@@ -171,4 +171,57 @@ describe('runtime endpoint HTTP surface', () => {
       },
     })
   })
+
+  it('dead-letters a queued message only after current sender policy removes it', async () => {
+    const env = makeEnv()
+    const checked = await runtimeEndpointsApp.fetch(
+      request('/check-in', 'token-a', checkInBody()),
+      env,
+    )
+    const checkedBody = await checked.json() as {
+      endpoint: { id: string }
+      endpoint_capability: string
+    }
+    const sent = await runtimeEndpointsApp.fetch(
+      request('/send', 'token-b', {
+        endpoint_id: checkedBody.endpoint.id,
+        project_id: 'proj-a',
+        body: 'queued before sender removal',
+        kind: 'request',
+        request_id: 'http-reject-1',
+      }),
+      env,
+    )
+    const sentBody = await sent.json() as { id: string }
+
+    const refreshed = await runtimeEndpointsApp.fetch(
+      request('/check-in', 'token-a', { ...checkInBody(), allowed_senders: ['agent-a'] }),
+      env,
+    )
+    expect(refreshed.status).toBe(200)
+    const refreshedBody = await refreshed.json() as { endpoint_capability: string }
+    const rejected = await runtimeEndpointsApp.fetch(
+      request('/reject', 'token-a', {
+        endpoint_id: checkedBody.endpoint.id,
+        endpoint_capability: refreshedBody.endpoint_capability,
+        message_id: sentBody.id,
+        reason: 'sender_policy_changed',
+      }),
+      env,
+    )
+
+    const rejectedBody = await rejected.json()
+    expect(rejected.status, JSON.stringify(rejectedBody)).toBe(200)
+    expect(rejectedBody).toMatchObject({
+      schema: 'mupot.runtime-endpoint-rejection/v1',
+      receipt: {
+        endpoint_id: checkedBody.endpoint.id,
+        message_id: sentBody.id,
+        request_id: 'http-reject-1',
+        reason: 'sender_policy_changed',
+        rejected_by_agent: 'agent-a',
+        duplicate: false,
+      },
+    })
+  })
 })

@@ -249,15 +249,24 @@ The reference Codex host bridge is
 `fleet-runtime/codex-thread-endpoint.mjs`. Raw thread identity stays in its
 local `0600` config. It validates sender and project allowlists, persists the
 message before execution, defers while the target thread already has an active
-turn, resumes the explicit thread rather than `--last`, and retries Mupot
-acceptance from a local turn receipt without rerunning Codex.
+turn, resumes the explicit thread through App Server rather than `--last`, and
+retries Mupot acceptance from a local turn receipt without rerunning Codex. The
+adapter supports both released raw-frame Unix listeners and the documented
+HTTP-Upgrade listener, and it sends no JSON-RPC until one transport opens.
 
-The current `codex_cli` rollout check is diagnostic and not an atomic busy-turn
-guard. Production closure requires the `codex_app_server` adapter to use
-authoritative `thread/resume` and `turn/start` conflict/queue behavior. It also
-requires the supervisor credential store to run under an OS principal or broker
-that resumed model tools cannot read. A same-user `0600` file is not a security
-boundary against a tool-capable turn.
+`thread/resume` plus `turn/start` replaces the prior rollout scan and CLI child
+process. A turn-start rejection is retryable; a connection loss after the start
+request is sent is an uncertain delivery and latches a durable bridge fault.
+Codex CLI 0.145/0.146 can accept turn starts from two independent clients for
+one thread, so the reference bridge requires an automation-exclusive thread;
+App Server is not claimed as a shared-Desktop mutex. Human input must use the
+same Mupot/Linear work path while that endpoint is active.
+Queued messages invalidated by a sender-policy change use the capability-bound
+reject operation, which re-verifies the current policy in D1 and writes an
+immutable rejection receipt. Production closure still requires the supervisor
+credential store to run under an OS principal or broker that resumed model tools
+cannot read. A same-user `0600` file is not a security boundary against a
+tool-capable turn.
 
 SOS is not part of Mupot's endpoint transport. An operator may copy an SOS
 check-in code, such as `20260727-0042`, into the endpoint's public

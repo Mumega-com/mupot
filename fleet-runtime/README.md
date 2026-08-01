@@ -212,8 +212,9 @@ daemon tick. The inbox read is signed with the agent's Ed25519 key and POSTed to
 Use this bridge when one welded Mupot agent has several Codex threads and a
 message must return to one specific project thread. The installer creates
 `~/.fleet/codex-thread-endpoint.json`; keep that file and its token file mode
-`0600`, then set the exact local `thread_id`, rollout path, project, and sender
-allowlist. An operator may copy a short SOS check-in code such as
+`0600`, then set the exact local `thread_id`, App Server socket, project, and
+sender allowlist, and explicitly set `exclusive_thread: true`. An operator may
+copy a short SOS check-in code such as
 `20260727-0042` into `local_source_id` and the Codex thread title so the session
 can be found in both systems. SOS is otherwise separate from this Mupot
 transport, and that copied label is not a credential.
@@ -241,31 +242,42 @@ stored only in the host's `0600` state and is required for inbox, heartbeat,
 acceptance, and revocation. The bridge peeks that endpoint's durable inbox,
 persists each message locally before execution, and invokes:
 
-```bash
-codex exec resume <exact-thread-id> --skip-git-repo-check --json -
+```text
+initialize -> thread/resume(<exact-thread-id>) -> turn/start(<attributed input>)
 ```
 
-It does not use `--last`. An active-turn guard scans backward through the full
-rollout instead of trusting a fixed-size tail. All cooperating watchers use one
-canonical host-wide lock derived from the exact thread. Mupot acceptance happens
-only after Codex emits a turn id. If the accept request fails, the local spool
-keeps that turn id and retries consumption without executing the request twice.
-An uncertain prior dispatch or an unconfirmed child termination writes a
-durable `*.fault.json` marker and stops the bridge. An operator must inspect the
-spool and Codex process state before clearing that marker and restarting; the
-bridge never guesses whether it is safe to execute the message again.
+It never uses `--last` or scans rollout files. The Unix client supports both the
+released raw WebSocket-frame listener and the documented HTTP-Upgrade listener,
+without sending JSON-RPC until one transport has opened. All cooperating
+watchers use one canonical host-wide lock derived from the exact thread. Mupot
+acceptance happens only after App Server returns a real turn id and emits the
+terminal turn event. If the accept request fails, the local spool keeps that turn
+id and retries consumption without executing the request twice. A connection
+loss after `turn/start` writes a durable `*.fault.json` marker and stops the
+bridge. An operator must inspect the spool and App Server thread state before
+clearing that marker; the bridge never guesses whether replay is safe.
+
+Codex CLI 0.145/0.146 does not provide an authoritative mutex across independent
+App Server/Desktop clients. This bridge therefore requires an automation-
+exclusive thread: human follow-ups must enter through Mupot while the endpoint
+is active. Opening the conversation for observation is fine; sending a direct
+Desktop turn concurrently is outside the supported contract.
+
+If an allowlisted sender is removed after its message was queued, the bridge
+calls the capability-bound `/reject` operation. Mupot independently proves that
+the sender is no longer authorized, writes an immutable rejection receipt, and
+removes the message from the active inbox without erasing its audit record.
 
 The bridge log and delivery receipts include endpoint/message/request/turn
 references only. They exclude the raw thread UUID, bearer token, and message
 body. Message bodies exist only in the `0600` pending spool until Mupot accepts
 the turn.
 
-This CLI adapter is a hardened foundation, not the production credential
-boundary. A production deployment must run the supervisor credential store
-under a separate OS principal or broker that Codex tool execution cannot read,
-and must use the app-server `thread/resume` plus `turn/start` path for
-authoritative busy-turn handling. The rollout scan cannot make a competing
-Desktop turn atomic.
+The App Server adapter closes the CLI/rollout race, but a same-user token file is
+still not a production credential boundary. A production deployment must run
+the supervisor credential store under a separate OS principal or broker that
+Codex tool execution cannot read. A same-user installation is a testing profile,
+not the production acceptance proof.
 
 ## Run the control daemon (remote open/close)
 

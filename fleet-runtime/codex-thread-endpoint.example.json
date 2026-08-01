@@ -3,7 +3,8 @@
   "base_url": "https://YOUR-POT.example",
   "token_file": "~/.config/mupot/agent.token",
   "thread_id": "00000000-0000-4000-8000-000000000000",
-  "rollout_path": "~/.codex/sessions/YYYY/MM/DD/rollout-THREAD.jsonl",
+  "exclusive_thread": true,
+  "app_server_socket": "~/.codex/app-server-control/app-server-control.sock",
   "workdir": "~/work/YOUR-PROJECT",
   "node_id": "node-local",
   "local_source_id": "20260727-0042",
@@ -18,7 +19,6 @@
   "timeout_ms": 600000,
   "http_timeout_ms": 15000,
   "shutdown_grace_ms": 5000,
-  "codex_bin": "/opt/homebrew/bin/codex",
   "state_file": "~/.fleet/state/codex-thread-endpoint.json",
   "spool_dir": "~/.fleet/inbox/codex-thread-endpoint"
 }

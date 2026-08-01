@@ -70,14 +70,27 @@ CREATE TABLE IF NOT EXISTS runtime_endpoint_messages (
   created_at      TEXT NOT NULL,
   accepted_at     TEXT,
   runtime_turn_id TEXT,
+  rejected_at     TEXT,
+  rejection_reason TEXT,
+  rejected_by_agent TEXT REFERENCES agents(id),
   CHECK (
-    (accepted_at IS NULL AND runtime_turn_id IS NULL)
-    OR (accepted_at IS NOT NULL AND runtime_turn_id IS NOT NULL)
+    (
+      accepted_at IS NULL AND runtime_turn_id IS NULL
+      AND rejected_at IS NULL AND rejection_reason IS NULL AND rejected_by_agent IS NULL
+    )
+    OR (
+      accepted_at IS NOT NULL AND runtime_turn_id IS NOT NULL
+      AND rejected_at IS NULL AND rejection_reason IS NULL AND rejected_by_agent IS NULL
+    )
+    OR (
+      accepted_at IS NULL AND runtime_turn_id IS NULL
+      AND rejected_at IS NOT NULL AND rejection_reason IS NOT NULL AND rejected_by_agent IS NOT NULL
+    )
   )
 );
 
 CREATE INDEX IF NOT EXISTS idx_runtime_endpoint_messages_inbox
-  ON runtime_endpoint_messages(tenant, endpoint_id, accepted_at, seq);
+  ON runtime_endpoint_messages(tenant, endpoint_id, accepted_at, rejected_at, seq);
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_endpoint_messages_request
   ON runtime_endpoint_messages(tenant, project_id, from_agent, request_id)
@@ -131,8 +144,20 @@ END;
 CREATE TRIGGER validate_runtime_endpoint_accept_once
 BEFORE UPDATE OF accepted_at, runtime_turn_id ON runtime_endpoint_messages
 WHEN OLD.accepted_at IS NOT NULL
+  OR OLD.rejected_at IS NOT NULL
   OR NEW.accepted_at IS NULL
   OR NEW.runtime_turn_id IS NULL
 BEGIN
   SELECT RAISE(ABORT, 'runtime endpoint acceptance immutable');
+END;
+
+CREATE TRIGGER validate_runtime_endpoint_reject_once
+BEFORE UPDATE OF rejected_at, rejection_reason, rejected_by_agent ON runtime_endpoint_messages
+WHEN OLD.accepted_at IS NOT NULL
+  OR OLD.rejected_at IS NOT NULL
+  OR NEW.rejected_at IS NULL
+  OR NEW.rejection_reason IS NULL
+  OR NEW.rejected_by_agent IS NULL
+BEGIN
+  SELECT RAISE(ABORT, 'runtime endpoint rejection immutable');
 END;

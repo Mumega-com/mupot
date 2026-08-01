@@ -1,7 +1,7 @@
 # MCPWP Automated Squad Design
 
 Date: 2026-08-01
-Status: Approved direction, implementation pending
+Status: Approved direction, Flight 1 implementation in progress
 Issue: #577
 Foundation: PR #578
 
@@ -24,11 +24,11 @@ their human approval gates.
 - PR #578 already provides project-scoped runtime endpoints, durable inboxes,
   sender allowlists, leased capabilities, exact-thread host configuration, and
   acceptance receipts.
-- The current PR #578 host adapter uses `codex exec resume`, which races with a
-  concurrently active desktop turn and is not the production transport.
-- A native Codex-chat test reached an existing thread and produced internal-chat
-  turn metadata. The automated path must preserve that behavior through Codex
-  App Server.
+- The recovered PR #578 baseline used `codex exec resume`, which raced with a
+  concurrently active desktop turn and was not the production transport.
+- A native Codex-chat delivery was reported from Cairn's Mac. Local rollout
+  metadata confirms the Codex chat surface but does not independently attest
+  Cairn as sender, so Mupot remains the required provenance boundary.
 
 ## Architecture
 
@@ -81,11 +81,15 @@ WebSocket-over-Unix protocol. For each queued Mupot message it:
 4. Calls `thread/resume` for the configured exact thread ID.
 5. Calls `turn/start` with the fenced, attributed message as text input.
 6. Persists the returned turn ID before acknowledging Mupot.
-7. Streams `turn/completed` and evidence notifications back to Mupot.
+7. Flight 1 consumes `turn/completed`; a later flight returns completion and
+   evidence notifications to Mupot and Linear.
 
-App Server owns active-turn serialization. An active-turn conflict is a retryable
-defer, never a second competing turn. The adapter does not scan rollout files or
-spawn `codex exec resume`.
+The first automated squad uses Mupot-exclusive Codex threads. Live testing on
+Codex CLI 0.146.0 confirmed that two app-server clients can both receive a
+successful `turn/start` for one thread; therefore App Server is not treated as a
+shared-Desktop mutex. Human follow-ups enter through Mupot or Linear while the
+automation endpoint is active. The adapter itself dispatches serially, never
+scans rollout files, and never spawns `codex exec resume`.
 
 The Mupot endpoint token is held by a supervisor principal or credential broker
 that the Codex runtime cannot read. The App Server keeps the user's Codex auth
@@ -176,8 +180,8 @@ service or routing policy is removed.
    leased runtime endpoints.
 2. A Mupot request starts exactly one turn in the intended existing Codex thread
    and records the real App Server turn ID.
-3. An active desktop turn defers work without dropping it or starting a competing
-   turn.
+3. Enrollment marks each thread automation-exclusive and fails cutover while a
+   separate Desktop client is allowed to submit direct turns.
 4. A queued message invalidated by policy is auditable, dead-lettered, and does
    not starve later authorized work.
 5. The Codex runtime cannot read the endpoint credential, state, or spool.
@@ -187,4 +191,3 @@ service or routing policy is removed.
    SOS has no delivery role.
 8. Human approval remains mandatory for publishing, spending, outreach, release,
    and production changes.
-

@@ -16,6 +16,7 @@ const HOST_ONLY_TOOLS = new Set([
   'runtime_endpoint_revoke',
   'runtime_endpoint_inbox',
   'runtime_endpoint_accept',
+  'runtime_endpoint_reject',
 ])
 
 async function invokeEndpointTool(
@@ -530,6 +531,70 @@ describe('runtime endpoint MCP contract', () => {
     const drained = await invokeEndpointTool(agentA, db.env, 'runtime_endpoint_inbox', {
       endpoint_id: endpoint.id,
       endpoint_capability: endpoint.capability,
+    })
+    expect(drained).toMatchObject({ ok: true, result: { messages: [], remaining: 0 } })
+  })
+
+  it('dead-letters a queued message invalidated by a later sender policy', async () => {
+    const db = makeDb()
+    const checked = await checkIn(db, agentA, SESSION_A)
+    if (!checked.ok) throw new Error('fixture check-in failed')
+    const endpoint = endpointCredentials(checked)
+    const sent = await invokeEndpointTool(agentB, db.env, 'runtime_endpoint_send', {
+      endpoint_id: endpoint.id,
+      project_id: 'proj-a',
+      body: 'queued before the sender policy changed',
+      kind: 'request',
+      request_id: 'req-reject-1',
+    })
+    if (!sent.ok) throw new Error('fixture send failed')
+    const messageId = (sent.result as { id: string }).id
+
+    const renewed = await checkIn(db, agentA, SESSION_A, {
+      allowed_senders: ['agent-a'],
+    })
+    if (!renewed.ok) throw new Error('fixture renewal failed')
+    const renewedEndpoint = endpointCredentials(renewed)
+    const rejected = await invokeEndpointTool(agentA, db.env, 'runtime_endpoint_reject', {
+      endpoint_id: renewedEndpoint.id,
+      endpoint_capability: renewedEndpoint.capability,
+      message_id: messageId,
+      reason: 'sender_policy_changed',
+    })
+
+    expect(rejected).toMatchObject({
+      ok: true,
+      result: {
+        schema: 'mupot.runtime-endpoint-rejection/v1',
+        receipt: {
+          endpoint_id: endpoint.id,
+          message_id: messageId,
+          request_id: 'req-reject-1',
+          reason: 'sender_policy_changed',
+          rejected_by_agent: 'agent-a',
+          duplicate: false,
+        },
+      },
+    })
+    expect(db.messageRows()[0]).toMatchObject({
+      accepted_at: null,
+      runtime_turn_id: null,
+      rejection_reason: 'sender_policy_changed',
+      rejected_by_agent: 'agent-a',
+    })
+    expect(db.messageRows()[0].rejected_at).toEqual(expect.any(String))
+
+    const replay = await invokeEndpointTool(agentA, db.env, 'runtime_endpoint_reject', {
+      endpoint_id: renewedEndpoint.id,
+      endpoint_capability: renewedEndpoint.capability,
+      message_id: messageId,
+      reason: 'sender_policy_changed',
+    })
+    expect(replay).toMatchObject({ ok: true, result: { receipt: { duplicate: true } } })
+
+    const drained = await invokeEndpointTool(agentA, db.env, 'runtime_endpoint_inbox', {
+      endpoint_id: renewedEndpoint.id,
+      endpoint_capability: renewedEndpoint.capability,
     })
     expect(drained).toMatchObject({ ok: true, result: { messages: [], remaining: 0 } })
   })

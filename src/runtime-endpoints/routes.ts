@@ -90,6 +90,7 @@ runtimeEndpointsApp.post('/revoke', (c) => runBodyTool(c, 'runtime_endpoint_revo
 runtimeEndpointsApp.post('/send', (c) => runBodyTool(c, 'runtime_endpoint_send'))
 runtimeEndpointsApp.post('/inbox', (c) => runBodyTool(c, 'runtime_endpoint_inbox'))
 runtimeEndpointsApp.post('/accept', (c) => runBodyTool(c, 'runtime_endpoint_accept'))
+runtimeEndpointsApp.post('/reject', (c) => runBodyTool(c, 'runtime_endpoint_reject'))
 
 runtimeEndpointsApp.get('/', async (c) => {
   const auth = await bearerAuth(c)

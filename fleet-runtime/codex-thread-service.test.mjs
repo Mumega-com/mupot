@@ -19,7 +19,8 @@ function fixture() {
     base_url: 'https://pot.example',
     token_file: join(dir, 'agent.token'),
     thread_id: '00000000-0000-4000-8000-000000000001',
-    rollout_path: join(dir, 'rollout.jsonl'),
+    exclusive_thread: true,
+    app_server_socket: join(dir, 'app-server.sock'),
     workdir: dir,
     node_id: 'node-local',
     local_source_id: 'sos-hadi-codex-session-0042',
@@ -32,7 +33,6 @@ function fixture() {
     timeout_ms: 600000,
     http_timeout_ms: 15000,
     shutdown_grace_ms: 5000,
-    codex_bin: '/usr/local/bin/codex',
     state_file: join(dir, 'state.json'),
     spool_dir: join(dir, 'spool'),
   }))
@@ -64,7 +64,7 @@ test('one exact thread gets a stable separately named launchd service', () => {
   assert.match(context.lifecycleCommand('reload'), /--config/)
 })
 
-test('systemd service identifies the SOS routing label without exposing credentials', () => {
+test('systemd service identifies the local source label without exposing credentials', () => {
   const { dir, configPath } = fixture()
   const context = createCodexThreadServiceContext({
     configPath,

@@ -2,6 +2,7 @@ import type { Env } from '../types'
 
 export const RUNTIME_ENDPOINT_SCHEMA = 'mupot.runtime-endpoint/v1'
 export const RUNTIME_ENDPOINT_ACK_SCHEMA = 'mupot.runtime-endpoint-ack/v1'
+export const RUNTIME_ENDPOINT_REJECTION_SCHEMA = 'mupot.runtime-endpoint-rejection/v1'
 export const MIN_LEASE_SECONDS = 60
 export const MAX_LEASE_SECONDS = 3600
 export const DEFAULT_LEASE_SECONDS = 300
@@ -480,7 +481,8 @@ export async function sendRuntimeEndpointMessage(
              )
         )
           AND (SELECT COUNT(*) FROM runtime_endpoint_messages
-                WHERE tenant = ?2 AND endpoint_id = ?3 AND accepted_at IS NULL) < ?13`,
+                WHERE tenant = ?2 AND endpoint_id = ?3
+                  AND accepted_at IS NULL AND rejected_at IS NULL) < ?13`,
     )
       .bind(
         id,
@@ -542,7 +544,8 @@ export async function readRuntimeEndpointInbox(
     `SELECT seq, id, endpoint_id, from_agent, from_member, kind, body,
             request_id, in_reply_to, project_id, created_at
        FROM runtime_endpoint_messages
-      WHERE tenant = ?1 AND endpoint_id = ?2 AND accepted_at IS NULL
+      WHERE tenant = ?1 AND endpoint_id = ?2
+        AND accepted_at IS NULL AND rejected_at IS NULL
         AND EXISTS (
           SELECT 1 FROM runtime_endpoints e
            WHERE e.tenant = ?1 AND e.id = ?2 AND e.capability_hash = ?3
@@ -554,7 +557,8 @@ export async function readRuntimeEndpointInbox(
     .all<RuntimeEndpointMessage>()
   const remainingRow = await env.DB.prepare(
     `SELECT COUNT(*) AS n FROM runtime_endpoint_messages
-      WHERE tenant = ?1 AND endpoint_id = ?2 AND accepted_at IS NULL`,
+      WHERE tenant = ?1 AND endpoint_id = ?2
+        AND accepted_at IS NULL AND rejected_at IS NULL`,
   )
     .bind(env.TENANT_SLUG, endpoint.id)
     .first<{ n: number }>()
@@ -584,7 +588,7 @@ export async function acceptRuntimeEndpointMessage(
   if (!REF_RE.test(runtimeTurnId)) return { ok: false, error: 'invalid_runtime_turn_id' }
   const capabilityHash = await sha256Hex(endpointCapability)
   const row = await env.DB.prepare(
-    `SELECT id, request_id, accepted_at, runtime_turn_id
+    `SELECT id, request_id, accepted_at, runtime_turn_id, rejected_at
        FROM runtime_endpoint_messages
       WHERE tenant = ?1 AND endpoint_id = ?2 AND id = ?3
         AND EXISTS (
@@ -594,8 +598,15 @@ export async function acceptRuntimeEndpointMessage(
       LIMIT 1`,
   )
     .bind(env.TENANT_SLUG, endpoint.id, messageId, capabilityHash)
-    .first<{ id: string; request_id: string | null; accepted_at: string | null; runtime_turn_id: string | null }>()
+    .first<{
+      id: string
+      request_id: string | null
+      accepted_at: string | null
+      runtime_turn_id: string | null
+      rejected_at: string | null
+    }>()
   if (!row) return { ok: false, error: 'message_not_found' }
+  if (row.rejected_at) return { ok: false, error: 'message_already_rejected' }
   if (row.accepted_at) {
     if (row.runtime_turn_id !== runtimeTurnId) return { ok: false, error: 'message_already_accepted' }
     return {
@@ -613,7 +624,8 @@ export async function acceptRuntimeEndpointMessage(
   const acceptedAt = now.toISOString()
   const update = await env.DB.prepare(
     `UPDATE runtime_endpoint_messages SET accepted_at = ?1, runtime_turn_id = ?2
-      WHERE tenant = ?3 AND endpoint_id = ?4 AND id = ?5 AND accepted_at IS NULL
+      WHERE tenant = ?3 AND endpoint_id = ?4 AND id = ?5
+        AND accepted_at IS NULL AND rejected_at IS NULL
         AND EXISTS (
           SELECT 1 FROM runtime_endpoints e
            WHERE e.tenant = ?3 AND e.id = ?4 AND e.status = 'active'
@@ -626,12 +638,18 @@ export async function acceptRuntimeEndpointMessage(
     const current = await getRuntimeEndpointWithCapability(env, endpoint.id, endpointCapability, now)
     if (!current || current.status !== 'active') return { ok: false, error: 'endpoint_unavailable' }
     const raced = await env.DB.prepare(
-      `SELECT request_id, accepted_at, runtime_turn_id
+      `SELECT request_id, accepted_at, runtime_turn_id, rejected_at
          FROM runtime_endpoint_messages
         WHERE tenant = ?1 AND endpoint_id = ?2 AND id = ?3 LIMIT 1`,
     )
       .bind(env.TENANT_SLUG, endpoint.id, messageId)
-      .first<{ request_id: string | null; accepted_at: string | null; runtime_turn_id: string | null }>()
+      .first<{
+        request_id: string | null
+        accepted_at: string | null
+        runtime_turn_id: string | null
+        rejected_at: string | null
+      }>()
+    if (raced?.rejected_at) return { ok: false, error: 'message_already_rejected' }
     if (!raced?.accepted_at) return { ok: false, error: 'db_error' }
     if (raced.runtime_turn_id !== runtimeTurnId) return { ok: false, error: 'message_already_accepted' }
     return {
@@ -654,6 +672,151 @@ export async function acceptRuntimeEndpointMessage(
       request_id: row.request_id,
       runtime_turn_id: runtimeTurnId,
       accepted_at: acceptedAt,
+      duplicate: false,
+    },
+  }
+}
+
+export async function rejectRuntimeEndpointMessage(
+  env: Env,
+  endpoint: RuntimeEndpoint,
+  endpointCapability: string,
+  messageId: string,
+  reason: string,
+  rejectedByAgent: string,
+  now: Date = new Date(),
+): Promise<Result<{
+  endpoint_id: string
+  message_id: string
+  request_id: string | null
+  reason: string
+  rejected_by_agent: string
+  rejected_at: string
+  duplicate: boolean
+}>> {
+  if (endpoint.status !== 'active') return { ok: false, error: 'endpoint_unavailable' }
+  if (!REF_RE.test(messageId)) return { ok: false, error: 'invalid_message_id' }
+  if (reason !== 'sender_policy_changed') return { ok: false, error: 'invalid_rejection_reason' }
+  const capabilityHash = await sha256Hex(endpointCapability)
+  const row = await env.DB.prepare(
+    `SELECT id, request_id, from_agent, accepted_at, rejected_at,
+            rejection_reason, rejected_by_agent
+       FROM runtime_endpoint_messages
+      WHERE tenant = ?1 AND endpoint_id = ?2 AND id = ?3
+        AND EXISTS (
+          SELECT 1 FROM runtime_endpoints e
+           WHERE e.tenant = ?1 AND e.id = ?2 AND e.capability_hash = ?4
+        )
+      LIMIT 1`,
+  )
+    .bind(env.TENANT_SLUG, endpoint.id, messageId, capabilityHash)
+    .first<{
+      id: string
+      request_id: string | null
+      from_agent: string
+      accepted_at: string | null
+      rejected_at: string | null
+      rejection_reason: string | null
+      rejected_by_agent: string | null
+    }>()
+  if (!row) return { ok: false, error: 'message_not_found' }
+  if (row.accepted_at) return { ok: false, error: 'message_already_accepted' }
+  if (row.rejected_at) {
+    if (row.rejection_reason !== reason || row.rejected_by_agent !== rejectedByAgent) {
+      return { ok: false, error: 'message_already_rejected' }
+    }
+    return {
+      ok: true,
+      value: {
+        endpoint_id: endpoint.id,
+        message_id: row.id,
+        request_id: row.request_id,
+        reason,
+        rejected_by_agent: rejectedByAgent,
+        rejected_at: row.rejected_at,
+        duplicate: true,
+      },
+    }
+  }
+  if (endpoint.allowed_senders.includes(row.from_agent)) {
+    return { ok: false, error: 'message_still_authorized' }
+  }
+  const rejectedAt = now.toISOString()
+  const update = await env.DB.prepare(
+    `UPDATE runtime_endpoint_messages
+        SET rejected_at = ?1, rejection_reason = ?2, rejected_by_agent = ?3
+      WHERE tenant = ?4 AND endpoint_id = ?5 AND id = ?6
+        AND accepted_at IS NULL AND rejected_at IS NULL
+        AND EXISTS (
+          SELECT 1 FROM runtime_endpoints e
+           WHERE e.tenant = ?4 AND e.id = ?5 AND e.status = 'active'
+             AND e.capability_hash = ?7 AND e.lease_expires_at > ?1
+             AND NOT EXISTS (
+               SELECT 1 FROM json_each(e.allowed_senders)
+                WHERE json_each.value = runtime_endpoint_messages.from_agent
+             )
+        )`,
+  )
+    .bind(
+      rejectedAt,
+      reason,
+      rejectedByAgent,
+      env.TENANT_SLUG,
+      endpoint.id,
+      messageId,
+      capabilityHash,
+    )
+    .run()
+  if ((update.meta?.changes ?? 0) === 0) {
+    const current = await getRuntimeEndpointWithCapability(env, endpoint.id, endpointCapability, now)
+    if (!current || current.status !== 'active') return { ok: false, error: 'endpoint_unavailable' }
+    const raced = await env.DB.prepare(
+      `SELECT from_agent, request_id, accepted_at, rejected_at,
+              rejection_reason, rejected_by_agent
+         FROM runtime_endpoint_messages
+        WHERE tenant = ?1 AND endpoint_id = ?2 AND id = ?3 LIMIT 1`,
+    )
+      .bind(env.TENANT_SLUG, endpoint.id, messageId)
+      .first<{
+        from_agent: string
+        request_id: string | null
+        accepted_at: string | null
+        rejected_at: string | null
+        rejection_reason: string | null
+        rejected_by_agent: string | null
+      }>()
+    if (raced?.accepted_at) return { ok: false, error: 'message_already_accepted' }
+    if (!raced?.rejected_at) {
+      if (raced && current.allowed_senders.includes(raced.from_agent)) {
+        return { ok: false, error: 'message_still_authorized' }
+      }
+      return { ok: false, error: 'db_error' }
+    }
+    if (raced.rejection_reason !== reason || raced.rejected_by_agent !== rejectedByAgent) {
+      return { ok: false, error: 'message_already_rejected' }
+    }
+    return {
+      ok: true,
+      value: {
+        endpoint_id: endpoint.id,
+        message_id: messageId,
+        request_id: raced.request_id,
+        reason,
+        rejected_by_agent: rejectedByAgent,
+        rejected_at: raced.rejected_at,
+        duplicate: true,
+      },
+    }
+  }
+  return {
+    ok: true,
+    value: {
+      endpoint_id: endpoint.id,
+      message_id: row.id,
+      request_id: row.request_id,
+      reason,
+      rejected_by_agent: rejectedByAgent,
+      rejected_at: rejectedAt,
       duplicate: false,
     },
   }

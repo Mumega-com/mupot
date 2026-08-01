@@ -3,6 +3,7 @@ import { readAccess, readableProject } from './projects'
 import { done, fail, str, type ToolSpec } from './index'
 import {
   RUNTIME_ENDPOINT_ACK_SCHEMA,
+  RUNTIME_ENDPOINT_REJECTION_SCHEMA,
   RUNTIME_ENDPOINT_SCHEMA,
   acceptRuntimeEndpointMessage,
   checkInRuntimeEndpoint,
@@ -11,6 +12,7 @@ import {
   heartbeatRuntimeEndpoint,
   listRuntimeEndpoints,
   readRuntimeEndpointInbox,
+  rejectRuntimeEndpointMessage,
   revokeRuntimeEndpoint,
   sendRuntimeEndpointMessage,
   type RuntimeEndpoint,
@@ -40,6 +42,7 @@ function serviceFailure(error: string) {
   if (error === 'sender_not_allowed') return fail(403, error)
   if (error === 'endpoint_unavailable' || error === 'endpoint_revoked' || error === 'endpoint_binding_conflict' ||
       error === 'message_already_accepted' ||
+      error === 'message_already_rejected' || error === 'message_still_authorized' ||
       error === 'request_id_conflict' || error === 'endpoint_inbox_full') return fail(409, error)
   if (error === 'db_error' || error === 'check_in_failed') return fail(500, error)
   return fail(400, error)
@@ -318,6 +321,45 @@ const acceptTool: ToolSpec = {
   },
 }
 
+const rejectTool: ToolSpec = {
+  name: 'runtime_endpoint_reject',
+  scope: 'self (dead-letter a queued message invalidated by current endpoint policy)',
+  min: 'authenticated',
+  args: '{ endpoint_id: string, endpoint_capability: string, message_id: string, reason: "sender_policy_changed" }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      endpoint_id: STRING,
+      endpoint_capability: STRING,
+      message_id: STRING,
+      reason: { type: 'string', enum: ['sender_policy_changed'] },
+    },
+    required: ['endpoint_id', 'endpoint_capability', 'message_id', 'reason'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const caller = identity(auth)
+    if (!caller) return fail(403, 'not_agent_bound')
+    const endpointId = str(args.endpoint_id)
+    const endpointCapability = str(args.endpoint_capability)
+    const messageId = str(args.message_id)
+    const reason = str(args.reason)
+    if (!endpointId || !endpointCapability || !messageId || !reason) return fail(400, 'invalid_args')
+    const owned = await ownedActiveEndpoint(auth, env, endpointId, endpointCapability)
+    if (!owned.ok) return owned.error
+    const result = await rejectRuntimeEndpointMessage(
+      env,
+      owned.endpoint,
+      endpointCapability,
+      messageId,
+      reason,
+      caller.agentId,
+    )
+    if (!result.ok) return serviceFailure(result.error)
+    return done({ schema: RUNTIME_ENDPOINT_REJECTION_SCHEMA, receipt: result.value })
+  },
+}
+
 export const RUNTIME_ENDPOINT_HOST_TOOLS: ToolSpec[] = [
   checkInTool,
   heartbeatTool,
@@ -326,6 +368,7 @@ export const RUNTIME_ENDPOINT_HOST_TOOLS: ToolSpec[] = [
   sendTool,
   inboxTool,
   acceptTool,
+  rejectTool,
 ]
 
 // Capabilities and host session handles are runtime-adapter secrets. Only safe

@@ -8,7 +8,6 @@
 // the exact thread, and accepts the message only after Codex reports a turn id.
 
 import { createHash, randomBytes } from 'node:crypto'
-import { spawn } from 'node:child_process'
 import {
   appendFileSync,
   closeSync,
@@ -23,10 +22,10 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs'
-import { open } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import { acquireSingletonLock } from './singleton-lock.mjs'
+import { runAppServerTurn } from './codex-app-server-client.mjs'
 
 export const CODEX_THREAD_ENDPOINT_SCHEMA = 'mupot.codex-thread-endpoint/v1'
 const STATE_SCHEMA = 'mupot.codex-thread-endpoint-state/v1'
@@ -34,11 +33,7 @@ const RECEIPT_SCHEMA = 'mupot.codex-thread-delivery-receipt/v1'
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const REF_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/
 const SECRET_RE = /Bearer\s+\S+|\bmupot_[A-Za-z0-9_-]+\b|(?:authorization|token|private_key|secret)\s*[:=]/i
-const STARTED_TOKEN = '"type":"event_msg","payload":{"type":"task_started"'
-const COMPLETED_TOKEN = '"type":"event_msg","payload":{"type":"task_complete"'
 const TURN_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/
-const MAX_CODEX_STDOUT_BUFFER = 1024 * 1024
-let activeChild = null
 
 function expandHome(path) {
   return typeof path === 'string' && path.startsWith('~/')
@@ -81,6 +76,9 @@ export function validateConfig(raw) {
   if (typeof raw.thread_id !== 'string' || !UUID_RE.test(raw.thread_id)) {
     throw new Error('config.thread_id must be the exact Codex thread UUID')
   }
+  if (raw.exclusive_thread !== true) {
+    throw new Error('config.exclusive_thread must acknowledge a Mupot-exclusive thread')
+  }
   const pollMs = Number(raw.poll_ms)
   if (!Number.isInteger(pollMs) || pollMs < 1000 || pollMs > 60_000) {
     throw new Error('config.poll_ms must be an integer from 1000 to 60000')
@@ -106,7 +104,8 @@ export function validateConfig(raw) {
     base_url: raw.base_url.replace(/\/+$/, ''),
     token_file: tokenFile,
     thread_id: raw.thread_id,
-    rollout_path: requiredPath(raw.rollout_path, 'rollout_path'),
+    exclusive_thread: true,
+    app_server_socket: requiredPath(raw.app_server_socket, 'app_server_socket'),
     workdir: requiredPath(raw.workdir, 'workdir'),
     node_id: requiredRef(raw.node_id, 'node_id'),
     local_source_id: requiredRef(raw.local_source_id, 'local_source_id'),
@@ -121,7 +120,6 @@ export function validateConfig(raw) {
     timeout_ms: timeoutMs,
     http_timeout_ms: httpTimeoutMs,
     shutdown_grace_ms: shutdownGraceMs,
-    codex_bin: requiredPath(raw.codex_bin, 'codex_bin'),
     state_file: requiredPath(raw.state_file, 'state_file'),
     spool_dir: requiredPath(raw.spool_dir, 'spool_dir'),
   }
@@ -130,94 +128,6 @@ export function validateConfig(raw) {
 export function threadLockPath(config, homeDir = homedir()) {
   const threadHash = createHash('sha256').update(config.thread_id).digest('hex').slice(0, 16)
   return join(homeDir, '.fleet', 'locks', `codex-thread-${threadHash}.lock`)
-}
-
-export async function threadTurnActive(rolloutPath) {
-  const chunkSize = 1024 * 1024
-  let handle
-  try {
-    handle = await open(rolloutPath, 'r')
-    const { size } = await handle.stat()
-    let end = size
-    let carry = ''
-    while (end > 0) {
-      const start = Math.max(0, end - chunkSize)
-      const buffer = Buffer.alloc(end - start)
-      await handle.read(buffer, 0, buffer.length, start)
-      const text = buffer.toString('utf8') + carry
-      const startedAt = text.lastIndexOf(STARTED_TOKEN)
-      const completedAt = text.lastIndexOf(COMPLETED_TOKEN)
-      if (startedAt >= 0 || completedAt >= 0) return startedAt > completedAt
-      carry = text.slice(0, Math.max(STARTED_TOKEN.length, COMPLETED_TOKEN.length))
-      end = start
-    }
-    return false
-  } finally {
-    await handle?.close()
-  }
-}
-
-// Reads only the first line of a rollout file -- the `session_meta` record
-// Codex writes once at session/thread creation -- and returns its thread id
-// (`payload.id`), or null if the file is missing, unreadable, or the first
-// line is not a recognizable session_meta record.
-export async function rolloutSessionId(rolloutPath) {
-  let handle
-  try {
-    handle = await open(rolloutPath, 'r')
-    const chunkSize = 8192
-    const buffer = Buffer.alloc(chunkSize)
-    const { bytesRead } = await handle.read(buffer, 0, chunkSize, 0)
-    const text = buffer.toString('utf8', 0, bytesRead)
-    const newlineAt = text.indexOf('\n')
-    const firstLine = newlineAt >= 0 ? text.slice(0, newlineAt) : text
-    const parsed = JSON.parse(firstLine)
-    if (parsed?.type === 'session_meta' && typeof parsed.payload?.id === 'string') {
-      return parsed.payload.id
-    }
-    return null
-  } catch {
-    return null
-  } finally {
-    await handle?.close()
-  }
-}
-
-// config.rollout_path is resolved once, at config-validation time, and was
-// never re-checked against the thread it is supposed to represent -- so a
-// bridge that has been running a long time trusted that path forever with no
-// way to notice if it stopped being the right file.
-//
-// EMPIRICAL FINDING (2026-07-27, codex-cli 0.145.0, isolated CODEX_HOME):
-// created a fresh thread with `codex exec --json`, recorded its rollout file's
-// inode and the reported thread_id, then ran `codex exec resume <thread_id>
-// --json` against it. Result: same file path, same inode, size grew in place
-// (46003 -> 86292 bytes) and the same thread_id was reported by
-// `thread.started`. `codex exec resume <thread_id>` APPENDS to the original
-// rollout file for that exact thread id -- it does not fork a new file.
-// Separately, real historical rollout files with a `source.subagent
-// .thread_spawn.parent_thread_id` backlink confirm that subagent/derived
-// threads get their OWN distinct thread id and their OWN distinct rollout
-// file (with the parent link recorded in the child's own session_meta) --
-// that is not the resumed thread's own file changing out from under it
-// either. So the specific forking failure mode the gate hypothesized does not
-// reproduce against the exact mechanism this bridge relies on.
-//
-// This check is kept anyway, proportionate to that finding: instead of a full
-// dynamic-re-resolution rewrite for a scenario that doesn't occur, verify on
-// every cycle that the file at config.rollout_path still carries session_meta
-// matching config.thread_id. If it does not -- a future Codex version changes
-// this behavior, an external process rotates/prunes/replaces the file, or the
-// config was generated against the wrong path -- fail loud (a bridge fault)
-// instead of silently trusting stale content forever. A missing/unreadable
-// file is not treated as a mismatch here; that already surfaces through
-// threadTurnActive's own read failure as a soft, retryable guard failure.
-export async function verifiedThreadTurnActive(config) {
-  const sessionId = await rolloutSessionId(config.rollout_path)
-  if (sessionId !== null && sessionId !== config.thread_id) {
-    throw new Error('rollout_identity_mismatch')
-  }
-  return threadTurnActive(config.rollout_path)
 }
 
 export function authorizeMessage(config, message, endpointId = null) {
@@ -287,196 +197,11 @@ export function promptForMessage(message, options = {}) {
   ].filter(Boolean).join('\n')
 }
 
-function turnIdFromEvent(value) {
-  if (!value || typeof value !== 'object') return null
-  for (const candidate of [
-    value.turn_id,
-    value.turnId,
-    value.turn?.id,
-    value.payload?.turn_id,
-    value.payload?.turn?.id,
-  ]) {
-    if (typeof candidate === 'string' && TURN_ID_RE.test(candidate)) return candidate
-  }
-  return null
-}
-
 export function runCodexTurn(config, message, options = {}) {
-  const activeCheck = options.activeCheck ?? (() => verifiedThreadTurnActive(config))
-  const spawnImpl = options.spawnImpl ?? spawn
-  const killImpl = options.killImpl ?? process.kill
-  return Promise.resolve(activeCheck()).then((active) => {
-    if (active) return { ok: false, reason: 'active_turn' }
-    return new Promise((resolveDone) => {
-      let settled = false
-      let timer
-      let killGraceTimer
-      let timedOut = false
-      let receiptPersistFailed = false
-      let processFailureReason = null
-      let runtimeTurnId = null
-      let stdoutCarry = ''
-      const finish = (value) => {
-        if (settled) return
-        settled = true
-        clearTimeout(timer)
-        clearTimeout(killGraceTimer)
-        if (activeChild === child && value?.reason !== 'termination_unconfirmed') {
-          activeChild = null
-        }
-        resolveDone(value)
-      }
-      let child
-      const captureTurnId = (parsed) => {
-        if (runtimeTurnId || !parsed) return
-        runtimeTurnId = parsed
-        try {
-          options.onTurnStarted?.(parsed)
-        } catch {
-          receiptPersistFailed = true
-          terminateChild('turn_receipt_persist_failed')
-        }
-      }
-      const terminateChild = (reason) => {
-        processFailureReason ??= reason
-        try {
-          if (child.pid) killImpl(-child.pid, 'SIGKILL')
-          else child.kill?.('SIGKILL')
-        } catch {
-          // Wait for close or the normal execution timeout.
-        }
-        killGraceTimer ??= setTimeout(
-          () => finish({ ok: false, reason: 'termination_unconfirmed', fatal: true }),
-          config.shutdown_grace_ms,
-        )
-      }
-      try {
-        options.onDispatching?.()
-        child = spawnImpl(
-          config.codex_bin,
-          [
-            'exec',
-            'resume',
-            config.thread_id,
-            '--skip-git-repo-check',
-            '--json',
-            '-',
-          ],
-          {
-            cwd: config.workdir,
-            env: {
-              HOME: process.env.HOME,
-              PATH: process.env.PATH,
-              CODEX_HOME: process.env.CODEX_HOME,
-            },
-            shell: false,
-            detached: true,
-            stdio: ['pipe', 'pipe', 'pipe'],
-          },
-        )
-      } catch {
-        return finish({ ok: false, reason: 'spawn_failed' })
-      }
-      activeChild = child
-      timer = setTimeout(() => {
-        timedOut = true
-        try {
-          if (child.pid) killImpl(-child.pid, 'SIGKILL')
-          else child.kill?.('SIGKILL')
-        } catch {
-          // The process may already have exited between timeout and kill.
-        }
-        killGraceTimer = setTimeout(
-          () => finish({ ok: false, reason: 'termination_unconfirmed', fatal: true }),
-          config.shutdown_grace_ms,
-        )
-      }, config.timeout_ms)
-      child.stdout.setEncoding?.('utf8')
-      child.stderr.resume?.()
-      child.stdout.on('data', (chunk) => {
-        stdoutCarry += String(chunk)
-        if (stdoutCarry.length > MAX_CODEX_STDOUT_BUFFER) {
-          terminateChild('stdout_overflow')
-          return
-        }
-        const lines = stdoutCarry.split(/\r?\n/)
-        stdoutCarry = lines.pop() ?? ''
-        for (const line of lines) {
-          try {
-            captureTurnId(turnIdFromEvent(JSON.parse(line)))
-          } catch {
-            // Ignore non-JSON output. It is intentionally never logged.
-          }
-        }
-      })
-      child.on('error', () => finish({ ok: false, reason: 'spawn_failed' }))
-      child.on('close', (code) => {
-        if (activeChild === child) activeChild = null
-        if (stdoutCarry) {
-          try {
-            captureTurnId(turnIdFromEvent(JSON.parse(stdoutCarry)))
-          } catch {
-            // Ignore a non-JSON final buffer.
-          }
-        }
-        if (receiptPersistFailed) return finish({ ok: false, reason: 'turn_receipt_persist_failed' })
-        if (processFailureReason) return finish({ ok: false, reason: processFailureReason })
-        if (timedOut) return finish({ ok: false, reason: 'timeout' })
-        if (code !== 0) return finish({ ok: false, reason: 'codex_exit_nonzero' })
-        if (!runtimeTurnId) return finish({ ok: false, reason: 'turn_id_missing' })
-        finish({ ok: true, runtime_turn_id: runtimeTurnId })
-      })
-      child.stdin.on('error', () => terminateChild('stdin_failed'))
-      try {
-        child.stdin.end(promptForMessage(message))
-      } catch {
-        terminateChild('stdin_failed')
-      }
-    })
-  }).catch((error) => {
-    if (error?.message === 'rollout_identity_mismatch') {
-      return { ok: false, reason: 'rollout_identity_mismatch', fatal: true }
-    }
-    return { ok: false, reason: 'active_guard_failed' }
+  return runAppServerTurn(config, message, {
+    ...options,
+    prompt: promptForMessage(message),
   })
-}
-
-export async function shutdownActiveChild(config, options = {}) {
-  const child = options.child ?? activeChild
-  if (!child) return
-  const killImpl = options.killImpl ?? process.kill
-  const closed = new Promise((resolveClose) => {
-    if (activeChild !== child) resolveClose(true)
-    else child.once('close', () => resolveClose(true))
-  })
-  const signal = (name) => {
-    if (activeChild !== child) return
-    if (child.pid) killImpl(-child.pid, name)
-    else child.kill?.(name)
-  }
-  try {
-    signal('SIGTERM')
-  } catch {
-    // Escalate after the same bounded grace period.
-  }
-  const closedDuringGrace = await Promise.race([
-    closed,
-    sleep(config.shutdown_grace_ms).then(() => false),
-  ])
-  if (closedDuringGrace === true || activeChild !== child) return
-  try {
-    signal('SIGKILL')
-  } catch {
-    // Keep waiting with the canonical lock held; shutdown is unconfirmed.
-  }
-  await closed
-}
-
-export async function completeShutdown(config, startedShutdown = null, options = {}) {
-  await startedShutdown
-  // A signal can arrive immediately before spawn assigns activeChild. Recheck
-  // after the active cycle has unwound so the canonical lock stays held.
-  await shutdownActiveChild(config, options)
 }
 
 function writeAtomic(path, value, mode = 0o600) {
@@ -595,7 +320,7 @@ async function checkIn(config, token, state, fetchImpl) {
       project_id: config.project_id,
       purpose: config.purpose,
       workspace: config.workspace,
-      wake_adapter: 'codex_cli',
+      wake_adapter: 'codex_app_server',
       allowed_senders: config.allowed_senders,
       lease_seconds: config.lease_seconds,
     },
@@ -702,6 +427,22 @@ function acceptedReceipt(payload, message, endpointId, runtimeTurnId) {
   }
 }
 
+function rejectedReceipt(payload, message, endpointId, reason) {
+  const receipt = payload?.receipt
+  if (
+    payload?.schema !== 'mupot.runtime-endpoint-rejection/v1' ||
+    !receipt ||
+    receipt.endpoint_id !== endpointId ||
+    receipt.message_id !== message.id ||
+    (receipt.request_id ?? null) !== (message.request_id ?? null) ||
+    receipt.reason !== reason ||
+    typeof receipt.rejected_at !== 'string'
+  ) {
+    throw new Error('runtime_endpoint_reject_invalid_receipt')
+  }
+  return receipt
+}
+
 async function acceptPending(config, token, state, message, runtimeTurnId, options = {}) {
   const payload = await api(config, token, '/accept', {
     method: 'POST',
@@ -714,6 +455,20 @@ async function acceptPending(config, token, state, message, runtimeTurnId, optio
     },
   })
   return acceptedReceipt(payload, message, state.endpoint_id, runtimeTurnId)
+}
+
+async function rejectPending(config, token, state, message, reason, options = {}) {
+  const payload = await api(config, token, '/reject', {
+    method: 'POST',
+    fetchImpl: options.fetchImpl,
+    body: {
+      endpoint_id: state.endpoint_id,
+      endpoint_capability: state.endpoint_capability,
+      message_id: message.id,
+      reason,
+    },
+  })
+  return rejectedReceipt(payload, message, state.endpoint_id, reason)
 }
 
 function finalizeMessage(config, message, serverReceipt, path) {
@@ -818,6 +573,22 @@ export async function cycle(config, token, state, options = {}) {
   for (const message of inbox?.messages ?? []) {
     const denied = authorizeMessage(config, message, state.endpoint_id)
     if (denied) {
+      if (denied === 'unauthorized_sender') {
+        const receipt = await rejectPending(
+          config,
+          token,
+          state,
+          message,
+          'sender_policy_changed',
+          options,
+        )
+        log(config, 'message_rejected', {
+          message_id: message.id,
+          reason: receipt.reason,
+          rejected_at: receipt.rejected_at,
+        })
+        continue
+      }
       log(config, 'message_refused', { message_id: message?.id ?? null, reason: denied })
       continue
     }
@@ -835,7 +606,8 @@ export async function cycle(config, token, state, options = {}) {
     }
     const deliveryId = pending.delivery_id ?? randomBytes(18).toString('base64url')
     const persistedMessage = pending.message
-    const delivery = await runCodexTurn(
+    const deliverTurn = options.runTurnImpl ?? runCodexTurn
+    const delivery = await deliverTurn(
       config,
       { ...persistedMessage, delivery_id: deliveryId },
       {
@@ -897,12 +669,12 @@ async function main() {
     process.stderr.write(`codex-thread-endpoint: ${lock.reason}\n`)
     process.exit(2)
   }
-  let shutdownPromise = null
   let stopped = false
   let faulted = existsSync(bridgeFaultPath(config))
+  const shutdown = new AbortController()
   const stop = () => {
     stopped = true
-    shutdownPromise ??= shutdownActiveChild(config)
+    shutdown.abort()
   }
   try {
     process.on('SIGINT', stop)
@@ -916,7 +688,7 @@ async function main() {
         continue
       }
       try {
-        state = await cycle(config, token, state)
+        state = await cycle(config, token, state, { signal: shutdown.signal })
       } catch (error) {
         const reason = String(error?.message ?? error)
         bestEffortLog(config, 'cycle_failed', { reason })
@@ -928,7 +700,6 @@ async function main() {
       if (!stopped) await sleep(config.poll_ms)
     }
   } finally {
-    await completeShutdown(config, shutdownPromise)
     process.off('SIGINT', stop)
     process.off('SIGTERM', stop)
     lock.release()

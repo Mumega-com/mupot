@@ -72,7 +72,8 @@
     "@cloudflare/workers-oauth-provider": "^0.4.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "agents": "^0.14.5",
-    "hono": "^4.12.28"
+    "hono": "^4.12.28",
+    "ws": "^8.21.0"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20260617.1",
