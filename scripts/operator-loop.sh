@@ -2,11 +2,13 @@
 # mupot standing operator — supervised multi-technician loop.
 #
 # Always-on governed dispatcher: each cycle polls the mumega pot board for
-# tasks assigned to each wired technician (cursor, mumcp) and status=open,
-# dispatches them via the matching *-worker.py driver, then runs the GATE
-# lane driver (review-worker.py) over whatever landed in `review` this cycle
-# (including from prior cycles), then sleeps and repeats. All three drivers
-# already enforce the gate on their own:
+# tasks assigned to each wired technician (cursor, mumcp, codex, claude) and
+# status=open, dispatches them via the matching *-worker.py driver, then runs
+# the GATE lane driver (review-worker.py) over whatever landed in `review`
+# this cycle (including from prior cycles), then sleeps and repeats.
+# codex-worker (gpt-5.3-codex-spark) and claude-worker (haiku) are the
+# small-model execution lanes: cheap models do the majority of the work,
+# the gate decides what merges. All drivers enforce the gate on their own:
 #   - cursor-worker.py: isolated git worktree, verify (tsc/tests), driver
 #     pushes + opens a PR, task -> review, gate_owner=gate:kasra-core.
 #     Cursor never touches the remote and cannot self-close its own task
@@ -82,6 +84,8 @@ run_driver(){
 while [ "$STOP" -eq 0 ]; do
   run_driver "cursor" "$REPO/scripts/cursor-worker.py"
   run_driver "mumcp"  "$REPO/scripts/mumcp-worker.py"
+  run_driver "codex"  "$REPO/scripts/codex-worker.py"
+  run_driver "claude" "$REPO/scripts/claude-worker.py"
   run_driver "review" "$REPO/scripts/review-worker.py"
 
   # Sleep in short slices so SIGTERM is honored promptly instead of blocking
