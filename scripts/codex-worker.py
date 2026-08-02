@@ -14,7 +14,7 @@ execute the majority of work, the expensive gate decides what merges.
 Flow per task (assignee = codex, status = open):
   1. claim        -> task_update status=in_progress
   2. isolate      -> git worktree add -b codex/task-<id8> <wt> main
-  3. dispatch     -> codex exec --cd <wt> --full-auto -m <model> "<brief>"
+  3. dispatch     -> codex exec --cd <wt> --sandbox danger-full-access -m <model> "<brief>"
   4. verify       -> codex must have committed; run tsc (no fake-green)
   5. deliver      -> driver pushes the branch + opens the PR (codex never does)
   6. report       -> task_update status=review, gate_owner set, PR linked
@@ -147,7 +147,13 @@ def build_brief(task: dict, worktree: Path, branch: str) -> str:
 
 
 def codex_run(worktree: Path, brief: str) -> subprocess.CompletedProcess:
-    cmd = ["codex", "exec", "--cd", str(worktree), "--full-auto"]
+    # --full-auto wraps codex in a bwrap sandbox, which cannot create its network
+    # namespace on this host (bwrap: loopback: Failed RTM_NEWADDR — Ubuntu
+    # unprivileged-userns restriction), so every write in the run fails.
+    # Containment here is the isolated worktree + no-remote-access + PR gate,
+    # same trust level as athena-worker (--force --trust) and claude-worker
+    # (--dangerously-skip-permissions). Hadi-approved 2026-08-02 (option A).
+    cmd = ["codex", "exec", "--cd", str(worktree), "--sandbox", "danger-full-access"]
     if MODEL:
         cmd += ["-m", MODEL]
     cmd.append(brief)
