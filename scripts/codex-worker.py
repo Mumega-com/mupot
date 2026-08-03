@@ -229,17 +229,59 @@ def _cage_out(worktree: Path, short: str) -> Path:
     return cage
 
 
+class HostileCageOutput(RuntimeError):
+    """The cage returned something the driver must not process (symlink attack)."""
+
+
+# The cage runs untrusted model output; the driver is trusted and holds every
+# repo credential. A symlink crossing that boundary turns the driver into the
+# model's file-read primitive: the model writes `.lane-summary.md -> /home/
+# mumega/.fleet/agents/<token>`, rsync -a faithfully recreates the *link*, and
+# any driver-side read follows it straight out of the repo and into a pushed
+# commit body. The repo tracks zero symlinks (`git ls-tree -r main` mode 120000
+# == 0), so the driver refuses all of them rather than trying to classify safe
+# ones. The single exception is the root node_modules link the driver itself
+# creates for tsc/vitest — never something the cage can author, since
+# node_modules is excluded from the sync in both directions.
+_ALLOWED_LINKS = {"node_modules"}
+
+
+def _reject_symlinks(worktree: Path) -> None:
+    """Refuse any symlink the cage produced. Fail loud, never silently strip."""
+    offenders = []
+    for path in worktree.rglob("*"):
+        if not path.is_symlink():
+            continue
+        rel = path.relative_to(worktree)
+        if rel.parts and rel.parts[0] == ".git":
+            continue
+        if str(rel) in _ALLOWED_LINKS:
+            continue
+        offenders.append(f"{rel} -> {os.readlink(path)}")
+    if offenders:
+        raise HostileCageOutput(
+            "cage returned symlink(s); refusing to process the delivery: "
+            + "; ".join(sorted(offenders))
+        )
+
+
 def _cage_back(worktree: Path, short: str) -> None:
-    """Bring the model's edits back into the driver's worktree (driver commits)."""
+    """Bring the model's edits back into the driver's worktree (driver commits).
+
+    --safe-links drops links resolving outside the tree at the rsync boundary;
+    _reject_symlinks is the belt to that suspenders, catching in-tree links and
+    any rsync flag regression. Both run before the driver reads a single byte.
+    """
     cage = _cage_dir(short)
     subprocess.run(
-        ["sudo", "-n", "rsync", "-a", "--delete", "--exclude=.git",
+        ["sudo", "-n", "rsync", "-a", "--safe-links", "--delete", "--exclude=.git",
          "--exclude=node_modules", "--exclude=CONTEXT.md",
          f"{cage}/", f"{worktree}/"],
         check=True,
     )
     subprocess.run(["sudo", "-n", "chown", "-R", "mumega:mumega", str(worktree)], check=True)
     subprocess.run(["sudo", "-n", "rm", "-rf", str(cage)], check=False)
+    _reject_symlinks(worktree)
 
 
 def _write_cage_context(worktree: Path) -> None:
@@ -273,12 +315,37 @@ def codex_run(worktree: Path, brief: str, short: str) -> subprocess.CompletedPro
         _cage_back(worktree, short)
 
 
+# The commit body is the one place cage-authored text reaches a pushed artifact,
+# so it is read with O_NOFOLLOW: even if _reject_symlinks were bypassed or a
+# future edit reordered the calls, the read itself cannot traverse a link. The
+# cap bounds how much a hostile summary can smuggle into a commit message.
+MAX_SUMMARY_BYTES = 8192
+
+
+def _read_summary(summary_file: Path) -> str:
+    """Read the model's commit body without ever following a symlink."""
+    try:
+        fd = os.open(summary_file, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return ""
+    except OSError as exc:  # ELOOP == the path is a symlink; treat as hostile
+        raise HostileCageOutput(
+            f".lane-summary.md is a symlink (-> {os.readlink(summary_file)}); "
+            "refusing to read it into a commit body"
+        ) from exc
+    try:
+        with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read(MAX_SUMMARY_BYTES).strip()
+    except OSError:
+        return ""
+
+
 def verify(worktree: Path, branch: str) -> tuple[bool, str]:
     """The cage returns file edits, not commits: the driver stages and commits
     them (summary from .lane-summary.md), then verifies. No fake-green."""
     summary_file = worktree / ".lane-summary.md"
-    summary = summary_file.read_text().strip() if summary_file.exists() else ""
-    if summary_file.exists():
+    summary = _read_summary(summary_file)
+    if summary_file.is_symlink() or summary_file.exists():
         summary_file.unlink()
     ctx = worktree / "CONTEXT.md"
     if ctx.exists():
