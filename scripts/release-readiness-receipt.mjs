@@ -55,6 +55,7 @@ export const REQUIRED_PR_CHECKS = [
   'build',
   'plugin',
   'no-secrets',
+  'design-status-policy',
   'local-evidence',
   'CodeQL',
   'Analyze (actions)',
