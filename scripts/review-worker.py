@@ -652,12 +652,29 @@ def build_receipt(head_sha: str, verdict_obj: dict, sensitive: bool, sensitive_r
     return "\n".join(lines)
 
 
+REPORT_BODY_MAX_CHARS = 60_000
+
+
+def _cap_body(body: str) -> str:
+    """The mupot endpoint 413s oversized task_update bodies; a lost receipt means
+    the head never carries its review marker, so the same PR gets re-reviewed
+    (a full model run) every cycle. Keep the original statement head + newest
+    receipts tail."""
+    if len(body) <= REPORT_BODY_MAX_CHARS:
+        return body
+    return (
+        body[:4000]
+        + "\n\n... [task body truncated: server request cap; newest receipts kept below] ...\n\n"
+        + body[-(REPORT_BODY_MAX_CHARS - 4000):]
+    )
+
+
 def report_review(task: dict, head_sha: str, verdict_obj: dict, sensitive: bool, sensitive_reason: str, mode_note: str) -> None:
     receipt = build_receipt(head_sha, verdict_obj, sensitive, sensitive_reason, mode_note)
     body = f"{task.get('body', '')}\n\n---\n{receipt}"
     # Body-only update: this task is already in `review` and stays there in
     # review-only mode -- status is deliberately NOT touched here.
-    mcp("task_update", {"task_id": task["id"], "body": body})
+    mcp("task_update", {"task_id": task["id"], "body": _cap_body(body)})
 
 
 def notify_kasra(task: dict, pr_meta: dict, verdict_obj: dict, sensitive: bool, automerge_result: dict) -> None:
