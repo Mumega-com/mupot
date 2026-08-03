@@ -206,6 +206,16 @@ ghlInboundApp.post('/inbound', async (c) => {
   const title = `[GHL] ${eventType}${contact ? ` · ${contact}` : ''}`
 
   // createTask is the canonical creation path (bus event emitted, GitHub mirror optional).
+  // PR #659 P0 fix, widened (kasra-core parallel-audit finding): a GHL webhook payload is
+  // CRM-contact-authored, untrusted text — same class as Linear/GitHub-Projects/GitHub-issues.
+  // Already unassigned (no assignee_agent_id above), so externalSource is what closes the
+  // unassigned-auto-pickup hole (#404/#659) — without it this task was indistinguishable
+  // from a trusted local one.
+  //
+  // NOTE (flagged, not fixed in this PR — outside the requested scope): this call omits
+  // skipMirror, unlike every other external-ingest call site in this codebase (Linear,
+  // GitHub Projects, GitHub webhook, events/ingest.ts) — it currently mirrors this
+  // untrusted body out to a GitHub issue under our token. Worth a follow-up.
   await createTask(c.env, {
     squad_id: squadId,
     title,
@@ -213,7 +223,7 @@ ghlInboundApp.post('/inbound', async (c) => {
     // #142: GHL inbound webhook — predicate is the CRM contact receiving a reply.
     done_when: `GHL contact ${typeof event.contact_id === 'string' ? event.contact_id : 'replied'} processed`,
     status: 'open',
-  })
+  }, { externalSource: 'ghl-webhook' })
 
   // Outreach reply tracking: if this inbound maps to a known prospect, move it so the
   // outcome KPI (replied) reflects it and the loop stops re-contacting. Best-effort —

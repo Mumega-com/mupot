@@ -130,4 +130,48 @@ describe('createLinearBoardPort.syncIntoProject', () => {
       .first<{ assignee_agent_id: string | null }>()
     expect(row?.assignee_agent_id).toBeNull()
   })
+
+  // PR #659 P0 gate, Low finding: a no_squad-misconfigured binding (defaultSquadId
+  // unset) imported NOTHING but still stamped synced_at — a fresh "successful sync"
+  // receipt hiding the actual misconfiguration from an operator looking at the binding.
+  it('does NOT stamp synced_at when the binding is no_squad-misconfigured (nothing was imported)', async () => {
+    const { env, harness } = await makeEnv()
+    harness.sqlite.exec(
+      `INSERT INTO project_provider_bindings (project_id, provider, external_id, connector_id, meta_json)
+       VALUES ('proj-1', 'linear', 'ENG', 'connector-linear-1', '{}')`,
+    )
+    vi.stubGlobal('fetch', linearFetch([
+      { id: 'I1', identifier: 'ENG-1', title: 'Fix parser', url: null, state: { name: 'Todo' }, assignee: null },
+    ]))
+    const port = createLinearBoardPort(env)
+
+    const res = await port.syncIntoProject(binding({ meta_json: '{}' }), { project_id: 'proj-1', dryRun: false })
+    expect(res).toMatchObject({ ok: true, imported: 0 })
+
+    const row = await env.DB.prepare(
+      `SELECT synced_at FROM project_provider_bindings WHERE project_id = ?1 AND provider = 'linear'`,
+    ).bind('proj-1').first<{ synced_at: string | null }>()
+    expect(row?.synced_at).toBeNull() // no false "synced" receipt for a misconfigured binding
+  })
+
+  it('DOES stamp synced_at for a real (squad-configured) sync, including a zero-issue team', async () => {
+    const { env, harness } = await makeEnv()
+    harness.sqlite.exec(
+      `INSERT INTO project_provider_bindings (project_id, provider, external_id, connector_id, meta_json)
+       VALUES ('proj-1', 'linear', 'ENG', 'connector-linear-1', '{}')`,
+    )
+    vi.stubGlobal('fetch', linearFetch([])) // empty team — a legitimate "synced nothing" outcome
+    const port = createLinearBoardPort(env)
+
+    const res = await port.syncIntoProject(
+      binding({ meta_json: JSON.stringify({ defaultSquadId: 'squad-a' }) }),
+      { project_id: 'proj-1', dryRun: false },
+    )
+    expect(res).toMatchObject({ ok: true, imported: 0, skipped: 0 })
+
+    const row = await env.DB.prepare(
+      `SELECT synced_at FROM project_provider_bindings WHERE project_id = ?1 AND provider = 'linear'`,
+    ).bind('proj-1').first<{ synced_at: string | null }>()
+    expect(row?.synced_at).not.toBeNull() // a genuine empty-team sync IS a successful sync
+  })
 })

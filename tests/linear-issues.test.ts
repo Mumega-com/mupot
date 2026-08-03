@@ -21,7 +21,10 @@ import {
   parseLinearIssues,
   LINEAR_ISSUES_QUERY,
 } from '../src/integrations/linear-issues'
-import type { Env } from '../src/types'
+// PR #659 P0 fix: end-to-end property test drives the REAL execute path
+// (runTaskExecution -> canAgentExecuteTask) against a Linear-imported task.
+import { runTaskExecution } from '../src/agents/execute'
+import type { Env, ModelPort } from '../src/types'
 
 const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
 const MASTER_KEY = '11'.repeat(32)
@@ -120,6 +123,30 @@ describe('parseLinearIssues', () => {
   it('returns [] for an empty/odd response', () => {
     expect(parseLinearIssues({})).toEqual([])
     expect(parseLinearIssues({ teams: { nodes: [] } })).toEqual([])
+  })
+
+  // PR #659 P0 fix, finding #5: title was already capped at 200; identifier and url
+  // were `typeof string` only and landed UNCAPPED into task.body/done_when
+  // (importLinearIssues) — an attacker-controlled Linear field with no bound.
+  it('caps identifier at 100 chars and url at 500 chars', () => {
+    const longIdentifier = 'X'.repeat(500)
+    const longUrl = 'https://linear.app/' + 'y'.repeat(1000)
+    const items = parseLinearIssues({
+      teams: {
+        nodes: [{
+          id: 't1',
+          issues: {
+            nodes: [
+              { id: 'I1', identifier: longIdentifier, title: 'Fix parser', url: longUrl, state: { name: 'Todo' }, assignee: null },
+            ],
+          },
+        }],
+      },
+    })
+    expect(items[0].identifier.length).toBe(100)
+    expect(items[0].identifier).toBe(longIdentifier.slice(0, 100))
+    expect(items[0].url?.length).toBe(500)
+    expect(items[0].url).toBe(longUrl.slice(0, 500))
   })
 })
 
@@ -233,13 +260,18 @@ describe('importLinearIssues', () => {
     expect(res).toMatchObject({ ok: true, imported: 1, skipped: 0 })
     expect(res.items[0]).toEqual({ title: 'Fix parser', status: 'created' })
 
-    const row = await env.DB.prepare('SELECT squad_id, assignee_agent_id, status, github_issue_url FROM tasks WHERE title = ?1')
+    const row = await env.DB.prepare('SELECT squad_id, assignee_agent_id, status, github_issue_url, external_source FROM tasks WHERE title = ?1')
       .bind('Fix parser')
-      .first<{ squad_id: string; assignee_agent_id: string | null; status: string; github_issue_url: string | null }>()
+      .first<{ squad_id: string; assignee_agent_id: string | null; status: string; github_issue_url: string | null; external_source: string | null }>()
     expect(row?.squad_id).toBe('squad-a') // admin-configured routing, not agent-specific
     expect(row?.assignee_agent_id).toBeNull() // NEVER set from Linear data — the core guarantee
     expect(row?.status).toBe('open') // queued, not started
     expect(row?.github_issue_url).toBeNull() // skipMirror honored — no outbound GitHub write
+    // PR #659 P0 fix (migrations/0077): the structural marker every downstream trust
+    // decision (canAgentExecuteTask, routeUnassignedWork, the admin reassignment gate,
+    // the untrusted-content prompt fence) keys off. Bounded by the already-validated
+    // TEAM_KEY_RE team key.
+    expect(row?.external_source).toBe('linear:ENG')
   })
 
   it('dry-run reports without writing', async () => {
@@ -292,11 +324,21 @@ describe('importLinearIssues', () => {
   })
 })
 
-// ── structural source-text proof: the no-dispatch guarantee is load-bearing, not
-// incidental. If a future edit reintroduces an assignee-resolution mechanism or
-// drops skipEvent/skipMirror, this test fails even before any behavioral test does.
+// ── structural source-text proof: necessary, but NOT sufficient (PR #659 P0 fix) ────
+//
+// The diverse-model adversarial gate overturned a PASS on this exact section: the
+// 'creates tasks with skipEvent + skipMirror' test below pins the mechanism as a
+// source-code regex. It stays green FOREVER even in the vulnerable build, because
+// skipEvent/skipMirror only ever suppressed the EVENT wake — they say nothing about
+// the board's status-POLLING drivers (canAgentExecuteTask's unassigned-auto-pickup
+// branch, the concierge's routeUnassignedWork cron), which never looked at events and
+// (pre-migrations/0077) had no column to test at all. Kept below because it is still
+// TRUE and a legitimate regression guard for the event-wake mechanism specifically —
+// but it is no longer the load-bearing proof. That role now belongs to the property
+// tests in the next block, which exercise the REAL functions end-to-end and fail for
+// the right reason on da8be05.
 
-describe('structural no-agent-dispatch guarantee', () => {
+describe('structural no-agent-dispatch guarantee (necessary, not sufficient — see block below)', () => {
   const source = readFileSync(join(__dirname, '..', 'src', 'integrations', 'linear-issues.ts'), 'utf8')
 
   it('never resolves any Linear field to a mupot agent', () => {
@@ -304,7 +346,7 @@ describe('structural no-agent-dispatch guarantee', () => {
     expect(source).toContain('assignee_agent_id: null')
   })
 
-  it('creates tasks with skipEvent + skipMirror (no bus wake, no outbound mirror)', () => {
+  it('creates tasks with skipEvent + skipMirror (closes the EVENT wake only — see PR #659 P0 fix note above)', () => {
     expect(source).toMatch(/skipEvent:\s*true/)
     expect(source).toMatch(/skipMirror:\s*true/)
   })
@@ -313,5 +355,42 @@ describe('structural no-agent-dispatch guarantee', () => {
     // Checked against LINEAR_ISSUES_QUERY directly (not the whole file, which
     // legitimately discusses "mutation" in prose comments above).
     expect(LINEAR_ISSUES_QUERY).not.toMatch(/\bmutation\b/i)
+  })
+})
+
+// ── PR #659 P0 fix — property tests against the REAL end-to-end pipeline ───────────
+//
+// A Linear-origin task, created through the REAL importLinearIssues -> createTask path
+// against a REAL D1 harness (full migration chain, including 0077), must be REFUSED by
+// the REAL canAgentExecuteTask (exercised via runTaskExecution — canAgentExecuteTask
+// itself is not exported, same convention tests/execute.test.ts's #404 regression suite
+// uses for source_pot). This is the load-bearing proof the section above cannot be:
+// it fails on da8be05 because the task IS picked up and executed, not because a helper
+// is missing.
+
+describe('importLinearIssues -> canAgentExecuteTask — Linear-origin task cannot be auto-picked-up (PR #659 P0 fix)', () => {
+  it('a Linear-imported task is refused by canAgentExecuteTask for an unassigned squad agent', async () => {
+    const { env, connectorId, harness } = await makeHarness()
+    vi.stubGlobal('fetch', vi.fn(linearResponse([
+      { id: 'I1', identifier: 'ENG-1', title: 'Fix parser', url: null, state: { name: 'Todo' }, assignee: null },
+    ])))
+    const res = await importLinearIssues(env, { connectorId, teamKey: 'ENG', defaultSquadId: 'squad-a', projectId: 'proj-1' })
+    expect(res).toMatchObject({ ok: true, imported: 1 })
+
+    const row = await env.DB.prepare('SELECT id FROM tasks WHERE title = ?1').bind('Fix parser').first<{ id: string }>()
+    expect(row?.id).toBeTruthy()
+
+    const agent = harness.sqlite.prepare('SELECT id, squad_id, slug, name, role, model, status, created_at FROM agents WHERE id = ?')
+      .get('agent-kasra') as { id: string; squad_id: string; slug: string; name: string; role: string | null; model: string | null; status: string; created_at: string }
+
+    const model: ModelPort = { chat: vi.fn(async () => 'should never run') }
+    const r = await runTaskExecution(env, agent, row!.id, { model, emit: async () => {} })
+
+    // Same refusal shape #404's source_pot regression suite proves (tests/execute.test.ts):
+    // canAgentExecuteTask's unassigned branch returns false -> loadTaskById+canAgentExecuteTask
+    // combo reports task_not_found without ever reaching the model.
+    expect(r.ok).toBe(false)
+    expect(r.error).toBe('task_not_found')
+    expect(model.chat).not.toHaveBeenCalled()
   })
 })

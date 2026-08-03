@@ -60,7 +60,17 @@ export function createLinearBoardPort(env: Env): TaskBoardPort {
         projectId: binding.project_id,
       })
       if (!res.ok) return { ok: false, error: res.error ?? 'sync_failed' }
-      if (!opts.dryRun) await touchProjectBindingSync(env, binding.project_id, 'linear')
+      // PR #659 P0 gate, Low finding: importLinearIssues returns ok:true with imported:0
+      // when defaultSquadId is unset — every item reports 'no_squad' and NOTHING is
+      // written (see its file header). That is a correctly fail-closed IMPORT, but it is
+      // not a successful SYNC: touching synced_at here would tell an operator "this
+      // binding synced fine" while hiding the actual problem (no admin-configured squad).
+      // Only stamp synced_at when the import attempt actually resolved past that
+      // misconfiguration — i.e. not every reported item is 'no_squad'. An empty team
+      // (zero Linear issues, res.items.length === 0) is a real, successful sync of
+      // nothing and still gets the touch.
+      const isSquadMisconfigured = res.items.length > 0 && res.items.every((item) => item.status === 'no_squad')
+      if (!opts.dryRun && !isSquadMisconfigured) await touchProjectBindingSync(env, binding.project_id, 'linear')
       return {
         ok: true,
         imported: res.imported,

@@ -100,9 +100,13 @@ export function parseLinearIssues(data: unknown): LinearIssueItem[] {
     const assignee = (n.assignee as { name?: unknown } | undefined)?.name
     out.push({
       id,
-      identifier: typeof n.identifier === 'string' ? n.identifier : '(unknown)',
+      // Capped like title below (PR #659 P0 fix, diverse-model gate finding #5): these
+      // land uncapped into task.body/task.done_when (see importLinearIssues) — an
+      // unbounded Linear-controlled string there is the same class of problem title
+      // capping already closed, just on a different field.
+      identifier: typeof n.identifier === 'string' ? n.identifier.slice(0, 100) : '(unknown)',
       title: typeof n.title === 'string' ? n.title.slice(0, 200) : '(untitled)',
-      url: typeof n.url === 'string' ? n.url : null,
+      url: typeof n.url === 'string' ? n.url.slice(0, 500) : null,
       state: typeof state === 'string' ? state : null,
       assigneeHint: typeof assignee === 'string' ? assignee : null,
     })
@@ -231,6 +235,15 @@ export async function importLinearIssues(
             // for a Linear-origin task. No GitHub issue mirror of external text either.
             skipEvent: true,
             skipMirror: true,
+            // PR #659 P0 fix (diverse-model adversarial gate BLOCK): skipEvent/skipMirror
+            // only suppress the EVENT wake — they were never a marker a status-POLLING
+            // reader (canAgentExecuteTask's unassigned branch, the concierge's
+            // routeUnassignedWork cron) could see. This is the structural fix: every
+            // Linear-imported task now carries external_source (migrations/0077), the
+            // same NULL-vs-non-NULL trust boundary source_pot already established for
+            // cross-pot tasks. teamKey is bounded/validated by TEAM_KEY_RE (fetchLinearIssues)
+            // before this call, so the marker itself is bounded too.
+            externalSource: `linear:${params.teamKey}`,
           },
         )
       } catch {

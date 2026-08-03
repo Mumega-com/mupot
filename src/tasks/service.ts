@@ -218,6 +218,14 @@ export interface CreateTaskOptions {
   skipMirror?: boolean
   /** Internal atomic fence used by Routine dispatch before creating control work. */
   routineRunFence?: { runId: string; tenant: string }
+  // PR #659 P0 fix: provenance marker for a task written by a governed external
+  // integration (see Task.external_source, migrations/0077). Undefined/null on every
+  // normal create call -- only src/integrations/linear-issues.ts and the task_create
+  // MCP tool's carry-forward path (steward reissue) set this today. Monotonic-safe to
+  // expose broadly: it only ever ADDS restriction (no auto-pickup, admin-gated
+  // reassignment, untrusted-content prompt fence), never removes it, so a caller
+  // setting it on its own new task cannot escalate privilege.
+  externalSource?: string | null
 }
 
 export class TaskCreateFenceError extends Error {
@@ -775,6 +783,24 @@ export async function createTask(
   await validateTaskProjectAttribution(env, projectId, input.squad_id)
 
   const now = new Date().toISOString()
+  const externalSource = options.externalSource ?? null
+  // CHOKE-POINT FIX (PR #659 P0, widened per kasra-core's parallel-audit finding on
+  // src/integrations/github-projects.ts:239-251 — confirmed live on main): an
+  // external-origin task must NEVER be created pre-assigned. Before this guard,
+  // createTask happily accepted assignee_agent_id + an external marker together,
+  // which is exactly the shape github-projects.ts used to auto-assign a task (title
+  // sourced from an attacker-editable GitHub Project field) straight to a named agent
+  // AND emit task.created -> dispatchSquad -> execution, with ZERO gate: not the
+  // unassigned-auto-pickup check (#404/#659, N/A once assignee_agent_id is non-null
+  // at creation) and not the admin-gated reassignment check (tasks/index.ts,
+  // mcp/index.ts — those only fire on a LATER task_update/PATCH call, never on the
+  // original createTask). Forcing assignee_agent_id to null here whenever an external
+  // marker is present makes the ORIGINAL Linear invariant ("propose, never authorize")
+  // structural for every current AND FUTURE external-integration caller, not just the
+  // ones that happen to remember not to pass an assignee. An admin must still take the
+  // explicit, admin-gated task_update/PATCH step (already required for any
+  // source_pot/external_source-tagged task) before the task is assignable.
+  const assigneeAgentId = externalSource ? null : (input.assignee_agent_id ?? null)
   const task: Task = {
     id: options.id ?? crypto.randomUUID(),
     squad_id: input.squad_id,
@@ -783,19 +809,21 @@ export async function createTask(
     body: input.body ?? '',
     done_when: input.done_when.trim(),
     status: input.status ?? 'open',
-    assignee_agent_id: input.assignee_agent_id ?? null,
+    assignee_agent_id: assigneeAgentId,
     github_issue_url: null,
     result: null,
     completed_at: null,
     gate_owner: input.gate_owner ?? null,
     created_at: now,
     updated_at: now,
+    external_source: externalSource,
   }
 
   let taskInsert
   try {
     const fence = options.routineRunFence
-    const values = [
+    const baseColumns = 'id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at'
+    const baseValues = [
       task.id,
       task.squad_id,
       task.project_id,
@@ -811,10 +839,23 @@ export async function createTask(
       task.created_at,
       task.updated_at,
     ]
+    // external_source (migrations/0077) is appended CONDITIONALLY, only when actually set,
+    // rather than unconditionally on every INSERT. Two reasons: (1) it keeps the column
+    // list + bind-array position of every existing column stable for any caller/test that
+    // indexes into it positionally (same rationale a purely-additive column change should
+    // have anyway); (2) more importantly, it means the overwhelmingly common case — a
+    // local/trusted createTask call, externalSource unset — never references the column at
+    // all, so it stays compatible with hand-rolled/pinned-migration-subset test DB schemas
+    // (several exist in this repo) that predate 0077 and never needed to know about it.
+    // Only the small set of external-integration callers that actually pass externalSource
+    // require the column to exist in their DB.
+    const columns = externalSource !== null ? `${baseColumns}, external_source` : baseColumns
+    const placeholders = externalSource !== null ? '?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?' : '?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?'
+    const values = externalSource !== null ? [...baseValues, externalSource] : baseValues
     if (fence) {
       taskInsert = await env.DB.prepare(
-        `INSERT INTO tasks (id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at)
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        `INSERT INTO tasks (${columns})
+         SELECT ${placeholders}
           WHERE EXISTS (
             SELECT 1 FROM routine_runs rr
              WHERE rr.id = ? AND rr.tenant = ? AND rr.project_id = ?
@@ -828,8 +869,8 @@ export async function createTask(
       ).bind(...values, fence.runId, fence.tenant, task.project_id).run()
     } else {
       taskInsert = await env.DB.prepare(
-        `INSERT INTO tasks (id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO tasks (${columns})
+         VALUES (${placeholders})`,
       ).bind(...values).run()
     }
   } catch (error) {

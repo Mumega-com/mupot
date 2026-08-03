@@ -297,6 +297,15 @@ export interface Task {
   // (agent, dashboard, MCP client) that title/body originated from an external pot and should
   // be treated as untrusted content, not as a trusted local instruction. See migrations/0063.
   source_pot?: string | null
+  // PR #659 P0 fix: same trust invariant as source_pot (NULL = trusted local write),
+  // generalized for non-pot external integrations. Set to an opaque, integration-defined
+  // string (e.g. `linear:<teamKey>`) when the row was written by a governed external
+  // importer (src/integrations/linear-issues.ts) rather than a local/trusted caller. See
+  // migrations/0077. Checked everywhere source_pot is checked (canAgentExecuteTask,
+  // routeUnassignedWork, the admin-gated reassignment guard, the untrusted-content prompt
+  // fence) -- kept as a separate column rather than folded into source_pot because it is
+  // a different untrusted-writer class (no pot-to-pot signature involved).
+  external_source?: string | null
   created_at: string
   updated_at: string
 }

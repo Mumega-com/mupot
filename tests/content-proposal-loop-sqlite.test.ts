@@ -66,7 +66,8 @@ function createSchema(sqlite: SqliteD1Harness['sqlite']): void {
       done_when          TEXT NOT NULL DEFAULT '(backfill required)',
       execution_receipt_id TEXT,
       execution_claim_expires_at INTEGER,
-      source_pot         TEXT
+      source_pot         TEXT,
+      external_source    TEXT
     );
     CREATE TABLE task_verdicts (
       id TEXT PRIMARY KEY, task_id TEXT NOT NULL, verdict TEXT NOT NULL CHECK(verdict IN ('approved','rejected')),
