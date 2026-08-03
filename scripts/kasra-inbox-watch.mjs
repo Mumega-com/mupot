@@ -117,7 +117,20 @@ function deliverToTmux(text) {
   if (type.status !== 0) {
     return { ok: false, reason: 'tmux_send_failed', detail: type.stderr || type.error?.message }
   }
-  // Enter as a separate key so multiline bodies stay literal under -l.
+  // Let the target TUI finish ingesting the paste before Enter arrives.
+  //
+  // Claude Code tolerates Enter landing immediately; cursor-agent does NOT —
+  // Enter is swallowed mid-ingest and the message sits unsent in the input box,
+  // which looks exactly like successful delivery from this side (send-keys
+  // returns 0 for both) while the recipient never receives anything. Observed
+  // against the athena pane, 2026-08-03.
+  //
+  // Scales with payload: a long body takes longer to paste. Bounded so a huge
+  // message cannot stall the cycle.
+  const settleMs = Number(process.env.TMUX_ENTER_DELAY_MS ?? 0)
+    || Math.min(2500, 250 + Math.floor(text.length / 40))
+  spawnSync('sleep', [String(settleMs / 1000)])
+
   const enter = spawnSync('tmux', ['send-keys', '-t', TMUX_SESSION, 'Enter'], { encoding: 'utf8' })
   if (enter.status !== 0) {
     return { ok: false, reason: 'tmux_enter_failed', detail: enter.stderr || enter.error?.message }
