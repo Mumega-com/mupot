@@ -164,9 +164,14 @@ describe('C4 regression — member API key door', () => {
     expect(body.result.tools.map((t) => t.name)).toContain('task_create')
   })
 
-  it('POST /mcp — JSON-RPC tools/call requires auth', async () => {
+  it('POST /mcp — bearerless JSON-RPC tools/call returns an OAuth challenge', async () => {
     const res = await post(mcpApp, '/', { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'status', arguments: {} } }, {}, env)
-    expect(res.status).toBe(401)
+    expect(res.status).toBe(200)
+    const body = await res.json() as {
+      result: { isError: boolean; _meta: { 'mcp/www_authenticate': string[] } }
+    }
+    expect(body.result.isError).toBe(true)
+    expect(body.result._meta['mcp/www_authenticate'][0]).toContain('error="invalid_token"')
   })
 
   it('POST /mcp — JSON-RPC tools/call authenticated via member key', async () => {

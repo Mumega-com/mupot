@@ -47,6 +47,7 @@ import { radarApp } from './dashboard/radar-routes'
 import { orientApp } from './orient/routes'
 import { handleOAuthAuthorize, resolveExternalToken as memberKeyResolver } from './mcp/oauth-authorize'
 import { McpOAuthApiHandler } from './mcp/oauth-api-handler'
+import { AUTH_CONTEXT_HEADER } from './mcp/auth-header'
 import { brainPhysicsIngestApp } from './dashboard/brain-ingest'
 import { billingAdminApp } from './billing/admin'
 import { ccSpendApp } from './economy/cc-spend'
@@ -222,6 +223,40 @@ const oauthProvider = new OAuthProvider<Env>({
   },
 })
 
+// ChatGPT must discover MCP tool descriptors before it can start OAuth. The
+// OAuthProvider intentionally protects the configured apiRoute wholesale, so
+// public bootstrap requests need to reach mcpApp before that wrapper. Tool calls
+// remain protected: bearer calls still go through OAuthProvider, while a
+// bearerless call reaches mcpApp only to receive the standard MCP OAuth challenge.
+const PUBLIC_MCP_METHODS = new Set(['initialize', 'notifications/initialized', 'tools/list'])
+
+async function isPublicMcpBootstrap(request: Request): Promise<boolean> {
+  if (request.method !== 'POST') return false
+  const url = new URL(request.url)
+  if (url.pathname !== ROUTES.mcp && url.pathname !== `${ROUTES.mcp}/`) return false
+
+  const len = Number(request.headers.get('content-length') ?? '0')
+  if (Number.isFinite(len) && len > 64 * 1024) return false
+
+  try {
+    const body = await request.clone().json() as { method?: unknown }
+    if (typeof body.method !== 'string') return false
+    if (PUBLIC_MCP_METHODS.has(body.method)) return true
+    return body.method === 'tools/call' && !request.headers.has('authorization')
+  } catch {
+    return false
+  }
+}
+
+function withoutExternalAuthContext(request: Request): Request {
+  const headers = new Headers(request.headers)
+  // This header is trusted only on the OAuthProvider -> WorkerEntrypoint internal
+  // dispatch. Strip it on the public bootstrap lane so an external caller cannot
+  // forge the context while asking for a tool-level auth challenge.
+  headers.delete(AUTH_CONTEXT_HEADER)
+  return new Request(request, { headers })
+}
+
 // Queue consumer — the bus component owns the handler.
 import { handleQueue } from './bus/consumer'
 // Metabolism — the pot heartbeat that pulses goal-bearing work-units (#27 loop, made autonomous).
@@ -278,8 +313,12 @@ export default {
   // The OAuth provider is the outer entry point. It handles OAuth paths and
   // dispatches authenticated /mcp requests to McpOAuthApiHandler. Everything
   // else falls through to the root Hono app via defaultHandler.
-  fetch: (req: Request, env: Env, ctx: ExecutionContext) =>
-    oauthProvider.fetch(req, env, ctx),
+  fetch: async (req: Request, env: Env, ctx: ExecutionContext) => {
+    if (await isPublicMcpBootstrap(req)) {
+      return app.fetch(withoutExternalAuthContext(req), env, ctx)
+    }
+    return oauthProvider.fetch(req, env, ctx)
+  },
 
   // Queue delivery remains owned by the bus component.
   queue: handleQueue,

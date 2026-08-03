@@ -2777,11 +2777,19 @@ function rpcError(id: unknown, code: number, message: string, data?: unknown, st
   })
 }
 
+const MCP_OAUTH_SECURITY_SCHEMES = [
+  { type: 'oauth2', scopes: ['mcp:read', 'mcp:write'] },
+]
+
 function mcpTool(spec: ToolSpec): Record<string, unknown> {
   return {
     name: spec.name,
     description: `${spec.scope}; minimum capability: ${spec.min}. Args: ${spec.args}`,
     inputSchema: spec.inputSchema,
+    securitySchemes: MCP_OAUTH_SECURITY_SCHEMES,
+    // Backward-compatible mirror for hosts that still read tool security from
+    // descriptor _meta rather than the MCP top-level field.
+    _meta: { securitySchemes: MCP_OAUTH_SECURITY_SCHEMES },
   }
 }
 
@@ -2789,6 +2797,16 @@ function mcpCallResult(tool: string, result: unknown): Record<string, unknown> {
   return {
     content: [{ type: 'text', text: JSON.stringify({ ok: true, tool, result }) }],
     structuredContent: result,
+  }
+}
+
+function mcpAuthenticationRequired(origin: string): Record<string, unknown> {
+  const metadataUrl = `${origin}/.well-known/oauth-protected-resource`
+  const challenge = `Bearer resource_metadata="${metadataUrl}", error="invalid_token", error_description="Authentication required to use Mupot tools"`
+  return {
+    content: [{ type: 'text', text: 'Authentication required: no valid access token was provided.' }],
+    _meta: { 'mcp/www_authenticate': [challenge] },
+    isError: true,
   }
 }
 
@@ -2913,9 +2931,8 @@ async function handleJsonRpc(c: import('hono').Context<AppEnv>, body: JsonRpcReq
 
   if (method === 'tools/call') {
     const auth = await resolveAuth(c)
-    if (!auth || auth.tenant !== c.env.TENANT_SLUG) {
-      return rpcError(id, -32001, 'unauthenticated', undefined, 401)
-    }
+    if (!auth) return rpcResult(id, mcpAuthenticationRequired(new URL(c.req.url).origin))
+    if (auth.tenant !== c.env.TENANT_SLUG) return rpcError(id, -32003, 'forbidden', { reason: 'tenant_scope' }, 403)
 
     const params = typeof body.params === 'object' && body.params !== null ? body.params as Record<string, unknown> : {}
     const outcome = await invokeTool(auth, c.env, params.name, params.arguments, new URL(c.req.url).origin)

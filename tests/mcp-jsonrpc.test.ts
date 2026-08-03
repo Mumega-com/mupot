@@ -74,20 +74,47 @@ describe('mcp JSON-RPC compatibility', () => {
   it('lists MCP tools with JSON schemas without a bearer token', async () => {
     const res = await rpc('tools/list')
     expect(res.status).toBe(200)
-    const body = await res.json() as { result: { tools: { name: string; inputSchema: unknown }[] } }
+    const body = await res.json() as {
+      result: {
+        tools: {
+          name: string
+          inputSchema: unknown
+          securitySchemes: unknown[]
+          _meta: { securitySchemes: unknown[] }
+        }[]
+      }
+    }
     expect(body.result.tools.map((t) => t.name)).toContain('status')
     expect(body.result.tools.find((t) => t.name === 'task_create')?.inputSchema).toMatchObject({
       type: 'object',
       // #142 capsule keystone: done_when is now required alongside squad_id + title.
       required: ['squad_id', 'title', 'done_when'],
     })
+    expect(body.result.tools.find((t) => t.name === 'status')?.securitySchemes).toEqual([
+      { type: 'oauth2', scopes: ['mcp:read', 'mcp:write'] },
+    ])
+    expect(body.result.tools.find((t) => t.name === 'status')?._meta.securitySchemes).toEqual([
+      { type: 'oauth2', scopes: ['mcp:read', 'mcp:write'] },
+    ])
   })
 
-  it('requires bearer auth for JSON-RPC tools/call', async () => {
+  it('returns an MCP OAuth challenge for a bearerless JSON-RPC tools/call', async () => {
     const res = await rpc('tools/call', { name: 'status', arguments: {} })
-    expect(res.status).toBe(401)
-    const body = await res.json() as { error: { message: string } }
-    expect(body.error.message).toBe('unauthenticated')
+    expect(res.status).toBe(200)
+    const body = await res.json() as {
+      result: {
+        isError: boolean
+        content: { type: string; text: string }[]
+        _meta: { 'mcp/www_authenticate': string[] }
+      }
+    }
+    expect(body.result.isError).toBe(true)
+    expect(body.result.content[0]?.text).toContain('Authentication required')
+    expect(body.result._meta['mcp/www_authenticate'][0]).toContain(
+      'resource_metadata="https://pot.example/.well-known/oauth-protected-resource"',
+    )
+    expect(body.result._meta['mcp/www_authenticate'][0]).toContain('error="invalid_token"')
+    expect(body.result._meta['mcp/www_authenticate'][0]).toContain('error_description=')
   })
 
   it('calls an authenticated tool through JSON-RPC tools/call', async () => {
