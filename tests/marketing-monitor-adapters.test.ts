@@ -822,16 +822,18 @@ describe('MCPWP marketing adapter', () => {
 })
 
 describe('marketing adapter registry', () => {
-  it('registers exactly the four Task 6 adapters as run-scoped source factories', () => {
+  it('registers adapters for web_analytics and search_performance sources', () => {
     expect(MARKETING_MONITOR_ADAPTERS.map((record) => record.adapter)).toEqual([
       'first_party',
       'posthog',
+      'dataforseo',
       'inkwell',
       'mcpwp',
     ])
     expect(MARKETING_MONITOR_ADAPTERS.map((record) => record.create(RUN_ID))).toEqual([
       expect.objectContaining({ key: 'first_party', slot: 'web_analytics', read: expect.any(Function) }),
       expect.objectContaining({ key: 'posthog', slot: 'web_analytics', read: expect.any(Function) }),
+      expect.objectContaining({ key: 'dataforseo', slot: 'search_performance', read: expect.any(Function) }),
       expect.objectContaining({ key: 'inkwell', slot: 'content_surface', read: expect.any(Function) }),
       expect.objectContaining({ key: 'mcpwp', slot: 'content_surface', read: expect.any(Function) }),
     ])
