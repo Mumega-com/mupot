@@ -156,10 +156,10 @@ Each later phase must repeat its mapped gate against the implemented runtime bef
 | Tenant token isolation | `phase0-tenant-token-isolation` | Approved non-mutating endpoint in the real pilot account | Pilot account-owned token succeeds only on the pilot account and returns `403` for the same endpoint against central account `e39eaf94...` and a second tenant-owned account | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/tenant-token-isolation.json` |
 | Account-scope blast radius | `phase0-account-scope-blast-radius` | Pilot account resource inventory plus cross-account negatives | Pilot account is dedicated to Mupot-managed resources; account-scoped write reaches no central/second-tenant account, and no shared-workload account is accepted without a separate risk gate | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/account-scope-blast-radius.json` |
 | Compromised tenant Worker isolation | `phase0-compromised-worker-admin-deny` | Fixture workload plus an approved non-mutating central endpoint | Workload has no central credential and its pilot token receives `401`/`403` from the central endpoint | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/compromised-worker-admin-deny.json` |
-| Health target SSRF resistance | `phase0-health-target-ssrf-deny` | URL-policy module with mocked DNS, redirects, and fetch | Loopback, link-local, private, redirect-to-private, non-HTTPS, and unregistered hosts are rejected before a network request | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/health-target-ssrf-deny.json` |
+| Health target SSRF resistance | `phase0-health-target-ssrf-deny` | URL-policy module with mocked DNS, redirects, and fetch | Loopback, link-local, private, redirect-to-private, non-HTTPS, and unregistered hosts are rejected; every redirect is revalidated and the actual connect address must equal a currently approved public resolution | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/health-target-ssrf-deny.json` |
 | Stale generation fencing | `phase0-stale-generation-cas-deny` | Pure generation/CAS state-machine model | A lower or replayed generation cannot overwrite a newer desired/observed generation | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/stale-generation-cas-deny.json` |
 | Immediate revocation | `phase0-revoked-token-immediate-stop` | Revoked pilot token plus cache/reconciliation model | The next Cloudflare request is denied and the model accepts no later reconciliation from the cached credential | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/revoked-token-immediate-stop.json` |
-| Manual rotation readiness | `phase0-token-expiry-rotation-runbook` | Deterministic alarm clock plus tenant-run rotation rehearsal | Each carrier's own Section 5 alarm schedule fires; a tenant Super Administrator can replace/validate/revoke observe or deploy tokens without Mupot token-management permission; JIT expires without renewal; every missed action fails closed | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/token-expiry-rotation-runbook.json` |
+| Manual rotation and release revocation | `phase0-token-expiry-rotation-runbook` | Deterministic alarm clock plus tenant-run rotation/release rehearsal | Each carrier's Section 5 schedule fires; a tenant Super Administrator can replace/validate/revoke without Mupot token-management permission; deploy token revokes with a receipt immediately when its release ends; support JIT expires without renewal; every missed action fails closed | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/token-expiry-rotation-runbook.json` |
 | Zero credentials in registry | `phase0-registry-zero-credentials` | Candidate schema, serializer, log/export fixtures, and backup fixture | Every fixture contains secret references only and rejects token-shaped material; Phase 1 repeats this against its real store before activation | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/registry-zero-credentials.json` |
 | No token-minting root / exact runtime-token capability set | `phase0-no-token-mint-permission` | Pilot token-read response versus the separately reviewed dated ID manifest | Each carrier's resolved ID set equals that manifest exactly; every missing, extra, unknown, renamed, or token-management group is a BLOCK | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/no-token-mint-permission.json` |
 | Deploy-write implied read exposure | `phase0-deploy-adapter-no-read-operations` | Deploy-adapter policy model, D1 migration fixtures, and simulated API audit log | Policy permits only reviewed release mutations, denies read endpoints/source retrieval and non-migration SQL, and records that stolen-token read exposure remains a bounded residual risk | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/deploy-adapter-no-read-operations.json` |
@@ -205,9 +205,10 @@ are reviewed in this ADR.
   attestor boundary separate from the managed workload, deploy account, and deploy runner; the
   workload cannot invoke the signer or read its key. Central intent/receipt keys remain outside
   tenant runtime. A signature proves origin, not truth, so an independent verifier periodically
-  compares attestation to authoritative Cloudflare state with a tenant-approved product-specific
-  JIT read. The verifier resolves a trusted public key by the signed tenant + purpose + `key_id`
-  tuple before parsing action data.
+  compares attestation to authoritative Cloudflare state with a tenant-approved, product-specific,
+  60-minute `observe-read` verification token available from Phase 1. This verification carrier is
+  not Phase 4 support access. The verifier resolves a trusted public key by the signed tenant +
+  purpose + `key_id` tuple before parsing action data.
 - The algorithm allowlist is explicit and contains no `none` mode or algorithm fallback. Signer,
   tenant, purpose, generation, and payload digest are all covered by the signature.
 - Rotation uses bounded current/next overlap and records an activation + retirement receipt.
@@ -220,12 +221,13 @@ Controls that become executable after Phase 0 retain named future gates:
 |---|---|---|
 | Confused deputy | Phase 2 | `phase2-tenant-account-secretref-binding` |
 | Spoofed telemetry | Phase 3 | `phase3-telemetry-signature-replay-deny` |
-| False signed telemetry | Phase 3 | `phase3-attestor-workload-separation-and-authoritative-reconcile` |
+| False signed telemetry | Phase 1 | `phase1-attestor-workload-separation-and-authoritative-reconcile` |
 | Telemetry content poisoning | Phase 3 | `phase3-telemetry-untrusted-content` |
 | Audit-chain integrity | Phase 1 | `phase1-control-receipt-chain-integrity` |
 | Build artifact drift | Phase 2 | `phase2-signed-artifact-digest-fence` |
 | Callback tampering | Phase 3 | `phase3-callback-signature-replay-deny` |
 | Central compromise | Phase 1 | `phase1-registry-zero-deploy-capability` |
+| SSRF connect-address/redirect revalidation | Phase 1 | `phase1-health-target-ssrf-connect-address-deny` |
 | Deploy-write implied read | Phase 2 | `phase2-deploy-adapter-no-read-operations` |
 | Runner compromise | Phase 2 | `phase2-runner-per-tenant-secretref-isolation` |
 | Secret-store compromise | Phase 2 | `phase2-secret-store-no-bulk-enumeration` |
@@ -251,17 +253,20 @@ Mupot policy for all rows:
   a zone binding.
 - Carry read and write grants in separate tokens: `observe-read` never receives a Write/Edit
   group; `deploy-write` never receives Logs/Tail access; `break-glass/JIT-support` is separately
-  tenant-approved. Each JIT token carries only the one approved product/operation needed for that
-  support window, never the union of the JIT rows.
+  tenant-approved. `observe-read` has a 30-day standing route-metadata profile and a separate
+  60-minute product-specific authoritative-verification profile; neither token may carry the union
+  of matrix rows. Each support token likewise carries only the one approved product/operation.
 - Set `expires_on` as an absolute UTC timestamp. Local maximum lifetime is 30 days for narrowly
   scoped metadata-only `observe-read`, 24 hours for `deploy-write`, and 60 minutes for
-  `break-glass/JIT-support`. Mupot alarms `observe-read` at 14, 7, 3, and 1 day; alarms
-  `deploy-write` at 6 and 1 hour; and warns `break-glass/JIT-support` at 15 minutes plus expiry.
+  `break-glass/JIT-support`. Mupot alarms 30-day `observe-read` at 14, 7, 3, and 1 day; warns
+  60-minute verification `observe-read` and `break-glass/JIT-support` at 15 minutes plus expiry;
+  and alarms `deploy-write` at 6 and 1 hour.
   The tenant's own Super Administrator manually creates any replacement, validates it, and revokes
   the superseded token with a receipt. `deploy-write` is issued for one approved release window and
-  JIT is never renewed in place. Expiry fails closed. This manual tenant operation is an accepted
-  sovereignty cost, not permission to add a broker, and a monthly revocation drill remains
-  mandatory.
+  must be revoked with a receipt immediately when that release completes; 24 hours is only the hard
+  expiry backstop. Verification/support tokens are never renewed in place. Expiry fails closed.
+  This manual tenant operation is an accepted sovereignty cost, not permission to add a broker,
+  and a monthly revocation drill remains mandatory.
 - Store only token secret references plus the permission-group IDs, exact resource IDs,
   `issued_on`, `expires_on`, and revocation receipt ID in the central registry.
 
@@ -283,10 +288,10 @@ Section 4.2 gate bound rather than eliminate the residual risk.
 
 | Product / operation | Expected read label | Expected write label | Cloudflare resource boundary | `expires_on` maximum | Capability carrier |
 |---|---|---|---|---|---|
-| Workers scripts, Durable Objects, and Workflows | `Workers Scripts Read` | `Workers Scripts Write` | Dedicated tenant account; all product resources in that account | read: 60m; write: 24h | read: `break-glass/JIT-support`; write: `deploy-write` |
-| D1 | `D1 Read` | `D1 Write` | Dedicated tenant account; all D1 databases in that account | read: 60m; write: 24h | read: `break-glass/JIT-support`; write: `deploy-write` |
-| Queues | `Queues Read` | `Queues Write` | Dedicated tenant account; all queues in that account | read: 60m; write: 24h | read: `break-glass/JIT-support`; write: `deploy-write` |
-| Workers KV | `Workers KV Storage Read` | `Workers KV Storage Write` | Dedicated tenant account; all KV namespaces in that account | read: 60m; write: 24h | read: `break-glass/JIT-support`; write: `deploy-write` |
+| Workers scripts, Durable Objects, and Workflows | `Workers Scripts Read` | `Workers Scripts Write` | Dedicated tenant account; all product resources in that account | read: 60m; write: 24h | read: product-specific `observe-read` verification; write: `deploy-write` |
+| D1 | `D1 Read` | `D1 Write` | Dedicated tenant account; all D1 databases in that account | read: 60m; write: 24h | read: product-specific `observe-read` verification; write: `deploy-write` |
+| Queues | `Queues Read` | `Queues Write` | Dedicated tenant account; all queues in that account | read: 60m; write: 24h | read: product-specific `observe-read` verification; write: `deploy-write` |
+| Workers KV | `Workers KV Storage Read` | `Workers KV Storage Write` | Dedicated tenant account; all KV namespaces in that account | read: 60m; write: 24h | read: product-specific `observe-read` verification; write: `deploy-write` |
 | R2 (deferred until exact bucket scope is proven) | `Workers R2 Storage Read` | `Workers R2 Storage Write` | Exact tenant bucket resource; no account-wide fallback | none in Phase 0 | no carrier until binding proof updates this ADR |
 | Worker routes | `Workers Routes Read` | `Workers Routes Write` | Exact tenant zone ID | read: 30d; write: 24h | metadata read: `observe-read`; write: `deploy-write` |
 | Live Worker tail | `Workers Tail Read` | none | Exact tenant account ID | 60m | `break-glass/JIT-support` only |
@@ -298,21 +303,24 @@ token expiry is not a teardown mechanism and must never be presented as one.
 
 Routine health/drift comes from minimized attestation signed by the separate tenant attestor, with
 periodic authoritative Cloudflare-side reconciliation by an independent verifier using a
-tenant-approved product-specific JIT read. The managed workload and deploy runner cannot access the
-attestation signer. `observe-read` is limited here to non-content route metadata and must not contain
+tenant-approved product-specific 60-minute `observe-read` verification token. This control is part
+of Phase 1 health/drift, not Phase 4 support. The managed workload and deploy runner cannot access
+the attestation signer. Standing `observe-read` is limited to non-content route metadata and must
+not contain
 `Workers Scripts Read`, `D1 Read`, `Queues Read`, `Workers KV Storage Read`, `Logs Read`, or
 `Workers Tail Read`; those groups can expose source, product state, tenant business data, or runtime
-content and are absent from standing **read** carriers. Direct support/verification reads remain
-JIT. The separate `deploy-write` residual above is explicitly accepted and controlled rather than
-misrepresented as JIT-only. The exact-permission test in Section 4.2 treats any unapproved standing
-grant as a BLOCK.
+content and are absent from standing **read** carriers. Authoritative verification uses one
+product-specific 60-minute `observe-read`; interactive support reads remain Phase 4 JIT. The
+separate `deploy-write` residual above is explicitly accepted and controlled rather than
+misrepresented as support access. The exact-permission test in Section 4.2 treats any unapproved
+standing grant as a BLOCK.
 
 Durable Objects and Workflows intentionally have no standalone matrix rows: Cloudflare's Durable
 Objects namespace API accepts `Workers Scripts Read` / `Workers Scripts Write`, and the Workflows
 API accepts `Workers Scripts Read` / `Workers Scripts Write` (plus `Workers Tail Read` for
-applicable reads). Both groups remain 60-minute tenant-approved JIT for read operations; routine
-health/drift uses signed attestation. Durable Objects and Workflows therefore remain folded into
-the Workers Scripts permission boundary without silently widening `observe-read`.
+applicable reads). Authoritative verification may use a product-specific 60-minute `observe-read`;
+interactive support remains Phase 4 JIT. Durable Objects and Workflows therefore remain folded into
+the Workers Scripts permission boundary without creating a standing broad read token.
 Before minting, the implementation must reconcile the current API-returned group name/ID. If the
 live permission-group list disagrees with this table, fail closed and update this ADR through a
 reviewed PR; do not broaden the token.
@@ -365,7 +373,8 @@ all of the following hold at one immutable tested commit:
 
 - **Phase 0** - closes only under the predicate above; ADR + threat model + matrix alone are not
   completion.
-- **Phase 1** - read-only registry + signed attestation + health/drift; starts only after Phase 0
+- **Phase 1** - read-only registry + signed attestation + health/drift, including periodic
+  product-specific 60-minute `observe-read` authoritative verification; starts only after Phase 0
   closes.
 - **Phase 2** - idempotent fenced reconciler; no dashboard shell-out.
 - **Phase 3** - minimized push telemetry.
