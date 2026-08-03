@@ -18,6 +18,9 @@ TENANT_SLUG = "mumega"          # your org slug
                                  # customer/forked deployment (src/types.ts Env, #473).
 BRAND = "Mumega"                   # dashboard brand
 OAUTH_PROVIDER = "google"         # google | telegram
+# Required for Project Routine dispatch; scheduled work has no request Host to derive safely.
+# Set this to the canonical public origin of this pot before enabling a Routine.
+# PUBLIC_ORIGIN = "https://mupot.example.com"
 FLEET_PROJECT = "sos"             # pot fleet label (legacy name; CF-native messaging, not SOS Redis — ADR #473)
 FLEET_OPS_AGENT = "kasra"         # ops agent that receives control asks via agent_messages (explicit — resolvers fail closed, no code default)
 # secrets (NOT here): OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET, GITHUB_TOKEN, AI_GATEWAY_TOKEN.
@@ -104,9 +107,10 @@ name = "mupot-task-workflow"
 binding = "TASK_WORKFLOW"
 class_name = "TaskWorkflow"
 
-# membership sync: reconcile channel membership → squad capabilities every 15 min
+# Project Routines and maintenance use separate triggers so their D1/subrequest
+# budgets cannot combine in one invocation. Maintenance jobs remain staggered.
 [triggers]
-crons = ["*/15 * * * *"]
+crons = ["* * * * *", "0-9,15-24,30-39,45-54 * * * *"]
 
 # ── GHL act-channel secrets (issue #8) ──
 # These are secrets — do NOT add them under [vars]. Set via wrangler secret put:

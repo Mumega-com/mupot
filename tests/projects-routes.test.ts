@@ -19,9 +19,16 @@ const { projectsApp } = await import('../src/projects')
 
 const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
 
-function makeHarness(): SqliteD1Harness {
+function makeHarness(options: { includeRoutineMigrations?: boolean } = {}): SqliteD1Harness {
+  const includeRoutineMigrations = options.includeRoutineMigrations !== false
   const harness = createSqliteD1()
   for (const file of readdirSync(MIGRATIONS_DIR).filter((name) => name.endsWith('.sql')).sort()) {
+    if (
+      !includeRoutineMigrations
+      && (file.startsWith('0073_') || file.startsWith('0074_'))
+    ) {
+      continue
+    }
     harness.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
   }
   harness.sqlite.exec(`
@@ -138,6 +145,33 @@ describe('projectsApp', () => {
     bindBudget = undefined
     harness?.close()
     harness = undefined
+  })
+
+  it('keeps ordinary Project REST reads healthy when migration 0073 tables are absent', async () => {
+    harness = makeHarness({ includeRoutineMigrations: false })
+    seedProjects(harness)
+    as(actor({
+      memberId: 'member-a',
+      capabilities: [{ member_id: 'member-a', scope_type: 'department', scope_id: 'dept-a', capability: 'observer' }],
+    }))
+
+    const detail = await fetch(harness, '/visible-child')
+    expect(detail.status).toBe(200)
+    await expect(detail.json()).resolves.toMatchObject({
+      project: { id: 'visible-child' },
+      situation: {
+        health: 'active',
+        routines: {
+          enabled_count: 0,
+          paused_count: 0,
+          next: null,
+          active_run: null,
+          latest_terminal_run: null,
+        },
+        active_work_count: 1,
+        next_action: { type: 'start_task', task: { id: 'visible-task' } },
+      },
+    })
   })
 
   it('rejects unauthenticated and cross-tenant requests before project access', async () => {

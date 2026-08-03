@@ -85,6 +85,8 @@ import { ADDON_TOOLS } from './addons'
 import { GATE_GRANT_TOOLS } from './gates'
 import { LOOP_TOOLS } from './loops'
 import { PRESENCE_TOOLS } from './presence'
+import { WORKFLOW_CIRCUIT_TOOLS } from './workflow-circuits'
+import { ROUTINE_TOOLS } from './routines'
 import { dispatchFlight } from '../flight/dispatch'
 import {
   deliverFlightLandedEvent,
@@ -906,7 +908,15 @@ const toolTaskUpdate: ToolSpec = {
     }
     if (args.gate_owner !== undefined) {
       const lockStatuses: ReadonlySet<TaskStatus> = new Set(['review', 'approved', 'rejected', 'done'])
-      if (lockStatuses.has(existing.status)) return fail(409, 'gate_owner_locked', { status: existing.status })
+      const repairsHistoricalUngatedReview =
+        existing.status === 'review' &&
+        existing.gate_owner === null &&
+        typeof args.gate_owner === 'string' &&
+        args.gate_owner.trim().length > 0 &&
+        hasWorkspaceAdmin(auth)
+      if (lockStatuses.has(existing.status) && !repairsHistoricalUngatedReview) {
+        return fail(409, 'gate_owner_locked', { status: existing.status })
+      }
       if (args.gate_owner === null) {
         next.gate_owner = null
       } else if (typeof args.gate_owner === 'string' && args.gate_owner.trim().length > 0) {
@@ -2737,6 +2747,8 @@ export const TOOLS: ToolSpec[] = [
   ...GATE_GRANT_TOOLS,
   ...LOOP_TOOLS,
   ...PRESENCE_TOOLS,
+  ...WORKFLOW_CIRCUIT_TOOLS,
+  ...ROUTINE_TOOLS,
 ]
 
 const TOOL_BY_NAME = new Map<string, ToolSpec>(TOOLS.map((t) => [t.name, t]))

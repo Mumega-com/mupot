@@ -19,6 +19,45 @@ block collapses into a changelog entry when it ships.
   `docs/fleet/goose-non-adoption-2026-07-22.md`; attach allow-list stays without
   `goose`/`goosed`. Technical basis reused from PR #483 / `b8070e2`.
 
+## [0.25.0] — 2026-07-27
+
+**Project Routines and Needs You.** Active Projects can schedule governed work through
+existing external agent runtimes, retain durable run state and evidence, and surface
+human decisions in one queue without turning Mupot into an agent harness.
+
+### Added
+
+- Project-owned Routines and Routine Runs with manual, once, and cron schedules,
+  timezone-aware occurrences, overlap policies, bounded retries, leases, cancellation,
+  cost snapshots, and immutable lifecycle events (#579).
+- A shared Needs You projection for Routine waits, task reviews, blocked work, and
+  budget decisions across dashboard, REST, MCP, and Project Situation views (#579).
+- Local lifecycle evidence that exercises a complete Routine through Task, Flight,
+  external runtime dispatch, approval, replay, cancellation, and receipt paths (#579).
+
+### Changed
+
+- Routine scheduling uses isolated one-minute and staggered maintenance cron triggers
+  so Cloudflare invocation budgets do not silently drop project work (#579, #582).
+- Historical review tasks created without a gate owner can be repaired by an owner or
+  admin through either REST or MCP; ordinary members cannot rewrite locked gates (#343).
+- Compiled native addons retain their digest-bound v0.24 lifecycle identity across the
+  additive v0.25 host minor; external addon compatibility remains strict.
+- Console consolidation remains planned for v0.26 under #584. It is not claimed as a
+  v0.25 feature.
+
+### Security
+
+- Project, squad, tenant, and capability checks are reapplied at each scheduling,
+  claim, dispatch, cancellation, approval, and projection boundary.
+- Mupot stores governance state and evidence while Hermes, Codex, Claude Code, and
+  other external runtimes remain replaceable executors.
+
+### Verified
+
+- Exact-head CI, independent review, migration compatibility, browser evidence, REST
+  and MCP parity, no-secrets scanning, and the full test suite gate this release.
+
 ## [0.24.0] — 2026-07-19
 
 **Project Operations.** Projects with squad-scoped RBAC, cross-pot collaboration via the

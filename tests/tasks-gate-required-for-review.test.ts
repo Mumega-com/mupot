@@ -118,4 +118,23 @@ describe('PATCH /:id — gate-required-for-review guard', () => {
     const json = (await res.json()) as { error: string }
     expect(json.error).toBe('gate_required_for_review')
   })
+
+  it('lets an owner repair a historical review task with no gate_owner', async () => {
+    const { env, updates } = makeEnv({
+      ...inProgressUngated,
+      status: 'review',
+      gate_owner: null,
+    })
+
+    const res = await tasksApp.fetch(
+      patch({ gate_owner: 'gate:content' }),
+      env,
+    )
+
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { task: Task }
+    expect(body.task.status).toBe('review')
+    expect(body.task.gate_owner).toBe('gate:content')
+    expect(updates.some(({ sql }) => sql.includes('UPDATE tasks'))).toBe(true)
+  })
 })

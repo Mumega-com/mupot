@@ -20,6 +20,8 @@ jobs:
         run: npm audit --audit-level=high
       - name: Typecheck
         run: npm run typecheck
+      - name: Install Playwright browser for integration tests
+        run: npx playwright install --with-deps chromium
       - name: Test
         run: npm test
       - name: Fleet runtime tests
@@ -71,6 +73,7 @@ jobs:
             tmp/local-evidence
             tmp/local-smoke
             tmp/local-runtime-conformance
+            tmp/local-project-routine
 
   no-secrets:
     runs-on: ubuntu-latest
@@ -81,3 +84,13 @@ jobs:
           node-version: 22
       - name: Guard — no secrets in this public template
         run: node scripts/no-secrets.mjs
+
+  design-status-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Guard — design status only in design-only contracts
+        run: node scripts/design-status-contract-policy.mjs

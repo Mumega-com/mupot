@@ -350,6 +350,7 @@ export interface FleetAgentIdentity {
 }
 
 export interface FleetAgentRuntimeState {
+  agent_id: string
   runtime: string
   status: string
   presence: Presence
@@ -420,6 +421,7 @@ export async function getFleetAgentRuntimeStates(
     const status = String(row.status ?? 'unknown')
     const lastSeen = String(row.last_reported_at ?? '')
     resolved.set(agent.agent_id, {
+      agent_id: row.agent_id,
       runtime: String(row.runtime ?? ''),
       status,
       presence: derivePresence(status, lastSeen, ttlSec, nowMs),
