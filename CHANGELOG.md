@@ -1,5 +1,27 @@
 # Changelog
 
+## 2026-08-02/03 — the weekend the loop became real
+
+- 4-technician operator loop shipped (#623/#624/#630/#644): tech-grok (minted
+  identity, 30d TTL), claude lane (haiku), mumcp, review gate; codex lane built
+  then PAUSED by its own security audit pending the cage predicate (#645 BLOCK).
+- design-status gate: 4 adversarial rounds → merged #640, now a REQUIRED check
+  (branch protection enabled). Gate caught kasra twice, athena twice, itself once.
+- Federated Control Plane Phase 0 ADR merged (452f11db) after adversarial BLOCK
+  found a deleted-constraints "restore" + 7 codex remediation rounds. Phase 1 open.
+- FLIGHT 00b2ef4b launched (GEO scanner, mupot#574): first real flight — codex
+  builds, athena review-first, mubot announces to Telegram via hermes send.
+- Verdict delegation proven: athena fired 4 verdicts under granted gate:kasra-core.
+- steward-worker added: auto-reissue of infra-blocked/orphaned tasks + Telegram
+  digest — the board now repairs itself.
+- Identity/comms healed: kasra SOS token reminted (was hash-only, raw lost since
+  June), exposed mumega token rotated dead, wake-storm fixed (7,103 warnings/14d),
+  OpenClaw dead routes removed, athena hooks fixed, all channels probe-verified.
+- Brain rot cleaned: organ-daemon retired (10/10 organisms were healthy daemons
+  killed by a batch timeout — dead-since-refactor), duplicate wakes removed,
+  "Gemma free" doc myth corrected; Mirror 501 no-op consolidation filed (#596).
+- Roster enforced (Hadi): tmux kasra/codex/athena/river; mubot sole gateway.
+
 All notable changes to mupot. Semver; pre-1.0 minor bumps may break.
 
 **What ships next:** see [ROADMAP.md](ROADMAP.md). The roadmap (planned, by version) and
