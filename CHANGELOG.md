@@ -21,6 +21,14 @@
   killed by a batch timeout — dead-since-refactor), duplicate wakes removed,
   "Gemma free" doc myth corrected; Mirror 501 no-op consolidation filed (#596).
 - Roster enforced (Hadi): tmux kasra/codex/athena/river; mubot sole gateway.
+- FIRST LIVE GEO SCANS (2026-08-03 ~05:15Z): 3/3 grounded queries ok, visibility
+  events emitted to PostHog — the DME trend clock started. En-route fixes:
+  PR #647 token-file Vertex auth fallback (merged), profile google_project_id
+  corrected mumegaproject→mumega-com (403 root cause), ADC-minted token
+  (gcloud CLI refresh broken). Residual: mupot receipt sink 404 + daily
+  cadence timer + profile upstream — task b6addee4 (mumega-com#601, codex).
+- Mission board live: mupot project goal field carries CURRENT/NEXT mission,
+  served in every agent's boot_context; squad broadcast sent.
 
 All notable changes to mupot. Semver; pre-1.0 minor bumps may break.
 

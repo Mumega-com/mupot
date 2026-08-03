@@ -34,7 +34,7 @@ sole Hermes gateway. Lanes = ephemeral processes: tech-grok (build), claude lane
 (haiku — docs/specs), mumcp (WordPress), codex lane (PAUSED pending #645 cage
 predicate), review (cross-vendor gate), steward (self-repair). One codex: 1eb0e718.
 
-**Workstreams:** W1 revenue — FLIGHT 00b2ef4b GEO scanner (#574) then viamar/digid
+**Workstreams:** W1 revenue — FLIGHT 00b2ef4b GEO scanner (#574): merged 49783032, FIRST LIVE SCANS OK 2026-08-03 (3/3, PostHog events); remaining = cadence timer + receipt-sink 404 + profile upstream (task b6addee4) then flight_land; next viamar/digid
 baselines + DME operational flight (e1a02d39; code already in main). W2 caged
 lanes — implement codex's acceptance predicate (#645), then Spark unpause + Hermes/
 V4-Flash lane via iron-proxy. W3 self-perpetuation — steward round 2 (dead-man
