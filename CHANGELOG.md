@@ -19,6 +19,12 @@ block collapses into a changelog entry when it ships.
 - `PresenceChannelDO.webSocketClose` sanitizes reserved/abnormal close codes
   (1005/1006/1015 → 1000) before calling `ws.close()`, avoiding RangeError in the
   hibernation close handler.
+- Presence live sockets revalidate the connect-time member token hash + project
+  read access before each roster disclosure, and close with `4001` on revoke /
+  deactivate / lost grant (mupot#545).
+- `PresenceChannelDO` schedules a Durable Object alarm at the earliest heartbeat
+  expiry so subscribers receive offline transitions without client-side sync
+  (mupot#545).
 
 ### Changed
 

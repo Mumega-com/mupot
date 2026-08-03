@@ -26,7 +26,7 @@
 
 import { Hono } from 'hono'
 import type { Env, AuthContext } from '../types'
-import { bearerToken, resolveMemberByToken } from '../auth/member-bearer'
+import { bearerToken, hashMemberToken, resolveMemberByToken } from '../auth/member-bearer'
 import { resolveCapabilities, hasCapability } from '../auth/capability'
 import { readAccess, readableProject } from '../mcp/projects'
 import { listPresence } from './service'
@@ -42,11 +42,13 @@ async function authorizePresenceRead(
   authorizationHeader: string | undefined,
   projectQuery: string | undefined,
 ): Promise<
-  | { ok: true; projectId: string | null | undefined }
+  | { ok: true; projectId: string | null | undefined; memberId: string; tokenHash: string }
   | { ok: false; status: 401 | 403 | 404; body: Record<string, unknown> }
 > {
-  const id = await resolveMemberByToken(env, bearerToken(authorizationHeader))
-  if (!id) return { ok: false, status: 401, body: { error: 'unauthorized' } }
+  const raw = bearerToken(authorizationHeader)
+  const id = await resolveMemberByToken(env, raw)
+  if (!id || !raw) return { ok: false, status: 401, body: { error: 'unauthorized' } }
+  const tokenHash = await hashMemberToken(raw)
 
   const grants = await resolveCapabilities(env, id.memberId)
   const isAdmin = hasCapability(grants, 'org', null, 'admin')
@@ -64,13 +66,13 @@ async function authorizePresenceRead(
 
   if (projectQuery === undefined || projectQuery === '') {
     if (!isAdmin) return { ok: false, status: 403, body: { error: 'forbidden', need: 'org:admin' } }
-    return { ok: true, projectId: undefined }
+    return { ok: true, projectId: undefined, memberId: id.memberId, tokenHash }
   }
 
   const access = readAccess(pseudoAuth)
   const project = await readableProject(env, projectQuery, access)
   if (!project) return { ok: false, status: 404, body: { error: 'project_not_found' } }
-  return { ok: true, projectId: projectQuery }
+  return { ok: true, projectId: projectQuery, memberId: id.memberId, tokenHash }
 }
 
 presenceApp.get('/', async (c) => {
@@ -110,5 +112,8 @@ presenceApp.get('/live', async (c) => {
   )
   const doUrl = new URL('https://presence-channel/subscribe')
   if (channelProjectId !== null) doUrl.searchParams.set('project', channelProjectId)
+  // Lease identity for post-connect revalidation (mupot#545) — hash only, never raw token.
+  doUrl.searchParams.set('member', authz.memberId)
+  doUrl.searchParams.set('token_hash', authz.tokenHash)
   return stub.fetch(new Request(doUrl.toString(), c.req.raw))
 })

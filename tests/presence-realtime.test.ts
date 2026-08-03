@@ -5,17 +5,26 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { Env } from '../src/types'
 import type { ModulePresence } from '../src/registry/service'
+import { PRESENCE_STALE_SECONDS } from '../src/registry/service'
 import {
   REALTIME_PRESENCE_FLAG,
   encodeRosterPush,
   fanOutWebSockets,
   isRealtimePresenceEnabled,
+  nextPresenceExpiryMs,
   parseRosterPush,
   presenceChannelName,
   publishRosterPush,
   reciprocateWebSocketClose,
   sanitizeWebSocketCloseCode,
 } from '../src/registry/realtime'
+import {
+  encodePresenceSocketTags,
+  fanOutAuthorizedRoster,
+  parsePresenceSocketTags,
+  PRESENCE_AUTH_REVOKED_CLOSE_CODE,
+  subscriptionStillAuthorized,
+} from '../src/registry/presence-subscription-auth'
 
 const NOW = new Date('2026-07-22T12:00:00.000Z')
 
@@ -204,17 +213,202 @@ describe('publishRosterPush', () => {
   })
 })
 
+describe('nextPresenceExpiryMs (stale-expiry publication schedule)', () => {
+  it('returns earliest online heartbeat + stale window', () => {
+    const nowMs = NOW.getTime()
+    const earlier = new Date(nowMs - 30_000).toISOString()
+    const later = new Date(nowMs - 10_000).toISOString()
+    const next = nextPresenceExpiryMs(
+      [
+        { status: 'online', last_heartbeat: later },
+        { status: 'online', last_heartbeat: earlier },
+        { status: 'offline', last_heartbeat: earlier },
+      ],
+      nowMs,
+      PRESENCE_STALE_SECONDS,
+    )
+    expect(next).toBe(Date.parse(earlier) + PRESENCE_STALE_SECONDS * 1000)
+  })
+
+  it('returns null when nobody is online (no alarm needed)', () => {
+    expect(
+      nextPresenceExpiryMs(
+        [{ status: 'offline', last_heartbeat: NOW.toISOString() }],
+        NOW.getTime(),
+        PRESENCE_STALE_SECONDS,
+      ),
+    ).toBeNull()
+  })
+
+  it('returns nowMs when an online row is already past expiry', () => {
+    const nowMs = NOW.getTime()
+    const staleHb = new Date(nowMs - (PRESENCE_STALE_SECONDS + 5) * 1000).toISOString()
+    expect(
+      nextPresenceExpiryMs(
+        [{ status: 'online', last_heartbeat: staleHb }],
+        nowMs,
+        PRESENCE_STALE_SECONDS,
+      ),
+    ).toBe(nowMs)
+  })
+})
+
+describe('presence socket lease tags + revocation revalidation (mupot#545)', () => {
+  it('round-trips lease tags (project / member / token_hash)', () => {
+    const tags = encodePresenceSocketTags({
+      projectId: 'proj-a',
+      memberId: 'mem-1',
+      tokenHash: 'abc123',
+    })
+    expect(tags).toEqual(['proj-a', 'mem-1', 'abc123'])
+    expect(parsePresenceSocketTags(tags)).toEqual({
+      projectId: 'proj-a',
+      memberId: 'mem-1',
+      tokenHash: 'abc123',
+    })
+  })
+
+  it('encodes null project as empty tag key', () => {
+    expect(
+      parsePresenceSocketTags(
+        encodePresenceSocketTags({ projectId: null, memberId: 'm', tokenHash: 'h' }),
+      ),
+    ).toEqual({ projectId: null, memberId: 'm', tokenHash: 'h' })
+  })
+
+  it('rejects incomplete tags (legacy project-only sockets)', () => {
+    expect(parsePresenceSocketTags(['proj-a'])).toBeNull()
+    expect(parsePresenceSocketTags(['proj-a', 'mem-1'])).toBeNull()
+  })
+
+  it('subscriptionStillAuthorized is false when the token hash is revoked', async () => {
+    const env = {
+      TENANT_SLUG: 't',
+      DB: {
+        prepare: () => ({
+          bind: () => ({
+            first: async () => null,
+          }),
+        }),
+      },
+    } as unknown as Env
+    await expect(
+      subscriptionStillAuthorized(env, {
+        projectId: 'proj-a',
+        memberId: 'mem-1',
+        tokenHash: 'dead',
+      }),
+    ).resolves.toBe(false)
+  })
+
+  it('subscriptionStillAuthorized is false when project access is gone', async () => {
+    let call = 0
+    const env = {
+      TENANT_SLUG: 't',
+      DB: {
+        prepare: (sql: string) => ({
+          bind: (..._args: unknown[]) => ({
+            first: async () => {
+              call += 1
+              if (sql.includes('member_tokens')) {
+                return { member_id: 'mem-1', status: 'active' }
+              }
+              // project visibility SELECT — no row = lost access
+              return null
+            },
+            all: async () => ({ results: [] }),
+          }),
+        }),
+      },
+    } as unknown as Env
+
+    // resolveCapabilities returns [] (no grants) via all(); readableProject fails closed
+    await expect(
+      subscriptionStillAuthorized(env, {
+        projectId: 'proj-a',
+        memberId: 'mem-1',
+        tokenHash: 'live',
+      }),
+    ).resolves.toBe(false)
+    expect(call).toBeGreaterThan(0)
+  })
+
+  it('fanOutAuthorizedRoster closes revoked sockets and skips their send', async () => {
+    const live = {
+      send: vi.fn(),
+      close: vi.fn(),
+      tags: ['proj-a', 'mem-live', 'hash-live'],
+    }
+    const revoked = {
+      send: vi.fn(),
+      close: vi.fn(),
+      tags: ['proj-a', 'mem-revoked', 'hash-revoked'],
+    }
+    const env = {
+      TENANT_SLUG: 't',
+      DB: {
+        prepare: (sql: string) => ({
+          bind: (...args: unknown[]) => ({
+            first: async () => {
+              if (sql.includes('member_tokens')) {
+                const hash = args[0]
+                if (hash === 'hash-live') return { member_id: 'mem-live', status: 'active' }
+                return null
+              }
+              // project row for live member with org admin path: return a project
+              return { id: 'proj-a' }
+            },
+            all: async () => ({
+              // grant org:admin so readableProject unrestricted path works for live
+              results: [
+                {
+                  id: 'g1',
+                  member_id: 'mem-live',
+                  scope_type: 'org',
+                  scope_id: null,
+                  capability: 'admin',
+                  granted_by: null,
+                  created_at: NOW.toISOString(),
+                },
+              ],
+            }),
+          }),
+        }),
+      },
+    } as unknown as Env
+
+    const sent = await fanOutAuthorizedRoster(
+      env,
+      [live, revoked],
+      (s) => s.tags,
+      'roster-frame',
+    )
+    expect(sent).toBe(1)
+    expect(live.send).toHaveBeenCalledWith('roster-frame')
+    expect(revoked.send).not.toHaveBeenCalled()
+    expect(revoked.close).toHaveBeenCalledWith(PRESENCE_AUTH_REVOKED_CLOSE_CODE, 'auth_revoked')
+  })
+})
+
 describe('PresenceChannelDO export + wrangler contract (structural)', () => {
   it('PresenceChannelDO is a named export from its module source', async () => {
     const { readFileSync } = await import('node:fs')
     const src = readFileSync('src/registry/presence-channel-do.ts', 'utf8')
     expect(src).toContain('export class PresenceChannelDO')
     expect(src).toContain('acceptWebSocket')
-    expect(src).toContain('fanOutWebSockets')
+    expect(src).toContain('fanOutAuthorizedRoster')
+    expect(src).toContain('subscriptionStillAuthorized')
+    expect(src).toContain('nextPresenceExpiryMs')
+    expect(src).toContain('async alarm(')
+    expect(src).toContain('setAlarm')
     expect(src).toContain('reciprocateWebSocketClose')
+    expect(src).toContain('token_hash')
     expect(src).not.toMatch(/ws\.close\(code,\s*reason\)/)
     const entry = readFileSync('src/index.ts', 'utf8')
     expect(entry).toContain("export { PresenceChannelDO } from './registry/presence-channel-do'")
+    const routes = readFileSync('src/registry/presence-routes.ts', 'utf8')
+    expect(routes).toContain("doUrl.searchParams.set('member'")
+    expect(routes).toContain("doUrl.searchParams.set('token_hash'")
   })
 
   it('wrangler templates declare the binding + v2 migration (not CF Pub/Sub)', async () => {
