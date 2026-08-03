@@ -28,6 +28,7 @@ import {
   listFlights,
   listFlightProjectMismatchTaskIds,
   listIncompleteFlightTaskIds,
+  approveFlight,
   FlightProjectError,
   type FlightStatus,
   type TriggerSource,
@@ -35,6 +36,7 @@ import {
 import type { FlightSignals, PreflightOptions } from './preflight'
 import { FLIGHT_META_V1_SCHEMA, parseFlightMetaV1, validateFlightMetaReferences, type FlightMetaV1 } from './meta'
 import { deriveActiveCollisions } from './board'
+import { verifyLinearSignature, createProposedFlightFromLinear, type LinearWebhookPayload } from './webhooks'
 
 // ── input parsing (pure, exported for tests) ──────────────────────────────────
 
@@ -334,4 +336,74 @@ flightsApp.get('/collisions', async (c) => {
   const flights = await listFlights(c.env, 500)
   const { holds, warns } = deriveActiveCollisions(flights)
   return c.json({ holds, warns })
+})
+
+// ── Webhook routes (external origins: Linear, PostHog, etc.) ────────────────────
+
+// POST /webhooks/linear — Linear webhook handler.
+// SECURITY: Signature verification required (Linear-Signature HMAC-SHA256).
+// Creates flights in 'proposed' gate_state only (not dispatchable until approval).
+flightsApp.post('/webhooks/linear', async (c) => {
+  const signature = c.req.header('linear-signature')
+  const body = await c.req.text()
+
+  // LINEAR_WEBHOOK_SECRET must be configured via environment.
+  const secret = c.env.LINEAR_WEBHOOK_SECRET
+  if (!secret) {
+    console.error('LINEAR_WEBHOOK_SECRET not configured')
+    return c.json({ error: 'webhook_not_configured' }, 500)
+  }
+
+  // Verify HMAC signature (fails if missing or invalid).
+  const isValid = await verifyLinearSignature(body, signature, secret)
+  if (!isValid) {
+    // 401: Signature verification failed (unsigned or replayed).
+    return c.json({ error: 'invalid_signature' }, 401)
+  }
+
+  // Parse payload (untrusted content — treat as attacker-influenceable).
+  let payload: LinearWebhookPayload
+  try {
+    payload = JSON.parse(body)
+  } catch {
+    return c.json({ error: 'invalid_json' }, 400)
+  }
+
+  // Validate minimal structure (id, data.id, data.title required).
+  if (!payload?.data?.id || !payload?.data?.title) {
+    return c.json({ error: 'invalid_payload_structure' }, 400)
+  }
+
+  // Create proposed flight (gate_state='proposed', not dispatchable).
+  try {
+    const flightId = await createProposedFlightFromLinear(c.env, payload)
+    return c.json({ ok: true, flight_id: flightId }, 201)
+  } catch (error) {
+    console.error('failed to create proposed flight from linear webhook', error)
+    return c.json({ error: 'flight_creation_failed' }, 500)
+  }
+})
+
+// POST /flights/:id/approve — Approve a proposed flight for dispatch.
+// SECURITY: Requires org-admin (mupot-side gate).
+// Moves flight from gate_state='proposed' → gate_state='approved'.
+flightsApp.post('/:id/approve', async (c) => {
+  const auth = await requireOrgAdmin(c.env, c.req.header('authorization'))
+  if (!auth.ok) return c.json({ error: auth.status === 401 ? 'unauthorized' : 'forbidden' }, auth.status)
+
+  const id = c.req.param('id')
+  const existing = await getFlight(c.env, id)
+  if (!existing) return c.json({ error: 'not_found' }, 404)
+  if (existing.gate_state !== 'proposed') {
+    return c.json(
+      { error: 'flight_not_proposed', gate_state: existing.gate_state },
+      409,
+    )
+  }
+
+  const approved = await approveFlight(c.env, id)
+  if (!approved) return c.json({ error: 'approval_failed' }, 409)
+
+  const updated = await getFlight(c.env, id)
+  return c.json({ ok: true, id, gate_state: updated?.gate_state ?? 'approved' })
 })
