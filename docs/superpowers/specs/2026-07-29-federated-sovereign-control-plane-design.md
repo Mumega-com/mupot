@@ -117,8 +117,11 @@ separate by design.
 |---|---|---|
 | Tenant onboarding and control plane | Tenant metadata, deploy intent, capability intents, token references | Child account secrets, raw credentials, cross-tenant state |
 | Reconciler service | Signed, audited execute intent, generation checks, idempotent deploy/apply | Direct host shelling, arbitrary file writes, unbounded network fetch |
+| Per-tenant runner | One signed intent, one tenant-bound secret reference, one ephemeral credential, allowlisted Cloudflare endpoints | Other tenant references/credentials, bulk secret listing, concurrent tenant work |
+| Secret store | Identity-bound retrieval of one approved tenant secret reference | Registry queries, arbitrary reference selection, list/export of tenant credentials |
 | Registry | Tenants, manifest versions, control receipts, per-tenant config digests | Token material, secrets, shared tenant data |
 | Tenant workload | Hosted runtime, queues, D1, bindings inside the tenant account | Central control credentials, other tenants' data |
+| Tenant attestor | Minimized health/drift facts signed from a tenant-controlled security boundary separate from the managed workload | Business data, deploy credential, keys reachable by the workload or deploy runner |
 
 ### 4.2 Acceptance attacks - must all hold before ship
 
@@ -159,6 +162,7 @@ Each later phase must repeat its mapped gate against the implemented runtime bef
 | Manual rotation readiness | `phase0-token-expiry-rotation-runbook` | Deterministic alarm clock plus tenant-run rotation rehearsal | Each carrier's own Section 5 alarm schedule fires; a tenant Super Administrator can replace/validate/revoke observe or deploy tokens without Mupot token-management permission; JIT expires without renewal; every missed action fails closed | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/token-expiry-rotation-runbook.json` |
 | Zero credentials in registry | `phase0-registry-zero-credentials` | Candidate schema, serializer, log/export fixtures, and backup fixture | Every fixture contains secret references only and rejects token-shaped material; Phase 1 repeats this against its real store before activation | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/registry-zero-credentials.json` |
 | No token-minting root / exact runtime-token capability set | `phase0-no-token-mint-permission` | Pilot token-read response versus the separately reviewed dated ID manifest | Each carrier's resolved ID set equals that manifest exactly; every missing, extra, unknown, renamed, or token-management group is a BLOCK | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/no-token-mint-permission.json` |
+| Deploy-write implied read exposure | `phase0-deploy-adapter-no-read-operations` | Deploy-adapter policy model, D1 migration fixtures, and simulated API audit log | Policy permits only reviewed release mutations, denies read endpoints/source retrieval and non-migration SQL, and records that stolen-token read exposure remains a bounded residual risk | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/deploy-adapter-no-read-operations.json` |
 | Signature verification boundary | `phase0-signature-verification-boundary` | Standalone verifier contract module and adversarial fixtures | Reject unsigned payloads, `alg:none`, unapproved algorithms, unknown/caller-supplied key IDs, cross-tenant signers, forged signatures, and revoked keys before state change | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/signature-verification-boundary.json` |
 | Signer compromise and rotation | `phase0-signer-key-lifecycle` | Key-registry model and verifier fixtures | Rotation overlap accepts only current/next trusted keys; compromise revocation rejects the old key, halts the modeled lane, and emits an audit receipt | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/signer-key-lifecycle.json` |
 | Evidence producer/signer separation | `phase0-evidence-separation-of-duty` | CI identities, key policy, raw artifact, and redacted reviewer view | Harness cannot use the receipt key or finalize its evidence; independent signer re-verifies raw artifact and both reviewers fetch the digest-matching view | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/evidence-separation-of-duty.json` |
@@ -180,22 +184,30 @@ are reviewed in this ADR.
 | Confused deputy | Reconciler uses Tenant A's credential for Tenant B's requested account | Bind signed intent to tenant ID + exact account ID; reject any secret-ref/account mismatch before secret retrieval |
 | Revoked credential from cache | Runner continues with an in-memory credential after revocation | Short-lived process cache, revocation epoch checked before each mutation, halt and purge on mismatch |
 | Spoofed telemetry | Fake heartbeat or reconcile status | Signed payloads, nonce/epoch monotonic checks, signer-to-tenant binding |
+| Compromised workload forges healthy state | Workload signs a genuine but false no-drift attestation | Attestor and key outside workload/deploy-runner boundary, plus periodic authoritative Cloudflare-side reconciliation by an independent verifier |
 | Telemetry content poisoning | Logs or status fields inject instructions, markup, or forged state | Treat telemetry as untrusted data, schema/size constrain it, escape rendering, redact before central storage |
 | Audit-chain integrity | Control receipts are removed, reordered, or rewritten | Append-only hash-linked receipts, signed sequence/generation, independent verification and gap alarms |
 | Control-plane front-door bypass | Current or proposed edge/application controls permit weak or cross-tenant access | Phishing-resistant MFA, bounded sessions, replay resistance, tenant-scoped authorization on every control route, independent auth-boundary acceptance test |
 | Build artifact drift | Unsigned or substituted artifact executes | Digest lock + signed manifest hash + generation checks |
 | Callback tampering | Untrusted postback path changes result | Replay window, callback signature, tenant-scoped routing |
 | SSRF | Unbounded health target reaches internal services | Canonical allowlist, scheme/host/path lock, DNS/IP revalidation, no arbitrary fetch |
-| Central compromise | Registry leak becomes cloud-wide control | Metadata-only registry separated from per-tenant deploy capabilities and runners |
+| Deploy-write implied read | Write group also permits source/data reads during its 24-hour window | Dedicated account, ephemeral isolated runner, mutation-only adapter, no interactive token exposure, audited endpoint/SQL allowlist; stolen-token read capability remains an explicit residual risk |
+| Runner compromise | Runner dereferences or uses another tenant's deploy credential | One-tenant process identity, signed tenant/account/secret-ref binding, no bulk retrieval, constrained egress, destroy credential and runner after the intent |
+| Secret-store compromise | Central service enumerates or exports fleet credentials | Per-tenant namespaces and envelope keys, non-listable references, identity-bound one-reference retrieval, independent access log and anomaly halt |
+| Central compromise | Registry, reconciler, or secret custody becomes fleet-wide control | Metadata-only registry; per-tenant runners/secret namespaces; no bulk credential path; independent audit. Secret-store root compromise remains catastrophic residual risk requiring owner approval |
 
 ### 4.4 Signing-key custody and compromise
 
 - Every signing key has an immutable `key_id`, tenant ID, purpose (`intent`, `telemetry`,
   `artifact`, or `receipt`), approved algorithm, `not_before`, `expires_on`, and revocation epoch in
   the trusted registry. A request cannot supply its own verification key, algorithm, or key URL.
-- Private keys never enter the metadata registry. Tenant telemetry keys remain in tenant-owned
-  secret custody; central intent/receipt keys remain outside tenant runtime. The verifier resolves
-  a trusted public key by the signed tenant + purpose + `key_id` tuple before parsing action data.
+- Private keys never enter the metadata registry. Tenant telemetry keys remain in a tenant-owned
+  attestor boundary separate from the managed workload, deploy account, and deploy runner; the
+  workload cannot invoke the signer or read its key. Central intent/receipt keys remain outside
+  tenant runtime. A signature proves origin, not truth, so an independent verifier periodically
+  compares attestation to authoritative Cloudflare state with a tenant-approved product-specific
+  JIT read. The verifier resolves a trusted public key by the signed tenant + purpose + `key_id`
+  tuple before parsing action data.
 - The algorithm allowlist is explicit and contains no `none` mode or algorithm fallback. Signer,
   tenant, purpose, generation, and payload digest are all covered by the signature.
 - Rotation uses bounded current/next overlap and records an activation + retirement receipt.
@@ -208,11 +220,15 @@ Controls that become executable after Phase 0 retain named future gates:
 |---|---|---|
 | Confused deputy | Phase 2 | `phase2-tenant-account-secretref-binding` |
 | Spoofed telemetry | Phase 3 | `phase3-telemetry-signature-replay-deny` |
+| False signed telemetry | Phase 3 | `phase3-attestor-workload-separation-and-authoritative-reconcile` |
 | Telemetry content poisoning | Phase 3 | `phase3-telemetry-untrusted-content` |
 | Audit-chain integrity | Phase 1 | `phase1-control-receipt-chain-integrity` |
 | Build artifact drift | Phase 2 | `phase2-signed-artifact-digest-fence` |
 | Callback tampering | Phase 3 | `phase3-callback-signature-replay-deny` |
 | Central compromise | Phase 1 | `phase1-registry-zero-deploy-capability` |
+| Deploy-write implied read | Phase 2 | `phase2-deploy-adapter-no-read-operations` |
+| Runner compromise | Phase 2 | `phase2-runner-per-tenant-secretref-isolation` |
+| Secret-store compromise | Phase 2 | `phase2-secret-store-no-bulk-enumeration` |
 
 ## 5. Per-product Cloudflare capability matrix (Phase 0 minimums)
 
@@ -256,6 +272,15 @@ shared-workload tenant account requires a separate accepted-risk ADR, resource i
 direct approval, and parallel GREEN gates before token creation. An exact account binding prevents
 cross-account access; it does not imply per-resource isolation inside that account.
 
+Some Write groups also permit reads: `Workers Scripts Write` can expose script content and
+`D1 Write` can execute read SQL. Cloudflare does not provide a schema-mutation-only D1 group. The
+24-hour `deploy-write` token therefore has bounded residual source/data-read capability even though
+the deploy adapter itself is mutation-only. The token is available only to an ephemeral per-tenant
+runner, never to the dashboard, support session, managed workload, or interactive agent. The runner
+enforces reviewed endpoint/method and D1 migration-statement allowlists and emits an audit receipt;
+token theft can bypass that adapter, so dedicated-account isolation, expiry, revoke, and the named
+Section 4.2 gate bound rather than eliminate the residual risk.
+
 | Product / operation | Expected read label | Expected write label | Cloudflare resource boundary | `expires_on` maximum | Capability carrier |
 |---|---|---|---|---|---|
 | Workers scripts, Durable Objects, and Workflows | `Workers Scripts Read` | `Workers Scripts Write` | Dedicated tenant account; all product resources in that account | read: 60m; write: 24h | read: `break-glass/JIT-support`; write: `deploy-write` |
@@ -271,12 +296,16 @@ The runtime control plane receives no `Logs Write` capability. A tenant configur
 Logpush destination manually in its own account under a separately reviewed destination allowlist;
 token expiry is not a teardown mechanism and must never be presented as one.
 
-Routine health/drift comes from minimized, signed tenant attestation rather than broad Cloudflare
-product reads. `observe-read` is limited here to non-content route metadata and must not contain
+Routine health/drift comes from minimized attestation signed by the separate tenant attestor, with
+periodic authoritative Cloudflare-side reconciliation by an independent verifier using a
+tenant-approved product-specific JIT read. The managed workload and deploy runner cannot access the
+attestation signer. `observe-read` is limited here to non-content route metadata and must not contain
 `Workers Scripts Read`, `D1 Read`, `Queues Read`, `Workers KV Storage Read`, `Logs Read`, or
 `Workers Tail Read`; those groups can expose source, product state, tenant business data, or runtime
-content and remain JIT. The exact-permission test in Section 4.2 treats any such standing grant as a
-BLOCK.
+content and are absent from standing **read** carriers. Direct support/verification reads remain
+JIT. The separate `deploy-write` residual above is explicitly accepted and controlled rather than
+misrepresented as JIT-only. The exact-permission test in Section 4.2 treats any unapproved standing
+grant as a BLOCK.
 
 Durable Objects and Workflows intentionally have no standalone matrix rows: Cloudflare's Durable
 Objects namespace API accepts `Workers Scripts Read` / `Workers Scripts Write`, and the Workflows
