@@ -143,6 +143,19 @@ export async function readWorkloadIdentityToken({
 } = {}) {
   const { controller, timer } = withTimeout(timeoutMs)
   try {
+    // VPS/local fallback (2026-08-03): outside GKE there is no metadata
+    // server. If GEO_VERTEX_ACCESS_TOKEN_FILE is set, read the token from
+    // that file (written by the operator from `gcloud auth print-access-token`)
+    // instead of the metadata endpoint. File-based like the other credentials.
+    const tokenFile = process.env.GEO_VERTEX_ACCESS_TOKEN_FILE
+    if (typeof tokenFile === 'string' && tokenFile.startsWith('/')) {
+      const { readFile } = await import('node:fs/promises')
+      const raw = (await readFile(tokenFile, 'utf8')).trim()
+      if (raw.length < 16 || raw.length > 4096 || /[\u0000-\u0020\u007f]/.test(raw)) {
+        throw new Error('metadata_token_invalid')
+      }
+      return raw
+    }
     const response = await fetchImpl(METADATA_TOKEN_URL, {
       method: 'GET',
       headers: { 'Metadata-Flavor': 'Google' },
