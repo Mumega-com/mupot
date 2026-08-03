@@ -16,8 +16,29 @@ jobs:
         with:
           node-version: 22
       - run: npm ci
-      - name: Dependency audit
-        run: npm audit --audit-level=high
+      # Blocking gate: PRODUCTION dependencies only.
+      #
+      # A Worker ships only production deps. Every high advisory on 2026-08-03 was
+      # in build tooling — undici via miniflare via wrangler, postcss via vite —
+      # none of which reaches a running Worker or a customer.
+      #
+      # The previous `npm audit --audit-level=high` failed on the whole tree, so a
+      # newly published advisory in any transitive dev dep turned EVERY branch red
+      # without a line of code changing. That happened twice (#464 fast-uri, #662
+      # undici/postcss) and it stopped the entire merge queue — including a PR
+      # closing a live production exposure. A required check that fails on a clock
+      # rather than on the diff teaches people to reach for the override, which is
+      # how a real red gets waved through.
+      #
+      # So: block on what ships, report on what doesn't.
+      - name: Dependency audit (production deps — blocking)
+        run: npm audit --audit-level=high --omit=dev
+      # Non-blocking: dev-dep advisories stay VISIBLE. They are real supply-chain
+      # signal for the build host even though they never reach production, and
+      # silencing them entirely would trade one blind spot for another.
+      - name: Dependency audit (dev deps — informational)
+        run: npm audit --audit-level=high || echo "::warning::dev-dependency advisories present — see log; non-blocking, they do not ship to the Worker"
+        continue-on-error: true
       - name: Typecheck
         run: npm run typecheck
       - name: Install Playwright browser for integration tests
