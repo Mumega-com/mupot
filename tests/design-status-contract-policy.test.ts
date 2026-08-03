@@ -293,7 +293,7 @@ describe('design-status contract policy', () => {
     expect(result.stderr).toBe('')
   })
 
-  it('hard-fails unrecognized contract ids only on runtime/release paths', () => {
+  it('warns on unrecognized contract ids on runtime paths; silent elsewhere; never hard-fails', () => {
     const root = createTrackedRepo({
       'src/contracts/bad-id.json': `${JSON.stringify(
         { id: 'Owner_Experience/v1.0', status: 'design', designOnly: true },
@@ -319,7 +319,9 @@ describe('design-status contract policy', () => {
 
     const result = runScanner(root)
 
-    expect(result.status).toBe(1)
+    expect(result.status).toBe(0)
+    expect(result.stdout).toContain('design-status contract policy: ok')
+    expect(result.stderr).toContain('warning:')
     expect(result.stderr).toContain('unrecognized contract-like object with id')
     expect(result.stderr).toContain('Owner_Experience/v1.0')
     expect(result.stderr).toContain('not_a_contract')
@@ -327,20 +329,127 @@ describe('design-status contract policy', () => {
     expect(result.stderr).toContain('pots.manifest.json')
     expect(result.stderr).not.toContain('tests/fixtures/ordinary-id-status.json')
     expect(result.stderr).not.toContain('docs/notes-bad-id.json')
-    expect(result.stderr).toContain('design-status policy violations: 2')
+    expect(result.stderr).not.toContain('design-status policy violations:')
   })
 
-  it('reports unparseable JSON instead of silently skipping', () => {
+  it('hard-fails unparseable JSON on runtime paths; warns elsewhere', () => {
     const root = createTrackedRepo({
+      'src/contracts/broken.json': '{ id: "runtime-adapter/v1", status: "documented", }\n',
       'docs/broken.json': '{ id: "runtime-adapter/v1", status: "documented", }\n',
     })
 
     const result = runScanner(root)
 
     expect(result.status).toBe(1)
+    expect(result.stderr).toContain('src/contracts/broken.json')
     expect(result.stderr).toContain('unparseable JSON')
-    expect(result.stderr).toContain('docs/broken.json')
     expect(result.stderr).toContain('design-status policy violations: 1')
+    expect(result.stderr).toContain('warning:')
+    expect(result.stderr).toContain('docs/broken.json')
+  })
+
+  it('skips known-JSONC and .design-status-ignore matches with notes', () => {
+    const root = createTrackedRepo({
+      'tsconfig.json': '{ "compilerOptions": { "strict": true, } }\n',
+      'tsconfig.build.json': '{ "extends": "./tsconfig.json", }\n',
+      '.vscode/settings.json': '{ "editor.formatOnSave": true, }\n',
+      '.devcontainer/devcontainer.json': '{ "name": "mupot", }\n',
+      'tests/fixtures/ignored-broken.json': '{ not json\n',
+      'docs/visible-broken.json': '{ also not json\n',
+      '.design-status-ignore': '# ignore fixture parse noise\ntests/fixtures/ignored-broken.json\n',
+    })
+
+    const result = runScanner(root)
+
+    expect(result.status).toBe(0)
+    expect(result.stdout).toContain('design-status contract policy: ok')
+    expect(result.stderr).toContain('note:')
+    expect(result.stderr).toContain('skipped known-JSONC')
+    expect(result.stderr).toContain('tsconfig.json')
+    expect(result.stderr).toContain('tsconfig.build.json')
+    expect(result.stderr).toContain('.vscode/settings.json')
+    expect(result.stderr).toContain('.devcontainer/devcontainer.json')
+    expect(result.stderr).toContain('skipped by .design-status-ignore')
+    expect(result.stderr).toContain('tests/fixtures/ignored-broken.json')
+    expect(result.stderr).toContain('warning:')
+    expect(result.stderr).toContain('docs/visible-broken.json')
+    expect(result.stderr).not.toContain('design-status policy violations:')
+  })
+
+  it('hard-fails recognized contracts when normalize(status) starts with design', () => {
+    const root = createTrackedRepo({
+      'src/contracts/design-cased.json': `${JSON.stringify(
+        { id: 'brain-learning-ranker/v1', status: 'DESIGN', designOnly: true },
+        null,
+        2,
+      )}\n`,
+      'src/contracts/design-space.json': `${JSON.stringify(
+        { id: 'owner-experience/v1', status: ' design-space ', designOnly: true },
+        null,
+        2,
+      )}\n`,
+      'src/contracts/design-only-status.json': `${JSON.stringify(
+        { id: 'tier2-user-chat/v1', status: 'design-only', designOnly: true },
+        null,
+        2,
+      )}\n`,
+      'src/contracts/documented-ok.json': `${JSON.stringify(
+        { id: 'runtime-adapter/v1', status: 'documented' },
+        null,
+        2,
+      )}\n`,
+    })
+
+    const result = runScanner(root)
+
+    expect(result.status).toBe(1)
+    expect(result.stderr).toContain('src/contracts/design-cased.json')
+    expect(result.stderr).toContain('src/contracts/design-space.json')
+    expect(result.stderr).toContain('src/contracts/design-only-status.json')
+    expect(result.stderr).toContain("status 'DESIGN'")
+    expect(result.stderr).toContain("status ' design-space '")
+    expect(result.stderr).toContain("status 'design-only'")
+    expect(result.stderr).not.toContain('src/contracts/documented-ok.json')
+    expect(result.stderr).toContain('design-status policy violations: 3')
+  })
+
+  it('treats status design-only as design status, not as a designOnly marker', () => {
+    // Ambiguity: "design-only" looks like the marker vocabulary, but as a
+    // status string it is design-status via prefix normalization. A string
+    // designOnly marker value must not authorize or invent design status.
+    const root = createTrackedRepo({
+      'docs/design-only-status-unmarked.json': `${JSON.stringify(
+        { id: 'brain-learning-ranker/v1', status: 'design-only' },
+        null,
+        2,
+      )}\n`,
+      'docs/string-marker-not-authorization.json': `${JSON.stringify(
+        { id: 'owner-experience/v1', status: 'design', designOnly: 'design-only' },
+        null,
+        2,
+      )}\n`,
+      'docs/string-marker-documented-ok.json': `${JSON.stringify(
+        { id: 'tier2-user-chat/v1', status: 'documented', designOnly: 'design-only' },
+        null,
+        2,
+      )}\n`,
+      'docs/boolean-marker-ok.json': `${JSON.stringify(
+        { id: 'runtime-adapter/v1', status: 'design-only', designOnly: true },
+        null,
+        2,
+      )}\n`,
+    })
+
+    const result = runScanner(root)
+
+    expect(result.status).toBe(1)
+    expect(result.stderr).toContain('docs/design-only-status-unmarked.json')
+    expect(result.stderr).toContain("status 'design-only'")
+    expect(result.stderr).toContain('docs/string-marker-not-authorization.json')
+    expect(result.stderr).toContain('not explicitly design-only')
+    expect(result.stderr).not.toContain('docs/string-marker-documented-ok.json')
+    expect(result.stderr).not.toContain('docs/boolean-marker-ok.json')
+    expect(result.stderr).toContain('design-status policy violations: 2')
   })
 
   it('reports symlinked and non-UTF-8 tracked JSON instead of dropping them', () => {
