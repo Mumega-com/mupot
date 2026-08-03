@@ -1,6 +1,7 @@
 # Federated Sovereign Control Plane - design + handoff (Phase 0 ADR)
 
-Status: Proposed Phase 0 ADR, 2026-08-03; not accepted or complete until Section 7 holds.
+Status: Proposed Phase 0 ADR, revised 2026-08-03; not accepted or complete until Section 7 holds.
+Origin session: 2026-07-29.
 Owner: unassigned - delegated to codex + cursor, 2026-07-29.
 Decision scope: this design artifact covers the ADR, threat model, and per-product Cloudflare
 capability matrix. Phase 0 completion additionally requires the evidence predicate in Section 7.
@@ -36,8 +37,10 @@ plane**. Two structural flaws in the original proposal:
 
 ### Credentials
 
-Preferred onboarding: the tenant's own Super Admin creates the deploy token directly (prefilled
-Cloudflare token-template URL, scoped to that one account + exact products) - not us minting it.
+Preferred onboarding uses **account-owned tokens only**, not user API tokens. A tenant's own Super
+Administrator creates the account-owned token through Cloudflare's authenticated account-token
+flow; any user credential used to authorize that creation remains tenant-held and never enters
+Mupot. The resulting token is owned by the tenant account rather than one person's membership.
 Three separate capabilities, never one omnibus token: **deploy-write**, **observe-read**,
 **break-glass/JIT-support**. Registry D1 stores only secret-store *references*, never the token
 itself. This ADR does not authorize auto-minting in a later phase. Any proposal to introduce an API
@@ -140,21 +143,27 @@ the raw artifact digest and tested commit, and sign the final receipt. Both requ
 be able to retrieve a least-privilege redacted evidence view through the receipt URI; inability to
 fetch and verify that view is a BLOCK. The evidence producer cannot serve as signer or final gate.
 
-| Acceptance attack | Named test | Required assertion | Evidence artifact |
-|---|---|---|---|
-| Tenant token isolation | `phase0-tenant-token-isolation` | Pilot token succeeds only on the pilot account and returns `403` for the same endpoint against central account `e39eaf94...` and a second tenant-owned account | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/tenant-token-isolation.json` |
-| Compromised tenant Worker isolation | `phase0-compromised-worker-admin-deny` | Tenant runtime has no central credential and a simulated compromised Worker receives `401`/`403` from central admin APIs | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/compromised-worker-admin-deny.json` |
-| Health target SSRF resistance | `phase0-health-target-ssrf-deny` | Loopback, link-local, private, redirect-to-private, non-HTTPS, and unregistered hosts are rejected before a network request | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/health-target-ssrf-deny.json` |
-| Stale generation fencing | `phase0-stale-generation-cas-deny` | A lower or replayed generation cannot overwrite a newer desired/observed generation | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/stale-generation-cas-deny.json` |
-| Immediate revocation | `phase0-revoked-token-immediate-stop` | After revocation, the next attempted control action is denied and no later reconciliation is accepted from the cached credential | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/revoked-token-immediate-stop.json` |
-| Manual rotation readiness | `phase0-token-expiry-rotation-runbook` | Expiry alarms fire at every required lead time; the tenant Super Administrator can replace, validate, and revoke each carrier without token-management permission; missed rotation expires fail closed | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/token-expiry-rotation-runbook.json` |
-| Zero credentials in registry | `phase0-registry-zero-credentials` | Schema, rows, logs, exports, and backups contain secret references only and reject token-shaped material | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/registry-zero-credentials.json` |
-| No token-minting root / exact runtime-token capability set | `phase0-no-token-mint-permission` | For each carrier, the token-read response's resolved permission-group ID set equals the reviewed Section 5 ID manifest exactly; every missing, extra, unknown, renamed, or token-management group is a BLOCK | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/no-token-mint-permission.json` |
-| Signature verification boundary | `phase0-signature-verification-boundary` | Reject unsigned payloads, `alg:none`, unapproved algorithms, unknown/caller-supplied key IDs, cross-tenant signers, forged signatures, and revoked keys before state change | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/signature-verification-boundary.json` |
-| Signer compromise and rotation | `phase0-signer-key-lifecycle` | Rotation overlap accepts only current/next trusted keys; compromise revocation immediately rejects the old key, halts affected reconciliation, and emits an audit receipt | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/signer-key-lifecycle.json` |
-| Evidence producer/signer separation | `phase0-evidence-separation-of-duty` | The harness identity cannot use the receipt key or finalize its own evidence; an independent signer re-verifies the raw artifact and both reviewers fetch a digest-matching redacted view | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/evidence-separation-of-duty.json` |
-| Phase 0 evidence receipt integrity | `phase0-evidence-receipt-chain-integrity` | Removing, reordering, rewriting, or replaying a receipt breaks the signed sequence/hash chain and blocks the final evidence predicate | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/evidence-receipt-chain-integrity.json` |
-| Control-plane front-door authentication | `phase0-control-plane-auth-boundary` | Missing phishing-resistant MFA or required edge/device/network posture, unauthenticated, expired-session, cross-tenant, and replayed-session requests cannot reach Mupot control APIs | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/control-plane-auth-boundary.json` |
+The **Phase 0 proof subject** column prevents production-shaped wording from creating a sequencing
+dependency. Contract tests use fixtures, pure policy/state-transition modules, or isolated
+reference routes. They do not claim that the Phase 1 registry or Phase 2 reconciler already exists.
+Each later phase must repeat its mapped gate against the implemented runtime before activation.
+
+| Acceptance attack | Named test | Phase 0 proof subject | Required assertion | Evidence artifact |
+|---|---|---|---|---|
+| Tenant token isolation | `phase0-tenant-token-isolation` | Approved non-mutating endpoint in the real pilot account | Pilot account-owned token succeeds only on the pilot account and returns `403` for the same endpoint against central account `e39eaf94...` and a second tenant-owned account | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/tenant-token-isolation.json` |
+| Account-scope blast radius | `phase0-account-scope-blast-radius` | Pilot account resource inventory plus cross-account negatives | Pilot account is dedicated to Mupot-managed resources; account-scoped write reaches no central/second-tenant account, and no shared-workload account is accepted without a separate risk gate | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/account-scope-blast-radius.json` |
+| Compromised tenant Worker isolation | `phase0-compromised-worker-admin-deny` | Fixture workload plus an approved non-mutating central endpoint | Workload has no central credential and its pilot token receives `401`/`403` from the central endpoint | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/compromised-worker-admin-deny.json` |
+| Health target SSRF resistance | `phase0-health-target-ssrf-deny` | URL-policy module with mocked DNS, redirects, and fetch | Loopback, link-local, private, redirect-to-private, non-HTTPS, and unregistered hosts are rejected before a network request | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/health-target-ssrf-deny.json` |
+| Stale generation fencing | `phase0-stale-generation-cas-deny` | Pure generation/CAS state-machine model | A lower or replayed generation cannot overwrite a newer desired/observed generation | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/stale-generation-cas-deny.json` |
+| Immediate revocation | `phase0-revoked-token-immediate-stop` | Revoked pilot token plus cache/reconciliation model | The next Cloudflare request is denied and the model accepts no later reconciliation from the cached credential | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/revoked-token-immediate-stop.json` |
+| Manual rotation readiness | `phase0-token-expiry-rotation-runbook` | Deterministic alarm clock plus tenant-run rotation rehearsal | Each carrier's own Section 5 alarm schedule fires; a tenant Super Administrator can replace/validate/revoke observe or deploy tokens without Mupot token-management permission; JIT expires without renewal; every missed action fails closed | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/token-expiry-rotation-runbook.json` |
+| Zero credentials in registry | `phase0-registry-zero-credentials` | Candidate schema, serializer, log/export fixtures, and backup fixture | Every fixture contains secret references only and rejects token-shaped material; Phase 1 repeats this against its real store before activation | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/registry-zero-credentials.json` |
+| No token-minting root / exact runtime-token capability set | `phase0-no-token-mint-permission` | Pilot token-read response versus the separately reviewed dated ID manifest | Each carrier's resolved ID set equals that manifest exactly; every missing, extra, unknown, renamed, or token-management group is a BLOCK | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/no-token-mint-permission.json` |
+| Signature verification boundary | `phase0-signature-verification-boundary` | Standalone verifier contract module and adversarial fixtures | Reject unsigned payloads, `alg:none`, unapproved algorithms, unknown/caller-supplied key IDs, cross-tenant signers, forged signatures, and revoked keys before state change | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/signature-verification-boundary.json` |
+| Signer compromise and rotation | `phase0-signer-key-lifecycle` | Key-registry model and verifier fixtures | Rotation overlap accepts only current/next trusted keys; compromise revocation rejects the old key, halts the modeled lane, and emits an audit receipt | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/signer-key-lifecycle.json` |
+| Evidence producer/signer separation | `phase0-evidence-separation-of-duty` | CI identities, key policy, raw artifact, and redacted reviewer view | Harness cannot use the receipt key or finalize its evidence; independent signer re-verifies raw artifact and both reviewers fetch the digest-matching view | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/evidence-separation-of-duty.json` |
+| Phase 0 evidence receipt integrity | `phase0-evidence-receipt-chain-integrity` | Evidence-receipt verifier and mutation/replay fixtures | Removing, reordering, rewriting, or replaying an **evidence** receipt breaks its signed sequence/hash chain; this does not satisfy Phase 1's separate control-receipt gate | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/evidence-receipt-chain-integrity.json` |
+| Control-plane front-door authentication | `phase0-control-plane-auth-boundary` | Isolated reference route using the proposed auth middleware contract | Missing phishing-resistant MFA or required posture, unauthenticated, expired-session, cross-tenant, and replayed requests fail; every implemented control route repeats this before activation | `mupot-evidence://project/<PROJECT_ID>/federated-control-plane/phase0/control-plane-auth-boundary.json` |
 
 For tenant isolation, Phase 0 selects and records a Cloudflare endpoint whose documented denial for
 the tested cross-account condition is `403`. The assertion also requires non-2xx and zero tenant
@@ -212,6 +221,12 @@ not authorization inputs. At token creation, resolve and record each immutable p
 **ID** from the account permission-groups API; that live ID list is authoritative and names may
 change.
 
+Before any token is created, a separate reviewed PR must check in a dated permission-group ID
+manifest derived from an independently captured API response. The manifest records the retrieval
+date, account scope, expected label, immutable ID, source digest, and reviewer receipt. The token
+producer cannot generate or approve that manifest in the token-creation run. Section 4.2 compares
+the later token-read result to this pinned manifest, never to a fresh self-generated allowlist.
+
 Mupot policy for all rows:
 
 - Bind account-scoped policies to exactly
@@ -220,25 +235,35 @@ Mupot policy for all rows:
   a zone binding.
 - Carry read and write grants in separate tokens: `observe-read` never receives a Write/Edit
   group; `deploy-write` never receives Logs/Tail access; `break-glass/JIT-support` is separately
-  tenant-approved.
+  tenant-approved. Each JIT token carries only the one approved product/operation needed for that
+  support window, never the union of the JIT rows.
 - Set `expires_on` as an absolute UTC timestamp. Local maximum lifetime is 30 days for narrowly
-  scoped `observe-read`, 7 days for `deploy-write`, and 60 minutes for
-  `break-glass/JIT-support`. Mupot sends tenant-owner expiry alarms at 14, 7, 3, and 1 day; the
-  tenant's own Super Administrator manually creates the replacement, validates it, and revokes the
-  superseded token with a receipt. `deploy-write` is issued for a bounded release window and is not
-  auto-renewed. Expiry fails closed. This manual tenant operation is an accepted sovereignty cost,
-  not permission to add a broker, and a monthly revocation drill remains mandatory.
+  scoped metadata-only `observe-read`, 24 hours for `deploy-write`, and 60 minutes for
+  `break-glass/JIT-support`. Mupot alarms `observe-read` at 14, 7, 3, and 1 day; alarms
+  `deploy-write` at 6 and 1 hour; and warns `break-glass/JIT-support` at 15 minutes plus expiry.
+  The tenant's own Super Administrator manually creates any replacement, validates it, and revokes
+  the superseded token with a receipt. `deploy-write` is issued for one approved release window and
+  JIT is never renewed in place. Expiry fails closed. This manual tenant operation is an accepted
+  sovereignty cost, not permission to add a broker, and a monthly revocation drill remains
+  mandatory.
 - Store only token secret references plus the permission-group IDs, exact resource IDs,
   `issued_on`, `expires_on`, and revocation receipt ID in the central registry.
 
-| Product / operation | Expected read label | Expected write label | Exact resource binding | `expires_on` maximum | Capability carrier |
+Cloudflare's product Write groups below are account-scoped: they do **not** isolate one Worker,
+database, namespace, or queue from another in the same account. Therefore a `deploy-write` token is
+permitted only for a dedicated tenant-owned account containing Mupot-managed resources. Using a
+shared-workload tenant account requires a separate accepted-risk ADR, resource inventory, Hadi's
+direct approval, and parallel GREEN gates before token creation. An exact account binding prevents
+cross-account access; it does not imply per-resource isolation inside that account.
+
+| Product / operation | Expected read label | Expected write label | Cloudflare resource boundary | `expires_on` maximum | Capability carrier |
 |---|---|---|---|---|---|
-| Workers scripts, Durable Objects, and Workflows | `Workers Scripts Read` | `Workers Scripts Write` | Exact tenant account ID | read: 30d; write: 7d | read: `observe-read`; write: `deploy-write` |
-| D1 | `D1 Read` | `D1 Write` | Exact tenant account ID | read: 30d; write: 7d | read: `observe-read`; write: `deploy-write` |
-| Queues | `Queues Read` | `Queues Write` | Exact tenant account ID | read: 30d; write: 7d | read: `observe-read`; write: `deploy-write` |
-| Workers KV | `Workers KV Storage Read` | `Workers KV Storage Write` | Exact tenant account ID | read: 30d; write: 7d | read: `observe-read`; write: `deploy-write` |
+| Workers scripts, Durable Objects, and Workflows | `Workers Scripts Read` | `Workers Scripts Write` | Dedicated tenant account; all product resources in that account | read: 60m; write: 24h | read: `break-glass/JIT-support`; write: `deploy-write` |
+| D1 | `D1 Read` | `D1 Write` | Dedicated tenant account; all D1 databases in that account | read: 60m; write: 24h | read: `break-glass/JIT-support`; write: `deploy-write` |
+| Queues | `Queues Read` | `Queues Write` | Dedicated tenant account; all queues in that account | read: 60m; write: 24h | read: `break-glass/JIT-support`; write: `deploy-write` |
+| Workers KV | `Workers KV Storage Read` | `Workers KV Storage Write` | Dedicated tenant account; all KV namespaces in that account | read: 60m; write: 24h | read: `break-glass/JIT-support`; write: `deploy-write` |
 | R2 (deferred until exact bucket scope is proven) | `Workers R2 Storage Read` | `Workers R2 Storage Write` | Exact tenant bucket resource; no account-wide fallback | none in Phase 0 | no carrier until binding proof updates this ADR |
-| Worker routes | `Workers Routes Read` | `Workers Routes Write` | Exact tenant zone ID | read: 30d; write: 7d | read: `observe-read`; write: `deploy-write` |
+| Worker routes | `Workers Routes Read` | `Workers Routes Write` | Exact tenant zone ID | read: 30d; write: 24h | metadata read: `observe-read`; write: `deploy-write` |
 | Live Worker tail | `Workers Tail Read` | none | Exact tenant account ID | 60m | `break-glass/JIT-support` only |
 | Logpull / Instant Logs | `Logs Read` | none | Exact tenant zone ID for a zone endpoint or exact tenant account ID for an account endpoint, selected in the reviewed manifest; no wildcard | 60m | `break-glass/JIT-support` only |
 
@@ -246,13 +271,19 @@ The runtime control plane receives no `Logs Write` capability. A tenant configur
 Logpush destination manually in its own account under a separately reviewed destination allowlist;
 token expiry is not a teardown mechanism and must never be presented as one.
 
+Routine health/drift comes from minimized, signed tenant attestation rather than broad Cloudflare
+product reads. `observe-read` is limited here to non-content route metadata and must not contain
+`Workers Scripts Read`, `D1 Read`, `Queues Read`, `Workers KV Storage Read`, `Logs Read`, or
+`Workers Tail Read`; those groups can expose source, product state, tenant business data, or runtime
+content and remain JIT. The exact-permission test in Section 4.2 treats any such standing grant as a
+BLOCK.
+
 Durable Objects and Workflows intentionally have no standalone matrix rows: Cloudflare's Durable
 Objects namespace API accepts `Workers Scripts Read` / `Workers Scripts Write`, and the Workflows
 API accepts `Workers Scripts Read` / `Workers Scripts Write` (plus `Workers Tail Read` for
-applicable reads). Standing `observe-read` covers only Workflows operations accepted with
-`Workers Scripts Read`; any operation requiring `Workers Tail Read` is excluded from routine
-health/drift and requires the 60-minute tenant-approved JIT carrier. They therefore remain folded
-into the Workers Scripts permission boundary without silently widening `observe-read`.
+applicable reads). Both groups remain 60-minute tenant-approved JIT for read operations; routine
+health/drift uses signed attestation. Durable Objects and Workflows therefore remain folded into
+the Workers Scripts permission boundary without silently widening `observe-read`.
 Before minting, the implementation must reconcile the current API-returned group name/ID. If the
 live permission-group list disagrees with this table, fail closed and update this ADR through a
 reviewed PR; do not broaden the token.
@@ -260,16 +291,20 @@ reviewed PR; do not broaden the token.
 ## 6. Separate-ownership account evidence gate
 
 Phase 0 is not proven by a second account controlled by the same Mumega owner. The pilot must be a
-genuinely separate-ownership Cloudflare account, and its deploy token must be created by **that
-account's own Super Administrator**. No real token may be minted or requested until Hadi grants
-the required direct approval for that named pilot and test.
+genuinely separate-ownership, dedicated Mupot-only Cloudflare account, and its account-owned deploy
+token must be created by **that account's own Super Administrator** through the account-token flow.
+No user API token is accepted as the pilot runtime credential. No real token may be minted or
+requested until Hadi grants the required direct approval for that named pilot and test.
+The tenant rotation runbook names primary and backup Super Administrator custodians so account-owned
+token maintenance does not depend on one person's availability.
 
 The protected evidence manifest must record full IDs for:
 
 1. the central Mumega account (`e39eaf94...`),
 2. the pilot separate-ownership account,
 3. a second tenant-owned account used only as the other negative boundary,
-4. the tested token ID/hash reference, creator account and role, exact permission-group IDs,
+4. the tested account-owned token ID/hash reference, creator account and Super Administrator role,
+   exact permission-group IDs,
    resource bindings, `issued_on`, `expires_on`, tested commit, and revocation receipt.
 
 The public PR and repository must contain only account-ID prefixes plus a signed receipt URI and
@@ -290,10 +325,13 @@ Landing this ADR does **not** complete Phase 0 and does not unlock Phase 1. Phas
 all of the following hold at one immutable tested commit:
 
 1. the evidence JSON Schema and CI verifier are merged and passing,
-2. Hadi has directly approved the named separate-ownership pilot/test and the front-door posture,
-3. every Section 4.2 evidence receipt verifies, including separate-account negative boundaries,
-4. review-worker and kasra-review are GREEN on the exact evidence-bearing head, and
-5. the gate owner recorded on the Mupot task, outside this deliberately owner-unassigned ADR,
+2. the dated permission-group ID manifest is merged under its own independent review receipt,
+3. Hadi has directly approved the named dedicated separate-ownership pilot, a distinct second
+   tenant-owned negative-boundary account, and the front-door posture,
+4. every Section 4.2 conformance-harness evidence receipt verifies,
+5. review-worker and kasra-review are GREEN on the exact evidence-bearing head,
+6. Hadi has assigned the post-ADR operational owner, and
+7. the gate owner recorded on the Mupot task, outside this deliberately owner-unassigned ADR,
    records the final Phase 0 verdict and receipt digest in Mupot Project Evidence.
 
 - **Phase 0** - closes only under the predicate above; ADR + threat model + matrix alone are not
@@ -315,11 +353,15 @@ all of the following hold at one immutable tested commit:
   direct go. This touches external-facing and credential-mint sensitive surfaces, so the
   adversarial gate runs **in parallel** with the correctness gate, not after it.
 - If genuinely blocked on a decision only Hadi can make - specifically which tenant owns the first
-  real separate-account pilot or whether its Super Administrator may mint the test token - file a
-  tracked GitHub issue with that decision clearly framed. Continue only unrelated design work;
+  real dedicated pilot, which distinct tenant supplies the second negative boundary, who becomes
+  the operational owner, or whether the pilot Super Administrator may create the test token - file
+  a tracked GitHub issue with that decision clearly framed. Continue only unrelated design work;
   do not treat the issue as permission to mint, deploy, merge, or bypass the gate.
 
 ## 9. Cloudflare sources
+
+All sources below were retrieved on 2026-08-03 UTC. Permission labels remain non-authoritative;
+the separately reviewed dated ID manifest required by Sections 5 and 7 is the immutable input.
 
 - API token permission names and resource scopes:
   https://developers.cloudflare.com/fundamentals/api/reference/permissions/
