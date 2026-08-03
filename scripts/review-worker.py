@@ -656,16 +656,28 @@ REPORT_BODY_MAX_CHARS = 60_000
 
 
 def _cap_body(body: str) -> str:
-    """The mupot endpoint 413s oversized task_update bodies; a lost receipt means
-    the head never carries its review marker, so the same PR gets re-reviewed
-    (a full model run) every cycle. Keep the original statement head + newest
-    receipts tail."""
-    if len(body) <= REPORT_BODY_MAX_CHARS:
+    """The mupot endpoint rejects oversized requests (HTTP 413), and a lost
+    receipt means the task gets re-processed every cycle. Budget the JSON-
+    ENCODED size (escaping inflates newline-heavy bodies), keep the head
+    (original statement) plus the newest receipts tail, and cut the tail at a
+    receipt boundary so the newest receipt survives complete with its marker."""
+    def encoded_len(s: str) -> int:
+        return len(json.dumps(s).encode())
+
+    if encoded_len(body) <= REPORT_BODY_MAX_CHARS:
         return body
+    head = body[:4000]
+    tail_budget = REPORT_BODY_MAX_CHARS - encoded_len(head) - 200
+    tail = body[-max(tail_budget // 2, 4000):]
+    while encoded_len(tail) > tail_budget and len(tail) > 1000:
+        tail = tail[len(tail) // 4:]
+    boundary = tail.find("\n---\n")
+    if 0 <= boundary <= len(tail) // 2:
+        tail = tail[boundary:]
     return (
-        body[:4000]
-        + "\n\n... [task body truncated: server request cap; newest receipts kept below] ...\n\n"
-        + body[-(REPORT_BODY_MAX_CHARS - 4000):]
+        head
+        + "\n\n... [task body truncated: server request cap; newest receipts kept below] ...\n"
+        + tail
     )
 
 

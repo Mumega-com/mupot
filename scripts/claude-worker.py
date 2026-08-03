@@ -111,22 +111,35 @@ def _link_node_modules(worktree: Path) -> None:
     resolves the wrong package ("This is not the tsc command you are looking
     for") and verify fails on every task. Symlink the repo's install into the
     worktree; skip silently if the repo has none."""
-    src = REPO / "node_modules"
+    src = (REPO / "node_modules").resolve()
     dst = worktree / "node_modules"
     if src.is_dir() and not dst.exists():
         dst.symlink_to(src)
 
 
 def _cap_body(body: str) -> str:
-    """The mupot endpoint rejects oversized task_update bodies (HTTP 413), and a
-    lost receipt means the task gets re-processed every cycle. Keep the head
-    (original task statement) and the newest tail (latest receipts)."""
-    if len(body) <= BODY_MAX_CHARS:
+    """The mupot endpoint rejects oversized requests (HTTP 413), and a lost
+    receipt means the task gets re-processed every cycle. Budget the JSON-
+    ENCODED size (escaping inflates newline-heavy bodies), keep the head
+    (original statement) plus the newest receipts tail, and cut the tail at a
+    receipt boundary so the newest receipt survives complete with its marker."""
+    def encoded_len(s: str) -> int:
+        return len(json.dumps(s).encode())
+
+    if encoded_len(body) <= BODY_MAX_CHARS:
         return body
+    head = body[:4000]
+    tail_budget = BODY_MAX_CHARS - encoded_len(head) - 200
+    tail = body[-max(tail_budget // 2, 4000):]
+    while encoded_len(tail) > tail_budget and len(tail) > 1000:
+        tail = tail[len(tail) // 4:]
+    boundary = tail.find("\n---\n")
+    if 0 <= boundary <= len(tail) // 2:
+        tail = tail[boundary:]
     return (
-        body[:4000]
-        + "\n\n... [task body truncated: server request cap; newest receipts kept below] ...\n\n"
-        + body[-(BODY_MAX_CHARS - 4000):]
+        head
+        + "\n\n... [task body truncated: server request cap; newest receipts kept below] ...\n"
+        + tail
     )
 
 
@@ -170,7 +183,8 @@ def verify(worktree: Path, branch: str) -> tuple[bool, str]:
     commits = git("log", "main..HEAD", "--oneline", cwd=worktree, check=False).stdout.strip()
     if not commits:
         return False, "no commits — claude produced no work"
-    changed = git("diff", "--name-only", "main..HEAD", cwd=worktree, check=False).stdout.split()
+    status_out = git("diff", "--name-status", "-M", "main..HEAD", cwd=worktree, check=False).stdout
+    changed = [f for line in status_out.splitlines() for f in line.split("\t")[1:]]
     if changed and not any(f.endswith(CODE_SUFFIXES) for f in changed):
         return True, f"docs-only diff — tsc skipped\ncommits:\n{commits}"
     _link_node_modules(worktree)
