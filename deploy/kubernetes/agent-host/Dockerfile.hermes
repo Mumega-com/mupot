@@ -33,6 +33,15 @@ COPY --chown=10000:10000 \
     fleet-runtime/hermes-query-stdin.py \
     /opt/mupot/
 
+COPY --chown=10000:10000 \
+    fleet-runtime/geo-scanner/contract.mjs \
+    fleet-runtime/geo-scanner/budget.mjs \
+    fleet-runtime/geo-scanner/vertex.mjs \
+    fleet-runtime/geo-scanner/sinks.mjs \
+    fleet-runtime/geo-scanner/scanner.mjs \
+    fleet-runtime/geo-scanner/cli.mjs \
+    /opt/mupot/geo-scanner/
+
 USER 10000:10000
 ENV HOME=/home/mupot \
     HERMES_HOME=/home/mupot \
