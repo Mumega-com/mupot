@@ -25,7 +25,7 @@ jobs:
       - name: Test
         run: npm test
       - name: Fleet runtime tests
-        run: node --test fleet-runtime/*.test.mjs
+        run: node --test 'fleet-runtime/**/*.test.mjs'
       - name: Wrangler dry-run bundle check
         run: npx wrangler deploy --dry-run --config wrangler.example.toml
       - name: D1 migration chain check

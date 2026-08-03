@@ -117,6 +117,11 @@ function deliverToTmux(text) {
   if (type.status !== 0) {
     return { ok: false, reason: 'tmux_send_failed', detail: type.stderr || type.error?.message }
   }
+  // Brief delay ensures input box registers text before Enter fires.
+  const delay = spawnSync('sleep', ['0.3'], { encoding: 'utf8' })
+  if (delay.status !== 0) {
+    return { ok: false, reason: 'delay_failed', detail: delay.stderr || delay.error?.message }
+  }
   // Enter as a separate key so multiline bodies stay literal under -l.
   const enter = spawnSync('tmux', ['send-keys', '-t', TMUX_SESSION, 'Enter'], { encoding: 'utf8' })
   if (enter.status !== 0) {
