@@ -84,9 +84,10 @@
   },
   "license": "SEE LICENSE IN LICENSE.md",
   "overrides": {
-    "fast-uri": "3.1.4",
-    "brace-expansion": "5.0.8",
+    "fast-uri": "^4.1.2",
+    "brace-expansion": "^5.0.9",
     "postcss": "8.5.18",
-    "sharp": "0.35.3"
+    "sharp": "0.35.3",
+    "ip-address": "^10.3.1"
   }
 }
