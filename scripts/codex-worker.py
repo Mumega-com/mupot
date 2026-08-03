@@ -11,6 +11,13 @@ Default model is the small/cheap tier (gpt-5.3-codex-spark, canary-verified
 2026-08-02): the loop philosophy is decision/execution split — cheap models
 execute the majority of work, the expensive gate decides what merges.
 
+CAGED EXECUTION (2026-08-03, per codex's own security audit): the model
+subprocess runs as the dedicated low-privilege user ``lane-codex`` with an
+empty environment — it cannot read mumega's home, tokens, or services, and
+holds only its own codex OAuth. The model gets a git-less COPY of the
+worktree in /home/lane-codex/work; the trusted driver rsyncs changes back,
+commits, verifies, and delivers. The model never touches git or the remote.
+
 Flow per task (assignee = codex, status = open):
   1. claim        -> task_update status=in_progress
   2. isolate      -> git worktree add -b codex/task-<id8> <wt> main
@@ -170,7 +177,7 @@ def build_brief(task: dict, worktree: Path, branch: str) -> str:
     return "\n".join(
         [
             f"You are the codex agent. Task from mupot (id {task['id']}).",
-            f"Work ONLY in this worktree: {worktree} (branch {branch}, already checked out).",
+            "Work ONLY in your current directory (a snapshot of the repo prepared for you).",
             "",
             f"TITLE: {task.get('title','')}",
             f"DONE WHEN: {task.get('done_when','')}",
@@ -179,34 +186,178 @@ def build_brief(task: dict, worktree: Path, branch: str) -> str:
             task.get("body", "") or "(no body — infer from title/done_when)",
             "",
             "RULES (hard):",
-            "- Make the change and COMMIT it in this worktree. Do NOT push, do NOT open a PR,",
-            "  do NOT merge, do NOT deploy — the driver handles delivery and a human gates it.",
-            "- Run `npx tsc --noEmit` and the affected `npx vitest run` yourself; the change must be clean+green.",
-            "- Pure, minimal, behavior-correct. If blocked or the task is unsafe, commit nothing and explain why.",
+            "- Edit files in this directory to complete the task. There is NO git here and no",
+            "  network remotes — the trusted driver diffs your changes, commits, and delivers;",
+            "  a human gates the PR. Do not attempt git/push/PR/deploy. CONTEXT.md has recent history.",
+            "- Run `npx tsc --noEmit` and the affected `npx vitest run` yourself; node_modules is",
+            "  provided. The change must be clean+green before you finish.",
+            "- Write a one-paragraph summary of WHAT you changed and WHY to .lane-summary.md",
+            "  in the directory root — the driver uses it as the commit body.",
+            "- Pure, minimal, behavior-correct. If blocked or the task is unsafe, change nothing",
+            "  except .lane-summary.md explaining why.",
         ]
     )
 
 
-def codex_run(worktree: Path, brief: str) -> subprocess.CompletedProcess:
-    # --full-auto wraps codex in a bwrap sandbox, which cannot create its network
-    # namespace on this host (bwrap: loopback: Failed RTM_NEWADDR — Ubuntu
-    # unprivileged-userns restriction), so every write in the run fails.
-    # Containment here is the isolated worktree + no-remote-access + PR gate,
-    # same trust level as athena-worker (--force --trust) and claude-worker
-    # (--dangerously-skip-permissions). Hadi-approved 2026-08-02 (option A).
-    cmd = ["codex", "exec", "--cd", str(worktree), "--sandbox", "danger-full-access"]
+LANE_USER = os.environ.get("LANE_USER", "lane-codex")
+LANE_WORK_ROOT = Path(os.environ.get("LANE_WORK_ROOT", "/home/lane-codex/work"))
+LANE_CODEX_BIN = os.environ.get("LANE_CODEX_BIN", "/usr/local/bin/codex")
+
+
+def _cage_dir(short: str) -> Path:
+    return LANE_WORK_ROOT / f"task-{short}"
+
+
+def _cage_out(worktree: Path, short: str) -> Path:
+    """Copy the checkout (minus .git) into the cage, owned by the lane user."""
+    cage = _cage_dir(short)
+    subprocess.run(["sudo", "-n", "rm", "-rf", str(cage)], check=True)
+    subprocess.run(["sudo", "-n", "mkdir", "-p", str(cage)], check=True)
+    subprocess.run(
+        ["sudo", "-n", "rsync", "-a", "--exclude=.git", f"{worktree}/", f"{cage}/"],
+        check=True,
+    )
+    subprocess.run(["sudo", "-n", "chown", "-R", f"{LANE_USER}:{LANE_USER}", str(cage)], check=True)
+    # Working deps: shared read-mostly store owned by the lane (refreshed out of
+    # band when the lockfile changes). Without this the model cannot run
+    # tsc/vitest and edits blind — the crippled-sandbox failure mode.
+    subprocess.run(
+        ["sudo", "-n", "-u", LANE_USER, "ln", "-sfn",
+         f"/home/{LANE_USER}/deps/node_modules", str(cage / "node_modules")],
+        check=False,
+    )
+    return cage
+
+
+class HostileCageOutput(RuntimeError):
+    """The cage returned something the driver must not process (symlink attack)."""
+
+
+# The cage runs untrusted model output; the driver is trusted and holds every
+# repo credential. A symlink crossing that boundary turns the driver into the
+# model's file-read primitive: the model writes `.lane-summary.md -> /home/
+# mumega/.fleet/agents/<token>`, rsync -a faithfully recreates the *link*, and
+# any driver-side read follows it straight out of the repo and into a pushed
+# commit body. The repo tracks zero symlinks (`git ls-tree -r main` mode 120000
+# == 0), so the driver refuses all of them rather than trying to classify safe
+# ones. The single exception is the root node_modules link the driver itself
+# creates for tsc/vitest — never something the cage can author, since
+# node_modules is excluded from the sync in both directions.
+_ALLOWED_LINKS = {"node_modules"}
+
+
+def _reject_symlinks(worktree: Path) -> None:
+    """Refuse any symlink the cage produced. Fail loud, never silently strip."""
+    offenders = []
+    for path in worktree.rglob("*"):
+        if not path.is_symlink():
+            continue
+        rel = path.relative_to(worktree)
+        if rel.parts and rel.parts[0] == ".git":
+            continue
+        if str(rel) in _ALLOWED_LINKS:
+            continue
+        offenders.append(f"{rel} -> {os.readlink(path)}")
+    if offenders:
+        raise HostileCageOutput(
+            "cage returned symlink(s); refusing to process the delivery: "
+            + "; ".join(sorted(offenders))
+        )
+
+
+def _cage_back(worktree: Path, short: str) -> None:
+    """Bring the model's edits back into the driver's worktree (driver commits).
+
+    --safe-links drops links resolving outside the tree at the rsync boundary;
+    _reject_symlinks is the belt to that suspenders, catching in-tree links and
+    any rsync flag regression. Both run before the driver reads a single byte.
+    """
+    cage = _cage_dir(short)
+    subprocess.run(
+        ["sudo", "-n", "rsync", "-a", "--safe-links", "--delete", "--exclude=.git",
+         "--exclude=node_modules", "--exclude=CONTEXT.md",
+         f"{cage}/", f"{worktree}/"],
+        check=True,
+    )
+    subprocess.run(["sudo", "-n", "chown", "-R", "mumega:mumega", str(worktree)], check=True)
+    subprocess.run(["sudo", "-n", "rm", "-rf", str(cage)], check=False)
+    _reject_symlinks(worktree)
+
+
+def _write_cage_context(worktree: Path) -> None:
+    """The cage has no .git — give the model recent history for orientation."""
+    log_out = git("log", "--oneline", "-15", cwd=worktree, check=False).stdout
+    (worktree / "CONTEXT.md").write_text(
+        "# Repo context (snapshot — no git available here)\n\n"
+        "Recent commits on main:\n```\n" + log_out + "```\n"
+    )
+
+
+def codex_run(worktree: Path, brief: str, short: str) -> subprocess.CompletedProcess:
+    # Caged execution: the model runs as LANE_USER with env -i — no mumega
+    # home access, no service control, no inherited secrets. It edits a
+    # git-less copy; the driver owns all git and remote operations.
+    _write_cage_context(worktree)
+    cage = _cage_out(worktree, short)
+    cmd = [
+        "sudo", "-n", "-u", LANE_USER,
+        "env", "-i", f"HOME=/home/{LANE_USER}", "PATH=/usr/local/bin:/usr/bin:/bin",
+        LANE_CODEX_BIN, "exec", "--cd", str(cage), "--skip-git-repo-check",
+        "--sandbox", "danger-full-access",
+    ]
     if MODEL:
         cmd += ["-m", MODEL]
     cmd.append(brief)
-    log(f"dispatching codex exec (model={MODEL or 'default'}, timeout {TIMEOUT}s) ...")
-    return subprocess.run(cmd, cwd=str(worktree), capture_output=True, text=True, timeout=TIMEOUT)
+    log(f"dispatching caged codex exec (user={LANE_USER}, model={MODEL or 'default'}, timeout {TIMEOUT}s) ...")
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT)
+    finally:
+        _cage_back(worktree, short)
+
+
+# The commit body is the one place cage-authored text reaches a pushed artifact,
+# so it is read with O_NOFOLLOW: even if _reject_symlinks were bypassed or a
+# future edit reordered the calls, the read itself cannot traverse a link. The
+# cap bounds how much a hostile summary can smuggle into a commit message.
+MAX_SUMMARY_BYTES = 8192
+
+
+def _read_summary(summary_file: Path) -> str:
+    """Read the model's commit body without ever following a symlink."""
+    try:
+        fd = os.open(summary_file, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return ""
+    except OSError as exc:  # ELOOP == the path is a symlink; treat as hostile
+        raise HostileCageOutput(
+            f".lane-summary.md is a symlink (-> {os.readlink(summary_file)}); "
+            "refusing to read it into a commit body"
+        ) from exc
+    try:
+        with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read(MAX_SUMMARY_BYTES).strip()
+    except OSError:
+        return ""
 
 
 def verify(worktree: Path, branch: str) -> tuple[bool, str]:
-    """codex must have committed real work + it must compile. No fake-green."""
+    """The cage returns file edits, not commits: the driver stages and commits
+    them (summary from .lane-summary.md), then verifies. No fake-green."""
+    summary_file = worktree / ".lane-summary.md"
+    summary = _read_summary(summary_file)
+    if summary_file.is_symlink() or summary_file.exists():
+        summary_file.unlink()
+    ctx = worktree / "CONTEXT.md"
+    if ctx.exists():
+        ctx.unlink()
+    status = git("status", "--porcelain", cwd=worktree, check=False).stdout.strip()
+    if status:
+        git("add", "-A", cwd=worktree)
+        msg = "lane(codex): caged task delivery\n\n" + (summary or "(model provided no .lane-summary.md)")
+        git("commit", "-m", msg, cwd=worktree)
     commits = git("log", "main..HEAD", "--oneline", cwd=worktree, check=False).stdout.strip()
     if not commits:
-        return False, "no commits — codex produced no work"
+        return False, "no changes — codex produced no work" + (f" (summary: {summary[:400]})" if summary else "")
     status_out = git("diff", "--name-status", "-M", "main..HEAD", cwd=worktree, check=False).stdout
     changed = [f for line in status_out.splitlines() for f in line.split("\t")[1:]]
     if changed and not any(f.endswith(CODE_SUFFIXES) for f in changed):
@@ -267,9 +418,19 @@ def run_task(task: dict) -> None:
     git("worktree", "add", "-b", branch, str(worktree), "main")
     _link_node_modules(worktree)
     try:
-        proc = codex_run(worktree, build_brief(task, worktree, branch))
+        proc = codex_run(worktree, build_brief(task, worktree, branch), short)
         log(f"codex exit {proc.returncode}; output tail:\n{(proc.stdout or '')[-800:]}")
         ok, note = verify(worktree, branch)
+        if not ok and "tsc errors" in note:
+            # One self-repair bounce: the cage sees its own compile errors once.
+            log("verify failed on tsc — one repair bounce")
+            repair_brief = build_brief(task, worktree, branch) + (
+                "\n\nREPAIR ROUND: your previous edits fail `npx tsc --noEmit` with the"
+                f" errors below. Fix them; change nothing else.\n\n{note[-3000:]}"
+            )
+            proc = codex_run(worktree, repair_brief, short)
+            log(f"repair exit {proc.returncode}; output tail:\n{(proc.stdout or '')[-400:]}")
+            ok, note = verify(worktree, branch)
         if not ok:
             log(f"verify FAILED: {note}")
             report_blocked(task, note)
