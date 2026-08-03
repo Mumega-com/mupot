@@ -634,6 +634,8 @@ export async function useConnectorById<T extends ImmediateConnectorResult>(
           const username = basicAuthUsername(row.meta)
           if (!username) throw new Error('invalid connector auth config')
           headers.set('authorization', `Basic ${btoa(`${username}:${secret}`)}`)
+        } else if (row.type === 'dataforseo') {
+          headers.set('authorization', `Bearer ${secret}`)
         } else {
           throw new Error('unsupported connector auth')
         }

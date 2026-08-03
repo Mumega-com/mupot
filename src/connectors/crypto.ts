@@ -44,6 +44,8 @@ export type ConnectorType =
   // uses the existing github_app connector + project_provider_bindings.
   | 'linear'
   | 'notion'
+  // SEO data sources (paid API connectors for search performance):
+  | 'dataforseo'
   | 'custom'
 export type ConnectorScopeType = 'squad' | 'agent' | 'pot'
 
@@ -62,6 +64,7 @@ const VALID_TYPES: readonly ConnectorType[] = [
   'crm',
   'linear',
   'notion',
+  'dataforseo',
   'custom',
 ]
 const VALID_SCOPE_TYPES: readonly ConnectorScopeType[] = ['squad', 'agent', 'pot']
