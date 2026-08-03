@@ -38,6 +38,54 @@ block collapses into a changelog entry when it ships.
 
 ## [Unreleased]
 
+### Added
+
+- Linear connector (flight-20260803-linear-posthog): `createLinearBoardPort`
+  (`src/projects/providers/linear.ts`) now does real, read-only GraphQL reads
+  against Linear (`src/integrations/linear-issues.ts`) through the existing
+  connector vault (`connector type 'linear'`, already registered in
+  `src/connectors/crypto.ts`/`dashboard.ts` since #issue-116-era scaffolding —
+  this flight replaces the `linear_adapter_pending_credentials` stub with the
+  live adapter). Recon during this flight found the port/registry/binding
+  layer for Linear already built (`src/projects/providers/{port,registry,
+  bindings}.ts`); only the adapter body was a stub — narrower work than the
+  flight's "Linear: greenfield" premise assumed.
+  - Structural, not discretionary, enforcement of "a priority surface must
+    never be an authorization surface": imported issues become UNASSIGNED
+    mupot tasks (`assignee_agent_id` is always `null` — no field on a Linear
+    issue, including its assignee, is ever mapped to a mupot agent), routed
+    only to an admin-configured `defaultSquadId` (set via the existing
+    project-binding `meta_json`, e.g. `{"defaultSquadId":"squad-a"}` —
+    absent it, every item reports `no_squad` and nothing is written).
+    Task creation passes `skipEvent: true` (no `task.created` bus event, so
+    `bus/consumer.ts`'s `dispatchSquad` — the actual wake mechanism — never
+    fires for Linear-origin data) and `skipMirror: true` (no outbound GitHub
+    issue write from externally-sourced text). This deliberately does NOT
+    mirror `src/integrations/github-projects.ts`'s agent-field-to-assignee
+    resolution, which is exactly the part of that pattern this flight's
+    binding constraint forbids for a read-only priority source.
+  - Added the `'linear'` case to `useConnectorById`'s auth-header construction
+    in `src/connectors/service.ts` (raw API key, no `Bearer` prefix — differs
+    from posthog/inkwell), the same extension point telegram/posthog/mcpwp
+    already register through.
+  - `TaskBoardSyncResult.items[].status` gained `'no_squad'` (additive; distinct
+    from GitHub's `'no_agent'`) in `src/projects/providers/port.ts`.
+  - Tests: `tests/linear-issues.test.ts`, `tests/linear-board-provider.test.ts`,
+    `tests/connectors-linear-auth.test.ts` — tenant isolation, revoked/missing
+    credential fail-closed, redirect/non-2xx fail-closed, secret never echoed,
+    dedup, and a **structural** source-text assertion (not just behavioral)
+    that the file never resolves a Linear field to an agent and always passes
+    `skipEvent`/`skipMirror`, so a future edit that reintroduces a dispatch
+    path fails this suite immediately.
+  - PostHog: recon found the tenant-scoped vault path and the owner-gated
+    env-credentials fallback (#473 CONCERN-2) were **already shipped**
+    (`src/addons/marketing/adapters/posthog.ts`, `isPotOwnerTenant`) with
+    thorough existing coverage in `tests/marketing-monitor-adapters.test.ts` —
+    no PostHog migration work remained for this flight beyond confirming it
+    (all suites re-run green). PostHog "capture" (event-ingestion) scope was
+    NOT implemented — no caller in the codebase needs it; flagging as an open
+    gap rather than building an unused write-shaped surface.
+
 ### Changed
 
 - Fleet coordination cut over to mupot CF-native primitives (D1 send/inbox + presence +
