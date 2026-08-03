@@ -53,7 +53,7 @@ and recommends no additional permissions plus IP or TTL restrictions.
 ### Operations
 
 Health+redeploy is insufficient. Cloudflare exposes real per-product APIs: D1 requires D1
-Read/Edit; Queues exposes list/consumer/backlog operations; Workers logs remain in each account
+Read/Write; Queues exposes list/consumer/backlog operations; Workers logs remain in each account
 while Tail Workers/OTEL/Logpush can push telemetry centrally. This needs an explicit per-product
 capability matrix, not one blanket scope. The central dashboard defaults to **metadata only**:
 desired-vs-observed release digest, config-hash drift, last reconciliation, health, queue
@@ -116,6 +116,12 @@ Every row is a merge gate. A verbal result, screenshot alone, or positive-path-o
 satisfy it. The named test must pass and its machine-readable evidence artifact must be attached to
 the PR at the tested commit.
 
+Artifact paths below are logical keys in protected Mupot Project Evidence, not instructions to
+commit tenant identifiers or credential metadata to the public repository. The PR records only the
+evidence receipt URI, SHA-256 digest, tested commit, account-ID prefixes, and gate verdict. Before
+Phase 0 can be accepted, a checked-in JSON Schema and CI verifier must reject unsigned, malformed,
+wrong-commit, or manually self-attested evidence.
+
 | Acceptance attack | Named test | Required assertion | Evidence artifact |
 |---|---|---|---|
 | Tenant token isolation | `phase0-tenant-token-isolation` | Pilot token succeeds only on the pilot account and returns `403` for the same endpoint against central account `e39eaf94...` and a second tenant-owned account | `evidence/federated-control-plane/phase0/tenant-token-isolation.json` |
@@ -124,6 +130,14 @@ the PR at the tested commit.
 | Stale generation fencing | `phase0-stale-generation-cas-deny` | A lower or replayed generation cannot overwrite a newer desired/observed generation | `evidence/federated-control-plane/phase0/stale-generation-cas-deny.json` |
 | Immediate revocation | `phase0-revoked-token-immediate-stop` | After revocation, the next attempted control action is denied and no later reconciliation is accepted from the cached credential | `evidence/federated-control-plane/phase0/revoked-token-immediate-stop.json` |
 | Zero credentials in registry | `phase0-registry-zero-credentials` | Schema, rows, logs, exports, and backups contain secret references only and reject token-shaped material | `evidence/federated-control-plane/phase0/registry-zero-credentials.json` |
+| No token-minting root | `phase0-no-token-mint-permission` | For every runtime token, the token-read response's resolved permission-group ID set excludes all API-token and account-API-token management Write/Edit groups | `evidence/federated-control-plane/phase0/no-token-mint-permission.json` |
+| Control-plane front-door authentication | `phase0-control-plane-auth-boundary` | Unauthenticated, expired-session, cross-tenant, and replayed-session requests cannot reach Mupot control APIs; authenticated tenant sessions remain tenant-scoped | `evidence/federated-control-plane/phase0/control-plane-auth-boundary.json` |
+
+For tenant isolation, Phase 0 selects and records a Cloudflare endpoint whose documented denial for
+the tested cross-account condition is `403`. The assertion also requires non-2xx and zero tenant
+resource data in the response body. A different observed status does not permit an ad hoc loosened
+gate; it blocks the evidence specification until the endpoint and expected Cloudflare error code
+are reviewed in this ADR.
 
 ### 4.3 Attack vectors
 
@@ -136,6 +150,7 @@ the PR at the tested commit.
 | Spoofed telemetry | Fake heartbeat or reconcile status | Signed payloads, nonce/epoch monotonic checks, signer-to-tenant binding |
 | Telemetry content poisoning | Logs or status fields inject instructions, markup, or forged state | Treat telemetry as untrusted data, schema/size constrain it, escape rendering, redact before central storage |
 | Audit-chain integrity | Control receipts are removed, reordered, or rewritten | Append-only hash-linked receipts, signed sequence/generation, independent verification and gap alarms |
+| Control-plane front-door bypass | Mupot application auth is the only remaining public control-plane gate | Short sessions, replay resistance, tenant-scoped authorization on every control route, independent auth-boundary acceptance test |
 | Build artifact drift | Unsigned or substituted artifact executes | Digest lock + signed manifest hash + generation checks |
 | Callback tampering | Untrusted postback path changes result | Replay window, callback signature, tenant-scoped routing |
 | SSRF | Unbounded health target reaches internal services | Canonical allowlist, scheme/host/path lock, DNS/IP revalidation, no arbitrary fetch |
@@ -153,7 +168,7 @@ Mupot policy for all rows:
   `"com.cloudflare.api.account.<TENANT_ACCOUNT_ID>": "*"`; never use the all-accounts wildcard.
 - Bind zone-scoped policies to the exact tenant zone ID. An account grant is not a substitute for
   a zone binding.
-- Carry read and write grants in separate tokens: `observe-read` never receives an Edit/Write
+- Carry read and write grants in separate tokens: `observe-read` never receives a Write/Edit
   group; `deploy-write` never receives Logs/Tail access; `break-glass/JIT-support` is separately
   tenant-approved.
 - Set `expires_on` as an absolute UTC timestamp. Local maximum lifetime is 30 days for
@@ -163,14 +178,14 @@ Mupot policy for all rows:
 
 | Product / operation | Documented read group | Documented write group | Exact resource binding | `expires_on` maximum | Capability carrier |
 |---|---|---|---|---|---|
-| Workers scripts, Durable Objects, and Workflows | `Workers Scripts Read` | `Workers Scripts Edit` | Exact tenant account ID | read: 30d; write: 7d | read: `observe-read`; write: `deploy-write` |
-| D1 | `D1 Read` | `D1 Edit` | Exact tenant account ID | read: 30d; write: 7d | read: `observe-read`; write: `deploy-write` |
-| Queues | `Queues Read` | `Queues Edit` | Exact tenant account ID | read: 30d; write: 7d | read: `observe-read`; write: `deploy-write` |
-| Workers KV | `Workers KV Storage Read` | `Workers KV Storage Edit` | Exact tenant account ID | read: 30d; write: 7d | read: `observe-read`; write: `deploy-write` |
-| R2 | `Workers R2 Storage Read` | `Workers R2 Storage Edit` | Exact tenant account ID; exact bucket binding where supported | read: 30d; write: 7d | read: `observe-read`; write: `deploy-write` |
-| Worker routes | `Workers Routes Read` | `Workers Routes Edit` | Exact tenant zone ID | read: 30d; write: 7d | read: `observe-read`; write: `deploy-write` |
+| Workers scripts, Durable Objects, and Workflows | `Workers Scripts Read` | `Workers Scripts Write` | Exact tenant account ID | read: 30d; write: 7d | read: `observe-read`; write: `deploy-write` |
+| D1 | `D1 Read` | `D1 Write` | Exact tenant account ID | read: 30d; write: 7d | read: `observe-read`; write: `deploy-write` |
+| Queues | `Queues Read` | `Queues Write` | Exact tenant account ID | read: 30d; write: 7d | read: `observe-read`; write: `deploy-write` |
+| Workers KV | `Workers KV Storage Read` | `Workers KV Storage Write` | Exact tenant account ID | read: 30d; write: 7d | read: `observe-read`; write: `deploy-write` |
+| R2 | `Workers R2 Storage Read` | `Workers R2 Storage Write` | Exact tenant account ID; exact bucket binding where supported | read: 30d; write: 7d | read: `observe-read`; write: `deploy-write` |
+| Worker routes | `Workers Routes Read` | `Workers Routes Write` | Exact tenant zone ID | read: 30d; write: 7d | read: `observe-read`; write: `deploy-write` |
 | Live Worker tail | `Workers Tail Read` | none | Exact tenant account ID | 60m | `break-glass/JIT-support` only |
-| Logpull / Logpush / Instant Logs | `Logs Read` | `Logs Edit` only when export configuration must change | Exact account or zone ID required by the endpoint | 60m | `break-glass/JIT-support` only |
+| Logpull / Logpush / Instant Logs | `Logs Read` | `Logs Write` only when export configuration must change | Exact account or zone ID required by the endpoint | 60m | `break-glass/JIT-support` only |
 
 Durable Objects and Workflows intentionally have no standalone matrix rows: Cloudflare's Durable
 Objects namespace API accepts `Workers Scripts Read` / `Workers Scripts Write`, and the Workflows
@@ -184,16 +199,19 @@ reviewed PR; do not broaden the token.
 
 Phase 0 is not proven by a second account controlled by the same Mumega owner. The pilot must be a
 genuinely separate-ownership Cloudflare account, and its deploy token must be created by **that
-account's own Super Administrator**. No real token may be minted or requested until Hadi gives the
-existing direct approval.
+account's own Super Administrator**. No real token may be minted or requested until Hadi grants
+the required direct approval for that named pilot and test.
 
-The evidence manifest must record full IDs for:
+The protected evidence manifest must record full IDs for:
 
 1. the central Mumega account (`e39eaf94...`),
 2. the pilot separate-ownership account,
 3. a second tenant-owned account used only as the other negative boundary,
 4. the tested token ID/hash reference, creator account and role, exact permission-group IDs,
    resource bindings, `issued_on`, `expires_on`, tested commit, and revocation receipt.
+
+The public PR and repository must contain only account-ID prefixes plus a signed receipt URI and
+digest. Full tenant account IDs remain in the access-controlled evidence store.
 
 `phase0-tenant-token-isolation` must contain a positive pilot request and paired negative requests
 using the same pilot token and endpoint shape: `403` against `e39eaf94...` and `403` against the
