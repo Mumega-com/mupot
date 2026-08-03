@@ -16,3 +16,6 @@ tmp/
 wrangler.toml
 wrangler.*.toml
 !wrangler.example.toml
+
+# mint artifacts: generated SQL carries token hashes + identity rows — never commit
+scripts/mint*.sql
