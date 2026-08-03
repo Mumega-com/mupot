@@ -1,7 +1,6 @@
 import { execFileSync } from 'node:child_process'
 import { existsSync, lstatSync, readFileSync } from 'node:fs'
 import { basename, resolve } from 'node:path'
-import { minimatch } from 'minimatch'
 
 /**
  * Design-status contract policy (#603 / rework of #604; round 4 decision table).
@@ -88,6 +87,30 @@ function hasValidContractId(contract) {
   return CONTRACT_ID_PATTERN.test(contract.id)
 }
 
+/** Dependency-free glob match for ignore patterns: `**` crosses slashes,
+ * `*` and `?` stay within a path segment. Enough for .design-status-ignore;
+ * avoids a runtime dep the bare CI job never installs. */
+function globMatch(path, pattern) {
+  let re = ''
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i]
+    if (ch === '*') {
+      if (pattern[i + 1] === '*') {
+        re += '.*'
+        i++
+        if (pattern[i + 1] === '/') i++
+      } else {
+        re += '[^/]*'
+      }
+    } else if (ch === '?') {
+      re += '[^/]'
+    } else {
+      re += ch.replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    }
+  }
+  return new RegExp(`^${re}$`).test(path)
+}
+
 function normalizeStatus(status) {
   return status.trim().toLowerCase()
 }
@@ -124,7 +147,7 @@ function isKnownJsoncPath(path) {
   const normalized = normalizePath(path)
   const base = basename(normalized)
   if (base.endsWith('.jsonc')) return true
-  if (minimatch(base, 'tsconfig*.json', { dot: true })) return true
+  if (base.startsWith('tsconfig') && base.endsWith('.json')) return true
   if (normalized === '.vscode' || normalized.startsWith('.vscode/')) return true
   if (normalized.includes('/.vscode/')) return true
   if (normalized === '.devcontainer' || normalized.startsWith('.devcontainer/')) return true
@@ -168,8 +191,6 @@ function pathMatchesGitignorePattern(filePath, pattern) {
   let pat = pattern
   const directoryOnly = pat.endsWith('/')
   if (directoryOnly) pat = pat.slice(0, -1)
-
-  const matchOptions = { dot: true, nocomment: true, nonegate: true }
   const candidates = []
 
   if (pat.startsWith('/')) {
@@ -192,7 +213,7 @@ function pathMatchesGitignorePattern(filePath, pattern) {
     }
   }
 
-  return candidates.some((candidate) => minimatch(normalized, candidate, matchOptions))
+  return candidates.some((candidate) => globMatch(normalized, candidate))
 }
 
 function isIgnoredByRules(path, rules) {
