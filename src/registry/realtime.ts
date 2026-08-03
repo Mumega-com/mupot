@@ -87,6 +87,33 @@ export function fanOutWebSockets(
 }
 
 /**
+ * nextPresenceExpiryMs — earliest wall-clock instant when an currently-online
+ * module's heartbeat window ends (last_heartbeat + PRESENCE_STALE_SECONDS).
+ * PresenceChannelDO schedules an alarm at this instant so subscribers receive an
+ * offline transition without relying on client-side sync. null = nothing online.
+ */
+export function nextPresenceExpiryMs(
+  modules: ReadonlyArray<Pick<ModulePresence, 'status' | 'last_heartbeat'>>,
+  nowMs: number,
+  staleSeconds: number,
+): number | null {
+  if (!Number.isFinite(nowMs)) throw new Error('presence_expiry_now_invalid')
+  if (!Number.isFinite(staleSeconds) || staleSeconds < 0) {
+    throw new Error('presence_expiry_stale_invalid')
+  }
+  let earliest: number | null = null
+  for (const mod of modules) {
+    if (mod.status !== 'online') continue
+    const heartbeatMs = Date.parse(mod.last_heartbeat)
+    if (Number.isNaN(heartbeatMs)) continue
+    const expiryMs = heartbeatMs + staleSeconds * 1000
+    if (expiryMs <= nowMs) return nowMs
+    if (earliest === null || expiryMs < earliest) earliest = expiryMs
+  }
+  return earliest
+}
+
+/**
  * Reserved / abnormal close codes (RFC 6455 §7.4.1) are synthesized by the
  * runtime when no Close frame arrived. Passing them to WebSocket.close()
  * throws RangeError inside the hibernation close handler — map to 1000
