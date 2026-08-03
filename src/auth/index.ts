@@ -116,7 +116,7 @@ async function clearPresence(env: Env, email: string | null): Promise<void> {
 
 /** Resolve the OAuth provider; default google. */
 function provider(env: Env): 'google' | 'telegram' {
-  return env.OAUTH_PROVIDER ?? 'google'
+  return env.IDP_PROVIDER ?? 'google'
 }
 
 /** Absolute redirect URI back to /auth/callback for this request's origin. */

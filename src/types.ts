@@ -70,7 +70,9 @@ export interface Env {
   // operator's own PostHog project and emit it under its own tenant's observations.
   OWNER_TENANT_SLUG?: string
   BRAND: string
-  OAUTH_PROVIDER: 'google' | 'telegram'
+  // Dashboard identity provider selector. Keep this distinct from the reserved
+  // OAUTH_PROVIDER helper that @cloudflare/workers-oauth-provider injects.
+  IDP_PROVIDER?: 'google' | 'telegram'
   // Immutable git commit for the deployed build, supplied by the release deploy.
   RELEASE_SHA?: string
   // The pot's canonical public origin (e.g. https://agents.digid.ca). When set, the

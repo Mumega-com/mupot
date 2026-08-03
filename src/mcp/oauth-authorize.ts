@@ -1,12 +1,12 @@
 // mupot — OAuth 2.1 authorize handler.
 //
-// Implements the Google IdP leg of the authorization flow (mupot.OAUTH_PROVIDER='google').
+// Implements the Google IdP leg of the authorization flow (mupot.IDP_PROVIDER='google').
 // Pattern ported from mumega's workers/mcp-dispatcher/src/oauth-authorize.ts with
 // mupot-specific simplifications:
 //   - No cross-pot identity call — sovereign per-pot: email → mupot's OWN members row.
 //   - No tenant provision endpoint — mupot IS the tenant (TENANT_SLUG from env).
 //   - No BYOA identity sync — mupot manages its own member_tokens.
-//   - Google only (mupot [vars] OAUTH_PROVIDER='google').
+//   - Google only (mupot [vars] IDP_PROVIDER='google').
 //
 // Design: Q1(a) — authorize-mints/resolves a member_tokens row:
 //   On consent the flow finds-or-creates a `members` row by email, mints a

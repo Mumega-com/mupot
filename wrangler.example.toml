@@ -17,7 +17,7 @@ TENANT_SLUG = "mumega"          # your org slug
                                  # only ever used on behalf of the owning tenant, never a
                                  # customer/forked deployment (src/types.ts Env, #473).
 BRAND = "Mumega"                   # dashboard brand
-OAUTH_PROVIDER = "google"         # google | telegram
+IDP_PROVIDER = "google"           # google | telegram; OAUTH_PROVIDER is reserved by the OAuth library
 # Required for Project Routine dispatch; scheduled work has no request Host to derive safely.
 # Set this to the canonical public origin of this pot before enabling a Routine.
 # PUBLIC_ORIGIN = "https://mupot.example.com"
