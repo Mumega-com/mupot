@@ -96,9 +96,15 @@ function globMatch(path, pattern) {
     const ch = pattern[i]
     if (ch === '*') {
       if (pattern[i + 1] === '*') {
-        re += '.*'
-        i++
-        if (pattern[i + 1] === '/') i++
+        if (pattern[i + 2] === '/') {
+          // '**/' spans zero or more COMPLETE segments — must not also match
+          // a suffix of a segment name ('**/broken.json' vs 'notbroken.json').
+          re += '(?:[^/]*/)*'
+          i += 2
+        } else {
+          re += '.*'
+          i++
+        }
       } else {
         re += '[^/]*'
       }
@@ -343,7 +349,7 @@ function collectContractLikes(parsed) {
 /**
  * @returns {{ failures: string[], warnings: string[], notes: string[] }}
  */
-function scanFile(path, text) {
+function scanFile(path, text, ignoreRules = []) {
   const empty = { failures: [], warnings: [], notes: [] }
   if (!normalizePath(path).endsWith('.json')) return empty
 
@@ -354,6 +360,12 @@ function scanFile(path, text) {
     const detail = error instanceof Error ? error.message : String(error)
     if (isKnownJsoncPath(path)) {
       return { failures: [], warnings: [], notes: [formatJsoncSkipNote(path, detail)] }
+    }
+    // Decision-table row (3): the ignore file suppresses PARSE errors only.
+    // It must never exempt a parseable contract from the status rules — a
+    // tracked one-line ignore entry would otherwise disable the whole gate.
+    if (isIgnoredByRules(path, ignoreRules)) {
+      return { failures: [], warnings: [], notes: [formatIgnoreSkipNote(path)] }
     }
     if (isRuntimeOrReleasePath(path)) {
       return { failures: [formatUnparseableJsonFailure(path, detail)], warnings: [], notes: [] }
@@ -422,11 +434,6 @@ function scan(root) {
   for (const path of trackedFiles(root)) {
     if (!normalizePath(path).endsWith('.json')) continue
 
-    if (isIgnoredByRules(path, ignoreRules)) {
-      notes.push(formatIgnoreSkipNote(path))
-      continue
-    }
-
     const absolutePath = resolve(root, path)
     const read = readTrackedText(absolutePath)
     if (read.kind === 'missing') continue
@@ -435,7 +442,7 @@ function scan(root) {
       continue
     }
 
-    const result = scanFile(path, read.text)
+    const result = scanFile(path, read.text, ignoreRules)
     failures.push(...result.failures)
     warnings.push(...result.warnings)
     notes.push(...result.notes)
