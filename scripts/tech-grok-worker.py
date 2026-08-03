@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""Headless athena (Cursor harness) -> mupot loop driver.
+"""Headless tech-grok (Cursor harness) -> mupot loop driver.
 
-Turns the `athena` agent (Grok 4.5, Cursor CLI harness) into a dispatchable technician that
+Turns the `tech-grok` technician (Grok 4.5, Cursor CLI harness) into a dispatchable technician that
 picks up mupot tasks and returns branches for a human/Kasra gate. The loop is
 trustworthy BY CONSTRUCTION: athena never self-closes a task (mupot's no-self-close
 guard, PR #417) and never touches the remote — the trusted driver does push/PR and
-moves the task to `review` for Kasra-core to gate. athena only writes code in an
+moves the task to `review` for Kasra-core to gate. tech-grok only writes code in an
 isolated worktree.
 
-Flow per task (assignee = athena, status = open):
+Flow per task (assignee = tech-grok, status = open):
   1. claim        -> task_update status=in_progress
-  2. isolate      -> git worktree add -b athena/task-<id8> <wt> main
+  2. isolate      -> git worktree add -b tech-grok/task-<id8> <wt> main
   3. dispatch     -> cursor-agent -p --force --trust --approve-mcps --workspace <wt> "<brief>"
-  4. verify       -> athena must have committed; run tsc + tests (no fake-green)
+  4. verify       -> tech-grok must have committed; run tsc + tests (no fake-green)
   5. deliver      -> driver pushes the branch + opens the PR (athena never does)
   6. report       -> task_update status=review, gate_owner set, PR linked
   7. notify       -> ping Kasra-core via mupot MCP send; remove the worktree (keep branch/PR)
@@ -21,20 +21,20 @@ The driver NEVER merges or deploys. Kasra-core gates the PR and verdicts the tas
 
 Config (env):
   MUPOT_MCP        default https://mupot.mumega.com/mcp
-  ATHENA_TOKEN     default ~/.fleet/agents/athena-member.token
-  ATHENA_AGENT_ID  default a9423609-... (the athena agent on the mumega pot)
+  TECH_GROK_TOKEN     default ~/.fleet/agents/tech-grok-member.token
+  TECH_GROK_AGENT_ID  default 141e954c-... (the tech-grok technician on the mumega pot)
   REPO             default /home/mumega/mupot
   GATE_OWNER       default 'gate:kasra-core' (capability Kasra-core holds)
   MODEL            optional cursor-agent --model override
   MAX_TASKS        default 1 (per run)
-  TIMEOUT          default 1800 (seconds per athena run)
+  TIMEOUT          default 1800 (seconds per tech-grok run)
   SANDBOX          '1' adds --sandbox enabled (recommended for untrusted tasks;
                    off by default so tsc/tests/git run unrestricted on our own repo)
   DRY_RUN          '1' = poll + print, do nothing
 
 Usage:
-  python3 scripts/athena-worker.py            # one-shot, up to MAX_TASKS
-  DRY_RUN=1 python3 scripts/athena-worker.py  # show what it would do
+  python3 scripts/tech-grok-worker.py            # one-shot, up to MAX_TASKS
+  DRY_RUN=1 python3 scripts/tech-grok-worker.py  # show what it would do
 """
 from __future__ import annotations
 
@@ -46,8 +46,8 @@ import urllib.request
 from pathlib import Path
 
 MUPOT_MCP = os.environ.get("MUPOT_MCP", "https://mupot.mumega.com/mcp")
-ATHENA_TOKEN_PATH = Path(os.environ.get("ATHENA_TOKEN", str(Path.home() / ".fleet/agents/athena-member.token")))
-ATHENA_AGENT_ID = os.environ.get("ATHENA_AGENT_ID", "a9423609-e3bf-4797-8af8-4b9b7aecdf16")
+TECH_GROK_TOKEN_PATH = Path(os.environ.get("TECH_GROK_TOKEN", str(Path.home() / ".fleet/agents/tech-grok-member.token")))
+TECH_GROK_AGENT_ID = os.environ.get("TECH_GROK_AGENT_ID", "141e954c-115c-45dc-918e-b02931317b9b")
 REPO = Path(os.environ.get("REPO", "/home/mumega/mupot"))
 GATE_OWNER = os.environ.get("GATE_OWNER", "gate:kasra-core")
 MODEL = os.environ.get("MODEL", "").strip()
@@ -61,15 +61,15 @@ WORKTREE_ROOT = Path(os.environ.get("WORKTREE_ROOT", "/home/mumega/mupot-worktre
 
 
 def log(msg: str) -> None:
-    print(f"[athena-worker] {msg}", flush=True)
+    print(f"[tech-grok-worker] {msg}", flush=True)
 
 
 def token() -> str:
-    return ATHENA_TOKEN_PATH.read_text().strip()
+    return TECH_GROK_TOKEN_PATH.read_text().strip()
 
 
 def mcp(tool: str, args: dict) -> dict:
-    """Call a mupot MCP tool as the athena agent. Returns the tool's `result`."""
+    """Call a mupot MCP tool as the tech-grok agent. Returns the tool's `result`."""
     body = json.dumps(
         {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": tool, "arguments": args}}
     ).encode()
@@ -80,7 +80,7 @@ def mcp(tool: str, args: dict) -> dict:
             "Authorization": f"Bearer {token()}",
             "content-type": "application/json",
             # CF error 1010 blocks the default Python-urllib UA as a bot signature.
-            "User-Agent": "athena-worker/1.0 (+mupot)",
+            "User-Agent": "tech-grok-worker/1.0 (+mupot)",
         },
         method="POST",
     )
@@ -145,7 +145,7 @@ def _cap_body(body: str) -> str:
 
 def register_presence() -> None:
     """Best-effort Port-1 self-registration so the concierge's dispatcher sees
-    athena as an online 'build' capability. registerModule is an idempotent
+    tech-grok as an online 'build' capability. registerModule is an idempotent
     upsert (src/registry/service.ts), so calling presence_register on every
     cycle both (re-)registers and refreshes the heartbeat in one call — no
     need to track "already registered this process" state, since each cycle
@@ -155,29 +155,29 @@ def register_presence() -> None:
     not block real task work.
 
     Capability tags must match src/tasks/effort-route.ts HARNESS_CAPABILITIES
-    for slug=athena: build only (never research/review).
+    for slug=tech-grok: build only (never research/review).
     """
     try:
         mcp("presence_register", {
-            "adapter": "athena",
+            "adapter": "tech-grok",
             "kind": "agent_system",
             "project_id": None,
             "capabilities": ["build"],
         })
-        log("presence: registered/refreshed (adapter=athena, capabilities=[build])")
+        log("presence: registered/refreshed (adapter=tech-grok, capabilities=[build])")
     except Exception as exc:  # noqa: BLE001 - presence is best-effort, never fatal
         log(f"presence_register failed (non-fatal): {exc}")
 
 
 def poll_open_tasks() -> list[dict]:
-    res = mcp("task_list", {"assignee_agent_id": ATHENA_AGENT_ID, "status": "open", "limit": MAX_TASKS})
+    res = mcp("task_list", {"assignee_agent_id": TECH_GROK_AGENT_ID, "status": "open", "limit": MAX_TASKS})
     return res.get("tasks", [])[:MAX_TASKS]
 
 
 def build_brief(task: dict, worktree: Path, branch: str) -> str:
     return "\n".join(
         [
-            f"You are the athena agent. Task from mupot (id {task['id']}).",
+            f"You are the tech-grok build technician. Task from mupot (id {task['id']}).",
             f"Work ONLY in this worktree: {worktree} (branch {branch}, already checked out).",
             "",
             f"TITLE: {task.get('title','')}",
@@ -213,10 +213,10 @@ def athena_run(worktree: Path, brief: str) -> subprocess.CompletedProcess:
 
 
 def verify(worktree: Path, branch: str) -> tuple[bool, str]:
-    """athena must have committed real work + it must compile. No fake-green."""
+    """tech-grok must have committed real work + it must compile. No fake-green."""
     commits = git("log", "main..HEAD", "--oneline", cwd=worktree, check=False).stdout.strip()
     if not commits:
-        return False, "no commits — athena produced no work"
+        return False, "no commits — tech-grok produced no work"
     status_out = git("diff", "--name-status", "-M", "main..HEAD", cwd=worktree, check=False).stdout
     changed = [f for line in status_out.splitlines() for f in line.split("\t")[1:]]
     if changed and not any(f.endswith(CODE_SUFFIXES) for f in changed):
@@ -233,12 +233,12 @@ def deliver(worktree: Path, branch: str, task: dict) -> str:
     git("push", "-u", "origin", branch, cwd=worktree)
     env = dict(os.environ)
     env.pop("GITHUB_TOKEN", None)
-    title = f"athena: {task.get('title','')[:60]}"
+    title = f"tech-grok: {task.get('title','')[:60]}"
     pr_body = (
-        f"Dispatched to the `athena` agent (Grok 4.5) headless via the mupot loop for task `{task['id']}`.\n\n"
+        f"Dispatched to the `tech-grok` technician (Grok 4.5) headless via the mupot loop for task `{task['id']}`.\n\n"
         f"Task done-when: {task.get('done_when','')}\n\n"
-        "Driver verified: athena committed real work + `tsc --noEmit` clean. "
-        "**Kasra-core gates this PR before merge** (the task is in `review`; athena cannot self-close it)."
+        "Driver verified: tech-grok committed real work + `tsc --noEmit` clean. "
+        "**Kasra-core gates this PR before merge** (the task is in `review`; tech-grok cannot self-close it)."
     )
     out = subprocess.run(
         ["gh", "pr", "create", "--repo", REPO_SLUG, "--base", "main", "--head", branch,
@@ -252,23 +252,23 @@ def deliver(worktree: Path, branch: str, task: dict) -> str:
 
 
 def report_review(task: dict, pr_url: str, note: str) -> None:
-    body = f"{task.get('body','')}\n\n---\nathena loop -> review. PR: {pr_url}\n{note}"
+    body = f"{task.get('body','')}\n\n---\ntech-grok loop -> review. PR: {pr_url}\n{note}"
     mcp("task_update", {"task_id": task["id"], "status": "review", "gate_owner": GATE_OWNER, "body": _cap_body(body)})
 
 
 def report_blocked(task: dict, reason: str) -> None:
-    body = f"{task.get('body','')}\n\n---\nathena loop BLOCKED: {reason}"
+    body = f"{task.get('body','')}\n\n---\ntech-grok loop BLOCKED: {reason}"
     mcp("task_update", {"task_id": task["id"], "status": "blocked", "body": _cap_body(body)})
 
 
 def run_task(task: dict) -> None:
     tid = task["id"]
     short = tid.split("-")[0]
-    branch = f"athena/task-{short}"
-    worktree = WORKTREE_ROOT / f"athena-{short}"
+    branch = f"tech-grok/task-{short}"
+    worktree = WORKTREE_ROOT / f"tech-grok-{short}"
     log(f"=== task {short}: {task.get('title','')[:60]} ===")
     if DRY_RUN:
-        log("DRY_RUN — would claim, dispatch athena, verify, PR, review. Skipping.")
+        log("DRY_RUN — would claim, dispatch tech-grok, verify, PR, review. Skipping.")
         return
 
     mcp("task_update", {"task_id": tid, "status": "in_progress"})
@@ -277,7 +277,7 @@ def run_task(task: dict) -> None:
     _link_node_modules(worktree)
     try:
         proc = athena_run(worktree, build_brief(task, worktree, branch))
-        log(f"athena exit {proc.returncode}; output tail:\n{(proc.stdout or '')[-800:]}")
+        log(f"tech-grok exit {proc.returncode}; output tail:\n{(proc.stdout or '')[-800:]}")
         ok, note = verify(worktree, branch)
         if not ok:
             log(f"verify FAILED: {note}")
@@ -306,7 +306,7 @@ def _notify_kasra(task: dict, pr_url: str) -> None:
             {
                 "to": to,
                 "body": (
-                    f"athena loop: task {task['id'].split('-')[0]} in review, "
+                    f"tech-grok loop: task {task['id'].split('-')[0]} in review, "
                     f"PR ready to gate: {pr_url}"
                 ),
             },
@@ -316,12 +316,12 @@ def _notify_kasra(task: dict, pr_url: str) -> None:
 
 
 def main() -> int:
-    if not ATHENA_TOKEN_PATH.exists():
-        log(f"no athena token at {ATHENA_TOKEN_PATH}")
+    if not TECH_GROK_TOKEN_PATH.exists():
+        log(f"no tech-grok token at {TECH_GROK_TOKEN_PATH}")
         return 2
     register_presence()
     try:
-        stuck = mcp("task_list", {"assignee_agent_id": ATHENA_AGENT_ID, "status": "in_progress", "limit": 5}).get("tasks", [])
+        stuck = mcp("task_list", {"assignee_agent_id": TECH_GROK_AGENT_ID, "status": "in_progress", "limit": 5}).get("tasks", [])
         for s_task in stuck:
             log(
                 f"WARNING orphaned in_progress task {s_task['id'][:8]} "
@@ -331,7 +331,7 @@ def main() -> int:
     except Exception:  # noqa: BLE001 - orphan check is advisory, never fatal
         pass
     tasks = poll_open_tasks()
-    log(f"{len(tasks)} open task(s) assigned to athena")
+    log(f"{len(tasks)} open task(s) assigned to tech-grok")
     for task in tasks:
         try:
             run_task(task)
