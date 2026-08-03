@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { chmodSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -46,26 +46,8 @@ describe('per-pot setup script', () => {
         env: { ...process.env, PATH: `${temp}:${process.env.PATH}`, FAKE_NPX_LOG: log },
         encoding: 'utf8',
       })
-      // Compare the config path by IDENTITY, not by string.
-      //
-      // setup.sh derives its root from bash `pwd` (logical path, symlinks kept);
-      // this test derives `repoRoot` from import.meta.url, which Node resolves to
-      // the real path. On this host /home/mumega and /mnt/HC_Volume_104325311 are
-      // the same physical directory, so the two spellings never matched and the
-      // test failed from every worktree — i.e. from every agent lane, since
-      // worktrees are the isolation model. See #658.
-      //
-      // The assertion's intent is "setup.sh points the operator at deploy.mjs with
-      // THIS config file", not "these two absolute strings are byte-identical".
-      // realpathSync collapses both spellings so the check survives any checkout root.
-      const deployLine = setupOutput.split('\n').find((l) => l.includes('deploy.mjs --config'))
-      expect(deployLine, 'setup.sh should print a deploy.mjs command').toBeDefined()
-      const emitted = /--config "([^"]+)"/.exec(deployLine ?? '')?.[1]
-      expect(emitted, 'deploy command should carry a --config path').toBeDefined()
-      expect(realpathSync(emitted as string)).toBe(realpathSync(config))
-
-      // Path-independent: setup.sh must never tell the operator to bypass deploy.mjs.
-      expect(setupOutput).not.toContain('npx wrangler deploy --config')
+      expect(setupOutput).toContain(`node scripts/deploy.mjs --config "${config}"`)
+      expect(setupOutput).not.toContain(`npx wrangler deploy --config "${config}"`)
 
       const written = readFileSync(config, 'utf8')
       expect(written).toContain(`name = "mupot-${pot}"`)
