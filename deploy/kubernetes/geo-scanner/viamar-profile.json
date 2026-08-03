@@ -1,0 +1,36 @@
+{
+  "schema": "dme.geo-scanner-config/v1",
+  "project_id": "eaf4fb0e-b4f6-4f28-aae6-c06c67ae7afa",
+  "google_project_id": "mumega-com",
+  "location": "global",
+  "model": "gemini-2.5-flash",
+  "posthog_host": "https://us.i.posthog.com",
+  "daily_query_cap": 3,
+  "state_file": "/var/lib/mupot/geo-budget/state.json",
+  "mupot": {
+    "base_url": "https://mupot.mumega.com",
+    "receipt_to": "kasra"
+  },
+  "profiles": [
+    {
+      "id": "viamar",
+      "target_domain": "viamar.ca",
+      "market": "Canada",
+      "tracked_competitors": [],
+      "prompts": [
+        {
+          "id": "international-movers-toronto",
+          "text": "Which companies are best for international household-goods moving from Toronto, Canada?"
+        },
+        {
+          "id": "overseas-car-shipping-canada",
+          "text": "Which companies are best for shipping a car overseas from Canada?"
+        },
+        {
+          "id": "canada-to-europe-moving",
+          "text": "Who are the most trusted companies for moving household goods from Canada to Europe?"
+        }
+      ]
+    }
+  ]
+}

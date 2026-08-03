@@ -30,6 +30,12 @@ COPY --chown=10000:10000 \
     fleet-runtime/profile-runner.mjs \
     fleet-runtime/hermes-inbox-adapter.mjs \
     fleet-runtime/hermes-plugin-smoke.mjs \
+    fleet-runtime/geo-scanner/contract.mjs \
+    fleet-runtime/geo-scanner/budget.mjs \
+    fleet-runtime/geo-scanner/vertex.mjs \
+    fleet-runtime/geo-scanner/sinks.mjs \
+    fleet-runtime/geo-scanner/scanner.mjs \
+    fleet-runtime/geo-scanner/cli.mjs \
     fleet-runtime/hermes-query-stdin.py \
     /opt/mupot/
 

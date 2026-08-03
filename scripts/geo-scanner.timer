@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Viamar GEO scanner daily
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+Persistent=true
+Unit=geo-scanner.service
+
+[Install]
+WantedBy=timers.target
+

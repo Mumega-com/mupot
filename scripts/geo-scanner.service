@@ -1,0 +1,17 @@
+[Unit]
+Description=Viamar GEO scanner one-shot runner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PATH=/home/mumega/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HOME=%h
+Environment=GEO_SCANNER_CONFIG_FILE=%h/.mumega/geo-scanner-viamar.json
+Environment=POSTHOG_PROJECT_TOKEN_FILE=%h/.mumega/geo-scanner-posthog.token
+Environment=MUPOT_AGENT_TOKEN_FILE=%h/.mumega/geo-scanner-agent.token
+ExecStart=%h/mupot-worktrees/codex-b6addee4/scripts/geo-scanner-run.sh
+
+[Install]
+WantedBy=default.target
+
