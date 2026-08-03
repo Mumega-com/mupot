@@ -10,8 +10,10 @@ import { basename, resolve } from 'node:path'
  *   `status: "design"` are allowed only in an explicit design-only location
  *   or with the approved machine-readable marker.
  * - Runtime/release registry paths must never carry `status: "design"`.
- * - Array/map registries are inspected; unrecognized contract-like objects
- *   and unparseable JSON are reported (never silently skipped).
+ * - Array/map/id-keyed registries and arbitrary single-wrapper maps are
+ *   inspected; unrecognized contract-like ids hard-fail on runtime/release
+ *   paths only; unreadable (symlink/non-UTF-8) and unparseable JSON are
+ *   reported (never silently skipped).
  *
  * Allowed design locations/markers:
  * - path under `docs/design-contracts/`
@@ -142,6 +144,13 @@ function formatUnparseableJson(path, detail) {
   ].join('\n')
 }
 
+function formatUnreadableJson(path, detail) {
+  return [
+    `${displayPath(path)}: unreadable tracked JSON (${detail}).`,
+    `  Tracked .json files must be regular UTF-8 files; silent skip is not allowed.`,
+  ].join('\n')
+}
+
 function evaluateContract(path, contract) {
   if (contract.status !== DESIGN_STATUS) return null
 
@@ -157,8 +166,15 @@ function evaluateContract(path, contract) {
 }
 
 /**
- * Collect contract-like objects from a single-contract file, an array registry,
- * or a wrapper map (`{ "contracts": [...] }` / `{ "contracts": { ... } }`).
+ * Collect contract-like objects from:
+ * - a single-contract root object
+ * - a top-level array registry
+ * - an id-keyed / name-keyed top-level map (`{ "x/v1": { id, status } }`)
+ * - any single-wrapper key holding an array or map of contract-likes
+ *   (`{ "contracts": [...] }`, `{ "registry": { ... } }`, etc.)
+ *
+ * Does not recurse into nested fields of a contract-like object
+ * (e.g. unmetDependencies stay ignored).
  */
 function collectContractLikes(parsed) {
   if (Array.isArray(parsed)) {
@@ -169,12 +185,25 @@ function collectContractLikes(parsed) {
 
   if (isContractLike(parsed)) return [parsed]
 
-  if (!Object.prototype.hasOwnProperty.call(parsed, 'contracts')) return []
-
-  const wrapped = parsed.contracts
-  if (Array.isArray(wrapped)) return wrapped.filter(isContractLike)
-  if (isPlainObject(wrapped)) return Object.values(wrapped).filter(isContractLike)
-  return []
+  const collected = []
+  for (const value of Object.values(parsed)) {
+    if (isContractLike(value)) {
+      collected.push(value)
+      continue
+    }
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        if (isContractLike(entry)) collected.push(entry)
+      }
+      continue
+    }
+    if (isPlainObject(value)) {
+      for (const nested of Object.values(value)) {
+        if (isContractLike(nested)) collected.push(nested)
+      }
+    }
+  }
+  return collected
 }
 
 function scanFile(path, text) {
@@ -191,7 +220,11 @@ function scanFile(path, text) {
   const findings = []
   for (const contract of collectContractLikes(parsed)) {
     if (!hasValidContractId(contract)) {
-      findings.push(formatUnrecognizedContract(path, contract.id))
+      // Ordinary fixtures often use id+status shapes; only hard-fail on
+      // runtime/release paths where a bad contract id is policy-relevant.
+      if (isRuntimeOrReleasePath(path)) {
+        findings.push(formatUnrecognizedContract(path, contract.id))
+      }
       continue
     }
 
@@ -202,30 +235,52 @@ function scanFile(path, text) {
   return findings
 }
 
+/**
+ * @returns {{ kind: 'missing' } | { kind: 'text', text: string } | { kind: 'error', detail: string }}
+ */
 function readTrackedText(absolutePath) {
   let stats
   try {
     stats = lstatSync(absolutePath)
   } catch (error) {
     // Staged deletion / missing working-tree file: skip, do not abort the run.
-    if (error && typeof error === 'object' && error.code === 'ENOENT') return null
+    if (error && typeof error === 'object' && error.code === 'ENOENT') {
+      return { kind: 'missing' }
+    }
     throw error
   }
 
-  if (!stats.isFile()) return null
+  if (stats.isSymbolicLink()) {
+    return { kind: 'error', detail: 'symbolic link' }
+  }
 
-  return decodeText(readFileSync(absolutePath))
+  if (!stats.isFile()) {
+    return { kind: 'error', detail: `not a regular file (mode=${stats.mode})` }
+  }
+
+  const text = decodeText(readFileSync(absolutePath))
+  if (text === null) {
+    return { kind: 'error', detail: 'non-UTF-8 or NUL-containing contents' }
+  }
+
+  return { kind: 'text', text }
 }
 
 function scan(root) {
   const findings = []
 
   for (const path of trackedFiles(root)) {
-    const absolutePath = resolve(root, path)
-    const text = readTrackedText(absolutePath)
-    if (text === null) continue
+    if (!normalizePath(path).endsWith('.json')) continue
 
-    findings.push(...scanFile(path, text))
+    const absolutePath = resolve(root, path)
+    const read = readTrackedText(absolutePath)
+    if (read.kind === 'missing') continue
+    if (read.kind === 'error') {
+      findings.push(formatUnreadableJson(path, read.detail))
+      continue
+    }
+
+    findings.push(...scanFile(path, read.text))
   }
 
   return findings

@@ -1,5 +1,13 @@
 import { execFileSync, spawnSync } from 'node:child_process'
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, unlinkSync } from 'node:fs'
+import {
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+  mkdirSync,
+  readFileSync,
+  unlinkSync,
+  symlinkSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -190,6 +198,56 @@ describe('design-status contract policy', () => {
     expect(result.stderr).toContain('design-status policy violations: 2')
   })
 
+  it('inspects id-keyed top-level maps and arbitrary single-wrapper keys', () => {
+    const root = createTrackedRepo({
+      'src/contracts/id-keyed-map.json': `${JSON.stringify(
+        {
+          'brain-learning-ranker/v1': {
+            id: 'brain-learning-ranker/v1',
+            status: 'design',
+            designOnly: true,
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      'src/contracts/named-map.json': `${JSON.stringify(
+        {
+          brain: { id: 'owner-experience/v1', status: 'design', designOnly: true },
+        },
+        null,
+        2,
+      )}\n`,
+      'docs/registry-items-wrapper.json': `${JSON.stringify(
+        {
+          items: [{ id: 'tier2-user-chat/v1', status: 'design' }],
+        },
+        null,
+        2,
+      )}\n`,
+      'pots.manifest.json': `${JSON.stringify(
+        {
+          'runtime-adapter/v1': { id: 'runtime-adapter/v1', status: 'design' },
+        },
+        null,
+        2,
+      )}\n`,
+    })
+
+    const result = runScanner(root)
+
+    expect(result.status).toBe(1)
+    expect(result.stderr).toContain('src/contracts/id-keyed-map.json')
+    expect(result.stderr).toContain("contract 'brain-learning-ranker/v1' has status 'design'")
+    expect(result.stderr).toContain('src/contracts/named-map.json')
+    expect(result.stderr).toContain("contract 'owner-experience/v1' has status 'design'")
+    expect(result.stderr).toContain('docs/registry-items-wrapper.json')
+    expect(result.stderr).toContain("contract 'tier2-user-chat/v1' has status 'design'")
+    expect(result.stderr).toContain('pots.manifest.json')
+    expect(result.stderr).toContain("contract 'runtime-adapter/v1' has status 'design'")
+    expect(result.stderr).toContain('design-status policy violations: 4')
+  })
+
   it('inspects array and map registries — accepts designOnly or non-design entries', () => {
     const root = createTrackedRepo({
       'docs/registry-array.json': `${JSON.stringify(
@@ -215,6 +273,17 @@ describe('design-status contract policy', () => {
         null,
         2,
       )}\n`,
+      'docs/id-keyed-ok.json': `${JSON.stringify(
+        {
+          'owner-experience/v1': {
+            id: 'owner-experience/v1',
+            status: 'design',
+            designOnly: true,
+          },
+        },
+        null,
+        2,
+      )}\n`,
     })
 
     const result = runScanner(root)
@@ -224,15 +293,25 @@ describe('design-status contract policy', () => {
     expect(result.stderr).toBe('')
   })
 
-  it('reports unrecognized contract-like objects instead of silently skipping', () => {
+  it('hard-fails unrecognized contract ids only on runtime/release paths', () => {
     const root = createTrackedRepo({
-      'docs/bad-id.json': `${JSON.stringify(
+      'src/contracts/bad-id.json': `${JSON.stringify(
         { id: 'Owner_Experience/v1.0', status: 'design', designOnly: true },
         null,
         2,
       )}\n`,
-      'docs/registry-bad.json': `${JSON.stringify(
+      'pots.manifest.json': `${JSON.stringify(
         [{ id: 'not_a_contract', status: 'documented' }],
+        null,
+        2,
+      )}\n`,
+      'tests/fixtures/ordinary-id-status.json': `${JSON.stringify(
+        { id: 'fixture-row-1', status: 'pending' },
+        null,
+        2,
+      )}\n`,
+      'docs/notes-bad-id.json': `${JSON.stringify(
+        { id: 'Owner_Experience/v1.0', status: 'design', designOnly: true },
         null,
         2,
       )}\n`,
@@ -244,6 +323,10 @@ describe('design-status contract policy', () => {
     expect(result.stderr).toContain('unrecognized contract-like object with id')
     expect(result.stderr).toContain('Owner_Experience/v1.0')
     expect(result.stderr).toContain('not_a_contract')
+    expect(result.stderr).toContain('src/contracts/bad-id.json')
+    expect(result.stderr).toContain('pots.manifest.json')
+    expect(result.stderr).not.toContain('tests/fixtures/ordinary-id-status.json')
+    expect(result.stderr).not.toContain('docs/notes-bad-id.json')
     expect(result.stderr).toContain('design-status policy violations: 2')
   })
 
@@ -258,6 +341,31 @@ describe('design-status contract policy', () => {
     expect(result.stderr).toContain('unparseable JSON')
     expect(result.stderr).toContain('docs/broken.json')
     expect(result.stderr).toContain('design-status policy violations: 1')
+  })
+
+  it('reports symlinked and non-UTF-8 tracked JSON instead of dropping them', () => {
+    const root = createTrackedRepo({
+      'docs/safe-v1.json': `${JSON.stringify({ id: 'runtime-adapter/v1', status: 'documented' }, null, 2)}\n`,
+      'docs/target-contract.json': designContract('brain-learning-ranker/v1', { designOnly: true }),
+    })
+
+    const symlinkPath = join(root, 'docs/link-contract.json')
+    symlinkSync('target-contract.json', symlinkPath)
+    execFileSync('git', ['add', '--', 'docs/link-contract.json'], { cwd: root })
+
+    const nonUtf8Path = join(root, 'docs/binary.json')
+    writeFileSync(nonUtf8Path, Buffer.from([0x7b, 0xff, 0x7d, 0x0a]))
+    execFileSync('git', ['add', '--', 'docs/binary.json'], { cwd: root })
+
+    const result = runScanner(root)
+
+    expect(result.status).toBe(1)
+    expect(result.stderr).toContain('unreadable tracked JSON')
+    expect(result.stderr).toContain('docs/link-contract.json')
+    expect(result.stderr).toContain('symbolic link')
+    expect(result.stderr).toContain('docs/binary.json')
+    expect(result.stderr).toContain('non-UTF-8')
+    expect(result.stderr).toContain('design-status policy violations: 2')
   })
 
   it('ignores nested status fields and non-contract JSON', () => {
