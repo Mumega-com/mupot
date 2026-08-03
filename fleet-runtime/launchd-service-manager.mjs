@@ -22,7 +22,9 @@ function launchctlTarget(context, service) {
 }
 
 function logPath(context, service, suffix) {
-  return `${context.logsDir}/${service.key === 'heartbeat' ? 'fleet-daemon' : 'fleet-control-daemon'}${suffix}`
+  const stem = service.logStem ??
+    (service.key === 'heartbeat' ? 'fleet-daemon' : 'fleet-control-daemon')
+  return `${context.logsDir}/${stem}${suffix}`
 }
 
 async function atomicWrite(path, content) {

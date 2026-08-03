@@ -202,6 +202,78 @@ that only have an MCP transport. Identity is derived from the authenticated
 member token; `source` and `label` are descriptive only. Repeated check-ins are
 debounced by tenant/member for 30 seconds before touching D1.
 
+### Exact Runtime Endpoints
+
+Presence answers "which agent/runtime is online." It is not a return address
+when one agent has several active harness sessions. The
+`mupot.runtime-endpoint/v1` contract adds a leased, project-scoped address.
+The model-visible MCP surface exposes only safe discovery and delivery:
+
+- `runtime_endpoint_list`
+- `runtime_endpoint_send`
+
+The supervised host adapter uses the bearer HTTP mirror for capability-bearing
+lifecycle operations:
+
+- `runtime_endpoint_check_in`
+- `runtime_endpoint_heartbeat`
+- `runtime_endpoint_revoke`
+- `runtime_endpoint_inbox`
+- `runtime_endpoint_accept`
+
+The bearer HTTP mirror is mounted at `/api/runtime-endpoints`. A host submits a
+random `runtime_session_handle`; it must not submit the raw Codex/Claude thread
+UUID. Mupot stores only the handle's SHA-256 fingerprint and returns an opaque
+endpoint id plus a one-time `endpoint_capability`. Mupot stores only the
+capability hash. The host keeps the capability in its `0600` state file and must
+send it in the JSON body for heartbeat, inbox, acceptance, and revocation. A
+renewed check-in rotates the capability, so a sibling runtime sharing the same
+agent token cannot operate the endpoint by knowing its id.
+Session handles and endpoint capabilities are never MCP tool arguments or
+results. Runtime endpoint HTTP responses are marked `no-store` and
+`no-referrer`.
+
+Check-in also requires an explicit `allowed_senders` list. Mupot enforces that
+policy before queue insertion; the host repeats the check as defense in depth.
+The HTTP inbox is `POST /api/runtime-endpoints/inbox`, not a capability-bearing
+URL.
+
+Delivery is endpoint-scoped, not agent-inbox-scoped. `runtime_endpoint_inbox`
+always peeks and never consumes. After the host has durably handed the request
+to the exact runtime, `runtime_endpoint_accept` records the message id, request
+id, endpoint id, and resulting runtime turn id under
+`mupot.runtime-endpoint-ack/v1`. Expired or revoked leases fail closed and leave
+messages queued.
+
+The reference Codex host bridge is
+`fleet-runtime/codex-thread-endpoint.mjs`. Raw thread identity stays in its
+local `0600` config. It validates sender and project allowlists, persists the
+message before execution, defers while the target thread already has an active
+turn, resumes the explicit thread through App Server rather than `--last`, and
+retries Mupot acceptance from a local turn receipt without rerunning Codex. The
+adapter supports both released raw-frame Unix listeners and the documented
+HTTP-Upgrade listener, and it sends no JSON-RPC until one transport opens.
+
+`thread/resume` plus `turn/start` replaces the prior rollout scan and CLI child
+process. A turn-start rejection is retryable; a connection loss after the start
+request is sent is an uncertain delivery and latches a durable bridge fault.
+Codex CLI 0.145/0.146 can accept turn starts from two independent clients for
+one thread, so the reference bridge requires an automation-exclusive thread;
+App Server is not claimed as a shared-Desktop mutex. Human input must use the
+same Mupot/Linear work path while that endpoint is active.
+Queued messages invalidated by a sender-policy change use the capability-bound
+reject operation, which re-verifies the current policy in D1 and writes an
+immutable rejection receipt. Production closure still requires the supervisor
+credential store to run under an OS principal or broker that resumed model tools
+cannot read. A same-user `0600` file is not a security boundary against a
+tool-capable turn.
+
+SOS is not part of Mupot's endpoint transport. An operator may copy an SOS
+check-in code, such as `20260727-0042`, into the endpoint's public
+`local_source_id` and the Codex thread title only to find the same session in
+both systems. It is a label, not authority; the endpoint capability and exact
+host-local thread UUID remain the security and execution bindings.
+
 ## Lifecycle Control
 
 `GET /api/fleet/trust` publishes the public Ed25519 JWK corresponding to

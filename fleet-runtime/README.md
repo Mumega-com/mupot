@@ -34,6 +34,9 @@ Fork the pot → you get this. No tenant is hardcoded: `base_url` + `tenant` com
 | `daemon.example.json` | config template (set base_url, tenant, agents, probes) |
 | `inbox-handler.mjs` | durable local handoff command for daemon inbox batches |
 | `inbox-handler.example.json` | per-agent spool + launch command config |
+| `codex-thread-endpoint.mjs` | leased exact-thread Codex bridge with durable handoff |
+| `codex-thread-service.mjs` | per-thread launchd/systemd lifecycle and receipt CLI |
+| `codex-thread-endpoint.example.json` | host-local exact-thread bridge config |
 | `fleet-control-daemon.mjs` | signed open/close/restart consumer for `POST /api/fleet/control` |
 | `control-request.mjs` | host verifier for `fleet-control.v1` requests |
 | `control.example.json` | control-daemon config template |
@@ -203,6 +206,78 @@ kind matches `run_for`. The command receives JSON on stdin with `files[]`, `mess
 the batch. A non-zero exit, crash, or timeout leaves the Mupot messages unread for the next
 daemon tick. The inbox read is signed with the agent's Ed25519 key and POSTed to
 `/api/inbox/signed`; it does not need a bearer token.
+
+## Run an exact Codex thread endpoint
+
+Use this bridge when one welded Mupot agent has several Codex threads and a
+message must return to one specific project thread. The installer creates
+`~/.fleet/codex-thread-endpoint.json`; keep that file and its token file mode
+`0600`, then set the exact local `thread_id`, App Server socket, project, and
+sender allowlist, and explicitly set `exclusive_thread: true`. An operator may
+copy a short SOS check-in code such as
+`20260727-0042` into `local_source_id` and the Codex thread title so the session
+can be found in both systems. SOS is otherwise separate from this Mupot
+transport, and that copied label is not a credential.
+
+```bash
+node ~/.fleet/runtime/codex-thread-endpoint.mjs \
+  ~/.fleet/codex-thread-endpoint.json
+```
+
+For an always-on bridge, install one separately named service per exact thread:
+
+```bash
+node ~/.fleet/runtime/codex-thread-service.mjs install \
+  --config ~/.fleet/codex-thread-endpoint.json
+```
+
+Use the same command with `status`, `reload`, or `uninstall`. The service name is
+derived from a thread hash, so several Codex threads can be supervised on one
+host without sharing a global process slot.
+
+The raw Codex thread UUID never leaves the host. Startup registers a random
+host-local session handle; Mupot stores only its SHA-256 fingerprint and returns
+an opaque endpoint id plus a rotating endpoint capability. The capability is
+stored only in the host's `0600` state and is required for inbox, heartbeat,
+acceptance, and revocation. The bridge peeks that endpoint's durable inbox,
+persists each message locally before execution, and invokes:
+
+```text
+initialize -> thread/resume(<exact-thread-id>) -> turn/start(<attributed input>)
+```
+
+It never uses `--last` or scans rollout files. The Unix client supports both the
+released raw WebSocket-frame listener and the documented HTTP-Upgrade listener,
+without sending JSON-RPC until one transport has opened. All cooperating
+watchers use one canonical host-wide lock derived from the exact thread. Mupot
+acceptance happens only after App Server returns a real turn id and emits the
+terminal turn event. If the accept request fails, the local spool keeps that turn
+id and retries consumption without executing the request twice. A connection
+loss after `turn/start` writes a durable `*.fault.json` marker and stops the
+bridge. An operator must inspect the spool and App Server thread state before
+clearing that marker; the bridge never guesses whether replay is safe.
+
+Codex CLI 0.145/0.146 does not provide an authoritative mutex across independent
+App Server/Desktop clients. This bridge therefore requires an automation-
+exclusive thread: human follow-ups must enter through Mupot while the endpoint
+is active. Opening the conversation for observation is fine; sending a direct
+Desktop turn concurrently is outside the supported contract.
+
+If an allowlisted sender is removed after its message was queued, the bridge
+calls the capability-bound `/reject` operation. Mupot independently proves that
+the sender is no longer authorized, writes an immutable rejection receipt, and
+removes the message from the active inbox without erasing its audit record.
+
+The bridge log and delivery receipts include endpoint/message/request/turn
+references only. They exclude the raw thread UUID, bearer token, and message
+body. Message bodies exist only in the `0600` pending spool until Mupot accepts
+the turn.
+
+The App Server adapter closes the CLI/rollout race, but a same-user token file is
+still not a production credential boundary. A production deployment must run
+the supervisor credential store under a separate OS principal or broker that
+Codex tool execution cannot read. A same-user installation is a testing profile,
+not the production acceptance proof.
 
 ## Run the control daemon (remote open/close)
 

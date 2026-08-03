@@ -87,6 +87,10 @@ import { LOOP_TOOLS } from './loops'
 import { PRESENCE_TOOLS } from './presence'
 import { WORKFLOW_CIRCUIT_TOOLS } from './workflow-circuits'
 import { ROUTINE_TOOLS } from './routines'
+import {
+  RUNTIME_ENDPOINT_HOST_TOOLS,
+  RUNTIME_ENDPOINT_MCP_TOOLS,
+} from './runtime-endpoints'
 import { dispatchFlight } from '../flight/dispatch'
 import {
   deliverFlightLandedEvent,
@@ -2749,9 +2753,13 @@ export const TOOLS: ToolSpec[] = [
   ...PRESENCE_TOOLS,
   ...WORKFLOW_CIRCUIT_TOOLS,
   ...ROUTINE_TOOLS,
+  ...RUNTIME_ENDPOINT_MCP_TOOLS,
 ]
 
 const TOOL_BY_NAME = new Map<string, ToolSpec>(TOOLS.map((t) => [t.name, t]))
+const HOST_TOOL_BY_NAME = new Map<string, ToolSpec>(
+  [...TOOLS, ...RUNTIME_ENDPOINT_HOST_TOOLS].map((tool) => [tool.name, tool]),
+)
 
 interface JsonRpcRequest {
   jsonrpc?: unknown
@@ -2838,7 +2846,8 @@ function validateArgs(schema: JsonSchema, args: Record<string, unknown>): string
   return null
 }
 
-export async function invokeTool(
+async function invokeRegisteredTool(
+  registry: Map<string, ToolSpec>,
   auth: AuthContext,
   env: Env,
   toolName: unknown,
@@ -2849,7 +2858,7 @@ export async function invokeTool(
     return { ...fail(400, 'invalid_request', 'tool required'), tool: undefined }
   }
 
-  const spec = TOOL_BY_NAME.get(toolName)
+  const spec = registry.get(toolName)
   if (!spec) return { ...fail(400, 'unknown_tool', toolName), tool: toolName }
 
   let args: Record<string, unknown>
@@ -2889,6 +2898,26 @@ export async function invokeTool(
     return { ...fail(500, 'internal_error'), tool: spec.name }
   }
   return { ...outcome, tool: spec.name }
+}
+
+export async function invokeTool(
+  auth: AuthContext,
+  env: Env,
+  toolName: unknown,
+  argsValue: unknown,
+  origin: string,
+) {
+  return await invokeRegisteredTool(TOOL_BY_NAME, auth, env, toolName, argsValue, origin)
+}
+
+export async function invokeHostTool(
+  auth: AuthContext,
+  env: Env,
+  toolName: unknown,
+  argsValue: unknown,
+  origin: string,
+) {
+  return await invokeRegisteredTool(HOST_TOOL_BY_NAME, auth, env, toolName, argsValue, origin)
 }
 
 async function handleJsonRpc(c: import('hono').Context<AppEnv>, body: JsonRpcRequest): Promise<Response> {

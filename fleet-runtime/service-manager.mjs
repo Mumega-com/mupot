@@ -281,6 +281,9 @@ export function shellQuote(value) {
 }
 
 export function serviceLifecycleCommand(context, action, opts = {}) {
+  if (typeof context.lifecycleCommand === 'function') {
+    return context.lifecycleCommand(action, opts)
+  }
   const definitionFlag = context.manager === 'launchd' ? '--launchd-dir' : '--systemd-dir'
   const linger = opts.enableLinger && context.manager === 'systemd' ? ' --enable-linger' : ''
   return `${shellQuote(context.nodePath)} ${shellQuote(join(context.runtimeDir, 'service-manager.mjs'))} ${shellQuote(action)} --service-manager ${shellQuote(context.manager)} --prefix ${shellQuote(context.prefix)} ${definitionFlag} ${shellQuote(context.definitionDir)} --node ${shellQuote(context.nodePath)}${linger}`
