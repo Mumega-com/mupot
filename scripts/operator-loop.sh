@@ -95,6 +95,7 @@ while [ "$STOP" -eq 0 ]; do
   fi
   run_driver "claude" "$REPO/scripts/claude-worker.py"
   run_driver "review" "$REPO/scripts/review-worker.py"
+  run_driver "steward" "$REPO/scripts/steward-worker.py"
 
   # Sleep in short slices so SIGTERM is honored promptly instead of blocking
   # for up to $INTERVAL seconds.
