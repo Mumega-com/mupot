@@ -18,14 +18,25 @@
   - Production: **BLOCKING at `moderate`**, tightened from `high`. Production is at 0,
     so this now blocks on the first regression instead of waiting for one to reach
     "high". Strictly stronger on shippable surface.
-  - Dev toolchain: report-only. Not a judgement that it is harmless — `undici` has open
-    highs reachable as `wrangler → miniflare → undici`, **no wrangler version exists
-    without it**, and npm's remediation is to DOWNGRADE wrangler 4.118 → 4.35.0. The
-    single combined gate therefore had two possible outcomes: permanently red, or a
-    downgrade that makes us less safe. Report-only keeps it visible without letting it
-    force that trade. Residual risk accepted explicitly: this is real exposure to a
-    compromised build host, just not shippable surface. Tracked with a close condition
-    in #670 — the day the dev audit passes on its own, the carve-out is deleted.
+  - Dev toolchain: gated against an **explicit allowlist** (`.github/audit-allowlist.json`
+    + `scripts/audit-gate.mjs`), not waived. `undici` has an open high reachable as
+    `wrangler → miniflare → undici`, **no wrangler version exists without it**, and npm's
+    remediation is to DOWNGRADE wrangler 4.118 → 4.35.0 — so the combined gate could only
+    be permanently red or actively harmful.
+  - The first attempt at this used `npm audit --audit-level=high || true` and was
+    **blocked in review**: `|| true` does not accept the known chain, it accepts *every
+    future* high/critical dev advisory and every audit-tool failure — and it made #670's
+    close condition undetectable, because the step passes identically whether the known
+    advisory is still there or ten new ones have joined it. The allowlist fails in **both**
+    directions: a high/critical advisory that is not listed, **and** a listed entry that
+    has stopped appearing (a fix shipped — delete it). It also fails on an audit it cannot
+    run or parse, rather than reading silence as safety. The stale direction is what
+    `|| true` could never do, and it makes #670 self-closing rather than dependent on
+    someone remembering to check.
+  - Exactly **one** advisory is accepted (GHSA-4cwx-7wf7-3272). The other four undici
+    advisories in the same chain are moderate and so do not block — deliberately absent
+    rather than allowlisted. Residual risk named rather than dismissed: this is real
+    exposure to a compromised build host, just not shippable surface.
   - **PR #664 was an earlier attempt to relax this gate and was retracted the same day**,
     because its premise came from a stale local `node_modules` while CI's clean `npm ci`
     had 5 production highs. That precedent is recorded in the workflow comment and in

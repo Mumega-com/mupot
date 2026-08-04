@@ -1,0 +1,16 @@
+{
+  "_comment": "Dev/build-toolchain advisories accepted ONLY because no fixed version exists. Read by scripts/audit-gate.mjs. An advisory listed here is tolerated; ANY high/critical advisory NOT listed here fails the build, and so does an entry here that has stopped appearing (that means a fix shipped and the entry must be deleted). This file is the reason the dev audit is not `|| true`.",
+  "_scope": "high and critical only — moderate and below do not block the dev half, so they are deliberately not listed here. Production dependencies get a separate blocking `npm audit --omit=dev --audit-level=moderate` with NO allowlist and no exceptions.",
+  "_review": "https://github.com/Mumega-com/mupot/issues/670",
+  "allowed": [
+    {
+      "ghsa": "GHSA-4cwx-7wf7-3272",
+      "package": "undici",
+      "severity": "high",
+      "path": "wrangler > miniflare > undici",
+      "title": "undici vulnerable to cross-user information disclosure and parse-time crash via degenerate private cache directives",
+      "why": "Dev/build toolchain only — this undici is miniflare's local Workers emulator and is never bundled into the deployed Worker. No wrangler release exists without a vulnerable miniflare; npm's remediation downgrades wrangler 4.118 -> 4.35.0, surrendering ~80 releases of fixes to silence a dev-only finding. Accepted as build-host exposure, NOT shippable surface. The other four undici advisories in this same chain are moderate and therefore do not block; they are intentionally absent rather than allowlisted.",
+      "accepted_on": "2026-08-04"
+    }
+  ]
+}
