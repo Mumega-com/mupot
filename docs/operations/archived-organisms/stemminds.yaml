@@ -1,0 +1,29 @@
+name: stemminds
+operator: river
+budget_cents_monthly: 10000
+heartbeat_hours: 24
+workspace: /home/mumega/clawd-stemminds
+
+channels:
+  - type: telegram
+    bot_token_env: TELEGRAM_BOT_TOKEN
+    chat_id: "765204057"
+  - type: redis
+    target_agent: athena
+
+content:
+  types: [stem_education, weekly_report, site_audit]
+  engine: gemini-flash
+
+tools: [sitepilot, google_ads]
+revenue: true
+priority: urgent
+escalate_to: athena
+
+# Hadi 2026-04-25: pause all projects until SOS substrate is mature enough
+# to handle clean dispatch (brain phantom-emission bug pending structural fix).
+# Only active project: Mumega (sos, mirror, inkwell). Re-onboard each project
+# after SOS readiness window closes.
+status: paused
+paused_at: 2026-04-25
+paused_reason: hadi-bulk-pause-pending-sos-readiness

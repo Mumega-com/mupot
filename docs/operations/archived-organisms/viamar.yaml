@@ -1,0 +1,23 @@
+name: viamar
+operator: river
+budget_cents_monthly: 20000
+heartbeat_hours: 12
+workspace: /home/viamar/projects/viamar-data
+
+channels:
+  - type: telegram
+    bot_token_env: TELEGRAM_BOT_TOKEN
+    chat_id: "765204057"
+  - type: redis
+    target_agent: athena
+
+content:
+  types: [freight_tips, auto_shipping, multilingual_content]
+  engine: gemini-flash
+
+tools: [sitepilot, ghl, google_ads]
+revenue: true
+escalate_to: athena
+
+# Re-onboarded and activated on S068
+status: active

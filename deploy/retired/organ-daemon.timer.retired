@@ -1,0 +1,14 @@
+# RETIRED 2026-08-04 — path (c) organisms redesign (mumega-com#595)
+# Do NOT install or enable.
+
+[Unit]
+Description=RETIRED — Organ Daemon Timer
+Requires=organ-daemon.service
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=12h
+Unit=organ-daemon.service
+
+[Install]
+WantedBy=timers.target

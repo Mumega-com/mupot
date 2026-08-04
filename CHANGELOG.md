@@ -48,6 +48,14 @@ block collapses into a changelog entry when it ships.
   task `e89df2c2` (rejected on process, not conclusion). Decision:
   `docs/fleet/goose-non-adoption-2026-07-22.md`; attach allow-list stays without
   `goose`/`goosed`. Technical basis reused from PR #483 / `b8070e2`.
+- Organisms redesign (mumega-com#595 / task `938ca06d`): **path (c) retirement** of the
+  product-organism YAML fleet. All ten configs (dentalnearyou, digid, gaf,
+  letsbefrank, musicalunicorn, pecb, prefrontal, realm-of-patterns, stemminds,
+  viamar) recorded as `retire`; archives under
+  `docs/operations/archived-organisms/`; decision + scheduler invariants in
+  `docs/operations/organisms-retirement-2026-08-04.md`. Rejects re-arming
+  organ-daemon oneshot+timeout against forever-loop `organism.py`. SOS daemon
+  runbook remains opt-in for deliberate future enables — not via organ-daemon.
 
 ## [0.25.0] — 2026-07-27
 

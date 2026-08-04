@@ -1,0 +1,48 @@
+name: realm-of-patterns
+project_lead: sol
+budget_cents_monthly: 5000
+workspace: /home/mumega/therealmofpatterns
+repo: servathadi/therealmofpatterns
+branch: main
+url: https://therealmofpatterns.com
+qnft: realm-of-patterns_1774719042_90b4
+constitution: /home/mumega/therealmofpatterns/CONSTITUTION.md
+
+squads:
+  seo: true
+  content: true
+  dev: true
+
+channels:
+  - type: telegram
+    bot_token_env: TROP_BOT_TOKEN
+    chat_id: "765204057"
+  - type: discord
+    agent: sol
+  - type: redis
+    target_agent: sol
+
+content:
+  schedule: "0 */6 * * *"
+  types: [daily_weather, historical_figure, jungian_concept, contemplation]
+  engine: gemini-flash
+
+revenue:
+  track: true
+  model: subscription
+  kpis: [daily_active_users, readings_generated, subscribers, content_engagement]
+
+pipeline:
+  build_cmd: "npm run build"
+  test_cmd: "npm run typecheck"
+  deploy_cmd: "npm run deploy"
+  smoke_cmd: "curl -sf https://therealmofpatterns.com/ > /dev/null"
+  deploy_mode: manual
+
+# Hadi 2026-04-25: pause all projects until SOS substrate is mature enough
+# to handle clean dispatch (brain phantom-emission bug pending structural fix).
+# Only active project: Mumega (sos, mirror, inkwell). Re-onboard each project
+# after SOS readiness window closes.
+status: paused
+paused_at: 2026-04-25
+paused_reason: hadi-bulk-pause-pending-sos-readiness

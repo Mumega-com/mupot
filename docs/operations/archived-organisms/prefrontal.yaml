@@ -1,0 +1,35 @@
+name: prefrontal
+# operator was river; reassigned to loom 2026-04-25 per BRAIN customer
+# recon task (Kasra) and the project_team_roles memory note (river dormant
+# pending revenue support). Loom holds operational seal until customer
+# re-engagement is confirmed and a dedicated knight is minted.
+operator: loom
+# Hadi 2026-04-25: pause for restructuring. Recon (01) and re-engagement
+# draft (02) are complete and parked at agents/loom/customers/prefrontal/.
+# No outreach, no build, no proactive movement until Hadi reopens this
+# organism. BRAIN portfolio scoring should treat prefrontal as
+# status:paused — do not re-dispatch.
+status: paused
+paused_at: 2026-04-25
+paused_reason: needs-restructuring (Hadi)
+budget_cents_monthly: 10000
+heartbeat_hours: 12
+workspace: /home/mumega/clawd-prefrontal
+
+channels:
+  - type: telegram
+    bot_token_env: TELEGRAM_PREFRONTAL_TOKEN
+    chat_id_env: TELEGRAM_PREFRONTAL_OPS_CHAT
+  - type: redis
+    target_agent: athena
+
+content:
+  schedule: "0 */12 * * *"
+  types: [psychology_insight, course_promotion, workshop_announcement]
+  engine: gemini-flash
+
+revenue:
+  stripe_product_ids: []
+  track: true
+
+escalate_to: athena

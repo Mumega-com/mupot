@@ -1,0 +1,82 @@
+{
+  "decision": "retire",
+  "path": "c",
+  "task_id": "938ca06d-ceda-458c-8399-e5cec398696b",
+  "github_issue": "Mumega-com/mumega-com#595",
+  "decided_at": "2026-08-04",
+  "decision_doc": "docs/operations/organisms-retirement-2026-08-04.md",
+  "archive_dir": "docs/operations/archived-organisms",
+  "rejected_paths": {
+    "a_systemd_template_daemon": "Would re-wake paused projects; requires deploy; YAML fleet is orphaned from organism.py anyway",
+    "b_step_once_batch": "Would re-legitimize organ-daemon batch timeouts against a forever-loop; step() already exists for tests/manual kicks"
+  },
+  "scheduler_invariants": {
+    "organ_daemon_timer": "disabled",
+    "organ_daemon_service": "disabled",
+    "product_organism_cron": "removed",
+    "mismatched_batch_invocation_forbidden": true,
+    "crontab_backup": "~/.mumega/crontab-backup-20260803-pre-organ-clean.txt"
+  },
+  "organisms": [
+    {
+      "name": "dentalnearyou",
+      "decision": "retire",
+      "prior_yaml_status": "paused",
+      "reason": "Hadi bulk pause 2026-04-25; project work continues via mupot/squad lanes when reopened, not YAML heartbeat"
+    },
+    {
+      "name": "digid",
+      "decision": "retire",
+      "prior_yaml_status": "paused",
+      "reason": "Hadi bulk pause 2026-04-25; digid mind is a separate SOS fork path, not product-organism YAML"
+    },
+    {
+      "name": "gaf",
+      "decision": "retire",
+      "prior_yaml_status": "paused",
+      "reason": "Hadi bulk pause 2026-04-25; SaaS customer work routes through brain/squad, not organ-daemon"
+    },
+    {
+      "name": "letsbefrank",
+      "decision": "retire",
+      "prior_yaml_status": "paused",
+      "reason": "Hadi bulk pause 2026-04-25; no live product-organism consumer"
+    },
+    {
+      "name": "musicalunicorn",
+      "decision": "retire",
+      "prior_yaml_status": "paused",
+      "reason": "Hadi bulk pause 2026-04-25; no live product-organism consumer"
+    },
+    {
+      "name": "pecb",
+      "decision": "retire",
+      "prior_yaml_status": "paused",
+      "reason": "Hadi bulk pause 2026-04-25; no live product-organism consumer"
+    },
+    {
+      "name": "prefrontal",
+      "decision": "retire",
+      "prior_yaml_status": "paused",
+      "reason": "Paused for restructuring (Hadi); cron previously contradicted pause — retirement removes the contradiction"
+    },
+    {
+      "name": "realm-of-patterns",
+      "decision": "retire",
+      "prior_yaml_status": "paused",
+      "reason": "Hadi bulk pause 2026-04-25; TROP rhythm lives in SOS trop-* timers / operations pulse when deliberately enabled"
+    },
+    {
+      "name": "stemminds",
+      "decision": "retire",
+      "prior_yaml_status": "paused",
+      "reason": "Hadi bulk pause 2026-04-25; no live product-organism consumer"
+    },
+    {
+      "name": "viamar",
+      "decision": "retire",
+      "prior_yaml_status": "active",
+      "reason": "YAML status was active but organism.py never loaded YAML; live work is mupot GEO/routines. Retire the orphan YAML fleet path, not the project"
+    }
+  ]
+}
