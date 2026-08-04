@@ -223,7 +223,20 @@ ghlInboundApp.post('/inbound', async (c) => {
     // #142: GHL inbound webhook — predicate is the CRM contact receiving a reply.
     done_when: `GHL contact ${typeof event.contact_id === 'string' ? event.contact_id : 'replied'} processed`,
     status: 'open',
-  }, { externalSource: 'ghl-webhook' })
+  }, {
+    // #663: never mirror externally-sourced webhook text out to a GitHub issue under
+    // our token. `body` above is the RAW GHL event — attacker-influenceable content
+    // from an inbound webhook. Every other external-ingest site already sets this
+    // (linear-issues.ts, github-projects.ts, github-routes.ts, events/ingest.ts);
+    // this call was the one that did not, so untrusted text was being written
+    // outbound under our identity. The inbound direction is fenced by the
+    // external_source provenance work (#659); this is the outbound half.
+    skipMirror: true,
+    // #659: and mark the provenance, so the inbound half is fenced too — this row
+    // must never be auto-assigned, auto-picked-up, or interpolated as trusted
+    // instructions. Both halves are required; neither substitutes for the other.
+    externalSource: 'ghl-webhook',
+  })
 
   // Outreach reply tracking: if this inbound maps to a known prospect, move it so the
   // outcome KPI (replied) reflects it and the loop stops re-contacting. Best-effort —
