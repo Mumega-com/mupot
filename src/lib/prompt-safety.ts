@@ -58,12 +58,54 @@ const UNSAFE_PROMPT_CHARS = buildUnsafePromptCharsRegex()
  * text via RTL tricks), escapes quotes, bounds length, and wraps in quotes.
  */
 export function asData(s: string, maxLen = 200): string {
-  const cleaned = s
-    .replace(UNSAFE_PROMPT_CHARS, ' ')
-    .replace(/"/g, "'")
-    .slice(0, maxLen)
-    .trim()
-  return `"${cleaned}"`
+  return `"${sanitizeInline(s, maxLen).replace(/"/g, "'")}"`
+}
+
+/**
+ * The same fence as asData(), WITHOUT the surrounding quotes. For callers that
+ * supply their own quoting or embed the value in a structured container (JSON),
+ * where an extra pair of literal quotes would be wrong.
+ *
+ * This is the single implementation of "strip prompt-forging characters and bound
+ * length"; asData() is this plus quoting. Previously src/agents/episodic.ts carried
+ * a private sanitizeData() that stripped ONLY C0 controls -- so it missed U+2028/9
+ * and the bidi overrides, i.e. it was strictly weaker than asData while reading as
+ * an equivalent guard. One invariant, one implementation (mupot#669).
+ */
+export function sanitizeInline(s: string, maxLen = 200): string {
+  return s.replace(UNSAFE_PROMPT_CHARS, ' ').slice(0, maxLen).trim()
+}
+
+/**
+ * Render a record of untrusted-origin fields as a JSON object safe to embed in a
+ * prompt. Every value is fenced with sanitizeInline() BEFORE serialization.
+ *
+ * WHY JSON.stringify ALONE IS NOT A FENCE -- the assumption this function exists to
+ * kill. It escapes \n, \r and \t, so it does stop the obvious forged-newline attack,
+ * and two call sites (src/loops/cro.ts, src/loops/outreach.ts) relied on that
+ * incidentally. But it passes these through RAW, verified empirically:
+ *
+ *   U+2028 LINE SEPARATOR        U+2029 PARAGRAPH SEPARATOR
+ *   U+202E RIGHT-TO-LEFT OVERRIDE    U+200F RLM    U+2066 LRI
+ *
+ * Those are precisely the characters UNSAFE_PROMPT_CODEPOINT_RANGES exists to remove:
+ * several renderers treat U+2028/9 as a hard line break, so external free text could
+ * still forge what looks like a new prompt line. JSON.stringify also applies NO length
+ * bound, so unbounded external text can flood the context window.
+ *
+ * The protection was therefore accidental and partial. A refactor to template
+ * interpolation would have removed even that, with no test failing.
+ */
+export function asDataFields(fields: Record<string, unknown>, maxLen = 200): string {
+  const safe: Record<string, string> = {}
+  for (const [key, value] of Object.entries(fields)) {
+    // Non-strings are serialized first so nested untrusted content is fenced too --
+    // never passed through as a live object that JSON.stringify would render raw.
+    const raw =
+      typeof value === 'string' ? value : value === null || value === undefined ? '' : JSON.stringify(value) ?? ''
+    safe[key] = sanitizeInline(raw, maxLen)
+  }
+  return JSON.stringify(safe)
 }
 
 /**
