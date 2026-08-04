@@ -670,7 +670,10 @@ tasksApp.patch('/:id', async (c) => {
     // source_pot — a Linear-origin task is the same untrusted-writer class, and the same
     // #406 reasoning applies (a member-tier/runtime-welded agent token must not be able to
     // self-assign untrusted external content onto itself and then execute it).
-    if (existing.source_pot || existing.external_source) {
+    // Explicit null semantics, matching migrations/0077 (adversarial gate BLOCK
+    // 2026-08-04): truthiness treated external_source='' as first-party while SQL
+    // treated it as external, so a blank-provenance row escaped the admin bar.
+    if (existing.source_pot != null || existing.external_source != null) {
       if (!(await canActOnSquad(c.env, c.get('auth'), existing.squad_id, 'admin'))) {
         return c.json(
           { error: 'forbidden', need: 'admin', detail: 'source_pot/external_source task assignment requires admin+' },

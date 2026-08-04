@@ -923,7 +923,7 @@ const toolTaskUpdate: ToolSpec = {
       // source_pot — same untrusted-writer class (e.g. Linear), same #406 reasoning: a
       // member-tier/runtime-welded agent token must not self-assign untrusted external
       // content and then execute it.
-      if (existing.source_pot || existing.external_source) {
+      if (existing.source_pot != null || existing.external_source != null) {
         if (!(await memberCanOnSquad(env, grants, existing.squad_id, 'admin'))) {
           return fail(403, 'forbidden', { need: 'admin', scope: 'squad', detail: 'source_pot/external_source task assignment requires admin+' })
         }

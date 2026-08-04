@@ -18,7 +18,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { createSqliteD1 } from './helpers/sqlite-d1'
 import { createTask } from '../src/tasks/service'
 import { ingestEvent } from '../src/events/ingest'
-import { runTaskExecution } from '../src/agents/execute'
+import { runTaskExecution, isExternallySourced } from '../src/agents/execute'
 import type { Agent, Env, ModelPort } from '../src/types'
 
 const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
@@ -122,5 +122,90 @@ describe('events/ingest.ts HTTP route call shape (5th entry point, found during 
     expect(taskRow?.assignee_agent_id).toBeNull()
     expect(taskRow?.external_source).toBe('event-ingest:viamar-worker')
     await assertUnpickableByAgent(env, result.task_id, agent)
+  })
+})
+
+// ── BLANK PROVENANCE (adversarial gate BLOCK, 2026-08-04) ────────────────────
+//
+// migrations/0077 defines the trust boundary as `external_source IS NULL` vs
+// `IS NOT NULL`. Every runtime check spelled it with JavaScript truthiness. Those two
+// definitions agree on every value except one: the EMPTY STRING is non-null in SQL and
+// falsy in JS.
+//
+// The reproduction that was run against the previous head, with real migrations, the
+// real createTask, and the real runTaskExecution:
+//
+//   createTask(..., { assignee_agent_id: 'agent-1' }, { externalSource: '' })
+//     -> stored row had external_source='' AND KEPT assignee_agent_id='agent-1'
+//     -> runTaskExecution returned ok: true and reached model.chat
+//
+// SQL considered the row externally sourced; the runtime considered it first-party; the
+// row was governed by whichever layer happened to be asked. Three layers now close it:
+// createTask REJECTS blank provenance, every boundary check uses explicit `!= null`, and
+// migrations/0078 makes a blank marker impossible to store at all.
+describe('blank provenance cannot become trusted absence', () => {
+  it('createTask REJECTS an empty external source instead of treating it as local', async () => {
+    const { env } = await makeEnv()
+    await expect(createTask(
+      env,
+      {
+        squad_id: 'squad-a',
+        title: 'hostile title',
+        body: 'hostile body',
+        done_when: 'never',
+        status: 'open',
+        assignee_agent_id: 'agent-1',
+      },
+      { externalSource: '', skipEvent: true, skipMirror: true },
+    )).rejects.toThrow(/non-blank identifier/)
+  })
+
+  it('createTask REJECTS whitespace-only provenance too', async () => {
+    const { env } = await makeEnv()
+    await expect(createTask(
+      env,
+      { squad_id: 'squad-a', title: 't', body: 'b', done_when: 'w', status: 'open', assignee_agent_id: 'agent-1' },
+      { externalSource: '   ', skipEvent: true, skipMirror: true },
+    )).rejects.toThrow(/non-blank identifier/)
+  })
+
+  it('the DATABASE refuses a blank marker even when the application is bypassed', async () => {
+    // The backstop. An application-layer check alone leaves this re-openable by a direct
+    // D1 write, a future caller, or a restore — so the invariant is stated where the
+    // trust boundary itself is defined.
+    const { harness } = await makeEnv()
+    expect(() => harness.sqlite.exec(`
+      INSERT INTO tasks (id, squad_id, title, body, done_when, status, external_source, created_at, updated_at)
+      VALUES ('t-blank', 'squad-a', 't', 'b', 'w', 'open', '', 'now', 'now');
+    `)).toThrow(/blank provenance/)
+  })
+
+  it('the DATABASE refuses blanking provenance by UPDATE', async () => {
+    const { env, harness } = await makeEnv()
+    const task = await createTask(
+      env,
+      { squad_id: 'squad-a', title: 't', body: 'b', done_when: 'w', status: 'open' },
+      { externalSource: 'linear:TEAM', skipEvent: true, skipMirror: true },
+    )
+    expect(() => harness.sqlite.exec(
+      `UPDATE tasks SET external_source = '' WHERE id = '${task.id}';`,
+    )).toThrow(/blank provenance/)
+  })
+
+  it('a legacy blank marker is treated as EXTERNAL, not promoted to trusted-local', () => {
+    // Fail closed: ambiguous provenance means untrusted. This is the property that holds
+    // for a row predating migrations/0078 — the boundary predicate asks `!= null`, so any
+    // present value is external, including one the validation would now reject.
+    //
+    // Tested directly on the predicate rather than by inserting a legacy row: the tasks
+    // table carries a pre-existing trigger that uses julianday() in an index, which the
+    // sqlite harness refuses on a raw insert. That is unrelated to this change, and
+    // testing the predicate is a stronger check anyway — it is the single place every
+    // boundary decision now goes through.
+    expect(isExternallySourced({ external_source: '', source_pot: null })).toBe(true)
+    expect(isExternallySourced({ external_source: '   ', source_pot: null })).toBe(true)
+    expect(isExternallySourced({ external_source: null, source_pot: '' })).toBe(true)
+    expect(isExternallySourced({ external_source: null, source_pot: null })).toBe(false)
+    expect(isExternallySourced({})).toBe(false)
   })
 })

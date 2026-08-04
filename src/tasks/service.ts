@@ -783,7 +783,27 @@ export async function createTask(
   await validateTaskProjectAttribution(env, projectId, input.squad_id)
 
   const now = new Date().toISOString()
-  const externalSource = options.externalSource ?? null
+  // PROVENANCE NORMALIZATION (adversarial gate BLOCK, 2026-08-04). migrations/0077
+  // defines the trust boundary as `external_source IS NULL` vs `IS NOT NULL`, but every
+  // runtime check below expressed it with JavaScript truthiness. An empty string is
+  // NON-NULL external provenance in the database and FALSY in JS, so the two layers
+  // disagreed about the same row: SQL called it external, `externalSource ? ... : ...`
+  // called it first-party. Passing `externalSource: ''` therefore produced a stored row
+  // with external_source='' that KEPT its assignee and executed through to a model turn.
+  //
+  // Blank provenance is rejected rather than coerced. Silently mapping '' to null would
+  // turn a caller's bug into trusted absence — the exact "absence means permission"
+  // shape this whole audit set has been about — and silently mapping it to a marker
+  // would invent provenance nobody supplied. A caller that has an external source knows
+  // its name; one that does not should pass null explicitly.
+  const rawExternalSource = options.externalSource
+  if (rawExternalSource !== undefined && rawExternalSource !== null && rawExternalSource.trim() === '') {
+    throw new Error(
+      'createTask: externalSource must be a non-blank identifier or null — ' +
+      'blank provenance is neither trusted-local nor attributable',
+    )
+  }
+  const externalSource = rawExternalSource ?? null
   // CHOKE-POINT FIX (PR #659 P0, widened per kasra-core's parallel-audit finding on
   // src/integrations/github-projects.ts:239-251 — confirmed live on main): an
   // external-origin task must NEVER be created pre-assigned. Before this guard,
@@ -800,7 +820,12 @@ export async function createTask(
   // ones that happen to remember not to pass an assignee. An admin must still take the
   // explicit, admin-gated task_update/PATCH step (already required for any
   // source_pot/external_source-tagged task) before the task is assignable.
-  const assigneeAgentId = externalSource ? null : (input.assignee_agent_id ?? null)
+  //
+  // Explicit null semantics, matching migrations/0077 exactly. Not truthiness: any
+  // non-null value is external, including one the validation above would have rejected
+  // but that reached here another way (a legacy row, a future caller, a direct write).
+  // Fail closed on anything that is not literally absent.
+  const assigneeAgentId = externalSource !== null ? null : (input.assignee_agent_id ?? null)
   const task: Task = {
     id: options.id ?? crypto.randomUUID(),
     squad_id: input.squad_id,

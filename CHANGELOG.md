@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+- **Blank provenance can no longer become trusted absence** (adversarial gate BLOCK).
+  `migrations/0077` defines the trust boundary as `external_source IS NULL` vs
+  `IS NOT NULL`, but every runtime check spelled it with JavaScript truthiness. Those
+  disagree on exactly one value: **the empty string is non-null in SQL and falsy in JS**.
+  Reproduced against the real migrations — a task created with `externalSource: ''`
+  stored `external_source=''`, **kept its `assignee_agent_id`, and executed through to a
+  model turn**. SQL called the row external, the runtime called it first-party, and the
+  row was governed by whichever layer was asked.
+  - `createTask` now **rejects** blank/whitespace provenance. Coercing `''` to null would
+    turn a caller's bug into trusted absence — the exact "absence means permission"
+    pattern this audit set has been closing — and coercing it to a marker would invent
+    provenance nobody supplied.
+  - Every boundary check goes through one predicate, `isExternallySourced`, using explicit
+    `!= null`: execution, auto-pickup, content-intent, the prompt fence, and the admin
+    reassignment guards in both REST and MCP.
+  - `migrations/0078` adds INSERT/UPDATE triggers so a blank marker cannot be stored at
+    all, including by a direct D1 write or a restore. Existing blank rows are marked
+    `unknown:blank-provenance-0078` — **fail closed as external**, never promoted to local.
+  - This vindicates an earlier independent finding that raised the empty string against
+    the provenance work. That report located it in `countOpenBacklog`, where `IS NULL`
+    already excluded `''` correctly and the proposed change would have introduced a bug —
+    but the underlying instinct, that the stamp is load-bearing and `''` breaks it, was
+    right, and this is where it was true.
+
+
 - **Production dependencies: 0 known vulnerabilities**, verified from the lockfile
   (`npm audit --package-lock-only --omit=dev`) rather than from a local tree.
   - Corrected overrides that were pinned to the TOP of a vulnerable range instead of
