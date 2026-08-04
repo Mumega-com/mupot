@@ -16,8 +16,52 @@ jobs:
         with:
           node-version: 22
       - run: npm ci
-      - name: Dependency audit
-        run: npm audit --audit-level=high
+      # Dependency audit, split by what actually ships.
+      #
+      # This step used to be a single `npm audit --audit-level=high` over prod AND dev.
+      # As of 2026-08-04 that is UNSATISFIABLE, not merely noisy: undici has open highs,
+      # reachable only as wrangler → miniflare → undici, and there is no wrangler version
+      # without it. `npm audit fix --force` "resolves" it by DOWNGRADING wrangler to
+      # 4.35.0 from 4.118 — surrendering ~80 releases of fixes to silence a dev-only
+      # finding. So the single gate had one of two outcomes: permanently red, or a
+      # downgrade that makes us less safe. Neither is a gate; both are theatre.
+      #
+      # The split below is STRICTER on what ships, not weaker. Production drops from
+      # --audit-level=high to MODERATE, and it currently reports 0 vulnerabilities at
+      # any level, so this blocks on the first regression rather than waiting for one
+      # to reach "high". It would still have caught every real finding this gate has
+      # ever caught (fast-uri, ip-address, brace-expansion — all production).
+      #
+      # PRECEDENT, recorded because it is the reason to distrust this change: PR #664
+      # was an earlier attempt to relax this gate, retracted the same day. It was wrong
+      # because the premise came from a STALE LOCAL node_modules that showed dev-only
+      # advisories while CI's clean `npm ci` had 5 production highs. The premise here
+      # was taken from the LOCKFILE (`npm audit --package-lock-only --omit=dev`), which
+      # is what CI installs from, and the production highs it found were FIXED rather
+      # than reclassified — see the overrides block in package.json.
+      - name: Dependency audit (production — BLOCKING)
+        run: npm audit --omit=dev --audit-level=moderate
+      # Dev/build-tooling advisories, gated against an explicit allowlist rather than
+      # waived. The first version of this step was `npm audit --audit-level=high || true`
+      # and adversarial review blocked it, correctly: `|| true` does not accept "the known
+      # unfixable undici chain", it accepts EVERY future high/critical dev advisory and
+      # every audit-tool failure. It also made #670's close condition undetectable, since
+      # the step passes identically whether the known advisory is still there or ten new
+      # ones have joined it.
+      #
+      # scripts/audit-gate.mjs fails in BOTH directions:
+      #   NEW    a high/critical advisory not in .github/audit-allowlist.json
+      #   STALE  an allowlist entry that no longer appears (a fix shipped — delete it)
+      # and it fails on an audit it cannot run or parse, rather than reading silence as
+      # safety. The STALE direction is what `|| true` could never do, and it is what makes
+      # #670 self-closing instead of dependent on someone remembering to check.
+      - name: Dependency audit (dev toolchain — allowlisted)
+        run: node scripts/audit-gate.mjs
+      # Hermetic — no registry, no lockfile. One case per bypass reproduced in review,
+      # so each stays shut. A gate whose tests need a working registry cannot be trusted
+      # to run when the registry is what is broken.
+      - name: Audit-gate self-tests
+        run: node --test tests/audit-gate.test.mjs
       - name: Typecheck
         run: npm run typecheck
       - name: Install Playwright browser for integration tests
