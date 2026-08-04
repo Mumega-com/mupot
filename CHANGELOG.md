@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- **Dependency tree unwedged**: `agents` dropped (unused), `cron-schedule` declared
+  explicitly. The tree was stuck — `agents@0.14.5` required `ai@^6` while its own peer
+  `@cloudflare/ai-chat` pulled `ai@7`, so every tree modification failed `ERESOLVE` and
+  **`npm audit fix` silently no-opped**, reporting nothing done even where it claimed a
+  fix was available. That is why advisories accumulated and why overrides were the only
+  thing that ever worked. Not neglect — the tool could not act.
+  - `agents` had no static import, no `require`, no dynamic import, no type-only use and
+    no wrangler config reference. Both Durable Object classes (`AgentDO`,
+    `SquadCoordinatorDO`) are ours, in `src/agents/`.
+  - But removing it broke 53 test files with `TS2307: Cannot find module 'cron-schedule'`
+    — it was transitively supplying a module `src/routines/schedule.ts` imports directly.
+    Declared first, then removed.
+  - Production audit stays at **0**. The `@hono/node-server` and `body-parser` overrides
+    stay live: they are reached via `@modelcontextprotocol/sdk`, which is a direct
+    dependency, so dropping `agents` did not orphan them (checked rather than assumed).
+
+
 - **Production dependencies: 0 known vulnerabilities**, verified from the lockfile
   (`npm audit --package-lock-only --omit=dev`) rather than from a local tree.
   - Corrected overrides that were pinned to the TOP of a vulnerable range instead of
