@@ -15,7 +15,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { evaluate, loadAllowlist, runAudit, ancestryOf, AuditGateError } from '../scripts/audit-gate.mjs'
+import { evaluate, loadAllowlist, runAudit, pathsTo, AuditGateError } from '../scripts/audit-gate.mjs'
 
 const UNDICI_GHSA = 'GHSA-4cwx-7wf7-3272'
 
@@ -27,7 +27,7 @@ function allowEntry(over = {}) {
     severity: 'high',
     nodes: ['node_modules/undici'],
     isDirect: false,
-    ancestry: ['miniflare', 'wrangler'],
+    paths: [['wrangler', 'miniflare', 'undici']],
     why: 'dev toolchain only',
     accepted_on: '2026-08-04',
     ...over,
@@ -37,7 +37,7 @@ function allowEntry(over = {}) {
 /** An npm-audit-shaped report carrying one advisory. */
 function report({
   pkg = 'undici', ghsa = UNDICI_GHSA, severity = 'high',
-  nodes = ['node_modules/undici'], isDirect = false, chain = true,
+  nodes = ['node_modules/undici'], isDirect = false, chain = true, miniflareDirect = false,
 } = {}) {
   const vulnerabilities = {
     [pkg]: {
@@ -52,7 +52,7 @@ function report({
   if (chain) {
     // The real shape: undici -> miniflare -> wrangler. Only the leaf carries the
     // blocking advisory; the ancestors appear as moderate entries.
-    vulnerabilities.miniflare = { name: 'miniflare', severity: 'moderate', nodes: ['node_modules/miniflare'], isDirect: false, effects: ['wrangler'], via: [pkg] }
+    vulnerabilities.miniflare = { name: 'miniflare', severity: 'moderate', nodes: ['node_modules/miniflare'], isDirect: miniflareDirect, effects: ['wrangler'], via: [pkg] }
     vulnerabilities.wrangler = { name: 'wrangler', severity: 'moderate', nodes: ['node_modules/wrangler'], isDirect: true, effects: [], via: ['miniflare'] }
   }
   return { vulnerabilities }
@@ -120,7 +120,7 @@ test('BYPASS: the allowlisted advisory as a DIRECT dependency is rejected', () =
   assert.match(violations[0], /direct=true/)
 })
 
-test('BYPASS: the allowlisted advisory reached by a DIFFERENT ancestry is rejected', () => {
+test('BYPASS: the allowlisted advisory reached by a DIFFERENT chain is rejected', () => {
   // Same package, same install location, same severity — but no longer via
   // wrangler > miniflare. That is a different decision, not the accepted one.
   const { violations } = evaluate(report({ chain: false }), [allowEntry()])
@@ -128,14 +128,62 @@ test('BYPASS: the allowlisted advisory reached by a DIFFERENT ancestry is reject
   assert.match(violations[0], /different finding/)
 })
 
-test('ancestryOf walks effects transitively', () => {
-  assert.deepEqual(ancestryOf(report(), 'undici'), ['miniflare', 'wrangler'])
+// ── BYPASS 5 (reproduced in review): effects is a NAME SET, not a causal path ─
+//
+// Making miniflare a DIRECT dev dependency left the flattened ancestry set identical
+// — still {miniflare, wrangler} — while the accepted justification ("we carry
+// miniflare only because wrangler needs it") became false. Reproduced under npm 9.9.4
+// and 10.9.8. Fixing bypass 4 with a sorted name set was the same error as fixing it
+// with `nodes`, one level up: binding a projection instead of the thing itself.
+
+test('BYPASS: a new DIRECT edge to an ancestor changes the accepted shape', () => {
+  const { violations } = evaluate(report({ miniflareDirect: true }), [allowEntry()])
+  assert.equal(violations.length, 1)
+  assert.match(violations[0], /different finding/)
 })
 
-test('ancestryOf terminates on a dependency cycle', () => {
+test('pathsTo returns ordered root-first causal chains', () => {
+  assert.deepEqual(pathsTo(report(), 'undici'), [['wrangler', 'miniflare', 'undici']])
+})
+
+test('pathsTo yields BOTH chains when an ancestor is also direct', () => {
+  // This is precisely what a flattened name set could not express.
+  assert.deepEqual(pathsTo(report({ miniflareDirect: true }), 'undici'), [
+    ['miniflare', 'undici'],
+    ['wrangler', 'miniflare', 'undici'],
+  ])
+})
+
+test('pathsTo yields both chains when the package itself is also direct', () => {
+  assert.deepEqual(pathsTo(report({ isDirect: true }), 'undici'), [
+    ['undici'],
+    ['wrangler', 'miniflare', 'undici'],
+  ])
+})
+
+test('pathsTo terminates on a dependency cycle', () => {
   // A malformed or cyclic effects graph must not hang the gate.
   const cyclic = { vulnerabilities: { a: { effects: ['b'] }, b: { effects: ['a'] } } }
-  assert.deepEqual(ancestryOf(cyclic, 'a'), ['a', 'b'])
+  assert.ok(pathsTo(cyclic, 'a').length > 0)
+})
+
+test('UNKNOWN: an unresolvable advisory id makes staleness undecidable, not "gone"', () => {
+  // Review finding: with a blocking finding whose id cannot be resolved, the gate used
+  // to print "A fix shipped — delete these entries" while a blocking finding was
+  // visibly present. It cannot know that. Classify as UNKNOWN and say so.
+  const r = {
+    vulnerabilities: {
+      undici: {
+        name: 'undici', severity: 'high', nodes: ['node_modules/undici'], isDirect: false, effects: [],
+        via: [{ title: 'no url', severity: 'high' }],
+      },
+    },
+  }
+  const { violations, stale } = evaluate(r, [allowEntry()])
+  assert.equal(violations.length, 1)
+  assert.match(violations[0], /no resolvable GHSA/)
+  assert.equal(stale.length, 1)
+  assert.equal(stale[0].reason, 'unknown')
 })
 
 test('an allowlist entry with isDirect true is rejected outright', () => {
@@ -269,7 +317,7 @@ test('a malformed allowlist throws', () => {
 })
 
 test('an entry missing a required field throws', () => {
-  for (const field of ['ghsa', 'package', 'severity', 'nodes', 'why', 'accepted_on']) {
+  for (const field of ['ghsa', 'package', 'severity', 'nodes', 'isDirect', 'paths', 'why', 'accepted_on']) {
     const entry = allowEntry()
     delete entry[field]
     withAllowlistFile({ allowed: [entry] }, (p) => {
