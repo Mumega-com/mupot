@@ -22,8 +22,9 @@ export interface AgentIdentity {
   boundAgentId: string | null
 }
 
-async function sha256Hex(s: string): Promise<string> {
-  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s))
+/** SHA-256 hex digest of a raw member token — store/pass this, never the raw secret. */
+export async function hashMemberToken(raw: string): Promise<string> {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(raw))
   return Array.from(new Uint8Array(buf))
     .map((b) => b.toString(16).padStart(2, '0'))
     .join('')
@@ -42,7 +43,7 @@ export function bearerToken(header: string | undefined | null): string | null {
 // a missing token and a bad token are indistinguishable to the caller).
 export async function resolveMemberByToken(env: Env, raw: string | null): Promise<AgentIdentity | null> {
   if (!raw) return null
-  const tokenHash = await sha256Hex(raw)
+  const tokenHash = await hashMemberToken(raw)
   const row = await env.DB.prepare(
     `SELECT m.id AS member_id, m.display_name AS display_name, m.email AS email, m.status AS status, t.agent_id AS bound_agent_id
        FROM member_tokens t
@@ -57,6 +58,32 @@ export async function resolveMemberByToken(env: Env, raw: string | null): Promis
     .first<{ member_id: string; display_name: string; email: string | null; status: string; bound_agent_id: string | null }>()
   if (!row || row.status !== 'active') return null
   return { memberId: row.member_id, displayName: row.display_name, email: row.email, boundAgentId: row.bound_agent_id ?? null }
+}
+
+/**
+ * Re-check a previously accepted subscription's token hash: still unrevoked,
+ * still bound to the expected member, member still active. Used by long-lived
+ * presence WebSockets so revoke/deactivate takes effect without waiting for disconnect.
+ */
+export async function memberTokenHashIsLive(
+  env: Env,
+  tokenHash: string,
+  expectedMemberId: string,
+): Promise<boolean> {
+  if (!tokenHash || !expectedMemberId) return false
+  const row = await env.DB.prepare(
+    `SELECT m.id AS member_id, m.status AS status
+       FROM member_tokens t
+       JOIN members m ON m.id = t.member_id
+      WHERE t.token_hash = ?1
+        AND t.tenant = ?2
+        AND m.tenant = ?2
+        AND t.revoked_at IS NULL
+      LIMIT 1`,
+  )
+    .bind(tokenHash, env.TENANT_SLUG)
+    .first<{ member_id: string; status: string }>()
+  return !!row && row.status === 'active' && row.member_id === expectedMemberId
 }
 
 // Resolve a bearer token to an ORG-ADMIN identity, or a refusal. Shared by the

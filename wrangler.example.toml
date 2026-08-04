@@ -23,6 +23,7 @@ OAUTH_PROVIDER = "google"         # google | telegram
 # PUBLIC_ORIGIN = "https://mupot.example.com"
 FLEET_PROJECT = "sos"             # pot fleet label (legacy name; CF-native messaging, not SOS Redis — ADR #473)
 FLEET_OPS_AGENT = "kasra"         # ops agent that receives control asks via agent_messages (explicit — resolvers fail closed, no code default)
+# REALTIME_PRESENCE = "1"         # opt-in live roster WebSocket fan-out (ADR #473). Off by default.
 # secrets (NOT here): OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET, GITHUB_TOKEN, AI_GATEWAY_TOKEN.
 # BUS_URL / BUS_TOKEN are SOS compat-shim leftovers — do NOT put them here; active fleet
 # routes never call the Redis bus (docs/architecture/sos-coordination-compat.md).
@@ -94,9 +95,19 @@ class_name = "AgentDO"
 name = "SQUAD"
 class_name = "SquadCoordinatorDO"
 
+# Live roster WebSocket channel (ADR #473). Binding is always declared so the
+# DO class can deploy; the feature stays OFF until REALTIME_PRESENCE=1 under [vars].
+[[durable_objects.bindings]]
+name = "PRESENCE_CHANNEL"
+class_name = "PresenceChannelDO"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["AgentDO", "SquadCoordinatorDO"]
+
+[[migrations]]
+tag = "v2"
+new_classes = ["PresenceChannelDO"]
 
 # ── durable task pipeline (issue #7) ──
 # Opt-in: start via POST /api/tasks/:id/pipeline.  The legacy direct-execute
