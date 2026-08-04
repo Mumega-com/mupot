@@ -57,6 +57,11 @@ jobs:
       # #670 self-closing instead of dependent on someone remembering to check.
       - name: Dependency audit (dev toolchain — allowlisted)
         run: node scripts/audit-gate.mjs
+      # Hermetic — no registry, no lockfile. One case per bypass reproduced in review,
+      # so each stays shut. A gate whose tests need a working registry cannot be trusted
+      # to run when the registry is what is broken.
+      - name: Audit-gate self-tests
+        run: node --test tests/audit-gate.test.mjs
       - name: Typecheck
         run: npm run typecheck
       - name: Install Playwright browser for integration tests
