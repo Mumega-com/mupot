@@ -1,5 +1,64 @@
 # Changelog
 
+## Unreleased
+
+- **Production dependencies: 0 known vulnerabilities**, verified from the lockfile
+  (`npm audit --package-lock-only --omit=dev`) rather than from a local tree.
+  - Corrected overrides that were pinned to the TOP of a vulnerable range instead of
+    past it — the original #662/#464 defect. `postcss` was still `8.5.18` against an
+    advisory of `<=8.5.22`; the fix for that class of bug had the same bug in it.
+  - `hono` `^4.12.28` → `^4.13.0` (CORS middleware ReDoS, GHSA-8j4g-w8fx-2239). This
+    one is our production router on an external-facing surface.
+  - Added overrides: `@hono/node-server ^2.0.5` (serve-static path traversal, reached
+    via `@modelcontextprotocol/sdk` ← `agents`), `body-parser ^2.2.3` (DoS via a limit
+    value that silently disables size enforcement).
+  - Went from 15 advisories (6 high) to **0 production / 3 dev**.
+
+- **CI dependency audit split by what actually ships** (`.github/workflows/ci.yml`).
+  - Production: **BLOCKING at `moderate`**, tightened from `high`. Production is at 0,
+    so this now blocks on the first regression instead of waiting for one to reach
+    "high". Strictly stronger on shippable surface.
+  - Dev toolchain: gated against an **explicit allowlist** (`.github/audit-allowlist.json`
+    + `scripts/audit-gate.mjs`), not waived. `undici` has an open high reachable as
+    `wrangler → miniflare → undici`, **no wrangler version exists without it**, and npm's
+    remediation is to DOWNGRADE wrangler 4.118 → 4.35.0 — so the combined gate could only
+    be permanently red or actively harmful.
+  - The first attempt at this used `npm audit --audit-level=high || true` and was
+    **blocked in review**: `|| true` does not accept the known chain, it accepts *every
+    future* high/critical dev advisory and every audit-tool failure — and it made #670's
+    close condition undetectable, because the step passes identically whether the known
+    advisory is still there or ten new ones have joined it. The allowlist fails in **both**
+    directions: a high/critical advisory that is not listed, **and** a listed entry that
+    has stopped appearing (a fix shipped — delete it). It also fails on an audit it cannot
+    run or parse, rather than reading silence as safety. The stale direction is what
+    `|| true` could never do, and it makes #670 self-closing rather than dependent on
+    someone remembering to check.
+  - Exactly **one** advisory is accepted (GHSA-4cwx-7wf7-3272). The other four undici
+    advisories in the same chain are moderate and so do not block — deliberately absent
+    rather than allowlisted. Residual risk named rather than dismissed: this is real
+    exposure to a compromised build host, just not shippable surface.
+  - **Six bypasses were reproduced against this gate in review before it was accepted**,
+    and the last three were the same mistake three times: binding a *projection* of the
+    dependency graph rather than the graph. `nodes` is an install location; a flattened
+    ancestry name-set is not a path; and `npm audit --json` keys its findings by package
+    **name**, so an npm alias (`wrangler-alias@npm:wrangler`) — a genuinely second root
+    edge — collapsed into the accepted chain and passed with zero violations. The audit
+    summary cannot express node identity, so paths now come from **package-lock.json**
+    (`scripts/lockfile-paths.mjs`), keyed by node path and resolved version.
+  - Lockfile ambiguity fails closed: an unresolvable declared dependency, a target absent
+    from the lockfile, an orphan reachable from no root edge, or more than `MAX_PATHS`
+    routes all fail rather than producing a plausible-looking answer. Optional deps and
+    optional peers may legitimately be uninstalled and do not trip it.
+  - Staleness is classified **GONE / MOVED / UNKNOWN**. The earlier single message told
+    the operator "a fix shipped — delete this entry" even when the advisory was still
+    present and had merely moved, which made deleting a live exemption the cheapest way
+    to get a green build.
+  - **PR #664 was an earlier attempt to relax this gate and was retracted the same day**,
+    because its premise came from a stale local `node_modules` while CI's clean `npm ci`
+    had 5 production highs. That precedent is recorded in the workflow comment and in
+    #670 so the next person to touch this gate has to take their premise from the
+    lockfile, not from a local tree.
+
 ## 2026-08-02/03 — the weekend the loop became real
 
 - 4-technician operator loop shipped (#623/#624/#630/#644): tech-grok (minted
