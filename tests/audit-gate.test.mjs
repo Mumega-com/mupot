@@ -15,7 +15,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { evaluate, loadAllowlist, AuditGateError } from '../scripts/audit-gate.mjs'
+import { evaluate, loadAllowlist, runAudit, ancestryOf, AuditGateError } from '../scripts/audit-gate.mjs'
 
 const UNDICI_GHSA = 'GHSA-4cwx-7wf7-3272'
 
@@ -26,6 +26,8 @@ function allowEntry(over = {}) {
     package: 'undici',
     severity: 'high',
     nodes: ['node_modules/undici'],
+    isDirect: false,
+    ancestry: ['miniflare', 'wrangler'],
     why: 'dev toolchain only',
     accepted_on: '2026-08-04',
     ...over,
@@ -33,17 +35,27 @@ function allowEntry(over = {}) {
 }
 
 /** An npm-audit-shaped report carrying one advisory. */
-function report({ pkg = 'undici', ghsa = UNDICI_GHSA, severity = 'high', nodes = ['node_modules/undici'] } = {}) {
-  return {
-    vulnerabilities: {
-      [pkg]: {
-        name: pkg,
-        severity,
-        nodes,
-        via: [{ source: 1130718, name: pkg, title: 'undici thing', url: `https://github.com/advisories/${ghsa}`, severity }],
-      },
+function report({
+  pkg = 'undici', ghsa = UNDICI_GHSA, severity = 'high',
+  nodes = ['node_modules/undici'], isDirect = false, chain = true,
+} = {}) {
+  const vulnerabilities = {
+    [pkg]: {
+      name: pkg,
+      severity,
+      nodes,
+      isDirect,
+      effects: chain ? ['miniflare'] : [],
+      via: [{ source: 1130718, name: pkg, title: 'undici thing', url: `https://github.com/advisories/${ghsa}`, severity }],
     },
   }
+  if (chain) {
+    // The real shape: undici -> miniflare -> wrangler. Only the leaf carries the
+    // blocking advisory; the ancestors appear as moderate entries.
+    vulnerabilities.miniflare = { name: 'miniflare', severity: 'moderate', nodes: ['node_modules/miniflare'], isDirect: false, effects: ['wrangler'], via: [pkg] }
+    vulnerabilities.wrangler = { name: 'wrangler', severity: 'moderate', nodes: ['node_modules/wrangler'], isDirect: true, effects: [], via: ['miniflare'] }
+  }
+  return { vulnerabilities }
 }
 
 function withAllowlistFile(contents, fn) {
@@ -94,6 +106,86 @@ test('BYPASS: same allowlisted GHSA re-rated high -> critical is rejected', () =
   assert.match(violations[0], /critical/)
 })
 
+// ── BYPASS 4 (reproduced in review): direct dependency inherits the exemption ─
+//
+// `nodes` is where a package is INSTALLED, not how it was REACHED. Adding undici as a
+// direct dev dependency produced the same GHSA, same severity and same nodes, so the
+// tuple matched and the gate passed. But the exemption's whole justification is the
+// ancestry — we carry this only because wrangler needs miniflare. A direct dependency
+// destroys that justification while looking identical by install location.
+
+test('BYPASS: the allowlisted advisory as a DIRECT dependency is rejected', () => {
+  const { violations } = evaluate(report({ isDirect: true }), [allowEntry()])
+  assert.equal(violations.length, 1)
+  assert.match(violations[0], /direct=true/)
+})
+
+test('BYPASS: the allowlisted advisory reached by a DIFFERENT ancestry is rejected', () => {
+  // Same package, same install location, same severity — but no longer via
+  // wrangler > miniflare. That is a different decision, not the accepted one.
+  const { violations } = evaluate(report({ chain: false }), [allowEntry()])
+  assert.equal(violations.length, 1)
+  assert.match(violations[0], /different finding/)
+})
+
+test('ancestryOf walks effects transitively', () => {
+  assert.deepEqual(ancestryOf(report(), 'undici'), ['miniflare', 'wrangler'])
+})
+
+test('ancestryOf terminates on a dependency cycle', () => {
+  // A malformed or cyclic effects graph must not hang the gate.
+  const cyclic = { vulnerabilities: { a: { effects: ['b'] }, b: { effects: ['a'] } } }
+  assert.deepEqual(ancestryOf(cyclic, 'a'), ['a', 'b'])
+})
+
+test('an allowlist entry with isDirect true is rejected outright', () => {
+  withAllowlistFile({ allowed: [allowEntry({ isDirect: true })] }, (p) => {
+    assert.throws(() => loadAllowlist(p), /cannot inherit the transitive-toolchain exemption/)
+  })
+})
+
+// ── BYPASS 1 (reproduced in review), now hermetic ────────────────────────────
+//
+// Previously proven only end-to-end with a fake npm on PATH. `runAudit` takes an
+// injectable exec so the exit-code contract is testable without a registry.
+
+function execThatExits(status, stdout) {
+  return () => {
+    const err = new Error(`Command failed with exit code ${status}`)
+    err.status = status
+    err.stdout = stdout
+    err.stderr = 'npm ERR! simulated'
+    throw err
+  }
+}
+
+const ALLOWED_JSON = JSON.stringify(report())
+
+test('BYPASS: npm exiting 2 with parseable JSON is a FAILURE, not a clean audit', () => {
+  assert.throws(
+    () => runAudit(process.cwd(), execThatExits(2, ALLOWED_JSON)),
+    /exited 2 .*Refusing to interpret a failed audit as a clean one/s,
+  )
+})
+
+test('npm exiting 1 (findings) is the normal path and parses', () => {
+  const r = runAudit(process.cwd(), execThatExits(1, ALLOWED_JSON))
+  assert.ok(r.vulnerabilities.undici)
+})
+
+test('npm exiting 0 parses', () => {
+  const r = runAudit(process.cwd(), () => JSON.stringify({ vulnerabilities: {} }))
+  assert.deepEqual(r.vulnerabilities, {})
+})
+
+test('npm exiting 1 with UNPARSEABLE output fails rather than passing', () => {
+  assert.throws(() => runAudit(process.cwd(), execThatExits(1, 'not json')), AuditGateError)
+})
+
+test('a killed npm (signal, no status) fails', () => {
+  assert.throws(() => runAudit(process.cwd(), () => { const e = new Error('killed'); e.signal = 'SIGKILL'; throw e }), AuditGateError)
+})
+
 // ── Both failure directions ──────────────────────────────────────────────────
 
 test('a high advisory that is not allowlisted at all is rejected', () => {
@@ -128,14 +220,8 @@ test('an advisory with no resolvable GHSA id fails closed', () => {
 })
 
 test('severity falls back to the package aggregate when the advisory omits it', () => {
-  const r = {
-    vulnerabilities: {
-      undici: {
-        name: 'undici', severity: 'high', nodes: ['node_modules/undici'],
-        via: [{ title: 'x', url: `https://github.com/advisories/${UNDICI_GHSA}` }],
-      },
-    },
-  }
+  const r = report()
+  delete r.vulnerabilities.undici.via[0].severity
   assert.deepEqual(evaluate(r, [allowEntry()]).violations, [])
 })
 

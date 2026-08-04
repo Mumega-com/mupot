@@ -26,9 +26,15 @@
 //   3. The same GHSA re-rated high -> critical. Severity was prose in the allowlist
 //      and never compared, so an escalation passed silently.
 //
-// The allowlist entry is therefore a TUPLE — ghsa + package + severity + nodes — and
-// every field is load-bearing. Anything that differs from what was accepted is treated
-// as a new, unreviewed finding.
+//   4. Installing undici as a DIRECT dev dependency. Same GHSA, same severity, same
+//      `nodes` — because `nodes` is where a package is INSTALLED, not how it was
+//      reached. The exemption's entire justification is the ancestry "we only have
+//      this because wrangler needs miniflare"; a direct dependency destroys that
+//      justification while matching the tuple exactly.
+//
+// The allowlist entry is therefore a TUPLE — ghsa + package + severity + nodes +
+// isDirect + ancestry — and every field is load-bearing. Anything that differs from
+// what was accepted is treated as a new, unreviewed finding.
 //
 // The gate fails in BOTH directions:
 //   NEW    a high/critical advisory whose tuple is not in the allowlist
@@ -60,9 +66,31 @@ function normalizeNodes(nodes) {
   return [...(nodes ?? [])].map(String).sort()
 }
 
+/**
+ * Transitive ancestry of a vulnerable package: which packages pull it in.
+ *
+ * `nodes` is the INSTALL LOCATION and says nothing about how a package was reached —
+ * that gap was bypass 4. npm's `effects` gives the immediate dependents, so walking it
+ * transitively reconstructs the declared chain. For the accepted finding this yields
+ * ["miniflare", "wrangler"], which is the actual reason it is exempt.
+ */
+export function ancestryOf(report, pkg) {
+  const out = new Set()
+  const stack = [...(report.vulnerabilities?.[pkg]?.effects ?? [])]
+  while (stack.length > 0) {
+    const next = stack.pop()
+    if (out.has(next)) continue
+    out.add(next)
+    for (const e of report.vulnerabilities?.[next]?.effects ?? []) {
+      if (!out.has(e)) stack.push(e)
+    }
+  }
+  return [...out].sort()
+}
+
 /** Identity of an accepted finding. Every component is compared; none is decoration. */
-function tupleKey({ ghsa, pkg, severity, nodes }) {
-  return JSON.stringify([ghsa, pkg, severity, normalizeNodes(nodes)])
+function tupleKey({ ghsa, pkg, severity, nodes, isDirect, ancestry }) {
+  return JSON.stringify([ghsa, pkg, severity, normalizeNodes(nodes), Boolean(isDirect), normalizeNodes(ancestry)])
 }
 
 export function loadAllowlist(path = DEFAULT_ALLOWLIST) {
@@ -80,13 +108,28 @@ export function loadAllowlist(path = DEFAULT_ALLOWLIST) {
   }
   const seen = new Set()
   for (const [i, entry] of allowed.entries()) {
-    for (const field of ['ghsa', 'package', 'severity', 'nodes', 'why', 'accepted_on']) {
+    for (const field of ['ghsa', 'package', 'severity', 'nodes', 'isDirect', 'ancestry', 'why', 'accepted_on']) {
       if (entry?.[field] === undefined) {
         throw new AuditGateError(`${path}: allowed[${i}] is missing required field "${field}"`)
       }
     }
     if (!Array.isArray(entry.nodes) || entry.nodes.length === 0) {
       throw new AuditGateError(`${path}: allowed[${i}].nodes must be a non-empty array`)
+    }
+    if (!Array.isArray(entry.ancestry)) {
+      throw new AuditGateError(`${path}: allowed[${i}].ancestry must be an array`)
+    }
+    if (typeof entry.isDirect !== 'boolean') {
+      throw new AuditGateError(`${path}: allowed[${i}].isDirect must be a boolean`)
+    }
+    if (entry.isDirect === true) {
+      // A DIRECT dependency is one we chose to add. If it carries a high/critical
+      // advisory, the answer is to change or drop it, never to allowlist it — the
+      // dev-toolchain justification does not apply to something we depend on directly.
+      throw new AuditGateError(
+        `${path}: allowed[${i}] has isDirect true. A direct dependency's advisory must be ` +
+        `fixed or the dependency dropped — it cannot inherit the transitive-toolchain exemption.`,
+      )
     }
     if (!BLOCKING.has(String(entry.severity).toLowerCase())) {
       // Only high/critical block, so allowlisting anything else is dead config that
@@ -97,7 +140,8 @@ export function loadAllowlist(path = DEFAULT_ALLOWLIST) {
       )
     }
     const key = tupleKey({
-      ghsa: entry.ghsa, pkg: entry.package, severity: String(entry.severity).toLowerCase(), nodes: entry.nodes,
+      ghsa: entry.ghsa, pkg: entry.package, severity: String(entry.severity).toLowerCase(),
+      nodes: entry.nodes, isDirect: entry.isDirect, ancestry: entry.ancestry,
     })
     if (seen.has(key)) throw new AuditGateError(`${path}: allowed[${i}] is a duplicate entry`)
     seen.add(key)
@@ -113,9 +157,9 @@ export function loadAllowlist(path = DEFAULT_ALLOWLIST) {
  * bad lockfile, EACCES), and a gate must never read that as a clean bill of health,
  * even when the process happened to emit parseable JSON on the way down.
  */
-export function runAudit(cwd = repoRoot) {
+export function runAudit(cwd = repoRoot, exec = execFileSync) {
   try {
-    return JSON.parse(execFileSync('npm', ['audit', '--json'], {
+    return JSON.parse(exec('npm', ['audit', '--json'], {
       cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
     }))
   } catch (err) {
@@ -141,7 +185,10 @@ export function evaluate(report, allowed) {
   }
 
   const allowedKeys = new Map(allowed.map((a) => [
-    tupleKey({ ghsa: a.ghsa, pkg: a.package, severity: String(a.severity).toLowerCase(), nodes: a.nodes }),
+    tupleKey({
+      ghsa: a.ghsa, pkg: a.package, severity: String(a.severity).toLowerCase(),
+      nodes: a.nodes, isDirect: a.isDirect, ancestry: a.ancestry,
+    }),
     a,
   ]))
   const matched = new Set()
@@ -160,7 +207,8 @@ export function evaluate(report, allowed) {
         continue
       }
 
-      const key = tupleKey({ ghsa, pkg, severity, nodes: vuln.nodes })
+      const ancestry = ancestryOf(report, pkg)
+      const key = tupleKey({ ghsa, pkg, severity, nodes: vuln.nodes, isDirect: vuln.isDirect, ancestry })
       if (allowedKeys.has(key)) {
         matched.add(key)
         continue
@@ -171,16 +219,19 @@ export function evaluate(report, allowed) {
       const sameGhsa = allowed.find((a) => a.ghsa === ghsa)
       const detail = sameGhsa
         ? ` (${ghsa} IS allowlisted, but as ${sameGhsa.package}/${sameGhsa.severity}` +
-          ` at ${normalizeNodes(sameGhsa.nodes).join(', ')} — found here as ${pkg}/${severity}` +
-          ` at ${normalizeNodes(vuln.nodes).join(', ')}. An exemption is bound to WHERE the` +
-          ` advisory sits; this is a different finding.)`
+          ` at ${normalizeNodes(sameGhsa.nodes).join(', ')}, direct=${Boolean(sameGhsa.isDirect)},` +
+          ` via [${normalizeNodes(sameGhsa.ancestry).join(' > ')}] — found here as ${pkg}/${severity}` +
+          ` at ${normalizeNodes(vuln.nodes).join(', ')}, direct=${Boolean(vuln.isDirect)},` +
+          ` via [${ancestry.join(' > ')}]. An exemption is bound to HOW the advisory is` +
+          ` reached, not just which package it is; this is a different finding.)`
         : ''
       violations.push(`${pkg}: ${severity} — ${ghsa} — ${via.title ?? ''}${detail}`)
     }
   }
 
   const stale = allowed.filter((a) => !matched.has(tupleKey({
-    ghsa: a.ghsa, pkg: a.package, severity: String(a.severity).toLowerCase(), nodes: a.nodes,
+    ghsa: a.ghsa, pkg: a.package, severity: String(a.severity).toLowerCase(),
+    nodes: a.nodes, isDirect: a.isDirect, ancestry: a.ancestry,
   })))
 
   return { violations, stale }
