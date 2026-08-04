@@ -105,6 +105,7 @@ import { loadFlightSquads, parseFlightMetaV1, validateFlightMetaReferences, type
 // AUTH_CONTEXT_HEADER lives in a separate module (no cloudflare:workers dep) so
 // Vitest can import it without the CF runtime. See ./auth-header.ts.
 import { AUTH_CONTEXT_HEADER } from './auth-header'
+import { isExternallySourced } from '../tasks/provenance'
 import { MUPOT_PUBLIC_API_VERSION } from '../version'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
@@ -434,7 +435,7 @@ function readConcepts(v: unknown): string[] | undefined | Extract<ToolOutcome, {
 
 async function loadTask(env: Env, taskId: string): Promise<Task | null> {
   const row = await env.DB.prepare(
-    `SELECT id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, source_pot, created_at, updated_at
+    `SELECT id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, source_pot, external_source, created_at, updated_at
        FROM tasks WHERE id = ?1 LIMIT 1`,
   )
     .bind(taskId)
@@ -536,7 +537,7 @@ const toolTaskCreate: ToolSpec = {
   name: 'task_create',
   scope: 'squad',
   min: 'member',
-  args: '{ squad_id: string, project_id?: string|null, title: string, done_when: string, body?: string, assignee_agent_id?: string }',
+  args: '{ squad_id: string, project_id?: string|null, title: string, done_when: string, body?: string, assignee_agent_id?: string, external_source?: string }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -546,6 +547,17 @@ const toolTaskCreate: ToolSpec = {
       done_when: { ...STRING_SCHEMA, description: 'Verifiable success predicate — a checkable condition that proves the task is complete.' },
       body: STRING_SCHEMA,
       assignee_agent_id: STRING_SCHEMA,
+      // PR #659 P0 fix (migrations/0077): carries provenance forward when a task with an
+      // existing external_source is legitimately re-created (today: scripts/steward-worker.py's
+      // auto-reissue of a blocked/orphaned task — the "amplifier" the diverse-model gate
+      // flagged, where a re-issued Linear-origin task lost its marker and re-entered the
+      // normal event-wake path unmarked). Safe to expose to any member+ caller: the field is
+      // MONOTONIC — it only ever ADDS restriction (no auto-pickup, admin-gated reassignment,
+      // untrusted-content prompt fence; see canAgentExecuteTask/routeUnassignedWork/
+      // buildExecutePrompt), never removes it, so a caller setting it on its own new task
+      // cannot escalate privilege. It cannot be used to CLEAR an existing task's marker —
+      // task_update has no assignee/provenance-mutation path for it.
+      external_source: STRING_SCHEMA,
     },
     required: ['squad_id', 'title', 'done_when'],
     additionalProperties: false,
@@ -579,6 +591,18 @@ const toolTaskCreate: ToolSpec = {
     const assignee = await resolveTaskAssignee(env, args.assignee_agent_id, squad.id)
     if (assignee.error) return fail(400, assignee.error)
 
+    // PR #659 P0 fix: bounded, optional provenance carry-forward (see inputSchema comment
+    // above). Absent/null/blank -> undefined -> createTask defaults external_source to null,
+    // same as every ordinary create call today.
+    let externalSource: string | undefined
+    if (args.external_source !== undefined && args.external_source !== null) {
+      if (typeof args.external_source !== 'string') return fail(400, 'invalid_args', 'external_source must be a string')
+      const trimmed = args.external_source.trim()
+      if (trimmed.length === 0) return fail(400, 'invalid_args', 'external_source must not be blank')
+      if (trimmed.length > 200) return fail(400, 'invalid_args', 'external_source must be at most 200 characters')
+      externalSource = trimmed
+    }
+
     const projectId = args.project_id == null ? null : str(args.project_id)
     if (args.project_id != null && !projectId) return fail(400, 'invalid_project_id')
     let task
@@ -593,7 +617,7 @@ const toolTaskCreate: ToolSpec = {
           body,
           assignee_agent_id: assignee.value,
         },
-        { actor: memberActor(auth.memberId as string) },
+        { actor: memberActor(auth.memberId as string), externalSource },
       )
     } catch (error) {
       if (error instanceof TaskProjectError) return taskProjectFailure(error)
@@ -674,7 +698,7 @@ const toolTaskList: ToolSpec = {
       const clauses = [...baseClauses, `status = ?${baseBinds.length + 1}`]
       const binds = [...baseBinds, status]
       const rows = await env.DB.prepare(
-        `SELECT id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, source_pot, created_at, updated_at
+        `SELECT id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, source_pot, external_source, created_at, updated_at
            FROM tasks
           WHERE ${clauses.join(' AND ')}
           ORDER BY created_at ${isActionable ? 'ASC' : 'DESC'}
@@ -691,7 +715,7 @@ const toolTaskList: ToolSpec = {
       // compete with actionable rows for the same slots (the P1 finding's
       // core failure mode).
       const actionableRows = await env.DB.prepare(
-        `SELECT id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, source_pot, created_at, updated_at
+        `SELECT id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, source_pot, external_source, created_at, updated_at
            FROM tasks
           WHERE ${[...baseClauses, actionableStatusInSql()].join(' AND ')}
           ORDER BY ${actionableStatusOrderSql()}, created_at ASC
@@ -704,7 +728,7 @@ const toolTaskList: ToolSpec = {
       const remaining = limit - taskRows.length
       if (remaining > 0) {
         const terminalRows = await env.DB.prepare(
-          `SELECT id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, source_pot, created_at, updated_at
+          `SELECT id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, source_pot, external_source, created_at, updated_at
              FROM tasks
             WHERE ${[...baseClauses, terminalStatusInSql()].join(' AND ')}
             ORDER BY created_at DESC
@@ -742,7 +766,7 @@ const toolTaskBoard: ToolSpec = {
     if (typeof limit !== 'number') return limit
 
     const rows = await env.DB.prepare(
-      `SELECT id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, source_pot, created_at, updated_at
+      `SELECT id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, source_pot, external_source, created_at, updated_at
          FROM tasks
         WHERE squad_id = ?1
         ORDER BY created_at DESC
@@ -896,9 +920,13 @@ const toolTaskUpdate: ToolSpec = {
       // and then execute it. Require admin+ to change assignee_agent_id on a
       // source_pot task; local (source_pot NULL) task assignment keeps the
       // member+ floor checked at the top of this tool, unaffected.
-      if (existing.source_pot) {
+      // PR #659 P0 fix: external_source (migrations/0077) requires the same admin+ bar as
+      // source_pot — same untrusted-writer class (e.g. Linear), same #406 reasoning: a
+      // member-tier/runtime-welded agent token must not self-assign untrusted external
+      // content and then execute it.
+      if (isExternallySourced(existing)) {
         if (!(await memberCanOnSquad(env, grants, existing.squad_id, 'admin'))) {
-          return fail(403, 'forbidden', { need: 'admin', scope: 'squad', detail: 'source_pot task assignment requires admin+' })
+          return fail(403, 'forbidden', { need: 'admin', scope: 'squad', detail: 'source_pot/external_source task assignment requires admin+' })
         }
       }
       const check = await resolveTaskAssignee(env, args.assignee_agent_id, existing.squad_id)

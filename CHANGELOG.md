@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- **Blank provenance can no longer become trusted absence** (adversarial gate BLOCK).
+  `migrations/0077` defines the trust boundary as `external_source IS NULL` vs
+  `IS NOT NULL`, but every runtime check spelled it with JavaScript truthiness. Those
+  disagree on exactly one value: **the empty string is non-null in SQL and falsy in JS**.
+  Reproduced against the real migrations — a task created with `externalSource: ''`
+  stored `external_source=''`, **kept its `assignee_agent_id`, and executed through to a
+  model turn**. SQL called the row external, the runtime called it first-party, and the
+  row was governed by whichever layer was asked.
+  - `createTask` now **rejects** blank/whitespace provenance. Coercing `''` to null would
+    turn a caller's bug into trusted absence — the exact "absence means permission"
+    pattern this audit set has been closing — and coercing it to a marker would invent
+    provenance nobody supplied.
+  - Every boundary check goes through one predicate, `isExternallySourced`, using explicit
+    `!= null`: execution, auto-pickup, content-intent, the prompt fence, and the admin
+    reassignment guards in both REST and MCP.
+  - `migrations/0078` adds INSERT/UPDATE triggers so a blank marker cannot be stored at
+    all, including by a direct D1 write or a restore. Existing blank rows are marked
+    `unknown:blank-provenance-0078` — **fail closed as external**, never promoted to local.
+  - This vindicates an earlier independent finding that raised the empty string against
+    the provenance work. That report located it in `countOpenBacklog`, where `IS NULL`
+    already excluded `''` correctly and the proposed change would have introduced a bug —
+    but the underlying instinct, that the stamp is load-bearing and `''` breaks it, was
+    right, and this is where it was true.
 - **Dependency tree unwedged**: `agents` dropped (unused), `cron-schedule` declared
   explicitly. The tree was stuck — `agents@0.14.5` required `ai@^6` while its own peer
   `@cloudflare/ai-chat` pulled `ai@7`, so every tree modification failed `ERESOLVE` and
@@ -113,6 +136,113 @@ this changelog (shipped, dated) share version numbers and feed each other — a 
 block collapses into a changelog entry when it ships.
 
 ## [Unreleased]
+
+### Added
+
+- Linear connector (flight-20260803-linear-posthog): `createLinearBoardPort`
+  (`src/projects/providers/linear.ts`) now does real, read-only GraphQL reads
+  against Linear (`src/integrations/linear-issues.ts`) through the existing
+  connector vault (`connector type 'linear'`, already registered in
+  `src/connectors/crypto.ts`/`dashboard.ts` since #issue-116-era scaffolding —
+  this flight replaces the `linear_adapter_pending_credentials` stub with the
+  live adapter). Recon during this flight found the port/registry/binding
+  layer for Linear already built (`src/projects/providers/{port,registry,
+  bindings}.ts`); only the adapter body was a stub — narrower work than the
+  flight's "Linear: greenfield" premise assumed.
+  - Structural, not discretionary, enforcement of "a priority surface must
+    never be an authorization surface": imported issues become UNASSIGNED
+    mupot tasks (`assignee_agent_id` is always `null` — no field on a Linear
+    issue, including its assignee, is ever mapped to a mupot agent), routed
+    only to an admin-configured `defaultSquadId` (set via the existing
+    project-binding `meta_json`, e.g. `{"defaultSquadId":"squad-a"}` —
+    absent it, every item reports `no_squad` and nothing is written).
+    Task creation passes `skipEvent: true` (no `task.created` bus event, so
+    `bus/consumer.ts`'s `dispatchSquad` — the actual wake mechanism — never
+    fires for Linear-origin data) and `skipMirror: true` (no outbound GitHub
+    issue write from externally-sourced text). This deliberately does NOT
+    mirror `src/integrations/github-projects.ts`'s agent-field-to-assignee
+    resolution, which is exactly the part of that pattern this flight's
+    binding constraint forbids for a read-only priority source.
+  - Added the `'linear'` case to `useConnectorById`'s auth-header construction
+    in `src/connectors/service.ts` (raw API key, no `Bearer` prefix — differs
+    from posthog/inkwell), the same extension point telegram/posthog/mcpwp
+    already register through.
+  - `TaskBoardSyncResult.items[].status` gained `'no_squad'` (additive; distinct
+    from GitHub's `'no_agent'`) in `src/projects/providers/port.ts`.
+  - Tests: `tests/linear-issues.test.ts`, `tests/linear-board-provider.test.ts`,
+    `tests/connectors-linear-auth.test.ts` — tenant isolation, revoked/missing
+    credential fail-closed, redirect/non-2xx fail-closed, secret never echoed,
+    dedup, and a **structural** source-text assertion (not just behavioral)
+    that the file never resolves a Linear field to an agent and always passes
+    `skipEvent`/`skipMirror`, so a future edit that reintroduces a dispatch
+    path fails this suite immediately.
+  - PostHog: recon found the tenant-scoped vault path and the owner-gated
+    env-credentials fallback (#473 CONCERN-2) were **already shipped**
+    (`src/addons/marketing/adapters/posthog.ts`, `isPotOwnerTenant`) with
+    thorough existing coverage in `tests/marketing-monitor-adapters.test.ts` —
+    no PostHog migration work remained for this flight beyond confirming it
+    (all suites re-run green). PostHog "capture" (event-ingestion) scope was
+    NOT implemented — no caller in the codebase needs it; flagging as an open
+    gap rather than building an unused write-shaped surface.
+
+### Security
+
+- **P0 fix (PR #659 diverse-model adversarial gate BLOCK, widened): external-content
+  tasks could reach an autonomous model turn with zero human step.** The Linear
+  connector's `skipEvent`/`skipMirror` only suppressed the `task.created` EVENT wake —
+  two status-POLLING drivers never looked at events at all and (pre-fix) had no column
+  to test: `canAgentExecuteTask`'s unassigned-auto-pickup branch
+  (`src/agents/execute.ts`) and the concierge's `routeUnassignedWork` maintenance cron
+  (`src/concierge/service.ts`). A parallel audit found the same choke-point gap live on
+  **`main`** in a more severe shape: `src/integrations/github-projects.ts` resolved a
+  GitHub Project field to a real pot agent and called `createTask` with
+  `assignee_agent_id` set AND no `skipEvent` — `task.created` fired, `dispatchSquad`
+  woke that exact agent, and `executeTaskAsPR` shipped work authored as it, from
+  attacker-editable field/title text, bypassing BOTH existing guards (the unassigned
+  check never applied; the admin-gated reassignment check only fires on a later
+  `task_update`, never on `createTask` itself).
+  - `Task.external_source` (migrations/0077) generalizes the `source_pot` trust
+    invariant (NULL = trusted local write) for non-pot external integrations. Checked
+    everywhere `source_pot` is checked: `canAgentExecuteTask`'s unassigned branch,
+    `routeUnassignedWork`'s WHERE clause, the admin-gated reassignment guard
+    (`src/tasks/index.ts`, `src/mcp/index.ts`), the content-intent short-circuit skip,
+    and the untrusted-content prompt fence (`buildExecutePrompt`/`buildExecuteSystem`,
+    `src/lib/prompt-safety.ts`).
+  - **Choke-point fix in `createTask`** (`src/tasks/service.ts`): any task carrying
+    `externalSource` is now FORCED unassigned at creation, structurally, regardless of
+    what a caller passes — closes the github-projects.ts class of bug for every
+    current and future external-integration caller, not just the ones that remember
+    not to pass an assignee. `external_source` is written only when actually set (not
+    unconditionally), so it stays compatible with pinned-migration/hand-rolled test DB
+    schemas that predate migration 0077.
+  - Marked at all five confirmed external-content entry points: Linear
+    (`linear:<teamKey>`), GitHub Projects (`github-projects:<owner>/<number>`, now
+    imports unassigned — `agentValue` is display-only, same shape as Linear's
+    `assigneeHint`), the GitHub `issues.opened` webhook and generic mapped-event path
+    (`github-webhook:<type>`), the GHL inbound webhook (`ghl-webhook`), and
+    `src/events/ingest.ts`'s generic HTTP ingest route (`event-ingest:<source>`,
+    found during the widened audit — HMAC-authenticated as a transport, but
+    `event.payload` content is fully external-system-controlled).
+  - Carried through `scripts/steward-worker.py`'s auto-reissue (the "amplifier" the
+    gate flagged: a reissued task went through `task_create` WITH an event, unmarked,
+    laundering a blocked external task into the exact wake `skipEvent` removed) and
+    through the `task_create` MCP tool's new optional `external_source` arg
+    (bounded, monotonic-safe — see the tool's inputSchema comment).
+  - `identifier`/`url` capped at 100/500 chars in `src/integrations/linear-issues.ts`
+    (title was already capped; these were `typeof string` only and landed uncapped
+    into task `body`/`done_when`).
+  - Low finding fixed: `createLinearBoardPort.syncIntoProject`
+    (`src/projects/providers/linear.ts`) no longer stamps `synced_at` when the binding
+    is `no_squad`-misconfigured — that was a false "synced successfully" receipt
+    hiding a binding with no admin-configured squad.
+  - Tests replace the insufficient source-regex mechanism pin
+    (`tests/linear-issues.test.ts`) with property tests against the real functions —
+    `tests/execute.test.ts`, `tests/concierge-service.test.ts`,
+    `tests/linear-issues.test.ts`, `tests/github-projects.test.ts`,
+    `tests/external-source-callsites.test.ts`, `tests/mcp-task-tools.test.ts`,
+    `scripts/test_steward_worker.py` — each verified to fail on the pre-fix commit
+    for the right reason (the task IS auto-picked-up / IS auto-assigned), not
+    because a helper is missing.
 
 ### Changed
 

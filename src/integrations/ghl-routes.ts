@@ -206,6 +206,16 @@ ghlInboundApp.post('/inbound', async (c) => {
   const title = `[GHL] ${eventType}${contact ? ` · ${contact}` : ''}`
 
   // createTask is the canonical creation path (bus event emitted, GitHub mirror optional).
+  // PR #659 P0 fix, widened (kasra-core parallel-audit finding): a GHL webhook payload is
+  // CRM-contact-authored, untrusted text — same class as Linear/GitHub-Projects/GitHub-issues.
+  // Already unassigned (no assignee_agent_id above), so externalSource is what closes the
+  // unassigned-auto-pickup hole (#404/#659) — without it this task was indistinguishable
+  // from a trusted local one.
+  //
+  // The follow-up this note used to flag — that the call omitted skipMirror and so
+  // mirrored untrusted body text out to a GitHub issue under our token — landed as #663
+  // and is now set below. Both halves are present at this call site: skipMirror fences
+  // the OUTBOUND direction, externalSource fences the INBOUND one.
   await createTask(c.env, {
     squad_id: squadId,
     title,
@@ -216,12 +226,15 @@ ghlInboundApp.post('/inbound', async (c) => {
   }, {
     // #663: never mirror externally-sourced webhook text out to a GitHub issue under
     // our token. `body` above is the RAW GHL event — attacker-influenceable content
-    // from an inbound webhook. Every other external-ingest site already sets this
-    // (linear-issues.ts, github-projects.ts, github-routes.ts, events/ingest.ts);
-    // this call was the one that did not, so untrusted text was being written
-    // outbound under our identity. The inbound direction is fenced by the
-    // external_source provenance work (#659); this is the outbound half.
+    // from an inbound webhook. Every other external-ingest site already set this
+    // (linear-issues.ts, github-projects.ts, github-routes.ts, events/ingest.ts) and
+    // this call was the one that did not, so untrusted text was being written outbound
+    // under our identity. That is the OUTBOUND half.
     skipMirror: true,
+    // #659: and mark the provenance, so the inbound half is fenced too — this row
+    // must never be auto-assigned, auto-picked-up, or interpolated as trusted
+    // instructions. Both halves are required; neither substitutes for the other.
+    externalSource: 'ghl-webhook',
   })
 
   // Outreach reply tracking: if this inbound maps to a known prospect, move it so the
