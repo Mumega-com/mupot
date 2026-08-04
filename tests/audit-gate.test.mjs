@@ -28,7 +28,7 @@ function allowEntry(over = {}) {
     severity: 'high',
     nodes: ['node_modules/undici'],
     isDirect: false,
-    paths: [['node_modules/wrangler@4.0.0', 'node_modules/miniflare@4.0.0', 'node_modules/undici@7.0.0']],
+    paths: [['node_modules/wrangler@4.0.0#sha512-WRANGLER', 'node_modules/miniflare@4.0.0#sha512-MINIFLARE', 'node_modules/undici@7.0.0#sha512-UNDICI']],
     why: 'dev toolchain only',
     accepted_on: '2026-08-04',
     ...over,
@@ -60,18 +60,23 @@ function report({
 }
 
 /** A package-lock fixture matching `report()`: root -> wrangler -> miniflare -> undici. */
-function lockfile({ undiciDirect = false, miniflareDirect = false, alias = false } = {}) {
+function lockfile({ undiciDirect = false, miniflareDirect = false, alias = false, workspace = false } = {}) {
   const rootDev = { wrangler: '^4' }
   if (undiciDirect) rootDev.undici = '^7'
   if (miniflareDirect) rootDev.miniflare = '^4'
   if (alias) rootDev['wrangler-alias'] = 'npm:wrangler@4.0.0'
   const packages = {
     '': { name: 'fixture', version: '1.0.0', devDependencies: rootDev },
-    'node_modules/wrangler': { version: '4.0.0', dev: true, dependencies: { miniflare: '^4' } },
-    'node_modules/miniflare': { version: '4.0.0', dev: true, dependencies: { undici: '^7' } },
-    'node_modules/undici': { version: '7.0.0', dev: true },
+    'node_modules/wrangler': { version: '4.0.0', dev: true, integrity: 'sha512-WRANGLER', dependencies: { miniflare: '^4' } },
+    'node_modules/miniflare': { version: '4.0.0', dev: true, integrity: 'sha512-MINIFLARE', dependencies: { undici: '^7' } },
+    'node_modules/undici': { version: '7.0.0', dev: true, integrity: 'sha512-UNDICI' },
   }
-  if (alias) packages['node_modules/wrangler-alias'] = { name: 'wrangler', version: '4.0.0', dev: true, dependencies: { miniflare: '^4' } }
+  if (alias) packages['node_modules/wrangler-alias'] = { name: 'wrangler', version: '4.0.0', dev: true, integrity: 'sha512-WRANGLER', dependencies: { miniflare: '^4' } }
+  if (workspace) {
+    packages[''].workspaces = ['packages/*']
+    packages['node_modules/demo-ws'] = { link: true, resolved: 'packages/demo' }
+    packages['packages/demo'] = { version: '1.0.0', devDependencies: { miniflare: '^4' } }
+  }
   return { lockfileVersion: 3, packages }
 }
 
@@ -169,7 +174,7 @@ test('BYPASS: a new DIRECT edge to an ancestor changes the accepted shape', () =
 
 test('pathsToNode returns the single lockfile chain, with node identity and version', () => {
   assert.deepEqual(pathsToNode(lockfile(), 'node_modules/undici'), [
-    ['node_modules/wrangler@4.0.0', 'node_modules/miniflare@4.0.0', 'node_modules/undici@7.0.0'],
+    ['node_modules/wrangler@4.0.0#sha512-WRANGLER', 'node_modules/miniflare@4.0.0#sha512-MINIFLARE', 'node_modules/undici@7.0.0#sha512-UNDICI'],
   ])
 })
 
@@ -184,8 +189,8 @@ test('pathsToNode returns the single lockfile chain, with node identity and vers
 test('BYPASS: an ALIASED second root edge produces a distinct path', () => {
   const paths = pathsToNode(lockfile({ alias: true }), 'node_modules/undici')
   assert.equal(paths.length, 2)
-  assert.ok(paths.some((p) => p[0] === 'node_modules/wrangler-alias@4.0.0'))
-  assert.ok(paths.some((p) => p[0] === 'node_modules/wrangler@4.0.0'))
+  assert.ok(paths.some((p) => p[0] === 'node_modules/wrangler-alias@4.0.0#sha512-WRANGLER'))
+  assert.ok(paths.some((p) => p[0] === 'node_modules/wrangler@4.0.0#sha512-WRANGLER'))
 })
 
 test('BYPASS: the aliased tree is rejected against the accepted single path', () => {
@@ -204,6 +209,64 @@ test('a direct edge to an intermediate adds a shorter path', () => {
   const paths = pathsToNode(lockfile({ miniflareDirect: true }), 'node_modules/undici')
   assert.equal(paths.length, 2)
   assert.ok(paths.some((p) => p.length === 2))
+})
+
+// ── BYPASS 7 (reproduced in review): workspaces are invisible root edges ─────
+//
+// npm records a workspace as a `link: true` node whose `resolved` points at the
+// workspace directory. Skipping link records disconnected every workspace's
+// dependencies, so a workspace with a DIRECT miniflare dependency contributed no path
+// at all and the gate passed. A workspace's devDependencies are installed exactly like
+// the root's, which is the part the first fix missed.
+
+test('BYPASS: a workspace direct dependency creates a real path', () => {
+  const paths = pathsToNode(lockfile({ workspace: true }), 'node_modules/undici')
+  assert.equal(paths.length, 2)
+  assert.ok(paths.some((p) => p.some((seg) => seg.startsWith('packages/demo@'))))
+})
+
+test('BYPASS: the workspace tree is rejected against the accepted single path', () => {
+  const { violations } = evaluate(report(), [allowEntry()], lockfile({ workspace: true }))
+  assert.equal(violations.length, 1)
+  assert.match(violations[0], /packages\/demo/)
+})
+
+test('a link record with a MISSING target fails closed', () => {
+  const lock = lockfile({ workspace: true })
+  delete lock.packages['packages/demo']
+  assert.throws(() => pathsToNode(lock, 'node_modules/undici'), /link target/)
+})
+
+// ── BYPASS 8 (reproduced in review): path + version is not identity ──────────
+//
+// A locally built tarball named wrangler@4.102.0 occupied the same lockfile path at the
+// same version and produced a byte-identical path, while being a different artifact.
+// Identity now carries `integrity`, falling back to a normalized `resolved` source.
+
+test('BYPASS: a substituted artifact at the same path and version is rejected', () => {
+  const lock = lockfile()
+  lock.packages['node_modules/wrangler'].integrity = 'sha512-DIFFERENT-ARTIFACT'
+  const { violations } = evaluate(report(), [allowEntry()], lock)
+  assert.equal(violations.length, 1)
+  assert.match(violations[0], /DIFFERENT-ARTIFACT/)
+})
+
+test('a file: source with no integrity is still distinguished by resolved', () => {
+  const lock = lockfile()
+  delete lock.packages['node_modules/wrangler'].integrity
+  lock.packages['node_modules/wrangler'].resolved = 'file:../evil/wrangler-4.0.0.tgz'
+  const paths = pathsToNode(lock, 'node_modules/undici')
+  assert.match(paths[0][0], /resolved:file:/)
+})
+
+test('registry host differences do not churn identity', () => {
+  // Same artifact from a mirror must not read as a different node.
+  const a = lockfile(); const b = lockfile()
+  delete a.packages['node_modules/wrangler'].integrity
+  delete b.packages['node_modules/wrangler'].integrity
+  a.packages['node_modules/wrangler'].resolved = 'https://registry.npmjs.org/wrangler/-/wrangler-4.0.0.tgz'
+  b.packages['node_modules/wrangler'].resolved = 'https://mirror.internal/wrangler/-/wrangler-4.0.0.tgz'
+  assert.deepEqual(pathsToNode(a, 'node_modules/undici'), pathsToNode(b, 'node_modules/undici'))
 })
 
 // ── Lockfile ambiguity fails closed ──────────────────────────────────────────
@@ -263,8 +326,8 @@ test('nearest-wins resolution picks a nested copy over the hoisted one', () => {
   lock.packages['node_modules/miniflare/node_modules/undici'] = { version: '9.9.9', dev: true }
   const paths = pathsToNode(lock, 'node_modules/miniflare/node_modules/undici')
   assert.deepEqual(paths, [[
-    'node_modules/wrangler@4.0.0', 'node_modules/miniflare@4.0.0',
-    'node_modules/miniflare/node_modules/undici@9.9.9',
+    'node_modules/wrangler@4.0.0#sha512-WRANGLER', 'node_modules/miniflare@4.0.0#sha512-MINIFLARE',
+    'node_modules/miniflare/node_modules/undici@9.9.9#source:unknown',
   ]])
 })
 
@@ -451,8 +514,8 @@ test('node and path order in the allowlist entry does not matter', () => {
   // opposite order must still match — ordering is normalized, not significant.
   const lock = lockfile({ alias: true })
   const paths = [
-    ['node_modules/wrangler@4.0.0', 'node_modules/miniflare@4.0.0', 'node_modules/undici@7.0.0'],
-    ['node_modules/wrangler-alias@4.0.0', 'node_modules/miniflare@4.0.0', 'node_modules/undici@7.0.0'],
+    ['node_modules/wrangler@4.0.0#sha512-WRANGLER', 'node_modules/miniflare@4.0.0#sha512-MINIFLARE', 'node_modules/undici@7.0.0#sha512-UNDICI'],
+    ['node_modules/wrangler-alias@4.0.0#sha512-WRANGLER', 'node_modules/miniflare@4.0.0#sha512-MINIFLARE', 'node_modules/undici@7.0.0#sha512-UNDICI'],
   ]
   const { violations } = evaluate(report(), [allowEntry({ paths: [...paths].reverse() })], lock)
   assert.deepEqual(violations, [])

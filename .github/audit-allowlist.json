@@ -17,9 +17,9 @@
       "isDirect": false,
       "paths": [
         [
-          "node_modules/wrangler@4.102.0",
-          "node_modules/miniflare@4.20260617.0",
-          "node_modules/undici@7.28.0"
+          "node_modules/wrangler@4.102.0#sha512-GPljlQs9a+/Ai2h0TdEUYaaWv9upK4fUteSWTPlruas7tdixiIwr74CZSWHcEPuRgZYkyYKHIBbT1w+BYPkPrw==",
+          "node_modules/miniflare@4.20260617.0#sha512-A+H5gcOCQZsKFg7/daZUtx8WHn4gGxwUfH1jnNDAisyAWSvvSZHe+GCeQWs16uthnUDcm72UQIQ1NXDJtnuo9Q==",
+          "node_modules/undici@7.28.0#sha512-cRZYrTDwWznlnRiPjggAGxZXanty6M8RV1ff8Wm4LWXBp7/IG8v5DnOm74DtUBp9OONpK75YlPnIjQqX0dBDtA=="
         ]
       ]
     }
