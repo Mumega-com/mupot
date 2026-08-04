@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+- **C10 — the backpressure governor is provenance-aware** (`src/agents/loop.ts`,
+  `countOpenBacklog`). Its unassigned branch treated "open + unassigned + in my squad"
+  as "backlog this agent's loop produced". An externally-imported task matches that
+  shape exactly, so imports counted against `MAX_OPEN_TASKS`: **import ten issues to a
+  connected board and the agent's loop stops producing** — denial of work through an
+  integration's normal intended use, no credential compromise, nothing in any log that
+  looks like an attack. Also a plain correctness bug with no attacker: the function's
+  own doc comment promises it counts what this loop produced, and it did not.
+  - The **assigned** branch deliberately still counts external rows. Once an admin takes
+    the explicit `task_update`/PATCH step, external work is real backlog and must exert
+    backpressure; narrowing both would trade a denial-of-work hole for an unbounded-work
+    one. The boundary is "nobody has decided this is mine yet".
+  - Tested against real SQL, asserting on `runGoalCycle`'s **outcome**. The existing
+    coverage in `tests/sane-brain-s3.test.ts` regexes the query string and passed
+    continuously while this defect was live — a test that pins the mechanism cannot fail
+    on a bug in that mechanism's meaning. Verified by reverting the fix: 3 of 6 fail
+    without it.
+  - Empty-string provenance is locked by two further cases. `IS NULL` is the condition
+    for counting a row as first-party, so `''` fails it and is excluded — the safe
+    direction. A proposed `COALESCE(col,'') = ''` remedy would have **introduced** the
+    denial of work it was meant to prevent; it was rejected by running it against both
+    versions rather than by reasoning about it.
+
+
 - **Blank provenance can no longer become trusted absence** (adversarial gate BLOCK).
   `migrations/0077` defines the trust boundary as `external_source IS NULL` vs
   `IS NOT NULL`, but every runtime check spelled it with JavaScript truthiness. Those
