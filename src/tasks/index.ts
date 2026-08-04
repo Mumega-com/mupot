@@ -673,7 +673,7 @@ tasksApp.patch('/:id', async (c) => {
     // Explicit null semantics, matching migrations/0077 (adversarial gate BLOCK
     // 2026-08-04): truthiness treated external_source='' as first-party while SQL
     // treated it as external, so a blank-provenance row escaped the admin bar.
-    if (existing.source_pot != null || existing.external_source != null) {
+    if (isExternallySourced(existing)) {
       if (!(await canActOnSquad(c.env, c.get('auth'), existing.squad_id, 'admin'))) {
         return c.json(
           { error: 'forbidden', need: 'admin', detail: 'source_pot/external_source task assignment requires admin+' },
@@ -1126,6 +1126,7 @@ tasksApp.post('/:id/pipeline', async (c) => {
 // POST body: { capability: string, principal_type: 'member'|'agent', principal_id: string }
 // DELETE body: same shape — revoke = hard delete (the verdict receipt IS the audit trail)
 
+import { isExternallySourced } from './provenance'
 import {
   grantGateCapability,
   parseGateGrantArgs,

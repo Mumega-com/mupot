@@ -226,11 +226,10 @@ ghlInboundApp.post('/inbound', async (c) => {
   }, {
     // #663: never mirror externally-sourced webhook text out to a GitHub issue under
     // our token. `body` above is the RAW GHL event — attacker-influenceable content
-    // from an inbound webhook. Every other external-ingest site already sets this
-    // (linear-issues.ts, github-projects.ts, github-routes.ts, events/ingest.ts);
-    // this call was the one that did not, so untrusted text was being written
-    // outbound under our identity. The inbound direction is fenced by the
-    // external_source provenance work (#659); this is the outbound half.
+    // from an inbound webhook. Every other external-ingest site already set this
+    // (linear-issues.ts, github-projects.ts, github-routes.ts, events/ingest.ts) and
+    // this call was the one that did not, so untrusted text was being written outbound
+    // under our identity. That is the OUTBOUND half.
     skipMirror: true,
     // #659: and mark the provenance, so the inbound half is fenced too — this row
     // must never be auto-assigned, auto-picked-up, or interpolated as trusted

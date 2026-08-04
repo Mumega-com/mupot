@@ -105,6 +105,7 @@ import { loadFlightSquads, parseFlightMetaV1, validateFlightMetaReferences, type
 // AUTH_CONTEXT_HEADER lives in a separate module (no cloudflare:workers dep) so
 // Vitest can import it without the CF runtime. See ./auth-header.ts.
 import { AUTH_CONTEXT_HEADER } from './auth-header'
+import { isExternallySourced } from '../tasks/provenance'
 import { MUPOT_PUBLIC_API_VERSION } from '../version'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
@@ -923,7 +924,7 @@ const toolTaskUpdate: ToolSpec = {
       // source_pot — same untrusted-writer class (e.g. Linear), same #406 reasoning: a
       // member-tier/runtime-welded agent token must not self-assign untrusted external
       // content and then execute it.
-      if (existing.source_pot != null || existing.external_source != null) {
+      if (isExternallySourced(existing)) {
         if (!(await memberCanOnSquad(env, grants, existing.squad_id, 'admin'))) {
           return fail(403, 'forbidden', { need: 'admin', scope: 'squad', detail: 'source_pot/external_source task assignment requires admin+' })
         }

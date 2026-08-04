@@ -40,29 +40,11 @@ import { CtxError } from '../departments/ctx'
 import { asData, untrustedContentGuard } from '../lib/prompt-safety'
 
 
-/**
- * The migration's trust boundary, expressed once.
- *
- * migrations/0077 defines external provenance as `external_source IS NOT NULL` (and
- * source_pot likewise). Every call site used to spell this with JS truthiness, which
- * disagrees with SQL about exactly one value: the empty string is NON-NULL in the
- * database and FALSY in JavaScript. An adversarial gate reproduced that split — a task
- * stored with external_source='' kept its assignee and executed through to a model turn,
- * because SQL called the row external and the runtime called it first-party.
- *
- * Explicit `!= null` means anything present is external. Fail closed: a value we did not
- * expect is treated as untrusted rather than as absence.
- */
-export function isExternallySourced(task: { source_pot?: string | null; external_source?: string | null }): boolean {
-  return task.source_pot != null || task.external_source != null
-}
-
-/** The marker to label untrusted content with, preferring the pot over the integration. */
-export function externalMarker(task: { source_pot?: string | null; external_source?: string | null }): string | null {
-  if (task.source_pot != null) return task.source_pot
-  if (task.external_source != null) return task.external_source
-  return null
-}
+// The trust boundary itself lives in ../tasks/provenance so the REST and MCP guards can
+// use the SAME predicate without importing the execution path. Re-exported here because
+// existing tests import it from this module.
+import { isExternallySourced, externalMarker } from '../tasks/provenance'
+export { isExternallySourced, externalMarker }
 
 // Hard ceiling on a persisted result (chars). Keeps a runaway model answer from
 // bloating the row / GitHub mirror. ~16KB.

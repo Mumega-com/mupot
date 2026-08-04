@@ -18,7 +18,8 @@ import { describe, expect, it, vi } from 'vitest'
 import { createSqliteD1 } from './helpers/sqlite-d1'
 import { createTask } from '../src/tasks/service'
 import { ingestEvent } from '../src/events/ingest'
-import { runTaskExecution, isExternallySourced } from '../src/agents/execute'
+import { runTaskExecution } from '../src/agents/execute'
+import { isExternallySourced, isBlankProvenance } from '../src/tasks/provenance'
 import type { Agent, Env, ModelPort } from '../src/types'
 
 const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
@@ -207,5 +208,60 @@ describe('blank provenance cannot become trusted absence', () => {
     expect(isExternallySourced({ external_source: null, source_pot: '' })).toBe(true)
     expect(isExternallySourced({ external_source: null, source_pot: null })).toBe(false)
     expect(isExternallySourced({})).toBe(false)
+  })
+})
+
+// ── WHITESPACE, not just spaces (adversarial re-gate, 2026-08-04) ────────────
+//
+// migrations/0078's first version used SQLite's ONE-ARGUMENT TRIM, which strips only
+// ORDINARY SPACES. The gate reproduced three bypasses: a direct INSERT of char(9)
+// succeeded, a direct UPDATE to char(10) succeeded, and a legacy tab-only marker
+// survived the backfill. The guard read as "reject whitespace" and meant "reject
+// spaces" — the same defect class as the JS/SQL split it exists to close: stated intent
+// and actual behaviour differing on values nobody tried.
+describe('whitespace-only provenance is blank, not just spaces', () => {
+  for (const [name, ch] of [['tab', '\t'], ['newline', '\n'], ['carriage return', '\r'], ['vertical tab', '\v'], ['form feed', '\f'], ['mixed', ' \t\n\r']] as const) {
+    it(`createTask rejects ${name}-only provenance`, async () => {
+      const { env } = await makeEnv()
+      await expect(createTask(
+        env,
+        { squad_id: 'squad-a', title: 't', body: 'b', done_when: 'w', status: 'open', assignee_agent_id: 'agent-1' },
+        { externalSource: ch, skipEvent: true, skipMirror: true },
+      )).rejects.toThrow(/non-blank identifier/)
+    })
+
+    it(`the DATABASE refuses a ${name}-only marker on INSERT`, async () => {
+      const { harness } = await makeEnv()
+      expect(() => harness.sqlite.exec(`
+        INSERT INTO tasks (id, squad_id, title, body, done_when, status, external_source, created_at, updated_at)
+        VALUES ('t-ws-${name.replace(/\s/g, '')}', 'squad-a', 't', 'b', 'w', 'open', '${ch}', 'now', 'now');
+      `)).toThrow(/blank provenance/)
+    })
+  }
+
+  it('the DATABASE refuses blanking provenance to a tab by UPDATE', async () => {
+    const { env, harness } = await makeEnv()
+    const task = await createTask(
+      env,
+      { squad_id: 'squad-a', title: 't', body: 'b', done_when: 'w', status: 'open' },
+      { externalSource: 'linear:TEAM', skipEvent: true, skipMirror: true },
+    )
+    expect(() => harness.sqlite.exec(
+      `UPDATE tasks SET external_source = char(9) WHERE id = '${task.id}';`,
+    )).toThrow(/blank provenance/)
+  })
+
+  it('isBlankProvenance agrees with the SQL character set', () => {
+    for (const ch of [' ', '\t', '\n', '\v', '\f', '\r', ' \t\n\r', '']) {
+      expect(isBlankProvenance(ch)).toBe(true)
+    }
+    for (const ok of ['linear:TEAM', ' linear ', 'a', '\u00a0']) {
+      expect(isBlankProvenance(ok)).toBe(false)
+    }
+  })
+
+  it('a real marker with surrounding whitespace is NOT blank', () => {
+    // Only wholly-blank markers are rejected. ' linear:TEAM ' is attributable.
+    expect(isBlankProvenance(' linear:TEAM ')).toBe(false)
   })
 })

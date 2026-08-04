@@ -8,6 +8,7 @@ import type { Env, Task, TaskVerdict, BusEvent } from '../types'
 import { createBus } from '../bus'
 import { assertWritten } from '../lib/receipt'
 import { resolveOutboundGitHubToken } from '../integrations/github-app'
+import { isBlankProvenance } from './provenance'
 import { hasProjectWriteForSquads } from '../projects/access'
 
 export type TaskStatus = Task['status']
@@ -797,7 +798,7 @@ export async function createTask(
   // would invent provenance nobody supplied. A caller that has an external source knows
   // its name; one that does not should pass null explicitly.
   const rawExternalSource = options.externalSource
-  if (rawExternalSource !== undefined && rawExternalSource !== null && rawExternalSource.trim() === '') {
+  if (rawExternalSource !== undefined && rawExternalSource !== null && isBlankProvenance(rawExternalSource)) {
     throw new Error(
       'createTask: externalSource must be a non-blank identifier or null — ' +
       'blank provenance is neither trusted-local nor attributable',
