@@ -29,9 +29,24 @@
 //                            U+202E RIGHT-TO-LEFT OVERRIDE, the classic
 //                            "reversed filename extension" trick
 //   0x2066-0x2069           LRI/RLI/FSI/PDI bidi isolates
+//   0x85                    NEXT LINE (NEL) -- a C1 control with
+//                            Line_Break=Next_Line. Unicode-aware splitters
+//                            (Python's str.splitlines, many renderers) break on
+//                            it exactly as they do on U+2028/U+2029, and it is
+//                            OUTSIDE the 0x00-0x1F C0 range above.
+//   0x61C                   ARABIC LETTER MARK (Bidi_Control=Yes) -- the same
+//                            class as the LRM/RLM marks below, but at a distant
+//                            code point, so it is easy to miss when the other
+//                            bidi controls are grouped in the 0x200x/0x202x/0x206x
+//                            neighbourhood.
+// (0x85 and 0x61C added after an adversarial gate on PR #675 demonstrated both
+//  survive JSON.stringify AND the fence, i.e. the "no forged prompt line" claim
+//  was incomplete for exactly the reason the rest of this list exists.)
 const UNSAFE_PROMPT_CODEPOINT_RANGES: ReadonlyArray<readonly [number, number]> = [
   [0x00, 0x1f],
   [0x7f, 0x7f],
+  [0x85, 0x85],
+  [0x61c, 0x61c],
   [0x2028, 0x2029],
   [0x200e, 0x200f],
   [0x202a, 0x202e],
