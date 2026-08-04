@@ -229,10 +229,30 @@ export function evaluate(report, allowed) {
     }
   }
 
-  const stale = allowed.filter((a) => !matched.has(tupleKey({
-    ghsa: a.ghsa, pkg: a.package, severity: String(a.severity).toLowerCase(),
-    nodes: a.nodes, isDirect: a.isDirect, ancestry: a.ancestry,
-  })))
+  // STALE, classified. An unmatched entry has two very different meanings and the
+  // remedies are opposite, so the gate must not report them the same way.
+  //
+  //   GONE   the GHSA does not appear at a blocking severity anywhere in the audit.
+  //          A fix shipped. Deleting the entry is correct.
+  //   MOVED  the GHSA is still here, but as a different package/severity/ancestry.
+  //          It is ALSO in `violations` above. Deleting the entry would remove a
+  //          still-live exemption to make the build green — which turns this gate
+  //          into a footgun. Say so explicitly instead of advising deletion.
+  //
+  // This is the false-negative direction I flagged against my own design: if the walk
+  // ever misses a present advisory, the cheapest way to green the build must not be
+  // "delete the exemption".
+  const seenGhsaAtBlockingSeverity = new Set(
+    [...matched].map((k) => JSON.parse(k)[0]).concat(
+      violations.map((v) => (v.match(/GHSA-[\w-]+/) ?? [])[0]).filter(Boolean),
+    ),
+  )
+  const stale = allowed
+    .filter((a) => !matched.has(tupleKey({
+      ghsa: a.ghsa, pkg: a.package, severity: String(a.severity).toLowerCase(),
+      nodes: a.nodes, isDirect: a.isDirect, ancestry: a.ancestry,
+    })))
+    .map((a) => ({ ...a, reason: seenGhsaAtBlockingSeverity.has(a.ghsa) ? 'moved' : 'gone' }))
 
   return { violations, stale }
 }
@@ -259,14 +279,33 @@ function main() {
   }
 
   if (result.stale.length > 0) {
-    console.error('\n✗ audit-gate: allowlist entries that no longer appear in the audit\n')
-    for (const s of result.stale) console.error(`    ${s.ghsa} (${s.package}, ${s.severity}) — accepted ${s.accepted_on}`)
-    console.error(
-      '\n  This is good news: the finding is gone, or it moved. Delete these entries from' +
-      '\n  .github/audit-allowlist.json. If the list becomes empty, the carve-out has no' +
-      '\n  reason to exist — close https://github.com/Mumega-com/mupot/issues/670 and fold' +
-      '\n  this step back into the blocking production audit.\n',
-    )
+    const gone = result.stale.filter((s) => s.reason === 'gone')
+    const moved = result.stale.filter((s) => s.reason === 'moved')
+
+    console.error('\n✗ audit-gate: allowlist entries that no longer match the audit\n')
+
+    if (gone.length > 0) {
+      console.error('  GONE — the advisory is no longer reported. A fix shipped.')
+      for (const s of gone) console.error(`    ${s.ghsa} (${s.package}, ${s.severity}) — accepted ${s.accepted_on}`)
+      console.error(
+        '\n    Delete these from .github/audit-allowlist.json. If the list becomes empty,' +
+        '\n    the carve-out has no reason to exist — close' +
+        '\n    https://github.com/Mumega-com/mupot/issues/670 and fold this step back into' +
+        '\n    the blocking production audit.\n',
+      )
+    }
+
+    if (moved.length > 0) {
+      console.error('  MOVED — the advisory is STILL PRESENT, reached a different way.')
+      for (const s of moved) console.error(`    ${s.ghsa} (${s.package}, ${s.severity}) — accepted ${s.accepted_on}`)
+      console.error(
+        '\n    DO NOT delete these to make the build green. The finding is live; only the' +
+        '\n    route to it changed, and it is reported above as an unaccepted advisory.' +
+        '\n    Decide whether the NEW shape is acceptable, and if it is, update the entry' +
+        '\n    to match it. Deleting the entry removes a real exemption and hides a real' +
+        '\n    finding at the same time.\n',
+      )
+    }
     process.exit(1)
   }
 

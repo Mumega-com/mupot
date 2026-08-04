@@ -193,11 +193,31 @@ test('a high advisory that is not allowlisted at all is rejected', () => {
   assert.equal(violations.length, 1)
 })
 
-test('STALE: an allowlist entry that no longer appears is reported', () => {
+test('STALE/GONE: an advisory that disappeared is reported as gone', () => {
   const { violations, stale } = evaluate({ vulnerabilities: {} }, [allowEntry()])
   assert.deepEqual(violations, [])
   assert.equal(stale.length, 1)
   assert.equal(stale[0].ghsa, UNDICI_GHSA)
+  assert.equal(stale[0].reason, 'gone')
+})
+
+test('STALE/MOVED: a still-present advisory reached differently is NOT reported as gone', () => {
+  // The footgun this classification exists to prevent: the entry no longer matches, so
+  // it is stale — but the finding is LIVE and only its route changed. Reporting this as
+  // "gone, delete it" would make deleting a real exemption the cheapest way to green the
+  // build, while the advisory itself stays in the tree.
+  const { violations, stale } = evaluate(report({ isDirect: true }), [allowEntry()])
+  assert.equal(violations.length, 1)
+  assert.equal(stale.length, 1)
+  assert.equal(stale[0].reason, 'moved')
+})
+
+test('STALE/GONE when the advisory downgrades below the blocking bar', () => {
+  // A high that becomes moderate is genuinely no longer a blocking finding, so the
+  // exemption really is dead config and should be deleted.
+  const { violations, stale } = evaluate(report({ severity: 'moderate' }), [allowEntry()])
+  assert.deepEqual(violations, [])
+  assert.equal(stale[0].reason, 'gone')
 })
 
 test('moderate advisories neither block nor satisfy an allowlist entry', () => {
