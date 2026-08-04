@@ -51,8 +51,19 @@ const FORBIDDEN_CODEPOINTS: ReadonlyArray<readonly [string, number]> = [
   ['U+2069 PDI', 0x2069],
 ]
 
-/** Characters the builders legitimately emit themselves; absence is not the invariant. */
-const STRUCTURAL = new Set([0x0a, 0x0d])
+/**
+ * Characters the builders legitimately emit THEMSELVES, so absence is not the
+ * invariant for them.
+ *
+ * LF ONLY. The builders author `\n` and never `\r`. A previous version of this file
+ * exempted CR as well, which made the production assertions blind to caller-supplied
+ * carriage-return leakage: an adversarial gate mutated buildCroUserContent to append
+ * a caller's `\r` while leaving every fence intact, and the suite still passed 46/46.
+ * The suite claimed a mechanism-independent property and did not hold it. Exempting a
+ * character the builder does not actually produce is how a green suite hides a real
+ * leak (PR #675 gate, round 2).
+ */
+const STRUCTURAL = new Set([0x0a])
 
 /** A forged-prompt payload built around the character under test. */
 function attack(cp: number): string {
@@ -159,6 +170,47 @@ describe('prompt fence — the shared helpers agree', () => {
 // U+2028/U+2029/U+0085/bidi. If someone "simplifies" a builder back to JSON.stringify,
 // the tests above fail — but this one states the reason explicitly so the next reader
 // does not have to re-derive it empirically the way #669 did.
+// CLASS-LEVEL regression. The three prior rounds of this PR each closed one INSTANCE
+// of "the unsafe set is incomplete" and left the class open. This test asserts the
+// implementation matches its own declared rule across the WHOLE code space, so a
+// future narrowing of UNSAFE_PROMPT_CHARS fails loudly instead of silently reopening
+// the gap. Exhaustive, not sampled — sampling is what let 31 C1 controls survive.
+describe('prompt fence — the unsafe class is complete, exhaustively', () => {
+  const DECLARED = /[\p{Cc}\p{Zl}\p{Zp}\p{Bidi_Control}]/u
+
+  it('every declared-unsafe code point in U+0000-U+10FFFF is stripped by sanitizeInline', () => {
+    const survivors: string[] = []
+    for (let cp = 0; cp <= 0x10ffff; cp++) {
+      // Skip surrogate halves: not standalone scalar values.
+      if (cp >= 0xd800 && cp <= 0xdfff) continue
+      const ch = String.fromCodePoint(cp)
+      if (!DECLARED.test(ch)) continue
+      if (sanitizeInline(`a${ch}b`).includes(ch)) {
+        survivors.push('U+' + cp.toString(16).toUpperCase().padStart(4, '0'))
+      }
+    }
+    expect(survivors).toEqual([])
+  })
+
+  it('the whole C1 control block U+0080-U+009F is stripped (the 31 that a range table missed)', () => {
+    const survivors: string[] = []
+    for (let cp = 0x80; cp <= 0x9f; cp++) {
+      const ch = String.fromCodePoint(cp)
+      if (sanitizeInline(`a${ch}b`).includes(ch)) {
+        survivors.push('U+' + cp.toString(16).toUpperCase().padStart(4, '0'))
+      }
+    }
+    expect(survivors).toEqual([])
+  })
+
+  it('does NOT over-strip: ZWJ and soft hyphen survive (why \\p{Cf} would be wrong)', () => {
+    for (const cp of [0x200d, 0x00ad]) {
+      const ch = String.fromCodePoint(cp)
+      expect(sanitizeInline(`a${ch}b`).includes(ch)).toBe(true)
+    }
+  })
+})
+
 describe('prompt fence — why JSON.stringify alone is insufficient', () => {
   for (const cp of [0x2028, 0x2029, 0x85, 0x61c, 0x202e]) {
     it(`JSON.stringify passes U+${cp.toString(16).toUpperCase().padStart(4, '0')} through raw; the fence removes it`, () => {
