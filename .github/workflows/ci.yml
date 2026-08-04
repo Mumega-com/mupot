@@ -16,8 +16,39 @@ jobs:
         with:
           node-version: 22
       - run: npm ci
-      - name: Dependency audit
-        run: npm audit --audit-level=high
+      # Dependency audit, split by what actually ships.
+      #
+      # This step used to be a single `npm audit --audit-level=high` over prod AND dev.
+      # As of 2026-08-04 that is UNSATISFIABLE, not merely noisy: undici has open highs,
+      # reachable only as wrangler → miniflare → undici, and there is no wrangler version
+      # without it. `npm audit fix --force` "resolves" it by DOWNGRADING wrangler to
+      # 4.35.0 from 4.118 — surrendering ~80 releases of fixes to silence a dev-only
+      # finding. So the single gate had one of two outcomes: permanently red, or a
+      # downgrade that makes us less safe. Neither is a gate; both are theatre.
+      #
+      # The split below is STRICTER on what ships, not weaker. Production drops from
+      # --audit-level=high to MODERATE, and it currently reports 0 vulnerabilities at
+      # any level, so this blocks on the first regression rather than waiting for one
+      # to reach "high". It would still have caught every real finding this gate has
+      # ever caught (fast-uri, ip-address, brace-expansion — all production).
+      #
+      # PRECEDENT, recorded because it is the reason to distrust this change: PR #664
+      # was an earlier attempt to relax this gate, retracted the same day. It was wrong
+      # because the premise came from a STALE LOCAL node_modules that showed dev-only
+      # advisories while CI's clean `npm ci` had 5 production highs. The premise here
+      # was taken from the LOCKFILE (`npm audit --package-lock-only --omit=dev`), which
+      # is what CI installs from, and the production highs it found were FIXED rather
+      # than reclassified — see the overrides block in package.json.
+      - name: Dependency audit (production — BLOCKING)
+        run: npm audit --omit=dev --audit-level=moderate
+      # Dev/build-tooling advisories. Real supply-chain exposure to a compromised build
+      # host, but not shippable surface, and currently unfixable at any version. Reported
+      # so a human sees it every run; non-blocking so it cannot force the downgrade above.
+      # Re-run WITHOUT `|| true` whenever wrangler publishes a miniflare bump — the day
+      # this passes on its own, delete the `|| true` and fold it back into the blocking
+      # step. Tracked: https://github.com/Mumega-com/mupot/issues/670
+      - name: Dependency audit (dev toolchain — report only)
+        run: npm audit --audit-level=high || true
       - name: Typecheck
         run: npm run typecheck
       - name: Install Playwright browser for integration tests

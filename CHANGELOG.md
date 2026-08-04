@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased
+
+- **Production dependencies: 0 known vulnerabilities**, verified from the lockfile
+  (`npm audit --package-lock-only --omit=dev`) rather than from a local tree.
+  - Corrected overrides that were pinned to the TOP of a vulnerable range instead of
+    past it — the original #662/#464 defect. `postcss` was still `8.5.18` against an
+    advisory of `<=8.5.22`; the fix for that class of bug had the same bug in it.
+  - `hono` `^4.12.28` → `^4.13.0` (CORS middleware ReDoS, GHSA-8j4g-w8fx-2239). This
+    one is our production router on an external-facing surface.
+  - Added overrides: `@hono/node-server ^2.0.5` (serve-static path traversal, reached
+    via `@modelcontextprotocol/sdk` ← `agents`), `body-parser ^2.2.3` (DoS via a limit
+    value that silently disables size enforcement).
+  - Went from 15 advisories (6 high) to **0 production / 3 dev**.
+
+- **CI dependency audit split by what actually ships** (`.github/workflows/ci.yml`).
+  - Production: **BLOCKING at `moderate`**, tightened from `high`. Production is at 0,
+    so this now blocks on the first regression instead of waiting for one to reach
+    "high". Strictly stronger on shippable surface.
+  - Dev toolchain: report-only. Not a judgement that it is harmless — `undici` has open
+    highs reachable as `wrangler → miniflare → undici`, **no wrangler version exists
+    without it**, and npm's remediation is to DOWNGRADE wrangler 4.118 → 4.35.0. The
+    single combined gate therefore had two possible outcomes: permanently red, or a
+    downgrade that makes us less safe. Report-only keeps it visible without letting it
+    force that trade. Residual risk accepted explicitly: this is real exposure to a
+    compromised build host, just not shippable surface. Tracked with a close condition
+    in #670 — the day the dev audit passes on its own, the carve-out is deleted.
+  - **PR #664 was an earlier attempt to relax this gate and was retracted the same day**,
+    because its premise came from a stale local `node_modules` while CI's clean `npm ci`
+    had 5 production highs. That precedent is recorded in the workflow comment and in
+    #670 so the next person to touch this gate has to take their premise from the
+    lockfile, not from a local tree.
+
 ## 2026-08-02/03 — the weekend the loop became real
 
 - 4-technician operator loop shipped (#623/#624/#630/#644): tech-grok (minted
