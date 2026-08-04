@@ -37,6 +37,22 @@
     advisories in the same chain are moderate and so do not block — deliberately absent
     rather than allowlisted. Residual risk named rather than dismissed: this is real
     exposure to a compromised build host, just not shippable surface.
+  - **Six bypasses were reproduced against this gate in review before it was accepted**,
+    and the last three were the same mistake three times: binding a *projection* of the
+    dependency graph rather than the graph. `nodes` is an install location; a flattened
+    ancestry name-set is not a path; and `npm audit --json` keys its findings by package
+    **name**, so an npm alias (`wrangler-alias@npm:wrangler`) — a genuinely second root
+    edge — collapsed into the accepted chain and passed with zero violations. The audit
+    summary cannot express node identity, so paths now come from **package-lock.json**
+    (`scripts/lockfile-paths.mjs`), keyed by node path and resolved version.
+  - Lockfile ambiguity fails closed: an unresolvable declared dependency, a target absent
+    from the lockfile, an orphan reachable from no root edge, or more than `MAX_PATHS`
+    routes all fail rather than producing a plausible-looking answer. Optional deps and
+    optional peers may legitimately be uninstalled and do not trip it.
+  - Staleness is classified **GONE / MOVED / UNKNOWN**. The earlier single message told
+    the operator "a fix shipped — delete this entry" even when the advisory was still
+    present and had merely moved, which made deleting a live exemption the cheapest way
+    to get a green build.
   - **PR #664 was an earlier attempt to relax this gate and was retracted the same day**,
     because its premise came from a stale local `node_modules` while CI's clean `npm ci`
     had 5 production highs. That precedent is recorded in the workflow comment and in

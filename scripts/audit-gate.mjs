@@ -39,6 +39,15 @@
 //      npm 9.9.4 and 10.9.8. Fixing bypass 4 with a sorted name set was the same
 //      mistake as fixing it with `nodes`, one level up.
 //
+//   6. `wrangler-alias@npm:wrangler@4.102.0` — a second, distinct root edge to the same
+//      package. `npm audit --json` keys `vulnerabilities` by package NAME, so both root
+//      edges collapsed into one "wrangler > miniflare > undici" chain and the gate
+//      passed with zero violations. This is the point at which the audit summary stops
+//      being fixable: its key space is names, so it CANNOT express node identity,
+//      aliases, or version-distinct copies, no matter how carefully it is read.
+//      Paths now come from package-lock.json (see scripts/lockfile-paths.mjs), which is
+//      keyed by node path — the identity that actually exists on disk.
+//
 // The allowlist entry is therefore a TUPLE — ghsa + package + severity + nodes +
 // isDirect + paths — where `paths` is the COMPLETE set of ordered root-to-node causal
 // chains. Every field is load-bearing. Anything that differs from what was accepted is
@@ -58,11 +67,13 @@
 
 import { execFileSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
+import { pathsToNode, LockfileGraphError } from './lockfile-paths.mjs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
 const DEFAULT_ALLOWLIST = join(repoRoot, '.github/audit-allowlist.json')
+const DEFAULT_LOCKFILE = join(repoRoot, 'package-lock.json')
 const BLOCKING = new Set(['high', 'critical'])
 
 /** npm audit's documented exit codes: 0 = nothing found, 1 = vulnerabilities found. */
@@ -72,44 +83,6 @@ export class AuditGateError extends Error {}
 
 function normalizeNodes(nodes) {
   return [...(nodes ?? [])].map(String).sort()
-}
-
-/**
- * Every ordered causal chain from a project root dependency down to `pkg`.
- *
- * `effects` alone is a flattened closure of dependent NAMES — that was bypass 5.
- * Making miniflare a direct dependency left the name set identical while the accepted
- * justification ("we carry miniflare only because wrangler needs it") became false.
- * A set of names cannot express that; an ordered path can.
- *
- * A chain terminates at a package with `isDirect: true` — something we chose to add.
- * A package that is BOTH direct and reachable transitively yields both chains, so
- * gaining a direct edge always changes the accepted shape.
- *
- * Returns chains root-first, e.g. [["wrangler", "miniflare", "undici"]], sorted for
- * stable comparison.
- */
-export function pathsTo(report, pkg, seen = new Set()) {
-  const vuln = report.vulnerabilities?.[pkg]
-  if (!vuln) return [[pkg]]
-
-  const chains = []
-  // Direct dependency: this package is itself a root edge.
-  if (vuln.isDirect) chains.push([pkg])
-
-  for (const parent of vuln.effects ?? []) {
-    if (seen.has(parent)) continue // cycle guard: a malformed graph must not hang the gate
-    for (const chain of pathsTo(report, parent, new Set([...seen, pkg]))) {
-      chains.push([...chain, pkg])
-    }
-  }
-
-  // Neither direct nor reachable from anything we know about — report it as its own
-  // chain rather than silently returning nothing, which would compare equal to another
-  // unknown shape.
-  if (chains.length === 0) chains.push([pkg])
-
-  return normalizePaths(chains)
 }
 
 function normalizePaths(paths) {
@@ -212,7 +185,21 @@ export function runAudit(cwd = repoRoot, exec = execFileSync) {
 }
 
 /** Pure core, so the bypasses above can be tested without a registry. */
-export function evaluate(report, allowed) {
+/**
+ * Paths to every install location the audit attributes to this finding, taken from the
+ * LOCKFILE rather than from the audit summary. A finding with several `nodes` (two
+ * copies of one package) contributes all of their paths.
+ */
+function pathsForFinding(lock, vuln) {
+  const all = []
+  for (const node of vuln.nodes ?? []) all.push(...pathsToNode(lock, node))
+  if (all.length === 0) {
+    throw new LockfileGraphError(`finding has no install nodes to locate in the lockfile`)
+  }
+  return normalizePaths(all)
+}
+
+export function evaluate(report, allowed, lock) {
   if (!report || typeof report !== 'object' || typeof report.vulnerabilities !== 'object' || report.vulnerabilities === null) {
     throw new AuditGateError('audit output has no `vulnerabilities` object — refusing to interpret silence as safety')
   }
@@ -246,7 +233,16 @@ export function evaluate(report, allowed) {
         continue
       }
 
-      const paths = pathsTo(report, pkg)
+      let paths
+      try {
+        paths = pathsForFinding(lock, vuln)
+      } catch (err) {
+        // Cannot locate the finding in the lockfile => cannot verify any exemption for
+        // it. Fail closed and say why, rather than comparing against a guess.
+        unresolvedIdentity = true
+        violations.push(`${pkg}: ${severity} — ${ghsa} — cannot verify dependency path: ${err.message}`)
+        continue
+      }
       seenBlocking.push({ ghsa, pkg, severity, nodes: normalizeNodes(vuln.nodes), isDirect: Boolean(vuln.isDirect), paths })
 
       const key = tupleKey({ ghsa, pkg, severity, nodes: vuln.nodes, isDirect: vuln.isDirect, paths })
@@ -299,7 +295,8 @@ function main() {
   let result
   try {
     allowed = loadAllowlist()
-    result = evaluate(runAudit(), allowed)
+    const lock = JSON.parse(readFileSync(DEFAULT_LOCKFILE, 'utf8'))
+    result = evaluate(runAudit(), allowed, lock)
   } catch (err) {
     console.error(`\n✗ audit-gate: ${err.message}\n`)
     process.exit(1)

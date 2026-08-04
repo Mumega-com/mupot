@@ -9,7 +9,7 @@
       "severity": "high",
       "path": "wrangler > miniflare > undici",
       "title": "undici vulnerable to cross-user information disclosure and parse-time crash via degenerate private cache directives",
-      "why": "Dev/build toolchain only \u2014 this undici is miniflare's local Workers emulator and is never bundled into the deployed Worker. The exemption is bound to the COMPLETE SET OF CAUSAL PATHS (root > wrangler > miniflare > undici, and no other) and to isDirect false, because that ancestry IS the justification: we carry it only because wrangler needs miniflare. A direct undici dependency, or undici reached any other way, is a different decision and must fail this gate. No wrangler release exists without a vulnerable miniflare; npm's remediation downgrades wrangler 4.118 -> 4.35.0, surrendering ~80 releases of fixes to silence a dev-only finding. Accepted as build-host exposure, NOT shippable surface. The other four undici advisories in this chain are moderate and therefore do not block; they are intentionally absent rather than allowlisted.",
+      "why": "Dev/build toolchain only \u2014 this undici is miniflare's local Workers emulator and is never bundled into the deployed Worker. The exemption is bound to the COMPLETE SET OF LOCKFILE PATHS (root > wrangler > miniflare > undici, by node path and resolved version, and no other) and to isDirect false, because that ancestry IS the justification: we carry it only because wrangler needs miniflare. A direct undici dependency, or undici reached any other way, is a different decision and must fail this gate. No wrangler release exists without a vulnerable miniflare; npm's remediation downgrades wrangler 4.118 -> 4.35.0, surrendering ~80 releases of fixes to silence a dev-only finding. Accepted as build-host exposure, NOT shippable surface. The other four undici advisories in this chain are moderate and therefore do not block; they are intentionally absent rather than allowlisted.",
       "accepted_on": "2026-08-04",
       "nodes": [
         "node_modules/undici"
@@ -17,9 +17,9 @@
       "isDirect": false,
       "paths": [
         [
-          "wrangler",
-          "miniflare",
-          "undici"
+          "node_modules/wrangler@4.102.0",
+          "node_modules/miniflare@4.20260617.0",
+          "node_modules/undici@7.28.0"
         ]
       ]
     }
