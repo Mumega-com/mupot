@@ -212,10 +212,10 @@ ghlInboundApp.post('/inbound', async (c) => {
   // unassigned-auto-pickup hole (#404/#659) — without it this task was indistinguishable
   // from a trusted local one.
   //
-  // NOTE (flagged, not fixed in this PR — outside the requested scope): this call omits
-  // skipMirror, unlike every other external-ingest call site in this codebase (Linear,
-  // GitHub Projects, GitHub webhook, events/ingest.ts) — it currently mirrors this
-  // untrusted body out to a GitHub issue under our token. Worth a follow-up.
+  // The follow-up this note used to flag — that the call omitted skipMirror and so
+  // mirrored untrusted body text out to a GitHub issue under our token — landed as #663
+  // and is now set below. Both halves are present at this call site: skipMirror fences
+  // the OUTBOUND direction, externalSource fences the INBOUND one.
   await createTask(c.env, {
     squad_id: squadId,
     title,

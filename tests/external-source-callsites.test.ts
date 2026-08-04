@@ -265,3 +265,117 @@ describe('whitespace-only provenance is blank, not just spaces', () => {
     expect(isBlankProvenance(' linear:TEAM ')).toBe(false)
   })
 })
+
+// ── LEGACY BACKFILL (adversarial re-gate, 2026-08-04) ───────────────────────
+//
+// The tests above cover createTask, direct INSERT and direct UPDATE. They do NOT cover
+// the third path the gate reproduced: a row that already existed BEFORE 0078 ran. That
+// is the restore/upgrade failure mode — the constraint cannot reject what is already
+// stored, so the migration has to repair it, and the first version of 0078 did not
+// because one-argument TRIM left tab/newline markers untouched.
+//
+// So this applies migrations through 0077, seeds whitespace-only provenance the way a
+// pre-0078 database would legitimately hold it, then applies 0078 and asserts the
+// repair. It is the only one of the four paths where the assertion is about the
+// MIGRATION rather than about a guard.
+describe('migration 0078 repairs legacy whitespace-only provenance', () => {
+  const WHITESPACE: ReadonlyArray<readonly [string, string]> = [
+    ['space', ' '], ['tab', '\t'], ['newline', '\n'], ['carriage return', '\r'],
+    ['vertical tab', '\v'], ['form feed', '\f'], ['mixed', ' \t\n\r'], ['empty', ''],
+  ]
+
+  function seedThrough0077() {
+    const harness = createSqliteD1()
+    const files = readdirSync(MIGRATIONS_DIR).filter((n) => n.endsWith('.sql')).sort()
+    const upTo0077 = files.filter((n) => n < '0078')
+    for (const file of upTo0077) harness.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
+    harness.sqlite.exec(`
+      INSERT INTO departments (id, slug, name) VALUES ('dept-a', 'dept-a', 'Department A');
+      INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-a', 'dept-a', 'squad-a', 'Squad A');
+    `)
+    return harness
+  }
+
+  // NOTE: seed rows use a real ISO timestamp, not the string 'now'. `tasks` carries an
+  // index over `julianday(created_at)` (migrations/0059), and SQLite reads the literal
+  // 'now' as CURRENT TIME — which makes the index expression non-deterministic and the
+  // insert fails. That is a property of the fixture data, not of the schema or of this
+  // change; it cost a wrong diagnosis before it was traced.
+
+  function apply0078(harness: ReturnType<typeof createSqliteD1>) {
+    harness.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, '0078_task_provenance_nonblank.sql'), 'utf8'))
+  }
+
+  for (const [name, ch] of WHITESPACE) {
+    it(`replaces a legacy ${name}-only external_source with an attributable marker`, async () => {
+      const harness = seedThrough0077()
+      // Seed through the D1 wrapper, the same path createTask uses. A raw
+      // sqlite.prepare() insert trips a PRE-EXISTING index on `tasks` that uses
+      // julianday() (migrations/0059), which node:sqlite rejects as non-deterministic.
+      // Unrelated to this change and not worth working around any other way.
+      await harness.db.prepare(
+        `INSERT INTO tasks (id, squad_id, title, body, done_when, status, external_source, created_at, updated_at)
+         VALUES (?, 'squad-a', 't', 'b', 'w', 'open', ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`,
+      ).bind(`legacy-${name}`, ch).run()
+
+      apply0078(harness)
+
+      const row = harness.sqlite.prepare('SELECT external_source FROM tasks WHERE id = ?').get(`legacy-${name}`)
+      // Fail CLOSED: repaired to an attributable EXTERNAL marker, never nulled to
+      // trusted-local. Nulling would silently promote an ambiguous row to first-party.
+      expect(row?.external_source).toBe('unknown:blank-provenance-0078')
+      harness.close()
+    })
+
+    it(`replaces a legacy ${name}-only source_pot with an attributable marker`, async () => {
+      const harness = seedThrough0077()
+      await harness.db.prepare(
+        `INSERT INTO tasks (id, squad_id, title, body, done_when, status, source_pot, created_at, updated_at)
+         VALUES (?, 'squad-a', 't', 'b', 'w', 'open', ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`,
+      ).bind(`legacy-pot-${name}`, ch).run()
+
+      apply0078(harness)
+
+      const row = harness.sqlite.prepare('SELECT source_pot FROM tasks WHERE id = ?').get(`legacy-pot-${name}`)
+      expect(row?.source_pot).toBe('unknown:blank-provenance-0078')
+      harness.close()
+    })
+  }
+
+  it('leaves a real marker with surrounding whitespace UNCHANGED', async () => {
+    // The backfill must repair only wholly-blank provenance. Rewriting ' linear:TEAM '
+    // would destroy real attribution to satisfy a formatting rule.
+    const harness = seedThrough0077()
+    await harness.db.prepare(
+      `INSERT INTO tasks (id, squad_id, title, body, done_when, status, external_source, created_at, updated_at)
+       VALUES ('legacy-real', 'squad-a', 't', 'b', 'w', 'open', ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`,
+    ).bind(' linear:TEAM ').run()
+
+    apply0078(harness)
+
+    const row = harness.sqlite.prepare("SELECT external_source FROM tasks WHERE id = 'legacy-real'").get()
+    expect(row?.external_source).toBe(' linear:TEAM ')
+    harness.close()
+  })
+
+  it('leaves NULL provenance NULL — a local row must not be marked external', async () => {
+    const harness = seedThrough0077()
+    await harness.db.prepare(
+      `INSERT INTO tasks (id, squad_id, title, body, done_when, status, created_at, updated_at)
+       VALUES ('legacy-local', 'squad-a', 't', 'b', 'w', 'open', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`,
+    ).run()
+
+    apply0078(harness)
+
+    const row = harness.sqlite.prepare("SELECT external_source, source_pot FROM tasks WHERE id = 'legacy-local'").get()
+    expect(row?.external_source).toBeNull()
+    expect(row?.source_pot).toBeNull()
+    harness.close()
+  })
+
+  it('the repaired row is classified EXTERNAL by the runtime predicate', () => {
+    // Closes the loop: the repair is only useful if the marker it writes actually makes
+    // the row untrusted to the code that reads it.
+    expect(isExternallySourced({ external_source: 'unknown:blank-provenance-0078', source_pot: null })).toBe(true)
+  })
+})
