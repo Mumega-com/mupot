@@ -384,6 +384,11 @@ export interface AuthContext {
   channel?: ConnectionChannel // how this principal connected
   capabilities?: CapabilityGrant[] // fine-grained, per-scope; the real RBAC
   boundAgentId?: string | null // the agent this token is bound to (the weld), or null = pure human/operator
+  // ──  ADR-001: session-based work identity ──
+  // Optional: when set, this request acts within a named session context (thread scope).
+  // If absent, falls back to agent.squad_id (no session filtering).
+  sessionId?: string | null
+  session?: Session | null // resolved session data (optional; loaded on demand)
 }
 
 // ── Members & capabilities — humans are first-class network nodes ──
@@ -417,6 +422,22 @@ export interface MemberToken {
   channel: ConnectionChannel
   created_at: string
   revoked_at: string | null
+}
+
+// ── Sessions (ADR-001) ────────────────────────────────────────────────────────
+// A session is a thread of work — one independent execution context for an agent/member.
+// Each thread registers in-band on connect() and receives its own identity (sessionId, address).
+// Sessions are scoped by project (if specified) or squad (if agent-bound).
+//
+// Scope: a session reach = (authorized projects INTERSECT parent-member capabilities).
+// Per-call re-resolution: scope is never cached; it is recomputed on each call.
+export interface Session {
+  id: string // unique session identifier (UUID)
+  agent_id: string // the agent or member this session acts as
+  project_id: string | null // optional: if set, session is scoped to this project only
+  thread_id: string | null // optional: caller-provided thread identifier for logging
+  address: string // human-readable address: "agent_id:session_id"
+  created_at: string // ISO 8601
 }
 
 export type CapabilityScopeType = 'org' | 'department' | 'squad'
