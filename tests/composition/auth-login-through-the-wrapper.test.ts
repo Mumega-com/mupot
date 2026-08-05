@@ -77,6 +77,24 @@ describe('the deployed composition (workerd)', () => {
     expect(injected, 'OAuthProvider no longer injects OAUTH_PROVIDER — re-read #712').toBeDefined()
   })
 
+  it('IDP_PROVIDER is genuinely READ — not merely survived by failing open', async () => {
+    // Athena's finding on #717. The suite passed a naive IDP_PROVIDER -> OAUTH_PROVIDER
+    // rename 4/4, because `typeof configured === 'string'` is FALSE for the injected
+    // helpers object, so provider() fell back to 'google' and login still 302'd.
+    //
+    // That means the previous tests could not distinguish "reads the right binding" from
+    // "reads the wrong binding and fails safe". The code was accidentally correct, and the
+    // day someone removes the typeof guard the 500 returns with nothing going red.
+    //
+    // Setting IDP_PROVIDER to a value that must CHANGE the outcome closes it: if provider()
+    // reads OAUTH_PROVIDER instead, it gets the injected object, typeof rejects it, the
+    // default wins, and this returns 302 rather than 400. Only reading the correct binding
+    // produces a 400 here.
+    const res = await get('/auth/login', env({ IDP_PROVIDER: 'telegram' }))
+    expect(res.status).toBe(400)
+    await expect(res.json()).resolves.toMatchObject({ error: 'unsupported_provider', provider: 'telegram' })
+  })
+
   it('routes the app owns still work through the wrapper', async () => {
     const res = await get('/health')
     expect(res.status).toBe(200)
