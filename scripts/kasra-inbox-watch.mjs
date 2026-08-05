@@ -19,6 +19,7 @@
 //   TMUX_DELIVERY_TIMEOUT_MS default 5000, clamped to 100..15000
 //   TMUX_PREVIEW_MAX_CHARS default 1000, clamped to 320..2000
 //   TMUX_CONFIRM_ATTEMPTS  default 3, clamped to 1..5
+//   TMUX_ENTER_DELAY_MS    default payload-scaled 250..2500
 
 import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -197,6 +198,18 @@ export function deliverToTmux(_text, message, opts = {}) {
   const type = spawn('tmux', ['send-keys', '-t', TMUX_SESSION, '-l', preview], commandOpts)
   if (type.status !== 0) {
     return tmuxFailure(type, 'tmux_send_failed', 'tmux_send_timeout')
+  }
+  // Preserve the live Athena fix from ac6cc29: cursor-agent can swallow Enter
+  // while it is still ingesting a paste. The preview is bounded, and so is the
+  // settle delay; running it through the same timed subprocess boundary keeps
+  // a broken child from wedging the watcher.
+  const requestedDelay = Number(opts.enterDelayMs ?? process.env.TMUX_ENTER_DELAY_MS)
+  const settleMs = Number.isFinite(requestedDelay) && requestedDelay > 0
+    ? Math.min(2_500, Math.max(0, requestedDelay))
+    : Math.min(2_500, 250 + Math.floor(preview.length / 40))
+  const settle = spawn('sleep', [String(settleMs / 1_000)], commandOpts)
+  if (settle.status !== 0) {
+    return tmuxFailure(settle, 'tmux_settle_failed', 'tmux_settle_timeout')
   }
   // Enter as a separate key so multiline bodies stay literal under -l.
   const enter = spawn('tmux', ['send-keys', '-t', TMUX_SESSION, 'Enter'], commandOpts)

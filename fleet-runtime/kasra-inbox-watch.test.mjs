@@ -88,6 +88,31 @@ test('deliverToTmux refuses success when post-Enter pane confirmation lacks the 
   assert.equal(result.reason, 'tmux_delivery_unconfirmed')
 })
 
+test('deliverToTmux preserves a bounded settle delay between literal write and Enter', () => {
+  const calls = []
+  let typed = ''
+  const result = deliverToTmux('', REQUEST, {
+    enterDelayMs: 275,
+    spoolMessage: () => '/tmp/mupot-message.json',
+    spawn: (command, args) => {
+      calls.push([command, ...args])
+      if (command === 'tmux' && args.includes('-l')) typed = args.at(-1)
+      if (command === 'tmux' && args[0] === 'capture-pane') {
+        return { status: 0, stdout: typed, stderr: '' }
+      }
+      return { status: 0, stdout: '', stderr: '' }
+    },
+  })
+
+  assert.equal(result.ok, true)
+  assert.deepEqual(calls.slice(0, 3).map((call) => call.slice(0, 2)), [
+    ['tmux', 'send-keys'],
+    ['sleep', '0.275'],
+    ['tmux', 'send-keys'],
+  ])
+  assert.equal(calls[2].at(-1), 'Enter')
+})
+
 test('runCycle consumes exactly once only after the pane confirms the delivery marker', async () => {
   let typed = ''
   let consumes = 0
