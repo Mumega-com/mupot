@@ -2703,8 +2703,14 @@ const toolConnect: ToolSpec = {
             'This session is on the DIRECTORY channel (the public OAuth door used by ChatGPT/Claude connectors),',
             'which carries NO standing capabilities by design — a member who holds admin or owner elsewhere does',
             'not inherit those here. Requesting a squad grant will NOT fix this; the directory door discards',
-            'grants by construction. Use a WORKSPACE-channel token instead: ask an org-admin to run',
-            `mint_agent_token { agent: "${agentRef.slug}" }, then connect with that bearer.`,
+            `grants by construction. Use a WORKSPACE-channel token instead: ask an admin on agent "${agentRef.slug}"'s`,
+            // Render the ID, never the slug. mint_agent_token resolves through the same
+            // resolveAgentRef contract as connect, so a DUPLICATED slug would come back
+            // `ambiguous_slug` — turning a reference the caller had already resolved
+            // unambiguously (they may have passed the id) back into a dead end, which is
+            // the exact failure this refusal exists to remove. Not hypothetical: six
+            // hadi/codex agent records share slugs today. (codex gate, #681.)
+            `squad to run mint_agent_token { agent: "${agentRef.id}" }, then connect with that bearer.`,
           ].join(' '),
           need: 'workspace-channel token',
           scope: 'channel',

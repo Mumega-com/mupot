@@ -534,6 +534,22 @@ describe('connect MCP tool (#128 — self-name-to-bind)', () => {
     expect(body.error.data.detail).toMatch(/mint_agent_token/)
   })
 
+  // codex gate on #681: the prescribed next action must stay executable. mint_agent_token
+  // resolves through the SAME resolveAgentRef contract as connect, so emitting the SLUG
+  // sends a caller who escaped a duplicate slug (by passing the id) straight back into
+  // `ambiguous_slug` — recreating the dead end this refusal exists to remove. Six
+  // hadi/codex records share slugs in production today, so this is live, not theoretical.
+  it('directory refusal prescribes the agent ID, so the next action survives a duplicated slug', async () => {
+    const env = makeEnv({ channel: 'directory', grants: [], ambiguousSlug: true })
+    const res = await callConnect(env, AGENT.id) // id resolves to exactly one agent
+    expect(res.status).toBe(403)
+    const body = (await res.json()) as { error: { data: { reason: string; detail: string } } }
+    expect(body.error.data.reason).toBe('directory_channel_zero_capability')
+    expect(body.error.data.detail).toContain(`mint_agent_token { agent: "${AGENT.id}" }`)
+    // The ambiguous slug must NOT be the thing the caller is told to run.
+    expect(body.error.data.detail).not.toMatch(new RegExp(`mint_agent_token \\{ agent: "${AGENT.slug}"`))
+  })
+
   it('workspace channel with no grants → still the ordinary no_squad_access refusal', async () => {
     // Negative control: the #678 branch must be scoped to the directory channel ONLY.
     // Without this, a fix that returned the new reason unconditionally would look identical.
