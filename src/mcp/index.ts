@@ -809,10 +809,14 @@ const toolTaskBoard: ToolSpec = {
     if (typeof limit !== 'number') return limit
 
     const rows = await env.DB.prepare(
+      // Ranked within the LIMIT, not merely recent (#713). task_board is the kanban view;
+      // ordering it by created_at means a board capped at `limit` drops the OLDEST rows
+      // regardless of priority, so a P0 filed last month can fall out of the board entirely
+      // while P3 chatter from today stays. Found by the ORDER-BY parity guard, not by me.
       `SELECT ${TASK_SELECT_COLUMNS}
          FROM tasks
         WHERE squad_id = ?1
-        ORDER BY created_at DESC
+        ORDER BY ${priorityOrderSql()}, created_at DESC
         LIMIT ?2`,
     )
       .bind(squadRes.squad.id, limit)
