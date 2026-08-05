@@ -59,6 +59,7 @@ import {
   TaskEvidenceFenceError,
 } from '../tasks/service'
 import type { TaskStatus } from '../tasks/service'
+import type { TaskPriority } from '../types'
 import { resolveTaskAssignee } from '../tasks/assignee'
 // #22 v1 ATC ranking: pure scorer + the radar's existing agent runtime-state
 // loader (dashboard/radar.ts already uses this same loader for the fleet
@@ -69,6 +70,7 @@ import {
   actionableStatusInSql,
   terminalStatusInSql,
   actionableStatusOrderSql,
+  priorityOrderSql,
 } from '../tasks/ranking'
 import { loadAgentRuntimeStates, type AgentRuntimeState } from '../dashboard/observatory'
 import { buildOrient, renderBrief } from '../orient/service'
@@ -397,12 +399,28 @@ const STRING_SCHEMA = { type: 'string' }
 const NULLABLE_STRING_SCHEMA = { type: ['string', 'null'] }
 const OPTIONAL_STRING_ARRAY_SCHEMA = { type: 'array', items: { type: 'string' } }
 const OPTIONAL_NUMBER_SCHEMA = { type: 'number' }
+/**
+ * The one projection every task read uses. This column list existed in FOUR places; three of
+ * them sit inside a LIMIT budget, so omitting a column from one of them drops the field
+ * for that path only — visible in some views, absent in others, with nothing failing.
+ */
+const TASK_SELECT_COLUMNS =
+  'id, squad_id, project_id, title, body, done_when, status, priority, parent_task_id, ' +
+  'assignee_agent_id, github_issue_url, result, completed_at, gate_owner, source_pot, ' +
+  'external_source, created_at, updated_at'
+
+const TASK_PRIORITIES: readonly string[] = ['P0', 'P1', 'P2', 'P3']
+
 const TASK_STATUSES: readonly TaskStatus[] = ['open', 'in_progress', 'blocked', 'done', 'review', 'approved', 'rejected']
 const PATCH_ALLOWED_STATUSES: ReadonlySet<string> = new Set(['open', 'in_progress', 'blocked', 'done', 'review'])
 const BROADCAST_REQUEST_ID_RE = /^[A-Za-z0-9_.:-]{1,128}$/
 
 function isTaskStatus(v: unknown): v is TaskStatus {
   return typeof v === 'string' && (TASK_STATUSES as readonly string[]).includes(v)
+}
+
+function isTaskPriority(v: unknown): v is TaskPriority {
+  return typeof v === 'string' && TASK_PRIORITIES.includes(v)
 }
 
 function isPatchableStatus(v: unknown): v is TaskStatus {
@@ -435,7 +453,7 @@ function readConcepts(v: unknown): string[] | undefined | Extract<ToolOutcome, {
 
 async function loadTask(env: Env, taskId: string): Promise<Task | null> {
   const row = await env.DB.prepare(
-    `SELECT id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, source_pot, external_source, created_at, updated_at
+    `SELECT ${TASK_SELECT_COLUMNS}
        FROM tasks WHERE id = ?1 LIMIT 1`,
   )
     .bind(taskId)
@@ -537,7 +555,7 @@ const toolTaskCreate: ToolSpec = {
   name: 'task_create',
   scope: 'squad',
   min: 'member',
-  args: '{ squad_id: string, project_id?: string|null, title: string, done_when: string, body?: string, assignee_agent_id?: string, external_source?: string }',
+  args: '{ squad_id: string, project_id?: string|null, title: string, done_when: string, body?: string, assignee_agent_id?: string, priority?: "P0"|"P1"|"P2"|"P3", parent_task_id?: string, external_source?: string }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -547,6 +565,8 @@ const toolTaskCreate: ToolSpec = {
       done_when: { ...STRING_SCHEMA, description: 'Verifiable success predicate — a checkable condition that proves the task is complete.' },
       body: STRING_SCHEMA,
       assignee_agent_id: STRING_SCHEMA,
+      priority: { type: 'string', enum: ['P0', 'P1', 'P2', 'P3'], description: 'Rank. Omit to leave UNTRIAGED — a real state, deliberately sorted last so unranked work has a cost.' },
+      parent_task_id: { ...STRING_SCHEMA, description: 'Parent task id, making this a subtask. Must be an existing task in the same squad.' },
       // PR #659 P0 fix (migrations/0077): carries provenance forward when a task with an
       // existing external_source is legitimately re-created (today: scripts/steward-worker.py's
       // auto-reissue of a blocked/orphaned task — the "amplifier" the diverse-model gate
@@ -605,6 +625,27 @@ const toolTaskCreate: ToolSpec = {
 
     const projectId = args.project_id == null ? null : str(args.project_id)
     if (args.project_id != null && !projectId) return fail(400, 'invalid_project_id')
+
+    let priority: TaskPriority | null = null
+    if (args.priority != null) {
+      if (!isTaskPriority(args.priority)) return fail(400, 'invalid_priority', { accepted: TASK_PRIORITIES })
+      priority = args.priority
+    }
+
+    // A subtask must live on the SAME squad as its parent. Without this a caller could
+    // parent a task onto a squad it cannot see, and every squad-scoped read would then
+    // return a tree whose branches cross an authorization boundary — the capability check
+    // above is per-squad, so a cross-squad parent silently widens what a reader sees.
+    let parentTaskId: string | null = null
+    if (args.parent_task_id != null) {
+      const ref = str(args.parent_task_id)
+      if (!ref) return fail(400, 'invalid_args', 'parent_task_id must be a non-empty string')
+      const parent = await loadTask(env, ref)
+      if (!parent) return fail(404, 'parent_task_not_found')
+      if (parent.squad_id !== squad.id) return fail(400, 'parent_task_cross_squad', 'a subtask must live on the same squad as its parent')
+      parentTaskId = parent.id
+    }
+
     let task
     try {
       task = await createTask(
@@ -616,6 +657,8 @@ const toolTaskCreate: ToolSpec = {
           done_when: doneWhen,
           body,
           assignee_agent_id: assignee.value,
+          priority,
+          parent_task_id: parentTaskId,
         },
         { actor: memberActor(auth.memberId as string), externalSource },
       )
@@ -698,10 +741,10 @@ const toolTaskList: ToolSpec = {
       const clauses = [...baseClauses, `status = ?${baseBinds.length + 1}`]
       const binds = [...baseBinds, status]
       const rows = await env.DB.prepare(
-        `SELECT id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, source_pot, external_source, created_at, updated_at
+        `SELECT ${TASK_SELECT_COLUMNS}
            FROM tasks
           WHERE ${clauses.join(' AND ')}
-          ORDER BY created_at ${isActionable ? 'ASC' : 'DESC'}
+          ORDER BY ${priorityOrderSql()}, created_at ${isActionable ? 'ASC' : 'DESC'}
           LIMIT ${limit}`,
       )
         .bind(...binds)
@@ -715,10 +758,10 @@ const toolTaskList: ToolSpec = {
       // compete with actionable rows for the same slots (the P1 finding's
       // core failure mode).
       const actionableRows = await env.DB.prepare(
-        `SELECT id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, source_pot, external_source, created_at, updated_at
+        `SELECT ${TASK_SELECT_COLUMNS}
            FROM tasks
           WHERE ${[...baseClauses, actionableStatusInSql()].join(' AND ')}
-          ORDER BY ${actionableStatusOrderSql()}, created_at ASC
+          ORDER BY ${actionableStatusOrderSql()}, ${priorityOrderSql()}, created_at ASC
           LIMIT ${limit}`,
       )
         .bind(...baseBinds)
@@ -728,10 +771,10 @@ const toolTaskList: ToolSpec = {
       const remaining = limit - taskRows.length
       if (remaining > 0) {
         const terminalRows = await env.DB.prepare(
-          `SELECT id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, source_pot, external_source, created_at, updated_at
+          `SELECT ${TASK_SELECT_COLUMNS}
              FROM tasks
             WHERE ${[...baseClauses, terminalStatusInSql()].join(' AND ')}
-            ORDER BY created_at DESC
+            ORDER BY ${priorityOrderSql()}, created_at DESC
             LIMIT ${remaining}`,
         )
           .bind(...baseBinds)
@@ -766,7 +809,7 @@ const toolTaskBoard: ToolSpec = {
     if (typeof limit !== 'number') return limit
 
     const rows = await env.DB.prepare(
-      `SELECT id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, source_pot, external_source, created_at, updated_at
+      `SELECT ${TASK_SELECT_COLUMNS}
          FROM tasks
         WHERE squad_id = ?1
         ORDER BY created_at DESC
@@ -801,7 +844,7 @@ const toolTaskUpdate: ToolSpec = {
   name: 'task_update',
   scope: 'squad (of the task)',
   min: 'member',
-  args: '{ task_id: string, project_id?: string|null, title?: string, body?: string, done_when?: string, status?: "open"|"in_progress"|"blocked"|"done"|"review", assignee_agent_id?: string|null, gate_owner?: string|null }',
+  args: '{ task_id: string, project_id?: string|null, title?: string, body?: string, done_when?: string, status?: "open"|"in_progress"|"blocked"|"done"|"review", priority?: "P0"|"P1"|"P2"|"P3"|null, parent_task_id?: string|null, assignee_agent_id?: string|null, gate_owner?: string|null }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -811,6 +854,8 @@ const toolTaskUpdate: ToolSpec = {
       body: STRING_SCHEMA,
       done_when: STRING_SCHEMA,
       status: STRING_SCHEMA,
+      priority: { type: ['string', 'null'], description: 'Rank, or null to return the task to UNTRIAGED.' },
+      parent_task_id: { type: ['string', 'null'], description: 'Parent task id, or null to promote this task to top level.' },
       assignee_agent_id: STRING_SCHEMA,
       gate_owner: STRING_SCHEMA,
     },
@@ -848,8 +893,56 @@ const toolTaskUpdate: ToolSpec = {
       next.done_when = (args.done_when as string).trim()
       changed = true
     }
+    if (args.priority !== undefined) {
+      // Explicit null RE-TRIAGES a task back to untriaged. That is a legitimate operation
+      // ("I ranked this wrongly"), and it is distinguishable from "field absent" only
+      // because we branch on `=== undefined` rather than on truthiness — the same
+      // null-vs-absent split that #684-era code kept getting wrong.
+      if (args.priority === null) {
+        next.priority = null
+      } else {
+        const candidate: unknown = args.priority
+        if (!isTaskPriority(candidate)) return fail(400, 'invalid_priority', { accepted: TASK_PRIORITIES })
+        next.priority = candidate
+      }
+      changed = true
+    }
+    if (args.parent_task_id !== undefined) {
+      if (args.parent_task_id === null) {
+        next.parent_task_id = null
+      } else {
+        const ref = str(args.parent_task_id)
+        if (!ref) return fail(400, 'invalid_args', 'parent_task_id must be a non-empty string or null')
+        if (ref === existing.id) return fail(400, 'parent_task_self', 'a task cannot be its own parent')
+        const parent = await loadTask(env, ref)
+        if (!parent) return fail(404, 'parent_task_not_found')
+        if (parent.squad_id !== existing.squad_id) {
+          return fail(400, 'parent_task_cross_squad', 'a subtask must live on the same squad as its parent')
+        }
+        // One level of cycle protection beyond the DB trigger: A->B->A. Deeper cycles are
+        // still possible and are NOT claimed to be prevented here — stating that rather
+        // than implying full acyclicity, because a guard that sounds complete and is not
+        // is worse than a named partial one.
+        if (parent.parent_task_id === existing.id) {
+          return fail(400, 'parent_task_cycle', 'that task is already a child of this one')
+        }
+        next.parent_task_id = parent.id
+      }
+      changed = true
+    }
     if (args.status !== undefined) {
-      if (!isPatchableStatus(args.status)) return fail(400, 'invalid_status')
+      if (!isPatchableStatus(args.status)) {
+        // approved/rejected are deliberately NOT patchable — a task must not approve
+        // itself; that transition belongs to task_verdict, which records who decided.
+        // Saying so here turns a dead end into a next step: this was read as "tasks are
+        // stuck in review" for weeks when the real answer was "use the other tool".
+        return fail(400, 'invalid_status', {
+          accepted: [...PATCH_ALLOWED_STATUSES],
+          hint: (args.status === 'approved' || args.status === 'rejected')
+            ? 'approved/rejected are set by task_verdict, not task_update — a task cannot approve itself'
+            : undefined,
+        })
+      }
       const transitionErr = checkTransition(existing.status, args.status)
       if (transitionErr) return fail(400, 'invalid_transition', transitionErr)
       // GATE-EXIT GUARD (mirror of PATCH /api/tasks/:id): entering 'review'

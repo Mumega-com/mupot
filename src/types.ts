@@ -284,10 +284,25 @@ export interface Membership {
 
 export type Capability = 'owner' | 'admin' | 'lead' | 'member' | 'observer'
 
+export type TaskPriority = 'P0' | 'P1' | 'P2' | 'P3'
+
 export interface Task {
   id: string
   squad_id: string
   project_id: string | null
+  /**
+   * Rank. NULL means UNTRIAGED and is a real, visible state — see migrations/0079.
+   * Before this existed, priority was encoded into task TITLES ("[P0] ..."), which is
+   * unsortable, unfilterable, and invisible to every view. Untriaged rows sort LAST in
+   * the ranker: deliberately, so that leaving work unranked has a cost.
+   */
+  priority: TaskPriority | null
+  /**
+   * Subtask link. NULL for a top-level task. ON DELETE SET NULL, never CASCADE —
+   * an orphaned child surfacing as a top-level task is recoverable; a silently
+   * deleted one is not (#705's lesson: a row can own more than itself).
+   */
+  parent_task_id: string | null
   title: string
   body: string
   status: 'open' | 'in_progress' | 'blocked' | 'done' | 'review' | 'approved' | 'rejected'

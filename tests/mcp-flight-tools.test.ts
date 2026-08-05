@@ -729,9 +729,17 @@ describe('MCP granted multi-squad flight lifecycle', () => {
         CREATE TABLE channel_capability_grants (
           id TEXT PRIMARY KEY, member_id TEXT NOT NULL, squad_id TEXT NOT NULL, capability TEXT NOT NULL
         );
+        -- NOTE (migrations/0079): priority + parent_task_id added here by hand, because this
+        -- fixture hand-writes tasks instead of applying the committed migration chain.
+        -- That is why this file broke on a purely-additive column: persistTaskUpdate writes
+        -- every column it owns, and this schema is a SUBSET of production's. It is one of the
+        -- 13 hand-written-schema tests tracked in #703, and this is the second time its
+        -- fixture has blocked a feature rather than caught a bug. Fixed properly by #703;
+        -- patched minimally here so a task-management change is not gated on that conversion.
         CREATE TABLE tasks (
           id TEXT PRIMARY KEY, squad_id TEXT NOT NULL, project_id TEXT, title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '',
-          done_when TEXT NOT NULL, status TEXT NOT NULL, assignee_agent_id TEXT, github_issue_url TEXT,
+          done_when TEXT NOT NULL, status TEXT NOT NULL, priority TEXT, parent_task_id TEXT,
+          assignee_agent_id TEXT, github_issue_url TEXT,
           result TEXT, completed_at TEXT, gate_owner TEXT, source_pot TEXT, external_source TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
         );
         CREATE TABLE task_verdicts (
