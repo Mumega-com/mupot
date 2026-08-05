@@ -398,6 +398,19 @@ export interface AuthContext {
   memberId?: string // set when the principal is a network member (MCP/IM), not just a web login
   channel?: ConnectionChannel // how this principal connected
   capabilities?: CapabilityGrant[] // fine-grained, per-scope; the real RBAC
+  /**
+   * What this member ACTUALLY holds, resolved but NOT active as ambient authority.
+   *
+   * Equal to `capabilities` on every channel except `directory`, where the B1 ceiling
+   * zeroes ambient authority so an OAuth seat cannot silently act with an owner's grants.
+   * Latent grants let an EXPLICIT, NAMED, read-only act — today only `connect
+   * { agent_name }` — be authorized against the truth instead of against the zeroed view.
+   *
+   * INVARIANT: never use this to satisfy an ambient capability check. Doing so reinstates
+   * the silent inheritance the ceiling exists to prevent. Any new reader must be an
+   * operation the caller named explicitly and that writes nothing. (#712)
+   */
+  latentCapabilities?: CapabilityGrant[]
   boundAgentId?: string | null // the agent this token is bound to (the weld), or null = pure human/operator
 }
 
