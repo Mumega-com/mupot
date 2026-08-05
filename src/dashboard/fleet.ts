@@ -59,7 +59,19 @@ function sqliteUtcToMs(s: string | null): number | null {
   return Number.isNaN(ms) ? null : ms
 }
 
-/** Compat shim: true when legacy SOS bus secrets are still present (unused by routes). */
+/**
+ * @deprecated SOS PAYLOAD retirement in progress (see docs/sos-payload-retirement-plan.md).
+ * Compat shim: true when legacy SOS bus secrets are still present (unused by routes).
+ *
+ * **Status (2026-08-05):** All active fleet routes use mupot CF-native primitives
+ * (D1 agent_messages + CF Queue). Zero live code calls this function. BUS_URL and BUS_TOKEN
+ * exist only for ops visibility during the transition window. Deletion blocked on sos#193
+ * (deploy path undefined) — cannot retire until all 21 running units in SOS repo are migrated
+ * to mupot and verified with dual-run parity tests.
+ *
+ * **Caller:** This function is exported for tests only; no live routes depend on it.
+ * See docs/sos-payload-retirement-plan.md for inventory, gaps, and blockers.
+ */
 export function busConfigured(env: Env): boolean {
   return Boolean(env.BUS_TOKEN && (env.BUS_URL || DEFAULT_BUS_URL))
 }

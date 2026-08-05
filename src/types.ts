@@ -105,9 +105,12 @@ export interface Env {
   // DEFAULT_POT_HOST_SUFFIX), passed as a planner opt — never read from client
   // request input. Unset ⇒ 'mupot.mumega.com'.
   DEFAULT_POT_HOST_SUFFIX?: string
+  // @deprecated SOS PAYLOAD retirement in progress (see docs/sos-payload-retirement-plan.md).
   // fleet window: SOS bus bridge REST — COMPAT SHIM ONLY (ADR #473).
   // Active fleet routes use D1 agent_messages + presence + Queue; see
   // docs/architecture/sos-coordination-compat.md. Do not add new callers.
+  // Status: Zero active calls. Retained for ops visibility only during migration window.
+  // Deletion blocked on sos#193 (deploy path undefined).
   BUS_URL?: string
   // fleet scoping (Flock #43): which project label this pot's fleet addresses, and
   // which ops agent receives control requests via agent_messages. NO code default —
@@ -130,7 +133,11 @@ export interface Env {
   //                       npx wrangler secret put GOOGLE_CLIENT_SECRET
   GOOGLE_CLIENT_ID?: string
   GOOGLE_CLIENT_SECRET?: string
-  BUS_TOKEN?: string // SOS compat shim only (ADR #473) — unused by active fleet routes
+  // @deprecated SOS compat shim only (ADR #473) — unused by active fleet routes.
+  // Status: Zero active calls. Retained for ops visibility only during migration window.
+  // Deletion blocked on sos#193 (deploy path undefined).
+  // See docs/sos-payload-retirement-plan.md for inventory and retirement plan.
+  BUS_TOKEN?: string
   GITHUB_TOKEN?: string // outbound: tasks↔issues mirror (fine-grained PAT or App install token)
   GITHUB_REPO?: string // "owner/repo" the pot weaves to (e.g. "Digidinc/Digid")
   GITHUB_WEBHOOK_SECRET?: string // inbound: verifies GitHub webhook (x-hub-signature-256)
