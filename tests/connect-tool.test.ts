@@ -36,6 +36,12 @@ interface Opts {
   ambiguousSlug?: boolean
   /** budget_cap_cents on the agent row (default null). Set non-null to prove redaction. */
   agentBudgetCents?: number | null
+  /**
+   * Connection channel on the member_tokens row (default 'workspace'). Set 'directory'
+   * to model the public OAuth door, which carries zero standing capabilities by design
+   * (B1 in src/mcp/oauth-authorize.ts) — see the mupot#678 refusal tests.
+   */
+  channel?: string
 }
 
 function makeEnv(opts: Opts = {}): Env {
@@ -66,7 +72,7 @@ function makeEnv(opts: Opts = {}): Env {
               telegram_chat_id: null,
               status: 'active',
               created_at: '2026-06-13 00:00:00',
-              channel: 'workspace',
+              channel: opts.channel ?? 'workspace',
               bound_agent_id: boundAgentId,
             }
           }
@@ -503,6 +509,43 @@ describe('connect MCP tool (#128 — self-name-to-bind)', () => {
     // isSelf → full packet, budget and field visible
     expect(sc.packet.agent.budget_cap_cents).toBe(5000)
     expect(sc.packet.field_restricted).toBe(false)
+  })
+
+  // mupot#678 — a directory-channel seat can NEVER pass the squad check (B1 sets its
+  // capabilities to [] regardless of what the member holds). The refusal must say THAT,
+  // not "no_squad_access / need: member", which sends the reader to request a grant that
+  // cannot possibly help. The property under test is "the refusal is actionable and does
+  // not misdirect" — asserted on the machine-readable fields, not on prose wording.
+  it('directory channel → 403 names the channel as the cause, not a missing squad grant', async () => {
+    const env = makeEnv({ channel: 'directory', grants: [] })
+    const res = await callConnect(env, AGENT.slug)
+    expect(res.status).toBe(403)
+    const body = (await res.json()) as {
+      error: { message: string; data: { reason: string; need: string; scope: string; detail: string } }
+    }
+    expect(body.error.message).toBe('forbidden')
+    expect(body.error.data.reason).toBe('directory_channel_zero_capability')
+    // Must NOT point at a squad grant — that is the misdirection this fixes.
+    expect(body.error.data.reason).not.toBe('no_squad_access')
+    expect(body.error.data.scope).not.toBe('squad')
+    expect(body.error.data.need).not.toBe('member')
+    // Must carry a usable next action out of the dead end (QA-1 convention above).
+    expect(body.error.data.detail).toMatch(/workspace/i)
+    expect(body.error.data.detail).toMatch(/mint_agent_token/)
+  })
+
+  it('workspace channel with no grants → still the ordinary no_squad_access refusal', async () => {
+    // Negative control: the #678 branch must be scoped to the directory channel ONLY.
+    // Without this, a fix that returned the new reason unconditionally would look identical.
+    const env = makeEnv({ channel: 'workspace', grants: [] })
+    const res = await callConnect(env, AGENT.slug)
+    expect(res.status).toBe(403)
+    const body = (await res.json()) as {
+      error: { message: string; data: { reason: string; need: string; scope: string } }
+    }
+    expect(body.error.data.reason).toBe('no_squad_access')
+    expect(body.error.data.need).toBe('member')
+    expect(body.error.data.scope).toBe('squad')
   })
 
   it('SEC: cross-squad capability claim → 403 (member on squad-B cannot claim agent on squad-A)', async () => {
