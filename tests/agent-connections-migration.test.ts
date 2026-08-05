@@ -5,6 +5,7 @@ import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
 const DIR = join(__dirname, '..', 'migrations')
 const TARGET = '0071_agent_connections.sql'
+const VERIFICATION_TARGET = '0072_agent_connection_verification.sql'
 const NOW = '2026-07-24T00:00:00.000Z'
 const LATER = '2026-07-24T00:15:00.000Z'
 const EXPIRES = '2026-07-25T00:00:00.000Z'
@@ -30,6 +31,10 @@ function applyTarget(sqlite: Sqlite): void {
     sqlite.exec('ROLLBACK')
     throw error
   }
+}
+
+function applyVerificationTarget(sqlite: Sqlite): void {
+  sqlite.exec(readFileSync(join(DIR, VERIFICATION_TARGET), 'utf8'))
 }
 
 function seedOrg(sqlite: Sqlite): void {
@@ -809,6 +814,58 @@ describe('0071 agent connection contract migration', () => {
         expect(requestColumns).not.toContain(forbidden)
         expect(receiptColumns).not.toContain(forbidden)
       }
+    } finally {
+      h.close()
+    }
+  })
+})
+
+describe('0072 agent connection verification contract migration', () => {
+  it('adds bounded monotonic verification attempts without weakening receipt immutability', () => {
+    const h = createBeforeTargetHarness()
+    try {
+      applyTarget(h.sqlite)
+      applyVerificationTarget(h.sqlite)
+      insertRequest(h.sqlite)
+      insertReceipt(h.sqlite)
+
+      const column = h.sqlite.prepare(
+        `SELECT name, "notnull" AS required, dflt_value
+           FROM pragma_table_info('agent_connection_receipts')
+          WHERE name = 'verification_attempts'`,
+      ).get()
+      expect(column).toEqual({
+        name: 'verification_attempts',
+        required: 1,
+        dflt_value: '0',
+      })
+
+      h.sqlite.exec(`
+        UPDATE agent_connection_receipts
+           SET verification_attempts = 4
+         WHERE id = 'receipt-1';
+      `)
+      expect(h.sqlite.prepare(
+        `SELECT verification_attempts
+           FROM agent_connection_receipts
+          WHERE id = 'receipt-1'`,
+      ).get()).toEqual({ verification_attempts: 4 })
+
+      expect(() => h.sqlite.exec(`
+        UPDATE agent_connection_receipts
+           SET verification_attempts = 3
+         WHERE id = 'receipt-1';
+      `)).toThrow(/invalid_verification_attempts/)
+      expect(() => h.sqlite.exec(`
+        UPDATE agent_connection_receipts
+           SET verification_attempts = 6
+         WHERE id = 'receipt-1';
+      `)).toThrow(/invalid_verification_attempts/)
+      expect(() => h.sqlite.exec(`
+        UPDATE agent_connection_receipts
+           SET endpoint = 'https://attacker.example/mcp'
+         WHERE id = 'receipt-1';
+      `)).toThrow(/agent_connection_receipt_immutable/)
     } finally {
       h.close()
     }

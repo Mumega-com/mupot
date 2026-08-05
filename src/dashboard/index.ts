@@ -158,6 +158,7 @@ import {
   updateRoutine,
 } from '../routines/service'
 import { answerRoutineRun, cancelRoutineRun } from '../routines/actions'
+import { loadAgentConnectionStatus } from '../members/agent-connection-status'
 
 // First-run setup wizard (the easy-onboard centerpiece). Mounted under '/setup'
 // on this same dashboard app, so it inherits the auth + tenant guard below.
@@ -261,6 +262,19 @@ dashboardApp.use('*', async (c, next) => {
 dashboardApp.route('/setup', wizardApp)
 
 // ── routes ───────────────────────────────────────────────────────────────────
+
+// Refresh-safe polling for the guided agent-connection flow. Authorization is
+// recalculated on every request and every denial is deliberately a 404.
+dashboardApp.get('/api/agent-connections/:receiptId/status', async (c) => {
+  const result = await loadAgentConnectionStatus(
+    c.env,
+    c.get('auth'),
+    c.req.param('receiptId'),
+  )
+  return result.ok
+    ? c.json(result.value)
+    : c.json({ error: 'not_found' }, 404)
+})
 
 // GET / — Observatory home (#13): swimlane of agents over time, operator queue,
 // recent tasks. First-run onboarding redirect is retained at the top.

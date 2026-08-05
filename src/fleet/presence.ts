@@ -38,6 +38,11 @@ export interface PresenceView extends PresenceRow {
   schedule: ScheduleStatus | null
 }
 
+type PresenceIdentity = Pick<
+  AgentIdentity,
+  'memberId' | 'displayName' | 'email' | 'boundAgentId'
+>
+
 // SQLite datetime('now') → "YYYY-MM-DD HH:MM:SS" (UTC, no tz). Convert to epoch ms.
 export function sqliteUtcToMs(s: string | null): number | null {
   if (!s) return null
@@ -49,7 +54,7 @@ export function sqliteUtcToMs(s: string | null): number | null {
 // sanitized; identity comes from the token, never the body.
 export async function recordCheckin(
   env: Env,
-  id: AgentIdentity,
+  id: PresenceIdentity,
   opts: { source?: unknown; label?: unknown } = {},
 ): Promise<void> {
   const source = normalizeSource(opts.source)

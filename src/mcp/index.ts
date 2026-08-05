@@ -81,6 +81,7 @@ import { sendToRef, readAgentInbox, sendAgentMessage } from '../agents/messages'
 import { recordCheckin, sqliteUtcToMs } from '../fleet/presence'
 import { agentKeyFingerprint, loadActiveAgentKey } from '../fleet/agent-keys'
 import { PROVISION_TOOLS } from './provision'
+import { AGENT_CONNECTION_TOOLS } from './agent-connection'
 import { PROJECT_TOOLS, readAccess, readableProject } from './projects'
 import { hasProjectWriteForSquads, anySquadHasProjectWrite } from '../projects/access'
 import { ADDON_TOOLS } from './addons'
@@ -162,6 +163,36 @@ async function resolveAuth(c: {
         const knownNonDirectory = isChannel(auth.channel)
         auth.capabilities = knownNonDirectory ? await resolveCapabilities(c.env, auth.userId) : []
         if (!knownNonDirectory) auth.boundAgentId = null
+
+        // The internal blob may name a token, but it cannot establish token
+        // identity by assertion. Re-read the exact live, tenant/member-scoped row
+        // before exposing tokenId or its agent weld to verification code.
+        if (typeof auth.tokenId === 'string' && auth.tokenId.length > 0) {
+          const token = await c.env.DB.prepare(
+            `SELECT t.id AS token_id, t.agent_id AS bound_agent_id, m.status AS member_status
+               FROM member_tokens t
+               JOIN members m ON m.id = t.member_id
+              WHERE t.id = ?1
+                AND t.member_id = ?2
+                AND t.tenant = ?3
+                AND m.tenant = ?3
+                AND t.revoked_at IS NULL
+              LIMIT 1`,
+          ).bind(auth.tokenId, auth.userId, c.env.TENANT_SLUG).first<{
+            token_id: string
+            bound_agent_id: string | null
+            member_status: Member['status']
+          }>()
+          if (!token || token.member_status !== 'active') {
+            auth.tokenId = null
+            auth.boundAgentId = null
+          } else {
+            auth.tokenId = token.token_id
+            auth.boundAgentId = knownNonDirectory ? token.bound_agent_id ?? null : null
+          }
+        } else {
+          auth.tokenId = null
+        }
         return auth
       }
     } catch {
@@ -219,7 +250,7 @@ function bearerToken(header: string | undefined): string | null {
 // Resolves identity server-side from the token only. On any failure we 401 with
 // a generic message (never distinguish "no token" from "bad token" to a caller —
 // no oracle). The tenant is forced to env.TENANT_SLUG.
-async function authenticateMember(c: {
+export async function authenticateMember(c: {
   req: { header: (name: string) => string | undefined }
   env: Env
 }): Promise<AuthContext | null> {
@@ -231,7 +262,8 @@ async function authenticateMember(c: {
   // Look up a live (not revoked) token, joined to its member. We re-check the
   // member's status: a suspended member's tokens are inert even if not revoked.
   const row = await c.env.DB.prepare(
-    `SELECT m.id            AS member_id,
+    `SELECT t.id            AS token_id,
+            m.id            AS member_id,
             m.email         AS email,
             m.display_name  AS display_name,
             m.telegram_chat_id AS telegram_chat_id,
@@ -250,6 +282,7 @@ async function authenticateMember(c: {
     .bind(tokenHash, c.env.TENANT_SLUG)
     .first<{
       member_id: string
+      token_id: string
       email: string | null
       display_name: string
       telegram_chat_id: string | null
@@ -275,6 +308,7 @@ async function authenticateMember(c: {
     channel: row.channel ?? 'workspace',
     capabilities,
     boundAgentId: row.bound_agent_id ?? null, // the weld: an agent-scoped token orients ITSELF
+    tokenId: row.token_id,
   }
   return auth
 }
@@ -349,7 +383,7 @@ function memberActor(memberId: string): { kind: 'member'; id: string } {
 // ── tool result shape ─────────────────────────────────────────────────────────
 // A tool returns either a value (→ 200 {ok:true, result}) or a typed error with
 // an HTTP status (→ that status, {ok:false, error}).
-type ToolError = { status: 400 | 403 | 404 | 409 | 500 | 503; error: string; detail?: unknown }
+type ToolError = { status: 400 | 403 | 404 | 409 | 410 | 500 | 503; error: string; detail?: unknown }
 export type ToolOutcome = { ok: true; result: unknown } | { ok: false } & ToolError
 
 export function fail(status: ToolError['status'], error: string, detail?: unknown): ToolOutcome {
@@ -2894,6 +2928,7 @@ export const TOOLS: ToolSpec[] = [
   toolBootContext,
   toolOrient,
   toolConnect,
+  ...AGENT_CONNECTION_TOOLS,
   ...PROJECT_TOOLS,
   ...PROVISION_TOOLS,
   ...ADDON_TOOLS,

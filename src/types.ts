@@ -399,6 +399,7 @@ export interface AuthContext {
   channel?: ConnectionChannel // how this principal connected
   capabilities?: CapabilityGrant[] // fine-grained, per-scope; the real RBAC
   boundAgentId?: string | null // the agent this token is bound to (the weld), or null = pure human/operator
+  tokenId?: string | null // exact live member_tokens row used for this request; server-derived only
 }
 
 // ── Members & capabilities — humans are first-class network nodes ──
