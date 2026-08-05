@@ -114,9 +114,24 @@ async function clearPresence(env: Env, email: string | null): Promise<void> {
   await env.SESSIONS.delete(await presenceKey(email))
 }
 
-/** Resolve the OAuth provider; default google. */
-function provider(env: Env): 'google' | 'telegram' {
-  return env.OAUTH_PROVIDER ?? 'google'
+/**
+ * Resolve which IdP the human web-login door uses; default google.
+ *
+ * Reads IDP_PROVIDER, never OAUTH_PROVIDER. The OAuthProvider wrapper reserves the
+ * latter and injects its own helpers object there, so reading it returned an object
+ * that failed `!== 'google'`, fell into the unsupported_provider branch, and then threw
+ * `Converting circular structure to JSON` while serialising the helpers into the error
+ * body — a 500 on every /auth/login, for as long as the wrapper has been mounted.
+ *
+ * Returns the configured value verbatim (defaulting to google) rather than narrowing it
+ * to a known provider. Both callers gate on `!== 'google'`, so mapping an unrecognised
+ * value onto 'google' would turn a config typo into a silently-enabled Google login —
+ * a fail-open introduced while fixing a crash. An unknown value must still reach the
+ * unsupported_provider branch. The `String()` is what keeps that branch safe to render.
+ */
+function provider(env: Env): string {
+  const configured = env.IDP_PROVIDER
+  return typeof configured === 'string' && configured !== '' ? configured : 'google'
 }
 
 /** Absolute redirect URI back to /auth/callback for this request's origin. */

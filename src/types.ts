@@ -70,7 +70,24 @@ export interface Env {
   // operator's own PostHog project and emit it under its own tenant's observations.
   OWNER_TENANT_SLUG?: string
   BRAND: string
-  OAUTH_PROVIDER: 'google' | 'telegram'
+  // Which IdP the human web-login door uses. NAMED `IDP_PROVIDER`, NOT `OAUTH_PROVIDER` —
+  // @cloudflare/workers-oauth-provider RESERVES the binding name `OAUTH_PROVIDER` and
+  // injects its own OAuthHelpersImpl instance there at runtime. Declaring that name as a
+  // string here was a lie the type system could not catch, because the two places that
+  // read it disagreed and one of them cast through `unknown`:
+  //   src/auth/index.ts    read it as a string  -> got an object -> 500 on /auth/login
+  //   src/mcp/oauth-authorize.ts  cast it to the helpers object  -> correct
+  // wrangler.toml already carried the rename (`IDP_PROVIDER = "google"`, with the reason
+  // in a comment); no code had followed it. See the note on OAUTH_PROVIDER below.
+  // Typed `string`, NOT 'google' | 'telegram'. A [vars] entry is arbitrary operator-supplied
+  // text; declaring it pre-narrowed asserts a validation that nothing performs, and reading
+  // a binding as a type it does not have at runtime is precisely what produced this bug.
+  // Callers narrow it themselves and must keep an unrecognised value refusable.
+  IDP_PROVIDER?: string
+  // NOT configuration. Injected by the OAuthProvider wrapper (src/index.ts) and typed as
+  // unknown on purpose: anything that wants the helpers must cast deliberately and say so,
+  // and nothing can accidentally read it as a settable string again.
+  OAUTH_PROVIDER?: unknown
   // Immutable git commit for the deployed build, supplied by the release deploy.
   RELEASE_SHA?: string
   // The pot's canonical public origin (e.g. https://agents.digid.ca). When set, the
