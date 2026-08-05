@@ -1,6 +1,7 @@
 // tests/resolve-agent-slug-active-only.test.ts — mupot#702.
 //
-// A slug resolves only against ACTIVE agents; an id resolves against any agent.
+// A slug resolves only against NON-TOMBSTONE agents (active or paused); an id resolves
+// against any agent, including inactive ones.
 //
 // The bug: agents.slug is UNIQUE(squad_id, slug) and a deactivated row keeps its slug
 // forever, so every deactivation left a permanent land-mine. The dead row did nothing but
@@ -44,7 +45,7 @@ function squad(id: string): void {
   )
 }
 
-function agent(id: string, slug: string, squadId: string, status: 'active' | 'inactive'): void {
+function agent(id: string, slug: string, squadId: string, status: 'active' | 'paused' | 'inactive'): void {
   squad(squadId)
   harness.sqlite.exec(
     `INSERT INTO agents (id, squad_id, slug, name, status)
@@ -110,6 +111,32 @@ describe('resolveAgentRef — a tombstone must not shadow a live agent (mupot#70
 
     expect(resolved.ok).toBe(true)
     expect(resolved.ok && resolved.value.id).toBe('ea2b0370')
+  })
+
+  it('a PAUSED agent is still slug-addressable — paused is not a tombstone', async () => {
+    // agents.status is CHECK IN ('active','paused','inactive'). `paused` is a live agent
+    // that is temporarily stopped; you address it by slug precisely to resume, inspect or
+    // reassign it. An `= 'active'` predicate would have made every paused agent
+    // unaddressable — trading one silent breakage for another. Found by the diverse gate.
+    agent('paused-1', 'napping', 'squad-nap', 'paused')
+    agent('dead-1', 'napping', 'squad-dead', 'inactive')
+
+    const resolved = await resolveAgentRef(env, 'napping')
+
+    expect(resolved.ok).toBe(true)
+    expect(resolved.ok && resolved.value.id).toBe('paused-1')
+  })
+
+  it('paused + active sharing a slug is a REAL collision and stays ambiguous', async () => {
+    // Both rows are live. Excluding tombstones must not collapse a genuine collision into
+    // an arbitrary pick — that is the self-poisoning defect this resolver exists to stop.
+    agent('act-1', 'both', 'squad-1', 'active')
+    agent('pau-1', 'both', 'squad-2', 'paused')
+
+    const resolved = await resolveAgentRef(env, 'both')
+
+    expect(resolved.ok).toBe(false)
+    expect(!resolved.ok && resolved.reason).toBe('ambiguous')
   })
 
   it('a single active agent still resolves by slug (no regression)', async () => {

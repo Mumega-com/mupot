@@ -54,8 +54,8 @@ export function resolveSquadRef(
 }
 
 /**
- * Resolve an agent ref. A SLUG resolves only against ACTIVE agents; an ID resolves
- * against any agent.
+ * Resolve an agent ref. A SLUG resolves only against NON-TOMBSTONE agents (active or
+ * paused); an ID resolves against any agent, including inactive ones.
  *
  * WHY THE STATUS FILTER (mupot#702, reported by hadi-claude and cyrus)
  *
@@ -77,11 +77,29 @@ export function resolveSquadRef(
  * deletions that would also have destroyed the engrams those rows own (see #705: recall
  * filters by agentId, so an agent row is a memory partition, not just a directory entry).
  *
- * FAIL-CLOSED PROPERTIES PRESERVED. This narrows what a slug can match; it never widens
- * it. A slug matching two ACTIVE agents is still refused as ambiguous — the self-poisoning
- * defect this resolver exists to prevent is untouched. `cursor`, whose rows are both
- * inactive, now resolves to not_found instead of ambiguous: both are refusals, and
- * "not_found" is the truthful one for an agent nobody has activated.
+ * WHY `!= 'inactive'` AND NOT `= 'active'`
+ *
+ * agents.status is CHECK (status IN ('active','paused','inactive')) — THREE states, not
+ * two. `paused` is a live agent that is temporarily stopped; you address it by slug
+ * precisely in order to resume, inspect or reassign it. Matching only 'active' would have
+ * made every paused agent slug-unaddressable — trading one silent breakage for another.
+ * Only 'inactive' is a tombstone, so only 'inactive' is excluded. (Athena, gate on #707.
+ * The first version read `= 'active'` because I reasoned "the live one" instead of reading
+ * the enum — the same infer-the-schema habit that #684 cost us.)
+ *
+ * WHAT THIS DOES AND DOES NOT NARROW — stated precisely, because the loose version of this
+ * sentence was itself a gate finding. The CANDIDATE set narrows: tombstones no longer
+ * count. The SUCCESS set therefore WIDENS for exactly one shape — a slug matching one live
+ * row plus one or more tombstones now RESOLVES where it previously refused as ambiguous.
+ * That is the entire point of the change, and it must be read as an intended widening
+ * rather than hidden behind "never widens".
+ *
+ * The fail-closed property that is genuinely preserved is narrower and worth naming on its
+ * own: a slug matching TWO OR MORE NON-TOMBSTONE agents is still refused as ambiguous. The
+ * self-poisoning defect this resolver exists to prevent — an arbitrary insertion-ordered
+ * row driving a capability gate and credential binding — is untouched. `cursor`, whose
+ * rows are both inactive, now resolves to not_found instead of ambiguous: both are
+ * refusals, and "not_found" is the truthful one for an agent nobody has activated.
  *
  * The id path is deliberately unfiltered, so a deactivated agent stays addressable by id
  * for inspection, reactivation, or engram merge.
@@ -95,6 +113,6 @@ export function resolveAgentRef(
     'id, squad_id, slug, name',
     'agents',
     ref,
-    ` AND status = 'active'`,
+    ` AND status != 'inactive'`,
   )
 }
