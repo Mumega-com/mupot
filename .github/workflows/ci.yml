@@ -132,7 +132,13 @@ jobs:
   test-schema-source:
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth: 0 is REQUIRED — the ratchet compares the baseline against the merge
+      # target, and a shallow clone cannot read it. The check FAILS rather than passes when
+      # the target is unreadable, so a missing fetch-depth surfaces as a red build instead
+      # of a silently-disengaged guard.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: 22

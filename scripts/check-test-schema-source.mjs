@@ -49,6 +49,7 @@
 // append to is an exemption, and exemptions are how #684 happened.
 
 import { readFileSync, readdirSync, statSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
 import { join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -59,22 +60,71 @@ const BASELINE_PATH = join(ROOT, 'scripts', 'test-schema-source-baseline.json')
 /** Files that build a schema by hand and still import production code. Only ever shrinks. */
 const baseline = new Set(JSON.parse(readFileSync(BASELINE_PATH, 'utf8')).files)
 
+/**
+ * MECHANICAL NON-GROWTH PIN.
+ *
+ * The first version claimed "the baseline may only shrink" and did not enforce it: adding a
+ * new violator AND appending it to the baseline exited 0. The ratchet was a promise in a
+ * comment — a named property that was false, which is the entire class this guard exists
+ * to stop. (Athena, gate on #711.)
+ *
+ * Enforced by comparing against the baseline on the MERGE TARGET, not against a number
+ * committed next to the list it is supposed to constrain. A PR cannot grow the list,
+ * because the thing it is measured against is not in the PR.
+ *
+ * Returns null when the target ref is unavailable (a shallow clone, a detached build, a
+ * fresh worktree). That is a real limitation and it FAILS LOUD rather than passing quietly
+ * — see the exit logic. A ratchet that silently disengages when it cannot read git is the
+ * same defect one level down.
+ */
+function baselineSizeOnTarget() {
+  const ref = process.env.BASE_REF ? `origin/${process.env.BASE_REF}` : 'origin/main'
+
+  // Distinguish THREE cases, because collapsing them is how a ratchet quietly disengages:
+  //   git unreadable           -> cannot verify -> FAIL (shallow clone, missing base ref)
+  //   ref readable, no file    -> bootstrap     -> allow, and say so
+  //   ref readable, file there -> compare
+  try {
+    execFileSync('git', ['rev-parse', '--verify', `${ref}^{commit}`], {
+      cwd: ROOT, stdio: 'ignore',
+    })
+  } catch {
+    return { state: 'unreadable' }
+  }
+
+  try {
+    const raw = execFileSync('git', ['show', `${ref}:scripts/test-schema-source-baseline.json`], {
+      cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+    })
+    return { state: 'compared', size: JSON.parse(raw).files.length }
+  } catch {
+    return { state: 'bootstrap' }
+  }
+}
+
 function walk(dir) {
   const out = []
   for (const entry of readdirSync(dir)) {
     const full = join(dir, entry)
     if (statSync(full).isDirectory()) out.push(...walk(full))
-    else if (entry.endsWith('.ts')) out.push(full)
+    // .mjs/.js too: the first version walked only .ts, so a violator written as .mjs was
+    // invisible to the scanner entirely.
+    else if (/\.(ts|tsx|mjs|cjs|js)$/.test(entry)) out.push(full)
   }
   return out
 }
 
 // Imports anything under src/ — i.e. exercises production code, as opposed to testing a
 // migration file's own behaviour (which legitimately builds a historical schema).
-const IMPORTS_PRODUCTION = /from '(\.\.\/)+src\//
+// Quote-agnostic and covers dynamic import(): the first version matched single quotes after
+// `from ` only, so `from "../src/x"` and `await import('../src/x')` both slipped past.
+const IMPORTS_PRODUCTION = /(?:from|import\s*\()\s*['"`](?:\.\.\/)+src\//
 // Builds a schema by hand: names individual migration files, or writes DDL inline.
-const PINS_MIGRATIONS = /migrations\/\d{4}_[a-z0-9_]+\.sql/
-const HAND_WRITTEN_DDL = /CREATE\s+TABLE/i
+// Whitespace-tolerant so `CREATE\n TABLE` and `migrations /0001_x.sql` still match. String
+// CONCATENATION ('CREA' + 'TE TABLE') defeats any regex and is NOT claimed to be caught —
+// see the honesty note at the bottom of this file.
+const PINS_MIGRATIONS = /migrations\s*\/\s*\d{4}_[a-z0-9_]+\.sql/
+const HAND_WRITTEN_DDL = /CREATE\s+(?:TEMP\s+|TEMPORARY\s+)?TABLE/i
 // The sanctioned path.
 const USES_HELPER = /applyAllMigrations\s*\(/
 
@@ -110,9 +160,30 @@ for (const file of walk(TESTS_DIR)) {
 const staleBaseline = [...baseline].filter((rel) => !violating.has(rel)).sort()
 
 const remaining = baseline.size - staleBaseline.length
-console.log(`test-schema-source: ${remaining} file(s) still building schema by hand (baseline ${baseline.size}).`)
+const target = baselineSizeOnTarget()
+const targetNote =
+  target.state === 'compared' ? `, target ${target.size}`
+  : target.state === 'bootstrap' ? ', target none (bootstrap)'
+  : ''
+console.log(
+  `test-schema-source: ${remaining} file(s) still building schema by hand ` +
+  `(baseline ${baseline.size}${targetNote}).`,
+)
 
 let failed = false
+
+if (target.state === 'unreadable') {
+  failed = true
+  console.error('\nCANNOT VERIFY THE RATCHET — the merge target is unreadable.')
+  console.error('Fetch the base ref (CI: actions/checkout with fetch-depth: 0) and re-run.')
+  console.error('Failing rather than passing: a ratchet that disengages when it cannot read')
+  console.error('git is exactly the silent-exemption defect it exists to prevent.\n')
+} else if (target.state === 'compared' && baseline.size > target.size) {
+  failed = true
+  console.error(`\nBASELINE GREW: ${target.size} -> ${baseline.size}. It may only shrink.`)
+  console.error('Appending a file here is not a fix. Convert the test to applyAllMigrations()')
+  console.error('and remove its entry instead.\n')
+}
 
 if (offenders.length > 0) {
   failed = true
@@ -132,5 +203,20 @@ if (staleBaseline.length > 0) {
   for (const f of staleBaseline) console.error(`  ${f}`)
   console.error('\nLeaving a fixed file in the baseline turns a ratchet into an exemption.\n')
 }
+
+// WHAT THIS DOES NOT CATCH — stated rather than implied.
+//
+// The scanner is regex over source. String concatenation defeats it: 'CREA' + 'TE TABLE',
+// or a migration path assembled at runtime, will pass. That is not fixable with a regex,
+// and pretending otherwise would make this exactly the kind of confidently-wrong guard it
+// exists to replace.
+//
+// It is not the load-bearing part. The scanner catches ACCIDENTAL drift — the way all 27
+// current entries arrived, and the way four more surfaces silently diverged in #713. The
+// RATCHET is what makes deliberate growth impossible, and it does not depend on regex at
+// all: it compares the committed list against the list on the merge target, so the number
+// cannot go up no matter how a violator is written.
+//
+// A determined author can still evade the scanner. They cannot evade the count.
 
 process.exit(failed ? 1 : 0)
