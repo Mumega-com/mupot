@@ -49,6 +49,23 @@ describe('every task read uses the SHARED projection', () => {
     expect(offenders, `inline task projections found in: ${offenders.join(', ')}`).toEqual([])
   })
 
+  it('NOTHING re-declares the shared constant — a shadow defeats the guard silently', () => {
+    // Athena's BLOCK on #715. The first version of this suite forbade INLINE projections
+    // only, so src/mcp/index.ts kept its OWN `const TASK_SELECT_COLUMNS = ...` — same name,
+    // separate value, shadowing the import. Every assertion above passed while the fork was
+    // live: no inline SELECT, so no offender, so green. A duplicate binding is the same
+    // divergence as an inline list, wearing the shared name.
+    const offenders = walk(SRC)
+      .filter((f) => !f.endsWith(join('tasks', 'ranking.ts')))
+      .filter((f) => /^\s*(?:export\s+)?const\s+TASK_SELECT_COLUMNS\s*=/m.test(readFileSync(f, 'utf8')))
+      .map((f) => f.slice(SRC.length + 1))
+
+    expect(
+      offenders,
+      `TASK_SELECT_COLUMNS is re-declared in: ${offenders.join(', ')} — import it from tasks/ranking instead`,
+    ).toEqual([])
+  })
+
   it('the shared projection actually carries the ranking columns', () => {
     // Guards the trivial-pass: an empty or truncated constant would satisfy the test above
     // while carrying nothing.
