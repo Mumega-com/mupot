@@ -1,4 +1,3 @@
-import { readFileSync } from 'node:fs'
 import type { D1PreparedStatement, D1Result } from '@cloudflare/workers-types'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
@@ -19,16 +18,8 @@ import { resolveConnectorByIdWithMeta } from '../src/connectors/service'
 import type { AddonManifestV1 } from '../src/addons/contract'
 import type { Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 
-const migrations = [
-  '../migrations/0001_init.sql',
-  '../migrations/0003_settings.sql',
-  '../migrations/0014_loops.sql',
-  '../migrations/0023_connectors.sql',
-  '../migrations/0029_department_microkernel.sql',
-  '../migrations/0050_addons.sql',
-  '../migrations/0052_addon_bindings.sql',
-].map((path) => readFileSync(new URL(path, import.meta.url), 'utf8'))
 
 const owner = { id: 'owner-1', role: 'owner' } as const
 const firstPartyBinding = {
@@ -120,7 +111,7 @@ describe('addon connector bindings', () => {
 
   beforeEach(() => {
     harness = createSqliteD1()
-    for (const migration of migrations) harness.sqlite.exec(migration)
+    applyAllMigrations(harness.sqlite)
     harness.sqlite.prepare(`
       INSERT INTO org_settings (key, value) VALUES ('billing_state', ?)
     `).run(JSON.stringify({ tier: 'scale', event_id: 'binding-tests', effective_at: '2026-07-16T00:00:00.000Z' }))

@@ -1,4 +1,3 @@
-import { readFileSync } from 'node:fs'
 import type { D1PreparedStatement, D1Result } from '@cloudflare/workers-types'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Env } from '../src/types'
@@ -24,15 +23,8 @@ import {
 } from '../src/addons/service'
 import { listAddonBindings } from '../src/addons/bindings'
 import { createSqliteD1 } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 
-const migrations = [
-  '../migrations/0001_init.sql',
-  '../migrations/0003_settings.sql',
-  '../migrations/0023_connectors.sql',
-  '../migrations/0029_department_microkernel.sql',
-  '../migrations/0050_addons.sql',
-  '../migrations/0052_addon_bindings.sql',
-].map((path) => readFileSync(new URL(path, import.meta.url), 'utf8'))
 const owner = { id: 'owner-1', role: 'owner' } as const
 const admin = { id: 'admin-1', role: 'admin' } as const
 const immutableInstallationUpdates = [
@@ -103,7 +95,7 @@ interface OperationFailureRow {
 
 function makeDb(tenant = 'tenant-a') {
   const harness = createSqliteD1()
-  for (const migration of migrations) harness.sqlite.exec(migration)
+  applyAllMigrations(harness.sqlite)
 
   return {
     harness,

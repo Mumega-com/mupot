@@ -1,4 +1,3 @@
-import { readFileSync } from 'node:fs'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   prepareMarketingRecommendation,
@@ -25,39 +24,8 @@ import {
 import type { Env } from '../src/types'
 import { createMarketingMonitorFixtureSource } from './fixtures/marketing-monitor'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 
-const migrations = [
-  '../migrations/0001_init.sql',
-  '../migrations/0002_members.sql',
-  '../migrations/0003_settings.sql',
-  '../migrations/0004_channels.sql',
-  '../migrations/0005_channel_capability_grants.sql',
-  '../migrations/0006_task_results.sql',
-  '../migrations/0007_gates.sql',
-  '../migrations/0008_gate_grants.sql',
-  '../migrations/0009_work_unit.sql',
-  '../migrations/0010_execution_meter.sql',
-  '../migrations/0011_meter_cost.sql',
-  '../migrations/0012_workflow_pipeline.sql',
-  '../migrations/0013_outbound_acts.sql',
-  '../migrations/0014_loops.sql',
-  '../migrations/0016_presence.sql',
-  '../migrations/0017_flights.sql',
-  '../migrations/0019_agent_token_binding.sql',
-  '../migrations/0023_connectors.sql',
-  '../migrations/0026_task_done_when.sql',
-  '../migrations/0028_metric_points.sql',
-  '../migrations/0029_department_microkernel.sql',
-  '../migrations/0040_members_tenant.sql',
-  '../migrations/0042_task_status_gate_values.sql',
-  '../migrations/0043_member_tokens_tenant.sql',
-  '../migrations/0050_addons.sql',
-  '../migrations/0052_addon_bindings.sql',
-  '../migrations/0053_marketing_monitor_runs.sql',
-  '../migrations/0054_marketing_recommendations.sql',
-  '../migrations/0055_projects.sql',
-  '../migrations/0064_marketing_recommendation_channel_kinds.sql',
-].map((path) => readFileSync(new URL(path, import.meta.url), 'utf8'))
 
 const owner = { id: 'owner-1', role: 'owner' as const }
 const window = {
@@ -118,7 +86,7 @@ describe('marketing monitor opportunities', () => {
 
   beforeEach(() => {
     harness = createSqliteD1()
-    for (const migration of migrations) harness.sqlite.exec(migration)
+    applyAllMigrations(harness.sqlite)
     harness.sqlite.prepare(`
       INSERT INTO org_settings (key, value) VALUES ('billing_state', ?)
     `).run(JSON.stringify({

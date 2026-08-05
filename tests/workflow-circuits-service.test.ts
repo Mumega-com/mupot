@@ -13,7 +13,6 @@
 // case so a reader can see it actually discriminates (not a test that can
 // only ever pass).
 
-import { readFileSync } from 'node:fs'
 import { beforeEach, describe, expect, it } from 'vitest'
 import type { Env } from '../src/types'
 import { activateAddon, configureAddon, installAddon } from '../src/addons/service'
@@ -26,21 +25,15 @@ import {
   type WorkflowCircuitActor,
 } from '../src/addons/workflow-circuits/service'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 
-const migrations = [
-  '../migrations/0001_init.sql',
-  '../migrations/0023_connectors.sql',
-  '../migrations/0050_addons.sql',
-  '../migrations/0052_addon_bindings.sql',
-  '../migrations/0075_workflow_circuits.sql',
-].map((path) => readFileSync(new URL(path, import.meta.url), 'utf8'))
 
 const TENANT = 'tenant-a'
 const ADMIN: WorkflowCircuitActor = { id: 'owner-1', role: 'owner' }
 const AGENT: WorkflowCircuitActor = { id: 'agent-1', role: 'member' }
 
 function makeEnv(harness: SqliteD1Harness): Env {
-  for (const migration of migrations) harness.sqlite.exec(migration)
+  applyAllMigrations(harness.sqlite)
   return { DB: harness.db, TENANT_SLUG: TENANT } as Env
 }
 

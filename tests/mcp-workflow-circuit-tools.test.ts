@@ -4,27 +4,20 @@
 // src/mcp/index.ts), with the same capability-floor + identity-attribution
 // guarantees every other tool gets — not just callable as bare functions.
 
-import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import type { AuthContext, CapabilityGrant, Env } from '../src/types'
 import { TOOLS, invokeTool } from '../src/mcp/index'
 import { activateAddon, configureAddon, installAddon } from '../src/addons/service'
 import { createSqliteD1 } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 
-const migrations = [
-  '../migrations/0001_init.sql',
-  '../migrations/0023_connectors.sql',
-  '../migrations/0050_addons.sql',
-  '../migrations/0052_addon_bindings.sql',
-  '../migrations/0075_workflow_circuits.sql',
-].map((path) => readFileSync(new URL(path, import.meta.url), 'utf8'))
 
 const TENANT = 'tenant-a'
 const ORIGIN = 'https://pot.test'
 
 async function makeEnv(): Promise<Env> {
   const harness = createSqliteD1()
-  for (const migration of migrations) harness.sqlite.exec(migration)
+  applyAllMigrations(harness.sqlite)
   const env = { DB: harness.db, TENANT_SLUG: TENANT } as Env
   const actor = { id: 'owner-1', role: 'owner' as const }
   const installed = await installAddon(env, actor, 'workflow-circuits')

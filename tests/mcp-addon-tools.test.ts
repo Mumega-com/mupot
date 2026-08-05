@@ -23,22 +23,13 @@
 //      fixture-addon-with-loop (src/addons/modules/fixture-with-loop.ts) so the assertion
 //      also proves an addon-declared loop claim is never duplicated (PR #439 pattern).
 
-import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import type { AuthContext, CapabilityGrant, Env } from '../src/types'
 import { TOOLS, invokeTool } from '../src/mcp/index'
 import { createSqliteD1 } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 import '../src/addons/modules/fixture-with-loop'
 
-const migrations = [
-  '../migrations/0001_init.sql',
-  '../migrations/0003_settings.sql',
-  '../migrations/0014_loops.sql',
-  '../migrations/0023_connectors.sql',
-  '../migrations/0029_department_microkernel.sql',
-  '../migrations/0050_addons.sql',
-  '../migrations/0052_addon_bindings.sql',
-].map((path) => readFileSync(new URL(path, import.meta.url), 'utf8'))
 
 const TENANT = 'tenant-a'
 const ADDON_KEY = 'fixture-addon-with-loop'
@@ -46,7 +37,7 @@ const ORIGIN = 'https://pot.test'
 
 function makeDb() {
   const harness = createSqliteD1()
-  for (const migration of migrations) harness.sqlite.exec(migration)
+  applyAllMigrations(harness.sqlite)
   return {
     env: { DB: harness.db, TENANT_SLUG: TENANT } as Env,
     installation: () => harness.sqlite.prepare(

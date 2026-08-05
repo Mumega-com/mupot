@@ -1,16 +1,12 @@
 // tests/mcp-loop-tools.test.ts — loop_list / loop_set_status MCP (paused→active promote).
 
-import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import type { AuthContext, CapabilityGrant, Env } from '../src/types'
 import { TOOLS, invokeTool } from '../src/mcp/index'
 import { insertLoopIfAbsent } from '../src/loops/service'
 import { createSqliteD1 } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 
-const migrations = [
-  '../migrations/0001_init.sql',
-  '../migrations/0014_loops.sql',
-].map((path) => readFileSync(new URL(path, import.meta.url), 'utf8'))
 
 const TENANT = 'tenant-a'
 const ORIGIN = 'https://pot.test'
@@ -30,7 +26,7 @@ const VALID_SPEC = {
 
 function makeDb() {
   const harness = createSqliteD1()
-  for (const migration of migrations) harness.sqlite.exec(migration)
+  applyAllMigrations(harness.sqlite)
   return {
     env: { DB: harness.db, TENANT_SLUG: TENANT } as Env,
     row: (id: string) => harness.sqlite.prepare('SELECT * FROM loops WHERE id = ?').get(id) as Record<string, unknown> | undefined,

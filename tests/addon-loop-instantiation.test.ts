@@ -18,7 +18,6 @@
 // barrel) so its registration stays local to this test file's module graph and never
 // pollutes addon-catalog-enumeration tests in other files (vitest isolates per file).
 
-import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import type { Env } from '../src/types'
 import {
@@ -33,6 +32,7 @@ import { registerAddon, type AddonManifestV1 } from '../src/addons/registry'
 import { FixtureModule } from '../src/departments/modules/fixture'
 import { validateLoopSpec } from '../src/loops/manifest'
 import { createSqliteD1 } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 import '../src/addons/modules/fixture-with-loop'
 
 const UNREGISTERED_TEMPLATE_ADDON: AddonManifestV1 = {
@@ -60,15 +60,6 @@ const UNREGISTERED_TEMPLATE_ADDON: AddonManifestV1 = {
 }
 await registerAddon(UNREGISTERED_TEMPLATE_ADDON)
 
-const migrations = [
-  '../migrations/0001_init.sql',
-  '../migrations/0003_settings.sql',
-  '../migrations/0014_loops.sql',
-  '../migrations/0023_connectors.sql',
-  '../migrations/0029_department_microkernel.sql',
-  '../migrations/0050_addons.sql',
-  '../migrations/0052_addon_bindings.sql',
-].map((path) => readFileSync(new URL(path, import.meta.url), 'utf8'))
 
 const owner = { id: 'owner-1', role: 'owner' } as const
 const ADDON_KEY = 'fixture-addon-with-loop'
@@ -101,7 +92,7 @@ interface OwnershipRow {
 
 function makeDb(tenant = 'tenant-a') {
   const harness = createSqliteD1()
-  for (const migration of migrations) harness.sqlite.exec(migration)
+  applyAllMigrations(harness.sqlite)
   return {
     env: { DB: harness.db, TENANT_SLUG: tenant } as Env,
     loops: () => harness.sqlite.prepare('SELECT * FROM loops ORDER BY created_at, id').all() as LoopRow[],

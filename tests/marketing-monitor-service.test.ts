@@ -1,5 +1,4 @@
 import { execFile } from 'node:child_process'
-import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import type { D1Database, D1PreparedStatement } from '@cloudflare/workers-types'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -15,25 +14,8 @@ import { archiveAddon } from '../src/addons/service'
 import type { Env } from '../src/types'
 import { createMarketingMonitorFixtureSource } from './fixtures/marketing-monitor'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 
-const migrations = [
-  '../migrations/0001_init.sql',
-  '../migrations/0002_members.sql',
-  '../migrations/0003_settings.sql',
-  '../migrations/0004_channels.sql',
-  '../migrations/0005_channel_capability_grants.sql',
-  '../migrations/0014_loops.sql',
-  '../migrations/0016_presence.sql',
-  '../migrations/0019_agent_token_binding.sql',
-  '../migrations/0023_connectors.sql',
-  '../migrations/0028_metric_points.sql',
-  '../migrations/0029_department_microkernel.sql',
-  '../migrations/0040_members_tenant.sql',
-  '../migrations/0043_member_tokens_tenant.sql',
-  '../migrations/0050_addons.sql',
-  '../migrations/0052_addon_bindings.sql',
-  '../migrations/0053_marketing_monitor_runs.sql',
-].map((path) => readFileSync(new URL(path, import.meta.url), 'utf8'))
 
 const owner = { id: 'owner-1', role: 'owner' as const }
 const member = { id: 'member-1', role: 'member' as const }
@@ -269,7 +251,7 @@ describe('marketing monitor service', () => {
 
   beforeEach(() => {
     harness = createSqliteD1()
-    for (const migration of migrations) harness.sqlite.exec(migration)
+    applyAllMigrations(harness.sqlite)
     harness.sqlite.prepare(`
       INSERT INTO org_settings (key, value) VALUES ('billing_state', ?)
     `).run(JSON.stringify({ tier: 'scale', event_id: 'monitor-tests', effective_at: '2026-07-16T00:00:00.000Z' }))
