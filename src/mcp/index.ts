@@ -2656,12 +2656,18 @@ const toolConnect: ToolSpec = {
     const orgAdmin = hasCapability(grants, 'org', null, 'admin')
     const onSquad = await memberCanOnSquad(env, grants, agentRef.squad_id, 'member')
     if (!orgAdmin && !onSquad) {
+      const isDirectoryChannel = auth.channel === 'directory'
       return fail(403, 'forbidden', {
-        reason: 'no_squad_access',
-        detail: [
-          `Your token does not have member-or-higher capability on the squad for agent "${agentRef.slug}".`,
-          'Ask an org-admin to grant you squad membership, or verify you are using the right token.',
-        ].join(' '),
+        reason: isDirectoryChannel ? 'directory_channel_zero_capability' : 'no_squad_access',
+        detail: isDirectoryChannel
+          ? [
+              'The directory/OAuth door is a public registration surface with zero capabilities by design.',
+              `Use a workspace member-API-key (mupot_ token with channel='workspace') to access agent "${agentRef.slug}".`,
+            ].join(' ')
+          : [
+              `Your token does not have member-or-higher capability on the squad for agent "${agentRef.slug}".`,
+              'Ask an org-admin to grant you squad membership, or verify you are using the right token.',
+            ].join(' '),
         need: 'member',
         scope: 'squad',
       })
