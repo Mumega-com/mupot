@@ -30,6 +30,7 @@ import {
   mintAgentBoundToken,
   isAgentTokenCapability,
   resolveAgentMemberBinding,
+  revokeMemberToken,
 } from '../members/service'
 import { setAgentSquadAccess, type AgentAccessCapability } from '../members/agent-access'
 import {
@@ -475,6 +476,145 @@ const toolMintAgentToken: ToolSpec = {
   },
 }
 
+// ── token lifecycle: list + revoke ────────────────────────────────────────────
+//
+// mupot#682. mint_agent_token existed with NO counterpart: the pot could ISSUE a
+// credential through its own surface but not SEE or WITHDRAW one. Cleaning up four
+// tokens I had minted on 2026-08-05 required dropping to raw D1 — i.e. the product
+// could not operate its own credential lifecycle, which is the exact failure the
+// standing goal names ("an agent can join, work, and be trusted on mupot without a
+// human debugging it").
+//
+// Revoke is gated identically to mint (admin on the agent's squad, operator principal
+// only). Withdrawing a credential must never be HARDER than issuing one, or the safe
+// action becomes the inconvenient one and people leave credentials live.
+
+const toolListAgentTokens: ToolSpec = {
+  name: 'list_agent_tokens',
+  scope: "agent's squad",
+  min: 'admin',
+  args: '{ agent: string (id|slug), include_revoked?: boolean }',
+  inputSchema: {
+    type: 'object',
+    properties: { agent: STRING_SCHEMA, include_revoked: { type: 'boolean' } },
+    required: ['agent'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args, _ctx) {
+    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
+    const agentRef = str(args.agent)
+    if (!agentRef) return fail(400, 'invalid_args', 'agent required')
+
+    const agentResult = await resolveAgentRef(env, agentRef)
+    if (!agentResult.ok) return resolveFail(agentResult.reason, 'agent_not_found')
+    const agent = agentResult.value
+
+    const grants = auth.capabilities ?? []
+    if (!(await memberCanOnSquad(env, grants, agent.squad_id, 'admin'))) {
+      return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
+    }
+
+    const includeRevoked = args.include_revoked === true
+    // NEVER select token_hash. There is no path from this tool to a usable secret —
+    // raw is show-once at mint and is not stored.
+    const rows = await env.DB.prepare(
+      // NOTE: member_tokens has NO `capability` column — a token's capability lives in
+      // `capabilities`, keyed by the token's member. Selecting it here shipped a live
+      // internal_error (mupot#684): the unit mock returned canned rows and never ran the
+      // SQL, so 12 tests passed against a query D1 rejects. Real-schema test below.
+      `SELECT id, member_id, label, channel, created_at, revoked_at
+         FROM member_tokens
+        WHERE agent_id = ?1 AND tenant = ?2
+          ${includeRevoked ? '' : 'AND revoked_at IS NULL'}
+        ORDER BY created_at ASC`,
+    )
+      .bind(agent.id, env.TENANT_SLUG)
+      .all<{ id: string; member_id: string; label: string; channel: string; created_at: string; revoked_at: string | null }>()
+
+    // Project EXPLICITLY in code, not only in the SQL above. Relying on the SELECT list
+    // means a later "SELECT *" — or a helper that widens the query — silently leaks
+    // token_hash through this tool, and no test that asserts on happy-path fields would
+    // notice. The allow-list here is the actual guarantee; the SQL projection is an
+    // optimisation on top of it.
+    const tokens = (rows.results ?? []).map((t) => ({
+      id: t.id,
+      member_id: t.member_id,
+      label: t.label,
+      channel: t.channel,
+      created_at: t.created_at,
+      revoked_at: t.revoked_at,
+    }))
+    return done({
+      agent: { id: agent.id, slug: agent.slug, name: agent.name },
+      tokens,
+      live_count: tokens.filter((t) => !t.revoked_at).length,
+    })
+  },
+}
+
+const toolRevokeAgentToken: ToolSpec = {
+  name: 'revoke_agent_token',
+  scope: "agent's squad",
+  min: 'admin',
+  args: '{ agent: string (id|slug), token_id: string }',
+  inputSchema: {
+    type: 'object',
+    properties: { agent: STRING_SCHEMA, token_id: STRING_SCHEMA },
+    required: ['agent', 'token_id'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args, _ctx) {
+    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
+    const agentRef = str(args.agent)
+    const tokenId = str(args.token_id)
+    if (!agentRef) return fail(400, 'invalid_args', 'agent required')
+    if (!tokenId) return fail(400, 'invalid_args', 'token_id required')
+
+    const agentResult = await resolveAgentRef(env, agentRef)
+    if (!agentResult.ok) return resolveFail(agentResult.reason, 'agent_not_found')
+    const agent = agentResult.value
+
+    const grants = auth.capabilities ?? []
+    if (!(await memberCanOnSquad(env, grants, agent.squad_id, 'admin'))) {
+      return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
+    }
+
+    // The token must belong to THIS agent. Without this, admin on squad A could revoke
+    // a token welded to an agent on squad B by guessing its id — authorization would be
+    // checked against the agent the caller NAMED rather than the one that actually owns
+    // the credential.
+    const row = await env.DB.prepare(
+      `SELECT id, member_id, agent_id, label, revoked_at
+         FROM member_tokens WHERE id = ?1 AND tenant = ?2 LIMIT 1`,
+    )
+      .bind(tokenId, env.TENANT_SLUG)
+      .first<{ id: string; member_id: string; agent_id: string | null; label: string; revoked_at: string | null }>()
+
+    if (!row || row.agent_id !== agent.id) {
+      // Same 404 whether the token is absent or belongs elsewhere — do not turn this
+      // into an oracle for token ids on other squads.
+      return fail(404, 'token_not_found', `No token "${tokenId}" belongs to agent "${agent.slug}".`)
+    }
+
+    // Idempotent: revoking an already-revoked token succeeds and reports revoked:false.
+    const revoked = await revokeMemberToken(env, row.member_id, tokenId)
+
+    await emitProvisioned(env, auth.memberId as string, 'token_revoked', tokenId, {
+      squad_id: agent.squad_id,
+      agent_id: agent.id,
+      member_id: row.member_id,
+    })
+
+    return done({
+      token: { id: tokenId, label: row.label, agent_id: agent.id },
+      revoked,
+      already_revoked: !revoked,
+      note: revoked
+        ? 'Token revoked. It fails authentication immediately — grants are re-resolved per request.'
+        : 'Token was already revoked; no change.',
+    })
+  },
+}
 function connectionErrorToFail(outcome: Extract<AgentConnectionOutcome, { status: 'error' }>) {
   const code = outcome.error
   if (code === 'forbidden' || code === 'capability_ceiling') {
@@ -933,6 +1073,8 @@ export const PROVISION_TOOLS: ToolSpec[] = [
   toolResolveAgent,
   toolGetAgentProfile,
   toolMintAgentToken,
+  toolListAgentTokens,
+  toolRevokeAgentToken,
   toolProvisionAgentConnection,
   toolGrantAgentCapability,
   toolRegisterAgentKey,
