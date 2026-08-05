@@ -518,14 +518,18 @@ const toolListAgentTokens: ToolSpec = {
     // NEVER select token_hash. There is no path from this tool to a usable secret —
     // raw is show-once at mint and is not stored.
     const rows = await env.DB.prepare(
-      `SELECT id, member_id, label, channel, capability, created_at, revoked_at
+      // NOTE: member_tokens has NO `capability` column — a token's capability lives in
+      // `capabilities`, keyed by the token's member. Selecting it here shipped a live
+      // internal_error (mupot#684): the unit mock returned canned rows and never ran the
+      // SQL, so 12 tests passed against a query D1 rejects. Real-schema test below.
+      `SELECT id, member_id, label, channel, created_at, revoked_at
          FROM member_tokens
         WHERE agent_id = ?1 AND tenant = ?2
           ${includeRevoked ? '' : 'AND revoked_at IS NULL'}
         ORDER BY created_at ASC`,
     )
       .bind(agent.id, env.TENANT_SLUG)
-      .all<{ id: string; member_id: string; label: string; channel: string; capability: string | null; created_at: string; revoked_at: string | null }>()
+      .all<{ id: string; member_id: string; label: string; channel: string; created_at: string; revoked_at: string | null }>()
 
     // Project EXPLICITLY in code, not only in the SQL above. Relying on the SELECT list
     // means a later "SELECT *" — or a helper that widens the query — silently leaks
@@ -537,7 +541,6 @@ const toolListAgentTokens: ToolSpec = {
       member_id: t.member_id,
       label: t.label,
       channel: t.channel,
-      capability: t.capability,
       created_at: t.created_at,
       revoked_at: t.revoked_at,
     }))
