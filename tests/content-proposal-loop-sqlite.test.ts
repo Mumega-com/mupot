@@ -24,6 +24,7 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 import type { Env, Task } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 import { runTaskExecution } from '../src/agents/execute'
 import { kernelMintCtx } from '../src/departments/kernel'
 import { getRegistered } from '../src/departments/registry'
@@ -36,47 +37,12 @@ const AGENT_ID = 'agent-editor'
 
 function createSchema(sqlite: SqliteD1Harness['sqlite']): void {
   sqlite.exec(`
-    CREATE TABLE departments (id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE, name TEXT NOT NULL);
-    CREATE TABLE squads (
-      id TEXT PRIMARY KEY, department_id TEXT NOT NULL, slug TEXT NOT NULL,
-      name TEXT NOT NULL, charter TEXT
-    );
-    CREATE TABLE agents (
-      id TEXT PRIMARY KEY, squad_id TEXT NOT NULL, slug TEXT NOT NULL, name TEXT NOT NULL,
-      role TEXT NOT NULL DEFAULT 'member', model TEXT NOT NULL DEFAULT '@cf/meta/llama-3.3',
-      status TEXT NOT NULL DEFAULT 'active'
-    );
-    CREATE TABLE tasks (
-      id                 TEXT PRIMARY KEY,
-      squad_id           TEXT NOT NULL,
-      project_id         TEXT,
-      title              TEXT NOT NULL,
-      body               TEXT NOT NULL DEFAULT '',
-      status             TEXT NOT NULL DEFAULT 'open'
-                           CHECK (status IN ('open','in_progress','blocked','done','review','approved','rejected')),
-      assignee_agent_id  TEXT,
-      github_issue_url   TEXT,
-      created_at         TEXT NOT NULL DEFAULT (datetime('now')),
-      updated_at         TEXT NOT NULL DEFAULT (datetime('now')),
-      result             TEXT,
-      completed_at       TEXT,
-      gate_owner         TEXT,
-      cost_micro_usd     INTEGER NOT NULL DEFAULT 0,
-      workflow_instance_id TEXT,
-      done_when          TEXT NOT NULL DEFAULT '(backfill required)',
-      execution_receipt_id TEXT,
-      execution_claim_expires_at INTEGER,
-      source_pot         TEXT,
-      external_source    TEXT
-    );
-    CREATE TABLE task_verdicts (
-      id TEXT PRIMARY KEY, task_id TEXT NOT NULL, verdict TEXT NOT NULL CHECK(verdict IN ('approved','rejected')),
-      note TEXT, decided_by TEXT NOT NULL, decided_at TEXT NOT NULL
-    );
-    CREATE TABLE department_proposals (
-      gate_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, department_key TEXT NOT NULL,
-      action TEXT NOT NULL, payload_json TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
+
+
+
+
+
+
   `)
 }
 
@@ -86,6 +52,7 @@ describe('content-publish loop — real SQLite, propose → approve → execute 
 
   beforeEach(() => {
     harness = createSqliteD1()
+  applyAllMigrations(harness.sqlite)
     createSchema(harness.sqlite)
     harness.sqlite.prepare('INSERT INTO departments (id, slug, name) VALUES (?, ?, ?)').run('dept-1', 'growth', 'Marketing & Sales')
     harness.sqlite.prepare('INSERT INTO squads (id, department_id, slug, name, charter) VALUES (?, ?, ?, ?, ?)')

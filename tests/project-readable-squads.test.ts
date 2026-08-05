@@ -3,6 +3,8 @@ import type { D1Database, D1PreparedStatement } from '@cloudflare/workers-types'
 import { resolveReadableSquadIds } from '../src/projects/readable-squads'
 import type { Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
+import { seedDepartment } from './helpers/seed'
 
 type QueryCall = { sql: string; values: unknown[] }
 
@@ -33,13 +35,15 @@ describe('resolveReadableSquadIds', () => {
 
   it('collects complete naturally deduplicated scope through bounded keyset pages', async () => {
     harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    seedDepartment(harness.sqlite, 'dept')
     harness.sqlite.exec(`
-      CREATE TABLE squads (id TEXT PRIMARY KEY, department_id TEXT NOT NULL);
       WITH RECURSIVE seq(n) AS (
         VALUES(0) UNION ALL SELECT n + 1 FROM seq WHERE n < 1200
       )
-      INSERT INTO squads (id, department_id)
-      SELECT 'squad-' || printf('%04d', n), 'dept' FROM seq;
+      INSERT INTO squads (id, department_id, slug, name)
+      SELECT 'squad-' || printf('%04d', n), 'dept',
+             'squad-' || printf('%04d', n), 'squad-' || printf('%04d', n) FROM seq;
     `)
     const calls: QueryCall[] = []
     const env = { DB: probedDb(harness.db, calls) } as Env
@@ -57,7 +61,7 @@ describe('resolveReadableSquadIds', () => {
 
   it('terminates after one empty bounded page', async () => {
     harness = createSqliteD1()
-    harness.sqlite.exec('CREATE TABLE squads (id TEXT PRIMARY KEY, department_id TEXT NOT NULL)')
+    applyAllMigrations(harness.sqlite)
     const calls: QueryCall[] = []
     const env = { DB: probedDb(harness.db, calls) } as Env
 

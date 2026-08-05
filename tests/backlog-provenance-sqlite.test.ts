@@ -24,6 +24,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { runGoalCycle, MAX_OPEN_TASKS } from '../src/agents/loop'
 import { SENSORIUM_VERSION } from '../src/agents/sensorium'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 import type { LoopDeps } from '../src/agents/loop'
 import type { Sensorium } from '../src/agents/sensorium'
 import type { Agent, Env, Task } from '../src/types'
@@ -36,16 +37,7 @@ let harness: SqliteD1Harness
 function createSchema(sqlite: SqliteD1Harness['sqlite']): void {
   // Only the columns countOpenBacklog reads. external_source arrives in migrations/0077.
   sqlite.exec(`
-    CREATE TABLE tasks (
-      id TEXT PRIMARY KEY,
-      squad_id TEXT NOT NULL,
-      title TEXT NOT NULL,
-      status TEXT NOT NULL,
-      assignee_agent_id TEXT,
-      source_pot TEXT,
-      external_source TEXT,
-      created_at TEXT NOT NULL
-    );
+
   `)
 }
 
@@ -134,6 +126,7 @@ function env(): Env {
 
 beforeEach(() => {
   harness = createSqliteD1()
+  applyAllMigrations(harness.sqlite)
   createSchema(harness.sqlite)
 })
 

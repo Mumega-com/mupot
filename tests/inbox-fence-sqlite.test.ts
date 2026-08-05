@@ -4,29 +4,19 @@ import { describe, expect, it } from 'vitest'
 import { readAgentInbox, readVerifiedSignedAgentInbox } from '../src/agents/messages'
 import type { Env } from '../src/types'
 import { createSqliteD1 } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 
 function fixture() {
   const harness = createSqliteD1()
+  applyAllMigrations(harness.sqlite)
   harness.sqlite.exec(`
-    CREATE TABLE members (id TEXT PRIMARY KEY);
-    CREATE TABLE agents (id TEXT PRIMARY KEY);
-    CREATE TABLE agent_messages (
-      seq INTEGER PRIMARY KEY AUTOINCREMENT,
-      id TEXT NOT NULL UNIQUE,
-      tenant TEXT NOT NULL,
-      to_agent TEXT NOT NULL,
-      from_agent TEXT NOT NULL,
-      from_member TEXT NOT NULL,
-      kind TEXT NOT NULL,
-      body TEXT NOT NULL,
-      request_id TEXT,
-      in_reply_to TEXT,
-      created_at TEXT NOT NULL,
-      read_at TEXT,
-      project_id TEXT
-    );
-    INSERT INTO members(id) VALUES ('owner');
-    INSERT INTO agents(id) VALUES ('agent-a');
+
+
+
+    INSERT INTO members(id, display_name) VALUES ('owner', 'owner');
+    INSERT INTO departments(id, slug, name) VALUES ('dept', 'dept', 'dept');
+    INSERT INTO squads(id, department_id, slug, name) VALUES ('squad', 'dept', 'squad', 'squad');
+    INSERT INTO agents(id, squad_id, slug, name) VALUES ('agent-a', 'squad', 'agent-a', 'agent-a');
   `)
   harness.sqlite.exec(readFileSync(new URL('../migrations/0058_agent_inbox_fences.sql', import.meta.url), 'utf8'))
   const env = { TENANT_SLUG: 'tenant-a', DB: harness.db } as unknown as Env

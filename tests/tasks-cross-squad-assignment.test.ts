@@ -3,6 +3,7 @@ import { runTaskExecution } from '../src/agents/execute'
 import { tasksApp } from '../src/tasks'
 import type { Agent, BusEvent, Env, ModelPort, Task } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 
 const TENANT = 'tenant-a'
 const TARGET_SQUAD_ID = 'squad-target'
@@ -30,58 +31,14 @@ const CROSS_AGENT: Agent = {
 
 function createSchema(sqlite: SqliteD1Harness['sqlite']): void {
   sqlite.exec(`
-    CREATE TABLE squads (id TEXT PRIMARY KEY, department_id TEXT NOT NULL, charter TEXT);
-    CREATE TABLE agents (id TEXT PRIMARY KEY, squad_id TEXT NOT NULL, status TEXT NOT NULL);
-    CREATE TABLE members (id TEXT PRIMARY KEY, tenant TEXT NOT NULL, status TEXT NOT NULL);
-    CREATE TABLE member_tokens (
-      id TEXT PRIMARY KEY,
-      member_id TEXT NOT NULL,
-      agent_id TEXT NOT NULL,
-      tenant TEXT NOT NULL,
-      revoked_at TEXT
-    );
-    CREATE TABLE agent_member_bindings (
-      tenant TEXT NOT NULL,
-      agent_id TEXT NOT NULL,
-      member_id TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      PRIMARY KEY (tenant, agent_id),
-      UNIQUE (tenant, member_id)
-    );
-    CREATE TABLE capabilities (
-      id TEXT PRIMARY KEY,
-      member_id TEXT NOT NULL,
-      scope_type TEXT NOT NULL,
-      scope_id TEXT,
-      capability TEXT NOT NULL
-    );
-    CREATE TABLE channel_capability_grants (
-      id TEXT PRIMARY KEY,
-      member_id TEXT NOT NULL,
-      squad_id TEXT NOT NULL,
-      capability TEXT NOT NULL
-    );
-    CREATE TABLE tasks (
-      id TEXT PRIMARY KEY,
-      squad_id TEXT NOT NULL,
-      project_id TEXT,
-      title TEXT NOT NULL,
-      body TEXT NOT NULL,
-      done_when TEXT NOT NULL,
-      status TEXT NOT NULL,
-      assignee_agent_id TEXT,
-      github_issue_url TEXT,
-      result TEXT,
-      completed_at TEXT,
-      gate_owner TEXT,
-      cost_micro_usd INTEGER NOT NULL DEFAULT 0,
-      execution_receipt_id TEXT,
-      execution_claim_expires_at INTEGER,
-      source_pot TEXT,
-      external_source TEXT,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
+
+
+
+
+
+
+
+
   `)
 }
 
@@ -136,6 +93,7 @@ describe('cross-squad task assignment over HTTP', () => {
 
   beforeEach(() => {
     harness = createSqliteD1()
+  applyAllMigrations(harness.sqlite)
     createSchema(harness.sqlite)
     env = ownerEnv(harness)
   })

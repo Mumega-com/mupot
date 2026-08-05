@@ -29,6 +29,7 @@ import type { StepLike, TaskPipelineParams, PipelineDeps, VerdictRow } from '../
 import type { Env, Agent, Task } from '../src/types'
 import type { ExecuteResult } from '../src/agents/execute'
 import { createSqliteD1 } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 
 // ── Shared fixtures ───────────────────────────────────────────────────────────
 
@@ -205,67 +206,17 @@ describe('ungated task', () => {
 describe('shared execution authorization', () => {
   it('uses the real engine and fails closed after a cross-squad capability revocation', async () => {
     const harness = createSqliteD1()
+  applyAllMigrations(harness.sqlite)
     try {
       harness.sqlite.exec(`
-        CREATE TABLE squads (id TEXT PRIMARY KEY, department_id TEXT NOT NULL, charter TEXT);
-        CREATE TABLE agents (id TEXT PRIMARY KEY, squad_id TEXT NOT NULL, status TEXT NOT NULL);
-        CREATE TABLE members (id TEXT PRIMARY KEY, tenant TEXT NOT NULL, status TEXT NOT NULL);
-        CREATE TABLE member_tokens (
-          id TEXT PRIMARY KEY,
-          member_id TEXT NOT NULL,
-          agent_id TEXT NOT NULL,
-          tenant TEXT NOT NULL,
-          revoked_at TEXT
-        );
-        CREATE TABLE agent_member_bindings (
-          tenant TEXT NOT NULL,
-          agent_id TEXT NOT NULL,
-          member_id TEXT NOT NULL,
-          created_at TEXT NOT NULL,
-          PRIMARY KEY (tenant, agent_id),
-          UNIQUE (tenant, member_id)
-        );
-        CREATE TABLE capabilities (
-          id TEXT PRIMARY KEY,
-          member_id TEXT NOT NULL,
-          scope_type TEXT NOT NULL,
-          scope_id TEXT,
-          capability TEXT NOT NULL
-        );
-        CREATE TABLE channel_capability_grants (
-          id TEXT PRIMARY KEY,
-          member_id TEXT NOT NULL,
-          squad_id TEXT NOT NULL,
-          capability TEXT NOT NULL
-        );
-        CREATE TABLE tasks (
-          id TEXT PRIMARY KEY,
-          squad_id TEXT NOT NULL,
-          project_id TEXT,
-          title TEXT NOT NULL,
-          body TEXT NOT NULL,
-          done_when TEXT NOT NULL,
-          status TEXT NOT NULL,
-          assignee_agent_id TEXT,
-          github_issue_url TEXT,
-          result TEXT,
-          completed_at TEXT,
-          gate_owner TEXT,
-          cost_micro_usd INTEGER NOT NULL DEFAULT 0,
-          execution_receipt_id TEXT,
-          execution_claim_expires_at INTEGER,
-          source_pot TEXT,
-          external_source TEXT,
-          created_at TEXT NOT NULL,
-          updated_at TEXT NOT NULL
-        );
-        CREATE TABLE engrams (
-          id TEXT PRIMARY KEY,
-          agent_id TEXT NOT NULL,
-          text TEXT NOT NULL,
-          concepts TEXT,
-          created_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
+
+
+
+
+
+
+
+
 
         INSERT INTO squads (id, department_id, charter)
         VALUES ('squad-wf-home', 'department-home', 'Home charter.');

@@ -5,6 +5,7 @@ import {
 } from '../src/members/service'
 import type { CapabilityGrant, Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 
 const TENANT = 'tenant-a'
 const AGENT_ID = 'agent-product'
@@ -12,41 +13,14 @@ const TARGET_SQUAD_ID = 'squad-other'
 
 function createSchema(sqlite: SqliteD1Harness['sqlite']): void {
   sqlite.exec(`
-    CREATE TABLE agents (
-      id TEXT PRIMARY KEY
-    );
-    CREATE TABLE members (
-      id TEXT PRIMARY KEY,
-      display_name TEXT NOT NULL,
-      status TEXT NOT NULL CHECK (status IN ('active', 'suspended')),
-      tenant TEXT NOT NULL
-    );
-    CREATE TABLE member_tokens (
-      id TEXT PRIMARY KEY,
-      member_id TEXT NOT NULL REFERENCES members(id),
-      token_hash TEXT NOT NULL UNIQUE,
-      agent_id TEXT,
-      tenant TEXT NOT NULL,
-      revoked_at TEXT
-    );
-    CREATE TABLE capabilities (
-      id TEXT PRIMARY KEY,
-      member_id TEXT NOT NULL REFERENCES members(id),
-      scope_type TEXT NOT NULL CHECK (scope_type IN ('org', 'department', 'squad')),
-      scope_id TEXT,
-      capability TEXT NOT NULL CHECK (capability IN ('owner', 'admin', 'lead', 'member', 'observer')),
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      UNIQUE (member_id, scope_type, scope_id)
-    );
-    CREATE TABLE agent_member_bindings (
-      tenant TEXT NOT NULL,
-      agent_id TEXT NOT NULL REFERENCES agents(id),
-      member_id TEXT NOT NULL REFERENCES members(id),
-      created_at TEXT NOT NULL,
-      PRIMARY KEY (tenant, agent_id),
-      UNIQUE (tenant, member_id)
-    );
-    INSERT INTO agents (id) VALUES ('${AGENT_ID}');
+
+
+
+
+
+    INSERT INTO departments (id, slug, name) VALUES ('dept', 'dept', 'dept');
+    INSERT INTO squads (id, department_id, slug, name) VALUES ('squad', 'dept', 'squad', 'squad');
+    INSERT INTO agents (id, squad_id, slug, name) VALUES ('${AGENT_ID}', 'squad', '${AGENT_ID}', '${AGENT_ID}');
   `)
 }
 
@@ -100,6 +74,7 @@ describe('SQLite-backed capability grant state', () => {
 
   beforeEach(() => {
     harness = createSqliteD1()
+  applyAllMigrations(harness.sqlite)
     createSchema(harness.sqlite)
     env = { TENANT_SLUG: TENANT, DB: harness.db } as Env
   })

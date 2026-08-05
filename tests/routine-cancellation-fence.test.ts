@@ -1,16 +1,16 @@
 import { describe, expect, it } from 'vitest'
 import { sqlNotCancellationPending } from '../src/routines/cancellation-fence'
 import { createSqliteD1 } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 
 describe('Routine cancellation SQL fence', () => {
   it('blocks a production-style UPDATE when the outer columns are qualified', () => {
     const harness = createSqliteD1()
+  applyAllMigrations(harness.sqlite)
     try {
       harness.sqlite.exec(`
-        CREATE TABLE routine_runs (id TEXT PRIMARY KEY, tenant TEXT NOT NULL, status TEXT NOT NULL);
-        CREATE TABLE routine_run_events (
-          id TEXT PRIMARY KEY, tenant TEXT NOT NULL, run_id TEXT NOT NULL, kind TEXT NOT NULL
-        );
+
+
         INSERT INTO routine_runs VALUES ('run-1', 'tenant-a', 'queued');
         INSERT INTO routine_run_events VALUES (
           'request-1', 'tenant-a', 'run-1', 'cancellation_requested'

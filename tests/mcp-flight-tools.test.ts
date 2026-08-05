@@ -4,6 +4,7 @@ import type { AuthContext, Env } from '../src/types'
 import type { FlightRow } from '../src/flight/service'
 import { flushFlightEventOutbox } from '../src/flight/service'
 import { createSqliteD1 } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 
 const TENANT = 'mumega'
 const MEMBER_ID = 'member-product'
@@ -686,72 +687,23 @@ describe('MCP flight tools', () => {
 describe('MCP granted multi-squad flight lifecycle', () => {
   it('re-authenticates the same Product bearer through assignment, dispatch, read, task completion, and landing', async () => {
     const harness = createSqliteD1()
+  applyAllMigrations(harness.sqlite)
     const events: unknown[] = []
     try {
       const productTokenHash = await sha256Hex(PRODUCT_TOKEN)
       harness.sqlite.exec(`
-        CREATE TABLE departments (id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE, name TEXT NOT NULL);
-        CREATE TABLE squads (
-          id TEXT PRIMARY KEY, department_id TEXT NOT NULL, slug TEXT NOT NULL, name TEXT NOT NULL,
-          charter TEXT, budget_cap_cents INTEGER, budget_window TEXT NOT NULL DEFAULT 'day',
-          created_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-        CREATE TABLE agents (
-          id TEXT PRIMARY KEY, squad_id TEXT NOT NULL, slug TEXT NOT NULL, name TEXT NOT NULL,
-          role TEXT NOT NULL DEFAULT 'member', model TEXT NOT NULL DEFAULT 'test',
-          status TEXT NOT NULL DEFAULT 'active', budget_cap_cents INTEGER,
-          budget_window TEXT NOT NULL DEFAULT 'day', created_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-        CREATE TABLE members (
-          id TEXT PRIMARY KEY, email TEXT, display_name TEXT NOT NULL, telegram_chat_id TEXT,
-          status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL DEFAULT (datetime('now')),
-          tenant TEXT NOT NULL
-        );
-        CREATE TABLE member_tokens (
-          id TEXT PRIMARY KEY, member_id TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE,
-          label TEXT NOT NULL DEFAULT '', channel TEXT NOT NULL DEFAULT 'workspace',
-          created_at TEXT NOT NULL DEFAULT (datetime('now')), revoked_at TEXT,
-          agent_id TEXT, tenant TEXT NOT NULL
-        );
-        CREATE TABLE agent_member_bindings (
-          tenant TEXT NOT NULL, agent_id TEXT NOT NULL, member_id TEXT NOT NULL,
-          created_at TEXT NOT NULL, PRIMARY KEY (tenant, agent_id), UNIQUE (tenant, member_id)
-        );
-        CREATE TABLE memberships (
-          id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, squad_id TEXT NOT NULL,
-          capability TEXT NOT NULL, UNIQUE (agent_id, squad_id)
-        );
-        CREATE TABLE capabilities (
-          id TEXT PRIMARY KEY, member_id TEXT NOT NULL, scope_type TEXT NOT NULL, scope_id TEXT,
-          capability TEXT NOT NULL CHECK (capability IN ('owner','admin','lead','member','observer')),
-          created_at TEXT NOT NULL DEFAULT (datetime('now')), UNIQUE (member_id, scope_type, scope_id)
-        );
-        CREATE TABLE channel_capability_grants (
-          id TEXT PRIMARY KEY, member_id TEXT NOT NULL, squad_id TEXT NOT NULL, capability TEXT NOT NULL
-        );
-        CREATE TABLE tasks (
-          id TEXT PRIMARY KEY, squad_id TEXT NOT NULL, project_id TEXT, title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '',
-          done_when TEXT NOT NULL, status TEXT NOT NULL, assignee_agent_id TEXT, github_issue_url TEXT,
-          result TEXT, completed_at TEXT, gate_owner TEXT, source_pot TEXT, external_source TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-        );
-        CREATE TABLE task_verdicts (
-          id TEXT PRIMARY KEY, task_id TEXT NOT NULL, verdict TEXT NOT NULL, note TEXT,
-          decided_by TEXT NOT NULL, decided_at TEXT NOT NULL
-        );
-        CREATE TABLE flights (
-          id TEXT PRIMARY KEY, tenant TEXT NOT NULL, project_id TEXT, agent TEXT NOT NULL, goal TEXT NOT NULL,
-          status TEXT NOT NULL DEFAULT 'preflight', trigger_source TEXT NOT NULL DEFAULT 'manual',
-          gate_verdict TEXT, gate_reason TEXT NOT NULL DEFAULT '', score REAL, budget_micro_usd INTEGER,
-          cost_micro_usd INTEGER NOT NULL DEFAULT 0, next_run_at INTEGER,
-          created_at INTEGER NOT NULL DEFAULT (unixepoch('now') * 1000), started_at INTEGER,
-          ended_at INTEGER, meta TEXT NOT NULL DEFAULT '{}'
-        );
-        CREATE TABLE flight_event_outbox (
-          id TEXT PRIMARY KEY, tenant TEXT NOT NULL, flight_id TEXT NOT NULL, event_type TEXT NOT NULL,
-          actor_kind TEXT NOT NULL, actor_id TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL,
-          delivered_at TEXT, consumed_at TEXT, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT,
-          UNIQUE (tenant, flight_id, event_type)
-        );
+
+
+
+
+
+
+
+
+
+
+
+
 
         INSERT INTO departments VALUES ('dept-home', 'home', 'Home');
         INSERT INTO departments VALUES ('dept-other', 'other', 'Other');

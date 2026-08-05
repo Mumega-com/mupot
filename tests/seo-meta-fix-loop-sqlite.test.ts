@@ -33,6 +33,7 @@
 
 import { beforeEach, describe, expect, it } from 'vitest'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 import { kernelMintCtx } from '../src/departments/kernel'
 import { getRegistered } from '../src/departments/registry'
 import '../src/departments/modules/growth'
@@ -45,14 +46,8 @@ function createSchema(sqlite: SqliteD1Harness['sqlite']): void {
   // actually touches (department_proposals, task_verdicts) — same column shapes
   // as tests/content-proposal-loop-sqlite.test.ts's full schema.
   sqlite.exec(`
-    CREATE TABLE task_verdicts (
-      id TEXT PRIMARY KEY, task_id TEXT NOT NULL, verdict TEXT NOT NULL CHECK(verdict IN ('approved','rejected')),
-      note TEXT, decided_by TEXT NOT NULL, decided_at TEXT NOT NULL
-    );
-    CREATE TABLE department_proposals (
-      gate_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, department_key TEXT NOT NULL,
-      action TEXT NOT NULL, payload_json TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
+
+
   `)
 }
 
@@ -61,6 +56,7 @@ describe('seo-meta-fix loop — real SQLite, propose → approve → execute →
 
   beforeEach(() => {
     harness = createSqliteD1()
+  applyAllMigrations(harness.sqlite)
     createSchema(harness.sqlite)
   })
 

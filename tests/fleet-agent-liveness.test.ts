@@ -22,26 +22,22 @@ import { afterEach, beforeEach, describe, it, expect } from 'vitest'
 import { getFleetAgentRuntime, getFleetAgentLiveness, DEFAULT_PRESENCE_TTL_SEC } from '../src/fleet/registry'
 import type { Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 
 const TENANT = 't'
 const KASRA_UUID = 'ea2b0370-ff27-4371-9581-5bcaf322baa7'
 
 function createSchema(sqlite: SqliteD1Harness['sqlite']): void {
   sqlite.exec(`
-    CREATE TABLE agents (id TEXT PRIMARY KEY, squad_id TEXT NOT NULL, slug TEXT NOT NULL);
-    CREATE TABLE fleet_agents (
-      tenant TEXT NOT NULL,
-      agent_id TEXT NOT NULL,
-      runtime TEXT NOT NULL DEFAULT '',
-      status TEXT NOT NULL DEFAULT 'unknown',
-      last_reported_at TEXT NOT NULL DEFAULT '',
-      PRIMARY KEY (tenant, agent_id)
-    );
+
+
   `)
 }
 
 function addAgent(sqlite: SqliteD1Harness['sqlite'], id: string, squadId: string, slug: string): void {
-  sqlite.prepare('INSERT INTO agents (id, squad_id, slug) VALUES (?, ?, ?)').run(id, squadId, slug)
+  sqlite.prepare('INSERT OR IGNORE INTO departments (id, slug, name) VALUES (?, ?, ?)').run(`${squadId}-dept`, `${squadId}-dept`, `${squadId}-dept`)
+  sqlite.prepare('INSERT OR IGNORE INTO squads (id, department_id, slug, name) VALUES (?, ?, ?, ?)').run(squadId, `${squadId}-dept`, squadId, squadId)
+  sqlite.prepare('INSERT INTO agents (id, squad_id, slug, name) VALUES (?, ?, ?, ?)').run(id, squadId, slug, slug)
 }
 
 function addFleetRow(
@@ -71,6 +67,7 @@ describe('getFleetAgentRuntime / getFleetAgentLiveness — real SQLite', () => {
 
   beforeEach(() => {
     harness = createSqliteD1()
+  applyAllMigrations(harness.sqlite)
     createSchema(harness.sqlite)
     env = { TENANT_SLUG: TENANT, DB: harness.db } as Env
   })

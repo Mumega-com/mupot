@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { resolveTaskAssignee } from '../src/tasks/assignee'
 import type { Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 
 const TENANT = 'tenant-a'
 const HOME_SQUAD_ID = 'squad-home'
@@ -13,42 +14,19 @@ const OUTSIDE = { value: null, error: 'assignee_not_in_squad' } as const
 
 function createSchema(sqlite: SqliteD1Harness['sqlite']): void {
   sqlite.exec(`
-    CREATE TABLE squads (id TEXT PRIMARY KEY, department_id TEXT NOT NULL);
-    CREATE TABLE agents (id TEXT PRIMARY KEY, squad_id TEXT NOT NULL, status TEXT NOT NULL);
-    CREATE TABLE members (id TEXT PRIMARY KEY, tenant TEXT NOT NULL, status TEXT NOT NULL);
-    CREATE TABLE member_tokens (
-      id TEXT PRIMARY KEY,
-      member_id TEXT NOT NULL,
-      agent_id TEXT NOT NULL,
-      tenant TEXT NOT NULL,
-      revoked_at TEXT
-    );
-    CREATE TABLE agent_member_bindings (
-      tenant TEXT NOT NULL,
-      agent_id TEXT NOT NULL,
-      member_id TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      PRIMARY KEY (tenant, agent_id),
-      UNIQUE (tenant, member_id)
-    );
-    CREATE TABLE capabilities (
-      id TEXT PRIMARY KEY,
-      member_id TEXT NOT NULL,
-      scope_type TEXT NOT NULL,
-      scope_id TEXT,
-      capability TEXT NOT NULL
-    );
-    CREATE TABLE channel_capability_grants (
-      id TEXT PRIMARY KEY,
-      member_id TEXT NOT NULL,
-      squad_id TEXT NOT NULL,
-      capability TEXT NOT NULL
-    );
+
+
+
+
+
+
+
   `)
 }
 
 function addSquad(sqlite: SqliteD1Harness['sqlite'], id: string, departmentId: string): void {
-  sqlite.prepare('INSERT INTO squads (id, department_id) VALUES (?, ?)').run(id, departmentId)
+  sqlite.prepare('INSERT OR IGNORE INTO departments (id, slug, name) VALUES (?, ?, ?)').run(departmentId, departmentId, departmentId)
+  sqlite.prepare('INSERT INTO squads (id, department_id, slug, name) VALUES (?, ?, ?, ?)').run(id, departmentId, id, id)
 }
 
 function addAgent(
@@ -57,7 +35,7 @@ function addAgent(
   squadId: string,
   status = 'active',
 ): void {
-  sqlite.prepare('INSERT INTO agents (id, squad_id, status) VALUES (?, ?, ?)').run(id, squadId, status)
+  sqlite.prepare('INSERT INTO agents (id, squad_id, slug, name, status) VALUES (?, ?, ?, ?, ?)').run(id, squadId, id, id, status)
 }
 
 function addMember(
@@ -66,7 +44,7 @@ function addMember(
   tenant = TENANT,
   status = 'active',
 ): void {
-  sqlite.prepare('INSERT INTO members (id, tenant, status) VALUES (?, ?, ?)').run(id, tenant, status)
+  sqlite.prepare('INSERT INTO members (id, tenant, display_name, status) VALUES (?, ?, ?, ?)').run(id, tenant, id, status)
 }
 
 function addToken(
@@ -108,6 +86,7 @@ describe('resolveTaskAssignee — SQLite capability matrix', () => {
 
   beforeEach(() => {
     harness = createSqliteD1()
+  applyAllMigrations(harness.sqlite)
     createSchema(harness.sqlite)
     addSquad(harness.sqlite, HOME_SQUAD_ID, 'department-home')
     addSquad(harness.sqlite, TARGET_SQUAD_ID, 'department-target')
@@ -199,6 +178,7 @@ describe('resolveTaskAssignee — SQLite capability matrix', () => {
     for (const testCase of cases) {
       harness.close()
       harness = createSqliteD1()
+  applyAllMigrations(harness.sqlite)
       createSchema(harness.sqlite)
       addSquad(harness.sqlite, HOME_SQUAD_ID, 'department-home')
       addSquad(harness.sqlite, TARGET_SQUAD_ID, 'department-target')
