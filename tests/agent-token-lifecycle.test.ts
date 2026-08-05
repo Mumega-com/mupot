@@ -40,6 +40,8 @@ interface Opts {
   listRows?: Record<string, unknown>[]
   /** false ⇒ revokeMemberToken reports "nothing changed" (already revoked) */
   revokeChanges?: number
+  /** collects every BUS.send payload so a probe can assert NO side effect */
+  busSent?: unknown[]
 }
 
 function makeEnv(opts: Opts = {}): Env {
@@ -103,7 +105,7 @@ function makeEnv(opts: Opts = {}): Env {
     DB: { prepare: (sql: string) => handler(sql), batch: async () => [] },
     TENANT_SLUG: 'mumega',
     PUBLIC_ORIGIN: 'https://mupot.mumega.com',
-    BUS: { send: async () => {} },
+    BUS: { send: async (e: unknown) => { (opts.busSent ??= []).push(e) } },
   } as unknown as Env
 }
 
@@ -170,13 +172,76 @@ describe('revoke_agent_token — ownership', () => {
     expect(body.error.message).toBe('token_not_found')
   })
 
-  it('a missing token and a wrong-owner token are indistinguishable (no id oracle)', async () => {
-    const missing = await call('revoke_agent_token', { agent: AGENT.slug, token_id: 'tok-nope' }, makeEnv({ tokenRow: null }))
-    const wrongOwner = await call('revoke_agent_token', { agent: AGENT.slug, token_id: TOKEN_OTHERS.id }, makeEnv({ tokenRow: TOKEN_OTHERS }))
-    expect(missing.status).toBe(wrongOwner.status)
-    const a = (await missing.json()) as { error: { message: string } }
-    const b = (await wrongOwner.json()) as { error: { message: string } }
-    expect(a.error.message).toBe(b.error.message)
+  // codex gate on #683: my first version of this test was FAKE-GREEN. It probed two
+  // DIFFERENT token ids and compared only status + error.message. Codex mutated the
+  // wrong-owner branch to leak `row.agent_id` in the detail while keeping the 404 and
+  // the message — creating the exact cross-squad owner oracle this test claims to
+  // prevent — and the suite still passed 9/9.
+  //
+  // The property is: for the SAME agent and the SAME candidate token_id, a missing row
+  // and a wrong-owner row must be indistinguishable in the COMPLETE response, and
+  // neither may produce a side effect. Compare the whole body, not a field I chose.
+  it('missing vs wrong-owner: identical agent, identical token_id, byte-identical response', async () => {
+    const CANDIDATE = 'tok-probe'
+    const missingBus: unknown[] = []
+    const wrongBus: unknown[] = []
+
+    const missingRes = await call(
+      'revoke_agent_token',
+      { agent: AGENT.slug, token_id: CANDIDATE },
+      makeEnv({ tokenRow: null, busSent: missingBus }),
+    )
+    const wrongRes = await call(
+      'revoke_agent_token',
+      { agent: AGENT.slug, token_id: CANDIDATE },
+      makeEnv({ tokenRow: { ...TOKEN_OTHERS, id: CANDIDATE }, busSent: wrongBus }),
+    )
+
+    expect(missingRes.status).toBe(wrongRes.status)
+    // WHOLE body, byte-for-byte — not a field the author picked.
+    expect(await missingRes.text()).toBe(await wrongRes.text())
+
+    // No side effect from either failed probe: no revocation event, nothing token-bearing.
+    expect(missingBus).toHaveLength(0)
+    expect(wrongBus).toHaveLength(0)
+  })
+
+  it('a failed probe emits no bus event at all (no pre-refusal emit)', async () => {
+    const bus: unknown[] = []
+    await call('revoke_agent_token', { agent: AGENT.slug, token_id: 'tok-probe' }, makeEnv({ tokenRow: null, busSent: bus }))
+    expect(JSON.stringify(bus)).not.toMatch(/token_revoked/)
+    expect(bus).toHaveLength(0)
+  })
+
+  // codex requirement 3: the fixture must match its claim. Default grants were ORG admin,
+  // which passes every squad gate and therefore never exercised the authorization
+  // disagreement this test is named for.
+  it('SQUAD-A-ONLY admin: naming agent A with a squad-B token gets the shared 404', async () => {
+    const squadAOnly: CapabilityGrant[] = [
+      { member_id: OPERATOR, scope_type: 'squad', scope_id: AGENT.squad_id, capability: 'admin' },
+    ]
+    const res = await call(
+      'revoke_agent_token',
+      { agent: AGENT.slug, token_id: TOKEN_OTHERS.id },
+      makeEnv({ grants: squadAOnly, tokenRow: TOKEN_OTHERS }),
+    )
+    expect(res.status).toBe(404)
+    const body = (await res.json()) as { error: { message: string } }
+    expect(body.error.message).toBe('token_not_found')
+  })
+
+  it('SQUAD-A-ONLY admin: naming the REAL squad-B agent fails the squad gate with 403', async () => {
+    const squadAOnly: CapabilityGrant[] = [
+      { member_id: OPERATOR, scope_type: 'squad', scope_id: AGENT.squad_id, capability: 'admin' },
+    ]
+    const res = await call(
+      'revoke_agent_token',
+      { agent: OTHER_AGENT.slug, token_id: TOKEN_OTHERS.id },
+      makeEnv({ grants: squadAOnly, tokenRow: TOKEN_OTHERS }),
+    )
+    expect(res.status).toBe(403)
+    const body = (await res.json()) as { error: { data: { need: string } } }
+    expect(body.error.data.need).toBe('admin')
   })
 })
 
