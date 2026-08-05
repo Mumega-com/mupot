@@ -255,6 +255,8 @@ describe('shared execution authorization', () => {
           execution_receipt_id TEXT,
           execution_claim_expires_at INTEGER,
           source_pot TEXT,
+          priority TEXT,
+          parent_task_id TEXT,
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL
         );
