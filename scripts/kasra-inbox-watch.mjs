@@ -15,8 +15,12 @@
 //   TMUX_SESSION           default kasra
 //   INTERVAL_SEC           default 30  (must be < 60 for DONE-WHEN canary)
 //   KASRA_INBOX_LOCK_FILE  default ~/.fleet/locks/kasra-inbox-watch-<agent_id>.lock
+//   KASRA_INBOX_SPOOL_DIR  default ~/.fleet/inbox-spool/<agent_id>
+//   TMUX_DELIVERY_TIMEOUT_MS default 5000, clamped to 100..15000
+//   TMUX_PREVIEW_MAX_CHARS default 1000, clamped to 320..2000
+//   TMUX_CONFIRM_ATTEMPTS  default 3, clamped to 1..5
 
-import { readFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -38,6 +42,11 @@ const TMUX_SESSION = process.env.TMUX_SESSION || 'kasra'
 const LOCK_FILE = process.env.KASRA_INBOX_LOCK_FILE
   || join(homedir(), '.fleet', 'locks', `kasra-inbox-watch-${EXPECTED_AGENT_ID}.lock`)
 const INTERVAL_SEC = Math.min(60, Math.max(5, Number(process.env.INTERVAL_SEC || 30) || 30))
+const TMUX_DELIVERY_TIMEOUT_MS = Math.min(15_000, Math.max(100, Number(process.env.TMUX_DELIVERY_TIMEOUT_MS || 5_000) || 5_000))
+const TMUX_PREVIEW_MAX_CHARS = Math.min(2_000, Math.max(320, Number(process.env.TMUX_PREVIEW_MAX_CHARS || 1_000) || 1_000))
+const TMUX_CONFIRM_ATTEMPTS = Math.min(5, Math.max(1, Number(process.env.TMUX_CONFIRM_ATTEMPTS || 3) || 3))
+const INBOX_SPOOL_DIR = process.env.KASRA_INBOX_SPOOL_DIR
+  || join(homedir(), '.fleet', 'inbox-spool', EXPECTED_AGENT_ID)
 const ONCE = process.argv.includes('--once')
 
 // Reasons that mean "this process's authorization precondition failed" —
@@ -112,17 +121,98 @@ async function mcpCall(token, name, args) {
   return inner.result ?? inner
 }
 
-function deliverToTmux(text) {
-  const type = spawnSync('tmux', ['send-keys', '-t', TMUX_SESSION, '-l', text], { encoding: 'utf8' })
+function safeMessageKey(message) {
+  const raw = typeof message?.id === 'string' && message.id
+    ? message.id
+    : `seq-${Number.isFinite(Number(message?.seq)) ? Number(message.seq) : 'unknown'}`
+  return raw.replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 96) || 'unknown'
+}
+
+export function deliveryMarker(message) {
+  return `[mupot-delivery:${safeMessageKey(message)}]`
+}
+
+export function spoolMessage(message, opts = {}) {
+  // Validate the complete envelope before persisting it. This also enforces
+  // the 8 KiB message-body contract used by the MCP inbox.
+  formatClaudeCodeNudge(message)
+  const dir = resolve(opts.spoolDir ?? INBOX_SPOOL_DIR)
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
+  chmodSync(dir, 0o700)
+  const target = join(dir, `${safeMessageKey(message)}.json`)
+  const temp = `${target}.${process.pid}.tmp`
+  writeFileSync(temp, `${JSON.stringify(message, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
+  chmodSync(temp, 0o600)
+  renameSync(temp, target)
+  chmodSync(target, 0o600)
+  return target
+}
+
+export function formatBoundedTmuxPreview(message, spoolPath, maxChars = TMUX_PREVIEW_MAX_CHARS) {
+  formatClaudeCodeNudge(message)
+  const cap = Math.min(2_000, Math.max(320, Number(maxChars) || TMUX_PREVIEW_MAX_CHARS))
+  const marker = deliveryMarker(message)
+  const requestId = message.request_id == null ? '' : String(message.request_id)
+  const inReplyTo = message.in_reply_to == null ? '' : String(message.in_reply_to)
+  const fixed = [
+    '[mupot inbox — authoritative receive preview]',
+    marker,
+    `seq: ${Number.isFinite(Number(message.seq)) ? Number(message.seq) : '?'}`,
+    `id: ${typeof message.id === 'string' && message.id ? message.id : '?'}`,
+    `from_agent: ${typeof message.from_agent === 'string' && message.from_agent ? message.from_agent : '?'}`,
+    `kind: ${message.kind}`,
+    `request_id: ${requestId}`,
+    `in_reply_to: ${inReplyTo}`,
+    `full_body_file: ${spoolPath}`,
+    'Read the mode-600 full_body_file before acting; this preview is intentionally bounded.',
+    'body_preview: ',
+  ].join('\n')
+  const remaining = Math.max(0, cap - fixed.length)
+  const body = message.body.slice(0, remaining)
+  return `${fixed}${body}`.slice(0, cap)
+}
+
+function tmuxFailure(result, failed, timedOut) {
+  if (result?.error?.code === 'ETIMEDOUT' || result?.signal === 'SIGTERM') {
+    return { ok: false, reason: timedOut, detail: result?.error?.message || 'timed out' }
+  }
+  return { ok: false, reason: failed, detail: result?.stderr || result?.error?.message }
+}
+
+export function deliverToTmux(_text, message, opts = {}) {
+  const spawn = opts.spawn ?? spawnSync
+  const timeoutMs = Math.min(15_000, Math.max(100, Number(opts.timeoutMs ?? TMUX_DELIVERY_TIMEOUT_MS) || TMUX_DELIVERY_TIMEOUT_MS))
+  const previewMaxChars = opts.previewMaxChars ?? TMUX_PREVIEW_MAX_CHARS
+  const confirmAttempts = Math.min(5, Math.max(1, Number(opts.confirmAttempts ?? TMUX_CONFIRM_ATTEMPTS) || TMUX_CONFIRM_ATTEMPTS))
+  const spool = opts.spoolMessage ?? ((value) => spoolMessage(value, opts))
+  let spoolPath
+  try {
+    spoolPath = spool(message)
+  } catch (error) {
+    return { ok: false, reason: 'message_spool_failed', detail: error instanceof Error ? error.message : String(error) }
+  }
+  const preview = formatBoundedTmuxPreview(message, spoolPath, previewMaxChars)
+  const marker = deliveryMarker(message)
+  const commandOpts = { encoding: 'utf8', timeout: timeoutMs }
+  const type = spawn('tmux', ['send-keys', '-t', TMUX_SESSION, '-l', preview], commandOpts)
   if (type.status !== 0) {
-    return { ok: false, reason: 'tmux_send_failed', detail: type.stderr || type.error?.message }
+    return tmuxFailure(type, 'tmux_send_failed', 'tmux_send_timeout')
   }
   // Enter as a separate key so multiline bodies stay literal under -l.
-  const enter = spawnSync('tmux', ['send-keys', '-t', TMUX_SESSION, 'Enter'], { encoding: 'utf8' })
+  const enter = spawn('tmux', ['send-keys', '-t', TMUX_SESSION, 'Enter'], commandOpts)
   if (enter.status !== 0) {
-    return { ok: false, reason: 'tmux_enter_failed', detail: enter.stderr || enter.error?.message }
+    return tmuxFailure(enter, 'tmux_enter_failed', 'tmux_enter_timeout')
   }
-  return { ok: true }
+  for (let attempt = 0; attempt < confirmAttempts; attempt += 1) {
+    const pane = spawn('tmux', ['capture-pane', '-pt', TMUX_SESSION, '-S', '-80'], commandOpts)
+    if (pane.status === 0 && typeof pane.stdout === 'string' && pane.stdout.includes(marker)) {
+      return { ok: true, spool_path: spoolPath, marker }
+    }
+    if (pane.status !== 0 && (pane?.error?.code === 'ETIMEDOUT' || pane?.signal === 'SIGTERM')) {
+      return tmuxFailure(pane, 'tmux_confirm_failed', 'tmux_confirm_timeout')
+    }
+  }
+  return { ok: false, reason: 'tmux_delivery_unconfirmed', spool_path: spoolPath, marker }
 }
 
 export async function runCycle(opts = {}) {
@@ -154,7 +244,7 @@ export async function runCycle(opts = {}) {
   const receipts = []
   for (const message of messages) {
     const nudge = formatClaudeCodeNudge(message)
-    const handoff = deliver(nudge)
+    const handoff = deliver(nudge, message)
     if (!handoff.ok) {
       log('deliver_fail', {
         reason: handoff.reason,
