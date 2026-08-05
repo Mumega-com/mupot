@@ -788,6 +788,8 @@ export async function createTask(
     result: null,
     completed_at: null,
     gate_owner: input.gate_owner ?? null,
+    priority: null,
+    parent_task_id: null,
     created_at: now,
     updated_at: now,
   }
@@ -808,13 +810,15 @@ export async function createTask(
       task.result,
       task.completed_at,
       task.gate_owner,
+      task.priority,
+      task.parent_task_id,
       task.created_at,
       task.updated_at,
     ]
     if (fence) {
       taskInsert = await env.DB.prepare(
-        `INSERT INTO tasks (id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at)
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        `INSERT INTO tasks (id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, priority, parent_task_id, created_at, updated_at)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
           WHERE EXISTS (
             SELECT 1 FROM routine_runs rr
              WHERE rr.id = ? AND rr.tenant = ? AND rr.project_id = ?
@@ -828,8 +832,8 @@ export async function createTask(
       ).bind(...values, fence.runId, fence.tenant, task.project_id).run()
     } else {
       taskInsert = await env.DB.prepare(
-        `INSERT INTO tasks (id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO tasks (id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, priority, parent_task_id, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).bind(...values).run()
     }
   } catch (error) {

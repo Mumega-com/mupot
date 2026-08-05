@@ -218,4 +218,27 @@ describe('Port 1.3 agent profile (0068) — real SQL', () => {
     // '%' would match everything if not escaped; it should match literally → 0 rows.
     expect(await findAgentsByName(env, '%')).toHaveLength(0)
   })
+
+  it('resolve_agent returns newly created agents in the same session (dogfooding gap)', async () => {
+    // Gap found by dogfooding: resolve_agent returned EMPTY for slugs create_agent
+    // had just successfully created in the same session. This test verifies the fix.
+    const createRes = await createAgent(env, 'sq-a', {
+      slug: 'onboarded-agent',
+      name: 'Onboarded Agent',
+      role: 'analyst',
+    })
+    expect(createRes.ok).toBe(true)
+    if (!createRes.ok) return
+
+    // Immediately search for the agent by its slug in the same session.
+    // Both exact slug match and partial name match should work.
+    const bySlug = await findAgentsByName(env, 'onboarded-agent')
+    expect(bySlug).toHaveLength(1)
+    expect(bySlug[0].id).toBe(createRes.value.id)
+    expect(bySlug[0].slug).toBe('onboarded-agent')
+
+    const byName = await findAgentsByName(env, 'Onboarded')
+    expect(byName).toHaveLength(1)
+    expect(byName[0].id).toBe(createRes.value.id)
+  })
 })

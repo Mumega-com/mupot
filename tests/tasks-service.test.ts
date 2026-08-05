@@ -89,6 +89,8 @@ describe('createTask', () => {
       null, // result — unset on create
       null, // completed_at — unset on create
       null, // gate_owner — unset on create
+      null, // priority — unset on create
+      null, // parent_task_id — unset on create
       task.created_at,
       task.updated_at,
     ])

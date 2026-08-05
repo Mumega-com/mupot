@@ -297,6 +297,9 @@ export interface Task {
   // (agent, dashboard, MCP client) that title/body originated from an external pot and should
   // be treated as untrusted content, not as a trusted local instruction. See migrations/0063.
   source_pot?: string | null
+  // Migration 0076: priority (backlog ordering) and parent_task_id (hierarchy).
+  priority: 'P0' | 'P1' | 'P2' | 'P3' | null
+  parent_task_id: string | null
   created_at: string
   updated_at: string
 }
