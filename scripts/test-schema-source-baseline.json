@@ -1,0 +1,32 @@
+{
+  "_why": "Files that build a test schema by hand while importing production code. RATCHET: this list may only shrink. scripts/check-test-schema-source.mjs fails on any file not listed, and ALSO fails if a listed file no longer violates (a fixed file must leave the list, or the ratchet becomes an exemption).",
+  "_measured": "2026-08-05, against origin/main after mupot#710",
+  "files": [
+    "tests/addon-bindings.test.ts",
+    "tests/addon-loop-instantiation.test.ts",
+    "tests/addon-routes.test.ts",
+    "tests/addon-service.test.ts",
+    "tests/backlog-provenance-sqlite.test.ts",
+    "tests/content-proposal-loop-sqlite.test.ts",
+    "tests/cro-apply-loop.test.ts",
+    "tests/fixtures/marketing-monitor-intrinsic-poisoning.ts",
+    "tests/fleet-agent-liveness.test.ts",
+    "tests/flight-meta.test.ts",
+    "tests/inbox-fence-sqlite.test.ts",
+    "tests/marketing-monitor-opportunities.test.ts",
+    "tests/marketing-monitor-service.test.ts",
+    "tests/mcp-addon-tools.test.ts",
+    "tests/mcp-flight-tools.test.ts",
+    "tests/mcp-loop-tools.test.ts",
+    "tests/mcp-workflow-circuit-tools.test.ts",
+    "tests/members-capability-sqlite.test.ts",
+    "tests/project-readable-squads.test.ts",
+    "tests/routine-cancellation-fence.test.ts",
+    "tests/seo-meta-fix-loop-sqlite.test.ts",
+    "tests/task-assignee-sqlite.test.ts",
+    "tests/tasks-cross-squad-assignment.test.ts",
+    "tests/tasks-source-pot-assignment-rbac.test.ts",
+    "tests/workflow-circuits-service.test.ts",
+    "tests/workflow-pipeline.test.ts"
+  ]
+}
