@@ -1,0 +1,834 @@
+{
+  "triage_date": "2026-08-05",
+  "total_archived": 137,
+  "note": "Issues archived during 2026-08-05 triage. Can be recovered if needed during future sprint planning.",
+  "recovery_instructions": [
+    "1. Search for issue # in GitHub",
+    "2. Re-open with reference to this triage date",
+    "3. Add current context and repro steps if still relevant"
+  ],
+  "issues": [
+    {
+      "number": 621,
+      "title": "[media] Add first-class image support for agents, tasks, memory, messages, and evidence",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 5d, can revisit in future sprint"
+    },
+    {
+      "number": 620,
+      "title": "[presence] Return lease expiry and next-heartbeat guidance to MCP clients",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 5d, can revisit in future sprint"
+    },
+    {
+      "number": 619,
+      "title": "[regression] Project-bound MCPWP task mirrors to tenant-default repository",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 5d, can revisit in future sprint"
+    },
+    {
+      "number": 616,
+      "title": "Duplicate migration numbers 0068 and 0069 block safe tenant-pot upgrades",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 5d, can revisit in future sprint"
+    },
+    {
+      "number": 613,
+      "title": "Daily Orchestration Pulse v0 \u2014 seven-day shadow proof",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 5d, can revisit in future sprint"
+    },
+    {
+      "number": 612,
+      "title": "Pausing an agent must reconcile its assigned and in-progress work",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 7d, can revisit in future sprint"
+    },
+    {
+      "number": 611,
+      "title": "Fleet: separate agent intent from credential, transport, presence, and endpoint readiness",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 7d, can revisit in future sprint"
+    },
+    {
+      "number": 609,
+      "title": "torivers.com marketplace: build MCP-client support (currently zero)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 7d, can revisit in future sprint"
+    },
+    {
+      "number": 608,
+      "title": "Fractal/nested workflow-circuits: sub_circuit node type + click-to-drill-down",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 7d, can revisit in future sprint"
+    },
+    {
+      "number": 606,
+      "title": "Addon: SOS + brain become mupot modules \u2014 retire the parallel substrate",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 8d, can revisit in future sprint"
+    },
+    {
+      "number": 605,
+      "title": "[GitHub addon] Project-scoped repository homes, multi-install bindings, and agent import",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 8d, can revisit in future sprint"
+    },
+    {
+      "number": 602,
+      "title": "MCP session can read status while send writes fail as session_expired",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 8d, can revisit in future sprint"
+    },
+    {
+      "number": 601,
+      "title": "Start gate must not assign project seed work to stale duplicate agents",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 8d, can revisit in future sprint"
+    },
+    {
+      "number": 597,
+      "title": "Routine proposal errors should identify assignment mismatch",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 8d, can revisit in future sprint"
+    },
+    {
+      "number": 595,
+      "title": "Release preflight must fail when PUBLIC_ORIGIN is missing",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 8d, can revisit in future sprint"
+    },
+    {
+      "number": 593,
+      "title": "Audit historical duplicate migration ledger entry on Mumega pot",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 8d, can revisit in future sprint"
+    },
+    {
+      "number": 592,
+      "title": "Harden append-only verdict guard against future schema columns",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 8d, can revisit in future sprint"
+    },
+    {
+      "number": 589,
+      "title": "Design addon upgrade migration and retire the native one-minor bridge",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 8d, can revisit in future sprint"
+    },
+    {
+      "number": 585,
+      "title": "test(addons): remove random UUID ordering from concurrent generation assertion",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 8d, can revisit in future sprint"
+    },
+    {
+      "number": 584,
+      "title": "[v0.26] Consolidate console navigation around Projects and unified Access",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 8d, can revisit in future sprint"
+    },
+    {
+      "number": 577,
+      "title": "Runtime: bind Mupot inbox delivery to an exact Codex thread and wake/resume it",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 8d, can revisit in future sprint"
+    },
+    {
+      "number": 576,
+      "title": "Branch and PR integration map \u2014 2026-07-26",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 9d, can revisit in future sprint"
+    },
+    {
+      "number": 574,
+      "title": "[codex] Build the GEO baseline scanner \u2014 grounded Vertex queries \u2192 PostHog (the actual product)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 10d, can revisit in future sprint"
+    },
+    {
+      "number": 573,
+      "title": "[codex] Gate #571 (prod drift) + design the per-pot cost ledger (the fractal's missing instrument)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 10d, can revisit in future sprint"
+    },
+    {
+      "number": 570,
+      "title": "/agents/:id page view has no squad-scoped authz \u2014 slug resolve makes it enumerable",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 10d, can revisit in future sprint"
+    },
+    {
+      "number": 545,
+      "title": "[BLOCK] PR #493: revocation-blind sockets + stale expiry",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 10d, can revisit in future sprint"
+    },
+    {
+      "number": 544,
+      "title": "Architecture: canonical runtime sessions and cross-harness adapters",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 8d, can revisit in future sprint"
+    },
+    {
+      "number": 541,
+      "title": "inbox tool: consume by explicit message ids, not just limit",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 11d, can revisit in future sprint"
+    },
+    {
+      "number": 533,
+      "title": "review\u2192completed unreachable: applyProjectCompletionVerdict never wired into the loop",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 11d, can revisit in future sprint"
+    },
+    {
+      "number": 532,
+      "title": "[engineering] Non-standard monoliths: god-file dashboard/MCP + duplicated helpers",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 11d, can revisit in future sprint"
+    },
+    {
+      "number": 531,
+      "title": "[incomplete] Departments gated-ACT surface ships stub ports and unwired executors",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 11d, can revisit in future sprint"
+    },
+    {
+      "number": 530,
+      "title": "[conflicting] Three parallel RBAC planes disagree (memberships vs capabilities vs legacy role escape)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 11d, can revisit in future sprint"
+    },
+    {
+      "number": 528,
+      "title": "[onboarding] Make agent creation, squad access, and MCP key setup one coherent flow",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 5d, can revisit in future sprint"
+    },
+    {
+      "number": 526,
+      "title": "local-browser-smoke: activate step fails start-gate (no_writable_squad), blocks PR #524 CI green",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 11d, can revisit in future sprint"
+    },
+    {
+      "number": 490,
+      "title": "Brain links wrong GitHub issue number to squad-latency finding",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 13d, can revisit in future sprint"
+    },
+    {
+      "number": 460,
+      "title": "review-worker: 2 must-fix before REVIEW_AUTOMERGE=1 (auto-merge flag-flip blockers)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 14d, can revisit in future sprint"
+    },
+    {
+      "number": 452,
+      "title": "projectManageAccessFor inlines bound params \u2014 use json_each (D1 param-limit fail-closed at ~100 squads)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 14d, can revisit in future sprint"
+    },
+    {
+      "number": 448,
+      "title": "review-wake: constrain resolvable gate_owner to caller-visible capabilities (cross-squad amplification)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 11d, can revisit in future sprint"
+    },
+    {
+      "number": 442,
+      "title": "Dashboard addon state\u2192button mapping may render wrong action under identity drift",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 14d, can revisit in future sprint"
+    },
+    {
+      "number": 434,
+      "title": "[P1][ECC] DME operator \u2014 install ECC marketing kit in dme-hermes pod + wire pot governance",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 15d, can revisit in future sprint"
+    },
+    {
+      "number": 432,
+      "title": "[P0][ECC] Guides-as-marketing \u2014 long-form guides shipped as X threads",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 15d, can revisit in future sprint"
+    },
+    {
+      "number": 431,
+      "title": "[P0][ECC] Gate-as-wedge \u2014 npx @mumega/gate + GitHub-App PR-auditor (SARIF \u00b7 evidence packs)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 15d, can revisit in future sprint"
+    },
+    {
+      "number": 430,
+      "title": "[P0][ECC] Dual-format skills + canonical-source (cross-harness portability)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 15d, can revisit in future sprint"
+    },
+    {
+      "number": 429,
+      "title": "[P0][ECC] Supply-chain CI hardening (--ignore-scripts \u00b7 audit signatures \u00b7 workflow validator \u00b7 IOC watch)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 15d, can revisit in future sprint"
+    },
+    {
+      "number": 428,
+      "title": "[P0][ECC] Agent-runtime security hooks (block-no-verify \u00b7 GateGuard \u00b7 secret-scan \u00b7 MCP audit)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 15d, can revisit in future sprint"
+    },
+    {
+      "number": 427,
+      "title": "[P0][ECC] Instincts schema + promotion gate (memory \u2192 FRC no-silent-promotion)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 15d, can revisit in future sprint"
+    },
+    {
+      "number": 426,
+      "title": "[EPIC] ECC extraction \u2014 features to adopt (instincts \u00b7 security hooks \u00b7 cross-harness \u00b7 gate-as-wedge)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 15d, can revisit in future sprint"
+    },
+    {
+      "number": 411,
+      "title": "DX: docker-compose try-it sandbox + offline vector/embeddings fallback",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 15d, can revisit in future sprint"
+    },
+    {
+      "number": 392,
+      "title": "[DESIGN-GATE] Secure Agent Host and DME Hermes cutover",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 16d, can revisit in future sprint"
+    },
+    {
+      "number": 380,
+      "title": "fix(mcp): preserve agent identity contract for Hermes operator access",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 16d, can revisit in future sprint"
+    },
+    {
+      "number": 379,
+      "title": "[agents] Preflight quota and offer explicit recovery when enrollment hits agent_limit_reached",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 13d, can revisit in future sprint"
+    },
+    {
+      "number": 378,
+      "title": "[onboarding] Show a deterministic post-setup receipt with identities, quota, MCP, and login state",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 11d, can revisit in future sprint"
+    },
+    {
+      "number": 376,
+      "title": "[BUG] Duplicate/cruft member rows on mumega pot (multiple 'Codex', 'Mupot Product' entries)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 19d, can revisit in future sprint"
+    },
+    {
+      "number": 372,
+      "title": "[bug] fleet-runtime systemd units fail to load \u2014 WorkingDirectory= gets quote-wrapped (systemd doesn't strip)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 16d, can revisit in future sprint"
+    },
+    {
+      "number": 368,
+      "title": "[P1][fleet] Route signed host control to one per-host consumer",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 16d, can revisit in future sprint"
+    },
+    {
+      "number": 363,
+      "title": "[hardening] fleet daemons: trust-anchor perm check + at-most-once control semantics (2 LOW from audit)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 16d, can revisit in future sprint"
+    },
+    {
+      "number": 358,
+      "title": "[roadmap] Agent email channel (AgentMail) \u2014 mupot as a teammate across IM / email / meetings",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 21d, can revisit in future sprint"
+    },
+    {
+      "number": 355,
+      "title": "[security] validateFlightMetaReferences has no tenant filter (cross-tenant id reference)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 16d, can revisit in future sprint"
+    },
+    {
+      "number": 354,
+      "title": "[flight] ATC clearance v1 hardening: atomic guard + staleness + ref normalization",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 16d, can revisit in future sprint"
+    },
+    {
+      "number": 352,
+      "title": "[P1][runtime] Add supported macOS launchd installation",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 16d, can revisit in future sprint"
+    },
+    {
+      "number": 350,
+      "title": "[P2][release] Include closed milestones in integrity export plan",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 16d, can revisit in future sprint"
+    },
+    {
+      "number": 344,
+      "title": "Make D1 tenant export package restore deterministically across foreign keys",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 16d, can revisit in future sprint"
+    },
+    {
+      "number": 342,
+      "title": "Fail task completion when model output is truncated or misses done_when",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 23d, can revisit in future sprint"
+    },
+    {
+      "number": 259,
+      "title": "[X] Durable, reliably-wakeable 2nd adversarial gate lens",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 35d, can revisit in future sprint"
+    },
+    {
+      "number": 258,
+      "title": "[X] Identity projects from qNFT + DNA (not flat rows)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 35d, can revisit in future sprint"
+    },
+    {
+      "number": 257,
+      "title": "[P4] Retire SOS bus for the squad",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 27d, can revisit in future sprint"
+    },
+    {
+      "number": 256,
+      "title": "[P3] Repoint squad wake-hooks / bus identity SOS \u2192 mupot",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 27d, can revisit in future sprint"
+    },
+    {
+      "number": 254,
+      "title": "[P3] Runtime loops consume the mupot inbox (not SOS)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 27d, can revisit in future sprint"
+    },
+    {
+      "number": 253,
+      "title": "[P2] Control surface \u2014 #agent-bus = top, #gates = signals",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 27d, can revisit in future sprint"
+    },
+    {
+      "number": 249,
+      "title": "[EPIC] Live mupot \u2014 squad runs, heartbeats, coordinates on mupot; retire SOS",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 22d, can revisit in future sprint"
+    },
+    {
+      "number": 238,
+      "title": "[ARCH] GCP-native pot \u2014 port-abstraction feasibility + the Durable-Object replacement blocker (trigger-gated)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 41d, can revisit in future sprint"
+    },
+    {
+      "number": 188,
+      "title": "Idempotency keys on bus consume + deploy/migration (M)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 43d, can revisit in future sprint"
+    },
+    {
+      "number": 184,
+      "title": "MCP supply chain \u2014 hash-pin tool servers + sanitize descriptions (S)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 16d, can revisit in future sprint"
+    },
+    {
+      "number": 181,
+      "title": "[strategy] pot \u2192 torivers marketplace publish handoff \u2014 sell the process via the JV channel",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 49d, can revisit in future sprint"
+    },
+    {
+      "number": 175,
+      "title": "[SPRINT] Billing / entitlement layer \u2014 GA + marketplace unlock",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 16d, can revisit in future sprint"
+    },
+    {
+      "number": 172,
+      "title": "Audit: align Hermes webhook/relay auth docs and route tests",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 49d, can revisit in future sprint"
+    },
+    {
+      "number": 171,
+      "title": "Audit: align plugin v0.2 docs, status probe, and credential schema",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 49d, can revisit in future sprint"
+    },
+    {
+      "number": 169,
+      "title": "Audit: fix Fleet UI route mismatch and add route coverage",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 49d, can revisit in future sprint"
+    },
+    {
+      "number": 167,
+      "title": "[EPIC] mupot substrate \u2014 sealed ports (LEGO) + child overlay + upstream merge",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 49d, can revisit in future sprint"
+    },
+    {
+      "number": 162,
+      "title": "feat(dashboard): pot check-in / check-out in the switcher (presence-aware)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 49d, can revisit in future sprint"
+    },
+    {
+      "number": 155,
+      "title": "[P3] A5: GitHub plan-tier auto-detection (deferred \u2014 unreliable)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 52d, can revisit in future sprint"
+    },
+    {
+      "number": 154,
+      "title": "[P2] Outbound Project writeback (pot status \u2192 board) \u2014 #23 follow-on",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 52d, can revisit in future sprint"
+    },
+    {
+      "number": 153,
+      "title": "[P2] D2: review gate for agent-authored PRs (define + wire)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 52d, can revisit in future sprint"
+    },
+    {
+      "number": 152,
+      "title": "[P2] Bridge: tentacle\u2192squid alias resolution (kasra-code \u2192 kasra identity)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 52d, can revisit in future sprint"
+    },
+    {
+      "number": 149,
+      "title": "[P1] Provision squid agents in the pot (kasra, loom, \u2026) \u2014 unblocks the GitHub board\u2192agent loop",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 52d, can revisit in future sprint"
+    },
+    {
+      "number": 143,
+      "title": "[identity] Classify bus identities (kind + principal) \u2014 collapse surfaces, tombstone duplicates",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 52d, can revisit in future sprint"
+    },
+    {
+      "number": 140,
+      "title": "[identity] Lineage countersign backlog \u2014 empty descriptors + River self-seal knot (200.107)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 52d, can revisit in future sprint"
+    },
+    {
+      "number": 139,
+      "title": "[identity] qNFT mint cryptographic signing \u2014 Ed25519 + resolvable registry + VC envelope",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 52d, can revisit in future sprint"
+    },
+    {
+      "number": 127,
+      "title": "[epic] Dashboard consolidation \u2014 pot dashboard canonical, salvage mumega.com UX, retire the React console",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 47d, can revisit in future sprint"
+    },
+    {
+      "number": 123,
+      "title": "[identity] DID+VC identity layer \u2014 Mumega as DID issuer, badges as Verifiable Credentials (doctrine: IDENTITY-WORLD-MODEL)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 54d, can revisit in future sprint"
+    },
+    {
+      "number": 122,
+      "title": "[connector] GHL OAuth connector \u2014 login flow + un-gate s184, leads flow into the GHL pipeline",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 54d, can revisit in future sprint"
+    },
+    {
+      "number": 121,
+      "title": "[dashboard] Leads/Pipeline screen \u2014 demo requests + CRM contacts land here, operator works them",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 54d, can revisit in future sprint"
+    },
+    {
+      "number": 120,
+      "title": "[design] Bespoke codex hero/section imagery for /mupot commercial page",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 54d, can revisit in future sprint"
+    },
+    {
+      "number": 115,
+      "title": "S-TENANT-AGENT-CONNECT \u2014 wake-hooks + cross-project bus (self-serve, end manual tmux wiring)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 54d, can revisit in future sprint"
+    },
+    {
+      "number": 113,
+      "title": "S-DIGID-SALES-POT \u2014 first real tenant deployment (Gavin sales / Hadi admin)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 54d, can revisit in future sprint"
+    },
+    {
+      "number": 112,
+      "title": "S-TORIVERS-MUPOT \u2014 torivers gateway+SDK + enterprise on-prem",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 54d, can revisit in future sprint"
+    },
+    {
+      "number": 111,
+      "title": "S-ORGANISM-PRIMACY-FLOCK \u2014 single-writer primacy + ambient flock",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 54d, can revisit in future sprint"
+    },
+    {
+      "number": 110,
+      "title": "S-ORGANISM-DISCOVERY \u2014 capability cards + Tailscale/Headscale mesh",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 54d, can revisit in future sprint"
+    },
+    {
+      "number": 109,
+      "title": "S-QNFT-CHARACTER \u2014 qNFT living character sheet (badges=earned caps, cosmetic layer, HR record)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 54d, can revisit in future sprint"
+    },
+    {
+      "number": 108,
+      "title": "S-MUPOT-DESKTOP \u2014 the aquarium (Tauri muggle app, connect-your-agent, voice optional)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 54d, can revisit in future sprint"
+    },
+    {
+      "number": 107,
+      "title": "S-MCPWP-POT \u2014 mcpwp as first sovereign dogfood pot + cognitive sandbox",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 54d, can revisit in future sprint"
+    },
+    {
+      "number": 105,
+      "title": "S-MUPOT-SANDBOX \u2014 5 isolation seams (host/cognitive/governor)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 16d, can revisit in future sprint"
+    },
+    {
+      "number": 104,
+      "title": "S-MUPOT-PORTABLE \u2014 Env adapters + Tier-1 own-CF + workerd + harness-agnostic gateway",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 16d, can revisit in future sprint"
+    },
+    {
+      "number": 103,
+      "title": "S-COCKPIT-MUMEGA-v0 \u2014 colony read-view (renders per-pot feeds)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 54d, can revisit in future sprint"
+    },
+    {
+      "number": 102,
+      "title": "S-BRAIN-GOV-VPS-3 \u2014 per-cycle control-flag read (pause/budget/kill)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 54d, can revisit in future sprint"
+    },
+    {
+      "number": 101,
+      "title": "S-BRAIN-GOV-VPS-2 \u2014 root-event dedup + self-output gate",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 54d, can revisit in future sprint"
+    },
+    {
+      "number": 100,
+      "title": "[meta] Pot work-spine: work from GitHub issues, leave a PR/issue trace (not internal memory)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 54d, can revisit in future sprint"
+    },
+    {
+      "number": 90,
+      "title": "Workforce ladder: Slack as a window onto the pot (rungs 2-5)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 56d, can revisit in future sprint"
+    },
+    {
+      "number": 80,
+      "title": "Wire the Python brain caller (SOS/sovereign) \u2192 demonstrate the loop end-to-end",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 56d, can revisit in future sprint"
+    },
+    {
+      "number": 78,
+      "title": "Harden: per-tenant rate-limit on POST /api/flights (money path)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 56d, can revisit in future sprint"
+    },
+    {
+      "number": 74,
+      "title": "Digid: go live on the GitHub weave (PAT + webhook secret + webhook config)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 56d, can revisit in future sprint"
+    },
+    {
+      "number": 72,
+      "title": "Auth: add GitHub OAuth + Cloudflare Access as login providers (dashboard + onboarding)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 19d, can revisit in future sprint"
+    },
+    {
+      "number": 53,
+      "title": "Flock 6 \u2014 harness skill/plugin packs (Claude Code, Codex, Hermes, openclaw)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 56d, can revisit in future sprint"
+    },
+    {
+      "number": 51,
+      "title": "Auth: unify OAuth users and capability members into one operator model",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 19d, can revisit in future sprint"
+    },
+    {
+      "number": 50,
+      "title": "Bus: keep public emit allowlist in sync with BusEventType",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 56d, can revisit in future sprint"
+    },
+    {
+      "number": 46,
+      "title": "Flock 4 \u2014 Fleet wake/control + flock-health UX",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 56d, can revisit in future sprint"
+    },
+    {
+      "number": 45,
+      "title": "Flock 3 \u2014 agent enrollment kit (Mac + VPS join)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 19d, can revisit in future sprint"
+    },
+    {
+      "number": 44,
+      "title": "Flock 2 \u2014 scoped Digid bus token + egress posture",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 56d, can revisit in future sprint"
+    },
+    {
+      "number": 42,
+      "title": "Digid: clean up tenant seed data and agent model config",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 56d, can revisit in future sprint"
+    },
+    {
+      "number": 40,
+      "title": "Digid: make Fleet page real or hide it until bus is configured",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 56d, can revisit in future sprint"
+    },
+    {
+      "number": 39,
+      "title": "Digid: finish Loops UI and gated approval pipeline",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 8d, can revisit in future sprint"
+    },
+    {
+      "number": 38,
+      "title": "1.0.0: freeze the manifest contract + bring-your-own-MCP docs/SDK + live-outcome proof",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 57d, can revisit in future sprint"
+    },
+    {
+      "number": 36,
+      "title": "P5: promote Digid pot to operating + seed outreach squad \u2192 first live gated send",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 57d, can revisit in future sprint"
+    },
+    {
+      "number": 32,
+      "title": "P1: Loop manifest + storage + ResourceRef resolver (MCP-native source/channel seam)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 57d, can revisit in future sprint"
+    },
+    {
+      "number": 31,
+      "title": "GHL: RBAC-gate createOutboundAct when a route caller is added",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 57d, can revisit in future sprint"
+    },
+    {
+      "number": 30,
+      "title": "GHL: per-tenant Workflow-instance cap (prevent unbounded outbound pipelines)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 57d, can revisit in future sprint"
+    },
+    {
+      "number": 29,
+      "title": "Cost: use real token usage from ModelPort instead of the EXECUTE_MAX_TOKENS estimate",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 57d, can revisit in future sprint"
+    },
+    {
+      "number": 24,
+      "title": "Define Mupot product family and physical interface kits",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 56d, can revisit in future sprint"
+    },
+    {
+      "number": 22,
+      "title": "Sovereign inference connector: BYO-brain via OpenAI-compatible local endpoint",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 16d, can revisit in future sprint"
+    },
+    {
+      "number": 21,
+      "title": "mumega join \u2014 device enrollment CLI (kill hand-rolled onboarding)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 58d, can revisit in future sprint"
+    },
+    {
+      "number": 20,
+      "title": "Rust pot-agent: single static binary for on-prem/Edge metal",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 58d, can revisit in future sprint"
+    },
+    {
+      "number": 19,
+      "title": "Enterprise readiness: SSO/SCIM, Teams adapter, audit export, admin console",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 16d, can revisit in future sprint"
+    },
+    {
+      "number": 18,
+      "title": "PWA: installable dashboard + web-push gate notifications",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 58d, can revisit in future sprint"
+    },
+    {
+      "number": 17,
+      "title": "Sandbox execution: pot spawns CF Sandbox MicroVMs (Claude Code + Hermes + GH checkout inside)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 13d, can revisit in future sprint"
+    },
+    {
+      "number": 16,
+      "title": "channels & integrations surfaces (mock screens 9+10 \u2192 real)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 58d, can revisit in future sprint"
+    },
+    {
+      "number": 10,
+      "title": "Visiting-operator sessions: sign-in/sign-out with full trace",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 58d, can revisit in future sprint"
+    },
+    {
+      "number": 9,
+      "title": "Self-host runtime: dockerized pot (workerd/miniflare, local D1+DO)",
+      "category": "BACKLOG",
+      "rationale": "Low priority, no activity in 16d, can revisit in future sprint"
+    }
+  ]
+}
