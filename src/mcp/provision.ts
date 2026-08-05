@@ -76,7 +76,7 @@ const GRANTABLE_AGENT_CAPABILITIES = new Set<Capability>(['observer', 'member', 
 async function emitProvisioned(
   env: Env,
   memberId: string,
-  kind: 'department' | 'squad' | 'agent' | 'token' | 'key' | 'capability' | 'agent_deactivated',
+  kind: 'department' | 'squad' | 'agent' | 'token' | 'token_revoked' | 'key' | 'capability' | 'agent_deactivated',
   id: string,
   extra: { squad_id?: string; agent_id?: string; member_id?: string; capability?: Capability; reason?: string } = {},
 ): Promise<void> {
