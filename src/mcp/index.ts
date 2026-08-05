@@ -2684,6 +2684,38 @@ const toolConnect: ToolSpec = {
     const orgAdmin = hasCapability(grants, 'org', null, 'admin')
     const onSquad = await memberCanOnSquad(env, grants, agentRef.squad_id, 'member')
     if (!orgAdmin && !onSquad) {
+      // A directory-channel seat can NEVER pass this check, by design: B1 in
+      // src/mcp/oauth-authorize.ts sets `capabilities = []` for channel='directory'
+      // regardless of what the member actually holds, so the public OAuth door does not
+      // inherit standing grants. Both branches above are therefore guaranteed false and
+      // NO GRANT CAN FIX IT.
+      //
+      // Saying "no_squad_access / need: member" here is true but actively misleading: it
+      // points the reader at "request squad membership", which is the wrong action. On
+      // 2026-08-05 that cost four round-trips and nearly produced a redundant grant for a
+      // member who already held org:owner — the grant would have changed nothing, because
+      // the directory door discards grants by construction. Name the real cause and the
+      // door that works (mupot#678).
+      if (auth.channel === 'directory') {
+        return fail(403, 'forbidden', {
+          reason: 'directory_channel_zero_capability',
+          detail: [
+            'This session is on the DIRECTORY channel (the public OAuth door used by ChatGPT/Claude connectors),',
+            'which carries NO standing capabilities by design — a member who holds admin or owner elsewhere does',
+            'not inherit those here. Requesting a squad grant will NOT fix this; the directory door discards',
+            `grants by construction. Use a WORKSPACE-channel token instead: ask an admin on agent "${agentRef.slug}"'s`,
+            // Render the ID, never the slug. mint_agent_token resolves through the same
+            // resolveAgentRef contract as connect, so a DUPLICATED slug would come back
+            // `ambiguous_slug` — turning a reference the caller had already resolved
+            // unambiguously (they may have passed the id) back into a dead end, which is
+            // the exact failure this refusal exists to remove. Not hypothetical: six
+            // hadi/codex agent records share slugs today. (codex gate, #681.)
+            `squad to run mint_agent_token { agent: "${agentRef.id}" }, then connect with that bearer.`,
+          ].join(' '),
+          need: 'workspace-channel token',
+          scope: 'channel',
+        })
+      }
       return fail(403, 'forbidden', {
         reason: 'no_squad_access',
         detail: [
