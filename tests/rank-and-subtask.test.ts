@@ -1,14 +1,11 @@
-// tests/task-priority-and-subtasks.test.ts — migrations/0079.
+// tests/rank-and-subtask.test.ts — migrations/0079.
 //
-// The pot could not answer "what is next". Tasks had no priority, so ranking got encoded
-// into TITLES ("[P0] ..."): unsortable, unfilterable, invisible to every view. And with no
-// parent link, a task with five sub-steps became five sibling tasks with the relationship
-// living in prose. Both were found by dogfooding — the operator went to GitHub Projects for
-// ranking because mupot could not do it.
-//
-// Schema is built from the committed migration chain, fail-closed. These tests assert on
-// which ROWS a ranked read returns and in what order; a hand-written CREATE TABLE would be
-// my belief about `tasks`, and #684 is what that costs.
+// FILENAME NOTE: this file is deliberately NOT named after the word it tests.
+// scripts/no-secrets.mjs matches an OpenAI-key shape, and the literal "ta" + "sk-"
+// followed by 20+ word characters satisfies it — so any tests/task-<long-name> file
+// trips the guard on its own path. The fix is the filename. Loosening a secrets
+// scanner so a test file can keep a nicer name is trading a real guard for cosmetics.
+
 
 import { beforeEach, afterEach, describe, expect, it } from 'vitest'
 import { readFileSync, readdirSync } from 'node:fs'

@@ -61,6 +61,10 @@ function createSchema(sqlite: SqliteD1Harness['sqlite']): void {
       squad_id TEXT NOT NULL,
       capability TEXT NOT NULL
     );
+    -- priority + parent_task_id (migrations/0079) added by hand: this fixture hand-writes
+    -- tasks rather than applying the committed chain, so a purely-additive column breaks it
+    -- (persistTaskUpdate writes every column it owns). The fixture did not catch a bug; it
+    -- lied about the schema and blocked a feature. One of the 13 tracked in #703.
     CREATE TABLE tasks (
       id TEXT PRIMARY KEY,
       squad_id TEXT NOT NULL,
@@ -68,6 +72,8 @@ function createSchema(sqlite: SqliteD1Harness['sqlite']): void {
       title TEXT NOT NULL,
       body TEXT NOT NULL,
       done_when TEXT NOT NULL,
+      priority TEXT,
+      parent_task_id TEXT,
       status TEXT NOT NULL,
       assignee_agent_id TEXT,
       github_issue_url TEXT,
