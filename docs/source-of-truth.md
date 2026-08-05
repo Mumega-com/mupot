@@ -51,7 +51,7 @@ Each of these was, until today, somewhere priority might live. None of them is a
 | Surface | Was | Now |
 |---|---|---|
 | SOS bus task board | a backlog | **execution transport.** Wakes an agent, carries a brief. Never the ranked list. The bus is poll-only and consume-once — reading drains it, so it cannot hold state anyone can re-read |
-| mupot internal tasks | a backlog | **execution records.** What an agent is doing and what it produced. Priority came out of this because mupot has no priority field, which is itself a product gap, not something to work around by typing `[P0]` into a title |
+| mupot internal tasks | a backlog | **execution records** — for now. Priority came out of this because the pot could not rank; that is being fixed in the pot (mupot#710) rather than routed around, so this row is expected to change once ranking has been used in anger |
 | Linear | "human portfolio ranking" | **unused.** Credits lapse ~2026-11-17; adopting it now means a third copy of the same list. Decide by 2026-10-17 or let it lapse |
 | `CLAUDE.md` "Current" | de facto status | **orientation only.** Narrative for a cold start. If a fact there matters operationally it belongs on the board |
 | Session task lists | invisible | **scratch.** Hadi cannot see them. That invisibility already caused a real failure ("I can't see the mission"). Anything worth tracking gets an item |
@@ -76,9 +76,22 @@ Each of these was, until today, somewhere priority might live. None of them is a
 - **185 open issues and 65 open PRs are not ranked.** Only the live work is. The PR count
   grew 55 → 65 in a single day, which makes unlanded mutable work the more dangerous
   number — a stale PR is a merge conflict and an expired gate waiting to happen.
-- **mupot has no priority field**, no parent/subtask field, and `task_update` rejects
-  `approved` with `invalid_status`, which strands tasks in `review`. Found by dogfooding.
-  Until fixed, mupot cannot be the queue even if we wanted it to be.
+- **mupot could not rank.** Tasks had no priority field and no parent/subtask link, so
+  ranking lived in task *titles* (`[P0] …`) — unsortable, unfilterable, invisible to every
+  view. Both are fixed by mupot#710 (migrations/0079). Until that lands and the operator
+  has actually used it, GitHub Project 3 stays the queue; **the intent is to move ranking
+  into the pot**, because a queue we own beats one we rent.
+  - **Correction, recorded rather than quietly dropped:** an earlier version of this list
+    also claimed `task_update` rejects `approved` and "strands tasks in review". That is
+    wrong and it was my error. `approved`/`rejected` are set by **`task_verdict`**, because
+    a task must not approve itself — the refusal is a gate working as designed, and I was
+    using the wrong tool for weeks while calling it a product defect. What was genuinely
+    missing was the signpost: the error now names `task_verdict`. A dead end and a signpost
+    are different products, but only one of them is a bug.
+- **Labels are the next real gap**, and the one that unlocks views: without them there is
+  no "my P0s across projects". Also absent vs. a mature tracker: estimates, comments on
+  tasks, saved filters, milestones, and cycles as first-class objects (projects carry only
+  a `cycle_boundary_at`).
 - **This document is not enforced by anything.** It is a convention. The first time it is
   contradicted by what people actually do, the document is wrong and should be changed
   rather than quietly ignored.
