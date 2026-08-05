@@ -4,7 +4,7 @@
 // (dashboard/API, MCP, IM, channels, agents) should call createTask() instead of
 // hand-writing rows. `task.created` is a post-persistence notification event.
 
-import type { Env, Task, TaskVerdict, BusEvent } from '../types'
+import type { Env, Task, TaskPriority, TaskVerdict, BusEvent } from '../types'
 import { createBus } from '../bus'
 import { assertWritten } from '../lib/receipt'
 import { resolveOutboundGitHubToken } from '../integrations/github-app'
@@ -204,6 +204,10 @@ export interface CreateTaskInput {
   status?: TaskStatus
   assignee_agent_id?: string | null
   gate_owner?: string | null
+  /** Rank (migrations/0079). Omitted/null = untriaged, which is a real state, not a default. */
+  priority?: TaskPriority | null
+  /** Subtask link (migrations/0079). Omitted/null = top-level. */
+  parent_task_id?: string | null
 }
 
 export interface CreateTaskOptions {
@@ -411,7 +415,7 @@ export async function persistTaskUpdate(
   try {
     result = await env.DB.prepare(
       `UPDATE tasks
-          SET title = ?, body = ?, done_when = ?, status = ?, assignee_agent_id = ?, github_issue_url = ?, gate_owner = ?, project_id = ?, completed_at = ?, updated_at = ?
+          SET title = ?, body = ?, done_when = ?, status = ?, priority = ?, parent_task_id = ?, assignee_agent_id = ?, github_issue_url = ?, gate_owner = ?, project_id = ?, completed_at = ?, updated_at = ?
         WHERE id = ? AND updated_at = ? AND project_id IS ?`,
     )
       .bind(
@@ -419,6 +423,8 @@ export async function persistTaskUpdate(
         next.body,
         next.done_when,
         next.status,
+        next.priority ?? null,
+        next.parent_task_id ?? null,
         next.assignee_agent_id,
         next.github_issue_url,
         next.gate_owner,
@@ -831,6 +837,8 @@ export async function createTask(
     id: options.id ?? crypto.randomUUID(),
     squad_id: input.squad_id,
     project_id: projectId,
+    priority: input.priority ?? null,
+    parent_task_id: input.parent_task_id ?? null,
     title: input.title.trim(),
     body: input.body ?? '',
     done_when: input.done_when.trim(),
@@ -875,9 +883,20 @@ export async function createTask(
     // (several exist in this repo) that predate 0077 and never needed to know about it.
     // Only the small set of external-integration callers that actually pass externalSource
     // require the column to exist in their DB.
-    const columns = externalSource !== null ? `${baseColumns}, external_source` : baseColumns
-    const placeholders = externalSource !== null ? '?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?' : '?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?'
-    const values = externalSource !== null ? [...baseValues, externalSource] : baseValues
+    // priority / parent_task_id (migrations/0079) follow the same conditional-append
+    // convention as external_source directly above: referenced ONLY when actually set, so
+    // the common create path never mentions them and stays compatible with any DB that
+    // predates 0079. Built as a list rather than another ternary pair — a third nested
+    // ternary over three optional columns is where an off-by-one bind lands.
+    const extraColumns: string[] = []
+    const extraValues: unknown[] = []
+    if (externalSource !== null) { extraColumns.push('external_source'); extraValues.push(externalSource) }
+    if (input.priority != null) { extraColumns.push('priority'); extraValues.push(input.priority) }
+    if (input.parent_task_id != null) { extraColumns.push('parent_task_id'); extraValues.push(input.parent_task_id) }
+
+    const columns = extraColumns.length > 0 ? `${baseColumns}, ${extraColumns.join(', ')}` : baseColumns
+    const values = [...baseValues, ...extraValues]
+    const placeholders = values.map(() => '?').join(', ')
     if (fence) {
       taskInsert = await env.DB.prepare(
         `INSERT INTO tasks (${columns})

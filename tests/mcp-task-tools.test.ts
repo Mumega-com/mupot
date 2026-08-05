@@ -305,11 +305,19 @@ describe('MCP task cutover tools', () => {
     expect(result.task.assignee_agent_id).toBe(AGENT_ID)
     expect(result.task.body).toBe('updated')
     expect(updates[0].sql).toContain('UPDATE tasks')
+    // NOTE: this pins the UPDATE's exact POSITIONAL bind array, so it breaks on every
+    // purely-additive column — it did here for priority + parent_task_id (migrations/0079),
+    // which the tested behaviour does not involve at all. Kept and updated rather than
+    // loosened: a positional assertion is brittle, but it is also the only thing that would
+    // catch a bind/column misalignment, which is silent corruption rather than a crash.
+    // The two nulls below are priority and parent_task_id, both unset on this task.
     expect(updates[0].args).toEqual([
       'Ship the adapter',
       'updated',
       'task tool tests pass',
       'in_progress',
+      null,
+      null,
       AGENT_ID,
       null,
       null,
