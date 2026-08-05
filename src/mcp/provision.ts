@@ -40,6 +40,7 @@ import {
 import { mcpEndpoint, requiredCanonicalOrigin, wakeContractForAgent } from '../dashboard/connect'
 import { createBus } from '../bus'
 import { resolveDepartmentRef, resolveSquadRef, resolveAgentRef } from '../org/resolve'
+import { listAgentTokensQuery, revokeTokenOwnershipQuery } from './token-queries'
 import { isValidEd25519PublicX, registerAgentPublicKey } from '../fleet/agent-keys'
 import { assertWritten, rowsWritten } from '../lib/receipt'
 import {
@@ -518,15 +519,7 @@ const toolListAgentTokens: ToolSpec = {
     // NEVER select token_hash. There is no path from this tool to a usable secret —
     // raw is show-once at mint and is not stored.
     const rows = await env.DB.prepare(
-      // NOTE: member_tokens has NO `capability` column — a token's capability lives in
-      // `capabilities`, keyed by the token's member. Selecting it here shipped a live
-      // internal_error (mupot#684): the unit mock returned canned rows and never ran the
-      // SQL, so 12 tests passed against a query D1 rejects. Real-schema test below.
-      `SELECT id, member_id, label, channel, created_at, revoked_at
-         FROM member_tokens
-        WHERE agent_id = ?1 AND tenant = ?2
-          ${includeRevoked ? '' : 'AND revoked_at IS NULL'}
-        ORDER BY created_at ASC`,
+      listAgentTokensQuery(includeRevoked),
     )
       .bind(agent.id, env.TENANT_SLUG)
       .all<{ id: string; member_id: string; label: string; channel: string; created_at: string; revoked_at: string | null }>()
@@ -584,8 +577,7 @@ const toolRevokeAgentToken: ToolSpec = {
     // checked against the agent the caller NAMED rather than the one that actually owns
     // the credential.
     const row = await env.DB.prepare(
-      `SELECT id, member_id, agent_id, label, revoked_at
-         FROM member_tokens WHERE id = ?1 AND tenant = ?2 LIMIT 1`,
+      revokeTokenOwnershipQuery(),
     )
       .bind(tokenId, env.TENANT_SLUG)
       .first<{ id: string; member_id: string; agent_id: string | null; label: string; revoked_at: string | null }>()

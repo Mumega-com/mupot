@@ -22,6 +22,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { listAgentTokensQuery, revokeTokenOwnershipQuery } from '../src/mcp/token-queries'
 
 const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
 
@@ -34,18 +35,23 @@ const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
  */
 function applyAllMigrations(sqlite: SqliteD1Harness['sqlite']): void {
   const files = readdirSync(MIGRATIONS_DIR).filter((f) => f.endsWith('.sql')).sort()
+  const failures: string[] = []
   for (const file of files) {
-    const sql = readFileSync(join(MIGRATIONS_DIR, file), 'utf8')
     try {
-      sqlite.exec(sql)
+      sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
     } catch (err) {
-      // D1-only constructs (and already-applied guards) are tolerated; a genuine break
-      // in a migration that builds what we assert on will surface as a missing table.
-      const msg = String(err)
-      if (!/already exists|duplicate column|no such (function|module)|near "PRAGMA"/i.test(msg)) {
-        throw new Error(`migration ${file}: ${msg}`)
-      }
+      failures.push(`${file}: ${String(err)}`)
     }
+  }
+  // FAIL CLOSED. The first version swallowed anything matching /already exists|duplicate
+  // column|no such function|module|near "PRAGMA"/ — broad enough to discard a genuinely
+  // broken migration and then build a schema that is NOT production's, reproducing the
+  // very bug class this file exists to catch, one level up. On this head every migration
+  // applies cleanly under node:sqlite, so the tolerance was never needed. If a real
+  // dialect exception appears later, allow-list the exact filename and the exact expected
+  // message here — never a pattern (mupot#684, gate round 2).
+  if (failures.length > 0) {
+    throw new Error(`migrations did not apply cleanly:\n${failures.join('\n')}`)
   }
 }
 
@@ -76,27 +82,25 @@ describe('member_tokens real schema (mupot#684)', () => {
     }
   })
 
-  // The decisive one: run the tool's REAL query. If it names a column that does not
-  // exist, sqlite throws here exactly as D1 did in production.
-  it("list_agent_tokens' query executes against the real schema", () => {
-    const query = `SELECT id, member_id, label, channel, created_at, revoked_at
-         FROM member_tokens
-        WHERE agent_id = ?1 AND tenant = ?2
-        ORDER BY created_at ASC`
-    expect(() => {
-      harness.sqlite.prepare(query.replace(/\?\d+/g, '?')).all('agent-x', 'mumega')
-    }).not.toThrow()
+  // THE decisive test. It executes the string the HANDLER executes, imported from
+  // production — not a copy. Mutating the handler's query now mutates this test's input.
+  it('the EXPORTED production query executes against the real schema', () => {
+    for (const includeRevoked of [false, true]) {
+      const sql = listAgentTokensQuery(includeRevoked).replace(/\?\d+/g, '?')
+      expect(() => harness.sqlite.prepare(sql).all('agent-x', 'mumega')).not.toThrow()
+    }
   })
 
-  it('the include_revoked variant also executes', () => {
-    const query = `SELECT id, member_id, label, channel, created_at, revoked_at
-         FROM member_tokens
-        WHERE agent_id = ?1 AND tenant = ?2
-          AND revoked_at IS NULL
-        ORDER BY created_at ASC`
-    expect(() => {
-      harness.sqlite.prepare(query.replace(/\?\d+/g, '?')).all('agent-x', 'mumega')
-    }).not.toThrow()
+  it('the exported query names ONLY columns that exist on member_tokens', () => {
+    const cols = (harness.sqlite.prepare('PRAGMA table_info(member_tokens)').all() as { name: string }[])
+      .map((c) => c.name)
+    const selected = listAgentTokensQuery(true)
+      .slice(listAgentTokensQuery(true).indexOf('SELECT') + 6, listAgentTokensQuery(true).indexOf('FROM'))
+      .split(',')
+      .map((c) => c.trim())
+      .filter(Boolean)
+    expect(selected.length).toBeGreaterThan(0)
+    for (const col of selected) expect(cols).toContain(col)
   })
 
   it('REGRESSION: the shipped query naming `capability` throws — proving this test catches it', () => {
