@@ -641,8 +641,27 @@ const toolTaskList: ToolSpec = {
     const baseBinds: unknown[] = [squadRes.squad.id]
     const parsedProjectId = args.project_id == null ? undefined : str(args.project_id)
     if (args.project_id != null && !parsedProjectId) return fail(400, 'invalid_project_id')
-    const projectId = parsedProjectId ?? undefined
+    let projectId = parsedProjectId ?? undefined
+
+    // ADR-001: Session scope — if a session is active with a project scope,
+    // enforce it. A session can never widen its scope (re-scope cannot exceed
+    // the session's authorized projects). If the call specifies a different
+    // project, fail closed.
+    if (auth.session?.project_id) {
+      if (projectId && projectId !== auth.session.project_id) {
+        return fail(403, 'forbidden', {
+          reason: 'session_scope_violation',
+          detail: `This session is scoped to project "${auth.session.project_id}"; cannot access "${projectId}".`,
+        })
+      }
+      projectId = auth.session.project_id
+    }
+
     if (projectId) {
+      // SECURITY: Re-validate project access on every call, even with cached session.
+      // Session scope was authorized at registration time; this confirms the requester
+      // still has access (handles revocation, role changes). Match existing error code
+      // (404) for consistency with canReadProjectForSquad behavior.
       if (!(await canReadProjectForSquad(env, auth, projectId, squadRes.squad.id))) {
         return fail(404, 'project_not_found')
       }
@@ -741,14 +760,26 @@ const toolTaskBoard: ToolSpec = {
     const limit = readLimit(args.limit, 100, 250)
     if (typeof limit !== 'number') return limit
 
+    // ADR-001: Session scope filtering for task_board (same as task_list).
+    const whereClauses = ['squad_id = ?1']
+    const binds: unknown[] = [squadRes.squad.id]
+    if (auth.session?.project_id) {
+      // SECURITY: Re-validate project access on every call (scope re-resolved, never cached).
+      if (!(await canReadProjectForSquad(env, auth, auth.session.project_id, squadRes.squad.id))) {
+        return fail(404, 'project_not_found')
+      }
+      whereClauses.push(`project_id = ?${binds.length + 1}`)
+      binds.push(auth.session.project_id)
+    }
+
     const rows = await env.DB.prepare(
       `SELECT id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, source_pot, created_at, updated_at
          FROM tasks
-        WHERE squad_id = ?1
+        WHERE ${whereClauses.join(' AND ')}
         ORDER BY created_at DESC
-        LIMIT ?2`,
+        LIMIT ?${binds.length + 1}`,
     )
-      .bind(squadRes.squad.id, limit)
+      .bind(...binds, limit)
       .all<Task>()
 
     const columns: Record<TaskStatus, Task[]> = {
@@ -2613,17 +2644,25 @@ const toolOrient: ToolSpec = {
 // pattern: the description and inputSchema use only fictional examples.
 const toolConnect: ToolSpec = {
   name: 'connect',
-  scope: 'self (session-local agent identity claim — no args beyond agent_name)',
+  scope: 'self (session-local agent identity claim + session registration)',
   min: 'authenticated',
   // QA-3 guard: fictional slugs only in the args documentation. Real tenant slugs must
   // never appear here — this string is the public tool description served to connectors.
-  args: '{ agent_name: string }  // the agent slug or id you are connecting as (e.g. "growth-lead", "researcher"); must already exist in this pot',
+  args: '{ agent_name: string, project_id?: string, thread_id?: string }  // agent slug or id (e.g. "growth-lead"), optional project to scope this session, optional thread identifier',
   inputSchema: {
     type: 'object',
     properties: {
       agent_name: {
         type: 'string',
         description: 'The slug or id of the agent you are connecting as. Must already exist in this pot. Examples: "growth-lead", "researcher" (fictional — use your actual agent slug).',
+      },
+      project_id: {
+        type: ['string', 'null'],
+        description: 'Optional: if provided, this session is scoped to access only this project. Caller must have access to the project.',
+      },
+      thread_id: {
+        type: ['string', 'null'],
+        description: 'Optional: caller-provided thread identifier for logging and attribution.',
       },
     },
     required: ['agent_name'],
@@ -2684,6 +2723,42 @@ const toolConnect: ToolSpec = {
     const viewSensitive =
       orgAdmin || isSelf || (await memberCanOnSquad(env, grants, agentRef.squad_id, 'lead'))
 
+    // ADR-001: Session registration (thread identity + optional project scope).
+    // Extract and validate optional project_id and thread_id from args.
+    const projectId = args.project_id === undefined || args.project_id === null ? null : str(args.project_id)
+    if (projectId !== null && !projectId) return fail(400, 'invalid_project_id')
+
+    const threadId = args.thread_id === undefined || args.thread_id === null ? null : str(args.thread_id)
+    if (threadId !== null && !threadId) return fail(400, 'invalid_thread_id')
+
+    // If project_id is provided, verify caller has access to it.
+    if (projectId) {
+      if (!(await canReadProjectForSquad(env, auth, projectId, agentRef.squad_id))) {
+        return fail(403, 'forbidden', {
+          reason: 'no_project_access',
+          detail: `You do not have access to project "${projectId}". Ask a project admin to grant you access.`,
+        })
+      }
+    }
+
+    // Generate session identity: unique sessionId + human-readable address.
+    const sessionId = crypto.getRandomValues(new Uint8Array(16))
+      .reduce((hex, b) => hex + b.toString(16).padStart(2, '0'), '')
+    const address = `${agentRef.id}:${sessionId}`
+
+    // Register session in SESSIONS KV. TTL: 24 hours (sessions are ephemeral work contexts).
+    const session: import('../types').Session = {
+      id: sessionId,
+      agent_id: agentRef.id,
+      project_id: projectId,
+      thread_id: threadId,
+      address,
+      created_at: new Date().toISOString(),
+    }
+    const sessionKey = `${env.TENANT_SLUG}:${sessionId}`
+    const sessionExpirationSecs = 24 * 60 * 60
+    await env.SESSIONS.put(sessionKey, JSON.stringify(session), { expirationTtl: sessionExpirationSecs })
+
     // Resolve the full orient packet for the claimed agent (read-only, no D1 write).
     const { data, notFound } = await buildOrient(
       env,
@@ -2698,11 +2773,15 @@ const toolConnect: ToolSpec = {
     return done({
       connection_status: 'hot',
       claimed_agent: { id: agentRef.id, slug: agentRef.slug, name: agentRef.name },
-      // SESSION-LOCAL binding note: this does not write member_tokens.agent_id.
-      // To promote to a permanent weld (so reconnects are automatic), ask an admin
-      // to call mint_agent_token { agent: "<id>" } and use the issued token going forward.
+      // ADR-001: Session registration result.
+      session: {
+        id: sessionId,
+        address,
+        project_id: projectId,
+        created_at: session.created_at,
+      },
       binding: 'session_local',
-      next_step: 'You are now hot. Call orient {} (or rely on this packet) for your full basin-drop. For a permanent identity weld ask an admin to call mint_agent_token.',
+      next_step: 'You are now hot. Call orient {} (or rely on this packet) for your full basin-drop. Include session id in subsequent calls for project-scoped access.',
       packet: data,
       brief: renderBrief(data),
     })
@@ -2838,6 +2917,35 @@ function validateArgs(schema: JsonSchema, args: Record<string, unknown>): string
   return null
 }
 
+// ADR-001: Load optional session from KV (resolved by sessionId header).
+// Sessions are thread-scoped work contexts; if a session is resolved, task queries
+// filter by the session's project scope. If no session is provided, falls back to
+// agent.squad_id (no filtering — backward compatible).
+//
+// SECURITY: Sessions are bound to the requesting agent_id. A session fetched for
+// agent A by a token claiming to be agent B is rejected (return null). This prevents
+// cross-agent session hijacking.
+async function loadSession(
+  env: Env,
+  tenant: string,
+  sessionId: string | null | undefined,
+  boundAgentId: string | null | undefined,
+): Promise<import('../types').Session | null> {
+  if (!sessionId) return null
+  try {
+    const sessionKey = `${tenant}:${sessionId}`
+    const data = await env.SESSIONS.get(sessionKey, 'json')
+    if (!data) return null
+    const session = data as import('../types').Session
+    // SECURITY: Bind session to the requester. A session can only be used by the
+    // agent it was created for (session.agent_id). Mismatch = rejection.
+    if (boundAgentId && session.agent_id !== boundAgentId) return null
+    return session
+  } catch {
+    return null
+  }
+}
+
 export async function invokeTool(
   auth: AuthContext,
   env: Env,
@@ -2917,6 +3025,14 @@ async function handleJsonRpc(c: import('hono').Context<AppEnv>, body: JsonRpcReq
       return rpcError(id, -32001, 'unauthenticated', undefined, 401)
     }
 
+    // ADR-001: Load optional session from X-Session-Id header.
+    // Sessions are bound to boundAgentId (the agent this token is welded to).
+    const sessionId = c.req.header('x-session-id')
+    if (sessionId) {
+      auth.sessionId = sessionId
+      auth.session = await loadSession(c.env, auth.tenant, sessionId, auth.boundAgentId)
+    }
+
     const params = typeof body.params === 'object' && body.params !== null ? body.params as Record<string, unknown> : {}
     const outcome = await invokeTool(auth, c.env, params.name, params.arguments, new URL(c.req.url).origin)
     if (outcome.ok) return rpcResult(id, mcpCallResult(outcome.tool as string, outcome.result))
@@ -2981,6 +3097,14 @@ mcpApp.post('/', async (c) => {
   if (!auth) return c.json({ error: 'unauthenticated' }, 401)
   if (auth.tenant !== c.env.TENANT_SLUG) {
     return c.json({ error: 'forbidden', reason: 'tenant_scope' }, 403)
+  }
+
+  // ADR-001: Load optional session from X-Session-Id header.
+  // Sessions are bound to boundAgentId (the agent this token is welded to).
+  const sessionId = c.req.header('x-session-id')
+  if (sessionId) {
+    auth.sessionId = sessionId
+    auth.session = await loadSession(c.env, auth.tenant, sessionId, auth.boundAgentId)
   }
 
   const outcome = await invokeTool(auth, c.env, body.tool, body.args, new URL(c.req.url).origin)
