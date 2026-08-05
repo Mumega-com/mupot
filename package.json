@@ -74,6 +74,7 @@
     "hono": "^4.13.0"
   },
   "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.20.2",
     "@cloudflare/workers-types": "^4.20260617.1",
     "playwright": "^1.61.1",
     "sharp": "0.35.3",
