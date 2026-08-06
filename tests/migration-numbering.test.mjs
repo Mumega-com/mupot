@@ -317,6 +317,62 @@ test('every tests/*.test.mjs is wired to a node --test step in CI', () => {
   assert.deepEqual(unwired, [], `these node:test suites run nowhere: ${unwired.join(', ')}`)
 })
 
+test('STACKED PR: clearing the declared base is not enough — main head still binds', (t) => {
+  // PR #398 is the live case (Prime, bypass review of the merged guard): base
+  // `codex/project-routines-v025` head 0061, adds 0062, main at 0079. The guard printed
+  // "migration numbering OK" while that migration can never run against main — it said
+  // "ordering verified" about an ordering that does not exist.
+  //
+  // Staged synthetically rather than replayed from the real repo: a worktree carrying main's
+  // full migration set makes "added vs an old base" meaningless, and my first attempt at
+  // reproducing #398 that way produced a confident wrong answer. Build the shape instead.
+  const dir = scaffold({ targetMigrations: ['0001_init.sql', '0079_x.sql'], addedMigrations: [] })
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const git = (...args) => execFileSync('git', args, { cwd: dir, stdio: 'ignore' })
+
+  // An intermediate branch that forked BEFORE main reached 0079 — it only knows up to 0061.
+  git('checkout', '-q', '-b', 'stack', 'HEAD')
+  rmSync(join(dir, 'migrations', '0079_x.sql'))
+  execFileSync('git', ['add', '-A'], { cwd: dir, stdio: 'ignore' })
+  git('commit', '-qm', 'stack base: no 0079')
+  execFileSync('git', ['write-tree'], { cwd: dir, stdio: 'ignore' })
+  writeFileSync(join(dir, 'migrations', '0061_stack_head.sql'), '-- x\n')
+  execFileSync('git', ['add', '-A'], { cwd: dir, stdio: 'ignore' })
+  git('commit', '-qm', 'stack base head 0061')
+  git('checkout', '-q', 'main')
+  git('fetch', '-q', 'origin')
+
+  // The PR: adds 0062. Above the stack's head (0061), at-or-below main's (0079).
+  writeFileSync(join(dir, 'migrations', '0062_stacked.sql'), '-- x\n')
+
+  const { code, out } = run(dir, { BASE_REF: 'stack' })
+  assert.equal(code, 1, '0062 clears the stack head but can never run against main')
+  assert.match(out, /0062_stacked\.sql/)
+  // The message must say WHICH constraint bound, or the author rebases onto the wrong thing.
+  assert.match(out, /origin\/main/)
+})
+
+test('EVERY green message names the ref it actually compared against', (t) => {
+  // The overstatement half of the same finding. "migration numbering OK" with no ref reads as
+  // "verified", full stop — which is exactly how #398 passed review.
+  //
+  // Both green paths, not one. The first version of this test covered only `above_target_head`,
+  // and a mutation stripping the ref from the OTHER message (`no_migrations_added`) left the
+  // suite 25/25 green. A test that pins one branch of a two-branch claim is the shape this
+  // whole file exists to reject.
+  const withAdd = scaffold({ targetMigrations: ['0079_x.sql'], addedMigrations: ['0080_new.sql'] })
+  t.after(() => rmSync(withAdd, { recursive: true, force: true }))
+  const a = run(withAdd)
+  assert.equal(a.code, 0, a.out)
+  assert.match(a.out, /origin\/main/, 'above_target_head message must name the ref')
+
+  const noAdd = scaffold({ targetMigrations: ['0079_x.sql'], addedMigrations: [] })
+  t.after(() => rmSync(noAdd, { recursive: true, force: true }))
+  const b = run(noAdd)
+  assert.equal(b.code, 0, b.out)
+  assert.match(b.out, /origin\/main/, 'no_migrations_added message must name the ref too')
+})
+
 test('end to end: a malformed BASE_REF is refused, not resolved', (t) => {
   // BASE_REF comes from github.base_ref, which the PR author influences. It never reaches a
   // shell (every git call passes an argument array), but an unexpected value should be a

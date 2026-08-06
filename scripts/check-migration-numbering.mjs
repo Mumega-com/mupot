@@ -47,6 +47,9 @@ import { dirname, join } from 'node:path'
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 const DIR = 'migrations'
+// The chain that will actually be applied. Every added migration must clear THIS head,
+// whatever branch the PR happens to declare as its base.
+const MAIN_REF = 'origin/main'
 
 // A migration filename is EXACTLY four digits, an underscore, a name, `.sql`. Anchored at
 // both ends: a loose /^(\d+)/ would accept `007_x.sql` and `00760_x.sql` and silently
@@ -159,7 +162,7 @@ export function evaluate(targetFiles, localFiles) {
  */
 function mergeTargetRef() {
   const base = process.env.BASE_REF
-  if (!base) return { ref: 'origin/main' }
+  if (!base) return { ref: MAIN_REF }
   if (!/^[A-Za-z0-9._\/-]{1,200}$/.test(base) || base.includes('..')) {
     return { ref: null, bad: base }
   }
@@ -230,14 +233,42 @@ function main() {
     return
   }
   const ref = target.ref
-  const verdict = evaluate(targetMigrations(ref), localMigrations())
+  const local = localMigrations()
+  let verdict = evaluate(targetMigrations(ref), local)
+
+  // STACKED PRs: the declared base is not the constraint. A migration number is claimed
+  // against the chain that will EVENTUALLY be applied — production's — so clearing an
+  // intermediate branch's head proves nothing.
+  //
+  // Measured, not theorised (Prime, bypass review of the merged guard): PR #398 declares base
+  // `codex/project-routines-v025` (head 0061) and adds 0062. Against that base the guard
+  // printed "migration numbering OK". Against main, head 0079, that migration can never run —
+  // and 0062_routine_cancellation_events also collides semantically with main's already-
+  // applied 0074_routine_cancellation_events. The guard said "ordering verified" about an
+  // ordering that does not exist.
+  //
+  // So when the base is not main, added files must clear BOTH heads. The base check stays (it
+  // catches collisions inside the stack) and main is checked as well; main's verdict wins when
+  // it is the one with something to say, so the author gets one clear reason.
+  if (verdict.ok && ref !== MAIN_REF) {
+    const mainVerdict = evaluate(targetMigrations(MAIN_REF), local)
+    if (!mainVerdict.ok) {
+      verdict = {
+        ...mainVerdict,
+        detail: { ...(mainVerdict.detail ?? {}), comparedAgainst: MAIN_REF, declaredBase: ref },
+      }
+    }
+  }
 
   if (verdict.ok) {
+    // Name the ref that was actually compared. "migration numbering OK" with no ref reads as
+    // "verified", full stop — which is exactly how #398 passed.
     if (verdict.reason === 'above_target_head') {
       const names = verdict.detail.added.join(', ')
-      console.log(`migration numbering OK — ${names} sort above ${ref} head ${verdict.detail.head}`)
+      const also = ref === MAIN_REF ? '' : ` (and above ${MAIN_REF})`
+      console.log(`migration numbering OK — ${names} sort above ${ref} head ${verdict.detail.head}${also}`)
     } else {
-      console.log(`migration numbering OK — ${verdict.reason}`)
+      console.log(`migration numbering OK — ${verdict.reason} (vs ${ref})`)
     }
     return
   }
@@ -276,6 +307,11 @@ function main() {
       break
     case 'below_target_head':
       console.error(
+        (verdict.detail.comparedAgainst
+          ? `Your declared base is ${verdict.detail.declaredBase}, but these must ALSO clear\n` +
+            `${verdict.detail.comparedAgainst} — a migration number is claimed against the chain that\n` +
+            'will eventually be applied, not against an intermediate branch.\n\n'
+          : '') +
         `Merge-target head is ${String(verdict.detail.head).padStart(4, '0')}. These added ` +
         'migrations are at or below it:\n' +
         verdict.detail.below
