@@ -2619,6 +2619,47 @@ const toolBootContext: ToolSpec = {
       ? 'call orient (no args — your token is agent-bound) to receive your full basin-drop packet'
       : 'if you know your agent slug/id: call connect { agent_name: "<slug>" } to claim your identity now (session-local). For a permanent weld: ask an org-admin to call mint_agent_token for your agent, then reconnect with the minted token.'
 
+    // THE DOOR MUST SAY WHAT IT IS (#712).
+    //
+    // A directory seat — every agentic harness arrives here: Claude Desktop, claude.ai,
+    // Claude Code, Codex, Cursor — carries ZERO ambient authority by design (B1 ceiling).
+    // boot_context reported `channel: "directory"` and `capabilities: []` and then advised
+    // a next_step as if that were an ordinary session. It is not, and nothing said so.
+    //
+    // The owner spent SEVEN calls discovering it on 2026-08-05: `status` worked, everything
+    // else returned 403, and the connector wrapper replaced mupot's actionable refusal with
+    // "may have been blocked by a firewall or security service". mupot said the right thing
+    // in a body nobody could see.
+    //
+    // So say it HERE, in the one response that always succeeds on this channel. A field
+    // named `channel` is a fact; a field explaining what that fact COSTS is a map. QA-1
+    // ("every refusal/unminted signal must carry the full map out — no dead ends") applied
+    // to refusals but never to the successful boot that precedes them.
+    const directoryNote =
+      auth.channel === 'directory'
+        ? {
+            ambient_authority: 'none',
+            why: [
+              'This is the DIRECTORY channel — the public OAuth door used by agentic harnesses',
+              '(Claude Desktop, claude.ai, Codex, Cursor). It carries NO standing capabilities by',
+              'design: anyone with a verified Google account can reach it, so a member who holds',
+              'owner or admin elsewhere does not inherit those here. Your grants still exist; they',
+              'are simply not ambient on this door.',
+            ].join(' '),
+            you_can: [
+              'status, boot_context — always',
+              'connect { agent_name }, orient { agent } — for agents your member has capability on',
+              'remember, recall — your own memory',
+            ],
+            you_cannot: [
+              'create or update tasks, projects, agents, or any other write',
+              'anything requiring a standing capability, regardless of what you hold elsewhere',
+            ],
+            to_get_write_access:
+              'ask an org-admin for a WORKSPACE-channel token (mint_agent_token), and connect with that bearer. Requesting a squad grant will NOT help — this door discards grants by construction.',
+          }
+        : undefined
+
     return done({
       // principal fields (mirrors the status tool's self-echo, kept stable)
       tenant: auth.tenant,
@@ -2631,6 +2672,8 @@ const toolBootContext: ToolSpec = {
       identity_status: identityStatus,
       bound_agent_id: auth.boundAgentId ?? null,
       next_step: nextStep,
+      // Present ONLY on the directory channel — its absence is itself information.
+      ...(directoryNote ? { channel_limits: directoryNote } : {}),
     })
   },
 }
