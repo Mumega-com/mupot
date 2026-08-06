@@ -155,8 +155,44 @@ jobs:
       # list of migration files is a schema the author invented — it executes real SQL
       # against a database production does not have, which is how #684 stayed green.
       # The baseline may shrink, never grow.
+      # Self-tests FIRST. The guard shipped without any, and the class it was missing
+      # (a hand-written SQL engine, #720) was found by an adversarial review of someone
+      # else's PR rather than by the guard. Each case here is a mutation that was
+      # reproduced against a previous version — including two where the suite passed for
+      # the wrong reason. A gate with no tests is the shape this gate exists to reject.
+      - name: Ratchet self-tests
+        run: node --test tests/test-schema-source.test.mjs
       - name: Guard — tests must build schema from the migration chain
         run: node scripts/check-test-schema-source.mjs
+
+  migration-numbering:
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 is REQUIRED — the guard compares added migrations against the merge
+      # target's head, and a shallow clone cannot read it. It FAILS rather than passes when
+      # the target is unreadable, so a missing fetch-depth surfaces as a red build instead of
+      # a guard that silently stopped guarding.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # Self-tests FIRST, same order and same reason as the schema ratchet above: a guard
+      # with no tests of its own is the shape these guards exist to reject. Each case is a
+      # mutation that was reproduced against the script before it shipped.
+      - name: Migration-numbering self-tests
+        run: node --test tests/migration-numbering.test.mjs
+      # #729: a migration numbered at or below the merge-target head merges green and NEVER
+      # RUNS — wrangler applies only files above the applied head. Twelve open PRs were
+      # blocked on this on 2026-08-06 (slot 0076 alone had four claimants), and it already
+      # cost one production incident (#594).
+      - name: Guard — added migrations must sort above the merge-target head
+        run: node scripts/check-migration-numbering.mjs
+        env:
+          # PRs are not always against main. Without this the guard would compare against the
+          # wrong branch and its verdict would be unrelated to what actually merges.
+          BASE_REF: ${{ github.base_ref }}
 
   design-status-policy:
     runs-on: ubuntu-latest
