@@ -7,9 +7,17 @@ import { defineConfig, configDefaults } from 'vitest/config'
 // tests/audit-gate.test.mjs is the same situation: it gates the dependency audit and is
 // deliberately written against node:test with zero test-framework dependency, so it still
 // runs when the toolchain itself is what is broken. CI runs it via `node --test`.
+// tests/composition/ runs inside workerd via @cloudflare/vitest-pool-workers
+// (vitest.composition.config.ts) — its `cloudflare:test` imports cannot load under the
+// default Node ESM runner, so it is excluded here and CI runs it as its own step.
 export default defineConfig({
   test: {
-    exclude: [...configDefaults.exclude, 'fleet-runtime/**', 'tests/audit-gate.test.mjs'],
+    exclude: [
+      ...configDefaults.exclude,
+      'fleet-runtime/**',
+      'tests/audit-gate.test.mjs',
+      'tests/composition/**',
+    ],
     testTimeout: 15_000,
   },
 })
