@@ -59,6 +59,7 @@ import {
   TaskEvidenceFenceError,
 } from '../tasks/service'
 import type { TaskStatus } from '../tasks/service'
+import type { TaskPriority } from '../types'
 import { resolveTaskAssignee } from '../tasks/assignee'
 // #22 v1 ATC ranking: pure scorer + the radar's existing agent runtime-state
 // loader (dashboard/radar.ts already uses this same loader for the fleet
@@ -69,6 +70,8 @@ import {
   actionableStatusInSql,
   terminalStatusInSql,
   actionableStatusOrderSql,
+  priorityOrderSql,
+  TASK_SELECT_COLUMNS,
 } from '../tasks/ranking'
 import { loadAgentRuntimeStates, type AgentRuntimeState } from '../dashboard/observatory'
 import { buildOrient, renderBrief } from '../orient/service'
@@ -85,6 +88,7 @@ import { ADDON_TOOLS } from './addons'
 import { GATE_GRANT_TOOLS } from './gates'
 import { LOOP_TOOLS } from './loops'
 import { PRESENCE_TOOLS } from './presence'
+import { WORKFLOW_CIRCUIT_TOOLS } from './workflow-circuits'
 import { ROUTINE_TOOLS } from './routines'
 import { dispatchFlight } from '../flight/dispatch'
 import {
@@ -104,6 +108,7 @@ import { loadFlightSquads, parseFlightMetaV1, validateFlightMetaReferences, type
 // AUTH_CONTEXT_HEADER lives in a separate module (no cloudflare:workers dep) so
 // Vitest can import it without the CF runtime. See ./auth-header.ts.
 import { AUTH_CONTEXT_HEADER } from './auth-header'
+import { isExternallySourced } from '../tasks/provenance'
 import { MUPOT_PUBLIC_API_VERSION } from '../version'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
@@ -395,12 +400,19 @@ const STRING_SCHEMA = { type: 'string' }
 const NULLABLE_STRING_SCHEMA = { type: ['string', 'null'] }
 const OPTIONAL_STRING_ARRAY_SCHEMA = { type: 'array', items: { type: 'string' } }
 const OPTIONAL_NUMBER_SCHEMA = { type: 'number' }
+
+const TASK_PRIORITIES: readonly string[] = ['P0', 'P1', 'P2', 'P3']
+
 const TASK_STATUSES: readonly TaskStatus[] = ['open', 'in_progress', 'blocked', 'done', 'review', 'approved', 'rejected']
 const PATCH_ALLOWED_STATUSES: ReadonlySet<string> = new Set(['open', 'in_progress', 'blocked', 'done', 'review'])
 const BROADCAST_REQUEST_ID_RE = /^[A-Za-z0-9_.:-]{1,128}$/
 
 function isTaskStatus(v: unknown): v is TaskStatus {
   return typeof v === 'string' && (TASK_STATUSES as readonly string[]).includes(v)
+}
+
+function isTaskPriority(v: unknown): v is TaskPriority {
+  return typeof v === 'string' && TASK_PRIORITIES.includes(v)
 }
 
 function isPatchableStatus(v: unknown): v is TaskStatus {
@@ -433,7 +445,7 @@ function readConcepts(v: unknown): string[] | undefined | Extract<ToolOutcome, {
 
 async function loadTask(env: Env, taskId: string): Promise<Task | null> {
   const row = await env.DB.prepare(
-    `SELECT id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, source_pot, created_at, updated_at
+    `SELECT ${TASK_SELECT_COLUMNS}
        FROM tasks WHERE id = ?1 LIMIT 1`,
   )
     .bind(taskId)
@@ -535,7 +547,7 @@ const toolTaskCreate: ToolSpec = {
   name: 'task_create',
   scope: 'squad',
   min: 'member',
-  args: '{ squad_id: string, project_id?: string|null, title: string, done_when: string, body?: string, assignee_agent_id?: string }',
+  args: '{ squad_id: string, project_id?: string|null, title: string, done_when: string, body?: string, assignee_agent_id?: string, priority?: "P0"|"P1"|"P2"|"P3", parent_task_id?: string, external_source?: string }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -545,6 +557,19 @@ const toolTaskCreate: ToolSpec = {
       done_when: { ...STRING_SCHEMA, description: 'Verifiable success predicate — a checkable condition that proves the task is complete.' },
       body: STRING_SCHEMA,
       assignee_agent_id: STRING_SCHEMA,
+      priority: { type: 'string', enum: ['P0', 'P1', 'P2', 'P3'], description: 'Rank. Omit to leave UNTRIAGED — a real state, deliberately sorted last so unranked work has a cost.' },
+      parent_task_id: { ...STRING_SCHEMA, description: 'Parent task id, making this a subtask. Must be an existing task in the same squad.' },
+      // PR #659 P0 fix (migrations/0077): carries provenance forward when a task with an
+      // existing external_source is legitimately re-created (today: scripts/steward-worker.py's
+      // auto-reissue of a blocked/orphaned task — the "amplifier" the diverse-model gate
+      // flagged, where a re-issued Linear-origin task lost its marker and re-entered the
+      // normal event-wake path unmarked). Safe to expose to any member+ caller: the field is
+      // MONOTONIC — it only ever ADDS restriction (no auto-pickup, admin-gated reassignment,
+      // untrusted-content prompt fence; see canAgentExecuteTask/routeUnassignedWork/
+      // buildExecutePrompt), never removes it, so a caller setting it on its own new task
+      // cannot escalate privilege. It cannot be used to CLEAR an existing task's marker —
+      // task_update has no assignee/provenance-mutation path for it.
+      external_source: STRING_SCHEMA,
     },
     required: ['squad_id', 'title', 'done_when'],
     additionalProperties: false,
@@ -578,8 +603,41 @@ const toolTaskCreate: ToolSpec = {
     const assignee = await resolveTaskAssignee(env, args.assignee_agent_id, squad.id)
     if (assignee.error) return fail(400, assignee.error)
 
+    // PR #659 P0 fix: bounded, optional provenance carry-forward (see inputSchema comment
+    // above). Absent/null/blank -> undefined -> createTask defaults external_source to null,
+    // same as every ordinary create call today.
+    let externalSource: string | undefined
+    if (args.external_source !== undefined && args.external_source !== null) {
+      if (typeof args.external_source !== 'string') return fail(400, 'invalid_args', 'external_source must be a string')
+      const trimmed = args.external_source.trim()
+      if (trimmed.length === 0) return fail(400, 'invalid_args', 'external_source must not be blank')
+      if (trimmed.length > 200) return fail(400, 'invalid_args', 'external_source must be at most 200 characters')
+      externalSource = trimmed
+    }
+
     const projectId = args.project_id == null ? null : str(args.project_id)
     if (args.project_id != null && !projectId) return fail(400, 'invalid_project_id')
+
+    let priority: TaskPriority | null = null
+    if (args.priority != null) {
+      if (!isTaskPriority(args.priority)) return fail(400, 'invalid_priority', { accepted: TASK_PRIORITIES })
+      priority = args.priority
+    }
+
+    // A subtask must live on the SAME squad as its parent. Without this a caller could
+    // parent a task onto a squad it cannot see, and every squad-scoped read would then
+    // return a tree whose branches cross an authorization boundary — the capability check
+    // above is per-squad, so a cross-squad parent silently widens what a reader sees.
+    let parentTaskId: string | null = null
+    if (args.parent_task_id != null) {
+      const ref = str(args.parent_task_id)
+      if (!ref) return fail(400, 'invalid_args', 'parent_task_id must be a non-empty string')
+      const parent = await loadTask(env, ref)
+      if (!parent) return fail(404, 'parent_task_not_found')
+      if (parent.squad_id !== squad.id) return fail(400, 'parent_task_cross_squad', 'a subtask must live on the same squad as its parent')
+      parentTaskId = parent.id
+    }
+
     let task
     try {
       task = await createTask(
@@ -591,8 +649,10 @@ const toolTaskCreate: ToolSpec = {
           done_when: doneWhen,
           body,
           assignee_agent_id: assignee.value,
+          priority,
+          parent_task_id: parentTaskId,
         },
-        { actor: memberActor(auth.memberId as string) },
+        { actor: memberActor(auth.memberId as string), externalSource },
       )
     } catch (error) {
       if (error instanceof TaskProjectError) return taskProjectFailure(error)
@@ -673,10 +733,10 @@ const toolTaskList: ToolSpec = {
       const clauses = [...baseClauses, `status = ?${baseBinds.length + 1}`]
       const binds = [...baseBinds, status]
       const rows = await env.DB.prepare(
-        `SELECT id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, source_pot, created_at, updated_at
+        `SELECT ${TASK_SELECT_COLUMNS}
            FROM tasks
           WHERE ${clauses.join(' AND ')}
-          ORDER BY created_at ${isActionable ? 'ASC' : 'DESC'}
+          ORDER BY ${priorityOrderSql()}, created_at ${isActionable ? 'ASC' : 'DESC'}
           LIMIT ${limit}`,
       )
         .bind(...binds)
@@ -690,10 +750,10 @@ const toolTaskList: ToolSpec = {
       // compete with actionable rows for the same slots (the P1 finding's
       // core failure mode).
       const actionableRows = await env.DB.prepare(
-        `SELECT id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, source_pot, created_at, updated_at
+        `SELECT ${TASK_SELECT_COLUMNS}
            FROM tasks
           WHERE ${[...baseClauses, actionableStatusInSql()].join(' AND ')}
-          ORDER BY ${actionableStatusOrderSql()}, created_at ASC
+          ORDER BY ${actionableStatusOrderSql()}, ${priorityOrderSql()}, created_at ASC
           LIMIT ${limit}`,
       )
         .bind(...baseBinds)
@@ -703,10 +763,10 @@ const toolTaskList: ToolSpec = {
       const remaining = limit - taskRows.length
       if (remaining > 0) {
         const terminalRows = await env.DB.prepare(
-          `SELECT id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, source_pot, created_at, updated_at
+          `SELECT ${TASK_SELECT_COLUMNS}
              FROM tasks
             WHERE ${[...baseClauses, terminalStatusInSql()].join(' AND ')}
-            ORDER BY created_at DESC
+            ORDER BY ${priorityOrderSql()}, created_at DESC
             LIMIT ${remaining}`,
         )
           .bind(...baseBinds)
@@ -741,10 +801,14 @@ const toolTaskBoard: ToolSpec = {
     if (typeof limit !== 'number') return limit
 
     const rows = await env.DB.prepare(
-      `SELECT id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, source_pot, created_at, updated_at
+      // Ranked within the LIMIT, not merely recent (#713). task_board is the kanban view;
+      // ordering it by created_at means a board capped at `limit` drops the OLDEST rows
+      // regardless of priority, so a P0 filed last month can fall out of the board entirely
+      // while P3 chatter from today stays. Found by the ORDER-BY parity guard, not by me.
+      `SELECT ${TASK_SELECT_COLUMNS}
          FROM tasks
         WHERE squad_id = ?1
-        ORDER BY created_at DESC
+        ORDER BY ${priorityOrderSql()}, created_at DESC
         LIMIT ?2`,
     )
       .bind(squadRes.squad.id, limit)
@@ -776,7 +840,7 @@ const toolTaskUpdate: ToolSpec = {
   name: 'task_update',
   scope: 'squad (of the task)',
   min: 'member',
-  args: '{ task_id: string, project_id?: string|null, title?: string, body?: string, done_when?: string, status?: "open"|"in_progress"|"blocked"|"done"|"review", assignee_agent_id?: string|null, gate_owner?: string|null }',
+  args: '{ task_id: string, project_id?: string|null, title?: string, body?: string, done_when?: string, status?: "open"|"in_progress"|"blocked"|"done"|"review", priority?: "P0"|"P1"|"P2"|"P3"|null, parent_task_id?: string|null, assignee_agent_id?: string|null, gate_owner?: string|null }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -786,6 +850,8 @@ const toolTaskUpdate: ToolSpec = {
       body: STRING_SCHEMA,
       done_when: STRING_SCHEMA,
       status: STRING_SCHEMA,
+      priority: { type: ['string', 'null'], description: 'Rank, or null to return the task to UNTRIAGED.' },
+      parent_task_id: { type: ['string', 'null'], description: 'Parent task id, or null to promote this task to top level.' },
       assignee_agent_id: STRING_SCHEMA,
       gate_owner: STRING_SCHEMA,
     },
@@ -823,8 +889,56 @@ const toolTaskUpdate: ToolSpec = {
       next.done_when = (args.done_when as string).trim()
       changed = true
     }
+    if (args.priority !== undefined) {
+      // Explicit null RE-TRIAGES a task back to untriaged. That is a legitimate operation
+      // ("I ranked this wrongly"), and it is distinguishable from "field absent" only
+      // because we branch on `=== undefined` rather than on truthiness — the same
+      // null-vs-absent split that #684-era code kept getting wrong.
+      if (args.priority === null) {
+        next.priority = null
+      } else {
+        const candidate: unknown = args.priority
+        if (!isTaskPriority(candidate)) return fail(400, 'invalid_priority', { accepted: TASK_PRIORITIES })
+        next.priority = candidate
+      }
+      changed = true
+    }
+    if (args.parent_task_id !== undefined) {
+      if (args.parent_task_id === null) {
+        next.parent_task_id = null
+      } else {
+        const ref = str(args.parent_task_id)
+        if (!ref) return fail(400, 'invalid_args', 'parent_task_id must be a non-empty string or null')
+        if (ref === existing.id) return fail(400, 'parent_task_self', 'a task cannot be its own parent')
+        const parent = await loadTask(env, ref)
+        if (!parent) return fail(404, 'parent_task_not_found')
+        if (parent.squad_id !== existing.squad_id) {
+          return fail(400, 'parent_task_cross_squad', 'a subtask must live on the same squad as its parent')
+        }
+        // One level of cycle protection beyond the DB trigger: A->B->A. Deeper cycles are
+        // still possible and are NOT claimed to be prevented here — stating that rather
+        // than implying full acyclicity, because a guard that sounds complete and is not
+        // is worse than a named partial one.
+        if (parent.parent_task_id === existing.id) {
+          return fail(400, 'parent_task_cycle', 'that task is already a child of this one')
+        }
+        next.parent_task_id = parent.id
+      }
+      changed = true
+    }
     if (args.status !== undefined) {
-      if (!isPatchableStatus(args.status)) return fail(400, 'invalid_status')
+      if (!isPatchableStatus(args.status)) {
+        // approved/rejected are deliberately NOT patchable — a task must not approve
+        // itself; that transition belongs to task_verdict, which records who decided.
+        // Saying so here turns a dead end into a next step: this was read as "tasks are
+        // stuck in review" for weeks when the real answer was "use the other tool".
+        return fail(400, 'invalid_status', {
+          accepted: [...PATCH_ALLOWED_STATUSES],
+          hint: (args.status === 'approved' || args.status === 'rejected')
+            ? 'approved/rejected are set by task_verdict, not task_update — a task cannot approve itself'
+            : undefined,
+        })
+      }
       const transitionErr = checkTransition(existing.status, args.status)
       if (transitionErr) return fail(400, 'invalid_transition', transitionErr)
       // GATE-EXIT GUARD (mirror of PATCH /api/tasks/:id): entering 'review'
@@ -895,9 +1009,13 @@ const toolTaskUpdate: ToolSpec = {
       // and then execute it. Require admin+ to change assignee_agent_id on a
       // source_pot task; local (source_pot NULL) task assignment keeps the
       // member+ floor checked at the top of this tool, unaffected.
-      if (existing.source_pot) {
+      // PR #659 P0 fix: external_source (migrations/0077) requires the same admin+ bar as
+      // source_pot — same untrusted-writer class (e.g. Linear), same #406 reasoning: a
+      // member-tier/runtime-welded agent token must not self-assign untrusted external
+      // content and then execute it.
+      if (isExternallySourced(existing)) {
         if (!(await memberCanOnSquad(env, grants, existing.squad_id, 'admin'))) {
-          return fail(403, 'forbidden', { need: 'admin', scope: 'squad', detail: 'source_pot task assignment requires admin+' })
+          return fail(403, 'forbidden', { need: 'admin', scope: 'squad', detail: 'source_pot/external_source task assignment requires admin+' })
         }
       }
       const check = await resolveTaskAssignee(env, args.assignee_agent_id, existing.squad_id)
@@ -2501,6 +2619,47 @@ const toolBootContext: ToolSpec = {
       ? 'call orient (no args — your token is agent-bound) to receive your full basin-drop packet'
       : 'if you know your agent slug/id: call connect { agent_name: "<slug>" } to claim your identity now (session-local). For a permanent weld: ask an org-admin to call mint_agent_token for your agent, then reconnect with the minted token.'
 
+    // THE DOOR MUST SAY WHAT IT IS (#712).
+    //
+    // A directory seat — every agentic harness arrives here: Claude Desktop, claude.ai,
+    // Claude Code, Codex, Cursor — carries ZERO ambient authority by design (B1 ceiling).
+    // boot_context reported `channel: "directory"` and `capabilities: []` and then advised
+    // a next_step as if that were an ordinary session. It is not, and nothing said so.
+    //
+    // The owner spent SEVEN calls discovering it on 2026-08-05: `status` worked, everything
+    // else returned 403, and the connector wrapper replaced mupot's actionable refusal with
+    // "may have been blocked by a firewall or security service". mupot said the right thing
+    // in a body nobody could see.
+    //
+    // So say it HERE, in the one response that always succeeds on this channel. A field
+    // named `channel` is a fact; a field explaining what that fact COSTS is a map. QA-1
+    // ("every refusal/unminted signal must carry the full map out — no dead ends") applied
+    // to refusals but never to the successful boot that precedes them.
+    const directoryNote =
+      auth.channel === 'directory'
+        ? {
+            ambient_authority: 'none',
+            why: [
+              'This is the DIRECTORY channel — the public OAuth door used by agentic harnesses',
+              '(Claude Desktop, claude.ai, Codex, Cursor). It carries NO standing capabilities by',
+              'design: anyone with a verified Google account can reach it, so a member who holds',
+              'owner or admin elsewhere does not inherit those here. Your grants still exist; they',
+              'are simply not ambient on this door.',
+            ].join(' '),
+            you_can: [
+              'status, boot_context — always',
+              'connect { agent_name }, orient { agent } — for agents your member has capability on',
+              'remember, recall — your own memory',
+            ],
+            you_cannot: [
+              'create or update tasks, projects, agents, or any other write',
+              'anything requiring a standing capability, regardless of what you hold elsewhere',
+            ],
+            to_get_write_access:
+              'ask an org-admin for a WORKSPACE-channel token (mint_agent_token), and connect with that bearer. Requesting a squad grant will NOT help — this door discards grants by construction.',
+          }
+        : undefined
+
     return done({
       // principal fields (mirrors the status tool's self-echo, kept stable)
       tenant: auth.tenant,
@@ -2513,6 +2672,8 @@ const toolBootContext: ToolSpec = {
       identity_status: identityStatus,
       bound_agent_id: auth.boundAgentId ?? null,
       next_step: nextStep,
+      // Present ONLY on the directory channel — its absence is itself information.
+      ...(directoryNote ? { channel_limits: directoryNote } : {}),
     })
   },
 }
@@ -2559,9 +2720,16 @@ const toolOrient: ToolSpec = {
     }
     const agentRef = resolved.value
 
+    // Same latent-grant authorization as connect (#712): orient is READ-ONLY and its
+    // packet is redacted by viewSensitive below, but it required `observer` on the squad —
+    // which a directory seat can never hold, because the B1 ceiling zeroes ambient
+    // authority. So the operator's only door could not orient either, and "boot" was
+    // impossible rather than merely limited. Authorizing a NAMED read against what the
+    // member actually holds keeps ambient authority at zero.
     const grants = auth.capabilities ?? []
-    const orgAdmin = hasCapability(grants, 'org', null, 'admin')
-    const onSquad = await memberCanOnSquad(env, grants, agentRef.squad_id, 'observer')
+    const claimGrants = auth.latentCapabilities ?? grants
+    const orgAdmin = hasCapability(claimGrants, 'org', null, 'admin')
+    const onSquad = await memberCanOnSquad(env, claimGrants, agentRef.squad_id, 'observer')
     if (!orgAdmin && !onSquad) return fail(403, 'forbidden', { need: 'observer', scope: 'squad' })
     const callerCapability = orgAdmin ? 'admin' : 'observer+'
 
@@ -2570,7 +2738,7 @@ const toolOrient: ToolSpec = {
     // || short-circuits, so the lead query only runs when not already self/admin.
     const isSelf = auth.boundAgentId === agentRef.id
     const viewSensitive =
-      orgAdmin || isSelf || (await memberCanOnSquad(env, grants, agentRef.squad_id, 'lead'))
+      orgAdmin || isSelf || (await memberCanOnSquad(env, claimGrants, agentRef.squad_id, 'lead'))
 
     const { data, notFound } = await buildOrient(
       env,
@@ -2651,10 +2819,60 @@ const toolConnect: ToolSpec = {
     // Authorization: caller must have squad-member capability on this agent's squad.
     // An org-admin also passes (inherits down via memberCanOnSquad). This prevents an
     // authorized-but-unscoped token from claiming an agent on a squad it has no access to.
+    //
+    // AUTHORIZED AGAINST LATENT GRANTS (#712). connect is READ-ONLY — it writes nothing,
+    // returns an orient packet, and redacts it unless the caller is org-admin, the agent
+    // itself, or a squad lead. Gating that read behind AMBIENT capability meant a
+    // directory seat could never pass, because the B1 ceiling guarantees ambient = [].
+    // The result was a dead-end loop: boot_context told the operator to call connect, and
+    // connect refused — on the only door the operator has. Reproduced live on the owner's
+    // own claude.ai seat, which could call `status` and nothing else.
+    //
+    // Authorizing the NAMED claim against what the member truly holds keeps the ceiling's
+    // real guarantee intact — zero ambient authority, nothing inherited silently — while
+    // making one explicit, auditable, side-effect-free selection act possible. Packet
+    // sensitivity is still decided separately by viewSensitive below, so a bare member
+    // claiming a PEER gets exactly the redacted packet it got before.
+    //
+    // On every non-directory channel latentCapabilities === capabilities, so this is a
+    // no-op there.
     const grants = auth.capabilities ?? []
-    const orgAdmin = hasCapability(grants, 'org', null, 'admin')
-    const onSquad = await memberCanOnSquad(env, grants, agentRef.squad_id, 'member')
+    const claimGrants = auth.latentCapabilities ?? grants
+    const orgAdmin = hasCapability(claimGrants, 'org', null, 'admin')
+    const onSquad = await memberCanOnSquad(env, claimGrants, agentRef.squad_id, 'member')
     if (!orgAdmin && !onSquad) {
+      // A directory-channel seat can NEVER pass this check, by design: B1 in
+      // src/mcp/oauth-authorize.ts sets `capabilities = []` for channel='directory'
+      // regardless of what the member actually holds, so the public OAuth door does not
+      // inherit standing grants. Both branches above are therefore guaranteed false and
+      // NO GRANT CAN FIX IT.
+      //
+      // Saying "no_squad_access / need: member" here is true but actively misleading: it
+      // points the reader at "request squad membership", which is the wrong action. On
+      // 2026-08-05 that cost four round-trips and nearly produced a redundant grant for a
+      // member who already held org:owner — the grant would have changed nothing, because
+      // the directory door discards grants by construction. Name the real cause and the
+      // door that works (mupot#678).
+      if (auth.channel === 'directory') {
+        return fail(403, 'forbidden', {
+          reason: 'directory_channel_zero_capability',
+          detail: [
+            'This session is on the DIRECTORY channel (the public OAuth door used by ChatGPT/Claude connectors),',
+            'which carries NO standing capabilities by design — a member who holds admin or owner elsewhere does',
+            'not inherit those here. Requesting a squad grant will NOT fix this; the directory door discards',
+            `grants by construction. Use a WORKSPACE-channel token instead: ask an admin on agent "${agentRef.slug}"'s`,
+            // Render the ID, never the slug. mint_agent_token resolves through the same
+            // resolveAgentRef contract as connect, so a DUPLICATED slug would come back
+            // `ambiguous_slug` — turning a reference the caller had already resolved
+            // unambiguously (they may have passed the id) back into a dead end, which is
+            // the exact failure this refusal exists to remove. Not hypothetical: six
+            // hadi/codex agent records share slugs today. (codex gate, #681.)
+            `squad to run mint_agent_token { agent: "${agentRef.id}" }, then connect with that bearer.`,
+          ].join(' '),
+          need: 'workspace-channel token',
+          scope: 'channel',
+        })
+      }
       return fail(403, 'forbidden', {
         reason: 'no_squad_access',
         detail: [
@@ -2681,7 +2899,7 @@ const toolConnect: ToolSpec = {
     // at which point isSelf=true on all subsequent orient/connect calls. (#128)
     const isSelf = auth.boundAgentId === agentRef.id
     const viewSensitive =
-      orgAdmin || isSelf || (await memberCanOnSquad(env, grants, agentRef.squad_id, 'lead'))
+      orgAdmin || isSelf || (await memberCanOnSquad(env, claimGrants, agentRef.squad_id, 'lead'))
 
     // Resolve the full orient packet for the claimed agent (read-only, no D1 write).
     const { data, notFound } = await buildOrient(
@@ -2746,6 +2964,7 @@ export const TOOLS: ToolSpec[] = [
   ...GATE_GRANT_TOOLS,
   ...LOOP_TOOLS,
   ...PRESENCE_TOOLS,
+  ...WORKFLOW_CIRCUIT_TOOLS,
   ...ROUTINE_TOOLS,
 ]
 
