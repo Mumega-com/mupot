@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Fixed
+- Routine dispatch requires `POST /api/fleet/attach` with `agent_id` set to the token bound agent UUID. `fleet_agents.presence` is derived from `last_seen` against a 180s TTL, and `presence_register` writes the module registry, which dispatch does not read (mupot#732).
+
 - **C10 — the backpressure governor is provenance-aware** (`src/agents/loop.ts`,
   `countOpenBacklog`). Its unassigned branch treated "open + unassigned + in my squad"
   as "backlog this agent's loop produced". An externally-imported task matches that
