@@ -216,11 +216,50 @@ function targetMigrations(ref) {
 // `no_migrations_added`. A sparse checkout that omits migrations/ disables the guard
 // silently, and the check that is supposed to notice reports success.
 function localMigrations() {
-  try {
-    return readdirSync(join(ROOT, DIR)).filter((name) => name.endsWith('.sql'))
-  } catch {
-    return null
-  }
+  // TWO ORACLES, UNIONED — and the union IS the fix, not belt-and-braces.
+  //
+  // This read used to be readdirSync alone, i.e. the WORKING TREE, while the target side reads
+  // GIT. Two different oracles for the two halves of one comparison. Athena's re-gate named the
+  // asymmetry; measured immediately after: commit a below-head 0076, delete only that file from
+  // the working tree, and the guard prints `no_migrations_added` and exits 0 — while the commit
+  // under review contains it.
+  //
+  // The earlier `local_unreadable` fix only caught a TOTAL readdir failure. A PARTIAL working
+  // tree returns a short list with no error at all, so the guard under-reports what the PR adds
+  // and calls the shortfall "added nothing". Fourth defect in this file, same seam every time:
+  // the verdict resting on an input read from the wrong place.
+  //
+  // HEAD is what CI actually judges, so it is authoritative. The working tree is unioned in so a
+  // developer running this before committing is still warned about a file git has not seen yet.
+  // The union fails SAFE — it can only add files to the set being checked, never remove them.
+  // Null only when BOTH oracles fail.
+  const fromGit = (() => {
+    try {
+      return execFileSync('git', ['ls-tree', '-r', '--name-only', 'HEAD', `${DIR}/`], {
+        cwd: ROOT, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'],
+      })
+        .split('\n')
+        .filter((line) => line.startsWith(`${DIR}/`))
+        .map((line) => line.slice(DIR.length + 1))
+        .filter((name) => name.endsWith('.sql'))
+    } catch {
+      return null
+    }
+  })()
+
+  const fromDisk = (() => {
+    try {
+      return readdirSync(join(ROOT, DIR)).filter((name) => name.endsWith('.sql'))
+    } catch {
+      // Found by Prime after the target-side fix shipped (c43b35b) — the mirror image of that
+      // bug in the mirror-image function. Measured on merged main: `mv migrations /tmp`, run the
+      // guard, exit 0 with `no_migrations_added`.
+      return null
+    }
+  })()
+
+  if (fromGit === null && fromDisk === null) return null
+  return [...new Set([...(fromGit ?? []), ...(fromDisk ?? [])])]
 }
 
 function main() {

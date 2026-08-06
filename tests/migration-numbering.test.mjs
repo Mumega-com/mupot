@@ -256,18 +256,67 @@ test('FAIL CLOSED at the GIT layer: ls-tree failing is a failure, not a bootstra
   assert.doesNotMatch(out, /bootstrap/)
 })
 
-test('end to end: hiding the working-tree migrations/ fails instead of passing', (t) => {
-  // The real shape, driven through the real script: on merged main this exited 0 with
-  // `no_migrations_added` — a sparse checkout that omits the directory silently disabled the
-  // guard. Measured, then fixed.
-  const dir = scaffold({ targetMigrations: ['0079_x.sql'], addedMigrations: ['0080_new.sql'] })
+test('PARTIAL working tree: a COMMITTED below-head migration is still caught when the file is not on disk', (t) => {
+  // The fourth defect in this file (Athena's re-gate named the asymmetry; measured immediately
+  // after). The local side read the WORKING TREE via readdirSync while the target side read
+  // GIT — two oracles for the two halves of one comparison. A total readdir failure was
+  // already handled; a PARTIAL tree returns a short list with NO error, so the guard
+  // under-reported what the PR adds and called the shortfall "added nothing".
+  //
+  // This test replaced an earlier one that removed the whole directory and asserted exit 1.
+  // That test encoded the WEAKER oracle: with HEAD now authoritative, a repo whose only added
+  // file was never committed genuinely has nothing added, and passing is correct. Deleting the
+  // old assertion was the right call, not a convenience — the property worth pinning is that a
+  // COMMITTED violation survives the file vanishing from disk.
+  const dir = scaffold({ targetMigrations: ['0079_x.sql'], addedMigrations: [] })
   t.after(() => rmSync(dir, { recursive: true, force: true }))
-  assert.equal(run(dir).code, 0, 'sanity: above-head passes with the directory present')
 
-  rmSync(join(dir, 'migrations'), { recursive: true, force: true })
+  writeFileSync(join(dir, 'migrations', '0076_committed.sql'), '-- x\n')
+  execFileSync('git', ['add', '-A'], { cwd: dir, stdio: 'ignore' })
+  execFileSync('git', ['-c', 'user.email=t@t.test', '-c', 'user.name=t', 'commit', '-qm', 'add below-head'], { cwd: dir, stdio: 'ignore' })
+  assert.equal(run(dir).code, 1, 'sanity: below-head fails while the file is on disk')
+
+  rmSync(join(dir, 'migrations', '0076_committed.sql'))
   const { code, out } = run(dir)
-  assert.equal(code, 1, 'an unlistable migrations/ must NOT read as "added nothing"')
+  assert.equal(code, 1, 'HEAD still contains it — the working tree is not the oracle')
+  assert.match(out, /0076_committed\.sql/)
   assert.doesNotMatch(out, /no_migrations_added/)
+})
+
+test('an UNCOMMITTED migration is still checked, so the pre-commit warning survives the union', (t) => {
+  // The reason the working tree is unioned in rather than dropped: a developer running this
+  // before committing must still be warned about a file git has not seen yet.
+  const dir = scaffold({ targetMigrations: ['0079_x.sql'], addedMigrations: ['0076_uncommitted.sql'] })
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const { code, out } = run(dir)
+  assert.equal(code, 1)
+  assert.match(out, /0076_uncommitted\.sql/)
+})
+
+test('FAIL CLOSED: only when BOTH local oracles fail is it local_unreadable', (t) => {
+  // The union must not become a way to always find *some* answer. With git gone AND the
+  // directory gone there is no oracle left, and inventing one is the original sin of this file.
+  const dir = scaffold({ targetMigrations: ['0079_x.sql'], addedMigrations: [] })
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  rmSync(join(dir, 'migrations'), { recursive: true, force: true })
+  rmSync(join(dir, '.git'), { recursive: true, force: true })
+  const { code, out } = run(dir)
+  assert.equal(code, 1)
+  // Assert the REASON, not just the exit code. Removing .git also makes the TARGET unreadable,
+  // so a mutation that deletes the both-null guard still exits 1 — via target_unreadable — and
+  // an exit-code-only assertion passes for the wrong reason. Measured: mutation M13 (`if
+  // (false) return null`) left the suite 27/27 green until this line existed. The local check
+  // runs first, so its message is the discriminator.
+  assert.match(out, /Could not list/, 'must fail on the LOCAL oracle, not incidentally on the target')
+  assert.doesNotMatch(out, /no_migrations_added/)
+})
+
+test('the union returns null, not [], when both local oracles fail', () => {
+  // The pure counterpart to the test above, stated at the layer where the distinction is
+  // unambiguous. `[]` and `null` are both falsy-ish shapes that flow onward; only one of them
+  // means "I could not look". This whole file exists because that difference was collapsed.
+  const v = evaluate(['0079_x.sql'], null)
+  assert.equal(v.reason, 'local_unreadable')
 })
 
 test('end to end: BASE_REF selects a different merge target', (t) => {
