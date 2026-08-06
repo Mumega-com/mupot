@@ -50,7 +50,7 @@ resources, and applies remote migrations. Review the generated bindings before
 the first deploy:
 
 ```bash
-grep -nE 'name =|TENANT_SLUG|binding =|database_name|database_id|index_name|queue =|bucket_name' "$CONFIG"
+grep -nE 'name =|TENANT_SLUG|PUBLIC_ORIGIN|binding =|database_name|database_id|index_name|queue =|bucket_name' "$CONFIG"
 npx wrangler deploy --dry-run --config "$CONFIG"
 ```
 
@@ -71,7 +71,7 @@ ceremony before any dashboard OAuth credential is configured:
 
 ```bash
 bash scripts/secrets.sh --pot "$POT" --bootstrap-owner
-npx wrangler deploy --config "$CONFIG" --message "bootstrap owner ${POT}"
+node scripts/deploy.mjs --config "$CONFIG" --message "bootstrap owner ${POT}"
 # Open https://<your-pot-host>/auth/bootstrap and submit the printed token + owner email.
 npx wrangler secret delete BOOTSTRAP_OWNER_TOKEN --config "$CONFIG"
 ```
@@ -133,10 +133,17 @@ Deploy once, set secrets if Wrangler required the Worker to exist first, then
 deploy again:
 
 ```bash
-npx wrangler deploy --config "$CONFIG" --message "initial ${POT} production deploy"
+node scripts/deploy.mjs --config "$CONFIG" --message "initial ${POT} production deploy"
 npx wrangler secret list --config "$CONFIG"
-npx wrangler deploy --config "$CONFIG" --message "production secrets configured"
+node scripts/deploy.mjs --config "$CONFIG" --message "production secrets configured"
 ```
+
+`scripts/deploy.mjs` wraps `wrangler deploy` and always stamps `RELEASE_SHA`
+with the exact commit HEAD is on (mupot#443) — `GET /health` will report it as
+`commit`. Do not call `wrangler deploy` directly for a real deploy; the manual
+`RELEASE_SHA=$(git rev-parse HEAD) wrangler deploy` incantation is exactly the
+step that got forgotten in practice and left production reporting
+`commit: null` for days.
 
 When dashboard OAuth is selected, register redirect URLs with the identity provider
 before inviting users:
@@ -179,8 +186,50 @@ npm test
 npm run typecheck
 npx wrangler d1 migrations list "$DB" --remote --config "$CONFIG"
 npx wrangler d1 migrations apply "$DB" --remote --config "$CONFIG"
-npx wrangler deploy --config "$CONFIG" --message "upgrade ${POT} to $(git rev-parse --short HEAD)"
+node scripts/deploy.mjs --config "$CONFIG" --message "upgrade ${POT} to $(git rev-parse --short HEAD)"
 ```
+
+Migrations apply BEFORE the code deploy in both paths above — code that
+expects a column/table the old schema doesn't have yet must never reach
+production ahead of the migration that adds it.
+
+For the v0.25 Project Routines upgrade, `0073_project_routines.sql` and
+`0074_routine_cancellation_events.sql` must complete in the same
+`wrangler d1 migrations apply` invocation before deploying v0.25 code. Do not
+pause traffic on a database with only `0073` applied: routine cancellation
+events are rejected by the older event-kind constraint until `0074` completes.
+If the migration command is interrupted, rerun it and confirm both migrations
+are applied before deploying or enabling Project Routines.
+
+Project Routines require separate Worker triggers for Routine work and existing
+maintenance. Before deploying v0.25, verify the pot config contains the exact
+active assignment below:
+
+```bash
+grep -F 'crons = ["* * * * *", "0-9,15-24,30-39,45-54 * * * *"]' "$CONFIG"
+```
+
+Do not enable a Routine when that command has no output. The Routine scheduler
+runs in its own invocation every minute. The maintenance trigger starts one of
+the ten existing jobs in minute slots 0-9 of each fifteen-minute window. This
+keeps their D1 and subrequest budgets isolated. A legacy `*/15` trigger cannot
+satisfy the v0.25 activation contract.
+
+After deploy, keep `npx wrangler tail "$WORKER"` open until
+`[scheduled:dispatch]` has reported all eleven route labels: `project-routines`
+plus `membership`, `metabolism`, `loops`, `github-project`, `growth`, `cro`,
+`flight-outbox`, `concierge`, `project-loop`, and
+`agent-connection-retention`. Dispatch routes and unmatched triggers are each
+reported at most once per UTC hour per Worker isolate, so this activation
+evidence stays bounded while remaining observable after the initial deploy
+minute. A dispatch marker proves the route was selected; any matching
+`[scheduled:<route>]` error still fails the activation gate.
+
+An unrecognized trigger emits the structured `[scheduled:unmatched-cron]`
+warning with its scheduled time and the expected trigger count. The warning
+does not include the received cron expression. Treat any occurrence, or failure
+to observe all eleven route labels within one hour, as a failed activation gate
+and correct the live config before enabling a Routine.
 
 Do not apply a migration to production until a D1 backup exists for the current
 production state.
@@ -246,8 +295,14 @@ export RESTORE_CONFIG="wrangler.${POT}.restore.toml"
 cp "$CONFIG" "$RESTORE_CONFIG"
 # Edit RESTORE_CONFIG: database_name = "$RESTORE_DB" and database_id = "<new id>"
 npx wrangler d1 execute "$RESTORE_DB" --remote --config "$RESTORE_CONFIG" --file "$BACKUP_DIR/d1.sql" --yes
-npx wrangler deploy --config "$RESTORE_CONFIG" --message "restore ${POT} D1 from ${BACKUP_DIR}"
+node scripts/deploy.mjs --config "$RESTORE_CONFIG" --message "restore ${POT} D1 from ${BACKUP_DIR}"
 ```
+
+Restore deploys go through `scripts/deploy.mjs`, never a bare `wrangler deploy`
+(mupot#443/#571) — a restored pot must be stamped with the same exact-commit
+`RELEASE_SHA` as any other deploy, or the restored pot silently reports
+`commit: null` (or a stale stamp from before the restore) and the staleness
+detector cannot see it.
 
 Restore R2 from the whole-bucket backup:
 

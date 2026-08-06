@@ -48,7 +48,7 @@ const MAX_PROJECT_MEMBER_ROWS = 100
 const MAX_FLIGHT_SCAN_PAGES = 10
 
 export const PROJECT_STATUSES: readonly ProjectStatus[] = [
-  'planned', 'active', 'paused', 'completed', 'archived',
+  'planned', 'active', 'paused', 'review', 'completed', 'archived',
 ]
 
 const PROJECT_LIFECYCLE_COMMANDS = [
@@ -269,19 +269,47 @@ export async function canManageProjects(env: Env, auth: AuthContext): Promise<bo
 // (src/mcp/index.ts) and destinationAuthorized (src/addons/project-link/
 // service.ts) already use elsewhere in v0.24 for "manage-level project ops".
 // Fail-closed: no member id, no taskable squads, or no matching row -> false.
-async function projectManageAccessFor(env: Env, access: ProjectAccess, projectId: string): Promise<boolean> {
-  if (access.workspaceAdmin) return true
+export interface ProjectManageAccessContext {
+  authorized: boolean
+  workspaceAdmin: boolean
+  // The subset of the actor's own taskable squads that actually hold write/admin
+  // on THIS project — i.e. the squad(s) whose authority the actor is acting
+  // through right now. NOT the same as "every squad linked to the project"
+  // (that would let an actor authorized via squad A act with squad B's
+  // authority merely because B also has some access_level on the project —
+  // the confused-deputy gap #453 requires closed at the connector-scope
+  // boundary; see upsertProjectBinding).
+  authorizingSquadIds: string[]
+  // The actor's RAW squad memberships (unfiltered by project_squad_access),
+  // for callers that need to re-verify authority against a LIVE read at
+  // write time rather than trust this snapshot (adversarial review on #453:
+  // authorizingSquadIds computed here can go stale by the time a later
+  // write actually executes if access is revoked/downgraded concurrently —
+  // see upsertProjectBinding's SQL-embedded live re-check).
+  actorSquadIds: string[]
+}
+
+async function projectManageAccessContextFor(
+  env: Env,
+  access: ProjectAccess,
+  projectId: string,
+): Promise<ProjectManageAccessContext> {
+  if (access.workspaceAdmin) {
+    return { authorized: true, workspaceAdmin: true, authorizingSquadIds: [], actorSquadIds: [] }
+  }
   const squadIds = access.taskableSquadIds ?? []
-  if (squadIds.length === 0) return false
+  if (squadIds.length === 0) {
+    return { authorized: false, workspaceAdmin: false, authorizingSquadIds: [], actorSquadIds: [] }
+  }
   const placeholders = squadIds.map((_, index) => `?${index + 2}`).join(', ')
-  const row = await env.DB.prepare(
-    `SELECT 1 FROM project_squad_access
+  const rows = await env.DB.prepare(
+    `SELECT squad_id FROM project_squad_access
       WHERE project_id = ?1
         AND squad_id IN (${placeholders})
-        AND access_level IN ('write', 'admin')
-      LIMIT 1`,
-  ).bind(projectId, ...squadIds).first()
-  return row !== null
+        AND access_level IN ('write', 'admin')`,
+  ).bind(projectId, ...squadIds).all<{ squad_id: string }>()
+  const authorizingSquadIds = (rows.results ?? []).map((row) => row.squad_id)
+  return { authorized: authorizingSquadIds.length > 0, workspaceAdmin: false, authorizingSquadIds, actorSquadIds: squadIds }
 }
 
 /**
@@ -292,7 +320,23 @@ async function projectManageAccessFor(env: Env, access: ProjectAccess, projectId
  * being pot-admin, and org-admin/owner still passes (see projectManageAccessFor).
  */
 export async function canManageProject(env: Env, auth: AuthContext, projectId: string): Promise<boolean> {
-  return projectManageAccessFor(env, await projectAccess(env, auth), projectId)
+  return (await projectManageAccessContextFor(env, await projectAccess(env, auth), projectId)).authorized
+}
+
+/**
+ * projectManageAccessContext — same gate as canManageProject, but also returns
+ * WHICH authority the actor is acting through (workspace admin, or the exact
+ * subset of their own squads holding write/admin here). Routes that mutate a
+ * project_provider_binding's connector_id need this to bound the connector's
+ * scope to the actor's OWN authority (#453) rather than "anything linked to
+ * the project" — see upsertProjectBinding's actor parameter.
+ */
+export async function projectManageAccessContext(
+  env: Env,
+  auth: AuthContext,
+  projectId: string,
+): Promise<ProjectManageAccessContext> {
+  return projectManageAccessContextFor(env, await projectAccess(env, auth), projectId)
 }
 
 function jsonIds(ids: string[]): string {
@@ -344,7 +388,8 @@ async function loadVisibleProjects(
   }
   const statement = env.DB.prepare(
     `SELECT p.id, p.slug, p.name, p.description, p.goal, p.status, p.parent_project_id,
-            p.target_date, p.created_at, p.updated_at
+            p.target_date, p.cycle_boundary_at, p.stalled, p.stall_threshold_days,
+            p.completion_proposed_by, p.created_at, p.updated_at
        FROM projects p
       ${clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''}
       ORDER BY p.parent_project_id IS NOT NULL, p.created_at, p.id
@@ -627,7 +672,7 @@ export async function loadProjectDetail(
     listProjectActivity(env, { projectId: project.id, readableSquadIds: access.readableSquadIds }),
     listProjectEvidence(env, { projectId: project.id, readableSquadIds: access.readableSquadIds }),
     listProjectBindings(env, project.id),
-    projectManageAccessFor(env, access, project.id),
+    projectManageAccessContextFor(env, access, project.id).then((ctx) => ctx.authorized),
   ])
 
   return {
@@ -692,6 +737,8 @@ export function projectMutationStatus(error: ProjectMutationError): 400 | 404 | 
     || error === 'active_children'
     || error === 'archived_project'
     || error === 'invalid_status_transition'
+    || error === 'completion_gate_required'
+    || error === 'start_gate_required'
   ) return 409
   return 400
 }
@@ -918,6 +965,18 @@ function operatingSituationBand(
           ? html`<div style="min-width:0;overflow-wrap:anywhere;">${activity.title}</div><div class="ui-agent-role" style="min-width:0;overflow-wrap:anywhere;">${activity.detail || activity.status}</div>`
           : html`<div style="min-width:0;overflow-wrap:anywhere;">No material activity yet.</div>`}
       </div>
+      <div style="min-width:0;overflow-wrap:anywhere;">
+        <div class="ui-panel-sub">Routines / attention</div>
+        <div>${situationCount(situation.routines.enabled_count, situation.routines.enabled_count_truncated)} enabled · ${situationCount(situation.routines.paused_count, situation.routines.paused_count_truncated)} paused · ${situationCount(situation.needs_you.count, situation.needs_you.truncated)} needs you</div>
+        <div class="ui-agent-role">${situation.routines.active_run
+          ? `${situation.routines.active_run.routine_name}: ${situation.routines.active_run.status}${situation.routines.active_run.waiting_reason ? ` (${situation.routines.active_run.waiting_reason})` : ''}`
+          : situation.routines.latest_terminal_run
+            ? `Latest outcome: ${situation.routines.latest_terminal_run.status} · ${situation.routines.latest_terminal_run.cost_micro_usd} micro USD`
+          : situation.routines.next ? `Next: ${situation.routines.next.name} at ${situation.routines.next.next_run_at}`
+            : situation.needs_you.highest_priority ? situation.needs_you.highest_priority.title : 'No Routine or attention item is active.'}</div>
+        <a class="ui-link" href="/projects/${encodeURIComponent(project.id)}/routines">Open Routines</a>
+        ${situation.needs_you.count ? html`<span> · </span><a class="ui-link" href="/needs-you">Open Needs You</a>` : ''}
+      </div>
     </div>
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,18rem),1fr));gap:16px;margin-top:16px;">
       <div style="min-width:0;overflow-wrap:anywhere;">
@@ -1081,6 +1140,8 @@ function projectMutationMessage(error: ProjectMutationError): string {
     invalid_name: 'Enter a project name.',
     invalid_status: 'Choose a valid project status action.',
     invalid_status_transition: 'That action is not available from the current project status.',
+    completion_gate_required: 'Project completion requires a structural gate and different-principal verdict.',
+    start_gate_required: 'Activating a planned project requires the start gate (seed first task + resource commit).',
     invalid_target_date: 'Enter a valid target date.',
     slug_taken: 'That project slug is already in use.',
     project_not_found: 'The project no longer exists.',
@@ -1190,9 +1251,10 @@ export function projectSettingsBody(view: ProjectSettingsView): Html {
   </section>`
 }
 
-function projectTabs() {
+function projectTabs(projectId: string) {
   return html`<nav aria-label="Project sections" style="display:flex;gap:8px;overflow-x:auto;padding:2px 0 8px;">
     <a class="btn secondary sm" data-project-tab href="#overview" aria-current="page">Overview</a>
+    <a class="btn secondary sm" href="/projects/${encodeURIComponent(projectId)}/routines">Routines</a>
     <a class="btn secondary sm" data-project-tab href="#work">Work</a>
     <a class="btn secondary sm" data-project-tab href="#board">Board</a>
     <a class="btn secondary sm" data-project-tab href="#squads">Team / Squads</a>
@@ -1364,8 +1426,10 @@ export function projectDetailBody(view: ProjectDetailView, statusResult?: string
     })}
     ${resultMessage ? html`<p role="status" style="margin:8px 0;color:var(--ok,#16a34a);">${resultMessage}</p>` : ''}
     ${view.canManage ? html`<div style="display:flex;justify-content:flex-end;margin:8px 0;"><a class="btn secondary sm" href="/projects/${encodeURIComponent(project.id)}/settings">Project settings</a></div>` : ''}
-    ${projectTabs()}
+    ${projectTabs(project.id)}
     <script type="application/json" id="project-situation-json">${raw(jsonScript(situation))}</script>
+    <script type="application/json" id="project-activity-json">${raw(jsonScript({ rows: view.activity.rows }))}</script>
+    <script type="application/json" id="project-evidence-json">${raw(jsonScript({ rows: view.evidence.rows }))}</script>
     ${operatingSituationBand(project, aggregates, situation)}
     <section id="work" aria-label="Work">
       ${sectionPanel({

@@ -12,11 +12,14 @@
 //   9. Existing provision-tools tests stay green (separate file)
 //  10. tsc strict — validated by build step
 
+import { readFileSync, readdirSync } from 'node:fs'
+import { join } from 'node:path'
 import { describe, it, expect, vi } from 'vitest'
-import { mintAgentBoundToken } from '../src/members/service'
+import { mintAgentBoundToken, sha256Hex } from '../src/members/service'
 import { loadAgentTokenView } from '../src/dashboard/agent-token'
 import { dashboardApp } from '../src/dashboard/index'
 import type { Env } from '../src/types'
+import { createSqliteD1 } from './helpers/sqlite-d1'
 
 // ── test fixtures ─────────────────────────────────────────────────────────────
 
@@ -50,6 +53,7 @@ function makeUnitEnv(opts: { captured?: Captured[]; agentExists?: boolean } = {}
       sql,
       args: boundArgs,
       async first(): Promise<unknown> {
+        if (sql.includes('FROM agent_member_bindings')) return null
         if (sql.includes('FROM agents') && sql.includes('WHERE id')) {
           return agentExists && boundArgs[0] === AGENT.id ? agentRow : null
         }
@@ -120,11 +124,13 @@ describe('mintAgentBoundToken', () => {
     expect(typeof result.memberId).toBe('string')
   })
 
-  it('batches exactly 3 INSERT rows (member + capability + token)', async () => {
+  it('batches exactly 4 INSERT rows (member + binding + capability + token)', async () => {
     const captured: Captured[] = []
     const env = makeUnitEnv({ captured })
     await mintAgentBoundToken(env, AGENT, 'batch-test')
+    expect(captured).toHaveLength(4)
     expect(captured.some((c) => c.sql.includes('INSERT INTO members'))).toBe(true)
+    expect(captured.some((c) => c.sql.includes('INSERT INTO agent_member_bindings'))).toBe(true)
     expect(captured.some((c) => c.sql.includes('INSERT INTO capabilities'))).toBe(true)
     expect(captured.some((c) => c.sql.includes('INSERT INTO member_tokens'))).toBe(true)
   })
@@ -196,6 +202,132 @@ describe('mintAgentBoundToken', () => {
     const capInsert = captured.find((c) => c.sql.includes('INSERT INTO capabilities'))
     if (capInsert) expect(capInsert.args).not.toContain(result.raw)
   })
+
+  it('discards a losing raw token and retries once on the concurrent canonical binding', async () => {
+    const batches: Captured[][] = []
+    let bindingRead = 0
+    const winnerMemberId = 'member-race-winner'
+    const prepare = (sql: string) => {
+      const makeStmt = (args: unknown[]) => ({
+        sql,
+        args,
+        bind(...values: unknown[]) { return makeStmt(values) },
+        async first(): Promise<unknown> {
+          if (sql.includes('FROM agent_member_bindings')) {
+            bindingRead += 1
+            return bindingRead === 1 ? null : { member_id: winnerMemberId }
+          }
+          if (sql.includes('SELECT capability FROM capabilities')) {
+            return { capability: 'observer' }
+          }
+          return null
+        },
+        async all(): Promise<{ results: unknown[] }> {
+          return { results: [] }
+        },
+        async run(): Promise<{ meta: { changes: number } }> {
+          return { meta: { changes: 1 } }
+        },
+      })
+      return makeStmt([])
+    }
+    const env = {
+      TENANT_SLUG: 'test',
+      DB: {
+        prepare,
+        async batch(statements: Captured[]) {
+          batches.push(statements)
+          if (batches.length === 1) throw new Error('agent_identity_conflict')
+          return statements.map(() => ({ meta: { changes: 1 } }))
+        },
+      },
+    } as unknown as Env
+
+    const result = await mintAgentBoundToken(env, AGENT, 'race-label', 'member')
+
+    expect(batches).toHaveLength(2)
+    expect(batches[0]).toHaveLength(4)
+    expect(batches[1]).toHaveLength(1)
+    const losingToken = batches[0].find(({ sql }) => sql.includes('INSERT INTO member_tokens'))
+    const winningToken = batches[1].find(({ sql }) => sql.includes('INSERT INTO member_tokens'))
+    expect(losingToken).toBeDefined()
+    expect(winningToken).toBeDefined()
+    expect(result.memberId).toBe(winnerMemberId)
+    expect(result.grantCapability).toBe('observer')
+    expect(winningToken?.args[1]).toBe(winnerMemberId)
+    expect(winningToken?.args[2]).toBe(await sha256Hex(result.raw))
+    expect(losingToken?.args[2]).not.toBe(winningToken?.args[2])
+  })
+})
+
+const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
+
+function createMigratedMintEnv(): {
+  env: Env
+  sqlite: ReturnType<typeof createSqliteD1>['sqlite']
+  close(): void
+} {
+  const harness = createSqliteD1()
+  for (const file of readdirSync(MIGRATIONS_DIR).filter((name) => name.endsWith('.sql')).sort()) {
+    harness.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
+  }
+  harness.sqlite.exec(`
+    INSERT INTO departments (id, slug, name) VALUES ('dept-mint', 'mint', 'Mint');
+    INSERT INTO squads (id, department_id, slug, name)
+      VALUES ('${AGENT.squad_id}', 'dept-mint', 'growth', 'Growth');
+    INSERT INTO agents (id, squad_id, slug, name, role, model, status)
+      VALUES ('${AGENT.id}', '${AGENT.squad_id}', '${AGENT.slug}', '${AGENT.name}', 'member', 'test', 'active');
+  `)
+  return {
+    env: { TENANT_SLUG: 'test', DB: harness.db } as Env,
+    sqlite: harness.sqlite,
+    close: harness.close,
+  }
+}
+
+describe('mintAgentBoundToken — canonical SQLite identity', () => {
+  it('keeps one member and its committed home grant after every token is revoked', async () => {
+    const harness = createMigratedMintEnv()
+    try {
+      const first = await mintAgentBoundToken(harness.env, AGENT, 'first', 'observer')
+      harness.sqlite.prepare(
+        'UPDATE member_tokens SET revoked_at = ? WHERE tenant = ? AND agent_id = ?',
+      ).run('2026-07-24T12:00:00.000Z', 'test', AGENT.id)
+
+      const second = await mintAgentBoundToken(harness.env, AGENT, 'second', 'member')
+      expect(second.memberId).toBe(first.memberId)
+      expect(second.grantCapability).toBe('observer')
+      expect(harness.sqlite.prepare(
+        'SELECT COUNT(DISTINCT member_id) AS count FROM member_tokens WHERE tenant = ? AND agent_id = ?',
+      ).get('test', AGENT.id)).toEqual({ count: 1 })
+      expect(harness.sqlite.prepare(
+        'SELECT member_id FROM agent_member_bindings WHERE tenant = ? AND agent_id = ?',
+      ).get('test', AGENT.id)).toEqual({ member_id: first.memberId })
+      expect(harness.sqlite.prepare(
+        `SELECT capability FROM capabilities
+          WHERE member_id = ? AND scope_type = 'squad' AND scope_id = ?`,
+      ).get(first.memberId, AGENT.squad_id)).toEqual({ capability: 'observer' })
+    } finally {
+      harness.close()
+    }
+  })
+
+  it('allows multiple live credentials without creating multiple identities', async () => {
+    const harness = createMigratedMintEnv()
+    try {
+      const first = await mintAgentBoundToken(harness.env, AGENT, 'first')
+      const second = await mintAgentBoundToken(harness.env, AGENT, 'second')
+      expect(second.memberId).toBe(first.memberId)
+      expect(harness.sqlite.prepare(
+        'SELECT COUNT(*) AS count FROM member_tokens WHERE revoked_at IS NULL AND agent_id = ?',
+      ).get(AGENT.id)).toEqual({ count: 2 })
+      expect(harness.sqlite.prepare(
+        'SELECT COUNT(DISTINCT member_id) AS count FROM member_tokens WHERE agent_id = ?',
+      ).get(AGENT.id)).toEqual({ count: 1 })
+    } finally {
+      harness.close()
+    }
+  })
 })
 
 // ── 3 & 4. Route integration tests ────────────────────────────────────────────
@@ -228,6 +360,7 @@ function makeRouteEnv(role: 'owner' | 'admin' | 'member', opts: {
       bind(...args: unknown[]) { return makeStmt(args) },
       async first(): Promise<unknown> {
         const ref = boundArgs[0]
+        if (sql.includes('FROM agent_member_bindings')) return null
         if (sql.includes('FROM agents') && sql.includes('WHERE id')) {
           return agentExists && ref === AGENT.id ? agentRow : null
         }
@@ -261,6 +394,7 @@ function makeRouteEnv(role: 'owner' | 'admin' | 'member', opts: {
     TENANT_SLUG: 'test',
     BRAND: 'Test',
     OAUTH_PROVIDER: 'google',
+    PUBLIC_ORIGIN: 'https://test.mupot.app',
     DB: {
       prepare,
       async batch(stmts: { sql: string; args: unknown[] }[]) {
@@ -414,6 +548,19 @@ describe('POST /admin/agent-token/mint', () => {
     const text = await res.text()
     expect(text).toContain('Grant must be observer or member')
     expect(captured.length).toBe(0)
+  })
+
+  it('503s before minting when PUBLIC_ORIGIN is not a secure canonical origin', async () => {
+    const captured: Captured[] = []
+    const env = makeRouteEnv('admin', { captured })
+    env.PUBLIC_ORIGIN = 'http://evil.example'
+    const form = new URLSearchParams({ agent_id: AGENT.id, label: 'origin-gap' })
+
+    const res = await dashboardApp.fetch(makeReq('/admin/agent-token/mint', 'POST', form), env)
+
+    expect(res.status).toBe(503)
+    expect(await res.text()).toContain('secure public origin')
+    expect(captured).toHaveLength(0)
   })
 
   it('Cache-Control: no-store on the mint result page', async () => {

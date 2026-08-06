@@ -37,7 +37,7 @@ function makeEnv(opts: { tenant?: string; releaseSha?: string; onboardingComplet
 }
 
 describe('loadDeployment', () => {
-  it('reuses publicHealth() for version/commit/ok/tenant — never re-derives them', async () => {
+  it('reuses publicHealth() for version/commit/clean/ok/tenant — never re-derives them', async () => {
     const sha = 'b'.repeat(40)
     const env = makeEnv({ tenant: 'mumega', releaseSha: sha, onboardingComplete: 'true' })
     const d = await loadDeployment(env)
@@ -45,6 +45,7 @@ describe('loadDeployment', () => {
       tenant: 'mumega',
       version: MUPOT_PUBLIC_API_VERSION,
       commit: sha,
+      clean: true,
       ok: true,
       onboarded: true,
     })
@@ -67,6 +68,17 @@ describe('loadDeployment', () => {
     const d = await loadDeployment(env)
     expect(d.onboarded).toBe(false)
   })
+
+  // mupot#571 fix 2 — a dirty/off-main deploy's stamp carries the -dirty
+  // suffix; the dashboard must surface that as clean:false, not silently
+  // strip it back down to looking like a normal clean release.
+  it('reports clean:false (and the real commit) for a -dirty stamped release', async () => {
+    const sha = 'b'.repeat(40)
+    const env = makeEnv({ tenant: 'mumega', releaseSha: `${sha}-dirty`, onboardingComplete: 'true' })
+    const d = await loadDeployment(env)
+    expect(d.commit).toBe(sha)
+    expect(d.clean).toBe(false)
+  })
 })
 
 describe('deploymentBody', () => {
@@ -74,6 +86,7 @@ describe('deploymentBody', () => {
     tenant: 'mumega',
     version: MUPOT_PUBLIC_API_VERSION,
     commit: 'c'.repeat(40),
+    clean: true,
     ok: true,
     onboarded: true,
   }
@@ -100,6 +113,19 @@ describe('deploymentBody', () => {
     const out = String(deploymentBody({ ...stamped, commit: null }))
     expect(out).toContain('Release SHA not set')
     expect(out).toContain('not stamped')
+  })
+
+  // mupot#571 fix 2 — clean:false must be visibly flagged, not silently
+  // rendered identically to a verified clean release.
+  it('flags an unverified (dirty/off-main) build even though a real commit is present', () => {
+    const out = String(deploymentBody({ ...stamped, clean: false }))
+    expect(out).toContain('Unverified build')
+    expect(out).toContain(stamped.commit) // still shows the real commit
+  })
+
+  it('does not show the unverified-build warning for a clean release', () => {
+    const out = String(deploymentBody(stamped))
+    expect(out).not.toContain('Unverified build')
   })
 
   it('nudges to /setup when the pot is not yet onboarded, but still shows live identity', () => {

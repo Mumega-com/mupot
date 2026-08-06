@@ -25,6 +25,8 @@ interface Opts {
   existingGrantCapabilities?: Capability[]
   guardedGrantNoRow?: boolean
   events?: unknown[]
+  publicOrigin?: string | null
+  boundAgentId?: string | null
 }
 
 const SQUAD = { id: 'squad-1', department_id: 'dept-1' }
@@ -41,6 +43,10 @@ function makeEnv(opts: Opts = {}, captured: Captured[] = []): Env {
   const deptExists = opts.deptExists ?? true
   const agentTokenMembers = opts.agentTokenMembers ?? ['member-agent-1']
   const existingGrantCapabilities = opts.existingGrantCapabilities ?? []
+  let accessMembership = existingGrantCapabilities.length > 0
+    ? { id: 'existing-membership-id', agent_id: AGENT.id, squad_id: TARGET_SQUAD.id, capability: 'member' }
+    : null
+  let accessCapability: Capability | null = existingGrantCapabilities[0] ?? null
 
   const agentRow = { id: AGENT.id, squad_id: AGENT.squad_id, slug: AGENT.slug, name: AGENT.name }
 
@@ -55,6 +61,16 @@ function makeEnv(opts: Opts = {}, captured: Captured[] = []): Env {
         // .first() serves the member_tokens authn lookup and every WHERE-id resolve
         // (ids are globally unique). Slug resolves go through .all() (count matches).
         async first() {
+          if (sql.includes('LEFT JOIN agent_member_bindings')) {
+            return {
+              home_squad_id: AGENT.squad_id,
+              bound_member_id: agentTokenMembers[0] ?? null,
+            }
+          }
+          if (sql.includes('FROM agent_member_bindings')) {
+            const member_id = agentTokenMembers[0]
+            return member_id === undefined ? null : { member_id }
+          }
           if (sql.includes('FROM member_tokens')) {
             return {
               member_id: memberId,
@@ -64,7 +80,7 @@ function makeEnv(opts: Opts = {}, captured: Captured[] = []): Env {
               status: 'active',
               created_at: '2026-06-09 00:00:00',
               channel: 'workspace',
-              bound_agent_id: null,
+              bound_agent_id: opts.boundAgentId ?? null,
             }
           }
           if (sql.includes('FROM agent_keys')) return null
@@ -78,8 +94,28 @@ function makeEnv(opts: Opts = {}, captured: Captured[] = []): Env {
             if (ref === TARGET_SQUAD.id) return { id: TARGET_SQUAD.id, department_id: TARGET_SQUAD.department_id }
             return null
           }
+          if (sql.includes('SELECT squad_id AS home_squad_id FROM agents')) {
+            return agentExists ? { home_squad_id: AGENT.squad_id } : null
+          }
           if (sql.includes('FROM agents') && byId) {
             return agentExists && ref === AGENT.id ? agentRow : null
+          }
+          if (sql.includes('SELECT id FROM squads WHERE id')) {
+            return squadExists ? { id: ref } : null
+          }
+          if (sql.includes('FROM memberships')) return accessMembership
+          if (sql.includes('SELECT capability') && sql.includes('FROM capabilities')) {
+            return accessCapability === null ? null : { capability: accessCapability }
+          }
+          if (sql.includes('SELECT member_id, scope_type, scope_id, capability')) {
+            return accessCapability === null
+              ? null
+              : {
+                  member_id: agentTokenMembers[0],
+                  scope_type: 'squad',
+                  scope_id: TARGET_SQUAD.id,
+                  capability: accessCapability,
+                }
           }
           return null
         },
@@ -115,11 +151,6 @@ function makeEnv(opts: Opts = {}, captured: Captured[] = []): Env {
             return { results: existingGrantCapabilities.map((capability) => ({ capability })) }
           }
           if (sql.includes('FROM capabilities')) return { results: grants }
-          if (sql.includes('SELECT DISTINCT t.member_id')) {
-            return {
-              results: [...new Set(agentTokenMembers)].slice(0, 2).map((member_id) => ({ member_id })),
-            }
-          }
           // slug resolves: count matches. 'dup' deliberately matches TWO agents.
           if (sql.includes('FROM agents') && sql.includes('WHERE slug')) {
             if (ref === 'dup') return { results: [agentRow, { ...agentRow, id: 'agent-2', squad_id: 'squad-2' }] }
@@ -149,12 +180,37 @@ function makeEnv(opts: Opts = {}, captured: Captured[] = []): Env {
 
   return {
     TENANT_SLUG: 'digid',
+    PUBLIC_ORIGIN: opts.publicOrigin === null
+      ? undefined
+      : (opts.publicOrigin ?? 'https://agents.digid.ca'),
     BRAND: 'Digid',
     OAUTH_PROVIDER: 'google',
     DB: {
       prepare: (sql: string) => handler(sql),
       // atomic mint runs member+capability+token as one batch; record each INSERT.
       async batch(stmts: { sql: string; args: unknown[] }[]) {
+        if (
+          stmts.length === 2
+          && stmts[0].sql.includes('INSERT INTO memberships')
+          && stmts[1].sql.includes('INSERT INTO capabilities')
+        ) {
+          if (opts.guardedGrantNoRow) {
+            return stmts.map(() => ({ meta: { changes: 0 } }))
+          }
+          accessMembership = {
+            id: stmts[0].args[0] as string,
+            agent_id: stmts[0].args[1] as string,
+            squad_id: stmts[0].args[2] as string,
+            capability: 'member',
+          }
+          accessCapability = stmts[1].args[3] as Capability
+          captured.push({ sql: stmts[0].sql, args: stmts[0].args })
+          captured.push({
+            sql: 'INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)',
+            args: [stmts[1].args[0], stmts[1].args[1], 'squad', stmts[1].args[2], stmts[1].args[3]],
+          })
+          return stmts.map(() => ({ meta: { changes: 1 } }))
+        }
         for (const s of stmts) if (s.sql.includes('INSERT INTO')) captured.push({ sql: s.sql, args: s.args })
         return stmts.map(() => ({ meta: { changes: 1 } }))
       },
@@ -163,9 +219,15 @@ function makeEnv(opts: Opts = {}, captured: Captured[] = []): Env {
   } as unknown as Env
 }
 
-async function call(name: string, args: Record<string, unknown>, env: Env, auth = true) {
+async function call(
+  name: string,
+  args: Record<string, unknown>,
+  env: Env,
+  auth = true,
+  requestOrigin = 'https://agents.digid.ca',
+) {
   return mcpApp.request(
-    'https://agents.digid.ca/',
+    `${requestOrigin}/`,
     {
       method: 'POST',
       headers: {
@@ -195,6 +257,7 @@ describe('provision tools — advertised', () => {
     expect(names).toContain('create_squad')
     expect(names).toContain('create_agent')
     expect(names).toContain('mint_agent_token')
+    expect(names).toContain('provision_agent_connection')
     expect(names).toContain('register_agent_key')
     expect(names).toContain('grant_agent_capability')
   })
@@ -223,6 +286,33 @@ describe('provision tools — advertised', () => {
       required: ['agent', 'squad', 'capability'],
       additionalProperties: false,
     })
+  })
+
+  it('refuses agent-bound callers on provision, mint, and grant surfaces', async () => {
+    for (const [name, args] of [
+      ['mint_agent_token', { agent: AGENT.id }],
+      ['grant_agent_capability', {
+        agent: AGENT.id,
+        squad: TARGET_SQUAD.id,
+        capability: 'member',
+      }],
+      ['provision_agent_connection', {
+        request_id: 'agent-self-provision',
+        existing_agent: AGENT.id,
+        credential: { action: 'add' },
+      }],
+    ] as const) {
+      const captured: Captured[] = []
+      const response = await call(
+        name,
+        args,
+        makeEnv({ boundAgentId: 'agent-caller' }, captured),
+      )
+      expect(response.status).toBe(403)
+      expect(((await response.json()) as { error: { message: string } }).error.message)
+        .toBe('operator_principal_required')
+      expect(captured).toEqual([])
+    }
   })
 })
 
@@ -318,6 +408,10 @@ describe('create_agent', () => {
     const body = (await res.json()) as { result: { structuredContent: { agent: { slug: string } } } }
     expect(body.result.structuredContent.agent.slug).toBe('sdr-1')
     expect(cap.some((c) => c.sql.includes('INSERT INTO agents'))).toBe(true)
+    expect(cap.some((c) => /INSERT INTO members\s*\(/.test(c.sql))).toBe(false)
+    expect(cap.some((c) => c.sql.includes('INSERT INTO agent_member_bindings'))).toBe(false)
+    expect(cap.some((c) => c.sql.includes('INSERT INTO capabilities'))).toBe(false)
+    expect(cap.some((c) => c.sql.includes('INSERT INTO member_tokens'))).toBe(false)
   })
 
   it('403s a squad member (needs lead)', async () => {
@@ -416,6 +510,57 @@ describe('mint_agent_token', () => {
     expect(higherRows).toEqual([])
   })
 
+  it('reuses the canonical member and committed home capability on an additional credential', async () => {
+    const rows: Captured[] = []
+    const res = await call(
+      'mint_agent_token',
+      { agent: AGENT.slug, capability: 'member' },
+      makeEnv({ existingGrantCapabilities: ['observer'] }, rows),
+    )
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as {
+      result: { structuredContent: { token: { member_id: string; capability: string } } }
+    }
+    expect(body.result.structuredContent.token).toMatchObject({
+      member_id: 'member-agent-1',
+      capability: 'observer',
+    })
+    expect(rows.filter(({ sql }) => sql.includes('INSERT INTO member_tokens'))).toHaveLength(1)
+    expect(rows.some(({ sql }) => /INSERT INTO members\s*\(/.test(sql))).toBe(false)
+    expect(rows.some(({ sql }) => sql.includes('INSERT INTO agent_member_bindings'))).toBe(false)
+    expect(rows.some(({ sql }) => sql.includes('INSERT INTO capabilities'))).toBe(false)
+  })
+
+  it('requires a safe pinned origin before minting and ignores a malicious request host', async () => {
+    for (const publicOrigin of [null, 'http://evil.example']) {
+      const rows: Captured[] = []
+      const res = await call(
+        'mint_agent_token',
+        { agent: AGENT.slug },
+        makeEnv({ agentTokenMembers: [], publicOrigin }, rows),
+      )
+      expect(res.status).toBe(503)
+      expect(((await res.json()) as { error: { message: string } }).error.message)
+        .toBe('public_origin_unconfigured')
+      expect(rows).toEqual([])
+    }
+
+    const res = await call(
+      'mint_agent_token',
+      { agent: AGENT.slug },
+      makeEnv({ agentTokenMembers: [], publicOrigin: 'https://pot.example' }),
+      true,
+      'https://evil.example',
+    )
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as {
+      result: { structuredContent: { mcp_endpoint: string; wake_contract: { emit_url: string } } }
+    }
+    expect(body.result.structuredContent.mcp_endpoint).toBe('https://pot.example/mcp')
+    expect(body.result.structuredContent.wake_contract.emit_url).toBe('https://pot.example/bus/emit')
+    expect(JSON.stringify(body)).not.toContain('evil.example')
+  })
+
   it('403s a squad-lead — minting a credential needs admin', async () => {
     const grants: CapabilityGrant[] = [
       { member_id: 'member-operator', scope_type: 'squad', scope_id: 'squad-1', capability: 'lead' },
@@ -502,6 +647,19 @@ describe('register_agent_key', () => {
     expect(captured).toEqual([])
   })
 
+  it('refuses to create a key before the canonical agent identity exists', async () => {
+    const captured: Captured[] = []
+    const res = await call(
+      'register_agent_key',
+      { agent: AGENT.slug, public_key: publicKey },
+      makeEnv({ agentTokenMembers: [] }, captured),
+    )
+    expect(res.status).toBe(409)
+    expect(((await res.json()) as { error: { message: string } }).error.message)
+      .toBe('agent_identity_unminted')
+    expect(captured).toEqual([])
+  })
+
   it('allows an explicit legacy slug or exact database id and rejects aliases', async () => {
     const idRows: Captured[] = []
     const idRes = await call(
@@ -571,6 +729,10 @@ describe('grant_agent_capability', () => {
       TARGET_SQUAD.id,
       'member',
     ])
+    expect(captured.find((row) => row.sql.includes('INSERT INTO memberships'))?.args.slice(1, 3)).toEqual([
+      AGENT.id,
+      TARGET_SQUAD.id,
+    ])
 
     expect(JSON.stringify(body.result.structuredContent)).not.toMatch(/token|raw|hash/i)
     expect(events).toHaveLength(1)
@@ -613,18 +775,6 @@ describe('grant_agent_capability', () => {
     expect(captured).toEqual([])
   })
 
-  it('rejects an agent with ambiguous active member identities before writing a grant', async () => {
-    const captured: Captured[] = []
-    const res = await call(
-      'grant_agent_capability',
-      args,
-      makeEnv({ agentTokenMembers: ['member-agent-1', 'member-agent-2'] }, captured),
-    )
-    expect(res.status).toBe(409)
-    expect(((await res.json()) as { error: { message: string } }).error.message).toBe('agent_identity_ambiguous')
-    expect(captured).toEqual([])
-  })
-
   it('reports a receipt failure when the guarded write returns no row but identity is unchanged', async () => {
     const captured: Captured[] = []
     const res = await call(
@@ -646,6 +796,19 @@ describe('grant_agent_capability', () => {
     )
     expect(res.status).toBe(400)
     expect(((await res.json()) as { error: { message: string } }).error.message).toBe('invalid_capability')
+    expect(captured).toEqual([])
+  })
+
+  it('never raises the immutable home squad above member', async () => {
+    const captured: Captured[] = []
+    const res = await call(
+      'grant_agent_capability',
+      { agent: AGENT.slug, squad: SQUAD.id, capability: 'lead' },
+      makeEnv({}, captured),
+    )
+    expect(res.status).toBe(409)
+    expect(((await res.json()) as { error: { message: string } }).error.message)
+      .toBe('home_capability_ceiling')
     expect(captured).toEqual([])
   })
 

@@ -1,0 +1,57 @@
+name: staleness-check
+
+# mupot#443 Part B — CI has no real deploy step, so drift between `main` and
+# what's actually live in each pot was invisible (7 merged PRs sat undeployed
+# for 4 days with nobody the wiser). This workflow makes drift visible without
+# auto-deploying anything: it reads each pot's public GET /health `commit`
+# (see src/health.ts, stamped by scripts/deploy.mjs / scripts/mupot-update.mjs)
+# and compares it to `main` HEAD. Read-only — no Cloudflare credentials, no
+# secrets, cannot deploy or touch any tenant pot.
+#
+# Signal on divergence: the job fails (red run in the Actions tab; GitHub
+# automatically emails the workflow's last editor when a SCHEDULED run fails)
+# and the human-readable report is written to the job summary either way, so
+# "everything's current" is just as visible as "pot X drifted".
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      # mupot#571: pin explicitly to the exact commit GitHub resolved for
+      # this event (github.sha) rather than relying on checkout's implicit
+      # default — a workflow_dispatch can be run against ANY branch/ref
+      # picked in the UI, so the ref actually built must never be assumed.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Compare live pots vs main HEAD
+        # shell: bash is required (not just cosmetic) — GitHub Actions' IMPLICIT
+        # default shell on Linux runs `bash -e {0}` WITHOUT `pipefail`, so
+        # `node ... | tee ...` would report the exit code of `tee` (always 0)
+        # instead of `node`'s. Declaring `shell: bash` explicitly switches to
+        # `bash --noprofile --norc -eo pipefail {0}`, which DOES set pipefail —
+        # verified empirically, see mupot fix/571-integrity-hotfix. Without
+        # this, a drifted/unstamped/unreachable pot would tee its ✘ report into
+        # the step summary and the job would still go green.
+        shell: bash
+        env:
+          # GITHUB_REF_NAME is already set by Actions for every event
+          # (schedule AND workflow_dispatch); passed through explicitly so
+          # the report names the REAL ref, never an assumed "main" — see
+          # scripts/staleness-check.mjs formatReport (mupot#571).
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          node scripts/staleness-check.mjs | tee -a "$GITHUB_STEP_SUMMARY"

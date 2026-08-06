@@ -79,3 +79,28 @@ export async function hasProjectWriteForSquads(
   )
   return uniqueSquadIds.every((squadId) => writable.has(squadId))
 }
+
+// The ANY-of variant of hasProjectWriteForSquads: true when AT LEAST ONE of `squadIds`
+// holds 'write'/'admin' on the project. This is the correct "can THIS CALLER write to
+// the project" test — a caller typically holds several squad grants (write on one,
+// observer on unrelated others), so the every-squad-writable form (hasProjectWriteForSquads)
+// would wrongly deny them. Same fail-closed discipline: absence of a project_squad_access
+// row is denial, never a bypass.
+export async function anySquadHasProjectWrite(
+  env: Env,
+  projectId: string,
+  squadIds: string[],
+): Promise<boolean> {
+  const uniqueSquadIds = [...new Set(squadIds)]
+  if (uniqueSquadIds.length === 0) return false
+  const placeholders = uniqueSquadIds.map((_, index) => `?${index + 2}`).join(', ')
+  const row = await env.DB.prepare(
+    `SELECT 1 AS ok
+       FROM project_squad_access
+      WHERE project_id = ?1
+        AND squad_id IN (${placeholders})
+        AND access_level IN ('write', 'admin')
+      LIMIT 1`,
+  ).bind(projectId, ...uniqueSquadIds).first<{ ok: number }>()
+  return row !== null
+}

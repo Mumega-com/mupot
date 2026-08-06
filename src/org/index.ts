@@ -37,6 +37,11 @@ import { resolveCapabilities, hasCapability, isOrgAdmin } from '../auth/capabili
 // Shared org-chart creation path (also used by the dashboard). Validation + the
 // UNIQUE conflict mapping live here so both surfaces stay in lockstep.
 import { createDepartment, createSquad, createAgent } from './service'
+import { resolveAgentMemberBinding } from '../members/service'
+import {
+  setAgentSquadAccess,
+  type AgentAccessCapability,
+} from '../members/agent-access'
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -92,9 +97,9 @@ function isNonEmptyString(v: unknown): v is string {
   return typeof v === 'string' && v.trim().length > 0
 }
 
-const CAPABILITIES: readonly Capability[] = ['owner', 'lead', 'member', 'observer']
-function isCapability(v: unknown): v is Capability {
-  return typeof v === 'string' && (CAPABILITIES as readonly string[]).includes(v)
+const ACCESS_CAPABILITIES: readonly AgentAccessCapability[] = ['admin', 'lead', 'member', 'observer']
+function isAccessCapability(v: unknown): v is AgentAccessCapability {
+  return typeof v === 'string' && (ACCESS_CAPABILITIES as readonly string[]).includes(v)
 }
 
 // ── app ──────────────────────────────────────────────────────────────────────
@@ -252,6 +257,10 @@ interface CreateMembershipBody {
 }
 
 orgApp.post('/agents/:id/memberships', async (c) => {
+  const auth = c.get('auth')
+  if (auth.boundAgentId) {
+    return c.json({ error: 'operator_principal_required' }, 403)
+  }
   const agentId = c.req.param('id')
   const agent = await getById<Agent>(c.env, 'agents', agentId)
   if (!agent) return c.json({ error: 'agent_not_found' }, 404)
@@ -267,36 +276,49 @@ orgApp.post('/agents/:id/memberships', async (c) => {
   const squad = await getById<Squad>(c.env, 'squads', body.squad_id)
   if (!squad) return c.json({ error: 'squad_not_found' }, 404)
 
-  // Attaching an agent to a squad (an RBAC edge into that squad) requires lead+ on
+  // Delegating agent authority into a squad requires admin on
   // the TARGET squad (dept grants inherit). Gated after the target squad resolves.
-  if (!(await canOnSquad(c.env, c.get('auth'), squad.id, 'lead'))) {
-    return c.json({ error: 'forbidden', need: 'lead' }, 403)
+  if (!(await canOnSquad(c.env, c.get('auth'), squad.id, 'admin'))) {
+    return c.json({ error: 'forbidden', need: 'admin' }, 403)
   }
 
-  const capability: Capability =
-    body.capability === undefined ? 'member' : (body.capability as Capability)
-  if (!isCapability(capability)) return c.json({ error: 'invalid_capability' }, 400)
+  const capability = body.capability === undefined ? 'member' : body.capability
+  if (!isAccessCapability(capability)) {
+    return c.json({ error: 'invalid_capability' }, 400)
+  }
 
-  const membership: Membership = {
-    id: crypto.randomUUID(),
-    agent_id: agentId,
-    squad_id: body.squad_id,
+  if (!isOrgAdmin(auth)) {
+    if (!auth.memberId) return c.json({ error: 'forbidden' }, 403)
+    const grants = auth.capabilities ?? (await resolveCapabilities(c.env, auth.memberId))
+    if (!hasCapability(grants, 'squad', squad.id, capability, squad.department_id)) {
+      return c.json({ error: 'cannot_grant_above_own_rank' }, 403)
+    }
+  }
+
+  const binding = await resolveAgentMemberBinding(c.env, agentId)
+  if (binding.kind === 'unminted') {
+    return c.json({ error: 'agent_identity_unminted' }, 409)
+  }
+  const result = await setAgentSquadAccess(c.env, {
+    agentId,
+    memberId: binding.memberId,
+    squadId: squad.id,
     capability,
+  })
+  if (!result.ok) {
+    const status = result.error === 'agent_not_found' || result.error === 'squad_not_found'
+      ? 404
+      : result.error === 'receipt_failed'
+        ? 500
+        : 409
+    return c.json({ error: result.error }, status)
   }
 
-  try {
-    await c.env.DB.prepare(
-      'INSERT INTO memberships (id, agent_id, squad_id, capability) VALUES (?, ?, ?, ?)',
-    )
-      .bind(membership.id, membership.agent_id, membership.squad_id, membership.capability)
-      .run()
-  } catch (err) {
-    // UNIQUE(agent_id, squad_id) — one membership edge per (agent, squad).
-    if (isUniqueViolation(err)) return c.json({ error: 'membership_exists' }, 409)
-    throw err
-  }
-
-  return c.json({ membership }, 201)
+  return c.json({
+    membership: result.membership,
+    grant: result.grant,
+    result: result.result,
+  }, result.result === 'created' ? 201 : 200)
 })
 
 // ── tree (full org chart) ────────────────────────────────────────────────────
@@ -368,10 +390,4 @@ async function getById<T>(env: Env, table: OrgTable, id: string): Promise<T | nu
     .bind(id)
     .first<T>()
   return row ?? null
-}
-
-// D1 surfaces UNIQUE constraint failures as an Error whose message contains
-// "UNIQUE constraint failed". We map those to 409 rather than 500.
-function isUniqueViolation(err: unknown): boolean {
-  return err instanceof Error && /UNIQUE constraint failed/i.test(err.message)
 }

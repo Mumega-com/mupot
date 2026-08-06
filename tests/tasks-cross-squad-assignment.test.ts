@@ -40,6 +40,14 @@ function createSchema(sqlite: SqliteD1Harness['sqlite']): void {
       tenant TEXT NOT NULL,
       revoked_at TEXT
     );
+    CREATE TABLE agent_member_bindings (
+      tenant TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      member_id TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (tenant, agent_id),
+      UNIQUE (tenant, member_id)
+    );
     CREATE TABLE capabilities (
       id TEXT PRIMARY KEY,
       member_id TEXT NOT NULL,
@@ -53,6 +61,10 @@ function createSchema(sqlite: SqliteD1Harness['sqlite']): void {
       squad_id TEXT NOT NULL,
       capability TEXT NOT NULL
     );
+    -- priority + parent_task_id (migrations/0079) added by hand: this fixture hand-writes
+    -- tasks rather than applying the committed chain, so a purely-additive column breaks it
+    -- (persistTaskUpdate writes every column it owns). The fixture did not catch a bug; it
+    -- lied about the schema and blocked a feature. One of the 13 tracked in #703.
     CREATE TABLE tasks (
       id TEXT PRIMARY KEY,
       squad_id TEXT NOT NULL,
@@ -60,6 +72,8 @@ function createSchema(sqlite: SqliteD1Harness['sqlite']): void {
       title TEXT NOT NULL,
       body TEXT NOT NULL,
       done_when TEXT NOT NULL,
+      priority TEXT,
+      parent_task_id TEXT,
       status TEXT NOT NULL,
       assignee_agent_id TEXT,
       github_issue_url TEXT,
@@ -70,6 +84,7 @@ function createSchema(sqlite: SqliteD1Harness['sqlite']): void {
       execution_receipt_id TEXT,
       execution_claim_expires_at INTEGER,
       source_pot TEXT,
+      external_source TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -84,6 +99,8 @@ function addCrossSquadIdentity(sqlite: SqliteD1Harness['sqlite'], capability: 'm
     VALUES ('${TARGET_SQUAD_ID}', 'department-target', 'Target squad charter.');
     INSERT INTO agents (id, squad_id, status) VALUES ('${CROSS_AGENT_ID}', '${HOME_SQUAD_ID}', 'active');
     INSERT INTO members (id, tenant, status) VALUES ('${MEMBER_ID}', '${TENANT}', 'active');
+    INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+    VALUES ('${TENANT}', '${CROSS_AGENT_ID}', '${MEMBER_ID}', '2026-07-24T00:00:00.000Z');
     INSERT INTO member_tokens (id, member_id, agent_id, tenant, revoked_at)
     VALUES ('token-cross', '${MEMBER_ID}', '${CROSS_AGENT_ID}', '${TENANT}', NULL);
   `)

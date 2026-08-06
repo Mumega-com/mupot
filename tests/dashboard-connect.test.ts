@@ -2,8 +2,10 @@ import { describe, expect, it } from 'vitest'
 import {
   mcpEndpoint,
   canonicalOrigin,
+  requiredCanonicalOrigin,
   claudeCodeSnippet,
   codexSnippet,
+  cursorSnippet,
   mcpServerKey,
   wakeContractForAgent,
 } from '../src/dashboard/connect'
@@ -21,6 +23,23 @@ describe('canonicalOrigin', () => {
     expect(canonicalOrigin({ PUBLIC_ORIGIN: 'not a url' }, 'https://pot.example.com')).toBe(
       'https://pot.example.com',
     )
+  })
+})
+
+describe('requiredCanonicalOrigin', () => {
+  it('requires a pinned HTTPS origin, with HTTP allowed only for explicit loopback', () => {
+    expect(requiredCanonicalOrigin({ PUBLIC_ORIGIN: 'https://agents.example' }))
+      .toEqual({ ok: true, origin: 'https://agents.example' })
+    expect(requiredCanonicalOrigin({ PUBLIC_ORIGIN: 'http://127.0.0.1:8787' }))
+      .toEqual({ ok: true, origin: 'http://127.0.0.1:8787' })
+    expect(requiredCanonicalOrigin({ PUBLIC_ORIGIN: 'http://localhost:8787/path' }))
+      .toEqual({ ok: true, origin: 'http://localhost:8787' })
+    expect(requiredCanonicalOrigin({ PUBLIC_ORIGIN: 'http://evil.example' }))
+      .toEqual({ ok: false, error: 'public_origin_unconfigured' })
+    expect(requiredCanonicalOrigin({ PUBLIC_ORIGIN: 'not a url' }))
+      .toEqual({ ok: false, error: 'public_origin_unconfigured' })
+    expect(requiredCanonicalOrigin({}))
+      .toEqual({ ok: false, error: 'public_origin_unconfigured' })
   })
 })
 
@@ -68,6 +87,21 @@ describe('codexSnippet', () => {
     expect(snippet).toContain('url = "https://pot.example.com/mcp"')
     expect(snippet).toContain('bearer_token_env_var = "ACME_MCP_TOKEN"')
     expect(snippet).not.toContain('transport = "sse"') // Codex uses streamable-http
+    expect(snippet).not.toContain('mupot_')
+  })
+})
+
+describe('cursorSnippet', () => {
+  it('produces streamable HTTP JSON with a placeholder token', () => {
+    const snippet = cursorSnippet('acme', 'https://pot.example.com')
+    const parsed = JSON.parse(snippet) as {
+      mcpServers: Record<string, { type: string; url: string; headers: Record<string, string> }>
+    }
+    expect(parsed.mcpServers.acme).toEqual({
+      type: 'http',
+      url: 'https://pot.example.com/mcp',
+      headers: { Authorization: 'Bearer <MEMBER_TOKEN>' },
+    })
     expect(snippet).not.toContain('mupot_')
   })
 })

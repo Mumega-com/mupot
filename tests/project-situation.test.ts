@@ -7,9 +7,16 @@ import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
 const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
 
-function makeHarness(): SqliteD1Harness {
+function makeHarness(options: { includeRoutineMigrations?: boolean } = {}): SqliteD1Harness {
+  const includeRoutineMigrations = options.includeRoutineMigrations !== false
   const harness = createSqliteD1()
   for (const file of readdirSync(MIGRATIONS_DIR).filter((name) => name.endsWith('.sql')).sort()) {
+    if (
+      !includeRoutineMigrations
+      && (file.startsWith('0073_') || file.startsWith('0074_'))
+    ) {
+      continue
+    }
     harness.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
   }
   harness.sqlite.exec(`
@@ -28,6 +35,33 @@ function makeHarness(): SqliteD1Harness {
 
 function envFor(harness: SqliteD1Harness): Env {
   return { DB: harness.db, TENANT_SLUG: 'pot-a' } as Env
+}
+
+function statementProbe(database: Env['DB']): {
+  db: Env['DB']
+  statements: Array<{ sql: string; values: unknown[] }>
+} {
+  const statements: Array<{ sql: string; values: unknown[] }> = []
+  type Statement = ReturnType<Env['DB']['prepare']>
+
+  const wrap = (statement: Statement, sql: string, values: unknown[] = []): Statement => ({
+    bind(...nextValues: unknown[]) {
+      return wrap(statement.bind(...nextValues), sql, nextValues)
+    },
+    async all<T>() {
+      statements.push({ sql, values })
+      return statement.all<T>()
+    },
+  }) as Statement
+
+  return {
+    db: {
+      prepare(sql: string) {
+        return wrap(database.prepare(sql), sql)
+      },
+    } as Env['DB'],
+    statements,
+  }
 }
 
 function insertProject(harness: SqliteD1Harness, id: string, status: ProjectStatus = 'active'): Project {
@@ -110,12 +144,109 @@ function insertFlight(
   )
 }
 
+function insertRoutine(
+  harness: SqliteD1Harness,
+  projectId: string,
+  input: {
+    id: string
+    tenant?: string
+    squadId?: string
+    status?: 'draft' | 'enabled' | 'paused' | 'archived'
+    nextRunAt?: string | null
+    name?: string
+  },
+): void {
+  const status = input.status ?? 'enabled'
+  const createdAt = '2026-07-19T01:00:00.000Z'
+  harness.sqlite.prepare(`
+    INSERT INTO routines (
+      id, tenant, project_id, name, objective, status, trigger_kind, cron_expression,
+      timezone, next_run_at, overlap_policy, execution_mode, responsible_squad_id,
+      budget_micro_usd, max_attempts, retry_backoff_seconds, revision, enabled_by,
+      enabled_at, created_by, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, 'Advance Project work', ?, 'cron', '* * * * *', 'America/Toronto',
+      ?, 'skip', 'propose', ?, 1000, 3, 300, 1, ?, ?, 'member-a', ?, ?)
+  `).run(
+    input.id, input.tenant ?? 'pot-a', projectId, input.name ?? input.id, status,
+    input.nextRunAt ?? null, input.squadId ?? 'squad-a',
+    status === 'enabled' ? 'member-a' : null, status === 'enabled' ? createdAt : null,
+    createdAt, createdAt,
+  )
+}
+
+function insertRoutineRun(
+  harness: SqliteD1Harness,
+  projectId: string,
+  input: {
+    id: string
+    routineId: string
+    status: 'queued' | 'leased' | 'observing' | 'waiting' | 'running' | 'succeeded' | 'failed' | 'skipped' | 'cancelled'
+    waitingReason?: 'agent' | 'approval' | 'answer' | 'review' | 'budget' | null
+    assignedAgentId?: string | null
+    resultSummary?: string | null
+    costMicroUsd?: number
+    occurredAt?: string
+  },
+): void {
+  const occurredAt = input.occurredAt ?? '2026-07-19T02:00:00.000Z'
+  harness.sqlite.prepare(`
+    INSERT INTO routine_runs (
+      id, tenant, project_id, routine_id, routine_revision, policy_json, occurrence_key,
+      trigger_kind, status, waiting_reason, assigned_agent_id, result_summary, cost_micro_usd,
+      scheduled_for, started_at, finished_at, created_at, updated_at
+    ) VALUES (?, 'pot-a', ?, ?, 1, '{}', ?, 'cron', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    input.id, projectId, input.routineId, `cron:${input.id}`, input.status,
+    input.waitingReason ?? null, input.assignedAgentId ?? null, input.resultSummary ?? null,
+    input.costMicroUsd ?? 0, occurredAt,
+    ['running', 'waiting', 'succeeded', 'failed', 'skipped', 'cancelled'].includes(input.status) ? occurredAt : null,
+    ['succeeded', 'failed', 'skipped', 'cancelled'].includes(input.status) ? occurredAt : null,
+    occurredAt, occurredAt,
+  )
+}
+
 describe('loadProjectSituation', () => {
   let harness: SqliteD1Harness | undefined
 
   afterEach(() => {
     harness?.close()
     harness = undefined
+  })
+
+  it('degrades to empty Routine slices when migration 0073 tables are absent', async () => {
+    harness = makeHarness({ includeRoutineMigrations: false })
+    const project = insertProject(harness, 'pre-0073')
+    insertTask(harness, project.id, {
+      id: 'open-work', status: 'open', title: 'Continue delivery',
+    })
+    insertTask(harness, project.id, {
+      id: 'review-work', status: 'review', title: 'Review release', gateOwner: 'lead',
+    })
+
+    const probe = statementProbe(envFor(harness).DB)
+    const situation = await loadProjectSituation(
+      { DB: probe.db, TENANT_SLUG: 'pot-a' } as Env,
+      project,
+      null,
+    )
+
+    expect(situation).toMatchObject({
+      health: 'review',
+      routines: {
+        enabled_count: 0,
+        paused_count: 0,
+        next: null,
+        active_run: null,
+        latest_terminal_run: null,
+        truncated: false,
+      },
+      needs_you: {
+        count: 1,
+        highest_priority: { kind: 'approval', source_id: 'review-work' },
+      },
+    })
+    expect(probe.statements.some((entry) => /\bFROM\s+routines\b/i.test(entry.sql))).toBe(false)
+    expect(probe.statements.some((entry) => /\bFROM\s+routine_runs\b/i.test(entry.sql))).toBe(false)
   })
 
   it('derives blocker health while reviewing a pending item first', async () => {
@@ -146,7 +277,7 @@ describe('loadProjectSituation', () => {
       blocker_details_truncated: false,
       pending_review_details_truncated: false,
       snapshot_truncated: false,
-      next_action: { type: 'review_task', task: { id: 'review' } },
+      next_action: { type: 'address_needs_you', item: { source_type: 'task', source_id: 'review', urgency: 'urgent' } },
     })
     expect(JSON.stringify(situation)).not.toContain('hidden-value')
   })
@@ -179,6 +310,180 @@ describe('loadProjectSituation', () => {
       next_action: { type: 'continue_task', task: { id: 'working' } },
     })
     expect(situation.latest_activity).not.toBeNull()
+  })
+
+  it('can exclude a Routine own control Task and Flight from its business Situation', async () => {
+    harness = makeHarness()
+    const project = insertProject(harness, 'routine-snapshot')
+    insertTask(harness, project.id, { id: 'business-task', status: 'open', updatedAt: '2026-07-19T01:00:00Z' })
+    insertTask(harness, project.id, { id: 'control-task', status: 'in_progress', updatedAt: '2026-07-19T03:00:00Z' })
+    insertFlight(harness, project.id, { id: 'control-flight', squadIds: ['squad-a'], taskIds: ['control-task'] })
+
+    const situation = await loadProjectSituation(envFor(harness), project, null, {
+      excludeTaskIds: ['control-task'],
+      excludeFlightIds: ['control-flight'],
+    })
+
+    expect(situation).toMatchObject({
+      task_counts: { open: 1, in_progress: 0 },
+      active_work_count: 1,
+      active_flight_count: 0,
+      latest_activity: { source_type: 'task', source_id: 'business-task' },
+      next_action: { type: 'start_task', task: { id: 'business-task' } },
+    })
+  })
+
+  it('summarizes readable Routine state and principal-neutral Needs You without exposing raw run state', async () => {
+    harness = makeHarness()
+    const project = insertProject(harness, 'routine-summary')
+    insertRoutine(harness, project.id, { id: 'enabled', nextRunAt: '2026-07-20T13:00:00.000Z', name: 'Daily triage' })
+    insertRoutine(harness, project.id, { id: 'paused', status: 'paused', name: 'Paused cleanup' })
+    insertRoutineRun(harness, project.id, {
+      id: 'waiting-budget', routineId: 'enabled', status: 'waiting', waitingReason: 'budget', assignedAgentId: 'agent-a',
+    })
+    insertRoutineRun(harness, project.id, {
+      id: 'succeeded', routineId: 'enabled', status: 'succeeded', resultSummary: 'token=private-value; completed', costMicroUsd: 12345,
+      occurredAt: '2026-07-19T04:00:00.000Z',
+    })
+
+    const situation = await loadProjectSituation(envFor(harness), project, null)
+
+    expect(situation).toMatchObject({
+      routines: {
+        enabled_count: 1,
+        paused_count: 1,
+        next: { id: 'enabled', name: 'Daily triage', next_run_at: '2026-07-20T13:00:00.000Z', timezone: 'America/Toronto' },
+        active_run: { id: 'waiting-budget', status: 'waiting', waiting_reason: 'budget', responsible_squad_id: 'squad-a' },
+        latest_terminal_run: { id: 'succeeded', status: 'succeeded', cost_micro_usd: 12345, result_summary: expect.stringContaining('[redacted]') },
+        truncated: false,
+      },
+      needs_you: {
+        count: 1,
+        highest_priority: { source_type: 'routine_run', source_id: 'waiting-budget', urgency: 'urgent' },
+        truncated: false,
+      },
+      next_action: { type: 'address_needs_you', item: { source_id: 'waiting-budget' } },
+    })
+    expect(JSON.stringify(situation)).not.toContain('private-value')
+  })
+
+  it('uses Routine action priority after urgent attention and before Project work, then falls through to the next enabled occurrence', async () => {
+    harness = makeHarness()
+    const project = insertProject(harness, 'routine-priority')
+    insertRoutine(harness, project.id, { id: 'routine', nextRunAt: '2026-07-20T13:00:00.000Z' })
+    insertRoutineRun(harness, project.id, { id: 'waiting-agent', routineId: 'routine', status: 'waiting', waitingReason: 'agent' })
+    insertTask(harness, project.id, { id: 'review', status: 'review' })
+    insertTask(harness, project.id, { id: 'working', status: 'in_progress' })
+    expect((await loadProjectSituation(envFor(harness), project, null)).next_action).toMatchObject({ type: 'resolve_routine_wait' })
+
+    harness.sqlite.prepare("UPDATE routine_runs SET status = 'succeeded', waiting_reason = NULL WHERE id = 'waiting-agent'").run()
+    expect((await loadProjectSituation(envFor(harness), project, null)).next_action).toMatchObject({ type: 'review_task', task: { id: 'review' } })
+
+    harness.sqlite.prepare("UPDATE tasks SET status = 'done' WHERE id = 'review'").run()
+    expect((await loadProjectSituation(envFor(harness), project, null)).next_action).toMatchObject({ type: 'continue_task', task: { id: 'working' } })
+
+    harness.sqlite.prepare("UPDATE tasks SET status = 'done' WHERE id = 'working'").run()
+    expect((await loadProjectSituation(envFor(harness), project, null)).next_action).toMatchObject({ type: 'run_routine', routine: { id: 'routine' } })
+
+    insertRoutineRun(harness, project.id, { id: 'urgent-budget', routineId: 'routine', status: 'waiting', waitingReason: 'budget' })
+    expect((await loadProjectSituation(envFor(harness), project, null)).next_action).toMatchObject({ type: 'address_needs_you', item: { source_id: 'urgent-budget' } })
+  })
+
+  it('keeps Routine and Needs You summaries tenant, Project, and squad scoped', async () => {
+    harness = makeHarness()
+    const project = insertProject(harness, 'routine-isolation')
+    const otherProject = insertProject(harness, 'routine-other-project')
+    insertRoutine(harness, project.id, { id: 'visible-routine', squadId: 'squad-a', nextRunAt: '2026-07-20T13:00:00.000Z' })
+    insertRoutine(harness, project.id, { id: 'hidden-routine', squadId: 'squad-b', nextRunAt: '2026-07-20T12:00:00.000Z', name: 'Private routine' })
+    insertRoutine(harness, otherProject.id, { id: 'other-project-routine', nextRunAt: '2026-07-20T11:00:00.000Z' })
+    insertRoutine(harness, project.id, { id: 'other-tenant-routine', tenant: 'pot-b', nextRunAt: '2026-07-20T10:00:00.000Z' })
+    insertRoutineRun(harness, project.id, { id: 'visible-wait', routineId: 'visible-routine', status: 'waiting', waitingReason: 'agent' })
+    insertRoutineRun(harness, project.id, { id: 'hidden-wait', routineId: 'hidden-routine', status: 'waiting', waitingReason: 'budget' })
+
+    const scoped = await loadProjectSituation(envFor(harness), project, ['squad-a'])
+    expect(scoped.routines).toMatchObject({ enabled_count: 1, next: { id: 'visible-routine' }, active_run: { id: 'visible-wait' } })
+    expect(scoped.needs_you).toMatchObject({ count: 1, highest_priority: { source_id: 'visible-wait' } })
+    expect(JSON.stringify(scoped)).not.toContain('Private routine')
+  })
+
+  it('uses matching keyset indexes for Routine Situation ordering without source sorts', async () => {
+    harness = makeHarness()
+    const project = insertProject(harness, 'routine-situation-plans')
+    insertRoutine(harness, project.id, { id: 'routine', nextRunAt: '2026-07-20T12:00:00.000Z' })
+    insertRoutineRun(harness, project.id, {
+      id: 'waiting', routineId: 'routine', status: 'waiting', waitingReason: 'budget',
+    })
+    insertRoutineRun(harness, project.id, {
+      id: 'terminal', routineId: 'routine', status: 'succeeded', occurredAt: '2026-07-19T03:00:00.000Z',
+    })
+    const probe = statementProbe(harness.db)
+
+    await loadProjectSituation({ DB: probe.db, TENANT_SLUG: 'pot-a' } as Env, project, null)
+
+    const planFor = (fragment: string) => {
+      const statement = probe.statements.find(candidate => candidate.sql.includes(fragment))
+      expect(statement).toBeDefined()
+      const plan = harness!.sqlite.prepare(`EXPLAIN QUERY PLAN ${statement!.sql}`).all(...statement!.values)
+      return plan.map(row => String(row.detail ?? '')).join('\n')
+    }
+    for (const [fragment, index] of [
+      ['idx_routines_project_next_occurrence', 'idx_routines_project_next_occurrence'],
+      ['idx_routine_runs_project_active_keyset', 'idx_routine_runs_project_active_keyset'],
+      ['idx_routine_runs_project_outcome_keyset', 'idx_routine_runs_project_outcome_keyset'],
+      ['idx_routine_runs_project_needs_you_keyset', 'idx_routine_runs_project_needs_you_keyset'],
+    ]) {
+      const details = planFor(fragment)
+      expect(details).toContain(`USING INDEX ${index}`)
+      if (index === 'idx_routine_runs_project_needs_you_keyset') {
+        const sourcePlan = details.slice(details.indexOf('CO-ROUTINE routine_waits'), details.indexOf('SCAN routine_waits'))
+        expect(sourcePlan).not.toContain('USE TEMP B-TREE')
+      } else {
+        expect(details).not.toContain('USE TEMP B-TREE FOR ORDER BY')
+      }
+    }
+  })
+
+  it('keeps the earliest urgent Routine deadline when its source exceeds the Situation cap', async () => {
+    harness = makeHarness()
+    const project = insertProject(harness, 'needs-you-source-cap')
+    insertRoutine(harness, project.id, { id: 'routine', nextRunAt: '2026-07-20T00:00:00.000Z' })
+    for (let index = 0; index < 101; index += 1) {
+      insertRoutineRun(harness, project.id, {
+        id: `recent-budget-${index.toString().padStart(3, '0')}`,
+        routineId: 'routine', status: 'waiting', waitingReason: 'budget',
+        occurredAt: '2026-07-21T00:00:00.000Z',
+      })
+    }
+    insertRoutineRun(harness, project.id, {
+      id: 'earliest-budget', routineId: 'routine', status: 'waiting', waitingReason: 'budget',
+      occurredAt: '2026-07-20T00:00:00.000Z',
+    })
+
+    const situation = await loadProjectSituation(envFor(harness), project, null)
+
+    expect(situation.needs_you.highest_priority).toMatchObject({
+      source_id: 'earliest-budget', deadline_at: '2026-07-20T00:00:00.000Z', urgency: 'urgent',
+    })
+    expect(situation.next_action).toMatchObject({ type: 'address_needs_you', item: { source_id: 'earliest-budget' } })
+  })
+
+  it('retains the next scheduled Routine when enabled manual Routines exceed the Situation cap', async () => {
+    harness = makeHarness()
+    const project = insertProject(harness, 'routine-next-cap')
+    for (let index = 0; index < 101; index += 1) {
+      insertRoutine(harness, project.id, { id: `manual-${index.toString().padStart(3, '0')}`, nextRunAt: null })
+    }
+    insertRoutine(harness, project.id, {
+      id: 'scheduled', name: 'Scheduled routine', nextRunAt: '2026-07-20T12:00:00.000Z',
+    })
+
+    const situation = await loadProjectSituation(envFor(harness), project, null)
+
+    expect(situation.routines).toMatchObject({
+      enabled_count: 100,
+      enabled_count_truncated: true,
+      next: { id: 'scheduled', next_run_at: '2026-07-20T12:00:00.000Z' },
+    })
   })
 
   it('falls through from open work to flight monitoring', async () => {
@@ -254,7 +559,7 @@ describe('loadProjectSituation', () => {
     harness.sqlite.prepare("UPDATE projects SET status = 'paused' WHERE id = ?").run(pausedProject.id)
     const paused = { ...pausedProject, status: 'paused' as const }
     expect(await loadProjectSituation(envFor(harness), paused, null)).toMatchObject({
-      health: 'paused', next_action: { type: 'continue_task', task: { id: 'paused-working' } },
+      health: 'paused', next_action: { type: 'resume_project' },
     })
     harness.sqlite.prepare('DELETE FROM tasks WHERE project_id = ?').run(paused.id)
     expect(await loadProjectSituation(envFor(harness), paused, null)).toMatchObject({
@@ -266,7 +571,7 @@ describe('loadProjectSituation', () => {
     ['paused', 'paused', 'resume_project'],
     ['completed', 'completed', 'verify_completion'],
     ['archived', 'archived', 'reopen_project'],
-  ] as const)('prioritizes %s lifecycle health', async (status, health, action) => {
+  ] as const)('prioritizes %s lifecycle health as absorbing', async (status, health, action) => {
     harness = makeHarness()
     const activeProject = insertProject(harness, `lifecycle-${status}`)
     const project = { ...activeProject, status }
@@ -276,7 +581,7 @@ describe('loadProjectSituation', () => {
     const situation = await loadProjectSituation(envFor(harness), project, null)
 
     expect(situation.health).toBe(health)
-    expect(situation.next_action?.type).toBe('unblock_task')
+    expect(situation.next_action?.type).toBe(action)
 
     harness.sqlite.prepare('DELETE FROM tasks WHERE project_id = ?').run(project.id)
     expect((await loadProjectSituation(envFor(harness), project, null)).next_action?.type).toBe(action)
@@ -428,5 +733,76 @@ describe('loadProjectSituation', () => {
     })
     expect(situation.blockers).toHaveLength(20)
     expect(situation.pending_reviews).toHaveLength(20)
+  })
+
+  it('caps Routine and Needs You summaries with explicit active and terminal truncation truth', async () => {
+    harness = makeHarness()
+    const project = insertProject(harness, 'routine-capped')
+    harness.sqlite.exec(`
+      WITH RECURSIVE seq(n) AS (
+        VALUES(0) UNION ALL SELECT n + 1 FROM seq WHERE n < 100
+      )
+      INSERT INTO routines (
+        id, tenant, project_id, name, objective, status, trigger_kind, timezone,
+        overlap_policy, execution_mode, responsible_squad_id, budget_micro_usd,
+        max_attempts, retry_backoff_seconds, revision, enabled_by, enabled_at, created_by, created_at, updated_at
+      )
+      SELECT 'enabled-' || printf('%03d', n), 'pot-a', '${project.id}', 'Enabled ' || n, 'Advance', 'enabled', 'manual', 'UTC',
+             'skip', 'propose', 'squad-a', 1000, 3, 300, 1, 'member-a', '2026-07-19T01:00:00Z', 'member-a', '2026-07-19T01:00:00Z', '2026-07-19T01:00:00Z'
+        FROM seq;
+      WITH RECURSIVE seq(n) AS (
+        VALUES(0) UNION ALL SELECT n + 1 FROM seq WHERE n < 100
+      )
+      INSERT INTO routines (
+        id, tenant, project_id, name, objective, status, trigger_kind, timezone,
+        overlap_policy, execution_mode, responsible_squad_id, budget_micro_usd,
+        max_attempts, retry_backoff_seconds, revision, created_by, created_at, updated_at
+      )
+      SELECT 'paused-' || printf('%03d', n), 'pot-a', '${project.id}', 'Paused ' || n, 'Advance', 'paused', 'manual', 'UTC',
+             'skip', 'propose', 'squad-a', 1000, 3, 300, 1, 'member-a', '2026-07-19T01:00:00Z', '2026-07-19T01:00:00Z'
+        FROM seq;
+      WITH RECURSIVE seq(n) AS (
+        VALUES(0) UNION ALL SELECT n + 1 FROM seq WHERE n < 100
+      )
+      INSERT INTO routine_runs (
+        id, tenant, project_id, routine_id, routine_revision, policy_json, occurrence_key,
+        trigger_kind, status, waiting_reason, created_at, updated_at
+      )
+      SELECT 'active-' || printf('%03d', n), 'pot-a', '${project.id}', 'enabled-000', 1, '{}', 'active:' || n,
+             'manual', 'waiting', 'agent', '2026-07-19T02:00:00Z', '2026-07-19T02:00:00Z'
+        FROM seq;
+      WITH RECURSIVE seq(n) AS (
+        VALUES(0) UNION ALL SELECT n + 1 FROM seq WHERE n < 100
+      )
+      INSERT INTO routine_runs (
+        id, tenant, project_id, routine_id, routine_revision, policy_json, occurrence_key,
+        trigger_kind, status, result_summary, cost_micro_usd, finished_at, created_at, updated_at
+      )
+      SELECT 'terminal-' || printf('%03d', n), 'pot-a', '${project.id}', 'enabled-000', 1, '{}', 'terminal:' || n,
+             'manual', 'succeeded', 'completed', n, '2026-07-19T03:00:00Z', '2026-07-19T03:00:00Z', '2026-07-19T03:00:00Z'
+        FROM seq;
+      WITH RECURSIVE seq(n) AS (
+        VALUES(0) UNION ALL SELECT n + 1 FROM seq WHERE n < 100
+      )
+      INSERT INTO tasks (id, squad_id, title, status, gate_owner, project_id, created_at, updated_at)
+      SELECT 'attention-' || printf('%03d', n), 'squad-a', 'Approval ' || n, 'review', 'gate:delivery', '${project.id}',
+             '2026-07-19T04:00:00Z', '2026-07-19T04:00:00Z'
+        FROM seq;
+    `)
+
+    const situation = await loadProjectSituation(envFor(harness), project, null)
+
+    expect(situation).toMatchObject({
+      routines: {
+        enabled_count: 100,
+        paused_count: 100,
+        enabled_count_truncated: true,
+        paused_count_truncated: true,
+        active_run_truncated: true,
+        latest_terminal_run_truncated: true,
+        truncated: true,
+      },
+      needs_you: { count: 100, truncated: true },
+    })
   })
 })
