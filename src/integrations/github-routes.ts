@@ -309,7 +309,16 @@ githubInboundApp.post('/', async (c) => {
           done_when: `GitHub issue #${num} closed`,
           status: 'open',
         },
-        { skipMirror: true },
+        {
+          skipMirror: true,
+          // PR #659 P0 fix, widened (kasra-core parallel-audit finding): an opened GitHub
+          // issue's title/body is authored by anyone with issue-open rights on the repo —
+          // the same untrusted-writer class as Linear/GitHub-Projects. Unassigned already
+          // (no assignee_agent_id above), so the new invariant is belt-and-suspenders here,
+          // but the marker itself is what closes the unassigned-auto-pickup hole (#404/#659):
+          // without it this task was indistinguishable from a trusted local one.
+          externalSource: 'github-webhook:issues',
+        },
       )
       return c.json({ ok: true, routed: squadId })
     }
@@ -375,7 +384,14 @@ githubInboundApp.post('/', async (c) => {
   // skipMirror: a GitHub-origin task must NOT be mirrored back out to a GitHub issue —
   // that reflects untrusted PR fields under our token + risks a feedback loop (P1).
   // #142: GitHub event mapped to task — predicate is the triggering event resolved.
-  await createTask(c.env, { squad_id: squadId, title: mapped.title, body: mapped.body, done_when: `GitHub event ${eventType} resolved`, status: 'open' }, { skipMirror: true })
+  // PR #659 P0 fix, widened: externalSource marks this (already-unassigned) task as
+  // untrusted-external-origin — see the issues.opened call site above for the full
+  // rationale (same untrusted-writer class, same #404/#659 unassigned-auto-pickup hole).
+  await createTask(
+    c.env,
+    { squad_id: squadId, title: mapped.title, body: mapped.body, done_when: `GitHub event ${eventType} resolved`, status: 'open' },
+    { skipMirror: true, externalSource: `github-webhook:${eventType}` },
+  )
 
   return c.json({ ok: true })
 })

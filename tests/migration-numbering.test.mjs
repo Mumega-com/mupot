@@ -1,0 +1,304 @@
+// tests/migration-numbering.test.mjs — self-tests for the migration-numbering guard (#729).
+//
+// The guard this file tests exists because a check that was correct when written decayed
+// silently. So this suite is written to catch the same thing happening one level up: every
+// case below was reproduced as a MUTATION against scripts/check-migration-numbering.mjs
+// before it shipped, and each one is here because deleting the corresponding line in the
+// script turns it red. A self-test that stays green when you break the thing it names is
+// worse than absent — it certifies the hole (#721, MUT-B).
+//
+// Two halves:
+//   - `evaluate` is pure, so the rules are driven directly with no git at all.
+//   - the git-reading half runs the real script against throwaway repos in tmp, because the
+//     fail-loud-on-unreadable-target behaviour cannot be proven any other way, and that is
+//     the branch where a mistake means the guard quietly stops guarding.
+//
+// Hermetic: nothing here touches this repo's migrations/ or origin.
+//
+// Run: node --test tests/migration-numbering.test.mjs
+
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, cpSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { tmpdir } from 'node:os'
+import { join, dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { evaluate, migrationNumber } from '../scripts/check-migration-numbering.mjs'
+
+const HERE = dirname(fileURLToPath(import.meta.url))
+const SCRIPT = join(HERE, '..', 'scripts', 'check-migration-numbering.mjs')
+
+// ── filename parsing ───────────────────────────────────────────────────────────────────
+
+test('a well-formed migration name parses to its number', () => {
+  assert.equal(migrationNumber('0079_task_priority_and_parent.sql'), 79)
+  assert.equal(migrationNumber('0001_init.sql'), 1)
+})
+
+test('names that are not exactly four digits do not parse', () => {
+  // The anchored regex matters: a loose /^(\d+)/ accepts all three of these and compares
+  // them as 7, 760 and 76 — an ordering guard confidently returning a wrong answer.
+  assert.equal(migrationNumber('007_short.sql'), null)
+  assert.equal(migrationNumber('00760_long.sql'), null)
+  assert.equal(migrationNumber('0076-dash.sql'), null)
+  assert.equal(migrationNumber('rollback.sql'), null)
+})
+
+// ── the rule ───────────────────────────────────────────────────────────────────────────
+
+const TARGET = ['0001_init.sql', '0078_x.sql', '0079_task_priority_and_parent.sql']
+
+test('an added migration above the target head passes', () => {
+  const v = evaluate(TARGET, [...TARGET, '0080_new.sql'])
+  assert.equal(v.ok, true)
+  assert.equal(v.reason, 'above_target_head')
+  assert.equal(v.detail.head, 79)
+})
+
+test('THE PRODUCTION CASE: an added migration at a free slot BELOW the head fails', () => {
+  // Slot 0076 is empty on main (it jumps 0075 -> 0077) and four open PRs each claim it.
+  // "The slot is free" is the intuition that makes this defect feel safe, and it is exactly
+  // wrong: free-but-below-head still never runs.
+  const v = evaluate(TARGET, [...TARGET, '0076_identity_cleanup.sql'])
+  assert.equal(v.ok, false)
+  assert.equal(v.reason, 'below_target_head')
+  assert.equal(v.detail.below[0].number, 76)
+})
+
+test('an added migration EQUAL to the head fails (boundary)', () => {
+  // <= not <. A file numbered exactly at the head does not run either, and an off-by-one
+  // here would let through the single most likely collision — the one written by someone
+  // who read the last filename and reused its number.
+  const v = evaluate(TARGET, [...TARGET, '0079_other_name.sql'])
+  assert.equal(v.ok, false)
+  assert.equal(v.reason, 'below_target_head')
+})
+
+test('a PR that adds no migrations passes', () => {
+  assert.equal(evaluate(TARGET, TARGET).reason, 'no_migrations_added')
+})
+
+test('PRE-EXISTING duplicates on the target are not this PR\'s problem', () => {
+  // main really does carry two 0068 files. Failing on inherited debt would make the guard
+  // unmergeable on the day it lands, and a guard nobody can merge protects nothing.
+  const withDupe = ['0068_a.sql', '0068_b.sql', '0079_x.sql']
+  assert.equal(evaluate(withDupe, [...withDupe, '0080_new.sql']).ok, true)
+})
+
+test('two added migrations sharing a number fail even when BOTH are above the head', () => {
+  // The head rule passes both, so this needs its own check. D1 breaks the tie alphabetically
+  // on the rest of the filename — an ordering nobody chose and nothing records.
+  const v = evaluate(TARGET, [...TARGET, '0080_a.sql', '0080_b.sql'])
+  assert.equal(v.ok, false)
+  assert.equal(v.reason, 'duplicate_number_within_pr')
+  assert.equal(v.detail.collisions[0].number, 80)
+})
+
+test('an added file with an unparseable name fails', () => {
+  const v = evaluate(TARGET, [...TARGET, 'rollback_0080.sql'])
+  assert.equal(v.ok, false)
+  assert.equal(v.reason, 'malformed_migration_name')
+})
+
+test('an unparseable name already ON THE TARGET is tolerated', () => {
+  // Ignored on purpose: refusing to compute a head because of one legacy filename would
+  // disengage the guard for every future PR — the failure mode is silence, not noise.
+  const messy = ['legacy.sql', '0079_x.sql']
+  assert.equal(evaluate(messy, [...messy, '0080_new.sql']).ok, true)
+})
+
+test('FAIL CLOSED: an unreadable merge target is a failure, never a pass', () => {
+  // The single most important assertion in this file. A shallow clone or a missing base ref
+  // means the guard cannot verify anything — and a green check would read as
+  // "ordering verified". The schema ratchet learned this the same way.
+  const v = evaluate(null, ['0001_init.sql'])
+  assert.equal(v.ok, false)
+  assert.equal(v.reason, 'target_unreadable')
+})
+
+test('a target with migrations but NONE parseable fails rather than inventing a head', () => {
+  // Math.max of an empty list is -Infinity, and every added file compares above it. That
+  // would pass everything while looking like a real comparison.
+  const v = evaluate(['legacy.sql'], ['legacy.sql', '0001_init.sql'])
+  assert.equal(v.ok, false)
+  assert.equal(v.reason, 'target_has_no_parseable_migrations')
+})
+
+test('a target with no migrations at all is bootstrap, and passes', () => {
+  assert.equal(evaluate([], ['0001_init.sql']).reason, 'bootstrap_no_target_migrations')
+})
+
+// ── the git-reading half ───────────────────────────────────────────────────────────────
+
+function scaffold({ targetMigrations, addedMigrations }) {
+  const dir = mkdtempSync(join(tmpdir(), 'migration-numbering-'))
+  mkdirSync(join(dir, 'scripts'), { recursive: true })
+  mkdirSync(join(dir, 'migrations'), { recursive: true })
+  cpSync(SCRIPT, join(dir, 'scripts', 'check-migration-numbering.mjs'))
+
+  const git = (...args) => execFileSync('git', args, { cwd: dir, stdio: 'ignore' })
+  git('init', '-q', '-b', 'main')
+  git('config', 'user.email', 't@t.test')
+  git('config', 'user.name', 't')
+
+  for (const name of targetMigrations) {
+    writeFileSync(join(dir, 'migrations', name), '-- x\n')
+  }
+  git('add', '-A')
+  git('commit', '-qm', 'target')
+
+  // The script resolves `origin/main`, so give the throwaway repo an origin that points at
+  // itself. This is what makes the test exercise the REAL ref-resolution path rather than a
+  // stubbed one — the path where a typo means the guard silently stops comparing.
+  git('remote', 'add', 'origin', dir)
+  git('fetch', '-q', 'origin')
+
+  for (const name of addedMigrations) {
+    writeFileSync(join(dir, 'migrations', name), '-- new\n')
+  }
+  return dir
+}
+
+function run(dir, env = {}) {
+  try {
+    const stdout = execFileSync('node', [join(dir, 'scripts', 'check-migration-numbering.mjs')], {
+      cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, ...env },
+    })
+    return { code: 0, out: stdout }
+  } catch (err) {
+    return { code: err.status ?? 1, out: `${err.stdout ?? ''}${err.stderr ?? ''}` }
+  }
+}
+
+test('end to end: a migration above the head exits 0', (t) => {
+  const dir = scaffold({ targetMigrations: ['0001_init.sql', '0079_x.sql'], addedMigrations: ['0080_new.sql'] })
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const { code, out } = run(dir)
+  assert.equal(code, 0, out)
+  assert.match(out, /0080_new\.sql/)
+})
+
+test('end to end: a migration below the head exits 1 and names the fix', (t) => {
+  const dir = scaffold({ targetMigrations: ['0001_init.sql', '0079_x.sql'], addedMigrations: ['0076_dupe.sql'] })
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const { code, out } = run(dir)
+  assert.equal(code, 1)
+  assert.match(out, /0076_dupe\.sql/)
+  // The message must carry the next free number. A failure that makes the author go read the
+  // directory to find out what to do costs more than the check saves.
+  assert.match(out, /0080/)
+})
+
+test('end to end: NO origin ref at all exits 1 — the guard fails loud, not open', (t) => {
+  // Reproduces the shallow-clone / missing-fetch-depth case in CI. If this ever exits 0, the
+  // check is decorative and every PR after it merges unverified with a green tick.
+  const dir = mkdtempSync(join(tmpdir(), 'migration-numbering-bare-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  mkdirSync(join(dir, 'scripts'), { recursive: true })
+  mkdirSync(join(dir, 'migrations'), { recursive: true })
+  cpSync(SCRIPT, join(dir, 'scripts', 'check-migration-numbering.mjs'))
+  writeFileSync(join(dir, 'migrations', '0080_new.sql'), '-- new\n')
+  execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: dir, stdio: 'ignore' })
+
+  const { code, out } = run(dir)
+  assert.equal(code, 1)
+  assert.match(out, /fetch-depth/)
+})
+
+test('end to end: a ref that genuinely has no migrations/ is bootstrap, and passes', (t) => {
+  // The counterpart to the test below. `git ls-tree -r --name-only <ref> migrations/` against
+  // a ref with no such path exits 0 with empty stdout — it does NOT throw. That is what makes
+  // real bootstrap distinguishable from a git failure, and it is the fact the first version
+  // of this guard got backwards.
+  const dir = scaffold({ targetMigrations: [], addedMigrations: ['0001_init.sql'] })
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const { code, out } = run(dir)
+  assert.equal(code, 0, out)
+  assert.match(out, /bootstrap/)
+})
+
+test('FAIL CLOSED at the GIT layer: ls-tree failing is a failure, not a bootstrap', (t) => {
+  // P0 found by Athena's diverse gate on this PR (pin 51aa9b1) — the guard against silent
+  // disengagement had one. rev-parse succeeded, ls-tree threw, the catch returned [], and
+  // `evaluate` read that as "target has no migrations yet" and PASSED a below-head migration.
+  //
+  // The pure/impure split is exactly what hid it: `evaluate([], …)` is legitimately a
+  // bootstrap pass and its unit test says so, so the only way to catch the mislabelling is
+  // to drive the real git layer with git actually broken. A PATH wrapper that fails only
+  // ls-tree is the smallest way to stage that.
+  const dir = scaffold({ targetMigrations: ['0079_x.sql'], addedMigrations: ['0076_below.sql'] })
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  assert.equal(run(dir).code, 1, 'sanity: below-head must fail with git working')
+
+  const bin = join(dir, 'fakebin')
+  mkdirSync(bin, { recursive: true })
+  writeFileSync(
+    join(bin, 'git'),
+    '#!/bin/bash\nif [ "$1" = "ls-tree" ]; then echo "fatal: simulated" >&2; exit 128; fi\nexec /usr/bin/git "$@"\n',
+    { mode: 0o755 },
+  )
+  const { code, out } = run(dir, { PATH: `${bin}:${process.env.PATH}` })
+  assert.equal(code, 1, 'a git failure must NOT read as bootstrap')
+  assert.doesNotMatch(out, /bootstrap/)
+})
+
+test('end to end: BASE_REF selects a different merge target', (t) => {
+  // PRs are not always against main. If BASE_REF were ignored, the guard would compare
+  // against the wrong branch and its verdict would be unrelated to what actually merges.
+  // No added file yet — it is written only after the release branch exists, or `git add -A`
+  // on that branch would commit it there too and it would stop being "added" at all.
+  const dir = scaffold({ targetMigrations: ['0001_init.sql', '0079_x.sql'], addedMigrations: [] })
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const git = (...args) => execFileSync('git', args, { cwd: dir, stdio: 'ignore' })
+  // A release branch that already carries 0080, so the same added file is now a collision.
+  git('checkout', '-qb', 'release')
+  writeFileSync(join(dir, 'migrations', '0080_taken.sql'), '-- taken\n')
+  git('add', '-A')
+  git('commit', '-qm', 'release carries 0080')
+  git('checkout', '-q', 'main')
+  git('fetch', '-q', 'origin')
+  writeFileSync(join(dir, 'migrations', '0080_new.sql'), '-- new\n')
+
+  assert.equal(run(dir).code, 0, 'against main, 0080 is free')
+  const { code, out } = run(dir, { BASE_REF: 'release' })
+  assert.equal(code, 1, 'against release, 0080 is taken')
+  assert.match(out, /0080/)
+})
+
+// ── repo invariant introduced by this change ───────────────────────────────────────────
+
+test('every tests/*.test.mjs is wired to a node --test step in CI', () => {
+  // This change excluded `**/*.test.mjs` from vitest as a class instead of naming each file,
+  // because the per-file list had to be appended to every time and the third append is the
+  // signal that the rule, not the list, was the thing to write down.
+  //
+  // That trade opens a hole: a new .test.mjs nobody wires to its own CI step now runs
+  // NOWHERE — excluded from vitest, invoked by nothing — and a suite that runs nowhere is
+  // indistinguishable from a suite that passes. This assertion is the close. It lives in
+  // this file because this file is a node:test suite CI already runs, and because this
+  // change is what opened the hole.
+  const ci = execFileSync('git', ['show', 'HEAD:.github/workflows/ci.yml'], {
+    cwd: join(HERE, '..'), encoding: 'utf8',
+  })
+  const files = execFileSync('git', ['ls-files', 'tests/*.test.mjs'], {
+    cwd: join(HERE, '..'), encoding: 'utf8',
+  }).split('\n').filter(Boolean)
+
+  assert.ok(files.length > 0, 'expected to find node:test files under tests/')
+  const unwired = files.filter((f) => !ci.includes(f))
+  assert.deepEqual(unwired, [], `these node:test suites run nowhere: ${unwired.join(', ')}`)
+})
+
+test('end to end: a malformed BASE_REF is refused, not resolved', (t) => {
+  // BASE_REF comes from github.base_ref, which the PR author influences. It never reaches a
+  // shell (every git call passes an argument array), but an unexpected value should be a
+  // loud refusal rather than a ref that quietly resolves to something nobody intended.
+  const dir = scaffold({ targetMigrations: ['0079_x.sql'], addedMigrations: ['0080_new.sql'] })
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  for (const bad of ['main;rm -rf /', '../../etc/passwd', 'a b']) {
+    const { code, out } = run(dir, { BASE_REF: bad })
+    assert.equal(code, 1, `${bad} must be refused`)
+    assert.match(out, /not a plausible branch name/)
+  }
+})

@@ -1,0 +1,39 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: viamar-geo-scanner
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: mupot-geo-scanner
+      app.kubernetes.io/instance: viamar
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: []
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - ipBlock:
+            cidr: 169.254.169.254/32
+      ports:
+        - protocol: TCP
+          port: 80
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              mumega.com/trusted-egress: "true"
+          podSelector:
+            matchLabels:
+              mumega.com/trusted-egress: "true"
+      ports:
+        - protocol: TCP
+          port: 443

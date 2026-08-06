@@ -203,6 +203,35 @@ describe('runProjectConcierge — stalled project dispatches exactly one starter
     expect(row.assignee_agent_id).toBeNull() // untrusted cross-pot task NOT auto-assigned
   })
 
+  // PR #659 P0 fix (diverse-model adversarial gate BLOCK): routeUnassignedWork's WHERE
+  // clause (project_id, status='open', assignee_agent_id IS NULL, source_pot IS NULL) was
+  // a character-for-character description of a Linear-imported task before
+  // migrations/0077 added external_source — the concierge's maintenance-cron tick is a
+  // status-POLLING read that never looked at the task.created event skipEvent suppressed,
+  // so a Linear-origin task got auto-assigned (and routed to a specific agent CLASS via
+  // classifyTaskRoleEffort reading its attacker-controlled title/body) on the very next
+  // tick with zero human step. This test must fail on da8be05 for the RIGHT reason (the
+  // task IS routed), not because external_source is an unknown column.
+  it('does NOT route a Linear-origin (external_source) task — PR #659 P0 fix', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    const p = project()
+    insertProject(harness, p)
+    grantSquadAccess(harness, p.id, 'squad-a', 'write')
+    harness.sqlite.exec(
+      `INSERT INTO tasks (id, squad_id, project_id, title, done_when, status, assignee_agent_id, external_source)
+       VALUES ('task-linear', 'squad-a', '${p.id}', 'Imported from Linear', 'done', 'open', NULL, 'linear:ENG')`,
+    )
+    await registerBuilderShared(env)
+
+    const result = await runProjectConcierge(env, p)
+    expect(result.decision).toEqual({ action: 'noop', reason: 'has_advancing_work' })
+    const row = harness.sqlite
+      .prepare('SELECT assignee_agent_id FROM tasks WHERE id = ?')
+      .get('task-linear') as { assignee_agent_id: string | null }
+    expect(row.assignee_agent_id).toBeNull() // untrusted Linear-origin task NOT auto-assigned
+  })
+
   it('does NOT reassign an already-assigned task; busy project with no sitting work -> noop', async () => {
     const harness = makeHarness()
     const env = envFor(harness)
