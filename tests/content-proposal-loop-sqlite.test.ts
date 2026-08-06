@@ -54,6 +54,11 @@ function createSchema(sqlite: SqliteD1Harness['sqlite']): void {
       body               TEXT NOT NULL DEFAULT '',
       status             TEXT NOT NULL DEFAULT 'open'
                            CHECK (status IN ('open','in_progress','blocked','done','review','approved','rejected')),
+      -- priority + parent_task_id (migrations/0079) added by hand: this fixture
+      -- hand-writes tasks instead of applying the committed chain, so it breaks
+      -- whenever a column joins the shared projection. Third time in one day (#703).
+      priority           TEXT,
+      parent_task_id     TEXT,
       assignee_agent_id  TEXT,
       github_issue_url   TEXT,
       created_at         TEXT NOT NULL DEFAULT (datetime('now')),
