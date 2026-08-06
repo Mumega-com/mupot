@@ -118,13 +118,17 @@ function makeDb(
       return claimed.map((m) => ({ ...m }))
     }
     if (sql.includes('FROM agent_messages') && sql.includes('read_at IS NULL') && sql.includes('ORDER BY seq ASC')) {
-      const [tenant, to_agent, limit] = b as [string, string, number]
+      const [tenant, to_agent, sinceSeqOrLimit, maybeLimit] = b as [string, string, number, number?]
       const effectiveMode = signedOnlyAgents.has(to_agent) ? 'signed_only' : 'bearer_only'
       const signed = sql.includes("mode = 'signed_only'")
       if (signed) {
-        if (effectiveMode !== 'signed_only' || b[3] !== keyFingerprint(tenant, to_agent)) return []
+        if (effectiveMode !== 'signed_only' || b[4] !== keyFingerprint(tenant, to_agent)) return []
       } else if (effectiveMode !== 'bearer_only') return []
-      return messages.filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null).sort((x, y) => x.seq - y.seq).slice(0, limit).map((m) => ({ ...m }))
+      // 5 binds = signed with cursor; 4 binds = bearer with cursor; 3 binds = plain peek (no cursor).
+      const hasCursor = signed ? b.length === 5 : b.length === 4
+      const sinceSeq = hasCursor ? (sinceSeqOrLimit ?? 0) : 0
+      const limit = hasCursor ? (maybeLimit as number) : sinceSeqOrLimit
+      return messages.filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null && m.seq > sinceSeq).sort((x, y) => x.seq - y.seq).slice(0, limit).map((m) => ({ ...m }))
     }
     if (sql.includes('FROM agents WHERE slug = ?1')) {
       const [ref] = b as [string]

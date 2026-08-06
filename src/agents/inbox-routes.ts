@@ -64,7 +64,7 @@ interface StreamOpts {
  *  Pure + injectable: the Hono route owns auth and the SSE wire format only. */
 export async function* streamInboxEvents(
   env: Env,
-  input: { agent: string; since?: number; pollMs?: number },
+  input: { agent: string; since?: number; pollMs?: number; revalidate?: () => Promise<boolean> },
   opts: StreamOpts = {},
 ): AsyncGenerator<InboxStreamEvent> {
   const tenant = env.TENANT_SLUG
@@ -79,7 +79,7 @@ export async function* streamInboxEvents(
   const isNew = (m: StreamMessage) => m.seq > lastSeq
 
   // Initial flush: anything unread above the client's cursor, oldest-first.
-  const initial = await readAgentInbox(env, { agent, peek: true, limit: 100 })
+  const initial = await readAgentInbox(env, { agent, peek: true, limit: 100, sinceSeq: lastSeq })
   if (initial.ok) {
     const fresh = initial.messages.filter(isNew)
     if (fresh.length > 0) {
@@ -88,18 +88,24 @@ export async function* streamInboxEvents(
     }
   }
 
-  // Poll loop: re-read unread, emit only rows newer than the last emitted seq.
+  // Poll loop: re-read unread above the cursor, emit only rows newer than the last emitted seq.
   for (;;) {
     if (aborted()) return
+    // P0-2: the bearer credential is re-validated every poll. A revoked token or
+    // deactivated agent ends the stream rather than leaking the full inbox.
+    if (input.revalidate !== undefined) {
+      const stillValid = await input.revalidate()
+      if (!stillValid) return
+    }
     await sleep(pollMs)
     if (aborted()) return
-    const res = await readAgentInbox(env, { agent, peek: true, limit: 100 })
+    const res = await readAgentInbox(env, { agent, peek: true, limit: 100, sinceSeq: lastSeq })
     if (!res.ok) {
       // Transient DB failure — keep the stream alive; the client re-reads on reconnect.
       yield { type: 'heartbeat' }
       continue
     }
-    const fresh = res.messages.filter(isNew)
+    const fresh = res.messages.filter((m) => m.seq > lastSeq)
     if (fresh.length === 0) {
       yield { type: 'heartbeat' }
       continue
@@ -136,7 +142,17 @@ inboxApp.get('/stream', async (c) => {
 
   const events = streamInboxEvents(
     c.env,
-    { agent: id.boundAgentId, since, pollMs },
+    {
+      agent: id.boundAgentId,
+      since,
+      pollMs,
+      // P0-2: re-validate the bearer credential on every poll so a revoked token or
+      // deactivated agent ends the stream instead of leaking the full inbox forever.
+      revalidate: async () => {
+        const current = await resolveMemberByToken(c.env, bearerToken(c.req.header('authorization')))
+        return current?.boundAgentId === id.boundAgentId
+      },
+    },
     { signal: c.req.raw.signal },
   )
   const encoder = new TextEncoder()

@@ -209,9 +209,9 @@ function makeDb() {
 
         // SELECT ... FROM agent_messages WHERE ... ORDER BY seq ASC LIMIT (peek — checked AFTER consume).
         if (/^SELECT/i.test(s) && /FROM agent_messages/.test(s) && /read_at IS NULL/.test(s) && /ORDER BY seq ASC/.test(s)) {
-          const [tenant, to_agent, limit] = binds as [string, string, number]
+          const [tenant, to_agent, sinceSeq, limit] = binds as [string, string, number, number]
           const rows = messages
-            .filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null)
+            .filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null && m.seq > (sinceSeq ?? 0))
             .sort((a, b) => a.seq - b.seq)
             .slice(0, limit)
           return { results: rows as unknown as T[] }
