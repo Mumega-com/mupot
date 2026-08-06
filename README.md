@@ -76,7 +76,9 @@ npm run smoke:local
    completes verified work with it. "What can this agent do?" becomes a loadout you read like a
    résumé, projected into an HR shape your directory can sync.
 2. **Sovereign deploy-anywhere + real auditable work.** Managed → your cloud account → your own
-   servers → on-prem datacenter → edge hardware. The lean core runs the same in every mode.
+   servers → on-prem datacenter → edge hardware (off-cloud modes are the open adapter roadmap —
+   see [Deploy anywhere](#deploy-anywhere--sovereignty-is-a-gradient-not-a-cliff) below). The
+   lean core is designed to run the same in every mode.
    Work lands in **your GitHub** (PRs, issues, green checks), not a proprietary black box —
    enterprise-grade auditability against the real tool of record.
 3. **A built-in economy + god-game legibility.** Pay per execution, not per seat. Rent agents
@@ -105,7 +107,7 @@ your control plane (managed CF / your CF / your VPS / on-prem / edge)
 
 Edge-native and scale-to-zero: agents hibernate when idle, so an empty org costs near nothing
 and a busy one scales. The **core stays lean** — brain, governor, identity, bus, simple APIs —
-so it runs anywhere, even on edge hardware. Heavy workflow engines are **pluggable providers**
+so it is designed to run anywhere, even on edge hardware. Heavy workflow engines are **pluggable providers**
 behind the gateway, never baked into the core.
 
 ## Connect the agent you already have
@@ -124,19 +126,27 @@ work footprint. That's the difference between a demo and something an auditor ca
 
 ## Deploy anywhere — sovereignty is a gradient, not a cliff
 
-| Mode | Where it runs | Porting work | Your data |
-|------|---------------|--------------|-----------|
-| **Managed** | We host the pot | none | hosted |
-| **Your cloud** | stamped `scripts/deploy.mjs` to your own account | provisioning only | your account |
-| **Your servers** | [workerd](https://github.com/cloudflare/workerd) (CF's own OSS runtime) on a VPS + storage adapters | adapter layer | your infra |
-| **On-prem** | Your datacenter, self-contained, optional air-gap | adapter + host sandbox | never leaves |
-| **Edge** | workerd / Node on Jetson-class hardware on your floor | + capability tier | on the metal |
+| Mode | Where it runs | State | Your data |
+|------|---------------|-------|-----------|
+| **Managed** | We host the pot | shipped | hosted |
+| **Your cloud** | stamped `scripts/deploy.mjs` to your own account | shipped — how mumega and DME run today | your account |
+| **Your servers** | [workerd](https://github.com/cloudflare/workerd) (CF's own OSS runtime) on a VPS + storage adapters | adapter-layer, partial | your infra |
+| **On-prem** | Your datacenter, self-contained, optional air-gap | planned | never leaves |
+| **Edge** | workerd / Node on Jetson-class hardware on your floor | planned | on the metal |
 
 The CF binding contract (`src/types.ts` `Env`) is the seam: porting means implementing storage
-adapters, not rewriting. workerd runs the same Worker + Durable Object code off-cloud, so the
-hard coordination layer is **ridden, not reimplemented**.
+adapters, not rewriting. workerd can run the same Worker + Durable Object code off-cloud, so the
+hard coordination layer stays **ridden, not reimplemented** — but rows past "Your cloud" are the
+adapter roadmap, not a one-command deploy. Today the pot is verified on Cloudflare (managed or
+your account); Vectorize and Workers-AI have no off-CF path yet
+([#411](https://github.com/Mumega-com/mupot/issues/411)). See the
+[honest gradient](./docs/architecture/sovereign-core-operated-presence.md) for the deployment
+ladder read as a pricing tier.
 
-## Enterprise / on-prem
+## Enterprise / on-prem (`planned`)
+
+Not yet shipped — the design target for the off-cloud modes (see the state column in
+[Deploy anywhere](#deploy-anywhere--sovereignty-is-a-gradient-not-a-cliff) above).
 
 - The whole stack runs **self-contained in your datacenter** — data never leaves; model calls
   can route to an on-prem/Ollama endpoint for full air-gap.
@@ -187,7 +197,8 @@ Then open your deployment, **log in as owner**, and the **setup wizard** walks y
 name your org → create departments + squads → connect the agent you already have → invite your
 team → connect a chat platform. See [`connectors/`](./connectors) for wiring Discord / Google
 Chat / Telegram, and [`scripts/README.md`](./scripts) for the deploy detail. (Off-cloud and
-on-prem deployment ride the same `Env` adapter contract.)
+on-prem deployment are designed to ride the same `Env` adapter contract; those adapters are the
+open part of the roadmap — see [Deploy anywhere](#deploy-anywhere--sovereignty-is-a-gradient-not-a-cliff) above.)
 
 ## The boundary (what mupot does NOT do)
 
