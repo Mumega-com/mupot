@@ -125,6 +125,40 @@ export function terminalStatusInSql(column = 'status'): string {
 // band first, then oldest first within a band — instead of an unqualified
 // `ORDER BY created_at` that could let a large pile of old `blocked` rows
 // crowd a fresher `open` row out of the fetch window.
+/**
+ * Untriaged (NULL) ranks LAST, after P3. That is a choice, not a fallback: ranking it
+ * mid-pack would be arbitrary, and ranking it first would reward never triaging. Sorting
+ * it last means unranked work still moves (anti-starvation by created_at applies within
+ * the untriaged band) but never outranks work someone actually assessed.
+ */
+export const PRIORITY_RANK: Record<string, number> = { P0: 0, P1: 1, P2: 2, P3: 3, untriaged: 4 }
+
+/**
+ * SQL mirror of PRIORITY_RANK, for ORDER BY. This must agree with the comparator above —
+ * the SQL ordering decides which rows survive the LIMIT, so a disagreement silently drops
+ * high-priority rows before the in-memory ranker ever sees them.
+ */
+/**
+ * The one projection every task read uses, on EVERY surface.
+ *
+ * It lived in five places inside src/mcp/index.ts and, unnoticed, in four more across
+ * src/tasks/index.ts (REST) and src/dashboard/index.ts. migrations/0079 added `priority`
+ * and `parent_task_id`; #710 updated the MCP copies and left the others. Result: the MCP
+ * path ranked correctly while the REST and dashboard paths — the ones a human opens —
+ * silently returned unranked rows, with comments in both claiming parity. Nothing failed.
+ * (Found by the diverse gate, mupot#713.)
+ *
+ * A projection duplicated across surfaces is a divergence waiting for its next column.
+ */
+export const TASK_SELECT_COLUMNS =
+  'id, squad_id, project_id, title, body, done_when, status, priority, parent_task_id, ' +
+  'assignee_agent_id, github_issue_url, result, completed_at, gate_owner, source_pot, ' +
+  'external_source, created_at, updated_at'
+
+export function priorityOrderSql(column = 'priority'): string {
+  return `CASE ${column} WHEN 'P0' THEN 0 WHEN 'P1' THEN 1 WHEN 'P2' THEN 2 WHEN 'P3' THEN 3 ELSE 4 END`
+}
+
 export function actionableStatusOrderSql(column = 'status'): string {
   const whens = ACTIONABLE_STATUSES.map((s, i) => `WHEN '${s}' THEN ${i}`).join(' ')
   return `CASE ${column} ${whens} END`
@@ -184,6 +218,14 @@ export function rankTasks(
   ranked.sort((a, b) => {
     const bandDiff = STATUS_BAND[a.status] - STATUS_BAND[b.status]
     if (bandDiff !== 0) return bandDiff
+    // Priority sits BELOW the status band and ABOVE created_at, deliberately. Status band
+    // stays first so in-flight work finishes before new work starts (WIP discipline, the
+    // existing principle). Anti-starvation by created_at still applies, but now WITHIN a
+    // priority rather than across all of them — otherwise a P0 filed today would sit behind
+    // every unranked task filed last week, which is precisely the failure a priority field
+    // exists to fix.
+    const priorityDiff = PRIORITY_RANK[a.priority ?? 'untriaged'] - PRIORITY_RANK[b.priority ?? 'untriaged']
+    if (priorityDiff !== 0) return priorityDiff
     if (a.created_at !== b.created_at) return a.created_at < b.created_at ? -1 : 1
     if (a.id !== b.id) return a.id < b.id ? -1 : 1
     return 0
