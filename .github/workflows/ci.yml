@@ -129,6 +129,27 @@ jobs:
       - name: Guard — no secrets in this public template
         run: node scripts/no-secrets.mjs
 
+  test-schema-source:
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 is REQUIRED — the ratchet compares the baseline against the merge
+      # target, and a shallow clone cannot read it. The check FAILS rather than passes when
+      # the target is unreadable, so a missing fetch-depth surfaces as a red build instead
+      # of a silently-disengaged guard.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # Ratchet (#684, #703): a test that imports production code must build its schema
+      # from the committed migration chain. A hand-written CREATE TABLE or a hand-picked
+      # list of migration files is a schema the author invented — it executes real SQL
+      # against a database production does not have, which is how #684 stayed green.
+      # The baseline may shrink, never grow.
+      - name: Guard — tests must build schema from the migration chain
+        run: node scripts/check-test-schema-source.mjs
+
   design-status-policy:
     runs-on: ubuntu-latest
     steps:
