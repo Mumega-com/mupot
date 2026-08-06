@@ -28,6 +28,7 @@ export interface DeploymentData {
   tenant: string
   version: string
   commit: string | null // 40-hex RELEASE_SHA, or null when unset/invalid (unstamped deploy)
+  clean: boolean // false when the build was from a dirty tree or off-main HEAD (mupot#571)
   ok: boolean // liveness — the same `ok` GET /health reports
   onboarded: boolean
 }
@@ -41,6 +42,7 @@ export async function loadDeployment(env: Env): Promise<DeploymentData> {
     tenant: health.tenant,
     version: health.version,
     commit: health.commit,
+    clean: health.clean,
     ok: health.ok,
     onboarded,
   }
@@ -73,6 +75,15 @@ export function deploymentBody(d: DeploymentData) {
       </div>`
     : html``
 
+  const dirtyWarning = d.commit && !d.clean
+    ? html`<div class="warn-box">
+        <strong>Unverified build.</strong> This deploy was built from a dirty working tree or a
+        HEAD not on/descended-from <code class="inline">main</code>. The commit shown below is
+        real, but it is not a verified clean production release — treat it as a local/test
+        deploy, not a release candidate.
+      </div>`
+    : html``
+
   return html`
     <p class="crumbs"><a href="/">Overview</a> / Deployment</p>
     <h1>Deployment</h1>
@@ -84,6 +95,7 @@ export function deploymentBody(d: DeploymentData) {
 
     ${onboardingNudge}
     ${shaWarning}
+    ${dirtyWarning}
 
     <div class="card">
       <dl class="kv">
@@ -116,18 +128,19 @@ export function deploymentBody(d: DeploymentData) {
         your own machine or CI — there is no "deploy" button in this dashboard on purpose (a
         dashboard click should never be able to push a new build to production).
       </p>
-      <pre class="snippet">npm run deploy
-# or, equivalently:
-npx wrangler deploy</pre>
+      <pre class="snippet">npm run deploy</pre>
       <p class="empty">
         For the full self-host / redeploy runbook (secrets, migrations, config), see
         <code class="inline">docs/SELF-HOST.md</code> and <code class="inline">docs/production-runbook.md</code>
         in this pot's repository.
       </p>
       <p class="empty">
-        To make <code class="inline">GET /health</code> report an exact commit identity, deploy
-        with <code class="inline">RELEASE_SHA</code> set to the commit you're shipping, e.g.
-        <code class="inline">RELEASE_SHA=$(git rev-parse HEAD) npx wrangler deploy</code>.
+        <code class="inline">GET /health</code> reports an exact commit identity automatically —
+        deploy via <code class="inline">npm run deploy</code> (or
+        <code class="inline">node scripts/mupot-update.mjs &lt;slug&gt; --apply</code> for a
+        managed pot) and <code class="inline">RELEASE_SHA</code> is stamped for you from
+        <code class="inline">git rev-parse HEAD</code>. A bare
+        <code class="inline">npx wrangler deploy</code> skips this stamp — use the wrapper.
       </p>
     </div>
   `

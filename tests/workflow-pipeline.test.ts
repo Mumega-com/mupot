@@ -246,6 +246,11 @@ describe('shared execution authorization', () => {
           body TEXT NOT NULL,
           done_when TEXT NOT NULL,
           status TEXT NOT NULL,
+          -- priority + parent_task_id (migrations/0079) added by hand: this fixture
+          -- hand-writes tasks instead of applying the committed chain, so it breaks
+          -- whenever a column joins the shared projection. Third time in one day (#703).
+          priority           TEXT,
+          parent_task_id     TEXT,
           assignee_agent_id TEXT,
           github_issue_url TEXT,
           result TEXT,
@@ -255,6 +260,7 @@ describe('shared execution authorization', () => {
           execution_receipt_id TEXT,
           execution_claim_expires_at INTEGER,
           source_pot TEXT,
+          external_source TEXT,
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL
         );

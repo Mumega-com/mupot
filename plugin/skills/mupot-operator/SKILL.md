@@ -74,7 +74,7 @@ mupot_provision(
 **Step 4 — Deploy + migrate (follow next_steps exactly):**
 ```bash
 # Deploy the worker
-npx wrangler deploy --config wrangler.acme.toml
+node scripts/deploy.mjs --config wrangler.acme.toml
 
 # !! MIGRATION SAFETY — always dry-run first (see Pitfall 2 below)
 npx wrangler d1 migrations apply mupot-acme --dry-run --config wrangler.acme.toml
@@ -153,7 +153,7 @@ rejected (it breaks pot sovereignty) — each user must stay within their own sl
 - Real apply: CF REST API via pure stdlib urllib (no extra deps), idempotent D1 + KV creation
 - Paginated list-guard: fetches all pages before create (no double-create on accounts with >100 resources)
 - `wrangler.<slug>.toml` written with resolved D1 + KV IDs after apply
-- Optional `wrangler deploy` via subprocess (version-check gate; token never in argv)
+- Optional stamped deploy via `scripts/deploy.mjs` subprocess (version-check gate; token never in argv)
 - Token security: never in argv, repr, error messages, or toml output
 - Brain profile + cron plan emission
 - Deploy-to-Cloudflare button (README)

@@ -197,6 +197,65 @@ describe('MCP task cutover tools', () => {
     expect(updates[0].args[7]).toBe('agent-other')
   })
 
+  // PR #659 P0 fix, requirement 4: task_create's optional external_source arg is the
+  // server-side half of "carry the marker through steward reissue" — steward-worker.py's
+  // reissue() (scripts/steward-worker.py) now passes external_source when the prior copy
+  // had one. This proves the MCP tool honors it end to end (bounded, member-tier-safe —
+  // see the tool's inputSchema comment for why exposing it broadly is monotonic-safe).
+  it('task_create carries external_source through to the created task (steward-reissue carry-forward)', async () => {
+    const { env } = makeEnv([])
+
+    const res = await invokeTool(
+      auth(),
+      env,
+      'task_create',
+      {
+        squad_id: SQUAD_ID,
+        title: 'Steward-reissue of a Linear-origin task',
+        done_when: 'MCP task tests pass',
+        external_source: 'linear:ENG',
+      },
+      'https://pot.example',
+    )
+
+    expect(res.ok).toBe(true)
+    expect((res.result as { task: Task }).task.external_source).toBe('linear:ENG')
+  })
+
+  it('task_create rejects a blank external_source rather than silently dropping it', async () => {
+    const { env } = makeEnv([])
+
+    const res = await invokeTool(
+      auth(),
+      env,
+      'task_create',
+      {
+        squad_id: SQUAD_ID,
+        title: 'Bad external_source',
+        done_when: 'MCP task tests pass',
+        external_source: '   ',
+      },
+      'https://pot.example',
+    )
+
+    expect(res).toMatchObject({ ok: false, status: 400, error: 'invalid_args' })
+  })
+
+  it('task_create omits external_source by default (undefined stays undefined, not forged)', async () => {
+    const { env } = makeEnv([])
+
+    const res = await invokeTool(
+      auth(),
+      env,
+      'task_create',
+      { squad_id: SQUAD_ID, title: 'Ordinary local task', done_when: 'MCP task tests pass' },
+      'https://pot.example',
+    )
+
+    expect(res.ok).toBe(true)
+    expect((res.result as { task: Task }).task.external_source ?? null).toBeNull()
+  })
+
   it('task_list defaults an agent-bound token to its own squad and filters status', async () => {
     const { env } = makeEnv([
       task({ id: 'task-open', status: 'open' }),
@@ -246,11 +305,19 @@ describe('MCP task cutover tools', () => {
     expect(result.task.assignee_agent_id).toBe(AGENT_ID)
     expect(result.task.body).toBe('updated')
     expect(updates[0].sql).toContain('UPDATE tasks')
+    // NOTE: this pins the UPDATE's exact POSITIONAL bind array, so it breaks on every
+    // purely-additive column — it did here for priority + parent_task_id (migrations/0079),
+    // which the tested behaviour does not involve at all. Kept and updated rather than
+    // loosened: a positional assertion is brittle, but it is also the only thing that would
+    // catch a bind/column misalignment, which is silent corruption rather than a crash.
+    // The two nulls below are priority and parent_task_id, both unset on this task.
     expect(updates[0].args).toEqual([
       'Ship the adapter',
       'updated',
       'task tool tests pass',
       'in_progress',
+      null,
+      null,
       AGENT_ID,
       null,
       null,
@@ -595,6 +662,55 @@ describe('MCP task cutover tools', () => {
     expect(res).toMatchObject({ ok: true, result: { task: { assignee_agent_id: AGENT_ID } } })
   })
 
+  // ── PR #659 P0 fix (diverse-model adversarial gate BLOCK) ───────────────────
+  // Same #406 admin-floor reasoning, extended to external_source (migrations/0077) —
+  // the generalized marker for a non-pot external integration (e.g. Linear). A
+  // member-tier/runtime-welded agent token must not be able to self-assign a
+  // Linear-origin task and then execute it, exactly as for source_pot.
+  it('task_update REFUSES a member-only principal assigning an external_source (Linear) task (PR #659 P0 fix)', async () => {
+    const { env } = makeEnv([task({ external_source: 'linear:ENG', assignee_agent_id: null })])
+
+    const res = await invokeTool(
+      auth(), // default capabilities: member on SQUAD_ID only
+      env,
+      'task_update',
+      { task_id: 'task-1', assignee_agent_id: AGENT_ID },
+      'https://pot.example',
+    )
+
+    expect(res).toMatchObject({ ok: false, status: 403, error: 'forbidden', detail: { need: 'admin' } })
+  })
+
+  it('task_update ALLOWS an admin-capability principal to assign an external_source (Linear) task (PR #659 P0 fix)', async () => {
+    const { env } = makeEnv([task({ external_source: 'linear:ENG', assignee_agent_id: null })])
+
+    const res = await invokeTool(
+      auth({
+        capabilities: [{ member_id: MEMBER_ID, scope_type: 'squad', scope_id: SQUAD_ID, capability: 'admin' }],
+      }),
+      env,
+      'task_update',
+      { task_id: 'task-1', assignee_agent_id: AGENT_ID },
+      'https://pot.example',
+    )
+
+    expect(res).toMatchObject({ ok: true, result: { task: { assignee_agent_id: AGENT_ID } } })
+  })
+
+  it('task_update leaves LOCAL (external_source NULL) task assignment unaffected — member+ still sufficient (regression check)', async () => {
+    const { env } = makeEnv([task({ external_source: null, assignee_agent_id: null })])
+
+    const res = await invokeTool(
+      auth(),
+      env,
+      'task_update',
+      { task_id: 'task-1', assignee_agent_id: AGENT_ID },
+      'https://pot.example',
+    )
+
+    expect(res).toMatchObject({ ok: true, result: { task: { assignee_agent_id: AGENT_ID } } })
+  })
+
   it('task_update accepts a cross-squad assignee with one active bound member and a target-squad member grant', async () => {
     const { env } = makeEnv([task()], { memberId: 'member-other', capability: 'member' })
 
@@ -672,6 +788,43 @@ describe('MCP task cutover tools', () => {
       { task_id: 'task-1', status: 'review', gate_owner: 'gate:content' },
       'https://pot.example',
     )
+    expect(res.ok).toBe(true)
+    const result = res.result as { task: Task }
+    expect(result.task.status).toBe('review')
+    expect(result.task.gate_owner).toBe('gate:content')
+  })
+
+  it('task_update keeps historical ungated review repair locked for members', async () => {
+    const { env, updates } = makeEnv([task({ status: 'review', gate_owner: null })])
+
+    const res = await invokeTool(
+      auth(),
+      env,
+      'task_update',
+      { task_id: 'task-1', gate_owner: 'gate:content' },
+      'https://pot.example',
+    )
+
+    expect(res.ok).toBe(false)
+    expect(res.error).toBe('gate_owner_locked')
+    expect(updates).toHaveLength(0)
+  })
+
+  it('task_update lets an org-admin workspace token repair a historical review task with no gate_owner', async () => {
+    const { env } = makeEnv([task({ status: 'review', gate_owner: null })])
+
+    const res = await invokeTool(
+      auth({
+        capabilities: [
+          { member_id: MEMBER_ID, scope_type: 'org', scope_id: null, capability: 'admin' },
+        ],
+      }),
+      env,
+      'task_update',
+      { task_id: 'task-1', gate_owner: 'gate:content' },
+      'https://pot.example',
+    )
+
     expect(res.ok).toBe(true)
     const result = res.result as { task: Task }
     expect(result.task.status).toBe('review')

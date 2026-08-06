@@ -24,6 +24,7 @@
 //                        Hermes can call directly (or the webhook calls for it).
 
 import { Hono } from 'hono'
+import { TASK_SELECT_COLUMNS } from '../tasks/ranking'
 import type {
   Env,
   Member,
@@ -535,8 +536,7 @@ function escapeLikePrefix(ref: string): string {
 
 async function resolveTaskRef(env: Env, ref: string): Promise<Task | 'ambiguous' | null> {
   const exact = await env.DB.prepare(
-    `SELECT id, squad_id, project_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at,
-            gate_owner, workflow_instance_id, created_at, updated_at
+    `SELECT ${TASK_SELECT_COLUMNS}, workflow_instance_id
        FROM tasks WHERE id = ?1 LIMIT 1`,
   )
     .bind(ref)
@@ -546,8 +546,7 @@ async function resolveTaskRef(env: Env, ref: string): Promise<Task | 'ambiguous'
   // Telegram is awkward for UUIDs; allow a unique prefix once it is specific enough.
   if (ref.length < 8) return null
   const rows = await env.DB.prepare(
-    `SELECT id, squad_id, project_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at,
-            gate_owner, workflow_instance_id, created_at, updated_at
+    `SELECT ${TASK_SELECT_COLUMNS}, workflow_instance_id
        FROM tasks WHERE id LIKE ?1 ESCAPE '\\' ORDER BY created_at DESC LIMIT 2`,
   )
     .bind(`${escapeLikePrefix(ref)}%`)
