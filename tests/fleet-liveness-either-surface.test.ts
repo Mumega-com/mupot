@@ -29,9 +29,23 @@ const TENANT = 'mumega'
 const AGENT = 'agent-uuid-1'
 const NOW = Date.parse('2026-08-06T03:00:00Z')
 
-/** Presence TTL is 180s, so this is comfortably inside it and this is comfortably outside. */
-const FRESH = new Date(NOW - 30_000).toISOString().replace('T', ' ').slice(0, 19)
-const STALE = new Date(NOW - 7 * 24 * 3600_000).toISOString().replace('T', ' ').slice(0, 19)
+// Presence TTL is 180s: FRESH is comfortably inside it, STALE comfortably outside.
+//
+// THE TWO TABLES STORE DIFFERENT FORMATS, and these fixtures must match production exactly:
+//   fleet_agents.last_reported_at   'YYYY-MM-DD HH:MM:SS'      (SQLite datetime('now'))
+//   module_registry.last_heartbeat  '2026-08-06T03:51:26.358Z' (ISO-8601, toISOString)
+//
+// The first version of this file wrote BOTH in SQLite format. Every test passed, the fix
+// merged and deployed — and production still reported agent_offline, because derivePresence
+// could not parse the ISO shape and returned 'stale' for every module row. Real SQL against
+// the real schema was not enough: the fixture invented the DATA, so the suite proved the code
+// matched my belief rather than production. Verified against live rows before rewriting.
+const sqliteStamp = (ms: number) => new Date(ms).toISOString().replace('T', ' ').slice(0, 19)
+const isoStamp = (ms: number) => new Date(ms).toISOString()
+const FRESH_FLEET = sqliteStamp(NOW - 30_000)
+const STALE_FLEET = sqliteStamp(NOW - 7 * 24 * 3600_000)
+const FRESH_MODULE = isoStamp(NOW - 30_000)
+const STALE_MODULE = isoStamp(NOW - 7 * 24 * 3600_000)
 
 let harness: SqliteD1Harness
 let env: Env
@@ -69,8 +83,8 @@ describe('an agent is live if EITHER presence surface is fresh (mupot#732)', () 
     // Exactly the state found on production: nothing had written fleet_agents for a week,
     // while presence_register was being called successfully. Before the fix this resolved to
     // `stale`/`offline`, selectAgent returned `offline`, and every routine parked forever.
-    fleetRow(STALE)
-    moduleRow(FRESH)
+    fleetRow(STALE_FLEET)
+    moduleRow(FRESH_MODULE)
 
     const state = (await liveness()).get(AGENT)
     expect(state?.presence).toBe('live')
@@ -80,14 +94,14 @@ describe('an agent is live if EITHER presence surface is fresh (mupot#732)', () 
   })
 
   it('module-registry-only agent (no fleet_agents row at all) is live and carries a runtime', async () => {
-    moduleRow(FRESH)
+    moduleRow(FRESH_MODULE)
     const state = (await liveness()).get(AGENT)
     expect(state?.presence).toBe('live')
     expect(state?.runtime).toBe('claude-code') // taken from the module adapter
   })
 
   it('fleet_agents fresh, module_registry absent -> live (the original path is untouched)', async () => {
-    fleetRow(FRESH)
+    fleetRow(FRESH_FLEET)
     const state = (await liveness()).get(AGENT)
     expect(state?.presence).toBe('live')
     expect(state?.runtime).toBe('claude-code')
@@ -98,8 +112,8 @@ describe('liveness is NOT weakened — stale still means stale', () => {
   it('BOTH surfaces stale -> not live', async () => {
     // The invariant the change rests on. If this ever passes as `live`, "either surface" has
     // become "no surface", and dispatch would hand work to an agent that is not there.
-    fleetRow(STALE)
-    moduleRow(STALE)
+    fleetRow(STALE_FLEET)
+    moduleRow(STALE_MODULE)
     expect((await liveness()).get(AGENT)?.presence).not.toBe('live')
   })
 
@@ -110,7 +124,7 @@ describe('liveness is NOT weakened — stale still means stale', () => {
   it('a STALE module row does not mask a FRESH one for the same identity', async () => {
     // Production carries several module rows per agent (project-scoped and unscoped). Reading
     // an arbitrary one would make liveness depend on row order.
-    moduleRow(FRESH)
+    moduleRow(FRESH_MODULE)
     // A real project row is required — module_registry.project_id carries a live FK, and the
     // first draft of this test invented 'proj-1' and was rejected by the schema. Worth
     // stating: that rejection is the harness doing its job. A mocked DB would have accepted
@@ -121,19 +135,19 @@ describe('liveness is NOT weakened — stale still means stale', () => {
        INSERT INTO module_registry (id, tenant, kind, adapter, project_id, identity, status,
                                     capabilities, last_heartbeat, registered_at)
        VALUES ('mod-2', '${TENANT}', 'agent_system', 'claude-code', 'proj-1', '${AGENT}',
-               'offline', '["build"]', '${STALE}', '${STALE}')`,
+               'offline', '["build"]', '${STALE_MODULE}', '${STALE_MODULE}')`,
     )
     expect((await liveness()).get(AGENT)?.presence).toBe('live')
   })
 
   it('a fresh module row for ANOTHER TENANT does not make this agent live', async () => {
     // The tenant fence is the thing that must not be traded away for availability.
-    fleetRow(STALE)
+    fleetRow(STALE_FLEET)
     harness.sqlite.exec(
       `INSERT INTO module_registry (id, tenant, kind, adapter, project_id, identity, status,
                                     capabilities, last_heartbeat, registered_at)
        VALUES ('mod-x', 'other-tenant', 'agent_system', 'claude-code', NULL, '${AGENT}',
-               'online', '["build"]', '${FRESH}', '${FRESH}')`,
+               'online', '["build"]', '${FRESH_MODULE}', '${FRESH_MODULE}')`,
     )
     expect((await liveness()).get(AGENT)?.presence).not.toBe('live')
   })
