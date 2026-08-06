@@ -68,14 +68,28 @@ export function migrationNumber(filename) {
  *
  * @param {string[]|null} targetFiles  migration filenames on the merge target, or null when
  *                                     the target could not be read at all
- * @param {string[]} localFiles        migration filenames in the working tree
+ * @param {string[]|null} localFiles   migration filenames in the working tree, or null when
+ *                                     the working tree's migrations/ could not be listed
  * @returns {{ok: boolean, reason: string, detail?: object}}
  */
 export function evaluate(targetFiles, localFiles) {
-  // CANNOT VERIFY IS NOT PASS. A shallow clone, a missing base ref, or a detached worktree
-  // makes the target unreadable — and a guard that shrugs and exits 0 there is worse than
-  // no guard, because the green check reads as "ordering verified". This is the single most
-  // important line in the file; the schema ratchet learned it the same way.
+  // CANNOT VERIFY IS NOT PASS — and it has TWO sides. The rule is not "the target must be
+  // readable", it is "every input this verdict rests on must be readable". Both sides get the
+  // same answer, because a guard that shrugs and exits 0 is worse than absent: the green tick
+  // reads as "ordering verified".
+  //
+  // This file shipped with only the target side (c43b35b) and was still fail-open on the
+  // local side for four hours. Both bugs are one sentence written down once and then applied
+  // to one of its two arguments. If a third input is ever added, it gets a null case too.
+
+  // LOCAL side. Checked first because it needs no target to be decidable. Treating an
+  // unlistable migrations/ as "this PR added nothing" is the same fail-open as the target
+  // side, reached from the opposite direction — a sparse checkout omitting the directory
+  // disables the guard and the check reports success.
+  if (localFiles === null) {
+    return { ok: false, reason: 'local_unreadable' }
+  }
+  // TARGET side. A shallow clone, a missing base ref, or an unreadable tree.
   if (targetFiles === null) {
     return { ok: false, reason: 'target_unreadable' }
   }
@@ -188,11 +202,21 @@ function targetMigrations(ref) {
   }
 }
 
+// The LOCAL side of the same cannot-read-is-not-pass rule. Returns null when the working
+// tree's migrations/ cannot be listed at all, so `evaluate` can refuse instead of reading
+// the absence as "this PR added nothing".
+//
+// Found by Prime's bypass review AFTER the target-side fix shipped (c43b35b) — the mirror
+// image of that bug, in the mirror-image function, which neither Athena's bypass sweep nor
+// 21 self-tests caught because everyone (me included) was looking at the target side.
+// Measured on merged main: `mv migrations /tmp` then run the guard → exit 0,
+// `no_migrations_added`. A sparse checkout that omits migrations/ disables the guard
+// silently, and the check that is supposed to notice reports success.
 function localMigrations() {
   try {
     return readdirSync(join(ROOT, DIR)).filter((name) => name.endsWith('.sql'))
   } catch {
-    return []
+    return null
   }
 }
 
@@ -220,6 +244,13 @@ function main() {
 
   console.error('MIGRATION NUMBERING CHECK FAILED\n')
   switch (verdict.reason) {
+    case 'local_unreadable':
+      console.error(
+        `Could not list ${DIR}/ in the working tree. This check cannot tell "this PR added\n` +
+        'no migrations" from "I could not look", so it refuses rather than passing.\n\n' +
+        'Usually a sparse checkout that omits the directory. Check out the full tree.',
+      )
+      break
     case 'target_unreadable':
       console.error(
         `Could not read ${ref}. This check compares against the merge target, so it cannot\n` +

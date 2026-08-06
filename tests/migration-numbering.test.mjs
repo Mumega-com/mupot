@@ -125,6 +125,19 @@ test('a target with migrations but NONE parseable fails rather than inventing a 
   assert.equal(v.reason, 'target_has_no_parseable_migrations')
 })
 
+test('FAIL CLOSED, LOCAL SIDE: an unlistable working-tree migrations/ is a failure', () => {
+  // Found by Prime's bypass review AFTER the target-side fix shipped in c43b35b — the mirror
+  // image of that bug, in the mirror-image function. Neither Athena's bypass sweep nor 21
+  // self-tests caught it, because everyone including me was looking at the target side.
+  //
+  // The lesson is not "check localMigrations too". It is that "cannot verify is not pass" was
+  // written down once and applied to ONE of the function's two arguments. A rule stated in a
+  // comment gets applied where the author was looking.
+  const v = evaluate(['0079_x.sql'], null)
+  assert.equal(v.ok, false)
+  assert.equal(v.reason, 'local_unreadable')
+})
+
 test('a target with no migrations at all is bootstrap, and passes', () => {
   assert.equal(evaluate([], ['0001_init.sql']).reason, 'bootstrap_no_target_migrations')
 })
@@ -241,6 +254,20 @@ test('FAIL CLOSED at the GIT layer: ls-tree failing is a failure, not a bootstra
   const { code, out } = run(dir, { PATH: `${bin}:${process.env.PATH}` })
   assert.equal(code, 1, 'a git failure must NOT read as bootstrap')
   assert.doesNotMatch(out, /bootstrap/)
+})
+
+test('end to end: hiding the working-tree migrations/ fails instead of passing', (t) => {
+  // The real shape, driven through the real script: on merged main this exited 0 with
+  // `no_migrations_added` — a sparse checkout that omits the directory silently disabled the
+  // guard. Measured, then fixed.
+  const dir = scaffold({ targetMigrations: ['0079_x.sql'], addedMigrations: ['0080_new.sql'] })
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  assert.equal(run(dir).code, 0, 'sanity: above-head passes with the directory present')
+
+  rmSync(join(dir, 'migrations'), { recursive: true, force: true })
+  const { code, out } = run(dir)
+  assert.equal(code, 1, 'an unlistable migrations/ must NOT read as "added nothing"')
+  assert.doesNotMatch(out, /no_migrations_added/)
 })
 
 test('end to end: BASE_REF selects a different merge target', (t) => {
