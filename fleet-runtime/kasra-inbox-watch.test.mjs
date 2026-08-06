@@ -1,7 +1,16 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
-import { runCycle, main } from '../scripts/kasra-inbox-watch.mjs'
+import {
+  deliverToTmux,
+  deliveryMarker,
+  main,
+  runCycle,
+  spoolMessage,
+} from '../scripts/kasra-inbox-watch.mjs'
 
 const AGENT = 'c855f82c-1eeb-409d-94d2-f11e9dd18968'
 const REQUEST = {
@@ -13,6 +22,159 @@ const REQUEST = {
   request_id: 'yc27-kasra-receive-canary',
   in_reply_to: null,
 }
+
+test('deliverToTmux times out a stuck literal write and sends no Enter', () => {
+  const calls = []
+  const result = deliverToTmux('', REQUEST, {
+    spoolMessage: () => '/tmp/mupot-message.json',
+    spawn: (_command, args) => {
+      calls.push(args)
+      return { status: null, error: { code: 'ETIMEDOUT', message: 'timed out' }, stderr: '' }
+    },
+    timeoutMs: 25,
+  })
+
+  assert.equal(result.ok, false)
+  assert.equal(result.reason, 'tmux_send_timeout')
+  assert.equal(calls.length, 1)
+  assert.ok(calls[0].includes('-l'))
+})
+
+test('deliverToTmux types a bounded correlation-preserving preview, never the full body', () => {
+  const sentinel = 'UNIQUE-TAIL-SENTINEL'
+  const message = { ...REQUEST, body: `${'x'.repeat(8000 - sentinel.length)}${sentinel}` }
+  let typed = ''
+  const result = deliverToTmux('', message, {
+    previewMaxChars: 640,
+    spoolMessage: () => '/secure/spool/msg-yc27.json',
+    spawn: (_command, args) => {
+      if (args.includes('-l')) typed = args.at(-1)
+      if (args[0] === 'capture-pane') return { status: 0, stdout: typed, stderr: '' }
+      return { status: 0, stdout: '', stderr: '' }
+    },
+  })
+
+  assert.equal(result.ok, true)
+  assert.ok(typed.length <= 640)
+  assert.match(typed, /id: msg-yc27/)
+  assert.match(typed, /request_id: yc27-kasra-receive-canary/)
+  assert.match(typed, /full_body_file: \/secure\/spool\/msg-yc27\.json/)
+  assert.doesNotMatch(typed, new RegExp(sentinel))
+})
+
+test('spoolMessage preserves the complete message in a mode-600 file', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'mupot-watch-test-'))
+  try {
+    const body = `${'full-body-'.repeat(790)}tail`
+    const file = spoolMessage({ ...REQUEST, body }, { spoolDir: dir })
+    assert.equal(statSync(file).mode & 0o777, 0o600)
+    assert.equal(JSON.parse(readFileSync(file, 'utf8')).body, body)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('deliverToTmux refuses success when post-Enter pane confirmation lacks the delivery marker', () => {
+  const result = deliverToTmux('', REQUEST, {
+    confirmAttempts: 2,
+    spoolMessage: () => '/tmp/mupot-message.json',
+    spawn: (_command, args) => {
+      if (args[0] === 'capture-pane') return { status: 0, stdout: 'prompt without marker', stderr: '' }
+      return { status: 0, stdout: '', stderr: '' }
+    },
+  })
+
+  assert.equal(result.ok, false)
+  assert.equal(result.reason, 'tmux_delivery_unconfirmed')
+})
+
+test('deliverToTmux preserves a bounded settle delay between literal write and Enter', () => {
+  const calls = []
+  let typed = ''
+  const result = deliverToTmux('', REQUEST, {
+    enterDelayMs: 275,
+    spoolMessage: () => '/tmp/mupot-message.json',
+    spawn: (command, args) => {
+      calls.push([command, ...args])
+      if (command === 'tmux' && args.includes('-l')) typed = args.at(-1)
+      if (command === 'tmux' && args[0] === 'capture-pane') {
+        return { status: 0, stdout: typed, stderr: '' }
+      }
+      return { status: 0, stdout: '', stderr: '' }
+    },
+  })
+
+  assert.equal(result.ok, true)
+  assert.deepEqual(calls.slice(0, 3).map((call) => call.slice(0, 2)), [
+    ['tmux', 'send-keys'],
+    ['sleep', '0.275'],
+    ['tmux', 'send-keys'],
+  ])
+  assert.equal(calls[2].at(-1), 'Enter')
+})
+
+test('runCycle consumes exactly once only after the pane confirms the delivery marker', async () => {
+  let typed = ''
+  let consumes = 0
+  const mcpCall = async (_token, name, args) => {
+    if (name === 'boot_context') return { bound_agent_id: AGENT }
+    if (name === 'inbox_consumer_status') return { mode: 'bearer_only' }
+    if (name === 'inbox' && args.peek === true) return { messages: [REQUEST], remaining: 0 }
+    if (name === 'inbox' && args.peek === false) {
+      consumes += 1
+      return { messages: [REQUEST], remaining: 0 }
+    }
+    throw new Error(`unexpected ${name}`)
+  }
+
+  const result = await runCycle({
+    token: 'test-token-not-real',
+    mcpCall,
+    deliverToTmux: (_nudge, message) => deliverToTmux('', message, {
+      spoolMessage: () => '/secure/spool/msg-yc27.json',
+      spawn: (_command, args) => {
+        if (args.includes('-l')) typed = args.at(-1)
+        if (args[0] === 'capture-pane') {
+          return { status: 0, stdout: `${typed}\n${deliveryMarker(message)}`, stderr: '' }
+        }
+        return { status: 0, stdout: '', stderr: '' }
+      },
+    }),
+  })
+
+  assert.equal(result.ok, true)
+  assert.equal(result.consumed, 1)
+  assert.equal(consumes, 1)
+})
+
+test('runCycle leaves the inbox unread when pane confirmation fails', async () => {
+  let consumed = false
+  const mcpCall = async (_token, name, args) => {
+    if (name === 'boot_context') return { bound_agent_id: AGENT }
+    if (name === 'inbox_consumer_status') return { mode: 'bearer_only' }
+    if (name === 'inbox' && args.peek === true) return { messages: [REQUEST], remaining: 0 }
+    if (name === 'inbox' && args.peek === false) {
+      consumed = true
+      return { messages: [REQUEST], remaining: 0 }
+    }
+    throw new Error(`unexpected ${name}`)
+  }
+
+  const result = await runCycle({
+    token: 'test-token-not-real',
+    mcpCall,
+    deliverToTmux: (_nudge, message) => deliverToTmux('', message, {
+      spoolMessage: () => '/tmp/mupot-message.json',
+      spawn: (_command, args) => args[0] === 'capture-pane'
+        ? { status: 0, stdout: '', stderr: '' }
+        : { status: 0, stdout: '', stderr: '' },
+    }),
+  })
+
+  assert.equal(result.ok, false)
+  assert.equal(result.consumed, 0)
+  assert.equal(consumed, false)
+})
 
 test('runCycle peeks, delivers with correlation, then consumes exactly once', async () => {
   const calls = []
@@ -329,6 +491,30 @@ test('main() keeps looping (does not exit) on a non-terminal cycle failure', asy
   assert.equal(cycleCalls, 1)
   assert.equal(slept, true, 'a non-terminal failure must proceed to the retry sleep, not exit')
   assert.equal(released, false, 'must not release on a non-terminal failure')
+  assert.deepEqual(exits, [])
+})
+
+test('main() treats a tmux delivery timeout as retryable under supervision', async () => {
+  const exits = []
+  let slept = false
+  const STOP = new Error('stop after timeout retry boundary')
+  await assert.rejects(() => main({
+    readTokenFn: () => 'test-token',
+    mcpCall: async (_token, name) => {
+      if (name === 'boot_context') return { bound_agent_id: AGENT }
+      if (name === 'inbox_consumer_status') return { mode: 'bearer_only', generation: 0 }
+      throw new Error(`unexpected preflight call ${name}`)
+    },
+    acquireLock: async () => ({ ok: true, reason: 'lock_acquired', release: () => {} }),
+    runCycle: async () => ({ ok: false, reason: 'tmux_send_timeout', consumed: 0, delivered: 0 }),
+    exit: (code) => exits.push(code),
+    sleep: async () => {
+      slept = true
+      throw STOP
+    },
+  }), STOP)
+
+  assert.equal(slept, true)
   assert.deepEqual(exits, [])
 })
 

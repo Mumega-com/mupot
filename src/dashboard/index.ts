@@ -24,6 +24,7 @@ import { Hono } from 'hono'
 import { csrf } from 'hono/csrf'
 import { html, raw } from 'hono/html'
 import type { HtmlEscapedString } from 'hono/utils/html'
+import { TASK_SELECT_COLUMNS, actionableStatusOrderSql, priorityOrderSql } from '../tasks/ranking'
 import { MUPOT_FAVICON_32_PNG_B64, MUPOT_MARK_64_PNG_B64 } from './brand-assets'
 import type {
   Env,
@@ -1370,8 +1371,13 @@ dashboardApp.get('/squads/:id', async (c) => {
       .bind(squadId)
       .all<Agent>(),
     c.env.DB.prepare(
-      `SELECT id, squad_id, project_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, created_at, updated_at
-         FROM tasks WHERE squad_id = ? ORDER BY updated_at DESC`,
+      // Ranked, not merely recent (#713). This ordered by updated_at DESC — so the human
+      // board showed "most recently touched", never "most important", while the MCP path
+      // ranked correctly. The board is the surface an operator opens to answer "what is
+      // next"; answering it with recency is a silent wrong answer.
+      `SELECT ${TASK_SELECT_COLUMNS}
+         FROM tasks WHERE squad_id = ?
+        ORDER BY ${actionableStatusOrderSql()}, ${priorityOrderSql()}, updated_at DESC`,
     )
       .bind(squadId)
       .all<Task>(),
