@@ -359,6 +359,16 @@ describe('addon lifecycle routes', () => {
         description: 'Signed, bounded collaboration between sovereign Mupot projects.',
         state: null,
       },
+      {
+        key: 'workflow-circuits',
+        name: 'Workflow Circuits',
+        version: '1.0.0',
+        publisher: 'mumega',
+        trustClass: 'native_reviewed',
+        kind: 'native',
+        description: 'Deterministic workflow-graph engine: gated node/edge circuits agents drive through MCP tools.',
+        state: null,
+      },
     ])
     for (const addon of body.addons) {
       expect(Object.keys(addon).sort()).toEqual([

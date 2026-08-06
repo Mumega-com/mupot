@@ -62,8 +62,33 @@ function supportsMupotVersion(range: string, version: string): boolean {
   return compareSemver(current, maximum) < 0
 }
 
+function supportsAdditiveNativePreviousMinor(
+  manifest: AddonManifestV1,
+  version: string,
+): boolean {
+  if (manifest.kind !== 'native' || manifest.trustClass !== 'native_reviewed') {
+    return false
+  }
+  if (!manifest.mupotCompatibility.startsWith('^')) return false
+  const minimum = parseSemver(manifest.mupotCompatibility.slice(1))
+  const current = parseSemver(version)
+  return Boolean(
+    minimum &&
+    current &&
+    minimum.major === 0 &&
+    current.major === 0 &&
+    current.minor === minimum.minor + 1,
+  )
+}
+
 export function assertAddonRuntimeContract(manifest: AddonManifestV1): void {
-  if (!supportsMupotVersion(manifest.mupotCompatibility, MUPOT_PUBLIC_API_VERSION)) {
+  // Native addons are compiled and reviewed with the host. Permit one additive
+  // pre-1.0 minor without rewriting their digest-bound lifecycle identity.
+  // External addons remain on strict semver compatibility.
+  if (
+    !supportsMupotVersion(manifest.mupotCompatibility, MUPOT_PUBLIC_API_VERSION) &&
+    !supportsAdditiveNativePreviousMinor(manifest, MUPOT_PUBLIC_API_VERSION)
+  ) {
     throw new Error('addon_mupot_incompatible')
   }
 

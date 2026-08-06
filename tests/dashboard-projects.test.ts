@@ -392,8 +392,9 @@ describe('project dashboard renderers', () => {
     const detail = (await loadProjectDetail(envFor(harness), actor({ role: 'owner' }), 'visible-child'))!
     const expected = {
       planned: ['activate', 'archive'],
-      active: ['pause', 'complete', 'archive'],
-      paused: ['activate', 'complete', 'archive'],
+      active: ['pause', 'archive'],
+      paused: ['activate', 'archive'],
+      review: ['activate', 'complete'],
       completed: ['activate', 'archive'],
       archived: ['restore'],
     } as const
@@ -957,8 +958,18 @@ describe('project dashboard renderers', () => {
 
   it('uses semantic anchor tabs and renders authoritative Activity and Evidence projections', async () => {
     harness = makeHarness()
+    harness.sqlite.prepare(`
+      UPDATE tasks
+         SET title = ?, result = ?
+       WHERE id = 'visible-task'
+    `).run(
+      'Visible task </script><script>alert("activity")</script>',
+      'Verified </script><script>alert("evidence")</script>',
+    )
     const view = await loadProjectDetail(envFor(harness), actor({ role: 'owner' }), 'visible-child')
     const body = await render(projectDetailBody(view!))
+    const activityMatch = body.match(/<script type="application\/json" id="project-activity-json">([^<]*)<\/script>/)
+    const evidenceMatch = body.match(/<script type="application\/json" id="project-evidence-json">([^<]*)<\/script>/)
 
     expect(body).toMatch(/<nav[^>]+aria-label="Project sections"/)
     expect(body).toContain('href="#overview" aria-current="page"')
@@ -968,7 +979,7 @@ describe('project dashboard renderers', () => {
     expect(body).toContain('href="#activity"')
     expect(body).toContain('href="#evidence"')
     expect(body).toContain('Coordinate &lt;safely&gt;')
-    expect(body).toContain('Verified &amp; retained &lt;result&gt;')
+    expect(body).toContain('Verified &lt;/script&gt;&lt;script&gt;alert(&quot;evidence&quot;)&lt;/script&gt;')
     expect(body).toContain('workflow receipt')
     expect(body).not.toContain('No project activity yet')
     expect(body).not.toContain('No project evidence yet')
@@ -979,6 +990,16 @@ describe('project dashboard renderers', () => {
     expect(body).toContain("window.addEventListener('hashchange', syncProjectTab)")
     expect(body).toContain("link.setAttribute('aria-current', 'page')")
     expect(body).toContain("link.removeAttribute('aria-current')")
+    expect(activityMatch).not.toBeNull()
+    expect(evidenceMatch).not.toBeNull()
+    expect(JSON.parse(activityMatch![1]!)).toEqual({ rows: view!.activity.rows })
+    expect(JSON.parse(evidenceMatch![1]!)).toEqual({ rows: view!.evidence.rows })
+    expect(activityMatch![1]).not.toContain('<')
+    expect(evidenceMatch![1]).not.toContain('<')
+    expect(JSON.parse(activityMatch![1]!)).not.toHaveProperty('hasMore')
+    expect(JSON.parse(activityMatch![1]!)).not.toHaveProperty('nextCursor')
+    expect(JSON.parse(evidenceMatch![1]!)).not.toHaveProperty('hasMore')
+    expect(JSON.parse(evidenceMatch![1]!)).not.toHaveProperty('nextCursor')
   })
 
   it('filters task authorization before applying the bounded detail sample', async () => {
@@ -1139,22 +1160,29 @@ describe('project dashboard routes', () => {
   it('applies the full explicit lifecycle and restores archived projects to planned', async () => {
     harness = makeHarness()
     as(actor({ role: 'owner' }))
+    // Start active — planned→active is owned by start-gate (covered in project-start-gate tests).
+    // complete is owned by the structural completion gate (not a bare dashboard flip).
+    harness.sqlite.exec(`
+      INSERT INTO projects (id, slug, name, status, goal, created_at, updated_at)
+      VALUES ('lifecycle-child', 'lifecycle-child', 'Lifecycle', 'active', 'Ship', '2026-06-01T00:00:00.000Z', '2026-06-01T00:00:00.000Z');
+      INSERT INTO project_squad_access (project_id, squad_id, access_level, granted_at)
+      VALUES ('lifecycle-child', 'squad-a', 'admin', '2026-06-01T00:00:00.000Z');
+    `)
     const transitions = [
-      ['activate', 'activated', 'active'],
       ['pause', 'paused', 'paused'],
-      ['complete', 'completed', 'completed'],
+      ['activate', 'activated', 'active'],
       ['archive', 'archived', 'archived'],
       ['restore', 'restored', 'planned'],
     ] as const
 
     for (const [command, result, status] of transitions) {
-      const response = await dashboardApp.fetch(projectFormRequest('/projects/visible-child/status', {
+      const response = await dashboardApp.fetch(projectFormRequest('/projects/lifecycle-child/status', {
         command,
       }), envFor(harness))
-      expect(response.status).toBe(303)
-      expect(response.headers.get('location')).toBe(`/projects/visible-child?status=${result}`)
+      expect(response.status, `${command} -> ${status}`).toBe(303)
+      expect(response.headers.get('location')).toBe(`/projects/lifecycle-child?status=${result}`)
       expect(await harness.db.prepare(
-        "SELECT status FROM projects WHERE id = 'visible-child'",
+        "SELECT status FROM projects WHERE id = 'lifecycle-child'",
       ).first()).toEqual({ status })
     }
   })

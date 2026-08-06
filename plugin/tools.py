@@ -7,7 +7,8 @@ the tool constructs CloudflareApiClient from env (MUPOT_CF_API_TOKEN / MUPOT_CF_
 and performs real idempotent provisioning (create D1 + KV).
 
 v0.2 also wires the Worker deploy path: after D1+KV are provisioned, the generated
-wrangler.<slug>.toml is used by `npx wrangler deploy`.  Migration apply follows the
+wrangler.<slug>.toml is deployed through `scripts/deploy.mjs`, which stamps the
+exact release commit. Migration apply follows the
 DRY-RUN-FIRST gate (Risk 2) and is emitted as a gated next_step — NOT auto-run.
 
 v0.3 defers: full Cloudflare Workers SDK upload (no wrangler dep), live BYO-CF
@@ -386,12 +387,12 @@ def mupot_provision(
       - construct CloudflareApiClient from env (if cf_client not injected)
       - idempotently create D1 database + KV namespaces (skip if already exist)
       - write wrangler.<slug>.toml with resolved IDs
-      - if wrangler_deploy=True: run `npx wrangler deploy` (Risk 4)
+      - if wrangler_deploy=True: run the stamped `scripts/deploy.mjs` wrapper (Risk 4)
     Migration apply is NEVER auto-run — emitted as a gated DRY-RUN-FIRST next_step (Risk 2).
 
     wrangler_deploy=False (default): write toml only; emit deploy command in next_steps.
-    wrangler_deploy=True: run `npx wrangler deploy --config wrangler.<slug>.toml` via
-      subprocess after provisioning.  Requires wrangler >= 3.x on PATH.  Worker deploy
+    wrangler_deploy=True: run `node scripts/deploy.mjs --config wrangler.<slug>.toml` via
+      subprocess after provisioning. Requires Node and wrangler >= 3.x on PATH. Worker deploy
       uses the generated toml — MUPOT_CF_API_TOKEN must be in env (Risk 1).
 
     Returns a structured plan/result dict.
@@ -482,7 +483,7 @@ def mupot_provision(
             f"2. Will create KV: mupot-{slug}-sessions  (skipped if already exists)",
             f"3. Will create KV: mupot-{slug}-oauth  (skipped if already exists)",
             f"4. Will write wrangler.{slug}.toml with resolved resource IDs.",
-            f"5. To deploy the worker: npx wrangler deploy --config wrangler.{slug}.toml",
+            f"5. To deploy the worker: node scripts/deploy.mjs --config wrangler.{slug}.toml",
             "6. MIGRATION — DRY-RUN FIRST (Risk 2 drift landmine):\n"
             f"   npx wrangler d1 migrations apply mupot-{slug} --dry-run "
             f"--config wrangler.{slug}.toml\n"
@@ -554,7 +555,7 @@ def _apply_next_steps(
     if not deployed:
         steps.append(
             f"1. Deploy the worker:\n"
-            f"   npx wrangler deploy --config {toml_path}  (Risk 4: needs wrangler >= 3.x)"
+            f"   node scripts/deploy.mjs --config {toml_path}  (Risk 4: needs Node + wrangler >= 3.x)"
         )
     else:
         steps.append("1. Worker deployed (wrangler_deploy=True).")
@@ -583,7 +584,8 @@ def _run_wrangler_deploy(
     _subprocess_run: Any = None,  # injectable for tests
 ) -> dict[str, Any]:
     """
-    Run `npx wrangler deploy --config <toml_path>` via subprocess.
+    Run `node scripts/deploy.mjs --config <toml_path>` via subprocess so every
+    real deployment carries the Git-derived RELEASE_SHA stamp.
 
     Risk 4: wrangler version drift — checks wrangler --version before deploying.
     The CF API token is read by wrangler from the environment (MUPOT_CF_API_TOKEN);
@@ -613,14 +615,17 @@ def _run_wrangler_deploy(
             ),
         }
 
+    repo_root = Path(__file__).resolve().parents[1]
+    deploy_script = repo_root / "scripts" / "deploy.mjs"
     deploy_proc = run(
         # Risk 1: NEVER pass the token on the argv (it would appear in process list).
         # wrangler reads CLOUDFLARE_API_TOKEN from env; MUPOT_CF_API_TOKEN is set by
         # the operator. The caller is responsible for mapping these if names differ.
-        ["npx", "wrangler", "deploy", "--config", str(toml_path)],
+        ["node", str(deploy_script), "--config", str(toml_path.resolve())],
         capture_output=True,
         text=True,
         timeout=120,
+        cwd=repo_root,
     )
     return {
         "ok": deploy_proc.returncode == 0,

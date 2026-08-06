@@ -61,7 +61,7 @@ For users who want to deploy a mupot instance directly:
 - Real apply: CF REST API via pure stdlib urllib (no extra deps) — creates D1 + KV idempotently
 - Idempotent list-guard: paginates all existing resources before creating (no double-create)
 - `wrangler.<slug>.toml` written with resolved D1 + KV IDs after apply
-- Optional `wrangler deploy` via subprocess (Risk 4: version-check gate first)
+- Optional stamped deploy via `scripts/deploy.mjs` subprocess (Risk 4: version-check gate first)
 - Token security: never in argv, repr, error messages, or toml output
 - Brain profile + cron plan emission (real-file cron, not symlink)
 - Deploy-to-Cloudflare button

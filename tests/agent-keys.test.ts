@@ -35,12 +35,12 @@ function fakeEnv(identities: string[], initial?: KeyRow) {
             args.push(...values)
             return stmt
           },
-          async all<T>() {
-            if (!sql.includes('SELECT DISTINCT t.member_id')) throw new Error(`unhandled all: ${sql}`)
-            identityBinds.push([...args])
-            return { results: identities.map((member_id) => ({ member_id })) as T[] }
-          },
           async first<T>() {
+            if (sql.includes('FROM agent_member_bindings')) {
+              identityBinds.push([...args])
+              const member_id = identities[0]
+              return (member_id === undefined ? null : { member_id }) as T | null
+            }
             if (!sql.includes('FROM agent_keys')) throw new Error(`unhandled first: ${sql}`)
             return (
               key && key.tenant === args[0] && key.agent_id === args[1]
@@ -88,7 +88,7 @@ describe('agent public-key registration', () => {
     expect(await isValidEd25519PublicX(null)).toBe(false)
   })
 
-  it('tenant-binds the unique active identity and is idempotent', async () => {
+  it('tenant-binds the canonical identity and is idempotent', async () => {
     const state = fakeEnv(['member-1'])
     expect(await registerAgentPublicKey(state.env, 'runtime-1', 'agent-1', publicX, () => 1234)).toEqual({
       ok: true,
@@ -124,12 +124,9 @@ describe('agent public-key registration', () => {
     expect(state.getKey()?.member_id).toBe('member-1')
   })
 
-  it('refuses unminted, ambiguous, and conflicting registrations', async () => {
+  it('refuses unminted and conflicting registrations', async () => {
     expect(await registerAgentPublicKey(fakeEnv([]).env, 'runtime-1', 'agent-1', publicX)).toEqual({
       ok: false, reason: 'identity_unminted',
-    })
-    expect(await registerAgentPublicKey(fakeEnv(['member-1', 'member-2']).env, 'runtime-1', 'agent-1', publicX)).toEqual({
-      ok: false, reason: 'identity_ambiguous',
     })
     const conflict = fakeEnv(['member-1'], {
       tenant: 'tenant-a', agent_id: 'runtime-1', pubkey: otherPublicX,

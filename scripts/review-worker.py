@@ -77,7 +77,7 @@ Flow per cycle:
                     diff fetch is treated as verdict=RED (fail-closed).
   5. act         -> ALWAYS: append a `review-worker -> <sha>: ...` receipt to
                     the task body (audit trail), record the sha in the local
-                    dedupe state, and best-effort bus-notify kasra.
+                    dedupe state, and best-effort mupot-send notify kasra.
                     REVIEW_AUTOMERGE=0 (default, shipping default): stop here
                     -- task stays in `review` for Kasra-core to task_verdict.
                     REVIEW_AUTOMERGE=1 (off by default): only when ALL of
@@ -905,16 +905,50 @@ def build_receipt(head_sha: str, verdict_obj: dict, sensitive: bool, sensitive_r
     return "\n".join(lines)
 
 
+REPORT_BODY_MAX_CHARS = 60_000
+
+
+def _cap_body(body: str) -> str:
+    """The mupot endpoint rejects oversized requests (HTTP 413), and a lost
+    receipt means the task gets re-processed every cycle. Budget the JSON-
+    ENCODED size (escaping inflates newline-heavy bodies), keep the head
+    (original statement) plus the newest receipts tail, and cut the tail at a
+    receipt boundary so the newest receipt survives complete with its marker."""
+    def encoded_len(s: str) -> int:
+        return len(json.dumps(s).encode())
+
+    if encoded_len(body) <= REPORT_BODY_MAX_CHARS:
+        return body
+    head = body[:4000]
+    tail_budget = REPORT_BODY_MAX_CHARS - encoded_len(head) - 200
+    tail = body[-max(tail_budget // 2, 4000):]
+    while encoded_len(tail) > tail_budget and len(tail) > 1000:
+        tail = tail[len(tail) // 4:]
+    boundary = tail.find("\n---\n")
+    if 0 <= boundary <= len(tail) // 2:
+        tail = tail[boundary:]
+    return (
+        head
+        + "\n\n... [task body truncated: server request cap; newest receipts kept below] ...\n"
+        + tail
+    )
+
+
 def report_review(task: dict, head_sha: str, verdict_obj: dict, sensitive: bool, sensitive_reason: str, mode_note: str) -> None:
     receipt = build_receipt(head_sha, verdict_obj, sensitive, sensitive_reason, mode_note)
     body = f"{task.get('body', '')}\n\n---\n{receipt}"
     # Body-only update: this task is already in `review` and stays there in
     # review-only mode -- status is deliberately NOT touched here.
-    mcp("task_update", {"task_id": task["id"], "body": body})
+    mcp("task_update", {"task_id": task["id"], "body": _cap_body(body)})
 
 
 def notify_kasra(task: dict, pr_meta: dict, verdict_obj: dict, sensitive: bool, automerge_result: dict) -> None:
-    """Best-effort bus ping so Kasra-core sees the recommended verdict. Non-fatal if it fails."""
+    """Best-effort mupot inbox ping with the recommended verdict. Non-fatal if it fails.
+
+    Uses MCP `send` (D1 agent_messages), not the retired SOS Redis bus-send path.
+    Requires an agent-bound token; member-only tokens fail closed here (task body
+    receipt remains the durable audit trail).
+    """
     try:
         automerge_note = "merged" if automerge_result.get("merged") else automerge_result.get("reason", "review-only")
         msg = (
@@ -923,10 +957,8 @@ def notify_kasra(task: dict, pr_meta: dict, verdict_obj: dict, sensitive: bool, 
             f"p0={len(verdict_obj['p0'])} p1={len(verdict_obj['p1'])} "
             f"automerge=[{automerge_note}] -- {pr_meta.get('url', '')}"
         )
-        subprocess.run(
-            ["python3", str(Path.home() / "scripts/bus-send.py"), "kasra", msg],
-            capture_output=True, text=True, timeout=20,
-        )
+        to = os.environ.get("NOTIFY_TO", "kasra")
+        mcp("send", {"to": to, "body": msg})
     except Exception as exc:  # noqa: BLE001 - notify is best-effort
         log(f"notify kasra failed (non-fatal): {exc}")
 

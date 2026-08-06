@@ -1,0 +1,7 @@
+{
+  "_comment": "Test fixture for tests/staleness-check.test.ts — mirrors the shape of pots.manifest.json.",
+  "pots": [
+    { "slug": "current-pot", "config": null, "db": "test", "health": "https://current.example/health" },
+    { "slug": "drifted-pot", "config": null, "db": "test", "health": "https://drifted.example/health" }
+  ]
+}

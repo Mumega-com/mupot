@@ -25,16 +25,22 @@
 
 import type { Capability, CapabilityGrant, Env, BusEvent, Squad } from '../types'
 import { hasCapability } from '../auth/capability'
-import { createDepartment, createSquad, createAgent } from '../org/service'
+import { createDepartment, createSquad, createAgent, findAgentsByName, getAgentProfile } from '../org/service'
 import {
   mintAgentBoundToken,
   isAgentTokenCapability,
-  resolveActiveAgentMember,
-  upsertActiveAgentCapabilityGrant,
+  resolveAgentMemberBinding,
 } from '../members/service'
-import { mcpEndpoint, wakeContractForAgent } from '../dashboard/connect'
+import { revokeMemberToken } from '../members/service'
+import { setAgentSquadAccess, type AgentAccessCapability } from '../members/agent-access'
+import {
+  provisionAgentConnection,
+  type AgentConnectionOutcome,
+} from '../members/agent-connection'
+import { mcpEndpoint, requiredCanonicalOrigin, wakeContractForAgent } from '../dashboard/connect'
 import { createBus } from '../bus'
 import { resolveDepartmentRef, resolveSquadRef, resolveAgentRef } from '../org/resolve'
+import { listAgentTokensQuery, revokeTokenOwnershipQuery } from './token-queries'
 import { isValidEd25519PublicX, registerAgentPublicKey } from '../fleet/agent-keys'
 import { assertWritten, rowsWritten } from '../lib/receipt'
 import {
@@ -47,6 +53,22 @@ import {
 
 const STRING_SCHEMA = { type: 'string' }
 const OPTIONAL_NUMBER_SCHEMA = { type: 'number' }
+const OPTIONAL_STRING_ARRAY_SCHEMA = { type: 'array', items: { type: 'string' } }
+const OPTIONAL_BOOLEAN_SCHEMA = { type: 'boolean' }
+// death_condition is a free-form lifecycle-policy object (validated as JSON in service).
+const PROFILE_OBJECT_SCHEMA = { type: 'object' }
+const AGENT_ACCESS_SCHEMA = {
+  type: 'array',
+  items: {
+    type: 'object',
+    properties: {
+      squad: STRING_SCHEMA,
+      capability: { type: 'string', enum: ['observer', 'member', 'lead', 'admin'] },
+    },
+    required: ['squad', 'capability'],
+    additionalProperties: false,
+  },
+}
 const GRANTABLE_AGENT_CAPABILITIES = new Set<Capability>(['observer', 'member', 'lead', 'admin'])
 
 // Emit an attributed provision event so the activity feed/consumer knows a member
@@ -55,7 +77,7 @@ const GRANTABLE_AGENT_CAPABILITIES = new Set<Capability>(['observer', 'member', 
 async function emitProvisioned(
   env: Env,
   memberId: string,
-  kind: 'department' | 'squad' | 'agent' | 'token' | 'key' | 'capability' | 'agent_deactivated',
+  kind: 'department' | 'squad' | 'agent' | 'token' | 'token_revoked' | 'key' | 'capability' | 'agent_deactivated',
   id: string,
   extra: { squad_id?: string; agent_id?: string; member_id?: string; capability?: Capability; reason?: string } = {},
 ): Promise<void> {
@@ -218,7 +240,7 @@ const toolCreateAgent: ToolSpec = {
   scope: 'squad',
   min: 'lead',
   args:
-    '{ squad: string (id|slug), slug: string, name: string, role?, model?, okr?, kpi_target?, effort?, autonomy?, budget_cap_cents?, budget_window? }',
+    '{ squad: string (id|slug), slug: string, name: string, role?, model?, okr?, kpi_target?, effort?, autonomy?, budget_cap_cents?, budget_window?, purpose?, owner?, model_fallback?, capabilities?: string[], skills?: string[], parent_agent_id?, qnft_ref?, death_condition?: object }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -233,6 +255,15 @@ const toolCreateAgent: ToolSpec = {
       autonomy: STRING_SCHEMA,
       budget_cap_cents: OPTIONAL_NUMBER_SCHEMA,
       budget_window: STRING_SCHEMA,
+      // profile (0068, Port 1.3)
+      purpose: STRING_SCHEMA,
+      owner: STRING_SCHEMA,
+      model_fallback: STRING_SCHEMA,
+      capabilities: OPTIONAL_STRING_ARRAY_SCHEMA,
+      skills: OPTIONAL_STRING_ARRAY_SCHEMA,
+      parent_agent_id: STRING_SCHEMA,
+      qnft_ref: STRING_SCHEMA,
+      death_condition: PROFILE_OBJECT_SCHEMA,
     },
     required: ['squad', 'slug', 'name'],
     additionalProperties: false,
@@ -262,6 +293,15 @@ const toolCreateAgent: ToolSpec = {
       autonomy: args.autonomy,
       budget_cap_cents: args.budget_cap_cents,
       budget_window: args.budget_window,
+      // profile (0068, Port 1.3)
+      purpose: args.purpose,
+      owner: args.owner,
+      model_fallback: args.model_fallback,
+      capabilities: args.capabilities,
+      skills: args.skills,
+      parent_agent_id: args.parent_agent_id,
+      qnft_ref: args.qnft_ref,
+      death_condition: args.death_condition,
     })
     if (!result.ok) return createErrorToFail(result.error)
     await emitProvisioned(env, auth.memberId as string, 'agent', result.value.id, {
@@ -269,6 +309,82 @@ const toolCreateAgent: ToolSpec = {
       agent_id: result.value.id,
     })
     return done({ agent: result.value })
+  },
+}
+
+// ── resolve_agent ───────────────────────────────────────────────────────────────
+// resolve-before-mint (Port 1.3): before minting a new agent, search existing agents
+// by name/slug across the whole pot so onboarding SEES the roles that already exist
+// and doesn't fork a duplicate identity. This is the anti-sprawl primitive — the
+// 2026-07-21 3-hermes incident (agent-hermes + kayhermes + hadi-hermes, distinct
+// roles, retired as "duplicates") is exactly what pot-wide resolve prevents.
+//
+// Scope: observer FLOOR (not 'authenticated'). Deliberately pot-wide (not caller-
+// squad-scoped): the sprawl this fixes spans squads, so a squad-scoped search would
+// miss the case. Agents live in a single-tenant pot (the `agents` table has no tenant
+// column — one pot = one tenant), so this discloses no cross-tenant data, only agent
+// metadata (name/role/purpose/model/capabilities/lineage). It is min:'observer', NOT
+// 'authenticated': `min:'authenticated'` would SKIP the AAGATE capability floor
+// (src/mcp/index.ts) and let a ZERO-GRANT OAuth member enumerate the whole pot's agent
+// inventory — a broadening a grantless token should not have (cursor gate,
+// 2026-07-22; the earlier "presence-roster parity" claim was wrong — a grantless
+// member never gets the roster either). 'observer' requires the caller hold observer
+// on SOME scope, enforced centrally at the dispatch chokepoint.
+const toolResolveAgent: ToolSpec = {
+  name: 'resolve_agent',
+  scope: 'org (read)',
+  min: 'observer',
+  args: '{ query: string, include_inactive?: boolean, limit?: number }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      query: STRING_SCHEMA,
+      include_inactive: OPTIONAL_BOOLEAN_SCHEMA,
+      limit: OPTIONAL_NUMBER_SCHEMA,
+    },
+    required: ['query'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    if (!auth.memberId) return fail(403, 'unauthenticated')
+    const query = str(args.query)
+    if (!query) return fail(400, 'invalid_args', 'query required')
+    const includeInactive = args.include_inactive === true
+    let limit: number | undefined
+    if (args.limit !== undefined) {
+      if (typeof args.limit !== 'number' || !Number.isFinite(args.limit)) {
+        return fail(400, 'invalid_args', 'limit must be a number')
+      }
+      limit = args.limit
+    }
+    const matches = await findAgentsByName(env, query, { includeInactive, limit })
+    return done({ matches })
+  },
+}
+
+// ── get_agent_profile ───────────────────────────────────────────────────────────
+// Read one agent's full profile by id. Same pot-internal, metadata-only disclosure
+// rationale as resolve_agent above — and the same observer FLOOR: min:'observer' so
+// the AAGATE capability floor rejects a zero-grant member (min:'authenticated' would
+// skip it). cursor gate, 2026-07-22.
+const toolGetAgentProfile: ToolSpec = {
+  name: 'get_agent_profile',
+  scope: 'org (read)',
+  min: 'observer',
+  args: '{ agent_id: string }',
+  inputSchema: {
+    type: 'object',
+    properties: { agent_id: STRING_SCHEMA },
+    required: ['agent_id'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    if (!auth.memberId) return fail(403, 'unauthenticated')
+    const agentId = str(args.agent_id)
+    if (!agentId) return fail(400, 'invalid_args', 'agent_id required')
+    const profile = await getAgentProfile(env, agentId)
+    if (!profile) return fail(404, 'agent_not_found')
+    return done({ profile })
   },
 }
 
@@ -288,7 +404,8 @@ const toolMintAgentToken: ToolSpec = {
     required: ['agent'],
     additionalProperties: false,
   },
-  async run(auth, env, args, ctx) {
+  async run(auth, env, args, _ctx) {
+    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
     const agentRef = str(args.agent)
     if (!agentRef) return fail(400, 'invalid_args', 'agent required')
 
@@ -313,9 +430,13 @@ const toolMintAgentToken: ToolSpec = {
       return fail(400, 'invalid_capability', 'capability must be observer or member')
     }
 
+    const canonical = requiredCanonicalOrigin(env)
+    if (!canonical.ok) return fail(503, canonical.error)
+
     // Delegate to the shared atomic-mint helper (members/service.ts).
-    // Three rows in ONE D1 batch: member envelope + escalation-guard capability +
-    // agent-weld token. Either all three land or none do — no orphan credentials.
+    // A first mint atomically creates the member envelope, canonical binding,
+    // home capability, and agent-weld token; later mints add only the token.
+    // Either the complete mint lands or none of it does — no orphan credentials.
     // The helper enforces: squad-scoped observer/member only, hash-only storage,
     // show-once raw.
     const minted = await mintAgentBoundToken(env, agent, label, grantCapability)
@@ -344,10 +465,320 @@ const toolMintAgentToken: ToolSpec = {
         raw: minted.raw,
       },
       agent: { id: agent.id, slug: agent.slug, name: agent.name },
-      mcp_endpoint: mcpEndpoint(ctx.origin),
-      wake_contract: wakeContractForAgent(agent.id, agent.squad_id, env.TENANT_SLUG, ctx.origin),
+      mcp_endpoint: mcpEndpoint(canonical.origin),
+      wake_contract: wakeContractForAgent(
+        agent.id,
+        agent.squad_id,
+        env.TENANT_SLUG,
+        canonical.origin,
+      ),
       note: 'raw token is shown ONCE — store it now; it is never retrievable again',
     })
+  },
+}
+
+// ── token lifecycle: list + revoke ────────────────────────────────────────────
+//
+// mupot#682. mint_agent_token existed with NO counterpart: the pot could ISSUE a
+// credential through its own surface but not SEE or WITHDRAW one. Cleaning up four
+// tokens I had minted on 2026-08-05 required dropping to raw D1 — i.e. the product
+// could not operate its own credential lifecycle, which is the exact failure the
+// standing goal names ("an agent can join, work, and be trusted on mupot without a
+// human debugging it").
+//
+// Revoke is gated identically to mint (admin on the agent's squad, operator principal
+// only). Withdrawing a credential must never be HARDER than issuing one, or the safe
+// action becomes the inconvenient one and people leave credentials live.
+
+const toolListAgentTokens: ToolSpec = {
+  name: 'list_agent_tokens',
+  scope: "agent's squad",
+  min: 'admin',
+  args: '{ agent: string (id|slug), include_revoked?: boolean }',
+  inputSchema: {
+    type: 'object',
+    properties: { agent: STRING_SCHEMA, include_revoked: { type: 'boolean' } },
+    required: ['agent'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args, _ctx) {
+    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
+    const agentRef = str(args.agent)
+    if (!agentRef) return fail(400, 'invalid_args', 'agent required')
+
+    const agentResult = await resolveAgentRef(env, agentRef)
+    if (!agentResult.ok) return resolveFail(agentResult.reason, 'agent_not_found')
+    const agent = agentResult.value
+
+    const grants = auth.capabilities ?? []
+    if (!(await memberCanOnSquad(env, grants, agent.squad_id, 'admin'))) {
+      return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
+    }
+
+    const includeRevoked = args.include_revoked === true
+    // NEVER select token_hash. There is no path from this tool to a usable secret —
+    // raw is show-once at mint and is not stored.
+    const rows = await env.DB.prepare(
+      listAgentTokensQuery(includeRevoked),
+    )
+      .bind(agent.id, env.TENANT_SLUG)
+      .all<{ id: string; member_id: string; label: string; channel: string; created_at: string; revoked_at: string | null }>()
+
+    // Project EXPLICITLY in code, not only in the SQL above. Relying on the SELECT list
+    // means a later "SELECT *" — or a helper that widens the query — silently leaks
+    // token_hash through this tool, and no test that asserts on happy-path fields would
+    // notice. The allow-list here is the actual guarantee; the SQL projection is an
+    // optimisation on top of it.
+    const tokens = (rows.results ?? []).map((t) => ({
+      id: t.id,
+      member_id: t.member_id,
+      label: t.label,
+      channel: t.channel,
+      created_at: t.created_at,
+      revoked_at: t.revoked_at,
+    }))
+    return done({
+      agent: { id: agent.id, slug: agent.slug, name: agent.name },
+      tokens,
+      live_count: tokens.filter((t) => !t.revoked_at).length,
+    })
+  },
+}
+
+const toolRevokeAgentToken: ToolSpec = {
+  name: 'revoke_agent_token',
+  scope: "agent's squad",
+  min: 'admin',
+  args: '{ agent: string (id|slug), token_id: string }',
+  inputSchema: {
+    type: 'object',
+    properties: { agent: STRING_SCHEMA, token_id: STRING_SCHEMA },
+    required: ['agent', 'token_id'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args, _ctx) {
+    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
+    const agentRef = str(args.agent)
+    const tokenId = str(args.token_id)
+    if (!agentRef) return fail(400, 'invalid_args', 'agent required')
+    if (!tokenId) return fail(400, 'invalid_args', 'token_id required')
+
+    const agentResult = await resolveAgentRef(env, agentRef)
+    if (!agentResult.ok) return resolveFail(agentResult.reason, 'agent_not_found')
+    const agent = agentResult.value
+
+    const grants = auth.capabilities ?? []
+    if (!(await memberCanOnSquad(env, grants, agent.squad_id, 'admin'))) {
+      return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
+    }
+
+    // The token must belong to THIS agent. Without this, admin on squad A could revoke
+    // a token welded to an agent on squad B by guessing its id — authorization would be
+    // checked against the agent the caller NAMED rather than the one that actually owns
+    // the credential.
+    const row = await env.DB.prepare(
+      revokeTokenOwnershipQuery(),
+    )
+      .bind(tokenId, env.TENANT_SLUG)
+      .first<{ id: string; member_id: string; agent_id: string | null; label: string; revoked_at: string | null }>()
+
+    if (!row || row.agent_id !== agent.id) {
+      // Same 404 whether the token is absent or belongs elsewhere — do not turn this
+      // into an oracle for token ids on other squads.
+      return fail(404, 'token_not_found', `No token "${tokenId}" belongs to agent "${agent.slug}".`)
+    }
+
+    // Idempotent: revoking an already-revoked token succeeds and reports revoked:false.
+    const revoked = await revokeMemberToken(env, row.member_id, tokenId)
+
+    await emitProvisioned(env, auth.memberId as string, 'token_revoked', tokenId, {
+      squad_id: agent.squad_id,
+      agent_id: agent.id,
+      member_id: row.member_id,
+    })
+
+    return done({
+      token: { id: tokenId, label: row.label, agent_id: agent.id },
+      revoked,
+      already_revoked: !revoked,
+      note: revoked
+        ? 'Token revoked. It fails authentication immediately — grants are re-resolved per request.'
+        : 'Token was already revoked; no change.',
+    })
+  },
+}
+
+function connectionErrorToFail(outcome: Extract<AgentConnectionOutcome, { status: 'error' }>) {
+  const code = outcome.error
+  if (code === 'forbidden' || code === 'capability_ceiling') {
+    return fail(403, code, outcome.details)
+  }
+  if (code === 'agent_not_found' || code === 'squad_not_found') {
+    return fail(404, code)
+  }
+  if (code === 'public_origin_unconfigured') return fail(503, code)
+  if (
+    code === 'request_id_conflict'
+    || code === 'agent_setup_in_progress'
+    || code === 'ambiguous_slug'
+    || code === 'agent_already_connected'
+    || code === 'agent_identity_conflict'
+    || code === 'agent_identity_unminted'
+    || code === 'replace_token_not_found'
+    || code === 'slug_taken'
+  ) {
+    return fail(409, code)
+  }
+  if (code === 'provisioning_failed' || code === 'receipt_not_found') {
+    return fail(500, code)
+  }
+  return fail(400, code, outcome.details)
+}
+
+// ── provision_agent_connection ───────────────────────────────────────────────
+// High-level, retry-safe owner workflow. This is the only surface that composes
+// reservation + optional create + canonical identity + synchronized access +
+// credential + immutable receipt into one provisioning transaction.
+const toolProvisionAgentConnection: ToolSpec = {
+  name: 'provision_agent_connection',
+  scope: 'home and additional squads',
+  min: 'admin',
+  args:
+    '{ request_id, existing_agent XOR new_agent, additional_access?, credential }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      request_id: STRING_SCHEMA,
+      existing_agent: STRING_SCHEMA,
+      new_agent: {
+        type: 'object',
+        properties: {
+          home_squad: STRING_SCHEMA,
+          slug: STRING_SCHEMA,
+          name: STRING_SCHEMA,
+          role: STRING_SCHEMA,
+          model: STRING_SCHEMA,
+        },
+        required: ['home_squad', 'slug', 'name'],
+        additionalProperties: false,
+      },
+      additional_access: AGENT_ACCESS_SCHEMA,
+      credential: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', enum: ['issue_if_missing', 'add', 'replace'] },
+          label: STRING_SCHEMA,
+          home_capability: { type: 'string', enum: ['observer', 'member'] },
+          replace_token_id: STRING_SCHEMA,
+        },
+        required: ['action'],
+        additionalProperties: false,
+      },
+    },
+    required: ['request_id', 'credential'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
+    const requestId = str(args.request_id)
+    const existingRef = str(args.existing_agent)
+    const newAgent = args.new_agent
+    if (!requestId || Boolean(existingRef) === Boolean(newAgent)) {
+      return fail(400, 'invalid_args', 'provide request_id and exactly one of existing_agent or new_agent')
+    }
+    if (!auth.memberId) return fail(403, 'forbidden', { need: 'member_identity' })
+
+    let target: Parameters<typeof provisionAgentConnection>[2]['target']
+    if (existingRef) {
+      const resolved = await resolveAgentRef(env, existingRef)
+      if (!resolved.ok) return resolveFail(resolved.reason, 'agent_not_found')
+      target = { kind: 'existing', agentRef: resolved.value.id }
+    } else {
+      if (!newAgent || typeof newAgent !== 'object' || Array.isArray(newAgent)) {
+        return fail(400, 'invalid_args', 'new_agent must be an object')
+      }
+      const value = newAgent as Record<string, unknown>
+      const homeSquadRef = str(value.home_squad)
+      const slug = str(value.slug)
+      const name = str(value.name)
+      if (!homeSquadRef || !slug || !name) {
+        return fail(400, 'invalid_args', 'new_agent.home_squad, slug, and name are required')
+      }
+      const homeSquad = await resolveSquadRef(env, homeSquadRef)
+      if (!homeSquad.ok) return resolveFail(homeSquad.reason, 'squad_not_found')
+      target = {
+        kind: 'new',
+        homeSquadId: homeSquad.value.id,
+        agent: {
+          slug,
+          name,
+          ...(str(value.role) ? { role: str(value.role) } : {}),
+          ...(str(value.model) ? { model: str(value.model) } : {}),
+        },
+      }
+    }
+
+    const additionalArgs = args.additional_access ?? []
+    if (!Array.isArray(additionalArgs)) {
+      return fail(400, 'invalid_args', 'additional_access must be an array')
+    }
+    const additionalAccess: Parameters<typeof provisionAgentConnection>[2]['additionalAccess'] = []
+    for (const entry of additionalArgs) {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+        return fail(400, 'invalid_args', 'additional_access entries must be objects')
+      }
+      const value = entry as Record<string, unknown>
+      const squadRef = str(value.squad)
+      const capability = str(value.capability)
+      if (
+        !squadRef
+        || !capability
+        || !GRANTABLE_AGENT_CAPABILITIES.has(capability as Capability)
+      ) {
+        return fail(400, 'invalid_args', 'invalid additional squad or capability')
+      }
+      const squad = await resolveSquadRef(env, squadRef)
+      if (!squad.ok) return resolveFail(squad.reason, 'squad_not_found')
+      additionalAccess.push({
+        squadId: squad.value.id,
+        capability: capability as AgentAccessCapability,
+      })
+    }
+
+    const credentialArg = args.credential
+    if (!credentialArg || typeof credentialArg !== 'object' || Array.isArray(credentialArg)) {
+      return fail(400, 'invalid_args', 'credential must be an object')
+    }
+    const credential = credentialArg as Record<string, unknown>
+    const action = str(credential.action)
+    if (!action || !['issue_if_missing', 'add', 'replace'].includes(action)) {
+      return fail(400, 'invalid_args', 'invalid credential action')
+    }
+
+    const outcome = await provisionAgentConnection(env, {
+      kind: 'member',
+      id: auth.memberId,
+      grants: auth.capabilities ?? [],
+    }, {
+      requestId,
+      target,
+      additionalAccess,
+      credential: {
+        action: action as 'issue_if_missing' | 'add' | 'replace',
+        label: str(credential.label)
+          ?? (target.kind === 'new' ? String(target.agent.slug) : 'workspace'),
+        ...(str(credential.home_capability)
+          ? { homeCapability: str(credential.home_capability) as 'observer' | 'member' }
+          : {}),
+        ...(str(credential.replace_token_id)
+          ? { replaceTokenId: str(credential.replace_token_id) as string }
+          : {}),
+      },
+    })
+
+    if (outcome.status === 'error') return connectionErrorToFail(outcome)
+    if (outcome.status === 'in_progress') return fail(409, 'agent_setup_in_progress')
+    return done(outcome)
   },
 }
 
@@ -370,6 +801,7 @@ const toolGrantAgentCapability: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
+    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
     const agentRef = str(args.agent)
     if (!agentRef) return fail(400, 'invalid_args', 'agent required')
     const squadRef = str(args.squad)
@@ -396,44 +828,34 @@ const toolGrantAgentCapability: ToolSpec = {
       return fail(403, 'cannot_grant_above_own_rank')
     }
 
-    const agentMemberId = await resolveActiveAgentMember(env, agent.id)
-    if (agentMemberId === 'unminted') {
+    const binding = await resolveAgentMemberBinding(env, agent.id)
+    if (binding.kind === 'unminted') {
       return fail(409, 'agent_identity_unminted', 'call mint_agent_token before granting capabilities')
     }
-    if (agentMemberId === 'ambiguous') {
-      return fail(409, 'agent_identity_ambiguous', 'revoke stale agent tokens until one active member identity remains')
-    }
 
-    const outcome = await upsertActiveAgentCapabilityGrant(env, {
+    const outcome = await setAgentSquadAccess(env, {
       agentId: agent.id,
-      expectedMemberId: agentMemberId,
+      memberId: binding.memberId,
       squadId: squad.id,
-      capability,
+      capability: capability as AgentAccessCapability,
     })
-    if (!outcome) {
-      const currentIdentity = await resolveActiveAgentMember(env, agent.id)
-      if (currentIdentity === 'unminted') {
-        return fail(409, 'agent_identity_unminted', 'call mint_agent_token before granting capabilities')
-      }
-      if (currentIdentity === 'ambiguous') {
-        return fail(409, 'agent_identity_ambiguous', 'revoke stale agent tokens until one active member identity remains')
-      }
-      if (currentIdentity === agentMemberId) {
-        return fail(500, 'receipt_failed', 'capability grant returned no write receipt')
-      }
-      return fail(409, 'agent_identity_changed', 'agent member binding changed; retry the grant')
+    if (!outcome.ok) {
+      if (outcome.error === 'agent_not_found') return fail(404, outcome.error)
+      if (outcome.error === 'squad_not_found') return fail(404, outcome.error)
+      if (outcome.error === 'receipt_failed') return fail(500, outcome.error)
+      return fail(409, outcome.error)
     }
     await emitProvisioned(env, auth.memberId as string, 'capability', squad.id, {
       squad_id: squad.id,
       agent_id: agent.id,
-      member_id: agentMemberId,
+      member_id: binding.memberId,
       capability,
     })
 
     return done({
       agent: { id: agent.id },
       squad: { id: squad.id },
-      member_id: agentMemberId,
+      member_id: binding.memberId,
       grant: outcome.grant,
       result: outcome.result,
     })
@@ -641,7 +1063,12 @@ export const PROVISION_TOOLS: ToolSpec[] = [
   toolCreateDepartment,
   toolCreateSquad,
   toolCreateAgent,
+  toolResolveAgent,
+  toolGetAgentProfile,
   toolMintAgentToken,
+  toolListAgentTokens,
+  toolRevokeAgentToken,
+  toolProvisionAgentConnection,
   toolGrantAgentCapability,
   toolRegisterAgentKey,
   toolDeactivateAgent,
