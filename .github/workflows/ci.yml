@@ -155,6 +155,13 @@ jobs:
       # list of migration files is a schema the author invented — it executes real SQL
       # against a database production does not have, which is how #684 stayed green.
       # The baseline may shrink, never grow.
+      # Self-tests FIRST. The guard shipped without any, and the class it was missing
+      # (a hand-written SQL engine, #720) was found by an adversarial review of someone
+      # else's PR rather than by the guard. Each case here is a mutation that was
+      # reproduced against a previous version — including two where the suite passed for
+      # the wrong reason. A gate with no tests is the shape this gate exists to reject.
+      - name: Ratchet self-tests
+        run: node --test tests/test-schema-source.test.mjs
       - name: Guard — tests must build schema from the migration chain
         run: node scripts/check-test-schema-source.mjs
 
