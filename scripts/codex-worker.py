@@ -102,6 +102,47 @@ def git(*args: str, cwd: Path | None = None, check: bool = True) -> subprocess.C
     )
 
 
+CODE_SUFFIXES = (".ts", ".tsx", ".mts", ".cts", ".js", ".mjs", ".cjs", ".jsx", ".json", ".sql")
+BODY_MAX_CHARS = 60_000
+
+
+def _link_node_modules(worktree: Path) -> None:
+    """Fresh worktrees share the repo's .git but NOT node_modules, so `npx tsc`
+    resolves the wrong package ("This is not the tsc command you are looking
+    for") and verify fails on every task. Symlink the repo's install into the
+    worktree; skip silently if the repo has none."""
+    src = (REPO / "node_modules").resolve()
+    dst = worktree / "node_modules"
+    if src.is_dir() and not dst.exists():
+        dst.symlink_to(src)
+
+
+def _cap_body(body: str) -> str:
+    """The mupot endpoint rejects oversized requests (HTTP 413), and a lost
+    receipt means the task gets re-processed every cycle. Budget the JSON-
+    ENCODED size (escaping inflates newline-heavy bodies), keep the head
+    (original statement) plus the newest receipts tail, and cut the tail at a
+    receipt boundary so the newest receipt survives complete with its marker."""
+    def encoded_len(s: str) -> int:
+        return len(json.dumps(s).encode())
+
+    if encoded_len(body) <= BODY_MAX_CHARS:
+        return body
+    head = body[:4000]
+    tail_budget = BODY_MAX_CHARS - encoded_len(head) - 200
+    tail = body[-max(tail_budget // 2, 4000):]
+    while encoded_len(tail) > tail_budget and len(tail) > 1000:
+        tail = tail[len(tail) // 4:]
+    boundary = tail.find("\n---\n")
+    if 0 <= boundary <= len(tail) // 2:
+        tail = tail[boundary:]
+    return (
+        head
+        + "\n\n... [task body truncated: server request cap; newest receipts kept below] ...\n"
+        + tail
+    )
+
+
 def register_presence() -> None:
     """Best-effort Port-1 self-registration; idempotent upsert, never fatal.
 
@@ -166,6 +207,11 @@ def verify(worktree: Path, branch: str) -> tuple[bool, str]:
     commits = git("log", "main..HEAD", "--oneline", cwd=worktree, check=False).stdout.strip()
     if not commits:
         return False, "no commits — codex produced no work"
+    status_out = git("diff", "--name-status", "-M", "main..HEAD", cwd=worktree, check=False).stdout
+    changed = [f for line in status_out.splitlines() for f in line.split("\t")[1:]]
+    if changed and not any(f.endswith(CODE_SUFFIXES) for f in changed):
+        return True, f"docs-only diff — tsc skipped\ncommits:\n{commits}"
+    _link_node_modules(worktree)
     tsc = subprocess.run(["npx", "tsc", "--noEmit"], cwd=str(worktree), capture_output=True, text=True)
     if tsc.returncode != 0:
         return False, f"tsc errors:\n{tsc.stdout[-1500:]}{tsc.stderr[-500:]}"
@@ -198,12 +244,12 @@ def deliver(worktree: Path, branch: str, task: dict) -> str:
 
 def report_review(task: dict, pr_url: str, note: str) -> None:
     body = f"{task.get('body','')}\n\n---\ncodex loop -> review. PR: {pr_url}\n{note}"
-    mcp("task_update", {"task_id": task["id"], "status": "review", "gate_owner": GATE_OWNER, "body": body})
+    mcp("task_update", {"task_id": task["id"], "status": "review", "gate_owner": GATE_OWNER, "body": _cap_body(body)})
 
 
 def report_blocked(task: dict, reason: str) -> None:
     body = f"{task.get('body','')}\n\n---\ncodex loop BLOCKED: {reason}"
-    mcp("task_update", {"task_id": task["id"], "status": "blocked", "body": body})
+    mcp("task_update", {"task_id": task["id"], "status": "blocked", "body": _cap_body(body)})
 
 
 def run_task(task: dict) -> None:
@@ -219,6 +265,7 @@ def run_task(task: dict) -> None:
     mcp("task_update", {"task_id": tid, "status": "in_progress"})
     WORKTREE_ROOT.mkdir(parents=True, exist_ok=True)
     git("worktree", "add", "-b", branch, str(worktree), "main")
+    _link_node_modules(worktree)
     try:
         proc = codex_run(worktree, build_brief(task, worktree, branch))
         log(f"codex exit {proc.returncode}; output tail:\n{(proc.stdout or '')[-800:]}")
@@ -259,6 +306,16 @@ def main() -> int:
         log(f"no codex token at {CODEX_TOKEN_PATH}")
         return 2
     register_presence()
+    try:
+        stuck = mcp("task_list", {"assignee_agent_id": CODEX_AGENT_ID, "status": "in_progress", "limit": 5}).get("tasks", [])
+        for s_task in stuck:
+            log(
+                f"WARNING orphaned in_progress task {s_task['id'][:8]} "
+                f"({s_task.get('title', '')[:50]}) — likely a SIGTERMed dispatch; the status "
+                f"machine has no requeue transition, re-issue it manually"
+            )
+    except Exception:  # noqa: BLE001 - orphan check is advisory, never fatal
+        pass
     tasks = poll_open_tasks()
     log(f"{len(tasks)} open task(s) assigned to codex")
     for task in tasks:
