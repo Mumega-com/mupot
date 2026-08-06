@@ -97,6 +97,28 @@ export function presenceTtlSec(env: Env): number {
 /** Pure liveness derivation. `lastReportedAt` is the SQLite UTC stamp 'YYYY-MM-DD HH:MM:SS'
  *  (written via datetime('now')). An unparseable/empty stamp is treated as NOT live (fail to
  *  stale, never to live). A future-dated stamp (clock skew) is still within TTL → live. */
+/**
+ * Parse either timestamp format this database stores, because it stores TWO.
+ *
+ *   fleet_agents.last_reported_at   'YYYY-MM-DD HH:MM:SS'      (SQLite datetime('now'))
+ *   module_registry.last_heartbeat  '2026-08-06T03:51:26.358Z' (ISO-8601, JS toISOString)
+ *
+ * The original did `Date.parse(s.replace(' ', 'T') + 'Z')`, which is correct for the SQLite
+ * shape and produces `...358ZZ` → NaN for the ISO one. NaN meant 'stale', so EVERY
+ * module_registry row read as stale — which silently defeated the whole either-surface fix in
+ * #734: it was merged, deployed, and changed nothing in production.
+ *
+ * It was invisible because the tests INVENTED the module timestamps in SQLite format. Real
+ * SQL against the real schema was not enough — the fixture made up the DATA shape, so the
+ * suite proved the code agreed with my belief rather than with production.
+ */
+export function parseStamp(stamp: string): number {
+  // Already ISO (has 'T', or an explicit zone) — parse as-is.
+  if (stamp.includes('T') || /[Zz]$|[+-]\d{2}:?\d{2}$/.test(stamp)) return Date.parse(stamp)
+  // SQLite 'YYYY-MM-DD HH:MM:SS' is UTC by convention here.
+  return Date.parse(stamp.replace(' ', 'T') + 'Z')
+}
+
 export function derivePresence(
   status: string,
   lastReportedAt: string,
@@ -105,7 +127,7 @@ export function derivePresence(
 ): Presence {
   if (status === 'stopped') return 'offline'
   if (!lastReportedAt) return 'stale'
-  const t = Date.parse(lastReportedAt.replace(' ', 'T') + 'Z')
+  const t = parseStamp(lastReportedAt)
   if (Number.isNaN(t)) return 'stale'
   const ageSec = (nowMs - t) / 1000
   return ageSec <= ttlSec ? 'live' : 'stale'
@@ -489,8 +511,17 @@ export async function getFleetAgentRuntimeStates(
     // agent must carry one or the fix would be inert. The adapter IS the runtime kind
     // ('claude-code', 'codex', …) — the same vocabulary fleet_agents.runtime uses.
     const runtime = String(row?.runtime ?? '') || (mod?.adapter ?? '')
+    // Compare by PARSED TIME, not by string. The two columns use different formats, and
+    // ' ' (0x20) sorts before 'T' (0x54), so a lexical compare reports an ISO stamp as newer
+    // than a SQLite stamp on the same date — even when it is a full day older:
+    //   '2026-08-06T00:00:01.000Z' > '2026-08-06 23:59:59'  ->  true, and wrong.
+    // Display-only today, but a wrong "last seen" is exactly what sends the next person
+    // looking in the wrong place. (Athena, residual on #735.)
     const fleetLastSeen = String(row?.last_reported_at ?? '')
-    const lastSeen = mod && (!fleetLastSeen || mod.lastSeen > fleetLastSeen) ? mod.lastSeen : fleetLastSeen
+    const modIsNewer = mod
+      ? (!fleetLastSeen || (parseStamp(mod.lastSeen) || 0) > (parseStamp(fleetLastSeen) || 0))
+      : false
+    const lastSeen = modIsNewer && mod ? mod.lastSeen : fleetLastSeen
 
     resolved.set(agent.agent_id, {
       agent_id: row?.agent_id ?? agent.agent_id,
