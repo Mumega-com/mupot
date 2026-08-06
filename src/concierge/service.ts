@@ -322,10 +322,21 @@ async function routeUnassignedWork(
   // unattended assignee-writer here would smuggle untrusted content straight into a model
   // turn (the exact auto-dispatch #404 blocked). The router is an unattended writer, so it
   // MUST carry the same `source_pot IS NULL` invariant.
+  //
+  // PR #659 P0 fix (diverse-model adversarial gate BLOCK): this WHERE clause was a
+  // character-for-character description of a Linear-imported task (open, unassigned,
+  // source_pot NULL) before migrations/0077 added external_source. This is the second of
+  // the two status-polling read paths the gate found bypassing skipEvent/skipMirror — the
+  // maintenance cron (src/index.ts) calls this on a fixed tick regardless of any bus
+  // event, so a Linear-origin task got auto-assigned (and, via classifyTaskRoleEffort
+  // reading its attacker-controlled title/body, routed to a specific agent CLASS) on the
+  // very next tick with zero human step. external_source IS NULL closes it the same way
+  // source_pot IS NULL already does for cross-pot tasks.
   const rows = await env.DB.prepare(
     `SELECT id, squad_id, title, body FROM tasks
       WHERE project_id = ?1 AND status = 'open' AND assignee_agent_id IS NULL
         AND source_pot IS NULL
+        AND external_source IS NULL
       ORDER BY created_at ASC
       LIMIT ?2`,
   )
