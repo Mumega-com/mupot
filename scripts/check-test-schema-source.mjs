@@ -50,15 +50,25 @@
 
 import { readFileSync, readdirSync, statSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
-import { join, relative } from 'node:path'
+import { join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const ROOT = join(fileURLToPath(new URL('.', import.meta.url)), '..')
 const TESTS_DIR = join(ROOT, 'tests')
 const BASELINE_PATH = join(ROOT, 'scripts', 'test-schema-source-baseline.json')
 
-/** Files that build a schema by hand and still import production code. Only ever shrinks. */
-const baseline = new Set(JSON.parse(readFileSync(BASELINE_PATH, 'utf8')).files)
+// TWO violating classes, TWO baselines, each shrink-only and each compared independently.
+//
+//   files   — real SQL engine, hand-built schema (the original rule, #703/#711)
+//   mockDb  — no SQL engine at all: a D1-shaped object literal that string-matches SQL
+//
+// Independent because a summed count lets one class grow while the other shrinks, which is
+// the non-growth pin defeating itself. (#720, found by the adversarial gate on #719.)
+const CLASSES = ['files', 'mockDb']
+const baselineFile = JSON.parse(readFileSync(BASELINE_PATH, 'utf8'))
+const baselines = Object.fromEntries(
+  CLASSES.map((c) => [c, new Set(baselineFile[c] ?? [])]),
+)
 
 /**
  * MECHANICAL NON-GROWTH PIN.
@@ -96,9 +106,48 @@ function baselineSizeOnTarget() {
     const raw = execFileSync('git', ['show', `${ref}:scripts/test-schema-source-baseline.json`], {
       cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
     })
-    return { state: 'compared', size: JSON.parse(raw).files.length }
+    const parsed = JSON.parse(raw)
+    // Per class, and ABSENT is distinguished from EMPTY:
+    //   key missing on target -> that class did not exist yet -> bootstrap, seed it once
+    //   key present (even [])  -> constrained, may only shrink
+    //
+    // The seeding path is not a bypass, and does not need to be trusted: deleting a class
+    // key from the baseline to "re-seed" it makes every file in that class a NEW offender
+    // in the very same run, because the in-PR baseline for it is empty. The escape hatch
+    // fails closed on use.
+    return {
+      state: 'compared',
+      sizes: Object.fromEntries(
+        CLASSES.map((c) => [c, Array.isArray(parsed[c]) ? parsed[c].length : null]),
+      ),
+    }
   } catch {
     return { state: 'bootstrap' }
+  }
+}
+
+/**
+ * Files that exist on the merge target, or null if it cannot be read.
+ *
+ * WHY: the non-growth pin is INERT while a class is being seeded (there is no number on the
+ * target to compare against), so during that one PR a brand-new violator can ride in
+ * alongside the legitimate pre-existing debt and be indistinguishable from it. Measured, not
+ * theorised: mutation M2 on this very change appended a new violating test to the seeding
+ * list and the check exited 0.
+ *
+ * The fix is definitional. A baseline records PRE-EXISTING debt, and pre-existing means
+ * "already on the merge target". A file introduced by this PR cannot be pre-existing, so it
+ * can never be baselined — during seeding or otherwise.
+ */
+function targetFileSet() {
+  const ref = process.env.BASE_REF ? `origin/${process.env.BASE_REF}` : 'origin/main'
+  try {
+    const raw = execFileSync('git', ['ls-tree', '-r', '--name-only', ref, 'tests/'], {
+      cwd: ROOT, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'],
+    })
+    return new Set(raw.split('\n').filter(Boolean))
+  } catch {
+    return null
   }
 }
 
@@ -125,11 +174,18 @@ const IMPORTS_PRODUCTION = /(?:from|import\s*\()\s*['"`](?:\.\.\/)+src\//
 // see the honesty note at the bottom of this file.
 const PINS_MIGRATIONS = /migrations\s*\/\s*\d{4}_[a-z0-9_]+\.sql/
 const HAND_WRITTEN_DDL = /CREATE\s+(?:TEMP\s+|TEMPORARY\s+)?TABLE/i
+// A REAL SQL engine — the thing that makes a schema mismatch actually throw.
+const REAL_ENGINE = /createSqliteD1|DatabaseSync/
+// A D1-shaped object literal: something supplying `prepare` as a property or method, i.e.
+// a hand-written stand-in for env.DB. Real-engine files also call `db.prepare(...)`, so
+// this is only consulted AFTER REAL_ENGINE has been ruled out.
+const MOCK_D1 = /\bprepare\s*[:(]/
 // The sanctioned path.
 const USES_HELPER = /applyAllMigrations\s*\(/
 
 /**
- * Does this file violate the rule? Returns false for files the rule does not apply to.
+ * Which violating class does this file fall into, if any? Returns null when the rule does
+ * not apply.
  *
  * Kept as ONE function evaluated for EVERY file, rather than a set of `continue` guards in
  * the scan loop. The first version filtered first and checked baseline staleness second,
@@ -137,86 +193,149 @@ const USES_HELPER = /applyAllMigrations\s*\(/
  * using the harness, or was deleted — was never evaluated at all and sat in the list
  * forever. The ratchet silently became an exemption. Caught by mutating a baselined file
  * to be compliant and finding the check still passed.
+ *
+ * THE mockDb CLASS (#720). The original rule bound hand-written DDL — it did not see a
+ * test that never builds a schema at all because it never executes SQL. Found on #719:
+ * tests/inbox-routes.test.ts re-implements D1 as a JS object that string-matches SQL, and
+ * passed this gate cleanly while doing precisely what the gate exists to prevent. A fake
+ * answers whatever the test expects, so #684's defect — a query naming a column that does
+ * not exist — is not merely undetected but UNDETECTABLE: there is nothing to contradict it.
+ * That is a strictly worse position than a hand-written schema, which at least executes.
  */
-function violates(source) {
-  if (!/createSqliteD1|DatabaseSync/.test(source)) return false
-  if (!IMPORTS_PRODUCTION.test(source)) return false
-  if (USES_HELPER.test(source)) return false
-  return PINS_MIGRATIONS.test(source) || HAND_WRITTEN_DDL.test(source)
+export function classify(source) {
+  if (!IMPORTS_PRODUCTION.test(source)) return null
+  if (USES_HELPER.test(source)) return null
+  if (REAL_ENGINE.test(source)) {
+    return PINS_MIGRATIONS.test(source) || HAND_WRITTEN_DDL.test(source) ? 'files' : null
+  }
+  return MOCK_D1.test(source) ? 'mockDb' : null
 }
 
-const offenders = []
-const violating = new Set()
+// Importing this module (the self-tests do, to exercise `classify` directly) must not run
+// the scan or call process.exit. Only direct execution does.
+const RUN_AS_SCRIPT = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+if (RUN_AS_SCRIPT) main()
 
-for (const file of walk(TESTS_DIR)) {
-  const rel = relative(ROOT, file)
-  if (!violates(readFileSync(file, 'utf8'))) continue
-  violating.add(rel)
-  if (!baseline.has(rel)) offenders.push(rel)
-}
+function main() {
+  const offenders = { files: [], mockDb: [] }
+  const violating = { files: new Set(), mockDb: new Set() }
 
-// Evaluated over the BASELINE, not over the scan — so a listed file that was fixed,
-// renamed, or deleted is reported rather than silently retained.
-const staleBaseline = [...baseline].filter((rel) => !violating.has(rel)).sort()
+  for (const file of walk(TESTS_DIR)) {
+    const rel = relative(ROOT, file)
+    const cls = classify(readFileSync(file, 'utf8'))
+    if (!cls) continue
+    violating[cls].add(rel)
+    if (!baselines[cls].has(rel)) offenders[cls].push(rel)
+  }
 
-const remaining = baseline.size - staleBaseline.length
-const target = baselineSizeOnTarget()
-const targetNote =
-  target.state === 'compared' ? `, target ${target.size}`
-  : target.state === 'bootstrap' ? ', target none (bootstrap)'
-  : ''
-console.log(
-  `test-schema-source: ${remaining} file(s) still building schema by hand ` +
-  `(baseline ${baseline.size}${targetNote}).`,
-)
+  // Evaluated over the BASELINE, not over the scan — so a listed file that was fixed,
+  // renamed, or deleted is reported rather than silently retained. A file that MOVED between
+  // classes is stale in its old class and a new offender in its new one, which is correct:
+  // converting a mock to a hand-written schema is not progress and must not pass silently.
+  const staleBaseline = Object.fromEntries(
+    CLASSES.map((c) => [c, [...baselines[c]].filter((rel) => !violating[c].has(rel)).sort()]),
+  )
 
-let failed = false
+  const target = baselineSizeOnTarget()
+  const label = { files: 'building schema by hand', mockDb: 'faking D1 instead of executing SQL' }
+  for (const c of CLASSES) {
+    const remaining = baselines[c].size - staleBaseline[c].length
+    const note =
+      target.state === 'compared' && target.sizes[c] !== null ? `, target ${target.sizes[c]}`
+      : target.state === 'compared' ? ', target none (new class, seeding)'
+      : target.state === 'bootstrap' ? ', target none (bootstrap)'
+      : ''
+    console.log(
+      `test-schema-source [${c}]: ${remaining} file(s) ${label[c]} ` +
+      `(baseline ${baselines[c].size}${note}).`,
+    )
+  }
 
-if (target.state === 'unreadable') {
-  failed = true
-  console.error('\nCANNOT VERIFY THE RATCHET — the merge target is unreadable.')
-  console.error('Fetch the base ref (CI: actions/checkout with fetch-depth: 0) and re-run.')
-  console.error('Failing rather than passing: a ratchet that disengages when it cannot read')
-  console.error('git is exactly the silent-exemption defect it exists to prevent.\n')
-} else if (target.state === 'compared' && baseline.size > target.size) {
-  failed = true
-  console.error(`\nBASELINE GREW: ${target.size} -> ${baseline.size}. It may only shrink.`)
-  console.error('Appending a file here is not a fix. Convert the test to applyAllMigrations()')
-  console.error('and remove its entry instead.\n')
-}
+  let failed = false
 
-if (offenders.length > 0) {
-  failed = true
-  console.error('\nNEW VIOLATION — a test that imports production code must build its schema')
-  console.error('with applyAllMigrations() from tests/helpers/migrations.ts:\n')
-  for (const f of offenders) console.error(`  ${f}`)
-  console.error('\nA hand-written CREATE TABLE or a hand-picked list of migration files is a')
-  console.error('schema you invented. It executes real SQL against a database production does')
-  console.error('not have, which is why it looks like a strong test while proving nothing.')
-  console.error('The baseline is a ratchet: it may shrink, never grow.\n')
-}
+  if (target.state === 'unreadable') {
+    failed = true
+    console.error('\nCANNOT VERIFY THE RATCHET — the merge target is unreadable.')
+    console.error('Fetch the base ref (CI: actions/checkout with fetch-depth: 0) and re-run.')
+    console.error('Failing rather than passing: a ratchet that disengages when it cannot read')
+    console.error('git is exactly the silent-exemption defect it exists to prevent.\n')
+  } else if (target.state === 'compared') {
+    for (const c of CLASSES) {
+      // null = the class did not exist on the target; seeding it once is allowed (see
+      // baselineSizeOnTarget). Every later run compares against a real number.
+      if (target.sizes[c] !== null && baselines[c].size > target.sizes[c]) {
+        failed = true
+        console.error(`\nBASELINE [${c}] GREW: ${target.sizes[c]} -> ${baselines[c].size}. It may only shrink.`)
+        console.error('Appending a file here is not a fix. Convert the test to applyAllMigrations()')
+        console.error('and remove its entry instead.\n')
+      }
+    }
+  }
 
-if (staleBaseline.length > 0) {
-  failed = true
-  console.error('\nSTALE BASELINE — these files no longer violate and must be removed from')
-  console.error(`${relative(ROOT, BASELINE_PATH)}:\n`)
-  for (const f of staleBaseline) console.error(`  ${f}`)
-  console.error('\nLeaving a fixed file in the baseline turns a ratchet into an exemption.\n')
-}
+  const WHY = {
+    files: [
+      'A hand-written CREATE TABLE or a hand-picked list of migration files is a',
+      'schema you invented. It executes real SQL against a database production does',
+      'not have, which is why it looks like a strong test while proving nothing.',
+    ],
+    mockDb: [
+      'A hand-written object supplying prepare() is a SQL ENGINE you invented. It does',
+      'not execute the query at all — it string-matches it and answers what the test',
+      'expects, so a query naming a column that does not exist cannot be contradicted.',
+      'That is strictly weaker than a hand-written schema, which at least runs.',
+    ],
+  }
 
-// WHAT THIS DOES NOT CATCH — stated rather than implied.
-//
-// The scanner is regex over source. String concatenation defeats it: 'CREA' + 'TE TABLE',
-// or a migration path assembled at runtime, will pass. That is not fixable with a regex,
-// and pretending otherwise would make this exactly the kind of confidently-wrong guard it
-// exists to replace.
-//
-// It is not the load-bearing part. The scanner catches ACCIDENTAL drift — the way all 27
-// current entries arrived, and the way four more surfaces silently diverged in #713. The
-// RATCHET is what makes deliberate growth impossible, and it does not depend on regex at
-// all: it compares the committed list against the list on the merge target, so the number
-// cannot go up no matter how a violator is written.
-//
-// A determined author can still evade the scanner. They cannot evade the count.
+  for (const c of CLASSES) {
+    if (offenders[c].length === 0) continue
+    failed = true
+    console.error(`\nNEW VIOLATION [${c}] — a test that imports production code must execute real`)
+    console.error('SQL against a schema built with applyAllMigrations() from tests/helpers/migrations.ts:\n')
+    for (const f of offenders[c]) console.error(`  ${f}`)
+    console.error('')
+    for (const line of WHY[c]) console.error(line)
+    console.error('The baseline is a ratchet: it may shrink, never grow.\n')
+  }
 
-process.exit(failed ? 1 : 0)
+  // A baselined file that does not exist on the merge target was introduced by this PR, and
+  // therefore is not pre-existing debt. Blocks the seeding-window bypass (mutation M2).
+  const onTarget = targetFileSet()
+  if (onTarget !== null) {
+    for (const c of CLASSES) {
+      const smuggled = [...baselines[c]].filter((rel) => !onTarget.has(rel)).sort()
+      if (smuggled.length === 0) continue
+      failed = true
+      console.error(`\nBASELINED FILE IS NEW [${c}] — these are not on the merge target, so they`)
+      console.error('are not pre-existing debt and cannot be baselined:\n')
+      for (const f of smuggled) console.error(`  ${f}`)
+      console.error('\nA baseline records debt that already existed. Write the new test against')
+      console.error('createSqliteD1() + applyAllMigrations() instead.\n')
+    }
+  }
+
+  for (const c of CLASSES) {
+    if (staleBaseline[c].length === 0) continue
+    failed = true
+    console.error(`\nSTALE BASELINE [${c}] — these files no longer violate and must be removed from`)
+    console.error(`${relative(ROOT, BASELINE_PATH)}:\n`)
+    for (const f of staleBaseline[c]) console.error(`  ${f}`)
+    console.error('\nLeaving a fixed file in the baseline turns a ratchet into an exemption.\n')
+  }
+
+  // WHAT THIS DOES NOT CATCH — stated rather than implied.
+  //
+  // The scanner is regex over source. String concatenation defeats it: 'CREA' + 'TE TABLE',
+  // or a migration path assembled at runtime, will pass. That is not fixable with a regex,
+  // and pretending otherwise would make this exactly the kind of confidently-wrong guard it
+  // exists to replace.
+  //
+  // It is not the load-bearing part. The scanner catches ACCIDENTAL drift — the way all 27
+  // current entries arrived, and the way four more surfaces silently diverged in #713. The
+  // RATCHET is what makes deliberate growth impossible, and it does not depend on regex at
+  // all: it compares the committed list against the list on the merge target, so the number
+  // cannot go up no matter how a violator is written.
+  //
+  // A determined author can still evade the scanner. They cannot evade the count.
+
+  process.exit(failed ? 1 : 0)
+  }
