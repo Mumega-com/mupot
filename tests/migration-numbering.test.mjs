@@ -206,6 +206,43 @@ test('end to end: NO origin ref at all exits 1 — the guard fails loud, not ope
   assert.match(out, /fetch-depth/)
 })
 
+test('end to end: a ref that genuinely has no migrations/ is bootstrap, and passes', (t) => {
+  // The counterpart to the test below. `git ls-tree -r --name-only <ref> migrations/` against
+  // a ref with no such path exits 0 with empty stdout — it does NOT throw. That is what makes
+  // real bootstrap distinguishable from a git failure, and it is the fact the first version
+  // of this guard got backwards.
+  const dir = scaffold({ targetMigrations: [], addedMigrations: ['0001_init.sql'] })
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const { code, out } = run(dir)
+  assert.equal(code, 0, out)
+  assert.match(out, /bootstrap/)
+})
+
+test('FAIL CLOSED at the GIT layer: ls-tree failing is a failure, not a bootstrap', (t) => {
+  // P0 found by Athena's diverse gate on this PR (pin 51aa9b1) — the guard against silent
+  // disengagement had one. rev-parse succeeded, ls-tree threw, the catch returned [], and
+  // `evaluate` read that as "target has no migrations yet" and PASSED a below-head migration.
+  //
+  // The pure/impure split is exactly what hid it: `evaluate([], …)` is legitimately a
+  // bootstrap pass and its unit test says so, so the only way to catch the mislabelling is
+  // to drive the real git layer with git actually broken. A PATH wrapper that fails only
+  // ls-tree is the smallest way to stage that.
+  const dir = scaffold({ targetMigrations: ['0079_x.sql'], addedMigrations: ['0076_below.sql'] })
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  assert.equal(run(dir).code, 1, 'sanity: below-head must fail with git working')
+
+  const bin = join(dir, 'fakebin')
+  mkdirSync(bin, { recursive: true })
+  writeFileSync(
+    join(bin, 'git'),
+    '#!/bin/bash\nif [ "$1" = "ls-tree" ]; then echo "fatal: simulated" >&2; exit 128; fi\nexec /usr/bin/git "$@"\n',
+    { mode: 0o755 },
+  )
+  const { code, out } = run(dir, { PATH: `${bin}:${process.env.PATH}` })
+  assert.equal(code, 1, 'a git failure must NOT read as bootstrap')
+  assert.doesNotMatch(out, /bootstrap/)
+})
+
 test('end to end: BASE_REF selects a different merge target', (t) => {
   // PRs are not always against main. If BASE_REF were ignored, the guard would compare
   // against the wrong branch and its verdict would be unrelated to what actually merges.

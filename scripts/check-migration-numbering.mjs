@@ -169,9 +169,22 @@ function targetMigrations(ref) {
       .map((line) => line.slice(DIR.length + 1))
       .filter((name) => name.endsWith('.sql'))
   } catch {
-    // The ref exists but has no migrations/ tree — a genuine bootstrap, distinct from the
-    // unreadable case above, which is why the two are separate try blocks and not one.
-    return []
+    // FAIL, not bootstrap. The first version of this returned [] here on the belief that a
+    // ref with no migrations/ tree makes ls-tree throw. It does not: `git ls-tree -r
+    // --name-only <ref> migrations/` against a ref with no such path exits 0 with EMPTY
+    // STDOUT, which the success path above already turns into []. So this catch is reachable
+    // ONLY when git actually failed — and returning [] there made a git failure look
+    // identical to a genuine bootstrap, which `evaluate` passes.
+    //
+    // Measured, not theorised (Athena, diverse gate on this PR, pin 51aa9b1): with a PATH
+    // git wrapper failing only `ls-tree`, a below-head migration exited 0 as
+    // `bootstrap_no_target_migrations`. The guard against silent disengagement had one.
+    //
+    // The three-state discipline this file argues for was correct; the bug was that the
+    // git layer mislabelled state 1 as state 2 before `evaluate` ever saw it. Keeping
+    // `evaluate` pure is what let it hide — its own bootstrap test drives `evaluate([], …)`
+    // directly and can never exercise this line.
+    return null
   }
 }
 
