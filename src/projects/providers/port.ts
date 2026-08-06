@@ -43,7 +43,13 @@ export interface TaskBoardSyncResult {
   ok: true
   imported: number
   skipped: number
-  items: Array<{ title: string; status: 'created' | 'skipped' | 'no_agent' | 'unknown_agent' | 'error'; detail?: string }>
+  // 'no_squad' (Linear): no admin-configured defaultSquadId to route to — distinct
+  // from 'no_agent' (GitHub Projects: an item carries no Agent-field value at all).
+  items: Array<{
+    title: string
+    status: 'created' | 'skipped' | 'no_agent' | 'unknown_agent' | 'no_squad' | 'error'
+    detail?: string
+  }>
 }
 
 export interface TaskBoardError {
