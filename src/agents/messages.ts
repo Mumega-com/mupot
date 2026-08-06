@@ -17,6 +17,7 @@
 import type { Env, CapabilityGrant } from '../types'
 import { resolveAgentRef } from '../org/resolve'
 import { canOnSquad } from '../auth/capability'
+import { postAgentMessageToGitHub } from '../integrations/github-agent-bridge'
 
 // ── tunables ────────────────────────────────────────────────────────────────────────────
 const MAX_BODY_CHARS = 8000
@@ -278,6 +279,17 @@ export async function sendAgentMessage(
       return { ok: false, reason: 'inbox_full', detail: `recipient at unread cap ${maxUnread}` }
     }
     const seq = Number(result.meta?.last_row_id ?? 0)
+    // Best-effort: post to GitHub if projectId is set. Don't fail the send if it fails.
+    try {
+      const agent = await env.DB.prepare(`SELECT name FROM agents WHERE id = ?1 LIMIT 1`)
+        .bind(input.fromAgent)
+        .first<{ name: string }>()
+      if (agent) {
+        await postAgentMessageToGitHub(env, agent.name, input.body, input.projectId)
+      }
+    } catch {
+      // Best-effort — GitHub posting failures don't fail the message send
+    }
     return { ok: true, id, seq, duplicate: false }
   } catch (err) {
     if (routineFence && !await routineDispatchAllowed(env, tenant, routineFence)) {

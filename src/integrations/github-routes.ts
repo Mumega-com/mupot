@@ -18,6 +18,7 @@ import type { Env } from '../types'
 import { createTask, syncTaskStatusFromIssue, syncCiResultToTask, closeGitHubPrMirrorTasks } from '../tasks/service'
 import { syncGitHubProject } from './github-projects'
 import { recordMergedPr } from '../agents/kpi-sources'
+import { processGitHubIssueComment } from './github-agent-bridge'
 
 interface GitHubRouteEnv {
   GITHUB_WEBHOOK_SECRET?: string
@@ -314,6 +315,18 @@ githubInboundApp.post('/', async (c) => {
       return c.json({ ok: true, routed: squadId })
     }
     return c.json({ ok: true, ignored: `issues.${action}` })
+  }
+
+  // Agent-message bridge: a comment on a task-mirrored issue (action: created).
+  // Resolve the GitHub user to an agent, and create an agent_message. Non-agent
+  // comments (unmapped users) are ignored; the bridge doesn't speak for humans.
+  if (eventType === 'issue_comment') {
+    const { messageId, reason } = await processGitHubIssueComment(c.env, payload as never)
+    if (messageId) {
+      return c.json({ ok: true, messageCreated: messageId })
+    }
+    // Inbound comment ignored (e.g., unmapped author, non-created action) — ack anyway.
+    return c.json({ ok: true, ignored: `issue_comment.${reason}` })
   }
 
   // D3 — CI feedback: a completed workflow_run that references a PR linked to a task writes
