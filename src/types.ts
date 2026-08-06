@@ -70,7 +70,24 @@ export interface Env {
   // operator's own PostHog project and emit it under its own tenant's observations.
   OWNER_TENANT_SLUG?: string
   BRAND: string
-  OAUTH_PROVIDER: 'google' | 'telegram'
+  // Which IdP the human web-login door uses. NAMED `IDP_PROVIDER`, NOT `OAUTH_PROVIDER` —
+  // @cloudflare/workers-oauth-provider RESERVES the binding name `OAUTH_PROVIDER` and
+  // injects its own OAuthHelpersImpl instance there at runtime. Declaring that name as a
+  // string here was a lie the type system could not catch, because the two places that
+  // read it disagreed and one of them cast through `unknown`:
+  //   src/auth/index.ts    read it as a string  -> got an object -> 500 on /auth/login
+  //   src/mcp/oauth-authorize.ts  cast it to the helpers object  -> correct
+  // wrangler.toml already carried the rename (`IDP_PROVIDER = "google"`, with the reason
+  // in a comment); no code had followed it. See the note on OAUTH_PROVIDER below.
+  // Typed `string`, NOT 'google' | 'telegram'. A [vars] entry is arbitrary operator-supplied
+  // text; declaring it pre-narrowed asserts a validation that nothing performs, and reading
+  // a binding as a type it does not have at runtime is precisely what produced this bug.
+  // Callers narrow it themselves and must keep an unrecognised value refusable.
+  IDP_PROVIDER?: string
+  // NOT configuration. Injected by the OAuthProvider wrapper (src/index.ts) and typed as
+  // unknown on purpose: anything that wants the helpers must cast deliberately and say so,
+  // and nothing can accidentally read it as a settable string again.
+  OAUTH_PROVIDER?: unknown
   // Immutable git commit for the deployed build, supplied by the release deploy.
   RELEASE_SHA?: string
   // The pot's canonical public origin (e.g. https://agents.digid.ca). When set, the
@@ -105,12 +122,14 @@ export interface Env {
   // DEFAULT_POT_HOST_SUFFIX), passed as a planner opt — never read from client
   // request input. Unset ⇒ 'mupot.mumega.com'.
   DEFAULT_POT_HOST_SUFFIX?: string
-  // fleet window: SOS bus bridge REST
+  // fleet window: SOS bus bridge REST — COMPAT SHIM ONLY (ADR #473).
+  // Active fleet routes use D1 agent_messages + presence + Queue; see
+  // docs/architecture/sos-coordination-compat.md. Do not add new callers.
   BUS_URL?: string
-  // fleet scoping (Flock #43): which bus project this pot's fleet addresses, and
-  // which ops agent executes control requests. NO code default — the resolvers
-  // fail closed (null → refuse). Each pot sets these explicitly in its wrangler
-  // vars (company: sos/kasra; tenant: its own project + operator agent).
+  // fleet scoping (Flock #43): which project label this pot's fleet addresses, and
+  // which ops agent receives control requests via agent_messages. NO code default —
+  // the resolvers fail closed (null → refuse). Each pot sets these explicitly in its
+  // wrangler vars (company: sos/kasra labels; tenant: its own project + operator agent).
   FLEET_PROJECT?: string
   FLEET_OPS_AGENT?: string
   // secrets (present at runtime only)
@@ -128,7 +147,7 @@ export interface Env {
   //                       npx wrangler secret put GOOGLE_CLIENT_SECRET
   GOOGLE_CLIENT_ID?: string
   GOOGLE_CLIENT_SECRET?: string
-  BUS_TOKEN?: string
+  BUS_TOKEN?: string // SOS compat shim only (ADR #473) — unused by active fleet routes
   GITHUB_TOKEN?: string // outbound: tasks↔issues mirror (fine-grained PAT or App install token)
   GITHUB_REPO?: string // "owner/repo" the pot weaves to (e.g. "Digidinc/Digid")
   GITHUB_WEBHOOK_SECRET?: string // inbound: verifies GitHub webhook (x-hub-signature-256)
@@ -243,6 +262,17 @@ export interface Agent {
   budget_cap_cents: number | null
   budget_window: BudgetWindow
   created_at: string
+  // profile fields (0068_agent_profile.sql) — Port 1.3. All nullable; pre-profile
+  // agents read null. capabilities/skills are JSON-array strings on the wire,
+  // parsed to string[] on read; death_condition is a JSON-object string.
+  purpose: string | null
+  owner: string | null
+  model_fallback: string | null
+  capabilities: string[] | null
+  skills: string[] | null
+  parent_agent_id: string | null
+  qnft_ref: string | null
+  death_condition: string | null
 }
 
 export interface Membership {
@@ -254,10 +284,25 @@ export interface Membership {
 
 export type Capability = 'owner' | 'admin' | 'lead' | 'member' | 'observer'
 
+export type TaskPriority = 'P0' | 'P1' | 'P2' | 'P3'
+
 export interface Task {
   id: string
   squad_id: string
   project_id: string | null
+  /**
+   * Rank. NULL means UNTRIAGED and is a real, visible state — see migrations/0079.
+   * Before this existed, priority was encoded into task TITLES ("[P0] ..."), which is
+   * unsortable, unfilterable, and invisible to every view. Untriaged rows sort LAST in
+   * the ranker: deliberately, so that leaving work unranked has a cost.
+   */
+  priority: TaskPriority | null
+  /**
+   * Subtask link. NULL for a top-level task. ON DELETE SET NULL, never CASCADE —
+   * an orphaned child surfacing as a top-level task is recoverable; a silently
+   * deleted one is not (#705's lesson: a row can own more than itself).
+   */
+  parent_task_id: string | null
   title: string
   body: string
   status: 'open' | 'in_progress' | 'blocked' | 'done' | 'review' | 'approved' | 'rejected'
@@ -284,13 +329,22 @@ export interface Task {
   // (agent, dashboard, MCP client) that title/body originated from an external pot and should
   // be treated as untrusted content, not as a trusted local instruction. See migrations/0063.
   source_pot?: string | null
+  // PR #659 P0 fix: same trust invariant as source_pot (NULL = trusted local write),
+  // generalized for non-pot external integrations. Set to an opaque, integration-defined
+  // string (e.g. `linear:<teamKey>`) when the row was written by a governed external
+  // importer (src/integrations/linear-issues.ts) rather than a local/trusted caller. See
+  // migrations/0077. Checked everywhere source_pot is checked (canAgentExecuteTask,
+  // routeUnassignedWork, the admin-gated reassignment guard, the untrusted-content prompt
+  // fence) -- kept as a separate column rather than folded into source_pot because it is
+  // a different untrusted-writer class (no pot-to-pot signature involved).
+  external_source?: string | null
   created_at: string
   updated_at: string
 }
 
 // ── Projects (migration 0055) ───────────────────────────────────────────────
 
-export type ProjectStatus = 'planned' | 'active' | 'paused' | 'completed' | 'archived'
+export type ProjectStatus = 'planned' | 'active' | 'paused' | 'review' | 'completed' | 'archived'
 export type ProjectAccessLevel = 'read' | 'write' | 'admin'
 
 export interface Project {
@@ -302,6 +356,17 @@ export interface Project {
   status: ProjectStatus
   parent_project_id: string | null
   target_date: string | null
+  /** Next ISO-8601 instant at which the lifecycle circuit breaker evaluates (migration 0068). */
+  cycle_boundary_at: string | null
+  /** Stall detector flag (0/1); raised early into the breaker — detector is slice 4. */
+  stalled: number
+  /** Per-project idle threshold in days; NULL = tenant default. */
+  stall_threshold_days: number | null
+  /**
+   * Principal that moved the project into completion review (migration 0069).
+   * Used for different-principal self-verdict blocking (slice 2).
+   */
+  completion_proposed_by: string | null
   created_at: string
   updated_at: string
 }
@@ -333,6 +398,19 @@ export interface AuthContext {
   memberId?: string // set when the principal is a network member (MCP/IM), not just a web login
   channel?: ConnectionChannel // how this principal connected
   capabilities?: CapabilityGrant[] // fine-grained, per-scope; the real RBAC
+  /**
+   * What this member ACTUALLY holds, resolved but NOT active as ambient authority.
+   *
+   * Equal to `capabilities` on every channel except `directory`, where the B1 ceiling
+   * zeroes ambient authority so an OAuth seat cannot silently act with an owner's grants.
+   * Latent grants let an EXPLICIT, NAMED, read-only act — today only `connect
+   * { agent_name }` — be authorized against the truth instead of against the zeroed view.
+   *
+   * INVARIANT: never use this to satisfy an ambient capability check. Doing so reinstates
+   * the silent inheritance the ceiling exists to prevent. Any new reader must be an
+   * operation the caller named explicitly and that writes nothing. (#712)
+   */
+  latentCapabilities?: CapabilityGrant[]
   boundAgentId?: string | null // the agent this token is bound to (the weld), or null = pure human/operator
 }
 
@@ -417,10 +495,9 @@ export interface BusEvent<T = unknown> {
 // or shell access. The bus consumer already routes agent.wake → AgentDO.wake();
 // this type makes the wire format explicit and machine-readable.
 //
-// Cross-project note (S175): today the /bus/emit endpoint is tenant-scoped —
-// only tokens minted inside the same pot can emit. Cross-project wake (e.g.
-// kasra@mumega waking agent:dgd.admin) requires S175 multiplex opt-in on the
-// SOS bus side; that is a runtime change outside this contract's scope.
+// Cross-project note: today the /bus/emit endpoint is tenant-scoped —
+// only tokens minted inside the same pot can emit. Cross-project wake uses
+// project-link / multiplex on the mupot CF-native bus (not the retired SOS Redis bus).
 export interface WakeContract {
   // POST this URL to fire the wake event.
   emit_url: string

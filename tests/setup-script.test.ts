@@ -16,7 +16,8 @@ printf '%s\\n' "$args" >> "$FAKE_NPX_LOG"
 case "$args" in
   *" --version"*|*" whoami") exit 0 ;;
   *"d1 create"*) printf 'database_id = "11111111-1111-4111-8111-111111111111"\\n' ;;
-  *"vectorize create"*|*"queues create"*|*"r2 bucket create"*|*"d1 migrations apply"*|*"secret put"*) printf 'ok\\n' ;;
+  *"secret put"*) cat >/dev/null; printf 'ok\\n' ;;
+  *"vectorize create"*|*"queues create"*|*"r2 bucket create"*|*"d1 migrations apply"*) printf 'ok\\n' ;;
   *"kv namespace create"*)
     if [[ "$args" == *"-sessions"* ]]; then
       printf 'id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"\\n'
@@ -40,11 +41,13 @@ describe('per-pot setup script', () => {
     chmodSync(fakeNpx, 0o755)
 
     try {
-      execFileSync('bash', ['scripts/setup.sh', '--pot', pot], {
+      const setupOutput = execFileSync('bash', ['scripts/setup.sh', '--pot', pot], {
         cwd: repoRoot,
         env: { ...process.env, PATH: `${temp}:${process.env.PATH}`, FAKE_NPX_LOG: log },
-        stdio: 'pipe',
+        encoding: 'utf8',
       })
+      expect(setupOutput).toContain(`node scripts/deploy.mjs --config "${config}"`)
+      expect(setupOutput).not.toContain(`npx wrangler deploy --config "${config}"`)
 
       const written = readFileSync(config, 'utf8')
       expect(written).toContain(`name = "mupot-${pot}"`)

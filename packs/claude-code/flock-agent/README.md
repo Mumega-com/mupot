@@ -28,6 +28,17 @@ implementation of the [harness pack contract](../../../docs/flock-harness-pack-c
 5. **Verify.** Start the agent. Within one heartbeat it shows `active` in the pot's
    `/fleet`. Stop it + wait the stale window (10 min) → it reads `dead` / absent.
 
+## Mupot inbox receive (Kasra / Claude Code)
+
+Do **not** consume the mupot inbox from a Stop hook with `peek=false` +
+`suppressOutput:true` — that marks rows read without injecting them into the
+turn (YC27). Use:
+
+1. `scripts/kasra-inbox-watch.mjs` — peek → tmux handoff (preserves
+   `request_id` / `in_reply_to`) → consume-on-success. Interval ≤ 60s.
+2. `packs/claude-code/flock-agent/check-inbox-mupot-branch.sh` — optional
+   non-consuming Stop peek that `decision:block`s with correlation fields.
+
 ## Remove
 
 Stop the agent + heartbeat; delete `.mcp.json`. It ages out of the Fleet. To revoke

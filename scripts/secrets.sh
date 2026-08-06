@@ -128,7 +128,7 @@ put_secret() {
     ok "${name} set."
   else
     unset value
-    die "Failed to set ${name}. Are you logged in and is the Worker deployed once? (wrangler deploy)"
+    die "Failed to set ${name}. Are you logged in and is the Worker deployed once? (node scripts/deploy.mjs)"
   fi
   unset value
 }
@@ -139,7 +139,7 @@ put_secret_value() {
   if printf '%s' "$value" | "${WRANGLER[@]}" secret put "$name" --config "${WRANGLER_TOML}" >/dev/null 2>&1; then
     ok "${name} set."
   else
-    die "Failed to set ${name}. Are you logged in and is the Worker deployed once? (wrangler deploy)"
+    die "Failed to set ${name}. Are you logged in and is the Worker deployed once? (node scripts/deploy.mjs)"
   fi
 }
 
@@ -162,7 +162,7 @@ put_secret AI_GATEWAY_TOKEN    optional
 
 printf '\n'
 ok "Secrets configured."
-say "Deploy (or re-deploy) to pick them up:  npx wrangler deploy --config \"${WRANGLER_TOML}\""
+say "Deploy (or re-deploy) to pick them up:  node scripts/deploy.mjs --config \"${WRANGLER_TOML}\""
 if [ "${BOOTSTRAP_OWNER}" -eq 1 ]; then
   say "After deploy, open <your-pot-url>/auth/bootstrap and submit your email with the printed token."
   say "After the owner session is created, remove the bootstrap secret:  npx wrangler secret delete BOOTSTRAP_OWNER_TOKEN --config \"${WRANGLER_TOML}\""

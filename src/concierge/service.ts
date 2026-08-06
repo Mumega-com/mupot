@@ -47,6 +47,12 @@
 import type { Env, Project } from '../types'
 import { listProjects } from '../projects/service'
 import { createTask, type CreateTaskInput } from '../tasks/service'
+import { resolveTaskAssignee } from '../tasks/assignee'
+import {
+  classifyTaskRoleEffort,
+  routeByEffort,
+  type OnlineHarness,
+} from '../tasks/effort-route'
 import type { Task } from '../types'
 import { registerModule, listPresence, type ModulePresence, type RegistryResult } from '../registry/service'
 
@@ -54,6 +60,15 @@ import { registerModule, listPresence, type ModulePresence, type RegistryResult 
  * that defines what counts as build-capable for dispatch purposes — extend here,
  * not at each call site, if a second capability should also qualify. */
 export const BUILD_CAPABILITY = 'build'
+
+// Work-router bounds (safety). A BUSY project's SITTING unassigned-open tasks get
+// assigned to online build agents — BOUNDED so one tick can never flood the board or a
+// single driver: at most MAX_ROUTES_PER_TICK assignments per project per tick, and at
+// most MAX_ROUTES_PER_AGENT to any one agent. The router only ASSIGNS (sets
+// assignee_agent_id on an unassigned open task) — it grants no deploy/publish/merge
+// authority; the assignee still builds on a branch and the gate-driver reviews.
+export const MAX_ROUTES_PER_TICK = 5
+export const MAX_ROUTES_PER_AGENT = 2
 
 /** Capabilities the concierge itself registers under. It is a dispatcher, never a
  * build target — CONCIERGE_IDENTITY_PREFIX + BUILD_CAPABILITY exclusion below is
@@ -106,6 +121,9 @@ export type ConciergeNoopReason =
 
 export type ConciergeDecision =
   | { action: 'dispatch'; agentId: string }
+  // work-router: a BUSY project (has advancing work) with SITTING unassigned-open
+  // tasks got `routed` of them assigned to online build agents this tick.
+  | { action: 'route'; routed: number }
   | { action: 'noop'; reason: ConciergeNoopReason }
 
 export interface ConciergeCycleResult {
@@ -123,6 +141,7 @@ export interface ConciergeCycleResult {
  * tells the two apart. */
 export interface ResolvedAgent {
   id: string
+  slug: string
   squad_id: string
   status: string
 }
@@ -130,7 +149,7 @@ export interface ResolvedAgent {
 // ── Default I/O seams (real D1) ──────────────────────────────────────────────
 
 async function defaultResolveAgent(env: Env, identity: string): Promise<ResolvedAgent | null> {
-  return env.DB.prepare(`SELECT id, squad_id, status FROM agents WHERE id = ?1 LIMIT 1`)
+  return env.DB.prepare(`SELECT id, slug, squad_id, status FROM agents WHERE id = ?1 LIMIT 1`)
     .bind(identity)
     .first<ResolvedAgent>()
 }
@@ -235,6 +254,140 @@ async function pickOnlineBuilder(
   return null
 }
 
+interface UnassignedTaskRow {
+  id: string
+  squad_id: string
+  title: string
+  body: string
+}
+
+interface OnlineRouteCandidate {
+  agent: ResolvedAgent
+  capabilities: readonly string[]
+}
+
+/**
+ * routeUnassignedWork — the work-router (the "drivers execute what's dispatched" half).
+ * A BUSY project (has advancing work) still leaves tasks SITTING when they are open +
+ * unassigned while harnesses idle online. This assigns those via the effort→idle
+ * ladder (src/tasks/effort-route.ts), BOUNDED (MAX_ROUTES_PER_TICK per project,
+ * MAX_ROUTES_PER_AGENT per agent) and GATED (assignment sets assignee_agent_id only —
+ * no deploy/merge/restart/heal; action space is assign|skip|escalate only).
+ *
+ * Safety invariants:
+ *  - Only status='open' AND assignee_agent_id IS NULL rows are touched (never reassign
+ *    in-progress/review/blocked/assigned work).
+ *  - Each assignment is validated by resolveTaskAssignee — the builder must be legally
+ *    assignable to the task's squad (same squad, or holds member capability there).
+ *  - The UPDATE re-guards `assignee_agent_id IS NULL AND status='open'` so a concurrent
+ *    tick (or a human assigning meanwhile) cannot be clobbered — the write is a no-op
+ *    (changes=0) if the row moved, and only a changes=1 counts as routed (TOCTOU-safe).
+ *  - Cross-pot tasks (source_pot IS NOT NULL) are never auto-assigned (#404).
+ */
+async function routeUnassignedWork(
+  env: Env,
+  project: Project,
+  roster: ModulePresence[],
+  selfIdentity: string,
+  resolveAgent: (env: Env, identity: string) => Promise<ResolvedAgent | null>,
+): Promise<Array<{ taskId: string; agentId: string }>> {
+  // Online active agents (any role capability) — the effort router picks by ladder.
+  // Known harness caps (agy=research only, etc.) are enforced inside routeByEffort.
+  const candidates: OnlineRouteCandidate[] = []
+  const seen = new Set<string>()
+  for (const module of roster) {
+    if (module.identity === selfIdentity) continue
+    if (module.status !== 'online') continue
+    const agent = await resolveAgent(env, module.identity)
+    if (agent && agent.status === 'active' && !seen.has(agent.id)) {
+      seen.add(agent.id)
+      candidates.push({ agent, capabilities: module.capabilities })
+    }
+  }
+  if (candidates.length === 0) return []
+
+  const bySlug = new Map<string, OnlineRouteCandidate>()
+  for (const candidate of candidates) {
+    if (!bySlug.has(candidate.agent.slug)) bySlug.set(candidate.agent.slug, candidate)
+  }
+  const online: OnlineHarness[] = candidates.map((c) => ({
+    slug: c.agent.slug,
+    capabilities: c.capabilities,
+  }))
+
+  // SECURITY (#404 invariant, adversarial-gate BLOCK 2026-07-22): NEVER auto-assign a
+  // cross-pot task (source_pot IS NOT NULL). An inbound task from a signed-but-untrusted
+  // remote pot must require an EXPLICIT human/operator assignee before it can execute —
+  // canAgentExecuteTask only enforces the source_pot guard on the UNASSIGNED branch, so an
+  // unattended assignee-writer here would smuggle untrusted content straight into a model
+  // turn (the exact auto-dispatch #404 blocked). The router is an unattended writer, so it
+  // MUST carry the same `source_pot IS NULL` invariant.
+  //
+  // PR #659 P0 fix (diverse-model adversarial gate BLOCK): this WHERE clause was a
+  // character-for-character description of a Linear-imported task (open, unassigned,
+  // source_pot NULL) before migrations/0077 added external_source. This is the second of
+  // the two status-polling read paths the gate found bypassing skipEvent/skipMirror — the
+  // maintenance cron (src/index.ts) calls this on a fixed tick regardless of any bus
+  // event, so a Linear-origin task got auto-assigned (and, via classifyTaskRoleEffort
+  // reading its attacker-controlled title/body, routed to a specific agent CLASS) on the
+  // very next tick with zero human step. external_source IS NULL closes it the same way
+  // source_pot IS NULL already does for cross-pot tasks.
+  const rows = await env.DB.prepare(
+    `SELECT id, squad_id, title, body FROM tasks
+      WHERE project_id = ?1 AND status = 'open' AND assignee_agent_id IS NULL
+        AND source_pot IS NULL
+        AND external_source IS NULL
+      ORDER BY created_at ASC
+      LIMIT ?2`,
+  )
+    .bind(project.id, MAX_ROUTES_PER_TICK)
+    .all<UnassignedTaskRow>()
+
+  const routed: Array<{ taskId: string; agentId: string }> = []
+  const perAgent = new Map<string, number>() // keyed by agent id (tick bound)
+  const loadBySlug = new Map<string, number>() // keyed by slug (ladder idle check)
+
+  for (const task of rows.results ?? []) {
+    if (routed.length >= MAX_ROUTES_PER_TICK) break
+
+    const { role, effort } = classifyTaskRoleEffort({ title: task.title, body: task.body ?? '' })
+    const decision = routeByEffort({
+      role,
+      effort,
+      online,
+      load: loadBySlug,
+      maxLoadPerAgent: MAX_ROUTES_PER_AGENT,
+    })
+    // Narrow action space: assign | skip | escalate — never restart/heal.
+    if (decision.action !== 'assign' || decision.agentSlug === null) continue
+
+    const picked = bySlug.get(decision.agentSlug)
+    if (!picked) continue
+    if ((perAgent.get(picked.agent.id) ?? 0) >= MAX_ROUTES_PER_AGENT) continue
+
+    const assignable = await resolveTaskAssignee(env, picked.agent.id, task.squad_id)
+    if (!assignable.value) continue
+
+    // Idempotent + TOCTOU-safe: only assign if still open + unassigned. Bump
+    // updated_at so a routed task shows a fresh timestamp (observability — humans
+    // see the work moved) and correctly signals "row changed" to the optimistic-
+    // concurrency task-update path (WHERE updated_at=…). The WHERE guard is
+    // unchanged, so idempotency/TOCTOU safety is preserved.
+    const upd = await env.DB.prepare(
+      `UPDATE tasks SET assignee_agent_id = ?1, updated_at = ?3
+        WHERE id = ?2 AND status = 'open' AND assignee_agent_id IS NULL`,
+    )
+      .bind(picked.agent.id, task.id, new Date().toISOString())
+      .run()
+    if (upd.meta.changes === 1) {
+      routed.push({ taskId: task.id, agentId: picked.agent.id })
+      perAgent.set(picked.agent.id, (perAgent.get(picked.agent.id) ?? 0) + 1)
+      loadBySlug.set(picked.agent.slug, (loadBySlug.get(picked.agent.slug) ?? 0) + 1)
+    }
+  }
+  return routed
+}
+
 /**
  * runProjectConcierge — one cycle for ONE project.
  *
@@ -295,9 +448,21 @@ export async function runProjectConcierge(
     return { registered, decision: { action: 'noop', reason: 'no_goal' }, taskId: null }
   }
 
+  // Build DRIVERS are SHARED, not per-project — the standing operator's cursor/claude/
+  // mumcp register presence in the shared pool (project_id = null), per the module-kernel
+  // design ("decision is per-project + always-on; execution is shared"). So the dispatch
+  // candidate set is the project-scoped roster UNION the shared build pool. Querying only
+  // the project scope was why the concierge saw `no_online_builder` and NEVER dispatched
+  // (the build agents are all project_id=null). The concierge's own per-project presence
+  // (project-scoped, caps=[dispatch,concierge]) is excluded by selfIdentity + the
+  // BUILD_CAPABILITY filter in pickOnlineBuilder, so unioning cannot make it pick itself.
   let roster: ModulePresence[]
   try {
-    roster = await listRoster(env, { projectId: project.id })
+    const [projectRoster, sharedRoster] = await Promise.all([
+      listRoster(env, { projectId: project.id }),
+      listRoster(env, { projectId: null }),
+    ])
+    roster = [...projectRoster, ...sharedRoster]
   } catch {
     return { registered, decision: { action: 'noop', reason: 'error' }, taskId: null }
   }
@@ -307,12 +472,40 @@ export async function runProjectConcierge(
     return { registered, decision: { action: 'noop', reason: 'no_online_builder' }, taskId: null }
   }
 
-  // Dispatch-once-ever (P0 fix, adversarial gate on PR #459): has the concierge EVER
-  // dispatched a starter for this project, in ANY status? Checked before the "live
-  // work" check below and independent of it — a starter that has gone
-  // approved/rejected/done must NOT be re-dispatched just because it fell out of the
-  // "advancing" set. See hasConciergeStarter's doc comment for why this has no status
-  // filter at all.
+  let advancing: boolean
+  try {
+    advancing = await hasAdvancingTask(env, project.id)
+  } catch {
+    // Fail-closed: if we can't verify the board state, never dispatch/route on
+    // uncertain state — a missed action this tick self-corrects next tick.
+    return { registered, decision: { action: 'noop', reason: 'error' }, taskId: null }
+  }
+  if (advancing) {
+    // BUSY project → the WORK-ROUTER, checked BEFORE the starter's dispatch-once-ever
+    // bookkeeping (that check gates only the starter, not routing — a project that once
+    // received a starter must still get its SITTING work routed). Assign open+unassigned
+    // tasks to online builders (bounded + gated). Fail-soft: a routing error must not
+    // break the tick; sitting work self-corrects next tick.
+    let routed: Array<{ taskId: string; agentId: string }> = []
+    try {
+      routed = await routeUnassignedWork(env, project, roster, identity, resolveAgent)
+    } catch {
+      routed = []
+    }
+    return {
+      registered,
+      decision:
+        routed.length > 0
+          ? { action: 'route', routed: routed.length }
+          : { action: 'noop', reason: 'has_advancing_work' },
+      taskId: null,
+    }
+  }
+
+  // STALLED project (zero advancing work). Dispatch-once-ever (P0 fix, adversarial gate
+  // on PR #459): has the concierge EVER dispatched a starter for this project, in ANY
+  // status? A starter that has gone approved/rejected/done must NOT be re-dispatched just
+  // because it fell out of the "advancing" set. See hasConciergeStarter's doc comment.
   let alreadyDispatched: boolean
   try {
     alreadyDispatched = await hasConciergeStarter(env, project.id)
@@ -321,19 +514,6 @@ export async function runProjectConcierge(
   }
   if (alreadyDispatched) {
     return { registered, decision: { action: 'noop', reason: 'already_dispatched' }, taskId: null }
-  }
-
-  let advancing: boolean
-  try {
-    advancing = await hasAdvancingTask(env, project.id)
-  } catch {
-    // Fail-closed: if we can't verify the board is empty, never dispatch on
-    // uncertain state — a missed dispatch this tick self-corrects next tick; a
-    // duplicate dispatch does not.
-    return { registered, decision: { action: 'noop', reason: 'error' }, taskId: null }
-  }
-  if (advancing) {
-    return { registered, decision: { action: 'noop', reason: 'has_advancing_work' }, taskId: null }
   }
 
   // (d) Dispatch — exactly one starter task, through the canonical createTask() path.
@@ -374,6 +554,8 @@ export interface ConciergeTickResult {
   projects: number
   registered: number
   dispatched: number
+  /** tasks the work-router assigned to online builders this tick (across all projects) */
+  routed: number
   noop: number
   errors: number
 }
@@ -392,12 +574,13 @@ export async function runConciergeTick(env: Env, deps: ConciergeDeps = {}): Prom
   try {
     projects = await list(env)
   } catch {
-    return { ok: false, projects: 0, registered: 0, dispatched: 0, noop: 0, errors: 0 }
+    return { ok: false, projects: 0, registered: 0, dispatched: 0, routed: 0, noop: 0, errors: 0 }
   }
 
   const batch = projects.slice(0, MAX_PROJECTS_PER_TICK)
   let registered = 0
   let dispatched = 0
+  let routed = 0
   let noop = 0
   let errors = 0
 
@@ -406,11 +589,12 @@ export async function runConciergeTick(env: Env, deps: ConciergeDeps = {}): Prom
       const result = await runProjectConcierge(env, project, deps)
       if (result.registered) registered++
       if (result.decision.action === 'dispatch') dispatched++
+      else if (result.decision.action === 'route') routed += result.decision.routed
       else noop++
     } catch {
       errors++ // one bad project cycle must not stop the rest of the sweep
     }
   }
 
-  return { ok: true, projects: batch.length, registered, dispatched, noop, errors }
+  return { ok: true, projects: batch.length, registered, dispatched, routed, noop, errors }
 }

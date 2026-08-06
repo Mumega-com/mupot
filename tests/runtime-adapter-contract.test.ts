@@ -337,6 +337,7 @@ describe('runtime-adapter/v1 contract artifact', () => {
     expect(workflow).toContain('actions/upload-artifact@v4')
     expect(workflow).toContain('tmp/local-smoke')
     expect(workflow).toContain('tmp/local-runtime-conformance')
+    expect(workflow).toContain('tmp/local-project-routine')
 
     const migration = commandBlock('"${WRANGLER[@]}" d1 migrations apply mupot-local-test', 'say "Seeding local D1 fixtures"')
     const seed = commandBlock('"${WRANGLER[@]}" d1 execute mupot-local-test', 'say "Starting local Wrangler server')
@@ -361,8 +362,36 @@ describe('runtime-adapter/v1 contract artifact', () => {
     const healthCall = script.lastIndexOf('\nwait_for_health\n')
     const browserCall = script.indexOf('npm run smoke:local', healthCall)
     const runtimeCall = script.indexOf('npm run conformance:runtime:local', browserCall)
+    const routineCall = script.indexOf('npm run collect:project-routine:local', runtimeCall)
+    const routineCheck = script.indexOf('npm run receipt:project-routine:check', routineCall)
     expect(healthCall).toBeGreaterThan(script.indexOf('dev_pid="$!"'))
     expect(browserCall).toBeGreaterThan(healthCall)
     expect(runtimeCall).toBeGreaterThan(browserCall)
+    expect(routineCall).toBeGreaterThan(runtimeCall)
+    expect(routineCheck).toBeGreaterThan(routineCall)
+  })
+
+  it('records Goose / goosed fleet-runtime non-adoption beside the contract', () => {
+    const decision = readFileSync(
+      new URL('../docs/fleet/goose-non-adoption-2026-07-22.md', import.meta.url),
+      'utf8',
+    )
+    const contractDoc = readFileSync(
+      new URL('../docs/runtime-adapter-contract.md', import.meta.url),
+      'utf8',
+    )
+    const attachRoutes = readFileSync(
+      new URL('../src/fleet/attach-routes.ts', import.meta.url),
+      'utf8',
+    )
+
+    expect(decision).toMatch(/kasra-core reviewed and ACCEPTS/i)
+    expect(decision).toContain('native CLI subscription')
+    expect(decision).toContain('goosed')
+    expect(decision).toContain('e89df2c2')
+    expect(contractDoc).toContain('goose-non-adoption-2026-07-22.md')
+    expect(attachRoutes).toContain('goose-non-adoption-2026-07-22.md')
+    expect(attachRoutes).not.toMatch(/['"]goose['"]/)
+    expect(attachRoutes).not.toMatch(/['"]goosed['"]/)
   })
 })

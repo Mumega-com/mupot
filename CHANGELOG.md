@@ -1,5 +1,158 @@
 # Changelog
 
+## Unreleased
+
+- **C10 — the backpressure governor is provenance-aware** (`src/agents/loop.ts`,
+  `countOpenBacklog`). Its unassigned branch treated "open + unassigned + in my squad"
+  as "backlog this agent's loop produced". An externally-imported task matches that
+  shape exactly, so imports counted against `MAX_OPEN_TASKS`: **import ten issues to a
+  connected board and the agent's loop stops producing** — denial of work through an
+  integration's normal intended use, no credential compromise, nothing in any log that
+  looks like an attack. Also a plain correctness bug with no attacker: the function's
+  own doc comment promises it counts what this loop produced, and it did not.
+  - The **assigned** branch deliberately still counts external rows. Once an admin takes
+    the explicit `task_update`/PATCH step, external work is real backlog and must exert
+    backpressure; narrowing both would trade a denial-of-work hole for an unbounded-work
+    one. The boundary is "nobody has decided this is mine yet".
+  - Tested against real SQL, asserting on `runGoalCycle`'s **outcome**. The existing
+    coverage in `tests/sane-brain-s3.test.ts` regexes the query string and passed
+    continuously while this defect was live — a test that pins the mechanism cannot fail
+    on a bug in that mechanism's meaning. Verified by reverting the fix: 3 of 6 fail
+    without it.
+  - Empty-string provenance is locked by two further cases. `IS NULL` is the condition
+    for counting a row as first-party, so `''` fails it and is excluded — the safe
+    direction. A proposed `COALESCE(col,'') = ''` remedy would have **introduced** the
+    denial of work it was meant to prevent; it was rejected by running it against both
+    versions rather than by reasoning about it.
+
+
+- **Blank provenance can no longer become trusted absence** (adversarial gate BLOCK).
+  `migrations/0077` defines the trust boundary as `external_source IS NULL` vs
+  `IS NOT NULL`, but every runtime check spelled it with JavaScript truthiness. Those
+  disagree on exactly one value: **the empty string is non-null in SQL and falsy in JS**.
+  Reproduced against the real migrations — a task created with `externalSource: ''`
+  stored `external_source=''`, **kept its `assignee_agent_id`, and executed through to a
+  model turn**. SQL called the row external, the runtime called it first-party, and the
+  row was governed by whichever layer was asked.
+  - `createTask` now **rejects** blank/whitespace provenance. Coercing `''` to null would
+    turn a caller's bug into trusted absence — the exact "absence means permission"
+    pattern this audit set has been closing — and coercing it to a marker would invent
+    provenance nobody supplied.
+  - Every boundary check goes through one predicate, `isExternallySourced`, using explicit
+    `!= null`: execution, auto-pickup, content-intent, the prompt fence, and the admin
+    reassignment guards in both REST and MCP.
+  - `migrations/0078` adds INSERT/UPDATE triggers so a blank marker cannot be stored at
+    all, including by a direct D1 write or a restore. Existing blank rows are marked
+    `unknown:blank-provenance-0078` — **fail closed as external**, never promoted to local.
+  - This vindicates an earlier independent finding that raised the empty string against
+    the provenance work. That report located it in `countOpenBacklog`, where `IS NULL`
+    already excluded `''` correctly and the proposed change would have introduced a bug —
+    but the underlying instinct, that the stamp is load-bearing and `''` breaks it, was
+    right, and this is where it was true.
+- **Dependency tree unwedged**: `agents` dropped (unused), `cron-schedule` declared
+  explicitly. The tree was stuck — `agents@0.14.5` required `ai@^6` while its own peer
+  `@cloudflare/ai-chat` pulled `ai@7`, so every tree modification failed `ERESOLVE` and
+  **`npm audit fix` silently no-opped**, reporting nothing done even where it claimed a
+  fix was available. That is why advisories accumulated and why overrides were the only
+  thing that ever worked. Not neglect — the tool could not act.
+  - `agents` had no static import, no `require`, no dynamic import, no type-only use and
+    no wrangler config reference. Both Durable Object classes (`AgentDO`,
+    `SquadCoordinatorDO`) are ours, in `src/agents/`.
+  - But removing it broke 53 test files with `TS2307: Cannot find module 'cron-schedule'`
+    — it was transitively supplying a module `src/routines/schedule.ts` imports directly.
+    Declared first, then removed.
+  - Production audit stays at **0**. The `@hono/node-server` and `body-parser` overrides
+    stay live: they are reached via `@modelcontextprotocol/sdk`, which is a direct
+    dependency, so dropping `agents` did not orphan them (checked rather than assumed).
+
+
+- **Production dependencies: 0 known vulnerabilities**, verified from the lockfile
+  (`npm audit --package-lock-only --omit=dev`) rather than from a local tree.
+  - Corrected overrides that were pinned to the TOP of a vulnerable range instead of
+    past it — the original #662/#464 defect. `postcss` was still `8.5.18` against an
+    advisory of `<=8.5.22`; the fix for that class of bug had the same bug in it.
+  - `hono` `^4.12.28` → `^4.13.0` (CORS middleware ReDoS, GHSA-8j4g-w8fx-2239). This
+    one is our production router on an external-facing surface.
+  - Added overrides: `@hono/node-server ^2.0.5` (serve-static path traversal, reached
+    via `@modelcontextprotocol/sdk` ← `agents`), `body-parser ^2.2.3` (DoS via a limit
+    value that silently disables size enforcement).
+  - Went from 15 advisories (6 high) to **0 production / 3 dev**.
+
+- **CI dependency audit split by what actually ships** (`.github/workflows/ci.yml`).
+  - Production: **BLOCKING at `moderate`**, tightened from `high`. Production is at 0,
+    so this now blocks on the first regression instead of waiting for one to reach
+    "high". Strictly stronger on shippable surface.
+  - Dev toolchain: gated against an **explicit allowlist** (`.github/audit-allowlist.json`
+    + `scripts/audit-gate.mjs`), not waived. `undici` has an open high reachable as
+    `wrangler → miniflare → undici`, **no wrangler version exists without it**, and npm's
+    remediation is to DOWNGRADE wrangler 4.118 → 4.35.0 — so the combined gate could only
+    be permanently red or actively harmful.
+  - The first attempt at this used `npm audit --audit-level=high || true` and was
+    **blocked in review**: `|| true` does not accept the known chain, it accepts *every
+    future* high/critical dev advisory and every audit-tool failure — and it made #670's
+    close condition undetectable, because the step passes identically whether the known
+    advisory is still there or ten new ones have joined it. The allowlist fails in **both**
+    directions: a high/critical advisory that is not listed, **and** a listed entry that
+    has stopped appearing (a fix shipped — delete it). It also fails on an audit it cannot
+    run or parse, rather than reading silence as safety. The stale direction is what
+    `|| true` could never do, and it makes #670 self-closing rather than dependent on
+    someone remembering to check.
+  - Exactly **one** advisory is accepted (GHSA-4cwx-7wf7-3272). The other four undici
+    advisories in the same chain are moderate and so do not block — deliberately absent
+    rather than allowlisted. Residual risk named rather than dismissed: this is real
+    exposure to a compromised build host, just not shippable surface.
+  - **Six bypasses were reproduced against this gate in review before it was accepted**,
+    and the last three were the same mistake three times: binding a *projection* of the
+    dependency graph rather than the graph. `nodes` is an install location; a flattened
+    ancestry name-set is not a path; and `npm audit --json` keys its findings by package
+    **name**, so an npm alias (`wrangler-alias@npm:wrangler`) — a genuinely second root
+    edge — collapsed into the accepted chain and passed with zero violations. The audit
+    summary cannot express node identity, so paths now come from **package-lock.json**
+    (`scripts/lockfile-paths.mjs`), keyed by node path and resolved version.
+  - Lockfile ambiguity fails closed: an unresolvable declared dependency, a target absent
+    from the lockfile, an orphan reachable from no root edge, or more than `MAX_PATHS`
+    routes all fail rather than producing a plausible-looking answer. Optional deps and
+    optional peers may legitimately be uninstalled and do not trip it.
+  - Staleness is classified **GONE / MOVED / UNKNOWN**. The earlier single message told
+    the operator "a fix shipped — delete this entry" even when the advisory was still
+    present and had merely moved, which made deleting a live exemption the cheapest way
+    to get a green build.
+  - **PR #664 was an earlier attempt to relax this gate and was retracted the same day**,
+    because its premise came from a stale local `node_modules` while CI's clean `npm ci`
+    had 5 production highs. That precedent is recorded in the workflow comment and in
+    #670 so the next person to touch this gate has to take their premise from the
+    lockfile, not from a local tree.
+
+## 2026-08-02/03 — the weekend the loop became real
+
+- 4-technician operator loop shipped (#623/#624/#630/#644): tech-grok (minted
+  identity, 30d TTL), claude lane (haiku), mumcp, review gate; codex lane built
+  then PAUSED by its own security audit pending the cage predicate (#645 BLOCK).
+- design-status gate: 4 adversarial rounds → merged #640, now a REQUIRED check
+  (branch protection enabled). Gate caught kasra twice, athena twice, itself once.
+- Federated Control Plane Phase 0 ADR merged (452f11db) after adversarial BLOCK
+  found a deleted-constraints "restore" + 7 codex remediation rounds. Phase 1 open.
+- FLIGHT 00b2ef4b launched (GEO scanner, mupot#574): first real flight — codex
+  builds, athena review-first, mubot announces to Telegram via hermes send.
+- Verdict delegation proven: athena fired 4 verdicts under granted gate:kasra-core.
+- steward-worker added: auto-reissue of infra-blocked/orphaned tasks + Telegram
+  digest — the board now repairs itself.
+- Identity/comms healed: kasra SOS token reminted (was hash-only, raw lost since
+  June), exposed mumega token rotated dead, wake-storm fixed (7,103 warnings/14d),
+  OpenClaw dead routes removed, athena hooks fixed, all channels probe-verified.
+- Brain rot cleaned: organ-daemon retired (10/10 organisms were healthy daemons
+  killed by a batch timeout — dead-since-refactor), duplicate wakes removed,
+  "Gemma free" doc myth corrected; Mirror 501 no-op consolidation filed (#596).
+- Roster enforced (Hadi): tmux kasra/codex/athena/river; mubot sole gateway.
+- FIRST LIVE GEO SCANS (2026-08-03 ~05:15Z): 3/3 grounded queries ok, visibility
+  events emitted to PostHog — the DME trend clock started. En-route fixes:
+  PR #647 token-file Vertex auth fallback (merged), profile google_project_id
+  corrected mumegaproject→mumega-com (403 root cause), ADC-minted token
+  (gcloud CLI refresh broken). Residual: mupot receipt sink 404 + daily
+  cadence timer + profile upstream — task b6addee4 (mumega-com#601, codex).
+- Mission board live: mupot project goal field carries CURRENT/NEXT mission,
+  served in every agent's boot_context; squad broadcast sent.
+
 All notable changes to mupot. Semver; pre-1.0 minor bumps may break.
 
 **What ships next:** see [ROADMAP.md](ROADMAP.md). The roadmap (planned, by version) and
@@ -7,6 +160,163 @@ this changelog (shipped, dated) share version numbers and feed each other — a 
 block collapses into a changelog entry when it ships.
 
 ## [Unreleased]
+
+### Added
+
+- Linear connector (flight-20260803-linear-posthog): `createLinearBoardPort`
+  (`src/projects/providers/linear.ts`) now does real, read-only GraphQL reads
+  against Linear (`src/integrations/linear-issues.ts`) through the existing
+  connector vault (`connector type 'linear'`, already registered in
+  `src/connectors/crypto.ts`/`dashboard.ts` since #issue-116-era scaffolding —
+  this flight replaces the `linear_adapter_pending_credentials` stub with the
+  live adapter). Recon during this flight found the port/registry/binding
+  layer for Linear already built (`src/projects/providers/{port,registry,
+  bindings}.ts`); only the adapter body was a stub — narrower work than the
+  flight's "Linear: greenfield" premise assumed.
+  - Structural, not discretionary, enforcement of "a priority surface must
+    never be an authorization surface": imported issues become UNASSIGNED
+    mupot tasks (`assignee_agent_id` is always `null` — no field on a Linear
+    issue, including its assignee, is ever mapped to a mupot agent), routed
+    only to an admin-configured `defaultSquadId` (set via the existing
+    project-binding `meta_json`, e.g. `{"defaultSquadId":"squad-a"}` —
+    absent it, every item reports `no_squad` and nothing is written).
+    Task creation passes `skipEvent: true` (no `task.created` bus event, so
+    `bus/consumer.ts`'s `dispatchSquad` — the actual wake mechanism — never
+    fires for Linear-origin data) and `skipMirror: true` (no outbound GitHub
+    issue write from externally-sourced text). This deliberately does NOT
+    mirror `src/integrations/github-projects.ts`'s agent-field-to-assignee
+    resolution, which is exactly the part of that pattern this flight's
+    binding constraint forbids for a read-only priority source.
+  - Added the `'linear'` case to `useConnectorById`'s auth-header construction
+    in `src/connectors/service.ts` (raw API key, no `Bearer` prefix — differs
+    from posthog/inkwell), the same extension point telegram/posthog/mcpwp
+    already register through.
+  - `TaskBoardSyncResult.items[].status` gained `'no_squad'` (additive; distinct
+    from GitHub's `'no_agent'`) in `src/projects/providers/port.ts`.
+  - Tests: `tests/linear-issues.test.ts`, `tests/linear-board-provider.test.ts`,
+    `tests/connectors-linear-auth.test.ts` — tenant isolation, revoked/missing
+    credential fail-closed, redirect/non-2xx fail-closed, secret never echoed,
+    dedup, and a **structural** source-text assertion (not just behavioral)
+    that the file never resolves a Linear field to an agent and always passes
+    `skipEvent`/`skipMirror`, so a future edit that reintroduces a dispatch
+    path fails this suite immediately.
+  - PostHog: recon found the tenant-scoped vault path and the owner-gated
+    env-credentials fallback (#473 CONCERN-2) were **already shipped**
+    (`src/addons/marketing/adapters/posthog.ts`, `isPotOwnerTenant`) with
+    thorough existing coverage in `tests/marketing-monitor-adapters.test.ts` —
+    no PostHog migration work remained for this flight beyond confirming it
+    (all suites re-run green). PostHog "capture" (event-ingestion) scope was
+    NOT implemented — no caller in the codebase needs it; flagging as an open
+    gap rather than building an unused write-shaped surface.
+
+### Security
+
+- **P0 fix (PR #659 diverse-model adversarial gate BLOCK, widened): external-content
+  tasks could reach an autonomous model turn with zero human step.** The Linear
+  connector's `skipEvent`/`skipMirror` only suppressed the `task.created` EVENT wake —
+  two status-POLLING drivers never looked at events at all and (pre-fix) had no column
+  to test: `canAgentExecuteTask`'s unassigned-auto-pickup branch
+  (`src/agents/execute.ts`) and the concierge's `routeUnassignedWork` maintenance cron
+  (`src/concierge/service.ts`). A parallel audit found the same choke-point gap live on
+  **`main`** in a more severe shape: `src/integrations/github-projects.ts` resolved a
+  GitHub Project field to a real pot agent and called `createTask` with
+  `assignee_agent_id` set AND no `skipEvent` — `task.created` fired, `dispatchSquad`
+  woke that exact agent, and `executeTaskAsPR` shipped work authored as it, from
+  attacker-editable field/title text, bypassing BOTH existing guards (the unassigned
+  check never applied; the admin-gated reassignment check only fires on a later
+  `task_update`, never on `createTask` itself).
+  - `Task.external_source` (migrations/0077) generalizes the `source_pot` trust
+    invariant (NULL = trusted local write) for non-pot external integrations. Checked
+    everywhere `source_pot` is checked: `canAgentExecuteTask`'s unassigned branch,
+    `routeUnassignedWork`'s WHERE clause, the admin-gated reassignment guard
+    (`src/tasks/index.ts`, `src/mcp/index.ts`), the content-intent short-circuit skip,
+    and the untrusted-content prompt fence (`buildExecutePrompt`/`buildExecuteSystem`,
+    `src/lib/prompt-safety.ts`).
+  - **Choke-point fix in `createTask`** (`src/tasks/service.ts`): any task carrying
+    `externalSource` is now FORCED unassigned at creation, structurally, regardless of
+    what a caller passes — closes the github-projects.ts class of bug for every
+    current and future external-integration caller, not just the ones that remember
+    not to pass an assignee. `external_source` is written only when actually set (not
+    unconditionally), so it stays compatible with pinned-migration/hand-rolled test DB
+    schemas that predate migration 0077.
+  - Marked at all five confirmed external-content entry points: Linear
+    (`linear:<teamKey>`), GitHub Projects (`github-projects:<owner>/<number>`, now
+    imports unassigned — `agentValue` is display-only, same shape as Linear's
+    `assigneeHint`), the GitHub `issues.opened` webhook and generic mapped-event path
+    (`github-webhook:<type>`), the GHL inbound webhook (`ghl-webhook`), and
+    `src/events/ingest.ts`'s generic HTTP ingest route (`event-ingest:<source>`,
+    found during the widened audit — HMAC-authenticated as a transport, but
+    `event.payload` content is fully external-system-controlled).
+  - Carried through `scripts/steward-worker.py`'s auto-reissue (the "amplifier" the
+    gate flagged: a reissued task went through `task_create` WITH an event, unmarked,
+    laundering a blocked external task into the exact wake `skipEvent` removed) and
+    through the `task_create` MCP tool's new optional `external_source` arg
+    (bounded, monotonic-safe — see the tool's inputSchema comment).
+  - `identifier`/`url` capped at 100/500 chars in `src/integrations/linear-issues.ts`
+    (title was already capped; these were `typeof string` only and landed uncapped
+    into task `body`/`done_when`).
+  - Low finding fixed: `createLinearBoardPort.syncIntoProject`
+    (`src/projects/providers/linear.ts`) no longer stamps `synced_at` when the binding
+    is `no_squad`-misconfigured — that was a false "synced successfully" receipt
+    hiding a binding with no admin-configured squad.
+  - Tests replace the insufficient source-regex mechanism pin
+    (`tests/linear-issues.test.ts`) with property tests against the real functions —
+    `tests/execute.test.ts`, `tests/concierge-service.test.ts`,
+    `tests/linear-issues.test.ts`, `tests/github-projects.test.ts`,
+    `tests/external-source-callsites.test.ts`, `tests/mcp-task-tools.test.ts`,
+    `scripts/test_steward_worker.py` — each verified to fail on the pre-fix commit
+    for the right reason (the task IS auto-picked-up / IS auto-assigned), not
+    because a helper is missing.
+
+### Changed
+
+- Fleet coordination cut over to mupot CF-native primitives (D1 send/inbox + presence +
+  Queue wake); SOS Redis bus reduced to a documented compat shim (ADR #473).
+- Formal gate decision: Goose / `goosed` fleet-runtime **non-adoption** (kasra-core
+  ACCEPTS). Native CLI subscription agents remain the fleet substrate; ACP wrappers
+  that re-enter the same CLIs are out of scope. Correctly scoped replacement for
+  task `e89df2c2` (rejected on process, not conclusion). Decision:
+  `docs/fleet/goose-non-adoption-2026-07-22.md`; attach allow-list stays without
+  `goose`/`goosed`. Technical basis reused from PR #483 / `b8070e2`.
+
+## [0.25.0] — 2026-07-27
+
+**Project Routines and Needs You.** Active Projects can schedule governed work through
+existing external agent runtimes, retain durable run state and evidence, and surface
+human decisions in one queue without turning Mupot into an agent harness.
+
+### Added
+
+- Project-owned Routines and Routine Runs with manual, once, and cron schedules,
+  timezone-aware occurrences, overlap policies, bounded retries, leases, cancellation,
+  cost snapshots, and immutable lifecycle events (#579).
+- A shared Needs You projection for Routine waits, task reviews, blocked work, and
+  budget decisions across dashboard, REST, MCP, and Project Situation views (#579).
+- Local lifecycle evidence that exercises a complete Routine through Task, Flight,
+  external runtime dispatch, approval, replay, cancellation, and receipt paths (#579).
+
+### Changed
+
+- Routine scheduling uses isolated one-minute and staggered maintenance cron triggers
+  so Cloudflare invocation budgets do not silently drop project work (#579, #582).
+- Historical review tasks created without a gate owner can be repaired by an owner or
+  admin through either REST or MCP; ordinary members cannot rewrite locked gates (#343).
+- Compiled native addons retain their digest-bound v0.24 lifecycle identity across the
+  additive v0.25 host minor; external addon compatibility remains strict.
+- Console consolidation remains planned for v0.26 under #584. It is not claimed as a
+  v0.25 feature.
+
+### Security
+
+- Project, squad, tenant, and capability checks are reapplied at each scheduling,
+  claim, dispatch, cancellation, approval, and projection boundary.
+- Mupot stores governance state and evidence while Hermes, Codex, Claude Code, and
+  other external runtimes remain replaceable executors.
+
+### Verified
+
+- Exact-head CI, independent review, migration compatibility, browser evidence, REST
+  and MCP parity, no-secrets scanning, and the full test suite gate this release.
 
 ## [0.24.0] — 2026-07-19
 
