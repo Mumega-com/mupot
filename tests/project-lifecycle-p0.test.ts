@@ -29,6 +29,11 @@ import {
 } from '../src/projects/stall-detector'
 import { loadProjectSituation } from '../src/projects/situation'
 import { stripExternalLifecycleFields } from '../src/projects/lifecycle-input'
+import {
+  nextCycleBoundary,
+  scheduleCycleBoundary,
+  processProjectCycleCreation,
+} from '../src/projects/cycle-creation'
 
 const authState = vi.hoisted(() => ({ current: null as AuthContext | null }))
 
@@ -429,6 +434,141 @@ describe('bare updateProject still requires internal via flags', () => {
       insertProject(harness, { id: 'proj-bare', status: 'active', boundary: null })
       await expect(updateProject(env, 'proj-bare', { status: 'review' }))
         .resolves.toEqual({ ok: false, error: 'completion_gate_required' })
+    } finally {
+      harness.close()
+    }
+  })
+})
+
+describe('Slice 5: cycle creation (rollover only, NO auto-carry)', () => {
+  it('nextCycleBoundary: schedules first boundary when none exists', () => {
+    const boundary = nextCycleBoundary(NOW, null, 14)
+    expect(boundary).toBeTruthy()
+    const ms = Date.parse(boundary!)
+    const nowMs = Date.parse(NOW)
+    const diff = ms - nowMs
+    const days = diff / (24 * 60 * 60 * 1000)
+    expect(days).toBeCloseTo(14, 0)
+  })
+
+  it('nextCycleBoundary: advances past boundary by interval', () => {
+    const oldBoundary = '2026-07-01T00:00:00.000Z'
+    const boundary = nextCycleBoundary(NOW, oldBoundary, 14)
+    expect(boundary).toBeTruthy()
+    const ms = Date.parse(boundary!)
+    const oldMs = Date.parse(oldBoundary)
+    const diff = ms - oldMs
+    const days = diff / (24 * 60 * 60 * 1000)
+    expect(days).toBeCloseTo(14, 0)
+  })
+
+  it('nextCycleBoundary: does not change future boundary', () => {
+    const futureBoundary = '2026-08-23T00:00:00.000Z'
+    const boundary = nextCycleBoundary(NOW, futureBoundary, 14)
+    expect(boundary).toBeNull()
+  })
+
+  it('scheduleCycleBoundary: schedules first boundary for active projects', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    try {
+      insertProject(harness, { id: 'proj-cycle-1', status: 'active', boundary: null })
+      const outcome = await scheduleCycleBoundary(env, 'proj-cycle-1', NOW, 14)
+      expect(outcome).toBe('scheduled')
+      const project = await getProject(env, 'proj-cycle-1')
+      expect(project?.cycle_boundary_at).toBeTruthy()
+      const ms = Date.parse(project!.cycle_boundary_at!)
+      const nowMs = Date.parse(NOW)
+      expect(ms - nowMs).toBeCloseTo(14 * 24 * 60 * 60 * 1000, -2)
+    } finally {
+      harness.close()
+    }
+  })
+
+  it('scheduleCycleBoundary: advances past boundaries', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    try {
+      insertProject(harness, { id: 'proj-cycle-2', status: 'active', boundary: BOUNDARY })
+      const outcome = await scheduleCycleBoundary(env, 'proj-cycle-2', NOW, 14)
+      expect(outcome).toBe('advanced')
+      const project = await getProject(env, 'proj-cycle-2')
+      const newBoundaryMs = Date.parse(project!.cycle_boundary_at!)
+      const oldBoundaryMs = Date.parse(BOUNDARY)
+      const diff = newBoundaryMs - oldBoundaryMs
+      expect(diff / (24 * 60 * 60 * 1000)).toBeCloseTo(14, 0)
+    } finally {
+      harness.close()
+    }
+  })
+
+  it('scheduleCycleBoundary: skips future boundaries', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    try {
+      const futureBoundary = '2026-08-23T00:00:00.000Z'
+      insertProject(harness, { id: 'proj-cycle-3', status: 'active', boundary: futureBoundary })
+      const outcome = await scheduleCycleBoundary(env, 'proj-cycle-3', NOW, 14)
+      expect(outcome).toBe('skipped')
+      const project = await getProject(env, 'proj-cycle-3')
+      expect(project?.cycle_boundary_at).toBe(futureBoundary)
+    } finally {
+      harness.close()
+    }
+  })
+
+  it('scheduleCycleBoundary: skips non-active projects', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    try {
+      insertProject(harness, { id: 'proj-cycle-4', status: 'planned', boundary: null })
+      const outcome = await scheduleCycleBoundary(env, 'proj-cycle-4', NOW, 14)
+      expect(outcome).toBe('skipped')
+      const project = await getProject(env, 'proj-cycle-4')
+      expect(project?.cycle_boundary_at).toBeNull()
+    } finally {
+      harness.close()
+    }
+  })
+
+  it('processProjectCycleCreation: schedules boundaries for multiple projects', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    try {
+      insertProject(harness, { id: 'proj-cycle-5', status: 'active', boundary: null })
+      insertProject(harness, { id: 'proj-cycle-6', status: 'active', boundary: null })
+      insertProject(harness, { id: 'proj-cycle-7', status: 'active', boundary: BOUNDARY })
+      const result = await processProjectCycleCreation(env, NOW, 14)
+      expect(result.scanned).toBe(3)
+      expect(result.scheduled).toBe(2)
+      expect(result.advanced).toBe(1)
+      expect(result.errors).toBe(0)
+    } finally {
+      harness.close()
+    }
+  })
+
+  it('NO auto-carry: updating boundary does not move tasks', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    try {
+      insertProject(harness, { id: 'proj-no-carry', status: 'active', boundary: BOUNDARY })
+      harness.sqlite.exec(`
+        INSERT INTO tasks (
+          id, squad_id, project_id, title, body, done_when, status, assignee_agent_id,
+          github_issue_url, result, completed_at, gate_owner, created_at, updated_at
+        ) VALUES (
+          'task-incomplete', 'squad-a', 'proj-no-carry', 'Incomplete work', '', 'done',
+          'open', 'agent-worker', NULL, NULL, NULL, NULL,
+          '2026-06-01T00:00:00.000Z', '2026-06-01T00:00:00.000Z'
+        );
+      `)
+      const outcome = await scheduleCycleBoundary(env, 'proj-no-carry', NOW, 14)
+      expect(outcome).toBe('advanced')
+      const taskAfter = await env.DB.prepare('SELECT status FROM tasks WHERE id = ?1')
+        .bind('task-incomplete')
+        .first<{ status: string }>()
+      expect(taskAfter?.status).toBe('open')
     } finally {
       harness.close()
     }

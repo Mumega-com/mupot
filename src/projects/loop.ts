@@ -1,5 +1,6 @@
 // Project lifecycle loop — circuit breaker (slice 1) + structural completion
-// (slice 2) + start-gate ghost alarm (slice 3) + stall detector (slice 4).
+// (slice 2) + start-gate ghost alarm (slice 3) + stall detector (slice 4) +
+// cycle creation (slice 5).
 //
 // Design: docs/superpowers/specs/2026-07-23-project-lifecycle-control-loop-design.md
 // Mirrors src/concierge/service.ts / src/loops/driver.ts: one bounded sweep per tick,
@@ -36,6 +37,10 @@ import {
   type StallDetectorDeps,
   type StallDetectorOutcome,
 } from './stall-detector'
+import {
+  DEFAULT_CYCLE_DAYS,
+  processProjectCycleCreation,
+} from './cycle-creation'
 
 /** Cap projects evaluated per cron tick — mirrors MAX_PROJECTS_PER_TICK / MAX_LOOPS_PER_TICK. */
 export const MAX_BOUNDARY_PROJECTS_PER_TICK = 25
@@ -54,6 +59,8 @@ export interface ProjectLoopTickResult {
   ghost_alarmed: number
   stall_flagged: number
   stall_cleared: number
+  cycles_scheduled: number
+  cycles_advanced: number
   errors: number
 }
 
@@ -161,8 +168,9 @@ export async function listActiveProjectsForStall(env: Env): Promise<Project[]> {
 
 /**
  * runProjectLoopTick — one heartbeat for project lifecycle.
- * Order: stall detect → circuit breaker (so early raise sees fresh flags) →
- * structural completion → ghost-start alarm.
+ * Order: cycle creation (slice 5) → stall detect → circuit breaker
+ * (so early raise sees fresh flags) → structural completion →
+ * ghost-start alarm.
  * Best-effort: a failed list returns {ok:false}; a failed project is counted and
  * does not abort the sweep.
  */
@@ -192,6 +200,22 @@ export async function runProjectLoopTick(
   let ghostAlarmed = 0
   let stallFlagged = 0
   let stallCleared = 0
+  let cyclesScheduled = 0
+  let cyclesAdvanced = 0
+
+  const cycleInterval = DEFAULT_CYCLE_DAYS
+  try {
+    const cycleResult = await processProjectCycleCreation(env, nowIso, cycleInterval)
+    cyclesScheduled = cycleResult.scheduled
+    cyclesAdvanced = cycleResult.advanced
+    errors += cycleResult.errors
+  } catch (err) {
+    errors++
+    console.error('project-loop: cycle creation failed (non-fatal)', {
+      tenant: env.TENANT_SLUG,
+      error: err instanceof Error ? err.message : String(err),
+    })
+  }
 
   let stallProjects: Project[]
   try {
@@ -207,7 +231,9 @@ export async function runProjectLoopTick(
       ghost_alarmed: 0,
       stall_flagged: 0,
       stall_cleared: 0,
-      errors: 0,
+      cycles_scheduled: cyclesScheduled,
+      cycles_advanced: cyclesAdvanced,
+      errors,
     }
   }
 
@@ -242,6 +268,8 @@ export async function runProjectLoopTick(
       ghost_alarmed: 0,
       stall_flagged: stallFlagged,
       stall_cleared: stallCleared,
+      cycles_scheduled: cyclesScheduled,
+      cycles_advanced: cyclesAdvanced,
       errors,
     }
   }
@@ -322,6 +350,8 @@ export async function runProjectLoopTick(
     ghost_alarmed: ghostAlarmed,
     stall_flagged: stallFlagged,
     stall_cleared: stallCleared,
+    cycles_scheduled: cyclesScheduled,
+    cycles_advanced: cyclesAdvanced,
     errors,
   }
 }
