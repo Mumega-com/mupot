@@ -2677,9 +2677,16 @@ const toolOrient: ToolSpec = {
     }
     const agentRef = resolved.value
 
+    // Same latent-grant authorization as connect (#712): orient is READ-ONLY and its
+    // packet is redacted by viewSensitive below, but it required `observer` on the squad —
+    // which a directory seat can never hold, because the B1 ceiling zeroes ambient
+    // authority. So the operator's only door could not orient either, and "boot" was
+    // impossible rather than merely limited. Authorizing a NAMED read against what the
+    // member actually holds keeps ambient authority at zero.
     const grants = auth.capabilities ?? []
-    const orgAdmin = hasCapability(grants, 'org', null, 'admin')
-    const onSquad = await memberCanOnSquad(env, grants, agentRef.squad_id, 'observer')
+    const claimGrants = auth.latentCapabilities ?? grants
+    const orgAdmin = hasCapability(claimGrants, 'org', null, 'admin')
+    const onSquad = await memberCanOnSquad(env, claimGrants, agentRef.squad_id, 'observer')
     if (!orgAdmin && !onSquad) return fail(403, 'forbidden', { need: 'observer', scope: 'squad' })
     const callerCapability = orgAdmin ? 'admin' : 'observer+'
 
@@ -2688,7 +2695,7 @@ const toolOrient: ToolSpec = {
     // || short-circuits, so the lead query only runs when not already self/admin.
     const isSelf = auth.boundAgentId === agentRef.id
     const viewSensitive =
-      orgAdmin || isSelf || (await memberCanOnSquad(env, grants, agentRef.squad_id, 'lead'))
+      orgAdmin || isSelf || (await memberCanOnSquad(env, claimGrants, agentRef.squad_id, 'lead'))
 
     const { data, notFound } = await buildOrient(
       env,
@@ -2769,9 +2776,27 @@ const toolConnect: ToolSpec = {
     // Authorization: caller must have squad-member capability on this agent's squad.
     // An org-admin also passes (inherits down via memberCanOnSquad). This prevents an
     // authorized-but-unscoped token from claiming an agent on a squad it has no access to.
+    //
+    // AUTHORIZED AGAINST LATENT GRANTS (#712). connect is READ-ONLY — it writes nothing,
+    // returns an orient packet, and redacts it unless the caller is org-admin, the agent
+    // itself, or a squad lead. Gating that read behind AMBIENT capability meant a
+    // directory seat could never pass, because the B1 ceiling guarantees ambient = [].
+    // The result was a dead-end loop: boot_context told the operator to call connect, and
+    // connect refused — on the only door the operator has. Reproduced live on the owner's
+    // own claude.ai seat, which could call `status` and nothing else.
+    //
+    // Authorizing the NAMED claim against what the member truly holds keeps the ceiling's
+    // real guarantee intact — zero ambient authority, nothing inherited silently — while
+    // making one explicit, auditable, side-effect-free selection act possible. Packet
+    // sensitivity is still decided separately by viewSensitive below, so a bare member
+    // claiming a PEER gets exactly the redacted packet it got before.
+    //
+    // On every non-directory channel latentCapabilities === capabilities, so this is a
+    // no-op there.
     const grants = auth.capabilities ?? []
-    const orgAdmin = hasCapability(grants, 'org', null, 'admin')
-    const onSquad = await memberCanOnSquad(env, grants, agentRef.squad_id, 'member')
+    const claimGrants = auth.latentCapabilities ?? grants
+    const orgAdmin = hasCapability(claimGrants, 'org', null, 'admin')
+    const onSquad = await memberCanOnSquad(env, claimGrants, agentRef.squad_id, 'member')
     if (!orgAdmin && !onSquad) {
       // A directory-channel seat can NEVER pass this check, by design: B1 in
       // src/mcp/oauth-authorize.ts sets `capabilities = []` for channel='directory'
@@ -2831,7 +2856,7 @@ const toolConnect: ToolSpec = {
     // at which point isSelf=true on all subsequent orient/connect calls. (#128)
     const isSelf = auth.boundAgentId === agentRef.id
     const viewSensitive =
-      orgAdmin || isSelf || (await memberCanOnSquad(env, grants, agentRef.squad_id, 'lead'))
+      orgAdmin || isSelf || (await memberCanOnSquad(env, claimGrants, agentRef.squad_id, 'lead'))
 
     // Resolve the full orient packet for the claimed agent (read-only, no D1 write).
     const { data, notFound } = await buildOrient(
