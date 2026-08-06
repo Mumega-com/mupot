@@ -713,6 +713,14 @@ describe('MCP granted multi-squad flight lifecycle', () => {
           created_at TEXT NOT NULL DEFAULT (datetime('now')), revoked_at TEXT,
           agent_id TEXT, tenant TEXT NOT NULL
         );
+        CREATE TABLE agent_member_bindings (
+          tenant TEXT NOT NULL, agent_id TEXT NOT NULL, member_id TEXT NOT NULL,
+          created_at TEXT NOT NULL, PRIMARY KEY (tenant, agent_id), UNIQUE (tenant, member_id)
+        );
+        CREATE TABLE memberships (
+          id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, squad_id TEXT NOT NULL,
+          capability TEXT NOT NULL, UNIQUE (agent_id, squad_id)
+        );
         CREATE TABLE capabilities (
           id TEXT PRIMARY KEY, member_id TEXT NOT NULL, scope_type TEXT NOT NULL, scope_id TEXT,
           capability TEXT NOT NULL CHECK (capability IN ('owner','admin','lead','member','observer')),
@@ -721,10 +729,18 @@ describe('MCP granted multi-squad flight lifecycle', () => {
         CREATE TABLE channel_capability_grants (
           id TEXT PRIMARY KEY, member_id TEXT NOT NULL, squad_id TEXT NOT NULL, capability TEXT NOT NULL
         );
+        -- NOTE (migrations/0079): priority + parent_task_id added here by hand, because this
+        -- fixture hand-writes tasks instead of applying the committed migration chain.
+        -- That is why this file broke on a purely-additive column: persistTaskUpdate writes
+        -- every column it owns, and this schema is a SUBSET of production's. It is one of the
+        -- 13 hand-written-schema tests tracked in #703, and this is the second time its
+        -- fixture has blocked a feature rather than caught a bug. Fixed properly by #703;
+        -- patched minimally here so a task-management change is not gated on that conversion.
         CREATE TABLE tasks (
           id TEXT PRIMARY KEY, squad_id TEXT NOT NULL, project_id TEXT, title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '',
-          done_when TEXT NOT NULL, status TEXT NOT NULL, assignee_agent_id TEXT, github_issue_url TEXT,
-          result TEXT, completed_at TEXT, gate_owner TEXT, source_pot TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+          done_when TEXT NOT NULL, status TEXT NOT NULL, priority TEXT, parent_task_id TEXT,
+          assignee_agent_id TEXT, github_issue_url TEXT,
+          result TEXT, completed_at TEXT, gate_owner TEXT, source_pot TEXT, external_source TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
         );
         CREATE TABLE task_verdicts (
           id TEXT PRIMARY KEY, task_id TEXT NOT NULL, verdict TEXT NOT NULL, note TEXT,
@@ -754,6 +770,8 @@ describe('MCP granted multi-squad flight lifecycle', () => {
         VALUES ('${MEMBER_ID}', 'Product', 'active', '${TENANT}');
         INSERT INTO members (id, display_name, status, tenant)
         VALUES ('member-operator', 'Operator', 'active', '${TENANT}');
+        INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+        VALUES ('${TENANT}', '${AGENT_ID}', '${MEMBER_ID}', '2026-07-24T00:00:00.000Z');
         INSERT INTO member_tokens (id, member_id, token_hash, revoked_at, agent_id, tenant)
         VALUES ('token-product', '${MEMBER_ID}', '${productTokenHash}', NULL, '${AGENT_ID}', '${TENANT}');
         INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)

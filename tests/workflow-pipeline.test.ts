@@ -217,6 +217,14 @@ describe('shared execution authorization', () => {
           tenant TEXT NOT NULL,
           revoked_at TEXT
         );
+        CREATE TABLE agent_member_bindings (
+          tenant TEXT NOT NULL,
+          agent_id TEXT NOT NULL,
+          member_id TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          PRIMARY KEY (tenant, agent_id),
+          UNIQUE (tenant, member_id)
+        );
         CREATE TABLE capabilities (
           id TEXT PRIMARY KEY,
           member_id TEXT NOT NULL,
@@ -238,6 +246,11 @@ describe('shared execution authorization', () => {
           body TEXT NOT NULL,
           done_when TEXT NOT NULL,
           status TEXT NOT NULL,
+          -- priority + parent_task_id (migrations/0079) added by hand: this fixture
+          -- hand-writes tasks instead of applying the committed chain, so it breaks
+          -- whenever a column joins the shared projection. Third time in one day (#703).
+          priority           TEXT,
+          parent_task_id     TEXT,
           assignee_agent_id TEXT,
           github_issue_url TEXT,
           result TEXT,
@@ -247,6 +260,7 @@ describe('shared execution authorization', () => {
           execution_receipt_id TEXT,
           execution_claim_expires_at INTEGER,
           source_pot TEXT,
+          external_source TEXT,
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL
         );
@@ -266,6 +280,8 @@ describe('shared execution authorization', () => {
         VALUES ('agent-wf-cross', 'squad-wf-home', 'active');
         INSERT INTO members (id, tenant, status)
         VALUES ('member-wf-cross', 'test', 'active');
+        INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+        VALUES ('test', 'agent-wf-cross', 'member-wf-cross', '2026-07-24T00:00:00.000Z');
         INSERT INTO member_tokens (id, member_id, agent_id, tenant, revoked_at)
         VALUES ('token-wf-cross', 'member-wf-cross', 'agent-wf-cross', 'test', NULL);
         INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)

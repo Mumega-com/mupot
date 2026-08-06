@@ -40,6 +40,38 @@ describe('addon registry', () => {
     })).rejects.toThrow('addon_mupot_incompatible')
   })
 
+  it('preserves an additive previous-minor lifecycle identity for compiled native addons', async () => {
+    const registry = createAddonRegistry()
+    const manifest = {
+      ...FixtureAddon,
+      key: 'previous-minor-native-addon',
+      version: '1.0.0',
+      mupotCompatibility: '^0.24.0',
+    }
+
+    await registry.register(manifest)
+
+    expect(registry.get(manifest.key)?.manifest).toMatchObject({
+      version: '1.0.0',
+      mupotCompatibility: '^0.24.0',
+    })
+  })
+
+  it('does not extend the additive native bridge to external addons', async () => {
+    const registry = createAddonRegistry()
+
+    await expect(registry.register({
+      ...FixtureAddon,
+      key: 'previous-minor-external-addon',
+      trustClass: 'external_isolated',
+      kind: 'external_mcp',
+      mupotCompatibility: '^0.24.0',
+      departments: [],
+      metrics: [],
+      consoleSections: [],
+    })).rejects.toThrow('addon_mupot_incompatible')
+  })
+
   it('rejects unknown department references', async () => {
     const registry = createAddonRegistry()
 

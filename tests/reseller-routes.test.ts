@@ -11,7 +11,18 @@ function envForRole(role: 'owner' | 'admin' | 'member'): Env {
   return {
     TENANT_SLUG: 't',
     BRAND: 'Test',
-    DB: { prepare: vi.fn(() => ({ bind: () => ({}), first: vi.fn(), all: vi.fn(), run: vi.fn() })) },
+    DB: {
+      prepare: vi.fn(() => ({
+        bind: () => ({
+          first: vi.fn(async () => null),
+          all: vi.fn(async () => ({ results: [] })),
+          run: vi.fn(async () => ({ meta: { changes: 0 } })),
+        }),
+        first: vi.fn(async () => null),
+        all: vi.fn(async () => ({ results: [] })),
+        run: vi.fn(async () => ({ meta: { changes: 0 } })),
+      })),
+    },
     SESSIONS: {
       get: vi.fn(async () =>
         JSON.stringify({ userId: 'u1', email: 'a@b.com', role, createdAt: '2026-01-01T00:00:00Z' }),

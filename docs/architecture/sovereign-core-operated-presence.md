@@ -121,7 +121,7 @@ The deployment gradient is the **pricing ladder**, marked by what actually ships
 | Mode | Status | Tier |
 |------|--------|------|
 | Managed (we host) | shipped | SaaS $ |
-| Your Cloudflare (`wrangler deploy`) | shipped — how mumega/DME run today | OSS free / SaaS $ |
+| Your Cloudflare (`scripts/deploy.mjs`) | shipped — how mumega/DME run today | OSS free / SaaS $ |
 | Your servers (workerd + storage adapters) | adapter-layer, partial | OSS free (DIY) |
 | On-prem / air-gap | planned | OSS free (DIY) + presence $$ |
 | Edge (Jetson-class) | planned | exploratory |

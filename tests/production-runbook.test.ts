@@ -55,6 +55,7 @@ describe('production self-hosting runbook', () => {
       'npx wrangler d1 execute "$RESTORE_DB" --remote --config "$RESTORE_CONFIG" --file "$BACKUP_DIR/d1.sql" --yes',
       'npx wrangler rollback <VERSION_ID> --config "$CONFIG"',
       'npx wrangler secret list --config "$CONFIG"',
+      'grep -F \'crons = ["* * * * *", "0-9,15-24,30-39,45-54 * * * *"]\' "$CONFIG"',
       'npx wrangler r2 object get "${BUCKET}/path/to/object" --remote --file "$BACKUP_DIR/r2/path/to/object"',
       'aws s3 sync "s3://${BUCKET}"',
       'npm run receipt:fresh-install:plan',
@@ -73,6 +74,10 @@ describe('production self-hosting runbook', () => {
     expect(runbook).toContain('tmp/local-smoke/report.json')
     expect(runbook).toContain('curl -fsS "$BASE_URL/health"')
     expect(runbook).toContain('npx wrangler tail "$WORKER"')
+    expect(runbook).toContain('[scheduled:unmatched-cron]')
+    expect(runbook).toContain('[scheduled:dispatch]')
+    expect(runbook).toContain('all eleven route labels')
+    expect(runbook).toContain('does not include the received cron expression')
   })
 
   it('defines a machine-checkable staging recovery evidence bundle', () => {
@@ -98,6 +103,23 @@ describe('production self-hosting runbook', () => {
     expect(runbook).toContain('npm run receipt:staging-recovery:check -- \\\n  --summary')
     expect(runbook.match(/npm run receipt:fresh-install:check -- \\/g)).toHaveLength(1)
     expect(runbook).toContain('npm run receipt:fresh-install:check -- \\\n  --summary')
+  })
+
+  // mupot#571 fix 4 — the restore path must go through the stamped deploy
+  // wrapper (scripts/deploy.mjs), never a bare `wrangler deploy`. A restored
+  // pot that skips the wrapper deploys unstamped (or with a stale RELEASE_SHA
+  // left over from before the restore), which the staleness detector cannot
+  // see because it only reads GET /health.
+  it('routes the restore deploy through the stamped scripts/deploy.mjs wrapper, not a bare wrangler deploy', () => {
+    const restoreStart = runbook.indexOf('## Restore')
+    expect(restoreStart).toBeGreaterThan(-1)
+    const nextHeading = runbook.indexOf('\n## ', restoreStart + 1)
+    const restoreSection = nextHeading === -1 ? runbook.slice(restoreStart) : runbook.slice(restoreStart, nextHeading)
+
+    expect(restoreSection).toContain('node scripts/deploy.mjs --config "$RESTORE_CONFIG"')
+    expect(restoreSection).not.toContain(
+      'npx wrangler deploy --config "$RESTORE_CONFIG" --message "restore ${POT} D1 from ${BACKUP_DIR}"',
+    )
   })
 
   it('covers the named incident classes from the tracker', () => {

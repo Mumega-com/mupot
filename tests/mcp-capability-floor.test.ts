@@ -145,8 +145,20 @@ describe('status — self-echo open, cross-agent lookup gated in-handler', () =>
   it('self-echo (no agent_id) is open to any authenticated member — no 403', async () => {
     const noTouchDb = { prepare() { throw new Error('self-echo must not touch DB') } }
     const env = { TENANT_SLUG: 'test', DB: noTouchDb } as unknown as Env
-    const out = await invokeTool(auth({ capabilities: [] }), env, 'status', {}, 'https://test')
+    const out = await invokeTool(
+      auth({ capabilities: [], boundAgentId: 'agent-welded', role: 'member' }),
+      env,
+      'status',
+      {},
+      'https://test',
+    )
     expect(out.ok).toBe(true) // returns the caller's own principal, touches no DB
+    if (!out.ok) throw new Error('expected ok')
+    expect(out.result).toMatchObject({
+      tenant: 'test',
+      role: 'member',
+      bound_agent_id: 'agent-welded',
+    })
   })
 
   it('cross-agent lookup by a grantless member → 403 forbidden (observer-on-squad required)', async () => {

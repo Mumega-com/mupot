@@ -91,6 +91,9 @@ describe('createTask', () => {
       null, // gate_owner — unset on create
       task.created_at,
       task.updated_at,
+      // PR #659 P0 fix (migrations/0077): external_source is appended to the INSERT's
+      // column/value lists only when actually set — this call is local/trusted (no
+      // externalSource), so the INSERT stays exactly the pre-#659 14-column shape.
     ])
     expect(linkUpdates).toEqual([['https://github.com/acme/widgets/issues/7', task.id]])
 
