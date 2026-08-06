@@ -27,4 +27,29 @@ Task 3: complete (commits c44f56f..2705202; review approved; 25 dashboard tests 
 Task 4: complete (commits 272d8dd..7cad70d; review approved; 95 focused tests + 3,787 full-suite tests + typecheck passed; shared lifecycle matrix and capability-correct RBAC)
 Task 5: complete (commits f716ebb..efb4031; review approved after two correction rounds; 65 focused tests + typecheck passed; bounded team roster preserves squad edges, runtime identity/presence truth, and mobile readability)
 Task 6: complete (commits 7d24d82..5b6ad7e; review approved after parity/lifecycle/idempotence corrections; 92 focused + 12 runtime-contract + 3,796 full-suite tests passed; browser, REST, MCP, mobile, no-secrets, and 11-step runtime evidence passed from isolated state)
+Task 7: complete (commits 9fc069f and c521e9b; independent review approved after
+source-authority and writable-Project-access remediation; 5 focused files / 126 tests
++ typecheck passed in the isolated implementation gate)
+Task 8: complete (commits 107c455, e20f970, c14560a; independent review approved
+after global-priority, scheduled-occurrence, and indexed-query remediation; 10 focused
+Project/parity/routine/migration files / 175 tests + typecheck passed)
+Task 9: remediation in progress on `cursor/task9-routines-cancellation-fence`
+(immutable 0061 + forward 0062; cancellation fence; resumable receipts)
+
+---
+
+# Mupot v0.25 Project Routines Progress
+
+Plan: docs/superpowers/plans/2026-07-19-project-routines-v025.md
+Base: c83086f
+Target: v0.25.0 Project Routines and Needs You
+
+Tasks 1-5: complete (commits 714aa0a..7b7888b)
+Task 6: complete (commit f628e29; review approved after concurrency, governed lifecycle,
+retry, and cost-ordering remediation; 14 focused files / 269 tests + typecheck passed)
 Task 7: in progress
+Task 9: remediation packed on `cursor/task9-routines-cancellation-fence` — restores
+immutable `0061`, adds forward-only `0062` cancellation event kinds, atomic
+cancellation fence on action/scheduler/dispatch claims, resumable request-only
+receipts, and conservative Flight confirmation (failFlight alone is not confirmable).
+Focused gate: 11 files / 115 tests + typecheck passed. Awaiting re-review.

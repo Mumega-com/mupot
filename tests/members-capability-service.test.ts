@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  resolveAgentMemberBinding,
   resolveActiveAgentMember,
   upsertCapabilityGrant,
 } from '../src/members/service'
@@ -12,8 +13,9 @@ interface StatementRecord {
 }
 
 interface ServiceDbOptions {
-  identityRows?: { member_id: string }[]
+  bindingRow?: { member_id: string } | null
   existingCapabilities?: Capability[]
+  homeCeilingConflict?: boolean
   batchResults?: { meta: { changes: number }; results?: { capability: Capability }[] }[]
 }
 
@@ -31,6 +33,12 @@ function makeServiceDb(options: ServiceDbOptions = {}) {
           return {
             ...record,
             async first<T>() {
+              if (sql.includes('JOIN agents a') && sql.includes('JOIN squads s')) {
+                return (options.homeCeilingConflict ? { conflict: 1 } : null) as T | null
+              }
+              if (sql.includes('FROM agent_member_bindings')) {
+                return (options.bindingRow ?? null) as T | null
+              }
               if (sql.includes('SELECT capability FROM capabilities')) {
                 const capability = options.existingCapabilities?.[0]
                 return (capability === undefined ? null : { capability }) as T | null
@@ -38,9 +46,6 @@ function makeServiceDb(options: ServiceDbOptions = {}) {
               throw new Error(`unexpected first query: ${sql}`)
             },
             async all<T>() {
-              if (sql.includes('FROM member_tokens t')) {
-                return { results: (options.identityRows ?? []) as T[] }
-              }
               if (sql.includes('SELECT capability FROM capabilities')) {
                 return {
                   results: (options.existingCapabilities ?? []).map((capability) => ({ capability })) as T[],
@@ -86,6 +91,9 @@ function makeGrantRouteEnv(existingCapabilities: Capability[]): Env {
         },
         async first<T>() {
           if (sql.includes('SELECT id FROM members')) return { id: 'member-1' } as T
+          if (sql.includes('SELECT b.agent_id') && sql.includes('b.member_id')) {
+            return null
+          }
           if (sql.includes('SELECT capability FROM capabilities')) {
             const capability = existingCapabilities[0]
             return (capability === undefined ? null : { capability }) as T | null
@@ -131,48 +139,36 @@ const squadGrant: CapabilityGrant = {
 }
 
 describe('resolveActiveAgentMember', () => {
-  it('returns the member holding one active agent token', async () => {
-    const { env } = makeServiceDb({ identityRows: [{ member_id: 'member-1' }] })
+  it('returns the canonical member binding', async () => {
+    const { env } = makeServiceDb({ bindingRow: { member_id: 'member-1' } })
 
     await expect(resolveActiveAgentMember(env, 'agent-1')).resolves.toBe('member-1')
+    await expect(resolveAgentMemberBinding(env, 'agent-1')).resolves.toEqual({
+      kind: 'bound',
+      memberId: 'member-1',
+    })
   })
 
-  it('resolves multiple active tokens for the same member to that member', async () => {
-    const { env } = makeServiceDb({ identityRows: [{ member_id: 'member-1' }] })
-
-    await expect(resolveActiveAgentMember(env, 'agent-1')).resolves.toBe('member-1')
-  })
-
-  it('returns unminted when no active member identity exists', async () => {
+  it('returns unminted when no canonical binding exists', async () => {
     const { env } = makeServiceDb()
 
     await expect(resolveActiveAgentMember(env, 'agent-1')).resolves.toBe('unminted')
+    await expect(resolveAgentMemberBinding(env, 'agent-1')).resolves.toEqual({ kind: 'unminted' })
   })
 
-  it('returns ambiguous when active tokens resolve to distinct members', async () => {
-    const { env } = makeServiceDb({
-      identityRows: [{ member_id: 'member-1' }, { member_id: 'member-2' }],
-    })
-
-    await expect(resolveActiveAgentMember(env, 'agent-1')).resolves.toBe('ambiguous')
-  })
-
-  it('uses a tenant-bound query that filters revoked tokens and inactive members', async () => {
-    const { env, statements } = makeServiceDb({ identityRows: [{ member_id: 'member-1' }] })
+  it('uses the tenant-scoped immutable binding instead of token liveness', async () => {
+    const { env, statements } = makeServiceDb({ bindingRow: { member_id: 'member-1' } })
 
     await resolveActiveAgentMember(env, 'agent-1')
 
-    const query = statements.find(({ sql }) => sql.includes('FROM member_tokens t'))
+    const query = statements.find(({ sql }) => sql.includes('FROM agent_member_bindings'))
     expect(query).toBeDefined()
-    expect(query?.sql).toContain('t.tenant = ?')
-    expect(query?.sql).toContain('t.agent_id = ?')
-    expect(query?.sql).toContain('t.revoked_at IS NULL')
-    expect(query?.sql).toContain('m.tenant = ?')
+    expect(query?.sql).toContain('b.tenant = ?')
+    expect(query?.sql).toContain('b.agent_id = ?')
+    expect(query?.sql).toContain('m.tenant = b.tenant')
     expect(query?.sql).toContain("m.status = 'active'")
-    expect(query?.sql).toContain('SELECT DISTINCT t.member_id')
-    expect(query?.sql).toContain('ORDER BY t.member_id')
-    expect(query?.sql).toContain('LIMIT 2')
-    expect(query?.values).toEqual(['tenant-a', 'agent-1', 'tenant-a'])
+    expect(query?.sql).not.toContain('member_tokens')
+    expect(query?.values).toEqual(['tenant-a', 'agent-1'])
   })
 })
 
@@ -246,6 +242,19 @@ describe('upsertCapabilityGrant', () => {
     expect(batches[0][0].sql).toContain('scope_id IS NULL')
     expect(batches[0][0].sql).toContain('RETURNING capability')
     expect(batches[0][0].values).toEqual(['member-1', 'org'])
+  })
+
+  it('refuses a high inherited grant that would exceed a bound agent home ceiling', async () => {
+    const grant: CapabilityGrant = {
+      member_id: 'member-1',
+      scope_type: 'org',
+      scope_id: null,
+      capability: 'admin',
+    }
+    const { env, batches } = makeServiceDb({ homeCeilingConflict: true })
+
+    await expect(upsertCapabilityGrant(env, grant)).rejects.toThrow('home_capability_ceiling')
+    expect(batches).toHaveLength(0)
   })
 })
 

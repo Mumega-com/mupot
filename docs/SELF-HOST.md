@@ -36,15 +36,15 @@ The script writes tenant-scoped resource names and bindings into
 one dashboard owner setup method against that exact config.
 
 ```bash
-npx wrangler deploy --config wrangler.acme.toml
+node scripts/deploy.mjs --config wrangler.acme.toml
 
 # Option A: Google dashboard login
 bash scripts/secrets.sh --pot acme
-npx wrangler deploy --config wrangler.acme.toml
+node scripts/deploy.mjs --config wrangler.acme.toml
 
 # Option B: no OAuth provider for the first owner
 bash scripts/secrets.sh --pot acme --bootstrap-owner
-npx wrangler deploy --config wrangler.acme.toml
+node scripts/deploy.mjs --config wrangler.acme.toml
 # Open https://<your-pot-url>/auth/bootstrap and enter your email plus the printed token.
 npx wrangler secret delete BOOTSTRAP_OWNER_TOKEN --config wrangler.acme.toml
 ```
@@ -79,7 +79,7 @@ is:
 git pull
 node scripts/mupot-update.mjs acme          # dry-run if the pot is in pots.manifest.json
 npx wrangler d1 migrations apply mupot-acme --remote --config wrangler.acme.toml
-npx wrangler deploy --config wrangler.acme.toml
+node scripts/deploy.mjs --config wrangler.acme.toml
 ```
 
 Migrations are additive and ordered; applying them is idempotent (already-applied

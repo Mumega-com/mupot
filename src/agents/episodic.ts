@@ -43,6 +43,7 @@
 //   SENSORIUM_VERSION. It is NOT the episode content. See dedup.ts.
 
 import type { Env, Agent } from '../types'
+import { sanitizeInline } from '../lib/prompt-safety'
 
 // ── Version (fingerprint preimage component) ──────────────────────────────────
 //
@@ -242,9 +243,10 @@ export async function safeRecentEpisodes(
  * prompt lines. Bounds length. Does NOT wrap in quotes (caller context determines).
  */
 function sanitizeData(s: string): string {
-  // Strip C0 control chars (\r \n \t and friends) so a summary cannot forge
-  // prompt lines; bound length. (Do NOT wrap — caller context determines.)
-  // eslint-disable-next-line no-control-regex
-  const noControl = s.replace(/[\u0000-\u001F\u007F]+/g, ' ')
-  return noControl.trim().slice(0, EPISODE_SUMMARY_MAX)
+  // Delegates to the ONE shared fence (mupot#669). The previous local implementation
+  // stripped only C0 controls + DEL, so it missed U+2028/U+2029 (several renderers treat
+  // those as a hard line break) and the bidi overrides -- strictly weaker than
+  // src/lib/prompt-safety while reading as an equivalent guard. Three near-copies of one
+  // invariant meant there was no single place to strengthen it.
+  return sanitizeInline(s, EPISODE_SUMMARY_MAX)
 }

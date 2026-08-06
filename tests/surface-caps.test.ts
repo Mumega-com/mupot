@@ -173,6 +173,16 @@ function makeSessionEnv(opts: {
       const captured = args
       return {
         first: vi.fn(async () => {
+          // requireAuth's verified-email bridge resolves member sessions before
+          // the route-level surface checks. Keep the member identity aligned
+          // with the principal used by the gate_grants fixture below.
+          if (
+            captured.length === 2 &&
+            captured[0] === `${orgRole}@test.com` &&
+            captured[1] === 'test'
+          ) {
+            return { id: userId }
+          }
           // gate_grants lookup: hasSurfaceCap binds (surface, principalType, principalId)
           // 3 args, second arg is 'member' or 'agent'.
           if (

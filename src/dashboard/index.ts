@@ -24,6 +24,8 @@ import { Hono } from 'hono'
 import { csrf } from 'hono/csrf'
 import { html, raw } from 'hono/html'
 import type { HtmlEscapedString } from 'hono/utils/html'
+import { TASK_SELECT_COLUMNS, actionableStatusOrderSql, priorityOrderSql } from '../tasks/ranking'
+import { MUPOT_FAVICON_32_PNG_B64, MUPOT_MARK_64_PNG_B64 } from './brand-assets'
 import type {
   Env,
   AuthContext,
@@ -50,6 +52,7 @@ import { resolveCapabilities, hasCapability, actorMaxRankOnScope, hasSurfaceCap,
 import { createDepartment, createSquad, createAgent, setAgentStatus, deleteAgent, updateUnitConfig } from '../org/service'
 import type { UnitConfigPatch } from '../org/service'
 import { createProject, getProject, updateProject } from '../projects/service'
+import { defaultStartGateDeps, startProject } from '../projects/start-gate'
 import { SQUAD_PACKS, seedSquadPack } from '../org/squad-packs'
 import { mintMemberToken, revokeMemberToken, loadLiveTokens, isChannel } from '../members/service'
 import type { MintedToken, PublicMemberToken } from '../members/service'
@@ -71,7 +74,13 @@ import { isValidEd25519PublicX, registerAgentPublicKey } from '../fleet/agent-ke
 import { resolveAgentRef } from '../org/resolve'
 
 // Connect-config builders (pure) for the Connect card.
-import { mcpEndpoint, claudeCodeSnippet, codexSnippet } from './connect'
+import {
+  mcpEndpoint,
+  claudeCodeSnippet,
+  codexSnippet,
+  cursorSnippet,
+  requiredCanonicalOrigin,
+} from './connect'
 import { loadApprovals, loadPublishable, resultPreview } from './approvals'
 import { CONTENT_DEPARTMENT_KEY } from '../agents/execute'
 import { loadLoopsView, loopsBody } from './loops'
@@ -117,6 +126,7 @@ import {
   canManageProject,
   canManageProjects,
   loadProjectDetail,
+  projectManageAccessContext,
   loadProjectFlights,
   loadProjectParentOptions,
   loadProjectWorkContext,
@@ -133,11 +143,33 @@ import {
   projectsPageBody,
   submittedProjectFormValues,
 } from './projects'
+import { stripExternalLifecycleFields } from '../projects/lifecycle-input'
+import {
+  consumeRoutineRunNonce,
+  loadRoutineWorkspace,
+  parseDashboardCursor,
+  routineDashboardErrorStatus,
+  routineInput,
+  routineWorkspaceBody,
+  submittedRoutineFormValues,
+} from './routines'
+import { loadNeedsYouDashboard, needsYouBody } from './needs-you'
+import { routinePrincipal } from '../routines/access'
+import {
+  archiveRoutine,
+  createManualRoutineRun,
+  createRoutine,
+  enableRoutine,
+  getRoutine,
+  getRoutineRun,
+  pauseRoutine,
+  updateRoutine,
+} from '../routines/service'
+import { answerRoutineRun, cancelRoutineRun } from '../routines/actions'
 
 // First-run setup wizard (the easy-onboard centerpiece). Mounted under '/setup'
 // on this same dashboard app, so it inherits the auth + tenant guard below.
-import { loadFleet, wakeFleetAgent, requestFleetControl, fleetScoped } from './fleet'
-import type { FleetRow } from './fleet'
+import { wakeFleetAgent, requestFleetControl, fleetScoped } from './fleet'
 import { listFleetAgentRuntimeView } from '../fleet/registry'
 import { emitControlRequest } from '../fleet/control'
 import { hostAgentsPanel } from './fleet-host'
@@ -324,7 +356,11 @@ dashboardApp.post('/projects/:id/settings', async (c) => {
   }
   const projectId = c.req.param('id')
   const values = submittedProjectFormValues(await c.req.parseBody())
-  const result = await updateProject(c.env, projectId, projectMutationInput(values))
+  const result = await updateProject(
+    c.env,
+    projectId,
+    stripExternalLifecycleFields(projectMutationInput(values) as Record<string, unknown>) as ReturnType<typeof projectMutationInput>,
+  )
   if (!result.ok) {
     const project = await getProject(c.env, projectId)
     if (!project) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
@@ -349,6 +385,29 @@ dashboardApp.post('/projects/:id/status', async (c) => {
   const form = await c.req.parseBody()
   const command = typeof form.command === 'string' ? form.command : ''
   const transition = projectLifecycleTransition(command)
+
+  // Slice 3: planned→active must authorize + provision via start-gate.
+  if (transition?.status === 'active' && currentProject.status === 'planned') {
+    const started = await startProject(c.env, projectId, defaultStartGateDeps())
+    if (!started.ok) {
+      const body = projectSettingsBody({
+        project: currentProject,
+        values: projectFormValues(currentProject),
+        parentOptions: await loadProjectParentOptions(c.env, currentProject.id),
+        error: started.error === 'project_not_found' ? 'project_not_found' : 'start_gate_required',
+        lifecycleCommand: command,
+      })
+      return c.html(
+        shell(c.env, 'Project settings', body),
+        started.error === 'project_not_found' ? 404 : 409,
+      )
+    }
+    return c.redirect(
+      `/projects/${encodeURIComponent(started.project.id)}?status=${encodeURIComponent(transition.result)}`,
+      303,
+    )
+  }
+
   const result = transition
     ? await updateProject(c.env, projectId, { status: transition.status })
     : { ok: false as const, error: 'invalid_status' as const }
@@ -368,6 +427,146 @@ dashboardApp.post('/projects/:id/status', async (c) => {
   return c.redirect(`/projects/${encodeURIComponent(result.value.id)}?status=${transition!.result}`, 303)
 })
 
+// ── Project Routines ───────────────────────────────────────────────────────
+// These HTML handlers only translate form submissions. Policy, authorization,
+// scheduling, idempotency, and cancellation remain owned by shared routine services.
+function dashboardHistoryCursor(value: string | undefined) {
+  return parseDashboardCursor(value)
+}
+
+function validDashboardHistoryQuery(c: { req: { query: (key: string) => string | undefined } }): boolean {
+  for (const key of ['run_limit', 'event_limit', 'routine_limit']) {
+    const value = c.req.query(key)
+    if (value !== undefined && (!/^[1-9]\d?$/.test(value) || Number(value) > 50)) return false
+  }
+  return dashboardHistoryCursor(c.req.query('run_cursor')) !== null
+    && dashboardHistoryCursor(c.req.query('event_cursor')) !== null
+    && dashboardHistoryCursor(c.req.query('routine_cursor')) !== null
+}
+
+dashboardApp.get('/projects/:id/routines', async (c) => {
+  if (!validDashboardHistoryQuery(c)) {
+    return c.html(shell(c.env, 'Project routines', errorBody('Choose a valid routine history page.')), 400)
+  }
+  const runAfter = dashboardHistoryCursor(c.req.query('run_cursor'))
+  const eventAfter = dashboardHistoryCursor(c.req.query('event_cursor'))
+  const routineAfter = dashboardHistoryCursor(c.req.query('routine_cursor'))
+  const runLimit = c.req.query('run_limit')
+  const eventLimit = c.req.query('event_limit')
+  const routineLimit = c.req.query('routine_limit')
+  const view = await loadRoutineWorkspace(c.env, c.get('auth'), c.req.param('id'), {
+    ...(runAfter ? { runAfter } : {}), ...(eventAfter ? { eventAfter } : {}),
+    ...(routineAfter ? { routineAfter } : {}),
+    ...(runLimit ? { runLimit: Number(runLimit) } : {}), ...(eventLimit ? { eventLimit: Number(eventLimit) } : {}),
+    ...(routineLimit ? { routineLimit: Number(routineLimit) } : {}),
+    ...(c.req.query('edit') ? { editId: c.req.query('edit') } : {}),
+    ...(c.req.query('run_id') ? { runId: c.req.query('run_id') } : {}),
+    ...(c.req.query('routine_id') ? { routineId: c.req.query('routine_id') } : {}),
+  })
+  if (!view) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
+  return c.html(shell(c.env, 'Project routines', routineWorkspaceBody(view, { status: c.req.query('status') })))
+})
+
+dashboardApp.post('/projects/:id/routines', async (c) => {
+  const projectId = c.req.param('id')
+  const auth = c.get('auth')
+  const view = await loadRoutineWorkspace(c.env, auth, projectId)
+  if (!view) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
+  if (!view.canManage) return c.html(shell(c.env, 'Project routines', errorBody('Routine administration requires workspace admin.')), 403)
+  const values = submittedRoutineFormValues(await c.req.parseBody())
+  const result = await createRoutine(c.env, routinePrincipal(auth), { ...routineInput(values), project_id: projectId })
+  if (!result.ok) {
+    return c.html(shell(c.env, 'Project routines', routineWorkspaceBody(view, { error: result.error, values })), routineDashboardErrorStatus(result.error))
+  }
+  return c.redirect(`/projects/${encodeURIComponent(projectId)}/routines?status=created`, 303)
+})
+
+dashboardApp.post('/projects/:id/routines/:routineId', async (c) => {
+  const projectId = c.req.param('id')
+  const routineId = c.req.param('routineId')
+  const auth = c.get('auth')
+  const view = await loadRoutineWorkspace(c.env, auth, projectId, { editId: routineId })
+  if (!view) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
+  if (!view.canManage) return c.html(shell(c.env, 'Project routines', errorBody('Routine administration requires workspace admin.')), 403)
+  const routine = await getRoutine(c.env, routinePrincipal(auth), routineId)
+  if (!routine || routine.project_id !== projectId) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
+  const values = submittedRoutineFormValues(await c.req.parseBody())
+  const result = await updateRoutine(c.env, routinePrincipal(auth), routineId, routineInput(values))
+  if (!result.ok) {
+    return c.html(shell(c.env, 'Project routines', routineWorkspaceBody(view, { error: result.error, values })), routineDashboardErrorStatus(result.error))
+  }
+  return c.redirect(`/projects/${encodeURIComponent(projectId)}/routines?status=updated`, 303)
+})
+
+for (const [command, action, message] of [
+  ['enable', enableRoutine, 'enabled'], ['pause', pauseRoutine, 'paused'], ['archive', archiveRoutine, 'archived'],
+] as const) {
+  dashboardApp.post(`/projects/:id/routines/:routineId/${command}`, async (c) => {
+    const projectId = c.req.param('id')
+    const routineId = c.req.param('routineId')
+    const auth = c.get('auth')
+    const view = await loadRoutineWorkspace(c.env, auth, projectId)
+    if (!view) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
+    if (!view.canManage) return c.html(shell(c.env, 'Project routines', errorBody('Routine administration requires workspace admin.')), 403)
+    const routine = await getRoutine(c.env, routinePrincipal(auth), routineId)
+    if (!routine || routine.project_id !== projectId) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
+    const result = await action(c.env, routinePrincipal(auth), routineId)
+    if (!result.ok) return c.html(shell(c.env, 'Project routines', routineWorkspaceBody(view, { error: result.error })), routineDashboardErrorStatus(result.error))
+    return c.redirect(`/projects/${encodeURIComponent(projectId)}/routines?status=${message}`, 303)
+  })
+}
+
+dashboardApp.post('/projects/:id/routines/:routineId/run', async (c) => {
+  const projectId = c.req.param('id')
+  const routineId = c.req.param('routineId')
+  const auth = c.get('auth')
+  const principal = routinePrincipal(auth)
+  const routine = await getRoutine(c.env, principal, routineId)
+  if (!routine || routine.project_id !== projectId) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
+  const form = await c.req.parseBody()
+  if (!await consumeRoutineRunNonce(c.env, auth, routineId, form.nonce)) {
+    const view = await loadRoutineWorkspace(c.env, auth, projectId)
+    return c.html(shell(c.env, 'Project routines', view ? routineWorkspaceBody(view, { error: 'invalid_nonce' }) : projectNotFoundBody()), 400)
+  }
+  const result = await createManualRoutineRun(c.env, principal, routineId, form.nonce as string)
+  if (!result.ok) {
+    const view = await loadRoutineWorkspace(c.env, auth, projectId)
+    return c.html(shell(c.env, 'Project routines', view ? routineWorkspaceBody(view, { error: result.error }) : projectNotFoundBody()), routineDashboardErrorStatus(result.error))
+  }
+  return c.redirect(`/projects/${encodeURIComponent(projectId)}/routines?status=run_queued`, 303)
+})
+
+dashboardApp.post('/projects/:id/routines/:runId/cancel', async (c) => {
+  const projectId = c.req.param('id')
+  const runId = c.req.param('runId')
+  const auth = c.get('auth')
+  const principal = routinePrincipal(auth)
+  const run = await getRoutineRun(c.env, principal, runId)
+  if (!run || run.project_id !== projectId) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
+  const result = await cancelRoutineRun(c.env, principal, runId)
+  if (!result.ok) {
+    const view = await loadRoutineWorkspace(c.env, auth, projectId)
+    return c.html(shell(c.env, 'Project routines', view ? routineWorkspaceBody(view, { error: result.error }) : projectNotFoundBody()), routineDashboardErrorStatus(result.error))
+  }
+  return c.redirect(`/projects/${encodeURIComponent(projectId)}/routines?status=run_cancelled`, 303)
+})
+
+dashboardApp.post('/projects/:id/routines/:runId/answer', async (c) => {
+  const projectId = c.req.param('id')
+  const runId = c.req.param('runId')
+  const auth = c.get('auth')
+  const principal = routinePrincipal(auth)
+  const run = await getRoutineRun(c.env, principal, runId)
+  if (!run || run.project_id !== projectId) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
+  const form = await c.req.parseBody()
+  const result = await answerRoutineRun(c.env, principal, runId, form.answer)
+  if (!result.ok) {
+    const view = await loadRoutineWorkspace(c.env, auth, projectId, { runId })
+    return c.html(shell(c.env, 'Project routines', view ? routineWorkspaceBody(view, { error: result.error }) : projectNotFoundBody()), routineDashboardErrorStatus(result.error))
+  }
+  return c.redirect(`/projects/${encodeURIComponent(projectId)}/routines?run_id=${encodeURIComponent(runId)}&status=answer_recorded`, 303)
+})
+
 dashboardApp.get('/projects/:id', async (c) => {
   const view = await loadProjectDetail(c.env, c.get('auth'), c.req.param('id'))
   if (!view) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
@@ -383,7 +582,13 @@ dashboardApp.get('/projects/:id', async (c) => {
 dashboardApp.post('/projects/:id/boards', async (c) => {
   const auth = c.get('auth')
   const projectId = c.req.param('id')
-  if (!await canManageProject(c.env, auth, projectId)) {
+  // Compute the manage-access context ONCE — the same authority check backs
+  // both the route gate and the connector-scope bound below (#453): the
+  // connector a caller may reference must never be broader than the specific
+  // authority (workspace-admin, or the exact squads) that got them past this
+  // gate in the first place.
+  const access = await projectManageAccessContext(c.env, auth, projectId)
+  if (!access.authorized) {
     return c.html(shell(c.env, 'Projects', projectNotFoundBody()), 403)
   }
   const view = await loadProjectDetail(c.env, auth, projectId)
@@ -394,7 +599,7 @@ dashboardApp.post('/projects/:id/boards', async (c) => {
     provider: form.provider,
     external_id: form.external_id,
     connector_id: form.connector_id,
-  })
+  }, { workspaceAdmin: access.workspaceAdmin, actorSquadIds: access.actorSquadIds })
   if (!result.ok) {
     return c.html(
       shell(c.env, view.project.name, projectDetailBody(view)),
@@ -469,6 +674,23 @@ dashboardApp.get('/approvals', async (c) => {
     loadPublishable(c.env, auth),
   ])
   return c.html(shell(c.env, 'Approvals', approvalsBody(items, publishable)))
+})
+
+dashboardApp.get('/needs-you', async (c) => {
+  const rawLimit = c.req.query('limit')
+  const cursor = c.req.query('cursor')
+  if ((rawLimit !== undefined && (!/^[1-9]\d{0,2}$/.test(rawLimit) || Number(rawLimit) > 100))
+    || (cursor !== undefined && !/^[A-Za-z0-9_-]{1,200}$/.test(cursor))) {
+    return c.html(shell(c.env, 'Needs You', errorBody('Choose a valid Needs You page.')), 400)
+  }
+  try {
+    const view = await loadNeedsYouDashboard(c.env, c.get('auth'), {
+      ...(rawLimit ? { limit: Number(rawLimit) } : {}), ...(cursor ? { after: cursor } : {}),
+    })
+    return c.html(shell(c.env, 'Needs You', needsYouBody(view)))
+  } catch {
+    return c.html(shell(c.env, 'Needs You', errorBody('Choose a valid Needs You page.')), 400)
+  }
 })
 
 // GET /ops — owner/admin health and observability console.
@@ -875,12 +1097,10 @@ dashboardApp.get('/radar', async (c) => {
   return c.html(shell(c.env, 'Radar', radarPageBody(radar)))
 })
 
-// ── fleet (company-wide agent roster over the SOS bus) ───────────────────────
-// GET /fleet — see every company agent: liveness, last active, role/label.
-// Window only: data comes from the bus bridge; the pot runs none of them.
+// ── fleet (CF-native roster — ADR gh #473; SOS bus retired from this path) ───
+// GET /fleet — pot check-in presence + signed host-control panel.
+// Wake/control POST endpoints below use agent_messages + Queue, not SOS Redis.
 dashboardApp.get('/fleet', async (c) => {
-  // The host-agents panel (signed control via mupot, the durable replacement for the bus path) is
-  // shown on BOTH the pot-native and the bus window — it's the pot's OWN fleet control surface.
   const auth = c.get('auth')
   const hostAgents = await listFleetAgentRuntimeView(c.env)
   const hostPanel = hostAgentsPanel(hostAgents, {
@@ -889,34 +1109,13 @@ dashboardApp.get('/fleet', async (c) => {
     flash: c.req.query('hc') ?? null,
   })
 
-  // No company-bus connection → show the POT-NATIVE flock instead of an empty
-  // notice: agents that checked in to THIS pot (inbound, no egress). This is the
-  // tenant-pot path (Digid); the bus path below is the company/HQ window.
-  // Trivially-cheap header wiring on both return paths (same light reads as
-  // Overview — bare KV get + one-row D1 scalar).
-  if (!fleetScoped(c.env)) {
-    const [presence, physics, spend] = await Promise.all([
-      listPresence(c.env, Date.now()),
-      loadBrainPhysics(c.env),
-      loadTodaySpendScalar(c.env),
-    ])
-    return c.html(
-      shell(c.env, 'Fleet', html`${hostPanel}${potFleetBody(presence)}`, {
-        physics,
-        costToday: { configured: spend.configured, todayUsdMicro: spend.today_usd_micro },
-      }),
-    )
-  }
-  let rows: FleetRow[] = []
-  let error: string | null = null
-  try {
-    rows = await loadFleet(c.env, Date.now())
-  } catch (e) {
-    error = e instanceof Error ? e.message : 'bus_unreachable'
-  }
-  const [physics, spend] = await Promise.all([loadBrainPhysics(c.env), loadTodaySpendScalar(c.env)])
+  const [presence, physics, spend] = await Promise.all([
+    listPresence(c.env, Date.now()),
+    loadBrainPhysics(c.env),
+    loadTodaySpendScalar(c.env),
+  ])
   return c.html(
-    shell(c.env, 'Fleet', html`${hostPanel}${fleetBody(rows, error)}`, {
+    shell(c.env, 'Fleet', html`${hostPanel}${potFleetBody(presence)}`, {
       physics,
       costToday: { configured: spend.configured, todayUsdMicro: spend.today_usd_micro },
     }),
@@ -940,43 +1139,51 @@ dashboardApp.post('/fleet/host-control', async (c) => {
   return c.redirect(`/fleet?hc=${encodeURIComponent(res.ok ? 'ok' : res.reason)}`)
 })
 
-// POST /fleet/wake — direct bus ping to the agent. Owner/admin only
-// (adversarial P2 2026-06-07): un-gated wake let any pot member ping any agent
-// by name. Gated to owner/admin to match /fleet/control. Isolation note: the
-// project pin in wakeFleetAgent is defense-in-depth — the real cross-tenant
-// boundary is the BUS_TOKEN scope (project-scoped + agent-bound per #44); the
-// resolvers fail closed so an unscoped pot cannot fall back to the company project.
+// POST /fleet/wake — durable inbox ping + agent.wake Queue event. Owner/admin only
+// (adversarial P2 2026-06-07). Fail closed when the pot has no tenant/sender scope.
 dashboardApp.post('/fleet/wake', async (c) => {
-  if (!fleetScoped(c.env)) return c.json({ error: 'bus_not_configured' }, 503)
+  if (!fleetScoped(c.env)) return c.json({ error: 'fleet_not_scoped' }, 503)
   const auth = c.get('auth')
   if (!isOrgAdmin(auth)) {
     return c.json({ error: 'forbidden', need: 'admin' }, 403)
   }
+  const memberId = auth.memberId ?? auth.userId
+  if (!memberId) return c.json({ error: 'no_member' }, 401)
   const body = (await c.req.json().catch(() => ({}))) as { agent?: unknown }
   const agent = typeof body.agent === 'string' ? body.agent.trim() : ''
   if (!agent || !/^[a-z0-9][a-z0-9._-]{0,63}$/i.test(agent)) {
     return c.json({ error: 'invalid_agent' }, 400)
   }
-  const ok = await wakeFleetAgent(c.env, agent, auth.email ?? 'admin')
-  return c.json(ok ? { ok: true } : { error: 'bus_send_failed' }, ok ? 200 : 502)
+  const ok = await wakeFleetAgent(c.env, agent, {
+    memberId,
+    boundAgentId: auth.boundAgentId ?? null,
+    label: auth.email ?? 'admin',
+  })
+  return c.json(ok ? { ok: true } : { error: 'send_failed' }, ok ? 200 : 502)
 })
 
 // POST /fleet/control — pause/resume/deactivate/delete REQUEST (owner/admin
-// only). Never a direct host action: emits a receipted control-request on the
-// bus to the operations agent, which executes server-side and acks.
+// only). Never a direct host action: durable agent_messages ask to FLEET_OPS_AGENT.
+// Host process start/stop uses POST /fleet/host-control (signed control plane).
 dashboardApp.post('/fleet/control', async (c) => {
-  if (!fleetScoped(c.env)) return c.json({ error: 'bus_not_configured' }, 503)
+  if (!fleetScoped(c.env)) return c.json({ error: 'fleet_not_scoped' }, 503)
   const auth = c.get('auth')
   if (!isOrgAdmin(auth)) {
     return c.json({ error: 'forbidden', need: 'admin' }, 403)
   }
+  const memberId = auth.memberId ?? auth.userId
+  if (!memberId) return c.json({ error: 'no_member' }, 401)
   const body = (await c.req.json().catch(() => ({}))) as { agent?: unknown; action?: unknown }
   const agent = typeof body.agent === 'string' ? body.agent.trim() : ''
   const action = typeof body.action === 'string' ? body.action : ''
   if (!agent || !/^[a-z0-9][a-z0-9._-]{0,63}$/i.test(agent)) {
     return c.json({ error: 'invalid_agent' }, 400)
   }
-  const r = await requestFleetControl(c.env, agent, action, auth.email ?? 'admin')
+  const r = await requestFleetControl(c.env, agent, action, {
+    memberId,
+    boundAgentId: auth.boundAgentId ?? null,
+    label: auth.email ?? 'admin',
+  })
   return c.json(r, r.ok ? 200 : 400)
 })
 
@@ -1131,8 +1338,13 @@ dashboardApp.get('/squads/:id', async (c) => {
       .bind(squadId)
       .all<Agent>(),
     c.env.DB.prepare(
-      `SELECT id, squad_id, project_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, created_at, updated_at
-         FROM tasks WHERE squad_id = ? ORDER BY updated_at DESC`,
+      // Ranked, not merely recent (#713). This ordered by updated_at DESC — so the human
+      // board showed "most recently touched", never "most important", while the MCP path
+      // ranked correctly. The board is the surface an operator opens to answer "what is
+      // next"; answering it with recency is a silent wrong answer.
+      `SELECT ${TASK_SELECT_COLUMNS}
+         FROM tasks WHERE squad_id = ?
+        ORDER BY ${actionableStatusOrderSql()}, ${priorityOrderSql()}, updated_at DESC`,
     )
       .bind(squadId)
       .all<Task>(),
@@ -1282,9 +1494,18 @@ dashboardApp.post('/agents/onboard', async (c) => {
 })
 
 // GET /agents/:id — agent console: identity, status, wake button.
+// `:id` accepts id OR unique slug (resolveAgentRef) so /agents/kayhermes works.
 dashboardApp.get('/agents/:id', async (c) => {
-  const agentId = c.req.param('id')
-  const agent = await getById<Agent>(c.env, 'agents', agentId)
+  const ref = c.req.param('id')
+  const resolved = await resolveAgentRef(c.env, ref)
+  if (!resolved.ok) {
+    const msg =
+      resolved.reason === 'ambiguous'
+        ? 'Agent slug is ambiguous — open by UUID instead.'
+        : 'Agent not found.'
+    return c.html(shell(c.env, 'Agent', errorBody(msg)), 404)
+  }
+  const agent = await getById<Agent>(c.env, 'agents', resolved.value.id)
   if (!agent) {
     return c.html(shell(c.env, 'Agent', errorBody('Agent not found.')), 404)
   }
@@ -1502,10 +1723,27 @@ dashboardApp.get('/admin/agent-token', async (c) => {
 // POST /admin/agent-token/mint
 dashboardApp.post('/admin/agent-token/mint', async (c) => {
   const auth = c.get('auth')
+  if (auth.boundAgentId) {
+    return c.html(
+      shell(c.env, 'Mint agent token', errorBody('An operator principal is required.')),
+      403,
+    )
+  }
   if (!isOrgAdmin(auth)) {
     return c.html(
       shell(c.env, 'Mint agent token', errorBody('Minting an agent token requires owner or admin.')),
       403,
+    )
+  }
+  const canonical = requiredCanonicalOrigin(c.env)
+  if (!canonical.ok) {
+    return c.html(
+      shell(
+        c.env,
+        'Mint agent token',
+        errorBody('A secure public origin must be configured before provisioning a token.'),
+      ),
+      503,
     )
   }
 
@@ -1554,9 +1792,9 @@ dashboardApp.post('/admin/agent-token/mint', async (c) => {
   }
   const agent = agentResult.value
 
-  // Delegate to the shared atomic-mint helper.
-  // Three rows in ONE D1 batch: member envelope + escalation-guard capability +
-  // agent-weld token. Same path the MCP mint_agent_token tool uses.
+  // Delegate to the shared atomic-mint helper. A first mint creates the member,
+  // binding, home capability, and welded token; later mints add only the token.
+  // This is the same path the MCP mint_agent_token tool uses.
   const minted = await mintAgentBoundToken(c.env, agent, labelRaw, capabilityRaw)
 
   // Look up the squad name for the show-once page.
@@ -1972,11 +2210,26 @@ dashboardApp.post('/members/:id/tokens', async (c) => {
     return c.html(shell(c.env, 'Access Tokens', errorBody('Invalid channel.')), 400)
   }
 
+  const canonical = requiredCanonicalOrigin(c.env)
+  if (!canonical.ok) {
+    return c.html(
+      shell(
+        c.env,
+        'Access Tokens',
+        errorBody('A secure public origin must be configured before provisioning a token.'),
+      ),
+      503,
+    )
+  }
+
   // Shared mint path — raw returned once, only the hash persisted.
   const minted = await mintMemberToken(c.env, memberId, labelRaw, channelRaw)
-  const origin = new URL(c.req.url).origin
   return c.html(
-    shell(c.env, 'Token provisioned', tokenShowOnceBody(c.env.TENANT_SLUG, origin, member.display_name, minted)),
+    shell(
+      c.env,
+      'Token provisioned',
+      tokenShowOnceBody(c.env.TENANT_SLUG, canonical.origin, member.display_name, minted),
+    ),
   )
 })
 
@@ -2458,6 +2711,7 @@ function shell(
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>${title} · ${brand}</title>
+    <link rel="icon" type="image/png" href="${raw(`data:image/png;base64,${MUPOT_FAVICON_32_PNG_B64}`)}" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Hanken+Grotesk:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
@@ -2548,9 +2802,11 @@ function shell(
       .switcher > summary::-webkit-details-marker { display: none; }
       .switcher > summary .pot-icon {
         width: 30px; height: 30px; flex: none; border-radius: 8px;
-        background: linear-gradient(140deg,#d4a017,#96780A);
+        overflow: hidden; background: #f7f3ef;
         display: flex; align-items: center; justify-content: center;
-        color: #fff; font-family: var(--font-display); font-size: 17px;
+      }
+      .switcher > summary .pot-icon img {
+        width: 100%; height: 100%; object-fit: cover; display: block;
       }
       .switcher > summary .pot-name {
         flex: 1; min-width: 0; font-size: 13.5px; font-weight: 700;
@@ -3237,9 +3493,38 @@ function shell(
       .ui-panel-sub { font-size: 12px; color: var(--dim); margin-top: 1px; }
       .ui-link { font-size: 12.5px; color: var(--primary); text-decoration: none; font-weight: 600; }
       .ui-link:hover { text-decoration: underline; }
+      .routine-form label { display: grid; gap: 5px; min-width: 0; }
+      .routine-form input, .routine-form select, .routine-form textarea {
+        width: 100%; min-width: 0; max-width: 100%;
+      }
+      .routine-table .routine-cell {
+        display: grid; gap: 3px; min-width: 0; overflow-wrap: anywhere;
+      }
+      .routine-mobile-label { display: none; }
+      .routine-stack {
+        display: grid; gap: 3px; min-width: 0;
+      }
       .obs-queue-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; }
       @media (max-width: 720px) {
         .ui-tr.ui-hide-sm-3 > .ui-td:nth-child(n+4), .ui-tr.ui-hide-sm-3 > .ui-th:nth-child(n+4) { display: none; }
+        .routine-table { min-width: 0 !important; }
+        .routine-table .ui-thead {
+          position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+          overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+        }
+        .routine-table .ui-row {
+          grid-template-columns: minmax(0, 1fr) !important;
+          align-items: start; gap: 10px; padding: 14px;
+        }
+        .routine-table .ui-td {
+          display: grid; grid-template-columns: minmax(7rem, 35%) minmax(0, 1fr);
+          gap: 12px; align-items: start;
+        }
+        .routine-table .routine-mobile-label {
+          display: block;
+          font-family: var(--font-mono); font-size: 10px; font-weight: 600;
+          letter-spacing: .6px; text-transform: uppercase; color: var(--dim);
+        }
       }
 
       /* ── /approvals page styles (kept here to avoid duplication) ── */
@@ -3257,7 +3542,7 @@ function shell(
         <div class="switcher">
           <details id="pot-details">
             <summary>
-              <span class="pot-icon" id="pot-icon">M</span>
+              <span class="pot-icon" id="pot-icon"><img src="${raw(`data:image/png;base64,${MUPOT_MARK_64_PNG_B64}`)}" alt="" width="30" height="30" /></span>
               <span class="pot-name" id="pot-name">${brand}</span>
               <span class="caret">
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><path d="M5 6.5 8 9.5l3-3"/></svg>
@@ -3300,6 +3585,11 @@ function shell(
           <a class="nav-link" href="/send">
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><circle cx="5.5" cy="5.5" r="2"/><circle cx="5.5" cy="14.5" r="2"/><circle cx="14.5" cy="10" r="2"/><path d="M5.5 7.5v5M7.4 5.9 12.7 9.2M7.3 13.9 12.7 10.7"/></svg>
             <span class="nav-label">Work</span>
+          </a>
+
+          <a class="nav-link" href="/needs-you">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M10 3.2a6.8 6.8 0 1 0 6.8 6.8"/><path d="M10 6.3v4.2l2.8 1.7"/><path d="M15.2 3.6v3.1h-3.1"/></svg>
+            <span class="nav-label">Needs You</span>
           </a>
 
           <!-- Approvals (with live badge) -->
@@ -4765,7 +5055,7 @@ function potFleetBody(rows: PresenceView[]) {
       crumbs: 'Overview / Fleet',
       title: 'Fleet',
       sub:
-        'Your flock — agents that check in to this pot, on any runtime (Claude Code, Codex, Hermes, openclaw…). Always-on agents read their heartbeat (active/idle/dead); session agents read their schedule (flying / sleeping · next run / done) — a resting agent is sleeping, not dead. Times UTC. Control arrives with the bus/ops wiring.',
+        'Your flock — agents that check in to this pot, on any runtime (Claude Code, Codex, Hermes, openclaw…). Always-on agents read their heartbeat (active/idle/dead); session agents read their schedule (flying / sleeping · next run / done) — a resting agent is sleeping, not dead. Times UTC. Host control uses the signed mupot control plane above.',
     })}
     ${kpiRow([statCard({ label: 'Present now', value: String(present), subTone: present > 0 ? 'ok' : 'dim' })])}
     <style>
@@ -4782,97 +5072,6 @@ function potFleetBody(rows: PresenceView[]) {
       .fl-sched-flying { color: var(--ok); } .fl-sched-sleeping { color: var(--warn); } .fl-sched-done { color: var(--dim); }
     </style>
     ${raw(`<div class="card" style="padding:0;overflow-x:auto">${table}</div>`)}`
-}
-
-function fleetBody(rows: FleetRow[], error: string | null) {
-  const dot = (l: string) =>
-    l === 'active' ? 'var(--ok)' : l === 'idle' ? 'var(--warn)' : l === 'dead' ? '#e5534b' : 'var(--dim)'
-  const tr = (r: FleetRow) => `
-    <tr data-agent="${escAttr(r.agent)}" class="fl-row ${r.liveness === 'dead' || r.liveness === 'never' ? 'fl-dim' : ''}">
-      <td><span class="fl-dot" style="background:${dot(r.liveness)}"></span>${escHtml(r.agent)}</td>
-      <td class="fl-label">${escHtml(r.label || '—')}</td>
-      <td><span class="fl-badge fl-${escAttr(r.liveness)}">${escHtml(r.liveness)}</span></td>
-      <td>${escHtml(r.last_seen_human)}</td>
-      <td class="fl-num">${r.messages}</td>
-      <td>${r.active_token ? 'yes' : '<span style="color:var(--dim)">no</span>'}</td>
-      <td class="fl-actions">
-        <button class="fl-btn" data-act="wake">Run</button>
-        <button class="fl-btn" data-act="pause">Pause</button>
-        <button class="fl-btn" data-act="deactivate">Deactivate</button>
-        <button class="fl-btn fl-danger" data-act="delete">Delete</button>
-        <span class="fl-status"></span>
-      </td>
-    </tr>`
-  const table = rows.length
-    ? `<table class="fl-table">
-        <thead><tr><th>Agent</th><th>Role / label</th><th>Status</th><th>Last active</th><th>Msgs</th><th>Token</th><th>Actions</th></tr></thead>
-        <tbody>${rows.map(tr).join('')}</tbody>
-      </table>`
-    : '<p class="empty">No agents visible on the bus.</p>'
-  const liveFleet = rows.filter((r) => r.liveness === 'active').length
-  return html`
-    ${pageHeader({
-      crumbs: 'Overview / Fleet',
-      title: 'Fleet',
-      sub:
-        'Every company agent on the bus. Run pings the agent directly. Pause / Deactivate / Delete send a receipted control request to operations (owner/admin only) — nothing here kills a process silently.',
-    })}
-    ${kpiRow([
-      statCard({ label: 'On the bus', value: String(rows.length) }),
-      statCard({ label: 'Active', value: String(liveFleet), subTone: liveFleet > 0 ? 'ok' : 'dim' }),
-    ])}
-    <style>
-      .fl-table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
-      .fl-table th { text-align: left; color: var(--muted); font-size: 12px; text-transform: uppercase;
-        letter-spacing: .5px; padding: 8px 10px; border-bottom: 1px solid var(--border); }
-      .fl-table td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
-      .fl-dim td { opacity: .6; }
-      .fl-dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:8px; }
-      .fl-label { color: var(--muted); max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-      .fl-badge { font-size: 11px; text-transform: uppercase; letter-spacing: .5px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); }
-      .fl-active { color: var(--ok); } .fl-idle { color: var(--warn); }
-      .fl-dead { color: #e5534b; } .fl-never { color: var(--dim); }
-      .fl-num { text-align: right; font-variant-numeric: tabular-nums; }
-      .fl-actions { white-space: nowrap; }
-      .fl-btn { font: inherit; font-size: 12px; padding: 3px 9px; margin-right: 4px; border-radius: 6px;
-        border: 1px solid var(--border); background: var(--surface2); color: var(--text); cursor: pointer; }
-      .fl-btn:hover { border-color: var(--accent); }
-      .fl-danger { color: #e5534b; }
-      .fl-status { font-size: 12px; color: var(--dim); margin-left: 6px; }
-    </style>
-    ${error ? html`<div class="card"><p class="empty">Bus error: ${error} — showing nothing rather than stale data.</p></div>` : raw(`<div class="card" style="padding:0;overflow-x:auto">${table}</div>`)}
-    ${rows.length ? fleetScript() : html``}`
-}
-
-function fleetScript() {
-  return raw(`
-    <script>
-      (function () {
-        document.querySelectorAll('.fl-row').forEach(function (row) {
-          var agent = row.getAttribute('data-agent');
-          var status = row.querySelector('.fl-status');
-          row.querySelectorAll('.fl-btn').forEach(function (btn) {
-            btn.addEventListener('click', function () {
-              var act = btn.getAttribute('data-act');
-              if (act === 'delete' && !confirm('Request DELETE of agent "' + agent + '"? Operations executes and acks.')) return;
-              var url = act === 'wake' ? '/fleet/wake' : '/fleet/control';
-              var payload = act === 'wake' ? { agent: agent } : { agent: agent, action: act };
-              btn.disabled = true; status.textContent = '…';
-              fetch(url, { method: 'POST', credentials: 'same-origin',
-                headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) })
-                .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
-                .then(function (r) {
-                  status.textContent = r.ok
-                    ? (act === 'wake' ? 'pinged ✓' : 'requested ✓ (' + (r.d.request_id || '').slice(0, 8) + ')')
-                    : (r.d.error || 'failed');
-                  btn.disabled = false;
-                })
-                .catch(function () { status.textContent = 'network error'; btn.disabled = false; });
-            });
-          });
-        });
-      })();
-    </script>`)
 }
 
 // ── members + divisions views ─────────────────────────────────────────────────
@@ -5060,6 +5259,8 @@ function tokenShowOnceBody(slug: string, origin: string, memberName: string, min
       <pre class="snippet">${claudeCodeSnippet(slug, origin)}</pre>
       <h3 style="font-size:13px;color:var(--muted);margin:14px 0 0">Codex · <code class="inline">~/.codex/config.toml</code></h3>
       <pre class="snippet">${codexSnippet(slug, origin)}</pre>
+      <h3 style="font-size:13px;color:var(--muted);margin:14px 0 0">Cursor · <code class="inline">MCP JSON</code></h3>
+      <pre class="snippet">${cursorSnippet(slug, origin)}</pre>
     </div>
     <p><a href="/members">← Back to access tokens</a></p>`
 }

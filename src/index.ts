@@ -56,6 +56,8 @@ import { coordinationApp } from './coordination/routes'
 import { addonsApp } from './addons/routes'
 import { projectLinkApp } from './addons/project-link/routes'
 import { presenceApp } from './registry/presence-routes'
+import { routinesApp } from './routines/routes'
+import { attentionApp } from './attention/routes'
 
 // Durable Object classes — implemented in src/agents/.
 export { AgentDO } from './agents/agent-do'
@@ -66,7 +68,7 @@ export { TaskWorkflow } from './workflows/task-workflow'
 // OAuth API handler WorkerEntrypoint — referenced by the OAuthProvider's apiHandler.
 export { McpOAuthApiHandler }
 
-const app = new Hono<{ Bindings: Env }>()
+export const app = new Hono<{ Bindings: Env }>()
 
 app.get('/health', (c) => c.json(publicHealth(c.env.TENANT_SLUG, c.env.RELEASE_SHA)))
 
@@ -74,6 +76,10 @@ app.route(ROUTES.auth, authApp)
 app.route(ROUTES.org, orgApp)
 app.route(ROUTES.agents, agentsApp)
 app.route(ROUTES.tasks, tasksApp)
+// Exact Project Routine and Needs You endpoints must precede the Projects
+// wildcard middleware so session and member-bearer auth select here first.
+app.route('/api', routinesApp)
+app.route('/api', attentionApp)
 app.route(ROUTES.projects, projectsApp)
 // K3: gate grant management (owner/admin only)
 app.route('/api/gates', gatesApp)
@@ -222,11 +228,48 @@ import { runLoopsTick } from './loops/driver'
 // Port 1 (module_registry + presence, #457): each active project gets one cycle per
 // tick (register presence, decide, dispatch a starter task when stalled+idle).
 import { runConciergeTick } from './concierge/service'
+import { runProjectLoopTick } from './projects/loop'
 import { syncGitHubProject } from './integrations/github-projects'
 // Growth cron step — active-guarded, fail-soft collection of growth metrics each tick.
 import { runGrowthCollection } from './departments/collectors/growth-cron'
 import { runCroCollection } from './cro/collect'
 import { flushFlightEventOutbox } from './flight/service'
+import { sweepAgentConnectionRetention } from './members/agent-connection'
+import { runRoutineScheduler } from './routines/scheduler'
+import { dispatchRoutineRun } from './routines/dispatch'
+
+const ROUTINE_CRON = '* * * * *'
+const MAINTENANCE_CRON = '0-9,15-24,30-39,45-54 * * * *'
+const scheduledObservationBuckets = new Map<string, number>()
+
+function shouldEmitScheduledObservation(
+  key: string,
+  scheduledAt: Date,
+): boolean {
+  const hourBucket = Math.floor(scheduledAt.getTime() / 3_600_000)
+  const latestBucket = scheduledObservationBuckets.get(key)
+  if (latestBucket !== undefined && latestBucket >= hourBucket) return false
+  scheduledObservationBuckets.set(key, hourBucket)
+  return true
+}
+
+function reportScheduledDispatch(route: string, scheduledAt: Date): void {
+  if (!shouldEmitScheduledObservation(`dispatch:${route}`, scheduledAt)) return
+  console.info('[scheduled:dispatch]', {
+    kind: 'scheduled_dispatch',
+    route,
+    scheduled_time: scheduledAt.toISOString(),
+  })
+}
+
+function reportUnmatchedCron(scheduledAt: Date): void {
+  if (!shouldEmitScheduledObservation('unmatched', scheduledAt)) return
+  console.warn('[scheduled:unmatched-cron]', {
+    kind: 'unmatched_cron',
+    scheduled_time: scheduledAt.toISOString(),
+    expected_trigger_count: 2,
+  })
+}
 
 export default {
   // The OAuth provider is the outer entry point. It handles OAuth paths and
@@ -235,10 +278,43 @@ export default {
   fetch: (req: Request, env: Env, ctx: ExecutionContext) =>
     oauthProvider.fetch(req, env, ctx),
 
-  // Queue and scheduled handlers are preserved unchanged (spec §A.2).
+  // Queue delivery remains owned by the bus component.
   queue: handleQueue,
-  async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    // Eight independent heartbeats on the same */15 cron:
+  async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    const scheduledAt = new Date(controller.scheduledTime)
+    const waitFor = (label: string, work: Promise<unknown>) => {
+      reportScheduledDispatch(label, scheduledAt)
+      ctx.waitUntil(
+        work
+          .catch((error) => {
+            console.error(`[scheduled:${label}]`, error)
+          }),
+      )
+    }
+
+    if (controller.cron === ROUTINE_CRON) {
+      waitFor(
+        'project-routines',
+        runRoutineScheduler(
+          env,
+          scheduledAt,
+          `routine-cron:${scheduledAt.toISOString()}`,
+          async (runId) => {
+            const result = await dispatchRoutineRun(env, runId, scheduledAt)
+            if (!result.ok) throw new Error(`routine_dispatch:${result.error}`)
+          },
+        ),
+      )
+      return
+    }
+
+    if (controller.cron !== MAINTENANCE_CRON) {
+      reportUnmatchedCron(scheduledAt)
+      return
+    }
+
+    // Ten independent maintenance heartbeats, staggered across each 15-minute
+    // window and isolated from the Routine invocation budget on Workers Free.
     //  1. membership sync — reconcile channel membership → squad capabilities.
     //  2. metabolism — kick goal-bearing agents so their goal loops actually run
     //     ("design loops, not prompts"; without this the v0.3.0 loop never fires).
@@ -260,13 +336,26 @@ export default {
     //     goal + idle online build capacity + zero advancing tasks. Heuristic MVP,
     //     no model call (model-seam left injectable for Sol later); idempotent by
     //     design (rank, never act-loop) — see src/concierge/service.ts.
-    ctx.waitUntil(reconcileMembership(env))
-    ctx.waitUntil(runMetabolism(env))
-    ctx.waitUntil(runLoopsTick(env))
-    ctx.waitUntil(syncGitHubProject(env).then(() => undefined))
-    ctx.waitUntil(runGrowthCollection(env))
-    ctx.waitUntil(runCroCollection(env).then(() => undefined))
-    ctx.waitUntil(flushFlightEventOutbox(env).then(() => undefined))
-    ctx.waitUntil(runConciergeTick(env).then(() => undefined))
+    //  9. Project lifecycle circuit breaker (slice 1) — at cycle_boundary_at, if
+    //     status ≠ completed and no receipted recommit, kill → archived (Shape Up
+    //     inversion). Receipts go through workflow_receipts; see
+    //     src/projects/circuit-breaker.ts + stall-detector.ts + loop.ts.
+    // 10. Agent-connection retention — expire abandoned reservations and
+    //     verification challenges, then purge request/receipt rows at their
+    //     fixed tenant-scoped retention boundaries. Fail-soft by contract.
+    const maintenance: ReadonlyArray<readonly [string, () => Promise<unknown>]> = [
+      ['membership', () => reconcileMembership(env)],
+      ['metabolism', () => runMetabolism(env)],
+      ['loops', () => runLoopsTick(env)],
+      ['github-project', () => syncGitHubProject(env)],
+      ['growth', () => runGrowthCollection(env)],
+      ['cro', () => runCroCollection(env)],
+      ['flight-outbox', () => flushFlightEventOutbox(env)],
+      ['concierge', () => runConciergeTick(env)],
+      ['project-loop', () => runProjectLoopTick(env, {})],
+      ['agent-connection-retention', () => sweepAgentConnectionRetention(env)],
+    ]
+    const heartbeat = maintenance[scheduledAt.getUTCMinutes() % 15]
+    if (heartbeat) waitFor(heartbeat[0], heartbeat[1]())
   },
 }
