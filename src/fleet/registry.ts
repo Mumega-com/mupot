@@ -511,8 +511,17 @@ export async function getFleetAgentRuntimeStates(
     // agent must carry one or the fix would be inert. The adapter IS the runtime kind
     // ('claude-code', 'codex', …) — the same vocabulary fleet_agents.runtime uses.
     const runtime = String(row?.runtime ?? '') || (mod?.adapter ?? '')
+    // Compare by PARSED TIME, not by string. The two columns use different formats, and
+    // ' ' (0x20) sorts before 'T' (0x54), so a lexical compare reports an ISO stamp as newer
+    // than a SQLite stamp on the same date — even when it is a full day older:
+    //   '2026-08-06T00:00:01.000Z' > '2026-08-06 23:59:59'  ->  true, and wrong.
+    // Display-only today, but a wrong "last seen" is exactly what sends the next person
+    // looking in the wrong place. (Athena, residual on #735.)
     const fleetLastSeen = String(row?.last_reported_at ?? '')
-    const lastSeen = mod && (!fleetLastSeen || mod.lastSeen > fleetLastSeen) ? mod.lastSeen : fleetLastSeen
+    const modIsNewer = mod
+      ? (!fleetLastSeen || (parseStamp(mod.lastSeen) || 0) > (parseStamp(fleetLastSeen) || 0))
+      : false
+    const lastSeen = modIsNewer && mod ? mod.lastSeen : fleetLastSeen
 
     resolved.set(agent.agent_id, {
       agent_id: row?.agent_id ?? agent.agent_id,

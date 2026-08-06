@@ -152,3 +152,24 @@ describe('liveness is NOT weakened — stale still means stale', () => {
     expect((await liveness()).get(AGENT)?.presence).not.toBe('live')
   })
 })
+
+describe('last_seen is compared by TIME, not by string (Athena residual on #735)', () => {
+  it('a fleet stamp later in the day beats an earlier ISO module stamp', async () => {
+    // The two columns use different formats and ' ' (0x20) sorts before 'T' (0x54), so a
+    // lexical compare calls the ISO stamp newer even when it is nearly a day older. Both
+    // rows are fresh here so liveness is not what is under test — only which stamp is
+    // reported as last_seen.
+    const base = Date.parse('2026-08-06T03:00:00Z')
+    harness.sqlite.exec(
+      `INSERT INTO fleet_agents (agent_id, tenant, display, runtime, squads, lifecycle, status,
+                                 reported_by, agent_type, member_id, host, last_reported_at, updated_at)
+       VALUES ('${AGENT}', '${TENANT}', '', 'claude-code', '[]', 'on_demand', 'running',
+               'reporter', 'builder', 'member', 'host', '${sqliteStamp(base - 10_000)}', '${sqliteStamp(base - 10_000)}')`,
+    )
+    moduleRow(isoStamp(base - 120_000))
+
+    const state = await getFleetAgentRuntimeStates(env, [{ agent_id: AGENT, slug: 'kasra' }], base)
+    // The fleet stamp is the more recent one; a string compare would have picked the module's.
+    expect(state.get(AGENT)?.last_seen).toBe(sqliteStamp(base - 10_000))
+  })
+})
