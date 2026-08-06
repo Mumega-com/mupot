@@ -465,4 +465,25 @@ describe('routine runtime-neutral dispatch', () => {
 
     expect(statements).toBeLessThanOrEqual(50 - MAX_SCHEDULER_DB_STATEMENTS)
   })
+
+  it('dispatches from module_registry presence alone with no fleet attach', async () => {
+    harness = makeHarness()
+    const heartbeatTime = new Date(NOW.getTime() - 30 * 1000).toISOString()
+    harness.sqlite.exec(`
+      DELETE FROM fleet_agents;
+      INSERT INTO module_registry (
+        id, tenant, kind, adapter, project_id, identity, status, capabilities, last_heartbeat, registered_at
+      ) VALUES (
+        '${crypto.randomUUID()}', 'tenant-a', 'agent_system', 'claude_code', 'project-1',
+        'agent-preferred', 'online', '[]', '${heartbeatTime}', '${heartbeatTime}'
+      );
+    `)
+
+    const result = await dispatchRoutineRun(envFor(harness), 'run-1', NOW)
+
+    expect(result).toMatchObject({ ok: true, status: 'dispatched', agent_id: 'agent-preferred' })
+    expect(row(harness, "SELECT assigned_agent_id, status FROM routine_runs WHERE id = 'run-1'")).toEqual({
+      assigned_agent_id: 'agent-preferred', status: 'running',
+    })
+  })
 })

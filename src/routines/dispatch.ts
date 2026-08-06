@@ -12,6 +12,7 @@ import type { CapabilityGrant, Env, Project, Task } from '../types'
 import type { RoutinePolicySnapshot } from './types'
 import { sqlNotCancellationPending } from './cancellation-fence'
 import { routineControlId, routineRequestId } from './identity'
+import { PRESENCE_STALE_SECONDS } from '../registry/service'
 
 const ROUTINE_SENDER = 'mupot-routines'
 const ROUTINE_MEMBER = 'system:routines'
@@ -64,6 +65,39 @@ type AgentSelection =
   | { kind: 'selected'; agentId: string; inboxAgentId: string }
   | { kind: 'none' }
   | { kind: 'offline' }
+
+async function getRegistryPresenceForAgents(
+  env: Env,
+  agentIds: string[],
+  projectId: string,
+  nowMs: number,
+): Promise<Map<string, boolean>> {
+  if (!agentIds.length) return new Map()
+
+  const rows = await env.DB.prepare(
+    `SELECT DISTINCT identity FROM module_registry
+      WHERE tenant = ?1 AND project_id = ?2
+        AND identity IN (SELECT CAST(value AS TEXT) FROM json_each(?3))`,
+  ).bind(env.TENANT_SLUG, projectId, JSON.stringify(agentIds)).all<{ identity: string }>()
+
+  const registered = new Set((rows.results ?? []).map(r => r.identity))
+
+  if (!registered.size) return new Map()
+
+  const heartbeats = await env.DB.prepare(
+    `SELECT identity, last_heartbeat FROM module_registry
+      WHERE tenant = ?1 AND project_id = ?2
+        AND identity IN (SELECT CAST(value AS TEXT) FROM json_each(?3))`,
+  ).bind(env.TENANT_SLUG, projectId, JSON.stringify([...registered])).all<{ identity: string; last_heartbeat: string }>()
+
+  const live = new Map<string, boolean>()
+  for (const row of heartbeats.results ?? []) {
+    const heartbeatMs = Date.parse(row.last_heartbeat)
+    const isLive = !Number.isNaN(heartbeatMs) && (nowMs - heartbeatMs) / 1000 <= PRESENCE_STALE_SECONDS
+    live.set(row.identity, isLive)
+  }
+  return live
+}
 
 export type RoutineDispatchResult =
   | {
@@ -215,6 +249,7 @@ async function selectAgent(
   policy: RoutinePolicySnapshot,
   now: Date,
   assignedAgentId: string | null,
+  projectId: string,
 ): Promise<AgentSelection> {
   const candidates = await loadCandidates(env, policy.responsible_squad_id)
   const memberIds = candidates.map(candidate => candidate.member_id)
@@ -244,6 +279,18 @@ async function selectAgent(
     const state = states.get(candidate.id)
     if (state?.runtime && state.presence === 'live') {
       return { kind: 'selected', agentId: candidate.id, inboxAgentId: state.agent_id }
+    }
+  }
+
+  const registryPresence = await getRegistryPresenceForAgents(
+    env,
+    eligible.map(c => c.id),
+    projectId,
+    now.getTime(),
+  )
+  for (const candidate of eligible) {
+    if (registryPresence.get(candidate.id)) {
+      return { kind: 'selected', agentId: candidate.id, inboxAgentId: candidate.id }
     }
   }
   return { kind: 'offline' }
@@ -486,7 +533,7 @@ export async function dispatchRoutineRun(
   const remainingBudget = Math.max(0, policy.budget_micro_usd - Number(run.cost_micro_usd))
   if (remainingBudget === 0) return waitForBudget(env, run, now)
 
-  const selected = await selectAgent(env, policy, now, run.assigned_agent_id)
+  const selected = await selectAgent(env, policy, now, run.assigned_agent_id, run.project_id)
   if (selected.kind === 'none') return waitForAgent(env, run, now, 'no_eligible_agent')
   if (selected.kind === 'offline') return waitForAgent(env, run, now, 'agent_offline')
 
