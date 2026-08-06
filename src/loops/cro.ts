@@ -22,6 +22,7 @@ import type { ProposedAct, RuntimeDeps } from './runtime'
 import { createModel } from '../model'
 import type { ResourceItem } from './resources'
 import { readSeries } from '../metrics/pulse'
+import { asDataFields } from '../lib/prompt-safety'
 
 // A page is an underperformer when its conversion rate is below this floor (fraction,
 // e.g. 0.02 = 2%). Overridable per call; a conservative default so the loop targets
@@ -171,6 +172,22 @@ function normalizeSlug(v: string): string {
 
 // ── recommendation drafting (model seam, fail-soft) ────────────────────────────
 
+/**
+ * The user-turn content for the CRO recommendation prompt. EXPORTED so tests can
+ * assert the prompt-injection property against the SAME string production builds,
+ * rather than against a re-implementation (mupot#669). page.title is CMS-editable
+ * external free text; asDataFields fences every value before serialization --
+ * JSON.stringify alone escapes \n but passes U+2028/9 and bidi overrides through
+ * raw, and applies no length bound.
+ */
+export function buildCroUserContent(goal: string, page: PagePerf): string {
+  return (
+    `Goal: ${goal}\n` +
+    `Page: ${asDataFields({ title: page.title, url: page.url, conversion_pct: (page.conversion * 100).toFixed(2) })}\n` +
+    'Propose the single highest-leverage change as JSON only.'
+  )
+}
+
 async function draftRecommendation(model: ModelPort, goal: string, page: PagePerf): Promise<string | null> {
   const messages: ModelMessage[] = [
     {
@@ -184,9 +201,7 @@ async function draftRecommendation(model: ModelPort, goal: string, page: PagePer
     {
       role: 'user',
       content:
-        `Goal: ${goal}\n` +
-        `Page: ${JSON.stringify({ title: page.title, url: page.url, conversion_pct: (page.conversion * 100).toFixed(2) })}\n` +
-        'Propose the single highest-leverage change as JSON only.',
+        buildCroUserContent(goal, page),
     },
   ]
 

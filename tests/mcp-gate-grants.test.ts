@@ -1,23 +1,18 @@
 // tests/mcp-gate-grants.test.ts — grant_gate_capability / revoke_gate_capability MCP twins.
 
-import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import type { AuthContext, CapabilityGrant, Env } from '../src/types'
 import { TOOLS, invokeTool } from '../src/mcp/index'
 import { createSqliteD1 } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 
-const migrations = [
-  '../migrations/0001_init.sql',
-  '../migrations/0007_gates.sql',
-  '../migrations/0008_gate_grants.sql',
-].map((path) => readFileSync(new URL(path, import.meta.url), 'utf8'))
 
 const TENANT = 'tenant-a'
 const ORIGIN = 'https://pot.test'
 
 function makeDb() {
   const harness = createSqliteD1()
-  for (const migration of migrations) harness.sqlite.exec(migration)
+  applyAllMigrations(harness.sqlite)
   return {
     env: { DB: harness.db, TENANT_SLUG: TENANT } as Env,
     grants: () => harness.sqlite.prepare('SELECT * FROM gate_grants').all() as Array<Record<string, unknown>>,

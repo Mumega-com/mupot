@@ -1,0 +1,6 @@
+{
+  "_comment": "Dev/build-toolchain advisories accepted ONLY because no fixed version exists. Read by scripts/audit-gate.mjs. An advisory listed here is tolerated; ANY high/critical advisory NOT listed here fails the build, and so does an entry here that has stopped appearing (that means a fix shipped and the entry must be deleted). This file is the reason the dev audit is not `|| true`. EMPTY as of 2026-08-06: undici GHSA-4cwx-7wf7-3272 fixed by pinning undici 7.29.0 via overrides \u2014 the entry's own premise ('no fixed version exists') stopped being true. If this list stays empty, close issue #670 and fold this step back into the blocking audit.",
+  "_scope": "high and critical only \u2014 moderate and below do not block the dev half, so they are deliberately not listed here. Production dependencies get a separate blocking `npm audit --omit=dev --audit-level=moderate` with NO allowlist and no exceptions. Every field of an entry is compared: ghsa + package + severity + nodes + isDirect + paths. isDirect true is rejected outright \u2014 a dependency we chose to add must have its advisory fixed or the dependency dropped.",
+  "_review": "https://github.com/Mumega-com/mupot/issues/670",
+  "allowed": []
+}
