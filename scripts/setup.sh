@@ -352,11 +352,11 @@ printf '\n'
 ok "Setup complete."
 printf '\n'
 say "Next steps:"
-printf '   1. First deploy:       npx wrangler deploy --config "%s"\n' "${WRANGLER_TOML}"
+printf '   1. First deploy:       node scripts/deploy.mjs --config "%s"\n' "${WRANGLER_TOML}"
 if [ -n "${POT}" ]; then
   printf '   2. Set your secrets:   bash scripts/secrets.sh --pot "%s"\n' "${POT}"
 else
   printf '   2. Set your secrets:   bash scripts/secrets.sh\n'
 fi
-printf '   3. Re-deploy:          npx wrangler deploy --config "%s"\n' "${WRANGLER_TOML}"
+printf '   3. Re-deploy:          node scripts/deploy.mjs --config "%s"\n' "${WRANGLER_TOML}"
 printf '   4. Open your deployment and log in — the first login becomes owner.\n'

@@ -380,8 +380,23 @@ eventIngestApp.post('/ingest', async (c) => {
     payload,
   }
 
+  // PR #659 P0 fix, widened (kasra-core parallel-audit finding): flagged as a 5th
+  // external-content entry point beyond the four named in the brief — HMAC-authenticated
+  // as a TRANSPORT (this really is a registered external worker) but the CONTENT
+  // (event.payload, flowing into title/body via each deriver) is fully external-system-
+  // controlled, same untrusted-writer class as Linear/GitHub-Projects/GitHub-webhook/GHL.
+  // Already unassigned (no assignee_agent_id passed to createTask below), so
+  // externalSource is what closes the unassigned-auto-pickup hole (#404/#659) — without
+  // it this task was indistinguishable from a trusted local one. Reported to kasra-core
+  // as found-and-fixed beyond the named list (see PR report) since the fix is the same
+  // one-line, monotonic-safe marker as the other four and ingestEvent already threads
+  // CreateTaskOptions straight through.
   const result = await ingestEvent(c.env, event, {
     actor: { kind: 'agent', id: event.source },
+    // event.source is caller-supplied free text (only checked non-empty above, no length
+    // cap) — bound it before it becomes part of a DB column, same discipline as the
+    // Linear identifier/url cap (finding #5, PR #659).
+    externalSource: `event-ingest:${event.source}`.slice(0, 100),
   })
 
   if (!result.ok) {

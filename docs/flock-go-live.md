@@ -34,7 +34,7 @@ npx wrangler secret put BUS_TOKEN --config wrangler.digid.toml   # paste the raw
 CLOUDFLARE_API_TOKEN=$(cat ~/.sos/keys/cf-token-mupot-digid-deploy.token) \
 CLOUDFLARE_ACCOUNT_ID=e39eaf94f33092c4efd029d94ae1e9dd \
 NODE_OPTIONS=--dns-result-order=ipv4first \
-  npx wrangler deploy -c wrangler.digid.toml
+  node scripts/deploy.mjs -c wrangler.digid.toml
 ```
 
 `agents.digid.ca/fleet` now renders the live `project:digid` roster (the existing

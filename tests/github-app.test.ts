@@ -130,6 +130,15 @@ describe('pemToPkcs8Der', () => {
   it('rejects non-PEM garbage', () => {
     expect(pemToPkcs8Der('hello')).toBeNull()
   })
+
+  it('rejects an adversarial unterminated envelope in bounded time', () => {
+    const header = '-----BEGIN PRIVATE KEY-----'
+    const input = header + `${header}a`.repeat(15_000)
+    const startedAt = performance.now()
+
+    expect(pemToPkcs8Der(input)).toBeNull()
+    expect(performance.now() - startedAt).toBeLessThan(500)
+  })
 })
 
 describe('getInstallationToken', () => {

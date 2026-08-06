@@ -77,7 +77,7 @@ export async function loadActiveAgentKey(env: Env, agentId: string): Promise<Act
 }
 
 /**
- * Register a host-held agent key against the agent's unique active token identity.
+ * Register a host-held agent key against the agent's immutable member binding.
  * Existing different keys are never replaced implicitly; deliberate rotation needs
  * a separate owner ceremony.
  */
@@ -88,23 +88,20 @@ export async function registerAgentPublicKey(
   publicKey: string,
   now = () => Math.floor(Date.now() / 1000),
 ): Promise<RegisterAgentKeyResult> {
-  const identities = await env.DB.prepare(
-    `SELECT DISTINCT t.member_id
-       FROM member_tokens t
-       JOIN members m ON m.id = t.member_id
-      WHERE t.tenant = ?1
-        AND m.tenant = ?1
-        AND t.agent_id = ?2
-        AND t.revoked_at IS NULL
+  const identity = await env.DB.prepare(
+    `SELECT b.member_id
+       FROM agent_member_bindings b
+       JOIN members m
+         ON m.id = b.member_id
+        AND m.tenant = b.tenant
+      WHERE b.tenant = ?1
+        AND b.agent_id = ?2
         AND m.status = 'active'
-      ORDER BY t.member_id
-      LIMIT 2`,
-  ).bind(env.TENANT_SLUG, identityAgentId).all<{ member_id: string }>()
+      LIMIT 1`,
+  ).bind(env.TENANT_SLUG, identityAgentId).first<{ member_id: string }>()
 
-  const memberIds = [...new Set((identities.results ?? []).map((row) => row.member_id))]
-  if (memberIds.length === 0) return { ok: false, reason: 'identity_unminted' }
-  if (memberIds.length !== 1) return { ok: false, reason: 'identity_ambiguous' }
-  const memberId = memberIds[0]
+  if (!identity) return { ok: false, reason: 'identity_unminted' }
+  const memberId = identity.member_id
 
   const existing = await loadKey(env, runtimeAgentId)
   if (existing) {

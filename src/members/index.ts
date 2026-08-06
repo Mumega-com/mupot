@@ -51,6 +51,14 @@ import {
   mintRawToken,
   upsertCapabilityGrant,
 } from './service'
+import {
+  isAgentAccessCapability,
+  removeAgentSquadAccess,
+  resolveBoundAgentForMember,
+  setAgentSquadAccess,
+  type AgentAccessCapability,
+  type AgentSquadAccessError,
+} from './agent-access'
 
 // The validated invite payload, stashed by the parse middleware so the scope
 // extractor (which runs inside requireCapability) can read the target department.
@@ -103,6 +111,19 @@ function isUniqueViolation(err: unknown): boolean {
 function protectRawTokenResponse(c: Context): void {
   c.header('Cache-Control', 'no-store')
   c.header('Referrer-Policy', 'no-referrer')
+}
+
+function agentAccessErrorResponse(
+  c: Context<AppEnv>,
+  error: AgentSquadAccessError,
+): Response {
+  if (error === 'agent_not_found' || error === 'squad_not_found') {
+    return c.json({ error }, 404)
+  }
+  if (error === 'receipt_failed') {
+    return c.json({ error }, 500)
+  }
+  return c.json({ error }, 409)
 }
 
 interface InviteRow {
@@ -537,7 +558,26 @@ membersApp.post('/members/:id/capabilities', requireCapability(orgScope, 'admin'
     if (!exists) return c.json({ error: `${scopeType}_not_found` }, 404)
   }
 
+  const boundAgent = await resolveBoundAgentForMember(c.env, memberId)
+  if (boundAgent && scopeType !== 'squad') {
+    return c.json({ error: 'agent_capability_scope_unsupported' }, 409)
+  }
+
   if (action === 'revoke') {
+    if (boundAgent) {
+      const outcome = await removeAgentSquadAccess(c.env, {
+        agentId: boundAgent.agentId,
+        memberId,
+        squadId: scopeId as string,
+      })
+      if (!outcome.ok) return agentAccessErrorResponse(c, outcome.error)
+      return c.json({
+        member_id: memberId,
+        action: 'revoke',
+        result: outcome.result,
+      })
+    }
+
     // scope_id comparison must treat null correctly (IS NULL vs = ?).
     const res = scopeId === null
       ? await c.env.DB.prepare(
@@ -557,11 +597,36 @@ membersApp.post('/members/:id/capabilities', requireCapability(orgScope, 'admin'
   // grant
   if (!isCapability(body.capability)) return c.json({ error: 'invalid_capability' }, 400)
   const capability: Capability = body.capability
+  let agentCapability: AgentAccessCapability | null = null
+  if (boundAgent) {
+    if (!isAgentAccessCapability(capability)) {
+      return c.json({
+        error: 'invalid_agent_capability',
+        allowed: ['observer', 'member', 'lead', 'admin'],
+      }, 400)
+    }
+    agentCapability = capability
+  }
 
   // CEILING: cannot grant above your own rank on the target scope (an org-admin
   // must not grant org 'owner'). P1 fix.
   if (capabilityRank(capability) > (await actorMaxRankOnScope(c, scopeType, scopeId))) {
     return c.json({ error: 'forbidden', reason: 'cannot_grant_above_own_rank' }, 403)
+  }
+
+  if (boundAgent && agentCapability) {
+    const outcome = await setAgentSquadAccess(c.env, {
+      agentId: boundAgent.agentId,
+      memberId,
+      squadId: scopeId as string,
+      capability: agentCapability,
+    })
+    if (!outcome.ok) return agentAccessErrorResponse(c, outcome.error)
+    return c.json({
+      grant: outcome.grant,
+      action: 'grant',
+      result: outcome.result,
+    }, outcome.result === 'created' ? 201 : 200)
   }
 
   const grant: CapabilityGrant = {

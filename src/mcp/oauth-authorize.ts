@@ -284,6 +284,25 @@ export async function buildAuthContextFromProps(
     channel,
     capabilities, // always defined; empty only for directory — prevents legacyRoleSatisfies escape
     boundAgentId, // directory seats are pure human/operator principals; workspace keys preserve the weld
+    // LATENT capabilities: what this member actually holds, resolved but NOT active.
+    //
+    // The ceiling above is right about STANDING authority — an OAuth seat must never
+    // silently act with an owner's grants. It was wrong about one thing: it assumed a
+    // blocked operator has another door. The operator has no internal API path and reaches
+    // mupot only through agentic harnesses (Claude Desktop, claude.ai, Codex, Cursor), all
+    // of which arrive HERE. So "use the workspace door instead" was not advice, it was a
+    // dead end — and the workaround it produced was worse than the risk it prevented: work
+    // routed through a shared shell holding every credential on the host.
+    //
+    // Latent capabilities exist so an EXPLICIT, NAMED act can be authorized against what
+    // the member truly holds, while ambient authority stays zero. `connect { agent_name }`
+    // is that act: it names one agent, it is auditable, and it writes nothing. Silent
+    // inheritance stays impossible; deliberate selection becomes possible.
+    //
+    // Anything reading `latentCapabilities` MUST be a read-only or explicitly-named
+    // operation. Using it to satisfy an ambient capability check would reinstate exactly
+    // the inheritance this ceiling exists to prevent. (#712)
+    latentCapabilities: channel === 'directory' ? resolvedCapabilities : capabilities,
   }
 }
 

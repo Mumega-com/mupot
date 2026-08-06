@@ -108,6 +108,19 @@ async function registerBuilderOnline(env: Env, projectId: string): Promise<void>
   expect(result.ok).toBe(true)
 }
 
+// The SHARED build pool: a driver registered with project_id = null (how the standing
+// operator's cursor/mumcp actually register). This is the live production shape.
+async function registerBuilderShared(env: Env): Promise<void> {
+  const result = await registerModule(env, {
+    identity: 'agent-builder',
+    kind: 'agent_system',
+    adapter: 'cursor',
+    projectId: null,
+    capabilities: [BUILD_CAPABILITY],
+  })
+  expect(result.ok).toBe(true)
+}
+
 describe('runProjectConcierge — presence registration', () => {
   it('registers the concierge and it appears online on its own project roster', async () => {
     const harness = makeHarness()
@@ -141,6 +154,190 @@ describe('runProjectConcierge — stalled project dispatches exactly one starter
     expect(result.registered).toBe(true)
     expect(result.decision).toEqual({ action: 'dispatch', agentId: 'agent-builder' })
     expect(result.taskId).toBeTruthy()
+  })
+
+  // Work-router: a BUSY project (has advancing work) with a SITTING unassigned-open
+  // task routes it to an online builder — the "10 tasks parked, agents idle" case.
+  it('routes a sitting unassigned-open task to an online builder (busy project)', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    const p = project()
+    insertProject(harness, p)
+    grantSquadAccess(harness, p.id, 'squad-a', 'write')
+    // open + unassigned in squad-a: makes the project "busy" AND is the routable target.
+    // Seed a stale updated_at so we can assert the router bumps it.
+    harness.sqlite.exec(
+      `INSERT INTO tasks (id, squad_id, project_id, title, done_when, status, assignee_agent_id, updated_at)
+       VALUES ('task-sitting', 'squad-a', '${p.id}', 'Sitting work', 'done', 'open', NULL, '2020-01-01T00:00:00.000Z')`,
+    )
+    await registerBuilderShared(env) // online in the shared pool (project_id=null)
+
+    const result = await runProjectConcierge(env, p)
+    expect(result.decision).toEqual({ action: 'route', routed: 1 })
+    const row = harness.sqlite
+      .prepare('SELECT assignee_agent_id, updated_at FROM tasks WHERE id = ?')
+      .get('task-sitting') as { assignee_agent_id: string | null; updated_at: string }
+    expect(row.assignee_agent_id).toBe('agent-builder')
+    expect(row.updated_at).not.toBe('2020-01-01T00:00:00.000Z') // router bumped it (observability)
+  })
+
+  // SECURITY regression (#404): a cross-pot (source_pot) open+unassigned task must NOT be
+  // auto-routed — untrusted remote content requires an explicit human/operator assignee.
+  it('does NOT route a cross-pot (source_pot) task — #404 invariant', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    const p = project()
+    insertProject(harness, p)
+    grantSquadAccess(harness, p.id, 'squad-a', 'write')
+    harness.sqlite.exec(
+      `INSERT INTO tasks (id, squad_id, project_id, title, done_when, status, assignee_agent_id, source_pot)
+       VALUES ('task-crosspot', 'squad-a', '${p.id}', 'Inbound remote work', 'done', 'open', NULL, 'remote-pot-x')`,
+    )
+    await registerBuilderShared(env)
+
+    const result = await runProjectConcierge(env, p)
+    expect(result.decision).toEqual({ action: 'noop', reason: 'has_advancing_work' })
+    const row = harness.sqlite
+      .prepare('SELECT assignee_agent_id FROM tasks WHERE id = ?')
+      .get('task-crosspot') as { assignee_agent_id: string | null }
+    expect(row.assignee_agent_id).toBeNull() // untrusted cross-pot task NOT auto-assigned
+  })
+
+  // PR #659 P0 fix (diverse-model adversarial gate BLOCK): routeUnassignedWork's WHERE
+  // clause (project_id, status='open', assignee_agent_id IS NULL, source_pot IS NULL) was
+  // a character-for-character description of a Linear-imported task before
+  // migrations/0077 added external_source — the concierge's maintenance-cron tick is a
+  // status-POLLING read that never looked at the task.created event skipEvent suppressed,
+  // so a Linear-origin task got auto-assigned (and routed to a specific agent CLASS via
+  // classifyTaskRoleEffort reading its attacker-controlled title/body) on the very next
+  // tick with zero human step. This test must fail on da8be05 for the RIGHT reason (the
+  // task IS routed), not because external_source is an unknown column.
+  it('does NOT route a Linear-origin (external_source) task — PR #659 P0 fix', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    const p = project()
+    insertProject(harness, p)
+    grantSquadAccess(harness, p.id, 'squad-a', 'write')
+    harness.sqlite.exec(
+      `INSERT INTO tasks (id, squad_id, project_id, title, done_when, status, assignee_agent_id, external_source)
+       VALUES ('task-linear', 'squad-a', '${p.id}', 'Imported from Linear', 'done', 'open', NULL, 'linear:ENG')`,
+    )
+    await registerBuilderShared(env)
+
+    const result = await runProjectConcierge(env, p)
+    expect(result.decision).toEqual({ action: 'noop', reason: 'has_advancing_work' })
+    const row = harness.sqlite
+      .prepare('SELECT assignee_agent_id FROM tasks WHERE id = ?')
+      .get('task-linear') as { assignee_agent_id: string | null }
+    expect(row.assignee_agent_id).toBeNull() // untrusted Linear-origin task NOT auto-assigned
+  })
+
+  it('does NOT reassign an already-assigned task; busy project with no sitting work -> noop', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    const p = project()
+    insertProject(harness, p)
+    grantSquadAccess(harness, p.id, 'squad-a', 'write')
+    // one in_progress task already assigned to someone else — busy, but nothing to route.
+    harness.sqlite.exec(
+      `INSERT INTO tasks (id, squad_id, project_id, title, done_when, status, assignee_agent_id)
+       VALUES ('task-owned', 'squad-a', '${p.id}', 'Owned work', 'done', 'in_progress', 'agent-paused')`,
+    )
+    await registerBuilderShared(env)
+
+    const result = await runProjectConcierge(env, p)
+    expect(result.decision).toEqual({ action: 'noop', reason: 'has_advancing_work' })
+    const row = harness.sqlite
+      .prepare('SELECT assignee_agent_id FROM tasks WHERE id = ?')
+      .get('task-owned') as { assignee_agent_id: string | null }
+    expect(row.assignee_agent_id).toBe('agent-paused') // untouched
+  })
+
+  it('routes at most MAX_ROUTES_PER_AGENT to one builder in a tick', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    const p = project()
+    insertProject(harness, p)
+    grantSquadAccess(harness, p.id, 'squad-a', 'write')
+    // 4 sitting tasks, only one online builder (agent-builder) → capped at 2 this tick.
+    for (let i = 0; i < 4; i++) {
+      harness.sqlite.exec(
+        `INSERT INTO tasks (id, squad_id, project_id, title, done_when, status, assignee_agent_id)
+         VALUES ('sit-${i}', 'squad-a', '${p.id}', 'Sitting ${i}', 'done', 'open', NULL)`,
+      )
+    }
+    await registerBuilderShared(env)
+
+    const result = await runProjectConcierge(env, p)
+    expect(result.decision).toEqual({ action: 'route', routed: 2 }) // MAX_ROUTES_PER_AGENT
+    const assigned = (
+      harness.sqlite
+        .prepare(`SELECT COUNT(*) AS n FROM tasks WHERE project_id = ? AND assignee_agent_id = 'agent-builder'`)
+        .get(p.id) as { n: number }
+    ).n
+    expect(assigned).toBe(2)
+  })
+
+  // Effort ladder: research task prefers agy; agy must never receive build work.
+  it('routes a research task to agy when online; does not give agy build work', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    const p = project()
+    insertProject(harness, p)
+    grantSquadAccess(harness, p.id, 'squad-a', 'write')
+    harness.sqlite.exec(`
+      INSERT INTO agents (id, squad_id, slug, name, status)
+      VALUES ('agent-agy', 'squad-a', 'agy', 'Agy', 'active');
+      INSERT INTO agents (id, squad_id, slug, name, status)
+      VALUES ('agent-cursor', 'squad-a', 'cursor', 'Cursor', 'active');
+      INSERT INTO tasks (id, squad_id, project_id, title, body, done_when, status, assignee_agent_id)
+      VALUES ('task-research', 'squad-a', '${p.id}', 'Research competitor pricing', '', 'done', 'open', NULL);
+      INSERT INTO tasks (id, squad_id, project_id, title, body, done_when, status, assignee_agent_id)
+      VALUES ('task-build', 'squad-a', '${p.id}', 'Ship the feature', '', 'done', 'open', NULL);
+    `)
+    // agy presence wrongly claims build — authoritative HARNESS_CAPABILITIES must still
+    // keep it research-only.
+    await registerModule(env, {
+      identity: 'agent-agy',
+      kind: 'agent_system',
+      adapter: 'antigravity',
+      projectId: null,
+      capabilities: ['build', 'research', 'review'],
+    })
+    await registerModule(env, {
+      identity: 'agent-cursor',
+      kind: 'agent_system',
+      adapter: 'cursor',
+      projectId: null,
+      capabilities: [BUILD_CAPABILITY],
+    })
+
+    const result = await runProjectConcierge(env, p)
+    expect(result.decision.action).toBe('route')
+    const research = harness.sqlite
+      .prepare('SELECT assignee_agent_id FROM tasks WHERE id = ?')
+      .get('task-research') as { assignee_agent_id: string | null }
+    const build = harness.sqlite
+      .prepare('SELECT assignee_agent_id FROM tasks WHERE id = ?')
+      .get('task-build') as { assignee_agent_id: string | null }
+    expect(research.assignee_agent_id).toBe('agent-agy')
+    expect(build.assignee_agent_id).toBe('agent-cursor')
+  })
+
+  // Regression for the "never dispatched in production" bug: the build driver is in the
+  // SHARED pool (project_id=null), NOT on the project roster. Before the fix the concierge
+  // only queried the project scope and reported no_online_builder forever.
+  it('goal + SHARED-pool (project_id=null) build agent + zero advancing -> dispatch', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    const p = project()
+    insertProject(harness, p)
+    grantSquadAccess(harness, p.id, 'squad-a', 'write')
+    await registerBuilderShared(env) // builder online in the shared pool ONLY
+
+    const result = await runProjectConcierge(env, p)
+    expect(result.decision).toEqual({ action: 'dispatch', agentId: 'agent-builder' })
+    expect(result.taskId).toBeTruthy()
 
     const rows = countTasks(harness, p.id)
     expect(rows).toHaveLength(1)
@@ -162,11 +359,14 @@ describe('runProjectConcierge — idempotency (the anti-spam proof)', () => {
     expect(first.decision.action).toBe('dispatch')
 
     const second = await runProjectConcierge(env, p)
-    // 'already_dispatched' (the dispatch-once-ever, any-status guard) fires here
-    // rather than 'has_advancing_work' — both are technically true (the task is
-    // still 'open' AND carries the marker), but hasConciergeStarter is checked
-    // first since it is the primary invariant this file enforces (P0 fix, PR #459).
-    expect(second.decision).toEqual({ action: 'noop', reason: 'already_dispatched' })
+    // After the dispatch, the starter is an OPEN task, so the project is now BUSY →
+    // the second cycle takes the work-router branch (checked before the starter's
+    // dispatch-once bookkeeping). The starter is already ASSIGNED (assignee=builder),
+    // so there is nothing unassigned to route → has_advancing_work. Crucially it does
+    // NOT dispatch a second starter — the dispatch-once invariant holds (the starter
+    // path is only reachable when the project is STALLED, and there already_dispatched
+    // still guards it — see the FULL-lifecycle regression below).
+    expect(second.decision).toEqual({ action: 'noop', reason: 'has_advancing_work' })
     expect(second.taskId).toBeNull()
 
     // The dedup guard is the whole point of this test: fails here if it's ever removed.
