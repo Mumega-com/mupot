@@ -10,6 +10,7 @@ import type { Env, ModelPort, ModelMessage } from '../types'
 import type { ProposedAct, RuntimeDeps } from './runtime'
 import { createModel } from '../model'
 import { claimProspect, countByStatus } from './prospects'
+import { asDataFields } from '../lib/prompt-safety'
 
 export interface OutreachReasonDeps {
   model?: ModelPort
@@ -70,6 +71,20 @@ interface Draft {
   body: string
 }
 
+/**
+ * The user-turn content for the outreach draft prompt. EXPORTED so tests can assert
+ * the prompt-injection property against the SAME string production builds (mupot#669).
+ * item.text is free-form prospect notes -- external free text reaching a model turn
+ * whose output becomes a gated send_email act.
+ */
+export function buildOutreachUserContent(offer: string, item: Record<string, unknown>): string {
+  return (
+    `Offer / goal: ${offer}\n` +
+    `Prospect: ${asDataFields({ org: item.org, title: item.title, notes: item.text })}\n` +
+    'Write the first-touch email as JSON only.'
+  )
+}
+
 async function draftMessage(model: ModelPort, offer: string, item: Record<string, unknown>): Promise<Draft | null> {
   const messages: ModelMessage[] = [
     {
@@ -83,9 +98,7 @@ async function draftMessage(model: ModelPort, offer: string, item: Record<string
     {
       role: 'user',
       content:
-        `Offer / goal: ${offer}\n` +
-        `Prospect: ${JSON.stringify({ org: item.org, title: item.title, notes: item.text })}\n` +
-        'Write the first-touch email as JSON only.',
+        buildOutreachUserContent(offer, item),
     },
   ]
 
