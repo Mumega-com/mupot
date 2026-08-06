@@ -661,12 +661,41 @@ def build_receipt(head_sha: str, verdict_obj: dict, sensitive: bool, sensitive_r
     return "\n".join(lines)
 
 
+REPORT_BODY_MAX_CHARS = 60_000
+
+
+def _cap_body(body: str) -> str:
+    """The mupot endpoint rejects oversized requests (HTTP 413), and a lost
+    receipt means the task gets re-processed every cycle. Budget the JSON-
+    ENCODED size (escaping inflates newline-heavy bodies), keep the head
+    (original statement) plus the newest receipts tail, and cut the tail at a
+    receipt boundary so the newest receipt survives complete with its marker."""
+    def encoded_len(s: str) -> int:
+        return len(json.dumps(s).encode())
+
+    if encoded_len(body) <= REPORT_BODY_MAX_CHARS:
+        return body
+    head = body[:4000]
+    tail_budget = REPORT_BODY_MAX_CHARS - encoded_len(head) - 200
+    tail = body[-max(tail_budget // 2, 4000):]
+    while encoded_len(tail) > tail_budget and len(tail) > 1000:
+        tail = tail[len(tail) // 4:]
+    boundary = tail.find("\n---\n")
+    if 0 <= boundary <= len(tail) // 2:
+        tail = tail[boundary:]
+    return (
+        head
+        + "\n\n... [task body truncated: server request cap; newest receipts kept below] ...\n"
+        + tail
+    )
+
+
 def report_review(task: dict, head_sha: str, verdict_obj: dict, sensitive: bool, sensitive_reason: str, mode_note: str) -> None:
     receipt = build_receipt(head_sha, verdict_obj, sensitive, sensitive_reason, mode_note)
     body = f"{task.get('body', '')}\n\n---\n{receipt}"
     # Body-only update: this task is already in `review` and stays there in
     # review-only mode -- status is deliberately NOT touched here.
-    mcp("task_update", {"task_id": task["id"], "body": body})
+    mcp("task_update", {"task_id": task["id"], "body": _cap_body(body)})
 
 
 def notify_kasra(task: dict, pr_meta: dict, verdict_obj: dict, sensitive: bool, automerge_result: dict) -> None:

@@ -1,4 +1,5 @@
 import type { D1Result } from '@cloudflare/workers-types'
+import { TASK_SELECT_COLUMNS } from '../tasks/ranking'
 import { sendAgentMessage as sendMessage } from '../agents/messages'
 import { hasCapability } from '../auth/capability'
 import { mcpEndpoint } from '../dashboard/connect'
@@ -330,8 +331,7 @@ async function waitForAgent(env: Env, run: DispatchRunRow, now: Date, reason: st
 
 async function existingTask(env: Env, id: string): Promise<Task | null> {
   return env.DB.prepare(
-    `SELECT id, squad_id, project_id, title, body, done_when, status, assignee_agent_id,
-            github_issue_url, result, completed_at, gate_owner, created_at, updated_at
+    `SELECT ${TASK_SELECT_COLUMNS}
        FROM tasks WHERE id = ?`,
   ).bind(id).first<Task>()
 }

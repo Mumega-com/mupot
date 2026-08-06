@@ -39,6 +39,8 @@ import {
   actionableStatusInSql,
   terminalStatusInSql,
   actionableStatusOrderSql,
+  priorityOrderSql,
+  TASK_SELECT_COLUMNS,
   ACTIONABLE_FETCH_CAP,
   PASSTHROUGH_FETCH_CAP,
 } from './ranking'
@@ -306,10 +308,10 @@ tasksApp.get('/', async (c) => {
     const statusBinds = [...binds, status]
     const cap = isActionable ? ACTIONABLE_FETCH_CAP : PASSTHROUGH_FETCH_CAP
     const rows = await c.env.DB.prepare(
-      `SELECT id, squad_id, project_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, source_pot, created_at, updated_at
+      `SELECT ${TASK_SELECT_COLUMNS}
          FROM tasks
         WHERE ${statusClauses.join(' AND ')}
-        ORDER BY created_at ${isActionable ? 'ASC' : 'DESC'}
+        ORDER BY ${priorityOrderSql()}, created_at ${isActionable ? 'ASC' : 'DESC'}
         LIMIT ${cap}`,
     )
       .bind(...statusBinds)
@@ -332,17 +334,17 @@ tasksApp.get('/', async (c) => {
 
     const [actionableRows, terminalRows] = await Promise.all([
       c.env.DB.prepare(
-        `SELECT id, squad_id, project_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, source_pot, created_at, updated_at
+        `SELECT ${TASK_SELECT_COLUMNS}
            FROM tasks ${actionableWhere}
-           ORDER BY ${actionableStatusOrderSql()}, created_at ASC
+           ORDER BY ${actionableStatusOrderSql()}, ${priorityOrderSql()}, created_at ASC
            LIMIT ${ACTIONABLE_FETCH_CAP}`,
       )
         .bind(...binds)
         .all<Task>(),
       c.env.DB.prepare(
-        `SELECT id, squad_id, project_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, source_pot, created_at, updated_at
+        `SELECT ${TASK_SELECT_COLUMNS}
            FROM tasks ${terminalWhere}
-           ORDER BY created_at DESC
+           ORDER BY ${priorityOrderSql()}, created_at DESC
            LIMIT ${PASSTHROUGH_FETCH_CAP}`,
       )
         .bind(...binds)
@@ -368,7 +370,7 @@ tasksApp.get('/', async (c) => {
 tasksApp.get('/:id', async (c) => {
   const id = c.req.param('id')
   const task = await c.env.DB.prepare(
-    `SELECT id, squad_id, project_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, source_pot, created_at, updated_at
+    `SELECT ${TASK_SELECT_COLUMNS}
        FROM tasks WHERE id = ? LIMIT 1`,
   )
     .bind(id)
@@ -666,10 +668,17 @@ tasksApp.patch('/:id', async (c) => {
     // moment this route gains bearer/memberId auth. The REACHABLE production
     // path for #406 is the MCP bearer surface, covered end-to-end in
     // tests/mcp-task-tools.test.ts.
-    if (existing.source_pot) {
+    // PR #659 P0 fix: external_source (migrations/0077) requires the same admin+ bar as
+    // source_pot — a Linear-origin task is the same untrusted-writer class, and the same
+    // #406 reasoning applies (a member-tier/runtime-welded agent token must not be able to
+    // self-assign untrusted external content onto itself and then execute it).
+    // Explicit null semantics, matching migrations/0077 (adversarial gate BLOCK
+    // 2026-08-04): truthiness treated external_source='' as first-party while SQL
+    // treated it as external, so a blank-provenance row escaped the admin bar.
+    if (isExternallySourced(existing)) {
       if (!(await canActOnSquad(c.env, c.get('auth'), existing.squad_id, 'admin'))) {
         return c.json(
-          { error: 'forbidden', need: 'admin', detail: 'source_pot task assignment requires admin+' },
+          { error: 'forbidden', need: 'admin', detail: 'source_pot/external_source task assignment requires admin+' },
           403,
         )
       }
@@ -1119,6 +1128,7 @@ tasksApp.post('/:id/pipeline', async (c) => {
 // POST body: { capability: string, principal_type: 'member'|'agent', principal_id: string }
 // DELETE body: same shape — revoke = hard delete (the verdict receipt IS the audit trail)
 
+import { isExternallySourced } from './provenance'
 import {
   grantGateCapability,
   parseGateGrantArgs,
