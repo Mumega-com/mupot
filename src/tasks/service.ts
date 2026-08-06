@@ -4,10 +4,11 @@
 // (dashboard/API, MCP, IM, channels, agents) should call createTask() instead of
 // hand-writing rows. `task.created` is a post-persistence notification event.
 
-import type { Env, Task, TaskVerdict, BusEvent } from '../types'
+import type { Env, Task, TaskPriority, TaskVerdict, BusEvent } from '../types'
 import { createBus } from '../bus'
 import { assertWritten } from '../lib/receipt'
 import { resolveOutboundGitHubToken } from '../integrations/github-app'
+import { isBlankProvenance } from './provenance'
 import { hasProjectWriteForSquads } from '../projects/access'
 
 export type TaskStatus = Task['status']
@@ -203,6 +204,10 @@ export interface CreateTaskInput {
   status?: TaskStatus
   assignee_agent_id?: string | null
   gate_owner?: string | null
+  /** Rank (migrations/0079). Omitted/null = untriaged, which is a real state, not a default. */
+  priority?: TaskPriority | null
+  /** Subtask link (migrations/0079). Omitted/null = top-level. */
+  parent_task_id?: string | null
 }
 
 export interface CreateTaskOptions {
@@ -218,6 +223,14 @@ export interface CreateTaskOptions {
   skipMirror?: boolean
   /** Internal atomic fence used by Routine dispatch before creating control work. */
   routineRunFence?: { runId: string; tenant: string }
+  // PR #659 P0 fix: provenance marker for a task written by a governed external
+  // integration (see Task.external_source, migrations/0077). Undefined/null on every
+  // normal create call -- only src/integrations/linear-issues.ts and the task_create
+  // MCP tool's carry-forward path (steward reissue) set this today. Monotonic-safe to
+  // expose broadly: it only ever ADDS restriction (no auto-pickup, admin-gated
+  // reassignment, untrusted-content prompt fence), never removes it, so a caller
+  // setting it on its own new task cannot escalate privilege.
+  externalSource?: string | null
 }
 
 export class TaskCreateFenceError extends Error {
@@ -402,7 +415,7 @@ export async function persistTaskUpdate(
   try {
     result = await env.DB.prepare(
       `UPDATE tasks
-          SET title = ?, body = ?, done_when = ?, status = ?, assignee_agent_id = ?, github_issue_url = ?, gate_owner = ?, project_id = ?, completed_at = ?, updated_at = ?
+          SET title = ?, body = ?, done_when = ?, status = ?, priority = ?, parent_task_id = ?, assignee_agent_id = ?, github_issue_url = ?, gate_owner = ?, project_id = ?, completed_at = ?, updated_at = ?
         WHERE id = ? AND updated_at = ? AND project_id IS ?`,
     )
       .bind(
@@ -410,6 +423,8 @@ export async function persistTaskUpdate(
         next.body,
         next.done_when,
         next.status,
+        next.priority ?? null,
+        next.parent_task_id ?? null,
         next.assignee_agent_id,
         next.github_issue_url,
         next.gate_owner,
@@ -775,27 +790,74 @@ export async function createTask(
   await validateTaskProjectAttribution(env, projectId, input.squad_id)
 
   const now = new Date().toISOString()
+  // PROVENANCE NORMALIZATION (adversarial gate BLOCK, 2026-08-04). migrations/0077
+  // defines the trust boundary as `external_source IS NULL` vs `IS NOT NULL`, but every
+  // runtime check below expressed it with JavaScript truthiness. An empty string is
+  // NON-NULL external provenance in the database and FALSY in JS, so the two layers
+  // disagreed about the same row: SQL called it external, `externalSource ? ... : ...`
+  // called it first-party. Passing `externalSource: ''` therefore produced a stored row
+  // with external_source='' that KEPT its assignee and executed through to a model turn.
+  //
+  // Blank provenance is rejected rather than coerced. Silently mapping '' to null would
+  // turn a caller's bug into trusted absence — the exact "absence means permission"
+  // shape this whole audit set has been about — and silently mapping it to a marker
+  // would invent provenance nobody supplied. A caller that has an external source knows
+  // its name; one that does not should pass null explicitly.
+  const rawExternalSource = options.externalSource
+  if (rawExternalSource !== undefined && rawExternalSource !== null && isBlankProvenance(rawExternalSource)) {
+    throw new Error(
+      'createTask: externalSource must be a non-blank identifier or null — ' +
+      'blank provenance is neither trusted-local nor attributable',
+    )
+  }
+  const externalSource = rawExternalSource ?? null
+  // CHOKE-POINT FIX (PR #659 P0, widened per kasra-core's parallel-audit finding on
+  // src/integrations/github-projects.ts:239-251 — confirmed live on main): an
+  // external-origin task must NEVER be created pre-assigned. Before this guard,
+  // createTask happily accepted assignee_agent_id + an external marker together,
+  // which is exactly the shape github-projects.ts used to auto-assign a task (title
+  // sourced from an attacker-editable GitHub Project field) straight to a named agent
+  // AND emit task.created -> dispatchSquad -> execution, with ZERO gate: not the
+  // unassigned-auto-pickup check (#404/#659, N/A once assignee_agent_id is non-null
+  // at creation) and not the admin-gated reassignment check (tasks/index.ts,
+  // mcp/index.ts — those only fire on a LATER task_update/PATCH call, never on the
+  // original createTask). Forcing assignee_agent_id to null here whenever an external
+  // marker is present makes the ORIGINAL Linear invariant ("propose, never authorize")
+  // structural for every current AND FUTURE external-integration caller, not just the
+  // ones that happen to remember not to pass an assignee. An admin must still take the
+  // explicit, admin-gated task_update/PATCH step (already required for any
+  // source_pot/external_source-tagged task) before the task is assignable.
+  //
+  // Explicit null semantics, matching migrations/0077 exactly. Not truthiness: any
+  // non-null value is external, including one the validation above would have rejected
+  // but that reached here another way (a legacy row, a future caller, a direct write).
+  // Fail closed on anything that is not literally absent.
+  const assigneeAgentId = externalSource !== null ? null : (input.assignee_agent_id ?? null)
   const task: Task = {
     id: options.id ?? crypto.randomUUID(),
     squad_id: input.squad_id,
     project_id: projectId,
+    priority: input.priority ?? null,
+    parent_task_id: input.parent_task_id ?? null,
     title: input.title.trim(),
     body: input.body ?? '',
     done_when: input.done_when.trim(),
     status: input.status ?? 'open',
-    assignee_agent_id: input.assignee_agent_id ?? null,
+    assignee_agent_id: assigneeAgentId,
     github_issue_url: null,
     result: null,
     completed_at: null,
     gate_owner: input.gate_owner ?? null,
     created_at: now,
     updated_at: now,
+    external_source: externalSource,
   }
 
   let taskInsert
   try {
     const fence = options.routineRunFence
-    const values = [
+    const baseColumns = 'id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at'
+    const baseValues = [
       task.id,
       task.squad_id,
       task.project_id,
@@ -811,10 +873,34 @@ export async function createTask(
       task.created_at,
       task.updated_at,
     ]
+    // external_source (migrations/0077) is appended CONDITIONALLY, only when actually set,
+    // rather than unconditionally on every INSERT. Two reasons: (1) it keeps the column
+    // list + bind-array position of every existing column stable for any caller/test that
+    // indexes into it positionally (same rationale a purely-additive column change should
+    // have anyway); (2) more importantly, it means the overwhelmingly common case — a
+    // local/trusted createTask call, externalSource unset — never references the column at
+    // all, so it stays compatible with hand-rolled/pinned-migration-subset test DB schemas
+    // (several exist in this repo) that predate 0077 and never needed to know about it.
+    // Only the small set of external-integration callers that actually pass externalSource
+    // require the column to exist in their DB.
+    // priority / parent_task_id (migrations/0079) follow the same conditional-append
+    // convention as external_source directly above: referenced ONLY when actually set, so
+    // the common create path never mentions them and stays compatible with any DB that
+    // predates 0079. Built as a list rather than another ternary pair — a third nested
+    // ternary over three optional columns is where an off-by-one bind lands.
+    const extraColumns: string[] = []
+    const extraValues: unknown[] = []
+    if (externalSource !== null) { extraColumns.push('external_source'); extraValues.push(externalSource) }
+    if (input.priority != null) { extraColumns.push('priority'); extraValues.push(input.priority) }
+    if (input.parent_task_id != null) { extraColumns.push('parent_task_id'); extraValues.push(input.parent_task_id) }
+
+    const columns = extraColumns.length > 0 ? `${baseColumns}, ${extraColumns.join(', ')}` : baseColumns
+    const values = [...baseValues, ...extraValues]
+    const placeholders = values.map(() => '?').join(', ')
     if (fence) {
       taskInsert = await env.DB.prepare(
-        `INSERT INTO tasks (id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at)
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        `INSERT INTO tasks (${columns})
+         SELECT ${placeholders}
           WHERE EXISTS (
             SELECT 1 FROM routine_runs rr
              WHERE rr.id = ? AND rr.tenant = ? AND rr.project_id = ?
@@ -828,8 +914,8 @@ export async function createTask(
       ).bind(...values, fence.runId, fence.tenant, task.project_id).run()
     } else {
       taskInsert = await env.DB.prepare(
-        `INSERT INTO tasks (id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO tasks (${columns})
+         VALUES (${placeholders})`,
       ).bind(...values).run()
     }
   } catch (error) {

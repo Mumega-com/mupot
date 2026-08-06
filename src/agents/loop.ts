@@ -769,12 +769,36 @@ async function safeDispatch(
  * tasks table has no creator column, so squad-scoped unassigned is the proxy for
  * "tasks this agent's loop produced and left for pickup". Counts status='open'
  * only (open = not yet started backlog; in_progress = being worked, not pile-up).
+ *
+ * PROVENANCE ON THE UNASSIGNED BRANCH (C10, Athena independent audit 2026-08-03).
+ * That proxy is only sound for FIRST-PARTY rows. An externally-sourced task (a
+ * cross-pot import, or an integration import via migrations/0077 external_source)
+ * lands open + unassigned in a squad, so it matched the proxy and counted against
+ * MAX_OPEN_TASKS — even though this agent's loop did not produce it. Two problems,
+ * and the first is a correctness bug independent of any attacker:
+ *
+ *  1. It is simply the wrong number. The doc contract above says "tasks this agent's
+ *     loop produced". An imported Linear issue was not produced by this loop, so
+ *     counting it made the governor measure something other than what it claims to.
+ *  2. It is remotely triggerable. Anyone who can write to a connected external board
+ *     can create open+unassigned rows in the squad. MAX_OPEN_TASKS worth of imports
+ *     pins the counter at the cap and the agent's loop stops producing — denial of
+ *     work, achieved through the normal, intended use of an integration, with no
+ *     credential compromise and nothing that looks like an attack in any log.
+ *
+ * The ASSIGNED branch deliberately keeps counting external rows. Once an admin takes
+ * the explicit task_update/PATCH step to assign an external task to this agent, it IS
+ * this agent's real backlog and belongs in the backpressure number. The distinction
+ * this guard draws is not "external is untrusted" — it is "nobody has decided this is
+ * my work yet", which is exactly what the unassigned branch was always trying to say.
  */
 async function countOpenBacklog(env: Env, agent: Agent): Promise<number> {
   const row = await env.DB.prepare(
     `SELECT COUNT(*) AS cnt FROM tasks
        WHERE status = 'open'
-         AND (assignee_agent_id = ? OR (assignee_agent_id IS NULL AND squad_id = ?))`,
+         AND (assignee_agent_id = ?
+              OR (assignee_agent_id IS NULL AND squad_id = ?
+                  AND source_pot IS NULL AND external_source IS NULL))`,
   )
     .bind(agent.id, agent.squad_id)
     .first<{ cnt: number }>()
