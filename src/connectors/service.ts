@@ -634,6 +634,10 @@ export async function useConnectorById<T extends ImmediateConnectorResult>(
           const username = basicAuthUsername(row.meta)
           if (!username) throw new Error('invalid connector auth config')
           headers.set('authorization', `Basic ${btoa(`${username}:${secret}`)}`)
+        } else if (row.type === 'linear') {
+          // Linear's GraphQL API takes the personal/workspace API key verbatim in
+          // the Authorization header — no "Bearer " prefix (unlike posthog/inkwell).
+          headers.set('authorization', secret)
         } else {
           throw new Error('unsupported connector auth')
         }

@@ -97,6 +97,28 @@ export function presenceTtlSec(env: Env): number {
 /** Pure liveness derivation. `lastReportedAt` is the SQLite UTC stamp 'YYYY-MM-DD HH:MM:SS'
  *  (written via datetime('now')). An unparseable/empty stamp is treated as NOT live (fail to
  *  stale, never to live). A future-dated stamp (clock skew) is still within TTL → live. */
+/**
+ * Parse either timestamp format this database stores, because it stores TWO.
+ *
+ *   fleet_agents.last_reported_at   'YYYY-MM-DD HH:MM:SS'      (SQLite datetime('now'))
+ *   module_registry.last_heartbeat  '2026-08-06T03:51:26.358Z' (ISO-8601, JS toISOString)
+ *
+ * The original did `Date.parse(s.replace(' ', 'T') + 'Z')`, which is correct for the SQLite
+ * shape and produces `...358ZZ` → NaN for the ISO one. NaN meant 'stale', so EVERY
+ * module_registry row read as stale — which silently defeated the whole either-surface fix in
+ * #734: it was merged, deployed, and changed nothing in production.
+ *
+ * It was invisible because the tests INVENTED the module timestamps in SQLite format. Real
+ * SQL against the real schema was not enough — the fixture made up the DATA shape, so the
+ * suite proved the code agreed with my belief rather than with production.
+ */
+export function parseStamp(stamp: string): number {
+  // Already ISO (has 'T', or an explicit zone) — parse as-is.
+  if (stamp.includes('T') || /[Zz]$|[+-]\d{2}:?\d{2}$/.test(stamp)) return Date.parse(stamp)
+  // SQLite 'YYYY-MM-DD HH:MM:SS' is UTC by convention here.
+  return Date.parse(stamp.replace(' ', 'T') + 'Z')
+}
+
 export function derivePresence(
   status: string,
   lastReportedAt: string,
@@ -105,7 +127,7 @@ export function derivePresence(
 ): Presence {
   if (status === 'stopped') return 'offline'
   if (!lastReportedAt) return 'stale'
-  const t = Date.parse(lastReportedAt.replace(' ', 'T') + 'Z')
+  const t = parseStamp(lastReportedAt)
   if (Number.isNaN(t)) return 'stale'
   const ageSec = (nowMs - t) / 1000
   return ageSec <= ttlSec ? 'live' : 'stale'
@@ -391,12 +413,21 @@ export async function getFleetAgentRuntimeStates(
     agent.slug ? [agent.agent_id, agent.slug] : [agent.agent_id]
   )))]
   const slugs = [...new Set([...unique.values()].map((agent) => agent.slug).filter(Boolean))]
-  const fleetRowsPromise = env.DB.prepare(
-    `SELECT agent_id, runtime, status, host, last_reported_at
+  // Both presence surfaces in ONE statement (see the budget note below), tagged by `src` and
+  // partitioned in memory. `host` exists only on fleet_agents, so module rows carry ''.
+  type UnionRow = FleetRow & { src: 'fleet' | 'module' }
+  const presenceRowsPromise = env.DB.prepare(
+    `SELECT 'fleet' AS src, agent_id, runtime, status, host, last_reported_at
        FROM fleet_agents
       WHERE tenant = ?1
-        AND agent_id IN (SELECT CAST(value AS TEXT) FROM json_each(?2))`,
-  ).bind(env.TENANT_SLUG, JSON.stringify(identities)).all<FleetRow>()
+        AND agent_id IN (SELECT CAST(value AS TEXT) FROM json_each(?2))
+     UNION ALL
+     SELECT 'module' AS src, identity AS agent_id, adapter AS runtime, status, '' AS host,
+            last_heartbeat AS last_reported_at
+       FROM module_registry
+      WHERE tenant = ?1
+        AND identity IN (SELECT CAST(value AS TEXT) FROM json_each(?2))`,
+  ).bind(env.TENANT_SLUG, JSON.stringify(identities)).all<UnionRow>()
   const slugCountsPromise = slugs.length
     ? env.DB.prepare(
         `SELECT slug_owner.slug, COUNT(*) AS n
@@ -408,24 +439,108 @@ export async function getFleetAgentRuntimeStates(
           GROUP BY slug_owner.slug`,
       ).bind(JSON.stringify(slugs)).all<{ slug: string; n: number }>()
     : Promise.resolve({ results: [] as { slug: string; n: number }[] })
-  const [fleetRows, slugCounts] = await Promise.all([fleetRowsPromise, slugCountsPromise])
-  const byIdentity = new Map((fleetRows.results ?? []).map((row) => [row.agent_id, row]))
+  // mupot#732 — SECOND LIVENESS SURFACE.
+  //
+  // "Is this agent reachable right now" is ONE fact with TWO writers in this codebase:
+  //   fleet_agents   <- POST /api/fleet/attach
+  //   module_registry <- presence_register / presence_heartbeat
+  //
+  // Only fleet_agents was read here, so an agent that faithfully heartbeats the other one is
+  // invisible to dispatch. Measured on production 2026-08-06: every fleet_agents row had been
+  // stale since 07-30, so `selectAgent` returned `offline` for everything and NO routine could
+  // dispatch — silently, indefinitely, with no alert. Registering presence returned 200 and
+  // changed nothing, which is what made it so expensive to diagnose.
+  //
+  // This is deliberately ADDITIVE, not a rewrite: an agent is live if EITHER surface has a
+  // fresh heartbeat. Accepting either signal is strictly MORE correct than accepting only the
+  // one nothing writes, and it needs no migration, so it can ship as an urgent fix. Collapsing
+  // to a single surface is the real repair and is tracked separately — this must not be read
+  // as an endorsement of keeping two.
+  //
+  // It does NOT invent a liveness notion: `derivePresence` and `presenceTtlSec` are reused
+  // verbatim, per the existing note on getFleetAgentLiveness below.
+  // ONE statement, not two. D1 caps statements per invocation and the scheduler path is
+  // already close to it — `tests/routine-dispatch.test.ts` pins the budget and caught an
+  // earlier draft of this change adding a 32nd statement against a ceiling of 31. Raising the
+  // ceiling would trade a real platform limit for implementation convenience, so both
+  // surfaces are read in a single UNION ALL above. Statement count is unchanged from before.
+  const [presenceRows, slugCounts] = await Promise.all([presenceRowsPromise, slugCountsPromise])
+  const allRows = presenceRows.results ?? []
+  const byIdentity = new Map(
+    allRows.filter((r) => r.src === 'fleet').map((row) => [row.agent_id, row]),
+  )
+  const moduleRows = { results: allRows.filter((r) => r.src === 'module').map((r) => ({
+    identity: r.agent_id, adapter: r.runtime, status: r.status, last_heartbeat: r.last_reported_at,
+  })) }
   const cardinality = new Map((slugCounts.results ?? []).map((row) => [row.slug, Number(row.n)]))
+
+  // Keep only the FRESHEST module row per identity — an agent may register several times
+  // (project-scoped and unscoped rows both exist in production), and a stale duplicate must
+  // not mask a live one.
+  const freshestModule = new Map<string, { adapter: string; status: string; lastSeen: string }>()
+  for (const row of moduleRows.results ?? []) {
+    const lastSeen = String(row.last_heartbeat ?? '')
+    const prev = freshestModule.get(row.identity)
+    if (prev && prev.lastSeen >= lastSeen) continue
+    freshestModule.set(row.identity, {
+      adapter: String(row.adapter ?? ''), status: String(row.status ?? 'unknown'), lastSeen,
+    })
+  }
+
   const ttlSec = presenceTtlSec(env)
   const resolved = new Map<string, FleetAgentRuntimeState>()
 
   for (const agent of unique.values()) {
     const exact = byIdentity.get(agent.agent_id)
     const row = exact ?? (cardinality.get(agent.slug) === 1 ? byIdentity.get(agent.slug) : undefined)
-    if (!row) continue
-    const status = String(row.status ?? 'unknown')
-    const lastSeen = String(row.last_reported_at ?? '')
+    const mod = freshestModule.get(agent.agent_id)
+      ?? (cardinality.get(agent.slug) === 1 ? freshestModule.get(agent.slug) : undefined)
+
+    const fleetPresence = row
+      ? derivePresence(String(row.status ?? 'unknown'), String(row.last_reported_at ?? ''), ttlSec, nowMs)
+      : undefined
+    const modulePresence = mod
+      ? derivePresence(mod.status, mod.lastSeen, ttlSec, nowMs)
+      : undefined
+
+    // Neither surface knows this agent — unchanged behaviour, it is simply absent.
+    if (!row && !mod) continue
+
+    const live = fleetPresence === 'live' || modulePresence === 'live'
+    // `selectAgent` requires a non-empty runtime as well as live presence, so a module-only
+    // agent must carry one or the fix would be inert. The adapter IS the runtime kind
+    // ('claude-code', 'codex', …) — the same vocabulary fleet_agents.runtime uses.
+    const runtime = String(row?.runtime ?? '') || (mod?.adapter ?? '')
+    // Compare by PARSED TIME, not by string. The two columns use different formats, and
+    // ' ' (0x20) sorts before 'T' (0x54), so a lexical compare reports an ISO stamp as newer
+    // than a SQLite stamp on the same date — even when it is a full day older:
+    //   '2026-08-06T00:00:01.000Z' > '2026-08-06 23:59:59'  ->  true, and wrong.
+    // Display-only today, but a wrong "last seen" is exactly what sends the next person
+    // looking in the wrong place. (Athena, residual on #735.)
+    const fleetLastSeen = String(row?.last_reported_at ?? '')
+    const modIsNewer = mod
+      ? (!fleetLastSeen || (parseStamp(mod.lastSeen) || 0) > (parseStamp(fleetLastSeen) || 0))
+      : false
+    const lastSeen = modIsNewer && mod ? mod.lastSeen : fleetLastSeen
+
     resolved.set(agent.agent_id, {
-      agent_id: row.agent_id,
-      runtime: String(row.runtime ?? ''),
-      status,
-      presence: derivePresence(status, lastSeen, ttlSec, nowMs),
-      host: String(row.host ?? ''),
+      agent_id: row?.agent_id ?? agent.agent_id,
+      runtime,
+      status: String(row?.status ?? mod?.status ?? 'unknown'),
+      // Derived so that `presence === 'live'` and `live` can NEVER disagree.
+      //
+      // The first draft was `live ? 'live' : (fleetPresence ?? modulePresence ?? 'offline')`,
+      // whose fallback could return 'live' while `live` was false — a self-contradictory
+      // state. Mutation testing found it: reverting `live` to fleet-only still left the
+      // module-only test green, because the fallback leaked 'live' through. The test was
+      // passing for the wrong reason AND the code could report a liveness it had just denied.
+      //
+      // Now: live if either surface says so; stale if either merely knows of it recently
+      // enough to be classified stale; otherwise offline. No path can contradict `live`.
+      presence: live
+        ? 'live'
+        : (fleetPresence === 'stale' || modulePresence === 'stale' ? 'stale' : 'offline'),
+      host: String(row?.host ?? ''),
       last_seen: lastSeen,
     })
   }
