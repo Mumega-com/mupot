@@ -25,6 +25,7 @@ interface DriverFixture {
   evidence: string
   smoke: string
   runtime: string
+  routine: string
 }
 
 const fixtureRoots: string[] = []
@@ -111,6 +112,20 @@ if [[ "$*" == *"conformance:runtime:local"* ]]; then
   printf '{"ok":true,"run":"success"}\n' > "\${MUPOT_CONFORMANCE_ARTIFACTS}/report.json"
   exit 0
 fi
+if [[ "$*" == *"collect:project-routine:local"* ]]; then
+  case "\${MUPOT_ROUTINE_ARTIFACTS}" in
+    "\${TEST_ARTIFACT_ROOT}"/*) ;;
+    *) echo "unexpected routine artifacts path: \${MUPOT_ROUTINE_ARTIFACTS}" >&2; exit 96 ;;
+  esac
+  mkdir -p "\${MUPOT_ROUTINE_ARTIFACTS}/artifacts" "\${MUPOT_ROUTINE_ARTIFACTS}/screenshots"
+  printf '{"ok":true,"routine_id":"routine-local","run_id":"run-local"}\n' \
+    > "\${MUPOT_ROUTINE_ARTIFACTS}/artifacts/collector-summary.json"
+  exit 0
+fi
+if [[ "$*" == *"receipt:project-routine:check"* ]]; then
+  printf '{"receipt_type":"mupot-project-routine-lifecycle/v1","status":"pass"}\n'
+  exit 0
+fi
 exit 99
 `)
   chmodSync(fakeNpm, 0o755)
@@ -122,6 +137,7 @@ exit 99
     evidence: join(root, 'local-evidence'),
     smoke: join(root, 'local-smoke'),
     runtime: join(root, 'local-runtime-conformance'),
+    routine: join(root, 'local-project-routine'),
   }
 }
 
@@ -175,6 +191,7 @@ function runDriver(
       MUPOT_LOCAL_EVIDENCE_DIR: fixture.evidence,
       MUPOT_SMOKE_ARTIFACTS: fixture.smoke,
       MUPOT_CONFORMANCE_ARTIFACTS: fixture.runtime,
+      MUPOT_ROUTINE_ARTIFACTS: fixture.routine,
       ...overrides,
     },
   })
@@ -272,8 +289,20 @@ describe('local evidence driver ownership and artifact isolation', () => {
     expect(passed.status).toBe(0)
     expect(readdirSync(fixture.smoke).sort()).toEqual(['.mupot-local-evidence-artifacts', 'report.json'])
     expect(readdirSync(fixture.runtime).sort()).toEqual(['.mupot-local-evidence-artifacts', 'report.json'])
+    expect(readdirSync(fixture.routine).sort()).toEqual([
+      '.mupot-local-evidence-artifacts',
+      'artifacts',
+      'project-routine-lifecycle-check.json',
+      'screenshots',
+    ])
     expect(readFileSync(join(fixture.smoke, 'report.json'), 'utf8')).toContain('"run":"success"')
     expect(readdirSync(fixture.smoke).some((name) => name.startsWith('failure-'))).toBe(false)
     expect(readdirSync(fixture.runtime).some((name) => name.startsWith('failure-'))).toBe(false)
+    const calls = invocations(fixture)
+    expect(calls).toContain('wrangler dev')
+    expect(calls).toContain('--test-scheduled')
+    expect(calls).toMatch(/--var RELEASE_SHA:[a-f0-9]{40}/)
+    expect(calls).toContain('npm run collect:project-routine:local')
+    expect(calls).toContain('npm run receipt:project-routine:check')
   }, 35_000)
 })

@@ -54,6 +54,11 @@ function makeEnv(changeCounts: number[] = [1]) {
         }
         return stmt
       },
+      async batch(statements: Array<{ run(): Promise<unknown> }>) {
+        const out = []
+        for (const s of statements) out.push(await s.run())
+        return out
+      },
     },
   } as unknown as Env
 

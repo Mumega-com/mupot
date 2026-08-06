@@ -31,7 +31,7 @@ Host-header resolver.** Canonical reference: `docs/SELF-HOST.md`.
 | # | Step | Command / who · gate |
 |---|------|----------------------|
 | 1 | **Provision the pot's infra** — create D1 + Vectorize + Queues + KV + R2, write `wrangler.<slug>.toml`, apply migrations. | `bash scripts/setup.sh --pot <slug>` (after `wrangler login`). Idempotent. |
-| 2 | **Deploy the Worker.** | `wrangler deploy -c wrangler.<slug>.toml` |
+| 2 | **Deploy the Worker.** | `node scripts/deploy.mjs -c wrangler.<slug>.toml` |
 | 3 | **Set secrets + bootstrap the owner.** OAuth creds, or `--bootstrap-owner` for a one-time owner token. | `bash scripts/secrets.sh --pot <slug>` · Hadi-go for a *hosted* tenant (secret write); a self-host fork does its own. |
 | 4 | **Owner-walk** — the agency owner (Maryam) OAuth-logs-in to `/setup`; **first login becomes owner**, seeds her goal-bearing agent(s); the `*/15` metabolism then runs them. | **Maryam** (sovereignty — cannot be bypassed; agents can't self-grant owner). |
 | 5 | **Activate the `agency` department** — seeds SEO/AEO/Ads/Content squads (idempotent, tier-gated: needs tier ≥ **pro**, else the S6 maxSquads gate refuses). | Owner/admin. |

@@ -189,6 +189,17 @@ class TestMupotProvisionDryRun:
         # Must tell the user to dry-run migrations (Risk 2)
         assert "--dry-run" in next_steps_str or "dry-run" in next_steps_str.lower()
 
+    def test_dry_run_routes_real_deploy_through_release_stamp_wrapper(self) -> None:
+        result = mupot_provision(
+            slug="acme",
+            brand="Acme Corp",
+            cf_account_id="a" * 32,
+            cf_api_token="tok_" + "x" * 40,
+        )
+        next_steps_str = "\n".join(result["next_steps"])
+        assert "node scripts/deploy.mjs --config wrangler.acme.toml" in next_steps_str
+        assert "npx wrangler deploy --config wrangler.acme.toml" not in next_steps_str
+
     def test_dry_run_next_steps_is_honest_plan_only(self) -> None:
         """v0.2 dry-run emits a plan summary (not the v0.1 manual wrangler commands).
         Must clearly say it is a dry-run and explain how to apply."""
@@ -438,6 +449,24 @@ class TestMupotProvisionApplyGate:
         apply_pos = next_steps_str.find("migrations apply", dry_run_pos)
         # If there's an apply step at all, there must be a dry-run step before it
         assert dry_run_pos < apply_pos or apply_pos == -1
+
+    def test_apply_routes_real_deploy_through_release_stamp_wrapper(
+        self, tmp_path: Path
+    ) -> None:
+        dry = DryRunClient()
+        result = mupot_provision(
+            slug="acme",
+            brand="Acme Corp",
+            cf_account_id="a" * 32,
+            cf_api_token="tok",
+            confirm=True,
+            dry_run=False,
+            cf_client=dry,
+            toml_output_dir=tmp_path,
+        )
+        next_steps_str = "\n".join(result["next_steps"])
+        assert f"node scripts/deploy.mjs --config {tmp_path / 'wrangler.acme.toml'}" in next_steps_str
+        assert f"npx wrangler deploy --config {tmp_path / 'wrangler.acme.toml'}" not in next_steps_str
 
     def test_apply_calls_create_on_client(self, tmp_path: Path) -> None:
         dry = DryRunClient()
@@ -1414,7 +1443,20 @@ class TestRunWranglerDeploy:
         deploy_cmd = next(c for c in recorded if "--version" not in c)
         assert "--config" in deploy_cmd
         config_idx = deploy_cmd.index("--config")
-        assert str(toml) == deploy_cmd[config_idx + 1]
+        assert str(toml.resolve()) == deploy_cmd[config_idx + 1]
+
+    def test_deploy_command_uses_release_stamp_wrapper(self, tmp_path: Path) -> None:
+        mock_run, recorded = self._make_run()
+        toml = tmp_path / "wrangler.myorg.toml"
+        toml.write_text("name = 'mupot-myorg'")
+
+        _run_wrangler_deploy(slug="myorg", toml_path=toml, _subprocess_run=mock_run)
+
+        deploy_cmd = next(c for c in recorded if "--version" not in c)
+        assert deploy_cmd[0] == "node"
+        assert deploy_cmd[1].endswith("/scripts/deploy.mjs")
+        assert deploy_cmd[2:] == ["--config", str(toml.resolve())]
+        assert ["npx", "wrangler", "deploy"] != deploy_cmd[:3]
 
 
 # ── v0.2: mupot_revoke_token stub ────────────────────────────────────────────

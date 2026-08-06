@@ -7,10 +7,11 @@
 // never logged or persisted, and revoke is idempotent (only flips live tokens).
 //
 // mintAgentBoundToken — the AGENT-BOUND mint path (shared between the MCP provision
-// tool and the dashboard /admin/agent-token route).  It is the ONLY place the three-
-// statement atomic batch (member envelope + escalation-guard capability + agent-weld
-// token) is written, so no logic lives in two places.
+// tool and the dashboard /admin/agent-token route). It is the ONLY place the first-
+// mint atomic batch (member envelope + canonical binding + escalation-guard capability
+// + agent-weld token) is written, so no logic lives in two places.
 
+import type { D1PreparedStatement } from '@cloudflare/workers-types'
 import type { Env, MemberToken, ConnectionChannel, Capability, CapabilityGrant } from '../types'
 import { assertBatchWritten } from '../lib/receipt'
 
@@ -138,14 +139,153 @@ export interface AgentMintResult {
   memberId: string
   createdAt: string
   grantCapability: AgentTokenCapability
+  bindingDisposition: 'created' | 'reused'
+}
+
+export type AgentMemberBinding =
+  | { kind: 'bound'; memberId: string }
+  | { kind: 'unminted' }
+
+export interface AgentBindingProof {
+  agentId: string
+  memberId: string
+  homeSquadId: string
+  disposition: 'creating' | 'existing'
+}
+
+export interface PreparedAgentTokenMint extends AgentMintResult {
+  statements: D1PreparedStatement[]
+  bindingProof: AgentBindingProof
 }
 
 /**
- * Atomically mint a DEDICATED member envelope + squad-scoped agent capability +
- * agent-weld token for `agent`.
+ * Prepare, but do not commit, an agent-bound token mint. Provisioning composes
+ * these statements into its larger request/receipt transaction.
+ */
+export async function prepareAgentBoundTokenMint(
+  env: Env,
+  agent: AgentForMint,
+  label: string,
+  grantCapability: AgentTokenCapability = 'member',
+): Promise<PreparedAgentTokenMint> {
+  if (!isAgentTokenCapability(grantCapability)) {
+    throw new Error('invalid agent token capability')
+  }
+
+  const binding = await resolveAgentMemberBinding(env, agent.id)
+  return prepareAgentBoundTokenMintForBinding(env, agent, label, grantCapability, binding)
+}
+
+export async function prepareAgentBoundTokenMintForBinding(
+  env: Env,
+  agent: AgentForMint,
+  label: string,
+  requestedCapability: AgentTokenCapability,
+  binding: AgentMemberBinding,
+): Promise<PreparedAgentTokenMint> {
+  const creating = binding.kind === 'unminted'
+  const memberId = creating ? crypto.randomUUID() : binding.memberId
+  let grantCapability = requestedCapability
+
+  if (!creating) {
+    const committed = await env.DB.prepare(
+      `SELECT capability FROM capabilities
+        WHERE member_id = ?
+          AND scope_type = 'squad'
+          AND scope_id = ?
+          AND capability IN ('observer', 'member')
+        LIMIT 1`,
+    )
+      .bind(memberId, agent.squad_id)
+      .first<{ capability: AgentTokenCapability }>()
+    if (!committed || !isAgentTokenCapability(committed.capability)) {
+      throw new Error(
+        'agent_home_capability_missing: canonical agent member has no observer/member home grant',
+      )
+    }
+    grantCapability = committed.capability
+  }
+
+  const tokenId = crypto.randomUUID()
+  const rawToken = mintRawToken()
+  const tokenHash = await sha256Hex(rawToken)
+  const createdAt = new Date().toISOString()
+  const safeLabel = label.trim().slice(0, 64) || agent.slug
+  const statements: D1PreparedStatement[] = []
+
+  if (creating) {
+    statements.push(
+      env.DB.prepare(
+        `INSERT INTO members (id, email, display_name, telegram_chat_id, status, created_at, tenant)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      ).bind(memberId, null, agent.name, null, 'active', createdAt, env.TENANT_SLUG),
+      env.DB.prepare(
+        `INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+         VALUES (?, ?, ?, ?)`,
+      ).bind(env.TENANT_SLUG, agent.id, memberId, createdAt),
+      env.DB.prepare(
+        `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+         VALUES (?, ?, 'squad', ?, ?)`,
+      ).bind(crypto.randomUUID(), memberId, agent.squad_id, grantCapability),
+    )
+  }
+
+  statements.push(
+    env.DB.prepare(
+      `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant)
+       VALUES (?, ?, ?, ?, 'workspace', ?, ?, ?)`,
+    ).bind(tokenId, memberId, tokenHash, safeLabel, createdAt, agent.id, env.TENANT_SLUG),
+  )
+
+  return {
+    raw: rawToken,
+    tokenId,
+    memberId,
+    createdAt,
+    grantCapability,
+    statements,
+    bindingDisposition: creating ? 'created' : 'reused',
+    bindingProof: {
+      agentId: agent.id,
+      memberId,
+      homeSquadId: agent.squad_id,
+      disposition: creating ? 'creating' : 'existing',
+    },
+  }
+}
+
+export function agentIdentityConflict(error: unknown): boolean {
+  if (!(error instanceof Error)) return false
+  return error.message.includes('agent_identity_conflict')
+    || (
+      error.message.includes('UNIQUE constraint failed')
+      && error.message.includes('agent_member_bindings')
+    )
+}
+
+async function commitPreparedAgentTokenMint(
+  env: Env,
+  prepared: PreparedAgentTokenMint,
+): Promise<AgentMintResult> {
+  const writes = await env.DB.batch(prepared.statements)
+  assertBatchWritten(writes, 'mint_agent_bound_token', 1)
+  return {
+    raw: prepared.raw,
+    tokenId: prepared.tokenId,
+    memberId: prepared.memberId,
+    createdAt: prepared.createdAt,
+    grantCapability: prepared.grantCapability,
+    bindingDisposition: prepared.bindingDisposition,
+  }
+}
+
+/**
+ * Atomically mint a dedicated member envelope, immutable agent/member binding,
+ * home-squad capability, and agent-weld token for `agent`.
  *
- * SECURITY INVARIANTS (same as the original mint_agent_token MCP tool):
- *   - THREE ROWS, ONE BATCH — all land or none do (no orphan credentials).
+ * SECURITY INVARIANTS:
+ *   - FIRST MINT: FOUR ROWS, ONE BATCH — all land or none do.
+ *   - LATER MINTS: token only; the canonical member and home grant are reused.
  *   - THE ESCALATION GUARD: the grant is hard-coded to scope_type='squad',
  *     scope_id=agent.squad_id, and capability <= 'member'.  Callers may lower it
  *     to 'observer', but can never widen it to lead/admin/owner or another scope.
@@ -161,66 +301,26 @@ export async function mintAgentBoundToken(
   label: string,
   grantCapability: AgentTokenCapability = 'member',
 ): Promise<AgentMintResult> {
-  if (!isAgentTokenCapability(grantCapability)) {
-    throw new Error('invalid agent token capability')
-  }
+  const first = await prepareAgentBoundTokenMint(env, agent, label, grantCapability)
+  try {
+    return await commitPreparedAgentTokenMint(env, first)
+  } catch (error) {
+    if (!agentIdentityConflict(error)) throw error
 
-  // ONE AGENT → ONE MEMBER. Reuse the agent's canonical member envelope if it
-  // already has exactly one. Previously every mint minted a FRESH member (a new
-  // random UUID), so a second token for the same agent spawned a second member
-  // identity — that is precisely what produces `agent_identity_ambiguous` and the
-  // "N kasra" duplicate-identity mess. Fail closed on an already-ambiguous agent
-  // rather than compounding it; it must be de-duplicated (revoke stale tokens)
-  // before another token is minted.
-  const canonical = await resolveActiveAgentMember(env, agent.id)
-  if (canonical === 'ambiguous') {
-    throw new Error(
-      'agent_identity_ambiguous: agent already has multiple active member identities; revoke stale tokens before minting',
+    // A concurrent first mint won the immutable binding. The losing raw token
+    // is discarded and never returned. Read the winner once, mint a fresh raw,
+    // and retry exactly once; any second conflict propagates.
+    const winner = await resolveAgentMemberBinding(env, agent.id)
+    if (winner.kind === 'unminted') throw error
+    const retry = await prepareAgentBoundTokenMintForBinding(
+      env,
+      agent,
+      label,
+      grantCapability,
+      winner,
     )
+    return commitPreparedAgentTokenMint(env, retry)
   }
-  const reuseMemberId = canonical === 'unminted' ? null : canonical
-
-  const memberId = reuseMemberId ?? crypto.randomUUID()
-  const tokenId = crypto.randomUUID()
-  const rawToken = mintRawToken()
-  const tokenHash = await sha256Hex(rawToken)
-  const createdAt = new Date().toISOString()
-  const safeLabel = label.trim().slice(0, 64) || agent.slug
-
-  const statements = []
-  if (!reuseMemberId) {
-    // First mint for this agent — create its dedicated member envelope + the
-    // escalation-guard squad grant. Skipped when reusing (both already exist).
-    statements.push(
-      // 1) Dedicated member envelope for the agent (no email, no IM).
-      env.DB.prepare(
-        `INSERT INTO members (id, email, display_name, telegram_chat_id, status, created_at, tenant)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      ).bind(memberId, null, agent.name, null, 'active', createdAt, env.TENANT_SLUG),
-      // 2) THE ESCALATION GUARD: squad-scoped grant on the agent's OWN squad only.
-      //    Hard-coded scope, with only observer/member allowed — never widened.
-      env.DB.prepare(
-        `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
-         VALUES (?, ?, 'squad', ?, ?)`,
-      ).bind(crypto.randomUUID(), memberId, agent.squad_id, grantCapability),
-    )
-  }
-  // 3) THE WELD: bind the new token to the agent (agent_id set) on the reused or
-  //    freshly-created member. Only the hash is stored. Always runs.
-  statements.push(
-    env.DB.prepare(
-      `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant)
-       VALUES (?, ?, ?, ?, 'workspace', ?, ?, ?)`,
-    ).bind(tokenId, memberId, tokenHash, safeLabel, createdAt, agent.id, env.TENANT_SLUG),
-  )
-
-  const mintWrites = await env.DB.batch(statements)
-  // Receipt: every statement MUST land. A partial mint (e.g. a token row without
-  // its member/capability on first mint) would hand out a show-once token bound to
-  // a broken identity.
-  assertBatchWritten(mintWrites, 'mint_agent_bound_token', 1)
-
-  return { raw: rawToken, tokenId, memberId, createdAt, grantCapability }
 }
 
 /** Live (non-revoked) tokens for every member — for the dashboard roster. The
@@ -232,30 +332,39 @@ export async function loadLiveTokens(env: Env): Promise<PublicMemberToken[]> {
   return rows.results ?? []
 }
 
-/** Resolve the active member identity welded to an agent's live tokens. */
+/** Resolve the immutable member identity bound to an agent. */
+export async function resolveAgentMemberBinding(
+  env: Env,
+  agentId: string,
+): Promise<AgentMemberBinding> {
+  const row = await env.DB.prepare(
+    `SELECT b.member_id
+       FROM agent_member_bindings b
+       JOIN members m
+         ON m.id = b.member_id
+        AND m.tenant = b.tenant
+      WHERE b.tenant = ?
+        AND b.agent_id = ?
+        AND m.status = 'active'
+      LIMIT 1`,
+  )
+    .bind(env.TENANT_SLUG, agentId)
+    .first<{ member_id: string }>()
+
+  return row ? { kind: 'bound', memberId: row.member_id } : { kind: 'unminted' }
+}
+
+/**
+ * Compatibility wrapper for callers not yet migrated to the structured result.
+ * `ambiguous` remains in the return type until those interfaces are cut over,
+ * but the canonical binding schema cannot produce a new ambiguous identity.
+ */
 export async function resolveActiveAgentMember(
   env: Env,
   agentId: string,
 ): Promise<string | 'unminted' | 'ambiguous'> {
-  const rows = await env.DB.prepare(
-    `SELECT DISTINCT t.member_id
-       FROM member_tokens t
-       JOIN members m ON m.id = t.member_id
-      WHERE t.tenant = ?
-        AND t.agent_id = ?
-        AND t.revoked_at IS NULL
-        AND m.tenant = ?
-        AND m.status = 'active'
-      ORDER BY t.member_id
-      LIMIT 2`,
-  )
-    .bind(env.TENANT_SLUG, agentId, env.TENANT_SLUG)
-    .all<{ member_id: string }>()
-
-  const members = rows.results ?? []
-  if (members.length === 0) return 'unminted'
-  if (members.length === 1) return members[0].member_id
-  return 'ambiguous'
+  const binding = await resolveAgentMemberBinding(env, agentId)
+  return binding.kind === 'bound' ? binding.memberId : 'unminted'
 }
 
 export interface CapabilityGrantUpsertOutcome {
@@ -263,82 +372,32 @@ export interface CapabilityGrantUpsertOutcome {
   result: 'created' | 'updated' | 'unchanged'
 }
 
-export interface ActiveAgentCapabilityGrantInput {
-  agentId: string
-  expectedMemberId: string
-  squadId: string
-  capability: Capability
-}
-
-/**
- * Apply a squad grant only while the agent still has exactly the expected active
- * member binding. Identity validation, conflict handling, and outcome evidence
- * are evaluated by one SQLite statement.
- */
-export async function upsertActiveAgentCapabilityGrant(
+async function assertAgentHomeCapabilityCeiling(
   env: Env,
-  input: ActiveAgentCapabilityGrantInput,
-): Promise<CapabilityGrantUpsertOutcome | null> {
-  const createdId = crypto.randomUUID()
-  const updatedId = crypto.randomUUID()
-  const rows = await env.DB.prepare(
-    `WITH active_identity AS MATERIALIZED (
-       SELECT DISTINCT t.member_id
-         FROM member_tokens t
-         JOIN members m ON m.id = t.member_id
-        WHERE t.tenant = ?1
-          AND t.agent_id = ?2
-          AND t.revoked_at IS NULL
-          AND m.tenant = ?1
-          AND m.status = 'active'
-        ORDER BY t.member_id
-        LIMIT 2
-     ),
-     prior_grant AS MATERIALIZED (
-       SELECT id, capability
-         FROM capabilities
-        WHERE member_id = ?3
-          AND scope_type = 'squad'
-          AND scope_id = ?5
-     )
-     INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
-     SELECT CASE
-              WHEN NOT EXISTS (SELECT 1 FROM prior_grant) THEN ?4
-              WHEN (SELECT capability FROM prior_grant) = ?6 THEN (SELECT id FROM prior_grant)
-              ELSE ?7
-            END,
-            member_id, 'squad', ?5, ?6
-       FROM active_identity
-      WHERE member_id = ?3
-        AND (SELECT COUNT(*) FROM active_identity) = 1
-     ON CONFLICT(member_id, scope_type, scope_id) DO UPDATE SET
-       id = excluded.id,
-       capability = excluded.capability
-     RETURNING id, member_id, scope_type, scope_id, capability`,
-  )
-    .bind(
-      env.TENANT_SLUG,
-      input.agentId,
-      input.expectedMemberId,
-      createdId,
-      input.squadId,
-      input.capability,
-      updatedId,
-    )
-    .all<CapabilityGrant & { id: string }>()
+  grant: CapabilityGrant,
+): Promise<void> {
+  if (grant.capability === 'observer' || grant.capability === 'member') return
 
-  const row = rows.results?.[0]
-  if (!row) return null
-  const result = row.id === createdId ? 'created' : row.id === updatedId ? 'updated' : 'unchanged'
-  return {
-    grant: {
-      member_id: row.member_id,
-      scope_type: row.scope_type,
-      scope_id: row.scope_id,
-      capability: row.capability,
-    },
-    result,
-  }
+  const conflict = await env.DB.prepare(
+    `SELECT 1 AS conflict
+       FROM agent_member_bindings b
+       JOIN agents a ON a.id = b.agent_id
+       JOIN squads s ON s.id = a.squad_id
+      WHERE b.tenant = ?1
+        AND b.member_id = ?2
+        AND (
+          ?3 = 'org'
+          OR (?3 = 'department' AND ?4 = s.department_id)
+          OR (?3 = 'squad' AND ?4 = a.squad_id)
+        )
+      LIMIT 1`,
+  ).bind(
+    env.TENANT_SLUG,
+    grant.member_id,
+    grant.scope_type,
+    grant.scope_id,
+  ).first<{ conflict: 1 }>()
+  if (conflict) throw new Error('home_capability_ceiling')
 }
 
 /** Replace a member's grant on one scope and report the transaction's actual prior state. */
@@ -346,6 +405,8 @@ export async function upsertCapabilityGrant(
   env: Env,
   grant: CapabilityGrant,
 ): Promise<CapabilityGrantUpsertOutcome> {
+  await assertAgentHomeCapabilityCeiling(env, grant)
+
   const deleteStmt = grant.scope_id === null
     ? env.DB.prepare(
         `DELETE FROM capabilities

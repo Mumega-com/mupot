@@ -1,0 +1,105 @@
+{
+  "title": "YC27 Kasra mupot inbox receive+ACK canary",
+  "started_at": "2026-07-23T22:46:46Z",
+  "observe_window": {
+    "start": "2026-07-23T22:46:47Z",
+    "end": "2026-07-23T22:46:48Z"
+  },
+  "request_id": "yc27-kasra-inbox-canary-20260723T224646Z",
+  "kasra_agent_id": "c855f82c-1eeb-409d-94d2-f11e9dd18968",
+  "kayhermes_agent_id": "942e2845-87ba-4bbf-9c64-2d2e8817c7cc",
+  "send_receipt": {
+    "id": "7ab14a2f-ce2d-4d18-a5cd-6f5471d5aa58",
+    "seq": 151,
+    "duplicate": false,
+    "to": "c855f82c-1eeb-409d-94d2-f11e9dd18968",
+    "project_id": null
+  },
+  "kasra_runtime_identity": {
+    "bound_agent_id": "c855f82c-1eeb-409d-94d2-f11e9dd18968",
+    "member_id": "080e173d-0764-45e4-9871-3d9b70a41b5c",
+    "tenant": "mumega"
+  },
+  "fence": {
+    "agent_id": "c855f82c-1eeb-409d-94d2-f11e9dd18968",
+    "mode": "bearer_only",
+    "generation": 0,
+    "key_fingerprint": null,
+    "active_key_present": false,
+    "key_matches": true,
+    "updated_at": null
+  },
+  "watch_events": [
+    {
+      "t": "2026-07-23T22:46:47.780Z",
+      "component": "kasra-inbox-watch",
+      "event": "start",
+      "mcp": "https://mupot.mumega.com/mcp",
+      "agent_id": "c855f82c-1eeb-409d-94d2-f11e9dd18968",
+      "tmux_session": "kasra",
+      "interval_sec": 30,
+      "once": true
+    },
+    {
+      "t": "2026-07-23T22:46:48.448Z",
+      "component": "kasra-inbox-watch",
+      "event": "inbox_consumed",
+      "agent_id": "c855f82c-1eeb-409d-94d2-f11e9dd18968",
+      "count": 1,
+      "receipts": [
+        {
+          "seq": 151,
+          "id": "7ab14a2f-ce2d-4d18-a5cd-6f5471d5aa58",
+          "request_id": "yc27-kasra-inbox-canary-20260723T224646Z",
+          "in_reply_to": null,
+          "kind": "request"
+        }
+      ]
+    },
+    {
+      "t": "2026-07-23T22:46:48.448Z",
+      "component": "kasra-inbox-watch",
+      "event": "cycle",
+      "ok": true,
+      "reason": "delivered_and_consumed",
+      "consumed": 1,
+      "delivered": 1,
+      "peeked": 1,
+      "remaining": 0,
+      "receipts": [
+        {
+          "seq": 151,
+          "id": "7ab14a2f-ce2d-4d18-a5cd-6f5471d5aa58",
+          "request_id": "yc27-kasra-inbox-canary-20260723T224646Z",
+          "in_reply_to": null,
+          "kind": "request"
+        }
+      ],
+      "agent_id": "c855f82c-1eeb-409d-94d2-f11e9dd18968"
+    }
+  ],
+  "ack_send_receipt": {
+    "id": "77c79ede-00d1-4117-a306-a79c158ce3ad",
+    "seq": 152,
+    "duplicate": false,
+    "to": "942e2845-87ba-4bbf-9c64-2d2e8817c7cc",
+    "project_id": null
+  },
+  "kayhermes_matching_acks": [
+    {
+      "seq": 152,
+      "id": "77c79ede-00d1-4117-a306-a79c158ce3ad",
+      "from_agent": "c855f82c-1eeb-409d-94d2-f11e9dd18968",
+      "from_member": "080e173d-0764-45e4-9871-3d9b70a41b5c",
+      "kind": "ack",
+      "body": "ACK YC27 canary yc27-kasra-inbox-canary-20260723T224646Z",
+      "request_id": "ack-yc27-kasra-inbox-canary-20260723T224646Z",
+      "in_reply_to": "yc27-kasra-inbox-canary-20260723T224646Z",
+      "created_at": "2026-07-23T22:46:48.866Z",
+      "project_id": null
+    }
+  ],
+  "tests": {
+    "command": "node --test fleet-runtime/claude-code-inbox-adapter.test.mjs fleet-runtime/kasra-inbox-watch.test.mjs"
+  }
+}
