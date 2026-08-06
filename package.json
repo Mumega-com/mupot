@@ -74,6 +74,7 @@
     "hono": "^4.13.0"
   },
   "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.20.2",
     "@cloudflare/workers-types": "^4.20260617.1",
     "playwright": "^1.61.1",
     "sharp": "0.35.3",
@@ -90,6 +91,7 @@
     "sharp": "0.35.3",
     "ip-address": "^10.3.1",
     "@hono/node-server": "^2.0.5",
-    "body-parser": "^2.2.3"
+    "body-parser": "^2.2.3",
+    "undici": "7.29.0"
   }
 }

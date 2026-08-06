@@ -68,6 +68,14 @@ jobs:
         run: npx playwright install --with-deps chromium
       - name: Test
         run: npm test
+      # The deployed COMPOSITION — src/index.ts with its OAuthProvider wrapper — executed
+      # inside real workerd, not Node. This is the suite that would have caught the
+      # /auth/login 500 (#699): every other test imports pieces below the wrapper, so the
+      # wrapper itself shipped unexecuted. Separate step because `cloudflare:test` cannot
+      # load under the default Node runner (excluded in vitest.config.ts); if this step is
+      # ever deleted, the composition is back to shipping untested.
+      - name: Composition tests (workerd)
+        run: npx vitest run --config vitest.composition.config.ts
       - name: Fleet runtime tests
         run: node --test fleet-runtime/*.test.mjs
       - name: Wrangler dry-run bundle check
