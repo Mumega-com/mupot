@@ -137,14 +137,26 @@ def reissue(task: dict, reason: str, state: dict) -> str | None:
     if DRY_RUN:
         log(f"DRY_RUN would reissue {task['id'][:8]} ({reason})")
         return None
-    new = mcp("task_create", {
+    payload = {
         "squad_id": task.get("squad_id", "squad-core"),
         "project_id": task.get("project_id"),
         "title": task.get("title", "")[:200],
         "done_when": task.get("done_when", "(carried from prior copy)"),
         "body": body,
         "assignee_agent_id": task.get("assignee_agent_id"),
-    })["task"]
+    }
+    # mupot#659 P0 fix / "amplifier" close: reissue used to always go through task_create
+    # with NO provenance marker, so a blocked task that originated from a governed
+    # external integration (e.g. Linear, external_source set — migrations/0077 on the
+    # server) came back on the reissued copy as an ordinary, unmarked, trusted-looking
+    # task — laundering it straight into the normal task.created bus wake the original
+    # import deliberately suppressed (skipEvent). Carry the marker forward whenever the
+    # prior copy had one, so the reissued task keeps every downstream guard the marker
+    # gates (no auto-pickup, admin-gated reassignment, untrusted-content prompt fence).
+    external_source = task.get("external_source")
+    if external_source:
+        payload["external_source"] = external_source
+    new = mcp("task_create", payload)["task"]
     state["reissued"][root] = new["id"]
     log(f"reissued {task['id'][:8]} -> {new['id'][:8]} ({reason})")
     return new["id"]
