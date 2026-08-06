@@ -1,4 +1,5 @@
 import type { D1Result } from '@cloudflare/workers-types'
+import { TASK_SELECT_COLUMNS } from '../tasks/ranking'
 import { canonicalJson, canonicalJsonDigest, sha256Hex } from '../lib/canonical-json'
 import { loadProjectSituation } from '../projects/situation'
 import { dispatchFlight } from '../flight/dispatch'
@@ -677,8 +678,7 @@ async function ensureActionTask(
 ): Promise<Task> {
   const id = await deterministicUuid('routine-action-task', actionId)
   const existing = await env.DB.prepare(
-    `SELECT id, squad_id, project_id, title, body, done_when, status, assignee_agent_id,
-            github_issue_url, result, completed_at, gate_owner, created_at, updated_at
+    `SELECT ${TASK_SELECT_COLUMNS}
        FROM tasks WHERE id = ?`,
   ).bind(id).first<Task>()
   if (existing) return existing
@@ -694,8 +694,7 @@ async function ensureActionTask(
     }, { id, skipMirror: true })
   } catch (error) {
     const raced = await env.DB.prepare(
-      `SELECT id, squad_id, project_id, title, body, done_when, status, assignee_agent_id,
-              github_issue_url, result, completed_at, gate_owner, created_at, updated_at
+      `SELECT ${TASK_SELECT_COLUMNS}
          FROM tasks WHERE id = ?`,
     ).bind(id).first<Task>()
     if (raced) return raced
@@ -793,8 +792,7 @@ async function executeFlightAction(
 
 async function loadTask(env: Env, taskId: string): Promise<Task | null> {
   return env.DB.prepare(
-    `SELECT id, squad_id, project_id, title, body, done_when, status, assignee_agent_id,
-            github_issue_url, result, completed_at, gate_owner, created_at, updated_at
+    `SELECT ${TASK_SELECT_COLUMNS}
        FROM tasks WHERE id = ?`,
   ).bind(taskId).first<Task>()
 }

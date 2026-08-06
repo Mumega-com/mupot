@@ -1,11 +1,23 @@
 // mupot — GitHub Projects v2 ↔ pot bridge (#22).
 //
-// You manage work on a familiar GitHub Project board; the pot reads it and routes each item
-// to the named agent it's assigned to. GitHub App bots can't be REST assignees, so an item is
-// "assigned to an agent" via a single-select/text project field (default name "Agent") whose
-// value matches a pot agent's slug or name. The pot imports such items as tasks, assigned to
-// that agent — then the own-fleet executor (executeTaskAsPR) ships the work, authored as that
-// agent (#21), and links the PR back. The pot is the bridge: Project ↔ pot tasks ↔ agents.
+// You manage work on a familiar GitHub Project board; the pot reads it and imports each item
+// as a task, carrying the single-select/text project field (default name "Agent") as a
+// DISPLAY-ONLY hint about who a project editor thinks should do it.
+//
+// PR #659 P0 fix, widened (kasra-core parallel-audit finding, confirmed live on main pre-fix):
+// this adapter used to resolve that field to a REAL pot agent and pass it straight to
+// createTask as assignee_agent_id, with NO skipEvent — so task.created fired, dispatchSquad
+// woke that exact agent, and the own-fleet executor (executeTaskAsPR) shipped work AUTHORED AS
+// THAT AGENT, PR-linked back, sourced from attacker-editable title/field text. No human step.
+// This bypassed BOTH existing guards: canAgentExecuteTask's unassigned-auto-pickup check
+// (N/A — the task was never unassigned) and the admin-gated reassignment check
+// (tasks/index.ts/mcp/index.ts task_update — those only fire on a LATER PATCH, never on the
+// original createTask call). Fixed at the choke point (src/tasks/service.ts createTask): any
+// task carrying externalSource is now FORCED unassigned at creation, structurally, regardless
+// of what this file (or any future external-integration caller) passes. This file now imports
+// EXACTLY like src/integrations/linear-issues.ts: propose only, `agentValue` is a display hint
+// (BoardItem-shaped, never read to select who does the work), and an admin must take the
+// explicit, admin-gated task_update/PATCH step before the task is assignable and executable.
 //
 // Requires the App to have Projects: read. Without it the GraphQL errors → projects_unavailable
 // (fail-closed). Read-only against GitHub; the only writes are pot tasks (this tenant's D1).
@@ -213,6 +225,11 @@ export async function importProjectItems(
       result.items.push({ title: it.title, agent: null, status: 'no_agent' })
       continue
     }
+    // PR #659 P0 fix: `agent` below resolves ONLY which SQUAD to route to (routing quality,
+    // not execution authority) and is surfaced back as a display hint (`agent` in the result
+    // item, same shape as Linear's assigneeHint). It is deliberately NEVER passed as
+    // assignee_agent_id anymore — see the file header. createTask's own choke-point guard
+    // would force it null even if it were passed, but this file no longer tries.
     const agent = await resolveAgentByValue(env, it.agentValue)
     if (!agent) {
       result.items.push({ title: it.title, agent: it.agentValue, status: 'unknown_agent' })
@@ -246,9 +263,18 @@ export async function importProjectItems(
           // #142: GitHub Project sync — predicate is the GH issue itself closing.
           done_when: `GitHub Project item ${it.itemId} closed`,
           status: 'open',
-          assignee_agent_id: agent.id,
+          // Structural enforcement (PR #659 P0 fix), not a default: NEVER set from a
+          // GitHub Project field. An admin must explicitly assign via task_update/PATCH.
+          assignee_agent_id: null,
         },
-        { skipMirror: true },
+        {
+          skipMirror: true,
+          // PR #659 P0 fix: the marker every downstream trust decision (canAgentExecuteTask,
+          // routeUnassignedWork, the admin reassignment gate, the untrusted-content prompt
+          // fence, createTask's own assignee choke-point) keys off. owner/projectNumber are
+          // bounded/validated above (LOGIN_RE, Number.isInteger) before this call.
+          externalSource: `github-projects:${params.owner}/${params.projectNumber}`,
+        },
       )
       if (kv) {
         try {
