@@ -16,6 +16,40 @@ Code merged or deployed after the `v0.25.0` tag is not retroactively part of
 `v0.25.0`. Capabilities remain preview until the release that owns them passes its
 gate and is tagged.
 
+## Operating loop — current live state (2026-08-03, updates by PR only)
+
+> Cross-cutting runtime plan; version-scoped features above own their releases.
+> "Where is the plan?" — here. Shipped record: CHANGELOG.md.
+
+**Ideal output** — a self-perpetuating loop, humans only at decision points:
+`board task → caged lane builds (cheap model) → cross-vendor review → gate verdict
+(delegable) → kasra merges → steward repairs → hermes-send announces to Hadi →
+revenue data accumulates`. Measured in the steward digest: (1) GEO scan events/day
+in PostHog, (2) tasks/day completing with no human in the execution path,
+(3) verdicts+merges Hadi personally performs (target: merges only), (4) silent
+failures found by steward that nothing else reported (target: 0).
+
+**Roster (Hadi, enforced 2026-08-03):** tmux kasra · codex · athena · river; mubot
+sole Hermes gateway. Lanes = ephemeral processes: tech-grok (build), claude lane
+(haiku — docs/specs), mumcp (WordPress), codex lane (PAUSED pending #645 cage
+predicate), review (cross-vendor gate), steward (self-repair). One codex: 1eb0e718.
+
+**Workstreams:** W1 revenue — FLIGHT 00b2ef4b GEO scanner (#574): merged 49783032, FIRST LIVE SCANS OK 2026-08-03 (3/3, PostHog events); remaining = cadence timer + receipt-sink 404 + profile upstream (task b6addee4) then flight_land; next viamar/digid
+baselines + DME operational flight (e1a02d39; code already in main). W2 caged
+lanes — implement codex's acceptance predicate (#645), then Spark unpause + Hermes/
+V4-Flash lane via iron-proxy. W3 self-perpetuation — steward round 2 (dead-man
+pings with evidence), server-side requeue + task markers + max-rounds (#635),
+codified gate delegation. W4 federation — Phase 1 registry (mumega-com#573) on the
+merged Phase 0 ADR (452f11db); separate-ownership pilot + mints stay Hadi-direct.
+W5 debt — 22-BLOCK backlog (#636), organisms redesign (#595), Mirror 501 (#596),
+board hygiene, athena-inbox-watch (#594), mubot token rotation.
+
+**Standing rules:** branch+PR only · cross-vendor review every merge · server-
+enforced no-self-verdict (delegation by explicit grant) · adversarial gate parallel
+on sensitive surfaces · "restore" commits get diffed against their claim · rigor
+budget scales with blast radius · consultations on GitHub artifacts, buses carry
+pointers.
+
 ## Product hierarchy
 
 Mupot uses one project-centered vocabulary:
