@@ -138,6 +138,23 @@ export const PRIORITY_RANK: Record<string, number> = { P0: 0, P1: 1, P2: 2, P3: 
  * the SQL ordering decides which rows survive the LIMIT, so a disagreement silently drops
  * high-priority rows before the in-memory ranker ever sees them.
  */
+/**
+ * The one projection every task read uses, on EVERY surface.
+ *
+ * It lived in five places inside src/mcp/index.ts and, unnoticed, in four more across
+ * src/tasks/index.ts (REST) and src/dashboard/index.ts. migrations/0079 added `priority`
+ * and `parent_task_id`; #710 updated the MCP copies and left the others. Result: the MCP
+ * path ranked correctly while the REST and dashboard paths — the ones a human opens —
+ * silently returned unranked rows, with comments in both claiming parity. Nothing failed.
+ * (Found by the diverse gate, mupot#713.)
+ *
+ * A projection duplicated across surfaces is a divergence waiting for its next column.
+ */
+export const TASK_SELECT_COLUMNS =
+  'id, squad_id, project_id, title, body, done_when, status, priority, parent_task_id, ' +
+  'assignee_agent_id, github_issue_url, result, completed_at, gate_owner, source_pot, ' +
+  'external_source, created_at, updated_at'
+
 export function priorityOrderSql(column = 'priority'): string {
   return `CASE ${column} WHEN 'P0' THEN 0 WHEN 'P1' THEN 1 WHEN 'P2' THEN 2 WHEN 'P3' THEN 3 ELSE 4 END`
 }

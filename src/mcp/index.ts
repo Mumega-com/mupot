@@ -71,6 +71,7 @@ import {
   terminalStatusInSql,
   actionableStatusOrderSql,
   priorityOrderSql,
+  TASK_SELECT_COLUMNS,
 } from '../tasks/ranking'
 import { loadAgentRuntimeStates, type AgentRuntimeState } from '../dashboard/observatory'
 import { buildOrient, renderBrief } from '../orient/service'
@@ -399,15 +400,6 @@ const STRING_SCHEMA = { type: 'string' }
 const NULLABLE_STRING_SCHEMA = { type: ['string', 'null'] }
 const OPTIONAL_STRING_ARRAY_SCHEMA = { type: 'array', items: { type: 'string' } }
 const OPTIONAL_NUMBER_SCHEMA = { type: 'number' }
-/**
- * The one projection every task read uses. This column list existed in FOUR places; three of
- * them sit inside a LIMIT budget, so omitting a column from one of them drops the field
- * for that path only — visible in some views, absent in others, with nothing failing.
- */
-const TASK_SELECT_COLUMNS =
-  'id, squad_id, project_id, title, body, done_when, status, priority, parent_task_id, ' +
-  'assignee_agent_id, github_issue_url, result, completed_at, gate_owner, source_pot, ' +
-  'external_source, created_at, updated_at'
 
 const TASK_PRIORITIES: readonly string[] = ['P0', 'P1', 'P2', 'P3']
 
@@ -809,10 +801,14 @@ const toolTaskBoard: ToolSpec = {
     if (typeof limit !== 'number') return limit
 
     const rows = await env.DB.prepare(
+      // Ranked within the LIMIT, not merely recent (#713). task_board is the kanban view;
+      // ordering it by created_at means a board capped at `limit` drops the OLDEST rows
+      // regardless of priority, so a P0 filed last month can fall out of the board entirely
+      // while P3 chatter from today stays. Found by the ORDER-BY parity guard, not by me.
       `SELECT ${TASK_SELECT_COLUMNS}
          FROM tasks
         WHERE squad_id = ?1
-        ORDER BY created_at DESC
+        ORDER BY ${priorityOrderSql()}, created_at DESC
         LIMIT ?2`,
     )
       .bind(squadRes.squad.id, limit)

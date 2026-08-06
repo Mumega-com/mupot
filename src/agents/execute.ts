@@ -26,6 +26,7 @@
 //    note; no tokens are spent.
 
 import type { Env, Agent, Task, ModelMessage, ModelPort, BusEvent } from '../types'
+import { TASK_SELECT_COLUMNS } from '../tasks/ranking'
 import { checkTransition, assertCompletableDoneWhen, assigneeSelfClose } from '../tasks/service'
 import { resolveTaskAssignee } from '../tasks/assignee'
 import { createModel } from '../model'
@@ -326,9 +327,9 @@ async function loadTaskById(env: Env, taskId: string): Promise<Task | null> {
   // was the actual hole (the column existed on the row and in the Task type, but
   // execute's own read of the row was dropping it on the floor).
   const row = await env.DB.prepare(
-    `SELECT id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url,
-            result, completed_at, gate_owner, source_pot, external_source, execution_receipt_id, execution_claim_expires_at,
-            created_at, updated_at
+    // Extra columns appended, not replaced: the shared projection does not carry the
+    // execution lease, and dropping it here would break at-most-once dispatch.
+    `SELECT ${TASK_SELECT_COLUMNS}, execution_receipt_id, execution_claim_expires_at
        FROM tasks WHERE id = ? LIMIT 1`,
   )
     .bind(taskId)
