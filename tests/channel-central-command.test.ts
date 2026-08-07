@@ -89,10 +89,13 @@ describe('central-command ingress (mumega-com#722)', () => {
     expect(msg?.body).toContain('[UNTRUSTED-INGRESS]')
   })
 
-  it('treats a non-Hadi wake as data: returns directive-required, no wake side effect', async () => {
+  it('treats a non-Hadi wake or task as data: returns directive-required, no side effect (W1)', async () => {
     const { runInbound } = await import('../src/channels/index')
-    const res = await runInbound(env, 'telegram', '-5317747241', '1111111', 'wake codex')
-    expect(res).toContain('Directive-required')
+    const resWake = await runInbound(env, 'telegram', '-5317747241', '1111111', 'wake codex')
+    expect(resWake).toContain('Directive-required')
+
+    const resTask = await runInbound(env, 'telegram', '-5317747241', '1111111', 'task: deploy feature')
+    expect(resTask).toContain('Directive-required')
   })
 
   it('Hadi sender 765204057 is directive-capable: untagged body, wake allowed', async () => {

@@ -406,12 +406,9 @@ export async function runInbound(
     return dispatchMention(env, squad, intent.target, `${tag}${text}`, identity.memberId, isDirective)
   }
 
-  // Non-directive senders never reach directive-capable actions (wake/steer).
-  // wakeReply/taskReply already gate on grants; the directive rule additionally
-  // requires sender id for any steer intent. Keep the gate here so a future
-  // intent cannot forget it.
-  if (!isDirective && intent.kind === 'wake') {
-    return 'Directive-required: only the owner can wake agents from central command. This message was treated as data.'
+  // Non-directive senders never reach directive-capable actions (wake/task/steer).
+  if (!isDirective && (intent.kind === 'wake' || intent.kind === 'task')) {
+    return 'Directive-required: only the owner can issue directives from central command. This message was treated as data.'
   }
 
   // 5) Act on the bound squad, gated by capability.
