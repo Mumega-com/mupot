@@ -58,6 +58,7 @@ import { projectLinkApp } from './addons/project-link/routes'
 import { presenceApp } from './registry/presence-routes'
 import { routinesApp } from './routines/routes'
 import { attentionApp } from './attention/routes'
+import { telegramIngressApp } from './telegram-bridge/ingress'
 
 // Durable Object classes — implemented in src/agents/.
 export { AgentDO } from './agents/agent-do'
@@ -100,6 +101,8 @@ app.route('/api/integrations/ghl', ghlInboundApp)
 app.route('/api/events', eventIngestApp)
 // GitHub weave: inbound webhook (HMAC-verified by GITHUB_WEBHOOK_SECRET) → work units.
 app.route('/api/integrations/github', githubInboundApp)
+// Telegram webhook ingress (POST /api/integrations/telegram/webhook)
+app.route('/api/integrations/telegram', telegramIngressApp)
 app.route('/api/prospects', prospectsApp)
 app.route('/api/loops', loopsApp)
 // Flock check-in (Flock #45): agents POST presence with their member-token (bearer).
