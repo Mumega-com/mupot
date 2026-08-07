@@ -10,6 +10,7 @@ describe('Dashboard Motherboard View Layer', () => {
       DB: {
         prepare: () => ({
           all: async () => ({ results: [] }),
+          first: async () => ({ total_prompt: 1000, total_comp: 500, cnt: 2 }),
         }),
       },
     } as any
@@ -36,6 +37,7 @@ describe('Dashboard Motherboard View Layer', () => {
       DB: {
         prepare: () => ({
           all: async () => ({ results: [] }),
+          first: async () => ({ total_prompt: 1000, total_comp: 500, cnt: 2 }),
         }),
       },
     } as any
