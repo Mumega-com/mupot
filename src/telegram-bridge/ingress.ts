@@ -202,7 +202,9 @@ telegramIngressApp.post('/webhook', async (c) => {
     status: 'dispatched',
     chat_id: result.chatId,
     sender: result.sender,
-    text: result.text,
+    // Capped here too. The bus payload was already capped; echoing the raw text
+    // in the response reintroduced the unbounded value on a different surface.
+    text: (result.text ?? '').slice(0, MAX_TEXT_CHARS),
     message_id: result.messageId
   }, 200)
 })

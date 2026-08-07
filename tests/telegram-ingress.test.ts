@@ -289,3 +289,18 @@ describe('ingress security layer', () => {
     expect(ev.actor.id).toBe('telegram:765204057')  // numeric, not a spoofable username
   })
 })
+
+// Athena gate WARN-2: a mutation to SUBSTRING matching left the suite green.
+// Production is correct (exact `includes(String(fromId))`), but nothing pinned it,
+// so a future refactor to `rawAllow.includes(String(fromId))` would pass review.
+// The dangerous case is a shorter id being a substring of an allowed one.
+describe('allowlist pins EXACT matching (Athena WARN-2)', () => {
+  it('rejects an id that is merely a SUBSTRING of an allowed id', () => {
+    expect(isSenderAllowed(765, '765204057')).toBe(false)
+    expect(isSenderAllowed(4057, '765204057')).toBe(false)
+    expect(isSenderAllowed(20405, '765204057,111222')).toBe(false)
+  })
+  it('still accepts the exact id, including inside a list', () => {
+    expect(isSenderAllowed(765204057, '111222,765204057,333')).toBe(true)
+  })
+})
