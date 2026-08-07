@@ -125,6 +125,19 @@ test('a target with migrations but NONE parseable fails rather than inventing a 
   assert.equal(v.reason, 'target_has_no_parseable_migrations')
 })
 
+test('FAIL CLOSED, LOCAL SIDE: an unlistable working-tree migrations/ is a failure', () => {
+  // Found by Prime's bypass review AFTER the target-side fix shipped in c43b35b — the mirror
+  // image of that bug, in the mirror-image function. Neither Athena's bypass sweep nor 21
+  // self-tests caught it, because everyone including me was looking at the target side.
+  //
+  // The lesson is not "check localMigrations too". It is that "cannot verify is not pass" was
+  // written down once and applied to ONE of the function's two arguments. A rule stated in a
+  // comment gets applied where the author was looking.
+  const v = evaluate(['0079_x.sql'], null)
+  assert.equal(v.ok, false)
+  assert.equal(v.reason, 'local_unreadable')
+})
+
 test('a target with no migrations at all is bootstrap, and passes', () => {
   assert.equal(evaluate([], ['0001_init.sql']).reason, 'bootstrap_no_target_migrations')
 })
@@ -243,6 +256,69 @@ test('FAIL CLOSED at the GIT layer: ls-tree failing is a failure, not a bootstra
   assert.doesNotMatch(out, /bootstrap/)
 })
 
+test('PARTIAL working tree: a COMMITTED below-head migration is still caught when the file is not on disk', (t) => {
+  // The fourth defect in this file (Athena's re-gate named the asymmetry; measured immediately
+  // after). The local side read the WORKING TREE via readdirSync while the target side read
+  // GIT — two oracles for the two halves of one comparison. A total readdir failure was
+  // already handled; a PARTIAL tree returns a short list with NO error, so the guard
+  // under-reported what the PR adds and called the shortfall "added nothing".
+  //
+  // This test replaced an earlier one that removed the whole directory and asserted exit 1.
+  // That test encoded the WEAKER oracle: with HEAD now authoritative, a repo whose only added
+  // file was never committed genuinely has nothing added, and passing is correct. Deleting the
+  // old assertion was the right call, not a convenience — the property worth pinning is that a
+  // COMMITTED violation survives the file vanishing from disk.
+  const dir = scaffold({ targetMigrations: ['0079_x.sql'], addedMigrations: [] })
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+
+  writeFileSync(join(dir, 'migrations', '0076_committed.sql'), '-- x\n')
+  execFileSync('git', ['add', '-A'], { cwd: dir, stdio: 'ignore' })
+  execFileSync('git', ['-c', 'user.email=t@t.test', '-c', 'user.name=t', 'commit', '-qm', 'add below-head'], { cwd: dir, stdio: 'ignore' })
+  assert.equal(run(dir).code, 1, 'sanity: below-head fails while the file is on disk')
+
+  rmSync(join(dir, 'migrations', '0076_committed.sql'))
+  const { code, out } = run(dir)
+  assert.equal(code, 1, 'HEAD still contains it — the working tree is not the oracle')
+  assert.match(out, /0076_committed\.sql/)
+  assert.doesNotMatch(out, /no_migrations_added/)
+})
+
+test('an UNCOMMITTED migration is still checked, so the pre-commit warning survives the union', (t) => {
+  // The reason the working tree is unioned in rather than dropped: a developer running this
+  // before committing must still be warned about a file git has not seen yet.
+  const dir = scaffold({ targetMigrations: ['0079_x.sql'], addedMigrations: ['0076_uncommitted.sql'] })
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const { code, out } = run(dir)
+  assert.equal(code, 1)
+  assert.match(out, /0076_uncommitted\.sql/)
+})
+
+test('FAIL CLOSED: only when BOTH local oracles fail is it local_unreadable', (t) => {
+  // The union must not become a way to always find *some* answer. With git gone AND the
+  // directory gone there is no oracle left, and inventing one is the original sin of this file.
+  const dir = scaffold({ targetMigrations: ['0079_x.sql'], addedMigrations: [] })
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  rmSync(join(dir, 'migrations'), { recursive: true, force: true })
+  rmSync(join(dir, '.git'), { recursive: true, force: true })
+  const { code, out } = run(dir)
+  assert.equal(code, 1)
+  // Assert the REASON, not just the exit code. Removing .git also makes the TARGET unreadable,
+  // so a mutation that deletes the both-null guard still exits 1 — via target_unreadable — and
+  // an exit-code-only assertion passes for the wrong reason. Measured: mutation M13 (`if
+  // (false) return null`) left the suite 27/27 green until this line existed. The local check
+  // runs first, so its message is the discriminator.
+  assert.match(out, /Could not list/, 'must fail on the LOCAL oracle, not incidentally on the target')
+  assert.doesNotMatch(out, /no_migrations_added/)
+})
+
+test('the union returns null, not [], when both local oracles fail', () => {
+  // The pure counterpart to the test above, stated at the layer where the distinction is
+  // unambiguous. `[]` and `null` are both falsy-ish shapes that flow onward; only one of them
+  // means "I could not look". This whole file exists because that difference was collapsed.
+  const v = evaluate(['0079_x.sql'], null)
+  assert.equal(v.reason, 'local_unreadable')
+})
+
 test('end to end: BASE_REF selects a different merge target', (t) => {
   // PRs are not always against main. If BASE_REF were ignored, the guard would compare
   // against the wrong branch and its verdict would be unrelated to what actually merges.
@@ -288,6 +364,62 @@ test('every tests/*.test.mjs is wired to a node --test step in CI', () => {
   assert.ok(files.length > 0, 'expected to find node:test files under tests/')
   const unwired = files.filter((f) => !ci.includes(f))
   assert.deepEqual(unwired, [], `these node:test suites run nowhere: ${unwired.join(', ')}`)
+})
+
+test('STACKED PR: clearing the declared base is not enough — main head still binds', (t) => {
+  // PR #398 is the live case (Prime, bypass review of the merged guard): base
+  // `codex/project-routines-v025` head 0061, adds 0062, main at 0079. The guard printed
+  // "migration numbering OK" while that migration can never run against main — it said
+  // "ordering verified" about an ordering that does not exist.
+  //
+  // Staged synthetically rather than replayed from the real repo: a worktree carrying main's
+  // full migration set makes "added vs an old base" meaningless, and my first attempt at
+  // reproducing #398 that way produced a confident wrong answer. Build the shape instead.
+  const dir = scaffold({ targetMigrations: ['0001_init.sql', '0079_x.sql'], addedMigrations: [] })
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const git = (...args) => execFileSync('git', args, { cwd: dir, stdio: 'ignore' })
+
+  // An intermediate branch that forked BEFORE main reached 0079 — it only knows up to 0061.
+  git('checkout', '-q', '-b', 'stack', 'HEAD')
+  rmSync(join(dir, 'migrations', '0079_x.sql'))
+  execFileSync('git', ['add', '-A'], { cwd: dir, stdio: 'ignore' })
+  git('commit', '-qm', 'stack base: no 0079')
+  execFileSync('git', ['write-tree'], { cwd: dir, stdio: 'ignore' })
+  writeFileSync(join(dir, 'migrations', '0061_stack_head.sql'), '-- x\n')
+  execFileSync('git', ['add', '-A'], { cwd: dir, stdio: 'ignore' })
+  git('commit', '-qm', 'stack base head 0061')
+  git('checkout', '-q', 'main')
+  git('fetch', '-q', 'origin')
+
+  // The PR: adds 0062. Above the stack's head (0061), at-or-below main's (0079).
+  writeFileSync(join(dir, 'migrations', '0062_stacked.sql'), '-- x\n')
+
+  const { code, out } = run(dir, { BASE_REF: 'stack' })
+  assert.equal(code, 1, '0062 clears the stack head but can never run against main')
+  assert.match(out, /0062_stacked\.sql/)
+  // The message must say WHICH constraint bound, or the author rebases onto the wrong thing.
+  assert.match(out, /origin\/main/)
+})
+
+test('EVERY green message names the ref it actually compared against', (t) => {
+  // The overstatement half of the same finding. "migration numbering OK" with no ref reads as
+  // "verified", full stop — which is exactly how #398 passed review.
+  //
+  // Both green paths, not one. The first version of this test covered only `above_target_head`,
+  // and a mutation stripping the ref from the OTHER message (`no_migrations_added`) left the
+  // suite 25/25 green. A test that pins one branch of a two-branch claim is the shape this
+  // whole file exists to reject.
+  const withAdd = scaffold({ targetMigrations: ['0079_x.sql'], addedMigrations: ['0080_new.sql'] })
+  t.after(() => rmSync(withAdd, { recursive: true, force: true }))
+  const a = run(withAdd)
+  assert.equal(a.code, 0, a.out)
+  assert.match(a.out, /origin\/main/, 'above_target_head message must name the ref')
+
+  const noAdd = scaffold({ targetMigrations: ['0079_x.sql'], addedMigrations: [] })
+  t.after(() => rmSync(noAdd, { recursive: true, force: true }))
+  const b = run(noAdd)
+  assert.equal(b.code, 0, b.out)
+  assert.match(b.out, /origin\/main/, 'no_migrations_added message must name the ref too')
 })
 
 test('end to end: a malformed BASE_REF is refused, not resolved', (t) => {
