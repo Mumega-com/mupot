@@ -426,15 +426,13 @@ export async function runInbound(
       return wakeReply(env, identity.memberId, grants, intent.ref)
     case 'task':
       return taskReply(env, identity.memberId, grants, squad, intent.title)
-    case 'mention':
-      return `Dispatched @${intent.target}`
   }
 }
 
 // ── Central-command mention helper ──────────────────────────────────────────
 async function dispatchMention(
   env: Env,
-  squad: { id: string },
+  _squad: { id: string },
   target: string,
   body: string,
   memberId: string,
