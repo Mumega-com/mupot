@@ -120,19 +120,17 @@ export async function loadMotherboardData(env: Env, selectedTenant = 'mumega.com
     }>()
     dbAgents = agentRes.results ?? []
 
-    try {
-      const usageRes = await env.DB.prepare(
-        'SELECT COALESCE(SUM(prompt_tokens), 0) AS total_prompt, COALESCE(SUM(completion_tokens), 0) AS total_comp, COUNT(*) AS cnt FROM subagent_token_usage'
-      ).first<{ total_prompt: number; total_comp: number; cnt: number }>()
-      if (usageRes) {
-        tokenMeter = {
-          totalTokens: Number(usageRes.total_prompt || 0) + Number(usageRes.total_comp || 0),
-          promptTokens: Number(usageRes.total_prompt || 0),
-          completionTokens: Number(usageRes.total_comp || 0),
-          recordCount: Number(usageRes.cnt || 0),
-        }
+    const usageRes = await env.DB.prepare(
+      'SELECT COALESCE(SUM(prompt_tokens), 0) AS total_prompt, COALESCE(SUM(completion_tokens), 0) AS total_comp, COUNT(*) AS cnt FROM subagent_token_usage'
+    ).first<{ total_prompt: number; total_comp: number; cnt: number }>()
+    if (usageRes) {
+      tokenMeter = {
+        totalTokens: Number(usageRes.total_prompt || 0) + Number(usageRes.total_comp || 0),
+        promptTokens: Number(usageRes.total_prompt || 0),
+        completionTokens: Number(usageRes.total_comp || 0),
+        recordCount: Number(usageRes.cnt || 0),
       }
-    } catch {}
+    }
   }
 
   const defaultDepartments: MotherboardDepartment[] = [

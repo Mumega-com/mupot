@@ -15,6 +15,18 @@ export interface MirrorSearchHit {
   concepts?: string[]
 }
 
+// Helper to safely parse concepts JSON array
+function parseConceptsJson(rawJson: string | null | undefined): string[] | undefined {
+  if (!rawJson) return undefined
+  try {
+    const parsed = JSON.parse(rawJson)
+    return Array.isArray(parsed) ? parsed : undefined
+  } catch (err) {
+    console.warn('[mirror] Non-fatal JSON parse warning for concepts:', err)
+    return undefined
+  }
+}
+
 // Helper to verify secret header authorization
 function verifyMirrorSecret(c: { req: { header: (name: string) => string | undefined }; env: Env }): boolean {
   const secret = c.env.MIRROR_SECRET || c.env.MIRROR_TOKEN
@@ -53,8 +65,8 @@ const handleSearch = async (c: import('hono').Context<{ Bindings: Env }>) => {
   let body: { query?: string; agent_id?: string; limit?: number; k?: number }
   try {
     body = await c.req.json()
-  } catch {
-    return c.json({ error: 'invalid_json', detail: 'Request body must be valid JSON' }, 400)
+  } catch (err) {
+    return c.json({ error: 'invalid_json', detail: `Request body must be valid JSON: ${err}` }, 400)
   }
 
   if (!body.query || typeof body.query !== 'string' || body.query.trim().length === 0) {
@@ -80,10 +92,7 @@ const handleSearch = async (c: import('hono').Context<{ Bindings: Env }>) => {
 
       let rank = 1
       for (const row of rows.results ?? []) {
-        let concepts: string[] | undefined
-        if (row.concepts) {
-          try { concepts = JSON.parse(row.concepts) } catch {}
-        }
+        const concepts = parseConceptsJson(row.concepts)
         textHitsMap.set(row.id, {
           id: row.id,
           text: row.text,
@@ -109,8 +118,9 @@ const handleSearch = async (c: import('hono').Context<{ Bindings: Env }>) => {
             vectorHitsMap.set(match.id, { id: match.id, vectorRank: vRank++, score: match.score })
           }
         }
-      } catch {
-        // Vector search error degrades gracefully to text RRF if vector engine fails
+      } catch (err) {
+        // Non-fatal vector search degradation: degrades gracefully to D1 text RRF
+        console.warn('[mirror] Vector search degraded to D1 text RRF:', err)
       }
     }
 
@@ -140,9 +150,7 @@ const handleSearch = async (c: import('hono').Context<{ Bindings: Env }>) => {
         if (d1Row) {
           text = d1Row.text
           agent_id = d1Row.agent_id
-          if (d1Row.concepts) {
-            try { concepts = JSON.parse(d1Row.concepts) } catch {}
-          }
+          concepts = parseConceptsJson(d1Row.concepts)
         }
       }
 
@@ -256,7 +264,9 @@ mirrorApp.post('/memory/store', async (c) => {
             metadata: { tenant: c.env.TENANT_SLUG || 'default', agentId, text: text.slice(0, 500) },
           }])
         }
-      } catch {}
+      } catch (err) {
+        console.warn('[mirror] Vector index write failed (relational engram preserved):', err)
+      }
     }
   } catch (err) {
     return c.json({
@@ -313,7 +323,9 @@ const handleForget = async (c: import('hono').Context<{ Bindings: Env }>) => {
     if (c.env.VEC) {
       try {
         await c.env.VEC.deleteByIds([targetId])
-      } catch {}
+      } catch (err) {
+        console.warn('[mirror] Vector index delete failed (relational engram purged):', err)
+      }
     }
 
     return c.json({ ok: true, deleted_id: targetId, count: 1 }, 200)
@@ -349,10 +361,7 @@ mirrorApp.get('/memory/:id', async (c) => {
       return c.json({ error: 'not_found', detail: `engram memory entry '${id}' not found` }, 404)
     }
 
-    let concepts: string[] | undefined
-    if (row.concepts) {
-      try { concepts = JSON.parse(row.concepts) } catch {}
-    }
+    const concepts = parseConceptsJson(row.concepts)
 
     return c.json({
       ok: true,
@@ -389,10 +398,7 @@ mirrorApp.get('/memory', async (c) => {
     const rows = await c.env.DB.prepare(sql).bind(...params).all<{ id: string; agent_id: string; text: string; concepts: string | null; created_at: string }>()
 
     const engrams = (rows.results ?? []).map((r) => {
-      let concepts: string[] | undefined
-      if (r.concepts) {
-        try { concepts = JSON.parse(r.concepts) } catch {}
-      }
+      const concepts = parseConceptsJson(r.concepts)
       return { id: r.id, agent_id: r.agent_id, text: r.text, concepts, created_at: r.created_at }
     })
 
