@@ -23,7 +23,7 @@ had no definable end state. This document is that end state.
 | 2 | `~/.env.secrets` + `~/.hermes/.env` | 106 vars (75 credential-shaped) | ✅ read |
 | 3 | Cloudflare Worker secrets (mupot) | 27 | ✅ `wrangler secret list` |
 | 4 | GitHub Actions repo secrets | 4 (mumega-com) | ✅ `gh secret list` |
-| 5 | **Cloudflare USER-owned API tokens** | **unknown** | ❌ **dashboard only** |
+| 5 | **Cloudflare USER-owned API tokens** | **3 tokens + 1 Global API Key** | ❌ **dashboard only — closed by human read** |
 | 6 | Cloudflare ACCOUNT-owned API tokens | 19 | ✅ API |
 
 ### Scope 1 — host credential files (68)
@@ -77,7 +77,45 @@ a permissions gap; with a working `gh` session it returns empty, so the workflow
 referencing `secrets.CLOUDFLARE_API_TOKEN` in that repo are reading **org-level** secrets
 or are broken. Verify before relying on either.
 
-### Scope 5 — CF USER-owned tokens — NOT ENUMERABLE
+### Scope 5 — CF USER-owned tokens — CLOSED 2026-08-07 by dashboard read
+
+**Enumerated by Dara via browser** at `https://dash.cloudflare.com/profile/api-tokens`
+("User API Tokens", under My Profile — a *different page* from Account API Tokens).
+CONFIRMED complete, not sampled: no pagination control present.
+
+| token | permissions | resources | expires |
+|---|---|---|---|
+| `shabrang build token` | Account.Containers, Account.Secrets Store **+24 more** | 1 Account, **All zones** | **never** |
+| `mumcp update` | Account.Workers R2 Storage | 1 Account | 2026-09-30 |
+| `mumcp email` | Account.Email Sending, Zone.DNS | 1 Account, **All zones** | **never** |
+
+Plus two non-token credentials on the same page:
+
+- 🔴 **A legacy GLOBAL API KEY — active.** This is the highest-privilege credential on
+  the account and it appears in *no* token listing. A Global API Key carries **complete,
+  unscopable account control**, cannot be reduced to permission groups, cannot be
+  resource-scoped, and **never expires**. It is strictly more powerful than the
+  ~130-permission `kasra` token that prompted this whole policy. Any credential audit
+  that enumerates tokens alone will never see it.
+- A deprecated Origin CA Key.
+
+`mumega R2 User Token` was deleted during this audit — it was the live production R2
+access key (`58685be8…`), replaced by `r2-sos-rotate-20260807`.
+
+**Why this scope needed a human.** `GET /user/tokens` returns
+`403 Valid user-level authentication not found` for **every** token we hold, including
+the ~130-permission admin token — because those are themselves *account-owned* and the
+endpoint requires *user-level* auth. **No mintable token can close it.** It is a
+structural boundary in Cloudflare's model, not a permissions gap.
+
+It had already hidden a live credential: the production R2 access key matched **none** of
+the 19 account-owned tokens. An audit that stopped at the account listing would have
+declared itself complete while a live R2 key and a Global API Key sat unaccounted.
+
+**Standing rule: a credential audit is not complete without a human reading
+`My Profile → API Tokens` in the dashboard.**
+
+### Scope 5 (historical) — why an agent cannot enumerate this
 
 **This is the important one.**
 
