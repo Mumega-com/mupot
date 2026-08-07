@@ -44,6 +44,16 @@ merged Phase 0 ADR (452f11db); separate-ownership pilot + mints stay Hadi-direct
 W5 debt — 22-BLOCK backlog (#636), organisms redesign (#595), Mirror 501 (#596),
 board hygiene, athena-inbox-watch (#594), mubot token rotation.
 
+**Noticing (landed 2026-08-07):** the loop now has a read-only sensing pass —
+`scripts/gatherer.py` runs inside `operator-loop.sh`, ranks anomalies into one digest
+per cycle, and carries its own dead man's switch. It closes measure (4) above: silent
+failures previously surfaced only when Hadi asked. Notification stays flag-gated and
+off. NOT yet closed: assignment. `scripts/router.py` exists and is dry-run only — every
+worker driver filters `task_list` to its own `assignee_agent_id`, so unassigned tasks
+are invisible to every lane (2,455 operator cycles logged `cycle ok` and moved nothing).
+Wiring the router into the loop is the next W3 step and needs a gate: a wrong assignment
+rule produces confident motion, not an error.
+
 **Standing rules:** branch+PR only · cross-vendor review every merge · server-
 enforced no-self-verdict (delegation by explicit grant) · adversarial gate parallel
 on sensitive surfaces · "restore" commits get diffed against their claim · rigor

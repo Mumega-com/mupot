@@ -2,6 +2,91 @@
 
 ## Unreleased
 
+- **The fleet can NOTICE — the gatherer** (`scripts/gatherer.py`, invoked from
+  `operator-loop.sh`; #752). Every defect found in the days before this landed was found
+  because a human asked a question: dead executor seats, 167 silent HTTP 401s, routines
+  parked in `queued` forever, a merged-and-inert fix. The system had observability
+  without noticing. The gatherer is a read-only pass in the running operator loop that
+  ranks anomalies into one digest per cycle and changes nothing — stale `review`,
+  stalled `in_progress`, presence, stuck routines, and **its own dead man's switch**.
+  Notification is off by default and flag-gated; a watcher that pages on every cycle
+  becomes the next thing people ignore.
+  - It found two things while being built. A repro for #718: Cloudflare's bot rule
+    rejects urllib's default User-Agent with `403 code 1010` *before the request reaches
+    the pot*, so an edge block reads as an auth failure. And a **false P0 in its own
+    first run** — `presence` is an object with a `liveness` field, not a string, so the
+    comparison could never match and it announced "NO agent is live" against a fleet with
+    two agents seen seconds earlier. Caught by verifying the tool's own finding. A
+    gatherer that cries false P0s is worse than none: it trains everyone to ignore the
+    real one.
+  - Its presence finding was later reworded (#762) for the same reason. "The roster is
+    mostly ghosts" was accurate about the table and a trap as a conclusion — `athena`
+    showed `dead 7d` while gating PRs minutes earlier, `tech-grok` showed `never` after
+    shipping a 956-line PR. Presence measures who calls the heartbeat, not who works. A
+    finding that implies the wrong action is worse than no finding.
+
+- **Migration numbering is now a CI ratchet** (`scripts/check-migration-numbering.mjs`;
+  #745, #749). `wrangler d1 migrations apply` runs only files ABOVE the applied head, so
+  a PR adding `0076_*.sql` while main is at `0079` **merges green, deploys green, and its
+  schema never runs** — #594's shape, measured across twelve blocked PRs with slot `0076`
+  alone carrying four claimants. Compared against the merge TARGET, never a number
+  written in the PR.
+  - **Four fail-opens were found in the guard itself, none by its own tests.** `ls-tree`
+    failure returning `[]` read as a legitimate bootstrap and passed a below-head
+    migration (found by the diverse gate). The working-tree oracle disagreed with git, so
+    a committed violation vanished when the file was deleted from disk. A stacked PR
+    passed against its *declared* base while being unrunnable against main — live on
+    #398. And the green message never named the ref it compared, so "OK" read as
+    "verified, full stop". Every one lived in the seam between the pure verdict and what
+    feeds it.
+  - It caught real contamination within a day: a `0076_identity_cleanup.sql` swept into
+    #760 by a `git add -A`, which would have shipped an identity cleanup with no schema.
+
+- **Gate-driver hardening** (`scripts/review-worker.py`; #474). Three bypasses in the
+  driver that gates everything else. Body-text "already reviewed" markers were OR'd into
+  the skip decision — and a PR author controls that text, because their PR title is
+  copied verbatim into the task body, so a forged marker meant **skipped review**. The
+  allow-list matched `(^|/)tests?/`, letting `src/test/pwn.ts` classify NON-SENSITIVE and
+  become auto-merge eligible; unanchored `README`/`LICENSE` did the same for
+  `src/README_evil.ts`. Dedupe state is now the only trusted signal, written 0600 under a
+  0700 dir with an atomic replace so a crash cannot leave a half-parsed JSON that fails
+  open into re-review storms.
+
+- **Inbox delivery consumes only after it delivers** (`scripts/codex-inbox-watch.mjs`;
+  #648). The bus is consume-once, so a message consumed before a failed delivery is gone
+  permanently. The cycle now peeks, delivers, and only then consumes, with a test pinning
+  the refusal (`refuses consume when tmux handoff fails`). `request_id` and `ACK required`
+  are carried through into the delivered text so the ACK protocol is visible to the
+  receiving agent rather than being convention nobody sees. Does not close #733: delivery
+  is honest, the round trip is still unverified.
+
+- **`POST /api/brain/consolidate`** (`src/dashboard/brain-ingest.ts`; #646). Restores the
+  nightly consolidation pipeline endpoint and keeps failures loud — non-2xx passthrough,
+  `503` on missing `MIRROR_URL`, `400` on an unparseable threshold — instead of the
+  success-shaped `501` placeholders it replaced. Org-admin gated.
+
+- **Telegram bridge for `task.review` / `task.blocked`** (`src/telegram-bridge/`; #760).
+  HMAC-SHA256 signed, 10s abort timeout. **Fails closed**: with no `HERMES_WEBHOOK_SECRET`
+  it logs and returns `{delivered:false}` rather than sending an unsigned payload.
+
+- **Task router and GH-mirror sweep, both dry-run by default** (`scripts/router.py`,
+  `scripts/sweep-gh-mirror-tasks.py`; #759). Every worker driver filters `task_list` to
+  its own `assignee_agent_id`, so an unassigned task is invisible to every lane forever —
+  the operator had run 2,455 cycles, each lane truthfully logging `cycle ok`, and moved
+  nothing. The router proposes and prints its reasoning; `--apply` is capped. The dry run
+  paid for itself immediately by revealing it would have routed ~40 GitHub PR-mirror
+  tasks to the build lane.
+  - Neither is wired into the operator loop. Assignment decides what every agent does,
+    and a wrong rule produces confident motion rather than an error.
+
+- **Test suites that ran nowhere** (#649, #761, #745). `node --test fleet-runtime/*.test.mjs`
+  was non-recursive, so six `geo-scanner/` suites — 32 tests — executed nowhere while
+  appearing covered. `**/*.test.mjs` is excluded from vitest as a class, so any unwired
+  `node:test` file is invisible; an invariant now asserts every `tests/*.test.mjs` appears
+  in `ci.yml`, and it caught its own author one day later. Worker briefs put the task id
+  on line 1, guaranteeing a prompt-cache miss before the invariant rules could be reached.
+
+
 - **C10 — the backpressure governor is provenance-aware** (`src/agents/loop.ts`,
   `countOpenBacklog`). Its unassigned branch treated "open + unassigned + in my squad"
   as "backlog this agent's loop produced". An externally-imported task matches that
