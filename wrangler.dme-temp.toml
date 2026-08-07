@@ -1,0 +1,75 @@
+# mupot-dme-temp — DME agency destination pot (Cloudflare).
+# Deploy: CLOUDFLARE_API_TOKEN=<deploy-capable> \
+#         CLOUDFLARE_ACCOUNT_ID=e39eaf94f33092c4efd029d94ae1e9dd \
+#         NODE_OPTIONS=--dns-result-order=ipv4first wrangler deploy -c wrangler.dme-temp.toml
+# Tracked copy: mumega.com/agents/dme/mupot-dme-temp.wrangler.toml (keep in sync).
+# Gate A: upgrade this pot to Projects/project-link (v0.24+) to match mupot.mumega.com.
+name = "mupot-dme-temp"
+main = "src/index.ts"
+compatibility_date = "2026-06-01"
+compatibility_flags = ["nodejs_compat"]
+[build]
+command = "node scripts/generate-build-info.mjs"
+
+[vars]
+TENANT_SLUG = "dme-temp"
+BRAND = "DME AI Visibility — Temporary"
+OAUTH_PROVIDER = "google"
+PUBLIC_ORIGIN = "https://mupot-dme-temp.weathered-scene-2272.workers.dev"
+FLEET_PROJECT = "dme-temp"
+FLEET_OPS_AGENT = "dme-ops"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "mupot-dme-temp"
+database_id = "706ef957-046d-4e65-85be-5cd3cc1c592b"
+migrations_dir = "migrations"
+
+[[vectorize]]
+binding = "VEC"
+index_name = "mupot-dme-temp-vec"
+
+[[queues.producers]]
+binding = "BUS"
+queue = "mupot-dme-temp-events"
+
+[[queues.consumers]]
+queue = "mupot-dme-temp-events"
+max_batch_size = 10
+max_retries = 3
+dead_letter_queue = "mupot-dme-temp-events-dlq"
+
+[[kv_namespaces]]
+binding = "SESSIONS"
+id = "247ebc3e21524294ab215d6d465cf516"
+
+[[kv_namespaces]]
+binding = "OAUTH_KV"
+id = "d20f9ac3673946949ed94b4a1863659d"
+
+[[r2_buckets]]
+binding = "BLOBS"
+bucket_name = "mupot-dme-temp-blobs"
+
+[ai]
+binding = "AI"
+
+[[durable_objects.bindings]]
+name = "AGENT"
+class_name = "AgentDO"
+
+[[durable_objects.bindings]]
+name = "SQUAD"
+class_name = "SquadCoordinatorDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["AgentDO", "SquadCoordinatorDO"]
+
+[[workflows]]
+name = "mupot-dme-temp-task-workflow"
+binding = "TASK_WORKFLOW"
+class_name = "TaskWorkflow"
+
+[triggers]
+crons = ["*/15 * * * *"]
