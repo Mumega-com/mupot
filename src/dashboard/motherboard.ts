@@ -56,6 +56,12 @@ export interface MotherboardViewData {
     agentCount: number
     activeContextTokens: string
     idleRamMb: number
+    tokenMeter: {
+      totalTokens: number
+      promptTokens: number
+      completionTokens: number
+      recordCount: number
+    }
   }
   departments: MotherboardDepartment[]
   deptSquadMap: Record<string, MotherboardSquad[]>
@@ -89,6 +95,7 @@ export async function loadMotherboardData(env: Env, selectedTenant = 'mumega.com
     parent_agent_id?: string
     capabilities?: string
   }> = []
+  let tokenMeter = { totalTokens: 0, promptTokens: 0, completionTokens: 0, recordCount: 0 }
 
   if (env.DB) {
     const deptRes = await env.DB.prepare('SELECT id, slug, name FROM departments').all<{ id: string; slug: string; name: string }>()
@@ -112,6 +119,20 @@ export async function loadMotherboardData(env: Env, selectedTenant = 'mumega.com
       capabilities?: string
     }>()
     dbAgents = agentRes.results ?? []
+
+    try {
+      const usageRes = await env.DB.prepare(
+        'SELECT COALESCE(SUM(prompt_tokens), 0) AS total_prompt, COALESCE(SUM(completion_tokens), 0) AS total_comp, COUNT(*) AS cnt FROM subagent_token_usage'
+      ).first<{ total_prompt: number; total_comp: number; cnt: number }>()
+      if (usageRes) {
+        tokenMeter = {
+          totalTokens: Number(usageRes.total_prompt || 0) + Number(usageRes.total_comp || 0),
+          promptTokens: Number(usageRes.total_prompt || 0),
+          completionTokens: Number(usageRes.total_comp || 0),
+          recordCount: Number(usageRes.cnt || 0),
+        }
+      }
+    } catch {}
   }
 
   const defaultDepartments: MotherboardDepartment[] = [
@@ -357,6 +378,7 @@ export async function loadMotherboardData(env: Env, selectedTenant = 'mumega.com
       agentCount: totalAgents,
       activeContextTokens: '5.0M',
       idleRamMb: 0,
+      tokenMeter,
     },
     departments: defaultDepartments,
     deptSquadMap,
@@ -802,6 +824,13 @@ export function motherboardPageBody(data: MotherboardViewData): Html {
         <div class="mb-stat-card">
           <div class="mb-stat-label">Squad Active Context</div>
           <div class="mb-stat-value" style="color: var(--accent-amber);">${data.stats.activeContextTokens} Tokens</div>
+        </div>
+        <div class="mb-stat-card" style="border-color: rgba(168, 85, 247, 0.3);">
+          <div class="mb-stat-label">Subagent Live Token Meter</div>
+          <div class="mb-stat-value" style="color: var(--accent-purple);">${data.stats.tokenMeter.totalTokens.toLocaleString()} ✦</div>
+          <div style="font-size: 0.72rem; color: var(--text-muted); margin-top: 0.2rem; font-family: 'JetBrains Mono', monospace;">
+            ${data.stats.tokenMeter.promptTokens.toLocaleString()} in / ${data.stats.tokenMeter.completionTokens.toLocaleString()} out (${data.stats.tokenMeter.recordCount} records)
+          </div>
         </div>
       </div>
 
