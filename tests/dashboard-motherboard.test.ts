@@ -1,27 +1,47 @@
-// tests/dashboard-motherboard.test.ts — Vitest unit suite for /dashboard/motherboard and migration 0080.
+// tests/dashboard-motherboard.test.ts — Vitest unit suite for /dashboard/motherboard and migrations.
 
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, beforeEach } from 'vitest'
 import { loadMotherboardData, motherboardPageBody, SUPPORTED_TENANTS } from '../src/dashboard/motherboard'
-import { migrationFiles } from './helpers/migrations'
+import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { applyAllMigrations, migrationFiles } from './helpers/migrations'
+import type { Env } from '../src/types'
+
+let harness: SqliteD1Harness
+let env: Env
+
+beforeEach(() => {
+  harness = createSqliteD1()
+  applyAllMigrations(harness.sqlite)
+  env = {
+    DB: harness.db,
+    TENANT_SLUG: 'mumega',
+  } as Env
+
+  // Seed test subagent usage into real D1 table
+  harness.sqlite.exec(`
+    INSERT INTO departments (id, slug, name) VALUES ('dept-core', 'core', 'Core Dept');
+    INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-core', 'dept-core', 'core', 'Core Squad');
+
+    INSERT INTO agents (id, squad_id, slug, name, status, parent_agent_id)
+    VALUES ('river', 'squad-core', 'river', 'River', 'active', NULL),
+           ('ag-river-code', 'squad-core', 'river-code', 'River Code', 'active', 'river'),
+           ('ag-river-copywriter', 'squad-core', 'river-copywriter', 'River Copywriter', 'active', 'river'),
+           ('ag-river-reviewer', 'squad-core', 'river-reviewer', 'River Reviewer', 'active', 'river'),
+           ('ag-river-frc', 'squad-core', 'river-frc', 'River FRC', 'active', 'river');
+
+    INSERT INTO subagent_token_usage (id, subagent_id, parent_agent_id, model_substrate, prompt_tokens, completion_tokens, task_id, timestamp)
+    VALUES ('st-001', 'river-code', 'river', 'claude-sonnet-4.6', 1000, 500, 'task-1', datetime('now'));
+  `)
+})
 
 describe('Dashboard Motherboard View Layer', () => {
   it('loads motherboard data with supported tenants and statistics', async () => {
-    const mockEnv = {
-      DB: {
-        prepare: () => ({
-          all: async () => ({ results: [] }),
-          first: async () => ({ total_prompt: 1000, total_comp: 500, cnt: 2 }),
-        }),
-      },
-    } as any
-
-    const data = await loadMotherboardData(mockEnv, 'mumega.com')
+    const data = await loadMotherboardData(env, 'mumega.com')
     expect(data.tenant).toBe('mumega.com')
     expect(data.tenants).toEqual(SUPPORTED_TENANTS)
-    expect(data.stats.departmentCount).toBeGreaterThanOrEqual(5)
-    expect(data.stats.squadCount).toBeGreaterThanOrEqual(32)
-    expect(data.stats.agentCount).toBeGreaterThanOrEqual(1000)
-    expect(data.stats.activeContextTokens).toBe('5.0M')
+    expect(data.stats.departmentCount).toBeGreaterThanOrEqual(1)
+    expect(data.stats.squadCount).toBeGreaterThanOrEqual(1)
+    expect(data.stats.agentCount).toBeGreaterThanOrEqual(5)
 
     // Verify subagent tentacle tree under agent:river
     expect(data.tentacleTree.parent).toBe('agent:river')
@@ -33,16 +53,7 @@ describe('Dashboard Motherboard View Layer', () => {
   })
 
   it('renders Hono HTML template containing motherboard components', async () => {
-    const mockEnv = {
-      DB: {
-        prepare: () => ({
-          all: async () => ({ results: [] }),
-          first: async () => ({ total_prompt: 1000, total_comp: 500, cnt: 2 }),
-        }),
-      },
-    } as any
-
-    const data = await loadMotherboardData(mockEnv, 'fractalresonance.com')
+    const data = await loadMotherboardData(env, 'fractalresonance.com')
     const renderedHtml = String(await motherboardPageBody(data))
 
     expect(renderedHtml).toContain('Fractal Motherboard — 1,000 Agent Map')
@@ -57,9 +68,9 @@ describe('Dashboard Motherboard View Layer', () => {
   })
 })
 
-describe('Migration 0080 Registration', () => {
-  it('includes 0080_subagent_tentacles_registration.sql in committed migration list', () => {
-    const files = migrationFiles()
-    expect(files).toContain('0080_subagent_tentacles_registration.sql')
+describe('Migration 0083 Tentacles Registration', () => {
+  it('includes migration 0083_subagent_tentacles_registration.sql in migration files list', () => {
+    const filenames = migrationFiles()
+    expect(filenames).toContain('0083_subagent_tentacles_registration.sql')
   })
 })

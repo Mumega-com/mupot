@@ -173,6 +173,7 @@ const handleSearch = async (c: import('hono').Context<{ Bindings: Env }>) => {
       ok: true,
       query: queryText,
       hits: results,
+      results,
       total: results.length,
       engine: '16d-rrf',
     }, 200)
@@ -275,7 +276,8 @@ mirrorApp.post('/memory/store', async (c) => {
     }, 500)
   }
 
-  return c.json({ ok: true, id, agent_id: agentId, text, concepts: body.concepts }, 201)
+  const entry = { id, agent_id: agentId, text, concepts: body.concepts ?? [] }
+  return c.json({ ok: true, id, agent_id: agentId, text, concepts: body.concepts, entry, engram: entry }, 201)
 })
 
 // POST /memory/search — 16D RRF vector memory search
@@ -363,15 +365,19 @@ mirrorApp.get('/memory/:id', async (c) => {
 
     const concepts = parseConceptsJson(row.concepts)
 
+    const entry = {
+      id: row.id,
+      agent_id: row.agent_id,
+      text: row.text,
+      concepts,
+      created_at: row.created_at,
+    }
+
     return c.json({
       ok: true,
-      engram: {
-        id: row.id,
-        agent_id: row.agent_id,
-        text: row.text,
-        concepts,
-        created_at: row.created_at,
-      },
+      id: row.id,
+      entry,
+      engram: entry,
     }, 200)
   } catch (err) {
     return c.json({

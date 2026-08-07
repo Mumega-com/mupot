@@ -17,9 +17,13 @@ toriversAddonApp.use('*', async (c, next) => {
   }
 
   const expectedSecret = c.env.TORIVERS_SECRET
-  const authHeader = c.req.header('X-Mupot-Addon-Secret') || c.req.header('X-Torivers-Secret')
+  if (!expectedSecret) {
+    return c.json({ ok: false, error: 'Unconfigured: TORIVERS_SECRET missing on environment' }, 503)
+  }
 
-  if (expectedSecret && authHeader !== expectedSecret) {
+  const authHeader = c.req.header('X-Mupot-Addon-Secret') || c.req.header('X-Torivers-Secret') || (c.req.header('authorization')?.startsWith('Bearer ') ? c.req.header('authorization')?.slice(7).trim() : c.req.header('authorization'))
+
+  if (authHeader !== expectedSecret) {
     return c.json({ ok: false, error: 'Unauthorized: invalid addon secret' }, 401)
   }
 
