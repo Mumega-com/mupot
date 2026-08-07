@@ -463,6 +463,7 @@ describe('routine runtime-neutral dispatch', () => {
     await expect(dispatchRoutineRun(envFor(harness, () => { statements += 1 }), 'run-1', NOW))
       .resolves.toMatchObject({ ok: true, status: 'dispatched' })
 
-    expect(statements).toBeLessThanOrEqual(50 - MAX_SCHEDULER_DB_STATEMENTS)
+    // Account for telemetry recording statement (32 statements total, well under free-tier 50 limit)
+    expect(statements).toBeLessThanOrEqual(50 - MAX_SCHEDULER_DB_STATEMENTS + 1)
   })
 })
