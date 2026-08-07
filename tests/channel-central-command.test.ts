@@ -68,7 +68,7 @@ describe('central-command ingress (mumega-com#722)', () => {
     expect(res).toContain('not wired to a squad')
   })
 
-  it('binds -5317747241 -> squad-core via migration 0082 alone and accepts mentions (B3)', async () => {
+  it('binds -5317747241 -> squad-core via channel_bindings seam and accepts mentions (B3)', async () => {
     const { runInbound } = await import('../src/channels/index')
     const res = await runInbound(env, 'telegram', '-5317747241', '765204057', '@prime status check')
     expect(res).toContain('Dispatched @prime via mupot inbox')
