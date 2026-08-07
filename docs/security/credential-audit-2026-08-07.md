@@ -233,11 +233,44 @@ so even a successful prompt-injection attempt (section above) has nothing to exf
 
 ### Indexing / backlink check (informed the keep-public list above)
 
-CONFIRMED via search: `mupot`, `sos`, `inkwell`, `mumega-docs`, and `mumcp-proxy` are
-indexed and cross-linked from real MCP-ecosystem discovery surfaces — Glama, PulseMCP,
-awesome-claude-code, wordpress.org's plugin directory. `mumega.com` itself is indexed.
-This is live backlink/discovery value, not hypothetical — reinforces keeping these public.
+Two passes: an API-based search first, then redone through an actual Google browser
+session (real `site:` queries against live Google results, not an API tool) since that's
+the more reliable signal — it corrected two items from the first pass, both noted below.
 
-CONFIRMED via search: `qbo-mini`, `qbo-torivers`, and all four `archive-*` repos have
-**zero indexing footprint** — nothing links to them, nothing surfaces. Flipping these
-private costs nothing on the SEO/discovery side.
+CONFIRMED via live Google search: `github.com/Mumega-com` and `mumega.com` both rank on
+**page 1** for the branded query "mumega mupot agent os," alongside `github.com/servathadi`
+(personal account, surfacing `inkwell`). `mupot`, `sos`, `inkwell`, and `mumcp-proxy` are
+also indexed and cross-linked from real MCP-ecosystem discovery surfaces — Glama, PulseMCP,
+awesome-claude-code, wordpress.org's plugin directory. This is live backlink/discovery
+value, not hypothetical — reinforces keeping these public. (`mumcp-proxy`'s indexed page is
+thin — just its Pull Requests listing, not real product content — so this doesn't change
+the recommend-private call on it below.)
+
+CORRECTION to the first-pass finding: **`mumega-docs` is NOT indexed** — the earlier API
+search result was a false read. Confirmed via a direct `site:` query: zero results. No SEO
+cost to privatizing it, consistent with the original recommendation.
+
+CONFIRMED via live Google search: `qbo-mini`, `qbo-torivers`, `Digid-MCP`, `mumega-cli`,
+`archive-wp-ai-operator`, and `archive-mumega-cms` have **zero indexing footprint** —
+nothing links to them, nothing surfaces under any query tried. Flipping these private
+costs nothing on the SEO/discovery side.
+
+**One real exception, and it changes the plan for one repo:** `archive-mumega-marketing`
+**is indexed with real content** — Google surfaces `brand/GUIDELINES.md` directly,
+containing live brand messaging copy ("Mumega is the operating system for the Sovereign
+Economy. We build autonomous digital employees that liberate human potential."). This repo
+also has a real revoked secret in its history (telegram_bot_token + google_api_key, from
+the 2026-08-03 cleanup pass in the earlier findings). `archive-ai-team` is also indexed,
+but only a thin issues/views UI page, not real content — no cost to privatizing it as-is.
+
+**Revised step for `archive-mumega-marketing` specifically — migrate before privatizing:**
+1. Copy `brand/GUIDELINES.md` into an actively-maintained public location (e.g. a trimmed
+   public section of `mumega-docs` if that becomes a public docs site, or a dedicated
+   brand-kit repo) so the messaging content re-indexes at a new, stable, actively-maintained
+   URL.
+2. Only then set `archive-mumega-marketing` private — this drops the repo carrying the
+   leaked-secret history while preserving the one thing in it worth keeping public.
+
+Every other item on the recommend-private list (`qbo-mini`, `qbo-torivers`, `mumcp-proxy`,
+`mumega-docs`, `Digid-MCP`, `mumega-cli`, `archive-ai-team`, `archive-wp-ai-operator`,
+`archive-mumega-cms`) is confirmed zero-cost to flip straight to private.
