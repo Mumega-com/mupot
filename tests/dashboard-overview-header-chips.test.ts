@@ -21,6 +21,14 @@ import type { Env } from '../src/types'
 // approvals.ts, and settings.ts already handle gracefully) EXCEPT cc_spend_daily,
 // which is driven by `spendRow` so loadTodaySpendScalar's single scalar read is
 // independently testable per test case.
+//
+// FLIGHT-001 F2 — the dashboard's global capability floor now runs before every
+// route, including GET /. The session below is a plain 'member' role (not
+// owner/admin), so requireAuth's email→member bridge resolves it to a real
+// member with ONE org-level capability grant — otherwise this fixture would be
+// exactly the zero-capability drive-by signup the floor is built to reject, and
+// every request in this file would 403 before ever reaching the header-chip
+// code these tests exist to cover.
 function makeD1(spendRow: { today_usd_micro: number; has_any: number } | null) {
   const stmt = {
     bind: (..._args: unknown[]) => stmt,
@@ -28,7 +36,27 @@ function makeD1(spendRow: { today_usd_micro: number; has_any: number } | null) {
     all: vi.fn(async () => ({ results: [] })),
     run: vi.fn(async () => ({ meta: { changes: 0 } })),
   }
-  return { prepare: vi.fn(() => stmt) }
+  const memberStmt = {
+    bind: (..._args: unknown[]) => memberStmt,
+    first: vi.fn(async () => ({ id: 'member-1' })),
+    all: vi.fn(async () => ({ results: [] })),
+    run: vi.fn(async () => ({ meta: { changes: 0 } })),
+  }
+  const capabilitiesStmt = {
+    bind: (..._args: unknown[]) => capabilitiesStmt,
+    first: vi.fn(async () => null),
+    all: vi.fn(async () => ({
+      results: [{ member_id: 'member-1', scope_type: 'org', scope_id: null, capability: 'member' }],
+    })),
+    run: vi.fn(async () => ({ meta: { changes: 0 } })),
+  }
+  return {
+    prepare: vi.fn((sql: string) => {
+      if (sql.includes('FROM members')) return memberStmt
+      if (sql.includes('FROM capabilities')) return capabilitiesStmt
+      return stmt
+    }),
+  }
 }
 
 function makeEnv(opts: {

@@ -3,11 +3,20 @@
 // All reads are pure D1 queries with no side-effects; every function is
 // independently testable via a D1 mock (same pattern as approvals.ts).
 //
-// loadAllAgents — every agent across all squads, with squad name, department
-//   name, status, role, model, and task counts. Ordered squad → name.
+// loadAllAgents — every agent in squads the CALLER holds a capability on (org
+//   grant → every agent; squad/department grant → that scope only), with squad
+//   name, department name, status, role, model, and task counts. Ordered squad
+//   → name. FLIGHT-001 F2: this used to load every agent in the pot regardless
+//   of caller — the dashboard's global capability floor (src/dashboard/index.ts)
+//   now stops zero-capability callers before they ever reach this function, but
+//   a real (non-admin) member still only holds grants on SOME squads, and used
+//   to see every OTHER squad's roster too. Scoped the same way loadProjectsPage
+//   scopes projects (../projects/readable-squads' resolveGrantedSquadIds).
 // loadSquadOptions — flat squad list for the add-agent <select> picker.
 
-import type { Env } from '../types'
+import type { AuthContext, Env } from '../types'
+import { hasCapability, isOrgAdmin, resolveCapabilities } from '../auth/capability'
+import { resolveGrantedSquadIds } from '../projects/readable-squads'
 
 // ── Row shapes (what D1 returns; narrower than the full Agent type) ───────────
 
@@ -55,8 +64,36 @@ export interface SquadOption {
 // ── loadAllAgents ─────────────────────────────────────────────────────────────
 
 /**
- * Load every agent in the pot, joined to squad + department, with aggregate
- * task counts and the agent's current-work + next-approval task titles.
+ * accessibleSquadIds — the squads THIS caller may see an agent roster for.
+ * `null` = unrestricted (org-wide grant, or the legacy owner/admin org role —
+ * same escape requireCapability/canOnOrg already use). `[]` = no squads (a
+ * member whose only grants don't resolve to any live squad — the roster query
+ * below then correctly returns zero rows instead of falling back to "all").
+ *
+ * A caller reaches loadAllAgents only after the dashboard's global capability
+ * floor (src/dashboard/index.ts) already proved they hold >= 1 capability row,
+ * so the [] case is the narrow edge (grant references a squad/department that
+ * no longer exists), not the common path — but it's still handled fail-closed.
+ */
+async function accessibleSquadIds(env: Env, auth: AuthContext): Promise<string[] | null> {
+  if (isOrgAdmin(auth)) return null
+  if (!auth.memberId) return []
+  const grants = auth.capabilities ?? (await resolveCapabilities(env, auth.memberId))
+  if (hasCapability(grants, 'org', null, 'observer')) return null
+  return resolveGrantedSquadIds(env, grants, 'observer')
+}
+
+/**
+ * Load every agent the CALLER holds a capability on, joined to squad +
+ * department, with aggregate task counts and the agent's current-work +
+ * next-approval task titles.
+ *
+ * FLIGHT-001 F2: this used to load EVERY agent in the pot unconditionally —
+ * "Read (GET /agents) is open to any authenticated pot member" meant a member
+ * with zero (or one narrow squad's worth of) capability rows saw the entire
+ * roster across every other squad too. Now scoped to accessibleSquadIds: an
+ * org-level grant (or legacy owner/admin) sees everything, a squad/department
+ * grant sees only its own squads.
  *
  * task_count        — total tasks ever assigned to the agent
  * open_count        — tasks currently open or in_progress (in-flight)
@@ -66,13 +103,19 @@ export interface SquadOption {
  * Both title fields are derived via correlated subqueries rather than extra
  * JOINs so the GROUP BY stays simple and the whole load remains a single round-trip.
  */
-export async function loadAllAgents(env: Env): Promise<AgentAdminRow[]> {
+export async function loadAllAgents(env: Env, auth: AuthContext): Promise<AgentAdminRow[]> {
   // #15: today's spend is read via a correlated subquery against the agent's
   // current-day execution_meter window. The window key is '<tenant>:<agent>:<date>'
   // (UTC) — we bind the tenant slug + today's UTC date and reconstruct the key in
   // SQL so the read stays a single round-trip with the rest of the agent load.
   const today = utcDateKey()
-  const rows = await env.DB.prepare(
+  const squadIds = await accessibleSquadIds(env, auth)
+  if (squadIds !== null && squadIds.length === 0) return []
+
+  const scopeClause = squadIds === null
+    ? ''
+    : ' AND a.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?3))'
+  const statement = env.DB.prepare(
     `SELECT
        a.id               AS id,
        a.slug             AS slug,
@@ -110,14 +153,17 @@ export async function loadAllAgents(env: Env): Promise<AgentAdminRow[]> {
      JOIN squads s ON s.id = a.squad_id
      LEFT JOIN departments d ON d.id = s.department_id
      LEFT JOIN tasks t ON t.assignee_agent_id = a.id
+     WHERE 1=1${scopeClause}
      GROUP BY a.id, a.slug, a.name, a.role, a.model, a.status, a.created_at,
               a.squad_id, s.name, d.name,
               a.okr, a.kpi_target, a.kpi_progress, a.effort, a.autonomy,
               a.budget_cap_cents, a.budget_window
      ORDER BY s.name ASC, a.name ASC`,
   )
-    .bind(env.TENANT_SLUG, today)
-    .all<AgentAdminRow>()
+  const bound = squadIds === null
+    ? statement.bind(env.TENANT_SLUG, today)
+    : statement.bind(env.TENANT_SLUG, today, JSON.stringify(squadIds))
+  const rows = await bound.all<AgentAdminRow>()
   return rows.results ?? []
 }
 

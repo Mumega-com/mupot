@@ -151,15 +151,27 @@ function dashboardEnv(
   role: 'owner' | 'admin' | 'member',
   addonInstallations: AddonInstallation[] = [],
 ): Env {
+  // FLIGHT-001 F2: the dashboard's global capability floor now runs before every
+  // route. The 'member' fixture must resolve to a REAL member holding >= 1
+  // capability grant, or every request here 403s before ever reaching the
+  // owner/admin-only checks these tests exist to exercise — otherwise this
+  // fixture becomes indistinguishable from the zero-capability drive-by signup
+  // the floor is built to reject.
   const prepare = (query: string) => {
     const statement = {
       bind: (..._args: unknown[]) => statement,
-      all: async () => ({
-        results: query.includes('FROM addon_installations')
-          ? addonInstallations.map(installationRow)
-          : [],
-      }),
-      first: async () => null,
+      all: async () => {
+        if (query.includes('FROM addon_installations')) {
+          return { results: addonInstallations.map(installationRow) }
+        }
+        if (role === 'member' && query.includes('FROM capabilities')) {
+          return {
+            results: [{ member_id: 'member-1', scope_type: 'org', scope_id: null, capability: 'member' }],
+          }
+        }
+        return { results: [] }
+      },
+      first: async () => (role === 'member' && query.includes('FROM members') ? { id: 'member-1' } : null),
     }
     return statement
   }

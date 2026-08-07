@@ -1,4 +1,5 @@
-import type { Env } from '../types'
+import type { Capability, CapabilityGrant, Env } from '../types'
+import { hasCapability } from '../auth/capability'
 
 const READABLE_SQUAD_PAGE_SIZE = 500
 
@@ -35,6 +36,35 @@ export async function resolveReadableSquadIds(
   }
 
   return resolved
+}
+
+// resolveGrantedSquadIds — the squad ids a principal's OWN grants cover at >=
+// `minimum` rank: an org-scope grant covers every squad (resolveAllSquadIds);
+// otherwise every squad/department-scope grant meeting the floor is resolved
+// through the squad table (department grants inherit their squads). Not
+// project-specific despite living alongside the readable-squad pagination
+// helpers — this is the general "which squads can this member act on" primitive,
+// shared by project read-scoping (dashboard/projects.ts) and the agent roster
+// (dashboard/agents-admin.ts, FLIGHT-001 F2) so there is exactly ONE
+// implementation of "resolve my squads from my grants" (see
+// [[feedback_two_tools_two_copies_of_one_predicate]] on why two copies of the
+// same security predicate silently drift).
+export async function resolveGrantedSquadIds(
+  env: Env,
+  grants: CapabilityGrant[],
+  minimum: Capability,
+): Promise<string[]> {
+  if (hasCapability(grants, 'org', null, minimum)) return resolveAllSquadIds(env)
+
+  const squadIds: string[] = []
+  const departmentIds: string[] = []
+  for (const grant of grants) {
+    if (!grant.scope_id || !hasCapability([grant], grant.scope_type, grant.scope_id, minimum)) continue
+    if (grant.scope_type === 'squad') squadIds.push(grant.scope_id)
+    if (grant.scope_type === 'department') departmentIds.push(grant.scope_id)
+  }
+  if (!squadIds.length && !departmentIds.length) return []
+  return resolveReadableSquadIds(env, squadIds, departmentIds)
 }
 
 export async function resolveAllSquadIds(env: Env): Promise<string[]> {
