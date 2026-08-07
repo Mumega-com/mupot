@@ -68,14 +68,52 @@ export async function recordCheckin(
     .run()
 }
 
-// List the flock for this tenant with derived liveness. Tenant-scoped.
-export async function listPresence(env: Env, nowMs: number): Promise<PresenceView[]> {
-  const res = await env.DB.prepare(
+/**
+ * listPresence — the pot's flock/check-in roster.
+ *
+ * `squadIds` (FLIGHT-001 #797): the caller's OWN accessible squad ids
+ * (resolveAccessibleSquadIds). `undefined` (the default, and every
+ * pre-existing caller — radar.ts, registry/presence-routes.ts, mcp/presence.ts,
+ * concierge/service.ts, etc.) is UNRESTRICTED, so those callers' behavior is
+ * unchanged; only the /fleet dashboard route passes this explicitly. `null` is
+ * also unrestricted (an org-scope grant or legacy owner/admin). `[]` scopes to
+ * nothing.
+ *
+ * `presence` rows have no squad column (a member check-in isn't squad-typed),
+ * so scoping is derived two ways, matching either makes a row visible:
+ *   1. the row's BOUND agent (member_tokens.agent_id, when set) belongs to
+ *      one of the caller's squads (agents.squad_id).
+ *   2. the CHECKING-IN member themself holds a capability grant (squad or
+ *      department) that resolves into one of the caller's squads — i.e. a
+ *      squadmate's presence is visible, a stranger's is not.
+ * Filtered at the QUERY (WHERE), never post-fetch in JS.
+ */
+export async function listPresence(env: Env, nowMs: number, squadIds?: string[] | null): Promise<PresenceView[]> {
+  let scopeClause = ''
+  let idsJson: string | null = null
+  if (squadIds !== undefined && squadIds !== null) {
+    if (squadIds.length === 0) return []
+    idsJson = JSON.stringify(squadIds)
+    scopeClause = `
+      AND (
+        (agent_id IS NOT NULL AND agent_id IN (
+          SELECT id FROM agents WHERE squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?2))
+        ))
+        OR member_id IN (
+          SELECT member_id FROM capabilities
+          WHERE (scope_type = 'squad' AND scope_id IN (SELECT CAST(value AS TEXT) FROM json_each(?2)))
+             OR (scope_type = 'department' AND scope_id IN (
+                  SELECT department_id FROM squads WHERE id IN (SELECT CAST(value AS TEXT) FROM json_each(?2))
+                ))
+        )
+      )`
+  }
+  const statement = env.DB.prepare(
     `SELECT member_id, display_name, source, label, agent_id, last_seen_at, first_seen_at
-       FROM presence WHERE tenant = ?1 ORDER BY last_seen_at DESC LIMIT 200`,
+       FROM presence WHERE tenant = ?1${scopeClause} ORDER BY last_seen_at DESC LIMIT 200`,
   )
-    .bind(env.TENANT_SLUG)
-    .all<PresenceRow>()
+  const bound = idsJson === null ? statement.bind(env.TENANT_SLUG) : statement.bind(env.TENANT_SLUG, idsJson)
+  const res = await bound.all<PresenceRow>()
   const rows = (res.results ?? []).map((r) => {
     const ms = sqliteUtcToMs(r.last_seen_at)
     return {

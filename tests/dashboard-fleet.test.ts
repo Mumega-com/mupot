@@ -11,9 +11,23 @@ import {
   wakeFleetAgent,
   requestFleetControl,
 } from '../src/dashboard/fleet'
-import type { Env } from '../src/types'
+import type { AuthContext, Env } from '../src/types'
 
 const NOW = 1_780_000_000_000
+
+// FLIGHT-001 #797: loadFleet now takes `auth` for squad-scoping. These
+// pre-existing tests exercise the roster-shape logic (bus fetch, presence
+// fallback), not the NEW scoping — an org-admin auth resolves unrestricted
+// (resolveAccessibleSquadIds short-circuits on isOrgAdmin before touching D1),
+// so passing it here preserves the exact prior behavior these tests assert.
+// The scoping behavior itself is covered separately in
+// tests/dashboard-fleet-brain-agent-scope.test.ts (real SQL, DENY matrix).
+const ORG_ADMIN_AUTH: AuthContext = {
+  userId: 'u-admin',
+  email: 'admin@pot.test',
+  role: 'owner',
+  tenant: 'mumega',
+}
 
 describe('classify', () => {
   it('null → never', () => expect(classify(null, NOW)).toBe('never'))
@@ -211,7 +225,7 @@ describe('loadFleet — CF-native roster (no SOS HTTP)', () => {
       ],
     })
     const env = { TENANT_SLUG: 'mumega', DB: db } as unknown as Env
-    const rows = await loadFleet(env, Date.parse('2026-07-22T07:01:00Z'))
+    const rows = await loadFleet(env, Date.parse('2026-07-22T07:01:00Z'), ORG_ADMIN_AUTH)
     expect(fetchMock).not.toHaveBeenCalled()
     expect(rows).toHaveLength(1)
     expect(rows[0].agent).toBe('agent-kasra')
@@ -233,7 +247,7 @@ describe('loadFleet — CF-native roster (no SOS HTTP)', () => {
       ],
     })
     const env = { TENANT_SLUG: 'mumega', DB: db } as unknown as Env
-    const rows = await loadFleet(env, Date.parse('2026-07-22T07:01:00Z'))
+    const rows = await loadFleet(env, Date.parse('2026-07-22T07:01:00Z'), ORG_ADMIN_AUTH)
     expect(rows).toHaveLength(1)
     expect(rows[0].agent).toBe('agent-cursor')
   })

@@ -592,13 +592,52 @@ export async function listFleetAgents(env: Env): Promise<FleetAgentRow[]> {
   }))
 }
 
-export async function listFleetAgentRuntimeView(env: Env, nowMs = Date.now()): Promise<FleetAgentRuntimeView[]> {
-  const rows = await env.DB.prepare(
+/**
+ * listFleetAgentRuntimeView — the /fleet host-agent roster.
+ *
+ * `squadIds` (FLIGHT-001 #797): the caller's OWN accessible squad ids
+ * (resolveAccessibleSquadIds), for scoping the roster to a squad-scoped
+ * dashboard viewer. `undefined` (the default, and every pre-existing caller —
+ * radar.ts, im/index.ts, fleet.ts's own callers) is UNRESTRICTED, preserving
+ * every non-dashboard consumer's behavior unchanged; only the /fleet route
+ * passes this explicitly. `null` is also unrestricted (an org-scope grant or
+ * legacy owner/admin, per resolveAccessibleSquadIds' own null contract) — the
+ * two are accepted together so a caller can pass its resolveAccessibleSquadIds
+ * result straight through without an extra branch. `[]` scopes to nothing.
+ *
+ * `fleet_agents.squads` is a SELF-REPORTED, agent-controlled JSON array of
+ * squad SLUGS (validated against AGENT_ID_RE at write time — see
+ * reportFleetAgents above), not squad ids, so scoping requires one extra
+ * lookup to translate the caller's granted squad ids to slugs before the
+ * membership test. Filtered at the QUERY (WHERE via json_each), never
+ * post-fetch in JS — same discipline as loadAllAgents (dashboard/agents-admin.ts).
+ */
+export async function listFleetAgentRuntimeView(
+  env: Env,
+  nowMs = Date.now(),
+  squadIds?: string[] | null,
+): Promise<FleetAgentRuntimeView[]> {
+  let scopeClause = ''
+  let slugsJson: string | null = null
+  if (squadIds !== undefined && squadIds !== null) {
+    if (squadIds.length === 0) return []
+    const slugRows = await env.DB.prepare(
+      `SELECT slug FROM squads WHERE id IN (SELECT CAST(value AS TEXT) FROM json_each(?1))`,
+    )
+      .bind(JSON.stringify(squadIds))
+      .all<{ slug: string }>()
+    const slugs = (slugRows.results ?? []).map((r) => r.slug)
+    if (slugs.length === 0) return []
+    slugsJson = JSON.stringify(slugs)
+    scopeClause =
+      ' AND EXISTS (SELECT 1 FROM json_each(fleet_agents.squads) je WHERE je.value IN (SELECT value FROM json_each(?2)))'
+  }
+  const statement = env.DB.prepare(
     `SELECT agent_id, display, runtime, squads, lifecycle, status, last_reported_at, host
-       FROM fleet_agents WHERE tenant = ?1 ORDER BY agent_id ASC`,
+       FROM fleet_agents WHERE tenant = ?1${scopeClause} ORDER BY agent_id ASC`,
   )
-    .bind(env.TENANT_SLUG)
-    .all<Record<string, unknown>>()
+  const bound = slugsJson === null ? statement.bind(env.TENANT_SLUG) : statement.bind(env.TENANT_SLUG, slugsJson)
+  const rows = await bound.all<Record<string, unknown>>()
 
   const ttlSec = presenceTtlSec(env)
   return (rows.results ?? []).map((r) => {

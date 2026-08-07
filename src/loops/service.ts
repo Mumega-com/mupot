@@ -128,21 +128,52 @@ export async function getLoop(env: Env, id: string): Promise<LoopManifest | null
   return row ? hydrateLoop(row) : null
 }
 
-/** listLoops — tenant-scoped, optionally filtered by status. Invalid rows are skipped. */
-export async function listLoops(env: Env, opts: { status?: LoopStatus } = {}): Promise<LoopManifest[]> {
-  const rows = opts.status
-    ? await env.DB.prepare(
-        `SELECT id, tenant, squad_id, agent_id, status, spec, dry_rounds, created_at, updated_at
-           FROM loops WHERE tenant = ? AND status = ? ORDER BY created_at DESC`,
-      )
-        .bind(env.TENANT_SLUG, opts.status)
-        .all<LoopRow>()
-    : await env.DB.prepare(
-        `SELECT id, tenant, squad_id, agent_id, status, spec, dry_rounds, created_at, updated_at
-           FROM loops WHERE tenant = ? ORDER BY created_at DESC`,
-      )
-        .bind(env.TENANT_SLUG)
-        .all<LoopRow>()
+/**
+ * listLoops — tenant-scoped, optionally filtered by status. Invalid rows are skipped.
+ *
+ * `squadIds` (FLIGHT-001 #797): the caller's OWN accessible squad ids
+ * (resolveAccessibleSquadIds), for scoping the /brain dashboard's loop feed to
+ * a squad-scoped viewer. `undefined` (the default, and every pre-existing
+ * caller — loops/driver.ts's engine loop, loops/routes.ts's admin-gated API,
+ * mcp/loops.ts) is UNRESTRICTED, so those callers are unaffected; only
+ * dashboard/brain.ts passes this explicitly. `null` is also unrestricted (an
+ * org-scope grant or legacy owner/admin). `[]` scopes to nothing. A loop is
+ * "in scope" when its OWN squad_id is one of the caller's squads, or (for an
+ * agent-owned loop, where squad_id is null by the schema's "exactly one of
+ * squad_id/agent_id" invariant — see manifest.ts) the owning agent's squad is.
+ */
+export async function listLoops(
+  env: Env,
+  opts: { status?: LoopStatus; squadIds?: string[] | null } = {},
+): Promise<LoopManifest[]> {
+  // Plain `?` placeholders throughout (matches this file's existing style) —
+  // the bind array is built in the SAME order the clauses below append `?`,
+  // so no numbered-placeholder bookkeeping is needed.
+  let scopeClause = ''
+  let idsJson: string | null = null
+  if (opts.squadIds !== undefined && opts.squadIds !== null) {
+    if (opts.squadIds.length === 0) return []
+    idsJson = JSON.stringify(opts.squadIds)
+    scopeClause = `
+      AND (
+        squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?))
+        OR (agent_id IS NOT NULL AND agent_id IN (
+          SELECT id FROM agents WHERE squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?))
+        ))
+      )`
+  }
+  const statement = env.DB.prepare(
+    opts.status
+      ? `SELECT id, tenant, squad_id, agent_id, status, spec, dry_rounds, created_at, updated_at
+           FROM loops WHERE tenant = ? AND status = ?${scopeClause} ORDER BY created_at DESC`
+      : `SELECT id, tenant, squad_id, agent_id, status, spec, dry_rounds, created_at, updated_at
+           FROM loops WHERE tenant = ?${scopeClause} ORDER BY created_at DESC`,
+  )
+  const bind: unknown[] = [env.TENANT_SLUG]
+  if (opts.status) bind.push(opts.status)
+  // scopeClause references json_each(?) TWICE — bind idsJson twice to match.
+  if (idsJson !== null) bind.push(idsJson, idsJson)
+  const rows = await statement.bind(...bind).all<LoopRow>()
 
   const out: LoopManifest[] = []
   for (const row of rows.results ?? []) {

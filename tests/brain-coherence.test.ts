@@ -60,13 +60,26 @@ describe('(a) parsePhysicsSnapshot', () => {
 
 // ── (b) loadBrainView includes physics ──────────────────────────────────────
 import { loadBrainView } from '../src/dashboard/brain'
-import type { Env } from '../src/types'
+import type { AuthContext, Env } from '../src/types'
 
 const ENV = { TENANT_SLUG: 't' } as unknown as Env
 
+// FLIGHT-001 #797: loadBrainView now takes `auth` (squad-scoping). These
+// tests exercise physics wiring only, not the new scoping — org-admin auth
+// resolves unrestricted via resolveAccessibleSquadIds' isOrgAdmin
+// short-circuit, so it never touches ENV.DB (which this fixture doesn't
+// have). Scoping itself is covered in
+// tests/dashboard-fleet-brain-agent-scope.test.ts (real SQL, DENY matrix).
+const ORG_ADMIN_AUTH: AuthContext = {
+  userId: 'u-admin',
+  email: 'admin@pot.test',
+  role: 'owner',
+  tenant: 't',
+}
+
 describe('(b) loadBrainView includes physics from loadPhysicsFn', () => {
   it('returns the physics snapshot when loadPhysicsFn resolves a snapshot', async () => {
-    const view = await loadBrainView(ENV, {
+    const view = await loadBrainView(ENV, ORG_ADMIN_AUTH, {
       listLoopsFn: async () => [],
       listDecisionsFn: async () => [],
       loadPhysicsFn: async () => VALID_SNAPSHOT,
@@ -77,7 +90,7 @@ describe('(b) loadBrainView includes physics from loadPhysicsFn', () => {
   })
 
   it('returns null physics when loadPhysicsFn resolves null', async () => {
-    const view = await loadBrainView(ENV, {
+    const view = await loadBrainView(ENV, ORG_ADMIN_AUTH, {
       listLoopsFn: async () => [],
       listDecisionsFn: async () => [],
       loadPhysicsFn: async () => null,
@@ -86,7 +99,7 @@ describe('(b) loadBrainView includes physics from loadPhysicsFn', () => {
   })
 
   it('returns null physics when loadPhysicsFn throws (fail-safe)', async () => {
-    const view = await loadBrainView(ENV, {
+    const view = await loadBrainView(ENV, ORG_ADMIN_AUTH, {
       listLoopsFn: async () => [],
       listDecisionsFn: async () => [],
       loadPhysicsFn: async () => { throw new Error('kv_down') },
