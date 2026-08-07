@@ -153,6 +153,10 @@ export interface Env {
   GITHUB_WEBHOOK_SECRET?: string // inbound: verifies GitHub webhook (x-hub-signature-256)
   GITHUB_INBOUND_SQUAD_ID?: string // optional: squad that GitHub work-units land on
   AI_GATEWAY_TOKEN?: string
+  // Telegram bridge: Mupot bus consumer notifies Hadi of task events
+  // via HMAC-signed POST to Hermes webhook deliver_only route.
+  HERMES_WEBHOOK_SECRET?: string
+  TELEGRAM_BRIDGE_URL?: string
   IM_WEBHOOK_SECRET?: string // shared secret for the IM webhook (Telegram secret_token)
   HERMES_RELAY_SECRET?: string // shared secret for the Hermes → mupot channel relay
   FLEET_PANEL_SK?: string      // Ed25519 PRIVATE OKP JWK — signs fleet control-requests. `wrangler secret put FLEET_PANEL_SK`. Absent ⇒ /api/fleet/control 503 (fail-closed).
