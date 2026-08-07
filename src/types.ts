@@ -59,10 +59,6 @@ export interface Env {
   // startTaskPipeline helper which handles the absent-binding case gracefully.
   TASK_WORKFLOW?: WorkflowBinding<import('./workflows/pipeline').TaskPipelineParams>
   // vars
-  // Addon authorization secrets
-  INKWELL_SECRET?: string
-  MIRROR_SECRET?: string
-  SOS_SECRET?: string
   TENANT_SLUG: string
   // The tenant slug that owns THIS deployment's Worker-level operator secrets/config (as
   // opposed to any per-tenant vault connector). Set once, in wrangler.toml [vars], to the
@@ -169,6 +165,7 @@ export interface Env {
   SOS_SECRET?: string // shared secret for SOS event bus bridge sub-app
   SOS_TOKEN?: string // token for SOS event bus bridge
   INKWELL_SECRET?: string // shared secret for Inkwell publishing sub-app
+  TORIVERS_SECRET?: string // shared secret for ToRivers v2 deterministic automation sub-app
   INKWELL_TOKEN?: string // token for Inkwell publishing
   INKWELL_API_TOKEN?: string // API token for Inkwell publishing
   AI_GATEWAY_TOKEN?: string
