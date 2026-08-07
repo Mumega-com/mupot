@@ -6,7 +6,7 @@
 // unconfigured bridge makes NO network call rather than a doomed one.
 
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { notifyHadi, formatTelegram, TELEGRAM_MAX_CHARS } from '../src/telegram-bridge/bus_notify'
+import { notifyHadi, formatTelegram, TELEGRAM_MAX_CHARS, redactBotToken } from '../src/telegram-bridge/bus_notify'
 import type { Env } from '../src/types'
 
 function stubEnv(over: Record<string, unknown> = {}): Env {
@@ -141,5 +141,21 @@ describe('formatTelegram', () => {
     const text = formatTelegram({ type: 'task.blocked', title: 'Needs input' })
     expect(text).toContain('Needs input')
     expect(text).not.toContain('(truncated)')
+  })
+})
+
+// Athena gate WARN on #767: the token lives in the request URL, so a REAL fetch
+// failure can embed it in the error string. Not interpolating it ourselves is not
+// enough — the runtime does it for us.
+describe('token redaction in error paths', () => {
+  it('strips a bot token from a realistic fetch error', () => {
+    const raw = 'TypeError: failed to fetch https://api.telegram.org/bot8548453459:AAH_fake-Token_value123/sendMessage'
+    const out = redactBotToken(raw)
+    expect(out).not.toContain('AAH_fake-Token_value123')
+    expect(out).not.toContain('8548453459:')
+    expect(out).toContain('bot<REDACTED>')
+  })
+  it('leaves unrelated text intact', () => {
+    expect(redactBotToken('network down')).toBe('network down')
   })
 })

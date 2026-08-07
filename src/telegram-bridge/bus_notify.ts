@@ -83,6 +83,18 @@ export function formatTelegram(n: TaskNotification): string {
     : text
 }
 
+/**
+ * Strip a bot token from any string before it reaches a log.
+ *
+ * The token is in the request URL, so a real fetch failure can embed it in the
+ * error message — "failed to fetch https://api.telegram.org/bot<TOKEN>/sendMessage".
+ * Never interpolating it ourselves is not sufficient; the runtime does it for us.
+ * Flagged by Athena's gate on #767.
+ */
+export function redactBotToken(s: string): string {
+  return s.replace(/bot\d{6,}:[A-Za-z0-9_-]+/g, 'bot<REDACTED>')
+}
+
 async function postJson(url: string, body: string, headers: Record<string, string>) {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS)
@@ -117,7 +129,7 @@ async function sendDirect(
       resp = await postJson(url, JSON.stringify(attempt), { 'Content-Type': 'application/json' })
     } catch (err) {
       // Never interpolate the token into a log line — the URL contains it.
-      console.error('telegram-bridge: send failed', String(err).slice(0, 200))
+      console.error('telegram-bridge: send failed', redactBotToken(String(err)).slice(0, 200))
       return { delivered: false }
     }
     if (resp.ok) {
@@ -172,7 +184,7 @@ export async function notifyHadi(
       console.log('telegram-bridge: delivered via webhook', notification.type, notification.task_id)
       return { delivered: true }
     } catch (err) {
-      console.error('telegram-bridge: webhook fetch failed', String(err).slice(0, 200))
+      console.error('telegram-bridge: webhook fetch failed', redactBotToken(String(err)).slice(0, 200))
       return { delivered: false }
     }
   }
