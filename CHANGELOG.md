@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- **Build-Time Release Identity & Version Truth** (`src/health.ts`, `scripts/generate-build-info.mjs`; #443, #571).
+  - `/health` and deployment consoles now stamp exact commit identity (`commit`), build timestamp (`built_at`), and working-tree cleanliness (`clean`) by construction via `src/build-info.ts` fallback when runtime environment variables are omitted.
+  - Eliminated decorative `clean: false` state; `clean` strictly reflects build-time git status and main-branch ancestry verification.
+
+- **Sovereign Addons & Memory Engine (v0.28.0)** (`src/addons/`, `src/telemetry/`, `src/dashboard/motherboard.ts`; #780, #796, #797, #798).
+  - Four modular Hono addon sub-apps (`sos`, `mirror`, `inkwell`, `torivers`) with fail-closed HTTP 503 `unconfigured_secret` and 401 authentication handlers.
+  - D1 token usage telemetry logging (`subagent_token_usage` table) integrated directly into `dispatchRun`.
+  - Fractal Motherboard visual map (`/dashboard/motherboard`) with RBAC squad scoping (`resolveGrantedSquadIds`).
+  - D1 Migrations `0083_subagent_tentacles_registration.sql`, `0084_subagent_token_telemetry.sql`, and `0085_identity_cleanup.sql`.
+
+- **Telegram Central Command Ingress & Native Webhook** (`src/channels/`, `src/telegram-bridge/`; #789, #769, #760, #767, #779).
+  - Fail-closed native Telegram webhook handler (`/channels/telegram/webhook`) gated by immutable sender authority (Hadi ID `765204057`), rate walls, and Bot API delivery.
+  - Cleaned up duplicate legacy webhook ingress.
+
+- **Master Constitution `MU.100.001` v6 Ratification** (`docs/constitution/`; #788).
+  - Ratified governance contract signed by River, Kasra, and Athena, establishing Asha identity, UNPROVEN sharpening, and council workflow state machines.
+
 - **The fleet can NOTICE — the gatherer** (`scripts/gatherer.py`, invoked from
   `operator-loop.sh`; #752). Every defect found in the days before this landed was found
   because a human asked a question: dead executor seats, 167 silent HTTP 401s, routines
