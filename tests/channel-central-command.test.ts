@@ -119,11 +119,11 @@ describe('central-command ingress (mumega-com#722)', () => {
     expect(msg?.body).toContain('[sos-bus]')
   })
 
-  it('B2: refuses mentions exceeding 8192 byte body length limit', async () => {
+  it('B2: refuses mentions exceeding MAX_BODY_CHARS via sendAgentMessage primitive', async () => {
     const { runInbound } = await import('../src/channels/index')
     const longBody = '@prime ' + 'x'.repeat(8200)
     const res = await runInbound(env, 'telegram', '-5317747241', '765204057', longBody)
-    expect(res).toContain('refused: mention body exceeds 8192 byte limit')
+    expect(res).toContain('refused: invalid_body')
   })
 
   it('unknown mention refuses: "no such active agent"', async () => {

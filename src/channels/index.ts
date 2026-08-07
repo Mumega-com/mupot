@@ -36,6 +36,7 @@ import type {
 import { resolveCapabilities, hasCapability } from '../auth/capability'
 import { createBus } from '../bus'
 import { getAdapter } from './registry'
+import { sendAgentMessage } from '../agents/messages'
 import { createTask } from '../tasks/service'
 
 type AppEnv = { Bindings: Env }
@@ -473,21 +474,24 @@ async function potSend(
   memberId: string,
   isDirective: boolean,
 ): Promise<string> {
-  // B2 Fix: Enforce body length limit fence (8192 bytes)
-  const MAX_BODY_LEN = 8192
-  if (body.length > MAX_BODY_LEN) {
-    return `refused: mention body exceeds ${MAX_BODY_LEN} byte limit`
+  const directiveNotice = isDirective ? '' : ' [UNTRUSTED-INGRESS]'
+  const res = await sendAgentMessage(
+    env,
+    {
+      fromAgent: 'central-command',
+      fromMember: memberId,
+      toAgent,
+      body,
+      kind: 'message',
+    },
+    { system: true, reason: 'central-command-mention-ingress' },
+  )
+
+  if (!res.ok) {
+    return `refused: ${res.reason}${res.detail ? ` (${res.detail})` : ''}`
   }
 
-  const id = crypto.randomUUID()
-  const tenant = env.TENANT_SLUG ?? 'mumega'
-  await env.DB.prepare(
-    `INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, created_at)
-     VALUES (?1, ?2, ?3, ?4, ?5, 'message', ?6, datetime('now'))`
-  ).bind(id, tenant, toAgent, 'central-command', memberId, body).run()
-
-  const directiveNotice = isDirective ? '' : ' [UNTRUSTED-INGRESS]'
-  return `Dispatched @${toAgent} via mupot inbox (id: ${id.slice(0, 8)})${directiveNotice}`
+  return `Dispatched @${toAgent} via mupot inbox (id: ${res.id.slice(0, 8)})${directiveNotice}`
 }
 
 async function sosBusSend(
