@@ -134,17 +134,35 @@ def call(tool: str, args: dict) -> dict:
     return payload.get("result") or {}
 
 
+# A GitHub webhook mirror is a NOTIFICATION, not work. Measured on the live board:
+# 76 of 89 unassigned tasks were `[GH <repo>] PR #<n> <action>: …` rows, and the first
+# dry run would have routed ~40 of them to the build lane.
+#
+# I reported that observation in this PR as evidence the dry run works — and did not
+# guard it. Athena's gate caught that: observing a misroute is not preventing one, and
+# --apply would still have done it. The guard belongs in the code, not in the commentary.
+GH_MIRROR_RE = re.compile(r"^\[GH [^\]]+\] PR #\d+ ")
+
+
 def route(task: dict) -> tuple[str | None, str]:
     """(lane_name | None, reason). None means a human decides — say why."""
-    text = f"{task.get('title','')} {task.get('body','')}".lower()
+    title = task.get("title", "")
+    if GH_MIRROR_RE.match(title):
+        return None, "GitHub PR mirror — a notification, not work; never route these to a lane"
+    text = f"{title} {task.get('body','')}".lower()
 
     for w in HUMAN_ONLY:
         if w in text:
             return None, f"human-only signal {w!r} — decisions, credentials and deploys are not delegated"
 
+    # WORD BOUNDARIES, not substrings. `k in text` matched 'ci' inside 'circuit',
+    # 'fix' inside 'Prefix', and 'page' inside unrelated prose — every one of those
+    # silently votes for a lane. A substring match is a confident wrong answer, which
+    # is the most expensive kind here because the task then gets picked up and worked.
     hits: list[tuple[int, str, list[str]]] = []
     for name, lane in LANES.items():
-        matched = [k for k in lane["keywords"] if k in text]
+        matched = [k for k in lane["keywords"]
+                   if re.search(rf"(?<![a-z0-9]){re.escape(k)}(?![a-z0-9])", text)]
         if matched:
             hits.append((len(matched), name, matched))
 

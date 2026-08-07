@@ -119,8 +119,15 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=300)
     args = ap.parse_args()
 
-    tasks = (call("task_list", {"squad_id": SQUAD, "status": "open", "limit": args.limit})
-             .get("tasks") or [])
+    # PARITY WITH THE PRODUCTION CLOSER. closeGitHubPrMirrorTasks reaps
+    # `status IN ('open','in_progress')` (tasks/service.ts:638). Listing only `open`
+    # here left in_progress mirrors behind — a backfill that does less than the thing
+    # it is backfilling, which is the worst kind of half-fix because the gap is
+    # invisible in the output. Found by Athena's gate on this PR.
+    tasks = []
+    for st in ("open", "in_progress"):
+        tasks.extend(call("task_list", {"squad_id": SQUAD, "status": st,
+                                        "limit": args.limit}).get("tasks") or [])
     mirrors = []
     for t in tasks:
         m = TITLE_RE.match(t.get("title", ""))
@@ -167,7 +174,10 @@ def main() -> int:
         tid = t["id"]
         try:
             # open -> in_progress -> done: the transition matrix refuses open -> done.
-            call("task_update", {"task_id": tid, "status": "in_progress"})
+            # A task already in_progress must NOT be re-sent there — in_progress ->
+            # in_progress is not a legal edge and would fail the whole close.
+            if t.get("status") != "in_progress":
+                call("task_update", {"task_id": tid, "status": "in_progress"})
             call("task_update", {"task_id": tid, "status": "done"})
             ok += 1
         except RuntimeError as e:
