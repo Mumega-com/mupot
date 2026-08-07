@@ -106,7 +106,8 @@ describe('Telegram Webhook Ingress Subsystem', () => {
 
     it('rejects unauthenticated secret token header with 401', async () => {
       const mockEnv = {
-        TELEGRAM_WEBHOOK_SECRET: 'expected-secret-key'
+        TELEGRAM_WEBHOOK_SECRET: 'expected-secret-key',
+        DB: idDb()
       } as unknown as Env
 
       const res = await telegramIngressApp.fetch(
@@ -130,7 +131,8 @@ describe('Telegram Webhook Ingress Subsystem', () => {
       const mockBusSend = vi.fn().mockResolvedValue(undefined)
       const mockEnv = {
         TELEGRAM_WEBHOOK_SECRET: 'correct-secret',
-        TELEGRAM_ALLOWED_SENDERS: '765204057',
+        DB: idDb(),
+        DB: idDb(),
         TELEGRAM_BOT_USERNAME: 'River_mumega_bot',
         TENANT_SLUG: 'mumega',
         BUS: { send: mockBusSend }
@@ -170,10 +172,10 @@ describe('Telegram Webhook Ingress Subsystem', () => {
       const emittedEvent: BusEvent = mockBusSend.mock.calls[0][0]
       expect(emittedEvent.type).toBe('agent.wake')
       expect(emittedEvent.tenant).toBe('mumega')
-      // Actor is the NUMERIC id, not the username. Usernames are user-mutable and can be
-      // released and re-registered — a display-name actor is a spoofable identity on an
-      // audited event.
-      expect(emittedEvent.actor).toEqual({ kind: 'member', id: 'telegram:765204057' })
+      // Actor is the resolved MEMBER (#775), not a platform id and not a username.
+      // This is what carries the CALLER's authority: downstream authorisation reads a
+      // real member id and applies that member's grants.
+      expect(emittedEvent.actor).toEqual({ kind: 'member', id: 'mem-hadi' })
       expect((emittedEvent.payload as any).chat_id).toBe(765204057)
       expect((emittedEvent.payload as any).text).toBe('@River_mumega_bot execute flight build')
     })
@@ -182,7 +184,8 @@ describe('Telegram Webhook Ingress Subsystem', () => {
       const mockBusSend = vi.fn().mockRejectedValue(new Error('Queue connection failure'))
       const mockEnv = {
         TELEGRAM_WEBHOOK_SECRET: 'correct-secret',
-        TELEGRAM_ALLOWED_SENDERS: '765204057',
+        DB: idDb(),
+        DB: idDb(),
         TELEGRAM_BOT_USERNAME: 'River_mumega_bot',
         TENANT_SLUG: 'mumega',
         BUS: { send: mockBusSend }
@@ -227,6 +230,23 @@ describe('Telegram Webhook Ingress Subsystem', () => {
 // ---------------------------------------------------------------------------
 import { isSenderAllowed, MAX_TEXT_CHARS } from '../src/telegram-bridge/ingress'
 
+// Channel-identity stub (#775). The allowlist these tests were written against is
+// retired; authorisation now resolves the caller to a member via D1. A missing DB
+// therefore yields 503 (unavailable) — correct fail-closed behaviour, which is why
+// every env below must supply one.
+function idDb(bound: Record<string, string> = { '765204057': 'mem-hadi' }) {
+  return {
+    prepare: () => ({
+      bind: (_t: unknown, _p: unknown, id: unknown) => ({
+        first: async () => bound[String(id)]
+          ? { member_id: bound[String(id)], bound_method: 'admin', revoked_at: null }
+          : null,
+      }),
+    }),
+  }
+}
+
+
 function busSpy() {
   const emitted: unknown[] = []
   return { emitted, BUS: { send: async (e: unknown) => { emitted.push(e) } } }
@@ -254,7 +274,7 @@ describe('ingress security layer', () => {
   it('rejects an unknown sender with 403 and NO bus publish', async () => {
     const { emitted, BUS } = busSpy()
     const res = await telegramIngressApp.fetch(post(update(999), 's'),
-      { TELEGRAM_WEBHOOK_SECRET: 's', TELEGRAM_ALLOWED_SENDERS: '765204057', BUS } as never)
+      { TELEGRAM_WEBHOOK_SECRET: 's', DB: idDb(), BUS } as never)
     expect(res.status).toBe(403)
     expect(emitted).toHaveLength(0)
   })
@@ -262,7 +282,7 @@ describe('ingress security layer', () => {
   it('returns 503 and does NOT publish when the secret is unset', async () => {
     const { emitted, BUS } = busSpy()
     const res = await telegramIngressApp.fetch(post(update(765204057)),
-      { TELEGRAM_ALLOWED_SENDERS: '765204057', BUS } as never)
+      { DB: idDb(), BUS } as never)
     expect(res.status).toBe(503)
     expect(emitted).toHaveLength(0)
   })
@@ -273,7 +293,7 @@ describe('ingress security layer', () => {
     const u = update(999, '@River_mumega_bot please deploy')
     u.message.chat = { id: -100, type: 'supergroup' } as never
     const res = await telegramIngressApp.fetch(post(u, 's'),
-      { TELEGRAM_WEBHOOK_SECRET: 's', TELEGRAM_ALLOWED_SENDERS: '765204057', BUS } as never)
+      { TELEGRAM_WEBHOOK_SECRET: 's', DB: idDb(), BUS } as never)
     expect(res.status).toBe(403)
     expect(emitted).toHaveLength(0)
   })
@@ -281,12 +301,12 @@ describe('ingress security layer', () => {
   it('caps attacker-controlled text and uses the NUMERIC id as actor', async () => {
     const { emitted, BUS } = busSpy()
     const res = await telegramIngressApp.fetch(post(update(765204057, 'x'.repeat(20_000)), 's'),
-      { TELEGRAM_WEBHOOK_SECRET: 's', TELEGRAM_ALLOWED_SENDERS: '765204057', BUS } as never)
+      { TELEGRAM_WEBHOOK_SECRET: 's', DB: idDb(), BUS } as never)
     expect(res.status).toBe(200)
     expect(emitted).toHaveLength(1)
     const ev = emitted[0] as { actor: { id: string }, payload: { text: string } }
     expect(ev.payload.text.length).toBeLessThanOrEqual(MAX_TEXT_CHARS)
-    expect(ev.actor.id).toBe('telegram:765204057')  // numeric, not a spoofable username
+    expect(ev.actor.id).toBe('mem-hadi')  // the resolved member, not a platform id (#775)
   })
 })
 
