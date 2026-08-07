@@ -295,6 +295,15 @@ human decisions in one queue without turning Mupot into an agent harness.
 - Local lifecycle evidence that exercises a complete Routine through Task, Flight,
   external runtime dispatch, approval, replay, cancellation, and receipt paths (#579).
 
+### Fixed
+
+- **v0.25 production migrations made D1-safe.** Activating v0.25 against live D1
+  applied `0068` and then failed and rolled back on `0069` (nested-Project foreign
+  key; D1 keeps foreign keys enforced through a migration's transaction regardless of
+  `PRAGMA foreign_keys = off`) — no v0.25 Worker deployed, production stayed on
+  v0.24.0. `0069` and `0071` now detach/restore self-referencing and orphaned rows
+  explicitly instead of relying on the pragma (#594, preceded by #591).
+
 ### Changed
 
 - Routine scheduling uses isolated one-minute and staggered maintenance cron triggers
