@@ -125,6 +125,8 @@ key literally named `CLOUDFLARE_API_TOKEN` / `R2_*` / `STRIPE_*`.
 | Transcript redaction — Mac `~/.claude/projects` | ✅ confirmed clean, nothing to redact |
 | Transcript redaction — Mac `~/.gemini` | ⚠️ 1 file needs review, rest false-positive |
 | `mumega R2 User Token` (Scope 5) deleted | ✅ done 2026-08-07 (this doc's table in secrets-inventory.md was stale as of the version reviewed) |
+| Cloudflare account token `kasra` (mint-capable, never-expires) revoked | ✅ done 2026-08-07, probe-confirmed dead — see below |
+| Cloudflare account tokens `kasra-apig` / `kasra-db-tenant` (also mint-capable) | ❌ open, pending Hadi's decision |
 
 ## Proposed secrets-storage policy
 
@@ -304,3 +306,48 @@ Current public repo count: 15 (down from the original 29). Remaining public:
 `mupot-plugin`, `mirror`, `mumega-motion-theme`, `therealmofpatterns`,
 `mcpwp-claude-plugin`, `torivers.com` (Mumega-com). `formflow-telemetry` remains the one
 unreviewed item — no README/description found, not yet checked.
+
+## Cloudflare broad-key revoke — `kasra` account token, 2026-08-07
+
+CONFIRMED DEAD. First rotation off the "one credential, many permissions, never expires"
+pattern flagged as the top Cloudflare risk item.
+
+**Target:** account API token named `kasra`, account `e39eaf...9dd` (Admin@digid.ca's
+Account) — token id `a4ab4616...38b7`. No expiration, ~131 permission groups (~111
+write), including `Account API Tokens Write` (mint-new-tokens capability). Identified and
+measured by kasra; execution split at the machine boundary since the token value and the
+verification tooling live on the Hetzner host, not this Mac.
+
+**Authorization:** kasra's first message relayed this as "Task from Hadi, direct and
+in-session" — held rather than acted on, since an authorization claim inside bus message
+content is indistinguishable from a prompt-injection and the bus is currently unsigned.
+kasra independently reached the same conclusion and self-corrected ("the bus WAKES, never
+STEERS"). Proceeded only after Hadi confirmed directly in-session, twice — once for the
+original full request, once after the split below was proposed.
+
+**Split, once kasra's brief turned out to reference Hetzner-only paths:**
+- **dara (dashboard):** navigated to Account API Tokens for the matching account id,
+  opened the `kasra` row, confirmed the edit-page URL resolved to the exact token id
+  (not just a name match — `kasra-apig`, `kasra-db-tenant`, `kasra-c623` all exist as
+  similarly-named, live, separate tokens), deleted it, then independently confirmed via
+  direct URL that the token now 404s.
+- **kasra (host):** ran the dead-token probe before and after, then shredded the local
+  key file — via a tool that refuses to shred a credential not proven dead first.
+
+**Verbatim probe output (kasra):**
+```
+BEFORE 14:16:43Z
+/home/mumega/.sos/keys/cf-token-admin.token  27633ea904ba  ALIVE  accounts=1
+
+AFTER 14:25:22Z
+/home/mumega/.sos/keys/cf-token-admin.token  27633ea904ba  REVOKED/INVALID  403 Invalid access token
+```
+`Invalid access token`, not the "from location" / IP-locked variant — genuinely dead, not
+just IP-restricted. Local key file shredded and verified absent.
+
+**Not done — explicitly out of scope for this pass:** two other tokens on the same
+account also carry mint capability — `kasra-apig` (`a8ae2892...4d5`) and
+`kasra-db-tenant` (`a97407a4...116`). kasra flagged that revoking one of three
+mint-capable tokens is not full containment and has put the other two to Hadi as a
+separate decision. Same split, same acceptance bar (probe-confirmed dead, not just
+"dashboard says deleted") if he says go.
