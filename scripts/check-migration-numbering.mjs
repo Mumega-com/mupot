@@ -47,6 +47,9 @@ import { dirname, join } from 'node:path'
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 const DIR = 'migrations'
+// The chain that will actually be applied. Every added migration must clear THIS head,
+// whatever branch the PR happens to declare as its base.
+const MAIN_REF = 'origin/main'
 
 // A migration filename is EXACTLY four digits, an underscore, a name, `.sql`. Anchored at
 // both ends: a loose /^(\d+)/ would accept `007_x.sql` and `00760_x.sql` and silently
@@ -68,14 +71,28 @@ export function migrationNumber(filename) {
  *
  * @param {string[]|null} targetFiles  migration filenames on the merge target, or null when
  *                                     the target could not be read at all
- * @param {string[]} localFiles        migration filenames in the working tree
+ * @param {string[]|null} localFiles   migration filenames in the working tree, or null when
+ *                                     the working tree's migrations/ could not be listed
  * @returns {{ok: boolean, reason: string, detail?: object}}
  */
 export function evaluate(targetFiles, localFiles) {
-  // CANNOT VERIFY IS NOT PASS. A shallow clone, a missing base ref, or a detached worktree
-  // makes the target unreadable — and a guard that shrugs and exits 0 there is worse than
-  // no guard, because the green check reads as "ordering verified". This is the single most
-  // important line in the file; the schema ratchet learned it the same way.
+  // CANNOT VERIFY IS NOT PASS — and it has TWO sides. The rule is not "the target must be
+  // readable", it is "every input this verdict rests on must be readable". Both sides get the
+  // same answer, because a guard that shrugs and exits 0 is worse than absent: the green tick
+  // reads as "ordering verified".
+  //
+  // This file shipped with only the target side (c43b35b) and was still fail-open on the
+  // local side for four hours. Both bugs are one sentence written down once and then applied
+  // to one of its two arguments. If a third input is ever added, it gets a null case too.
+
+  // LOCAL side. Checked first because it needs no target to be decidable. Treating an
+  // unlistable migrations/ as "this PR added nothing" is the same fail-open as the target
+  // side, reached from the opposite direction — a sparse checkout omitting the directory
+  // disables the guard and the check reports success.
+  if (localFiles === null) {
+    return { ok: false, reason: 'local_unreadable' }
+  }
+  // TARGET side. A shallow clone, a missing base ref, or an unreadable tree.
   if (targetFiles === null) {
     return { ok: false, reason: 'target_unreadable' }
   }
@@ -145,7 +162,7 @@ export function evaluate(targetFiles, localFiles) {
  */
 function mergeTargetRef() {
   const base = process.env.BASE_REF
-  if (!base) return { ref: 'origin/main' }
+  if (!base) return { ref: MAIN_REF }
   if (!/^[A-Za-z0-9._\/-]{1,200}$/.test(base) || base.includes('..')) {
     return { ref: null, bad: base }
   }
@@ -188,12 +205,61 @@ function targetMigrations(ref) {
   }
 }
 
+// The LOCAL side of the same cannot-read-is-not-pass rule. Returns null when the working
+// tree's migrations/ cannot be listed at all, so `evaluate` can refuse instead of reading
+// the absence as "this PR added nothing".
+//
+// Found by Prime's bypass review AFTER the target-side fix shipped (c43b35b) — the mirror
+// image of that bug, in the mirror-image function, which neither Athena's bypass sweep nor
+// 21 self-tests caught because everyone (me included) was looking at the target side.
+// Measured on merged main: `mv migrations /tmp` then run the guard → exit 0,
+// `no_migrations_added`. A sparse checkout that omits migrations/ disables the guard
+// silently, and the check that is supposed to notice reports success.
 function localMigrations() {
-  try {
-    return readdirSync(join(ROOT, DIR)).filter((name) => name.endsWith('.sql'))
-  } catch {
-    return []
-  }
+  // TWO ORACLES, UNIONED — and the union IS the fix, not belt-and-braces.
+  //
+  // This read used to be readdirSync alone, i.e. the WORKING TREE, while the target side reads
+  // GIT. Two different oracles for the two halves of one comparison. Athena's re-gate named the
+  // asymmetry; measured immediately after: commit a below-head 0076, delete only that file from
+  // the working tree, and the guard prints `no_migrations_added` and exits 0 — while the commit
+  // under review contains it.
+  //
+  // The earlier `local_unreadable` fix only caught a TOTAL readdir failure. A PARTIAL working
+  // tree returns a short list with no error at all, so the guard under-reports what the PR adds
+  // and calls the shortfall "added nothing". Fourth defect in this file, same seam every time:
+  // the verdict resting on an input read from the wrong place.
+  //
+  // HEAD is what CI actually judges, so it is authoritative. The working tree is unioned in so a
+  // developer running this before committing is still warned about a file git has not seen yet.
+  // The union fails SAFE — it can only add files to the set being checked, never remove them.
+  // Null only when BOTH oracles fail.
+  const fromGit = (() => {
+    try {
+      return execFileSync('git', ['ls-tree', '-r', '--name-only', 'HEAD', `${DIR}/`], {
+        cwd: ROOT, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'],
+      })
+        .split('\n')
+        .filter((line) => line.startsWith(`${DIR}/`))
+        .map((line) => line.slice(DIR.length + 1))
+        .filter((name) => name.endsWith('.sql'))
+    } catch {
+      return null
+    }
+  })()
+
+  const fromDisk = (() => {
+    try {
+      return readdirSync(join(ROOT, DIR)).filter((name) => name.endsWith('.sql'))
+    } catch {
+      // Found by Prime after the target-side fix shipped (c43b35b) — the mirror image of that
+      // bug in the mirror-image function. Measured on merged main: `mv migrations /tmp`, run the
+      // guard, exit 0 with `no_migrations_added`.
+      return null
+    }
+  })()
+
+  if (fromGit === null && fromDisk === null) return null
+  return [...new Set([...(fromGit ?? []), ...(fromDisk ?? [])])]
 }
 
 function main() {
@@ -206,20 +272,55 @@ function main() {
     return
   }
   const ref = target.ref
-  const verdict = evaluate(targetMigrations(ref), localMigrations())
+  const local = localMigrations()
+  let verdict = evaluate(targetMigrations(ref), local)
+
+  // STACKED PRs: the declared base is not the constraint. A migration number is claimed
+  // against the chain that will EVENTUALLY be applied — production's — so clearing an
+  // intermediate branch's head proves nothing.
+  //
+  // Measured, not theorised (Prime, bypass review of the merged guard): PR #398 declares base
+  // `codex/project-routines-v025` (head 0061) and adds 0062. Against that base the guard
+  // printed "migration numbering OK". Against main, head 0079, that migration can never run —
+  // and 0062_routine_cancellation_events also collides semantically with main's already-
+  // applied 0074_routine_cancellation_events. The guard said "ordering verified" about an
+  // ordering that does not exist.
+  //
+  // So when the base is not main, added files must clear BOTH heads. The base check stays (it
+  // catches collisions inside the stack) and main is checked as well; main's verdict wins when
+  // it is the one with something to say, so the author gets one clear reason.
+  if (verdict.ok && ref !== MAIN_REF) {
+    const mainVerdict = evaluate(targetMigrations(MAIN_REF), local)
+    if (!mainVerdict.ok) {
+      verdict = {
+        ...mainVerdict,
+        detail: { ...(mainVerdict.detail ?? {}), comparedAgainst: MAIN_REF, declaredBase: ref },
+      }
+    }
+  }
 
   if (verdict.ok) {
+    // Name the ref that was actually compared. "migration numbering OK" with no ref reads as
+    // "verified", full stop — which is exactly how #398 passed.
     if (verdict.reason === 'above_target_head') {
       const names = verdict.detail.added.join(', ')
-      console.log(`migration numbering OK — ${names} sort above ${ref} head ${verdict.detail.head}`)
+      const also = ref === MAIN_REF ? '' : ` (and above ${MAIN_REF})`
+      console.log(`migration numbering OK — ${names} sort above ${ref} head ${verdict.detail.head}${also}`)
     } else {
-      console.log(`migration numbering OK — ${verdict.reason}`)
+      console.log(`migration numbering OK — ${verdict.reason} (vs ${ref})`)
     }
     return
   }
 
   console.error('MIGRATION NUMBERING CHECK FAILED\n')
   switch (verdict.reason) {
+    case 'local_unreadable':
+      console.error(
+        `Could not list ${DIR}/ in the working tree. This check cannot tell "this PR added\n` +
+        'no migrations" from "I could not look", so it refuses rather than passing.\n\n' +
+        'Usually a sparse checkout that omits the directory. Check out the full tree.',
+      )
+      break
     case 'target_unreadable':
       console.error(
         `Could not read ${ref}. This check compares against the merge target, so it cannot\n` +
@@ -245,6 +346,11 @@ function main() {
       break
     case 'below_target_head':
       console.error(
+        (verdict.detail.comparedAgainst
+          ? `Your declared base is ${verdict.detail.declaredBase}, but these must ALSO clear\n` +
+            `${verdict.detail.comparedAgainst} — a migration number is claimed against the chain that\n` +
+            'will eventually be applied, not against an intermediate branch.\n\n'
+          : '') +
         `Merge-target head is ${String(verdict.detail.head).padStart(4, '0')}. These added ` +
         'migrations are at or below it:\n' +
         verdict.detail.below
