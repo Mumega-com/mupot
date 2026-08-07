@@ -68,6 +68,59 @@ describe('Dashboard Motherboard View Layer', () => {
   })
 })
 
+describe('Motherboard Capability & Squad Scoping (real-SQL)', () => {
+  it('unrestricted org admin sees all agents across all squads', async () => {
+    const adminAuth = {
+      tenant: 'mumega',
+      role: 'admin',
+      capabilities: [],
+    } as any
+
+    const data = await loadMotherboardData(env, 'mumega.com', adminAuth)
+    expect(data.stats.agentCount).toBeGreaterThanOrEqual(5)
+  })
+
+  it('scoped member with grant on squad-core sees squad-core agents but not squad-other agents', async () => {
+    // Seed squad-other and an agent inside squad-other
+    harness.sqlite.exec(`
+      INSERT INTO departments (id, slug, name) VALUES ('dept-other', 'other', 'Other Dept');
+      INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-other', 'dept-other', 'other', 'Other Squad');
+      INSERT INTO agents (id, squad_id, slug, name, status) VALUES ('agent-other', 'squad-other', 'other-agent', 'Other Agent', 'active');
+      INSERT INTO members (id, display_name, status, tenant) VALUES ('mem-scoped', 'Scoped Member', 'active', 'mumega');
+    `)
+
+    const memberAuth = {
+      tenant: 'mumega',
+      memberId: 'mem-scoped',
+      capabilities: [
+        { scope_type: 'squad', scope_id: 'squad-core', capability: 'observer' },
+      ],
+    } as any
+
+    const data = await loadMotherboardData(env, 'mumega.com', memberAuth)
+
+    // Should see squad-core tentacles
+    const tentacles = data.tentacleTree.tentacles.map((t) => t.slug)
+    expect(tentacles).toContain('river-code')
+
+    // Should NOT see dept-other or squad-other agents
+    const otherSquads = data.deptSquadMap['dept-other'] ?? []
+    expect(otherSquads).toHaveLength(0)
+  })
+
+  it('member with zero squad capability grants sees zero agents and zero squads (fail-closed)', async () => {
+    const zeroAuth = {
+      tenant: 'mumega',
+      memberId: 'mem-zero',
+      capabilities: [],
+    } as any
+
+    const data = await loadMotherboardData(env, 'mumega.com', zeroAuth)
+    expect(data.stats.agentCount).toBe(0)
+    expect(data.stats.squadCount).toBe(0)
+  })
+})
+
 describe('Migration 0083 Tentacles Registration', () => {
   it('includes migration 0083_subagent_tentacles_registration.sql in migration files list', () => {
     const filenames = migrationFiles()

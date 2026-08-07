@@ -1165,8 +1165,9 @@ dashboardApp.get('/radar', async (c) => {
 
 // ── motherboard (Fractal Motherboard Map visual topology engine — #v0.28.0) ──
 dashboardApp.get('/motherboard', async (c) => {
+  const auth = c.get('auth') as AuthContext | undefined
   const tenant = c.req.query('tenant') ?? 'mumega.com'
-  const data = await loadMotherboardData(c.env, tenant)
+  const data = await loadMotherboardData(c.env, tenant, auth)
   const accept = c.req.header('accept') ?? ''
   const wantsJson = c.req.query('format') === 'json' || (accept.includes('application/json') && !accept.includes('text/html'))
   if (wantsJson) return c.json(data)
@@ -1174,8 +1175,9 @@ dashboardApp.get('/motherboard', async (c) => {
 })
 
 dashboardApp.get('/dashboard/motherboard', async (c) => {
+  const auth = c.get('auth') as AuthContext | undefined
   const tenant = c.req.query('tenant') ?? 'mumega.com'
-  const data = await loadMotherboardData(c.env, tenant)
+  const data = await loadMotherboardData(c.env, tenant, auth)
   const accept = c.req.header('accept') ?? ''
   const wantsJson = c.req.query('format') === 'json' || (accept.includes('application/json') && !accept.includes('text/html'))
   if (wantsJson) return c.json(data)

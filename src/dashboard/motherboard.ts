@@ -10,7 +10,6 @@
 
 import { html, raw } from 'hono/html'
 import type { HtmlEscapedString } from 'hono/utils/html'
-import type { Env } from '../types'
 
 export type Html = HtmlEscapedString | Promise<HtmlEscapedString>
 
@@ -77,10 +76,24 @@ export const SUPPORTED_TENANTS = [
   { slug: 'therealmofpatterns.com', name: 'Sacred Geometry & Pattern Engine' },
 ]
 
+import type { AuthContext, Env } from '../types'
+import { hasCapability, isOrgAdmin, resolveCapabilities } from '../auth/capability'
+import { resolveGrantedSquadIds } from '../projects/readable-squads'
+
+async function accessibleSquadIds(env: Env, auth?: AuthContext): Promise<string[] | null> {
+  if (!auth) return null
+  if (isOrgAdmin(auth)) return null
+  if (!auth.memberId) return []
+  const grants = auth.capabilities ?? (await resolveCapabilities(env, auth.memberId))
+  if (hasCapability(grants, 'org', null, 'observer')) return null
+  return resolveGrantedSquadIds(env, grants, 'observer')
+}
+
 /**
  * Fetch motherboard topology data from D1 and construct the fractal map model.
+ * Per-squad scoped based on caller's capability grants (org grant → unrestricted).
  */
-export async function loadMotherboardData(env: Env, selectedTenant = 'mumega.com'): Promise<MotherboardViewData> {
+export async function loadMotherboardData(env: Env, selectedTenant = 'mumega.com', auth?: AuthContext): Promise<MotherboardViewData> {
   let dbDepts: Array<{ id: string; slug: string; name: string }> = []
   let dbSquads: Array<{ id: string; department_id: string; slug: string; name: string }> = []
   let dbAgents: Array<{
@@ -98,27 +111,44 @@ export async function loadMotherboardData(env: Env, selectedTenant = 'mumega.com
   let tokenMeter = { totalTokens: 0, promptTokens: 0, completionTokens: 0, recordCount: 0 }
 
   if (env.DB) {
-    const deptRes = await env.DB.prepare('SELECT id, slug, name FROM departments').all<{ id: string; slug: string; name: string }>()
-    dbDepts = deptRes.results ?? []
+    const squadIds = await accessibleSquadIds(env, auth)
+    if (squadIds !== null && squadIds.length === 0) {
+      dbAgents = []
+      dbSquads = []
+      dbDepts = []
+    } else {
+      const deptRes = await env.DB.prepare('SELECT id, slug, name FROM departments').all<{ id: string; slug: string; name: string }>()
+      dbDepts = deptRes.results ?? []
 
-    const squadRes = await env.DB.prepare('SELECT id, department_id, slug, name FROM squads').all<{ id: string; department_id: string; slug: string; name: string }>()
-    dbSquads = squadRes.results ?? []
+      const squadSql = squadIds === null
+        ? 'SELECT id, department_id, slug, name FROM squads'
+        : 'SELECT id, department_id, slug, name FROM squads WHERE id IN (SELECT CAST(value AS TEXT) FROM json_each(?1))'
+      const squadStmt = squadIds === null
+        ? env.DB.prepare(squadSql)
+        : env.DB.prepare(squadSql).bind(JSON.stringify(squadIds))
+      const squadRes = await squadStmt.all<{ id: string; department_id: string; slug: string; name: string }>()
+      dbSquads = squadRes.results ?? []
 
-    const agentRes = await env.DB.prepare(
-      'SELECT id, squad_id, slug, name, role, model, status, purpose, parent_agent_id, capabilities FROM agents'
-    ).all<{
-      id: string
-      squad_id: string
-      slug: string
-      name: string
-      role: string
-      model: string
-      status: string
-      purpose?: string
-      parent_agent_id?: string
-      capabilities?: string
-    }>()
-    dbAgents = agentRes.results ?? []
+      const agentSql = squadIds === null
+        ? 'SELECT id, squad_id, slug, name, role, model, status, purpose, parent_agent_id, capabilities FROM agents'
+        : 'SELECT id, squad_id, slug, name, role, model, status, purpose, parent_agent_id, capabilities FROM agents WHERE squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?1))'
+      const agentStmt = squadIds === null
+        ? env.DB.prepare(agentSql)
+        : env.DB.prepare(agentSql).bind(JSON.stringify(squadIds))
+      const agentRes = await agentStmt.all<{
+        id: string
+        squad_id: string
+        slug: string
+        name: string
+        role: string
+        model: string
+        status: string
+        purpose?: string
+        parent_agent_id?: string
+        capabilities?: string
+      }>()
+      dbAgents = agentRes.results ?? []
+    }
 
     const usageRes = await env.DB.prepare(
       'SELECT COALESCE(SUM(prompt_tokens), 0) AS total_prompt, COALESCE(SUM(completion_tokens), 0) AS total_comp, COUNT(*) AS cnt FROM subagent_token_usage'
@@ -363,9 +393,31 @@ export async function loadMotherboardData(env: Env, selectedTenant = 'mumega.com
     }
   }
 
-  const totalAgents = Math.max(1000, dbAgents.length)
-  const totalSquads = Math.max(32, dbSquads.length)
-  const totalDepts = Math.max(5, dbDepts.length)
+  // Filter riverTentacles to accessible dbAgents when caller is scoped
+  let finalTentacles = riverTentacles
+  if (env.DB) {
+    const squadIds = await accessibleSquadIds(env, auth)
+    if (squadIds !== null) {
+      const accessibleSlugs = new Set(dbAgents.map((a) => a.slug))
+      finalTentacles = riverTentacles.filter((t) => accessibleSlugs.has(t.slug))
+    }
+  }
+
+  // If squadIds !== null, filter static deptSquadMap to accessible squads
+  if (env.DB) {
+    const squadIds = await accessibleSquadIds(env, auth)
+    if (squadIds !== null) {
+      const accessibleSet = new Set(squadIds)
+      for (const [deptId, squadList] of Object.entries(deptSquadMap)) {
+        deptSquadMap[deptId] = squadList.filter(s => accessibleSet.has(s.id) || accessibleSet.has(s.slug))
+      }
+    }
+  }
+
+  const isUnrestricted = !auth || isOrgAdmin(auth) || (auth.capabilities && hasCapability(auth.capabilities, 'org', null, 'observer'))
+  const totalAgents = isUnrestricted ? Math.max(1000, dbAgents.length) : dbAgents.length
+  const totalSquads = isUnrestricted ? Math.max(32, dbSquads.length) : dbSquads.length
+  const totalDepts = isUnrestricted ? Math.max(5, dbDepts.length) : Object.values(deptSquadMap).filter(l => l.length > 0).length
 
   return {
     tenant: selectedTenant,
@@ -382,7 +434,7 @@ export async function loadMotherboardData(env: Env, selectedTenant = 'mumega.com
     deptSquadMap,
     tentacleTree: {
       parent: 'agent:river',
-      tentacles: riverTentacles,
+      tentacles: finalTentacles,
     },
   }
 }
