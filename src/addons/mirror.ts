@@ -27,22 +27,19 @@ function parseConceptsJson(rawJson: string | null | undefined): string[] | undef
   }
 }
 
-// Helper to verify secret header authorization
-function verifyMirrorSecret(c: { req: { header: (name: string) => string | undefined }; env: Env }): boolean {
+mirrorApp.use('*', async (c, next) => {
+  if (c.req.path.endsWith('/health')) return next()
   const secret = c.env.MIRROR_SECRET || c.env.MIRROR_TOKEN
-  if (!secret) return true // Pass through if no secret is configured
+  if (!secret) {
+    return c.json({ error: 'unconfigured_secret', detail: 'addon secret unconfigured on environment' }, 503)
+  }
 
   const authHeader = c.req.header('authorization')
   const bearerToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7).trim() : authHeader
   const xSecret = c.req.header('x-secret') || c.req.header('x-mirror-secret')
 
   const providedToken = bearerToken || xSecret
-  return providedToken === secret
-}
-
-mirrorApp.use('*', async (c, next) => {
-  if (c.req.path.endsWith('/health')) return next()
-  if (!verifyMirrorSecret(c)) {
+  if (providedToken !== secret) {
     return c.json({ error: 'unauthorized', detail: 'invalid or missing secret header' }, 401)
   }
   return next()

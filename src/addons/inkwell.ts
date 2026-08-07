@@ -13,22 +13,20 @@ export interface InkwellPublishPayload {
   tags?: string[]
 }
 
-// Helper to verify secret header authorization
-function verifyInkwellSecret(c: { req: { header: (name: string) => string | undefined }; env: Env }): boolean {
+// Authentication middleware for Inkwell sub-app
+inkwellApp.use('*', async (c, next) => {
+  if (c.req.path.endsWith('/health')) return next()
   const secret = c.env.INKWELL_SECRET || c.env.INKWELL_TOKEN || c.env.INKWELL_API_TOKEN
-  if (!secret) return true // Pass through if no secret is configured on env
+  if (!secret) {
+    return c.json({ error: 'unconfigured_secret', detail: 'addon secret unconfigured on environment' }, 503)
+  }
 
   const authHeader = c.req.header('authorization')
   const bearerToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7).trim() : authHeader
   const xSecret = c.req.header('x-secret') || c.req.header('x-inkwell-secret')
 
   const providedToken = bearerToken || xSecret
-  return providedToken === secret
-}
-
-inkwellApp.use('*', async (c, next) => {
-  if (c.req.path.endsWith('/health')) return next()
-  if (!verifyInkwellSecret(c)) {
+  if (providedToken !== secret) {
     return c.json({ error: 'unauthorized', detail: 'invalid or missing secret header' }, 401)
   }
   return next()

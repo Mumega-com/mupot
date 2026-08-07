@@ -3,23 +3,20 @@ import type { Env, BusEvent, BusEventType } from '../types'
 
 export const sosApp = new Hono<{ Bindings: Env }>()
 
-// Helper to verify secret header authorization
-function verifySosSecret(c: { req: { header: (name: string) => string | undefined }; env: Env }): boolean {
+// Authentication middleware for SOS sub-app
+sosApp.use('*', async (c, next) => {
+  if (c.req.path.endsWith('/health')) return next()
   const secret = c.env.SOS_SECRET || c.env.BUS_TOKEN || c.env.SOS_TOKEN
-  if (!secret) return true // If no secret is configured on the environment, pass through
+  if (!secret) {
+    return c.json({ error: 'unconfigured_secret', detail: 'addon secret unconfigured on environment' }, 503)
+  }
 
   const authHeader = c.req.header('authorization')
   const bearerToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7).trim() : authHeader
   const xSecret = c.req.header('x-secret') || c.req.header('x-sos-secret')
 
   const providedToken = bearerToken || xSecret
-  return providedToken === secret
-}
-
-// Authentication middleware for SOS sub-app
-sosApp.use('*', async (c, next) => {
-  if (c.req.path.endsWith('/health')) return next()
-  if (!verifySosSecret(c)) {
+  if (providedToken !== secret) {
     return c.json({ error: 'unauthorized', detail: 'invalid or missing secret header' }, 401)
   }
   return next()
