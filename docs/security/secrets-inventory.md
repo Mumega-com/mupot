@@ -72,10 +72,23 @@ before setting a second one — a duplicated secret under two names is its own d
 `SOS_BUS_TOKEN`, `SOS_BUS_URL`. `CLOUDFLARE_API_TOKEN` last updated **2026-05-03** —
 predates the 2026-07-29 sweep and is a rotation candidate.
 
-`Mumega-com/mupot`: none listed. Earlier this was recorded as UNSURE on the assumption of
-a permissions gap; with a working `gh` session it returns empty, so the workflows
-referencing `secrets.CLOUDFLARE_API_TOKEN` in that repo are reading **org-level** secrets
-or are broken. Verify before relying on either.
+**CORRECTED 2026-08-07 by Dara's audit** ([credential-audit-2026-08-07.md](credential-audit-2026-08-07.md), #771).
+I had this wrong twice over. `Mumega-com/mupot`'s workflows reference **no secrets at all**
+— the `secrets.CLOUDFLARE_API_TOKEN` reference lives in **`Mumega-com/inkwell`**, not mupot.
+And it is not a permissions gap: **zero org-level Actions secrets exist org-wide**, so that
+workflow has nothing to resolve. Consequence: **"Deploy mumega.com" has been failing on
+every run since 2026-05-10 — three months, silently.**
+
+Also found, and absent from my sweep because I only looked at the repos I was working in:
+`Mumega-com/therealmofpatterns` (public) carries its **own** `CLOUDFLARE_API_TOKEN` dated
+2026-01-31 — six months stale, a stronger rotation candidate than the 2026-05-03 one above.
+`Mumega-com/sos` and `Mumega-com/mirror` hold `HETZNER_HOST`, `HETZNER_SSH_KEY`,
+`HETZNER_USER`, `DISCORD_DEPLOY_WEBHOOK` (2026-04-05).
+
+⚠️ **Secret scanning is enabled on every PUBLIC repo and unavailable on all 15 PRIVATE
+ones** (no GHAS tier). That is inverted from where the risk sits — `mumega-com` is private
+and holds the Cloudflare and SOS Actions secrets directly. If a credential is ever
+committed there, nothing automated catches it.
 
 ### Scope 5 — CF USER-owned tokens — CLOSED 2026-08-07 by dashboard read
 
