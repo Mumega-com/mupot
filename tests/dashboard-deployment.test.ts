@@ -12,6 +12,7 @@
 import { describe, it, expect } from 'vitest'
 import { loadDeployment, deploymentBody } from '../src/dashboard/deployment'
 import { MUPOT_PUBLIC_API_VERSION } from '../src/version'
+import { BUILD_INFO } from '../src/build-info'
 import type { Env } from '../src/types'
 
 // ── D1 mock — drives the single isOnboardingComplete() read (org_settings) ─────
@@ -51,10 +52,10 @@ describe('loadDeployment', () => {
     })
   })
 
-  it('reports commit: null when RELEASE_SHA is unset', async () => {
+  it('reports BUILD_INFO commit fallback when RELEASE_SHA is unset', async () => {
     const env = makeEnv({ onboardingComplete: 'true' })
     const d = await loadDeployment(env)
-    expect(d.commit).toBeNull()
+    expect(d.commit).toBe(BUILD_INFO.commit)
   })
 
   it('reports commit: null when RELEASE_SHA is not a valid 40-hex sha (e.g. a branch name)', async () => {
