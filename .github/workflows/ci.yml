@@ -77,7 +77,7 @@ jobs:
       - name: Composition tests (workerd)
         run: npx vitest run --config vitest.composition.config.ts
       - name: Fleet runtime tests
-        run: node --test fleet-runtime/*.test.mjs
+        run: node --test 'fleet-runtime/**/*.test.mjs'
       # Router routing-rule tests. Wired here rather than left to vitest because
       # **/*.test.mjs is excluded from vitest as a class (#745) — so an unwired
       # .test.mjs runs NOWHERE and its green is meaningless. #745's own invariant

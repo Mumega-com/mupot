@@ -211,6 +211,11 @@ export function deliverToTmux(_text, message, opts = {}) {
   if (settle.status !== 0) {
     return tmuxFailure(settle, 'tmux_settle_failed', 'tmux_settle_timeout')
   }
+  // Brief delay ensures input box registers text before Enter fires.
+  const delay = spawnSync('sleep', ['0.3'], { encoding: 'utf8' })
+  if (delay.status !== 0) {
+    return { ok: false, reason: 'delay_failed', detail: delay.stderr || delay.error?.message }
+  }
   // Enter as a separate key so multiline bodies stay literal under -l.
   const enter = spawn('tmux', ['send-keys', '-t', TMUX_SESSION, 'Enter'], commandOpts)
   if (enter.status !== 0) {
