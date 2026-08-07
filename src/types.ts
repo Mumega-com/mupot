@@ -164,16 +164,12 @@ export interface Env {
   AI_GATEWAY_TOKEN?: string
   // Telegram bridge: Mupot bus consumer notifies Hadi of task events
   // via HMAC-signed POST to Hermes webhook deliver_only route.
-  // --- Telegram ingress (POST /api/integrations/telegram/webhook) ---
-  // Shared secret Telegram echoes in X-Telegram-Bot-Api-Secret-Token.
-  // ABSENT => the route refuses with 503. There is no dev-mode bypass: production
-  // IS the unset case until someone remembers to set it.
-  TELEGRAM_WEBHOOK_SECRET?: string
-  // Comma/space separated NUMERIC Telegram user ids permitted to reach dispatch.
-  // Unset or empty => reject everyone (fail closed). Numeric ids only — usernames
-  // are user-mutable and can be released and re-registered by someone else.
-  TELEGRAM_ALLOWED_SENDERS?: string
-  TELEGRAM_BOT_USERNAME?: string
+  // Telegram ingress lives at POST /channels/telegram/webhook and authenticates with
+  // IM_WEBHOOK_SECRET (below). The former /api/integrations/telegram route and its
+  // TELEGRAM_WEBHOOK_SECRET / TELEGRAM_ALLOWED_SENDERS / TELEGRAM_BOT_USERNAME keys are
+  // GONE — /channels resolves the caller to a member (member_identities) and applies
+  // their capabilities, which the allowlist could not do. Do not reintroduce them:
+  // a second authorisation model on one surface means the weaker one sets the level.
   HERMES_WEBHOOK_SECRET?: string
   TELEGRAM_BRIDGE_URL?: string
   IM_WEBHOOK_SECRET?: string // shared secret for the IM webhook (Telegram secret_token)
