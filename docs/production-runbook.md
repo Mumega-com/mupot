@@ -145,6 +145,12 @@ with the exact commit HEAD is on (mupot#443) — `GET /health` will report it as
 step that got forgotten in practice and left production reporting
 `commit: null` for days.
 
+`GET /health` also reports a `clean` boolean alongside `commit`: `true` only
+when `RELEASE_SHA` was a bare 40-hex sha; a dirty tree or an off-main HEAD at
+deploy time gets a `-dirty` suffix instead (`scripts/lib/release-sha.mjs`
+`releaseShaDeployArgs`), and `clean` always reports `false` for that case —
+never silently upgraded to look clean (`src/health.ts`).
+
 When dashboard OAuth is selected, register redirect URLs with the identity provider
 before inviting users:
 
@@ -200,6 +206,51 @@ pause traffic on a database with only `0073` applied: routine cancellation
 events are rejected by the older event-kind constraint until `0074` completes.
 If the migration command is interrupted, rerun it and confirm both migrations
 are applied before deploying or enabling Project Routines.
+
+**Incident, 2026-07-27: v0.25 activation partially applied against live D1.**
+A pre-migration D1 backup was taken, then `0068_project_cycle_boundary.sql`
+applied successfully and `0069_project_structural_completion.sql` failed and
+rolled back on a nested-Project foreign key violation. `0071`, `0073`, and
+`0074` never ran; no v0.25 Worker was deployed; production stayed on
+`v0.24.0`; no production rows were hand-edited. Fixed by mupot#594 (merged as
+`7e8595b0`), preceded by mupot#591 (a preflight against a production-shaped
+schema that caught a related evidence-loss bug in the same file *before* any
+live migration ran — see mupot#590). Two lessons:
+
+1. **`PRAGMA foreign_keys = off` is a silent no-op inside a migration
+   transaction.** `wrangler d1 migrations apply` runs each migration file
+   inside one transaction, and SQLite only allows foreign-key enforcement to
+   change with no transaction open, so the pragma does not take effect until
+   the migration's transaction ends — it gives false confidence and must not
+   be relied on (`migrations/0049_agent_status_inactive.sql` documents the
+   same finding independently). `projects.parent_project_id` is
+   self-referential (`REFERENCES projects(id) ON DELETE RESTRICT`, declared
+   `migrations/0055_projects.sql:15`), so it stayed enforced straight through
+   `0069`'s `DELETE FROM projects` regardless of the pragma at the top of the
+   file — that is what aborted the migration. Back up and explicitly
+   detach/restore referencing rows instead; see the fixed
+   `migrations/0069_project_structural_completion.sql` and
+   `migrations/0071_agent_connections.sql` for the pattern.
+
+2. **`wrangler d1 migrations list` only reports on migration files your local
+   checkout can see.** It diffs the `migrations/` directory against the D1
+   ledger table, so a checkout on a stale branch prints a clean "No
+   migrations to apply!" while silently under-verifying — it has no way to
+   know about migrations a newer branch would add. Concrete instance: a
+   branch missing `0073_project_routines.sql` and
+   `0074_routine_cancellation_events.sql` produces exactly that false-clean
+   result. Before trusting the output, diff `migrations/` against
+   `origin/main`, or run the check from a detached `origin/main` worktree
+   with the real (gitignored) `wrangler.toml` copied in.
+
+Also worth remembering: a table-rebuild migration (`CREATE TABLE x_new`,
+copy, `DROP`, `RENAME`) can silently drop a constraint the live table
+declared if the `_new` table's `CREATE` omits it — exactly what happened to
+`parent_project_id`'s `REFERENCES ... ON DELETE RESTRICT` in the original
+`0069`. Verify with `pragma_foreign_key_list('<table>')` before and after a
+rebuild (used in `tests/projects-migration.test.ts` and
+`tests/project-structural-migration.test.ts`) — don't eyeball the CREATE
+statement.
 
 Project Routines require separate Worker triggers for Routine work and existing
 maintenance. Before deploying v0.25, verify the pot config contains the exact

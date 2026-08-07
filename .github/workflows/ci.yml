@@ -16,16 +16,75 @@ jobs:
         with:
           node-version: 22
       - run: npm ci
-      - name: Dependency audit
-        run: npm audit --audit-level=high
+      # Dependency audit, split by what actually ships.
+      #
+      # This step used to be a single `npm audit --audit-level=high` over prod AND dev.
+      # As of 2026-08-04 that is UNSATISFIABLE, not merely noisy: undici has open highs,
+      # reachable only as wrangler → miniflare → undici, and there is no wrangler version
+      # without it. `npm audit fix --force` "resolves" it by DOWNGRADING wrangler to
+      # 4.35.0 from 4.118 — surrendering ~80 releases of fixes to silence a dev-only
+      # finding. So the single gate had one of two outcomes: permanently red, or a
+      # downgrade that makes us less safe. Neither is a gate; both are theatre.
+      #
+      # The split below is STRICTER on what ships, not weaker. Production drops from
+      # --audit-level=high to MODERATE, and it currently reports 0 vulnerabilities at
+      # any level, so this blocks on the first regression rather than waiting for one
+      # to reach "high". It would still have caught every real finding this gate has
+      # ever caught (fast-uri, ip-address, brace-expansion — all production).
+      #
+      # PRECEDENT, recorded because it is the reason to distrust this change: PR #664
+      # was an earlier attempt to relax this gate, retracted the same day. It was wrong
+      # because the premise came from a STALE LOCAL node_modules that showed dev-only
+      # advisories while CI's clean `npm ci` had 5 production highs. The premise here
+      # was taken from the LOCKFILE (`npm audit --package-lock-only --omit=dev`), which
+      # is what CI installs from, and the production highs it found were FIXED rather
+      # than reclassified — see the overrides block in package.json.
+      - name: Dependency audit (production — BLOCKING)
+        run: npm audit --omit=dev --audit-level=moderate
+      # Dev/build-tooling advisories, gated against an explicit allowlist rather than
+      # waived. The first version of this step was `npm audit --audit-level=high || true`
+      # and adversarial review blocked it, correctly: `|| true` does not accept "the known
+      # unfixable undici chain", it accepts EVERY future high/critical dev advisory and
+      # every audit-tool failure. It also made #670's close condition undetectable, since
+      # the step passes identically whether the known advisory is still there or ten new
+      # ones have joined it.
+      #
+      # scripts/audit-gate.mjs fails in BOTH directions:
+      #   NEW    a high/critical advisory not in .github/audit-allowlist.json
+      #   STALE  an allowlist entry that no longer appears (a fix shipped — delete it)
+      # and it fails on an audit it cannot run or parse, rather than reading silence as
+      # safety. The STALE direction is what `|| true` could never do, and it is what makes
+      # #670 self-closing instead of dependent on someone remembering to check.
+      - name: Dependency audit (dev toolchain — allowlisted)
+        run: node scripts/audit-gate.mjs
+      # Hermetic — no registry, no lockfile. One case per bypass reproduced in review,
+      # so each stays shut. A gate whose tests need a working registry cannot be trusted
+      # to run when the registry is what is broken.
+      - name: Audit-gate self-tests
+        run: node --test tests/audit-gate.test.mjs
       - name: Typecheck
         run: npm run typecheck
       - name: Install Playwright browser for integration tests
         run: npx playwright install --with-deps chromium
       - name: Test
         run: npm test
+      # The deployed COMPOSITION — src/index.ts with its OAuthProvider wrapper — executed
+      # inside real workerd, not Node. This is the suite that would have caught the
+      # /auth/login 500 (#699): every other test imports pieces below the wrapper, so the
+      # wrapper itself shipped unexecuted. Separate step because `cloudflare:test` cannot
+      # load under the default Node runner (excluded in vitest.config.ts); if this step is
+      # ever deleted, the composition is back to shipping untested.
+      - name: Composition tests (workerd)
+        run: npx vitest run --config vitest.composition.config.ts
       - name: Fleet runtime tests
         run: node --test 'fleet-runtime/**/*.test.mjs'
+      # Router routing-rule tests. Wired here rather than left to vitest because
+      # **/*.test.mjs is excluded from vitest as a class (#745) — so an unwired
+      # .test.mjs runs NOWHERE and its green is meaningless. #745's own invariant
+      # test caught this file being unwired on PR #759, one day after it shipped:
+      # the guard fired on the person who wrote it, which is the point of a guard.
+      - name: Router routing-rule tests
+        run: node --test tests/router.test.mjs
       - name: Wrangler dry-run bundle check
         run: npx wrangler deploy --dry-run --config wrangler.example.toml
       - name: D1 migration chain check
@@ -84,6 +143,63 @@ jobs:
           node-version: 22
       - name: Guard — no secrets in this public template
         run: node scripts/no-secrets.mjs
+
+  test-schema-source:
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 is REQUIRED — the ratchet compares the baseline against the merge
+      # target, and a shallow clone cannot read it. The check FAILS rather than passes when
+      # the target is unreadable, so a missing fetch-depth surfaces as a red build instead
+      # of a silently-disengaged guard.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # Ratchet (#684, #703): a test that imports production code must build its schema
+      # from the committed migration chain. A hand-written CREATE TABLE or a hand-picked
+      # list of migration files is a schema the author invented — it executes real SQL
+      # against a database production does not have, which is how #684 stayed green.
+      # The baseline may shrink, never grow.
+      # Self-tests FIRST. The guard shipped without any, and the class it was missing
+      # (a hand-written SQL engine, #720) was found by an adversarial review of someone
+      # else's PR rather than by the guard. Each case here is a mutation that was
+      # reproduced against a previous version — including two where the suite passed for
+      # the wrong reason. A gate with no tests is the shape this gate exists to reject.
+      - name: Ratchet self-tests
+        run: node --test tests/test-schema-source.test.mjs
+      - name: Guard — tests must build schema from the migration chain
+        run: node scripts/check-test-schema-source.mjs
+
+  migration-numbering:
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 is REQUIRED — the guard compares added migrations against the merge
+      # target's head, and a shallow clone cannot read it. It FAILS rather than passes when
+      # the target is unreadable, so a missing fetch-depth surfaces as a red build instead of
+      # a guard that silently stopped guarding.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # Self-tests FIRST, same order and same reason as the schema ratchet above: a guard
+      # with no tests of its own is the shape these guards exist to reject. Each case is a
+      # mutation that was reproduced against the script before it shipped.
+      - name: Migration-numbering self-tests
+        run: node --test tests/migration-numbering.test.mjs
+      # #729: a migration numbered at or below the merge-target head merges green and NEVER
+      # RUNS — wrangler applies only files above the applied head. Twelve open PRs were
+      # blocked on this on 2026-08-06 (slot 0076 alone had four claimants), and it already
+      # cost one production incident (#594).
+      - name: Guard — added migrations must sort above the merge-target head
+        run: node scripts/check-migration-numbering.mjs
+        env:
+          # PRs are not always against main. Without this the guard would compare against the
+          # wrong branch and its verdict would be unrelated to what actually merges.
+          BASE_REF: ${{ github.base_ref }}
 
   design-status-policy:
     runs-on: ubuntu-latest

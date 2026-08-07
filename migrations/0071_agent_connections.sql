@@ -3,6 +3,14 @@
 -- This migration establishes the durable identity weld used by every agent
 -- credential path. It fails closed when historical welded tokens are ambiguous
 -- or tenantless, then backfills exactly one canonical member per agent.
+--
+-- mupot#594: the backfill INSERT into agent_member_bindings below is FK-bound
+-- to agents(id); D1 runs this whole file in one transaction and keeps FK
+-- enforcement ON throughout it (`PRAGMA foreign_keys = off` would be a
+-- no-op — see the same finding recorded in 0069_project_structural_completion.sql
+-- and 0049_agent_status_inactive.sql), so the revoke/delete steps just below
+-- must clean up member_tokens/agent_keys rows that point at deleted agents
+-- BEFORE the backfill runs, or the FK-constrained INSERT fails against live data.
 
 -- A credential cannot remain authoritative for an agent that no longer exists.
 -- Revoke stale credentials while retaining their historical agent attribution.
