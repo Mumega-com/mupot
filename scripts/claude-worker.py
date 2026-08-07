@@ -151,20 +151,24 @@ def poll_open_tasks() -> list[dict]:
 def build_brief(task: dict, worktree: Path, branch: str) -> str:
     return "\n".join(
         [
-            f"You are a headless build lane for the kasra agent. Task from mupot (id {task['id']}).",
-            f"Work ONLY in this worktree: {worktree} (branch {branch}, already checked out).",
-            "",
-            f"TITLE: {task.get('title','')}",
-            f"DONE WHEN: {task.get('done_when','')}",
-            "",
-            "BRIEF:",
-            task.get("body", "") or "(no body — infer from title/done_when)",
+            # ── stable prefix (see tech-grok-worker.build_brief for why order matters)
+            "You are a headless build lane for the kasra agent, working a task from mupot.",
             "",
             "RULES (hard):",
             "- Make the change and COMMIT it in this worktree. Do NOT push, do NOT open a PR,",
             "  do NOT merge, do NOT deploy — the driver handles delivery and a human gates it.",
             "- Run `npx tsc --noEmit` and the affected `npx vitest run` yourself; the change must be clean+green.",
             "- Pure, minimal, behavior-correct. If blocked or the task is unsafe, commit nothing and explain why.",
+            "",
+            # ── per-task tail: everything below changes every dispatch ──────────────
+            f"TASK ID: {task['id']}",
+            f"WORKTREE: {worktree} (branch {branch}, already checked out) — work ONLY here.",
+            "",
+            f"TITLE: {task.get('title','')}",
+            f"DONE WHEN: {task.get('done_when','')}",
+            "",
+            "BRIEF:",
+            task.get("body", "") or "(no body — infer from title/done_when)",
         ]
     )
 
