@@ -261,16 +261,33 @@ containing live brand messaging copy ("Mumega is the operating system for the So
 Economy. We build autonomous digital employees that liberate human potential."). This repo
 also has a real revoked secret in its history (telegram_bot_token + google_api_key, from
 the 2026-08-03 cleanup pass in the earlier findings). `archive-ai-team` is also indexed,
-but only a thin issues/views UI page, not real content — no cost to privatizing it as-is.
+but only a thin issues/views UI page, not real content — already privatized below.
 
 **Revised step for `archive-mumega-marketing` specifically — migrate before privatizing:**
-1. Copy `brand/GUIDELINES.md` into an actively-maintained public location (e.g. a trimmed
-   public section of `mumega-docs` if that becomes a public docs site, or a dedicated
-   brand-kit repo) so the messaging content re-indexes at a new, stable, actively-maintained
-   URL.
+1. Copy `brand/GUIDELINES.md` into an actively-maintained *public* location, so the
+   messaging content re-indexes at a new, stable URL. **Note: `mumega-docs` is no longer a
+   valid target for this** — it's in the privatized batch below, on Hadi's instruction.
+   Needs a different destination: a dedicated public brand-kit repo, or somewhere on the
+   `mumega.com` site itself. Not yet decided.
 2. Only then set `archive-mumega-marketing` private — this drops the repo carrying the
    leaked-secret history while preserving the one thing in it worth keeping public.
 
-Every other item on the recommend-private list (`qbo-mini`, `qbo-torivers`, `mumcp-proxy`,
-`mumega-docs`, `Digid-MCP`, `mumega-cli`, `archive-ai-team`, `archive-wp-ai-operator`,
-`archive-mumega-cms`) is confirmed zero-cost to flip straight to private.
+## Status — repo visibility changes (2026-08-07, on Hadi's instruction)
+
+DONE — flipped to private, verified via API afterward:
+
+| repo | notes |
+|---|---|
+| `Digidinc/qbo-mini` | |
+| `Digidinc/qbo-torivers` | |
+| `Digidinc/Digid-MCP` | |
+| `Digidinc/mumega-cli` | |
+| `Mumega-com/mumcp-proxy` | |
+| `Mumega-com/mumega-docs` | |
+| `Mumega-com/archive-ai-team` | |
+| `Mumega-com/archive-wp-ai-operator` | |
+| `Mumega-com/archive-mumega-cms` | GitHub-archived repos are read-only for visibility changes via API — unarchived, flipped to private, re-archived. Confirmed still archived + now private afterward. |
+
+NOT YET DONE — `Mumega-com/archive-mumega-marketing`: blocked on picking a new home for
+`brand/GUIDELINES.md` (see above), since the original planned destination is now itself
+private. Still public as of this writing.
