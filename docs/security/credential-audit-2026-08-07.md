@@ -263,18 +263,14 @@ also has a real revoked secret in its history (telegram_bot_token + google_api_k
 the 2026-08-03 cleanup pass in the earlier findings). `archive-ai-team` is also indexed,
 but only a thin issues/views UI page, not real content — already privatized below.
 
-**Revised step for `archive-mumega-marketing` specifically — migrate before privatizing:**
-1. Copy `brand/GUIDELINES.md` into an actively-maintained *public* location, so the
-   messaging content re-indexes at a new, stable URL. **Note: `mumega-docs` is no longer a
-   valid target for this** — it's in the privatized batch below, on Hadi's instruction.
-   Needs a different destination: a dedicated public brand-kit repo, or somewhere on the
-   `mumega.com` site itself. Not yet decided.
-2. Only then set `archive-mumega-marketing` private — this drops the repo carrying the
-   leaked-secret history while preserving the one thing in it worth keeping public.
+**Resolved — no migration needed.** Hadi's rule: content older than 3 months gets ignored
+rather than migrated. CONFIRMED via commit history: `brand/GUIDELINES.md` has exactly 2
+commits, both 2026-01-06 — over 7 months old, past the cutoff. Privatized directly, no
+migration.
 
 ## Status — repo visibility changes (2026-08-07, on Hadi's instruction)
 
-DONE — flipped to private, verified via API afterward:
+DONE — all 10, flipped to private and verified via API afterward:
 
 | repo | notes |
 |---|---|
@@ -287,7 +283,6 @@ DONE — flipped to private, verified via API afterward:
 | `Mumega-com/archive-ai-team` | |
 | `Mumega-com/archive-wp-ai-operator` | |
 | `Mumega-com/archive-mumega-cms` | GitHub-archived repos are read-only for visibility changes via API — unarchived, flipped to private, re-archived. Confirmed still archived + now private afterward. |
+| `Mumega-com/archive-mumega-marketing` | Same archived-repo dance. `brand/GUIDELINES.md` was past Hadi's 3-month freshness cutoff (last touched 2026-01-06), so migrated nothing — privatized directly per his call. |
 
-NOT YET DONE — `Mumega-com/archive-mumega-marketing`: blocked on picking a new home for
-`brand/GUIDELINES.md` (see above), since the original planned destination is now itself
-private. Still public as of this writing.
+All items from the original public-repo review are now closed.
