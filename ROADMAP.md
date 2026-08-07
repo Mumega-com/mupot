@@ -16,6 +16,29 @@ Code merged or deployed after the `v0.25.0` tag is not retroactively part of
 `v0.25.0`. Capabilities remain preview until the release that owns them passes its
 gate and is tagged.
 
+## Security flight queue — ordered (updates by PR only)
+
+> **This is where flight plans live.** One ordered list; Hadi sets the order, the fleet
+> executes top-down. Detail lives in the linked issues — this table is the index, not a
+> second store. A flight is declared by writing a manifest (`/tmp/flight-active.md`,
+> archived to `agents/kasra/.remember/flights/` on landing).
+
+| # | Flight | Why it is here | Issues | State |
+|---|---|---|---|---|
+| — | **FLIGHT-001-R** — RBAC remediation | random-email P0, unfiltered roster, PII leak, fail-open addons | #796 #798 #780 #788 | **LANDED 2026-08-07** |
+| 1 | **FLIGHT-002** — identity & token lifecycle | `member_tokens` have no `expires_at`; permanent until hand-revoked. Time alone increases exposure | F5; `pi` token rotation; CF mint-capable pair (Hadi-gated) | NEXT |
+| 2 | **FLIGHT-003** — channel authority shrink | non-directory channels resolve FULL standing capability: one compromised session = all authority, no expiry, no ceiling | F4, #799 (self-reported fleet squads, `/radar` unscoped) | queued |
+| 3 | **FLIGHT-004** — approvals & 2FA native | make "Hadi said X" unusable as a claim in code, not in a side-script: pot surfaces, pot verifies, nonce single-use, action-hash bound | mumega-com#725 | queued |
+| 4 | **FLIGHT-005** — governance wiring | SOS's voting contract has never worked (`engine/app.py` calls methods that do not exist); MU.100.001's protocol should not live on the bus | mumega-com#723 | queued |
+| 5 | unified execution metering | two disjoint budget accountings over one surface; routine spend never reaches `execution_meter` | F8 | backlog |
+| 6 | untrusted-content marking as structure | today it is an ingress tag + convention; make refusal structural | F6 | backlog |
+| 7 | loop-driver unhold | pot-registered, metered, propose-only scope, Hadi go | — | HELD |
+
+**Board opinion policy:** priority ORDER is Hadi's alone — no vote, no ceremony. Board
+input (asha first-pass, Athena architecture, River build feasibility) is requested per
+flight when SCOPE is unclear, and is advisory. Ratification voting (MU.100.001 §1.3)
+applies to constitution amendments only — never to sequencing work.
+
 ## Operating loop — current live state (2026-08-03, updates by PR only)
 
 > Cross-cutting runtime plan; version-scoped features above own their releases.
