@@ -215,3 +215,193 @@ mirrorApp.post('/engrams', async (c) => {
 
   return c.json({ ok: true, id, agent_id: agentId, text }, 201)
 })
+
+// ── Canonical /memory REST API Endpoints (B-001) ─────────────────────────────
+
+// POST /memory/store — store memory engram (supports upsert, concepts, vector embedding)
+mirrorApp.post('/memory/store', async (c) => {
+  let body: { id?: string; text?: string; agent_id?: string; concepts?: string[] }
+  try {
+    body = await c.req.json()
+  } catch {
+    return c.json({ error: 'invalid_json', detail: 'Request body must be valid JSON' }, 400)
+  }
+
+  if (!body.text || typeof body.text !== 'string' || body.text.trim().length === 0) {
+    return c.json({ error: 'invalid_payload', detail: 'text string is required' }, 400)
+  }
+
+  if (!c.env.DB) {
+    return c.json({ error: 'database_unavailable', detail: 'DB binding missing' }, 500)
+  }
+
+  const id = body.id && typeof body.id === 'string' && body.id.trim().length > 0 ? body.id.trim() : crypto.randomUUID()
+  const agentId = body.agent_id ?? 'river'
+  const text = body.text.trim()
+  const conceptsJson = body.concepts && body.concepts.length > 0 ? JSON.stringify(body.concepts) : null
+
+  try {
+    await c.env.DB.prepare(
+      'INSERT INTO engrams (id, agent_id, text, concepts) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET text = excluded.text, concepts = excluded.concepts'
+    ).bind(id, agentId, text, conceptsJson).run()
+
+    if (c.env.VEC && c.env.AI) {
+      try {
+        const embedRes = await c.env.AI.run('@cf/baai/bge-base-en-v1.5', { text: [text] }) as { data?: number[][] }
+        const vector = embedRes.data?.[0]
+        if (vector) {
+          await c.env.VEC.insert([{
+            id,
+            values: vector,
+            metadata: { tenant: c.env.TENANT_SLUG || 'default', agentId, text: text.slice(0, 500) },
+          }])
+        }
+      } catch {}
+    }
+  } catch (err) {
+    return c.json({
+      error: 'memory_store_failed',
+      detail: err instanceof Error ? err.message : String(err),
+    }, 500)
+  }
+
+  return c.json({ ok: true, id, agent_id: agentId, text, concepts: body.concepts }, 201)
+})
+
+// POST /memory/search — 16D RRF vector memory search
+mirrorApp.post('/memory/search', handleSearch)
+
+// POST/DELETE /memory/forget & DELETE /memory/:id — delete engram entry
+const handleForget = async (c: import('hono').Context<{ Bindings: Env }>) => {
+  let id = c.req.param('id')
+  let agentId: string | undefined
+
+  if (!id) {
+    try {
+      const body = await c.req.json()
+      id = body.id
+      agentId = body.agent_id
+    } catch {}
+  }
+
+  if (!id || typeof id !== 'string' || id.trim().length === 0) {
+    return c.json({ error: 'invalid_payload', detail: 'id string parameter is required' }, 400)
+  }
+
+  if (!c.env.DB) {
+    return c.json({ error: 'database_unavailable', detail: 'DB binding missing' }, 500)
+  }
+
+  const targetId = id.trim()
+
+  try {
+    const checkSql = agentId
+      ? 'SELECT id FROM engrams WHERE id = ? AND agent_id = ?'
+      : 'SELECT id FROM engrams WHERE id = ?'
+    const params = agentId ? [targetId, agentId] : [targetId]
+    const existing = await c.env.DB.prepare(checkSql).bind(...params).first()
+
+    if (!existing) {
+      return c.json({ error: 'not_found', detail: `engram memory entry '${targetId}' not found` }, 404)
+    }
+
+    const deleteSql = agentId
+      ? 'DELETE FROM engrams WHERE id = ? AND agent_id = ?'
+      : 'DELETE FROM engrams WHERE id = ?'
+    await c.env.DB.prepare(deleteSql).bind(...params).run()
+
+    if (c.env.VEC) {
+      try {
+        await c.env.VEC.deleteByIds([targetId])
+      } catch {}
+    }
+
+    return c.json({ ok: true, deleted_id: targetId, count: 1 }, 200)
+  } catch (err) {
+    return c.json({
+      error: 'memory_forget_failed',
+      detail: err instanceof Error ? err.message : String(err),
+    }, 500)
+  }
+}
+
+mirrorApp.post('/memory/forget', handleForget)
+mirrorApp.delete('/memory/forget', handleForget)
+mirrorApp.delete('/memory/:id', handleForget)
+
+// GET /memory/:id — fetch engram by ID
+mirrorApp.get('/memory/:id', async (c) => {
+  const id = c.req.param('id')
+  if (!id || typeof id !== 'string' || id.trim().length === 0) {
+    return c.json({ error: 'invalid_payload', detail: 'id string parameter is required' }, 400)
+  }
+
+  if (!c.env.DB) {
+    return c.json({ error: 'database_unavailable', detail: 'DB binding missing' }, 500)
+  }
+
+  try {
+    const row = await c.env.DB.prepare(
+      'SELECT id, agent_id, text, concepts, created_at FROM engrams WHERE id = ?'
+    ).bind(id.trim()).first<{ id: string; agent_id: string; text: string; concepts: string | null; created_at: string }>()
+
+    if (!row) {
+      return c.json({ error: 'not_found', detail: `engram memory entry '${id}' not found` }, 404)
+    }
+
+    let concepts: string[] | undefined
+    if (row.concepts) {
+      try { concepts = JSON.parse(row.concepts) } catch {}
+    }
+
+    return c.json({
+      ok: true,
+      engram: {
+        id: row.id,
+        agent_id: row.agent_id,
+        text: row.text,
+        concepts,
+        created_at: row.created_at,
+      },
+    }, 200)
+  } catch (err) {
+    return c.json({
+      error: 'memory_fetch_failed',
+      detail: err instanceof Error ? err.message : String(err),
+    }, 500)
+  }
+})
+
+// GET /memory — list recent engrams
+mirrorApp.get('/memory', async (c) => {
+  if (!c.env.DB) {
+    return c.json({ error: 'database_unavailable', detail: 'DB binding missing' }, 500)
+  }
+
+  const agentId = c.req.query('agent_id')
+  const limit = Math.min(Math.max(1, Number(c.req.query('limit')) || 20), 100)
+
+  try {
+    const sql = agentId
+      ? 'SELECT id, agent_id, text, concepts, created_at FROM engrams WHERE agent_id = ? ORDER BY id DESC LIMIT ?'
+      : 'SELECT id, agent_id, text, concepts, created_at FROM engrams ORDER BY id DESC LIMIT ?'
+    const params = agentId ? [agentId, limit] : [limit]
+    const rows = await c.env.DB.prepare(sql).bind(...params).all<{ id: string; agent_id: string; text: string; concepts: string | null; created_at: string }>()
+
+    const engrams = (rows.results ?? []).map((r) => {
+      let concepts: string[] | undefined
+      if (r.concepts) {
+        try { concepts = JSON.parse(r.concepts) } catch {}
+      }
+      return { id: r.id, agent_id: r.agent_id, text: r.text, concepts, created_at: r.created_at }
+    })
+
+    return c.json({ ok: true, engrams, total: engrams.length }, 200)
+  } catch (err) {
+    return c.json({
+      error: 'memory_list_failed',
+      detail: err instanceof Error ? err.message : String(err),
+    }, 500)
+  }
+})
+
