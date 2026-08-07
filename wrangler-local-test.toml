@@ -8,6 +8,8 @@ name = "mupot-local-test"
 main = "src/index.ts"
 compatibility_date = "2026-06-01"
 compatibility_flags = ["nodejs_compat"]
+[build]
+command = "node scripts/generate-build-info.mjs"
 
 [vars]
 TENANT_SLUG = "local"

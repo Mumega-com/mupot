@@ -3,8 +3,8 @@
 ## 0.26.0 — 2026-08-07
 
 - **Build-Time Release Identity & Version Truth** (`src/health.ts`, `scripts/generate-build-info.mjs`; #443, #571).
-  - `/health` and deployment consoles now stamp exact commit identity (`commit`), build timestamp (`built_at`), and working-tree cleanliness (`clean`) by construction via `src/build-info.ts` fallback when runtime environment variables are omitted.
-  - Eliminated decorative `clean: false` state; `clean` strictly reflects build-time git status and main-branch ancestry verification.
+  - `/health` and deployment consoles now stamp exact commit identity (`commit`), branch (`ref`), build timestamp (`built_at`), and working-tree cleanliness (`clean`) by construction via `src/build-info.ts` fallback when runtime environment variables are omitted.
+  - Eliminated decorative `clean: false` state; `clean` strictly reflects working-tree status (`git status --porcelain`). Branch identity is tracked separately via `ref`.
 
 - **Sovereign Addons & Memory Engine (v0.28.0)** (`src/addons/`, `src/telemetry/`, `src/dashboard/motherboard.ts`; #780, #796, #797, #798).
   - Four modular Hono addon sub-apps (`sos`, `mirror`, `inkwell`, `torivers`) with fail-closed HTTP 503 `unconfigured_secret` and 401 authentication handlers.
