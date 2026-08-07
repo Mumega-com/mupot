@@ -60,6 +60,80 @@ on sensitive surfaces · "restore" commits get diffed against their claim · rig
 budget scales with blast radius · consultations on GitHub artifacts, buses carry
 pointers.
 
+## Cloudflare: credential governance and platform roadmap
+
+### Credential governance (policy, effective 2026-08-07)
+
+**No broad-access Cloudflare credentials.** Every CF credential is fine-grained,
+purpose-scoped, resource-scoped, and expiring. A token is minted for one named
+consumer with the minimum permission groups that consumer provably needs, scoped to
+specific zones/accounts — never "all zones" — and carries an `expires_on`. Requesting
+one states: consumer, operations performed, permission groups, resource scope, expiry.
+
+The registry of live tokens and their scopes lives in
+[docs/security/cloudflare-key-registry.md](docs/security/cloudflare-key-registry.md)
+and is surfaced in the mupot dashboard Docs so members can see what exists and at what
+scope without holding a credential.
+
+**Measured state at the time this policy was written, because the policy exists for a
+reason:** the account carried **16 active account-owned tokens, 12 of them with
+`expires_on: None`**, several issued before the 2026-07-29 sweep that was recorded as
+ending standing admin access. A credential believed retired verified `active` with no
+expiry. Retirement is not complete until an independent probe says so.
+
+⚠ **Verify on the right endpoint.** An account-owned token FAILS the user-scoped
+`/user/tokens/verify` with a plain `Invalid API Token`, which is indistinguishable from
+a revoked token. The correct probe is `/accounts/<account_id>/tokens/verify`. A
+known-good token returning "Invalid" on the wrong endpoint is the tell.
+
+**Revocation order — never revoke first.** Inventory consumers → mint scoped
+replacements → cut over → verify → revoke. Killing a credential a CI workflow or a
+running agent depends on fails silently and is found later by a human noticing.
+
+### Platform roadmap (Cloudflare for Startups)
+
+⚠ **Confirm our credit tier in the dashboard before budgeting against any cap.** The
+program is three-tiered, not a flat $10k, and the caps differ by an order of magnitude:
+
+| Tier | Credit | Workers AI sub-cap |
+|---|---|---|
+| Tier 3 (our likely tier) | $10,000 | **$2,500** |
+| Tier 2 | $100,000 | $10,000 |
+| Tier 1 (accelerator partner) | $350,000 | $50,000 |
+
+A prior internal note recorded the **$50k** Workers AI cap as ours. That figure is real
+but belongs to Tier 1. If we are Tier 3 the real ceiling is **$2,500**, and any plan
+that assumed 20× that is wrong. **AI Gateway remains excluded from credits.** R2 +
+Cache Reserve alone is capped at $10k and could consume the entire grant. Credits
+expire at one year or on exhaustion, whichever comes first, with no extensions and no
+stated grace period before card billing resumes. Several products we care about
+(Zero Trust/Access, Hyperdrive, Browser Run, Containers, AI Search, Turnstile, Logpush,
+Analytics Engine) are not named on the program page at all — their credit status is
+genuinely unknown, which is not the same as excluded.
+
+**Adopt.** *Browser Run* (GA 2026-04-15, renamed from Browser Rendering) replaces the
+GEO/SEO screenshot pipeline. *Analytics Engine + Workers Logpush* on our existing
+Workers Paid plan — not the Enterprise-only zone Logpush — is the cheapest fix for thin
+observability now that the gatherer gives us something worth logging. *Cloudflare
+Tunnel* plus a narrow Access re-widen scoped strictly to the Hetzner box and internal
+admin surfaces.
+
+**Evaluate.** *Workflows* passes the gates-not-routers test — it is a durable-execution
+primitive, not an orchestration framework, so it does not collide with our gate model
+the way LangGraph/CrewAI would. *Queues* is a real upgrade over poll-based dispatch,
+but Worker consumers cap at 15 minutes, so long-running host agents still pull over
+HTTP rather than being pushed to. *Hyperdrive* for Mirror's Postgres, wired after
+Tunnel — note it does not fix recall/remember reliability, only the connection path.
+
+**Do not plan around.** *Containers* is GA (2026-04-13) but is wake-on-request /
+sleep-when-idle with ephemeral disk. It is **not** a drop-in replacement for the
+persistent Hetzner agent processes, and the VPS exit must not be scheduled against it
+without a real re-architecture. *Agents SDK* — take the Durable Object state/WebSocket
+primitives and MCP hosting; **reject its `waitForApproval()` / `runWorkflow()`
+orchestration layer**, which duplicates mupot's gate system and is the same category of
+dependency we already declined. *AI Search / AutoRAG* is a shallow wrapper over the
+Vectorize pipeline we already operate.
+
 ## Product hierarchy
 
 Mupot uses one project-centered vocabulary:
