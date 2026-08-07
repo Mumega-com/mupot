@@ -170,6 +170,10 @@ export interface Env {
   // GONE — /channels resolves the caller to a member (member_identities) and applies
   // their capabilities, which the allowlist could not do. Do not reintroduce them:
   // a second authorisation model on one surface means the weaker one sets the level.
+  // Telegram notification bridge — PRIMARY delivery path (direct to Bot API).
+  // Set via: npx wrangler secret put TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
+  TELEGRAM_BOT_TOKEN?: string
+  TELEGRAM_CHAT_ID?: string
   HERMES_WEBHOOK_SECRET?: string
   TELEGRAM_BRIDGE_URL?: string
   IM_WEBHOOK_SECRET?: string // shared secret for the IM webhook (Telegram secret_token)
