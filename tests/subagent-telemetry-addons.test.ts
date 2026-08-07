@@ -223,6 +223,23 @@ describe('SOS Event Bus Bridge Sub-App (src/addons/sos.ts)', () => {
     expect(body.error).toBe('bus_publish_failed')
     expect(body.detail).toContain('Queue connection dropped')
   })
+
+  it('Flight F1: fails closed with HTTP 503 unconfigured_secret when SOS_SECRET is missing', async () => {
+    const unconfiguredEnv = {
+      DB: harness.db,
+      TENANT_SLUG: 'mumega',
+    } as Env
+
+    const res = await sosApp.request('/publish', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ type: 'test' }),
+    }, unconfiguredEnv)
+
+    expect(res.status).toBe(503)
+    const body = await res.json() as Record<string, unknown>
+    expect(body.error).toBe('unconfigured_secret')
+  })
 })
 
 // ── 3. Mirror 16D RRF Memory Search Sub-App Tests ──────────────────────────
@@ -242,6 +259,23 @@ describe('Mirror 16D RRF Memory Search Sub-App (src/addons/mirror.ts)', () => {
       body: JSON.stringify({ query: 'telemetry' }),
     }, env)
     expect(res.status).toBe(401)
+  })
+
+  it('Flight F1: fails closed with HTTP 503 unconfigured_secret when MIRROR_SECRET is missing', async () => {
+    const unconfiguredEnv = {
+      DB: harness.db,
+      TENANT_SLUG: 'mumega',
+    } as Env
+
+    const res = await mirrorApp.request('/search', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ query: 'telemetry' }),
+    }, unconfiguredEnv)
+
+    expect(res.status).toBe(503)
+    const body = await res.json() as Record<string, unknown>
+    expect(body.error).toBe('unconfigured_secret')
   })
 
   it('stores engrams and performs 16D RRF memory search', async () => {
@@ -346,6 +380,23 @@ describe('Inkwell Publishing Sub-App (src/addons/inkwell.ts)', () => {
       body: JSON.stringify({ title: 'T', slug: 's', content: 'c' }),
     }, env)
     expect(res.status).toBe(401)
+  })
+
+  it('Flight F1: fails closed with HTTP 503 unconfigured_secret when INKWELL_SECRET is missing', async () => {
+    const unconfiguredEnv = {
+      DB: harness.db,
+      TENANT_SLUG: 'mumega',
+    } as Env
+
+    const res = await inkwellApp.request('/publish', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ title: 'T', slug: 's', content: 'c' }),
+    }, unconfiguredEnv)
+
+    expect(res.status).toBe(503)
+    const body = await res.json() as Record<string, unknown>
+    expect(body.error).toBe('unconfigured_secret')
   })
 
   it('publishes content and creates draft items', async () => {
