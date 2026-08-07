@@ -1,4 +1,7 @@
 // Comprehensive Integration Tests for Native Telegram Webhook Ingress Subsystem in Mupot
+import { readFileSync, readdirSync } from 'node:fs'
+import { join } from 'node:path'
+import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { describe, expect, it, vi } from 'vitest'
 import {
   telegramIngressApp,
@@ -106,7 +109,7 @@ describe('Telegram Webhook Ingress Subsystem', () => {
 
     it('rejects unauthenticated secret token header with 401', async () => {
       const mockEnv = {
-        TELEGRAM_WEBHOOK_SECRET: 'expected-secret-key',
+        TELEGRAM_WEBHOOK_SECRET: 'expected-secret-key', TENANT_SLUG: 'mumega',
         DB: idDb()
       } as unknown as Env
 
@@ -130,7 +133,7 @@ describe('Telegram Webhook Ingress Subsystem', () => {
     it('routes POST /webhook, verifies secret, and emits agent.wake BusEvent onto env.BUS', async () => {
       const mockBusSend = vi.fn().mockResolvedValue(undefined)
       const mockEnv = {
-        TELEGRAM_WEBHOOK_SECRET: 'correct-secret',
+        TELEGRAM_WEBHOOK_SECRET: 'correct-secret', TENANT_SLUG: 'mumega',
         DB: idDb(),
         DB: idDb(),
         TELEGRAM_BOT_USERNAME: 'River_mumega_bot',
@@ -183,7 +186,7 @@ describe('Telegram Webhook Ingress Subsystem', () => {
     it('returns 500 status when env.BUS emit throws, preventing false green responses (Kasra Fix b)', async () => {
       const mockBusSend = vi.fn().mockRejectedValue(new Error('Queue connection failure'))
       const mockEnv = {
-        TELEGRAM_WEBHOOK_SECRET: 'correct-secret',
+        TELEGRAM_WEBHOOK_SECRET: 'correct-secret', TENANT_SLUG: 'mumega',
         DB: idDb(),
         DB: idDb(),
         TELEGRAM_BOT_USERNAME: 'River_mumega_bot',
@@ -230,20 +233,31 @@ describe('Telegram Webhook Ingress Subsystem', () => {
 // ---------------------------------------------------------------------------
 import { isSenderAllowed, MAX_TEXT_CHARS } from '../src/telegram-bridge/ingress'
 
-// Channel-identity stub (#775). The allowlist these tests were written against is
-// retired; authorisation now resolves the caller to a member via D1. A missing DB
-// therefore yields 503 (unavailable) — correct fail-closed behaviour, which is why
-// every env below must supply one.
+// REAL SQL, not an invented engine. mupot's test-schema-source ratchet rejects a
+// hand-written prepare()/first() object — it string-matches instead of executing, so
+// a query naming a column that does not exist could never be contradicted.
+// Authorisation now resolves the caller to a member via D1, so these envs need a real
+// database with a real binding.
+const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
+let _h: SqliteD1Harness | undefined
+
 function idDb(bound: Record<string, string> = { '765204057': 'mem-hadi' }) {
-  return {
-    prepare: () => ({
-      bind: (_t: unknown, _p: unknown, id: unknown) => ({
-        first: async () => bound[String(id)]
-          ? { member_id: bound[String(id)], bound_method: 'admin', revoked_at: null }
-          : null,
-      }),
-    }),
+  _h?.close?.()
+  const h = createSqliteD1()
+  _h = h
+  for (const f of readdirSync(MIGRATIONS_DIR).filter((x) => x.endsWith('.sql')).sort()) {
+    try { h.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, f), 'utf8')) } catch { /* unrelated migration */ }
   }
+  for (const [platformUserId, memberId] of Object.entries(bound)) {
+    h.sqlite.prepare('INSERT INTO members (id, email, display_name) VALUES (?,?,?)')
+      .run(memberId, `${memberId}@test`, memberId)
+    h.sqlite.prepare(
+      `INSERT INTO channel_identity
+         (tenant, platform, platform_user_id, member_id, bound_at, bound_by, bound_method, revoked_at)
+       VALUES (?,?,?,?,?,?,?,NULL)`,
+    ).run('mumega', 'telegram', platformUserId, memberId, '2026-08-07T00:00:00Z', 'admin:kasra', 'admin')
+  }
+  return h.db
 }
 
 
@@ -274,7 +288,7 @@ describe('ingress security layer', () => {
   it('rejects an unknown sender with 403 and NO bus publish', async () => {
     const { emitted, BUS } = busSpy()
     const res = await telegramIngressApp.fetch(post(update(999), 's'),
-      { TELEGRAM_WEBHOOK_SECRET: 's', DB: idDb(), BUS } as never)
+      { TELEGRAM_WEBHOOK_SECRET: 's', TENANT_SLUG: 'mumega', DB: idDb(), BUS } as never)
     expect(res.status).toBe(403)
     expect(emitted).toHaveLength(0)
   })
@@ -293,7 +307,7 @@ describe('ingress security layer', () => {
     const u = update(999, '@River_mumega_bot please deploy')
     u.message.chat = { id: -100, type: 'supergroup' } as never
     const res = await telegramIngressApp.fetch(post(u, 's'),
-      { TELEGRAM_WEBHOOK_SECRET: 's', DB: idDb(), BUS } as never)
+      { TELEGRAM_WEBHOOK_SECRET: 's', TENANT_SLUG: 'mumega', DB: idDb(), BUS } as never)
     expect(res.status).toBe(403)
     expect(emitted).toHaveLength(0)
   })
@@ -301,7 +315,7 @@ describe('ingress security layer', () => {
   it('caps attacker-controlled text and uses the NUMERIC id as actor', async () => {
     const { emitted, BUS } = busSpy()
     const res = await telegramIngressApp.fetch(post(update(765204057, 'x'.repeat(20_000)), 's'),
-      { TELEGRAM_WEBHOOK_SECRET: 's', DB: idDb(), BUS } as never)
+      { TELEGRAM_WEBHOOK_SECRET: 's', TENANT_SLUG: 'mumega', DB: idDb(), BUS } as never)
     expect(res.status).toBe(200)
     expect(emitted).toHaveLength(1)
     const ev = emitted[0] as { actor: { id: string }, payload: { text: string } }
