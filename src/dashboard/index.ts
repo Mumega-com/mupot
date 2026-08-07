@@ -187,6 +187,7 @@ import type { PhysicsSnapshot } from './brain'
 import { loadGrowthView, growthBody } from './growth'
 import { loadFleetRadar } from './radar'
 import { radarPageBody } from './radar-view'
+import { loadMotherboardData, motherboardPageBody } from './motherboard'
 import { setLoopControl, isLoopControlAction } from '../loops/decisions'
 import { getLoop } from '../loops/service'
 import {
@@ -1160,6 +1161,25 @@ dashboardApp.get('/radar', async (c) => {
   const wantsJson = c.req.query('format') === 'json' || (accept.includes('application/json') && !accept.includes('text/html'))
   if (wantsJson) return c.json(radar)
   return c.html(shell(c.env, 'Radar', radarPageBody(radar)))
+})
+
+// ── motherboard (Fractal Motherboard Map visual topology engine — #v0.28.0) ──
+dashboardApp.get('/motherboard', async (c) => {
+  const tenant = c.req.query('tenant') ?? 'mumega.com'
+  const data = await loadMotherboardData(c.env, tenant)
+  const accept = c.req.header('accept') ?? ''
+  const wantsJson = c.req.query('format') === 'json' || (accept.includes('application/json') && !accept.includes('text/html'))
+  if (wantsJson) return c.json(data)
+  return c.html(shell(c.env, 'Fractal Motherboard', motherboardPageBody(data)))
+})
+
+dashboardApp.get('/dashboard/motherboard', async (c) => {
+  const tenant = c.req.query('tenant') ?? 'mumega.com'
+  const data = await loadMotherboardData(c.env, tenant)
+  const accept = c.req.header('accept') ?? ''
+  const wantsJson = c.req.query('format') === 'json' || (accept.includes('application/json') && !accept.includes('text/html'))
+  if (wantsJson) return c.json(data)
+  return c.html(shell(c.env, 'Fractal Motherboard', motherboardPageBody(data)))
 })
 
 // ── fleet (CF-native roster — ADR gh #473; SOS bus retired from this path) ───
@@ -3614,6 +3634,12 @@ function shell(
           <a class="nav-link" href="/radar">
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><circle cx="10" cy="10" r="7"/><circle cx="10" cy="10" r="1.4" fill="currentColor" stroke="none"/><path d="M10 3v2M10 15v2M3 10h2M15 10h2"/></svg>
             <span class="nav-label">Radar</span>
+          </a>
+
+          <!-- Motherboard (Fractal Motherboard map — v0.28.0) -->
+          <a class="nav-link" href="/motherboard">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><rect x="3" y="3" width="14" height="14" rx="2"/><path d="M7 7h2v2H7zM11 7h2v2h-2zM7 11h2v2H7zM11 11h2v2h-2z"/></svg>
+            <span class="nav-label">Motherboard</span>
           </a>
 
           <!-- Health (operator console) -->
