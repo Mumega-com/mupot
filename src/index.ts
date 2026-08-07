@@ -57,6 +57,7 @@ import { addonsApp } from './addons/routes'
 import { sosApp } from './addons/sos'
 import { mirrorApp } from './addons/mirror'
 import { inkwellApp } from './addons/inkwell'
+import { toriversAddonApp } from './addons/torivers'
 import { projectLinkApp } from './addons/project-link/routes'
 import { presenceApp } from './registry/presence-routes'
 import { routinesApp } from './routines/routes'
@@ -152,13 +153,15 @@ app.route('/api/inbox', inboxApp)
 // dashboard /coordination. Before the '/' catch-all.
 app.route('/api/coordination', coordinationApp)
 
-// Modular sovereign addon sub-apps (SOS bridge, Mirror RRF search, Inkwell CMS).
+// Modular sovereign addon sub-apps (SOS bridge, Mirror RRF search, Inkwell CMS, ToRivers automations).
 app.route('/api/sos', sosApp)
 app.route('/api/mirror', mirrorApp)
 app.route('/api/inkwell', inkwellApp)
+app.route('/api/torivers', toriversAddonApp)
 app.route('/api/addons/sos', sosApp)
 app.route('/api/addons/mirror', mirrorApp)
 app.route('/api/addons/inkwell', inkwellApp)
+app.route('/api/addons/torivers', toriversAddonApp)
 
 // Native addon catalog and lifecycle commands. Before the dashboard catch-all.
 app.route('/api/addons', addonsApp)
