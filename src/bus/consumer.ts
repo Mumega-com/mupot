@@ -18,6 +18,7 @@ import type { Env, BusEvent, Task } from '../types'
 import { postAgentActivity } from '../channels'
 import { getFleetAgentLiveness } from '../fleet/registry'
 import { deliverDispatchToInbox, dispatchInboxDelivered, InboxFullError, DISPATCH_INBOX_PREFIX } from './fleet-bridge'
+import { notifyHadi } from '../telegram-bridge/bus_notify'
 
 // Internal origin for DO fetch routing. DO fetch ignores host; the path carries
 // the intent. The agents component routes these paths inside its DO classes.
@@ -364,8 +365,6 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
     }
     case 'task.updated':
     case 'task.completed':
-    case 'task.review':   // K1: gated execution success — task awaits verdict; no DO wake
-    case 'task.blocked':
     case 'task.verdict':
     case 'fleet.control.requested':
     case 'brain.directive.updated':
@@ -374,6 +373,29 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
       // Terminal observations, gate decisions, and structural provisioning; no DO
       // wake by default. Log for the activity feed (the agent-actor branch in
       // handleQueue surfaces task.completed/blocked into the squad's bound channel).
+      console.log(`bus: ${event.type}`, {
+        tenant: event.tenant,
+        squad_id: event.squad_id,
+      })
+      return true
+    }
+    case 'task.review':   // K1: gated execution success — task awaits verdict; no DO wake
+    case 'task.blocked': {
+      // Notify Hadi via Telegram bridge when a task needs his opinion
+      console.log(`bus: ${event.type} — notifying Hadi`, {
+        tenant: event.tenant,
+        task_id: (event.payload as any)?.task_id,
+      })
+      await notifyHadi(env, {
+        type: event.type,
+        task_id: (event.payload as any)?.task_id,
+        title: (event.payload as any)?.task_title,
+        squad_id: event.squad_id,
+        agent_id: event.agent_id,
+        project_id: (event.payload as any)?.project_id,
+      })
+      // Still log for the activity feed (the agent-actor branch in handleQueue
+      // surfaces task events into the squad's bound channel).
       console.log(`bus: ${event.type}`, {
         tenant: event.tenant,
         squad_id: event.squad_id,
