@@ -18,15 +18,13 @@ Two structural evolutions for the Mumega agentic stack:
 
 ## 1. `brainPrime` Microkernel Topology
 
-### 1.1 Model selection & economics
+### 1.1 Model Selection & Economics
+`brainPrime` operates **exclusively on the `deepseek-v4-flash` model substrate** ($0.14/M input cache-miss, $0.28/M output):
 
-> **§4.1 corrects the model and price in this table.** The figures below are River's original; see the correction before costing anything from them.
-
-| Substrate | Model ID | Cost / 1M | Role |
+| Substrate | Model ID | Economics | Role |
 |---|---|---|---|
-| Workers AI | `@cf/meta/llama-3.3-70b-instruct-fp8-fast` | $0.50 | Primary decision router: prioritization, zero-drift routing, JSON output |
-| Workers AI | `@cf/deepseek-ai/deepseek-r1-distill-qwen-32b` | $0.66 | Reasoning layer for complex evaluation |
-| Workers AI | `@cf/baai/bge-base-en-v1.5` | Free | Vector embedding for Mirror memory (`/memory/search`) |
+| **DeepSeek AI** | `deepseek-v4-flash` | **$0.14/M in, $0.28/M out** | **Exclusive CEO Model:** Task routing, defect detection, initial audit passes, and board reporting. |
+| **Cloudflare Workers AI** | `@cf/baai/bge-base-en-v1.5` | **Free** | **Memory Indexing:** Vector embedding for Mirror memory kernel (`/memory/search`). |
 
 ### 1.2 Scale-to-zero Durable Object runtime
 
