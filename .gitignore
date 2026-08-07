@@ -20,3 +20,7 @@ wrangler.*.toml
 
 # mint artifacts: generated SQL carries token hashes + identity rows — never commit
 scripts/mint*.sql
+
+# Python bytecode — swept into a PR by `git add -A` on 2026-08-07.
+__pycache__/
+*.pyc
