@@ -286,3 +286,21 @@ DONE — all 10, flipped to private and verified via API afterward:
 | `Mumega-com/archive-mumega-marketing` | Same archived-repo dance. `brand/GUIDELINES.md` was past Hadi's 3-month freshness cutoff (last touched 2026-01-06), so migrated nothing — privatized directly per his call. |
 
 All items from the original public-repo review are now closed.
+
+**Additional privatizations, 2026-08-07, direct instruction from Hadi** (not part of the
+original recommend-private analysis — these were originally assessed as fine to keep
+public; Hadi made the call to privatize anyway):
+
+| repo | notes |
+|---|---|
+| `Digidinc/Mydiv` | |
+| `Digidinc/myDivClient` | |
+| `Digidinc/react-postgres-fullstack-template` | |
+| `Digidinc/multiplayer-globe-template` | |
+
+Current public repo count: 15 (down from the original 29). Remaining public:
+`fractalresonance` (servathadi); `strapi-plugin-formflow`, `formflow`, `formflow-sdk`,
+`formflow-telemetry`, `shabrang`, `shabrang-cms` (Digidinc); `mupot`, `inkwell`, `sos`,
+`mupot-plugin`, `mirror`, `mumega-motion-theme`, `therealmofpatterns`,
+`mcpwp-claude-plugin`, `torivers.com` (Mumega-com). `formflow-telemetry` remains the one
+unreviewed item — no README/description found, not yet checked.
