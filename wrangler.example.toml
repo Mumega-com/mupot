@@ -8,6 +8,9 @@ main = "src/index.ts"
 compatibility_date = "2026-06-01"
 compatibility_flags = ["nodejs_compat"]
 
+[build]
+command = "node scripts/generate-build-info.mjs"
+
 # ── tenant config (non-secret; secrets via `wrangler secret put`) ──
 [vars]
 TENANT_SLUG = "mumega"          # your org slug

@@ -29,6 +29,10 @@
 
 import { spawnSync } from 'node:child_process'
 import { assertNoCallerReleaseSha, isMainDescendant, releaseShaDeployArgs } from './lib/release-sha.mjs'
+import { generateBuildInfo } from './generate-build-info.mjs'
+
+// Automatically stamp src/build-info.ts prior to deploy
+generateBuildInfo()
 
 function capture(cmd, args) {
   const r = spawnSync(cmd, args, { encoding: 'utf8' })

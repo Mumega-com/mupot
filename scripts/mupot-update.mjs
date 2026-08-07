@@ -20,6 +20,10 @@ import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { dirname, join, resolve } from 'node:path'
 import { isFullSha, isMainDescendant, releaseShaDeployArgs } from './lib/release-sha.mjs'
+import { generateBuildInfo } from './generate-build-info.mjs'
+
+// Automatically stamp src/build-info.ts prior to multi-pot update
+generateBuildInfo()
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const DESTRUCTIVE = /\bDROP\s+TABLE\b|\bDROP\s+COLUMN\b|\bDELETE\s+FROM\b|\bTRUNCATE\b|\bRENAME\s+TO\b/i
