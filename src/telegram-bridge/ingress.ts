@@ -3,6 +3,7 @@
 
 import { Hono } from 'hono'
 import type { Env, BusEvent } from '../types'
+import { resolveChannelIdentity, mayDispatch, refusalCode } from '../channels/identity'
 import { createBus } from '../bus'
 import type { TelegramUpdate, TelegramIngressResult } from './types'
 
@@ -49,27 +50,15 @@ export function validateSecretToken(
 }
 
 /**
- * Is this Telegram user permitted to reach dispatch?
- *
- * A Telegram bot is PUBLICLY ADDRESSABLE — anyone who knows its handle can DM it.
- * The secret-token header proves TELEGRAM is the caller; it says nothing about WHO
- * wrote the message. Without this check the route is unauthenticated remote task
- * dispatch into the fleet.
- *
- * Matches on the NUMERIC user id, never the username: usernames are user-mutable
- * and can be released and re-registered by someone else.
- *
- * Fails CLOSED — an unset, empty, or unparseable allowlist rejects everyone.
+ * @deprecated Superseded by channel_identity (#775). Retained ONLY so a stale
+ * TELEGRAM_ALLOWED_SENDERS in config cannot silently widen access: it is no longer
+ * consulted on the dispatch path. Delete once no environment sets that var.
  */
 export function isSenderAllowed(fromId: number | undefined, rawAllow?: string): boolean {
   if (fromId === undefined || !Number.isFinite(fromId)) return false
   if (!rawAllow) return false
-  const allowed = rawAllow
-    .split(/[,\s]+/)
-    .map((s) => s.trim())
-    .filter(Boolean)
-  if (allowed.length === 0) return false
-  return allowed.includes(String(fromId))
+  const allowed = rawAllow.split(/[,\s]+/).map((x) => x.trim()).filter(Boolean)
+  return allowed.length > 0 && allowed.includes(String(fromId))
 }
 
 /**
@@ -152,13 +141,23 @@ telegramIngressApp.post('/webhook', async (c) => {
     return c.json({ error: 'Invalid JSON body' }, 400)
   }
 
-  // AUTHORISATION. Runs BEFORE any parsing decision that could cause a side effect.
+  // IDENTITY. Runs BEFORE any parsing decision that could cause a side effect.
   // A mention is a routing hint, never a credential — an attacker in a group can
-  // @mention the bot too, so this check is not conditional on chat type.
+  // @mention the bot too, so this is not conditional on chat type.
+  //
+  // Resolves WHO is calling, so dispatch can carry the CALLER's authority rather
+  // than the bot's. An unresolvable identity is refused with no side effect —
+  // identical fail-closed behaviour to the allowlist it replaces, but now keyed on
+  // a deliberate, revocable, audited binding instead of an env var.
   const fromId = (update.message || update.edited_message || update.channel_post)?.from?.id
-  if (!isSenderAllowed(fromId, c.env.TELEGRAM_ALLOWED_SENDERS)) {
-    console.warn('[telegram-ingress] rejected sender', fromId ?? '<none>')
-    return c.json({ error: 'sender_not_allowed' }, 403)
+  const identity = await resolveChannelIdentity(c.env, 'telegram', fromId)
+  if (!mayDispatch(identity)) {
+    // 503 for an infrastructure failure, 403 for a genuine refusal. Collapsing
+    // these would make a database outage indistinguishable from a stranger — and
+    // an outage that reads as normal operation is one nobody investigates.
+    const status = identity.kind === 'unavailable' ? 503 : 403
+    console.warn('[telegram-ingress] refused', refusalCode(identity), 'caller', fromId ?? '<none>')
+    return c.json({ error: refusalCode(identity) }, status)
   }
 
   const botUsername = c.env.TELEGRAM_BOT_USERNAME || DEFAULT_BOT_USERNAME
@@ -179,9 +178,10 @@ telegramIngressApp.post('/webhook', async (c) => {
     const event: BusEvent = {
       type: 'agent.wake',
       tenant: c.env.TENANT_SLUG || 'mumega',
-      // Numeric id, not the display name: usernames are user-mutable, so a
-      // display-name actor is a spoofable identity on an audited event.
-      actor: { kind: 'member', id: `telegram:${fromId}` },
+      // The resolved MEMBER is the actor — not the bot, and not a display name.
+      // This is what makes the dispatch carry the caller's authority: downstream
+      // authorisation reads a real member id and applies that member's grants.
+      actor: { kind: 'member', id: identity.memberId },
       payload: {
         source: 'telegram',
         chat_id: result.chatId,
