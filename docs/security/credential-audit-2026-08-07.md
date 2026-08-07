@@ -164,3 +164,80 @@ rule 2 ("Never `.env.secrets`. Each consumer gets its own file") and for finally
 - Decision needed from Hadi on the 10 "recommend private" repos above.
 - Secrets-manager selection (Bitwarden Secrets Manager vs. Infisical) for VPS process
   secrets — not yet decided, proposed here for the first time.
+
+## Prelaunch security posture — external research, 2026-08-07
+
+Requested by Hadi: what is the industry seeing on AI-coding-agent secret leaks, and does
+it change the public/private repo decision above. Summary of external research (sources
+inline); full findings available on request.
+
+### This incident is a named, documented pattern — not a one-off
+
+- **"Comment and Control"** (Aonan Guan, covered by VentureBeat): prompt injection via
+  GitHub PR/issue comments got Claude Code, Gemini CLI, and GitHub Copilot Agent to read
+  `/proc/*/environ` and exfiltrate `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` / `GITHUB_TOKEN`.
+  Command-blocklisting (Anthropic blocked `ps`) didn't hold — equivalent commands achieved
+  the same exfiltration.
+- Anthropic's own March 2026 tracker confirmed Claude Code printing full API keys into
+  **model-visible output and session history** — the same failure mode as tonight's
+  incident, at a different vendor.
+- **GitGuardian State of Secrets Sprawl 2026**: commits co-authored by Claude Code leak
+  secrets at **~2x the baseline rate** across public GitHub. 29M new hardcoded secrets
+  exposed on public GitHub in 2025 (+34% YoY); secrets tied to AI services specifically:
+  1.27M, +81% YoY.
+
+### MCP-specific risk — directly relevant, this is our own product surface
+
+- "Tool poisoning" (CVE-2025-54136 MCPoison, CVE-2025-54135 CurXecute): a compromised MCP
+  server embeds adversarial instructions in tool descriptions at connect time; responses
+  aren't re-vetted at runtime, so a poisoned server can instruct the agent to read a
+  sensitive file and pass its contents as a parameter, exfiltrating silently.
+- GitGuardian: **24,008 unique secrets found sitting in MCP configuration files**
+  industry-wide. We run MCP infrastructure (sos, mcpwp, mumcp-proxy) — this is exposure
+  in our own product category, not just background risk.
+
+### New action item — `CLAUDE.md` as a supply-chain vector
+
+The "TrapDoor" campaign (May 2026, 34 malicious packages across npm/PyPI/Crates.io)
+planted invisible instructions inside `.cursorrules` and `CLAUDE.md` files that hijack the
+agent on next read (a fake "security scan" that steals credentials). Separately, 5
+typosquatting npm packages hijacked Claude Code's `SessionStart` hook to re-execute on
+every session.
+
+CONFIRMED: public `CLAUDE.md` files exist in `sos`, `mcpwp-claude-plugin`, `torivers.com`,
+and `therealmofpatterns`. Not evidence of tampering — no review has been done yet — but
+worth a clean-history check before launch, especially `mcpwp-claude-plugin` since it's
+distributed as an installable Claude Code plugin (a direct analogue to the TrapDoor
+vector).
+
+### Does this change the public/private recommendation above? No — it reframes the fix.
+
+GitGuardian: **private repositories are 6x more likely to contain hardcoded secrets than
+public ones** — the privacy of a private repo creates false security, while public-repo
+pressure forces better hygiene. The data does not support "go private for safety." It
+supports the opposite lever: **credential brokering** — secrets live in infrastructure
+outside the agent's sandbox and are injected server-side, so the agent's context (and
+therefore its transcript) never contains the raw value, regardless of whether the repo is
+public or private.
+
+Anthropic converged on the same architecture and open-sourced it, May 2026:
+`anthropic-experimental/sandbox-runtime` — OS-level sandboxing (Seatbelt/bubblewrap),
+filesystem writes confined to the workspace, network denied by default, credential proxy
+living *outside* the sandbox so tokens are structurally unreachable from code the agent
+runs. Reported 84% fewer permission prompts alongside improved containment.
+
+**This is the stronger version of issue #772.** Bitwarden Secrets Manager / Infisical
+solves "no giant flat file for an agent to `cat`." Sandboxing the agent process itself
+solves it at the layer above: the agent structurally cannot reach the secret store at all,
+so even a successful prompt-injection attempt (section above) has nothing to exfiltrate.
+
+### Indexing / backlink check (informed the keep-public list above)
+
+CONFIRMED via search: `mupot`, `sos`, `inkwell`, `mumega-docs`, and `mumcp-proxy` are
+indexed and cross-linked from real MCP-ecosystem discovery surfaces — Glama, PulseMCP,
+awesome-claude-code, wordpress.org's plugin directory. `mumega.com` itself is indexed.
+This is live backlink/discovery value, not hypothetical — reinforces keeping these public.
+
+CONFIRMED via search: `qbo-mini`, `qbo-torivers`, and all four `archive-*` repos have
+**zero indexing footprint** — nothing links to them, nothing surfaces. Flipping these
+private costs nothing on the SEO/discovery side.
