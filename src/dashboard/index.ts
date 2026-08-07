@@ -45,7 +45,14 @@ import { requireAuth } from '../auth'
 // Fine-grained RBAC — the dashboard's mutating handlers reuse the SAME gates the
 // JSON API uses (admin on org for tokens / departments; admin on the department for
 // a squad; lead on the squad for an agent). Identity is always server-derived.
-import { resolveCapabilities, hasCapability, actorMaxRankOnScope, hasSurfaceCap, isOrgAdmin } from '../auth/capability'
+import {
+  resolveCapabilities,
+  hasCapability,
+  actorMaxRankOnScope,
+  hasSurfaceCap,
+  isOrgAdmin,
+  holdsCapabilityFloor,
+} from '../auth/capability'
 
 // Shared creation paths — the dashboard handlers call the SAME service functions
 // the /api routes call, never re-implementing the write/validation logic.
@@ -243,6 +250,71 @@ dashboardApp.use('*', async (c, next) => {
     return c.html(shell(c.env, 'Forbidden', errorBody('This session is not scoped to this org.')), 403)
   }
   await next()
+})
+
+// ── capability floor (FLIGHT-001 F2 — READ was never gated, only WRITE) ────────
+// requireAuth above only proves PRESENCE (a valid session cookie), never
+// authorization. Before this gate, a random Google-connect signup resolved
+// role='member' with ZERO rows in `capabilities` / `channel_capability_grants`,
+// sailed past requireAuth (presence, not capability), and saw every menu, the
+// full agent roster, and every project/task. The dashboard's write handlers were
+// already gated (isOrgAdmin / canOnOrg / requireCapability-equivalent inline
+// checks) — reads never were. That asymmetry was the whole bug.
+//
+// The floor is deliberately the LOWEST rank on the ladder:
+// `holdsCapabilityFloor(auth, 'observer')` asks only "does this principal hold
+// ANY capability row, at ANY rank, on ANY scope" — an org grant, a department
+// grant, or a single squad 'observer' row all satisfy it, since observer is the
+// bottom of RANK and every real grant meets-or-exceeds it. That is intentionally
+// NOT the same question as "can this member see THIS resource" — individual
+// read paths (loadAllAgents, loadProjectsPage, etc.) still do their own per-scope
+// filtering; this is the coarse "you belong somewhere in this org" chokepoint
+// that a zero-capability drive-by signup can never pass, applied once instead of
+// re-implemented per route (see [[feedback_two_tools_two_copies_of_one_predicate]]
+// on why a single chokepoint beats N copies of the same predicate).
+//
+// A legacy org owner/admin (web login, no fine-grained `capabilities` array) is
+// never locked out — holdsCapabilityFloor falls back to the SAME legacy-role
+// escape requireCapability/requireOrgCapability already use.
+//
+// Scoped to GET/HEAD only, deliberately. Every mutating (POST/PUT/DELETE)
+// handler on this app ALREADY inline-gates on isOrgAdmin / canOnOrg /
+// hasSurfaceCap before it writes anything (that was true before this fix —
+// "READ was never gated, only WRITE" is the bug this closes, not evidence
+// WRITE needs the same floor). Applying the floor to writes too would also
+// wrongly reject a legitimate principal who holds ONLY a surface-scoped grant
+// (gate_grants — e.g. a scoped API key minted with content:write but no
+// capabilities-table row; see hasSurfaceCap's own comment on why that ladder
+// is intentionally separate) — such a principal has zero rows this floor can
+// see, yet is fully authorized for the specific write its token names. Reads
+// have no equivalent per-route gate to defer to, which is exactly the gap.
+dashboardApp.use('*', async (c, next) => {
+  if (c.req.method !== 'GET' && c.req.method !== 'HEAD') {
+    await next()
+    return
+  }
+  const auth = c.get('auth')
+  // isOrgAdmin is checked explicitly (not left to holdsCapabilityFloor's own
+  // legacy-role escape) because that escape only fires when auth.capabilities
+  // is `undefined` — true for every REAL owner/admin session (requireAuth's
+  // member-email bridge only ever runs for role==='member', see auth/index.ts).
+  // A coarse "does this principal belong in this pot at all" gate should never
+  // depend on whether some fine-grained capabilities array happens to be
+  // attached; that array governs PER-RESOURCE scoping (loadAllAgents,
+  // loadProjectsPage, …) downstream, not baseline dashboard access.
+  if (isOrgAdmin(auth) || holdsCapabilityFloor(auth, 'observer')) {
+    await next()
+    return
+  }
+  // Same content-negotiation precedent as GET /radar below: ?format=json or an
+  // Accept header that wants JSON without HTML gets a JSON 403; everyone else
+  // (the normal browser navigation case) gets the rendered deny page.
+  const accept = c.req.header('accept') ?? ''
+  const wantsJson =
+    c.req.query('format') === 'json' ||
+    (accept.includes('application/json') && !accept.includes('text/html'))
+  if (wantsJson) return c.json({ error: 'forbidden', need: 'capability' }, 403)
+  return c.html(shell(c.env, 'No access', noDashboardAccessBody()), 403)
 })
 
 // Addon discoverability is part of the server-rendered shell, not a client-side
@@ -1198,19 +1270,23 @@ dashboardApp.get('/coordination', async (c) => {
 // ── /agents — unified agent management ───────────────────────────────────────
 //
 // Owner/admin gated on every mutating path (create, status, delete).
-// Read (GET /agents) is open to any authenticated pot member.
+// Read (GET /agents) is open to any authenticated pot member who holds at
+// least one capability grant (the dashboard's global capability floor) — and
+// loadAllAgents itself further scopes the roster to the squads that grant
+// covers (org grant → every squad; squad/department grant → its own squads
+// only). FLIGHT-001 F2.
 
-// GET /agents — the management table: all agents across squads, plus an Add form.
+// GET /agents — the management table: agents in the caller's squads, plus an Add form.
 dashboardApp.get('/agents', async (c) => {
+  const auth = c.get('auth')
   // Trivially-cheap header wiring (same light reads as Overview — bare KV get +
   // one-row D1 scalar, not the full loadBrainView/loadEconomy).
   const [agents, squadOptions, physics, spend] = await Promise.all([
-    loadAllAgents(c.env),
+    loadAllAgents(c.env, auth),
     loadSquadOptions(c.env),
     loadBrainPhysics(c.env),
     loadTodaySpendScalar(c.env),
   ])
-  const auth = c.get('auth')
   const canManage = isOrgAdmin(auth)
   return c.html(
     shell(c.env, 'Agents', agentsBody(agents, squadOptions, canManage), {
@@ -1243,7 +1319,7 @@ dashboardApp.post('/agents', async (c) => {
     model: form.model,
   })
   if (!result.ok) {
-    const [agents, squadOptions] = await Promise.all([loadAllAgents(c.env), loadSquadOptions(c.env)])
+    const [agents, squadOptions] = await Promise.all([loadAllAgents(c.env, auth), loadSquadOptions(c.env)])
     return c.html(
       shell(c.env, 'Agents', agentsBody(agents, squadOptions, true, `Could not add agent: ${result.error}.`)),
       result.error === 'slug_taken' ? 409 : 400,
@@ -1318,11 +1394,28 @@ dashboardApp.post('/squads/:id/config', async (c) => {
 })
 
 // GET /squads/:id — squad board: charter, agents, tasks by lane.
+//
+// FLIGHT-001-adjacent (found auditing F2): this rendered ANY squad's full agent
+// + task list to ANY authenticated caller who knew or guessed the squad id — the
+// dashboard's capability floor only proves the caller belongs SOMEWHERE in the
+// org, not that they belong on THIS squad. A squad-A-only member could browse
+// straight to /squads/squad-b. Gated the same way GET /projects/:id already is
+// (loadProjectDetail → projectAccess): org-scope capability (or legacy owner/
+// admin) reads every squad; a squad/department grant reads only its own.
 dashboardApp.get('/squads/:id', async (c) => {
   const squadId = c.req.param('id')
   const squad = await getById<Squad>(c.env, 'squads', squadId)
   if (!squad) {
     return c.html(shell(c.env, 'Squad', errorBody('Squad not found.')), 404)
+  }
+  const auth = c.get('auth')
+  if (!isOrgAdmin(auth)) {
+    const grants = auth.memberId ? auth.capabilities ?? (await resolveCapabilities(c.env, auth.memberId)) : []
+    const orgRead = hasCapability(grants, 'org', null, 'observer')
+    const squadRead = orgRead || (await canOnSquadRead(c.env, grants, squadId))
+    if (!squadRead) {
+      return c.html(shell(c.env, 'Squad', errorBody('You do not have access to this squad.')), 403)
+    }
   }
   const [agents, tasks] = await Promise.all([
     c.env.DB.prepare(
@@ -1342,7 +1435,6 @@ dashboardApp.get('/squads/:id', async (c) => {
       .bind(squadId)
       .all<Task>(),
   ])
-  const auth = c.get('auth')
   const canAddAgent = await canOnSquad(c.env, auth, squadId)
   const canManage = isOrgAdmin(auth)
   return c.html(
@@ -2033,9 +2125,20 @@ dashboardApp.get('/connect/github/callback', async (c) => {
 // reuse the shared members service AND the SAME org-admin gate the JSON API uses.
 
 // GET /members — roster with mint + revoke (forms hidden for non-admins).
+// FLIGHT-001-adjacent: found auditing F2. loadMembers/loadLiveTokens return the
+// WHOLE org's member list (email, display_name, telegram_chat_id) and every live
+// token's label/channel with no scoping — same "read was never gated" shape as
+// the agent roster, but worse (PII, not just org structure), and reachable by
+// ANY capability-holding member, not only zero-capability ones (the dashboard
+// floor above stops the zero-capability case; it can't narrow this one since
+// the page has no per-squad meaning to scope by — org membership is inherently
+// org-wide). Require org-admin, same threshold /admin/members already uses.
 dashboardApp.get('/members', async (c) => {
   const auth = c.get('auth')
   const canManage = await canOnOrg(c.env, auth, 'admin')
+  if (!canManage) {
+    return c.html(shell(c.env, 'Access Tokens', errorBody('Access Tokens requires owner or admin.')), 403)
+  }
   const [members, channels, tokens] = await Promise.all([
     loadMembers(c.env),
     loadChannels(c.env),
@@ -2366,6 +2469,19 @@ async function canOnSquad(env: Env, auth: AuthContext, squadId: string): Promise
   const grants = auth.capabilities ?? (await resolveCapabilities(env, auth.memberId))
   const deptId = await squadDepartment(env, squadId)
   return hasCapability(grants, 'squad', squadId, 'lead', deptId)
+}
+
+/**
+ * squad-scope READ gate (GET /squads/:id, FLIGHT-001-adjacent) — the read
+ * threshold is 'observer', deliberately lower than canOnSquad's 'lead' write
+ * threshold above: any real member of the squad (down to observer) can view
+ * its board, matching the read floor everywhere else in this file (agent
+ * roster, projects). Takes already-resolved `grants` (caller already resolved
+ * them for the org-read check this is OR'd with) rather than re-querying.
+ */
+async function canOnSquadRead(env: Env, grants: CapabilityGrant[], squadId: string): Promise<boolean> {
+  const deptId = await squadDepartment(env, squadId)
+  return hasCapability(grants, 'squad', squadId, 'observer', deptId)
 }
 
 async function loadMembers(env: Env): Promise<Member[]> {
@@ -3749,6 +3865,15 @@ function shell(
 
 function errorBody(message: string) {
   return html`<h1>Hmm.</h1><p class="empty">${message}</p><p><a href="/">← Back to overview</a></p>`
+}
+
+// FLIGHT-001 F2 — the capability-floor deny page. Deliberately does NOT link
+// back to "/" — a zero-capability member would just bounce off the same gate.
+// Points to logout instead so the visitor can sign in with the right account.
+function noDashboardAccessBody() {
+  return html`<h1>No access</h1><p class="empty">Your account is signed in, but it doesn't hold any
+    capability grant on this workspace yet. Ask an admin to add you to a squad.</p>
+    <p><a href="/auth/logout">← Sign out</a></p>`
 }
 
 function statusDot(status: Agent['status']) {

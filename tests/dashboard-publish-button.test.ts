@@ -33,11 +33,11 @@ const PUBLISHABLE_ROW = {
   created_at: '2026-07-14T09:00:00.000Z',
 }
 
-function makeStmt(rows: unknown[]) {
+function makeStmt(rows: unknown[], firstValue: unknown = null) {
   const stmt = {
     bind: (..._args: unknown[]) => stmt,
     all: async () => ({ results: rows }),
-    first: async () => null,
+    first: async () => firstValue,
     run: async () => ({ meta: { changes: 1 } }),
   }
   return stmt
@@ -47,13 +47,25 @@ function makeStmt(rows: unknown[]) {
 // query (loadPublishable) → the given rows (only reached at all when the caller
 // is owner/admin — loadPublishable short-circuits before querying otherwise).
 function envForRole(role: 'owner' | 'admin' | 'member', publishRows: unknown[]): Env {
+  // FLIGHT-001 F2: the dashboard's global capability floor runs before every
+  // GET route. A plain 'member' fixture must resolve to a REAL member holding
+  // >= 1 capability grant (a squad-scope grant here — deliberately NOT org/admin,
+  // so this stays the "sees the page, but not the admin-only Publish control"
+  // case the test exists to cover) — otherwise it becomes indistinguishable
+  // from the zero-capability drive-by signup the floor is built to reject, and
+  // /approvals would 403 before ever reaching loadPublishable's own gate.
   return {
     TENANT_SLUG: 't',
     BRAND: 'Test',
     DB: {
-      prepare: vi.fn((sql: string) =>
-        sql.includes("t.status = 'approved'") ? makeStmt(publishRows) : makeStmt([]),
-      ),
+      prepare: vi.fn((sql: string) => {
+        if (sql.includes("t.status = 'approved'")) return makeStmt(publishRows)
+        if (role === 'member' && sql.includes('FROM members')) return makeStmt([{ id: 'member-1' }], { id: 'member-1' })
+        if (role === 'member' && sql.includes('FROM capabilities')) {
+          return makeStmt([{ member_id: 'member-1', scope_type: 'squad', scope_id: 'sq-1', capability: 'member' }])
+        }
+        return makeStmt([])
+      }),
     },
     SESSIONS: {
       get: vi.fn(async () =>

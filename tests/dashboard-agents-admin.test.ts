@@ -5,7 +5,17 @@ import {
   setAgentStatus,
   deleteAgent,
 } from '../src/org/service'
-import type { Env } from '../src/types'
+import type { AuthContext, Env } from '../src/types'
+
+// loadAllAgents now scopes the roster to the caller's capability grants
+// (FLIGHT-001 F2). These field-shape tests care about the SQL/row mapping,
+// not RBAC scoping (that's covered with real SQL in
+// tests/dashboard-agents-admin-capability-scope.test.ts) — so every call here
+// uses a legacy org-owner AuthContext, the "sees everything" case, to keep the
+// existing assertions about the unfiltered SELECT shape valid.
+function ownerAuth(): AuthContext {
+  return { userId: 'owner-1', email: 'owner@example.test', role: 'owner', tenant: 'test-tenant' }
+}
 
 // ── D1 mock ───────────────────────────────────────────────────────────────────
 // Records every prepare() call (sql + binds) and returns configured rows.
@@ -90,7 +100,7 @@ describe('loadAllAgents', () => {
       in_flight_count: 2,
     }
     const { env, calls } = makeEnv([[row]])
-    const out = await loadAllAgents(env)
+    const out = await loadAllAgents(env, ownerAuth())
     expect(out).toHaveLength(1)
     expect(out[0]).toMatchObject({ id: 'a1', name: 'Scout', squad_name: 'Alpha', dept_name: 'Engineering' })
     // SQL must join agents → squads → departments + LEFT JOIN tasks
@@ -112,20 +122,20 @@ describe('loadAllAgents', () => {
       task_count: 10, open_count: 3, in_flight_count: 3,
     }
     const { env } = makeEnv([[row]])
-    const out = await loadAllAgents(env)
+    const out = await loadAllAgents(env, ownerAuth())
     expect(out[0].task_count).toBe(10)
     expect(out[0].open_count).toBe(3)
   })
 
   it('returns empty array when no agents exist', async () => {
     const { env } = makeEnv([[]])
-    const out = await loadAllAgents(env)
+    const out = await loadAllAgents(env, ownerAuth())
     expect(out).toEqual([])
   })
 
   it('SQL selects status field so active/paused badge renders', async () => {
     const { env, calls } = makeEnv([[]])
-    await loadAllAgents(env)
+    await loadAllAgents(env, ownerAuth())
     expect(calls[0].sql).toContain('a.status')
   })
 })

@@ -1,14 +1,12 @@
 import { html, raw } from 'hono/html'
 import type {
   AuthContext,
-  Capability,
-  CapabilityGrant,
   Env,
   Project,
   ProjectAccessLevel,
   ProjectStatus,
 } from '../types'
-import { hasCapability, resolveCapabilities } from '../auth/capability'
+import { resolveCapabilities } from '../auth/capability'
 import { parseFlightMetaV1 } from '../flight/meta'
 import { canonicalFlightMetaSql } from '../flight/meta-sql'
 import type { FlightRow } from '../flight/service'
@@ -26,7 +24,7 @@ import {
 } from '../projects/access'
 import { listProjectActivity, listProjectEvidence } from '../projects/projections'
 import { loadProjectSituation } from '../projects/situation'
-import { resolveAllSquadIds, resolveReadableSquadIds } from '../projects/readable-squads'
+import { resolveGrantedSquadIds } from '../projects/readable-squads'
 import type {
   ProjectActivitySource,
   ProjectEvidenceSource,
@@ -232,24 +230,6 @@ async function projectAccess(env: Env, auth: AuthContext): Promise<ProjectAccess
     readableSquadIds,
     taskableSquadIds,
   }
-}
-
-async function resolveGrantedSquadIds(
-  env: Env,
-  grants: CapabilityGrant[],
-  minimum: Capability,
-): Promise<string[]> {
-  if (hasCapability(grants, 'org', null, minimum)) return resolveAllSquadIds(env)
-
-  const squadIds: string[] = []
-  const departmentIds: string[] = []
-  for (const grant of grants) {
-    if (!grant.scope_id || !hasCapability([grant], grant.scope_type, grant.scope_id, minimum)) continue
-    if (grant.scope_type === 'squad') squadIds.push(grant.scope_id)
-    if (grant.scope_type === 'department') departmentIds.push(grant.scope_id)
-  }
-  if (!squadIds.length && !departmentIds.length) return []
-  return resolveReadableSquadIds(env, squadIds, departmentIds)
 }
 
 export async function canManageProjects(env: Env, auth: AuthContext): Promise<boolean> {

@@ -17,7 +17,16 @@ import { describe, it, expect } from 'vitest'
 import { loadAllAgents } from '../src/dashboard/agents-admin'
 import { updateUnitConfig } from '../src/org/service'
 import { isEffort, isAutonomy, isBudgetWindow } from '../src/types'
-import type { Env } from '../src/types'
+import type { AuthContext, Env } from '../src/types'
+
+// loadAllAgents now scopes the roster to the caller's capability grants
+// (FLIGHT-001 F2). These tests care about row/SQL shape, not RBAC scoping
+// (see tests/dashboard-agents-admin-capability-scope.test.ts for that) — every
+// call here uses a legacy org-owner AuthContext, the unrestricted "sees
+// everything" case.
+function ownerAuth(): AuthContext {
+  return { userId: 'owner-1', email: 'owner@example.test', role: 'owner', tenant: 'test-tenant' }
+}
 
 // ── D1 mock (same pattern as dashboard-agents-admin.test.ts) ─────────────────
 
@@ -102,7 +111,7 @@ describe('loadAllAgents — extended row shape (#26)', () => {
 
   it('SQL selects all work-unit fields', async () => {
     const { env, calls } = makeEnv([[baseRow]])
-    await loadAllAgents(env)
+    await loadAllAgents(env, ownerAuth())
     const sql = calls[0].sql
     expect(sql).toContain('a.okr')
     expect(sql).toContain('a.kpi_target')
@@ -115,7 +124,7 @@ describe('loadAllAgents — extended row shape (#26)', () => {
 
   it('SQL includes correlated subquery for current_task_title (in_progress/open)', async () => {
     const { env, calls } = makeEnv([[baseRow]])
-    await loadAllAgents(env)
+    await loadAllAgents(env, ownerAuth())
     const sql = calls[0].sql
     expect(sql).toContain('current_task_title')
     expect(sql).toMatch(/status IN \(['"]{0,1}in_progress['"]{0,1}.*open|open.*in_progress/i)
@@ -123,7 +132,7 @@ describe('loadAllAgents — extended row shape (#26)', () => {
 
   it('SQL includes correlated subquery for review_task_title (review status)', async () => {
     const { env, calls } = makeEnv([[baseRow]])
-    await loadAllAgents(env)
+    await loadAllAgents(env, ownerAuth())
     const sql = calls[0].sql
     expect(sql).toContain('review_task_title')
     expect(sql).toContain("status = 'review'")
@@ -131,33 +140,33 @@ describe('loadAllAgents — extended row shape (#26)', () => {
 
   it('row shape includes current_task_title when set', async () => {
     const { env } = makeEnv([[baseRow]])
-    const out = await loadAllAgents(env)
+    const out = await loadAllAgents(env, ownerAuth())
     expect(out[0].current_task_title).toBe('Research competitor pricing')
   })
 
   it('row shape includes review_task_title when set', async () => {
     const { env } = makeEnv([[baseRow]])
-    const out = await loadAllAgents(env)
+    const out = await loadAllAgents(env, ownerAuth())
     expect(out[0].review_task_title).toBe('Draft Q3 brief')
   })
 
   it('current_task_title is null when agent has no active task', async () => {
     const row = { ...baseRow, current_task_title: null }
     const { env } = makeEnv([[row]])
-    const out = await loadAllAgents(env)
+    const out = await loadAllAgents(env, ownerAuth())
     expect(out[0].current_task_title).toBeNull()
   })
 
   it('review_task_title is null when agent has no task in review', async () => {
     const row = { ...baseRow, review_task_title: null }
     const { env } = makeEnv([[row]])
-    const out = await loadAllAgents(env)
+    const out = await loadAllAgents(env, ownerAuth())
     expect(out[0].review_task_title).toBeNull()
   })
 
   it('row shape includes work-unit config fields', async () => {
     const { env } = makeEnv([[baseRow]])
-    const out = await loadAllAgents(env)
+    const out = await loadAllAgents(env, ownerAuth())
     expect(out[0].okr).toBe('Drive Q3 pipeline to 50 leads')
     expect(out[0].kpi_target).toBe('50 leads')
     expect(out[0].kpi_progress).toBe(40)
@@ -169,7 +178,7 @@ describe('loadAllAgents — extended row shape (#26)', () => {
 
   it('GROUP BY includes work-unit fields so aggregate does not collapse them', async () => {
     const { env, calls } = makeEnv([[baseRow]])
-    await loadAllAgents(env)
+    await loadAllAgents(env, ownerAuth())
     const sql = calls[0].sql
     // Each work-unit field must appear in the GROUP BY so D1 does not reject
     // or silently misgroup rows when multiple tasks are LEFT JOINed.
@@ -366,7 +375,7 @@ describe('unit card data field null-handling (#26)', () => {
 
   it('row with all nullable fields loads without error', async () => {
     const { env } = makeEnv([[nullRow]])
-    const out = await loadAllAgents(env)
+    const out = await loadAllAgents(env, ownerAuth())
     expect(out[0].okr).toBeNull()
     expect(out[0].kpi_target).toBeNull()
     expect(out[0].budget_cap_cents).toBeNull()
@@ -376,7 +385,7 @@ describe('unit card data field null-handling (#26)', () => {
 
   it('kpi_progress defaults to 0 when not set', async () => {
     const { env } = makeEnv([[nullRow]])
-    const out = await loadAllAgents(env)
+    const out = await loadAllAgents(env, ownerAuth())
     expect(out[0].kpi_progress).toBe(0)
   })
 })
