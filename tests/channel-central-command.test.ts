@@ -47,13 +47,11 @@ describe('central-command ingress (mumega-com#722)', () => {
       VALUES ('dept-core', 'core', 'Dept Core');
 
       INSERT OR IGNORE INTO squads (id, department_id, slug, name)
-      VALUES ('sq-core', 'dept-core', 'core', 'Squad Core');
+      VALUES ('squad-core', 'dept-core', 'core', 'Squad Core');
 
       INSERT OR IGNORE INTO agents (id, squad_id, slug, name, status)
-      VALUES ('ag-prime', 'sq-core', 'prime', 'Prime', 'active');
-
-      INSERT OR IGNORE INTO channel_bindings (id, platform, external_channel_id, squad_id, max_capability)
-      VALUES ('central-command-telegram', 'telegram', '-5317747241', 'sq-core', 'member');
+      VALUES ('ag-prime', 'squad-core', 'prime', 'Prime', 'active'),
+             ('ag-river', 'squad-core', 'river', 'River', 'active');
     `)
   })
 
@@ -67,7 +65,7 @@ describe('central-command ingress (mumega-com#722)', () => {
     expect(res).toContain('not wired to a squad')
   })
 
-  it('binds -5317747241 -> squad-core via migration 0082 and accepts mentions', async () => {
+  it('binds -5317747241 -> squad-core via migration 0082 alone and accepts mentions (B3)', async () => {
     const { runInbound } = await import('../src/channels/index')
     const res = await runInbound(env, 'telegram', '-5317747241', '765204057', '@prime status check')
     expect(res).toContain('Dispatched @prime via mupot inbox')
@@ -104,10 +102,22 @@ describe('central-command ingress (mumega-com#722)', () => {
     expect(res).toContain('Dispatched @prime')
   })
 
-  it('returns honest SOS-native status for @river', async () => {
+  it('B1: returns honest SOS-native status for @river even when river is active in D1 agents', async () => {
     const { runInbound } = await import('../src/channels/index')
     const res = await runInbound(env, 'telegram', '-5317747241', '765204057', '@river review spec')
     expect(res).toContain('@river is SOS-native; relayed via Kasra')
+
+    const msg = await env.DB.prepare(
+      `SELECT * FROM agent_messages WHERE to_agent = 'river'`
+    ).first()
+    expect(msg?.body).toContain('[sos-bus]')
+  })
+
+  it('B2: refuses mentions exceeding 8192 byte body length limit', async () => {
+    const { runInbound } = await import('../src/channels/index')
+    const longBody = '@prime ' + 'x'.repeat(8200)
+    const res = await runInbound(env, 'telegram', '-5317747241', '765204057', longBody)
+    expect(res).toContain('refused: mention body exceeds 8192 byte limit')
   })
 
   it('unknown mention refuses: "no such active agent"', async () => {

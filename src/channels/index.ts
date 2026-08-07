@@ -453,16 +453,18 @@ async function dispatchMention(
     return `prime rate-limited: @${target} has hit the 10/hour mention wall.`
   }
 
-  // F2 Fix: Query agents table dynamically instead of hardcoded Set
+  // B1 Fix: Check SOS-native agents BEFORE DB lookup so @river / @dara never get trapped in potSend
+  if (target === 'river' || target === 'dara') {
+    return sosBusSend(env, target, body)
+  }
+
+  // F2 Fix: Query agents table dynamically for pot-native active agents
   const activeAgent = await env.DB.prepare(
     `SELECT id, slug, status FROM agents WHERE slug = ?1 AND status IN ('active', 'paused')`
   ).bind(target).first<{ id: string; slug: string }>()
 
   if (activeAgent) {
     return potSend(env, target, body, memberId, isDirective)
-  }
-  if (target === 'river' || target === 'dara') {
-    return sosBusSend(env, target, body)
   }
   return `no such active agent: @${target}`
 }
@@ -474,6 +476,12 @@ async function potSend(
   memberId: string,
   isDirective: boolean,
 ): Promise<string> {
+  // B2 Fix: Enforce body length limit fence (8192 bytes)
+  const MAX_BODY_LEN = 8192
+  if (body.length > MAX_BODY_LEN) {
+    return `refused: mention body exceeds ${MAX_BODY_LEN} byte limit`
+  }
+
   const id = crypto.randomUUID()
   const tenant = env.TENANT_SLUG ?? 'mumega'
   await env.DB.prepare(
