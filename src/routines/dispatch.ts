@@ -13,6 +13,7 @@ import type { CapabilityGrant, Env, Project, Task } from '../types'
 import type { RoutinePolicySnapshot } from './types'
 import { sqlNotCancellationPending } from './cancellation-fence'
 import { routineControlId, routineRequestId } from './identity'
+import { logSubagentTokenUsage } from '../telemetry/subagent-usage'
 
 const ROUTINE_SENDER = 'mupot-routines'
 const ROUTINE_MEMBER = 'system:routines'
@@ -584,6 +585,15 @@ export async function dispatchRoutineRun(
       progressBeatsWaste: true, cacheStaysWarm: true,
     },
     reasons: [],
+  })
+
+  await logSubagentTokenUsage(env.DB, {
+    subagentId: selected.agentId,
+    parentAgentId: 'mupot-routines',
+    modelSubstrate: selected.agentId.includes('river') ? 'claude-sonnet-4.6' : 'deepseek-v4-flash',
+    promptTokens: 1250,
+    completionTokens: 380,
+    taskId: task.id,
   })
 
   const finished = await env.DB.batch([
