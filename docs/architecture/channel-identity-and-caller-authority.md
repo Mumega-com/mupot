@@ -115,6 +115,46 @@ as the Google account, which satisfies the principle above.
 
 **Never:** binding inferred from a name, an email string in a payload, or first-contact.
 
+## Self-service binding — a member links their own channel
+
+**No human should type another person's platform id.** `bound_method: 'admin'` asserts an
+identity nobody verified, and it does not survive customers: every new member would queue
+behind an operator.
+
+**The member proves their own identity, and never hands over a credential:**
+
+```
+1. member logs into the mupot dashboard      <- this IS the proof of which member they are
+2. "Connect Telegram" -> short-lived, single-use link code
+3. member messages the bot:  /link ABC123
+4. ingress sees an unbound caller WITH a valid code
+   -> binding written: bound_method='verified_login', bound_by=<their own member id>
+```
+
+**Why this is safe with no API key and no pasted id:**
+
+| fact | proven by |
+|---|---|
+| which member this is | the authenticated dashboard session |
+| which platform account this is | **the platform itself** — Telegram reports `from.id`, which the sender cannot forge |
+| that they are the same person | possession of a single-use code only that session could obtain |
+
+The bot learns the platform id **from the platform** — the one thing it can actually prove.
+
+**Code requirements:** single-use, short TTL (~10 min), bound to one member, invalidated on
+use or expiry, rate-limited per member. A leaked code must expire before it is useful and
+must bind at most one account.
+
+**Platform-neutral.** Only step 3 differs — `/link` in Telegram, a slash command in Slack,
+a bot DM in Discord. Steps 1, 2 and 4 are shared, the same property that makes resolution
+platform-agnostic.
+
+**Prior art already in the schema:** `members.telegram_chat_id TEXT UNIQUE` has existed
+since `0002_members.sql` — a single-platform version of this mapping, found by running
+tests against the real schema. `channel_identity` generalises it and adds revocation and
+audit; a later migration should reconcile them. Until then `channel_identity` is
+authoritative for ingress.
+
 ## Autonomous work is unchanged
 
 When an agent acts on its own — routine, cron, self-directed — it uses **its own
