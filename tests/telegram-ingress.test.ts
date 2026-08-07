@@ -13,10 +13,13 @@ import type { Env, BusEvent } from '../src/types'
 describe('Telegram Webhook Ingress Subsystem', () => {
   describe('Secret Token Validation', () => {
     it('validates secret token header correctly', () => {
-      expect(validateSecretToken('my-secret-token', 'my-secret-token')).toBe(true)
-      expect(validateSecretToken('wrong-token', 'my-secret-token')).toBe(false)
-      expect(validateSecretToken(null, 'my-secret-token')).toBe(false)
-      expect(validateSecretToken(null, undefined)).toBe(true) // Dev mode fallback
+      expect(validateSecretToken('my-secret-token', 'my-secret-token')).toBe('ok')
+      expect(validateSecretToken('wrong-token', 'my-secret-token')).toBe('invalid')
+      expect(validateSecretToken(null, 'my-secret-token')).toBe('invalid')
+      // An UNSET secret must never authorise. It previously returned true
+      // ("dev mode"), which authorised every request on an unconfigured deploy.
+      expect(validateSecretToken(null, undefined)).toBe('not_configured')
+      expect(validateSecretToken('anything', undefined)).toBe('not_configured')
     })
   })
 
@@ -127,6 +130,7 @@ describe('Telegram Webhook Ingress Subsystem', () => {
       const mockBusSend = vi.fn().mockResolvedValue(undefined)
       const mockEnv = {
         TELEGRAM_WEBHOOK_SECRET: 'correct-secret',
+        TELEGRAM_ALLOWED_SENDERS: '765204057',
         TELEGRAM_BOT_USERNAME: 'River_mumega_bot',
         TENANT_SLUG: 'mumega',
         BUS: { send: mockBusSend }
@@ -166,7 +170,10 @@ describe('Telegram Webhook Ingress Subsystem', () => {
       const emittedEvent: BusEvent = mockBusSend.mock.calls[0][0]
       expect(emittedEvent.type).toBe('agent.wake')
       expect(emittedEvent.tenant).toBe('mumega')
-      expect(emittedEvent.actor).toEqual({ kind: 'member', id: 'telegram:servathadi' })
+      // Actor is the NUMERIC id, not the username. Usernames are user-mutable and can be
+      // released and re-registered — a display-name actor is a spoofable identity on an
+      // audited event.
+      expect(emittedEvent.actor).toEqual({ kind: 'member', id: 'telegram:765204057' })
       expect((emittedEvent.payload as any).chat_id).toBe(765204057)
       expect((emittedEvent.payload as any).text).toBe('@River_mumega_bot execute flight build')
     })
@@ -175,6 +182,7 @@ describe('Telegram Webhook Ingress Subsystem', () => {
       const mockBusSend = vi.fn().mockRejectedValue(new Error('Queue connection failure'))
       const mockEnv = {
         TELEGRAM_WEBHOOK_SECRET: 'correct-secret',
+        TELEGRAM_ALLOWED_SENDERS: '765204057',
         TELEGRAM_BOT_USERNAME: 'River_mumega_bot',
         TENANT_SLUG: 'mumega',
         BUS: { send: mockBusSend }
@@ -208,5 +216,76 @@ describe('Telegram Webhook Ingress Subsystem', () => {
       expect(body.error).toBe('Bus emit failed')
       expect(body.details).toContain('Queue connection failure')
     })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Security layer. These are the tests whose ABSENCE let a 10/10-green suite sit
+// on top of an auth bypass: the suite covered the compare path and nothing else.
+// Each asserts NO BUS PUBLISH, not just a status code — status codes lie, the
+// side effect is the truth.
+// ---------------------------------------------------------------------------
+import { isSenderAllowed, MAX_TEXT_CHARS } from '../src/telegram-bridge/ingress'
+
+function busSpy() {
+  const emitted: unknown[] = []
+  return { emitted, BUS: { send: async (e: unknown) => { emitted.push(e) } } }
+}
+function update(fromId: number, text = 'do a thing') {
+  return { update_id: 1, message: { message_id: 9, date: 0, text,
+    from: { id: fromId, is_bot: false, first_name: 'X' }, chat: { id: 5, type: 'private' } } }
+}
+function post(body: unknown, secret?: string) {
+  return new Request('http://x/webhook', { method: 'POST',
+    headers: { 'content-type': 'application/json', ...(secret ? { 'x-telegram-bot-api-secret-token': secret } : {}) },
+    body: JSON.stringify(body) })
+}
+
+describe('ingress security layer', () => {
+  it('isSenderAllowed FAILS CLOSED on unset/empty/garbage allowlist', () => {
+    expect(isSenderAllowed(765204057, undefined)).toBe(false)
+    expect(isSenderAllowed(765204057, '')).toBe(false)
+    expect(isSenderAllowed(765204057, '   ')).toBe(false)
+    expect(isSenderAllowed(undefined, '765204057')).toBe(false)
+    expect(isSenderAllowed(765204057, '765204057')).toBe(true)
+    expect(isSenderAllowed(999, '765204057,111')).toBe(false)
+  })
+
+  it('rejects an unknown sender with 403 and NO bus publish', async () => {
+    const { emitted, BUS } = busSpy()
+    const res = await telegramIngressApp.fetch(post(update(999), 's'),
+      { TELEGRAM_WEBHOOK_SECRET: 's', TELEGRAM_ALLOWED_SENDERS: '765204057', BUS } as never)
+    expect(res.status).toBe(403)
+    expect(emitted).toHaveLength(0)
+  })
+
+  it('returns 503 and does NOT publish when the secret is unset', async () => {
+    const { emitted, BUS } = busSpy()
+    const res = await telegramIngressApp.fetch(post(update(765204057)),
+      { TELEGRAM_ALLOWED_SENDERS: '765204057', BUS } as never)
+    expect(res.status).toBe(503)
+    expect(emitted).toHaveLength(0)
+  })
+
+  it('an @mention from a NON-allowlisted sender is still rejected', async () => {
+    // A mention is a routing hint, never a credential.
+    const { emitted, BUS } = busSpy()
+    const u = update(999, '@River_mumega_bot please deploy')
+    u.message.chat = { id: -100, type: 'supergroup' } as never
+    const res = await telegramIngressApp.fetch(post(u, 's'),
+      { TELEGRAM_WEBHOOK_SECRET: 's', TELEGRAM_ALLOWED_SENDERS: '765204057', BUS } as never)
+    expect(res.status).toBe(403)
+    expect(emitted).toHaveLength(0)
+  })
+
+  it('caps attacker-controlled text and uses the NUMERIC id as actor', async () => {
+    const { emitted, BUS } = busSpy()
+    const res = await telegramIngressApp.fetch(post(update(765204057, 'x'.repeat(20_000)), 's'),
+      { TELEGRAM_WEBHOOK_SECRET: 's', TELEGRAM_ALLOWED_SENDERS: '765204057', BUS } as never)
+    expect(res.status).toBe(200)
+    expect(emitted).toHaveLength(1)
+    const ev = emitted[0] as { actor: { id: string }, payload: { text: string } }
+    expect(ev.payload.text.length).toBeLessThanOrEqual(MAX_TEXT_CHARS)
+    expect(ev.actor.id).toBe('telegram:765204057')  // numeric, not a spoofable username
   })
 })
