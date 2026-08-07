@@ -175,16 +175,27 @@ def poll_open_tasks() -> list[dict]:
 
 
 def build_brief(task: dict, worktree: Path, branch: str) -> str:
+    """Brief with the STABLE prefix first and the per-task tail last.
+
+    Prompt caching matches on an exact prefix: the cache breakpoint lands on the last
+    block whose bytes are identical across requests, and everything after it is a miss.
+    The previous ordering put the task id on line 1 and the worktree path on line 2, so
+    the FIRST tokens differed on every dispatch and the invariant RULES block behind them
+    could never be reached by a cache hit.
+
+    The operator dispatches every ~90s, well inside the 5-minute TTL, so consecutive
+    cycles are exactly the case caching is for. Stable-first costs nothing and makes the
+    shared preamble cacheable as the brief grows.
+
+    Honest bound on the win: this preamble alone is under the 512-token minimum for
+    Opus-class models, so the brief is not independently cacheable today — the real
+    saving is on the tool definitions and system prompt that precede it. This ordering
+    is correctness for when the preamble grows, not a claimed cost cut.
+    """
     return "\n".join(
         [
-            f"You are the tech-grok build technician. Task from mupot (id {task['id']}).",
-            f"Work ONLY in this worktree: {worktree} (branch {branch}, already checked out).",
-            "",
-            f"TITLE: {task.get('title','')}",
-            f"DONE WHEN: {task.get('done_when','')}",
-            "",
-            "BRIEF:",
-            task.get("body", "") or "(no body — infer from title/done_when)",
+            # ── stable prefix: identical on every dispatch ──────────────────────────
+            "You are the tech-grok build technician working a task from mupot.",
             "",
             "RULES (hard):",
             "- Make the change and COMMIT it in this worktree. Do NOT push, do NOT open a PR,",
@@ -192,6 +203,16 @@ def build_brief(task: dict, worktree: Path, branch: str) -> str:
             "- Run `npx tsc --noEmit` and the affected `npx vitest run` yourself; the change must be clean+green.",
             "- Pure, minimal, behavior-correct. If blocked or the task is unsafe, commit nothing and explain why.",
             "- You have the mupot MCP server for read-only context (task_list, recall, boot_context).",
+            "",
+            # ── per-task tail: everything below here changes every dispatch ─────────
+            f"TASK ID: {task['id']}",
+            f"WORKTREE: {worktree} (branch {branch}, already checked out) — work ONLY here.",
+            "",
+            f"TITLE: {task.get('title','')}",
+            f"DONE WHEN: {task.get('done_when','')}",
+            "",
+            "BRIEF:",
+            task.get("body", "") or "(no body — infer from title/done_when)",
         ]
     )
 

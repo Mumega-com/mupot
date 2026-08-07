@@ -159,9 +159,12 @@ def poll_open_tasks() -> list[dict]:
 def build_brief(task: dict) -> str:
     return "\n".join(
         [
-            f"You are mumega-mumcp (MCPWP WordPress-plugin builder + operator), dispatched by the",
-            f"mupot loop driver for task {task['id']} (mupot task, squad MCPWP Core).",
+            # ── stable prefix first: the task id used to sit on line 2, which made every
+            # dispatch a cache miss from the second line onward.
+            "You are mumega-mumcp (MCPWP WordPress-plugin builder + operator), dispatched by the",
+            "mupot loop driver (squad MCPWP Core).",
             "",
+            f"TASK ID: {task['id']}",
             f"TITLE: {task.get('title', '')}",
             f"DONE WHEN: {task.get('done_when', '')}",
             "",
