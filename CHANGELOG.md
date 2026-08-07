@@ -5,6 +5,7 @@
 - **Build-Time Release Identity & Version Truth** (`src/health.ts`, `scripts/generate-build-info.mjs`; #443, #571).
   - `/health` and deployment consoles now stamp exact commit identity (`commit`), branch (`ref`), build timestamp (`built_at`), and working-tree cleanliness (`clean`) by construction via `src/build-info.ts` fallback when runtime environment variables are omitted.
   - Eliminated decorative `clean: false` state; `clean` strictly reflects working-tree status (`git status --porcelain`). Branch identity is tracked separately via `ref`.
+  - Supersedes the env-only stamping direction of `aac13ed` (#443, #571): `RELEASE_SHA` still takes precedence when present, and the generated build-info module is the floor for deploys that do not run the wrapper. Adopted deliberately — four production deploys on 2026-08-07 used bare `wrangler deploy` and every one reported `commit: null`.
 
 - **Sovereign Addons & Memory Engine (v0.28.0)** (`src/addons/`, `src/telemetry/`, `src/dashboard/motherboard.ts`; #780, #796, #797, #798).
   - Four modular Hono addon sub-apps (`sos`, `mirror`, `inkwell`, `torivers`) with fail-closed HTTP 503 `unconfigured_secret` and 401 authentication handlers.
