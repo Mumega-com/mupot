@@ -1,3 +1,3 @@
 // Mupot release/public API version.
 // Bump this with package.json for every release candidate and final release.
-export const MUPOT_PUBLIC_API_VERSION = '0.25.0' as const
+export const MUPOT_PUBLIC_API_VERSION = '0.26.0' as const
