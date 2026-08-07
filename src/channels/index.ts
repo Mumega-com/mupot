@@ -438,6 +438,7 @@ async function dispatchMention(
   memberId: string,
   isDirective: boolean,
 ): Promise<string> {
+  // F3: Rate wall uses fixed ISO UTC-hour buckets (v1 decision).
   const bucket = new Date().toISOString().slice(0, 13) + ':00:00Z'
   const tenant = env.TENANT_SLUG ?? 'mumega'
   const inc = await env.DB.prepare(
@@ -452,14 +453,18 @@ async function dispatchMention(
     return `prime rate-limited: @${target} has hit the 10/hour mention wall.`
   }
 
-  const MUPOT_SLUGS = new Set(['prime', 'kasra', 'athena', 'codex', 'mubot', 'witness'])
-  if (MUPOT_SLUGS.has(target)) {
+  // F2 Fix: Query agents table dynamically instead of hardcoded Set
+  const activeAgent = await env.DB.prepare(
+    `SELECT id, slug, status FROM agents WHERE slug = ?1 AND status IN ('active', 'paused')`
+  ).bind(target).first<{ id: string; slug: string }>()
+
+  if (activeAgent) {
     return potSend(env, target, body, memberId, isDirective)
   }
   if (target === 'river' || target === 'dara') {
     return sosBusSend(env, target, body)
   }
-  return `no such agent: @${target}`
+  return `no such active agent: @${target}`
 }
 
 async function potSend(
@@ -485,7 +490,7 @@ async function sosBusSend(
   target: string,
   body: string,
 ): Promise<string> {
-  // SOS-native dispatch marker logged to agent_messages for audit trailing
+  // F1 Fix: Record audit row in agent_messages, but return honest status
   const id = crypto.randomUUID()
   const tenant = env.TENANT_SLUG ?? 'mumega'
   await env.DB.prepare(
@@ -493,7 +498,7 @@ async function sosBusSend(
      VALUES (?1, ?2, ?3, ?4, 'system', 'message', ?5, datetime('now'))`
   ).bind(id, tenant, target, 'central-command', `[sos-bus] ${body}`).run()
 
-  return `Dispatched @${target} via SOS bus (id: ${id.slice(0, 8)})`
+  return `@${target} is SOS-native; relayed via Kasra until the SOS bridge lands (audit id: ${id.slice(0, 8)})`
 }
 
 // ── postAgentActivity — the live agent-activity feed ──────────────────────────

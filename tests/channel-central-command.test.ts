@@ -49,6 +49,9 @@ describe('central-command ingress (mumega-com#722)', () => {
       INSERT OR IGNORE INTO squads (id, department_id, slug, name)
       VALUES ('sq-core', 'dept-core', 'core', 'Squad Core');
 
+      INSERT OR IGNORE INTO agents (id, squad_id, slug, name, status)
+      VALUES ('ag-prime', 'sq-core', 'prime', 'Prime', 'active');
+
       INSERT OR IGNORE INTO channel_bindings (id, platform, external_channel_id, squad_id, max_capability)
       VALUES ('central-command-telegram', 'telegram', '-5317747241', 'sq-core', 'member');
     `)
@@ -101,10 +104,16 @@ describe('central-command ingress (mumega-com#722)', () => {
     expect(res).toContain('Dispatched @prime')
   })
 
-  it('unknown mention refuses: "no such agent"', async () => {
+  it('returns honest SOS-native status for @river', async () => {
+    const { runInbound } = await import('../src/channels/index')
+    const res = await runInbound(env, 'telegram', '-5317747241', '765204057', '@river review spec')
+    expect(res).toContain('@river is SOS-native; relayed via Kasra')
+  })
+
+  it('unknown mention refuses: "no such active agent"', async () => {
     const { runInbound } = await import('../src/channels/index')
     const res = await runInbound(env, 'telegram', '-5317747241', '765204057', '@ghost test')
-    expect(res).toContain('no such agent: @ghost')
+    expect(res).toContain('no such active agent: @ghost')
   })
 
   it('rate wall: 11th mention in the hour returns the cap message and records 11', async () => {
