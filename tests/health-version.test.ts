@@ -15,6 +15,7 @@ describe('public health endpoint & release truth', () => {
       version: MUPOT_PUBLIC_API_VERSION,
       commit: releaseSha,
       clean: true,
+      ref: BUILD_INFO.ref,
       built_at: BUILD_INFO.builtAt,
     })
   })
@@ -25,6 +26,7 @@ describe('public health endpoint & release truth', () => {
     expect(res.version).toBe(MUPOT_PUBLIC_API_VERSION)
     expect(res.commit).toBe(BUILD_INFO.commit)
     expect(res.clean).toBe(BUILD_INFO.clean)
+    expect(res.ref).toBe(BUILD_INFO.ref)
     expect(res.built_at).toBe(BUILD_INFO.builtAt)
   })
 
@@ -37,14 +39,16 @@ describe('public health endpoint & release truth', () => {
       version: MUPOT_PUBLIC_API_VERSION,
       commit: sha,
       clean: false,
+      ref: BUILD_INFO.ref,
       built_at: BUILD_INFO.builtAt,
     })
   })
 
-  it('generateBuildInfo script creates non-null build info timestamp', () => {
+  it('generateBuildInfo script reports valid commit, ref, and boolean clean state', () => {
     const info = generateBuildInfo()
     expect(info.commit).toMatch(/^[0-9a-f]{40}$/i)
     expect(typeof info.clean).toBe('boolean')
+    expect(typeof info.ref).toBe('string')
     expect(typeof info.builtAt).toBe('string')
   })
 })

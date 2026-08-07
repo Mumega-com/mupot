@@ -11,6 +11,7 @@ import { join } from 'node:path'
 export function generateBuildInfo() {
   let commit = null
   let clean = false
+  let ref = null
 
   try {
     const rawSha = execSync('git rev-parse HEAD', { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] }).trim()
@@ -23,8 +24,8 @@ export function generateBuildInfo() {
 
   try {
     const status = execSync('git status --porcelain', { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] }).trim()
-    const onMain = execSync('git rev-parse --abbrev-ref HEAD', { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] }).trim() === 'main'
-    clean = status.length === 0 && onMain
+    ref = execSync('git rev-parse --abbrev-ref HEAD', { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] }).trim()
+    clean = status.length === 0
   } catch {
     clean = false
   }
@@ -38,21 +39,23 @@ export interface BuildInfo {
   commit: string | null
   clean: boolean
   builtAt: string | null
+  ref: string | null
 }
 
 export const BUILD_INFO: BuildInfo = {
   commit: ${commit ? JSON.stringify(commit) : 'null'},
   clean: ${JSON.stringify(clean)},
   builtAt: ${JSON.stringify(builtAt)},
+  ref: ${ref ? JSON.stringify(ref) : 'null'},
 }
 `
 
   const targetFile = join(process.cwd(), 'src', 'build-info.ts')
   writeFileSync(targetFile, content, 'utf8')
-  return { commit, clean, builtAt }
+  return { commit, clean, builtAt, ref }
 }
 
 if (process.argv[1] && process.argv[1].endsWith('generate-build-info.mjs')) {
   const result = generateBuildInfo()
-  console.log(`[build-info] Stamped commit: ${result.commit ?? 'null'}, clean: ${result.clean}, builtAt: ${result.builtAt}`)
+  console.log(`[build-info] Stamped commit: ${result.commit ?? 'null'}, clean: ${result.clean}, ref: ${result.ref}, builtAt: ${result.builtAt}`)
 }

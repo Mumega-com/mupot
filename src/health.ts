@@ -37,6 +37,7 @@ export function publicHealth(tenant: string, releaseSha?: string) {
     version: MUPOT_PUBLIC_API_VERSION,
     commit,
     clean,
+    ref: BUILD_INFO.ref,
     built_at: BUILD_INFO.builtAt,
   }
 }
