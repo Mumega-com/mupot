@@ -192,6 +192,8 @@ function makeIngestEnv(opts: {
   adminTokenHash?: string | null
   kvPutResult?: 'ok' | 'fail'
   directiveRaw?: string | null
+  mirrorUrl?: string | null
+  mirrorToken?: string | null
 } = {}) {
   const { adminTokenHash = null, kvPutResult = 'ok', directiveRaw = null } = opts
 
@@ -242,6 +244,8 @@ function makeIngestEnv(opts: {
         kvStore[k] = v
       }),
     },
+    MIRROR_URL: opts.mirrorUrl,
+    MIRROR_TOKEN: opts.mirrorToken,
   } as unknown as Env & { TENANT_SLUG: string }
 }
 
@@ -301,6 +305,127 @@ describe('(e2) GET /api/brain/directive — auth + read', () => {
     const body = await res.json() as { ok: boolean; directive: HumanDirective | null }
     expect(body.ok).toBe(true)
     expect(body.directive).toMatchObject(VALID_DIRECTIVE)
+  })
+})
+
+describe('(e3) POST /api/brain/consolidate — admin-gated proxy to Mirror', () => {
+  it('returns 401 when no Authorization header is provided', async () => {
+    const env = makeIngestEnv({ mirrorUrl: 'https://mirror.example' })
+    const req = new Request('https://pot.test/consolidate', { method: 'POST' })
+    const res = await brainPhysicsIngestApp.fetch(req, env)
+    expect(res.status).toBe(401)
+  })
+
+  it('returns 400 when threshold is not a valid number', async () => {
+    const env = makeIngestEnv({ adminTokenHash: 'some-hash', mirrorUrl: 'https://mirror.example' })
+    const req = new Request('https://pot.test/consolidate?threshold=bad', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer valid-admin-token' },
+    })
+    const res = await brainPhysicsIngestApp.fetch(req, env)
+    expect(res.status).toBe(400)
+    const body = await res.json() as { error: string }
+    expect(body.error).toBe('invalid_threshold')
+  })
+
+  it('returns 503 when MIRROR_URL is not configured', async () => {
+    const env = makeIngestEnv({ adminTokenHash: 'some-hash' })
+    const req = new Request('https://pot.test/consolidate', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer valid-admin-token' },
+    })
+    const res = await brainPhysicsIngestApp.fetch(req, env)
+    expect(res.status).toBe(503)
+    const body = await res.json() as { error: string }
+    expect(body.error).toBe('mirror_url_missing')
+  })
+
+  it('forwards POST /consolidate to the Mirror base URL and returns JSON on 200', async () => {
+    const realFetch = globalThis.fetch
+    const fake = vi.fn(async (_url: RequestInfo | URL, _init?: RequestInit) => {
+      return new Response(JSON.stringify({ merged: 2 }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    })
+    globalThis.fetch = fake as typeof fetch
+
+    try {
+      const env = makeIngestEnv({
+        adminTokenHash: 'some-hash',
+        mirrorUrl: 'https://mirror.example',
+        mirrorToken: 'mirror-token',
+      })
+      const req = new Request('https://pot.test/consolidate?agent=brain&threshold=0.88', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer valid-admin-token' },
+      })
+      const res = await brainPhysicsIngestApp.fetch(req, env)
+      const resBody = await res.json() as { merged: number }
+
+      expect(res.status).toBe(200)
+      expect(resBody.merged).toBe(2)
+      expect(fake).toHaveBeenCalledTimes(1)
+      const [calledUrl, init] = fake.mock.calls[0]
+      expect(String(calledUrl)).toBe('https://mirror.example/consolidate?agent=brain&threshold=0.88')
+      expect(init?.method).toBe('POST')
+      const headers = new Headers(init?.headers)
+      expect(headers.get('authorization')).toBe('Bearer mirror-token')
+    } finally {
+      globalThis.fetch = realFetch
+    }
+  })
+
+  it('forwards non-2xx responses from Mirror as non-2xx', async () => {
+    const realFetch = globalThis.fetch
+    const fake = vi.fn(async () =>
+      new Response('down', {
+        status: 501,
+      }),
+    )
+    globalThis.fetch = fake as typeof fetch
+
+    try {
+      const env = makeIngestEnv({
+        adminTokenHash: 'some-hash',
+        mirrorUrl: 'https://mirror.example',
+      })
+      const req = new Request('https://pot.test/consolidate', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer valid-admin-token' },
+      })
+      const res = await brainPhysicsIngestApp.fetch(req, env)
+
+      expect(res.status).toBe(501)
+      expect(await res.text()).toBe('down')
+    } finally {
+      globalThis.fetch = realFetch
+    }
+  })
+
+  it('returns 502 when the Mirror call fails before response', async () => {
+    const realFetch = globalThis.fetch
+    const fake = vi.fn(async () => {
+      throw new Error('mirror unreachable')
+    })
+    globalThis.fetch = fake as typeof fetch
+
+    try {
+      const env = makeIngestEnv({
+        adminTokenHash: 'some-hash',
+        mirrorUrl: 'https://mirror.example',
+      })
+      const req = new Request('https://pot.test/consolidate', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer valid-admin-token' },
+      })
+      const res = await brainPhysicsIngestApp.fetch(req, env)
+      expect(res.status).toBe(502)
+      const body = await res.json() as { error: string }
+      expect(body.error).toBe('mirror_consolidate_request_failed')
+    } finally {
+      globalThis.fetch = realFetch
+    }
   })
 })
 

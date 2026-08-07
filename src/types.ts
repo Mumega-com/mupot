@@ -152,6 +152,8 @@ export interface Env {
   GITHUB_REPO?: string // "owner/repo" the pot weaves to (e.g. "Digidinc/Digid")
   GITHUB_WEBHOOK_SECRET?: string // inbound: verifies GitHub webhook (x-hub-signature-256)
   GITHUB_INBOUND_SQUAD_ID?: string // optional: squad that GitHub work-units land on
+  MIRROR_URL?: string // base URL for SOS/Mirror API (e.g. https://mirror.example.com)
+  MIRROR_TOKEN?: string // bearer token for the Mirror API
   AI_GATEWAY_TOKEN?: string
   // Telegram bridge: Mupot bus consumer notifies Hadi of task events
   // via HMAC-signed POST to Hermes webhook deliver_only route.

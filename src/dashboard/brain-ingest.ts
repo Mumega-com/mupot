@@ -54,6 +54,90 @@ brainPhysicsIngestApp.get('/directive', async (c) => {
   return c.json({ ok: true, directive })
 })
 
+function consolidateThreshold(raw: string | undefined): { value: number } | { error: string } {
+  if (raw === undefined || raw.length === 0) return { value: 0.88 }
+  const threshold = Number(raw)
+  if (!Number.isFinite(threshold)) {
+    return { error: 'invalid_threshold' }
+  }
+  return { value: threshold }
+}
+
+// POST /api/brain/consolidate — forward to the configured Mirror consolidate API.
+// This route restores the nightly brain consolidation pipeline endpoint and keeps
+// failures loud (non-2xx passthrough or explicit request failures), rather than
+// silently returning 501 success-shaped placeholders.
+brainPhysicsIngestApp.post('/consolidate', async (c) => {
+  const auth = await resolveOrgAdmin(c.env, c.req.header('authorization'))
+  if (!auth.ok) return c.json({ error: auth.status === 401 ? 'unauthorized' : 'forbidden' }, auth.status)
+
+  const mirrorUrl = c.env.MIRROR_URL?.trim()
+  if (!mirrorUrl) {
+    return c.json(
+      { error: 'mirror_url_missing', detail: 'MIRROR_URL is required for brain consolidation' },
+      503,
+    )
+  }
+
+  const thresholdResult = consolidateThreshold(c.req.query('threshold'))
+  if ('error' in thresholdResult) {
+    return c.json({ error: thresholdResult.error }, 400)
+  }
+
+  const agent = c.req.query('agent')?.trim() ?? 'brain'
+  const params = new URLSearchParams({ agent, threshold: String(thresholdResult.value) })
+
+  const requestUrl = new URL('/consolidate', mirrorUrl)
+  requestUrl.search = params.toString()
+
+  const mirrorHeaders: Record<string, string> = {}
+  if (c.env.MIRROR_TOKEN) {
+    mirrorHeaders.Authorization = `Bearer ${c.env.MIRROR_TOKEN}`
+  }
+
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 60_000)
+
+  try {
+    const mirrorRes = await fetch(requestUrl, {
+      method: 'POST',
+      headers: mirrorHeaders,
+      signal: controller.signal,
+    })
+
+    const responseBody = await mirrorRes.text()
+    if (!mirrorRes.ok) {
+      return new Response(responseBody || mirrorRes.statusText, {
+        status: mirrorRes.status,
+        headers: {
+          'content-type': mirrorRes.headers.get('content-type') ?? 'text/plain',
+        },
+      })
+    }
+
+    try {
+      return c.json(responseBody ? JSON.parse(responseBody) : {}, 200)
+    } catch {
+      return new Response(responseBody, {
+        status: 200,
+        headers: {
+          'content-type': mirrorRes.headers.get('content-type') ?? 'text/plain',
+        },
+      })
+    }
+  } catch (error) {
+    return c.json(
+      {
+        error: 'mirror_consolidate_request_failed',
+        detail: error instanceof Error ? error.message : 'unknown_error',
+      },
+      502,
+    )
+  } finally {
+    clearTimeout(timer)
+  }
+})
+
 // POST /api/brain/physics — ingest a new physics snapshot from the sovereign daemon.
 brainPhysicsIngestApp.post('/physics', async (c) => {
   // Auth: org-admin bearer token.
