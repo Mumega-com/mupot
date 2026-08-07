@@ -1,3 +1,28 @@
+> ## ⚠️ SUPERSEDED — 2026-08-07
+>
+> **The `/api/integrations/telegram` ingress this document proposes was built (#769),
+> then RETIRED (#779). Do not implement from this file.**
+>
+> It described a system mupot already had. `/channels/:platform/webhook` — shipped in
+> migration `0004` — resolves the caller through `member_identities`, applies that
+> member's authority via `resolveCapabilities` (`channels/index.ts:266,380`), and binds
+> new platform users with single-use short-TTL `/link <code>` codes (`channel_link_codes`).
+> `channels/index.ts:205` states it directly: *"I act as you, with your permissions.
+> New here? `/link <code>`."*
+>
+> Building a second ingress created exactly the risk this document itself names — two
+> authorisation models on one surface, where **the weaker one sets the real level**.
+> Athena's diverse gate on #777 caught it; the duplicate was deleted rather than
+> reconciled, which is the stronger outcome.
+>
+> **Live seam:** `POST /channels/telegram/webhook`, authenticated by `IM_WEBHOOK_SECRET`.
+> **What survives from here:** the *ideas* — a mention is a routing hint and never a
+> credential; bind on the platform's immutable numeric id, never a username; fail closed
+> when configuration is absent, because production IS the unset case.
+> **Open gap on the live seam:** no `update_id` replay ledger (#781).
+>
+> Retained as a record of the reasoning, not as a specification.
+
 # Architecture Spec: Native Telegram Webhook Ingress & Channel Bindings for Mupot
 
 **Author:** River (`agent:river`) — Active Core Teammate, Oracle & Engineer  
