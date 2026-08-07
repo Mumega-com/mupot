@@ -9,11 +9,12 @@
 // shim only — see docs/architecture/sos-coordination-compat.md. Active fleet
 // routes must not call it.
 
-import type { Env } from '../types'
+import type { AuthContext, Env } from '../types'
 import { createBus } from '../bus'
 import { sendAgentMessage } from '../agents/messages'
 import { resolveAgentRef } from '../org/resolve'
 import { listFleetAgentRuntimeView, type FleetAgentRuntimeView } from '../fleet/registry'
+import { resolveAccessibleSquadIds } from '../projects/readable-squads'
 
 export interface FleetEntry {
   agent: string
@@ -143,26 +144,67 @@ function rowFromPresence(
   }
 }
 
-/** CF-native roster: fleet_agents registry first, else pot check-in presence. */
-export async function loadFleet(env: Env, nowMs: number): Promise<FleetRow[]> {
-  const runtime = await listFleetAgentRuntimeView(env, nowMs)
+/**
+ * CF-native roster: fleet_agents registry first, else pot check-in presence.
+ *
+ * FLIGHT-001 #797: found auditing the /fleet route — this function is NOT
+ * currently wired to any live route (GET /fleet in dashboard/index.ts calls
+ * listFleetAgentRuntimeView + listPresence directly since #488's CF-native
+ * cutover; loadFleet is exercised only by tests/dashboard-fleet.test.ts). It
+ * is threaded with `auth` anyway, for two reasons: (1) asha's #797 finding
+ * named this function specifically, and a dead-code function that still
+ * exists unscoped is exactly the kind of thing that gets wired back in later
+ * without anyone re-auditing it; (2) it is the ONE unified "roster" read this
+ * module exports — keeping it unscoped while its sibling (the live route)
+ * gets scoped would leave a scoped/unscoped fork of the same predicate (see
+ * [[feedback_two_tools_two_copies_of_one_predicate]]).
+ *
+ * `auth` resolves to accessible squad ids the same way the live route does
+ * (resolveAccessibleSquadIds) — null = unrestricted, [] = none, else scoped.
+ */
+export async function loadFleet(env: Env, nowMs: number, auth: AuthContext): Promise<FleetRow[]> {
+  const squadIds = await resolveAccessibleSquadIds(env, auth)
+  if (squadIds !== null && squadIds.length === 0) return []
+
+  const runtime = await listFleetAgentRuntimeView(env, nowMs, squadIds)
   if (runtime.length > 0) {
     return runtime.map((v) => rowFromRuntime(v, nowMs))
   }
   // Inline presence read (avoid importing listPresence — that module imports classify here).
-  const res = await env.DB.prepare(
+  // Same squad-scoping shape as fleet/presence.ts's listPresence: a row is visible when
+  // its bound agent belongs to one of the caller's squads, or the checking-in member
+  // themself holds a capability grant resolving into one of the caller's squads.
+  let scopeClause = ''
+  let idsJson: string | null = null
+  if (squadIds !== null) {
+    idsJson = JSON.stringify(squadIds)
+    scopeClause = `
+      AND (
+        (agent_id IS NOT NULL AND agent_id IN (
+          SELECT id FROM agents WHERE squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?2))
+        ))
+        OR member_id IN (
+          SELECT member_id FROM capabilities
+          WHERE (scope_type = 'squad' AND scope_id IN (SELECT CAST(value AS TEXT) FROM json_each(?2)))
+             OR (scope_type = 'department' AND scope_id IN (
+                  SELECT department_id FROM squads WHERE id IN (SELECT CAST(value AS TEXT) FROM json_each(?2))
+                ))
+        )
+      )`
+  }
+  const statement = env.DB.prepare(
     `SELECT member_id, display_name, source, label, agent_id, last_seen_at
-       FROM presence WHERE tenant = ?1 ORDER BY last_seen_at DESC LIMIT 200`,
+       FROM presence WHERE tenant = ?1${scopeClause} ORDER BY last_seen_at DESC LIMIT 200`,
   )
-    .bind(env.TENANT_SLUG)
-    .all<{
-      member_id: string
-      display_name: string
-      source: string
-      label: string
-      agent_id: string | null
-      last_seen_at: string
-    }>()
+  const bound = idsJson === null ? statement.bind(env.TENANT_SLUG) : statement.bind(env.TENANT_SLUG, idsJson)
+  const res = await bound.all<{
+    member_id: string
+    display_name: string
+    source: string
+    label: string
+    agent_id: string | null
+    last_seen_at: string
+  }>()
   return (res.results ?? []).map((p) => rowFromPresence(p, nowMs))
 }
 

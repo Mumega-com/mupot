@@ -25,12 +25,13 @@
 // shows "—" when null so the column is always visible (born tier-aware).
 
 import { html, raw } from 'hono/html'
-import type { Env } from '../types'
+import type { AuthContext, Env } from '../types'
 import { listLoops } from '../loops/service'
 import { listLoopDecisions } from '../loops/decisions'
 import type { LoopDecisionRow } from '../loops/decisions'
 import type { LoopManifest } from '../loops/manifest'
 import { getHumanDirective, type HumanDirective } from '../brain/directive'
+import { resolveAccessibleSquadIds } from '../projects/readable-squads'
 
 // ── coherence physics (observe-only, #138) ───────────────────────────────────
 
@@ -141,7 +142,7 @@ export interface BrainView {
 }
 
 export interface BrainViewDeps {
-  listLoopsFn?: (env: Env) => Promise<LoopManifest[]>
+  listLoopsFn?: (env: Env, opts?: { squadIds?: string[] | null }) => Promise<LoopManifest[]>
   listDecisionsFn?: (env: Env, loopId: string, opts?: { limit?: number }) => Promise<LoopDecisionRow[]>
   loadPhysicsFn?: (env: Env) => Promise<PhysicsSnapshot | null>
   loadDirectiveFn?: (env: Env) => Promise<HumanDirective | null>
@@ -154,19 +155,38 @@ export interface BrainViewDeps {
  * per loop so the page stays snappy). In practice most pots have 1-3 active
  * loops so the total query count is bounded. Physics load is fire-and-forget
  * (returns null when absent — the coherence panel shows "no data yet").
+ *
+ * FLIGHT-001 #797 — judged scope decision: the LOOP FEED (loops + their
+ * decisions) carries per-squad/per-agent operational detail — OKR, status,
+ * budget cap, kpi target, and every decision record — and is now scoped to
+ * `auth`'s accessible squads via resolveAccessibleSquadIds (org-scope grant
+ * or legacy owner/admin sees every loop; a squad/department grant sees only
+ * loops owned by its own squads, or by an agent belonging to one). Decisions
+ * follow automatically — they're only fetched for the already-scoped `loops`
+ * array. PHYSICS and DIRECTIVE are deliberately left UNSCOPED: physics is a
+ * single org-wide coherence aggregate (C/R/Psi/ARF/regime — no per-squad
+ * breakdown exists to filter by) and directive is a single org-wide pinned
+ * value (brain/directive.ts — one row, not squad-attributable). Both were
+ * already documented as "any authenticated pot member can view" (this file's
+ * header comment) BEFORE this fix and that premise still holds post-#796: the
+ * dashboard's global capability floor already stops the zero-capability
+ * drive-by case these two fields were exposed to; narrowing them further has
+ * no scope to narrow BY.
  */
-export async function loadBrainView(env: Env, deps: BrainViewDeps = {}): Promise<BrainView> {
-  const listFn = deps.listLoopsFn ?? ((e) => listLoops(e))
+export async function loadBrainView(env: Env, auth: AuthContext, deps: BrainViewDeps = {}): Promise<BrainView> {
+  const listFn = deps.listLoopsFn ?? ((e, opts) => listLoops(e, opts))
   const decisionsFn = deps.listDecisionsFn ?? listLoopDecisions
   const physicsFn = deps.loadPhysicsFn ?? loadBrainPhysics
   const directiveFn = deps.loadDirectiveFn ?? getHumanDirective
+
+  const squadIds = await resolveAccessibleSquadIds(env, auth)
 
   // Load directive + physics + loops concurrently; the directive and loops are D1,
   // but the directive is a single-key lookup and failures must not break the page.
   const [physics, directive, loops] = await Promise.all([
     physicsFn(env).catch(() => null),
     directiveFn(env).catch(() => null),
-    listFn(env),
+    listFn(env, { squadIds }),
   ])
 
   const loopRows: BrainLoopRow[] = loops.map((l) => ({

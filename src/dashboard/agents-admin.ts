@@ -15,8 +15,7 @@
 // loadSquadOptions — flat squad list for the add-agent <select> picker.
 
 import type { AuthContext, Env } from '../types'
-import { hasCapability, isOrgAdmin, resolveCapabilities } from '../auth/capability'
-import { resolveGrantedSquadIds } from '../projects/readable-squads'
+import { resolveAccessibleSquadIds } from '../projects/readable-squads'
 
 // ── Row shapes (what D1 returns; narrower than the full Agent type) ───────────
 
@@ -64,26 +63,6 @@ export interface SquadOption {
 // ── loadAllAgents ─────────────────────────────────────────────────────────────
 
 /**
- * accessibleSquadIds — the squads THIS caller may see an agent roster for.
- * `null` = unrestricted (org-wide grant, or the legacy owner/admin org role —
- * same escape requireCapability/canOnOrg already use). `[]` = no squads (a
- * member whose only grants don't resolve to any live squad — the roster query
- * below then correctly returns zero rows instead of falling back to "all").
- *
- * A caller reaches loadAllAgents only after the dashboard's global capability
- * floor (src/dashboard/index.ts) already proved they hold >= 1 capability row,
- * so the [] case is the narrow edge (grant references a squad/department that
- * no longer exists), not the common path — but it's still handled fail-closed.
- */
-async function accessibleSquadIds(env: Env, auth: AuthContext): Promise<string[] | null> {
-  if (isOrgAdmin(auth)) return null
-  if (!auth.memberId) return []
-  const grants = auth.capabilities ?? (await resolveCapabilities(env, auth.memberId))
-  if (hasCapability(grants, 'org', null, 'observer')) return null
-  return resolveGrantedSquadIds(env, grants, 'observer')
-}
-
-/**
  * Load every agent the CALLER holds a capability on, joined to squad +
  * department, with aggregate task counts and the agent's current-work +
  * next-approval task titles.
@@ -109,7 +88,7 @@ export async function loadAllAgents(env: Env, auth: AuthContext): Promise<AgentA
   // (UTC) — we bind the tenant slug + today's UTC date and reconstruct the key in
   // SQL so the read stays a single round-trip with the rest of the agent load.
   const today = utcDateKey()
-  const squadIds = await accessibleSquadIds(env, auth)
+  const squadIds = await resolveAccessibleSquadIds(env, auth)
   if (squadIds !== null && squadIds.length === 0) return []
 
   const scopeClause = squadIds === null

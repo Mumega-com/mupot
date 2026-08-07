@@ -53,6 +53,10 @@ import {
   isOrgAdmin,
   holdsCapabilityFloor,
 } from '../auth/capability'
+// FLIGHT-001 #797 — the shared "which squads can this caller read" primitive
+// (extracted from dashboard/agents-admin.ts's accessibleSquadIds, #796), reused
+// to scope /fleet's roster + presence and /brain's loop feed.
+import { resolveAccessibleSquadIds } from '../projects/readable-squads'
 
 // Shared creation paths — the dashboard handlers call the SAME service functions
 // the /api routes call, never re-implementing the write/validation logic.
@@ -919,11 +923,13 @@ dashboardApp.get('/audit', async (c) => {
 
 // ── brain (per-pot brain panel — decision feed + governor) ───────────────────
 // GET /brain — decision feed + governor controls (S-BRAIN-CTRL-MUPOT-1 AC#4).
-// Reads are requireAuth only (the outer middleware already gates the whole app).
-// Governor writes are isAdmin-gated (AC#7) in the POST handler below.
+// Reads are the dashboard's global capability floor (FLIGHT-001 F2, #796) plus
+// per-squad loop-feed scoping (FLIGHT-001 #797 — see loadBrainView's own doc
+// comment for the judged physics/directive-stay-org-level decision). Governor
+// writes are isAdmin-gated (AC#7) in the POST handler below.
 dashboardApp.get('/brain', async (c) => {
   const auth = c.get('auth')
-  const view = await loadBrainView(c.env)
+  const view = await loadBrainView(c.env, auth)
   // Header regime chip reuses this SAME loadBrainView() call (it already fetched
   // the KV physics snapshot for the coherence panel below) — no extra KV read.
   return c.html(
@@ -1187,9 +1193,19 @@ dashboardApp.get('/dashboard/motherboard', async (c) => {
 // ── fleet (CF-native roster — ADR gh #473; SOS bus retired from this path) ───
 // GET /fleet — pot check-in presence + signed host-control panel.
 // Wake/control POST endpoints below use agent_messages + Queue, not SOS Redis.
+//
+// FLIGHT-001 #797: this used to load listFleetAgentRuntimeView + listPresence
+// UNSCOPED — any caller who passed the dashboard's global capability floor
+// (FLIGHT-001 F2, #796; proves "belongs somewhere in this org", not "may see
+// THIS squad's agents") saw the FULL live-fleet roster and the full pot
+// check-in presence list, across every squad, not just their own. Both reads
+// are now scoped to resolveAccessibleSquadIds(auth): an org-scope grant (or
+// legacy owner/admin) sees everything; a squad/department grant sees only its
+// own squads' host agents + squadmates' presence.
 dashboardApp.get('/fleet', async (c) => {
   const auth = c.get('auth')
-  const hostAgents = await listFleetAgentRuntimeView(c.env)
+  const squadIds = await resolveAccessibleSquadIds(c.env, auth)
+  const hostAgents = await listFleetAgentRuntimeView(c.env, Date.now(), squadIds)
   const hostPanel = hostAgentsPanel(hostAgents, {
     configured: !!c.env.FLEET_PANEL_SK && !!c.env.FLEET_CONSUMER_AGENT,
     canControl: auth.role === 'owner',
@@ -1197,7 +1213,7 @@ dashboardApp.get('/fleet', async (c) => {
   })
 
   const [presence, physics, spend] = await Promise.all([
-    listPresence(c.env, Date.now()),
+    listPresence(c.env, Date.now(), squadIds),
     loadBrainPhysics(c.env),
     loadTodaySpendScalar(c.env),
   ])
@@ -1470,6 +1486,14 @@ dashboardApp.get('/squads/:id', async (c) => {
 
 // GET /agents/:id — agent console: identity, status, wake button.
 // `:id` accepts id OR unique slug (resolveAgentRef) so /agents/kayhermes works.
+//
+// FLIGHT-001 #797 (the follow-up gap flagged auditing #796's GET /agents roster
+// scope): the dashboard's global capability floor (F2) only proves the caller
+// belongs SOMEWHERE in the org — any floor-passing caller who knew or guessed an
+// agent id/slug could open ANY agent's console regardless of squad membership,
+// the same shape as the GET /squads/:id gap #796 already closed. Gated the same
+// way: org-scope capability (or legacy owner/admin) reads every agent; a
+// squad/department grant reads only agents in its own squads.
 dashboardApp.get('/agents/:id', async (c) => {
   const ref = c.req.param('id')
   const resolved = await resolveAgentRef(c.env, ref)
@@ -1484,8 +1508,16 @@ dashboardApp.get('/agents/:id', async (c) => {
   if (!agent) {
     return c.html(shell(c.env, 'Agent', errorBody('Agent not found.')), 404)
   }
-  const squad = await getById<Squad>(c.env, 'squads', agent.squad_id)
   const auth = c.get('auth')
+  if (!isOrgAdmin(auth)) {
+    const grants = auth.memberId ? auth.capabilities ?? (await resolveCapabilities(c.env, auth.memberId)) : []
+    const orgRead = hasCapability(grants, 'org', null, 'observer')
+    const squadRead = orgRead || (await canOnSquadRead(c.env, grants, agent.squad_id))
+    if (!squadRead) {
+      return c.html(shell(c.env, 'Agent', errorBody('You do not have access to this agent.')), 403)
+    }
+  }
+  const squad = await getById<Squad>(c.env, 'squads', agent.squad_id)
   // Mirror the wake API's real gate (lead+ on the agent's squad) so squad leads
   // see a working button — the API re-checks server-side either way.
   const canWake = await canOnSquad(c.env, auth, agent.squad_id)
