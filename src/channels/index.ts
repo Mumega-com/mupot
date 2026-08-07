@@ -36,6 +36,7 @@ import type {
 import { resolveCapabilities, hasCapability } from '../auth/capability'
 import { createBus } from '../bus'
 import { getAdapter } from './registry'
+import { sendAgentMessage } from '../agents/messages'
 import { createTask } from '../tasks/service'
 
 type AppEnv = { Bindings: Env }
@@ -165,6 +166,7 @@ type Intent =
   | { kind: 'status' }
   | { kind: 'wake'; ref: string }
   | { kind: 'task'; title: string }
+  | { kind: 'mention'; target: string }
   | { kind: 'unknown' }
 
 function parseIntent(text: string): Intent {
@@ -173,6 +175,14 @@ function parseIntent(text: string): Intent {
   const lower = trimmed.toLowerCase()
 
   if (lower === 'help' || lower === '/help' || lower === '?') return { kind: 'help' }
+
+  // "@agent" — central-command dispatch (mumega-com#722). A mention is a routing
+  // intent: the message body is dispatched to the named agent's native channel.
+  // Never a directive by itself — directive authority is the SENDER, below.
+  const mentionMatch = trimmed.match(/^@([a-z0-9][a-z0-9-]*)\b/i)
+  if (mentionMatch) {
+    return { kind: 'mention', target: mentionMatch[1].toLowerCase() }
+  }
 
   // '/link <code>' — redeem a single-use link code to bind this platform user.
   const linkMatch = trimmed.match(/^\/?link\s+(.+)$/i)
@@ -340,7 +350,7 @@ async function taskReply(
 // ── the pipeline: resolve → gate → act → post ─────────────────────────────────
 // Pure with respect to HTTP (no Hono context) so the webhook handler — and tests
 // — can drive it directly. Returns the reply text that was posted.
-async function runInbound(
+export async function runInbound(
   env: Env,
   platform: string,
   externalChannelId: string,
@@ -379,6 +389,29 @@ async function runInbound(
   // 4) Capabilities for this member (the real RBAC).
   const grants = await resolveCapabilities(env, identity.memberId)
 
+  // ── Central-command (mumega-com#722): Hadi-only directive rule, enforced IN
+  // CODE on the existing caller-authority seam. Sender id is the platform's
+  // immutable from.id (the adapter already guarantees identity = sender, never
+  // chat or text — src/channels/adapters/telegram.ts header). Any other sender,
+  // including agent-relayed text, is UNTRUSTED-INGRESS: data, never authorization.
+  const DIRECTIVE_SENDERS: Readonly<Record<string, ReadonlyArray<string>>> = {
+    telegram: ['765204057'], // Hadi, platform-authenticated sender id
+  }
+  const isDirective =
+    (DIRECTIVE_SENDERS[platform] ?? []).includes(externalUserId)
+
+  // mention -> agent dispatch. The body dispatched to the agent carries the
+  // untrusted tag unless the sender is directive-capable.
+  if (intent.kind === 'mention') {
+    const tag = isDirective ? '' : '[UNTRUSTED-INGRESS] '
+    return dispatchMention(env, squad, intent.target, `${tag}${text}`, identity.memberId, isDirective)
+  }
+
+  // Non-directive senders never reach directive-capable actions (wake/task/steer).
+  if (!isDirective && (intent.kind === 'wake' || intent.kind === 'task')) {
+    return 'Directive-required: only the owner can issue directives from central command. This message was treated as data.'
+  }
+
   // 5) Act on the bound squad, gated by capability.
   switch (intent.kind) {
     case 'help':
@@ -392,6 +425,89 @@ async function runInbound(
     case 'task':
       return taskReply(env, identity.memberId, grants, squad, intent.title)
   }
+}
+
+// ── Central-command mention helper ──────────────────────────────────────────
+async function dispatchMention(
+  env: Env,
+  _squad: { id: string },
+  target: string,
+  body: string,
+  memberId: string,
+  isDirective: boolean,
+): Promise<string> {
+  // F3: Rate wall uses fixed ISO UTC-hour buckets (v1 decision).
+  const bucket = new Date().toISOString().slice(0, 13) + ':00:00Z'
+  const tenant = env.TENANT_SLUG ?? 'mumega'
+  const inc = await env.DB.prepare(
+    `INSERT INTO channel_mention_budget (tenant, agent_slug, hour_bucket, count)
+     VALUES (?1, ?2, ?3, 1)
+     ON CONFLICT(tenant, agent_slug, hour_bucket)
+     DO UPDATE SET count = count + 1
+     RETURNING count`,
+  ).bind(tenant, target, bucket).first<{ count: number }>()
+
+  if (inc && Number(inc.count) > 10) {
+    return `prime rate-limited: @${target} has hit the 10/hour mention wall.`
+  }
+
+  // B1 Fix: Check SOS-native agents BEFORE DB lookup so @river / @dara never get trapped in potSend
+  if (target === 'river' || target === 'dara') {
+    return sosBusSend(env, target, body)
+  }
+
+  // F2 Fix: Query agents table dynamically for pot-native active agents
+  const activeAgent = await env.DB.prepare(
+    `SELECT id, slug, status FROM agents WHERE slug = ?1 AND status IN ('active', 'paused')`
+  ).bind(target).first<{ id: string; slug: string }>()
+
+  if (activeAgent) {
+    return potSend(env, target, body, memberId, isDirective)
+  }
+  return `no such active agent: @${target}`
+}
+
+async function potSend(
+  env: Env,
+  toAgent: string,
+  body: string,
+  memberId: string,
+  isDirective: boolean,
+): Promise<string> {
+  const directiveNotice = isDirective ? '' : ' [UNTRUSTED-INGRESS]'
+  const res = await sendAgentMessage(
+    env,
+    {
+      fromAgent: 'central-command',
+      fromMember: memberId,
+      toAgent,
+      body,
+      kind: 'message',
+    },
+    { system: true, reason: 'central-command-mention-ingress' },
+  )
+
+  if (!res.ok) {
+    return `refused: ${res.reason}${res.detail ? ` (${res.detail})` : ''}`
+  }
+
+  return `Dispatched @${toAgent} via mupot inbox (id: ${res.id.slice(0, 8)})${directiveNotice}`
+}
+
+async function sosBusSend(
+  env: Env,
+  target: string,
+  body: string,
+): Promise<string> {
+  // F1 Fix: Record audit row in agent_messages, but return honest status
+  const id = crypto.randomUUID()
+  const tenant = env.TENANT_SLUG ?? 'mumega'
+  await env.DB.prepare(
+    `INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, created_at)
+     VALUES (?1, ?2, ?3, ?4, 'system', 'message', ?5, datetime('now'))`
+  ).bind(id, tenant, target, 'central-command', `[sos-bus] ${body}`).run()
+
+  return `@${target} is SOS-native; relayed via Kasra until the SOS bridge lands (audit id: ${id.slice(0, 8)})`
 }
 
 // ── postAgentActivity — the live agent-activity feed ──────────────────────────
