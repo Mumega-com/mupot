@@ -13,12 +13,20 @@ You are client-optimized by **ECC** (skills/hooks). Your **output is governed by
 ## Session start
 
 1. `boot_context` — identity from the bearer token (never invent tenant/agent).
-2. `check_in` — announce presence on your project (your bound agent name); shows you live in Fleet.
-3. `orient` — basin packet; follow assigned tasks only.
-4. `inbox` — consume operator messages; ack via `send` when asked.
+2. `instinct_recall` — confidence-weighted project + global instincts (decayed).
+3. `check_in` — announce presence on your project (your bound agent name); shows you live in Fleet.
+4. `orient` — basin packet; follow assigned tasks only.
+5. `inbox` — consume operator messages; ack via `send` when asked.
 
 Refresh presence while working (`check_in` on start; a heartbeat hook or cron if idle —
 see [flock contract](../../../docs/flock-harness-pack-contract.md)).
+
+## Instinct memory (Port 4)
+
+Hooks auto-capture via `packs/cursor/ecc-operator/hooks/instinct-observe.sh`
+(`MUPOT_MCP_URL` + `MUPOT_TOKEN` + `MUPOT_PROJECT_ID`). Distill with
+`instinct_distill` when `distill_ready` (cheap model). Org-admin promotes with
+`instinct_promote` only when the same id appears in ≥2 projects at avg confidence ≥0.8.
 
 ## Work loop
 

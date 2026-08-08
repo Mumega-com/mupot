@@ -116,8 +116,10 @@ give agents a role/why/death; memory the project holds, not just each agent.
 cheap supervisor always-on (the standing operator) + **warm restart**
 (save/resume-session) + **durable distilled learnings** (instinct-style memory) +
 **gate-as-a-driver** (santa-loop: two independent models, both NICE before ship).
-Wake the decider only for hard calls. mupot already has the supervisor; it needs
-warm-restart, instinct-memory, a gate-lane driver, and a FED BOARD.
+Wake the decider only for hard calls. mupot already has the supervisor and
+**Port 4 instinct-memory** (`instinct_observe` → cheap distill →
+`instinct_recall` / gated `instinct_promote`). Warm-restart (session handoff)
+remains a sibling Port 4 track.
 
 ## Build order (declared, not optional)
 
@@ -126,8 +128,9 @@ warm-restart, instinct-memory, a gate-lane driver, and a FED BOARD.
    codex, mumcp). Fixes "10 agents, none connected" immediately.
 2. **Feed the board + santa-loop gate-driver** — so connected agents do governed
    work that closes hands-off. First real unattended 2-agent flight.
-3. **Warm-restart + instinct-memory** — save/resume-session + confidence-weighted
-   learnings, so a restart is warm not cold (the context-loss fix).
+3. **Warm-restart + instinct-memory** — instinct-memory ✅ LIVE (migration 0070:
+   observe/distill/recall/promote, confidence decay, ≥2-project promotion gate).
+   Warm-restart (save/resume-session) is the sibling track.
 4. **Surface port** — mount the Hermes dashboard as a mupot panel.
 5. **Workflow adapters** — n8n behind the workflow port (marketing loop = proving
    ground).
