@@ -87,7 +87,7 @@ def test_reissue_carries_external_source_forward_when_present(steward, monkeypat
 
     task = _base_task(external_source="linear:ENG")
     state = {"reissued": {}}
-    new_id = steward.reissue(task, "timed out", state)
+    new_id = steward.reissue(task, "timed out", state, set())
 
     assert new_id == "new-task-id"
     assert len(captured_calls) == 1
@@ -115,7 +115,7 @@ def test_reissue_of_a_local_task_does_not_forge_external_source(steward, monkeyp
 
     task = _base_task()  # no external_source key at all — a local task
     state = {"reissued": {}}
-    steward.reissue(task, "timed out", state)
+    steward.reissue(task, "timed out", state, set())
 
     _, payload = captured_calls[0]
     assert "external_source" not in payload
@@ -135,7 +135,7 @@ def test_reissue_does_not_forward_a_falsy_external_source(steward, monkeypatch):
 
     task = _base_task(external_source=None)
     state = {"reissued": {}}
-    steward.reissue(task, "timed out", state)
+    steward.reissue(task, "timed out", state, set())
 
     _, payload = captured_calls[0]
     assert "external_source" not in payload
