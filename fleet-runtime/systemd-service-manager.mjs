@@ -71,7 +71,10 @@ export function renderSystemd(context) {
     path: service.definitionPath,
     content: [
       '[Unit]',
-      `Description=Pot fleet ${service.key === 'heartbeat' ? 'daemon (signed presence heartbeat)' : 'control daemon (signed runtime open/close)'}`,
+      `Description=${service.description ??
+        `Pot fleet ${service.key === 'heartbeat'
+          ? 'daemon (signed presence heartbeat)'
+          : 'control daemon (signed runtime open/close)'}`}`,
       'After=network-online.target',
       'Wants=network-online.target',
       '',

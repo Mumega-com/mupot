@@ -62,6 +62,7 @@ import { projectLinkApp } from './addons/project-link/routes'
 import { presenceApp } from './registry/presence-routes'
 import { routinesApp } from './routines/routes'
 import { attentionApp } from './attention/routes'
+import { runtimeEndpointsApp } from './runtime-endpoints/routes'
 
 // Durable Object classes — implemented in src/agents/.
 export { AgentDO } from './agents/agent-do'
@@ -175,6 +176,11 @@ app.route('/api/project-links', projectLinkApp)
 // daemon. Member-bearer auth, self-scoped for the mutating tools (MCP only — this
 // route is read-only). Before the dashboard '/' catch-all.
 app.route('/api/presence', presenceApp)
+
+// Leased runtime endpoints: one explicit, revocable return address per host-local
+// agent session. Bearer-authenticated hooks use this surface to register, peek,
+// and accept exact-thread delivery without exposing the raw harness thread id.
+app.route('/api/runtime-endpoints', runtimeEndpointsApp)
 
 // ── OAuth 2.1 authorize leg (C3) ─────────────────────────────────────────────
 // /authorize and /oauth/google-callback must be mounted BEFORE the dashboardApp

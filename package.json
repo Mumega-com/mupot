@@ -1,6 +1,6 @@
 {
   "name": "mupot",
-  "version": "0.29.0",
+  "version": "0.25.0",
   "private": false,
   "description": "Installable Cloudflare-native sovereign agent substrate (the pot).",
   "type": "module",
@@ -9,9 +9,7 @@
     "dev": "wrangler dev",
     "dev:local:test": "wrangler dev --local --config wrangler-local-test.toml --port 8787",
     "deploy": "node scripts/deploy.mjs",
-    "pretypecheck": "node scripts/generate-build-info.mjs",
     "typecheck": "tsc --noEmit",
-    "pretest": "node scripts/generate-build-info.mjs",
     "test": "vitest run",
     "migrate:local": "wrangler d1 migrations apply mupot --local",
     "migrate:local:test": "wrangler d1 migrations apply mupot-local-test --local --config wrangler-local-test.toml",
@@ -55,7 +53,6 @@
     "receipt:release-readiness:plan": "node scripts/release-readiness-receipt.mjs --plan",
     "receipt:release-readiness:check": "node scripts/release-readiness-receipt.mjs --check",
     "receipt:kubernetes-agent-host": "node scripts/kubernetes-agent-host-receipt.mjs",
-    "receipt:kubernetes-geo-scanner": "node scripts/kubernetes-geo-scanner-receipt.mjs",
     "receipt:kubernetes-hermes-plugin-smoke": "node scripts/kubernetes-hermes-plugin-smoke-evidence.mjs",
     "receipt:project-link-flight": "node scripts/project-link-flight-evidence.mjs",
     "receipt:project-routine:plan": "node scripts/project-routine-lifecycle-receipt.mjs --plan",
@@ -66,17 +63,19 @@
     "fleet:starter": "node fleet-runtime/starter-manifest.mjs",
     "fleet:service": "node fleet-runtime/service-manager.mjs",
     "fleet:trust:bootstrap": "node fleet-runtime/trust-bootstrap.mjs",
+    "fleet:codex-endpoint": "node fleet-runtime/codex-thread-endpoint.mjs",
+    "fleet:codex-endpoint-service": "node fleet-runtime/codex-thread-service.mjs",
     "migrate:remote": "wrangler d1 migrations apply mupot --remote",
     "update": "node scripts/mupot-update.mjs"
   },
   "dependencies": {
     "@cloudflare/workers-oauth-provider": "^0.4.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "cron-schedule": "^6.0.0",
-    "hono": "^4.13.0"
+    "agents": "^0.14.5",
+    "hono": "^4.12.28",
+    "ws": "^8.21.0"
   },
   "devDependencies": {
-    "@cloudflare/vitest-pool-workers": "^0.20.2",
     "@cloudflare/workers-types": "^4.20260617.1",
     "playwright": "^1.61.1",
     "sharp": "0.35.3",
@@ -87,13 +86,9 @@
   },
   "license": "SEE LICENSE IN LICENSE.md",
   "overrides": {
-    "fast-uri": "^4.1.2",
-    "brace-expansion": "^5.0.9",
-    "postcss": "^8.5.23",
-    "sharp": "0.35.3",
-    "ip-address": "^10.3.1",
-    "@hono/node-server": "^2.0.5",
-    "body-parser": "^2.2.3",
-    "undici": "7.29.0"
+    "fast-uri": "3.1.4",
+    "brace-expansion": "5.0.8",
+    "postcss": "8.5.18",
+    "sharp": "0.35.3"
   }
 }
