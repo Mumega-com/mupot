@@ -65,7 +65,7 @@ describe('addon registry', () => {
       key: 'previous-minor-external-addon',
       trustClass: 'external_isolated',
       kind: 'external_mcp',
-      mupotCompatibility: '^0.24.0',
+      mupotCompatibility: '^0.28.0',
       departments: [],
       metrics: [],
       consoleSections: [],
