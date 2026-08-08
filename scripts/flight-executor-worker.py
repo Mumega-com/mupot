@@ -163,31 +163,13 @@ def run_flight_goal(flight: dict, agent_id: str, agent_name: str) -> tuple[bool,
     """
     Run flight goal in isolation. Returns (success, output, cost_micro_usd).
 
-    Goal passed as safe data (heredoc), no injection.
-    Timeout: 30 minutes. Process group kill on timeout.
-    Env scrubbed of: CLOUDFLARE_API_TOKEN, GITHUB_TOKEN, MUPOT_ADMIN_TOKEN, etc.
+    Goal passed via stdin (no shell injection). Timeout: 30 minutes.
+    Process group kill on timeout. Env scrubbed of secrets.
     """
     flight_id = flight["id"]
     goal = flight["goal"]
     meta = flight.get("meta", {})
     routine_run_id = meta.get("routine_run_id")
-
-    # Safe goal passing: via heredoc in a shell script, no quotes/escapes needed.
-    script = f"""#!/usr/bin/env bash
-set -e
-cd {WORKTREE_ROOT}
-timeout 1800 prime-agent -p --mode json \\
-  --autonomous \\
-  --autonomous-max-turns 20 \\
-  --autonomous-max-tokens 150000 \\
-  --autonomous-timeout-ms 1800000 \\
-  -- <<'GOAL'
-{goal}
-GOAL
-"""
-    script_path = WORKTREE_ROOT / f".flight-{flight_id}.sh"
-    script_path.write_text(script)
-    script_path.chmod(0o755)
 
     # Scrub secrets from child env.
     env = os.environ.copy()
@@ -196,12 +178,22 @@ GOAL
 
     log(f"running flight {flight_id} for {agent_name} (routine_run_id={routine_run_id})")
     try:
+        # Goal passed via stdin, not shell. No injection risk.
         result = subprocess.run(
-            [str(script_path)],
+            [
+                "prime-agent", "-p", "--mode", "json",
+                "--autonomous",
+                "--autonomous-max-turns", "20",
+                "--autonomous-max-tokens", "150000",
+                "--autonomous-timeout-ms", "1800000",
+                "--",
+            ],
+            input=goal,
             capture_output=True,
             text=True,
             timeout=1800,
             env=env,
+            cwd=str(WORKTREE_ROOT),
             preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None,
         )
         output = result.stdout + result.stderr
@@ -219,8 +211,6 @@ GOAL
     except Exception as e:
         log(f"flight {flight_id} error: {e}")
         return False, str(e), 0
-    finally:
-        script_path.unlink(missing_ok=True)
 
 
 def submit_routine_proposal(
