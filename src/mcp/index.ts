@@ -87,6 +87,7 @@ import { hasProjectWriteForSquads, anySquadHasProjectWrite } from '../projects/a
 import { ADDON_TOOLS } from './addons'
 import { GATE_GRANT_TOOLS } from './gates'
 import { LOOP_TOOLS } from './loops'
+import { SECRET_ENV_TOOLS } from './secret-env'
 import { PRESENCE_TOOLS } from './presence'
 import { WORKFLOW_CIRCUIT_TOOLS } from './workflow-circuits'
 import { ROUTINE_TOOLS } from './routines'
@@ -2963,6 +2964,7 @@ export const TOOLS: ToolSpec[] = [
   ...ADDON_TOOLS,
   ...GATE_GRANT_TOOLS,
   ...LOOP_TOOLS,
+  ...SECRET_ENV_TOOLS,
   ...PRESENCE_TOOLS,
   ...WORKFLOW_CIRCUIT_TOOLS,
   ...ROUTINE_TOOLS,
