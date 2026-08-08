@@ -1,3 +1,4 @@
+import { projectLinkTimestampMsSql } from '../addons/project-link/timestamps'
 import { canonicalFlightMetaSql } from '../flight/meta-sql'
 import { routineTablesReady } from '../routines/schema-ready'
 import type { Env, Project } from '../types'
@@ -13,6 +14,13 @@ const PROJECT_SITUATION_DETAIL_CAP = 20
 
 export type ProjectHealth = 'archived' | 'paused' | 'completed' | 'blocked' | 'review' | 'active' | 'ready'
 export type ProjectSituationWorkStatus = 'blocked' | 'review' | 'in_progress' | 'open'
+export type ProjectSituationFactKind = 'local' | 'current_remote' | 'stale_remote' | 'unknown'
+export type ProjectSituationLinkHealth = 'unknown' | 'healthy' | 'failed' | 'stale' | 'revoked'
+
+export interface ProjectSituationFact {
+  kind: ProjectSituationFactKind
+  source_pot: string | null
+}
 
 export interface ProjectSituationTask {
   id: string
@@ -21,6 +29,7 @@ export interface ProjectSituationTask {
   status: ProjectSituationWorkStatus
   assignee_agent_id: string | null
   updated_at: string
+  fact: ProjectSituationFact
 }
 
 export interface ProjectSituationBlocker extends ProjectSituationTask {
@@ -162,6 +171,7 @@ type SituationTaskRow = {
   assignee_agent_id: string | null
   result: string | null
   gate_owner: string | null
+  source_pot: string | null
   updated_at: string
   status_order: number
 }
@@ -207,7 +217,48 @@ function epochMs(expression: string): string {
   return `CAST(ROUND((julianday(${expression}) - 2440587.5) * 86400000) AS INTEGER)`
 }
 
-function safeTask(row: SituationTaskRow): ProjectSituationTask {
+export function projectSituationFactFor(
+  sourcePot: string | null | undefined,
+  linkHealthByPot: ReadonlyMap<string, ProjectSituationLinkHealth>,
+): ProjectSituationFact {
+  if (!sourcePot) return { kind: 'local', source_pot: null }
+  const health = linkHealthByPot.get(sourcePot)
+  if (health === 'healthy') return { kind: 'current_remote', source_pot: sourcePot }
+  if (health === 'stale' || health === 'failed' || health === 'revoked') {
+    return { kind: 'stale_remote', source_pot: sourcePot }
+  }
+  return { kind: 'unknown', source_pot: sourcePot }
+}
+
+export function projectLinkHealthFromRow(row: {
+  state: 'active' | 'revoked'
+  last_success_at: string | null
+  last_failure_at: string | null
+  success_event_at: number | null
+  failure_event_at: number | null
+  now_event_at: number | null
+  stale_after_seconds: number
+}): ProjectSituationLinkHealth {
+  if (row.state === 'revoked') return 'revoked'
+  if (!row.last_success_at && !row.last_failure_at) return 'unknown'
+  if (row.last_failure_at && (
+    !row.last_success_at
+    || (row.failure_event_at !== null
+      && row.success_event_at !== null
+      && row.failure_event_at > row.success_event_at)
+  )) {
+    return 'failed'
+  }
+  const stale = row.now_event_at !== null
+    && row.success_event_at !== null
+    && row.now_event_at - row.success_event_at > row.stale_after_seconds * 1000
+  return stale ? 'stale' : 'healthy'
+}
+
+function safeTask(
+  row: SituationTaskRow,
+  linkHealthByPot: ReadonlyMap<string, ProjectSituationLinkHealth>,
+): ProjectSituationTask {
   return {
     id: row.id,
     squad_id: row.squad_id,
@@ -215,16 +266,23 @@ function safeTask(row: SituationTaskRow): ProjectSituationTask {
     status: row.status,
     assignee_agent_id: row.assignee_agent_id,
     updated_at: row.updated_at,
+    fact: projectSituationFactFor(row.source_pot, linkHealthByPot),
   }
 }
 
-function safeBlocker(row: SituationTaskRow): ProjectSituationBlocker {
+function safeBlocker(
+  row: SituationTaskRow,
+  linkHealthByPot: ReadonlyMap<string, ProjectSituationLinkHealth>,
+): ProjectSituationBlocker {
   const detail = sanitizeProjectDetail(row.result)
-  return { ...safeTask(row), status: 'blocked', blocker_summary: detail || null }
+  return { ...safeTask(row, linkHealthByPot), status: 'blocked', blocker_summary: detail || null }
 }
 
-function safeReview(row: SituationTaskRow): ProjectSituationReview {
-  return { ...safeTask(row), status: 'review', gate_owner: row.gate_owner }
+function safeReview(
+  row: SituationTaskRow,
+  linkHealthByPot: ReadonlyMap<string, ProjectSituationLinkHealth>,
+): ProjectSituationReview {
+  return { ...safeTask(row, linkHealthByPot), status: 'review', gate_owner: row.gate_owner }
 }
 
 function safeFlight(row: SituationFlightRow): ProjectSituationFlight {
@@ -402,12 +460,12 @@ export async function loadProjectSituation(
   const routinesReady = controlSnapshot ? false : await routineTablesReady(env)
   const skipRoutineSlices = controlSnapshot || !routinesReady
 
-  const [taskResult, flightResult, routineResult, nextRoutineResult, activeRunResult, terminalRunResult, needsYouResult, activity] = await Promise.all([
+  const [taskResult, flightResult, routineResult, nextRoutineResult, activeRunResult, terminalRunResult, needsYouResult, activity, linkHealthResult] = await Promise.all([
     env.DB.prepare(
       `WITH
        blocked_rows AS (
          SELECT t.id, t.squad_id, t.title, t.status, t.assignee_agent_id,
-                t.result, t.gate_owner, t.updated_at, 2 AS status_order
+                t.result, t.gate_owner, t.source_pot, t.updated_at, 2 AS status_order
            FROM tasks t
           WHERE t.project_id = ?1 AND t.status = 'blocked'
             AND (?2 = 1 OR t.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?3)))
@@ -416,7 +474,7 @@ export async function loadProjectSituation(
        ),
        review_rows AS (
          SELECT t.id, t.squad_id, t.title, t.status, t.assignee_agent_id,
-                t.result, t.gate_owner, t.updated_at, 1 AS status_order
+                t.result, t.gate_owner, t.source_pot, t.updated_at, 1 AS status_order
            FROM tasks t
           WHERE t.project_id = ?1 AND t.status = 'review'
             AND (?2 = 1 OR t.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?3)))
@@ -425,7 +483,7 @@ export async function loadProjectSituation(
        ),
        in_progress_rows AS (
          SELECT t.id, t.squad_id, t.title, t.status, t.assignee_agent_id,
-                t.result, t.gate_owner, t.updated_at, 3 AS status_order
+                t.result, t.gate_owner, t.source_pot, t.updated_at, 3 AS status_order
            FROM tasks t
           WHERE t.project_id = ?1 AND t.status = 'in_progress'
             AND (?2 = 1 OR t.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?3)))
@@ -434,7 +492,7 @@ export async function loadProjectSituation(
        ),
        open_rows AS (
          SELECT t.id, t.squad_id, t.title, t.status, t.assignee_agent_id,
-                t.result, t.gate_owner, t.updated_at, 4 AS status_order
+                t.result, t.gate_owner, t.source_pot, t.updated_at, 4 AS status_order
            FROM tasks t
           WHERE t.project_id = ?1 AND t.status = 'open'
             AND (?2 = 1 OR t.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?3)))
@@ -616,7 +674,30 @@ export async function loadProjectSituation(
       excludeRoutineEvents: skipRoutineSlices,
       limit: Math.min(100, excludedActivity.size + 1),
     }),
+    env.DB.prepare(
+      `SELECT pl.remote_pot, pl.state, pl.stale_after_seconds,
+              pl.last_success_at, pl.last_failure_at,
+              ${projectLinkTimestampMsSql('pl.last_success_at')} AS success_event_at,
+              ${projectLinkTimestampMsSql('pl.last_failure_at')} AS failure_event_at,
+              ${projectLinkTimestampMsSql('CURRENT_TIMESTAMP')} AS now_event_at
+         FROM project_links pl
+        WHERE pl.tenant = ?1 AND pl.local_project_id = ?2`,
+    ).bind(env.TENANT_SLUG, project.id).all<{
+      remote_pot: string
+      state: 'active' | 'revoked'
+      stale_after_seconds: number
+      last_success_at: string | null
+      last_failure_at: string | null
+      success_event_at: number | null
+      failure_event_at: number | null
+      now_event_at: number | null
+    }>(),
   ])
+
+  const linkHealthRows = linkHealthResult.results ?? []
+  const linkHealthByPot = new Map(
+    linkHealthRows.map(row => [row.remote_pot, projectLinkHealthFromRow(row)]),
+  )
 
   const taskRows = taskResult.results ?? []
   const rowsByStatus = {
@@ -643,12 +724,12 @@ export async function loadProjectSituation(
     || taskCountsTruncated.in_progress
     || taskCountsTruncated.open
 
-  const blockers = rowsByStatus.blocked.slice(0, PROJECT_SITUATION_DETAIL_CAP).map(safeBlocker)
-  const pendingReviews = rowsByStatus.review.slice(0, PROJECT_SITUATION_DETAIL_CAP).map(safeReview)
+  const blockers = rowsByStatus.blocked.slice(0, PROJECT_SITUATION_DETAIL_CAP).map(row => safeBlocker(row, linkHealthByPot))
+  const pendingReviews = rowsByStatus.review.slice(0, PROJECT_SITUATION_DETAIL_CAP).map(row => safeReview(row, linkHealthByPot))
   const blockerDetailsTruncated = rowsByStatus.blocked.length > PROJECT_SITUATION_DETAIL_CAP
   const pendingReviewDetailsTruncated = rowsByStatus.review.length > PROJECT_SITUATION_DETAIL_CAP
-  const inProgress = rowsByStatus.in_progress[0] ? safeTask(rowsByStatus.in_progress[0]) : null
-  const open = rowsByStatus.open[0] ? safeTask(rowsByStatus.open[0]) : null
+  const inProgress = rowsByStatus.in_progress[0] ? safeTask(rowsByStatus.in_progress[0], linkHealthByPot) : null
+  const open = rowsByStatus.open[0] ? safeTask(rowsByStatus.open[0], linkHealthByPot) : null
   const activeWorkCount = taskCounts.blocked + taskCounts.review + taskCounts.in_progress + taskCounts.open
 
   const flightRows = flightResult.results ?? []
