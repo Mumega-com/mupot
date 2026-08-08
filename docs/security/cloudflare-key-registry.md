@@ -49,6 +49,7 @@ Ranked by blast radius. This table is what replacement tokens are minted from.
 | 9 | **Substrate health probe** | `scripts/substrate-health.mjs:279-285` | ✅ ~5 min timer | `Account Settings:Read` | account |
 | 10 | **Workers AI health ping** | `factory_watchdog.py` | ✅ `factory-watchdog.service` | `Workers AI:Read` | account |
 | 11 | **mupot tenant provisioning** | `mupot/plugin/tools.py` | transient export | `Workers Scripts:Edit`, `D1:Edit`, `Workers KV Storage:Edit`, `Account Settings:Read` | account (multi-tenant by nature) |
+| 12 | **⚠️ SHABRANG BUILD (UNKNOWN CONSUMER)** | *user-owned token, no code ref found* | ❓ | **26 groups** (overprivileged; recommend min: `Cloudflare Pages:Edit`, `Account Settings:Read`) | account only — **currently ALL zones, will reduce** |
 
 ### Notes on individual rows
 
@@ -74,6 +75,17 @@ claims `MUPOT_CF_API_TOKEN` "lives in Hermes `.env.secrets` in plaintext." It is
 **not** persisted anywhere on the host; the live pattern is a transient per-command
 export from a token file, which is the safer one. Fix the doc line before someone
 "fixes" reality to match it.
+
+**#12 — SHABRANG BUILD TOKEN (INCIDENT).** User-owned token on dashboard
+(`https://dash.cloudflare.com/profile/api-tokens`), found 2026-08-07. **Status:** consumer
+unknown — not found in any worktree, GitHub Actions secrets, or build script. Has 26
+permission groups; likely candidate is Shabrang publishing build/deploy (Pages or Workers
+deploy). Current state is dangerous: `Account.Secrets Store` permission grants secret-reading
+access; `All zones` + no expiry compound the blast radius. **Action plan:** (a) search
+Shabrang repos/CI for usage; (b) if found, mint scoped replacement (recommend:
+`Cloudflare Pages:Edit` + `Account Settings:Read`, zone `mumega.com` only, `expires_on`
+90 days); (c) if consumer remains unknown, confirm with Hadi before deletion — it may
+live on a laptop or external CI. OLD token deletion is a human gate (dashboard only).
 
 ## Credentials with no consumer — revoke candidates
 
