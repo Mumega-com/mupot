@@ -1,0 +1,268 @@
+{
+  "id": "brain-learning-ranker/v1",
+  "status": "design",
+  "spec": "docs/superpowers/specs/2026-07-27-brain-learning-ranker-design.md",
+  "thesis": "Receipts distill into gated instincts; rank recalls them; the core still gates every proposal \u2014 the brain never becomes an actor.",
+  "lineage": {
+    "target": "mupot-typescript-brainport",
+    "targetStatus": "type-only-sealed-decision-record-zero-callers",
+    "liveAtcRanking": "src/tasks/ranking.ts-rankTasks-wired-out-of-scope",
+    "liveHermesBrain": "agents/mumega-brain/hermes/prioritize_scan.py-separate-repo-out-of-scope",
+    "note": "third-lineage-off-unbuilt-port-not-extension-of-live-brain"
+  },
+  "contrast": {
+    "learningRanker": {
+      "name": "brain-learning-ranker",
+      "role": "idempotent-portfolio-atc",
+      "output": "BrainDecision.ranked-proposals-only",
+      "learning": "port4-instinct-loop",
+      "hotPathLlm": false,
+      "mayAct": false
+    },
+    "learningActor": {
+      "name": "anti-pattern-learning-actor",
+      "role": "autonomous-operator",
+      "output": "direct-side-effects",
+      "learning": "conflated-with-hermes-gateway",
+      "hotPathLlm": true,
+      "mayAct": true
+    }
+  },
+  "invariants": [
+    "brain-rank-not-act",
+    "learning-is-instinct-loop-not-hermes-gateway",
+    "hot-path-zero-llm",
+    "recall-at-rank-core-injected",
+    "anti-fabrication-receipt-provenance",
+    "anti-selection-bias-staleness-and-unexercised-decay",
+    "instincts-confidence-decay-domain-gated",
+    "project-scope-enforced",
+    "instincts-never-bypass-core-gates",
+    "no-new-brain-proposal-verbs",
+    "determinism-same-inputs-same-rank",
+    "max-learn-delta-bound",
+    "noop-veto-full-block-unbounded-priority",
+    "hermes-optional-runtime-only"
+  ],
+  "rankPipeline": [
+    "loadBoardContext",
+    "recallInstincts",
+    "gateInstincts",
+    "decide",
+    "applyInstinctBias",
+    "emitDecision"
+  ],
+  "rankProposalShape": {
+    "matches": "BrainProposal",
+    "fields": {
+      "kind": "'spawn_task' | 'wake_agent' | 'noop'",
+      "agentId": "string | undefined \u2014 required for wake_agent deliverability",
+      "summary": "string",
+      "doneWhen": "string | undefined",
+      "priority": "number"
+    },
+    "note": "RankProposal must be structurally identical to BrainProposal \u2014 no conversion layer"
+  },
+  "forbiddenActionEnforcement": {
+    "primary": "kind-only via ALLOWED_BRAIN_PROPOSAL_KINDS union + assertProposalKindAllowed (throws)",
+    "proseScreening": {
+      "enabled": true,
+      "mode": "non-throwing-warning-on-single-proposal-never-batch-throw",
+      "matching": "word-tokens-after-separator-normalization-no-compact-substring"
+    }
+  },
+  "allowedProposalKinds": [
+    "spawn_task",
+    "wake_agent",
+    "noop"
+  ],
+  "forbiddenActionVerbs": [
+    "restart",
+    "heal",
+    "merge",
+    "deploy",
+    "publish",
+    "verdict",
+    "mint_token",
+    "fleet_control"
+  ],
+  "instinct": {
+    "fields": [
+      "trigger",
+      "confidence",
+      "decay",
+      "domain"
+    ],
+    "confidenceMin": 0.3,
+    "confidenceMax": 0.9,
+    "injectThreshold": 0.7,
+    "decayHalfLifeDays": 30,
+    "maxInjected": 6,
+    "allowedDomains": [
+      "rank-discipline",
+      "routing",
+      "citation",
+      "lifecycle"
+    ],
+    "domainDistillConstraint": "prompt-or-mapping-must-emit-allowlist-members-only",
+    "promoteMinProjects": 2,
+    "promoteMinConfidence": 0.8,
+    "injectCorroborationMinObservations": 2,
+    "gateRequiresProjectId": true
+  },
+  "bias": {
+    "maxLearnDelta": 5.0,
+    "noopVetoSeparateFromMaxLearnDelta": true,
+    "noopVetoInvariant": "noop-veto-full-block-unbounded-priority",
+    "softDemote": "clampLearnDelta(-matching.length) — graduated; clamp binds at n>5",
+    "noopAuditDelta": "records-true-priority-change-tagged-noopVeto",
+    "note": "MAX_LEARN_DELTA=5 bounds soft-demote only. Noop veto is a SEPARATE invariant: kind→noop, priority floors at 0; audited delta is the true change tagged noopVeto:true.",
+    "stalenessEscalationWiredInto": "applyInstinctBiasToProposals(consecutiveSuppressionTicks)"
+  },
+  "selectionBiasGuards": {
+    "stalenessEscalation": {
+      "enabled": true,
+      "wired": true,
+      "caller": "applyInstinctBiasToProposals",
+      "description": "item suppressed N consecutive ticks force-promoted once — deterministic, not random"
+    },
+    "unexercisedSuppressingInstinctDecay": {
+      "enabled": true,
+      "wired": true,
+      "caller": "gateInstinctsForRank",
+      "description": "instinct that suppresses but produces no confirming receipts loses confidence"
+    },
+    "epsilonGreedy": false,
+    "reason": "random sampling breaks determinism-same-inputs-same-rank"
+  },
+  "distill": {
+    "receiptResolution": "unexported-unique-symbol-VerifiedReceiptRef-only-from-injected-ReceiptStoreResolver-with-resolved-content-boolean-bag-rejected",
+    "corroborationRequiredBeforeInject": true,
+    "corroborationIndependence": "distinct-agentId-OR-distinct-incidentId-string-diversity-structural-limit-full-independence-needs-store",
+    "contentSanitization": "structural-allowlist-only-JSON-evidence-field-shape-not-a-content-allowlist-see-fenceUntrustedEvidenceForPrompt",
+    "verifiedReceiptProvenance": "WeakSet-registry-plus-unexported-unique-symbol-Object.freeze-mint-only",
+    "parseIsTrustBoundary": true,
+    "allowedSources": [
+      "gate_fail_receipt",
+      "fabrication_receipt",
+      "human_correction_receipt"
+    ],
+    "forbiddenSources": [
+      "raw_agent_self_report",
+      "unverified_board_diff",
+      "model_speculation"
+    ],
+    "modelClass": "cheap",
+    "runsOnHotPath": false,
+    "domainOutput": "must-map-to-instinct.allowedDomains-or-no-op-loop",
+    "verifiedReceiptConstructor": "verifiedReceiptRefFromResolver",
+    "trustBoundary": "injected-ReceiptStoreResolver-like-Port4-InstinctChat",
+    "contentTrustBoundary": "consumer-inert-fence-not-content-denylist",
+    "untrustedEvidenceApi": {
+      "brand": "UntrustedDistillEvidence",
+      "constructor": "asUntrustedDistillEvidence",
+      "onlyPromptAdjacentPath": "fenceUntrustedEvidenceForPrompt",
+      "typedFactExtractor": "extractTypedFactsFromEvidence-returns-empty-allowlisted-bag-never-free-text",
+      "note": "regex denylist (INSTRUCTION_SHAPED) demoted to non-security soft note (noteEvidenceLooksInstructionShaped); narrative-steering/homoglyph/zero-width evasions defeat any keyword filter, so evidence is made inert by fencing, never by stripping"
+    }
+  },
+  "recallInstincts": {
+    "signature": "recallInstincts(store: InstinctReadPort, opts: RecallInstinctsOpts): Promise<RecallInstinctsResult>",
+    "opts": {
+      "projectId": "string \u2014 required",
+      "nowIso": "string \u2014 required for decay",
+      "includeGlobal": "boolean \u2014 default false"
+    },
+    "result": {
+      "instincts": "RankInstinctSnapshot[]",
+      "degraded": "boolean \u2014 true when Port-4 unavailable"
+    },
+    "scopingRule": "instinct.projectId === opts.projectId OR (null AND promote-gate-passed AND includeGlobal)"
+  },
+  "gateInstincts": {
+    "requiredOpts": {
+      "projectId": "string \u2014 fail-closed cross-project rejection",
+      "nowIso": "string",
+      "allowedDomains": "string[] \u2014 fail-closed on empty"
+    }
+  },
+  "runtime": {
+    "hermes": "optional-resilient-host",
+    "hermesIsLearningMechanism": false,
+    "experienceJson": "mechanical-reliability-signal-only"
+  },
+  "exampleInstinctId": "no-act-on-fabrication",
+  "tiesTo": {
+    "brainportSealDoc": "docs/architecture/port-interfaces-model-brain.md \u2014 Remaining S3 #1 brainport-default-adapter",
+    "dormantPort4Task": "b143e73d",
+    "dormantPort4Branch": "cursor/task-b143e73d",
+    "dormantPort4Status": "prerequisite-or-unmet-dependency-with-no-learning-degrade-never-reuse",
+    "failureClass": "#490-act-on-fabrication"
+  },
+  "nonGoals": [
+    "replace-brainport-with-hermes-gateway",
+    "make-brain-an-actor",
+    "merge-port4-in-this-design-commit",
+    "merge-b143e73d-to-unblock-this-design",
+    "migration-applied-in-this-design-commit",
+    "retarget-at-live-rankTasks-or-prioritize_scan-without-explicit-decision",
+    "instinct-ui-in-this-design-commit",
+    "silent-global-promotion",
+    "epsilon-greedy-exploration"
+  ],
+  "buildSlices": [
+    "contract-lock",
+    "brainport-default-adapter",
+    "port4-land",
+    "receipt-observe",
+    "offline-distill",
+    "recall-at-rank",
+    "optional-hermes-runtime"
+  ],
+  "acceptance": {
+    "testCount": 26,
+    "mechanismLockNeTrustLock": {
+      "name": "mechanism-lock-ne-trust-lock",
+      "description": "tests that lock a mechanism but not the trust it depends on — mayDistillFromSource enum fence is canonical example",
+      "structuralLimitation": "no-contract-test-can-prove-port4-is-wired"
+    },
+    "testInventory": {
+      "note": "updated for Kasra ranker gate item 2 — INSTRUCTION_SHAPED denylist demoted from security claim; consumer-inert fence (fenceUntrustedEvidenceForPrompt) added; reproduce-and-refuse suite locks E/H/F/J evasions (narrative-steering/homoglyph/zero-width) pass structural allowlist verbatim and are made inert only at the fence",
+      "contractDoc": {
+        "count": 3,
+        "catches": "json-ts-drift",
+        "misses": "design-correctness"
+      },
+      "brainRole": {
+        "count": 4,
+        "catches": "hardcoded-literals-kind-enforcement-prose-warn",
+        "misses": "none-on-cleared-BLOCK-B-C"
+      },
+      "distillFence": {
+        "count": 3,
+        "catches": "resolver-brand-independence-schema-allowlist",
+        "misses": "production-store-wiring"
+      },
+      "untrustedEvidenceFence": {
+        "count": 4,
+        "catches": "structural-allowlist-accepts-content-verbatim-fence-wraps-without-claiming-sanitized-no-safe-string-api-forged-non-branded-input-refused",
+        "misses": "no-live-llm-consumer-wired-yet"
+      },
+      "instinctGate": {
+        "count": 5,
+        "catches": "project-scope-independent-corroboration-wired-decay",
+        "misses": "none-on-requireCorroboration-false-path-removed"
+      },
+      "selectionBias": {
+        "count": 1,
+        "catches": "staleness-wired-into-applyInstinctBias",
+        "misses": "none-if-caller-deleted-grep-would-fail-test"
+      },
+      "recallAtRank": {
+        "count": 3,
+        "catches": "noop-veto-capped-delta-agentId-pipeline-order",
+        "misses": "prose-warn-noise-on-board"
+      }
+    }
+  }
+}
