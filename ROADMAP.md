@@ -8,41 +8,52 @@ numbers.
 
 | State | Version | Meaning |
 |---|---|---|
-| Stable release | `v0.25.0` | Project Routines and Needs You. |
-| Development target | `v0.26.0` | Governed Tools, Marketing/CRO Pilot, Identity and Unified Access, and Console Consolidation. |
-| Next planned | `v0.27.0` | Agent Computers and Recovery. |
+| Cut version | `v0.29.0` | Release Truth and Sovereign Substrate. Constants cut, **not yet tagged**. |
+| Last tagged release | `v0.25.0` | Project Routines and Needs You. |
+| Development target | `v0.30.0` | Governed Tools, Marketing/CRO Pilot, Identity and Unified Access, and Console Consolidation. |
+| Next planned | `v0.31.0` | Agent Computers and Recovery. |
 
-Code merged or deployed after the `v0.25.0` tag is not retroactively part of
-`v0.25.0`. Capabilities remain preview until the release that owns them passes its
+Code merged or deployed after the `v0.29.0` cut is not retroactively part of
+`v0.29.0`. Capabilities remain preview until the release that owns them passes its
 gate and is tagged.
 
-## Release blocked — mupot cannot currently version itself (2026-08-07)
+## Versioning unblocked — `v0.29.0` cut, tag still owed (2026-08-08)
 
-`v0.25.0` remains the tagged release. **65 commits sit on `main` past that tag, all
-deployed**, and they cannot be named yet: the version constants are pinned by a
-published tenant receipt and the native-addon compatibility grace is already spent.
-Full evidence: [#805](https://github.com/Mumega-com/mupot/issues/805).
+[#805](https://github.com/Mumega-com/mupot/issues/805) is resolved. The blocker was
+that the version constants were pinned by a published tenant receipt and the
+native-addon compatibility grace was already spent, so the 69 deployed commits past
+`v0.25.0` could not be named. #805 option c was taken — the historical receipt
+assertions were decoupled from the live constants — and
+[#806](https://github.com/Mumega-com/mupot/pull/806) landed the atomic cut:
+`package.json`, `src/version.ts` (`MUPOT_PUBLIC_API_VERSION`), and `CHANGELOG.md`
+(`## 0.29.0 — 2026-08-08`) all read `0.29.0`.
 
-What DID land (flight-20260807-release-truth): `/health` now reports the true deployed
-commit, ref, build time and working-tree cleanliness — stamped by a `[build]` hook that
-fires on the bare `wrangler deploy` path, so it cannot be forgotten
-([#801](https://github.com/Mumega-com/mupot/pull/801)). The deployed version is
-**knowable**; naming it is what remains blocked. Unblocking is a governance decision
-(re-issue the receipt, widen the grace, or decouple the receipt test from live
-constants — #805 recommends the third).
+Two consequences this document now carries:
+
+1. **`0.29.0` was renumbered out of the plan.** The cut went forward without shipping
+   the promises of `v0.26.0`, `v0.27.0`, and `v0.28.0`, so those numbers can no longer
+   sit below the cut version. All four unshipped releases moved up by four:
+   Governed Tools `v0.26.0`→`v0.30.0`, Agent Computers `v0.27.0`→`v0.31.0`,
+   Compounding Project Knowledge `v0.28.0`→`v0.32.0`, and Distribution and Commercial
+   Operations `v0.29.0`→`v0.33.0`. **No promise was dropped, delivered, or reworded —
+   only the number moved.** Anything from those scopes already on `main` is `preview`
+   under the activation states below, not shipped.
+2. **`v0.29.0` is cut but not tagged.** `git tag` still tops out at `v0.25.0`. Until the
+   tag exists, `v0.29.0` is the version the code reports, not a supported release
+   contract, and the `stable` label below is not yet earned by it.
 
 ## Security flight queue — ordered (updates by PR only)
 
 > **This is where flight plans live.** One ordered list; Hadi sets the order, the fleet
 > executes top-down. Detail lives in the linked issues — this table is the index, not a
 > second store. **Every flight names a target version** (rule 2: no unmilestoned
-> implementation) — concrete numbers return once #805 unblocks versioning. A flight is
+> implementation) — #805 is resolved, so flights name concrete numbers again — `v0.30.0` and later. A flight is
 > declared by writing a manifest (`/tmp/flight-active.md`,
 > archived to `agents/kasra/.remember/flights/` on landing).
 
 | # | Flight | Target | Why it is here | Issues | State |
 |---|---|---|---|---|---|
-| — | **FLIGHT-001-R** — RBAC remediation | next release (#805) | random-email P0, unfiltered roster, PII leak, fail-open addons | #796 #798 #780 #788 | **LANDED 2026-08-07** |
+| — | **FLIGHT-001-R** — RBAC remediation | `v0.29.0` | random-email P0, unfiltered roster, PII leak, fail-open addons | #796 #798 #780 #788 | **LANDED 2026-08-07** |
 | 1 | **FLIGHT-002** — identity & token lifecycle | next+1 | `member_tokens` have no `expires_at`; permanent until hand-revoked. Time alone increases exposure | F5; `pi` token rotation; CF mint-capable pair (Hadi-gated) | NEXT |
 | 2 | **FLIGHT-003** — channel authority shrink | next+1 | non-directory channels resolve FULL standing capability: one compromised session = all authority, no expiry, no ceiling | F4, #799 (self-reported fleet squads, `/radar` unscoped) | queued |
 | 3 | **FLIGHT-004** — approvals & 2FA native | next+1 | make "Hadi said X" unusable as a claim in code, not in a side-script: pot surfaces, pot verifies, nonce single-use, action-hash bound | mumega-com#725 | queued |
@@ -352,7 +363,37 @@ Activation:
 Not in `v0.25.0`: event/webhook/alarm triggers, session reuse, model routing,
 per-flight sandboxes, self-modifying skills, or console consolidation.
 
-### v0.26.0: Governed Tools and Marketing/CRO Pilot - planned
+### v0.29.0: Release Truth and Sovereign Substrate - cut, untagged
+
+**One promise:** A deployed pot can prove which commit it is running, and the version
+it reports is the version its constants and CHANGELOG agree on.
+
+This release exists because the previous three planned numbers were never cut. It was
+taken as a forward cut over `v0.26.0`–`v0.28.0` rather than as delivery of them; see
+"Versioning unblocked" above for the renumber that followed. Scope is what
+[CHANGELOG.md](CHANGELOG.md) `## 0.29.0 — 2026-08-08` records, principally:
+
+- build-time release identity — `/health` stamps the true `commit`, `ref`, `built_at`,
+  and working-tree `clean` state by construction, including on the bare
+  `wrangler deploy` path ([#443](https://github.com/Mumega-com/mupot/issues/443),
+  [#571](https://github.com/Mumega-com/mupot/issues/571),
+  [#801](https://github.com/Mumega-com/mupot/pull/801));
+- the atomic version cut itself, with historical receipt assertions decoupled from live
+  constants ([#805](https://github.com/Mumega-com/mupot/issues/805) option c,
+  [#806](https://github.com/Mumega-com/mupot/pull/806));
+- sovereign addon sub-apps, token-usage telemetry, and the motherboard map;
+- Telegram central-command ingress and the `MU.100.001` v6 constitution ratification.
+
+Activation: build-time stamping is default-on. Everything else follows the activation
+label of the addon or channel that carries it.
+
+Not in `v0.29.0`: any promise from `v0.30.0`–`v0.33.0`. Parts of those scopes are on
+`main` and are `preview`, not shipped.
+
+Owed before this can be labelled `stable`: a `v0.29.0` tag, and a release record under
+`docs/releases/` matching the pattern the `v0.23.0` and `v0.24.0` entries set.
+
+### v0.30.0: Governed Tools and Marketing/CRO Pilot - planned
 
 **One promise:** A Project routine can use a real business system without exposing
 its raw credential to the model, and Marketing/CRO proves the path end to end.
@@ -440,10 +481,10 @@ Activation:
 - Identity migration: additive and flagged; existing tokens get an implicit
   full-ceiling grant so behavior is unchanged until a key is deliberately scoped.
 
-Not in `v0.26.0`: accounting, payments, unrestricted tool catalogs, or silent
+Not in `v0.30.0`: accounting, payments, unrestricted tool catalogs, or silent
 credential fallback into runtime environments.
 
-### v0.27.0: Agent Computers and Recovery - planned
+### v0.31.0: Agent Computers and Recovery - planned
 
 **One promise:** Substantial flights can run in isolated, recoverable computers without
 making one Mac, pod, or agent harness the system of record.
@@ -465,7 +506,7 @@ Activation:
   after recovery and cost gates pass.
 - `reuse` and `pinned` sessions remain opt-in.
 
-### v0.28.0: Compounding Project Knowledge - planned
+### v0.32.0: Compounding Project Knowledge - planned
 
 **One promise:** Projects improve from measured outcomes without confusing generated
 memory with evidence or allowing agents to widen their own authority.
@@ -486,7 +527,7 @@ Activation:
 - Promotion and policy changes: human approval required.
 - Automated Project prioritization: opt-in only after held-out evaluation.
 
-### v0.29.0: Distribution and Commercial Operations - planned
+### v0.33.0: Distribution and Commercial Operations - planned
 
 **One promise:** A customer can install, operate, upgrade, and commercially license a
 Mupot without Mumega performing hidden manual steps.
@@ -538,15 +579,15 @@ study. Feature count alone cannot satisfy the GA gate.
 | Mac/Kubernetes Agent Host | `v0.24.0` | Opt-in per host/profile |
 | Routines and RoutineRun | `v0.25.0` | Each Routine explicitly enabled |
 | Needs You review inbox | `v0.25.0` | Default-on projection |
-| Console consolidation (project-centered nav) | `v0.26.0` | Default-on; no dead/duplicate/orphan menus |
-| Governed connector actions | `v0.26.0` | Connector and grant required |
-| Unified principals + token-scoped access | `v0.26.0` | Additive migration; implicit full-ceiling grant until scoped |
-| Marketing & CRO addon | `v0.26.0` | Opt-in per Project |
-| Isolated Agent Computers | `v0.27.0` | Initially opt-in |
-| Reviewed knowledge and coherence evaluation | `v0.28.0` | Promotion gated |
-| Commercial installation and operations | `v0.29.0` | License/entitlement dependent |
-| Operated Presence (metered guest check-in/out) | `v0.29.0` | Owner opt-in per engagement, fail-closed, revocable |
-| Commercial tiers and support entitlements | `v0.29.0` | Payment-gated support; free = public updates only |
+| Console consolidation (project-centered nav) | `v0.30.0` | Default-on; no dead/duplicate/orphan menus |
+| Governed connector actions | `v0.30.0` | Connector and grant required |
+| Unified principals + token-scoped access | `v0.30.0` | Additive migration; implicit full-ceiling grant until scoped |
+| Marketing & CRO addon | `v0.30.0` | Opt-in per Project |
+| Isolated Agent Computers | `v0.31.0` | Initially opt-in |
+| Reviewed knowledge and coherence evaluation | `v0.32.0` | Promotion gated |
+| Commercial installation and operations | `v0.33.0` | License/entitlement dependent |
+| Operated Presence (metered guest check-in/out) | `v0.33.0` | Owner opt-in per engagement, fail-closed, revocable |
+| Commercial tiers and support entitlements | `v0.33.0` | Payment-gated support; free = public updates only |
 | Governed business loop GA | `v1.0.0` | Stable supported product |
 
 ## Scope-control rules
