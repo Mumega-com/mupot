@@ -36,6 +36,7 @@ import os
 import subprocess
 import time
 import sys
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -49,6 +50,7 @@ STATE_PATH = Path(os.environ.get("STEWARD_STATE", str(Path.home() / ".fleet/stew
 WORKTREE_ROOT = Path(os.environ.get("WORKTREE_ROOT", "/home/mumega/mupot-worktrees"))
 DRY_RUN = os.environ.get("DRY_RUN", "") == "1"
 
+LIST_LIMIT = 100  # server hard-caps task_list at 100 and exposes no offset
 REISSUE_MARKER = "steward-reissue-of:"
 # Block reasons that are infra failures, safe to auto-retry once. Review
 # verdicts, gate BLOCKs, and anything unrecognized stay human.
@@ -81,8 +83,14 @@ def mcp(tool: str, args: dict) -> dict:
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        payload = json.loads(resp.read())
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            payload = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        # The server puts the useful reason (e.g. assignee_not_in_squad) in the
+        # body, which the raw HTTPError hides behind a bare status code.
+        detail = exc.read().decode(errors="replace")[:400]
+        raise RuntimeError(f"mupot {tool} http {exc.code}: {detail}") from exc
     if "error" in payload:
         raise RuntimeError(f"mupot {tool} error: {payload['error']}")
     inner = json.loads(payload["result"]["content"][0]["text"])
@@ -106,7 +114,7 @@ def save_state(state: dict) -> None:
 
 
 def list_tasks(status: str) -> list[dict]:
-    return mcp("task_list", {"status": status, "limit": 50}).get("tasks", [])
+    return mcp("task_list", {"status": status, "limit": LIST_LIMIT}).get("tasks", [])
 
 
 def lineage_root(task: dict) -> str:
@@ -123,9 +131,32 @@ def is_retriable(task: dict) -> bool:
     return any(s in tail for s in RETRIABLE_SNIPPETS)
 
 
-def reissue(task: dict, reason: str, state: dict) -> str | None:
+def live_lineages() -> set[str]:
+    """Lineage roots that already have a copy someone could still work on.
+
+    The state file is the fast path, but it is local and losable; the board is the
+    truth. Deriving the guard from the board too means a wiped or rolled-back state
+    file can no longer cause a second copy of work that is already queued.
+    """
+    roots: set[str] = set()
+    for status in ("open", "in_progress", "review"):
+        try:
+            tasks = list_tasks(status)
+        except Exception as exc:  # noqa: BLE001 - a partial guard beats none
+            log(f"live-lineage scan of {status} failed ({exc}) — relying on state file")
+            continue
+        roots.update(lineage_root(task) for task in tasks)
+        if len(tasks) >= LIST_LIMIT:
+            # No offset parameter exists, so a full page means the scan is partial and
+            # this guard cannot prove a lineage is absent. Say so rather than imply
+            # coverage the query never had; the state file remains the real dedup.
+            log(f"live-lineage scan of {status} truncated at {LIST_LIMIT} — guard is partial")
+    return roots
+
+
+def reissue(task: dict, reason: str, state: dict, live: set[str]) -> str | None:
     root = lineage_root(task)
-    if root in state["reissued"]:
+    if root in state["reissued"] or root in live:
         return None  # one automatic retry per lineage; after that, humans
     base_body = task.get("body", "").split("\n\n---\n")[0]
     body = (
@@ -138,12 +169,11 @@ def reissue(task: dict, reason: str, state: dict) -> str | None:
         log(f"DRY_RUN would reissue {task['id'][:8]} ({reason})")
         return None
     payload = {
-        "squad_id": task.get("squad_id", "squad-core"),
+        "squad_id": task.get("squad_id") or "squad-core",
         "project_id": task.get("project_id"),
         "title": task.get("title", "")[:200],
-        "done_when": task.get("done_when", "(carried from prior copy)"),
+        "done_when": task.get("done_when") or "(carried from prior copy)",
         "body": body,
-        "assignee_agent_id": task.get("assignee_agent_id"),
     }
     # mupot#659 P0 fix / "amplifier" close: reissue used to always go through task_create
     # with NO provenance marker, so a blocked task that originated from a governed
@@ -156,8 +186,24 @@ def reissue(task: dict, reason: str, state: dict) -> str | None:
     external_source = task.get("external_source")
     if external_source:
         payload["external_source"] = external_source
-    new = mcp("task_create", payload)["task"]
+    assignee = task.get("assignee_agent_id")
+    try:
+        new = mcp("task_create", {**payload, "assignee_agent_id": assignee} if assignee else payload)["task"]
+    except RuntimeError as exc:
+        # The original assignee may have left the squad (roster changes, expired
+        # technician tokens). The work still needs doing — re-issue unassigned so
+        # any squad member can claim it.
+        if "assignee_not_in_squad" not in str(exc):
+            raise
+        log(f"{task['id'][:8]}: assignee {str(assignee)[:8]} no longer in squad — re-issuing unassigned")
+        new = mcp("task_create", payload)["task"]
     state["reissued"][root] = new["id"]
+    # Persist the moment the copy exists. The dedup record used to be written only
+    # after the whole cycle finished, so any later failure (or a SIGTERM mid-cycle)
+    # discarded it and the next cycle re-issued the SAME lineage again — that is how
+    # 2026-08-03 produced two copies of the same task ten minutes apart. A duplicate
+    # on the board is worse than a lost cycle, so the marker lands first.
+    save_state(state)
     log(f"reissued {task['id'][:8]} -> {new['id'][:8]} ({reason})")
     return new["id"]
 
@@ -184,9 +230,13 @@ def send_digest(state: dict, repaired: list[str]) -> None:
             counts[status] = len(list_tasks(status))
         except Exception:  # noqa: BLE001
             counts[status] = -1
+    def render(value: int) -> str:
+        # list_tasks pages at 50; a full page means "at least", not "exactly".
+        return "?" if value < 0 else (f"{value}+" if value >= LIST_LIMIT else str(value))
+
     lines = [
         f"🧭 Steward digest {datetime.now(timezone.utc).strftime('%H:%M')}Z — board: "
-        + ", ".join(f"{k} {v}" for k, v in counts.items()),
+        + ", ".join(f"{k} {render(v)}" for k, v in counts.items()),
     ]
     if repaired:
         lines.append("repaired this cycle: " + "; ".join(repaired))
@@ -213,18 +263,26 @@ def main() -> int:
         return 2
     state = load_state()
     repaired: list[str] = []
+    live = live_lineages()
+
+    def repair(task: dict, reason: str, label: str) -> None:
+        # One unrepairable task must never cost the cycle its other repairs.
+        try:
+            new_id = reissue(task, reason, state, live)
+        except Exception as exc:  # noqa: BLE001 - keep stewarding the rest
+            log(f"{label} {task['id'][:8]}: re-issue failed, left for a human — {exc}")
+            return
+        if new_id:
+            live.add(lineage_root(task))
+            repaired.append(f"{label} {task['id'][:8]}→{new_id[:8]}")
 
     for task in list_tasks("blocked"):
         if is_retriable(task):
-            new_id = reissue(task, "retriable infra failure", state)
-            if new_id:
-                repaired.append(f"blocked {task['id'][:8]}→{new_id[:8]}")
+            repair(task, "retriable infra failure", "blocked")
 
     for task in list_tasks("in_progress"):
         if orphan_age_hours(task) >= ORPHAN_HOURS and not has_live_worktree(task):
-            new_id = reissue(task, f"orphaned in_progress >{ORPHAN_HOURS}h, no worktree", state)
-            if new_id:
-                repaired.append(f"orphan {task['id'][:8]}→{new_id[:8]}")
+            repair(task, f"orphaned in_progress >{ORPHAN_HOURS}h, no worktree", "orphan")
 
     send_digest(state, repaired)
     if not DRY_RUN:
