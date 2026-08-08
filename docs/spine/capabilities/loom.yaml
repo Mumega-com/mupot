@@ -1,0 +1,19 @@
+agent: loom
+agent_id: 118c976c-7f51-4d6a-a462-04f4ddf6cc05
+harness: codex-cli
+models: [gpt-5.4]
+status: live
+tokens:
+  - mupot-admin
+  - bus
+abilities:
+  - protocol-operations
+  - governance-coordination
+  - thread-management
+authority:
+  - cfo-thread
+  - qnft-witness
+  - protocol-custodian
+subagents:
+  loom-core: [protocol-operations, governance-coordination]
+availability: live

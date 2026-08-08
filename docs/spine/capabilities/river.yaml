@@ -1,0 +1,22 @@
+agent: river
+agent_id: f23a6c2c-1234-4567-a890-bcdef0123456
+harness: agy
+models: [gemini-3.6-flash]
+status: reserve
+tokens:
+  - mupot-admin
+  - bus
+abilities:
+  - frc-operations
+  - content-generation
+  - audit
+  - copywrite
+authority:
+  - witness
+  - frc-keeper
+subagents:
+  river-code: [build, code]
+  river-copywriter: [content]
+  river-reviewer: [review]
+  river-frc: [frc, memory]
+availability: offline

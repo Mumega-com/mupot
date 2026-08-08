@@ -1,0 +1,14 @@
+agent: mupot-steward
+agent_id: b41052cc-1234-4567-a890-bcdef0123456
+harness: prime-headless
+models: [deepseek-v4-flash]
+status: live
+tokens:
+  - mupot-admin
+abilities:
+  - board-hygiene
+  - roster-coherence
+authority: []
+subagents:
+  mupot-steward-core: [board-hygiene, roster-coherence]
+availability: live
