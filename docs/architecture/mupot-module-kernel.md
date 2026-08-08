@@ -116,8 +116,9 @@ give agents a role/why/death; memory the project holds, not just each agent.
 cheap supervisor always-on (the standing operator) + **warm restart**
 (save/resume-session) + **durable distilled learnings** (instinct-style memory) +
 **gate-as-a-driver** (santa-loop: two independent models, both NICE before ship).
-Wake the decider only for hard calls. mupot already has the supervisor; it needs
-warm-restart, instinct-memory, a gate-lane driver, and a FED BOARD.
+Wake the decider only for hard calls. mupot already has the supervisor, the
+gate-lane driver, the fed board, and **Port 4 warm-restart + instinct-memory**.
+The remaining build-order items are the surface port and workflow adapters.
 
 ## Build order (declared, not optional)
 
@@ -126,14 +127,17 @@ warm-restart, instinct-memory, a gate-lane driver, and a FED BOARD.
    codex, mumcp). Fixes "10 agents, none connected" immediately.
 2. **Feed the board + santa-loop gate-driver** — so connected agents do governed
    work that closes hands-off. First real unattended 2-agent flight.
-3. **Warm-restart + instinct-memory** — save/resume-session + confidence-weighted
-   learnings, so a restart is warm not cold (the context-loss fix).
+3. **Warm-restart + instinct-memory** — ✅ LIVE (Port 4). `session_save` /
+   `session_resume` (stale-replay guarded) + confidence-scored `instinct_*`
+   (promotion gate ≥2 projects / avg conf ≥0.8). Migration 0070. So a
+   post-compaction restart is warm, not cold.
 4. **Surface port** — mount the Hermes dashboard as a mupot panel.
 5. **Workflow adapters** — n8n behind the workflow port (marketing loop = proving
    ground).
 
 Ports 2–3 are the ECC ports; port 1 is the SOS-connectedness we lost, rebuilt
-durable. All five are extensions of the addon pattern, not new frameworks.
+durable. Port 4 is the ECC memory-persistence / continuous-learning-v2 port onto
+CF. All five are extensions of the addon pattern, not new frameworks.
 
 ## Presence authz — the write path is gated too (2026-07-21, adversarial-gate fix)
 
