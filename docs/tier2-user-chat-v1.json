@@ -1,0 +1,84 @@
+{
+  "id": "tier2-user-chat/v1",
+  "status": "design",
+  "spec": "docs/superpowers/specs/2026-07-27-tier2-stateless-user-chat-design.md",
+  "thesis": "Chat decides and dispatches; the board executes; the gate verifies; D1 remembers; idle costs nothing.",
+  "contrast": {
+    "tier1": {
+      "name": "persistent-mubot",
+      "audience": "few-rich-mubots",
+      "examples": ["kayhermes", "dme_mubot"],
+      "runtime": "persistent-upstream-hermes-sessions",
+      "reference": "PR #505",
+      "idleCost": "non-zero"
+    },
+    "tier2": {
+      "name": "stateless-user-chat",
+      "audience": "every-connected-member",
+      "runtime": "worker-request-scoped-turn",
+      "idleCost": "zero",
+      "persistentProcessPerUser": false
+    }
+  },
+  "invariants": [
+    "no-persistent-agent-process-per-user",
+    "dormant-when-idle-zero-model-cost",
+    "budget-gate-before-model-call",
+    "board-dispatch-only-no-self-execute",
+    "session-history-in-d1",
+    "results-return-via-gated-task-terminal",
+    "tenant-isolation-from-auth-not-body"
+  ],
+  "provenanceMarkerPrefix": "[tier2-chat:",
+  "turnPipeline": [
+    "authorize",
+    "loadContext",
+    "budgetGate",
+    "modelTurn",
+    "dispatchTools",
+    "persist",
+    "respond"
+  ],
+  "allowedTools": [
+    "task_create",
+    "task_list",
+    "task_get",
+    "project_recall",
+    "project_context",
+    "project_remember"
+  ],
+  "forbiddenTools": [
+    "gate_verdict",
+    "merge",
+    "deploy",
+    "publish",
+    "fleet_control",
+    "hermes_sessions",
+    "mint_agent_token"
+  ],
+  "budget": {
+    "tenantCeiling": "PLAN_LIMITS.monthlyModelBudgetMicroUsd",
+    "preCallGate": true,
+    "denyWithoutModelCall": true,
+    "debitRequiresMessageRow": true
+  },
+  "resultFanIn": {
+    "trigger": "gated-terminal-task-with-tier2-provenance",
+    "messageRole": "result",
+    "idempotencyKey": ["session_id", "task_id", "terminal_status"]
+  },
+  "nonGoals": [
+    "replace-tier1-kayhermes",
+    "ui-in-this-design-commit",
+    "migration-applied-in-this-design-commit",
+    "cron-wake-for-idle-chats"
+  ],
+  "buildSlices": [
+    "schema-provenance",
+    "budget-gate",
+    "turn-pipeline-route",
+    "board-dispatch",
+    "result-fan-in",
+    "chat-ui-surface"
+  ]
+}
