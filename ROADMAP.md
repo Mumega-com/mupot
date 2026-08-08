@@ -16,23 +16,40 @@ Code merged or deployed after the `v0.25.0` tag is not retroactively part of
 `v0.25.0`. Capabilities remain preview until the release that owns them passes its
 gate and is tagged.
 
+## Release blocked — mupot cannot currently version itself (2026-08-07)
+
+`v0.25.0` remains the tagged release. **65 commits sit on `main` past that tag, all
+deployed**, and they cannot be named yet: the version constants are pinned by a
+published tenant receipt and the native-addon compatibility grace is already spent.
+Full evidence: [#805](https://github.com/Mumega-com/mupot/issues/805).
+
+What DID land (flight-20260807-release-truth): `/health` now reports the true deployed
+commit, ref, build time and working-tree cleanliness — stamped by a `[build]` hook that
+fires on the bare `wrangler deploy` path, so it cannot be forgotten
+([#801](https://github.com/Mumega-com/mupot/pull/801)). The deployed version is
+**knowable**; naming it is what remains blocked. Unblocking is a governance decision
+(re-issue the receipt, widen the grace, or decouple the receipt test from live
+constants — #805 recommends the third).
+
 ## Security flight queue — ordered (updates by PR only)
 
 > **This is where flight plans live.** One ordered list; Hadi sets the order, the fleet
 > executes top-down. Detail lives in the linked issues — this table is the index, not a
-> second store. A flight is declared by writing a manifest (`/tmp/flight-active.md`,
+> second store. **Every flight names a target version** (rule 2: no unmilestoned
+> implementation) — concrete numbers return once #805 unblocks versioning. A flight is
+> declared by writing a manifest (`/tmp/flight-active.md`,
 > archived to `agents/kasra/.remember/flights/` on landing).
 
-| # | Flight | Why it is here | Issues | State |
-|---|---|---|---|---|
-| — | **FLIGHT-001-R** — RBAC remediation | random-email P0, unfiltered roster, PII leak, fail-open addons | #796 #798 #780 #788 | **LANDED 2026-08-07** |
-| 1 | **FLIGHT-002** — identity & token lifecycle | `member_tokens` have no `expires_at`; permanent until hand-revoked. Time alone increases exposure | F5; `pi` token rotation; CF mint-capable pair (Hadi-gated) | NEXT |
-| 2 | **FLIGHT-003** — channel authority shrink | non-directory channels resolve FULL standing capability: one compromised session = all authority, no expiry, no ceiling | F4, #799 (self-reported fleet squads, `/radar` unscoped) | queued |
-| 3 | **FLIGHT-004** — approvals & 2FA native | make "Hadi said X" unusable as a claim in code, not in a side-script: pot surfaces, pot verifies, nonce single-use, action-hash bound | mumega-com#725 | queued |
-| 4 | **FLIGHT-005** — governance wiring | SOS's voting contract has never worked (`engine/app.py` calls methods that do not exist); MU.100.001's protocol should not live on the bus | mumega-com#723 | queued |
-| 5 | unified execution metering | two disjoint budget accountings over one surface; routine spend never reaches `execution_meter` | F8 | backlog |
-| 6 | untrusted-content marking as structure | today it is an ingress tag + convention; make refusal structural | F6 | backlog |
-| 7 | loop-driver unhold | pot-registered, metered, propose-only scope, Hadi go | — | HELD |
+| # | Flight | Target | Why it is here | Issues | State |
+|---|---|---|---|---|---|
+| — | **FLIGHT-001-R** — RBAC remediation | next release (#805) | random-email P0, unfiltered roster, PII leak, fail-open addons | #796 #798 #780 #788 | **LANDED 2026-08-07** |
+| 1 | **FLIGHT-002** — identity & token lifecycle | next+1 | `member_tokens` have no `expires_at`; permanent until hand-revoked. Time alone increases exposure | F5; `pi` token rotation; CF mint-capable pair (Hadi-gated) | NEXT |
+| 2 | **FLIGHT-003** — channel authority shrink | next+1 | non-directory channels resolve FULL standing capability: one compromised session = all authority, no expiry, no ceiling | F4, #799 (self-reported fleet squads, `/radar` unscoped) | queued |
+| 3 | **FLIGHT-004** — approvals & 2FA native | next+1 | make "Hadi said X" unusable as a claim in code, not in a side-script: pot surfaces, pot verifies, nonce single-use, action-hash bound | mumega-com#725 | queued |
+| 4 | **FLIGHT-005** — governance wiring | next+1 | SOS's voting contract has never worked (`engine/app.py` calls methods that do not exist); MU.100.001's protocol should not live on the bus | mumega-com#723 | queued |
+| 5 | unified execution metering | next+1 | two disjoint budget accountings over one surface; routine spend never reaches `execution_meter` | F8 | backlog |
+| 6 | untrusted-content marking as structure | next+1 | today it is an ingress tag + convention; make refusal structural | F6 | backlog |
+| 7 | loop-driver unhold | next+1 | pot-registered, metered, propose-only scope, Hadi go | — | HELD |
 
 **Board opinion policy:** priority ORDER is Hadi's alone — no vote, no ceremony. Board
 input (asha first-pass, Athena architecture, River build feasibility) is requested per
