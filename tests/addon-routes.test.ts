@@ -192,7 +192,7 @@ describe('addon lifecycle routes', () => {
     expect(beforeBody.manifestSha256).toMatch(/^[a-f0-9]{64}$/)
     expect(beforeBody).toMatchObject({
       installedVersion: '1.0.0',
-      mupotCompatibility: '^0.24.0',
+      mupotCompatibility: '^0.29.0',
       publisher: 'mumega',
       trustClass: 'native_reviewed',
     })
@@ -850,7 +850,7 @@ describe('addon lifecycle routes', () => {
       action: 'install',
       addonKey: 'fixture-addon',
       manifestSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
-      mupotCompatibility: '^0.24.0',
+      mupotCompatibility: '^0.29.0',
     }))
     expect(Object.keys(body.receipts[0]).sort()).toEqual([
       'action',

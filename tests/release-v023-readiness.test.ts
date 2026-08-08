@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
+import { MUPOT_PUBLIC_API_VERSION } from '../src/version'
 
 const read = (path: string) => readFileSync(new URL(path, import.meta.url), 'utf8')
 
@@ -101,8 +102,8 @@ describe('v0.23.0 Trusted Runtime release gate', () => {
   it('publishes final stable metadata while retaining the RC evidence boundary', () => {
     // Current head release is v0.25.0 (Project Routines); v0.23.0 history is retained
     // permanently below. These two pins track the current shipped version.
-    expect(pkg.version).toBe('0.25.0')
-    expect(publicApiVersion).toContain("MUPOT_PUBLIC_API_VERSION = '0.25.0'")
+    expect(pkg.version).toBe(MUPOT_PUBLIC_API_VERSION)
+    expect(publicApiVersion).toContain(`MUPOT_PUBLIC_API_VERSION = '${MUPOT_PUBLIC_API_VERSION}'`)
     expect(changelog).toContain('## [0.25.0] — 2026-07-27')
     expect(changelog).toContain('## [0.24.0] — 2026-07-19')
     expect(changelog).toContain('## [0.23.0] — 2026-07-13')

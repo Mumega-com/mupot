@@ -19,7 +19,7 @@ export const WorkflowCircuitsAddon = Object.freeze<AddonManifestV1>({
   version: '1.0.0',
   publisher: 'mumega',
   trustClass: 'native_reviewed',
-  mupotCompatibility: '^0.24.0',
+  mupotCompatibility: '^0.29.0',
   kind: 'native',
   description: 'Deterministic workflow-graph engine: gated node/edge circuits agents drive through MCP tools.',
   departments: [],

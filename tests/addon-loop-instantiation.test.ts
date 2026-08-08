@@ -42,7 +42,7 @@ const UNREGISTERED_TEMPLATE_ADDON: AddonManifestV1 = {
   version: '1.0.0',
   publisher: 'mumega',
   trustClass: 'native_reviewed',
-  mupotCompatibility: '^0.24.0',
+  mupotCompatibility: '^0.29.0',
   kind: 'native',
   description: 'Lifecycle fixture declaring a templateKey with no registered factory.',
   departments: [{ moduleKey: FixtureModule.key, required: true }],
