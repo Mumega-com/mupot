@@ -25,7 +25,15 @@
 
 import type { Capability, CapabilityGrant, Env, BusEvent, Squad } from '../types'
 import { hasCapability } from '../auth/capability'
-import { createDepartment, createSquad, createAgent, findAgentsByName, getAgentProfile } from '../org/service'
+import {
+  createDepartment,
+  createSquad,
+  createAgent,
+  findAgentsByName,
+  getAgentProfile,
+  updateAgentProfile,
+} from '../org/service'
+import type { AgentProfilePatch } from '../org/service'
 import {
   mintAgentBoundToken,
   isAgentTokenCapability,
@@ -77,9 +85,28 @@ const GRANTABLE_AGENT_CAPABILITIES = new Set<Capability>(['observer', 'member', 
 async function emitProvisioned(
   env: Env,
   memberId: string,
-  kind: 'department' | 'squad' | 'agent' | 'token' | 'token_revoked' | 'key' | 'capability' | 'agent_deactivated',
+  kind:
+    | 'department'
+    | 'squad'
+    | 'agent'
+    | 'token'
+    | 'token_revoked'
+    | 'key'
+    | 'capability'
+    | 'agent_deactivated'
+    | 'agent_updated',
   id: string,
-  extra: { squad_id?: string; agent_id?: string; member_id?: string; capability?: Capability; reason?: string } = {},
+  extra: {
+    squad_id?: string
+    agent_id?: string
+    member_id?: string
+    capability?: Capability
+    reason?: string
+    // A profile correction keeps no history on the row (agents has no
+    // updated_at), so the field-level before/after must ride on the event or
+    // the change is unreversible from the trail.
+    changed?: Record<string, { from: unknown; to: unknown }>
+  } = {},
 ): Promise<void> {
   const event: BusEvent<{
     kind: string
@@ -88,6 +115,7 @@ async function emitProvisioned(
     member_id?: string
     capability?: Capability
     reason?: string
+    changed?: Record<string, { from: unknown; to: unknown }>
   }> = {
     type: 'org.provisioned',
     tenant: env.TENANT_SLUG,
@@ -101,6 +129,7 @@ async function emitProvisioned(
       ...(extra.member_id ? { member_id: extra.member_id } : {}),
       ...(extra.capability ? { capability: extra.capability } : {}),
       ...(extra.reason ? { reason: extra.reason } : {}),
+      ...(extra.changed ? { changed: extra.changed } : {}),
     },
     ts: new Date().toISOString(),
   }
@@ -929,6 +958,108 @@ const toolRegisterAgentKey: ToolSpec = {
   },
 }
 
+// ── update_agent ──────────────────────────────────────────────────────────────
+// Correct a live agent's profile row. Added because the registry drifts and had
+// no repair path: before this, the only writes to `agents` were status and
+// kpi_progress, so a re-harnessed or re-modelled seat kept asserting whatever
+// was true the day it was created, and the only fix was direct database access
+// — which is why it never stayed fixed. Partial patch: absent keys are left
+// alone, so correcting a model cannot blank a purpose. `status` is NOT settable
+// here (deactivate_agent owns retirement, with its token/presence/key teardown)
+// and neither is squad_id (moving squads changes capability scope — that is a
+// re-provision, not an edit).
+const toolUpdateAgent: ToolSpec = {
+  name: 'update_agent',
+  scope: "agent's squad",
+  min: 'admin',
+  args:
+    '{ agent: string (id|slug), slug?, name?, role?, model?, model_fallback?, purpose?, owner?, parent_agent_id?, qnft_ref?, capabilities?: string[], skills?: string[], reason?: string }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      agent: STRING_SCHEMA,
+      slug: STRING_SCHEMA,
+      name: STRING_SCHEMA,
+      role: STRING_SCHEMA,
+      model: STRING_SCHEMA,
+      model_fallback: STRING_SCHEMA,
+      purpose: STRING_SCHEMA,
+      owner: STRING_SCHEMA,
+      parent_agent_id: STRING_SCHEMA,
+      qnft_ref: STRING_SCHEMA,
+      capabilities: { type: 'array', items: STRING_SCHEMA },
+      skills: { type: 'array', items: STRING_SCHEMA },
+      reason: STRING_SCHEMA,
+    },
+    required: ['agent'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const agentRef = str(args.agent)
+    if (!agentRef) return fail(400, 'invalid_args', 'agent required')
+
+    const agentResult = await resolveAgentRef(env, agentRef)
+    if (!agentResult.ok) return resolveFail(agentResult.reason, 'agent_not_found')
+    const agent = agentResult.value
+
+    // Gate: admin on the agent's squad, same rank as create/deactivate. A
+    // profile row is identity — who an agent claims to be is what every
+    // downstream router, gate, and dispatcher reads.
+    const grants = auth.capabilities ?? []
+    if (!(await memberCanOnSquad(env, grants, agent.squad_id, 'admin'))) {
+      return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
+    }
+
+    const PATCHABLE = [
+      'slug',
+      'name',
+      'role',
+      'model',
+      'model_fallback',
+      'purpose',
+      'owner',
+      'parent_agent_id',
+      'qnft_ref',
+      'capabilities',
+      'skills',
+    ] as const
+
+    const patch: AgentProfilePatch = {}
+    for (const key of PATCHABLE) {
+      if (key in args) patch[key] = args[key]
+    }
+    if (!Object.keys(patch).length) {
+      return fail(400, 'invalid_args', 'at least one field to update is required')
+    }
+
+    const before = await getAgentProfile(env, agent.id)
+    const result = await updateAgentProfile(env, agent.id, patch)
+    if (!result.ok) {
+      if (result.error === 'slug_taken') return fail(409, 'slug_taken', { slug: str(args.slug) })
+      if (result.error === 'not_found') return fail(404, 'agent_not_found', { agent: agentRef })
+      return fail(400, 'invalid_args', { reason: result.error })
+    }
+
+    // Audit carries before/after for exactly the fields touched — a correction
+    // must be reversible from the trail alone, since the row keeps no history.
+    const changed: Record<string, { from: unknown; to: unknown }> = {}
+    for (const key of Object.keys(patch) as (keyof AgentProfilePatch)[]) {
+      changed[key] = {
+        from: before ? (before as unknown as Record<string, unknown>)[key] : null,
+        to: (result.value as unknown as Record<string, unknown>)[key],
+      }
+    }
+    await emitProvisioned(env, auth.memberId as string, 'agent_updated', agent.id, {
+      agent_id: agent.id,
+      squad_id: agent.squad_id,
+      changed,
+      reason: str(args.reason) || undefined,
+    })
+
+    return done({ agent: result.value, changed })
+  },
+}
+
 // ── deactivate_agent ──────────────────────────────────────────────────────────
 // The inverse of create_agent: retires a dead/junk agent (or a duplicate
 // identity) auditably, without a raw-D1 hand-edit. SOFT delete only —
@@ -1072,4 +1203,5 @@ export const PROVISION_TOOLS: ToolSpec[] = [
   toolGrantAgentCapability,
   toolRegisterAgentKey,
   toolDeactivateAgent,
+  toolUpdateAgent,
 ]

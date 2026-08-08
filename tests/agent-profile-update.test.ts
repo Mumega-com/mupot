@@ -1,0 +1,168 @@
+import { readFileSync, readdirSync } from 'node:fs'
+import { join } from 'node:path'
+import { beforeEach, describe, expect, it } from 'vitest'
+import { createAgent, getAgentProfile, updateAgentProfile } from '../src/org/service'
+import type { Env } from '../src/types'
+import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+
+// updateAgentProfile — the repair path for registry drift. Real SQLite, ALL
+// migrations applied in order, so these exercise the production write against the
+// actual `agents` schema (which notably has NO updated_at column — 0049 rebuilt
+// the table without one; a write that assumed it would fail only at runtime).
+
+const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
+
+function allMigrations(): string[] {
+  return readdirSync(MIGRATIONS_DIR)
+    .filter((name) => name.endsWith('.sql'))
+    .sort()
+}
+
+function seed(sqlite: SqliteD1Harness['sqlite']): void {
+  sqlite.exec(`
+    INSERT INTO departments (id, slug, name) VALUES ('dept-1', 'dept', 'Dept One');
+    INSERT INTO squads (id, department_id, slug, name) VALUES ('sq-a', 'dept-1', 'sqa', 'Squad A');
+    INSERT INTO org_settings (key, value, updated_at)
+      VALUES ('billing_state', '{"tier":"scale"}', '2026-07-22 00:00:00');
+  `)
+}
+
+describe('updateAgentProfile — registry drift repair', () => {
+  let harness: SqliteD1Harness
+  let env: Env
+  let agentId: string
+
+  beforeEach(async () => {
+    harness = createSqliteD1()
+    for (const file of allMigrations()) {
+      harness.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
+    }
+    seed(harness.sqlite)
+    env = { DB: harness.db } as unknown as Env
+
+    // The real-world case this exists for: a seat created under one name and
+    // model, later re-harnessed, with the row still asserting the old truth.
+    const created = await createAgent(env, 'sq-a', {
+      slug: 'prime',
+      name: 'Prime',
+      role: 'member',
+      model: '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+    })
+    if (!created.ok) throw new Error(`fixture create failed: ${created.error}`)
+    agentId = created.value.id
+  })
+
+  it('corrects slug, name, role and model in one patch', async () => {
+    const result = await updateAgentProfile(env, agentId, {
+      slug: 'asha',
+      name: 'Asha',
+      role: 'First-Pass Gate',
+      model: 'deepseek-v4-flash',
+    })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value.slug).toBe('asha')
+    expect(result.value.name).toBe('Asha')
+    expect(result.value.role).toBe('First-Pass Gate')
+    expect(result.value.model).toBe('deepseek-v4-flash')
+
+    // Read back through the production read path, not the return value.
+    const reread = await getAgentProfile(env, agentId)
+    expect(reread?.slug).toBe('asha')
+    expect(reread?.model).toBe('deepseek-v4-flash')
+  })
+
+  it('is partial: untouched fields keep their values', async () => {
+    await updateAgentProfile(env, agentId, { purpose: 'evidence detection' })
+    await updateAgentProfile(env, agentId, { model: 'deepseek-v4-flash' })
+
+    const profile = await getAgentProfile(env, agentId)
+    // The second patch must not have blanked what the first one set.
+    expect(profile?.purpose).toBe('evidence detection')
+    expect(profile?.model).toBe('deepseek-v4-flash')
+    expect(profile?.name).toBe('Prime')
+  })
+
+  it('round-trips array columns and clears them with an explicit null', async () => {
+    const set = await updateAgentProfile(env, agentId, {
+      capabilities: ['gate', 'research'],
+      skills: ['verify'],
+    })
+    expect(set.ok).toBe(true)
+    expect((await getAgentProfile(env, agentId))?.capabilities).toEqual(['gate', 'research'])
+
+    const cleared = await updateAgentProfile(env, agentId, { capabilities: null })
+    expect(cleared.ok).toBe(true)
+    expect((await getAgentProfile(env, agentId))?.capabilities).toBeNull()
+    // clearing one array column must not disturb the other
+    expect((await getAgentProfile(env, agentId))?.skills).toEqual(['verify'])
+  })
+
+  it('sets the qnft_ref an identity mint left null', async () => {
+    await updateAgentProfile(env, agentId, { qnft_ref: '375a9d13' })
+    expect((await getAgentProfile(env, agentId))?.qnft_ref).toBe('375a9d13')
+  })
+
+  it('refuses an empty patch rather than issuing a no-op UPDATE', async () => {
+    const result = await updateAgentProfile(env, agentId, {})
+    expect(result).toEqual({ ok: false, error: 'no_fields' })
+  })
+
+  it('refuses to null slug or name — the schema requires them', async () => {
+    expect(await updateAgentProfile(env, agentId, { slug: null })).toEqual({
+      ok: false,
+      error: 'invalid_field',
+    })
+    expect(await updateAgentProfile(env, agentId, { name: null })).toEqual({
+      ok: false,
+      error: 'invalid_field',
+    })
+    // and the row is untouched after a rejected patch
+    expect((await getAgentProfile(env, agentId))?.slug).toBe('prime')
+  })
+
+  it('refuses a whitespace-only required field', async () => {
+    expect(await updateAgentProfile(env, agentId, { model: '   ' })).toEqual({
+      ok: false,
+      error: 'invalid_field',
+    })
+  })
+
+  it('refuses a non-string where a string column is expected', async () => {
+    expect(await updateAgentProfile(env, agentId, { model: 42 })).toEqual({
+      ok: false,
+      error: 'invalid_field',
+    })
+    expect(await updateAgentProfile(env, agentId, { capabilities: 'gate' })).toEqual({
+      ok: false,
+      error: 'invalid_field',
+    })
+  })
+
+  it('refuses a column outside the allow-list — no status or squad moves', async () => {
+    // status has its own transition (setAgentStatus/deactivate_agent, which also
+    // revokes tokens and clears presence); squad_id changes capability scope.
+    expect(
+      await updateAgentProfile(env, agentId, { status: 'inactive' } as Record<string, unknown>),
+    ).toEqual({ ok: false, error: 'invalid_field' })
+    expect(
+      await updateAgentProfile(env, agentId, { squad_id: 'sq-b' } as Record<string, unknown>),
+    ).toEqual({ ok: false, error: 'invalid_field' })
+    expect((await getAgentProfile(env, agentId))?.status).toBe('active')
+  })
+
+  it('reports slug_taken instead of throwing on the UNIQUE(squad_id, slug) collision', async () => {
+    const other = await createAgent(env, 'sq-a', { slug: 'taken', name: 'Taken' })
+    expect(other.ok).toBe(true)
+
+    const result = await updateAgentProfile(env, agentId, { slug: 'taken' })
+    expect(result).toEqual({ ok: false, error: 'slug_taken' })
+    expect((await getAgentProfile(env, agentId))?.slug).toBe('prime')
+  })
+
+  it('returns not_found for an id that does not exist', async () => {
+    const result = await updateAgentProfile(env, 'no-such-agent', { name: 'Ghost' })
+    expect(result).toEqual({ ok: false, error: 'not_found' })
+  })
+})

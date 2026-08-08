@@ -722,6 +722,115 @@ export async function setAgentStatus(
   return { ok: true }
 }
 
+export type UpdateAgentProfileResult =
+  | { ok: true; value: AgentProfileSummary }
+  | { ok: false; error: 'not_found' | 'slug_taken' | 'no_fields' | 'invalid_field' }
+
+// Fields an admin may correct on an existing agent. `status` is deliberately
+// excluded — setAgentStatus/deactivateAgent own that transition and carry their
+// own semantics. `id` and `squad_id` are excluded because moving an agent
+// between squads changes its capability scope and is not a profile edit.
+const UPDATABLE_TEXT_COLUMNS = [
+  'slug',
+  'name',
+  'role',
+  'model',
+  'model_fallback',
+  'purpose',
+  'owner',
+  'parent_agent_id',
+  'qnft_ref',
+] as const
+
+const UPDATABLE_ARRAY_COLUMNS = ['capabilities', 'skills'] as const
+
+export type UpdatableAgentField =
+  | (typeof UPDATABLE_TEXT_COLUMNS)[number]
+  | (typeof UPDATABLE_ARRAY_COLUMNS)[number]
+
+export type AgentProfilePatch = Partial<Record<UpdatableAgentField, unknown>>
+
+/**
+ * Correct an existing agent's profile row in place.
+ *
+ * Exists because the registry drifts: a seat is re-harnessed or re-modelled and
+ * the row keeps asserting what was true at creation. Before this, the only
+ * mutations on `agents` were status and kpi_progress, so a wrong model or a
+ * stale role could be fixed only by direct database access — which meant it
+ * never stayed fixed.
+ *
+ * Partial by construction: only the keys present in `patch` are written, so a
+ * caller correcting a model cannot accidentally blank a purpose. An explicit
+ * null clears a nullable column; `slug` and `name` reject null because the
+ * schema requires them.
+ */
+export async function updateAgentProfile(
+  env: Env,
+  agentId: string,
+  patch: AgentProfilePatch,
+): Promise<UpdateAgentProfileResult> {
+  const sets: string[] = []
+  const binds: (string | null)[] = []
+
+  for (const [key, raw] of Object.entries(patch)) {
+    if (raw === undefined) continue
+
+    if ((UPDATABLE_ARRAY_COLUMNS as readonly string[]).includes(key)) {
+      if (raw === null) {
+        sets.push(`${key} = ?`)
+        binds.push(null)
+        continue
+      }
+      if (!Array.isArray(raw) || !raw.every((x) => typeof x === 'string')) {
+        return { ok: false, error: 'invalid_field' }
+      }
+      sets.push(`${key} = ?`)
+      binds.push(JSON.stringify(raw))
+      continue
+    }
+
+    if (!(UPDATABLE_TEXT_COLUMNS as readonly string[]).includes(key)) {
+      return { ok: false, error: 'invalid_field' }
+    }
+
+    if (raw === null) {
+      // slug and name are NOT NULL in the schema; clearing them would corrupt
+      // every join that resolves an agent by slug.
+      if (key === 'slug' || key === 'name') return { ok: false, error: 'invalid_field' }
+      sets.push(`${key} = ?`)
+      binds.push(null)
+      continue
+    }
+
+    if (typeof raw !== 'string') return { ok: false, error: 'invalid_field' }
+    const trimmed = raw.trim()
+    if ((key === 'slug' || key === 'name' || key === 'role' || key === 'model') && !trimmed) {
+      return { ok: false, error: 'invalid_field' }
+    }
+    sets.push(`${key} = ?`)
+    binds.push(trimmed)
+  }
+
+  if (!sets.length) return { ok: false, error: 'no_fields' }
+
+  try {
+    // No updated_at column on `agents` — 0049 rebuilt the table without one and
+    // no later migration adds it. Provenance for a correction lives in the audit
+    // trail, not on the row.
+    const result = await env.DB.prepare(`UPDATE agents SET ${sets.join(', ')} WHERE id = ?`)
+      .bind(...binds, agentId)
+      .run()
+    if (!result.meta.changes) return { ok: false, error: 'not_found' }
+  } catch (err) {
+    if (isUniqueViolation(err)) return { ok: false, error: 'slug_taken' }
+    throw err
+  }
+
+  const profile = await getAgentProfile(env, agentId)
+  if (!profile) return { ok: false, error: 'not_found' }
+  return { ok: true, value: profile }
+}
+
 export type DeleteAgentResult = { ok: true } | { ok: false; error: 'not_found' }
 
 /**
