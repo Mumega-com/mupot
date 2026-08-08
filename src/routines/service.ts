@@ -17,6 +17,7 @@ import {
   principalCanRunForSquad,
   type RoutinePrincipal,
 } from './access'
+import { hasCapability } from '../auth/capability'
 
 export type RoutineMutationError =
   | 'forbidden' | 'project_not_found' | 'project_not_active' | 'archived_project'
@@ -281,12 +282,41 @@ function validPage(limit = 50, after?: RoutineCursor): boolean {
   return boundedText(after.timestamp, 1, 100) !== null && boundedText(after.id, 1, 200) !== null
 }
 
+/**
+ * Policy mutations (create/update/enable/pause/archive) require EITHER org-scope
+ * workspace admin (legacy) OR admin on the responsible squad with write/admin
+ * access on the routine's project. Squad MEMBER is NOT sufficient — policy
+ * mutation stays admin-only, just squad-scoped instead of org-scoped.
+ * (#811 adversarial gate: routine_create hard-required workspace_admin, which
+ *  forced an org-admin grant for a squad-local need. This relaxes that.)
+ */
+async function principalCanMutateRoutinePolicy(
+  env: Env,
+  principal: RoutinePrincipal,
+  projectId: string,
+  squadId: string,
+): Promise<boolean> {
+  if (principal.workspace_admin) return true
+  if (principal.tenant !== env.TENANT_SLUG) return false
+  const squad = await env.DB.prepare(
+    `SELECT s.department_id
+       FROM squads s
+       JOIN project_squad_access psa ON psa.squad_id = s.id
+      WHERE s.id = ? AND psa.project_id = ? AND psa.access_level IN ('write','admin')`,
+  ).bind(squadId, projectId).first<{ department_id: string }>()
+  if (!squad) return false
+  return (
+    hasCapability(principal.grants, 'squad', squadId, 'admin', squad.department_id) ||
+    hasCapability(principal.grants, 'department', squad.department_id, 'admin')
+  )
+}
+
 export async function createRoutine(
   env: Env,
   principal: RoutinePrincipal,
   input: CreateRoutineInput,
 ): Promise<RoutineMutationResult<Routine>> {
-  if (principal.tenant !== env.TENANT_SLUG || principal.actor_type !== 'member' || !principal.workspace_admin) return { ok: false, error: 'forbidden' }
+  if (principal.tenant !== env.TENANT_SLUG || principal.actor_type !== 'member') return { ok: false, error: 'forbidden' }
   const projectId = boundedText(input.project_id, 1, 200)
   if (!projectId) return { ok: false, error: 'project_not_found' }
   const targetProject = await project(env, projectId)
@@ -294,6 +324,9 @@ export async function createRoutine(
   if (targetProject.status === 'archived') return { ok: false, error: 'archived_project' }
   const normalized = normalizePolicy(input)
   if (!normalized.ok) return normalized
+  if (!await principalCanMutateRoutinePolicy(env, principal, projectId, normalized.value.responsible_squad_id)) {
+    return { ok: false, error: 'forbidden' }
+  }
   const ownershipError = await validateOwnership(env, projectId, normalized.value)
   if (ownershipError) return { ok: false, error: ownershipError }
   const now = new Date().toISOString()
@@ -373,12 +406,15 @@ export async function updateRoutine(
   id: string,
   input: UpdateRoutineInput,
 ): Promise<RoutineMutationResult<Routine>> {
-  if (principal.tenant !== env.TENANT_SLUG || principal.actor_type !== 'member' || !principal.workspace_admin) return { ok: false, error: 'forbidden' }
+  if (principal.tenant !== env.TENANT_SLUG || principal.actor_type !== 'member') return { ok: false, error: 'forbidden' }
   const existing = await directRoutine(env, id)
   if (!existing) return { ok: false, error: 'routine_not_found' }
   if (existing.status === 'archived') return { ok: false, error: 'routine_archived' }
   const normalized = normalizePolicy(input, existing)
   if (!normalized.ok) return normalized
+  if (!await principalCanMutateRoutinePolicy(env, principal, existing.project_id, normalized.value.responsible_squad_id)) {
+    return { ok: false, error: 'forbidden' }
+  }
   const ownershipError = await validateOwnership(env, existing.project_id, normalized.value)
   if (ownershipError) return { ok: false, error: ownershipError }
   const p = normalized.value
@@ -412,7 +448,7 @@ async function transitionRoutine(
   id: string,
   target: 'enabled' | 'paused' | 'archived',
 ): Promise<RoutineMutationResult<Routine>> {
-  if (principal.tenant !== env.TENANT_SLUG || principal.actor_type !== 'member' || !principal.workspace_admin) return { ok: false, error: 'forbidden' }
+  if (principal.tenant !== env.TENANT_SLUG || principal.actor_type !== 'member') return { ok: false, error: 'forbidden' }
   const existing = await directRoutine(env, id)
   if (!existing) return { ok: false, error: 'routine_not_found' }
   if (existing.status === 'archived') return { ok: false, error: 'routine_archived' }
@@ -423,6 +459,9 @@ async function transitionRoutine(
   if (target === 'enabled' && targetProject.status !== 'active') return { ok: false, error: 'project_not_active' }
   const normalized = normalizePolicy({}, existing)
   if (!normalized.ok) return normalized
+  if (!await principalCanMutateRoutinePolicy(env, principal, existing.project_id, existing.responsible_squad_id)) {
+    return { ok: false, error: 'forbidden' }
+  }
   const ownershipError = await validateOwnership(env, existing.project_id, normalized.value)
   if (ownershipError) return { ok: false, error: ownershipError }
   const now = new Date()
