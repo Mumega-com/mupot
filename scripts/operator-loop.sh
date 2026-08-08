@@ -82,7 +82,7 @@ run_driver(){
 }
 
 while [ "$STOP" -eq 0 ]; do
-  run_driver "tech-grok" "$REPO/scripts/tech-grok-worker.py"
+  run_driver "asha-tech" "$REPO/scripts/asha-tech-worker.py"
   run_driver "mumcp"  "$REPO/scripts/mumcp-worker.py"
   # codex lane paused by default per codex's own security audit 2026-08-03:
   # --sandbox danger-full-access gives lane tasks host-level read of home/
