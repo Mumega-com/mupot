@@ -45,6 +45,10 @@ import sys
 import urllib.request
 from pathlib import Path
 
+# Claim fence (#742): shared with all operator-loop technicians.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+from claim_fence import claimable
+
 MUPOT_MCP = os.environ.get("MUPOT_MCP", "https://mupot.mumega.com/mcp")
 TECH_GROK_TOKEN_PATH = Path(os.environ.get("TECH_GROK_TOKEN", str(Path.home() / ".fleet/agents/tech-grok-member.token")))
 TECH_GROK_AGENT_ID = os.environ.get("TECH_GROK_AGENT_ID", "141e954c-115c-45dc-918e-b02931317b9b")
@@ -290,6 +294,13 @@ def run_task(task: dict) -> None:
     log(f"=== task {short}: {task.get('title','')[:60]} ===")
     if DRY_RUN:
         log("DRY_RUN — would claim, dispatch tech-grok, verify, PR, review. Skipping.")
+        return
+
+    # Claim fence (#742): never claim a task explicitly assigned to a DIFFERENT
+    # agent; unassigned tasks (assignee null) remain claimable.
+    may_claim, skip_reason = claimable(task, TECH_GROK_AGENT_ID)
+    if not may_claim:
+        log(f"SKIP task {short}: {skip_reason}")
         return
 
     mcp("task_update", {"task_id": tid, "status": "in_progress"})

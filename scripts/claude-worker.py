@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
-"""Headless claude -> mupot loop driver (small-model execution lane for Kasra's queue).
+"""Headless claude -> mupot loop driver (small-model execution lane).
 
-Grinds `open` build tasks assigned to the kasra agent with a CHEAP Claude model
-(default: haiku) so the expensive interactive Kasra session spends its tokens on
-gating and decisions, not execution. Same trust shape as cursor-worker.py: the
-model never self-closes a task and never touches the remote — the trusted driver
-does push/PR and moves the task to `review` for Kasra-core to gate.
+Claims `open` build tasks the CLAUDE TECHNICIAN may own: tasks UNASSIGNED on the
+board, or tasks assigned to the claude technician's own agent id (CLAUDE_AGENT_ID).
+It runs them with a CHEAP Claude model (default: haiku). Same trust shape as
+cursor-worker.py: the model never self-closes a task and never touches the remote —
+the trusted driver does push/PR and moves the task to `review` for Kasra-core to gate.
+
+Claim fence (mupot #742): a technician NEVER claims a task whose
+assignee_agent_id is set and != its own agent id. This lane historically
+impersonated kasra (KASRA_AGENT_ID=c855f82c) and claimed kasra's tasks — the
+live double-dispatch that built a broken TS parallel on a kasra-assigned task
+(mumega-com#740). The impersonation is removed: kasra-assigned tasks are
+invisible to this lane; only unassigned (or claude-own) tasks are claimable.
 
 Gate tasks are naturally excluded: the gate lane lives in status=review, and this
 driver polls status=open only. A cheap model doing the work changes nothing about
 what merges — the gate does.
 
-Flow per task (assignee = kasra, status = open):
+Flow per task (assignee = null or claude, status = open):
   1. claim        -> task_update status=in_progress
   2. isolate      -> git worktree add -b claude/task-<id8> <wt> main
   3. dispatch     -> claude -p --model <model> --dangerously-skip-permissions "<brief>"
@@ -25,7 +32,11 @@ The driver NEVER merges or deploys. Kasra-core gates the PR and verdicts the tas
 Config (env):
   MUPOT_MCP            default https://mupot.mumega.com/mcp
   KASRA_TOKEN          default ~/.fleet/agents/kasra-agent.token
-  KASRA_AGENT_ID       default c855f82c-... (the kasra agent on the mumega pot)
+                       (driver auth for delivery/gate ops; replace with a dedicated
+                       claude-technician token when the claude agent is minted, #742)
+  CLAUDE_AGENT_ID      default '' — the claude technician's OWN agent id; '' means
+                       only UNASSIGNED tasks are claimable (never kasra's / anyone
+                       else's). Set to the claude technician's own id when minted.
   REPO                 default /home/mumega/mupot
   GATE_OWNER           default 'gate:kasra-core'
   CLAUDE_WORKER_MODEL  default 'haiku' ('' = harness default)
@@ -46,9 +57,20 @@ import sys
 import urllib.request
 from pathlib import Path
 
+# Claim fence (#742): shared with all operator-loop technicians.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+from claim_fence import claimable
+
 MUPOT_MCP = os.environ.get("MUPOT_MCP", "https://mupot.mumega.com/mcp")
 KASRA_TOKEN_PATH = Path(os.environ.get("KASRA_TOKEN", str(Path.home() / ".fleet/agents/kasra-agent.token")))
-KASRA_AGENT_ID = os.environ.get("KASRA_AGENT_ID", "c855f82c-1eeb-409d-94d2-f11e9dd18968")
+# The claude technician's OWN agent id on the mumega pot. This lane used to
+# impersonate kasra (KASRA_AGENT_ID=c855f82c) — that impersonation is the
+# double-dispatch root cause (mupot #742): it let the lane claim tasks the
+# operator explicitly assigned to kasra and build broken parallels. The lane
+# now claims ONLY tasks assigned to its own id, or UNASSIGNED tasks. Default
+# "" = no own-assigned lane yet, so only unassigned tasks are claimable;
+# set CLAUDE_AGENT_ID to the claude technician's own agent id when minted.
+CLAUDE_AGENT_ID = os.environ.get("CLAUDE_AGENT_ID", "")
 REPO = Path(os.environ.get("REPO", "/home/mumega/mupot"))
 GATE_OWNER = os.environ.get("GATE_OWNER", "gate:kasra-core")
 MODEL = os.environ.get("CLAUDE_WORKER_MODEL", "haiku").strip()
@@ -144,8 +166,18 @@ def _cap_body(body: str) -> str:
 
 
 def poll_open_tasks() -> list[dict]:
-    res = mcp("task_list", {"assignee_agent_id": KASRA_AGENT_ID, "status": "open", "limit": MAX_TASKS})
-    return res.get("tasks", [])[:MAX_TASKS]
+    # Fetch a bounded window, then fence-filter and cap at MAX_TASKS. Slicing to
+    # MAX_TASKS BEFORE the fence would let one non-claimable ranked task starve
+    # every claimable one behind it (the lane would idle on an assigned task it
+    # must skip).
+    args: dict = {"status": "open", "limit": max(MAX_TASKS, 25)}
+    if CLAUDE_AGENT_ID:
+        args["assignee_agent_id"] = CLAUDE_AGENT_ID
+    res = mcp("task_list", args)
+    tasks = res.get("tasks", [])
+    # Claim fence (#742): keep only tasks this technician may claim (unassigned,
+    # or assigned to the claude technician's own agent id).
+    return [t for t in tasks if claimable(t, CLAUDE_AGENT_ID)[0]][:MAX_TASKS]
 
 
 def build_brief(task: dict, worktree: Path, branch: str) -> str:
@@ -206,7 +238,7 @@ def deliver(worktree: Path, branch: str, task: dict) -> str:
     title = f"claude: {task.get('title','')[:60]}"
     pr_body = (
         f"Dispatched to the claude small-model lane ({MODEL or 'default'}) headless via the mupot loop "
-        f"for task `{task['id']}` (assignee kasra).\n\n"
+        f"for task `{task['id']}` (unassigned, or assigned to the claude technician).\n\n"
         f"Task done-when: {task.get('done_when','')}\n\n"
         "Driver verified: the model committed real work + `tsc --noEmit` clean. "
         "**Kasra-core gates this PR before merge** (the task is in `review`; the lane cannot self-close it)."
@@ -240,6 +272,13 @@ def run_task(task: dict) -> None:
     log(f"=== task {short}: {task.get('title','')[:60]} ===")
     if DRY_RUN:
         log("DRY_RUN — would claim, dispatch claude, verify, PR, review. Skipping.")
+        return
+
+    # Claim fence (#742): never claim a task explicitly assigned to a DIFFERENT
+    # agent (e.g. kasra); unassigned tasks (assignee null) remain claimable.
+    may_claim, skip_reason = claimable(task, CLAUDE_AGENT_ID)
+    if not may_claim:
+        log(f"SKIP task {short}: {skip_reason}")
         return
 
     mcp("task_update", {"task_id": tid, "status": "in_progress"})
@@ -285,18 +324,22 @@ def main() -> int:
     if not KASRA_TOKEN_PATH.exists():
         log(f"no kasra token at {KASRA_TOKEN_PATH}")
         return 2
-    try:
-        stuck = mcp("task_list", {"assignee_agent_id": KASRA_AGENT_ID, "status": "in_progress", "limit": 5}).get("tasks", [])
-        for s_task in stuck:
-            log(
-                f"WARNING orphaned in_progress task {s_task['id'][:8]} "
-                f"({s_task.get('title', '')[:50]}) — likely a SIGTERMed dispatch; the status "
-                f"machine has no requeue transition, re-issue it manually"
-            )
-    except Exception:  # noqa: BLE001 - orphan check is advisory, never fatal
-        pass
+    if CLAUDE_AGENT_ID:
+        # Orphan visibility only makes sense for the lane's own-assigned tasks; with
+        # no dedicated claude agent yet (CLAUDE_AGENT_ID unset) the lane claims only
+        # unassigned tasks and there is no orphan class to warn about.
+        try:
+            stuck = mcp("task_list", {"assignee_agent_id": CLAUDE_AGENT_ID, "status": "in_progress", "limit": 5}).get("tasks", [])
+            for s_task in stuck:
+                log(
+                    f"WARNING orphaned in_progress task {s_task['id'][:8]} "
+                    f"({s_task.get('title', '')[:50]}) — likely a SIGTERMed dispatch; the status "
+                    f"machine has no requeue transition, re-issue it manually"
+                )
+        except Exception:  # noqa: BLE001 - orphan check is advisory, never fatal
+            pass
     tasks = poll_open_tasks()
-    log(f"{len(tasks)} open task(s) assigned to kasra")
+    log(f"{len(tasks)} open task(s) claimable by the claude lane")
     for task in tasks:
         try:
             run_task(task)
