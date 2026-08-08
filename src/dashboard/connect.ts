@@ -108,6 +108,11 @@ export function cursorSnippet(slug: string, origin: string): string {
   return claudeCodeSnippet(slug, origin)
 }
 
+/** Grok Build MCP JSON — streamable HTTP transport for 1-click Grok Build onboarding. */
+export function grokSnippet(slug: string, origin: string): string {
+  return claudeCodeSnippet(slug, origin)
+}
+
 /** Normalize a tenant slug into a config-key-safe server name (fallback 'mupot'). */
 export function mcpServerKey(slug: string): string {
   const cleaned = slug
