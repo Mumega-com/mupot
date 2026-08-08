@@ -1,0 +1,43 @@
+# Default-deny ingress (nothing in-cluster needs to call this pod; kubelet
+# probes bypass NetworkPolicy on GKE Dataplane V2). Egress is limited to
+# DNS + HTTPS — the destinations (Telegram API, Secret Manager API, the
+# Cloudflare-hosted pot) are all internet endpoints behind IP ranges that
+# rotate, so this is IP-agnostic (port/protocol only) rather than a CIDR
+# allowlist. If tighter egress is ever required, GKE's Cloud Armor / FQDN
+# network policies (Dataplane V2) can pin the exact destinations later.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: dme-hermes-relay
+  namespace: dme-hermes
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: dme-hermes-relay
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: []
+  egress:
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443
+    # Workload Identity token exchange talks to the node's metadata
+    # concealment proxy at 169.254.169.254, not a namespaced pod — carve
+    # it out explicitly since it's not covered by the DNS/HTTPS rules above.
+    - to:
+        - ipBlock:
+            cidr: 169.254.169.254/32
+      ports:
+        - protocol: TCP
+          port: 80

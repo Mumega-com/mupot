@@ -1,0 +1,24 @@
+# ClusterIP only — NOT LoadBalancer. Nothing outside the cluster needs to
+# reach this pod: Hermes calls OUT to Telegram, Secret Manager, and the pot;
+# nothing calls IN except the kubelet's own liveness/readiness probes,
+# which hit the Pod IP directly and don't need this Service at all. This
+# object exists purely for `kubectl get svc` / manual `kubectl port-forward`
+# debugging, and costs nothing (ClusterIP is free; a LoadBalancer Service
+# would cost ~$18-20/mo in forwarding-rule fees for zero functional benefit
+# here — see ../DESIGN.md).
+apiVersion: v1
+kind: Service
+metadata:
+  name: dme-hermes-relay
+  namespace: dme-hermes
+  labels:
+    app.kubernetes.io/name: dme-hermes-relay
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: dme-hermes-relay
+  ports:
+    - name: health
+      port: 8080
+      targetPort: health
+      protocol: TCP
