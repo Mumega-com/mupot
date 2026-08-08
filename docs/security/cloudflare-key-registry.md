@@ -49,6 +49,7 @@ Ranked by blast radius. This table is what replacement tokens are minted from.
 | 9 | **Substrate health probe** | `scripts/substrate-health.mjs:279-285` | ✅ ~5 min timer | `Account Settings:Read` | account |
 | 10 | **Workers AI health ping** | `factory_watchdog.py` | ✅ `factory-watchdog.service` | `Workers AI:Read` | account |
 | 11 | **mupot tenant provisioning** | `mupot/plugin/tools.py` | transient export | `Workers Scripts:Edit`, `D1:Edit`, `Workers KV Storage:Edit`, `Account Settings:Read` | account (multi-tenant by nature) |
+| 12 | **Shabrang Astro Pages deploy** | `Mumega-com/shabrang/.github/workflows/deploy.yml:L23-27` | ⏳ pending token swap | `Cloudflare Pages:Edit`, `Account Settings:Read` | account + zone `mumega.com` |
 
 ### Notes on individual rows
 
@@ -74,6 +75,21 @@ claims `MUPOT_CF_API_TOKEN` "lives in Hermes `.env.secrets` in plaintext." It is
 **not** persisted anywhere on the host; the live pattern is a transient per-command
 export from a token file, which is the safer one. Fix the doc line before someone
 "fixes" reality to match it.
+
+**#12 — SHABRANG BUILD TOKEN (INCIDENT, IN PROGRESS).** User-owned token on dashboard
+(`https://dash.cloudflare.com/profile/api-tokens`), found 2026-08-07. **Consumer identified:**
+`Mumega-com/shabrang` repository, `.github/workflows/deploy.yml`, Astro site deploy to
+Cloudflare Pages (`mumega-inkwell` project). **Old token state:** 26 permission groups
+including `Account.Secrets Store` (read secrets — dangerous); `All zones` (should be 1 zone);
+no expiry (should be 90d).
+
+**Replacement plan (task f16dfac1):** (1) Mint scoped token with `Cloudflare Pages:Edit` +
+`Account Settings:Read`, zone `mumega.com` only, 90-day expiry; (2) Update GitHub Actions
+secret in Shabrang repo; (3) Run deploy workflow to verify new token works; (4) Delete old
+token from dashboard. See `docs/security/shabrang-token-replacement.md` for detailed steps.
+
+**Blocker:** Permission ID for "Cloudflare Pages:Edit" must be discovered from Cloudflare API.
+NEW token can then be minted by Kasra or admin token holder.
 
 ## Credentials with no consumer — revoke candidates
 
