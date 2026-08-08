@@ -1,0 +1,17 @@
+agent: asha
+agent_id: e211b0fb-6ebf-4aab-bac5-6129ce6075e0
+harness: prime-headless
+models: [deepseek-v4-flash]
+status: live
+tokens:
+  - mupot-admin
+abilities:
+  - evidence-gate
+  - coherency-sweep
+  - task-decompose
+authority:
+  - first-pass-gate
+  - task-master
+subagents:
+  asha-core: [evidence-gate, coherency-sweep, task-decompose]
+availability: live

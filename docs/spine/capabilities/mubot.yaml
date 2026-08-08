@@ -1,0 +1,15 @@
+agent: mubot
+agent_id: d3fd65b6-1234-4567-a890-bcdef0123456
+harness: telegram-bot
+models: [deepseek-v4-flash]
+status: live
+tokens:
+  - telegram-channel
+abilities:
+  - customer-face
+  - reflect
+  - notification-routing
+authority: []
+subagents:
+  mubot-core: [customer-face, reflect]
+availability: live
