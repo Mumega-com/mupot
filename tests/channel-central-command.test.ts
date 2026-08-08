@@ -120,17 +120,11 @@ describe('central-command ingress (mumega-com#722)', () => {
     expect(msg?.body).toContain('[sos-bus]')
   })
 
-  it('B1: @prime is SOS-native too — relayed, not dispatched into the pot inbox', async () => {
-    const { runInbound } = await import('../src/channels/index')
-    const res = await runInbound(env, 'telegram', '-5317747241', '765204057', '@prime status check')
-    expect(res).toContain('@prime is SOS-native; relayed via Kasra')
-    expect(res).not.toContain('Dispatched @prime')
-
-    const msg = await env.DB.prepare(
-      `SELECT * FROM agent_messages WHERE to_agent = 'prime'`
-    ).first()
-    expect(msg?.body).toContain('[sos-bus]')
-  })
+  // NOTE: @prime routing is deliberately NOT asserted here. dispatchMention routes
+  // prime/asha to sosBusSend, which returns "is SOS-native; relayed via Kasra" — but
+  // asha is mupot-native with a working inbox, and sosBusSend performs no relay at all
+  // (it writes one [sos-bus] audit row and returns the string). Pinning either side of
+  // that would encode a falsehood. Classification + honest status tracked separately.
 
   it('B2: refuses mentions exceeding MAX_BODY_CHARS via sendAgentMessage primitive', async () => {
     const { runInbound } = await import('../src/channels/index')
