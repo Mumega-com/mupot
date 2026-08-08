@@ -168,3 +168,18 @@ Lesson for the next module port: if a write binds identity into a scoped
 resource (project, squad, department), gate the WRITE with the same
 visibility primitive as the READ — deriving identity safely is necessary but
 not sufficient; the destination scope needs its own check.
+
+## Port 3 — Hermes-Sol constant agent (2026-07-22)
+
+Hermes daemon = always-on chat front-door:
+
+- **Luna** heartbeat triage (zero model spend on greetings/status)
+- **Sol** (`gpt-5.6-sol`) for real reasoning + optional `TASK:` / `WAKE_OPUS:` trailers
+- **Opus wake** — hard calls wake the live Kasra agent; Worker does not burn Opus tokens per turn
+
+Surfaces:
+
+- `GET /hermes` — dashboard surface panel (cookie auth)
+- `POST /api/hermes/chat` — member-bearer twin for the Hermes daemon
+- `scripts/hermes-worker.py` — Port-1 presence (`chat`/`dispatch`/`gate`) + optional Luna ping
+- `REVIEW_BACKEND=hermes-sol` on `scripts/review-worker.py` — Sol as the diverse gate eye (retires Codex dep)
