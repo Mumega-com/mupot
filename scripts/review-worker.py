@@ -136,6 +136,12 @@ MAX_REVIEWS = int(os.environ.get("MAX_REVIEWS", "1"))
 TIMEOUT = int(os.environ.get("TIMEOUT", "900"))
 MODEL = os.environ.get("MODEL", "opus")
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
+# Port 3: REVIEW_BACKEND=hermes-sol runs the diverse eye on GPT-5.6 Sol via
+# `hermes -z` (retires the Codex diverse-eye dependency). Default remains
+# claude (current santa-loop) until Hermes-Sol is proven on live reviews.
+REVIEW_BACKEND = os.environ.get("REVIEW_BACKEND", "claude").strip().lower()
+HERMES_BIN = os.environ.get("HERMES_BIN", "hermes")
+HERMES_SOL_MODEL = os.environ.get("HERMES_SOL_MODEL", "gpt-5.6-sol")
 WORKTREE_ROOT = Path(os.environ.get("WORKTREE_ROOT", "/home/mumega/mupot-worktrees"))
 DRY_RUN = os.environ.get("DRY_RUN", "") == "1"
 # #460: dedupe state written ONLY by this driver, after a REAL review runs --
@@ -483,6 +489,33 @@ def run_claude_review(prompt: str) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, input=prompt, cwd=str(scratch), capture_output=True, text=True, timeout=TIMEOUT)
 
 
+def run_hermes_sol_review(prompt: str) -> subprocess.CompletedProcess:
+    """Port 3 diverse eye: GPT-5.6 Sol via Hermes CLI (no tools, one shot).
+
+    Hermes `-z` is non-interactive prompt mode. We deliberately do not pass
+    toolsets so Sol reasons over the fenced diff only — same isolation intent
+    as the Claude path (tools denied). Isolation invariant still applies to
+    Claude JSON; for Hermes we parse free text into the verdict JSON.
+    """
+    scratch = WORKTREE_ROOT / "review-scratch"
+    scratch.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        HERMES_BIN, "-z", prompt,
+        "-m", HERMES_SOL_MODEL,
+        "--safe-mode",
+        "-t", "",
+    ]
+    log(f"dispatching adversarial review ({HERMES_BIN} -m {HERMES_SOL_MODEL}, timeout {TIMEOUT}s, "
+        f"Port-3 Hermes-Sol diverse eye, neutral scratch cwd) ...")
+    return subprocess.run(cmd, cwd=str(scratch), capture_output=True, text=True, timeout=TIMEOUT)
+
+
+def run_review(prompt: str) -> subprocess.CompletedProcess:
+    if REVIEW_BACKEND in ("hermes-sol", "hermes", "sol"):
+        return run_hermes_sol_review(prompt)
+    return run_claude_review(prompt)
+
+
 def check_isolation_invariant(stdout_text: str) -> tuple[bool, str]:
     """Backstop for the isolation guarantee above (P0 #1): from the run's own
     JSON result, assert zero tool calls were EVER attempted (allowed or
@@ -785,8 +818,14 @@ def process_task(task: dict) -> bool:
     raw = ""
     proc: subprocess.CompletedProcess | None = None
     try:
-        proc = run_claude_review(prompt)
-        raw = extract_claude_text(proc)
+        proc = run_review(prompt)
+        if REVIEW_BACKEND in ("hermes-sol", "hermes", "sol"):
+            # Hermes -z returns plain text (not Claude's JSON result wrapper).
+            raw = (proc.stdout or "") if proc.returncode == 0 else ""
+            if proc.returncode != 0:
+                log(f"hermes-sol exit {proc.returncode}: {(proc.stderr or '')[-500:]}")
+        else:
+            raw = extract_claude_text(proc)
     except subprocess.TimeoutExpired:
         log(f"task {short}: adversarial review TIMED OUT after {TIMEOUT}s -- fail-closed RED")
 
@@ -796,10 +835,9 @@ def process_task(task: dict) -> bool:
         else {"verdict": "RED", "p0": ["adversarial review timed out or produced no output -- fail-closed"], "p1": [], "warn": [], "summary": "no reviewer output"}
     )
 
-    # P0 #1 backstop: reject the run outright (regardless of what verdict text
-    # it produced) if the isolation invariant (zero tool calls, single turn)
-    # doesn't hold.
-    if proc is not None:
+    # P0 #1 backstop: Claude path only (JSON result + num_turns). Hermes-Sol
+    # isolation is launcher-side (--safe-mode, empty toolsets) — no Claude JSON.
+    if proc is not None and REVIEW_BACKEND not in ("hermes-sol", "hermes", "sol"):
         isolation_ok, isolation_reason = check_isolation_invariant(proc.stdout or "")
         if not isolation_ok:
             log(f"task {short}: {isolation_reason}")

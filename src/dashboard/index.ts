@@ -188,6 +188,8 @@ import { wizardApp } from './wizard'
 import { isOnboardingComplete } from './settings'
 import { loadBrainView, brainBody, regimeBadgeClass, loadBrainPhysics } from './brain'
 import type { PhysicsSnapshot } from './brain'
+import { hermesPanelBody } from './hermes'
+import { handleHermesTurn, HERMES_CHAT_MAX_CHARS } from '../hermes'
 import { loadGrowthView, growthBody } from './growth'
 import { loadFleetRadar } from './radar'
 import { radarPageBody } from './radar-view'
@@ -935,6 +937,44 @@ dashboardApp.get('/brain', async (c) => {
   return c.html(
     shell(c.env, 'Brain', brainBody(view, isOrgAdmin(auth)), { physics: view.physics }),
   )
+})
+
+// ── Hermes surface panel (Port 3: constant agent chat front-door) ────────────
+// GET /hermes — Luna→Sol chat UI. POST /hermes/chat — same-origin form turn.
+dashboardApp.get('/hermes', async (c) => {
+  return c.html(shell(c.env, 'Hermes', hermesPanelBody(null, null)))
+})
+
+dashboardApp.post('/hermes/chat', async (c) => {
+  const auth = c.get('auth')
+  if (!auth.memberId) {
+    return c.html(shell(c.env, 'Hermes', hermesPanelBody(null, 'Sign in as a member to chat with Hermes.')), 403)
+  }
+  const body = await c.req.parseBody()
+  const raw = typeof body.message === 'string' ? body.message : ''
+  const message = raw.trim()
+  if (!message) {
+    return c.html(shell(c.env, 'Hermes', hermesPanelBody(null, 'Message required.')), 400)
+  }
+  if (message.length > HERMES_CHAT_MAX_CHARS) {
+    return c.html(
+      shell(c.env, 'Hermes', hermesPanelBody(null, `Message too long (max ${HERMES_CHAT_MAX_CHARS}).`)),
+      400,
+    )
+  }
+  try {
+    const result = await handleHermesTurn(c.env, {
+      message,
+      memberId: auth.memberId,
+      projectId: null,
+      squadId: null,
+    })
+    return c.html(shell(c.env, 'Hermes', hermesPanelBody(result, null)))
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : 'hermes_turn_failed'
+    console.error('dashboard hermes.chat failed', { reason })
+    return c.html(shell(c.env, 'Hermes', hermesPanelBody(null, 'Hermes turn failed. Try again.')), 500)
+  }
 })
 
 // ── departments/growth (Marketing & Sales console view) ─────────────────────
@@ -3662,6 +3702,12 @@ function shell(
           <a class="nav-link" href="/fleet">
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" width="17" height="17"><circle cx="10" cy="10" r="6.2"/><circle cx="10" cy="10" r="1.7" fill="currentColor" stroke="none"/></svg>
             <span class="nav-label">Fleet</span>
+          </a>
+
+          <!-- Hermes constant agent (Port 3) -->
+          <a class="nav-link" href="/hermes">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M4 14.5 10 3.5l6 11"/><path d="M6.2 11h7.6"/><circle cx="10" cy="16.2" r="1.1" fill="currentColor" stroke="none"/></svg>
+            <span class="nav-label">Hermes</span>
           </a>
 
           <!-- Radar (fleet + squad awareness map — #21/#23) -->
