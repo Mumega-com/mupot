@@ -1,0 +1,55 @@
+name: gaf
+project_lead: worker
+budget_cents_monthly: 20000
+workspace: /home/mumega/gaf-app
+repo: servathadi/gaf
+branch: main
+url: https://grantandfunding.com
+
+# Squad routing
+squads:
+  seo: true
+  dev: true
+  content: true
+  outreach: true
+
+# Channels
+channels:
+  - type: redis
+    target_agent: worker
+
+# Content
+content:
+  schedule: "0 */12 * * *"
+  types: [grant_tips, funding_updates, sred_guides, success_stories]
+  engine: gemini-flash
+
+# Revenue
+revenue:
+  track: true
+  model: saas_subscription
+  stripe_product_ids: []
+  kpis: [grant_matches, sred_narratives, paying_clients, mrr]
+
+# Pipeline
+pipeline:
+  build_cmd: "cd web && npm run build"
+  test_cmd: "npx vitest run --reporter=verbose 2>&1 | tail -5"
+  deploy_cmd: "npx wrangler deploy"
+  smoke_cmd: "curl -sf https://grantandfunding.com/api/health > /dev/null"
+  deploy_mode: manual
+
+# Product
+product:
+  type: b2b_saas
+  description: "SR&ED tax credit automation + government grant matching for Canadian businesses"
+  target_market: "Canadian SMEs doing R&D"
+  pricing: "Subscription + success fee on grants"
+
+# Hadi 2026-04-25: pause all projects until SOS substrate is mature enough
+# to handle clean dispatch (brain phantom-emission bug pending structural fix).
+# Only active project: Mumega (sos, mirror, inkwell). Re-onboard each project
+# after SOS readiness window closes.
+status: paused
+paused_at: 2026-04-25
+paused_reason: hadi-bulk-pause-pending-sos-readiness

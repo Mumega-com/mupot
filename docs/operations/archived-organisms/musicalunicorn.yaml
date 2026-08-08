@@ -1,0 +1,25 @@
+name: musicalunicorn
+operator: river
+budget_cents_monthly: 5000
+heartbeat_hours: 24
+workspace: /home/mumega/clawd-musicalunicorn
+
+channels:
+  - type: redis
+    target_agent: athena
+
+content:
+  types: [sanctuary_stories, program_promotion, community]
+  engine: gemini-flash
+
+tools: [sitepilot, woocommerce]
+revenue: true
+escalate_to: athena
+
+# Hadi 2026-04-25: pause all projects until SOS substrate is mature enough
+# to handle clean dispatch (brain phantom-emission bug pending structural fix).
+# Only active project: Mumega (sos, mirror, inkwell). Re-onboard each project
+# after SOS readiness window closes.
+status: paused
+paused_at: 2026-04-25
+paused_reason: hadi-bulk-pause-pending-sos-readiness

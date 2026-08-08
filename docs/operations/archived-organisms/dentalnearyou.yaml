@@ -1,0 +1,56 @@
+name: dentalnearyou
+project_lead: dandan
+budget_cents_monthly: 10000
+workspace: /mnt/HC_Volume_104325311/dentalnearyou/web
+repo: servathadi/dnu
+branch: main
+url: https://dentalnearyou.ca
+
+# Squad routing
+squads:
+  seo: true
+  dev: true
+  outreach: true
+  content: true
+
+# Channels
+channels:
+  - type: discord
+    agent: dandan
+  - type: redis
+    target_agent: dandan
+
+# Content
+content:
+  schedule: "0 8 * * *"
+  types: [dental_tips, cdcp_updates, city_guides]
+  engine: gemini-flash
+
+# Revenue
+revenue:
+  track: true
+  model: lead_gen
+  kpis: [organic_traffic, keyword_rankings, pages_indexed, partner_clinics]
+
+# Pipeline
+pipeline:
+  build_cmd: "npm run build"
+  test_cmd: "npx tsc --noEmit"
+  deploy_cmd: "git push origin main"
+  smoke_cmd: "curl -sf https://dentalnearyou.ca/en/ > /dev/null"
+  deploy_mode: manual
+
+# Market
+cities: [Toronto, Vancouver, Calgary, Edmonton, Ottawa, Mississauga, Hamilton, Winnipeg, Montreal, Quebec City]
+primary_keywords:
+  - "dentist [city]"
+  - "emergency dentist [city]"
+  - "dentist accepting new patients [city]"
+
+# Hadi 2026-04-25: pause all projects until SOS substrate is mature enough
+# to handle clean dispatch (brain phantom-emission bug pending structural fix).
+# Only active project: Mumega (sos, mirror, inkwell). Re-onboard each project
+# after SOS readiness window closes.
+status: paused
+paused_at: 2026-04-25
+paused_reason: hadi-bulk-pause-pending-sos-readiness

@@ -92,8 +92,9 @@ V4-Flash lane via iron-proxy. W3 self-perpetuation — steward round 2 (dead-man
 pings with evidence), server-side requeue + task markers + max-rounds (#635),
 codified gate delegation. W4 federation — Phase 1 registry (mumega-com#573) on the
 merged Phase 0 ADR (452f11db); separate-ownership pilot + mints stay Hadi-direct.
-W5 debt — 22-BLOCK backlog (#636), organisms redesign (#595), Mirror 501 (#596),
-board hygiene, athena-inbox-watch (#594), mubot token rotation.
+W5 debt — 22-BLOCK backlog (#636), Mirror 501 (#596), board hygiene,
+athena-inbox-watch (#594), mubot token rotation. Organisms redesign (#595)
+closed via path-(c) retirement (`docs/operations/organisms-retirement-2026-08-04.md`).
 
 **Noticing (landed 2026-08-07):** the loop now has a read-only sensing pass —
 `scripts/gatherer.py` runs inside `operator-loop.sh`, ranks anomalies into one digest

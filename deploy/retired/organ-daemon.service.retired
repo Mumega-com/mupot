@@ -1,0 +1,19 @@
+# RETIRED 2026-08-04 — path (c) organisms redesign (mumega-com#595)
+# Do NOT install or enable. Kept as forensic copy of the mismatched batch wrapper
+# that ran forever-loop organism.py under timeout=300.
+#
+# See: docs/operations/organisms-retirement-2026-08-04.md
+
+[Unit]
+Description=RETIRED — Organ Daemon (product organism heartbeat runner)
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /home/mumega/scripts/run-all-organisms.py
+Environment=HOME=/home/mumega
+Environment=PYTHONPATH=/home/mumega/mirror
+EnvironmentFile=-/home/mumega/.env.secrets
+
+[Install]
+WantedBy=default.target
