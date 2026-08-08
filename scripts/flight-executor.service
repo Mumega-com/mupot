@@ -1,0 +1,20 @@
+[Unit]
+Description=mupot flight executor (headless flights → prime-agent → routine.proposal)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env bash %h/mupot/scripts/flight-executor-loop.sh
+Restart=always
+RestartSec=30
+Environment=PATH=/home/mumega/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=REPO=%h/mupot
+Environment=MUPOT_MCP=https://mupot.mumega.com/mcp
+Environment=FLIGHT_EXECUTOR_INTERVAL=120
+Environment=MAX_FLIGHTS=3
+Environment=ASHA_TOKEN=%h/.fleet/agents/asha-agent.token
+Environment=STEWARD_TOKEN=%h/.fleet/agents/steward-agent.token
+
+[Install]
+WantedBy=default.target
