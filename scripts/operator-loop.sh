@@ -96,6 +96,7 @@ while [ "$STOP" -eq 0 ]; do
   run_driver "claude" "$REPO/scripts/claude-worker.py"
   run_driver "review" "$REPO/scripts/review-worker.py"
   run_driver "steward" "$REPO/scripts/steward-worker.py"
+  run_driver "flight-executor" "$REPO/scripts/flight-executor-worker.py"
   # The NOTICING pass. Read-only: no task_update, no verdict, no dispatch, no
   # merge. Every fleet defect found on 2026-08-06 was found because a human asked
   # a question — dead executor seats, 167 HTTP 401s, routines parked forever, a
