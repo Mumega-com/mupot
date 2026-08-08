@@ -451,8 +451,8 @@ async function dispatchMention(
     return `prime rate-limited: @${target} has hit the 10/hour mention wall.`
   }
 
-  // B1 Fix: Check SOS-native agents BEFORE DB lookup so @river / @dara never get trapped in potSend
-  if (target === 'river' || target === 'dara') {
+  // B1 Fix: Check SOS-native agents BEFORE DB lookup so @river, @asha, @kasra, @athena, @loom never get trapped in potSend
+  if (target === 'river' || target === 'dara' || target === 'asha' || target === 'prime' || target === 'kasra' || target === 'athena' || target === 'loom') {
     return sosBusSend(env, target, body)
   }
 
