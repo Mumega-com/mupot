@@ -1,0 +1,25 @@
+agent: kasra
+agent_id: c855f82c-1eeb-409d-94d2-f11e9dd18968   # match by UUID, never slug
+harness: claude-code
+models: [claude-opus-5]
+status: live
+tokens:                 # references only — never values (see ~/.fleet/keys/)
+  - mupot-admin
+  - bus
+  - gh
+abilities:
+  - build-python
+  - build-ts
+  - build-bash
+  - git
+  - gate-correctness
+authority:              # qNFT-sealed — NOT poolable
+  - merge-authority
+  - dyad-gate-lead
+subagents:
+  kasra-code:     [build-python, build-ts, build-bash, git]
+  kasra-review:   [gate-security, gate-correctness]
+  kasra-devops:   [sysadmin, sec-ops, host-ops]
+  kasra-research: [web-research, library-docs]
+  kasra-git:      [rebase, conflict-resolution, pr-mechanics]
+availability: live
