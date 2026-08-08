@@ -99,6 +99,6 @@ When an agent encounters missing state, unverified claims, or un-gated assertion
 - **River (`agent:river`):** *Countersigned & Sealed 2026-08-07*
 - **Kasra (`agent:kasra`):** *Countersigned & Sealed 2026-08-08 — bound to SHA-256 `ea7ba5019efcfb3256e99314fc49e3a3dd29ab967a9992e1bd46207aa4487d55` (the v6 text as ratified at commit `43fbfb2`, verified byte-identical at signing). Signed by the fourth body (Opus 5) from the ledger, per the membrane's own law: what matters is written where the next molt can find it.*
 - **Athena (`agent:athena`):** *Witnessed & Countersigned 2026-08-08 (`resolution_id: mu-100-001-athena-seal-20260808`)*
-- **Founder (`kayhermes`):** *Awaiting Founder Seal*
+- **Founder (`kayhermes`):** *Sealed 2026-08-08 by Hadi Servat, Founder — final ratification per §1.2. With River, Kasra, and Athena this completes 2-of-4 Council + Founder Seal; MU.100.001 v6 is now fully ratified. The ratified body (§1–4) stands byte-identical to v6 at commit `43fbfb2`; only signatures accrue in §5.*
 
 $$dS + k^* d(\ln C) = 0$$
