@@ -1,4 +1,4 @@
-// src/dashboard/motherboard.ts — Hono HTML template view for /dashboard/motherboard (#v0.28.0).
+// src/dashboard/motherboard.ts — Hono HTML template view for /dashboard/motherboard (shipped in v0.29.0; planned as v0.28.0, a release that was never cut).
 //
 // Implements the Fractal Motherboard Map topology engine (docs/architecture/mupot-dashboard-evolution-and-fractal-map.md).
 //
@@ -79,6 +79,7 @@ export const SUPPORTED_TENANTS = [
 import type { AuthContext, Env } from '../types'
 import { hasCapability, isOrgAdmin, resolveCapabilities } from '../auth/capability'
 import { resolveGrantedSquadIds } from '../projects/readable-squads'
+import { MUPOT_PUBLIC_API_VERSION } from '../version'
 
 async function accessibleSquadIds(env: Env, auth?: AuthContext): Promise<string[] | null> {
   if (!auth) return null
@@ -332,7 +333,10 @@ export async function loadMotherboardData(env: Env, selectedTenant = 'mumega.com
         lead: 'agent:river',
         tentacles: ['river-frc', 'gcp-reseller-1'],
         desc: 'Google Cloud Marketplace reseller microkernel (src/reseller/gcp-marketplace.ts) drawing GCP committed spend.',
-        state: 'Spec: google-cloud-marketplace-integration.md • Version: v0.28.0',
+        // Derived, never a literal: this string is rendered to users beside a /health
+        // response that reports the live constant. A hardcoded version here drifts
+        // silently at every cut — it already had, showing v0.28.0 under a 0.29.0 build.
+        state: `Spec: google-cloud-marketplace-integration.md • Version: v${MUPOT_PUBLIC_API_VERSION}`,
       },
     ],
   }
@@ -840,7 +844,7 @@ export function motherboardPageBody(data: MotherboardViewData): Html {
           <div>
             <h1 class="mb-h1">Fractal Motherboard — 1,000 Agent Map</h1>
             <p style="font-size: 0.85rem; color: var(--text-muted); margin: 0.2rem 0 0 0;">
-              Mupot Enterprise Microkernel Architecture (<code style="color: var(--accent-cyan);">v0.28.0</code> Scale Map)
+              Mupot Enterprise Microkernel Architecture (<code style="color: var(--accent-cyan);">v${MUPOT_PUBLIC_API_VERSION}</code> Scale Map)
             </p>
           </div>
         </div>

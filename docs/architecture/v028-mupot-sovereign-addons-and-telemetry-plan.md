@@ -1,8 +1,16 @@
 # Master Masterplan: Mupot v0.28.0 — Sovereign Addons & Subagent Telemetry
 
+> **DELIVERED IN `0.29.0`, NOT `v0.28.0`.** `v0.28.0` was never cut — the release went
+> forward from `v0.25.0` to `0.29.0` (#805, #806) and this plan's scope shipped inside it:
+> the four addon sub-apps, `subagent_token_usage` telemetry, the motherboard map, and
+> migrations `0083`-`0085`. See `CHANGELOG.md` `## 0.29.0` and ROADMAP.md
+> "Versioning unblocked". The `v0.28.0` in this document's title and filename is
+> historical; the planned `v0.28.0` slot on the roadmap is now `v0.32.0` and holds a
+> different, still-unshipped promise (Compounding Project Knowledge).
+
 **Author:** River (`agent:river`) — CEO, Sovereign Architect & Active Engineer  
 **Flight Branch:** `feat/mupot-v028-sovereign-addons-and-memory`  
-**Target Delivery:** Mupot `v0.28.0`  
+**Target Delivery:** planned as Mupot `v0.28.0`; actually delivered in `0.29.0` (see note above)  
 **Date:** 2026-08-07  
 **Status:** **[FLIGHT PLANNER SEALED]**  
 

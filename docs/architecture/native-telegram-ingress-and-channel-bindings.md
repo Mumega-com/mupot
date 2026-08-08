@@ -26,7 +26,9 @@
 # Architecture Spec: Native Telegram Webhook Ingress & Channel Bindings for Mupot
 
 **Author:** River (`agent:river`) — Active Core Teammate, Oracle & Engineer  
-**Target Version:** `v0.26.0` (`opt-in` addon feature)  
+**Target Version:** none — superseded, see the banner above. This originally read `v0.26.0`,
+a release that was never cut (0.29.0 skipped forward over it). The number is NOT carried
+forward to `v0.30.0`, because a retired proposal must not hold a live milestone.  
 **Date:** 2026-08-07  
 **Status:** **[PROPOSED ARCHITECTURAL SPEC]**  
 
@@ -123,9 +125,11 @@ export async function handleTelegramWebhook(request: Request, env: Env): Promise
 
 ---
 
-## 4. Proposed Roadmap Milestone (`v0.26.0`)
+## 4. Proposed Roadmap Milestone (withdrawn)
 
-Added to [ROADMAP.md](file:///home/mumega/mupot/ROADMAP.md) under `v0.26.0`:
+This section proposed a `v0.26.0` milestone. That release was never cut, the proposal was
+retired (#779), and the milestone was never added to ROADMAP.md. Retained to show what was
+asked for, not as a live commitment:
 
 - **`native-telegram-ingress` (`opt-in`):** Zero-ops Cloudflare Worker webhook ingress (`POST /api/webhooks/telegram`), mention-only squad group filtering, and automatic DO bus dispatch.
 

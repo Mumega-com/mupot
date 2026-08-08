@@ -1,4 +1,4 @@
-// src/addons/torivers.ts — ToRivers v2 Deterministic Automation & Credential Matching Addon (#v0.28.0).
+// src/addons/torivers.ts — ToRivers v2 Deterministic Automation & Credential Matching Addon (shipped in v0.29.0; planned as v0.28.0, a release that was never cut).
 //
 // Adapts ToRivers v2 (/mnt/HC_Volume_104325311/torivers-v2) into a native Mupot Hono sub-app router.
 // Provides deterministic workflow execution, step-by-step receipt generation, and credential matching.
@@ -30,12 +30,26 @@ toriversAddonApp.use('*', async (c, next) => {
   await next()
 })
 
+/**
+ * This addon's OWN semver, deliberately NOT the pot's version.
+ *
+ * It reads 0.28.0 because the addon was written for the v0.28.0 release plan, which was
+ * never cut — the pot went from 0.25.0 to 0.29.0 (#805, #806). The matching number is a
+ * coincidence of origin, not a claim about which pot is running, and it is intentionally
+ * NOT bumped to track MUPOT_PUBLIC_API_VERSION: an addon versions on its own contract, so
+ * coupling the two would make every pot release silently restamp addons that did not change.
+ *
+ * If you are looking for the pot version, it is MUPOT_PUBLIC_API_VERSION in src/version.ts,
+ * reported by the pot's own /health. This value is scoped to this addon's /health response.
+ */
+const TORIVERS_ADDON_VERSION = '0.28.0'
+
 // ── Health Probe ──────────────────────────────────────────────────────────────
 toriversAddonApp.get('/health', (c) => {
   return c.json({
     ok: true,
     addon: '@mumega/addon-torivers',
-    version: '0.28.0',
+    version: TORIVERS_ADDON_VERSION,
     status: 'healthy',
     timestamp: new Date().toISOString(),
   })
