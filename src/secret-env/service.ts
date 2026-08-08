@@ -25,6 +25,7 @@
 import type { Env } from '../types'
 import { assertBindingName } from './names'
 import { getSecretEnvCfConfig, putScriptSecrets } from './cf-secrets'
+import { rowsWritten } from '../lib/receipt'
 import type {
   SecretEnvKeySpec,
   PublicSecretEnvRequest,
@@ -405,20 +406,24 @@ export async function bindSecretEnv(
 
   const now = new Date().toISOString()
   const boundNames: string[] = []
+  const statements = [
+    env.DB.prepare(
+      `UPDATE secret_env_requests SET status = 'approved', decided_by = ?1, decided_at = ?2 WHERE id = ?3 AND tenant = ?4 AND status = 'pending'`,
+    ).bind(actorId, now, requestId, env.TENANT_SLUG),
+  ]
   for (const binding of pendingBindings) {
-    await env.DB.prepare(
-      `UPDATE secret_env_bindings SET status = 'bound', bound_by = ?1, bound_at = ?2 WHERE id = ?3 AND tenant = ?4`,
+    statements.push(
+      env.DB.prepare(
+        `UPDATE secret_env_bindings SET status = 'bound', bound_by = ?1, bound_at = ?2 WHERE id = ?3 AND tenant = ?4`,
+      ).bind(actorId, now, binding.id, env.TENANT_SLUG),
     )
-      .bind(actorId, now, binding.id, env.TENANT_SLUG)
-      .run()
     boundNames.push(binding.binding_name)
   }
 
-  await env.DB.prepare(
-    `UPDATE secret_env_requests SET status = 'approved', decided_by = ?1, decided_at = ?2 WHERE id = ?3 AND tenant = ?4`,
-  )
-    .bind(actorId, now, requestId, env.TENANT_SLUG)
-    .run()
+  const batchResult = await env.DB.batch(statements)
+  if (rowsWritten(batchResult[0]) !== 1) {
+    return { ok: false, error: 'request_state_changed' }
+  }
 
   await writeSecretEnvAudit(env, {
     requestId,
@@ -460,17 +465,19 @@ export async function rejectSecretEnv(
 
   const now = new Date().toISOString()
 
-  await env.DB.prepare(
-    `UPDATE secret_env_requests SET status = 'rejected', decided_by = ?1, decided_at = ?2 WHERE id = ?3 AND tenant = ?4`,
-  )
-    .bind(actorId, now, requestId, env.TENANT_SLUG)
-    .run()
+  const statements = [
+    env.DB.prepare(
+      `UPDATE secret_env_requests SET status = 'rejected', decided_by = ?1, decided_at = ?2 WHERE id = ?3 AND tenant = ?4 AND status = 'pending'`,
+    ).bind(actorId, now, requestId, env.TENANT_SLUG),
+    env.DB.prepare(
+      `UPDATE secret_env_bindings SET status = 'revoked', revoked_at = ?1 WHERE tenant = ?2 AND request_id = ?3 AND status = 'pending'`,
+    ).bind(now, env.TENANT_SLUG, requestId),
+  ]
 
-  await env.DB.prepare(
-    `UPDATE secret_env_bindings SET status = 'revoked', revoked_at = ?1 WHERE tenant = ?2 AND request_id = ?3 AND status = 'pending'`,
-  )
-    .bind(now, env.TENANT_SLUG, requestId)
-    .run()
+  const batchResult = await env.DB.batch(statements)
+  if (rowsWritten(batchResult[0]) !== 1) {
+    return { ok: false, error: 'request_state_changed' }
+  }
 
   await writeSecretEnvAudit(env, {
     requestId,
