@@ -23,6 +23,8 @@ export type FlightStatus =
 
 export type TriggerSource = 'manual' | 'schedule' | 'api' | 'event' | 'cron'
 
+export type FlightGateState = 'open' | 'proposed' | 'approved'
+
 export interface FlightRow {
   id: string
   tenant: string
@@ -31,6 +33,7 @@ export interface FlightRow {
   goal: string
   status: FlightStatus
   trigger_source: TriggerSource
+  gate_state: FlightGateState
   gate_verdict: string | null
   gate_reason: string
   score: number | null
@@ -49,6 +52,7 @@ export interface NewFlight {
   project_id?: string | null
   trigger_source?: TriggerSource
   budget_micro_usd?: number
+  gate_state?: FlightGateState
   meta?: FlightMetaV1
 }
 
@@ -146,9 +150,12 @@ function mapFlightProjectInsertError(error: unknown): never {
 }
 
 // Create a flight in `preflight` — it has not launched; the gate decides next.
+// gate_state defaults to 'open' (normal dispatch flow); set to 'proposed' for
+// external origins (Linear, PostHog, etc.) that require explicit mupot-side approval.
 export async function createFlight(env: Env, f: NewFlight, options: CreateFlightOptions = {}): Promise<string> {
   await validateFlightProjectAttribution(env, f)
   const id = options.id ?? crypto.randomUUID()
+  const gateState = f.gate_state ?? 'open'
   let result
   try {
     const fence = options.routineRunFence
@@ -160,15 +167,16 @@ export async function createFlight(env: Env, f: NewFlight, options: CreateFlight
       f.goal,
       f.trigger_source ?? 'manual',
       f.budget_micro_usd ?? null,
+      gateState,
       JSON.stringify(f.meta ?? {}),
     ]
     if (fence) {
       result = await env.DB.prepare(
-        `INSERT INTO flights (id, tenant, project_id, agent, goal, status, trigger_source, budget_micro_usd, meta)
-         SELECT ?1, ?2, ?3, ?4, ?5, 'preflight', ?6, ?7, ?8
+        `INSERT INTO flights (id, tenant, project_id, agent, goal, status, trigger_source, budget_micro_usd, gate_state, meta)
+         SELECT ?1, ?2, ?3, ?4, ?5, 'preflight', ?6, ?7, ?8, ?9
           WHERE EXISTS (
             SELECT 1 FROM routine_runs rr
-             WHERE rr.id = ?9 AND rr.tenant = ?10 AND rr.project_id = ?3
+             WHERE rr.id = ?10 AND rr.tenant = ?11 AND rr.project_id = ?3
                AND rr.status IN ('leased','observing')
                AND NOT EXISTS (
                  SELECT 1 FROM routine_run_events requested
@@ -179,8 +187,8 @@ export async function createFlight(env: Env, f: NewFlight, options: CreateFlight
       ).bind(...values, fence.runId, fence.tenant).run()
     } else {
       result = await env.DB.prepare(
-        `INSERT INTO flights (id, tenant, project_id, agent, goal, status, trigger_source, budget_micro_usd, meta)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'preflight', ?6, ?7, ?8)`,
+        `INSERT INTO flights (id, tenant, project_id, agent, goal, status, trigger_source, budget_micro_usd, gate_state, meta)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'preflight', ?6, ?7, ?8, ?9)`,
       ).bind(...values).run()
     }
   } catch (error) {
@@ -212,6 +220,19 @@ export async function applyPreflight(env: Env, id: string, r: PreflightResult): 
     .bind(id, env.TENANT_SLUG, r.reasons.join(','), r.score, now)
     .run()
   return 'held'
+}
+
+// Approve a proposed flight, transitioning it to approved state so it can be dispatched.
+// Only works for flights in 'proposed' gate_state. Returns true if approved, false if
+// not found/not proposed.
+export async function approveFlight(env: Env, id: string): Promise<boolean> {
+  const result = await env.DB.prepare(
+    `UPDATE flights SET gate_state='approved'
+     WHERE id=?1 AND tenant=?2 AND gate_state='proposed'`,
+  )
+    .bind(id, env.TENANT_SLUG)
+    .run()
+  return (result?.meta?.changes ?? 0) > 0
 }
 
 // Land a flight (completed OK). Only from an in-air state.

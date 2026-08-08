@@ -54,6 +54,12 @@ export async function dispatchFlight(
   opts: PreflightOptions = {},
   extra: DispatchExtra = {},
 ): Promise<DispatchResult> {
+  // SECURITY: Reject any attempt to dispatch a proposed flight (external origin).
+  // Proposed flights require explicit mupot-side approval gate before dispatch.
+  if (flight.gate_state === 'proposed') {
+    throw new Error('cannot_dispatch_proposed_flight: external-origin flights require approval gate')
+  }
+
   const preflight = preflightCheck(signals, opts)
 
   let clearance: ClearanceResult | undefined
