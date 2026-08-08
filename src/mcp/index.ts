@@ -3078,17 +3078,18 @@ export async function invokeTool(
     return { ...fail(400, 'invalid_args', 'args must be an object'), tool: spec.name }
   }
 
-  const schemaError = validateArgs(spec.inputSchema, args)
-  if (schemaError) return { ...fail(400, 'invalid_args', schemaError), tool: spec.name }
-
   // AAGATE (#183) — deny-by-default capability FLOOR. `spec.min` is enforced HERE,
-  // centrally, BEFORE the handler runs. A tool that declares a capability minimum
+  // centrally, BEFORE argument validation. A tool that declares a capability minimum
   // can no longer fail-open if its handler omits the inline scope check: a caller
   // holding `min` on NO scope is rejected at the chokepoint. The handler still runs
   // its precise per-scope check (the floor is scope-agnostic — see capability.ts).
+  // Check authz FIRST so unauthorized callers get 403 regardless of body validity.
   if (spec.min !== 'authenticated' && !hasWorkspaceAdmin(auth) && !holdsCapabilityFloor(auth, spec.min)) {
     return { ...fail(403, 'forbidden', { need: spec.min }), tool: spec.name }
   }
+
+  const schemaError = validateArgs(spec.inputSchema, args)
+  if (schemaError) return { ...fail(400, 'invalid_args', schemaError), tool: spec.name }
 
   // A handler that THROWS (rather than returning fail()) must not escape as an
   // opaque 500 / unhandled rejection — convert it to a structured outcome so the
