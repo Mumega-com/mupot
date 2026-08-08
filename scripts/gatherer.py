@@ -247,12 +247,26 @@ def check_presence(findings: list[tuple[str, str]]) -> None:
             f"every routine will park in queued/agent_offline with no other symptom "
             f"(mupot#732)",
         ))
-    idle_only = [a for a in active if liveness(a) in ("dead", "never")]
-    if len(idle_only) >= max(1, len(active) - 2):
+    # PRESENCE IS NOT ACTIVITY, and this finding must not imply that it is.
+    #
+    # Measured 2026-08-07: athena showed liveness='dead, 7d ago' while it was gating PRs
+    # minutes earlier, and tech-grok showed 'never' while having shipped a 956-line PR the
+    # day before. The only two agents reporting 'active' were the two a host cron pokes
+    # (~/scripts/fleet-heartbeat.sh). So this table measures WHO CALLS THE HEARTBEAT, not
+    # who is working — and almost no lane calls it (mupot#732's family).
+    #
+    # The first wording here said "the roster is mostly ghosts". Acting on that would have
+    # retired the two most productive agents in the fleet. A finding that invites the wrong
+    # action is worse than no finding, so it now says what is actually true: the SIGNAL is
+    # unfed, which is a defect in the instrument, not evidence about the fleet.
+    unfed = [a for a in active if liveness(a) in ("dead", "never")]
+    if len(unfed) >= max(1, len(active) - 2):
         findings.append((
             "P2",
-            f"{len(idle_only)}/{len(active)} roster agents have never checked in or are "
-            f"long dead — the roster is mostly ghosts, which makes a real outage harder to see",
+            f"{len(unfed)}/{len(active)} roster agents report no recent presence — but "
+            f"presence is written by a heartbeat almost no lane calls, so this measures the "
+            f"INSTRUMENT, not the fleet. Do NOT retire seats on this signal alone (mupot#732): "
+            f"agents demonstrably doing work show here as dead. Verify activity independently.",
         ))
 
 
