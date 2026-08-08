@@ -167,6 +167,23 @@ describe('routine policy service', () => {
     expect(await createRoutine(env, member(), manualInput)).toEqual({ ok: false, error: 'forbidden' })
   })
 
+  it('denies a non-owner squad-admin from updating/transferring another squad\'s routine', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+    // squad-1 admin creates a routine on project-a (owner squad-1)
+    const created = await createRoutine(env, squadAdmin(), manualInput)
+    expect(created.ok).toBe(true)
+    if (!created.ok) return
+    const id = created.value.id
+    // squad-2 admin tries to update AND transfer it to squad-2 — must be forbidden
+    expect(await updateRoutine(env, squad2Admin(), id, { name: 'Hijacked' }))
+      .toEqual({ ok: false, error: 'forbidden' })
+    expect(await updateRoutine(env, squad2Admin(), id, { responsible_squad_id: 'squad-2' }))
+      .toEqual({ ok: false, error: 'forbidden' })
+    // owner squad-1 admin can still update in place
+    expect(await updateRoutine(env, squadAdmin(), id, { name: 'Owner edit' })).toMatchObject({ ok: true })
+  })
+
   it('allows department-admin to mutate policy on any squad project in the department', async () => {
     harness = makeHarness()
     const env = envFor(harness)
