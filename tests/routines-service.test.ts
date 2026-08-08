@@ -74,6 +74,24 @@ function observer() {
   return routinePrincipal({ ...auth([observerGrant]), memberId: 'member-2', userId: 'user-2' })
 }
 
+function squadAdmin() {
+  return routinePrincipal(auth([{
+    member_id: 'member-1', scope_type: 'squad', scope_id: 'squad-1', capability: 'admin',
+  }]))
+}
+
+function squad2Admin() {
+  return routinePrincipal(auth([{
+    member_id: 'member-1', scope_type: 'squad', scope_id: 'squad-2', capability: 'admin',
+  }]))
+}
+
+function deptAdmin() {
+  return routinePrincipal(auth([{
+    member_id: 'member-1', scope_type: 'department', scope_id: 'dept-1', capability: 'admin',
+  }]))
+}
+
 function agentAdmin() {
   return {
     tenant: 'tenant-a', actor_type: 'agent' as const, actor_id: 'agent-1', workspace_admin: true,
@@ -118,6 +136,42 @@ describe('routine policy service', () => {
     expect(await archiveRoutine(env, owner(), created.value.id)).toMatchObject({
       ok: true, value: { status: 'archived', revision: 4 },
     })
+  })
+
+  it('allows squad-admin and department-admin to mutate policy on their squad project (scoped, no org grant)', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+    // squad admin on squad-1 → can create + full lifecycle on project-a (squad-1 write)
+    const created = await createRoutine(env, squadAdmin(), manualInput)
+    expect(created).toMatchObject({ ok: true, value: { status: 'draft', revision: 1, responsible_squad_id: 'squad-1' } })
+    if (!created.ok) return
+    const id = created.value.id
+    expect(await enableRoutine(env, squadAdmin(), id)).toMatchObject({ ok: true, value: { status: 'enabled' } })
+    expect(await updateRoutine(env, squadAdmin(), id, { name: 'Squad-admin edit' })).toMatchObject({ ok: true })
+    expect(await pauseRoutine(env, squadAdmin(), id)).toMatchObject({ ok: true, value: { status: 'paused' } })
+    expect(await archiveRoutine(env, squadAdmin(), id)).toMatchObject({ ok: true, value: { status: 'archived' } })
+  })
+
+  it('denies squad-admin outside their squad: other projects, other squads, and squad-member floor', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+    // squad-1 admin on project-b (squad-2 only) → forbidden (no project access for squad-1)
+    expect(await createRoutine(env, squadAdmin(), { ...manualInput, project_id: 'project-b' }))
+      .toEqual({ ok: false, error: 'forbidden' })
+    // squad-1 admin responsible for squad-2 → forbidden (not admin on squad-2)
+    expect(await createRoutine(env, squadAdmin(), { ...manualInput, responsible_squad_id: 'squad-2' }))
+      .toEqual({ ok: false, error: 'forbidden' })
+    // squad-2 admin on project-a (squad-1's project) → forbidden
+    expect(await createRoutine(env, squad2Admin(), manualInput)).toEqual({ ok: false, error: 'forbidden' })
+    // plain squad MEMBER is still forbidden (policy mutation is admin-only)
+    expect(await createRoutine(env, member(), manualInput)).toEqual({ ok: false, error: 'forbidden' })
+  })
+
+  it('allows department-admin to mutate policy on any squad project in the department', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+    const created = await createRoutine(env, deptAdmin(), manualInput)
+    expect(created).toMatchObject({ ok: true, value: { status: 'draft', responsible_squad_id: 'squad-1' } })
   })
 
   it('rejects an agent-bound workspace administrator from every policy lifecycle mutation', async () => {
