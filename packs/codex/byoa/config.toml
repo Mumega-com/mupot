@@ -1,0 +1,8 @@
+# BYOA Codex CLI pack — merge into ~/.codex/config.toml
+# Streamable-HTTP only (Codex does not support SSE for remote MCP).
+# Export the env var with the show-once agent token (one line, no quotes).
+
+[mcp_servers.mupot]
+url = "https://YOUR-POT.example.workers.dev/mcp"
+bearer_token_env_var = "MUPOT_MCP_TOKEN"
+# then: export MUPOT_MCP_TOKEN=<MUPOT_MEMBER_TOKEN>

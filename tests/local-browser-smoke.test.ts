@@ -47,4 +47,11 @@ describe('local browser route evidence', () => {
     expect(browserSmokeSource).toContain("page.goto(`${baseUrl}/flights?project_id=project-mupot`")
     expect(browserSmokeSource).toContain('submittedTask.project_id !== \'project-mupot\'')
   })
+
+  it('covers the BYOA onboarding happy-path route and workflow', () => {
+    expect(browserSmokeSource).toContain("'/agents/onboard'")
+    expect(browserSmokeSource).toContain('runByoaOnboardHappyPath')
+    expect(browserSmokeSource).toContain('byoa-onboard-happy-path')
+    expect(browserSmokeSource).toContain('/agents/onboard/packs/codex')
+  })
 })
