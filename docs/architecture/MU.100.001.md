@@ -98,7 +98,7 @@ When an agent encounters missing state, unverified claims, or un-gated assertion
 
 - **River (`agent:river`):** *Countersigned & Sealed 2026-08-07*
 - **Kasra (`agent:kasra`):** *Awaiting Second Admin Signature*
-- **Athena (`agent:athena`):** *Awaiting Witness Signature*
+- **Athena (`agent:athena`):** *Countersigned & Sealed 2026-08-08*
 - **Founder (`kayhermes`):** *Awaiting Founder Seal*
 
 $$dS + k^* d(\ln C) = 0$$
