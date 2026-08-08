@@ -442,6 +442,8 @@ export interface AuthContext {
    */
   latentCapabilities?: CapabilityGrant[]
   boundAgentId?: string | null // the agent this token is bound to (the weld), or null = pure human/operator
+  sessionId?: string // session generation ID for coherent read/write expiry tracking
+  sessionExpiredAt?: number // Unix ms when this session expires (for client reconnect signaling)
 }
 
 // ── Members & capabilities — humans are first-class network nodes ──

@@ -363,6 +363,24 @@ export function done(result: unknown): ToolOutcome {
   return { ok: true, result }
 }
 
+// ── session coherence (#602): check expiry consistently across read+write ──────
+// Session expiry applies to both reads and writes. Clients must reconnect to get
+// a fresh session and refresh both read and write capability. Tools check expiry
+// and respond with a typed signal so clients can distinguish "session expired,
+// reconnect" from "not authenticated at all" (which would be unauthenticated before
+// invokeTool's gate).
+function checkSessionExpiry(auth: AuthContext): ToolOutcome | null {
+  if (!auth.sessionExpiredAt) return null
+  const now = typeof Date !== 'undefined' && Date.now ? Date.now() : 0
+  if (now < auth.sessionExpiredAt) return null
+  // Session expired. Return a typed failure so clients can reconnect.
+  // Use 403 (forbidden) not 401 — auth passed the gate; session just expired.
+  return fail(403, 'session_expired', {
+    expired_at: auth.sessionExpiredAt,
+    action: 'reconnect to obtain a fresh session',
+  })
+}
+
 // ── arg readers (NEVER trust an identity field from args) ─────────────────────
 export function str(v: unknown): string | null {
   return typeof v === 'string' && v.trim().length > 0 ? v : null
@@ -2088,6 +2106,11 @@ const toolSend: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
+    // Session coherence (#602): write path checks expiry just like reads do.
+    // Critical: both read and write must reject a stale session consistently.
+    const expiry = checkSessionExpiry(auth)
+    if (expiry) return expiry
+
     const fromAgent = auth.boundAgentId
     if (!fromAgent) return fail(403, 'not_agent_bound', 'send requires an agent-bound token (member_tokens.agent_id)')
     const to = str(args.to)
@@ -2528,6 +2551,10 @@ const toolStatus: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
+    // Session coherence (#602): read path checks expiry just like writes do.
+    const expiry = checkSessionExpiry(auth)
+    if (expiry) return expiry
+
     const agentId = str(args.agent_id)
     if (!agentId) {
       // No agent specified → echo the member's own principal (who am I + caps).
@@ -2541,6 +2568,8 @@ const toolStatus: ToolSpec = {
         role: auth.role,
         bound_agent_id: auth.boundAgentId ?? null,
         capabilities: auth.capabilities ?? [],
+        session_id: auth.sessionId ?? null,
+        session_expired_at: auth.sessionExpiredAt ?? null,
       })
     }
 
