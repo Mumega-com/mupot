@@ -457,10 +457,16 @@ def build_review_prompt(pr_meta: dict, diff_text: str, sensitive: bool, sensitiv
             "        recommended but not an emergency.",
             "  WARN -- lower severity: style, missing test, minor edge case.",
             "",
+            "CRITICAL: Every finding MUST cite concrete verifiable evidence from the diff.",
+            "Cite line numbers, file paths, or exact code snippets. Do not include a finding",
+            "unless you can point to specific proof in the diff. Claims without citations are",
+            "fabricated findings and harm the gate.",
+            "",
             "Respond with STRICT JSON ONLY -- no markdown fences, no commentary before or",
             "after -- exactly this shape:",
-            '{"verdict": "GREEN"|"RED", "p0": ["..."], "p1": ["..."], "warn": ["..."], "summary": "one paragraph"}',
+            '{"verdict": "GREEN"|"RED", "p0": [{"claim": "...", "evidence": "..."}], "p1": [{"claim": "...", "evidence": "..."}], "warn": [{"claim": "...", "evidence": "..."}], "summary": "one paragraph"}',
             "",
+            "Each finding object MUST have 'claim' (the issue) and 'evidence' (specific line/snippet).",
             "verdict MUST be RED if p0 is non-empty. GREEN requires zero p0 AND zero p1.",
             "Do not execute any code or use any tools -- you have none available -- reason",
             "only over the diff text above.",
@@ -515,21 +521,75 @@ def extract_claude_text(proc: subprocess.CompletedProcess) -> str:
         return proc.stdout or ""
 
 
+def _normalize_finding(finding: object) -> tuple[dict | None, bool]:
+    """Normalize a finding to {claim, evidence} format.
+    Returns (normalized_dict, was_fixable).
+    A finding is fixable iff it has both claim and evidence.
+    """
+    if isinstance(finding, str):
+        # Old string format is not fixable
+        return None, False
+    if isinstance(finding, dict):
+        claim = finding.get("claim", "").strip() if isinstance(finding.get("claim"), str) else ""
+        evidence = finding.get("evidence", "").strip() if isinstance(finding.get("evidence"), str) else ""
+        if claim and evidence:
+            return {"claim": claim, "evidence": evidence}, True
+        elif claim:
+            # Has claim but missing evidence -- unfixable
+            return None, False
+    return None, False
+
+
 def _normalize_verdict(obj: dict) -> dict:
     verdict = obj.get("verdict")
     if verdict not in ("GREEN", "RED"):
         return {
             "verdict": "RED",
-            "p0": [f"invalid_verdict_value:{verdict!r} -- fail-closed"],
+            "p0": [{"claim": "invalid_verdict_value", "evidence": f"verdict={verdict!r} -- fail-closed"}],
             "p1": [],
             "warn": [],
             "summary": obj.get("summary", "") if isinstance(obj.get("summary"), str) else "",
         }
+
+    def scrub_findings(raw_findings: object) -> tuple[list[dict], int]:
+        """Returns (valid_findings, count_unfixable)."""
+        if not isinstance(raw_findings, list):
+            return [], 0
+        normalized = []
+        unfixable = 0
+        for f in raw_findings:
+            norm, fixable = _normalize_finding(f)
+            if norm:
+                normalized.append(norm)
+            elif not fixable and f:
+                unfixable += 1
+        return normalized, unfixable
+
+    p0, p0_unfixable = scrub_findings(obj.get("p0"))
+    p1, p1_unfixable = scrub_findings(obj.get("p1"))
+    warn_list, warn_unfixable = scrub_findings(obj.get("warn"))
+
+    issues = []
+
+    total_unfixable = p0_unfixable + p1_unfixable + warn_unfixable
+    if total_unfixable > 0:
+        issues.append({
+            "claim": "findings_lack_evidence",
+            "evidence": f"{total_unfixable} finding(s) cited without concrete evidence from diff -- fail-closed"
+        })
+
+    if verdict == "GREEN" and p0:
+        issues.append({"claim": "verdict_GREEN_with_p0", "evidence": f"GREEN verdict but {len(p0)} p0 finding(s) present"})
+
+    if issues:
+        p0 = issues + p0
+        verdict = "RED"
+
     return {
         "verdict": verdict,
-        "p0": obj["p0"] if isinstance(obj.get("p0"), list) else [],
-        "p1": obj["p1"] if isinstance(obj.get("p1"), list) else [],
-        "warn": obj["warn"] if isinstance(obj.get("warn"), list) else [],
+        "p0": p0,
+        "p1": p1,
+        "warn": warn_list,
         "summary": obj.get("summary", "") if isinstance(obj.get("summary"), str) else "",
     }
 
@@ -644,6 +704,25 @@ def attempt_automerge(task: dict, pr_number: int, reviewed_head_sha: str, verdic
         return {"attempted": True, "merged": False, "reason": f"exception during automerge, parked (fail-closed): {exc}"}
 
 
+def _format_findings(findings: list[dict], label: str) -> str:
+    """Format findings with their evidence citations."""
+    if not findings:
+        return ""
+    lines = [f"{label}:"]
+    for i, f in enumerate(findings[:10], 1):
+        if isinstance(f, dict):
+            claim = f.get("claim", str(f))
+            evidence = f.get("evidence", "")
+            if evidence:
+                lines.append(f"  {i}. {claim}")
+                lines.append(f"     evidence: {evidence[:200]}")
+            else:
+                lines.append(f"  {i}. {claim}")
+        else:
+            lines.append(f"  {i}. {f}")
+    return "\n".join(lines)
+
+
 def build_receipt(head_sha: str, verdict_obj: dict, sensitive: bool, sensitive_reason: str, mode_note: str) -> str:
     lines = [
         f"review-worker -> {head_sha}: {verdict_obj['verdict']} "
@@ -652,11 +731,11 @@ def build_receipt(head_sha: str, verdict_obj: dict, sensitive: bool, sensitive_r
         f"summary: {verdict_obj['summary']}",
     ]
     if verdict_obj["p0"]:
-        lines.append("P0: " + "; ".join(str(x) for x in verdict_obj["p0"][:10]))
+        lines.append(_format_findings(verdict_obj["p0"], "P0"))
     if verdict_obj["p1"]:
-        lines.append("P1: " + "; ".join(str(x) for x in verdict_obj["p1"][:10]))
+        lines.append(_format_findings(verdict_obj["p1"], "P1"))
     if verdict_obj["warn"]:
-        lines.append("WARN: " + "; ".join(str(x) for x in verdict_obj["warn"][:10]))
+        lines.append(_format_findings(verdict_obj["warn"], "WARN"))
     lines.append(mode_note)
     return "\n".join(lines)
 
