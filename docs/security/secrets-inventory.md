@@ -98,7 +98,7 @@ CONFIRMED complete, not sampled: no pagination control present.
 
 | token | permissions | resources | expires |
 |---|---|---|---|
-| `shabrang build token` | Account.Containers, Account.Secrets Store **+24 more** (26 total) | 1 Account, **All zones** | **never** | 🔴 INCIDENT — consumer unknown; replacement in progress per task-f16dfac1 |
+| `shabrang build token` | Account.Containers, Account.Secrets Store **+24 more** (26 total) | 1 Account, **All zones** | **never** | 🔴 INCIDENT — consumer: `Mumega-com/shabrang` Pages deploy; replacement token pending mint (task-f16dfac1) |
 | `mumcp update` | Account.Workers R2 Storage | 1 Account | 2026-09-30 |
 | `mumcp email` | Account.Email Sending, Zone.DNS | 1 Account, **All zones** | **never** |
 
