@@ -412,7 +412,10 @@ export async function updateRoutine(
   if (existing.status === 'archived') return { ok: false, error: 'routine_archived' }
   const normalized = normalizePolicy(input, existing)
   if (!normalized.ok) return normalized
-  if (!await principalCanMutateRoutinePolicy(env, principal, existing.project_id, normalized.value.responsible_squad_id)) {
+  // Authorize against the EXISTING owner squad: an admin on squad B must not be
+  // able to transfer/rewrite a routine owned by squad A (destination is validated
+  // by validateOwnership below). #813 follow-up from review P1.
+  if (!await principalCanMutateRoutinePolicy(env, principal, existing.project_id, existing.responsible_squad_id)) {
     return { ok: false, error: 'forbidden' }
   }
   const ownershipError = await validateOwnership(env, existing.project_id, normalized.value)
