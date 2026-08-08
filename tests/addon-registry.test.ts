@@ -46,14 +46,14 @@ describe('addon registry', () => {
       ...FixtureAddon,
       key: 'previous-minor-native-addon',
       version: '1.0.0',
-      mupotCompatibility: '^0.24.0',
+      mupotCompatibility: '^0.28.0',
     }
 
     await registry.register(manifest)
 
     expect(registry.get(manifest.key)?.manifest).toMatchObject({
       version: '1.0.0',
-      mupotCompatibility: '^0.24.0',
+      mupotCompatibility: '^0.28.0',
     })
   })
 

@@ -90,7 +90,7 @@ describe('DME integration release receipt', () => {
     expect(versionSource).toContain(`MUPOT_PUBLIC_API_VERSION = '${MUPOT_PUBLIC_API_VERSION}'`)
     expect(addonManifest).toContain("key: 'project-link'")
     expect(addonManifest).toContain("version: '1.0.0'")
-    expect(addonManifest).toContain("mupotCompatibility: '^0.24.0'")
+    expect(addonManifest).toContain("mupotCompatibility: '^0.29.0'")
     expect(receipt).toContain('`0.24.0`')
     expect(receipt).toContain('`1.0.0`')
     expect(receipt).toContain('`^0.24.0`')
