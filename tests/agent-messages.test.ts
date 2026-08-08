@@ -162,11 +162,11 @@ function makeDb(
       return claimed.slice().reverse().map((m) => ({ ...m }))
     }
     if (sql.includes('FROM agent_messages') && sql.includes('read_at IS NULL') && sql.includes('ORDER BY seq ASC')) {
-      const [tenant, to_agent, limit] = b as [string, string, number]
+      const [tenant, to_agent, sinceSeq, limit] = b as [string, string, number, number]
       const effectiveMode = fences.get(to_agent)?.mode ?? 'bearer_only'
       if (!sql.includes("mode = 'signed_only'") && effectiveMode !== 'bearer_only') return []
       return messages
-        .filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null)
+        .filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null && m.seq > (sinceSeq ?? 0))
         .sort((x, y) => x.seq - y.seq)
         .slice(0, limit)
         .map((m) => ({ ...m }))
