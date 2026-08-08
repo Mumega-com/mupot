@@ -472,6 +472,37 @@ export async function verifyAgentConnection(
   const checks: VerificationChecks = {
     challenge: { status: 'pass' },
   }
+
+  let currentCapability: string | null = null
+  try {
+    const memberCapability = await env.DB.prepare(
+      `SELECT capability FROM capabilities
+        WHERE member_id = ?
+          AND scope_type = 'squad'
+          AND scope_id = ?
+          AND capability IN ('observer', 'member')
+        LIMIT 1`,
+    )
+      .bind(receipt.member_id, receipt.home_squad_id)
+      .first<{ capability: string }>()
+    currentCapability = memberCapability?.capability ?? null
+  } catch {
+    checks.membership = { status: 'fail', error: 'membership_lookup_failed' }
+    return recordTransientFailure(
+      env,
+      receipt,
+      nowIso,
+      'membership_lookup_failed',
+      checks,
+    )
+  }
+
+  if (!currentCapability) {
+    checks.membership = { status: 'fail', error: 'membership_revoked' }
+    return recordTransientFailure(env, receipt, nowIso, 'membership_revoked', checks)
+  }
+  checks.membership = { status: 'pass' }
+
   const canonical = deps.requiredCanonicalOrigin(env)
   if (!canonical.ok) {
     checks.configuration = { status: 'fail', error: 'canonical_origin_unavailable' }
@@ -488,7 +519,7 @@ export async function verifyAgentConnection(
     const oriented = await deps.buildOrient(
       env,
       receipt.agent_id,
-      receipt.home_capability,
+      currentCapability as 'observer' | 'member',
       mcpEndpoint(canonical.origin),
       true,
       now.getTime(),
