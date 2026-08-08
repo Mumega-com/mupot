@@ -3964,6 +3964,20 @@ function observatoryBody(
 ) {
   const { agents, stats, runtimeStates, bars, ticks, recentTasks } = data
 
+  // Filter active or council agents for the primary swimlane view (#824)
+  const COUNCIL_SLUGS = new Set(['asha', 'kasra', 'athena', 'river', 'loom'])
+  const activeAgents = agents.filter((a) => {
+    const s = stats.get(a.id)
+    const runtime = runtimeStates.get(a.id)
+    const slug = (a.id || '').toLowerCase()
+    const name = (a.name || '').toLowerCase()
+    const isCouncil = COUNCIL_SLUGS.has(slug) || COUNCIL_SLUGS.has(name)
+    const hasActivity = s && (s.task_count > 0 || s.in_flight > 0 || s.spend_micro_usd > 0)
+    const isLive = runtime === 'live'
+    return isCouncil || hasActivity || isLive
+  })
+  const displayAgents = activeAgents.length > 0 ? activeAgents : agents
+
   function runtimeLabel(state: AgentRuntimeState): string {
     if (state === 'live') return 'live runtime'
     if (state === 'stale') return 'stale runtime'
@@ -4004,9 +4018,9 @@ function observatoryBody(
     .join('')
 
   // Agent tiles (left sticky column)
-  const agentTiles = agents.length === 0
+  const agentTiles = displayAgents.length === 0
     ? '<div class="tile"><span class="empty">No agents yet.</span></div>'
-    : agents.map((a) => {
+    : displayAgents.map((a) => {
         const stat: AgentStat = stats.get(a.id) ?? {
           agent_id: a.id,
           task_count: 0,
@@ -4043,9 +4057,9 @@ function observatoryBody(
       }).join('')
 
   // Grid rows (one per agent)
-  const gridRows = agents.length === 0
+  const gridRows = displayAgents.length === 0
     ? '<div class="grid-row"></div>'
-    : agents.map((a) => {
+    : displayAgents.map((a) => {
         const agentBars = barsByAgent.get(a.id) ?? []
         const barHtml = agentBars
           .map((b) => {
