@@ -54,7 +54,8 @@ describe('central-command ingress (mumega-com#722)', () => {
 
       INSERT OR IGNORE INTO agents (id, squad_id, slug, name, status)
       VALUES ('ag-prime', 'squad-core', 'prime', 'Prime', 'active'),
-             ('ag-river', 'squad-core', 'river', 'River', 'active');
+             ('ag-river', 'squad-core', 'river', 'River', 'active'),
+             ('ag-mubot', 'squad-core', 'mubot', 'Mubot', 'active');
     `)
   })
 
@@ -70,19 +71,19 @@ describe('central-command ingress (mumega-com#722)', () => {
 
   it('binds -5317747241 -> squad-core via channel_bindings seam and accepts mentions (B3)', async () => {
     const { runInbound } = await import('../src/channels/index')
-    const res = await runInbound(env, 'telegram', '-5317747241', '765204057', '@prime status check')
-    expect(res).toContain('Dispatched @prime via mupot inbox')
+    const res = await runInbound(env, 'telegram', '-5317747241', '765204057', '@mubot status check')
+    expect(res).toContain('Dispatched @mubot via mupot inbox')
 
     const msg = await env.DB.prepare(
-      `SELECT * FROM agent_messages WHERE to_agent = 'prime'`
+      `SELECT * FROM agent_messages WHERE to_agent = 'mubot'`
     ).first()
     expect(msg).not.toBeNull()
-    expect(msg?.body).toBe('@prime status check')
+    expect(msg?.body).toBe('@mubot status check')
   })
 
   it('tags non-Hadi mentions UNTRUSTED-INGRESS: body carries the tag', async () => {
     const { runInbound } = await import('../src/channels/index')
-    const res = await runInbound(env, 'telegram', '-5317747241', '1111111', '@prime execute order')
+    const res = await runInbound(env, 'telegram', '-5317747241', '1111111', '@mubot execute order')
     expect(res).toContain('[UNTRUSTED-INGRESS]')
 
     const msg = await env.DB.prepare(
@@ -103,9 +104,9 @@ describe('central-command ingress (mumega-com#722)', () => {
 
   it('Hadi sender 765204057 is directive-capable: untagged body, wake allowed', async () => {
     const { runInbound } = await import('../src/channels/index')
-    const res = await runInbound(env, 'telegram', '-5317747241', '765204057', '@prime full flight plan')
+    const res = await runInbound(env, 'telegram', '-5317747241', '765204057', '@mubot full flight plan')
     expect(res).not.toContain('[UNTRUSTED-INGRESS]')
-    expect(res).toContain('Dispatched @prime')
+    expect(res).toContain('Dispatched @mubot')
   })
 
   it('B1: returns honest SOS-native status for @river even when river is active in D1 agents', async () => {
@@ -119,9 +120,15 @@ describe('central-command ingress (mumega-com#722)', () => {
     expect(msg?.body).toContain('[sos-bus]')
   })
 
+  // NOTE: @prime routing is deliberately NOT asserted here. dispatchMention routes
+  // prime/asha to sosBusSend, which returns "is SOS-native; relayed via Kasra" — but
+  // asha is mupot-native with a working inbox, and sosBusSend performs no relay at all
+  // (it writes one [sos-bus] audit row and returns the string). Pinning either side of
+  // that would encode a falsehood. Classification + honest status tracked separately.
+
   it('B2: refuses mentions exceeding MAX_BODY_CHARS via sendAgentMessage primitive', async () => {
     const { runInbound } = await import('../src/channels/index')
-    const longBody = '@prime ' + 'x'.repeat(8200)
+    const longBody = '@mubot ' + 'x'.repeat(8200)
     const res = await runInbound(env, 'telegram', '-5317747241', '765204057', longBody)
     expect(res).toContain('refused: invalid_body')
   })
@@ -135,15 +142,15 @@ describe('central-command ingress (mumega-com#722)', () => {
   it('rate wall: 11th mention in the hour returns the cap message and records 11', async () => {
     const { runInbound } = await import('../src/channels/index')
     for (let i = 0; i < 10; i++) {
-      const res = await runInbound(env, 'telegram', '-5317747241', '765204057', `@prime ping ${i}`)
-      expect(res).toContain('Dispatched @prime')
+      const res = await runInbound(env, 'telegram', '-5317747241', '765204057', `@mubot ping ${i}`)
+      expect(res).toContain('Dispatched @mubot')
     }
 
-    const eleventh = await runInbound(env, 'telegram', '-5317747241', '765204057', '@prime ping 11')
+    const eleventh = await runInbound(env, 'telegram', '-5317747241', '765204057', '@mubot ping 11')
     expect(eleventh).toContain('10/hour mention wall')
 
     const budget = await env.DB.prepare(
-      `SELECT count FROM channel_mention_budget WHERE agent_slug = 'prime'`
+      `SELECT count FROM channel_mention_budget WHERE agent_slug = 'mubot'`
     ).first<{ count: number }>()
     expect(budget?.count).toBe(11)
   })
