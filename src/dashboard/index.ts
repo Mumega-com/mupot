@@ -1169,7 +1169,7 @@ dashboardApp.get('/radar', async (c) => {
   return c.html(shell(c.env, 'Radar', radarPageBody(radar)))
 })
 
-// ── motherboard (Fractal Motherboard Map visual topology engine — #v0.28.0) ──
+// ── motherboard (Fractal Motherboard Map visual topology engine — shipped in v0.29.0, planned as v0.28.0) ──
 dashboardApp.get('/motherboard', async (c) => {
   const auth = c.get('auth') as AuthContext | undefined
   const tenant = c.req.query('tenant') ?? 'mumega.com'
@@ -3670,7 +3670,7 @@ function shell(
             <span class="nav-label">Radar</span>
           </a>
 
-          <!-- Motherboard (Fractal Motherboard map — v0.28.0) -->
+          <!-- Motherboard (Fractal Motherboard map — shipped in v0.29.0) -->
           <a class="nav-link" href="/motherboard">
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><rect x="3" y="3" width="14" height="14" rx="2"/><path d="M7 7h2v2H7zM11 7h2v2h-2zM7 11h2v2H7zM11 11h2v2h-2z"/></svg>
             <span class="nav-label">Motherboard</span>

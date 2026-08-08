@@ -1,4 +1,4 @@
-// src/addons/torivers.ts — ToRivers v2 Deterministic Automation & Credential Matching Addon (#v0.28.0).
+// src/addons/torivers.ts — ToRivers v2 Deterministic Automation & Credential Matching Addon (shipped in v0.29.0; planned as v0.28.0, a release that was never cut).
 //
 // Adapts ToRivers v2 (/mnt/HC_Volume_104325311/torivers-v2) into a native Mupot Hono sub-app router.
 // Provides deterministic workflow execution, step-by-step receipt generation, and credential matching.
