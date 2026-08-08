@@ -94,6 +94,12 @@ function insertAgent(harness: SqliteD1Harness, id = 'agent-a'): void {
   harness.sqlite.exec(`
     INSERT INTO agents (id, squad_id, slug, name, role, model, status, created_at)
     VALUES ('${id}', 'squad-a', '${id}', 'Agent ${id}', 'builder', 'test', 'active', '2026-07-20T00:00:00.000Z');
+    INSERT INTO members (id, email, display_name, telegram_chat_id, status, created_at, tenant)
+    VALUES ('mem-${id}', '${id}@example.com', 'Member ${id}', NULL, 'active', '2026-07-20T00:00:00.000Z', '${TENANT}');
+    INSERT INTO agent_keys (tenant, agent_id, pubkey, algo, member_id, created_at)
+    VALUES ('${TENANT}', '${id}', 'test-key-${id}', 'ed25519', 'mem-${id}', '2026-07-20T00:00:00.000Z');
+    INSERT INTO fleet_agents (tenant, agent_id, status, last_reported_at)
+    VALUES ('${TENANT}', '${id}', 'running', '${NOW}');
   `)
 }
 
@@ -284,6 +290,68 @@ describe('startProject happy path', () => {
       harness.close()
     }
   })
+
+  it('excludes stale/offline agents: selects the live agent when multiple exist', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    try {
+      insertPlannedProject(harness, { id: 'proj-stale-exclusion', goal: 'Test stale agent exclusion' })
+      grantSquadAccess(harness, 'proj-stale-exclusion', 'admin')
+
+      // Insert a stale agent (no fleet presence) first
+      harness.sqlite.exec(`
+        INSERT INTO agents (id, squad_id, slug, name, role, model, status, created_at)
+        VALUES ('agent-stale', 'squad-a', 'agent-stale', 'Stale Agent', 'builder', 'test', 'active', '2026-07-15T00:00:00.000Z');
+        INSERT INTO members (id, email, display_name, telegram_chat_id, status, created_at, tenant)
+        VALUES ('mem-stale', 'stale@example.com', 'Member Stale', NULL, 'active', '2026-07-15T00:00:00.000Z', '${TENANT}');
+        INSERT INTO agent_keys (tenant, agent_id, pubkey, algo, member_id, created_at)
+        VALUES ('${TENANT}', 'agent-stale', 'test-key-stale', 'ed25519', 'mem-stale', '2026-07-15T00:00:00.000Z');
+      `)
+
+      // Insert a live agent second
+      insertAgent(harness, 'agent-live')
+
+      const deps = makeDeps({
+        createTask: vi.fn(async (taskEnv, input) => {
+          const id = 'task-stale-test-1'
+          await taskEnv.DB.prepare(
+            `INSERT INTO tasks (
+               id, squad_id, project_id, title, body, done_when, status, assignee_agent_id,
+               github_issue_url, result, completed_at, gate_owner, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, 'open', ?, NULL, NULL, NULL, NULL, ?, ?)`,
+          ).bind(
+            id, input.squad_id, input.project_id, input.title, input.body, input.done_when,
+            input.assignee_agent_id, NOW, NOW,
+          ).run()
+          return {
+            id,
+            squad_id: input.squad_id,
+            project_id: input.project_id,
+            title: input.title,
+            body: input.body,
+            done_when: input.done_when,
+            status: 'open' as const,
+            assignee_agent_id: input.assignee_agent_id,
+            github_issue_url: null,
+            result: null,
+            completed_at: null,
+            gate_owner: null,
+            created_at: NOW,
+            updated_at: NOW,
+          }
+        }),
+      })
+
+      const result = await startProject(env, 'proj-stale-exclusion', deps)
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
+      // Verify the live agent was selected, not the stale one
+      expect(result.agent_id).toBe('agent-live')
+      expect(result.project.status).toBe('active')
+    } finally {
+      harness.close()
+    }
+  })
 })
 
 describe('startProject resource-fail stays planned (blocked-start)', () => {
@@ -338,6 +406,31 @@ describe('startProject resource-fail stays planned (blocked-start)', () => {
       const result = await startProject(env, 'proj-nosquad', makeDeps())
       expect(result).toMatchObject({ ok: false, error: 'no_writable_squad' })
       expect((await getProject(env, 'proj-nosquad'))?.status).toBe('planned')
+    } finally {
+      harness.close()
+    }
+  })
+
+  it('blocks start when all squad agents are stale (no live agent available)', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    try {
+      insertPlannedProject(harness, { id: 'proj-all-stale' })
+      grantSquadAccess(harness, 'proj-all-stale', 'write')
+
+      // Insert an agent with key but no fleet presence (offline/stale)
+      harness.sqlite.exec(`
+        INSERT INTO agents (id, squad_id, slug, name, role, model, status, created_at)
+        VALUES ('agent-offline', 'squad-a', 'agent-offline', 'Offline Agent', 'builder', 'test', 'active', '2026-07-20T00:00:00.000Z');
+        INSERT INTO members (id, email, display_name, telegram_chat_id, status, created_at, tenant)
+        VALUES ('mem-offline', 'offline@example.com', 'Member Offline', NULL, 'active', '2026-07-20T00:00:00.000Z', '${TENANT}');
+        INSERT INTO agent_keys (tenant, agent_id, pubkey, algo, member_id, created_at)
+        VALUES ('${TENANT}', 'agent-offline', 'test-key-offline', 'ed25519', 'mem-offline', '2026-07-20T00:00:00.000Z');
+      `)
+
+      const result = await startProject(env, 'proj-all-stale', makeDeps())
+      expect(result).toMatchObject({ ok: false, error: 'no_squad_agent' })
+      expect((await getProject(env, 'proj-all-stale'))?.status).toBe('planned')
     } finally {
       harness.close()
     }

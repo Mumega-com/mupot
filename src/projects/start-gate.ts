@@ -254,16 +254,39 @@ async function pickWritableSquad(
 }
 
 async function pickSquadAgent(env: Env, squadId: string): Promise<SquadAgentRow | null> {
-  const row = await env.DB.prepare(
-    `SELECT id, squad_id, slug, name
-       FROM agents
-      WHERE squad_id = ?1 AND status = 'active'
-      ORDER BY created_at ASC, id ASC
-      LIMIT 1`,
+  // Fetch all active agents in the squad with runtime state indicators.
+  // Exclude stale duplicates: pick only agents with both an active key_member
+  // AND a fleet_agents presence record (requirements for 'live' state).
+  const rows = await env.DB.prepare(
+    `SELECT a.id,
+            a.squad_id,
+            a.slug,
+            a.name,
+            CASE WHEN k.member_id IS NOT NULL THEN 1 ELSE 0 END AS has_key_member,
+            CASE WHEN f.status IS NOT NULL THEN 1 ELSE 0 END AS has_fleet_status
+       FROM agents a
+       LEFT JOIN agent_keys k
+              ON k.tenant = ?1 AND k.agent_id = a.id
+       LEFT JOIN fleet_agents f
+              ON f.tenant = ?1 AND f.agent_id = a.id
+      WHERE a.squad_id = ?2 AND a.status = 'active'
+      ORDER BY a.created_at ASC, a.id ASC`,
   )
-    .bind(squadId)
-    .first<SquadAgentRow>()
-  return row ?? null
+    .bind(env.TENANT_SLUG, squadId)
+    .all<SquadAgentRow & { has_key_member: number; has_fleet_status: number }>()
+
+  // Return first agent with both markers (live runtime state).
+  for (const row of rows.results ?? []) {
+    if (row.has_key_member && row.has_fleet_status) {
+      return {
+        id: row.id,
+        squad_id: row.squad_id,
+        slug: row.slug,
+        name: row.name,
+      }
+    }
+  }
+  return null
 }
 
 async function countProjectTasks(env: Env, projectId: string): Promise<number> {
