@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest'
 import {
   PROJECT_LINK_ENVELOPE_SCHEMA,
   PROJECT_LINK_ENVELOPE_SIGNATURE_DOMAIN,
+  PROJECT_LINK_PROHIBITED_CUSTOMER_FIELDS,
+  PROJECT_LINK_PROHIBITED_FIELD_CLASSES,
   canonicalDomainSeparatedBytes,
   canonicalJson,
   canonicalProjectLinkArtifact,
@@ -9,6 +11,7 @@ import {
   canonicalProjectLinkEnvelopeSigningBytes,
   createSignedProjectEnvelope,
   generateProjectLinkKeyPair,
+  projectLinkBoundaryDenialEvent,
   validateProjectLinkEnvelope,
 } from '../src/addons/project-link/envelope'
 
@@ -53,6 +56,48 @@ function fromB64url(value: string): Uint8Array {
 }
 
 describe('project-link envelope security boundary', () => {
+  it('publishes an explicit prohibited-field-class denylist covering the DME data boundary', () => {
+    expect(Object.keys(PROJECT_LINK_PROHIBITED_FIELD_CLASSES).sort()).toEqual([
+      'analytics_exports',
+      'contacts',
+      'credentials',
+      'file_contents',
+      'private_memory',
+      'prompts',
+      'transcripts',
+    ])
+    expect(PROJECT_LINK_PROHIBITED_CUSTOMER_FIELDS).toEqual(expect.arrayContaining([
+      'customer_email', 'customer_record', 'contact_list',
+      'access_token', 'api_key', 'credentials',
+      'raw_analytics', 'analytics_export',
+      'private_prompt', 'prompt',
+      'transcript', 'conversation_transcript',
+      'private_memory', 'model_memory',
+      'file_contents', 'unapproved_files',
+    ]))
+  })
+
+  it('builds boundary-denial log events without embedding field values', () => {
+    const event = projectLinkBoundaryDenialEvent({
+      reason: 'prohibited_field',
+      path: 'credentials',
+      field_class: 'credentials',
+      direction: 'outbound',
+      link_id: 'mumega-link',
+    })
+    expect(event).toEqual({
+      event: 'project-link.customer_data_boundary_denial',
+      reason: 'prohibited_field',
+      path: 'credentials',
+      field_class: 'credentials',
+      direction: 'outbound',
+      link_id: 'mumega-link',
+    })
+    expect(Object.keys(event).sort()).toEqual([
+      'direction', 'event', 'field_class', 'link_id', 'path', 'reason',
+    ])
+  })
+
   it('produces stable canonical JSON for key ordering, Unicode, escaping, and nulls', () => {
     const vector = {
       z: null,
