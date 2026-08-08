@@ -10,7 +10,7 @@ import { resolveCapabilities } from '../auth/capability'
 
 const AGENT_ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/
 const STATUSES = new Set(['running', 'stopped', 'unknown'])
-const RUNTIMES = new Set(['codex', 'claude-code', 'nous', 'hermes-cron', 'systemd-user', 'tmux', 'python', ''])
+const RUNTIMES = new Set(['codex', 'claude-code', 'cursor', 'nous', 'hermes-cron', 'systemd-user', 'tmux', 'python', ''])
 const LIFECYCLES = new Set(['on_demand', 'always_on', ''])
 // Valid agent type values — what KIND of agent, not the runtime it runs on.
 const AGENT_TYPES = new Set(['builder', 'reviewer', 'weaver', 'brain', 'comms', 'generic'])
