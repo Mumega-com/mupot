@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.29.0 — 2026-08-08
 
 - **Build-Time Release Identity & Version Truth** (`src/health.ts`, `scripts/generate-build-info.mjs`; #443, #571).
   - `/health` and deployment consoles now stamp exact commit identity (`commit`), branch (`ref`), build timestamp (`built_at`), and working-tree cleanliness (`clean`) by construction via `src/build-info.ts` fallback when runtime environment variables are omitted.

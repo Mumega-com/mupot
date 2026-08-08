@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
+import { MUPOT_PUBLIC_API_VERSION } from '../src/version'
 
 const runbook = readFileSync(new URL('../docs/dme-integration-runbook.md', import.meta.url), 'utf8')
 const receipt = readFileSync(new URL('../docs/releases/dme-integration.md', import.meta.url), 'utf8')
@@ -85,8 +86,8 @@ describe('DME integration runbook', () => {
 
 describe('DME integration release receipt', () => {
   it('keeps the v0.24 addon lifecycle identity and receipt immutable', () => {
-    expect(pkg.version).toBe('0.25.0')
-    expect(versionSource).toContain("MUPOT_PUBLIC_API_VERSION = '0.25.0'")
+    expect(pkg.version).toBe(MUPOT_PUBLIC_API_VERSION)
+    expect(versionSource).toContain(`MUPOT_PUBLIC_API_VERSION = '${MUPOT_PUBLIC_API_VERSION}'`)
     expect(addonManifest).toContain("key: 'project-link'")
     expect(addonManifest).toContain("version: '1.0.0'")
     expect(addonManifest).toContain("mupotCompatibility: '^0.24.0'")

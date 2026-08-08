@@ -77,7 +77,7 @@ function supportsAdditiveNativePreviousMinor(
     current &&
     minimum.major === 0 &&
     current.major === 0 &&
-    current.minor === minimum.minor + 1,
+    current.minor >= minimum.minor,
   )
 }
 
