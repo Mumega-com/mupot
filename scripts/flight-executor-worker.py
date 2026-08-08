@@ -276,14 +276,58 @@ def land_flight(flight: dict, token: str, success: bool, cost_micro_usd: int) ->
         return False
 
 
+def reconcile_stuck_flights(agent_id: str, token: str) -> int:
+    """
+    Reconcile stuck flights: mark very old running flights as failed.
+    Returns count reconciled.
+    """
+    try:
+        if agent_id not in HEADLESS_AGENTS:
+            return 0
+        tenant = os.environ.get("TENANT", "mumega")
+        # Flights stuck if running for >2 hours (7200000 ms).
+        query = (
+            f"SELECT id, started_at FROM flights "
+            f"WHERE status = 'running' AND agent = '{agent_id}' AND tenant = '{tenant}' "
+            f"AND started_at IS NOT NULL "
+            f"AND (unixepoch('now') * 1000 - started_at) > 7200000 "
+            f"ORDER BY started_at LIMIT 10"
+        )
+        cmd = ["wrangler", "d1", "execute", "mupot", query, "--json"]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, cwd=str(REPO))
+        if result.returncode != 0:
+            log(f"reconcile: wrangler query failed: {result.stderr}")
+            return 0
+        data = json.loads(result.stdout)
+        reconciled = 0
+        for row in data:
+            flight_id = row.get("id")
+            if DRY_RUN:
+                log(f"[DRY RUN] would fail stuck flight {flight_id}")
+                reconciled += 1
+                continue
+            try:
+                # Mark stuck flight as failed.
+                mcp("flight_land", {"flight_id": flight_id, "cost_micro_usd": 0}, token)
+                log(f"reconciled stuck flight {flight_id}")
+                reconciled += 1
+            except Exception as e:
+                log(f"error reconciling {flight_id}: {e}")
+        return reconciled
+    except Exception as e:
+        log(f"reconcile_stuck_flights error: {e}")
+        return 0
+
+
 def main() -> int:
-    """Main loop: poll, execute, land."""
+    """Main loop: poll, execute, land, reconcile."""
     state = load_state()
     executed = state.get("executed", {})
     landed = state.get("landed", {})
 
     log("cycle start")
     flights_done = 0
+    stuck_reconciled = 0
 
     for agent_id in HEADLESS_AGENTS:
         if flights_done >= MAX_FLIGHTS:
@@ -330,8 +374,11 @@ def main() -> int:
             except Exception as e:
                 log(f"error executing flight {flight_id}: {e}")
 
+        # Reconcile stuck flights (older than 2 hours).
+        stuck_reconciled += reconcile_stuck_flights(agent_id, token)
+
     save_state({"executed": executed, "landed": landed})
-    log(f"cycle end (flights_done={flights_done})")
+    log(f"cycle end (flights_done={flights_done} stuck_reconciled={stuck_reconciled})")
     return 0
 
 
