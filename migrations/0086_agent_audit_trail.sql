@@ -25,7 +25,16 @@
 CREATE TABLE IF NOT EXISTS agent_audit (
   seq             INTEGER PRIMARY KEY AUTOINCREMENT, -- monotonic; the ordering key
   id              TEXT NOT NULL UNIQUE,              -- UUID, the external handle
-  agent_id        TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  -- Deliberately NOT a foreign key. It was `REFERENCES agents(id) ON DELETE
+  -- CASCADE`, which erased an agent's entire history the moment deleteAgent ran
+  -- — the trail vanishing exactly when it is most needed, at retirement, when
+  -- someone asks what this seat used to be and who changed it. Orphan rows are
+  -- the acceptable price of the record surviving its subject.
+  --
+  -- Dropping only the CASCADE would be worse than leaving it: the default
+  -- NO ACTION would make deleteAgent fail outright once an agent had any audit
+  -- history. So the constraint goes, not just its action. (#857)
+  agent_id        TEXT NOT NULL,
   actor_id        TEXT NOT NULL,                 -- agent/user id (admin who made change)
   actor_type      TEXT NOT NULL DEFAULT 'agent' CHECK (actor_type IN ('agent','user','system')),
   action          TEXT NOT NULL,                 -- 'update_agent'

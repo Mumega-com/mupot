@@ -1,7 +1,7 @@
 import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { beforeEach, describe, expect, it } from 'vitest'
-import { createAgent, getAgentProfile, updateAgentProfile } from '../src/org/service'
+import { createAgent, deleteAgent, getAgentProfile, updateAgentProfile } from '../src/org/service'
 import type { Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
@@ -252,6 +252,23 @@ describe('updateAgentProfile — registry drift repair', () => {
       expect(rows).toHaveLength(1)
       expect(rows[0]!.actor_id).toBe('system')
       expect(rows[0]!.actor_type).toBe('system')
+    })
+
+    it('survives deletion of the agent it describes', async () => {
+      // The trail used to be REFERENCES agents(id) ON DELETE CASCADE, so retiring
+      // a seat erased every record of what it had been and who changed it —
+      // the audit disappearing at the one moment someone would come looking.
+      // Orphan rows are the price of the record outliving its subject.
+      await updateAgentProfile(env, agentId, { model: 'was-this-before-retirement' })
+      expect(await auditRows(agentId)).toHaveLength(1)
+
+      const deleted = await deleteAgent(env, agentId)
+      expect(deleted).toEqual({ ok: true })
+      expect(await getAgentProfile(env, agentId)).toBeNull()
+
+      const survivors = await auditRows(agentId)
+      expect(survivors).toHaveLength(1)
+      expect(JSON.parse(survivors[0]!.after_state).model).toBe('was-this-before-retirement')
     })
 
     it('appends one row per correction rather than overwriting', async () => {
