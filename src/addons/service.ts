@@ -321,7 +321,11 @@ function hasNoAuthorityGrants(entry: AddonCatalogEntry): boolean {
     && entry.manifest.authorityRequests.surfaceGrants.length === 0
 }
 
-function matchesRegisteredIdentity(installation: AddonInstallation, entry: AddonCatalogEntry): boolean {
+// Exported so migrations that repair installation identity drift (e.g. a
+// mupotCompatibility version bump backfill) can assert the exact production
+// check — not a hand-rolled reimplementation of it — against a live
+// registered catalog entry. See migrations/0089_backfill_addon_manifest_v0_29.sql.
+export function matchesRegisteredIdentity(installation: AddonInstallation, entry: AddonCatalogEntry): boolean {
   return installation.addonKey === entry.manifest.key
     && installation.installedVersion === entry.manifest.version
     && installation.publisher === entry.manifest.publisher
