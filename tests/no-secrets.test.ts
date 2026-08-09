@@ -54,9 +54,11 @@ describe('no-secrets scanner', () => {
   })
 
   it('does not match sk- inside ordinary kebab-case words', () => {
-    // Regression: `/sk-[A-Za-z0-9_-]{20,}/` with no left boundary matched
-    // "ta|sk-with-tier2-provenance" and failed PR #850, which held no secret.
-    // Every string here embeds sk- mid-word with 20+ trailing chars.
+    // Regression: `/sk-[A-Za-z0-9_-]{20,}/` with no left boundary matched the "sk-"
+    // buried inside "gated-terminal-task-with-tier2-provenance" and failed PR #850,
+    // which held no secret. Every string here embeds sk- mid-word with 20+ trailing
+    // chars. Note: do not spell that example with a delimiter before "sk-" — it would
+    // satisfy the new lookbehind and become a real finding in this very file.
     const root = createRepo({
       'contract.json': JSON.stringify({
         trigger: 'gated-terminal-task-with-tier2-provenance',
