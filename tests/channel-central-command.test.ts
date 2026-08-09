@@ -151,12 +151,14 @@ describe('central-command ingress (mumega-com#722)', () => {
     expect(res).toContain('Dispatched @mubot')
   })
 
-  // FENCE STAYS (adversarial review, binding correction from the original brief):
-  // do NOT remove the hardcoded SOS-native branch or sosBusSend. Whether a Telegram
-  // mention should ever reach kasra/athena/loom (seats with gate/merge/deploy
-  // authority) is a reachability policy call (#845-B), not an addressing bug. These
-  // two tests are UNCHANGED from before this fix and must stay pinned to the
-  // fence's actual (non-)behavior — never assert relay/delivery (#845's lesson).
+  // FENCE STAYS (Athena-approved revert, flight-20260809-mupot-deploy-unblock,
+  // reverting c2c71df's widening back to prod's actual river||dara fence): do NOT
+  // remove the hardcoded SOS-native branch or sosBusSend. Whether a Telegram
+  // mention should ever reach kasra/athena/loom/asha/prime (seats with
+  // gate/merge/deploy authority, or SOS-native identity) is a reachability policy
+  // call (#845-B), not an addressing bug. This test is UNCHANGED and must stay
+  // pinned to the fence's actual (non-)behavior — never assert relay/delivery
+  // (#845's lesson).
 
   it('B1: @river routes to the SOS-native path and is told plainly it was NOT reached', async () => {
     const { runInbound } = await import('../src/channels/index')
@@ -175,19 +177,29 @@ describe('central-command ingress (mumega-com#722)', () => {
     expect(msg?.body).toContain('review spec')
   })
 
-  it('B1b: @prime takes the same path — audit row written, delivery explicitly denied', async () => {
+  // B1b UPDATED (flight-20260809-mupot-deploy-unblock): PR #866 reverted the
+  // fence's target list back to river||dara (matching prod) — @prime was never
+  // actually SOS-native-fenced in prod; that was c2c71df's since-reverted
+  // widening. Post-revert, @prime is a real pot-native agent (seeded 'ag-prime'
+  // above) and dispatches through the ordinary potSend path, same as @mubot.
+  it('B1b: @prime is unfenced post-revert — dispatches via potSend like any pot-native agent', async () => {
     const { runInbound } = await import('../src/channels/index')
     const res = await runInbound(env, 'telegram', '-5317747241', '765204057', '@prime status report')
 
-    expect(res).toContain('@prime is SOS-native and NOT REACHED')
-    expect(res).not.toContain('relayed via Kasra')
-    expect(res).not.toContain('Dispatched @prime')
+    expect(res).toContain('Dispatched @prime via mupot inbox')
+    expect(res).not.toContain('SOS-native and NOT REACHED')
 
+    // ADDRESSING INVARIANT: written keyed by the resolved agent UUID, not the slug.
     const msg = await env.DB.prepare(
-      `SELECT * FROM agent_messages WHERE to_agent = 'prime'`
+      `SELECT * FROM agent_messages WHERE to_agent = 'ag-prime'`
     ).first<{ body: string }>()
-    expect(msg?.body).toContain('[sos-bus]')
-    expect(msg?.body).toContain('status report')
+    expect(msg).not.toBeNull()
+    expect(msg?.body).toBe('@prime status report')
+
+    const bySlug = await env.DB.prepare(
+      `SELECT * FROM agent_messages WHERE to_agent = 'prime'`
+    ).first()
+    expect(bySlug).toBeNull()
   })
 
   it('BLOCK-1: a mention shaped like a raw agent id is rejected before it ever resolves (tombstone protection)', async () => {
@@ -238,7 +250,7 @@ describe('central-command ingress (mumega-com#722)', () => {
     expect(msg).toBeNull()
   })
 
-  it('WARN-1: dispatch charges a per-(member, recipient) rate-wall bucket, not just the global per-slug one', async () => {
+  it('WARN-1/repair: dispatch charges the enforced per-(member, resolved recipient) rate-wall bucket', async () => {
     const { runInbound } = await import('../src/channels/index')
     const res = await runInbound(env, 'telegram', '-5317747241', '765204057', '@mubot ping')
     expect(res).toContain('Dispatched @mubot')
@@ -321,7 +333,7 @@ describe('central-command ingress (mumega-com#722)', () => {
     expect(msg).toBeNull()
   })
 
-  it('rate wall: 11th mention in the hour returns the cap message and records 11', async () => {
+  it('rate wall: 11th mention from the SAME sender to the SAME recipient in the hour is capped', async () => {
     const { runInbound } = await import('../src/channels/index')
     for (let i = 0; i < 10; i++) {
       const res = await runInbound(env, 'telegram', '-5317747241', '765204057', `@mubot ping ${i}`)
@@ -330,10 +342,75 @@ describe('central-command ingress (mumega-com#722)', () => {
 
     const eleventh = await runInbound(env, 'telegram', '-5317747241', '765204057', '@mubot ping 11')
     expect(eleventh).toContain('10/hour mention wall')
+    expect(eleventh).not.toContain('Dispatched @mubot')
 
+    // Enforced bucket is keyed on the RESOLVED recipient uuid, not the slug.
     const budget = await env.DB.prepare(
-      `SELECT count FROM channel_mention_budget WHERE agent_slug = 'mubot'`
+      `SELECT count FROM channel_mention_budget_v2
+        WHERE tenant = 'mumega' AND from_member = 'm-hadi' AND agent_id = 'ag-mubot'`
     ).first<{ count: number }>()
     expect(budget?.count).toBe(11)
+  })
+
+  // THE done_when TEST (Loom's binding ruling, flight-20260809-mupot-deploy-unblock):
+  // PR #865 claimed to fix a cross-sender DoS but did not. It kept the ORIGINAL
+  // wall — global per RECIPIENT SLUG (tenant, agent_slug, hour_bucket), charged
+  // unconditionally before resolution, no sender dimension — running FIRST and
+  // UNCHANGED, and only ADDED a narrower per-(sender, recipient) wall on top. An
+  // additive, narrower constraint cannot lift a lockout an earlier, wider one
+  // already imposed: sender A spending 10 mentions on @mubot still trips the
+  // shared per-slug wall for sender B's very first mention to @mubot. This test
+  // fails against that pre-repair code (it would see sender B refused with the
+  // "prime rate-limited" global-wall message) and passes against the repair,
+  // which deletes the global per-slug wall from enforcement outright and keys the
+  // ONE remaining wall per sender.
+  it('DoS repair: sender A exhausting the wall for @mubot does not lock out sender B', async () => {
+    const { runInbound } = await import('../src/channels/index')
+
+    // Sender A (Hadi, directive) spends all 10 mentions on @mubot this hour.
+    for (let i = 0; i < 10; i++) {
+      const res = await runInbound(env, 'telegram', '-5317747241', '765204057', `@mubot ping ${i}`)
+      expect(res).toContain('Dispatched @mubot')
+    }
+    const eleventh = await runInbound(env, 'telegram', '-5317747241', '765204057', '@mubot ping 11')
+    expect(eleventh).toContain('10/hour mention wall')
+
+    // Sender B (m-user, a DIFFERENT linked member) mentions the SAME recipient
+    // for the FIRST time this hour. It must still deliver.
+    const senderB = await runInbound(env, 'telegram', '-5317747241', '1111111', '@mubot first ping')
+    expect(senderB).toContain('Dispatched @mubot')
+    expect(senderB).not.toContain('rate-limited')
+    expect(senderB).not.toContain('rate wall')
+
+    // Independent buckets per sender, both keyed on the resolved recipient uuid.
+    const rowA = await env.DB.prepare(
+      `SELECT count FROM channel_mention_budget_v2
+        WHERE tenant = 'mumega' AND from_member = 'm-hadi' AND agent_id = 'ag-mubot'`
+    ).first<{ count: number }>()
+    expect(rowA?.count).toBe(11)
+
+    const rowB = await env.DB.prepare(
+      `SELECT count FROM channel_mention_budget_v2
+        WHERE tenant = 'mumega' AND from_member = 'm-user' AND agent_id = 'ag-mubot'`
+    ).first<{ count: number }>()
+    expect(rowB?.count).toBe(1)
+  })
+
+  it('fenced seats never consume the recipient rate wall (no resolved agent row, no delivery to protect)', async () => {
+    const { runInbound } = await import('../src/channels/index')
+    // Ten mentions to a fenced SOS-native target — well past what would trip the
+    // wall for a real recipient — must never charge channel_mention_budget_v2:
+    // river/dara are not rows in `agents`, sosBusSend never delivers, and there is
+    // no real recipient budget to protect.
+    for (let i = 0; i < 10; i++) {
+      const res = await runInbound(env, 'telegram', '-5317747241', '765204057', `@river ping ${i}`)
+      expect(res).toContain('@river is SOS-native and NOT REACHED')
+    }
+    const rows = await env.DB.prepare(
+      `SELECT count(*) as n FROM channel_mention_budget_v2 WHERE agent_id = 'river' OR from_member = 'm-hadi'`
+    ).first<{ n: number }>()
+    // m-hadi's earlier tests in this file run in a fresh harness per-test
+    // (beforeEach), so the only rows possible here are ones THIS test wrote.
+    expect(rows?.n).toBe(0)
   })
 })

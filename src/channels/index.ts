@@ -452,54 +452,53 @@ async function dispatchMention(
     return `no such active agent: @${target}`
   }
 
-  // F3: Rate wall uses fixed ISO UTC-hour buckets (v1 decision). Global, per-slug,
-  // unconditional — applies to every mention, fenced or not, unchanged from before.
-  const bucket = new Date().toISOString().slice(0, 13) + ':00:00Z'
-  const tenant = env.TENANT_SLUG ?? 'mumega'
-  const inc = await env.DB.prepare(
-    `INSERT INTO channel_mention_budget (tenant, agent_slug, hour_bucket, count)
-     VALUES (?1, ?2, ?3, 1)
-     ON CONFLICT(tenant, agent_slug, hour_bucket)
-     DO UPDATE SET count = count + 1
-     RETURNING count`,
-  ).bind(tenant, target, bucket).first<{ count: number }>()
-
-  if (inc && Number(inc.count) > 10) {
-    return `prime rate-limited: @${target} has hit the 10/hour mention wall.`
-  }
-
-  // B1 Fix: Check SOS-native agents BEFORE DB lookup so @river, @asha, @kasra, @athena, @loom never get trapped in potSend
+  // B1 Fix: Check SOS-native agents BEFORE DB lookup so @river / @dara never get
+  // trapped in potSend.
   //
-  // SCOPE NOTE (adversarial review on mumega-com#722 follow-up — this fence stays,
-  // full stop): removing it would make an untrusted external Telegram channel a
-  // live input to the seats holding gate, merge, and deploy authority
-  // (kasra/athena/loom). The dispatched body is attacker-controlled text with only
-  // an [UNTRUSTED-INGRESS] prefix — no delimiter, no structured envelope — and
-  // from_agent reads as 'central-command', which looks authoritative to a
-  // recipient LLM. Today those seats are structurally immune only because
-  // sosBusSend delivers nothing. Whether a Telegram mention should EVER reach
-  // those seats is a reachability policy call (#845-B) for Hadi/Loom, not an
-  // implementation detail of an addressing-bug fix. Untouched.
-  if (target === 'river' || target === 'dara' || target === 'asha' || target === 'prime' || target === 'kasra' || target === 'athena' || target === 'loom') {
+  // SCOPE NOTE (Athena-approved revert, flight-20260809-mupot-deploy-unblock):
+  // prod (95e3721) never had the @asha/@prime/@kasra/@athena/@loom widening from
+  // c2c71df — that widening never shipped, so this fence matches live behavior.
+  // Whether any of those five seats SHOULD be reachable via Telegram mention is a
+  // reachability policy call (#845-B) for Hadi/Loom, not this PR's call.
+  //
+  // Fenced seats do NOT touch the rate wall below: sosBusSend never delivers
+  // (mupot#845 — it writes an audit row and returns), so charging a delivery
+  // budget against a message that was never delivered would be nonsensical, and
+  // there is no resolved recipient (river/dara are not rows in `agents`) to key a
+  // per-recipient bucket on anyway.
+  if (target === 'river' || target === 'dara') {
     return sosBusSend(env, target, body)
   }
 
-  // WARN-1 (adversarial review): once dispatch below actually delivers, a wall
-  // keyed only on (tenant, slug, hour) lets ANY linked member exhaust one SPECIFIC
-  // recipient's hourly budget and lock out every OTHER sender's dispatch to that
-  // same agent — including Hadi's own directive dispatch. Resolve the real
-  // recipient first (read-only; sendToRef resolves again for the actual send —
-  // acceptable duplication, both are cheap indexed lookups) and charge a SECOND
-  // wall keyed per (sender, recipient), IN ADDITION to the global wall above, not
-  // instead of it. If resolution fails here, there is no real recipient to protect
-  // a budget for — fall through to potSend and let sendToRef's own resolution
-  // produce the honest, authz-shaped refusal.
+  // Loom's binding ruling (flight-20260809-mupot-deploy-unblock, repairing PR
+  // #865's incomplete DoS fix): the ORIGINAL wall this replaced was keyed
+  // (tenant, agent_slug, hour_bucket) — global per recipient SLUG, charged before
+  // resolution, with NO sender dimension. #865 added a second, narrower wall
+  // (tenant, from_member, agent_id, hour_bucket) IN ADDITION to that one, not
+  // instead of it. An additive, narrower constraint cannot lift a lockout the
+  // wider one already imposed: sender A spending 10 mentions on @X still trips
+  // the global slug wall for sender B's first mention to @X. The DoS was never
+  // fixed.
+  //
+  // The fix is to key the ONE enforced wall on (tenant, from_member,
+  // resolved_agent_id, hour_bucket) — per SENDER, per RESOLVED RECIPIENT — and
+  // delete the global per-slug wall outright rather than replace it with some
+  // other aggregate ceiling; a global-aggregate cap is a separate authorization
+  // decision this fix does not make (do not reintroduce one here).
+  //
+  // Resolution must happen BEFORE the charge — the recipient the budget protects
+  // has to be real. sendToRef resolves the ref again for the actual send;
+  // duplicating the read is acceptable, both are cheap indexed lookups. If
+  // resolution fails here, there is no real recipient to protect a budget for —
+  // fall through to potSend and let sendToRef's own resolution produce the
+  // honest, authz-shaped refusal (send_target_not_visible / ambiguous), same as
+  // before this fix.
   //
   // Directive senders do NOT bypass this wall. Deliberate, not an oversight: a
-  // self-inflicted cap still protects against a compromised or looping client, and
-  // nothing in this fix's scope asked for an owner exemption — flagging this as a
-  // default worth confirming, not silently assuming an exemption that was never
-  // specified.
+  // self-inflicted cap still protects against a compromised or looping client,
+  // and nothing in this fix's scope asked for an owner exemption.
+  const bucket = new Date().toISOString().slice(0, 13) + ':00:00Z'
+  const tenant = env.TENANT_SLUG ?? 'mumega'
   const resolved = await resolveAgentRef(env, target)
   if (resolved.ok) {
     const perRecipientInc = await env.DB.prepare(
