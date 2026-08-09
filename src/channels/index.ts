@@ -36,8 +36,7 @@ import type {
 import { resolveCapabilities, hasCapability } from '../auth/capability'
 import { createBus } from '../bus'
 import { getAdapter } from './registry'
-import { sendToRef } from '../agents/messages'
-import { resolveAgentRef } from '../org/resolve'
+import { sendToRef, resolveVisibleSendTarget } from '../agents/messages'
 import { createTask } from '../tasks/service'
 
 type AppEnv = { Bindings: Env }
@@ -486,28 +485,52 @@ async function dispatchMention(
   // other aggregate ceiling; a global-aggregate cap is a separate authorization
   // decision this fix does not make (do not reintroduce one here).
   //
+  // ORACLE-CLOSE REPAIR (P0 fix-forward on e117832/#868, Loom's gate finding): the
+  // first cut of this re-key gated the charge on bare EXISTENCE
+  // (`resolveAgentRef(env, target).ok`), not VISIBILITY. That reintroduced the
+  // exact existence-oracle class BLOCK-3 (above) deleted the F2 pre-check to
+  // close — just moved into the budget side-channel: a no-grants linked member
+  // could tell "real agent, not mine to see" (resolves → charges → 11th call
+  // returns a target-specific rate-limited message) apart from "no such agent"
+  // (never resolves → never charges → always send_target_not_visible) across an
+  // 11-call sequence.
+  //
+  // The gate MUST be the same resolved-AND-visible-to-this-caller check
+  // sendToRef itself applies before it will ever touch sendAgentMessage —
+  // `resolveVisibleSendTarget` (src/agents/messages.ts) factors exactly that
+  // check (case (a): resolveAgentRef, then canOnSquad ≥observer for a
+  // non-admin) out of sendToRef so this call site can share it instead of
+  // reimplementing (and risking drift from) it. A real-but-invisible target and
+  // a nonexistent one now collapse to the SAME `{ ok: false,
+  // reason: 'send_target_not_visible' }` here, so BOTH skip the charge
+  // identically — no divergence for an attacker to read across any number of
+  // calls. (Central-command never attaches a projectId, so the primitive's
+  // absence of sendToRef's case-(b) project fallback does not change behavior
+  // here.)
+  //
   // Resolution must happen BEFORE the charge — the recipient the budget protects
-  // has to be real. sendToRef resolves the ref again for the actual send;
-  // duplicating the read is acceptable, both are cheap indexed lookups. If
-  // resolution fails here, there is no real recipient to protect a budget for —
-  // fall through to potSend and let sendToRef's own resolution produce the
-  // honest, authz-shaped refusal (send_target_not_visible / ambiguous), same as
-  // before this fix.
+  // has to be real AND visible. sendToRef resolves (and re-checks visibility)
+  // again for the actual send; duplicating the read is acceptable, both are
+  // cheap indexed lookups. If resolution/visibility fails here, there is no
+  // recipient a non-admin sender is authorized to charge a budget against — fall
+  // through to potSend and let sendToRef's own resolution produce the honest,
+  // authz-shaped refusal (send_target_not_visible), same as before this fix.
   //
   // Directive senders do NOT bypass this wall. Deliberate, not an oversight: a
   // self-inflicted cap still protects against a compromised or looping client,
   // and nothing in this fix's scope asked for an owner exemption.
   const bucket = new Date().toISOString().slice(0, 13) + ':00:00Z'
   const tenant = env.TENANT_SLUG ?? 'mumega'
-  const resolved = await resolveAgentRef(env, target)
-  if (resolved.ok) {
+  const isAdmin = hasCapability(grants, 'org', null, 'admin')
+  const visible = await resolveVisibleSendTarget(env, target, { isAdmin, grants })
+  if (visible.ok) {
     const perRecipientInc = await env.DB.prepare(
       `INSERT INTO channel_mention_budget_v2 (tenant, from_member, agent_id, hour_bucket, count)
        VALUES (?1, ?2, ?3, ?4, 1)
        ON CONFLICT(tenant, from_member, agent_id, hour_bucket)
        DO UPDATE SET count = count + 1
        RETURNING count`,
-    ).bind(tenant, memberId, resolved.value.id, bucket).first<{ count: number }>()
+    ).bind(tenant, memberId, visible.value.id, bucket).first<{ count: number }>()
 
     if (perRecipientInc && Number(perRecipientInc.count) > 10) {
       return `rate-limited: you've hit the 10/hour mention wall for @${target}.`
