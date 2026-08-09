@@ -396,6 +396,99 @@ describe('central-command ingress (mumega-com#722)', () => {
     expect(rowB?.count).toBe(1)
   })
 
+  // ORACLE-CLOSE REPAIR (P0 fix-forward on e117832/#868, Loom's gate finding): PR #868's
+  // rate-wall re-key gated the charge on bare `resolveAgentRef(...).ok` — EXISTENCE, not
+  // VISIBILITY — before charging. A no-grants linked member could then distinguish "a
+  // real agent, just not mine to see" from "no such agent" by watching the SEQUENCE of
+  // responses across repeated mentions: the real-but-invisible target resolves every
+  // call, so the shared per-(sender, recipient) budget increments each time and the 11th
+  // call surfaces a target-specific `rate-limited: ... @<target>` message; the nonexistent
+  // slug never resolves, never charges, and returns the SAME `send_target_not_visible`
+  // refusal forever. That divergence — present only across a SEQUENCE, invisible to any
+  // single-call test (see BLOCK-2 above, which sends exactly one message) — is a
+  // tenant-wide agent-slug enumeration oracle available to any linked member with zero
+  // grants. The existing single-call BLOCK-2 test cannot see it; this test builds the full
+  // 11-call sequence for both cases and asserts they are byte-identical.
+  it('ORACLE CLOSE: invisible-real vs nonexistent mention targets produce IDENTICAL 11-call response sequences for a no-grants sender', async () => {
+    harness.sqlite.exec(`
+      INSERT OR IGNORE INTO members (id, email, display_name, status)
+      VALUES ('m-nogrants2', 'nogrants2@mumega.com', 'NoGrants2', 'active');
+      INSERT OR IGNORE INTO member_identities (id, member_id, platform, external_user_id)
+      VALUES ('id-nogrants2', 'm-nogrants2', 'telegram', '3333333');
+    `)
+
+    const { runInbound } = await import('../src/channels/index')
+
+    // (A) @mubot: a REAL, pot-native, active agent (seeded in beforeEach) that
+    // m-nogrants2 cannot see — zero capability grants, no channel-sync grant either.
+    const invisibleRealSeq: string[] = []
+    for (let i = 0; i < 11; i++) {
+      invisibleRealSeq.push(
+        await runInbound(env, 'telegram', '-5317747241', '3333333', `@mubot probe ${i}`),
+      )
+    }
+
+    // Fresh harness per test (beforeEach) — re-seed identically for the (B) run so the
+    // only variable between the two sequences is which target slug is being probed.
+    harness.close()
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    env = { DB: harness.db, TENANT_SLUG: 'mumega', TELEGRAM_BOT_TOKEN: 'test-bot-token' } as unknown as Env
+    harness.sqlite.exec(`
+      INSERT OR IGNORE INTO members (id, email, display_name, status)
+      VALUES ('m-hadi', 'hadi@mumega.com', 'Hadi', 'active');
+      INSERT OR IGNORE INTO member_identities (id, member_id, platform, external_user_id)
+      VALUES ('id-hadi', 'm-hadi', 'telegram', '765204057');
+      INSERT OR IGNORE INTO members (id, email, display_name, status)
+      VALUES ('m-user', 'user@mumega.com', 'User', 'active');
+      INSERT OR IGNORE INTO member_identities (id, member_id, platform, external_user_id)
+      VALUES ('id-user', 'm-user', 'telegram', '1111111');
+      INSERT OR IGNORE INTO departments (id, slug, name)
+      VALUES ('dept-core', 'core', 'Dept Core');
+      INSERT OR IGNORE INTO squads (id, department_id, slug, name)
+      VALUES ('squad-core', 'dept-core', 'core', 'Squad Core');
+      INSERT OR IGNORE INTO channel_bindings (id, platform, external_channel_id, squad_id, max_capability)
+      VALUES ('central-command-telegram', 'telegram', '-5317747241', 'squad-core', 'member');
+      INSERT OR IGNORE INTO agents (id, squad_id, slug, name, status)
+      VALUES ('ag-prime', 'squad-core', 'prime', 'Prime', 'active'),
+             ('ag-river', 'squad-core', 'river', 'River', 'active'),
+             ('ag-mubot', 'squad-core', 'mubot', 'Mubot', 'active');
+      INSERT OR IGNORE INTO capabilities (id, member_id, scope_type, scope_id, capability)
+      VALUES ('cap-hadi-squad-core', 'm-hadi', 'squad', 'squad-core', 'member'),
+             ('cap-user-squad-core', 'm-user', 'squad', 'squad-core', 'member');
+      INSERT OR IGNORE INTO members (id, email, display_name, status)
+      VALUES ('m-nogrants2', 'nogrants2@mumega.com', 'NoGrants2', 'active');
+      INSERT OR IGNORE INTO member_identities (id, member_id, platform, external_user_id)
+      VALUES ('id-nogrants2', 'm-nogrants2', 'telegram', '3333333');
+    `)
+
+    // (B) @ghost: no agent with this slug exists anywhere in the tenant.
+    const nonexistentSeq: string[] = []
+    for (let i = 0; i < 11; i++) {
+      nonexistentSeq.push(
+        await runInbound(env, 'telegram', '-5317747241', '3333333', `@ghost probe ${i}`),
+      )
+    }
+
+    // THE ASSERTION: the two complete 11-response sequences must be indistinguishable.
+    // Compare call-by-call so a mismatch reports exactly which call diverged.
+    for (let i = 0; i < 11; i++) {
+      expect(invisibleRealSeq[i]).toBe(nonexistentSeq[i])
+    }
+    expect(invisibleRealSeq).toEqual(nonexistentSeq)
+    // Neither case ever produced the target-specific rate-limited message or a
+    // Dispatched confirmation — every one of the 22 calls is the same collapsed refusal.
+    for (const r of [...invisibleRealSeq, ...nonexistentSeq]) {
+      expect(r).toBe('refused: send_target_not_visible')
+    }
+
+    // No budget row was written for EITHER case — the charge itself never fired.
+    const budgetRows = await env.DB.prepare(
+      `SELECT count(*) as n FROM channel_mention_budget_v2 WHERE from_member = 'm-nogrants2'`
+    ).first<{ n: number }>()
+    expect(budgetRows?.n).toBe(0)
+  })
+
   it('fenced seats never consume the recipient rate wall (no resolved agent row, no delivery to protect)', async () => {
     const { runInbound } = await import('../src/channels/index')
     // Ten mentions to a fenced SOS-native target — well past what would trip the

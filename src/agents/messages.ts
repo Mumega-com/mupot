@@ -525,6 +525,51 @@ export type SendToRefResult =
       detail?: string
     }
 
+// ── resolveVisibleSendTarget — the authorized pre-send visibility primitive ────────────
+// Oracle-close repair (P0 fix-forward on PR #868/e117832, Loom's gate finding): the
+// central-command mention-rate-wall charge (src/channels/index.ts dispatchMention) used to
+// gate on bare `resolveAgentRef` — EXISTENCE only, no visibility check — before charging.
+// That let any linked member with zero grants distinguish "real agent I can't see" (resolves
+// → charges → 11th call surfaces a target-specific rate-limited message) from "no such agent"
+// (never resolves → never charges → always send_target_not_visible): a tenant-wide agent-slug
+// enumeration oracle, same class as BLOCK-3 above, reintroduced through the budget side-channel.
+//
+// This is CASE (a) of sendToRef's own gate below — resolveAgentRef, then (for a non-admin)
+// canOnSquad ≥observer — factored out so a pre-send caller (e.g. a rate-limit charge gate) can
+// ask "is this ref a REAL, VISIBLE-TO-THIS-CALLER recipient" using the EXACT SAME check
+// sendToRef applies before it will ever touch sendAgentMessage, rather than reimplementing (and
+// risking drift from) that logic. Any non-admin failure mode — doesn't resolve, resolves
+// ambiguously, resolves but isn't squad-visible — collapses to the same 'send_target_not_visible'
+// so nothing downstream of this primitive (a charge, a log line, a timing difference) can leak
+// which case occurred.
+//
+// Deliberately does NOT implement sendToRef's case (b) projectId fallback: that fallback is only
+// authoritative via sendAgentMessage's own project-access check (validateMessageProjectAccess),
+// which this resolve-only primitive cannot decide. A caller with a projectId must still go
+// through sendToRef itself for the send-time decision — this primitive is for pre-send
+// visibility gating (e.g. rate-limit charge keys) only, never a substitute for the real send.
+// sendToRef itself is intentionally left untouched by this addition (zero behavior change to
+// already-reviewed, already-gated send-authz code) — it continues to implement case (a) and (b)
+// inline exactly as before.
+export async function resolveVisibleSendTarget(
+  env: Env,
+  toRef: string,
+  authz: SendTargetAuthz,
+): Promise<
+  | { ok: true; value: { id: string; squad_id: string; slug: string; name: string } }
+  | { ok: false; reason: 'recipient_not_found' | 'recipient_ambiguous' | 'send_target_not_visible' }
+> {
+  const resolved = await resolveAgentRef(env, toRef)
+  if (!resolved.ok) {
+    if (!authz.isAdmin) return { ok: false, reason: 'send_target_not_visible' }
+    return { ok: false, reason: resolved.reason === 'ambiguous' ? 'recipient_ambiguous' : 'recipient_not_found' }
+  }
+  if (authz.isAdmin) return { ok: true, value: resolved.value }
+  const squadVisible = await canOnSquad(env, authz.grants, resolved.value.squad_id, 'observer')
+  if (!squadVisible) return { ok: false, reason: 'send_target_not_visible' }
+  return { ok: true, value: resolved.value }
+}
+
 export async function sendToRef(
   env: Env,
   input: {
