@@ -165,4 +165,94 @@ describe('updateAgentProfile — registry drift repair', () => {
     const result = await updateAgentProfile(env, 'no-such-agent', { name: 'Ghost' })
     expect(result).toEqual({ ok: false, error: 'not_found' })
   })
+
+  // parent_agent_id shipped on the updatable allow-list and reached the SET clause
+  // through the generic text path, with none of createAgent's validation. The column
+  // is a soft self-reference with no foreign key, so D1 catches nothing: the governed
+  // repair path was the only way to write the corruption it exists to prevent.
+  //
+  // These pin the exclusion. Each is a write that previously SUCCEEDED.
+  describe('parent_agent_id is not patchable — placement is structural', () => {
+    it('refuses a phantom parent that was never an agent', async () => {
+      expect(
+        await updateAgentProfile(env, agentId, {
+          parent_agent_id: 'no-such-agent',
+        } as Record<string, unknown>),
+      ).toEqual({ ok: false, error: 'invalid_field' })
+      expect((await getAgentProfile(env, agentId))?.parent_agent_id).toBeNull()
+    })
+
+    it('refuses an agent as its own parent', async () => {
+      expect(
+        await updateAgentProfile(env, agentId, {
+          parent_agent_id: agentId,
+        } as Record<string, unknown>),
+      ).toEqual({ ok: false, error: 'invalid_field' })
+      expect((await getAgentProfile(env, agentId))?.parent_agent_id).toBeNull()
+    })
+
+    it('refuses the two-write cycle that makes a tree walk loop forever', async () => {
+      const other = await createAgent(env, 'sq-a', { slug: 'sibling', name: 'Sibling' })
+      expect(other.ok).toBe(true)
+      if (!other.ok) return
+      const otherId = other.value.id
+
+      // A -> B, then B -> A. Neither write is individually suspicious; together
+      // they close a loop with no root, and every consumer that climbs the
+      // placement tree hangs.
+      expect(
+        await updateAgentProfile(env, agentId, {
+          parent_agent_id: otherId,
+        } as Record<string, unknown>),
+      ).toEqual({ ok: false, error: 'invalid_field' })
+      expect(
+        await updateAgentProfile(env, otherId, {
+          parent_agent_id: agentId,
+        } as Record<string, unknown>),
+      ).toEqual({ ok: false, error: 'invalid_field' })
+
+      expect((await getAgentProfile(env, agentId))?.parent_agent_id).toBeNull()
+      expect((await getAgentProfile(env, otherId))?.parent_agent_id).toBeNull()
+    })
+
+    it('refuses even a legitimate re-parent, and leaves the rest of the patch unwritten', async () => {
+      // The exclusion is not "reject bad values" — it is "this column is not a
+      // profile edit". A valid parent is refused too, and because validation
+      // happens before any write, the sibling field in the same patch must not
+      // land. Re-parenting goes through re-provisioning, like squad_id.
+      const parent = await createAgent(env, 'sq-a', { slug: 'overseer', name: 'Overseer' })
+      expect(parent.ok).toBe(true)
+      if (!parent.ok) return
+
+      expect(
+        await updateAgentProfile(env, agentId, {
+          name: 'Renamed By Smuggled Patch',
+          parent_agent_id: parent.value.id,
+        } as Record<string, unknown>),
+      ).toEqual({ ok: false, error: 'invalid_field' })
+
+      const after = await getAgentProfile(env, agentId)
+      expect(after?.parent_agent_id).toBeNull()
+      expect(after?.name).not.toBe('Renamed By Smuggled Patch')
+    })
+
+    it('still accepts a parent at CREATE time, where cycles are unreachable', async () => {
+      // createAgent keeps the column: it validates the parent row exists, and the
+      // new id is crypto.randomUUID() generated server-side, so a caller cannot
+      // name it. A fresh agent can be neither its own parent nor an ancestor of
+      // anything. The create path is not the hole and is not narrowed here.
+      const parent = await createAgent(env, 'sq-a', { slug: 'root-seat', name: 'Root' })
+      expect(parent.ok).toBe(true)
+      if (!parent.ok) return
+
+      const child = await createAgent(env, 'sq-a', {
+        slug: 'child-seat',
+        name: 'Child',
+        parent_agent_id: parent.value.id,
+      })
+      expect(child.ok).toBe(true)
+      if (!child.ok) return
+      expect(child.value.parent_agent_id).toBe(parent.value.id)
+    })
+  })
 })

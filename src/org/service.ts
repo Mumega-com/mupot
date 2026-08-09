@@ -730,6 +730,31 @@ export type UpdateAgentProfileResult =
 // excluded — setAgentStatus/deactivateAgent own that transition and carry their
 // own semantics. `id` and `squad_id` are excluded because moving an agent
 // between squads changes its capability scope and is not a profile edit.
+//
+// `parent_agent_id` is excluded for the same reason, and it is the sharper case.
+// It shipped on this list and reached the SET clause through the generic text
+// path — trimmed, bound, written — with none of createAgent's validation. That
+// made the governed repair path the ONLY way to write the corruption it exists
+// to prevent:
+//
+//   phantom  update_agent(a, {parent_agent_id: 'not-an-agent'})
+//   self     update_agent(a, {parent_agent_id: a})
+//   cycle    update_agent(a, {parent_agent_id: b}) + update_agent(b, {parent_agent_id: a})
+//
+// The column is a soft self-reference with no foreign key (see migration), so
+// D1 catches none of it, and a cycle makes every consumer that walks the
+// placement tree loop forever.
+//
+// createAgent cannot produce any of the three: it validates that the parent row
+// exists, and the new agent's id is crypto.randomUUID() generated server-side —
+// a caller cannot name it, so it can be neither its own parent nor an ancestor
+// of anything. With this column off the update list, no service path can create
+// a cycle at all, which is why this is an exclusion and not a validator.
+//
+// Re-parenting remains possible by re-provisioning, exactly as with squad_id. If
+// a governed in-place re-parent is wanted later, it needs its own entry point
+// with an existence check, a self check, and a bounded ancestor walk — not a
+// line on this list.
 const UPDATABLE_TEXT_COLUMNS = [
   'slug',
   'name',
@@ -738,7 +763,6 @@ const UPDATABLE_TEXT_COLUMNS = [
   'model_fallback',
   'purpose',
   'owner',
-  'parent_agent_id',
   'qnft_ref',
 ] as const
 
