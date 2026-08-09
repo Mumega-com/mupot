@@ -11,8 +11,24 @@ const KNOWN_PUBLIC_TEST_KEY_SHA256 = new Set([
 
 const rules = [
   {
+    // The left boundary is load-bearing. Without it, `sk-` matches INSIDE ordinary
+    // kebab-case words — "gated-terminal-task-with-tier2-provenance" tripped this rule
+    // and failed a PR that contained no secret at all: the match starts at the "sk-"
+    // buried in "ta·sk-", and the 24 remaining chars clear the {20,} floor. Same for
+    // risk-, disk-, desk-, flask-, subtask-.
+    //
+    // Do NOT write that example with a plain delimiter between "ta" and "sk-". Any
+    // character outside [A-Za-z0-9_-] satisfies the lookbehind, so an illustrative
+    // "ta|sk-…" in a comment becomes a REAL match and fails this repo's own scan.
+    // The interpunct above is deliberate. This bit us once; see PR #851.
+    //
+    // A secrets guard that cries wolf on ordinary identifiers is worse than a missing
+    // one: reviewers learn to wave through a red no-secrets check, and that is exactly
+    // how a real key gets merged. Boundary keeps every genuine prefix position — start
+    // of file, after a quote, space, colon, comma, equals, or slash — while excluding
+    // the case where `sk-` is the tail of a longer word.
     label: 'OpenAI API key',
-    pattern: /sk-[A-Za-z0-9_-]{20,}/,
+    pattern: /(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{20,}/,
   },
   {
     label: 'GitHub personal access token',

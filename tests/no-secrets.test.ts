@@ -53,6 +53,49 @@ describe('no-secrets scanner', () => {
     expect(result.stderr).not.toContain(token)
   })
 
+  it('does not match sk- inside ordinary kebab-case words', () => {
+    // Regression: `/sk-[A-Za-z0-9_-]{20,}/` with no left boundary matched the "sk-"
+    // buried inside "gated-terminal-task-with-tier2-provenance" and failed PR #850,
+    // which held no secret. Every string here embeds sk- mid-word with 20+ trailing
+    // chars. Note: do not spell that example with a delimiter before "sk-" — it would
+    // satisfy the new lookbehind and become a real finding in this very file.
+    const root = createRepo({
+      'contract.json': JSON.stringify({
+        trigger: 'gated-terminal-task-with-tier2-provenance',
+        retry: 'low-risk-retry-policy-for-terminal-states',
+        cache: 'on-disk-cache-invalidation-strategy-v2',
+      }),
+      'notes.md': 'subtask-ordering-and-dependency-resolution\nflask-style-routing-adapter-shim',
+    })
+
+    const result = runScanner(root)
+
+    expect(result.status).toBe(0)
+    expect(result.stderr).not.toContain('OpenAI API key')
+  })
+
+  it('still detects a real sk- key at every legitimate prefix position', () => {
+    // The boundary must not weaken detection. Each line puts the key after a
+    // different delimiter — quote, space, colon, equals, comma, slash, line start.
+    const key = `sk-${'C'.repeat(24)}`
+    const root = createRepo({
+      'a.json': `{"api_key": "${key}"}`,
+      'b.sh': `export OPENAI_API_KEY=${key}`,
+      'c.yml': `key: ${key}`,
+      'd.md': `${key}`,
+      'e.ts': `const keys = [${key}, other]`,
+      'f.txt': `https://example.com/${key}`,
+    })
+
+    const result = runScanner(root)
+
+    expect(result.status).toBe(1)
+    for (const file of ['a.json', 'b.sh', 'c.yml', 'd.md', 'e.ts', 'f.txt']) {
+      expect(result.stderr).toContain(`${file}:1: OpenAI API key`)
+    }
+    expect(result.stderr).not.toContain(key)
+  })
+
   it('detects GitHub tokens and private-key envelopes', () => {
     const githubToken = `ghp_${'B'.repeat(24)}`
     const privateKey = ['-----BEGIN RSA', 'PRIVATE KEY-----'].join(' ')
