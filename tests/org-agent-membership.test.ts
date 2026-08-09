@@ -155,10 +155,9 @@ describe('POST /agents/:id/memberships canonical delegation', () => {
     ).get(AGENT_ID, TARGET_SQUAD_ID)).toEqual({ count: 0 })
   })
 
-  it('refuses home escalation and an unminted identity without partial writes', async () => {
+  it('allows home escalation and refuses an unminted identity without partial writes', async () => {
     const home = await orgApp.fetch(request(HOME_SQUAD_ID, 'lead'), env)
-    expect(home.status).toBe(409)
-    await expect(home.json()).resolves.toEqual({ error: 'home_capability_ceiling' })
+    expect(home.status).toBe(200)
 
     harness.sqlite.exec(`
       DELETE FROM capabilities WHERE member_id = '${MEMBER_ID}';

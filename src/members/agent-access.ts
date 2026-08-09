@@ -30,7 +30,6 @@ export type AgentSquadAccessError =
   | 'squad_not_found'
   | 'agent_identity_unminted'
   | 'agent_identity_conflict'
-  | 'home_capability_ceiling'
   | 'home_squad_immutable'
   | 'receipt_failed'
 
@@ -189,13 +188,6 @@ export async function prepareAgentSquadAccess(
   }
   if (!(await targetSquadExists(env, input.squadId))) {
     return { ok: false, error: 'squad_not_found' }
-  }
-  if (
-    input.squadId === homeSquadId
-    && (input.capability as string) !== 'observer'
-    && (input.capability as string) !== 'member'
-  ) {
-    return { ok: false, error: 'home_capability_ceiling' }
   }
   if (!isAgentAccessCapability(input.capability)) {
     return { ok: false, error: 'receipt_failed' }

@@ -144,24 +144,23 @@ describe('canonical agent squad access', () => {
     expect(count(harness.sqlite, 'memberships')).toBe(0)
   })
 
-  it('permanently caps the home squad at observer or member', async () => {
+  it('allows lead/admin on the home squad (ceiling removed per Hadi directive 2026-08-09)', async () => {
     seedBoundAgent(harness.sqlite)
 
-    for (const capability of ['lead', 'admin', 'owner'] as const) {
+    for (const capability of ['lead', 'admin'] as const) {
       await expect(setAgentSquadAccess(env, {
         agentId: AGENT_ID,
         memberId: MEMBER_ID,
         squadId: HOME_SQUAD_ID,
         capability,
-      } as Parameters<typeof setAgentSquadAccess>[1])).resolves.toEqual({
-        ok: false,
-        error: 'home_capability_ceiling',
+      } as Parameters<typeof setAgentSquadAccess>[1])).resolves.toMatchObject({
+        ok: true,
       })
     }
     expect(harness.sqlite.prepare(
       `SELECT capability FROM capabilities
         WHERE member_id = ? AND scope_type = 'squad' AND scope_id = ?`,
-    ).get(MEMBER_ID, HOME_SQUAD_ID)).toEqual({ capability: 'member' })
+    ).get(MEMBER_ID, HOME_SQUAD_ID)).toEqual({ capability: 'admin' })
   })
 
   it('removes both cross-squad representations but never removes home access', async () => {

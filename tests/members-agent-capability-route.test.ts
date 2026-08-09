@@ -139,16 +139,13 @@ describe('POST /members/:id/capabilities bound-agent delegation', () => {
     ).get(MEMBER_ID)).toEqual({ n: 0 })
   })
 
-  it('maps a bound member home escalation to the stable ceiling error', async () => {
+  it('allows a bound member home escalation to lead (ceiling removed per Hadi directive 2026-08-09)', async () => {
     const response = await membersApp.fetch(capabilityRequest({
       scope_type: 'squad',
       scope_id: HOME_SQUAD_ID,
       capability: 'lead',
     }), env)
-    expect(response.status).toBe(409)
-    await expect(response.json()).resolves.toEqual({
-      error: 'home_capability_ceiling',
-    })
+    expect(response.status).toBe(200)
   })
 
   it('refuses the unsupported owner rank for bound-agent squad access', async () => {
