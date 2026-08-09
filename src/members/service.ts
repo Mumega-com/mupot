@@ -372,41 +372,11 @@ export interface CapabilityGrantUpsertOutcome {
   result: 'created' | 'updated' | 'unchanged'
 }
 
-async function assertAgentHomeCapabilityCeiling(
-  env: Env,
-  grant: CapabilityGrant,
-): Promise<void> {
-  if (grant.capability === 'observer' || grant.capability === 'member') return
-
-  const conflict = await env.DB.prepare(
-    `SELECT 1 AS conflict
-       FROM agent_member_bindings b
-       JOIN agents a ON a.id = b.agent_id
-       JOIN squads s ON s.id = a.squad_id
-      WHERE b.tenant = ?1
-        AND b.member_id = ?2
-        AND (
-          ?3 = 'org'
-          OR (?3 = 'department' AND ?4 = s.department_id)
-          OR (?3 = 'squad' AND ?4 = a.squad_id)
-        )
-      LIMIT 1`,
-  ).bind(
-    env.TENANT_SLUG,
-    grant.member_id,
-    grant.scope_type,
-    grant.scope_id,
-  ).first<{ conflict: 1 }>()
-  if (conflict) throw new Error('home_capability_ceiling')
-}
-
 /** Replace a member's grant on one scope and report the transaction's actual prior state. */
 export async function upsertCapabilityGrant(
   env: Env,
   grant: CapabilityGrant,
 ): Promise<CapabilityGrantUpsertOutcome> {
-  await assertAgentHomeCapabilityCeiling(env, grant)
-
   const deleteStmt = grant.scope_id === null
     ? env.DB.prepare(
         `DELETE FROM capabilities

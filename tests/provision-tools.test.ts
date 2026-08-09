@@ -806,10 +806,8 @@ describe('grant_agent_capability', () => {
       { agent: AGENT.slug, squad: SQUAD.id, capability: 'lead' },
       makeEnv({}, captured),
     )
-    expect(res.status).toBe(409)
-    expect(((await res.json()) as { error: { message: string } }).error.message)
-      .toBe('home_capability_ceiling')
-    expect(captured).toEqual([])
+    expect(res.status).toBe(200)
+    expect(captured.length).toBeGreaterThan(0)
   })
 
   it('requires admin on the target squad rather than the agent home squad', async () => {

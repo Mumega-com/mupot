@@ -377,71 +377,75 @@ describe('0071 agent connection contract migration', () => {
     }
   })
 
-  it('enforces the home capability ceiling on every insert and update path', () => {
+  it('allows home-squad high capability after the ceiling triggers are dropped (0087)', () => {
     const h = createBeforeTargetHarness()
     try {
       applyTarget(h.sqlite)
+      // Migration 0087 drops the ceiling triggers — apply it so this test runs
+      // against the post-drop schema.
+      h.sqlite.exec(readFileSync(join(DIR, '0087_drop_home_capability_ceiling.sql'), 'utf8'))
       h.sqlite.exec(`
         INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
         VALUES ('tenant-a', 'agent-1', 'member-1', '${NOW}');
       `)
 
-      expect(() => h.sqlite.exec(`
-        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
-        VALUES ('grant-home-high', 'member-1', 'squad', 'squad-home', 'lead');
-      `)).toThrow(/home_capability_ceiling/)
-      expect(() => h.sqlite.exec(`
-        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
-        VALUES ('grant-org-high', 'member-1', 'org', NULL, 'admin');
-      `)).toThrow(/home_capability_ceiling/)
-      expect(() => h.sqlite.exec(`
-        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
-        VALUES ('grant-dept-high', 'member-1', 'department', 'dept-1', 'lead');
-      `)).toThrow(/home_capability_ceiling/)
-
       h.sqlite.exec(`
         INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
         VALUES
-          ('grant-home', 'member-1', 'squad', 'squad-home', 'member'),
-          ('grant-org-low', 'member-1', 'org', NULL, 'member'),
-          ('grant-cross', 'member-1', 'squad', 'squad-other', 'admin');
+          ('grant-home-high', 'member-1', 'squad', 'squad-home', 'lead'),
+          ('grant-org-high', 'member-1', 'org', NULL, 'admin'),
+          ('grant-dept-high', 'member-1', 'department', 'dept-1', 'lead');
       `)
-      expect(() => h.sqlite.exec(`
+
+      h.sqlite.exec(`
+        UPDATE capabilities
+           SET capability = 'member'
+         WHERE member_id = 'member-1' AND scope_type = 'squad' AND scope_id = 'squad-home';
+        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES ('grant-org-low', 'member-1', 'org', NULL, 'member'),
+               ('grant-cross', 'member-1', 'squad', 'squad-other', 'admin');
+      `)
+      h.sqlite.exec(`
         UPDATE capabilities
            SET capability = 'admin'
-         WHERE id = 'grant-home';
-      `)).toThrow(/home_capability_ceiling/)
+         WHERE member_id = 'member-1' AND scope_type = 'squad' AND scope_id = 'squad-home';
+      `)
       expect(h.sqlite.prepare(
         "SELECT capability FROM capabilities WHERE id = 'grant-cross'",
       ).get()).toEqual({ capability: 'admin' })
-      expect(() => h.sqlite.exec(`
+      h.sqlite.exec(`
         UPDATE capabilities
            SET capability = 'owner'
          WHERE id = 'grant-org-low';
-      `)).toThrow(/home_capability_ceiling/)
+      `)
 
-      expect(() => h.sqlite.exec(`
+      h.sqlite.exec(`
         UPDATE agents SET squad_id = 'squad-other' WHERE id = 'agent-1';
-      `)).toThrow(/home_capability_ceiling/)
+      `)
 
       h.sqlite.exec(`
         INSERT INTO departments (id, slug, name) VALUES ('dept-2', 'other-dept', 'Other Dept');
         INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
         VALUES ('grant-future-dept', 'member-1', 'department', 'dept-2', 'admin');
       `)
-      expect(() => h.sqlite.exec(`
+      h.sqlite.exec(`
         UPDATE squads SET department_id = 'dept-2' WHERE id = 'squad-home';
-      `)).toThrow(/home_capability_ceiling/)
+      `)
 
       addSecondAgentAndMember(h.sqlite)
       h.sqlite.exec(`
         INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
         VALUES ('grant-second-high', 'member-2', 'org', NULL, 'admin');
       `)
-      expect(() => h.sqlite.exec(`
+      h.sqlite.exec(`
         INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
         VALUES ('tenant-a', 'agent-2', 'member-2', '${NOW}');
-      `)).toThrow(/home_capability_ceiling/)
+      `)
+      // grant-home-high was escalated to admin by the later UPDATE — the
+      // ceiling removal means that escalation is legal.
+      expect(h.sqlite.prepare(
+        "SELECT capability FROM capabilities WHERE id = 'grant-home-high'",
+      ).get()).toEqual({ capability: 'admin' })
     } finally {
       h.close()
     }
