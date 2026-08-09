@@ -1,7 +1,7 @@
 import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { beforeEach, describe, expect, it } from 'vitest'
-import { createAgent, getAgentProfile, updateAgentProfile } from '../src/org/service'
+import { createAgent, deleteAgent, getAgentProfile, updateAgentProfile } from '../src/org/service'
 import type { Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
@@ -164,6 +164,123 @@ describe('updateAgentProfile — registry drift repair', () => {
   it('returns not_found for an id that does not exist', async () => {
     const result = await updateAgentProfile(env, 'no-such-agent', { name: 'Ghost' })
     expect(result).toEqual({ ok: false, error: 'not_found' })
+  })
+
+  // The audit trail is the ONLY provenance a correction has: `agents` has no
+  // updated_at column (0049 rebuilt it without one, #846). #842 shipped with the
+  // audit riding on a bus event that was caught and swallowed on failure, so a
+  // correction could land with nothing recording that it happened or what it was
+  // before — an unrecorded mutation the design tells operators to trust (#857).
+  //
+  // These pin the trail to the transaction.
+  describe('audit trail is written atomically with the update', () => {
+    async function auditRows(agent: string) {
+      const res = await env.DB.prepare(
+        'SELECT seq, id, actor_id, actor_type, action, fields_changed, before_state, after_state FROM agent_audit WHERE agent_id = ? ORDER BY seq',
+      )
+        .bind(agent)
+        .all<{
+          seq: number
+          id: string
+          actor_id: string
+          actor_type: string
+          action: string
+          fields_changed: string
+          before_state: string
+          after_state: string
+        }>()
+      return res.results ?? []
+    }
+
+    it('records before and after for exactly the fields touched', async () => {
+      const result = await updateAgentProfile(
+        env,
+        agentId,
+        { model: 'claude-opus-5', role: 'gatekeeper' },
+        { id: 'member-42', type: 'user' },
+      )
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
+
+      const rows = await auditRows(agentId)
+      expect(rows).toHaveLength(1)
+      const row = rows[0]!
+      expect(row.id).toBe(result.auditId)
+      expect(row.actor_id).toBe('member-42')
+      expect(row.actor_type).toBe('user')
+      expect(row.action).toBe('update_agent')
+      expect(JSON.parse(row.fields_changed).sort()).toEqual(['model', 'role'])
+
+      const before = JSON.parse(row.before_state)
+      const after = JSON.parse(row.after_state)
+      expect(after.model).toBe('claude-opus-5')
+      expect(after.role).toBe('gatekeeper')
+      expect(before.model).not.toBe('claude-opus-5')
+      // Reversibility is the point: the untouched fields must also be captured,
+      // or the trail cannot reconstruct the row.
+      expect(before.slug).toBe('prime')
+      expect(after.slug).toBe('prime')
+    })
+
+    it('writes NO audit row when the update fails — one transaction, not two', async () => {
+      // This is the atomicity proof. slug_taken throws inside the batch, so the
+      // audit INSERT that already ran must roll back with it. A non-atomic
+      // implementation leaves an audit row describing a change that never landed.
+      const other = await createAgent(env, 'sq-a', { slug: 'occupied', name: 'Occupied' })
+      expect(other.ok).toBe(true)
+
+      const result = await updateAgentProfile(env, agentId, { slug: 'occupied' })
+      expect(result).toEqual({ ok: false, error: 'slug_taken' })
+
+      expect(await auditRows(agentId)).toHaveLength(0)
+      expect((await getAgentProfile(env, agentId))?.slug).toBe('prime')
+    })
+
+    it('writes NO audit row for an agent that does not exist', async () => {
+      const result = await updateAgentProfile(env, 'no-such-agent', { name: 'Ghost' })
+      expect(result).toEqual({ ok: false, error: 'not_found' })
+
+      const all = await env.DB.prepare('SELECT COUNT(*) AS n FROM agent_audit').first<{ n: number }>()
+      expect(all?.n).toBe(0)
+    })
+
+    it('attributes a call with no explicit actor to the system', async () => {
+      const result = await updateAgentProfile(env, agentId, { purpose: 'reconciled by job' })
+      expect(result.ok).toBe(true)
+
+      const rows = await auditRows(agentId)
+      expect(rows).toHaveLength(1)
+      expect(rows[0]!.actor_id).toBe('system')
+      expect(rows[0]!.actor_type).toBe('system')
+    })
+
+    it('survives deletion of the agent it describes', async () => {
+      // The trail used to be REFERENCES agents(id) ON DELETE CASCADE, so retiring
+      // a seat erased every record of what it had been and who changed it —
+      // the audit disappearing at the one moment someone would come looking.
+      // Orphan rows are the price of the record outliving its subject.
+      await updateAgentProfile(env, agentId, { model: 'was-this-before-retirement' })
+      expect(await auditRows(agentId)).toHaveLength(1)
+
+      const deleted = await deleteAgent(env, agentId)
+      expect(deleted).toEqual({ ok: true })
+      expect(await getAgentProfile(env, agentId)).toBeNull()
+
+      const survivors = await auditRows(agentId)
+      expect(survivors).toHaveLength(1)
+      expect(JSON.parse(survivors[0]!.after_state).model).toBe('was-this-before-retirement')
+    })
+
+    it('appends one row per correction rather than overwriting', async () => {
+      await updateAgentProfile(env, agentId, { model: 'first' })
+      await updateAgentProfile(env, agentId, { model: 'second' })
+
+      const rows = await auditRows(agentId)
+      expect(rows).toHaveLength(2)
+      expect(JSON.parse(rows[0]!.after_state).model).toBe('first')
+      expect(JSON.parse(rows[1]!.before_state).model).toBe('first')
+      expect(JSON.parse(rows[1]!.after_state).model).toBe('second')
+    })
   })
 
   // parent_agent_id shipped on the updatable allow-list and reached the SET clause

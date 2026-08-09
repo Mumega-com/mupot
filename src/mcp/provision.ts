@@ -958,6 +958,41 @@ const toolRegisterAgentKey: ToolSpec = {
   },
 }
 
+/**
+ * Read the before/after diff back out of the committed audit row.
+ *
+ * The audit is the authoritative record — it is written in the same transaction
+ * as the update. Deriving the event payload from it (instead of from a separate
+ * pre-read) means the notification and the trail always tell the same story.
+ *
+ * Returns an empty diff if the row cannot be read or parsed. That is not a
+ * silent swallow: the audit itself is already committed and durable, so this
+ * only degrades the advisory event payload, never the record.
+ */
+async function readAuditDiff(
+  env: Env,
+  auditId: string,
+  fields: string[],
+): Promise<Record<string, { from: unknown; to: unknown }>> {
+  const row = await env.DB.prepare('SELECT before_state, after_state FROM agent_audit WHERE id = ?')
+    .bind(auditId)
+    .first<{ before_state: string; after_state: string }>()
+  if (!row) return {}
+
+  let before: Record<string, unknown>
+  let after: Record<string, unknown>
+  try {
+    before = JSON.parse(row.before_state) as Record<string, unknown>
+    after = JSON.parse(row.after_state) as Record<string, unknown>
+  } catch {
+    return {}
+  }
+
+  const changed: Record<string, { from: unknown; to: unknown }> = {}
+  for (const key of fields) changed[key] = { from: before[key] ?? null, to: after[key] ?? null }
+  return changed
+}
+
 // ── update_agent ──────────────────────────────────────────────────────────────
 // Correct a live agent's profile row. Added because the registry drifts and had
 // no repair path: before this, the only writes to `agents` were status and
@@ -1033,23 +1068,25 @@ const toolUpdateAgent: ToolSpec = {
       return fail(400, 'invalid_args', 'at least one field to update is required')
     }
 
-    const before = await getAgentProfile(env, agent.id)
-    const result = await updateAgentProfile(env, agent.id, patch)
+    const result = await updateAgentProfile(env, agent.id, patch, {
+      id: auth.memberId as string,
+      type: 'user',
+    })
     if (!result.ok) {
       if (result.error === 'slug_taken') return fail(409, 'slug_taken', { slug: str(args.slug) })
       if (result.error === 'not_found') return fail(404, 'agent_not_found', { agent: agentRef })
       return fail(400, 'invalid_args', { reason: result.error })
     }
 
-    // Audit carries before/after for exactly the fields touched — a correction
-    // must be reversible from the trail alone, since the row keeps no history.
-    const changed: Record<string, { from: unknown; to: unknown }> = {}
-    for (const key of Object.keys(patch) as (keyof AgentProfilePatch)[]) {
-      changed[key] = {
-        from: before ? (before as unknown as Record<string, unknown>)[key] : null,
-        to: (result.value as unknown as Record<string, unknown>)[key],
-      }
-    }
+    // The durable record is agent_audit, written inside the same transaction as
+    // the update (see updateAgentProfile). `changed` below is derived FROM that
+    // committed row rather than from a separate pre-read, so the event and the
+    // audit cannot disagree — and a concurrent write cannot make either of them
+    // report a diff that never happened.
+    const changed = await readAuditDiff(env, result.auditId, Object.keys(patch))
+
+    // Best-effort by design, and now safe to be: a bus failure loses a
+    // notification, not the audit trail. It used to lose both.
     await emitProvisioned(env, auth.memberId as string, 'agent_updated', agent.id, {
       agent_id: agent.id,
       squad_id: agent.squad_id,
@@ -1057,7 +1094,7 @@ const toolUpdateAgent: ToolSpec = {
       reason: str(args.reason) || undefined,
     })
 
-    return done({ agent: result.value, changed })
+    return done({ agent: result.value, changed, audit_id: result.auditId })
   },
 }
 
