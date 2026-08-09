@@ -1,9 +1,8 @@
-import { readFileSync, readdirSync } from 'node:fs'
-import { join } from 'node:path'
 import { beforeEach, describe, expect, it } from 'vitest'
 import { createAgent, updateAgentProfile } from '../src/org/service'
 import type { Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 
 // 0086_agent_audit_trail — append-only triggers (agent_audit_no_update /
 // agent_audit_no_delete). Matches task_verdicts_no_update/_no_delete
@@ -22,14 +21,6 @@ import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 // transition (OLD.after_state = '' -> a real value, nothing else different)
 // and blocks everything else — same narrow-allow-list shape as
 // task_verdicts_no_update.
-
-const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
-
-function allMigrations(): string[] {
-  return readdirSync(MIGRATIONS_DIR)
-    .filter((name) => name.endsWith('.sql'))
-    .sort()
-}
 
 function seed(sqlite: SqliteD1Harness['sqlite']): void {
   sqlite.exec(`
@@ -64,9 +55,7 @@ describe('0086_agent_audit_trail — append-only triggers', () => {
 
   beforeEach(() => {
     harness = createSqliteD1()
-    for (const file of allMigrations()) {
-      harness.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
-    }
+    applyAllMigrations(harness.sqlite)
     seed(harness.sqlite)
   })
 
