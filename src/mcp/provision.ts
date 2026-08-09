@@ -906,6 +906,7 @@ const toolRegisterAgentKey: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
+    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
     const agentRef = str(args.agent)
     if (!agentRef) return fail(400, 'invalid_args', 'agent required')
 
@@ -1032,6 +1033,7 @@ const toolUpdateAgent: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
+    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
     const agentRef = str(args.agent)
     if (!agentRef) return fail(400, 'invalid_args', 'agent required')
 
