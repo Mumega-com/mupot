@@ -723,8 +723,31 @@ export async function setAgentStatus(
 }
 
 export type UpdateAgentProfileResult =
-  | { ok: true; value: AgentProfileSummary }
+  | { ok: true; value: AgentProfileSummary; auditId: string }
   | { ok: false; error: 'not_found' | 'slug_taken' | 'no_fields' | 'invalid_field' }
+
+/** Who made a correction. `actor_type` is constrained by 0086's CHECK; a member
+ *  acting through the MCP tool is a 'user'. */
+export interface AuditActor {
+  id: string
+  type: 'agent' | 'user' | 'system'
+}
+
+// A call that supplies no actor is a system-initiated correction — migrations,
+// reconciliation jobs, tests. The MCP tool always passes the real member.
+const SYSTEM_ACTOR: AuditActor = { id: 'system', type: 'system' }
+
+// The audited snapshot, built in SQL so it can be taken inside the transaction.
+// Deliberately excludes `id` (the audit row already carries agent_id) and
+// created_at (immutable). Keep in sync with the updatable columns above: a
+// field that can be corrected but is not snapshotted is a change no one can
+// reverse from the trail.
+const AGENT_SNAPSHOT_JSON = `json_object(
+  'squad_id', squad_id, 'slug', slug, 'name', name, 'role', role, 'status', status,
+  'model', model, 'model_fallback', model_fallback, 'purpose', purpose, 'owner', owner,
+  'capabilities', capabilities, 'skills', skills, 'parent_agent_id', parent_agent_id,
+  'qnft_ref', qnft_ref
+)`
 
 // Fields an admin may correct on an existing agent. `status` is deliberately
 // excluded — setAgentStatus/deactivateAgent own that transition and carry their
@@ -792,6 +815,7 @@ export async function updateAgentProfile(
   env: Env,
   agentId: string,
   patch: AgentProfilePatch,
+  actor: AuditActor = SYSTEM_ACTOR,
 ): Promise<UpdateAgentProfileResult> {
   const sets: string[] = []
   const binds: (string | null)[] = []
@@ -837,22 +861,59 @@ export async function updateAgentProfile(
 
   if (!sets.length) return { ok: false, error: 'no_fields' }
 
+  const auditId = crypto.randomUUID()
+  const fieldsChanged = JSON.stringify(Object.keys(patch).filter((k) => patch[k as UpdatableAgentField] !== undefined))
+
+  let changes = 0
   try {
     // No updated_at column on `agents` — 0049 rebuilt the table without one and
     // no later migration adds it. Provenance for a correction lives in the audit
-    // trail, not on the row.
-    const result = await env.DB.prepare(`UPDATE agents SET ${sets.join(', ')} WHERE id = ?`)
-      .bind(...binds, agentId)
-      .run()
-    if (!result.meta.changes) return { ok: false, error: 'not_found' }
+    // trail, not on the row, which is why that trail must be durable.
+    //
+    // All three statements run in ONE D1 batch, i.e. one transaction. This is
+    // load-bearing on both counts:
+    //
+    //   Durability — the audit row commits WITH the update or not at all. The
+    //   previous design wrote the row, then emitted a bus event that was caught
+    //   and swallowed on failure, so a correction could land with no record of
+    //   what changed or what it was before. On a table with no updated_at, that
+    //   is an unrecorded mutation the design tells operators to trust.
+    //
+    //   Accuracy — the before-image is captured in SQL, inside the transaction,
+    //   rather than by a separate SELECT beforehand. A concurrent write between
+    //   a client-side read and the UPDATE would otherwise make before_state a
+    //   fabrication: a diff that never happened.
+    //
+    // Same shape as 0046_flight_event_outbox ("Landing and outbox insertion
+    // share one D1 batch").
+    //
+    // Statement 1 uses INSERT..SELECT so a missing agent inserts no audit row;
+    // statement 2 then reports 0 changes and we return not_found with nothing
+    // written. Statement 3 backfills after_state from the committed row.
+    const batch = await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO agent_audit
+           (id, agent_id, actor_id, actor_type, action, fields_changed, before_state, after_state)
+         SELECT ?, id, ?, ?, 'update_agent', ?, ${AGENT_SNAPSHOT_JSON}, ''
+           FROM agents WHERE id = ?`,
+      ).bind(auditId, actor.id, actor.type, fieldsChanged, agentId),
+      env.DB.prepare(`UPDATE agents SET ${sets.join(', ')} WHERE id = ?`).bind(...binds, agentId),
+      env.DB.prepare(
+        `UPDATE agent_audit
+            SET after_state = (SELECT ${AGENT_SNAPSHOT_JSON} FROM agents WHERE id = ?)
+          WHERE id = ?`,
+      ).bind(agentId, auditId),
+    ])
+    changes = batch[1]?.meta.changes ?? 0
   } catch (err) {
     if (isUniqueViolation(err)) return { ok: false, error: 'slug_taken' }
     throw err
   }
+  if (!changes) return { ok: false, error: 'not_found' }
 
   const profile = await getAgentProfile(env, agentId)
   if (!profile) return { ok: false, error: 'not_found' }
-  return { ok: true, value: profile }
+  return { ok: true, value: profile, auditId }
 }
 
 export type DeleteAgentResult = { ok: true } | { ok: false; error: 'not_found' }
