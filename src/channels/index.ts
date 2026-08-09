@@ -494,12 +494,27 @@ async function potSend(
   return `Dispatched @${toAgent} via mupot inbox (id: ${res.id.slice(0, 8)})${directiveNotice}`
 }
 
+// This function DOES NOT DELIVER ANYTHING. It writes one [sos-bus] audit row to
+// agent_messages and returns. There is no SOS bridge, no outbound call, no relay.
+//
+// It used to say "relayed via Kasra until the SOS bridge lands". That was false in
+// the way that costs the most: it named a specific agent as the courier, so a human
+// reading it in Telegram concluded the message was in flight and stopped following
+// up. Kasra never received one. Every mention of the seats routed here since #789
+// vanished behind that sentence, and a green test asserted it (#845).
+//
+// The status string below is the ONLY signal the sender gets. It must state
+// non-delivery plainly enough that a human acts on it. Do not soften it, and do not
+// name a courier, until something in this function actually sends.
+//
+// Which seats belong on this path at all is a separate open question (#845-B):
+// asha/prime is pot-native with a working inbox, so routing her here is probably
+// wrong. That decision is deliberately NOT made here.
 async function sosBusSend(
   env: Env,
   target: string,
   body: string,
 ): Promise<string> {
-  // F1 Fix: Record audit row in agent_messages, but return honest status
   const id = crypto.randomUUID()
   const tenant = env.TENANT_SLUG ?? 'mumega'
   await env.DB.prepare(
@@ -507,7 +522,7 @@ async function sosBusSend(
      VALUES (?1, ?2, ?3, ?4, 'system', 'message', ?5, datetime('now'))`
   ).bind(id, tenant, target, 'central-command', `[sos-bus] ${body}`).run()
 
-  return `@${target} is SOS-native; relayed via Kasra until the SOS bridge lands (audit id: ${id.slice(0, 8)})`
+  return `@${target} is SOS-native and NOT REACHED: no SOS bridge exists, so this message was only recorded for audit (id: ${id.slice(0, 8)}). Nobody received it — deliver it another way.`
 }
 
 // ── postAgentActivity — the live agent-activity feed ──────────────────────────

@@ -109,22 +109,47 @@ describe('central-command ingress (mumega-com#722)', () => {
     expect(res).toContain('Dispatched @mubot')
   })
 
-  it('B1: returns honest SOS-native status for @river even when river is active in D1 agents', async () => {
+  // These two tests pin the SOS-native path to what it ACTUALLY does: write one
+  // [sos-bus] audit row and reach nobody. They must never assert that anything was
+  // relayed, delivered, or handed to a named agent — that is the #845 defect, where a
+  // green test asserted "relayed via Kasra" while Kasra received nothing and every
+  // Telegram mention of these seats since #789 silently vanished.
+  //
+  // Whether a given seat BELONGS on this path is a separate question (#845-B) and is
+  // deliberately not asserted here. What is asserted is that while a seat is routed
+  // here, the caller is told the truth.
+
+  it('B1: @river routes to the SOS-native path and is told plainly it was NOT reached', async () => {
     const { runInbound } = await import('../src/channels/index')
     const res = await runInbound(env, 'telegram', '-5317747241', '765204057', '@river review spec')
-    expect(res).toContain('@river is SOS-native; relayed via Kasra')
+
+    expect(res).toContain('@river is SOS-native and NOT REACHED')
+    expect(res).toContain('Nobody received it')
+    // The old string named a courier who never got anything. Never reintroduce it.
+    expect(res).not.toContain('relayed via Kasra')
 
     const msg = await env.DB.prepare(
       `SELECT * FROM agent_messages WHERE to_agent = 'river'`
-    ).first()
+    ).first<{ body: string }>()
     expect(msg?.body).toContain('[sos-bus]')
+    // The audit row is the ONLY effect. It is not evidence of delivery.
+    expect(msg?.body).toContain('review spec')
   })
 
-  // NOTE: @prime routing is deliberately NOT asserted here. dispatchMention routes
-  // prime/asha to sosBusSend, which returns "is SOS-native; relayed via Kasra" — but
-  // asha is mupot-native with a working inbox, and sosBusSend performs no relay at all
-  // (it writes one [sos-bus] audit row and returns the string). Pinning either side of
-  // that would encode a falsehood. Classification + honest status tracked separately.
+  it('B1b: @prime takes the same path — audit row written, delivery explicitly denied', async () => {
+    const { runInbound } = await import('../src/channels/index')
+    const res = await runInbound(env, 'telegram', '-5317747241', '765204057', '@prime status report')
+
+    expect(res).toContain('@prime is SOS-native and NOT REACHED')
+    expect(res).not.toContain('relayed via Kasra')
+    expect(res).not.toContain('Dispatched @prime')
+
+    const msg = await env.DB.prepare(
+      `SELECT * FROM agent_messages WHERE to_agent = 'prime'`
+    ).first<{ body: string }>()
+    expect(msg?.body).toContain('[sos-bus]')
+    expect(msg?.body).toContain('status report')
+  })
 
   it('B2: refuses mentions exceeding MAX_BODY_CHARS via sendAgentMessage primitive', async () => {
     const { runInbound } = await import('../src/channels/index')
