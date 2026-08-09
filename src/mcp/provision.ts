@@ -973,7 +973,7 @@ const toolUpdateAgent: ToolSpec = {
   scope: "agent's squad",
   min: 'admin',
   args:
-    '{ agent: string (id|slug), slug?, name?, role?, model?, model_fallback?, purpose?, owner?, parent_agent_id?, qnft_ref?, capabilities?: string[], skills?: string[], reason?: string }',
+    '{ agent: string (id|slug), slug?, name?, role?, model?, model_fallback?, purpose?, owner?, qnft_ref?, capabilities?: string[], skills?: string[], reason?: string }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -985,7 +985,9 @@ const toolUpdateAgent: ToolSpec = {
       model_fallback: STRING_SCHEMA,
       purpose: STRING_SCHEMA,
       owner: STRING_SCHEMA,
-      parent_agent_id: STRING_SCHEMA,
+      // parent_agent_id is NOT patchable here. additionalProperties:false makes a
+      // caller that still sends it fail loudly at the schema instead of silently
+      // dropping the field. See UPDATABLE_TEXT_COLUMNS in src/org/service.ts.
       qnft_ref: STRING_SCHEMA,
       capabilities: { type: 'array', items: STRING_SCHEMA },
       skills: { type: 'array', items: STRING_SCHEMA },
@@ -1018,7 +1020,6 @@ const toolUpdateAgent: ToolSpec = {
       'model_fallback',
       'purpose',
       'owner',
-      'parent_agent_id',
       'qnft_ref',
       'capabilities',
       'skills',
