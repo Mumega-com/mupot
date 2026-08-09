@@ -36,7 +36,8 @@ import type {
 import { resolveCapabilities, hasCapability } from '../auth/capability'
 import { createBus } from '../bus'
 import { getAdapter } from './registry'
-import { sendAgentMessage } from '../agents/messages'
+import { sendToRef } from '../agents/messages'
+import { resolveAgentRef } from '../org/resolve'
 import { createTask } from '../tasks/service'
 
 type AppEnv = { Bindings: Env }
@@ -404,7 +405,7 @@ export async function runInbound(
   // untrusted tag unless the sender is directive-capable.
   if (intent.kind === 'mention') {
     const tag = isDirective ? '' : '[UNTRUSTED-INGRESS] '
-    return dispatchMention(env, squad, intent.target, `${tag}${text}`, identity.memberId, isDirective)
+    return dispatchMention(env, squad, intent.target, `${tag}${text}`, identity.memberId, grants, isDirective)
   }
 
   // Non-directive senders never reach directive-capable actions (wake/task/steer).
@@ -427,6 +428,16 @@ export async function runInbound(
   }
 }
 
+// BLOCK-1 (adversarial review, mumega-com#722 addressing-fix follow-up): a mention
+// target that LOOKS like an agents.id must never reach resolveAgentRef.
+// resolveAgentRef (src/org/resolve.ts) tries the id path FIRST, and — unlike the
+// slug path, which excludes 'inactive' rows (see its docstring on the #705/#702
+// tombstone-as-memory-partition finding) — the id path is deliberately
+// status-unfiltered, so it can address a deactivated agent. A human never
+// legitimately @mentions an agent by its raw uuid; the mention grammar is for
+// slugs. Reject the shape before it ever reaches a resolver.
+const AGENT_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
 // ── Central-command mention helper ──────────────────────────────────────────
 async function dispatchMention(
   env: Env,
@@ -434,64 +445,132 @@ async function dispatchMention(
   target: string,
   body: string,
   memberId: string,
+  grants: CapabilityGrant[],
   isDirective: boolean,
 ): Promise<string> {
-  // F3: Rate wall uses fixed ISO UTC-hour buckets (v1 decision).
-  const bucket = new Date().toISOString().slice(0, 13) + ':00:00Z'
-  const tenant = env.TENANT_SLUG ?? 'mumega'
-  const inc = await env.DB.prepare(
-    `INSERT INTO channel_mention_budget (tenant, agent_slug, hour_bucket, count)
-     VALUES (?1, ?2, ?3, 1)
-     ON CONFLICT(tenant, agent_slug, hour_bucket)
-     DO UPDATE SET count = count + 1
-     RETURNING count`,
-  ).bind(tenant, target, bucket).first<{ count: number }>()
-
-  if (inc && Number(inc.count) > 10) {
-    return `prime rate-limited: @${target} has hit the 10/hour mention wall.`
+  if (AGENT_ID_RE.test(target)) {
+    return `no such active agent: @${target}`
   }
 
-  // B1 Fix: Check SOS-native agents BEFORE DB lookup so @river, @asha, @kasra, @athena, @loom never get trapped in potSend
-  if (target === 'river' || target === 'dara' || target === 'asha' || target === 'prime' || target === 'kasra' || target === 'athena' || target === 'loom') {
+  // B1 Fix: Check SOS-native agents BEFORE DB lookup so @river / @dara never get
+  // trapped in potSend.
+  //
+  // SCOPE NOTE (Athena-approved revert, flight-20260809-mupot-deploy-unblock):
+  // prod (95e3721) never had the @asha/@prime/@kasra/@athena/@loom widening from
+  // c2c71df — that widening never shipped, so this fence matches live behavior.
+  // Whether any of those five seats SHOULD be reachable via Telegram mention is a
+  // reachability policy call (#845-B) for Hadi/Loom, not this PR's call.
+  //
+  // Fenced seats do NOT touch the rate wall below: sosBusSend never delivers
+  // (mupot#845 — it writes an audit row and returns), so charging a delivery
+  // budget against a message that was never delivered would be nonsensical, and
+  // there is no resolved recipient (river/dara are not rows in `agents`) to key a
+  // per-recipient bucket on anyway.
+  if (target === 'river' || target === 'dara') {
     return sosBusSend(env, target, body)
   }
 
-  // F2 Fix: Query agents table dynamically for pot-native active agents
-  const activeAgent = await env.DB.prepare(
-    `SELECT id, slug, status FROM agents WHERE slug = ?1 AND status IN ('active', 'paused')`
-  ).bind(target).first<{ id: string; slug: string }>()
+  // Loom's binding ruling (flight-20260809-mupot-deploy-unblock, repairing PR
+  // #865's incomplete DoS fix): the ORIGINAL wall this replaced was keyed
+  // (tenant, agent_slug, hour_bucket) — global per recipient SLUG, charged before
+  // resolution, with NO sender dimension. #865 added a second, narrower wall
+  // (tenant, from_member, agent_id, hour_bucket) IN ADDITION to that one, not
+  // instead of it. An additive, narrower constraint cannot lift a lockout the
+  // wider one already imposed: sender A spending 10 mentions on @X still trips
+  // the global slug wall for sender B's first mention to @X. The DoS was never
+  // fixed.
+  //
+  // The fix is to key the ONE enforced wall on (tenant, from_member,
+  // resolved_agent_id, hour_bucket) — per SENDER, per RESOLVED RECIPIENT — and
+  // delete the global per-slug wall outright rather than replace it with some
+  // other aggregate ceiling; a global-aggregate cap is a separate authorization
+  // decision this fix does not make (do not reintroduce one here).
+  //
+  // Resolution must happen BEFORE the charge — the recipient the budget protects
+  // has to be real. sendToRef resolves the ref again for the actual send;
+  // duplicating the read is acceptable, both are cheap indexed lookups. If
+  // resolution fails here, there is no real recipient to protect a budget for —
+  // fall through to potSend and let sendToRef's own resolution produce the
+  // honest, authz-shaped refusal (send_target_not_visible / ambiguous), same as
+  // before this fix.
+  //
+  // Directive senders do NOT bypass this wall. Deliberate, not an oversight: a
+  // self-inflicted cap still protects against a compromised or looping client,
+  // and nothing in this fix's scope asked for an owner exemption.
+  const bucket = new Date().toISOString().slice(0, 13) + ':00:00Z'
+  const tenant = env.TENANT_SLUG ?? 'mumega'
+  const resolved = await resolveAgentRef(env, target)
+  if (resolved.ok) {
+    const perRecipientInc = await env.DB.prepare(
+      `INSERT INTO channel_mention_budget_v2 (tenant, from_member, agent_id, hour_bucket, count)
+       VALUES (?1, ?2, ?3, ?4, 1)
+       ON CONFLICT(tenant, from_member, agent_id, hour_bucket)
+       DO UPDATE SET count = count + 1
+       RETURNING count`,
+    ).bind(tenant, memberId, resolved.value.id, bucket).first<{ count: number }>()
 
-  if (activeAgent) {
-    return potSend(env, target, body, memberId, isDirective)
+    if (perRecipientInc && Number(perRecipientInc.count) > 10) {
+      return `rate-limited: you've hit the 10/hour mention wall for @${target}.`
+    }
   }
-  return `no such active agent: @${target}`
+
+  return potSend(env, target, body, memberId, grants, isDirective)
 }
 
+// BLOCK-2 authz (adversarial review, mumega-com#722 addressing-fix follow-up):
+// sendAgentMessage's SendAuthzDecision has a `{ system: true, reason }` bypass —
+// compile-time forcing function only, no runtime effect (Gate 1 visibility lives
+// in sendToRef, not there). sendToRef has NO such bypass; its only way to skip the
+// squad-visibility check (canOnSquad on the SENDER's own grants, #392) is
+// `isAdmin: true`, and that check is exactly the thing Gate 1 exists to enforce —
+// it must not be defeated here just to get the types to line up.
+//
+// The correct value is `{ isAdmin, grants }` derived from the INGRESS MEMBER's own
+// real capability grants (identity.memberId, resolved once in runInbound and
+// threaded through). isAdmin is computed the SAME way every other sendToRef caller
+// computes it (mcp/index.ts `send`, agents/inbox-routes.ts): does this member hold
+// org:admin. No new privilege level is invented for Telegram ingress.
+//
+// This is a NARROWING versus today, stated plainly: the pre-fix F2 lookup
+// (deleted, BLOCK-3) was tenant-wide with NO capability check at all — any member
+// who had ever run '/link' could already write into any pot-native agent's inbox
+// in any squad, just by knowing its slug. After this fix, dispatch is confined to
+// agents in a squad the member can see (>= observer, including department
+// inheritance) via canOnSquad — the SAME confinement `wake`/`task` already apply a
+// few lines up in runInbound. Members whose channel-derived grants have not been
+// synced yet (channel_capability_grants is populated by the reconcileMembership
+// cron, not synchronously on '/link') will see `send_target_not_visible` until
+// that reconcile runs — an honest refusal, not a crash or a silent drop.
 async function potSend(
   env: Env,
-  toAgent: string,
+  toRef: string,
   body: string,
   memberId: string,
+  grants: CapabilityGrant[],
   isDirective: boolean,
 ): Promise<string> {
   const directiveNotice = isDirective ? '' : ' [UNTRUSTED-INGRESS]'
-  const res = await sendAgentMessage(
+  const isAdmin = hasCapability(grants, 'org', null, 'admin')
+  const res = await sendToRef(
     env,
     {
       fromAgent: 'central-command',
       fromMember: memberId,
-      toAgent,
+      toRef,
       body,
       kind: 'message',
     },
-    { system: true, reason: 'central-command-mention-ingress' },
+    { isAdmin, grants },
   )
 
   if (!res.ok) {
+    if (res.reason === 'recipient_ambiguous') {
+      return `refused: @${toRef} matches more than one agent — address it by full agent id, not slug.`
+    }
     return `refused: ${res.reason}${res.detail ? ` (${res.detail})` : ''}`
   }
 
-  return `Dispatched @${toAgent} via mupot inbox (id: ${res.id.slice(0, 8)})${directiveNotice}`
+  return `Dispatched @${toRef} via mupot inbox (id: ${res.id.slice(0, 8)})${directiveNotice}`
 }
 
 // This function DOES NOT DELIVER ANYTHING. It writes one [sos-bus] audit row to
