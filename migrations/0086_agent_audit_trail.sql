@@ -47,3 +47,57 @@ CREATE TABLE IF NOT EXISTS agent_audit (
 
 CREATE INDEX IF NOT EXISTS idx_agent_audit_agent ON agent_audit(agent_id, seq DESC);
 CREATE INDEX IF NOT EXISTS idx_agent_audit_actor ON agent_audit(actor_id, seq DESC);
+
+-- Append-only triggers, matching task_verdicts_no_update/_no_delete
+-- (migrations/0008_gate_grants.sql). An audit trail that is append-only only by
+-- convention is not an audit trail: anything with DB access could otherwise
+-- rewrite or delete history silently, which is exactly the failure mode this
+-- table exists to close (agents has no updated_at — see header comment above).
+--
+-- Rollback does NOT need an exception here: per the schema comment, undo is a
+-- NEW row with rollback_to_id pointing at a prior audit id, never a mutation of
+-- an existing one. Verified against src/org/service.ts — the rollback path this
+-- table anticipates is not implemented yet, so there is nothing there to
+-- reconcile with immutability today.
+--
+-- updateAgentProfile DOES need an exception: it writes agent_audit inside the
+-- same env.DB.batch() as the `agents` UPDATE it records (src/org/service.ts,
+-- around lines 893-906), and that batch's third statement UPDATEs the
+-- just-inserted row's after_state — the INSERT (statement 1) runs BEFORE the
+-- `agents` UPDATE (statement 2), so the post-update snapshot can only be
+-- captured with a follow-up read. That is not a design accident: the comment
+-- there rejects computing after_state from a pre-UPDATE JS-side SELECT because
+-- a concurrent write between the read and the transaction would make it a
+-- fabrication. So the trigger below permits exactly that one transition — the
+-- one-time after_state backfill on a row whose after_state is still the ''
+-- sentinel INSERT always writes — and blocks every other UPDATE, including any
+-- second attempt to backfill the same row. Same narrow-allow-list shape as
+-- task_verdicts_no_update (migrations/0069_project_structural_completion.sql:232),
+-- which already carries a controlled exception for exactly this reason: a
+-- blanket append-only trigger with no exception would break this table's own
+-- primary write path.
+CREATE TRIGGER agent_audit_no_update
+  BEFORE UPDATE ON agent_audit
+  WHEN NOT (
+    OLD.after_state = ''
+    AND NEW.after_state <> ''
+    AND NEW.seq IS OLD.seq
+    AND NEW.id IS OLD.id
+    AND NEW.agent_id IS OLD.agent_id
+    AND NEW.actor_id IS OLD.actor_id
+    AND NEW.actor_type IS OLD.actor_type
+    AND NEW.action IS OLD.action
+    AND NEW.fields_changed IS OLD.fields_changed
+    AND NEW.before_state IS OLD.before_state
+    AND NEW.rollback_to_id IS OLD.rollback_to_id
+    AND NEW.created_at IS OLD.created_at
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'agent_audit is append-only: UPDATE is forbidden');
+END;
+
+CREATE TRIGGER agent_audit_no_delete
+  BEFORE DELETE ON agent_audit
+BEGIN
+  SELECT RAISE(ABORT, 'agent_audit is append-only: DELETE is forbidden');
+END;
