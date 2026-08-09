@@ -75,7 +75,7 @@ import {
 } from '../tasks/ranking'
 import { loadAgentRuntimeStates, type AgentRuntimeState } from '../dashboard/observatory'
 import { buildOrient, renderBrief } from '../orient/service'
-import { mcpEndpoint, canonicalOrigin } from '../dashboard/connect'
+import { mcpEndpoint, canonicalOrigin, requiredCanonicalOrigin } from '../dashboard/connect'
 import { classify, humanAge } from '../dashboard/fleet'
 import { resolveAgentRef } from '../org/resolve'
 import { sendToRef, readAgentInbox, sendAgentMessage } from '../agents/messages'
@@ -93,6 +93,7 @@ import { ROUTINE_TOOLS } from './routines'
 import { dispatchFlight } from '../flight/dispatch'
 import {
   deliverFlightLandedEvent,
+  failFlight,
   getFlight,
   landGovernedFlight,
   listFlightProjectMismatchTaskIds,
@@ -1575,7 +1576,78 @@ const toolFlightDispatch: ToolSpec = {
     }
     const flight = await getFlight(env, preflight.id)
     if (!flight) return fail(500, 'flight_record_missing')
-    return done({ flight: flightWithParsedMeta(flight, meta), preflight })
+
+    // The tool is called flight_dispatch and it did not dispatch (#860). It created
+    // the row, scored it, and returned — no envelope, no agent told anything. A
+    // flight would sit in `running` forever while its assigned seat's inbox stayed
+    // empty, which is indistinguishable from a stalled flight and is the shape of
+    // every phantom on this board.
+    //
+    // Ordering is deliberate and is the other half of #861: preflight GATES the
+    // send. On a no_go nothing is sent, because a gate that runs after the work is
+    // handed out is a stamp, not a gate.
+    //
+    // The envelope is flight.dispatch/v1, NOT routine.run/v1. routine.run/v1 carries
+    // run_id, project_id, routine_revision and situation_digest — an API-dispatched
+    // flight has none of those, and forging them would make a flight impersonate a
+    // routine run that no scheduler owns.
+    if (preflight.go) {
+      // Omit the endpoint rather than emit a request-derived or "null" origin: a
+      // wrong MCP address in a work order sends the agent somewhere real and wrong.
+      const flightOrigin = requiredCanonicalOrigin(env)
+      const delivery = await sendAgentMessage(
+        env,
+        {
+          fromAgent: 'mupot-flights',
+          fromMember: auth.memberId as string,
+          toAgent: flight.agent,
+          kind: 'request',
+          requestId: `flight.${flight.id}`,
+          body: JSON.stringify({
+            version: 'flight.dispatch/v1',
+            flight_id: flight.id,
+            goal: flight.goal,
+            done_when: meta.done_when,
+            task_ids: meta.task_ids,
+            squad_ids: meta.squad_ids,
+            budget_micro_usd: flight.budget_micro_usd,
+            ...(flightOrigin.ok ? { mcp_endpoint: mcpEndpoint(flightOrigin.origin) } : {}),
+            land_with: 'flight_land',
+          }),
+          ...(projectId ? { projectId } : {}),
+        },
+        {
+          system: true,
+          reason: 'flight_dispatch delivers to the flight\'s own bound agent, which the caller already had to be',
+        },
+        {
+          // The sender is synthetic ('mupot-flights') and is not a member of any
+          // project, so the primitive's sender/recipient membership check would
+          // refuse every project-attributed flight. Authorization already happened
+          // upstream in this tool and is stricter than what the check would do:
+          // hasProjectWriteForSquads() gated the project, and agent_squad_not_in_flight
+          // guarantees the recipient's squad is one of the flight's squads. Project
+          // existence and archived-status are still enforced inside the primitive.
+          systemProjectAttribution: true,
+        },
+      )
+
+      // A flight nobody was told about must not be left looking live. Failing it
+      // here keeps `running` meaning "an agent has this", which is the property the
+      // phantom flights lost.
+      if (!delivery.ok) {
+        await failFlight(env, flight.id, `dispatch_delivery_failed:${delivery.reason}`)
+        return fail(503, 'flight_dispatch_delivery_failed', {
+          flight_id: flight.id,
+          reason: delivery.reason,
+        })
+      }
+
+      const dispatched = await getFlight(env, preflight.id)
+      return done({ flight: flightWithParsedMeta(dispatched ?? flight, meta), preflight, delivered: true })
+    }
+
+    return done({ flight: flightWithParsedMeta(flight, meta), preflight, delivered: false })
   },
 }
 

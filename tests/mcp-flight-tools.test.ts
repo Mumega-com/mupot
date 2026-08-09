@@ -75,7 +75,7 @@ function auth(overrides: Partial<AuthContext> = {}): AuthContext {
   }
 }
 
-function makeEnv(agentStatus: 'active' | 'paused' | null = 'active') {
+function makeEnv(agentStatus: 'active' | 'paused' | null = 'active', inboxFull = false) {
   const rows = new Map<string, FlightRow>()
   const cursors = new Map<string, string>()
   let beforeFlightLand: (() => void) | null = null
@@ -91,6 +91,10 @@ function makeEnv(agentStatus: 'active' | 'paused' | null = 'active') {
     attempts: number; last_error: string | null
   }>()
   let busFailure = false
+  // flight_dispatch now sends a flight.dispatch/v1 envelope (#860). The unread cap is
+  // enforced inside the INSERT, so a mock that does not model agent_messages reports
+  // 0 changes and the sender reads that as inbox_full.
+  const delivered: { toAgent: string; body: string; kind: string; requestId: string | null }[] = []
   const squads = new Map([
     [SQUAD_ID, { id: SQUAD_ID, department_id: 'dept-1', slug: 'mmhq', name: 'Mumega HQ', charter: null, budget_cap_cents: 100, budget_window: 'day', created_at: 'now' }],
     [OTHER_SQUAD_ID, { id: OTHER_SQUAD_ID, department_id: 'dept-2', slug: 'other', name: 'Other', charter: null, budget_cap_cents: 100, budget_window: 'day', created_at: 'now' }],
@@ -136,6 +140,15 @@ function makeEnv(agentStatus: 'active' | 'paused' | null = 'active') {
               },
               async run() {
                 let changes = 0
+                if (sql.includes('INSERT INTO agent_messages')) {
+                  delivered.push({
+                    toAgent: String(args[2] ?? ''),
+                    body: String(args[6] ?? ''),
+                    kind: String(args[5] ?? ''),
+                    requestId: args[7] == null ? null : String(args[7]),
+                  })
+                  return { meta: { changes: inboxFull ? 0 : 1 } }
+                }
                 if (sql.includes('INSERT INTO flights (')) {
                   const [id, tenant, projectId, agent, goal, trigger, budget, rawMeta] = args as [string, string, string | null, string, string, FlightRow['trigger_source'], number | null, string]
                   rows.set(id, {
@@ -145,6 +158,24 @@ function makeEnv(agentStatus: 'active' | 'paused' | null = 'active') {
                     ended_at: null, meta: rawMeta,
                   })
                   changes = 1
+                } else if (sql.includes("status='held', gate_verdict='no_go'")) {
+                  const row = rows.get(args[0] as string)
+                  if (row && row.tenant === args[1] && row.status === 'preflight') {
+                    row.status = 'held'
+                    row.gate_verdict = 'no_go'
+                    row.gate_reason = args[2] as string
+                    row.score = args[3] as number
+                    row.ended_at = args[4] as number
+                    changes = 1
+                  }
+                } else if (sql.includes("status='failed'")) {
+                  const row = rows.get(args[0] as string)
+                  if (row && row.tenant === args[1] && ['preflight', 'running', 'waiting', 'sleeping'].includes(row.status)) {
+                    row.status = 'failed'
+                    row.gate_reason = args[2] as string
+                    row.ended_at = args[3] as number
+                    changes = 1
+                  }
                 } else if (sql.includes("status='running', gate_verdict='go'")) {
                   const row = rows.get(args[0] as string)
                   if (row && row.tenant === args[1] && row.status === 'preflight') {
@@ -284,6 +315,7 @@ function makeEnv(agentStatus: 'active' | 'paused' | null = 'active') {
   } as unknown as Env
   return {
     env,
+    delivered,
     rows,
     tasks,
     verdicts,
@@ -316,6 +348,70 @@ describe('MCP flight tools', () => {
     expect(result.flight.agent).toBe(AGENT_ID)
     expect(result.flight.status).toBe('running')
     expect(result.flight.meta).toEqual(meta)
+  })
+
+  // #860: the tool is named flight_dispatch and it did not dispatch. It created the
+  // row, scored it, returned — and the assigned seat's inbox stayed empty, so the
+  // flight sat in `running` with nobody told. Proven live on flight 9f5e0147, which
+  // passed preflight (go, 0.967) while inbox(peek) returned {"messages":[]}.
+  it('sends a flight.dispatch/v1 envelope to the flight\'s own agent', async () => {
+    const { env, delivered } = makeEnv()
+    const out = await invokeTool(auth(), env, 'flight_dispatch', dispatchArgs, 'https://pot.example')
+
+    expect(out.ok, JSON.stringify(out)).toBe(true)
+    expect((out.result as { delivered: boolean }).delivered).toBe(true)
+
+    expect(delivered).toHaveLength(1)
+    const sent = delivered[0]!
+    expect(sent.toAgent).toBe(AGENT_ID)
+    expect(sent.kind).toBe('request')
+
+    const envelope = JSON.parse(sent.body) as Record<string, unknown>
+    // NOT routine.run/v1: that envelope carries run_id, project_id, routine_revision
+    // and situation_digest. An API flight has none, and forging them would make it
+    // impersonate a routine run no scheduler owns.
+    expect(envelope.version).toBe('flight.dispatch/v1')
+    expect(envelope.flight_id).toBe((out.result as { flight: FlightRow }).flight.id)
+    expect(envelope.done_when).toEqual(meta.done_when)
+    expect(envelope.task_ids).toEqual(meta.task_ids)
+    expect(envelope.land_with).toBe('flight_land')
+    expect(sent.requestId).toBe(`flight.${(out.result as { flight: FlightRow }).flight.id}`)
+  })
+
+  it('does not send when preflight holds the flight — the gate precedes the send', async () => {
+    // The other half of #861: the routine path sends first and then stamps go/1.
+    // Ordering is the guarantee, so an empty-signals dispatch must reach nobody.
+    const { env, delivered } = makeEnv()
+    const out = await invokeTool(
+      auth(),
+      env,
+      'flight_dispatch',
+      { ...dispatchArgs, signals_json: JSON.stringify({ ...signals, contextComplete: false, toolsReachable: false }) },
+      'https://pot.example',
+    )
+
+    expect(out.ok, JSON.stringify(out)).toBe(true)
+    const result = out.result as { flight: FlightRow; delivered: boolean; preflight: { go: boolean; reasons: string[] } }
+    expect(result.preflight.go).toBe(false)
+    expect(result.preflight.reasons).toEqual(expect.arrayContaining(['context_incomplete', 'tools_unreachable']))
+    expect(result.flight.status).toBe('held')
+    expect(result.delivered).toBe(false)
+    expect(delivered).toHaveLength(0)
+  })
+
+  it('fails the flight when delivery fails, so `running` never means nobody was told', async () => {
+    // A flight left running with an empty recipient inbox is indistinguishable from a
+    // stalled one — the exact shape of the six phantom flights on this board.
+    const { env, rows } = makeEnv('active', true)
+    const out = await invokeTool(auth(), env, 'flight_dispatch', dispatchArgs, 'https://pot.example')
+
+    expect(out.ok).toBe(false)
+    expect(out.error).toBe('flight_dispatch_delivery_failed')
+    const detail = out.detail as { flight_id: string; reason: string }
+    expect(detail.reason).toBe('inbox_full')
+
+    const row = rows.get(detail.flight_id)
+    expect(row?.status).not.toBe('running')
   })
 
   it('requires a stable bound agent identity', async () => {
@@ -753,6 +849,29 @@ describe('MCP granted multi-squad flight lifecycle', () => {
           cost_micro_usd INTEGER NOT NULL DEFAULT 0, next_run_at INTEGER,
           created_at INTEGER NOT NULL DEFAULT (unixepoch('now') * 1000), started_at INTEGER,
           ended_at INTEGER, meta TEXT NOT NULL DEFAULT '{}'
+        );
+        -- flight_dispatch delivers a flight.dispatch/v1 envelope (#860), so this
+        -- lifecycle test now needs the table the send writes to. Mirrors 0032.
+        CREATE TABLE agent_messages (
+          seq          INTEGER PRIMARY KEY AUTOINCREMENT,
+          id           TEXT NOT NULL UNIQUE,
+          tenant       TEXT NOT NULL,
+          to_agent     TEXT NOT NULL,
+          from_agent   TEXT NOT NULL,
+          from_member  TEXT NOT NULL,
+          kind         TEXT NOT NULL DEFAULT 'message',
+          body         TEXT NOT NULL,
+          request_id   TEXT,
+          in_reply_to  TEXT,
+          created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+          read_at      TEXT,
+          project_id   TEXT
+        );
+        CREATE TABLE agent_inbox_fences (
+          tenant TEXT NOT NULL, agent_id TEXT NOT NULL, mode TEXT NOT NULL,
+          generation INTEGER NOT NULL DEFAULT 1, key_fingerprint TEXT,
+          updated_by_member_id TEXT NOT NULL, updated_at TEXT NOT NULL, reason TEXT NOT NULL,
+          PRIMARY KEY (tenant, agent_id)
         );
         CREATE TABLE flight_event_outbox (
           id TEXT PRIMARY KEY, tenant TEXT NOT NULL, flight_id TEXT NOT NULL, event_type TEXT NOT NULL,
