@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest'
-import { mcpApp } from '../src/mcp'
-import { callerCanGrantAgentCapability } from '../src/mcp/provision'
-import type { Capability, CapabilityGrant, Env } from '../src/types'
+import { done, mcpApp } from '../src/mcp'
+import type { ToolCtx, ToolSpec } from '../src/mcp'
+import { callerCanGrantAgentCapability, PROVISION_TOOLS } from '../src/mcp/provision'
+import type { AuthContext, Capability, CapabilityGrant, Env } from '../src/types'
 
 // The provision tools (create_squad / create_agent / mint_agent_token) are the in-band
 // org-builder surface. These tests drive them through the JSON-RPC seam (tools/call) the
@@ -848,5 +849,130 @@ describe('grant_agent_capability authorization ceiling', () => {
     expect(callerCanGrantAgentCapability(leadGrants, TARGET_SQUAD, 'lead')).toBe(true)
     expect(callerCanGrantAgentCapability(leadGrants, TARGET_SQUAD, 'admin')).toBe(false)
     expect(callerCanGrantAgentCapability(adminGrants, TARGET_SQUAD, 'admin')).toBe(true)
+  })
+})
+
+// ── operator-principal invariant — exhaustive by construction ────────────────
+//
+// mupot P0 (2026-08-09): register_agent_key was missing the operator-principal
+// check every sibling credential/capability tool carries. It was unreachable
+// while no bound agent could hold admin — that admin gate WAS the implicit
+// operator check. Migration 0087 drops the home_capability_ceiling triggers,
+// so a bound agent can now hold admin on its own squad, and the missing check
+// became a live peer-identity-capture path (register a key for a keyless peer
+// → hasRegisteredKey() closes that peer's bearer attach path → attacker holds
+// the only private key for the victim's agent id).
+//
+// The bug survived because the old test (below, "refuses agent-bound callers
+// on provision, mint, and grant surfaces") hand-enumerated THREE tools and
+// silently stopped covering the rest. A hand-maintained list can always drift
+// behind the real registry. This block replaces that pattern: it drives every
+// tool the module actually registers (PROVISION_TOOLS, not a literal copied
+// into the test) and requires each one to either enforce the guard or be
+// named — with a reason — on the exemption list below. A new tool that omits
+// the check needs no test update to be caught; it fails this test on its own.
+describe('provision tools — operator-principal invariant is exhaustive', () => {
+  // Every entry here is a considered exception, not a gap. Each is backed by
+  // its own dedicated coverage elsewhere, so removing an entry without also
+  // changing the tool's run() will fail THIS test, and adding the guard back
+  // without removing the entry changes nothing (the tool would just pass both
+  // ways) — the pairing is what keeps the list honest.
+  const OPERATOR_PRINCIPAL_EXEMPT: ReadonlySet<string> = new Set([
+    // Read-only, pot-internal metadata disclosure gated at the 'observer'
+    // FLOOR (see the block comments on these two tools in provision.ts). No
+    // write, no credential, no peer-identity mutation — never in scope for
+    // this guard.
+    'resolve_agent',
+    'get_agent_profile',
+    // CREATE new org structure the caller already holds admin/lead on. These
+    // never touch an EXISTING peer's identity or credential — the attack
+    // this guard defends against (capturing/locking out a peer agent) does
+    // not apply to minting a brand-new row. Matches the dashboard HTTP
+    // equivalent (src/org/index.ts POST /squads/:id/agents), which has no
+    // operator_principal_required check either — same design, same surface.
+    'create_department',
+    'create_squad',
+    'create_agent',
+    // Deliberately allows one bound agent to deactivate ANOTHER agent —
+    // only self-deactivation is blocked (see the 'cannot_deactivate_self'
+    // guard in toolDeactivateAgent and the explicit assertion in
+    // tests/deactivate-agent.test.ts: "allows a different agent-bound token
+    // to deactivate this agent" → 200). This is an existing, tested product
+    // decision, not an oversight uncovered by this audit — flagged for
+    // Kasra-core to re-examine now that 0087 makes it reachable by more
+    // callers than before, but not silently changed here.
+    'deactivate_agent',
+  ])
+
+  const boundAgentAuth: AuthContext = {
+    userId: 'agent-caller',
+    email: null,
+    role: 'member',
+    tenant: 'digid',
+    memberId: 'member-agent-1',
+    capabilities: [
+      // Worst case: the bound agent's own home identity holds org:admin —
+      // exactly what migration 0087 makes reachable. If the guard is
+      // missing, this grant is enough to sail past every downstream
+      // capability check, so a false pass here cannot hide behind "the
+      // capability gate would have caught it anyway."
+      { member_id: 'member-agent-1', scope_type: 'org', scope_id: null, capability: 'admin' },
+    ],
+    boundAgentId: 'agent-caller',
+  }
+  const ctx: ToolCtx = { origin: 'https://agents.digid.ca' }
+
+  // Args deliberately empty: the guard must be the FIRST statement in run(),
+  // before any argument is even read, so it must fire on a call carrying no
+  // arguments at all. Calling tool.run() directly (bypassing the JSON-RPC /
+  // inputSchema seam) means this loop needs no per-tool argument fixtures —
+  // which is what lets it generalize to a tool that doesn't exist yet.
+  async function isGuarded(tool: ToolSpec, env: Env): Promise<boolean> {
+    const outcome = await tool.run(boundAgentAuth, env, {}, ctx)
+    return outcome.ok === false && outcome.status === 403 && outcome.error === 'operator_principal_required'
+  }
+
+  it('every registered provision tool is either guarded or an explicit, commented exemption', () => {
+    const names = new Set(PROVISION_TOOLS.map((t) => t.name))
+    for (const exempt of OPERATOR_PRINCIPAL_EXEMPT) {
+      expect(names.has(exempt)).toBe(true) // catches a stale/typo'd exemption entry
+    }
+  })
+
+  it('every non-exempt tool refuses a bound-agent caller as the first statement in run()', async () => {
+    const env = makeEnv()
+    const ungated: string[] = []
+    for (const tool of PROVISION_TOOLS) {
+      if (OPERATOR_PRINCIPAL_EXEMPT.has(tool.name)) continue
+      if (!(await isGuarded(tool, env))) ungated.push(tool.name)
+    }
+    expect(ungated).toEqual([])
+  })
+
+  it('catches a newly-added tool that forgets the guard (regression simulation)', async () => {
+    // Structurally identical to a real provision tool — reads args, checks a
+    // squad-admin capability — but omits the operator_principal_required
+    // line, i.e. exactly the register_agent_key bug this suite exists to
+    // catch. Appended to a COPY of the real registry (the real one is never
+    // mutated) so this test proves the loop above actually fails on a
+    // regression instead of vacuously passing every run.
+    const forgotTheGuard: ToolSpec = {
+      name: 'simulated_new_tool_missing_guard',
+      scope: "agent's squad",
+      min: 'admin',
+      args: '{}',
+      inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+      async run(_auth, _env, _args) {
+        return done({ ok: true })
+      },
+    }
+    const registryWithRegression = [...PROVISION_TOOLS, forgotTheGuard]
+    const env = makeEnv()
+    const ungated: string[] = []
+    for (const tool of registryWithRegression) {
+      if (OPERATOR_PRINCIPAL_EXEMPT.has(tool.name)) continue
+      if (!(await isGuarded(tool, env))) ungated.push(tool.name)
+    }
+    expect(ungated).toEqual(['simulated_new_tool_missing_guard'])
   })
 })
