@@ -239,20 +239,59 @@ def check_presence(findings: list[tuple[str, str]]) -> None:
             return str(pres.get("liveness", "")).lower()
         return str(pres or "").lower()
 
+    # Same unfed instrument as the P2 below, but a LOUDER alarm and a STRONGER claim,
+    # so it was the more dangerous of the two.
+    #
+    # It used to fire P0 "NO agent is live — every routine will park in
+    # queued/agent_offline". Both halves are unsupported:
+    #
+    #   The premise. Measured 2026-08-09 03:42 against live peers: of 25 active agents
+    #   exactly TWO read liveness=active — prime (poked by a host cron) and kasra (who
+    #   had manually called presence_register four minutes earlier). athena read
+    #   'dead, 9d ago' while having gated four PRs that hour; river read 'never' while
+    #   running hourly sweeps. Emptiness of `live` measures heartbeat callers, not the
+    #   fleet, so this P0 sits one cron failure away from firing against a working fleet.
+    #
+    #   The consequence. Routines do NOT park because presence is dead. At 03:32 a seat
+    #   registered presence online with a heartbeat fresh to the second and dispatched a
+    #   flight 32s later; it was held with score 0.005080218046913022 — byte-identical to
+    #   three earlier flights across three days with no live presence. Presence and
+    #   readiness are decoupled (mupot#849). Naming #732 here sent readers at the wrong
+    #   defect.
+    #
+    # A P0 that cries wolf trains everyone to ignore the real one — the scar already
+    # recorded above this function, repeated one severity louder. Report the instrument
+    # honestly and let a human decide, rather than asserting a cause we cannot support.
     live = [a for a in active if liveness(a) in ("active", "live")]
     if not live:
         findings.append((
-            "P0",
-            f"NO agent is live ({len(active)} active on the roster, none seen recently) — "
-            f"every routine will park in queued/agent_offline with no other symptom "
-            f"(mupot#732)",
+            "P1",
+            f"0/{len(active)} active agents report presence — but presence is written by a "
+            f"heartbeat almost no lane calls, so this is very likely the INSTRUMENT rather "
+            f"than an outage. Do NOT conclude routines are parked, and do NOT retire seats "
+            f"on it. Verify activity independently (recent commits, PRs, bus traffic) before "
+            f"acting; if independent signals are ALSO silent, then escalate as a real outage.",
         ))
-    idle_only = [a for a in active if liveness(a) in ("dead", "never")]
-    if len(idle_only) >= max(1, len(active) - 2):
+    # PRESENCE IS NOT ACTIVITY, and this finding must not imply that it is.
+    #
+    # Measured 2026-08-07: athena showed liveness='dead, 7d ago' while it was gating PRs
+    # minutes earlier, and tech-grok showed 'never' while having shipped a 956-line PR the
+    # day before. The only two agents reporting 'active' were the two a host cron pokes
+    # (~/scripts/fleet-heartbeat.sh). So this table measures WHO CALLS THE HEARTBEAT, not
+    # who is working — and almost no lane calls it (mupot#732's family).
+    #
+    # The first wording here said "the roster is mostly ghosts". Acting on that would have
+    # retired the two most productive agents in the fleet. A finding that invites the wrong
+    # action is worse than no finding, so it now says what is actually true: the SIGNAL is
+    # unfed, which is a defect in the instrument, not evidence about the fleet.
+    unfed = [a for a in active if liveness(a) in ("dead", "never")]
+    if len(unfed) >= max(1, len(active) - 2):
         findings.append((
             "P2",
-            f"{len(idle_only)}/{len(active)} roster agents have never checked in or are "
-            f"long dead — the roster is mostly ghosts, which makes a real outage harder to see",
+            f"{len(unfed)}/{len(active)} roster agents report no recent presence — but "
+            f"presence is written by a heartbeat almost no lane calls, so this measures the "
+            f"INSTRUMENT, not the fleet. Do NOT retire seats on this signal alone (mupot#732): "
+            f"agents demonstrably doing work show here as dead. Verify activity independently.",
         ))
 
 
