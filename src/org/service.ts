@@ -478,6 +478,8 @@ export interface AgentProfileSummary {
   parent_agent_id: string | null
   qnft_ref: string | null
   death_condition: string | null
+  budget_cap_cents: number | null
+  budget_window: string
 }
 
 interface AgentProfileRow {
@@ -496,6 +498,8 @@ interface AgentProfileRow {
   parent_agent_id: string | null
   qnft_ref: string | null
   death_condition: string | null
+  budget_cap_cents: number | null
+  budget_window: string
 }
 
 // JSON-array text column → string[]; tolerate a corrupt/legacy value by returning null
@@ -527,11 +531,13 @@ function rowToProfileSummary(r: AgentProfileRow): AgentProfileSummary {
     parent_agent_id: r.parent_agent_id,
     qnft_ref: r.qnft_ref,
     death_condition: r.death_condition,
+    budget_cap_cents: r.budget_cap_cents,
+    budget_window: r.budget_window,
   }
 }
 
 const PROFILE_COLUMNS =
-  'id, squad_id, slug, name, role, status, model, model_fallback, purpose, owner, capabilities, skills, parent_agent_id, qnft_ref, death_condition'
+  'id, squad_id, slug, name, role, status, model, model_fallback, purpose, owner, capabilities, skills, parent_agent_id, qnft_ref, death_condition, budget_cap_cents, budget_window'
 
 // Read one agent's profile by id. null when the agent does not exist.
 export async function getAgentProfile(env: Env, agentId: string): Promise<AgentProfileSummary | null> {
@@ -671,7 +677,13 @@ export async function updateUnitConfig(
     if (v === null || v === undefined) {
       setClauses.push('budget_cap_cents = ?')
       binds.push(null)
-    } else if (typeof v === 'number' && Number.isInteger(v)) {
+    } else if (typeof v === 'number' && Number.isInteger(v) && v >= 0) {
+      // >= 0 matches the creation-path guard (prepareSquadCreate/prepareAgentCreate,
+      // above) — this branch was missing it, so a negative cap could previously be
+      // set post-creation even though creation itself always rejected one. A cap of
+      // -1 clamps nothing (meter.ts only applies budgetCapMicroDollars when it is a
+      // POSITIVE finite number — see the Governor/budget-cap inversion note), so a
+      // negative value here was not a stricter cap, it was a silently-ignored one.
       setClauses.push('budget_cap_cents = ?')
       binds.push(v)
     } else {
@@ -746,7 +758,7 @@ const AGENT_SNAPSHOT_JSON = `json_object(
   'squad_id', squad_id, 'slug', slug, 'name', name, 'role', role, 'status', status,
   'model', model, 'model_fallback', model_fallback, 'purpose', purpose, 'owner', owner,
   'capabilities', capabilities, 'skills', skills, 'parent_agent_id', parent_agent_id,
-  'qnft_ref', qnft_ref
+  'qnft_ref', qnft_ref, 'budget_cap_cents', budget_cap_cents, 'budget_window', budget_window
 )`
 
 // Fields an admin may correct on an existing agent. `status` is deliberately
@@ -791,9 +803,23 @@ const UPDATABLE_TEXT_COLUMNS = [
 
 const UPDATABLE_ARRAY_COLUMNS = ['capabilities', 'skills'] as const
 
+// budget_cap_cents/budget_window (mupot#611 item 1): before this, budget_cap_cents
+// was settable ONLY at creation (prepareSquadCreate/prepareAgentCreate above). An
+// agent or squad created without a cap — or one whose spend profile changed — could
+// never dispatch a budgeted flight again (src/mcp/index.ts's flight_budget_policy_missing
+// gate requires a positive integer cap on the bound agent AND every referenced squad),
+// and the only "fix" was recreating the row, discarding its grants and history. These
+// two get their own category (not TEXT, not ARRAY) because the valid shape is a typed
+// number/enum, not a free string — validation below mirrors prepareAgentCreate's guard
+// exactly (integer >= 0 or null; budget_window ∈ BudgetWindow).
+const UPDATABLE_NUMERIC_COLUMNS = ['budget_cap_cents'] as const
+const UPDATABLE_ENUM_COLUMNS = ['budget_window'] as const
+
 export type UpdatableAgentField =
   | (typeof UPDATABLE_TEXT_COLUMNS)[number]
   | (typeof UPDATABLE_ARRAY_COLUMNS)[number]
+  | (typeof UPDATABLE_NUMERIC_COLUMNS)[number]
+  | (typeof UPDATABLE_ENUM_COLUMNS)[number]
 
 export type AgentProfilePatch = Partial<Record<UpdatableAgentField, unknown>>
 
@@ -818,10 +844,40 @@ export async function updateAgentProfile(
   actor: AuditActor = SYSTEM_ACTOR,
 ): Promise<UpdateAgentProfileResult> {
   const sets: string[] = []
-  const binds: (string | null)[] = []
+  const binds: (string | number | null)[] = []
 
   for (const [key, raw] of Object.entries(patch)) {
     if (raw === undefined) continue
+
+    if ((UPDATABLE_NUMERIC_COLUMNS as readonly string[]).includes(key)) {
+      // budget_cap_cents: null clears the cap; otherwise integer >= 0, exactly
+      // mirroring prepareAgentCreate/prepareSquadCreate's guard (lines ~139-147
+      // above). A negative value is not a stricter cap — meter.ts only applies
+      // budgetCapMicroDollars when it is positive — so rejecting it here rather
+      // than silently storing a no-op cap matches the creation path's intent,
+      // not just its shape.
+      if (raw === null) {
+        sets.push(`${key} = ?`)
+        binds.push(null)
+        continue
+      }
+      if (typeof raw !== 'number' || !Number.isInteger(raw) || raw < 0) {
+        return { ok: false, error: 'invalid_field' }
+      }
+      sets.push(`${key} = ?`)
+      binds.push(raw)
+      continue
+    }
+
+    if ((UPDATABLE_ENUM_COLUMNS as readonly string[]).includes(key)) {
+      // budget_window has a schema DEFAULT and is never null-valued on a live
+      // row (prepareAgentCreate defaults it to 'week' when omitted) — unlike
+      // budget_cap_cents, null is not accepted here.
+      if (!isBudgetWindow(raw)) return { ok: false, error: 'invalid_field' }
+      sets.push(`${key} = ?`)
+      binds.push(raw)
+      continue
+    }
 
     if ((UPDATABLE_ARRAY_COLUMNS as readonly string[]).includes(key)) {
       if (raw === null) {

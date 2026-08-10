@@ -104,6 +104,93 @@ describe('updateAgentProfile — registry drift repair', () => {
     expect((await getAgentProfile(env, agentId))?.qnft_ref).toBe('375a9d13')
   })
 
+  // mupot#611 item 1: budget_cap_cents/budget_window were settable ONLY at
+  // create_agent time before this. An agent left uncapped — or one whose spend
+  // profile needed revision — could never dispatch a budgeted flight again
+  // (flight_budget_policy_missing, src/mcp/index.ts requires a positive integer
+  // cap), and the only "fix" was recreating the row from scratch, discarding its
+  // grants and history. Validation here must mirror prepareAgentCreate's guard
+  // (src/org/service.ts ~line 139-147) exactly: integer >= 0 or null.
+  describe('budget_cap_cents / budget_window — mupot#611 item 1', () => {
+    it('sets a cap that was never set at creation', async () => {
+      // the fixture agent is created with no budget_cap_cents — this is exactly
+      // the "an agent left uncapped can never dispatch a budgeted flight again"
+      // scenario the fix targets.
+      expect((await getAgentProfile(env, agentId))?.budget_cap_cents).toBeNull()
+
+      const result = await updateAgentProfile(env, agentId, { budget_cap_cents: 5000 })
+      expect(result.ok).toBe(true)
+      expect((await getAgentProfile(env, agentId))?.budget_cap_cents).toBe(5000)
+    })
+
+    it('clears a cap with an explicit null', async () => {
+      await updateAgentProfile(env, agentId, { budget_cap_cents: 5000 })
+      const cleared = await updateAgentProfile(env, agentId, { budget_cap_cents: null })
+      expect(cleared.ok).toBe(true)
+      expect((await getAgentProfile(env, agentId))?.budget_cap_cents).toBeNull()
+    })
+
+    it('rejects a negative cap — mirrors the creation-path guard exactly', async () => {
+      // MUTATION TARGET: if the `raw < 0` half of the guard is deleted, this is
+      // the test that catches it (see the mutation table in the PR body).
+      const result = await updateAgentProfile(env, agentId, { budget_cap_cents: -1 })
+      expect(result).toEqual({ ok: false, error: 'invalid_field' })
+      expect((await getAgentProfile(env, agentId))?.budget_cap_cents).toBeNull()
+    })
+
+    it('rejects a non-integer cap', async () => {
+      const result = await updateAgentProfile(env, agentId, { budget_cap_cents: 9.99 })
+      expect(result).toEqual({ ok: false, error: 'invalid_field' })
+    })
+
+    it('rejects a non-numeric cap', async () => {
+      const result = await updateAgentProfile(env, agentId, {
+        budget_cap_cents: '5000',
+      } as Record<string, unknown>)
+      expect(result).toEqual({ ok: false, error: 'invalid_field' })
+    })
+
+    it('sets budget_window independently of budget_cap_cents', async () => {
+      const result = await updateAgentProfile(env, agentId, { budget_window: 'day' })
+      expect(result.ok).toBe(true)
+      expect((await getAgentProfile(env, agentId))?.budget_window).toBe('day')
+    })
+
+    it('rejects a budget_window outside day|week', async () => {
+      const result = await updateAgentProfile(env, agentId, {
+        budget_window: 'month',
+      } as Record<string, unknown>)
+      expect(result).toEqual({ ok: false, error: 'invalid_field' })
+      // untouched — still whatever createAgent defaulted it to
+      expect((await getAgentProfile(env, agentId))?.budget_window).toBe('week')
+    })
+
+    it('is captured in the audit trail like every other patchable field', async () => {
+      const result = await updateAgentProfile(
+        env,
+        agentId,
+        { budget_cap_cents: 12000, budget_window: 'day' },
+        { id: 'member-budget', type: 'user' },
+      )
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
+
+      const row = await env.DB.prepare(
+        'SELECT fields_changed, before_state, after_state FROM agent_audit WHERE id = ?',
+      )
+        .bind(result.auditId)
+        .first<{ fields_changed: string; before_state: string; after_state: string }>()
+      expect(row).toBeTruthy()
+      expect(JSON.parse(row!.fields_changed).sort()).toEqual(['budget_cap_cents', 'budget_window'])
+      const before = JSON.parse(row!.before_state)
+      const after = JSON.parse(row!.after_state)
+      expect(before.budget_cap_cents).toBeNull()
+      expect(before.budget_window).toBe('week')
+      expect(after.budget_cap_cents).toBe(12000)
+      expect(after.budget_window).toBe('day')
+    })
+  })
+
   it('refuses an empty patch rather than issuing a no-op UPDATE', async () => {
     const result = await updateAgentProfile(env, agentId, {})
     expect(result).toEqual({ ok: false, error: 'no_fields' })

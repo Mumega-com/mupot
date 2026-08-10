@@ -466,4 +466,92 @@ describe('routine runtime-neutral dispatch', () => {
     // Account for telemetry recording statement (32 statements total, well under free-tier 50 limit)
     expect(statements).toBeLessThanOrEqual(50 - MAX_SCHEDULER_DB_STATEMENTS + 1)
   })
+
+  // mupot#611 item 3, end-to-end: loadCandidates (src/routines/dispatch.ts) used
+  // to join ONLY on the agent's home squad column, so an agent added to a squad
+  // via the separate `memberships` table while homed elsewhere was invisible to
+  // dispatch — reachable by message (src/agents/messages.ts already trusts
+  // `memberships`), unreachable by dispatch. These pin BOTH halves through the
+  // real selectAgent/dispatchRoutineRun path (tests/routine-dispatch-candidates.test.ts
+  // covers the SQL shape directly): the widened pool actually gets dispatched to,
+  // AND the capability gate — now the sole authority on the widened pool — still
+  // blocks a membership-only agent whose only grant is on its own home
+  // department, which has nothing to do with the target squad.
+  describe('mupot#611 item 3 — membership-only candidates (widened pool, gate stays authoritative)', () => {
+    function addMembershipOnlyAgent(h: SqliteD1Harness): void {
+      h.sqlite.exec(`
+        INSERT INTO departments (id, slug, name) VALUES ('dept-2', 'other-dept', 'Other Dept');
+        INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-2', 'dept-2', 'other', 'Other');
+        INSERT INTO agents (id, squad_id, slug, name, status)
+          VALUES ('agent-member-only', 'squad-2', 'member-only', 'Member Only', 'active');
+        INSERT INTO memberships (id, agent_id, squad_id, capability)
+          VALUES ('membership-only', 'agent-member-only', 'squad-1', 'member');
+        INSERT INTO members (id, display_name, status, tenant)
+          VALUES ('member-only', 'Member-only runtime', 'active', 'tenant-a');
+        INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+          VALUES ('tenant-a', 'agent-member-only', 'member-only', '${NOW.toISOString()}');
+        INSERT INTO member_tokens
+          (id, member_id, token_hash, label, channel, created_at, revoked_at, agent_id, tenant)
+        VALUES
+          ('token-member-only', 'member-only', 'hash-member-only', 'member-only', 'workspace', '${NOW.toISOString()}', NULL, 'agent-member-only', 'tenant-a');
+        INSERT INTO fleet_agents
+          (agent_id, tenant, display, runtime, squads, lifecycle, status, reported_by, last_reported_at, updated_at)
+        VALUES
+          ('agent-member-only', 'tenant-a', 'Member Only', 'codex', '["squad-2"]', 'always_on', 'running', 'host', '2026-07-19 15:59:30', '2026-07-19 15:59:30');
+        -- neither preferred nor fallback is eligible — forces selection down to
+        -- whatever the widened pool contributes.
+        DELETE FROM capabilities WHERE id IN ('cap-preferred', 'cap-fallback');
+      `)
+    }
+
+    it('dispatches to a membership-only agent once it holds real authority on the target squad', async () => {
+      harness = makeHarness()
+      addMembershipOnlyAgent(harness)
+      harness.sqlite.exec(`
+        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+          VALUES ('cap-member-only', 'member-only', 'squad', 'squad-1', 'member');
+      `)
+
+      const result = await dispatchRoutineRun(envFor(harness), 'run-1', NOW)
+
+      expect(result).toMatchObject({ ok: true, status: 'dispatched', agent_id: 'agent-member-only' })
+    })
+
+    it('does NOT dispatch to a membership-only agent whose only grant is admin on its OWN home department', async () => {
+      // This is the exact shape a naive fix (pulling department_id from the
+      // candidate's home squad instead of the target squad) would have gotten
+      // wrong: dept-2 is agent-member-only's home department and has nothing to
+      // do with squad-1 (dept-1). If loadCandidates handed selectAgent the
+      // candidate's OWN department here, this grant would incorrectly satisfy
+      // hasCapability's department-inheritance branch — an authority leak, not
+      // a missed dispatch.
+      harness = makeHarness()
+      addMembershipOnlyAgent(harness)
+      harness.sqlite.exec(`
+        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+          VALUES ('cap-member-only', 'member-only', 'department', 'dept-2', 'admin');
+      `)
+
+      const result = await dispatchRoutineRun(envFor(harness), 'run-1', NOW)
+
+      expect(result).toEqual({ ok: true, status: 'waiting', reason: 'agent', run_id: 'run-1' })
+    })
+
+    it("DOES dispatch when the grant is department-admin on the TARGET squad's department", async () => {
+      // Sanity companion to the negative test above: department inheritance
+      // works correctly when the grant is actually on squad-1's department
+      // (dept-1), proving the fix narrows WHICH department is checked rather
+      // than breaking department inheritance altogether.
+      harness = makeHarness()
+      addMembershipOnlyAgent(harness)
+      harness.sqlite.exec(`
+        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+          VALUES ('cap-member-only', 'member-only', 'department', 'dept-1', 'admin');
+      `)
+
+      const result = await dispatchRoutineRun(envFor(harness), 'run-1', NOW)
+
+      expect(result).toMatchObject({ ok: true, status: 'dispatched', agent_id: 'agent-member-only' })
+    })
+  })
 })

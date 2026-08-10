@@ -417,6 +417,28 @@ describe('updateUnitConfig', () => {
     expect(result).toMatchObject({ ok: false, error: 'invalid_budget_cap_cents' })
   })
 
+  // mupot#611 item 1 companion fix: this branch previously accepted ANY integer,
+  // including negative ones — a gap the creation-path guard (prepareAgentCreate/
+  // prepareSquadCreate, src/org/service.ts ~line 139-147) never had. A negative
+  // cap is not a stricter cap: meter.ts only applies budgetCapMicroDollars when
+  // it is a POSITIVE finite number (see the Governor/budget-cap inversion note),
+  // so a negative value here silently stored a no-op cap instead of the
+  // rejection the creation path always gave the same input.
+  //
+  // MUTATION TARGET: delete the `v >= 0` half of the guard and only this test
+  // fails (the float test above exercises Number.isInteger, not the sign check).
+  it('rejects a negative budget_cap_cents — matches the creation-path guard', async () => {
+    const { env } = makeEnv([0])
+    const result = await updateUnitConfig(env, 'agent', 'a1', { budget_cap_cents: -1 })
+    expect(result).toMatchObject({ ok: false, error: 'invalid_budget_cap_cents' })
+  })
+
+  it('rejects a negative budget_cap_cents on a squad too', async () => {
+    const { env } = makeEnv([0])
+    const result = await updateUnitConfig(env, 'squad', 's1', { budget_cap_cents: -500 })
+    expect(result).toMatchObject({ ok: false, error: 'invalid_budget_cap_cents' })
+  })
+
   it('rejects invalid budget_window', async () => {
     const { env } = makeEnv([0])
     const result = await updateUnitConfig(env, 'agent', 'a1', { budget_window: 'month' })

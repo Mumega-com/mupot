@@ -32,8 +32,9 @@ import {
   findAgentsByName,
   getAgentProfile,
   updateAgentProfile,
+  updateUnitConfig,
 } from '../org/service'
-import type { AgentProfilePatch } from '../org/service'
+import type { AgentProfilePatch, UnitConfigPatch } from '../org/service'
 import {
   mintAgentBoundToken,
   isAgentTokenCapability,
@@ -94,7 +95,8 @@ async function emitProvisioned(
     | 'key'
     | 'capability'
     | 'agent_deactivated'
-    | 'agent_updated',
+    | 'agent_updated'
+    | 'squad_updated',
   id: string,
   extra: {
     squad_id?: string
@@ -1025,7 +1027,7 @@ const toolUpdateAgent: ToolSpec = {
   scope: "agent's squad",
   min: 'admin',
   args:
-    '{ agent: string (id|slug), slug?, name?, role?, model?, model_fallback?, purpose?, owner?, qnft_ref?, capabilities?: string[], skills?: string[], reason?: string }',
+    '{ agent: string (id|slug), slug?, name?, role?, model?, model_fallback?, purpose?, owner?, qnft_ref?, capabilities?: string[], skills?: string[], budget_cap_cents?: number|null, budget_window?: "day"|"week", reason?: string }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -1043,6 +1045,14 @@ const toolUpdateAgent: ToolSpec = {
       qnft_ref: STRING_SCHEMA,
       capabilities: { type: 'array', items: STRING_SCHEMA },
       skills: { type: 'array', items: STRING_SCHEMA },
+      // mupot#611 item 1: budget_cap_cents/budget_window were settable only at
+      // create_agent time — an agent left uncapped (or whose cap needed revision)
+      // could never dispatch a budgeted flight again (flight_budget_policy_missing,
+      // src/mcp/index.ts) and the only remedy was recreating the row from scratch.
+      // Validated in updateAgentProfile exactly like the creation path: integer >= 0
+      // or null (clears the cap); budget_window ∈ 'day'|'week'.
+      budget_cap_cents: OPTIONAL_NUMBER_SCHEMA,
+      budget_window: STRING_SCHEMA,
       reason: STRING_SCHEMA,
     },
     required: ['agent'],
@@ -1076,6 +1086,8 @@ const toolUpdateAgent: ToolSpec = {
       'qnft_ref',
       'capabilities',
       'skills',
+      'budget_cap_cents',
+      'budget_window',
     ] as const
 
     const patch: AgentProfilePatch = {}
@@ -1113,6 +1125,116 @@ const toolUpdateAgent: ToolSpec = {
     })
 
     return done({ agent: result.value, changed, audit_id: result.auditId })
+  },
+}
+
+// ── update_squad ────────────────────────────────────────────────────────────────
+// mupot#611 item 1, squad half. There was no update path for squads at all before
+// this — budget_cap_cents/budget_window were settable only at create_squad time
+// (prepareSquadCreate, src/org/service.ts), so a squad left uncapped (or one whose
+// cap needed revision) could never dispatch a budgeted flight again
+// (flight_budget_policy_missing, src/mcp/index.ts requires a positive integer cap
+// on EVERY referenced squad, not just the bound agent) — the only remedy was
+// recreating the squad, discarding its agents' history.
+//
+// Scoped narrowly to the two budget fields, not the full work-unit patch surface
+// (role/okr/kpi_target/effort/autonomy) that updateUnitConfig also supports —
+// those weren't asked for here and widening the MCP write surface beyond what was
+// requested is its own review, not a rider on a budget fix.
+//
+// Audit note: squads have no durable audit table — agent_audit (migration 0086)
+// is agent-only by design (agent_id NOT NULL, no squad equivalent exists anywhere
+// in the schema). Building one is out of scope for a budget-field fix. Instead this
+// emits a 'squad_updated' bus event carrying a before/after diff, same shape as
+// update_agent's 'agent_updated' event — parity in the audit *emit*, not in durable
+// storage. Unlike updateAgentProfile (which computes before/after inside one D1
+// batch so a concurrent write cannot fabricate the diff), the before-read here is a
+// separate SELECT ahead of the UPDATE: a race with a second concurrent
+// update_squad call could make the emitted diff's `from` stale. That is a known,
+// stated limitation of the emitted event, not of the write itself — the actual
+// UPDATE is still a single statement with normal SQLite atomicity, so no invalid
+// value is ever persisted. A durable, race-free squad audit trail is a fast-follow
+// if wanted, and needs its own migration.
+const toolUpdateSquad: ToolSpec = {
+  name: 'update_squad',
+  scope: 'squad',
+  min: 'admin',
+  args: '{ squad: string (id|slug), budget_cap_cents?: number|null, budget_window?: "day"|"week", reason?: string }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      squad: STRING_SCHEMA,
+      budget_cap_cents: OPTIONAL_NUMBER_SCHEMA,
+      budget_window: STRING_SCHEMA,
+      reason: STRING_SCHEMA,
+    },
+    required: ['squad'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
+    const squadRef = str(args.squad)
+    if (!squadRef) return fail(400, 'invalid_args', 'squad required')
+
+    const squadResult = await resolveSquadRef(env, squadRef)
+    if (!squadResult.ok) return resolveFail(squadResult.reason, 'squad_not_found')
+    const squad = squadResult.value
+
+    // Gate: admin on the squad itself — same rank as update_agent's "admin on
+    // the agent's squad". An org/department admin grant inherits down via
+    // memberCanOnSquad, same as every other tool in this file.
+    const grants = auth.capabilities ?? []
+    if (!(await memberCanOnSquad(env, grants, squad.id, 'admin'))) {
+      return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
+    }
+
+    const PATCHABLE = ['budget_cap_cents', 'budget_window'] as const
+    const patch: UnitConfigPatch = {}
+    for (const key of PATCHABLE) {
+      if (key in args) patch[key] = args[key]
+    }
+    if (!Object.keys(patch).length) {
+      return fail(400, 'invalid_args', 'at least one field to update is required')
+    }
+
+    // Before-image, read outside the UPDATE transaction — see the race caveat in
+    // the doc comment above.
+    const before = await env.DB.prepare(
+      'SELECT budget_cap_cents, budget_window FROM squads WHERE id = ?1',
+    )
+      .bind(squad.id)
+      .first<{ budget_cap_cents: number | null; budget_window: string }>()
+    if (!before) return fail(404, 'squad_not_found', { squad: squadRef })
+
+    const result = await updateUnitConfig(env, 'squad', squad.id, patch)
+    if (!result.ok) {
+      if (result.error === 'not_found') return fail(404, 'squad_not_found', { squad: squadRef })
+      return fail(400, 'invalid_args', { reason: result.error })
+    }
+
+    const after = await env.DB.prepare(
+      'SELECT budget_cap_cents, budget_window FROM squads WHERE id = ?1',
+    )
+      .bind(squad.id)
+      .first<{ budget_cap_cents: number | null; budget_window: string }>()
+
+    const changed: Record<string, { from: unknown; to: unknown }> = {}
+    for (const key of Object.keys(patch)) {
+      changed[key] = {
+        from: (before as unknown as Record<string, unknown>)[key] ?? null,
+        to: (after as unknown as Record<string, unknown> | null)?.[key] ?? null,
+      }
+    }
+
+    // Best-effort by design — a bus failure loses a notification, not the write
+    // (the UPDATE above already committed).
+    await emitProvisioned(env, auth.memberId as string, 'squad_updated', squad.id, {
+      squad_id: squad.id,
+      changed,
+      reason: str(args.reason) || undefined,
+    })
+
+    return done({ squad: after, changed })
   },
 }
 
@@ -1260,4 +1382,5 @@ export const PROVISION_TOOLS: ToolSpec[] = [
   toolRegisterAgentKey,
   toolDeactivateAgent,
   toolUpdateAgent,
+  toolUpdateSquad,
 ]
