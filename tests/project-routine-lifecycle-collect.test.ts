@@ -180,7 +180,9 @@ function dependencies(overrides: Record<string, unknown> = {}) {
         return { ok: true, status: 200, result: { project: situation.project, situation } }
       }
       if (tool === 'routine_run_get') {
-        return { ok: true, status: 200, result: { run: terminalRun } }
+        // #894: routine_run_get returns situation_digest to the ASSIGNED agent. This
+        // stub reads with the assigned token, so the real tool would include it.
+        return { ok: true, status: 200, result: { run: { ...terminalRun, situation_digest: 'a'.repeat(64) } } }
       }
       if (tool === 'needs_you_list') {
         return {
@@ -585,7 +587,7 @@ describe('collector CLI', () => {
               }]
             }),
             invokeAction: async ({ token, tool, input }) => {
-              if (tool === 'routine_run_get') return { ok: true, result: { run } }
+              if (tool === 'routine_run_get') return { ok: true, result: { run: { ...run, situation_digest: 'a'.repeat(64) } } }
               if (tool === 'project_get') return {
                 ok: true, result: { project: { id: config.projectId, status: 'active' }, situation }
               }
