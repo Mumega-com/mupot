@@ -405,6 +405,90 @@ describe('routine MCP tools', () => {
     expect(echoed).toMatchObject({ ok: true, result: { status: 'succeeded' } })
   })
 
+  it('prices measured usage onto the flight, for the assigned agent only, and refuses unknown models', async () => {
+    const fixture = await makeReadyRoutineFixture('execute_internal')
+    harness = fixture.harness
+    const assigned = principal({ boundAgentId: 'agent-1', capabilities: [grant('member', 'squad-1')] })
+    const usage = { run_id: 'run-1', model: 'deepseek-v4-flash', input: 1_000_000, output: 1_000_000 }
+
+    // 1. A DIFFERENT bound agent cannot report cost for someone else's run.
+    const wrongAgent = principal({ boundAgentId: 'agent-2', capabilities: [grant('member', 'squad-1')] })
+    await expect(invokeTool(wrongAgent, fixture.env, 'report_run_usage', usage, 'https://pot.test'))
+      .resolves.toMatchObject({ ok: false, error: 'assigned_agent_mismatch' })
+
+    // 2. A non-agent principal cannot either — cost must be agent-attributed.
+    const orgAdmin = principal({ boundAgentId: null, capabilities: [grant('admin', null, 'org')] })
+    await expect(invokeTool(orgAdmin, fixture.env, 'report_run_usage', usage, 'https://pot.test'))
+      .resolves.toMatchObject({ ok: false, error: 'assigned_agent_mismatch' })
+
+    // 3. An unknown model is REFUSED, not silently priced at zero. Zero must keep meaning
+    //    "free", never "we could not work it out".
+    await expect(invokeTool(assigned, fixture.env, 'report_run_usage',
+      { ...usage, model: 'no-such-model-v9' }, 'https://pot.test'))
+      .resolves.toMatchObject({ ok: false, error: 'model_not_priced' })
+
+    // 4. The assigned agent's report prices and lands on the flight.
+    //    2 MTok at the blended $0.24/MTok from cd9be86 => $0.48 => 480000 micro-USD.
+    const ok = await invokeTool(assigned, fixture.env, 'report_run_usage', usage, 'https://pot.test')
+    expect(ok).toMatchObject({ ok: true, result: { cost_micro_usd: 480_000 } })
+
+    const flightRow = harness.sqlite.prepare('SELECT cost_micro_usd FROM flights WHERE id = ?')
+      .get((ok.result as { flight_id: string }).flight_id) as { cost_micro_usd: number }
+    expect(flightRow.cost_micro_usd).toBe(480_000)
+
+    // 5. The run is kept consistent with its flights, not left stale.
+    const runRow = harness.sqlite.prepare('SELECT cost_micro_usd FROM routine_runs WHERE id = ?')
+      .get('run-1') as { cost_micro_usd: number }
+    expect(runRow.cost_micro_usd).toBe(480_000)
+
+    // 6. Idempotent for identical input — repeating must not double-charge.
+    await invokeTool(assigned, fixture.env, 'report_run_usage', usage, 'https://pot.test')
+    const again = harness.sqlite.prepare('SELECT cost_micro_usd FROM routine_runs WHERE id = ?')
+      .get('run-1') as { cost_micro_usd: number }
+    expect(again.cost_micro_usd).toBe(480_000)
+  })
+
+  it('corrects the undelivered flight.landed payload, and never rewrites a delivered one', async () => {
+    const fixture = await makeReadyRoutineFixture('execute_internal')
+    harness = fixture.harness
+    const assigned = principal({ boundAgentId: 'agent-1', capabilities: [grant('member', 'squad-1')] })
+    const flightId = (harness.sqlite.prepare('SELECT flight_id FROM routine_runs WHERE id = ?')
+      .get('run-1') as { flight_id: string }).flight_id
+
+    // landGovernedFlight bakes cost into the outbox payload at landing, reading the flights
+    // row — which landControlFlight had hardcoded to 0. Reproduce that starting state.
+    // UNIQUE(tenant, flight_id, event_type) — exactly one flight.landed row per flight ever
+    // exists, so the delivered and undelivered cases have to be tested in sequence.
+    const zeroPayload = JSON.stringify({ flight_id: flightId, cost_micro_usd: 0, score: 1 })
+    const tenant = 'tenant-a'
+    harness.sqlite.prepare(
+      `INSERT INTO flight_event_outbox
+         (id, tenant, flight_id, event_type, actor_kind, actor_id, payload, created_at, delivered_at)
+       VALUES ('ob-1', ?, ?, 'flight.landed', 'agent', 'agent-1', ?, '2026-08-10T00:00:00.000Z', NULL)`,
+    ).run(tenant, flightId, zeroPayload)
+
+    const payload = () => JSON.parse(
+      (harness.sqlite.prepare('SELECT payload FROM flight_event_outbox WHERE id = ?')
+        .get('ob-1') as { payload: string }).payload,
+    ) as { cost_micro_usd: number }
+
+    const report = (input: number) => invokeTool(assigned, fixture.env, 'report_run_usage',
+      { run_id: 'run-1', model: 'deepseek-v4-flash', input, output: 1_000_000 }, 'https://pot.test')
+
+    // UNDELIVERED: corrected, so the durable event stops carrying the fabricated zero.
+    await report(1_000_000)
+    expect(payload().cost_micro_usd).toBe(480_000)
+
+    // Once DELIVERED, a later corrected measurement must not rewrite it. History stands —
+    // you cannot un-send a receipt. The flights row still updates; only the sent event is frozen.
+    harness.sqlite.prepare("UPDATE flight_event_outbox SET delivered_at = '2026-08-10T01:00:00.000Z' WHERE id = 'ob-1'").run()
+    await report(3_000_000) // 4 MTok @ $0.24 => 960000
+    expect(payload().cost_micro_usd).toBe(480_000)
+    const flightRow = harness.sqlite.prepare('SELECT cost_micro_usd FROM flights WHERE id = ?')
+      .get(flightId) as { cost_micro_usd: number }
+    expect(flightRow.cost_micro_usd).toBe(960_000)
+  })
+
   it('binds proposal submission to the auth-welded assigned agent and action key', async () => {
     const fixture = await makeReadyRoutineFixture('execute_internal')
     harness = fixture.harness

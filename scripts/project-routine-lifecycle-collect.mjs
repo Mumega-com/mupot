@@ -573,7 +573,31 @@ async function collectLifecycle(config, deps, secretValues) {
   const mcpRun = normalizeRun(mcpRunResult)
   const restRun = normalizeRun(await deps.api.readRestRun({ runId, ownerToken: config.ownerToken }))
   const dashboardRun = normalizeRun(await deps.browser.readRun({ runId, projectId: config.projectId, expected: restRun }))
-  assertEqual(restRun, mcpRun, 'terminal REST and MCP run parity failed', secretValues)
+
+  // REST and MCP are NO LONGER byte-identical, and that is the intended contract as of #894:
+  // routine_run_get returns situation_digest to the run's ASSIGNED AGENT and to nobody else
+  // (src/mcp/routines.ts). This read uses assignedToken, so the extra field is correct here —
+  // whereas REST reads publicRoutineRun and must never carry it.
+  //
+  // This assertion previously demanded blanket equality and so failed on #894. Rather than
+  // relax it to "close enough", it now states the real invariant: MCP-for-the-assignee is
+  // REST plus exactly one field, that field is a well-formed digest, and nothing else drifts.
+  // A blanket-equality check that gets deleted the first time the shapes legitimately differ
+  // stops protecting the fields that must still match.
+  const { situation_digest: mcpDigest, ...mcpRunWithoutDigest } = mcpRun
+  if (typeof mcpDigest !== 'string' || !/^[a-f0-9]{64}$/.test(mcpDigest)) {
+    throw new CollectorError(
+      'assigned agent did not receive a well-formed situation_digest over MCP (#894)',
+      { situation_digest: mcpDigest ?? null }, secretValues,
+    )
+  }
+  if ('situation_digest' in restRun) {
+    throw new CollectorError(
+      'REST leaked situation_digest — it must stay scoped to the assigned agent over MCP (#894)',
+      restRun, secretValues,
+    )
+  }
+  assertEqual(restRun, mcpRunWithoutDigest, 'terminal REST and MCP run parity failed', secretValues)
   assertEqual(restRun, dashboardRun, 'terminal REST and dashboard run parity failed', secretValues)
   if (!TERMINAL_STATUSES.has(restRun.status)) {
     throw new CollectorError('routine run is not terminal', restRun, secretValues)
@@ -660,13 +684,23 @@ async function collectLifecycle(config, deps, secretValues) {
   const restartedDashboardRun = normalizeRun(
     await deps.browser.readRun({ runId, projectId: config.projectId, expected: restartedRestRun }),
   )
+  // Same #894 contract as the terminal check above: the assigned agent's MCP read carries
+  // situation_digest, REST and the dashboard must not. Compare the MCP row on its public
+  // shape, and assert the digest survived the restart rather than dropping it from scope.
+  const { situation_digest: restartedDigest, ...restartedMcpPublic } = restartedMcpRun
+  if (typeof restartedDigest !== 'string' || !/^[a-f0-9]{64}$/.test(restartedDigest)) {
+    throw new CollectorError(
+      'assigned agent lost situation_digest across the Worker restart (#894)',
+      { situation_digest: restartedDigest ?? null }, secretValues,
+    )
+  }
   if (!equal(beforeRestart.run, restartedRestRun)
-    || !equal(beforeRestart.run, restartedMcpRun)
+    || !equal(beforeRestart.run, restartedMcpPublic)
     || !equal(beforeRestart.run, restartedDashboardRun)) {
     throw new CollectorError('restart run parity failed', {
       before: beforeRestart.run,
       rest: restartedRestRun,
-      mcp: restartedMcpRun,
+      mcp: restartedMcpPublic,
       dashboard: restartedDashboardRun,
     }, secretValues)
   }
