@@ -28,6 +28,14 @@ export default defineConfig({
       'fleet-runtime/**',
       '**/*.test.mjs',
       'tests/composition/**',
+      // Git worktrees live under .wt/ INSIDE the repo root, so each is a full copy of this
+      // repo checked out to a DIFFERENT branch. Without this line vitest globs into all of
+      // them and runs the suite once per worktree. Measured 2026-08-10: 2871 test files
+      // (~317 x 9 trees), 45282 tests, 33 minutes — and the failures it reported came from
+      // branches that were neither the developer's nor main. A gate reading those numbers is
+      // reading other people's code. With this line: 317 files, 5042 tests, ~217s.
+      // CI is unaffected — it checks out clean, with no .wt/ present.
+      '.wt/**',
     ],
     testTimeout: 15_000,
   },
