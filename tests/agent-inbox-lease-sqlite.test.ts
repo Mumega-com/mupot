@@ -1,15 +1,19 @@
 // tests/agent-inbox-lease-sqlite.test.ts — lease / ack / dead-letter (#899).
 //
-// Real SQLite, real migration files. The fixture applies migrations/0090_agent_message_lease.sql
-// verbatim rather than hand-writing the four columns, so a migration that does not parse or
-// does not apply is red HERE and not on the D1 apply.
+// Real SQLite, and the schema is the WHOLE committed migration chain via applyAllMigrations
+// (the #684 ratchet — scripts/check-test-schema-source.mjs). The first draft of this file
+// hand-wrote a five-column agent_messages and pinned migrations 0058 + 0090 individually.
+// It passed. That is precisely the shape the ratchet exists to reject: a hand-picked chain
+// starts correct and rots without anyone making a mistake, and it would have hidden any
+// interaction between 0090 and the 0069 project triggers or the 0032 partial unique index.
+// Applying the full chain also means a 0090 that does not parse or does not apply on top of
+// everything before it is red HERE, not on the D1 apply.
 //
 // Every behavioural test below was MUTATION-CHECKED: the guard it names was reverted in
 // src/agents/messages.ts, the suite was re-run, the named test was confirmed to fail, and the
 // guard was restored. The mapping is in the PR body. A test that stays green with the guard
 // removed certifies the hole instead of closing it.
 
-import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 
 import {
@@ -24,6 +28,7 @@ import {
 } from '../src/agents/messages'
 import type { Env } from '../src/types'
 import { createSqliteD1 } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 
 const T0 = '2026-08-10T15:00:00.000Z'
 const at = (secondsFromT0: number) => new Date(Date.parse(T0) + secondsFromT0 * 1000).toISOString()
@@ -31,34 +36,18 @@ const clock = (iso: string) => ({ now: () => iso })
 
 function fixture() {
   const harness = createSqliteD1()
-  // 0032_agent_messages.sql shape + the 0056 project_id column. Written out rather than
-  // sourced because 0032 also creates tables this fixture has no use for; the columns and
-  // the two indexes the lease path depends on are what matter and they are reproduced exactly.
+  applyAllMigrations(harness.sqlite)
+  // Real FKs are ON in this harness: agent_inbox_fences references agents(id) and
+  // members(id), so the seats have to be real rows in the real tables.
   harness.sqlite.exec(`
-    CREATE TABLE members (id TEXT PRIMARY KEY);
-    CREATE TABLE agents (id TEXT PRIMARY KEY);
-    CREATE TABLE agent_messages (
-      seq         INTEGER PRIMARY KEY AUTOINCREMENT,
-      id          TEXT NOT NULL UNIQUE,
-      tenant      TEXT NOT NULL,
-      to_agent    TEXT NOT NULL,
-      from_agent  TEXT NOT NULL,
-      from_member TEXT NOT NULL,
-      kind        TEXT NOT NULL DEFAULT 'message',
-      body        TEXT NOT NULL,
-      request_id  TEXT,
-      in_reply_to TEXT,
-      created_at  TEXT NOT NULL DEFAULT (datetime('now')),
-      read_at     TEXT,
-      project_id  TEXT
-    );
-    CREATE INDEX idx_agent_messages_inbox ON agent_messages(tenant, to_agent, read_at, seq);
-    INSERT INTO members(id) VALUES ('owner');
-    INSERT INTO agents(id) VALUES ('agent-a'), ('agent-b');
+    INSERT INTO departments (id, slug, name) VALUES ('dept-a', 'dept-a', 'Department A');
+    INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-a', 'dept-a', 'squad-a', 'Squad Alpha');
+    INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES
+      ('agent-a', 'squad-a', 'agent-a', 'Agent Alpha', 'operator', 'test', 'active'),
+      ('agent-b', 'squad-a', 'agent-b', 'Agent Beta', 'operator', 'test', 'active');
+    INSERT INTO members (id, email, display_name, status, tenant) VALUES
+      ('owner', 'owner@pot.test', 'Owner', 'active', 'tenant-a');
   `)
-  harness.sqlite.exec(readFileSync(new URL('../migrations/0058_agent_inbox_fences.sql', import.meta.url), 'utf8'))
-  // THE migration under test, applied as shipped.
-  harness.sqlite.exec(readFileSync(new URL('../migrations/0090_agent_message_lease.sql', import.meta.url), 'utf8'))
 
   const env = { TENANT_SLUG: 'tenant-a', DB: harness.db } as unknown as Env
 
