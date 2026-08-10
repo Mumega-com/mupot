@@ -78,7 +78,11 @@ import { buildOrient, renderBrief } from '../orient/service'
 import { mcpEndpoint, canonicalOrigin, requiredCanonicalOrigin } from '../dashboard/connect'
 import { classify, humanAge } from '../dashboard/fleet'
 import { resolveAgentRef } from '../org/resolve'
-import { sendToRef, readAgentInbox, sendAgentMessage } from '../agents/messages'
+import {
+  sendToRef, readAgentInbox, sendAgentMessage,
+  leaseAgentInbox, ackAgentMessages, listDeadLetteredMessages, summarizeDeadLetters,
+  MAX_DELIVERY_ATTEMPTS, DEFAULT_LEASE_SECONDS, MAX_LEASE_SECONDS,
+} from '../agents/messages'
 import { recordCheckin, sqliteUtcToMs } from '../fleet/presence'
 import { agentKeyFingerprint, loadActiveAgentKey } from '../fleet/agent-keys'
 import { PROVISION_TOOLS } from './provision'
@@ -2359,6 +2363,156 @@ const toolInbox: ToolSpec = {
   },
 }
 
+// inbox_lease — read the caller's own inbox WITHOUT marking it read (#899).
+//
+// `inbox` can only say "delivered the whole batch" or "delivered nothing", which is why every
+// harness carries a local file spool: the spool, not the pot, is where "fetched but not yet
+// handled" lives. That is also where it hides — a responder that retried one oversized
+// message five times over ~55 minutes on 2026-08-10 was invisible here, because in the pot
+// those rows read simply as "read".
+//
+// This hands rows out under a visibility lease and leaves read_at alone. The caller acks what
+// it handled with inbox_ack; anything it did not ack comes back when the lease expires. After
+// MAX_DELIVERY_ATTEMPTS hand-outs a message is dead-lettered — it stops being leased (so the
+// queue behind it drains) and shows up in inbox_dead_letters.
+//
+// Self-scoped and fenced exactly like `inbox`: the agent id is auth.boundAgentId, never an
+// argument, and an agent fenced to signed_only refuses the bearer caller.
+const toolInboxLease: ToolSpec = {
+  name: 'inbox_lease',
+  scope: 'self (the caller agent leases from its own inbox)',
+  min: 'authenticated',
+  args: '{ limit?: number, lease_seconds?: number }',
+  inputSchema: {
+    type: 'object',
+    properties: { limit: OPTIONAL_NUMBER_SCHEMA, lease_seconds: OPTIONAL_NUMBER_SCHEMA },
+    required: [],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const agent = auth.boundAgentId
+    if (!agent) return fail(403, 'not_agent_bound', 'inbox_lease requires an agent-bound token (member_tokens.agent_id)')
+    let limit: number | undefined
+    if (args.limit !== undefined) {
+      if (typeof args.limit !== 'number' || !Number.isFinite(args.limit))
+        return fail(400, 'invalid_args', 'limit must be a number')
+      limit = args.limit
+    }
+    let leaseSeconds: number | undefined
+    if (args.lease_seconds !== undefined) {
+      if (typeof args.lease_seconds !== 'number' || !Number.isFinite(args.lease_seconds))
+        return fail(400, 'invalid_args', 'lease_seconds must be a number')
+      leaseSeconds = args.lease_seconds
+    }
+
+    const res = await leaseAgentInbox(env, { agent, limit, leaseSeconds })
+    if (!res.ok) {
+      if (res.reason === 'db_error') return fail(500, res.reason) // no raw DB string to caller
+      if (res.reason === 'consumer_fenced') return fail(409, res.reason)
+      return fail(400, res.reason, res.detail)
+    }
+    return done({
+      messages: res.messages,
+      remaining: res.remaining,
+      dead_lettered: res.dead_lettered,
+      lease_seconds: res.lease_seconds,
+      max_lease_seconds: MAX_LEASE_SECONDS,
+      default_lease_seconds: DEFAULT_LEASE_SECONDS,
+      max_delivery_attempts: MAX_DELIVERY_ATTEMPTS,
+      consumed: false,
+    })
+  },
+}
+
+// inbox_ack — mark the messages the caller ACTUALLY handled as read (#899).
+//
+// Per message, so a poison message at the head of the queue no longer buries everything
+// behind it. Idempotent: re-acking an already-read id is success, not an error, because the
+// alternative is every caller re-implementing the retry bookkeeping this tool exists to
+// remove. Ids that are not this agent's are refused without saying whether they exist.
+const toolInboxAck: ToolSpec = {
+  name: 'inbox_ack',
+  scope: 'self (the caller agent acks messages addressed to itself)',
+  min: 'authenticated',
+  args: '{ ids: string[] }',
+  inputSchema: {
+    type: 'object',
+    properties: { ids: OPTIONAL_STRING_ARRAY_SCHEMA },
+    required: ['ids'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const agent = auth.boundAgentId
+    if (!agent) return fail(403, 'not_agent_bound', 'inbox_ack requires an agent-bound token (member_tokens.agent_id)')
+    if (!Array.isArray(args.ids) || args.ids.some((id) => typeof id !== 'string'))
+      return fail(400, 'invalid_args', 'ids must be an array of strings')
+
+    const res = await ackAgentMessages(env, { agent, ids: args.ids as string[] })
+    if (!res.ok) {
+      if (res.reason === 'db_error') return fail(500, res.reason)
+      if (res.reason === 'consumer_fenced') return fail(409, res.reason)
+      return fail(400, res.reason, res.detail)
+    }
+    return done({ acked: res.acked, already_read: res.already_read, refused: res.refused })
+  },
+}
+
+// inbox_dead_letters — the stuck-seat fact, in the pot (#899).
+//
+// Poison-message parking used to happen in a local failed/ directory nobody inspects. Two
+// scopes, deliberately:
+//   - default, self: the caller's own parked messages, bodies included, fenced like `inbox`.
+//   - scope:"pot" (org admin): counts and ages per agent, NO bodies. An operator needs to
+//     know WHICH seat is stuck; that question does not require minting a new
+//     admin-reads-every-agent's-messages capability, so it does not get one.
+const toolInboxDeadLetters: ToolSpec = {
+  name: 'inbox_dead_letters',
+  scope: 'self by default; scope:"pot" is org-admin metadata across every inbox',
+  min: 'authenticated',
+  args: '{ limit?: number, scope?: "self"|"pot" }',
+  inputSchema: {
+    type: 'object',
+    properties: { limit: OPTIONAL_NUMBER_SCHEMA, scope: STRING_SCHEMA },
+    required: [],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    if (args.scope !== undefined && args.scope !== 'self' && args.scope !== 'pot')
+      return fail(400, 'invalid_args', 'scope must be "self" or "pot"')
+    let limit: number | undefined
+    if (args.limit !== undefined) {
+      if (typeof args.limit !== 'number' || !Number.isFinite(args.limit))
+        return fail(400, 'invalid_args', 'limit must be a number')
+      limit = args.limit
+    }
+
+    if (args.scope === 'pot') {
+      if (!hasWorkspaceAdmin(auth)) return fail(403, 'forbidden', { need: 'org:admin' })
+      const summary = await summarizeDeadLetters(env, limit ?? 100)
+      if (!summary.ok) {
+        if (summary.reason === 'db_error') return fail(500, summary.reason)
+        return fail(400, summary.reason, summary.detail)
+      }
+      return done({ scope: 'pot', agents: summary.agents, max_delivery_attempts: MAX_DELIVERY_ATTEMPTS })
+    }
+
+    const agent = auth.boundAgentId
+    if (!agent) return fail(403, 'not_agent_bound', 'inbox_dead_letters requires an agent-bound token')
+    const res = await listDeadLetteredMessages(env, { agent, limit })
+    if (!res.ok) {
+      if (res.reason === 'db_error') return fail(500, res.reason)
+      if (res.reason === 'consumer_fenced') return fail(409, res.reason)
+      return fail(400, res.reason, res.detail)
+    }
+    return done({
+      scope: 'self',
+      messages: res.messages,
+      total: res.total,
+      max_delivery_attempts: MAX_DELIVERY_ATTEMPTS,
+    })
+  },
+}
+
 // inbox_fence_status — redacted self-status for cutover evidence. The fence is
 // enforced in readAgentInbox, so this tool cannot bypass or consume the inbox.
 const toolInboxFenceStatus: ToolSpec = {
@@ -3022,6 +3176,9 @@ export const TOOLS: ToolSpec[] = [
   toolSend,
   toolBroadcast,
   toolInbox,
+  toolInboxLease,
+  toolInboxAck,
+  toolInboxDeadLetters,
   toolInboxFenceStatus,
   toolInboxFenceSet,
   toolPeers,
