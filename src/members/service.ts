@@ -202,6 +202,11 @@ export async function prepareAgentBoundTokenMintForBinding(
     // 'member' row, the SELECT returns nothing, and the mint throws. That made
     // every lead-holding agent permanently unmintable: recovery needed an
     // operator principal to downgrade first, so no agent could self-recover.
+    // LIMIT 1 with no ORDER BY is deterministic ONLY because
+    // migrations/0002_members.sql:36 declares UNIQUE(member_id, scope_type, scope_id)
+    // — at most one row can match. If that constraint is ever relaxed this silently
+    // becomes "whichever row SQLite reaches first"; add an explicit ordering then.
+    // (Athena, gate on #891.)
     const committed = await env.DB.prepare(
       `SELECT capability FROM capabilities
         WHERE member_id = ?
