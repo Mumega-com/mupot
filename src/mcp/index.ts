@@ -37,6 +37,7 @@ import type {
 import { resolveCapabilities, hasCapability, holdsCapabilityFloor, canOnSquad, hasSurfaceCap } from '../auth/capability'
 import { callerHoldsGateCapability, verdictPrincipal } from '../tasks/index'
 import { isChannel } from '../members/service'
+import { resolveConsentedAgentCapabilities } from './oauth-authorize'
 import { createBus } from '../bus'
 import { createMemory } from '../memory'
 import {
@@ -165,9 +166,51 @@ async function resolveAuth(c: {
         // own normalization exactly: only a KNOWN non-directory channel (workspace/im/
         // dashboard) earns real caps — missing/garbage channel fails closed to [], same
         // as the producer, so the two ceilings can never diverge on a malformed blob.
+        //
+        // mupot#903b: a directory-channel session CAN legitimately carry non-zero
+        // capabilities now — a consent-bound seat (auth.boundAgentId set via the
+        // explicit /oauth/consent flow). Before this, EVERY directory-channel request
+        // landed in the `else` branch below and got capabilities=[] + boundAgentId=null
+        // unconditionally — which would have made the entire consent feature dead on
+        // arrival in production: buildAuthContextFromProps computes the correct clamped
+        // capabilities upstream in McpOAuthApiHandler, serializes them into THIS header,
+        // and this re-derivation step would have erased them again on every single real
+        // request before a tool handler ever saw them. (Every unit test in
+        // tests/agent-bound-oauth-consent.test.ts calls invokeTool directly with an
+        // already-built AuthContext, bypassing this header hop entirely — which is why
+        // none of them caught it; tests/mcp-app-oauth-header.test.ts below drives the
+        // real McpOAuthApiHandler -> header -> mcpApp path specifically to close that
+        // gap.)
+        //
+        // Same "never trust the blob's capabilities claim, always re-derive server-side"
+        // posture as the known-non-directory branch: resolveConsentedAgentCapabilities
+        // re-runs the FULL live check (agent status, the CONSENTING human's status and
+        // continued eligibility, and the P0-1 clamp to that human's own rank) fresh
+        // against D1 every call — it does not trust auth.capabilities, only
+        // auth.boundAgentId and auth.consentedByMemberId as identity/routing pointers
+        // (the same trust level auth.boundAgentId already carries for a workspace
+        // channel in the branch above, which is left untouched here).
         const knownNonDirectory = isChannel(auth.channel)
-        auth.capabilities = knownNonDirectory ? await resolveCapabilities(c.env, auth.userId) : []
-        if (!knownNonDirectory) auth.boundAgentId = null
+        if (knownNonDirectory) {
+          auth.capabilities = await resolveCapabilities(c.env, auth.userId)
+        } else if (auth.channel === 'directory' && auth.boundAgentId) {
+          auth.capabilities = await resolveConsentedAgentCapabilities(
+            c.env,
+            auth.boundAgentId,
+            auth.consentedByMemberId ?? null,
+          )
+          // mupot#903b P1 (adversarial review round 3): mirrors the same null-out
+          // in buildAuthContextFromProps (src/mcp/oauth-authorize.ts) — this is the
+          // SECOND derivation site (the internal-header re-derivation hop), and
+          // both must independently null the weld once capabilities are empty, or
+          // inbox/inbox_consumer_status (gate on auth.boundAgentId alone, zero
+          // capability check) would keep this session's identity alive after its
+          // ambient authority has already died on this same request.
+          if (auth.capabilities.length === 0) auth.boundAgentId = null
+        } else {
+          auth.capabilities = []
+          auth.boundAgentId = null
+        }
         return auth
       }
     } catch {
