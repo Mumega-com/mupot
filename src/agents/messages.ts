@@ -472,6 +472,416 @@ export function readAgentInbox(
   return readAgentInboxForReader(env, input, 'bearer', opts)
 }
 
+// ── lease / ack / dead-letter (#899) ───────────────────────────────────────────────────
+//
+// The problem this closes. `inbox` has exactly two modes and neither can express "I got it
+// but I have not handled it yet": peek reads without claiming (so a crashed reader re-reads
+// the same head forever), and the default consume marks the WHOLE BATCH read in one
+// UPDATE…RETURNING (so a reader that dies on message #1 has already told the pot all six
+// were delivered). Every harness therefore keeps a LOCAL file spool to hold the difference,
+// and the spool is where the truth goes to hide: on 2026-08-10 a responder timed out on one
+// oversized message five times across ~55 minutes, head-of-line blocking a queue of six, and
+// in the pot those rows read simply as "read".
+//
+// The fix is the same shape mupot already uses for its own events (wrangler.toml:
+// mupot-events -> mupot-events-dlq): a visibility lease, an explicit per-message ack, and an
+// automatic dead-letter after a bounded number of attempts.
+//
+//   inbox_lease  hands rows out and makes them invisible until lease_expires_at, WITHOUT
+//                setting read_at. A reader that dies gets the rows back when the lease
+//                expires — that is the crash recovery the local spool was standing in for.
+//   inbox_ack    sets read_at for the ids the caller ACTUALLY handled. Per message, so a
+//                poison message at the head no longer buries the five behind it.
+//   dead-letter  after MAX_DELIVERY_ATTEMPTS hand-outs the row stops being leased and
+//                becomes a queryable fact in the pot instead of a file in a failed/ dir.
+//
+// `inbox` is untouched. Its SQL, its predicates and its two callers (the MCP tool and
+// GET /api/inbox) are exactly as they were — five live seats depend on that path right now,
+// and this is purely additive alongside it. A row consumed the old way simply never has
+// delivery_attempts or lease_expires_at touched.
+//
+// The consumer fence (agent_inbox_fences, migration 0058) applies to all three, using the
+// IDENTICAL bearer predicate as readAgentInboxForReader. That is not decoration: lease reads
+// bodies and ack sets read_at, so an agent fenced to signed_only whose bearer token could
+// still lease or ack would have the fence bypassed outright — the bearer caller could drain
+// or destroy the inbox the signed consumer is supposed to own.
+
+/** Hand-outs allowed before a message is dead-lettered instead of leased again. The 55-minute
+ *  incident was ~5 retries of one message; at the default 300s lease that is ~25 minutes of
+ *  blockage before the pot itself says "this one is stuck". */
+export const MAX_DELIVERY_ATTEMPTS = 5
+/** Default visibility timeout for a leased message. */
+export const DEFAULT_LEASE_SECONDS = 300
+/** Caller-override ceiling. An unbounded lease is a self-inflicted outage: nothing else can
+ *  pick the message up until it expires, and there is no unlease call. */
+export const MAX_LEASE_SECONDS = 3600
+const MIN_LEASE_SECONDS = 1
+/** Ids accepted by one inbox_ack call — the lease cap is MAX_INBOX_LIMIT, so a caller can
+ *  always ack a full lease in one shot. */
+const MAX_ACK_IDS = MAX_INBOX_LIMIT
+
+export interface LeasedMessage extends InboxMessage {
+  delivery_attempts: number
+  lease_expires_at: string
+}
+
+export interface LeaseResult {
+  ok: true
+  messages: LeasedMessage[]
+  /** Unread, not dead-lettered, not currently leased — i.e. how many MORE could be leased now. */
+  remaining: number
+  /** Unread rows parked by the dead-letter rule. Non-zero means a seat is stuck. */
+  dead_lettered: number
+  lease_seconds: number
+}
+
+export interface DeadLetteredMessage extends InboxMessage {
+  delivery_attempts: number
+  dead_lettered_at: string
+  dead_letter_reason: string
+}
+
+export interface AckResult {
+  ok: true
+  /** Ids this call moved from unread to read. */
+  acked: string[]
+  /** Ids already read — idempotent success, NOT an error (a retried ack must not fail). */
+  already_read: string[]
+  /** Ids that are not this agent's to ack. Deliberately merges "no such message" with
+   *  "exists, addressed to someone else": splitting them turns ack into a tenant-wide
+   *  message-id oracle, the same class the send path collapses to send_target_not_visible. */
+  refused: string[]
+}
+
+export type LeaseFailure = {
+  ok: false
+  reason: 'no_tenant' | 'invalid_agent' | 'invalid_limit' | 'invalid_lease' | 'consumer_fenced' | 'db_error'
+  detail?: string
+}
+
+export type AckFailure = {
+  ok: false
+  reason: 'no_tenant' | 'invalid_agent' | 'invalid_ids' | 'consumer_fenced' | 'db_error'
+  detail?: string
+}
+
+const LEASE_COLS =
+  'seq, id, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id, delivery_attempts, lease_expires_at'
+
+/** The bearer half of the 0058 consumer fence, written once so lease/ack/dead-letter cannot
+ *  drift from the predicate readAgentInboxForReader enforces. `?N` numbering is caller-chosen
+ *  because these statements bind different positions. */
+function bearerFencePredicate(tenantParam: string, agentParam: string): string {
+  return `COALESCE((SELECT mode FROM agent_inbox_fences
+                     WHERE tenant = ${tenantParam} AND agent_id = ${agentParam}), 'bearer_only') = 'bearer_only'`
+}
+
+async function bearerFenceBlocks(env: Env, tenant: string, agent: string): Promise<boolean> {
+  const fence = await env.DB.prepare(
+    `SELECT mode FROM agent_inbox_fences WHERE tenant = ?1 AND agent_id = ?2 LIMIT 1`,
+  ).bind(tenant, agent).first<{ mode: string }>()
+  return (fence?.mode ?? 'bearer_only') !== 'bearer_only'
+}
+
+/**
+ * Lease the oldest unread, non-dead-lettered, non-leased messages for the caller's own inbox.
+ *
+ * Does NOT set read_at — only inbox_ack does. The row is hidden from the next lease until
+ * lease_expires_at passes, at which point it becomes leasable again.
+ */
+export async function leaseAgentInbox(
+  env: Env,
+  input: { agent: string; limit?: number; leaseSeconds?: number },
+  opts: Pick<Opts, 'now'> = {},
+): Promise<LeaseResult | LeaseFailure> {
+  const tenant = env.TENANT_SLUG
+  if (!tenant) return { ok: false, reason: 'no_tenant' }
+  if (typeof input.agent !== 'string' || !isRef(input.agent))
+    return { ok: false, reason: 'invalid_agent', detail: 'agent required' }
+
+  let limit = DEFAULT_INBOX_LIMIT
+  if (input.limit !== undefined) {
+    if (typeof input.limit !== 'number' || !Number.isFinite(input.limit))
+      return { ok: false, reason: 'invalid_limit', detail: 'limit must be a number' }
+    limit = Math.min(MAX_INBOX_LIMIT, Math.max(1, Math.floor(input.limit)))
+  }
+
+  let leaseSeconds = DEFAULT_LEASE_SECONDS
+  if (input.leaseSeconds !== undefined) {
+    if (typeof input.leaseSeconds !== 'number' || !Number.isFinite(input.leaseSeconds))
+      return { ok: false, reason: 'invalid_lease', detail: 'lease_seconds must be a number' }
+    leaseSeconds = Math.min(MAX_LEASE_SECONDS, Math.max(MIN_LEASE_SECONDS, Math.floor(input.leaseSeconds)))
+  }
+
+  const now = opts.now ?? (() => new Date().toISOString())
+  const nowIso = now()
+  const nowMs = Date.parse(nowIso)
+  if (!Number.isFinite(nowMs)) return { ok: false, reason: 'db_error', detail: 'clock' }
+  const expiresIso = new Date(nowMs + leaseSeconds * 1000).toISOString()
+
+  // "Not currently leased" — NULL means never leased; a lease at or before now has expired.
+  // Both timestamps are ISO-8601 UTC with a fixed shape, so lexicographic <= IS chronological.
+  const leasable = (t: string, a: string, n: string) =>
+    `tenant = ${t} AND to_agent = ${a} AND read_at IS NULL AND dead_lettered_at IS NULL
+       AND (lease_expires_at IS NULL OR lease_expires_at <= ${n})`
+
+  try {
+    // No pre-flight fence check. An earlier draft had one; a mutation run showed it was
+    // unobservable — deleting it left the whole suite green — because BOTH statements below
+    // carry the fence predicate themselves and the post-check turns a lost race into a
+    // reason. A guard nothing can detect the removal of is not a guard, it is a comment that
+    // costs a query. The fence for this path is: the predicate in the sweep, the predicate in
+    // the lease, and the post-check.
+
+    // Step 1 — dead-letter sweep. A row that has already been handed out MAX_DELIVERY_ATTEMPTS
+    // times and has come back round (lease expired, still unacked) is poison: park it so the
+    // messages queued behind it drain on this very call. This is a separate statement from the
+    // lease on purpose — UPDATE…RETURNING returns every row it touched, so dead-lettering
+    // inside the lease would hand the poison message straight back to the caller.
+    await env.DB.prepare(
+      `UPDATE agent_messages
+          SET dead_lettered_at = ?4,
+              dead_letter_reason = 'max_delivery_attempts_exceeded:' || delivery_attempts
+        WHERE ${leasable('?1', '?2', '?3')}
+          AND delivery_attempts >= ?5
+          AND ${bearerFencePredicate('?1', '?2')}`,
+    ).bind(tenant, input.agent, nowIso, nowIso, MAX_DELIVERY_ATTEMPTS).run()
+
+    // Step 2 — the lease. ONE statement, same shape as the existing consume: the rows are
+    // selected and stamped together, so two concurrent leases cannot hand out the same row.
+    // The loser's subquery re-evaluates against the winner's committed lease_expires_at (now
+    // in the future) and selects nothing. delivery_attempts increments here, on hand-out —
+    // the count is "times delivered", which is what the dead-letter rule needs to be true.
+    const rows = await env.DB.prepare(
+      `UPDATE agent_messages
+          SET delivery_attempts = delivery_attempts + 1,
+              lease_expires_at = ?5
+        WHERE seq IN (
+          SELECT seq FROM agent_messages
+           WHERE ${leasable('?1', '?2', '?3')}
+             AND ${bearerFencePredicate('?1', '?2')}
+           ORDER BY seq ASC LIMIT ?4
+        )
+        RETURNING ${LEASE_COLS}`,
+    ).bind(tenant, input.agent, nowIso, limit, expiresIso).all<LeasedMessage>()
+
+    const messages = (rows.results ?? []).slice().sort((a, b) => Number(a.seq) - Number(b.seq))
+    for (const m of messages) {
+      m.seq = Number(m.seq)
+      m.delivery_attempts = Number(m.delivery_attempts)
+      m.project_id = m.project_id ?? null
+    }
+
+    // Post-check, mirroring readAgentInboxForReader. The pre-check above is NOT the fence —
+    // it cannot be, because a fence flip between it and the UPDATE would slip through. The
+    // fence is the predicate INSIDE both statements; this re-read exists only so a caller
+    // that lost that race is told `consumer_fenced` rather than an ambiguous empty inbox.
+    // If rows WERE claimed, they were claimed while the fence still allowed it and must be
+    // returned — dropping them here would lose messages the pot has already counted as
+    // delivered once.
+    if (messages.length === 0 && await bearerFenceBlocks(env, tenant, input.agent)) {
+      return { ok: false, reason: 'consumer_fenced' }
+    }
+
+    const counts = await env.DB.prepare(
+      `SELECT
+         SUM(CASE WHEN dead_lettered_at IS NULL
+                   AND (lease_expires_at IS NULL OR lease_expires_at <= ?3) THEN 1 ELSE 0 END) AS leasable,
+         SUM(CASE WHEN dead_lettered_at IS NOT NULL THEN 1 ELSE 0 END) AS dead
+        FROM agent_messages
+       WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL`,
+    ).bind(tenant, input.agent, nowIso).first<{ leasable: number | null; dead: number | null }>()
+
+    return {
+      ok: true,
+      messages,
+      remaining: Number(counts?.leasable ?? 0),
+      dead_lettered: Number(counts?.dead ?? 0),
+      lease_seconds: leaseSeconds,
+    }
+  } catch (err) {
+    return { ok: false, reason: 'db_error', detail: err instanceof Error ? err.message : String(err) }
+  }
+}
+
+/**
+ * Acknowledge messages the caller ACTUALLY handled: set read_at and drop the lease.
+ *
+ * Only the bound recipient may ack, and only rows addressed to them — enforced in SQL by
+ * `to_agent = ?`, never by trusting an argument. Acking an already-read row is an idempotent
+ * no-op success: a retried ack after a network blip must not look like a failure, or every
+ * caller re-invents the retry bookkeeping this tool exists to remove.
+ */
+export async function ackAgentMessages(
+  env: Env,
+  input: { agent: string; ids: string[] },
+  opts: Pick<Opts, 'now'> = {},
+): Promise<AckResult | AckFailure> {
+  const tenant = env.TENANT_SLUG
+  if (!tenant) return { ok: false, reason: 'no_tenant' }
+  if (typeof input.agent !== 'string' || !isRef(input.agent))
+    return { ok: false, reason: 'invalid_agent', detail: 'agent required' }
+  if (!Array.isArray(input.ids) || input.ids.length === 0)
+    return { ok: false, reason: 'invalid_ids', detail: 'ids must be a non-empty array' }
+  if (input.ids.length > MAX_ACK_IDS)
+    return { ok: false, reason: 'invalid_ids', detail: `at most ${MAX_ACK_IDS} ids per call` }
+  if (!input.ids.every((id) => typeof id === 'string' && isRef(id)))
+    return { ok: false, reason: 'invalid_ids', detail: 'each id must be a non-empty string' }
+
+  // De-duplicate so a repeated id inside ONE call cannot land in both `acked` and `refused`.
+  const ids = [...new Set(input.ids)]
+  const now = opts.now ?? (() => new Date().toISOString())
+  const placeholders = ids.map((_, i) => `?${i + 4}`).join(', ')
+
+  try {
+    // The fence lives in the statement below and in the post-check after it — see the note in
+    // leaseAgentInbox on why there is no pre-flight check here.
+    // One statement, RETURNING the ids it actually moved. Rows addressed to another agent
+    // never match `to_agent = ?2`, so a non-recipient's ack writes nothing at all — the
+    // refusal is a property of the SQL, not of a check that could be skipped above it.
+    const acked = await env.DB.prepare(
+      `UPDATE agent_messages
+          SET read_at = ?3, lease_expires_at = NULL
+        WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL
+          AND id IN (${placeholders})
+          AND ${bearerFencePredicate('?1', '?2')}
+        RETURNING id`,
+    ).bind(tenant, input.agent, now(), ...ids).all<{ id: string }>()
+    const ackedIds = new Set((acked.results ?? []).map((r) => r.id))
+
+    // Same post-check as lease: the in-statement predicate is the fence, this only turns a
+    // lost race into an honest reason instead of a silent all-refused result.
+    if (ackedIds.size === 0 && await bearerFenceBlocks(env, tenant, input.agent)) {
+      return { ok: false, reason: 'consumer_fenced' }
+    }
+
+    // Whatever did not move is either already-read (the caller's own row: safe to name, and
+    // naming it is what makes the retry idempotent rather than ambiguous) or not theirs.
+    const rest = ids.filter((id) => !ackedIds.has(id))
+    const alreadyRead = new Set<string>()
+    if (rest.length > 0) {
+      const restPlaceholders = rest.map((_, i) => `?${i + 3}`).join(', ')
+      const owned = await env.DB.prepare(
+        `SELECT id FROM agent_messages
+          WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NOT NULL
+            AND id IN (${restPlaceholders})`,
+      ).bind(tenant, input.agent, ...rest).all<{ id: string }>()
+      for (const r of owned.results ?? []) alreadyRead.add(r.id)
+    }
+
+    return {
+      ok: true,
+      acked: ids.filter((id) => ackedIds.has(id)),
+      already_read: rest.filter((id) => alreadyRead.has(id)),
+      refused: rest.filter((id) => !alreadyRead.has(id)),
+    }
+  } catch (err) {
+    return { ok: false, reason: 'db_error', detail: err instanceof Error ? err.message : String(err) }
+  }
+}
+
+/**
+ * List the caller's dead-lettered (parked) messages, oldest first.
+ *
+ * This is the whole point of dead-lettering in the pot rather than in a local failed/ dir:
+ * a stuck seat is a row anyone with the right to read that inbox can see, not something
+ * found by grepping journalctl on one host.
+ */
+export async function listDeadLetteredMessages(
+  env: Env,
+  input: { agent: string; limit?: number },
+): Promise<{ ok: true; messages: DeadLetteredMessage[]; total: number } | LeaseFailure> {
+  const tenant = env.TENANT_SLUG
+  if (!tenant) return { ok: false, reason: 'no_tenant' }
+  if (typeof input.agent !== 'string' || !isRef(input.agent))
+    return { ok: false, reason: 'invalid_agent', detail: 'agent required' }
+
+  let limit = DEFAULT_INBOX_LIMIT
+  if (input.limit !== undefined) {
+    if (typeof input.limit !== 'number' || !Number.isFinite(input.limit))
+      return { ok: false, reason: 'invalid_limit', detail: 'limit must be a number' }
+    limit = Math.min(MAX_INBOX_LIMIT, Math.max(1, Math.floor(input.limit)))
+  }
+
+  try {
+    // Fenced identically to lease: this returns message BODIES, so a bearer caller on a
+    // signed_only agent must not be able to read its inbox through the dead-letter door.
+    // The fence predicate is IN the SELECT, exactly like readAgentInboxForReader's peek path:
+    // a flip landing between the pre-check and this read would otherwise disclose the bodies
+    // the flip exists to withhold.
+    const rows = await env.DB.prepare(
+      `SELECT seq, id, from_agent, from_member, kind, body, request_id, in_reply_to, created_at,
+              project_id, delivery_attempts, dead_lettered_at, dead_letter_reason
+         FROM agent_messages
+        WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL AND dead_lettered_at IS NOT NULL
+          AND ${bearerFencePredicate('?1', '?2')}
+        ORDER BY seq ASC LIMIT ?3`,
+    ).bind(tenant, input.agent, limit).all<DeadLetteredMessage>()
+    const messages = rows.results ?? []
+    for (const m of messages) {
+      m.seq = Number(m.seq)
+      m.delivery_attempts = Number(m.delivery_attempts)
+      m.project_id = m.project_id ?? null
+    }
+
+    if (messages.length === 0 && await bearerFenceBlocks(env, tenant, input.agent)) {
+      return { ok: false, reason: 'consumer_fenced' }
+    }
+
+    const totalRow = await env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM agent_messages
+        WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL AND dead_lettered_at IS NOT NULL
+          AND ${bearerFencePredicate('?1', '?2')}`,
+    ).bind(tenant, input.agent).first<{ n: number }>()
+
+    return { ok: true, messages, total: Number(totalRow?.n ?? 0) }
+  } catch (err) {
+    return { ok: false, reason: 'db_error', detail: err instanceof Error ? err.message : String(err) }
+  }
+}
+
+/**
+ * Dead-letter roll-up across every inbox in the pot — METADATA ONLY, no bodies.
+ *
+ * The operator question "which seat is stuck?" cannot be answered from a self-scoped tool,
+ * and answering it must not quietly mint a new admin-reads-every-agent's-messages
+ * capability. So this returns counts and the parking reason per agent, and nothing an
+ * operator could not already infer from the fact that a seat is not draining.
+ */
+export async function summarizeDeadLetters(
+  env: Env,
+  limit = 100,
+): Promise<{ ok: true; agents: Array<{ agent_id: string; dead_lettered: number; oldest_dead_lettered_at: string; max_delivery_attempts: number }> } | LeaseFailure> {
+  const tenant = env.TENANT_SLUG
+  if (!tenant) return { ok: false, reason: 'no_tenant' }
+  const capped = Math.min(MAX_INBOX_LIMIT, Math.max(1, Math.floor(limit)))
+  try {
+    const rows = await env.DB.prepare(
+      `SELECT to_agent AS agent_id, COUNT(*) AS dead_lettered,
+              MIN(dead_lettered_at) AS oldest_dead_lettered_at,
+              MAX(delivery_attempts) AS max_delivery_attempts
+         FROM agent_messages
+        WHERE tenant = ?1 AND read_at IS NULL AND dead_lettered_at IS NOT NULL
+        GROUP BY to_agent
+        ORDER BY dead_lettered DESC, to_agent ASC
+        LIMIT ?2`,
+    ).bind(tenant, capped).all<{
+      agent_id: string; dead_lettered: number; oldest_dead_lettered_at: string; max_delivery_attempts: number
+    }>()
+    return {
+      ok: true,
+      agents: (rows.results ?? []).map((r) => ({
+        agent_id: r.agent_id,
+        dead_lettered: Number(r.dead_lettered),
+        oldest_dead_lettered_at: r.oldest_dead_lettered_at,
+        max_delivery_attempts: Number(r.max_delivery_attempts),
+      })),
+    }
+  } catch (err) {
+    return { ok: false, reason: 'db_error', detail: err instanceof Error ? err.message : String(err) }
+  }
+}
+
 /** Called only by the cryptographic verify-and-read boundary in fleet/signed-inbox.ts. */
 export function readVerifiedSignedAgentInbox(
   env: Env,
