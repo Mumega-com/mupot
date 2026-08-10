@@ -3,12 +3,17 @@
  *
  * WHY THIS FILE EXISTS
  *
- * mupot recorded no real cost anywhere. `landControlFlight` (routines/actions.ts) hardcoded
- * cost_micro_usd: 0, routine_runs.cost_micro_usd is computed as SUM(flights.cost_micro_usd)
- * — so it summed zeroes — and meter.ts's recordTokens(), the only function that would have
- * accumulated a real figure, has zero callers. Meanwhile routines/dispatch.ts inserted the
- * CONSTANTS promptTokens=1250 / completionTokens=380 at dispatch time, before any work ran,
- * and dashboard/motherboard.ts rendered them as measured usage. See #896.
+ * The ROUTINE FLIGHT PATH recorded no real cost. `landControlFlight` (routines/actions.ts)
+ * hardcoded cost_micro_usd: 0, and routine_runs.cost_micro_usd is computed as
+ * SUM(flights.cost_micro_usd) — so it summed zeroes. Meanwhile routines/dispatch.ts inserted
+ * the CONSTANTS promptTokens=1250 / completionTokens=380 at dispatch time, before any work
+ * ran, and dashboard/motherboard.ts rendered them as measured usage. See #896.
+ *
+ * Scope correction (Athena, gating this PR): meter.ts's recordTokens() is NOT uncalled — the
+ * agent-execute path uses it live via recordTokensSafe (agents/execute.ts:290, :301), covered
+ * by tests/execution-meter.test.ts. An earlier draft of this header claimed "zero callers",
+ * which came from grepping `recordTokens(` and missing the call sites that pass it as a value.
+ * The accurate and sufficient statement is the one above: the ROUTINE path never reaches it.
  *
  * RULES, both learned from that failure:
  *
@@ -48,16 +53,21 @@ export const MODEL_PRICES: Readonly<Record<string, ModelPrice>> = {
     blended: true,
     source: 'commit cd9be86 (fleet roster change that provisioned Asha)',
   },
-  // dashboard/economy.ts already prices Claude Code spend at these list rates.
+  // src/dashboard/economy.ts:248 states these rates in its footer ("priced at Anthropic
+  // list rates (Opus $15/$75 per MTok in/out)") — a display string, not a rate map. This
+  // file is the first machine-readable copy; economy.ts is corroboration, not the source.
   'claude-opus-4': {
     inputMicroUsdPerMTok: 15 * USD_PER_MTOK,
     outputMicroUsdPerMTok: 75 * USD_PER_MTOK,
-    source: 'Anthropic list price, as already used in src/dashboard/economy.ts',
+    source: 'Anthropic list price; corroborated by the footer at src/dashboard/economy.ts:248',
   },
+  // NOT corroborated anywhere in this repo — economy.ts names Opus rates only, and $3/$15
+  // appears nowhere else. Recorded as an external claim so the next reader can challenge it
+  // rather than inherit it. Confirm against a bill before trusting a sonnet-priced total.
   'claude-sonnet-4.6': {
     inputMicroUsdPerMTok: 3 * USD_PER_MTOK,
     outputMicroUsdPerMTok: 15 * USD_PER_MTOK,
-    source: 'Anthropic list price, as already used in src/dashboard/economy.ts',
+    source: 'Anthropic public list price (UNCORROBORATED in-repo — verify before relying on it)',
   },
 }
 
