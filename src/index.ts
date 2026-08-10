@@ -177,12 +177,15 @@ app.route('/api/project-links', projectLinkApp)
 app.route('/api/presence', presenceApp)
 
 // ── OAuth 2.1 authorize leg (C3) ─────────────────────────────────────────────
-// /authorize and /oauth/google-callback must be mounted BEFORE the dashboardApp
-// '/' catch-all so they are not shadowed by the Coming-Soon page.
+// /authorize, /oauth/google-callback, and /oauth/consent must be mounted BEFORE
+// the dashboardApp '/' catch-all so they are not shadowed by the Coming-Soon page.
+// /oauth/consent (mupot#903b) is the agent-selection consent screen's POST target —
+// same handler, routed internally by pathname.
 // /token, /register, /.well-known/* are auto-served by the OAuthProvider wrapper —
 // they never reach this Hono app (the OAuthProvider intercepts them first).
 app.all('/authorize', async (c) => handleOAuthAuthorize(c.req.raw, c.env))
 app.all('/oauth/google-callback', async (c) => handleOAuthAuthorize(c.req.raw, c.env))
+app.all('/oauth/consent', async (c) => handleOAuthAuthorize(c.req.raw, c.env))
 
 app.route(ROUTES.dashboard, dashboardApp)
 

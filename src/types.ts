@@ -442,6 +442,20 @@ export interface AuthContext {
    */
   latentCapabilities?: CapabilityGrant[]
   boundAgentId?: string | null // the agent this token is bound to (the weld), or null = pure human/operator
+  /**
+   * mupot#903b: for a directory-channel session consent-bound to an agent, the
+   * MEMBER ID of the HUMAN who consented — distinct from `memberId`, which for a
+   * bound session is the AGENT's own dedicated member (required by migration
+   * 0071's member_tokens_agent_binding_insert trigger; see oauth-authorize.ts).
+   * null for every unbound/workspace/im/dashboard session — there is no separate
+   * "consenting human" concept outside the directory-consent flow.
+   *
+   * This is the identity the P0-1/P0-2 guards key off: capabilities are clamped
+   * to this human's OWN live rank per scope (never wider than what they hold),
+   * and re-checked live every request (offboarding this human kills the session's
+   * authority even though the AGENT stays untouched).
+   */
+  consentedByMemberId?: string | null
 }
 
 // ── Members & capabilities — humans are first-class network nodes ──
