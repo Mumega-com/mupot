@@ -117,9 +117,12 @@ const VALID_TYPES = new Set(['builder', 'reviewer', 'weaver', 'brain', 'comms', 
 // Attach runtimes include 'hermes' (standalone Hermes agent runtime, absent from the
 // daemon-report set which uses 'hermes-cron' for cron-only Hermes).
 // Goose / goosed are deliberately excluded — see docs/fleet/goose-non-adoption-2026-07-22.md.
+// 'prime-agent' (the harness) and 'herdr' (the terminal host) are the fleet's current
+// migration substrate (F-09 / #881): without them a herdr-hosted seat can never attach
+// with a live runtime, so flight dispatch skips every migrated seat.
 const VALID_RUNTIMES = new Set([
   'codex', 'claude-code', 'nous', 'hermes', 'hermes-cron',
-  'systemd-user', 'tmux', 'python',
+  'systemd-user', 'tmux', 'python', 'prime-agent', 'herdr',
 ])
 
 const VALID_LIFECYCLES = new Set(['on_demand', 'always_on'])
