@@ -188,22 +188,45 @@ export async function prepareAgentBoundTokenMintForBinding(
   let grantCapability = requestedCapability
 
   if (!creating) {
+    // TWO SEPARATE QUESTIONS — do not merge them back together (mupot#890).
+    //
+    //   1. PRECONDITION: does the canonical member hold a home-squad grant at all?
+    //      Any capability satisfies this. Its absence means the identity is
+    //      incomplete and must not be issued a token.
+    //
+    //   2. CLAMP: what capability may this TOKEN record? Never above 'member'.
+    //
+    // Filtering the SELECT by IN ('observer','member') collapsed the two, and
+    // `capabilities` is UNIQUE(member_id, scope_type, scope_id) — one row per
+    // scope. So raising a member's home grant to lead/admin/owner REPLACES the
+    // 'member' row, the SELECT returns nothing, and the mint throws. That made
+    // every lead-holding agent permanently unmintable: recovery needed an
+    // operator principal to downgrade first, so no agent could self-recover.
+    // LIMIT 1 with no ORDER BY is deterministic ONLY because
+    // migrations/0002_members.sql:36 declares UNIQUE(member_id, scope_type, scope_id)
+    // — at most one row can match. If that constraint is ever relaxed this silently
+    // becomes "whichever row SQLite reaches first"; add an explicit ordering then.
+    // (Athena, gate on #891.)
     const committed = await env.DB.prepare(
       `SELECT capability FROM capabilities
         WHERE member_id = ?
           AND scope_type = 'squad'
           AND scope_id = ?
-          AND capability IN ('observer', 'member')
         LIMIT 1`,
     )
       .bind(memberId, agent.squad_id)
-      .first<{ capability: AgentTokenCapability }>()
-    if (!committed || !isAgentTokenCapability(committed.capability)) {
+      .first<{ capability: string }>()
+    if (!committed) {
       throw new Error(
-        'agent_home_capability_missing: canonical agent member has no observer/member home grant',
+        'agent_home_capability_missing: canonical agent member has no home-squad grant',
       )
     }
-    grantCapability = committed.capability
+    // The escalation guard is unchanged and still absolute: AGENT_TOKEN_CAPABILITIES
+    // is ['observer','member'], so a higher home grant clamps DOWN to 'member' and
+    // can never widen what the token carries.
+    grantCapability = isAgentTokenCapability(committed.capability)
+      ? committed.capability
+      : 'member'
   }
 
   const tokenId = crypto.randomUUID()

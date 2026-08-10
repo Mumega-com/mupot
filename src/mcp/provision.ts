@@ -468,7 +468,23 @@ const toolMintAgentToken: ToolSpec = {
     // Either the complete mint lands or none of it does — no orphan credentials.
     // The helper enforces: squad-scoped observer/member only, hash-only storage,
     // show-once raw.
-    const minted = await mintAgentBoundToken(env, agent, label, grantCapability)
+    // Surface the one expected identity precondition as a NAMED failure. Left
+    // unhandled it reaches the caller as a bare `internal_error`, which is what
+    // made mupot#890 cost hours: the message said nothing, so the actual cause
+    // (a missing home-squad grant on the canonical member) was invisible.
+    let minted
+    try {
+      minted = await mintAgentBoundToken(env, agent, label, grantCapability)
+    } catch (err) {
+      if (err instanceof Error && err.message.startsWith('agent_home_capability_missing')) {
+        return fail(409, 'agent_home_capability_missing', {
+          detail: 'canonical agent member has no home-squad grant; grant one before minting',
+          agent_id: agent.id,
+          squad_id: agent.squad_id,
+        })
+      }
+      throw err
+    }
 
     await emitProvisioned(env, auth.memberId as string, 'token', minted.tokenId, {
       squad_id: agent.squad_id,
