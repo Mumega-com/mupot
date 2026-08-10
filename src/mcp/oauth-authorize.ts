@@ -203,12 +203,32 @@ async function mintDirectoryToken(
 //        (src/members/service.ts prepareAgentBoundTokenMintForBinding). An unminted
 //        agent has no dedicated member row and therefore no capability set to grant;
 //        there is nothing to consent to. Fail closed: excluded, not offered as "zero".
-//     3. the human holds `member`-or-higher capability on A's squad_id, via
-//        `canOnSquad` (src/auth/capability.ts) — the SAME primitive, with the SAME
-//        org-wide/department-inheritance semantics, that already gates the existing
-//        `connect { agent_name }` tool's agent-claim check (src/mcp/index.ts
-//        toolConnect). One audited implementation reused, not a second rule invented
-//        for this screen.
+//     3. the human holds `admin`-or-higher capability on A's squad_id, via
+//        `canOnSquad` (src/auth/capability.ts) — the SAME primitive `connect
+//        { agent_name }` uses for its (much weaker, session-local, non-welding)
+//        agent-claim check, but NOT the same floor.
+//
+//        mupot#903b P0-3 (adversarial review, 2026-08-10, gate decision): this
+//        floor was originally 'member', matching connect's floor. That was wrong.
+//        `connect` never welds anything — it is `binding: 'session_local'`
+//        (src/mcp/index.ts toolConnect) and explicitly tells a non-admin caller to
+//        "ask an admin to call mint_agent_token" for anything durable. Consenting
+//        HERE writes a REAL member_tokens.agent_id weld (mintDirectoryToken below)
+//        — the SAME durable artifact mint_agent_token produces, and
+//        mint_agent_token has required 'admin' since it was written, with the
+//        rationale stated verbatim at its own gate (src/mcp/provision.ts): "Minting
+//        a credential that IS an agent is an org-trust act -> admin, never
+//        lead/member." Gating the weld itself at 'member' opened a second, weaker
+//        door to the exact same artifact — proven live pre-fix: a human holding
+//        only squad-a:member consented to agent-a and could then read + CONSUME
+//        agent-a's own inbox messages and SEND on the bus under agent-a's
+//        attribution (`inbox`/`send` gate on `auth.boundAgentId` alone, zero
+//        capability check — src/mcp/index.ts), with isSelf/presence follow-ons
+//        (unredacted orient/connect packets, dispatch-selection injection). This
+//        PR does not touch the deeper "boundAgentId alone is enough for inbox/
+//        send/isSelf/presence" design — see the note in P2-6 below — it closes
+//        the ONE door among several that this PR itself created a second, easier
+//        way through.
 //
 // WHAT THE SESSION ACTUALLY GETS (never the human's own STANDING grants elsewhere,
 // never more than the agent holds, AND — since the 2026-08-10 adversarial review,
@@ -217,15 +237,17 @@ async function mintDirectoryToken(
 // (agent_member_bindings → a member record created solely for that agent at first
 // mint, isolated from the human's own `capabilities` rows by construction — see
 // src/members/service.ts), then CLAMPS each grant to min(agent's own rank, the
-// consenting human's own live rank on that SAME scope) — an agent-bound member CAN
-// legitimately hold more than 'member' on its home squad (setAgentSquadAccess
-// permits up to 'admin'), and the selection rule above only ever required the human
-// to clear 'member'; without the clamp a bare member consenting to an over-permissioned
-// agent inherited that agent's full rank. Re-run on every live request (C2): an
-// agent deactivated after consent immediately loses its grant here (defence in depth
-// alongside the token-revocation side effect above), and — P0-2 — so does an
-// OFFBOARDED HUMAN: the consenting human's own status and continued eligibility are
-// re-validated on every call too, not just the agent's, because the member_tokens row
+// consenting human's own live rank on that SAME scope) — setAgentSquadAccess still
+// permits an agent-bound member up to 'admin' on a squad OTHER than its own home
+// squad (the human's admin-floor grant covers only the CONSENTED agent's home
+// squad, per scope, same as before P0-3), so the clamp remains load-bearing for
+// multi-scope agents even with the raised floor — see section D's per-scope-drop
+// test. Re-run on every live request (C2): an agent deactivated after consent
+// immediately loses its grant here (defence in depth alongside the token-revocation
+// side effect above), and — P0-2 — so does an OFFBOARDED (or merely DEMOTED BELOW
+// ADMIN — P0-3) HUMAN: the consenting human's own status and continued eligibility
+// (now 'admin', not 'member') are re-validated on every call too, not just the
+// agent's, because the member_tokens row
 // this all hangs off of belongs to the AGENT (see mintDirectoryToken below), so the
 // ordinary token-liveness check alone never sees the human's side of this at all.
 
@@ -343,17 +365,34 @@ export async function resolveConsentedAgentCapabilities(
   if (!row || row.status !== 'active') return []
   const agentGrants = await resolveCapabilities(env, row.bound_member_id)
 
-  // Re-validate the CONSENTING HUMAN, live, every call (P0-2).
+  // Re-validate the CONSENTING HUMAN, live, every call (P0-2). Floor is 'admin'
+  // (P0-3) — the SAME bar mint_agent_token requires to create this class of weld
+  // in the first place; a human demoted to 'member' (still eligible under the OLD
+  // floor) must lose the session just as completely as one with zero access.
   const human = await env.DB.prepare(
     `SELECT status FROM members WHERE id = ?1 AND tenant = ?2`,
   ).bind(consentingMemberId, env.TENANT_SLUG).first<{ status: string }>()
   if (!human || human.status !== 'active') return []
   const humanGrants = await resolveCapabilities(env, consentingMemberId)
-  if (!(await canOnSquad(env, humanGrants, row.squad_id, 'member'))) return []
+  if (!(await canOnSquad(env, humanGrants, row.squad_id, 'admin'))) return []
 
   // Clamp every grant to min(agent's own rank, human's own live rank) on that
   // SAME scope (P0-1). Never widen: a scope the human holds nothing on is
   // dropped, not defaulted to the agent's value or to 'observer'.
+  //
+  // Mutation-check note (2026-08-10, gate correction): the `effectiveRank <= 0`
+  // line below is individually an EQUIVALENT MUTANT of the `!clampedCapability`
+  // line right after it — RANK_ORDER contains no capability of rank 0
+  // (observer=1..owner=5), so `.find(c => capabilityRank(c) === 0)` already
+  // returns undefined and the SECOND guard alone drops the grant just as
+  // completely. Verified directly: removing only the first line, leaving the
+  // second untouched, passes all 65 tests in tests/agent-bound-oauth-consent.test.ts
+  // unchanged. The fail-closed BEHAVIOUR (a zero-rank grant is dropped, not
+  // defaulted) is real and IS covered — by the second line — this comment exists
+  // so nobody reads a future refactor that touches only the first line as
+  // removing live protection, and so this file does not misdescribe which line
+  // a passing test actually depends on (see this PR's own mutation-table history
+  // for why that distinction matters).
   const clamped: CapabilityGrant[] = []
   for (const g of agentGrants) {
     const humanRank = await humanMaxRankOnScope(env, humanGrants, g.scope_type, g.scope_id)
@@ -396,16 +435,19 @@ async function resolveAgentForConsent(env: Env, agentId: string): Promise<Consen
 }
 
 /** Re-validates a client-submitted agent_id against the SAME rule the consent
- *  screen was rendered with. Never trust the posted value as proof of eligibility. */
+ *  screen was rendered with. Never trust the posted value as proof of eligibility.
+ *  Floor is 'admin' (P0-3, adversarial review 2026-08-10) — matching
+ *  mint_agent_token, the only other producer of a member_tokens.agent_id weld. */
 export async function memberMayConsentToAgent(env: Env, memberId: string, agentId: string): Promise<boolean> {
   const agent = await resolveAgentForConsent(env, agentId)
   if (!agent) return false
   const humanGrants = await resolveCapabilities(env, memberId)
-  return canOnSquad(env, humanGrants, agent.squad_id, 'member')
+  return canOnSquad(env, humanGrants, agent.squad_id, 'admin')
 }
 
 /** The full selectable list for the consent screen, each with its capability preview
- *  — "a parameter that grants capability without showing it is a phishing surface". */
+ *  — "a parameter that grants capability without showing it is a phishing surface".
+ *  Floor is 'admin' (P0-3) — see memberMayConsentToAgent. */
 export async function listConsentableAgents(env: Env, memberId: string): Promise<ConsentableAgent[]> {
   const humanGrants = await resolveCapabilities(env, memberId)
   const rows = await env.DB.prepare(
@@ -421,7 +463,7 @@ export async function listConsentableAgents(env: Env, memberId: string): Promise
 
   const out: ConsentableAgent[] = []
   for (const row of rows.results ?? []) {
-    if (!(await canOnSquad(env, humanGrants, row.squad_id, 'member'))) continue
+    if (!(await canOnSquad(env, humanGrants, row.squad_id, 'admin'))) continue
     // The preview shows the TRUE clamped result (P0-1) — `memberId` here IS the
     // viewing/consenting human, so this is honest about exactly what the session
     // would carry, never the agent's raw (possibly higher) grant.
@@ -1095,6 +1137,18 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     //      is that this connection acts AS that agent.
     // A human who wants to keep provisioning/administering agents from claude.ai
     // uses "continue unbound" instead — the default, unaffected path.
+    //
+    // RE-READ after P0-3 (gate decision, same review): this reasoning was written
+    // while memberMayConsentToAgent's floor was still 'member', under which a bare
+    // squad-member could reach both side effects above — "a bare member injects an
+    // agent into dispatch selection" was a live consequence of the SAME bug P0-3
+    // fixes, not a separate, independently-decided cost. With the floor raised to
+    // 'admin' (matching mint_agent_token, the only other producer of this weld),
+    // both side effects now require the SAME rank mint_agent_token already
+    // requires to cause them directly — the ground this paragraph stands on is
+    // firmer after P0-3, not weaker; it no longer needs to argue "member is an
+    // acceptable price," only "admin choosing this is the same act as admin
+    // choosing mint_agent_token."
 
     // Mint a directory-channel token for this OAuth seat (show-once raw discarded;
     // the OAuth access token is the credential the client holds). The token row

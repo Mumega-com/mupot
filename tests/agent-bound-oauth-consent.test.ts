@@ -127,11 +127,14 @@ function seedBase(sqlite: SqliteD1Harness['sqlite']): void {
     INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
       VALUES ('cap-e-home', '${MEMBER_AGENT_E}', 'squad', '${AGENT_E.squad_id}', 'admin');
 
-    -- The HUMAN's own standing grants: squad-a member access (to select agent-a),
+    -- The HUMAN's own standing grants: squad-a ADMIN access (P0-3, adversarial
+    -- review 2026-08-10 — the floor to WELD an OAuth session to an agent is
+    -- 'admin', matching mint_agent_token, the only other producer of that weld;
+    -- 'member' is no longer sufficient to consent at all — see section D0),
     -- PLUS an unrelated org:owner grant — this is the human's OWN authority and
     -- must never leak into a consented session's capabilities.
     INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
-      VALUES ('cap-human-squad-a', '${HUMAN}', 'squad', '${AGENT_A.squad_id}', 'member');
+      VALUES ('cap-human-squad-a', '${HUMAN}', 'squad', '${AGENT_A.squad_id}', 'admin');
   `)
 }
 
@@ -223,6 +226,26 @@ describe('A. selection rule — a human may consent to agent A iff active + boun
     expect(list).toEqual([])
     expect(await memberMayConsentToAgent(env, 'member-nobody', AGENT_A.id)).toBe(false)
   })
+
+  it('memberMayConsentToAgent: false — a binding for this agent exists ONLY in a DIFFERENT tenant (resolveAgentForConsent\'s `b.tenant = ?2` join, adversarial review 2026-08-10 — untested before this)', async () => {
+    // agent-f exists (globally — agents carries no tenant column at all, see the
+    // mintMemberId design comment above), active, but has NO agent_member_bindings
+    // row in OUR tenant ('mumega') — only in a hypothetical other tenant sharing
+    // the same D1. Without the tenant-scoped JOIN, resolveAgentForConsent would
+    // find that OTHER tenant's binding and treat agent-f as legitimately minted.
+    harness.sqlite.exec(`
+      INSERT INTO agents (id, squad_id, slug, name, status)
+        VALUES ('agent-f', '${AGENT_A.squad_id}', 'agent-f', 'Agent F', 'active');
+      INSERT INTO members (id, email, display_name, status, created_at, tenant)
+        VALUES ('member-agent-f-other-tenant', NULL, 'Agent F (other tenant)', 'active', '2026-08-01T00:00:00.000Z', 'other-tenant');
+      INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+        VALUES ('other-tenant', 'agent-f', 'member-agent-f-other-tenant', '2026-08-01T00:00:00.000Z');
+    `)
+    const env = envFor(harness)
+    expect(await memberMayConsentToAgent(env, HUMAN, 'agent-f')).toBe(false)
+    const list = await listConsentableAgents(env, HUMAN)
+    expect(list.map((a) => a.id)).not.toContain('agent-f')
+  })
 })
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -271,7 +294,7 @@ describe('B1. unbound directory session — byte-for-byte unchanged (the hard re
       boundAgentId: null,
       consentedByMemberId: null,
       latentCapabilities: [
-        { member_id: HUMAN, scope_type: 'squad', scope_id: AGENT_A.squad_id, capability: 'member' },
+        { member_id: HUMAN, scope_type: 'squad', scope_id: AGENT_A.squad_id, capability: 'admin' },
       ],
     })
   })
@@ -853,7 +876,101 @@ describe('C6. POST /oauth/consent — CSRF and replay protection', () => {
 // the fixture the review named as missing: "the agent holds more than you."
 // ════════════════════════════════════════════════════════════════════════════
 
-describe('D. P0-1 — vertical-escalation clamp (agent-e holds admin on its own squad; human only member)', () => {
+// ════════════════════════════════════════════════════════════════════════════
+// D0. P0-3 (adversarial review 2026-08-10, GATE DECISION) — the weld floor is
+// ADMIN, not member. memberMayConsentToAgent writes a REAL member_tokens.agent_id
+// weld (mintDirectoryToken) — the SAME durable artifact mint_agent_token produces,
+// and mint_agent_token has required 'admin' since it was written (provision.ts:
+// "Minting a credential that IS an agent is an org-trust act -> admin, never
+// lead/member"). Proven live pre-fix: a human holding only squad-a:member
+// consented to agent-a, then read + CONSUMED agent-a's own inbox and SENT on the
+// bus under agent-a's attribution (inbox/send gate on boundAgentId alone, zero
+// capability check). This section is what was missing before: nothing pinned
+// WHICH rank obtains a weld, which is exactly why 53 tests were green while the
+// gap was open.
+// ════════════════════════════════════════════════════════════════════════════
+
+describe('D0. P0-3 — the weld floor is admin, not member', () => {
+  it('memberMayConsentToAgent: a human holding only member -> false (member is NOT enough to weld)', async () => {
+    // The base fixture's HUMAN grant on squad-a is 'admin' (see seedBase) —
+    // narrow it here specifically to prove the OLD floor no longer qualifies.
+    harness.sqlite.exec(`UPDATE capabilities SET capability = 'member' WHERE id = 'cap-human-squad-a'`)
+    const env = envFor(harness)
+    expect(await memberMayConsentToAgent(env, HUMAN, AGENT_A.id)).toBe(false)
+  })
+
+  it('memberMayConsentToAgent: a human holding admin -> true', async () => {
+    const env = envFor(harness)
+    expect(await memberMayConsentToAgent(env, HUMAN, AGENT_A.id)).toBe(true)
+  })
+
+  it('listConsentableAgents: a member-only human sees NOTHING — not even agent-a, reachable at the old floor', async () => {
+    harness.sqlite.exec(`UPDATE capabilities SET capability = 'member' WHERE id = 'cap-human-squad-a'`)
+    const env = envFor(harness)
+    const list = await listConsentableAgents(env, HUMAN)
+    expect(list).toEqual([])
+  })
+
+  it('listConsentableAgents: an admin human still sees agent-a (unchanged from the base fixture)', async () => {
+    const env = envFor(harness)
+    const list = await listConsentableAgents(env, HUMAN)
+    expect(list.map((a) => a.id)).toContain(AGENT_A.id)
+  })
+
+  it('POST /oauth/consent: a member-only human is refused server-side exactly like a tampered agent_id — 403, no mint, and the agent is not even offered on render', async () => {
+    harness.sqlite.exec(`UPDATE capabilities SET capability = 'member' WHERE id = 'cap-human-squad-a'`)
+    const oauthProvider = stubOAuthProvider()
+    const { env } = httpEnv(harness, oauthProvider)
+    const { consentCookie, html } = await reachConsentScreen(env, oauthProvider, 'human@example.test')
+    expect(html).not.toContain(AGENT_A.slug)
+    const before = harness.sqlite.prepare('SELECT COUNT(*) AS n FROM member_tokens').all()[0] as { n: number }
+
+    const form = new URLSearchParams({ consent_nonce: consentCookie, action: 'continue', agent_id: AGENT_A.id })
+    const req = new Request('https://pot.test/oauth/consent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${consentCookie}` },
+      body: form.toString(),
+    })
+    const res = await handleOAuthAuthorize(req, env)
+
+    expect(res.status).toBe(403)
+    expect(oauthProvider.completeAuthorization).not.toHaveBeenCalled()
+    const after = harness.sqlite.prepare('SELECT COUNT(*) AS n FROM member_tokens').all()[0] as { n: number }
+    expect(after.n).toBe(before.n)
+  })
+
+  it('the org owner (org:owner, coordinator\'s note: does not lock the owner out) still passes the admin floor via inheritance', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status, created_at, tenant)
+        VALUES ('member-owner-probe', 'owner@example.test', 'Owner', 'active', '2026-08-01T00:00:00.000Z', '${TENANT}');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES ('cap-owner-probe', 'member-owner-probe', 'org', NULL, 'owner');
+    `)
+    const env = envFor(harness)
+    expect(await memberMayConsentToAgent(env, 'member-owner-probe', AGENT_A.id)).toBe(true)
+  })
+
+  it('a session already consent-bound while admin is killed live the moment the human is merely DEMOTED to member (P0-2 x P0-3)', async () => {
+    const env = envFor(harness)
+    insertDirectoryToken(harness.sqlite, 'tok-d0-1', MEMBER_AGENT_A, AGENT_A.id)
+    const before = await buildAuthContextFromProps(env, {
+      memberId: MEMBER_AGENT_A, tokenId: 'tok-d0-1', email: 'human@example.test',
+      consentedByMemberId: HUMAN,
+    })
+    expect(before!.capabilities.length).toBeGreaterThan(0)
+
+    harness.sqlite.exec(`UPDATE capabilities SET capability = 'member' WHERE id = 'cap-human-squad-a'`)
+
+    const after = await buildAuthContextFromProps(env, {
+      memberId: MEMBER_AGENT_A, tokenId: 'tok-d0-1', email: 'human@example.test',
+      consentedByMemberId: HUMAN,
+    })
+    expect(after).not.toBeNull() // the row itself (the agent's own member) is still live
+    expect(after!.capabilities).toEqual([]) // but 'member' no longer clears the weld floor
+  })
+})
+
+describe('D. P0-1 — vertical-escalation clamp (agent-e holds admin on its own squad; human ALSO admin, but on a scope the agent separately holds MORE grants on)', () => {
   function grantHumanSquadC(capability: 'member' | 'admin'): void {
     harness.sqlite.exec(`
       INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
@@ -861,7 +978,11 @@ describe('D. P0-1 — vertical-escalation clamp (agent-e holds admin on its own 
     `)
   }
 
-  it('human=member, agent-e=admin on the SAME scope -> clamped DOWN to member, never admin', async () => {
+  it('a human below the P0-3 admin floor (only member) gets a fully zeroed session even probed directly — create_agent 403s for the more fundamental reason (zero capabilities, not merely a clamp)', async () => {
+    // Pre-P0-3 this scenario clamped agent-e's raw 'admin' down to 'member'. Post-
+    // P0-3 'member' no longer clears the live eligibility re-check inside
+    // resolveConsentedAgentCapabilities either (raised to 'admin' alongside the
+    // consent-time gate) — so the session is zeroed outright, not merely narrowed.
     grantHumanSquadC('member')
     const env = envFor(harness)
     insertDirectoryToken(harness.sqlite, 'tok-e-1', MEMBER_AGENT_E, AGENT_E.id)
@@ -869,30 +990,17 @@ describe('D. P0-1 — vertical-escalation clamp (agent-e holds admin on its own 
       memberId: MEMBER_AGENT_E, tokenId: 'tok-e-1', email: 'human@example.test',
       consentedByMemberId: HUMAN,
     })
-    expect(auth!.capabilities).toEqual([
-      { member_id: MEMBER_AGENT_E, scope_type: 'squad', scope_id: AGENT_E.squad_id, capability: 'member' },
-    ])
-  })
+    expect(auth!.capabilities).toEqual([])
 
-  it('the clamp is load-bearing: create_agent (min: lead) — raw admin would pass, clamped member correctly 403s', async () => {
-    grantHumanSquadC('member')
-    const env = envFor(harness)
-    insertDirectoryToken(harness.sqlite, 'tok-e-2', MEMBER_AGENT_E, AGENT_E.id)
-    const auth = await buildAuthContextFromProps(env, {
-      memberId: MEMBER_AGENT_E, tokenId: 'tok-e-2', email: 'human@example.test',
-      consentedByMemberId: HUMAN,
-    })
     const out = await invokeTool(auth!, env, 'create_agent', {
       squad: AGENT_E.squad_id, slug: 'puppet', name: 'Puppet',
     }, 'https://pot.test')
     expect((out as { error?: string }).error).toBe('forbidden')
-
-    // Prove nothing was created — not just that the call reported an error.
     const created = harness.sqlite.prepare(`SELECT COUNT(*) AS n FROM agents WHERE slug = 'puppet'`).all()[0] as { n: number }
     expect(created.n).toBe(0)
   })
 
-  it('human ALSO holds admin there -> session correctly carries admin (clamp does not needlessly narrow a real match)', async () => {
+  it('human ALSO holds admin there -> session correctly carries admin (the only reachable single-scope state at floor=ceiling=admin)', async () => {
     grantHumanSquadC('admin')
     const env = envFor(harness)
     insertDirectoryToken(harness.sqlite, 'tok-e-3', MEMBER_AGENT_E, AGENT_E.id)
@@ -919,42 +1027,49 @@ describe('D. P0-1 — vertical-escalation clamp (agent-e holds admin on its own 
     expect(auth!.capabilities).toEqual([])
   })
 
-  it('per-scope drop: agent holds a SECOND grant on a squad the human passed the OVERALL gate but never touched -> that grant is dropped, the eligible one is kept clamped', async () => {
-    // The overall eligibility gate (canOnSquad(..., agent's home squad, 'member'))
+  it('per-scope drop: agent holds a SECOND grant on a squad the human passed the OVERALL (admin) gate on but never touched at all -> that second grant is dropped, the eligible one survives', async () => {
+    // The overall eligibility gate (canOnSquad(..., agent's home squad, 'admin'))
     // only checks ONE scope. An agent-bound member can separately hold capability
     // on OTHER squads too (setAgentSquadAccess is callable per-squad) — each grant
     // must be clamped against the human's rank on THAT SAME scope independently,
     // not just gated once overall. Without this, a grant on a squad the human never
     // touched at all would leak through unclamped once the human clears the single
-    // overall gate on a DIFFERENT scope.
-    grantHumanSquadC('member') // passes the overall gate on squad-c (agent-e's home)
+    // overall gate on a DIFFERENT scope. Human is 'admin' on squad-c (clears the
+    // P0-3 floor) but has NOTHING on squad-d.
+    grantHumanSquadC('admin')
     harness.sqlite.exec(`
       INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-d', 'dept-eng', 'squad-d', 'Squad D');
       INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
         VALUES ('cap-e-squad-d', '${MEMBER_AGENT_E}', 'squad', 'squad-d', 'admin');
     `)
-    // Human has ZERO standing on squad-d specifically.
     const env = envFor(harness)
     insertDirectoryToken(harness.sqlite, 'tok-e-5', MEMBER_AGENT_E, AGENT_E.id)
     const auth = await buildAuthContextFromProps(env, {
       memberId: MEMBER_AGENT_E, tokenId: 'tok-e-5', email: 'human@example.test',
       consentedByMemberId: HUMAN,
     })
-    // squad-c grant survives (clamped to member); squad-d grant is dropped entirely.
+    // squad-c grant survives (human is admin there too); squad-d grant is dropped
+    // entirely — the clamp remains load-bearing even with the raised floor,
+    // because the floor only governs the ONE scope memberMayConsentToAgent checks.
     expect(auth!.capabilities).toEqual([
-      { member_id: MEMBER_AGENT_E, scope_type: 'squad', scope_id: AGENT_E.squad_id, capability: 'member' },
+      { member_id: MEMBER_AGENT_E, scope_type: 'squad', scope_id: AGENT_E.squad_id, capability: 'admin' },
     ])
     expect(auth!.capabilities.some((c) => c.scope_id === 'squad-d')).toBe(false)
   })
 
-  it('the consent-screen PREVIEW is honest: shows the CLAMPED value, not the agent\'s raw admin grant', async () => {
-    grantHumanSquadC('member')
+  it('the consent-screen PREVIEW is honest: shows the TRUE per-scope-filtered value, excluding a grant on a squad the human never touched', async () => {
+    grantHumanSquadC('admin')
+    harness.sqlite.exec(`
+      INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-d-preview', 'dept-eng', 'squad-d-preview', 'Squad D Preview');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES ('cap-e-squad-d-preview', '${MEMBER_AGENT_E}', 'squad', 'squad-d-preview', 'admin');
+    `)
     const env = envFor(harness)
     const list = await listConsentableAgents(env, HUMAN)
     const e = list.find((a) => a.id === AGENT_E.id)
     expect(e).toBeDefined()
     expect(e!.capabilities).toEqual([
-      { member_id: MEMBER_AGENT_E, scope_type: 'squad', scope_id: AGENT_E.squad_id, capability: 'member' },
+      { member_id: MEMBER_AGENT_E, scope_type: 'squad', scope_id: AGENT_E.squad_id, capability: 'admin' },
     ])
   })
 })
@@ -1183,6 +1298,94 @@ describe('G. consent screen escaping — slug, squad name, budget window (not ju
     const { env } = httpEnv(harness, oauthProvider)
     const { html } = await reachConsentScreen(env, oauthProvider, 'human@example.test')
     expect(html).not.toContain('<script>alert(5)</script>')
+  })
+
+  // The following four were already escaped in the code but had NO test coverage
+  // (adversarial review 2026-08-10, P3 — "lower bar but free") — each would have
+  // survived its escapeHtml call being deleted, undetected, exactly like slug/
+  // squad_name/budget_window above before this file covered them.
+
+  it('formatCapabilities escapes a malicious scope_id inside the capability PREVIEW itself — capabilities.scope_id has no FK, nothing stops a stray value from reaching here', async () => {
+    // capabilities.scope_id (migrations/0002_members.sql) is free TEXT, no FK — the
+    // capability PREVIEW line (formatCapabilities) interpolates scope_type:scope_id
+    // for every grant the session would carry, escaped as a whole.
+    //
+    // The P0-1 clamp drops any grant on a scope the human holds nothing on — a
+    // first version of this test gave agent-a's dedicated member a grant on a
+    // nonsense scope_id and nothing else, which the clamp silently dropped before
+    // formatCapabilities ever saw it (100% green even with .map(escapeHtml)
+    // deleted — the exact "different mechanism, same visible result" trap noted
+    // elsewhere in this suite). Fixed by ALSO granting the human an exact-match
+    // capability on that same literal scope_id string, so the clamp lets the
+    // grant through and formatCapabilities is the thing actually under test.
+    const hostileScopeId = '"><script>alert(6)</script>'
+    harness.sqlite.exec(`
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES ('cap-a-hostile-scope', '${MEMBER_AGENT_A}', 'squad', '${hostileScopeId}', 'member');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES ('cap-human-hostile-scope', '${HUMAN}', 'squad', '${hostileScopeId}', 'admin');
+    `)
+    const oauthProvider = stubOAuthProvider()
+    const { env } = httpEnv(harness, oauthProvider)
+    const { html } = await reachConsentScreen(env, oauthProvider, 'human@example.test')
+    expect(html).not.toContain('<script>alert(6)</script>')
+    // Positive check: the grant actually reached the preview (unescaped form would
+    // show scope_id verbatim) — proves this test exercises formatCapabilities, not
+    // a dropped-by-the-clamp no-op.
+    expect(html).toContain('capabilities this session would carry:')
+  })
+
+  it('escapes a.autonomy', async () => {
+    harness.sqlite.exec(`UPDATE agents SET autonomy = '"><script>alert(7)</script>' WHERE id = '${AGENT_A.id}'`)
+    const oauthProvider = stubOAuthProvider()
+    const { env } = httpEnv(harness, oauthProvider)
+    const { html } = await reachConsentScreen(env, oauthProvider, 'human@example.test')
+    expect(html).not.toContain('<script>alert(7)</script>')
+  })
+
+  it('escapes the signed-in EMAIL — IdP-supplied (Google), not admin-authored, the least trustworthy field on the page', async () => {
+    const oauthProvider = stubOAuthProvider()
+    const { env } = httpEnv(harness, oauthProvider)
+    const { html } = await reachConsentScreen(env, oauthProvider, '"><script>alert(8)</script>@example.test')
+    expect(html).not.toContain('<script>alert(8)</script>')
+  })
+
+  it('escapes a.id (the radio value)', async () => {
+    // agents.id is normally a UUID (crypto.randomUUID()), but nothing besides
+    // convention stops it from being something else — updating an existing row's
+    // id in place isn't representable via UPDATE against a PRIMARY KEY cleanly in
+    // this fixture, so this inserts a fresh agent whose id IS the payload,
+    // eligible for and shown to HUMAN the same way agent-a is.
+    harness.sqlite.exec(`
+      INSERT INTO agents (id, squad_id, slug, name, status)
+        VALUES ('"><script>alert(9)</script>', '${AGENT_A.squad_id}', 'hostile-id-agent', 'Hostile Id Agent', 'active');
+      INSERT INTO members (id, email, display_name, status, created_at, tenant)
+        VALUES ('member-hostile-id-agent', NULL, 'Hostile Id Agent', 'active', '2026-08-01T00:00:00.000Z', '${TENANT}');
+      INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+        VALUES ('${TENANT}', '"><script>alert(9)</script>', 'member-hostile-id-agent', '2026-08-01T00:00:00.000Z');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES ('cap-hostile-id-home', 'member-hostile-id-agent', 'squad', '${AGENT_A.squad_id}', 'member');
+    `)
+    const oauthProvider = stubOAuthProvider()
+    const { env } = httpEnv(harness, oauthProvider)
+    const { html } = await reachConsentScreen(env, oauthProvider, 'human@example.test')
+    expect(html).not.toContain('<script>alert(9)</script>')
+  })
+
+  it('consent_nonce hidden field renders the server-generated UUID verbatim (escapeHtml around it is verified an EQUIVALENT MUTANT below, not a caught guard — see comment)', async () => {
+    // Mutation-checked directly: removing escapeHtml(consentNonce) does NOT fail
+    // this or any other test in this file. crypto.randomUUID() output is always
+    // [0-9a-f-]{36} — it structurally cannot contain a character escapeHtml would
+    // ever change, so there is no payload this test (or any test) could assert
+    // against to distinguish "escaped" from "not escaped" here. Per the earlier
+    // lesson in this file (M13/M15): label this honestly as untestable-by-payload
+    // rather than leave a test reading as a catch it is not. The call stays in the
+    // source as defence-in-depth against a future change to how consentNonce is
+    // generated, not because this test proves it necessary today.
+    const oauthProvider = stubOAuthProvider()
+    const { env } = httpEnv(harness, oauthProvider)
+    const { html } = await reachConsentScreen(env, oauthProvider, 'human@example.test')
+    expect(html).toMatch(/name="consent_nonce" value="[0-9a-f-]{36}"/)
   })
 })
 
