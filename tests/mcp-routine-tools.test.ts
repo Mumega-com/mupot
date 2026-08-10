@@ -367,6 +367,44 @@ describe('routine MCP tools', () => {
       .resolves.toMatchObject({ ok: false, status: 403, error: 'forbidden' })
   })
 
+  it('gives situation_digest to the assigned agent alone, and the value actually works', async () => {
+    const fixture = await makeReadyRoutineFixture('execute_internal')
+    harness = fixture.harness
+
+    // 1. The assigned agent reads the digest.
+    const assigned = principal({ boundAgentId: 'agent-1', capabilities: [grant('member', 'squad-1')] })
+    const mine = await invokeTool(assigned, fixture.env, 'routine_run_get', { run_id: 'run-1' }, 'https://pot.test')
+    const mineRun = (mine.result as { run: Record<string, unknown> }).run
+    expect(mineRun.situation_digest).toBe(fixture.digest)
+
+    // 2. A DIFFERENT bound agent does not. Exact-key assertion, so an extra field fails
+    //    rather than merely being un-asserted.
+    const wrongAgent = principal({ boundAgentId: 'agent-2', capabilities: [grant('member', 'squad-1')] })
+    const theirs = await invokeTool(wrongAgent, fixture.env, 'routine_run_get', { run_id: 'run-1' }, 'https://pot.test')
+    const theirsRun = (theirs.result as { run: Record<string, unknown> }).run
+    expect(theirsRun.situation_digest).toBeUndefined()
+    expectPublicRun(theirsRun)
+
+    // 3. A non-agent principal does not either — org admin is not a way in. The digest is
+    //    agent-operational, not an audit field, and boundAgentId null must never match.
+    const orgAdmin = principal({ boundAgentId: null, capabilities: [grant('admin', null, 'org')] })
+    const asAdmin = await invokeTool(orgAdmin, fixture.env, 'routine_run_get', { run_id: 'run-1' }, 'https://pot.test')
+    expectPublicRun((asAdmin.result as { run: Record<string, unknown> }).run)
+
+    // 4. The exposed value is the REAL digest, not a placeholder: feeding it straight back
+    //    into routine_proposal_submit is accepted. Without this, 1 could pass on any
+    //    64-char string and the tool would still be useless to the executor it exists for.
+    const echoed = await invokeTool(assigned, fixture.env, 'routine_proposal_submit', {
+      version: 'routine.proposal/v1',
+      run_id: 'run-1',
+      project_id: 'project-1',
+      situation_digest: mineRun.situation_digest as string,
+      summary: 'Digest read back from routine_run_get and echoed.',
+      action: { key: 'digest-readback', kind: 'no_action', input: { reason: 'No further action.' } },
+    }, 'https://pot.test')
+    expect(echoed).toMatchObject({ ok: true, result: { status: 'succeeded' } })
+  })
+
   it('binds proposal submission to the auth-welded assigned agent and action key', async () => {
     const fixture = await makeReadyRoutineFixture('execute_internal')
     harness = fixture.harness
