@@ -296,12 +296,41 @@ const routineRunList: ToolSpec = {
 }
 
 const routineRunGet: ToolSpec = {
-  name: 'routine_run_get', scope: 'visible routine run', min: 'observer', args: '{ run_id: string }',
+  name: 'routine_run_get',
+  scope: 'visible routine run; the assigned agent additionally reads situation_digest',
+  min: 'observer', args: '{ run_id: string }',
   inputSchema: { type: 'object', properties: { run_id: id() }, required: ['run_id'], additionalProperties: false },
   async run(auth, env, args) {
     if (!validId(args.run_id)) return fail(404, 'run_not_found')
     const run = await getRoutineRun(env, routinePrincipal(auth), args.run_id)
-    return run ? done({ run: publicRoutineRun(run) }) : fail(404, 'run_not_found')
+    if (!run) return fail(404, 'run_not_found')
+    // The assigned agent MUST echo situation_digest back on routine_proposal_submit
+    // (proposal.ts:181-189 requires the field; actions.ts:1656 rejects a mismatch with
+    // situation_mismatch). Today that value reaches the agent through exactly ONE channel:
+    // the routine.run/v1 inbox envelope minted at dispatch.ts:554. And `inbox` has no
+    // per-message consume — {limit, peek}, additionalProperties:false — so a non-peek read
+    // marks the whole batch read (messages.ts:406) and no MCP tool can reach a consumed
+    // row again. Any second reader of that inbox therefore strands the run permanently.
+    // That is not hypothetical: flight 94e5195c sat unlanded from 2026-08-08 because a
+    // watcher drained asha's inbox first, and flight-executor.py fail-closed rather than
+    // fabricate the digest.
+    //
+    // Read-back is NOT an authorization weakening. submitRoutineProposal RECOMPUTES
+    // currentSituationDigest server-side and compares (actions.ts:1673) before accepting
+    // anything, so an echoed value cannot bypass the staleness gate — it can only prove
+    // the agent saw the situation it acted on. And the gate is scoped to the ONE principal
+    // that already received this exact digest by message, so no reach is added.
+    //
+    // Everyone else keeps the byte-identical public Run DTO: REST and the dashboard read
+    // publicRoutineRun and are deliberately untouched.
+    const assignedAgent = typeof auth.boundAgentId === 'string'
+      && run.assigned_agent_id !== null
+      && auth.boundAgentId === run.assigned_agent_id
+    return done({
+      run: assignedAgent
+        ? { ...publicRoutineRun(run), situation_digest: run.situation_digest }
+        : publicRoutineRun(run),
+    })
   },
 }
 
