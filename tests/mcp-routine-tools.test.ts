@@ -405,6 +405,49 @@ describe('routine MCP tools', () => {
     expect(echoed).toMatchObject({ ok: true, result: { status: 'succeeded' } })
   })
 
+  it('prices measured usage onto the flight, for the assigned agent only, and refuses unknown models', async () => {
+    const fixture = await makeReadyRoutineFixture('execute_internal')
+    harness = fixture.harness
+    const assigned = principal({ boundAgentId: 'agent-1', capabilities: [grant('member', 'squad-1')] })
+    const usage = { run_id: 'run-1', model: 'deepseek-v4-flash', input: 1_000_000, output: 1_000_000 }
+
+    // 1. A DIFFERENT bound agent cannot report cost for someone else's run.
+    const wrongAgent = principal({ boundAgentId: 'agent-2', capabilities: [grant('member', 'squad-1')] })
+    await expect(invokeTool(wrongAgent, fixture.env, 'report_run_usage', usage, 'https://pot.test'))
+      .resolves.toMatchObject({ ok: false, error: 'assigned_agent_mismatch' })
+
+    // 2. A non-agent principal cannot either — cost must be agent-attributed.
+    const orgAdmin = principal({ boundAgentId: null, capabilities: [grant('admin', null, 'org')] })
+    await expect(invokeTool(orgAdmin, fixture.env, 'report_run_usage', usage, 'https://pot.test'))
+      .resolves.toMatchObject({ ok: false, error: 'assigned_agent_mismatch' })
+
+    // 3. An unknown model is REFUSED, not silently priced at zero. Zero must keep meaning
+    //    "free", never "we could not work it out".
+    await expect(invokeTool(assigned, fixture.env, 'report_run_usage',
+      { ...usage, model: 'no-such-model-v9' }, 'https://pot.test'))
+      .resolves.toMatchObject({ ok: false, error: 'model_not_priced' })
+
+    // 4. The assigned agent's report prices and lands on the flight.
+    //    2 MTok at the blended $0.24/MTok from cd9be86 => $0.48 => 480000 micro-USD.
+    const ok = await invokeTool(assigned, fixture.env, 'report_run_usage', usage, 'https://pot.test')
+    expect(ok).toMatchObject({ ok: true, result: { cost_micro_usd: 480_000 } })
+
+    const flightRow = harness.sqlite.prepare('SELECT cost_micro_usd FROM flights WHERE id = ?')
+      .get((ok.result as { flight_id: string }).flight_id) as { cost_micro_usd: number }
+    expect(flightRow.cost_micro_usd).toBe(480_000)
+
+    // 5. The run is kept consistent with its flights, not left stale.
+    const runRow = harness.sqlite.prepare('SELECT cost_micro_usd FROM routine_runs WHERE id = ?')
+      .get('run-1') as { cost_micro_usd: number }
+    expect(runRow.cost_micro_usd).toBe(480_000)
+
+    // 6. Idempotent for identical input — repeating must not double-charge.
+    await invokeTool(assigned, fixture.env, 'report_run_usage', usage, 'https://pot.test')
+    const again = harness.sqlite.prepare('SELECT cost_micro_usd FROM routine_runs WHERE id = ?')
+      .get('run-1') as { cost_micro_usd: number }
+    expect(again.cost_micro_usd).toBe(480_000)
+  })
+
   it('binds proposal submission to the auth-welded assigned agent and action key', async () => {
     const fixture = await makeReadyRoutineFixture('execute_internal')
     harness = fixture.harness

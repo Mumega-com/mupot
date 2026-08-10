@@ -1,4 +1,5 @@
 import { listNeedsYou } from '../attention/service'
+import { priceUsage } from '../economy/prices'
 import { answerRoutineRun, cancelRoutineRun, submitRoutineProposal } from '../routines/actions'
 import { principalCanReadProject, routinePrincipal } from '../routines/access'
 import { publicRoutineRun } from '../routines/public'
@@ -387,6 +388,94 @@ const routineProposalSubmit: ToolSpec = {
   },
 }
 
+const reportRunUsage: ToolSpec = {
+  name: 'report_run_usage',
+  scope: 'self (the run\'s assigned agent reports its own measured token usage)',
+  min: 'member',
+  args: '{ run_id: string, model: string, input: number, output: number, cache_read?: number, cache_write?: number }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      run_id: id(),
+      model: { type: 'string', maxLength: 120 },
+      input: { type: 'integer', minimum: 0 },
+      output: { type: 'integer', minimum: 0 },
+      cache_read: { type: 'integer', minimum: 0 },
+      cache_write: { type: 'integer', minimum: 0 },
+    },
+    required: ['run_id', 'model', 'input', 'output'],
+    additionalProperties: false,
+  },
+  // WHY THIS IS A POST-HOC WRITE, and not a field on routine_proposal_submit:
+  // token usage is only known once the runtime subprocess EXITS, which happens after the
+  // model has already called routine_proposal_submit — and that call auto-lands the flight
+  // via landControlFlight. So the cost necessarily arrives after the landing. Accepting it
+  // on the proposal would mean asking a model to self-report its own usage before it has
+  // finished producing it, which is a number it cannot know and would therefore invent.
+  //
+  // The measurement itself comes from the harness, not the model: prime-agent emits real
+  // {input, output, cacheRead, cacheWrite} plus the true model name on every turn_end, and
+  // prime-responder.py captures it. See #896 for the full chain this replaces — hardcoded
+  // 1250/380 at dispatch, cost 0 at landing, and a dashboard rendering the constants as
+  // measured usage.
+  async run(auth, env, args) {
+    if (!validId(args.run_id)) return fail(404, 'run_not_found')
+    const run = await getRoutineRun(env, routinePrincipal(auth), args.run_id)
+    if (!run) return fail(404, 'run_not_found')
+
+    // Same predicate routine_proposal_submit enforces (routines/actions.ts): only the
+    // assigned agent may speak for this run. An operator principal (boundAgentId null)
+    // must never match — cost is agent-attributed, and an unattributed cost is not a cost.
+    if (typeof auth.boundAgentId !== 'string'
+      || run.assigned_agent_id === null
+      || auth.boundAgentId !== run.assigned_agent_id) {
+      return fail(403, 'assigned_agent_mismatch')
+    }
+    if (!run.flight_id) return fail(409, 'run_has_no_flight')
+
+    const priced = priceUsage(args.model as string, {
+      input: args.input as number,
+      output: args.output as number,
+      cacheRead: (args.cache_read as number | undefined) ?? 0,
+      cacheWrite: (args.cache_write as number | undefined) ?? 0,
+    })
+    // Unknown model => refuse. Recording 0 here would be indistinguishable from "this run
+    // was free", which is exactly the ambiguity that made cost_micro_usd meaningless.
+    if (priced === null) {
+      return fail(400, 'model_not_priced', {
+        detail: 'no rate for this model; add it to src/economy/prices.ts with a cited source',
+        model: args.model,
+      })
+    }
+
+    // SET, not accumulate: the harness reports one measured total per run. Repeating the
+    // same call writes the same number, so this is idempotent for identical input; a later
+    // call with different usage is a corrected measurement and last-write-wins is correct.
+    // Lands on the flight even after status='landed' — this is an accounting correction,
+    // and refusing it would mean the only flights we can price are ones that never finished.
+    await env.DB.prepare(
+      `UPDATE flights SET cost_micro_usd = ?3 WHERE id = ?1 AND tenant = ?2`,
+    ).bind(run.flight_id, env.TENANT_SLUG, priced).run()
+
+    // Keep the run consistent with its flights. routine_runs.cost_micro_usd is defined
+    // elsewhere (actions.ts) as SUM over the run's flights; recompute with the same shape
+    // rather than assigning `priced` directly, so a multi-flight run stays correct.
+    await env.DB.prepare(
+      `UPDATE routine_runs SET cost_micro_usd = (
+         SELECT COALESCE(SUM(f.cost_micro_usd), 0) FROM flights f
+          WHERE f.tenant = routine_runs.tenant AND (
+            f.id = routine_runs.flight_id OR f.id IN (
+              SELECT ref_id FROM routine_run_refs WHERE run_id = routine_runs.id AND ref_type = 'flight'
+            )
+          )
+       ), updated_at = ?3
+       WHERE id = ?1 AND tenant = ?2`,
+    ).bind(run.id, env.TENANT_SLUG, new Date().toISOString()).run()
+
+    return done({ run_id: run.id, flight_id: run.flight_id, cost_micro_usd: priced, model: args.model })
+  },
+}
+
 const needsYouList: ToolSpec = {
   name: 'needs_you_list', scope: 'visible project and workspace attention items', min: 'observer',
   args: '{ project_id?: string, limit?: 1..100, cursor?: string }',
@@ -412,5 +501,5 @@ const needsYouList: ToolSpec = {
 export const ROUTINE_TOOLS: ToolSpec[] = [
   routineList, routineGet, routineCreate, routineUpdate,
   lifecycle('routine_enable', enableRoutine), lifecycle('routine_pause', pauseRoutine), lifecycle('routine_archive', archiveRoutine),
-  routineRunNow, routineRunList, routineRunGet, routineRunAnswer, routineRunCancel, routineProposalSubmit, needsYouList,
+  routineRunNow, routineRunList, routineRunGet, routineRunAnswer, routineRunCancel, routineProposalSubmit, reportRunUsage, needsYouList,
 ]
