@@ -463,6 +463,15 @@ const reportRunUsage: ToolSpec = {
     // ONE BATCH, three statements. A crash between them would otherwise leave the run's
     // aggregate or the outbox payload stale against the flight row (Athena, gate on #898).
     await env.DB.batch([
+      // NO STATUS GUARD, AND THAT IS DELIBERATE — do not "fix" this into hiding spend.
+      // Cost lands even on a failed or cancelled flight, because status='failed' describes
+      // how the flight ENDED, not whether it happened: a cancelled run still burned real
+      // tokens. Adding `AND status = 'landed'` here would recreate the exact failure class
+      // this tool exists to remove — cost stuck at 0 for a whole category of real spend —
+      // one WHERE clause away from the one it just killed. (Athena, gate on #898.)
+      // The provenance risk this might look like it guards against — a model claiming usage
+      // for work that never ran — is not addressed by a status check; it lives in the report
+      // path, and is tracked separately.
       env.DB.prepare(
         `UPDATE flights SET cost_micro_usd = ?3 WHERE id = ?1 AND tenant = ?2`,
       ).bind(run.flight_id, env.TENANT_SLUG, priced),
