@@ -725,6 +725,21 @@ export async function buildAuthContextFromProps(
         : []
       : resolvedCapabilities
 
+  // mupot#903b P1 (adversarial review round 3, 2026-08-10): a consent-bound
+  // session whose capabilities have gone to zero (agent deactivated, or the
+  // consenting human demoted/offboarded — P0-2/P0-3) must not keep its IDENTITY
+  // weld alive either. inbox / inbox_consumer_status (src/mcp/index.ts) gate on
+  // `auth.boundAgentId` ALONE — zero capability check — and inbox defaults to
+  // consumed:true, so a session that was correctly capability-zeroed but still
+  // reported boundAgentId could keep draining a live agent's inbox (the real
+  // agent never receives those messages) indefinitely, until someone manually
+  // revokes the token. Capability-gated tools already died on the same request;
+  // this is what makes the SESSION die with them, not just its ambient authority.
+  // Deliberately uses `boundAgentId` (the raw, pre-exposure value) so this cannot
+  // rot: whatever the capabilities computation just decided IS what gets nulled.
+  const exposedBoundAgentId =
+    channel === 'directory' && boundAgentId && capabilities.length === 0 ? null : boundAgentId
+
   return {
     userId: props.memberId,
     email: tokenRow.email ?? props.email,
@@ -733,7 +748,7 @@ export async function buildAuthContextFromProps(
     memberId: props.memberId,
     channel,
     capabilities, // always defined; empty only for directory — prevents legacyRoleSatisfies escape
-    boundAgentId, // null unless explicitly consent-bound (mupot#903b) or a workspace weld
+    boundAgentId: exposedBoundAgentId, // null unless explicitly consent-bound (mupot#903b) AND still capability-live (P1)
     // mupot#903b: carried through so resolveAuth's header re-derivation (src/mcp/
     // index.ts) can re-run the SAME resolveConsentedAgentCapabilities check rather
     // than trust this AuthContext's `capabilities` value verbatim from the internal

@@ -950,7 +950,14 @@ describe('D0. P0-3 — the weld floor is admin, not member', () => {
     expect(await memberMayConsentToAgent(env, 'member-owner-probe', AGENT_A.id)).toBe(true)
   })
 
-  it('a session already consent-bound while admin is killed live the moment the human is merely DEMOTED to member (P0-2 x P0-3)', async () => {
+  it('a session already consent-bound while admin has its capabilities zeroed AND its identity weld killed (boundAgentId -> null) the moment the human is merely DEMOTED to member (P0-2 x P0-3 x P1)', async () => {
+    // P1 (adversarial review round 3, 2026-08-10): capabilities alone were not
+    // enough. inbox/inbox_consumer_status gate on auth.boundAgentId ALONE, zero
+    // capability check — a capability-zeroed-but-still-bound session could keep
+    // draining a live agent's inbox. buildAuthContextFromProps now nulls
+    // boundAgentId in the SAME pass that zeroes capabilities, so this test asserts
+    // BOTH — "killed" is only accurate once boundAgentId is actually null, not
+    // merely when capabilities is empty.
     const env = envFor(harness)
     insertDirectoryToken(harness.sqlite, 'tok-d0-1', MEMBER_AGENT_A, AGENT_A.id)
     const before = await buildAuthContextFromProps(env, {
@@ -958,6 +965,7 @@ describe('D0. P0-3 — the weld floor is admin, not member', () => {
       consentedByMemberId: HUMAN,
     })
     expect(before!.capabilities.length).toBeGreaterThan(0)
+    expect(before!.boundAgentId).toBe(AGENT_A.id)
 
     harness.sqlite.exec(`UPDATE capabilities SET capability = 'member' WHERE id = 'cap-human-squad-a'`)
 
@@ -965,8 +973,50 @@ describe('D0. P0-3 — the weld floor is admin, not member', () => {
       memberId: MEMBER_AGENT_A, tokenId: 'tok-d0-1', email: 'human@example.test',
       consentedByMemberId: HUMAN,
     })
-    expect(after).not.toBeNull() // the row itself (the agent's own member) is still live
-    expect(after!.capabilities).toEqual([]) // but 'member' no longer clears the weld floor
+    expect(after).not.toBeNull() // the D1 row itself (the agent's own member_tokens row) is still live, unrevoked
+    expect(after!.capabilities).toEqual([]) // 'member' no longer clears the weld floor
+    expect(after!.boundAgentId).toBeNull() // AND the identity weld itself is killed, not just its authority
+  })
+
+  it('P1 (adversarial review round 3): a demoted session cannot read (or DRAIN) agent-a\'s inbox — the identity weld dies with capabilities, not just ambient authority', async () => {
+    // Before this fix: inbox/inbox_consumer_status gated on auth.boundAgentId
+    // ALONE, zero capability check. A capability-zeroed-but-still-bound session
+    // could keep reading (and, by default, CONSUMING) a live agent's inbox
+    // indefinitely — the real agent never receives those messages.
+    harness.sqlite.exec(`
+      INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, created_at)
+        VALUES ('msg-secret', '${TENANT}', '${AGENT_A.id}', '${AGENT_A.id}', '${MEMBER_AGENT_A}', 'message', 'SECRET-PAYLOAD', '2026-08-01T00:00:00.000Z');
+    `)
+    const env = envFor(harness)
+    insertDirectoryToken(harness.sqlite, 'tok-d0-inbox', MEMBER_AGENT_A, AGENT_A.id)
+
+    // Live and bound: CAN peek its own inbox (proves the fixture is realistic;
+    // peek does not consume, so the message survives for the real assertion below).
+    const before = await buildAuthContextFromProps(env, {
+      memberId: MEMBER_AGENT_A, tokenId: 'tok-d0-inbox', email: 'human@example.test',
+      consentedByMemberId: HUMAN,
+    })
+    const peekOut = await invokeTool(before!, env, 'inbox', { peek: true }, 'https://pot.test')
+    expect((peekOut as { result?: { messages?: { body: string }[] } }).result?.messages?.[0]?.body).toBe('SECRET-PAYLOAD')
+
+    // Demote the human below the P0-3 weld floor.
+    harness.sqlite.exec(`UPDATE capabilities SET capability = 'member' WHERE id = 'cap-human-squad-a'`)
+
+    const after = await buildAuthContextFromProps(env, {
+      memberId: MEMBER_AGENT_A, tokenId: 'tok-d0-inbox', email: 'human@example.test',
+      consentedByMemberId: HUMAN,
+    })
+    expect(after!.boundAgentId).toBeNull() // P1 fix
+
+    const afterOut = await invokeTool(after!, env, 'inbox', {}, 'https://pot.test')
+    expect((afterOut as { error?: string }).error).toBe('not_agent_bound')
+
+    // The message was NEVER consumed by the demoted session — proves this closes
+    // the DRAIN, not merely the read: it is still waiting for the real agent-a.
+    const stillUnread = harness.sqlite.prepare(
+      `SELECT read_at FROM agent_messages WHERE id = 'msg-secret'`,
+    ).all()[0] as { read_at: string | null }
+    expect(stillUnread.read_at).toBeNull()
   })
 })
 
@@ -1080,7 +1130,7 @@ describe('D. P0-1 — vertical-escalation clamp (agent-e holds admin on its own 
 // ════════════════════════════════════════════════════════════════════════════
 
 describe('E. P0-2 — offboarding the consenting human, not just the agent, kills authority', () => {
-  it('human member.status flips to suspended -> capabilities zero (agent stays active, token stays live)', async () => {
+  it('human member.status flips to suspended -> capabilities zero AND boundAgentId null (agent stays active, token stays live)', async () => {
     const env = envFor(harness)
     insertDirectoryToken(harness.sqlite, 'tok-off-1', MEMBER_AGENT_A, AGENT_A.id)
 
@@ -1098,6 +1148,36 @@ describe('E. P0-2 — offboarding the consenting human, not just the agent, kill
     })
     expect(after).not.toBeNull() // the row's own member (the agent's) is still live
     expect(after!.capabilities).toEqual([])
+    expect(after!.boundAgentId).toBeNull() // P1: the identity weld is killed too, not just authority
+  })
+
+  it('P1, full offboard (member.status=suspended AND the capability row deleted — the coordinator\'s exact PROBE4 second stage): inbox is refused and the queued message survives unconsumed', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, created_at)
+        VALUES ('msg-secret-2', '${TENANT}', '${AGENT_A.id}', '${AGENT_A.id}', '${MEMBER_AGENT_A}', 'message', 'SECRET-2', '2026-08-01T00:00:00.000Z');
+    `)
+    const env = envFor(harness)
+    insertDirectoryToken(harness.sqlite, 'tok-off-full', MEMBER_AGENT_A, AGENT_A.id)
+
+    harness.sqlite.exec(`
+      UPDATE members SET status = 'suspended' WHERE id = '${HUMAN}';
+      DELETE FROM capabilities WHERE id = 'cap-human-squad-a';
+    `)
+
+    const auth = await buildAuthContextFromProps(env, {
+      memberId: MEMBER_AGENT_A, tokenId: 'tok-off-full', email: 'human@example.test',
+      consentedByMemberId: HUMAN,
+    })
+    expect(auth!.capabilities).toEqual([])
+    expect(auth!.boundAgentId).toBeNull()
+
+    const out = await invokeTool(auth!, env, 'inbox', {}, 'https://pot.test')
+    expect((out as { error?: string }).error).toBe('not_agent_bound')
+
+    const stillUnread = harness.sqlite.prepare(
+      `SELECT read_at FROM agent_messages WHERE id = 'msg-secret-2'`,
+    ).all()[0] as { read_at: string | null }
+    expect(stillUnread.read_at).toBeNull()
   })
 
   it('human\'s capability grant on the agent\'s squad is revoked -> capabilities zero (member.status stays active)', async () => {
@@ -1192,6 +1272,84 @@ describe('F. resolveAuth header re-derivation — real dispatch, not invokeTool 
     expect(res.status).toBe(200)
     const body = await res.json() as { ok: boolean }
     expect(body.ok).toBe(true)
+  })
+
+  it('P1 (adversarial review round 3): driven through the FULL real seam — mint, persisted props, buildAuthContextFromProps, internal header, mcpApp — a demoted session cannot read agent-a\'s inbox', async () => {
+    // Reproduces the coordinator's exact seam: /oauth/consent mint -> persisted
+    // props -> buildAuthContextFromProps -> internal header -> mcpApp, not a
+    // hand-forged header. This is the actual request path a browser tab drives.
+    harness.sqlite.exec(`
+      INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, created_at)
+        VALUES ('msg-secret-3', '${TENANT}', '${AGENT_A.id}', '${AGENT_A.id}', '${MEMBER_AGENT_A}', 'message', 'SECRET-3', '2026-08-01T00:00:00.000Z');
+    `)
+    const env = envFor(harness)
+    insertDirectoryToken(harness.sqlite, 'tok-http-inbox', MEMBER_AGENT_A, AGENT_A.id)
+
+    // buildAuthContextFromProps is what McpOAuthApiHandler calls to build the
+    // AuthContext it serializes into the header — using it here (not a hand-built
+    // object) means the header carries whatever the real mint+props path produces.
+    harness.sqlite.exec(`UPDATE capabilities SET capability = 'member' WHERE id = 'cap-human-squad-a'`)
+    const realAuth = await buildAuthContextFromProps(env, {
+      memberId: MEMBER_AGENT_A, tokenId: 'tok-http-inbox', email: 'human@example.test',
+      consentedByMemberId: HUMAN,
+    })
+    expect(realAuth!.boundAgentId).toBeNull() // P1 fix, confirmed before dispatch
+
+    const res = await mcpApp.request('https://pot.test/', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', [AUTH_CONTEXT_HEADER]: JSON.stringify(realAuth) },
+      body: JSON.stringify({ tool: 'inbox', args: {} }),
+    }, env)
+
+    const body = await res.json() as { ok?: boolean; error?: string }
+    expect(body.ok).not.toBe(true)
+    expect(body.error).toBe('not_agent_bound')
+
+    const stillUnread = harness.sqlite.prepare(
+      `SELECT read_at FROM agent_messages WHERE id = 'msg-secret-3'`,
+    ).all()[0] as { read_at: string | null }
+    expect(stillUnread.read_at).toBeNull()
+  })
+
+  it('P1, isolating resolveAuth\'s OWN null-out specifically: a header that STILL CLAIMS boundAgentId (as if site 1\'s fix did not run) is independently nulled by site 2, and inbox is refused', async () => {
+    // The test above derives its header via buildAuthContextFromProps, which
+    // already nulls boundAgentId (site 1) — so it cannot, by itself, prove site 2
+    // (resolveAuth's own re-derivation) does the same independently; a mutation
+    // that deleted ONLY site 2's null-out survived against that test alone (site
+    // 1's result flows straight through). This test hand-forges the header the
+    // same way the OTHER section-F tests do — boundAgentId still set, exactly as
+    // it would be BEFORE site 2 runs its own check — so only site 2's own logic
+    // is under test.
+    harness.sqlite.exec(`
+      INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, created_at)
+        VALUES ('msg-secret-4', '${TENANT}', '${AGENT_A.id}', '${AGENT_A.id}', '${MEMBER_AGENT_A}', 'message', 'SECRET-4', '2026-08-01T00:00:00.000Z');
+    `)
+    const env = envFor(harness)
+    insertDirectoryToken(harness.sqlite, 'tok-http-inbox-2', MEMBER_AGENT_A, AGENT_A.id)
+    harness.sqlite.exec(`UPDATE capabilities SET capability = 'member' WHERE id = 'cap-human-squad-a'`)
+
+    const forgedHeaderAuth: AuthContext = {
+      userId: MEMBER_AGENT_A, email: 'human@example.test', role: 'member', tenant: TENANT,
+      memberId: MEMBER_AGENT_A, channel: 'directory',
+      capabilities: [{ member_id: MEMBER_AGENT_A, scope_type: 'squad', scope_id: AGENT_A.squad_id, capability: 'admin' }], // forged, stale, wrong
+      boundAgentId: AGENT_A.id, // still claims the weld — the exact pre-site-2 shape
+      consentedByMemberId: HUMAN,
+    }
+
+    const res = await mcpApp.request('https://pot.test/', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', [AUTH_CONTEXT_HEADER]: JSON.stringify(forgedHeaderAuth) },
+      body: JSON.stringify({ tool: 'inbox', args: {} }),
+    }, env)
+
+    const body = await res.json() as { ok?: boolean; error?: string }
+    expect(body.ok).not.toBe(true)
+    expect(body.error).toBe('not_agent_bound')
+
+    const stillUnread = harness.sqlite.prepare(
+      `SELECT read_at FROM agent_messages WHERE id = 'msg-secret-4'`,
+    ).all()[0] as { read_at: string | null }
+    expect(stillUnread.read_at).toBeNull()
   })
 
   it('an unbound directory session STILL gets zero through this same real path (regression pin)', async () => {

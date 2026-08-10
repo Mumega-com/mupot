@@ -195,6 +195,14 @@ async function resolveAuth(c: {
             auth.boundAgentId,
             auth.consentedByMemberId ?? null,
           )
+          // mupot#903b P1 (adversarial review round 3): mirrors the same null-out
+          // in buildAuthContextFromProps (src/mcp/oauth-authorize.ts) — this is the
+          // SECOND derivation site (the internal-header re-derivation hop), and
+          // both must independently null the weld once capabilities are empty, or
+          // inbox/inbox_consumer_status (gate on auth.boundAgentId alone, zero
+          // capability check) would keep this session's identity alive after its
+          // ambient authority has already died on this same request.
+          if (auth.capabilities.length === 0) auth.boundAgentId = null
         } else {
           auth.capabilities = []
           auth.boundAgentId = null
