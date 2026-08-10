@@ -17,7 +17,18 @@ import { logSubagentTokenUsage } from '../telemetry/subagent-usage'
 
 const ROUTINE_SENDER = 'mupot-routines'
 const ROUTINE_MEMBER = 'system:routines'
-const CANDIDATE_LIMIT = 20
+// mupot#611 item 2: this used to be a SILENT ceiling — past the Nth agent in a
+// squad (ordered by ascending uuid) the rest were invisible to dispatch with no
+// error and no log. Raised 20 → 200 to comfortably clear the stated target scale
+// (200 agents across 10 tenants, i.e. this ceiling is now the same order of
+// magnitude as the WHOLE FLEET, not one squad within it) — but a number alone
+// can't promise "never truncates again", so loadCandidates ALSO makes a breach
+// loud (see the over-limit branch below) instead of picking this bigger number
+// and calling it done. Both halves are test-pinned.
+// Exported (along with loadCandidates below) so tests/routine-dispatch-candidates.test.ts
+// can pin the truncation branch with a small override instead of fixturing 201 real
+// agent+membership+capability rows to exercise the same code path.
+export const CANDIDATE_LIMIT = 200
 
 interface DispatchRunRow {
   id: string
@@ -55,7 +66,7 @@ interface DispatchRunRow {
   human_result_json: string | null
 }
 
-interface CandidateRow {
+export interface CandidateRow {
   id: string
   slug: string
   department_id: string
@@ -178,19 +189,76 @@ async function loadRun(env: Env, runId: string): Promise<DispatchRunRow | null> 
   ).bind(runId, env.TENANT_SLUG).first<DispatchRunRow>()
 }
 
-async function loadCandidates(env: Env, squadId: string): Promise<CandidateRow[]> {
+/**
+ * Load dispatch candidates for a squad.
+ *
+ * mupot#611 item 3: this used to join ONLY on the agent's home column
+ * (`a.squad_id = squadId`), ignoring the separate `memberships` table
+ * (agent_id, squad_id, capability — migration 0001) that the send-authz path
+ * already treats as real squad membership (src/agents/messages.ts,
+ * validateMessageProjectAccess). An agent added to a squad via `memberships`
+ * while homed elsewhere could message that squad but could never be
+ * dispatched by it — reachable one way, invisible the other.
+ *
+ * Fixed by widening the candidate set to home-squad OR membership-squad, and
+ * — this is the part that has to be right, not just present — pulling
+ * `department_id` from the TARGET squad (`s.id = squadId`) rather than from
+ * `a.squad_id`. The two were interchangeable before this change because every
+ * candidate's home squad WAS the target squad; once membership-only
+ * candidates (whose home squad differs) are admitted, `a.squad_id`'s
+ * department would silently substitute the CANDIDATE's home department for
+ * the department-inheritance check in `hasCapability` (selectAgent, below) —
+ * which does not gate selection, it WIDENS it, since a membership-only
+ * agent's home-department admin grant has nothing to do with authority over
+ * the target squad. `s.id = squadId` keeps that argument correct regardless
+ * of which column admitted the row, so `hasCapability` stays the sole,
+ * correctly-scoped authority gate on the widened pool (see selectAgent).
+ *
+ * `limit` is the mupot#611 item 2 ceiling (CANDIDATE_LIMIT by default, override
+ * only for tests). Queried as `limit + 1` so a breach is DETECTABLE — see the
+ * truncation branch below — rather than indistinguishable from "exactly at the
+ * limit, happens to be everyone".
+ */
+export async function loadCandidates(
+  env: Env,
+  squadId: string,
+  limit: number = CANDIDATE_LIMIT,
+): Promise<CandidateRow[]> {
   const result = await env.DB.prepare(
     `SELECT a.id, a.slug, s.department_id, b.member_id
        FROM agents a
-       JOIN squads s ON s.id = a.squad_id
+       JOIN squads s ON s.id = ?1
        JOIN agent_member_bindings b
-         ON b.agent_id = a.id AND b.tenant = ?
+         ON b.agent_id = a.id AND b.tenant = ?2
        JOIN members m
          ON m.id = b.member_id AND m.tenant = b.tenant AND m.status = 'active'
-      WHERE a.squad_id = ? AND a.status = 'active'
-      ORDER BY a.id ASC LIMIT ?`,
-  ).bind(env.TENANT_SLUG, squadId, CANDIDATE_LIMIT).all<CandidateRow>()
-  return result.results ?? []
+      WHERE a.status = 'active'
+        AND (
+          a.squad_id = ?1
+          OR EXISTS (
+            SELECT 1 FROM memberships mm
+             WHERE mm.agent_id = a.id AND mm.squad_id = ?1
+          )
+        )
+      ORDER BY a.id ASC LIMIT ?3`,
+  ).bind(squadId, env.TENANT_SLUG, limit + 1).all<CandidateRow>()
+  const rows = result.results ?? []
+  if (rows.length > limit) {
+    // LOUD, not silent (mupot#611 item 2). This does not remove the ceiling —
+    // an unbounded candidate pool is its own D1/latency risk — it makes a
+    // breach observable (Workers logs/tail) instead of the previous behaviour,
+    // which was to hand back an arbitrary ascending-uuid subset with nothing
+    // in the response, a log, or an event distinguishing "this is everyone"
+    // from "this is a truncated slice".
+    console.error('dispatch: candidate pool exceeds CANDIDATE_LIMIT, truncating', {
+      tenant: env.TENANT_SLUG,
+      squad_id: squadId,
+      limit,
+      candidates_found_at_least: rows.length,
+    })
+    return rows.slice(0, limit)
+  }
+  return rows
 }
 
 async function loadCandidateGrants(env: Env, memberIds: string[]): Promise<Map<string, CapabilityGrant[]>> {
