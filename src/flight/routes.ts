@@ -39,7 +39,13 @@ import { deriveActiveCollisions } from './board'
 // ── input parsing (pure, exported for tests) ──────────────────────────────────
 
 const TRIGGERS: ReadonlySet<string> = new Set(['manual', 'schedule', 'api', 'event', 'cron'])
-const STATUSES: ReadonlySet<string> = new Set(['preflight', 'held', 'running', 'waiting', 'sleeping', 'landed', 'failed'])
+// The ?status= filter allowlist. Typed as FlightStatus (not string) on purpose: the
+// parse below casts survivors to FlightStatus[], so an entry the union does not contain
+// would make that cast a lie — which is exactly how 'waiting'/'sleeping' lingered here
+// after both were found to have no writer (mupot#913). Typed, a stale name is now a
+// compile error. Filtering on a status nothing can produce is not an error for a
+// caller — it simply matches no rows, same as before.
+const STATUSES: ReadonlySet<FlightStatus> = new Set<FlightStatus>(['preflight', 'held', 'running', 'landed', 'failed'])
 
 function asBool(v: unknown): boolean {
   return v === true
@@ -118,7 +124,7 @@ export interface OutcomeQuery {
 export function parseOutcomeQuery(q: URLSearchParams): OutcomeQuery {
   const statusRaw = q.get('status')
   const statuses = statusRaw
-    ? (statusRaw.split(',').map((x) => x.trim()).filter((x) => STATUSES.has(x)) as FlightStatus[])
+    ? statusRaw.split(',').map((x) => x.trim()).filter((x): x is FlightStatus => STATUSES.has(x as FlightStatus))
     : null
   const sinceRaw = q.get('since')
   const sinceN = sinceRaw == null ? NaN : Number(sinceRaw)
@@ -233,7 +239,10 @@ flightsApp.post('/:id/land', async (c) => {
     if (score !== undefined && (typeof score !== 'number' || !Number.isFinite(score) || score < 0 || score > 1)) {
       return c.json({ error: 'invalid_flight_score' }, 400)
     }
-    if (!['running', 'waiting', 'sleeping'].includes(existing.status)) {
+    // In the air = 'running', the only state a flight can be landed from (see the
+    // lifecycle note in flight/service.ts). Mirrors landGovernedFlight's own WHERE
+    // guard so the caller gets a 409 with a reason instead of a silent no-op UPDATE.
+    if (existing.status !== 'running') {
       return c.json({ error: 'flight_not_in_air', status: existing.status }, 409)
     }
     if (!Number.isSafeInteger(existing.budget_micro_usd) || (existing.budget_micro_usd as number) < 0) {

@@ -89,12 +89,18 @@ export interface ClearanceResult {
   warns: FlightCollision[]
 }
 
-// A flight is "live" (currently doing or about to do work) while pre-launch, in the
-// air, or sleeping between legs — mirrors board.ts's LIVE_PHASES membership (kept as
-// an independent literal set here to avoid a board.ts↔clearance.ts import cycle;
-// board.ts imports FROM clearance.ts for deriveActiveCollisions, not the reverse).
+// A flight is "live" (currently doing or about to do work) while pre-launch or in the
+// air — mirrors board.ts's LIVE_PHASES membership (kept as an independent literal set
+// here to avoid a board.ts↔clearance.ts import cycle; board.ts imports FROM clearance.ts
+// for deriveActiveCollisions, not the reverse).
 // Terminal flights (landed/failed/held) cannot collide — they are not doing anything.
-const LIVE_STATUSES: ReadonlySet<FlightStatus> = new Set<FlightStatus>(['preflight', 'running', 'waiting', 'sleeping'])
+//
+// This set previously also listed 'waiting' and 'sleeping'. Removing them (mupot#913,
+// where both states were found to have no writer) does not change which flights collide:
+// no row has ever held either status, so the two entries only ever widened the set on
+// paper. The typed FlightStatus union is what keeps this mirror in step with board.ts —
+// a stale name here is now a compile error rather than a silent extra member.
+const LIVE_STATUSES: ReadonlySet<FlightStatus> = new Set<FlightStatus>(['preflight', 'running'])
 
 function intersect(a: readonly string[], b: readonly string[]): string[] {
   const setB = new Set(b)

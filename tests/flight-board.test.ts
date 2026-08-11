@@ -17,7 +17,6 @@ function row(p: Partial<FlightRow> & { agent: string; status: FlightStatus }): F
     score: p.score ?? null,
     budget_micro_usd: p.budget_micro_usd ?? null,
     cost_micro_usd: p.cost_micro_usd ?? 0,
-    next_run_at: p.next_run_at ?? null,
     created_at: p.created_at ?? NOW,
     started_at: null,
     ended_at: null,
@@ -62,8 +61,6 @@ describe('buildBoard — phase + live', () => {
   it('maps each status to its phase metaphor', () => {
     const rows = [
       row({ agent: 'a', status: 'running' }),
-      row({ agent: 'b', status: 'waiting' }),
-      row({ agent: 'c', status: 'sleeping' }),
       row({ agent: 'd', status: 'held' }),
       row({ agent: 'e', status: 'landed' }),
       row({ agent: 'f', status: 'failed' }),
@@ -72,15 +69,13 @@ describe('buildBoard — phase + live', () => {
     const cards = buildBoard(rows, NOW)
     expect(cards.map((c) => c.phase)).toEqual([
       'flying',
-      'holding',
-      'sleeping',
       'held',
       'landed',
       'failed',
       'preflight',
     ])
-    // live = pre-launch / in-air / sleeping; terminal = history
-    expect(cards.map((c) => c.live)).toEqual([true, true, true, false, false, false, true])
+    // live = pre-launch / in-air; terminal (held/landed/failed) = history
+    expect(cards.map((c) => c.live)).toEqual([true, false, false, false, true])
   })
 })
 
@@ -98,21 +93,6 @@ describe('buildBoard — cost + budget', () => {
     const [c] = buildBoard([row({ agent: 'a', status: 'running', cost_micro_usd: 99 })], NOW)
     expect(c.budget_usd).toBeNull()
     expect(c.over_budget).toBe(false)
-  })
-})
-
-describe('buildBoard — next departure (sleeping only)', () => {
-  it('sleeping with future next_run_at → "in <dur>"', () => {
-    const [c] = buildBoard([row({ agent: 'a', status: 'sleeping', next_run_at: NOW + 12 * 60_000 })], NOW)
-    expect(c.next_departure).toBe('in 12m')
-  })
-  it('sleeping past-due → "due"', () => {
-    const [c] = buildBoard([row({ agent: 'a', status: 'sleeping', next_run_at: NOW - 1000 })], NOW)
-    expect(c.next_departure).toBe('due')
-  })
-  it('non-sleeping → null even with next_run_at', () => {
-    const [c] = buildBoard([row({ agent: 'a', status: 'running', next_run_at: NOW + 60_000 })], NOW)
-    expect(c.next_departure).toBeNull()
   })
 })
 

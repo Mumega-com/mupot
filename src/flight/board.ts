@@ -2,30 +2,37 @@
 //
 // Pure derivation from FlightRow[] (listFlights, DESC by created_at) into display
 // cards: phase metaphor, accounted cost, readiness/coherence score + per-agent
-// trend, and the next departure for sleeping flights. No I/O, no Hono — so the
-// dashboard renders it and tests cover it without a Worker. See docs/flight-operations.md.
+// trend. No I/O, no Hono — so the dashboard renders it and tests cover it without a
+// Worker. See docs/flight-operations.md.
+//
+// This board used to carry a 'holding' phase (from status 'waiting') and a 'sleeping'
+// phase with a "next departure" countdown read off next_run_at. Both were removed in
+// mupot#913: no writer for either status was ever built, so the countdown column was
+// permanently blank and the two phases were unreachable. See flight/service.ts's header
+// for the full account and for why the DB schema keeps both names anyway.
 
 import type { FlightRow, FlightStatus } from './service'
 import { detectFlightCollisions } from './clearance'
 import type { FlightCollision } from './clearance'
 
-// The board metaphor (plain mupot language): running=flying, waiting=holding (at a
-// human gate), sleeping=between flights. preflight/held/landed/failed keep their names.
-export type FlightPhase = 'preflight' | 'flying' | 'holding' | 'sleeping' | 'held' | 'landed' | 'failed'
+// The board metaphor (plain mupot language): running=flying. preflight/held/landed/failed
+// keep their names. Record<FlightStatus, …> is exhaustive by construction — adding a
+// status to the union without giving it a phase here is a compile error, which is the
+// property that keeps this map honest.
+export type FlightPhase = 'preflight' | 'flying' | 'held' | 'landed' | 'failed'
 
 const PHASE: Record<FlightStatus, FlightPhase> = {
   preflight: 'preflight',
   running: 'flying',
-  waiting: 'holding',
-  sleeping: 'sleeping',
   held: 'held',
   landed: 'landed',
   failed: 'failed',
 }
 
-// A flight is "live" (on the board now) while it is pre-launch, in the air, or sleeping
-// between legs. Terminal flights (landed/failed/held) are history.
-const LIVE_PHASES: ReadonlySet<FlightPhase> = new Set<FlightPhase>(['preflight', 'flying', 'holding', 'sleeping'])
+// A flight is "live" (on the board now) while it is pre-launch or in the air. Terminal
+// flights (landed/failed/held) are history. `held` is terminal despite sounding
+// in-progress: it is the NO-GO verdict, an ending, not a pause.
+const LIVE_PHASES: ReadonlySet<FlightPhase> = new Set<FlightPhase>(['preflight', 'flying'])
 
 export type Trend = 'up' | 'down' | 'flat'
 
@@ -42,7 +49,6 @@ export interface FlightCard {
   score: number | null
   score_pct: string | null
   trend: Trend | null
-  next_departure: string | null
   age: string
 }
 
@@ -66,12 +72,6 @@ export function humanDur(ms: number): string {
   const h = Math.round(m / 60)
   if (h < 24) return `${h}h`
   return `${Math.round(h / 24)}d`
-}
-
-function nextDeparture(row: FlightRow, nowMs: number): string | null {
-  if (row.status !== 'sleeping' || row.next_run_at == null) return null
-  const delta = row.next_run_at - nowMs
-  return delta <= 0 ? 'due' : `in ${humanDur(delta)}`
 }
 
 /**
@@ -109,7 +109,6 @@ export function buildBoard(rows: FlightRow[], nowMs: number): FlightCard[] {
       score: row.score,
       score_pct: formatPct(row.score),
       trend,
-      next_departure: nextDeparture(row, nowMs),
       age: `${humanDur(nowMs - row.created_at)} ago`,
     }
   })

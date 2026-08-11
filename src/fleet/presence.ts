@@ -123,7 +123,8 @@ export async function listPresence(env: Env, nowMs: number, squadIds?: string[] 
     }
   })
   // Second axis (#62): overlay schedule-state from this tenant's flights so a
-  // resting session agent reads "sleeping · next 14:00" instead of a false "dead".
+  // resting session agent reads "done" (its flights have ended) instead of a false
+  // "dead" from a heartbeat it never sends.
   const states = scheduleStates(await listFlights(env))
   return attachSchedule(rows, states)
 }

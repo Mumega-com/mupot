@@ -1,9 +1,28 @@
 // flight/service — the flight record lifecycle (the dispatch spine, Flight #61/#62).
 //
 // A flight = one bounded run of an agent toward a goal. Lifecycle:
-//   preflight → held (NO-GO) | running → waiting (human gate) | sleeping → landed | failed
+//   preflight → held (NO-GO) | running → landed | failed
 // All tenant-scoped. Transition guards live in each UPDATE's WHERE (a terminal flight
 // cannot be revived; a held/landed flight cannot be re-landed) — same discipline as loops.
+//
+// 'waiting' and 'sleeping' are NOT in this union (mupot#913). 0017_flights.sql sketched a
+// richer lifecycle — running → waiting (human gate) → sleeping (between legs, waking at
+// next_run_at) — but no writer for either state was ever built: nothing in src/ has ever
+// issued `status='waiting'`, and the lone `status='sleeping'` writer (sleepFlight) was
+// called only by its own test. Every consumer that branched on them was therefore dead —
+// a board phase nothing could reach, a "next departure" nothing could schedule, and
+// land/fail guards accepting states no row could hold. Carrying them cost real reading
+// time on every pass over the flight spine, so the code now describes only what
+// production can actually produce.
+//
+// The SCHEMA half is deliberately NOT changed: the CHECK constraint in 0017 still allows
+// all seven names and `next_run_at` is still a column. Narrowing either on D1 means a
+// table rewrite (12-step ALTER), and `flights` carries the partial unique index
+// idx_marketing_recommendation_flight_dedup (0054/0064) plus the marketing fence triggers
+// that reference it — a rewrite would silently drop them. A wider CHECK than the code
+// emits is harmless (it constrains, it does not oblige); a lost unique index is not.
+// If a human gate or a sleep/wake leg is ever genuinely built, re-add the state here
+// WITH its writer and the schema needs no migration at all.
 
 import type { Env } from '../types'
 import { createBus } from '../bus'
@@ -16,8 +35,6 @@ export type FlightStatus =
   | 'preflight'
   | 'held'
   | 'running'
-  | 'waiting'
-  | 'sleeping'
   | 'landed'
   | 'failed'
 
@@ -36,7 +53,9 @@ export interface FlightRow {
   score: number | null
   budget_micro_usd: number | null
   cost_micro_usd: number
-  next_run_at: number | null
+  // NOTE: the row also carries a `next_run_at` column (0017). It is not modelled here
+  // because nothing writes it — see the sleep/wake note at the top of this file. `SELECT *`
+  // still returns it; it is always NULL, and typing it would invite a fourth consumer.
   created_at: number
   started_at: number | null
   ended_at: number | null
@@ -214,7 +233,9 @@ export async function applyPreflight(env: Env, id: string, r: PreflightResult): 
   return 'held'
 }
 
-// Land a flight (completed OK). Only from an in-air state.
+// Land a flight (completed OK). Only from an in-air state — which is 'running' and only
+// 'running': applyPreflight is the sole door into the air, and it opens onto 'running'.
+// (The guard used to also accept 'waiting'/'sleeping'; nothing could ever be in either.)
 export async function landFlight(
   env: Env,
   id: string,
@@ -222,7 +243,7 @@ export async function landFlight(
 ): Promise<void> {
   await env.DB.prepare(
     `UPDATE flights SET status='landed', cost_micro_usd=?3, score=COALESCE(?4, score), ended_at=?5
-     WHERE id=?1 AND tenant=?2 AND status IN ('running','waiting','sleeping')`,
+     WHERE id=?1 AND tenant=?2 AND status='running'`,
   )
     .bind(id, env.TENANT_SLUG, opts.cost_micro_usd ?? 0, opts.score ?? null, Date.now())
     .run()
@@ -279,7 +300,7 @@ export async function landGovernedFlight(
     `UPDATE flights SET status='landed', cost_micro_usd=?4, score=COALESCE(?5, score), ended_at=?6
      WHERE id=?1 AND tenant=?2
        AND (?3 IS NULL OR agent=?3)
-       AND status IN ('running','waiting','sleeping')
+       AND status='running'
        AND budget_micro_usd IS NOT NULL AND ?4 <= budget_micro_usd
        AND json_valid(meta)
        AND json_extract(meta, '$.schema') = 'mupot.flight.meta/v1'
@@ -446,23 +467,15 @@ export async function flushFlightEventOutbox(env: Env, limit = 50): Promise<{ at
   return { attempted: rows.results?.length ?? 0, delivered }
 }
 
-// Fail a flight (errored). From any non-terminal state.
+// Fail a flight (errored). From any non-terminal state — 'preflight' (died before or
+// during the gate) or 'running' (died in the air). held/landed/failed are terminal and
+// stay excluded, so a failure report can never revive or overwrite a finished flight.
 export async function failFlight(env: Env, id: string, reason: string): Promise<void> {
   await env.DB.prepare(
     `UPDATE flights SET status='failed', gate_reason=?3, ended_at=?4
-     WHERE id=?1 AND tenant=?2 AND status IN ('preflight','running','waiting','sleeping')`,
+     WHERE id=?1 AND tenant=?2 AND status IN ('preflight','running')`,
   )
     .bind(id, env.TENANT_SLUG, reason.slice(0, 500), Date.now())
-    .run()
-}
-
-// Put a flight to sleep until next_run_at (Unix ms). Only from an in-air state.
-export async function sleepFlight(env: Env, id: string, nextRunAt: number): Promise<void> {
-  await env.DB.prepare(
-    `UPDATE flights SET status='sleeping', next_run_at=?3
-     WHERE id=?1 AND tenant=?2 AND status IN ('running','waiting')`,
-  )
-    .bind(id, env.TENANT_SLUG, nextRunAt)
     .run()
 }
 

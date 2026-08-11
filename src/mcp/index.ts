@@ -1764,7 +1764,11 @@ const toolFlightLand: ToolSpec = {
     if (!memberCanAccessFlight(auth, meta, squadCache, 'member')) {
       return fail(403, 'forbidden', { need: 'member', scope: 'flight squads' })
     }
-    if (!(['running', 'waiting', 'sleeping'] as const).includes(flight.status as 'running' | 'waiting' | 'sleeping')) {
+    // In the air = 'running', the only state a flight can be landed from (see the
+    // lifecycle note in flight/service.ts). This is the caller-facing mirror of
+    // landGovernedFlight's own WHERE guard, kept so the agent gets a 409 with a reason
+    // instead of a silent zero-row UPDATE.
+    if (flight.status !== 'running') {
       return fail(409, 'flight_not_in_air', { status: flight.status })
     }
     if (!Number.isSafeInteger(flight.budget_micro_usd) || (flight.budget_micro_usd as number) < 0) {

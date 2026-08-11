@@ -127,7 +127,7 @@ export interface FleetRadar {
 
 // ── tuning ───────────────────────────────────────────────────────────────────
 
-// A "live" flight (flight/board.ts LIVE_PHASES) stuck in running/waiting this long
+// A "live" flight (flight/board.ts LIVE_PHASES) stuck in running this long
 // since it started (or was created, if never started) with no lifecycle transition
 // is flagged as stalled. This is a SEPARATE clock from presenceTtlSec on purpose —
 // heartbeats and flights are different signals with different natural cadences; see
@@ -226,10 +226,11 @@ export function buildFleetRadar(inputs: FleetRadarInputs): FleetRadar {
       activeFlightCountBySquad.set(sid, (activeFlightCountBySquad.get(sid) ?? 0) + 1)
     }
 
-    // Stalled-flight detection: still running/waiting (not merely sleeping between
-    // legs — that's healthy) this long since launch.
+    // Stalled-flight detection: still running this long since launch. 'preflight' is
+    // excluded on purpose — a flight sitting at the gate has not launched, so age since
+    // creation says nothing about it being stuck in the air.
     const row = flights[i]
-    if ((card.status === 'running' || card.status === 'waiting') && row) {
+    if (card.status === 'running' && row) {
       const since = row.started_at ?? row.created_at
       const ageMs = nowMs - since
       if (ageMs > staleFlightAgeMs) {

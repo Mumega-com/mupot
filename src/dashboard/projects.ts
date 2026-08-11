@@ -414,7 +414,7 @@ async function loadListMetrics(
             (SELECT COUNT(*) FROM flights f
               WHERE f.project_id = p.id
                 AND f.tenant = ${tenantParam}
-                AND f.status IN ('preflight', 'running', 'waiting', 'sleeping')${flightFilter}) AS active_flights
+                AND f.status IN ('preflight', 'running')${flightFilter}) AS active_flights
        FROM projects p
       WHERE p.id IN (SELECT CAST(value AS TEXT) FROM json_each(?1))
       LIMIT ${limitParam}`,

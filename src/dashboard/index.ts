@@ -4974,7 +4974,7 @@ function approvalsScript() {
 // pot-native control is a later objective (#46).
 function flightsBody(cards: FlightCard[], project?: Project, scanLimited = false) {
   const phaseColor = (p: string) =>
-    p === 'flying' ? 'var(--ok)' : p === 'sleeping' ? 'var(--warn)' : p === 'holding' || p === 'preflight' ? 'var(--accent)' : p === 'failed' || p === 'held' ? '#e5534b' : 'var(--dim)'
+    p === 'flying' ? 'var(--ok)' : p === 'preflight' ? 'var(--accent)' : p === 'failed' || p === 'held' ? '#e5534b' : 'var(--dim)'
   const arrow = (t: string | null) => (t === 'up' ? '▲' : t === 'down' ? '▼' : t === 'flat' ? '▬' : '')
   const arrowColor = (t: string | null) => (t === 'up' ? 'var(--ok)' : t === 'down' ? '#e5534b' : 'var(--dim)')
   const tr = (c: FlightCard) => `
@@ -4984,13 +4984,13 @@ function flightsBody(cards: FlightCard[], project?: Project, scanLimited = false
       <td><span class="fl-badge" style="color:${phaseColor(c.phase)}">${escHtml(c.phase)}</span></td>
       <td class="fl-num">${c.score_pct ? `${escHtml(c.score_pct)} <span style="color:${arrowColor(c.trend)}">${arrow(c.trend)}</span>` : '<span style="color:var(--dim)">—</span>'}</td>
       <td class="fl-num ${c.over_budget ? 'fl-over' : ''}">${escHtml(c.cost_usd)}${c.budget_usd ? `<span style="color:var(--dim)"> / ${escHtml(c.budget_usd)}</span>` : ''}</td>
-      <td>${c.next_departure ? escHtml(c.next_departure) : escHtml(c.age)}</td>
+      <td>${escHtml(c.age)}</td>
     </tr>`
   const flying = cards.filter((c) => c.phase === 'flying').length
-  const sleeping = cards.filter((c) => c.phase === 'sleeping').length
+  const preflight = cards.filter((c) => c.phase === 'preflight').length
   const table = cards.length
     ? `<table class="fl-table">
-        <thead><tr><th>Agent</th><th>Goal</th><th>Phase</th><th>Score</th><th>Cost / budget</th><th>Departure / age</th></tr></thead>
+        <thead><tr><th>Agent</th><th>Goal</th><th>Phase</th><th>Score</th><th>Cost / budget</th><th>Age</th></tr></thead>
         <tbody>${cards.map(tr).join('')}</tbody>
       </table>`
     : `<p class="empty">No flights yet. A flight = one bounded run of an agent toward a goal —
@@ -5006,7 +5006,10 @@ function flightsBody(cards: FlightCard[], project?: Project, scanLimited = false
     })}
     ${kpiRow([
       statCard({ label: 'Flying', value: String(flying), subTone: flying > 0 ? 'ok' : 'dim' }),
-      statCard({ label: 'Sleeping', value: String(sleeping), subTone: 'dim' }),
+      // The other half of LIVE_PHASES. This slot used to count 'sleeping', a phase no
+      // flight could ever be in (mupot#913), so the card read 0 forever; 'preflight'
+      // is the real second live phase and needs no data the board doesn't already have.
+      statCard({ label: 'Preflight', value: String(preflight), subTone: preflight > 0 ? 'ok' : 'dim' }),
     ])}
     ${scanLimited ? html`<div class="card" role="status" style="border-color:var(--warn);margin-bottom:12px">
       Flight history is partial because the project scan safety limit was reached.
@@ -5075,23 +5078,19 @@ function potFleetBody(rows: PresenceView[]) {
   // Heartbeat axis (cheap always-on agents): active/idle/dead/never.
   const dot = (l: string) =>
     l === 'active' ? 'var(--ok)' : l === 'idle' ? 'var(--warn)' : l === 'dead' ? '#e5534b' : 'var(--dim)'
-  // Schedule axis (#62, session agents with flights): flying/sleeping/done.
-  const schedDot = (s: string) => (s === 'flying' ? 'var(--ok)' : s === 'sleeping' ? 'var(--warn)' : 'var(--dim)')
-  // "Present" = heartbeat active OR mid/between flights (flying or sleeping).
+  // Schedule axis (#62, session agents with flights): flying/done.
+  const schedDot = (s: string) => (s === 'flying' ? 'var(--ok)' : 'var(--dim)')
+  // "Present" = heartbeat active OR mid-flight.
   const present = rows.filter(
-    (r) => r.liveness === 'active' || r.schedule?.state === 'flying' || r.schedule?.state === 'sleeping',
+    (r) => r.liveness === 'active' || r.schedule?.state === 'flying',
   ).length
   const tr = (r: PresenceView) => {
-    // Session agent (has flights) → read schedule-state; a resting one is sleeping,
-    // never "dead". Cheap always-on agent → read heartbeat liveness as before.
+    // Session agent (has flights) → read schedule-state, so a resting one reads "done"
+    // rather than a false "dead". Cheap always-on agent → heartbeat liveness as before.
     const useSched = r.schedule != null
     const dimmed = useSched ? r.schedule!.state === 'done' : r.liveness === 'dead' || r.liveness === 'never'
     const dotColor = useSched ? schedDot(r.schedule!.state) : dot(r.liveness)
-    const statusLabel = useSched
-      ? r.schedule!.state === 'sleeping' && r.schedule!.next_label
-        ? `${r.schedule!.state} · ${r.schedule!.next_label}`
-        : r.schedule!.state
-      : r.liveness
+    const statusLabel = useSched ? r.schedule!.state : r.liveness
     const badgeClass = useSched ? `fl-sched-${escAttr(r.schedule!.state)}` : `fl-${escAttr(r.liveness)}`
     return `
     <tr class="fl-row ${dimmed ? 'fl-dim' : ''}">
@@ -5115,7 +5114,7 @@ function potFleetBody(rows: PresenceView[]) {
       crumbs: 'Overview / Fleet',
       title: 'Fleet',
       sub:
-        'Your flock — agents that check in to this pot, on any runtime (Claude Code, Codex, Hermes, openclaw…). Always-on agents read their heartbeat (active/idle/dead); session agents read their schedule (flying / sleeping · next run / done) — a resting agent is sleeping, not dead. Times UTC. Host control uses the signed mupot control plane above.',
+        'Your flock — agents that check in to this pot, on any runtime (Claude Code, Codex, Hermes, openclaw…). Always-on agents read their heartbeat (active/idle/dead); session agents read their schedule (flying / done) — a resting agent is done, not dead. Times UTC. Host control uses the signed mupot control plane above.',
     })}
     ${kpiRow([statCard({ label: 'Present now', value: String(present), subTone: present > 0 ? 'ok' : 'dim' })])}
     <style>
@@ -5129,7 +5128,7 @@ function potFleetBody(rows: PresenceView[]) {
       .fl-badge { font-size: 11px; text-transform: uppercase; letter-spacing: .5px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); }
       .fl-active { color: var(--ok); } .fl-idle { color: var(--warn); }
       .fl-dead { color: #e5534b; } .fl-never { color: var(--dim); }
-      .fl-sched-flying { color: var(--ok); } .fl-sched-sleeping { color: var(--warn); } .fl-sched-done { color: var(--dim); }
+      .fl-sched-flying { color: var(--ok); } .fl-sched-done { color: var(--dim); }
     </style>
     ${raw(`<div class="card" style="padding:0;overflow-x:auto">${table}</div>`)}`
 }

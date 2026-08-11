@@ -4,7 +4,6 @@ import {
   applyPreflight,
   landFlight,
   failFlight,
-  sleepFlight,
   getFlight,
   listFlights,
 } from '../src/flight/service'
@@ -39,7 +38,7 @@ function makeEnv(tenant = 'digid'): { env: Env; rows: Map<string, FlightRow> } {
                   rows.set(id, {
                     id, tenant: t, project_id: projectId, agent, goal, status: 'preflight', trigger_source: trig as FlightRow['trigger_source'],
                     gate_verdict: null, gate_reason: '', score: null, budget_micro_usd: budget,
-                    cost_micro_usd: 0, next_run_at: null, created_at: rows.size + 1, started_at: null,
+                    cost_micro_usd: 0, created_at: rows.size + 1, started_at: null,
                     ended_at: null, meta,
                   })
                 } else if (sql.includes("status='running', gate_verdict='go'")) {
@@ -50,13 +49,10 @@ function makeEnv(tenant = 'digid'): { env: Env; rows: Map<string, FlightRow> } {
                   guarded(id, t, ['preflight'], (r) => { r.status = 'held'; r.gate_verdict = 'no_go'; r.gate_reason = reason; r.score = score; r.ended_at = ended })
                 } else if (sql.includes("status='landed'")) {
                   const [id, t, cost, score, ended] = a as [string, string, number, number | null, number]
-                  guarded(id, t, ['running', 'waiting', 'sleeping'], (r) => { r.status = 'landed'; r.cost_micro_usd = cost; if (score != null) r.score = score; r.ended_at = ended })
+                  guarded(id, t, ['running'], (r) => { r.status = 'landed'; r.cost_micro_usd = cost; if (score != null) r.score = score; r.ended_at = ended })
                 } else if (sql.includes("status='failed'")) {
                   const [id, t, reason, ended] = a as [string, string, string, number]
-                  guarded(id, t, ['preflight', 'running', 'waiting', 'sleeping'], (r) => { r.status = 'failed'; r.gate_reason = reason; r.ended_at = ended })
-                } else if (sql.includes("status='sleeping'")) {
-                  const [id, t, next] = a as [string, string, number]
-                  guarded(id, t, ['running', 'waiting'], (r) => { r.status = 'sleeping'; r.next_run_at = next })
+                  guarded(id, t, ['preflight', 'running'], (r) => { r.status = 'failed'; r.gate_reason = reason; r.ended_at = ended })
                 }
                 return { success: true }
               },
@@ -179,7 +175,7 @@ describe('applyPreflight', () => {
   })
 })
 
-describe('land / fail / sleep + terminal guards', () => {
+describe('land / fail + terminal guards', () => {
   it('lands a running flight with cost', async () => {
     const { env } = makeEnv()
     const id = await createFlight(env, { agent: 'kasra', goal: 'g' })
@@ -196,18 +192,6 @@ describe('land / fail / sleep + terminal guards', () => {
     await applyPreflight(env, id, NOGO) // held
     await landFlight(env, id, { cost_micro_usd: 1 })
     expect((await getFlight(env, id))?.status).toBe('held') // unchanged
-  })
-  it('sleep then land', async () => {
-    const { env } = makeEnv()
-    const id = await createFlight(env, { agent: 'kasra', goal: 'g' })
-    await applyPreflight(env, id, GO)
-    await sleepFlight(env, id, 1_780_000_000_000)
-    let f = await getFlight(env, id)
-    expect(f?.status).toBe('sleeping')
-    expect(f?.next_run_at).toBe(1_780_000_000_000)
-    await landFlight(env, id, { cost_micro_usd: 10 })
-    f = await getFlight(env, id)
-    expect(f?.status).toBe('landed')
   })
   it('fails a running flight', async () => {
     const { env } = makeEnv()

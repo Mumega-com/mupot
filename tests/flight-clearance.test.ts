@@ -46,7 +46,6 @@ function row(p: Partial<FlightRow> & { agent: string; status: FlightStatus; meta
     score: p.score ?? null,
     budget_micro_usd: p.budget_micro_usd ?? null,
     cost_micro_usd: p.cost_micro_usd ?? 0,
-    next_run_at: p.next_run_at ?? null,
     created_at: p.created_at ?? NOW,
     started_at: p.started_at ?? null,
     ended_at: p.ended_at ?? null,
@@ -144,7 +143,7 @@ describe('checkFlightClearance / detectFlightCollisions — severity + edge case
   })
 
   it('same squad_ids only → WARN', () => {
-    const a = row({ agent: 'a', status: 'waiting', meta: meta({ goal_id: 'goal-1', objective_id: 'obj-1', squad_ids: ['squad-shared'], task_ids: ['task-1'] }) })
+    const a = row({ agent: 'a', status: 'running', meta: meta({ goal_id: 'goal-1', objective_id: 'obj-1', squad_ids: ['squad-shared'], task_ids: ['task-1'] }) })
     const b = row({ agent: 'b', status: 'preflight', meta: meta({ goal_id: 'goal-2', objective_id: 'obj-2', squad_ids: ['squad-shared'], task_ids: ['task-2'] }) })
     const collisions = detectFlightCollisions([a, b])
     expect(collisions).toHaveLength(1)
@@ -170,8 +169,8 @@ describe('checkFlightClearance / detectFlightCollisions — severity + edge case
     expect(result.holds).toHaveLength(0)
   })
 
-  it('preflight/waiting/sleeping all count as live (collide), landed/failed/held do not', () => {
-    const liveStatuses: FlightStatus[] = ['preflight', 'running', 'waiting', 'sleeping']
+  it('preflight and running both count as live (collide), landed/failed/held do not', () => {
+    const liveStatuses: FlightStatus[] = ['preflight', 'running']
     for (const status of liveStatuses) {
       const a = row({ agent: 'a', status, meta: flightKMeta })
       const b = row({ agent: 'b', status: 'running', meta: flightCMeta })
@@ -230,7 +229,7 @@ describe('deriveActiveCollisions (board.ts) — the presentation split', () => {
     const flightC = row({ agent: 'codex', status: 'running', meta: flightCMeta })
     const unrelatedWarn = row({
       agent: 'someone',
-      status: 'waiting',
+      status: 'running',
       meta: meta({ goal_id: 'goal-x', objective_id: 'obj-254-runtime-inbox', squad_ids: ['squad-x'], task_ids: ['task-x'], artifact_refs: ['x.ts'] }),
     })
 

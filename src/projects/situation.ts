@@ -37,7 +37,7 @@ export interface ProjectSituationFlight {
   id: string
   agent: string
   goal: string
-  status: 'preflight' | 'running' | 'waiting' | 'sleeping'
+  status: 'preflight' | 'running'
   created_at: number
 }
 
@@ -453,7 +453,7 @@ export async function loadProjectSituation(
          FROM flights f
         WHERE f.project_id = ?1
           AND f.tenant = ?2
-          AND f.status IN ('preflight', 'running', 'waiting', 'sleeping')
+          AND f.status IN ('preflight', 'running')
           AND f.id NOT IN (SELECT CAST(value AS TEXT) FROM json_each(?6))
           ${canonicalFlightMetaSql('f')}
           AND (?3 = 1 OR NOT EXISTS (
