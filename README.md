@@ -43,7 +43,8 @@ the active development target is `v0.30.0 Governed Tools and Console Consolidati
 [DME integration runbook](./docs/dme-integration-runbook.md),
 [DME integration release receipt](./docs/releases/dme-integration.md),
 [what running an agent on Mupot means](./docs/agent-running-on-mupot.md),
-[how to connect an MCP client](./docs/connect-mcp-client.md), and
+[how to connect an MCP client](./docs/connect-mcp-client.md),
+[how to host a seat on your own machine](./docs/host-a-seat.md), and
 [what runs offline in local dev](./docs/local-dev.md).
 
 ## Pots and projects
