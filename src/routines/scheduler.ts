@@ -1,4 +1,3 @@
-import type { D1Result } from '@cloudflare/workers-types'
 import type { Env } from '../types'
 import { nextRoutineOccurrence, routineOccurrenceKey } from './schedule'
 import type { Routine, RoutinePolicySnapshot, RoutineSchedule } from './types'
@@ -40,14 +39,6 @@ export interface RoutineSchedulerSummary {
 }
 
 export type RoutineRunProcessor = (runId: string) => Promise<void>
-
-function wrote(result: D1Result<unknown>): boolean {
-  return Number(result.meta?.changes ?? 0) > 0
-}
-
-function changes(result: D1Result<unknown>): number {
-  return Number(result.meta?.changes ?? 0)
-}
 
 function scheduleFrom(routine: Routine): RoutineSchedule {
   if (routine.trigger_kind === 'once') {
@@ -116,8 +107,12 @@ async function createDueOccurrence(
   const createdEventId = crypto.randomUUID()
   const skippedEventId = crypto.randomUUID()
 
-  const outcomes = await env.DB.batch([
-    env.DB.prepare(
+  // Sequential (#919). Statement 1 used to read back the run statement 0 had just
+  // inserted, so on production D1 it wrote NO events at all — and `skipped` was derived
+  // from `changes(outcomes[1]) === 2`, which made it permanently false. The run's own
+  // status is the honest source for that, so it is read from RETURNING instead of inferred
+  // from how many event rows an insert happened to write.
+  const insertResult = await env.DB.prepare(
       `INSERT OR IGNORE INTO routine_runs (
         id, tenant, project_id, routine_id, routine_revision, policy_json, occurrence_key,
         trigger_kind, scheduled_for, status, result_summary, finished_at, created_at, updated_at
@@ -167,7 +162,8 @@ async function createDueOccurrence(
       ) AND NOT EXISTS (
         SELECT 1 FROM routine_runs
          WHERE tenant = ? AND routine_id = ? AND occurrence_key = ?
-      )`,
+      )
+     RETURNING status, result_summary`,
     ).bind(
       runId, routine.tenant, routine.project_id, routine.id, routine.revision, policyJson,
       occurrenceKey, routine.trigger_kind, routine.next_run_at,
@@ -180,44 +176,63 @@ async function createDueOccurrence(
       nowIso, nowIso,
       routine.id, routine.tenant, routine.project_id, routine.revision, routine.next_run_at,
       routine.tenant, routine.id, occurrenceKey,
-    ),
-    env.DB.prepare(
-      `INSERT INTO routine_run_events (
-        id, tenant, project_id, run_id, kind, actor_type, actor_id,
-        occurred_at, metadata_json, correlation_id
-      )
-      SELECT ?, ?, ?, ?, 'created', 'system', ?, ?, ?, ?
-       WHERE EXISTS (SELECT 1 FROM routine_runs WHERE id = ?)
-      UNION ALL
-      SELECT ?, ?, ?, ?, 'skipped', 'system', ?, ?,
-             json_object('reason', result_summary), ?
-        FROM routine_runs WHERE id = ? AND status = 'skipped'`,
-    ).bind(
-      createdEventId, routine.tenant, routine.project_id, runId, owner, nowIso,
-      JSON.stringify({ scheduled_for: routine.next_run_at, routine_revision: routine.revision }),
-      runId, runId,
-      skippedEventId, routine.tenant, routine.project_id, runId, owner, nowIso, runId, runId,
-    ),
-    env.DB.prepare(
+    ).all<{ status: string; result_summary: string | null }>()
+
+  const inserted = insertResult.results ?? []
+  const created = inserted.length === 1
+  const skipped = created && inserted[0].status === 'skipped'
+
+  // Receipts. A lost event must not change what the caller is told happened — the run row
+  // is the fact, these are its record.
+  if (created) {
+    try {
+      const events = [
+        env.DB.prepare(
+          `INSERT INTO routine_run_events (
+            id, tenant, project_id, run_id, kind, actor_type, actor_id,
+            occurred_at, metadata_json, correlation_id
+          ) VALUES (?1, ?2, ?3, ?4, 'created', 'system', ?5, ?6, ?7, ?4)`,
+        ).bind(
+          createdEventId, routine.tenant, routine.project_id, runId, owner, nowIso,
+          JSON.stringify({ scheduled_for: routine.next_run_at, routine_revision: routine.revision }),
+        ),
+      ]
+      if (skipped) {
+        events.push(env.DB.prepare(
+          `INSERT INTO routine_run_events (
+            id, tenant, project_id, run_id, kind, actor_type, actor_id,
+            occurred_at, metadata_json, correlation_id
+          ) VALUES (?1, ?2, ?3, ?4, 'skipped', 'system', ?5, ?6, ?7, ?4)`,
+        ).bind(
+          skippedEventId, routine.tenant, routine.project_id, runId, owner, nowIso,
+          JSON.stringify({ reason: inserted[0].result_summary }),
+        ))
+      }
+      // Safe to batch: both write routine_run_events and neither reads it.
+      await env.DB.batch(events)
+    } catch (error) {
+      console.error('routine run created without its receipts', {
+        run_id: runId, error: error instanceof Error ? error.message : 'unknown_error',
+      })
+    }
+  }
+
+  await env.DB.prepare(
       `UPDATE routines SET next_run_at = ?, updated_at = ?
         WHERE id = ? AND tenant = ? AND project_id = ? AND revision = ?
           AND status = 'enabled' AND next_run_at = ?`,
     ).bind(
       nextRunAt, nowIso, routine.id, routine.tenant, routine.project_id,
       routine.revision, routine.next_run_at,
-    ),
-  ])
+    ).run()
 
-  return {
-    created: wrote(outcomes[0]),
-    skipped: changes(outcomes[1]) === 2,
-  }
+  return { created, skipped }
 }
 
 async function skipStaleRun(env: Env, runId: string, owner: string, now: string): Promise<boolean> {
   const eventId = crypto.randomUUID()
-  const outcomes = await env.DB.batch([
-    env.DB.prepare(
+  // Sequential (#919): the event INSERT below reads back the row this UPDATE writes.
+  const skipResult = await env.DB.prepare(
       `UPDATE routine_runs SET status = 'skipped',
               result_summary = CASE
                 WHEN NOT EXISTS (
@@ -235,25 +250,38 @@ async function skipStaleRun(env: Env, runId: string, owner: string, now: string)
                AND r.project_id = routine_runs.project_id AND r.status = 'enabled'
                AND r.revision = routine_runs.routine_revision
           )
-        )`,
-    ).bind(now, now, runId, env.TENANT_SLUG),
-    env.DB.prepare(
+        )
+     RETURNING project_id, result_summary`,
+    ).bind(now, now, runId, env.TENANT_SLUG)
+    .all<{ project_id: string; result_summary: string }>()
+
+  const skipped = skipResult.results ?? []
+  if (skipped.length !== 1) return false
+
+  // The skip is the outcome; this event is its receipt. Never let a missing receipt
+  // report the skip as not having happened (#916/#919).
+  try {
+    await env.DB.prepare(
       `INSERT INTO routine_run_events (
         id, tenant, project_id, run_id, kind, actor_type, actor_id,
         occurred_at, metadata_json, correlation_id
       )
-      SELECT ?, tenant, project_id, id, 'skipped', 'system', ?, ?,
-             json_object('reason', result_summary), id
-        FROM routine_runs
-       WHERE id = ? AND tenant = ? AND status = 'skipped'
-         AND result_summary IN ('project_not_active','routine_policy_changed')
-         AND NOT EXISTS (
+      SELECT ?1, ?2, ?3, ?4, 'skipped', 'system', ?5, ?6,
+             json_object('reason', ?7), ?4
+       WHERE NOT EXISTS (
            SELECT 1 FROM routine_run_events e
-            WHERE e.run_id = routine_runs.id AND e.kind = 'skipped'
+            WHERE e.run_id = ?4 AND e.kind = 'skipped'
          )`,
-    ).bind(eventId, owner, now, runId, env.TENANT_SLUG),
-  ])
-  return wrote(outcomes[0])
+    ).bind(
+      eventId, env.TENANT_SLUG, skipped[0].project_id, runId, owner, now,
+      skipped[0].result_summary,
+    ).run()
+  } catch (error) {
+    console.error('routine run skipped without its receipt', {
+      run_id: runId, error: error instanceof Error ? error.message : 'unknown_error',
+    })
+  }
+  return true
 }
 
 async function failExhaustedQueuedRun(
@@ -263,31 +291,42 @@ async function failExhaustedQueuedRun(
   now: string,
 ): Promise<boolean> {
   const eventId = crypto.randomUUID()
-  const outcomes = await env.DB.batch([
-    env.DB.prepare(
+  // Sequential (#919). Note the old return was `wrote(0) && wrote(1)`, so a lost receipt
+  // reported the run as NOT failed — and the caller then tried to claim a failed run.
+  const failResult = await env.DB.prepare(
       `UPDATE routine_runs SET status = 'failed', result_summary = 'retry_exhausted',
               finished_at = ?, updated_at = ?
         WHERE id = ? AND tenant = ? AND status = 'queued'
-          AND attempt >= CAST(json_extract(policy_json, '$.max_attempts') AS INTEGER)`,
-    ).bind(now, now, runId, env.TENANT_SLUG),
-    env.DB.prepare(
+          AND attempt >= CAST(json_extract(policy_json, '$.max_attempts') AS INTEGER)
+     RETURNING project_id, attempt`,
+    ).bind(now, now, runId, env.TENANT_SLUG)
+    .all<{ project_id: string; attempt: number }>()
+
+  const failed = failResult.results ?? []
+  if (failed.length !== 1) return false
+
+  try {
+    await env.DB.prepare(
       `INSERT INTO routine_run_events (
         id, tenant, project_id, run_id, kind, actor_type, actor_id,
         occurred_at, metadata_json, correlation_id
       )
-      SELECT ?, tenant, project_id, id, 'failed', 'system', ?, ?,
-             json_object('reason', 'retry_exhausted', 'attempt', attempt), id
-        FROM routine_runs
-       WHERE id = ? AND tenant = ? AND status = 'failed'
-         AND result_summary = 'retry_exhausted'
-         AND NOT EXISTS (
+      SELECT ?1, ?2, ?3, ?4, 'failed', 'system', ?5, ?6,
+             json_object('reason', 'retry_exhausted', 'attempt', ?7), ?4
+       WHERE NOT EXISTS (
            SELECT 1 FROM routine_run_events e
-            WHERE e.run_id = routine_runs.id AND e.kind = 'failed'
+            WHERE e.run_id = ?4 AND e.kind = 'failed'
               AND json_extract(e.metadata_json, '$.reason') = 'retry_exhausted'
          )`,
-    ).bind(eventId, owner, now, runId, env.TENANT_SLUG),
-  ])
-  return wrote(outcomes[0]) && wrote(outcomes[1])
+    ).bind(
+      eventId, env.TENANT_SLUG, failed[0].project_id, runId, owner, now, failed[0].attempt,
+    ).run()
+  } catch (error) {
+    console.error('routine run failed without its receipt', {
+      run_id: runId, error: error instanceof Error ? error.message : 'unknown_error',
+    })
+  }
+  return true
 }
 
 export async function claimRoutineRun(
@@ -423,36 +462,49 @@ export async function recoverExpiredRoutineLeases(
       : new Date(now.getTime() + policy.backoffSeconds * 1000).toISOString()
     const eventKind = exhausted ? 'failed' : 'retry_scheduled'
     const eventId = crypto.randomUUID()
-    const outcomes = await env.DB.batch([
-      env.DB.prepare(
+    // Sequential (#919). The old form batched the recovery UPDATE with an event INSERT
+    // that read the row back, so the insert wrote nothing and `recovered` — gated on
+    // BOTH writing — never incremented. The recovery itself always happened; only the
+    // count and the receipt were lost, which is why this looked like "leases recover but
+    // the scheduler reports 0".
+    const recoverResult = await env.DB.prepare(
         `UPDATE routine_runs SET status = ?, lease_owner = NULL, lease_expires_at = NULL,
                 retry_at = ?, result_summary = ?, finished_at = ?, updated_at = ?
           WHERE id = ? AND tenant = ? AND status IN ('leased','observing')
             AND lease_expires_at <= ?
-            AND ${sqlNotCancellationPending('routine_runs')}`,
+            AND ${sqlNotCancellationPending('routine_runs')}
+       RETURNING project_id`,
       ).bind(
         exhausted ? 'failed' : 'queued', retryAt, exhausted ? 'retry_exhausted' : null,
         exhausted ? nowIso : null, nowIso, run.id, env.TENANT_SLUG, nowIso,
-      ),
-      env.DB.prepare(
+      ).all<{ project_id: string }>()
+
+    const recoveredRows = recoverResult.results ?? []
+    if (recoveredRows.length !== 1) continue
+
+    try {
+      await env.DB.prepare(
         `INSERT INTO routine_run_events (
           id, tenant, project_id, run_id, kind, actor_type, actor_id,
           occurred_at, metadata_json, correlation_id
         )
-        SELECT ?, tenant, project_id, id, ?, 'system', 'routine-scheduler', ?, ?, id
-          FROM routine_runs WHERE id = ? AND tenant = ? AND status = ?
-           AND NOT EXISTS (
+        SELECT ?1, ?2, ?3, ?4, ?5, 'system', 'routine-scheduler', ?6, ?7, ?4
+         WHERE NOT EXISTS (
              SELECT 1 FROM routine_run_events e
-              WHERE e.run_id = routine_runs.id AND e.kind = ?
-                AND CAST(json_extract(e.metadata_json, '$.attempt') AS INTEGER) = ?
+              WHERE e.run_id = ?4 AND e.kind = ?5
+                AND CAST(json_extract(e.metadata_json, '$.attempt') AS INTEGER) = ?8
            )`,
       ).bind(
-        eventId, eventKind, nowIso,
+        eventId, env.TENANT_SLUG, recoveredRows[0].project_id, run.id, eventKind, nowIso,
         JSON.stringify({ reason: 'lease_expired', retry_at: retryAt, attempt: run.attempt }),
-        run.id, env.TENANT_SLUG, exhausted ? 'failed' : 'queued', eventKind, run.attempt,
-      ),
-    ])
-    if (wrote(outcomes[0]) && wrote(outcomes[1])) recovered++
+        run.attempt,
+      ).run()
+    } catch (error) {
+      console.error('routine lease recovered without its receipt', {
+        run_id: run.id, error: error instanceof Error ? error.message : 'unknown_error',
+      })
+    }
+    recovered++
   }
   return recovered
 }
