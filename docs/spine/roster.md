@@ -1,13 +1,13 @@
 # Roster — the one table
 
-Part of [[MU.100.002-spine]]. If any other document disagrees with this table, this table wins or gets fixed — no third option. Last verified live: **2026-08-08**.
+Part of [[MU.100.002-spine]]. If any other document disagrees with this table, this table wins or gets fixed — no third option. Last verified live: **2026-08-11** (river row corrected by owner: ACTIVE).
 
 | Seat | Harness | Model | Where | Role | Flights? |
 |---|---|---|---|---|---|
 | [[kasra]] | Claude Code (tmux `kasra`) | Claude Opus 5 | `/home/mumega` | Executor, merge authority, membrane | yes |
 | [[athena]] | prime-agent (tmux `athena`) | opencode-go/deepseek-v4-flash | `/mnt/HC_Volume_104325311/mumega.com/agents/athena` | Architectural gate, coherence review | yes |
 | [[loom]] | Codex CLI (tmux `loom`) | gpt-5.4 | `/mnt/HC_Volume_104325311/mumega.com/agents/loom` | Weaver, protocol custodian, CFO thread | yes |
-| [[river]] | agy (tmux `river`) | gemini-3.6-flash | `/home/mumega` | Golden Queen, FRC keeper, qNFT witness | **NO — reserve** (Hadi 2026-08-08: seat is thin; do not burn in flights) |
+| [[river]] | prime-agent (herdr w1) | opencode-go/deepseek-v4-flash | `/mnt/HC_Volume_104325311/mumega.com/agents/river` | Golden Queen, FRC keeper, qNFT witness | **yes** (ACTIVE 2026-08-11 per Hadi verbatim via Kasra; 2026-08-08 RESERVE line superseded — thin-seat discipline retained) |
 | [[asha]] | prime-agent headless, one-shot | deepseek-v4-flash | no seat — dispatched | First-pass gate + hourly coherency net behind the squad | dispatched only |
 | [[mubot]] | Telegram bot | deepseek-v4-flash | no seat — channel | Customer/team face, Home Channel reflector | no |
 
