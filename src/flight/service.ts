@@ -251,6 +251,22 @@ function routineCostAggregationStatement(env: Env, flightId: string, updatedAt: 
   ).bind(env.TENANT_SLUG, flightId, updatedAt)
 }
 
+/**
+ * Outcome of a governed landing. The two fields are deliberately separate (#916): a
+ * refused transition and a missing receipt are different failures with opposite
+ * remedies — the first means the flight did NOT land and the caller should diagnose
+ * why; the second means it DID land and the receipt needs repair, not a retry. The
+ * previous `Promise<boolean>` collapsed them, and every caller read the collapsed
+ * false as "the landing was refused", which is how a 100%-reproducible receipt bug
+ * spent its whole life being reported as `flight_transition_conflict`.
+ */
+export interface GovernedLandingResult {
+  /** The flight moved to 'landed' in this call. */
+  transitioned: boolean
+  /** The flight.landed receipt exists (written now, or already present). */
+  receipt: boolean
+}
+
 export async function landGovernedFlight(
   env: Env,
   id: string,
@@ -262,7 +278,7 @@ export async function landGovernedFlight(
     meta: FlightMetaV1
     actor: { kind: 'member' | 'agent'; id: string }
   },
-): Promise<boolean> {
+): Promise<GovernedLandingResult> {
   const endedAt = Date.now()
   const createdAt = new Date(endedAt).toISOString()
   const eventId = crypto.randomUUID()
@@ -300,7 +316,8 @@ export async function landGovernedFlight(
                   LIMIT 1
                ), '') <> 'approved'
              )
-       )`,
+       )
+     RETURNING score, cost_micro_usd`,
   )
     .bind(
       id,
@@ -310,23 +327,104 @@ export async function landGovernedFlight(
       opts.score ?? null,
       endedAt,
     )
-  const outbox = env.DB.prepare(
-    `INSERT INTO flight_event_outbox
-       (id, tenant, flight_id, event_type, actor_kind, actor_id, payload, created_at)
-     SELECT ?1, ?2, ?3, 'flight.landed', ?4, ?5,
-            json_set(?6, '$.score', score, '$.cost_micro_usd', cost_micro_usd), ?7
-       FROM flights
-      WHERE id=?3 AND tenant=?2 AND status='landed' AND ended_at=?8
-     ON CONFLICT (tenant, flight_id, event_type) DO NOTHING`,
-  ).bind(eventId, env.TENANT_SLUG, id, opts.actor.kind, opts.actor.id, payload, createdAt, endedAt)
-  const [transitionResult, outboxResult] = await env.DB.batch([
-    transition,
-    outbox,
-    ...(opts.meta.routine_run_id
-      ? [routineCostAggregationStatement(env, id, createdAt)]
-      : []),
-  ])
-  return transitionResult.meta?.changes === 1 && outboxResult.meta?.changes === 1
+  // SEQUENTIAL, NOT BATCHED (#916). The previous version put the transition and this
+  // INSERT in one env.DB.batch(), and the INSERT read back the row the transition had
+  // just written (`SELECT ... FROM flights WHERE status='landed' AND ended_at=?`). On
+  // production D1 that read does NOT see the preceding statement's write, so the insert
+  // matched zero rows on every single land: the flight transitioned, no receipt was ever
+  // written, and the function returned false — telling the caller a successful land had
+  // failed. Two live flights (b4126c91, ab98f1d1) reproduced it minutes apart.
+  //
+  // It could not be caught locally: tests/helpers/sqlite-d1.ts implements batch() as
+  // BEGIN IMMEDIATE + sequential execute + COMMIT, and real SQLite *does* read its own
+  // writes inside a transaction. The helper is more transactional than the platform.
+  //
+  // So the rule this encodes: never read back your own write inside a batch. Awaiting the
+  // statements separately is the fix — read-your-writes holds ACROSS calls, just not
+  // within one batch.
+  // Decide from the RETURNING rows, NOT from meta.changes. Adversarial review caught the
+  // first draft reading `meta.changes` off `.all()` of a RETURNING write — an unverified
+  // platform behaviour of exactly the class that caused #916, and one no local harness can
+  // check (tests/helpers/sqlite-d1.ts fabricates `changes` with its own SELECT changes()).
+  // Row count is derived from the statement's own output, and it is this codebase's
+  // established idiom for conditional-UPDATE-with-RETURNING: see the fence write at
+  // src/mcp/index.ts:2652 and consumeAgentInbox in src/agents/messages.ts.
+  const transitionResult = await transition.all<{ score: number | null; cost_micro_usd: number }>()
+  const landedRows = transitionResult.results ?? []
+  if (landedRows.length !== 1) return { transitioned: false, receipt: false }
+
+  // The transition committed. From here the flight IS landed, and every remaining failure
+  // is a receipt problem, never a landing problem — the caller must be able to tell those
+  // apart, because they have opposite remedies (retry vs. repair).
+  //
+  // The landed values come back from the transition's own RETURNING clause. That matters
+  // for `score`: the UPDATE uses COALESCE(?5, score), so when the caller supplies no score
+  // the stored one survives and only the row knows the final value. RETURNING hands it
+  // over without a second query and, unlike the old INSERT...SELECT, without depending on
+  // one statement observing another's write.
+  const landedRow = landedRows[0]
+
+  const receiptPayload = JSON.stringify({
+    ...JSON.parse(payload) as Record<string, unknown>,
+    score: landedRow?.score ?? opts.score ?? null,
+    cost_micro_usd: landedRow?.cost_micro_usd ?? opts.cost_micro_usd,
+  })
+
+  let receipt = false
+  try {
+    // ON CONFLICT keeps this idempotent: a retry after a partial failure re-uses the
+    // existing receipt rather than duplicating it, and `changes === 0` from a conflict is
+    // reported as receipt=true because the receipt genuinely exists.
+    const outboxResult = await env.DB.prepare(
+      `INSERT INTO flight_event_outbox
+         (id, tenant, flight_id, event_type, actor_kind, actor_id, payload, created_at)
+       VALUES (?1, ?2, ?3, 'flight.landed', ?4, ?5, ?6, ?7)
+       ON CONFLICT (tenant, flight_id, event_type) DO NOTHING`,
+    ).bind(eventId, env.TENANT_SLUG, id, opts.actor.kind, opts.actor.id, receiptPayload, createdAt).run()
+    receipt = (outboxResult.meta?.changes ?? 0) === 1 || (await flightReceiptExists(env, id))
+  } catch (error) {
+    // A receipt that fails to write must not un-land a landed flight — that is the whole
+    // point of separating the two outcomes. Be honest about the consequence though: there
+    // is NO backfill today. flushFlightEventOutbox only iterates outbox rows that already
+    // exist, and landGovernedFlight is their only producer, so `receipt: false` is a
+    // PERMANENT audit gap until a repair path exists (tracked separately). Callers must
+    // treat it as an alarm, not as a transient.
+    console.error('flight.landed receipt insert failed', {
+      flight_id: id,
+      error: error instanceof Error ? error.message : 'unknown_error',
+    })
+  }
+
+  // Also sequential, and for the same reason: this statement SUMs flights.cost_micro_usd,
+  // which the transition above had just set. Inside the batch it summed the pre-update
+  // value, so every routine run's rolled-up cost was silently computed from stale rows.
+  if (opts.meta.routine_run_id) {
+    try {
+      await routineCostAggregationStatement(env, id, createdAt).run()
+    } catch (error) {
+      // Must not throw past a committed transition. Throwing here would 500 the caller
+      // after the flight already landed, and the retry would get flight_not_in_air —
+      // precisely the "successful action reported as failure" shape this issue exists to
+      // remove. The statement is a recompute-from-SUM, so it is idempotent and a later
+      // report_run_usage converges it.
+      console.error('routine cost aggregation failed after landing', {
+        flight_id: id,
+        routine_run_id: opts.meta.routine_run_id,
+        error: error instanceof Error ? error.message : 'unknown_error',
+      })
+    }
+  }
+
+  return { transitioned: true, receipt }
+}
+
+/** True when this flight already carries its landed receipt. */
+export async function flightReceiptExists(env: Env, flightId: string): Promise<boolean> {
+  const row = await env.DB.prepare(
+    `SELECT 1 AS present FROM flight_event_outbox
+      WHERE tenant=?1 AND flight_id=?2 AND event_type='flight.landed' LIMIT 1`,
+  ).bind(env.TENANT_SLUG, flightId).first<{ present: number }>()
+  return row !== null
 }
 
 interface FlightTaskCompletionRow {

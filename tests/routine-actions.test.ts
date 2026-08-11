@@ -32,6 +32,28 @@ function failFlightCreation(env: Env): Env {
   }
 }
 
+// #916: fail ONLY the receipt INSERT, so the landing transition itself still commits.
+// That is the half-landed state landControlFlight's re-check exists to adjudicate: the
+// flight really is 'landed', but no flight.landed receipt was ever written.
+function loseLandingReceipt(env: Env): Env {
+  const db = env.DB
+  return {
+    ...env,
+    DB: {
+      prepare(sql: string) {
+        if (/INSERT INTO flight_event_outbox/.test(sql)) {
+          return {
+            bind() { return this },
+            async run() { throw new Error('simulated receipt write failure') },
+          } as unknown as D1PreparedStatement
+        }
+        return db.prepare(sql)
+      },
+      batch: db.batch.bind(db),
+    } as unknown as D1Database,
+  }
+}
+
 function loseActionClaim(env: Env, fixture: ReadyRoutineFixture): Env {
   const db = env.DB
   return {
@@ -54,18 +76,43 @@ function loseActionClaim(env: Env, fixture: ReadyRoutineFixture): Env {
   }
 }
 
+// #916: the governed landing is no longer issued inside env.DB.batch() — the transition
+// and the receipt insert are separate awaited statements now, because on production D1 a
+// statement in a batch cannot see the write of the statement before it. The race this
+// helper models (a child Flight landing while the control Flight is mid-land) is still
+// real; only the injection point moved. Hook the prepared statement itself so the
+// injection fires wherever the landing is issued from, rather than assuming a batch.
 function landChildBeforeControlFlight(env: Env, fixture: ReadyRoutineFixture): Env {
   const db = env.DB
   let injected = false
+  const isControlFlightLanding = (sql: string, values: unknown[] | undefined) =>
+    /UPDATE flights SET status='landed'/.test(sql) && values?.[0] === 'control-flight'
   return {
     ...env,
     DB: {
-      prepare: db.prepare.bind(db),
+      prepare(sql: string) {
+        const statement = db.prepare(sql)
+        return {
+          bind(...values: unknown[]) {
+            const bound = statement.bind(...values)
+            if (!isControlFlightLanding(sql, values)) return bound
+            const withInjection = <T>(run: () => Promise<T>) => async (): Promise<T> => {
+              await injectChildLanding()
+              return run()
+            }
+            return {
+              ...bound,
+              run: withInjection(() => bound.run()),
+              all: withInjection(() => bound.all()),
+              first: withInjection(() => bound.first()),
+            } as unknown as D1PreparedStatement
+          },
+        } as unknown as D1PreparedStatement
+      },
       async batch(statements: D1PreparedStatement[]) {
         const landsControlFlight = statements.some(statement => {
           const prepared = statement as unknown as { sql?: string; values?: unknown[] }
-          return /UPDATE flights SET status='landed'/.test(prepared.sql ?? '')
-            && prepared.values?.[0] === 'control-flight'
+          return isControlFlightLanding(prepared.sql ?? '', prepared.values)
         })
         if (landsControlFlight && !injected) {
           injected = true
@@ -85,11 +132,33 @@ function landChildBeforeControlFlight(env: Env, fixture: ReadyRoutineFixture): E
             meta,
             actor: { kind: 'agent', id: child.agent as string },
           })
-          if (!landed) throw new Error('expected injected child Flight landing')
+          if (!landed.transitioned) throw new Error('expected injected child Flight landing')
         }
         return db.batch(statements)
       },
     } as unknown as D1Database,
+  }
+
+  async function injectChildLanding(): Promise<void> {
+    if (injected) return
+    injected = true
+    const child = row(fixture, `
+      SELECT id, agent, meta FROM flights
+       WHERE id <> 'control-flight'
+         AND json_extract(meta, '$.routine_run_id') = 'run-1'
+         AND status = 'running'
+       ORDER BY created_at DESC LIMIT 1
+    `)
+    const meta = parseFlightMetaV1(JSON.parse(child?.meta as string))
+    if (!child || !meta) throw new Error('expected running Routine child Flight')
+    const landed = await landGovernedFlight(env, child.id as string, {
+      cost_micro_usd: 3000,
+      expected_agent: child.agent as string,
+      agent_id: child.agent as string,
+      meta,
+      actor: { kind: 'agent', id: child.agent as string },
+    })
+    if (!landed.transitioned) throw new Error('expected injected child Flight landing')
   }
 }
 
@@ -255,6 +324,53 @@ describe('Routine proposal submission and governed actions', () => {
     expect(row(fixture, "SELECT COUNT(*) AS count FROM flight_event_outbox WHERE flight_id = 'control-flight' AND event_type = 'flight.landed'")).toEqual({ count: 1 })
   })
 
+  // #916 mutation guard. landGovernedFlight used to return a boolean; it now returns
+  // { transitioned, receipt }. An object is ALWAYS truthy, so `if (landed) return` — the
+  // shape of the pre-#916 line — skips the verification block underneath it entirely, and
+  // deleting the block outright has the same effect. Both mutations leave every other
+  // Routine test green, because on the happy path the landing does succeed. These two
+  // tests are the only ones that walk the failing half of that branch, so they are what
+  // stands between the fallthrough re-check and silent deletion.
+  it('fails the action when the control Flight transitions without writing its receipt', async () => {
+    fixture = await makeReadyRoutineFixture('execute_internal')
+    // Exhaust the attempts so the failure classifies terminally instead of retry-scheduling.
+    fixture.harness.sqlite.prepare("UPDATE routine_runs SET attempt = 3 WHERE id = 'run-1'").run()
+
+    const result = await submitRoutineProposal(loseLandingReceipt(fixture.env), fixture.principal, fixture.proposal({
+      key: 'none-no-receipt', kind: 'no_action', input: { reason: 'No accountable action is currently available.' },
+    }))
+
+    // A landing with no receipt is not a completed landing: the run must fail, not report success.
+    expect(result).toEqual({ ok: false, error: 'action_failed' })
+    expect(row(fixture, "SELECT status, result_summary FROM routine_runs WHERE id = 'run-1'")).toMatchObject({
+      status: 'failed', result_summary: 'execution_failed',
+    })
+    // The state that makes this the interesting case: the flight DID transition, and the
+    // receipt is still missing. Only the outbox re-check can tell those apart.
+    expect(row(fixture, "SELECT status FROM flights WHERE id = 'control-flight'")).toEqual({ status: 'landed' })
+    expect(row(fixture, "SELECT COUNT(*) AS count FROM flight_event_outbox WHERE flight_id = 'control-flight' AND event_type = 'flight.landed'")).toEqual({ count: 0 })
+  })
+
+  it('fails the action when the control Flight landing is refused outright', async () => {
+    fixture = await makeReadyRoutineFixture('execute_internal')
+    fixture.harness.sqlite.exec(`
+      UPDATE routine_runs SET attempt = 3 WHERE id = 'run-1';
+      UPDATE flights SET status = 'failed' WHERE id = 'control-flight';
+    `)
+
+    const result = await submitRoutineProposal(fixture.env, fixture.principal, fixture.proposal({
+      key: 'none-refused', kind: 'no_action', input: { reason: 'No accountable action is currently available.' },
+    }))
+
+    // transitioned:false must never be read as success — the control Flight is still not landed.
+    expect(result).toEqual({ ok: false, error: 'action_failed' })
+    expect(row(fixture, "SELECT status, result_summary FROM routine_runs WHERE id = 'run-1'")).toMatchObject({
+      status: 'failed', result_summary: 'execution_failed',
+    })
+    expect(row(fixture, "SELECT status FROM flights WHERE id = 'control-flight'")).toEqual({ status: 'failed' })
+    expect(row(fixture, "SELECT COUNT(*) AS count FROM flight_event_outbox WHERE flight_id = 'control-flight' AND event_type = 'flight.landed'")).toEqual({ count: 0 })
+  })
+
   it('dispatches an internal Flight within budget and keeps human questions waiting', async () => {
     fixture = await makeReadyRoutineFixture('execute_internal')
     const flight = await submitRoutineProposal(fixture.env, fixture.principal, fixture.proposal({
@@ -341,7 +457,7 @@ describe('Routine proposal submission and governed actions', () => {
       actor: { kind: 'agent', id: 'agent-1' },
     })
 
-    expect(landed).toBe(true)
+    expect(landed).toEqual({ transitioned: true, receipt: true })
     expect(row(fixture, "SELECT cost_micro_usd FROM routine_runs WHERE id = 'run-1'")).toEqual({
       cost_micro_usd: 3000,
     })

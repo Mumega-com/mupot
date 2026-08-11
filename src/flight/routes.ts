@@ -242,14 +242,15 @@ flightsApp.post('/:id/land', async (c) => {
     if ((cost as number) > (existing.budget_micro_usd as number)) {
       return c.json({ error: 'flight_budget_exceeded', budget_micro_usd: existing.budget_micro_usd }, 409)
     }
-    const transitioned = await landGovernedFlight(c.env, id, {
+    const landing = await landGovernedFlight(c.env, id, {
       cost_micro_usd: cost as number,
       score: score as number | undefined,
       agent_id: existing.agent,
       meta: governedMeta,
       actor: { kind: 'member', id: auth.id.memberId },
     })
-    if (!transitioned) {
+    // See the note in src/mcp/index.ts — a missing receipt is not a failed landing (#916).
+    if (!landing.transitioned) {
       const projectMismatchTaskIds = await listFlightProjectMismatchTaskIds(
         c.env,
         existing.project_id,
@@ -266,6 +267,11 @@ flightsApp.post('/:id/land', async (c) => {
     }
     const landed = await getFlight(c.env, id)
     if (!landed || landed.status !== 'landed') return c.json({ error: 'flight_record_missing' }, 500)
+    if (!landing.receipt) {
+      // Same signal the MCP path emits. Without it the org-admin land surface can open a
+      // permanent audit gap with no trace anywhere.
+      console.error('flight landed without a receipt', { flight_id: landed.id })
+    }
     await deliverFlightLandedEvent(c.env, landed.id)
     return c.json({ ok: true, id, status: landed.status })
   }
