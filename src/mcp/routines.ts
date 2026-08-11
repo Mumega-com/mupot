@@ -460,9 +460,23 @@ const reportRunUsage: ToolSpec = {
     // Lands on the flight even after status='landed' — this is an accounting correction,
     // and refusing it would mean the only flights we can price are ones that never finished.
     //
-    // ONE BATCH, three statements. A crash between them would otherwise leave the run's
-    // aggregate or the outbox payload stale against the flight row (Athena, gate on #898).
-    await env.DB.batch([
+    // SEQUENTIAL, NOT ONE BATCH (#919). This was three statements in one env.DB.batch()
+    // for crash-atomicity (Athena, gate on #898) — and statement 2 SUMs flights.cost_micro_usd
+    // that statement 1 had just written. On production D1 a statement in a batch sees the
+    // pre-batch snapshot, so the SUM read the OLD value: landControlFlight hardcodes
+    // cost_micro_usd 0, so routine_runs.cost_micro_usd was recomputed as 0 on every report.
+    //
+    // That is not just a reporting error. routine_runs.cost_micro_usd is the budget input at
+    // routines/dispatch.ts:555 and routines/actions.ts:400 and :712 — so the routine budget
+    // cap never engaged, while this tool returned the correct priced number it had failed to
+    // persist. The atomicity the batch was buying was never real for the one statement that
+    // needed it, and the cost of keeping it was a silent wrong number on the money path.
+    //
+    // The ordering guarantee is preserved by awaiting in sequence; what is lost is
+    // all-or-nothing on a crash between statements. Every one of the three is idempotent and
+    // recomputed-from-source, so a replay of report_run_usage converges — which is the
+    // weaker but honest property, versus an atomicity that silently computed the wrong value.
+    const usageStatements = [
       // NO STATUS GUARD, AND THAT IS DELIBERATE — do not "fix" this into hiding spend.
       // Cost lands even on a failed or cancelled flight, because status='failed' describes
       // how the flight ENDED, not whether it happened: a cancelled run still burned real
@@ -507,7 +521,8 @@ const reportRunUsage: ToolSpec = {
           WHERE tenant = ?2 AND flight_id = ?1
             AND event_type = 'flight.landed' AND delivered_at IS NULL`,
       ).bind(run.flight_id, env.TENANT_SLUG, priced),
-    ])
+    ]
+    for (const statement of usageStatements) await statement.run()
 
     return done({ run_id: run.id, flight_id: run.flight_id, cost_micro_usd: priced, model: args.model })
   },
