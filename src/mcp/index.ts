@@ -3117,11 +3117,26 @@ const toolConnect: ToolSpec = {
     const orgAdmin = hasCapability(claimGrants, 'org', null, 'admin')
     const onSquad = await memberCanOnSquad(env, claimGrants, agentRef.squad_id, 'member')
     if (!orgAdmin && !onSquad) {
-      // A directory-channel seat can NEVER pass this check, by design: B1 in
+      // An UNBOUND directory-channel seat cannot pass this check, by design: B1 in
       // src/mcp/oauth-authorize.ts sets `capabilities = []` for channel='directory'
       // regardless of what the member actually holds, so the public OAuth door does not
-      // inherit standing grants. Both branches above are therefore guaranteed false and
-      // NO GRANT CAN FIX IT.
+      // inherit standing grants. For that seat both branches above are guaranteed false
+      // and no squad grant can fix it.
+      //
+      // NO LONGER TRUE OF EVERY DIRECTORY SEAT (corrected 2026-08-11). mupot#906 added
+      // consent-time agent binding, and resolveConsentedAgentCapabilities
+      // (oauth-authorize.ts:340, applied in buildAuthContextFromProps at :470) gives a
+      // CONSENTED directory session the bound agent's own capabilities, clamped to the
+      // consenting human's rank. Such a seat can and does pass this check. The blanket
+      // "NEVER / NO GRANT CAN FIX IT" this comment used to assert described the
+      // pre-#906 door only.
+      //
+      // The distinction matters because this comment is load-bearing for the refusal
+      // text below: it decides which door a stuck user is pointed at. Getting it wrong
+      // is not free — on 2026-08-05 the previous misdirection cost four round-trips and
+      // nearly produced a redundant squad grant for a member who already held org:owner
+      // (mupot#678). The refusal is still correct for the unbound case, which is the
+      // only case that reaches it.
       //
       // Saying "no_squad_access / need: member" here is true but actively misleading: it
       // points the reader at "request squad membership", which is the wrong action. On
