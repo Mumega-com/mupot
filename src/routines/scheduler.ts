@@ -301,8 +301,20 @@ export async function claimRoutineRun(
   if (await failExhaustedQueuedRun(env, runId, owner, nowIso)) return false
   const leaseExpiresAt = new Date(now.getTime() + LEASE_SECONDS * 1000).toISOString()
   const eventId = crypto.randomUUID()
-  const outcomes = await env.DB.batch([
-    env.DB.prepare(
+  // SEQUENTIAL, NOT BATCHED (#919). The lease UPDATE and the 'leased' event INSERT used to
+  // share one env.DB.batch(), and the INSERT selected FROM routine_runs matching the very
+  // status/lease_owner/lease_expires_at the UPDATE had just written. On production D1 a
+  // statement in a batch sees the PRE-BATCH snapshot, so that SELECT matched zero rows on
+  // every claim: the row WAS leased and attempt WAS incremented, while this function
+  // returned false.
+  //
+  // Its only caller is `if (!await claimRoutineRun(...)) continue` (see runRoutineScheduler
+  // below), and dispatchRoutineRun is reachable only through that callback — so the
+  // scheduler leased runs, believed every claim failed, and dispatched nothing. Each cron
+  // tick burnt an attempt; recoverExpiredRoutineLeases requeued; the run died at
+  // max_attempts. This is the keystone of #919: every other routines finding sat behind it,
+  // unreachable.
+  const leaseResult = await env.DB.prepare(
       `UPDATE routine_runs SET status = 'leased', lease_owner = ?, lease_expires_at = ?,
               attempt = attempt + 1, retry_at = NULL, updated_at = ?
         WHERE id = ? AND tenant = ? AND status = 'queued'
@@ -334,26 +346,48 @@ export async function claimRoutineRun(
                AND (earlier.created_at < routine_runs.created_at
                  OR (earlier.created_at = routine_runs.created_at AND earlier.id < routine_runs.id))
           )
-          AND ${sqlNotCancellationPending('routine_runs')}`,
-    ).bind(owner, leaseExpiresAt, nowIso, runId, env.TENANT_SLUG, nowIso),
-    env.DB.prepare(
+          AND ${sqlNotCancellationPending('routine_runs')}
+     RETURNING project_id, attempt`,
+    ).bind(owner, leaseExpiresAt, nowIso, runId, env.TENANT_SLUG, nowIso)
+    .all<{ project_id: string; attempt: number }>()
+
+  // Decide from the RETURNING rows, not meta.changes on .all() of a RETURNING write — the
+  // same discipline as #916's fix: row count comes from the statement's own output, and it
+  // is this codebase's idiom for conditional-UPDATE-with-RETURNING.
+  const leased = leaseResult.results ?? []
+  if (leased.length !== 1) return false
+  const claimed = leased[0]
+
+  // The lease IS the claim; this event is its receipt. A receipt that fails to write must
+  // not un-claim a claimed run — reporting a successful claim as a failure is exactly the
+  // bug above, and would strand the run for a whole lease period. The NOT EXISTS keeps it
+  // idempotent across a redelivered claim at the same attempt, so zero rows here is a
+  // normal outcome, not an error.
+  try {
+    await env.DB.prepare(
       `INSERT INTO routine_run_events (
         id, tenant, project_id, run_id, kind, actor_type, actor_id,
         occurred_at, metadata_json, correlation_id
       )
-      SELECT ?, tenant, project_id, id, 'leased', 'system', ?, ?,
-             json_object('lease_expires_at', lease_expires_at, 'attempt', attempt), id
-        FROM routine_runs
-       WHERE id = ? AND tenant = ? AND status = 'leased'
-         AND lease_owner = ? AND lease_expires_at = ?
-         AND NOT EXISTS (
+      SELECT ?1, ?2, ?3, ?4, 'leased', 'system', ?5, ?6,
+             json_object('lease_expires_at', ?7, 'attempt', ?8), ?4
+       WHERE NOT EXISTS (
            SELECT 1 FROM routine_run_events e
-            WHERE e.run_id = routine_runs.id AND e.kind = 'leased'
-              AND CAST(json_extract(e.metadata_json, '$.attempt') AS INTEGER) = routine_runs.attempt
+            WHERE e.run_id = ?4 AND e.kind = 'leased'
+              AND CAST(json_extract(e.metadata_json, '$.attempt') AS INTEGER) = ?8
          )`,
-    ).bind(eventId, owner, nowIso, runId, env.TENANT_SLUG, owner, leaseExpiresAt),
-  ])
-  return wrote(outcomes[0]) && wrote(outcomes[1])
+    ).bind(
+      eventId, env.TENANT_SLUG, claimed.project_id, runId, owner, nowIso,
+      leaseExpiresAt, claimed.attempt,
+    ).run()
+  } catch (error) {
+    console.error('routine run leased without its receipt', {
+      run_id: runId,
+      attempt: claimed.attempt,
+      error: error instanceof Error ? error.message : 'unknown_error',
+    })
+  }
+  return true
 }
 
 function retryPolicy(value: string): { maxAttempts: number; backoffSeconds: number } {
