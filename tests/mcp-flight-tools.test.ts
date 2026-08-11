@@ -218,14 +218,20 @@ function makeEnv(agentStatus: 'active' | 'paused' | null = 'active', inboxFull =
                     changes = 1
                   }
                 } else if (sql.includes('INSERT INTO flight_event_outbox')) {
-                  const [id, tenant, flightId, actorKind, actorId, payload, createdAt, endedAt] = args as [
-                    string, string, string, 'member' | 'agent', string, string, string, number,
+                  // #916: the receipt INSERT no longer re-reads the flights row it was
+                  // just written by (that read is exactly what production D1 could not
+                  // see inside a batch), so it no longer binds ended_at as an 8th arg and
+                  // no longer re-derives score/cost from the row — the caller bakes the
+                  // landed values into the payload before inserting. This double models
+                  // the new contract; the correlation it used to enforce via ended_at is
+                  // now enforced by control flow, because the insert only runs after the
+                  // transition has been confirmed to have changed exactly one row.
+                  const [id, tenant, flightId, actorKind, actorId, payload, createdAt] = args as [
+                    string, string, string, 'member' | 'agent', string, string, string,
                   ]
                   const flight = rows.get(flightId)
-                  if (flight?.tenant === tenant && flight.status === 'landed' && flight.ended_at === endedAt) {
+                  if (flight?.tenant === tenant && flight.status === 'landed' && !outbox.has(flightId)) {
                     const eventPayload = JSON.parse(payload) as Record<string, unknown>
-                    eventPayload.score = flight.score
-                    eventPayload.cost_micro_usd = flight.cost_micro_usd
                     outbox.set(flightId, {
                       id, tenant, flight_id: flightId, event_type: 'flight.landed', actor_kind: actorKind,
                       actor_id: actorId, payload: JSON.stringify(eventPayload), created_at: createdAt,
@@ -251,6 +257,20 @@ function makeEnv(agentStatus: 'active' | 'paused' | null = 'active', inboxFull =
                 return { meta: { changes } }
               },
               async all<T>() {
+                // #916: the landing transition now carries `RETURNING score,
+                // cost_micro_usd`, so it is issued through all() rather than run(). Reuse
+                // run()'s mutation and hand back the landed row — the caller needs the
+                // FINAL score, which survives COALESCE when no score was supplied.
+                if (sql.includes("UPDATE flights SET status='landed'")) {
+                  const ran = await this.run() as { meta: { changes: number } }
+                  const row = rows.get(args[0] as string)
+                  return {
+                    results: (ran.meta.changes === 1 && row
+                      ? [{ score: row.score, cost_micro_usd: row.cost_micro_usd }]
+                      : []) as T[],
+                    meta: ran.meta,
+                  }
+                }
                 if (sql.includes('FROM flight_event_outbox')) {
                   const limit = args[1] as number
                   return { results: [...outbox.values()].filter((row) => (

@@ -258,6 +258,20 @@ function makeGovernedLandEnv(taskStatus: 'done' | 'review', verdict: 'approved' 
                 return null
               },
               async all<T>() {
+                // #916: the landing transition carries `RETURNING score, cost_micro_usd`
+                // and so is issued through all(). Reuse run()'s mutation and hand back the
+                // landed row — the caller reads the FINAL score from it (COALESCE keeps
+                // the stored one when no score is supplied) instead of re-reading the row,
+                // which is what production D1 could not see inside a batch.
+                if (sql.includes("UPDATE flights SET status='landed'")) {
+                  const ran = await this.run() as { meta: { changes: number } }
+                  return {
+                    results: (ran.meta.changes === 1
+                      ? [{ score: flight.score, cost_micro_usd: flight.cost_micro_usd }]
+                      : []) as T[],
+                    meta: ran.meta,
+                  }
+                }
                 if (sql.includes('FROM capabilities')) {
                   return { results: [{ member_id: 'admin-1', scope_type: 'org', scope_id: null, capability: 'admin' }] as T[] }
                 }
@@ -271,13 +285,16 @@ function makeGovernedLandEnv(taskStatus: 'done' | 'review', verdict: 'approved' 
               async run() {
                 let changes = 0
                 if (sql.includes('INSERT INTO flight_event_outbox')) {
-                  const [id, tenant, flightId, actorKind, actorId, payload, createdAt, endedAt] = args as [
-                    string, string, string, 'member' | 'agent', string, string, string, number,
+                  // #916: seven args now — the receipt insert no longer reads back the
+                  // flights row (no ended_at correlation, no re-derived score/cost). The
+                  // caller bakes the landed values into the payload, and the insert only
+                  // runs after the transition is confirmed. Still gated on the flight
+                  // actually being landed, so an insert issued too early still fails.
+                  const [id, tenant, flightId, actorKind, actorId, payload, createdAt] = args as [
+                    string, string, string, 'member' | 'agent', string, string, string,
                   ]
-                  if (flight.id === flightId && flight.status === 'landed' && flight.ended_at === endedAt) {
+                  if (flight.id === flightId && flight.status === 'landed' && outbox === null) {
                     const eventPayload = JSON.parse(payload) as Record<string, unknown>
-                    eventPayload.score = flight.score
-                    eventPayload.cost_micro_usd = flight.cost_micro_usd
                     outbox = {
                       id, tenant, flight_id: flightId, event_type: 'flight.landed', actor_kind: actorKind,
                       actor_id: actorId, payload: JSON.stringify(eventPayload), created_at: createdAt,

@@ -1774,7 +1774,7 @@ const toolFlightLand: ToolSpec = {
       return fail(409, 'flight_budget_exceeded', { budget_micro_usd: flight.budget_micro_usd })
     }
 
-    const transitioned = await landGovernedFlight(env, flight.id, {
+    const landing = await landGovernedFlight(env, flight.id, {
       cost_micro_usd: costMicroUsd as number,
       score: score as number | undefined,
       expected_agent: auth.boundAgentId,
@@ -1782,7 +1782,11 @@ const toolFlightLand: ToolSpec = {
       meta,
       actor: { kind: 'agent', id: auth.boundAgentId },
     })
-    if (!transitioned) {
+    // Only a refused TRANSITION is a failed land (#916). A missing receipt means the
+    // flight is already landed; answering 409 there tells the agent to retry something
+    // that already succeeded, and the retry then returns flight_not_in_air — which reads
+    // as a completely different bug. Report the landing, log the receipt gap.
+    if (!landing.transitioned) {
       const projectMismatchTaskIds = await listFlightProjectMismatchTaskIds(env, flight.project_id, meta.task_ids)
       if (projectMismatchTaskIds.length > 0) {
         return fail(409, 'flight_task_project_conflict', { task_ids: projectMismatchTaskIds })
@@ -1795,8 +1799,11 @@ const toolFlightLand: ToolSpec = {
     }
     const landed = await getFlight(env, flight.id)
     if (!landed || landed.status !== 'landed') return fail(500, 'flight_record_missing')
+    if (!landing.receipt) {
+      console.error('flight landed without a receipt', { flight_id: landed.id })
+    }
     await deliverFlightLandedEvent(env, landed.id)
-    return done({ flight: flightWithParsedMeta(landed, meta) })
+    return done({ flight: flightWithParsedMeta(landed, meta), receipt: landing.receipt })
   },
 }
 

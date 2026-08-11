@@ -840,7 +840,10 @@ async function landControlFlight(env: Env, run: RunContext): Promise<void> {
     meta,
     actor: { kind: 'agent', id: run.assigned_agent_id },
   })
-  if (landed) return
+  // #916: `landed` is now a result object, so a bare truthiness test would always pass and
+  // skip the verification below — which is the one place that catches a control flight
+  // that transitioned without a receipt. Require BOTH, and let the re-check adjudicate.
+  if (landed.transitioned && landed.receipt) return
   const existing = await getFlight(env, flight.id)
   const outbox = await env.DB.prepare(
     `SELECT 1 FROM flight_event_outbox
