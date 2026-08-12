@@ -73,6 +73,17 @@ export interface AddonManifestV1 {
     disablePreservesData: true
     purgeRequiresOwner: true
   }
+  pricing?: {
+    perExecution: number
+  }
+  limits?: {
+    maxExecutionTimeSec: number
+  }
+  schemas?: {
+    input: Record<string, unknown>
+    output: Record<string, unknown>
+  }
+  workflowType?: string
 }
 
 export type AddonValidationResult =
@@ -105,6 +116,13 @@ const TOP_LEVEL_KEYS = [
   'retention',
 ] as const
 
+const OPTIONAL_TOP_LEVEL_KEYS = [
+  'pricing',
+  'limits',
+  'schemas',
+  'workflowType',
+] as const
+
 const KEY_PATTERN = /^[a-z0-9-]{3,64}$/
 const SEMVER_PATTERN = /^\d+\.\d+\.\d+$/
 const MAX_ARRAY_INDEX = 2 ** 32 - 1
@@ -117,12 +135,12 @@ function fail(reason: string, path?: string): AddonValidationResult {
   return path === undefined ? { ok: false, reason } : { ok: false, reason, path }
 }
 
-function validateCanonicalRecord(value: unknown, keys: readonly string[], path: string): AddonValidationResult | null {
+function validateCanonicalRecord(value: unknown, keys: readonly string[], path: string, optionalKeys: readonly string[] = []): AddonValidationResult | null {
   if (!isRecord(value)) return fail('invalid_object', path)
   const prototype = Object.getPrototypeOf(value)
   if (prototype !== Object.prototype && prototype !== null) return fail('invalid_object', path)
 
-  const allowed = new Set(keys)
+  const allowed = new Set([...keys, ...optionalKeys])
   for (const key of Reflect.ownKeys(value)) {
     if (typeof key !== 'string') return fail('invalid_object', path)
     const descriptor = Object.getOwnPropertyDescriptor(value, key)
@@ -375,7 +393,7 @@ function validateApprovalPolicies(value: unknown): AddonValidationResult | null 
 export function validateAddonManifest(value: unknown): AddonValidationResult {
   try {
     if (!isRecord(value)) return fail('invalid_manifest')
-    const topLevelError = validateCanonicalRecord(value, TOP_LEVEL_KEYS, 'manifest')
+    const topLevelError = validateCanonicalRecord(value, TOP_LEVEL_KEYS, 'manifest', OPTIONAL_TOP_LEVEL_KEYS)
     if (topLevelError) return topLevelError
     if (value.schema !== 'mupot.addon/v1') return fail('invalid_schema', 'schema')
     if (typeof value.key !== 'string' || !KEY_PATTERN.test(value.key)) return fail('invalid_key', 'key')
@@ -413,6 +431,27 @@ export function validateAddonManifest(value: unknown): AddonValidationResult {
     const retentionError = validateCanonicalRecord(value.retention, ['disablePreservesData', 'purgeRequiresOwner'], 'retention')
     if (retentionError) return retentionError
     if (value.retention.disablePreservesData !== true || value.retention.purgeRequiresOwner !== true) return fail('invalid_retention', 'retention')
+
+    if (value.pricing !== undefined) {
+      if (!isRecord(value.pricing)) return fail('invalid_object', 'pricing')
+      const pricingError = validateCanonicalRecord(value.pricing, ['perExecution'], 'pricing')
+      if (pricingError) return pricingError
+      if (typeof value.pricing.perExecution !== 'number') return fail('invalid_number', 'pricing.perExecution')
+    }
+    if (value.limits !== undefined) {
+      if (!isRecord(value.limits)) return fail('invalid_object', 'limits')
+      const limitsError = validateCanonicalRecord(value.limits, ['maxExecutionTimeSec'], 'limits')
+      if (limitsError) return limitsError
+      if (typeof value.limits.maxExecutionTimeSec !== 'number') return fail('invalid_number', 'limits.maxExecutionTimeSec')
+    }
+    if (value.schemas !== undefined) {
+      if (!isRecord(value.schemas)) return fail('invalid_object', 'schemas')
+      const schemasError = validateCanonicalRecord(value.schemas, ['input', 'output'], 'schemas')
+      if (schemasError) return schemasError
+      if (!isRecord(value.schemas.input)) return fail('invalid_object', 'schemas.input')
+      if (!isRecord(value.schemas.output)) return fail('invalid_object', 'schemas.output')
+    }
+    if (value.workflowType !== undefined && typeof value.workflowType !== 'string') return fail('invalid_string', 'workflowType')
 
     const manifest = value as unknown as AddonManifestV1
     const policies = new Set(manifest.approvalPolicies.map((policy) => policy.action))
