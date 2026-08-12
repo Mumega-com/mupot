@@ -61,7 +61,7 @@ async function upsertRunning(
   await env.DB.prepare(
     `INSERT INTO fleet_agents
           (agent_id, tenant, display, runtime, squads, lifecycle, provider_contract,
-           status, reported_by, agent_type, member_id, host, last_reported_at, updated_at)
+           status, reported_by, agent_type, member_id, host, model, last_reported_at, updated_at)
      VALUES (?1, ?2, '', ?3, '[]', ?4, NULL, 'running', ?5, ?6, ?7, ?8, ?9, datetime('now'), datetime('now'))
      ON CONFLICT(tenant, agent_id) DO UPDATE SET
           runtime          = excluded.runtime,
@@ -85,8 +85,7 @@ async function upsertRunning(
   if (model !== null) {
     await env.DB.prepare(
       `UPDATE agents
-          SET model = ?1,
-              updated_at = datetime('now')
+          SET model = ?1
         WHERE id = ?2`,
     )
       .bind(model, agentId)
