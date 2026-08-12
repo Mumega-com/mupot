@@ -68,7 +68,7 @@ toriversAddonApp.post('/workflows/execute', async (c) => {
       return c.json({ ok: false, error: 'Missing required field: workflowId' }, 400)
     }
 
-    const executionId = `exec_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+    const executionId = `exec_${Date.now()}_${crypto.randomUUID()}`
     const tenantSlug = c.env.TENANT_SLUG || 'default'
 
     // Record workflow execution step in D1 if available
