@@ -215,6 +215,14 @@ describe('GET /collisions — read-only tower view', () => {
             },
           }
         },
+        async batch(statements: Array<{ all: () => Promise<unknown>, run: () => Promise<unknown> }>) {
+          return Promise.all(statements.map((statement) => {
+            if ('all' in statement && typeof statement.all === 'function') {
+              return statement.all()
+            }
+            return statement.run()
+          }))
+        },
       },
     } as unknown as Env
     return env
@@ -276,6 +284,14 @@ describe('REST flight dispatch reference integrity', () => {
               }
             },
           }
+        },
+        async batch(statements: Array<{ all: () => Promise<unknown>, run: () => Promise<unknown> }>) {
+          return Promise.all(statements.map((statement) => {
+            if ('all' in statement && typeof statement.all === 'function') {
+              return statement.all()
+            }
+            return statement.run()
+          }))
         },
       },
     } as unknown as Env
