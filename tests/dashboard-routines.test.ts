@@ -19,6 +19,7 @@ vi.mock('../src/auth', () => ({
 }))
 
 const { dashboardApp, dashboardBuiltInGetRoutes } = await import('../src/dashboard')
+const { parseDashboardCursor, encodeDashboardCursor } = await import('../src/dashboard/routines')
 
 const MIGRATIONS_DIR = join(import.meta.dirname, '..', 'migrations')
 
@@ -115,6 +116,56 @@ function jsonScript(body: string, id: string): unknown {
   if (!match) throw new Error(`missing JSON script ${id}`)
   return JSON.parse(match[1])
 }
+
+
+describe('Dashboard cursor parsing', () => {
+  it('handles undefined input', () => {
+    expect(parseDashboardCursor(undefined)).toBeUndefined()
+  })
+
+  it('rejects invalid characters and lengths', () => {
+    expect(parseDashboardCursor('')).toBeNull()
+    expect(parseDashboardCursor(' ')).toBeNull()
+    expect(parseDashboardCursor('a'.repeat(2049))).toBeNull()
+    expect(parseDashboardCursor('invalid!chars')).toBeNull()
+  })
+
+  it('rejects unparseable or non-object JSON', () => {
+    // Valid base64, but encodes a string "test"
+    const encodedString = btoa(JSON.stringify("test")).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+    expect(parseDashboardCursor(encodedString)).toBeNull()
+
+    // Valid base64, but encodes invalid JSON (e.g. "{")
+    const encodedInvalidJson = btoa("{").replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+    expect(parseDashboardCursor(encodedInvalidJson)).toBeNull()
+  })
+
+  it('rejects missing or invalid fields', () => {
+    const invalidV = btoa(JSON.stringify({ v: 2, t: new Date().toISOString(), i: 'id1' })).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+    expect(parseDashboardCursor(invalidV)).toBeNull()
+
+    const missingT = btoa(JSON.stringify({ v: 1, i: 'id1' })).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+    expect(parseDashboardCursor(missingT)).toBeNull()
+  })
+
+  it('rejects invalid timestamp format', () => {
+    const invalidT = btoa(JSON.stringify({ v: 1, t: 'not-a-date', i: 'id1' })).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+    expect(parseDashboardCursor(invalidT)).toBeNull()
+  })
+
+  it('rejects invalid id format', () => {
+    const invalidI = btoa(JSON.stringify({ v: 1, t: new Date().toISOString(), i: 'invalid id!' })).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+    expect(parseDashboardCursor(invalidI)).toBeNull()
+  })
+
+  it('encodes and parses correctly', () => {
+    const cursor = { timestamp: new Date().toISOString(), id: 'valid-id_123' }
+    const encoded = encodeDashboardCursor(cursor)
+    expect(encoded).toMatch(/^[A-Za-z0-9_-]+$/)
+    const parsed = parseDashboardCursor(encoded)
+    expect(parsed).toEqual(cursor)
+  })
+})
 
 describe('Project Routines dashboard', () => {
   let harness: SqliteD1Harness | undefined
