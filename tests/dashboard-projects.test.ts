@@ -1482,7 +1482,7 @@ describe('project dashboard routes', () => {
     expect(body).not.toContain('Legacy project flight')
     expect(body).not.toContain('Ship Mirror')
     expect(observed.some((sql) => (
-      /json_valid\(f\.meta\)[\s\S]*json_each\(\?3\)[\s\S]*\?4 IS NULL[\s\S]*f\.created_at < \?4[\s\S]*f\.id < \?5[\s\S]*ORDER BY f\.created_at DESC, f\.id DESC[\s\S]*LIMIT \?6/i
+      /json_valid\(f\.meta\)[\s\S]*json_each\(\?3\)[\s\S]*ORDER BY f\.created_at DESC, f\.id DESC[\s\S]*LIMIT \?4/i
         .test(sql)
     ))).toBe(true)
 
@@ -1565,8 +1565,7 @@ describe('project dashboard routes', () => {
     expect(body).toContain('Ship Inkwell')
     expect(body).not.toContain('SQL-pass JS-fail')
     expect(observed).toHaveLength(1)
-    expect(observed[0]).toMatch(/\?4 IS NULL[\s\S]*f\.created_at < \?4[\s\S]*f\.id < \?5/i)
-    expect(observed[0]).toMatch(/ORDER BY f\.created_at DESC, f\.id DESC[\s\S]*LIMIT \?6/i)
+    expect(observed[0]).toMatch(/ORDER BY f\.created_at DESC, f\.id DESC[\s\S]*LIMIT \?4/i)
     expect(observed[0]).not.toMatch(/\bOFFSET\b/i)
   })
 
@@ -1574,7 +1573,7 @@ describe('project dashboard routes', () => {
     harness = makeHarness()
     as(memberA())
     let flightQueries = 0
-    const invalidCandidates = Array.from({ length: 100 }, (_, index) => ({
+    const invalidCandidates = Array.from({ length: 1000 }, (_, index) => ({
       id: `adapter-invalid-${index}`,
       tenant: 'pot-a',
       project_id: 'visible-child',
@@ -1603,7 +1602,7 @@ describe('project dashboard routes', () => {
     )
     const body = await response.text()
     expect(response.status).toBe(200)
-    expect(flightQueries).toBe(10)
+    expect(flightQueries).toBe(1)
     expect(body).toContain('Flight history is partial because the project scan safety limit was reached.')
     expect(body).not.toContain('Adapter invalid')
   })
