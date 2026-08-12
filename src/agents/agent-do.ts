@@ -12,6 +12,7 @@
 
 import { DurableObject } from 'cloudflare:workers'
 import type { Env, Agent, Task, MemoryPort, ModelMessage } from '../types'
+import { createBus } from '../bus'
 import { createMemory } from '../memory'
 import { createModel } from '../model'
 import { createTask } from '../tasks/service'
@@ -200,9 +201,8 @@ export class AgentDO extends DurableObject<Env> {
         // S2: consume observer signals from the goal cycle.
         // cooldown=true → extend the next alarm so the agent backs off instead of
         //   busy-looping on an identical situation every 15 min.
-        // escalate=true → TODO: emit a single operator notification via the
+        // escalate=true → emit a single operator notification via the
         //   approval/notification seam (see loops/notifications or tasks gate_owner).
-        //   Left as a result field for now — the surface to wire it onto is S3 scope.
         const obs = goalResult.observer
         if (obs?.cooldown) {
           // Extend alarm by COOLDOWN_EXTENSION_MS on top of the standard interval.
@@ -212,12 +212,12 @@ export class AgentDO extends DurableObject<Env> {
           await this.ensureAlarm()
         }
         // obs?.escalate → emit ONE operator-facing task via the existing createTask
-        // seam (same path the cortex propose-cycle uses). The observer dedupes on
-        // ESCALATION_COOLDOWN_MS, so this fires at most once per stuck state —
-        // not once per tick. gate_owner marks it for operator attention.
+        // seam (same path the cortex propose-cycle uses) and emit a task.blocked event.
+        // The observer dedupes on ESCALATION_COOLDOWN_MS, so this fires at most once
+        // per stuck state — not once per tick. gate_owner marks it for operator attention.
         if (obs?.escalate) {
           try {
-            await createTask(
+            const t = await createTask(
               this.env,
               {
                 squad_id: agent.squad_id,
@@ -228,6 +228,20 @@ export class AgentDO extends DurableObject<Env> {
               },
               { actor: { kind: 'agent', id: agent.id } },
             )
+
+            await createBus(this.env).emit({
+              type: 'task.blocked',
+              tenant: this.env.TENANT_SLUG,
+              squad_id: agent.squad_id,
+              actor: { kind: 'agent', id: agent.id },
+              payload: {
+                task_id: t.id,
+                task_title: t.title,
+                gate_owner: 'gate:escalation',
+                reason: obs.reason ?? 'unknown'
+              },
+              ts: new Date().toISOString(),
+            })
           } catch (emitErr) {
             // A failed escalation emit must not kill the goal cycle — record and
             // continue (the next tick re-emits after the cooldown).
