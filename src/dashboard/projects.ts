@@ -828,48 +828,32 @@ export async function loadProjectFlights(
   }
 
   const flights: FlightRow[] = []
-  let cursorCreatedAt: number | null = null
-  let cursorId: string | null = null
+  const maxCandidates = MAX_FLIGHT_SCAN_PAGES * 100
 
-  for (let page = 0; page < MAX_FLIGHT_SCAN_PAGES; page += 1) {
-    const result: { results?: FlightRow[] } = await env.DB.prepare(
-      `SELECT *
-         FROM flights f
-        WHERE f.tenant = ?1 AND f.project_id = ?2
-          ${readableFlightSql('f', '?3')}
-          AND (
-            ?4 IS NULL
-            OR f.created_at < ?4
-            OR (f.created_at = ?4 AND f.id < ?5)
-          )
-        ORDER BY f.created_at DESC, f.id DESC
-        LIMIT ?6`,
-    ).bind(
-      env.TENANT_SLUG,
-      context.project.id,
-      jsonIds(context.readableSquadIds),
-      cursorCreatedAt,
-      cursorId,
-      100,
-    ).all<FlightRow>()
-    const candidates: FlightRow[] = result.results ?? []
+  const result: { results?: FlightRow[] } = await env.DB.prepare(
+    `SELECT *
+       FROM flights f
+      WHERE f.tenant = ?1 AND f.project_id = ?2
+        ${readableFlightSql('f', '?3')}
+      ORDER BY f.created_at DESC, f.id DESC
+      LIMIT ?4`,
+  ).bind(
+    env.TENANT_SLUG,
+    context.project.id,
+    jsonIds(context.readableSquadIds),
+    maxCandidates,
+  ).all<FlightRow>()
+  const candidates: FlightRow[] = result.results ?? []
 
-    for (const flight of candidates) {
-      if (projectFlightIsReadable(context, flight.meta)) {
-        flights.push(flight)
-        if (flights.length === 100) break
-      }
+  for (const flight of candidates) {
+    if (projectFlightIsReadable(context, flight.meta)) {
+      flights.push(flight)
+      if (flights.length === 100) break
     }
-
-    if (candidates.length < 100 || flights.length === 100) {
-      return { rows: flights, scanLimited: false }
-    }
-    const last: FlightRow = candidates[candidates.length - 1]!
-    cursorCreatedAt = last.created_at
-    cursorId = last.id
   }
 
-  return { rows: flights, scanLimited: true }
+  const scanLimited = flights.length < 100 && candidates.length === maxCandidates
+  return { rows: flights, scanLimited }
 }
 
 function statusTone(status: ProjectStatus): 'ok' | 'warn' | 'dim' | 'primary' {
