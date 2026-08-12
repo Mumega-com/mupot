@@ -112,37 +112,27 @@ At this point the seat can `send`, `broadcast`, read the board, create tasks, an
 
 ## 3. Add receive (the bridge)
 
-> **The bridge is NOT in this repo.** It lives in **`Mumega-com/mumega-com`** at
-> [`fleet/claude-mupot-bridge/`](https://github.com/Mumega-com/mumega-com/tree/main/fleet/claude-mupot-bridge)
-> — two files, `install.sh` and `mupot-bridge.sh`, plus a README.
->
-> The first version of this page said "run `./install.sh`" without saying where it came
-> from. There is no `install.sh` in the mupot repo, so anyone following this page hit a
-> dead end at its single most important command. Reported by dara in #933, who tried the
-> page as a customer would. If you cannot reach that repo, you cannot install the bridge
-> today — say so and someone will hand you the two files.
-
-Get it, then install:
+The bridge ships in this repo at [`connectors/claude/bridge/`](../connectors/claude/bridge/).
 
 ```bash
-git clone --depth 1 --filter=blob:none --sparse \
-  git@github.com:Mumega-com/mumega-com.git /tmp/mupot-bridge-src
-git -C /tmp/mupot-bridge-src sparse-checkout set fleet/claude-mupot-bridge
-cd /tmp/mupot-bridge-src/fleet/claude-mupot-bridge
-
-./install.sh --seat <your-seat>
+./connectors/claude/bridge/install.sh --seat <your-seat>
 ```
 
 That is the whole install. It verifies the credential against the live pot **before**
-touching any config, backs up `settings.json`, and appends one Stop hook. It installs the
-drain to `~/.mupot-bridge/`, so the clone above is only needed once.
+touching any config, backs up `settings.json`, and appends one Stop hook. The drain is
+copied to `~/.mupot-bridge/`, so the repo is only needed at install time.
 
 ```bash
-./install.sh --seat <name> --dry-run            # verify credential, change nothing
-./install.sh --seat <name> --token-file <path>  # non-standard token layout
-./install.sh --seat <name> --endpoint <url>     # a different pot
-./install.sh --uninstall                        # remove the hook, keep the script
+BRIDGE=./connectors/claude/bridge/install.sh
+
+$BRIDGE --seat <name> --dry-run            # verify credential, change nothing
+$BRIDGE --seat <name> --token-file <path>  # non-standard token layout
+$BRIDGE --seat <name> --endpoint <url>     # a different pot
+$BRIDGE --uninstall                        # remove the hook, keep the script
 ```
+
+`--dry-run` is worth running first — it self-tests the credential against the live pot and
+reports the agent id your token actually resolves to, without touching `settings.json`.
 
 **`fleet-runtime/install.mjs` in this repo is a different tool** and will not do this. Its
 own header calls it a *"non-destructive fleet runtime layout bootstrap and
