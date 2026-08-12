@@ -26,17 +26,12 @@ UPDATE tasks
  WHERE id = 'd8029460-956a-4fc3-86d1-86943ee3a8c0'
    AND gate_owner = 'a9423609-e3bf-4797-8af8-4b9b7aecdf16';
 
--- 2) Backfill the grant EXPLICITLY. This is a RECORDED FACT, not a fill value
---    (#947): granted_by names the real granter (Hadi's org-owner principal, who
---    authorized the same grant live at 2026-08-12T17:15:30Z via mupot-admin.token).
---    INSERT OR IGNORE is idempotent against UNIQUE(capability, principal_type,
---    principal_id) — if the live grant already exists this is a no-op.
-INSERT OR IGNORE INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
-VALUES (
-  'grant-gate-athena-0096',
-  'gate:athena',
-  'agent',
-  'a9423609-e3bf-4797-8af8-4b9b7aecdf16',
-  'migration:0096',
-  '2026-08-12T17:30:00.000Z'
-);
+-- 2) The grant itself is NOT seeded here. It already exists as a live recorded
+--    fact — Hadi's org-owner principal granted 'gate:athena' -> agent a9423609
+--    at 2026-08-12T17:15:30Z (via mupot-admin.token, step B of the 247858f1 fix).
+--    Migrations must NOT seed gate_grants: the applyAllMigrations snapshot test
+--    (tests/helpers-migrations.test.ts) asserts the finished chain leaves every
+--    table with ZERO rows, and grant-suite fixtures depend on an empty
+--    gate_grants after migration. Seeding it here breaks both. On any pot other
+--    than mumega these two UPDATEs are no-ops (those task ids don't exist), and a
+--    fresh pot mints its grants via grant_gate_capability, never a migration.
