@@ -56,6 +56,17 @@ MCP calls. Install:
 3. In Claude Code, run `/mupot task ...`, `/mupot status`, or `/mupot recall ...`.
    See [`skills/mupot/SKILL.md`](./skills/mupot/SKILL.md) for the full command set.
 
+### C. `mupot-agent` skill (for an agent-bound identity, not a member token)
+
+If your Claude Code session already has `mcp__mupot__*` MCP tools available directly (a bound
+agent identity, not a member token — this is the case for most in-fleet agents, not new users),
+skip A and B and use [`skills/mupot-agent/`](./skills/mupot-agent/) instead. It documents the
+full agent-native surface — flights, routines, gates, credential minting, the two-gate-mechanism
+distinction — and the operational patterns learned the hard way running it in production
+(2026-08-12: session flakiness on `connect`, the `gate_owner`-with-no-holder trap, the
+account-vs-user token-verify-endpoint trap). It is not a `curl` wrapper; it assumes you already
+have the tools and need the playbook, not the plumbing.
+
 ## What Claude can do (gated by your capability)
 
 Everything Claude does goes through the member token's capabilities. With a token
