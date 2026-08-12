@@ -1089,9 +1089,9 @@ const toolTaskUpdate: ToolSpec = {
       } else if (typeof args.gate_owner === 'string' && args.gate_owner.trim().length > 0) {
         const trimmed = args.gate_owner.trim()
         // Write-time form guard (247858f1): a bare slug is unverdictable. Reject,
-        // never coerce. Legal: 'gate:<owner>' or an agent id.
+        // never coerce. Legal form: 'gate:<owner>' only.
         if (!isValidGateOwnerForm(trimmed)) {
-          return fail(400, 'invalid_gate_owner', "gate_owner must be 'gate:<owner>' or an agent id — a bare slug can never match a grant")
+          return fail(400, 'invalid_gate_owner', "gate_owner must be of the form 'gate:<owner>' — nothing else can match an insertable grant")
         }
         next.gate_owner = trimmed
       } else {

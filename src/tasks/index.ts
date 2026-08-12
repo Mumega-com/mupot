@@ -466,7 +466,7 @@ tasksApp.post('/', async (c) => {
   // Reject a bare-slug gate_owner at write time — it is unverdictable (247858f1).
   if (gateOwner !== null && gateOwner !== undefined && !isValidGateOwnerForm(gateOwner)) {
     return c.json(
-      { error: 'invalid_gate_owner', detail: "gate_owner must be 'gate:<owner>' or an agent id — a bare slug can never match a grant" },
+      { error: 'invalid_gate_owner', detail: "gate_owner must be of the form 'gate:<owner>' — nothing else can match an insertable grant" },
       400,
     )
   }
@@ -737,7 +737,7 @@ tasksApp.patch('/:id', async (c) => {
       // value is not a repair.
       if (!isValidGateOwnerForm(trimmed)) {
         return c.json(
-          { error: 'invalid_gate_owner', detail: "gate_owner must be 'gate:<owner>' or an agent id — a bare slug can never match a grant" },
+          { error: 'invalid_gate_owner', detail: "gate_owner must be of the form 'gate:<owner>' — nothing else can match an insertable grant" },
           400,
         )
       }
