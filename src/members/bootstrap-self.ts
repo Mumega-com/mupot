@@ -119,11 +119,54 @@
 // unwind. Folding agent + mint + audit into one batch removes that failure mode
 // entirely: if the audit INSERT's uniqueness check fails, the agent and its
 // mint never landed in the first place.
+//
+// ── SECOND ADVERSARIAL PASS (mupot#925, 2026-08-11) — findings in the SHARED
+// HELPERS this function calls, not in this function's own first-pass fixes,
+// which the pass re-verified as genuinely closed:
+//
+//   P0-N1 (river ruling, addendum C) — src/org/service.ts's create* functions
+//   counted departments/squads/agents POT-WIDE with no kind distinction, so a
+//   freshly provisioned pot (fails closed to 'free': 1 squad / 2 agents, no
+//   department limit existed at all) admitted exactly ONE human via this
+//   function before every subsequent caller hit squad_limit_reached. Fix: a
+//   `kind` column (migration 0093) — every row this function creates is
+//   kind:'home', structurally exempt from the plan counters; every other
+//   caller in the codebase is untouched and keeps writing kind:'work' by
+//   omission. See src/billing/plans.ts and src/org/service.ts.
+//
+//   P0-N2 — deptSlug/squadSlug collisions used to be permanent: no
+//   adopt-existing branch meant a worker dying between the createSquad commit
+//   and the atomic batch below left that human locked out of bootstrap_self
+//   FOREVER (createDepartment's slug_taken becoming
+//   provisioning_failed{stage:'department'} on every retry, since the slug is
+//   deterministic and departments.slug is globally UNIQUE). Fixed by
+//   findDepartmentBySlug/findSquadBySlug below — adopt a prior partial
+//   attempt's own row instead of failing on it.
+//
+//   WARN-1 — the batch-failure compensator ran deleteOrphanedDeptAndSquad
+//   BEFORE classifying the error, unconditionally, even against rows this
+//   call did not itself create. Fixed by compensateCreatedRows: classify
+//   first, compensate second, each DELETE in its own try/catch, and only ever
+//   on ids this specific invocation created (never an adopted row).
+//
+//   WARN-3 — BootstrapAuth was a hand-declared duck type with no compile-time
+//   link to AuthContext (src/types.ts). Fixed: `Pick<AuthContext, ...>`.
+//
+//   LOW-1 — the per-member throttle ran AFTER the already-bootstrapped
+//   pre-check, so a member who already bootstrapped could poll this tool at
+//   an unmetered rate. Fixed: throttle first. Paired with a best-effort
+//   refund (refundBootstrapSelfRateLimit) for the *_limit_reached family,
+//   which P0-N1 has since made unreachable through this function — see that
+//   function's own doc comment.
+//
+// See the build report for exact line references, literal test output, and
+// per-mutation evidence.
 
 import type { D1PreparedStatement } from '@cloudflare/workers-types'
-import type { Env, Agent } from '../types'
+import type { Env, Agent, AuthContext, Department, Squad } from '../types'
 import { createDepartment, createSquad, prepareAgentCreate, isValidSlug } from '../org/service'
 import { prepareAgentBoundTokenMint, resolveActiveAgentMember, type AgentForMint } from './service'
+import { assertBatchWritten, type D1WriteLike } from '../lib/receipt'
 
 // Mirrors AGENT_SNAPSHOT_JSON's field list (src/org/service.ts, ~line 757) so a
 // bootstrap-creation record and an update_agent correction record are directly
@@ -197,12 +240,56 @@ export async function checkBootstrapSelfRateLimit(env: Env, memberId: string): P
   }
 }
 
-// ── the gate this whole path hangs off ─────────────────────────────────────────
-export interface BootstrapAuth {
-  channel?: string
-  boundAgentId?: string | null
-  memberId?: string
+// LOW-1 (adversarial review, second pass): a pot-wide entitlement failure
+// (department/squad/agent_limit_reached) is not the caller's fault — spamming
+// retries into a full pot is not attempt-abuse, so it must not burn the same
+// per-member throttle budget a genuine retry storm would. Best-effort refund;
+// never throws (fail-open, same posture as the check itself).
+//
+// NOTE ON REACHABILITY: as of mupot#925 P0-N1 (the kind='home' exemption),
+// bootstrap_self ALWAYS passes kind:'home' to createDepartment/createSquad/
+// prepareAgentCreate, and all three skip their entitlement gate entirely for a
+// 'home' create (src/org/service.ts) — so today this function has no live call
+// site that can actually fire from INSIDE bootstrapSelf. It is wired in anyway,
+// at the three stages that used to be able to return a *_limit_reached reason
+// before that fix, as defense-in-depth against a future change that re-exposes
+// a limit check on the home-creation path. See the build report for the
+// reachability argument in full.
+export async function refundBootstrapSelfRateLimit(env: Env, memberId: string): Promise<void> {
+  const key = `bootstrap-self-rl:${memberId}`
+  try {
+    const raw = await env.SESSIONS.get(key)
+    const count = raw !== null ? parseInt(raw, 10) : 0
+    if (count <= 0) return
+    // KV has no partial-TTL-preserving write in this binding surface — a
+    // refund necessarily resets the window's clock along with the count. That
+    // is a minor imprecision (a refunded attempt gets a fresh hour rather than
+    // the remainder of the old one), never a correctness problem: it can only
+    // ever WIDEN the caller's remaining budget, never narrow it.
+    await env.SESSIONS.put(key, String(count - 1), { expirationTtl: BOOTSTRAP_RL_TTL })
+  } catch {
+    // best-effort; never block on a refund.
+  }
 }
+
+/** True for the three provisioning_failed reasons a pot-wide entitlement gate
+ *  (not the caller's fault) can produce — see refundBootstrapSelfRateLimit. */
+function isEntitlementLimitReason(reason: unknown): boolean {
+  return reason === 'department_limit_reached'
+    || reason === 'squad_limit_reached'
+    || reason === 'agent_limit_reached'
+}
+
+// ── the gate this whole path hangs off ─────────────────────────────────────────
+// WARN-3 (adversarial review, second pass): this used to be a hand-declared duck
+// type with no compile-time link to AuthContext (src/types.ts) — a rename of
+// AuthContext.boundAgentId would leave `!auth.boundAgentId` at
+// isUnboundDirectorySession permanently true (an always-undefined field reads as
+// falsy), silently passing an agent-bound session through the gate, with no
+// TypeScript error anywhere. `Pick` makes that rename a compile error here
+// instead: the real caller (src/mcp/bootstrap.ts's `run(auth, env, args)`) always
+// passes a full AuthContext, which is trivially assignable to this narrower type.
+export type BootstrapAuth = Pick<AuthContext, 'channel' | 'boundAgentId' | 'memberId'>
 
 function isUnboundDirectorySession(auth: BootstrapAuth): auth is BootstrapAuth & { memberId: string } {
   return auth.channel === 'directory' && !auth.boundAgentId && typeof auth.memberId === 'string'
@@ -276,16 +363,78 @@ async function alreadyBootstrappedResult(env: Env, consentingMemberId: string): 
   }
 }
 
-/** Department and squad are never referenced by anything with a delete-guard
- *  trigger, so both are always safely, fully deletable — no partial state can
- *  ever survive this. Missing ids are simply skipped (nothing to undo yet). */
-async function deleteOrphanedDeptAndSquad(
+/**
+ * WARN-1 (adversarial review, second pass): each DELETE gets its OWN try/catch.
+ * Before this fix, a single unguarded call ran both deletes; once the batch has
+ * actually landed (e.g. a real D1 commit followed by an app-level throw — see
+ * LOW-3's assertBatchWritten, or the WARN-2 test), DELETE FROM squads reaches
+ * agents via ON DELETE CASCADE, and agent_member_bindings.agent_id's
+ * ON DELETE RESTRICT (migration 0071) refuses that cascade — the squads DELETE
+ * itself throws "FOREIGN KEY constraint failed", the department DELETE never
+ * even runs, and the exception used to escape uncaught (a bare 500 with the
+ * real stage/reason lost). Splitting the two into independent try/catch means a
+ * blocked squad delete no longer suppresses the department delete attempt, and
+ * neither ever throws out of this function — the caller always gets back the
+ * structured provisioning_failed it was already building.
+ *
+ * Only ever called with ids THIS invocation itself created (never an ADOPTED,
+ * pre-existing row from a prior attempt — see findDepartmentBySlug/
+ * findSquadBySlug below) — deleting an adopted row out from under a possibly-
+ * still-live prior identity would be the P0-N2 lockout's mirror-image bug.
+ */
+async function compensateCreatedRows(
   env: Env,
   squadId: string | null,
   departmentId: string | null,
 ): Promise<void> {
-  if (squadId) await env.DB.prepare('DELETE FROM squads WHERE id = ?1').bind(squadId).run()
-  if (departmentId) await env.DB.prepare('DELETE FROM departments WHERE id = ?1').bind(departmentId).run()
+  if (squadId) {
+    try {
+      await env.DB.prepare('DELETE FROM squads WHERE id = ?1').bind(squadId).run()
+    } catch {
+      // Best-effort. If this is FK-blocked (an agent already landed for real —
+      // see the file comment above), the department delete below must still be
+      // attempted rather than skipped.
+    }
+  }
+  if (departmentId) {
+    try {
+      await env.DB.prepare('DELETE FROM departments WHERE id = ?1').bind(departmentId).run()
+    } catch {
+      // Best-effort; see above. An orphaned dept/squad is never delete-guarded
+      // by anything ELSE in the schema, so leaving one behind on a genuinely
+      // failed delete is always safe for a future retry/adopt (P0-N2) rather
+      // than something worth looping or escalating on here.
+    }
+  }
+}
+
+// P0-N2 (adversarial review, second pass) — orphan lockout fix.
+//
+// deptSlug/squadSlug are SERVER-DERIVED from consentingMemberId (see the file
+// header) and departments.slug is GLOBALLY UNIQUE (migrations/0001_init.sql).
+// So the only possible reason `dept-home-<memberId>` already exists is a PRIOR
+// bootstrap_self attempt for THIS SAME human that got as far as committing the
+// department (or squad) but never finished — e.g. the worker died between the
+// createSquad commit and the final atomic batch. Before this fix there was no
+// adopt-existing branch: createDepartment's slug_taken became
+// provisioning_failed{stage:'department'} FOREVER, with no audit row and no way
+// to recover — every retry hit the exact same dead end. Squads are scoped
+// UNIQUE(department_id, slug) (not globally), but since departmentId here is
+// ALSO this same member's own (freshly created OR adopted) department, the
+// same "can only be this human's own prior row" argument applies transitively.
+//
+// This is READ-ONLY discovery — it does not decide policy on its own row (no
+// other member can ever hold this exact slug, by construction), it just finds
+// the row a prior partial run already committed so this run can use it instead
+// of failing forever.
+async function findDepartmentBySlug(env: Env, slug: string): Promise<Department | null> {
+  return env.DB.prepare('SELECT * FROM departments WHERE slug = ?1 LIMIT 1').bind(slug).first<Department>()
+}
+
+async function findSquadBySlug(env: Env, departmentId: string, slug: string): Promise<Squad | null> {
+  return env.DB.prepare('SELECT * FROM squads WHERE department_id = ?1 AND slug = ?2 LIMIT 1')
+    .bind(departmentId, slug)
+    .first<Squad>()
 }
 
 export interface BootstrapSelfDeps {
@@ -294,7 +443,7 @@ export interface BootstrapSelfDeps {
   prepareAgentCreate: typeof prepareAgentCreate
   prepareAgentBoundTokenMint: typeof prepareAgentBoundTokenMint
   checkRateLimit: typeof checkBootstrapSelfRateLimit
-  batch: (env: Env, statements: D1PreparedStatement[]) => Promise<unknown[]>
+  batch: (env: Env, statements: D1PreparedStatement[]) => Promise<D1WriteLike[]>
 }
 
 export function defaultBootstrapSelfDeps(): BootstrapSelfDeps {
@@ -336,16 +485,22 @@ export async function bootstrapSelf(
     return { ok: false, error: 'agent_name_required', detail: 'agent_name must be 128 characters or fewer' }
   }
 
-  // Condition 5 (part 1 of 2 — see migration 0092 for the structural half) —
-  // optimization only: skip five doomed writes on the common repeat-call path.
-  const preCheck = await findExistingBootstrap(env, consentingMemberId)
-  if (preCheck) return alreadyBootstrappedResult(env, consentingMemberId)
-
-  // Per-member attempt throttle (adversarial review LOW-1).
+  // Per-member attempt throttle (adversarial review LOW-1) — runs BEFORE the
+  // already-bootstrapped pre-check, not after. Before this reorder, a member
+  // who already bootstrapped could hammer this tool for free forever: the
+  // pre-check short-circuited every repeat call BEFORE it ever reached the
+  // throttle, so an unlimited-rate loop of "is this member bootstrapped yet"
+  // reads never cost the caller anything. Now every call, including a cheap
+  // already_bootstrapped repeat, spends one unit of the SAME 5/hour budget.
   const rl = await deps.checkRateLimit(env, consentingMemberId)
   if (!rl.allowed) {
     return { ok: false, error: 'rate_limited', detail: { retry_after_seconds: rl.retryAfter } }
   }
+
+  // Condition 5 (part 1 of 2 — see migration 0092 for the structural half) —
+  // optimization only: skip five doomed writes on the common repeat-call path.
+  const preCheck = await findExistingBootstrap(env, consentingMemberId)
+  if (preCheck) return alreadyBootstrappedResult(env, consentingMemberId)
 
   // Server-derived slugs (adversarial review P0-1) — see the file header for
   // why this is structurally collision-proof and needs no extra uniqueness
@@ -361,23 +516,62 @@ export async function bootstrapSelf(
   const homeName = `Home — ${agentName}`
 
   // ── department, squad: individually-committing, always fully compensable ────
-  const deptResult = await deps.createDepartment(env, { slug: deptSlug, name: homeName })
-  if (!deptResult.ok) {
+  // Every row this function creates is kind:'home' (mupot#925 P0-N1) — a
+  // structural exemption from the pot's plan-limit counters (src/org/service.ts,
+  // src/billing/plans.ts), never a tier carve-out. A human bootstrapping their
+  // own identity is never "one more work squad"; it is the room they speak in.
+  let departmentId: string
+  let departmentCreatedHere = false
+  const deptResult = await deps.createDepartment(env, { slug: deptSlug, name: homeName, kind: 'home' })
+  if (deptResult.ok) {
+    departmentId = deptResult.value.id
+    departmentCreatedHere = true
+  } else if (deptResult.error === 'slug_taken') {
+    // P0-N2 (adversarial review, second pass) — adopt-existing. See
+    // findDepartmentBySlug's doc comment for why this slug can only ever be
+    // THIS SAME human's own row from a prior partial attempt.
+    const existing = await findDepartmentBySlug(env, deptSlug)
+    if (!existing) {
+      return { ok: false, error: 'provisioning_failed', detail: { stage: 'department', reason: 'slug_taken_but_not_found' } }
+    }
+    departmentId = existing.id
+  } else {
+    if (isEntitlementLimitReason(deptResult.error)) await refundBootstrapSelfRateLimit(env, consentingMemberId)
     return { ok: false, error: 'provisioning_failed', detail: { stage: 'department', reason: deptResult.error } }
   }
-  const departmentId = deptResult.value.id
 
-  const squadResult = await deps.createSquad(env, departmentId, { slug: squadSlug, name: homeName })
-  if (!squadResult.ok) {
-    await deleteOrphanedDeptAndSquad(env, null, departmentId)
+  let squad: Squad
+  let squadCreatedHere = false
+  const squadResult = await deps.createSquad(env, departmentId, { slug: squadSlug, name: homeName, kind: 'home' })
+  if (squadResult.ok) {
+    squad = squadResult.value
+    squadCreatedHere = true
+  } else if (squadResult.error === 'slug_taken') {
+    // P0-N2 — adopt-existing, same argument as the department above: this
+    // department is EITHER this call's own fresh row OR this same human's own
+    // adopted row, so a squad slug collision under it can only be this same
+    // human's own prior squad.
+    const existing = await findSquadBySlug(env, departmentId, squadSlug)
+    if (!existing) {
+      await compensateCreatedRows(env, null, departmentCreatedHere ? departmentId : null)
+      return { ok: false, error: 'provisioning_failed', detail: { stage: 'squad', reason: 'slug_taken_but_not_found' } }
+    }
+    squad = existing
+  } else {
+    if (isEntitlementLimitReason(squadResult.error)) await refundBootstrapSelfRateLimit(env, consentingMemberId)
+    await compensateCreatedRows(env, null, departmentCreatedHere ? departmentId : null)
     return { ok: false, error: 'provisioning_failed', detail: { stage: 'squad', reason: squadResult.error } }
   }
-  const squad = squadResult.value
 
   // ── agent + member + weld + capability + token + audit: ONE atomic batch ───
-  const preparedAgent = await deps.prepareAgentCreate(env, squad.id, { slug: agentSlug, name: agentName })
+  const preparedAgent = await deps.prepareAgentCreate(env, squad.id, { slug: agentSlug, name: agentName, kind: 'home' })
   if (!preparedAgent.ok) {
-    await deleteOrphanedDeptAndSquad(env, squad.id, departmentId)
+    if (isEntitlementLimitReason(preparedAgent.error)) await refundBootstrapSelfRateLimit(env, consentingMemberId)
+    await compensateCreatedRows(
+      env,
+      squadCreatedHere ? squad.id : null,
+      departmentCreatedHere ? departmentId : null,
+    )
     return { ok: false, error: 'provisioning_failed', detail: { stage: 'agent', reason: preparedAgent.error } }
   }
   const agent = preparedAgent.value.agent
@@ -404,7 +598,11 @@ export async function bootstrapSelf(
       'member',
     )
   } catch (err) {
-    await deleteOrphanedDeptAndSquad(env, squad.id, departmentId)
+    await compensateCreatedRows(
+      env,
+      squadCreatedHere ? squad.id : null,
+      departmentCreatedHere ? departmentId : null,
+    )
     return {
       ok: false,
       error: 'provisioning_failed',
@@ -466,13 +664,40 @@ export async function bootstrapSelf(
   ]
 
   try {
-    await deps.batch(env, allStatements)
+    // LOW-3: same receipt discipline commitPreparedAgentTokenMint applies to
+    // the identical statements (src/members/service.ts) — a D1 batch call can
+    // report success while a statement inside it silently wrote zero rows (a
+    // swallowed ON CONFLICT, a replica that didn't land). Without this, a
+    // "minted" bootstrap whose token/binding/audit row never actually landed
+    // would still return ok:true.
+    const writes = await deps.batch(env, allStatements)
+    assertBatchWritten(writes, 'bootstrap_self', 1)
   } catch (err) {
-    // The batch is all-or-nothing: NOTHING in it landed. Only department/squad
-    // (committed earlier, outside this batch) can possibly be orphaned — and
-    // both are always safely deletable (see the file header).
-    await deleteOrphanedDeptAndSquad(env, squad.id, departmentId)
-    if (isBootstrapAuditConflict(err)) {
+    // WARN-1 (adversarial review, second pass): CLASSIFY FIRST, compensate
+    // SECOND — the reverse of the original order. A losing race on the
+    // agent_audit uniqueness guard (migration 0092) means the WINNING caller's
+    // batch already committed for real; reporting already_bootstrapped must
+    // not first run a delete against rows a real, live identity may now
+    // depend on. See compensateCreatedRows' doc comment for the FK-cascade
+    // failure mode that made an unconditional pre-classification delete
+    // dangerous (escaped exceptions, and — worse — a delete that could
+    // silently succeed against a real winner's rows in a shape this repo's
+    // FK graph does not actually allow, but a future schema change could).
+    //
+    // Only ever compensate rows THIS invocation created (never an ADOPTED
+    // row — P0-N2): if department/squad were adopted from a prior partial
+    // attempt, deleting them on THIS attempt's batch failure would reproduce
+    // the exact orphan-lockout P0-N2 exists to close, just from the other
+    // direction.
+    const auditConflict = isBootstrapAuditConflict(err)
+    if (!auditConflict) {
+      await compensateCreatedRows(
+        env,
+        squadCreatedHere ? squad.id : null,
+        departmentCreatedHere ? departmentId : null,
+      )
+    }
+    if (auditConflict) {
       // A concurrent bootstrap for the SAME human won the race. Report exactly
       // what the pre-check would have reported to a slightly-later caller.
       return alreadyBootstrappedResult(env, consentingMemberId)

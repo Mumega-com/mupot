@@ -8,9 +8,22 @@
 // can shape its own response (JSON error vs re-rendered form).
 
 import type { D1PreparedStatement } from '@cloudflare/workers-types'
-import type { Env, Department, Squad, Agent, Effort, Autonomy, BudgetWindow } from '../types'
+import type { Env, Department, Squad, Agent, Effort, Autonomy, BudgetWindow, OrgKind } from '../types'
 import { isEffort, isAutonomy, isBudgetWindow } from '../types'
 import { checkCreateLimit } from '../billing/entitlement'
+
+// ── kind (migration 0093, mupot#925 P0-N1) ─────────────────────────────────────
+// 'work' (default) counts against PLAN_LIMITS; 'home' is bootstrap_self's
+// per-human identity container and is STRUCTURALLY exempt — the entitlement
+// gate below only ever runs when the row being created is kind='work'. See
+// src/billing/plans.ts's maxDepartments comment and src/members/bootstrap-self.ts
+// for the caller that passes kind:'home'. Every OTHER call site in this codebase
+// (src/org/index.ts, src/dashboard/index.ts, src/mcp/provision.ts) never sets
+// `kind` on its input, so it defaults to 'work' — unchanged behavior.
+const ORG_KINDS: readonly OrgKind[] = ['work', 'home']
+export function isOrgKind(v: unknown): v is OrgKind {
+  return typeof v === 'string' && (ORG_KINDS as readonly string[]).includes(v)
+}
 
 // slugs are URL-safe identifiers: lowercase alphanumeric + single hyphens,
 // 1–48 chars, no leading/trailing/double hyphen.
@@ -44,6 +57,9 @@ export type CreateResult<T> = { ok: true; value: T } | { ok: false; error: strin
 export interface DepartmentInput {
   slug?: unknown
   name?: unknown
+  // 'work' (default) | 'home' — see the kind block above. Only bootstrap_self
+  // ever passes 'home'; every other caller omits this and gets 'work'.
+  kind?: unknown
 }
 
 export async function createDepartment(
@@ -52,19 +68,35 @@ export async function createDepartment(
 ): Promise<CreateResult<Department>> {
   if (!isValidSlug(input.slug)) return { ok: false, error: 'invalid_slug' }
   if (!isNonEmptyString(input.name)) return { ok: false, error: 'invalid_name' }
+  const kind: OrgKind = input.kind === undefined ? 'work' : (input.kind as OrgKind)
+  if (!isOrgKind(kind)) return { ok: false, error: 'invalid_kind' }
+
+  // ── Plan ENTITLEMENT gate (mupot#925 P0-N1) — the pot's tier must permit one
+  // more department. ONLY when creating a WORK department: a 'home' create
+  // (bootstrap_self only) is structurally exempt — never even reads the tier.
+  // Fail-closed: an unconfigured pot resolves to 'free'. Existing overage is
+  // grandfathered — only the NEXT create is blocked.
+  if (kind === 'work') {
+    const deptCount =
+      (await env.DB.prepare(`SELECT COUNT(*) AS n FROM departments WHERE kind = 'work'`).bind().first<{ n: number }>())
+        ?.n ?? 0
+    const deptGate = await checkCreateLimit(env, 'maxDepartments', deptCount)
+    if (!deptGate.ok) return { ok: false, error: 'department_limit_reached' }
+  }
 
   const dept: Department = {
     id: crypto.randomUUID(),
     slug: input.slug,
     name: input.name.trim(),
+    kind,
     created_at: new Date().toISOString(),
   }
 
   try {
     await env.DB.prepare(
-      'INSERT INTO departments (id, slug, name, created_at) VALUES (?, ?, ?, ?)',
+      'INSERT INTO departments (id, slug, name, kind, created_at) VALUES (?, ?, ?, ?, ?)',
     )
-      .bind(dept.id, dept.slug, dept.name, dept.created_at)
+      .bind(dept.id, dept.slug, dept.name, dept.kind, dept.created_at)
       .run()
   } catch (err) {
     if (isUniqueViolation(err)) return { ok: false, error: 'slug_taken' }
@@ -79,6 +111,8 @@ export interface SquadInput {
   slug?: unknown
   name?: unknown
   charter?: unknown
+  // 'work' (default) | 'home' — see the kind block above.
+  kind?: unknown
   // work-unit fields (optional; defaults applied when omitted)
   role?: unknown
   okr?: unknown
@@ -150,13 +184,22 @@ export async function createSquad(
     input.budget_window === undefined ? 'week' : (input.budget_window as BudgetWindow)
   if (!isBudgetWindow(budget_window)) return { ok: false, error: 'invalid_budget_window' }
 
-  // ── Plan ENTITLEMENT gate (S6) — the pot's tier must permit one more squad ──────
-  // This is a pot-level invariant (the tier's maxSquads), NOT caller authz (the route
-  // already gated scope). Fail-closed: an unconfigured pot resolves to 'free'. Existing
-  // overage is grandfathered — only the NEXT create is blocked.
-  const squadCount = (await env.DB.prepare('SELECT COUNT(*) AS n FROM squads').bind().first<{ n: number }>())?.n ?? 0
-  const squadGate = await checkCreateLimit(env, 'maxSquads', squadCount)
-  if (!squadGate.ok) return { ok: false, error: 'squad_limit_reached' }
+  const kind: OrgKind = input.kind === undefined ? 'work' : (input.kind as OrgKind)
+  if (!isOrgKind(kind)) return { ok: false, error: 'invalid_kind' }
+
+  // ── Plan ENTITLEMENT gate (S6; kind-filtered per mupot#925 P0-N1) — the pot's
+  // tier must permit one more WORK squad. This is a pot-level invariant (the
+  // tier's maxSquads), NOT caller authz (the route already gated scope).
+  // Fail-closed: an unconfigured pot resolves to 'free'. Existing overage is
+  // grandfathered — only the NEXT create is blocked. A 'home' create
+  // (bootstrap_self only) is structurally exempt — never reaches this block.
+  if (kind === 'work') {
+    const squadCount =
+      (await env.DB.prepare(`SELECT COUNT(*) AS n FROM squads WHERE kind = 'work'`).bind().first<{ n: number }>())
+        ?.n ?? 0
+    const squadGate = await checkCreateLimit(env, 'maxSquads', squadCount)
+    if (!squadGate.ok) return { ok: false, error: 'squad_limit_reached' }
+  }
 
   const squad: Squad = {
     id: crypto.randomUUID(),
@@ -164,6 +207,7 @@ export async function createSquad(
     slug: input.slug,
     name: input.name.trim(),
     charter,
+    kind,
     role,
     okr,
     kpi_target,
@@ -178,10 +222,10 @@ export async function createSquad(
   try {
     await env.DB.prepare(
       `INSERT INTO squads
-        (id, department_id, slug, name, charter,
+        (id, department_id, slug, name, charter, kind,
          role, okr, kpi_target, kpi_progress, effort, autonomy, budget_cap_cents, budget_window,
          created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
       .bind(
         squad.id,
@@ -189,6 +233,7 @@ export async function createSquad(
         squad.slug,
         squad.name,
         squad.charter,
+        squad.kind,
         squad.role,
         squad.okr,
         squad.kpi_target,
@@ -215,6 +260,8 @@ export interface AgentInput {
   role?: unknown
   model?: unknown
   status?: unknown
+  // 'work' (default) | 'home' — see the kind block above.
+  kind?: unknown
   // work-unit fields (optional; defaults applied when omitted)
   okr?: unknown
   kpi_target?: unknown
@@ -362,12 +409,21 @@ export async function prepareAgentCreate(
     if (!parent) return { ok: false, error: 'parent_agent_not_found' }
   }
 
-  // ── Plan ENTITLEMENT gate (S6) — the pot's tier must permit one more agent ──────
-  // Pot-level invariant (the tier's maxAgents), NOT caller authz. Fail-closed to 'free'
-  // when unconfigured. Existing overage grandfathered — only the NEXT create is blocked.
-  const agentCount = (await env.DB.prepare('SELECT COUNT(*) AS n FROM agents').bind().first<{ n: number }>())?.n ?? 0
-  const agentGate = await checkCreateLimit(env, 'maxAgents', agentCount)
-  if (!agentGate.ok) return { ok: false, error: 'agent_limit_reached' }
+  const kind: OrgKind = input.kind === undefined ? 'work' : (input.kind as OrgKind)
+  if (!isOrgKind(kind)) return { ok: false, error: 'invalid_kind' }
+
+  // ── Plan ENTITLEMENT gate (S6; kind-filtered per mupot#925 P0-N1) — the pot's
+  // tier must permit one more WORK agent. Pot-level invariant (the tier's
+  // maxAgents), NOT caller authz. Fail-closed to 'free' when unconfigured.
+  // Existing overage grandfathered — only the NEXT create is blocked. A 'home'
+  // create (bootstrap_self only) is structurally exempt — never reaches this.
+  if (kind === 'work') {
+    const agentCount =
+      (await env.DB.prepare(`SELECT COUNT(*) AS n FROM agents WHERE kind = 'work'`).bind().first<{ n: number }>())
+        ?.n ?? 0
+    const agentGate = await checkCreateLimit(env, 'maxAgents', agentCount)
+    if (!agentGate.ok) return { ok: false, error: 'agent_limit_reached' }
+  }
 
   // The AgentDO is lazy — provisioned on first wake. Here we only insert the row;
   // the agent's id doubles as the DurableObject id name.
@@ -379,6 +435,7 @@ export async function prepareAgentCreate(
     role: (role as string).trim(),
     model: (model as string).trim(),
     status,
+    kind,
     okr,
     kpi_target,
     kpi_progress: 0,
@@ -406,11 +463,11 @@ export async function prepareAgentCreate(
   const statements: [D1PreparedStatement, D1PreparedStatement] = [
     env.DB.prepare(
       `INSERT INTO agents
-      (id, squad_id, slug, name, role, model, status,
+      (id, squad_id, slug, name, role, model, status, kind,
        okr, kpi_target, kpi_progress, effort, autonomy, budget_cap_cents, budget_window,
        created_at,
        purpose, owner, model_fallback, capabilities, skills, parent_agent_id, qnft_ref, death_condition)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).bind(
       agent.id,
       agent.squad_id,
@@ -419,6 +476,7 @@ export async function prepareAgentCreate(
       agent.role,
       agent.model,
       agent.status,
+      agent.kind,
       agent.okr,
       agent.kpi_target,
       agent.kpi_progress,

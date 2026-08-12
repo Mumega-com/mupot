@@ -69,7 +69,9 @@ const toolBootstrapSelf: ToolSpec = {
           result.error,
           {
             ...(typeof result.detail === 'object' && result.detail !== null ? result.detail : {}),
-            note: 'This member already bootstrapped an agent. bootstrap_self is idempotent-once per member, not per token.',
+            note: 'This member already bootstrapped an agent. bootstrap_self is idempotent-once per member, not per token. '
+              + 'The founder grant (squad:admin on the home squad) landed in the SAME atomic batch as that bootstrap, so '
+              + 'this caller can proceed via the normal /oauth/consent flow to bind THIS session to that agent instead.',
           },
         )
       case 'provisioning_failed':

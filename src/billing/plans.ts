@@ -75,17 +75,35 @@ export const POT_FEATURES: Record<PotFeature, FeatureSpec> = deepFreeze({
 
 // ── limits (numeric ceilings per tier) ─────────────────────────────────────────
 // SCAFFOLDING DEFAULTS — tune via product/pricing decision. -1 = unlimited.
+//
+// maxDepartments (added mupot#925 P0-N1): departments/squads/agents all gained a
+// `kind` column (migration 0093) — 'work' (the default, counted here) vs 'home'
+// (bootstrap_self's per-human identity container, STRUCTURALLY exempt from every
+// counter in this table — see checkCreateLimit's callers in src/org/service.ts,
+// which only run the count+gate at all when kind==='work'). river's ruling: "the
+// plan meters WORK; it never meters how many people can speak in the pot."
+//
+// maxDepartments did not exist before this — createDepartment had NO gate at all.
+// Chosen values follow the same ~2 squads-per-department ratio the existing
+// maxSquads numbers already imply at starter/pro (an owner/product call, not a
+// structural one — see the module header): free gets exactly 1 (matches
+// maxSquads:1 — a department without any squad is not useful, and free's one
+// squad needs exactly one home for it); starter 2 (maxSquads:3 → ~1.5/dept,
+// rounded down conservatively rather than up); pro 5 (maxSquads:10 → 2/dept,
+// the same ratio starter and pro now share); scale unlimited, as with every
+// other limit at that tier.
 export interface PotLimits {
   maxAgents: number
   maxSquads: number
+  maxDepartments: number
   monthlyModelBudgetMicroUsd: number
 }
 
 export const PLAN_LIMITS: Record<PotTier, PotLimits> = deepFreeze({
-  free: { maxAgents: 2, maxSquads: 1, monthlyModelBudgetMicroUsd: 2_000_000 }, // ~$2/mo Workers-AI
-  starter: { maxAgents: 8, maxSquads: 3, monthlyModelBudgetMicroUsd: 50_000_000 }, // ~$50/mo
-  pro: { maxAgents: 30, maxSquads: 10, monthlyModelBudgetMicroUsd: 300_000_000 }, // ~$300/mo
-  scale: { maxAgents: -1, maxSquads: -1, monthlyModelBudgetMicroUsd: -1 }, // unlimited / metered
+  free: { maxAgents: 2, maxSquads: 1, maxDepartments: 1, monthlyModelBudgetMicroUsd: 2_000_000 }, // ~$2/mo Workers-AI
+  starter: { maxAgents: 8, maxSquads: 3, maxDepartments: 2, monthlyModelBudgetMicroUsd: 50_000_000 }, // ~$50/mo
+  pro: { maxAgents: 30, maxSquads: 10, maxDepartments: 5, monthlyModelBudgetMicroUsd: 300_000_000 }, // ~$300/mo
+  scale: { maxAgents: -1, maxSquads: -1, maxDepartments: -1, monthlyModelBudgetMicroUsd: -1 }, // unlimited / metered
 })
 
 // ── pure gates (no I/O — fully testable) ───────────────────────────────────────

@@ -32,9 +32,11 @@ import {
   bootstrapSelf,
   defaultBootstrapSelfDeps,
   checkBootstrapSelfRateLimit,
+  refundBootstrapSelfRateLimit,
   type BootstrapSelfDeps,
   type BootstrapAuth,
 } from '../src/members/bootstrap-self'
+import { createDepartment, createSquad } from '../src/org/service'
 import type { Env } from '../src/types'
 
 const TENANT = 'mumega'
@@ -73,9 +75,11 @@ function unboundDirectoryAuth(memberId = HUMAN): BootstrapAuth {
  *  member id but never creates it (findOrCreateMember, a separate flow, already
  *  did that at OAuth time). */
 function seedHuman(sqlite: SqliteD1Harness['sqlite'], memberId = HUMAN): void {
+  // email is UNIQUE on members — derive it from memberId so tests seeding
+  // multiple distinct humans (P0-N1, LOW-4) don't collide on a shared literal.
   sqlite.exec(
     `INSERT INTO members (id, email, display_name, status, created_at, tenant)
-     VALUES ('${memberId}', 'human@example.test', 'Human', 'active', '2026-08-11T00:00:00.000Z', '${TENANT}')`,
+     VALUES ('${memberId}', '${memberId}@example.test', 'Human', 'active', '2026-08-11T00:00:00.000Z', '${TENANT}')`,
   )
 }
 
@@ -421,33 +425,73 @@ describe('compensation on mid-chain failure', () => {
     expect(retry.ok).toBe(true)
   })
 
-  it('batch failure (e.g. a losing race on the audit uniqueness guard): department and squad are deleted', async () => {
+  // WARN-2 (adversarial review, second pass): the PREVIOUS version of this test
+  // was titled "batch failure ... department and squad are deleted" but seeded
+  // the winner audit row BEFORE calling bootstrapSelf — so the app-level
+  // pre-check (bootstrap-self.ts, "Condition 5 (part 1 of 2)") short-circuited
+  // to already_bootstrapped before ever creating a department, and its
+  // departments==0/squads==0 assertions passed VACUOUSLY (nothing was ever
+  // created in the first place). Nothing in the suite ever reached the actual
+  // batch-catch compensator code.
+  //
+  // REACHABILITY NOTE on the scenario the old test THOUGHT it was covering (a
+  // concurrent same-member race losing specifically on the agent_audit
+  // uniqueness guard, INSIDE the batch): after P0-N2's adopt-existing fix, two
+  // concurrent bootstrap_self calls for the SAME member converge on the SAME
+  // department AND the SAME squad (server-derived, deterministic slugs), which
+  // means their agent INSERTs also collide on agents' own
+  // UNIQUE(squad_id, slug) — and that statement runs BEFORE the audit INSERT
+  // in this batch's statement order (preparedAgent.statements is first). So the
+  // race now fails on `agents`, not `agent_audit`, and isBootstrapAuditConflict
+  // (which pattern-matches specifically on 'agent_audit' in the error message)
+  // does not classify it as already_bootstrapped — it falls through to the
+  // generic provisioning_failed{stage:'batch'} path instead, which is provably
+  // safe: compensateCreatedRows is only ever called with squadCreatedHere/
+  // departmentCreatedHere ids, so the LOSING caller (which adopted, not
+  // created) leaves the WINNER's real rows completely untouched (see the
+  // 'squad-vs-department adoption is respected by the compensator' test below,
+  // which pins that behavior directly). I did not find a way to reach
+  // isBootstrapAuditConflict's TRUE branch through the batch catch via a normal
+  // same-member race anymore, given that statement ordering.
+  //
+  // What THIS test verifies instead is the compensator branch itself: a batch
+  // call that reports success at the D1-call level (no thrown error) but whose
+  // writes never actually landed in THIS test's sqlite (the stub never touches
+  // the real env.DB.batch) — the exact "phantom success" shape LOW-3's
+  // assertBatchWritten (src/lib/receipt.ts) exists to catch. assertBatchWritten
+  // throws AFTER the stub "commits" (returns normally), which is exactly what
+  // reaches bootstrap-self.ts's real batch-catch block and its compensator.
+  function depsWithPhantomBatchWrite(): BootstrapSelfDeps {
+    return {
+      ...defaultBootstrapSelfDeps(),
+      batch: async (_env, statements) => statements.map(() => ({ success: true, meta: { changes: 0 } })),
+    }
+  }
+
+  it('WARN-2: a phantom batch write (assertBatchWritten/LOW-3 catches it) — department and squad are deleted', async () => {
     const env = envFor(harness)
-    // Seed a WINNING bootstrap_self audit row for this member directly (simulates
-    // a concurrent request that finished first), then bypass the app-level
-    // pre-check by calling with a deps object that skips straight to the batch —
-    // simplest: just call bootstrapSelf normally twice; the second call's
-    // pre-check already catches it (covered above). This test instead forces the
-    // BATCH-level path by making the pre-check see nothing (a deps override that
-    // fakes prepareAgentCreate/mint normally) while the row exists at INSERT time.
-    const realDeps = defaultBootstrapSelfDeps()
-    const winnerId = 'agent-winner'
-    harness.sqlite.exec(
-      `INSERT INTO agent_audit (id, agent_id, actor_id, actor_type, action, fields_changed, before_state, after_state)
-       VALUES ('winner-audit', '${winnerId}', '${HUMAN}', 'user', 'bootstrap_self', '[]', '{}', '{"x":1}')`,
-    )
-    // The pre-check inside bootstrapSelf reads this row and short-circuits to
-    // already_bootstrapped BEFORE ever creating a department — so to exercise the
-    // batch-level race path specifically we call with the pre-check's read
-    // racing behind the write, i.e. we assert the OUTCOME is already_bootstrapped
-    // either way (pre-check or batch), and that nothing is left behind.
-    const out = await bootstrapSelf(env, unboundDirectoryAuth(), 'Aria', realDeps)
+    const out = await bootstrapSelf(env, unboundDirectoryAuth(), 'Aria', depsWithPhantomBatchWrite())
     expect(out.ok).toBe(false)
     if (out.ok) throw new Error('expected failure')
-    expect(out.error).toBe('already_bootstrapped')
+    expect(out.error).toBe('provisioning_failed')
+    expect((out.detail as { stage?: string })?.stage).toBe('batch')
+    expect((out.detail as { reason?: string })?.reason).toMatch(/receipt_failed/)
+
     expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM departments').get()!.n).toBe(0)
     expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM squads').get()!.n).toBe(0)
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM agents').get()!.n).toBe(0)
+
+    // A retry (real deps) must succeed cleanly afterward — no orphan slug lockout.
+    const retry = await bootstrapSelf(env, unboundDirectoryAuth(), 'Aria')
+    expect(retry.ok).toBe(true)
   })
+  // NOTE (build brief: "verify both independently, do not assume one covers
+  // the other"): the mint-prepare-failure test above throws BEFORE deps.batch
+  // is ever called (no batch statement exists yet — it exercises the
+  // mint_prepare catch block). This phantom-write test throws AFTER
+  // deps.batch returns (inside assertBatchWritten — it exercises the batch
+  // catch block). Two distinct try/catch blocks, two distinct trigger points,
+  // both asserted above independently — not inferred from one another.
 })
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -485,5 +529,164 @@ describe('per-member attempt throttle', () => {
     if (out.ok) throw new Error('expected refusal')
     expect(out.error).toBe('rate_limited')
     expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM agents').get()!.n).toBe(0)
+  })
+
+  // LOW-1 (adversarial review, second pass): the throttle check now runs
+  // BEFORE the already-bootstrapped pre-check (bootstrap-self.ts). Before this
+  // reorder, an already-bootstrapped member's repeat calls short-circuited at
+  // the pre-check and NEVER reached checkRateLimit, so they cost nothing —
+  // an unmetered "is this member bootstrapped yet" poll loop.
+  it('LOW-1: repeat calls from an already-bootstrapped member consume throttle budget too', async () => {
+    const env = envFor(harness)
+    const first = await bootstrapSelf(env, unboundDirectoryAuth(), 'Aria')
+    expect(first.ok).toBe(true)
+
+    // 4 more repeat calls (already_bootstrapped) — 5 calls total (1 fresh +
+    // 4 repeats), still within the 5/hour budget.
+    for (let i = 0; i < 4; i += 1) {
+      const r = await bootstrapSelf(env, unboundDirectoryAuth(), 'Aria')
+      expect(r.ok).toBe(false)
+      if (!r.ok) expect(r.error).toBe('already_bootstrapped')
+    }
+
+    // The 6th call exceeds the budget — even though every repeat was a cheap
+    // already-bootstrapped short-circuit, not a fresh provisioning attempt.
+    const sixth = await bootstrapSelf(env, unboundDirectoryAuth(), 'Aria')
+    expect(sixth.ok).toBe(false)
+    if (sixth.ok) throw new Error('expected refusal')
+    expect(sixth.error).toBe('rate_limited')
+  })
+
+  // Unit-level pin of the refund primitive itself. As documented on
+  // refundBootstrapSelfRateLimit's own doc comment, bootstrapSelf currently has
+  // NO reachable call site for this (P0-N1's kind:'home' exemption means
+  // createDepartment/createSquad/prepareAgentCreate never return a
+  // *_limit_reached reason for a kind:'home' create) — this test proves the
+  // primitive itself is correct in isolation, not that bootstrapSelf exercises
+  // it end-to-end.
+  it('refundBootstrapSelfRateLimit returns one unit of budget to a member', async () => {
+    const kv = memoryKv()
+    const env = { DB: harness.db, TENANT_SLUG: TENANT, SESSIONS: kv } as unknown as Env
+    for (let i = 0; i < 5; i += 1) await checkBootstrapSelfRateLimit(env, 'member-refund')
+    const blocked = await checkBootstrapSelfRateLimit(env, 'member-refund')
+    expect(blocked.allowed).toBe(false)
+
+    await refundBootstrapSelfRateLimit(env, 'member-refund')
+    const afterRefund = await checkBootstrapSelfRateLimit(env, 'member-refund')
+    expect(afterRefund.allowed).toBe(true)
+  })
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// 8. P0-N2 — orphan lockout: adopt-existing, never a permanent 500
+// ════════════════════════════════════════════════════════════════════════════
+describe('P0-N2: a prior partial attempt\'s dept/squad is ADOPTED, not a permanent lockout', () => {
+  it('resume path: create a dept+squad exactly as a crashed prior attempt would, then bootstrap_self completes', async () => {
+    const env = envFor(harness)
+    // Simulate the exact crash point P0-2 describes: the worker died AFTER the
+    // createDepartment/createSquad commits but BEFORE the atomic agent/mint/
+    // audit batch ever ran. Call the real service functions directly with the
+    // SAME server-derived slugs bootstrapSelf itself would compute.
+    const deptSlug = `dept-home-${HUMAN}`
+    const squadSlug = `home-${HUMAN}`
+    const deptRes = await createDepartment(env, { slug: deptSlug, name: 'Home — Aria', kind: 'home' })
+    expect(deptRes.ok).toBe(true)
+    if (!deptRes.ok) throw new Error('setup failed')
+    const squadRes = await createSquad(env, deptRes.value.id, { slug: squadSlug, name: 'Home — Aria', kind: 'home' })
+    expect(squadRes.ok).toBe(true)
+    if (!squadRes.ok) throw new Error('setup failed')
+
+    // Before P0-N2: this returned provisioning_failed{stage:'department',
+    // reason:'slug_taken'} — FOREVER, on every retry, no audit row, no recovery.
+    const out = await bootstrapSelf(env, unboundDirectoryAuth(), 'Aria')
+    expect(out.ok).toBe(true)
+    if (!out.ok) throw new Error(`expected the resume to succeed, got: ${JSON.stringify(out)}`)
+    expect(out.department.id).toBe(deptRes.value.id) // ADOPTED, not a fresh row
+    expect(out.squad.id).toBe(squadRes.value.id)
+
+    // Adoption did not create a duplicate department/squad for this member.
+    const deptCount = harness.sqlite
+      .prepare('SELECT COUNT(*) AS n FROM departments WHERE slug = ?').get(deptSlug) as { n: number }
+    expect(deptCount.n).toBe(1)
+    const squadCount = harness.sqlite
+      .prepare('SELECT COUNT(*) AS n FROM squads WHERE slug = ?').get(squadSlug) as { n: number }
+    expect(squadCount.n).toBe(1)
+  })
+
+  it('a batch failure AFTER adopting a prior dept/squad does NOT delete the adopted rows', async () => {
+    const env = envFor(harness)
+    const deptSlug = `dept-home-${HUMAN}`
+    const squadSlug = `home-${HUMAN}`
+    const deptRes = await createDepartment(env, { slug: deptSlug, name: 'Home — Aria', kind: 'home' })
+    if (!deptRes.ok) throw new Error('setup failed')
+    const squadRes = await createSquad(env, deptRes.value.id, { slug: squadSlug, name: 'Home — Aria', kind: 'home' })
+    if (!squadRes.ok) throw new Error('setup failed')
+
+    const depsWithFailingMintPrepare: BootstrapSelfDeps = {
+      ...defaultBootstrapSelfDeps(),
+      prepareAgentBoundTokenMint: async () => {
+        throw new Error('simulated mint-prepare failure')
+      },
+    }
+    const out = await bootstrapSelf(env, unboundDirectoryAuth(), 'Aria', depsWithFailingMintPrepare)
+    expect(out.ok).toBe(false)
+
+    // The ADOPTED department/squad from the prior attempt must survive — they
+    // were never created by THIS call, so compensateCreatedRows must never
+    // touch them.
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM departments').get()!.n).toBe(1)
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM squads').get()!.n).toBe(1)
+    expect(
+      harness.sqlite.prepare('SELECT id FROM departments WHERE slug = ?').get(deptSlug),
+    ).toBeTruthy()
+  })
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// 9. P0-N1 — home containers are exempt from plan-limit counters
+//    (river ruling rul-2026-08-11-bootstrap-self, addendum C)
+// ════════════════════════════════════════════════════════════════════════════
+describe('P0-N1: a fresh free-tier pot admits MANY humans via bootstrap_self, not one', () => {
+  it('at least 3 distinct humans succeed on a fresh (unconfigured -> free) pot', async () => {
+    const env = envFor(harness)
+    // No billing_state row is seeded -> resolveTier fails closed to 'free'
+    // (maxSquads:1, maxAgents:2 — see src/billing/plans.ts). Before P0-N1, the
+    // SECOND human here got squad_limit_reached (1 existing squad -> 1+1=2 > 1).
+    const humans = [HUMAN, 'human-b', 'human-c']
+    for (const h of humans) if (h !== HUMAN) seedHuman(harness.sqlite, h)
+
+    const results = []
+    for (const h of humans) {
+      results.push(await bootstrapSelf(env, unboundDirectoryAuth(h), `Agent-${h}`))
+    }
+    const succeeded = results.filter((r) => r.ok)
+    expect(succeeded.length).toBeGreaterThanOrEqual(3)
+
+    // Each human got their OWN distinct home department/squad/agent.
+    const squadIds = new Set(succeeded.map((r) => (r as { squad: { id: string } }).squad.id))
+    expect(squadIds.size).toBe(3)
+  })
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// 10. LOW-4 — slug length at the REAL 48-char cap boundary
+// ════════════════════════════════════════════════════════════════════════════
+describe('LOW-4: slugs stay within the 48-char cap for a REAL UUID-length member id', () => {
+  it('dept-home-<uuid> (46 chars) / home-<uuid> (41) / self-<uuid> (41) all validate and succeed', async () => {
+    // findOrCreateMember always mints a real crypto.randomUUID() (36 chars) —
+    // the existing suite's HUMAN = 'member-human-1' (14 chars) never exercises
+    // "dept-home-" (10 chars) + a real UUID = 46 chars against the 48-char cap
+    // (src/org/service.ts's isValidSlug). This test uses a real UUID shape.
+    const realUuidMember = crypto.randomUUID()
+    expect(realUuidMember.length).toBe(36)
+    seedHuman(harness.sqlite, realUuidMember)
+    const env = envFor(harness)
+    const out = await bootstrapSelf(env, unboundDirectoryAuth(realUuidMember), 'Aria')
+    expect(out.ok).toBe(true)
+    if (!out.ok) throw new Error(`expected success, got: ${JSON.stringify(out)}`)
+    expect(out.department.slug).toBe(`dept-home-${realUuidMember}`)
+    expect(out.department.slug.length).toBe(46)
+    expect(out.squad.slug.length).toBeLessThanOrEqual(48)
+    expect(out.agent.slug.length).toBeLessThanOrEqual(48)
   })
 })
