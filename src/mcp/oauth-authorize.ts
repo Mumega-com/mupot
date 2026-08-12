@@ -26,6 +26,7 @@
 import type { Env, AuthContext, Capability, CapabilityGrant, CapabilityScopeType, ConnectionChannel } from '../types'
 import { resolveCapabilities, canOnSquad, hasCapability, capabilityRank } from '../auth/capability'
 import { sha256Hex, mintRawToken, resolveAgentMemberBinding } from '../members/service'
+import { redactSecretPatterns } from '../lib/redact'
 
 // ── OAuth props stored via completeAuthorization ─────────────────────────────
 // Encrypted by the library; read back via resolveExternalToken.
@@ -985,7 +986,7 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     try {
       memberId = await findOrCreateMember(env, googleUser.email, googleUser.name)
     } catch (err) {
-      console.error('[oauth-authorize] member find-or-create failed:', err)
+      console.error('[oauth-authorize] member find-or-create failed:', redactSecretPatterns(err instanceof Error ? err.message : String(err)))
       return new Response('Member provisioning failed', { status: 500 })
     }
 
@@ -1008,7 +1009,7 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     try {
       agents = await listConsentableAgents(env, memberId)
     } catch (err) {
-      console.error('[oauth-authorize] listConsentableAgents failed:', err)
+      console.error('[oauth-authorize] listConsentableAgents failed:', redactSecretPatterns(err instanceof Error ? err.message : String(err)))
       // Fail closed on the LISTING, not on the flow: an admin/D1 hiccup here must not
       // block a legitimate unbound connection. Render the screen with no agent
       // choices — "continue unbound" (today's exact default) is still available.
@@ -1181,7 +1182,7 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       )
       tokenId = minted.tokenId
     } catch (err) {
-      console.error('[oauth-authorize] token mint failed:', err)
+      console.error('[oauth-authorize] token mint failed:', redactSecretPatterns(err instanceof Error ? err.message : String(err)))
       return new Response('Token mint failed', { status: 500 })
     }
 
@@ -1201,7 +1202,7 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
            VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))`,
         ).bind(crypto.randomUUID(), env.TENANT_SLUG, tokenId, pending.memberId, boundAgentId, mintMemberId).run()
       } catch (err) {
-        console.error('[oauth-authorize] consent receipt write failed (non-fatal):', err)
+        console.error('[oauth-authorize] consent receipt write failed (non-fatal):', redactSecretPatterns(err instanceof Error ? err.message : String(err)))
       }
     }
 
@@ -1242,7 +1243,7 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       })
       redirectTo = result.redirectTo
     } catch (err) {
-      console.error('[oauth-authorize] completeAuthorization failed:', err)
+      console.error('[oauth-authorize] completeAuthorization failed:', redactSecretPatterns(err instanceof Error ? err.message : String(err)))
       return new Response('OAuth completion failed', { status: 500 })
     }
 

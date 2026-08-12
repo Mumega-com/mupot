@@ -22,6 +22,7 @@
 
 import { Hono } from 'hono'
 import type { Env } from '../types'
+import { timingSafeEqual } from '../lib/timing-safe-equal'
 import { createTask } from '../tasks/service'
 import { findByEmail, setProspectStatus } from '../loops/prospects'
 import type { ProspectStatus } from '../loops/prospects'
@@ -42,25 +43,6 @@ function ghlRouteEnv(env: Env): GHLRouteEnv {
 }
 
 export const GHL_INBOUND_MAX_BODY_BYTES = 256 * 1024
-
-// ── Constant-time comparison ──────────────────────────────────────────────────
-//
-// timingSafeEqual is the canonical approach (Web Crypto TextEncoder → ArrayBuffer).
-// We compare byte-by-byte with a running XOR so there is no early exit.
-// Both arguments must be the same length — we pad/compare lengths separately
-// (length comparison leaks length, but the HMAC is fixed-length so this is fine).
-
-function timingSafeEqual(a: string, b: string): boolean {
-  const enc = new TextEncoder()
-  const ab = enc.encode(a)
-  const bb = enc.encode(b)
-  if (ab.length !== bb.length) return false
-  let diff = 0
-  for (let i = 0; i < ab.length; i++) {
-    diff |= (ab[i] ?? 0) ^ (bb[i] ?? 0)
-  }
-  return diff === 0
-}
 
 // ── HMAC-SHA256 computation ───────────────────────────────────────────────────
 

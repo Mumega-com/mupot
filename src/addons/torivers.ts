@@ -5,6 +5,7 @@
 
 import { Hono } from 'hono'
 import type { Env } from '../types'
+import { redactSecretPatterns } from '../lib/redact'
 
 export const toriversAddonApp = new Hono<{ Bindings: Env }>()
 
@@ -104,7 +105,7 @@ toriversAddonApp.post('/workflows/execute', async (c) => {
       },
     })
   } catch (error) {
-    console.error('[torivers:execute-error]', error)
+    console.error('[torivers:execute-error]', redactSecretPatterns(error instanceof Error ? error.message : String(error)))
     return c.json({ ok: false, error: 'Internal Server Error in ToRivers execution engine' }, 500)
   }
 })
@@ -135,7 +136,7 @@ toriversAddonApp.post('/credentials/match', async (c) => {
       matches,
     })
   } catch (error) {
-    console.error('[torivers:credential-match-error]', error)
+    console.error('[torivers:credential-match-error]', redactSecretPatterns(error instanceof Error ? error.message : String(error)))
     return c.json({ ok: false, error: 'Internal Server Error in credential matching' }, 500)
   }
 })
