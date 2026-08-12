@@ -133,12 +133,19 @@ export interface MetricsPort {
 
 export interface AuditPort {
   /**
-   * Write an audit event. Capability-checked + tenant-bound.
+   * Write an audit event. Capability-checked (member floor) + tenant/dept-bound.
    *
-   * TODO(full-impl): write to the audit log table with ctx.tenantId + ctx.departmentKey.
-   * Shape is the contract; enforcement is ctx-first + capability-checked.
+   * Persists a row to department_audit (migration 0095) with ctx.tenantId +
+   * ctx.departmentKey. actor defaults to { type: 'system' }; a caller that holds
+   * identity may pass actor explicitly. Fail-closed: capability denial throws
+   * CtxError 'capability_denied'; a DB write failure propagates (a lost audit
+   * row is worse than a silent drop — the pre-0095 behavior was `void event`).
    */
-  write(event: { action: string; payload?: unknown }): Promise<void>
+  write(event: {
+    action: string
+    payload?: unknown
+    actor?: { type: 'system' | 'agent' | 'user'; id?: string }
+  }): Promise<void>
 }
 
 export interface GatePort {
@@ -153,10 +160,13 @@ export interface GatePort {
 
 export interface BusPort {
   /**
-   * Publish a bus message. Tenant-bound + capability-checked.
+   * Publish a bus message. Capability-checked (member floor) + tenant/dept-bound.
    *
-   * TODO(full-impl): publish via the CF Queue binding with ctx.tenantId envelope.
-   * Shape is the contract; enforcement is ctx-first + capability-checked.
+   * Persists a row to department_outbox (migration 0095, flight_event_outbox
+   * pattern) — the durable bus message. A queue producer drains delivered_at
+   * IS NULL rows into the mupot-events queue. Fail-closed: capability denial
+   * throws CtxError 'capability_denied'; payload must be JSON-serializable
+   * (the outbox CHECK enforces json_valid).
    */
   publish(msg: { type: string; payload?: unknown }): Promise<void>
 }
