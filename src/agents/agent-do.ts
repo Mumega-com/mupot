@@ -211,8 +211,29 @@ export class AgentDO extends DurableObject<Env> {
         } else {
           await this.ensureAlarm()
         }
-        // obs?.escalate → TODO: emit a single operator notification via approval/notification
-        // seam. Surface: return it in the result for now; S3 wires the actual emit.
+        // obs?.escalate → emit ONE operator-facing task via the existing createTask
+        // seam (same path the cortex propose-cycle uses). The observer dedupes on
+        // ESCALATION_COOLDOWN_MS, so this fires at most once per stuck state —
+        // not once per tick. gate_owner marks it for operator attention.
+        if (obs?.escalate) {
+          try {
+            await createTask(
+              this.env,
+              {
+                squad_id: agent.squad_id,
+                title: `ESCALATION: agent ${agent.slug} stuck`,
+                body: `Agent ${agent.slug} (${agent.id}) crossed the stuck threshold.\nReason: ${obs.reason ?? 'unknown'}\nCycle: ${cycle}`,
+                done_when: '(operator resolves — set via task update)',
+                gate_owner: 'gate:escalation',
+              },
+              { actor: { kind: 'agent', id: agent.id } },
+            )
+          } catch (emitErr) {
+            // A failed escalation emit must not kill the goal cycle — record and
+            // continue (the next tick re-emits after the cooldown).
+            this.recordCycle(cycle, `escalation-emit-failed: ${emitErr instanceof Error ? emitErr.message : 'err'}`)
+          }
+        }
 
         return {
           ok: goalResult.ok,
