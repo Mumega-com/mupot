@@ -343,19 +343,35 @@ export async function landGovernedFlight(
     )
   // SEQUENTIAL, NOT BATCHED (#916). The previous version put the transition and this
   // INSERT in one env.DB.batch(), and the INSERT read back the row the transition had
-  // just written (`SELECT ... FROM flights WHERE status='landed' AND ended_at=?`). On
-  // production D1 that read does NOT see the preceding statement's write, so the insert
-  // matched zero rows on every single land: the flight transitioned, no receipt was ever
-  // written, and the function returned false — telling the caller a successful land had
-  // failed. Two live flights (b4126c91, ab98f1d1) reproduced it minutes apart.
+  // just written (`SELECT ... FROM flights WHERE status='landed' AND ended_at=?`).
   //
-  // It could not be caught locally: tests/helpers/sqlite-d1.ts implements batch() as
-  // BEGIN IMMEDIATE + sequential execute + COMMIT, and real SQLite *does* read its own
-  // writes inside a transaction. The helper is more transactional than the platform.
+  // WHAT WAS ACTUALLY OBSERVED, and it is narrower than this comment used to claim: two
+  // live flights (b4126c91, ab98f1d1) landed and the caller got a 409. That is all that
+  // was ever observed.
   //
-  // So the rule this encodes: never read back your own write inside a batch. Awaiting the
-  // statements separately is the fix — read-your-writes holds ACROSS calls, just not
-  // within one batch.
+  // WHAT WAS INFERRED AND IS FALSE: that no receipt row was written. It was written. Both
+  // rows exist in flight_event_outbox and BOTH WERE DELIVERED by the maintenance cron
+  // roughly six minutes after landing, with created_at matching each flight's ended_at to
+  // the millisecond — so this INSERT ran in the same batch as the transition and
+  // COMMITTED. Verified against production D1 on 2026-08-12.
+  //
+  // The "missing receipt" was inferred from `outboxResult.meta?.changes !== 1` and then
+  // treated as a fact. meta.changes misreported; everything downstream inherited it. An
+  // entire 46-site audit (mupot#919), a strict-mode test harness, PR #927 and a fleet-wide
+  // migration deadline were built on a phenomenon that never occurred. All withdrawn.
+  //
+  // A LIVE CANDIDATE for why meta.changes was wrong, still inferred rather than proven:
+  // migrations/0059 defines flight_event_outbox_project_hydrate_insert, an AFTER INSERT
+  // trigger that UPDATEs this same table. SQLite's total_changes counts trigger-program
+  // rows; changes() does not. If D1 derives meta.changes from a total-changes delta, every
+  // insert here reports 2 and `=== 1` can never pass. One staging insert settles it.
+  //
+  // SO WHY IS THIS STILL SEQUENTIAL? Not because of any same-batch read behaviour — that
+  // premise is retracted and the phenomenon it explained did not happen. It is sequential
+  // because deciding success from RETURNING rows requires awaiting this statement on its
+  // own, and because not trusting meta.changes is correct regardless of which mechanism
+  // broke it. Do not re-batch these to "optimise": the win is nil and the success test
+  // below depends on the split.
   // Decide from the RETURNING rows, NOT from meta.changes. Adversarial review caught the
   // first draft reading `meta.changes` off `.all()` of a RETURNING write — an unverified
   // platform behaviour of exactly the class that caused #916, and one no local harness can
@@ -409,9 +425,15 @@ export async function landGovernedFlight(
     })
   }
 
-  // Also sequential, and for the same reason: this statement SUMs flights.cost_micro_usd,
-  // which the transition above had just set. Inside the batch it summed the pre-update
-  // value, so every routine run's rolled-up cost was silently computed from stale rows.
+  // Also sequential. NOTE the claim that used to be here — that inside the batch this SUM
+  // read pre-update values, so every routine run's rolled-up cost was silently wrong — was
+  // never independently observed. It was asserted by analogy to the receipt INSERT above,
+  // whose own "missing row" turned out to be false (see the note there). Treat stale-SUM
+  // as UNVERIFIED, not as a known past defect.
+  //
+  // Kept sequential anyway: it costs nothing, and a statement that reads a value an
+  // earlier statement wrote is worth isolating on its own merits rather than on a
+  // mechanism nobody has established.
   if (opts.meta.routine_run_id) {
     try {
       await routineCostAggregationStatement(env, id, createdAt).run()

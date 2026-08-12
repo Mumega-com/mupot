@@ -77,11 +77,17 @@ function loseActionClaim(env: Env, fixture: ReadyRoutineFixture): Env {
 }
 
 // #916: the governed landing is no longer issued inside env.DB.batch() — the transition
-// and the receipt insert are separate awaited statements now, because on production D1 a
-// statement in a batch cannot see the write of the statement before it. The race this
-// helper models (a child Flight landing while the control Flight is mid-land) is still
-// real; only the injection point moved. Hook the prepared statement itself so the
-// injection fires wherever the landing is issued from, rather than assuming a batch.
+// and the receipt insert are separate awaited statements now.
+// [mupot#919, RETRACTED] This comment used to give a reason stated as fact: "on
+// production D1 a statement in a batch cannot see the write of the statement before it."
+// That mechanism claim is retracted — unverified for a plain SELECT/INSERT; see the
+// retraction note in tests/flight-land-receipt-916.test.ts for what is and isn't proven.
+// The fix (separate awaited statements) stands regardless of the mechanism: it removes
+// any dependency on same-batch read visibility, whichever way that visibility goes.
+// The race this helper models (a child Flight landing while the control Flight is
+// mid-land) is still real; only the injection point moved. Hook the prepared statement
+// itself so the injection fires wherever the landing is issued from, rather than
+// assuming a batch.
 function landChildBeforeControlFlight(env: Env, fixture: ReadyRoutineFixture): Env {
   const db = env.DB
   let injected = false

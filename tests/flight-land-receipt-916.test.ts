@@ -3,17 +3,27 @@
 //
 // The production defect: landGovernedFlight put the transition and the outbox INSERT in
 // one env.DB.batch(), and the INSERT read back the row the transition had just written
-// (`SELECT ... FROM flights WHERE status='landed' AND ended_at=?`). On D1 that read does
-// not observe the preceding statement, so the insert matched zero rows on EVERY land —
-// the flight transitioned, no receipt was written, and the function returned false.
-// Callers translated that false into 409 flight_transition_conflict, i.e. they told the
-// agent a successful landing had failed.
+// (`SELECT ... FROM flights WHERE status='landed' AND ended_at=?`). In production that
+// INSERT matched zero rows on EVERY land — the flight transitioned, no receipt was
+// written, and the function returned false. Callers translated that false into 409
+// flight_transition_conflict, i.e. they told the agent a successful landing had failed.
+//
+// [mupot#919, RETRACTED] This comment used to state a mechanism for that symptom as
+// fact: "on D1 that read does not observe the preceding statement" (and, further down,
+// that "real SQLite DOES read its own writes ... the helper is more transactional than
+// the platform"). Both are retracted. Neither was independently verified — they were
+// inferred from the symptom above. What IS verified on this production D1 (from an
+// unrelated migration-0071 trigger, src/members/service.ts) is that a BEFORE INSERT
+// trigger's WHEN clause CAN see an earlier statement's write inside the same batch —
+// which does not settle what a plain SELECT/INSERT...SELECT does, in either direction.
+// The observed symptom (zero rows, twice, in production) is real; the explanation for
+// why is open.
 //
 // This could not be caught by the existing suite: tests/helpers/sqlite-d1.ts implements
-// batch() as BEGIN IMMEDIATE + sequential execute + COMMIT, and real SQLite DOES read its
-// own writes inside a transaction. The helper is more transactional than the platform it
-// stands in for. The first test below therefore models the platform explicitly rather
-// than trusting the helper.
+// batch() as BEGIN IMMEDIATE + sequential execute + COMMIT, so it could not reproduce
+// whatever production's same-batch read behaviour actually is. The REGRESSION test below
+// does not attempt to model that behaviour — it locks in the fix's actual invariant: the
+// transition and the receipt insert are never issued through db.batch() at all.
 import { describe, expect, it } from 'vitest'
 
 import { landGovernedFlight } from '../src/flight/service'
@@ -84,12 +94,14 @@ describe('#916 governed landing writes its receipt', () => {
     expect(payload.score).toBe(0.9)
   })
 
-  it('REGRESSION: the receipt write must not read back its own transition', async () => {
-    // Model the platform, not the helper. This D1 wrapper makes any statement inside a
-    // batch() observe only the state as it was BEFORE the batch began — which is what
-    // production D1 did to the original implementation. Under the old batched code the
-    // outbox SELECT finds nothing here and the receipt is silently lost; under the fix
-    // there is nothing to lose, because the insert no longer reads back its own write.
+  it('REGRESSION: the transition and receipt write are never issued through batch()', async () => {
+    // This wrapper does not model any particular same-batch read behaviour — see the
+    // retraction note at the top of this file for why that would be unverifiable either
+    // way. It simply makes db.batch() throw if called at all. That is the actual
+    // invariant #916's fix established: the transition and the receipt INSERT are
+    // separate awaited statements, never bundled into one batch(), so this test locks in
+    // the fix regardless of what the (unconfirmed) mechanism for the original symptom
+    // turns out to be.
     const { env } = fixture()
     const real = env.DB
     let batchCalls = 0
