@@ -369,3 +369,4 @@ fleetAttachApp.post('/detach', async (c) => {
 
   return c.json({ ok: true })
 })
+// lane A: runtime-reported model — reported-truth discipline (gate-protocol v2 App A).
