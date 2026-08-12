@@ -6,6 +6,7 @@ import {
   claudeCodeSnippet,
   codexSnippet,
   cursorSnippet,
+  grokSnippet,
   mcpServerKey,
   wakeContractForAgent,
 } from '../src/dashboard/connect'
@@ -94,6 +95,21 @@ describe('codexSnippet', () => {
 describe('cursorSnippet', () => {
   it('produces streamable HTTP JSON with a placeholder token', () => {
     const snippet = cursorSnippet('acme', 'https://pot.example.com')
+    const parsed = JSON.parse(snippet) as {
+      mcpServers: Record<string, { type: string; url: string; headers: Record<string, string> }>
+    }
+    expect(parsed.mcpServers.acme).toEqual({
+      type: 'http',
+      url: 'https://pot.example.com/mcp',
+      headers: { Authorization: 'Bearer <MEMBER_TOKEN>' },
+    })
+    expect(snippet).not.toContain('mupot_')
+  })
+})
+
+describe('grokSnippet', () => {
+  it('produces streamable HTTP JSON with a placeholder token', () => {
+    const snippet = grokSnippet('acme', 'https://pot.example.com')
     const parsed = JSON.parse(snippet) as {
       mcpServers: Record<string, { type: string; url: string; headers: Record<string, string> }>
     }
