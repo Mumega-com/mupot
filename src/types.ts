@@ -250,10 +250,18 @@ export function isBudgetWindow(v: unknown): v is BudgetWindow {
   return typeof v === 'string' && (BUDGET_WINDOWS as readonly string[]).includes(v)
 }
 
+// OrgKind (migration 0093, mupot#925 P0-N1): 'work' (default, counted against
+// PLAN_LIMITS) vs 'home' (bootstrap_self's per-human identity container —
+// structurally exempt from every plan counter; see src/billing/plans.ts and
+// src/org/service.ts). Declared here (not just in org/service.ts) so Department/
+// Squad/Agent — read anywhere in the codebase — carry the real column.
+export type OrgKind = 'work' | 'home'
+
 export interface Department {
   id: string
   slug: string
   name: string
+  kind: OrgKind
   created_at: string
 }
 
@@ -263,6 +271,7 @@ export interface Squad {
   slug: string
   name: string
   charter: string | null // the squad's culture/mandate — tenant-authored
+  kind: OrgKind
   // work-unit fields (0009_work_unit.sql)
   role: string | null           // accountability line for the squad
   okr: string | null
@@ -283,6 +292,7 @@ export interface Agent {
   role: string // tenant-defined role label
   model: string // e.g. "@cf/meta/llama-3.3" | "gemini-2.5-flash"
   status: 'active' | 'paused'
+  kind: OrgKind
   // work-unit fields (0009_work_unit.sql)
   okr: string | null
   kpi_target: string | null

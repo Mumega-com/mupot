@@ -87,6 +87,7 @@ import {
 import { recordCheckin, sqliteUtcToMs } from '../fleet/presence'
 import { agentKeyFingerprint, loadActiveAgentKey } from '../fleet/agent-keys'
 import { PROVISION_TOOLS } from './provision'
+import { BOOTSTRAP_TOOLS } from './bootstrap'
 import { PROJECT_TOOLS, readAccess, readableProject } from './projects'
 import { hasProjectWriteForSquads, anySquadHasProjectWrite } from '../projects/access'
 import { ADDON_TOOLS } from './addons'
@@ -3254,6 +3255,7 @@ export const TOOLS: ToolSpec[] = [
   toolConnect,
   ...PROJECT_TOOLS,
   ...PROVISION_TOOLS,
+  ...BOOTSTRAP_TOOLS,
   ...ADDON_TOOLS,
   ...GATE_GRANT_TOOLS,
   ...LOOP_TOOLS,

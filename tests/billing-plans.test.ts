@@ -59,6 +59,18 @@ describe('numeric limits', () => {
     expect(withinLimit('scale', 'maxAgents', 9_999)).toBe(true)
     expect(withinLimit('scale', 'monthlyModelBudgetMicroUsd', Number.MAX_SAFE_INTEGER)).toBe(true)
   })
+  // mupot#925 P0-N1: maxDepartments did not exist before this — createDepartment
+  // had no gate at all. Values follow the same ~2-squads-per-department ratio
+  // maxSquads already implies (see the PLAN_LIMITS doc comment).
+  it('maxDepartments ceilings ascend with tier and follow the maxSquads ratio', () => {
+    expect(withinLimit('free', 'maxDepartments', 1)).toBe(true)
+    expect(withinLimit('free', 'maxDepartments', 2)).toBe(false)
+    expect(withinLimit('starter', 'maxDepartments', 2)).toBe(true)
+    expect(withinLimit('starter', 'maxDepartments', 3)).toBe(false)
+    expect(withinLimit('pro', 'maxDepartments', 5)).toBe(true)
+    expect(withinLimit('pro', 'maxDepartments', 6)).toBe(false)
+    expect(withinLimit('scale', 'maxDepartments', 9_999)).toBe(true)
+  })
 })
 
 describe('entitlement snapshot', () => {
