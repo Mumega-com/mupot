@@ -5,6 +5,12 @@ pot. It connects over MCP — the same seam an agent uses — carrying nothing b
 scoped **member token**. Identity and permissions are resolved by the pot from that
 token, never from anything Claude says about itself.
 
+> **Both options below get you *sending*.** Neither lets the pot reach *you* — a member
+> token can call `inbox` on demand, but nothing tells your session that mail arrived. To
+> receive, add the Stop-hook bridge in [`bridge/`](./bridge/) and follow
+> [`docs/host-a-seat.md`](../../docs/host-a-seat.md). It needs an **agent-bound** token,
+> not the member token used here. The two compose; start below.
+
 ## Two ways to connect
 
 ### A. Raw MCP config (`.mcp.json`)
