@@ -1515,7 +1515,14 @@ const toolFlightDispatch: ToolSpec = {
   name: 'flight_dispatch',
   scope: 'squad',
   min: 'member',
-  args: '{ squad_id: string, project_id?: string|null, goal: string, meta_json: string, signals_json: string, budget_micro_usd?: number }',
+  args: '{ squad_id: string, project_id?: string|null, goal: string, meta_json: string, '
+    + 'signals_json: string (JSON object — camelCase or snake_case, both accepted; ALL 8 fields '
+    + 'required, unknown keys refused: contextComplete/context_complete: boolean, '
+    + 'toolsReachable/tools_reachable: boolean, budgetRemainingMicroUsd/budget_remaining_micro_usd: number, '
+    + 'budgetEstimateMicroUsd/budget_estimate_micro_usd: number, recentProgress/recent_progress: number 0..1, '
+    + 'progressPerStep/progress_per_step: number 0..1, wastePerStep/waste_per_step: number 0..1, '
+    + 'stepSeconds/step_seconds: number), budget_micro_usd?: number, '
+    + 'executor_agent_id?: string (who FLIES the flight, if not the caller — requires lead on the executor\'s squad) }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -1525,6 +1532,7 @@ const toolFlightDispatch: ToolSpec = {
       meta_json: STRING_SCHEMA,
       signals_json: STRING_SCHEMA,
       budget_micro_usd: OPTIONAL_NUMBER_SCHEMA,
+      executor_agent_id: STRING_SCHEMA,
     },
     required: ['squad_id', 'goal', 'meta_json', 'signals_json'],
     additionalProperties: false,
@@ -1547,9 +1555,30 @@ const toolFlightDispatch: ToolSpec = {
     const grants = auth.capabilities ?? []
     const workspaceAdmin = hasWorkspaceAdmin(auth)
 
+    // executor delegation (mupot flight_dispatch executor-delegation defect): the
+    // caller (auth.boundAgentId) is always the DISPATCHER; the EXECUTOR — who
+    // flies the flight, whose seat the work envelope lands on, whose budget the
+    // flight spends against execute.ts's meter — defaults to the dispatcher but
+    // may be a DIFFERENT agent. Delegating causes work to appear under another
+    // agent's identity and consume their budget, so it is gated exactly like
+    // wake_agent gates "make another agent act": lead+ on the EXECUTOR's own
+    // squad (src/mcp/index.ts's toolWakeAgent) — not merely membership on the
+    // flight's squads, and no executor consent is required or sought, matching
+    // wake_agent's posture. Omitting executor_agent_id is a no-op: executor ===
+    // dispatcher, byte-identical to pre-delegation behaviour.
+    const executorAgentId = args.executor_agent_id == null ? boundAgent.id : str(args.executor_agent_id)
+    if (!executorAgentId) return fail(400, 'invalid_args', 'executor_agent_id must not be blank')
+    const isDelegated = executorAgentId !== boundAgent.id
+    const executorAgent = isDelegated ? await loadAgent(env, executorAgentId) : boundAgent
+    if (!executorAgent) return fail(404, 'executor_agent_not_found')
+    if (executorAgent.status !== 'active') return fail(409, 'executor_agent_inactive')
+    if (isDelegated && !workspaceAdmin && !(await memberCanOnSquad(env, grants, executorAgent.squad_id, 'lead'))) {
+      return fail(403, 'flight_delegation_forbidden', { need: 'lead', scope: 'squad', squad_id: executorAgent.squad_id })
+    }
+
     const meta = parseFlightMetaV1(parseJsonArg(args.meta_json))
     if (!meta || !meta.squad_ids.includes(squad.id)) return fail(400, 'invalid_flight_meta')
-    if (!meta.squad_ids.includes(boundAgent.squad_id)) return fail(400, 'agent_squad_not_in_flight')
+    if (!meta.squad_ids.includes(executorAgent.squad_id)) return fail(400, 'agent_squad_not_in_flight')
     const referencedSquads = await loadFlightSquads(env, meta.squad_ids)
     if (referencedSquads.length !== meta.squad_ids.length) return fail(403, 'forbidden')
     const requiredCapability: Capability = (requestedBudget as number) > 0 ? 'lead' : 'member'
@@ -1585,7 +1614,13 @@ const toolFlightDispatch: ToolSpec = {
 
     let budgetCeilingMicroUsd = 0
     if ((requestedBudget as number) > 0) {
-      const caps = [boundAgent.budget_cap_cents, ...referencedSquads.map((item) => item.budget_cap_cents)]
+      // The EXECUTOR's cap governs, not the dispatcher's: execute.ts's meter
+      // (checkAndReserve) enforces agents.budget_cap_cents keyed to the agent
+      // whose Durable Object actually runs the cycle — i.e. the executor. When
+      // executor === dispatcher (the non-delegated, default case) this is the
+      // exact same value as before; behaviour is unchanged for every existing
+      // caller.
+      const caps = [executorAgent.budget_cap_cents, ...referencedSquads.map((item) => item.budget_cap_cents)]
       if (caps.some((cap) => typeof cap !== 'number' || !Number.isSafeInteger(cap) || cap <= 0)) {
         return fail(409, 'flight_budget_policy_missing')
       }
@@ -1603,7 +1638,12 @@ const toolFlightDispatch: ToolSpec = {
     }
     const signals = parseJsonArg(args.signals_json)
     const parsed = parseDispatchBody({
-      agent: auth.boundAgentId,
+      agent: executorAgentId,
+      // Always recorded, delegated or not (see flights.dispatched_by_agent_id /
+      // 0094_flight_dispatched_by.sql): flight.agent stays the EXECUTOR, never
+      // silently overwritten to "tidy" the record — both facts must be
+      // independently recoverable from the row.
+      dispatched_by: auth.boundAgentId,
       goal,
       project_id: projectId,
       trigger_source: 'api',
@@ -1611,7 +1651,7 @@ const toolFlightDispatch: ToolSpec = {
       meta,
       signals,
     })
-    if (!parsed.ok) return fail(400, parsed.error)
+    if (!parsed.ok) return fail(400, parsed.error, parsed.detail)
     parsed.value.signals.budgetEstimateMicroUsd = requestedBudget as number
     parsed.value.signals.budgetRemainingMicroUsd = budgetCeilingMicroUsd
 

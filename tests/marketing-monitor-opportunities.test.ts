@@ -57,6 +57,7 @@ const migrations = [
   '../migrations/0054_marketing_recommendations.sql',
   '../migrations/0055_projects.sql',
   '../migrations/0064_marketing_recommendation_channel_kinds.sql',
+  '../migrations/0094_flight_dispatched_by.sql',
 ].map((path) => readFileSync(new URL(path, import.meta.url), 'utf8'))
 
 const owner = { id: 'owner-1', role: 'owner' as const }

@@ -54,17 +54,108 @@ function asStr(v: unknown, max: number): string {
 }
 
 export interface DispatchBody {
-  flight: { agent: string; goal: string; project_id?: string | null; trigger_source?: TriggerSource; budget_micro_usd?: number; meta?: FlightMetaV1 }
+  flight: {
+    agent: string
+    dispatched_by?: string
+    goal: string
+    project_id?: string | null
+    trigger_source?: TriggerSource
+    budget_micro_usd?: number
+    meta?: FlightMetaV1
+  }
   signals: FlightSignals
   opts: PreflightOptions
+}
+
+export interface DispatchParseError {
+  ok: false
+  error: string
+  /** Structured detail for the specific error (e.g. which key was unrecognised or missing). */
+  detail?: unknown
+}
+
+// ── signals_json casing (mupot#940) ─────────────────────────────────────────
+//
+// The tool's args string never documented signals_json's shape, and meta_json in
+// the SAME call uses snake_case — so snake_case is the natural guess, and it was
+// silently wrong: an unrecognised key just read as `undefined`, coerced to a
+// falsy default, and the readiness gate scored the (missing) input as if it had
+// been CHECKED and found bad — 'tools_unreachable' when the truth was "you never
+// told me". See docs on FlightSignals (preflight.ts) for the canonical
+// (camelCase) field set. Fixed here, in priority order:
+//   1. accept EITHER casing (normalise before scoring) — cheapest, kills the class
+//   2. documented in the tool's args string (src/mcp/index.ts)
+//   3. an unrecognised key is refused LOUDLY (signals_unknown_key), never scored
+//   4. a MISSING key is refused LOUDLY (signals_missing_fields), never defaulted
+//      into a "checked and failed" reason — that distinction is the actual fix;
+//      1-3 just make the failure mode easy to find in seconds instead of an hour.
+const SIGNAL_FIELD_ALIASES: ReadonlyArray<{ canonical: keyof FlightSignals; camel: string; snake: string }> = [
+  { canonical: 'contextComplete', camel: 'contextComplete', snake: 'context_complete' },
+  { canonical: 'toolsReachable', camel: 'toolsReachable', snake: 'tools_reachable' },
+  { canonical: 'budgetRemainingMicroUsd', camel: 'budgetRemainingMicroUsd', snake: 'budget_remaining_micro_usd' },
+  { canonical: 'budgetEstimateMicroUsd', camel: 'budgetEstimateMicroUsd', snake: 'budget_estimate_micro_usd' },
+  { canonical: 'recentProgress', camel: 'recentProgress', snake: 'recent_progress' },
+  { canonical: 'progressPerStep', camel: 'progressPerStep', snake: 'progress_per_step' },
+  { canonical: 'wastePerStep', camel: 'wastePerStep', snake: 'waste_per_step' },
+  { canonical: 'stepSeconds', camel: 'stepSeconds', snake: 'step_seconds' },
+]
+const SIGNAL_KEY_ALLOWLIST: ReadonlySet<string> = new Set(
+  SIGNAL_FIELD_ALIASES.flatMap((f) => [f.camel, f.snake]),
+)
+
+/**
+ * Normalise a signals object that may use either camelCase or snake_case keys
+ * (mupot#940). Refuses (rather than silently drops) any key outside the known
+ * camel/snake alias set, and refuses (rather than defaults) any of the 8
+ * required fields that is absent under BOTH spellings — a MISSING signal is a
+ * caller mistake, not evidence the thing it describes was checked and failed.
+ */
+function normalizeSignalsInput(s: Record<string, unknown>): { ok: true; value: FlightSignals } | DispatchParseError {
+  for (const key of Object.keys(s)) {
+    if (!SIGNAL_KEY_ALLOWLIST.has(key)) {
+      return { ok: false, error: 'signals_unknown_key', detail: { key } }
+    }
+  }
+
+  const missing: string[] = []
+  const raw: Record<string, unknown> = {}
+  for (const field of SIGNAL_FIELD_ALIASES) {
+    // Both spellings present is treated as caller redundancy, not conflict —
+    // prefer camelCase (the documented canonical form) when both are given.
+    if (field.camel in s) {
+      raw[field.canonical] = s[field.camel]
+    } else if (field.snake in s) {
+      raw[field.canonical] = s[field.snake]
+    } else {
+      missing.push(field.canonical)
+    }
+  }
+  if (missing.length > 0) {
+    return { ok: false, error: 'signals_missing_fields', detail: { missing } }
+  }
+
+  return {
+    ok: true,
+    value: {
+      contextComplete: asBool(raw.contextComplete),
+      toolsReachable: asBool(raw.toolsReachable),
+      budgetRemainingMicroUsd: asNum(raw.budgetRemainingMicroUsd, 0, 0),
+      budgetEstimateMicroUsd: asNum(raw.budgetEstimateMicroUsd, 0, 0),
+      recentProgress: asNum(raw.recentProgress, 0, 0, 1),
+      progressPerStep: asNum(raw.progressPerStep, 0, 0, 1),
+      wastePerStep: asNum(raw.wastePerStep, 0, 0, 1),
+      stepSeconds: asNum(raw.stepSeconds, 0, 0),
+    },
+  }
 }
 
 /**
  * Parse + validate a dispatch request body. Returns the typed dispatch inputs, or an
  * error string. The brain MUST supply the full signal set (it owns context/budget);
- * a missing signal block is rejected rather than defaulted to a launch.
+ * a missing signal block — or a missing individual field within it — is rejected
+ * rather than defaulted to a launch (mupot#940).
  */
-export function parseDispatchBody(raw: unknown): { ok: true; value: DispatchBody } | { ok: false; error: string } {
+export function parseDispatchBody(raw: unknown): { ok: true; value: DispatchBody } | DispatchParseError {
   if (typeof raw !== 'object' || raw === null) return { ok: false, error: 'body_required' }
   const b = raw as Record<string, unknown>
   const agent = asStr(b.agent, 120)
@@ -72,7 +163,7 @@ export function parseDispatchBody(raw: unknown): { ok: true; value: DispatchBody
   if (!agent) return { ok: false, error: 'agent_required' }
   if (!goal) return { ok: false, error: 'goal_required' }
   if (typeof b.signals !== 'object' || b.signals === null) return { ok: false, error: 'signals_required' }
-  const s = b.signals as Record<string, unknown>
+  const dispatchedBy = b.dispatched_by == null ? undefined : asStr(b.dispatched_by, 120)
 
   const trigger = typeof b.trigger_source === 'string' && TRIGGERS.has(b.trigger_source) ? (b.trigger_source as TriggerSource) : 'api'
   const budget = b.budget_micro_usd == null ? undefined : asNum(b.budget_micro_usd, 0, 0)
@@ -85,16 +176,9 @@ export function parseDispatchBody(raw: unknown): { ok: true; value: DispatchBody
   const meta = b.meta == null ? undefined : parseFlightMetaV1(b.meta)
   if (b.meta != null && !meta) return { ok: false, error: 'invalid_flight_meta' }
 
-  const signals: FlightSignals = {
-    contextComplete: asBool(s.contextComplete),
-    toolsReachable: asBool(s.toolsReachable),
-    budgetRemainingMicroUsd: asNum(s.budgetRemainingMicroUsd, 0, 0),
-    budgetEstimateMicroUsd: asNum(s.budgetEstimateMicroUsd, 0, 0),
-    recentProgress: asNum(s.recentProgress, 0, 0, 1),
-    progressPerStep: asNum(s.progressPerStep, 0, 0, 1),
-    wastePerStep: asNum(s.wastePerStep, 0, 0, 1),
-    stepSeconds: asNum(s.stepSeconds, 0, 0),
-  }
+  const normalized = normalizeSignalsInput(b.signals as Record<string, unknown>)
+  if (!normalized.ok) return normalized
+  const signals = normalized.value
 
   const o = (typeof b.opts === 'object' && b.opts !== null ? b.opts : {}) as Record<string, unknown>
   const opts: PreflightOptions = {}
@@ -104,7 +188,19 @@ export function parseDispatchBody(raw: unknown): { ok: true; value: DispatchBody
 
   return {
     ok: true,
-    value: { flight: { agent, goal, project_id: projectId, trigger_source: trigger, budget_micro_usd: budget, meta: meta ?? undefined }, signals, opts },
+    value: {
+      flight: {
+        agent,
+        ...(dispatchedBy ? { dispatched_by: dispatchedBy } : {}),
+        goal,
+        project_id: projectId,
+        trigger_source: trigger,
+        budget_micro_usd: budget,
+        meta: meta ?? undefined,
+      },
+      signals,
+      opts,
+    },
   }
 }
 
@@ -145,7 +241,7 @@ flightsApp.post('/', async (c) => {
 
   const raw = await c.req.json().catch(() => null)
   const parsed = parseDispatchBody(raw)
-  if (!parsed.ok) return c.json({ error: parsed.error }, 400)
+  if (!parsed.ok) return c.json({ error: parsed.error, ...(parsed.detail !== undefined ? { detail: parsed.detail } : {}) }, 400)
 
   const { flight, signals, opts } = parsed.value
   if (flight.meta) {

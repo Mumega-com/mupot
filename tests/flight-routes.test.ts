@@ -65,6 +65,71 @@ describe('parseDispatchBody', () => {
     expect(r.value.signals.recentProgress).toBe(1) // clamped 0..1
   })
 
+  // ── signals_json casing (mupot#940) ───────────────────────────────────────────
+  it('accepts snake_case signal keys, scoring identically to the camelCase equivalent', () => {
+    const snakeCase = {
+      context_complete: true,
+      tools_reachable: true,
+      budget_remaining_micro_usd: 1_000_000,
+      budget_estimate_micro_usd: 200_000,
+      recent_progress: 0.8,
+      progress_per_step: 0.5,
+      waste_per_step: 0.1,
+      step_seconds: 20,
+    }
+    const r = parseDispatchBody({ agent: 'a', goal: 'g', signals: snakeCase })
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    expect(r.value.signals).toEqual(goodSignals)
+  })
+
+  it('still accepts camelCase signal keys (documented canonical form)', () => {
+    const r = parseDispatchBody({ agent: 'a', goal: 'g', signals: goodSignals })
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    expect(r.value.signals).toEqual(goodSignals)
+  })
+
+  it('refuses an unrecognised signals key loudly rather than silently ignoring it', () => {
+    expect(parseDispatchBody({ agent: 'a', goal: 'g', signals: { ...goodSignals, contextCompete: true } }))
+      .toEqual({ ok: false, error: 'signals_unknown_key', detail: { key: 'contextCompete' } })
+    // Mixed casing on a DIFFERENT field is fine; only an unknown key is refused.
+    const mixed = parseDispatchBody({
+      agent: 'a', goal: 'g',
+      signals: { ...goodSignals, contextComplete: undefined, context_complete: true },
+    })
+    // contextComplete key is present (value undefined) so it still counts as
+    // "supplied" for the missing-field check — but asBool(undefined) is false.
+    // This exercises key-presence vs value-validity as independent concerns.
+    expect(mixed.ok).toBe(true)
+  })
+
+  it('refuses a signals block missing a required field — never defaults it into a false-and-scored value', () => {
+    const { contextComplete: _drop, ...missingContext } = goodSignals
+    expect(parseDispatchBody({ agent: 'a', goal: 'g', signals: missingContext }))
+      .toEqual({ ok: false, error: 'signals_missing_fields', detail: { missing: ['contextComplete'] } })
+
+    const { toolsReachable: _drop2, contextComplete: _drop3, ...missingBoth } = goodSignals
+    const r = parseDispatchBody({ agent: 'a', goal: 'g', signals: missingBoth })
+    expect(r).toEqual({
+      ok: false, error: 'signals_missing_fields',
+      detail: { missing: ['contextComplete', 'toolsReachable'] },
+    })
+  })
+
+  it('threads dispatched_by through when the caller supplies it, else leaves it unset (createFlight defaults it to agent)', () => {
+    const withDispatcher = parseDispatchBody({ agent: 'executor-1', dispatched_by: 'dispatcher-1', goal: 'g', signals: goodSignals })
+    expect(withDispatcher.ok).toBe(true)
+    if (!withDispatcher.ok) return
+    expect(withDispatcher.value.flight.agent).toBe('executor-1')
+    expect(withDispatcher.value.flight.dispatched_by).toBe('dispatcher-1')
+
+    const selfDispatch = parseDispatchBody({ agent: 'executor-1', goal: 'g', signals: goodSignals })
+    expect(selfDispatch.ok).toBe(true)
+    if (!selfDispatch.ok) return
+    expect(selfDispatch.value.flight.dispatched_by).toBeUndefined()
+  })
+
   it('keeps a known trigger_source + clamps negative budget to 0', () => {
     const r = parseDispatchBody({ agent: 'a', goal: 'g', trigger_source: 'cron', budget_micro_usd: -50, signals: goodSignals })
     expect(r.ok).toBe(true)
