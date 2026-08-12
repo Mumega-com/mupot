@@ -360,18 +360,31 @@ export async function landGovernedFlight(
   // entire 46-site audit (mupot#919), a strict-mode test harness, PR #927 and a fleet-wide
   // migration deadline were built on a phenomenon that never occurred. All withdrawn.
   //
-  // A LIVE CANDIDATE for why meta.changes was wrong, still inferred rather than proven:
-  // migrations/0059 defines flight_event_outbox_project_hydrate_insert, an AFTER INSERT
-  // trigger that UPDATEs this same table. SQLite's total_changes counts trigger-program
-  // rows; changes() does not. If D1 derives meta.changes from a total-changes delta, every
-  // insert here reports 2 and `=== 1` can never pass. One staging insert settles it.
+  // WHY meta.changes WAS WRONG — SETTLED 2026-08-12, proven with a control, no longer a
+  // candidate. migrations/0059 defines flight_event_outbox_project_hydrate_insert, an
+  // AFTER INSERT trigger that UPDATEs this same table. D1 derives meta.changes from a
+  // total-changes delta, which COUNTS TRIGGER-PROGRAM ROWS; SQLite's changes() does not.
+  // Measured on a throwaway D1 reproducing this table's exact shape:
+  //     receipt INSERT, flight HAS a project        -> changes 2
+  //     receipt INSERT, flight has NO project       -> changes 2   (subselect NULL, UPDATE still runs)
+  //     CONTROL: same INSERT, table with NO trigger -> changes 1
+  //     ON CONFLICT hit                             -> changes 0
+  // So `changes === 1` could never be true here. Not "unlikely" — unsatisfiable. The old
+  // success test could not have passed on any run, which is the whole of #916.
   //
   // SO WHY IS THIS STILL SEQUENTIAL? Not because of any same-batch read behaviour — that
   // premise is retracted and the phenomenon it explained did not happen. It is sequential
-  // because deciding success from RETURNING rows requires awaiting this statement on its
-  // own, and because not trusting meta.changes is correct regardless of which mechanism
-  // broke it. Do not re-batch these to "optimise": the win is nil and the success test
-  // below depends on the split.
+  // because not trusting meta.changes is correct regardless of which mechanism broke it,
+  // and sequential is the simpler thing to reason about.
+  //
+  // CORRECTION, 2026-08-12: this comment previously also claimed "the success test below
+  // depends on the split" and told you not to re-batch on that basis. THAT WAS FALSE and
+  // was never tested. batch() preserves per-statement `results`, so a RETURNING row count
+  // works identically inside a batch (measured: batch with RETURNING -> results.length 1;
+  // batch, RETURNING matching nothing -> results.length 0, changes 0). The conclusion
+  // survives, the stated reason did not. Noted plainly because an unverified mechanism
+  // asserted as fact, one paragraph below the retraction of an unverified mechanism
+  // asserted as fact, is exactly the habit #916 was supposed to break.
   // Decide from the RETURNING rows, NOT from meta.changes. Adversarial review caught the
   // first draft reading `meta.changes` off `.all()` of a RETURNING write — an unverified
   // platform behaviour of exactly the class that caused #916, and one no local harness can
@@ -403,15 +416,27 @@ export async function landGovernedFlight(
   let receipt = false
   try {
     // ON CONFLICT keeps this idempotent: a retry after a partial failure re-uses the
-    // existing receipt rather than duplicating it, and `changes === 0` from a conflict is
-    // reported as receipt=true because the receipt genuinely exists.
-    const outboxResult = await env.DB.prepare(
+    // existing receipt rather than duplicating it, and a conflict is still receipt=true
+    // because the receipt genuinely exists.
+    //
+    // The receipt is decided by QUERYING FOR IT, never by meta.changes. This used to read
+    // `(outboxResult.meta?.changes ?? 0) === 1 || (await flightReceiptExists(env, id))`.
+    // The first clause was dead — see the settled measurement above: this table's AFTER
+    // INSERT trigger makes changes 2 on success and 0 on conflict, so `=== 1` never fired
+    // and flightReceiptExists carried every call anyway. Removing it changes no behaviour;
+    // it removes a claim that reads as a working fast path and is not one.
+    //
+    // DO NOT "restore the fast path" and drop the query to save a round trip. That inverts
+    // the failure: receipt would become false on every landing, and per the catch block
+    // below there is NO BACKFILL — flushFlightEventOutbox only iterates rows that already
+    // exist. A wrong `false` here is a permanent audit gap, not a retryable blip.
+    await env.DB.prepare(
       `INSERT INTO flight_event_outbox
          (id, tenant, flight_id, event_type, actor_kind, actor_id, payload, created_at)
        VALUES (?1, ?2, ?3, 'flight.landed', ?4, ?5, ?6, ?7)
        ON CONFLICT (tenant, flight_id, event_type) DO NOTHING`,
     ).bind(eventId, env.TENANT_SLUG, id, opts.actor.kind, opts.actor.id, receiptPayload, createdAt).run()
-    receipt = (outboxResult.meta?.changes ?? 0) === 1 || (await flightReceiptExists(env, id))
+    receipt = await flightReceiptExists(env, id)
   } catch (error) {
     // A receipt that fails to write must not un-land a landed flight — that is the whole
     // point of separating the two outcomes. Be honest about the consequence though: there
