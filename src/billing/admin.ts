@@ -17,9 +17,9 @@
 
 import { Hono } from 'hono'
 import type { Env } from '../types'
+import { timingSafeEqual } from '../lib/crypto'
 import { applyPlanEvent } from './entitlement'
 import { isPotTier } from './plans'
-import { timingSafeEqual } from '../lib/crypto'
 
 const MAX_BODY_BYTES = 4096
 

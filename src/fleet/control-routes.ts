@@ -20,6 +20,7 @@ import { emitControlRequest, emitSquadControlRequest } from './control'
 import { reportFleetAgents, getAgentView } from './registry'
 import { resolveOrgAdmin } from '../auth/member-bearer'
 import { panelPublicJwk } from './control-request'
+import { redactSecretPatterns } from '../lib/redact'
 
 export const fleetControlApp = new Hono<{ Bindings: Env }>()
 const FLEET_ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/
@@ -140,7 +141,9 @@ fleetControlApp.get('/trust', async (c) => {
     })
   } catch (error) {
     console.error('fleet trust export failed', {
-      error: error instanceof Error ? `${error.name}: ${error.message}` : 'unknown error',
+      tenant: c.env.TENANT_SLUG,
+      consumer_agent_id: c.env.FLEET_CONSUMER_AGENT,
+      error: redactSecretPatterns(error instanceof Error ? `${error.name}: ${error.message}` : 'unknown error'),
     })
     return c.json({ error: 'fleet_trust_unavailable' }, 503)
   }

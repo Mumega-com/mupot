@@ -20,6 +20,7 @@ import { getFleetAgentLiveness } from '../fleet/registry'
 import { deliverDispatchToInbox, dispatchInboxDelivered, InboxFullError, DISPATCH_INBOX_PREFIX } from './fleet-bridge'
 import { notifyHadi } from '../telegram-bridge/bus_notify'
 import { deliverMessageCreatedEvent } from './hermes-delivery'
+import { redactSecretPatterns } from '../lib/redact'
 
 // Internal origin for DO fetch routing. DO fetch ignores host; the path carries
 // the intent. The agents component routes these paths inside its DO classes.
@@ -505,7 +506,7 @@ export async function handleQueue(batch: MessageBatch<BusEvent>, env: Env): Prom
         } catch (e) {
           console.error('bus: activity-feed post failed (non-fatal)', {
             id: message.id,
-            error: e instanceof Error ? e.message : String(e),
+            error: redactSecretPatterns(e instanceof Error ? e.message : String(e)),
           })
         }
       }
@@ -514,7 +515,7 @@ export async function handleQueue(batch: MessageBatch<BusEvent>, env: Env): Prom
       console.error('bus: message failed, will retry', {
         id: message.id,
         attempts: message.attempts,
-        error: err instanceof Error ? err.message : String(err),
+        error: redactSecretPatterns(err instanceof Error ? err.message : String(err)),
       })
       if (err instanceof RetryAfterError) {
         message.retry({ delaySeconds: err.delaySeconds })
