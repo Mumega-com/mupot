@@ -10,6 +10,23 @@ import { assertWritten } from '../lib/receipt'
 import { resolveOutboundGitHubToken } from '../integrations/github-app'
 import { isBlankProvenance } from './provenance'
 import { hasProjectWriteForSquads } from '../projects/access'
+import { GATE_CAPABILITY_RE } from '../gates/grants'
+
+// gate_owner is used RAW as the grant capability in callerHoldsGateCapability
+// (src/tasks/index.ts): `SELECT 1 FROM gate_grants WHERE capability = <gate_owner>`.
+// Only 'gate:<owner>' strings are insertable into gate_grants (GATE_CAPABILITY_RE,
+// grants.ts) — there is NO self-verdict-by-agent-id path; an agent UUID as
+// gate_owner is looked up as capability='<uuid>' and matches nothing, exactly as
+// unverdictable as a bare slug. So the ONE legal form is 'gate:<owner>'.
+//
+// (This is TIGHTER than the first-pass criteria "gate:<owner> OR an agent id":
+// tracing the lookup showed the agent-id branch would never match a grant, so
+// accepting it would just let a different unverdictable value through — board
+// 247858f1.) Reject at WRITE TIME rather than silently coerce: a silent coerce is
+// how the next mismatch ships.
+export function isValidGateOwnerForm(value: string): boolean {
+  return GATE_CAPABILITY_RE.test(value)
+}
 
 export type TaskStatus = Task['status']
 type TaskActor = NonNullable<BusEvent['actor']>

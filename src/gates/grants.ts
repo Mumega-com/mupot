@@ -32,7 +32,7 @@ export type GateGrantValidationError =
  *  HTTP/MCP grant paths accept gate:* only by design — surface caps
  *  (content:write, outreach:send-gated, …) also live in gate_grants but are
  *  minted via preset/dashboard, not grant_gate_capability. */
-const GATE_CAPABILITY_RE = /^gate:[a-zA-Z0-9][a-zA-Z0-9:_-]{0,120}$/
+export const GATE_CAPABILITY_RE = /^gate:[a-zA-Z0-9][a-zA-Z0-9:_-]{0,120}$/
 
 export function parseGateGrantArgs(input: {
   capability?: unknown
