@@ -29,6 +29,7 @@ const {
   projectCreateBody,
   projectDetailBody,
   projectFormValues,
+  projectMutationStatus,
   projectSettingsBody,
   projectsPageBody,
 } = await import('../src/dashboard/projects')
@@ -1756,5 +1757,33 @@ describe('project board bind authz (#402)', () => {
 
     as(actor({ role: 'admin' }))
     expect((await dashboardApp.fetch(syncRequest('hidden-child'), env)).status).not.toBe(403)
+  })
+})
+
+describe('projectMutationStatus', () => {
+  it('maps not-found errors to 404', () => {
+    expect(projectMutationStatus('project_not_found')).toBe(404)
+    expect(projectMutationStatus('parent_not_found')).toBe(404)
+    expect(projectMutationStatus('squad_not_found')).toBe(404)
+  })
+
+  it('maps conflict errors to 409', () => {
+    expect(projectMutationStatus('slug_taken')).toBe(409)
+    expect(projectMutationStatus('receipt_failed')).toBe(409)
+    expect(projectMutationStatus('hierarchy_depth')).toBe(409)
+    expect(projectMutationStatus('hierarchy_cycle')).toBe(409)
+    expect(projectMutationStatus('active_children')).toBe(409)
+    expect(projectMutationStatus('archived_project')).toBe(409)
+    expect(projectMutationStatus('invalid_status_transition')).toBe(409)
+    expect(projectMutationStatus('completion_gate_required')).toBe(409)
+    expect(projectMutationStatus('start_gate_required')).toBe(409)
+  })
+
+  it('maps other validation errors to 400', () => {
+    expect(projectMutationStatus('invalid_slug')).toBe(400)
+    expect(projectMutationStatus('invalid_name')).toBe(400)
+    expect(projectMutationStatus('invalid_status')).toBe(400)
+    expect(projectMutationStatus('invalid_target_date')).toBe(400)
+    expect(projectMutationStatus('invalid_access_level')).toBe(400)
   })
 })
