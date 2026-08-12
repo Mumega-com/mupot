@@ -392,14 +392,27 @@ function _mintCtxInternal(
   // ── audit facade ──────────────────────────────────────────────────────────
 
   const audit: AuditPort = Object.freeze({
-    async write(event: { action: string; payload?: unknown }): Promise<void> {
+    async write(event: { action: string; payload?: unknown; actor?: { type: 'system' | 'agent' | 'user'; id?: string } }): Promise<void> {
       if (!hasCapability(_capSet, 'member')) {
         throw new CtxError(
           'capability_denied',
           `ctx(${departmentKey}@${tenantId}): 'member' capability required to write audit`,
         )
       }
-      void event
+      // Real durable write (0095) — the pre-0095 behavior was `void event`
+      // (silent no-op). Fail-closed: a DB failure propagates; a lost audit row
+      // is worse than a silent drop.
+      const actor = event.actor ?? { type: 'system' as const }
+      const id = idFn()
+      const payloadJson = event.payload === undefined ? null : JSON.stringify(event.payload)
+      await handle.db
+        .prepare(
+          `INSERT INTO department_audit
+             (id, tenant_id, department_key, action, actor_type, actor_id, payload_json, recorded_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)`,
+        )
+        .bind(id, tenantId, departmentKey, event.action, actor.type, actor.id ?? null, payloadJson, nowFn())
+        .run()
     },
   })
 
@@ -502,7 +515,25 @@ function _mintCtxInternal(
           `ctx(${departmentKey}@${tenantId}): 'member' capability required to publish`,
         )
       }
-      void msg
+      if (typeof msg.type !== 'string' || msg.type.length === 0) {
+        throw new CtxError('bus_type_required', `ctx(${departmentKey}@${tenantId}): bus message requires a non-empty type`)
+      }
+      // Real durable write (0095, flight_event_outbox pattern) — the pre-0095
+      // behavior was `void msg` (silent no-op). The queue producer drains
+      // delivered_at IS NULL rows into the mupot-events queue.
+      const payloadJson = JSON.stringify(msg.payload ?? {})
+      if (payloadJson === undefined) {
+        throw new CtxError('bus_payload_not_json', `ctx(${departmentKey}@${tenantId}): bus payload must be JSON-serializable`)
+      }
+      const id = idFn()
+      await handle.db
+        .prepare(
+          `INSERT INTO department_outbox
+             (id, tenant_id, department_key, msg_type, payload_json, created_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6)`,
+        )
+        .bind(id, tenantId, departmentKey, msg.type, payloadJson, nowFn())
+        .run()
     },
   })
 

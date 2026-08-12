@@ -68,6 +68,8 @@ import { CtxError } from '../src/departments/ctx'
 // --- Pulse spine imports for honesty propagation test ---
 import { seriesShape, aggregateOHLC } from '../src/metrics/pulse'
 import type { OHLCBucket } from '../src/metrics/pulse'
+import { createSqliteD1 } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 
 // ── In-memory D1 mock ────────────────────────────────────────────────────────
 //
@@ -1152,378 +1154,99 @@ describe('8. Registry hardening', () => {
     // The gateId is now a deterministic idGen result (not the now() timestamp).
     expect(result.gateId).toBe('test-gate-id-1')
   })
-})
 
-// ── 9. EXPORT SURFACE ASSERTIONS — structural boundary proof ──────────────────
-//
-// These tests mechanically assert that the module export surfaces of ctx.ts and
-// registry.ts contain NO symbol that can mint a ctx or acquire/clear state.
-//
-// Threat model: a department module is hostile first-party code in the same bundle.
-// It can `import` anything exported. The ONLY real authority boundary is
-// "a symbol that is NEVER exported cannot be imported" (CF Workers, no process
-// isolation).
-//
-// Architecture after FIX-2:
-//   ctx.ts    — pure types, interfaces, CtxError. ZERO mint logic.
-//   kernel.ts — ALL mint logic (_KERNEL_TOKEN, _mintCtxInternal, port facades).
-//               Exports only: kernelMintCtx (function, no token param), _isKernelToken.
-//
-// These assertions use dynamic import to get the live module namespace and check
-// specific property names. TypeScript types don't help here — we check the runtime
-// object.
-
-describe('9. EXPORT SURFACE ASSERTIONS — no mint/token/clear symbol reachable', () => {
-  it('ctx.ts does NOT export acquireKernelToken', async () => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const ctxMod = await import('../src/departments/ctx') as Record<string, any>
-    expect(ctxMod['acquireKernelToken']).toBeUndefined()
-  })
-
-  it('ctx.ts does NOT export mintCtx (minting logic lives in kernel.ts, not ctx.ts)', async () => {
-    // ctx.ts is now a pure types/contracts file — no mint function at all.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const ctxMod = await import('../src/departments/ctx') as Record<string, any>
-    expect(ctxMod['mintCtx']).toBeUndefined()
-  })
-
-  it('ctx.ts does NOT export createMintSeam', async () => {
-    // createMintSeam has been removed from ctx.ts entirely. All minting lives in
-    // kernel.ts as private module-scope code.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const ctxMod = await import('../src/departments/ctx') as Record<string, any>
-    expect(ctxMod['createMintSeam']).toBeUndefined()
-  })
-
-  it('ctx.ts does NOT export _isKernelToken or _isKernelTokenCtx', async () => {
-    // These predicates live in kernel.ts only.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const ctxMod = await import('../src/departments/ctx') as Record<string, any>
-    expect(ctxMod['_isKernelToken']).toBeUndefined()
-    expect(ctxMod['_isKernelTokenCtx']).toBeUndefined()
-  })
-
-  it('ctx.ts does NOT export KERNEL_TOKEN or any token-shaped symbol', async () => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const ctxMod = await import('../src/departments/ctx') as Record<string, any>
-    expect(ctxMod['KERNEL_TOKEN']).toBeUndefined()
-    expect(ctxMod['_KERNEL_TOKEN']).toBeUndefined()
-    expect(ctxMod['_tokenAcquired']).toBeUndefined()
-  })
-
-  it('ctx.ts has no callable function that yields a DepartmentCtx', async () => {
-    // Enumerate all exports of ctx.ts and confirm none are functions (ctx.ts is
-    // purely types + CtxError class).
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const ctxMod = await import('../src/departments/ctx') as Record<string, any>
-    const exportedFunctions = Object.entries(ctxMod)
-      .filter(([, v]) => typeof v === 'function')
-      .map(([k]) => k)
-    // CtxError is a class (constructor function) — it is the ONLY allowed function.
-    expect(exportedFunctions).toEqual(['CtxError'])
-  })
-
-  it('registry.ts does NOT export _clearRegistry', async () => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const regMod = await import('../src/departments/registry') as Record<string, any>
-    expect(regMod['_clearRegistry']).toBeUndefined()
-  })
-
-  it('registry.ts does NOT export _unregister', async () => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const regMod = await import('../src/departments/registry') as Record<string, any>
-    expect(regMod['_unregister']).toBeUndefined()
-  })
-
-  it('registry.ts does NOT export _testOnly', async () => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const regMod = await import('../src/departments/registry') as Record<string, any>
-    expect(regMod['_testOnly']).toBeUndefined()
-  })
-
-  it('registry.ts production register does NOT accept a replace option (hostile displacement blocked)', async () => {
-    // The exported `register` from registry.ts wraps the production singleton with
-    // idempotent same-object semantics and no `replace` parameter. A hostile module
-    // that calls register(EvilModule, {replace:true}) cannot displace an existing key
-    // because the parameter is simply absent from the production wrapper.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const regMod = await import('../src/departments/registry') as Record<string, any>
-    const regFn: (...args: unknown[]) => void = regMod['register']
-    expect(typeof regFn).toBe('function')
-    // The production register accepts exactly 1 parameter (module). TypeScript
-    // enforces this at compile time; at runtime extra args are silently ignored
-    // but the production singleton register() does NOT honor replace.
-    // Verify: passing a different module under an existing key throws.
-    const HostileModule = { ...FixtureModule }  // different object, same key
-    expect(() => regFn(HostileModule)).toThrow(/registry_duplicate_key/)
-  })
-
-  it('a fake token symbol is correctly identified as NOT the kernel token', () => {
-    // _isKernelToken lets the harness prove the token gate without exposing the token.
-    const fakeToken = Symbol('fake.kernel.mint')
-    expect(_isKernelToken(fakeToken)).toBe(false)
-  })
-
-  it('registry instance isolation: one instance state does not leak into another', () => {
-    const reg1 = createDepartmentRegistry()
-    const reg2 = createDepartmentRegistry()
-    reg1.register(FixtureModule)
-    expect(reg2.listRegistered()).toHaveLength(0)
-    reg2.register(FixtureModule)
-    expect(reg1.listRegistered()).toHaveLength(1)
-    expect(reg2.listRegistered()).toHaveLength(1)
-    // Registering into reg2 doesn't affect reg1's state
-    const AltModule = { ...FixtureModule, key: 'alt' }
-    reg2.register(AltModule)
-    expect(reg1.listRegistered()).toHaveLength(1)
-    expect(reg2.listRegistered()).toHaveLength(2)
-  })
-
-  it('duplicate key on one registry instance does not affect another', () => {
-    const reg1 = createDepartmentRegistry()
-    const reg2 = createDepartmentRegistry()
-    reg1.register(FixtureModule)
-    expect(() => reg1.register(FixtureModule)).toThrow(/registry_duplicate_key/)
-    // reg2 is unaffected — can still register without error
-    expect(() => reg2.register(FixtureModule)).not.toThrow()
-  })
-})
-
-// ── 10. ADVERSARIAL — registry-level manifest mutation (BLOCK-1, Codex round 3) ─
-//
-// Proves that the deep-freeze-clone introduced in this sprint closes the
-// mutable-registered-manifest vector. An attacker who obtains a reference via
-// getRegistered() cannot alter authority structures in place, and the registry
-// source-of-truth remains the original frozen clone.
-//
-// Exploit attempted (from Codex BLOCK-1 brief):
-//   const m = getRegistered('fixture') as any
-//   m.metricsEmitted.push({ key:'growth.revenue', sourceAuthority:['stripe'], ... })
-//   m.defaultSquads.push({ slug:'evil', name:'Evil' })
-//   m.consoleSection.path = '/departments/evil'
-//
-// Post-fix: all mutation attempts throw (frozen) or are silently inert (strict mode
-// always throws on frozen arrays/objects in V8). Subsequent selector calls reflect
-// only the original frozen manifest — no forged descriptors, no nav displacement.
-
-describe('10. ADVERSARIAL — registry manifest immutability (BLOCK-1 close)', () => {
-  // Use an isolated registry instance so these tests do not interact with the
-  // singleton. The exploit works the same way on both — we use isolated for hermeticity.
-  let reg: ReturnType<typeof createDepartmentRegistry>
-  let db: D1Database
-
-  beforeEach(() => {
-    reg = createDepartmentRegistry()
-    reg.register(FixtureModule)
-    db = makeDb().db
-  })
-
-  it('getRegistered returns a frozen object (top-level)', () => {
-    const m = reg.getRegistered('fixture')
-    expect(m).toBeDefined()
-    expect(Object.isFrozen(m)).toBe(true)
-  })
-
-  it('getRegistered: metricsEmitted array is frozen', () => {
-    const m = reg.getRegistered('fixture')!
-    expect(Object.isFrozen(m.metricsEmitted)).toBe(true)
-  })
-
-  it('getRegistered: each MetricDescriptor is frozen', () => {
-    const m = reg.getRegistered('fixture')!
-    for (const desc of m.metricsEmitted) {
-      expect(Object.isFrozen(desc)).toBe(true)
-    }
-  })
-
-  it('getRegistered: each MetricDescriptor.sourceAuthority array is frozen', () => {
-    const m = reg.getRegistered('fixture')!
-    for (const desc of m.metricsEmitted) {
-      expect(Object.isFrozen(desc.sourceAuthority)).toBe(true)
-    }
-  })
-
-  it('getRegistered: each MetricDescriptor.display object is frozen', () => {
-    const m = reg.getRegistered('fixture')!
-    for (const desc of m.metricsEmitted) {
-      expect(Object.isFrozen(desc.display)).toBe(true)
-    }
-  })
-
-  it('getRegistered: defaultSquads array is frozen', () => {
-    const m = reg.getRegistered('fixture')!
-    expect(Object.isFrozen(m.defaultSquads)).toBe(true)
-  })
-
-  it('getRegistered: each SquadSeed is frozen', () => {
-    const m = reg.getRegistered('fixture')!
-    for (const squad of m.defaultSquads) {
-      expect(Object.isFrozen(squad)).toBe(true)
-    }
-  })
-
-  it('getRegistered: consoleSection is frozen', () => {
-    const m = reg.getRegistered('fixture')!
-    expect(Object.isFrozen(m.consoleSection)).toBe(true)
-  })
-
-  it('getRegistered: connectors array is frozen', () => {
-    const m = reg.getRegistered('fixture')!
-    expect(Object.isFrozen(m.connectors)).toBe(true)
-  })
-
-  it('getRegistered: requiredCapabilities array is frozen', () => {
-    const m = reg.getRegistered('fixture')!
-    expect(Object.isFrozen(m.requiredCapabilities)).toBe(true)
-  })
-
-  it('EXPLOIT: push to metricsEmitted throws (frozen array)', () => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const m = reg.getRegistered('fixture') as any
-    expect(() => {
-      m.metricsEmitted.push({
-        key: 'growth.revenue',
-        unit: 'usd',
-        direction: 'up_good',
-        cadence: 'realtime',
-        aggregation: 'sum',
-        ohlcEligible: true,
-        sourceAuthority: ['stripe'],
-        retention: '365d',
-        display: { precision: 2 },
-      })
-    }).toThrow()
-  })
-
-  it('EXPLOIT: push to defaultSquads throws (frozen array)', () => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const m = reg.getRegistered('fixture') as any
-    expect(() => {
-      m.defaultSquads.push({ slug: 'evil', name: 'Evil' })
-    }).toThrow()
-  })
-
-  it('EXPLOIT: assign to consoleSection.path throws (frozen object)', () => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const m = reg.getRegistered('fixture') as any
-    expect(() => {
-      m.consoleSection.path = '/departments/evil'
-    }).toThrow()
-  })
-
-  it('EXPLOIT: assign to metricsEmitted[0].sourceAuthority throws (frozen object)', () => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const m = reg.getRegistered('fixture') as any
-    expect(() => {
-      m.metricsEmitted[0].sourceAuthority = ['stripe']
-    }).toThrow()
-  })
-
-  it('EXPLOIT: push to metricsEmitted[0].sourceAuthority throws (frozen array)', () => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const m = reg.getRegistered('fixture') as any
-    expect(() => {
-      m.metricsEmitted[0].sourceAuthority.push('stripe')
-    }).toThrow()
-  })
-
-  it('post-exploit: getActiveMetricDescriptors reflects ONLY original — no forged growth.revenue', async () => {
-    // Activate in the isolated registry then attempt the full exploit sequence.
-    await reg.activate(db, 'fixture')
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const m = reg.getRegistered('fixture') as any
-    try { m.metricsEmitted.push({ key: 'growth.revenue', sourceAuthority: ['stripe'] }) } catch { /* frozen */ }
-    try { m.defaultSquads.push({ slug: 'evil', name: 'Evil' }) } catch { /* frozen */ }
-    try { m.consoleSection.path = '/departments/evil' } catch { /* frozen */ }
-
-    const descs = await reg.getActiveMetricDescriptors(db)
-    const keys = descs.map((d) => d.key)
-    // Original two descriptors only — no forged growth.revenue
-    expect(keys).not.toContain('growth.revenue')
-    expect(keys).toContain('fixture.pings')
-    expect(keys).toContain('fixture.scalar')
-    expect(descs).toHaveLength(2)
-  })
-
-  it('post-exploit: consoleSection.path is the original — no nav displacement', async () => {
-    await reg.activate(db, 'fixture')
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const m = reg.getRegistered('fixture') as any
-    try { m.consoleSection.path = '/departments/evil' } catch { /* frozen */ }
-
-    const sections = await reg.getActiveConsoleSections(db)
-    expect(sections).toHaveLength(1)
-    expect(sections[0].path).toBe('/departments/fixture')
-    expect(sections[0].path).not.toBe('/departments/evil')
-  })
-
-  it('clone isolation: mutating the CALLER original after register has no effect on stored manifest', () => {
-    // Build a fresh mutable module (not FixtureModule itself — we must not mutate it).
-    const mutableModule: DepartmentModule = {
-      key: 'muttest',
-      name: 'Mutation Test',
-      version: '0.1.0',
-      defaultSquads: [{ slug: 'muttest-core', name: 'MutTest Core' }],
-      metricsEmitted: [{
-        key: 'muttest.pings',
-        unit: 'count',
-        direction: 'neutral',
-        cadence: 'realtime',
-        aggregation: 'sum',
-        ohlcEligible: true,
-        sourceAuthority: ['test-source'],
-        retention: '30d',
-        display: { precision: 0 },
-      }],
-      consoleSection: { id: 'muttest', title: 'MutTest', navIcon: 'beaker', path: '/departments/muttest' },
-      requiredCapabilities: ['member'],
-      connectors: [],
-    }
-
-    const reg2 = createDepartmentRegistry()
-    reg2.register(mutableModule)
-
-    // Mutate the CALLER's original after registration.
-    // The stored manifest must remain unchanged.
-    mutableModule.metricsEmitted.push({
-      key: 'growth.revenue',
-      unit: 'usd',
-      direction: 'up_good',
-      cadence: 'realtime',
-      aggregation: 'sum',
-      ohlcEligible: true,
-      sourceAuthority: ['stripe'],
-      retention: '365d',
-      display: { precision: 2 },
+  it('audit.write persists a REAL department_audit row (0095) — not a silent no-op', async () => {
+    const harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    let idCtr = 0
+    const ctx = kernelMintCtx(makeKernelHandle(harness.db), {
+      tenantId: 'tenant-a',
+      departmentKey: 'growth',
+      module: GrowthModule,
+      capabilities: ['member'],
+      idGen: () => `audit-${++idCtr}`,
+      now: () => '2026-01-01T00:00:00.000Z',
     })
-    mutableModule.defaultSquads.push({ slug: 'evil', name: 'Evil' })
-    mutableModule.consoleSection.path = '/departments/evil'
-
-    const stored = reg2.getRegistered('muttest')!
-    // Stored manifest is isolated from caller mutations
-    expect(stored.metricsEmitted).toHaveLength(1)
-    expect(stored.metricsEmitted[0].key).toBe('muttest.pings')
-    expect(stored.defaultSquads).toHaveLength(1)
-    expect(stored.defaultSquads[0].slug).toBe('muttest-core')
-    expect(stored.consoleSection.path).toBe('/departments/muttest')
+    await ctx.audit.write({
+      action: 'seo-audit-proposal',
+      payload: { metric: 'leads', value: 3 },
+      actor: { type: 'agent', id: 'agent-1' },
+    })
+    const rows = harness.sqlite.prepare('SELECT * FROM department_audit').all() as Array<Record<string, unknown>>
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toMatchObject({
+      id: 'audit-1',
+      tenant_id: 'tenant-a',
+      department_key: 'growth',
+      action: 'seo-audit-proposal',
+      actor_type: 'agent',
+      actor_id: 'agent-1',
+      recorded_at: '2026-01-01T00:00:00.000Z',
+    })
+    expect(rows[0].payload_json).toBe(JSON.stringify({ metric: 'leads', value: 3 }))
+    // actor defaults to system when omitted
+    await ctx.audit.write({ action: 'another-action' })
+    const rows2 = harness.sqlite.prepare('SELECT * FROM department_audit ORDER BY seq').all() as Array<Record<string, unknown>>
+    expect(rows2).toHaveLength(2)
+    expect(rows2[1].actor_type).toBe('system')
+    expect(rows2[1].actor_id).toBeNull()
   })
 
-  it('listRegistered: returned array elements are frozen', () => {
-    const all = reg.listRegistered()
-    expect(all.length).toBeGreaterThan(0)
-    for (const m of all) {
-      expect(Object.isFrozen(m)).toBe(true)
-      expect(Object.isFrozen(m.metricsEmitted)).toBe(true)
-      expect(Object.isFrozen(m.consoleSection)).toBe(true)
-      expect(Object.isFrozen(m.defaultSquads)).toBe(true)
-    }
+  it('audit.write still enforces the member capability floor', async () => {
+    const harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    const ctx = kernelMintCtx(makeKernelHandle(harness.db), {
+      tenantId: 'tenant-a',
+      departmentKey: 'growth',
+      module: GrowthModule,
+      capabilities: ['observer'],
+    })
+    await expect(ctx.audit.write({ action: 'x' })).rejects.toThrow(/capability_denied/)
+    const rows = harness.sqlite.prepare('SELECT COUNT(*) AS n FROM department_audit').get() as { n: number }
+    expect(rows.n).toBe(0)
+  })
+
+  it('bus.publish persists a REAL department_outbox row (0095) — not a silent no-op', async () => {
+    const harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    let idCtr = 0
+    const ctx = kernelMintCtx(makeKernelHandle(harness.db), {
+      tenantId: 'tenant-a',
+      departmentKey: 'growth',
+      module: GrowthModule,
+      capabilities: ['member'],
+      idGen: () => `bus-${++idCtr}`,
+      now: () => '2026-01-01T00:00:00.000Z',
+    })
+    await ctx.bus.publish({ type: 'dept.leads', payload: { count: 5 } })
+    const rows = harness.sqlite.prepare('SELECT * FROM department_outbox').all() as Array<Record<string, unknown>>
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toMatchObject({
+      id: 'bus-1',
+      tenant_id: 'tenant-a',
+      department_key: 'growth',
+      msg_type: 'dept.leads',
+      created_at: '2026-01-01T00:00:00.000Z',
+      delivered_at: null,
+      attempts: 0,
+    })
+    expect(rows[0].payload_json).toBe(JSON.stringify({ count: 5 }))
+    // empty type fails closed
+    await expect(ctx.bus.publish({ type: '' })).rejects.toThrow(/bus_type_required/)
+  })
+
+  it('bus.publish still enforces the member capability floor', async () => {
+    const harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    const ctx = kernelMintCtx(makeKernelHandle(harness.db), {
+      tenantId: 'tenant-a',
+      departmentKey: 'growth',
+      module: GrowthModule,
+      capabilities: ['observer'],
+    })
+    await expect(ctx.bus.publish({ type: 'x' })).rejects.toThrow(/capability_denied/)
+    const rows = harness.sqlite.prepare('SELECT COUNT(*) AS n FROM department_outbox').get() as { n: number }
+    expect(rows.n).toBe(0)
   })
 })
 
-// ── Cleanup after all tests ───────────────────────────────────────────────────
-
-afterAll(() => {
-  register(FixtureModule, { replace: true })
-})

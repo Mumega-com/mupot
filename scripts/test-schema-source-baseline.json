@@ -69,7 +69,6 @@
     "tests/dashboard-publish-button.test.ts",
     "tests/dashboard-unit-panels.test.ts",
     "tests/deactivate-agent.test.ts",
-    "tests/department-conformance.test.ts",
     "tests/department-proposals-durability.test.ts",
     "tests/discord-cap-sync.test.ts",
     "tests/discord-sync-route.test.ts",
