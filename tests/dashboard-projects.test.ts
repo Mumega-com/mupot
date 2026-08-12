@@ -26,6 +26,7 @@ const {
   loadProjectParentOptions,
   loadProjectWorkContext,
   loadProjectsPage,
+  parseProjectListFilters,
   projectCreateBody,
   projectDetailBody,
   projectFormValues,
@@ -162,6 +163,30 @@ function projectFormRequest(path: string, values: Record<string, string>): Reque
     body: new URLSearchParams(values),
   })
 }
+
+describe('parseProjectListFilters', () => {
+  it('returns default values when inputs are undefined', () => {
+    expect(parseProjectListFilters(undefined, undefined)).toEqual({ search: '' })
+  })
+
+  it('preserves a valid search term without status', () => {
+    expect(parseProjectListFilters('hello', undefined)).toEqual({ search: 'hello' })
+    expect(parseProjectListFilters('hello', '')).toEqual({ search: 'hello' })
+  })
+
+  it('parses a valid status', () => {
+    expect(parseProjectListFilters(undefined, 'active')).toEqual({ search: '', status: 'active' })
+    expect(parseProjectListFilters('query', 'completed')).toEqual({ search: 'query', status: 'completed' })
+  })
+
+  it('trims whitespace from status', () => {
+    expect(parseProjectListFilters(undefined, '  paused  ')).toEqual({ search: '', status: 'paused' })
+  })
+
+  it('returns null for an invalid status', () => {
+    expect(parseProjectListFilters(undefined, 'not-a-status')).toBeNull()
+  })
+})
 
 describe('project dashboard renderers', () => {
   let harness: SqliteD1Harness | undefined
