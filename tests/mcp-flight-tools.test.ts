@@ -229,13 +229,16 @@ function makeEnv(
                   }
                 } else if (sql.includes('INSERT INTO flight_event_outbox')) {
                   // #916: the receipt INSERT no longer re-reads the flights row it was
-                  // just written by (that read is exactly what production D1 could not
-                  // see inside a batch), so it no longer binds ended_at as an 8th arg and
-                  // no longer re-derives score/cost from the row — the caller bakes the
+                  // just written by, so it no longer binds ended_at as an 8th arg and no
+                  // longer re-derives score/cost from the row — the caller bakes the
                   // landed values into the payload before inserting. This double models
                   // the new contract; the correlation it used to enforce via ended_at is
                   // now enforced by control flow, because the insert only runs after the
                   // transition has been confirmed to have changed exactly one row.
+                  // [mupot#919, RETRACTED] This used to justify dropping the second read
+                  // by asserting "that read is exactly what production D1 could not see
+                  // inside a batch" as settled fact — that mechanism is unconfirmed; see
+                  // the retraction note in tests/flight-land-receipt-916.test.ts.
                   const [id, tenant, flightId, actorKind, actorId, payload, createdAt] = args as [
                     string, string, string, 'member' | 'agent', string, string, string,
                   ]

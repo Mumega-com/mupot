@@ -326,8 +326,12 @@ function makeGovernedLandEnv(taskStatus: 'done' | 'review', verdict: 'approved' 
                 // #916: the landing transition carries `RETURNING score, cost_micro_usd`
                 // and so is issued through all(). Reuse run()'s mutation and hand back the
                 // landed row — the caller reads the FINAL score from it (COALESCE keeps
-                // the stored one when no score is supplied) instead of re-reading the row,
-                // which is what production D1 could not see inside a batch.
+                // the stored one when no score is supplied) instead of re-reading the row.
+                // [mupot#919, RETRACTED] This used to say that second read is "what
+                // production D1 could not see inside a batch" as settled fact — that
+                // mechanism is unconfirmed; see the retraction note in
+                // tests/flight-land-receipt-916.test.ts. Avoiding the second read removes
+                // the dependency either way.
                 if (sql.includes("UPDATE flights SET status='landed'")) {
                   const ran = await this.run() as { meta: { changes: number } }
                   return {
