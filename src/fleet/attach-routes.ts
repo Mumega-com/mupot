@@ -56,12 +56,13 @@ async function upsertRunning(
   agentType: string,
   memberId: string | null,
   host: string,
+  model: string | null = null,
 ): Promise<void> {
   await env.DB.prepare(
     `INSERT INTO fleet_agents
           (agent_id, tenant, display, runtime, squads, lifecycle, provider_contract,
            status, reported_by, agent_type, member_id, host, last_reported_at, updated_at)
-     VALUES (?1, ?2, '', ?3, '[]', ?4, NULL, 'running', ?5, ?6, ?7, ?8, datetime('now'), datetime('now'))
+     VALUES (?1, ?2, '', ?3, '[]', ?4, NULL, 'running', ?5, ?6, ?7, ?8, ?9, datetime('now'), datetime('now'))
      ON CONFLICT(tenant, agent_id) DO UPDATE SET
           runtime          = excluded.runtime,
           lifecycle        = excluded.lifecycle,
@@ -70,11 +71,27 @@ async function upsertRunning(
           agent_type       = excluded.agent_type,
           member_id        = excluded.member_id,
           host             = excluded.host,
+          model            = excluded.model,
           last_reported_at = excluded.last_reported_at,
           updated_at       = excluded.updated_at`,
   )
-    .bind(agentId, env.TENANT_SLUG, runtime, lifecycle, memberId, agentType, memberId, host)
+    .bind(agentId, env.TENANT_SLUG, runtime, lifecycle, memberId, agentType, memberId, host, model)
     .run()
+
+  // Runtime truth reaches the identity record too (harness-native-mupot lane A): the Fleet
+  // Activity dashboard reads agents.model, so a stale identity model (the grok-4.5 class)
+  // must not survive a truthful runtime checkin. Reported-truth discipline: agents.model is
+  // updated from the runtime, labeled runtime-reported downstream.
+  if (model !== null) {
+    await env.DB.prepare(
+      `UPDATE agents
+          SET model = ?1,
+              updated_at = datetime('now')
+        WHERE id = ?2`,
+    )
+      .bind(model, agentId)
+      .run()
+  }
 }
 
 /** Mark a fleet row stopped for the authenticated/key-bound identity. Signed
@@ -119,7 +136,7 @@ const VALID_TYPES = new Set(['builder', 'reviewer', 'weaver', 'brain', 'comms', 
 // Goose / goosed are deliberately excluded — see docs/fleet/goose-non-adoption-2026-07-22.md.
 const VALID_RUNTIMES = new Set([
   'codex', 'claude-code', 'nous', 'hermes', 'hermes-cron',
-  'systemd-user', 'tmux', 'python',
+  'systemd-user', 'tmux', 'python', 'pi',
 ])
 
 const VALID_LIFECYCLES = new Set(['on_demand', 'always_on'])
@@ -187,6 +204,17 @@ fleetAttachApp.post('/attach', async (c) => {
   if (typeof b.runtime !== 'string' || !VALID_RUNTIMES.has(b.runtime)) {
     return c.json({ error: 'bad_request', detail: `runtime: must be one of ${[...VALID_RUNTIMES].join('|')}` }, 400)
   }
+  // Runtime-reported model (harness-native-mupot lane A): optional display metadata, never
+  // an authority. Reported-truth discipline (gate-protocol v2, Appendix A): the runtime
+  // reports what it ACTUALLY loaded; mupot labels it runtime-reported, never canonical.
+  let model: string | null = null
+  if (b.model !== undefined && b.model !== null) {
+    if (typeof b.model !== 'string' || !/^[A-Za-z0-9_./@-]{1,128}$/.test(b.model)) {
+      return c.json({ error: 'bad_request', detail: 'model: must be a 1-128 char string of [A-Za-z0-9_./@-]' }, 400)
+    }
+    model = b.model
+  }
+
   const runtime = b.runtime
 
   // lifecycle is optional; defaults to 'on_demand'.
@@ -224,7 +252,7 @@ fleetAttachApp.post('/attach', async (c) => {
 
   // 7. Upsert (shared with the signed path). display + squads + provider_contract default
   //    on INSERT and are NOT overwritten on UPDATE (preserve any daemon-populated value).
-  await upsertRunning(c.env, agentId, runtime, lifecycle, agentType, memberId, host)
+  await upsertRunning(c.env, agentId, runtime, lifecycle, agentType, memberId, host, model)
 
   // 8. Boot-ack: return the full getAgentView row so the runtime confirms its identity,
   //    type, and capabilities as mupot sees them after the upsert.
