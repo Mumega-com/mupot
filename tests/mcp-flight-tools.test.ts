@@ -75,7 +75,11 @@ function auth(overrides: Partial<AuthContext> = {}): AuthContext {
   }
 }
 
-function makeEnv(agentStatus: 'active' | 'paused' | null = 'active', inboxFull = false) {
+function makeEnv(
+  agentStatus: 'active' | 'paused' | null = 'active',
+  inboxFull = false,
+  extraAgents: Array<{ id: string; squad_id: string; status: 'active' | 'paused'; budget_cap_cents: number | null }> = [],
+) {
   const rows = new Map<string, FlightRow>()
   const cursors = new Map<string, string>()
   let beforeFlightLand: (() => void) | null = null
@@ -102,6 +106,12 @@ function makeEnv(agentStatus: 'active' | 'paused' | null = 'active', inboxFull =
   const agents = new Map<string, { id: string; squad_id: string; slug: string; name: string; role: null; model: null; status: 'active' | 'paused'; created_at: string }>()
   if (agentStatus) {
     agents.set(AGENT_ID, { id: AGENT_ID, squad_id: SQUAD_ID, slug: 'product', name: 'Product', role: null, model: null, status: agentStatus, budget_cap_cents: 100, budget_window: 'day', created_at: 'now' } as never)
+  }
+  for (const extra of extraAgents) {
+    agents.set(extra.id, {
+      id: extra.id, squad_id: extra.squad_id, slug: extra.id, name: extra.id, role: null, model: null,
+      status: extra.status, budget_cap_cents: extra.budget_cap_cents, budget_window: 'day', created_at: 'now',
+    } as never)
   }
   const env = {
     TENANT_SLUG: TENANT,
@@ -150,9 +160,9 @@ function makeEnv(agentStatus: 'active' | 'paused' | null = 'active', inboxFull =
                   return { meta: { changes: inboxFull ? 0 : 1 } }
                 }
                 if (sql.includes('INSERT INTO flights (')) {
-                  const [id, tenant, projectId, agent, goal, trigger, budget, rawMeta] = args as [string, string, string | null, string, string, FlightRow['trigger_source'], number | null, string]
+                  const [id, tenant, projectId, agent, dispatchedBy, goal, trigger, budget, rawMeta] = args as [string, string, string | null, string, string, string, FlightRow['trigger_source'], number | null, string]
                   rows.set(id, {
-                    id, tenant, project_id: projectId, agent, goal, trigger_source: trigger, budget_micro_usd: budget,
+                    id, tenant, project_id: projectId, agent, dispatched_by_agent_id: dispatchedBy, goal, trigger_source: trigger, budget_micro_usd: budget,
                     status: 'preflight', gate_verdict: null, gate_reason: '', score: null,
                     cost_micro_usd: 0, next_run_at: null, created_at: Date.now(), started_at: null,
                     ended_at: null, meta: rawMeta,
@@ -531,6 +541,188 @@ describe('MCP flight tools', () => {
     expect(missingList).toMatchObject({ ok: false, status: 403, error: 'forbidden' })
   })
 
+  // ── executor delegation (flight_dispatch executor-delegation defect) ─────────
+  // Delegating a flight to another agent's seat causes work to appear under that
+  // agent's identity and consume their budget — gated exactly like wake_agent
+  // gates "make another agent act": lead+ on the EXECUTOR's own squad, no
+  // executor consent sought or required (matching wake_agent's posture).
+  const DELEGATE_AGENT_ID = 'agent-delegate'
+
+  it('omitting executor_agent_id dispatches under the caller\'s own seat, byte-identical to pre-delegation behaviour', async () => {
+    const { env } = makeEnv()
+    const out = await invokeTool(auth(), env, 'flight_dispatch', dispatchArgs, 'https://pot.example')
+    expect(out.ok, JSON.stringify(out)).toBe(true)
+    const flight = (out.result as { flight: FlightRow }).flight
+    expect(flight.agent).toBe(AGENT_ID)
+    expect(flight.dispatched_by_agent_id).toBe(AGENT_ID)
+  })
+
+  it('refuses to delegate a flight to another agent without lead on the executor\'s squad', async () => {
+    const { env } = makeEnv('active', false, [
+      { id: DELEGATE_AGENT_ID, squad_id: SQUAD_ID, status: 'active', budget_cap_cents: 100 },
+    ])
+    // auth() only grants 'member' on SQUAD_ID — sufficient to dispatch under one's
+    // own seat, NOT sufficient to make agent-delegate fly instead.
+    const out = await invokeTool(auth(), env, 'flight_dispatch', {
+      ...dispatchArgs,
+      executor_agent_id: DELEGATE_AGENT_ID,
+    }, 'https://pot.example')
+    expect(out).toMatchObject({
+      ok: false, status: 403, error: 'flight_delegation_forbidden',
+      detail: { need: 'lead', scope: 'squad', squad_id: SQUAD_ID },
+    })
+  })
+
+  it('allows delegation with lead on the executor\'s squad — BOTH executor and dispatcher stay recoverable, neither overwrites the other', async () => {
+    const { env, delivered } = makeEnv('active', false, [
+      { id: DELEGATE_AGENT_ID, squad_id: SQUAD_ID, status: 'active', budget_cap_cents: 100 },
+    ])
+    const leadAuth = auth({
+      capabilities: [{ member_id: MEMBER_ID, scope_type: 'squad', scope_id: SQUAD_ID, capability: 'lead' }],
+    })
+    const out = await invokeTool(leadAuth, env, 'flight_dispatch', {
+      ...dispatchArgs,
+      executor_agent_id: DELEGATE_AGENT_ID,
+    }, 'https://pot.example')
+    expect(out.ok, JSON.stringify(out)).toBe(true)
+    const flight = (out.result as { flight: FlightRow }).flight
+    // flight.agent is NEVER overwritten to hide who dispatched — it stays the
+    // EXECUTOR. dispatched_by_agent_id independently carries the dispatcher.
+    expect(flight.agent).toBe(DELEGATE_AGENT_ID)
+    expect(flight.dispatched_by_agent_id).toBe(AGENT_ID)
+    // No executor consent was sought: agent-delegate had no chance to accept or
+    // refuse, matching wake_agent's posture — the work envelope is sent straight
+    // to the executor's inbox.
+    expect(delivered).toHaveLength(1)
+    expect(delivered[0]!.toAgent).toBe(DELEGATE_AGENT_ID)
+  })
+
+  it('refuses delegation to a paused or unknown executor agent', async () => {
+    const { env: pausedEnv } = makeEnv('active', false, [
+      { id: DELEGATE_AGENT_ID, squad_id: SQUAD_ID, status: 'paused', budget_cap_cents: 100 },
+    ])
+    const leadAuth = auth({
+      capabilities: [{ member_id: MEMBER_ID, scope_type: 'squad', scope_id: SQUAD_ID, capability: 'lead' }],
+    })
+    const paused = await invokeTool(leadAuth, pausedEnv, 'flight_dispatch', {
+      ...dispatchArgs,
+      executor_agent_id: DELEGATE_AGENT_ID,
+    }, 'https://pot.example')
+    expect(paused).toMatchObject({ ok: false, status: 409, error: 'executor_agent_inactive' })
+
+    const { env: bareEnv } = makeEnv()
+    const unknown = await invokeTool(leadAuth, bareEnv, 'flight_dispatch', {
+      ...dispatchArgs,
+      executor_agent_id: 'agent-does-not-exist',
+    }, 'https://pot.example')
+    expect(unknown).toMatchObject({ ok: false, status: 404, error: 'executor_agent_not_found' })
+  })
+
+  it('a delegated flight\'s budget ceiling is governed by the EXECUTOR\'s cap, not the dispatcher\'s', async () => {
+    // execute.ts's meter (checkAndReserve) enforces agents.budget_cap_cents keyed
+    // to whichever agent's Durable Object actually runs the cycle — the executor.
+    // agent-delegate's cap (50) is lower than AGENT_ID's (100) and the squad's
+    // (100); a ceiling that (wrongly) used the dispatcher's cap would compute
+    // min(100,100)=100 -> 1,000,000 microUSD and ADMIT 600,000. The fix computes
+    // min(50,100)=50 -> 500,000 microUSD and REFUSES it.
+    const { env } = makeEnv('active', false, [
+      { id: DELEGATE_AGENT_ID, squad_id: SQUAD_ID, status: 'active', budget_cap_cents: 50 },
+    ])
+    const leadAuth = auth({
+      capabilities: [{ member_id: MEMBER_ID, scope_type: 'squad', scope_id: SQUAD_ID, capability: 'lead' }],
+    })
+    const overExecutorCap = await invokeTool(leadAuth, env, 'flight_dispatch', {
+      ...dispatchArgs,
+      executor_agent_id: DELEGATE_AGENT_ID,
+      budget_micro_usd: 600_000,
+    }, 'https://pot.example')
+    expect(overExecutorCap).toMatchObject({
+      ok: false, status: 409, error: 'flight_budget_exceeds_cap', detail: { cap_micro_usd: 500_000 },
+    })
+
+    const withinExecutorCap = await invokeTool(leadAuth, env, 'flight_dispatch', {
+      ...dispatchArgs,
+      executor_agent_id: DELEGATE_AGENT_ID,
+      budget_micro_usd: 500_000,
+    }, 'https://pot.example')
+    expect(withinExecutorCap.ok, JSON.stringify(withinExecutorCap)).toBe(true)
+  })
+
+  // ── signals_json casing (mupot#940) ───────────────────────────────────────────
+  // meta_json in the SAME call uses snake_case, and the tool never documented
+  // signals_json's shape — so snake_case was the natural guess, and it was
+  // silently wrong: an unrecognised key read as undefined, coerced falsy, and
+  // the gate scored the MISSING input as CHECKED-AND-FAILED ('tools_unreachable'
+  // when the truth was "you never told me"). MEASURED: snake_case -> held/no_go,
+  // score 0.005080218046913022 (the FLOOR-driven signature, not a real score);
+  // camelCase -> running/go, score 0.9673638414148399.
+  const snakeCaseSignals = {
+    context_complete: true,
+    tools_reachable: true,
+    budget_remaining_micro_usd: 999_000_000,
+    budget_estimate_micro_usd: 999_000_000,
+    recent_progress: 0.9,
+    progress_per_step: 0.8,
+    waste_per_step: 0.1,
+    step_seconds: 10,
+  }
+
+  it('accepts snake_case signals_json (the previously-silent-wrong casing)', async () => {
+    const { env } = makeEnv()
+    const out = await invokeTool(auth(), env, 'flight_dispatch', {
+      ...dispatchArgs,
+      signals_json: JSON.stringify(snakeCaseSignals),
+    }, 'https://pot.example')
+    expect(out.ok, JSON.stringify(out)).toBe(true)
+    const result = out.result as { flight: FlightRow; preflight: { go: boolean; score: number } }
+    expect(result.preflight.go).toBe(true)
+    expect(result.flight.status).toBe('running')
+  })
+
+  it('still accepts camelCase signals_json (the documented canonical form)', async () => {
+    const { env } = makeEnv()
+    const out = await invokeTool(auth(), env, 'flight_dispatch', {
+      ...dispatchArgs,
+      signals_json: JSON.stringify(signals),
+    }, 'https://pot.example')
+    expect(out.ok, JSON.stringify(out)).toBe(true)
+    const result = out.result as { flight: FlightRow; preflight: { go: boolean } }
+    expect(result.preflight.go).toBe(true)
+    expect(result.flight.status).toBe('running')
+  })
+
+  it('refuses an unrecognised key in signals_json loudly instead of silently scoring it as absent', async () => {
+    const { env, rows } = makeEnv()
+    const out = await invokeTool(auth(), env, 'flight_dispatch', {
+      ...dispatchArgs,
+      signals_json: JSON.stringify({ ...signals, contextCompete: true }), // typo'd key, real one still present
+    }, 'https://pot.example')
+    expect(out).toMatchObject({ ok: false, status: 400, error: 'signals_unknown_key', detail: { key: 'contextCompete' } })
+    expect(rows.size).toBe(0) // never created — refused before a flight row exists
+  })
+
+  it('refuses a missing signal field as signals_missing_fields, and NEVER reports it as tools_unreachable/context_incomplete', async () => {
+    // The general lesson (mupot#940, item 4): a computed refusal reason must mean
+    // "I checked and it failed", never "you didn't tell me". Deleting the two keys
+    // the readiness gate reads directly (contextComplete/toolsReachable) is exactly
+    // the shape that used to fabricate 'context_incomplete'/'tools_unreachable'.
+    const { env, rows } = makeEnv()
+    const incomplete = { ...signals } as Partial<typeof signals>
+    delete incomplete.contextComplete
+    delete incomplete.toolsReachable
+    const out = await invokeTool(auth(), env, 'flight_dispatch', {
+      ...dispatchArgs,
+      signals_json: JSON.stringify(incomplete),
+    }, 'https://pot.example')
+    expect(out).toMatchObject({
+      ok: false, status: 400, error: 'signals_missing_fields',
+      detail: { missing: expect.arrayContaining(['contextComplete', 'toolsReachable']) },
+    })
+    expect(out.error).not.toBe('tools_unreachable')
+    expect(out.error).not.toBe('context_incomplete')
+    expect(rows.size).toBe(0) // never created — refused before a flight row (and its gate reasons) exist
+  })
+
   it('returns a visible flight with parsed metadata', async () => {
     const { env } = makeEnv()
     const dispatched = await invokeTool(auth(), env, 'flight_dispatch', dispatchArgs, 'https://pot.example')
@@ -863,7 +1055,8 @@ describe('MCP granted multi-squad flight lifecycle', () => {
           decided_by TEXT NOT NULL, decided_at TEXT NOT NULL
         );
         CREATE TABLE flights (
-          id TEXT PRIMARY KEY, tenant TEXT NOT NULL, project_id TEXT, agent TEXT NOT NULL, goal TEXT NOT NULL,
+          id TEXT PRIMARY KEY, tenant TEXT NOT NULL, project_id TEXT, agent TEXT NOT NULL,
+          dispatched_by_agent_id TEXT NOT NULL DEFAULT '', goal TEXT NOT NULL,
           status TEXT NOT NULL DEFAULT 'preflight', trigger_source TEXT NOT NULL DEFAULT 'manual',
           gate_verdict TEXT, gate_reason TEXT NOT NULL DEFAULT '', score REAL, budget_micro_usd INTEGER,
           cost_micro_usd INTEGER NOT NULL DEFAULT 0, next_run_at INTEGER,

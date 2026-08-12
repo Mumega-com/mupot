@@ -28,6 +28,11 @@ export interface FlightRow {
   tenant: string
   project_id: string | null
   agent: string
+  // Who DISPATCHED this flight — may differ from `agent` (who FLIES it) when a
+  // lead delegates the flight to another agent's seat (mupot flight_dispatch
+  // executor-delegation; 0094_flight_dispatched_by.sql). Both are always
+  // recoverable; neither field is ever overwritten to hide the other.
+  dispatched_by_agent_id: string
   goal: string
   status: FlightStatus
   trigger_source: TriggerSource
@@ -45,6 +50,11 @@ export interface FlightRow {
 
 export interface NewFlight {
   agent: string
+  // Who is dispatching this flight, if different from `agent`. Omitted (the
+  // common case — schedule/cron dispatch, or a member dispatching under their
+  // own seat) defaults to `agent` itself in createFlight: self-dispatch is a
+  // true fact, not a placeholder.
+  dispatched_by?: string
   goal: string
   project_id?: string | null
   trigger_source?: TriggerSource
@@ -152,11 +162,15 @@ export async function createFlight(env: Env, f: NewFlight, options: CreateFlight
   let result
   try {
     const fence = options.routineRunFence
+    // Self-dispatch (dispatched_by omitted) is a true fact, not a placeholder —
+    // see NewFlight.dispatched_by's docstring.
+    const dispatchedBy = f.dispatched_by ?? f.agent
     const values = [
       id,
       env.TENANT_SLUG,
       f.project_id ?? null,
       f.agent,
+      dispatchedBy,
       f.goal,
       f.trigger_source ?? 'manual',
       f.budget_micro_usd ?? null,
@@ -164,11 +178,11 @@ export async function createFlight(env: Env, f: NewFlight, options: CreateFlight
     ]
     if (fence) {
       result = await env.DB.prepare(
-        `INSERT INTO flights (id, tenant, project_id, agent, goal, status, trigger_source, budget_micro_usd, meta)
-         SELECT ?1, ?2, ?3, ?4, ?5, 'preflight', ?6, ?7, ?8
+        `INSERT INTO flights (id, tenant, project_id, agent, dispatched_by_agent_id, goal, status, trigger_source, budget_micro_usd, meta)
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, 'preflight', ?7, ?8, ?9
           WHERE EXISTS (
             SELECT 1 FROM routine_runs rr
-             WHERE rr.id = ?9 AND rr.tenant = ?10 AND rr.project_id = ?3
+             WHERE rr.id = ?10 AND rr.tenant = ?11 AND rr.project_id = ?3
                AND rr.status IN ('leased','observing')
                AND NOT EXISTS (
                  SELECT 1 FROM routine_run_events requested
@@ -179,8 +193,8 @@ export async function createFlight(env: Env, f: NewFlight, options: CreateFlight
       ).bind(...values, fence.runId, fence.tenant).run()
     } else {
       result = await env.DB.prepare(
-        `INSERT INTO flights (id, tenant, project_id, agent, goal, status, trigger_source, budget_micro_usd, meta)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'preflight', ?6, ?7, ?8)`,
+        `INSERT INTO flights (id, tenant, project_id, agent, dispatched_by_agent_id, goal, status, trigger_source, budget_micro_usd, meta)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'preflight', ?7, ?8, ?9)`,
       ).bind(...values).run()
     }
   } catch (error) {
