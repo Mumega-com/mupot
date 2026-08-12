@@ -150,7 +150,11 @@ orgApp.post('/departments', async (c) => {
     return c.json({ error: 'invalid_json' }, 400)
   }
 
-  const result = await createDepartment(c.env, body)
+  // P0-N1 gate fix (re-gate condition 2026-08-12): construct the input from
+  // known fields — never pass the raw body through. `as CreateDepartmentBody`
+  // does not strip extra JSON fields, so a caller could smuggle kind:'home'
+  // past the plan meter (kind is an internal-only boundary set by bootstrap-self).
+  const result = await createDepartment(c.env, { slug: body.slug, name: body.name })
   if (!result.ok) {
     return c.json({ error: result.error }, result.error === 'slug_taken' ? 409 : 400)
   }
@@ -195,7 +199,13 @@ orgApp.post('/departments/:id/squads', async (c) => {
     return c.json({ error: 'invalid_json' }, 400)
   }
 
-  const result = await createSquad(c.env, departmentId, body)
+  // Same boundary fix as departments (re-gate condition 2026-08-12): construct
+  // from known fields; kind is internal-only.
+  const result = await createSquad(c.env, departmentId, {
+    slug: body.slug,
+    name: body.name,
+    charter: body.charter,
+  })
   if (!result.ok) {
     return c.json({ error: result.error }, result.error === 'slug_taken' ? 409 : 400)
   }
