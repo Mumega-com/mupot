@@ -61,10 +61,17 @@
 // (`dept-home-<memberId>`, `home-<memberId>`, `self-<memberId>`) — a UUID is
 // already slug-safe (lowercase hex + single hyphens, well under the 48-char
 // cap), and because it is 1:1 with a globally-unique member id, no two humans
-// can ever collide on it. That structural uniqueness is why no additional
-// "refuse if this slug exists tenant-wide" check is needed on top: the only way
-// `home-<memberId>` already exists is if THIS SAME human already has a home
-// squad, which the idempotency check above already handles.
+// EVER DERIVE the same slug independently. That does NOT mean the slug is
+// unclaimable by anyone else, though (WARN-1, adversarial review THIRD pass,
+// PR #928): slug is a plain caller-chosen field on POST /departments,
+// the dashboard, and MCP create_department/create_squad — nothing stops a
+// DIFFERENT org:admin from deliberately creating a department or squad slugged
+// `dept-home-<victim-uuid>` / `home-<victim-uuid>` first. So a slug match is
+// NOT by itself proof of "this human's own prior partial attempt" — the
+// adopt-existing path (findDepartmentBySlug/findSquadBySlug, below) requires
+// kind='home' on the row it would adopt for exactly this reason; a squatted
+// work-kind row is refused, never silently adopted into this human's identity
+// chain.
 //
 // DIRECTORY-SESSION CAVEAT + THE FOUNDER GRANT (adversarial review P0-2,
 // resolved by river addendum A — rul-2026-08-11-bootstrap-self): the raw token
@@ -159,11 +166,58 @@
 //   which P0-N1 has since made unreachable through this function — see that
 //   function's own doc comment.
 //
+// ── THIRD ADVERSARIAL PASS (PR #928 review) — the kind:'home' exemption
+// P0-N1 above shipped in fixed itself introduced a WORSE hole, plus two
+// findings in this file's own adopt/founder-grant logic. NOTE: this pass
+// reuses the labels WARN-1/WARN-2/WARN-3 from the reviewer's own numbering —
+// they are UNRELATED to the SECOND-pass WARN-1/WARN-3 above (different
+// findings entirely); every inline comment for this pass says "THIRD pass"
+// explicitly to avoid the collision.
+//
+//   BLOCK-1 (P0) — src/org/index.ts's three org routes cast an unvalidated
+//   JSON body straight into DepartmentInput/SquadInput/AgentInput
+//   (`body = (await c.req.json()) as CreateXBody` — a CAST, not a parse), so
+//   `kind` living on those Input interfaces meant any org:admin/
+//   department:admin/squad:lead caller could POST {"kind":"home",...} and
+//   skip the plan-entitlement gate entirely — worse than P0-N1, and the
+//   planted rows are invisible (the GET routes never select kind). FIX: kind
+//   no longer lives on any Input interface — src/org/service.ts's
+//   createDepartment/createSquad/prepareAgentCreate now take it as a
+//   SEPARATE `opts: CreateOpts` parameter that only this function supplies.
+//   A route body has nowhere to bind `kind` to anymore; the exemption is
+//   unrepresentable from an HTTP request, not merely filtered.
+//
+//   WARN-1 (THIRD pass) — findDepartmentBySlug/findSquadBySlug adopted any
+//   slug match, but slug is caller-chosen everywhere else in the codebase
+//   (POST /departments, the dashboard, MCP create_department/create_squad) —
+//   proving the slug is not proving provenance. FIX: both lookups now
+//   additionally require kind='home' on the row they adopt; a colliding
+//   work-kind (or otherwise squatted) row is refused, not adopted.
+//
+//   WARN-2 (THIRD pass) — the founder-grant INSERT (river addendum A) was
+//   unconditional; capabilities' UNIQUE(member_id, scope_type, scope_id)
+//   meant a pre-existing capability row for this member on the adopted
+//   squad made every retry fail identically, forever (a permanent lockout,
+//   the P0-N2 shape from the other direction). FIX: pre-check the exact
+//   tuple before building the batch; a pre-existing row is adopted (its real
+//   capability value is returned, never widened to admin), and the INSERT
+//   statement is omitted from the batch entirely rather than made a no-op —
+//   assertBatchWritten's per-statement receipt check stays meaningful.
+//
+//   WARN-3 (THIRD pass) — no test exercised compensateCreatedRows against a
+//   batch that ACTUALLY COMMITTED (every prior test used a stub that never
+//   writes). Added — see tests/bootstrap-self.test.ts's "compensator vs a
+//   real committed winner" describe block. compensateCreatedRows is now
+//   exported for that test to call directly (WARN-3's own comment already
+//   explains why calling it through bootstrapSelf a second time cannot reach
+//   this state: the already-bootstrapped pre-check intercepts a second call
+//   for the same human before the batch ever runs).
+//
 // See the build report for exact line references, literal test output, and
 // per-mutation evidence.
 
 import type { D1PreparedStatement } from '@cloudflare/workers-types'
-import type { Env, Agent, AuthContext, Department, Squad } from '../types'
+import type { Env, Agent, AuthContext, Department, Squad, Capability } from '../types'
 import { createDepartment, createSquad, prepareAgentCreate, isValidSlug } from '../org/service'
 import { prepareAgentBoundTokenMint, resolveActiveAgentMember, type AgentForMint } from './service'
 import { assertBatchWritten, type D1WriteLike } from '../lib/receipt'
@@ -312,7 +366,10 @@ export interface BootstrapSelfOk {
   token: { id: string; raw: string; capability: 'observer' | 'member' }
   // river addendum A — the FOUNDING HUMAN's own grant, a separate principal
   // from `member_id` above. Always scope_type='squad', scope_id=squad.id.
-  founder_grant: { member_id: string; squad_id: string; capability: 'admin' }
+  // capability is 'admin' when this call wrote the grant fresh; WARN-2: when a
+  // pre-existing row was adopted instead (never widened), capability reflects
+  // that row's REAL value and disposition is 'existing', not 'created'.
+  founder_grant: { member_id: string; squad_id: string; capability: Capability; disposition: 'created' | 'existing' }
   audit_id: string
   directory_session_note: string
 }
@@ -381,8 +438,15 @@ async function alreadyBootstrappedResult(env: Env, consentingMemberId: string): 
  * pre-existing row from a prior attempt — see findDepartmentBySlug/
  * findSquadBySlug below) — deleting an adopted row out from under a possibly-
  * still-live prior identity would be the P0-N2 lockout's mirror-image bug.
+ *
+ * Exported (WARN-3, THIRD pass, PR #928) SOLELY so tests/bootstrap-self.test.ts
+ * can drive it directly against a REAL, already-committed winner's rows — the
+ * exact "batch that actually committed" case no test exercised before. Calling
+ * bootstrapSelf itself a second time for the same human cannot reach that
+ * state: findExistingBootstrap's pre-check intercepts the second call before
+ * any batch ever runs (see the file header, condition 5).
  */
-async function compensateCreatedRows(
+export async function compensateCreatedRows(
   env: Env,
   squadId: string | null,
   departmentId: string | null,
@@ -412,27 +476,41 @@ async function compensateCreatedRows(
 //
 // deptSlug/squadSlug are SERVER-DERIVED from consentingMemberId (see the file
 // header) and departments.slug is GLOBALLY UNIQUE (migrations/0001_init.sql).
-// So the only possible reason `dept-home-<memberId>` already exists is a PRIOR
-// bootstrap_self attempt for THIS SAME human that got as far as committing the
-// department (or squad) but never finished — e.g. the worker died between the
-// createSquad commit and the final atomic batch. Before this fix there was no
-// adopt-existing branch: createDepartment's slug_taken became
-// provisioning_failed{stage:'department'} FOREVER, with no audit row and no way
-// to recover — every retry hit the exact same dead end. Squads are scoped
-// UNIQUE(department_id, slug) (not globally), but since departmentId here is
-// ALSO this same member's own (freshly created OR adopted) department, the
-// same "can only be this human's own prior row" argument applies transitively.
+// Before this fix there was no adopt-existing branch: createDepartment's
+// slug_taken became provisioning_failed{stage:'department'} FOREVER, with no
+// audit row and no way to recover — every retry hit the exact same dead end
+// whenever a prior bootstrap_self attempt for this same human had committed
+// the department (or squad) but never finished, e.g. the worker died between
+// the createSquad commit and the final atomic batch.
 //
-// This is READ-ONLY discovery — it does not decide policy on its own row (no
-// other member can ever hold this exact slug, by construction), it just finds
-// the row a prior partial run already committed so this run can use it instead
-// of failing forever.
+// WARN-1 (adversarial review, THIRD pass, PR #928) — the PREVIOUS
+// version of this comment asserted "the only way this slug can exist is a
+// prior bootstrap_self by the same human." That claim is FALSE and this
+// function must not rely on it: `dept-home-<memberId>` / `home-<memberId>`
+// are ordinary valid slugs (isValidSlug has no reserved-prefix concept), and
+// slug is CALLER-CHOSEN on POST /departments (src/org/index.ts), the
+// dashboard, and MCP create_department/create_squad — any org:admin can
+// create a department slugged exactly `dept-home-<some-other-uuid>` today.
+// Proving the slug matches is therefore NOT proof of provenance; only
+// kind='home' is (every OTHER creation path in this codebase always defaults
+// to kind='work' — see src/org/service.ts's CreateOpts block comment — so
+// kind='home' is, by construction, reachable ONLY through this function).
+//
+// FIX: both lookups now require kind='home' on the row they would adopt. A
+// slug collision against a kind='work' row (or a 'home' row seeded by
+// something other than this exact human, in some future world where kind
+// alone is not enough) is treated as NOT FOUND — the caller's existing
+// slug_taken_but_not_found handling then refuses provisioning outright
+// (provisioning_failed) rather than silently adopting a stranger's — or a
+// wrong-kind — row into this human's identity chain.
 async function findDepartmentBySlug(env: Env, slug: string): Promise<Department | null> {
-  return env.DB.prepare('SELECT * FROM departments WHERE slug = ?1 LIMIT 1').bind(slug).first<Department>()
+  return env.DB.prepare(`SELECT * FROM departments WHERE slug = ?1 AND kind = 'home' LIMIT 1`)
+    .bind(slug)
+    .first<Department>()
 }
 
 async function findSquadBySlug(env: Env, departmentId: string, slug: string): Promise<Squad | null> {
-  return env.DB.prepare('SELECT * FROM squads WHERE department_id = ?1 AND slug = ?2 LIMIT 1')
+  return env.DB.prepare(`SELECT * FROM squads WHERE department_id = ?1 AND slug = ?2 AND kind = 'home' LIMIT 1`)
     .bind(departmentId, slug)
     .first<Squad>()
 }
@@ -522,14 +600,16 @@ export async function bootstrapSelf(
   // own identity is never "one more work squad"; it is the room they speak in.
   let departmentId: string
   let departmentCreatedHere = false
-  const deptResult = await deps.createDepartment(env, { slug: deptSlug, name: homeName, kind: 'home' })
+  const deptResult = await deps.createDepartment(env, { slug: deptSlug, name: homeName }, { kind: 'home' })
   if (deptResult.ok) {
     departmentId = deptResult.value.id
     departmentCreatedHere = true
   } else if (deptResult.error === 'slug_taken') {
-    // P0-N2 (adversarial review, second pass) — adopt-existing. See
-    // findDepartmentBySlug's doc comment for why this slug can only ever be
-    // THIS SAME human's own row from a prior partial attempt.
+    // P0-N2 (adversarial review, second pass) — adopt-existing, gated by
+    // kind='home' (WARN-1). See findDepartmentBySlug's doc comment: a slug
+    // match alone is NOT proof this is a prior attempt by the same human —
+    // only kind='home' is, since every other creation path defaults to
+    // kind='work'. A colliding non-home row is treated as not found below.
     const existing = await findDepartmentBySlug(env, deptSlug)
     if (!existing) {
       return { ok: false, error: 'provisioning_failed', detail: { stage: 'department', reason: 'slug_taken_but_not_found' } }
@@ -542,15 +622,15 @@ export async function bootstrapSelf(
 
   let squad: Squad
   let squadCreatedHere = false
-  const squadResult = await deps.createSquad(env, departmentId, { slug: squadSlug, name: homeName, kind: 'home' })
+  const squadResult = await deps.createSquad(env, departmentId, { slug: squadSlug, name: homeName }, { kind: 'home' })
   if (squadResult.ok) {
     squad = squadResult.value
     squadCreatedHere = true
   } else if (squadResult.error === 'slug_taken') {
-    // P0-N2 — adopt-existing, same argument as the department above: this
-    // department is EITHER this call's own fresh row OR this same human's own
-    // adopted row, so a squad slug collision under it can only be this same
-    // human's own prior squad.
+    // P0-N2 — adopt-existing, same kind='home' gate as the department above
+    // (WARN-1): a squad slug match under this department is only adoptable
+    // when it is ALSO kind='home' — a work-kind squad squatting on this slug
+    // is never adopted, treated as not-found below instead.
     const existing = await findSquadBySlug(env, departmentId, squadSlug)
     if (!existing) {
       await compensateCreatedRows(env, null, departmentCreatedHere ? departmentId : null)
@@ -564,7 +644,7 @@ export async function bootstrapSelf(
   }
 
   // ── agent + member + weld + capability + token + audit: ONE atomic batch ───
-  const preparedAgent = await deps.prepareAgentCreate(env, squad.id, { slug: agentSlug, name: agentName, kind: 'home' })
+  const preparedAgent = await deps.prepareAgentCreate(env, squad.id, { slug: agentSlug, name: agentName }, { kind: 'home' })
   if (!preparedAgent.ok) {
     if (isEntitlementLimitReason(preparedAgent.error)) await refundBootstrapSelfRateLimit(env, consentingMemberId)
     await compensateCreatedRows(
@@ -629,11 +709,55 @@ export async function bootstrapSelf(
   // simply now, genuinely, holds squad:admin on the home squad it checks, so
   // they can clear it on its own terms if they later choose to bind THIS SAME
   // OAuth session to the new agent via the normal consent flow.
+  //
+  // WARN-2 (adversarial review, THIRD pass, PR #928): this used to be
+  // an UNCONDITIONAL INSERT. capabilities carries UNIQUE(member_id, scope_type,
+  // scope_id) (migrations/0002_members.sql:36) — if the ADOPTED squad (P0-N2,
+  // above) already has ANY capability row for this member on ('squad',
+  // squad.id) — e.g. an operator pre-seated this human on their own home squad
+  // before bootstrap_self ever ran — the unconditional INSERT threw a UNIQUE
+  // violation INSIDE the atomic batch. That error message contains
+  // "capabilities", never "agent_audit", so isBootstrapAuditConflict
+  // misclassified it as a hard failure, and every input here is deterministic
+  // (server-derived slugs, same member, same squad), so every retry failed
+  // identically — a PERMANENT lockout, the P0-N2 shape reached from the other
+  // direction.
+  //
+  // FIX: pre-check for an existing row on the EXACT (consentingMemberId,
+  // 'squad', squad.id) tuple BEFORE building the batch, and only ever include
+  // founderAdminStatement when none exists. A pre-existing row is therefore
+  // never fatal — and NEVER WIDENED: if the pre-seated row already holds
+  // something other than 'admin' (e.g. an operator granted 'member'), this
+  // path does not touch it. The ceiling story (river's condition 3, the
+  // agent's OWN grant clamp) depends on nothing here ever escalating a row it
+  // did not create — see prepareAgentBoundTokenMintForBinding's own "clamp,
+  // never widen" comment (src/members/service.ts) for the sibling doctrine
+  // this mirrors. A statement that is never added cannot trip
+  // assertBatchWritten's per-statement receipt check either — the batch below
+  // only ever contains statements this call actually expects to write >=1 row.
+  //
+  // Residual TOCTOU: a row inserted by something else in the narrow window
+  // between this SELECT and the batch commit would still throw inside the
+  // batch (no ON CONFLICT clause — belt-and-suspenders would fight
+  // assertBatchWritten's uniform per-statement expectation). That failure is
+  // NOT a lockout: it lands in the generic provisioning_failed{stage:'batch'}
+  // path below, and the department/squad were already individually committed
+  // (never touched by this race), so a plain retry re-runs this same pre-check,
+  // now sees the row, and succeeds — unlike the P0-N2/WARN-2 shapes, nothing
+  // here is deterministically doomed.
+  const existingFounderGrant = await env.DB.prepare(
+    `SELECT capability FROM capabilities
+      WHERE member_id = ?1 AND scope_type = 'squad' AND scope_id = ?2
+      LIMIT 1`,
+  ).bind(consentingMemberId, squad.id).first<{ capability: Capability }>()
+
   const founderGrantId = crypto.randomUUID()
-  const founderAdminStatement = env.DB.prepare(
-    `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
-     VALUES (?1, ?2, 'squad', ?3, 'admin')`,
-  ).bind(founderGrantId, consentingMemberId, squad.id)
+  const founderAdminStatement = existingFounderGrant
+    ? null
+    : env.DB.prepare(
+        `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+         VALUES (?1, ?2, 'squad', ?3, 'admin')`,
+      ).bind(founderGrantId, consentingMemberId, squad.id)
 
   // Condition 4 — before/after computed as plain JS values, right here, before
   // any INSERT runs. Nothing later in this function reads them back from D1.
@@ -659,7 +783,11 @@ export async function bootstrapSelf(
   const allStatements: D1PreparedStatement[] = [
     ...preparedAgent.value.statements,
     ...preparedMint.statements,
-    founderAdminStatement,
+    // Only included when there is no pre-existing founder grant to conflict
+    // with (WARN-2 above) — omitted, not a no-op statement, so
+    // assertBatchWritten's per-statement expected>=1 check stays meaningful
+    // for every statement that IS in this array.
+    ...(founderAdminStatement ? [founderAdminStatement] : []),
     auditStatement,
   ]
 
@@ -717,7 +845,14 @@ export async function bootstrapSelf(
     agent: { id: agent.id, slug: agent.slug, name: agent.name },
     member_id: preparedMint.memberId,
     token: { id: preparedMint.tokenId, raw: preparedMint.raw, capability: preparedMint.grantCapability },
-    founder_grant: { member_id: consentingMemberId, squad_id: squad.id, capability: 'admin' },
+    // WARN-2: report the REAL row, not always 'admin' — when a pre-existing
+    // grant was adopted rather than written, capability reflects whatever it
+    // actually holds and disposition says so, so a caller can never be told
+    // "you have admin" when what genuinely exists on the row is something
+    // this path deliberately left untouched.
+    founder_grant: existingFounderGrant
+      ? { member_id: consentingMemberId, squad_id: squad.id, capability: existingFounderGrant.capability, disposition: 'existing' }
+      : { member_id: consentingMemberId, squad_id: squad.id, capability: 'admin', disposition: 'created' },
     audit_id: auditId,
     directory_session_note: DIRECTORY_SESSION_NOTE,
   }

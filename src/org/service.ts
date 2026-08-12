@@ -12,14 +12,37 @@ import type { Env, Department, Squad, Agent, Effort, Autonomy, BudgetWindow, Org
 import { isEffort, isAutonomy, isBudgetWindow } from '../types'
 import { checkCreateLimit } from '../billing/entitlement'
 
-// ── kind (migration 0093, mupot#925 P0-N1) ─────────────────────────────────────
+// ── kind (migration 0093, mupot#925 P0-N1; UNSETTABLE-BY-BODY fix, mupot#925
+// P0-N3 / PR #928) ──────────────────────────────────────────────────────────
 // 'work' (default) counts against PLAN_LIMITS; 'home' is bootstrap_self's
 // per-human identity container and is STRUCTURALLY exempt — the entitlement
-// gate below only ever runs when the row being created is kind='work'. See
-// src/billing/plans.ts's maxDepartments comment and src/members/bootstrap-self.ts
-// for the caller that passes kind:'home'. Every OTHER call site in this codebase
-// (src/org/index.ts, src/dashboard/index.ts, src/mcp/provision.ts) never sets
-// `kind` on its input, so it defaults to 'work' — unchanged behavior.
+// gate below only ever runs when the row being created is kind='work'.
+//
+// P0-N3: kind used to live on DepartmentInput/SquadInput/AgentInput — the SAME
+// shape the three authenticated REST routes (src/org/index.ts) cast an
+// unvalidated JSON body into (`body = (await c.req.json()) as CreateXBody`,
+// a CAST not a parse — TypeScript's excess-property check does not apply to a
+// variable, only an object literal). Any org:admin/department:admin/squad:lead
+// caller could POST `{"slug":"x","name":"x","kind":"home"}` and skip the
+// entitlement gate entirely — WORSE than the bug P0-N1 fixed, because the
+// planted rows are also invisible (GET /departments and GET .../squads select
+// an explicit column list that never includes kind).
+//
+// THE FIX: kind is no longer a field any Input interface can carry, so no
+// JSON body — however permissive its parsing — can ever set it. It is instead
+// a SEPARATE parameter (`opts.kind`) that only a caller with the TypeScript
+// reference to these functions can pass, and the only caller that ever does is
+// src/members/bootstrap-self.ts. A route handler that hands a request body
+// straight to input can no longer reach this parameter at all — not because
+// something strips the key, but because the key has nowhere to bind to. A
+// fourth route added later inherits this for free; there is no allowlist to
+// forget to update.
+export interface CreateOpts {
+  // 'work' (default) | 'home'. Omit entirely on every call site except
+  // src/members/bootstrap-self.ts — see the block comment above.
+  kind?: OrgKind
+}
+
 const ORG_KINDS: readonly OrgKind[] = ['work', 'home']
 export function isOrgKind(v: unknown): v is OrgKind {
   return typeof v === 'string' && (ORG_KINDS as readonly string[]).includes(v)
@@ -57,19 +80,19 @@ export type CreateResult<T> = { ok: true; value: T } | { ok: false; error: strin
 export interface DepartmentInput {
   slug?: unknown
   name?: unknown
-  // 'work' (default) | 'home' — see the kind block above. Only bootstrap_self
-  // ever passes 'home'; every other caller omits this and gets 'work'.
-  kind?: unknown
 }
 
 export async function createDepartment(
   env: Env,
   input: DepartmentInput,
+  opts: CreateOpts = {},
 ): Promise<CreateResult<Department>> {
   if (!isValidSlug(input.slug)) return { ok: false, error: 'invalid_slug' }
   if (!isNonEmptyString(input.name)) return { ok: false, error: 'invalid_name' }
-  const kind: OrgKind = input.kind === undefined ? 'work' : (input.kind as OrgKind)
-  if (!isOrgKind(kind)) return { ok: false, error: 'invalid_kind' }
+  // kind is a caller-supplied, TypeScript-typed OrgKind (never parsed from an
+  // unknown request body — see the block comment above) — no runtime
+  // validation is meaningful here beyond the type system itself.
+  const kind: OrgKind = opts.kind ?? 'work'
 
   // ── Plan ENTITLEMENT gate (mupot#925 P0-N1) — the pot's tier must permit one
   // more department. ONLY when creating a WORK department: a 'home' create
@@ -111,8 +134,6 @@ export interface SquadInput {
   slug?: unknown
   name?: unknown
   charter?: unknown
-  // 'work' (default) | 'home' — see the kind block above.
-  kind?: unknown
   // work-unit fields (optional; defaults applied when omitted)
   role?: unknown
   okr?: unknown
@@ -127,6 +148,7 @@ export async function createSquad(
   env: Env,
   departmentId: string,
   input: SquadInput,
+  opts: CreateOpts = {},
 ): Promise<CreateResult<Squad>> {
   if (!isValidSlug(input.slug)) return { ok: false, error: 'invalid_slug' }
   if (!isNonEmptyString(input.name)) return { ok: false, error: 'invalid_name' }
@@ -184,8 +206,9 @@ export async function createSquad(
     input.budget_window === undefined ? 'week' : (input.budget_window as BudgetWindow)
   if (!isBudgetWindow(budget_window)) return { ok: false, error: 'invalid_budget_window' }
 
-  const kind: OrgKind = input.kind === undefined ? 'work' : (input.kind as OrgKind)
-  if (!isOrgKind(kind)) return { ok: false, error: 'invalid_kind' }
+  // kind is a caller-supplied, TypeScript-typed OrgKind (never parsed from an
+  // unknown request body — see the block comment near CreateOpts above).
+  const kind: OrgKind = opts.kind ?? 'work'
 
   // ── Plan ENTITLEMENT gate (S6; kind-filtered per mupot#925 P0-N1) — the pot's
   // tier must permit one more WORK squad. This is a pot-level invariant (the
@@ -260,8 +283,6 @@ export interface AgentInput {
   role?: unknown
   model?: unknown
   status?: unknown
-  // 'work' (default) | 'home' — see the kind block above.
-  kind?: unknown
   // work-unit fields (optional; defaults applied when omitted)
   okr?: unknown
   kpi_target?: unknown
@@ -330,6 +351,7 @@ export async function prepareAgentCreate(
   env: Env,
   squadId: string,
   input: AgentInput,
+  opts: CreateOpts = {},
 ): Promise<CreateResult<PreparedAgentCreate>> {
   if (!isValidSlug(input.slug)) return { ok: false, error: 'invalid_slug' }
   if (!isNonEmptyString(input.name)) return { ok: false, error: 'invalid_name' }
@@ -409,8 +431,9 @@ export async function prepareAgentCreate(
     if (!parent) return { ok: false, error: 'parent_agent_not_found' }
   }
 
-  const kind: OrgKind = input.kind === undefined ? 'work' : (input.kind as OrgKind)
-  if (!isOrgKind(kind)) return { ok: false, error: 'invalid_kind' }
+  // kind is a caller-supplied, TypeScript-typed OrgKind (never parsed from an
+  // unknown request body — see the block comment near CreateOpts above).
+  const kind: OrgKind = opts.kind ?? 'work'
 
   // ── Plan ENTITLEMENT gate (S6; kind-filtered per mupot#925 P0-N1) — the pot's
   // tier must permit one more WORK agent. Pot-level invariant (the tier's
@@ -505,8 +528,9 @@ export async function createAgent(
   env: Env,
   squadId: string,
   input: AgentInput,
+  opts: CreateOpts = {},
 ): Promise<CreateResult<Agent>> {
-  const prepared = await prepareAgentCreate(env, squadId, input)
+  const prepared = await prepareAgentCreate(env, squadId, input, opts)
   if (!prepared.ok) return prepared
   try {
     await env.DB.batch(prepared.value.statements)

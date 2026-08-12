@@ -153,20 +153,28 @@ describe('createDepartment — maxDepartments enforcement (mupot#925 P0-N1)', ()
 // for a kind:'home' input — proven by the create succeeding even when the mock
 // is configured at (or past) the ceiling.
 describe('kind:\'home\' is structurally exempt from every plan counter (mupot#925 P0-N1)', () => {
+  // kind now arrives ONLY via the third `opts` parameter (mupot#925 P0-928,
+  // BLOCK-1) — never via a field on the input object — so these calls pass
+  // `{ kind: 'home' }` as opts, not spread into the input literal. See
+  // src/org/service.ts's CreateOpts block comment for why: DepartmentInput/
+  // SquadInput/AgentInput no longer declare a `kind` field at all, so a JSON
+  // request body (cast, not parsed, at src/org/index.ts) has nowhere to bind
+  // a `kind` key to — the exemption is reachable only from TypeScript code
+  // that has the literal `opts` parameter, i.e. only bootstrap-self.ts.
   it('createDepartment: a home department succeeds even at/past the free department ceiling', async () => {
-    const res = await createDepartment(makeEnv({ tier: 'free', departments: 5 }), { ...DEPARTMENT, kind: 'home' })
+    const res = await createDepartment(makeEnv({ tier: 'free', departments: 5 }), DEPARTMENT, { kind: 'home' })
     expect(res.ok).toBe(true)
     if (res.ok) expect(res.value.kind).toBe('home')
   })
 
   it('createSquad: a home squad succeeds even at/past the free squad ceiling', async () => {
-    const res = await createSquad(makeEnv({ tier: 'free', squads: 5 }), 'dept-1', { ...SQUAD, kind: 'home' })
+    const res = await createSquad(makeEnv({ tier: 'free', squads: 5 }), 'dept-1', SQUAD, { kind: 'home' })
     expect(res.ok).toBe(true)
     if (res.ok) expect(res.value.kind).toBe('home')
   })
 
   it('createAgent: a home agent succeeds even at/past the free agent ceiling', async () => {
-    const res = await createAgent(makeEnv({ tier: 'free', agents: 5 }), 'squad-1', { ...AGENT, kind: 'home' })
+    const res = await createAgent(makeEnv({ tier: 'free', agents: 5 }), 'squad-1', AGENT, { kind: 'home' })
     expect(res.ok).toBe(true)
     if (res.ok) expect(res.value.kind).toBe('home')
   })
@@ -184,5 +192,38 @@ describe('kind:\'home\' is structurally exempt from every plan counter (mupot#92
       ok: false,
       error: 'agent_limit_reached',
     })
+  })
+})
+
+// BLOCK-1 (P0, mupot#925 P0-928): a `kind` key ON THE INPUT OBJECT — exactly
+// the shape an unvalidated JSON request body takes at src/org/index.ts
+// (`body = (await c.req.json()) as CreateXBody`, a CAST that lets an extra
+// key ride along unrejected) — must be silently IGNORED by the service layer.
+// The gate exemption is reachable ONLY through the third `opts` parameter,
+// never through anything that could originate from a caller's JSON body.
+//
+// MUTATION-CHECK: reverting src/org/service.ts's kind derivation from
+// `opts.kind ?? 'work'` back to reading `input.kind` (the pre-fix shape) made
+// every test below fail — see the build report for the literal red output.
+describe('BLOCK-1: a `kind` field ON THE INPUT OBJECT is never honored — only the opts parameter is', () => {
+  it('createDepartment: input.kind="home" at the free department ceiling is still blocked', async () => {
+    const res = await createDepartment(makeEnv({ tier: 'free', departments: 1 }), { ...DEPARTMENT, kind: 'home' })
+    expect(res).toEqual({ ok: false, error: 'department_limit_reached' })
+  })
+
+  it('createSquad: input.kind="home" at the free squad ceiling is still blocked', async () => {
+    const res = await createSquad(makeEnv({ tier: 'free', squads: 1 }), 'dept-1', { ...SQUAD, kind: 'home' })
+    expect(res).toEqual({ ok: false, error: 'squad_limit_reached' })
+  })
+
+  it('createAgent: input.kind="home" at the free agent ceiling is still blocked', async () => {
+    const res = await createAgent(makeEnv({ tier: 'free', agents: 2 }), 'squad-1', { ...AGENT, kind: 'home' })
+    expect(res).toEqual({ ok: false, error: 'agent_limit_reached' })
+  })
+
+  it('createDepartment: input.kind="home" UNDER the ceiling creates a normal kind="work" row (the key is ignored, not just blocked)', async () => {
+    const res = await createDepartment(makeEnv({ tier: 'free', departments: 0 }), { ...DEPARTMENT, kind: 'home' })
+    expect(res.ok).toBe(true)
+    if (res.ok) expect(res.value.kind).toBe('work')
   })
 })

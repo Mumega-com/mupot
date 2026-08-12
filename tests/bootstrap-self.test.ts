@@ -33,6 +33,7 @@ import {
   defaultBootstrapSelfDeps,
   checkBootstrapSelfRateLimit,
   refundBootstrapSelfRateLimit,
+  compensateCreatedRows,
   type BootstrapSelfDeps,
   type BootstrapAuth,
 } from '../src/members/bootstrap-self'
@@ -250,7 +251,7 @@ describe('success path', () => {
     expect(out.ok).toBe(true)
     if (!out.ok) throw new Error('expected success')
 
-    expect(out.founder_grant).toEqual({ member_id: HUMAN, squad_id: out.squad.id, capability: 'admin' })
+    expect(out.founder_grant).toEqual({ member_id: HUMAN, squad_id: out.squad.id, capability: 'admin', disposition: 'created' })
 
     const humanRows = harness.sqlite
       .prepare('SELECT scope_type, scope_id, capability FROM capabilities WHERE member_id = ?')
@@ -589,10 +590,10 @@ describe('P0-N2: a prior partial attempt\'s dept/squad is ADOPTED, not a permane
     // SAME server-derived slugs bootstrapSelf itself would compute.
     const deptSlug = `dept-home-${HUMAN}`
     const squadSlug = `home-${HUMAN}`
-    const deptRes = await createDepartment(env, { slug: deptSlug, name: 'Home — Aria', kind: 'home' })
+    const deptRes = await createDepartment(env, { slug: deptSlug, name: 'Home — Aria' }, { kind: 'home' })
     expect(deptRes.ok).toBe(true)
     if (!deptRes.ok) throw new Error('setup failed')
-    const squadRes = await createSquad(env, deptRes.value.id, { slug: squadSlug, name: 'Home — Aria', kind: 'home' })
+    const squadRes = await createSquad(env, deptRes.value.id, { slug: squadSlug, name: 'Home — Aria' }, { kind: 'home' })
     expect(squadRes.ok).toBe(true)
     if (!squadRes.ok) throw new Error('setup failed')
 
@@ -617,9 +618,9 @@ describe('P0-N2: a prior partial attempt\'s dept/squad is ADOPTED, not a permane
     const env = envFor(harness)
     const deptSlug = `dept-home-${HUMAN}`
     const squadSlug = `home-${HUMAN}`
-    const deptRes = await createDepartment(env, { slug: deptSlug, name: 'Home — Aria', kind: 'home' })
+    const deptRes = await createDepartment(env, { slug: deptSlug, name: 'Home — Aria' }, { kind: 'home' })
     if (!deptRes.ok) throw new Error('setup failed')
-    const squadRes = await createSquad(env, deptRes.value.id, { slug: squadSlug, name: 'Home — Aria', kind: 'home' })
+    const squadRes = await createSquad(env, deptRes.value.id, { slug: squadSlug, name: 'Home — Aria' }, { kind: 'home' })
     if (!squadRes.ok) throw new Error('setup failed')
 
     const depsWithFailingMintPrepare: BootstrapSelfDeps = {
@@ -660,7 +661,10 @@ describe('P0-N1: a fresh free-tier pot admits MANY humans via bootstrap_self, no
       results.push(await bootstrapSelf(env, unboundDirectoryAuth(h), `Agent-${h}`))
     }
     const succeeded = results.filter((r) => r.ok)
-    expect(succeeded.length).toBeGreaterThanOrEqual(3)
+    // Exactly 3 humans were attempted above — === is the honest assertion;
+    // >= let a regression that silently dropped an attempt (or double-counted
+    // one) pass unnoticed (adversarial review, PR #928 review).
+    expect(succeeded.length).toBe(3)
 
     // Each human got their OWN distinct home department/squad/agent.
     const squadIds = new Set(succeeded.map((r) => (r as { squad: { id: string } }).squad.id))
@@ -688,5 +692,242 @@ describe('LOW-4: slugs stay within the 48-char cap for a REAL UUID-length member
     expect(out.department.slug.length).toBe(46)
     expect(out.squad.slug.length).toBeLessThanOrEqual(48)
     expect(out.agent.slug.length).toBeLessThanOrEqual(48)
+  })
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// 11. WARN-2 (third adversarial pass, PR #928) — a pre-existing founder-grant
+//    row on the adopted home squad must not be a permanent lockout, and must
+//    never be silently widened.
+// ════════════════════════════════════════════════════════════════════════════
+describe('WARN-2: a pre-existing founder-grant row is adopted, never fatal, never widened', () => {
+  // MUTATION-CHECK (per the build brief): reverting bootstrap-self.ts's
+  // founderAdminStatement back to an unconditional INSERT (no pre-check, no
+  // conditional statement) makes this test fail with
+  // `provisioning_failed{stage:'batch', reason: '...UNIQUE constraint
+  // failed: capabilities...'}` instead of ok:true — see the build report for
+  // the literal red output.
+  it('a pre-existing "member" grant on the home squad does not block bootstrap_self, and is not upgraded to admin', async () => {
+    const env = envFor(harness)
+    const deptSlug = `dept-home-${HUMAN}`
+    const squadSlug = `home-${HUMAN}`
+
+    // Simulate an operator having pre-seated this human on their own
+    // (not-yet-created-by-them) home squad — reachable whenever an operator
+    // grants capabilities before the human ever calls bootstrap_self, or a
+    // prior partial attempt got as far as the squad but this exact row was
+    // seeded out-of-band.
+    const deptRes = await createDepartment(env, { slug: deptSlug, name: 'Home — Aria' }, { kind: 'home' })
+    if (!deptRes.ok) throw new Error('setup failed')
+    const squadRes = await createSquad(env, deptRes.value.id, { slug: squadSlug, name: 'Home — Aria' }, { kind: 'home' })
+    if (!squadRes.ok) throw new Error('setup failed')
+    harness.sqlite.exec(
+      `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+       VALUES ('pre-seeded-grant', '${HUMAN}', 'squad', '${squadRes.value.id}', 'member')`,
+    )
+
+    // Before the WARN-2 fix: this threw inside the atomic batch on
+    // capabilities' UNIQUE(member_id, scope_type, scope_id), was
+    // misclassified (the error message says "capabilities", never
+    // "agent_audit"), and failed identically on every retry — forever.
+    const out = await bootstrapSelf(env, unboundDirectoryAuth(), 'Aria')
+    expect(out.ok).toBe(true)
+    if (!out.ok) throw new Error(`expected success, got: ${JSON.stringify(out)}`)
+
+    // Reported honestly: the REAL pre-existing capability, not always 'admin'.
+    expect(out.founder_grant).toEqual({
+      member_id: HUMAN, squad_id: squadRes.value.id, capability: 'member', disposition: 'existing',
+    })
+
+    // Never widened: exactly the one pre-seeded row, still 'member'.
+    const rows = harness.sqlite
+      .prepare('SELECT id, capability FROM capabilities WHERE member_id = ? AND scope_type = \'squad\' AND scope_id = ?')
+      .all(HUMAN, squadRes.value.id) as { id: string; capability: string }[]
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toEqual({ id: 'pre-seeded-grant', capability: 'member' })
+  })
+
+  it('a pre-existing "lead" grant is likewise adopted, not upgraded to admin', async () => {
+    const env = envFor(harness)
+    const deptSlug = `dept-home-${HUMAN}`
+    const squadSlug = `home-${HUMAN}`
+    const deptRes = await createDepartment(env, { slug: deptSlug, name: 'Home — Aria' }, { kind: 'home' })
+    if (!deptRes.ok) throw new Error('setup failed')
+    const squadRes = await createSquad(env, deptRes.value.id, { slug: squadSlug, name: 'Home — Aria' }, { kind: 'home' })
+    if (!squadRes.ok) throw new Error('setup failed')
+    harness.sqlite.exec(
+      `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+       VALUES ('pre-seeded-lead', '${HUMAN}', 'squad', '${squadRes.value.id}', 'lead')`,
+    )
+
+    const out = await bootstrapSelf(env, unboundDirectoryAuth(), 'Aria')
+    expect(out.ok).toBe(true)
+    if (!out.ok) throw new Error(`expected success, got: ${JSON.stringify(out)}`)
+    expect(out.founder_grant.capability).toBe('lead')
+    expect(out.founder_grant.disposition).toBe('existing')
+
+    const row = harness.sqlite
+      .prepare('SELECT capability FROM capabilities WHERE id = ?').get('pre-seeded-lead') as { capability: string }
+    expect(row.capability).toBe('lead') // untouched — never widened to admin
+  })
+
+  it('with NO pre-existing grant, the founder grant is written fresh as admin (regression guard on the common path)', async () => {
+    const env = envFor(harness)
+    const out = await bootstrapSelf(env, unboundDirectoryAuth(), 'Aria')
+    expect(out.ok).toBe(true)
+    if (!out.ok) throw new Error('expected success')
+    expect(out.founder_grant).toEqual({
+      member_id: HUMAN, squad_id: out.squad.id, capability: 'admin', disposition: 'created',
+    })
+  })
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// 12. WARN-1 (third adversarial pass, PR #928) — the adopt-existing path must
+//    re-prove ownership by kind='home', not by slug match alone.
+// ════════════════════════════════════════════════════════════════════════════
+describe('WARN-1: adopt-existing requires kind=\'home\' on the row it adopts', () => {
+  // MUTATION-CHECK: reverting findDepartmentBySlug/findSquadBySlug back to a
+  // plain slug lookup (dropping `AND kind = 'home'`) makes both tests below
+  // fail — bootstrapSelf would silently ADOPT the squatted work-kind row
+  // instead of refusing it. See the build report for the literal red output.
+  it('a kind="work" department squatting on the derived slug is refused, never adopted', async () => {
+    const env = envFor(harness)
+    const deptSlug = `dept-home-${HUMAN}`
+    // A DIFFERENT org:admin (or an earlier unrelated create) creating an
+    // ordinary WORK department that happens to collide with this human's
+    // server-derived slug — slug is caller-chosen everywhere else in this
+    // codebase (POST /departments, dashboard, MCP create_department), so
+    // this is directly reachable, not a contrived setup.
+    const squattedDept = await createDepartment(env, { slug: deptSlug, name: 'Someone Else\'s Work Dept' })
+    expect(squattedDept.ok).toBe(true)
+    if (!squattedDept.ok) throw new Error('setup failed')
+    expect(squattedDept.value.kind).toBe('work')
+
+    const out = await bootstrapSelf(env, unboundDirectoryAuth(), 'Aria')
+    expect(out.ok).toBe(false)
+    if (out.ok) throw new Error('expected refusal — must not adopt a work-kind department')
+    expect(out.error).toBe('provisioning_failed')
+    expect(out.detail).toEqual({ stage: 'department', reason: 'slug_taken_but_not_found' })
+
+    // The squatted row is untouched — nothing was created or deleted.
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM departments').get()!.n).toBe(1)
+    expect(harness.sqlite.prepare('SELECT kind FROM departments WHERE slug = ?').get(deptSlug))
+      .toEqual({ kind: 'work' })
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM agents').get()!.n).toBe(0)
+  })
+
+  it('a kind="work" squad squatting on the derived slug (under this human\'s own adopted department) is refused, never adopted', async () => {
+    const env = envFor(harness)
+    const deptSlug = `dept-home-${HUMAN}`
+    const squadSlug = `home-${HUMAN}`
+
+    // This human's OWN legitimate home department already exists (kind='home')
+    // — e.g. from a genuinely prior partial attempt — but under it, someone
+    // else's ordinary work squad happens to collide with the derived squad
+    // slug.
+    const deptRes = await createDepartment(env, { slug: deptSlug, name: 'Home — Aria' }, { kind: 'home' })
+    if (!deptRes.ok) throw new Error('setup failed')
+    const squattedSquad = await createSquad(env, deptRes.value.id, { slug: squadSlug, name: 'Someone Else\'s Work Squad' })
+    expect(squattedSquad.ok).toBe(true)
+    if (!squattedSquad.ok) throw new Error('setup failed')
+    expect(squattedSquad.value.kind).toBe('work')
+
+    const out = await bootstrapSelf(env, unboundDirectoryAuth(), 'Aria')
+    expect(out.ok).toBe(false)
+    if (out.ok) throw new Error('expected refusal — must not adopt a work-kind squad')
+    expect(out.error).toBe('provisioning_failed')
+    expect(out.detail).toEqual({ stage: 'squad', reason: 'slug_taken_but_not_found' })
+
+    // Nothing deleted (compensateCreatedRows is never called on an ADOPTED
+    // department — departmentCreatedHere is false here), nothing created.
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM departments').get()!.n).toBe(1)
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM squads').get()!.n).toBe(1)
+    expect(harness.sqlite.prepare('SELECT kind FROM squads WHERE slug = ?').get(squadSlug))
+      .toEqual({ kind: 'work' })
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM agents').get()!.n).toBe(0)
+  })
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// 13. WARN-3 (third adversarial pass, PR #928) — compensateCreatedRows against
+//    a batch that ACTUALLY COMMITTED, not a stub. The dangerous shape: two
+//    same-member calls race, the loser (A) created dept+squad, the winner (B)
+//    adopted them and committed first, A's own batch then fails on agents'
+//    UNIQUE(squad_id, slug) (NOT agent_audit — so auditConflict is false) and
+//    A's failure handler calls compensateCreatedRows against the SAME
+//    squad/department ids that now hold B's live, committed identity.
+// ════════════════════════════════════════════════════════════════════════════
+describe('WARN-3: compensateCreatedRows against a batch that ACTUALLY COMMITTED does not destroy a live winner', () => {
+  it('deleting a squad/department that hold a real, committed agent is blocked by the agent_member_bindings FK RESTRICT — nothing is lost', async () => {
+    const env = envFor(harness)
+    const deptSlug = `dept-home-${HUMAN}`
+    const squadSlug = `home-${HUMAN}`
+
+    // Step 1 — "A": creates dept+squad exactly as bootstrapSelf itself would
+    // (individually-committing calls, matching the file's own architecture).
+    const deptRes = await createDepartment(env, { slug: deptSlug, name: 'Home — Aria' }, { kind: 'home' })
+    if (!deptRes.ok) throw new Error('setup failed')
+    const squadRes = await createSquad(env, deptRes.value.id, { slug: squadSlug, name: 'Home — Aria' }, { kind: 'home' })
+    if (!squadRes.ok) throw new Error('setup failed')
+
+    // Step 2 — "B": a full, real bootstrapSelf call for the SAME human ADOPTS
+    // A's dept+squad (P0-N2) and commits the entire agent/mint/founder/audit
+    // batch for real. This is the WINNER — every row below is genuinely live,
+    // not a stub.
+    const winner = await bootstrapSelf(env, unboundDirectoryAuth(), 'Aria')
+    expect(winner.ok).toBe(true)
+    if (!winner.ok) throw new Error('expected the winner to succeed')
+    expect(winner.department.id).toBe(deptRes.value.id) // adopted, not fresh
+    expect(winner.squad.id).toBe(squadRes.value.id)
+
+    // Sanity: the winner's identity is genuinely committed (not a mock).
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM agents WHERE id = ?').get(winner.agent.id))
+      .toEqual({ n: 1 })
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM agent_member_bindings WHERE agent_id = ?').get(winner.agent.id))
+      .toEqual({ n: 1 })
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM member_tokens WHERE id = ?').get(winner.token.id))
+      .toEqual({ n: 1 })
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM agent_audit WHERE id = ?').get(winner.audit_id))
+      .toEqual({ n: 1 })
+
+    // Step 3 — "A"'s own batch (agent insert with the SAME deterministic slug
+    // `self-<HUMAN>` in the SAME squad B just committed to) would fail on
+    // agents' UNIQUE(squad_id, slug) — not agent_audit — so A's failure
+    // handler calls compensateCreatedRows with THE SAME squad/department ids
+    // A itself created in step 1 (squadCreatedHere/departmentCreatedHere were
+    // both true for A). This is that exact call, direct.
+    await expect(compensateCreatedRows(env, squadRes.value.id, deptRes.value.id)).resolves.toBeUndefined()
+
+    // THE ASSERTION THIS TEST EXISTS FOR: B's live identity survived. If any
+    // of these fail, the compensator destroyed a real winner's rows and that
+    // is a P0, not something to patch around here.
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM departments WHERE id = ?').get(deptRes.value.id))
+      .toEqual({ n: 1 })
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM squads WHERE id = ?').get(squadRes.value.id))
+      .toEqual({ n: 1 })
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM agents WHERE id = ?').get(winner.agent.id))
+      .toEqual({ n: 1 })
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM agent_member_bindings WHERE agent_id = ?').get(winner.agent.id))
+      .toEqual({ n: 1 })
+    expect(harness.sqlite.prepare('SELECT revoked_at FROM member_tokens WHERE id = ?').get(winner.token.id))
+      .toEqual({ revoked_at: null })
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM agent_audit WHERE id = ?').get(winner.audit_id))
+      .toEqual({ n: 1 })
+  })
+
+  it('CONTROL: the same compensator call DOES delete a squad/department that hold no live agent (proves the assertions above are not vacuous)', async () => {
+    const env = envFor(harness)
+    const deptRes = await createDepartment(env, { slug: 'orphan-dept', name: 'Orphan' }, { kind: 'home' })
+    if (!deptRes.ok) throw new Error('setup failed')
+    const squadRes = await createSquad(env, deptRes.value.id, { slug: 'orphan-squad', name: 'Orphan' }, { kind: 'home' })
+    if (!squadRes.ok) throw new Error('setup failed')
+
+    await compensateCreatedRows(env, squadRes.value.id, deptRes.value.id)
+
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM departments WHERE id = ?').get(deptRes.value.id))
+      .toEqual({ n: 0 })
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM squads WHERE id = ?').get(squadRes.value.id))
+      .toEqual({ n: 0 })
   })
 })
