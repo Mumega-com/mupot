@@ -463,6 +463,13 @@ tasksApp.post('/', async (c) => {
   ) {
     return c.json({ error: 'invalid_gate_owner' }, 400)
   }
+  // Reject a bare-slug gate_owner at write time — it is unverdictable (247858f1).
+  if (gateOwner !== null && gateOwner !== undefined && !isValidGateOwnerForm(gateOwner)) {
+    return c.json(
+      { error: 'invalid_gate_owner', detail: "gate_owner must be of the form 'gate:<owner>' — nothing else can match an insertable grant" },
+      400,
+    )
+  }
 
   const auth = c.get('auth')
   const projectId = body.project_id === undefined || body.project_id === null
@@ -723,7 +730,18 @@ tasksApp.patch('/:id', async (c) => {
     if (body.gate_owner === null) {
       next.gate_owner = null
     } else if (typeof body.gate_owner === 'string' && body.gate_owner.trim().length > 0) {
-      next.gate_owner = body.gate_owner.trim()
+      const trimmed = body.gate_owner.trim()
+      // Same write-time form guard as task_create (247858f1): reject a bare slug
+      // that could never match a grant, including on the owner/admin historical
+      // review-repair path above — a repair that writes another unverdictable
+      // value is not a repair.
+      if (!isValidGateOwnerForm(trimmed)) {
+        return c.json(
+          { error: 'invalid_gate_owner', detail: "gate_owner must be of the form 'gate:<owner>' — nothing else can match an insertable grant" },
+          400,
+        )
+      }
+      next.gate_owner = trimmed
     } else {
       return c.json({ error: 'invalid_gate_owner' }, 400)
     }
@@ -1129,6 +1147,7 @@ tasksApp.post('/:id/pipeline', async (c) => {
 // DELETE body: same shape — revoke = hard delete (the verdict receipt IS the audit trail)
 
 import { isExternallySourced } from './provenance'
+import { isValidGateOwnerForm } from './service'
 import {
   grantGateCapability,
   parseGateGrantArgs,
