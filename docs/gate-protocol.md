@@ -78,16 +78,24 @@ no test, because it is what a reader checks instead of asking the harder questio
 **Open** until a `task_verdict` (`approved`/`rejected`) is recorded by a principal holding the
 exact capability named in the task's `gate_owner`. **Closed** the moment that verdict lands.
 
-Corollary, discovered the hard way (§7.2): a task's `gate_owner` is only a real gate if at least
-one principal actually holds that capability. A `gate_owner` value with **zero grants in
-`gate_grants`** is not a strict gate — it is a wall with no door. Any process that sets
+Corollary, discovered the hard way (§10, Appendix B): a task's `gate_owner` is only a real gate
+if at least one principal actually holds that capability. A `gate_owner` value with **zero grants
+in `gate_grants`** is not a strict gate — it is a wall with no door. Any process that sets
 `gate_owner` on a task (a proposal path, an automated review request) must either name a
 capability with a live holder, or validate one exists before setting it. Setting an ungrantable
 `gate_owner` produces a task that is **permanently un-adjudicable** — which, for a fabricated
 proposal, is worse than no gate at all, because it looks gated.
 
+Related but distinct: mupot#964 rejects a `gate_owner` of the wrong **form** at write time (a
+bare slug or a raw agent UUID — neither can ever match a `gate_grants` row, by construction of
+`GATE_CAPABILITY_RE`). That closes the malformed-form class. It does not close the class this
+corollary describes — a well-formed `gate:<owner>` with zero grants, which is exactly how
+`gate:routines` failed. The two checks are complementary, not redundant: form validation catches
+"this string can never be a capability"; a holder check catches "this capability exists and
+nobody has it." Both are needed; #964 implements only the first.
+
 Granting a new `gate:<name>` capability itself requires an operator principal — never
-self-granted, never peer-granted between two agents without that authority. See §8, Appendix B.
+self-granted, never peer-granted between two agents without that authority. See §10, Appendix B.
 
 ## 7. Gate 5 — Merge and deploy authority
 
