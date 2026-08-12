@@ -382,14 +382,36 @@ export interface BootstrapSelfErr {
 
 export type BootstrapSelfResult = BootstrapSelfOk | BootstrapSelfErr
 
-const DIRECTORY_SESSION_NOTE =
-  'This token is a WORKSPACE-channel credential — put it in a client that sends a bearer token '
-  + 'directly (e.g. your agent\'s .mcp.json), the same way mint_agent_token\'s output is used. '
-  + 'It does NOT change THIS OAuth/directory session by itself, which stays unbound (zero '
-  + 'standing capability) on purpose. Separately, you (the human) now hold admin on your new '
-  + 'home squad (see founder_grant) — so if you want THIS session bound instead, you can go '
-  + 'through the normal /oauth/consent flow and choose this agent; you will clear its admin '
-  + 'floor honestly, because you now are admin on this squad.'
+// The second half of this note depends on what the human ACTUALLY holds, which is not
+// always 'admin'. When the home squad was adopted (P0-N2) and an operator had already
+// seated this member on it, the founder-grant INSERT is skipped and the pre-existing
+// capability stands — possibly 'member' or 'observer'. The previous version of this note
+// asserted 'admin' unconditionally and pointed at a `founder_grant` field the MCP response
+// did not even carry. That is the "reports a success it did not achieve" class, on the
+// signup funnel, which is the worst place for it: the human is told they can clear the
+// /oauth/consent admin floor when they cannot, and finds out at the next dead end.
+function directorySessionNote(founderCapability: Capability): string {
+  const head =
+    'This token is a WORKSPACE-channel credential — put it in a client that sends a bearer '
+    + 'token directly (e.g. your agent\'s .mcp.json), the same way mint_agent_token\'s output '
+    + 'is used. It does NOT change THIS OAuth/directory session by itself, which stays '
+    + 'unbound (zero standing capability) on purpose. '
+  // /oauth/consent's floor is admin-or-higher (mupot#903b P0-3, src/mcp/oauth-authorize.ts).
+  // Only 'admin' and 'owner' clear it; say so honestly rather than promising a path that
+  // will refuse them.
+  return founderCapability === 'admin' || founderCapability === 'owner'
+    ? head
+      + `Separately, you (the human) hold ${founderCapability} on your home squad `
+      + '(see founder_grant) — so if you want THIS session bound instead, you can go through '
+      + 'the normal /oauth/consent flow and choose this agent; you will clear its admin floor '
+      + 'honestly, because you genuinely hold that rank on this squad.'
+    : head
+      + `Note that you hold ${founderCapability} — not admin — on your home squad (see `
+      + 'founder_grant): it already carried a capability row for you, which was left exactly '
+      + 'as it was rather than widened. /oauth/consent requires admin-or-higher, so binding '
+      + 'THIS session to the new agent will NOT work until an admin raises your rank on that '
+      + 'squad. Use the token above in the meantime — it is unaffected.'
+}
 
 function isBootstrapAuditConflict(err: unknown): boolean {
   return err instanceof Error
@@ -854,6 +876,8 @@ export async function bootstrapSelf(
       ? { member_id: consentingMemberId, squad_id: squad.id, capability: existingFounderGrant.capability, disposition: 'existing' }
       : { member_id: consentingMemberId, squad_id: squad.id, capability: 'admin', disposition: 'created' },
     audit_id: auditId,
-    directory_session_note: DIRECTORY_SESSION_NOTE,
+    directory_session_note: directorySessionNote(
+      existingFounderGrant ? existingFounderGrant.capability : 'admin',
+    ),
   }
 }

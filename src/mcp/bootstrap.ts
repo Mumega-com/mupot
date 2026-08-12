@@ -42,6 +42,12 @@ const toolBootstrapSelf: ToolSpec = {
         agent: result.agent,
         member_id: result.member_id,
         token: result.token,
+        // Serialized because directory_session_note tells the human to "see
+        // founder_grant" — a field this payload did not previously carry, so the
+        // note pointed at nothing. It also carries disposition:'existing' when an
+        // adopted home squad already held a capability row for this member, which
+        // is the difference between "you can bind this session" and "you cannot".
+        founder_grant: result.founder_grant,
         audit_id: result.audit_id,
         note: result.directory_session_note,
       })
