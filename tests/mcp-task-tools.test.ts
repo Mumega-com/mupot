@@ -1259,6 +1259,25 @@ describe('task_verdict (MCP)', () => {
     expect(updates.some((u) => /UPDATE tasks SET status/.test(u.sql))).toBe(false)
   })
 
+  it('D1 WAIVER: self-verdict ALLOWED on gate:agent-self-completion (the executor fallback for an agent\'s own ungated completion)', async () => {
+    // gate:agent-self-completion exists precisely so the completing agent closes its
+    // own completed ungated work (BLOCK-2, PR #417). Owner role passes the gate
+    // capability check; the waiver lets the assignee self-verdict — the verdict IS written.
+    const { env, updates } = makeEnv([reviewTask({ assignee_agent_id: AGENT_ID, gate_owner: 'gate:agent-self-completion' })])
+    const res = await invokeTool(auth({ role: 'owner' }), env, 'task_verdict', { task_id: 'task-1', verdict: 'approved' }, URL)
+    expect(res.ok).toBe(true)
+    expect(updates.some((u) => /UPDATE tasks SET status/.test(u.sql))).toBe(true)
+  })
+
+  it('D1 WAIVER is not blanket: a grantless member is still forbidden on gate:agent-self-completion (403 before the waiver)', async () => {
+    // member role, no gate_grants row in the mock -> callerHoldsGateCapability false,
+    // so the 403 fires before the self_verdict waiver is ever reached.
+    const { env } = makeEnv([reviewTask({ assignee_agent_id: AGENT_ID, gate_owner: 'gate:agent-self-completion' })])
+    const res = await invokeTool(auth(), env, 'task_verdict', { task_id: 'task-1', verdict: 'approved' }, URL)
+    expect(res.ok).toBe(false)
+    if (!res.ok) expect(res.error).toBe('forbidden')
+  })
+
   it('approves a review task for a NON-assignee gate holder, writing the verdict', async () => {
     const { env, updates } = makeEnv([reviewTask({ assignee_agent_id: 'agent-other' })])
     const res = await invokeTool(auth({ role: 'owner' }), env, 'task_verdict', { task_id: 'task-1', verdict: 'approved' }, URL)

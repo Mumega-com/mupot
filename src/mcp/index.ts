@@ -1306,9 +1306,15 @@ const toolTaskVerdict: ToolSpec = {
     // Self-verdict prevention (no grading your own homework). Agent-bound tokens
     // resolve to the bound agent id, so an assignee cannot hide behind its member
     // envelope. Org owner may override with override_self_verdict:true (audited).
+    // D1 (2026-08-13): gate:agent-self-completion is the executor's fallback gate
+    // for an agent's OWN completion of ungated work (BLOCK-2, PR #417) — the
+    // different-principal rule is waived for exactly this capability (the caller
+    // still had to pass callerHoldsGateCapability above; every other gate keeps
+    // the self_verdict 409). Mirrors the HTTP twin in src/tasks/index.ts.
     const principal = verdictPrincipal(auth)
     let note = typeof args.note === 'string' ? args.note : null
-    if (principal.id === task.assignee_agent_id) {
+    const isSelfCompletionGate = task.gate_owner === 'gate:agent-self-completion'
+    if (principal.id === task.assignee_agent_id && !isSelfCompletionGate) {
       const isOrgOwner = auth.role === 'owner'
       const overrideRequested = args.override_self_verdict === true
       if (!isOrgOwner || !overrideRequested) {

@@ -326,7 +326,9 @@ export async function mintAgentBoundToken(
 ): Promise<AgentMintResult> {
   const first = await prepareAgentBoundTokenMint(env, agent, label, grantCapability)
   try {
-    return await commitPreparedAgentTokenMint(env, first)
+    const result = await commitPreparedAgentTokenMint(env, first)
+    await ensureSelfCompletionGrant(env, agent.id)
+    return result
   } catch (error) {
     if (!agentIdentityConflict(error)) throw error
 
@@ -342,8 +344,30 @@ export async function mintAgentBoundToken(
       grantCapability,
       winner,
     )
-    return commitPreparedAgentTokenMint(env, retry)
+    const result = await commitPreparedAgentTokenMint(env, retry)
+    await ensureSelfCompletionGrant(env, agent.id)
+    return result
   }
+}
+
+/**
+ * D1 (2026-08-13, athena gate cluster map on 247858f1): every minted agent
+ * receives the gate:agent-self-completion grant — the executor's fallback gate
+ * for an agent's OWN completion of previously-ungated work (BLOCK-2, PR #417,
+ * src/agents/execute.ts AGENT_SELF_COMPLETION_GATE_OWNER). The capability only
+ * ever authorizes closing the holder's OWN completed work (the verdict route
+ * waives self_verdict for exactly this gate, and only after the gate_grants
+ * check passes), so it is safe to grant universally at mint. INSERT OR IGNORE
+ * keeps it idempotent across re-mints; granted_by records the pot itself as the
+ * grantor so the audit trail distinguishes system grants from operator grants.
+ */
+async function ensureSelfCompletionGrant(env: Env, agentId: string): Promise<void> {
+  await env.DB.prepare(
+    `INSERT OR IGNORE INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
+       VALUES (?, 'gate:agent-self-completion', 'agent', ?, 'system:mint', ?)`,
+  )
+    .bind(crypto.randomUUID(), agentId, new Date().toISOString())
+    .run()
 }
 
 /** Live (non-revoked) tokens for every member — for the dashboard roster. The

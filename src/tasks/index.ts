@@ -1033,7 +1033,17 @@ tasksApp.post('/:id/verdict', async (c) => {
   const principal = verdictPrincipal(auth)
   const deciderPrincipalId = principal.id
   const isSelfVerdict = deciderPrincipalId === task.assignee_agent_id
-  if (isSelfVerdict) {
+  // D1 (2026-08-13, athena gate cluster map on 247858f1): gate:agent-self-completion
+  // is the executor's fallback gate for an agent's OWN completion of previously
+  // UNGATED work (src/agents/execute.ts AGENT_SELF_COMPLETION_GATE_OWNER, BLOCK-2
+  // PR #417). Its entire purpose is that the completing agent closes it — so the
+  // different-principal self_verdict rule is DELIBERATELY WAIVED for exactly this
+  // capability. The waiver is not blanket: reaching this point already required
+  // callerHoldsGateCapability to pass above (a gate_grants row for the caller, or
+  // the org owner/admin legacy bypass), so a caller without the grant still gets
+  // 403, and every other gate keeps the self_verdict 409.
+  const isSelfCompletionGate = task.gate_owner === 'gate:agent-self-completion'
+  if (isSelfVerdict && !isSelfCompletionGate) {
     const isOrgOwner = auth.role === 'owner'
     const overrideRequested = body.override_self_verdict === true
     if (!isOrgOwner || !overrideRequested) {
@@ -1150,8 +1160,10 @@ import { isExternallySourced } from './provenance'
 import { isValidGateOwnerForm } from './service'
 import {
   grantGateCapability,
+  listGateCapabilities,
   parseGateGrantArgs,
   revokeGateCapability,
+  type GatePrincipalType,
 } from '../gates/grants'
 
 export const gatesApp = new Hono<{ Bindings: Env; Variables: { auth: AuthContext } }>()
@@ -1231,6 +1243,23 @@ gatesApp.delete('/grants', async (c) => {
   })
 
   return c.json({ ok: true })
+})
+
+// GET /api/gates/grants — read gate grants (D3, 2026-08-13). Org owner/admin only;
+// optional filters: ?capability=, ?principal_type=, ?principal_id=. Audit data must
+// be readable or authority is a wall, not a gate.
+gatesApp.get('/grants', async (c) => {
+  const auth = c.get('auth')
+  if (!isOrgAdmin(auth)) {
+    return c.json({ error: 'forbidden', need: 'owner_or_admin' }, 403)
+  }
+  const q = c.req.query()
+  const grants = await listGateCapabilities(c.env, {
+    capability: q.capability || undefined,
+    principalType: (q.principal_type as GatePrincipalType | undefined) || undefined,
+    principalId: q.principal_id || undefined,
+  })
+  return c.json({ ok: true, grants, count: grants.length })
 })
 
 // ── d1 helpers ───────────────────────────────────────────────────────────────
