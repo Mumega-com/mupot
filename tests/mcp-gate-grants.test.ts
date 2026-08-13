@@ -202,7 +202,7 @@ describe('grant_list_gate_capabilities (D3 read tool, 2026-08-13)', () => {
 
 
 describe('mintAgentBoundToken lands the D2 lane grant atomically (2026-08-13)', () => {
-  it('every first mint grants the agent gate:agent-self-completion (idempotent, audited as system:mint)', async () => {
+  it('grants gate:<slug> lane gate atomically, NOT gate:agent-self-completion (BLOCK-1)', async () => {
     const db = makeDb()
     // Seed the FK targets the mint touches: department -> squad -> agent.
     db.env.DB.prepare(
