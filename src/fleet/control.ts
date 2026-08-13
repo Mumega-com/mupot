@@ -9,6 +9,7 @@
 import type { Env } from '../types'
 import { signControlRequest, signSquadControlRequest, ControlRequestError } from './control-request'
 import { sendAgentMessage } from '../agents/messages'
+import { listSquadMemberIds } from './registry'
 
 export interface ControlPrincipal {
   memberId: string
@@ -80,12 +81,24 @@ export async function emitControlRequest(
  * `squads` includes squad_id; a squad_id is only ever a SELECTOR for which already-declared
  * manifests run, same trust boundary as the single-agent path.
  *
- * KNOWN GAP (kasra-review, PR #954 adversarial gate on control_squad, flagged low-priority):
- * neither this nor the single-agent emitControlRequest above filters by the manifest's
- * `owner_scope` — control_squad matches purely on squad-id string, tenant-wide. Not exploitable
- * today (one scope, "mumega", in the whole registry), but note it here so the gap doesn't
- * silently outlive the day a second scope exists. Fix belongs in the same place for both paths,
- * not bolted on here alone.
+ * MEMBERSHIP BINDING (kasra-review, PR #954/#957/#1004 BLOCK gate — closed here): the dashboard's
+ * squad confirm() dialog names agents resolved from THIS pot's `fleet_agents` cache — a
+ * SELF-REPORTED, agent-controlled source (src/fleet/registry.ts) that can be stale or wrong. The
+ * host's engine.control_squad executes against a DIFFERENT source (its own live, version-
+ * controlled manifest registry). Without binding them together, an operator's confirm could show
+ * one blast radius while a different one actually runs. The fix: resolve the member set HERE,
+ * server-side (never from the client/form — see listSquadMemberIds), and sign it into the
+ * request. The host re-resolves membership live and REFUSES the whole action if the two sets
+ * disagree (engine.control_squad's expected_members parameter) — so this function's ONLY job is
+ * to sign an honest snapshot of what mupot currently believes; the host is what actually
+ * enforces the match.
+ *
+ * owner_scope: this function still does NOT filter by the manifest's `owner_scope` (matches the
+ * pre-existing single-agent emitControlRequest above) — not exploitable today (one scope,
+ * "mumega", in the whole registry). Real enforcement lives on the HOST daemon (mumega-com PR
+ * #957): it requires its own locally-configured FLEET_OWNER_SCOPE and never trusts anything this
+ * mupot-signed payload carries, so a second tenant sharing this host could never be swept in via
+ * either the agent- or squad-targeted path regardless of what mupot signs.
  */
 export async function emitSquadControlRequest(
   env: Env,
@@ -95,9 +108,17 @@ export async function emitSquadControlRequest(
   if (!env.FLEET_PANEL_SK) return { ok: false, reason: 'unconfigured', detail: 'FLEET_PANEL_SK not set' }
   if (!env.FLEET_CONSUMER_AGENT) return { ok: false, reason: 'unconfigured', detail: 'FLEET_CONSUMER_AGENT not set' }
 
+  // Resolve NOW, server-side, from mupot's own registry — never from the caller. This is the
+  // exact set that gets signed (see the doc comment above); the caller only ever supplies
+  // squad_id + verb.
+  const members = await listSquadMemberIds(env, input.squad_id)
+  if (members.length === 0) {
+    return { ok: false, reason: 'invalid_input', detail: `squad "${input.squad_id}" has no known members in the fleet registry` }
+  }
+
   let req
   try {
-    req = await signSquadControlRequest(env.FLEET_PANEL_SK, input)
+    req = await signSquadControlRequest(env.FLEET_PANEL_SK, { squad_id: input.squad_id, verb: input.verb, members })
   } catch (e) {
     if (e instanceof ControlRequestError) return { ok: false, reason: 'invalid_input', detail: e.message }
     throw e

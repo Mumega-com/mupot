@@ -48,13 +48,26 @@ export interface ControlRequest {
 // WHICH manifests run by squad_id (engine.control_squad on the host) instead of a single
 // agent_id. Mutually exclusive with ControlRequest at the call site — a request names exactly
 // one target.
+//
+// `members` is the resolved member set the requester is CONFIRMING (mupot resolves this
+// server-side from its own fleet_agents cache — see registry.listSquadMemberIds — at signing
+// time, the SAME data the dashboard's confirm() dialog was rendered from; never accepted from a
+// client/form). It is bound into the SIGNED canonical bytes, not merely carried alongside
+// (kasra-review, PR #954/#957/#1004 BLOCK gate): the host's engine.control_squad re-resolves
+// membership live from its OWN version-controlled manifest registry and REFUSES the whole
+// action if that disagrees with `members` — so a stale mupot cache, a membership change between
+// confirm and execute, or a compromised report channel can never cause a wider blast radius than
+// what was actually confirmed. Sorted ascending, deduped, 1-64 entries — see MAX_SQUAD_MEMBERS.
 export interface SquadControlRequest {
   squad_id: string
   verb: ControlVerb
+  members: string[]
   nonce: string
   ts: number
   sig: string
 }
+
+export const MAX_SQUAD_MEMBERS = 64
 
 export class ControlRequestError extends Error {}
 
@@ -79,9 +92,12 @@ export function canonicalBytes(agentId: string, verb: string, nonce: string, ts:
 
 /** The exact bytes signed/verified for a squad-targeted request — same shape as
  *  canonicalBytes, under CANON_VERSION_SQUAD so it can never collide with an agent-targeted
- *  canonical string (see that constant's comment). */
-export function canonicalSquadBytes(squadId: string, verb: string, nonce: string, ts: number): Uint8Array {
-  return new TextEncoder().encode([CANON_VERSION_SQUAD, squadId, verb, nonce, String(ts)].join('\n'))
+ *  canonical string (see that constant's comment). `members` is joined with ',' — a member id
+ *  can never contain a comma (ID_RE), so this is an unambiguous delimiter, same reasoning as
+ *  the newline-free fields elsewhere. Must match the host's canonical_squad_bytes exactly:
+ *  CANON_VERSION_SQUAD \n squad_id \n verb \n members.join(',') \n nonce \n ts. */
+export function canonicalSquadBytes(squadId: string, verb: string, members: string[], nonce: string, ts: number): Uint8Array {
+  return new TextEncoder().encode([CANON_VERSION_SQUAD, squadId, verb, members.join(','), nonce, String(ts)].join('\n'))
 }
 
 function validate(agentId: string, verb: string, nonce: string, ts: number): void {
@@ -91,11 +107,24 @@ function validate(agentId: string, verb: string, nonce: string, ts: number): voi
   if (!Number.isInteger(ts)) throw new ControlRequestError('ts must be an integer (unix seconds)')
 }
 
-// Same checks as validate(), just for squad_id (reuses ID_RE — a squad id is a registry slug
-// too, exactly like an agent id; it is only ever a SELECTOR for which manifests run).
-function validateSquad(squadId: string, verb: string, nonce: string, ts: number): void {
+// Same checks as validate(), plus `members` — 1-64 registry slugs, STRICTLY sorted ascending
+// with no duplicates (the signer commits to ONE canonical ordering so the verifier's
+// reconstruction is unambiguous; mirrors the host's _validated_squad_fields exactly).
+function validateSquad(squadId: string, verb: string, members: string[], nonce: string, ts: number): void {
   if (!ID_RE.test(squadId)) throw new ControlRequestError('squad_id must be a registry slug (<=64, no traversal)')
   if (!(CONTROL_VERBS as readonly string[]).includes(verb)) throw new ControlRequestError(`verb must be one of ${CONTROL_VERBS.join('|')}`)
+  if (
+    !Array.isArray(members) ||
+    members.length < 1 ||
+    members.length > MAX_SQUAD_MEMBERS ||
+    !members.every((m) => ID_RE.test(m))
+  ) {
+    throw new ControlRequestError(`members must be a list of 1-${MAX_SQUAD_MEMBERS} registry slugs`)
+  }
+  const sorted = [...members].sort()
+  if (members.some((m, i) => m !== sorted[i]) || new Set(members).size !== members.length) {
+    throw new ControlRequestError('members must be sorted ascending with no duplicates')
+  }
   if (!NONCE_RE.test(nonce)) throw new ControlRequestError('nonce must be 16-128 url-safe chars')
   if (!Number.isInteger(ts)) throw new ControlRequestError('ts must be an integer (unix seconds)')
 }
@@ -187,23 +216,28 @@ export async function verifyControlRequest(publicKeyJwkJson: string, req: Contro
   return crypto.subtle.verify({ name: 'Ed25519' }, key, sig, canonicalBytes(req.agent_id, req.verb, req.nonce, req.ts))
 }
 
-/** Build a signed squad-targeted control-request. Mirrors signControlRequest exactly, against
- *  the squad canonical bytes. Validates first; throws ControlRequestError on bad input. */
+/** Build a signed squad-targeted control-request. Mirrors signControlRequest, against the squad
+ *  canonical bytes (which now bind `members` — see SquadControlRequest's doc comment). `members`
+ *  must already be sorted+deduped by the caller (registry.listSquadMemberIds returns it that
+ *  way); this function does NOT sort for you — validateSquad fails closed on anything else, the
+ *  same discipline as every other field. Validates first; throws ControlRequestError on bad
+ *  input. */
 export async function signSquadControlRequest(
   privateKeyJwkJson: string | undefined,
-  input: { squad_id: string; verb: string },
+  input: { squad_id: string; verb: string; members: string[] },
   opts: SignOpts = {},
 ): Promise<SquadControlRequest> {
   if (!privateKeyJwkJson) throw new ControlRequestError('FLEET_PANEL_SK not configured (fail-closed)')
   const squadId = input.squad_id
   const verb = input.verb
+  const members = input.members
   const nonce = opts.nonce ?? genNonce()
   const nowMs = opts.now ? opts.now() : Date.now()
   const ts = opts.ts ?? Math.floor(nowMs / 1000)
-  validateSquad(squadId, verb, nonce, ts)
+  validateSquad(squadId, verb, members, nonce, ts)
   const key = await importPrivateKey(privateKeyJwkJson)
-  const sigBytes = new Uint8Array(await crypto.subtle.sign({ name: 'Ed25519' }, key, canonicalSquadBytes(squadId, verb, nonce, ts)))
-  return { squad_id: squadId, verb: verb as ControlVerb, nonce, ts, sig: b64urlEncode(sigBytes, true) }
+  const sigBytes = new Uint8Array(await crypto.subtle.sign({ name: 'Ed25519' }, key, canonicalSquadBytes(squadId, verb, members, nonce, ts)))
+  return { squad_id: squadId, verb: verb as ControlVerb, members, nonce, ts, sig: b64urlEncode(sigBytes, true) }
 }
 
 /** TS-side verify for a squad-targeted request (round-trip tests + a future ack-verify). */
@@ -212,8 +246,8 @@ export async function verifySquadControlRequest(publicKeyJwkJson: string, req: S
   if (jwk.kty !== 'OKP' || jwk.crv !== 'Ed25519' || (jwk as { d?: string }).d) {
     throw new ControlRequestError('public key must be a PUBLIC Ed25519 OKP JWK')
   }
-  validateSquad(req.squad_id, req.verb, req.nonce, req.ts)
+  validateSquad(req.squad_id, req.verb, req.members, req.nonce, req.ts)
   const key = await crypto.subtle.importKey('jwk', { kty: jwk.kty, crv: jwk.crv, x: jwk.x }, { name: 'Ed25519' }, false, ['verify'])
   const sig = Uint8Array.from(atob(req.sig.replace(/-/g, '+').replace(/_/g, '/')), (ch) => ch.charCodeAt(0))
-  return crypto.subtle.verify({ name: 'Ed25519' }, key, sig, canonicalSquadBytes(req.squad_id, req.verb, req.nonce, req.ts))
+  return crypto.subtle.verify({ name: 'Ed25519' }, key, sig, canonicalSquadBytes(req.squad_id, req.verb, req.members, req.nonce, req.ts))
 }

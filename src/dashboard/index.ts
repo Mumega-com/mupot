@@ -1239,6 +1239,13 @@ dashboardApp.post('/fleet/host-control', async (c) => {
   const agent_id = typeof form.agent_id === 'string' ? form.agent_id : ''
   const squad_id = typeof form.squad_id === 'string' ? form.squad_id : ''
   const verb = typeof form.verb === 'string' ? form.verb : ''
+  // Exactly one of agent_id/squad_id — mirrors POST /api/fleet/control's mutual-exclusion 400
+  // (src/fleet/control-routes.ts). This route previously fell through to "squad wins" when both
+  // were present instead of refusing outright; the two panel forms never legitimately submit
+  // both, so a request carrying both is malformed, not an ambiguity to silently resolve.
+  if (Boolean(agent_id) === Boolean(squad_id)) {
+    return c.json({ error: 'bad_request', detail: 'exactly one of agent_id/squad_id required' }, 400)
+  }
   const principal = { memberId: auth.memberId ?? auth.userId, boundAgentId: auth.boundAgentId ?? null }
   const res = squad_id
     ? await emitSquadControlRequest(c.env, { squad_id, verb }, principal)

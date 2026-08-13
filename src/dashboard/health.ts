@@ -121,6 +121,7 @@ interface ConnectorAuditRow {
 interface FleetControlRow {
   id: string
   agent_id: string
+  squad_id: string | null
   verb: string
   requested_by_member: string
   created_at: string
@@ -341,7 +342,7 @@ export async function loadOpsHealth(env: Env, nowMs = Date.now()): Promise<OpsHe
     ),
     safeAll<FleetControlRow>(
       env,
-      `SELECT id, agent_id, verb, requested_by_member, created_at
+      `SELECT id, agent_id, squad_id, verb, requested_by_member, created_at
          FROM fleet_control_log
         WHERE tenant = ?1
         ORDER BY created_at DESC
@@ -493,7 +494,9 @@ export async function loadOpsHealth(env: Env, nowMs = Date.now()): Promise<OpsHe
     ...fleetControl.rows.map((row) => ({
       id: `fleet:${row.id}`,
       label: `Fleet ${row.verb}`,
-      detail: `${row.agent_id} requested by ${row.requested_by_member}`,
+      // A squad-targeted row (migrations/0098) leaves agent_id = '' and carries the real target
+      // in squad_id instead — render whichever is actually populated, never a blank target.
+      detail: `${row.agent_id || `squad:${row.squad_id ?? 'unknown'}`} requested by ${row.requested_by_member}`,
       at: row.created_at,
       href: '/fleet',
     })),

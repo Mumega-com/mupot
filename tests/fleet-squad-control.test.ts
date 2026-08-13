@@ -16,7 +16,7 @@ import { fleetControlApp } from '../src/fleet/control-routes'
 import { verifySquadControlRequest } from '../src/fleet/control-request'
 import { dashboardApp } from '../src/dashboard/index'
 import { groupBySquad } from '../src/dashboard/fleet-host'
-import type { FleetAgentRuntimeView } from '../src/fleet/registry'
+import { listSquadMemberIds, type FleetAgentRuntimeView } from '../src/fleet/registry'
 import type { Env } from '../src/types'
 
 async function sha256Hex(s: string): Promise<string> {
@@ -128,6 +128,9 @@ describe('POST /api/fleet/control — squad-scoped shape', () => {
     const sentReq = JSON.parse(msgRow!.body)
     expect(sentReq).toMatchObject({ squad_id: 'squad-core', verb: 'start', nonce: json.nonce })
     expect(sentReq.agent_id).toBeUndefined() // never carries BOTH selectors
+    // THE BLOCK fix: the member set is resolved server-side (never from the client) and bound
+    // into the signature — 'kasra' and 'river' are the seeded squad-core members (see makeHarness).
+    expect(sentReq.members).toEqual(['kasra', 'river'])
     expect(await verifySquadControlRequest(panelPubJwk, sentReq)).toBe(true)
 
     const logRow = await harness.db
@@ -166,6 +169,33 @@ describe('POST /api/fleet/control — squad-scoped shape', () => {
     const res = await post(apiEnv(harness, { FLEET_PANEL_SK: undefined }), { squad_id: 'squad-core', verb: 'status' })
     expect(res.status).toBe(503)
   })
+
+  it('400 for a squad with no known members (never signs/sends an empty-member request)', async () => {
+    harness = await makeHarness()
+    const res = await post(apiEnv(harness), { squad_id: 'no-such-squad', verb: 'status' })
+    expect(res.status).toBe(400)
+    const msgRow = await harness.db
+      .prepare(`SELECT COUNT(*) AS n FROM agent_messages WHERE tenant = ?1 AND to_agent = ?2`)
+      .bind('t', 'fleet-consumer')
+      .first<{ n: number }>()
+    expect(msgRow!.n).toBe(0) // nothing sent
+  })
+})
+
+describe('listSquadMemberIds (pure DB read)', () => {
+  let harness: SqliteD1Harness | undefined
+  afterEach(() => {
+    harness?.close()
+    harness = undefined
+  })
+
+  it('returns sorted, deduped agent_ids reporting the given squad', async () => {
+    harness = await makeHarness()
+    const env = apiEnv(harness)
+    expect(await listSquadMemberIds(env, 'squad-core')).toEqual(['kasra', 'river'])
+    expect(await listSquadMemberIds(env, 'other-squad')).toEqual(['solo'])
+    expect(await listSquadMemberIds(env, 'no-such-squad')).toEqual([])
+  })
 })
 
 describe('POST /fleet/host-control — squad form field (dashboard panel)', () => {
@@ -195,6 +225,26 @@ describe('POST /fleet/host-control — squad form field (dashboard panel)', () =
       .bind('t', 'fleet-consumer')
       .first<{ body: string }>()
     expect(JSON.parse(msgRow!.body)).toMatchObject({ squad_id: 'squad-core', verb: 'start' })
+  })
+
+  it('owner session: BOTH agent_id and squad_id present -> 400, not a silent squad-wins pick', async () => {
+    harness = await makeHarness()
+    const env = dashboardEnv(harness, { 'sess:s-owner': sessionRecord('owner@pot.test') })
+    const form = new URLSearchParams({ agent_id: 'kasra', squad_id: 'squad-core', verb: 'start' })
+    const res = await dashboardApp.fetch(
+      req('/fleet/host-control', 's-owner', {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded', origin: 'https://pot.test' },
+        body: form.toString(),
+      }),
+      env,
+    )
+    expect(res.status).toBe(400)
+    const msgRow = await harness.db
+      .prepare(`SELECT COUNT(*) AS n FROM agent_messages WHERE tenant = ?1 AND to_agent = ?2`)
+      .bind('t', 'fleet-consumer')
+      .first<{ n: number }>()
+    expect(msgRow!.n).toBe(0)
   })
 
   it('non-owner session: 403, no message sent', async () => {
@@ -227,6 +277,7 @@ describe('POST /fleet/host-control — squad form field (dashboard panel)', () =
     expect(body).toContain('squad-core')
     expect(body).toContain('Start squad')
     expect(body).toContain('Stop squad')
+    expect(body).toContain('Restart squad')
     // confirm-gate data attributes carry the affected member list
     expect(body).toMatch(/data-squad="squad-core"/)
     expect(body).toMatch(/data-members="[^"]*Kasra[^"]*River[^"]*"/)

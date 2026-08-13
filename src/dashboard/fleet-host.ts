@@ -82,6 +82,9 @@ function squadControlCell(group: SquadGroup): Html {
     <button class="btn sm secondary" name="verb" value="stop"
       data-squad="${group.squad_id}" data-members="${memberList}" data-verb="stop"
       onclick="return fleetSquadConfirm(this)">Stop squad</button>
+    <button class="btn sm secondary" name="verb" value="restart"
+      data-squad="${group.squad_id}" data-members="${memberList}" data-verb="restart"
+      onclick="return fleetSquadConfirm(this)">Restart squad</button>
   </form>`
 }
 
@@ -91,7 +94,7 @@ function fleetSquadConfirm(btn) {
   var squad = btn.dataset.squad;
   var verb = btn.dataset.verb;
   var members = btn.dataset.members;
-  var verbLabel = verb === 'stop' ? 'STOP' : 'START';
+  var verbLabel = verb === 'stop' ? 'STOP' : (verb === 'restart' ? 'RESTART' : 'START');
   return confirm(verbLabel + ' the WHOLE "' + squad + '" squad? This affects: ' + members + '.');
 }
 </script>`

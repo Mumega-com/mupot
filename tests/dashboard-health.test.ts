@@ -260,6 +260,22 @@ describe('loadOpsHealth', () => {
     expect(schema.nextAction).toContain('Run D1 migrations')
   })
 
+  it('renders a squad-targeted fleet_control_log row by squad_id, not a blank agent_id', async () => {
+    // migrations/0098: a squad-targeted control row leaves agent_id = '' and carries the real
+    // target in squad_id — the audit feed must not render a blank target (kasra-review MEDIUM).
+    const { env } = makeEnv({
+      fleetControl: [
+        { id: 'fc-1', agent_id: '', squad_id: 'squad-core', verb: 'stop', requested_by_member: 'hadi@digid.ca', created_at: RECENT },
+        { id: 'fc-2', agent_id: 'kasra', squad_id: null, verb: 'start', requested_by_member: 'hadi@digid.ca', created_at: RECENT },
+      ],
+    })
+
+    const health = await loadOpsHealth(env, NOW)
+    const details = health.auditSignals.map((s) => s.detail)
+    expect(details).toContain('squad:squad-core requested by hadi@digid.ca')
+    expect(details).toContain('kasra requested by hadi@digid.ca')
+  })
+
   it('warns when runtime evidence is stale', async () => {
     const { env } = makeEnv({
       fleet: [
