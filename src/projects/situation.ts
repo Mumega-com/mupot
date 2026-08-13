@@ -230,6 +230,19 @@ export function projectSituationFactFor(
   return { kind: 'unknown', source_pot: sourcePot }
 }
 
+/** One row of the per-project link-health query. Named so the control-snapshot short-circuit
+ *  and the real query cannot drift into two different shapes. */
+export interface ProjectLinkHealthRow {
+  remote_pot: string
+  state: 'active' | 'revoked'
+  stale_after_seconds: number
+  last_success_at: string | null
+  last_failure_at: string | null
+  success_event_at: number | null
+  failure_event_at: number | null
+  now_event_at: number | null
+}
+
 export function projectLinkHealthFromRow(row: {
   state: 'active' | 'revoked'
   last_success_at: string | null
@@ -674,7 +687,21 @@ export async function loadProjectSituation(
       excludeRoutineEvents: skipRoutineSlices,
       limit: Math.min(100, excludedActivity.size + 1),
     }),
-    env.DB.prepare(
+    // GATED ON controlSnapshot, like every other optional slice in this Promise.all.
+    //
+    // Added ungated, this query costs one D1 statement on EVERY situation load — including
+    // the scheduler's control-snapshot path, which deliberately skips the routine slices to
+    // stay inside the per-invocation statement budget. It pushed that path from 32 to 33 and
+    // turned `routine-dispatch › leaves D1 statement headroom for dispatch` red.
+    //
+    // Link health is provenance decoration on the read surface, not something the scheduler
+    // needs to dispatch. In control-snapshot mode the map comes back empty and
+    // projectSituationFactFor then reports `kind: 'unknown'` for remote-sourced rows, which
+    // is the honest answer: nothing measured the link on that path. It does NOT fall back to
+    // 'local' or 'current_remote' — an unmeasured link must never read as a healthy one.
+    controlSnapshot
+      ? Promise.resolve({ results: [] as ProjectLinkHealthRow[] })
+      : env.DB.prepare(
       `SELECT pl.remote_pot, pl.state, pl.stale_after_seconds,
               pl.last_success_at, pl.last_failure_at,
               ${projectLinkTimestampMsSql('pl.last_success_at')} AS success_event_at,
