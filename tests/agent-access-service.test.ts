@@ -233,4 +233,38 @@ describe('canonical agent squad access', () => {
     expect(count(harness.sqlite, 'memberships')).toBe(1)
     expect(count(harness.sqlite, 'capabilities')).toBe(1)
   })
+
+  it('WITHOUT the binding, the guarded statements write NOTHING', async () => {
+    // The negative half of the case above, and the one that makes the guard load-bearing.
+    //
+    // Found by mutation probe on mupot#691: deleting the
+    // `WHERE EXISTS (SELECT 1 FROM agent_member_bindings ...)` clause from BOTH the
+    // membership and capability inserts left every existing test GREEN — including the
+    // sibling test directly above. That test inserts the binding in the same batch, so the
+    // EXISTS clause is satisfied either way and the guard is never the thing deciding the
+    // outcome. Escalating the grant's scope from 'squad' to 'org' also stayed green.
+    //
+    // This case executes the exact same prepared statements with NO binding row present. If
+    // the guard is removed, an agent with no agent→member weld receives a real membership and
+    // a real capability grant — which is the whole thing the weld exists to prevent.
+    seedBoundAgent(harness.sqlite, false)
+    const prepared = await prepareAgentSquadAccess(env, {
+      agentId: AGENT_ID,
+      memberId: MEMBER_ID,
+      squadId: TARGET_SQUAD_ID,
+      capability: 'member',
+    }, {
+      agentId: AGENT_ID,
+      memberId: MEMBER_ID,
+      homeSquadId: HOME_SQUAD_ID,
+      disposition: 'creating',
+    })
+    if (!prepared.ok) throw new Error(prepared.error)
+
+    // Deliberately NOT inserting into agent_member_bindings.
+    await harness.db.batch(prepared.value.statements)
+
+    expect(count(harness.sqlite, 'memberships')).toBe(0)
+    expect(count(harness.sqlite, 'capabilities')).toBe(0)
+  })
 })
