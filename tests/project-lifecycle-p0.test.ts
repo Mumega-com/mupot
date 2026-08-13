@@ -14,7 +14,7 @@ import {
   recordRecommitOrKill,
 } from '../src/projects/circuit-breaker'
 import { writeReceiptToD1 } from '../src/workflows/pipeline'
-import { listProjectsDueAtBoundary } from '../src/projects/loop'
+import { listProjectsDueAtBoundary, runProjectLoopTick } from '../src/projects/loop'
 import { getProject, updateProject } from '../src/projects/service'
 import {
   START_GATE_SEED_MARKER,
@@ -434,6 +434,85 @@ describe('bare updateProject still requires internal via flags', () => {
       insertProject(harness, { id: 'proj-bare', status: 'active', boundary: null })
       await expect(updateProject(env, 'proj-bare', { status: 'review' }))
         .resolves.toEqual({ ok: false, error: 'completion_gate_required' })
+    } finally {
+      harness.close()
+    }
+  })
+})
+
+describe('Slice 5 ORDERING: cycle creation must run AFTER the circuit breaker', () => {
+  // THE DEFECT THIS PINS
+  //
+  // Slice 5 originally ran as the FIRST step of runProjectLoopTick. Every unit test of
+  // scheduleCycleBoundary passed, because the module is correct in isolation — the defect
+  // lived entirely in WHERE it was placed in the sequence, and nothing drove the tick.
+  //
+  // listProjectsDueAtBoundary selects projects whose boundary has ELAPSED. scheduleCycleBoundary
+  // advances an elapsed boundary to +14d, a future timestamp. Run first, it pushes the boundary
+  // out of range before the breaker is given the chance to evaluate it, and recommit-or-kill
+  // becomes unreachable for every non-stalled project — no error, no changed counter, no signal.
+  //
+  // These tests drive the REAL tick with the REAL listDue, and spy only on the breaker, so the
+  // ordering itself is the thing under test.
+
+  it('an elapsed boundary REACHES the breaker in the same tick', async () => {
+    const harness = makeHarness()
+    try {
+      // Boundary elapsed only ONE DAY ago — deliberately, and this is the whole test.
+      // A boundary far in the past survives the pre-fix ordering by accident: advancing it by
+      // one 14-day interval leaves it STILL elapsed, so the breaker sees it regardless and the
+      // mutation probe passes. Only a recently-elapsed boundary distinguishes the two orders,
+      // because +14d lands it in the future and listProjectsDueAtBoundary then drops it.
+      // Which is also the real case — boundaries elapse by minutes, not months.
+      insertProject(harness, { id: 'ord-1', status: 'active', boundary: '2026-07-22T00:00:00.000Z' })
+      const seen: string[] = []
+      const result = await runProjectLoopTick(envFor(harness), {
+        nowIso: () => NOW,
+        evaluate: async (_env, project) => {
+          seen.push(project.id)
+          return 'skipped'
+        },
+        listActiveForCompletion: async () => [],
+        listActiveForStall: async () => [],
+        listStalePlanned: async () => [],
+      })
+      expect(seen).toContain('ord-1')
+      // And the advance still happened this tick — it is deferred, not skipped.
+      expect(result.cycles_advanced).toBeGreaterThanOrEqual(1)
+    } finally {
+      harness.close()
+    }
+  })
+
+  it('the boundary is advanced only AFTER the breaker has seen it', async () => {
+    const harness = makeHarness()
+    try {
+      insertProject(harness, { id: 'ord-2', status: 'active', boundary: '2026-07-01T00:00:00.000Z' })
+      let boundaryAtBreakerTime: string | null | undefined
+      await runProjectLoopTick(envFor(harness), {
+        nowIso: () => NOW,
+        evaluate: async (_env, project) => {
+          boundaryAtBreakerTime = project.cycle_boundary_at
+          return 'skipped'
+        },
+        listActiveForCompletion: async () => [],
+        listActiveForStall: async () => [],
+        listStalePlanned: async () => [],
+      })
+      // The breaker must have been handed the ORIGINAL elapsed boundary, not the advanced one.
+      expect(boundaryAtBreakerTime).toBe('2026-07-01T00:00:00.000Z')
+
+      // ...and the row IS advanced by the time the tick returns — by exactly ONE interval
+      // from the original, not to the next future boundary. That matters: a boundary long
+      // elapsed catches up one cycle per tick, so the breaker gets to evaluate EACH missed
+      // boundary rather than skipping straight past them. Asserting "now in the future" here
+      // would have been wrong and would have pinned the wrong behaviour.
+      const row = harness.sqlite
+        .prepare("SELECT cycle_boundary_at FROM projects WHERE id = 'ord-2'")
+        .all() as Array<{ cycle_boundary_at: string }>
+      const advancedMs = Date.parse(row[0].cycle_boundary_at)
+      const originalMs = Date.parse('2026-07-01T00:00:00.000Z')
+      expect(advancedMs - originalMs).toBe(14 * 24 * 60 * 60 * 1000)
     } finally {
       harness.close()
     }
