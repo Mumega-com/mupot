@@ -727,6 +727,19 @@ tasksApp.patch('/:id', async (c) => {
     if (lockStatuses.has(existing.status) && !repairsHistoricalUngatedReview) {
       return c.json({ error: 'gate_owner_locked', status: existing.status }, 409)
     }
+    // BLOCK-2 fix (kasra-review 2026-08-13, proof-of-exploit): once set,
+    // gate_owner is IMMUTABLE via the member API. Re-gating (or un-gating) a
+    // task to a peer's lane let two colluding/compromised agents launder any
+    // single-gate check (proven live). Only an org owner/admin may change or
+    // clear an existing gate_owner.
+    if (existing.gate_owner !== null && body.gate_owner !== existing.gate_owner) {
+      if (!legacyOwnerAdmin(c.get('auth'))) {
+        return c.json(
+          { error: 'gate_owner_immutable', detail: 'once set, gate_owner can only be changed or cleared by an org owner/admin' },
+          403,
+        )
+      }
+    }
     if (body.gate_owner === null) {
       next.gate_owner = null
     } else if (typeof body.gate_owner === 'string' && body.gate_owner.trim().length > 0) {
@@ -998,9 +1011,21 @@ tasksApp.post('/:id/verdict', async (c) => {
 
   // RBAC: caller must hold the gate capability.
   const auth = c.get('auth')
-  const hasGate = await callerHoldsGateCapability(c.env, auth, task.squad_id, task.gate_owner)
-  if (!hasGate) {
-    return c.json({ error: 'forbidden', need: task.gate_owner }, 403)
+  const principal = verdictPrincipal(auth)
+  // BLOCK-1 fix (kasra-review 2026-08-13, proof-of-exploit): gate:agent-self-completion
+  // is closeable ONLY by the completing agent (the assignee) or an org owner/admin.
+  // The gate grant is NOT authority for this gate — the D2 universal mint grant
+  // would let any agent approve any other agent's completed task (proven live).
+  // Every other gate keeps the capability-based check.
+  if (task.gate_owner === 'gate:agent-self-completion') {
+    if (principal.id !== task.assignee_agent_id && !legacyOwnerAdmin(auth)) {
+      return c.json({ error: 'forbidden', need: 'assignee_or_org_admin' }, 403)
+    }
+  } else {
+    const hasGate = await callerHoldsGateCapability(c.env, auth, task.squad_id, task.gate_owner)
+    if (!hasGate) {
+      return c.json({ error: 'forbidden', need: task.gate_owner }, 403)
+    }
   }
 
   // Surface-cap gate (#106): approving a gate:loops task (outreach queue) requires
@@ -1030,7 +1055,6 @@ tasksApp.post('/:id/verdict', async (c) => {
   //
   // Override: org owner may self-verdict by passing { override_self_verdict: true }
   // in the body. The override is logged in the verdict note for auditability.
-  const principal = verdictPrincipal(auth)
   const deciderPrincipalId = principal.id
   const isSelfVerdict = deciderPrincipalId === task.assignee_agent_id
   // D1 (2026-08-13, athena gate cluster map on 247858f1): gate:agent-self-completion

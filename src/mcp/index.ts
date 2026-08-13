@@ -1084,6 +1084,19 @@ const toolTaskUpdate: ToolSpec = {
       if (lockStatuses.has(existing.status) && !repairsHistoricalUngatedReview) {
         return fail(409, 'gate_owner_locked', { status: existing.status })
       }
+      // BLOCK-2 fix (kasra-review 2026-08-13, proof-of-exploit): once set,
+      // gate_owner is IMMUTABLE via the member API. Re-gating (or un-gating) a
+      // task to a peer's lane let two colluding/compromised agents launder any
+      // single-gate check (proven live). Only an org owner/admin may change or
+      // clear an existing gate_owner.
+      if (existing.gate_owner !== null && args.gate_owner !== existing.gate_owner) {
+        const isOwnerAdmin = auth.role === 'owner' || auth.role === 'admin'
+        if (!isOwnerAdmin) {
+          return fail(403, 'gate_owner_immutable', {
+            detail: 'once set, gate_owner can only be changed or cleared by an org owner/admin',
+          })
+        }
+      }
       if (args.gate_owner === null) {
         next.gate_owner = null
       } else if (typeof args.gate_owner === 'string' && args.gate_owner.trim().length > 0) {
@@ -1291,7 +1304,18 @@ const toolTaskVerdict: ToolSpec = {
     if (task.status !== 'review') return fail(409, 'not_in_review', { status: task.status })
 
     // RBAC: caller must hold the gate capability named by task.gate_owner.
-    if (!(await callerHoldsGateCapability(env, auth, task.squad_id, task.gate_owner))) {
+    // BLOCK-1 fix (kasra-review 2026-08-13, proof-of-exploit): gate:agent-self-completion
+    // is closeable ONLY by the completing agent (the assignee) or an org owner/admin.
+    // The grant is NOT authority for this gate — the D2 universal mint grant would
+    // let any agent approve any other agent's task (proven live). Every other gate
+    // keeps the capability-based check.
+    const principal = verdictPrincipal(auth)
+    if (task.gate_owner === 'gate:agent-self-completion') {
+      const isOwnerAdmin = auth.role === 'owner' || auth.role === 'admin'
+      if (principal.id !== task.assignee_agent_id && !isOwnerAdmin) {
+        return fail(403, 'forbidden', { need: 'assignee_or_org_admin' })
+      }
+    } else if (!(await callerHoldsGateCapability(env, auth, task.squad_id, task.gate_owner))) {
       return fail(403, 'forbidden', { need: task.gate_owner })
     }
 
@@ -1311,7 +1335,6 @@ const toolTaskVerdict: ToolSpec = {
     // different-principal rule is waived for exactly this capability (the caller
     // still had to pass callerHoldsGateCapability above; every other gate keeps
     // the self_verdict 409). Mirrors the HTTP twin in src/tasks/index.ts.
-    const principal = verdictPrincipal(auth)
     let note = typeof args.note === 'string' ? args.note : null
     const isSelfCompletionGate = task.gate_owner === 'gate:agent-self-completion'
     if (principal.id === task.assignee_agent_id && !isSelfCompletionGate) {

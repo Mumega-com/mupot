@@ -810,6 +810,22 @@ describe('MCP task cutover tools', () => {
     expect(updates).toHaveLength(0)
   })
 
+  it('BLOCK-2 fix: member cannot re-gate a gated open task to another lane (gate laundering blocked)', async () => {
+    const { env, updates } = makeEnv([task({ status: 'open', gate_owner: 'gate:kasra-core' })])
+    const res = await invokeTool(auth(), env, 'task_update', { task_id: 'task-1', gate_owner: 'gate:athena' }, URL)
+    expect(res.ok).toBe(false)
+    if (!res.ok) expect(res.error).toBe('gate_owner_immutable')
+    expect(updates.some((u) => u.sql.includes('gate_owner'))).toBe(false)
+  })
+
+  it('BLOCK-2 fix: org owner/admin may re-gate (repair path preserved)', async () => {
+    const { env, updates } = makeEnv([task({ status: 'open', gate_owner: 'gate:kasra-core' })])
+    const res = await invokeTool(auth({ role: 'owner' }), env, 'task_update', { task_id: 'task-1', gate_owner: 'gate:athena' }, URL)
+    expect(res.ok).toBe(true)
+    if (res.ok) expect((res.result as { task: Task }).task.gate_owner).toBe('gate:athena')
+    expect(updates.some((u) => u.sql.includes('gate_owner'))).toBe(true)
+  })
+
   it('task_update lets an org-admin workspace token repair a historical review task with no gate_owner', async () => {
     const { env } = makeEnv([task({ status: 'review', gate_owner: null })])
 
@@ -1259,23 +1275,33 @@ describe('task_verdict (MCP)', () => {
     expect(updates.some((u) => /UPDATE tasks SET status/.test(u.sql))).toBe(false)
   })
 
-  it('D1 WAIVER: self-verdict ALLOWED on gate:agent-self-completion (the executor fallback for an agent\'s own ungated completion)', async () => {
+  it('BLOCK-1 fix: the ASSIGNEE (plain member, no grant needed) closes its own gate:agent-self-completion task', async () => {
     // gate:agent-self-completion exists precisely so the completing agent closes its
-    // own completed ungated work (BLOCK-2, PR #417). Owner role passes the gate
-    // capability check; the waiver lets the assignee self-verdict — the verdict IS written.
+    // own completed ungated work (BLOCK-2, PR #417). The route authorizes by
+    // assignment (assignee or org owner/admin), NOT by grant — a plain member
+    // assignee can close its own task; the verdict IS written.
     const { env, updates } = makeEnv([reviewTask({ assignee_agent_id: AGENT_ID, gate_owner: 'gate:agent-self-completion' })])
-    const res = await invokeTool(auth({ role: 'owner' }), env, 'task_verdict', { task_id: 'task-1', verdict: 'approved' }, URL)
+    const res = await invokeTool(auth(), env, 'task_verdict', { task_id: 'task-1', verdict: 'approved' }, URL)
     expect(res.ok).toBe(true)
     expect(updates.some((u) => /UPDATE tasks SET status/.test(u.sql))).toBe(true)
   })
 
-  it('D1 WAIVER is not blanket: a grantless member is still forbidden on gate:agent-self-completion (403 before the waiver)', async () => {
-    // member role, no gate_grants row in the mock -> callerHoldsGateCapability false,
-    // so the 403 fires before the self_verdict waiver is ever reached.
-    const { env } = makeEnv([reviewTask({ assignee_agent_id: AGENT_ID, gate_owner: 'gate:agent-self-completion' })])
+  it('BLOCK-1 fix: a NON-assignee is forbidden on gate:agent-self-completion even with owner role for the capability check bypass', async () => {
+    // The exploit: any grant holder (or owner) approving another agent's completed
+    // task. Owner role passes capability checks generally — but for the
+    // self-completion gate the route requires assignee-or-org-admin, and this
+    // auth is a member (not owner/admin) who is NOT the assignee -> 403.
+    const { env } = makeEnv([reviewTask({ assignee_agent_id: 'agent-other', gate_owner: 'gate:agent-self-completion' })])
     const res = await invokeTool(auth(), env, 'task_verdict', { task_id: 'task-1', verdict: 'approved' }, URL)
     expect(res.ok).toBe(false)
     if (!res.ok) expect(res.error).toBe('forbidden')
+  })
+
+  it('BLOCK-1 fix: org owner may still close a self-completion task assigned to another agent', async () => {
+    const { env, updates } = makeEnv([reviewTask({ assignee_agent_id: 'agent-other', gate_owner: 'gate:agent-self-completion' })])
+    const res = await invokeTool(auth({ role: 'owner' }), env, 'task_verdict', { task_id: 'task-1', verdict: 'approved' }, URL)
+    expect(res.ok).toBe(true)
+    expect(updates.some((u) => /UPDATE tasks SET status/.test(u.sql))).toBe(true)
   })
 
   it('approves a review task for a NON-assignee gate holder, writing the verdict', async () => {

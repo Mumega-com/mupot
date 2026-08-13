@@ -201,7 +201,7 @@ describe('grant_list_gate_capabilities (D3 read tool, 2026-08-13)', () => {
 })
 
 
-describe('mintAgentBoundToken lands the D1 self-completion grant (2026-08-13)', () => {
+describe('mintAgentBoundToken lands the D2 lane grant atomically (2026-08-13)', () => {
   it('every first mint grants the agent gate:agent-self-completion (idempotent, audited as system:mint)', async () => {
     const db = makeDb()
     // Seed the FK targets the mint touches: department -> squad -> agent.
@@ -226,20 +226,17 @@ describe('mintAgentBoundToken lands the D1 self-completion grant (2026-08-13)', 
     expect(result.tokenId).toBeTruthy()
 
     const rows = db.grants()
-    expect(rows).toHaveLength(2)
-    const byCap = Object.fromEntries(rows.map((r) => [r.capability, r]))
-    // D1: universal self-completion grant.
-    expect(byCap['gate:agent-self-completion']).toMatchObject({
+    expect(rows).toHaveLength(1)
+    // D2: the agent's own lane gate (gate:<slug>) — part of the atomic mint.
+    expect(rows[0]).toMatchObject({
+      capability: 'gate:minty',
       principal_type: 'agent',
       principal_id: 'agent-mint-1',
       granted_by: 'system:mint',
     })
-    // D2: the agent's own lane gate (gate:<slug>).
-    expect(byCap['gate:minty']).toMatchObject({
-      principal_type: 'agent',
-      principal_id: 'agent-mint-1',
-      granted_by: 'system:mint',
-    })
+    // BLOCK-1 (kasra-review): gate:agent-self-completion is deliberately NOT
+    // granted at mint — the verdict route treats it as assignee-or-org-admin
+    // only, so a universal grant would be a dead authority surface.
 
     // Re-mint is idempotent — no duplicate grant rows.
     await mintAgentBoundToken(
@@ -247,6 +244,6 @@ describe('mintAgentBoundToken lands the D1 self-completion grant (2026-08-13)', 
       { id: 'agent-mint-1', squad_id: 'squad-mint', slug: 'minty', name: 'Minty' },
       'minty',
     )
-    expect(db.grants()).toHaveLength(2)
+    expect(db.grants()).toHaveLength(1)
   })
 })
