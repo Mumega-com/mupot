@@ -20,7 +20,13 @@ TENANT_SLUG = "mumega"          # your org slug
                                  # only ever used on behalf of the owning tenant, never a
                                  # customer/forked deployment (src/types.ts Env, #473).
 BRAND = "Mumega"                   # dashboard brand
-OAUTH_PROVIDER = "google"         # google | telegram
+IDP_PROVIDER = "google"           # google | telegram
+                                  # NOT `OAUTH_PROVIDER` — that binding name is RESERVED by
+                                  # @cloudflare/workers-oauth-provider, which injects its helpers
+                                  # object there only if the slot is empty. A [vars] entry of that
+                                  # name is truthy, so injection is skipped and /authorize throws
+                                  # at runtime while the worker still deploys green. (#699, P0-0;
+                                  # enforced by scripts/reserved-bindings.mjs.)
 # Required for Project Routine dispatch; scheduled work has no request Host to derive safely.
 # Set this to the canonical public origin of this pot before enabling a Routine.
 # PUBLIC_ORIGIN = "https://mupot.example.com"
