@@ -727,6 +727,19 @@ tasksApp.patch('/:id', async (c) => {
     if (lockStatuses.has(existing.status) && !repairsHistoricalUngatedReview) {
       return c.json({ error: 'gate_owner_locked', status: existing.status }, 409)
     }
+    // BLOCK-2 fix (kasra-review 2026-08-13, proof-of-exploit): once set,
+    // gate_owner is IMMUTABLE via the member API. Re-gating (or un-gating) a
+    // task to a peer's lane let two colluding/compromised agents launder any
+    // single-gate check (proven live). Only an org owner/admin may change or
+    // clear an existing gate_owner.
+    if (existing.gate_owner !== null && body.gate_owner !== existing.gate_owner) {
+      if (!legacyOwnerAdmin(c.get('auth'))) {
+        return c.json(
+          { error: 'gate_owner_immutable', detail: 'once set, gate_owner can only be changed or cleared by an org owner/admin' },
+          403,
+        )
+      }
+    }
     if (body.gate_owner === null) {
       next.gate_owner = null
     } else if (typeof body.gate_owner === 'string' && body.gate_owner.trim().length > 0) {
@@ -998,9 +1011,21 @@ tasksApp.post('/:id/verdict', async (c) => {
 
   // RBAC: caller must hold the gate capability.
   const auth = c.get('auth')
-  const hasGate = await callerHoldsGateCapability(c.env, auth, task.squad_id, task.gate_owner)
-  if (!hasGate) {
-    return c.json({ error: 'forbidden', need: task.gate_owner }, 403)
+  const principal = verdictPrincipal(auth)
+  // BLOCK-1 fix (kasra-review 2026-08-13, proof-of-exploit): gate:agent-self-completion
+  // is closeable ONLY by the completing agent (the assignee) or an org owner/admin.
+  // The gate grant is NOT authority for this gate — the D2 universal mint grant
+  // would let any agent approve any other agent's completed task (proven live).
+  // Every other gate keeps the capability-based check.
+  if (task.gate_owner === 'gate:agent-self-completion') {
+    if (principal.id !== task.assignee_agent_id && !legacyOwnerAdmin(auth)) {
+      return c.json({ error: 'forbidden', need: 'assignee_or_org_admin' }, 403)
+    }
+  } else {
+    const hasGate = await callerHoldsGateCapability(c.env, auth, task.squad_id, task.gate_owner)
+    if (!hasGate) {
+      return c.json({ error: 'forbidden', need: task.gate_owner }, 403)
+    }
   }
 
   // Surface-cap gate (#106): approving a gate:loops task (outreach queue) requires
@@ -1030,10 +1055,19 @@ tasksApp.post('/:id/verdict', async (c) => {
   //
   // Override: org owner may self-verdict by passing { override_self_verdict: true }
   // in the body. The override is logged in the verdict note for auditability.
-  const principal = verdictPrincipal(auth)
   const deciderPrincipalId = principal.id
   const isSelfVerdict = deciderPrincipalId === task.assignee_agent_id
-  if (isSelfVerdict) {
+  // D1 (2026-08-13, athena gate cluster map on 247858f1): gate:agent-self-completion
+  // is the executor's fallback gate for an agent's OWN completion of previously
+  // UNGATED work (src/agents/execute.ts AGENT_SELF_COMPLETION_GATE_OWNER, BLOCK-2
+  // PR #417). Its entire purpose is that the completing agent closes it — so the
+  // different-principal self_verdict rule is DELIBERATELY WAIVED for exactly this
+  // capability. The waiver is not blanket: reaching this point already required
+  // callerHoldsGateCapability to pass above (a gate_grants row for the caller, or
+  // the org owner/admin legacy bypass), so a caller without the grant still gets
+  // 403, and every other gate keeps the self_verdict 409.
+  const isSelfCompletionGate = task.gate_owner === 'gate:agent-self-completion'
+  if (isSelfVerdict && !isSelfCompletionGate) {
     const isOrgOwner = auth.role === 'owner'
     const overrideRequested = body.override_self_verdict === true
     if (!isOrgOwner || !overrideRequested) {
@@ -1150,8 +1184,10 @@ import { isExternallySourced } from './provenance'
 import { isValidGateOwnerForm } from './service'
 import {
   grantGateCapability,
+  listGateCapabilities,
   parseGateGrantArgs,
   revokeGateCapability,
+  type GatePrincipalType,
 } from '../gates/grants'
 
 export const gatesApp = new Hono<{ Bindings: Env; Variables: { auth: AuthContext } }>()
@@ -1231,6 +1267,23 @@ gatesApp.delete('/grants', async (c) => {
   })
 
   return c.json({ ok: true })
+})
+
+// GET /api/gates/grants — read gate grants (D3, 2026-08-13). Org owner/admin only;
+// optional filters: ?capability=, ?principal_type=, ?principal_id=. Audit data must
+// be readable or authority is a wall, not a gate.
+gatesApp.get('/grants', async (c) => {
+  const auth = c.get('auth')
+  if (!isOrgAdmin(auth)) {
+    return c.json({ error: 'forbidden', need: 'owner_or_admin' }, 403)
+  }
+  const q = c.req.query()
+  const grants = await listGateCapabilities(c.env, {
+    capability: q.capability || undefined,
+    principalType: (q.principal_type as GatePrincipalType | undefined) || undefined,
+    principalId: q.principal_id || undefined,
+  })
+  return c.json({ ok: true, grants, count: grants.length })
 })
 
 // ── d1 helpers ───────────────────────────────────────────────────────────────

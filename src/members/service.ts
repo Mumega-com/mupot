@@ -260,6 +260,25 @@ export async function prepareAgentBoundTokenMintForBinding(
     ).bind(tokenId, memberId, tokenHash, safeLabel, createdAt, agent.id, env.TENANT_SLUG),
   )
 
+  // D2 (2026-08-13, athena gate cluster map 247858f1; Hadi decision option A
+  // "make it smooth now, tighten later"): the agent's OWN LANE gate is part of
+  // the identity weld — one atomic batch, so the grant can never silently miss
+  // a mint (BLOCK-4 re-baseline: this replaces the post-commit grant call that
+  // broke the batch contract). Because this lives in the shared prepare, every
+  // mint path gets it: mint_agent_token, provision_agent_connection, and
+  // bootstrap_self (kasra-review P2). The upsert keeps re-mints idempotent
+  // AND always reports a written row (assertBatchWritten contract); granted_by='system:mint'
+  // marks it a system grant in the D3 audit trail. NOTE: gate:agent-self-completion is
+  // deliberately NOT granted here — the verdict route treats that gate as assignee-or-org-admin only,
+  // so a universal grant would be a dead authority surface (BLOCK-1, kasra-review).
+  statements.push(
+    env.DB.prepare(
+      `INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
+       VALUES (?, ?, 'agent', ?, 'system:mint', ?)
+       ON CONFLICT (capability, principal_type, principal_id) DO UPDATE SET created_at = created_at`,
+    ).bind(crypto.randomUUID(), `gate:${agent.slug}`, agent.id, createdAt),
+  )
+
   return {
     raw: rawToken,
     tokenId,

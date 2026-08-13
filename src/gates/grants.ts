@@ -79,6 +79,49 @@ export async function grantGateCapability(
   }
 }
 
+
+export interface GateGrantFilter {
+  capability?: string
+  principalType?: GatePrincipalType
+  principalId?: string
+}
+
+/**
+ * D3 (2026-08-13, athena gate cluster map on 247858f1): read-side twin of
+ * grant/revoke — grants are audit data; an unreadable audit is a wall. Returns
+ * gate_grants rows (capability, principal_type, principal_id, granted_by,
+ * created_at), optionally filtered, newest first, capped at 500. Callers gate
+ * org:admin in the tool/route layer.
+ */
+export async function listGateCapabilities(
+  env: Env,
+  filter: GateGrantFilter = {},
+): Promise<GateGrantRecord[]> {
+  const clauses: string[] = []
+  const binds: unknown[] = []
+  if (filter.capability !== undefined) {
+    clauses.push('capability = ?')
+    binds.push(filter.capability)
+  }
+  if (filter.principalType !== undefined) {
+    clauses.push('principal_type = ?')
+    binds.push(filter.principalType)
+  }
+  if (filter.principalId !== undefined) {
+    clauses.push('principal_id = ?')
+    binds.push(filter.principalId)
+  }
+  const where = clauses.length > 0 ? ` WHERE ${clauses.join(' AND ')}` : ''
+  const rows = await env.DB.prepare(
+    `SELECT capability, principal_type, principal_id, granted_by, created_at
+       FROM gate_grants${where}
+      ORDER BY created_at DESC
+      LIMIT 500`,
+  )
+    .bind(...binds)
+    .all<GateGrantRecord>()
+  return rows.results ?? []
+}
 export async function revokeGateCapability(
   env: Env,
   input: {

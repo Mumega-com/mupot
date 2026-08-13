@@ -7,8 +7,10 @@
 import type { AuthContext, Env } from '../types'
 import {
   grantGateCapability,
+  listGateCapabilities,
   parseGateGrantArgs,
   revokeGateCapability,
+  type GatePrincipalType,
 } from '../gates/grants'
 import { type ToolSpec, fail, done, hasWorkspaceAdmin } from './index'
 
@@ -106,7 +108,37 @@ const toolRevokeGateCapability: ToolSpec = {
   },
 }
 
+
+const toolListGateCapabilities: ToolSpec = {
+  name: 'grant_list_gate_capabilities',
+  scope: 'org (org-admin read of gate:<owner> grants — D3 audit visibility, 2026-08-13)',
+  min: 'admin',
+  args: '{ capability?, principal_type?, principal_id? } (all optional filters)',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      capability: STRING_SCHEMA,
+      principal_type: { type: 'string', enum: ['member', 'agent'] },
+      principal_id: STRING_SCHEMA,
+    },
+    required: [],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const denied = requireOrgAdmin(auth)
+    if (denied) return denied
+
+    const grants = await listGateCapabilities(env as Env, {
+      capability: args.capability === undefined ? undefined : String(args.capability),
+      principalType: args.principal_type === undefined ? undefined : String(args.principal_type) as GatePrincipalType,
+      principalId: args.principal_id === undefined ? undefined : String(args.principal_id),
+    })
+    return done({ grants, count: grants.length })
+  },
+}
+
 export const GATE_GRANT_TOOLS: ToolSpec[] = [
   toolGrantGateCapability,
+  toolListGateCapabilities,
   toolRevokeGateCapability,
 ]

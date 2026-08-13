@@ -124,15 +124,16 @@ describe('mintAgentBoundToken', () => {
     expect(typeof result.memberId).toBe('string')
   })
 
-  it('batches exactly 4 INSERT rows (member + binding + capability + token)', async () => {
+  it('batches exactly 5 INSERT rows (member + binding + capability + token + D2 lane grant)', async () => {
     const captured: Captured[] = []
     const env = makeUnitEnv({ captured })
     await mintAgentBoundToken(env, AGENT, 'batch-test')
-    expect(captured).toHaveLength(4)
+    expect(captured).toHaveLength(5)
     expect(captured.some((c) => c.sql.includes('INSERT INTO members'))).toBe(true)
     expect(captured.some((c) => c.sql.includes('INSERT INTO agent_member_bindings'))).toBe(true)
     expect(captured.some((c) => c.sql.includes('INSERT INTO capabilities'))).toBe(true)
     expect(captured.some((c) => c.sql.includes('INSERT INTO member_tokens'))).toBe(true)
+    expect(captured.some((c) => c.sql.includes('INSERT INTO gate_grants'))).toBe(true)
   })
 
   it('THE WELD: member_tokens binds agent.id and tenant', async () => {
@@ -246,8 +247,13 @@ describe('mintAgentBoundToken', () => {
     const result = await mintAgentBoundToken(env, AGENT, 'race-label', 'member')
 
     expect(batches).toHaveLength(2)
-    expect(batches[0]).toHaveLength(4)
-    expect(batches[1]).toHaveLength(1)
+    // BLOCK-4 re-baseline (kasra-review 2026-08-13): the D2 lane grant
+    // (gate:<slug>) is part of the atomic mint batch, so the first mint is
+    // 5 rows (member + binding + capability + token + gate_grants) and the
+    // winning re-mint is 2 rows (token + gate_grants). Batch COUNT stays 2 —
+    // the losing commit + the winning retry — no third batch.
+    expect(batches[0]).toHaveLength(5)
+    expect(batches[1]).toHaveLength(2)
     const losingToken = batches[0].find(({ sql }) => sql.includes('INSERT INTO member_tokens'))
     const winningToken = batches[1].find(({ sql }) => sql.includes('INSERT INTO member_tokens'))
     expect(losingToken).toBeDefined()
