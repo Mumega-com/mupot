@@ -1,7 +1,7 @@
 agent: athena
 agent_id: a9423609-e3bf-4797-8af8-4b9b7aecdf16   # match by UUID, never slug
 harness: prime-agent
-models: [opencode-go/deepseek-v4-flash]
+models: [opencode-go/deepseek-v4-pro]
 status: live
 tokens:
   - bus
