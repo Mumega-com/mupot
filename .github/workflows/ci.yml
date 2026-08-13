@@ -144,6 +144,19 @@ jobs:
       - name: Guard — no secrets in this public template
         run: node scripts/no-secrets.mjs
 
+  reserved-bindings:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # A wrangler config is the one input to the running worker that neither code
+      # review nor the type system sees. #699 was fixed in code and still shipped
+      # broken for 8 days because the fix never reached the configs. See the scanner.
+      - name: Guard — no reserved binding names in wrangler configs
+        run: node scripts/reserved-bindings.mjs
+
   test-schema-source:
     runs-on: ubuntu-latest
     steps:

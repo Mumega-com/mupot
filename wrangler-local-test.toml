@@ -14,7 +14,7 @@ command = "node scripts/generate-build-info.mjs"
 [vars]
 TENANT_SLUG = "local"
 BRAND = "Mupot Local"
-OAUTH_PROVIDER = "google"
+IDP_PROVIDER = "google"
 PUBLIC_ORIGIN = "http://127.0.0.1:8787"
 FLEET_PROJECT = "local"
 FLEET_OPS_AGENT = "local-ops"
