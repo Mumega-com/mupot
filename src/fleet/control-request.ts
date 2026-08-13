@@ -13,6 +13,12 @@
 // this compatibility.
 
 export const CANON_VERSION = 'fleet-control.v1'
+// Squad-targeted requests use a DISTINCT canonical version — never 'fleet-control.v1' with a
+// squad_id smuggled into the agent_id slot. That keeps the two request shapes from ever
+// producing colliding canonical bytes, so a captured agent-targeted signature can never be
+// replayed as a squad-targeted one (or vice versa) even when the id strings happen to match.
+// Must match the host's control_request.CANON_VERSION_SQUAD byte-for-byte.
+export const CANON_VERSION_SQUAD = 'fleet-control-squad.v1'
 export const CONTROL_VERBS = ['start', 'stop', 'status', 'restart'] as const
 export type ControlVerb = (typeof CONTROL_VERBS)[number]
 
@@ -31,6 +37,19 @@ export const _NONCE_RE = NONCE_RE
 
 export interface ControlRequest {
   agent_id: string
+  verb: ControlVerb
+  nonce: string
+  ts: number
+  sig: string
+}
+
+// A squad-targeted control-request — the SAME transport (rides the agent inbox to the host
+// consumer) and the SAME three checks (signature + freshness + single-use nonce), but selects
+// WHICH manifests run by squad_id (engine.control_squad on the host) instead of a single
+// agent_id. Mutually exclusive with ControlRequest at the call site — a request names exactly
+// one target.
+export interface SquadControlRequest {
+  squad_id: string
   verb: ControlVerb
   nonce: string
   ts: number
@@ -58,8 +77,24 @@ export function canonicalBytes(agentId: string, verb: string, nonce: string, ts:
   return new TextEncoder().encode([CANON_VERSION, agentId, verb, nonce, String(ts)].join('\n'))
 }
 
+/** The exact bytes signed/verified for a squad-targeted request — same shape as
+ *  canonicalBytes, under CANON_VERSION_SQUAD so it can never collide with an agent-targeted
+ *  canonical string (see that constant's comment). */
+export function canonicalSquadBytes(squadId: string, verb: string, nonce: string, ts: number): Uint8Array {
+  return new TextEncoder().encode([CANON_VERSION_SQUAD, squadId, verb, nonce, String(ts)].join('\n'))
+}
+
 function validate(agentId: string, verb: string, nonce: string, ts: number): void {
   if (!ID_RE.test(agentId)) throw new ControlRequestError('agent_id must be a registry slug (<=64, no traversal)')
+  if (!(CONTROL_VERBS as readonly string[]).includes(verb)) throw new ControlRequestError(`verb must be one of ${CONTROL_VERBS.join('|')}`)
+  if (!NONCE_RE.test(nonce)) throw new ControlRequestError('nonce must be 16-128 url-safe chars')
+  if (!Number.isInteger(ts)) throw new ControlRequestError('ts must be an integer (unix seconds)')
+}
+
+// Same checks as validate(), just for squad_id (reuses ID_RE — a squad id is a registry slug
+// too, exactly like an agent id; it is only ever a SELECTOR for which manifests run).
+function validateSquad(squadId: string, verb: string, nonce: string, ts: number): void {
+  if (!ID_RE.test(squadId)) throw new ControlRequestError('squad_id must be a registry slug (<=64, no traversal)')
   if (!(CONTROL_VERBS as readonly string[]).includes(verb)) throw new ControlRequestError(`verb must be one of ${CONTROL_VERBS.join('|')}`)
   if (!NONCE_RE.test(nonce)) throw new ControlRequestError('nonce must be 16-128 url-safe chars')
   if (!Number.isInteger(ts)) throw new ControlRequestError('ts must be an integer (unix seconds)')
@@ -150,4 +185,35 @@ export async function verifyControlRequest(publicKeyJwkJson: string, req: Contro
   const key = await crypto.subtle.importKey('jwk', { kty: jwk.kty, crv: jwk.crv, x: jwk.x }, { name: 'Ed25519' }, false, ['verify'])
   const sig = Uint8Array.from(atob(req.sig.replace(/-/g, '+').replace(/_/g, '/')), (ch) => ch.charCodeAt(0))
   return crypto.subtle.verify({ name: 'Ed25519' }, key, sig, canonicalBytes(req.agent_id, req.verb, req.nonce, req.ts))
+}
+
+/** Build a signed squad-targeted control-request. Mirrors signControlRequest exactly, against
+ *  the squad canonical bytes. Validates first; throws ControlRequestError on bad input. */
+export async function signSquadControlRequest(
+  privateKeyJwkJson: string | undefined,
+  input: { squad_id: string; verb: string },
+  opts: SignOpts = {},
+): Promise<SquadControlRequest> {
+  if (!privateKeyJwkJson) throw new ControlRequestError('FLEET_PANEL_SK not configured (fail-closed)')
+  const squadId = input.squad_id
+  const verb = input.verb
+  const nonce = opts.nonce ?? genNonce()
+  const nowMs = opts.now ? opts.now() : Date.now()
+  const ts = opts.ts ?? Math.floor(nowMs / 1000)
+  validateSquad(squadId, verb, nonce, ts)
+  const key = await importPrivateKey(privateKeyJwkJson)
+  const sigBytes = new Uint8Array(await crypto.subtle.sign({ name: 'Ed25519' }, key, canonicalSquadBytes(squadId, verb, nonce, ts)))
+  return { squad_id: squadId, verb: verb as ControlVerb, nonce, ts, sig: b64urlEncode(sigBytes, true) }
+}
+
+/** TS-side verify for a squad-targeted request (round-trip tests + a future ack-verify). */
+export async function verifySquadControlRequest(publicKeyJwkJson: string, req: SquadControlRequest): Promise<boolean> {
+  const jwk = JSON.parse(publicKeyJwkJson) as JsonWebKey
+  if (jwk.kty !== 'OKP' || jwk.crv !== 'Ed25519' || (jwk as { d?: string }).d) {
+    throw new ControlRequestError('public key must be a PUBLIC Ed25519 OKP JWK')
+  }
+  validateSquad(req.squad_id, req.verb, req.nonce, req.ts)
+  const key = await crypto.subtle.importKey('jwk', { kty: jwk.kty, crv: jwk.crv, x: jwk.x }, { name: 'Ed25519' }, false, ['verify'])
+  const sig = Uint8Array.from(atob(req.sig.replace(/-/g, '+').replace(/_/g, '/')), (ch) => ch.charCodeAt(0))
+  return crypto.subtle.verify({ name: 'Ed25519' }, key, sig, canonicalSquadBytes(req.squad_id, req.verb, req.nonce, req.ts))
 }

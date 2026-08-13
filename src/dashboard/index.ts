@@ -175,8 +175,8 @@ import { answerRoutineRun, cancelRoutineRun } from '../routines/actions'
 // on this same dashboard app, so it inherits the auth + tenant guard below.
 import { wakeFleetAgent, requestFleetControl, fleetScoped } from './fleet'
 import { listFleetAgentRuntimeView } from '../fleet/registry'
-import { emitControlRequest } from '../fleet/control'
-import { hostAgentsPanel } from './fleet-host'
+import { emitControlRequest, emitSquadControlRequest } from '../fleet/control'
+import { hostAgentsPanel, squadControlPanel } from './fleet-host'
 import { listPresence } from '../fleet/presence'
 import type { PresenceView } from '../fleet/presence'
 import { listJourneys, buildDepartureBoard } from '../coordination/journeys'
@@ -1206,11 +1206,13 @@ dashboardApp.get('/fleet', async (c) => {
   const auth = c.get('auth')
   const squadIds = await resolveAccessibleSquadIds(c.env, auth)
   const hostAgents = await listFleetAgentRuntimeView(c.env, Date.now(), squadIds)
-  const hostPanel = hostAgentsPanel(hostAgents, {
+  const hostPanelOpts = {
     configured: !!c.env.FLEET_PANEL_SK && !!c.env.FLEET_CONSUMER_AGENT,
     canControl: auth.role === 'owner',
     flash: c.req.query('hc') ?? null,
-  })
+  }
+  const hostPanel = hostAgentsPanel(hostAgents, hostPanelOpts)
+  const squadPanel = squadControlPanel(hostAgents, hostPanelOpts)
 
   const [presence, physics, spend] = await Promise.all([
     listPresence(c.env, Date.now(), squadIds),
@@ -1218,27 +1220,29 @@ dashboardApp.get('/fleet', async (c) => {
     loadTodaySpendScalar(c.env),
   ])
   return c.html(
-    shell(c.env, 'Fleet', html`${hostPanel}${potFleetBody(presence)}`, {
+    shell(c.env, 'Fleet', html`${hostPanel}${squadPanel}${potFleetBody(presence)}`, {
       physics,
       costToday: { configured: spend.configured, todayUsdMicro: spend.today_usd_micro },
     }),
   )
 })
 
-// POST /fleet/host-control — start|stop|restart a HOST agent via the SIGNED control plane (mupot
-// inbox → host daemon verifies the Ed25519 signature → engine). OWNER only (highest-stakes action;
-// host process control). The principal comes from the session, never the form. Form POST + redirect.
+// POST /fleet/host-control — start|stop|restart a HOST agent OR squad via the SIGNED control
+// plane (mupot inbox → host daemon verifies the Ed25519 signature → engine.control/control_squad).
+// OWNER only (highest-stakes action; host process control). The principal comes from the
+// session, never the form. Form POST + redirect. Exactly one of agent_id/squad_id is present —
+// the two panel forms (controlCell / squadControlCell) each set only their own hidden field.
 dashboardApp.post('/fleet/host-control', async (c) => {
   const auth = c.get('auth')
   if (auth.role !== 'owner') return c.json({ error: 'forbidden', need: 'owner' }, 403)
   const form = await c.req.parseBody()
   const agent_id = typeof form.agent_id === 'string' ? form.agent_id : ''
+  const squad_id = typeof form.squad_id === 'string' ? form.squad_id : ''
   const verb = typeof form.verb === 'string' ? form.verb : ''
-  const res = await emitControlRequest(
-    c.env,
-    { agent_id, verb },
-    { memberId: auth.memberId ?? auth.userId, boundAgentId: auth.boundAgentId ?? null },
-  )
+  const principal = { memberId: auth.memberId ?? auth.userId, boundAgentId: auth.boundAgentId ?? null }
+  const res = squad_id
+    ? await emitSquadControlRequest(c.env, { squad_id, verb }, principal)
+    : await emitControlRequest(c.env, { agent_id, verb }, principal)
   return c.redirect(`/fleet?hc=${encodeURIComponent(res.ok ? 'ok' : res.reason)}`)
 })
 

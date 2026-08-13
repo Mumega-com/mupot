@@ -1,6 +1,8 @@
 // Fleet Control routes (Deliverable 2) — under /api/fleet.
 //
 //  POST /control  — emit a signed control-request (owner-cap; the host verifies + executes).
+//                   Body is EITHER {agent_id, verb} OR {squad_id, verb} — a request names
+//                   exactly one target; the two shapes are mutually exclusive at this route.
 //  POST /report   — the host consumer daemon publishes its controllable agents + live status.
 //  GET  /agents   — read the registry (the dashboard renders the roster from this).
 //  GET  /trust    — publish public-only panel verification metadata for host bootstrap.
@@ -14,7 +16,7 @@ import type { Context } from 'hono'
 import type { Env } from '../types'
 import { bearerToken, resolveMemberByToken } from '../auth/member-bearer'
 import { resolveCapabilities, hasCapability } from '../auth/capability'
-import { emitControlRequest } from './control'
+import { emitControlRequest, emitSquadControlRequest } from './control'
 import { reportFleetAgents, getAgentView } from './registry'
 import { resolveOrgAdmin } from '../auth/member-bearer'
 import { panelPublicJwk } from './control-request'
@@ -56,14 +58,32 @@ fleetControlApp.post('/control', async (c) => {
 
   const parsed = await readJsonCapped(c, 4096)
   if (!parsed.ok) return c.json({ error: parsed.reason }, parsed.reason === 'too_large' ? 413 : 400)
-  const body = parsed.value as { agent_id?: unknown; verb?: unknown }
-  if (typeof body.agent_id !== 'string' || typeof body.verb !== 'string') {
-    return c.json({ error: 'bad_request', detail: 'agent_id and verb (string) required' }, 400)
+  const body = parsed.value as { agent_id?: unknown; squad_id?: unknown; verb?: unknown }
+  const hasAgent = typeof body.agent_id === 'string'
+  const hasSquad = typeof body.squad_id === 'string'
+  // Exactly one of agent_id/squad_id, plus a verb. `hasAgent === hasSquad` catches BOTH
+  // "neither present" (false===false) and "both present" (true===true) — a request must name
+  // exactly one target, never zero, never two ambiguous ones.
+  if (typeof body.verb !== 'string' || hasAgent === hasSquad) {
+    return c.json({ error: 'bad_request', detail: 'exactly one of agent_id/squad_id (string), plus verb (string), required' }, 400)
+  }
+
+  if (hasSquad) {
+    const res = await emitSquadControlRequest(
+      c.env,
+      { squad_id: body.squad_id as string, verb: body.verb },
+      { memberId: id.memberId, boundAgentId: id.boundAgentId },
+    )
+    if (!res.ok) {
+      const code = res.reason === 'unconfigured' ? 503 : res.reason === 'invalid_input' ? 400 : 502
+      return c.json({ error: res.reason, detail: res.detail }, code)
+    }
+    return c.json({ ok: true, nonce: res.nonce, squad_id: res.squad_id, verb: res.verb })
   }
 
   const res = await emitControlRequest(
     c.env,
-    { agent_id: body.agent_id, verb: body.verb },
+    { agent_id: body.agent_id as string, verb: body.verb },
     { memberId: id.memberId, boundAgentId: id.boundAgentId },
   )
   if (!res.ok) {
