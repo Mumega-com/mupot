@@ -57,7 +57,7 @@ function parseRoot(args) {
 // are the ones that actually broke production, but they are by definition invisible to
 // CI — a scan that silently found nothing in them would be a false green. They are the
 // operator's responsibility at deploy time; what CI can own is that the TEMPLATE never
-// teaches the mistake again. See the deploy-preflight note in docs.
+// teaches the mistake again. The operator half is docs/operations/deploy-preflight.md.
 function trackedConfigs(root) {
   const out = execFileSync('git', ['ls-files', '-z', '--', '*.toml'], {
     cwd: root,
