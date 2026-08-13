@@ -200,9 +200,6 @@ export class AgentDO extends DurableObject<Env> {
         // S2: consume observer signals from the goal cycle.
         // cooldown=true → extend the next alarm so the agent backs off instead of
         //   busy-looping on an identical situation every 15 min.
-        // escalate=true → TODO: emit a single operator notification via the
-        //   approval/notification seam (see loops/notifications or tasks gate_owner).
-        //   Left as a result field for now — the surface to wire it onto is S3 scope.
         const obs = goalResult.observer
         if (obs?.cooldown) {
           // Extend alarm by COOLDOWN_EXTENSION_MS on top of the standard interval.

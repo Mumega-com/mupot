@@ -91,7 +91,7 @@ interface ObserverRow {
  * AgentDO consumes:
  *   cooldown  → extend the next alarm (back off; don't busy-loop)
  *   escalate  → emit a single operator notification via existing approval/notification
- *               seam. TODO: wire the actual emit in AgentDO (see agent-do.ts).
+ *               seam.
  *
  * The `now` parameter is injectable for determinism in tests.
  */
