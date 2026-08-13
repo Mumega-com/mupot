@@ -1022,6 +1022,13 @@ describe('MCP granted multi-squad flight lifecycle', () => {
           id TEXT PRIMARY KEY, member_id TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE,
           label TEXT NOT NULL DEFAULT '', channel TEXT NOT NULL DEFAULT 'workspace',
           created_at TEXT NOT NULL DEFAULT (datetime('now')), revoked_at TEXT,
+          -- migrations/0099: the bearer lookup now references these. Hand-written here
+          -- because this fixture predates the real-migration harness. That is exactly
+          -- why it broke: a transcribed schema is a second source of truth, and it
+          -- drifts silently — the query referenced a column this table never had and
+          -- every authenticated call in the file returned 500. Prefer the migration
+          -- harness (tests/token-lifecycle-real-schema.test.ts) for anything new.
+          expires_at TEXT, last_used_at TEXT,
           agent_id TEXT, tenant TEXT NOT NULL
         );
         CREATE TABLE agent_member_bindings (

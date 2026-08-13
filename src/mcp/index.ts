@@ -35,6 +35,7 @@ import type {
   Task,
 } from '../types'
 import { resolveCapabilities, hasCapability, holdsCapabilityFloor, canOnSquad, hasSurfaceCap } from '../auth/capability'
+import { TOKEN_LIVE_PREDICATE, nowSqlUtc, touchTokenLastUsed } from '../auth/token-lifecycle'
 import { callerHoldsGateCapability, verdictPrincipal } from '../tasks/index'
 import { isChannel } from '../members/service'
 import { resolveConsentedAgentCapabilities } from './oauth-authorize'
@@ -295,10 +296,13 @@ async function authenticateMember(c: {
       WHERE t.token_hash = ?1
         AND t.tenant = ?2
         AND m.tenant = ?2
-        AND t.revoked_at IS NULL
+        -- 0099: liveness (revoked OR expired) comes from ONE shared predicate that
+        -- src/auth/member-bearer.ts also executes. Enforcing expiry in only one of the
+        -- two bearer lookups would leave the other as a live bypass door.
+        AND ${TOKEN_LIVE_PREDICATE('?3')}
       LIMIT 1`,
   )
-    .bind(tokenHash, c.env.TENANT_SLUG)
+    .bind(tokenHash, c.env.TENANT_SLUG, nowSqlUtc())
     .first<{
       member_id: string
       email: string | null
@@ -311,6 +315,14 @@ async function authenticateMember(c: {
     }>()
 
   if (!row) return null
+
+  // 0099: stamp last_used_at. Best-effort by construction — this is telemetry that
+  // makes credential cleanup POSSIBLE (without it nothing separates a live agent's
+  // token from an abandoned one, so the safe action is always "leave it" and the set
+  // only grows), but it is not an authorization input. A failed write must never fail
+  // an authenticated request, hence the swallowed catch and the absence of an await
+  // on the caller's critical path being load-bearing.
+  void touchTokenLastUsed(c.env, tokenHash)
   if (row.status !== 'active') return null
 
   const capabilities = await resolveCapabilities(c.env, row.member_id)
