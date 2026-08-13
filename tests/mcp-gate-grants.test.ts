@@ -226,20 +226,27 @@ describe('mintAgentBoundToken lands the D1 self-completion grant (2026-08-13)', 
     expect(result.tokenId).toBeTruthy()
 
     const rows = db.grants()
-    expect(rows).toHaveLength(1)
-    expect(rows[0]).toMatchObject({
-      capability: 'gate:agent-self-completion',
+    expect(rows).toHaveLength(2)
+    const byCap = Object.fromEntries(rows.map((r) => [r.capability, r]))
+    // D1: universal self-completion grant.
+    expect(byCap['gate:agent-self-completion']).toMatchObject({
+      principal_type: 'agent',
+      principal_id: 'agent-mint-1',
+      granted_by: 'system:mint',
+    })
+    // D2: the agent's own lane gate (gate:<slug>).
+    expect(byCap['gate:minty']).toMatchObject({
       principal_type: 'agent',
       principal_id: 'agent-mint-1',
       granted_by: 'system:mint',
     })
 
-    // Re-mint is idempotent — no duplicate grant row.
+    // Re-mint is idempotent — no duplicate grant rows.
     await mintAgentBoundToken(
       db.env,
       { id: 'agent-mint-1', squad_id: 'squad-mint', slug: 'minty', name: 'Minty' },
       'minty',
     )
-    expect(db.grants()).toHaveLength(1)
+    expect(db.grants()).toHaveLength(2)
   })
 })

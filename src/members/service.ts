@@ -327,7 +327,7 @@ export async function mintAgentBoundToken(
   const first = await prepareAgentBoundTokenMint(env, agent, label, grantCapability)
   try {
     const result = await commitPreparedAgentTokenMint(env, first)
-    await ensureSelfCompletionGrant(env, agent.id)
+    await ensureSystemGateGrants(env, agent)
     return result
   } catch (error) {
     if (!agentIdentityConflict(error)) throw error
@@ -345,29 +345,45 @@ export async function mintAgentBoundToken(
       winner,
     )
     const result = await commitPreparedAgentTokenMint(env, retry)
-    await ensureSelfCompletionGrant(env, agent.id)
+    await ensureSystemGateGrants(env, agent)
     return result
   }
 }
 
 /**
- * D1 (2026-08-13, athena gate cluster map on 247858f1): every minted agent
- * receives the gate:agent-self-completion grant — the executor's fallback gate
- * for an agent's OWN completion of previously-ungated work (BLOCK-2, PR #417,
- * src/agents/execute.ts AGENT_SELF_COMPLETION_GATE_OWNER). The capability only
- * ever authorizes closing the holder's OWN completed work (the verdict route
- * waives self_verdict for exactly this gate, and only after the gate_grants
- * check passes), so it is safe to grant universally at mint. INSERT OR IGNORE
- * keeps it idempotent across re-mints; granted_by records the pot itself as the
- * grantor so the audit trail distinguishes system grants from operator grants.
+ * D1+D2 (2026-08-13, athena gate cluster map on 247858f1; Hadi decision: option A
+ * "make it smooth now, tighten later"): every minted agent automatically receives
+ * two system grants:
+ *
+ *  1. gate:agent-self-completion — the executor's fallback gate for an agent's
+ *     OWN completion of previously-ungated work (BLOCK-2, PR #417,
+ *     src/agents/execute.ts AGENT_SELF_COMPLETION_GATE_OWNER). Only authorizes
+ *     closing the holder's OWN completed work (the verdict route waives
+ *     self_verdict for exactly this gate, and only after the gate_grants check
+ *     passes), so it is safe to grant universally.
+ *  2. gate:<agent.slug> — the agent's own lane gate. A task gated with the
+ *     agent's slug becomes verdictable by that agent (e.g. gate:athena tasks by
+ *     Athena). Dormant unless used, and the DIFFERENT-PRINCIPAL self_verdict
+ *     rule still applies to it — the lane grant only lets the agent verdict
+ *     work in its lane assigned to OTHERS, never its own work.
+ *
+ * INSERT OR IGNORE keeps both idempotent across re-mints; granted_by records
+ * the pot itself as the grantor so the audit trail distinguishes system grants
+ * from operator grants. NOTE: the lane grant keys on slug at mint time; a later
+ * slug rename leaves a harmless stale row (re-grant on rename is a follow-up).
  */
-async function ensureSelfCompletionGrant(env: Env, agentId: string): Promise<void> {
-  await env.DB.prepare(
-    `INSERT OR IGNORE INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
-       VALUES (?, 'gate:agent-self-completion', 'agent', ?, 'system:mint', ?)`,
-  )
-    .bind(crypto.randomUUID(), agentId, new Date().toISOString())
-    .run()
+async function ensureSystemGateGrants(env: Env, agent: AgentForMint): Promise<void> {
+  const now = new Date().toISOString()
+  await env.DB.batch([
+    env.DB.prepare(
+      `INSERT OR IGNORE INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
+         VALUES (?, 'gate:agent-self-completion', 'agent', ?, 'system:mint', ?)`,
+    ).bind(crypto.randomUUID(), agent.id, now),
+    env.DB.prepare(
+      `INSERT OR IGNORE INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
+         VALUES (?, ?, 'agent', ?, 'system:mint', ?)`,
+    ).bind(crypto.randomUUID(), `gate:${agent.slug}`, agent.id, now),
+  ])
 }
 
 /** Live (non-revoked) tokens for every member — for the dashboard roster. The
