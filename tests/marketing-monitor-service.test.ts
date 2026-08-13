@@ -33,6 +33,11 @@ const migrations = [
   '../migrations/0050_addons.sql',
   '../migrations/0052_addon_bindings.sql',
   '../migrations/0053_marketing_monitor_runs.sql',
+  // 0099 adds member_tokens.expires_at/last_used_at, which the bearer lookup now
+  // references. Omitting it here does not skip a feature — it makes the auth query
+  // reference a column this fixture never created, so every authenticated request in
+  // this file 401s. A curated migration list is a second schema that silently drifts.
+  '../migrations/0099_member_token_lifecycle.sql',
 ].map((path) => readFileSync(new URL(path, import.meta.url), 'utf8'))
 
 const owner = { id: 'owner-1', role: 'owner' as const }

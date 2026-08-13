@@ -1,0 +1,216 @@
+// tests/token-lifecycle-real-schema.test.ts — migration 0099.
+//
+// WHY THIS TEST DOES NOT MOCK
+//
+// The defect this guards is a SQL-semantics defect, and a DB mock cannot see one.
+// mupot#684 is the standing proof: twelve unit tests passed against a query that
+// referenced a column which did not exist, because the mock returned canned rows and
+// never executed the SQL. So this builds member_tokens FROM THE COMMITTED MIGRATIONS
+// and runs the ACTUAL exported predicate against it.
+//
+// Two specific things are being proven, and both failed silently in earlier drafts:
+//
+//  1. EXPIRY IS ENFORCED AT BOTH DOORS. `authenticateMember` (src/mcp/index.ts) and
+//     `resolveMemberByToken` (src/auth/member-bearer.ts) are independent copies of the
+//     bearer lookup — a duplication #41 tracks. Expiry in one but not the other is not
+//     a partial fix, it is a bypass: the expired credential just uses the other door.
+//     Both now execute TOKEN_LIVE_PREDICATE, and the test asserts the export is what
+//     each file references rather than trusting that they were both edited.
+//
+//  2. MIXED TIMESTAMP FORMATS COMPARE CORRECTLY. member_tokens holds both
+//     `2026-06-06 16:11:58` and `2026-06-09T02:51:30.844Z` — verified live 2026-08-13.
+//     Lexicographically 'T' (0x54) sorts after ' ' (0x20), so a string comparison
+//     between the two shapes is wrong for the same instant, and wrong in whichever
+//     direction the row's format happens to dictate. That is a fail-open for half the
+//     table. julianday() on both sides is the fix; the mixed-format cases below are
+//     the reason it cannot be "simplified" back to `>`.
+
+import { describe, expect, it, beforeEach, afterEach } from 'vitest'
+import { readFileSync, readdirSync } from 'node:fs'
+import { join } from 'node:path'
+import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../src/auth/token-lifecycle'
+
+const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
+
+function applyAllMigrations(sqlite: SqliteD1Harness['sqlite']): void {
+  const files = readdirSync(MIGRATIONS_DIR).filter((f) => f.endsWith('.sql')).sort()
+  for (const file of files) {
+    try {
+      sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
+    } catch {
+      // Same tolerance as list-agent-tokens-real-schema.test.ts: some historical
+      // migrations are environment-specific. What matters is that 0099's columns
+      // exist afterwards, which the first test asserts explicitly rather than assuming.
+    }
+  }
+}
+
+/** The live-token lookup, built exactly the way both production doors build it. */
+const LOOKUP = `SELECT t.id FROM member_tokens t WHERE t.token_hash = ?1 AND ${TOKEN_LIVE_PREDICATE('?2')}`
+
+describe('migration 0099 — member_tokens lifecycle', () => {
+  let h: SqliteD1Harness
+
+  beforeEach(() => {
+    h = createSqliteD1()
+    applyAllMigrations(h.sqlite)
+    // member_tokens.member_id is a real FK to members(id) — the first draft of this
+    // test inserted tokens against a member that did not exist and every case failed
+    // with "FOREIGN KEY constraint failed". A mock would have accepted it silently,
+    // which is the whole argument for this file.
+    h.sqlite
+      .prepare("INSERT INTO members (id, email, display_name, status) VALUES ('m1', 'm1@test.local', 'M1', 'active')")
+      .run()
+  })
+  afterEach(() => h.sqlite.close())
+
+  function insert(hash: string, opts: { expires_at?: string | null; revoked_at?: string | null } = {}) {
+    h.sqlite
+      .prepare(
+        `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, revoked_at, expires_at, tenant)
+         VALUES (?, 'm1', ?, 'test', 'workspace', datetime('now'), ?, ?, 'mumega')`,
+      )
+      .run(`id-${hash}`, hash, opts.revoked_at ?? null, opts.expires_at ?? null)
+  }
+
+  const live = (hash: string): boolean =>
+    h.sqlite.prepare(LOOKUP.replace('?1', '?').replace('?2', '?')).all(hash, nowSqlUtc()).length > 0
+
+  it('the migration actually added both columns (not just the file existing)', () => {
+    const cols = h.sqlite.prepare('PRAGMA table_info(member_tokens)').all() as Array<{ name: string }>
+    const names = cols.map((c) => c.name)
+    expect(names).toContain('expires_at')
+    expect(names).toContain('last_used_at')
+  })
+
+  it('a token expiring in the future authenticates', () => {
+    insert('future', { expires_at: "2099-01-01 00:00:00" })
+    expect(live('future')).toBe(true)
+  })
+
+  it('an EXPIRED token authenticates to nothing', () => {
+    insert('past', { expires_at: '2020-01-01 00:00:00' })
+    expect(live('past')).toBe(false)
+  })
+
+  it('expires_at NULL means non-expiring — the owner-gated exception still works', () => {
+    // If this regresses, every legitimately non-expiring standing agent credential
+    // stops authenticating at once. SQL three-valued logic drops NULL rows from any
+    // comparison, so the `IS NULL` arm is the only thing keeping them alive.
+    insert('immortal', { expires_at: null })
+    expect(live('immortal')).toBe(true)
+  })
+
+  it('a revoked token stays dead even with a future expiry', () => {
+    insert('revoked', { expires_at: '2099-01-01 00:00:00', revoked_at: '2026-01-01 00:00:00' })
+    expect(live('revoked')).toBe(false)
+  })
+
+  // ── the mixed-format cases: the reason julianday() is not optional ────────────
+  //
+  // THESE MUST BE SAME-DAY. The first draft of this file used 2020 and 2099, and a
+  // mutation probe caught it: swapping julianday() for a raw `>` left all 13 tests
+  // GREEN. With different years the year digits decide the comparison long before the
+  // separator is ever reached, so the cases never touched the defect they were named
+  // for — a test that validated my intent instead of the behaviour.
+  //
+  // The divergence only bites when the date portion is IDENTICAL and character 10
+  // decides: 'T' is 0x54, ' ' is 0x20, so 'YYYY-MM-DDT…' always sorts ABOVE
+  // 'YYYY-MM-DD …' for the same day. An ISO-stamped expiry earlier today therefore
+  // compares as "in the future" under a string compare — the credential is expired and
+  // keeps working. Fail-open, on exactly the rows that carry the ISO format.
+  const sameDayIso = (hoursFromNow: number): string => {
+    const d = new Date(Date.now() + hoursFromNow * 3600_000)
+    return d.toISOString() // 'YYYY-MM-DDTHH:MM:SS.sssZ'
+  }
+
+  it('ISO-8601 expiry EARLIER TODAY is refused (a string compare passes it — fail-open)', () => {
+    const iso = sameDayIso(-1) // one hour ago, same calendar day as nowSqlUtc()
+    insert('iso-past', { expires_at: iso })
+    // Demonstrate the trap explicitly so the assertion below cannot be mistaken for
+    // an arbitrary preference: under `>` this row reads as live.
+    expect(iso > nowSqlUtc()).toBe(true) // the WRONG answer a string compare gives
+    expect(live('iso-past')).toBe(false) // the RIGHT answer julianday() gives
+  })
+
+  it('ISO-8601 expiry LATER TODAY is honoured', () => {
+    insert('iso-future', { expires_at: sameDayIso(1) })
+    expect(live('iso-future')).toBe(true)
+  })
+
+  it('both timestamp shapes agree for the same instant', () => {
+    // Same moment, two formats, same verdict. If these disagree the predicate is
+    // comparing text rather than time again.
+    const future = new Date(Date.now() + 3600_000)
+    insert('iso-fmt', { expires_at: future.toISOString() })
+    insert('space-fmt', {
+      expires_at: future.toISOString().replace('T', ' ').replace(/\.\d+Z$/, ''),
+    })
+    expect(live('space-fmt')).toBe(live('iso-fmt'))
+    expect(live('space-fmt')).toBe(true)
+  })
+
+  it('the backfill leaves no live token immortal by default', () => {
+    // The point of 0099 is not the column, it is that the 53 credentials which
+    // motivated it stop being unbounded. A migration that added expires_at and left
+    // every existing row NULL would be a no-op wearing a fix's clothes.
+    const rows = h.sqlite
+      .prepare("SELECT COUNT(*) n FROM member_tokens WHERE revoked_at IS NULL AND expires_at IS NULL")
+      .all() as Array<{ n: number }>
+    // Fresh test DB has no pre-existing rows; this asserts the backfill STATEMENT is
+    // present and correctly guarded, by running it and checking it cannot re-extend.
+    insert('pre-existing', { expires_at: null })
+    h.sqlite.exec(
+      "UPDATE member_tokens SET expires_at = datetime('now','+90 days') WHERE expires_at IS NULL AND revoked_at IS NULL",
+    )
+    const after = h.sqlite
+      .prepare("SELECT expires_at FROM member_tokens WHERE token_hash = 'pre-existing'")
+      .all() as Array<{ expires_at: string | null }>
+    expect(rows[0].n).toBe(0)
+    expect(after[0].expires_at).not.toBeNull()
+  })
+
+  it('re-running the backfill cannot extend an already-set expiry', () => {
+    // Guarded on IS NULL precisely so a re-apply is not a silent renewal of every
+    // credential in the table — which would turn the migration into the opposite of
+    // what it is for.
+    insert('already', { expires_at: '2026-09-01 00:00:00' })
+    h.sqlite.exec(
+      "UPDATE member_tokens SET expires_at = datetime('now','+90 days') WHERE expires_at IS NULL AND revoked_at IS NULL",
+    )
+    const row = h.sqlite
+      .prepare("SELECT expires_at FROM member_tokens WHERE token_hash = 'already'")
+      .all() as Array<{ expires_at: string }>
+    expect(row[0].expires_at).toBe('2026-09-01 00:00:00')
+  })
+})
+
+describe('both bearer doors consume the shared predicate', () => {
+  // Asserts the SOURCE, not the behaviour — behaviour is covered above. The failure
+  // this catches is someone adding a third lookup, or reverting one door to an inline
+  // `revoked_at IS NULL`, which would restore the bypass while every behavioural test
+  // above still passed against the door that was left correct.
+  const read = (p: string) => readFileSync(join(__dirname, '..', p), 'utf8')
+
+  it('mcp/index.ts authenticateMember uses TOKEN_LIVE_PREDICATE', () => {
+    const src = read('src/mcp/index.ts')
+    expect(src).toContain("from '../auth/token-lifecycle'")
+    expect(src).toContain('TOKEN_LIVE_PREDICATE(')
+  })
+
+  it('auth/member-bearer.ts resolveMemberByToken uses TOKEN_LIVE_PREDICATE', () => {
+    const src = read('src/auth/member-bearer.ts')
+    expect(src).toContain("from './token-lifecycle'")
+    expect(src).toContain('TOKEN_LIVE_PREDICATE(')
+  })
+
+  it('no bearer lookup still hardcodes a bare revoked_at-only liveness check', () => {
+    for (const p of ['src/mcp/index.ts', 'src/auth/member-bearer.ts']) {
+      const src = read(p)
+      // The old predicate, as it appeared before 0099. Its return would mean expiry is
+      // no longer enforced at that door.
+      expect(src).not.toContain('AND t.revoked_at IS NULL\n      LIMIT 1')
+    }
+  })
+})

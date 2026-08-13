@@ -11,6 +11,7 @@
 
 import type { Env } from '../types'
 import { resolveCapabilities, hasCapability } from './capability'
+import { TOKEN_LIVE_PREDICATE, nowSqlUtc, touchTokenLastUsed } from './token-lifecycle'
 
 export interface AgentIdentity {
   memberId: string
@@ -50,12 +51,19 @@ export async function resolveMemberByToken(env: Env, raw: string | null): Promis
       WHERE t.token_hash = ?1
         AND t.tenant = ?2
         AND m.tenant = ?2
-        AND t.revoked_at IS NULL
+        -- 0099: same shared liveness predicate mcp/index.ts authenticateMember uses.
+        -- These two lookups are known duplicates (see this file's header, #41). Expiry
+        -- enforced in one but not the other would make THIS the door an expired
+        -- credential still opens, so both execute the one export.
+        AND ${TOKEN_LIVE_PREDICATE('?3')}
       LIMIT 1`,
   )
-    .bind(tokenHash, env.TENANT_SLUG)
+    .bind(tokenHash, env.TENANT_SLUG, nowSqlUtc())
     .first<{ member_id: string; display_name: string; email: string | null; status: string; bound_agent_id: string | null }>()
   if (!row || row.status !== 'active') return null
+  // 0099: best-effort usage stamp, same contract as the mcp/index.ts copy — telemetry
+  // that makes cleanup possible, never an authorization input.
+  void touchTokenLastUsed(env, tokenHash)
   return { memberId: row.member_id, displayName: row.display_name, email: row.email, boundAgentId: row.bound_agent_id ?? null }
 }
 
