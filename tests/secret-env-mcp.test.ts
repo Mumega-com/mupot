@@ -10,7 +10,7 @@ import { createSqliteD1 } from './helpers/sqlite-d1'
 
 const migrations = [
   '../migrations/0001_init.sql',
-  '../migrations/0071_secret_env.sql',
+  '../migrations/0100_secret_env.sql',
 ].map((path) => readFileSync(new URL(path, import.meta.url), 'utf8'))
 
 const TENANT = 'tenant-a'

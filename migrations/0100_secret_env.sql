@@ -1,4 +1,4 @@
--- 0071_secret_env.sql — pot-level secret env grants (CF Worker secret custody)
+-- 0100_secret_env.sql — pot-level secret env grants (CF Worker secret custody)
 -- Values NEVER stored here — metadata + audit names only.
 
 CREATE TABLE IF NOT EXISTS secret_env_requests (
