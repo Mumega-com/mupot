@@ -323,7 +323,13 @@ describe('GET /approvals — secret-env section', () => {
     })
     if (!created.ok) throw new Error('setup: requestSecretEnv failed')
 
-    authState.current = auth('member', { memberId: 'm-1', userId: 'm-1' })
+        // The observer grant is REQUIRED for this test to test what it names. Main added a
+    // dashboard-wide baseline gate (isOrgAdmin || holdsCapabilityFloor(auth, 'observer')),
+    // so a member with NO capabilities is refused at the door with 403. Asserting that 403
+    // would look like a passing test while proving only that the BASELINE gate works — the
+    // secret-env section gating would never be reached. The principal here must be one that
+    // CAN load /approvals and still must not see the secret-env section.
+authState.current = auth('member', { memberId: 'm-1', userId: 'm-1', capabilities: [{ member_id: 'm-1', scope_type: 'org', scope_id: null, capability: 'observer' }] as never })
     const res = await dashboardApp.fetch(new Request('https://pot.test/approvals'), env)
     expect(res.status).toBe(200)
     const body = await res.text()
