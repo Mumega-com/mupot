@@ -3,6 +3,18 @@ import type { Env } from '../types'
 
 export const inkwellApp = new Hono<{ Bindings: Env }>()
 
+function timingSafeEqual(a: string, b: string): boolean {
+  const enc = new TextEncoder()
+  const ab = enc.encode(a)
+  const bb = enc.encode(b)
+  if (ab.length !== bb.length) return false
+  let diff = 0
+  for (let i = 0; i < ab.length; i++) {
+    diff |= (ab[i] ?? 0) ^ (bb[i] ?? 0)
+  }
+  return diff === 0
+}
+
 export interface InkwellPublishPayload {
   title: string
   slug: string
@@ -26,7 +38,7 @@ inkwellApp.use('*', async (c, next) => {
   const xSecret = c.req.header('x-secret') || c.req.header('x-inkwell-secret')
 
   const providedToken = bearerToken || xSecret
-  if (providedToken !== secret) {
+  if (!providedToken || !timingSafeEqual(providedToken, secret)) {
     return c.json({ error: 'unauthorized', detail: 'invalid or missing secret header' }, 401)
   }
   return next()
