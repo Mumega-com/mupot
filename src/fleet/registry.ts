@@ -570,6 +570,29 @@ export async function getFleetAgentLiveness(
   return { runtime, live, agentId: String(row?.agent_id ?? '') }
 }
 
+/**
+ * listSquadMemberIds — sorted, deduped agent_ids currently reporting squadId in their
+ * `squads[]` (the SAME self-reported column groupBySquad/squadControlPanel already group by —
+ * src/dashboard/fleet-host.ts). This is the SIGNING-TIME input for a squad control-request
+ * (src/fleet/control.ts's emitSquadControlRequest): the host's engine.control_squad re-resolves
+ * squad membership live from its OWN version-controlled manifest registry (a DIFFERENT source)
+ * and REFUSES the whole action if the two disagree (kasra-review, PR #954/#957/#1004 BLOCK gate
+ * — the confirm() dialog is bound to nothing that runs unless the confirmed set is itself part
+ * of what gets signed). Callers MUST NOT accept a member list from the client/form — always
+ * resolve it here, server-side, at emit time, from mupot's own live cache.
+ */
+export async function listSquadMemberIds(env: Env, squadId: string): Promise<string[]> {
+  const rows = await env.DB.prepare(
+    `SELECT agent_id FROM fleet_agents
+      WHERE tenant = ?1
+        AND EXISTS (SELECT 1 FROM json_each(fleet_agents.squads) je WHERE je.value = ?2)
+      ORDER BY agent_id ASC`,
+  )
+    .bind(env.TENANT_SLUG, squadId)
+    .all<{ agent_id: string }>()
+  return (rows.results ?? []).map((r) => r.agent_id)
+}
+
 export async function listFleetAgents(env: Env): Promise<FleetAgentRow[]> {
   const rows = await env.DB.prepare(
     `SELECT agent_id, display, runtime, squads, lifecycle, provider_contract, status, reported_by, last_reported_at, agent_type, member_id

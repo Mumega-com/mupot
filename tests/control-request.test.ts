@@ -12,6 +12,11 @@ import {
   panelPublicJwk,
   _ID_RE,
   _NONCE_RE,
+  signSquadControlRequest,
+  verifySquadControlRequest,
+  canonicalSquadBytes,
+  CANON_VERSION,
+  CANON_VERSION_SQUAD,
 } from '../src/fleet/control-request'
 
 async function freshKeys(): Promise<{ priv: string; pub: string }> {
@@ -97,5 +102,67 @@ describe('fleet control-request signer', () => {
     // also confirm no `/m` flag is set on either
     expect(_ID_RE.flags).toBe('')
     expect(_NONCE_RE.flags).toBe('')
+  })
+})
+
+describe('fleet squad control-request signer', () => {
+  const MEMBERS = ['a', 'b']
+
+  it('round-trips sign → verify', async () => {
+    const { priv, pub } = await freshKeys()
+    const req = await signSquadControlRequest(priv, { squad_id: 'yang', verb: 'start', members: MEMBERS })
+    expect(req.squad_id).toBe('yang')
+    expect(req.members).toEqual(MEMBERS)
+    expect(await verifySquadControlRequest(pub, req)).toBe(true)
+  })
+
+  it('a tampered field breaks the signature', async () => {
+    const { priv, pub } = await freshKeys()
+    const req = await signSquadControlRequest(priv, { squad_id: 'yang', verb: 'stop', members: MEMBERS })
+    expect(await verifySquadControlRequest(pub, { ...req, verb: 'start' })).toBe(false)
+    expect(await verifySquadControlRequest(pub, { ...req, squad_id: 'yin' })).toBe(false)
+  })
+
+  it('a tampered members list breaks the signature (THE BLOCK fix)', async () => {
+    // members must be part of the SIGNED bytes, not a field an attacker (or a stale relay) could
+    // widen/shrink after signing without invalidating it.
+    const { priv, pub } = await freshKeys()
+    const req = await signSquadControlRequest(priv, { squad_id: 'yang', verb: 'stop', members: MEMBERS })
+    expect(await verifySquadControlRequest(pub, { ...req, members: ['a', 'b', 'c'] })).toBe(false)
+    expect(await verifySquadControlRequest(pub, { ...req, members: ['a'] })).toBe(false)
+  })
+
+  it('rejects malformed input and an unconfigured key (fail-closed)', async () => {
+    const { priv } = await freshKeys()
+    await expect(signSquadControlRequest(priv, { squad_id: '../evil', verb: 'status', members: MEMBERS })).rejects.toThrow(ControlRequestError)
+    await expect(signSquadControlRequest(priv, { squad_id: 'bad/slug', verb: 'status', members: MEMBERS })).rejects.toThrow(ControlRequestError)
+    await expect(signSquadControlRequest(priv, { squad_id: 'yang', verb: 'rm -rf /', members: MEMBERS })).rejects.toThrow(ControlRequestError)
+    await expect(signSquadControlRequest(undefined, { squad_id: 'yang', verb: 'status', members: MEMBERS })).rejects.toThrow(ControlRequestError)
+    // members validation
+    await expect(signSquadControlRequest(priv, { squad_id: 'yang', verb: 'status', members: [] })).rejects.toThrow(ControlRequestError)
+    await expect(signSquadControlRequest(priv, { squad_id: 'yang', verb: 'status', members: ['b', 'a'] })).rejects.toThrow(ControlRequestError) // unsorted
+    await expect(signSquadControlRequest(priv, { squad_id: 'yang', verb: 'status', members: ['a', 'a'] })).rejects.toThrow(ControlRequestError) // dup
+    await expect(signSquadControlRequest(priv, { squad_id: 'yang', verb: 'status', members: ['../evil'] })).rejects.toThrow(ControlRequestError)
+    await expect(signSquadControlRequest(priv, { squad_id: 'yang', verb: 'status', members: Array(65).fill('a') })).rejects.toThrow(ControlRequestError)
+  })
+
+  // Distinctness from the agent-targeted canonical string — pinned as a literal string on BOTH
+  // sides (this file and the host's test_control_request.py::test_squad_canon_version_pinned)
+  // so a drift in either language's format is caught even without a shared committed fixture
+  // (the way the single-agent path is pinned via fleet-control-vector.json — a genuine
+  // cross-language squad vector is a natural follow-up, not required for this to be safe: both
+  // sides independently assert the exact same literal string).
+  it('canonical squad bytes use a DISTINCT versioned prefix, pinned literal, members comma-joined', () => {
+    expect(CANON_VERSION_SQUAD).toBe('fleet-control-squad.v1')
+    expect(CANON_VERSION_SQUAD).not.toBe(CANON_VERSION)
+    const got = new TextDecoder().decode(canonicalSquadBytes('yang', 'start', ['a', 'b'], 'abcdefghijklmnop1234', 1_700_000_000))
+    expect(got).toBe('fleet-control-squad.v1\nyang\nstart\na,b\nabcdefghijklmnop1234\n1700000000')
+  })
+
+  it('a squad-signed request does not verify as an agent-targeted request (distinct canon)', async () => {
+    const { priv, pub } = await freshKeys()
+    const squadReq = await signSquadControlRequest(priv, { squad_id: 'yang', verb: 'start', members: MEMBERS })
+    const relabeled = { agent_id: squadReq.squad_id, verb: squadReq.verb, nonce: squadReq.nonce, ts: squadReq.ts, sig: squadReq.sig }
+    expect(await verifyControlRequest(pub, relabeled)).toBe(false)
   })
 })
