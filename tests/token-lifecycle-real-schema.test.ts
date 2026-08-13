@@ -151,38 +151,32 @@ describe('migration 0099 — member_tokens lifecycle', () => {
     expect(live('space-fmt')).toBe(true)
   })
 
-  it('the backfill leaves no live token immortal by default', () => {
-    // The point of 0099 is not the column, it is that the 53 credentials which
-    // motivated it stop being unbounded. A migration that added expires_at and left
-    // every existing row NULL would be a no-op wearing a fix's clothes.
-    const rows = h.sqlite
-      .prepare("SELECT COUNT(*) n FROM member_tokens WHERE revoked_at IS NULL AND expires_at IS NULL")
+  it('is mechanism-only — applying it does NOT expire any existing token', () => {
+    // Hadi deferred the backfill (2026-08-13): add the columns, let last_used_at record,
+    // then choose a horizon from MEASURED usage rather than a guessed number. So this
+    // migration's effect on the existing 53 live credentials must be exactly ZERO —
+    // expires_at stays NULL, which the predicate reads as non-expiring.
+    //
+    // This asserts the safety property of deferring, not the absence of work: if a
+    // future edit reintroduces a backfill into 0099 without the deliberate decision
+    // behind it, this test fails and asks why.
+    const nullExpiry = h.sqlite
+      .prepare('SELECT COUNT(*) n FROM member_tokens WHERE expires_at IS NOT NULL')
       .all() as Array<{ n: number }>
-    // Fresh test DB has no pre-existing rows; this asserts the backfill STATEMENT is
-    // present and correctly guarded, by running it and checking it cannot re-extend.
-    insert('pre-existing', { expires_at: null })
-    h.sqlite.exec(
-      "UPDATE member_tokens SET expires_at = datetime('now','+90 days') WHERE expires_at IS NULL AND revoked_at IS NULL",
-    )
-    const after = h.sqlite
-      .prepare("SELECT expires_at FROM member_tokens WHERE token_hash = 'pre-existing'")
-      .all() as Array<{ expires_at: string | null }>
-    expect(rows[0].n).toBe(0)
-    expect(after[0].expires_at).not.toBeNull()
+    expect(nullExpiry[0].n).toBe(0)
+
+    insert('pre-existing') // a token as it exists today: no expiry set
+    expect(live('pre-existing')).toBe(true)
   })
 
-  it('re-running the backfill cannot extend an already-set expiry', () => {
-    // Guarded on IS NULL precisely so a re-apply is not a silent renewal of every
-    // credential in the table — which would turn the migration into the opposite of
-    // what it is for.
-    insert('already', { expires_at: '2026-09-01 00:00:00' })
-    h.sqlite.exec(
-      "UPDATE member_tokens SET expires_at = datetime('now','+90 days') WHERE expires_at IS NULL AND revoked_at IS NULL",
-    )
+  it('last_used_at starts NULL and is nullable — it is telemetry, not a constraint', () => {
+    // The column has to accept NULL for every pre-existing row, or adding it would
+    // itself be the outage. It gets populated on use, not on migration.
+    insert('never-used')
     const row = h.sqlite
-      .prepare("SELECT expires_at FROM member_tokens WHERE token_hash = 'already'")
-      .all() as Array<{ expires_at: string }>
-    expect(row[0].expires_at).toBe('2026-09-01 00:00:00')
+      .prepare("SELECT last_used_at FROM member_tokens WHERE token_hash = 'never-used'")
+      .all() as Array<{ last_used_at: string | null }>
+    expect(row[0].last_used_at).toBeNull()
   })
 })
 
