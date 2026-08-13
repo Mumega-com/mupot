@@ -14,7 +14,7 @@ import {
   recordRecommitOrKill,
 } from '../src/projects/circuit-breaker'
 import { writeReceiptToD1 } from '../src/workflows/pipeline'
-import { listProjectsDueAtBoundary } from '../src/projects/loop'
+import { listProjectsDueAtBoundary, runProjectLoopTick } from '../src/projects/loop'
 import { getProject, updateProject } from '../src/projects/service'
 import {
   START_GATE_SEED_MARKER,
@@ -29,6 +29,11 @@ import {
 } from '../src/projects/stall-detector'
 import { loadProjectSituation } from '../src/projects/situation'
 import { stripExternalLifecycleFields } from '../src/projects/lifecycle-input'
+import {
+  nextCycleBoundary,
+  scheduleCycleBoundary,
+  processProjectCycleCreation,
+} from '../src/projects/cycle-creation'
 
 const authState = vi.hoisted(() => ({ current: null as AuthContext | null }))
 
@@ -429,6 +434,220 @@ describe('bare updateProject still requires internal via flags', () => {
       insertProject(harness, { id: 'proj-bare', status: 'active', boundary: null })
       await expect(updateProject(env, 'proj-bare', { status: 'review' }))
         .resolves.toEqual({ ok: false, error: 'completion_gate_required' })
+    } finally {
+      harness.close()
+    }
+  })
+})
+
+describe('Slice 5 ORDERING: cycle creation must run AFTER the circuit breaker', () => {
+  // THE DEFECT THIS PINS
+  //
+  // Slice 5 originally ran as the FIRST step of runProjectLoopTick. Every unit test of
+  // scheduleCycleBoundary passed, because the module is correct in isolation — the defect
+  // lived entirely in WHERE it was placed in the sequence, and nothing drove the tick.
+  //
+  // listProjectsDueAtBoundary selects projects whose boundary has ELAPSED. scheduleCycleBoundary
+  // advances an elapsed boundary to +14d, a future timestamp. Run first, it pushes the boundary
+  // out of range before the breaker is given the chance to evaluate it, and recommit-or-kill
+  // becomes unreachable for every non-stalled project — no error, no changed counter, no signal.
+  //
+  // These tests drive the REAL tick with the REAL listDue, and spy only on the breaker, so the
+  // ordering itself is the thing under test.
+
+  it('an elapsed boundary REACHES the breaker in the same tick', async () => {
+    const harness = makeHarness()
+    try {
+      // Boundary elapsed only ONE DAY ago — deliberately, and this is the whole test.
+      // A boundary far in the past survives the pre-fix ordering by accident: advancing it by
+      // one 14-day interval leaves it STILL elapsed, so the breaker sees it regardless and the
+      // mutation probe passes. Only a recently-elapsed boundary distinguishes the two orders,
+      // because +14d lands it in the future and listProjectsDueAtBoundary then drops it.
+      // Which is also the real case — boundaries elapse by minutes, not months.
+      insertProject(harness, { id: 'ord-1', status: 'active', boundary: '2026-07-22T00:00:00.000Z' })
+      const seen: string[] = []
+      const result = await runProjectLoopTick(envFor(harness), {
+        nowIso: () => NOW,
+        evaluate: async (_env, project) => {
+          seen.push(project.id)
+          return 'skipped'
+        },
+        listActiveForCompletion: async () => [],
+        listActiveForStall: async () => [],
+        listStalePlanned: async () => [],
+      })
+      expect(seen).toContain('ord-1')
+      // And the advance still happened this tick — it is deferred, not skipped.
+      expect(result.cycles_advanced).toBeGreaterThanOrEqual(1)
+    } finally {
+      harness.close()
+    }
+  })
+
+  it('the boundary is advanced only AFTER the breaker has seen it', async () => {
+    const harness = makeHarness()
+    try {
+      insertProject(harness, { id: 'ord-2', status: 'active', boundary: '2026-07-01T00:00:00.000Z' })
+      let boundaryAtBreakerTime: string | null | undefined
+      await runProjectLoopTick(envFor(harness), {
+        nowIso: () => NOW,
+        evaluate: async (_env, project) => {
+          boundaryAtBreakerTime = project.cycle_boundary_at
+          return 'skipped'
+        },
+        listActiveForCompletion: async () => [],
+        listActiveForStall: async () => [],
+        listStalePlanned: async () => [],
+      })
+      // The breaker must have been handed the ORIGINAL elapsed boundary, not the advanced one.
+      expect(boundaryAtBreakerTime).toBe('2026-07-01T00:00:00.000Z')
+
+      // ...and the row IS advanced by the time the tick returns — by exactly ONE interval
+      // from the original, not to the next future boundary. That matters: a boundary long
+      // elapsed catches up one cycle per tick, so the breaker gets to evaluate EACH missed
+      // boundary rather than skipping straight past them. Asserting "now in the future" here
+      // would have been wrong and would have pinned the wrong behaviour.
+      const row = harness.sqlite
+        .prepare("SELECT cycle_boundary_at FROM projects WHERE id = 'ord-2'")
+        .all() as Array<{ cycle_boundary_at: string }>
+      const advancedMs = Date.parse(row[0].cycle_boundary_at)
+      const originalMs = Date.parse('2026-07-01T00:00:00.000Z')
+      expect(advancedMs - originalMs).toBe(14 * 24 * 60 * 60 * 1000)
+    } finally {
+      harness.close()
+    }
+  })
+})
+
+describe('Slice 5: cycle creation (rollover only, NO auto-carry)', () => {
+  it('nextCycleBoundary: schedules first boundary when none exists', () => {
+    const boundary = nextCycleBoundary(NOW, null, 14)
+    expect(boundary).toBeTruthy()
+    const ms = Date.parse(boundary!)
+    const nowMs = Date.parse(NOW)
+    const diff = ms - nowMs
+    const days = diff / (24 * 60 * 60 * 1000)
+    expect(days).toBeCloseTo(14, 0)
+  })
+
+  it('nextCycleBoundary: advances past boundary by interval', () => {
+    const oldBoundary = '2026-07-01T00:00:00.000Z'
+    const boundary = nextCycleBoundary(NOW, oldBoundary, 14)
+    expect(boundary).toBeTruthy()
+    const ms = Date.parse(boundary!)
+    const oldMs = Date.parse(oldBoundary)
+    const diff = ms - oldMs
+    const days = diff / (24 * 60 * 60 * 1000)
+    expect(days).toBeCloseTo(14, 0)
+  })
+
+  it('nextCycleBoundary: does not change future boundary', () => {
+    const futureBoundary = '2026-08-23T00:00:00.000Z'
+    const boundary = nextCycleBoundary(NOW, futureBoundary, 14)
+    expect(boundary).toBeNull()
+  })
+
+  it('scheduleCycleBoundary: schedules first boundary for active projects', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    try {
+      insertProject(harness, { id: 'proj-cycle-1', status: 'active', boundary: null })
+      const outcome = await scheduleCycleBoundary(env, 'proj-cycle-1', NOW, 14)
+      expect(outcome).toBe('scheduled')
+      const project = await getProject(env, 'proj-cycle-1')
+      expect(project?.cycle_boundary_at).toBeTruthy()
+      const ms = Date.parse(project!.cycle_boundary_at!)
+      const nowMs = Date.parse(NOW)
+      expect(ms - nowMs).toBeCloseTo(14 * 24 * 60 * 60 * 1000, -2)
+    } finally {
+      harness.close()
+    }
+  })
+
+  it('scheduleCycleBoundary: advances past boundaries', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    try {
+      insertProject(harness, { id: 'proj-cycle-2', status: 'active', boundary: BOUNDARY })
+      const outcome = await scheduleCycleBoundary(env, 'proj-cycle-2', NOW, 14)
+      expect(outcome).toBe('advanced')
+      const project = await getProject(env, 'proj-cycle-2')
+      const newBoundaryMs = Date.parse(project!.cycle_boundary_at!)
+      const oldBoundaryMs = Date.parse(BOUNDARY)
+      const diff = newBoundaryMs - oldBoundaryMs
+      expect(diff / (24 * 60 * 60 * 1000)).toBeCloseTo(14, 0)
+    } finally {
+      harness.close()
+    }
+  })
+
+  it('scheduleCycleBoundary: skips future boundaries', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    try {
+      const futureBoundary = '2026-08-23T00:00:00.000Z'
+      insertProject(harness, { id: 'proj-cycle-3', status: 'active', boundary: futureBoundary })
+      const outcome = await scheduleCycleBoundary(env, 'proj-cycle-3', NOW, 14)
+      expect(outcome).toBe('skipped')
+      const project = await getProject(env, 'proj-cycle-3')
+      expect(project?.cycle_boundary_at).toBe(futureBoundary)
+    } finally {
+      harness.close()
+    }
+  })
+
+  it('scheduleCycleBoundary: skips non-active projects', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    try {
+      insertProject(harness, { id: 'proj-cycle-4', status: 'planned', boundary: null })
+      const outcome = await scheduleCycleBoundary(env, 'proj-cycle-4', NOW, 14)
+      expect(outcome).toBe('skipped')
+      const project = await getProject(env, 'proj-cycle-4')
+      expect(project?.cycle_boundary_at).toBeNull()
+    } finally {
+      harness.close()
+    }
+  })
+
+  it('processProjectCycleCreation: schedules boundaries for multiple projects', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    try {
+      insertProject(harness, { id: 'proj-cycle-5', status: 'active', boundary: null })
+      insertProject(harness, { id: 'proj-cycle-6', status: 'active', boundary: null })
+      insertProject(harness, { id: 'proj-cycle-7', status: 'active', boundary: BOUNDARY })
+      const result = await processProjectCycleCreation(env, NOW, 14)
+      expect(result.scanned).toBe(3)
+      expect(result.scheduled).toBe(2)
+      expect(result.advanced).toBe(1)
+      expect(result.errors).toBe(0)
+    } finally {
+      harness.close()
+    }
+  })
+
+  it('NO auto-carry: updating boundary does not move tasks', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    try {
+      insertProject(harness, { id: 'proj-no-carry', status: 'active', boundary: BOUNDARY })
+      harness.sqlite.exec(`
+        INSERT INTO tasks (
+          id, squad_id, project_id, title, body, done_when, status, assignee_agent_id,
+          github_issue_url, result, completed_at, gate_owner, created_at, updated_at
+        ) VALUES (
+          'task-incomplete', 'squad-a', 'proj-no-carry', 'Incomplete work', '', 'done',
+          'open', 'agent-worker', NULL, NULL, NULL, NULL,
+          '2026-06-01T00:00:00.000Z', '2026-06-01T00:00:00.000Z'
+        );
+      `)
+      const outcome = await scheduleCycleBoundary(env, 'proj-no-carry', NOW, 14)
+      expect(outcome).toBe('advanced')
+      const taskAfter = await env.DB.prepare('SELECT status FROM tasks WHERE id = ?1')
+        .bind('task-incomplete')
+        .first<{ status: string }>()
+      expect(taskAfter?.status).toBe('open')
     } finally {
       harness.close()
     }

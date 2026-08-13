@@ -1,5 +1,6 @@
 // Project lifecycle loop — circuit breaker (slice 1) + structural completion
-// (slice 2) + start-gate ghost alarm (slice 3) + stall detector (slice 4).
+// (slice 2) + start-gate ghost alarm (slice 3) + stall detector (slice 4) +
+// cycle creation (slice 5).
 //
 // Design: docs/superpowers/specs/2026-07-23-project-lifecycle-control-loop-design.md
 // Mirrors src/concierge/service.ts / src/loops/driver.ts: one bounded sweep per tick,
@@ -36,6 +37,10 @@ import {
   type StallDetectorDeps,
   type StallDetectorOutcome,
 } from './stall-detector'
+import {
+  DEFAULT_CYCLE_DAYS,
+  processProjectCycleCreation,
+} from './cycle-creation'
 
 /** Cap projects evaluated per cron tick — mirrors MAX_PROJECTS_PER_TICK / MAX_LOOPS_PER_TICK. */
 export const MAX_BOUNDARY_PROJECTS_PER_TICK = 25
@@ -54,6 +59,8 @@ export interface ProjectLoopTickResult {
   ghost_alarmed: number
   stall_flagged: number
   stall_cleared: number
+  cycles_scheduled: number
+  cycles_advanced: number
   errors: number
 }
 
@@ -161,8 +168,15 @@ export async function listActiveProjectsForStall(env: Env): Promise<Project[]> {
 
 /**
  * runProjectLoopTick — one heartbeat for project lifecycle.
- * Order: stall detect → circuit breaker (so early raise sees fresh flags) →
- * structural completion → ghost-start alarm.
+ * Order: stall detect (so early raise sees fresh flags) → circuit breaker →
+ * cycle creation (slice 5) → structural completion → ghost-start alarm.
+ *
+ * Cycle creation runs AFTER the breaker on purpose. It advances cycle_boundary_at
+ * into the future, and the breaker fires only when that boundary has ELAPSED —
+ * so placed first it pushes the boundary forward before the breaker can look at
+ * it, and recommit-or-kill silently stops being reachable for any non-stalled
+ * project. See the block comment at the call site.
+ *
  * Best-effort: a failed list returns {ok:false}; a failed project is counted and
  * does not abort the sweep.
  */
@@ -192,6 +206,10 @@ export async function runProjectLoopTick(
   let ghostAlarmed = 0
   let stallFlagged = 0
   let stallCleared = 0
+  let cyclesScheduled = 0
+  let cyclesAdvanced = 0
+
+  const cycleInterval = DEFAULT_CYCLE_DAYS
 
   let stallProjects: Project[]
   try {
@@ -207,7 +225,9 @@ export async function runProjectLoopTick(
       ghost_alarmed: 0,
       stall_flagged: 0,
       stall_cleared: 0,
-      errors: 0,
+      cycles_scheduled: cyclesScheduled,
+      cycles_advanced: cyclesAdvanced,
+      errors,
     }
   }
 
@@ -242,6 +262,8 @@ export async function runProjectLoopTick(
       ghost_alarmed: 0,
       stall_flagged: stallFlagged,
       stall_cleared: stallCleared,
+      cycles_scheduled: cyclesScheduled,
+      cycles_advanced: cyclesAdvanced,
       errors,
     }
   }
@@ -261,6 +283,39 @@ export async function runProjectLoopTick(
         error: err instanceof Error ? err.message : String(err),
       })
     }
+  }
+
+  // CYCLE CREATION RUNS *AFTER* THE BREAKER, NOT BEFORE IT.
+  //
+  // This block was originally the first step of the tick. That is a silent disabling of
+  // recommit-or-kill, and it merges clean:
+  //
+  //   listProjectsDueAtBoundary() selects on `cycle_boundary_at IS NOT NULL AND status NOT IN
+  //   (...)` and then filters through shouldEvaluateBreaker(), which for a non-stalled project
+  //   returns isAtCycleBoundary(cycleBoundaryAt, nowIso) — true only once the boundary has
+  //   ELAPSED. Meanwhile scheduleCycleBoundary() advances any active project whose boundary is
+  //   <= now to boundary + 14d, a FUTURE timestamp.
+  //
+  // Run first, it pushes the boundary forward before the breaker is given the chance to look
+  // at it, and isAtCycleBoundary then reads false. The recommit-or-kill evaluation that the
+  // boundary exists to trigger becomes reachable only through the `stalled === 1` early-raise
+  // path — i.e. the ordinary case stops being evaluated at all, forever, with no error and no
+  // changed counter.
+  //
+  // Running it here instead means the breaker evaluates THIS tick's boundary, and the advance
+  // sets up the NEXT one. Both `projects` and the breaker loop above are already complete, so
+  // nothing downstream re-reads cycle_boundary_at.
+  try {
+    const cycleResult = await processProjectCycleCreation(env, nowIso, cycleInterval)
+    cyclesScheduled = cycleResult.scheduled
+    cyclesAdvanced = cycleResult.advanced
+    errors += cycleResult.errors
+  } catch (err) {
+    errors++
+    console.error('project-loop: cycle creation failed (non-fatal)', {
+      tenant: env.TENANT_SLUG,
+      error: err instanceof Error ? err.message : String(err),
+    })
   }
 
   let activeProjects: Project[]
@@ -322,6 +377,8 @@ export async function runProjectLoopTick(
     ghost_alarmed: ghostAlarmed,
     stall_flagged: stallFlagged,
     stall_cleared: stallCleared,
+    cycles_scheduled: cyclesScheduled,
+    cycles_advanced: cyclesAdvanced,
     errors,
   }
 }
