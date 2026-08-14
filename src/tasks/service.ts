@@ -945,7 +945,51 @@ export async function createTask(
   // actually landed before we emit "created" and return the task as success.
   assertWritten(taskInsert, 'tasks.insert')
 
-  if (!options.skipMirror) {
+  // A task that ALREADY NAMES A HOME does not get a second one manufactured for it.
+  //
+  // mirrorTaskCreate resolves its destination from one tenant-wide GITHUB_REPO var, so
+  // every mirror lands in the same repo regardless of where the work lives. That is not a
+  // misconfiguration — there is no per-task repo input anywhere in this path, so the
+  // bridge CANNOT target the right repo for cross-repo work. Measured 2026-08-14: 529
+  // mumega-com issues carry the issueBody() footer (auto-mirrors); ZERO mupot-repo issues
+  // do; 296/296 task github_issue_urls point at mumega-com. Capability and history agree.
+  //
+  // The damage is not the duplicate issue, it is that the duplicate is created with an
+  // IDENTICAL title and body — which defeats dedup-by-search and leaves no signal about
+  // which home is canonical. A finding filed by hand in the right repo then acquires a
+  // second, indistinguishable home nobody asked for.
+  //
+  // So: an explicit provenance marker or a caller-supplied issue URL SUPPRESSES creation.
+  // Until now `external_source` was persisted (migrations/0077) and gated assignability
+  // (the trust boundary below), but neither mirror site read it — a caller could set it,
+  // get no rejection, and change nothing about the behaviour they were trying to
+  // influence. That is a field honored by one subsystem and invisible to another.
+  //
+  // NOTE THE COMPARISON: `externalSource === null`, not truthiness. Be precise about why,
+  // because the honest version is weaker than it first looks. '' is NON-NULL external
+  // provenance in SQL and FALSY in JS, and that exact split already shipped one live
+  // defect here (#0077, adversarial gate BLOCK 2026-08-04). But blanks are REJECTED
+  // upstream (see the normalization above), so by this line the value is only null or a
+  // real identifier — and for those two, truthiness and `=== null` agree exactly.
+  //
+  // Verified, not assumed: mutating this to `!externalSource` leaves all four tests in
+  // tests/task-bridge-external-source-suppression.test.ts GREEN. It is an EQUIVALENT
+  // MUTANT today, not an unwitnessed line. The explicit null test is defence in depth
+  // against the upstream rejection being relaxed later — if blanks ever reach here, the
+  // two layers must not disagree about the same row. Keeping it costs nothing; claiming
+  // it currently prevents a live bug would be false.
+  //
+  // This does NOT make the bridge repo-aware — that is the real fix and it changes where
+  // issues land for every existing caller, so it gets a design pass, not a patch. This
+  // only stops manufacturing homes for work that already has one.
+  //
+  // Deliberately NOT also testing `task.github_issue_url !== null` here: the task literal
+  // above hardcodes `github_issue_url: null` and createTask exposes no input for it, so
+  // that arm could never be true. A guard clause that cannot fire reads as protection
+  // while providing none — the same "exemption justified by a case that cannot occur"
+  // shape found in the #847 dashboard capability floor. If a caller-supplied issue URL is
+  // ever wanted, it needs a real input on CreateTaskOptions, not a dead disjunct here.
+  if (!options.skipMirror && externalSource === null) {
     const issueUrl = await mirrorTaskCreate(env, task)
     if (issueUrl) {
       const linkUpdate = await env.DB.prepare(
