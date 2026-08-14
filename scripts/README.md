@@ -182,6 +182,19 @@ variable — never echoed, never written to any file, never committed.
 
 Re-runnable — setting a secret again overwrites it.
 
+### Secret env taker (agent MCP bindings)
+
+Optional — enables approved tenant secret bindings via `/approvals`. See the
+`SECRET_ENV_CF_*` block in **`wrangler.example.toml`** (`wrangler.toml` is gitignored).
+
+```bash
+npx wrangler secret put SECRET_ENV_CF_API_TOKEN
+# vars (or secrets): SECRET_ENV_CF_ACCOUNT_ID, SECRET_ENV_CF_SCRIPT_NAME
+# Token needs Workers Scripts:Edit (secrets) on the pot account
+```
+
+All three must be present or the bind path fails closed.
+
 ## Security
 
 - **No secret ever lands in `wrangler.toml` or git.** Only Cloudflare resource

@@ -28,6 +28,26 @@ Point your GHL location's outbound webhook at:
 
 Until these are set the send path is inert (acts stay pending) — fail-closed by design.
 
+## 1b. Secret env taker — CF ops bootstrap (one time)
+
+Agents can request pot-level env bindings for MCP/API adapt; admins paste on **`/approvals`**.
+Values land as Cloudflare Worker secrets on your account (D1 holds metadata only). Without
+this bootstrap the bind path fails closed.
+
+Binding contract and comments: **`wrangler.example.toml`** (`wrangler.toml` is gitignored).
+
+```bash
+npx wrangler secret put SECRET_ENV_CF_API_TOKEN --config wrangler.digid.toml
+# vars (or secrets): SECRET_ENV_CF_ACCOUNT_ID, SECRET_ENV_CF_SCRIPT_NAME
+# Token needs Workers Scripts:Edit (secrets) on the pot account
+```
+
+Set `SECRET_ENV_CF_ACCOUNT_ID` and `SECRET_ENV_CF_SCRIPT_NAME` in `[vars]` or as secrets.
+Re-deploy after bootstrap so the Worker picks up vars.
+
+v1 revoke of a Worker secret is done in the tenant CF dashboard / wrangler; reject does not
+delete CF secrets.
+
 ## 2. Seed the outreach loop (through the product, not SQL)
 
 Sign in as owner/admin, then:
