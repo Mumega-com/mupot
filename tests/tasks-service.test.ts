@@ -177,6 +177,32 @@ describe('mirrorTaskUpdate', () => {
 
     expect(url).toBe('https://github.com/acme/widgets/issues/8')
     expect(fetchMock).toHaveBeenCalledTimes(1) // PATCH, not create
+    const patchBody = JSON.parse((fetchMock.mock.calls[0] as unknown as [string, { body: string }])[1].body)
+    expect(patchBody.state).toBe('open')
+  })
+
+  it('omits state in PATCH when statusChanged is false to prevent re-opening upstream closed issues', async () => {
+    const { env } = makeTaskEnv()
+    const fetchMock = vi.fn(async () =>
+      new Response(JSON.stringify({ html_url: 'https://github.com/acme/widgets/issues/8' }), { status: 200 }),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+
+    const url = await mirrorTaskUpdate(
+      env,
+      {
+        ...baseTask,
+        title: 'Edited title',
+        github_issue_url: 'https://github.com/acme/widgets/issues/8',
+      },
+      { statusChanged: false },
+    )
+
+    expect(url).toBe('https://github.com/acme/widgets/issues/8')
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    const patchBody = JSON.parse((fetchMock.mock.calls[0] as unknown as [string, { body: string }])[1].body)
+    expect(patchBody.title).toBe('Edited title')
+    expect(patchBody.state).toBeUndefined()
   })
 })
 

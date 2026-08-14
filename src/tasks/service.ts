@@ -528,7 +528,11 @@ export async function mirrorTaskCreate(env: Env, task: Task): Promise<string | n
   })
 }
 
-export async function mirrorTaskUpdate(env: Env, task: Task): Promise<string | null> {
+export async function mirrorTaskUpdate(
+  env: Env,
+  task: Task,
+  opts?: { statusChanged?: boolean },
+): Promise<string | null> {
   const repo = githubRepo(env)
   if (!repo) return task.github_issue_url
   const token = await resolveOutboundGitHubToken(env)
@@ -543,14 +547,21 @@ export async function mirrorTaskUpdate(env: Env, task: Task): Promise<string | n
     return task.github_issue_url
   }
 
+  // Defect #1040: Only include `state` in the GitHub PATCH payload if the task status actually changed
+  // or is terminal (`done`). If status was not modified in this update (e.g. title/body/assignee edit),
+  // omitting `state` prevents accidentally re-opening an issue that was closed upstream on GitHub.
+  const payload: { title: string; body: string; state?: 'open' | 'closed' } = {
+    title: task.title,
+    body: issueBody(task),
+  }
+  if (opts?.statusChanged !== false || task.status === 'done') {
+    payload.state = issueState(task.status)
+  }
+
   return (await requestGitHubIssue(`https://api.github.com/repos/${repo}/issues/${issueNumber}`, {
     method: 'PATCH',
     headers: githubHeaders(token),
-    body: JSON.stringify({
-      title: task.title,
-      body: issueBody(task),
-      state: issueState(task.status),
-    }),
+    body: JSON.stringify(payload),
   })) ?? task.github_issue_url
 }
 
