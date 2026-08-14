@@ -214,6 +214,36 @@ jobs:
           # wrong branch and its verdict would be unrelated to what actually merges.
           BASE_REF: ${{ github.base_ref }}
 
+  branch-staleness:
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 is REQUIRED — the guard diffs against the merge base and the target's
+      # head. A shallow clone cannot read either, and the guard FAILS rather than passes when
+      # it cannot, so a missing fetch-depth surfaces as a red build instead of a guard that
+      # silently stopped guarding.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # Self-tests FIRST, same order and same reason as the sibling guards: a guard with no
+      # tests of its own is the shape these guards exist to reject. All four mutations were
+      # reproduced against the script before it shipped — and one of them (dropping
+      # --diff-filter=M) initially SURVIVED, because no fixture created the state that
+      # distinguishes it. The fixture that closes it is in the suite.
+      - name: Branch-staleness self-tests
+        run: node --test tests/branch-staleness.test.mjs
+      # mupot#834: a branch 244 commits behind main whose content was the OLDER copy of work
+      # already landed. Merging it would have deleted principalCanMutateRoutinePolicy
+      # (reverting #811/#813) and dropped three cancellation-fence guards — as a CLEAN MERGE.
+      # "Already on main, but OLDER" is more dangerous than CONFLICTING, because a conflict
+      # announces itself and this does not.
+      - name: Guard — modified files must not have moved on the merge target
+        run: node scripts/check-branch-staleness.mjs
+        env:
+          BASE_REF: ${{ github.base_ref }}
+
   design-status-policy:
     runs-on: ubuntu-latest
     steps:
