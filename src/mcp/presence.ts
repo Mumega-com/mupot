@@ -69,7 +69,7 @@ const toolPresenceRegister: ToolSpec = {
   name: 'presence_register',
   scope: 'self (register/re-register this module in the project-scoped roster)',
   min: 'authenticated',
-  args: '{ adapter: string, project_id?: string|null, kind?: "agent_system"|"workflow"|"surface", capabilities?: string[] }',
+  args: '{ adapter: string, project_id?: string|null, kind?: "agent_system"|"workflow"|"surface", capabilities?: string[], model?: string|null }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -77,6 +77,7 @@ const toolPresenceRegister: ToolSpec = {
       project_id: NULLABLE_STRING_SCHEMA,
       kind: { type: 'string', enum: MODULE_KIND_ENUM },
       capabilities: OPTIONAL_STRING_ARRAY_SCHEMA,
+      model: NULLABLE_STRING_SCHEMA,
     },
     required: ['adapter'],
     additionalProperties: false,
@@ -116,17 +117,21 @@ const toolPresenceRegister: ToolSpec = {
       capabilities = args.capabilities
     }
 
+    const model = typeof args.model === 'string' ? args.model : null
+
     const result = await registerModule(env, {
       identity,
       kind,
       adapter,
       projectId: projectId ?? null,
       capabilities,
+      model,
     })
     if (!result.ok) return fail(400, result.error)
     return done({ module: result.value })
   },
 }
+
 
 const toolPresenceHeartbeat: ToolSpec = {
   name: 'presence_heartbeat',
