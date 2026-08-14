@@ -117,12 +117,75 @@ describe('Point-of-Capture Intake Contract Governance (Mupot #1040)', () => {
       }).not.toThrow()
     })
 
-    it('accepts standard P1/P2/P3 tasks with valid verifiable predicates', () => {
+    it('accepts standard P2/P3 tasks with valid verifiable predicates', () => {
       expect(() => {
         assertValidIntakeContract({
           title: 'Implement Kanban UI',
           done_when: 'GET /dashboard/kanban returns 200 with swimlanes',
           priority: 'P2',
+        })
+      }).not.toThrow()
+    })
+
+    it('rejects P1 tasks that lack both flight/project linkage and escape hatch', () => {
+      expect(() => {
+        assertValidIntakeContract({
+          title: 'Unlinked critical finding',
+          done_when: 'Unit test assertions verify fix',
+          priority: 'P1',
+        })
+      }).toThrowError(/p1_linkage_required/)
+    })
+
+    it('accepts P1 tasks with project_id linkage', () => {
+      expect(() => {
+        assertValidIntakeContract({
+          title: 'Flight blocker defect',
+          done_when: 'Unit test assertions verify fix',
+          priority: 'P1',
+          project_id: 'proj-123',
+        })
+      }).not.toThrow()
+    })
+
+    it('accepts P1 tasks with parent_task_id linkage', () => {
+      expect(() => {
+        assertValidIntakeContract({
+          title: 'Subtask blocker defect',
+          done_when: 'Unit test assertions verify fix',
+          priority: 'P1',
+          parent_task_id: 'task-parent-123',
+        })
+      }).not.toThrow()
+    })
+
+    it('rejects unlinked P1 tasks with prose mentioning owner or ttl without the structured bracketed tag', () => {
+      expect(() => {
+        assertValidIntakeContract({
+          title: 'Critical issue discovered',
+          done_when: 'Unit test assertions verify fix',
+          priority: 'P1',
+          body: 'The owner of this task said ttl is 7d and re-review is needed',
+        })
+      }).toThrowError(/p1_linkage_required/)
+
+      expect(() => {
+        assertValidIntakeContract({
+          title: 'Critical issue discovered',
+          done_when: 'Unit test assertions verify fix',
+          priority: 'P1',
+          body: 'owner: kasra, ttl: 7d',
+        })
+      }).toThrowError(/p1_linkage_required/)
+    })
+
+    it('accepts P1 tasks with named owner and review TTL escape hatch in body', () => {
+      expect(() => {
+        assertValidIntakeContract({
+          title: 'Discovered critical anomaly',
+          done_when: 'Unit test assertions verify fix',
+          priority: 'P1',
+          body: 'Discovered during idle scan. [owner: @kasra, ttl: 7d]',
         })
       }).not.toThrow()
     })
@@ -171,6 +234,51 @@ describe('Point-of-Capture Intake Contract Governance (Mupot #1040)', () => {
           title: 'Wire Hermes receiver',
           done_when: '(backfill required)',
         }),
+      ).rejects.toThrowError(TaskIntakeContractError)
+    })
+
+    it('enforces P1 discipline on task mutation / updates', () => {
+      const existingTask: TaskIntakePayload = {
+        title: 'Low priority chore',
+        done_when: 'Chore completed and verified',
+        priority: 'P3',
+        project_id: null,
+      }
+
+      // Escalating to P1 without project linkage or escape hatch is rejected
+      expect(() => {
+        assertValidIntakeContract({
+          ...existingTask,
+          priority: 'P1',
+        })
+      }).toThrowError(/p1_linkage_required/)
+
+      // Escalating to P1 with project linkage succeeds
+      expect(() => {
+        assertValidIntakeContract({
+          ...existingTask,
+          priority: 'P1',
+          project_id: 'proj-flight-1',
+        })
+      }).not.toThrow()
+    })
+
+    it('persistTaskUpdate rejects escalating an unlinked task to P1', async () => {
+      const task = await createTask(env, {
+        squad_id: 'sq-1',
+        title: 'Chore task',
+        done_when: 'Chore verified',
+        priority: 'P3',
+      })
+
+      const updatedTask = {
+        ...task,
+        priority: 'P1' as const,
+        updated_at: new Date().toISOString(),
+      }
+
+      await expect(
+        import('../src/tasks/service').then(m => m.persistTaskUpdate(env, task, updatedTask))
       ).rejects.toThrowError(TaskIntakeContractError)
     })
   })
