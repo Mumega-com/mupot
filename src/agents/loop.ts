@@ -54,7 +54,7 @@ import { createTask } from '../tasks/service'
 import { createModel } from '../model'
 import { createMemory } from '../memory'
 import { checkAndReserve, recordTokens } from './meter'
-import { costMicroUsd } from './cost'
+import { costMicroUsd, costUsageMicroUsd } from './cost'
 import { buildSensorium, renderSensorium } from './sensorium'
 import type { AgentRuntime, Sensorium } from './sensorium'
 import { computeDecisionFp, reserveDecision } from './dedup'
@@ -358,14 +358,31 @@ export async function runGoalCycle(
       },
     ]
 
-    const raw = await model.chat(messages, { model: agent.model })
+    const chatResult = model.chatWithUsage
+      ? await model.chatWithUsage(messages, { model: agent.model })
+      : { text: await model.chat(messages, { model: agent.model }), usage: undefined }
+    const raw = chatResult.text
 
     // Record this planning call's (conservative) spend so the dollar cap (#4) sees
     // the loop's OWN burn, not just execute-mode spend. Best-effort — a failed
     // accounting write must never abort the cycle.
     const recordSpend = deps.recordTokens ?? recordTokens
     try {
-      await recordSpend(env, agent.id, LOOP_PLANNING_MAX_TOKENS, estimateMicroUsd)
+      // P0 (River gate): bill from REAL usage when the provider reported it;
+      // the estimate only when usage is absent. costMicroUsd has no deepseek
+      // entry, so a usage-less call would otherwise bill v4-pro at the $15/M
+      // fallback — a 34x/4000x overstatement that made the meter block early.
+      const usage = chatResult.usage
+      const cost =
+        usage !== undefined
+          ? (costUsageMicroUsd(agent.model, usage) ?? estimateMicroUsd)
+          : estimateMicroUsd
+      await recordSpend(env, agent.id, LOOP_PLANNING_MAX_TOKENS, cost, {
+        input: usage?.input,
+        output: usage?.output,
+        cacheRead: usage?.cacheRead,
+        cacheWrite: usage?.cacheWrite,
+      })
     } catch {
       // best-effort accounting
     }

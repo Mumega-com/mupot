@@ -140,3 +140,45 @@ export function formatBurn(spendTodayMicroUsd: number, nowMs: number): string {
   if (perHr < 0.01) return `$${perHr.toFixed(4)}/hr`
   return `$${perHr.toFixed(2)}/hr`
 }
+
+
+// ── Cache-aware cost (cache-telemetry, 2026-08-14) ────────────────────────────
+//
+// ONE PRICE HOME (River gate P1-2): the split hit/miss/output rates live in
+// src/economy/prices.ts (MODEL_PRICES — the established, cited table that
+// priceUsage already reads live at src/mcp/routines.ts:442). This module
+// DELEGATES to it; there is exactly one table, so the Aug-16 peak/off-peak
+// switch is a config edit in prices.ts, not a code change here.
+//
+// Disjoint convention (River gate P1-3): `input` in TokenUsage is the NON-CACHE
+// input (billed at the miss rate); cacheRead/cacheWrite are separate fields. A
+// producer that sees prompt_cache_hit_tokens must subtract it from prompt_tokens
+// before setting `input` — summing both would double-bill every cache token.
+import type { TokenUsage } from '../types'
+import { priceUsage } from '../economy/prices'
+
+/**
+ * costUsageMicroUsd(model, usage) — cost of a REAL usage record, cache-aware.
+ *
+ * Delegates to priceUsage (economy/prices.ts) — the single price home. Cache-hit
+ * tokens bill at the hit rate; non-cache input at the miss rate; output at the
+ * output rate. Unknown models / missing usage → null (caller decides: estimate
+ * or refuse — never invent).
+ */
+export function costUsageMicroUsd(
+  model: string | null | undefined,
+  usage: TokenUsage,
+): number | null {
+  return priceUsage(model, usage)
+}
+
+/**
+ * cacheHitRatio(cacheRead, cacheMiss) — rolling cache-hit ratio for telemetry.
+ * 0 when there is nothing to measure; never NaN.
+ */
+export function cacheHitRatio(cacheRead: number, cacheMiss: number): number {
+  const read = cacheRead > 0 ? cacheRead : 0
+  const miss = cacheMiss > 0 ? cacheMiss : 0
+  if (read + miss === 0) return 0
+  return read / (read + miss)
+}

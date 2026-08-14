@@ -216,25 +216,51 @@ export async function checkAndReserve(
  * (blocking on budget_cap_cents) is intentionally deferred and must land with its
  * own adversarial gate pass (see the module header). Tracking ≠ enforcing.
  */
+export interface RecordTokensUsage {
+  /** Total input tokens (cache-read + cache-miss combined), when known. */
+  input?: number
+  /** Output tokens, when known. */
+  output?: number
+  /** Cache-read tokens (the cheap half of the bill), when the provider reports them. */
+  cacheRead?: number
+  /** Cache-write tokens, when reported. */
+  cacheWrite?: number
+}
+
 export async function recordTokens(
   env: Env,
   agentId: string,
   tokens: number,
   costMicroUsd = 0,
+  usage?: RecordTokensUsage,
 ): Promise<void> {
   const tok = tokens > 0 ? tokens : 0
   const cost = costMicroUsd > 0 ? Math.round(costMicroUsd) : 0
-  if (tok === 0 && cost === 0) return
+  const cacheRead = usage?.cacheRead && usage.cacheRead > 0 ? Math.round(usage.cacheRead) : 0
+  const cacheMiss =
+    usage?.input && usage.input > 0
+      ? Math.max(Math.round(usage.input) - cacheRead, 0)
+      : 0
+  const output = usage?.output && usage.output > 0 ? Math.round(usage.output) : 0
+  if (tok === 0 && cost === 0 && cacheRead === 0 && output === 0) return
   const windowKey = buildWindowKey(env.TENANT_SLUG, agentId)
   const now = new Date().toISOString()
   await env.DB.prepare(
-    `INSERT INTO execution_meter (id, window_key, count, tokens, cost_micro_usd, window_start)
-       VALUES (?, ?, 0, ?, ?, ?)
+    `INSERT INTO execution_meter
+       (id, window_key, count, tokens, cost_micro_usd, cache_read_tokens, cache_miss_tokens, output_tokens, window_start)
+       VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(window_key) DO UPDATE SET
          tokens = tokens + ?,
-         cost_micro_usd = cost_micro_usd + ?`,
+         cost_micro_usd = cost_micro_usd + ?,
+         cache_read_tokens = cache_read_tokens + ?,
+         cache_miss_tokens = cache_miss_tokens + ?,
+         output_tokens = output_tokens + ?`,
   )
-    .bind(crypto.randomUUID(), windowKey, tok, cost, now, tok, cost)
+    .bind(
+      crypto.randomUUID(), windowKey, tok, cost,
+      cacheRead, cacheMiss, output, now,
+      tok, cost, cacheRead, cacheMiss, output,
+    )
     .run()
 }
 
