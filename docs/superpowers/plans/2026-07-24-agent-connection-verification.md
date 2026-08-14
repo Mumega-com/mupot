@@ -45,7 +45,7 @@ Vitest, TypeScript.
 ### Task 1: Add verification attempt state and exact cleanup contract
 
 **Files:**
-- Create: `migrations/0072_agent_connection_verification.sql`
+- Create: `migrations/0103_agent_connection_verification.sql`
 - Modify: `tests/agent-connections-migration.test.ts`
 - Modify: `src/agents/messages.ts`
 - Create: `tests/agent-connection-message-cleanup.test.ts`
@@ -86,10 +86,10 @@ npx vitest run \
   tests/agent-connection-message-cleanup.test.ts
 ```
 
-Expected: failure because migration `0072` and
+Expected: failure because migration `0103` and
 `deleteAgentConnectionMessage()` do not exist.
 
-- [x] **Step 4: Add migration `0072`**
+- [x] **Step 4: Add migration `0103`**
 
 Use:
 
@@ -136,7 +136,7 @@ Expected: both files pass.
 - [x] **Step 7: Commit**
 
 ```bash
-git add migrations/0072_agent_connection_verification.sql \
+git add migrations/0103_agent_connection_verification.sql \
   src/agents/messages.ts \
   tests/agent-connections-migration.test.ts \
   tests/agent-connection-message-cleanup.test.ts

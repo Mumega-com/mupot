@@ -296,6 +296,13 @@ describe('B1. unbound directory session — byte-for-byte unchanged (the hard re
       latentCapabilities: [
         { member_id: HUMAN, scope_type: 'squad', scope_id: AGENT_A.squad_id, capability: 'admin' },
       ],
+      // mupot#847 (rebased onto this test, kasra-git 2026-08-14): buildAuthContextFromProps
+      // now always echoes back the live-verified token id — see oauth-authorize.ts's
+      // `tokenId: props.tokenId` and the comment above it ("live row was re-read above").
+      // Genuinely new field, not a regression of "byte-for-byte unchanged" — the token row
+      // read at the top of this function (tokenRow) already re-verifies props.tokenId is
+      // live before this function returns at all, so exposing it here adds no new trust.
+      tokenId: 'tok-unbound',
     })
   })
 })

@@ -311,6 +311,21 @@ dashboardApp.use('*', async (c, next) => {
     await next()
     return
   }
+  // Agent-connection status polling (#847) does its OWN full authorization —
+  // callerMayPoll in src/members/agent-connection-status.ts — keyed to the
+  // SPECIFIC receipt (issuer, org-admin, or admin on that receipt's home
+  // squad). That is a narrower and more correct question than this floor's
+  // "does the caller hold ANY capability anywhere" chokepoint, and the common
+  // caller is the human who just issued the connection and may hold ZERO
+  // standing capabilities otherwise. Running the floor first would 403 that
+  // issuer before callerMayPoll's exception ever runs, contradicting the
+  // route's own documented contract ("every denial is deliberately a 404")
+  // and defeating the issuer exception outright. Exempted here, at the single
+  // chokepoint, rather than widened for every route.
+  if (/^\/api\/agent-connections\/[^/]+\/status$/.test(c.req.path)) {
+    await next()
+    return
+  }
   const auth = c.get('auth')
   // isOrgAdmin is checked explicitly (not left to holdsCapabilityFloor's own
   // legacy-role escape) because that escape only fires when auth.capabilities

@@ -5,7 +5,7 @@ import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
 const DIR = join(__dirname, '..', 'migrations')
 const TARGET = '0071_agent_connections.sql'
-const VERIFICATION_TARGET = '0072_agent_connection_verification.sql'
+const VERIFICATION_TARGET = '0103_agent_connection_verification.sql'
 const NOW = '2026-07-24T00:00:00.000Z'
 const LATER = '2026-07-24T00:15:00.000Z'
 const EXPIRES = '2026-07-25T00:00:00.000Z'
@@ -824,7 +824,7 @@ describe('0071 agent connection contract migration', () => {
   })
 })
 
-describe('0072 agent connection verification contract migration', () => {
+describe('0103 agent connection verification contract migration', () => {
   it('adds bounded monotonic verification attempts without weakening receipt immutability', () => {
     const h = createBeforeTargetHarness()
     try {
