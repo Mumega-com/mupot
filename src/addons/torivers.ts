@@ -68,41 +68,43 @@ toriversAddonApp.post('/workflows/execute', async (c) => {
       return c.json({ ok: false, error: 'Missing required field: workflowId' }, 400)
     }
 
-    const executionId = `exec_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
     const tenantSlug = c.env.TENANT_SLUG || 'default'
 
-    // Record workflow execution step in D1 if available
-    if (c.env.DB) {
-      await c.env.DB.prepare(
-        `INSERT INTO subagent_token_usage 
-         (id, subagent_id, parent_agent_id, model_substrate, prompt_tokens, completion_tokens, task_id, timestamp)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-      ).bind(
-        executionId,
-        'torivers-workflow-engine',
-        'river',
-        'deterministic-dag',
-        150,
-        300,
-        body.workflowId,
-        new Date().toISOString()
-      ).run()
-    }
-
-    return c.json({
-      ok: true,
-      executionId,
-      workflowId: body.workflowId,
-      tenantSlug,
-      status: 'completed',
-      receipt: {
-        stepsExecuted: 3,
-        deterministicOutputs: {
-          result: 'Workflow executed successfully with zero non-deterministic drift.',
-          timestamp: new Date().toISOString(),
-        },
+    // NOT IMPLEMENTED — and it says so, because the previous version did not.
+    //
+    // This handler never read a workflow DAG or an action identifier. It returned
+    // `status: 'completed'` with `stepsExecuted: 3` and "Workflow executed successfully
+    // with zero non-deterministic drift", and it INSERTed hardcoded prompt/completion
+    // token counts (150/300) into `subagent_token_usage` — an accounting surface. Those
+    // rows are indistinguishable at read time from measured usage, so every call quietly
+    // added fabricated COGS to the ledger (mupot#1017, found by Athena's gate review).
+    //
+    // Same class as #656, refused at review on 2026-08-13 for writing a guessed 0.1 into
+    // a column named `reported_cost` that feeds the spend ceiling. That one was caught
+    // before landing. This one shipped in v0.28.0 (f8d5a55).
+    //
+    // The fix is deliberately NOT "return 200 with an `implemented: false` flag". A 2xx
+    // means the workflow ran, and a success-shaped response that nobody reads carefully
+    // is exactly how the fabrication survived review in the first place. 501 is the
+    // honest answer: the endpoint is declared, the engine is not built.
+    //
+    // A missing row is a visible gap. A fabricated row is invisible corruption.
+    //
+    // G-1b (atlas §2.1) replaces this with a real AST/DAG runner. When it lands, the
+    // receipt and the usage row come back — DERIVED from what actually executed, and
+    // the test below must be updated deliberately rather than deleted.
+    return c.json(
+      {
+        ok: false,
+        error: 'not_implemented',
+        detail:
+          'The deterministic workflow engine is not built. This endpoint accepts and ' +
+          'validates a request but executes nothing — see mupot#1017 / atlas G-1b.',
+        workflowId: body.workflowId,
+        tenantSlug,
       },
-    })
+      501,
+    )
   } catch (error) {
     console.error('[torivers:execute-error]', error)
     return c.json({ ok: false, error: 'Internal Server Error in ToRivers execution engine' }, 500)
