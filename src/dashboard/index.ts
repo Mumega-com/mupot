@@ -311,21 +311,27 @@ dashboardApp.use('*', async (c, next) => {
     await next()
     return
   }
-  // Agent-connection status polling (#847) does its OWN full authorization —
-  // callerMayPoll in src/members/agent-connection-status.ts — keyed to the
-  // SPECIFIC receipt (issuer, org-admin, or admin on that receipt's home
-  // squad). That is a narrower and more correct question than this floor's
-  // "does the caller hold ANY capability anywhere" chokepoint, and the common
-  // caller is the human who just issued the connection and may hold ZERO
-  // standing capabilities otherwise. Running the floor first would 403 that
-  // issuer before callerMayPoll's exception ever runs, contradicting the
-  // route's own documented contract ("every denial is deliberately a 404")
-  // and defeating the issuer exception outright. Exempted here, at the single
-  // chokepoint, rather than widened for every route.
-  if (/^\/api\/agent-connections\/[^/]+\/status$/.test(c.req.path)) {
-    await next()
-    return
-  }
+  // NOTE (#847 adversarial gate, P2-2): this route used to be exempted from the
+  // floor here, reasoning that "the common caller is the human who just issued
+  // the connection and may hold ZERO standing capabilities otherwise." That
+  // premise does not hold against the live code: the only production issuance
+  // path, provision_agent_connection (src/mcp/provision.ts, min: 'admin'),
+  // always constructs its actor as `{ kind: 'member', ... }` (never sets
+  // `legacyOrgRole`), and agent-connection.ts#authorize() requires that actor
+  // to hold a REAL admin-rank capability grant on the receipt's home squad
+  // before a receipt is ever written (agent-connection.ts:357-365). So by
+  // construction, the human who issued a connection already holds a capability
+  // row that satisfies holdsCapabilityFloor('observer') on its own — the
+  // exemption was never load-bearing for that caller. (The `actor_kind: 'user'`
+  // + zero-grants issuer that motivated this exemption is only ever constructed
+  // directly in tests/agent-connection-status.test.ts; no production code path
+  // writes it — src/mcp/provision.ts:806 hardcodes `kind: 'member'`.)
+  //
+  // callerMayPoll (src/members/agent-connection-status.ts) still does its own
+  // full, receipt-scoped authorization after this floor — org-admin, the
+  // issuing member, or current admin on the receipt's home squad — so removing
+  // this exemption narrows who reaches that check without narrowing who
+  // callerMayPoll itself would have allowed.
   const auth = c.get('auth')
   // isOrgAdmin is checked explicitly (not left to holdsCapabilityFloor's own
   // legacy-role escape) because that escape only fires when auth.capabilities

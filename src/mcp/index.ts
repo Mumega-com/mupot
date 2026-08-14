@@ -234,9 +234,13 @@ async function resolveAuth(c: {
                 AND t.member_id = ?2
                 AND t.tenant = ?3
                 AND m.tenant = ?3
-                AND t.revoked_at IS NULL
+                -- 0099: same shared liveness predicate authenticateMember (below) and
+                -- src/auth/member-bearer.ts execute. A hand-written revoked_at IS NULL
+                -- here would be a THIRD copy missing expiry — see token-lifecycle.ts's
+                -- header on why that is a live bypass door, not a stylistic nit.
+                AND ${TOKEN_LIVE_PREDICATE('?4')}
               LIMIT 1`,
-          ).bind(auth.tokenId, auth.userId, c.env.TENANT_SLUG).first<{
+          ).bind(auth.tokenId, auth.userId, c.env.TENANT_SLUG, nowSqlUtc()).first<{
             token_id: string
             bound_agent_id: string | null
             member_status: Member['status']

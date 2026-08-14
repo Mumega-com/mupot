@@ -269,7 +269,14 @@ describe('agent connection public status', () => {
     }
   })
 
-  it('route collapses an unauthorized same-tenant session to 404', async () => {
+  // #847 P2-2: the dashboard-wide capability floor (dashboard/index.ts) used to
+  // exempt this route entirely, reasoning the issuer "may hold ZERO standing
+  // capabilities." That premise does not hold in production (provision_agent_
+  // connection always requires — and the issuer therefore always holds — a real
+  // admin-rank grant on the receipt's home squad before a receipt is written),
+  // so the exemption was removed and this route now sits behind the SAME floor
+  // every other dashboard GET/HEAD route does.
+  it('a session with ZERO capabilities anywhere is blocked by the floor before the route runs (403)', async () => {
     env = {
       ...env,
       SESSIONS: {
@@ -282,10 +289,51 @@ describe('agent connection public status', () => {
       },
     } as unknown as Env
     const response = await dashboardApp.request(
+      // ?format=json — same content-negotiation precedent as every other floor-gated
+      // GET route (dashboard/index.ts): a bearerless browser navigation gets the
+      // rendered deny page, an API-style caller asking for JSON gets a JSON 403.
+      `https://pot.example/api/agent-connections/${issued.receipt.id}/status?format=json`,
+      { headers: { Cookie: 'mupot_session=session-1' } },
+      env,
+    )
+    // Blocked by the dashboard-wide floor, not the route's own not-found shape —
+    // this caller never reaches callerMayPoll at all.
+    expect(response.status).toBe(403)
+    await expect(response.json()).resolves.toEqual({ error: 'forbidden', need: 'capability' })
+  })
+
+  // Proves callerMayPoll's own per-receipt authorization is still the real
+  // enforcement point for a caller who clears the floor (holds SOME capability
+  // somewhere) but is not the issuer and not admin on THIS receipt's home
+  // squad — the floor removal above does not turn this into a rubber stamp.
+  it('a session that clears the floor but is unauthorized for this receipt still gets 404 (not-found contract intact)', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO members (id, display_name, email, status, tenant) VALUES
+        ('unrelated-admin', 'Unrelated Admin', 'unrelated@example.com', 'active', '${TENANT}');
+      INSERT INTO squads (id, department_id, slug, name) VALUES
+        ('squad-unrelated', 'dept-1', 'unrelated', 'Unrelated');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES
+        ('unrelated-admin-cap', 'unrelated-admin', 'squad', 'squad-unrelated', 'admin');
+    `)
+    env = {
+      ...env,
+      SESSIONS: {
+        get: async () => JSON.stringify({
+          userId: 'unrelated-admin',
+          email: 'unrelated@example.com',
+          role: 'member',
+          createdAt: NOW.toISOString(),
+        }),
+      },
+    } as unknown as Env
+    const response = await dashboardApp.request(
       `https://pot.example/api/agent-connections/${issued.receipt.id}/status`,
       { headers: { Cookie: 'mupot_session=session-1' } },
       env,
     )
+    // Clears the dashboard floor (holds an admin grant on squad-unrelated), but
+    // callerMayPoll denies: not the issuer, not org-admin, not admin on
+    // squad-home. The route's own not-found (never 403) contract holds here.
     expect(response.status).toBe(404)
     await expect(response.json()).resolves.toEqual({ error: 'not_found' })
   })
