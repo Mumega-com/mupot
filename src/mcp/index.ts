@@ -61,6 +61,7 @@ import {
   VerdictRaceError,
   TaskEvidenceFenceError,
 } from '../tasks/service'
+import { loadKanbanData } from '../dashboard/kanban-routes'
 import type { TaskStatus } from '../tasks/service'
 import type { TaskPriority } from '../types'
 import { resolveTaskAssignee } from '../tasks/assignee'
@@ -936,6 +937,39 @@ const toolTaskBoard: ToolSpec = {
       TASK_STATUSES.map((status) => [status, columns[status].length]),
     ) as Record<TaskStatus, number>
     return done({ squad_id: squadRes.squad.id, counts, columns })
+  },
+}
+
+// kanban_board — multi-perspective Squad & Project Kanban view for agents and tools.
+// Supports both squad-centric and project-centric perspectives with RBAC isolation.
+const toolKanbanBoard: ToolSpec = {
+  name: 'kanban_board',
+  scope: 'squad / project',
+  min: 'member',
+  args: '{ squad_id?: string, squad?: string, project_id?: string, project?: string, view?: "squad"|"project"|"matrix" }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      squad_id: STRING_SCHEMA,
+      squad: STRING_SCHEMA,
+      project_id: STRING_SCHEMA,
+      project: STRING_SCHEMA,
+      view: { type: 'string', enum: ['squad', 'project', 'matrix'] },
+    },
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const squadParam = str(args.squad_id) || str(args.squad) || undefined
+    const projectParam = str(args.project_id) || str(args.project) || undefined
+    const viewParam = str(args.view) || undefined
+
+    const data = await loadKanbanData(env, auth, {
+      squadIdOrSlug: squadParam,
+      projectIdOrSlug: projectParam,
+      view: viewParam,
+    })
+
+    return done(data)
   },
 }
 
@@ -3360,6 +3394,7 @@ export const TOOLS: ToolSpec[] = [
   toolTaskCreate,
   toolTaskList,
   toolTaskBoard,
+  toolKanbanBoard,
   toolTaskUpdate,
   toolTaskVerdict,
   toolTaskDispatch,

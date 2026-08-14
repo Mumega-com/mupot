@@ -128,10 +128,9 @@ import {
 } from './ui'
 import type { Html } from './ui'
 import type { ApprovalItem } from './approvals'
-import {
-  loadObservatory,
-  agentGradient,
-} from './observatory'
+import { loadObservatory, agentGradient } from './observatory'
+import { kanbanApp, loadKanbanData, kanbanBoardBody } from './kanban-routes'
+
 import type { ObservatoryData, SwimlaneBar, AgentRuntimeState, AgentStat } from './observatory'
 import { loadOpsHealth } from './health'
 import type { OpsHealthData, HealthTone } from './health'
@@ -1319,6 +1318,42 @@ dashboardApp.get('/fleet', async (c) => {
     }),
   )
 })
+
+// Mount Kanban Sub-app
+dashboardApp.route('/', kanbanApp)
+
+// GET /dashboard/kanban — Multi-Perspective Squad & Project Kanban Board
+dashboardApp.get('/dashboard/kanban', async (c) => {
+  const auth = c.get('auth')
+  const squad = c.req.query('squad') || c.req.query('squad_id')
+  const project = c.req.query('project') || c.req.query('project_id')
+  const view = c.req.query('view')
+
+  const accessibleSquadIds = await resolveAccessibleSquadIds(c.env, auth)
+  const isAllAccessible = isOrgAdmin(auth) || accessibleSquadIds === null
+
+  const [data, allSquads, allProjects] = await Promise.all([
+    loadKanbanData(c.env, auth, { squadIdOrSlug: squad, projectIdOrSlug: project, view }),
+    loadSquads(c.env),
+    c.env.DB.prepare('SELECT id, slug, name, goal, status FROM projects WHERE status <> "archived" ORDER BY name ASC').all<Project>().then(r => r.results ?? []),
+  ])
+
+  const visibleSquads = isAllAccessible
+    ? allSquads
+    : allSquads.filter(s => accessibleSquadIds?.includes(s.id))
+
+  const visibleProjects = allProjects // Projects without accessible squad tasks will render empty/scoped per-squad lanes
+
+  const title = data.mode === 'project' && data.project
+    ? `Project Board · ${data.project.name}`
+    : `Squad Board · ${data.squad?.name || 'Kanban'}`
+
+  return c.html(
+    shell(c.env, title, kanbanBoardBody(data, visibleSquads, visibleProjects)),
+  )
+})
+
+
 
 // POST /fleet/host-control — start|stop|restart a HOST agent OR squad via the SIGNED control
 // plane (mupot inbox → host daemon verifies the Ed25519 signature → engine.control/control_squad).
@@ -3756,6 +3791,7 @@ function shell(
               <span class="nav-chevron" id="chev-work"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="13" height="13"><path d="M6 4l4 4-4 4"/></svg></span>
             </button>
             <div class="nav-children" id="children-work">
+              <a class="nav-child" href="/dashboard/kanban">Kanban board</a>
               <a class="nav-child" href="/send">Tasks</a>
               <a class="nav-child" href="/flights">Pull requests</a>
               <a class="nav-child" href="/verifications">Verifications</a>
