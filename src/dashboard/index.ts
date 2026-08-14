@@ -182,6 +182,7 @@ import {
   updateRoutine,
 } from '../routines/service'
 import { answerRoutineRun, cancelRoutineRun } from '../routines/actions'
+import { loadAgentConnectionStatus } from '../members/agent-connection-status'
 
 // First-run setup wizard (the easy-onboard centerpiece). Mounted under '/setup'
 // on this same dashboard app, so it inherits the auth + tenant guard below.
@@ -310,6 +311,27 @@ dashboardApp.use('*', async (c, next) => {
     await next()
     return
   }
+  // NOTE (#847 adversarial gate, P2-2): this route used to be exempted from the
+  // floor here, reasoning that "the common caller is the human who just issued
+  // the connection and may hold ZERO standing capabilities otherwise." That
+  // premise does not hold against the live code: the only production issuance
+  // path, provision_agent_connection (src/mcp/provision.ts, min: 'admin'),
+  // always constructs its actor as `{ kind: 'member', ... }` (never sets
+  // `legacyOrgRole`), and agent-connection.ts#authorize() requires that actor
+  // to hold a REAL admin-rank capability grant on the receipt's home squad
+  // before a receipt is ever written (agent-connection.ts:357-365). So by
+  // construction, the human who issued a connection already holds a capability
+  // row that satisfies holdsCapabilityFloor('observer') on its own — the
+  // exemption was never load-bearing for that caller. (The `actor_kind: 'user'`
+  // + zero-grants issuer that motivated this exemption is only ever constructed
+  // directly in tests/agent-connection-status.test.ts; no production code path
+  // writes it — src/mcp/provision.ts:806 hardcodes `kind: 'member'`.)
+  //
+  // callerMayPoll (src/members/agent-connection-status.ts) still does its own
+  // full, receipt-scoped authorization after this floor — org-admin, the
+  // issuing member, or current admin on the receipt's home squad — so removing
+  // this exemption narrows who reaches that check without narrowing who
+  // callerMayPoll itself would have allowed.
   const auth = c.get('auth')
   // isOrgAdmin is checked explicitly (not left to holdsCapabilityFloor's own
   // legacy-role escape) because that escape only fires when auth.capabilities
@@ -351,6 +373,19 @@ dashboardApp.use('*', async (c, next) => {
 dashboardApp.route('/setup', wizardApp)
 
 // ── routes ───────────────────────────────────────────────────────────────────
+
+// Refresh-safe polling for the guided agent-connection flow. Authorization is
+// recalculated on every request and every denial is deliberately a 404.
+dashboardApp.get('/api/agent-connections/:receiptId/status', async (c) => {
+  const result = await loadAgentConnectionStatus(
+    c.env,
+    c.get('auth'),
+    c.req.param('receiptId'),
+  )
+  return result.ok
+    ? c.json(result.value)
+    : c.json({ error: 'not_found' }, 404)
+})
 
 // GET / — Observatory home (#13): swimlane of agents over time, operator queue,
 // recent tasks. First-run onboarding redirect is retained at the top.

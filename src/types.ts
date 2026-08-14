@@ -473,6 +473,7 @@ export interface AuthContext {
    * authority even though the AGENT stays untouched).
    */
   consentedByMemberId?: string | null
+  tokenId?: string | null // exact live member_tokens row used for this request; server-derived only
 }
 
 // ── Members & capabilities — humans are first-class network nodes ──
