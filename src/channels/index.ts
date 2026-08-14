@@ -754,9 +754,9 @@ channelsApp.post('/:platform/webhook', async (c) => {
   }
 
   // 0) Inline-response platforms (Discord interactions: PING→PONG, slash command →
-  // {type:4}). The adapter owns its own verify + the HTTP response; the core only
-  // hands it the resolve→gate→act pipeline via `run`. A non-null Response is returned
-  // verbatim. Adapters without respond() (Telegram, Google Chat) fall through to the
+  // {type:4}; Google Chat: {text: reply}). The adapter owns its own verify + the HTTP response;
+  // the core only hands it the resolve→gate→act pipeline via `run`. A non-null Response is returned
+  // verbatim. Adapters without respond() (Telegram) fall through to the
   // standard verify → parseInbound → post() path below.
   if (adapter.respond) {
     const r = await adapter.respond(c.req.raw, c.env, (inb) =>

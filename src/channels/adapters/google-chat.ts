@@ -736,12 +736,39 @@ async function roleCapability(
   return null
 }
 
+// ── respond (synchronous HTTP reply for Google Chat webhook) ──────────────────
+// Google Chat supports returning the reply directly in the HTTP 200 response body as
+// { "text": "..." }. This eliminates the need for outbound service-account token minting
+// for immediate conversational replies, providing immediate, zero-latency feedback.
+async function respond(
+  req: Request,
+  env: Env,
+  run: (inbound: InboundMessage) => Promise<string>,
+): Promise<Response | null> {
+  const verified = await verify(req, env)
+  if (!verified) return new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401, headers: { 'content-type': 'application/json' } })
+
+  const inbound = await parseInbound(req, env)
+  if (!inbound) {
+    // Non-message event or bot echo: 200 OK with empty body
+    return new Response(JSON.stringify({}), { status: 200, headers: { 'content-type': 'application/json' } })
+  }
+
+  const reply = await run(inbound)
+  return new Response(JSON.stringify({ text: reply }), {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+  })
+}
+
 // ── the adapter (the only export the core sees) ───────────────────────────────
 export const googleChatAdapter: ChannelAdapter = {
   platform: 'google-chat',
   verify,
   parseInbound,
+  respond,
   post,
   listChannelMembers,
   roleCapability,
 }
+
