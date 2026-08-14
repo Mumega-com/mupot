@@ -1232,7 +1232,9 @@ const toolTaskUpdate: ToolSpec = {
       if (error instanceof TaskUpdateConflictError) return fail(409, error.code)
       throw error
     }
-    next.github_issue_url = await mirrorTaskUpdate(env, next)
+    next.github_issue_url = await mirrorTaskUpdate(env, next, {
+      statusChanged: existing.status !== next.status,
+    })
 
     const actor = memberActor(auth.memberId as string)
     await emitTaskEvent(env, 'task.updated', next, actor)

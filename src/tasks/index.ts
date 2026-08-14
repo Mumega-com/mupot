@@ -799,7 +799,9 @@ tasksApp.patch('/:id', async (c) => {
 
   // A stale update must never reach the external mirror. The mirror remains
   // best-effort and update-only; project attribution does not alter its auth.
-  next.github_issue_url = await mirrorTaskUpdate(c.env, next)
+  next.github_issue_url = await mirrorTaskUpdate(c.env, next, {
+    statusChanged: existing.status !== next.status,
+  })
 
   {
     const auth = c.get('auth')
