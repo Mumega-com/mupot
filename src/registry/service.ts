@@ -47,6 +47,7 @@ interface ModuleRegistryRow {
   identity: string
   status: string
   capabilities: string
+  model?: string | null
   last_heartbeat: string
   registered_at: string
 }
@@ -63,11 +64,12 @@ export interface ModulePresence {
   identity: string
   status: ModuleStatus
   capabilities: string[]
+  model?: string | null
   last_heartbeat: string
   registered_at: string
 }
 
-const SELECT_COLUMNS = `id, tenant, kind, adapter, project_id, identity, status, capabilities, last_heartbeat, registered_at`
+const SELECT_COLUMNS = `id, tenant, kind, adapter, project_id, identity, status, capabilities, model, last_heartbeat, registered_at`
 
 function parseCapabilities(raw: string): string[] {
   try {
@@ -104,6 +106,7 @@ function hydrate(row: ModuleRegistryRow, nowMs: number): ModulePresence | null {
     identity: row.identity,
     status: effectiveStatus(row, nowMs),
     capabilities: parseCapabilities(row.capabilities),
+    model: row.model ?? null,
     last_heartbeat: row.last_heartbeat,
     registered_at: row.registered_at,
   }
@@ -115,11 +118,12 @@ export interface RegisterModuleInput {
   adapter: string
   projectId: string | null
   capabilities?: string[]
+  model?: string | null
 }
 
 /**
  * registerModule — idempotent upsert. Re-registering the SAME identity under the SAME
- * (tenant, project_id) updates the existing row in place (kind/adapter/capabilities may
+ * (tenant, project_id) updates the existing row in place (kind/adapter/capabilities/model may
  * change; status resets to 'online'; last_heartbeat bumps to now) — it never inserts a
  * duplicate. This targets the migration 0066 unique index on
  * (tenant, identity, project_key) where project_key normalizes NULL project_id to ''.
@@ -141,19 +145,21 @@ export async function registerModule(
   const id = crypto.randomUUID()
   const nowIso = now.toISOString()
   const capabilitiesJson = JSON.stringify(input.capabilities ?? [])
+  const model = input.model?.trim() || null
 
   await env.DB.prepare(
     `INSERT INTO module_registry
-       (id, tenant, kind, adapter, project_id, identity, status, capabilities, last_heartbeat, registered_at)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'online', ?7, ?8, ?8)
+       (id, tenant, kind, adapter, project_id, identity, status, capabilities, model, last_heartbeat, registered_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'online', ?7, ?8, ?9, ?9)
      ON CONFLICT (tenant, identity, project_key) DO UPDATE SET
        kind           = excluded.kind,
        adapter        = excluded.adapter,
        status         = 'online',
        capabilities   = excluded.capabilities,
+       model          = excluded.model,
        last_heartbeat = excluded.last_heartbeat`,
   )
-    .bind(id, tenant, input.kind, adapter, input.projectId, identity, capabilitiesJson, nowIso)
+    .bind(id, tenant, input.kind, adapter, input.projectId, identity, capabilitiesJson, model, nowIso)
     .run()
 
   const row = await env.DB.prepare(`SELECT ${SELECT_COLUMNS} FROM module_registry WHERE tenant = ?1 AND identity = ?2 AND project_id IS ?3 LIMIT 1`)
@@ -163,6 +169,7 @@ export async function registerModule(
   const hydrated = hydrate(row, now.getTime())
   return hydrated ? { ok: true, value: hydrated } : { ok: false, error: 'register_failed' }
 }
+
 
 /**
  * heartbeatModule — bump last_heartbeat (and flip status back to 'online' if the row
