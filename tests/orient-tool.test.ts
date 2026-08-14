@@ -96,6 +96,7 @@ function makeEnv(opts: Opts = {}): Env {
     TENANT_SLUG: 'digid',
     BRAND: 'Digid',
     OAUTH_PROVIDER: 'google',
+    GOOGLE_WORKSPACE_DRIVE_ROOT: 'https://drive.google.com/drive/folders/mumega-shared-drive-root',
     DB: { prepare: (sql: string) => handler(sql) },
   } as unknown as Env
 }
@@ -140,13 +141,39 @@ describe('orient MCP tool', () => {
     expect(body.result.structuredContent.brief).toContain('Growth Lead')
     // the brief grounds the agent in THIS pot's MCP endpoint, derived from the request origin
     expect(body.result.structuredContent.brief).toContain('https://agents.digid.ca/mcp')
+    expect(body.result.structuredContent.brief).toContain('Your Google Workspace / Drive root: [Shared Squad Drive](https://drive.google.com/drive/folders/mumega-shared-drive-root)')
     // self/weld → viewSensitive: the agent sees its OWN budget + field (NOT redacted)
     const selfPacket = body.result.structuredContent.packet as unknown as {
       agent: { budget_cap_cents: number | null }
       field_restricted?: boolean
+      workspace_drive_url?: string | null
     }
     expect(selfPacket.agent.budget_cap_cents).toBe(5000)
     expect(selfPacket.field_restricted).toBe(false)
+    expect(selfPacket.workspace_drive_url).toBe('https://drive.google.com/drive/folders/mumega-shared-drive-root')
+  })
+
+  it('renders Google Workspace / Drive root in brief when provided', async () => {
+    const { renderBrief } = await import('../src/orient/service')
+    const brief = renderBrief({
+      agent: {
+        id: AGENT.id, slug: AGENT.slug, name: AGENT.name, role: AGENT.role, status: 'active',
+        okr: 'Grow', kpi_target: '10', kpi_progress: 50, effort: 'high', autonomy: 'draft',
+        budget_cap_cents: 1000, budget_window: 'week',
+      },
+      department: { id: 'dept-1', name: 'Sales' },
+      squad: { id: 'squad-1', name: 'Growth', charter: 'Expand', okr: 'Sales' },
+      supervisor: null,
+      squadmates: [],
+      tasks: [],
+      capability: 'member',
+      mcpEndpoint: 'https://mupot.mumega.com/mcp',
+      workspace_drive_url: 'https://drive.google.com/drive/folders/mumega-growth-squad',
+      field: { present: false, stale: false, coherence: null, regime: null, trust_tier: null, trust_score: null, spin: null, age_human: null },
+      induction: false,
+    })
+
+    expect(brief).toContain('Your Google Workspace / Drive root: [Shared Squad Drive](https://drive.google.com/drive/folders/mumega-growth-squad)')
   })
 
   it('orients an explicitly named agent (operator path)', async () => {

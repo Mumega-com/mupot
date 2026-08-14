@@ -94,6 +94,10 @@ export interface Env {
   // orient brief pins its MCP endpoint to THIS instead of echoing the request Host
   // header (which is client-influenceable and renders into a DIRECTIVE surface). #88.
   PUBLIC_ORIGIN?: string
+  // Canonical Google Workspace / Shared Drive root for collaborative artifacts (Issue #1044).
+  // When set (e.g. 'https://drive.google.com/drive/folders/...'), the orient basin-drop
+  // automatically grounds agents in their squad / workspace drive root.
+  GOOGLE_WORKSPACE_DRIVE_ROOT?: string
   // SSO handoff (#262): mumega is the verified-identity issuer; this pot is a relying
   // party that ACCEPTS a signed verified-email claim and mints its OWN session — while
   // keeping its own Google OAuth (additive). We hold ONLY the issuer's Ed25519 PUBLIC

@@ -145,6 +145,7 @@ export interface OrientData {
   tasks: OrientTask[]
   capability: string // the caller's capability on this squad
   mcpEndpoint: string
+  workspace_drive_url?: string | null
   field: FieldHalf
   field_restricted?: boolean // true → field/budget hidden (peer viewer, not self/lead/admin)
   induction: boolean // first time this agent has been oriented
@@ -202,6 +203,7 @@ export function renderBrief(d: OrientData): string {
     `## Your tools — use these, they exist; do not rebuild them`,
     `- Your access on this squad: **${d.capability}**.`,
     `- This pot's MCP endpoint: \`${d.mcpEndpoint}\` (read squads/agents/tasks, create/update tasks — through here, not by hand).`,
+    d.workspace_drive_url ? `- Your Google Workspace / Drive root: [Shared Squad Drive](${d.workspace_drive_url}) (use for collaboration, document drafting, and customer-facing deliverables).` : ``,
     ``,
     `## Your field state (from the mind)`,
     ...fieldLines,
@@ -312,6 +314,7 @@ export async function buildOrient(
     tasks: tasksRes.results ?? [],
     capability: callerCapability,
     mcpEndpoint,
+    workspace_drive_url: env.GOOGLE_WORKSPACE_DRIVE_ROOT?.trim() || null,
     field: viewSensitive ? fieldHalf(fieldRow ?? null, nowMs) : fieldHalf(null, nowMs),
     field_restricted: !viewSensitive,
     induction,
