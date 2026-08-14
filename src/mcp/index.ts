@@ -56,6 +56,7 @@ import {
   stampTaskUpdate,
   TaskProjectError,
   TaskUpdateConflictError,
+  TaskIntakeContractError,
   validateTaskProjectAttribution,
   writeVerdict,
   VerdictRaceError,
@@ -762,6 +763,7 @@ const toolTaskCreate: ToolSpec = {
         { actor: memberActor(auth.memberId as string), externalSource },
       )
     } catch (error) {
+      if (error instanceof TaskIntakeContractError) return fail(400, error.code, error.message)
       if (error instanceof TaskProjectError) return taskProjectFailure(error)
       throw error
     }

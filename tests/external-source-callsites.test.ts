@@ -165,7 +165,7 @@ describe('blank provenance cannot become trusted absence', () => {
     const { env } = await makeEnv()
     await expect(createTask(
       env,
-      { squad_id: 'squad-a', title: 't', body: 'b', done_when: 'w', status: 'open', assignee_agent_id: 'agent-1' },
+      { squad_id: 'squad-a', title: 't', body: 'b', done_when: 'verified closed', status: 'open', assignee_agent_id: 'agent-1' },
       { externalSource: '   ', skipEvent: true, skipMirror: true },
     )).rejects.toThrow(/non-blank identifier/)
   })
@@ -185,7 +185,7 @@ describe('blank provenance cannot become trusted absence', () => {
     const { env, harness } = await makeEnv()
     const task = await createTask(
       env,
-      { squad_id: 'squad-a', title: 't', body: 'b', done_when: 'w', status: 'open' },
+      { squad_id: 'squad-a', title: 't', body: 'b', done_when: 'verified closed', status: 'open' },
       { externalSource: 'linear:TEAM', skipEvent: true, skipMirror: true },
     )
     expect(() => harness.sqlite.exec(
@@ -225,7 +225,7 @@ describe('whitespace-only provenance is blank, not just spaces', () => {
       const { env } = await makeEnv()
       await expect(createTask(
         env,
-        { squad_id: 'squad-a', title: 't', body: 'b', done_when: 'w', status: 'open', assignee_agent_id: 'agent-1' },
+        { squad_id: 'squad-a', title: 't', body: 'b', done_when: 'verified closed', status: 'open', assignee_agent_id: 'agent-1' },
         { externalSource: ch, skipEvent: true, skipMirror: true },
       )).rejects.toThrow(/non-blank identifier/)
     })
@@ -243,7 +243,7 @@ describe('whitespace-only provenance is blank, not just spaces', () => {
     const { env, harness } = await makeEnv()
     const task = await createTask(
       env,
-      { squad_id: 'squad-a', title: 't', body: 'b', done_when: 'w', status: 'open' },
+      { squad_id: 'squad-a', title: 't', body: 'b', done_when: 'verified closed', status: 'open' },
       { externalSource: 'linear:TEAM', skipEvent: true, skipMirror: true },
     )
     expect(() => harness.sqlite.exec(

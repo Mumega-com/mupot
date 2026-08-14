@@ -247,6 +247,11 @@ export interface CreateTaskOptions {
   // expose broadly: it only ever ADDS restriction (no auto-pickup, admin-gated
   // reassignment, untrusted-content prompt fence), never removes it, so a caller
   // setting it on its own new task cannot escalate privilege.
+  /**
+   * Allow creation with a recognized placeholder sentinel (e.g. agent-do fallback, loop spawn, channel quick-add).
+   * The task is still blocked from transitioning to 'done' by assertCompletableDoneWhen until a real predicate is set.
+   */
+  allowDeferredPredicate?: boolean
   externalSource?: string | null
 }
 
@@ -747,9 +752,10 @@ export function isDoneWhenValid(v: unknown): v is string {
 // done_when replaced with a real predicate before it can be marked done.
 //
 // Canonical sentinel set (matches Door 3 inbound call-site fallback values):
-//  - '(backfill required)'                     — DB migration column default
-//  - '(set via task update)'                   — IM / channel inbound path
-//  - '(agent-generated — set via task update)' — agent-do model-fallback
+//  - '(backfill required)'                          — DB migration column default
+//  - '(set via task update)'                        — IM / channel inbound path
+//  - '(agent-generated — set via task update)'      — agent-do / loop model-fallback
+//  - '(operator resolves — set via task update)'    — escalation emit fallback
 //
 // Matching is case-insensitive and whitespace-trimmed so minor typos in old rows
 // still hit the guard. New sentinels should be added here AND at the inbound call
@@ -758,6 +764,7 @@ const PLACEHOLDER_SENTINELS: ReadonlySet<string> = new Set([
   '(backfill required)',
   '(set via task update)',
   '(agent-generated — set via task update)',
+  '(operator resolves — set via task update)',
 ])
 
 /**
@@ -793,15 +800,80 @@ export function assertCompletableDoneWhen(doneWhen: string | null | undefined): 
   }
 }
 
+/**
+ * Point-of-Capture Evidence Discipline & Intake Governance (Mupot #1040).
+ * 
+ * Enforces verifiable intake contracts at task creation:
+ * 1. Non-empty, non-sentinel verifiable success predicate (`done_when`), unless explicitly allowed by caller option.
+ * 2. Minimum predicate length (min 5 chars).
+ * 3. Structural P0 priority discipline: requires substantive justification in body (min 20 chars).
+ */
+export interface TaskIntakePayload {
+  title: string
+  done_when: string
+  body?: string
+  priority?: TaskPriority | null
+  project_id?: string | null
+  parent_task_id?: string | null
+}
+
+export class TaskIntakeContractError extends Error {
+  constructor(readonly code: string, message: string) {
+    super(`${code}: ${message}`)
+    this.name = 'TaskIntakeContractError'
+  }
+}
+
+export function assertValidIntakeContract(
+  input: TaskIntakePayload,
+  options: { allowDeferredPredicate?: boolean } = {},
+): void {
+  if (!isDoneWhenValid(input.done_when)) {
+    throw new TaskIntakeContractError(
+      'done_when_required',
+      'task creation requires a non-empty verifiable success predicate (done_when)',
+    )
+  }
+
+  const trimmedDoneWhen = input.done_when.trim()
+  const isSentinel = isPlaceholderDoneWhen(trimmedDoneWhen)
+
+  if (isSentinel) {
+    if (!options.allowDeferredPredicate) {
+      throw new TaskIntakeContractError(
+        'done_when_placeholder_rejected',
+        `placeholder sentinel "${trimmedDoneWhen}" is not a verifiable success predicate — provide checkable completion criteria`,
+      )
+    }
+  } else {
+    // Non-sentinel predicates must satisfy minimum length to prevent trivial bypasses
+    if (trimmedDoneWhen.length < 5) {
+      throw new TaskIntakeContractError(
+        'done_when_insufficient',
+        'done_when predicate is too short to be verifiable — provide concrete verification instructions (min 5 chars)',
+      )
+    }
+  }
+
+  // P0 Priority Discipline: requires non-trivial justification in body explaining emergency/impact
+  if (input.priority === 'P0') {
+    const bodyText = (input.body ?? '').trim()
+    if (bodyText.length < 20) {
+      throw new TaskIntakeContractError(
+        'p0_justification_required',
+        'P0 priority requires a detailed explanation of impact/urgency in task body (minimum 20 characters)',
+      )
+    }
+  }
+}
+
 export async function createTask(
   env: Env,
   input: CreateTaskInput,
   options: CreateTaskOptions = {},
 ): Promise<Task> {
-  // Enforce done_when before touching the DB.
-  if (!isDoneWhenValid(input.done_when)) {
-    throw new Error('done_when_required: task creation requires a non-empty verifiable success predicate')
-  }
+  // Enforce Point-of-Capture Intake Contract before touching the DB.
+  assertValidIntakeContract(input, { allowDeferredPredicate: options.allowDeferredPredicate })
 
   const projectId = input.project_id ?? null
   await validateTaskProjectAttribution(env, projectId, input.squad_id)

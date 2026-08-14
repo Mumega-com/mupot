@@ -23,7 +23,7 @@ import { requireAuth } from '../auth'
 // task's SQUAD scope. The squad is data-derived (request body on POST, the loaded
 // row on PATCH), so we check inline rather than as static route middleware.
 import { resolveCapabilities, hasCapability, hasSurfaceCap, isOrgAdmin } from '../auth/capability'
-import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, TaskEvidenceFenceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution, assigneeSelfClose, assigneeCannotMutateOwnAssignment } from './service'
+import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, TaskEvidenceFenceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution, assigneeSelfClose, assigneeCannotMutateOwnAssignment, TaskIntakeContractError } from './service'
 import type { TaskStatus } from './service'
 import { resolveTaskAssignee } from './assignee'
 export { resolveTaskAssignee as resolveAssignee } from './assignee'
@@ -493,6 +493,9 @@ tasksApp.post('/', async (c) => {
       actor: auth.memberId ? { kind: 'member', id: auth.memberId } : undefined,
     })
   } catch (error) {
+    if (error instanceof TaskIntakeContractError) {
+      return c.json({ error: error.code, detail: error.message }, 400)
+    }
     if (!(error instanceof TaskProjectError)) throw error
     const mapped = taskProjectErrorResponse(error)
     return c.json(mapped.body, mapped.status)
