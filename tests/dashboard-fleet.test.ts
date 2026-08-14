@@ -11,7 +11,7 @@ import {
   wakeFleetAgent,
   requestFleetControl,
 } from '../src/dashboard/fleet'
-import type { AuthContext, Env } from '../src/types'
+import type { AuthContext, BusEvent, Env, MessageCreatedPayload } from '../src/types'
 
 const NOW = 1_780_000_000_000
 
@@ -275,7 +275,22 @@ describe('wakeFleetAgent / requestFleetControl — agent_messages path', () => {
     expect(messages).toHaveLength(1)
     expect(messages[0][2]).toBe('id-kasra') // to_agent
     expect(fetchMock).not.toHaveBeenCalled()
-    expect(queue).toHaveLength(1)
+    // mumega-com#970: wakeFleetAgent writes ONE agent_messages row (asserted above) via
+    // sendAgentMessage, which — on that real insert — emits its OWN message.created Queue
+    // event (src/agents/messages.ts). wakeFleetAgent then separately emits agent.wake. Two
+    // distinct events on ONE landed message is correct (not a double-write of the message
+    // itself: `messages` above still has length 1). A bare `toHaveLength(2)` would be as
+    // weak as the `toHaveLength(1)` this replaces — assert WHAT was emitted, not just how
+    // many, so a future regression that emits the wrong type/target here still fails loud.
+    expect(queue).toHaveLength(2)
+    const created = queue[0] as BusEvent<MessageCreatedPayload>
+    expect(created.type).toBe('message.created')
+    expect(created.tenant).toBe('mumega')
+    expect(created.payload.to_agent).toBe('id-kasra')
+    expect(created.payload.request_id).toMatch(/^fleet-wake:id-kasra:/)
+    const wake = queue[1] as BusEvent
+    expect(wake.type).toBe('agent.wake')
+    expect(wake.agent_id).toBe('id-kasra')
     vi.unstubAllGlobals()
   })
 
