@@ -183,6 +183,14 @@ export interface Env {
   TELEGRAM_CHAT_ID?: string
   HERMES_WEBHOOK_SECRET?: string
   TELEGRAM_BRIDGE_URL?: string
+  // Delivery target for the message.created push seam (mumega-com#970) — the bus
+  // consumer's outbound leg, distinct from TELEGRAM_BRIDGE_URL (a different route,
+  // different payload shape). Non-secret: a full URL, e.g.
+  // https://hermes-kay.mumega.com/webhooks/mupot-events. Set in wrangler.toml [vars].
+  // Signed with HERMES_WEBHOOK_SECRET (above) — same secret, two consumers of it.
+  // Absent (either this or the secret) ⇒ delivery is skipped, not attempted; see
+  // src/bus/hermes-delivery.ts for the not_configured contract.
+  HERMES_EVENTS_WEBHOOK_URL?: string
   IM_WEBHOOK_SECRET?: string // shared secret for the IM webhook (Telegram secret_token)
   HERMES_RELAY_SECRET?: string // shared secret for the Hermes → mupot channel relay
   FLEET_PANEL_SK?: string      // Ed25519 PRIVATE OKP JWK — signs fleet control-requests. `wrangler secret put FLEET_PANEL_SK`. Absent ⇒ /api/fleet/control 503 (fail-closed).
