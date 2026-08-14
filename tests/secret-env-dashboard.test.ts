@@ -9,7 +9,10 @@
 // src/dashboard/secret-env.ts (the render side of that contract).
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import type { D1PreparedStatement, D1Result } from '@cloudflare/workers-types'
 import type { AuthContext, Env } from '../src/types'
+import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 
 const authState = vi.hoisted(() => ({ current: null as AuthContext | null }))
 
@@ -31,19 +34,42 @@ vi.mock('../src/auth', () => ({
 const { dashboardApp } = await import('../src/dashboard')
 const { requestSecretEnv, listPendingSecretEnvRequests } = await import('../src/secret-env/service')
 
-// ── minimal D1 mock — secret_env_* tables only, patterned on the identical
-// harness in tests/secret-env-service.test.ts so requestSecretEnv / bindSecretEnv
-// / rejectSecretEnv behave exactly as their unit tests already prove. Any other
-// query (loadApprovals/loadPublishable's task/squad/agent reads) falls back to
-// empty results — those code paths are covered elsewhere. ────────────────────
+// ── real D1, real schema — the WHOLE committed migration chain via
+// applyAllMigrations (the #684 ratchet — scripts/check-test-schema-source.mjs).
+// The first draft of this file hand-rolled a D1-shaped object literal keyed
+// off secret_env_* SQL substrings; any other query (loadApprovals/
+// loadPublishable's task/squad/agent reads) fell back to `{ results: [] }`
+// blind — a real, empty schema produces exactly that same shape honestly,
+// so nothing here needs a fallback branch at all. ───────────────────────────
 
-interface CallRecord { sql: string; binds: unknown[] }
+interface CallRecord { sql: string }
 
-function makeEnv(tenant = 'test-tenant'): { env: Env; calls: CallRecord[] } {
+/**
+ * Wraps the real D1 handle to COUNT prepare() calls without faking anything —
+ * every prepare/bind/run/first/all is the genuine SqliteD1Statement, this only
+ * observes how many statements were prepared. Used for the one assertion that
+ * needs it: proving the 403 gate short-circuits before ANY query is issued,
+ * not merely before a write. Pattern matches the existing `withPreBatchHook`
+ * wrapper in tests/addon-bindings.test.ts.
+ */
+function countingDb(realDb: Env['DB']): { db: Env['DB']; calls: CallRecord[] } {
   const calls: CallRecord[] = []
-  const requests = new Map<string, Record<string, unknown>>()
-  const bindings = new Map<string, Record<string, unknown>>()
-  const audit: Record<string, unknown>[] = []
+  const db = {
+    prepare(sql: string) {
+      calls.push({ sql })
+      return realDb.prepare(sql)
+    },
+    batch<T = unknown>(statements: D1PreparedStatement[]): Promise<D1Result<T>[]> {
+      return realDb.batch<T>(statements)
+    },
+  } as unknown as Env['DB']
+  return { db, calls }
+}
+
+function makeEnv(tenant = 'test-tenant'): { env: Env; harness: SqliteD1Harness; calls: CallRecord[] } {
+  const harness = createSqliteD1()
+  applyAllMigrations(harness.sqlite)
+  const { db, calls } = countingDb(harness.db)
 
   const envBase: Record<string, unknown> = {
     TENANT_SLUG: tenant,
@@ -52,126 +78,10 @@ function makeEnv(tenant = 'test-tenant'): { env: Env; calls: CallRecord[] } {
     SECRET_ENV_CF_SCRIPT_NAME: 'mupot-t',
     SECRET_ENV_CF_API_TOKEN: 'ops-tok',
     SESSIONS: { get: vi.fn(), put: vi.fn() },
+    DB: db,
   }
 
-  envBase.DB = {
-    prepare(sql: string) {
-      const call: CallRecord = { sql, binds: [] }
-      calls.push(call)
-      const sNorm = sql.replace(/\s+/g, ' ').trim().toUpperCase()
-      const stmt = {
-        bind(...args: unknown[]) { call.binds = args; return stmt },
-        async run() {
-          if (sNorm.startsWith('INSERT INTO SECRET_ENV_REQUESTS')) {
-            const [id, ten, reason, schemaJson, requestedBy, createdAt] = call.binds
-            requests.set(id as string, {
-              id, tenant: ten, reason, schema_json: schemaJson, status: 'pending',
-              requested_by: requestedBy, decided_by: null, created_at: createdAt, decided_at: null,
-            })
-            return { meta: { changes: 1 } }
-          }
-          if (sNorm.startsWith('UPDATE SECRET_ENV_REQUESTS') && sNorm.includes("STATUS = 'APPROVED'")) {
-            const [actorId, decidedAt, requestId, ten] = call.binds
-            const row = requests.get(requestId as string)
-            if (row && row.tenant === ten) {
-              row.status = 'approved'; row.decided_by = actorId; row.decided_at = decidedAt
-              return { meta: { changes: 1 } }
-            }
-            return { meta: { changes: 0 } }
-          }
-          if (sNorm.startsWith('UPDATE SECRET_ENV_REQUESTS') && sNorm.includes("STATUS = 'REJECTED'")) {
-            const [actorId, decidedAt, requestId, ten] = call.binds
-            const row = requests.get(requestId as string)
-            if (row && row.tenant === ten) {
-              row.status = 'rejected'; row.decided_by = actorId; row.decided_at = decidedAt
-              return { meta: { changes: 1 } }
-            }
-            return { meta: { changes: 0 } }
-          }
-          if (sNorm.startsWith('INSERT INTO SECRET_ENV_BINDINGS')) {
-            const [id, ten, bindingName, purpose, adapterHint, requestedBy, requestId, createdAt] = call.binds
-            bindings.set(id as string, {
-              id, tenant: ten, binding_name: bindingName, purpose, adapter_hint: adapterHint,
-              status: 'pending', requested_by: requestedBy, bound_by: null, request_id: requestId,
-              created_at: createdAt, bound_at: null, revoked_at: null,
-            })
-            return { meta: { changes: 1 } }
-          }
-          if (sNorm.startsWith('UPDATE SECRET_ENV_BINDINGS') && sNorm.includes("STATUS = 'BOUND'")) {
-            const [actorId, boundAt, bindingId, ten] = call.binds
-            const row = bindings.get(bindingId as string)
-            if (row && row.tenant === ten) {
-              row.status = 'bound'; row.bound_by = actorId; row.bound_at = boundAt
-              return { meta: { changes: 1 } }
-            }
-            return { meta: { changes: 0 } }
-          }
-          if (sNorm.startsWith('UPDATE SECRET_ENV_BINDINGS') && sNorm.includes("STATUS = 'REVOKED'")) {
-            const [revokedAt, ten, requestId] = call.binds
-            let changes = 0
-            for (const row of bindings.values()) {
-              if (row.tenant === ten && row.request_id === requestId && row.status === 'pending') {
-                row.status = 'revoked'; row.revoked_at = revokedAt
-                changes += 1
-              }
-            }
-            return { meta: { changes } }
-          }
-          // Revoked-binding reuse path in requestSecretEnv: re-pending an existing row.
-          if (sNorm.startsWith('UPDATE SECRET_ENV_BINDINGS') && sNorm.includes("STATUS = 'PENDING'")) {
-            const [purpose, adapterHint, requestedBy, requestId, createdAt, bindingId, ten] = call.binds
-            const row = bindings.get(bindingId as string)
-            if (row && row.tenant === ten) {
-              row.purpose = purpose; row.adapter_hint = adapterHint; row.status = 'pending'
-              row.requested_by = requestedBy; row.bound_by = null; row.request_id = requestId
-              row.created_at = createdAt; row.bound_at = null; row.revoked_at = null
-              return { meta: { changes: 1 } }
-            }
-            return { meta: { changes: 0 } }
-          }
-          if (sNorm.startsWith('INSERT INTO SECRET_ENV_AUDIT')) {
-            const [id, ten, requestId, bindingName, action, actorId, detail, recordedAt] = call.binds
-            audit.push({ id, tenant: ten, request_id: requestId, binding_name: bindingName, action, actor_id: actorId, detail, recorded_at: recordedAt })
-            return { meta: { changes: 1 } }
-          }
-          return { meta: { changes: 1 } }
-        },
-        async first<T>(): Promise<T | null> {
-          if (sNorm.includes('FROM SECRET_ENV_REQUESTS') && sNorm.includes('LIMIT 1')) {
-            const [requestId, ten] = call.binds
-            const row = requests.get(requestId as string)
-            if (row && row.tenant === ten) return row as unknown as T
-            return null
-          }
-          return null
-        },
-        async all<T>(): Promise<{ results: T[] }> {
-          if (sNorm.startsWith('SELECT ID, BINDING_NAME, STATUS FROM SECRET_ENV_BINDINGS')) {
-            const [ten, ...names] = call.binds as [string, ...string[]]
-            const rows = [...bindings.values()].filter((r) => r.tenant === ten && names.includes(r.binding_name as string))
-            return { results: rows.map((r) => ({ id: r.id, binding_name: r.binding_name, status: r.status })) as unknown as T[] }
-          }
-          if (sNorm.includes('FROM SECRET_ENV_REQUESTS') && sNorm.includes("STATUS = 'PENDING'")) {
-            const [ten] = call.binds
-            return { results: [...requests.values()].filter((r) => r.tenant === ten && r.status === 'pending') as unknown as T[] }
-          }
-          if (sNorm.includes('FROM SECRET_ENV_BINDINGS') && sNorm.includes('REQUEST_ID') && sNorm.includes("STATUS = 'PENDING'")) {
-            const [ten, requestId] = call.binds
-            return { results: [...bindings.values()].filter((r) => r.tenant === ten && r.request_id === requestId && r.status === 'pending') as unknown as T[] }
-          }
-          return { results: [] }
-        },
-      }
-      return stmt
-    },
-    async batch(stmts: { run: () => Promise<unknown> }[]) {
-      const results: unknown[] = []
-      for (const stmt of stmts) results.push(await stmt.run())
-      return results
-    },
-  }
-
-  return { env: envBase as unknown as Env, calls }
+  return { env: envBase as unknown as Env, harness, calls }
 }
 
 function auth(role: AuthContext['role'], over: Partial<AuthContext> = {}): AuthContext {
@@ -225,7 +135,7 @@ describe('POST /admin/secret-env/:requestId/bind', () => {
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({ success: true }), { status: 200 }))
     vi.stubGlobal('fetch', fetchMock)
 
-    const plaintext = 'sk-super-secret-plaintext-XYZ-123'
+    const plaintext = 'CANARY-plaintext-must-never-appear-XYZ-123'
     const res = await dashboardApp.fetch(
       formRequest(`/admin/secret-env/${created.request.id}/bind`, { secret__NOTION_API_KEY: plaintext }),
       env,

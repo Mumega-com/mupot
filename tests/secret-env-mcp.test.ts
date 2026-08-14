@@ -2,23 +2,18 @@
 // Custody discipline: neither tool ever returns a secret VALUE. request returns
 // only names + a request id; status returns only the state enum per name.
 
-import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import type { AuthContext, Env } from '../src/types'
 import { TOOLS, invokeTool } from '../src/mcp/index'
 import { createSqliteD1 } from './helpers/sqlite-d1'
-
-const migrations = [
-  '../migrations/0001_init.sql',
-  '../migrations/0100_secret_env.sql',
-].map((path) => readFileSync(new URL(path, import.meta.url), 'utf8'))
+import { applyAllMigrations } from './helpers/migrations'
 
 const TENANT = 'tenant-a'
 const ORIGIN = 'https://pot.test'
 
 function makeDb() {
   const harness = createSqliteD1()
-  for (const migration of migrations) harness.sqlite.exec(migration)
+  applyAllMigrations(harness.sqlite)
   return {
     env: { DB: harness.db, TENANT_SLUG: TENANT } as Env,
     bindingRow: (name: string) => harness.sqlite

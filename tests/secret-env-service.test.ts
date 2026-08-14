@@ -3,6 +3,13 @@
 // Custody invariant under test throughout: third-party secret VALUES must never
 // appear in any D1 SQL bind argument or audit `detail` string. Only binding
 // NAMES, purposes, reasons, and actor ids may touch D1.
+//
+// Real SQLite, and the schema is the WHOLE committed migration chain via
+// applyAllMigrations (the #684 ratchet — scripts/check-test-schema-source.mjs).
+// The first draft of this file hand-rolled a D1-shaped object literal that
+// string-matched SQL and answered whatever the test expected — it never
+// executed a query, so a bind naming a column that does not exist could not
+// be contradicted. Real SQLite catches that.
 
 import { describe, it, expect } from 'vitest'
 import {
@@ -14,168 +21,42 @@ import {
   resolveSecretEnvBinding,
 } from '../src/secret-env/service'
 import type { Env } from '../src/types'
+import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 
-// ── DB mock ───────────────────────────────────────────────────────────────────
+// ── DB harness ────────────────────────────────────────────────────────────
 
-interface CallRecord { sql: string; binds: unknown[] }
-
-/** Minimal in-memory store for secret_env_requests / bindings / audit, patterned
- * on tests/connectors.test.ts. SQL matching is by distinctive substrings that
- * correspond 1:1 to the literal SQL written in src/secret-env/service.ts. */
 function makeEnv(opts: {
   tenant?: string
   cfConfigured?: boolean
-} = {}): {
-  env: Env
-  calls: CallRecord[]
-  requests: Map<string, Record<string, unknown>>
-  bindings: Map<string, Record<string, unknown>>
-  audit: Record<string, unknown>[]
-} {
+} = {}): { env: Env; harness: SqliteD1Harness } {
   const tenant = opts.tenant ?? 'test-tenant'
   const cfConfigured = opts.cfConfigured ?? true
-  const calls: CallRecord[] = []
 
-  const requests = new Map<string, Record<string, unknown>>()
-  const bindings = new Map<string, Record<string, unknown>>()
-  const audit: Record<string, unknown>[] = []
+  const harness = createSqliteD1()
+  applyAllMigrations(harness.sqlite)
 
-  const envBase: Record<string, unknown> = { TENANT_SLUG: tenant }
+  const envBase: Record<string, unknown> = { TENANT_SLUG: tenant, DB: harness.db }
   if (cfConfigured) {
     envBase.SECRET_ENV_CF_ACCOUNT_ID = 'acct'
     envBase.SECRET_ENV_CF_SCRIPT_NAME = 'mupot-t'
     envBase.SECRET_ENV_CF_API_TOKEN = 'ops-tok'
   }
 
-  envBase.DB = {
-    prepare(sql: string) {
-      const call: CallRecord = { sql, binds: [] }
-      calls.push(call)
-      const sNorm = sql.replace(/\s+/g, ' ').trim().toUpperCase()
-      const stmt = {
-        bind(...args: unknown[]) { call.binds = args; return stmt },
-        async run() {
-          if (sNorm.startsWith('INSERT INTO SECRET_ENV_REQUESTS')) {
-            const [id, ten, reason, schemaJson, requestedBy, createdAt] = call.binds
-            requests.set(id as string, {
-              id, tenant: ten, reason, schema_json: schemaJson, status: 'pending',
-              requested_by: requestedBy, decided_by: null, created_at: createdAt, decided_at: null,
-            })
-            return { meta: { changes: 1 } }
-          }
-          if (sNorm.startsWith('UPDATE SECRET_ENV_REQUESTS') && sNorm.includes("STATUS = 'APPROVED'")) {
-            const [actorId, decidedAt, requestId, ten] = call.binds
-            const row = requests.get(requestId as string)
-            if (row && row.tenant === ten) {
-              row.status = 'approved'; row.decided_by = actorId; row.decided_at = decidedAt
-              return { meta: { changes: 1 } }
-            }
-            return { meta: { changes: 0 } }
-          }
-          if (sNorm.startsWith('UPDATE SECRET_ENV_REQUESTS') && sNorm.includes("STATUS = 'REJECTED'")) {
-            const [actorId, decidedAt, requestId, ten] = call.binds
-            const row = requests.get(requestId as string)
-            if (row && row.tenant === ten) {
-              row.status = 'rejected'; row.decided_by = actorId; row.decided_at = decidedAt
-              return { meta: { changes: 1 } }
-            }
-            return { meta: { changes: 0 } }
-          }
-          if (sNorm.startsWith('INSERT INTO SECRET_ENV_BINDINGS')) {
-            const [id, ten, bindingName, purpose, adapterHint, requestedBy, requestId, createdAt] = call.binds
-            bindings.set(id as string, {
-              id, tenant: ten, binding_name: bindingName, purpose, adapter_hint: adapterHint,
-              status: 'pending', requested_by: requestedBy, bound_by: null, request_id: requestId,
-              created_at: createdAt, bound_at: null, revoked_at: null,
-            })
-            return { meta: { changes: 1 } }
-          }
-          if (sNorm.startsWith('UPDATE SECRET_ENV_BINDINGS') && sNorm.includes("STATUS = 'BOUND'")) {
-            const [actorId, boundAt, bindingId, ten] = call.binds
-            const row = bindings.get(bindingId as string)
-            if (row && row.tenant === ten) {
-              row.status = 'bound'; row.bound_by = actorId; row.bound_at = boundAt
-              return { meta: { changes: 1 } }
-            }
-            return { meta: { changes: 0 } }
-          }
-          if (sNorm.startsWith('UPDATE SECRET_ENV_BINDINGS') && sNorm.includes("STATUS = 'REVOKED'")) {
-            const [revokedAt, ten, requestId] = call.binds
-            let changes = 0
-            for (const row of bindings.values()) {
-              if (row.tenant === ten && row.request_id === requestId && row.status === 'pending') {
-                row.status = 'revoked'; row.revoked_at = revokedAt
-                changes += 1
-              }
-            }
-            return { meta: { changes } }
-          }
-          // Revoked-binding reuse path in requestSecretEnv: re-pending an existing row.
-          if (sNorm.startsWith('UPDATE SECRET_ENV_BINDINGS') && sNorm.includes("STATUS = 'PENDING'")) {
-            const [purpose, adapterHint, requestedBy, requestId, createdAt, bindingId, ten] = call.binds
-            const row = bindings.get(bindingId as string)
-            if (row && row.tenant === ten) {
-              row.purpose = purpose; row.adapter_hint = adapterHint; row.status = 'pending'
-              row.requested_by = requestedBy; row.bound_by = null; row.request_id = requestId
-              row.created_at = createdAt; row.bound_at = null; row.revoked_at = null
-              return { meta: { changes: 1 } }
-            }
-            return { meta: { changes: 0 } }
-          }
-          if (sNorm.startsWith('INSERT INTO SECRET_ENV_AUDIT')) {
-            const [id, ten, requestId, bindingName, action, actorId, detail, recordedAt] = call.binds
-            audit.push({ id, tenant: ten, request_id: requestId, binding_name: bindingName, action, actor_id: actorId, detail, recorded_at: recordedAt })
-            return { meta: { changes: 1 } }
-          }
-          return { meta: { changes: 1 } }
-        },
-        async first<T>(): Promise<T | null> {
-          if (sNorm.includes('SELECT STATUS FROM SECRET_ENV_BINDINGS')) {
-            const [ten, bindingName] = call.binds
-            for (const row of bindings.values()) {
-              if (row.tenant === ten && row.binding_name === bindingName) {
-                return { status: row.status } as unknown as T
-              }
-            }
-            return null
-          }
-          if (sNorm.includes('FROM SECRET_ENV_REQUESTS') && sNorm.includes('LIMIT 1')) {
-            const [requestId, ten] = call.binds
-            const row = requests.get(requestId as string)
-            if (row && row.tenant === ten) return row as unknown as T
-            return null
-          }
-          return null
-        },
-        async all<T>(): Promise<{ results: T[] }> {
-          if (sNorm.startsWith('SELECT ID, BINDING_NAME, STATUS FROM SECRET_ENV_BINDINGS')) {
-            const [ten, ...names] = call.binds as [string, ...string[]]
-            const rows = [...bindings.values()].filter((r) => r.tenant === ten && names.includes(r.binding_name as string))
-            return { results: rows.map((r) => ({ id: r.id, binding_name: r.binding_name, status: r.status })) as unknown as T[] }
-          }
-          if (sNorm.includes('FROM SECRET_ENV_REQUESTS') && sNorm.includes("STATUS = 'PENDING'")) {
-            const [ten] = call.binds
-            const rows = [...requests.values()].filter((r) => r.tenant === ten && r.status === 'pending')
-            return { results: rows as unknown as T[] }
-          }
-          if (sNorm.includes('FROM SECRET_ENV_BINDINGS') && sNorm.includes('REQUEST_ID') && sNorm.includes("STATUS = 'PENDING'")) {
-            const [ten, requestId] = call.binds
-            const rows = [...bindings.values()].filter((r) => r.tenant === ten && r.request_id === requestId && r.status === 'pending')
-            return { results: rows as unknown as T[] }
-          }
-          return { results: [] }
-        },
-      }
-      return stmt
-    },
-    async batch(stmts: { run: () => Promise<unknown> }[]) {
-      const results: unknown[] = []
-      for (const stmt of stmts) results.push(await stmt.run())
-      return results
-    },
-  }
+  return { env: envBase as unknown as Env, harness }
+}
 
-  return { env: envBase as unknown as Env, calls, requests, bindings, audit }
+// Direct real-row reads — the substrate-real replacement for the old mock's
+// in-memory Maps. These read the ACTUAL committed state, not an author's
+// belief about what an INSERT would have produced.
+function requestRows(harness: SqliteD1Harness): Record<string, unknown>[] {
+  return harness.sqlite.prepare('SELECT * FROM secret_env_requests').all()
+}
+function bindingRows(harness: SqliteD1Harness): Record<string, unknown>[] {
+  return harness.sqlite.prepare('SELECT * FROM secret_env_bindings').all()
+}
+function auditRows(harness: SqliteD1Harness): Record<string, unknown>[] {
+  return harness.sqlite.prepare('SELECT * FROM secret_env_audit').all()
 }
 
 const validKeys = [
@@ -186,7 +67,7 @@ const validKeys = [
 
 describe('requestSecretEnv', () => {
   it('inserts request + pending bindings + request audit', async () => {
-    const { env, requests, bindings, audit } = makeEnv()
+    const { env, harness } = makeEnv()
     const result = await requestSecretEnv(env, {
       keys: validKeys,
       reason: 'Need Notion access for the docs adapter',
@@ -199,12 +80,13 @@ describe('requestSecretEnv', () => {
     expect(result.request.keys).toEqual(validKeys)
     expect(result.request.adapter_hint).toBe('mcp:notion')
 
-    expect(requests.size).toBe(1)
-    expect(bindings.size).toBe(1)
-    const bindingRow = [...bindings.values()][0]!
-    expect(bindingRow.binding_name).toBe('NOTION_API_KEY')
-    expect(bindingRow.status).toBe('pending')
+    expect(requestRows(harness).length).toBe(1)
+    const bindings = bindingRows(harness)
+    expect(bindings.length).toBe(1)
+    expect(bindings[0]!.binding_name).toBe('NOTION_API_KEY')
+    expect(bindings[0]!.status).toBe('pending')
 
+    const audit = auditRows(harness)
     expect(audit.length).toBe(1)
     expect(audit[0]!.action).toBe('request')
     expect(String(audit[0]!.detail)).toContain('NOTION_API_KEY')
@@ -292,7 +174,7 @@ describe('requestSecretEnv', () => {
   })
 
   it('rejects re-requesting a name that is already pending, with binding_name_conflict', async () => {
-    const { env, bindings } = makeEnv()
+    const { env, harness } = makeEnv()
     const first = await requestSecretEnv(env, {
       keys: validKeys, reason: 'r1', adapterHint: null, requestedBy: 'agent-1',
     })
@@ -305,7 +187,7 @@ describe('requestSecretEnv', () => {
     if (second.ok) throw new Error()
     expect(second.error).toBe('binding_name_conflict')
     // No partial write from the rejected second request.
-    expect(bindings.size).toBe(1)
+    expect(bindingRows(harness).length).toBe(1)
   })
 
   it('rejects re-requesting a name that is already bound, with binding_name_conflict', async () => {
@@ -346,7 +228,7 @@ describe('requestSecretEnv', () => {
   })
 
   it('allows re-requesting a name that was revoked (reuses the row, back to pending)', async () => {
-    const { env, bindings } = makeEnv()
+    const { env, harness } = makeEnv()
     const first = await requestSecretEnv(env, {
       keys: validKeys, reason: 'r1', adapterHint: null, requestedBy: 'agent-1',
     })
@@ -363,8 +245,9 @@ describe('requestSecretEnv', () => {
     if (!second.ok) throw new Error()
 
     // Reused in place — still exactly one binding row for the name, not two.
-    expect(bindings.size).toBe(1)
-    const row = [...bindings.values()][0]!
+    const bindings = bindingRows(harness)
+    expect(bindings.length).toBe(1)
+    const row = bindings[0]!
     expect(row.status).toBe('pending')
     expect(row.purpose).toBe('reused purpose')
     expect(row.request_id).toBe(second.request.id)
@@ -438,14 +321,14 @@ describe('getSecretEnvStatus + bindSecretEnv', () => {
     expect(fetchCalled).toBe(false)
   })
 
-  it('(custody) no D1 bind argument or audit detail ever contains the pasted plaintext', async () => {
-    const { env, calls, audit } = makeEnv()
+  it('(custody) no D1 row or audit entry ever contains the pasted plaintext', async () => {
+    const { env, harness } = makeEnv()
     const req = await requestSecretEnv(env, {
       keys: validKeys, reason: 'r', adapterHint: null, requestedBy: 'agent-1',
     })
     if (!req.ok) throw new Error()
 
-    const plaintext = 'sk-super-secret-plaintext-XYZ-123'
+    const plaintext = 'CANARY-plaintext-must-never-appear-XYZ-123'
     const fetchImpl = (async () => new Response(JSON.stringify({ success: true }), { status: 200 })) as unknown as typeof fetch
     const bind = await bindSecretEnv(env, {
       requestId: req.request.id,
@@ -455,13 +338,19 @@ describe('getSecretEnvStatus + bindSecretEnv', () => {
     })
     expect(bind.ok).toBe(true)
 
-    for (const call of calls) {
-      for (const arg of call.binds) {
-        expect(String(arg)).not.toContain(plaintext)
+    // Real engine, real persisted state: dump EVERY row of EVERY secret_env_*
+    // table and prove the pasted plaintext is not sitting in any column. This
+    // is the substrate-real replacement for the old mock's per-call
+    // bind-argument check — bindSecretEnv never puts the value into a D1 bind
+    // at all (it only ever reaches putScriptSecrets/fetchImpl), so asserting
+    // against the actual committed rows is the stronger, faithful proof of
+    // the same custody claim: the paste never reaches storage.
+    for (const rows of [requestRows(harness), bindingRows(harness), auditRows(harness)]) {
+      for (const row of rows) {
+        for (const value of Object.values(row)) {
+          expect(String(value)).not.toContain(plaintext)
+        }
       }
-    }
-    for (const entry of audit) {
-      expect(String(entry.detail)).not.toContain(plaintext)
     }
   })
 
