@@ -61,7 +61,17 @@ describe('workflow-circuits MCP tools — registry', () => {
       define_circuit: 'admin',
       advance_node: 'member',
       get_circuit_state: 'member',
-      approve_gate_edge: 'member',
+      // #1016: was 'member'. approve_gate_edge IS the verdict signal for a gate
+      // edge — the one condition a circuit cannot satisfy on its own — and it
+      // performed no authorization at all, so any authenticated member could
+      // satisfy any gate in any circuit. Now org:admin.
+      //
+      // Narrower than binding to a per-gate `gate:<owner>` capability, and
+      // deliberately so: migration 0075 gives edges, nodes and circuits NO
+      // gate_owner column, so there is no ownership to bind to yet. Failing
+      // closed at admin is strictly safer than any-member and consistent with
+      // grant_gate_capability; per-gate-owner binding is filed separately.
+      approve_gate_edge: 'admin',
     }
     for (const [name, min] of Object.entries(expected)) {
       const spec = TOOLS.find((t) => t.name === name)

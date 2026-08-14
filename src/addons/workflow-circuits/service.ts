@@ -338,6 +338,37 @@ export async function approveGateEdge(
   circuitId: string,
   edgeId: string,
 ): Promise<ApproveGateEdgeResult> {
+  // AUTHORITY CHECK — the gate lives HERE, in the service, not in the caller.
+  //
+  // #1016: this function previously performed NO authorization at all. Any
+  // authenticated member could approve ANY gate edge in ANY circuit, while the
+  // workflow schema and the lumen spec both assert that gate edges require a
+  // registered gate-owner principal. A gate every principal can satisfy is a
+  // label on an unguarded path, and it reads as enforcement to everything
+  // downstream that trusts the schema's claim.
+  //
+  // It is checked in the SERVICE deliberately, following this addon's own stated
+  // principle (see the module header on advance_node): the service function IS
+  // the gate, so a second caller cannot appear later and skip it. The MCP tool
+  // now passes the caller's REAL role rather than a hardcoded 'member', which is
+  // what made this check impossible to write before.
+  //
+  // WHY org:admin AND NOT per-gate-owner — a deliberate, narrower fix than the
+  // one first proposed. There is no ownership model to bind to: neither
+  // workflow_circuit_edges, workflow_circuit_nodes, nor workflow_circuits carries
+  // a gate_owner column (migration 0075). Binding to `gate:<owner>` via
+  // callerHoldsGateCapability — the canonical predicate used by task verdicts —
+  // requires first DECIDING and PERSISTING who owns a given gate, which is a
+  // schema change and a design decision, not a security patch.
+  //
+  // Inventing that ownership model inline, on an authority surface, and baking it
+  // into a migration is how a wrong model becomes permanent. So this fails closed
+  // now at org:admin — strictly safer than any-member, consistent with
+  // grant_gate_capability which already requires org:admin — and per-gate-owner
+  // binding is filed as its own change. Loosening later is easy; a wrong
+  // ownership model in an applied migration is not.
+  if (!admin(actor)) return { ok: false, reason: 'not_authorized' }
+
   if (!(await workflowCircuitsAddonActive(env))) return { ok: false, reason: 'addon_inactive' }
   const circuit = await loadCircuitRow(env, circuitId)
   if (!circuit) return { ok: false, reason: 'circuit_not_found' }

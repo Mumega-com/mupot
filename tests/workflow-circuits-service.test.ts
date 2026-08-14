@@ -282,11 +282,55 @@ describe('advanceNode — gate edge requires explicit approval, not source compl
     const edge = state?.edges.find((e) => e.type === 'gate')
     expect(edge).toBeDefined()
 
-    const approved = await approveGateEdge(env, { id: 'approver-1', role: 'member' }, circuitId, edge!.id)
+    // #1016: approval is an ADMIN act. This previously passed `role: 'member'`
+    // and succeeded, which is the defect — any authenticated member could satisfy
+    // any gate edge in any circuit.
+    const approved = await approveGateEdge(env, ADMIN, circuitId, edge!.id)
     expect(approved.ok).toBe(true)
 
     const opened = await advanceNode(env, AGENT, circuitId, 'publish', 'active')
     expect(opened.ok).toBe(true)
+  })
+
+  it('#1016: a plain member CANNOT approve a gate edge', async () => {
+    // THE REGRESSION TEST. The gate edge is the verdict signal — the one thing a
+    // circuit cannot satisfy on its own. Before this, approveGateEdge performed no
+    // authorization whatsoever: addon-active, circuit exists, edge is type 'gate',
+    // and the caller's id went straight into approved_by.
+    //
+    // Checked in the SERVICE, not the tool, so a future second caller cannot skip
+    // it — this addon's own principle is that the service function IS the gate.
+    const circuitId = await defineGateCircuit('gate-member-refused')
+    const state = await getCircuitState(env, circuitId)
+    const edge = state?.edges.find((e) => e.type === 'gate')
+    expect(edge).toBeDefined()
+
+    const refused = await approveGateEdge(env, AGENT, circuitId, edge!.id)
+    expect(refused.ok).toBe(false)
+    if (refused.ok) throw new Error('unreachable')
+    expect(refused.reason).toBe('not_authorized')
+
+    // And the refusal is REAL — nothing was written.
+    const after = await getCircuitState(env, circuitId)
+    const sameEdge = after?.edges.find((e) => e.id === edge!.id)
+    expect(sameEdge?.approved_by).toBeFalsy()
+    expect(sameEdge?.approved_at).toBeFalsy()
+  })
+
+  it('#1016: the gate edge stays unsatisfied after a refused approval', async () => {
+    // The consequence that matters. A refusal that still lets the circuit advance
+    // would be theatre — the point of the gate is that the downstream node cannot
+    // open without it.
+    const circuitId = await defineGateCircuit('gate-refused-stays-shut')
+    const state = await getCircuitState(env, circuitId)
+    const edge = state?.edges.find((e) => e.type === 'gate')
+
+    await advanceNode(env, AGENT, circuitId, 'draft', 'active')
+    await advanceNode(env, AGENT, circuitId, 'draft', 'done')
+    await approveGateEdge(env, AGENT, circuitId, edge!.id)   // refused
+
+    const blocked = await advanceNode(env, AGENT, circuitId, 'publish', 'active')
+    expect(blocked.ok).toBe(false)
   })
 })
 

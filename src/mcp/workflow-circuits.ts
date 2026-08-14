@@ -28,16 +28,28 @@ import {
   type WorkflowCircuitActor,
 } from '../addons/workflow-circuits/service'
 import '../addons/workflow-circuits/manifest'
+import type { AuthContext } from '../types'
 import { type ToolSpec, fail, done, str, hasWorkspaceAdmin } from './index'
 
 const STRING_SCHEMA = { type: 'string' }
 
-function memberActor(auth: { memberId?: string }): WorkflowCircuitActor {
-  // 'member' is the coarse role literal — advanceNode/approveGateEdge/
-  // getCircuitState never branch on role, only on addon-active + the graph
-  // itself, so this never claims a rank beyond what the caller proved
-  // (an authenticated member identity).
-  return { id: auth.memberId as string, role: 'member' }
+function memberActor(auth: AuthContext): WorkflowCircuitActor {
+  // Carries the caller's REAL rank, not a hardcoded literal.
+  //
+  // This previously always returned role:'member', justified by "advanceNode/
+  // approveGateEdge/getCircuitState never branch on role". That was true when
+  // written and became false: approveGateEdge now IS an authority check (#1016),
+  // and a hardcoded rank would have made it unwritable — a genuine org admin
+  // would arrive indistinguishable from any member.
+  //
+  // advanceNode and getCircuitState still do not branch on role, so nothing about
+  // their behaviour changes; this simply stops the actor from misreporting who it
+  // is. Rank is derived from hasWorkspaceAdmin — the same predicate define_circuit
+  // and grant_gate_capability use — rather than a second copy of the admin rule.
+  return {
+    id: auth.memberId as string,
+    role: hasWorkspaceAdmin(auth) ? 'admin' : 'member',
+  }
 }
 
 function circuitFailureStatus(reason: string): 400 | 403 | 404 | 409 {
@@ -177,8 +189,8 @@ const toolGetCircuitState: ToolSpec = {
 
 const toolApproveGateEdge: ToolSpec = {
   name: 'approve_gate_edge',
-  scope: 'org (any authenticated member/agent records the explicit approval a gate edge requires)',
-  min: 'member',
+  scope: 'org:admin (records the explicit approval a gate edge requires — SENSITIVE: this IS the verdict signal)',
+  min: 'admin',
   args: '{ circuit_id: string, edge_id: string }',
   inputSchema: {
     type: 'object',
