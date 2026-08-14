@@ -293,7 +293,7 @@ export async function runTaskExecution(
           `done_when_placeholder: cannot mark done — done_when is a placeholder sentinel ("${String(task.done_when).trim()}"). ` +
           'Update done_when to a real, checkable predicate before retrying.',
         )
-        if (!(await finishTask(env, task.id, agent.id, executionReceiptId, 'blocked', note, finishedAt, cycleCostMicroUsd))) {
+        if (!(await finishTask(env, task.id, agent.id, executionReceiptId, 'blocked', note, finishedAt, recordedCostMicroUsd))) {
           return { ok: false, task_id: task.id, decided: '', error: 'task_claim_lost' }
         }
         await emitSafe(emit, executionEvent('task.blocked', env, agent, task, 'blocked'))
@@ -306,7 +306,7 @@ export async function runTaskExecution(
         }
       }
     }
-    if (!(await finishTask(env, task.id, agent.id, executionReceiptId, successStatus, result, finishedAt, cycleCostMicroUsd, AGENT_SELF_COMPLETION_GATE_OWNER))) {
+    if (!(await finishTask(env, task.id, agent.id, executionReceiptId, successStatus, result, finishedAt, recordedCostMicroUsd, AGENT_SELF_COMPLETION_GATE_OWNER))) {
       await recordTokensSafe(meter.recordTokens, env, agent.id, EXECUTE_MAX_TOKENS, recordedCostMicroUsd, {
       input: chatUsage?.input,
       output: chatUsage?.output,
@@ -335,7 +335,7 @@ export async function runTaskExecution(
     const note = capResult(`Execution failed: ${msg}`)
     const finishedAt = new Date().toISOString()
     // NEVER leave in_progress stuck — land it in blocked with the error note.
-    if (!(await finishTask(env, task.id, agent.id, executionReceiptId, 'blocked', note, finishedAt, cycleCostMicroUsd))) {
+    if (!(await finishTask(env, task.id, agent.id, executionReceiptId, 'blocked', note, finishedAt, recordedCostMicroUsd))) {
       await recordTokensSafe(meter.recordTokens, env, agent.id, EXECUTE_MAX_TOKENS, recordedCostMicroUsd, {
       input: chatUsage?.input,
       output: chatUsage?.output,
