@@ -120,13 +120,37 @@ describe('migration 0099 — member_tokens lifecycle', () => {
   // 'YYYY-MM-DD …' for the same day. An ISO-stamped expiry earlier today therefore
   // compares as "in the future" under a string compare — the credential is expired and
   // keeps working. Fail-open, on exactly the rows that carry the ISO format.
+  //
+  // CLAMPED TO THE CURRENT UTC DAY — the helper must honour the rule stated above.
+  //
+  // The first version was `new Date(Date.now() + hours * 3600_000)`, and it broke its
+  // own contract for one hour a day. Between 00:00 and 01:00 UTC, "one hour ago" is
+  // YESTERDAY, so the two timestamps no longer share a calendar day, the separator at
+  // character 10 stops being the deciding character, and the demo assertion
+  // `iso > nowSqlUtc()` correctly returns false. CI went red daily in that window on
+  // main, blocking every PR — found by Athena 2026-08-14 00:46 UTC.
+  //
+  // Which is the same defect this file already documents, one level up: a fixture whose
+  // VALUES stop reaching the divergence the test is named for. The 2020/2099 draft
+  // failed because differing years decided the comparison too early; this failed because
+  // a midnight crossing decided it too early. Same class, opposite end.
+  //
+  // Clamping to [midnight today, now] guarantees same-day in every window. At 00:30 the
+  // past instant becomes midnight itself — 30 minutes ago, still today, still strictly
+  // ordered under both comparisons. At exactly 00:00:00.000 expiry equals now, which
+  // julianday() treats as NOT in the future, so the row is still correctly refused.
   const sameDayIso = (hoursFromNow: number): string => {
-    const d = new Date(Date.now() + hoursFromNow * 3600_000)
-    return d.toISOString() // 'YYYY-MM-DDTHH:MM:SS.sssZ'
+    const now = Date.now()
+    const midnight = new Date(now)
+    midnight.setUTCHours(0, 0, 0, 0)
+    const endOfDay = midnight.getTime() + 86_400_000 - 1
+    const target = now + hoursFromNow * 3600_000
+    const clamped = Math.min(Math.max(target, midnight.getTime()), endOfDay)
+    return new Date(clamped).toISOString() // 'YYYY-MM-DDTHH:MM:SS.sssZ'
   }
 
   it('ISO-8601 expiry EARLIER TODAY is refused (a string compare passes it — fail-open)', () => {
-    const iso = sameDayIso(-1) // one hour ago, same calendar day as nowSqlUtc()
+    const iso = sameDayIso(-1) // one hour ago, CLAMPED to today — never yesterday
     insert('iso-past', { expires_at: iso })
     // Demonstrate the trap explicitly so the assertion below cannot be mistaken for
     // an arbitrary preference: under `>` this row reads as live.
