@@ -527,6 +527,39 @@ export type BusEventType =
   | 'squad.dispatch'
   | 'org.provisioned' // a department/squad/agent/token was created in-band (payload.kind)
   | 'project.mutated' // project lifecycle or project-to-squad access changed through MCP
+  | 'message.created' // an agent_messages row LANDED (mumega-com#970) — the push seam that
+                      // makes an inbox poll unnecessary. Emitted ONLY on a real insert
+                      // (result.meta.changes > 0), so a capped, fenced, or idempotent-
+                      // duplicate send produces no event. See MessageCreatedPayload.
+
+/**
+ * message.created payload (mumega-com#970).
+ *
+ * Carries exactly the correlation a downstream runtime needs to activate on a message
+ * WITHOUT reading it back — the point of the seam is that no consumer has to poll the
+ * inbox to discover the message exists.
+ *
+ * It deliberately carries NO message body. The event says "a message landed, here is its
+ * identity and routing"; reading it still goes through the authorized inbox path, so the
+ * event cannot become a side channel that leaks message content past the tenant/project
+ * authorization the inbox enforces. A subscriber that could read bodies off the bus would
+ * be a second, weaker copy of the authorization surface — the exact shape that produced
+ * the dashboard authenticated-≠-authorized defect (FLIGHT-001).
+ */
+export interface MessageCreatedPayload {
+  message_id: string
+  seq: number
+  to_agent: string
+  from_agent: string
+  from_member: string
+  kind: string
+  /** Present when the sender supplied one — the ACK correlation key. */
+  request_id?: string | null
+  /** Present when this message answers another — threads a conversation. */
+  in_reply_to?: string | null
+  project_id?: string | null
+  created_at: string
+}
 
 export interface BusEvent<T = unknown> {
   type: BusEventType

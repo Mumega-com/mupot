@@ -14,7 +14,7 @@
 // message lands in the DLQ.
 
 import type { MessageBatch, Message } from '@cloudflare/workers-types'
-import type { Env, BusEvent, Task } from '../types'
+import type { Env, BusEvent, Task , MessageCreatedPayload } from '../types'
 import { postAgentActivity } from '../channels'
 import { getFleetAgentLiveness } from '../fleet/registry'
 import { deliverDispatchToInbox, dispatchInboxDelivered, InboxFullError, DISPATCH_INBOX_PREFIX } from './fleet-bridge'
@@ -407,6 +407,41 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
       console.log('bus: flight.landed', {
         tenant: event.tenant,
         squad_id: event.squad_id,
+      })
+      return true
+    }
+    case 'message.created': {
+      // mumega-com#970 — the push seam's consumer half.
+      //
+      // WHAT IS DELIBERATELY NOT HERE: an outbound POST to a Hermes gateway. #970 asks for
+      // delivery "to a Hermes gateway endpoint", and no such endpoint is reachable today.
+      // Verified live, 2026-08-14:
+      //     GET https://hermes.mumega.com/health      -> 200 {"service":"inkwell-api"}
+      //     GET https://hermes-kay.mumega.com/health  -> 502 Bad Gateway
+      // and the Hermes gateway that DOES hold a `mupot-events` subscription binds loopback
+      // only, so no Worker can reach it. src/telegram-bridge/bus_notify.ts:6-18 records the
+      // previous attempt down this exact road: a perfectly signed payload POSTed into a 404,
+      // while `resp.ok` logic "reported a clean failure nobody watched".
+      //
+      // Wiring a delivery target now would reproduce that. So this case logs the event and
+      // acks it. That is honest: the event EXISTS on the queue, durably, with retry and a
+      // DLQ, and the moment a reachable signed endpoint exists the delivery is a few lines
+      // here — against a spine already carrying real traffic rather than a hypothetical one.
+      //
+      // It is explicitly NOT a polling loop and NOT a silent fallback (#970's two named
+      // prohibitions): nothing here reads the inbox on a timer, and nothing pretends a
+      // delivery occurred.
+      const p = event.payload as MessageCreatedPayload
+      console.log('bus: message.created', {
+        tenant: event.tenant,
+        message_id: p?.message_id,
+        to_agent: p?.to_agent,
+        from_agent: p?.from_agent,
+        kind: p?.kind,
+        request_id: p?.request_id ?? null,
+        in_reply_to: p?.in_reply_to ?? null,
+        project_id: p?.project_id ?? null,
+        delivery: 'none — no reachable Hermes ingress (mumega-com#970)',
       })
       return true
     }

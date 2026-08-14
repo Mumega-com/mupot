@@ -14,7 +14,8 @@
 //     with different content it is rejected (request_id_conflict), never a silent drop. Scoping
 //     by from_agent stops one agent poisoning another's rid namespace. Dedup wins over the cap.
 
-import type { Env, CapabilityGrant } from '../types'
+import type { Env, CapabilityGrant, MessageCreatedPayload } from '../types'
+import { createBus } from '../bus'
 import { resolveAgentRef } from '../org/resolve'
 import { canOnSquad } from '../auth/capability'
 
@@ -278,6 +279,51 @@ export async function sendAgentMessage(
       return { ok: false, reason: 'inbox_full', detail: `recipient at unread cap ${maxUnread}` }
     }
     const seq = Number(result.meta?.last_row_id ?? 0)
+
+    // mumega-com#970 — the push seam. Emitted HERE and nowhere else, because this is the
+    // only point at which a row is proven to have landed:
+    //   * capped inbox / routine fence  -> changes === 0, returns above, no event
+    //   * idempotent duplicate          -> idempotentOrConflict() above, no event
+    // so "one landed message = exactly one event" holds without a dedup table. The
+    // UNIQUE(tenant, from_agent, request_id) index is what makes that true, not this code.
+    //
+    // Delivery is the Queue's problem, not ours: durability, batching, retry and the DLQ
+    // are already configured (wrangler.toml). We do not await a downstream endpoint here.
+    //
+    // FAIL-OPEN, DELIBERATELY. The message IS committed to D1 at this point. If the emit
+    // throws, the send must still succeed — a notification failure must never roll back or
+    // fail a delivered message, and the inbox remains the source of truth. The failure is
+    // logged loudly rather than swallowed, because a silent emit failure would recreate the
+    // exact defect this seam exists to remove: something that looks delivered and is not.
+    try {
+      await createBus(env).emit({
+        type: 'message.created',
+        tenant,
+        agent_id: input.toAgent,
+        actor: { kind: 'agent', id: input.fromAgent },
+        payload: {
+          message_id: id,
+          seq,
+          to_agent: input.toAgent,
+          from_agent: input.fromAgent,
+          from_member: input.fromMember,
+          kind,
+          request_id: input.requestId ?? null,
+          in_reply_to: input.inReplyTo ?? null,
+          project_id: input.projectId ?? null,
+          created_at: createdAt,
+        } satisfies MessageCreatedPayload,
+        ts: createdAt,
+      })
+    } catch (emitErr) {
+      console.error(
+        '[message.created] emit FAILED — message %s is committed but no push event was ' +
+        'published; a subscriber will not learn of it until the inbox is read: %s',
+        id,
+        emitErr instanceof Error ? emitErr.message : String(emitErr),
+      )
+    }
+
     return { ok: true, id, seq, duplicate: false }
   } catch (err) {
     if (routineFence && !await routineDispatchAllowed(env, tenant, routineFence)) {
