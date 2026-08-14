@@ -615,6 +615,12 @@ export interface ModelChatOpts {
   temperature?: number // additive v1-optional
 }
 
+/**
+ * Token usage — DISJOINT convention (River gate P1-3): `input` is the NON-CACHE
+ * input only. cacheRead/cacheWrite are separate fields; summing input + cacheRead
+ * would double-bill every cached token. Producers that see a total prompt_tokens
+ * (DeepSeek) MUST subtract the hit before setting `input`.
+ */
 export interface TokenUsage {
   readonly input: number
   readonly output: number

@@ -25,7 +25,7 @@
 //    BEFORE the model call. On block: task lands 'blocked' with a rate_limited
 //    note; no tokens are spent.
 
-import type { Env, Agent, Task, ModelMessage, ModelPort, BusEvent } from '../types'
+import type { Env, Agent, Task, ModelMessage, ModelPort, BusEvent , TokenUsage } from '../types'
 import { TASK_SELECT_COLUMNS } from '../tasks/ranking'
 import { checkTransition, assertCompletableDoneWhen, assigneeSelfClose } from '../tasks/service'
 import { resolveTaskAssignee } from '../tasks/assignee'
@@ -33,7 +33,7 @@ import { createModel } from '../model'
 import { createBus } from '../bus'
 import { createMemory } from '../memory'
 import { checkAndReserve, recordTokens, type RecordTokensUsage } from './meter'
-import { costMicroUsd } from './cost'
+import { costMicroUsd, costUsageMicroUsd } from './cost'
 import { detectContentIntent } from './content-intent'
 import type { ContentIntent } from './content-intent'
 import { getRegistered, kernelMintCtx } from '../departments/registry'
@@ -216,7 +216,11 @@ export async function runTaskExecution(
   // Hoisted so the catch path can record whatever usage the call DID report
   // (even on failure the provider may have consumed tokens). Undefined when the
   // port has no chatWithUsage or the call threw before returning.
-  let chatUsage: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number } | undefined
+  let chatUsage: TokenUsage | undefined
+  // Hoisted with chatUsage: the catch path still bills SOMETHING (the estimate)
+  // when the call failed mid-flight — an attempted call consumed budget even if
+  // we never got a usage record back.
+  let recordedCostMicroUsd = cycleCostMicroUsd
 
   try {
     const charter = await loadSquadCharter(env, task.squad_id)
@@ -231,6 +235,14 @@ export async function runTaskExecution(
       ? await model.chatWithUsage(messages, { model: agent.model, maxTokens: EXECUTE_MAX_TOKENS })
       : { text: await model.chat(messages, { model: agent.model, maxTokens: EXECUTE_MAX_TOKENS }), usage: undefined }
     chatUsage = chatResult.usage
+    // P0 (River gate): the recorded cost must come from REAL usage when the
+    // provider reported it — usage-derived, estimate only as fallback. The old
+    // path billed deepseek-v4-pro at the $15/M fallback (34x miss / 4000x hit
+    // overstatement) because costMicroUsd had no deepseek entry.
+    recordedCostMicroUsd =
+      chatUsage !== undefined
+        ? (costUsageMicroUsd(agent.model, chatUsage) ?? cycleCostMicroUsd)
+        : cycleCostMicroUsd
     const result = capResult(chatResult.text)
     const finishedAt = new Date().toISOString()
 
@@ -295,7 +307,7 @@ export async function runTaskExecution(
       }
     }
     if (!(await finishTask(env, task.id, agent.id, executionReceiptId, successStatus, result, finishedAt, cycleCostMicroUsd, AGENT_SELF_COMPLETION_GATE_OWNER))) {
-      await recordTokensSafe(meter.recordTokens, env, agent.id, EXECUTE_MAX_TOKENS, cycleCostMicroUsd, {
+      await recordTokensSafe(meter.recordTokens, env, agent.id, EXECUTE_MAX_TOKENS, recordedCostMicroUsd, {
       input: chatUsage?.input,
       output: chatUsage?.output,
       cacheRead: chatUsage?.cacheRead,
@@ -311,7 +323,7 @@ export async function runTaskExecution(
     // Best-effort token + cost accounting: record EXECUTE_MAX_TOKENS as a conservative
     // estimate, priced at the model rate (#15). When the model port surfaces actual
     // usage, replace EXECUTE_MAX_TOKENS with the real count (cost follows automatically).
-    await recordTokensSafe(meter.recordTokens, env, agent.id, EXECUTE_MAX_TOKENS, cycleCostMicroUsd, {
+    await recordTokensSafe(meter.recordTokens, env, agent.id, EXECUTE_MAX_TOKENS, recordedCostMicroUsd, {
       input: chatUsage?.input,
       output: chatUsage?.output,
       cacheRead: chatUsage?.cacheRead,
@@ -324,7 +336,7 @@ export async function runTaskExecution(
     const finishedAt = new Date().toISOString()
     // NEVER leave in_progress stuck — land it in blocked with the error note.
     if (!(await finishTask(env, task.id, agent.id, executionReceiptId, 'blocked', note, finishedAt, cycleCostMicroUsd))) {
-      await recordTokensSafe(meter.recordTokens, env, agent.id, EXECUTE_MAX_TOKENS, cycleCostMicroUsd, {
+      await recordTokensSafe(meter.recordTokens, env, agent.id, EXECUTE_MAX_TOKENS, recordedCostMicroUsd, {
       input: chatUsage?.input,
       output: chatUsage?.output,
       cacheRead: chatUsage?.cacheRead,
@@ -334,7 +346,7 @@ export async function runTaskExecution(
     }
     await emitSafe(emit, executionEvent('task.blocked', env, agent, task, 'blocked'))
     // Still count tokens + cost on model failure: the call was attempted.
-    await recordTokensSafe(meter.recordTokens, env, agent.id, EXECUTE_MAX_TOKENS, cycleCostMicroUsd, {
+    await recordTokensSafe(meter.recordTokens, env, agent.id, EXECUTE_MAX_TOKENS, recordedCostMicroUsd, {
       input: chatUsage?.input,
       output: chatUsage?.output,
       cacheRead: chatUsage?.cacheRead,

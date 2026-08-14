@@ -48,11 +48,24 @@ const USD_PER_MTOK = 1_000_000 // micro-USD in one USD
 export const MODEL_PRICES: Readonly<Record<string, ModelPrice>> = {
   // Commit cd9be86, "retire tech-grok and replace with Asha Tech Worker (DeepSeek v4 @
   // $0.24/M tokens)". A single blended figure — the team recorded one number, not a split.
+  // DeepSeek V4 split rates — verified LIVE by River 2026-08-14 (running
+  // deepseek-v4-pro) and cross-checked against BenchLM published pricing (synced
+  // 2026-07-31): cache-hit input falls to $0.003625 (pro) / $0.0028 (flash).
+  // Aug 16 the vendor moves to peak/off-peak (off-peak = half peak; peak windows
+  // 01:00-04:00 + 06:00-10:00 UTC) — flip this table then; it is the ONE home.
+  // The old blended 0.24/M (commit cd9be86) billed cache hits at full input rate,
+  // overstating loop cost ~100x and making the budget meter block early.
   'deepseek-v4-flash': {
-    inputMicroUsdPerMTok: 0.24 * USD_PER_MTOK,
-    outputMicroUsdPerMTok: 0.24 * USD_PER_MTOK,
-    blended: true,
-    source: 'commit cd9be86 (fleet roster change that provisioned Asha)',
+    inputMicroUsdPerMTok: 0.14 * USD_PER_MTOK,
+    outputMicroUsdPerMTok: 0.28 * USD_PER_MTOK,
+    cacheReadMicroUsdPerMTok: 0.0028 * USD_PER_MTOK,
+    source: 'River live verify 2026-08-14 + BenchLM DeepSeek API pricing (synced 2026-07-31)',
+  },
+  'deepseek-v4-pro': {
+    inputMicroUsdPerMTok: 0.435 * USD_PER_MTOK,
+    outputMicroUsdPerMTok: 0.87 * USD_PER_MTOK,
+    cacheReadMicroUsdPerMTok: 0.003625 * USD_PER_MTOK,
+    source: 'River live verify 2026-08-14 + BenchLM DeepSeek API pricing (synced 2026-07-31)',
   },
   // src/dashboard/economy.ts:248 states these rates in its footer ("priced at Anthropic
   // list rates (Opus $15/$75 per MTok in/out)") — a display string, not a rate map. This

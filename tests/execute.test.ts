@@ -8,6 +8,7 @@ import {
   buildExecuteSystem,
   MAX_RESULT_CHARS,
 } from '../src/agents/execute'
+import { checkAndReserve } from '../src/agents/meter'
 import type { Agent, Task, ModelPort, ModelMessage, BusEvent } from '../src/types'
 
 // ── test doubles ───────────────────────────────────────────────────────────────
@@ -784,5 +785,65 @@ describe('runTaskExecution — budget cap (#4)', () => {
     expect(r.error).toBe('budget_cap_exceeded')
     // task row was transitioned to blocked, never left in_progress.
     expect(updates.some((u) => String(u.args[0]) === 'blocked')).toBe(true)
+  })
+})
+
+
+// ── cache-telemetry call path (River gate P0, 2026-08-14) ─────────────────────
+//
+// River's adversarial pass found the cost functions were DEAD CODE: execute.ts
+// billed the flat EXECUTE_MAX_TOKENS estimate at the $15/M fallback even when
+// usage was available (v4-pro: ~34x over miss, ~4000x over hit). These tests
+// pin the CALL PATH — a model reporting usage must cause recordTokens to receive
+// the usage-derived cost, and the estimate only when usage is absent.
+describe('runTaskExecution — usage-derived cost reaches the meter (cache-telemetry P0)', () => {
+  // A model that reports DeepSeek-style usage: 1000 fresh input + 9000 cache-hit
+  // input + 512 output, on deepseek-v4-pro (hit .003625 / miss .435 / out .87).
+  const usageModel = (): ModelPort & { chatWithUsage: ReturnType<typeof vi.fn> } => ({
+    chat: vi.fn(async () => 'Work product.'),
+    chatWithUsage: vi.fn(async () => ({
+      text: 'Work product.',
+      usage: { input: 1000, output: 512, cacheRead: 9000 },
+    })),
+  })
+
+  it('records the usage-derived cost (not the flat estimate) when chatWithUsage reports usage', async () => {
+    const agent: Agent = { ...AGENT, model: 'deepseek-v4-pro' }
+    const { env } = makeEnv({ task: makeTask() })
+    const model = usageModel()
+    const recordTokens = vi.fn()
+    await runTaskExecution(env, agent, 'task-1', {
+      model,
+      emit: async () => {},
+      remember: async () => 'x',
+      meter: { checkAndReserve, recordTokens },
+    })
+
+    expect(model.chatWithUsage).toHaveBeenCalledTimes(1)
+    expect(recordTokens).toHaveBeenCalledTimes(1)
+    const [, , tokens, cost] = recordTokens.mock.calls[0]
+    // usage-derived: 1000*0.435 + 9000*0.003625 + 512*0.87 = 435 + 32.625 + 445.44
+    //   = 913.065 micro-USD → 913. The flat estimate for EXECUTE_MAX_TOKENS=2048 at
+    //   the $15/M fallback would be 30,720 — an order of magnitude different.
+    expect(cost).toBeLessThan(2000)
+    expect(cost).toBeGreaterThan(800)
+  })
+
+  it('falls back to the estimate when the model has no chatWithUsage', async () => {
+    const agent: Agent = { ...AGENT, model: 'deepseek-v4-pro' }
+    const { env } = makeEnv({ task: makeTask() })
+    const model: ModelPort = { chat: vi.fn(async () => 'Work product.') }
+    const recordTokens = vi.fn()
+    await runTaskExecution(env, agent, 'task-1', {
+      model,
+      emit: async () => {},
+      remember: async () => 'x',
+      meter: { checkAndReserve, recordTokens },
+    })
+
+    expect(recordTokens).toHaveBeenCalledTimes(1)
+    const [, , , cost] = recordTokens.mock.calls[0]
+    // No usage → cycleCostMicroUsd estimate (EXECUTE_MAX_TOKENS=2048 at fallback $15/M)
+    expect(cost).toBe(2048 * 15)
   })
 })

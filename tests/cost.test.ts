@@ -158,13 +158,17 @@ describe('costUsageMicroUsd — DeepSeek cache-aware split', () => {
   const pro = 'deepseek-v4-pro'
   const flash = 'deepseek-v4-flash'
 
-  it('bills cache-read at the hit rate, not the miss rate', () => {
-    // 1M tokens read from cache on v4-flash: 0.0028/M → $0.0028 → 2,800 micro-USD
-    const micro = costUsageMicroUsd(flash, { input: 1_000_000, output: 0, cacheRead: 1_000_000 })
+  it('bills cache-read at the hit rate, not the miss rate (disjoint convention)', () => {
+    // DISJOINT: input = NON-cache input only. 1M cache-read tokens with 0 fresh
+    // input: cost = 0.0028/M → $0.0028 → 2,800 micro-USD.
+    const micro = costUsageMicroUsd(flash, { input: 0, output: 0, cacheRead: 1_000_000 })
     expect(micro).toBe(Math.round(0.0028 * 1_000_000))
-    // same 1M as a MISS: 0.14/M → 140,000 micro-USD — the ~100x split River measured
-    const missMicro = costUsageMicroUsd(flash, { input: 1_000_000, output: 0, cacheRead: 0 })
+    // 1M as fresh (miss) input: 0.14/M → 140,000 micro-USD — the ~100x split River measured
+    const missMicro = costUsageMicroUsd(flash, { input: 1_000_000, output: 0 })
     expect(missMicro).toBe(Math.round(0.14 * 1_000_000))
+    // mixed: 900k hit + 100k fresh = 2520 + 14000 = 16,520
+    const mixed = costUsageMicroUsd(flash, { input: 100_000, output: 0, cacheRead: 900_000 })
+    expect(mixed).toBe(Math.round(100_000 * 0.14) + Math.round(900_000 * 0.0028))
   })
 
   it('bills output at the output rate', () => {
@@ -181,6 +185,15 @@ describe('costUsageMicroUsd — DeepSeek cache-aware split', () => {
   it('returns null for negative / non-finite counts', () => {
     expect(costUsageMicroUsd(flash, { input: -1, output: 0 })).toBeNull()
     expect(costUsageMicroUsd(flash, { input: Number.NaN, output: 0 })).toBeNull()
+  })
+
+  it('prices v4-pro at the verified split (River live)', () => {
+    // 1M fresh input on pro: 0.435/M → 435,000 micro-USD
+    expect(costUsageMicroUsd(pro, { input: 1_000_000, output: 0 })).toBe(435_000)
+    // 1M output on pro: 0.87/M → 870,000
+    expect(costUsageMicroUsd(pro, { input: 0, output: 1_000_000 })).toBe(870_000)
+    // 1M cache hit on pro: 0.003625/M → 3,625
+    expect(costUsageMicroUsd(pro, { input: 0, output: 0, cacheRead: 1_000_000 })).toBe(3_625)
   })
 })
 

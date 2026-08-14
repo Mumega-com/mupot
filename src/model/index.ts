@@ -177,12 +177,19 @@ async function callOpenAI(
     }
   }
   const u = json.usage
+  // DISJOINT convention (River gate P1-3): `input` is the NON-CACHE input.
+  // DeepSeek reports prompt_tokens as TOTAL (hit + miss); subtracting the hit
+  // keeps input disjoint from cacheRead so price functions never double-bill.
+  // cacheWrite is NOT set: DeepSeek does not charge for cache writes, and
+  // conflating miss with write was the exact confusion River flagged.
   const usage = u
     ? {
-        input: u.prompt_tokens ?? (u.prompt_cache_hit_tokens ?? 0) + (u.prompt_cache_miss_tokens ?? 0),
+        input:
+          u.prompt_cache_miss_tokens !== undefined
+            ? u.prompt_cache_miss_tokens
+            : u.prompt_tokens ?? 0,
         output: u.completion_tokens ?? 0,
         cacheRead: u.prompt_cache_hit_tokens ?? 0,
-        cacheWrite: u.prompt_cache_miss_tokens ?? 0,
       }
     : undefined
   return { text: json.choices?.[0]?.message?.content ?? '', usage }
