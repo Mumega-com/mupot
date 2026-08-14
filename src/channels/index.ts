@@ -341,7 +341,7 @@ async function taskReply(
       done_when: '(set via task update)',
       body: '',
     },
-    { actor: memberActor(memberId) },
+    { actor: memberActor(memberId), allowDeferredPredicate: true },
   )
 
   return `Added to ${squad.name}: "${task.title}".`

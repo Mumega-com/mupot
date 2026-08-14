@@ -120,7 +120,7 @@ describe('THE CEILING SURVIVES — ambient authority stays zero', () => {
     const seat = directorySeat([grant('owner', 'org', null), grant('member')])
 
     const out = await invokeTool(seat, env, 'task_create', {
-      squad_id: 'squad-core', title: 't', done_when: 'x',
+      squad_id: 'squad-core', title: 't', done_when: 'check done',
     }, ORIGIN)
 
     expect((out as { error?: string }).error).toBe('forbidden')

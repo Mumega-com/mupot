@@ -69,8 +69,8 @@ afterEach(() => harness.close())
 
 describe('task_create — priority and parent', () => {
   it('stores a priority and leaves it NULL when omitted', async () => {
-    const withP = await invokeTool(auth(), env, 'task_create', { squad_id: 'sq', title: 'ranked', done_when: 'x', priority: 'P0' }, ORIGIN)
-    const without = await invokeTool(auth(), env, 'task_create', { squad_id: 'sq', title: 'unranked', done_when: 'x' }, ORIGIN)
+    const withP = await invokeTool(auth(), env, 'task_create', { squad_id: 'sq', title: 'ranked', done_when: 'check done', priority: 'P0', body: 'P0 outage on production — requires immediate rollback and incident review.' }, ORIGIN)
+    const without = await invokeTool(auth(), env, 'task_create', { squad_id: 'sq', title: 'unranked', done_when: 'check done' }, ORIGIN)
 
     expect((withP as { result?: { task?: Task } }).result?.task?.priority).toBe('P0')
     // Untriaged must stay NULL, not be defaulted. A default priority is a number that looks
@@ -79,7 +79,7 @@ describe('task_create — priority and parent', () => {
   })
 
   it('refuses an unrecognised priority instead of coercing it', async () => {
-    const out = await invokeTool(auth(), env, 'task_create', { squad_id: 'sq', title: 't', done_when: 'x', priority: 'P9' }, ORIGIN)
+    const out = await invokeTool(auth(), env, 'task_create', { squad_id: 'sq', title: 't', done_when: 'check done', priority: 'P9' }, ORIGIN)
     expect((out as { error?: string }).error).toBe('invalid_priority')
   })
 
@@ -87,7 +87,7 @@ describe('task_create — priority and parent', () => {
     squad('other')
     seedTask('foreign-parent', 'other')
 
-    const out = await invokeTool(auth(), env, 'task_create', { squad_id: 'sq', title: 'child', done_when: 'x', parent_task_id: 'foreign-parent' }, ORIGIN)
+    const out = await invokeTool(auth(), env, 'task_create', { squad_id: 'sq', title: 'child', done_when: 'check done', parent_task_id: 'foreign-parent' }, ORIGIN)
 
     // Reads are squad-scoped, so a cross-squad parent would return a tree whose branches
     // cross the capability check that gated the read.
@@ -96,7 +96,7 @@ describe('task_create — priority and parent', () => {
 
   it('links a subtask to a parent on the same squad', async () => {
     seedTask('parent-1', 'sq')
-    const out = await invokeTool(auth(), env, 'task_create', { squad_id: 'sq', title: 'child', done_when: 'x', parent_task_id: 'parent-1' }, ORIGIN)
+    const out = await invokeTool(auth(), env, 'task_create', { squad_id: 'sq', title: 'child', done_when: 'check done', parent_task_id: 'parent-1' }, ORIGIN)
     expect((out as { result?: { task?: Task } }).result?.task?.parent_task_id).toBe('parent-1')
   })
 })

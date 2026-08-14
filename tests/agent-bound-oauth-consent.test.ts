@@ -349,7 +349,7 @@ describe('B2. consent-bound session gets EXACTLY the chosen agent\'s own capabil
     // cannot act on squad-b, which the human's (irrelevant, unused) org grant
     // would otherwise cover.
     const out = await invokeTool(auth!, env, 'task_create', {
-      squad_id: AGENT_B.squad_id, title: 'sneaky', done_when: 'x',
+      squad_id: AGENT_B.squad_id, title: 'sneaky', done_when: 'check done',
     }, 'https://pot.test')
     expect((out as { error?: string }).error).toBe('forbidden')
   })
@@ -380,7 +380,7 @@ describe('B2. consent-bound session gets EXACTLY the chosen agent\'s own capabil
       consentedByMemberId: HUMAN,
     })
     const out = await invokeTool(auth!, env, 'task_create', {
-      squad_id: AGENT_A.squad_id, title: 'via consented session', done_when: 'x',
+      squad_id: AGENT_A.squad_id, title: 'via consented session', done_when: 'check done',
     }, 'https://pot.test')
     expect((out as { ok?: boolean }).ok).toBe(true)
   })
@@ -1272,7 +1272,7 @@ describe('F. resolveAuth header re-derivation — real dispatch, not invokeTool 
       headers: { 'content-type': 'application/json', [AUTH_CONTEXT_HEADER]: JSON.stringify(forgedHeaderAuth) },
       body: JSON.stringify({
         tool: 'task_create',
-        args: { squad_id: AGENT_A.squad_id, title: 'via real dispatch', done_when: 'x' },
+        args: { squad_id: AGENT_A.squad_id, title: 'via real dispatch', done_when: 'check done' },
       }),
     }, env)
 
@@ -1376,7 +1376,7 @@ describe('F. resolveAuth header re-derivation — real dispatch, not invokeTool 
       headers: { 'content-type': 'application/json', [AUTH_CONTEXT_HEADER]: JSON.stringify(unboundHeaderAuth) },
       body: JSON.stringify({
         tool: 'task_create',
-        args: { squad_id: AGENT_A.squad_id, title: 'should be refused', done_when: 'x' },
+        args: { squad_id: AGENT_A.squad_id, title: 'should be refused', done_when: 'check done' },
       }),
     }, env)
 

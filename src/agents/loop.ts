@@ -434,7 +434,7 @@ export async function runGoalCycle(
           gate_owner: gateOwner,
           assignee_agent_id: assignee,
         },
-        { actor: { kind: 'agent', id: agent.id } },
+        { actor: { kind: 'agent', id: agent.id }, allowDeferredPredicate: true },
       )
 
       // Dispatch (wake execute mode) for execute + execute_with_approval.

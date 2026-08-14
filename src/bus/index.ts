@@ -46,7 +46,9 @@ export function createBus(env: Env): BusPort {
         ...event,
         ts: event.ts && event.ts.length > 0 ? event.ts : new Date().toISOString(),
       }
-      await env.BUS.send(stamped)
+      if (env.BUS?.send) {
+        await env.BUS.send(stamped)
+      }
     },
   }
 }

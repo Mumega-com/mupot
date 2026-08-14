@@ -226,7 +226,7 @@ export class AgentDO extends DurableObject<Env> {
                 done_when: '(operator resolves — set via task update)',
                 gate_owner: 'gate:escalation',
               },
-              { actor: { kind: 'agent', id: agent.id } },
+              { actor: { kind: 'agent', id: agent.id }, allowDeferredPredicate: true },
             )
           } catch (emitErr) {
             // A failed escalation emit must not kill the goal cycle — record and
@@ -279,6 +279,7 @@ export class AgentDO extends DurableObject<Env> {
           done_when: t.done_when ?? '(agent-generated — set via task update)',
         }, {
           actor: { kind: 'agent', id: agent.id },
+          allowDeferredPredicate: true,
         })
       }
 
