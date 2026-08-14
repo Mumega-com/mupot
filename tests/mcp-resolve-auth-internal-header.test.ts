@@ -11,6 +11,15 @@
 // Every existing test drives a `directory` channel through resolveAuth. None of them
 // touch this branch at all, so B and C were unwitnessed, not merely under-asserted.
 //
+// P2-1 (same PR, same re-read): the hand-written `t.revoked_at IS NULL` fragment was
+// replaced with TOKEN_LIVE_PREDICATE (src/auth/token-lifecycle.ts) so expiry is
+// enforced here too. That fix was ITSELF unwitnessed on first pass — every fixture
+// left expires_at NULL, so nothing distinguished the predicate from the fragment it
+// replaced:
+//   Mutation D (revert TOKEN_LIVE_PREDICATE back to the hand-written
+//               `t.revoked_at IS NULL` fragment, verbatim)            -> suite GREEN.
+// The two expiry tests below are the fixture that finally writes expires_at.
+//
 // Real SQLite (createSqliteD1 + applyAllMigrations, the #684/#720 ratchet) driven
 // through the real HTTP surface (mcpApp.request), not a hand-rolled DB double — a
 // dropped WHERE clause must be provable by a query that actually executes it.
@@ -57,6 +66,12 @@ function seedMemberToken(
     tenant: string
     boundAgentId?: string | null
     status?: 'active' | 'suspended'
+    // 0099-shaped: NULL = non-expiring. Must be in the SAME format nowSqlUtc()
+    // emits ('YYYY-MM-DD HH:MM:SS', space separator) — TOKEN_LIVE_PREDICATE
+    // compares via julianday() specifically because member_tokens holds a real
+    // mix of ' ' and 'T'-separated timestamps and a plain string compare gets
+    // the wrong answer for the same instant. Do not pass an ISO 'T' value here.
+    expiresAt?: string | null
   },
 ): void {
   sqlite
@@ -77,10 +92,15 @@ function seedMemberToken(
   }
   sqlite
     .prepare(
-      `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant)
-       VALUES (?, ?, 'unused-hash-not-exercised-by-this-hop', 'test', 'workspace', datetime('now'), ?, ?)`,
+      `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant, expires_at)
+       VALUES (?, ?, 'unused-hash-not-exercised-by-this-hop', 'test', 'workspace', datetime('now'), ?, ?, ?)`,
     )
-    .run(opts.tokenId, opts.memberId, opts.boundAgentId ?? null, opts.tenant)
+    .run(opts.tokenId, opts.memberId, opts.boundAgentId ?? null, opts.tenant, opts.expiresAt ?? null)
+}
+
+/** Same shape nowSqlUtc() (src/auth/token-lifecycle.ts) produces: 'YYYY-MM-DD HH:MM:SS'. */
+function sqlUtc(date: Date): string {
+  return date.toISOString().replace('T', ' ').replace(/\.\d+Z$/, '')
 }
 
 /** Injected internal AuthContext, as McpOAuthApiHandler/mcpInternalRequest would set it. */
@@ -176,5 +196,81 @@ describe('resolveAuth internal-header hop — workspace-channel token re-read (P
     // The cross-tenant token row must not resolve at all — boundAgentId falls back
     // to null exactly like an unbound/missing token, never the foreign tenant's weld.
     expect(body.result?.bound_agent_id).toBeNull()
+  })
+
+  // Fix 1 (P2-1) itself was unwitnessed until now: replacing the hand-written
+  // `t.revoked_at IS NULL` with `TOKEN_LIVE_PREDICATE` closes the missing-expiry
+  // gap, but every existing fixture (including the two tests above) leaves
+  // expires_at NULL — exactly like every real production row today — so nothing
+  // actually drove an EXPIRED row through this hop. A regression that reverted
+  // the predicate back to the hand-written fragment would leave every other test
+  // in this file, and the whole suite, green. These two tests are the fixture
+  // that writes expires_at, deliberately, to prove the predicate itself.
+  it('never resolves boundAgentId from a token whose expires_at is in the past (kills mutation D — the reverted third-copy predicate)', async () => {
+    seedAgent(harness.sqlite, TENANT, 'agent-expired-weld')
+    seedMemberToken(harness.sqlite, {
+      memberId: 'member-expired',
+      tokenId: 'tok-expired',
+      tenant: TENANT,
+      boundAgentId: 'agent-expired-weld',
+      // revoked_at is NOT set (seedMemberToken never sets it) — ONLY expiry can
+      // reject this row. If revoked_at also rejected it, this test would pass
+      // for the wrong reason and would not distinguish the predicate from the
+      // hand-written `revoked_at IS NULL` fragment it replaced.
+      expiresAt: sqlUtc(new Date(Date.now() - 60_000)), // one minute in the past
+    })
+
+    const injected: AuthContext = {
+      userId: 'member-expired',
+      email: 'member-expired@example.test',
+      role: 'member',
+      tenant: TENANT,
+      memberId: 'member-expired',
+      channel: 'workspace',
+      capabilities: [],
+      boundAgentId: 'agent-expired-weld',
+      tokenId: 'tok-expired',
+    }
+
+    const { status, body } = await statusVia(makeEnv(harness, TENANT), injected)
+
+    expect(status).toBe(200)
+    expect(body.ok).toBe(true)
+    // An expired-but-unrevoked token must resolve to nothing — exactly like a
+    // missing or revoked token, never the agent it names.
+    expect(body.result?.bound_agent_id).toBeNull()
+  })
+
+  // Companion positive case: without this, a predicate that rejects EVERY token
+  // regardless of expiry (fails closed, over-broadly) would also pass the test
+  // above — a different bug, but still unwitnessed if nothing proves the normal
+  // "expires in the future" token still authenticates.
+  it('still resolves boundAgentId from a token whose expires_at is in the future', async () => {
+    seedAgent(harness.sqlite, TENANT, 'agent-not-yet-expired-weld')
+    seedMemberToken(harness.sqlite, {
+      memberId: 'member-not-yet-expired',
+      tokenId: 'tok-not-yet-expired',
+      tenant: TENANT,
+      boundAgentId: 'agent-not-yet-expired-weld',
+      expiresAt: sqlUtc(new Date(Date.now() + 24 * 60 * 60 * 1000)), // one day out
+    })
+
+    const injected: AuthContext = {
+      userId: 'member-not-yet-expired',
+      email: 'member-not-yet-expired@example.test',
+      role: 'member',
+      tenant: TENANT,
+      memberId: 'member-not-yet-expired',
+      channel: 'workspace',
+      capabilities: [],
+      boundAgentId: 'agent-not-yet-expired-weld',
+      tokenId: 'tok-not-yet-expired',
+    }
+
+    const { status, body } = await statusVia(makeEnv(harness, TENANT), injected)
+
+    expect(status).toBe(200)
+    expect(body.ok).toBe(true)
+    expect(body.result?.bound_agent_id).toBe('agent-not-yet-expired-weld')
   })
 })
