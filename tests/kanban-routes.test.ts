@@ -152,4 +152,76 @@ describe('Multi-Perspective Squad & Project Kanban (Real Schema)', () => {
     expect(data.squad).toBeNull()
     expect(data.lanes).toHaveLength(0)
   })
+
+  it('loads multi-squad org matrix view (?view=matrix)', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO squads (id, department_id, slug, name) VALUES
+        ('sq-m1', 'dept-1', 'squad-alpha', 'Squad Alpha'),
+        ('sq-m2', 'dept-1', 'squad-beta', 'Squad Beta');
+
+      INSERT INTO tasks (id, squad_id, project_id, title, done_when, status, created_at, updated_at) VALUES
+        ('t-m1', 'sq-m1', NULL, 'Alpha Task 1', 'Verified', 'open', '2026-08-14T10:00:00.000Z', '2026-08-14T10:00:00.000Z'),
+        ('t-m2', 'sq-m2', NULL, 'Beta Task 1', 'Verified', 'done', '2026-08-14T10:05:00.000Z', '2026-08-14T10:05:00.000Z');
+    `)
+
+    const auth: AuthContext = {
+      role: 'owner',
+      tenant: 'mumega',
+      userId: 'u-admin',
+    }
+
+    const data = await loadKanbanData(env, auth, { view: 'matrix' })
+
+    expect(data.mode).toBe('matrix')
+    expect(data.swimlanes).toHaveLength(2)
+    expect(data.swimlanes![0].label).toBe('Squad Alpha')
+    expect(data.swimlanes![0].lanes[0].tasks[0].title).toBe('Alpha Task 1')
+    expect(data.swimlanes![1].label).toBe('Squad Beta')
+    expect(data.swimlanes![1].lanes[3].tasks[0].title).toBe('Beta Task 1')
+  })
+
+  it('filters matrix view strictly to member-accessible squads (anti-leak)', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO squads (id, department_id, slug, name) VALUES
+        ('sq-acc', 'dept-1', 'squad-accessible', 'Accessible Squad'),
+        ('sq-hid', 'dept-1', 'squad-hidden', 'Hidden Squad');
+
+      INSERT INTO tasks (id, squad_id, project_id, title, done_when, status, created_at, updated_at) VALUES
+        ('t-acc', 'sq-acc', NULL, 'Visible Task', 'Verified', 'open', '2026-08-14T10:00:00.000Z', '2026-08-14T10:00:00.000Z'),
+        ('t-hid', 'sq-hid', NULL, 'Secret Task', 'Verified', 'open', '2026-08-14T10:05:00.000Z', '2026-08-14T10:05:00.000Z');
+    `)
+
+    const auth: AuthContext = {
+      role: 'member',
+      tenant: 'mumega',
+      userId: 'u-member',
+      memberId: 'm-member',
+      capabilities: [
+        { member_id: 'm-member', scope_type: 'squad', scope_id: 'sq-acc', capability: 'member' },
+      ],
+    }
+
+    const data = await loadKanbanData(env, auth, { view: 'matrix' })
+
+    expect(data.mode).toBe('matrix')
+    expect(data.swimlanes).toHaveLength(1)
+    expect(data.swimlanes![0].label).toBe('Accessible Squad')
+    expect(data.swimlanes![0].lanes[0].tasks[0].title).toBe('Visible Task')
+  })
+
+  it('fails closed with mode matrix for grant-less member on matrix view', async () => {
+    const auth: AuthContext = {
+      role: 'member',
+      tenant: 'mumega',
+      userId: 'u-nogrants',
+      memberId: 'm-nogrants',
+      capabilities: [],
+    }
+
+    const data = await loadKanbanData(env, auth, { view: 'matrix' })
+
+    expect(data.mode).toBe('matrix')
+    expect(data.swimlanes).toHaveLength(0)
+    expect(data.lanes).toHaveLength(0)
+  })
 })

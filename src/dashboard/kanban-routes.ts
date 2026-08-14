@@ -66,7 +66,8 @@ export async function loadKanbanData(
 
   // Fail-closed for grant-less members
   if (!isAllAccessible && accessibleSquadIds && accessibleSquadIds.length === 0) {
-    return { mode: params.projectIdOrSlug ? 'project' : 'squad', squad: null, project: null, lanes: [], swimlanes: [] }
+    const mode = params.view === 'matrix' ? 'matrix' : params.projectIdOrSlug ? 'project' : 'squad'
+    return { mode, squad: null, project: null, lanes: [], swimlanes: [] }
   }
 
   // 1. Project-Centric View
@@ -140,6 +141,67 @@ export async function loadKanbanData(
     return {
       mode: 'project',
       project,
+      lanes: [],
+      swimlanes,
+    }
+  }
+
+  // 3. Matrix View (?view=matrix) — Multi-Squad Org Grid
+  if (params.view === 'matrix') {
+    const squadFilter = isAllAccessible
+      ? ''
+      : ' WHERE t.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?1))'
+
+    const taskRows = await env.DB.prepare(`
+      SELECT 
+        t.id, t.squad_id, t.project_id, t.priority, t.parent_task_id,
+        t.title, t.body, t.status, t.assignee_agent_id, t.github_issue_url,
+        t.result, t.completed_at, t.gate_owner, t.done_when, t.created_at, t.updated_at,
+        s.name AS squad_name, s.slug AS squad_slug,
+        p.name AS project_name, p.slug AS project_slug,
+        a.name AS assignee_name, a.slug AS assignee_slug
+      FROM tasks t
+      JOIN squads s ON t.squad_id = s.id
+      LEFT JOIN projects p ON t.project_id = p.id
+      LEFT JOIN agents a ON t.assignee_agent_id = a.id
+      ${squadFilter}
+      ORDER BY s.name ASC, ${actionableStatusOrderSql('t.status')}, ${priorityOrderSql('t.priority')}, t.updated_at DESC
+    `).bind(
+      ...(isAllAccessible ? [] : [JSON.stringify(accessibleSquadIds ?? [])]),
+    ).all<KanbanTaskRow>()
+
+    const tasks = taskRows.results ?? []
+    const swimlanesMap = new Map<string, { label: string; tasks: KanbanTaskRow[] }>()
+    for (const t of tasks) {
+      const sKey = t.squad_id
+      const sLabel = t.squad_name || 'Squad'
+      if (!swimlanesMap.has(sKey)) {
+        swimlanesMap.set(sKey, { label: sLabel, tasks: [] })
+      }
+      swimlanesMap.get(sKey)!.tasks.push(t)
+    }
+
+    const swimlanes = Array.from(swimlanesMap.entries()).map(([sId, { label, tasks: sTasks }]) => {
+      const byLane = new Map<string, KanbanTaskRow[]>()
+      for (const lane of KANBAN_STATUS_LANES) byLane.set(lane.key, [])
+      for (const t of sTasks) {
+        const laneKey = t.status === 'blocked' ? 'in_progress' : t.status === 'approved' || t.status === 'rejected' ? 'review' : t.status
+        const l = byLane.get(laneKey)
+        if (l) l.push(t)
+      }
+      return {
+        id: sId,
+        label,
+        lanes: KANBAN_STATUS_LANES.map(lane => ({
+          key: lane.key,
+          label: lane.label,
+          tasks: byLane.get(lane.key) ?? []
+        }))
+      }
+    })
+
+    return {
+      mode: 'matrix',
       lanes: [],
       swimlanes,
     }
@@ -254,6 +316,7 @@ function taskCardHtml(t: KanbanTaskRow) {
 
 export function kanbanBoardBody(data: KanbanBoardData, squads: Squad[], projects: Project[]) {
   const isProjectMode = data.mode === 'project' && data.project
+  const isMatrixMode = data.mode === 'matrix'
 
   return html`
     <div class="kanban-container">
@@ -261,6 +324,7 @@ export function kanbanBoardBody(data: KanbanBoardData, squads: Squad[], projects
         <div class="kanban-selectors">
           <label>Perspective:
             <select onchange="location.href = this.value">
+              <option value="/dashboard/kanban?view=matrix" ${isMatrixMode ? 'selected' : ''}>🌐 Org Matrix (All Squads)</option>
               <optgroup label="Squad Boards">
                 ${squads.map(s => html`<option value="/dashboard/kanban?squad=${s.slug}" ${data.squad?.id === s.id ? 'selected' : ''}>Squad: ${s.name}</option>`)}
               </optgroup>
@@ -271,16 +335,20 @@ export function kanbanBoardBody(data: KanbanBoardData, squads: Squad[], projects
           </label>
         </div>
         <div class="kanban-meta-summary">
-          ${isProjectMode ? html`<strong>Project Goal:</strong> ${data.project?.goal || 'No goal set'}` : html`<strong>Squad Charter:</strong> ${data.squad?.charter || 'Active execution squad'}`}
+          ${isMatrixMode
+            ? html`<strong>Org Matrix:</strong> Unified multi-squad workflow execution grid`
+            : isProjectMode
+              ? html`<strong>Project Goal:</strong> ${data.project?.goal || 'No goal set'}`
+              : html`<strong>Squad Charter:</strong> ${data.squad?.charter || 'Active execution squad'}`}
         </div>
       </div>
 
-      ${isProjectMode ? html`
+      ${(isProjectMode || isMatrixMode) ? html`
         <div class="kanban-swimlanes">
           ${(data.swimlanes ?? []).map(sw => html`
             <div class="kanban-swimlane">
               <div class="swimlane-header">
-                <span class="swimlane-title">👥 Contributing Squad: <strong>${sw.label}</strong></span>
+                <span class="swimlane-title">👥 Squad: <strong>${sw.label}</strong></span>
               </div>
               <div class="kanban-columns">
                 ${sw.lanes.map(lane => html`
