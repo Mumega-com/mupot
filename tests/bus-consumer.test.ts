@@ -1,7 +1,7 @@
-import { describe, expect, it, vi } from 'vitest'
+import { describe, expect, it, vi, beforeEach } from 'vitest'
 import type { MessageBatch } from '@cloudflare/workers-types'
 import { handleQueue } from '../src/bus/consumer'
-import type { BusEvent, Env } from '../src/types'
+import type { BusEvent, Env, MessageCreatedPayload } from '../src/types'
 import { postAgentActivity } from '../src/channels'
 
 vi.mock('../src/channels', () => ({ postAgentActivity: vi.fn(async () => undefined) }))
@@ -774,5 +774,121 @@ describe('S353 v2 — route-to-one-executor dispatch bridge', () => {
     expect(item.retry).toHaveBeenCalledWith({ delaySeconds: expect.any(Number) })
     expect(item.ack).not.toHaveBeenCalled()
     expect(db._receipt.consumedAt).toBeNull()
+  })
+})
+
+// ── message.created delivery (mumega-com#970, delivery half) ────────────────
+//
+// The consumer's own routeEvent/handleQueue ack-vs-retry contract, exercised end to end
+// through the real handleQueue — not a unit test of hermes-delivery.ts in isolation (that
+// lives in tests/hermes-delivery.test.ts). What matters HERE is that a delivery outcome
+// actually reaches the Queue's own ack()/retry() calls correctly: only a throw inside
+// routeEvent causes retry (see handleQueue in src/bus/consumer.ts — a `return false` alone
+// still acks). This case does not touch env.DB at all, so no D1 double — real or mock — is
+// needed for any of it.
+
+function messageCreatedEvent(overrides: Partial<MessageCreatedPayload> = {}): BusEvent<MessageCreatedPayload> {
+  return {
+    type: 'message.created',
+    tenant: 'acme-tenant',
+    agent_id: 'agent-b',
+    actor: { kind: 'agent', id: 'agent-a' },
+    ts: '2026-08-14T12:00:00.000Z',
+    payload: {
+      message_id: 'msg-999',
+      seq: 3,
+      to_agent: 'agent-b',
+      from_agent: 'agent-a',
+      from_member: 'member-1',
+      kind: 'note',
+      request_id: null,
+      in_reply_to: null,
+      project_id: 'proj-1',
+      created_at: '2026-08-14T12:00:00.000Z',
+      ...overrides,
+    },
+  }
+}
+
+function envForDelivery(overrides: Partial<Env> = {}): Env {
+  return {
+    HERMES_WEBHOOK_SECRET: 'super-secret-hex',
+    HERMES_EVENTS_WEBHOOK_URL: 'https://hermes-kay.mumega.test/webhooks/mupot-events',
+    ...overrides,
+  } as Env
+}
+
+describe('bus queue consumer — message.created delivery', () => {
+  beforeEach(() => vi.restoreAllMocks())
+
+  it('acks (no retry) on a confirmed delivery receipt', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ accepted: true, event_id: 'msg-999' }), { status: 200 }),
+    )
+    const item = message(messageCreatedEvent())
+
+    await handleQueue({ messages: [item] } as unknown as MessageBatch<BusEvent>, envForDelivery())
+
+    expect(item.ack).toHaveBeenCalledOnce()
+    expect(item.retry).not.toHaveBeenCalled()
+  })
+
+  it('acks (no retry) when delivery is not configured — never a retry storm for an off knob', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+    const item = message(messageCreatedEvent())
+
+    await handleQueue(
+      { messages: [item] } as unknown as MessageBatch<BusEvent>,
+      envForDelivery({ HERMES_EVENTS_WEBHOOK_URL: undefined }),
+    )
+
+    expect(item.ack).toHaveBeenCalledOnce()
+    expect(item.retry).not.toHaveBeenCalled()
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
+  it('retries (does NOT ack) on a 404 — the expected state while the Hermes route is unregistered, but still loud and retryable, never silently swallowed', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('not found', { status: 404 }))
+    const item = message(messageCreatedEvent())
+
+    await handleQueue({ messages: [item] } as unknown as MessageBatch<BusEvent>, envForDelivery())
+
+    expect(item.retry).toHaveBeenCalledOnce()
+    expect(item.ack).not.toHaveBeenCalled()
+  })
+
+  it('retries (does NOT ack) on a 401 — signature/secret mismatch, the most likely real-world failure', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('bad signature', { status: 401 }))
+    const item = message(messageCreatedEvent())
+
+    await handleQueue({ messages: [item] } as unknown as MessageBatch<BusEvent>, envForDelivery())
+
+    expect(item.retry).toHaveBeenCalledOnce()
+    expect(item.ack).not.toHaveBeenCalled()
+  })
+
+  it('retries (does NOT ack) on a network/timeout failure', async () => {
+    vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('The operation was aborted'))
+    const item = message(messageCreatedEvent())
+
+    await handleQueue({ messages: [item] } as unknown as MessageBatch<BusEvent>, envForDelivery())
+
+    expect(item.retry).toHaveBeenCalledOnce()
+    expect(item.ack).not.toHaveBeenCalled()
+  })
+
+  it('the delivered envelope carries the EMITTING tenant, never anything caller-controlled', async () => {
+    let sentTenant: unknown
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
+      const body = JSON.parse(String((init as RequestInit).body)) as { tenant: unknown; event_id: string }
+      sentTenant = body.tenant
+      return new Response(JSON.stringify({ accepted: true, event_id: body.event_id }), { status: 200 })
+    })
+    const item = message(messageCreatedEvent())
+    item.body.tenant = 'acme-tenant' // the BusEvent's own tenant — set by the producer, not a client
+
+    await handleQueue({ messages: [item] } as unknown as MessageBatch<BusEvent>, envForDelivery())
+
+    expect(sentTenant).toBe('acme-tenant')
   })
 })

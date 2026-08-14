@@ -770,12 +770,27 @@ describe('MCP flight tools', () => {
     const expectedScore = rows.get(id)!.score
     tasks.get('task-m000')!.status = 'done'
     verdicts.set('task-m000', 'approved')
+    // mumega-com#970: flight_dispatch's own sendAgentMessage call (delivering the
+    // flight.dispatch/v1 envelope to the bound agent's inbox) lands a message.created
+    // event HERE, on the healthy Queue, BEFORE the outage below begins. That is correct
+    // and unrelated to what this test is actually about — flight_land's own
+    // flight.landed delivery during an outage — so pin it explicitly rather than let a
+    // stale `toEqual([])` (written before message.created existed) hide it.
+    expect(events).toHaveLength(1)
+    expect(events[0]).toMatchObject({ type: 'message.created', tenant: TENANT })
     setBusFailure(true)
 
     const landed = await invokeTool(auth(), env, 'flight_land', { flight_id: id, cost_micro_usd: 0 }, 'https://pot.example')
     expect(landed.ok, JSON.stringify(landed)).toBe(true)
     expect(outbox.get(id)).toMatchObject({ delivered_at: null, attempts: 1 })
-    expect(events).toEqual([])
+    // The invariant under test: a Queue outage during landing does NOT fail the landing
+    // (asserted above) and does NOT put flight.landed on the bus (it goes to the outbox
+    // instead, asserted above) — but it also must NOT retroactively un-land the message
+    // that already went out cleanly before the outage started. `events` still holds
+    // exactly that one pre-outage message.created and nothing else — no flight.landed
+    // slipped onto the bus despite the failure.
+    expect(events).toHaveLength(1)
+    expect(events.some((e) => (e as { type: string }).type === 'flight.landed')).toBe(false)
 
     outbox.get(id)!.created_at = '2026-07-12T02:00:00.000Z'
     setBusFailure(false)

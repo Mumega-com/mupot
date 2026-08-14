@@ -300,7 +300,24 @@ describe('routine runtime-neutral dispatch', () => {
       'run_id', 'situation_digest', 'version',
     ])
     expect(message?.body).not.toMatch(/token|credential|thread_id|api_key|password|secret/i)
-    expect(env.BUS?.send).not.toHaveBeenCalled()
+    // mumega-com#970: this dispatch's own sendAgentMessage insert (asserted above via the
+    // agent_messages row) now emits its own message.created event — the same plumbing
+    // exercised by every other real dispatch/wake path in this codebase, not something
+    // specific to routines. The ORIGINAL assertion here ("BUS.send never called") predates
+    // that emit existing at all and was never a deliberate project-isolation check — no
+    // other test in this file makes that claim, and dispatchRoutineRun's D1 writes above
+    // are already what proves project attribution. What's actually worth pinning, and
+    // fits this test's own stated purpose ("attributes ... to the exact Project"), is that
+    // the EMITTED event carries the correct project/tenant — i.e. attribution survives
+    // onto the bus, not just into D1.
+    expect(env.BUS?.send).toHaveBeenCalledOnce()
+    const emitted = (env.BUS?.send as ReturnType<typeof vi.fn>).mock.calls[0][0] as {
+      type: string; tenant: string; payload: { project_id: string | null; request_id: string | null }
+    }
+    expect(emitted.type).toBe('message.created')
+    expect(emitted.tenant).toBe('tenant-a')
+    expect(emitted.payload.project_id).toBe('project-1')
+    expect(emitted.payload.request_id).toBe('routine-run:run-1')
   })
 
   it('uses a stable inbox request id when delivery is replayed', async () => {

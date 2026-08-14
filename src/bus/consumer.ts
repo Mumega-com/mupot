@@ -14,11 +14,12 @@
 // message lands in the DLQ.
 
 import type { MessageBatch, Message } from '@cloudflare/workers-types'
-import type { Env, BusEvent, Task } from '../types'
+import type { Env, BusEvent, Task , MessageCreatedPayload } from '../types'
 import { postAgentActivity } from '../channels'
 import { getFleetAgentLiveness } from '../fleet/registry'
 import { deliverDispatchToInbox, dispatchInboxDelivered, InboxFullError, DISPATCH_INBOX_PREFIX } from './fleet-bridge'
 import { notifyHadi } from '../telegram-bridge/bus_notify'
+import { deliverMessageCreatedEvent } from './hermes-delivery'
 
 // Internal origin for DO fetch routing. DO fetch ignores host; the path carries
 // the intent. The agents component routes these paths inside its DO classes.
@@ -409,6 +410,73 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
         squad_id: event.squad_id,
       })
       return true
+    }
+    case 'message.created': {
+      // mumega-com#970 — the push seam's consumer half: sign + POST to a Hermes gateway.
+      //
+      // A prior version of this comment justified NOT delivering by citing two live
+      // measurements: `GET https://hermes-kay.mumega.com/health -> 502 Bad Gateway`, and a
+      // claim that "the Hermes gateway that DOES hold a mupot-events subscription binds
+      // loopback only". BOTH are now stale and were re-measured, not assumed, before this
+      // was rewritten (2026-08-14 ~14:00 UTC, from the same host that runs the Hermes
+      // gateway process):
+      //     GET https://hermes-kay.mumega.com/health -> 200 {"status":"ok","platform":"webhook"}
+      //     `ss -ltnp` -> LISTEN 0.0.0.0:8644 (hermes gateway pid) — public bind, not loopback
+      // The 502 was an nginx vhost proxying 127.0.0.1:8645 (a wecom_callback port nothing
+      // listens on) instead of 8644, where hermes_cli.main gateway actually listens; fixed
+      // host-side. The loopback claim was itself an unmeasured comment quoted forward — see
+      // MEMORY.md "measurement cannot catch a framing error": a stale claim survives review
+      // when nobody re-runs the command it cites.
+      //
+      // What is STILL true, and still governs the code below: the Hermes-side route that
+      // accepts this event (`/webhooks/mupot-events` or equivalent) is not registered yet —
+      // that is host-side Hermes-lane work, out of scope for this branch. So a live delivery
+      // attempt today is expected to 404. src/bus/hermes-delivery.ts classifies that 404 as
+      // a distinct, loud outcome (not a silent ack) and this case THROWS on it, so Cloudflare
+      // Queue's own retry/DLQ policy (wrangler.toml: max_retries=3, dead_letter_queue=
+      // "mupot-events-dlq") carries it forward instead of it disappearing — no new polling
+      // loop, no silent fallback (#970's two named prohibitions).
+      //
+      // src/telegram-bridge/bus_notify.ts:6-18 records the shape of failure this must NOT
+      // reproduce: a correctly-signed payload POSTed into an unreachable/404 endpoint with
+      // bare `resp.ok` logic reporting a clean failure nobody watched. hermes-delivery.ts's
+      // classifyDeliveryOutcome() exists specifically so 404 / 401 / network-timeout / a 2xx
+      // from something that isn't actually our endpoint are four distinct, logged outcomes.
+      // `as`: BusEvent's payload is `unknown` by default (the switch on `event.type` does
+      // not narrow the generic) — same cast this case already relied on for `p` above.
+      const p = event.payload as MessageCreatedPayload
+      const outcome = await deliverMessageCreatedEvent(env, event as BusEvent<MessageCreatedPayload>)
+      const logCtx = {
+        tenant: event.tenant,
+        message_id: p?.message_id,
+        to_agent: p?.to_agent,
+        from_agent: p?.from_agent,
+        kind: p?.kind,
+        request_id: p?.request_id ?? null,
+        in_reply_to: p?.in_reply_to ?? null,
+        project_id: p?.project_id ?? null,
+      }
+      switch (outcome.kind) {
+        case 'not_configured':
+          // Feature not wired on this deployment (URL and/or secret unset). Deliberately
+          // NOT a retry target — retrying a delivery nobody has configured would just churn
+          // the DLQ forever for a knob that is off on purpose. Same explicit-opt-in
+          // discipline as src/telegram-bridge/bus_notify.ts: log which knob is missing,
+          // ack, move on.
+          console.log('bus: message.created — delivery not configured', { ...logCtx, missing: outcome.missing })
+          return true
+        case 'delivered':
+          console.log('bus: message.created — delivered', { ...logCtx, status: outcome.status })
+          return true
+        default:
+          // unexpected_response | unauthorized | not_found | server_error | network_error:
+          // all four are real, present-tense failures of a CONFIGURED delivery target.
+          // Throwing (not returning false) is what makes handleQueue retry instead of
+          // ack — see handleQueue below: only a throw triggers message.retry() /
+          // eventual DLQ landing, a `return false` here would still ack silently.
+          console.error('bus: message.created — delivery failed', { ...logCtx, outcome })
+          throw new Error(`message.created delivery failed: ${outcome.kind}`)
+      }
     }
     default: {
       // Exhaustiveness guard. Unknown types are acked (not retried) to avoid

@@ -142,3 +142,22 @@ crons = ["* * * * *", "0-9,15-24,30-39,45-54 * * * *"]
 # Until these secrets are set the GHL channel is inert (fails closed):
 #   - Outbound sends return { ok: false, reason: 'not_configured' }
 #   - Inbound webhook returns 503 { error: 'not_configured' }
+
+# ── Hermes push delivery (mumega-com#970) — bus consumer's outbound leg for
+# message.created (and future) events. Same shared secret as the Telegram bridge's
+# opt-in webhook path (src/telegram-bridge/bus_notify.ts) — one secret, two callers,
+# see src/types.ts Env comment on HERMES_WEBHOOK_SECRET.
+#
+#   npx wrangler secret put HERMES_WEBHOOK_SECRET   # HMAC-SHA256 signing secret —
+#                                                     # SAME value as HERMES_R6_WEBHOOK_SECRET
+#                                                     # in the Hermes .env
+#
+# Non-secret (goes in [vars]):
+#   HERMES_EVENTS_WEBHOOK_URL = "https://hermes-kay.mumega.com/webhooks/mupot-events"
+#
+# Until BOTH are set, src/bus/hermes-delivery.ts returns { kind: 'not_configured' } and the
+# consumer acks without attempting delivery — never a silent fallback, never a retry storm
+# for a knob that is deliberately off. Once both are set but the Hermes-side route is not
+# yet registered, delivery attempts 404 loudly and retry per the Queue's DLQ policy above —
+# that is expected today; registering the route is Hermes-lane, host-side work, not this
+# repo's.
