@@ -615,8 +615,35 @@ export interface ModelChatOpts {
   temperature?: number // additive v1-optional
 }
 
+export interface TokenUsage {
+  readonly input: number
+  readonly output: number
+  readonly cacheRead?: number
+  readonly cacheWrite?: number
+}
+
+export interface ModelChatResult {
+  /** The assistant's text reply. */
+  text: string
+  /**
+   * Token usage reported by the provider on this call. Optional because not every
+   * transport surfaces it (Workers AI fallback, some gateway providers).
+   * cacheRead/cacheWrite are only present when the provider reports them
+   * (e.g. DeepSeek's prompt_cache_hit_tokens / prompt_cache_miss_tokens).
+   */
+  usage?: TokenUsage
+}
+
 export interface ModelPort {
   chat(messages: ModelMessage[], opts?: ModelChatOpts): Promise<string>
+  /**
+   * chatWithUsage — like chat(), but also returns the provider's token usage
+   * (cache hit/miss split when the provider reports it). ADDITIVE: mocks that only
+   * implement `chat` remain valid (structural typing); callers that need real
+   * usage for metering use this method and fall back to estimates when it is
+   * absent or usage is undefined.
+   */
+  chatWithUsage?(messages: ModelMessage[], opts?: ModelChatOpts): Promise<ModelChatResult>
 }
 
 // ── Brain port (substrate-contract.md §kernel ports). RANK-ONLY: the brain reads

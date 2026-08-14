@@ -15,6 +15,8 @@ import {
   hoursSinceUtcMidnight,
   burnUsdPerHour,
   formatBurn,
+  costUsageMicroUsd,
+  cacheHitRatio,
 } from '../src/agents/cost'
 
 describe('rateUsdPerMillion', () => {
@@ -146,5 +148,51 @@ describe('formatBurn', () => {
     const ms = Date.UTC(2026, 5, 8, 12, 0, 0)
     // 1200 micro-USD over 12h = $0.0001/hr
     expect(formatBurn(1200, ms)).toBe('$0.0001/hr')
+  })
+})
+
+
+// ── cache-aware cost (cache-telemetry, 2026-08-14) ───────────────────────────
+
+describe('costUsageMicroUsd — DeepSeek cache-aware split', () => {
+  const pro = 'deepseek-v4-pro'
+  const flash = 'deepseek-v4-flash'
+
+  it('bills cache-read at the hit rate, not the miss rate', () => {
+    // 1M tokens read from cache on v4-flash: 0.0028/M → $0.0028 → 2,800 micro-USD
+    const micro = costUsageMicroUsd(flash, { input: 1_000_000, output: 0, cacheRead: 1_000_000 })
+    expect(micro).toBe(Math.round(0.0028 * 1_000_000))
+    // same 1M as a MISS: 0.14/M → 140,000 micro-USD — the ~100x split River measured
+    const missMicro = costUsageMicroUsd(flash, { input: 1_000_000, output: 0, cacheRead: 0 })
+    expect(missMicro).toBe(Math.round(0.14 * 1_000_000))
+  })
+
+  it('bills output at the output rate', () => {
+    const micro = costUsageMicroUsd(pro, { input: 0, output: 1_000_000 })
+    expect(micro).toBe(Math.round(0.87 * 1_000_000))
+  })
+
+  it('returns null for an unknown model (never invents a rate)', () => {
+    expect(costUsageMicroUsd('some-unknown-model', { input: 10, output: 10 })).toBeNull()
+    expect(costUsageMicroUsd(null, { input: 10, output: 10 })).toBeNull()
+    expect(costUsageMicroUsd(undefined, { input: 10, output: 10 })).toBeNull()
+  })
+
+  it('returns null for negative / non-finite counts', () => {
+    expect(costUsageMicroUsd(flash, { input: -1, output: 0 })).toBeNull()
+    expect(costUsageMicroUsd(flash, { input: Number.NaN, output: 0 })).toBeNull()
+  })
+})
+
+describe('cacheHitRatio — telemetry', () => {
+  it('is the read/(read+miss) ratio', () => {
+    expect(cacheHitRatio(98, 2)).toBeCloseTo(0.98)
+  })
+  it('is 0 when nothing was measured (never NaN)', () => {
+    expect(cacheHitRatio(0, 0)).toBe(0)
+    expect(Number.isNaN(cacheHitRatio(0, 0))).toBe(false)
+  })
+  it('treats negative inputs as zero', () => {
+    expect(cacheHitRatio(-5, 5)).toBe(0)
   })
 })

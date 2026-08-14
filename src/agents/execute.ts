@@ -32,7 +32,7 @@ import { resolveTaskAssignee } from '../tasks/assignee'
 import { createModel } from '../model'
 import { createBus } from '../bus'
 import { createMemory } from '../memory'
-import { checkAndReserve, recordTokens } from './meter'
+import { checkAndReserve, recordTokens, type RecordTokensUsage } from './meter'
 import { costMicroUsd } from './cost'
 import { detectContentIntent } from './content-intent'
 import type { ContentIntent } from './content-intent'
@@ -213,6 +213,11 @@ export async function runTaskExecution(
     }
   }
 
+  // Hoisted so the catch path can record whatever usage the call DID report
+  // (even on failure the provider may have consumed tokens). Undefined when the
+  // port has no chatWithUsage or the call threw before returning.
+  let chatUsage: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number } | undefined
+
   try {
     const charter = await loadSquadCharter(env, task.squad_id)
     const messages: ModelMessage[] = [
@@ -222,8 +227,11 @@ export async function runTaskExecution(
       { role: 'system', content: buildExecuteSystem(agent, charter, externalMarker(task)) },
       { role: 'user', content: buildExecutePrompt(task) },
     ]
-    const raw = await model.chat(messages, { model: agent.model, maxTokens: EXECUTE_MAX_TOKENS })
-    const result = capResult(typeof raw === 'string' ? raw : '')
+    const chatResult = model.chatWithUsage
+      ? await model.chatWithUsage(messages, { model: agent.model, maxTokens: EXECUTE_MAX_TOKENS })
+      : { text: await model.chat(messages, { model: agent.model, maxTokens: EXECUTE_MAX_TOKENS }), usage: undefined }
+    chatUsage = chatResult.usage
+    const result = capResult(chatResult.text)
     const finishedAt = new Date().toISOString()
 
     // BLOCK-2 close (fake-green guard, 2026-07-20 re-gate on PR #417): this was
@@ -287,7 +295,12 @@ export async function runTaskExecution(
       }
     }
     if (!(await finishTask(env, task.id, agent.id, executionReceiptId, successStatus, result, finishedAt, cycleCostMicroUsd, AGENT_SELF_COMPLETION_GATE_OWNER))) {
-      await recordTokensSafe(meter.recordTokens, env, agent.id, EXECUTE_MAX_TOKENS, cycleCostMicroUsd)
+      await recordTokensSafe(meter.recordTokens, env, agent.id, EXECUTE_MAX_TOKENS, cycleCostMicroUsd, {
+      input: chatUsage?.input,
+      output: chatUsage?.output,
+      cacheRead: chatUsage?.cacheRead,
+      cacheWrite: chatUsage?.cacheWrite,
+    })
       return { ok: false, task_id: task.id, decided: '', error: 'task_claim_lost' }
     }
     // Every execution success now lands 'review' (BLOCK-2 close) — a different
@@ -298,7 +311,12 @@ export async function runTaskExecution(
     // Best-effort token + cost accounting: record EXECUTE_MAX_TOKENS as a conservative
     // estimate, priced at the model rate (#15). When the model port surfaces actual
     // usage, replace EXECUTE_MAX_TOKENS with the real count (cost follows automatically).
-    await recordTokensSafe(meter.recordTokens, env, agent.id, EXECUTE_MAX_TOKENS, cycleCostMicroUsd)
+    await recordTokensSafe(meter.recordTokens, env, agent.id, EXECUTE_MAX_TOKENS, cycleCostMicroUsd, {
+      input: chatUsage?.input,
+      output: chatUsage?.output,
+      cacheRead: chatUsage?.cacheRead,
+      cacheWrite: chatUsage?.cacheWrite,
+    })
     return { ok: true, task_id: task.id, decided: `completed: ${task.title}`, task_status: successStatus }
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'execution_failed'
@@ -306,12 +324,22 @@ export async function runTaskExecution(
     const finishedAt = new Date().toISOString()
     // NEVER leave in_progress stuck — land it in blocked with the error note.
     if (!(await finishTask(env, task.id, agent.id, executionReceiptId, 'blocked', note, finishedAt, cycleCostMicroUsd))) {
-      await recordTokensSafe(meter.recordTokens, env, agent.id, EXECUTE_MAX_TOKENS, cycleCostMicroUsd)
+      await recordTokensSafe(meter.recordTokens, env, agent.id, EXECUTE_MAX_TOKENS, cycleCostMicroUsd, {
+      input: chatUsage?.input,
+      output: chatUsage?.output,
+      cacheRead: chatUsage?.cacheRead,
+      cacheWrite: chatUsage?.cacheWrite,
+    })
       return { ok: false, task_id: task.id, decided: '', error: 'task_claim_lost' }
     }
     await emitSafe(emit, executionEvent('task.blocked', env, agent, task, 'blocked'))
     // Still count tokens + cost on model failure: the call was attempted.
-    await recordTokensSafe(meter.recordTokens, env, agent.id, EXECUTE_MAX_TOKENS, cycleCostMicroUsd)
+    await recordTokensSafe(meter.recordTokens, env, agent.id, EXECUTE_MAX_TOKENS, cycleCostMicroUsd, {
+      input: chatUsage?.input,
+      output: chatUsage?.output,
+      cacheRead: chatUsage?.cacheRead,
+      cacheWrite: chatUsage?.cacheWrite,
+    })
     return { ok: false, task_id: task.id, decided: '', task_status: 'blocked', error: msg }
   }
 }
@@ -751,9 +779,10 @@ async function recordTokensSafe(
   agentId: string,
   tokens: number,
   costMicroUsd = 0,
+  usage?: RecordTokensUsage,
 ): Promise<void> {
   try {
-    await record(env, agentId, tokens, costMicroUsd)
+    await record(env, agentId, tokens, costMicroUsd, usage)
   } catch {
     // best-effort
   }

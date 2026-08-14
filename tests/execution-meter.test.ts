@@ -29,6 +29,9 @@ interface WindowState {
   count: number
   tokens: number
   cost_micro_usd?: number // #15 — optional so pre-cost fixtures stay valid
+  cache_read_tokens?: number // #cache-telemetry — optional so pre-cache fixtures stay valid
+  cache_miss_tokens?: number
+  output_tokens?: number
 }
 
 function makeMockDB(initial: Map<string, WindowState> = new Map()) {
@@ -60,6 +63,9 @@ function makeMockDB(initial: Map<string, WindowState> = new Map()) {
                   count: row.count,
                   tokens: row.tokens,
                   cost_micro_usd: row.cost_micro_usd ?? 0,
+                  cache_read_tokens: row.cache_read_tokens ?? 0,
+                  cache_miss_tokens: row.cache_miss_tokens ?? 0,
+                  output_tokens: row.output_tokens ?? 0,
                 } as unknown as T
               }
               return null as unknown as T
@@ -81,18 +87,32 @@ function makeMockDB(initial: Map<string, WindowState> = new Map()) {
               if (sql.includes('tokens = tokens +')) {
                 const key = args[1] as string
                 // args order: id, window_key, tokens(insert), cost(insert),
-                //             window_start, tokens(update), cost(update)
-                const tokensToAdd = args[5] as number
-                const costToAdd = args[6] as number
+                //   cacheRead(insert), cacheMiss(insert), output(insert), window_start,
+                //   tokens(update), cost(update), cacheRead(update), cacheMiss(update), output(update)
+                const tokensToAdd = args[8] as number
+                const costToAdd = args[9] as number
+                const cacheReadToAdd = args[10] as number
+                const cacheMissToAdd = args[11] as number
+                const outputToAdd = args[12] as number
                 const existing = state.get(key)
                 if (existing) {
                   state.set(key, {
                     ...existing,
                     tokens: existing.tokens + tokensToAdd,
                     cost_micro_usd: (existing.cost_micro_usd ?? 0) + costToAdd,
+                    cache_read_tokens: (existing.cache_read_tokens ?? 0) + cacheReadToAdd,
+                    cache_miss_tokens: (existing.cache_miss_tokens ?? 0) + cacheMissToAdd,
+                    output_tokens: (existing.output_tokens ?? 0) + outputToAdd,
                   })
                 } else {
-                  state.set(key, { count: 0, tokens: tokensToAdd, cost_micro_usd: costToAdd })
+                  state.set(key, {
+                    count: 0,
+                    tokens: tokensToAdd,
+                    cost_micro_usd: costToAdd,
+                    cache_read_tokens: cacheReadToAdd,
+                    cache_miss_tokens: cacheMissToAdd,
+                    output_tokens: outputToAdd,
+                  })
                 }
               }
               return { meta: { changes: 1 } }
@@ -529,5 +549,48 @@ describe('checkAndReserve — verbatim micro-USD cap (P0 sub-cent fix)', () => {
     const env = makeEnv({}, new Map([[todayWindowKey('test-tenant', 'a'), { count: 0, tokens: 0, cost_micro_usd: 6_000 }]]))
     const r = await checkAndReserve(env, 'a', { estimateMicroUsd: 0, budgetCapMicroUsd: 5_000, budgetCapCents: 100 })
     expect(r.ok).toBe(false)
+  })
+})
+
+describe('recordTokens — cache split (cache-telemetry, 2026-08-14)', () => {
+  it('records cacheRead / cacheMiss / output separately when usage is passed', async () => {
+    const env = makeEnv()
+    await recordTokens(env, 'agent-1', 2048, 100, {
+      input: 10_000,
+      output: 2048,
+      cacheRead: 9_000,
+    })
+    const key = todayWindowKey('test-tenant', 'agent-1')
+    const row = (env.DB as any).__read ? null : null
+    // Read through the mock's SELECT path: issue a direct SELECT like checkAndReserve does
+    const sel = await (env.DB as any).prepare(
+      'SELECT count, tokens FROM execution_meter WHERE window_key = ?',
+    ).bind(key).first<{ count: number; tokens: number; cache_read_tokens: number }>()
+    expect(sel).not.toBeNull()
+    expect(sel!.tokens).toBe(2048)
+    expect(sel!.cache_read_tokens).toBe(9000)
+  })
+
+  it('cacheMiss is input minus cacheRead', async () => {
+    const env = makeEnv()
+    await recordTokens(env, 'agent-1', 1000, 0, { input: 5000, output: 1000, cacheRead: 4000 })
+    const key = todayWindowKey('test-tenant', 'agent-1')
+    const sel = await (env.DB as any).prepare(
+      'SELECT count, tokens FROM execution_meter WHERE window_key = ?',
+    ).bind(key).first<{ cache_read_tokens: number; cache_miss_tokens: number; output_tokens: number }>()
+    expect(sel!.cache_read_tokens).toBe(4000)
+    expect(sel!.cache_miss_tokens).toBe(1000)
+    expect(sel!.output_tokens).toBe(1000)
+  })
+
+  it('back-compat: a token-only call still works (no usage arg)', async () => {
+    const env = makeEnv()
+    await recordTokens(env, 'agent-1', 500)
+    const key = todayWindowKey('test-tenant', 'agent-1')
+    const sel = await (env.DB as any).prepare(
+      'SELECT count, tokens FROM execution_meter WHERE window_key = ?',
+    ).bind(key).first<{ tokens: number; cache_read_tokens: number }>()
+    expect(sel!.tokens).toBe(500)
+    expect(sel!.cache_read_tokens).toBe(0)
   })
 })

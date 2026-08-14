@@ -19,7 +19,7 @@
 // onboarding wizard), never tenant business content. Identity/tenant scoping is
 // not this layer's concern — the caller (AgentDO) is already tenant-verified.
 
-import type { Env, ModelPort, ModelMessage } from '../types'
+import type { Env, ModelPort, ModelMessage, ModelChatResult } from '../types'
 
 // ── settings keys (written by the onboarding wizard into org_settings) ──
 const KEY_PROVIDER = 'model_provider'
@@ -114,7 +114,7 @@ async function callAnthropic(
   model: string,
   messages: ModelMessage[],
   maxTokens: number,
-): Promise<string> {
+): Promise<ModelChatResult> {
   const { system, turns } = splitMessages(messages)
   const body: {
     model: string
@@ -134,12 +134,17 @@ async function callAnthropic(
     body: JSON.stringify(body),
   })
   const text = await readGatewayResponse(res, 'anthropic')
-  const json = text as { content?: { type?: string; text?: string }[] }
+  const json = text as {
+    content?: { type?: string; text?: string }[]
+    usage?: { input_tokens?: number; output_tokens?: number }
+  }
   const out = (json.content ?? [])
     .filter((b) => b.type === 'text' && typeof b.text === 'string')
     .map((b) => b.text as string)
     .join('')
-  return out
+  const u = json.usage
+  const usage = u ? { input: u.input_tokens ?? 0, output: u.output_tokens ?? 0 } : undefined
+  return { text: out, usage }
 }
 
 // OpenAI Chat Completions via AI Gateway.
@@ -148,7 +153,7 @@ async function callOpenAI(
   model: string,
   messages: ModelMessage[],
   maxTokens: number,
-): Promise<string> {
+): Promise<ModelChatResult> {
   const body = {
     model,
     max_tokens: maxTokens,
@@ -164,8 +169,23 @@ async function callOpenAI(
   })
   const json = (await readGatewayResponse(res, 'openai')) as {
     choices?: { message?: { content?: string } }[]
+    usage?: {
+      prompt_tokens?: number
+      completion_tokens?: number
+      prompt_cache_hit_tokens?: number
+      prompt_cache_miss_tokens?: number
+    }
   }
-  return json.choices?.[0]?.message?.content ?? ''
+  const u = json.usage
+  const usage = u
+    ? {
+        input: u.prompt_tokens ?? (u.prompt_cache_hit_tokens ?? 0) + (u.prompt_cache_miss_tokens ?? 0),
+        output: u.completion_tokens ?? 0,
+        cacheRead: u.prompt_cache_hit_tokens ?? 0,
+        cacheWrite: u.prompt_cache_miss_tokens ?? 0,
+      }
+    : undefined
+  return { text: json.choices?.[0]?.message?.content ?? '', usage }
 }
 
 // Google Gemini (generateContent) via AI Gateway's google-ai-studio provider.
@@ -174,7 +194,7 @@ async function callGoogle(
   model: string,
   messages: ModelMessage[],
   maxTokens: number,
-): Promise<string> {
+): Promise<ModelChatResult> {
   const { system, turns } = splitMessages(messages)
   const body: {
     systemInstruction?: { parts: { text: string }[] }
@@ -202,9 +222,16 @@ async function callGoogle(
   )
   const json = (await readGatewayResponse(res, 'google')) as {
     candidates?: { content?: { parts?: { text?: string }[] } }[]
+    usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number }
   }
   const parts = json.candidates?.[0]?.content?.parts ?? []
-  return parts.map((p) => p.text ?? '').join('')
+  const u = json.usageMetadata as
+    | { promptTokenCount?: number; candidatesTokenCount?: number; totalTokenCount?: number }
+    | undefined
+  const usage = u
+    ? { input: u.promptTokenCount ?? 0, output: u.candidatesTokenCount ?? 0 }
+    : undefined
+  return { text: parts.map((p) => p.text ?? '').join(''), usage }
 }
 
 // Shared gateway response handler. Throws a CLEAR error on non-2xx WITHOUT echoing
@@ -227,7 +254,7 @@ async function readGatewayResponse(res: Response, provider: GatewayProvider): Pr
 }
 
 // ── Workers AI fallback ──
-async function callWorkersAI(env: Env, model: string, messages: ModelMessage[]): Promise<string> {
+async function callWorkersAI(env: Env, model: string, messages: ModelMessage[]): Promise<ModelChatResult> {
   // env.AI.run is typed against a model union; the chat model id is a constant of
   // this module (or a caller-supplied override), so we narrow at this one boundary.
   const ai = env.AI
@@ -237,8 +264,8 @@ async function callWorkersAI(env: Env, model: string, messages: ModelMessage[]):
       messages: messages.map((m) => ({ role: m.role, content: m.content })),
     } as Parameters<typeof ai.run>[1],
   )) as { response?: string } | string
-  if (typeof resp === 'string') return resp
-  return resp.response ?? ''
+  if (typeof resp === 'string') return { text: resp, usage: undefined }
+  return { text: resp.response ?? '', usage: undefined }
 }
 
 // ── factory ──
@@ -255,6 +282,12 @@ async function callWorkersAI(env: Env, model: string, messages: ModelMessage[]):
 export function createModel(env: Env): ModelPort {
   return {
     async chat(messages: ModelMessage[], opts?: ChatOpts): Promise<string> {
+      const result = await this.chatWithUsage?.(messages, opts)
+      // chatWithUsage is always present on the real factory; the guard keeps the
+      // structural contract honest if a caller wraps only `chat`.
+      return result ? result.text : ''
+    },
+    async chatWithUsage(messages: ModelMessage[], opts?: ChatOpts): Promise<ModelChatResult> {
       const maxTokens = opts?.maxTokens && opts.maxTokens > 0 ? opts.maxTokens : DEFAULT_MAX_TOKENS
 
       const provider = await getSetting(env, KEY_PROVIDER)

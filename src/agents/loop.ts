@@ -358,14 +358,22 @@ export async function runGoalCycle(
       },
     ]
 
-    const raw = await model.chat(messages, { model: agent.model })
+    const chatResult = model.chatWithUsage
+      ? await model.chatWithUsage(messages, { model: agent.model })
+      : { text: await model.chat(messages, { model: agent.model }), usage: undefined }
+    const raw = chatResult.text
 
     // Record this planning call's (conservative) spend so the dollar cap (#4) sees
     // the loop's OWN burn, not just execute-mode spend. Best-effort — a failed
     // accounting write must never abort the cycle.
     const recordSpend = deps.recordTokens ?? recordTokens
     try {
-      await recordSpend(env, agent.id, LOOP_PLANNING_MAX_TOKENS, estimateMicroUsd)
+      await recordSpend(env, agent.id, LOOP_PLANNING_MAX_TOKENS, estimateMicroUsd, {
+        input: chatResult.usage?.input,
+        output: chatResult.usage?.output,
+        cacheRead: chatResult.usage?.cacheRead,
+        cacheWrite: chatResult.usage?.cacheWrite,
+      })
     } catch {
       // best-effort accounting
     }

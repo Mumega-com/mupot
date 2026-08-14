@@ -140,3 +140,84 @@ export function formatBurn(spendTodayMicroUsd: number, nowMs: number): string {
   if (perHr < 0.01) return `$${perHr.toFixed(4)}/hr`
   return `$${perHr.toFixed(2)}/hr`
 }
+
+
+// ── Cache-aware rates (DeepSeek V4) ───────────────────────────────────────────
+//
+// River verified these LIVE on 2026-08-14 (running deepseek-v4-pro); cross-checked
+// against BenchLM's published DeepSeek API pricing (synced 2026-07-31):
+//   v4-pro:   cache-hit $0.003625/M · miss $0.435/M · output $0.87/M
+//   v4-flash: cache-hit $0.0028/M   · miss $0.14/M  · output $0.28/M
+//
+// Why the split matters: the previous blended rate (0.24/M, commit cd9be86) billed
+// cache-hit tokens at the full input rate, overstating loop cost by ~100× and
+// making the budget meter block early. DeepSeek's whole economics is the cache:
+// at a 98% hit rate the EFFECTIVE input price is ~0.8% of the miss price.
+//
+// Aug 16 the vendor switches to peak/off-peak (off-peak = half peak; peak windows
+// 01:00–04:00 and 06:00–10:00 UTC). The switch must be a CONFIG EDIT to the table
+// below, not a code change — keep all rates in this ONE structure.
+export interface DeepSeekRates {
+  readonly cacheHitUsdPerMTok: number
+  readonly cacheMissUsdPerMTok: number
+  readonly outputUsdPerMTok: number
+  readonly peakWindowsUtc?: ReadonlyArray<readonly [startHour: number, endHour: number]>
+}
+
+export const DEEPSEEK_RATES_USD_PER_M: Readonly<Record<string, DeepSeekRates>> = {
+  'deepseek-v4-pro': {
+    cacheHitUsdPerMTok: 0.003625,
+    cacheMissUsdPerMTok: 0.435,
+    outputUsdPerMTok: 0.87,
+    // Peak/off-peak arrives 2026-08-16; off-peak = half peak. TODO: flip when live.
+    peakWindowsUtc: [[1, 4], [6, 10]],
+  },
+  'deepseek-v4-flash': {
+    cacheHitUsdPerMTok: 0.0028,
+    cacheMissUsdPerMTok: 0.14,
+    outputUsdPerMTok: 0.28,
+    peakWindowsUtc: [[1, 4], [6, 10]],
+  },
+}
+
+/**
+ * costUsageMicroUsd(model, usage) — cost of a REAL usage record, cache-aware.
+ *
+ * Cache-hit tokens bill at the hit rate; cache-miss + non-cache input at the miss
+ * rate; output at the output rate. Unknown models / missing usage → null (caller
+ * decides: estimate or refuse — never invent).
+ *
+ * This is the function recordTokens/execute should use once ModelPort surfaces
+ * real usage; it replaces the blended estimate for POST-call metering.
+ */
+export function costUsageMicroUsd(
+  model: string | null | undefined,
+  usage: { input: number; output: number; cacheRead?: number; cacheWrite?: number },
+): number | null {
+  if (typeof model !== 'string') return null
+  const rates = DEEPSEEK_RATES_USD_PER_M[model]
+  if (!rates) return null // no split table → caller falls back to blended estimate
+
+  const input = usage.input
+  const output = usage.output
+  const cacheRead = usage.cacheRead ?? 0
+  const cacheMiss = Math.max(input - cacheRead, 0) // cacheWrite billed as miss when uncached
+  if (!Number.isFinite(input) || !Number.isFinite(output) || input < 0 || output < 0) return null
+
+  const usd =
+    cacheRead * (rates.cacheHitUsdPerMTok / 1_000_000) +
+    cacheMiss * (rates.cacheMissUsdPerMTok / 1_000_000) +
+    output * (rates.outputUsdPerMTok / 1_000_000)
+  return Math.round(usd * 1_000_000) // dollars → micro-USD
+}
+
+/**
+ * cacheHitRatio(cacheRead, cacheMiss) — rolling cache-hit ratio for telemetry.
+ * 0 when there is nothing to measure; never NaN.
+ */
+export function cacheHitRatio(cacheRead: number, cacheMiss: number): number {
+  const read = cacheRead > 0 ? cacheRead : 0
+  const miss = cacheMiss > 0 ? cacheMiss : 0
+  if (read + miss === 0) return 0
+  return read / (read + miss)
+}

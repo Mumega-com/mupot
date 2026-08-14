@@ -1,3 +1,4 @@
+import type { TokenUsage } from '../types'
 /**
  * Model price table — the ONLY place a token count becomes money.
  *
@@ -71,12 +72,7 @@ export const MODEL_PRICES: Readonly<Record<string, ModelPrice>> = {
   },
 }
 
-export interface TokenUsage {
-  readonly input: number
-  readonly output: number
-  readonly cacheRead?: number
-  readonly cacheWrite?: number
-}
+// TokenUsage now lives in src/types.ts (the shared contract) — imported below.
 
 /**
  * Price one usage record. Returns null for an unknown model or a negative/non-finite count —
