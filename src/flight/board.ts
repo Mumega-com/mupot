@@ -27,11 +27,22 @@ const PHASE: Record<FlightStatus, FlightPhase> = {
 // between legs. Terminal flights (landed/failed/held) are history.
 const LIVE_PHASES: ReadonlySet<FlightPhase> = new Set<FlightPhase>(['preflight', 'flying', 'holding', 'sleeping'])
 
+// Structural phase metric separation (Flight-006 Slice 2): the score column is
+// phase-scoped. Preflight = readiness; landed = coherence. Flying/held/failed have
+// NO score badge — their state is the phase/outcome, not a success percentage.
+const PHASE_METRIC_LABEL: Partial<Record<FlightPhase, string>> = {
+  preflight: 'readiness',
+  landed: 'coherence',
+}
+
 export type Trend = 'up' | 'down' | 'flat'
 
 export interface FlightCard {
   id: string
   agent: string
+  // Canonical display identity (server-joined); falls back to the raw id.
+  agent_name: string
+  squad_name: string | null
   goal: string
   status: FlightStatus
   phase: FlightPhase
@@ -40,7 +51,10 @@ export interface FlightCard {
   budget_usd: string | null
   over_budget: boolean
   score: number | null
+  // Phase-appropriate score only: preflight=readiness, landed=coherence.
+  // Failed/held/flying have NO success-looking percentage.
   score_pct: string | null
+  metric_label: string | null
   trend: Trend | null
   next_departure: string | null
   age: string
@@ -96,9 +110,14 @@ export function buildBoard(rows: FlightRow[], nowMs: number): FlightCard[] {
       }
     }
 
+    const metricLabel = PHASE_METRIC_LABEL[phase] ?? null
+    const scoreShown = metricLabel !== null && row.score != null && Number.isFinite(row.score)
+
     return {
       id: row.id,
       agent: row.agent,
+      agent_name: row.agent_name ?? row.agent,
+      squad_name: row.squad_name ?? null,
       goal: row.goal,
       status: row.status,
       phase,
@@ -107,7 +126,8 @@ export function buildBoard(rows: FlightRow[], nowMs: number): FlightCard[] {
       budget_usd: formatUsd(row.budget_micro_usd),
       over_budget: over,
       score: row.score,
-      score_pct: formatPct(row.score),
+      score_pct: scoreShown ? formatPct(row.score) : null,
+      metric_label: metricLabel,
       trend,
       next_departure: nextDeparture(row, nowMs),
       age: `${humanDur(nowMs - row.created_at)} ago`,

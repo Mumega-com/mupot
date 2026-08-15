@@ -206,7 +206,7 @@ describe('GET /collisions — read-only tower view', () => {
                   if (sql.includes('FROM capabilities')) {
                     return { results: [{ member_id: 'admin-1', scope_type: 'org', scope_id: null, capability: 'admin' }] as T[] }
                   }
-                  if (sql.includes('FROM flights WHERE tenant=')) {
+                  if (sql.includes('FROM flights f')) {
                     return { results: flights.filter((f) => f.tenant === args[0]) as unknown as T[] }
                   }
                   return { results: [] as T[] }
