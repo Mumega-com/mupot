@@ -22,9 +22,9 @@ describe('entity-resolver — fail-closed short-UUID prefix resolution (real sch
     const { harness, env } = makeHarness()
     const agentId = '17aa283f-8cdb-4c1f-864f-1974ee45a033'
     harness.sqlite.exec(`
-      INSERT INTO departments (id, slug, name, tenant) VALUES ('dept-1', 'eng', 'Engineering', 'mumega');
-      INSERT INTO squads (id, department_id, slug, name, charter, tenant) VALUES ('squad-1', 'dept-1', 'core', 'Core Squad', 'Build core', 'mumega');
-      INSERT INTO agents (id, squad_id, slug, name, role, model, status, tenant) VALUES ('${agentId}', 'squad-1', 'loom', 'Loom', 'Lead', 'gemini', 'active', 'mumega');
+      INSERT INTO departments (id, slug, name) VALUES ('dept-1', 'eng', 'Engineering');
+      INSERT INTO squads (id, department_id, slug, name, charter) VALUES ('squad-1', 'dept-1', 'core', 'Core Squad', 'Build core');
+      INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('${agentId}', 'squad-1', 'loom', 'Loom', 'Lead', 'gemini', 'active');
     `)
 
     const res = await resolveEntity<{ id: string; name: string }>(
@@ -43,9 +43,9 @@ describe('entity-resolver — fail-closed short-UUID prefix resolution (real sch
     const { harness, env } = makeHarness()
     const agentId = '17aa283f-8cdb-4c1f-864f-1974ee45a033'
     harness.sqlite.exec(`
-      INSERT INTO departments (id, slug, name, tenant) VALUES ('dept-1', 'eng', 'Engineering', 'mumega');
-      INSERT INTO squads (id, department_id, slug, name, charter, tenant) VALUES ('squad-1', 'dept-1', 'core', 'Core Squad', 'Build core', 'mumega');
-      INSERT INTO agents (id, squad_id, slug, name, role, model, status, tenant) VALUES ('${agentId}', 'squad-1', 'loom', 'Loom', 'Lead', 'gemini', 'active', 'mumega');
+      INSERT INTO departments (id, slug, name) VALUES ('dept-1', 'eng', 'Engineering');
+      INSERT INTO squads (id, department_id, slug, name, charter) VALUES ('squad-1', 'dept-1', 'core', 'Core Squad', 'Build core');
+      INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('${agentId}', 'squad-1', 'loom', 'Loom', 'Lead', 'gemini', 'active');
     `)
 
     const res = await resolveEntity<{ id: string; name: string }>(
@@ -64,9 +64,9 @@ describe('entity-resolver — fail-closed short-UUID prefix resolution (real sch
     const { harness, env } = makeHarness()
     const agentId = '17aa283f-8cdb-4c1f-864f-1974ee45a033'
     harness.sqlite.exec(`
-      INSERT INTO departments (id, slug, name, tenant) VALUES ('dept-1', 'eng', 'Engineering', 'mumega');
-      INSERT INTO squads (id, department_id, slug, name, charter, tenant) VALUES ('squad-1', 'dept-1', 'core', 'Core Squad', 'Build core', 'mumega');
-      INSERT INTO agents (id, squad_id, slug, name, role, model, status, tenant) VALUES ('${agentId}', 'squad-1', 'loom', 'Loom', 'Lead', 'gemini', 'active', 'mumega');
+      INSERT INTO departments (id, slug, name) VALUES ('dept-1', 'eng', 'Engineering');
+      INSERT INTO squads (id, department_id, slug, name, charter) VALUES ('squad-1', 'dept-1', 'core', 'Core Squad', 'Build core');
+      INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('${agentId}', 'squad-1', 'loom', 'Loom', 'Lead', 'gemini', 'active');
     `)
 
     const res = await resolveEntity<{ id: string }>(env, 'agents', '17aa28')
@@ -81,10 +81,10 @@ describe('entity-resolver — fail-closed short-UUID prefix resolution (real sch
     const id1 = 'ambig123-1111-4444-8888-aaaaaaaaaaaa'
     const id2 = 'ambig123-2222-4444-8888-bbbbbbbbbbbb'
     harness.sqlite.exec(`
-      INSERT INTO departments (id, slug, name, tenant) VALUES ('dept-1', 'eng', 'Engineering', 'mumega');
-      INSERT INTO squads (id, department_id, slug, name, charter, tenant) VALUES ('squad-1', 'dept-1', 'core', 'Core Squad', 'Build core', 'mumega');
-      INSERT INTO agents (id, squad_id, slug, name, role, model, status, tenant) VALUES ('${id1}', 'squad-1', 'a1', 'Agent 1', 'Lead', 'gemini', 'active', 'mumega');
-      INSERT INTO agents (id, squad_id, slug, name, role, model, status, tenant) VALUES ('${id2}', 'squad-1', 'a2', 'Agent 2', 'Lead', 'gemini', 'active', 'mumega');
+      INSERT INTO departments (id, slug, name) VALUES ('dept-1', 'eng', 'Engineering');
+      INSERT INTO squads (id, department_id, slug, name, charter) VALUES ('squad-1', 'dept-1', 'core', 'Core Squad', 'Build core');
+      INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('${id1}', 'squad-1', 'a1', 'Agent 1', 'Lead', 'gemini', 'active');
+      INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('${id2}', 'squad-1', 'a2', 'Agent 2', 'Lead', 'gemini', 'active');
     `)
 
     const res = await resolveEntity<{ id: string }>(env, 'agents', 'ambig123')
@@ -109,13 +109,13 @@ describe('entity-resolver — fail-closed short-UUID prefix resolution (real sch
     const task2 = 'ambig123-tk22-4444-8888-bbbbbbbbbbbb'
 
     harness.sqlite.exec(`
-      INSERT INTO departments (id, slug, name, tenant) VALUES ('dept-1', 'eng', 'Engineering', 'mumega');
-      INSERT INTO squads (id, department_id, slug, name, charter, tenant) VALUES ('${squad1}', 'dept-1', 's1', 'Squad 1', 'C1', 'mumega');
-      INSERT INTO squads (id, department_id, slug, name, charter, tenant) VALUES ('${squad2}', 'dept-1', 's2', 'Squad 2', 'C2', 'mumega');
-      INSERT INTO agents (id, squad_id, slug, name, role, model, status, tenant) VALUES ('${agent1}', '${squad1}', 'a1', 'Agent 1', 'Lead', 'gemini', 'active', 'mumega');
-      INSERT INTO agents (id, squad_id, slug, name, role, model, status, tenant) VALUES ('${agent2}', '${squad1}', 'a2', 'Agent 2', 'Lead', 'gemini', 'active', 'mumega');
-      INSERT INTO tasks (id, squad_id, title, done_when, status, tenant, created_at, updated_at) VALUES ('${task1}', '${squad1}', 'Task 1', 'Pass 1', 'open', 'mumega', '2026-08-15T00:00:00.000Z', '2026-08-15T00:00:00.000Z');
-      INSERT INTO tasks (id, squad_id, title, done_when, status, tenant, created_at, updated_at) VALUES ('${task2}', '${squad1}', 'Task 2', 'Pass 2', 'open', 'mumega', '2026-08-15T00:00:00.000Z', '2026-08-15T00:00:00.000Z');
+      INSERT INTO departments (id, slug, name) VALUES ('dept-1', 'eng', 'Engineering');
+      INSERT INTO squads (id, department_id, slug, name, charter) VALUES ('${squad1}', 'dept-1', 's1', 'Squad 1', 'C1');
+      INSERT INTO squads (id, department_id, slug, name, charter) VALUES ('${squad2}', 'dept-1', 's2', 'Squad 2', 'C2');
+      INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('${agent1}', '${squad1}', 'a1', 'Agent 1', 'Lead', 'gemini', 'active');
+      INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('${agent2}', '${squad1}', 'a2', 'Agent 2', 'Lead', 'gemini', 'active');
+      INSERT INTO tasks (id, squad_id, title, done_when, status, created_at, updated_at) VALUES ('${task1}', '${squad1}', 'Task 1', 'Pass 1', 'open', '2026-08-15T00:00:00.000Z', '2026-08-15T00:00:00.000Z');
+      INSERT INTO tasks (id, squad_id, title, done_when, status, created_at, updated_at) VALUES ('${task2}', '${squad1}', 'Task 2', 'Pass 2', 'open', '2026-08-15T00:00:00.000Z', '2026-08-15T00:00:00.000Z');
     `)
 
     const squadOutcome = await getSquad(env, 'ambig123')
