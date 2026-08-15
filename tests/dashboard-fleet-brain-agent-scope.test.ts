@@ -125,19 +125,19 @@ describe('FLIGHT-001 #797 — /fleet, /brain, /agents/:id squad scoping (real SQ
     harness = undefined
   })
 
-  // ── GET /fleet ──────────────────────────────────────────────────────────────
+  // ── GET /radar?tab=fleet (formerly /fleet) ───────────────────────────────────
 
-  it('zero-capability member: 403 on GET /fleet (F2 floor — asserted once, not re-litigated)', async () => {
+  it('zero-capability member: 403 on GET /radar?tab=fleet (F2 floor — asserted once, not re-litigated)', async () => {
     harness = await makeHarness()
     const env = envFor(harness, { 'sess:s-zero': sessionRecord('zero@drive-by.test') })
-    const res = await dashboardApp.fetch(req('/fleet', 's-zero'), env)
+    const res = await dashboardApp.fetch(req('/radar?tab=fleet', 's-zero'), env)
     expect(res.status).toBe(403)
   })
 
-  it('squad-a member: 200 on GET /fleet, sees ONLY Host A + their own presence row', async () => {
+  it('squad-a member: 200 on GET /radar?tab=fleet, sees ONLY Host A + their own presence row', async () => {
     harness = await makeHarness()
     const env = envFor(harness, { 'sess:s-squad-a': sessionRecord('squad-a@pot.test') })
-    const res = await dashboardApp.fetch(req('/fleet', 's-squad-a'), env)
+    const res = await dashboardApp.fetch(req('/radar?tab=fleet', 's-squad-a'), env)
     expect(res.status).toBe(200)
     const body = await res.text()
     expect(body).toContain('Host A')
@@ -146,10 +146,10 @@ describe('FLIGHT-001 #797 — /fleet, /brain, /agents/:id squad scoping (real SQ
     expect(body).not.toContain('Squad B Member')
   })
 
-  it('squad-b member: 200 on GET /fleet, sees ONLY Host B + their own presence row', async () => {
+  it('squad-b member: 200 on GET /radar?tab=fleet, sees ONLY Host B + their own presence row', async () => {
     harness = await makeHarness()
     const env = envFor(harness, { 'sess:s-squad-b': sessionRecord('squad-b@pot.test') })
-    const res = await dashboardApp.fetch(req('/fleet', 's-squad-b'), env)
+    const res = await dashboardApp.fetch(req('/radar?tab=fleet', 's-squad-b'), env)
     expect(res.status).toBe(200)
     const body = await res.text()
     expect(body).toContain('Host B')
@@ -158,10 +158,10 @@ describe('FLIGHT-001 #797 — /fleet, /brain, /agents/:id squad scoping (real SQ
     expect(body).not.toContain('Squad A Member')
   })
 
-  it('org-scope capability: 200 on GET /fleet, sees BOTH host agents and BOTH presence rows', async () => {
+  it('org-scope capability: 200 on GET /radar?tab=fleet, sees BOTH host agents and BOTH presence rows', async () => {
     harness = await makeHarness()
     const env = envFor(harness, { 'sess:s-org': sessionRecord('org@pot.test') })
-    const res = await dashboardApp.fetch(req('/fleet', 's-org'), env)
+    const res = await dashboardApp.fetch(req('/radar?tab=fleet', 's-org'), env)
     expect(res.status).toBe(200)
     const body = await res.text()
     expect(body).toContain('Host A')
@@ -173,7 +173,7 @@ describe('FLIGHT-001 #797 — /fleet, /brain, /agents/:id squad scoping (real SQ
   it('legacy owner (no fine-grained capabilities row at all): 200, sees every squad', async () => {
     harness = await makeHarness()
     const env = envFor(harness, { 'sess:s-owner': sessionRecord('owner@pot.test', 'owner') })
-    const res = await dashboardApp.fetch(req('/fleet', 's-owner'), env)
+    const res = await dashboardApp.fetch(req('/radar?tab=fleet', 's-owner'), env)
     expect(res.status).toBe(200)
     const body = await res.text()
     expect(body).toContain('Host A')
