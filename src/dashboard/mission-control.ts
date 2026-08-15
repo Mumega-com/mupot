@@ -14,7 +14,7 @@ import type { MotherboardViewData } from './motherboard'
 import type { DepartureCard } from '../coordination/journeys'
 import { renderBrainImage, renderAgentCard } from './radar-view'
 import { motherboardPageBody } from './motherboard'
-import { potFleetBody, controlTowerBody } from './index'
+import { potFleetBody, controlTowerBody } from './mission-control-views'
 
 export interface MissionControlData {
   radar: FleetRadar
