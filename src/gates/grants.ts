@@ -136,3 +136,23 @@ export async function revokeGateCapability(
     .bind(input.capability, input.principalType, input.principalId)
     .run()
 }
+
+
+/**
+ * Resolve a gate_owner CAPABILITY NAME (e.g. 'gate:athena') to the single AGENT
+ * principal that holds it, from the gate_grants table (migration 0008:
+ * capability, principal_type, principal_id — no tenant column, mirroring every
+ * other gate_grants query in this codebase). Zero or more than one agent holder
+ * has no unambiguous wake target, so the caller treats it as "skip silently" —
+ * the same posture task_verdict takes when a capability isn't resolvable to a
+ * sole actor.
+ */
+export async function resolveSoleGateOwnerAgent(env: Env, gateOwner: string): Promise<string | null> {
+  const rows = await env.DB.prepare(
+    `SELECT principal_id FROM gate_grants WHERE capability = ?1 AND principal_type = 'agent'`,
+  )
+    .bind(gateOwner)
+    .all<{ principal_id: string }>()
+  const results = rows.results ?? []
+  return results.length === 1 ? results[0].principal_id : null
+}
