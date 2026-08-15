@@ -270,9 +270,12 @@ async function callWorkersAI(env: Env, model: string, messages: ModelMessage[]):
     {
       messages: messages.map((m) => ({ role: m.role, content: m.content })),
     } as Parameters<typeof ai.run>[1],
-  )) as { response?: string } | string
+  )) as { response?: unknown } | string
   if (typeof resp === 'string') return { text: resp, usage: undefined }
-  return { text: resp.response ?? '', usage: undefined }
+  // Workers AI can return `response` as a non-string (array/object); enforce the
+  // ModelChatResult.text string contract so a drifted response never leaks through.
+  const r = resp?.response
+  return { text: typeof r === 'string' ? r : '', usage: undefined }
 }
 
 // ── factory ──
@@ -292,7 +295,7 @@ export function createModel(env: Env): ModelPort {
       const result = await this.chatWithUsage?.(messages, opts)
       // chatWithUsage is always present on the real factory; the guard keeps the
       // structural contract honest if a caller wraps only `chat`.
-      return result ? result.text : ''
+      return result && typeof result.text === 'string' ? result.text : ''
     },
     async chatWithUsage(messages: ModelMessage[], opts?: ChatOpts): Promise<ModelChatResult> {
       const maxTokens = opts?.maxTokens && opts.maxTokens > 0 ? opts.maxTokens : DEFAULT_MAX_TOKENS
