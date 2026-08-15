@@ -19,7 +19,7 @@
 // onboarding wizard), never tenant business content. Identity/tenant scoping is
 // not this layer's concern — the caller (AgentDO) is already tenant-verified.
 
-import type { Env, ModelPort, ModelMessage, ModelChatResult } from '../types'
+import type { Env, ModelPort, ModelMessage, ModelChatResult, TokenUsage } from '../types'
 
 // ── settings keys (written by the onboarding wizard into org_settings) ──
 const KEY_PROVIDER = 'model_provider'
@@ -261,21 +261,78 @@ async function readGatewayResponse(res: Response, provider: GatewayProvider): Pr
 }
 
 // ── Workers AI fallback ──
-async function callWorkersAI(env: Env, model: string, messages: ModelMessage[]): Promise<ModelChatResult> {
+
+/**
+ * Normalize every known Workers AI text-generation response shape to a single
+ * assistant string:
+ *   - plain string (rare)
+ *   - `{ response: string }` (stream:false)
+ *   - `{ response: <array of {response:string}|string chunks> }` (some models
+ *     assemble the stream into an array)
+ *   - ReadableStream<{ response: string }> (default stream:true)
+ * A drifted shape must NEVER leak a non-string into parseDecision/parseProposals
+ * (raw2.indexOf crash) — and must not silently drop real output to ''.
+ */
+async function extractWorkersText(resp: unknown): Promise<string> {
+  if (typeof resp === 'string') return resp
+  if (resp === null || typeof resp !== 'object') return ''
+
+  // ReadableStream (stream:true drift): read + join the chunk texts.
+  const maybeStream = resp as { getReader?: unknown }
+  if (typeof maybeStream.getReader === 'function') {
+    const reader = (resp as ReadableStream<{ response?: unknown }>).getReader()
+    let out = ''
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (typeof value === 'string') { out += value; continue }
+      const t = (value as { response?: unknown } | undefined)?.response
+      if (typeof t === 'string') out += t
+    }
+    return out
+  }
+
+  const r = (resp as { response?: unknown }).response
+  if (typeof r === 'string') return r
+  if (Array.isArray(r)) {
+    return r
+      .map((chunk): string => {
+        if (typeof chunk === 'string') return chunk
+        if (chunk && typeof chunk === 'object') {
+          const t = (chunk as { response?: unknown }).response
+          return typeof t === 'string' ? t : ''
+        }
+        return ''
+      })
+      .join('')
+  }
+  return ''
+}
+
+/** Map Workers AI usage (prompt_tokens/completion_tokens) to TokenUsage. */
+function normalizeWorkersUsage(resp: unknown): TokenUsage | undefined {
+  if (!resp || typeof resp !== 'object') return undefined
+  const u = (resp as { usage?: { prompt_tokens?: number; completion_tokens?: number } }).usage
+  if (!u || typeof u !== 'object') return undefined
+  return {
+    input: typeof u.prompt_tokens === 'number' ? u.prompt_tokens : 0,
+    output: typeof u.completion_tokens === 'number' ? u.completion_tokens : 0,
+  }
+}
+
+async function callWorkersAI(env: Env, model: string, messages: ModelMessage[], maxTokens: number): Promise<ModelChatResult> {
   // env.AI.run is typed against a model union; the chat model id is a constant of
   // this module (or a caller-supplied override), so we narrow at this one boundary.
   const ai = env.AI
-  const resp = (await ai.run(
+  const resp: unknown = await ai.run(
     model as Parameters<typeof ai.run>[0], // module-constant or caller-supplied chat model id
     {
       messages: messages.map((m) => ({ role: m.role, content: m.content })),
+      stream: false, // force non-streaming `{ response: string, usage? }` shape
+      max_tokens: maxTokens,
     } as Parameters<typeof ai.run>[1],
-  )) as { response?: unknown } | string
-  if (typeof resp === 'string') return { text: resp, usage: undefined }
-  // Workers AI can return `response` as a non-string (array/object); enforce the
-  // ModelChatResult.text string contract so a drifted response never leaks through.
-  const r = resp?.response
-  return { text: typeof r === 'string' ? r : '', usage: undefined }
+  )
+  return { text: await extractWorkersText(resp), usage: normalizeWorkersUsage(resp) }
 }
 
 // ── factory ──
@@ -319,7 +376,7 @@ export function createModel(env: Env): ModelPort {
       // a Workers AI model id (starts with '@cf/'); otherwise the module default —
       // a provider-style id (e.g. "claude-…") is meaningless to env.AI.run.
       const override = opts?.model && opts.model.startsWith('@cf/') ? opts.model : null
-      return callWorkersAI(env, override ?? WORKERS_AI_CHAT_MODEL, messages)
+      return callWorkersAI(env, override ?? WORKERS_AI_CHAT_MODEL, messages, maxTokens)
     },
   }
 }
