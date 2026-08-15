@@ -4669,37 +4669,88 @@ function agentConsoleBody(agent: Agent, squad: Squad | null, canWake: boolean) {
 // polls /api/tasks/:id every 2s (cap 120s), rendering sent → working → done.
 function sendPageBody(agents: PickerAgent[], project?: Project, projectSquadsTruncated = false) {
   const hasAgents = agents.length > 0
-  const options = agents
+  const agentOptions = agents
     .map(
       (a) =>
         `<option value="${escAttr(`${a.id}|${a.squad_id}`)}">${escHtml(a.name)} — ${escHtml(a.role)} · ${escHtml(a.squad_name)}</option>`,
     )
     .join('')
 
-  const form = hasAgents
+  // Unique squad list for the backlog squad picker (post requires a squad).
+  const squadMap = new Map<string, string>()
+  for (const a of agents) squadMap.set(a.squad_id, a.squad_name)
+  const squadOptions = Array.from(squadMap.entries())
+    .map(([id, name]) => `<option value="${escAttr(id)}">${escHtml(name)}</option>`)
+    .join('')
+
+  // ── New backlog task (planning only: dispatch:false, unassigned by default) ──
+  const backlogForm = html`
+    <div class="card">
+      <h2 style="margin:0 0 4px">New backlog task</h2>
+      <p class="dim" style="margin:0 0 14px;font-size:13px">Captures planning work without waking anyone — dispatch:false, nothing executes.</p>
+      <label class="block">
+        <span class="lbl">Title</span>
+        <input id="bk-title" placeholder="Short, specific title">
+      </label>
+      <label class="block" style="margin-top:10px">
+        <span class="lbl">What needs doing?</span>
+        <textarea id="bk-body" rows="4" placeholder="Describe the work…"></textarea>
+      </label>
+      <label class="block" style="margin-top:10px">
+        <span class="lbl">Done when (verifiable)</span>
+        <input id="bk-done" placeholder="e.g. the report exists and names any follow-up">
+      </label>
+      <div style="display:flex;gap:12px;margin-top:12px;flex-wrap:wrap">
+        <label class="block" style="flex:1;min-width:140px">
+          <span class="lbl">Priority</span>
+          <select id="bk-priority">
+            <option value="">Untriaged</option><option>P0</option><option>P1</option><option>P2</option><option>P3</option>
+          </select>
+        </label>
+        <label class="block" style="flex:1;min-width:140px">
+          <span class="lbl">Squad</span>
+          <select id="bk-squad">${squadOptions ? raw(squadOptions) : html`<option value="">No squads available</option>`}</select>
+        </label>
+        <label class="block" style="flex:1;min-width:140px">
+          <span class="lbl">Assignee (optional)</span>
+          <select id="bk-assignee"><option value="">Unassigned</option>${raw(agentOptions)}</select>
+        </label>
+      </div>
+      <div style="margin-top:14px">
+        <button id="bk-btn" class="btn">Add to backlog</button>
+        <span style="margin-left:12px;color:var(--dim);font-size:13px;">dispatch:false — nothing wakes, nothing runs</span>
+      </div>
+      <div id="bk-status" class="status-line"></div>
+      <div id="bk-result" class="result-box" hidden></div>
+    </div>`
+
+  // ── Dispatch now (existing /send flow, relabeled) ──
+  const dispatchForm = hasAgents
     ? html`
-        <div class="card">
+        <div class="card" style="margin-top:18px">
+          <h2 style="margin:0 0 4px">Dispatch now</h2>
+          <p class="dim" style="margin:0 0 14px;font-size:13px">Assigns an active agent and wakes it immediately to do the work.</p>
           <label class="block">
             <span class="lbl">Your agents</span>
-            <select id="send-agent">${raw(options)}</select>
+            <select id="send-agent">${raw(agentOptions)}</select>
           </label>
           <label class="block" style="margin-top:14px">
             <span class="lbl">What do you need done?</span>
             <textarea id="send-body" rows="6" placeholder="Describe the task in your own words…"></textarea>
           </label>
           <div style="margin-top:14px">
-            <button id="send-btn" class="btn">Send a task</button>
-            <span id="send-hint" style="margin-left:12px;color:var(--dim);font-size:13px;">your agent does it and the result lands here</span>
+            <button id="send-btn" class="btn">Dispatch now</button>
+            <span id="send-hint" style="margin-left:12px;color:var(--dim);font-size:13px;">wakes your agent now and the result lands here</span>
           </div>
           <div id="send-status" class="status-line"></div>
           <div id="send-result" class="result-box" hidden></div>
         </div>`
-    : html`<div class="card"><p class="empty">No active agents yet. Add one from a
-        <a href="/">squad board</a> first, then come back to send it a task.</p></div>`
+    : html`<div class="card" style="margin-top:18px"><p class="empty">No active agents yet. Add one from a
+        <a href="/">squad board</a> first, then come back to dispatch it a task.</p></div>`
 
   return html`
-    <p class="crumbs"><a href="/">Overview</a> / ${project ? html`<a href="/projects/${encodeURIComponent(project.id)}">${project.name}</a> / ` : ''}Send a task</p>
-    <h1>Send a task</h1>
+    <p class="crumbs"><a href="/">Overview</a> / ${project ? html`<a href="/projects/${encodeURIComponent(project.id)}">${project.name}</a> / ` : ''}Create a task</p>
+    <h1>Create a task</h1>
     ${project ? html`<p class="empty" style="margin-top:0;max-width:640px">
       Project context: <strong>${project.name}</strong>. Only writable project squads and their active agents are available.
     </p>` : ''}
@@ -4707,12 +4758,11 @@ function sendPageBody(agents: PickerAgent[], project?: Project, projectSquadsTru
       Only the first 100 project squad edges were evaluated; additional eligible agents may be omitted.
     </p>` : ''}
     <p class="empty" style="margin-top:0;max-width:640px">
-      Write what you need in plain language and pick one of your agents. It does the
-      work and the result appears below — no jargon, no setup.</p>
+      Add a planning-only backlog task (nothing runs), or dispatch work to an active agent now.</p>
     <style>
       .block { display: flex; flex-direction: column; gap: 6px; }
       .block .lbl { font-size: 13px; color: var(--muted); }
-      #send-agent, #send-body {
+      #send-agent, #send-body, #bk-title, #bk-body, #bk-done, #bk-priority, #bk-squad, #bk-assignee {
         font: inherit; padding: 9px 11px; border-radius: 8px; border: 1px solid var(--border);
         background: var(--bg); color: var(--text); width: 100%; resize: vertical;
       }
@@ -4723,8 +4773,66 @@ function sendPageBody(agents: PickerAgent[], project?: Project, projectSquadsTru
       }
       .result-box .done-meta { color: var(--dim); font-size: 12px; margin-bottom: 10px; }
     </style>
-    ${form}
+    ${backlogForm}
+    ${dispatchForm}
+    ${backlogScript(project?.id)}
     ${hasAgents ? sendScript(project?.id) : html``}`
+}
+
+function backlogScript(projectId?: string) {
+  // Backlog-only create: POST /api/tasks with dispatch:false (server hard-excludes
+  // the task.created → dispatchSquad loop). No polling — nothing will execute.
+  return raw(`
+    <script>
+      (function () {
+        var projectId = ${JSON.stringify(projectId ?? null).replace(/</g, '\\u003c')};
+        var btn = document.getElementById('bk-btn');
+        if (!btn) return;
+        var status = document.getElementById('bk-status');
+        var resultBox = document.getElementById('bk-result');
+        function esc(s) {
+          return String(s).replace(/[&<>"']/g, function (c) {
+            return { '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c];
+          });
+        }
+        btn.addEventListener('click', async function () {
+          var title = (document.getElementById('bk-title').value || '').trim();
+          var body = (document.getElementById('bk-body').value || '').trim();
+          var doneWhen = (document.getElementById('bk-done').value || '').trim();
+          var priority = document.getElementById('bk-priority').value;
+          var squadId = document.getElementById('bk-squad').value;
+          var assigneeVal = document.getElementById('bk-assignee').value || '';
+          var agentId = assigneeVal.split('|')[0] || undefined;
+          if (!title) { status.textContent = 'Title is required.'; return; }
+          if (!doneWhen) { status.textContent = 'A verifiable done-when is required.'; return; }
+          if (!squadId) { status.textContent = 'Pick a squad.'; return; }
+          btn.disabled = true; resultBox.hidden = true; resultBox.innerHTML = '';
+          status.textContent = 'Saving…';
+          try {
+            var payload = { squad_id: squadId, title: title, done_when: doneWhen, body: body, dispatch: false };
+            if (priority) payload.priority = priority;
+            if (agentId) payload.assignee_agent_id = agentId;
+            if (projectId) payload.project_id = projectId;
+            var res = await fetch('/api/tasks', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              credentials: 'same-origin',
+              body: JSON.stringify(payload)
+            });
+            var data = await res.json().catch(function () { return {}; });
+            if (!res.ok) { status.textContent = 'Could not add (' + res.status + ')' + (data.error ? ': ' + data.error : '') + '.'; return; }
+            var t = data.task;
+            resultBox.hidden = false;
+            resultBox.innerHTML = '<div class="done-meta">Task ' + esc(t.id) + ' · ' + esc(t.status) + ' · squad ' + esc(t.squad_id) + ' · assignee ' + (t.assignee_agent_id ? esc(t.assignee_agent_id) : 'unassigned') + ' · priority ' + (t.priority ? esc(t.priority) : 'untriaged') + ' · dispatch:false</div>' + esc(t.title);
+            status.textContent = 'Added to backlog — nothing dispatched.';
+          } catch (e) {
+            status.textContent = 'Add failed — try again.';
+          } finally {
+            btn.disabled = false;
+          }
+        });
+      })();
+    </script>`)
 }
 
 function sendScript(projectId?: string) {
