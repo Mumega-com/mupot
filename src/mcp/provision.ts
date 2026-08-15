@@ -506,6 +506,7 @@ const toolMintAgentToken: ToolSpec = {
     await emitProvisioned(env, auth.memberId as string, 'token', minted.tokenId, {
       squad_id: agent.squad_id,
       agent_id: agent.id,
+      reason: expiresAt ? `expires_at:${expiresAt}` : 'non_expiring:immortal',
     })
 
     // SECURITY: `raw` is the show-once token — returned as a BARE field, never woven

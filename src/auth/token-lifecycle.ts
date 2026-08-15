@@ -85,3 +85,58 @@ export async function touchTokenLastUsed(env: Env, tokenHash: string): Promise<v
     // future cleanup decision; failing the request degrades a live agent right now.
   }
 }
+
+export interface ExpiringTokenSweepResult {
+  warned: number
+  tokens: Array<{ id: string; agent_id: string | null; label: string; expires_at: string }>
+}
+
+/**
+ * Sweep member_tokens for active credentials expiring within `warningDays` (default 7 days).
+ * Emits a bus event or warning log for each expiring credential so seats/operators receive
+ * proactive notification rather than silent drops.
+ */
+export async function sweepExpiringTokensWarning(
+  env: Env,
+  warningDays = 7,
+): Promise<ExpiringTokenSweepResult> {
+  try {
+    const rows = await env.DB.prepare(
+      `SELECT id, agent_id, label, expires_at
+         FROM member_tokens
+        WHERE tenant = ?1
+          AND revoked_at IS NULL
+          AND expires_at IS NOT NULL`,
+    )
+      .bind(env.TENANT_SLUG)
+      .all<{ id: string; agent_id: string | null; label: string; expires_at: string }>()
+
+    const candidates = rows.results ?? []
+    const expiringSoon = candidates.filter((t) => isTokenExpiringSoon(t.expires_at, warningDays))
+
+    if (expiringSoon.length > 0 && env.BUS?.send) {
+      for (const t of expiringSoon) {
+        await env.BUS.send({
+          type: 'org.provisioned',
+          tenant: env.TENANT_SLUG,
+          ts: new Date().toISOString(),
+          data: {
+            kind: 'token_expiring_soon',
+            token_id: t.id,
+            agent_id: t.agent_id,
+            label: t.label,
+            expires_at: t.expires_at,
+          },
+        })
+      }
+    }
+
+    return {
+      warned: expiringSoon.length,
+      tokens: expiringSoon,
+    }
+  } catch (error) {
+    console.error('expiring tokens warning sweep failed', error)
+    return { warned: 0, tokens: [] }
+  }
+}

@@ -360,6 +360,9 @@ export default {
     // 10. Agent-connection retention — expire abandoned reservations and
     //     verification challenges, then purge request/receipt rows at their
     //     fixed tenant-scoped retention boundaries. Fail-soft by contract.
+    // 11. Token expiry warning (Flight-002) — sweep active tokens expiring within 7 days
+    //     and emit proactive warning bus events (pages seat/operator before silent stall).
+    const { sweepExpiringTokensWarning } = await import('./auth/token-lifecycle')
     const maintenance: ReadonlyArray<readonly [string, () => Promise<unknown>]> = [
       ['membership', () => reconcileMembership(env)],
       ['metabolism', () => runMetabolism(env)],
@@ -371,6 +374,7 @@ export default {
       ['concierge', () => runConciergeTick(env)],
       ['project-loop', () => runProjectLoopTick(env, {})],
       ['agent-connection-retention', () => sweepAgentConnectionRetention(env)],
+      ['token-expiry-warning', () => sweepExpiringTokensWarning(env)],
     ]
     const heartbeat = maintenance[scheduledAt.getUTCMinutes() % 15]
     if (heartbeat) waitFor(heartbeat[0], heartbeat[1]())

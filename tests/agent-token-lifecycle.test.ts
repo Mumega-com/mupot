@@ -320,3 +320,50 @@ describe('Flight-002: mint_agent_token expiry and rotation', () => {
     expect(body.result.structuredContent.token.id).toBeDefined()
   })
 })
+
+describe('Flight-002: expiring-soon detection & maintenance sweep', () => {
+  it('isTokenExpiringSoon detects token expiring within 7 days and ignores token 8 days out', async () => {
+    const { isTokenExpiringSoon } = await import('../src/auth/token-lifecycle')
+    const now = Date.now()
+    const in6Days = new Date(now + 6 * 24 * 60 * 60 * 1000).toISOString()
+    const in8Days = new Date(now + 8 * 24 * 60 * 60 * 1000).toISOString()
+
+    expect(isTokenExpiringSoon(in6Days, 7)).toBe(true)
+    expect(isTokenExpiringSoon(in8Days, 7)).toBe(false)
+    expect(isTokenExpiringSoon(null, 7)).toBe(false)
+    expect(isTokenExpiringSoon(undefined, 7)).toBe(false)
+  })
+
+  it('sweepExpiringTokensWarning warns seat/operator for tokens expiring within 7 days and emits bus event', async () => {
+    const { sweepExpiringTokensWarning } = await import('../src/auth/token-lifecycle')
+    const now = Date.now()
+    const in6Days = new Date(now + 6 * 24 * 60 * 60 * 1000).toISOString()
+    const in10Days = new Date(now + 10 * 24 * 60 * 60 * 1000).toISOString()
+
+    const busEvents: unknown[] = []
+    const env = {
+      DB: {
+        prepare: () => ({
+          bind: () => ({
+            all: async () => ({
+              results: [
+                { id: 'tok-exp-soon', agent_id: 'agent-1', label: 'daemon', expires_at: in6Days },
+                { id: 'tok-fine', agent_id: 'agent-2', label: 'safe', expires_at: in10Days },
+              ],
+            }),
+          }),
+        }),
+      },
+      TENANT_SLUG: 'mumega',
+      BUS: {
+        send: async (e: unknown) => { busEvents.push(e) },
+      },
+    } as unknown as Env
+
+    const res = await sweepExpiringTokensWarning(env, 7)
+    expect(res.warned).toBe(1)
+    expect(res.tokens[0].id).toBe('tok-exp-soon')
+    expect(busEvents.length).toBe(1)
+    expect((busEvents[0] as { data: { kind: string } }).data.kind).toBe('token_expiring_soon')
+  })
+})
