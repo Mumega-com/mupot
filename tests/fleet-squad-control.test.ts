@@ -267,10 +267,10 @@ describe('POST /fleet/host-control — squad form field (dashboard panel)', () =
     expect(msgRow!.n).toBe(0)
   })
 
-  it('GET /fleet renders the Squad control panel grouped by squads[], scoped like the roster', async () => {
+  it('GET /radar?tab=fleet renders the Squad control panel grouped by squads[], scoped like the roster', async () => {
     harness = await makeHarness()
     const env = dashboardEnv(harness, { 'sess:s-owner': sessionRecord('owner@pot.test') })
-    const res = await dashboardApp.fetch(req('/fleet', 's-owner'), env)
+    const res = await dashboardApp.fetch(req('/radar?tab=fleet', 's-owner'), env)
     expect(res.status).toBe(200)
     const body = await res.text()
     expect(body).toContain('Squad control')
