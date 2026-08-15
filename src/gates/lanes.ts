@@ -26,7 +26,12 @@ export interface CouncilGateLane {
   readonly purpose: string
 }
 
-/** Synthetic Council gate lanes → the council agent that owns the lane. */
+/**
+ * Synthetic Council gate lanes currently tracked in this registry → the council
+ * agent that owns the lane. This is NOT the full set of live gate:owner lanes:
+ * system lanes such as gate:loops (src/loops/gate.ts) and gate:agent-self-completion
+ * are intentionally omitted here because no single council agent owns them.
+ */
 export const COUNCIL_GATE_LANES = {
   athena: {
     lane: GATE_ATHENA,
