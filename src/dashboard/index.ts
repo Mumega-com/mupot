@@ -185,8 +185,6 @@ import { loadAgentConnectionStatus } from '../members/agent-connection-status'
 
 import { wakeFleetAgent, requestFleetControl, fleetScoped } from './fleet'
 import { emitControlRequest, emitSquadControlRequest } from '../fleet/control'
-import type { PresenceView } from '../fleet/presence'
-import type { DepartureCard } from '../coordination/journeys'
 import { listFlights } from '../flight/service'
 import { buildBoard } from '../flight/board'
 import type { FlightCard } from '../flight/board'

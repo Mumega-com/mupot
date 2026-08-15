@@ -6,7 +6,6 @@
 
 import { Hono } from 'hono'
 import type { Env, AuthContext } from '../types'
-import { isOrgAdmin } from '../auth/capability'
 import { resolveAccessibleSquadIds } from '../projects/readable-squads'
 import { loadFleetRadar } from './radar'
 import { listFleetAgentRuntimeView } from '../fleet/registry'
@@ -16,7 +15,7 @@ import { listJourneys, buildDepartureBoard } from '../coordination/journeys'
 import { loadBrainPhysics } from './brain'
 import { loadTodaySpendScalar } from './economy'
 import { hostAgentsPanel, squadControlPanel } from './fleet-host'
-import { shell, errorBody } from './index'
+import { shell } from './index'
 import { missionControlBody } from './mission-control'
 
 export const missionControlApp = new Hono<{ Bindings: Env; Variables: { auth: AuthContext } }>()
