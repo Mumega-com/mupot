@@ -42,9 +42,11 @@ const pages = [
   '/brain',
   '/departments/growth',
   '/flights',
-  '/fleet',
+  '/radar',
+  '/radar?tab=fleet',
+  '/radar?tab=motherboard',
+  '/radar?tab=departures',
   '/ops',
-  '/coordination',
   '/agents',
   '/squads/sq-growth',
   '/agents/agent-hermes',
@@ -863,7 +865,7 @@ export async function runLocalBrowserSmoke() {
 
     await page.goto(`${baseUrl}/`, { waitUntil: 'networkidle' })
     await page.screenshot({ path: path.join(artifactsDir, 'home.png'), fullPage: true })
-    await page.goto(`${baseUrl}/fleet`, { waitUntil: 'networkidle' })
+    await page.goto(`${baseUrl}/radar?tab=fleet`, { waitUntil: 'networkidle' })
     await page.screenshot({ path: path.join(artifactsDir, 'fleet.png'), fullPage: true })
     await page.goto(`${baseUrl}/ops`, { waitUntil: 'networkidle' })
     await page.screenshot({ path: path.join(artifactsDir, 'ops-health.png'), fullPage: true })

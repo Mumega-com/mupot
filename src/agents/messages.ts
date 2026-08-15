@@ -401,7 +401,7 @@ function readerCanRead(
 
 async function readAgentInboxForReader(
   env: Env,
-  input: { agent: string; limit?: number; peek?: boolean; keyFingerprint?: string },
+  input: { agent: string; limit?: number; peek?: boolean; keyFingerprint?: string; sinceSeq?: number },
   reader: InboxReader,
   opts: Opts,
 ): Promise<InboxResult | InboxFailure> {
@@ -417,6 +417,10 @@ async function readAgentInboxForReader(
     limit = Math.min(MAX_INBOX_LIMIT, Math.max(1, Math.floor(input.limit)))
   }
   const peek = input.peek === true
+  // Cursor for streaming consumers: only rows STRICTLY above this seq are returned. This is
+  // what lets an SSE stream advance past a pinned unread window (see inbox-routes /stream):
+  // without it, once unread >= limit the oldest-`limit` rows never move and the stream starves.
+  const sinceSeq = Number.isFinite(input.sinceSeq) && (input.sinceSeq ?? 0) > 0 ? Math.floor(input.sinceSeq as number) : 0
   const signedKeyFingerprint = reader === 'signed' && /^[a-f0-9]{64}$/.test(input.keyFingerprint ?? '')
     ? input.keyFingerprint
     : undefined
@@ -433,17 +437,17 @@ async function readAgentInboxForReader(
         ), 'bearer_only') = 'bearer_only'`
       : `AND EXISTS (SELECT 1 FROM agent_inbox_fences
                       WHERE tenant = ?1 AND agent_id = ?2
-                        AND mode = 'signed_only' AND key_fingerprint = ?4)`
+                        AND mode = 'signed_only' AND key_fingerprint = ?5)`
     if (peek) {
       const statement = env.DB.prepare(
         `SELECT ${cols} FROM agent_messages
-          WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL
+          WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL AND seq > ?3
           ${peekPolicyPredicate}
-          ORDER BY seq ASC LIMIT ?3`,
+          ORDER BY seq ASC LIMIT ?4`,
       )
       const rows = await (reader === 'signed'
-        ? statement.bind(tenant, input.agent, limit, signedKeyFingerprint)
-        : statement.bind(tenant, input.agent, limit)).all<InboxMessage>()
+        ? statement.bind(tenant, input.agent, sinceSeq, limit, signedKeyFingerprint)
+        : statement.bind(tenant, input.agent, sinceSeq, limit)).all<InboxMessage>()
       messages = rows.results ?? []
     } else {
       // Atomic consume: mark the oldest `limit` unread as read and return exactly those rows.
@@ -512,7 +516,7 @@ async function readAgentInboxForReader(
 
 export function readAgentInbox(
   env: Env,
-  input: { agent: string; limit?: number; peek?: boolean },
+  input: { agent: string; limit?: number; peek?: boolean; sinceSeq?: number },
   opts: Opts = {},
 ): Promise<InboxResult | InboxFailure> {
   return readAgentInboxForReader(env, input, 'bearer', opts)

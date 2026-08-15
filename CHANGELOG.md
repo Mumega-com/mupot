@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-08-15
+
+- **Session transcript** (`docs/session-transcripts/2026-08-15-primeagent-deepseek-v4-flash-0730.md`) — truncated transcription of the Athena gate seat session on prime-agent (deepseek-v4-flash): gate verdict confirmation (Flight 640f6b4d, #1040), correctness lenses #1052/#1053, CF token TTL fix, fleet responder retirement, mupot visibility review (Hadi-directed).
+
+
+
 ## 0.29.0 — 2026-08-08
 
 - **Build-Time Release Identity & Version Truth** (`src/health.ts`, `scripts/generate-build-info.mjs`; #443, #571).
