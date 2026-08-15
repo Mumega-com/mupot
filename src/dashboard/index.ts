@@ -1938,10 +1938,20 @@ dashboardApp.post('/admin/agent-token/mint', async (c) => {
   }
   const agent = agentResult.value
 
+  const expiresInDaysRaw = typeof form.expires_in_days === 'string' ? Number(form.expires_in_days) : 30
+  let expiresAt: string | null = null
+  if (!isNaN(expiresInDaysRaw) && expiresInDaysRaw > 0) {
+    const { calculateExpiryTimestamp } = await import('../auth/token-lifecycle')
+    expiresAt = calculateExpiryTimestamp(expiresInDaysRaw)
+  }
+
   // Delegate to the shared atomic-mint helper. A first mint creates the member,
   // binding, home capability, and welded token; later mints add only the token.
   // This is the same path the MCP mint_agent_token tool uses.
-  const minted = await mintAgentBoundToken(c.env, agent, labelRaw, capabilityRaw)
+  const minted = await mintAgentBoundToken(c.env, agent, labelRaw, {
+    grantCapability: capabilityRaw,
+    expiresAt,
+  })
 
   // Look up the squad name for the show-once page.
   const squadRow = await c.env.DB.prepare('SELECT name FROM squads WHERE id = ?1 LIMIT 1')

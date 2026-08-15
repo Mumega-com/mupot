@@ -523,6 +523,8 @@ export interface MemberToken {
   label: string // "laptop", "hermes-gateway", ...
   channel: ConnectionChannel
   created_at: string
+  expires_at?: string | null
+  last_used_at?: string | null
   revoked_at: string | null
 }
 

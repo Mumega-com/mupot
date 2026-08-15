@@ -55,6 +55,7 @@ export interface MintedToken {
   label: string
   channel: ConnectionChannel
   created_at: string
+  expires_at?: string | null
   /** The raw token — returned EXACTLY ONCE. Never persisted, never logged. */
   raw: string
 }
@@ -67,6 +68,7 @@ export async function mintMemberToken(
   label: string,
   channel: ConnectionChannel,
   agentId: string | null = null,
+  expiresAt: string | null = null,
 ): Promise<MintedToken> {
   const rawToken = mintRawToken()
   const tokenHash = await sha256Hex(rawToken)
@@ -77,14 +79,15 @@ export async function mintMemberToken(
     label: label.trim(),
     channel,
     created_at: new Date().toISOString(),
+    expires_at: expiresAt,
     revoked_at: null,
   }
 
   // agent_id binds this token to an agent (the weld). NULL = a human/operator principal.
   await env.DB.prepare(
-    'INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    'INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
   )
-    .bind(token.id, token.member_id, tokenHash, token.label, token.channel, token.created_at, agentId, token.tenant)
+    .bind(token.id, token.member_id, tokenHash, token.label, token.channel, token.created_at, agentId, token.tenant, token.expires_at ?? null)
     .run()
 
   return {
@@ -93,6 +96,7 @@ export async function mintMemberToken(
     label: token.label,
     channel: token.channel,
     created_at: token.created_at,
+    expires_at: token.expires_at,
     raw: rawToken,
   }
 }
@@ -158,6 +162,12 @@ export interface PreparedAgentTokenMint extends AgentMintResult {
   bindingProof: AgentBindingProof
 }
 
+export interface PrepareAgentTokenMintOptions {
+  grantCapability?: AgentTokenCapability
+  expiresAt?: string | null
+  revokePriorTokenId?: string | null
+}
+
 /**
  * Prepare, but do not commit, an agent-bound token mint. Provisioning composes
  * these statements into its larger request/receipt transaction.
@@ -166,14 +176,19 @@ export async function prepareAgentBoundTokenMint(
   env: Env,
   agent: AgentForMint,
   label: string,
-  grantCapability: AgentTokenCapability = 'member',
+  grantCapabilityOrOpts?: AgentTokenCapability | PrepareAgentTokenMintOptions,
 ): Promise<PreparedAgentTokenMint> {
+  const opts: PrepareAgentTokenMintOptions = typeof grantCapabilityOrOpts === 'object' && grantCapabilityOrOpts !== null
+    ? grantCapabilityOrOpts
+    : { grantCapability: (grantCapabilityOrOpts as AgentTokenCapability) ?? 'member' }
+
+  const grantCapability = opts.grantCapability ?? 'member'
   if (!isAgentTokenCapability(grantCapability)) {
     throw new Error('invalid agent token capability')
   }
 
   const binding = await resolveAgentMemberBinding(env, agent.id)
-  return prepareAgentBoundTokenMintForBinding(env, agent, label, grantCapability, binding)
+  return prepareAgentBoundTokenMintForBinding(env, agent, label, grantCapability, binding, opts.expiresAt, opts.revokePriorTokenId)
 }
 
 export async function prepareAgentBoundTokenMintForBinding(
@@ -182,6 +197,8 @@ export async function prepareAgentBoundTokenMintForBinding(
   label: string,
   requestedCapability: AgentTokenCapability,
   binding: AgentMemberBinding,
+  expiresAt: string | null = null,
+  revokePriorTokenId: string | null = null,
 ): Promise<PreparedAgentTokenMint> {
   const creating = binding.kind === 'unminted'
   const memberId = creating ? crypto.randomUUID() : binding.memberId
@@ -253,11 +270,20 @@ export async function prepareAgentBoundTokenMintForBinding(
     )
   }
 
+  // If rotating a prior token, atomically revoke it in the same batch
+  if (revokePriorTokenId) {
+    statements.push(
+      env.DB.prepare(
+        `UPDATE member_tokens SET revoked_at = ? WHERE id = ? AND member_id = ? AND tenant = ? AND revoked_at IS NULL`,
+      ).bind(createdAt, revokePriorTokenId, memberId, env.TENANT_SLUG),
+    )
+  }
+
   statements.push(
     env.DB.prepare(
-      `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant)
-       VALUES (?, ?, ?, ?, 'workspace', ?, ?, ?)`,
-    ).bind(tokenId, memberId, tokenHash, safeLabel, createdAt, agent.id, env.TENANT_SLUG),
+      `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant, expires_at)
+       VALUES (?, ?, ?, ?, 'workspace', ?, ?, ?, ?)`,
+    ).bind(tokenId, memberId, tokenHash, safeLabel, createdAt, agent.id, env.TENANT_SLUG, expiresAt ?? null),
   )
 
   // D2 (2026-08-13, athena gate cluster map 247858f1; Hadi decision option A
@@ -341,9 +367,9 @@ export async function mintAgentBoundToken(
   env: Env,
   agent: AgentForMint,
   label: string,
-  grantCapability: AgentTokenCapability = 'member',
+  grantCapabilityOrOpts?: AgentTokenCapability | PrepareAgentTokenMintOptions,
 ): Promise<AgentMintResult> {
-  const first = await prepareAgentBoundTokenMint(env, agent, label, grantCapability)
+  const first = await prepareAgentBoundTokenMint(env, agent, label, grantCapabilityOrOpts)
   try {
     return await commitPreparedAgentTokenMint(env, first)
   } catch (error) {

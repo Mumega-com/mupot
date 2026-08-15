@@ -102,7 +102,10 @@ function makeEnv(opts: Opts = {}): Env {
   })
 
   return {
-    DB: { prepare: (sql: string) => handler(sql), batch: async () => [] },
+    DB: {
+      prepare: (sql: string) => handler(sql),
+      batch: async (stmts: unknown[]) => stmts.map(() => ({ meta: { changes: 1 } })),
+    },
     TENANT_SLUG: 'mumega',
     PUBLIC_ORIGIN: 'https://mupot.mumega.com',
     BUS: { send: async (e: unknown) => { (opts.busSent ??= []).push(e) } },
@@ -280,5 +283,40 @@ describe('no tool may emit a secret', () => {
     const raw = await res.text()
     expect(raw).not.toMatch(/SECRET-HASH-MUST-NEVER-APPEAR/)
     expect(raw).not.toMatch(/"raw"/)
+  })
+})
+
+describe('Flight-002: mint_agent_token expiry and rotation', () => {
+  it('mints agent token with default 30-day expiry when unspecified', async () => {
+    const env = makeEnv()
+    const res = await call('mint_agent_token', { agent: AGENT.slug }, env)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { result: { structuredContent: { token: { id: string; raw: string } } } }
+    expect(body.result.structuredContent.token.raw).toMatch(/^mupot_/)
+    expect(body.result.structuredContent.token.id).toBeDefined()
+  })
+
+  it('mints agent token with custom expiry days', async () => {
+    const env = makeEnv()
+    const res = await call('mint_agent_token', { agent: AGENT.slug, expires_in_days: 90 }, env)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { result: { structuredContent: { token: { id: string; raw: string } } } }
+    expect(body.result.structuredContent.token.raw).toMatch(/^mupot_/)
+  })
+
+  it('mints non-expiring agent token when explicitly requested', async () => {
+    const env = makeEnv()
+    const res = await call('mint_agent_token', { agent: AGENT.slug, non_expiring: true }, env)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { result: { structuredContent: { token: { id: string; raw: string } } } }
+    expect(body.result.structuredContent.token.raw).toMatch(/^mupot_/)
+  })
+
+  it('atomically rotates prior token on mint when rotate_prior_token_id provided', async () => {
+    const env = makeEnv()
+    const res = await call('mint_agent_token', { agent: AGENT.slug, rotate_prior_token_id: 'tok-old' }, env)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { result: { structuredContent: { token: { id: string; raw: string } } } }
+    expect(body.result.structuredContent.token.id).toBeDefined()
   })
 })

@@ -40,6 +40,7 @@ import {
   isAgentTokenCapability,
   resolveAgentMemberBinding,
 } from '../members/service'
+import { calculateExpiryTimestamp, DEFAULT_TOKEN_EXPIRY_DAYS } from '../auth/token-lifecycle'
 import { revokeMemberToken } from '../members/service'
 import { setAgentSquadAccess, type AgentAccessCapability } from '../members/agent-access'
 import {
@@ -428,10 +429,17 @@ const toolMintAgentToken: ToolSpec = {
   name: 'mint_agent_token',
   scope: "agent's squad",
   min: 'admin',
-  args: '{ agent: string (id|slug), label?, capability?: "observer"|"member" }',
+  args: '{ agent: string (id|slug), label?, capability?: "observer"|"member", expires_in_days?: number, non_expiring?: boolean, rotate_prior_token_id?: string }',
   inputSchema: {
     type: 'object',
-    properties: { agent: STRING_SCHEMA, label: STRING_SCHEMA, capability: STRING_SCHEMA },
+    properties: {
+      agent: STRING_SCHEMA,
+      label: STRING_SCHEMA,
+      capability: STRING_SCHEMA,
+      expires_in_days: OPTIONAL_NUMBER_SCHEMA,
+      non_expiring: OPTIONAL_BOOLEAN_SCHEMA,
+      rotate_prior_token_id: STRING_SCHEMA,
+    },
     required: ['agent'],
     additionalProperties: false,
   },
@@ -461,22 +469,29 @@ const toolMintAgentToken: ToolSpec = {
       return fail(400, 'invalid_capability', 'capability must be observer or member')
     }
 
+    // Flight-002: Expiry resolution (default 30 days, unless non_expiring=true is explicitly requested)
+    let expiresAt: string | null = null
+    const nonExpiring = Boolean(args.non_expiring)
+    if (!nonExpiring) {
+      const days = typeof args.expires_in_days === 'number' && args.expires_in_days > 0
+        ? Math.min(Math.max(args.expires_in_days, 1), 365)
+        : DEFAULT_TOKEN_EXPIRY_DAYS
+      expiresAt = calculateExpiryTimestamp(days)
+    }
+
+    const rotatePriorTokenId = str(args.rotate_prior_token_id) ?? null
+
     const canonical = requiredCanonicalOrigin(env)
     if (!canonical.ok) return fail(503, canonical.error)
 
     // Delegate to the shared atomic-mint helper (members/service.ts).
-    // A first mint atomically creates the member envelope, canonical binding,
-    // home capability, and agent-weld token; later mints add only the token.
-    // Either the complete mint lands or none of it does — no orphan credentials.
-    // The helper enforces: squad-scoped observer/member only, hash-only storage,
-    // show-once raw.
-    // Surface the one expected identity precondition as a NAMED failure. Left
-    // unhandled it reaches the caller as a bare `internal_error`, which is what
-    // made mupot#890 cost hours: the message said nothing, so the actual cause
-    // (a missing home-squad grant on the canonical member) was invisible.
     let minted
     try {
-      minted = await mintAgentBoundToken(env, agent, label, grantCapability)
+      minted = await mintAgentBoundToken(env, agent, label, {
+        grantCapability,
+        expiresAt,
+        revokePriorTokenId: rotatePriorTokenId,
+      })
     } catch (err) {
       if (err instanceof Error && err.message.startsWith('agent_home_capability_missing')) {
         return fail(409, 'agent_home_capability_missing', {

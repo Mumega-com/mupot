@@ -43,6 +43,26 @@ export function nowSqlUtc(): string {
   return new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, '')
 }
 
+export const DEFAULT_TOKEN_EXPIRY_DAYS = 30
+
+/** Calculate a standard SQLite-compatible UTC ISO timestamp given days in the future.
+ *  Returns null if days is null or 0 (meaning non-expiring). */
+export function calculateExpiryTimestamp(days: number | null | undefined = DEFAULT_TOKEN_EXPIRY_DAYS): string | null {
+  if (days === null || days === undefined || days <= 0) return null
+  const date = new Date(Date.now() + days * 24 * 60 * 60 * 1000)
+  return date.toISOString().replace('T', ' ').replace(/\.\d+Z$/, '')
+}
+
+/** Check if a token is expiring within warningDays threshold (default 7 days). */
+export function isTokenExpiringSoon(expiresAt: string | null | undefined, warningDays = 7): boolean {
+  if (!expiresAt) return false
+  const expTime = new Date(expiresAt.replace(' ', 'T') + (expiresAt.includes('Z') ? '' : 'Z')).getTime()
+  if (isNaN(expTime)) return false
+  const now = Date.now()
+  const threshold = now + warningDays * 24 * 60 * 60 * 1000
+  return expTime > now && expTime <= threshold
+}
+
 /** Stamp `last_used_at` for a successfully authenticated token hash.
  *
  *  BEST-EFFORT BY CONTRACT. This is the telemetry that makes credential cleanup
