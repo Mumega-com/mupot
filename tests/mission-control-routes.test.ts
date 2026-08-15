@@ -33,13 +33,11 @@ describe('Mission Control & Fleet Consolidation (Flight-003B)', () => {
       INSERT INTO capabilities (id, member_id, scope_type, capability) VALUES ('cap-1', '${memberId}', 'org', 'owner');
     `)
 
-    sessionStore.set('session:tok-1', JSON.stringify({
+    sessionStore.set('sess:tok-1', JSON.stringify({
       userId: memberId,
       email: 'test@example.com',
       role: 'owner',
-      tenant: 'mumega',
-      createdAt: Date.now(),
-      expiresAt: Date.now() + 3600_000,
+      createdAt: new Date().toISOString(),
     }))
 
     const req = new Request('http://localhost/fleet', {
@@ -64,13 +62,11 @@ describe('Mission Control & Fleet Consolidation (Flight-003B)', () => {
       INSERT INTO capabilities (id, member_id, scope_type, capability) VALUES ('cap-1', '${memberId}', 'org', 'owner');
     `)
 
-    sessionStore.set('session:tok-1', JSON.stringify({
+    sessionStore.set('sess:tok-1', JSON.stringify({
       userId: memberId,
       email: 'test@example.com',
       role: 'owner',
-      tenant: 'mumega',
-      createdAt: Date.now(),
-      expiresAt: Date.now() + 3600_000,
+      createdAt: new Date().toISOString(),
     }))
 
     const req = new Request('http://localhost/motherboard', {
@@ -95,13 +91,11 @@ describe('Mission Control & Fleet Consolidation (Flight-003B)', () => {
       INSERT INTO capabilities (id, member_id, scope_type, capability) VALUES ('cap-1', '${memberId}', 'org', 'owner');
     `)
 
-    sessionStore.set('session:tok-1', JSON.stringify({
+    sessionStore.set('sess:tok-1', JSON.stringify({
       userId: memberId,
       email: 'test@example.com',
       role: 'owner',
-      tenant: 'mumega',
-      createdAt: Date.now(),
-      expiresAt: Date.now() + 3600_000,
+      createdAt: new Date().toISOString(),
     }))
 
     const req = new Request('http://localhost/coordination', {
