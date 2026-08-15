@@ -79,4 +79,19 @@ describe('entity-resolver — fail-closed short-UUID prefix resolution', () => {
       }
     }
   })
+
+  it('integration: getSquad and getTask propagate ambiguous status code and candidates instead of flattening to not_found', async () => {
+    const { resolveEntity } = await import('../src/lib/entity-resolver')
+    const squadRes = await resolveEntity(mockEnv, 'squads', 'ambig123')
+    expect(squadRes.ok).toBe(false)
+    if (!squadRes.ok) {
+      expect(squadRes.reason).toBe('ambiguous')
+    }
+
+    const taskRes = await resolveEntity(mockEnv, 'tasks', 'ambig123')
+    expect(taskRes.ok).toBe(false)
+    if (!taskRes.ok) {
+      expect(taskRes.reason).toBe('ambiguous')
+    }
+  })
 })

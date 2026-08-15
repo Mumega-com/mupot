@@ -413,10 +413,34 @@ async function loadSquad(env: Env, squadId: string): Promise<Squad | null> {
   return res.ok ? res.entity : null
 }
 
+async function getSquad(env: Env, squadRef: string): Promise<{ ok: true; squad: Squad } | Extract<ToolOutcome, { ok: false }>> {
+  const { resolveSquadEntity } = await import('../lib/entity-resolver')
+  const res = await resolveSquadEntity(env, squadRef)
+  if (!res.ok) {
+    if (res.reason === 'ambiguous') {
+      return failOnly(409, 'ambiguous_squad_id', { candidates: res.candidates })
+    }
+    return failOnly(404, 'squad_not_found')
+  }
+  return { ok: true, squad: res.entity }
+}
+
 async function loadAgent(env: Env, agentId: string): Promise<Agent | null> {
   const { resolveAgentEntity } = await import('../lib/entity-resolver')
   const res = await resolveAgentEntity(env, agentId)
   return res.ok ? res.entity : null
+}
+
+async function getAgent(env: Env, agentRef: string): Promise<{ ok: true; agent: Agent } | Extract<ToolOutcome, { ok: false }>> {
+  const { resolveAgentEntity } = await import('../lib/entity-resolver')
+  const res = await resolveAgentEntity(env, agentRef)
+  if (!res.ok) {
+    if (res.reason === 'ambiguous') {
+      return failOnly(409, 'ambiguous_agent_id', { candidates: res.candidates })
+    }
+    return failOnly(404, 'agent_not_found')
+  }
+  return { ok: true, agent: res.entity }
 }
 
 async function loadMemberIdentity(env: Env, auth: AuthContext): Promise<{
@@ -543,6 +567,18 @@ async function loadTask(env: Env, taskId: string): Promise<Task | null> {
   return res.ok ? res.entity : null
 }
 
+async function getTask(env: Env, taskRef: string): Promise<{ ok: true; task: Task } | Extract<ToolOutcome, { ok: false }>> {
+  const { resolveTaskEntity } = await import('../lib/entity-resolver')
+  const res = await resolveTaskEntity(env, taskRef)
+  if (!res.ok) {
+    if (res.reason === 'ambiguous') {
+      return failOnly(409, 'ambiguous_task_id', { candidates: res.candidates })
+    }
+    return failOnly(404, 'task_not_found')
+  }
+  return { ok: true, task: res.entity }
+}
+
 async function resolveTaskSquad(
   env: Env,
   auth: AuthContext,
@@ -620,8 +656,9 @@ async function resolveScopedSquad(
   }
   if (!squadId) return failOnly(400, 'invalid_args', missingDetail)
 
-  const squad = await loadSquad(env, squadId)
-  if (!squad) return failOnly(404, 'squad_not_found')
+  const squadRes = await getSquad(env, squadId)
+  if (!squadRes.ok) return squadRes
+  const squad = squadRes.squad
 
   const grants = auth.capabilities ?? []
   if (!workspaceAdminBypass && !(await memberCanOnSquad(env, grants, squad.id, min))) {
@@ -972,7 +1009,6 @@ const toolTaskUpdate: ToolSpec = {
       project_id: NULLABLE_STRING_SCHEMA,
       title: STRING_SCHEMA,
       body: STRING_SCHEMA,
-      result: STRING_SCHEMA,
       note: STRING_SCHEMA,
       reason: STRING_SCHEMA,
       done_when: STRING_SCHEMA,
@@ -986,10 +1022,11 @@ const toolTaskUpdate: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    const taskId = str(args.task_id)
-    if (!taskId) return fail(400, 'invalid_args', 'task_id required')
-    const existing = await loadTask(env, taskId)
-    if (!existing) return fail(404, 'task_not_found')
+    const taskRef = str(args.task_id)
+    if (!taskRef) return fail(400, 'invalid_args', 'task_id required')
+    const taskRes = await getTask(env, taskRef)
+    if (!taskRes.ok) return taskRes
+    const existing = taskRes.task
 
     const grants = auth.capabilities ?? []
     if (!(await memberCanOnSquad(env, grants, existing.squad_id, 'member'))) {
@@ -1004,9 +1041,9 @@ const toolTaskUpdate: ToolSpec = {
       next.title = (args.title as string).trim()
       changed = true
     }
-    if (args.body !== undefined || args.result !== undefined || args.note !== undefined || args.reason !== undefined) {
+    if (args.body !== undefined || args.note !== undefined || args.reason !== undefined) {
       const explicitBody = typeof args.body === 'string' ? args.body : existing.body ?? ''
-      const extraContent = [args.result, args.note, args.reason]
+      const extraContent = [args.note, args.reason]
         .filter((x): x is string => typeof x === 'string' && x.trim().length > 0)
         .join('\n\n')
       
@@ -1385,15 +1422,16 @@ const toolTaskVerdict: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    const taskId = str(args.task_id)
-    if (!taskId) return fail(400, 'invalid_args', 'task_id required')
+    const taskRef = str(args.task_id)
+    if (!taskRef) return fail(400, 'invalid_args', 'task_id required')
     const verdict = args.verdict
     if (verdict !== 'approved' && verdict !== 'rejected') {
       return fail(400, 'invalid_verdict', { accepted: ['approved', 'rejected'] })
     }
 
-    const task = await loadTask(env, taskId)
-    if (!task) return fail(404, 'task_not_found')
+    const taskRes = await getTask(env, taskRef)
+    if (!taskRes.ok) return taskRes
+    const task = taskRes.task
 
     // Base guard: member+ on the task's squad (same floor as every task mutation).
     const grants = auth.capabilities ?? []
@@ -2413,11 +2451,15 @@ const toolWakeAgent: ToolSpec = {
     const agentId = str(args.agent_id)
     if (!agentId) return fail(400, 'invalid_args', 'agent_id required')
 
-    const agent = await loadAgent(env, agentId)
-    if (!agent) return fail(404, 'agent_not_found')
+    const agentRes = await getAgent(env, agentId)
+    if (!agentRes.ok) return agentRes
+    const agent = agentRes.agent
 
     const grants = auth.capabilities ?? []
-    if (!(await memberCanOnSquad(env, grants, agent.squad_id, 'lead'))) {
+    // Workspace admin bypass matches agentsApp: an org owner/admin can wake any
+    // agent in the pot without hand-granting lead on every squad first.
+    const workspaceAdmin = hasWorkspaceAdmin(auth)
+    if (!workspaceAdmin && !(await memberCanOnSquad(env, grants, agent.squad_id, 'lead'))) {
       return fail(403, 'forbidden', { need: 'lead', scope: 'squad' })
     }
 
@@ -2476,8 +2518,9 @@ const toolSquadMessage: ToolSpec = {
     if (!squadId) return fail(400, 'invalid_args', 'squad_id required')
     if (!message) return fail(400, 'invalid_args', 'message required')
 
-    const squad = await loadSquad(env, squadId)
-    if (!squad) return fail(404, 'squad_not_found')
+    const squadRes = await getSquad(env, squadId)
+    if (!squadRes.ok) return squadRes
+    const squad = squadRes.squad
 
     const grants = auth.capabilities ?? []
     if (!(await memberCanOnSquad(env, grants, squad.id, 'member'))) {
