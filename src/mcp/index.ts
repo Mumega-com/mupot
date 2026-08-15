@@ -37,6 +37,7 @@ import type {
 import { resolveCapabilities, hasCapability, holdsCapabilityFloor, canOnSquad, hasSurfaceCap } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc, touchTokenLastUsed } from '../auth/token-lifecycle'
 import { callerHoldsGateCapability, verdictPrincipal } from '../tasks/index'
+import { resolveSoleGateOwnerAgent } from '../gates/grants'
 import { isChannel } from '../members/service'
 import { resolveConsentedAgentCapabilities } from './oauth-authorize'
 import { createBus } from '../bus'
@@ -1292,23 +1293,6 @@ const toolTaskUpdate: ToolSpec = {
     }
     return done({ task: next })
   },
-}
-
-// Resolve a gate_owner CAPABILITY NAME (e.g. 'gate:kasra-core') to the single agent
-// PRINCIPAL that holds it, per the same gate_grants table callerHoldsGateCapability
-// reads (migration 0008: capability, principal_type, principal_id — no tenant column,
-// mirroring every other gate_grants query in this codebase). Ambiguous ownership (zero
-// or more than one agent holder) has no single unambiguous wake target — the caller
-// treats that as "skip silently", the same posture task_verdict already takes when a
-// capability isn't resolvable to a sole actor.
-async function resolveSoleGateOwnerAgent(env: Env, gateOwner: string): Promise<string | null> {
-  const rows = await env.DB.prepare(
-    `SELECT principal_id FROM gate_grants WHERE capability = ?1 AND principal_type = 'agent'`,
-  )
-    .bind(gateOwner)
-    .all<{ principal_id: string }>()
-  const results = rows.results ?? []
-  return results.length === 1 ? results[0].principal_id : null
 }
 
 // Non-spoofable system-sender literal for a review-wake's durable inbox delegation —
