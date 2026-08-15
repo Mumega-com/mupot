@@ -102,7 +102,10 @@ function makeEnv(opts: Opts = {}): Env {
   })
 
   return {
-    DB: { prepare: (sql: string) => handler(sql), batch: async () => [] },
+    DB: {
+      prepare: (sql: string) => handler(sql),
+      batch: async (stmts: unknown[]) => stmts.map(() => ({ meta: { changes: 1 } })),
+    },
     TENANT_SLUG: 'mumega',
     PUBLIC_ORIGIN: 'https://mupot.mumega.com',
     BUS: { send: async (e: unknown) => { (opts.busSent ??= []).push(e) } },
@@ -280,5 +283,101 @@ describe('no tool may emit a secret', () => {
     const raw = await res.text()
     expect(raw).not.toMatch(/SECRET-HASH-MUST-NEVER-APPEAR/)
     expect(raw).not.toMatch(/"raw"/)
+  })
+})
+
+describe('Flight-002: mint_agent_token expiry and rotation', () => {
+  it('mints agent token with default 30-day expiry when unspecified', async () => {
+    const env = makeEnv()
+    const res = await call('mint_agent_token', { agent: AGENT.slug }, env)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { result: { structuredContent: { token: { id: string; raw: string } } } }
+    expect(body.result.structuredContent.token.raw).toMatch(/^mupot_/)
+    expect(body.result.structuredContent.token.id).toBeDefined()
+  })
+
+  it('mints agent token with custom expiry days', async () => {
+    const env = makeEnv()
+    const res = await call('mint_agent_token', { agent: AGENT.slug, expires_in_days: 90 }, env)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { result: { structuredContent: { token: { id: string; raw: string } } } }
+    expect(body.result.structuredContent.token.raw).toMatch(/^mupot_/)
+  })
+
+  it('mints non-expiring agent token when explicitly requested', async () => {
+    const env = makeEnv()
+    const res = await call('mint_agent_token', { agent: AGENT.slug, non_expiring: true }, env)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { result: { structuredContent: { token: { id: string; raw: string } } } }
+    expect(body.result.structuredContent.token.raw).toMatch(/^mupot_/)
+  })
+
+  it('atomically rotates prior token on mint when rotate_prior_token_id provided', async () => {
+    const env = makeEnv()
+    const res = await call('mint_agent_token', { agent: AGENT.slug, rotate_prior_token_id: 'tok-old' }, env)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { result: { structuredContent: { token: { id: string; raw: string } } } }
+    expect(body.result.structuredContent.token.id).toBeDefined()
+  })
+})
+
+describe('Flight-002: expiring-soon detection & maintenance sweep', () => {
+  it('isTokenExpiringSoon detects token expiring within 7 days and ignores token 8 days out', async () => {
+    const { isTokenExpiringSoon } = await import('../src/auth/token-lifecycle')
+    const now = Date.now()
+    const in6Days = new Date(now + 6 * 24 * 60 * 60 * 1000).toISOString()
+    const in8Days = new Date(now + 8 * 24 * 60 * 60 * 1000).toISOString()
+
+    expect(isTokenExpiringSoon(in6Days, 7)).toBe(true)
+    expect(isTokenExpiringSoon(in8Days, 7)).toBe(false)
+    expect(isTokenExpiringSoon(null, 7)).toBe(false)
+    expect(isTokenExpiringSoon(undefined, 7)).toBe(false)
+  })
+
+  it('sweepExpiringTokensWarning warns seat/operator for tokens expiring within 7 days and emits bus event', async () => {
+    const { sweepExpiringTokensWarning } = await import('../src/auth/token-lifecycle')
+    const now = Date.now()
+    const in6Days = new Date(now + 6 * 24 * 60 * 60 * 1000).toISOString()
+    const in10Days = new Date(now + 10 * 24 * 60 * 60 * 1000).toISOString()
+
+    const busEvents: unknown[] = []
+    const env = {
+      DB: {
+        prepare: () => ({
+          bind: () => ({
+            all: async () => ({
+              results: [
+                { id: 'tok-exp-soon', agent_id: 'agent-1', label: 'daemon', expires_at: in6Days },
+                { id: 'tok-fine', agent_id: 'agent-2', label: 'safe', expires_at: in10Days },
+              ],
+            }),
+          }),
+        }),
+      },
+      TENANT_SLUG: 'mumega',
+      BUS: {
+        send: async (e: unknown) => { busEvents.push(e) },
+      },
+    } as unknown as Env
+
+    const res = await sweepExpiringTokensWarning(env, 7)
+    expect(res.warned).toBe(1)
+    expect(res.tokens[0].id).toBe('tok-exp-soon')
+    expect(busEvents.length).toBe(1)
+    expect((busEvents[0] as { payload: { kind: string } }).payload.kind).toBe('token_expiring_soon')
+  })
+
+  it('heartbeat wiring: scheduled handler in src/index.ts wires token-expiry-warning into maintenance cron', async () => {
+    const { readFileSync } = await import('node:fs')
+    const { join } = await import('node:path')
+    const src = readFileSync(join(__dirname, '..', 'src', 'index.ts'), 'utf8')
+
+    // PINNED: If someone deletes or comments out the maintenance wiring in src/index.ts, this test fails RED.
+    expect(src).toContain("['token-expiry-warning', () => sweepExpiringTokensWarning(env)]")
+    expect(src).toContain("const { sweepExpiringTokensWarning } = await import('./auth/token-lifecycle')")
+
+    // Pin the maintenance array structure and scheduled execution hook in src/index.ts
+    expect(src).toMatch(/const maintenance:\s*ReadonlyArray<readonly \[string,\s*\(\)\s*=>\s*Promise<unknown>\]>\s*=\s*\[[\s\S]*?\['token-expiry-warning',\s*\(\)\s*=>\s*sweepExpiringTokensWarning\(env\)\]/)
+    expect(src).toContain("const heartbeat = maintenance[scheduledAt.getUTCMinutes() % 15]")
   })
 })

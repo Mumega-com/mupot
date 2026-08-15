@@ -127,6 +127,15 @@ ${honoRaw(errorHtml)}
           <option value="observer">Observer — can read roster/shared memory, inbox, and private memory</option>
         </select>
       </label>
+      <label style="margin-top:10px">
+        Expiry lifecycle
+        <select name="expires_in_days">
+          <option value="30" selected>30 days (default security posture)</option>
+          <option value="90">90 days (quarterly)</option>
+          <option value="365">1 year (annual)</option>
+          <option value="0">Non-expiring (standing infrastructure daemon only)</option>
+        </select>
+      </label>
       <div style="margin-top:16px">
         <button class="btn" type="submit">Mint agent token</button>
         <a href="/members" class="btn secondary sm" style="margin-left:10px">Cancel</a>

@@ -43,6 +43,26 @@ export function nowSqlUtc(): string {
   return new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, '')
 }
 
+export const DEFAULT_TOKEN_EXPIRY_DAYS = 30
+
+/** Calculate a standard SQLite-compatible UTC ISO timestamp given days in the future.
+ *  Returns null if days is null or 0 (meaning non-expiring). */
+export function calculateExpiryTimestamp(days: number | null | undefined = DEFAULT_TOKEN_EXPIRY_DAYS): string | null {
+  if (days === null || days === undefined || days <= 0) return null
+  const date = new Date(Date.now() + days * 24 * 60 * 60 * 1000)
+  return date.toISOString().replace('T', ' ').replace(/\.\d+Z$/, '')
+}
+
+/** Check if a token is expiring within warningDays threshold (default 7 days). */
+export function isTokenExpiringSoon(expiresAt: string | null | undefined, warningDays = 7): boolean {
+  if (!expiresAt) return false
+  const expTime = new Date(expiresAt.replace(' ', 'T') + (expiresAt.includes('Z') ? '' : 'Z')).getTime()
+  if (isNaN(expTime)) return false
+  const now = Date.now()
+  const threshold = now + warningDays * 24 * 60 * 60 * 1000
+  return expTime > now && expTime <= threshold
+}
+
 /** Stamp `last_used_at` for a successfully authenticated token hash.
  *
  *  BEST-EFFORT BY CONTRACT. This is the telemetry that makes credential cleanup
@@ -63,5 +83,60 @@ export async function touchTokenLastUsed(env: Env, tokenHash: string): Promise<v
   } catch {
     // Intentionally silent: see the contract above. Losing a usage stamp degrades a
     // future cleanup decision; failing the request degrades a live agent right now.
+  }
+}
+
+export interface ExpiringTokenSweepResult {
+  warned: number
+  tokens: Array<{ id: string; agent_id: string | null; label: string; expires_at: string }>
+}
+
+/**
+ * Sweep member_tokens for active credentials expiring within `warningDays` (default 7 days).
+ * Emits a bus event or warning log for each expiring credential so seats/operators receive
+ * proactive notification rather than silent drops.
+ */
+export async function sweepExpiringTokensWarning(
+  env: Env,
+  warningDays = 7,
+): Promise<ExpiringTokenSweepResult> {
+  try {
+    const rows = await env.DB.prepare(
+      `SELECT id, agent_id, label, expires_at
+         FROM member_tokens
+        WHERE tenant = ?1
+          AND revoked_at IS NULL
+          AND expires_at IS NOT NULL`,
+    )
+      .bind(env.TENANT_SLUG)
+      .all<{ id: string; agent_id: string | null; label: string; expires_at: string }>()
+
+    const candidates = rows.results ?? []
+    const expiringSoon = candidates.filter((t) => isTokenExpiringSoon(t.expires_at, warningDays))
+
+    if (expiringSoon.length > 0 && env.BUS?.send) {
+      for (const t of expiringSoon) {
+        await env.BUS.send({
+          type: 'org.provisioned',
+          tenant: env.TENANT_SLUG,
+          ts: new Date().toISOString(),
+          payload: {
+            kind: 'token_expiring_soon',
+            token_id: t.id,
+            agent_id: t.agent_id,
+            label: t.label,
+            expires_at: t.expires_at,
+          },
+        })
+      }
+    }
+
+    return {
+      warned: expiringSoon.length,
+      tokens: expiringSoon,
+    }
+  } catch (error) {
+    console.error('expiring tokens warning sweep failed', error)
+    return { warned: 0, tokens: [] }
   }
 }
