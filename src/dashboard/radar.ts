@@ -362,9 +362,14 @@ function flightSquadIds(row: FlightRow | undefined): string[] | null {
 // (dashboard/observatory.ts, fleet/presence.ts, fleet/registry.ts, flight/service.ts)
 // plus one plain `agents`/`squads` SELECT (same columns loadObservatory / org/index.ts
 // already use — there is no narrower exported lister for either table) and feeds them
-// in. No writes, no new tables, no second liveness definition.
+export async function loadFleetRadar(
+  env: Env,
+  nowMs = Date.now(),
+  squadIds?: readonly string[] | null,
+): Promise<FleetRadar> {
+  const isFiltered = squadIds !== undefined && squadIds !== null
+  const accessibleSet = isFiltered ? new Set(squadIds) : null
 
-export async function loadFleetRadar(env: Env, nowMs = Date.now()): Promise<FleetRadar> {
   const [agentRows, squadRows, stats, runtimeStates, fleetRuntimeRows, presence, recentTasks, flights] =
     await Promise.all([
       env.DB.prepare(
@@ -375,16 +380,19 @@ export async function loadFleetRadar(env: Env, nowMs = Date.now()): Promise<Flee
       >(),
       loadAgentStats(env),
       loadAgentRuntimeStates(env, nowMs),
-      listFleetAgentRuntimeView(env, nowMs),
-      listPresence(env, nowMs),
+      listFleetAgentRuntimeView(env, nowMs, squadIds),
+      listPresence(env, nowMs, squadIds),
       loadRecentTasks(env),
       listFlights(env, 500),
     ])
 
+  const agents = (agentRows.results ?? []).filter((a) => !accessibleSet || accessibleSet.has(a.squad_id))
+  const squads = (squadRows.results ?? []).filter((s) => !accessibleSet || accessibleSet.has(s.id))
+
   return buildFleetRadar({
     nowMs,
-    agents: agentRows.results ?? [],
-    squads: squadRows.results ?? [],
+    agents,
+    squads,
     stats,
     runtimeStates,
     fleetRuntimeRows,

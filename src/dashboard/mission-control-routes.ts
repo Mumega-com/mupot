@@ -46,10 +46,13 @@ export function makeMissionControlApp(shell: ShellFn) {
         : 'radar'
 
     const squadIds = await resolveAccessibleSquadIds(c.env, auth)
+    if (squadIds !== null && squadIds.length === 0) {
+      return c.text('Forbidden: no squad capabilities', 403)
+    }
     const tenant = c.req.query('tenant') ?? 'mumega.com'
 
     const [radar, hostAgents, presence, motherboard, journeys, physics, spend] = await Promise.all([
-      loadFleetRadar(c.env),
+      loadFleetRadar(c.env, Date.now(), squadIds),
       listFleetAgentRuntimeView(c.env, Date.now(), squadIds),
       listPresence(c.env, Date.now(), squadIds),
       loadMotherboardData(c.env, tenant, auth),

@@ -180,6 +180,50 @@ describe('FLIGHT-001 #797 — /fleet, /brain, /agents/:id squad scoping (real SQ
     expect(body).toContain('Host B')
   })
 
+  // ── GET /radar & GET /radar?format=json ──────────────────────────────────────
+
+  it('zero-capability member: 403 on GET /radar and GET /radar?format=json', async () => {
+    harness = await makeHarness()
+    const env = envFor(harness, { 'sess:s-zero': sessionRecord('zero@drive-by.test') })
+    const resHtml = await dashboardApp.fetch(req('/radar', 's-zero'), env)
+    expect(resHtml.status).toBe(403)
+
+    const resJson = await dashboardApp.fetch(req('/radar?format=json', 's-zero'), env)
+    expect(resJson.status).toBe(403)
+  })
+
+  it('squad-a member: 200 on GET /radar?format=json, JSON returns ONLY Squad A agents and squads', async () => {
+    harness = await makeHarness()
+    const env = envFor(harness, { 'sess:s-squad-a': sessionRecord('squad-a@pot.test') })
+    const res = await dashboardApp.fetch(req('/radar?format=json', 's-squad-a'), env)
+    expect(res.status).toBe(200)
+    const data = await res.json() as { agents: Array<{ agent_id: string; display: string }>; squads: Array<{ squad_id: string; name: string }> }
+    expect(data.agents.map(a => a.agent_id)).toEqual(['agent-a'])
+    expect(data.squads.map(s => s.squad_id)).toEqual(['squad-a'])
+  })
+
+  it('squad-b member: 200 on GET /radar?format=json, JSON returns ONLY Squad B agents and squads', async () => {
+    harness = await makeHarness()
+    const env = envFor(harness, { 'sess:s-squad-b': sessionRecord('squad-b@pot.test') })
+    const res = await dashboardApp.fetch(req('/radar?format=json', 's-squad-b'), env)
+    expect(res.status).toBe(200)
+    const data = await res.json() as { agents: Array<{ agent_id: string; display: string }>; squads: Array<{ squad_id: string; name: string }> }
+    expect(data.agents.map(a => a.agent_id)).toEqual(['agent-b'])
+    expect(data.squads.map(s => s.squad_id)).toEqual(['squad-b'])
+  })
+
+  it('org-scope capability: 200 on GET /radar?format=json, JSON returns ALL agents and squads', async () => {
+    harness = await makeHarness()
+    const env = envFor(harness, { 'sess:s-org': sessionRecord('org@pot.test') })
+    const res = await dashboardApp.fetch(req('/radar?format=json', 's-org'), env)
+    expect(res.status).toBe(200)
+    const data = await res.json() as { agents: Array<{ agent_id: string }>; squads: Array<{ squad_id: string }> }
+    expect(data.agents.map(a => a.agent_id)).toContain('agent-a')
+    expect(data.agents.map(a => a.agent_id)).toContain('agent-b')
+    expect(data.squads.map(s => s.squad_id)).toContain('squad-a')
+    expect(data.squads.map(s => s.squad_id)).toContain('squad-b')
+  })
+
   // ── GET /brain ──────────────────────────────────────────────────────────────
 
   it('zero-capability member: 403 on GET /brain (F2 floor)', async () => {
