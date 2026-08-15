@@ -183,16 +183,8 @@ import {
 import { answerRoutineRun, cancelRoutineRun } from '../routines/actions'
 import { loadAgentConnectionStatus } from '../members/agent-connection-status'
 
-// First-run setup wizard (the easy-onboard centerpiece). Mounted under '/setup'
-// on this same dashboard app, so it inherits the auth + tenant guard below.
 import { wakeFleetAgent, requestFleetControl, fleetScoped } from './fleet'
-import { listFleetAgentRuntimeView } from '../fleet/registry'
 import { emitControlRequest, emitSquadControlRequest } from '../fleet/control'
-import { hostAgentsPanel, squadControlPanel } from './fleet-host'
-import { listPresence } from '../fleet/presence'
-import type { PresenceView } from '../fleet/presence'
-import { listJourneys, buildDepartureBoard } from '../coordination/journeys'
-import type { DepartureCard } from '../coordination/journeys'
 import { listFlights } from '../flight/service'
 import { buildBoard } from '../flight/board'
 import type { FlightCard } from '../flight/board'
@@ -201,9 +193,6 @@ import { isOnboardingComplete } from './settings'
 import { loadBrainView, brainBody, regimeBadgeClass, loadBrainPhysics } from './brain'
 import type { PhysicsSnapshot } from './brain'
 import { loadGrowthView, growthBody } from './growth'
-import { loadFleetRadar } from './radar'
-import { radarPageBody } from './radar-view'
-import { loadMotherboardData, motherboardPageBody } from './motherboard'
 import { setLoopControl, isLoopControlAction } from '../loops/decisions'
 import { getLoop } from '../loops/service'
 import {
@@ -211,8 +200,12 @@ import {
   rotateConnector,
   revokeConnector,
   listConnectors,
+  resolveConnector,
+  resolveConnectorWithMeta,
 } from '../connectors/service'
 import { isConnectorType, isConnectorScopeType } from '../connectors/crypto'
+import { parseWpConnectorConfig } from '../departments/executors/mcpwp'
+import { kernelMintCtx, getRegistered } from '../departments/registry'
 import { githubCapabilitySnapshot } from '../integrations/github-capabilities'
 import { writeAgentDef, assignIssueToCopilot } from '../integrations/github-repo-write'
 import { installUrl, parseInstallCallback, storeInstallation, getInstallationId } from '../integrations/github-install'
@@ -221,13 +214,12 @@ import { executeTaskAsPR } from '../integrations/github-execute'
 import { importProjectItems } from '../integrations/github-projects'
 import { githubStatusBody } from '../integrations/github-dashboard'
 import { connectorsPageBody, connectorAddedBody, connectorRotatedBody } from '../connectors/dashboard'
-import { resolveConnector, resolveConnectorWithMeta } from '../connectors/service'
-import { parseWpConnectorConfig } from '../departments/executors/mcpwp'
-import { kernelMintCtx, getRegistered } from '../departments/registry'
 import type { KernelHandle } from '../departments/ctx'
 import '../departments/modules/growth' // side-effect: register GrowthModule so getRegistered('growth') resolves
 import '../departments/modules/agency' // side-effect: register AgencyModule (reusable agency/AEO template)
 import '../departments/modules/web-ops' // side-effect: register WebOpsModule (AI website-operations team — the wedge)
+import { makeMissionControlApp } from './mission-control-routes'
+export { controlTowerBody, potFleetBody } from './mission-control-views'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
@@ -1245,79 +1237,8 @@ dashboardApp.get('/flights', async (c) => {
 // the org-admin authorization LEVEL that GET /api/radar's bearer-token
 // resolveOrgAdmin check requires, via the mechanism this cookie-authed
 // dashboard already uses everywhere else. GET /api/radar's own bearer check
-// (src/auth/member-bearer.ts resolveOrgAdmin) is NOT touched by this route —
-// it stays the canonical JSON surface for the brain / programmatic callers.
-// ?format=json (or an Accept: application/json request) returns the identical
-// FleetRadar JSON through this session-authed path for convenience.
-dashboardApp.get('/radar', async (c) => {
-  const auth = c.get('auth')
-  if (!isOrgAdmin(auth)) {
-    return c.html(shell(c.env, 'Radar', errorBody('Fleet radar requires owner or admin.')), 403)
-  }
-  const radar = await loadFleetRadar(c.env)
-  const accept = c.req.header('accept') ?? ''
-  const wantsJson = c.req.query('format') === 'json' || (accept.includes('application/json') && !accept.includes('text/html'))
-  if (wantsJson) return c.json(radar)
-  return c.html(shell(c.env, 'Radar', radarPageBody(radar)))
-})
-
-// ── motherboard (Fractal Motherboard Map visual topology engine — shipped in v0.29.0, planned as v0.28.0) ──
-dashboardApp.get('/motherboard', async (c) => {
-  const auth = c.get('auth') as AuthContext | undefined
-  const tenant = c.req.query('tenant') ?? 'mumega.com'
-  const data = await loadMotherboardData(c.env, tenant, auth)
-  const accept = c.req.header('accept') ?? ''
-  const wantsJson = c.req.query('format') === 'json' || (accept.includes('application/json') && !accept.includes('text/html'))
-  if (wantsJson) return c.json(data)
-  return c.html(shell(c.env, 'Fractal Motherboard', motherboardPageBody(data)))
-})
-
-dashboardApp.get('/dashboard/motherboard', async (c) => {
-  const auth = c.get('auth') as AuthContext | undefined
-  const tenant = c.req.query('tenant') ?? 'mumega.com'
-  const data = await loadMotherboardData(c.env, tenant, auth)
-  const accept = c.req.header('accept') ?? ''
-  const wantsJson = c.req.query('format') === 'json' || (accept.includes('application/json') && !accept.includes('text/html'))
-  if (wantsJson) return c.json(data)
-  return c.html(shell(c.env, 'Fractal Motherboard', motherboardPageBody(data)))
-})
-
-// ── fleet (CF-native roster — ADR gh #473; SOS bus retired from this path) ───
-// GET /fleet — pot check-in presence + signed host-control panel.
-// Wake/control POST endpoints below use agent_messages + Queue, not SOS Redis.
-//
-// FLIGHT-001 #797: this used to load listFleetAgentRuntimeView + listPresence
-// UNSCOPED — any caller who passed the dashboard's global capability floor
-// (FLIGHT-001 F2, #796; proves "belongs somewhere in this org", not "may see
-// THIS squad's agents") saw the FULL live-fleet roster and the full pot
-// check-in presence list, across every squad, not just their own. Both reads
-// are now scoped to resolveAccessibleSquadIds(auth): an org-scope grant (or
-// legacy owner/admin) sees everything; a squad/department grant sees only its
-// own squads' host agents + squadmates' presence.
-dashboardApp.get('/fleet', async (c) => {
-  const auth = c.get('auth')
-  const squadIds = await resolveAccessibleSquadIds(c.env, auth)
-  const hostAgents = await listFleetAgentRuntimeView(c.env, Date.now(), squadIds)
-  const hostPanelOpts = {
-    configured: !!c.env.FLEET_PANEL_SK && !!c.env.FLEET_CONSUMER_AGENT,
-    canControl: auth.role === 'owner',
-    flash: c.req.query('hc') ?? null,
-  }
-  const hostPanel = hostAgentsPanel(hostAgents, hostPanelOpts)
-  const squadPanel = squadControlPanel(hostAgents, hostPanelOpts)
-
-  const [presence, physics, spend] = await Promise.all([
-    listPresence(c.env, Date.now(), squadIds),
-    loadBrainPhysics(c.env),
-    loadTodaySpendScalar(c.env),
-  ])
-  return c.html(
-    shell(c.env, 'Fleet', html`${hostPanel}${squadPanel}${potFleetBody(presence)}`, {
-      physics,
-      costToday: { configured: spend.configured, todayUsdMicro: spend.today_usd_micro },
-    }),
-  )
-})
+// Mount Mission Control Sub-app (unified /radar + 301 redirects)
+dashboardApp.route('/', makeMissionControlApp(shell))
 
 // Mount Kanban Sub-app
 dashboardApp.route('/', kanbanApp)
@@ -1427,21 +1348,6 @@ dashboardApp.post('/fleet/control', async (c) => {
     label: auth.email ?? 'admin',
   })
   return c.json(r, r.ok ? 200 : 400)
-})
-
-// ── Control Tower (coordination departures board) ────────────────────────────
-// GET /coordination — which agent flies to which project, when, what status. Read-only,
-// any authenticated pot member. Agents board flights at POST /api/coordination.
-dashboardApp.get('/coordination', async (c) => {
-  const scope = c.req.query('scope') === 'all' ? 'all' : 'live'
-  // Render even if the read fails — an empty board, never a raw 500 with a stack.
-  let cards: DepartureCard[] = []
-  try {
-    cards = buildDepartureBoard(await listJourneys(c.env, { scope }), Date.now())
-  } catch {
-    cards = []
-  }
-  return c.html(shell(c.env, 'Control Tower', controlTowerBody(cards)))
 })
 
 // ── /agents — unified agent management ───────────────────────────────────────
@@ -2877,7 +2783,7 @@ export function resolveSwitchPotUrl(env: Env): string {
  * Fonts: Instrument Serif (headings/metrics) · Hanken Grotesk (body) · JetBrains Mono (IDs/badges).
  * Sidebar: Stripe-style with collapsible sections that remember open/closed state.
  */
-function shell(
+export function shell(
   env: Env,
   title: string,
   body: HtmlEscapedString | Promise<HtmlEscapedString>,
@@ -3808,22 +3714,10 @@ function shell(
             </div>
           </div>
 
-          <!-- Fleet -->
-          <a class="nav-link" href="/fleet">
-            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" width="17" height="17"><circle cx="10" cy="10" r="6.2"/><circle cx="10" cy="10" r="1.7" fill="currentColor" stroke="none"/></svg>
-            <span class="nav-label">Fleet</span>
-          </a>
-
-          <!-- Radar (fleet + squad awareness map — #21/#23) -->
+          <!-- Mission Control (unified Radar, Fleet, Motherboard, and Departures — Flight-003B) -->
           <a class="nav-link" href="/radar">
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><circle cx="10" cy="10" r="7"/><circle cx="10" cy="10" r="1.4" fill="currentColor" stroke="none"/><path d="M10 3v2M10 15v2M3 10h2M15 10h2"/></svg>
-            <span class="nav-label">Radar</span>
-          </a>
-
-          <!-- Motherboard (Fractal Motherboard map — shipped in v0.29.0) -->
-          <a class="nav-link" href="/motherboard">
-            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><rect x="3" y="3" width="14" height="14" rx="2"/><path d="M7 7h2v2H7zM11 7h2v2h-2zM7 11h2v2H7zM11 11h2v2h-2z"/></svg>
-            <span class="nav-label">Motherboard</span>
+            <span class="nav-label">Mission Control</span>
           </a>
 
           <!-- Health (operator console) -->
@@ -3835,12 +3729,6 @@ function shell(
           <a class="nav-link" href="/addons" id="nav-addons" hidden>
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M7.2 3.5v3.1a2.1 2.1 0 1 0 2.1 2.1h3.2v-2a1.9 1.9 0 1 1 3.8 0v2H17v6.1H9.3a2.1 2.1 0 1 0-2.1 2.1v-2.1H3.5V9h2.1a2.1 2.1 0 1 0 1.6-3.4V3.5z"/></svg>
             <span class="nav-label">Addons</span>
-          </a>
-
-          <!-- Control Tower (coordination departures board) -->
-          <a class="nav-link" href="/coordination">
-            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M10 2v6M6 5l8 0M5 17l5-9 5 9M7.5 13h5"/></svg>
-            <span class="nav-label">Control Tower</span>
           </a>
 
           <!-- Economy (collapsible) -->
@@ -4073,7 +3961,7 @@ function shell(
 </html>`
 }
 
-function errorBody(message: string) {
+export function errorBody(message: string) {
   return html`<h1>Hmm.</h1><p class="empty">${message}</p><p><a href="/">← Back to overview</a></p>`
 }
 
@@ -5177,114 +5065,6 @@ function flightsBody(cards: FlightCard[], project?: Project, scanLimited = false
       .fl-badge { font-size: 11px; text-transform: uppercase; letter-spacing: .5px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); }
       .fl-num { text-align: right; font-variant-numeric: tabular-nums; }
       .fl-over { color: #e5534b; }
-    </style>
-    ${raw(`<div class="card" style="padding:0;overflow-x:auto">${table}</div>`)}`
-}
-
-// The Control Tower departures board. Cards come pre-derived (buildDepartureBoard); every
-// agent-supplied field (agent/project/goal/gate) is escHtml'd before interpolation. Exported so
-// the XSS regression test can assert the escaping on the rendered output directly.
-export function controlTowerBody(cards: DepartureCard[]) {
-  const dot = (p: string) =>
-    p === 'IN FLIGHT' ? 'var(--ok)' : p === 'BOARDING' ? 'var(--warn)' : p === 'DELAYED' ? '#e5534b' : 'var(--dim)'
-  const tr = (c: DepartureCard) => `
-    <tr class="ct-row ${c.live ? '' : 'ct-dim'}">
-      <td><span class="ct-dot" style="background:${dot(c.phase)}"></span>${escHtml(c.agent)}</td>
-      <td class="ct-dest">${escHtml(c.project)}</td>
-      <td class="ct-label">${escHtml(c.goal || '—')}</td>
-      <td><span class="ct-badge">${escHtml(c.phase)}</span></td>
-      <td>${escHtml(c.departed)}</td>
-      <td>${escHtml(c.eta)}</td>
-      <td class="ct-label">${c.gate ? escHtml(c.gate) : '—'}</td>
-      <td>${escHtml(c.age)}</td>
-    </tr>`
-  const live = cards.filter((c) => c.live).length
-  const table = cards.length
-    ? `<table class="ct-table">
-        <thead><tr><th>Flight (agent)</th><th>Destination</th><th>Goal</th><th>Status</th><th>Departed</th><th>ETA</th><th>Gate</th><th>Age</th></tr></thead>
-        <tbody>${cards.map(tr).join('')}</tbody>
-      </table>`
-    : `<p class="empty">No flights on the board. An agent boards one at <code>POST /api/coordination</code> with {project, goal, gate, eta_ms} and it appears here.</p>`
-  return html`
-    ${pageHeader({
-      crumbs: 'Overview / Control Tower',
-      title: 'Control Tower',
-      sub: 'Departures board — which agent flies to which project, when, and what status. Any agent-bound token boards a flight (POST /api/coordination); the colony reads the board. Live flights first; arrived/cancelled fade to history. Times UTC.',
-    })}
-    ${kpiRow([statCard({ label: 'In the air', value: String(live), subTone: live > 0 ? 'ok' : 'dim' })])}
-    <style>
-      .ct-table{width:100%;border-collapse:collapse;font-size:14px}
-      .ct-table th{text-align:left;padding:8px 10px;color:var(--dim);font-weight:600;border-bottom:1px solid var(--border)}
-      .ct-table td{padding:8px 10px;border-bottom:1px solid var(--border)}
-      .ct-row.ct-dim{opacity:.5}
-      .ct-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:8px;vertical-align:middle}
-      .ct-dest{font-weight:600}
-      .ct-label{color:var(--dim)}
-      .ct-badge{font-size:11px;padding:2px 8px;border-radius:10px;background:var(--surface);border:1px solid var(--border)}
-      .empty{color:var(--dim);padding:16px}
-    </style>
-    ${raw(table)}`
-}
-
-function potFleetBody(rows: PresenceView[]) {
-  // Heartbeat axis (cheap always-on agents): active/idle/dead/never.
-  const dot = (l: string) =>
-    l === 'active' ? 'var(--ok)' : l === 'idle' ? 'var(--warn)' : l === 'dead' ? '#e5534b' : 'var(--dim)'
-  // Schedule axis (#62, session agents with flights): flying/sleeping/done.
-  const schedDot = (s: string) => (s === 'flying' ? 'var(--ok)' : s === 'sleeping' ? 'var(--warn)' : 'var(--dim)')
-  // "Present" = heartbeat active OR mid/between flights (flying or sleeping).
-  const present = rows.filter(
-    (r) => r.liveness === 'active' || r.schedule?.state === 'flying' || r.schedule?.state === 'sleeping',
-  ).length
-  const tr = (r: PresenceView) => {
-    // Session agent (has flights) → read schedule-state; a resting one is sleeping,
-    // never "dead". Cheap always-on agent → read heartbeat liveness as before.
-    const useSched = r.schedule != null
-    const dimmed = useSched ? r.schedule!.state === 'done' : r.liveness === 'dead' || r.liveness === 'never'
-    const dotColor = useSched ? schedDot(r.schedule!.state) : dot(r.liveness)
-    const statusLabel = useSched
-      ? r.schedule!.state === 'sleeping' && r.schedule!.next_label
-        ? `${r.schedule!.state} · ${r.schedule!.next_label}`
-        : r.schedule!.state
-      : r.liveness
-    const badgeClass = useSched ? `fl-sched-${escAttr(r.schedule!.state)}` : `fl-${escAttr(r.liveness)}`
-    return `
-    <tr class="fl-row ${dimmed ? 'fl-dim' : ''}">
-      <td><span class="fl-dot" style="background:${dotColor}"></span>${escHtml(r.display_name || '—')}</td>
-      <td class="fl-label">${escHtml(r.source)}</td>
-      <td class="fl-label">${escHtml(r.label || '—')}</td>
-      <td><span class="fl-badge ${badgeClass}">${escHtml(statusLabel)}</span></td>
-      <td>${escHtml(r.last_seen_human)}</td>
-    </tr>`
-  }
-  const table = rows.length
-    ? `<table class="fl-table">
-        <thead><tr><th>Agent</th><th>Runtime</th><th>Role / label</th><th>Status</th><th>Last check-in</th></tr></thead>
-        <tbody>${rows.map(tr).join('')}</tbody>
-      </table>`
-    : `<p class="empty">No agents have checked in yet. Give an agent this pot's flock
-       pack + a member token; it checks in at <code>POST /api/fleet/checkin</code> and
-       appears here (active when in, fades to dead when out).</p>`
-  return html`
-    ${pageHeader({
-      crumbs: 'Overview / Fleet',
-      title: 'Fleet',
-      sub:
-        'Your flock — agents that check in to this pot, on any runtime (Claude Code, Codex, Hermes, openclaw…). Always-on agents read their heartbeat (active/idle/dead); session agents read their schedule (flying / sleeping · next run / done) — a resting agent is sleeping, not dead. Times UTC. Host control uses the signed mupot control plane above.',
-    })}
-    ${kpiRow([statCard({ label: 'Present now', value: String(present), subTone: present > 0 ? 'ok' : 'dim' })])}
-    <style>
-      .fl-table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
-      .fl-table th { text-align: left; color: var(--muted); font-size: 12px; text-transform: uppercase;
-        letter-spacing: .5px; padding: 8px 10px; border-bottom: 1px solid var(--border); }
-      .fl-table td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
-      .fl-dim td { opacity: .6; }
-      .fl-dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:8px; }
-      .fl-label { color: var(--muted); max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-      .fl-badge { font-size: 11px; text-transform: uppercase; letter-spacing: .5px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); }
-      .fl-active { color: var(--ok); } .fl-idle { color: var(--warn); }
-      .fl-dead { color: #e5534b; } .fl-never { color: var(--dim); }
-      .fl-sched-flying { color: var(--ok); } .fl-sched-sleeping { color: var(--warn); } .fl-sched-done { color: var(--dim); }
     </style>
     ${raw(`<div class="card" style="padding:0;overflow-x:auto">${table}</div>`)}`
 }

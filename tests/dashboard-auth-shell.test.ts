@@ -30,8 +30,8 @@ describe('dashboard authenticated account shell', () => {
     expect(navStart).toBeGreaterThan(-1)
     expect(navEnd).toBeGreaterThan(navStart)
     for (const href of [
-      '/admin/divisions', '/agents', '/send', '/flights', '/verifications', '/fleet', '/radar', '/ops',
-      '/addons', '/coordination', '/economy', '/economy/wallet', '/economy/marketplace', '/economy/billing',
+      '/admin/divisions', '/agents', '/send', '/flights', '/verifications', '/radar', '/ops',
+      '/addons', '/economy', '/economy/wallet', '/economy/marketplace', '/economy/billing',
       '/members', '/admin/members', '/audit', '/deployment', '/admin/github', '/admin/keys',
     ]) {
       expect(sidebarNav).toContain(`href="${href}"`)
