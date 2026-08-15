@@ -3694,7 +3694,6 @@ export function shell(
             </button>
             <div class="nav-children" id="children-org">
               <a class="nav-child" href="/admin/divisions">Departments</a>
-              <a class="nav-child" href="/admin/divisions">Squads</a>
               <a class="nav-child" href="/agents">Agents</a>
             </div>
           </div>
