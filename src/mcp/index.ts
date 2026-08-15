@@ -408,23 +408,39 @@ export async function memberCanOnSquad(
 
 // ── d1 helpers (read-only lookups; allow-listed table names) ──────────────────
 async function loadSquad(env: Env, squadId: string): Promise<Squad | null> {
-  const row = await env.DB.prepare(
-    `SELECT id, department_id, slug, name, charter, budget_cap_cents, budget_window, created_at
-       FROM squads WHERE id = ?1 LIMIT 1`,
-  )
-    .bind(squadId)
-    .first<Squad>()
-  return row ?? null
+  const { resolveSquadEntity } = await import('../lib/entity-resolver')
+  const res = await resolveSquadEntity(env, squadId)
+  return res.ok ? res.entity : null
+}
+
+export async function getSquad(env: Env, squadRef: string): Promise<{ ok: true; squad: Squad } | Extract<ToolOutcome, { ok: false }>> {
+  const { resolveSquadEntity } = await import('../lib/entity-resolver')
+  const res = await resolveSquadEntity(env, squadRef)
+  if (!res.ok) {
+    if (res.reason === 'ambiguous') {
+      return failOnly(409, 'ambiguous_squad_id', { candidates: res.candidates })
+    }
+    return failOnly(404, 'squad_not_found')
+  }
+  return { ok: true, squad: res.entity }
 }
 
 async function loadAgent(env: Env, agentId: string): Promise<Agent | null> {
-  const row = await env.DB.prepare(
-    `SELECT id, squad_id, slug, name, role, model, status, budget_cap_cents, budget_window, created_at
-       FROM agents WHERE id = ?1 LIMIT 1`,
-  )
-    .bind(agentId)
-    .first<Agent>()
-  return row ?? null
+  const { resolveAgentEntity } = await import('../lib/entity-resolver')
+  const res = await resolveAgentEntity(env, agentId)
+  return res.ok ? res.entity : null
+}
+
+export async function getAgent(env: Env, agentRef: string): Promise<{ ok: true; agent: Agent } | Extract<ToolOutcome, { ok: false }>> {
+  const { resolveAgentEntity } = await import('../lib/entity-resolver')
+  const res = await resolveAgentEntity(env, agentRef)
+  if (!res.ok) {
+    if (res.reason === 'ambiguous') {
+      return failOnly(409, 'ambiguous_agent_id', { candidates: res.candidates })
+    }
+    return failOnly(404, 'agent_not_found')
+  }
+  return { ok: true, agent: res.entity }
 }
 
 async function loadMemberIdentity(env: Env, auth: AuthContext): Promise<{
@@ -546,13 +562,21 @@ function readConcepts(v: unknown): string[] | undefined | Extract<ToolOutcome, {
 }
 
 async function loadTask(env: Env, taskId: string): Promise<Task | null> {
-  const row = await env.DB.prepare(
-    `SELECT ${TASK_SELECT_COLUMNS}
-       FROM tasks WHERE id = ?1 LIMIT 1`,
-  )
-    .bind(taskId)
-    .first<Task>()
-  return row ?? null
+  const { resolveTaskEntity } = await import('../lib/entity-resolver')
+  const res = await resolveTaskEntity(env, taskId)
+  return res.ok ? res.entity : null
+}
+
+export async function getTask(env: Env, taskRef: string): Promise<{ ok: true; task: Task } | Extract<ToolOutcome, { ok: false }>> {
+  const { resolveTaskEntity } = await import('../lib/entity-resolver')
+  const res = await resolveTaskEntity(env, taskRef)
+  if (!res.ok) {
+    if (res.reason === 'ambiguous') {
+      return failOnly(409, 'ambiguous_task_id', { candidates: res.candidates })
+    }
+    return failOnly(404, 'task_not_found')
+  }
+  return { ok: true, task: res.entity }
 }
 
 async function resolveTaskSquad(
@@ -632,8 +656,9 @@ async function resolveScopedSquad(
   }
   if (!squadId) return failOnly(400, 'invalid_args', missingDetail)
 
-  const squad = await loadSquad(env, squadId)
-  if (!squad) return failOnly(404, 'squad_not_found')
+  const squadRes = await getSquad(env, squadId)
+  if (!squadRes.ok) return squadRes
+  const squad = squadRes.squad
 
   const grants = auth.capabilities ?? []
   if (!workspaceAdminBypass && !(await memberCanOnSquad(env, grants, squad.id, min))) {
@@ -984,6 +1009,8 @@ const toolTaskUpdate: ToolSpec = {
       project_id: NULLABLE_STRING_SCHEMA,
       title: STRING_SCHEMA,
       body: STRING_SCHEMA,
+      note: STRING_SCHEMA,
+      reason: STRING_SCHEMA,
       done_when: STRING_SCHEMA,
       status: STRING_SCHEMA,
       priority: { type: ['string', 'null'], description: 'Rank, or null to return the task to UNTRIAGED.' },
@@ -995,10 +1022,11 @@ const toolTaskUpdate: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    const taskId = str(args.task_id)
-    if (!taskId) return fail(400, 'invalid_args', 'task_id required')
-    const existing = await loadTask(env, taskId)
-    if (!existing) return fail(404, 'task_not_found')
+    const taskRef = str(args.task_id)
+    if (!taskRef) return fail(400, 'invalid_args', 'task_id required')
+    const taskRes = await getTask(env, taskRef)
+    if (!taskRes.ok) return taskRes
+    const existing = taskRes.task
 
     const grants = auth.capabilities ?? []
     if (!(await memberCanOnSquad(env, grants, existing.squad_id, 'member'))) {
@@ -1013,9 +1041,17 @@ const toolTaskUpdate: ToolSpec = {
       next.title = (args.title as string).trim()
       changed = true
     }
-    if (args.body !== undefined) {
-      if (typeof args.body !== 'string') return fail(400, 'invalid_body')
-      next.body = args.body
+    if (args.body !== undefined || args.note !== undefined || args.reason !== undefined) {
+      const explicitBody = typeof args.body === 'string' ? args.body : existing.body ?? ''
+      const extraContent = [args.note, args.reason]
+        .filter((x): x is string => typeof x === 'string' && x.trim().length > 0)
+        .join('\n\n')
+      
+      const newBody = extraContent
+        ? (explicitBody ? `${explicitBody}\n\n${extraContent}` : extraContent)
+        : explicitBody
+
+      next.body = newBody
       changed = true
     }
     if (args.done_when !== undefined) {
@@ -1372,28 +1408,30 @@ const toolTaskVerdict: ToolSpec = {
   name: 'task_verdict',
   scope: 'squad (of the task)',
   min: 'member',
-  args: '{ task_id: string, verdict: "approved"|"rejected", note?: string, override_self_verdict?: boolean }',
+  args: '{ task_id: string, verdict: "approved"|"rejected", note?: string, reason?: string, override_self_verdict?: boolean }',
   inputSchema: {
     type: 'object',
     properties: {
       task_id: STRING_SCHEMA,
       verdict: STRING_SCHEMA,
       note: STRING_SCHEMA,
+      reason: STRING_SCHEMA,
       override_self_verdict: { type: 'boolean' },
     },
     required: ['task_id', 'verdict'],
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    const taskId = str(args.task_id)
-    if (!taskId) return fail(400, 'invalid_args', 'task_id required')
+    const taskRef = str(args.task_id)
+    if (!taskRef) return fail(400, 'invalid_args', 'task_id required')
     const verdict = args.verdict
     if (verdict !== 'approved' && verdict !== 'rejected') {
       return fail(400, 'invalid_verdict', { accepted: ['approved', 'rejected'] })
     }
 
-    const task = await loadTask(env, taskId)
-    if (!task) return fail(404, 'task_not_found')
+    const taskRes = await getTask(env, taskRef)
+    if (!taskRes.ok) return taskRes
+    const task = taskRes.task
 
     // Base guard: member+ on the task's squad (same floor as every task mutation).
     const grants = auth.capabilities ?? []
@@ -1435,7 +1473,9 @@ const toolTaskVerdict: ToolSpec = {
     // different-principal rule is waived for exactly this capability (the caller
     // still had to pass callerHoldsGateCapability above; every other gate keeps
     // the self_verdict 409). Mirrors the HTTP twin in src/tasks/index.ts.
-    let note = typeof args.note === 'string' ? args.note : null
+    let note: string | null = typeof args.note === 'string'
+      ? args.note
+      : (typeof args.reason === 'string' ? args.reason : null)
     const isSelfCompletionGate = task.gate_owner === 'gate:agent-self-completion'
     if (principal.id === task.assignee_agent_id && !isSelfCompletionGate) {
       const isOrgOwner = auth.role === 'owner'
@@ -2022,13 +2062,15 @@ const toolFlightLand: ToolSpec = {
   name: 'flight_land',
   scope: 'self (bound agent own flight)',
   min: 'member',
-  args: '{ flight_id: string, cost_micro_usd: number, score?: number }',
+  args: '{ flight_id: string, cost_micro_usd: number, score?: number, note?: string, reason?: string }',
   inputSchema: {
     type: 'object',
     properties: {
       flight_id: STRING_SCHEMA,
       cost_micro_usd: OPTIONAL_NUMBER_SCHEMA,
       score: OPTIONAL_NUMBER_SCHEMA,
+      note: STRING_SCHEMA,
+      reason: STRING_SCHEMA,
     },
     required: ['flight_id', 'cost_micro_usd'],
     additionalProperties: false,
@@ -2039,18 +2081,26 @@ const toolFlightLand: ToolSpec = {
     if (!boundAgent) return fail(409, 'agent_binding_invalid')
     if (boundAgent.status !== 'active') return fail(409, 'agent_binding_inactive')
 
-    const flightId = str(args.flight_id)
+    const flightRef = str(args.flight_id)
     const costMicroUsd = args.cost_micro_usd
     const score = args.score
-    if (!flightId || !Number.isSafeInteger(costMicroUsd) || (costMicroUsd as number) < 0) {
+    if (!flightRef || !Number.isSafeInteger(costMicroUsd) || (costMicroUsd as number) < 0) {
       return fail(400, 'invalid_args')
     }
     if (score !== undefined && (typeof score !== 'number' || !Number.isFinite(score) || score < 0 || score > 1)) {
       return fail(400, 'invalid_flight_score')
     }
 
-    const flight = await getFlight(env, flightId)
-    if (!flight || flight.agent !== auth.boundAgentId) return fail(404, 'flight_not_found')
+    const { resolveFlightEntity } = await import('../lib/entity-resolver')
+    const flightRes = await resolveFlightEntity(env, flightRef)
+    if (!flightRes.ok) {
+      if (flightRes.reason === 'ambiguous') {
+        return fail(409, 'ambiguous_flight_id', { candidates: flightRes.candidates })
+      }
+      return fail(404, 'flight_not_found')
+    }
+    const flight = flightRes.entity
+    if (flight.agent !== auth.boundAgentId) return fail(404, 'flight_not_found')
     const meta = parseFlightMetaV1(parseJsonArg(flight.meta))
     if (!meta) return fail(404, 'flight_not_found')
     const squads = await loadFlightSquads(env, meta.squad_ids)
@@ -2401,11 +2451,15 @@ const toolWakeAgent: ToolSpec = {
     const agentId = str(args.agent_id)
     if (!agentId) return fail(400, 'invalid_args', 'agent_id required')
 
-    const agent = await loadAgent(env, agentId)
-    if (!agent) return fail(404, 'agent_not_found')
+    const agentRes = await getAgent(env, agentId)
+    if (!agentRes.ok) return agentRes
+    const agent = agentRes.agent
 
     const grants = auth.capabilities ?? []
-    if (!(await memberCanOnSquad(env, grants, agent.squad_id, 'lead'))) {
+    // Workspace admin bypass matches agentsApp: an org owner/admin can wake any
+    // agent in the pot without hand-granting lead on every squad first.
+    const workspaceAdmin = hasWorkspaceAdmin(auth)
+    if (!workspaceAdmin && !(await memberCanOnSquad(env, grants, agent.squad_id, 'lead'))) {
       return fail(403, 'forbidden', { need: 'lead', scope: 'squad' })
     }
 
@@ -2464,8 +2518,9 @@ const toolSquadMessage: ToolSpec = {
     if (!squadId) return fail(400, 'invalid_args', 'squad_id required')
     if (!message) return fail(400, 'invalid_args', 'message required')
 
-    const squad = await loadSquad(env, squadId)
-    if (!squad) return fail(404, 'squad_not_found')
+    const squadRes = await getSquad(env, squadId)
+    if (!squadRes.ok) return squadRes
+    const squad = squadRes.squad
 
     const grants = auth.capabilities ?? []
     if (!(await memberCanOnSquad(env, grants, squad.id, 'member'))) {
