@@ -7235,7 +7235,7 @@ Findings (all in tests/, docs/, and one src/):
 
 The src/integrations/github-app.ts private-key finding is the one that matters — GitHub App private keys in source? Let me check whether it's a real key or a placeholder/test fixture. Also check the actual secret values (the report contains them — handle carefully, don't print raw).
 
-Let me examine the details of the findings — especially src/integrations/github-app.ts, and classify each as REAL vs fixture/placeholder. The file paths (tests/, docs superpowers) strongly suggest test fixtures. src/integrations/github-app.ts — could be a real private key that was committed (dangerous!) or a placeholder like "-----BEGIN RSA PRIVATE KEY-----\n...test...". Need to check.
+Let me examine the details of the findings — especially src/integrations/github-app.ts, and classify each as REAL vs fixture/placeholder. The file paths (tests/, docs superpowers) strongly suggest test fixtures. src/integrations/github-app.ts — could be a real private key that was committed (dangerous!) or a placeholder like "-----BEGIN RSA PRIV·KEY-----\n...test...". Need to check.
 
 Let me analyze the report with context (file content at those commits, or the match line).
 ```
