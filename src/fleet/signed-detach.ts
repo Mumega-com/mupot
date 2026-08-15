@@ -31,7 +31,7 @@ export function canonicalDetachMessage(p: {
   ].join('\n'))
 }
 
-function b64urlToBytes(s: string): Uint8Array | null {
+export function b64urlToBytes(s: string): Uint8Array | null {
   if (!/^[A-Za-z0-9_-]*$/.test(s)) return null
   const pad = s.length % 4 === 0 ? '' : '='.repeat(4 - (s.length % 4))
   const b64 = s.replace(/-/g, '+').replace(/_/g, '/') + pad
@@ -45,7 +45,7 @@ function b64urlToBytes(s: string): Uint8Array | null {
   }
 }
 
-async function importEd25519Pub(xB64url: string): Promise<CryptoKey | null> {
+export async function importEd25519Pub(xB64url: string): Promise<CryptoKey | null> {
   try {
     return await crypto.subtle.importKey(
       'jwk',

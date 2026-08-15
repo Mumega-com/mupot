@@ -4,6 +4,7 @@ export const SHARED_NONCE_WINDOWS_SEC = {
   'fleet-attach:v1': 300,
   'fleet-detach:v1': 300,
   'agent-inbox:v1': 300,
+  'runner-receipt:v1': 300,
 } as const
 
 export type SharedNonceDomain = keyof typeof SHARED_NONCE_WINDOWS_SEC

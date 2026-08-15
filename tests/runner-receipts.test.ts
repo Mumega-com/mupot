@@ -7,6 +7,8 @@ import { describe, expect, it } from 'vitest'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
 import { recordRunner, listRunners } from '../src/runners/service'
+import { canonicalRunnerReceiptMessage } from '../src/runners/signature'
+import { registerAgentPublicKey } from '../src/fleet/agent-keys'
 import { mcpApp } from '../src/mcp/index'
 import { AUTH_CONTEXT_HEADER } from '../src/mcp/auth-header'
 import type { Env, AuthContext } from '../src/types'
@@ -36,6 +38,10 @@ async function makeHarness(): Promise<SqliteD1Harness> {
       ('cap-squad-a', 'member-squad-a', 'squad', 'squad-a', 'member'),
       ('cap-squad-b', 'member-squad-b', 'squad', 'squad-b', 'member'),
       ('cap-org', 'member-org', 'org', NULL, 'admin');
+
+    INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES
+      ('mumega', 'agent-a', 'member-squad-a', datetime('now')),
+      ('mumega', 'agent-b', 'member-squad-b', datetime('now'));
   `)
 
   return harness
@@ -261,8 +267,18 @@ describe('Flight-004 Tentacles: Runner Receipts', () => {
     // Cross-seat mutation rejected
     await expect(recordRunner(env, { id: 'run-locked', seat_agent_id: 'agent-b', name: 'test', task: 'test', status: 'landed' }, 'agent-b')).rejects.toThrow('forbidden_cross_seat_mutation')
 
-    // Terminal status reversal rejected
-    await expect(recordRunner(env, { id: 'run-locked', seat_agent_id: 'agent-a', name: 'test', task: 'test', status: 'running' }, 'agent-a')).rejects.toThrow('invalid_status_transition')
+    // Terminal status reversal (re-open to running) rejected
+    await expect(recordRunner(env, { id: 'run-locked', seat_agent_id: 'agent-a', name: 'test', task: 'test', status: 'running' }, 'agent-a')).rejects.toThrow('receipt_locked')
+
+    // Terminal status flip (landed -> failed) rejected
+    await expect(recordRunner(env, { id: 'run-locked', seat_agent_id: 'agent-a', name: 'test', task: 'test', status: 'failed' }, 'agent-a')).rejects.toThrow('receipt_locked')
+
+    // Terminal evidence rewrite (landed -> landed with new evidence) rejected
+    await expect(recordRunner(env, { id: 'run-locked', seat_agent_id: 'agent-a', name: 'test', task: 'test', status: 'landed', evidence_summary: 'tampered' }, 'agent-a')).rejects.toThrow('receipt_locked')
+
+    // failed -> landed flip rejected
+    await recordRunner(env, { id: 'run-failed-lock', seat_agent_id: 'agent-a', name: 'test', task: 'test', status: 'failed' }, 'agent-a')
+    await expect(recordRunner(env, { id: 'run-failed-lock', seat_agent_id: 'agent-a', name: 'test', task: 'test', status: 'landed' }, 'agent-a')).rejects.toThrow('receipt_locked')
 
     // Unsafe log_url schemes rejected (e.g. javascript:, data:, vbscript:)
     await expect(recordRunner(env, { seat_agent_id: 'agent-a', name: 'test', task: 'test', status: 'running', log_url: 'javascript:alert(1)' })).rejects.toThrow('invalid_log_url')
@@ -301,5 +317,60 @@ describe('Flight-004 Tentacles: Runner Receipts', () => {
     )
     expect(res.status).toBe(403)
   })
-})
 
+  it('Slice 2b provenance: seat/squad are D1-derived; foreign keys + bad sigs rejected', async () => {
+    const harness = await makeHarness()
+    const env = envFor(harness)
+
+    // Recording for a non-existent seat is rejected (no fabricated foreign seat)
+    await expect(recordRunner(env, { seat_agent_id: 'ghost-seat', name: 't', task: 't', status: 'running' })).rejects.toThrow('seat_agent_not_found')
+
+    // squad_id is D1-derived: a foreign squad for agent-a is rejected
+    await expect(recordRunner(env, { seat_agent_id: 'agent-a', squad_id: 'squad-b', name: 't', task: 't', status: 'running' })).rejects.toThrow('forbidden_cross_squad_mutation')
+
+    // squad_id: null means "derive it" — the stored squad is the seat's authoritative squad
+    const derived = await recordRunner(env, { seat_agent_id: 'agent-a', squad_id: null, name: 't', task: 't', status: 'running' })
+    expect(derived.squad_id).toBe('squad-a')
+
+    // signature fields are all-or-nothing
+    await expect(recordRunner(env, { seat_agent_id: 'agent-a', name: 't', task: 't', status: 'running', sig: 'bad' })).rejects.toThrow('invalid_signature')
+  })
+
+  it('Slice 2b provenance: a valid Ed25519 receipt signature is accepted', async () => {
+    const harness = await makeHarness()
+    const env = envFor(harness)
+
+    // Generate a seat keypair and register the public key for agent-a
+    const kp = (await crypto.subtle.generateKey({ name: 'Ed25519' }, true, ['sign', 'verify'])) as CryptoKeyPair
+    const pubRaw = new Uint8Array(await crypto.subtle.exportKey('raw', kp.publicKey))
+    const pubB64url = Buffer.from(pubRaw).toString('base64url')
+
+    await registerAgentPublicKey(env, 'agent-a', 'agent-a', pubB64url)
+
+    const nowSec = Math.floor(Date.now() / 1000)
+    const nonce = 'nonce_' + 'A'.repeat(20)
+    const msg = canonicalRunnerReceiptMessage({
+      tenant: 'mumega',
+      seat_agent_id: 'agent-a',
+      name: 'gated-run',
+      task: 'gate review',
+      status: 'landed',
+      ts: nowSec,
+      nonce,
+    })
+    const sigRaw = new Uint8Array(await crypto.subtle.sign({ name: 'Ed25519' }, kp.privateKey, msg))
+    const sigB64url = Buffer.from(sigRaw).toString('base64url')
+
+    const r = await recordRunner(env, {
+      seat_agent_id: 'agent-a',
+      name: 'gated-run',
+      task: 'gate review',
+      status: 'landed',
+      sig: sigB64url,
+      sig_ts: nowSec,
+      sig_nonce: nonce,
+    })
+    expect(r.status).toBe('landed')
+    expect(r.seat_agent_id).toBe('agent-a')
+  })
+})
