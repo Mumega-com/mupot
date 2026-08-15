@@ -163,12 +163,14 @@ export async function classifyDeliveryOutcome(resp: Response, sentEventId: strin
     const raw = await resp.text().catch(() => '')
     try {
       const body = JSON.parse(raw) as unknown
-      if (
-        body && typeof body === 'object' &&
-        (body as Record<string, unknown>).accepted === true &&
-        (body as Record<string, unknown>).event_id === sentEventId
-      ) {
-        return { kind: 'delivered', status }
+      if (body && typeof body === 'object') {
+        const b = body as Record<string, unknown>
+        if (
+          (b.accepted === true && b.event_id === sentEventId) ||
+          (b.status === 'accepted' && b.delivery_id === sentEventId)
+        ) {
+          return { kind: 'delivered', status }
+        }
       }
     } catch {
       // fall through — not JSON, not our contract
@@ -214,6 +216,8 @@ export async function deliverMessageCreatedEvent(
       headers: {
         'Content-Type': 'application/json',
         'X-Hub-Signature-256': `sha256=${signature}`,
+        'X-Request-ID': envelope.event_id,
+        'X-GitHub-Delivery': envelope.event_id,
       },
       body,
       signal: controller.signal,
