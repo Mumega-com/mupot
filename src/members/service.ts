@@ -369,7 +369,12 @@ export async function mintAgentBoundToken(
   label: string,
   grantCapabilityOrOpts?: AgentTokenCapability | PrepareAgentTokenMintOptions,
 ): Promise<AgentMintResult> {
-  const first = await prepareAgentBoundTokenMint(env, agent, label, grantCapabilityOrOpts)
+  const opts: PrepareAgentTokenMintOptions = typeof grantCapabilityOrOpts === 'object' && grantCapabilityOrOpts !== null
+    ? grantCapabilityOrOpts
+    : { grantCapability: (grantCapabilityOrOpts as AgentTokenCapability) ?? 'member' }
+
+  const grantCapability = opts.grantCapability ?? 'member'
+  const first = await prepareAgentBoundTokenMint(env, agent, label, opts)
   try {
     return await commitPreparedAgentTokenMint(env, first)
   } catch (error) {
@@ -386,6 +391,8 @@ export async function mintAgentBoundToken(
       label,
       grantCapability,
       winner,
+      opts.expiresAt,
+      opts.revokePriorTokenId,
     )
     return commitPreparedAgentTokenMint(env, retry)
   }
