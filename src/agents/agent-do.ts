@@ -332,9 +332,9 @@ export class AgentDO extends DurableObject<Env> {
   }
 
   // Defensive parse — cheap models drift from the schema. Never throw on bad JSON.
-  private parseDecision(raw: string): Decision {
+  private parseDecision(raw: unknown): Decision {
     const empty: Decision = { summary: 'no-op', tasks: [] }
-    if (!raw) return empty
+    if (typeof raw !== 'string' || !raw) return empty
     const start = raw.indexOf('{')
     const end = raw.lastIndexOf('}')
     if (start === -1 || end === -1 || end <= start) return { summary: raw.slice(0, 200), tasks: [] }

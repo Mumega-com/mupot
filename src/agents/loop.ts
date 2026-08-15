@@ -599,9 +599,9 @@ interface Proposal {
 }
 
 /** Parse model output defensively — never throw. */
-function parseProposals(raw: string, limit: number): Proposal[] {
+function parseProposals(raw: unknown, limit: number): Proposal[] {
   const empty: Proposal[] = []
-  if (!raw) return empty
+  if (typeof raw !== 'string' || !raw) return empty
   const start = raw.indexOf('{')
   const end = raw.lastIndexOf('}')
   if (start === -1 || end === -1 || end <= start) return empty
