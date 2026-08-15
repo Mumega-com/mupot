@@ -286,7 +286,7 @@ describe('Flight-004 Tentacles: Runner Receipts', () => {
       channel: 'workspace',
       memberId: 'member-a',
       role: 'member',
-      capabilities: [{ type: 'squad', id: 'squad-a', capability: 'member' }],
+      capabilities: [{ member_id: 'member-a', scope_type: 'squad', scope_id: 'squad-a', capability: 'member' }],
     }
 
     // Unbound member on squad-a tries to record for agent-b (squad-b) -> 403
