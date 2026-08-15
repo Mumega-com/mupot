@@ -485,6 +485,7 @@ interface CreateTaskBody {
   status?: unknown
   assignee_agent_id?: unknown
   gate_owner?: unknown
+  priority?: unknown
   // when dispatch === true AND an assignee resolves, wake that agent in execute
   // mode (agent.wake carrying payload.task_id) right after the task persists.
   dispatch?: unknown
@@ -558,6 +559,16 @@ tasksApp.post('/', async (c) => {
     )
   }
 
+  // priority: optional rank. Omitted/null = untriaged (a real state, not a default).
+  // Mirrors the PATCH route's null-vs-valid semantics.
+  let priority: import('../types').TaskPriority | null = null
+  if (body.priority !== undefined && body.priority !== null) {
+    if (!isTaskPriority(body.priority)) {
+      return c.json({ error: 'invalid_priority', accepted: TASK_PRIORITIES }, 400)
+    }
+    priority = body.priority
+  }
+
   const auth = c.get('auth')
   const projectId = body.project_id === undefined || body.project_id === null
     ? null
@@ -576,8 +587,14 @@ tasksApp.post('/', async (c) => {
       status,
       assignee_agent_id: assigneeAgentId,
       gate_owner: gateOwner,
+      priority,
     }, {
       actor: auth.memberId ? { kind: 'member', id: auth.memberId } : undefined,
+      // HARD-EXCLUSION (Flight-006 Slice 1): a backlog-only create (dispatch:false)
+      // must NOT emit task.created, so the task.created → dispatchSquad →
+      // SquadCoordinatorDO /dispatch → wake-all-agents loop never fires for
+      // planning work. dispatch:true keeps the event + the direct agent.wake.
+      skipEvent: body.dispatch === false,
     })
   } catch (error) {
     if (error instanceof TaskIntakeContractError) {
