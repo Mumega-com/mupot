@@ -251,6 +251,18 @@ describe('Flight-004 Tentacles: Runner Receipts', () => {
 
     // Missing task -> error
     await expect(recordRunner(env, { seat_agent_id: 'agent-a', name: 'test', task: '', status: 'running' })).rejects.toThrow('task_required')
+
+    // Seat spoofing rejected
+    await expect(recordRunner(env, { seat_agent_id: 'agent-b', name: 'test', task: 'test', status: 'running' }, 'agent-a')).rejects.toThrow('forbidden_seat_spoofing')
+
+    // Record a landed runner
+    await recordRunner(env, { id: 'run-locked', seat_agent_id: 'agent-a', name: 'test', task: 'test', status: 'landed' }, 'agent-a')
+
+    // Cross-seat mutation rejected
+    await expect(recordRunner(env, { id: 'run-locked', seat_agent_id: 'agent-b', name: 'test', task: 'test', status: 'landed' }, 'agent-b')).rejects.toThrow('forbidden_cross_seat_mutation')
+
+    // Terminal status reversal rejected
+    await expect(recordRunner(env, { id: 'run-locked', seat_agent_id: 'agent-a', name: 'test', task: 'test', status: 'running' }, 'agent-a')).rejects.toThrow('invalid_status_transition')
   })
 })
 

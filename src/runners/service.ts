@@ -10,7 +10,11 @@ export async function recordRunner(
   input: RecordRunnerInput,
   callerAgentId?: string,
 ): Promise<RunnerReceipt> {
-  const seatAgentId = input.seat_agent_id || callerAgentId
+  if (callerAgentId && input.seat_agent_id && input.seat_agent_id !== callerAgentId) {
+    throw new Error('forbidden_seat_spoofing: seat_agent_id must match authenticated bound agent')
+  }
+
+  const seatAgentId = callerAgentId || input.seat_agent_id
   if (!seatAgentId) {
     throw new Error('seat_agent_id_required: must provide seat_agent_id or have caller identity')
   }
@@ -30,10 +34,22 @@ export async function recordRunner(
   const id = input.id || crypto.randomUUID()
   const tenant = env.TENANT_SLUG || 'mumega'
   const now = Date.now()
-  const startedAt = input.started_at ?? now
-  const endedAt = input.ended_at ?? (input.status === 'landed' || input.status === 'failed' ? now : null)
 
-  let squadId = input.squad_id
+  // Check existing row if updating by ID
+  const existing = await env.DB.prepare('SELECT * FROM runner_receipts WHERE id = ?1').bind(id).first<RunnerReceipt>()
+  if (existing) {
+    if (existing.seat_agent_id !== seatAgentId) {
+      throw new Error('forbidden_cross_seat_mutation: cannot modify runner receipt owned by another seat')
+    }
+    if ((existing.status === 'landed' || existing.status === 'failed') && input.status === 'running') {
+      throw new Error('invalid_status_transition: terminal runner receipts (landed/failed) cannot revert to running')
+    }
+  }
+
+  const startedAt = input.started_at ?? (existing ? existing.started_at : now)
+  const endedAt = input.ended_at !== undefined ? input.ended_at : (input.status === 'landed' || input.status === 'failed' ? (existing?.ended_at ?? now) : null)
+
+  let squadId = input.squad_id ?? (existing ? existing.squad_id : undefined)
   if (squadId === undefined) {
     const agentRow = await env.DB.prepare('SELECT squad_id FROM agents WHERE id = ?1 OR slug = ?1 LIMIT 1')
       .bind(seatAgentId)
