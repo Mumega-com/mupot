@@ -117,6 +117,9 @@ describe('deliverMessageCreatedEvent — signature construction', () => {
     const expected = await hmacSign('super-secret-hex', capturedBody)
     expect(provided).toBe(expected)
 
+    expect(capturedHeaders['X-Request-ID']).toBe('msg-123')
+    expect(capturedHeaders['X-GitHub-Delivery']).toBe('msg-123')
+
     // And the signed material is genuinely what was sent — parses back to the envelope.
     const parsedBody = JSON.parse(capturedBody) as HermesEventEnvelope
     expect(parsedBody.event_id).toBe('msg-123')
@@ -173,10 +176,16 @@ describe('classifyDeliveryOutcome', () => {
     expect(outcome.kind).toBe('delivered')
   })
 
-  it('a 202 with Hermes standard webhook format { status: "accepted", delivery_id: ... } -> delivered', async () => {
-    const resp = new Response(JSON.stringify({ status: 'accepted', route: 'mubot-inbox', delivery_id: '1786757015484' }), { status: 202 })
+  it('a 202 with Hermes standard webhook format { status: "accepted", delivery_id: sentEventId } -> delivered', async () => {
+    const resp = new Response(JSON.stringify({ status: 'accepted', route: 'mubot-inbox', delivery_id: 'msg-123' }), { status: 202 })
     const outcome = await classifyDeliveryOutcome(resp, 'msg-123')
     expect(outcome.kind).toBe('delivered')
+  })
+
+  it('a 202 with Hermes format but mismatched delivery_id -> unexpected_response', async () => {
+    const resp = new Response(JSON.stringify({ status: 'accepted', route: 'mubot-inbox', delivery_id: 'other-id' }), { status: 202 })
+    const outcome = await classifyDeliveryOutcome(resp, 'msg-123')
+    expect(outcome.kind).toBe('unexpected_response')
   })
 
   it('a 2xx from something that is NOT our endpoint (wrong/absent body) -> unexpected_response, NOT delivered', async () => {

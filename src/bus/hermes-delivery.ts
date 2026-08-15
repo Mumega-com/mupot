@@ -167,7 +167,7 @@ export async function classifyDeliveryOutcome(resp: Response, sentEventId: strin
         const b = body as Record<string, unknown>
         if (
           (b.accepted === true && b.event_id === sentEventId) ||
-          (b.status === 'accepted' && typeof b.delivery_id === 'string')
+          (b.status === 'accepted' && b.delivery_id === sentEventId)
         ) {
           return { kind: 'delivered', status }
         }
@@ -216,6 +216,8 @@ export async function deliverMessageCreatedEvent(
       headers: {
         'Content-Type': 'application/json',
         'X-Hub-Signature-256': `sha256=${signature}`,
+        'X-Request-ID': envelope.event_id,
+        'X-GitHub-Delivery': envelope.event_id,
       },
       body,
       signal: controller.signal,
