@@ -185,24 +185,11 @@ import { loadAgentConnectionStatus } from '../members/agent-connection-status'
 
 // First-run setup wizard (the easy-onboard centerpiece). Mounted under '/setup'
 // on this same dashboard app, so it inherits the auth + tenant guard below.
-import { wakeFleetAgent, requestFleetControl, fleetScoped } from './fleet'
-import { listFleetAgentRuntimeView } from '../fleet/registry'
-import { emitControlRequest, emitSquadControlRequest } from '../fleet/control'
-import { hostAgentsPanel, squadControlPanel } from './fleet-host'
-import { listPresence } from '../fleet/presence'
-import type { PresenceView } from '../fleet/presence'
-import { listJourneys, buildDepartureBoard } from '../coordination/journeys'
-import type { DepartureCard } from '../coordination/journeys'
-import { listFlights } from '../flight/service'
-import { buildBoard } from '../flight/board'
-import type { FlightCard } from '../flight/board'
 import { wizardApp } from './wizard'
 import { isOnboardingComplete } from './settings'
 import { loadBrainView, brainBody, regimeBadgeClass, loadBrainPhysics } from './brain'
 import type { PhysicsSnapshot } from './brain'
 import { loadGrowthView, growthBody } from './growth'
-import { loadFleetRadar } from './radar'
-import { loadMotherboardData } from './motherboard'
 import { setLoopControl, isLoopControlAction } from '../loops/decisions'
 import { getLoop } from '../loops/service'
 import {
@@ -210,8 +197,12 @@ import {
   rotateConnector,
   revokeConnector,
   listConnectors,
+  resolveConnector,
+  resolveConnectorWithMeta,
 } from '../connectors/service'
 import { isConnectorType, isConnectorScopeType } from '../connectors/crypto'
+import { parseWpConnectorConfig } from '../departments/executors/mcpwp'
+import { kernelMintCtx, getRegistered } from '../departments/registry'
 import { githubCapabilitySnapshot } from '../integrations/github-capabilities'
 import { writeAgentDef, assignIssueToCopilot } from '../integrations/github-repo-write'
 import { installUrl, parseInstallCallback, storeInstallation, getInstallationId } from '../integrations/github-install'
@@ -220,13 +211,11 @@ import { executeTaskAsPR } from '../integrations/github-execute'
 import { importProjectItems } from '../integrations/github-projects'
 import { githubStatusBody } from '../integrations/github-dashboard'
 import { connectorsPageBody, connectorAddedBody, connectorRotatedBody } from '../connectors/dashboard'
-import { resolveConnector, resolveConnectorWithMeta } from '../connectors/service'
-import { parseWpConnectorConfig } from '../departments/executors/mcpwp'
-import { kernelMintCtx, getRegistered } from '../departments/registry'
 import type { KernelHandle } from '../departments/ctx'
 import '../departments/modules/growth' // side-effect: register GrowthModule so getRegistered('growth') resolves
 import '../departments/modules/agency' // side-effect: register AgencyModule (reusable agency/AEO template)
 import '../departments/modules/web-ops' // side-effect: register WebOpsModule (AI website-operations team — the wedge)
+import { missionControlApp } from './mission-control-routes'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
@@ -1246,72 +1235,8 @@ dashboardApp.get('/flights', async (c) => {
 // dashboard already uses everywhere else. GET /api/radar's own bearer check
 // (src/auth/member-bearer.ts resolveOrgAdmin) is NOT touched by this route —
 // it stays the canonical JSON surface for the brain / programmatic callers.
-// ── mission-control (unified /radar, /fleet, /motherboard, /coordination surface — Flight-003B) ──
-dashboardApp.get('/radar', async (c) => {
-  const auth = c.get('auth')
-  if (!isOrgAdmin(auth)) {
-    return c.html(shell(c.env, 'Mission Control', errorBody('Mission Control requires owner or admin.')), 403)
-  }
-
-  const tabParam = c.req.query('tab')
-  const activeTab: 'radar' | 'fleet' | 'motherboard' | 'departures' =
-    tabParam === 'fleet' || tabParam === 'motherboard' || tabParam === 'departures'
-      ? tabParam
-      : 'radar'
-
-  const squadIds = await resolveAccessibleSquadIds(c.env, auth)
-  const tenant = c.req.query('tenant') ?? 'mumega.com'
-
-  const [radar, hostAgents, presence, motherboard, journeys, physics, spend] = await Promise.all([
-    loadFleetRadar(c.env),
-    listFleetAgentRuntimeView(c.env, Date.now(), squadIds),
-    listPresence(c.env, Date.now(), squadIds),
-    loadMotherboardData(c.env, tenant, auth),
-    listJourneys(c.env, { scope: 'live' }).catch(() => []),
-    loadBrainPhysics(c.env),
-    loadTodaySpendScalar(c.env),
-  ])
-
-  const accept = c.req.header('accept') ?? ''
-  const wantsJson = c.req.query('format') === 'json' || (accept.includes('application/json') && !accept.includes('text/html'))
-  if (wantsJson) {
-    if (activeTab === 'motherboard') return c.json(motherboard)
-    return c.json(radar)
-  }
-
-  const hostPanelOpts = {
-    configured: !!c.env.FLEET_PANEL_SK && !!c.env.FLEET_CONSUMER_AGENT,
-    canControl: auth.role === 'owner',
-    flash: c.req.query('hc') ?? null,
-  }
-  const hostPanelHtml = hostAgentsPanel(hostAgents, hostPanelOpts)
-  const squadPanelHtml = squadControlPanel(hostAgents, hostPanelOpts)
-  const departures = buildDepartureBoard(journeys, Date.now())
-
-  const { missionControlBody } = await import('./mission-control')
-  const body = missionControlBody({
-    radar,
-    presence,
-    hostPanelHtml,
-    squadPanelHtml,
-    motherboard,
-    departures,
-    activeTab,
-  })
-
-  return c.html(
-    shell(c.env, 'Mission Control', body, {
-      physics,
-      costToday: { configured: spend.configured, todayUsdMicro: spend.today_usd_micro },
-    }),
-  )
-})
-
-// 301 / 302 backward-compatible redirects from legacy fleet views to consolidated Mission Control
-dashboardApp.get('/fleet', (c) => c.redirect('/radar?tab=fleet', 301))
-dashboardApp.get('/motherboard', (c) => c.redirect('/radar?tab=motherboard', 301))
-dashboardApp.get('/dashboard/motherboard', (c) => c.redirect('/radar?tab=motherboard', 301))
-dashboardApp.get('/coordination', (c) => c.redirect('/radar?tab=departures', 301))
+// Mount Mission Control Sub-app (unified /radar + 301 redirects)
+dashboardApp.route('/', missionControlApp)
 
 // Mount Kanban Sub-app
 dashboardApp.route('/', kanbanApp)
@@ -2856,7 +2781,7 @@ export function resolveSwitchPotUrl(env: Env): string {
  * Fonts: Instrument Serif (headings/metrics) · Hanken Grotesk (body) · JetBrains Mono (IDs/badges).
  * Sidebar: Stripe-style with collapsible sections that remember open/closed state.
  */
-function shell(
+export function shell(
   env: Env,
   title: string,
   body: HtmlEscapedString | Promise<HtmlEscapedString>,
@@ -4034,7 +3959,7 @@ function shell(
 </html>`
 }
 
-function errorBody(message: string) {
+export function errorBody(message: string) {
   return html`<h1>Hmm.</h1><p class="empty">${message}</p><p><a href="/">← Back to overview</a></p>`
 }
 
