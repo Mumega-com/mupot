@@ -1249,9 +1249,6 @@ dashboardApp.get('/flights', async (c) => {
 // ── mission-control (unified /radar, /fleet, /motherboard, /coordination surface — Flight-003B) ──
 dashboardApp.get('/radar', async (c) => {
   const auth = c.get('auth')
-  if (!isOrgAdmin(auth)) {
-    return c.html(shell(c.env, 'Mission Control', errorBody('Mission Control requires owner or admin.')), 403)
-  }
 
   const tabParam = c.req.query('tab')
   const activeTab: 'radar' | 'fleet' | 'motherboard' | 'departures' =
