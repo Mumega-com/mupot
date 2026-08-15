@@ -46,6 +46,10 @@ export interface FlightRow {
   started_at: number | null
   ended_at: number | null
   meta: string
+  // Server-joined canonical names (Flight-006 Slice 2). Absent on hand-built
+  // rows / when the agent has since been deleted; callers fall back to `agent`.
+  agent_name?: string | null
+  squad_name?: string | null
 }
 
 export interface NewFlight {
@@ -636,10 +640,20 @@ export async function getFlight(env: Env, id: string): Promise<FlightRow | null>
 export async function listFlights(env: Env, limit = 100, projectId?: string): Promise<FlightRow[]> {
   const boundedLimit = Math.min(Math.max(limit, 1), 500)
   const statement = projectId === undefined
-    ? env.DB.prepare(`SELECT * FROM flights WHERE tenant=?1 ORDER BY created_at DESC LIMIT ?2`)
-      .bind(env.TENANT_SLUG, boundedLimit)
-    : env.DB.prepare(`SELECT * FROM flights WHERE tenant=?1 AND project_id=?2 ORDER BY created_at DESC LIMIT ?3`)
-      .bind(env.TENANT_SLUG, projectId, boundedLimit)
+    ? env.DB.prepare(
+        `SELECT f.*, a.name AS agent_name, s.name AS squad_name
+           FROM flights f
+           LEFT JOIN agents a ON a.id = f.agent
+           LEFT JOIN squads s ON s.id = a.squad_id
+          WHERE f.tenant=?1 ORDER BY f.created_at DESC LIMIT ?2`,
+      ).bind(env.TENANT_SLUG, boundedLimit)
+    : env.DB.prepare(
+        `SELECT f.*, a.name AS agent_name, s.name AS squad_name
+           FROM flights f
+           LEFT JOIN agents a ON a.id = f.agent
+           LEFT JOIN squads s ON s.id = a.squad_id
+          WHERE f.tenant=?1 AND f.project_id=?2 ORDER BY f.created_at DESC LIMIT ?3`,
+      ).bind(env.TENANT_SLUG, projectId, boundedLimit)
   const res = await statement
     .all<FlightRow>()
   return res.results ?? []
@@ -657,7 +671,10 @@ export async function listFlightsForSquad(
   const beforeId = before?.id ?? '\uffff'
   const statement = projectId === undefined
     ? env.DB.prepare(
-      `SELECT f.* FROM flights f
+      `SELECT f.*, a.name AS agent_name, s.name AS squad_name
+        FROM flights f
+        LEFT JOIN agents a ON a.id = f.agent
+        LEFT JOIN squads s ON s.id = a.squad_id
       WHERE f.tenant = ?1
         AND EXISTS (
           SELECT 1
@@ -669,7 +686,10 @@ export async function listFlightsForSquad(
       LIMIT ?6`,
     ).bind(env.TENANT_SLUG, squadId, beforeCreatedAt, beforeCreatedAt, beforeId, boundedLimit)
     : env.DB.prepare(
-      `SELECT f.* FROM flights f
+      `SELECT f.*, a.name AS agent_name, s.name AS squad_name
+        FROM flights f
+        LEFT JOIN agents a ON a.id = f.agent
+        LEFT JOIN squads s ON s.id = a.squad_id
       WHERE f.tenant = ?1
         AND f.project_id = ?2
         AND EXISTS (

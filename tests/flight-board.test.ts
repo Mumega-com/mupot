@@ -22,6 +22,8 @@ function row(p: Partial<FlightRow> & { agent: string; status: FlightStatus }): F
     started_at: null,
     ended_at: null,
     meta: '{}',
+    agent_name: p.agent_name ?? null,
+    squad_name: p.squad_name ?? null,
   }
 }
 
@@ -151,5 +153,41 @@ describe('buildBoard — score trend per agent', () => {
     const [c] = buildBoard([row({ agent: 'a', status: 'preflight', score: null })], NOW)
     expect(c.trend).toBeNull()
     expect(c.score_pct).toBeNull()
+  })
+})
+
+describe('Flight-006 Slice 2 — phase metric separation + canonical names', () => {
+  it('failed/held/flying never render a success-looking percentage', () => {
+    const cards = buildBoard([
+      row({ agent: 'a', status: 'failed', score: 1 }),
+      row({ agent: 'b', status: 'held', score: 1 }),
+      row({ agent: 'c', status: 'running', score: 1 }),
+    ], NOW)
+    for (const c of cards) {
+      expect(c.score_pct).toBeNull()
+      expect(c.metric_label).toBeNull()
+    }
+  })
+
+  it('preflight = readiness, landed = coherence', () => {
+    const cards = buildBoard([
+      row({ agent: 'a', status: 'preflight', score: 0.8 }),
+      row({ agent: 'b', status: 'landed', score: 0.9 }),
+    ], NOW)
+    expect(cards[0].metric_label).toBe('readiness')
+    expect(cards[0].score_pct).toBe('80%')
+    expect(cards[1].metric_label).toBe('coherence')
+    expect(cards[1].score_pct).toBe('90%')
+  })
+
+  it('resolves server-joined canonical names, falling back to the raw id', () => {
+    const cards = buildBoard([
+      row({ agent: 'uuid-1', status: 'landed', agent_name: 'Scout', squad_name: 'Fleet' }),
+      row({ agent: 'uuid-2', status: 'landed' }),
+    ], NOW)
+    expect(cards[0].agent_name).toBe('Scout')
+    expect(cards[0].squad_name).toBe('Fleet')
+    expect(cards[1].agent_name).toBe('uuid-2')
+    expect(cards[1].squad_name).toBeNull()
   })
 })

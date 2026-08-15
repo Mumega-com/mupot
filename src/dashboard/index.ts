@@ -3708,7 +3708,7 @@ export function shell(
             <div class="nav-children" id="children-work">
               <a class="nav-child" href="/dashboard/kanban">Kanban board</a>
               <a class="nav-child" href="/send">Tasks</a>
-              <a class="nav-child" href="/flights">Pull requests</a>
+              <a class="nav-child" href="/flights">Flights</a>
               <a class="nav-child" href="/verifications">Verifications</a>
             </div>
           </div>
@@ -5129,10 +5129,10 @@ function flightsBody(cards: FlightCard[], project?: Project, scanLimited = false
   const arrowColor = (t: string | null) => (t === 'up' ? 'var(--ok)' : t === 'down' ? '#e5534b' : 'var(--dim)')
   const tr = (c: FlightCard) => `
     <tr class="fl-row ${c.live ? '' : 'fl-dim'}">
-      <td><span class="fl-dot" style="background:${phaseColor(c.phase)}"></span>${escHtml(c.agent)}</td>
+      <td><span class="fl-dot" style="background:${phaseColor(c.phase)}"></span>${escHtml(c.agent_name)}${c.squad_name ? ` <span style="color:var(--dim);font-size:11px">· ${escHtml(c.squad_name)}</span>` : ''}</td>
       <td class="fl-label">${escHtml(c.goal)}</td>
       <td><span class="fl-badge" style="color:${phaseColor(c.phase)}">${escHtml(c.phase)}</span></td>
-      <td class="fl-num">${c.score_pct ? `${escHtml(c.score_pct)} <span style="color:${arrowColor(c.trend)}">${arrow(c.trend)}</span>` : '<span style="color:var(--dim)">—</span>'}</td>
+      <td class="fl-num">${c.metric_label && c.score_pct ? `${escHtml(c.metric_label)} ${escHtml(c.score_pct)} <span style="color:${arrowColor(c.trend)}">${arrow(c.trend)}</span>` : '<span style="color:var(--dim)">—</span>'}</td>
       <td class="fl-num ${c.over_budget ? 'fl-over' : ''}">${escHtml(c.cost_usd)}${c.budget_usd ? `<span style="color:var(--dim)"> / ${escHtml(c.budget_usd)}</span>` : ''}</td>
       <td>${c.next_departure ? escHtml(c.next_departure) : escHtml(c.age)}</td>
     </tr>`
@@ -5140,7 +5140,7 @@ function flightsBody(cards: FlightCard[], project?: Project, scanLimited = false
   const sleeping = cards.filter((c) => c.phase === 'sleeping').length
   const table = cards.length
     ? `<table class="fl-table">
-        <thead><tr><th>Agent</th><th>Goal</th><th>Phase</th><th>Score</th><th>Cost / budget</th><th>Departure / age</th></tr></thead>
+        <thead><tr><th>Agent</th><th>Goal</th><th>Phase</th><th>Metric</th><th>Cost / budget</th><th>Departure / age</th></tr></thead>
         <tbody>${cards.map(tr).join('')}</tbody>
       </table>`
     : `<p class="empty">No flights yet. A flight = one bounded run of an agent toward a goal —

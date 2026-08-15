@@ -317,7 +317,7 @@ describe('flight project attribution', () => {
     const legacyQueries: string[] = []
     const legacy = await list(harness, '', legacyQueries)
     expect((await legacy.json() as { flights: FlightRow[] }).flights.map((flight) => flight.id)).toEqual(['flight-a', 'flight-b', 'flight-null'])
-    expect(legacyQueries.some((sql) => sql.includes('FROM flights WHERE tenant=?1 ORDER BY created_at DESC LIMIT ?2'))).toBe(true)
+    expect(legacyQueries.some((sql) => sql.includes('FROM flights f') && sql.includes('LEFT JOIN agents') && sql.includes('LEFT JOIN squads') && sql.includes('WHERE f.tenant=?1'))).toBe(true)
   })
 
   it('maps final project trigger failures to stable service errors', async () => {
