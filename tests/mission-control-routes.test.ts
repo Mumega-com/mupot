@@ -111,4 +111,34 @@ describe('Mission Control & Fleet Consolidation (Flight-003B)', () => {
     expect(res.status).toBe(301)
     expect(res.headers.get('Location')).toBe('/radar?tab=departures')
   })
+
+  it('GET /radar is accessible to regular members (non-admin capability floor)', async () => {
+    const { harness, env, sessionStore } = makeEnv()
+    const memberId = 'member-regular'
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status, tenant) VALUES ('${memberId}', 'regular@example.com', 'Regular Member', 'active', 'mumega');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-reg', '${memberId}', 'squad', 'squad-1', 'member');
+    `)
+
+    sessionStore.set('sess:tok-reg', JSON.stringify({
+      userId: memberId,
+      email: 'regular@example.com',
+      role: 'member',
+      createdAt: new Date().toISOString(),
+    }))
+
+    const req = new Request('http://localhost/radar', {
+      headers: {
+        cookie: 'mupot_session=tok-reg',
+      },
+    })
+    const res = await dashboardApp.fetch(req, env, {
+      waitUntil: () => {},
+      passThroughOnException: () => {},
+    } as unknown as ExecutionContext)
+
+    expect(res.status).toBe(200)
+    const text = await res.text()
+    expect(text).toContain('Mission Control')
+  })
 })

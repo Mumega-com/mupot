@@ -1238,8 +1238,6 @@ dashboardApp.get('/flights', async (c) => {
 // the org-admin authorization LEVEL that GET /api/radar's bearer-token
 // resolveOrgAdmin check requires, via the mechanism this cookie-authed
 // dashboard already uses everywhere else. GET /api/radar's own bearer check
-// (src/auth/member-bearer.ts resolveOrgAdmin) is NOT touched by this route —
-// it stays the canonical JSON surface for the brain / programmatic callers.
 // Mount Mission Control Sub-app (unified /radar + 301 redirects)
 dashboardApp.route('/', missionControlApp)
 

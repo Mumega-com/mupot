@@ -24,9 +24,6 @@ export const missionControlApp = new Hono<{ Bindings: Env; Variables: { auth: Au
 // ── GET /radar — Unified Mission Control surface ─────────────────────────────
 missionControlApp.get('/radar', async (c) => {
   const auth = c.get('auth')
-  if (!isOrgAdmin(auth)) {
-    return c.html(shell(c.env, 'Mission Control', errorBody('Mission Control requires owner or admin.')), 403)
-  }
 
   const tabParam = c.req.query('tab')
   const activeTab: 'radar' | 'fleet' | 'motherboard' | 'departures' =
