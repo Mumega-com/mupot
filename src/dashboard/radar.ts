@@ -365,7 +365,7 @@ function flightSquadIds(row: FlightRow | undefined): string[] | null {
 export async function loadFleetRadar(
   env: Env,
   nowMs = Date.now(),
-  squadIds?: readonly string[] | null,
+  squadIds?: string[] | null,
 ): Promise<FleetRadar> {
   const isFiltered = squadIds !== undefined && squadIds !== null
   const accessibleSet = isFiltered ? new Set(squadIds) : null
