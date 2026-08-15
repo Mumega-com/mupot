@@ -147,7 +147,7 @@ describe('Flight-004 Tentacles: Runner Receipts', () => {
       channel: 'workspace',
       memberId: 'member-squad-a',
       role: 'member',
-      agentId: 'agent-a',
+      boundAgentId: 'agent-a',
       capabilities: [{ scope_type: 'squad', scope_id: 'squad-a', capability: 'member' }],
     }
 
@@ -157,7 +157,7 @@ describe('Flight-004 Tentacles: Runner Receipts', () => {
       channel: 'workspace',
       memberId: 'member-squad-b',
       role: 'member',
-      agentId: 'agent-b',
+      boundAgentId: 'agent-b',
       capabilities: [{ scope_type: 'squad', scope_id: 'squad-b', capability: 'member' }],
     }
 

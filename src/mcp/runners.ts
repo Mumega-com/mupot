@@ -33,7 +33,7 @@ export const toolRunnerRecord: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    const callerAgentId = auth.agentId ?? undefined
+    const callerAgentId = auth.boundAgentId ?? undefined
     const name = str(args.name)
     const task = str(args.task)
     const status = str(args.status) as RunnerStatus
