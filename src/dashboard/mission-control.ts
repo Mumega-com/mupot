@@ -12,9 +12,11 @@ import type { FleetRadar } from './radar'
 import type { PresenceView } from '../fleet/presence'
 import type { MotherboardViewData } from './motherboard'
 import type { DepartureCard } from '../coordination/journeys'
+import type { RunnerReceipt } from '../runners/types'
 import { renderBrainImage, renderAgentCard } from './radar-view'
 import { motherboardPageBody } from './motherboard'
 import { potFleetBody, controlTowerBody } from './mission-control-views'
+import { renderTentaclesPanel } from './tentacles-view'
 
 export interface MissionControlData {
   radar: FleetRadar
@@ -23,11 +25,12 @@ export interface MissionControlData {
   squadPanelHtml: Html
   motherboard: MotherboardViewData
   departures: DepartureCard[]
-  activeTab: 'radar' | 'fleet' | 'motherboard' | 'departures'
+  runners?: RunnerReceipt[]
+  activeTab: 'radar' | 'fleet' | 'motherboard' | 'departures' | 'tentacles'
 }
 
 export function missionControlBody(data: MissionControlData): Html {
-  const { radar, presence, hostPanelHtml, squadPanelHtml, motherboard, departures, activeTab } = data
+  const { radar, presence, hostPanelHtml, squadPanelHtml, motherboard, departures, runners = [], activeTab } = data
 
   const squadNameByAgent = new Map<string, string>()
   for (const s of radar.squads) {
@@ -102,6 +105,9 @@ export function missionControlBody(data: MissionControlData): Html {
       <a class="mc-tab ${activeTab === 'departures' ? 'active' : ''}" href="/radar?tab=departures">
         Departures <span class="mc-badge">${departures.length}</span>
       </a>
+      <a class="mc-tab ${activeTab === 'tentacles' ? 'active' : ''}" href="/radar?tab=tentacles">
+        Tentacles <span class="mc-badge">${runners.length}</span>
+      </a>
     </div>
 
     ${
@@ -124,9 +130,11 @@ export function missionControlBody(data: MissionControlData): Html {
           `
         : activeTab === 'motherboard'
         ? motherboardPageBody(motherboard)
-        : html`
+        : activeTab === 'departures'
+        ? html`
             ${controlTowerBody(departures)}
           `
+        : renderTentaclesPanel({ runners, nowMs })
     }
   `
 }

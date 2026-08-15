@@ -107,6 +107,7 @@ import { SECRET_ENV_TOOLS } from './secret-env'
 import { PRESENCE_TOOLS } from './presence'
 import { WORKFLOW_CIRCUIT_TOOLS } from './workflow-circuits'
 import { ROUTINE_TOOLS } from './routines'
+import { RUNNER_TOOLS } from './runners'
 import { dispatchFlight } from '../flight/dispatch'
 import {
   deliverFlightLandedEvent,
@@ -3615,6 +3616,7 @@ export const TOOLS: ToolSpec[] = [
   ...PRESENCE_TOOLS,
   ...WORKFLOW_CIRCUIT_TOOLS,
   ...ROUTINE_TOOLS,
+  ...RUNNER_TOOLS,
 ]
 
 const TOOL_BY_NAME = new Map<string, ToolSpec>(TOOLS.map((t) => [t.name, t]))

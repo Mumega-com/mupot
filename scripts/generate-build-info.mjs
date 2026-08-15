@@ -5,7 +5,7 @@
 // even when runtime RELEASE_SHA env vars are not set.
 
 import { execSync } from 'node:child_process'
-import { writeFileSync } from 'node:fs'
+import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 export function generateBuildInfo() {
@@ -30,6 +30,34 @@ export function generateBuildInfo() {
     clean = false
   }
 
+  const targetFile = join(process.cwd(), 'src', 'build-info.ts')
+  let existing = null
+  try {
+    existing = readFileSync(targetFile, 'utf8')
+  } catch {
+    existing = null
+  }
+
+  if (existing) {
+    const objectMatch = existing.match(/export const BUILD_INFO:\s*BuildInfo\s*=\s*\{([^}]+)\}/)
+    if (objectMatch) {
+      const block = objectMatch[1]
+      const commitMatch = block.match(/commit:\s*("[^"]+"|\S+),/)
+      const cleanMatch = block.match(/clean:\s*(true|false),/)
+      const refMatch = block.match(/ref:\s*("[^"]+"|\S+),/)
+      const builtAtMatch = block.match(/builtAt:\s*("[^"]+"|\S+),/)
+
+      const existingCommit = commitMatch ? (commitMatch[1] === 'null' ? null : JSON.parse(commitMatch[1])) : undefined
+      const existingClean = cleanMatch ? cleanMatch[1] === 'true' : undefined
+      const existingRef = refMatch ? (refMatch[1] === 'null' ? null : JSON.parse(refMatch[1])) : undefined
+      const existingBuiltAt = builtAtMatch ? (builtAtMatch[1] === 'null' ? null : JSON.parse(builtAtMatch[1])) : null
+
+      if (existingCommit === commit && existingClean === clean && existingRef === ref) {
+        return { commit, clean, builtAt: existingBuiltAt, ref }
+      }
+    }
+  }
+
   const builtAt = new Date().toISOString()
 
   const content = `// Generated build information module — DO NOT EDIT DIRECTLY.
@@ -50,7 +78,6 @@ export const BUILD_INFO: BuildInfo = {
 }
 `
 
-  const targetFile = join(process.cwd(), 'src', 'build-info.ts')
   writeFileSync(targetFile, content, 'utf8')
   return { commit, clean, builtAt, ref }
 }
