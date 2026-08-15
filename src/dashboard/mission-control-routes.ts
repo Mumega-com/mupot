@@ -3,8 +3,13 @@
 // Modular sub-app mounting:
 //   - GET /radar (Unified Mission Control: ATC Radar, Fleet Presence, Topology, Departures)
 //   - 301 Redirects: /fleet, /motherboard, /dashboard/motherboard, /coordination
+//
+// NOTE: `shell` is injected by index.ts via makeMissionControlApp() to break the
+// circular import index.ts → mission-control-routes.ts → shell → index.ts that
+// caused workerd's "Top-level await in module is unsettled" boot failure.
 
 import { Hono } from 'hono'
+import type { HtmlEscapedString } from 'hono/utils/html'
 import type { Env, AuthContext } from '../types'
 import { resolveAccessibleSquadIds } from '../projects/readable-squads'
 import { loadFleetRadar } from './radar'
@@ -13,72 +18,85 @@ import { listPresence } from '../fleet/presence'
 import { loadMotherboardData } from './motherboard'
 import { listJourneys, buildDepartureBoard } from '../coordination/journeys'
 import { loadBrainPhysics } from './brain'
+import type { PhysicsSnapshot } from './brain'
 import { loadTodaySpendScalar } from './economy'
 import { hostAgentsPanel, squadControlPanel } from './fleet-host'
-import { shell } from './index'
 import { missionControlBody } from './mission-control'
 
-export const missionControlApp = new Hono<{ Bindings: Env; Variables: { auth: AuthContext } }>()
+type ShellFn = (
+  env: Env,
+  title: string,
+  body: HtmlEscapedString | Promise<HtmlEscapedString>,
+  header?: { physics?: PhysicsSnapshot | null; costToday?: { configured: boolean; todayUsdMicro: number } | null },
+) => HtmlEscapedString | Promise<HtmlEscapedString>
 
-// ── GET /radar — Unified Mission Control surface ─────────────────────────────
-missionControlApp.get('/radar', async (c) => {
-  const auth = c.get('auth')
+/** Factory — call once from index.ts with the local `shell` reference to avoid
+ *  the circular import index → mission-control-routes → shell → index. */
+export function makeMissionControlApp(shell: ShellFn) {
+  const app = new Hono<{ Bindings: Env; Variables: { auth: AuthContext } }>()
 
-  const tabParam = c.req.query('tab')
-  const activeTab: 'radar' | 'fleet' | 'motherboard' | 'departures' =
-    tabParam === 'fleet' || tabParam === 'motherboard' || tabParam === 'departures'
-      ? tabParam
-      : 'radar'
+  // ── GET /radar — Unified Mission Control surface ─────────────────────────────
+  app.get('/radar', async (c) => {
+    const auth = c.get('auth')
 
-  const squadIds = await resolveAccessibleSquadIds(c.env, auth)
-  const tenant = c.req.query('tenant') ?? 'mumega.com'
+    const tabParam = c.req.query('tab')
+    const activeTab: 'radar' | 'fleet' | 'motherboard' | 'departures' =
+      tabParam === 'fleet' || tabParam === 'motherboard' || tabParam === 'departures'
+        ? tabParam
+        : 'radar'
 
-  const [radar, hostAgents, presence, motherboard, journeys, physics, spend] = await Promise.all([
-    loadFleetRadar(c.env),
-    listFleetAgentRuntimeView(c.env, Date.now(), squadIds),
-    listPresence(c.env, Date.now(), squadIds),
-    loadMotherboardData(c.env, tenant, auth),
-    listJourneys(c.env, { scope: 'live' }).catch(() => []),
-    loadBrainPhysics(c.env),
-    loadTodaySpendScalar(c.env),
-  ])
+    const squadIds = await resolveAccessibleSquadIds(c.env, auth)
+    const tenant = c.req.query('tenant') ?? 'mumega.com'
 
-  const accept = c.req.header('accept') ?? ''
-  const wantsJson = c.req.query('format') === 'json' || (accept.includes('application/json') && !accept.includes('text/html'))
-  if (wantsJson) {
-    if (activeTab === 'motherboard') return c.json(motherboard)
-    return c.json(radar)
-  }
+    const [radar, hostAgents, presence, motherboard, journeys, physics, spend] = await Promise.all([
+      loadFleetRadar(c.env),
+      listFleetAgentRuntimeView(c.env, Date.now(), squadIds),
+      listPresence(c.env, Date.now(), squadIds),
+      loadMotherboardData(c.env, tenant, auth),
+      listJourneys(c.env, { scope: 'live' }).catch(() => []),
+      loadBrainPhysics(c.env),
+      loadTodaySpendScalar(c.env),
+    ])
 
-  const hostPanelOpts = {
-    configured: !!c.env.FLEET_PANEL_SK && !!c.env.FLEET_CONSUMER_AGENT,
-    canControl: auth.role === 'owner',
-    flash: c.req.query('hc') ?? null,
-  }
-  const hostPanelHtml = hostAgentsPanel(hostAgents, hostPanelOpts)
-  const squadPanelHtml = squadControlPanel(hostAgents, hostPanelOpts)
-  const departures = buildDepartureBoard(journeys, Date.now())
+    const accept = c.req.header('accept') ?? ''
+    const wantsJson = c.req.query('format') === 'json' || (accept.includes('application/json') && !accept.includes('text/html'))
+    if (wantsJson) {
+      if (activeTab === 'motherboard') return c.json(motherboard)
+      return c.json(radar)
+    }
 
-  const body = missionControlBody({
-    radar,
-    presence,
-    hostPanelHtml,
-    squadPanelHtml,
-    motherboard,
-    departures,
-    activeTab,
+    const hostPanelOpts = {
+      configured: !!c.env.FLEET_PANEL_SK && !!c.env.FLEET_CONSUMER_AGENT,
+      canControl: auth.role === 'owner',
+      flash: c.req.query('hc') ?? null,
+    }
+    const hostPanelHtml = hostAgentsPanel(hostAgents, hostPanelOpts)
+    const squadPanelHtml = squadControlPanel(hostAgents, hostPanelOpts)
+    const departures = buildDepartureBoard(journeys, Date.now())
+
+    const body = missionControlBody({
+      radar,
+      presence,
+      hostPanelHtml,
+      squadPanelHtml,
+      motherboard,
+      departures,
+      activeTab,
+    })
+
+    return c.html(
+      shell(c.env, 'Mission Control', body, {
+        physics,
+        costToday: { configured: spend.configured, todayUsdMicro: spend.today_usd_micro },
+      }),
+    )
   })
 
-  return c.html(
-    shell(c.env, 'Mission Control', body, {
-      physics,
-      costToday: { configured: spend.configured, todayUsdMicro: spend.today_usd_micro },
-    }),
-  )
-})
+  // ── 301 backward-compatible redirects from legacy fleet views ────────────────
+  app.get('/fleet', (c) => c.redirect('/radar?tab=fleet', 301))
+  app.get('/motherboard', (c) => c.redirect('/radar?tab=motherboard', 301))
+  app.get('/dashboard/motherboard', (c) => c.redirect('/radar?tab=motherboard', 301))
+  app.get('/coordination', (c) => c.redirect('/radar?tab=departures', 301))
 
-// ── 301 / 302 backward-compatible redirects from legacy fleet views ─────────
-missionControlApp.get('/fleet', (c) => c.redirect('/radar?tab=fleet', 301))
-missionControlApp.get('/motherboard', (c) => c.redirect('/radar?tab=motherboard', 301))
-missionControlApp.get('/dashboard/motherboard', (c) => c.redirect('/radar?tab=motherboard', 301))
-missionControlApp.get('/coordination', (c) => c.redirect('/radar?tab=departures', 301))
+  return app
+}

@@ -218,7 +218,7 @@ import type { KernelHandle } from '../departments/ctx'
 import '../departments/modules/growth' // side-effect: register GrowthModule so getRegistered('growth') resolves
 import '../departments/modules/agency' // side-effect: register AgencyModule (reusable agency/AEO template)
 import '../departments/modules/web-ops' // side-effect: register WebOpsModule (AI website-operations team — the wedge)
-import { missionControlApp } from './mission-control-routes'
+import { makeMissionControlApp } from './mission-control-routes'
 export { controlTowerBody, potFleetBody } from './mission-control-views'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
@@ -1238,7 +1238,7 @@ dashboardApp.get('/flights', async (c) => {
 // resolveOrgAdmin check requires, via the mechanism this cookie-authed
 // dashboard already uses everywhere else. GET /api/radar's own bearer check
 // Mount Mission Control Sub-app (unified /radar + 301 redirects)
-dashboardApp.route('/', missionControlApp)
+dashboardApp.route('/', makeMissionControlApp(shell))
 
 // Mount Kanban Sub-app
 dashboardApp.route('/', kanbanApp)
