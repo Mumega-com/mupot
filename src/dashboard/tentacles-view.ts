@@ -4,8 +4,8 @@
 // Agent -> Seat -> Tentacle (bounded runner).
 // Interactive SVG fan-out with status-colored nodes and collapsible log/evidence cards.
 
-import { html, raw } from 'hono/html'
-import type { HtmlEscapedString } from 'hono/utils/html'
+import { html } from 'hono/html'
+import type { Html } from './ui'
 import type { RunnerReceipt } from '../runners/types'
 
 export interface TentaclesViewProps {
@@ -23,7 +23,7 @@ function escapeHtml(str: string | null | undefined): string {
     .replace(/'/g, '&#039;')
 }
 
-export function renderTentaclesPanel(props: TentaclesViewProps): HtmlEscapedString {
+export function renderTentaclesPanel(props: TentaclesViewProps): Html {
   const { runners, nowMs = Date.now() } = props
 
   // Group runners by seat_agent_id
