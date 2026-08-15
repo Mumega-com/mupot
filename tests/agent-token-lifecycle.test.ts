@@ -364,6 +364,49 @@ describe('Flight-002: expiring-soon detection & maintenance sweep', () => {
     expect(res.warned).toBe(1)
     expect(res.tokens[0].id).toBe('tok-exp-soon')
     expect(busEvents.length).toBe(1)
-    expect((busEvents[0] as { data: { kind: string } }).data.kind).toBe('token_expiring_soon')
+    expect((busEvents[0] as { payload: { kind: string } }).payload.kind).toBe('token_expiring_soon')
+  })
+
+  it('heartbeat wiring: scheduled handler in src/index.ts wires token-expiry-warning into maintenance cron', async () => {
+    const { readFileSync } = await import('node:fs')
+    const { join } = await import('node:path')
+    const src = readFileSync(join(__dirname, '..', 'src', 'index.ts'), 'utf8')
+
+    // PINNED: If someone deletes or comments out the maintenance wiring in src/index.ts, this test fails RED.
+    expect(src).toContain("['token-expiry-warning', () => sweepExpiringTokensWarning(env)]")
+    expect(src).toContain("const { sweepExpiringTokensWarning } = await import('./auth/token-lifecycle')")
+
+    // Assert scheduled handler executes the heartbeat function
+    const workerEntry = (await import('../src/index')).default
+    expect(workerEntry).toBeDefined()
+    expect(typeof workerEntry.scheduled).toBe('function')
+
+    let executedHeartbeat = false
+    const mockEnv = {
+      DB: {
+        prepare: () => ({
+          bind: () => ({
+            all: async () => {
+              executedHeartbeat = true
+              return { results: [] }
+            },
+          }),
+        }),
+      },
+      TENANT_SLUG: 'mumega',
+      BUS: { send: async () => {} },
+    } as unknown as Env
+
+    // Trigger scheduled handler at minute 10 (% 15 == 10) where token-expiry-warning is wired
+    const mockController = { cron: '*/15 * * * *', scheduledTime: Date.UTC(2026, 7, 15, 12, 10, 0) }
+    const waitUntilPromises: Promise<unknown>[] = []
+    const mockCtx = {
+      waitUntil: (p: Promise<unknown>) => { waitUntilPromises.push(p) },
+      passThroughOnException: () => {},
+    }
+
+    await workerEntry.scheduled(mockController, mockEnv, mockCtx)
+    await Promise.all(waitUntilPromises)
+    expect(executedHeartbeat).toBe(true)
   })
 })

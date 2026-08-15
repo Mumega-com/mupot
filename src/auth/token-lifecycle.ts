@@ -120,7 +120,7 @@ export async function sweepExpiringTokensWarning(
           type: 'org.provisioned',
           tenant: env.TENANT_SLUG,
           ts: new Date().toISOString(),
-          data: {
+          payload: {
             kind: 'token_expiring_soon',
             token_id: t.id,
             agent_id: t.agent_id,
