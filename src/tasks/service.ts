@@ -29,6 +29,20 @@ export function isValidGateOwnerForm(value: string): boolean {
 }
 
 export type TaskStatus = Task['status']
+export const ALL_TASK_STATUSES: readonly TaskStatus[] = [
+  'open',
+  'in_progress',
+  'blocked',
+  'done',
+  'review',
+  'approved',
+  'rejected',
+]
+
+export function isTaskStatus(v: unknown): v is TaskStatus {
+  return typeof v === 'string' && (ALL_TASK_STATUSES as readonly string[]).includes(v)
+}
+
 type TaskActor = NonNullable<BusEvent['actor']>
 
 // Task rows are durable before mirroring begins. Bound the best-effort GitHub
@@ -902,6 +916,38 @@ export function assertValidIntakeContract(
         )
       }
     }
+  }
+}
+
+export interface TaskIntakeAuditResult {
+  compliant: boolean
+  code?: string
+  reason?: string
+}
+
+/**
+ * Pure, non-throwing evaluator for task intake compliance (Issue #1040 Phase 3).
+ * Used by audit linters, sweepers, and dashboard inspectors to evaluate compliance
+ * of existing tasks without throwing runtime errors.
+ * Evaluates strictly by default (allowDeferredPredicate: false) so placeholder sentinels
+ * are identified as non-compliant debt items.
+ */
+export function evaluateTaskIntakeContract(
+  task: TaskIntakePayload,
+  options: { allowDeferredPredicate?: boolean } = {},
+): TaskIntakeAuditResult {
+  try {
+    assertValidIntakeContract(task, { allowDeferredPredicate: Boolean(options.allowDeferredPredicate) })
+    return { compliant: true }
+  } catch (err) {
+    if (err instanceof TaskIntakeContractError) {
+      return {
+        compliant: false,
+        code: err.code,
+        reason: err.message,
+      }
+    }
+    throw err
   }
 }
 

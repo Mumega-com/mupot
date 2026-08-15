@@ -4,11 +4,14 @@ import { applyAllMigrations } from './helpers/migrations'
 import {
   createTask,
   assertValidIntakeContract,
+  evaluateTaskIntakeContract,
   assertCompletableDoneWhen,
   isPlaceholderDoneWhen,
   TaskIntakeContractError,
 } from '../src/tasks/service'
-import type { Env } from '../src/types'
+import { tasksApp } from '../src/tasks'
+import { invokeTool } from '../src/mcp'
+import type { Env, AuthContext } from '../src/types'
 
 describe('Point-of-Capture Intake Contract Governance (Mupot #1040)', () => {
   let harness: SqliteD1Harness
@@ -280,6 +283,158 @@ describe('Point-of-Capture Intake Contract Governance (Mupot #1040)', () => {
       await expect(
         import('../src/tasks/service').then(m => m.persistTaskUpdate(env, task, updatedTask))
       ).rejects.toThrowError(TaskIntakeContractError)
+    })
+  })
+
+  describe('evaluateTaskIntakeContract non-throwing audit scanner (Issue #1040 Phase 3)', () => {
+    it('returns compliant: true for compliant tasks', () => {
+      const result = evaluateTaskIntakeContract({
+        title: 'Check service logs',
+        done_when: 'journalctl -u service returns 0 errors',
+        priority: 'P2',
+      })
+      expect(result.compliant).toBe(true)
+      expect(result.code).toBeUndefined()
+    })
+
+    it('returns compliant: false for tasks with sentinel placeholder predicates (e.g. (set via task update))', () => {
+      const result = evaluateTaskIntakeContract({
+        title: 'Task with sentinel predicate debt',
+        done_when: '(set via task update)',
+        priority: 'P2',
+      })
+      expect(result.compliant).toBe(false)
+      expect(result.code).toBe('done_when_placeholder_rejected')
+    })
+
+    it('returns compliant: true for P1 tasks with valid structured escape hatch', () => {
+      const result = evaluateTaskIntakeContract({
+        title: 'Critical issue discovered during scan',
+        done_when: 'Health check returns 200 OK after patch',
+        priority: 'P1',
+        body: 'Discovered in idle scan. [owner: @kasra, ttl: 7d]',
+      })
+      expect(result.compliant).toBe(true)
+      expect(result.code).toBeUndefined()
+    })
+
+    it('returns compliant: false with violation_code and reason for unlinked P1 tasks without escape hatch', () => {
+      const result = evaluateTaskIntakeContract({
+        title: 'Discovered emergency',
+        done_when: 'Service is back up and responding 200 OK',
+        priority: 'P1',
+      })
+      expect(result.compliant).toBe(false)
+      expect(result.code).toBe('p1_linkage_required')
+      expect(result.reason).toContain('P1 priority requires flight/project linkage')
+    })
+
+    it('returns compliant: false for insufficient P0 justifications', () => {
+      const result = evaluateTaskIntakeContract({
+        title: 'Fix prod',
+        done_when: 'Prod is green',
+        priority: 'P0',
+        body: 'urgent',
+      })
+      expect(result.compliant).toBe(false)
+      expect(result.code).toBe('p0_justification_required')
+    })
+  })
+
+  describe('Route-Level Audit Strictness Witness (REST GET /audit & MCP task_intake_audit)', () => {
+    const adminAuth: AuthContext = {
+      userId: 'user-admin',
+      memberId: 'member-admin',
+      email: 'admin@mumega.com',
+      role: 'owner',
+      tenant: 'test-tenant',
+      channel: 'workspace',
+      boundAgentId: null,
+      capabilities: [
+        { member_id: 'member-admin', scope_type: 'squad', scope_id: 'sq-1', capability: 'admin' },
+      ],
+    }
+
+    it('REST GET /audit surfaces sentinel-predicate task as non-compliant debt', async () => {
+      // Seed a task with placeholder sentinel done_when directly in the database
+      harness.sqlite.exec(`
+        INSERT INTO tasks (id, squad_id, title, done_when, priority, status, created_at, updated_at)
+        VALUES ('task-sentinel-1', 'sq-1', 'Sentinel Task Debt', '(set via task update)', 'P2', 'open', '2026-08-15T00:00:00Z', '2026-08-15T00:00:00Z');
+      `)
+
+      const sessionStore = new Map<string, string>()
+      sessionStore.set('sess:test-session-id', JSON.stringify({
+        userId: 'user-admin',
+        email: 'admin@mumega.com',
+        role: 'owner',
+        createdAt: new Date().toISOString(),
+      }))
+
+      const testEnv = {
+        ...env,
+        TENANT_SLUG: 'test-tenant',
+        SESSIONS: {
+          get: async (key: string) => sessionStore.get(key) ?? null,
+          put: async (key: string, val: string) => { sessionStore.set(key, val) },
+          delete: async (key: string) => { sessionStore.delete(key) },
+        },
+      } as unknown as Env
+
+      const req = new Request('http://localhost/audit?squad_id=sq-1&non_compliant_only=true', {
+        method: 'GET',
+        headers: {
+          'Cookie': 'mupot_session=test-session-id',
+        },
+      })
+
+      const res = await tasksApp.fetch(req, testEnv)
+      expect(res.status).toBe(200)
+
+      const body = await res.json() as {
+        total_scanned: number
+        compliant_count: number
+        non_compliant_count: number
+        tasks: Array<{ id: string; compliant: boolean; violation_code?: string }>
+      }
+
+      expect(body.non_compliant_count).toBeGreaterThanOrEqual(1)
+      const sentinelTask = body.tasks.find((t) => t.id === 'task-sentinel-1')
+      expect(sentinelTask).toBeDefined()
+      expect(sentinelTask?.compliant).toBe(false)
+      expect(sentinelTask?.violation_code).toBe('done_when_placeholder_rejected')
+    })
+
+    it('MCP task_intake_audit tool surfaces sentinel-predicate task as non-compliant', async () => {
+      harness.sqlite.exec(`
+        INSERT INTO tasks (id, squad_id, title, done_when, priority, status, created_at, updated_at)
+        VALUES ('task-sentinel-mcp', 'sq-1', 'MCP Sentinel Task', '(backfill required)', 'P2', 'open', '2026-08-15T00:00:00Z', '2026-08-15T00:00:00Z');
+      `)
+
+      const testEnv = {
+        ...env,
+        TENANT_SLUG: 'test-tenant',
+      }
+
+      const res = await invokeTool(
+        adminAuth,
+        testEnv,
+        'task_intake_audit',
+        { squad_id: 'sq-1', non_compliant_only: true },
+        'https://mupot.test'
+      )
+
+      expect(res.ok).toBe(true)
+      const result = res.result as {
+        total_scanned: number
+        compliant_count: number
+        non_compliant_count: number
+        tasks: Array<{ id: string; compliant: boolean; violation_code?: string }>
+      }
+      expect(result.non_compliant_count).toBeGreaterThanOrEqual(1)
+      const sentinelTask = result.tasks.find((t) => t.id === 'task-sentinel-mcp')
+      expect(sentinelTask).toBeDefined()
+      expect(sentinelTask?.compliant).toBe(false)
+      expect(sentinelTask?.violation_code).toBe('done_when_placeholder_rejected')
     })
   })
 })

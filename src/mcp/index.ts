@@ -58,6 +58,9 @@ import {
   TaskUpdateConflictError,
   TaskIntakeContractError,
   assertValidIntakeContract,
+  evaluateTaskIntakeContract,
+  isTaskStatus,
+  ALL_TASK_STATUSES,
   validateTaskProjectAttribution,
   writeVerdict,
   VerdictRaceError,
@@ -65,6 +68,7 @@ import {
 } from '../tasks/service'
 import { loadKanbanData } from '../dashboard/kanban-routes'
 import type { TaskStatus } from '../tasks/service'
+import { isTaskPriority, TASK_PRIORITIES } from '../types'
 import type { TaskPriority } from '../types'
 import { resolveTaskAssignee } from '../tasks/assignee'
 // #22 v1 ATC ranking: pure scorer + the radar's existing agent runtime-state
@@ -510,19 +514,8 @@ const NULLABLE_STRING_SCHEMA = { type: ['string', 'null'] }
 const OPTIONAL_STRING_ARRAY_SCHEMA = { type: 'array', items: { type: 'string' } }
 const OPTIONAL_NUMBER_SCHEMA = { type: 'number' }
 
-const TASK_PRIORITIES: readonly string[] = ['P0', 'P1', 'P2', 'P3']
-
-const TASK_STATUSES: readonly TaskStatus[] = ['open', 'in_progress', 'blocked', 'done', 'review', 'approved', 'rejected']
 const PATCH_ALLOWED_STATUSES: ReadonlySet<string> = new Set(['open', 'in_progress', 'blocked', 'done', 'review'])
 const BROADCAST_REQUEST_ID_RE = /^[A-Za-z0-9_.:-]{1,128}$/
-
-function isTaskStatus(v: unknown): v is TaskStatus {
-  return typeof v === 'string' && (TASK_STATUSES as readonly string[]).includes(v)
-}
-
-function isTaskPriority(v: unknown): v is TaskPriority {
-  return typeof v === 'string' && TASK_PRIORITIES.includes(v)
-}
 
 function isPatchableStatus(v: unknown): v is TaskStatus {
   return typeof v === 'string' && PATCH_ALLOWED_STATUSES.has(v)
@@ -937,7 +930,7 @@ const toolTaskBoard: ToolSpec = {
       if (columns[task.status]) columns[task.status].push(task)
     }
     const counts = Object.fromEntries(
-      TASK_STATUSES.map((status) => [status, columns[status].length]),
+      ALL_TASK_STATUSES.map((status) => [status, columns[status].length]),
     ) as Record<TaskStatus, number>
     return done({ squad_id: squadRes.squad.id, counts, columns })
   },
@@ -1241,6 +1234,7 @@ const toolTaskUpdate: ToolSpec = {
     try {
       await persistTaskUpdate(env, existing, next)
     } catch (error) {
+      if (error instanceof TaskIntakeContractError) return fail(400, error.code, error.message)
       if (error instanceof TaskUpdateConflictError) return fail(409, error.code)
       throw error
     }
@@ -1565,6 +1559,124 @@ const toolTaskDispatch: ToolSpec = {
         dispatched_by: memberActor(memberId),
         dispatched_at: dispatchedAt,
       },
+    })
+  },
+}
+
+// task_intake_audit — audit existing tasks for Point-of-Capture intake contract
+// compliance (Issue #1040 Phase 3). Scans open/actionable tasks on a squad or across
+// the tenant and reports compliance stats, non-compliant tasks, reasons, and suggested remediations.
+// Evaluates strictly so placeholder sentinels and unlinked P1 tasks are caught.
+const toolTaskIntakeAudit: ToolSpec = {
+  name: 'task_intake_audit',
+  scope: 'squad / tenant',
+  min: 'member',
+  args: '{ squad_id?: string, status?: string, priority?: string, non_compliant_only?: boolean, limit?: number }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      squad_id: STRING_SCHEMA,
+      status: { type: 'string', enum: [...ALL_TASK_STATUSES] },
+      priority: { type: 'string', enum: ['P0', 'P1', 'P2', 'P3'] },
+      non_compliant_only: { type: 'boolean' },
+      limit: { type: 'number' },
+    },
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const squadId = str(args.squad_id)
+    const grants = auth.capabilities ?? []
+
+    if (squadId) {
+      if (!(await memberCanOnSquad(env, grants, squadId, 'member'))) {
+        return fail(404, 'squad_not_found')
+      }
+    }
+
+    if (args.status !== undefined && !isTaskStatus(args.status)) {
+      return fail(400, 'invalid_status', { accepted: ALL_TASK_STATUSES })
+    }
+    if (args.priority !== undefined && !isTaskPriority(args.priority)) {
+      return fail(400, 'invalid_priority', { accepted: TASK_PRIORITIES })
+    }
+
+    const limit = Math.min(Math.max(Number(args.limit) || 100, 1), 500)
+    const nonCompliantOnly = Boolean(args.non_compliant_only)
+
+    const conditions: string[] = []
+    const bindings: unknown[] = []
+
+    if (squadId) {
+      conditions.push(`squad_id = ?`)
+      bindings.push(squadId)
+    }
+    if (args.status && typeof args.status === 'string') {
+      conditions.push(`status = ?`)
+      bindings.push(args.status)
+    }
+    if (args.priority && typeof args.priority === 'string') {
+      conditions.push(`priority = ?`)
+      bindings.push(args.priority)
+    }
+
+    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
+
+    const rows = await env.DB.prepare(
+      `SELECT ${TASK_SELECT_COLUMNS}
+         FROM tasks ${whereClause}
+        ORDER BY ${priorityOrderSql()}, created_at DESC
+        LIMIT ?`,
+    )
+      .bind(...bindings, limit)
+      .all<Task>()
+
+    const tasks = rows.results ?? []
+    const audited = []
+    let compliantCount = 0
+    let nonCompliantCount = 0
+
+    for (const task of tasks) {
+      // Check squad visibility if querying tenant-wide
+      if (!squadId && !(await memberCanOnSquad(env, grants, task.squad_id, 'member'))) {
+        continue
+      }
+
+      // STRICT evaluation (no deferral): catches sentinel predicates and short predicates as debt
+      const audit = evaluateTaskIntakeContract(task, { allowDeferredPredicate: false })
+      if (audit.compliant) {
+        compliantCount++
+        if (!nonCompliantOnly) {
+          audited.push({
+            id: task.id,
+            squad_id: task.squad_id,
+            title: task.title,
+            priority: task.priority,
+            status: task.status,
+            project_id: task.project_id,
+            compliant: true,
+          })
+        }
+      } else {
+        nonCompliantCount++
+        audited.push({
+          id: task.id,
+          squad_id: task.squad_id,
+          title: task.title,
+          priority: task.priority,
+          status: task.status,
+          project_id: task.project_id,
+          compliant: false,
+          violation_code: audit.code,
+          reason: audit.reason,
+        })
+      }
+    }
+
+    return done({
+      total_scanned: audited.length,
+      compliant_count: compliantCount,
+      non_compliant_count: nonCompliantCount,
+      tasks: audited,
     })
   },
 }
@@ -3414,6 +3526,7 @@ export const TOOLS: ToolSpec[] = [
   toolTaskUpdate,
   toolTaskVerdict,
   toolTaskDispatch,
+  toolTaskIntakeAudit,
   toolRemember,
   toolRecall,
   toolSquadRemember,
