@@ -344,6 +344,11 @@ export interface Membership {
 export type Capability = 'owner' | 'admin' | 'lead' | 'member' | 'observer'
 
 export type TaskPriority = 'P0' | 'P1' | 'P2' | 'P3'
+export const TASK_PRIORITIES: readonly TaskPriority[] = ['P0', 'P1', 'P2', 'P3']
+
+export function isTaskPriority(v: unknown): v is TaskPriority {
+  return typeof v === 'string' && (TASK_PRIORITIES as readonly string[]).includes(v)
+}
 
 export interface Task {
   id: string

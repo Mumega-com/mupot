@@ -16,6 +16,7 @@
 import { Hono } from 'hono'
 import { csrf } from 'hono/csrf'
 import type { Env, AuthContext, Task, Squad, Capability } from '../types'
+import { isTaskPriority, TASK_PRIORITIES } from '../types'
 
 // requireAuth is owned by the auth component; it sets c.get('auth').
 import { requireAuth } from '../auth'
@@ -23,7 +24,7 @@ import { requireAuth } from '../auth'
 // task's SQUAD scope. The squad is data-derived (request body on POST, the loaded
 // row on PATCH), so we check inline rather than as static route middleware.
 import { resolveCapabilities, hasCapability, hasSurfaceCap, isOrgAdmin } from '../auth/capability'
-import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, TaskEvidenceFenceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution, assigneeSelfClose, assigneeCannotMutateOwnAssignment, TaskIntakeContractError } from './service'
+import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, TaskEvidenceFenceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution, assigneeSelfClose, assigneeCannotMutateOwnAssignment, TaskIntakeContractError, assertValidIntakeContract } from './service'
 import type { TaskStatus } from './service'
 import { resolveTaskAssignee } from './assignee'
 export { resolveTaskAssignee as resolveAssignee } from './assignee'
@@ -535,6 +536,7 @@ interface UpdateTaskBody {
   // Must be a non-empty, non-sentinel string. Cannot be cleared (blank → error).
   done_when?: unknown
   status?: unknown
+  priority?: unknown
   assignee_agent_id?: unknown
   gate_owner?: unknown
   project_id?: unknown
@@ -652,6 +654,14 @@ tasksApp.patch('/:id', async (c) => {
       }
     }
     next.status = body.status
+  }
+  if (body.priority !== undefined) {
+    if (body.priority === null) {
+      next.priority = null
+    } else {
+      if (!isTaskPriority(body.priority)) return c.json({ error: 'invalid_priority', accepted: TASK_PRIORITIES }, 400)
+      next.priority = body.priority
+    }
   }
   if (body.assignee_agent_id !== undefined) {
     // #406 fast-follow (Opus re-gate WARN-1 on #404): #404 closed AUTO-pickup of
@@ -786,6 +796,19 @@ tasksApp.patch('/:id', async (c) => {
     if (!(error instanceof TaskProjectError)) throw error
     const mapped = taskProjectErrorResponse(error)
     return c.json(mapped.body, mapped.status)
+  }
+
+  // Point-of-capture severity discipline on mutation (Issue #1040 Phase 2):
+  // If priority is explicitly modified to P0/P1, validate intake contract requirements
+  if (body.priority !== undefined && (next.priority === 'P0' || next.priority === 'P1')) {
+    try {
+      assertValidIntakeContract(next, { allowDeferredPredicate: true })
+    } catch (error) {
+      if (error instanceof TaskIntakeContractError) {
+        return c.json({ error: error.code, detail: error.message }, 400)
+      }
+      throw error
+    }
   }
 
   stampTaskUpdate(next, existing.status, new Date().toISOString())

@@ -433,6 +433,12 @@ export async function persistTaskUpdate(
   existing: Task,
   next: Task,
 ): Promise<void> {
+  // Chokepoint enforcement for priority discipline (Issue #1040 Phase 2):
+  // When a task is escalated or mutated to P0/P1, validate intake contract requirements
+  if ((existing.priority !== next.priority || existing.body !== next.body || existing.project_id !== next.project_id || existing.parent_task_id !== next.parent_task_id) && (next.priority === 'P0' || next.priority === 'P1')) {
+    assertValidIntakeContract(next, { allowDeferredPredicate: true })
+  }
+
   let result
   try {
     result = await env.DB.prepare(
@@ -856,7 +862,7 @@ export function assertValidIntakeContract(
         `placeholder sentinel "${trimmedDoneWhen}" is not a verifiable success predicate — provide checkable completion criteria`,
       )
     }
-  } else {
+  } else if (!options.allowDeferredPredicate) {
     // Non-sentinel predicates must satisfy minimum length to prevent trivial bypasses
     if (trimmedDoneWhen.length < 5) {
       throw new TaskIntakeContractError(
@@ -874,6 +880,27 @@ export function assertValidIntakeContract(
         'p0_justification_required',
         'P0 priority requires a detailed explanation of impact/urgency in task body (minimum 20 characters)',
       )
+    }
+  }
+
+  // P1 Priority Discipline (Issue #1040 Phase 2):
+  // P1 designates active Flight Blockers or urgent sprint milestones.
+  // Gated rule: A task at priority P1 requires either:
+  // 1. Direct linkage to a Project (input.project_id) or Parent Task (input.parent_task_id), OR
+  // 2. Escape Hatch: Explicit named owner + review TTL stated in body/metadata (e.g. "[owner: @kasra, ttl: 7d]").
+  if (input.priority === 'P1') {
+    const hasLinkage = isNonEmptyString(input.project_id) || isNonEmptyString(input.parent_task_id)
+    if (!hasLinkage) {
+      const bodyText = input.body ?? ''
+      const HATCH_RE = /\[owner:\s*@?[\w.-]+,\s*ttl:\s*\d+[dwmyh](?:,\s*re-review)?\]/i
+      const hasEscapeHatch = HATCH_RE.test(bodyText)
+
+      if (!hasEscapeHatch) {
+        throw new TaskIntakeContractError(
+          'p1_linkage_required',
+          'P1 priority requires flight/project linkage (project_id or parent_task_id) or explicit escape hatch in body (e.g. "[owner: @name, ttl: 7d]")',
+        )
+      }
     }
   }
 }

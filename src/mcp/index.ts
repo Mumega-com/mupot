@@ -57,6 +57,7 @@ import {
   TaskProjectError,
   TaskUpdateConflictError,
   TaskIntakeContractError,
+  assertValidIntakeContract,
   validateTaskProjectAttribution,
   writeVerdict,
   VerdictRaceError,
@@ -1223,6 +1224,17 @@ const toolTaskUpdate: ToolSpec = {
     } catch (error) {
       if (error instanceof TaskProjectError) return taskProjectFailure(error)
       throw error
+    }
+
+    // Point-of-capture severity discipline on mutation (Issue #1040 Phase 2):
+    // If priority is explicitly modified to P0/P1, validate intake contract requirements
+    if (args.priority !== undefined && (next.priority === 'P0' || next.priority === 'P1')) {
+      try {
+        assertValidIntakeContract(next, { allowDeferredPredicate: true })
+      } catch (error) {
+        if (error instanceof TaskIntakeContractError) return fail(400, error.code, error.message)
+        throw error
+      }
     }
 
     stampTaskUpdate(next, existing.status, new Date().toISOString())
