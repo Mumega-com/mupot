@@ -24,7 +24,7 @@ import { requireAuth } from '../auth'
 // task's SQUAD scope. The squad is data-derived (request body on POST, the loaded
 // row on PATCH), so we check inline rather than as static route middleware.
 import { resolveCapabilities, hasCapability, hasSurfaceCap, isOrgAdmin } from '../auth/capability'
-import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, TaskEvidenceFenceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution, assigneeSelfClose, assigneeCannotMutateOwnAssignment, TaskIntakeContractError, assertValidIntakeContract } from './service'
+import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, TaskEvidenceFenceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution, assigneeSelfClose, assigneeCannotMutateOwnAssignment, TaskIntakeContractError, assertValidIntakeContract, evaluateTaskIntakeContract, isTaskStatus, ALL_TASK_STATUSES } from './service'
 import type { TaskStatus } from './service'
 import { resolveTaskAssignee } from './assignee'
 export { resolveTaskAssignee as resolveAssignee } from './assignee'
@@ -50,11 +50,6 @@ import { loadAgentRuntimeStates, type AgentRuntimeState } from '../dashboard/obs
 // ── validation helpers ───────────────────────────────────────────────────────
 type TaskActor = NonNullable<BusEvent['actor']>
 
-// Gate statuses (review/approved/rejected) extend the base set. PATCH is
-// constrained to a safe subset: review→approved|rejected is forbidden via PATCH
-// (must go through the verdict endpoint). See PATCH handler for details.
-const TASK_STATUSES = ['open', 'in_progress', 'blocked', 'done', 'review', 'approved', 'rejected'] as const
-
 // Statuses the PATCH endpoint may set directly. The gate-transition statuses
 // (approved, rejected) require the verdict endpoint.
 const PATCH_ALLOWED_STATUSES: ReadonlySet<string> = new Set([
@@ -74,10 +69,6 @@ const PATCH_ALLOWED_STATUSES: ReadonlySet<string> = new Set([
 // Rationale: tasks are born open or immediately in_progress (e.g., dispatch:true).
 // Any other status is a lifecycle state reachable only through proper transitions.
 const CREATE_ALLOWED_STATUSES: ReadonlySet<string> = new Set(['open', 'in_progress'])
-
-function isTaskStatus(v: unknown): v is TaskStatus {
-  return typeof v === 'string' && (TASK_STATUSES as readonly string[]).includes(v)
-}
 
 function isPatchableStatus(v: unknown): v is TaskStatus {
   return typeof v === 'string' && PATCH_ALLOWED_STATUSES.has(v)
@@ -363,6 +354,101 @@ tasksApp.get('/', async (c) => {
     taskRows.length > 0 ? await loadAgentRuntimeStates(c.env) : new Map()
 
   return c.json({ tasks: rankTasks(taskRows, agentStates) })
+})
+
+// ── GET /audit — audit task intake compliance across squad/tenant (Issue #1040 Phase 3) ──
+tasksApp.get('/audit', async (c) => {
+  const auth = c.get('auth')
+  const squadId = c.req.query('squad_id')
+  const status = c.req.query('status')
+  const priority = c.req.query('priority')
+  const nonCompliantOnly = c.req.query('non_compliant_only') === 'true'
+  const limit = Math.min(Math.max(Number(c.req.query('limit')) || 100, 1), 500)
+
+  if (squadId && !(await canActOnSquad(c.env, auth, squadId))) {
+    return c.json({ error: 'forbidden', need: 'member' }, 403)
+  }
+
+  if (status !== undefined && !isTaskStatus(status)) {
+    return c.json({ error: 'invalid_status', accepted: ALL_TASK_STATUSES }, 400)
+  }
+  if (priority !== undefined && !isTaskPriority(priority)) {
+    return c.json({ error: 'invalid_priority', accepted: TASK_PRIORITIES }, 400)
+  }
+
+  const conditions: string[] = []
+  const binds: unknown[] = []
+
+  if (squadId) {
+    conditions.push('squad_id = ?')
+    binds.push(squadId)
+  }
+  if (status) {
+    conditions.push('status = ?')
+    binds.push(status)
+  }
+  if (priority) {
+    conditions.push('priority = ?')
+    binds.push(priority)
+  }
+
+  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
+  const rows = await c.env.DB.prepare(
+    `SELECT ${TASK_SELECT_COLUMNS}
+       FROM tasks ${whereClause}
+      ORDER BY ${priorityOrderSql()}, created_at DESC
+      LIMIT ?`,
+  )
+    .bind(...binds, limit)
+    .all<Task>()
+
+  const tasks = rows.results ?? []
+  const audited = []
+  let compliantCount = 0
+  let nonCompliantCount = 0
+
+  for (const task of tasks) {
+    if (!squadId && !(await canActOnSquad(c.env, auth, task.squad_id))) {
+      continue
+    }
+
+    // STRICT evaluation (no deferral): placeholder sentinels & short predicates flag non-compliant
+    const audit = evaluateTaskIntakeContract(task, { allowDeferredPredicate: false })
+    if (audit.compliant) {
+      compliantCount++
+      if (!nonCompliantOnly) {
+        audited.push({
+          id: task.id,
+          squad_id: task.squad_id,
+          title: task.title,
+          priority: task.priority,
+          status: task.status,
+          project_id: task.project_id,
+          compliant: true,
+        })
+      }
+    } else {
+      nonCompliantCount++
+      audited.push({
+        id: task.id,
+        squad_id: task.squad_id,
+        title: task.title,
+        priority: task.priority,
+        status: task.status,
+        project_id: task.project_id,
+        compliant: false,
+        violation_code: audit.code,
+        reason: audit.reason,
+      })
+    }
+  }
+
+  return c.json({
+    total_scanned: audited.length,
+    compliant_count: compliantCount,
+    non_compliant_count: nonCompliantCount,
+    tasks: audited,
+  })
 })
 
 // ── GET /:id — single task read (for the /send poller) ───────────────────────
@@ -816,6 +902,9 @@ tasksApp.patch('/:id', async (c) => {
   try {
     await persistTaskUpdate(c.env, existing, next)
   } catch (error) {
+    if (error instanceof TaskIntakeContractError) {
+      return c.json({ error: error.code, detail: error.message }, 400)
+    }
     if (error instanceof TaskUpdateConflictError) return c.json({ error: error.code }, 409)
     throw error
   }
