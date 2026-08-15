@@ -7,6 +7,10 @@
 //
 //   GET  /api/inbox?peek=1&limit=N  — read the CALLER's own inbox (consume by default; peek=1
 //                                     reads without consuming, for a poll that doesn't drain).
+//   GET  /api/inbox/stream          — SSE stream of NEW messages (server-side poll over the
+//                                     same readAgentInbox service; initial flush + subsequent
+//                                     message events; ?since=<seq> to skip already-seen rows;
+//                                     ?poll_ms=<N> to tune the poll cadence).
 //   POST /api/inbox/send            — send to another agent (e.g. a hook ACKing a delegation).
 //
 // Auth: the agent's pot member-token (bearer), resolved server-side. Identity (from/to-scope)
@@ -23,7 +27,164 @@ import { verifyAndReadSignedInbox } from '../fleet/signed-inbox'
 
 const MAX_BODY_BYTES = 8192
 
+// ── inbox stream (SSE) ────────────────────────────────────────────────────────────────────
+// The durable inbox is pull-only; this endpoint is the push side of #706. It is a thin SSE
+// wrapper over the SAME readAgentInbox service (peek=true), so the stream can never diverge
+// from the MCP/HTTP inbox surfaces on ordering or auth. It does NOT consume — consumption
+// stays with the inbox tool/route so delivery and ack remain separate (matches #622's
+// at-least-once framing: the stream is the notification, the consume is the ack).
+const DEFAULT_STREAM_POLL_MS = 1000
+const MIN_STREAM_POLL_MS = 250
+const MAX_STREAM_POLL_MS = 30_000
+
+export interface StreamMessage {
+  seq: number
+  id: string
+  from_agent: string
+  kind: string
+  body: string
+  request_id: string | null
+  in_reply_to: string | null
+  created_at: string
+}
+
+export type InboxStreamEvent =
+  | { type: 'initial'; since: number; messages: StreamMessage[] }
+  | { type: 'message'; message: StreamMessage }
+  | { type: 'heartbeat' }
+
+interface StreamOpts {
+  /** Async sleep used between polls — injectable for tests (like now/idGen in messages.ts). */
+  sleep?: (ms: number) => Promise<void>
+  /** AbortSignal: when aborted (client disconnect), the generator stops polling and ends. */
+  signal?: AbortSignal
+}
+
+/** Poll the agent's unread inbox on a cadence, yielding new messages (seq > since) as events.
+ *  Pure + injectable: the Hono route owns auth and the SSE wire format only. */
+export async function* streamInboxEvents(
+  env: Env,
+  input: { agent: string; since?: number; pollMs?: number; revalidate?: () => Promise<boolean> },
+  opts: StreamOpts = {},
+): AsyncGenerator<InboxStreamEvent> {
+  const tenant = env.TENANT_SLUG
+  if (!tenant) return
+  const agent = input.agent
+  const since = Number.isFinite(input.since) && (input.since ?? 0) > 0 ? Math.floor(input.since as number) : 0
+  const pollMs = Math.min(MAX_STREAM_POLL_MS, Math.max(MIN_STREAM_POLL_MS, Math.floor(input.pollMs ?? DEFAULT_STREAM_POLL_MS)))
+  const sleep = opts.sleep ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)))
+  const aborted = () => opts.signal?.aborted === true
+
+  let lastSeq = since
+  const isNew = (m: StreamMessage) => m.seq > lastSeq
+
+  // Initial flush: anything unread above the client's cursor, oldest-first.
+  const initial = await readAgentInbox(env, { agent, peek: true, limit: 100, sinceSeq: lastSeq })
+  if (initial.ok) {
+    const fresh = initial.messages.filter(isNew)
+    if (fresh.length > 0) {
+      lastSeq = fresh[fresh.length - 1].seq
+      yield { type: 'initial', since: lastSeq, messages: fresh }
+    }
+  }
+
+  // Poll loop: re-read unread above the cursor, emit only rows newer than the last emitted seq.
+  for (;;) {
+    if (aborted()) return
+    // P0-2: the bearer credential is re-validated every poll. A revoked token or
+    // deactivated agent ends the stream rather than leaking the full inbox.
+    if (input.revalidate !== undefined) {
+      const stillValid = await input.revalidate()
+      if (!stillValid) return
+    }
+    await sleep(pollMs)
+    if (aborted()) return
+    const res = await readAgentInbox(env, { agent, peek: true, limit: 100, sinceSeq: lastSeq })
+    if (!res.ok) {
+      // Transient DB failure — keep the stream alive; the client re-reads on reconnect.
+      yield { type: 'heartbeat' }
+      continue
+    }
+    const fresh = res.messages.filter((m) => m.seq > lastSeq)
+    if (fresh.length === 0) {
+      yield { type: 'heartbeat' }
+      continue
+    }
+    lastSeq = fresh[fresh.length - 1].seq
+    for (const m of fresh) {
+      yield { type: 'message', message: m }
+    }
+  }
+}
+
 export const inboxApp = new Hono<{ Bindings: Env }>()
+
+// GET /api/inbox/stream — SSE stream of new inbox messages (recipient's own inbox only).
+inboxApp.get('/stream', async (c) => {
+  const id = await resolveMemberByToken(c.env, bearerToken(c.req.header('authorization')))
+  if (!id) return c.json({ error: 'unauthorized' }, 401) // generic — no auth oracle
+  if (!id.boundAgentId) return c.json({ error: 'not_agent_bound' }, 403)
+
+  const sinceQ = c.req.query('since')
+  let since: number | undefined
+  if (sinceQ !== undefined) {
+    const n = Number(sinceQ)
+    if (!Number.isFinite(n) || n < 0) return c.json({ error: 'invalid_since' }, 400)
+    since = n
+  }
+  const pollMsQ = c.req.query('poll_ms')
+  let pollMs: number | undefined
+  if (pollMsQ !== undefined) {
+    const n = Number(pollMsQ)
+    if (!Number.isFinite(n) || n <= 0) return c.json({ error: 'invalid_poll_ms' }, 400)
+    pollMs = n
+  }
+
+  const events = streamInboxEvents(
+    c.env,
+    {
+      agent: id.boundAgentId,
+      since,
+      pollMs,
+      // P0-2: re-validate the bearer credential on every poll so a revoked token or
+      // deactivated agent ends the stream instead of leaking the full inbox forever.
+      revalidate: async () => {
+        const current = await resolveMemberByToken(c.env, bearerToken(c.req.header('authorization')))
+        return current?.boundAgentId === id.boundAgentId
+      },
+    },
+    { signal: c.req.raw.signal },
+  )
+  const encoder = new TextEncoder()
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      try {
+        for await (const ev of events) {
+          // Comment frame keeps proxies from timing the connection out between polls.
+          if (ev.type === 'heartbeat') {
+            controller.enqueue(encoder.encode(': ping\n\n'))
+            continue
+          }
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(ev)}\n\n`))
+        }
+      } finally {
+        try {
+          controller.close()
+        } catch {
+          // already closed — client went away mid-frame
+        }
+      }
+    },
+  })
+  return new Response(stream, {
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    },
+  })
+})
 
 type ParsedBody = { ok: true; value: Record<string, unknown> } | { ok: false; status: 400 | 413; error: string }
 

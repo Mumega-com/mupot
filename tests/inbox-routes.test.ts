@@ -118,13 +118,17 @@ function makeDb(
       return claimed.map((m) => ({ ...m }))
     }
     if (sql.includes('FROM agent_messages') && sql.includes('read_at IS NULL') && sql.includes('ORDER BY seq ASC')) {
-      const [tenant, to_agent, limit] = b as [string, string, number]
+      const [tenant, to_agent, sinceSeqOrLimit, maybeLimit] = b as [string, string, number, number?]
       const effectiveMode = signedOnlyAgents.has(to_agent) ? 'signed_only' : 'bearer_only'
       const signed = sql.includes("mode = 'signed_only'")
       if (signed) {
-        if (effectiveMode !== 'signed_only' || b[3] !== keyFingerprint(tenant, to_agent)) return []
+        if (effectiveMode !== 'signed_only' || b[4] !== keyFingerprint(tenant, to_agent)) return []
       } else if (effectiveMode !== 'bearer_only') return []
-      return messages.filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null).sort((x, y) => x.seq - y.seq).slice(0, limit).map((m) => ({ ...m }))
+      // 5 binds = signed with cursor; 4 binds = bearer with cursor; 3 binds = plain peek (no cursor).
+      const hasCursor = signed ? b.length === 5 : b.length === 4
+      const sinceSeq = hasCursor ? (sinceSeqOrLimit ?? 0) : 0
+      const limit = hasCursor ? (maybeLimit as number) : sinceSeqOrLimit
+      return messages.filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null && m.seq > sinceSeq).sort((x, y) => x.seq - y.seq).slice(0, limit).map((m) => ({ ...m }))
     }
     if (sql.includes('FROM agents WHERE slug = ?1')) {
       const [ref] = b as [string]
@@ -467,5 +471,62 @@ describe('POST /api/inbox/signed', () => {
       { 'm-code': 'inactive' },
     )
     expect((await postSigned(await signedInboxBody(kp.privateKey, 'ag-code'), disabled.env)).status).toBe(401)
+  })
+})
+
+describe('GET /api/inbox/stream', () => {
+  it('no token → 401', async () => {
+    const { env: e } = env(AGENTS)
+    const res = await inboxApp.fetch(getReq(undefined, 'stream'), e)
+    expect(res.status).toBe(401)
+  })
+  it('unbound token → 403', async () => {
+    const { env: e } = env(AGENTS)
+    const res = await inboxApp.fetch(getReq('tok-unbound', 'stream'), e)
+    expect(res.status).toBe(403)
+  })
+  it('invalid since → 400', async () => {
+    const { env: e } = env(AGENTS)
+    const res = await inboxApp.fetch(getReq('tok-code', 'stream?since=abc'), e)
+    expect(res.status).toBe(400)
+  })
+  it('invalid poll_ms → 400', async () => {
+    const { env: e } = env(AGENTS)
+    const res = await inboxApp.fetch(getReq('tok-code', 'stream?poll_ms=-5'), e)
+    expect(res.status).toBe(400)
+  })
+  it('emits the recipient’s unread messages as SSE data frames', async () => {
+    const { env: e, db } = env(AGENTS)
+    db._messages.push({ seq: 1, id: 'x', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm-rev', kind: 'message', body: 'hi code', request_id: null, in_reply_to: null, created_at: 't0', read_at: null })
+    const res = await inboxApp.fetch(getReq('tok-code', 'stream'), e)
+    expect(res.status).toBe(200)
+    expect(res.headers.get('content-type')).toContain('text/event-stream')
+    // Read only the first frame: the initial flush (poll loop runs forever).
+    const reader = res.body!.getReader()
+    const { value } = await reader.read()
+    const text = new TextDecoder().decode(value)
+    await reader.cancel()
+    expect(text).toMatch(/^data: /)
+    const event = JSON.parse(text.slice(5))
+    expect(event.type).toBe('initial')
+    expect(event.messages.map((m: { body: string }) => m.body)).toEqual(['hi code'])
+    // peek semantics: the stream never consumes — a later read still sees the message.
+    const again = await inboxApp.fetch(getReq('tok-code', '?peek=1'), e)
+    const j = (await again.json()) as { messages: unknown[] }
+    expect(j.messages.length).toBe(1)
+  })
+  it('since=N skips already-seen messages in the initial flush', async () => {
+    const { env: e, db } = env(AGENTS)
+    db._messages.push({ seq: 1, id: 'a', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm-rev', kind: 'message', body: 'old', request_id: null, in_reply_to: null, created_at: 't0', read_at: null })
+    db._messages.push({ seq: 2, id: 'b', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm-rev', kind: 'request', body: 'new', request_id: 'rid', in_reply_to: null, created_at: 't0', read_at: null })
+    const res = await inboxApp.fetch(getReq('tok-code', 'stream?since=1'), e)
+    const reader = res.body!.getReader()
+    const { value } = await reader.read()
+    const text = new TextDecoder().decode(value)
+    await reader.cancel()
+    const event = JSON.parse(text.slice(5))
+    expect(event.type).toBe('initial')
+    expect(event.messages.map((m: { body: string }) => m.body)).toEqual(['new'])
+    expect(event.since).toBe(2)
   })
 })
