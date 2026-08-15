@@ -183,8 +183,13 @@ import {
 import { answerRoutineRun, cancelRoutineRun } from '../routines/actions'
 import { loadAgentConnectionStatus } from '../members/agent-connection-status'
 
-// First-run setup wizard (the easy-onboard centerpiece). Mounted under '/setup'
-// on this same dashboard app, so it inherits the auth + tenant guard below.
+import { wakeFleetAgent, requestFleetControl, fleetScoped } from './fleet'
+import { emitControlRequest, emitSquadControlRequest } from '../fleet/control'
+import type { PresenceView } from '../fleet/presence'
+import type { DepartureCard } from '../coordination/journeys'
+import { listFlights } from '../flight/service'
+import { buildBoard } from '../flight/board'
+import type { FlightCard } from '../flight/board'
 import { wizardApp } from './wizard'
 import { isOnboardingComplete } from './settings'
 import { loadBrainView, brainBody, regimeBadgeClass, loadBrainPhysics } from './brain'
