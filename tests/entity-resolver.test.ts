@@ -80,18 +80,31 @@ describe('entity-resolver — fail-closed short-UUID prefix resolution', () => {
     }
   })
 
-  it('integration: getSquad and getTask propagate ambiguous status code and candidates instead of flattening to not_found', async () => {
-    const { resolveEntity } = await import('../src/lib/entity-resolver')
-    const squadRes = await resolveEntity(mockEnv, 'squads', 'ambig123')
-    expect(squadRes.ok).toBe(false)
-    if (!squadRes.ok) {
-      expect(squadRes.reason).toBe('ambiguous')
+  it('integration: getSquad, getAgent, and getTask propagate 409 ambiguous status and candidates instead of flattening to 404 not_found', async () => {
+    const { getSquad, getAgent, getTask } = await import('../src/mcp/index')
+
+    const squadOutcome = await getSquad(mockEnv, 'ambig123')
+    expect(squadOutcome.ok).toBe(false)
+    if (!squadOutcome.ok) {
+      expect(squadOutcome.status).toBe(409)
+      expect(squadOutcome.error).toBe('ambiguous_squad_id')
+      expect((squadOutcome.detail as { candidates: string[] }).candidates.length).toBe(2)
     }
 
-    const taskRes = await resolveEntity(mockEnv, 'tasks', 'ambig123')
-    expect(taskRes.ok).toBe(false)
-    if (!taskRes.ok) {
-      expect(taskRes.reason).toBe('ambiguous')
+    const agentOutcome = await getAgent(mockEnv, 'ambig123')
+    expect(agentOutcome.ok).toBe(false)
+    if (!agentOutcome.ok) {
+      expect(agentOutcome.status).toBe(409)
+      expect(agentOutcome.error).toBe('ambiguous_agent_id')
+      expect((agentOutcome.detail as { candidates: string[] }).candidates.length).toBe(2)
+    }
+
+    const taskOutcome = await getTask(mockEnv, 'ambig123')
+    expect(taskOutcome.ok).toBe(false)
+    if (!taskOutcome.ok) {
+      expect(taskOutcome.status).toBe(409)
+      expect(taskOutcome.error).toBe('ambiguous_task_id')
+      expect((taskOutcome.detail as { candidates: string[] }).candidates.length).toBe(2)
     }
   })
 })

@@ -413,7 +413,7 @@ async function loadSquad(env: Env, squadId: string): Promise<Squad | null> {
   return res.ok ? res.entity : null
 }
 
-async function getSquad(env: Env, squadRef: string): Promise<{ ok: true; squad: Squad } | Extract<ToolOutcome, { ok: false }>> {
+export async function getSquad(env: Env, squadRef: string): Promise<{ ok: true; squad: Squad } | Extract<ToolOutcome, { ok: false }>> {
   const { resolveSquadEntity } = await import('../lib/entity-resolver')
   const res = await resolveSquadEntity(env, squadRef)
   if (!res.ok) {
@@ -431,7 +431,7 @@ async function loadAgent(env: Env, agentId: string): Promise<Agent | null> {
   return res.ok ? res.entity : null
 }
 
-async function getAgent(env: Env, agentRef: string): Promise<{ ok: true; agent: Agent } | Extract<ToolOutcome, { ok: false }>> {
+export async function getAgent(env: Env, agentRef: string): Promise<{ ok: true; agent: Agent } | Extract<ToolOutcome, { ok: false }>> {
   const { resolveAgentEntity } = await import('../lib/entity-resolver')
   const res = await resolveAgentEntity(env, agentRef)
   if (!res.ok) {
@@ -567,7 +567,7 @@ async function loadTask(env: Env, taskId: string): Promise<Task | null> {
   return res.ok ? res.entity : null
 }
 
-async function getTask(env: Env, taskRef: string): Promise<{ ok: true; task: Task } | Extract<ToolOutcome, { ok: false }>> {
+export async function getTask(env: Env, taskRef: string): Promise<{ ok: true; task: Task } | Extract<ToolOutcome, { ok: false }>> {
   const { resolveTaskEntity } = await import('../lib/entity-resolver')
   const res = await resolveTaskEntity(env, taskRef)
   if (!res.ok) {
@@ -1844,8 +1844,9 @@ const toolFlightDispatch: ToolSpec = {
       return fail(400, 'invalid_flight_budget')
     }
 
-    const squad = await loadSquad(env, squadId)
-    if (!squad) return fail(403, 'forbidden')
+    const squadRes = await getSquad(env, squadId)
+    if (!squadRes.ok) return squadRes
+    const squad = squadRes.squad
     const grants = auth.capabilities ?? []
     const workspaceAdmin = hasWorkspaceAdmin(auth)
 
@@ -2166,8 +2167,9 @@ const toolFlightList: ToolSpec = {
   async run(auth, env, args) {
     const squadId = str(args.squad_id)
     if (!squadId) return fail(400, 'invalid_args')
-    const squad = await loadSquad(env, squadId)
-    if (!squad) return fail(403, 'forbidden')
+    const squadRes = await getSquad(env, squadId)
+    if (!squadRes.ok) return squadRes
+    const squad = squadRes.squad
     const grants = auth.capabilities ?? []
     const workspaceAdmin = hasWorkspaceAdmin(auth)
     if (!workspaceAdmin && !(await memberCanOnSquad(env, grants, squad.id, 'observer'))) {
