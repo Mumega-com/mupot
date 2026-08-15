@@ -389,6 +389,20 @@ export async function loadFleetRadar(
   const agents = (agentRows.results ?? []).filter((a) => !accessibleSet || accessibleSet.has(a.squad_id))
   const squads = (squadRows.results ?? []).filter((s) => !accessibleSet || accessibleSet.has(s.id))
 
+  const agentSquadMap = new Map<string, string>()
+  for (const a of agentRows.results ?? []) {
+    agentSquadMap.set(a.id, a.squad_id)
+    agentSquadMap.set(a.slug, a.squad_id)
+  }
+
+  const scopedFlights = (flights ?? []).filter((f) => {
+    if (!accessibleSet) return true
+    const sIds = flightSquadIds(f) ?? (
+      agentSquadMap.has(f.agent) ? [agentSquadMap.get(f.agent)!] : []
+    )
+    return sIds.some((id) => accessibleSet.has(id))
+  })
+
   return buildFleetRadar({
     nowMs,
     agents,
@@ -398,7 +412,7 @@ export async function loadFleetRadar(
     fleetRuntimeRows,
     presence,
     recentTasks,
-    flights,
+    flights: scopedFlights,
     presenceTtlSec: presenceTtlSec(env),
   })
 }

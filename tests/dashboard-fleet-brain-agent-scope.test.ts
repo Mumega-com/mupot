@@ -90,6 +90,9 @@ async function makeHarness(): Promise<SqliteD1Harness> {
     INSERT INTO presence (tenant, member_id, display_name, source, label, agent_id, first_seen_at, last_seen_at) VALUES
       ('pot-a', 'member-squad-a', 'Squad A Member', 'claude-code', 'build', 'agent-a', datetime('now'), datetime('now')),
       ('pot-a', 'member-squad-b', 'Squad B Member', 'claude-code', 'build', 'agent-b', datetime('now'), datetime('now'));
+
+    INSERT INTO flights (id, tenant, agent, dispatched_by_agent_id, goal, status, trigger_source, created_at, started_at) VALUES
+      ('flight-stalled-b', 'pot-a', 'agent-b', 'agent-b', 'SQUAD-B-SECRET-FLIGHT-GOAL', 'running', 'manual', 1000, 1000);
   `)
   const env = { DB: harness.db, TENANT_SLUG: 'pot-a' } as unknown as Env
   await createLoop(env, { ...VALID_SPEC, squad_id: 'squad-a', agent_id: null, okr: 'SQUAD-A-ONLY-OKR-TEXT' })
@@ -210,6 +213,26 @@ describe('FLIGHT-001 #797 — /fleet, /brain, /agents/:id squad scoping (real SQ
     const data = await res.json() as { agents: Array<{ agent_id: string; display: string }>; squads: Array<{ squad_id: string; name: string }> }
     expect(data.agents.map(a => a.agent_id)).toEqual(['agent-b'])
     expect(data.squads.map(s => s.squad_id)).toEqual(['squad-b'])
+  })
+
+  it('squad-a member: 200 on GET /radar?format=json, stale_signals excludes Squad B stalled flight', async () => {
+    harness = await makeHarness()
+    const env = envFor(harness, { 'sess:s-squad-a': sessionRecord('squad-a@pot.test') })
+    const res = await dashboardApp.fetch(req('/radar?format=json', 's-squad-a'), env)
+    expect(res.status).toBe(200)
+    const data = await res.json() as { summary: { stale_signals?: Array<{ id: string; detail: string }> } }
+    const signals = data.summary?.stale_signals || []
+    expect(signals.some(s => s.detail?.includes('SQUAD-B-SECRET-FLIGHT-GOAL') || s.id === 'flight-stalled-b')).toBe(false)
+  })
+
+  it('squad-b member: 200 on GET /radar?format=json, stale_signals INCLUDES Squad B stalled flight', async () => {
+    harness = await makeHarness()
+    const env = envFor(harness, { 'sess:s-squad-b': sessionRecord('squad-b@pot.test') })
+    const res = await dashboardApp.fetch(req('/radar?format=json', 's-squad-b'), env)
+    expect(res.status).toBe(200)
+    const data = await res.json() as { summary: { stale_signals?: Array<{ id: string; detail: string }> } }
+    const signals = data.summary?.stale_signals || []
+    expect(signals.some(s => s.detail?.includes('SQUAD-B-SECRET-FLIGHT-GOAL') && s.id === 'flight-stalled-b')).toBe(true)
   })
 
   it('org-scope capability: 200 on GET /radar?format=json, JSON returns ALL agents and squads', async () => {
