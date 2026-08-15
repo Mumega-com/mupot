@@ -3761,37 +3761,23 @@ function shell(
             <span class="nav-label">Projects</span>
           </a>
 
-          <!-- Flight Operations (collapsible) -->
-          <div class="nav-section">
-            <button class="nav-section-toggle" data-section="flights" onclick="navToggle('flights')">
-              <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M10 2v6M6 5l8 0M5 17l5-9 5 9M7.5 13h5"/></svg>
-              <span class="nav-label">Flight Operations</span>
-              <span class="nav-chevron" id="chev-flights"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="13" height="13"><path d="M6 4l4 4-4 4"/></svg></span>
-            </button>
-            <div class="nav-children" id="children-flights">
-              <a class="nav-child" href="/flights">Flights &amp; Missions</a>
-              <a class="nav-child" href="/radar">Fleet Radar (ATC)</a>
-              <a class="nav-child" href="/fleet">Active Fleet</a>
-              <a class="nav-child" href="/motherboard">Motherboard Map</a>
-              <a class="nav-child" href="/coordination">Control Tower</a>
-            </div>
-          </div>
+          <!-- Work -->
+          <a class="nav-link" href="/send">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><circle cx="5.5" cy="5.5" r="2"/><circle cx="5.5" cy="14.5" r="2"/><circle cx="14.5" cy="10" r="2"/><path d="M5.5 7.5v5M7.4 5.9 12.7 9.2M7.3 13.9 12.7 10.7"/></svg>
+            <span class="nav-label">Work</span>
+          </a>
 
-          <!-- Work & Tasks (collapsible) -->
-          <div class="nav-section">
-            <button class="nav-section-toggle" data-section="work" onclick="navToggle('work')">
-              <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><circle cx="5.5" cy="5.5" r="2"/><circle cx="5.5" cy="14.5" r="2"/><circle cx="14.5" cy="10" r="2"/><path d="M5.5 7.5v5M7.4 5.9 12.7 9.2M7.3 13.9 12.7 10.7"/></svg>
-              <span class="nav-label">Work &amp; Tasks</span>
-              <span class="nav-chevron" id="chev-work"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="13" height="13"><path d="M6 4l4 4-4 4"/></svg></span>
-            </button>
-            <div class="nav-children" id="children-work">
-              <a class="nav-child" href="/send">Task Dispatch</a>
-              <a class="nav-child" href="/dashboard/kanban">Kanban Board</a>
-              <a class="nav-child" href="/needs-you">Needs You</a>
-              <a class="nav-child" href="/approvals">Approvals</a>
-              <a class="nav-child" href="/verifications">Verifications</a>
-            </div>
-          </div>
+          <a class="nav-link" href="/needs-you">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M10 3.2a6.8 6.8 0 1 0 6.8 6.8"/><path d="M10 6.3v4.2l2.8 1.7"/><path d="M15.2 3.6v3.1h-3.1"/></svg>
+            <span class="nav-label">Needs You</span>
+          </a>
+
+          <!-- Approvals (with live badge) -->
+          <a class="nav-link" href="/approvals" id="nav-approvals">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M10 3 4.5 5.2v4.3c0 3.4 2.3 5.8 5.5 7 3.2-1.2 5.5-3.6 5.5-7V5.2z"/><path d="M7.6 10l1.7 1.7 3.1-3.4"/></svg>
+            <span class="nav-label">Approvals</span>
+            <span class="nav-badge" id="approvals-badge" style="display:none;">0</span>
+          </a>
 
           <!-- Organization (collapsible) -->
           <div class="nav-section">
@@ -3801,22 +3787,60 @@ function shell(
               <span class="nav-chevron" id="chev-org"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="13" height="13"><path d="M6 4l4 4-4 4"/></svg></span>
             </button>
             <div class="nav-children" id="children-org">
-              <a class="nav-child" href="/admin/divisions">Departments &amp; Squads</a>
+              <a class="nav-child" href="/admin/divisions">Departments</a>
+              <a class="nav-child" href="/admin/divisions">Squads</a>
               <a class="nav-child" href="/agents">Agents</a>
-              <a class="nav-child" href="/admin/members">People &amp; Roles</a>
             </div>
           </div>
 
-          <!-- Health & Observability -->
-          <a class="nav-link" href="/ops">
-            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M10 2v4"/><path d="M10 14v4"/><path d="M4.3 4.3l2.8 2.8"/><path d="m12.9 12.9 2.8 2.8"/><path d="M2 10h4"/><path d="M14 10h4"/><path d="m4.3 15.7 2.8-2.8"/><path d="m12.9 7.1 2.8-2.8"/><circle cx="10" cy="10" r="3"/></svg>
-            <span class="nav-label">Health &amp; Ops</span>
+          <!-- Work views (collapsible) -->
+          <div class="nav-section">
+            <button class="nav-section-toggle" data-section="work" onclick="navToggle('work')">
+              <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><circle cx="5.5" cy="5.5" r="2"/><circle cx="5.5" cy="14.5" r="2"/><circle cx="14.5" cy="10" r="2"/><path d="M5.5 7.5v5M7.4 5.9 12.7 9.2M7.3 13.9 12.7 10.7"/></svg>
+              <span class="nav-label">Work views</span>
+              <span class="nav-chevron" id="chev-work"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="13" height="13"><path d="M6 4l4 4-4 4"/></svg></span>
+            </button>
+            <div class="nav-children" id="children-work">
+              <a class="nav-child" href="/dashboard/kanban">Kanban board</a>
+              <a class="nav-child" href="/send">Tasks</a>
+              <a class="nav-child" href="/flights">Pull requests</a>
+              <a class="nav-child" href="/verifications">Verifications</a>
+            </div>
+          </div>
+
+          <!-- Fleet -->
+          <a class="nav-link" href="/fleet">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" width="17" height="17"><circle cx="10" cy="10" r="6.2"/><circle cx="10" cy="10" r="1.7" fill="currentColor" stroke="none"/></svg>
+            <span class="nav-label">Fleet</span>
           </a>
 
-          <!-- Addons -->
-          <a class="nav-link" href="/addons" id="nav-addons">
+          <!-- Radar (fleet + squad awareness map — #21/#23) -->
+          <a class="nav-link" href="/radar">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><circle cx="10" cy="10" r="7"/><circle cx="10" cy="10" r="1.4" fill="currentColor" stroke="none"/><path d="M10 3v2M10 15v2M3 10h2M15 10h2"/></svg>
+            <span class="nav-label">Radar</span>
+          </a>
+
+          <!-- Motherboard (Fractal Motherboard map — shipped in v0.29.0) -->
+          <a class="nav-link" href="/motherboard">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><rect x="3" y="3" width="14" height="14" rx="2"/><path d="M7 7h2v2H7zM11 7h2v2h-2zM7 11h2v2H7zM11 11h2v2h-2z"/></svg>
+            <span class="nav-label">Motherboard</span>
+          </a>
+
+          <!-- Health (operator console) -->
+          <a class="nav-link" href="/ops">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M10 2v4"/><path d="M10 14v4"/><path d="M4.3 4.3l2.8 2.8"/><path d="m12.9 12.9 2.8 2.8"/><path d="M2 10h4"/><path d="M14 10h4"/><path d="m4.3 15.7 2.8-2.8"/><path d="m12.9 7.1 2.8-2.8"/><circle cx="10" cy="10" r="3"/></svg>
+            <span class="nav-label">Health</span>
+          </a>
+
+          <a class="nav-link" href="/addons" id="nav-addons" hidden>
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M7.2 3.5v3.1a2.1 2.1 0 1 0 2.1 2.1h3.2v-2a1.9 1.9 0 1 1 3.8 0v2H17v6.1H9.3a2.1 2.1 0 1 0-2.1 2.1v-2.1H3.5V9h2.1a2.1 2.1 0 1 0 1.6-3.4V3.5z"/></svg>
             <span class="nav-label">Addons</span>
+          </a>
+
+          <!-- Control Tower (coordination departures board) -->
+          <a class="nav-link" href="/coordination">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M10 2v6M6 5l8 0M5 17l5-9 5 9M7.5 13h5"/></svg>
+            <span class="nav-label">Control Tower</span>
           </a>
 
           <!-- Economy (collapsible) -->
@@ -3837,13 +3861,19 @@ function shell(
           <!-- Members & access (tokens) -->
           <a class="nav-link" href="/members">
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><circle cx="7.3" cy="7.5" r="2.5"/><circle cx="13.6" cy="8.5" r="2"/><path d="M3.4 16c0-2.3 1.8-3.8 3.9-3.8s3.9 1.5 3.9 3.8M12.4 12.5c2 0 3.9 1.1 3.9 3.5"/></svg>
-            <span class="nav-label">Access Tokens</span>
+            <span class="nav-label">Access tokens</span>
+          </a>
+
+          <!-- People & roles (grants roster) -->
+          <a class="nav-link" href="/admin/members">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><circle cx="10" cy="6.5" r="2.6"/><path d="M4.5 16c0-2.6 2.5-4.3 5.5-4.3s5.5 1.7 5.5 4.3"/></svg>
+            <span class="nav-label">People &amp; roles</span>
           </a>
 
           <!-- Audit log -->
           <a class="nav-link" href="/audit">
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M5.5 3.5h6l3.5 3.5V16.5h-9.5z"/><path d="M11.3 3.5V7h3.4M7.5 10.5h5M7.5 13h5"/></svg>
-            <span class="nav-label">Audit Log</span>
+            <span class="nav-label">Audit log</span>
           </a>
 
           <!-- SOVEREIGNTY section label -->
