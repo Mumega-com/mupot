@@ -17,6 +17,7 @@ import { listFleetAgentRuntimeView } from '../fleet/registry'
 import { listPresence } from '../fleet/presence'
 import { loadMotherboardData } from './motherboard'
 import { listJourneys, buildDepartureBoard } from '../coordination/journeys'
+import { listRunners } from '../runners/service'
 import { loadBrainPhysics } from './brain'
 import type { PhysicsSnapshot } from './brain'
 import { loadTodaySpendScalar } from './economy'
@@ -40,8 +41,8 @@ export function makeMissionControlApp(shell: ShellFn) {
     const auth = c.get('auth')
 
     const tabParam = c.req.query('tab')
-    const activeTab: 'radar' | 'fleet' | 'motherboard' | 'departures' =
-      tabParam === 'fleet' || tabParam === 'motherboard' || tabParam === 'departures'
+    const activeTab: 'radar' | 'fleet' | 'motherboard' | 'departures' | 'tentacles' =
+      tabParam === 'fleet' || tabParam === 'motherboard' || tabParam === 'departures' || tabParam === 'tentacles'
         ? tabParam
         : 'radar'
 
@@ -51,7 +52,7 @@ export function makeMissionControlApp(shell: ShellFn) {
     }
     const tenant = c.req.query('tenant') ?? 'mumega.com'
 
-    const [radar, hostAgents, presence, motherboard, journeys, physics, spend] = await Promise.all([
+    const [radar, hostAgents, presence, motherboard, journeys, physics, spend, runners] = await Promise.all([
       loadFleetRadar(c.env, Date.now(), squadIds),
       listFleetAgentRuntimeView(c.env, Date.now(), squadIds),
       listPresence(c.env, Date.now(), squadIds),
@@ -59,12 +60,14 @@ export function makeMissionControlApp(shell: ShellFn) {
       listJourneys(c.env, { scope: 'live' }).catch(() => []),
       loadBrainPhysics(c.env),
       loadTodaySpendScalar(c.env),
+      listRunners(c.env, { squad_ids: squadIds, limit: 100 }),
     ])
 
     const accept = c.req.header('accept') ?? ''
     const wantsJson = c.req.query('format') === 'json' || (accept.includes('application/json') && !accept.includes('text/html'))
     if (wantsJson) {
       if (activeTab === 'motherboard') return c.json(motherboard)
+      if (activeTab === 'tentacles') return c.json({ runners })
       return c.json(radar)
     }
 
@@ -84,6 +87,7 @@ export function makeMissionControlApp(shell: ShellFn) {
       squadPanelHtml,
       motherboard,
       departures,
+      runners,
       activeTab,
     })
 
@@ -100,6 +104,7 @@ export function makeMissionControlApp(shell: ShellFn) {
   app.get('/motherboard', (c) => c.redirect('/radar?tab=motherboard', 301))
   app.get('/dashboard/motherboard', (c) => c.redirect('/radar?tab=motherboard', 301))
   app.get('/coordination', (c) => c.redirect('/radar?tab=departures', 301))
+  app.get('/tentacles', (c) => c.redirect('/radar?tab=tentacles', 301))
 
   return app
 }
