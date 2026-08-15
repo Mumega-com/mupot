@@ -23,6 +23,15 @@ function escapeHtml(str: string | null | undefined): string {
     .replace(/'/g, '&#039;')
 }
 
+function safeLogUrl(url: string | null | undefined): string | null {
+  if (!url) return null
+  const trimmed = url.trim()
+  if (/^https?:\/\//i.test(trimmed) || /^file:\/\/\//i.test(trimmed)) {
+    return trimmed
+  }
+  return null
+}
+
 export function renderTentaclesPanel(props: TentaclesViewProps): Html {
   const { runners, nowMs = Date.now() } = props
 
@@ -134,8 +143,8 @@ export function renderTentaclesPanel(props: TentaclesViewProps): Html {
 
                             <div style="margin-top: auto; padding-top: 0.5rem; border-top: 1px solid #1e293b; display: flex; align-items: center; justify-content: space-between; font-size: 0.7rem; color: #64748b;">
                               <span>Duration: ${durationSec}s</span>
-                              ${r.log_url
-                                ? html`<a href="${escapeHtml(r.log_url)}" target="_blank" rel="noopener noreferrer" style="color: #38bdf8; text-decoration: none; display: flex; align-items: center; gap: 0.25rem;">
+                              ${safeLogUrl(r.log_url)
+                                ? html`<a href="${safeLogUrl(r.log_url)!}" target="_blank" rel="noopener noreferrer" style="color: #38bdf8; text-decoration: none; display: flex; align-items: center; gap: 0.25rem;">
                                     View Log &rarr;
                                   </a>`
                                 : html`<span style="font-family: monospace; color: #475569;">${escapeHtml(r.id.slice(0, 8))}</span>`}

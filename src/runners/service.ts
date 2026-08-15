@@ -31,6 +31,16 @@ export async function recordRunner(
     throw new Error(`invalid_status: status must be one of 'running', 'landed', 'failed'`)
   }
 
+  if (input.log_url !== undefined && input.log_url !== null) {
+    const rawUrl = String(input.log_url).trim()
+    if (rawUrl.length > 0) {
+      const isAllowedScheme = /^https?:\/\//i.test(rawUrl) || /^file:\/\/\//i.test(rawUrl)
+      if (!isAllowedScheme) {
+        throw new Error('invalid_log_url: log_url must start with http://, https://, or file:///')
+      }
+    }
+  }
+
   const id = input.id || crypto.randomUUID()
   const tenant = env.TENANT_SLUG || 'mumega'
   const now = Date.now()

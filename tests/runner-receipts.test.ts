@@ -263,6 +263,14 @@ describe('Flight-004 Tentacles: Runner Receipts', () => {
 
     // Terminal status reversal rejected
     await expect(recordRunner(env, { id: 'run-locked', seat_agent_id: 'agent-a', name: 'test', task: 'test', status: 'running' }, 'agent-a')).rejects.toThrow('invalid_status_transition')
+
+    // Unsafe log_url schemes rejected (e.g. javascript:, data:, vbscript:)
+    await expect(recordRunner(env, { seat_agent_id: 'agent-a', name: 'test', task: 'test', status: 'running', log_url: 'javascript:alert(1)' })).rejects.toThrow('invalid_log_url')
+    await expect(recordRunner(env, { seat_agent_id: 'agent-a', name: 'test', task: 'test', status: 'running', log_url: 'data:text/html,<script>alert(1)</script>' })).rejects.toThrow('invalid_log_url')
+
+    // Safe log_url schemes allowed
+    const safeRun = await recordRunner(env, { seat_agent_id: 'agent-a', name: 'test', task: 'test', status: 'running', log_url: 'https://logs.mumega.com/run-1' })
+    expect(safeRun.log_url).toBe('https://logs.mumega.com/run-1')
   })
 })
 
