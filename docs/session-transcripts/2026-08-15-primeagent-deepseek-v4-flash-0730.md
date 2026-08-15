@@ -7235,7 +7235,7 @@ Findings (all in tests/, docs/, and one src/):
 
 The src/integrations/github-app.ts private-key finding is the one that matters — GitHub App private keys in source? Let me check whether it's a real key or a placeholder/test fixture. Also check the actual secret values (the report contains them — handle carefully, don't print raw).
 
-Let me examine the details of the findings — especially src/integrations/github-app.ts, and classify each as REAL vs fixture/placeholder. The file paths (tests/, docs superpowers) strongly suggest test fixtures. src/integrations/github-app.ts — could be a real private key that was committed (dangerous!) or a placeholder like "-----BEGIN RSA PRIVATE KEY-----\n...test...". Need to check.
+Let me examine the details of the findings — especially src/integrations/github-app.ts, and classify each as REAL vs fixture/placeholder. The file paths (tests/, docs superpowers) strongly suggest test fixtures. src/integrations/github-app.ts — could be a real private key that was committed (dangerous!) or a placeholder like "-----BEGIN <redacted> PRIVATE KEY-----\n...test...". Need to check.
 
 Let me analyze the report with context (file content at those commits, or the match line).
 ```
@@ -7279,7 +7279,7 @@ Classification of the 18 gitleaks findings:
 - `key_fingerprint: '6d4c5cc4...'` — test fixture fingerprint (64 hex, looks fake)
 - `AKIAABCDEFGHIJKLMNOP` — THE canonical fake AWS key (literally "ABCDEFGHIJKLMNOP")
 - JWT `eyJ<test-fixture-jwt-redacted>` — contains "signaturepart" — fake
-- `-----BEGIN PRIVATE KEY----- QUJDREVGR0hJSktMTU5PUFF...` — "ABCDEFGHIJKLMNOPQ" base64 — fake
+- `-----BEGIN <redacted> PRIVATE KEY----- QUJDREVGR0hJSktMTU5PUFF...` — "ABCDEFGHIJKLMNOPQ" base64 — fake
 - `ph-evt-abc123`, `growth.leads_7d`, `ghl_api_key_abc123xyz` — fake keys
 - `unminted/ambiguous` — false positive
 
