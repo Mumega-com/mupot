@@ -173,6 +173,12 @@ describe('classifyDeliveryOutcome', () => {
     expect(outcome.kind).toBe('delivered')
   })
 
+  it('a 202 with Hermes standard webhook format { status: "accepted", delivery_id: ... } -> delivered', async () => {
+    const resp = new Response(JSON.stringify({ status: 'accepted', route: 'mubot-inbox', delivery_id: '1786757015484' }), { status: 202 })
+    const outcome = await classifyDeliveryOutcome(resp, 'msg-123')
+    expect(outcome.kind).toBe('delivered')
+  })
+
   it('a 2xx from something that is NOT our endpoint (wrong/absent body) -> unexpected_response, NOT delivered', async () => {
     // This is the bare-`resp.ok` defect from bus_notify.ts, reproduced as a fixture: some
     // other server (a health check, a default nginx 200 page) answering on the hostname.
