@@ -408,23 +408,15 @@ export async function memberCanOnSquad(
 
 // ── d1 helpers (read-only lookups; allow-listed table names) ──────────────────
 async function loadSquad(env: Env, squadId: string): Promise<Squad | null> {
-  const row = await env.DB.prepare(
-    `SELECT id, department_id, slug, name, charter, budget_cap_cents, budget_window, created_at
-       FROM squads WHERE id = ?1 LIMIT 1`,
-  )
-    .bind(squadId)
-    .first<Squad>()
-  return row ?? null
+  const { resolveSquadEntity } = await import('../lib/entity-resolver')
+  const res = await resolveSquadEntity(env, squadId)
+  return res.ok ? res.entity : null
 }
 
 async function loadAgent(env: Env, agentId: string): Promise<Agent | null> {
-  const row = await env.DB.prepare(
-    `SELECT id, squad_id, slug, name, role, model, status, budget_cap_cents, budget_window, created_at
-       FROM agents WHERE id = ?1 LIMIT 1`,
-  )
-    .bind(agentId)
-    .first<Agent>()
-  return row ?? null
+  const { resolveAgentEntity } = await import('../lib/entity-resolver')
+  const res = await resolveAgentEntity(env, agentId)
+  return res.ok ? res.entity : null
 }
 
 async function loadMemberIdentity(env: Env, auth: AuthContext): Promise<{
@@ -546,13 +538,9 @@ function readConcepts(v: unknown): string[] | undefined | Extract<ToolOutcome, {
 }
 
 async function loadTask(env: Env, taskId: string): Promise<Task | null> {
-  const row = await env.DB.prepare(
-    `SELECT ${TASK_SELECT_COLUMNS}
-       FROM tasks WHERE id = ?1 LIMIT 1`,
-  )
-    .bind(taskId)
-    .first<Task>()
-  return row ?? null
+  const { resolveTaskEntity } = await import('../lib/entity-resolver')
+  const res = await resolveTaskEntity(env, taskId)
+  return res.ok ? res.entity : null
 }
 
 async function resolveTaskSquad(
@@ -984,6 +972,9 @@ const toolTaskUpdate: ToolSpec = {
       project_id: NULLABLE_STRING_SCHEMA,
       title: STRING_SCHEMA,
       body: STRING_SCHEMA,
+      result: STRING_SCHEMA,
+      note: STRING_SCHEMA,
+      reason: STRING_SCHEMA,
       done_when: STRING_SCHEMA,
       status: STRING_SCHEMA,
       priority: { type: ['string', 'null'], description: 'Rank, or null to return the task to UNTRIAGED.' },
@@ -1013,9 +1004,17 @@ const toolTaskUpdate: ToolSpec = {
       next.title = (args.title as string).trim()
       changed = true
     }
-    if (args.body !== undefined) {
-      if (typeof args.body !== 'string') return fail(400, 'invalid_body')
-      next.body = args.body
+    if (args.body !== undefined || args.result !== undefined || args.note !== undefined || args.reason !== undefined) {
+      const explicitBody = typeof args.body === 'string' ? args.body : existing.body ?? ''
+      const extraContent = [args.result, args.note, args.reason]
+        .filter((x): x is string => typeof x === 'string' && x.trim().length > 0)
+        .join('\n\n')
+      
+      const newBody = extraContent
+        ? (explicitBody ? `${explicitBody}\n\n${extraContent}` : extraContent)
+        : explicitBody
+
+      next.body = newBody
       changed = true
     }
     if (args.done_when !== undefined) {
@@ -1372,13 +1371,14 @@ const toolTaskVerdict: ToolSpec = {
   name: 'task_verdict',
   scope: 'squad (of the task)',
   min: 'member',
-  args: '{ task_id: string, verdict: "approved"|"rejected", note?: string, override_self_verdict?: boolean }',
+  args: '{ task_id: string, verdict: "approved"|"rejected", note?: string, reason?: string, override_self_verdict?: boolean }',
   inputSchema: {
     type: 'object',
     properties: {
       task_id: STRING_SCHEMA,
       verdict: STRING_SCHEMA,
       note: STRING_SCHEMA,
+      reason: STRING_SCHEMA,
       override_self_verdict: { type: 'boolean' },
     },
     required: ['task_id', 'verdict'],
@@ -1391,6 +1391,7 @@ const toolTaskVerdict: ToolSpec = {
     if (verdict !== 'approved' && verdict !== 'rejected') {
       return fail(400, 'invalid_verdict', { accepted: ['approved', 'rejected'] })
     }
+    const note = typeof args.note === 'string' ? args.note : (typeof args.reason === 'string' ? args.reason : undefined)
 
     const task = await loadTask(env, taskId)
     if (!task) return fail(404, 'task_not_found')
@@ -2022,13 +2023,15 @@ const toolFlightLand: ToolSpec = {
   name: 'flight_land',
   scope: 'self (bound agent own flight)',
   min: 'member',
-  args: '{ flight_id: string, cost_micro_usd: number, score?: number }',
+  args: '{ flight_id: string, cost_micro_usd: number, score?: number, note?: string, reason?: string }',
   inputSchema: {
     type: 'object',
     properties: {
       flight_id: STRING_SCHEMA,
       cost_micro_usd: OPTIONAL_NUMBER_SCHEMA,
       score: OPTIONAL_NUMBER_SCHEMA,
+      note: STRING_SCHEMA,
+      reason: STRING_SCHEMA,
     },
     required: ['flight_id', 'cost_micro_usd'],
     additionalProperties: false,
@@ -2039,18 +2042,26 @@ const toolFlightLand: ToolSpec = {
     if (!boundAgent) return fail(409, 'agent_binding_invalid')
     if (boundAgent.status !== 'active') return fail(409, 'agent_binding_inactive')
 
-    const flightId = str(args.flight_id)
+    const flightRef = str(args.flight_id)
     const costMicroUsd = args.cost_micro_usd
     const score = args.score
-    if (!flightId || !Number.isSafeInteger(costMicroUsd) || (costMicroUsd as number) < 0) {
+    if (!flightRef || !Number.isSafeInteger(costMicroUsd) || (costMicroUsd as number) < 0) {
       return fail(400, 'invalid_args')
     }
     if (score !== undefined && (typeof score !== 'number' || !Number.isFinite(score) || score < 0 || score > 1)) {
       return fail(400, 'invalid_flight_score')
     }
 
-    const flight = await getFlight(env, flightId)
-    if (!flight || flight.agent !== auth.boundAgentId) return fail(404, 'flight_not_found')
+    const { resolveFlightEntity } = await import('../lib/entity-resolver')
+    const flightRes = await resolveFlightEntity(env, flightRef)
+    if (!flightRes.ok) {
+      if (flightRes.reason === 'ambiguous') {
+        return fail(409, 'ambiguous_flight_id', { candidates: flightRes.candidates })
+      }
+      return fail(404, 'flight_not_found')
+    }
+    const flight = flightRes.entity
+    if (flight.agent !== auth.boundAgentId) return fail(404, 'flight_not_found')
     const meta = parseFlightMetaV1(parseJsonArg(flight.meta))
     if (!meta) return fail(404, 'flight_not_found')
     const squads = await loadFlightSquads(env, meta.squad_ids)
