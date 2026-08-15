@@ -1844,9 +1844,8 @@ const toolFlightDispatch: ToolSpec = {
       return fail(400, 'invalid_flight_budget')
     }
 
-    const squadRes = await getSquad(env, squadId)
-    if (!squadRes.ok) return squadRes
-    const squad = squadRes.squad
+    const squad = await loadSquad(env, squadId)
+    if (!squad) return fail(403, 'forbidden')
     const grants = auth.capabilities ?? []
     const workspaceAdmin = hasWorkspaceAdmin(auth)
 
@@ -2167,9 +2166,8 @@ const toolFlightList: ToolSpec = {
   async run(auth, env, args) {
     const squadId = str(args.squad_id)
     if (!squadId) return fail(400, 'invalid_args')
-    const squadRes = await getSquad(env, squadId)
-    if (!squadRes.ok) return squadRes
-    const squad = squadRes.squad
+    const squad = await loadSquad(env, squadId)
+    if (!squad) return fail(403, 'forbidden')
     const grants = auth.capabilities ?? []
     const workspaceAdmin = hasWorkspaceAdmin(auth)
     if (!workspaceAdmin && !(await memberCanOnSquad(env, grants, squad.id, 'observer'))) {
