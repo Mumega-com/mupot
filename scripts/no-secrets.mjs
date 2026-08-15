@@ -99,7 +99,7 @@ function scan(root) {
 
     // docs/session-transcripts/ — pre-redacted documentation, not code/config.
     // The publish pipeline redacts token prefixes/ids and PEM headers before push
-    // (2026-08-15 incident: a transcript quoting "-----BEGIN RSA PRIVATE KEY-----\n...test..."
+    // (2026-08-15 incident: a transcript quoting a PEM-header placeholder like "BEGIN·RSA·PRIVATE·KEY"
     // as a placeholder tripped this guard on main and blocked every rebase).
     // Transcripts legitimately quote security-pattern text, so line rules on this
     // class are false-positive noise; the guard's target is code and config.
