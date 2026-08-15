@@ -202,8 +202,7 @@ import { loadBrainView, brainBody, regimeBadgeClass, loadBrainPhysics } from './
 import type { PhysicsSnapshot } from './brain'
 import { loadGrowthView, growthBody } from './growth'
 import { loadFleetRadar } from './radar'
-import { radarPageBody } from './radar-view'
-import { loadMotherboardData, motherboardPageBody } from './motherboard'
+import { loadMotherboardData } from './motherboard'
 import { setLoopControl, isLoopControlAction } from '../loops/decisions'
 import { getLoop } from '../loops/service'
 import {
@@ -1247,77 +1246,72 @@ dashboardApp.get('/flights', async (c) => {
 // dashboard already uses everywhere else. GET /api/radar's own bearer check
 // (src/auth/member-bearer.ts resolveOrgAdmin) is NOT touched by this route —
 // it stays the canonical JSON surface for the brain / programmatic callers.
-// ?format=json (or an Accept: application/json request) returns the identical
-// FleetRadar JSON through this session-authed path for convenience.
+// ── mission-control (unified /radar, /fleet, /motherboard, /coordination surface — Flight-003B) ──
 dashboardApp.get('/radar', async (c) => {
   const auth = c.get('auth')
   if (!isOrgAdmin(auth)) {
-    return c.html(shell(c.env, 'Radar', errorBody('Fleet radar requires owner or admin.')), 403)
+    return c.html(shell(c.env, 'Mission Control', errorBody('Mission Control requires owner or admin.')), 403)
   }
-  const radar = await loadFleetRadar(c.env)
-  const accept = c.req.header('accept') ?? ''
-  const wantsJson = c.req.query('format') === 'json' || (accept.includes('application/json') && !accept.includes('text/html'))
-  if (wantsJson) return c.json(radar)
-  return c.html(shell(c.env, 'Radar', radarPageBody(radar)))
-})
 
-// ── motherboard (Fractal Motherboard Map visual topology engine — shipped in v0.29.0, planned as v0.28.0) ──
-dashboardApp.get('/motherboard', async (c) => {
-  const auth = c.get('auth') as AuthContext | undefined
-  const tenant = c.req.query('tenant') ?? 'mumega.com'
-  const data = await loadMotherboardData(c.env, tenant, auth)
-  const accept = c.req.header('accept') ?? ''
-  const wantsJson = c.req.query('format') === 'json' || (accept.includes('application/json') && !accept.includes('text/html'))
-  if (wantsJson) return c.json(data)
-  return c.html(shell(c.env, 'Fractal Motherboard', motherboardPageBody(data)))
-})
+  const tabParam = c.req.query('tab')
+  const activeTab: 'radar' | 'fleet' | 'motherboard' | 'departures' =
+    tabParam === 'fleet' || tabParam === 'motherboard' || tabParam === 'departures'
+      ? tabParam
+      : 'radar'
 
-dashboardApp.get('/dashboard/motherboard', async (c) => {
-  const auth = c.get('auth') as AuthContext | undefined
-  const tenant = c.req.query('tenant') ?? 'mumega.com'
-  const data = await loadMotherboardData(c.env, tenant, auth)
-  const accept = c.req.header('accept') ?? ''
-  const wantsJson = c.req.query('format') === 'json' || (accept.includes('application/json') && !accept.includes('text/html'))
-  if (wantsJson) return c.json(data)
-  return c.html(shell(c.env, 'Fractal Motherboard', motherboardPageBody(data)))
-})
-
-// ── fleet (CF-native roster — ADR gh #473; SOS bus retired from this path) ───
-// GET /fleet — pot check-in presence + signed host-control panel.
-// Wake/control POST endpoints below use agent_messages + Queue, not SOS Redis.
-//
-// FLIGHT-001 #797: this used to load listFleetAgentRuntimeView + listPresence
-// UNSCOPED — any caller who passed the dashboard's global capability floor
-// (FLIGHT-001 F2, #796; proves "belongs somewhere in this org", not "may see
-// THIS squad's agents") saw the FULL live-fleet roster and the full pot
-// check-in presence list, across every squad, not just their own. Both reads
-// are now scoped to resolveAccessibleSquadIds(auth): an org-scope grant (or
-// legacy owner/admin) sees everything; a squad/department grant sees only its
-// own squads' host agents + squadmates' presence.
-dashboardApp.get('/fleet', async (c) => {
-  const auth = c.get('auth')
   const squadIds = await resolveAccessibleSquadIds(c.env, auth)
-  const hostAgents = await listFleetAgentRuntimeView(c.env, Date.now(), squadIds)
+  const tenant = c.req.query('tenant') ?? 'mumega.com'
+
+  const [radar, hostAgents, presence, motherboard, journeys, physics, spend] = await Promise.all([
+    loadFleetRadar(c.env),
+    listFleetAgentRuntimeView(c.env, Date.now(), squadIds),
+    listPresence(c.env, Date.now(), squadIds),
+    loadMotherboardData(c.env, tenant, auth),
+    listJourneys(c.env, { scope: 'live' }).catch(() => []),
+    loadBrainPhysics(c.env),
+    loadTodaySpendScalar(c.env),
+  ])
+
+  const accept = c.req.header('accept') ?? ''
+  const wantsJson = c.req.query('format') === 'json' || (accept.includes('application/json') && !accept.includes('text/html'))
+  if (wantsJson) {
+    if (activeTab === 'motherboard') return c.json(motherboard)
+    return c.json(radar)
+  }
+
   const hostPanelOpts = {
     configured: !!c.env.FLEET_PANEL_SK && !!c.env.FLEET_CONSUMER_AGENT,
     canControl: auth.role === 'owner',
     flash: c.req.query('hc') ?? null,
   }
-  const hostPanel = hostAgentsPanel(hostAgents, hostPanelOpts)
-  const squadPanel = squadControlPanel(hostAgents, hostPanelOpts)
+  const hostPanelHtml = hostAgentsPanel(hostAgents, hostPanelOpts)
+  const squadPanelHtml = squadControlPanel(hostAgents, hostPanelOpts)
+  const departures = buildDepartureBoard(journeys, Date.now())
 
-  const [presence, physics, spend] = await Promise.all([
-    listPresence(c.env, Date.now(), squadIds),
-    loadBrainPhysics(c.env),
-    loadTodaySpendScalar(c.env),
-  ])
+  const { missionControlBody } = await import('./mission-control')
+  const body = missionControlBody({
+    radar,
+    presence,
+    hostPanelHtml,
+    squadPanelHtml,
+    motherboard,
+    departures,
+    activeTab,
+  })
+
   return c.html(
-    shell(c.env, 'Fleet', html`${hostPanel}${squadPanel}${potFleetBody(presence)}`, {
+    shell(c.env, 'Mission Control', body, {
       physics,
       costToday: { configured: spend.configured, todayUsdMicro: spend.today_usd_micro },
     }),
   )
 })
+
+// 301 / 302 backward-compatible redirects from legacy fleet views to consolidated Mission Control
+dashboardApp.get('/fleet', (c) => c.redirect('/radar?tab=fleet', 301))
+dashboardApp.get('/motherboard', (c) => c.redirect('/radar?tab=motherboard', 301))
+dashboardApp.get('/dashboard/motherboard', (c) => c.redirect('/radar?tab=motherboard', 301))
+dashboardApp.get('/coordination', (c) => c.redirect('/radar?tab=departures', 301))
 
 // Mount Kanban Sub-app
 dashboardApp.route('/', kanbanApp)
@@ -3808,22 +3802,10 @@ function shell(
             </div>
           </div>
 
-          <!-- Fleet -->
-          <a class="nav-link" href="/fleet">
-            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" width="17" height="17"><circle cx="10" cy="10" r="6.2"/><circle cx="10" cy="10" r="1.7" fill="currentColor" stroke="none"/></svg>
-            <span class="nav-label">Fleet</span>
-          </a>
-
-          <!-- Radar (fleet + squad awareness map — #21/#23) -->
+          <!-- Mission Control (unified Radar, Fleet, Motherboard, and Departures — Flight-003B) -->
           <a class="nav-link" href="/radar">
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><circle cx="10" cy="10" r="7"/><circle cx="10" cy="10" r="1.4" fill="currentColor" stroke="none"/><path d="M10 3v2M10 15v2M3 10h2M15 10h2"/></svg>
-            <span class="nav-label">Radar</span>
-          </a>
-
-          <!-- Motherboard (Fractal Motherboard map — shipped in v0.29.0) -->
-          <a class="nav-link" href="/motherboard">
-            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><rect x="3" y="3" width="14" height="14" rx="2"/><path d="M7 7h2v2H7zM11 7h2v2h-2zM7 11h2v2H7zM11 11h2v2h-2z"/></svg>
-            <span class="nav-label">Motherboard</span>
+            <span class="nav-label">Mission Control</span>
           </a>
 
           <!-- Health (operator console) -->
@@ -3835,12 +3817,6 @@ function shell(
           <a class="nav-link" href="/addons" id="nav-addons" hidden>
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M7.2 3.5v3.1a2.1 2.1 0 1 0 2.1 2.1h3.2v-2a1.9 1.9 0 1 1 3.8 0v2H17v6.1H9.3a2.1 2.1 0 1 0-2.1 2.1v-2.1H3.5V9h2.1a2.1 2.1 0 1 0 1.6-3.4V3.5z"/></svg>
             <span class="nav-label">Addons</span>
-          </a>
-
-          <!-- Control Tower (coordination departures board) -->
-          <a class="nav-link" href="/coordination">
-            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M10 2v6M6 5l8 0M5 17l5-9 5 9M7.5 13h5"/></svg>
-            <span class="nav-label">Control Tower</span>
           </a>
 
           <!-- Economy (collapsible) -->
@@ -5226,7 +5202,7 @@ export function controlTowerBody(cards: DepartureCard[]) {
     ${raw(table)}`
 }
 
-function potFleetBody(rows: PresenceView[]) {
+export function potFleetBody(rows: PresenceView[]) {
   // Heartbeat axis (cheap always-on agents): active/idle/dead/never.
   const dot = (l: string) =>
     l === 'active' ? 'var(--ok)' : l === 'idle' ? 'var(--warn)' : l === 'dead' ? '#e5534b' : 'var(--dim)'
