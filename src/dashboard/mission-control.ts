@@ -14,6 +14,7 @@ import type { MotherboardViewData } from './motherboard'
 import type { DepartureCard } from '../coordination/journeys'
 import { renderBrainImage, renderAgentCard } from './radar-view'
 import { motherboardPageBody } from './motherboard'
+import { potFleetBody, controlTowerBody } from './index'
 
 export interface MissionControlData {
   radar: FleetRadar
@@ -119,65 +120,12 @@ export function missionControlBody(data: MissionControlData): Html {
         ? html`
             ${hostPanelHtml}
             ${squadPanelHtml}
-            <div class="card" style="margin-top:16px">
-              <h2 style="margin-top:0">Check-in Presence</h2>
-              ${
-                presence.length
-                  ? html`
-                      <table class="table" style="width:100%">
-                        <thead>
-                          <tr>
-                            <th>Member / Agent</th>
-                            <th>Source</th>
-                            <th>Label</th>
-                            <th>Last Seen</th>
-                            <th>Liveness</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          ${presence.map((p) => html`
-                            <tr>
-                              <td><strong>${p.display_name}</strong> <span style="font-size:11px;color:var(--dim)">(${p.agent_id ?? p.member_id})</span></td>
-                              <td><span class="badge">${p.source}</span></td>
-                              <td>${p.label || '—'}</td>
-                              <td>${p.last_seen_human}</td>
-                              <td><span class="badge">${p.liveness}</span></td>
-                            </tr>
-                          `)}
-                        </tbody>
-                      </table>
-                    `
-                  : html`<p class="empty">No active agent presence heartbeats detected.</p>`
-              }
-            </div>
+            ${potFleetBody(presence)}
           `
         : activeTab === 'motherboard'
         ? motherboardPageBody(motherboard)
         : html`
-            <div class="card">
-              <h2 style="margin-top:0">Departures & Flight Journeys</h2>
-              ${
-                departures.length
-                  ? html`
-                      <div class="radar-grid">
-                        ${departures.map((d) => html`
-                          <div class="card" style="padding:12px 14px">
-                            <div style="font-weight:600">${d.agent} &rarr; ${d.project}</div>
-                            <div style="font-size:12px;color:var(--dim);margin:4px 0">${d.goal}</div>
-                            <div style="font-size:11px;display:flex;justify-content:space-between">
-                              <span>Phase: <strong style="color:var(--primary)">${d.phase}</strong></span>
-                              <span>Gate: <code>${d.gate}</code></span>
-                            </div>
-                            <div style="font-size:11px;color:var(--dim);margin-top:4px">
-                              ETA: ${d.eta} &bull; Departed: ${d.departed}
-                            </div>
-                          </div>
-                        `)}
-                      </div>
-                    `
-                  : html`<p class="empty">No flights on the board. Agents board flights at <code>POST /api/coordination</code>.</p>`
-              }
-            </div>
+            ${controlTowerBody(departures)}
           `
     }
   `

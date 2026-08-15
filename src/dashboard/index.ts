@@ -1423,21 +1423,6 @@ dashboardApp.post('/fleet/control', async (c) => {
   return c.json(r, r.ok ? 200 : 400)
 })
 
-// ── Control Tower (coordination departures board) ────────────────────────────
-// GET /coordination — which agent flies to which project, when, what status. Read-only,
-// any authenticated pot member. Agents board flights at POST /api/coordination.
-dashboardApp.get('/coordination', async (c) => {
-  const scope = c.req.query('scope') === 'all' ? 'all' : 'live'
-  // Render even if the read fails — an empty board, never a raw 500 with a stack.
-  let cards: DepartureCard[] = []
-  try {
-    cards = buildDepartureBoard(await listJourneys(c.env, { scope }), Date.now())
-  } catch {
-    cards = []
-  }
-  return c.html(shell(c.env, 'Control Tower', controlTowerBody(cards)))
-})
-
 // ── /agents — unified agent management ───────────────────────────────────────
 //
 // Owner/admin gated on every mutating path (create, status, delete).
