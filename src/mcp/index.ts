@@ -1391,7 +1391,6 @@ const toolTaskVerdict: ToolSpec = {
     if (verdict !== 'approved' && verdict !== 'rejected') {
       return fail(400, 'invalid_verdict', { accepted: ['approved', 'rejected'] })
     }
-    const note = typeof args.note === 'string' ? args.note : (typeof args.reason === 'string' ? args.reason : undefined)
 
     const task = await loadTask(env, taskId)
     if (!task) return fail(404, 'task_not_found')
@@ -1436,7 +1435,9 @@ const toolTaskVerdict: ToolSpec = {
     // different-principal rule is waived for exactly this capability (the caller
     // still had to pass callerHoldsGateCapability above; every other gate keeps
     // the self_verdict 409). Mirrors the HTTP twin in src/tasks/index.ts.
-    let note = typeof args.note === 'string' ? args.note : null
+    let note: string | null = typeof args.note === 'string'
+      ? args.note
+      : (typeof args.reason === 'string' ? args.reason : null)
     const isSelfCompletionGate = task.gate_owner === 'gate:agent-self-completion'
     if (principal.id === task.assignee_agent_id && !isSelfCompletionGate) {
       const isOrgOwner = auth.role === 'owner'
