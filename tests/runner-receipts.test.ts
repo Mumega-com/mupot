@@ -271,6 +271,35 @@ describe('Flight-004 Tentacles: Runner Receipts', () => {
     // Safe log_url schemes allowed
     const safeRun = await recordRunner(env, { seat_agent_id: 'agent-a', name: 'test', task: 'test', status: 'running', log_url: 'https://logs.mumega.com/run-1' })
     expect(safeRun.log_url).toBe('https://logs.mumega.com/run-1')
+
+    // Cross-squad mismatch rejected
+    await expect(recordRunner(env, { seat_agent_id: 'agent-a', squad_id: 'squad-b', name: 'test', task: 'test', status: 'running' })).rejects.toThrow('forbidden_cross_squad_mutation')
+  })
+
+  it('kill-witness: unbound member token cannot record for foreign seat agent (403)', async () => {
+    const harness = await makeHarness()
+    const env = envFor(harness)
+
+    const authSquadA: AuthContext = {
+      userId: 'member-a',
+      tenant: 'mumega',
+      channel: 'workspace',
+      memberId: 'member-a',
+      role: 'member',
+      capabilities: [{ type: 'squad', id: 'squad-a', capability: 'member' }],
+    }
+
+    // Unbound member on squad-a tries to record for agent-b (squad-b) -> 403
+    const res = await mcpApp.fetch(
+      mcpRequest('runner_record', {
+        seat_agent_id: 'agent-b',
+        name: 'test-unbound',
+        task: 'fabricated evidence',
+        status: 'landed',
+      }, authSquadA),
+      env,
+    )
+    expect(res.status).toBe(403)
   })
 })
 

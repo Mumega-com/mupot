@@ -42,6 +42,27 @@ export const toolRunnerRecord: ToolSpec = {
       return fail(400, 'invalid_status')
     }
 
+    // Require boundAgentId (seat agent) or squad lead/admin/org-admin capability
+    if (!callerAgentId) {
+      const targetSeat = str(args.seat_agent_id)
+      if (!targetSeat) {
+        return fail(403, 'forbidden: seat_agent_id required for unbound caller')
+      }
+      const accessibleSquads = await resolveAccessibleSquadIds(env, auth)
+      // Check if targetSeat belongs to an accessible squad
+      const agentRow = await env.DB.prepare('SELECT squad_id FROM agents WHERE id = ?1 OR slug = ?1 LIMIT 1')
+        .bind(targetSeat)
+        .first<{ squad_id: string | null }>()
+      if (!agentRow) {
+        return fail(404, 'agent_not_found')
+      }
+      if (accessibleSquads !== null) {
+        if (!agentRow.squad_id || !accessibleSquads.includes(agentRow.squad_id)) {
+          return fail(403, 'forbidden: cannot record runner for agent outside accessible squads')
+        }
+      }
+    }
+
     try {
       const receipt = await recordRunner(
         env,

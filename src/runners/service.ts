@@ -59,13 +59,15 @@ export async function recordRunner(
   const startedAt = input.started_at ?? (existing ? existing.started_at : now)
   const endedAt = input.ended_at !== undefined ? input.ended_at : (input.status === 'landed' || input.status === 'failed' ? (existing?.ended_at ?? now) : null)
 
-  let squadId = input.squad_id ?? (existing ? existing.squad_id : undefined)
-  if (squadId === undefined) {
-    const agentRow = await env.DB.prepare('SELECT squad_id FROM agents WHERE id = ?1 OR slug = ?1 LIMIT 1')
-      .bind(seatAgentId)
-      .first<{ squad_id: string | null }>()
-    squadId = agentRow?.squad_id ?? null
+  const agentRow = await env.DB.prepare('SELECT squad_id FROM agents WHERE id = ?1 OR slug = ?1 LIMIT 1')
+    .bind(seatAgentId)
+    .first<{ squad_id: string | null }>()
+  const authoritativeSquadId = agentRow ? agentRow.squad_id : null
+
+  if (input.squad_id && authoritativeSquadId && input.squad_id !== authoritativeSquadId) {
+    throw new Error('forbidden_cross_squad_mutation: squad_id does not match seat agent squad')
   }
+  const squadId = authoritativeSquadId ?? input.squad_id ?? (existing ? existing.squad_id : null)
 
   await env.DB.prepare(
     `INSERT INTO runner_receipts (
