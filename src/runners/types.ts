@@ -31,6 +31,11 @@ export interface RecordRunnerInput {
   evidence_summary?: string | null
   verdict_line?: string | null
   log_url?: string | null
+  // Optional provenance signature (Flight-005 Slice 2b). When present, verified
+  // server-side against the seat's active Ed25519 key; absent = bearer-bound.
+  sig?: string
+  sig_ts?: number
+  sig_nonce?: string
 }
 
 export interface ListRunnersFilter {

@@ -2,6 +2,7 @@
 
 import type { Env } from '../types'
 import type { RunnerReceipt, RecordRunnerInput, ListRunnersFilter, RunnerStatus } from './types'
+import { verifyRunnerReceiptSig } from './signature'
 
 const VALID_STATUSES: Set<RunnerStatus> = new Set(['running', 'landed', 'failed'])
 
@@ -45,6 +46,20 @@ export async function recordRunner(
   const tenant = env.TENANT_SLUG || 'mumega'
   const now = Date.now()
 
+  // Optional provenance signature (Flight-005 Slice 2b). If ANY sig field is
+  // present, all three are required and the signature must verify against the
+  // seat's active Ed25519 key. Absent signature = strict bearer-bound clamping.
+  if (input.sig !== undefined || input.sig_ts !== undefined || input.sig_nonce !== undefined) {
+    if (typeof input.sig !== 'string' || typeof input.sig_ts !== 'number' || typeof input.sig_nonce !== 'string') {
+      throw new Error('invalid_signature: sig, sig_ts and sig_nonce must all be present')
+    }
+    await verifyRunnerReceiptSig(env, seatAgentId, input.name, input.task, input.status, {
+      sig: input.sig,
+      sig_ts: input.sig_ts,
+      sig_nonce: input.sig_nonce,
+    })
+  }
+
   // Check existing row if updating by ID
   const existing = await env.DB.prepare('SELECT * FROM runner_receipts WHERE id = ?1').bind(id).first<RunnerReceipt>()
   if (existing) {
@@ -62,15 +77,22 @@ export async function recordRunner(
   const startedAt = input.started_at ?? (existing ? existing.started_at : now)
   const endedAt = input.ended_at !== undefined ? input.ended_at : (input.status === 'landed' || input.status === 'failed' ? (existing?.ended_at ?? now) : null)
 
+  // PROVENANCE (Flight-005 Slice 2b): seat + squad are authoritative from the
+  // authenticated context and D1, never from caller-supplied foreign keys.
   const agentRow = await env.DB.prepare('SELECT squad_id FROM agents WHERE id = ?1 OR slug = ?1 LIMIT 1')
     .bind(seatAgentId)
     .first<{ squad_id: string | null }>()
-  const authoritativeSquadId = agentRow ? agentRow.squad_id : null
+  if (!agentRow) {
+    throw new Error('seat_agent_not_found: seat_agent_id must resolve to a registered agent')
+  }
+  const authoritativeSquadId = agentRow.squad_id
 
-  if (input.squad_id && authoritativeSquadId && input.squad_id !== authoritativeSquadId) {
+  // Reject any non-null caller-supplied squad_id that disagrees with the D1
+  // authoritative squad (a null means "derive it", matching the previous API).
+  if (input.squad_id != null && input.squad_id !== authoritativeSquadId) {
     throw new Error('forbidden_cross_squad_mutation: squad_id does not match seat agent squad')
   }
-  const squadId = authoritativeSquadId ?? input.squad_id ?? (existing ? existing.squad_id : null)
+  const squadId = authoritativeSquadId
 
   await env.DB.prepare(
     `INSERT INTO runner_receipts (
