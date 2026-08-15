@@ -261,8 +261,18 @@ describe('Flight-004 Tentacles: Runner Receipts', () => {
     // Cross-seat mutation rejected
     await expect(recordRunner(env, { id: 'run-locked', seat_agent_id: 'agent-b', name: 'test', task: 'test', status: 'landed' }, 'agent-b')).rejects.toThrow('forbidden_cross_seat_mutation')
 
-    // Terminal status reversal rejected
-    await expect(recordRunner(env, { id: 'run-locked', seat_agent_id: 'agent-a', name: 'test', task: 'test', status: 'running' }, 'agent-a')).rejects.toThrow('invalid_status_transition')
+    // Terminal status reversal (re-open to running) rejected
+    await expect(recordRunner(env, { id: 'run-locked', seat_agent_id: 'agent-a', name: 'test', task: 'test', status: 'running' }, 'agent-a')).rejects.toThrow('receipt_locked')
+
+    // Terminal status flip (landed -> failed) rejected
+    await expect(recordRunner(env, { id: 'run-locked', seat_agent_id: 'agent-a', name: 'test', task: 'test', status: 'failed' }, 'agent-a')).rejects.toThrow('receipt_locked')
+
+    // Terminal evidence rewrite (landed -> landed with new evidence) rejected
+    await expect(recordRunner(env, { id: 'run-locked', seat_agent_id: 'agent-a', name: 'test', task: 'test', status: 'landed', evidence_summary: 'tampered' }, 'agent-a')).rejects.toThrow('receipt_locked')
+
+    // failed -> landed flip rejected
+    await recordRunner(env, { id: 'run-failed-lock', seat_agent_id: 'agent-a', name: 'test', task: 'test', status: 'failed' }, 'agent-a')
+    await expect(recordRunner(env, { id: 'run-failed-lock', seat_agent_id: 'agent-a', name: 'test', task: 'test', status: 'landed' }, 'agent-a')).rejects.toThrow('receipt_locked')
 
     // Unsafe log_url schemes rejected (e.g. javascript:, data:, vbscript:)
     await expect(recordRunner(env, { seat_agent_id: 'agent-a', name: 'test', task: 'test', status: 'running', log_url: 'javascript:alert(1)' })).rejects.toThrow('invalid_log_url')

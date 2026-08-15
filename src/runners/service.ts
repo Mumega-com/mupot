@@ -51,8 +51,11 @@ export async function recordRunner(
     if (existing.seat_agent_id !== seatAgentId) {
       throw new Error('forbidden_cross_seat_mutation: cannot modify runner receipt owned by another seat')
     }
-    if ((existing.status === 'landed' || existing.status === 'failed') && input.status === 'running') {
-      throw new Error('invalid_status_transition: terminal runner receipts (landed/failed) cannot revert to running')
+    // Status lock (Flight-005): a terminal receipt is immutable evidence. Once
+    // landed/failed, the owning seat cannot flip the status, re-open to running,
+    // or rewrite evidence — any further mutation throws.
+    if (existing.status === 'landed' || existing.status === 'failed') {
+      throw new Error('receipt_locked: terminal runner receipts (landed/failed) are immutable')
     }
   }
 
