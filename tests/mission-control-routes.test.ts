@@ -112,10 +112,12 @@ describe('Mission Control & Fleet Consolidation (Flight-003B)', () => {
     expect(res.headers.get('Location')).toBe('/radar?tab=departures')
   })
 
-  it('GET /radar is accessible to regular members (non-admin capability floor)', async () => {
+  it('GET /radar is accessible to squad-capable regular members (200, non-admin capability floor)', async () => {
     const { harness, env, sessionStore } = makeEnv()
     const memberId = 'member-regular'
     harness.sqlite.exec(`
+      INSERT INTO departments (id, slug, name) VALUES ('dept-1', 'dept-1', 'Department 1');
+      INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-1', 'dept-1', 'squad-1', 'Squad 1');
       INSERT INTO members (id, email, display_name, status, tenant) VALUES ('${memberId}', 'regular@example.com', 'Regular Member', 'active', 'mumega');
       INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-reg', '${memberId}', 'squad', 'squad-1', 'member');
     `)
@@ -140,5 +142,32 @@ describe('Mission Control & Fleet Consolidation (Flight-003B)', () => {
     expect(res.status).toBe(200)
     const text = await res.text()
     expect(text).toContain('Mission Control')
+  })
+
+  it('GET /radar returns 403 for zero-capability members (fail-closed authz floor)', async () => {
+    const { harness, env, sessionStore } = makeEnv()
+    const memberId = 'member-zero'
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status, tenant) VALUES ('${memberId}', 'zero@example.com', 'Zero Member', 'active', 'mumega');
+    `)
+
+    sessionStore.set('sess:tok-zero', JSON.stringify({
+      userId: memberId,
+      email: 'zero@example.com',
+      role: 'member',
+      createdAt: new Date().toISOString(),
+    }))
+
+    const req = new Request('http://localhost/radar', {
+      headers: {
+        cookie: 'mupot_session=tok-zero',
+      },
+    })
+    const res = await dashboardApp.fetch(req, env, {
+      waitUntil: () => {},
+      passThroughOnException: () => {},
+    } as unknown as ExecutionContext)
+
+    expect(res.status).toBe(403)
   })
 })
