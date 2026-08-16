@@ -7,6 +7,7 @@ import {
   type AgentConnectionIssued,
 } from '../src/members/agent-connection'
 import { loadAgentConnectionStatus } from '../src/members/agent-connection-status'
+import { revealCredentialClaim } from '../src/auth/credential-claim'
 import type { AuthContext, CapabilityGrant, Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
@@ -62,14 +63,24 @@ describe('agent connection public status', () => {
       DB: harness.db,
       TENANT_SLUG: TENANT,
       PUBLIC_ORIGIN: 'https://pot.example',
-      SESSIONS: {
-        get: async () => JSON.stringify({
+      // mupot#987: provisionAgentConnection below stores the raw credential
+      // behind a one-time SESSIONS-KV claim (src/auth/credential-claim.ts) — a
+      // real in-memory store, not a fixed-response stub, with the SAME
+      // owner-session fallback the old stub always returned for any other key.
+      SESSIONS: (() => {
+        const store = new Map<string, string>()
+        const fallback = JSON.stringify({
           userId: 'owner-1',
           email: null,
           role: 'owner',
           createdAt: NOW.toISOString(),
-        }),
-      },
+        })
+        return {
+          async get(key: string) { return store.has(key) ? (store.get(key) as string) : fallback },
+          async put(key: string, value: string) { store.set(key, value) },
+          async delete(key: string) { store.delete(key) },
+        }
+      })(),
     } as unknown as Env
     const outcome = await provisionAgentConnection(env, {
       kind: 'user',
@@ -131,7 +142,11 @@ describe('agent connection public status', () => {
     })
     if (!result.ok) throw new Error(result.error)
     const serialized = JSON.stringify(result.value)
-    expect(serialized).not.toContain(issued.credential.raw)
+    // mupot#987: reveal the claim (the only sanctioned path to the raw value)
+    // and prove the status snapshot doesn't leak it either.
+    const revealed = await revealCredentialClaim(env, issued.credential.claim.claim_id, 'owner-1')
+    if (!revealed.ok) throw new Error('expected reveal to succeed')
+    expect(serialized).not.toContain(revealed.raw)
     expect(serialized).not.toContain(issued.verification.challenge)
     expect(serialized).not.toContain(issued.receipt.verification_challenge_hash as string)
     expect(serialized).not.toContain(issued.receipt.actor_id)

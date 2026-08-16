@@ -70,9 +70,72 @@ describe('bootstrap_self via invokeTool — an unbound directory session with ZE
     const out = await invokeTool(unboundDirectoryAuth(), env, 'bootstrap_self', { agent_name: 'Aria' }, 'https://pot.test')
     expect(out.ok).toBe(true)
     if (!out.ok) throw new Error(`expected success, got ${out.error}`)
-    const result = out.result as { agent: { name: string }; token: { raw: string } }
+    const result = out.result as {
+      agent: { name: string }
+      token: { id: string; capability: string }
+      credential_claim: { claim_id: string; fingerprint: string; expires_at: string }
+    }
     expect(result.agent.name).toBe('Aria')
-    expect(result.token.raw).toMatch(/^mupot_/)
+    // mupot#987: the raw token must never appear in this tool result — only a
+    // single-use claim. Structural proof (not a field-by-field allowlist): the
+    // string "raw" never appears as a key anywhere in the serialized result.
+    expect(JSON.stringify(out.result)).not.toMatch(/"raw"\s*:/)
+    expect(result.credential_claim.claim_id).toBeTruthy()
+    expect(result.credential_claim.fingerprint).toMatch(/^[0-9a-f]{16}$/)
+
+    const revealed = await invokeTool(
+      unboundDirectoryAuth(),
+      env,
+      'reveal_credential_claim',
+      { claim_id: result.credential_claim.claim_id },
+      'https://pot.test',
+    )
+    expect(revealed.ok).toBe(true)
+    if (!revealed.ok) throw new Error(`expected reveal to succeed, got ${revealed.error}`)
+    expect((revealed.result as { raw: string }).raw).toMatch(/^mupot_/)
+
+    // Single-use: redeeming the same claim again finds nothing.
+    const revealedAgain = await invokeTool(
+      unboundDirectoryAuth(),
+      env,
+      'reveal_credential_claim',
+      { claim_id: result.credential_claim.claim_id },
+      'https://pot.test',
+    )
+    expect(revealedAgain.ok).toBe(false)
+    if (revealedAgain.ok) throw new Error('expected the second reveal to be refused')
+    expect(revealedAgain.status).toBe(410)
+  })
+
+  it('a DIFFERENT member cannot redeem someone else\'s claim (owner-gated, mupot#987)', async () => {
+    const env = envFor(harness)
+    const out = await invokeTool(unboundDirectoryAuth(), env, 'bootstrap_self', { agent_name: 'Aria' }, 'https://pot.test')
+    expect(out.ok).toBe(true)
+    if (!out.ok) throw new Error(`expected success, got ${out.error}`)
+    const result = out.result as { credential_claim: { claim_id: string } }
+
+    const attacker: AuthContext = { ...unboundDirectoryAuth(), userId: 'someone-else', memberId: 'someone-else' }
+    const stolen = await invokeTool(
+      attacker,
+      env,
+      'reveal_credential_claim',
+      { claim_id: result.credential_claim.claim_id },
+      'https://pot.test',
+    )
+    expect(stolen.ok).toBe(false)
+    if (stolen.ok) throw new Error('expected the wrong-owner reveal to be refused')
+    expect(stolen.status).toBe(410)
+
+    // And it burned the claim even on the wrong-owner attempt — the legitimate
+    // owner can no longer redeem it either (fail-closed, not fail-open-once-checked).
+    const ownerRetry = await invokeTool(
+      unboundDirectoryAuth(),
+      env,
+      'reveal_credential_claim',
+      { claim_id: result.credential_claim.claim_id },
+      'https://pot.test',
+    )
+    expect(ownerRetry.ok).toBe(false)
   })
 
   it('rejects a missing agent_name at the schema layer, before the handler runs', async () => {

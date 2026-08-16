@@ -13,6 +13,7 @@
 import type { ToolSpec } from './index'
 import { fail, done } from './index'
 import { bootstrapSelf } from '../members/bootstrap-self'
+import { createCredentialClaim } from '../auth/credential-claim'
 
 const toolBootstrapSelf: ToolSpec = {
   name: 'bootstrap_self',
@@ -35,13 +36,28 @@ const toolBootstrapSelf: ToolSpec = {
     const result = await bootstrapSelf(env, auth, args.agent_name)
 
     if (result.ok) {
+      // mupot#987: result.token.raw is NEVER forwarded into the tool result — that
+      // is the exact defect the issue names (mint_agent_token's old `token.raw`,
+      // reproduced here at the self-bootstrap door). auth.memberId is the calling
+      // HUMAN's own member id (bootstrapSelf requires an unbound directory session,
+      // so it is never the freshly-created agent's dedicated member — see
+      // result.member_id below, which IS the agent's) — that is who redeems the claim.
+      const credentialClaim = await createCredentialClaim(
+        env,
+        result.token.raw,
+        auth.memberId as string,
+      )
       return done({
         disposition: result.disposition,
         department: result.department,
         squad: result.squad,
         agent: result.agent,
         member_id: result.member_id,
-        token: result.token,
+        token: {
+          id: result.token.id,
+          capability: result.token.capability,
+        },
+        credential_claim: credentialClaim,
         // Serialized because directory_session_note tells the human to "see
         // founder_grant" — a field this payload did not previously carry, so the
         // note pointed at nothing. It also carries disposition:'existing' when an
@@ -49,7 +65,10 @@ const toolBootstrapSelf: ToolSpec = {
         // is the difference between "you can bind this session" and "you cannot".
         founder_grant: result.founder_grant,
         audit_id: result.audit_id,
-        note: result.directory_session_note,
+        note:
+          `${result.directory_session_note} The raw token is NOT in this result — call `
+          + 'reveal_credential_claim { claim_id: credential_claim.claim_id } to redeem it '
+          + 'once, as this same caller, before it expires.',
       })
     }
 

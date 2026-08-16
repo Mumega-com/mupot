@@ -6,6 +6,7 @@ import {
   provisionAgentConnection,
   sweepAgentConnectionRetention,
 } from '../src/members/agent-connection'
+import { revealCredentialClaim } from '../src/auth/credential-claim'
 import { mcpApp } from '../src/mcp'
 import { deleteAgent } from '../src/org/service'
 import type { Env } from '../src/types'
@@ -175,7 +176,18 @@ describe('agent connection provisioning', () => {
       DB: harness.db,
       TENANT_SLUG: TENANT,
       PUBLIC_ORIGIN: 'https://pot.example',
-    } as Env
+      // mupot#987: provisionAgentConnection now stores the raw credential behind
+      // a one-time SESSIONS-KV claim (src/auth/credential-claim.ts) rather than
+      // returning it — needs a real in-memory store, not a stub.
+      SESSIONS: (() => {
+        const store = new Map<string, string>()
+        return {
+          async get(key: string) { return store.get(key) ?? null },
+          async put(key: string, value: string) { store.set(key, value) },
+          async delete(key: string) { store.delete(key) },
+        }
+      })(),
+    } as unknown as Env
   })
 
   afterEach(() => harness.close())
@@ -193,7 +205,13 @@ describe('agent connection provisioning', () => {
         verification_status: 'pending',
       },
     })
-    expect((result as { credential: { raw: string } }).credential.raw).toMatch(/^mupot_/)
+    // mupot#987: no raw field on AgentConnectionIssued.credential — structural,
+    // not incidental (see the type in src/members/agent-connection.ts).
+    expect(result).not.toHaveProperty('credential.raw')
+    const claimId = (result as { credential: { claim: { claim_id: string } } }).credential.claim.claim_id
+    const revealed = await revealCredentialClaim(env, claimId, OWNER.id)
+    expect(revealed.ok).toBe(true)
+    if (revealed.ok) expect(revealed.raw).toMatch(/^mupot_/)
     expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM agents').get()).toEqual({ n: 1 })
     expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM agent_member_bindings').get()).toEqual({ n: 1 })
     expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM member_tokens').get()).toEqual({ n: 1 })
@@ -523,6 +541,10 @@ describe('agent connection provisioning', () => {
   it('persists no raw credential, token hash, challenge, or reusable config', async () => {
     const result = await provisionAgentConnection(env, OWNER, newInput('secret-check'), NOW)
     if (result.status !== 'credential_issued') throw new Error(result.status)
+    // mupot#987: the RETURN VALUE itself must not carry raw either — reveal it
+    // out-of-band via the claim, the only sanctioned path.
+    const revealed = await revealCredentialClaim(env, result.credential.claim.claim_id, OWNER.id)
+    if (!revealed.ok) throw new Error('expected reveal to succeed')
     const request = harness.sqlite.prepare(
       `SELECT * FROM agent_connection_requests WHERE request_id = 'secret-check'`,
     ).get()
@@ -530,12 +552,12 @@ describe('agent connection provisioning', () => {
       `SELECT * FROM agent_connection_receipts WHERE request_id = 'secret-check'`,
     ).get()
     const persisted = JSON.stringify({ request, receipt })
-    expect(persisted).not.toContain(result.credential.raw)
+    expect(persisted).not.toContain(revealed.raw)
     expect(persisted).not.toContain(result.verification.challenge)
     expect(persisted).not.toContain('<MEMBER_TOKEN>')
     expect(Object.keys(receipt as object)).not.toContain('token_hash')
     expect(result.endpoint).toBe('https://pot.example/mcp')
-    expect(JSON.stringify(result.configuration)).not.toContain(result.credential.raw)
+    expect(JSON.stringify(result.configuration)).not.toContain(revealed.raw)
   })
 
   it('exposes the same transaction through the authenticated MCP tool', async () => {
@@ -596,7 +618,7 @@ describe('agent connection provisioning', () => {
         structuredContent: {
           status: string
           endpoint: string
-          credential: { raw: string }
+          credential: { claim: { claim_id: string } }
         }
       }
     }
@@ -604,8 +626,33 @@ describe('agent connection provisioning', () => {
       status: 'credential_issued',
       endpoint: 'https://pot.example/mcp',
     })
-    expect(body.result.structuredContent.credential.raw).toMatch(/^mupot_/)
+    // mupot#987: no raw secret in the MCP tool result — structural proof.
+    expect(JSON.stringify(body)).not.toMatch(/"raw"\s*:/)
     expect(JSON.stringify(body)).not.toContain('malicious-host.example')
+
+    const revealResponse = await mcpApp.request(
+      'https://pot.example/',
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          authorization: `Bearer ${rawOperatorToken}`,
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 2,
+          method: 'tools/call',
+          params: {
+            name: 'reveal_credential_claim',
+            arguments: { claim_id: body.result.structuredContent.credential.claim.claim_id },
+          },
+        }),
+      },
+      env,
+    )
+    expect(revealResponse.status).toBe(200)
+    const revealBody = await revealResponse.json() as { result: { structuredContent: { raw: string } } }
+    expect(revealBody.result.structuredContent.raw).toMatch(/^mupot_/)
   })
 
   it('expires and purges only tenant-scoped lifecycle rows at exact boundaries', async () => {

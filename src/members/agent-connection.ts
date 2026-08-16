@@ -16,6 +16,7 @@ import {
   type PreparedAgentCreate,
 } from '../org/service'
 import { resolveAgentRef } from '../org/resolve'
+import { createCredentialClaim, type CredentialClaimHandle } from '../auth/credential-claim'
 import type { Agent, Capability, CapabilityGrant, Env } from '../types'
 import {
   prepareAgentSquadAccess,
@@ -98,8 +99,12 @@ export interface AgentConnectionReceipt {
 
 export interface AgentConnectionIssued {
   status: 'credential_issued'
+  // mupot#987: NO raw field on this type, deliberately — see credential-claim.ts.
+  // A raw secret here would round-trip straight into the calling MCP client's
+  // persisted transcript exactly like mint_agent_token's old `token.raw` did.
+  // `claim` is redeemed once, out of band, via reveal_credential_claim.
   credential: {
-    raw: string
+    claim: CredentialClaimHandle
     tokenId: string
     shownOnce: true
   }
@@ -707,10 +712,14 @@ async function commitPreparedConnectionAttempt(
     throw new Error('receipt_failed')
   }
 
+  // mupot#987: raw never leaves this function. It is handed straight to
+  // createCredentialClaim and the caller gets a single-use claim instead — see the
+  // AgentConnectionIssued doc comment above.
+  const claim = await createCredentialClaim(env, token.raw, actor.id)
   return {
     status: 'credential_issued',
     credential: {
-      raw: token.raw,
+      claim,
       tokenId: token.tokenId,
       shownOnce: true,
     },

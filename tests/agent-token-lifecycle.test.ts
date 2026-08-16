@@ -109,6 +109,16 @@ function makeEnv(opts: Opts = {}): Env {
     TENANT_SLUG: 'mumega',
     PUBLIC_ORIGIN: 'https://mupot.mumega.com',
     BUS: { send: async (e: unknown) => { (opts.busSent ??= []).push(e) } },
+    // mupot#987: mint_agent_token stores raw behind a one-time SESSIONS-KV claim
+    // (src/auth/credential-claim.ts) instead of returning it directly.
+    SESSIONS: (() => {
+      const store = new Map<string, string>()
+      return {
+        async get(key: string) { return store.get(key) ?? null },
+        async put(key: string, value: string) { store.set(key, value) },
+        async delete(key: string) { store.delete(key) },
+      }
+    })(),
   } as unknown as Env
 }
 
@@ -287,37 +297,71 @@ describe('no tool may emit a secret', () => {
 })
 
 describe('Flight-002: mint_agent_token expiry and rotation', () => {
+  // mupot#987: mint_agent_token's tool result must never carry the raw token —
+  // only a single-use credential_claim, redeemed via reveal_credential_claim.
+  async function revealRaw(env: Env, claimId: string): Promise<{ status: number; raw?: string }> {
+    const res = await call('reveal_credential_claim', { claim_id: claimId }, env)
+    if (res.status !== 200) return { status: res.status }
+    const body = (await res.json()) as { result: { structuredContent: { raw: string } } }
+    return { status: res.status, raw: body.result.structuredContent.raw }
+  }
+
   it('mints agent token with default 30-day expiry when unspecified', async () => {
     const env = makeEnv()
     const res = await call('mint_agent_token', { agent: AGENT.slug }, env)
     expect(res.status).toBe(200)
-    const body = (await res.json()) as { result: { structuredContent: { token: { id: string; raw: string } } } }
-    expect(body.result.structuredContent.token.raw).toMatch(/^mupot_/)
+    const body = (await res.json()) as {
+      result: { structuredContent: { token: { id: string }; credential_claim: { claim_id: string } } }
+    }
+    expect(JSON.stringify(body)).not.toMatch(/"raw"\s*:/)
     expect(body.result.structuredContent.token.id).toBeDefined()
+    const revealed = await revealRaw(env, body.result.structuredContent.credential_claim.claim_id)
+    expect(revealed.raw).toMatch(/^mupot_/)
   })
 
   it('mints agent token with custom expiry days', async () => {
     const env = makeEnv()
     const res = await call('mint_agent_token', { agent: AGENT.slug, expires_in_days: 90 }, env)
     expect(res.status).toBe(200)
-    const body = (await res.json()) as { result: { structuredContent: { token: { id: string; raw: string } } } }
-    expect(body.result.structuredContent.token.raw).toMatch(/^mupot_/)
+    const body = (await res.json()) as {
+      result: { structuredContent: { credential_claim: { claim_id: string } } }
+    }
+    expect(JSON.stringify(body)).not.toMatch(/"raw"\s*:/)
+    const revealed = await revealRaw(env, body.result.structuredContent.credential_claim.claim_id)
+    expect(revealed.raw).toMatch(/^mupot_/)
   })
 
   it('mints non-expiring agent token when explicitly requested', async () => {
     const env = makeEnv()
     const res = await call('mint_agent_token', { agent: AGENT.slug, non_expiring: true }, env)
     expect(res.status).toBe(200)
-    const body = (await res.json()) as { result: { structuredContent: { token: { id: string; raw: string } } } }
-    expect(body.result.structuredContent.token.raw).toMatch(/^mupot_/)
+    const body = (await res.json()) as {
+      result: { structuredContent: { credential_claim: { claim_id: string } } }
+    }
+    expect(JSON.stringify(body)).not.toMatch(/"raw"\s*:/)
+    const revealed = await revealRaw(env, body.result.structuredContent.credential_claim.claim_id)
+    expect(revealed.raw).toMatch(/^mupot_/)
   })
 
   it('atomically rotates prior token on mint when rotate_prior_token_id provided', async () => {
     const env = makeEnv()
     const res = await call('mint_agent_token', { agent: AGENT.slug, rotate_prior_token_id: 'tok-old' }, env)
     expect(res.status).toBe(200)
-    const body = (await res.json()) as { result: { structuredContent: { token: { id: string; raw: string } } } }
+    const body = (await res.json()) as { result: { structuredContent: { token: { id: string } } } }
     expect(body.result.structuredContent.token.id).toBeDefined()
+  })
+
+  it('a claim can only be redeemed once — the second reveal is refused (mupot#987)', async () => {
+    const env = makeEnv()
+    const res = await call('mint_agent_token', { agent: AGENT.slug }, env)
+    const body = (await res.json()) as {
+      result: { structuredContent: { credential_claim: { claim_id: string } } }
+    }
+    const claimId = body.result.structuredContent.credential_claim.claim_id
+    const first = await revealRaw(env, claimId)
+    expect(first.status).toBe(200)
+    const second = await revealRaw(env, claimId)
+    expect(second.status).toBe(410)
   })
 })
 
