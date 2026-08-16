@@ -1435,7 +1435,7 @@ describe('project dashboard routes', () => {
     const body = await response.text()
     expect(response.status).toBe(200)
     expect(body).not.toContain('Agent Beta Secret')
-    expect(body).toContain('No active agents yet')
+    expect(body).toContain('No reachable agents right now')
   })
 
   it('excludes writable project squads when the member is only an observer', async () => {
@@ -1454,7 +1454,7 @@ describe('project dashboard routes', () => {
     const body = await response.text()
     expect(response.status).toBe(200)
     expect(body).not.toContain('Agent Alpha')
-    expect(body).toContain('No active agents yet')
+    expect(body).toContain('No reachable agents right now')
   })
 
   it('uses a pre-limit authorized project-flight query and excludes hidden or malformed flights', async () => {

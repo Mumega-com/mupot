@@ -130,6 +130,13 @@ import type { Html } from './ui'
 import type { ApprovalItem } from './approvals'
 import { loadObservatory, agentGradient } from './observatory'
 import { kanbanApp, loadKanbanData, kanbanBoardBody } from './kanban-routes'
+// Flight-008 Slice 3 (#1062): the /send dispatch-now picker's reachability signal.
+// Reuses getFleetAgentRuntimeStates VERBATIM — the SAME dual-surface (fleet_agents ∪
+// module_registry) presence primitive src/routines/dispatch.ts#selectAgent already
+// uses for automated dispatch (mupot#732's either-surface fix). Do not invent a
+// second liveness notion here.
+import { getFleetAgentRuntimeStates, MAX_RUNTIME_STATE_BATCH } from '../fleet/registry'
+import type { FleetAgentIdentity, FleetAgentRuntimeState } from '../fleet/registry'
 
 import type { ObservatoryData, SwimlaneBar, AgentRuntimeState, AgentStat } from './observatory'
 import { loadOpsHealth } from './health'
@@ -753,15 +760,23 @@ dashboardApp.get('/send', async (c) => {
   if (projectId !== undefined) {
     const context = await loadProjectWorkContext(c.env, c.get('auth'), projectId)
     if (!context) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
-    const agents = await loadActiveAgentsWithSquad(c.env, context.taskableSquadIds)
+    const [agents, dispatchable] = await Promise.all([
+      loadActiveAgentsWithSquad(c.env, context.taskableSquadIds),
+      loadDispatchableAgents(c.env, context.taskableSquadIds),
+    ])
     return c.html(shell(c.env, 'Send a task', sendPageBody(
       agents,
+      dispatchable,
+      pickDispatchDefault(dispatchable),
       context.project,
       context.taskableSquadIdsTruncated,
     )))
   }
-  const agents = await loadActiveAgentsWithSquad(c.env)
-  return c.html(shell(c.env, 'Send a task', sendPageBody(agents)))
+  const [agents, dispatchable] = await Promise.all([
+    loadActiveAgentsWithSquad(c.env),
+    loadDispatchableAgents(c.env),
+  ])
+  return c.html(shell(c.env, 'Send a task', sendPageBody(agents, dispatchable, pickDispatchDefault(dispatchable))))
 })
 
 // GET /approvals — the gate queue (#6). Tasks in 'review' the caller may
@@ -2662,6 +2677,153 @@ async function loadActiveAgentsWithSquad(env: Env, squadIds?: string[]): Promise
     ? await statement.all<PickerAgent>()
     : await statement.bind(JSON.stringify([...new Set(squadIds)])).all<PickerAgent>()
   return rows.results ?? []
+}
+
+// ── Flight-008 Slice 3 (mupot#1062) — disambiguated dispatch-now picker ────────
+//
+// loadActiveAgentsWithSquad above answers "which agents COULD this squad ever
+// task" (catalog membership: agents.status='active') and still backs the backlog
+// form's squad list + optional assignee — a backlog task is allowed to name an
+// agent that isn't live right now, since nothing wakes until later. The
+// "Dispatch now" panel is different: it WAKES the agent immediately, so offering
+// a not-runtime / unattached / stale-seat identity there is a silent misdispatch
+// (the owner picks a name, nothing is actually listening). loadDispatchableAgents
+// answers the narrower, execution-safe question: "which of this squad's active
+// agents has a REACHABLE runtime right now" — reachability is the SAME
+// dual-surface presence getFleetAgentRuntimeStates already computes for the
+// routine scheduler (mupot#732), not a reinvented notion.
+
+type SeatStatus = FleetAgentRuntimeState['presence'] // 'live' | 'stale' | 'offline'
+
+export interface DispatchableAgent {
+  id: string
+  slug: string
+  name: string
+  role: string
+  model: string
+  squad_id: string
+  squad_name: string
+  seat_status: SeatStatus
+  last_seen: string
+}
+
+export interface DispatchDefault {
+  agent_id: string | null
+  reason: string
+}
+
+interface DispatchAgentCandidate {
+  id: string
+  slug: string
+  name: string
+  role: string
+  model: string
+  squad_id: string
+  squad_name: string
+}
+
+/**
+ * isLiveRuntimeState — the ONE predicate that decides "reachable enough to wake
+ * right now." Factored out as its own named function (rather than inlined in the
+ * filter loop below) so a mutation that deletes/inverts this check is directly
+ * observable: strip the call in loadDispatchableAgents and every seeded
+ * stale/unattached/offline seat starts getting offered again (see
+ * tests/dashboard-send-picker.test.ts, "reachability filter is load-bearing").
+ */
+export function isLiveRuntimeState(state: FleetAgentRuntimeState | undefined): boolean {
+  return state !== undefined && state.presence === 'live'
+}
+
+/**
+ * loadDispatchableAgents — active agents in scope, narrowed to ones with a LIVE
+ * runtime right now. Excludes, by construction (never a post-fetch client-side
+ * hide — every exclusion happens in this server function before the row ever
+ * reaches HTML):
+ *   - not-runtime / unattached: agent has NEVER reported to either presence
+ *     surface (fleet_agents or module_registry) — getFleetAgentRuntimeStates
+ *     returns no entry for it at all, so isLiveRuntimeState(undefined) is false.
+ *   - stale-seat: a presence row exists but its heartbeat has aged past the TTL
+ *     (presence: 'stale') or was explicitly detached (presence: 'offline').
+ *   - ambiguous-duplicate: when a runtime attached under a bare SLUG that more
+ *     than one agent (across squads) shares, getFleetAgentRuntimeStates REFUSES
+ *     to attribute that row to any of them (readFleetAgentRow's cardinality
+ *     check, src/fleet/registry.ts) — such an agent also reads as "no entry"
+ *     here. This is distinct from two agents that each carry their OWN
+ *     exact-id-keyed presence row and simply happen to share a slug across
+ *     squads: those are NOT ambiguous (id lookup always wins unconditionally)
+ *     and both surface as separate, live, distinctly-badged rows — see the
+ *     "same slug, different squads, never collapsed" test.
+ * Never groups/dedupes by name or slug — one row per agents.id, always.
+ */
+export async function loadDispatchableAgents(env: Env, squadIds?: string[], nowMs = Date.now()): Promise<DispatchableAgent[]> {
+  if (squadIds?.length === 0) return []
+  const filter = squadIds === undefined
+    ? ''
+    : ' AND a.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?1))'
+  const statement = env.DB.prepare(
+    `SELECT a.id AS id, a.slug AS slug, a.name AS name, a.role AS role, a.model AS model,
+            a.squad_id AS squad_id, s.name AS squad_name
+       FROM agents a JOIN squads s ON s.id = a.squad_id
+      WHERE a.status = 'active'${filter}
+      ORDER BY s.name ASC, a.name ASC`,
+  )
+  const rows = squadIds === undefined
+    ? await statement.all<DispatchAgentCandidate>()
+    : await statement.bind(JSON.stringify([...new Set(squadIds)])).all<DispatchAgentCandidate>()
+  const candidates = rows.results ?? []
+  if (candidates.length === 0) return []
+
+  // getFleetAgentRuntimeStates throws past MAX_RUNTIME_STATE_BATCH — a pot is
+  // documented as small (loadActiveAgentsWithSquad's own docstring above), but
+  // fail safe rather than 500 the whole /send page: cap the batch rather than
+  // let an unusually large roster take the page down. A truncated candidate set
+  // can only OMIT potential live agents, never wrongly ADMIT an unreachable one.
+  const identities: FleetAgentIdentity[] = candidates
+    .slice(0, MAX_RUNTIME_STATE_BATCH)
+    .map((a) => ({ agent_id: a.id, slug: a.slug }))
+  const states = await getFleetAgentRuntimeStates(env, identities, nowMs)
+
+  const live: DispatchableAgent[] = []
+  for (const a of candidates) {
+    const state = states.get(a.id)
+    if (!isLiveRuntimeState(state)) continue
+    live.push({
+      id: a.id,
+      slug: a.slug,
+      name: a.name,
+      role: a.role,
+      model: a.model,
+      squad_id: a.squad_id,
+      squad_name: a.squad_name,
+      seat_status: (state as FleetAgentRuntimeState).presence,
+      last_seen: (state as FleetAgentRuntimeState).last_seen,
+    })
+  }
+  return live
+}
+
+/**
+ * pickDispatchDefault — the deterministic default for the "Dispatch now" picker.
+ * Never a first-row/array-order pick (that was the arbitrary-default bug,
+ * mupot#1062): the ONLY case that pre-selects anything is exactly one live
+ * runtime, and the reason string is always returned alongside the id so the UI
+ * can show WHY that one (or no one) is selected — never a silent default.
+ */
+export function pickDispatchDefault(agents: DispatchableAgent[]): DispatchDefault {
+  if (agents.length === 0) {
+    return { agent_id: null, reason: 'No reachable agents are live right now — nothing can be auto-selected.' }
+  }
+  if (agents.length === 1) {
+    const only = agents[0]
+    return {
+      agent_id: only.id,
+      reason: `Only live runtime — ${only.name} (${only.squad_name}) auto-selected.`,
+    }
+  }
+  return {
+    agent_id: null,
+    reason: `${agents.length} live runtimes available — choose one.`,
+  }
 }
 
 /** id → display name for department & squad scopes, so grants read as names not uuids. */
@@ -4667,8 +4829,14 @@ function agentConsoleBody(agent: Agent, squad: Squad | null, canWake: boolean) {
 // squad. The option VALUE carries "agentId|squadId" so the client can post both
 // without a second lookup. The client posts to /api/tasks (dispatch:true) and then
 // polls /api/tasks/:id every 2s (cap 120s), rendering sent → working → done.
-function sendPageBody(agents: PickerAgent[], project?: Project, projectSquadsTruncated = false) {
-  const hasAgents = agents.length > 0
+export function sendPageBody(
+  agents: PickerAgent[],
+  dispatchable: DispatchableAgent[] = [],
+  dispatchDefault: DispatchDefault = pickDispatchDefault(dispatchable),
+  project?: Project,
+  projectSquadsTruncated = false,
+) {
+  const hasDispatchable = dispatchable.length > 0
   const agentOptions = agents
     .map(
       (a) =>
@@ -4676,11 +4844,37 @@ function sendPageBody(agents: PickerAgent[], project?: Project, projectSquadsTru
     )
     .join('')
 
-  // Unique squad list for the backlog squad picker (post requires a squad).
+  // Unique squad list for the backlog squad picker (post requires a squad). This
+  // stays sourced from the FULL catalog (agents), not the reachability-filtered
+  // dispatchable list — a squad remains plannable for backlog work even when
+  // none of its agents currently have a live runtime; only "Dispatch now" (which
+  // wakes something immediately) requires reachability.
   const squadMap = new Map<string, string>()
   for (const a of agents) squadMap.set(a.squad_id, a.squad_name)
   const squadOptions = Array.from(squadMap.entries())
     .map(([id, name]) => `<option value="${escAttr(id)}">${escHtml(name)}</option>`)
+    .join('')
+
+  // ── Disambiguated agent picker (Flight-008 Slice 3, mupot#1062) ──────────────
+  // Radio cards, not a native <select>: every offered row carries its own
+  // MODEL / SQUAD / SEAT STATUS badges (server-derived, from loadDispatchableAgents
+  // — never guessed or cached client-side), and — critically — the browser can no
+  // longer supply an implicit "first option" default the way a bare <select>
+  // does. Only the id pickDispatchDefault names gets the `checked` attribute; a
+  // multi-candidate page renders with NOTHING checked, forcing an explicit choice.
+  const agentCards = dispatchable
+    .map((a) => {
+      const value = `${a.id}|${a.squad_id}`
+      const checked = a.id === dispatchDefault.agent_id
+      return `<label class="agent-option${checked ? ' is-default' : ''}">
+        <input type="radio" name="send-agent" value="${escAttr(value)}"${checked ? ' checked' : ''}>
+        <span class="agent-option-name">${escHtml(a.name)}</span>
+        <span class="agent-option-role dim">${escHtml(a.role)}</span>
+        <span class="badge badge-model" title="model">${escHtml(a.model)}</span>
+        <span class="badge badge-squad" title="squad">${escHtml(a.squad_name)}</span>
+        <span class="badge badge-seat badge-seat-${escAttr(a.seat_status)}" title="seat status">${escHtml(a.seat_status)}</span>
+      </label>`
+    })
     .join('')
 
   // ── New backlog task (planning only: dispatch:false, unassigned by default) ──
@@ -4725,15 +4919,16 @@ function sendPageBody(agents: PickerAgent[], project?: Project, projectSquadsTru
     </div>`
 
   // ── Dispatch now (existing /send flow, relabeled) ──
-  const dispatchForm = hasAgents
+  const dispatchForm = hasDispatchable
     ? html`
         <div class="card" style="margin-top:18px">
           <h2 style="margin:0 0 4px">Dispatch now</h2>
-          <p class="dim" style="margin:0 0 14px;font-size:13px">Assigns an active agent and wakes it immediately to do the work.</p>
-          <label class="block">
+          <p class="dim" style="margin:0 0 14px;font-size:13px">Assigns a reachable agent and wakes it immediately to do the work. Only agents with a live runtime right now are offered.</p>
+          <div class="block">
             <span class="lbl">Your agents</span>
-            <select id="send-agent">${raw(agentOptions)}</select>
-          </label>
+            <div class="agent-picker" role="radiogroup" aria-label="Choose an agent">${raw(agentCards)}</div>
+            <p class="dim" id="send-agent-reason" style="margin:2px 0 0;font-size:12px">${dispatchDefault.reason}</p>
+          </div>
           <label class="block" style="margin-top:14px">
             <span class="lbl">What do you need done?</span>
             <textarea id="send-body" rows="6" placeholder="Describe the task in your own words…"></textarea>
@@ -4745,8 +4940,9 @@ function sendPageBody(agents: PickerAgent[], project?: Project, projectSquadsTru
           <div id="send-status" class="status-line"></div>
           <div id="send-result" class="result-box" hidden></div>
         </div>`
-    : html`<div class="card" style="margin-top:18px"><p class="empty">No active agents yet. Add one from a
-        <a href="/">squad board</a> first, then come back to dispatch it a task.</p></div>`
+    : html`<div class="card" style="margin-top:18px"><p class="empty">No reachable agents right now — either add one from a
+        <a href="/">squad board</a>, or wait for an existing agent's runtime to come online (seat status derives from its
+        live presence heartbeat, not just being enabled in the catalog).</p></div>`
 
   return html`
     <p class="crumbs"><a href="/">Overview</a> / ${project ? html`<a href="/projects/${encodeURIComponent(project.id)}">${project.name}</a> / ` : ''}Create a task</p>
@@ -4762,7 +4958,7 @@ function sendPageBody(agents: PickerAgent[], project?: Project, projectSquadsTru
     <style>
       .block { display: flex; flex-direction: column; gap: 6px; }
       .block .lbl { font-size: 13px; color: var(--muted); }
-      #send-agent, #send-body, #bk-title, #bk-body, #bk-done, #bk-priority, #bk-squad, #bk-assignee {
+      #send-body, #bk-title, #bk-body, #bk-done, #bk-priority, #bk-squad, #bk-assignee {
         font: inherit; padding: 9px 11px; border-radius: 8px; border: 1px solid var(--border);
         background: var(--bg); color: var(--text); width: 100%; resize: vertical;
       }
@@ -4772,11 +4968,28 @@ function sendPageBody(agents: PickerAgent[], project?: Project, projectSquadsTru
         line-height: 1.55;
       }
       .result-box .done-meta { color: var(--dim); font-size: 12px; margin-bottom: 10px; }
+      .agent-picker { display: flex; flex-direction: column; gap: 6px; }
+      .agent-option {
+        display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+        padding: 9px 11px; border-radius: 8px; border: 1px solid var(--border);
+        background: var(--bg); cursor: pointer;
+      }
+      .agent-option:has(input:checked) { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, var(--bg)); }
+      .agent-option input[type="radio"] { flex: none; }
+      .agent-option-name { font-weight: 600; }
+      .agent-option-role { font-size: 12px; }
+      .badge {
+        font-size: 11px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--border);
+        color: var(--muted); background: var(--surface2);
+      }
+      .badge-seat-live { color: var(--ok); border-color: var(--ok); }
+      .badge-seat-stale { color: var(--warn); border-color: var(--warn); }
+      .badge-seat-offline { color: var(--danger, #f85149); border-color: var(--danger, #f85149); }
     </style>
     ${backlogForm}
     ${dispatchForm}
     ${backlogScript(project?.id)}
-    ${hasAgents ? sendScript(project?.id) : html``}`
+    ${hasDispatchable ? sendScript(project?.id) : html``}`
 }
 
 function backlogScript(projectId?: string) {
@@ -4844,10 +5057,17 @@ function sendScript(projectId?: string) {
         var projectId = ${JSON.stringify(projectId ?? null).replace(/</g, '\\u003c')};
         var btn = document.getElementById('send-btn');
         var bodyEl = document.getElementById('send-body');
-        var agentEl = document.getElementById('send-agent');
         var status = document.getElementById('send-status');
         var resultBox = document.getElementById('send-result');
         if (!btn) return;
+
+        // The picker is a radio-card group (name="send-agent"), not a <select> —
+        // no implicit "first option" default exists to accidentally read. Only
+        // the id the server named in pickDispatchDefault is pre-selected.
+        function selectedAgentValue() {
+          var selected = document.querySelector('input[name="send-agent"]:checked');
+          return selected ? selected.value : '';
+        }
 
         var POLL_MS = 2000;
         var MAX_MS = 120000;
@@ -4903,7 +5123,7 @@ function sendScript(projectId?: string) {
         btn.addEventListener('click', async function () {
           var text = (bodyEl.value || '').trim();
           if (!text) { status.textContent = 'Write what you need first.'; return; }
-          var val = agentEl.value || '';
+          var val = selectedAgentValue();
           var parts = val.split('|');
           var agentId = parts[0];
           var squadId = parts[1];

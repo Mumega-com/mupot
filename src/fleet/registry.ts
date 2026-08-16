@@ -380,7 +380,7 @@ export interface FleetAgentRuntimeState {
   last_seen: string
 }
 
-const MAX_RUNTIME_STATE_BATCH = 100
+export const MAX_RUNTIME_STATE_BATCH = 100
 
 /**
  * Resolve a bounded set of canonical agent IDs to fleet rows without per-agent reads.
