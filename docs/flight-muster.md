@@ -37,6 +37,18 @@ Three sources of record, three different answers, zero of them flagged. Had Athe
 registered at flight start, she would have registered a lie — sincerely. She is not
 lying; she does not know. Nothing in the system reads what she is actually running.
 
+The obvious objection is that Athena is one bad case. She is not. The second agent checked
+drifted too, and was found *while filing this spec*:
+
+| source | River's model |
+|---|---|
+| `resolve_agent` (the mupot registry of record) | `deepseek-v4-pro` |
+| actual tmux pane | `DeepSeek V4 Flash (2x usage)` |
+
+Right family, wrong tier — which is the more dangerous shape, because it survives any check
+that matches on family and it is exactly the axis the lens invariant below depends on. Two
+of two agents checked are drifted. The sample is small; the base rate is not.
+
 This is not a one-off. It is already filed five times, each capturing one face of it:
 
 | issue | the face it captures |
