@@ -1319,3 +1319,30 @@ describe('task_verdict (MCP)', () => {
     if (!res.ok) expect(res.error).toBe('forbidden')
   })
 })
+
+  // Flight-006 Slice 1 parity: dispatch:false = backlog-only (no task.created wake).
+  it('task_create dispatch:false suppresses the task.created wake (backlog parity)', async () => {
+    const { env, events } = makeEnv([])
+    const res = await invokeTool(auth(), env, 'task_create', {
+      squad_id: SQUAD_ID,
+      title: 'Backlog via MCP',
+      done_when: 'The backlog task exists.',
+      dispatch: false,
+    }, 'https://pot.example')
+
+    expect(res.ok).toBe(true)
+    expect((events as Array<{ type?: string }>).some((e) => e.type === 'task.created')).toBe(false)
+  })
+
+  it('task_create dispatch:true still emits the task.created wake', async () => {
+    const { env, events } = makeEnv([])
+    const res = await invokeTool(auth(), env, 'task_create', {
+      squad_id: SQUAD_ID,
+      title: 'Dispatch via MCP',
+      done_when: 'The dispatched task exists.',
+      dispatch: true,
+    }, 'https://pot.example')
+
+    expect(res.ok).toBe(true)
+    expect((events as Array<{ type?: string }>).some((e) => e.type === 'task.created')).toBe(true)
+  })
