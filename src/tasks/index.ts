@@ -7,6 +7,10 @@
 //   GET  /            list tasks, filterable by ?squad_id= and ?status=
 //   POST /            create a task (member+ within the pot)           -> mirrors to GH
 //   PATCH /:id        update status / assignee / title / body         -> mirrors to GH
+//   POST /:id/verdict approve/reject a single review task (gate_owner RBAC)
+//   POST /batch-verdict  approve/reject several review tasks in one request,
+//                        idempotent — replays /:id/verdict per id (Flight-008
+//                        Slice 2, mupot#1061)
 //
 // Tenant isolation: env.DB IS this tenant's pot (one DB per tenant), so task rows
 // carry no tenant column. We still HARD GUARD AuthContext.tenant === TENANT_SLUG so
@@ -1255,6 +1259,101 @@ tasksApp.post('/:id/verdict', async (c) => {
     }
     throw err // propagate unexpected errors (5xx)
   }
+})
+
+// ── POST /batch-verdict — approve/reject several review tasks in one request ─
+//
+// Flight-008 Slice 2 (mupot#1061, Safe Approvals Triage): bulk resolution for
+// the /approvals batch toolbar. Deliberately NOT a parallel write path — each
+// id is dispatched through tasksApp.request(), i.e. a REAL internal call to
+// the exact same POST /:id/verdict route above, replaying the caller's own
+// Cookie so requireAuth re-authenticates it independently per item. That means
+// every check the single-item route enforces (canActOnSquad, no_gate,
+// not_in_review, callerHoldsGateCapability, the gate:loops surface cap, the
+// self-verdict guard, and — the idempotency guarantee this route exists to
+// prove — writeVerdict's K5 conditional `UPDATE tasks ... WHERE status =
+// 'review'`) applies unmodified to every item in the batch. A second
+// batch-resolve of an already-decided id (or a duplicate id inside the SAME
+// batch) reads the task's CURRENT status on its own turn and gets back
+// 409 not_in_review — a no-op, never a double-apply. Processed sequentially
+// (not Promise.all) so a duplicate id within one batch sees the prior item's
+// committed status change before its own turn runs, and so D1 sees one write
+// at a time rather than contending writers.
+//
+// hono/csrf's Origin/Sec-Fetch-Site check only fires for form-encoded content
+// types (multipart/form-data, x-www-form-urlencoded, text/plain) — every
+// verdict write here (batch and single) is 'content-type: application/json',
+// so it is exempt exactly like the existing dashboard fetch() calls already are.
+
+interface BatchVerdictBody {
+  ids?: unknown
+  verdict?: unknown
+  note?: unknown
+}
+
+interface BatchVerdictItemResult {
+  id: string
+  status: number
+  applied: boolean
+  body: unknown
+}
+
+const MAX_BATCH_VERDICT_IDS = 25
+
+function isNonEmptyStringArray(value: unknown): value is string[] {
+  return Array.isArray(value)
+    && value.length > 0
+    && value.every((v) => typeof v === 'string' && v.length > 0 && v.length <= 200)
+}
+
+tasksApp.post('/batch-verdict', async (c) => {
+  let body: BatchVerdictBody
+  try {
+    body = (await c.req.json()) as BatchVerdictBody
+  } catch {
+    return c.json({ error: 'invalid_json' }, 400)
+  }
+
+  if (!isNonEmptyStringArray(body.ids)) {
+    return c.json({ error: 'invalid_ids' }, 400)
+  }
+  if (body.ids.length > MAX_BATCH_VERDICT_IDS) {
+    return c.json({ error: 'batch_too_large', max: MAX_BATCH_VERDICT_IDS }, 400)
+  }
+  if (body.verdict !== 'approved' && body.verdict !== 'rejected') {
+    return c.json({ error: 'invalid_verdict', accepted: ['approved', 'rejected'] }, 400)
+  }
+  const note = typeof body.note === 'string' ? body.note : undefined
+
+  const cookie = c.req.header('Cookie') ?? ''
+  const ids = body.ids
+  const verdict = body.verdict
+
+  const results: BatchVerdictItemResult[] = []
+  for (const id of ids) {
+    const res = await tasksApp.request(
+      `/${encodeURIComponent(id)}/verdict`,
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          cookie,
+        },
+        body: JSON.stringify({ verdict, note }),
+      },
+      c.env,
+    )
+    let payload: unknown = null
+    try {
+      payload = await res.json()
+    } catch {
+      payload = null
+    }
+    results.push({ id, status: res.status, applied: res.status === 201, body: payload })
+  }
+
+  const appliedCount = results.filter((r) => r.applied).length
+  return c.json({ results, applied_count: appliedCount, total: results.length }, 200)
 })
 
 // ── POST /:id/pipeline — start a durable CF Workflows pipeline for a task ────

@@ -280,10 +280,21 @@ describe('verdict immutability — no update/delete route', () => {
     const { tasksApp } = await import('../src/tasks/index')
     // Hono exposes routes via .routes
     const routes = tasksApp.routes as Array<{ method: string; path: string }>
-    const verdictRoutes = routes.filter((r) => r.path.includes('verdict'))
-    // There must be exactly one verdict route: POST /:id/verdict
+    // Exact-path match (not a substring filter): /batch-verdict (Flight-008
+    // Slice 2, mupot#1061) also contains the substring 'verdict' by name, so a
+    // loose .includes('verdict') filter would over-count as soon as that route
+    // exists. There must be exactly one route at the single-item path.
+    const verdictRoutes = routes.filter((r) => r.path === '/:id/verdict')
     expect(verdictRoutes).toHaveLength(1)
     expect(verdictRoutes[0].method).toBe('POST')
+  })
+
+  it('tasksApp does not register PATCH or DELETE on /batch-verdict either', async () => {
+    const { tasksApp } = await import('../src/tasks/index')
+    const routes = tasksApp.routes as Array<{ method: string; path: string }>
+    const batchRoutes = routes.filter((r) => r.path === '/batch-verdict')
+    expect(batchRoutes).toHaveLength(1)
+    expect(batchRoutes[0].method).toBe('POST')
   })
 })
 

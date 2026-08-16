@@ -12,6 +12,7 @@
 
 import type { Env, Task, AuthContext } from '../types'
 import { CONTENT_GATE_OWNER } from '../agents/execute'
+import { resolveGateOwners, type GateOwnerResolution } from '../gates/grants'
 
 export interface ApprovalItem {
   id: string
@@ -25,6 +26,54 @@ export interface ApprovalItem {
   result: string | null
   completed_at: string | null
   created_at: string
+  // Flight-008 Slice 2 (mupot#1061, Safe Approvals Triage) — server-derived,
+  // never placeholders. gate_owner_name/blocker_reason explain WHO must act
+  // and WHY the row is waiting; can_verdict is the belt-and-suspenders twin of
+  // the write-path RBAC (POST /api/tasks/:id/verdict) — the UI must never
+  // offer Approve/Reject where the backend has no safe, named owner to honor.
+  gate_owner_name: string | null
+  blocker_reason: string
+  can_verdict: boolean
+}
+
+// Raw column shape the two SELECTs below actually return — gate_owner_name/
+// blocker_reason/can_verdict are computed afterward by decorateApprovals,
+// never selected from D1 directly.
+type ApprovalRow = Omit<ApprovalItem, 'gate_owner_name' | 'blocker_reason' | 'can_verdict'>
+
+/** Human-legible, per-row reason — never a generic placeholder ("blocked", ""). */
+function blockerReason(gateOwner: string | null, resolution: GateOwnerResolution): string {
+  if (resolution.resolvable) {
+    return `Waiting on ${resolution.holder.displayName} (${gateOwner}) to approve or reject.`
+  }
+  switch (resolution.reason) {
+    case 'absent':
+      return 'Blocked — no gate owner is configured for this task; set gate_owner to route it for approval.'
+    case 'no_grant':
+      return `Blocked — nobody currently holds ${gateOwner}; grant it to a member or agent to unblock.`
+    case 'multiple_grants':
+      return `Blocked — ${gateOwner} is granted to more than one principal; narrow it to a single owner to unblock.`
+    case 'inactive':
+      return `Blocked — ${resolution.holder?.displayName ?? 'the current holder'} of ${gateOwner} is inactive; reassign the grant to unblock.`
+    default:
+      return `Blocked — ${gateOwner ?? 'this task'} has no resolvable owner.`
+  }
+}
+
+/** Decorate raw ApprovalRow rows with server-computed owner/reason/can_verdict. */
+async function decorateApprovals(env: Env, items: ApprovalRow[]): Promise<ApprovalItem[]> {
+  const resolutions = await resolveGateOwners(env, items.map((item) => item.gate_owner))
+  return items.map((item) => {
+    const resolution: GateOwnerResolution = item.gate_owner
+      ? resolutions.get(item.gate_owner) ?? { resolvable: false, capability: item.gate_owner, reason: 'no_grant', holder: null }
+      : { resolvable: false, capability: null, reason: 'absent', holder: null }
+    return {
+      ...item,
+      gate_owner_name: resolution.resolvable ? resolution.holder.displayName : null,
+      blocker_reason: blockerReason(item.gate_owner, resolution),
+      can_verdict: resolution.resolvable,
+    }
+  })
 }
 
 // The gate queue only lists tasks that CAN be verdicted. A review task with a
@@ -63,8 +112,8 @@ const PUBLISHABLE_SELECT = `
 
 export async function loadApprovals(env: Env, auth: AuthContext): Promise<ApprovalItem[]> {
   if (isOwnerAdmin(auth)) {
-    const rs = await env.DB.prepare(`${BASE_SELECT} ORDER BY t.created_at ASC`).all<ApprovalItem>()
-    return rs.results ?? []
+    const rs = await env.DB.prepare(`${BASE_SELECT} ORDER BY t.created_at ASC`).all<ApprovalRow>()
+    return decorateApprovals(env, rs.results ?? [])
   }
 
   // Non-admin: visibility == verdict authority. Same principal resolution as
@@ -85,20 +134,31 @@ export async function loadApprovals(env: Env, auth: AuthContext): Promise<Approv
      ORDER BY t.created_at ASC`,
   )
     .bind(principalType, principalId)
-    .all<ApprovalItem>()
-  return rs.results ?? []
+    .all<ApprovalRow>()
+  return decorateApprovals(env, rs.results ?? [])
 }
 
 // Approved content-publish tasks awaiting the admin's separate Publish click.
 // Admin/owner only — see PUBLISHABLE_SELECT comment above. Non-admin callers get
 // an empty list (not a 403): the page still renders, the section just stays empty,
 // same shape as loadApprovals' non-admin path.
+//
+// These rows are past the verdict gate (status='approved') — Publish is a
+// SEPARATE action (publishCardHtml/publishScript, its own admin-gated write
+// path), so can_verdict is always false here and there is nothing left to
+// "wait on" for a verdict; the fields are still populated (not omitted) so
+// ApprovalItem stays one honest shape everywhere it is used.
 export async function loadPublishable(env: Env, auth: AuthContext): Promise<ApprovalItem[]> {
   if (!isOwnerAdmin(auth)) return []
   const rs = await env.DB.prepare(`${PUBLISHABLE_SELECT} ORDER BY t.created_at ASC`)
     .bind(CONTENT_GATE_OWNER)
-    .all<ApprovalItem>()
-  return rs.results ?? []
+    .all<ApprovalRow>()
+  return (rs.results ?? []).map((item) => ({
+    ...item,
+    gate_owner_name: null,
+    blocker_reason: 'Approved — awaiting the separate Publish action.',
+    can_verdict: false,
+  }))
 }
 
 // Small pure helper for the result preview shown on queue cards.

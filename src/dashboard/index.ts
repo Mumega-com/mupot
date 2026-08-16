@@ -3356,6 +3356,21 @@ export function shell(
       .approval.decided { opacity: .55; }
       .publish.decided { opacity: .55; }
 
+      /* Flight-008 Slice 2 (mupot#1061) — blocker reason, owner, and the
+         no-verdict-control state (a row with no safe, named owner). */
+      .appr-reason { margin-top: 8px; font-size: 13px; color: var(--muted); }
+      .appr-owner { display: block; margin-top: 2px; font-size: 12px; color: var(--accent); }
+      .appr-no-action {
+        font-size: 13px; color: var(--warn2); border: 1px dashed var(--warn2);
+        border-radius: 8px; padding: 6px 10px;
+      }
+      .appr-select { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); }
+      .appr-batch-toolbar {
+        display: none; align-items: center; gap: 10px; flex-wrap: wrap;
+        margin-bottom: 12px; padding: 10px 12px; border: 1px solid var(--border);
+        border-radius: 8px; background: var(--surface2);
+      }
+
       /* recent tasks table */
       .recent-tasks { width: 100%; border-collapse: collapse; font-size: 13px; }
       .recent-tasks th, .recent-tasks td {
@@ -4397,6 +4412,14 @@ function opsHealthBody(data: OpsHealthData) {
  * Shared between observatoryBody (operator queue) and approvalsBody (/approvals page).
  * The verdict buttons call the existing RBAC-gated POST /api/tasks/:id/verdict endpoint.
  * NO new write path is introduced here (adversarial review point from #12).
+ *
+ * Flight-008 Slice 2 (mupot#1061, Safe Approvals Triage): every card shows the
+ * server-derived blocker_reason (never a generic placeholder) and, when one is
+ * resolvable, the gate_owner_name. Approve/Reject render ONLY when
+ * t.can_verdict is true — a server-computed field (dashboard/approvals.ts,
+ * resolveGateOwner) mirroring what POST /api/tasks/:id/verdict would actually
+ * honor. When false, NO <button> markup is emitted at all: the control is
+ * structurally absent, not disabled/hidden, so it cannot be re-enabled client-side.
  */
 function approvalCardHtml(t: ApprovalItem): string {
   const preview = resultPreview(t)
@@ -4405,27 +4428,35 @@ function approvalCardHtml(t: ApprovalItem): string {
   const gateChip = t.gate_owner
     ? `· <span class="gate-chip">${escHtml(t.gate_owner)}</span>`
     : ''
+  const ownerHtml = t.can_verdict && t.gate_owner_name
+    ? `<span class="appr-owner">Owner: ${escHtml(t.gate_owner_name)}</span>`
+    : ''
   const when = escHtml((t.completed_at ?? t.created_at).slice(0, 16).replace('T', ' '))
   const previewHtml = preview
     ? `<div class="appr-result"><div class="lbl">Result</div>${escHtml(preview)}</div>`
     : ''
+  const reasonHtml = `<div class="appr-reason">${escHtml(t.blocker_reason)}</div>`
+  const actionsHtml = t.can_verdict
+    ? `<label class="appr-select"><input type="checkbox" class="appr-check" /> Select</label>
+        <input type="text" class="appr-note" placeholder="note (optional; required to reject)" />
+        <button class="btn appr-approve">Approve</button>
+        <button class="btn btn-reject appr-reject">Reject</button>
+        <span class="appr-status"></span>`
+    : `<span class="appr-no-action">No verdict action available</span>`
   return `
-    <div class="card approval" data-task="${escAttr(t.id)}" style="border-left:3px solid var(--accent)">
+    <div class="card approval" data-task="${escAttr(t.id)}" data-can-verdict="${t.can_verdict ? '1' : '0'}" style="border-left:3px solid var(--accent)">
       <div class="appr-head">
         <div>
           <div class="appr-title">${escHtml(t.title)}</div>
           <div class="appr-meta">${agentLabel} · ${squadLabel} ${gateChip}</div>
+          ${ownerHtml}
         </div>
         <div class="appr-when">${when}</div>
       </div>
       <div class="appr-body">${escHtml(t.body)}</div>
+      ${reasonHtml}
       ${previewHtml}
-      <div class="appr-actions">
-        <input type="text" class="appr-note" placeholder="note (optional; required to reject)" />
-        <button class="btn appr-approve">Approve</button>
-        <button class="btn btn-reject appr-reject">Reject</button>
-        <span class="appr-status"></span>
-      </div>
+      <div class="appr-actions">${actionsHtml}</div>
     </div>`
 }
 
@@ -4437,9 +4468,15 @@ function obsQueueScript(): string {
     <script>
       (function () {
         document.querySelectorAll('#obs-queue .approval').forEach(function (card) {
+          // Flight-008 Slice 2: a row with no safe, named gate owner renders NO
+          // Approve/Reject buttons at all (data-can-verdict="0") — nothing to wire.
+          if (card.getAttribute('data-can-verdict') !== '1') return;
           var id = card.getAttribute('data-task');
           var note = card.querySelector('.appr-note');
           var status = card.querySelector('.appr-status');
+          var approveBtn = card.querySelector('.appr-approve');
+          var rejectBtn = card.querySelector('.appr-reject');
+          if (!approveBtn || !rejectBtn) return;
           function decide(verdict) {
             if (verdict === 'rejected' && !note.value.trim()) {
               status.textContent = 'a note is required to reject';
@@ -4467,8 +4504,8 @@ function obsQueueScript(): string {
               card.querySelectorAll('button').forEach(function (b) { b.disabled = false; });
             });
           }
-          card.querySelector('.appr-approve').addEventListener('click', function () { decide('approved'); });
-          card.querySelector('.appr-reject').addEventListener('click', function () { decide('rejected'); });
+          approveBtn.addEventListener('click', function () { decide('approved'); });
+          rejectBtn.addEventListener('click', function () { decide('rejected'); });
         });
 
         // Jump-to-now: scroll the swimlane grid all the way right.
@@ -4968,6 +5005,21 @@ function approvalsBody(
   const cards = items.map((t) => approvalCardHtml(t)).join('')
   const n = items.length
 
+  // Flight-008 Slice 2 (mupot#1061): batch triage toolbar. Only rendered when
+  // at least one row has a resolvable, currently-valid owner — a queue with
+  // zero verdictable rows has nothing safe to batch-resolve either.
+  const verdictableCount = items.filter((t) => t.can_verdict).length
+  const batchToolbar = verdictableCount
+    ? raw(`
+      <div class="appr-batch-toolbar" id="appr-batch-toolbar">
+        <span id="appr-batch-count">0 selected</span>
+        <input type="text" id="appr-batch-note" class="appr-note" placeholder="note (optional; required to reject)" />
+        <button class="btn" id="appr-batch-approve">Approve selected</button>
+        <button class="btn btn-reject" id="appr-batch-reject">Reject selected</button>
+        <span id="appr-batch-status" class="appr-status"></span>
+      </div>`)
+    : html``
+
   // "Ready to publish" (flight-1 gap fix): tasks already past the gate
   // (status='approved', gate:content) with no operator control to fire the real
   // write. loadPublishable is admin/owner-gated server-side — publishable is
@@ -4996,7 +5048,7 @@ function approvalsBody(
       badge: n ? `${String(n)} awaiting your gate` : 'Gate clear',
       badgeTone: n ? 'warn' : 'ok',
     })}
-    ${n ? raw(`<div id="approvals-list">${cards}</div>`) : html`<div class="card"><p class="empty">Nothing waiting at your gates. Gated work lands here when an agent finishes it.</p></div>`}
+    ${n ? html`${batchToolbar}${raw(`<div id="approvals-list">${cards}</div>`)}` : html`<div class="card"><p class="empty">Nothing waiting at your gates. Gated work lands here when an agent finishes it.</p></div>`}
     ${n ? approvalsScript() : html``}
     ${publishSection}
     ${secretEnvApprovalsSection(secretEnvRequests)}`
@@ -5074,15 +5126,27 @@ function publishScript() {
 function approvalsScript() {
   // Same-origin, credentialed. POSTs to the existing RBAC'd verdict endpoint;
   // CSRF Origin check + no-store come from the dashboard middleware.
+  //
+  // Flight-008 Slice 2 (mupot#1061): a row with data-can-verdict="0" has no
+  // .appr-approve/.appr-reject buttons at all (see approvalCardHtml) — this
+  // wiring loop simply has nothing to attach to on those cards, so it moves on.
+  // The batch toolbar (rendered only when >=1 row is verdictable) POSTs to
+  // POST /api/tasks/batch-verdict, which re-runs the SAME per-task RBAC +
+  // idempotent verdict write for every selected id — see src/tasks/index.ts.
   return raw(`
     <script>
       (function () {
         var list = document.getElementById('approvals-list');
         if (!list) return;
-        list.querySelectorAll('.approval').forEach(function (card) {
+
+        function wireCard(card) {
+          if (card.getAttribute('data-can-verdict') !== '1') return;
           var id = card.getAttribute('data-task');
           var note = card.querySelector('.appr-note');
           var status = card.querySelector('.appr-status');
+          var approveBtn = card.querySelector('.appr-approve');
+          var rejectBtn = card.querySelector('.appr-reject');
+          if (!approveBtn || !rejectBtn) return;
           function decide(verdict) {
             if (verdict === 'rejected' && !note.value.trim()) {
               status.textContent = 'a note is required to reject';
@@ -5110,9 +5174,89 @@ function approvalsScript() {
               card.querySelectorAll('button').forEach(function (b) { b.disabled = false; });
             });
           }
-          card.querySelector('.appr-approve').addEventListener('click', function () { decide('approved'); });
-          card.querySelector('.appr-reject').addEventListener('click', function () { decide('rejected'); });
+          approveBtn.addEventListener('click', function () { decide('approved'); });
+          rejectBtn.addEventListener('click', function () { decide('rejected'); });
+        }
+        list.querySelectorAll('.approval').forEach(wireCard);
+
+        // ── batch toolbar ────────────────────────────────────────────────────
+        var toolbar = document.getElementById('appr-batch-toolbar');
+        if (!toolbar) return;
+        var countEl = document.getElementById('appr-batch-count');
+        var batchNote = document.getElementById('appr-batch-note');
+        var batchStatus = document.getElementById('appr-batch-status');
+
+        function selectableCards() {
+          return Array.prototype.slice.call(
+            list.querySelectorAll('.approval[data-can-verdict="1"]:not(.decided)')
+          );
+        }
+        function selectedIds() {
+          return selectableCards()
+            .filter(function (card) {
+              var cb = card.querySelector('.appr-check');
+              return cb && cb.checked;
+            })
+            .map(function (card) { return card.getAttribute('data-task'); });
+        }
+        function refreshToolbar() {
+          var ids = selectedIds();
+          toolbar.style.display = ids.length ? 'flex' : 'none';
+          if (countEl) countEl.textContent = ids.length + ' selected';
+        }
+        list.querySelectorAll('.appr-check').forEach(function (cb) {
+          cb.addEventListener('change', refreshToolbar);
         });
+
+        function batchDecide(verdict) {
+          var ids = selectedIds();
+          if (!ids.length) return;
+          var noteValue = batchNote ? batchNote.value.trim() : '';
+          if (verdict === 'rejected' && !noteValue) {
+            if (batchStatus) batchStatus.textContent = 'a note is required to reject';
+            return;
+          }
+          toolbar.querySelectorAll('button').forEach(function (b) { b.disabled = true; });
+          if (batchStatus) batchStatus.textContent = '…';
+          fetch('/api/tasks/batch-verdict', {
+            method: 'POST', credentials: 'same-origin',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ ids: ids, verdict: verdict, note: noteValue || undefined })
+          }).then(function (res) {
+            return res.json().then(function (data) { return { ok: res.ok, data: data }; });
+          }).then(function (r) {
+            toolbar.querySelectorAll('button').forEach(function (b) { b.disabled = false; });
+            var results = (r.data && r.data.results) || [];
+            var appliedCount = 0;
+            results.forEach(function (item) {
+              var card = list.querySelector('.approval[data-task="' + item.id + '"]');
+              if (!card) return;
+              var status = card.querySelector('.appr-status');
+              if (item.applied) {
+                appliedCount += 1;
+                if (status) status.textContent = verdict === 'approved' ? 'approved ✓' : 'rejected ✗';
+                card.classList.add('decided');
+                card.querySelectorAll('button, input').forEach(function (el) { el.disabled = true; });
+              } else if (status) {
+                var reason = (item.body && (item.body.error || item.body.reason)) || 'skipped';
+                status.textContent = reason;
+              }
+            });
+            if (batchStatus) {
+              batchStatus.textContent = r.ok
+                ? (appliedCount + '/' + results.length + ' applied')
+                : ((r.data && r.data.error) || 'batch failed');
+            }
+            refreshToolbar();
+          }).catch(function () {
+            toolbar.querySelectorAll('button').forEach(function (b) { b.disabled = false; });
+            if (batchStatus) batchStatus.textContent = 'network error — try again';
+          });
+        }
+        var batchApprove = document.getElementById('appr-batch-approve');
+        var batchReject = document.getElementById('appr-batch-reject');
+        if (batchApprove) batchApprove.addEventListener('click', function () { batchDecide('approved'); });
+        if (batchReject) batchReject.addEventListener('click', function () { batchDecide('rejected'); });
       })();
     </script>`)
 }

@@ -156,3 +156,93 @@ export async function resolveSoleGateOwnerAgent(env: Env, gateOwner: string): Pr
   const results = rows.results ?? []
   return results.length === 1 ? results[0].principal_id : null
 }
+
+// ── Flight-008 Slice 2 (mupot#1061, Safe Approvals Triage) ───────────────────
+//
+// A named, currently-active gate lane owner — the read-side fact a triage UI
+// needs before it is safe to offer an Approve/Reject control at all. This
+// generalises resolveSoleGateOwnerAgent (above) in two ways the dashboard
+// needs and the auto-wake path does not:
+//   1. Member principals too — humans hold gate_grants rows exactly like
+//      agents do (e.g. the /approvals member path in tasks/index.ts), so a
+//      "who must approve" projection that only resolves agents would render
+//      every human-owned gate as unowned.
+//   2. Liveness — a grant to a PAUSED agent or a SUSPENDED member is not a
+//      safe target: the capability nominally has a holder, but no one who can
+//      actually act on it. That holder is surfaced (for the blocker-reason
+//      text) but resolvable stays false.
+//
+// Same posture as resolveSoleGateOwnerAgent on cardinality: zero or more than
+// one holder has no unambiguous accountable owner, so both collapse to
+// "unresolved" rather than guessing. Callers must never render a verdict
+// control when resolvable is false.
+
+export interface GateOwnerHolder {
+  readonly principalType: GatePrincipalType
+  readonly principalId: string
+  readonly displayName: string
+  readonly active: boolean
+}
+
+export type GateOwnerUnresolvedReason = 'absent' | 'no_grant' | 'multiple_grants' | 'inactive'
+
+export type GateOwnerResolution =
+  | { readonly resolvable: true; readonly capability: string; readonly holder: GateOwnerHolder }
+  | {
+      readonly resolvable: false
+      readonly capability: string | null
+      readonly reason: GateOwnerUnresolvedReason
+      readonly holder: GateOwnerHolder | null
+    }
+
+interface GateOwnerHolderRow {
+  principal_type: GatePrincipalType
+  principal_id: string
+  display_name: string | null
+  principal_status: string | null
+}
+
+export async function resolveGateOwner(env: Env, gateOwner: string | null): Promise<GateOwnerResolution> {
+  if (!gateOwner) return { resolvable: false, capability: null, reason: 'absent', holder: null }
+
+  const rows = await env.DB.prepare(
+    `SELECT g.principal_type, g.principal_id,
+            CASE WHEN g.principal_type = 'agent' THEN a.name ELSE m.display_name END AS display_name,
+            CASE WHEN g.principal_type = 'agent' THEN a.status ELSE m.status END AS principal_status
+       FROM gate_grants g
+       LEFT JOIN agents  a ON g.principal_type = 'agent'  AND a.id = g.principal_id
+       LEFT JOIN members m ON g.principal_type = 'member' AND m.id = g.principal_id
+      WHERE g.capability = ?1`,
+  )
+    .bind(gateOwner)
+    .all<GateOwnerHolderRow>()
+
+  const results = rows.results ?? []
+  if (results.length === 0) return { resolvable: false, capability: gateOwner, reason: 'no_grant', holder: null }
+  if (results.length > 1) return { resolvable: false, capability: gateOwner, reason: 'multiple_grants', holder: null }
+
+  const row = results[0]
+  const holder: GateOwnerHolder = {
+    principalType: row.principal_type,
+    principalId: row.principal_id,
+    displayName: row.display_name ?? row.principal_id,
+    active: row.principal_status === 'active',
+  }
+  if (!holder.active) return { resolvable: false, capability: gateOwner, reason: 'inactive', holder }
+  return { resolvable: true, capability: gateOwner, holder }
+}
+
+/** Resolve several gate_owner capabilities in parallel, de-duplicated — the
+ * batch-friendly counterpart to resolveGateOwner for list surfaces (e.g. the
+ * /approvals queue) where many rows commonly share the same capability. */
+export async function resolveGateOwners(
+  env: Env,
+  gateOwners: ReadonlyArray<string | null>,
+): Promise<Map<string, GateOwnerResolution>> {
+  const distinct = Array.from(new Set(gateOwners.filter((v): v is string => Boolean(v))))
+  const map = new Map<string, GateOwnerResolution>()
+  await Promise.all(distinct.map(async (capability) => {
+    map.set(capability, await resolveGateOwner(env, capability))
+  }))
+  return map
+}
