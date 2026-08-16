@@ -327,6 +327,27 @@ catch. It also produced the corollary:
 > **The HOST is a shared `artifact_ref`.** Host remediation takes a claim the same way a file
 > does. Two agents acted on host memory the same evening with neither declaring one.
 
+> **A git BRANCH is a shared `artifact_ref` too.** A second agent committed to this document's
+> own branch and pushed it, duplicating three rules into two wordings and reintroducing a hole
+> the gate had just closed.
+
+> **A clearance dies when the pen moves.** The write above was not unauthorised — it was
+> authorised *earlier*, and never revoked when authorship changed hands. A standing clearance
+> outlives the situation that justified it. A write requires a **live** claim, not a remembered
+> permission.
+
+And the collision produced the sharpest version of this document's thesis, one layer beneath
+where anyone was looking:
+
+> **A commit stamp in a shared worktree is a routing label, not a principal.**
+
+Git recorded that write as authored by the worktree's inherited identity. The bus record shows a
+different agent announced the push, and the *content* was text handed to that agent and to nobody
+else. Three sources, no agreement, and **no attribution provable** — the identical structure as
+the model-label finding, expressed in version control instead of inference. We do not reliably
+know which model wrote a thing, and we do not reliably know which agent committed it. Both are
+declarations we have been reading as observations.
+
 ### The rule is symmetric
 
 > **A correction is also a claim about a file, and must be verified against the file before it is
