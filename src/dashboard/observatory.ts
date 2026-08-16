@@ -293,13 +293,26 @@ export async function loadAgentRuntimeStates(env: Env, nowMs = Date.now()): Prom
   return states
 }
 
-export async function loadObservatory(env: Env): Promise<ObservatoryData> {
+/**
+ * nowMs is threaded (not read from Date.now() inside) so Home's runtime-liveness
+ * count can be clock-pinned the same way the other two owner-facing surfaces
+ * already are — loadOpsHealth(env, auth, nowMs) and loadFleetRadar(env, nowMs, …).
+ *
+ * Flight-008 Slice 1 (mupot#1060), River kill-witness review: without this, the
+ * cross-surface parity test could only assert liveness against the WALL CLOCK.
+ * Its fixture pins a heartbeat at 11:58Z against a NOW of 12:00Z, so the suite
+ * passed in CI and then began failing deterministically ~12:01Z once the 180s
+ * presence TTL elapsed in real time — a green that rots on a timer rather than
+ * on a code change. A count helper whose three consumers cannot all be pinned to
+ * one clock is not actually single-source; this closes that last gap.
+ */
+export async function loadObservatory(env: Env, nowMs = Date.now()): Promise<ObservatoryData> {
   const [agentRows, statsMap, runtimeStates, bars, recentTasks] = await Promise.all([
     env.DB.prepare(
       'SELECT id, squad_id, slug, name, role, model, status, created_at FROM agents ORDER BY created_at ASC, name ASC',
     ).all<Agent>(),
     loadAgentStats(env),
-    loadAgentRuntimeStates(env),
+    loadAgentRuntimeStates(env, nowMs),
     loadSwimlaneBars(env),
     loadRecentTasks(env),
   ])

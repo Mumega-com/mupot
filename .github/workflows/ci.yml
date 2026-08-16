@@ -185,6 +185,27 @@ jobs:
       - name: Guard — tests must build schema from the migration chain
         run: node scripts/check-test-schema-source.mjs
 
+  operator-counts-source:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      # Flight-008 Slice 1 (mupot#1060): Home, Health, and Fleet used to independently
+      # re-derive the same "how many agents are live / need a decision" hero KPIs and
+      # disagreed (Home 25 agents vs Health 23; Home 127 decisions vs Health 130).
+      # src/dashboard/operator-counts.ts is now the ONE place those aggregations live.
+      # This guard fails the build the moment any OTHER src/dashboard/*.ts file
+      # reintroduces one of the three query/filter shapes that caused the divergence.
+      # Self-tests first — the pure matcher this guard runs on is exported and driven
+      # with synthetic content in tests/check-operator-counts-source.test.ts.
+      - name: Guard self-tests
+        run: npx vitest run tests/check-operator-counts-source.test.ts
+      - name: Guard — no second implementation of the operator hero-KPI aggregations
+        run: node scripts/check-operator-counts-source.mjs
+
   migration-numbering:
     runs-on: ubuntu-latest
     steps:

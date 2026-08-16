@@ -4,7 +4,10 @@
 // instead of creating a new health table. The point is an operator-readable
 // answer to "is this pot healthy, what is wrong, and where do I act next?"
 
-import type { Env } from '../types'
+import type { Agent, AuthContext, Env } from '../types'
+import { loadAgentStats, loadAgentRuntimeStates, type AgentStat, type AgentRuntimeState } from './observatory'
+import { loadApprovals, type ApprovalItem } from './approvals'
+import { computeOperatorCounts, loadTaskStatusCounts, type OperatorCounts } from './operator-counts'
 
 export type HealthTone = 'ok' | 'warn' | 'danger' | 'dim'
 
@@ -179,6 +182,19 @@ async function safeAll<T>(env: Env, sql: string, binds: unknown[] = []): Promise
   }
 }
 
+/** Same fail-soft contract as safeAll, for the canonical operator-counts.ts loaders
+ *  (which throw rather than swallow, unlike this module's queries). /ops must survive a
+ *  broken/partial schema — that is literally what the "Schema readiness" check below is
+ *  for — so a canonical-loader failure becomes a queryErrors entry + a safe fallback
+ *  value, never a 500 for the whole page. */
+async function safeCall<T>(fn: () => Promise<T>, fallback: T): Promise<{ value: T; error: string | null }> {
+  try {
+    return { value: await fn(), error: null }
+  } catch (err) {
+    return { value: fallback, error: err instanceof Error ? err.message : String(err) }
+  }
+}
+
 function toNumber(v: unknown): number {
   if (typeof v === 'number' && Number.isFinite(v)) return v
   if (typeof v === 'string') {
@@ -267,11 +283,10 @@ function makeCheck(input: HealthCheck): HealthCheck {
   return input
 }
 
-export async function loadOpsHealth(env: Env, nowMs = Date.now()): Promise<OpsHealthData> {
+export async function loadOpsHealth(env: Env, auth: AuthContext, nowMs = Date.now()): Promise<OpsHealthData> {
   const tenant = env.TENANT_SLUG
   const [
-    agents,
-    tasks,
+    agentsRaw,
     fleet,
     presence,
     connectors,
@@ -283,9 +298,12 @@ export async function loadOpsHealth(env: Env, nowMs = Date.now()): Promise<OpsHe
     verdicts,
     loopObserver,
     schemaTables,
+    stats,
+    runtimeStates,
+    approvals,
+    taskStatusCounts,
   ] = await Promise.all([
-    safeAll<CountRow>(env, 'SELECT status, COUNT(*) AS count FROM agents GROUP BY status'),
-    safeAll<CountRow>(env, 'SELECT status, COUNT(*) AS count FROM tasks GROUP BY status'),
+    safeAll<Pick<Agent, 'id' | 'status'>>(env, 'SELECT id, status FROM agents'),
     safeAll<FleetAgentRow>(
       env,
       `SELECT agent_id, display, runtime, lifecycle, status, last_reported_at, updated_at
@@ -374,11 +392,27 @@ export async function loadOpsHealth(env: Env, nowMs = Date.now()): Promise<OpsHe
           AND name IN (${CORE_TABLES.map(() => '?').join(',')})`,
       CORE_TABLES,
     ),
+    // Flight-008 Slice 1 (mupot#1060): the SAME canonical loaders Home's `/` route
+    // uses (dashboard/observatory.ts + dashboard/approvals.ts), wrapped fail-soft —
+    // /ops must survive a broken/partial schema (see "Schema readiness" below), so a
+    // failure here becomes a queryErrors entry + safe fallback, not a 500.
+    safeCall(() => loadAgentStats(env), new Map<string, AgentStat>()),
+    safeCall(() => loadAgentRuntimeStates(env, nowMs), new Map<string, AgentRuntimeState>()),
+    safeCall(() => loadApprovals(env, auth), [] as ApprovalItem[]),
+    safeCall(() => loadTaskStatusCounts(env), new Map<string, number>()),
   ])
 
+  const counts: OperatorCounts = computeOperatorCounts({
+    nowMs,
+    agents: agentsRaw.rows,
+    stats: stats.value,
+    runtimeStates: runtimeStates.value,
+    approvals: approvals.value,
+    taskStatusCounts: taskStatusCounts.value,
+  })
+
   const queryErrors = [
-    agents,
-    tasks,
+    agentsRaw,
     fleet,
     presence,
     connectors,
@@ -391,17 +425,20 @@ export async function loadOpsHealth(env: Env, nowMs = Date.now()): Promise<OpsHe
     loopObserver,
     schemaTables,
   ].flatMap((r) => (r.error ? [r.error] : []))
+    .concat([stats.error, runtimeStates.error, approvals.error, taskStatusCounts.error].flatMap((e) => (e ? [e] : [])))
 
-  const activeAgents = countFor(agents.rows, 'active')
-  const pausedAgents = countFor(agents.rows, 'paused')
-  const totalAgents = activeAgents + pausedAgents
+  // Agent roster + task-queue detail text below reads the SAME canonical `counts` /
+  // taskStatusCounts the KPI strip above uses — never a second GROUP BY. See
+  // operator-counts.ts.
+  const activeAgents = counts.agentsActive
+  const pausedAgents = counts.agentsPaused
+  const totalAgents = counts.agentsTotal
 
-  const openTasks = countFor(tasks.rows, 'open')
-  const inProgressTasks = countFor(tasks.rows, 'in_progress')
-  const reviewTasks = countFor(tasks.rows, 'review')
-  const blockedTasks = countFor(tasks.rows, 'blocked')
-  const rejectedTasks = countFor(tasks.rows, 'rejected')
-  const blockedOrRejected = blockedTasks + rejectedTasks
+  const openTasks = taskStatusCounts.value.get('open') ?? 0
+  const inProgressTasks = taskStatusCounts.value.get('in_progress') ?? 0
+  const blockedTasks = taskStatusCounts.value.get('blocked') ?? 0
+  const rejectedTasks = taskStatusCounts.value.get('rejected') ?? 0
+  const blockedOrRejected = counts.blockedOrRejectedCount
 
   const runtimeSignals: RuntimeSignal[] = [
     ...fleet.rows.map((row) => {
@@ -435,7 +472,11 @@ export async function loadOpsHealth(env: Env, nowMs = Date.now()): Promise<OpsHe
     }),
   ].sort((a, b) => toneRank(b.tone) - toneRank(a.tone))
 
-  const runtimeOnline = runtimeSignals.filter((r) => r.tone === 'ok').length
+  // NOTE: deliberately NOT a second "how many agents are live" number. runtimeSignals
+  // mixes fleet_agents rows AND presence rows (the same agent can appear in both) —
+  // it answers "how many runtime/presence evidence SIGNALS look stale", which is a
+  // genuinely different, row-level diagnostic question from counts.liveRuntimeCount
+  // (the canonical per-agent tally the KPI strip and "Runtime liveness" check use).
   const activePresence = presence.rows.filter((r) => liveness(r.last_seen_at, nowMs) === 'active').length
   const staleRuntime = runtimeSignals.filter((r) => r.tone === 'warn' || r.tone === 'danger').length
 
@@ -535,13 +576,13 @@ export async function loadOpsHealth(env: Env, nowMs = Date.now()): Promise<OpsHe
     makeCheck({
       id: 'runtime',
       label: 'Runtime liveness',
-      tone: runtimeOnline > 0 && staleRuntime === 0 ? 'ok' : runtimeOnline > 0 ? 'warn' : 'warn',
-      state: runtimeOnline > 0 ? `${runtimeOnline} online` : 'no online runtime',
+      tone: counts.liveRuntimeCount > 0 && staleRuntime === 0 ? 'ok' : counts.liveRuntimeCount > 0 ? 'warn' : 'warn',
+      state: counts.liveRuntimeCount > 0 ? `${counts.liveRuntimeCount} online` : 'no online runtime',
       detail:
         runtimeSignals.length > 0
           ? `${runtimeSignals.length} runtime or presence signals; ${staleRuntime} need attention.`
           : 'No runtime has checked in through fleet or pot-native presence.',
-      nextAction: runtimeOnline > 0 ? 'Open Fleet for stale or stopped runtimes.' : 'Attach a runtime or start the host consumer.',
+      nextAction: counts.liveRuntimeCount > 0 ? 'Open Fleet for stale or stopped runtimes.' : 'Attach a runtime or start the host consumer.',
       href: '/fleet',
     }),
     makeCheck({
@@ -556,10 +597,10 @@ export async function loadOpsHealth(env: Env, nowMs = Date.now()): Promise<OpsHe
     makeCheck({
       id: 'approvals',
       label: 'Approval gates',
-      tone: reviewTasks > 0 ? 'warn' : 'ok',
-      state: reviewTasks > 0 ? `${reviewTasks} waiting` : 'clear',
-      detail: reviewTasks > 0 ? 'Gated work is waiting for an accountable verdict.' : 'No tasks are waiting in review.',
-      nextAction: reviewTasks > 0 ? 'Approve, reject, or request changes.' : 'No action needed.',
+      tone: counts.needsDecisionCount > 0 ? 'warn' : 'ok',
+      state: counts.needsDecisionCount > 0 ? `${counts.needsDecisionCount} waiting` : 'clear',
+      detail: counts.needsDecisionCount > 0 ? 'Gated work is waiting for an accountable verdict.' : 'No tasks are waiting in review.',
+      nextAction: counts.needsDecisionCount > 0 ? 'Approve, reject, or request changes.' : 'No action needed.',
       href: '/approvals',
     }),
     makeCheck({
@@ -659,9 +700,9 @@ export async function loadOpsHealth(env: Env, nowMs = Date.now()): Promise<OpsHe
     checks,
     kpis: {
       activeAgents,
-      runtimeOnline,
+      runtimeOnline: counts.liveRuntimeCount,
       activePresence,
-      needsDecision: reviewTasks,
+      needsDecision: counts.needsDecisionCount,
       blockedOrRejected,
       recentAudit: auditSignals.length,
     },
