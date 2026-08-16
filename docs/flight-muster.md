@@ -77,12 +77,11 @@ stamped at flight start is a static token for identity.
 
 > **Declaration is the input. Observation is the gate.**
 
-> **A SEAL IS A CLAIM ABOUT A FILE AND MUST BE VERIFIED AGAINST THE FILE.** `muster.mustered`
-> certifies `observed == declared`; the certification is itself a seal and must be re-verifiable
-> against the observation records it names — never against a summary of them. Announcement ≠ text;
-> relay ≠ evidence. (Live case, 2026-08-16: two charter copies stamped different A6 amendments
-> within 60 seconds; announcements ran ahead of their text twice. Recorded in the charter
-> reconciliation record and the muster gate verdict.)
+And the rule turns back on the muster itself: `muster.mustered` certifies that
+`observed == declared`, which makes **the certification its own kind of seal** — it must stay
+re-verifiable against the observation records it names, never against a summary of them. A
+muster verdict nobody can re-derive is a relay. See ["A seal is a claim about a file"](#a-seal-is-a-claim-about-a-file-f3)
+for the rule and the four ways it was violated the night this was written.
 
 An agent declares what it intends to be. The muster **independently observes** what it
 actually is. A flight departs only when the two agree. Disagreement is a NO-GO with a named
@@ -169,13 +168,7 @@ because no substitution ever occurred. Check the standing state, not just the tr
 
 ### The lens source must be harness-independent (F1)
 
-**The pane string is a declaration by another name.** The tmux pane model string is printed
-by the harness itself; it proves identity-as-printed, not truth. If the harness prints a
-wrong string, `observed == declared == wrong` and the lens invariant certifies a monoculture
-as diversity. Lens observations MUST come from a source the harness does not control: provider
-contract (what the API key is billed/routed as), API-side model attribution, or a behavioural
-probe with model-distinguishable answers. In the `ObservationSource` strength ordering,
-pane-capture ranks below provider-contract FOR LENS (it remains valid for liveness and identity).
+> **The pane string is a declaration by another name.**
 
 This is the sharpest finding in the gate verdict on this document, and it breaks the naive
 version of everything above.
@@ -257,12 +250,7 @@ picker right now. It is not failed. Replacing it would discard a live session fo
 
 ### stalled vs blocked needs a named discriminator (F2)
 
-**`stalled` and `blocked` are discriminated by observation, never by guess.** Discriminator:
-harness input-wait state — an interactive prompt / picker / attached client waiting on input —
-means BLOCKED (the session is alive and waiting on a human); alive with no output, no error,
-and NO input-wait means STALLED. If the discriminator is unavailable for a given harness, default
-to `blocked`-hold and state the cost: replacing a live session is irreversible; holding is
-reversible. A false `stalled` re-creates the dead-crew flight this gate exists to close.
+> **`stalled` and `blocked` are discriminated by observation, never by guess.**
 
 The table above asserts a distinction the machinery may not be able to draw. **Alive, no output
 progress, no error** describes both states equally. Left unresolved, the taxonomy has four names
