@@ -383,7 +383,7 @@ async function runProjectWorkspaceWorkflow() {
 
   await page.goto(`${baseUrl}/send?project_id=project-mupot`, { waitUntil: 'networkidle', timeout: 20_000 })
   const projectSendText = await textSnippet(page.locator('body'), 3000)
-  if (!projectSendText.includes('Project context: Mupot') || await page.locator('#send-agent option').count() === 0) {
+  if (!projectSendText.includes('Project context: Mupot') || await page.locator('input[name="send-agent"]').count() === 0) {
     fail('project task context did not render an authorized picker', { projectSendText })
   }
   await page.goto(`${baseUrl}/flights?project_id=project-mupot`, { waitUntil: 'networkidle', timeout: 20_000 })
@@ -600,7 +600,11 @@ async function runSendTaskWorkflow() {
     '',
     'Verify the browser harness can create a task, preserve done_when, and render a visible result.',
   ].join('\n'))
-  await page.locator('#send-agent').selectOption('agent-hermes|sq-growth')
+  // Flight-008 Slice 3 (mupot#1062): the /send dispatch-now picker is a radio-card
+  // group (name="send-agent"), not a <select> — the browser can no longer supply
+  // an implicit "first option" default, so the smoke workflow must explicitly
+  // check the specific candidate's radio input by its "id|squad_id" value.
+  await page.locator('input[name="send-agent"][value="agent-hermes|sq-growth"]').check()
 
   const createResponsePromise = page.waitForResponse(
     (res) => res.url() === `${baseUrl}/api/tasks` && res.request().method() === 'POST',
