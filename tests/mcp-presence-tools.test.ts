@@ -209,7 +209,22 @@ describe('presence_heartbeat / presence_deregister — self-scoped only', () => 
   it('presence_heartbeat schema has no identity/target field to name another principal', () => {
     const spec = TOOLS.find((t) => t.name === 'presence_heartbeat')
     expect(spec).toBeDefined()
-    expect(Object.keys(spec?.inputSchema.properties ?? {})).toEqual(['project_id'])
+    const keys = Object.keys(spec?.inputSchema.properties ?? {})
+
+    // The exact list stays pinned (mupot#1117 added state/message/seq, the activity
+    // report — see src/mcp/presence.ts). Keeping it exact means any FUTURE field has
+    // to be added deliberately here, with someone asking whether it can name another
+    // principal — which is the property this test actually guards.
+    expect(keys).toEqual(['project_id', 'state', 'message', 'seq'])
+
+    // …and state the invariant directly rather than leaving it implied by the list.
+    // A pinned list catches a new field; it does not say WHY the field is dangerous.
+    // These two assertions together survive a future edit that updates the list
+    // without thinking: the intent is enforced independently of the enumeration.
+    for (const forbidden of ['identity', 'agent', 'agent_id', 'member_id', 'target', 'as', 'on_behalf_of']) {
+      expect(keys).not.toContain(forbidden)
+    }
+    expect(spec?.inputSchema.additionalProperties).toBe(false)
   })
 
   it('presence_deregister marks only the caller\'s own row offline', async () => {
