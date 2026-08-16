@@ -189,6 +189,34 @@ The general form, which is the whole document in one line: **an observation is o
 independent as the party that produced it.** Reading a value from the thing being measured is
 not measurement.
 
+#### Known limit: the required source may not exist
+
+This is not a hypothetical gap, and a build must confront it before writing any code.
+
+An independent check of `prime-agent`'s `openai-codex-responses` provider found that it
+initialises `output.model` from the **requested** `model.id` *before* the upstream request is
+made — verified in the shipped bundle, where `response.id` is stored but `response.model` is
+never substituted back. So the session log's model field is a **routed label, not API-side
+attribution**: it records what was asked for, never what answered. A direct provider-side
+readback was then attempted and refused (401 upstream, 403 at the backend).
+
+For that harness, today, **no harness-independent lens source is obtainable at all.**
+`lens_unverified` is therefore not a rare edge case there — it is the default state, and the lens
+invariant is *unenforceable* rather than merely unverified.
+
+A build must decide, explicitly, which of these it does — and say so in the code, not in a
+comment:
+
+1. treat `lens_unverified` as a hard NO-GO, which grounds every flight on that harness until
+   attribution exists;
+2. accept a declared lens under a recorded, expiring exception with the risk named;
+3. obtain attribution another way — a behavioural probe, or a provider relationship that returns
+   the serving model.
+
+What it must not do is let an unverifiable lens quietly satisfy the diversity constraint. That
+converts this document from a gate into a decoration, which is the failure it was written to
+describe.
+
 ## Failure taxonomy — replace vs demote vs hold
 
 "If a model or harness fails, replace it or change the roles" is right, but *failed* is three
@@ -279,9 +307,32 @@ catch. It also produced the corollary:
 > **The HOST is a shared `artifact_ref`.** Host remediation takes a claim the same way a file
 > does. Two agents acted on host memory the same evening with neither declaring one.
 
-Both rules exist because the only thing that surfaced any of the four failures was someone opening
-the file instead of trusting the message. That should be mechanical, not a function of who happens
-to be suspicious that day.
+### The rule is symmetric
+
+> **A correction is also a claim about a file, and must be verified against the file before it is
+> applied.**
+
+The failures above are all one direction — text lagging an accurate announcement. The same evening
+produced the other direction: an agent inferred from message traffic that a ruling had not
+happened, and moved to edit the governing document to mark a *correctly sealed* clause as open.
+The file had carried the ruling, with its timestamp, the whole time. It would have been the first
+event to make the record **less** accurate rather than more, and it was performed while invoking
+the seal rule.
+
+And a fourth shape, subtler than the rest: **a substring match reported as its context.** One
+agent grepped the charter for the revoked v1.1 phrasing, found it, and reported the clause as
+unfixed — but the match was inside the sentence *revoking* it. The string that proved the defect
+was the string that fixed it. The same error produced a host process count of 46 when the truth
+was 24, because the matcher was hitting socket paths and wrapper shells rather than processes.
+
+So the general form covers all four:
+
+> **A claim about a file — a seal, a correction, or a grep result — must be verified against the
+> file in context. A match is not a reading.**
+
+Every one of these was sincere, and every one was caught only because somebody opened the
+artifact. That is the argument for making verification mechanical rather than cultural: it caught
+three different agents in one evening, and nothing in the system would have caught any of them.
 
 ## Where it plugs in
 
