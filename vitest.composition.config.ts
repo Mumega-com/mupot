@@ -52,6 +52,14 @@ export default defineConfig({
       miniflare: {
         compatibilityDate: '2026-06-01',
         compatibilityFlags: ['nodejs_compat'],
+        // mupot#919 — a scratch D1 binding, unused by src/index.ts and not backed by this
+        // repo's migrations. It exists solely so tests/composition/d1-batch-visibility.test.ts
+        // can exercise the REAL workerd/Miniflare D1 implementation via `cloudflare:test`'s
+        // `env`, as opposed to tests/helpers/sqlite-d1.ts (a hand-rolled node:sqlite stand-in
+        // that #916/#943 already found is MORE transactional than the platform it models).
+        // This is the closest thing to production D1 available without live Cloudflare
+        // credentials — same D1 implementation class Wrangler/Miniflare ship, not a shim.
+        d1Databases: { D1_BATCH_PROBE: 'd1-batch-probe' },
       },
     }),
   ],
