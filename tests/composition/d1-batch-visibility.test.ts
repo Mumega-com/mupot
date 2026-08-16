@@ -8,11 +8,12 @@
 // merging its 24-site fix; #919 itself was never updated or closed to say so.
 //
 // This file is this flight's (FLIGHT-009B) contribution to that record: a permanent,
-// CI-run measurement against the REAL platform implementation, not a claim in a comment or
-// an issue body. It runs inside actual workerd via @cloudflare/vitest-pool-workers, whose D1
-// binding is Miniflare's own implementation of the D1 API — the same code Wrangler ships,
-// not this repo's tests/helpers/sqlite-d1.ts stand-in (which the #916 investigation already
-// showed is MORE transactional than production, i.e. the wrong direction of error to trust).
+// CI-run measurement against the OFFICIAL LOCAL workerd/Miniflare D1 SIMULATOR — explicitly
+// NOT remote, deployed D1. It runs inside actual workerd via @cloudflare/vitest-pool-workers,
+// whose D1 binding is Miniflare's own implementation of the D1 API — the same code Wrangler
+// ships locally, and materially better than this repo's tests/helpers/sqlite-d1.ts stand-in
+// (which the #916 investigation showed is MORE transactional than production, i.e. the wrong
+// direction of error to trust). "Local simulator" is the whole claim; see the gap note below.
 //
 // What this does NOT prove: it cannot reach Cloudflare's remote, deployed D1 (this run had
 // no live CF credentials). So it settles the LOCAL half of "verify against a real local run"
@@ -55,9 +56,10 @@ describe('#919 — D1Database.batch() intra-batch read visibility (real workerd 
     expect(selectResult.results?.[0]).toMatchObject({ status: 'leased' })
   })
 
-  it('a later statement sees an INSERT an earlier statement in the SAME batch just made', async () => {
+  it('a later aggregate SELECT sees an UPDATE an earlier statement in the SAME batch just made', async () => {
     // Mirrors src/mcp/routines.ts's report_run_usage: statement 0 UPDATEs a value,
-    // statement 1 SUMs/reads it back, in the same batch.
+    // statement 1 SUMs/reads it back, in the same batch. (Gate correction: this is an
+    // UPDATE, not an INSERT — the old title said INSERT and the code never performed one.)
     const [, sumResult] = await db.batch([
       db.prepare(`UPDATE probe SET val = 42 WHERE id = 1`).bind(),
       db.prepare(`SELECT SUM(val) AS total FROM probe`).bind(),
@@ -66,10 +68,21 @@ describe('#919 — D1Database.batch() intra-batch read visibility (real workerd 
     expect(sumResult.results?.[0]).toMatchObject({ total: 42 })
   })
 
-  it('the effect is NOT explained by an implicit whole-batch transaction masking a real gap', async () => {
-    // Control: a batch statement that depends on NOTHING earlier in the batch still reads
-    // the pre-existing 'pending' row correctly — rules out the batch trivially returning
-    // stale/cached results regardless of what happened before it.
+  // SEED SANITY CHECK — deliberately NOT a control, and the rename matters.
+  //
+  // It was originally titled as a control that "rules out the batch trivially returning
+  // stale/cached results." IT DOES NOT, AND CANNOT. It batches a single SELECT against the
+  // pre-seeded 'pending' row with nothing earlier in the batch to depend on — so a
+  // pre-batch-snapshot implementation returns exactly the same 'pending' row. IT PASSES
+  // UNDER BOTH COMPETING HYPOTHESES, which makes it incapable of discriminating between
+  // them: a vacuous check wearing a control's name.
+  //
+  // Caught by the correctness gate on this PR (Athena, 2026-08-16), and the irony is the
+  // point: a PR whose subject is "#919 overclaimed" shipped an overclaiming test. Same
+  // shape as mupot#1076's can_verdict — true on every reachable path, therefore proving
+  // nothing. Kept, honestly renamed, because the seed assertion is still worth having: if
+  // it fails, the fixture is broken and the two real tests above mean nothing.
+  it('seed sanity: the probe row exists and reads back as seeded (NOT a stale-result control)', async () => {
     const [result] = await db.batch([
       db.prepare(`SELECT status FROM probe WHERE id = 1`),
     ])
