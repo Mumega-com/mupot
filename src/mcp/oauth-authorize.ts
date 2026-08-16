@@ -505,6 +505,25 @@ function formatBudgetCap(cents: number | null): string {
   return `${n}¢`
 }
 
+// mupot#901 residual gap: a member with ZERO consentable agents (the exact
+// first-run case — no agent exists yet that this human could bind to) used to
+// see nothing but "continue unbound", with no indication that a self-serve
+// path exists at all. bootstrap_self (mupot#925/#928) IS that path and is
+// already live — a same-session tool call names an agent, mints its home
+// squad, and grants the calling human squad:admin on it, which is exactly
+// what clears THIS screen's own admin floor (P0-3) on a later visit. The gap
+// was never in the mechanism, only in this screen's silence about it. This is
+// pure copy on the empty-state branch — it does not touch selection, minting,
+// or any of the P0-1/P0-2/P0-3 invariants proven in
+// tests/agent-bound-oauth-consent.test.ts.
+const EMPTY_STATE_HINT = `
+<p class="empty-hint">No agent is available to bind this connection to yet. If you are
+connecting an AI assistant (Claude Desktop, claude.ai, etc.), ask it to call the
+<code>bootstrap_self</code> tool — pass the name you want to give your agent. That creates
+a home for it and gives <em>you</em> admin on it immediately, no operator needed. Come back
+to this screen afterward (reconnect / re-authorize) and your new agent will be listed
+here to choose.</p>`
+
 /** Renders the consent screen. The ONLY thing the user reads before a token is
  *  minted — every field a selectable agent would carry into the session is shown
  *  literally, not summarized (slug, name, squad, capabilities, autonomy, budget). */
@@ -512,6 +531,12 @@ function renderConsentPage(
   consentNonce: string,
   email: string,
   agents: ConsentableAgent[],
+  // mupot#901 gate amendment (River): `agents` is [] in TWO states — the listing
+  // succeeded and found none, or the listing THREW and fell back to []. The empty-
+  // state hint asserts "no agent is available to bind to yet", which is a claim
+  // about a board that, on the failure path, was never read. Render the claim only
+  // when we actually know it. Defaults true so existing callers are unchanged.
+  agentsListed = true,
 ): Response {
   const rows = agents.map((a) => `
         <label class="agent-option">
@@ -534,6 +559,8 @@ function renderConsentPage(
   .agent-option { display: flex; gap: 0.75rem; align-items: flex-start; border: 1px solid #ccc; border-radius: 8px; padding: 0.75rem; margin: 0.5rem 0; }
   .agent-meta, .agent-caps { font-size: 0.85rem; color: #444; }
   .agent-caps { font-family: monospace; }
+  .empty-hint { font-size: 0.85rem; color: #444; background: #f5f5f5; border-radius: 8px; padding: 0.75rem; }
+  .empty-hint code { font-family: monospace; }
   fieldset { border: none; padding: 0; }
   .actions { margin-top: 1.5rem; display: flex; gap: 0.75rem; }
   button { padding: 0.5rem 1rem; font-size: 1rem; }
@@ -542,6 +569,7 @@ function renderConsentPage(
 <body>
 <h1>Connect to mupot</h1>
 <p>Signed in as <strong>${escapeHtml(email)}</strong>. Choose what this connection can act as.</p>
+${agentsListed && agents.length === 0 ? EMPTY_STATE_HINT : ''}
 <form method="POST" action="/oauth/consent">
   <input type="hidden" name="consent_nonce" value="${escapeHtml(consentNonce)}">
   <fieldset>
@@ -1006,6 +1034,10 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     )
 
     let agents: ConsentableAgent[]
+    // Distinguishes "listed, found none" from "listing failed" — see renderConsentPage's
+    // agentsListed param. Without this the empty-state hint states a fact about agents
+    // on the one path where we never learned it.
+    let agentsListed = true
     try {
       agents = await listConsentableAgents(env, memberId)
     } catch (err) {
@@ -1014,9 +1046,10 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       // block a legitimate unbound connection. Render the screen with no agent
       // choices — "continue unbound" (today's exact default) is still available.
       agents = []
+      agentsListed = false
     }
 
-    const page = renderConsentPage(consentNonce, googleUser.email, agents)
+    const page = renderConsentPage(consentNonce, googleUser.email, agents, agentsListed)
     // B3-style: bind the consent nonce to this browser. Clears the earlier
     // google-callback CSRF cookie (its job is done) and sets the consent one,
     // scoped to the /oauth/consent path only.
