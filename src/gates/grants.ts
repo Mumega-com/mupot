@@ -161,7 +161,7 @@ export async function resolveSoleGateOwnerAgent(env: Env, gateOwner: string): Pr
 //
 // A named, currently-active gate lane owner — the read-side fact a triage UI
 // needs before it is safe to offer an Approve/Reject control at all. This
-// generalises resolveSoleGateOwnerAgent (above) in two ways the dashboard
+// generalises resolveSoleGateOwnerAgent (above) in the ways the dashboard
 // needs and the auto-wake path does not:
 //   1. Member principals too — humans hold gate_grants rows exactly like
 //      agents do (e.g. the /approvals member path in tasks/index.ts), so a
@@ -169,13 +169,26 @@ export async function resolveSoleGateOwnerAgent(env: Env, gateOwner: string): Pr
 //      every human-owned gate as unowned.
 //   2. Liveness — a grant to a PAUSED agent or a SUSPENDED member is not a
 //      safe target: the capability nominally has a holder, but no one who can
-//      actually act on it. That holder is surfaced (for the blocker-reason
-//      text) but resolvable stays false.
-//
-// Same posture as resolveSoleGateOwnerAgent on cardinality: zero or more than
-// one holder has no unambiguous accountable owner, so both collapse to
-// "unresolved" rather than guessing. Callers must never render a verdict
-// control when resolvable is false.
+//      actually act on it. Such holders are still surfaced (for the
+//      blocker-reason text) but do not count toward resolvability.
+//   3. Cardinality: MULTIPLE active holders is a normal, intended shape — NOT
+//      ambiguous. docs/gate-protocol.md §10 (Appendix B, "gate:routines had
+//      zero holders") records the real precedent: gate:routines shipped with
+//      ZERO gate_grants rows (a wall with no door — every task assigned to it
+//      was permanently unrejectable/unapprovable), and the fix Hadi applied
+//      was granting it to TWO principals directly, not one. The write-path
+//      authorization this mirrors — callerHoldsGateCapability, tasks/index.ts —
+//      is itself an EXISTS check per-caller, never a sole-holder check; a
+//      "resolvable only if exactly one holder" policy would (a) contradict
+//      that documented precedent and (b) hide the verdict control from a
+//      legitimate second/third holder of a shared capability even though the
+//      backend would honor their verdict. So: resolvable requires only
+//      >=1 ACTIVE holder. Only the true "wall with no door" case — zero
+//      grants, or every grant pointing at a paused/suspended principal —
+//      collapses to unresolved. This does NOT relax resolveSoleGateOwnerAgent
+//      above, which intentionally stays sole-target because it drives
+//      auto-wake (paging N holders on every review-entry has a different, and
+//      real, cost/ambiguity tradeoff than showing N names in a UI).
 
 export interface GateOwnerHolder {
   readonly principalType: GatePrincipalType
@@ -184,15 +197,18 @@ export interface GateOwnerHolder {
   readonly active: boolean
 }
 
-export type GateOwnerUnresolvedReason = 'absent' | 'no_grant' | 'multiple_grants' | 'inactive'
+export type GateOwnerUnresolvedReason = 'absent' | 'no_grant' | 'inactive'
 
 export type GateOwnerResolution =
-  | { readonly resolvable: true; readonly capability: string; readonly holder: GateOwnerHolder }
+  // holders = every currently ACTIVE holder (>=1) when resolvable.
+  | { readonly resolvable: true; readonly capability: string; readonly holders: readonly GateOwnerHolder[] }
+  // holders = whatever grants were actually found (possibly all-inactive, for
+  // the 'inactive' reason's blocker text), or [] for 'absent'/'no_grant'.
   | {
       readonly resolvable: false
       readonly capability: string | null
       readonly reason: GateOwnerUnresolvedReason
-      readonly holder: GateOwnerHolder | null
+      readonly holders: readonly GateOwnerHolder[]
     }
 
 interface GateOwnerHolderRow {
@@ -203,7 +219,7 @@ interface GateOwnerHolderRow {
 }
 
 export async function resolveGateOwner(env: Env, gateOwner: string | null): Promise<GateOwnerResolution> {
-  if (!gateOwner) return { resolvable: false, capability: null, reason: 'absent', holder: null }
+  if (!gateOwner) return { resolvable: false, capability: null, reason: 'absent', holders: [] }
 
   const rows = await env.DB.prepare(
     `SELECT g.principal_type, g.principal_id,
@@ -218,18 +234,17 @@ export async function resolveGateOwner(env: Env, gateOwner: string | null): Prom
     .all<GateOwnerHolderRow>()
 
   const results = rows.results ?? []
-  if (results.length === 0) return { resolvable: false, capability: gateOwner, reason: 'no_grant', holder: null }
-  if (results.length > 1) return { resolvable: false, capability: gateOwner, reason: 'multiple_grants', holder: null }
+  if (results.length === 0) return { resolvable: false, capability: gateOwner, reason: 'no_grant', holders: [] }
 
-  const row = results[0]
-  const holder: GateOwnerHolder = {
+  const holders: GateOwnerHolder[] = results.map((row) => ({
     principalType: row.principal_type,
     principalId: row.principal_id,
     displayName: row.display_name ?? row.principal_id,
     active: row.principal_status === 'active',
-  }
-  if (!holder.active) return { resolvable: false, capability: gateOwner, reason: 'inactive', holder }
-  return { resolvable: true, capability: gateOwner, holder }
+  }))
+  const activeHolders = holders.filter((h) => h.active)
+  if (activeHolders.length === 0) return { resolvable: false, capability: gateOwner, reason: 'inactive', holders }
+  return { resolvable: true, capability: gateOwner, holders: activeHolders }
 }
 
 /** Resolve several gate_owner capabilities in parallel, de-duplicated — the

@@ -41,37 +41,63 @@ export interface ApprovalItem {
 // never selected from D1 directly.
 type ApprovalRow = Omit<ApprovalItem, 'gate_owner_name' | 'blocker_reason' | 'can_verdict'>
 
+function holderNames(holders: readonly { displayName: string }[]): string {
+  return holders.map((h) => h.displayName).join(', ')
+}
+
 /** Human-legible, per-row reason — never a generic placeholder ("blocked", ""). */
 function blockerReason(gateOwner: string | null, resolution: GateOwnerResolution): string {
   if (resolution.resolvable) {
-    return `Waiting on ${resolution.holder.displayName} (${gateOwner}) to approve or reject.`
+    return `Waiting on ${holderNames(resolution.holders)} (${gateOwner}) to approve or reject.`
   }
   switch (resolution.reason) {
     case 'absent':
       return 'Blocked — no gate owner is configured for this task; set gate_owner to route it for approval.'
     case 'no_grant':
       return `Blocked — nobody currently holds ${gateOwner}; grant it to a member or agent to unblock.`
-    case 'multiple_grants':
-      return `Blocked — ${gateOwner} is granted to more than one principal; narrow it to a single owner to unblock.`
     case 'inactive':
-      return `Blocked — ${resolution.holder?.displayName ?? 'the current holder'} of ${gateOwner} is inactive; reassign the grant to unblock.`
+      return `Blocked — ${resolution.holders.length ? holderNames(resolution.holders) : 'the current holder'} of ${gateOwner} ${resolution.holders.length > 1 ? 'are' : 'is'} inactive; reassign the grant to unblock.`
     default:
       return `Blocked — ${gateOwner ?? 'this task'} has no resolvable owner.`
   }
 }
 
-/** Decorate raw ApprovalRow rows with server-computed owner/reason/can_verdict. */
-async function decorateApprovals(env: Env, items: ApprovalRow[]): Promise<ApprovalItem[]> {
+/**
+ * Decorate raw ApprovalRow rows with server-computed owner/reason/can_verdict.
+ *
+ * can_verdict mirrors the write-path's OWN authorization shape
+ * (tasks/index.ts callerHoldsGateCapability), not just gate-owner
+ * resolvability: an org owner/admin may verdict ANY review task via the
+ * legacy bypass regardless of whether gate_owner resolves to a named holder
+ * (see this file's header comment) — a row's blocker_reason still explains
+ * the real gate-lane state (e.g. "nobody currently holds gate:routines") so
+ * the admin isn't flying blind, but the control itself must not vanish for a
+ * caller the backend would actually honor. Athena+River adversarial gate,
+ * Flight-008 Slice 2 (mupot#1061): a prior version set can_verdict purely
+ * from resolution.resolvable, which silently contradicted this module's own
+ * documented owner/admin bypass and hung the Project-Routine E2E control
+ * task's approve click (its gate, gate:routines, has zero grants in the
+ * local/CI seed — the exact "wall with no door" case docs/gate-protocol.md
+ * §10 records) — a real regression, not a fixture gap.
+ *
+ * For a non-admin caller, resolution.resolvable is still the correct and
+ * sufficient signal: loadApprovals' non-admin branch already filters to rows
+ * where EXISTS a gate_grants row for THIS principal, so if the capability's
+ * only active holder(s) are empty here it means the row's one grant just
+ * went inactive since the query ran (a genuine race, not a bug to bypass).
+ */
+async function decorateApprovals(env: Env, auth: AuthContext, items: ApprovalRow[]): Promise<ApprovalItem[]> {
   const resolutions = await resolveGateOwners(env, items.map((item) => item.gate_owner))
+  const bypass = isOwnerAdmin(auth)
   return items.map((item) => {
     const resolution: GateOwnerResolution = item.gate_owner
-      ? resolutions.get(item.gate_owner) ?? { resolvable: false, capability: item.gate_owner, reason: 'no_grant', holder: null }
-      : { resolvable: false, capability: null, reason: 'absent', holder: null }
+      ? resolutions.get(item.gate_owner) ?? { resolvable: false, capability: item.gate_owner, reason: 'no_grant', holders: [] }
+      : { resolvable: false, capability: null, reason: 'absent', holders: [] }
     return {
       ...item,
-      gate_owner_name: resolution.resolvable ? resolution.holder.displayName : null,
+      gate_owner_name: resolution.resolvable ? holderNames(resolution.holders) : null,
       blocker_reason: blockerReason(item.gate_owner, resolution),
-      can_verdict: resolution.resolvable,
+      can_verdict: bypass || resolution.resolvable,
     }
   })
 }
@@ -113,7 +139,7 @@ const PUBLISHABLE_SELECT = `
 export async function loadApprovals(env: Env, auth: AuthContext): Promise<ApprovalItem[]> {
   if (isOwnerAdmin(auth)) {
     const rs = await env.DB.prepare(`${BASE_SELECT} ORDER BY t.created_at ASC`).all<ApprovalRow>()
-    return decorateApprovals(env, rs.results ?? [])
+    return decorateApprovals(env, auth, rs.results ?? [])
   }
 
   // Non-admin: visibility == verdict authority. Same principal resolution as
@@ -135,7 +161,7 @@ export async function loadApprovals(env: Env, auth: AuthContext): Promise<Approv
   )
     .bind(principalType, principalId)
     .all<ApprovalRow>()
-  return decorateApprovals(env, rs.results ?? [])
+  return decorateApprovals(env, auth, rs.results ?? [])
 }
 
 // Approved content-publish tasks awaiting the admin's separate Publish click.

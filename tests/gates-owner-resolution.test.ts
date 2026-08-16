@@ -30,10 +30,21 @@ function makeHarness(): SqliteD1Harness {
     INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at) VALUES
       ('grant-1', 'gate:athena', 'agent', 'agent-active', 'member-active', '2026-08-01T00:00:00.000Z'),
       ('grant-2', 'gate:paused', 'agent', 'agent-paused', 'member-active', '2026-08-01T00:00:00.000Z'),
+      -- gate:duo mirrors docs/gate-protocol.md §10 (Appendix B) — the real
+      -- production shape of gate:routines: TWO active holders, intended, not
+      -- ambiguous.
       ('grant-3', 'gate:duo', 'agent', 'agent-active', 'member-active', '2026-08-01T00:00:00.000Z'),
       ('grant-4', 'gate:duo', 'agent', 'agent-second', 'member-active', '2026-08-01T00:00:00.000Z'),
       ('grant-5', 'gate:human', 'member', 'member-active', 'member-active', '2026-08-01T00:00:00.000Z'),
-      ('grant-6', 'gate:suspended-human', 'member', 'member-suspended', 'member-active', '2026-08-01T00:00:00.000Z');
+      ('grant-6', 'gate:suspended-human', 'member', 'member-suspended', 'member-active', '2026-08-01T00:00:00.000Z'),
+      -- gate:mixed — one active holder, one paused holder. Resolvable via the
+      -- active one; the paused holder must not sink the whole capability.
+      ('grant-7', 'gate:mixed', 'agent', 'agent-active', 'member-active', '2026-08-01T00:00:00.000Z'),
+      ('grant-8', 'gate:mixed', 'agent', 'agent-paused', 'member-active', '2026-08-01T00:00:00.000Z'),
+      -- gate:all-inactive — every grant points at a non-active principal —
+      -- the true "wall with no door" case, distinct from gate:duo/gate:mixed.
+      ('grant-9', 'gate:all-inactive', 'agent', 'agent-paused', 'member-active', '2026-08-01T00:00:00.000Z'),
+      ('grant-10', 'gate:all-inactive', 'member', 'member-suspended', 'member-active', '2026-08-01T00:00:00.000Z');
   `)
   return harness
 }
@@ -56,7 +67,7 @@ describe('resolveGateOwner', () => {
     expect(result.resolvable).toBe(false)
     if (!result.resolvable) {
       expect(result.reason).toBe('absent')
-      expect(result.holder).toBeNull()
+      expect(result.holders).toEqual([])
     }
   })
 
@@ -64,7 +75,10 @@ describe('resolveGateOwner', () => {
     harness = makeHarness()
     const result = await resolveGateOwner(envFor(harness), 'gate:nobody')
     expect(result.resolvable).toBe(false)
-    if (!result.resolvable) expect(result.reason).toBe('no_grant')
+    if (!result.resolvable) {
+      expect(result.reason).toBe('no_grant')
+      expect(result.holders).toEqual([])
+    }
   })
 
   it('capability with exactly one ACTIVE agent grant → resolvable, named', async () => {
@@ -72,10 +86,11 @@ describe('resolveGateOwner', () => {
     const result = await resolveGateOwner(envFor(harness), 'gate:athena')
     expect(result.resolvable).toBe(true)
     if (result.resolvable) {
-      expect(result.holder.principalType).toBe('agent')
-      expect(result.holder.principalId).toBe('agent-active')
-      expect(result.holder.displayName).toBe('Athena')
-      expect(result.holder.active).toBe(true)
+      expect(result.holders).toHaveLength(1)
+      expect(result.holders[0].principalType).toBe('agent')
+      expect(result.holders[0].principalId).toBe('agent-active')
+      expect(result.holders[0].displayName).toBe('Athena')
+      expect(result.holders[0].active).toBe(true)
     }
   })
 
@@ -84,8 +99,9 @@ describe('resolveGateOwner', () => {
     const result = await resolveGateOwner(envFor(harness), 'gate:human')
     expect(result.resolvable).toBe(true)
     if (result.resolvable) {
-      expect(result.holder.principalType).toBe('member')
-      expect(result.holder.displayName).toBe('Ada Active')
+      expect(result.holders).toHaveLength(1)
+      expect(result.holders[0].principalType).toBe('member')
+      expect(result.holders[0].displayName).toBe('Ada Active')
     }
   })
 
@@ -95,8 +111,9 @@ describe('resolveGateOwner', () => {
     expect(result.resolvable).toBe(false)
     if (!result.resolvable) {
       expect(result.reason).toBe('inactive')
-      expect(result.holder?.principalId).toBe('agent-paused')
-      expect(result.holder?.active).toBe(false)
+      expect(result.holders).toHaveLength(1)
+      expect(result.holders[0].principalId).toBe('agent-paused')
+      expect(result.holders[0].active).toBe(false)
     }
   })
 
@@ -107,13 +124,41 @@ describe('resolveGateOwner', () => {
     if (!result.resolvable) expect(result.reason).toBe('inactive')
   })
 
-  it('capability granted to TWO principals → multiple_grants, unresolvable (no unambiguous owner)', async () => {
+  // Flight-008 Slice 2 correction (Athena+River adversarial gate, 2026-08-16):
+  // docs/gate-protocol.md §10 (Appendix B) records that the REAL production
+  // fix for gate:routines (which shipped with ZERO holders — a wall with no
+  // door) was granting it to TWO principals, not narrowing to one. Multiple
+  // active holders is the intended shape for a shared/committee gate lane —
+  // it must resolve, listing every active holder, not collapse to unresolved.
+  it('capability granted to TWO ACTIVE principals → resolvable, lists both holders (gate:routines precedent)', async () => {
     harness = makeHarness()
     const result = await resolveGateOwner(envFor(harness), 'gate:duo')
+    expect(result.resolvable).toBe(true)
+    if (result.resolvable) {
+      expect(result.holders).toHaveLength(2)
+      expect(result.holders.map((h) => h.principalId).sort()).toEqual(['agent-active', 'agent-second'])
+      expect(result.holders.every((h) => h.active)).toBe(true)
+    }
+  })
+
+  it('capability with ONE active + ONE paused holder → resolvable via the active one only', async () => {
+    harness = makeHarness()
+    const result = await resolveGateOwner(envFor(harness), 'gate:mixed')
+    expect(result.resolvable).toBe(true)
+    if (result.resolvable) {
+      expect(result.holders).toHaveLength(1)
+      expect(result.holders[0].principalId).toBe('agent-active')
+    }
+  })
+
+  it('capability where EVERY grant is inactive → unresolved (the true wall-with-no-door case)', async () => {
+    harness = makeHarness()
+    const result = await resolveGateOwner(envFor(harness), 'gate:all-inactive')
     expect(result.resolvable).toBe(false)
     if (!result.resolvable) {
-      expect(result.reason).toBe('multiple_grants')
-      expect(result.holder).toBeNull()
+      expect(result.reason).toBe('inactive')
+      expect(result.holders).toHaveLength(2)
+      expect(result.holders.every((h) => !h.active)).toBe(true)
     }
   })
 })
