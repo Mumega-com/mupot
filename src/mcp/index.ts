@@ -699,6 +699,11 @@ const toolTaskCreate: ToolSpec = {
       // cannot escalate privilege. It cannot be used to CLEAR an existing task's marker —
       // task_update has no assignee/provenance-mutation path for it.
       external_source: STRING_SCHEMA,
+      // Backlog vs dispatch (Flight-006 Slice 1 parity for the MCP path).
+      // dispatch:false = planning-only create — task.created is suppressed so the
+      // task.created → dispatchSquad wake loop never fires. dispatch:true (or
+      // omitted) keeps the current wake behavior.
+      dispatch: { type: 'boolean', description: 'false = backlog-only (no wake); true/omitted = wake the squad' },
     },
     required: ['squad_id', 'title', 'done_when'],
     additionalProperties: false,
@@ -781,7 +786,7 @@ const toolTaskCreate: ToolSpec = {
           priority,
           parent_task_id: parentTaskId,
         },
-        { actor: memberActor(auth.memberId as string), externalSource },
+        { actor: memberActor(auth.memberId as string), externalSource, skipEvent: args.dispatch === false },
       )
     } catch (error) {
       if (error instanceof TaskIntakeContractError) return fail(400, error.code, error.message)
