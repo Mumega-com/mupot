@@ -76,7 +76,10 @@ describe('operator-counts cross-surface parity (real D1, seeded fixture)', () =>
 
   async function homeCounts() {
     const [obsData, approvals, taskStatusCounts] = await Promise.all([
-      loadObservatory(env),
+      // NOW, not the wall clock — same pin as loadOpsHealth/loadFleetRadar below.
+      // Pinning all three surfaces to one clock is what makes this a parity test
+      // rather than a race against the presence TTL.
+      loadObservatory(env, NOW),
       loadApprovals(env, OWNER),
       loadTaskStatusCounts(env),
     ])
