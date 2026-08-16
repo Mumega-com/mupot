@@ -74,6 +74,8 @@ import { findPreset, isValidPresetId } from '../auth/role-presets'
 
 // Agent-bound token mint UI.
 import { loadAgentTokenView, agentTokenPageBody, agentTokenMintedBody } from './agent-token'
+import { loadControlCenterView, controlCenterPageBody } from './control-center'
+import { loadJoinPreview, confirmJoin, joinPreviewPageBody, joinConfirmedBody } from './join-agent'
 import { mintAgentBoundToken, isAgentTokenCapability } from '../members/service'
 import { resolveAgentRef } from '../org/resolve'
 
@@ -1742,6 +1744,24 @@ dashboardApp.post('/admin/keys/mint', async (c) => {
   )
 })
 
+// ── Owner Control Center (read-only, mupot#1067) ─────────────────────────────
+//
+// GET /admin/control-center — one owner-facing roster: hierarchy, canonical ids,
+// home/additional memberships, effective capability + source, credential STATE
+// (never hashes/raw), duplicate warnings. Org-admin only. Pure read — no writes.
+
+dashboardApp.get('/admin/control-center', async (c) => {
+  const auth = c.get('auth')
+  if (!isOrgAdmin(auth)) {
+    return c.html(
+      shell(c.env, 'Control Center', errorBody('The Control Center requires owner or admin.')),
+      403,
+    )
+  }
+  const view = await loadControlCenterView(c.env)
+  return c.html(shell(c.env, 'Control Center', controlCenterPageBody(view)))
+})
+
 // ── agent-bound token mint ───────────────────────────────────────────────────
 //
 // Distinct from the operator token mint at POST /members/:id/tokens (which mints a
@@ -2448,6 +2468,75 @@ dashboardApp.post('/squads/:id/agents', async (c) => {
     )
   }
   return c.redirect(`/squads/${squadId}`)
+})
+
+// ── join existing agent (mupot#1067) ──────────────────────────────────────────
+//
+// REUSE path — never creates a duplicate, never mints. Gate mirrors
+// POST /agents/:id/memberships (admin on TARGET squad, dept inherits).
+//
+// GET  /squads/:id/agents/join?ref=… — resolve + preview (fail-closed on ambiguity)
+// POST /squads/:id/agents/join       — confirm via setAgentSquadAccess (idempotent)
+
+dashboardApp.get('/squads/:id/agents/join', async (c) => {
+  const auth = c.get('auth')
+  const squadId = c.req.param('id')
+  const squad = await getById<Squad>(c.env, 'squads', squadId)
+  if (!squad) return c.html(shell(c.env, 'Squad', errorBody('Squad not found.')), 404)
+  if (!(await canOnSquad(c.env, auth, squadId))) {
+    return c.html(
+      shell(c.env, `Squad · ${squad.name}`, errorBody('Adding an agent requires lead on this squad.')),
+      403,
+    )
+  }
+  const ref = typeof c.req.query('ref') === 'string' ? c.req.query('ref') ?? '' : ''
+  const result = ref ? await loadJoinPreview(c.env, squad, ref) : { ok: false, error: 'invalid_ref' as const }
+  return c.html(shell(c.env, `Add existing agent · ${squad.name}`, joinPreviewPageBody(squad, ref, result)))
+})
+
+dashboardApp.post('/squads/:id/agents/join', async (c) => {
+  const auth = c.get('auth')
+  const squadId = c.req.param('id')
+  const squad = await getById<Squad>(c.env, 'squads', squadId)
+  if (!squad) return c.html(shell(c.env, 'Squad', errorBody('Squad not found.')), 404)
+  // Join writes a membership — requires admin on the TARGET squad (same gate as
+  // POST /agents/:id/memberships in src/org/index.ts; dept grants inherit).
+  if (isOrgAdmin(auth)) {
+    // org-admin ok
+  } else {
+    const grants = auth.memberId ? auth.capabilities ?? (await resolveCapabilities(c.env, auth.memberId)) : []
+    const deptId = await squadDepartment(c.env, squadId)
+    if (!hasCapability(grants, 'squad', squadId, 'admin', deptId)) {
+      return c.html(
+        shell(c.env, `Squad · ${squad.name}`, errorBody('Joining an existing agent requires admin on this squad.')),
+        403,
+      )
+    }
+  }
+
+  const form = await c.req.parseBody()
+  const agentId = typeof form.agent_id === 'string' ? form.agent_id.trim() : ''
+  const capability = typeof form.capability === 'string' ? form.capability.trim() : 'member'
+  if (!agentId) {
+    return c.html(shell(c.env, `Squad · ${squad.name}`, errorBody('Agent id is required.')), 400)
+  }
+
+  // Re-resolve the EXACT agent row by id (never slug at write time — the preview
+  // already de-ambiguated; the write pins the id).
+  const agent = await getById<Agent>(c.env, 'agents', agentId)
+  if (!agent) return c.html(shell(c.env, `Squad · ${squad.name}`, errorBody('Agent not found.')), 404)
+
+  const outcome = await confirmJoin(c.env, squad, agentId, capability)
+  if (!outcome.ok) {
+    const msg =
+      outcome.error === 'agent_identity_unminted'
+        ? 'This agent has no welded identity. Mint an agent-bound token first — joining never mints.'
+        : `Could not join agent: ${outcome.error}.`
+    return c.html(shell(c.env, `Squad · ${squad.name}`, errorBody(msg)), 409)
+  }
+  return c.html(
+    shell(c.env, 'Membership confirmed', joinConfirmedBody(squad, agent.name, outcome.result, capability)),
+  )
 })
 
 // Capture the real Hono GET table before registering the addon wildcard. Catalog
@@ -4510,7 +4599,11 @@ function squadBoardBody(squad: Squad, agents: Agent[], tasks: Task[], canAddAgen
             <input name="model" value="@cf/meta/llama-3.3-70b-instruct-fp8-fast" />
           </label>
           <button type="submit" class="btn">Add agent</button>
-        </form>`
+        </form>
+        <div style="margin-top:8px;font-size:13px;color:var(--muted)">
+          Or <a href="/squads/${squad.id}/agents/join">add an <strong>existing</strong> agent</a>
+          (reuse, never duplicates — join is separate from create).
+        </div>`
     : html``
 
   // Squad rollup header — shows the squad's own OKR/KPI/effort/autonomy if set,
@@ -4571,6 +4664,57 @@ function squadBoardBody(squad: Squad, agents: Agent[], tasks: Task[], canAddAgen
           : html`<div class="agents">${raw(agents.map((a) => agentChip(a).toString()).join(''))}</div>`
       }
       ${addAgentForm}
+    </div>
+    <h2>Backlog</h2>
+    <div class="card">
+      ${
+        canAddAgent
+          ? html`<form id="backlog-form" class="adminform" autocomplete="off" style="margin:0">
+              <input type="hidden" id="backlog-squad" value="${squad.id}" />
+              <label>Title
+                <input id="backlog-title" required placeholder="What needs doing?" />
+              </label>
+              <label>Done when
+                <input id="backlog-donewhen" required placeholder="Verifiable success predicate — e.g. tests pass and PR merged" style="width:100%" />
+              </label>
+              <button type="submit" class="btn">Create task (backlog only)</button>
+              <span style="margin-left:10px;color:var(--muted);font-size:13px">Creation is separate from dispatch — no agent is woken by this action.</span>
+              <span id="backlog-status" style="margin-left:10px;color:var(--muted);font-size:13px"></span>
+            </form>
+            <script>
+              (function () {
+                var form = document.getElementById('backlog-form');
+                var status = document.getElementById('backlog-status');
+                if (!form) return;
+                form.addEventListener('submit', async function (ev) {
+                  ev.preventDefault();
+                  var title = document.getElementById('backlog-title').value.trim();
+                  var doneWhen = document.getElementById('backlog-donewhen').value.trim();
+                  var squadId = document.getElementById('backlog-squad').value;
+                  if (!title || !doneWhen) return;
+                  status.textContent = 'Creating…';
+                  try {
+                    var res = await fetch('/api/tasks', {
+                      method: 'POST',
+                      credentials: 'same-origin',
+                      headers: { 'content-type': 'application/json' },
+                      body: JSON.stringify({ squad_id: squadId, title: title, done_when: doneWhen })
+                    });
+                    var data = await res.json().catch(function () { return {}; });
+                    if (res.ok) {
+                      status.textContent = 'Created (backlog). Dispatch is a separate action.';
+                      form.reset();
+                    } else {
+                      status.textContent = 'Failed: ' + ((data && data.error) || res.status);
+                    }
+                  } catch (e) {
+                    status.textContent = 'Network error — try again.';
+                  }
+                });
+              })();
+            </script>`
+          : html`<p class="empty">You need member+ to create tasks.</p>`
+      }
     </div>
     <h2>Board</h2>
     <div class="board">
