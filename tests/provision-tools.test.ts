@@ -217,6 +217,17 @@ function makeEnv(opts: Opts = {}, captured: Captured[] = []): Env {
       },
     },
     BUS: { send: async (event: unknown) => { opts.events?.push(event) } },
+    // mupot#987: mint_agent_token stores the raw secret behind a one-time claim
+    // in SESSIONS KV (src/auth/credential-claim.ts) instead of returning it —
+    // needs a real in-memory store, not a stub.
+    SESSIONS: (() => {
+      const store = new Map<string, string>()
+      return {
+        async get(key: string) { return store.get(key) ?? null },
+        async put(key: string, value: string) { store.set(key, value) },
+        async delete(key: string) { store.delete(key) },
+      }
+    })(),
   } as unknown as Env
 }
 
@@ -434,13 +445,15 @@ describe('create_agent', () => {
 describe('mint_agent_token', () => {
   it('org-admin mints a bound token (the weld) with a default hard-capped squad member grant', async () => {
     const cap = [] as Captured[]
+    const env = makeEnv({ agentTokenMembers: [] }, cap)
     // Fresh agent (no prior member) so the FIRST mint creates the member + guard cap.
-    const res = await call('mint_agent_token', { agent: 'growth-lead' }, makeEnv({ agentTokenMembers: [] }, cap))
+    const res = await call('mint_agent_token', { agent: 'growth-lead' }, env)
     expect(res.status).toBe(200)
     const body = (await res.json()) as {
       result: {
         structuredContent: {
-          token: { raw: string; agent_id: string; capability: string }
+          token: { agent_id: string; capability: string }
+          credential_claim: { claim_id: string; fingerprint: string; expires_at: string }
           agent: { id: string }
           mcp_endpoint: string
           wake_contract: {
@@ -453,8 +466,21 @@ describe('mint_agent_token', () => {
       }
     }
     const sc = body.result.structuredContent
-    // show-once raw token, bound to the agent
-    expect(sc.token.raw.startsWith('mupot_')).toBe(true)
+    // mupot#987: the raw token must NEVER be in this tool result — structural
+    // proof, not a field-by-field allowlist.
+    expect(JSON.stringify(body)).not.toMatch(/"raw"\s*:/)
+    expect(sc.credential_claim.claim_id).toBeTruthy()
+    expect(sc.credential_claim.fingerprint).toMatch(/^[0-9a-f]{16}$/)
+
+    // The claim redeems exactly once, as the same caller who minted it.
+    const revealRes = await call('reveal_credential_claim', { claim_id: sc.credential_claim.claim_id }, env)
+    expect(revealRes.status).toBe(200)
+    const revealBody = (await revealRes.json()) as { result: { structuredContent: { raw: string } } }
+    expect(revealBody.result.structuredContent.raw.startsWith('mupot_')).toBe(true)
+
+    const secondReveal = await call('reveal_credential_claim', { claim_id: sc.credential_claim.claim_id }, env)
+    expect(secondReveal.status).toBe(410)
+
     expect(sc.token.agent_id).toBe('agent-1')
     expect(sc.token.capability).toBe('member')
     expect(sc.agent.id).toBe('agent-1')

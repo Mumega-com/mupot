@@ -78,7 +78,17 @@ describe('agent connection verification service', () => {
       DB: harness.db,
       TENANT_SLUG: TENANT,
       PUBLIC_ORIGIN: 'https://pot.example',
-    } as Env
+      // mupot#987: provisionAgentConnection stores the raw credential behind a
+      // one-time SESSIONS-KV claim (src/auth/credential-claim.ts).
+      SESSIONS: (() => {
+        const store = new Map<string, string>()
+        return {
+          async get(key: string) { return store.get(key) ?? null },
+          async put(key: string, value: string) { store.set(key, value) },
+          async delete(key: string) { store.delete(key) },
+        }
+      })(),
+    } as unknown as Env
   })
 
   afterEach(() => harness.close())

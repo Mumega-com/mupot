@@ -20,7 +20,9 @@
 // Tools (registered into the TOOLS array in src/mcp/index):
 //   create_squad      — admin on the department (org inherits)
 //   create_agent      — lead on the squad (org/department inherit)
-//   mint_agent_token  — admin on the agent's squad (org/department inherit) → show-once raw
+//   mint_agent_token  — admin on the agent's squad (org/department inherit) → single-use
+//                        credential_claim (mupot#987 — never a raw field in the result;
+//                        redeem via reveal_credential_claim)
 //   register_agent_key — admin on the agent's squad → public-only signed-runtime identity
 
 import type { Capability, CapabilityGrant, Env, BusEvent, Squad } from '../types'
@@ -41,6 +43,7 @@ import {
   resolveAgentMemberBinding,
 } from '../members/service'
 import { calculateExpiryTimestamp, DEFAULT_TOKEN_EXPIRY_DAYS } from '../auth/token-lifecycle'
+import { createCredentialClaim, CLAIM_TTL_SECONDS } from '../auth/credential-claim'
 import { revokeMemberToken } from '../members/service'
 import { setAgentSquadAccess, type AgentAccessCapability } from '../members/agent-access'
 import {
@@ -423,8 +426,10 @@ const toolGetAgentProfile: ToolSpec = {
 // ── mint_agent_token ─────────────────────────────────────────────────────────────
 // Creates a DEDICATED member for the agent, grants it a HARD-CAPPED squad-scoped
 // capability on the agent's own squad, binds a fresh token to the agent (the weld:
-// member_tokens.agent_id), and returns the raw token EXACTLY ONCE. Default grant is
-// 'member'; callers may lower to 'observer' but never above member.
+// member_tokens.agent_id), and returns a single-use credential_claim (mupot#987 —
+// the raw token itself never appears in this tool's result; redeem the claim via
+// reveal_credential_claim). Default grant is 'member'; callers may lower to
+// 'observer' but never above member.
 const toolMintAgentToken: ToolSpec = {
   name: 'mint_agent_token',
   scope: "agent's squad",
@@ -509,13 +514,20 @@ const toolMintAgentToken: ToolSpec = {
       reason: expiresAt ? `expires_at:${expiresAt}` : 'non_expiring:immortal',
     })
 
-    // SECURITY: `raw` is the show-once token — returned as a BARE field, never woven
-    // into a reusable config snippet (see src/dashboard/connect security note). The
-    // caller renders its own client config from raw + mcp_endpoint + wake_contract.
+    // SECURITY (mupot#987): the raw token NEVER appears in this tool result. Every
+    // MCP client that persists a conversation (all of them) writes the tool result
+    // verbatim to a transcript file — a `raw` field here, however it was named or
+    // wrapped, would be a live credential sitting in that transcript forever. Instead
+    // the raw value is handed to createCredentialClaim, which stores it behind a
+    // single-use, short-TTL claim in SESSIONS KV. Redeem it with
+    // reveal_credential_claim { claim_id } — exactly once, only as the same member
+    // who called this tool, within CLAIM_TTL_SECONDS. See src/auth/credential-claim.ts
+    // for the honest scope of what this does and does not close.
     //
     // wake_contract (#115): the machine-readable spec for waking this agent via the
     // bus HTTP surface. Returned alongside mcp_endpoint so the operator has the full
     // self-serve picture in one flow — no manual tmux or shell access required.
+    const credentialClaim = await createCredentialClaim(env, minted.raw, auth.memberId as string)
     return done({
       token: {
         id: minted.tokenId,
@@ -525,8 +537,8 @@ const toolMintAgentToken: ToolSpec = {
         channel: 'workspace',
         capability: minted.grantCapability,
         created_at: minted.createdAt,
-        raw: minted.raw,
       },
+      credential_claim: credentialClaim,
       agent: { id: agent.id, slug: agent.slug, name: agent.name },
       mcp_endpoint: mcpEndpoint(canonical.origin),
       wake_contract: wakeContractForAgent(
@@ -535,7 +547,10 @@ const toolMintAgentToken: ToolSpec = {
         env.TENANT_SLUG,
         canonical.origin,
       ),
-      note: 'raw token is shown ONCE — store it now; it is never retrievable again',
+      note:
+        'the raw token is NOT in this result. Call reveal_credential_claim '
+        + `{ claim_id: credential_claim.claim_id } within ${CLAIM_TTL_SECONDS / 60} minutes to redeem it — `
+        + 'exactly once, as this same caller. It is never retrievable again after that.',
     })
   },
 }

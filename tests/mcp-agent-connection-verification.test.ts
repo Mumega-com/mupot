@@ -7,6 +7,7 @@ import {
   provisionAgentConnection,
   type AgentConnectionIssued,
 } from '../src/members/agent-connection'
+import { revealCredentialClaim } from '../src/auth/credential-claim'
 import type { Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
@@ -44,6 +45,16 @@ describe('verify_agent_connection MCP callback', () => {
   let harness: SqliteD1Harness
   let env: Env
   let issued: AgentConnectionIssued
+  let issuedRaw: string
+
+  // mupot#987: provisionAgentConnection returns a single-use claim, not the raw
+  // token — reveal it once (as the same actor who provisioned it) to get a
+  // reusable bearer for the rest of a test.
+  async function reveal(outcome: AgentConnectionIssued): Promise<string> {
+    const revealed = await revealCredentialClaim(env, outcome.credential.claim.claim_id, OWNER.id)
+    if (!revealed.ok) throw new Error('expected credential claim reveal to succeed')
+    return revealed.raw
+  }
 
   beforeEach(async () => {
     harness = createSqliteD1()
@@ -53,7 +64,17 @@ describe('verify_agent_connection MCP callback', () => {
       DB: harness.db,
       TENANT_SLUG: TENANT,
       PUBLIC_ORIGIN: 'https://pot.example',
-    } as Env
+      // mupot#987: provisionAgentConnection stores the raw credential behind a
+      // one-time SESSIONS-KV claim (src/auth/credential-claim.ts).
+      SESSIONS: (() => {
+        const store = new Map<string, string>()
+        return {
+          async get(key: string) { return store.get(key) ?? null },
+          async put(key: string, value: string) { store.set(key, value) },
+          async delete(key: string) { store.delete(key) },
+        }
+      })(),
+    } as unknown as Env
     const outcome = await provisionAgentConnection(env, OWNER, {
       requestId: 'mcp-verify',
       target: {
@@ -70,6 +91,7 @@ describe('verify_agent_connection MCP callback', () => {
     }, NOW)
     if (outcome.status !== 'credential_issued') throw new Error(outcome.status)
     issued = outcome
+    issuedRaw = await reveal(issued)
   })
 
   afterEach(() => harness.close())
@@ -130,7 +152,7 @@ describe('verify_agent_connection MCP callback', () => {
   })
 
   it('derives all identity from the issued key and returns only non-secret proof', async () => {
-    const { response, body } = await call(issued.credential.raw, {
+    const { response, body } = await call(issuedRaw, {
       receipt_id: issued.receipt.id,
       challenge: issued.verification.challenge,
     })
@@ -145,9 +167,9 @@ describe('verify_agent_connection MCP callback', () => {
       },
     })
     const serialized = JSON.stringify(body)
-    expect(serialized).not.toContain(issued.credential.raw)
+    expect(serialized).not.toContain(issuedRaw)
     expect(serialized).not.toContain(issued.verification.challenge)
-    expect(serialized).not.toContain(hash(issued.credential.raw))
+    expect(serialized).not.toContain(hash(issuedRaw))
     expect(serialized).not.toContain('Mupot agent connection verification')
     expect(serialized).not.toContain('attacker-host.invalid')
   })
@@ -202,7 +224,7 @@ describe('verify_agent_connection MCP callback', () => {
   })
 
   it('rejects client-supplied identity fields at schema validation', async () => {
-    const { response, body } = await call(issued.credential.raw, {
+    const { response, body } = await call(issuedRaw, {
       receipt_id: issued.receipt.id,
       challenge: issued.verification.challenge,
       token_id: issued.receipt.token_id,
@@ -214,7 +236,7 @@ describe('verify_agent_connection MCP callback', () => {
 
   it('maps challenge mismatch, exhaustion, expiry, and replay to stable outcomes', async () => {
     for (let attempt = 1; attempt <= 5; attempt += 1) {
-      const { response, body } = await call(issued.credential.raw, {
+      const { response, body } = await call(issuedRaw, {
         receipt_id: issued.receipt.id,
         challenge: `wrong-${attempt}`,
       })
@@ -235,7 +257,8 @@ describe('verify_agent_connection MCP callback', () => {
       credential: { action: 'issue_if_missing', label: 'workspace' },
     }, new Date(NOW.getTime() - 60 * 60 * 1000))
     if (expired.status !== 'credential_issued') throw new Error(expired.status)
-    const expiredCall = await call(expired.credential.raw, {
+    const expiredRaw = await reveal(expired)
+    const expiredCall = await call(expiredRaw, {
       receipt_id: expired.receipt.id,
       challenge: expired.verification.challenge,
     })
@@ -253,12 +276,13 @@ describe('verify_agent_connection MCP callback', () => {
       credential: { action: 'issue_if_missing', label: 'workspace' },
     }, NOW)
     if (replayed.status !== 'credential_issued') throw new Error(replayed.status)
-    const first = await call(replayed.credential.raw, {
+    const replayedRaw = await reveal(replayed)
+    const first = await call(replayedRaw, {
       receipt_id: replayed.receipt.id,
       challenge: replayed.verification.challenge,
     })
     expect(first.response.status).toBe(200)
-    const replay = await call(replayed.credential.raw, {
+    const replay = await call(replayedRaw, {
       receipt_id: replayed.receipt.id,
       challenge: 'unused-after-success',
     })

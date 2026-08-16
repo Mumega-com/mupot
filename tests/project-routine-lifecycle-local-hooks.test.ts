@@ -11,6 +11,9 @@ const { createCollectorDependencies } = localHooks
 
 const OWNER_TOKEN = 'owner-secret-never-persist'
 const MINTED_TOKEN = 'minted-secret-never-persist'
+// mupot#987: mint_agent_token returns a claim_id, not the raw token — this
+// fixture's claim id, checked round-trip against reveal_credential_claim.
+const MOCK_CLAIM_ID = 'mock-claim-fixture-1'
 const COMMIT = 'a'.repeat(40)
 const ENV_KEYS = [
   'MUPOT_WRANGLER_PID_FILE',
@@ -230,13 +233,29 @@ describe('Project Routine local lifecycle hooks', () => {
           ok: true, tenant: 'local', version: '0.25.0', commit: COMMIT,
         })
       }
+      // mupot#987: mint_agent_token no longer returns the raw token inline —
+      // it returns a single-use credential_claim, redeemed via a follow-up
+      // reveal_credential_claim call as the same caller. Mirror both legs
+      // here so this fixture matches the real /actions/:tool contract
+      // (src/mcp/provision.ts, src/mcp/credential-claim.ts).
       if (url.pathname === '/actions/mint_agent_token') {
         return json(response, 200, {
           ok: true,
           tool: 'mint_agent_token',
           result: {
-            token: { raw: MINTED_TOKEN, agent_id: value.agent, capability: value.capability },
+            token: { agent_id: value.agent, capability: value.capability },
+            credential_claim: { claim_id: MOCK_CLAIM_ID, fingerprint: 'f'.repeat(16), expires_at: new Date().toISOString() },
           },
+        })
+      }
+      if (url.pathname === '/actions/reveal_credential_claim') {
+        if (value?.claim_id !== MOCK_CLAIM_ID) {
+          return json(response, 410, { ok: false, tool: 'reveal_credential_claim', error: 'claim_not_found_or_consumed' })
+        }
+        return json(response, 200, {
+          ok: true,
+          tool: 'reveal_credential_claim',
+          result: { raw: MINTED_TOKEN },
         })
       }
       if (url.pathname === '/__scheduled') {
@@ -341,6 +360,14 @@ describe('Project Routine local lifecycle hooks', () => {
     expect(mint).toMatchObject({
       authorization: `Bearer ${OWNER_TOKEN}`,
       value: { agent: 'agent-conformance', capability: 'member' },
+    })
+    // mupot#987: the claim is redeemed as the SAME caller who minted it, and
+    // the raw token itself never appears as a request/response field named
+    // "raw" on the mint leg — only on the separate reveal leg.
+    const reveal = observations.find(item => item.path === '/actions/reveal_credential_claim')
+    expect(reveal).toMatchObject({
+      authorization: `Bearer ${OWNER_TOKEN}`,
+      value: { claim_id: MOCK_CLAIM_ID },
     })
     expect(observations.some(item => item.path === '/__scheduled')).toBe(true)
     expect(observations.map(item => item.path)).toEqual(expect.arrayContaining([

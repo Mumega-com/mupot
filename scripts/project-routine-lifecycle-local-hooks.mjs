@@ -444,9 +444,16 @@ export async function createCollectorDependencies(config) {
       return assertResponse('target health', response)
     },
 
+    // mupot#987: mint_agent_token no longer returns the raw token inline — a
+    // raw secret in the MCP tool result gets written verbatim into any
+    // persisting client's transcript. It now returns a single-use,
+    // short-lived credential_claim instead; the raw value is redeemed
+    // exactly once, as the SAME caller who minted it, via
+    // reveal_credential_claim. This hook does both calls back-to-back so its
+    // own return shape (a ready-to-use raw token) is unchanged for callers.
     async mintAgentToken({ ownerToken: callerToken, agentId, capability }) {
       if (callerToken !== ownerToken) throw new Error('mint caller token does not match collector owner token')
-      const response = await invokeAction({
+      const mintResponse = await invokeAction({
         token: callerToken,
         tool: 'mint_agent_token',
         input: {
@@ -455,15 +462,49 @@ export async function createCollectorDependencies(config) {
           label: `project-routine-lifecycle:${agentId}`.slice(0, 64),
         },
       })
-      const raw = response?.result?.token?.raw
-      if (response.ok !== true || typeof raw !== 'string' || raw.length === 0) {
-        throw new Error(`mint_agent_token failed with HTTP ${response.status}`)
+      // Distinguish a transport/authz failure (non-2xx, outcome.ok === false)
+      // from a 200-with-unexpected-shape response — the two used to be
+      // conflated into one "failed with HTTP <status>" message that reported
+      // HTTP 200 for what was actually a response-shape mismatch, which reads
+      // like a flake at a glance and burns real triage time chasing the
+      // wrong layer.
+      if (mintResponse.ok !== true) {
+        throw new Error(
+          `mint_agent_token failed with HTTP ${mintResponse.status}: ${mintResponse.error ?? 'unknown error'}`,
+        )
       }
+      const claimId = mintResponse?.result?.credential_claim?.claim_id
+      if (typeof claimId !== 'string' || claimId.length === 0) {
+        throw new Error(
+          `mint_agent_token returned HTTP ${mintResponse.status} with ok:true but no `
+          + 'credential_claim.claim_id in the result — response shape mismatch, not a transport failure '
+          + '(mupot#987: the raw token is no longer inline; it must be redeemed via reveal_credential_claim)',
+        )
+      }
+
+      const revealResponse = await invokeAction({
+        token: callerToken,
+        tool: 'reveal_credential_claim',
+        input: { claim_id: claimId },
+      })
+      if (revealResponse.ok !== true) {
+        throw new Error(
+          `reveal_credential_claim failed with HTTP ${revealResponse.status}: ${revealResponse.error ?? 'unknown error'}`,
+        )
+      }
+      const raw = revealResponse?.result?.raw
+      if (typeof raw !== 'string' || raw.length === 0) {
+        throw new Error(
+          `reveal_credential_claim returned HTTP ${revealResponse.status} with ok:true but no raw value `
+          + 'in the result — response shape mismatch, not a transport failure',
+        )
+      }
+
       secrets.add(raw)
       return {
         token: raw,
-        agentId: response.result.token.agent_id,
-        capability: response.result.token.capability,
+        agentId: mintResponse.result.token.agent_id,
+        capability: mintResponse.result.token.capability,
       }
     },
 

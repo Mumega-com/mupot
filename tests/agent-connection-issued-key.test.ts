@@ -62,14 +62,31 @@ describe('issued agent connection key end-to-end', () => {
       DB: harness.db,
       TENANT_SLUG: TENANT,
       PUBLIC_ORIGIN: 'https://pot.example',
-      SESSIONS: {
-        get: async () => JSON.stringify({
+      // Real in-memory KV (not a fixed-response stub) — mupot#987's credential-claim
+      // path does get/put/delete against SESSIONS (see src/auth/credential-claim.ts),
+      // so the mock needs to actually store what it's given. Any key nothing put()
+      // falls back to the same fixed JSON the old stub always returned, preserving
+      // whatever pre-existing (untested-by-name) code path relied on that default.
+      SESSIONS: (() => {
+        const store = new Map<string, string>()
+        const fallback = JSON.stringify({
           userId: 'operator-web',
           email: 'operator@example.com',
           role: 'member',
           createdAt: '2026-07-24T00:00:00.000Z',
-        }),
-      },
+        })
+        return {
+          async get(key: string) {
+            return store.has(key) ? (store.get(key) as string) : fallback
+          },
+          async put(key: string, value: string) {
+            store.set(key, value)
+          },
+          async delete(key: string) {
+            store.delete(key)
+          },
+        }
+      })(),
     } as unknown as Env
   })
 
@@ -103,10 +120,21 @@ describe('issued agent connection key end-to-end', () => {
     }
   }
 
+  // mupot#987: provision_agent_connection no longer returns the raw credential —
+  // it returns a single-use claim (credential.claim.claim_id). Redeem it through
+  // the same bearer that minted it, exactly as a real caller would.
+  async function revealClaim(claimId: string): Promise<string> {
+    const revealed = await rpc<{ raw: string }>(OPERATOR_RAW, 'reveal_credential_claim', {
+      claim_id: claimId,
+    })
+    expect(revealed.response.status).toBe(200)
+    return revealed.body.result.structuredContent.raw
+  }
+
   it('provisions once, reconnects, proves public messaging, verifies, and polls', async () => {
     const provisioned = await rpc<{
       status: string
-      credential: { raw: string; tokenId: string; shownOnce: boolean }
+      credential: { claim: { claim_id: string; fingerprint: string; expires_at: string }; tokenId: string; shownOnce: boolean }
       verification: { receiptId: string; challenge: string; expiresAt: string }
       endpoint: string
       configuration: { claudeCode: string; codex: string; cursor: string }
@@ -137,18 +165,31 @@ describe('issued agent connection key end-to-end', () => {
     const connection = provisioned.body.result.structuredContent
     expect(connection.status).toBe('credential_issued')
     expect(connection.endpoint).toBe('https://pot.example/mcp')
-    expect(connection.credential.raw).toMatch(/^mupot_/)
+    // The structural proof for #987: no raw secret anywhere in this tool result.
+    expect(JSON.stringify(provisioned.body)).not.toMatch(/"raw"\s*:/)
+    expect(connection.credential.claim.claim_id).toBeTruthy()
+    expect(connection.credential.claim.fingerprint).toMatch(/^[0-9a-f]{16}$/)
+
+    const rawToken = await revealClaim(connection.credential.claim.claim_id)
+    expect(rawToken).toMatch(/^mupot_/)
     for (const config of Object.values(connection.configuration)) {
       expect(config).toContain('https://pot.example/mcp')
       expect(config).not.toContain('malicious-request-host.invalid')
-      expect(config).not.toContain(connection.credential.raw)
+      expect(config).not.toContain(rawToken)
     }
+
+    // A second reveal of the SAME claim must fail — single-use, burned on first read.
+    const secondReveal = await rpc<Record<string, unknown>>(OPERATOR_RAW, 'reveal_credential_claim', {
+      claim_id: connection.credential.claim.claim_id,
+    })
+    expect(secondReveal.response.status).toBe(410)
+    expect(JSON.stringify(secondReveal.body)).toContain('claim_not_found_or_consumed')
 
     const boot = await rpc<{
       identity_status: string
       bound_agent_id: string
       mcp_endpoint: string
-    }>(connection.credential.raw, 'boot_context', {})
+    }>(rawToken, 'boot_context', {})
     expect(boot.response.status).toBe(200)
     expect(boot.body.result.structuredContent).toMatchObject({
       identity_status: 'minted',
@@ -158,7 +199,7 @@ describe('issued agent connection key end-to-end', () => {
 
     const oriented = await rpc<{
       packet: { agent: { id: string } }
-    }>(connection.credential.raw, 'orient', {})
+    }>(rawToken, 'orient', {})
     expect(oriented.response.status).toBe(200)
     expect(oriented.body.result.structuredContent.packet.agent.id)
       .toBe(connection.receipt.agent_id)
@@ -167,7 +208,7 @@ describe('issued agent connection key end-to-end', () => {
       id: string
       to: string
       duplicate: boolean
-    }>(connection.credential.raw, 'send', {
+    }>(rawToken, 'send', {
       to: connection.receipt.agent_id,
       body: 'Public messaging surface proof',
       kind: 'request',
@@ -183,7 +224,7 @@ describe('issued agent connection key end-to-end', () => {
     const inbox = await rpc<{
       messages: Array<{ id: string; request_id: string }>
       consumed: boolean
-    }>(connection.credential.raw, 'inbox', { peek: true })
+    }>(rawToken, 'inbox', { peek: true })
     expect(inbox.response.status).toBe(200)
     expect(inbox.body.result.structuredContent.consumed).toBe(false)
     expect(inbox.body.result.structuredContent.messages).toContainEqual(
@@ -206,7 +247,7 @@ describe('issued agent connection key end-to-end', () => {
       status: string
       receiptId: string
       replay: boolean
-    }>(connection.credential.raw, 'verify_agent_connection', {
+    }>(rawToken, 'verify_agent_connection', {
       receipt_id: connection.verification.receiptId,
       challenge: connection.verification.challenge,
     })
@@ -240,7 +281,7 @@ describe('issued agent connection key end-to-end', () => {
         'SELECT * FROM agent_connection_receipts WHERE id = ?',
       ).get(connection.receipt.id),
     })
-    expect(persisted).not.toContain(connection.credential.raw)
+    expect(persisted).not.toContain(rawToken)
     expect(persisted).not.toContain(connection.verification.challenge)
     expect(persisted).not.toContain('Public messaging surface proof')
     expect(persisted).not.toContain('Mupot agent connection verification')
@@ -248,7 +289,7 @@ describe('issued agent connection key end-to-end', () => {
 
   it('fails closed for a human key, another same-agent key, and another agent key', async () => {
     const first = await rpc<{
-      credential: { raw: string }
+      credential: { claim: { claim_id: string } }
       verification: { receiptId: string; challenge: string }
       receipt: { agent_id: string; member_id: string }
     }>(OPERATOR_RAW, 'provision_agent_connection', {
@@ -294,15 +335,16 @@ describe('issued agent connection key end-to-end', () => {
     expect(JSON.stringify(sameAgent.body)).toContain('verification_not_found')
 
     const second = await rpc<{
-      credential: { raw: string }
+      credential: { claim: { claim_id: string } }
     }>(OPERATOR_RAW, 'provision_agent_connection', {
       request_id: 'negative-second',
       new_agent: { home_squad: 'home', slug: 'negative-two', name: 'Negative Two' },
       credential: { action: 'issue_if_missing' },
     })
     expect(second.response.status).toBe(200)
+    const secondRawToken = await revealClaim(second.body.result.structuredContent.credential.claim.claim_id)
     const otherAgent = await rpc<Record<string, unknown>>(
-      second.body.result.structuredContent.credential.raw,
+      secondRawToken,
       'verify_agent_connection',
       {
         receipt_id: connection.verification.receiptId,
