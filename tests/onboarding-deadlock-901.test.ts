@@ -140,6 +140,36 @@ describe('#901 residual gap — the empty-agent consent screen names the escape 
 
     harness.close()
   })
+
+  // Gate amendment (River, #1099): `agents` is [] in TWO states — the listing
+  // succeeded and found none, or the listing THREW and fell back to []. The hint
+  // asserts "no agent is available to bind to yet". On the failure path that is a
+  // claim about a board we never read, so it must not render there.
+  it('does NOT claim "no agent exists" when the agent listing FAILED — an unread board is not an empty one', async () => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    const oauthProvider = stubOAuthProvider()
+    const { env } = httpEnv(harness, oauthProvider)
+
+    // Force listConsentableAgents to throw, exercising the fail-closed fallback.
+    const boom = new Error('simulated D1 failure in listConsentableAgents')
+    const originalPrepare = env.DB.prepare.bind(env.DB)
+    let armed = true
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    ;(env.DB as any).prepare = (sql: string) => {
+      if (armed && /FROM\s+agents/i.test(sql)) throw boom
+      return originalPrepare(sql)
+    }
+
+    const { html } = await reachConsentScreen(env, FRESH_EMAIL)
+    armed = false
+
+    // The page must still render with "continue unbound" available (fail-closed on
+    // the LISTING, not the flow) — but it must not state the fact it could not check.
+    expect(html).not.toContain('No agent is available to bind')
+
+    harness.close()
+  })
 })
 
 describe('#901 — the first-run deadlock, reproduced and then closed end-to-end', () => {

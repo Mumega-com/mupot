@@ -531,6 +531,12 @@ function renderConsentPage(
   consentNonce: string,
   email: string,
   agents: ConsentableAgent[],
+  // mupot#901 gate amendment (River): `agents` is [] in TWO states — the listing
+  // succeeded and found none, or the listing THREW and fell back to []. The empty-
+  // state hint asserts "no agent is available to bind to yet", which is a claim
+  // about a board that, on the failure path, was never read. Render the claim only
+  // when we actually know it. Defaults true so existing callers are unchanged.
+  agentsListed = true,
 ): Response {
   const rows = agents.map((a) => `
         <label class="agent-option">
@@ -563,7 +569,7 @@ function renderConsentPage(
 <body>
 <h1>Connect to mupot</h1>
 <p>Signed in as <strong>${escapeHtml(email)}</strong>. Choose what this connection can act as.</p>
-${agents.length === 0 ? EMPTY_STATE_HINT : ''}
+${agentsListed && agents.length === 0 ? EMPTY_STATE_HINT : ''}
 <form method="POST" action="/oauth/consent">
   <input type="hidden" name="consent_nonce" value="${escapeHtml(consentNonce)}">
   <fieldset>
@@ -1028,6 +1034,10 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     )
 
     let agents: ConsentableAgent[]
+    // Distinguishes "listed, found none" from "listing failed" — see renderConsentPage's
+    // agentsListed param. Without this the empty-state hint states a fact about agents
+    // on the one path where we never learned it.
+    let agentsListed = true
     try {
       agents = await listConsentableAgents(env, memberId)
     } catch (err) {
@@ -1036,9 +1046,10 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       // block a legitimate unbound connection. Render the screen with no agent
       // choices — "continue unbound" (today's exact default) is still available.
       agents = []
+      agentsListed = false
     }
 
-    const page = renderConsentPage(consentNonce, googleUser.email, agents)
+    const page = renderConsentPage(consentNonce, googleUser.email, agents, agentsListed)
     // B3-style: bind the consent nonce to this browser. Clears the earlier
     // google-callback CSRF cookie (its job is done) and sets the consent one,
     // scoped to the /oauth/consent path only.
