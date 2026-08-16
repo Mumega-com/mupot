@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest'
 import { loadOpsHealth } from '../src/dashboard/health'
-import type { Env } from '../src/types'
+import type { AuthContext, Env } from '../src/types'
 
 const NOW = new Date('2026-07-08T12:00:00.000Z').getTime()
 const RECENT = '2026-07-08T11:58:00.000Z'
 const OLD = '2026-07-06T12:00:00.000Z'
+
+const OWNER: AuthContext = { userId: 'owner-1', email: 'owner@test', role: 'owner', tenant: 'local' }
 
 const CORE_TABLES = [
   'agents',
@@ -17,8 +19,21 @@ const CORE_TABLES = [
   'workflow_receipts',
 ]
 
+// Flight-008 Slice 1 (mupot#1060): loadOpsHealth's agent/runtime/needs-decision KPIs now
+// route through operator-counts.ts's computeOperatorCounts, fed by the SAME canonical
+// loaders Home uses (observatory.ts's loadAgentStats/loadAgentRuntimeStates,
+// approvals.ts's loadApprovals) instead of health.ts's own ad hoc queries. Default fixture
+// below: 2 agents, both with a live runtime (key_member_id + fleet status=running,
+// recent heartbeat) — kept for continuity with this suite's pre-existing "2 online"
+// expectations, now sourced from the canonical query shape instead of a GROUP BY.
 interface MockRows {
-  agentCounts?: unknown[]
+  /** Raw agents.{id,status} rows (loadOperatorCounts' plain SELECT — no GROUP BY). */
+  agents?: unknown[]
+  /** loadAgentRuntimeStates' evidence rows (agent_id, key_member_id, fleet_status, last_reported_at). */
+  runtimeEvidence?: unknown[]
+  /** loadApprovals' gate-queue rows. */
+  approvals?: unknown[]
+  /** loadTaskStatusCounts' grouped rows — also feeds blockedOrRejected/open/in_progress. */
   taskCounts?: unknown[]
   fleet?: unknown[]
   presence?: unknown[]
@@ -33,12 +48,36 @@ interface MockRows {
   schema?: unknown[]
 }
 
+const DEFAULT_AGENTS = [
+  { id: 'a1', status: 'active' },
+  { id: 'a2', status: 'active' },
+]
+
+const DEFAULT_RUNTIME_EVIDENCE = [
+  { agent_id: 'a1', key_member_id: 'm1', fleet_status: 'running', last_reported_at: RECENT },
+  { agent_id: 'a2', key_member_id: 'm2', fleet_status: 'running', last_reported_at: RECENT },
+]
+
 function makeEnv(rows: MockRows = {}, envOver: Partial<Env> & { EVENT_INGEST_SECRET?: string } = {}) {
   const calls: { sql: string; binds: unknown[] }[] = []
   const resultFor = (sql: string) => {
-    if (sql.includes('FROM agents') && sql.includes('GROUP BY status')) {
-      return rows.agentCounts ?? [{ status: 'active', count: 2 }]
+    // loadAgentStats (observatory.ts) — per-agent 24h task stats. Not exposed on
+    // OpsHealthData.kpis; empty is fine unless a test asserts on it directly.
+    if (sql.includes('AS task_count')) {
+      return []
     }
+    // loadAgentRuntimeStates (observatory.ts) — the canonical live/stale/offline/
+    // unattached classifier Home's kpiStrip and Fleet's radar summary also read.
+    if (sql.includes('key_member_id')) {
+      return rows.runtimeEvidence ?? DEFAULT_RUNTIME_EVIDENCE
+    }
+    // loadApprovals (approvals.ts) — the RBAC + gate_owner-scoped gate queue, i.e.
+    // "needs your decision".
+    if (sql.includes('t.gate_owner')) {
+      return rows.approvals ?? []
+    }
+    // loadTaskStatusCounts (operator-counts.ts) — the ONE grouped tasks-by-status
+    // count; feeds blockedOrRejected AND the Task queues check's open/in_progress text.
     if (sql.includes('FROM tasks') && sql.includes('GROUP BY status')) {
       return rows.taskCounts ?? [
         { status: 'open', count: 1 },
@@ -47,6 +86,11 @@ function makeEnv(rows: MockRows = {}, envOver: Partial<Env> & { EVENT_INGEST_SEC
         { status: 'blocked', count: 0 },
         { status: 'rejected', count: 0 },
       ]
+    }
+    // Plain agents roster (operator-counts.ts loadOperatorCounts-equivalent: health.ts
+    // feeds computeOperatorCounts directly, but the SELECT shape is the same).
+    if (sql.includes('SELECT id, status FROM agents')) {
+      return rows.agents ?? DEFAULT_AGENTS
     }
     if (sql.includes('FROM fleet_agents')) {
       return rows.fleet ?? [
@@ -163,7 +207,7 @@ describe('loadOpsHealth', () => {
   it('classifies a connected pot as healthy', async () => {
     const { env } = makeEnv()
 
-    const health = await loadOpsHealth(env, NOW)
+    const health = await loadOpsHealth(env, OWNER, NOW)
 
     expect(health.overallTone).toBe('ok')
     expect(health.kpis.activeAgents).toBe(2)
@@ -192,7 +236,7 @@ describe('loadOpsHealth', () => {
       } as never,
     )
 
-    const health = await loadOpsHealth(env, NOW)
+    const health = await loadOpsHealth(env, OWNER, NOW)
     const webhooks = health.checks.find((c) => c.id === 'webhooks')!
     const integrations = health.checks.find((c) => c.id === 'integrations')!
 
@@ -237,7 +281,7 @@ describe('loadOpsHealth', () => {
       ],
     })
 
-    const health = await loadOpsHealth(env, NOW)
+    const health = await loadOpsHealth(env, OWNER, NOW)
 
     expect(health.overallTone).toBe('danger')
     expect(health.checks.find((c) => c.id === 'tasks')).toMatchObject({ tone: 'danger' })
@@ -252,7 +296,7 @@ describe('loadOpsHealth', () => {
   it('detects missing core schema tables', async () => {
     const { env } = makeEnv({ schema: [{ name: 'agents' }, { name: 'tasks' }] })
 
-    const health = await loadOpsHealth(env, NOW)
+    const health = await loadOpsHealth(env, OWNER, NOW)
     const schema = health.checks.find((c) => c.id === 'schema')!
 
     expect(schema.tone).toBe('danger')
@@ -270,7 +314,7 @@ describe('loadOpsHealth', () => {
       ],
     })
 
-    const health = await loadOpsHealth(env, NOW)
+    const health = await loadOpsHealth(env, OWNER, NOW)
     const details = health.auditSignals.map((s) => s.detail)
     expect(details).toContain('squad:squad-core requested by hadi@digid.ca')
     expect(details).toContain('kasra requested by hadi@digid.ca')
@@ -301,7 +345,7 @@ describe('loadOpsHealth', () => {
       ],
     })
 
-    const health = await loadOpsHealth(env, NOW)
+    const health = await loadOpsHealth(env, OWNER, NOW)
     const runtime = health.checks.find((c) => c.id === 'runtime')!
 
     expect(runtime.tone).toBe('warn')

@@ -134,6 +134,8 @@ import { kanbanApp, loadKanbanData, kanbanBoardBody } from './kanban-routes'
 import type { ObservatoryData, SwimlaneBar, AgentRuntimeState, AgentStat } from './observatory'
 import { loadOpsHealth } from './health'
 import type { OpsHealthData, HealthTone } from './health'
+import { computeOperatorCounts, loadTaskStatusCounts } from './operator-counts'
+import type { OperatorCounts } from './operator-counts'
 import { loadAllAgents, loadSquadOptions } from './agents-admin'
 import type { AgentAdminRow, SquadOption } from './agents-admin'
 import { formatBurn, formatUsd } from '../agents/cost'
@@ -400,14 +402,28 @@ dashboardApp.get('/', async (c) => {
   //   - loadTodaySpendScalar: ONE D1 round trip (today's sum + an EXISTS check),
   //     vs loadEconomy's 5 parallel queries — see economy.ts for why "configured"
   //     is defined identically so the two never disagree.
-  const [obsData, approvals, physics, spend] = await Promise.all([
+  const [obsData, approvals, physics, spend, taskStatusCounts] = await Promise.all([
     loadObservatory(c.env),
     loadApprovals(c.env, auth),
     loadBrainPhysics(c.env),
     loadTodaySpendScalar(c.env),
+    loadTaskStatusCounts(c.env),
   ])
+  // Flight-008 Slice 1 (mupot#1060): the hero KPI strip (Configured agents, Live
+  // runtimes, In flight, Needs decision) is derived through the SAME pure helper
+  // Health's loadOpsHealth uses (operator-counts.ts) — fed with the SAME loaded
+  // maps this route already needed for the swimlane/directory render below, so
+  // this is not an extra D1 round trip. See operator-counts.ts's header for why.
+  const counts = computeOperatorCounts({
+    nowMs: Date.now(),
+    agents: obsData.agents,
+    stats: obsData.stats,
+    runtimeStates: obsData.runtimeStates,
+    approvals,
+    taskStatusCounts,
+  })
   return c.html(
-    shell(c.env, 'Overview', observatoryBody(c.env.BRAND, obsData, approvals, auth), {
+    shell(c.env, 'Overview', observatoryBody(c.env.BRAND, obsData, approvals, auth, counts), {
       physics,
       costToday: { configured: spend.configured, todayUsdMicro: spend.today_usd_micro },
     }),
@@ -855,7 +871,7 @@ dashboardApp.get('/ops', async (c) => {
   if (!isOrgAdmin(auth)) {
     return c.html(shell(c.env, 'Operations', errorBody('Operations health requires owner or admin.')), 403)
   }
-  const data = await loadOpsHealth(c.env)
+  const data = await loadOpsHealth(c.env, auth)
   return c.html(shell(c.env, 'Operations', opsHealthBody(data)))
 })
 
@@ -3998,6 +4014,7 @@ function observatoryBody(
   data: ObservatoryData,
   approvals: ApprovalItem[],
   auth: AuthContext,
+  counts: OperatorCounts,
 ) {
   const { agents, stats, runtimeStates, bars, ticks, recentTasks } = data
 
@@ -4150,26 +4167,19 @@ function observatoryBody(
   </section>`
 
   // ── operator queue ────────────────────────────────────────────────────────
-  const queueCount = approvals.length
+  const queueCount = counts.needsDecisionCount
   const queueCards = approvals.map((t) => approvalCardHtml(t)).join('')
 
-  // ── fleet-level KPI strip (ui.ts) — real numbers only, summed from loaded stats
-  let inFlightTotal = 0
-  let spendTotal = 0
-  for (const a of agents) {
-    const s = stats.get(a.id)
-    if (s) {
-      inFlightTotal += s.in_flight
-      spendTotal += s.spend_micro_usd
-    }
-  }
-  const liveRuntimeCount = agents.filter((a) => runtimeStates.get(a.id) === 'live').length
+  // ── fleet-level KPI strip (ui.ts) — every number here comes from the SAME
+  // computeOperatorCounts helper Health's loadOpsHealth reads (operator-counts.ts).
+  // Do not re-derive any of these inline — that is exactly how Home and Health
+  // drifted apart before Flight-008 Slice 1 (mupot#1060).
   const kpiStrip = kpiRow([
-    statCard({ label: 'Configured agents', value: String(agents.length) }),
-    statCard({ label: 'Live runtimes', value: String(liveRuntimeCount), subTone: liveRuntimeCount > 0 ? 'primary' : 'warn' }),
-    statCard({ label: 'In flight', value: String(inFlightTotal), subTone: inFlightTotal > 0 ? 'primary' : 'dim' }),
-    statCard({ label: 'Needs decision', value: String(queueCount), subTone: queueCount > 0 ? 'warn' : 'dim' }),
-    statCard({ label: 'Spend · 24h', value: formatUsd(spendTotal) }),
+    statCard({ label: 'Configured agents', value: String(counts.agentsTotal) }),
+    statCard({ label: 'Live runtimes', value: String(counts.liveRuntimeCount), subTone: counts.liveRuntimeCount > 0 ? 'primary' : 'warn' }),
+    statCard({ label: 'In flight', value: String(counts.inFlightTotal), subTone: counts.inFlightTotal > 0 ? 'primary' : 'dim' }),
+    statCard({ label: 'Needs decision', value: String(counts.needsDecisionCount), subTone: counts.needsDecisionCount > 0 ? 'warn' : 'dim' }),
+    statCard({ label: 'Spend · 24h', value: formatUsd(counts.spendMicroUsdTotal) }),
   ])
 
   // ── operator queue — "The Gate" surface, rendered inside the new section panel.
