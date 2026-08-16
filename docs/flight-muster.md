@@ -350,6 +350,8 @@ declarations we have been reading as observations.
 
 ### The rule is symmetric
 
+**The rule is symmetric: a correction is also a claim about a file and must be verified against the file before it is applied.** Tonight produced the fourth announcement-vs-text event in the opposite direction (a message lagging accurate text) — F3 currently describes only the first direction. Same defect, both directions.
+
 > **A correction is also a claim about a file, and must be verified against the file before it is
 > applied.**
 
