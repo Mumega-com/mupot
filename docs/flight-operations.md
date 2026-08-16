@@ -147,6 +147,20 @@ Two presence sources, by agent tier:
   string — declare canonical repo-relative paths / issue refs or overlaps are missed;
   (c) a flight declaring no scope is invisible to the tower (ceiling of self-declared scope).
 
+**Muster — the crew gate (spec, not built):**
+- Preflight scores the *work*; clearance clears the *airspace*; neither knows **who is
+  flying**. `readinessScore()` takes no crew signal at all, so a flight with a dead crew
+  scores identically to a fully staffed one.
+- Muster is clearance's F4 (self-declared scope) applied to crew, and it fails harder: a
+  flight can declare its crew *honestly* and still be wrong, because an agent does not read
+  the model it is actually running. Rule: **declaration is the input, observation is the
+  gate.**
+- Consolidates five orphaned issues — #837, #882, #902, #910, #883 — into one surface, and
+  adds the substitution invariant that keeps the parallel gate from silently collapsing to a
+  monoculture.
+- Spec: [flight-muster.md](./flight-muster.md). `dispatchFlight` becomes
+  `preflight.go && clearance.cleared && muster.mustered`.
+
 **Future (post-0.19):**
 - ATC / dispatch — multi-flight sequencing + automatic departure scheduling (routines).
 - Atomic clearance — DB-level task-claim guard closing the TOCTOU race so CLEAR is a hard
