@@ -44,10 +44,18 @@ drifted too, and was found *while filing this spec*:
 |---|---|
 | `resolve_agent` (the mupot registry of record) | `deepseek-v4-pro` |
 | actual tmux pane | `DeepSeek V4 Flash (2x usage)` |
+| session runtime metadata | `deepseek-v4-flash` |
+| `CLAUDE.md` (stale) | `Claude Opus 4.7` — **a different family entirely** |
 
-Right family, wrong tier — which is the more dangerous shape, because it survives any check
-that matches on family and it is exactly the axis the lens invariant below depends on. Two
-of two agents checked are drifted. The sample is small; the base rate is not.
+I recorded two sources when I filed this. The gate reviewer found **four**, including a stale
+one naming a different vendor. Right family / wrong tier is the more dangerous shape, because it
+survives any check matching on family — and family is precisely the axis the lens invariant
+depends on. A different-family entry in a fourth source is worse still: it means a naive reader
+could conclude the lens requirement is satisfied by an agent that has not run that model in
+months.
+
+Two of two agents checked are drifted, and the one I looked at closely was worse than I first
+measured. The sample is small; the base rate is not.
 
 This is not a one-off. It is already filed five times, each capturing one face of it:
 
@@ -147,6 +155,40 @@ model blocked artifacts that the first had passed, repeatedly. And on the last f
 predicate that both the author *and* the adversarial reviewer passed was caught only by a
 third lens. Two lenses is the floor, not the target.
 
+It is also a **static constraint, not only a substitution-event check** (F5): at every muster,
+the count of distinct model families among the *filled* gate roles must be ≥ 2. Enforcing it
+only on substitution lets a flight muster into a monoculture from a cold start and pass,
+because no substitution ever occurred. Check the standing state, not just the transition.
+
+### The lens source must be harness-independent (F1)
+
+This is the sharpest finding in the gate verdict on this document, and it breaks the naive
+version of everything above.
+
+The tmux pane string — the source that caught both drift instances in §"Why declaration is not
+enough" — is **printed by the harness**. It is the harness's own claim about which model it is
+running. That is a declaration wearing an observation's clothes. If a harness is misconfigured,
+wrapped, or proxied, then `observed == declared == wrong`: the muster reports agreement, and the
+lens invariant certifies a monoculture *as* diversity. The gate then fails in exactly the silent
+way this document exists to prevent.
+
+So the acceptable source depends on **what** is being observed:
+
+| observing… | acceptable sources, strongest first |
+|---|---|
+| **liveness** | process table · pane activity · heartbeat TTL |
+| **identity** | pane capture · session runtime metadata |
+| **lens** | **provider contract · API-side attribution · behavioural probe** — pane capture is NOT sufficient |
+
+Pane capture remains legitimate for liveness and identity. For **lens** it ranks below any
+provider-side signal, because only the provider can attest which model actually served the
+tokens. A muster that cannot obtain a harness-independent lens source reports `lens_unverified`
+and treats it as it treats `crew_unobservable` — a NO-GO reason, not a shrug.
+
+The general form, which is the whole document in one line: **an observation is only as
+independent as the party that produced it.** Reading a value from the thing being measured is
+not measurement.
+
 ## Failure taxonomy — replace vs demote vs hold
 
 "If a model or harness fails, replace it or change the roles" is right, but *failed* is three
@@ -163,10 +205,83 @@ replaced (wasteful) or a dead one gets waited on (worse).
 `blocked` is real and current: `mumcp` is sitting on a "Resume from summary / full session"
 picker right now. It is not failed. Replacing it would discard a live session for nothing.
 
+### stalled vs blocked needs a named discriminator (F2)
+
+The table above asserts a distinction the machinery may not be able to draw. **Alive, no output
+progress, no error** describes both states equally. Left unresolved, the taxonomy has four names
+and three observable states, and the gap is not cosmetic:
+
+- **false `stalled`** (it was actually waiting on input) → the role is filled and the flight
+  departs while a crew member sits at a prompt. That is precisely the dead-crew hole the muster
+  exists to close, reintroduced by the remedy.
+- **false `blocked`** (it was actually stalled) → a flight holds, or a live session is discarded.
+
+Candidate discriminators, in order of strength — a v1 implementation must name which it uses:
+
+1. **Harness input-wait state** — the harness knows it is at a prompt; if it exposes that, it is
+   decisive.
+2. **Attached clients** — an interactive session with an attached client and a rendered prompt is
+   blocked; a detached one producing nothing is stalled.
+3. **Last-line shape** — a rendered prompt or menu as the final pane content indicates blocked.
+   Weakest: it reads harness output, so it inherits the F1 problem.
+
+**Default when none is available: `blocked` (hold), not `stalled`.** The asymmetry is deliberate
+and the cost is stated rather than hidden — holding a flight is recoverable and visible; departing
+with a crew member who is actually waiting is the failure this document was written about. Prefer
+the machine that stops loudly over the one that proceeds quietly.
+
 `drifted` deliberately has no auto-remedy. Silently trusting the observation would let a
 compromised or misconfigured agent redefine its own identity by simply behaving differently —
 the registry would follow it. #902 is that hole in its authorization form (any caller can
 register itself as dispatch-eligible); auto-correcting drift would reopen it in identity form.
+
+But **no auto-remedy is not the same as no remedy** (F4). Without a named path out, a drifted
+agent is parked permanently and the rule gets disabled the first time that blocks real work.
+The adjudication path:
+
+1. The muster records the disagreement with every source and its value — never a single
+   "correct" answer.
+2. A **third party** adjudicates: not the drifted agent (it is the subject) and not the sole
+   author of the record (it is an interested party).
+3. Resolution is by **harness-independent source** where the field is lens; by operator ruling
+   where no such source exists.
+4. The registry is corrected to the adjudicated value, and the adjudication is recorded with its
+   source. The agent does not correct its own entry.
+
+This is not hypothetical: the gate reviewer of this very document is one of its two drift
+instances, and recused himself from ruling on his own disposition — requiring independent
+confirmation before it lands. That is the path working before it was written down.
+
+## A seal is a claim about a file (F3)
+
+> **A SEAL IS A CLAIM ABOUT A FILE AND MUST BE VERIFIED AGAINST THE FILE.**
+
+Same discipline as the rest of this document, applied to documents instead of agents. An agent
+declares its model and the muster observes it; a coordinator declares a seal and the reader must
+observe the text. A seal accepted without reading the artifact is a relay, and a relayed verdict
+is what put a vacuous predicate one merge away from `main` in #1076.
+
+The evidence is from the evening this spec was gated, and all three failures were sincere — every
+author accurately reported their own intent while the file lagged behind it:
+
+- **"we are 100% aligned"** — announced while the amendments were still unwritten.
+- **"charter v1.2 sealed"** — announced while the amendment it named still carried the superseded
+  text verbatim.
+- **A6 collided.** Two principals stamped different amendments with the same number, in two copies
+  of the charter, sixty seconds apart, neither seeing the other's write.
+- **An amendment cited from memory that no file ever contained** — caught by its own author during
+  reconciliation.
+
+The A6 collision is this document's defect class demonstrated live: two principals writing one
+shared artifact with no claim, which is the airspace collision `clearance.ts` already exists to
+catch. It also produced the corollary:
+
+> **The HOST is a shared `artifact_ref`.** Host remediation takes a claim the same way a file
+> does. Two agents acted on host memory the same evening with neither declaring one.
+
+Both rules exist because the only thing that surfaced any of the four failures was someone opening
+the file instead of trusting the message. That should be mechanical, not a function of who happens
+to be suspicious that day.
 
 ## Where it plugs in
 
@@ -184,7 +299,7 @@ export function musterCheck(
 ```
 
 Reasons are named, never generic: `role_unfilled`, `identity_drift`, `lens_collapse`,
-`author_is_gate`, `merge_delegated`, `crew_unobservable`, `crew_blocked`.
+`lens_unverified`, `author_is_gate`, `merge_delegated`, `crew_unobservable`, `crew_blocked`.
 
 `dispatchFlight` already gates on `preflight.go && clearance.cleared`. It becomes:
 
@@ -216,7 +331,8 @@ Nothing here needs new instrumentation. Every source already exists:
 | source | strength | reads |
 |---|---|---|
 | host process table | strong | harness binary, uptime, CPU — proves *alive* |
-| tmux pane capture | strong | **the model string the harness itself prints** — proves *identity* |
+| tmux pane capture | strong for liveness/identity, **insufficient for lens** | the model string the harness itself prints — see F1 above: the harness attesting to itself is a declaration, not an observation |
+| provider contract / API-side attribution | **required for lens** | which model actually served the tokens — the only harness-independent source |
 | `fleet_agents.last_reported_at` | medium | `derivePresence()`, already built |
 | systemd unit state | weak | says `active` for a hung service — see below |
 | service health endpoint | strong | but must have a timeout, and the timeout must be a NO-GO |
