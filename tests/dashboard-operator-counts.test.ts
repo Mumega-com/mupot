@@ -12,7 +12,9 @@
 // tests/operator-counts-cross-surface.test.ts covers the real-D1, seeded-fixture,
 // cross-surface (Home vs Health vs Fleet) parity assertion done_when #1 asks for.
 
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, beforeAll, afterAll } from 'vitest'
+import { createSqliteD1 } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 import {
   computeOperatorCounts,
   loadTaskStatusCounts,
@@ -133,69 +135,88 @@ describe('computeOperatorCounts — single source of truth (mutate the input, ev
   })
 })
 
-describe('loadTaskStatusCounts', () => {
-  function makeEnv(rows: unknown[]) {
-    const calls: { sql: string; binds: unknown[] }[] = []
-    const env = {
-      DB: {
-        prepare(sql: string) {
-          calls.push({ sql, binds: [] })
-          return {
-            bind(...args: unknown[]) { calls[calls.length - 1].binds = args; return this },
-            async all() { return { results: rows } },
-          }
-        },
-      },
-    } as unknown as Env
-    return { env, calls }
-  }
+// Real D1 (node:sqlite + the FULL migration chain — tests/helpers, the #684 ratchet
+// enforced by scripts/check-test-schema-source.mjs). No hand-written prepare() stand-in:
+// a fake that string-matches SQL and returns canned rows cannot be contradicted by a
+// query naming a column that doesn't exist — see tests/helpers/migrations.ts's header.
+describe('loadTaskStatusCounts (real D1)', () => {
+  let harness: ReturnType<typeof createSqliteD1>
+  let env: Env
 
-  it('returns a status -> count map from the grouped query, coercing string counts', async () => {
-    const { env, calls } = makeEnv([
-      { status: 'open', count: 3 },
-      { status: 'blocked', count: '1' },
-    ])
+  beforeAll(() => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    harness.sqlite.exec(`
+      INSERT INTO departments (id, slug, name, created_at) VALUES ('dept1', 'ops', 'Ops', datetime('now'));
+      INSERT INTO squads (id, department_id, slug, name, created_at) VALUES ('squad1', 'dept1', 'core', 'Core', datetime('now'));
+      INSERT INTO agents (id, squad_id, slug, name, role, model, status, created_at) VALUES
+        ('a1', 'squad1', 'a1', 'A1', 'builder', 'test-model', 'active', datetime('now'));
+
+      INSERT INTO tasks (id, squad_id, title, status, created_at, updated_at) VALUES
+        ('t-open-1', 'squad1', 'Open 1', 'open', datetime('now'), datetime('now')),
+        ('t-open-2', 'squad1', 'Open 2', 'open', datetime('now'), datetime('now')),
+        ('t-open-3', 'squad1', 'Open 3', 'open', datetime('now'), datetime('now')),
+        ('t-blocked-1', 'squad1', 'Blocked 1', 'blocked', datetime('now'), datetime('now'));
+    `)
+    env = { TENANT_SLUG: 'test', DB: harness.db } as unknown as Env
+  })
+
+  afterAll(() => { harness.close() })
+
+  it('returns a real status -> count map from the grouped query against actual rows', async () => {
     const map = await loadTaskStatusCounts(env)
     expect(map.get('open')).toBe(3)
     expect(map.get('blocked')).toBe(1)
-    expect(calls[0].sql).toContain('GROUP BY status')
-    expect(calls[0].sql).toContain('FROM tasks')
+    expect(map.has('review')).toBe(false) // no review rows seeded — must not fabricate a zero-vs-absent distinction
   })
 })
 
-describe('loadOperatorCounts — thin D1 wiring', () => {
-  it('wires agents/stats/runtimeStates/approvals/taskStatusCounts into computeOperatorCounts', async () => {
-    const sqlLog: string[] = []
-    const env = {
-      TENANT_SLUG: 'test',
-      DB: {
-        prepare(sql: string) {
-          sqlLog.push(sql)
-          const rowsFor = (): unknown[] => {
-            if (sql.includes('SELECT id, status FROM agents')) return [{ id: 'a1', status: 'active' }]
-            if (sql.includes('AS task_count')) return []
-            if (sql.includes('key_member_id')) return []
-            if (sql.includes('t.gate_owner')) return []
-            if (sql.includes('GROUP BY status')) return [{ status: 'blocked', count: 1 }]
-            return []
-          }
-          return {
-            bind() { return this },
-            async all() { return { results: rowsFor() } },
-          }
-        },
-      },
-    } as unknown as Env
-    const auth = { userId: 'owner-1', email: null, role: 'owner', tenant: 'test' } as AuthContext
+describe('loadOperatorCounts — thin D1 wiring (real D1)', () => {
+  let harness: ReturnType<typeof createSqliteD1>
+  let env: Env
+  const AUTH: AuthContext = { userId: 'owner-1', email: 'owner@test', role: 'owner', tenant: 'wiring-test' }
+  const NOW = new Date('2026-08-16T12:00:00.000Z').getTime()
+  const RECENT = '2026-08-16T11:58:00.000Z'
 
-    const counts = await loadOperatorCounts(env, auth, 5_000)
-    expect(counts.agentsTotal).toBe(1)
+  beforeAll(() => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    harness.sqlite.exec(`
+      INSERT INTO departments (id, slug, name, created_at) VALUES ('dept1', 'ops', 'Ops', datetime('now'));
+      INSERT INTO squads (id, department_id, slug, name, created_at) VALUES ('squad1', 'dept1', 'core', 'Core', datetime('now'));
+
+      -- One active agent with a live runtime, one paused agent with no runtime attach.
+      INSERT INTO agents (id, squad_id, slug, name, role, model, status, created_at) VALUES
+        ('a-live', 'squad1', 'live', 'Live', 'builder', 'test-model', 'active', datetime('now')),
+        ('a-paused', 'squad1', 'paused', 'Paused', 'builder', 'test-model', 'paused', datetime('now'));
+
+      INSERT INTO members (id, tenant, display_name, email, status, created_at) VALUES
+        ('m-live', 'wiring-test', 'Live Key Owner', NULL, 'active', datetime('now'));
+
+      INSERT INTO agent_keys (tenant, agent_id, pubkey, member_id, created_at) VALUES
+        ('wiring-test', 'a-live', 'pk-live', 'm-live', unixepoch());
+
+      INSERT INTO fleet_agents (agent_id, tenant, display, runtime, status, last_reported_at, updated_at) VALUES
+        ('a-live', 'wiring-test', 'Live', 'claude-code', 'running', '${RECENT}', '${RECENT}');
+
+      -- One task this owner can verdict (needs decision), one blocked task.
+      INSERT INTO tasks (id, squad_id, title, status, assignee_agent_id, gate_owner, created_at, updated_at) VALUES
+        ('t-review-1', 'squad1', 'Ship it', 'review', 'a-live', 'gate:content', datetime('now'), datetime('now')),
+        ('t-blocked-1', 'squad1', 'Blocked work', 'blocked', 'a-live', NULL, datetime('now'), datetime('now'));
+    `)
+    env = { TENANT_SLUG: 'wiring-test', DB: harness.db } as unknown as Env
+  })
+
+  afterAll(() => { harness.close() })
+
+  it('wires the real agents/stats/runtimeStates/approvals/taskStatusCounts loaders into computeOperatorCounts', async () => {
+    const counts = await loadOperatorCounts(env, AUTH, NOW)
+    expect(counts.agentsTotal).toBe(2)
     expect(counts.agentsActive).toBe(1)
+    expect(counts.agentsPaused).toBe(1)
+    expect(counts.liveRuntimeCount).toBe(1)
+    expect(counts.needsDecisionCount).toBe(1)
     expect(counts.blockedOrRejectedCount).toBe(1)
-    expect(counts.generatedAtMs).toBe(5_000)
-    // Confirms it actually issued all five underlying queries, not a cached/short-circuited subset.
-    expect(sqlLog.some((s) => s.includes('SELECT id, status FROM agents'))).toBe(true)
-    expect(sqlLog.some((s) => s.includes('key_member_id'))).toBe(true)
-    expect(sqlLog.some((s) => s.includes('t.gate_owner'))).toBe(true)
+    expect(counts.generatedAtMs).toBe(NOW)
   })
 })
