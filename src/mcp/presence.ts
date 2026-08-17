@@ -183,9 +183,22 @@ const toolPresenceHeartbeat: ToolSpec = {
     let report: ActivityReport | undefined
     if (args.state !== undefined) {
       if (!isActivityState(args.state)) return fail(400, 'invalid_state', { accepted: ACTIVITY_STATES })
+      // seq MUST BE >= 1, and the off-by-one here was a real accepted-but-inert bug.
+      //
+      // Found by Athena (GPT-5.6 Luna) on the #1118 gate, who proved it with a throwaway
+      // test rather than by reading: this accepted any NON-NEGATIVE integer including 0,
+      // while migration 0106 initializes activity_seq to 0 and heartbeatModule guards with
+      // `?7 > activity_seq`. So `0 > 0` is false and a seat's first report at seq 0 was
+      // accepted by validation, returned ok, and SILENTLY DROPPED — activity stayed
+      // 'unknown' forever while the caller had every reason to think it had reported.
+      //
+      // 0 is the NEVER-REPORTED SENTINEL, not a usable sequence value. Rejecting it here
+      // is better than moving the sentinel to -1: the boundary is then visible to callers
+      // as a 400 instead of silently doing nothing, and "seq starts at 1" is easier to get
+      // right in a reporter than "seq must exceed a sentinel you cannot see".
       const seq = args.seq
-      if (typeof seq !== 'number' || !Number.isInteger(seq) || seq < 0) {
-        return fail(400, 'invalid_seq', 'state requires a non-negative integer seq (monotonic per seat)')
+      if (typeof seq !== 'number' || !Number.isInteger(seq) || seq < 1) {
+        return fail(400, 'invalid_seq', 'state requires an integer seq >= 1 (monotonic per seat; 0 is the never-reported sentinel)')
       }
       let message: string | null = null
       if (args.message !== undefined && args.message !== null) {

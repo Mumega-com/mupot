@@ -53,6 +53,22 @@ ALTER TABLE module_registry ADD COLUMN activity_seq INTEGER NOT NULL DEFAULT 0;
 -- report.
 ALTER TABLE module_registry ADD COLUMN activity_at TEXT;
 
+-- When an activity report was last ACCEPTED — distinct from activity_at (last CHANGE) and
+-- from last_heartbeat (reachability, which advances even for a REJECTED report).
+--
+-- Without this, a rejected-seq storm is invisible. Loom's #1118 gate scenario: process A
+-- reports seq 100 then crashes; an old clone keeps emitting seq 99 every 90 seconds. The
+-- row stays 'online' forever because the heartbeat always lands, activity stays frozen at
+-- A's last value because every report loses the seq comparison, and NOTHING tells an
+-- operator that every current report is being thrown away. That is split-brain presented
+-- as health.
+--
+-- With all three timestamps a reader can separate the cases: last_heartbeat fresh +
+-- activity_report_at stale means reports are arriving and being REJECTED; both stale means
+-- the seat went quiet; activity_report_at fresh + activity_at old means it is genuinely
+-- holding one state (a long turn, or a wedge).
+ALTER TABLE module_registry ADD COLUMN activity_report_at TEXT;
+
 -- Find wedged/blocked seats without scanning the tenant: the dashboard's
 -- "who needs attention" query orders by how long a seat has held one activity.
 CREATE INDEX IF NOT EXISTS idx_module_registry_activity

@@ -65,9 +65,15 @@ export function isActivityState(value: unknown): value is ActivityState {
  * real turn does not trip it and short enough that a genuinely wedged seat surfaces
  * within one working session.
  *
- * NOTE this flag is only *evidence*, and its meaning depends on the activity it
- * accompanies: stale + 'working'/'blocked' is a wedge worth looking at; stale + 'idle'
- * is simply a seat that has had nothing to do, which is not a defect.
+ * THE FLAG ITSELF NOW ENCODES WHICH ACTIVITIES IT APPLIES TO. It is raised only for
+ * 'working'/'blocked' on a reachable seat — states that CLAIM PROGRESS, where age means a
+ * wedge. It is never raised for 'idle'/'done' (resting; age carries no alarm) or 'unknown'
+ * (no live claim to have gone quiet).
+ *
+ * This comment previously explained that distinction and left the caller to apply it,
+ * while the code flagged on age alone. Loom caught it on the #1118 gate: a healthy idle
+ * seat came back stale after 15 minutes, so any triage view filtering on the flag would
+ * alert on every resting seat. Documenting a caveat is not the same as implementing it.
  */
 export const ACTIVITY_STALE_SECONDS = 900
 
@@ -99,6 +105,7 @@ interface ModuleRegistryRow {
   activity_message?: string | null
   activity_seq?: number | null
   activity_at?: string | null
+  activity_report_at?: string | null
 }
 
 // The read-model returned to callers. `status` here is the caller-facing EFFECTIVE
@@ -139,13 +146,22 @@ export interface ModulePresence {
   /** Seconds since that change, or null if it has never reported. */
   activity_age_seconds: number | null
   /**
+   * When an activity report was last ACCEPTED. Distinct from activity_at (last CHANGE) and
+   * from last_heartbeat (which advances even when a report is REJECTED by the seq guard).
+   * Fresh heartbeat + stale activity_report_at = reports are arriving and losing the seq
+   * comparison, i.e. a zombie reporter. Loom's #1118 BLOCKER 2.
+   */
+  activity_report_at: string | null
+  /** Highest accepted sequence. Exposed so a reporter can see whether its seq is winning. */
+  activity_seq: number
+  /**
    * True when the activity has gone unchanged longer than ACTIVITY_STALE_SECONDS.
    * Evidence, not a verdict — read it together with `activity` (see that const's docs).
    */
   activity_stale: boolean
 }
 
-const SELECT_COLUMNS = `id, tenant, kind, adapter, project_id, identity, status, capabilities, model, last_heartbeat, registered_at, activity, activity_message, activity_seq, activity_at`
+const SELECT_COLUMNS = `id, tenant, kind, adapter, project_id, identity, status, capabilities, model, last_heartbeat, registered_at, activity, activity_message, activity_seq, activity_at, activity_report_at`
 
 function parseCapabilities(raw: string): string[] {
   try {
@@ -185,9 +201,35 @@ function effectiveStatus(row: Pick<ModuleRegistryRow, 'status' | 'last_heartbeat
  * Also 'unknown' when the seat has never reported: an unreported seat is NOT an idle
  * one, and defaulting to idle would invent a healthy reading out of missing data.
  */
-function effectiveActivity(stored: ActivityState | null, status: ModuleStatus): EffectiveActivity {
+function effectiveActivity(
+  stored: ActivityState | null,
+  status: ModuleStatus,
+  ageSeconds: number | null,
+): EffectiveActivity {
   if (status === 'offline') return 'unknown'
-  return stored ?? 'unknown'
+  if (stored === null) return 'unknown'
+  // BLOCKER 1 from Loom's #1118 gate, and he was right that the first version was
+  // self-defeating. This field is documented as the value a reader may ACT ON, yet it
+  // only expired on REACHABILITY. So: the activity reporter dies at 00:00 while a plain
+  // heartbeat keeps the row online, and at 00:20 the roster still answers 'working'. A
+  // consumer using the advertised field gets exactly the false-green #1117 exists to
+  // remove — and the old test suite PROVED that behaviour rather than catching it.
+  //
+  // A claim of progress has a shelf life. Past ACTIVITY_STALE_SECONDS, 'working' and
+  // 'blocked' stop being current and become last-known, so the effective field says
+  // 'unknown' and refuses to speak for a reporter that has gone quiet.
+  //
+  // Nothing is lost: activity_reported still carries the last word, activity_stale still
+  // flags it, and activity_age_seconds still says how long — so the WEDGE SIGNAL survives
+  // intact (reported='working' + stale=true + online). What changes is that the field
+  // labelled "act on this" no longer hands you a stale claim.
+  //
+  // 'idle'/'done' do not expire: they are resting states, and a resting seat that has had
+  // nothing to do is still accurately idle.
+  if ((stored === 'working' || stored === 'blocked') && ageSeconds !== null && ageSeconds > ACTIVITY_STALE_SECONDS) {
+    return 'unknown'
+  }
+  return stored
 }
 
 function hydrate(row: ModuleRegistryRow, nowMs: number): ModulePresence | null {
@@ -211,12 +253,34 @@ function hydrate(row: ModuleRegistryRow, nowMs: number): ModulePresence | null {
     model: row.model ?? null,
     last_heartbeat: row.last_heartbeat,
     registered_at: row.registered_at,
-    activity: effectiveActivity(storedActivity, status),
+    activity: effectiveActivity(storedActivity, status, ageSeconds),
     activity_reported: storedActivity,
     activity_message: typeof row.activity_message === 'string' ? row.activity_message : null,
     activity_at: activityAt,
     activity_age_seconds: ageSeconds,
-    activity_stale: ageSeconds !== null && ageSeconds > ACTIVITY_STALE_SECONDS,
+    activity_report_at: typeof row.activity_report_at === 'string' ? row.activity_report_at : null,
+    activity_seq: typeof row.activity_seq === 'number' ? row.activity_seq : 0,
+    // STALE ONLY MEANS SOMETHING FOR A SEAT THAT CLAIMS TO BE BUSY.
+    //
+    // Found by Loom (Gemini) on the #1118 gate. The first version flagged ANY activity
+    // older than the window, so a seat that reported 'idle' and then sat healthy and
+    // heartbeating for 20 minutes — the normal state of a fleet with nothing queued —
+    // came back activity_stale: true. Any triage view filtering on that flag would alert
+    // on healthy idle seats, i.e. cry wolf until nobody reads it.
+    //
+    // The original code even documented this ("stale + 'idle' is simply a seat that has
+    // had nothing to do, which is not a defect") and then set the flag anyway, leaving the
+    // reader to apply a caveat the data should have encoded. Writing the caveat down is
+    // not the same as implementing it.
+    //
+    // 'working'/'blocked' are CLAIMS OF PROGRESS: unchanged for too long, they are the
+    // wedge signal. 'idle'/'done' are resting states where age carries no alarm, and
+    // 'unknown' has nothing to be stale about.
+    activity_stale:
+      ageSeconds !== null &&
+      ageSeconds > ACTIVITY_STALE_SECONDS &&
+      (storedActivity === 'working' || storedActivity === 'blocked') &&
+      status === 'online',
   }
 }
 
@@ -265,7 +329,30 @@ export async function registerModule(
        status         = 'online',
        capabilities   = excluded.capabilities,
        model          = excluded.model,
-       last_heartbeat = excluded.last_heartbeat`,
+       last_heartbeat = excluded.last_heartbeat,
+       -- REGISTRATION IS THE LIFECYCLE BOUNDARY: reset the activity fields.
+       --
+       -- Found by Loom (Gemini) on the #1118 gate, and it is the worst defect in this
+       -- change. Without this reset: a seat runs up to activity_seq=45 and dies; systemd
+       -- restarts it; the fresh process re-registers and starts ITS counter at 1; every
+       -- subsequent report fails the 1 > 45 comparison and is silently dropped FOREVER.
+       -- (No backticks in this comment: it lives inside a JS template literal, and one
+       -- stray backtick terminates the SQL string mid-statement.) The seat then
+       -- reads online + 'working' + stale permanently while actually sitting idle.
+       --
+       -- That is this feature's own failure mode pointed at itself: a healthy agent frozen
+       -- as busy, which is exactly the "dead agent looks busy" reading #1117 exists to kill.
+       --
+       -- A register call means a NEW PROCESS is announcing itself, and a new process has a
+       -- new sequence origin. Clearing to the never-reported sentinel is therefore correct
+       -- rather than merely convenient: the old process's last activity is not the new
+       -- process's current activity, and carrying it over would be another last-known
+       -- value read as current.
+       activity         = NULL,
+       activity_message = NULL,
+       activity_at      = NULL,
+       activity_report_at = NULL,
+       activity_seq     = 0`,
   )
     .bind(id, tenant, input.kind, adapter, input.projectId, identity, capabilitiesJson, model, nowIso)
     .run()
@@ -336,7 +423,10 @@ export async function heartbeatModule(
             activity_message = CASE WHEN ?7 > activity_seq THEN ?6 ELSE activity_message END,
             activity_at      = CASE WHEN ?7 > activity_seq AND activity IS NOT ?5
                                     THEN ?1 ELSE activity_at END,
-            activity_seq     = CASE WHEN ?7 > activity_seq THEN ?7 ELSE activity_seq END
+            activity_seq     = CASE WHEN ?7 > activity_seq THEN ?7 ELSE activity_seq END,
+            -- Stamped ONLY when the report is accepted, which is what makes a rejected-seq
+            -- storm visible: last_heartbeat keeps advancing, this does not.
+            activity_report_at = CASE WHEN ?7 > activity_seq THEN ?1 ELSE activity_report_at END
       WHERE tenant = ?2 AND identity = ?3 AND project_id IS ?4`,
   )
     .bind(nowIso, env.TENANT_SLUG, identity, projectId, report.state, message, report.seq)

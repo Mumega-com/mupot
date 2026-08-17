@@ -52,7 +52,7 @@ function makeDb() {
     raw: (identity: string) =>
       harness.sqlite
         .prepare(
-          'SELECT status, last_heartbeat, activity, activity_message, activity_seq, activity_at FROM module_registry WHERE tenant = ? AND identity = ? AND project_id IS ?',
+          'SELECT status, last_heartbeat, activity, activity_message, activity_seq, activity_at, activity_report_at FROM module_registry WHERE tenant = ? AND identity = ? AND project_id IS ?',
         )
         .get(TENANT, identity, 'proj-a') as
         | {
@@ -62,6 +62,7 @@ function makeDb() {
             activity_message: string | null
             activity_seq: number
             activity_at: string | null
+            activity_report_at: string | null
           }
         | undefined,
   }
@@ -215,6 +216,95 @@ describe('unreachable seats — the defect mupot#1117 exists to kill', () => {
   })
 })
 
+// ── Findings from the #1118 diverse gate (2026-08-17) ────────────────────────────────
+// Three defects, none of which this suite caught while green and mutation-tested. Two
+// independent reviewers on two model families found two different ones; the author found
+// none. Each test below fails against the pre-gate code.
+describe('gate finding (Loom/Gemini) — re-registration must reset the sequence origin', () => {
+  it('a restarted seat starting its counter at 1 is NOT locked out by the old seq', async () => {
+    const db = makeDb()
+    const id = await seat(db)
+
+    // Long-lived process climbs to a high seq, then dies mid-'working'.
+    await heartbeatModule(db.env, id, 'proj-a', at(10), { state: 'working', seq: 45 })
+    expect(db.raw(id)?.activity_seq).toBe(45)
+
+    // systemd restarts it; the fresh process re-registers and its counter starts over.
+    await registerModule(
+      db.env,
+      { identity: id, kind: 'agent_system', adapter: 'prime_agent', projectId: 'proj-a' },
+      at(100),
+    )
+
+    // Pre-fix, ON CONFLICT left activity_seq at 45, so `1 > 45` was false and EVERY report
+    // from the new process was silently dropped — the seat read online + 'working' + stale
+    // forever while sitting idle. A healthy agent frozen as busy.
+    const row = db.raw(id)
+    expect(row?.activity_seq).toBe(0)
+    expect(row?.activity).toBeNull()
+    expect(row?.activity_at).toBeNull()
+
+    const ok = await heartbeatModule(db.env, id, 'proj-a', at(110), { state: 'idle', seq: 1 })
+    expect(ok).toBe(true)
+    expect(db.raw(id)?.activity).toBe('idle')
+    expect(db.raw(id)?.activity_seq).toBe(1)
+
+    const view = await getModule(db.env, id, 'proj-a', at(115))
+    expect(view?.activity).toBe('idle')
+  })
+})
+
+describe('gate finding (Loom/Gemini) — stale is a claim-of-progress signal, not an age signal', () => {
+  it('an idle seat unchanged for a long time is NOT stale', async () => {
+    const db = makeDb()
+    const id = await seat(db)
+    await heartbeatModule(db.env, id, 'proj-a', at(10), { state: 'idle', seq: 1 })
+
+    // Healthy, heartbeating, simply nothing queued — the normal state of a quiet fleet.
+    let t = 10
+    while (t < ACTIVITY_STALE_SECONDS + 300) {
+      t += PRESENCE_STALE_SECONDS - 10
+      await heartbeatModule(db.env, id, 'proj-a', at(t))
+    }
+
+    const view = await getModule(db.env, id, 'proj-a', at(t))
+    expect(view?.status).toBe('online')
+    expect(view?.activity).toBe('idle')
+    // Pre-fix this was true, so any triage view filtering on activity_stale alerted on
+    // every healthy resting seat — a flag that cries wolf until nobody reads it.
+    expect(view?.activity_stale).toBe(false)
+    expect(view?.activity_age_seconds).toBeGreaterThan(ACTIVITY_STALE_SECONDS)
+  })
+
+  it('a done seat unchanged for a long time is NOT stale either', async () => {
+    const db = makeDb()
+    const id = await seat(db)
+    await heartbeatModule(db.env, id, 'proj-a', at(10), { state: 'done', seq: 1 })
+    let t = 10
+    while (t < ACTIVITY_STALE_SECONDS + 300) {
+      t += PRESENCE_STALE_SECONDS - 10
+      await heartbeatModule(db.env, id, 'proj-a', at(t))
+    }
+    const view = await getModule(db.env, id, 'proj-a', at(t))
+    expect(view?.activity).toBe('done')
+    expect(view?.activity_stale).toBe(false)
+  })
+
+  it('an UNREACHABLE seat is not stale either — unknown has nothing to be stale about', async () => {
+    const db = makeDb()
+    const id = await seat(db)
+    await heartbeatModule(db.env, id, 'proj-a', at(10), { state: 'working', seq: 1 })
+
+    // No further heartbeat: it dies mid-turn and ages out of reachability.
+    const later = at(10 + ACTIVITY_STALE_SECONDS + 600)
+    const view = await getModule(db.env, id, 'proj-a', later)
+    expect(view?.status).toBe('offline')
+    expect(view?.activity).toBe('unknown')
+    // 'stale' would imply a live claim gone quiet; this seat makes no live claim at all.
+    expect(view?.activity_stale).toBe(false)
+  })
+})
+
 describe('the wedge signal — reachability and activity are genuinely independent', () => {
   it('a seat heartbeating happily while stuck on one activity reads online + stale', async () => {
     const db = makeDb()
@@ -232,9 +322,82 @@ describe('the wedge signal — reachability and activity are genuinely independe
 
     const view = await getModule(db.env, id, 'proj-a', at(t))
     expect(view?.status).toBe('online')
-    expect(view?.activity).toBe('working')
+
+    // REWRITTEN after Loom's #1118 BLOCKER 1. This test previously asserted
+    // activity === 'working' here, i.e. it PROVED the defect rather than catching it: the
+    // field documented as "the value a reader may act on" was handing out a claim whose
+    // reporter had been silent for twenty minutes.
+    //
+    // The wedge signal is unchanged and is still fully expressible — it just lives in the
+    // honest fields now: the seat is reachable, it last CLAIMED 'working', that claim is
+    // stale, and here is its age. What a reader may act on is 'unknown'.
+    expect(view?.activity).toBe('unknown')
+    expect(view?.activity_reported).toBe('working')
     expect(view?.activity_stale).toBe(true)
     expect(view?.activity_age_seconds).toBeGreaterThan(ACTIVITY_STALE_SECONDS)
+  })
+
+  it('a long turn INSIDE the window still reads as working — the fix must not blind the normal case', async () => {
+    const db = makeDb()
+    const id = await seat(db)
+    await heartbeatModule(db.env, id, 'proj-a', at(10), { state: 'working', seq: 1 })
+    await heartbeatModule(db.env, id, 'proj-a', at(200))
+
+    // Well inside ACTIVITY_STALE_SECONDS: a genuinely long turn must still be actionable,
+    // or expiring the field would trade one blindness for another.
+    const view = await getModule(db.env, id, 'proj-a', at(300))
+    expect(view?.activity).toBe('working')
+    expect(view?.activity_stale).toBe(false)
+  })
+})
+
+describe('gate finding (Loom/Gemini) BLOCKER 2 — a rejected-seq storm must be visible', () => {
+  it('a zombie clone replaying an old seq leaves activity_report_at frozen while the heartbeat advances', async () => {
+    const db = makeDb()
+    const id = await seat(db)
+
+    // Process A reports seq 100, then crashes.
+    await heartbeatModule(db.env, id, 'proj-a', at(10), { state: 'working', seq: 100 })
+    const accepted = db.raw(id)?.activity_report_at
+    expect(accepted).toBe(at(10).toISOString())
+
+    // An old clone keeps emitting seq 99 every 90s. Each one loses the seq comparison.
+    let t = 10
+    for (let i = 0; i < 5; i += 1) {
+      t += 90
+      await heartbeatModule(db.env, id, 'proj-a', at(t), { state: 'idle', seq: 99 })
+    }
+
+    const row = db.raw(id)
+    // Reachability keeps advancing — which is correct, and is exactly why this was invisible.
+    expect(row?.last_heartbeat).toBe(at(t).toISOString())
+    // …but nothing was accepted, and now that is READABLE rather than merely implied.
+    expect(row?.activity_report_at).toBe(at(10).toISOString())
+    expect(row?.activity_seq).toBe(100)
+
+    const view = await getModule(db.env, id, 'proj-a', at(t))
+    expect(view?.status).toBe('online')
+    expect(view?.activity_seq).toBe(100)
+    // The discriminator: heartbeat fresh, accepted-report old. An operator can now tell
+    // "reports are arriving and being rejected" from "the seat went quiet".
+    const heartbeatAge = (at(t).getTime() - Date.parse(row!.last_heartbeat)) / 1000
+    const reportAge = (at(t).getTime() - Date.parse(view!.activity_report_at!)) / 1000
+    expect(heartbeatAge).toBeLessThan(5)
+    expect(reportAge).toBeGreaterThan(400)
+  })
+
+  it('an accepted report stamps activity_report_at even when the state does not change', async () => {
+    const db = makeDb()
+    const id = await seat(db)
+    await heartbeatModule(db.env, id, 'proj-a', at(10), { state: 'working', seq: 1 })
+    await heartbeatModule(db.env, id, 'proj-a', at(70), { state: 'working', seq: 2 })
+
+    const row = db.raw(id)
+    // activity_at pins the TRANSITION (still the wedge signal)…
+    expect(row?.activity_at).toBe(at(10).toISOString())
+    // …while activity_report_at proves reports are still landing. Two different questions,
+    // two different columns; conflating them is what hid the zombie case.
+    expect(row?.activity_report_at).toBe(at(70).toISOString())
   })
 
   it('listPresence carries both axes for every row', async () => {
