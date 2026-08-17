@@ -23,7 +23,11 @@ import {
   deliverFlightLandedEvent,
   failFlight,
   getFlight,
-  landFlight,
+  // landFlight is deliberately NOT imported here any more. It is the ungoverned land
+  // primitive — a bare UPDATE to status='landed' with no gate, no actor and no receipt
+  // — and this route was its only production caller (#911). It remains exported from
+  // ../service and covered by tests/flight-service.test.ts, but nothing in production
+  // calls it now; removing it outright is a follow-up, not part of this fix.
   landGovernedFlight,
   listFlights,
   listFlightProjectMismatchTaskIds,
@@ -372,11 +376,64 @@ flightsApp.post('/:id/land', async (c) => {
     return c.json({ ok: true, id, status: landed.status })
   }
 
-  const cost_micro_usd = b.cost_micro_usd == null ? undefined : asNum(b.cost_micro_usd, 0, 0)
-  const score = b.score == null ? undefined : asNum(b.score, 0, 0, 1)
-  await landFlight(c.env, id, { cost_micro_usd, score })
-  const after = await getFlight(c.env, id)
-  return c.json({ ok: true, id, status: after?.status ?? 'landed' })
+  // NON-v1 META — REFUSED (mupot#911).
+  //
+  // Control used to FALL THROUGH to here and call landFlight() directly. Every gate
+  // above was skipped: no in-air status check, no budget policy check, no budget
+  // ceiling check, no task-completion check, no gate-verdict check, no actor
+  // attribution — and, most importantly, NO RECEIPT and no flight.landed event. The
+  // flight went to status='landed' with a cost recorded against it and nothing
+  // anywhere attesting that it was allowed to.
+  //
+  // The console.error thirty lines above already called that outcome "a permanent
+  // audit gap with no trace anywhere" — for the case where a GOVERNED landing merely
+  // loses its receipt. This path produced the same gap unconditionally, by design,
+  // and was the only land path in the codebase with no test covering it. That is not
+  // a coincidence: an untested branch is how a known-bad path survives being written
+  // down next to a warning about itself.
+  //
+  // WHY REFUSE RATHER THAN GOVERN-BY-DEFAULT. There is no meta to govern with. The
+  // gates need task_ids, squad_ids and a goal/objective to check anything; a flight
+  // that never declared them cannot be checked, only waved through. Fabricating an
+  // empty FlightMetaV1 to satisfy the type would make the gates pass vacuously — a
+  // check whose query entails its own answer is not a check.
+  //
+  // WHY 409 AND NOT 400. The request body is fine; the STORED FLIGHT is what cannot
+  // be governed. Every other refusal in this handler is a 409 on resource state
+  // (flight_not_in_air, flight_budget_exceeded, flight_meta_incompatible,
+  // flight_transition_conflict) and this is the same kind of thing. A lone 400 among
+  // them reads as "fix your request and retry", which is advice the caller cannot act
+  // on. `flight_meta_incompatible` directly above — meta that DECLARES v1 but fails
+  // to parse — is the same refusal for the adjacent case, at the same status.
+  //
+  // WHAT A CALLER DOES NOW. An ungoverned flight can still reach a terminal state via
+  // POST /:id/fail, which is the honest one: a flight nobody can attest to did not
+  // land successfully. To land, dispatch with `meta` (mupot.flight.meta/v1).
+  //
+  // NOT CLOSED HERE, deliberately, and left for the gate: POST /api/flights still
+  // ACCEPTS a dispatch with no meta (`b.meta == null` → undefined → stored as '{}'),
+  // so this surface can still mint a flight that is born unlandable. The MCP twin
+  // requires v1 meta at BOTH ends already (flight_dispatch → 400 invalid_flight_meta,
+  // flight_land → 404), so closing dispatch here is what brings the two surfaces to
+  // one predicate. It is not in this PR because it changes the published contract in
+  // docs/coherence-loop-brain-caller.md and touches ~25 dispatch call sites — a scope
+  // decision, not a defect fix. See the doc note added alongside this change.
+  const observedSchema = typeof (storedMeta as Record<string, unknown> | null)?.schema === 'string'
+    ? ((storedMeta as Record<string, unknown>).schema as string).slice(0, 100)
+    : null
+  return c.json(
+    {
+      error: 'flight_meta_ungoverned',
+      detail:
+        'This flight did not declare governed metadata, so budget, task-completion and ' +
+        'gate checks cannot be evaluated and no landing receipt can be written. Landing ' +
+        'it would record a terminal outcome with nothing attesting to it. Use POST ' +
+        '/:id/fail to close an ungoverned flight, or dispatch with meta to land one.',
+      expected_schema: FLIGHT_META_V1_SCHEMA,
+      observed_schema: observedSchema,
+    },
+    409,
+  )
 })
 
 // Fail — executor reports a failed outcome.
