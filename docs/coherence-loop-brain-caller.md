@@ -56,9 +56,24 @@ Body:
 - The brain MUST supply the full `signals` block — the pot will not default a missing block to a launch (it 400s). The brain owns context/budget knowledge; the pot owns the gate math.
 - Response `201` `{id, go:true, status:'running', score, reasons}` on GO; `200` `{id, go:false, status:'held', score, reasons}` on a recorded NO-GO (not an error — the gate worked, spend was avoided). Record `id`.
 
+- **`meta` is optional at dispatch but REQUIRED to land** (mupot#911). The body above omits
+  it, and the pot will accept that — but a flight without `mupot.flight.meta/v1` meta cannot
+  be landed, because the budget / task-completion / gate checks have nothing to check and no
+  landing receipt can be written. It used to land anyway, ungoverned and unattested; that
+  fall-through is closed. A flight dispatched without `meta` can only be closed via `/fail`.
+  Supply `meta` (see `src/flight/meta.ts` — `goal_id`, `objective_id`, `squad_ids`,
+  `task_ids`, `done_when`, `confidentiality`, `publication_target`, `parent_flight_id`) on any
+  flight you intend to land.
+
 ### `POST /api/flights/:id/land` — successful outcome
 Body `{ "cost_micro_usd": 1840000, "score": 0.86 }` (both optional; `score` = the flight's
 realized coherence 0..1). Idempotent via terminal-state guard. → `{ok, id, status}`.
+
+Refusals are all `409` on flight state, never `400` on your body: `flight_not_in_air`,
+`flight_budget_exceeded`, `flight_tasks_incomplete`, `flight_task_project_conflict`,
+`flight_meta_incompatible` (meta declares v1 but does not parse), and
+`flight_meta_ungoverned` (meta is not v1 at all — see the note above; the response carries
+`expected_schema` and `observed_schema`). A refusal leaves the flight in the air.
 
 ### `POST /api/flights/:id/fail` — failed outcome
 Body `{ "reason": "tool X unreachable after 3 tries" }`. → `{ok, id, status}`.

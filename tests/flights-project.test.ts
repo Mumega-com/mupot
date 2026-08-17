@@ -422,6 +422,126 @@ describe('flight project attribution', () => {
       .toEqual({ status: 'running' })
   })
 
+  // ── ungoverned land, refused (mupot#911) ───────────────────────────────────
+  //
+  // The three tests above cover meta that DECLARES v1 and fails to parse. The gap was
+  // the case one step earlier: meta that never declares v1 at all. `declaresGovernedV1`
+  // is false, so `flight_meta_incompatible` does not fire; `governedMeta` is null, so
+  // the governed block is skipped — and control fell through to a bare landFlight()
+  // with no budget check, no task check, no gate check, no actor and NO RECEIPT.
+  //
+  // These use the real migrated SQLite harness, not a mock that routes on SQL
+  // substrings, so the assertion is on the row the request actually left behind.
+
+  const ungovernedCases: Array<{ name: string; id: string; meta: string; observed: string | null }> = [
+    // The reachable-today case: POST /api/flights accepts a dispatch with no meta and
+    // createFlight stores `JSON.stringify(f.meta ?? {})` — literally '{}'. This is what
+    // the documented brain caller in docs/coherence-loop-brain-caller.md produces.
+    { name: 'meta absent at dispatch', id: 'flight-ungoverned-empty', meta: '{}', observed: null },
+    // A pre-v1 row.
+    {
+      name: 'a legacy pre-v1 schema',
+      id: 'flight-ungoverned-legacy',
+      meta: JSON.stringify({ schema: 'legacy/v0', goal_id: 'goal-1' }),
+      observed: 'legacy/v0',
+    },
+    // Not JSON at all: json_valid() is false so the SQL shape probe sees '{}', and
+    // JSON.parse throws so storedMeta stays null. Both halves must agree that this is
+    // ungoverned rather than one of them defaulting to "fine".
+    { name: 'meta that is not valid JSON', id: 'flight-ungoverned-garbage', meta: 'not json at all', observed: null },
+  ]
+
+  for (const { name, id, meta: storedMeta, observed } of ungovernedCases) {
+    it(`refuses to land a flight with ${name} — and leaves it in the air`, async () => {
+      harness = makeHarness()
+      harness.sqlite.prepare(`
+        INSERT INTO flights (id, tenant, agent, goal, status, budget_micro_usd, meta, project_id)
+        VALUES (?, 'pot-a', 'agent-a', 'Ungoverned', 'running', 10, ?, 'project-a')
+      `).run(id, storedMeta)
+      // An UNDELIVERED terminal event, so the delivery assertion below has a false
+      // branch to fail on — see the note at that assertion for why this seed exists.
+      harness.sqlite.prepare(`
+        INSERT INTO flight_event_outbox
+          (id, tenant, flight_id, event_type, actor_kind, actor_id, payload, created_at, delivered_at)
+        VALUES (?, 'pot-a', ?, 'flight.landed', 'member', 'admin-1', '{"squad_ids":["squad-a"]}', '2026-01-01T00:00:00.000Z', NULL)
+      `).run(`outbox-${id}`, id)
+
+      const response = await flightsApp.request(`https://pot.test/${id}/land`, {
+        method: 'POST',
+        headers: { authorization: 'Bearer admin', 'content-type': 'application/json' },
+        // A cost WITHIN budget and a valid score — so nothing else can be the reason
+        // this is refused. The old code accepted exactly this and landed the flight.
+        body: JSON.stringify({ cost_micro_usd: 5, score: 0.9 }),
+      }, envFor(harness))
+
+      expect(response.status).toBe(409)
+      const body = await response.json()
+      expect(body.error).toBe('flight_meta_ungoverned')
+      // The refusal names the version it wanted and the version it got, so an operator
+      // reading a log knows which flights are affected without opening the DB.
+      expect(body.expected_schema).toBe('mupot.flight.meta/v1')
+      expect(body.observed_schema).toBe(observed)
+
+      // THE LOAD-BEARING ASSERTION, and the one the brief gates on: not merely that the
+      // response was a 409, but that the ROW was not written. status must still be
+      // 'running' — asserted as a value, not as "not landed", because 'failed' or
+      // 'held' would also satisfy `!== 'landed'` and neither is what this path should
+      // produce. cost and ended_at must be untouched: landFlight() set BOTH, so a
+      // status-only assertion would miss a partial write.
+      const row = harness.sqlite
+        .prepare(`SELECT status, cost_micro_usd, ended_at, score FROM flights WHERE id = ?`)
+        .get(id)
+      // cost_micro_usd is 0 here because that is the flights column DEFAULT and the
+      // fixture never set it — this is the UNTOUCHED value, not a landed one. The
+      // request above reports cost 5 and score 0.9, so landFlight() would have written
+      // 5 / 0.9 / a timestamp; all three assertions catch it independently.
+      expect(row).toEqual({ status: 'running', cost_micro_usd: 0, ended_at: null, score: null })
+
+      // And no terminal event is DELIVERED.
+      //
+      // The first version of this assertion counted rows in flight_event_outbox and
+      // expected 0 — which passed, always, and proved nothing. deliverFlightLandedEvent
+      // is a PUMP, not a writer (src/flight/service.ts:558): it SELECTs an undelivered
+      // row that landGovernedFlight already INSERTed and emits it. On the ungoverned
+      // path no such row is ever written, so "count is 0" was entailed by the setup and
+      // had no false branch. A mutation that added deliverFlightLandedEvent() to this
+      // path left the suite fully green.
+      //
+      // So the fixture SEEDS an undelivered row first (above), and this asserts it is
+      // still undelivered. Now the assertion has a false branch: any call into the
+      // delivery pump on a refusal path sets delivered_at and turns this red. The
+      // invariant is the real one — a refused land must not push flight.landed to the
+      // bus for a flight that did not land.
+      const outbox = harness.sqlite
+        .prepare(`SELECT delivered_at FROM flight_event_outbox WHERE flight_id = ?`)
+        .get(id) as { delivered_at: string | null } | undefined
+      expect(outbox).toBeDefined()
+      expect(outbox?.delivered_at).toBeNull()
+    })
+  }
+
+  it('still lands a governed flight — the refusal is scoped to ungoverned meta', async () => {
+    // The control. Without this, "refuse everything" would pass the three tests above,
+    // and the fix would read as correct while having closed the whole route.
+    harness = makeHarness()
+    harness.sqlite.exec(`UPDATE tasks SET status = 'done' WHERE id = 'task-a';`)
+    harness.sqlite.prepare(`
+      INSERT INTO flights (id, tenant, agent, goal, status, budget_micro_usd, meta, project_id)
+      VALUES ('flight-governed-ok', 'pot-a', 'agent-a', 'Governed', 'running', 100, ?, 'project-a')
+    `).run(JSON.stringify(meta))
+
+    const response = await flightsApp.request('https://pot.test/flight-governed-ok/land', {
+      method: 'POST',
+      headers: { authorization: 'Bearer admin', 'content-type': 'application/json' },
+      body: JSON.stringify({ cost_micro_usd: 5, score: 0.9 }),
+    }, envFor(harness))
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toMatchObject({ ok: true, status: 'landed' })
+    expect(harness.sqlite.prepare(`SELECT status FROM flights WHERE id = 'flight-governed-ok'`).get())
+      .toEqual({ status: 'landed' })
+  })
+
   it('reports large project-mismatch sets in input order within the D1 bind budget', async () => {
     harness = makeHarness()
     const mismatchIndexes = new Set([5, 150])
