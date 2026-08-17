@@ -254,9 +254,9 @@ import { flushFlightEventOutbox } from './flight/service'
 import { sweepAgentConnectionRetention } from './members/agent-connection'
 import { runRoutineScheduler } from './routines/scheduler'
 import { dispatchRoutineRun } from './routines/dispatch'
+import { MAINTENANCE_CRON, maintenanceSlot } from './scheduled/slots'
 
 const ROUTINE_CRON = '* * * * *'
-const MAINTENANCE_CRON = '0-9,15-24,30-39,45-54 * * * *'
 const scheduledObservationBuckets = new Map<string, number>()
 
 function shouldEmitScheduledObservation(
@@ -330,7 +330,7 @@ export default {
       return
     }
 
-    // Ten independent maintenance heartbeats, staggered across each 15-minute
+    // Eleven independent maintenance heartbeats, staggered across each 15-minute
     // window and isolated from the Routine invocation budget on Workers Free.
     //  1. membership sync — reconcile channel membership → squad capabilities.
     //  2. metabolism — kick goal-bearing agents so their goal loops actually run
@@ -376,7 +376,7 @@ export default {
       ['agent-connection-retention', () => sweepAgentConnectionRetention(env)],
       ['token-expiry-warning', () => sweepExpiringTokensWarning(env)],
     ]
-    const heartbeat = maintenance[scheduledAt.getUTCMinutes() % 15]
+    const heartbeat = maintenance[maintenanceSlot(scheduledAt.getUTCMinutes(), maintenance.length)]
     if (heartbeat) waitFor(heartbeat[0], heartbeat[1]())
   },
 }
