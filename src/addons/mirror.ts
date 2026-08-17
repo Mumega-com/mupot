@@ -1,5 +1,6 @@
 import { Hono } from 'hono'
 import type { Env } from '../types'
+import { timingSafeEqual } from '../lib/crypto'
 
 export const mirrorApp = new Hono<{ Bindings: Env }>()
 
@@ -39,7 +40,7 @@ mirrorApp.use('*', async (c, next) => {
   const xSecret = c.req.header('x-secret') || c.req.header('x-mirror-secret')
 
   const providedToken = bearerToken || xSecret
-  if (providedToken !== secret) {
+  if (!providedToken || !timingSafeEqual(providedToken, secret)) {
     return c.json({ error: 'unauthorized', detail: 'invalid or missing secret header' }, 401)
   }
   return next()
