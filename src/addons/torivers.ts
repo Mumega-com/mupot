@@ -123,19 +123,58 @@ toriversAddonApp.post('/credentials/match', async (c) => {
       return c.json({ ok: false, error: 'Missing required field: requiredScopes array' }, 400)
     }
 
-    const matches = body.requiredScopes.map((scope) => ({
-      scope,
-      satisfied: true,
-      provider: body.provider || 'google-oauth2',
-      vaultKeyId: `vault_${scope.replace('.', '_')}_key`,
-    }))
-
-    return c.json({
-      ok: true,
-      tenantSlug: c.env.TENANT_SLUG || 'default',
-      allSatisfied: true,
-      matches,
-    })
+    // NOT IMPLEMENTED — same class as /workflows/execute above, and refused the same way.
+    //
+    // This handler performed NO LOOKUP OF ANY KIND. It mapped over the caller's own
+    // `requiredScopes` and returned `satisfied: true` for every one of them, plus
+    // `allSatisfied: true` — so it answered YES to `admin.everything` exactly as
+    // readily as to `github.repo`. A credentials check that cannot say no is not a
+    // check; it is a rubber stamp with a 200 on it.
+    //
+    // Worse than the always-yes was the `vaultKeyId`. It was string-substituted out of
+    // the scope name (`vault_${scope.replace('.','_')}_key`) — an identifier shaped
+    // exactly like a real vault key reference, pointing at nothing. That value is the
+    // kind that gets logged, persisted into a caller's config, quoted in an audit
+    // trail, and believed. A fabricated identifier is worse than a missing one because
+    // the missing one is visibly missing (mupot#1085).
+    //
+    // WHY NOT IMPLEMENT THE REAL LOOKUP. There is nothing to look up. The credential
+    // vault (migrations/0023_connectors.sql, src/connectors/service.ts) stores
+    // `connectors(id, tenant, type, label, encrypted_secret, meta, scope_type,
+    // scope_id, ...)`. Its `type` vocabulary is telegram | instantly | ghl | apify |
+    // mcpwp | custom | linear | github_app — there is no `google-oauth2` provider, no
+    // OAuth-scope column, and no mapping anywhere in this repo from the catalog's
+    // scope strings (`google.analytics`, `search.console`, `github.repo`,
+    // `inkwell.cms`) to a connector row. `scope_type` in that table means squad|agent|
+    // pot — grantee scope, not OAuth scope. The names collide; the concepts do not.
+    // Implementing "the real lookup" would mean inventing the scope model first.
+    //
+    // WHY NOT DELETE THE ROUTE. Zero callers, verified: nothing in this repo and
+    // nothing in the ToRivers v2 tree (/mnt/HC_Volume_104325311/torivers-v2 — its
+    // packages/shared/src/credentials/matching.ts is a self-contained local module
+    // that never calls the pot) issues this request. Deletion was the smaller fix and
+    // was considered. It loses on one point: GET /marketplace/automations below still
+    // advertises a `requiredScopes` array on every automation, so the matching contract
+    // is published even though the engine behind it is not. A bare 404 tells an
+    // integrator the endpoint is gone; a 501 tells them it is declared and unbuilt,
+    // which is the true state. When the scope model lands, delete this block — not the
+    // route — and the test below must be updated deliberately rather than removed.
+    //
+    // A missing answer is a visible gap. A fabricated YES is invisible corruption.
+    return c.json(
+      {
+        ok: false,
+        error: 'not_implemented',
+        detail:
+          'Credential scope matching is not built. No credential store in this pot ' +
+          'records OAuth scopes, so no scope can be truthfully confirmed or denied — ' +
+          'see mupot#1085. This endpoint previously confirmed every scope it was asked ' +
+          'about and returned a fabricated key identifier; it now answers nothing.',
+        requiredScopes: body.requiredScopes,
+        tenantSlug: c.env.TENANT_SLUG || 'default',
+      },
+      501,
+    )
   } catch (error) {
     console.error('[torivers:credential-match-error]', error)
     return c.json({ ok: false, error: 'Internal Server Error in credential matching' }, 500)
