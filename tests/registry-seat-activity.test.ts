@@ -18,6 +18,8 @@
 //   6. reachable + fresh heartbeat + long-unchanged activity = the WEDGE signal:
 //      status online, activity 'working', activity_stale true — proving the two axes
 //      are genuinely independent and not one field wearing two names
+//   7. a NEVER-reported seat receiving a state-less heartbeat still has raw activity
+//      NULL and effective 'unknown' — a heartbeat may not invent an activity
 
 import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
@@ -115,6 +117,42 @@ describe('activity report — lands and stamps the transition', () => {
     expect(row?.activity_at).toBe(at(10).toISOString())
     // …but the heartbeat itself did land.
     expect(row?.last_heartbeat).toBe(at(40).toISOString())
+  })
+
+  // ADDED after Athena's #1118 gate, which proved the gap by mutation: making the plain
+  // heartbeat do `SET activity = COALESCE(activity, 'idle')` left the suite 36/36 GREEN.
+  // That mutation IS the defect this PR exists to prevent — a heartbeat silently
+  // inventing an activity state — and nothing could see it, because the two nearest
+  // tests each miss the one path that matters. The test above starts from a prior
+  // 'working' report, so COALESCE(activity, 'idle') is a no-op there; the "never
+  // reported" test further down never heartbeats at all. A seat that has NEVER reported
+  // and THEN receives a state-less heartbeat was covered by neither.
+  //
+  // NULL means "this seat has never reported". 'idle' means "reported, nothing to do".
+  // They are different facts and the write path must not convert one into the other.
+  it('a plain heartbeat on a NEVER-reported seat invents no activity', async () => {
+    const db = makeDb()
+    const id = await seat(db)
+
+    const ok = await heartbeatModule(db.env, id, 'proj-a', at(10))
+    expect(ok).toBe(true)
+
+    const row = db.raw(id)
+    // The heartbeat landed — reachability is exactly what it proves…
+    expect(row?.last_heartbeat).toBe(at(10).toISOString())
+    // …and it proves NOTHING about what the seat is doing, so every activity column is
+    // still untouched. Asserted RAW so a write cannot hide behind read-derivation.
+    expect(row?.activity).toBeNull()
+    expect(row?.activity_message).toBeNull()
+    expect(row?.activity_at).toBeNull()
+    expect(row?.activity_report_at).toBeNull()
+    expect(row?.activity_seq).toBe(0)
+
+    // And the effective read says 'unknown' — never 'idle'.
+    const view = await getModule(db.env, id, 'proj-a', at(15))
+    expect(view?.status).toBe('online')
+    expect(view?.activity).toBe('unknown')
+    expect(view?.activity_reported).toBeNull()
   })
 })
 
