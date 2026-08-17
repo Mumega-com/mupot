@@ -207,7 +207,7 @@ describe('presence_heartbeat / presence_deregister — self-scoped only', () => 
   })
 
   // Gate finding (Athena / GPT-5.6 Luna, #1118, 2026-08-17): seq 0 was ACCEPTED and INERT.
-  // Validation allowed any non-negative integer; migration 0106 initializes activity_seq
+  // Validation allowed any non-negative integer; migration 0108 initializes activity_seq
   // to 0; heartbeatModule guards with `?7 > activity_seq`. So 0 > 0 is false — the call
   // returned ok while the activity was silently discarded, and the caller had every reason
   // to believe it had reported. 0 is the never-reported sentinel, not a usable sequence.

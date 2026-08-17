@@ -1,4 +1,4 @@
--- 0106_module_seat_activity.sql — what a seat is DOING, alongside whether it is REACHABLE.
+-- 0108_module_seat_activity.sql — what a seat is DOING, alongside whether it is REACHABLE.
 --
 -- mupot#1117. module_registry already answers "is this module reachable?" via
 -- status + last_heartbeat (staleness read-derived, never written — see

@@ -187,7 +187,7 @@ const toolPresenceHeartbeat: ToolSpec = {
       //
       // Found by Athena (GPT-5.6 Luna) on the #1118 gate, who proved it with a throwaway
       // test rather than by reading: this accepted any NON-NEGATIVE integer including 0,
-      // while migration 0106 initializes activity_seq to 0 and heartbeatModule guards with
+      // while migration 0108 initializes activity_seq to 0 and heartbeatModule guards with
       // `?7 > activity_seq`. So `0 > 0` is false and a seat's first report at seq 0 was
       // accepted by validation, returned ok, and SILENTLY DROPPED — activity stayed
       // 'unknown' forever while the caller had every reason to think it had reported.

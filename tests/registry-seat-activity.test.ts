@@ -1,4 +1,4 @@
-// tests/registry-seat-activity.test.ts — seat ACTIVITY (mupot#1117, migration 0106),
+// tests/registry-seat-activity.test.ts — seat ACTIVITY (mupot#1117, migration 0108),
 // the orthogonal twin of presence's REACHABILITY (tests/registry-presence-service.test.ts).
 //
 // Runs against REAL D1/SQL via the sqlite-d1 harness with the full migration chain —

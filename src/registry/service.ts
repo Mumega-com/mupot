@@ -236,7 +236,7 @@ function hydrate(row: ModuleRegistryRow, nowMs: number): ModulePresence | null {
   if (!isModuleKind(row.kind)) return null // defensive: re-validate stored data on read
   const status = effectiveStatus(row, nowMs)
   // Re-validate on read, same defensive posture as kind: the column carries no CHECK
-  // constraint (SQLite ALTER TABLE limitation, see migration 0106), so an unexpected
+  // constraint (SQLite ALTER TABLE limitation, see migration 0108), so an unexpected
   // value must degrade to "never reported" rather than escape as a bogus state.
   const storedActivity = isActivityState(row.activity) ? row.activity : null
   const activityAt = typeof row.activity_at === 'string' ? row.activity_at : null
