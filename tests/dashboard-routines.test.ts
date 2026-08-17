@@ -2,6 +2,7 @@ import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AuthContext, Env } from '../src/types'
+import { submittedRoutineFormValues } from '../src/dashboard/routines'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
 const authState = vi.hoisted(() => ({ current: null as AuthContext | null }))
@@ -323,5 +324,73 @@ describe('Project Routines dashboard', () => {
     }), env)
     expect(validation.status).toBe(400)
     expect(await validation.text()).toContain('invalid_name')
+  })
+})
+
+describe('submittedRoutineFormValues', () => {
+  it('extracts valid string fields correctly', () => {
+    const input = {
+      name: 'My Routine',
+      objective: 'Do something',
+      trigger_kind: 'cron',
+      run_once_at: '2023-01-01T00:00:00Z',
+      cron_expression: '* * * * *',
+      timezone: 'UTC',
+      overlap_policy: 'skip',
+      execution_mode: 'propose',
+      responsible_squad_id: 'squad-1',
+      preferred_agent_id: 'agent-1',
+      budget_micro_usd: '100000',
+      max_attempts: '3',
+      retry_backoff_seconds: '60',
+      max_occurrences: '10',
+      stop_at: '2024-01-01T00:00:00Z',
+    }
+
+    const values = submittedRoutineFormValues(input)
+    expect(values).toEqual(input)
+  })
+
+  it('defaults non-string, null, or undefined fields to an empty string', () => {
+    const input = {
+      name: null,
+      objective: undefined,
+      trigger_kind: 123,
+      run_once_at: true,
+      cron_expression: {},
+      timezone: [],
+    }
+
+    const values = submittedRoutineFormValues(input)
+    expect(values).toEqual({
+      name: '',
+      objective: '',
+      trigger_kind: '',
+      run_once_at: '',
+      cron_expression: '',
+      timezone: '',
+      overlap_policy: '',
+      execution_mode: '',
+      responsible_squad_id: '',
+      preferred_agent_id: '',
+      budget_micro_usd: '',
+      max_attempts: '',
+      retry_backoff_seconds: '',
+      max_occurrences: '',
+      stop_at: '',
+    })
+  })
+
+  it('ignores extra keys in the input record', () => {
+    const input = {
+      name: 'Valid Name',
+      extra_key: 'Should be ignored',
+      another_extra: 123
+    }
+
+    const values = submittedRoutineFormValues(input)
+    expect(values).not.toHaveProperty('extra_key')
+    expect(values).not.toHaveProperty('another_extra')
+    expect(values.name).toBe('Valid Name')
   })
 })
