@@ -10,7 +10,8 @@
 // Exports (the FROZEN contract — peers build against these signatures):
 //   - resolveCapabilities(env, memberId): Promise<CapabilityGrant[]>
 //   - hasCapability(grants, scopeType, scopeId, min, squadDepartmentId?): boolean
-//   - isOrgAdmin(auth): boolean                          — coarse owner|admin role
+//   - isOrgAdmin(auth): boolean                          — org owner|admin, on EITHER plane
+//                                                          (legacy role OR an org-scope grant)
 //   - requireCapability(scope, min): MiddlewareHandler   — per-route gate
 //   - requireOrgCapability(min): MiddlewareHandler       — convenience over org scope
 //
@@ -37,11 +38,52 @@ function meets(have: Capability, min: Capability): boolean {
 }
 
 /**
- * Coarse org-role check: true when auth.role is owner or admin.
- * Shared by dashboard/API surfaces that gate on the legacy org role (not fine-grained grants).
+ * isOrgAdmin — "may this principal act as an org admin?", asked of BOTH RBAC planes.
+ *
+ * This gates every dashboard admin surface (Operations, Deployment, Addons,
+ * Marketing/CRO, People & Access, Scoped Keys, Connectors, GitHub, Create-agent,
+ * Mint-agent-token, the addon consoles). It used to read ONLY `auth.role` — the
+ * coarse legacy column that `src/types.ts` itself annotates "capabilities are the
+ * fine grain". That column is written exactly once, at account creation
+ * (src/auth/index.ts: first account ever → 'owner', every later account →
+ * 'member', permanently), and no supported interface can change it afterwards:
+ * there is no update_member / set_member_role tool, and migrations/0002_members.sql
+ * has no role column at all. So an operator whose account was created second could
+ * never reach an admin page — including the org OWNER, whose ownership lives as a
+ * capability row (scope 'org' → 'owner') that this function did not read. Measured
+ * on the credential that holds org ownership: role='member', capabilities org→owner,
+ * and GET /admin/agent-token answered 403. (Issue #530: which RBAC plane is canonical.)
+ *
+ * The MCP plane already asked the right question — src/mcp/index.ts does
+ * `hasCapability(grants, 'org', null, 'admin')`. Same question, two answers. This
+ * makes the dashboard agree with it.
+ *
+ * SHAPE — capability OR legacy role, never AND:
+ *   1. legacy `role` owner|admin still admits (the bootstrap owner has no grant
+ *      rows at all; dropping this would lock the FIRST account out instead of the
+ *      second). It is an additional ACCEPT, never a REQUIREMENT.
+ *   2. an ORG-scope grant of 'admin' or higher admits. One `hasCapability` call
+ *      covers both 'admin' and 'owner': the ladder ranks owner(5) above admin(4),
+ *      so an org→owner grant meets min='admin'.
+ *
+ * WIDENING IS THE DANGEROUS DIRECTION — what this deliberately does NOT admit:
+ *   - a squad-scope or department-scope admin/owner grant. hasCapability's org
+ *     branch matches `scope_type === 'org'` only, and grants never bubble UP, so
+ *     squad admin does not become org admin. That is the escalation this function
+ *     must never allow.
+ *   - `latentCapabilities`. On a directory-channel session the B1 ceiling zeroes
+ *     ambient authority and parks the real grants in `latentCapabilities`; reading
+ *     them here would reinstate exactly the silent inheritance that ceiling exists
+ *     to prevent (#712). We read `capabilities`, the ambient view, only.
+ *   - a principal with no grants and a plain 'member' role — unchanged, still refused.
  */
-export function isOrgAdmin(auth: AuthContext): boolean {
-  return auth.role === 'owner' || auth.role === 'admin'
+export function isOrgAdmin(auth: AuthContext | null | undefined): boolean {
+  if (!auth) return false
+  // Legacy plane — still honoured, so the bootstrap owner never regresses.
+  if (auth.role === 'owner' || auth.role === 'admin') return true
+  // Modern plane — an ORG-scope grant at admin rank or above.
+  if (auth.capabilities === undefined) return false
+  return hasCapability(auth.capabilities, 'org', null, 'admin')
 }
 
 // ── resolve (load grants, fail-closed) ─────────────────────────────────────────

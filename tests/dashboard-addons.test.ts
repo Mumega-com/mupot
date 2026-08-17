@@ -557,7 +557,9 @@ describe('GET /addons', () => {
     const html = await response.text()
 
     expect(response.status).toBe(403)
-    expect(html).toContain('Addons requires owner or admin.')
+    expect(html).toContain('The Addons console requires owner or admin at ORG scope.')
+    // The refusal must name WHO is refused, not only what is required (#530 follow-on).
+    expect(html).toContain('You are signed in as')
     expect(html).toContain('id="nav-addons" hidden')
     expect(html).not.toContain("operatorRole === 'owner' || operatorRole === 'admin'")
   })
@@ -638,7 +640,9 @@ describe('registered addon console paths', () => {
     )
 
     expect(response.status).toBe(403)
-    expect(await response.text()).toContain('Addon consoles require owner or admin.')
+    const denied = await response.text()
+    expect(denied).toContain('The addon console requires owner or admin at ORG scope.')
+    expect(denied).toContain('You are signed in as')
   })
 
   it.each([

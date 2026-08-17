@@ -4,6 +4,7 @@ import type { Context } from 'hono'
 import type { Env, AuthContext } from '../types'
 import { requireAuth } from '../auth'
 import { isOrgAdmin } from '../auth/capability'
+import { orgAdminForbiddenPayload, ORG_ADMIN_REFUSAL_LINKS } from '../auth/refusal'
 import { resolveOrgAdmin } from '../auth/member-bearer'
 import './modules'
 import { getRegisteredAddon, listRegisteredAddons } from './registry'
@@ -374,7 +375,7 @@ function mutationError(result: Extract<AddonMutationResult, { ok: false }>) {
 
 async function mutate(c: Context<AppEnv>, action: LifecycleAction) {
   const auth = c.get('auth')
-  if (!isOrgAdmin(auth)) return c.json({ error: 'forbidden', detail: 'owner/admin only' }, 403)
+  if (!isOrgAdmin(auth)) return c.json(orgAdminForbiddenPayload('Addon lifecycle changes', auth, ORG_ADMIN_REFUSAL_LINKS), 403)
 
   const key = c.req.param('key')
   if (!key) return c.json({ error: 'addon_not_registered' }, 404)
@@ -464,7 +465,7 @@ addonsApp.use('*', async (c, next) => {
 })
 
 addonsApp.get('/', async (c) => {
-  if (!isOrgAdmin(c.get('auth'))) return c.json({ error: 'forbidden', detail: 'owner/admin only' }, 403)
+  if (!isOrgAdmin(c.get('auth'))) return c.json(orgAdminForbiddenPayload('Listing addon installations', c.get('auth'), ORG_ADMIN_REFUSAL_LINKS), 403)
 
   try {
     const installations = latestInstallationsByKey(await listAddonInstallations(c.env))
@@ -476,7 +477,7 @@ addonsApp.get('/', async (c) => {
 
 addonsApp.post('/marketing-cro-monitor/monitor', async (c) => {
   const auth = c.get('auth')
-  if (!isOrgAdmin(auth)) return c.json({ error: 'forbidden', detail: 'owner/admin only' }, 403)
+  if (!isOrgAdmin(auth)) return c.json(orgAdminForbiddenPayload('Running the marketing/CRO monitor', auth, ORG_ADMIN_REFUSAL_LINKS), 403)
   const body = await readBoundedBody(c)
   if (!body.ok) return c.json({ error: body.status === 413 ? 'payload_too_large' : 'invalid_body' }, body.status)
   const parsed = parseMonitorBody(body.raw)
@@ -500,7 +501,7 @@ addonsApp.post('/marketing-cro-monitor/monitor', async (c) => {
 
 addonsApp.get('/marketing-cro-monitor/monitor/latest', async (c) => {
   const auth = c.get('auth')
-  if (!isOrgAdmin(auth)) return c.json({ error: 'forbidden', detail: 'owner/admin only' }, 403)
+  if (!isOrgAdmin(auth)) return c.json(orgAdminForbiddenPayload('Reading the latest marketing/CRO monitor run', auth, ORG_ADMIN_REFUSAL_LINKS), 403)
   const result = await getLatestMarketingMonitorRun(c.env, { id: auth.userId, role: auth.role })
   if (!result.ok) {
     const error = monitorError(result.reason)
@@ -511,7 +512,7 @@ addonsApp.get('/marketing-cro-monitor/monitor/latest', async (c) => {
 
 addonsApp.get('/marketing-cro-monitor/monitor', async (c) => {
   const auth = c.get('auth')
-  if (!isOrgAdmin(auth)) return c.json({ error: 'forbidden', detail: 'owner/admin only' }, 403)
+  if (!isOrgAdmin(auth)) return c.json(orgAdminForbiddenPayload('Reading marketing/CRO monitor state', auth, ORG_ADMIN_REFUSAL_LINKS), 403)
   const limit = parseMonitorLimit(c.req.url)
   if (limit === null) return c.json({ error: 'invalid_limit' }, 400)
   const result = await listMarketingMonitorRuns(c.env, { id: auth.userId, role: auth.role }, { limit })
@@ -524,7 +525,7 @@ addonsApp.get('/marketing-cro-monitor/monitor', async (c) => {
 
 addonsApp.post('/marketing-cro-monitor/recommendation', async (c) => {
   const auth = c.get('auth')
-  if (!isOrgAdmin(auth)) return c.json({ error: 'forbidden', detail: 'owner/admin only' }, 403)
+  if (!isOrgAdmin(auth)) return c.json(orgAdminForbiddenPayload('Recording a marketing/CRO recommendation', auth, ORG_ADMIN_REFUSAL_LINKS), 403)
   const body = await readBoundedBody(c)
   if (!body.ok) return c.json({ error: body.status === 413 ? 'payload_too_large' : 'invalid_body' }, body.status)
   const parsed = parseRecommendationBody(body.raw)
@@ -553,7 +554,7 @@ addonsApp.post('/:key/disable', (c) => mutate(c, 'disable'))
 addonsApp.post('/:key/archive', (c) => mutate(c, 'archive'))
 
 addonsApp.get('/:key/evidence', async (c) => {
-  if (!isOrgAdmin(c.get('auth'))) return c.json({ error: 'forbidden', detail: 'owner/admin only' }, 403)
+  if (!isOrgAdmin(c.get('auth'))) return c.json(orgAdminForbiddenPayload('Reading addon evidence', c.get('auth'), ORG_ADMIN_REFUSAL_LINKS), 403)
   const entry = getRegisteredAddon(c.req.param('key'))
   if (!entry) return c.json({ error: 'addon_not_registered' }, 404)
 
@@ -572,7 +573,7 @@ addonsApp.get('/:key/evidence', async (c) => {
 })
 
 addonsApp.get('/:key/receipts', async (c) => {
-  if (!isOrgAdmin(c.get('auth'))) return c.json({ error: 'forbidden', detail: 'owner/admin only' }, 403)
+  if (!isOrgAdmin(c.get('auth'))) return c.json(orgAdminForbiddenPayload('Reading addon receipts', c.get('auth'), ORG_ADMIN_REFUSAL_LINKS), 403)
 
   if (!getRegisteredAddon(c.req.param('key'))) return c.json({ error: 'addon_not_registered' }, 404)
   try {

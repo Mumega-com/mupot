@@ -14,6 +14,7 @@ import { Hono } from 'hono'
 import type { Env, AuthContext } from '../types'
 import { requireAuth } from '../auth'
 import { isOrgAdmin } from '../auth/capability'
+import { orgAdminForbiddenPayload, ORG_ADMIN_REFUSAL_LINKS } from '../auth/refusal'
 import { planResellerTenant, type ResellerProvisionInput } from './provision'
 
 const MAX_BODY_BYTES = 8192
@@ -27,7 +28,7 @@ resellerApp.use('*', requireAuth)
 resellerApp.post('/provision-plan', async (c) => {
   const auth = c.get('auth')
   if (!isOrgAdmin(auth)) {
-    return c.json({ error: 'forbidden', detail: 'owner/admin only' }, 403)
+    return c.json(orgAdminForbiddenPayload('Reading the reseller provisioning plan', auth, ORG_ADMIN_REFUSAL_LINKS), 403)
   }
 
   // size-cap as a TRUE byte cap. Reject by declared Content-Length first (before reading the

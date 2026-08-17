@@ -34,6 +34,7 @@ import { requireAuth } from '../auth'
 // creating an agent / attaching a membership in a squad is lead+ on THAT squad.
 // The scope is data-derived (URL param), so we check inline with the pure API.
 import { resolveCapabilities, hasCapability, isOrgAdmin } from '../auth/capability'
+import { orgAdminForbiddenPayload, ORG_ADMIN_REFUSAL_LINKS } from '../auth/refusal'
 // Shared org-chart creation path (also used by the dashboard). Validation + the
 // UNIQUE conflict mapping live here so both surfaces stay in lockstep.
 import { createDepartment, createSquad, createAgent } from './service'
@@ -136,10 +137,11 @@ orgApp.post('/departments', async (c) => {
   // Creating a department is an org-wide admin action.
   const auth = c.get('auth')
   if (!isOrgAdmin(auth)) {
-    if (!auth.memberId) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+    const refusal = orgAdminForbiddenPayload('Creating a department', auth, ORG_ADMIN_REFUSAL_LINKS)
+    if (!auth.memberId) return c.json(refusal, 403)
     const grants = auth.capabilities ?? (await resolveCapabilities(c.env, auth.memberId))
     if (!hasCapability(grants, 'org', null, 'admin')) {
-      return c.json({ error: 'forbidden', need: 'admin' }, 403)
+      return c.json(refusal, 403)
     }
   }
 

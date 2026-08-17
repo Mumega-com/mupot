@@ -24,6 +24,7 @@ import { requireAuth } from '../auth'
 // task's SQUAD scope. The squad is data-derived (request body on POST, the loaded
 // row on PATCH), so we check inline rather than as static route middleware.
 import { resolveCapabilities, hasCapability, hasSurfaceCap, isOrgAdmin } from '../auth/capability'
+import { orgAdminForbiddenPayload, ORG_ADMIN_REFUSAL_LINKS } from '../auth/refusal'
 import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, TaskEvidenceFenceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution, assigneeSelfClose, assigneeCannotMutateOwnAssignment, TaskIntakeContractError, assertValidIntakeContract, evaluateTaskIntakeContract, isTaskStatus, ALL_TASK_STATUSES } from './service'
 import type { TaskStatus } from './service'
 import { resolveTaskAssignee } from './assignee'
@@ -1344,7 +1345,7 @@ interface GrantBody {
 gatesApp.post('/grants', async (c) => {
   const auth = c.get('auth')
   if (!isOrgAdmin(auth)) {
-    return c.json({ error: 'forbidden', need: 'owner_or_admin' }, 403)
+    return c.json(orgAdminForbiddenPayload('Managing gate capability grants', auth, ORG_ADMIN_REFUSAL_LINKS, 'owner_or_admin'), 403)
   }
 
   let body: GrantBody
@@ -1376,7 +1377,7 @@ gatesApp.post('/grants', async (c) => {
 gatesApp.delete('/grants', async (c) => {
   const auth = c.get('auth')
   if (!isOrgAdmin(auth)) {
-    return c.json({ error: 'forbidden', need: 'owner_or_admin' }, 403)
+    return c.json(orgAdminForbiddenPayload('Managing gate capability grants', auth, ORG_ADMIN_REFUSAL_LINKS, 'owner_or_admin'), 403)
   }
 
   let body: GrantBody
@@ -1409,7 +1410,7 @@ gatesApp.delete('/grants', async (c) => {
 gatesApp.get('/grants', async (c) => {
   const auth = c.get('auth')
   if (!isOrgAdmin(auth)) {
-    return c.json({ error: 'forbidden', need: 'owner_or_admin' }, 403)
+    return c.json(orgAdminForbiddenPayload('Managing gate capability grants', auth, ORG_ADMIN_REFUSAL_LINKS, 'owner_or_admin'), 403)
   }
   const q = c.req.query()
   const grants = await listGateCapabilities(c.env, {
