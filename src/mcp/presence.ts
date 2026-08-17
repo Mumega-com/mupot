@@ -40,8 +40,12 @@ import {
   heartbeatModule,
   deregisterModule,
   listPresence,
+  getModule,
   isModuleKind,
+  isActivityState,
+  ACTIVITY_STATES,
   type ModuleKind,
+  type ActivityReport,
 } from '../registry/service'
 import { readAccess, readableProject } from './projects'
 import { type ToolSpec, fail, done, str, hasWorkspaceAdmin } from './index'
@@ -135,12 +139,22 @@ const toolPresenceRegister: ToolSpec = {
 
 const toolPresenceHeartbeat: ToolSpec = {
   name: 'presence_heartbeat',
-  scope: 'self (keep this module\'s registration online)',
+  scope: 'self (keep this module\'s registration online, and optionally report what it is doing)',
   min: 'authenticated',
-  args: '{ project_id?: string|null }',
+  args: '{ project_id?: string|null, state?: "working"|"idle"|"blocked"|"done", message?: string|null, seq?: number }',
   inputSchema: {
     type: 'object',
-    properties: { project_id: NULLABLE_STRING_SCHEMA },
+    properties: {
+      project_id: NULLABLE_STRING_SCHEMA,
+      // mupot#1117 — the activity report rides the HEARTBEAT rather than getting its
+      // own tool. One call, one round trip, and it becomes structurally impossible to
+      // report activity for a seat that is not simultaneously announcing reachability.
+      // Both facts describe the same seat at the same instant; a separate tool would
+      // let them drift apart, which is the exact failure this surface exists to stop.
+      state: { type: 'string', enum: [...ACTIVITY_STATES] },
+      message: NULLABLE_STRING_SCHEMA,
+      seq: { type: 'number' },
+    },
     additionalProperties: false,
   },
   async run(auth, env, args) {
@@ -161,9 +175,52 @@ const toolPresenceHeartbeat: ToolSpec = {
       if (!project) return fail(404, 'project_not_found')
     }
 
-    const ok = await heartbeatModule(env, identity, projectId ?? null)
+    // An activity report is all-or-nothing: `state` REQUIRES `seq`, because without a
+    // monotonic sequence two racing reports resolve by arrival order, and a late
+    // 'working' would pin a finished seat as busy forever. Rejecting a report we cannot
+    // order is better than accepting one — defaulting the seq would manufacture an
+    // ordering that does not exist, which is worse than a 400.
+    let report: ActivityReport | undefined
+    if (args.state !== undefined) {
+      if (!isActivityState(args.state)) return fail(400, 'invalid_state', { accepted: ACTIVITY_STATES })
+      // seq MUST BE >= 1, and the off-by-one here was a real accepted-but-inert bug.
+      //
+      // Found by Athena (GPT-5.6 Luna) on the #1118 gate, who proved it with a throwaway
+      // test rather than by reading: this accepted any NON-NEGATIVE integer including 0,
+      // while migration 0108 initializes activity_seq to 0 and heartbeatModule guards with
+      // `?7 > activity_seq`. So `0 > 0` is false and a seat's first report at seq 0 was
+      // accepted by validation, returned ok, and SILENTLY DROPPED — activity stayed
+      // 'unknown' forever while the caller had every reason to think it had reported.
+      //
+      // 0 is the NEVER-REPORTED SENTINEL, not a usable sequence value. Rejecting it here
+      // is better than moving the sentinel to -1: the boundary is then visible to callers
+      // as a 400 instead of silently doing nothing, and "seq starts at 1" is easier to get
+      // right in a reporter than "seq must exceed a sentinel you cannot see".
+      const seq = args.seq
+      if (typeof seq !== 'number' || !Number.isInteger(seq) || seq < 1) {
+        return fail(400, 'invalid_seq', 'state requires an integer seq >= 1 (monotonic per seat; 0 is the never-reported sentinel)')
+      }
+      let message: string | null = null
+      if (args.message !== undefined && args.message !== null) {
+        message = str(args.message) ?? null
+        if (message === null) return fail(400, 'invalid_args', 'message must be a string')
+      }
+      report = { state: args.state, message, seq }
+    } else if (args.seq !== undefined || args.message !== undefined) {
+      return fail(400, 'invalid_args', 'seq/message are only meaningful alongside state')
+    }
+
+    const ok = await heartbeatModule(env, identity, projectId ?? null, new Date(), report)
     if (!ok) return fail(404, 'not_registered', 'call presence_register first')
-    return done({ ok: true })
+    if (!report) return done({ ok: true })
+
+    // Hand back the RESULTING row, not an acknowledgement. A stale-seq report is
+    // dropped silently by design (see heartbeatModule), so a bare `{ok:true}` would
+    // tell the caller its report landed when it did not — a receipt for something
+    // that never happened. Returning what is actually stored lets the caller see for
+    // itself whether its seq won.
+    const module = await getModule(env, identity, projectId ?? null)
+    return done({ ok: true, module })
   },
 }
 

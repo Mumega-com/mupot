@@ -206,10 +206,57 @@ describe('presence_heartbeat / presence_deregister — self-scoped only', () => 
     expect(db.rows()[0].identity).toBe('member-a')
   })
 
+  // Gate finding (Athena / GPT-5.6 Luna, #1118, 2026-08-17): seq 0 was ACCEPTED and INERT.
+  // Validation allowed any non-negative integer; migration 0108 initializes activity_seq
+  // to 0; heartbeatModule guards with `?7 > activity_seq`. So 0 > 0 is false — the call
+  // returned ok while the activity was silently discarded, and the caller had every reason
+  // to believe it had reported. 0 is the never-reported sentinel, not a usable sequence.
+  it('presence_heartbeat REJECTS seq 0 — the sentinel value can never land as a report', async () => {
+    const db = makeDb()
+    await invokeTool(squadObserver, db.env, 'presence_register', { adapter: 'claude_code', project_id: 'proj-a' }, ORIGIN)
+
+    const res = await invokeTool(
+      squadObserver, db.env, 'presence_heartbeat',
+      { project_id: 'proj-a', state: 'idle', seq: 0 }, ORIGIN,
+    )
+
+    expect(res.ok).toBe(false)
+    if (!res.ok) expect(res.status).toBe(400)
+    // A 400 is strictly better than the old silent no-op: the boundary is visible to the
+    // caller instead of being a report that vanished.
+  })
+
+  it('presence_heartbeat accepts seq 1 — the lowest usable sequence', async () => {
+    const db = makeDb()
+    await invokeTool(squadObserver, db.env, 'presence_register', { adapter: 'claude_code', project_id: 'proj-a' }, ORIGIN)
+
+    const res = await invokeTool(
+      squadObserver, db.env, 'presence_heartbeat',
+      { project_id: 'proj-a', state: 'idle', seq: 1 }, ORIGIN,
+    )
+
+    expect(res.ok).toBe(true)
+  })
+
   it('presence_heartbeat schema has no identity/target field to name another principal', () => {
     const spec = TOOLS.find((t) => t.name === 'presence_heartbeat')
     expect(spec).toBeDefined()
-    expect(Object.keys(spec?.inputSchema.properties ?? {})).toEqual(['project_id'])
+    const keys = Object.keys(spec?.inputSchema.properties ?? {})
+
+    // The exact list stays pinned (mupot#1117 added state/message/seq, the activity
+    // report — see src/mcp/presence.ts). Keeping it exact means any FUTURE field has
+    // to be added deliberately here, with someone asking whether it can name another
+    // principal — which is the property this test actually guards.
+    expect(keys).toEqual(['project_id', 'state', 'message', 'seq'])
+
+    // …and state the invariant directly rather than leaving it implied by the list.
+    // A pinned list catches a new field; it does not say WHY the field is dangerous.
+    // These two assertions together survive a future edit that updates the list
+    // without thinking: the intent is enforced independently of the enumeration.
+    for (const forbidden of ['identity', 'agent', 'agent_id', 'member_id', 'target', 'as', 'on_behalf_of']) {
+      expect(keys).not.toContain(forbidden)
+    }
+    expect(spec?.inputSchema.additionalProperties).toBe(false)
   })
 
   it('presence_deregister marks only the caller\'s own row offline', async () => {

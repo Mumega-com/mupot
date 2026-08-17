@@ -36,7 +36,58 @@ export function isModuleKind(v: unknown): v is ModuleKind {
 // dead module linger "online" for long.
 export const PRESENCE_STALE_SECONDS = 120
 
+/**
+ * What a seat reports it is DOING (mupot#1117) — orthogonal to `status`, which is
+ * whether we can REACH it. Wire shape adopted verbatim from prime-agent's built-in
+ * reporter so existing seats report with no new integration.
+ *
+ * `done` is not in prime-agent's set (it releases the pane instead of reporting a
+ * terminal state); it is included because a seat that finished and exited cleanly is
+ * a different fact than one resting between turns, and the release path has to land
+ * somewhere honest.
+ */
+export const ACTIVITY_STATES = ['working', 'idle', 'blocked', 'done'] as const
+export type ActivityState = (typeof ACTIVITY_STATES)[number]
+
+/** Caller-facing activity, including the two states a seat can never report itself. */
+export type EffectiveActivity = ActivityState | 'unknown'
+
+export function isActivityState(value: unknown): value is ActivityState {
+  return typeof value === 'string' && (ACTIVITY_STATES as readonly string[]).includes(value)
+}
+
+/**
+ * How long an activity may go unchanged before a READER should treat it as suspect.
+ *
+ * Deliberately much wider than PRESENCE_STALE_SECONDS (heartbeat cadence) because these
+ * measure different things: a heartbeat is expected every few seconds, whereas a single
+ * 'working' turn legitimately runs for many minutes. 15 minutes is long enough that a
+ * real turn does not trip it and short enough that a genuinely wedged seat surfaces
+ * within one working session.
+ *
+ * THE FLAG ITSELF NOW ENCODES WHICH ACTIVITIES IT APPLIES TO. It is raised only for
+ * 'working'/'blocked' on a reachable seat — states that CLAIM PROGRESS, where age means a
+ * wedge. It is never raised for 'idle'/'done' (resting; age carries no alarm) or 'unknown'
+ * (no live claim to have gone quiet).
+ *
+ * This comment previously explained that distinction and left the caller to apply it,
+ * while the code flagged on age alone. Loom caught it on the #1118 gate: a healthy idle
+ * seat came back stale after 15 minutes, so any triage view filtering on the flag would
+ * alert on every resting seat. Documenting a caveat is not the same as implementing it.
+ */
+export const ACTIVITY_STALE_SECONDS = 900
+
 export type RegistryResult<T> = { ok: true; value: T } | { ok: false; error: string }
+
+/** An activity report from a seat. `seq` must be monotonic per seat; see the migration. */
+export interface ActivityReport {
+  state: ActivityState
+  message?: string | null
+  seq: number
+}
+
+/** Cap on activity_message, so a runaway error string cannot bloat the row. */
+export const ACTIVITY_MESSAGE_MAX = 500
 
 interface ModuleRegistryRow {
   id: string
@@ -50,6 +101,11 @@ interface ModuleRegistryRow {
   model?: string | null
   last_heartbeat: string
   registered_at: string
+  activity?: string | null
+  activity_message?: string | null
+  activity_seq?: number | null
+  activity_at?: string | null
+  activity_report_at?: string | null
 }
 
 // The read-model returned to callers. `status` here is the caller-facing EFFECTIVE
@@ -67,9 +123,45 @@ export interface ModulePresence {
   model?: string | null
   last_heartbeat: string
   registered_at: string
+  /**
+   * EFFECTIVE activity — what a reader may act on.
+   *
+   * 'unknown' whenever the seat is unreachable (effective status 'offline') or has never
+   * reported. THIS IS THE POINT OF THE FIELD: an unreachable seat's last word is a
+   * last-KNOWN value, not a current one, and reading the two as the same thing is the
+   * exact defect mupot#1117 exists to kill. A crashed seat whose final report was
+   * 'working' must not keep reading as working.
+   *
+   * The raw stored value remains visible as `activity_reported` for anyone who needs
+   * the last word rather than the current one — the same derived-vs-stored separation
+   * `status` already uses.
+   */
+  activity: EffectiveActivity
+  /** Last value the seat actually reported, regardless of reachability. NEVER act on this alone. */
+  activity_reported: ActivityState | null
+  /** Why it is blocked / what it is doing, as reported. */
+  activity_message: string | null
+  /** When `activity_reported` last CHANGED (not last re-asserted). */
+  activity_at: string | null
+  /** Seconds since that change, or null if it has never reported. */
+  activity_age_seconds: number | null
+  /**
+   * When an activity report was last ACCEPTED. Distinct from activity_at (last CHANGE) and
+   * from last_heartbeat (which advances even when a report is REJECTED by the seq guard).
+   * Fresh heartbeat + stale activity_report_at = reports are arriving and losing the seq
+   * comparison, i.e. a zombie reporter. Loom's #1118 BLOCKER 2.
+   */
+  activity_report_at: string | null
+  /** Highest accepted sequence. Exposed so a reporter can see whether its seq is winning. */
+  activity_seq: number
+  /**
+   * True when the activity has gone unchanged longer than ACTIVITY_STALE_SECONDS.
+   * Evidence, not a verdict — read it together with `activity` (see that const's docs).
+   */
+  activity_stale: boolean
 }
 
-const SELECT_COLUMNS = `id, tenant, kind, adapter, project_id, identity, status, capabilities, model, last_heartbeat, registered_at`
+const SELECT_COLUMNS = `id, tenant, kind, adapter, project_id, identity, status, capabilities, model, last_heartbeat, registered_at, activity, activity_message, activity_seq, activity_at, activity_report_at`
 
 function parseCapabilities(raw: string): string[] {
   try {
@@ -96,19 +188,99 @@ function effectiveStatus(row: Pick<ModuleRegistryRow, 'status' | 'last_heartbeat
   return ageSeconds <= PRESENCE_STALE_SECONDS ? 'online' : 'offline'
 }
 
+/**
+ * effectiveActivity — the activity counterpart of effectiveStatus, and the reason
+ * mupot#1117 exists.
+ *
+ * Returns 'unknown' when the seat is UNREACHABLE, no matter what it last reported.
+ * A seat that reported 'working' and then died still reads 'working' in the raw row
+ * forever; surfacing that as current is precisely how a dead agent looks busy. The
+ * stored value is not lost — it stays on `activity_reported` — but the field a reader
+ * is meant to act on refuses to speak for a seat that cannot answer.
+ *
+ * Also 'unknown' when the seat has never reported: an unreported seat is NOT an idle
+ * one, and defaulting to idle would invent a healthy reading out of missing data.
+ */
+function effectiveActivity(
+  stored: ActivityState | null,
+  status: ModuleStatus,
+  ageSeconds: number | null,
+): EffectiveActivity {
+  if (status === 'offline') return 'unknown'
+  if (stored === null) return 'unknown'
+  // BLOCKER 1 from Loom's #1118 gate, and he was right that the first version was
+  // self-defeating. This field is documented as the value a reader may ACT ON, yet it
+  // only expired on REACHABILITY. So: the activity reporter dies at 00:00 while a plain
+  // heartbeat keeps the row online, and at 00:20 the roster still answers 'working'. A
+  // consumer using the advertised field gets exactly the false-green #1117 exists to
+  // remove — and the old test suite PROVED that behaviour rather than catching it.
+  //
+  // A claim of progress has a shelf life. Past ACTIVITY_STALE_SECONDS, 'working' and
+  // 'blocked' stop being current and become last-known, so the effective field says
+  // 'unknown' and refuses to speak for a reporter that has gone quiet.
+  //
+  // Nothing is lost: activity_reported still carries the last word, activity_stale still
+  // flags it, and activity_age_seconds still says how long — so the WEDGE SIGNAL survives
+  // intact (reported='working' + stale=true + online). What changes is that the field
+  // labelled "act on this" no longer hands you a stale claim.
+  //
+  // 'idle'/'done' do not expire: they are resting states, and a resting seat that has had
+  // nothing to do is still accurately idle.
+  if ((stored === 'working' || stored === 'blocked') && ageSeconds !== null && ageSeconds > ACTIVITY_STALE_SECONDS) {
+    return 'unknown'
+  }
+  return stored
+}
+
 function hydrate(row: ModuleRegistryRow, nowMs: number): ModulePresence | null {
   if (!isModuleKind(row.kind)) return null // defensive: re-validate stored data on read
+  const status = effectiveStatus(row, nowMs)
+  // Re-validate on read, same defensive posture as kind: the column carries no CHECK
+  // constraint (SQLite ALTER TABLE limitation, see migration 0108), so an unexpected
+  // value must degrade to "never reported" rather than escape as a bogus state.
+  const storedActivity = isActivityState(row.activity) ? row.activity : null
+  const activityAt = typeof row.activity_at === 'string' ? row.activity_at : null
+  const activityAtMs = activityAt ? Date.parse(activityAt) : Number.NaN
+  const ageSeconds = Number.isNaN(activityAtMs) ? null : Math.max(0, (nowMs - activityAtMs) / 1000)
   return {
     id: row.id,
     kind: row.kind,
     adapter: row.adapter,
     project_id: row.project_id,
     identity: row.identity,
-    status: effectiveStatus(row, nowMs),
+    status,
     capabilities: parseCapabilities(row.capabilities),
     model: row.model ?? null,
     last_heartbeat: row.last_heartbeat,
     registered_at: row.registered_at,
+    activity: effectiveActivity(storedActivity, status, ageSeconds),
+    activity_reported: storedActivity,
+    activity_message: typeof row.activity_message === 'string' ? row.activity_message : null,
+    activity_at: activityAt,
+    activity_age_seconds: ageSeconds,
+    activity_report_at: typeof row.activity_report_at === 'string' ? row.activity_report_at : null,
+    activity_seq: typeof row.activity_seq === 'number' ? row.activity_seq : 0,
+    // STALE ONLY MEANS SOMETHING FOR A SEAT THAT CLAIMS TO BE BUSY.
+    //
+    // Found by Loom (Gemini) on the #1118 gate. The first version flagged ANY activity
+    // older than the window, so a seat that reported 'idle' and then sat healthy and
+    // heartbeating for 20 minutes — the normal state of a fleet with nothing queued —
+    // came back activity_stale: true. Any triage view filtering on that flag would alert
+    // on healthy idle seats, i.e. cry wolf until nobody reads it.
+    //
+    // The original code even documented this ("stale + 'idle' is simply a seat that has
+    // had nothing to do, which is not a defect") and then set the flag anyway, leaving the
+    // reader to apply a caveat the data should have encoded. Writing the caveat down is
+    // not the same as implementing it.
+    //
+    // 'working'/'blocked' are CLAIMS OF PROGRESS: unchanged for too long, they are the
+    // wedge signal. 'idle'/'done' are resting states where age carries no alarm, and
+    // 'unknown' has nothing to be stale about.
+    activity_stale:
+      ageSeconds !== null &&
+      ageSeconds > ACTIVITY_STALE_SECONDS &&
+      (storedActivity === 'working' || storedActivity === 'blocked') &&
+      status === 'online',
   }
 }
 
@@ -157,7 +329,30 @@ export async function registerModule(
        status         = 'online',
        capabilities   = excluded.capabilities,
        model          = excluded.model,
-       last_heartbeat = excluded.last_heartbeat`,
+       last_heartbeat = excluded.last_heartbeat,
+       -- REGISTRATION IS THE LIFECYCLE BOUNDARY: reset the activity fields.
+       --
+       -- Found by Loom (Gemini) on the #1118 gate, and it is the worst defect in this
+       -- change. Without this reset: a seat runs up to activity_seq=45 and dies; systemd
+       -- restarts it; the fresh process re-registers and starts ITS counter at 1; every
+       -- subsequent report fails the 1 > 45 comparison and is silently dropped FOREVER.
+       -- (No backticks in this comment: it lives inside a JS template literal, and one
+       -- stray backtick terminates the SQL string mid-statement.) The seat then
+       -- reads online + 'working' + stale permanently while actually sitting idle.
+       --
+       -- That is this feature's own failure mode pointed at itself: a healthy agent frozen
+       -- as busy, which is exactly the "dead agent looks busy" reading #1117 exists to kill.
+       --
+       -- A register call means a NEW PROCESS is announcing itself, and a new process has a
+       -- new sequence origin. Clearing to the never-reported sentinel is therefore correct
+       -- rather than merely convenient: the old process's last activity is not the new
+       -- process's current activity, and carrying it over would be another last-known
+       -- value read as current.
+       activity         = NULL,
+       activity_message = NULL,
+       activity_at      = NULL,
+       activity_report_at = NULL,
+       activity_seq     = 0`,
   )
     .bind(id, tenant, input.kind, adapter, input.projectId, identity, capabilitiesJson, model, nowIso)
     .run()
@@ -183,13 +378,58 @@ export async function heartbeatModule(
   identity: string,
   projectId: string | null,
   now: Date = new Date(),
+  report?: ActivityReport,
 ): Promise<boolean> {
+  const nowIso = now.toISOString()
+
+  if (!report) {
+    const res = await env.DB.prepare(
+      `UPDATE module_registry
+          SET last_heartbeat = ?1, status = 'online'
+        WHERE tenant = ?2 AND identity = ?3 AND project_id IS ?4`,
+    )
+      .bind(nowIso, env.TENANT_SLUG, identity, projectId)
+      .run()
+    return (res.meta?.changes ?? 0) > 0
+  }
+
+  const message =
+    typeof report.message === 'string' ? report.message.slice(0, ACTIVITY_MESSAGE_MAX) || null : null
+
+  // THE SEQ GUARD IS IN THE SET, NOT THE WHERE — and that placement is the whole
+  // correctness of this statement.
+  //
+  // Putting `activity_seq < ?7` in the WHERE clause would make an out-of-order report
+  // drop the HEARTBEAT along with the activity, so a seat whose reports briefly raced
+  // would age into 'offline' while perfectly alive. Liveness must never depend on
+  // report ordering. Here the row always matches, last_heartbeat always advances, and
+  // only the four activity columns are gated.
+  //
+  // Every right-hand side sees the OLD row (SQLite evaluates all SET expressions
+  // against the pre-update values), which is what makes two things work at once:
+  // `?7 > activity_seq` compares against the stored seq, and `activity IS NOT ?5`
+  // compares the stored activity against the incoming one — NULL-safe via IS NOT, so
+  // a first-ever report (stored NULL) correctly counts as a change.
+  //
+  // activity_at therefore advances ONLY on a real transition. A seat re-asserting
+  // 'working' every 30 seconds keeps a fresh heartbeat and a fresh seq while its
+  // activity_at stays pinned to when the turn actually began — which is exactly the
+  // signal that lets a reader tell a long turn from a wedge.
   const res = await env.DB.prepare(
     `UPDATE module_registry
-        SET last_heartbeat = ?1, status = 'online'
+        SET last_heartbeat   = ?1,
+            status           = 'online',
+            activity         = CASE WHEN ?7 > activity_seq THEN ?5 ELSE activity END,
+            activity_message = CASE WHEN ?7 > activity_seq THEN ?6 ELSE activity_message END,
+            activity_at      = CASE WHEN ?7 > activity_seq AND activity IS NOT ?5
+                                    THEN ?1 ELSE activity_at END,
+            activity_seq     = CASE WHEN ?7 > activity_seq THEN ?7 ELSE activity_seq END,
+            -- Stamped ONLY when the report is accepted, which is what makes a rejected-seq
+            -- storm visible: last_heartbeat keeps advancing, this does not.
+            activity_report_at = CASE WHEN ?7 > activity_seq THEN ?1 ELSE activity_report_at END
       WHERE tenant = ?2 AND identity = ?3 AND project_id IS ?4`,
   )
-    .bind(now.toISOString(), env.TENANT_SLUG, identity, projectId)
+    .bind(nowIso, env.TENANT_SLUG, identity, projectId, report.state, message, report.seq)
     .run()
   return (res.meta?.changes ?? 0) > 0
 }
