@@ -131,6 +131,7 @@ import { loadFlightSquads, parseFlightMetaV1, validateFlightMetaReferences, type
 import { AUTH_CONTEXT_HEADER } from './auth-header'
 import { isExternallySourced } from '../tasks/provenance'
 import { MUPOT_PUBLIC_API_VERSION } from '../version'
+import { MUPOT_MCP_INITIALIZE_INSTRUCTIONS } from './instructions'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
@@ -3760,6 +3761,7 @@ async function handleJsonRpc(c: import('hono').Context<AppEnv>, body: JsonRpcReq
       protocolVersion: '2025-06-18',
       capabilities: { tools: {} },
       serverInfo: { name: `mupot-${c.env.TENANT_SLUG}`, version: MUPOT_PUBLIC_API_VERSION },
+      instructions: MUPOT_MCP_INITIALIZE_INSTRUCTIONS,
     })
   }
 

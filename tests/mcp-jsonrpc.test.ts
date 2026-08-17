@@ -65,10 +65,16 @@ describe('mcp JSON-RPC compatibility', () => {
   it('initializes without a bearer token for ChatGPT connector discovery', async () => {
     const res = await rpc('initialize')
     expect(res.status).toBe(200)
-    const body = await res.json() as { result: { capabilities: unknown; serverInfo: { name: string; version: string } } }
+    const body = await res.json() as { result: { capabilities: unknown; serverInfo: { name: string; version: string }; instructions?: string } }
     expect(body.result.serverInfo.name).toBe('mupot-digid')
     expect(body.result.serverInfo.version).toBe(MUPOT_PUBLIC_API_VERSION)
     expect(body.result.capabilities).toEqual({ tools: {} })
+    expect(typeof body.result.instructions).toBe('string')
+    expect(body.result.instructions).toContain('boot_context')
+    expect(body.result.instructions).toContain('B1 security ceiling')
+    expect(body.result.instructions).toContain('bootstrap_self')
+    expect(body.result.instructions).toContain("Client Error 'mcp_request_blocked'")
+    expect(body.result.instructions).toContain('ack_for')
   })
 
   it('lists MCP tools with JSON schemas without a bearer token', async () => {
