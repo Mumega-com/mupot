@@ -135,6 +135,10 @@ function outboxRows(flightId: string): Record<string, unknown>[] {
   return harness.sqlite.prepare(`SELECT * FROM flight_event_outbox WHERE flight_id = ?`).all(flightId)
 }
 
+function reapReceiptRows(flightId: string): Record<string, unknown>[] {
+  return harness.sqlite.prepare(`SELECT * FROM flight_reap_receipts WHERE flight_id = ?`).all(flightId)
+}
+
 const WATCHDOG = { actor: { kind: 'system' as const, id: 'mupot-watchdog' } }
 
 // ───────────────────────────────────────────────────────────────────────────────
@@ -520,46 +524,71 @@ describe('reapStalledFlight — governed terminal transition, real UPDATE agains
 })
 
 // ───────────────────────────────────────────────────────────────────────────────
-describe('reap audit receipt — flight_event_outbox', () => {
-  it('DEFECT, LIVE ON MAIN: the reap receipt is REJECTED by the real schema, so a reap lands with NO audit row', async () => {
-    // This is the finding the mock D1 concealed, and the reason this file had to be
-    // converted. The previous version of this test asserted `res.receipt === true`, because
-    // the hand-written `prepare()` accepted any INSERT it was handed. The committed schema
-    // does not:
+describe('reap audit receipt — flight_reap_receipts', () => {
+  it('FIXED: a reap now writes a real audit receipt, with the evidence the decision rested on', async () => {
+    // FLIPPED from the characterization test this replaces, exactly as that test demanded:
+    // "the moment anyone widens the CHECK this test goes RED and must be flipped to assert a
+    // real receipt — which is exactly the forcing function wanted."
     //
-    //   migrations/0046_flight_event_outbox.sql
-    //     event_type TEXT NOT NULL CHECK (event_type = 'flight.landed')
-    //     actor_kind TEXT NOT NULL CHECK (actor_kind IN ('member', 'agent'))
+    // The CHECK was NOT widened. That test also named the reason, and it was right: widening
+    // requires "scoping three consumers that today assume every outbox row is a landing
+    // (deliverFlightLandedEvent + flushFlightEventOutbox, projections landing feed)" — otherwise
+    // "a reaped flight is re-emitted on the bus as flight.landed". Independently re-traced and
+    // confirmed: deliverFlightLandedEvent SELECTs with no event_type filter, emits a HARDCODED
+    // type:'flight.landed', and UPDATEs delivered_at with no filter. So widening would have
+    // broadcast a reap as a successful landing. A false receipt is worse than a missing one.
     //
-    // src/flight/watchdog.ts writes event_type='flight.reaped' with actor_kind='system'.
-    // BOTH violate that CHECK. The INSERT throws, watchdog.ts catches it, logs, and returns
-    // receipt:false — while still returning transitioned:true. So the reaper marks live work
-    // FAILED and the "immutable audit receipt" promised in its own file header (invariant 3,
-    // "Complete Auditability") is never written. There is no backfill path.
-    //
-    // This test asserts the TRUE current behaviour so CI is honest, NOT because the behaviour
-    // is correct. It is a characterization test on a defect. It pins the root cause below, so
-    // the moment anyone widens the CHECK this test goes RED and must be flipped to assert a
-    // real receipt — which is exactly the forcing function wanted.
-    //
-    // Fixing it is a scope decision, not a test change: the receipt needs a home. Widening
-    // the CHECK is a table rebuild AND requires scoping three consumers that today assume
-    // every outbox row is a landing (src/flight/service.ts deliverFlightLandedEvent +
-    // flushFlightEventOutbox, src/projects/projections.ts landing feed) — otherwise a reaped
-    // flight is re-emitted on the bus as `flight.landed`, and src/bus/consumer.ts
-    // claimFlightEvent (which filters event_type='flight.landed') can never claim it, so it
-    // retries forever. Raised for Kasra-core / the owner gate.
+    // The receipt got its own home instead (migrations/0109_flight_reap_receipts.sql). A reap is
+    // not a landing: the system gave up, and the consumer is an auditor, not the delivery
+    // pipeline. The outbox CHECK is untouched — proven by the root-cause test below, which still
+    // passes UNCHANGED, so the landing path is demonstrably undisturbed by this change.
     seedFlight({ id: 'fl-receipt', started_at: T0 })
 
     const res = await reapStalledFlight(env, 'fl-receipt', WATCHDOG, 'Exceeded 60m deadline', T0 + 70 * MINUTE)
 
-    // The flight IS reaped — the terminal transition succeeds.
     expect(res.transitioned).toBe(true)
     expect(rawFlightRow('fl-receipt')?.status).toBe('failed')
 
-    // …and the audit trail is silently absent.
-    expect(res.receipt, 'DEFECT: reap receipt rejected by flight_event_outbox CHECK').toBe(false)
-    expect(outboxRows('fl-receipt'), 'DEFECT: reap left no audit row').toHaveLength(0)
+    // The audit trail now exists.
+    expect(res.receipt, 'reap must produce a real audit receipt').toBe(true)
+    const receipts = reapReceiptRows('fl-receipt')
+    expect(receipts, 'exactly one receipt per reap').toHaveLength(1)
+
+    const row = receipts[0]
+    // actor_kind='system' is the watchdog. The 0046 outbox CHECK admitted only member|agent,
+    // which was the SECOND reason it rejected these writes — not just the event_type.
+    expect(row.actor_kind).toBe('system')
+    expect(row.actor_id).toBe('mupot-watchdog')
+    expect(row.previous_status).toBe('running')
+    expect(row.reap_reason).toBe('Exceeded 60m deadline')
+
+    // The evidence the decision rested on, so a WRONG reap is diagnosable without re-deriving
+    // the predicate from scratch.
+    expect(row.predicate_reason, 'the machine reason, distinct from the operator reason').toBeTruthy()
+    expect(Number(row.age_ms), 'age at reap').toBe(70 * MINUTE)
+    expect(Number(row.timeout_ms), 'threshold applied').toBeGreaterThan(0)
+    expect(() => JSON.parse(String(row.payload))).not.toThrow()
+
+    // And nothing leaked into the landing pipeline — the reap is invisible to the outbox, which
+    // is the whole point of separating the surfaces.
+    expect(outboxRows('fl-receipt'), 'a reap must NOT appear in the landing outbox').toHaveLength(0)
+  })
+
+  it('receipt is idempotent: a refused second reap cannot add a duplicate audit row', async () => {
+    // UNIQUE (tenant, flight_id) + ON CONFLICT DO NOTHING. A flight can only be reaped once (the
+    // transition is guarded on a non-terminal status), so a duplicate here would mean a
+    // double-reap recorded as two independent events.
+    seedFlight({ id: 'fl-once', started_at: T0 })
+
+    const first = await reapStalledFlight(env, 'fl-once', WATCHDOG, 'first', T0 + 70 * MINUTE)
+    expect(first.transitioned).toBe(true)
+    expect(first.receipt).toBe(true)
+
+    const second = await reapStalledFlight(env, 'fl-once', WATCHDOG, 'second', T0 + 80 * MINUTE)
+    // The flight is already terminal, so the transition itself must refuse.
+    expect(second.transitioned).toBe(false)
+    expect(reapReceiptRows('fl-once'), 'still exactly one receipt').toHaveLength(1)
+    expect(reapReceiptRows('fl-once')[0].reap_reason, 'the FIRST reason survives').toBe('first')
   })
 
   it('pins the root cause: flight_event_outbox rejects flight.reaped and accepts flight.landed', () => {

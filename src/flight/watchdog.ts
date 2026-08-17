@@ -329,7 +329,23 @@ export async function reapStalledFlight(
     }
   }
 
-  // 2. Write immutable audit receipt to flight_event_outbox
+  // 2. Write immutable audit receipt to flight_reap_receipts (migration 0109).
+  //
+  // This previously targeted flight_event_outbox with event_type='flight.reaped', against that
+  // table's `CHECK (event_type = 'flight.landed')` (0046). It therefore THREW ON EVERY REAP, was
+  // swallowed below, and the function returned transitioned:true / receipt:false — a reaped flight
+  // with no audit trail, visible only in a console line nobody reads.
+  //
+  // The obvious repair — widen the CHECK — is the wrong one, for a reason that is not obvious:
+  // deliverFlightLandedEvent (src/flight/service.ts) selects undelivered outbox rows with NO
+  // event_type filter, emits a HARDCODED type:'flight.landed', and updates delivered_at with NO
+  // event_type filter. The moment 'flight.reaped' became insertable, flushFlightEventOutbox would
+  // pick it up and ANNOUNCE A REAP AS A LANDING on the bus, then mark it delivered. A stalled
+  // flight broadcast as a successful landing is worse than the silence it replaces.
+  //
+  // A reap is not a landing. It is the system giving up on a flight, and its consumer is an
+  // auditor rather than the delivery pipeline. Keeping the surfaces separate makes the two
+  // structurally unconfusable. Full reasoning in migrations/0109_flight_reap_receipts.sql.
   let receipt = false
   const receiptPayload = JSON.stringify({
     flight_id: flightId,
@@ -348,25 +364,37 @@ export async function reapStalledFlight(
 
   try {
     await env.DB.prepare(
-      `INSERT INTO flight_event_outbox
-         (id, tenant, flight_id, event_type, actor_kind, actor_id, payload, created_at)
-       VALUES (?1, ?2, ?3, 'flight.reaped', ?4, ?5, ?6, ?7)
-       ON CONFLICT (tenant, flight_id, event_type) DO NOTHING`,
+      `INSERT INTO flight_reap_receipts
+         (id, tenant, flight_id, previous_status, actor_kind, actor_id,
+          reap_reason, predicate_reason, age_ms, timeout_ms, payload, created_at)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+       ON CONFLICT (tenant, flight_id) DO NOTHING`,
     )
       .bind(
         eventId,
         env.TENANT_SLUG,
         flightId,
+        previousStatus,
         principal.actor.kind,
         principal.actor.id,
+        reason,
+        evalResult.reason,
+        evalResult.ageMs ?? null,
+        evalResult.timeoutMs ?? null,
         receiptPayload,
         createdAt,
       )
       .run()
     receipt = true
   } catch (error) {
-    console.error('flight.reaped receipt insert failed', {
+    // The flight is ALREADY transitioned by this point, so a receipt failure means a reap with no
+    // audit trail — exactly the condition that hid this defect. It must be loud, and the caller
+    // must not read transitioned:true as success on its own.
+    console.error('flight reap receipt insert failed — FLIGHT REAPED WITHOUT AUDIT TRAIL', {
       flight_id: flightId,
+      previous_status: previousStatus,
+      actor_kind: principal.actor.kind,
+      actor_id: principal.actor.id,
       error: error instanceof Error ? error.message : 'unknown_error',
     })
   }
