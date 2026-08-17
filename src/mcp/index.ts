@@ -2144,6 +2144,80 @@ const toolFlightLand: ToolSpec = {
   },
 }
 
+const toolFlightReapStalled: ToolSpec = {
+  name: 'flight_reap_stalled',
+  scope: 'squad:lead / org:admin / flight:agent',
+  min: 'member',
+  args: '{ flight_id: string, reason: string }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      flight_id: STRING_SCHEMA,
+      reason: STRING_SCHEMA,
+    },
+    required: ['flight_id', 'reason'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const flightRef = str(args.flight_id)
+    const reason = str(args.reason)
+    if (!flightRef || !reason) return fail(400, 'invalid_args')
+
+    const { resolveFlightEntity } = await import('../lib/entity-resolver')
+    const flightRes = await resolveFlightEntity(env, flightRef)
+    if (!flightRes.ok) {
+      if (flightRes.reason === 'ambiguous') {
+        return fail(409, 'ambiguous_flight_id', { candidates: flightRes.candidates })
+      }
+      return fail(404, 'flight_not_found')
+    }
+    const flight = flightRes.entity
+
+    const { reapStalledFlight } = await import('../flight/watchdog')
+    const grants = auth.capabilities ?? []
+    const isOrgAdmin = hasCapability(grants, 'org', null, 'admin')
+    const leadSquadIds = grants
+      .filter((c) => c.scope_type === 'squad' && (c.capability === 'lead' || c.capability === 'admin') && typeof c.scope_id === 'string')
+      .map((c) => c.scope_id as string)
+
+    const actorId = auth.boundAgentId ?? auth.memberId ?? auth.userId ?? 'unknown-actor'
+    const actor = auth.boundAgentId
+      ? { kind: 'agent' as const, id: actorId }
+      : { kind: 'member' as const, id: actorId }
+
+    const result = await reapStalledFlight(
+      env,
+      flight.id,
+      { actor, isOrgAdmin, leadSquadIds },
+      reason,
+    )
+
+    if (!result.transitioned) {
+      if (result.error === 'cannot_reap_waiting_gate_must_escalate') {
+        return fail(409, 'cannot_reap_waiting_gate_must_escalate')
+      }
+      if (result.error === 'flight_not_stalled') {
+        return fail(409, 'flight_not_stalled')
+      }
+      if (result.error === 'flight_already_terminal') {
+        return fail(409, 'flight_already_terminal')
+      }
+      if (result.error === 'forbidden_insufficient_reap_capability') {
+        return fail(403, 'forbidden', { need: 'squad:lead or org:admin', scope: 'flight' })
+      }
+      return fail(409, result.error ?? 'flight_reap_failed')
+    }
+
+    return done({
+      reaped: true,
+      flight_id: result.flight_id,
+      previous_status: result.previous_status,
+      age_ms: result.age_ms,
+      receipt: result.receipt,
+    })
+  },
+}
+
 const toolFlightList: ToolSpec = {
   name: 'flight_list',
   scope: 'squad',
@@ -3566,6 +3640,7 @@ export const TOOLS: ToolSpec[] = [
   toolFlightGet,
   toolFlightList,
   toolFlightLand,
+  toolFlightReapStalled,
   toolTaskCreate,
   toolTaskList,
   toolTaskBoard,
