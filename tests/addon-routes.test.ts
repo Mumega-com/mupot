@@ -147,7 +147,15 @@ describe('addon lifecycle routes', () => {
       )
 
       expect(res.status).toBe(403)
-      await expect(res.json()).resolves.toEqual({ error: 'forbidden', detail: 'owner/admin only' })
+      await expect(res.json()).resolves.toMatchObject({
+        error: 'forbidden',
+        need: 'admin',
+        // #530 follow-on: the envelope now NAMES the refused principal and its
+        // standing (and offers a route it can reach) instead of stating only the
+        // requirement. Same gate, same 403 — a legible one.
+        signed_in_as: expect.any(String),
+        standing: { role: 'member', org_capability: null, scoped_grants_only: false },
+      })
     },
   )
 
@@ -155,21 +163,45 @@ describe('addon lifecycle routes', () => {
     const res = await addonsApp.fetch(request('/', 'GET'), envForRole(harness, 'member'))
 
     expect(res.status).toBe(403)
-    await expect(res.json()).resolves.toEqual({ error: 'forbidden', detail: 'owner/admin only' })
+    await expect(res.json()).resolves.toMatchObject({
+        error: 'forbidden',
+        need: 'admin',
+        // #530 follow-on: the envelope now NAMES the refused principal and its
+        // standing (and offers a route it can reach) instead of stating only the
+        // requirement. Same gate, same 403 — a legible one.
+        signed_in_as: expect.any(String),
+        standing: { role: 'member', org_capability: null, scoped_grants_only: false },
+      })
   })
 
   it('rejects a member receipt read before resolving the addon or reading receipts', async () => {
     const res = await addonsApp.fetch(request('/missing-addon/receipts', 'GET'), envForRole(harness, 'member'))
 
     expect(res.status).toBe(403)
-    await expect(res.json()).resolves.toEqual({ error: 'forbidden', detail: 'owner/admin only' })
+    await expect(res.json()).resolves.toMatchObject({
+        error: 'forbidden',
+        need: 'admin',
+        // #530 follow-on: the envelope now NAMES the refused principal and its
+        // standing (and offers a route it can reach) instead of stating only the
+        // requirement. Same gate, same 403 — a legible one.
+        signed_in_as: expect.any(String),
+        standing: { role: 'member', org_capability: null, scoped_grants_only: false },
+      })
   })
 
   it('rejects a member business-state evidence read before resolving the addon', async () => {
     const res = await addonsApp.fetch(request('/missing-addon/evidence', 'GET'), envForRole(harness, 'member'))
 
     expect(res.status).toBe(403)
-    await expect(res.json()).resolves.toEqual({ error: 'forbidden', detail: 'owner/admin only' })
+    await expect(res.json()).resolves.toMatchObject({
+        error: 'forbidden',
+        need: 'admin',
+        // #530 follow-on: the envelope now NAMES the refused principal and its
+        // standing (and offers a route it can reach) instead of stating only the
+        // requirement. Same gate, same 403 — a legible one.
+        signed_in_as: expect.any(String),
+        standing: { role: 'member', org_capability: null, scoped_grants_only: false },
+      })
   })
 
   it('returns on-demand type-preserving business evidence without rows or addon state', async () => {
@@ -564,7 +596,15 @@ describe('addon lifecycle routes', () => {
     ] as const) {
       const res = await addonsApp.fetch(request(path, method), memberEnv)
       expect(res.status).toBe(403)
-      await expect(res.json()).resolves.toEqual({ error: 'forbidden', detail: 'owner/admin only' })
+      await expect(res.json()).resolves.toMatchObject({
+        error: 'forbidden',
+        need: 'admin',
+        // #530 follow-on: the envelope now NAMES the refused principal and its
+        // standing (and offers a route it can reach) instead of stating only the
+        // requirement. Same gate, same 403 — a legible one.
+        signed_in_as: expect.any(String),
+        standing: { role: 'member', org_capability: null, scoped_grants_only: false },
+      })
     }
 
     const invalidLimit = await addonsApp.fetch(

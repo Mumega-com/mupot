@@ -53,6 +53,9 @@ import {
   isOrgAdmin,
   holdsCapabilityFloor,
 } from '../auth/capability'
+// Legible refusals (#530 follow-on): a 403 that names the signed-in principal and
+// their actual standing, not just the requirement they failed. See src/auth/refusal.ts.
+import { orgAdminRefusalLines, orgAdminForbiddenPayload, ORG_ADMIN_REFUSAL_LINKS } from '../auth/refusal'
 // FLIGHT-001 #797 — the shared "which squads can this caller read" primitive
 // (extracted from dashboard/agents-admin.ts's accessibleSquadIds, #796), reused
 // to scope /fleet's roster + presence and /brain's loop feed.
@@ -824,7 +827,7 @@ dashboardApp.get('/approvals', async (c) => {
 // any error page render binding NAMES only (see ./secret-env.ts).
 dashboardApp.post('/admin/secret-env/:requestId/bind', async (c) => {
   const auth = c.get('auth')
-  if (!isOrgAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  if (!isOrgAdmin(auth)) return c.json(orgAdminForbiddenJson('Binding a secret-env request', auth), 403)
 
   const requestId = c.req.param('requestId')
   const form = await c.req.parseBody()
@@ -850,7 +853,7 @@ dashboardApp.post('/admin/secret-env/:requestId/bind', async (c) => {
 // POST /admin/secret-env/:requestId/reject — admin declines; no CF calls, no values.
 dashboardApp.post('/admin/secret-env/:requestId/reject', async (c) => {
   const auth = c.get('auth')
-  if (!isOrgAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  if (!isOrgAdmin(auth)) return c.json(orgAdminForbiddenJson('Rejecting a secret-env request', auth), 403)
 
   const requestId = c.req.param('requestId')
   const result = await rejectSecretEnv(c.env, { requestId, actorId: auth.memberId ?? auth.userId })
@@ -884,7 +887,7 @@ dashboardApp.get('/needs-you', async (c) => {
 dashboardApp.get('/ops', async (c) => {
   const auth = c.get('auth')
   if (!isOrgAdmin(auth)) {
-    return c.html(shell(c.env, 'Operations', errorBody('Operations health requires owner or admin.')), 403)
+    return c.html(shell(c.env, 'Operations', orgAdminForbiddenBody('The Operations page', auth)), 403)
   }
   const data = await loadOpsHealth(c.env, auth)
   return c.html(shell(c.env, 'Operations', opsHealthBody(data)))
@@ -899,7 +902,7 @@ dashboardApp.get('/ops', async (c) => {
 dashboardApp.get('/deployment', async (c) => {
   const auth = c.get('auth')
   if (!isOrgAdmin(auth)) {
-    return c.html(shell(c.env, 'Deployment', errorBody('Deployment requires owner or admin.')), 403)
+    return c.html(shell(c.env, 'Deployment', orgAdminForbiddenBody('The Deployment page', auth)), 403)
   }
   const data = await loadDeployment(c.env)
   return c.html(shell(c.env, 'Deployment', deploymentBody(data)))
@@ -925,7 +928,7 @@ dashboardApp.get('/services', async (c) => {
 dashboardApp.get('/addons', async (c) => {
   const auth = c.get('auth')
   if (!isOrgAdmin(auth)) {
-    return c.html(shell(c.env, 'Addons', errorBody('Addons requires owner or admin.')), 403)
+    return c.html(shell(c.env, 'Addons', orgAdminForbiddenBody('The Addons console', auth)), 403)
   }
   try {
     const [installations, connectors] = await Promise.all([
@@ -956,7 +959,7 @@ function currentUtcMarketingWindow(now = new Date()) {
 dashboardApp.post('/addons/marketing-cro-monitor/run', async (c) => {
   const auth = c.get('auth')
   if (!isOrgAdmin(auth)) {
-    return c.html(shell(c.env, 'Marketing & CRO', errorBody('Running the monitor requires owner or admin.')), 403)
+    return c.html(shell(c.env, 'Marketing & CRO', orgAdminForbiddenBody('Running the monitor', auth)), 403)
   }
   const result = await runMarketingMonitor(
     c.env,
@@ -1078,7 +1081,7 @@ dashboardApp.get('/departments/growth', async (c) => {
 // config → 503 executor_not_configured (inert; nothing wired for this pot at all).
 dashboardApp.post('/admin/departments/:dept/execute/:gateId', async (c) => {
   const auth = c.get('auth')
-  if (!isOrgAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  if (!isOrgAdmin(auth)) return c.json(orgAdminForbiddenJson('Executing a department gate', auth), 403)
   const dept = c.req.param('dept')
   const gateId = c.req.param('gateId')
   if (!/^[a-z0-9][a-z0-9_-]{0,63}$/i.test(dept) || !gateId) {
@@ -1339,7 +1342,7 @@ dashboardApp.post('/fleet/wake', async (c) => {
   if (!fleetScoped(c.env)) return c.json({ error: 'fleet_not_scoped' }, 503)
   const auth = c.get('auth')
   if (!isOrgAdmin(auth)) {
-    return c.json({ error: 'forbidden', need: 'admin' }, 403)
+    return c.json(orgAdminForbiddenJson('Waking a fleet agent', auth), 403)
   }
   const memberId = auth.memberId ?? auth.userId
   if (!memberId) return c.json({ error: 'no_member' }, 401)
@@ -1363,7 +1366,7 @@ dashboardApp.post('/fleet/control', async (c) => {
   if (!fleetScoped(c.env)) return c.json({ error: 'fleet_not_scoped' }, 503)
   const auth = c.get('auth')
   if (!isOrgAdmin(auth)) {
-    return c.json({ error: 'forbidden', need: 'admin' }, 403)
+    return c.json(orgAdminForbiddenJson('Fleet control', auth), 403)
   }
   const memberId = auth.memberId ?? auth.userId
   if (!memberId) return c.json({ error: 'no_member' }, 401)
@@ -1414,7 +1417,7 @@ dashboardApp.get('/agents', async (c) => {
 dashboardApp.post('/agents', async (c) => {
   const auth = c.get('auth')
   if (!isOrgAdmin(auth)) {
-    return c.html(shell(c.env, 'Agents', errorBody('Creating an agent requires owner or admin.')), 403)
+    return c.html(shell(c.env, 'Agents', orgAdminForbiddenBody('Creating an agent', auth)), 403)
   }
   const form = await c.req.parseBody()
   const squadId = typeof form.squad_id === 'string' ? form.squad_id.trim() : ''
@@ -1445,7 +1448,7 @@ dashboardApp.post('/agents', async (c) => {
 // POST /agents/:id/status — pause or resume an agent (owner/admin only).
 dashboardApp.post('/agents/:id/status', async (c) => {
   const auth = c.get('auth')
-  if (!isOrgAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  if (!isOrgAdmin(auth)) return c.json(orgAdminForbiddenJson('Changing agent status', auth), 403)
   const agentId = c.req.param('id')
   // Validate agentId is a non-empty string (UUID format); we don't need to parse
   // the body format strictly since we validate the status value via isAgentStatus.
@@ -1464,7 +1467,7 @@ dashboardApp.post('/agents/:id/status', async (c) => {
 // Note: HTML forms cannot DELETE; the client sends via fetch() with method:DELETE.
 dashboardApp.delete('/agents/:id', async (c) => {
   const auth = c.get('auth')
-  if (!isOrgAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  if (!isOrgAdmin(auth)) return c.json(orgAdminForbiddenJson('Deleting an agent', auth), 403)
   const agentId = c.req.param('id')
   if (!agentId || agentId.length > 64) return c.json({ error: 'invalid_agent_id' }, 400)
   const result = await deleteAgent(c.env, agentId)
@@ -1476,7 +1479,7 @@ dashboardApp.delete('/agents/:id', async (c) => {
 // Calls the shared updateUnitConfig from org/service — no new write logic here.
 dashboardApp.post('/agents/:id/config', async (c) => {
   const auth = c.get('auth')
-  if (!isOrgAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  if (!isOrgAdmin(auth)) return c.json(orgAdminForbiddenJson('Changing agent config', auth), 403)
   const agentId = c.req.param('id')
   if (!agentId || agentId.length > 64) return c.json({ error: 'invalid_agent_id' }, 400)
 
@@ -1493,7 +1496,7 @@ dashboardApp.post('/agents/:id/config', async (c) => {
 // POST /squads/:id/config — patch work-unit knobs on a squad (owner/admin only).
 dashboardApp.post('/squads/:id/config', async (c) => {
   const auth = c.get('auth')
-  if (!isOrgAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  if (!isOrgAdmin(auth)) return c.json(orgAdminForbiddenJson('Changing squad config', auth), 403)
   const squadId = c.req.param('id')
   if (!squadId || squadId.length > 64) return c.json({ error: 'invalid_squad_id' }, 400)
 
@@ -1616,7 +1619,7 @@ dashboardApp.get('/admin/members', async (c) => {
   const auth = c.get('auth')
   if (!isOrgAdmin(auth)) {
     return c.html(
-      shell(c.env, 'People & Access', errorBody('People & Access admin requires owner or admin.')),
+      shell(c.env, 'People & Access', orgAdminForbiddenBody('The People & Access page', auth)),
       403,
     )
   }
@@ -1642,7 +1645,7 @@ dashboardApp.get('/admin/divisions', async (c) => {
   const auth = c.get('auth')
   if (!isOrgAdmin(auth)) {
     return c.html(
-      shell(c.env, 'Organization', errorBody('Organization admin requires owner or admin.')),
+      shell(c.env, 'Organization', orgAdminForbiddenBody('The Organization page', auth)),
       403,
     )
   }
@@ -1675,7 +1678,7 @@ dashboardApp.get('/admin/keys', async (c) => {
   const auth = c.get('auth')
   if (!isOrgAdmin(auth)) {
     return c.html(
-      shell(c.env, 'Scoped Keys', errorBody('Scoped key management requires owner or admin.')),
+      shell(c.env, 'Scoped Keys', orgAdminForbiddenBody('Scoped key management', auth)),
       403,
     )
   }
@@ -1688,7 +1691,7 @@ dashboardApp.post('/admin/keys/mint', async (c) => {
   const auth = c.get('auth')
   if (!isOrgAdmin(auth)) {
     return c.html(
-      shell(c.env, 'Scoped Keys', errorBody('Minting a scoped key requires owner or admin.')),
+      shell(c.env, 'Scoped Keys', orgAdminForbiddenBody('Minting a scoped key', auth)),
       403,
     )
   }
@@ -1795,7 +1798,7 @@ dashboardApp.get('/admin/agent-token', async (c) => {
   const auth = c.get('auth')
   if (!isOrgAdmin(auth)) {
     return c.html(
-      shell(c.env, 'Mint agent token', errorBody('Minting an agent token requires owner or admin.')),
+      shell(c.env, 'Mint agent token', orgAdminForbiddenBody('Minting an agent token', auth)),
       403,
     )
   }
@@ -1814,7 +1817,7 @@ dashboardApp.post('/admin/agent-token/mint', async (c) => {
   }
   if (!isOrgAdmin(auth)) {
     return c.html(
-      shell(c.env, 'Mint agent token', errorBody('Minting an agent token requires owner or admin.')),
+      shell(c.env, 'Mint agent token', orgAdminForbiddenBody('Minting an agent token', auth)),
       403,
     )
   }
@@ -1933,7 +1936,7 @@ dashboardApp.get('/admin/connectors', async (c) => {
   const auth = c.get('auth')
   if (!isOrgAdmin(auth)) {
     return c.html(
-      shell(c.env, 'Connectors', errorBody('Connector management requires owner or admin.')),
+      shell(c.env, 'Connectors', orgAdminForbiddenBody('Connector management', auth)),
       403,
     )
   }
@@ -1946,7 +1949,7 @@ dashboardApp.post('/admin/connectors', async (c) => {
   const auth = c.get('auth')
   if (!isOrgAdmin(auth)) {
     return c.html(
-      shell(c.env, 'Connectors', errorBody('Adding a connector requires owner or admin.')),
+      shell(c.env, 'Connectors', orgAdminForbiddenBody('Adding a connector', auth)),
       403,
     )
   }
@@ -2018,7 +2021,7 @@ dashboardApp.post('/admin/connectors', async (c) => {
 dashboardApp.post('/admin/connectors/:id/rotate', async (c) => {
   const auth = c.get('auth')
   if (!isOrgAdmin(auth)) {
-    return c.json({ error: 'forbidden', need: 'admin' }, 403)
+    return c.json(orgAdminForbiddenJson('Rotating a connector', auth), 403)
   }
 
   const connectorId = c.req.param('id')
@@ -2059,7 +2062,7 @@ dashboardApp.post('/admin/connectors/:id/rotate', async (c) => {
 dashboardApp.post('/admin/connectors/:id/revoke', async (c) => {
   const auth = c.get('auth')
   if (!isOrgAdmin(auth)) {
-    return c.json({ error: 'forbidden', need: 'admin' }, 403)
+    return c.json(orgAdminForbiddenJson('Revoking a connector', auth), 403)
   }
 
   const connectorId = c.req.param('id')
@@ -2085,7 +2088,7 @@ dashboardApp.post('/admin/connectors/:id/revoke', async (c) => {
 
 dashboardApp.get('/admin/github/status', async (c) => {
   const auth = c.get('auth')
-  if (!isOrgAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  if (!isOrgAdmin(auth)) return c.json(orgAdminForbiddenJson('Reading GitHub status', auth), 403)
   const snapshot = await githubCapabilitySnapshot(c.env)
   return c.json(snapshot)
 })
@@ -2094,7 +2097,7 @@ dashboardApp.get('/admin/github/status', async (c) => {
 dashboardApp.get('/admin/github', async (c) => {
   const auth = c.get('auth')
   if (!isOrgAdmin(auth)) {
-    return c.html(shell(c.env, 'GitHub', errorBody('GitHub management requires owner or admin.')), 403)
+    return c.html(shell(c.env, 'GitHub', orgAdminForbiddenBody('GitHub management', auth)), 403)
   }
   const snapshot = await githubCapabilitySnapshot(c.env)
   const installationId = await getInstallationId(c.env)
@@ -2109,7 +2112,7 @@ dashboardApp.get('/admin/github', async (c) => {
 
 dashboardApp.post('/admin/github/agent-def', async (c) => {
   const auth = c.get('auth')
-  if (!isOrgAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  if (!isOrgAdmin(auth)) return c.json(orgAdminForbiddenJson('Writing an agent definition to GitHub', auth), 403)
 
   let body: { repo?: unknown; agentName?: unknown; content?: unknown; message?: unknown }
   try {
@@ -2128,7 +2131,7 @@ dashboardApp.post('/admin/github/agent-def', async (c) => {
 
 dashboardApp.post('/admin/github/assign-copilot', async (c) => {
   const auth = c.get('auth')
-  if (!isOrgAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  if (!isOrgAdmin(auth)) return c.json(orgAdminForbiddenJson('Assigning Copilot', auth), 403)
 
   let body: { repo?: unknown; issueNumber?: unknown }
   try {
@@ -2147,7 +2150,7 @@ dashboardApp.post('/admin/github/assign-copilot', async (c) => {
 // each wired to THIS pot's MCP endpoint. { repo, dryRun? }. dryRun previews without writing.
 dashboardApp.post('/admin/github/sync-fleet', async (c) => {
   const auth = c.get('auth')
-  if (!isOrgAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  if (!isOrgAdmin(auth)) return c.json(orgAdminForbiddenJson('Syncing the fleet to GitHub', auth), 403)
 
   let body: { repo?: unknown; dryRun?: unknown }
   try {
@@ -2168,7 +2171,7 @@ dashboardApp.post('/admin/github/sync-fleet', async (c) => {
 // { taskId, repo, branchName, files:[{path,content}], title, body?, baseBranch? }
 dashboardApp.post('/admin/github/execute-task', async (c) => {
   const auth = c.get('auth')
-  if (!isOrgAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  if (!isOrgAdmin(auth)) return c.json(orgAdminForbiddenJson('Executing a task on GitHub', auth), 403)
 
   let body: {
     taskId?: unknown; repo?: unknown; branchName?: unknown
@@ -2201,7 +2204,7 @@ dashboardApp.post('/admin/github/execute-task', async (c) => {
 // a named agent (via the "Agent" field) as routed tasks. { owner, projectNumber, agentField?, dryRun? }
 dashboardApp.post('/admin/github/import-project', async (c) => {
   const auth = c.get('auth')
-  if (!isOrgAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  if (!isOrgAdmin(auth)) return c.json(orgAdminForbiddenJson('Importing a GitHub project', auth), 403)
 
   let body: { owner?: unknown; projectNumber?: unknown; agentField?: unknown; dryRun?: unknown }
   try {
@@ -2228,7 +2231,7 @@ dashboardApp.post('/admin/github/import-project', async (c) => {
 
 dashboardApp.get('/admin/github/connect', async (c) => {
   const auth = c.get('auth')
-  if (!isOrgAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  if (!isOrgAdmin(auth)) return c.json(orgAdminForbiddenJson('Connecting GitHub', auth), 403)
   const state = crypto.randomUUID()
   // Single-use, tenant-bound, 10-min TTL. Verified + deleted on callback.
   await c.env.SESSIONS.put(`ghstate:${state}`, c.env.TENANT_SLUG, { expirationTtl: 600 })
@@ -2237,7 +2240,7 @@ dashboardApp.get('/admin/github/connect', async (c) => {
 
 dashboardApp.get('/connect/github/callback', async (c) => {
   const auth = c.get('auth')
-  if (!isOrgAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  if (!isOrgAdmin(auth)) return c.json(orgAdminForbiddenJson('Completing the GitHub connection', auth), 403)
 
   const url = new URL(c.req.url)
   const state = url.searchParams.get('state') ?? ''
@@ -2277,7 +2280,7 @@ dashboardApp.get('/members', async (c) => {
   const auth = c.get('auth')
   const canManage = await canOnOrg(c.env, auth, 'admin')
   if (!canManage) {
-    return c.html(shell(c.env, 'Access Tokens', errorBody('Access Tokens requires owner or admin.')), 403)
+    return c.html(shell(c.env, 'Access Tokens', orgAdminForbiddenBody('The Access Tokens page', auth)), 403)
   }
   const [members, channels, tokens] = await Promise.all([
     loadMembers(c.env),
@@ -2490,7 +2493,7 @@ export const dashboardBuiltInGetRoutes = Object.freeze(dashboardApp.routes
 
 dashboardApp.get('*', async (c) => {
   if (!isOrgAdmin(c.get('auth'))) {
-    return c.html(shell(c.env, 'Addon console', errorBody('Addon consoles require owner or admin.')), 403)
+    return c.html(shell(c.env, 'Addon console', orgAdminForbiddenBody('The addon console', c.get('auth'))), 403)
   }
   const resolved = createAddonConsoleResolver(
     listRegisteredAddons(),
@@ -4140,6 +4143,36 @@ export function shell(
 
 export function errorBody(message: string) {
   return html`<h1>Hmm.</h1><p class="empty">${message}</p><p><a href="/">← Back to overview</a></p>`
+}
+
+// ── the org-admin refusal surface ────────────────────────────────────────────
+// The links live in src/auth/refusal.ts (ORG_ADMIN_REFUSAL_LINKS) so the HTML
+// page and its JSON twin can never drift, and every href there is asserted
+// reachable-by-a-refused-member in tests/org-admin-capability-gate.test.ts.
+
+/**
+ * orgAdminForbiddenBody — the HTML 403 for an isOrgAdmin refusal.
+ *
+ * Names the signed-in principal and the standing they hold, states what the page
+ * requires, says what would grant it, and offers a route they can actually reach.
+ * The gate and the status code are unchanged — this is legibility, not outcome.
+ */
+export function orgAdminForbiddenBody(action: string, auth: AuthContext | null | undefined) {
+  const lines = orgAdminRefusalLines(action, auth)
+  return html`<h1>Not allowed</h1>
+    <p class="empty">${lines.identity}</p>
+    <p class="empty">${lines.requirement}</p>
+    <p class="empty">${lines.nextStep}</p>
+    <p>
+      ${ORG_ADMIN_REFUSAL_LINKS.map(
+        (l) => html`<a href="${l.href}" style="margin-right:16px">${l.label}</a>`,
+      )}
+    </p>`
+}
+
+/** JSON twin of orgAdminForbiddenBody, carrying the same verified links. */
+export function orgAdminForbiddenJson(action: string, auth: AuthContext | null | undefined) {
+  return orgAdminForbiddenPayload(action, auth, ORG_ADMIN_REFUSAL_LINKS)
 }
 
 // FLIGHT-001 F2 — the capability-floor deny page. Deliberately does NOT link
