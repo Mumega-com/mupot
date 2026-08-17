@@ -146,4 +146,34 @@ describe('scheduled invocation budget', () => {
       error.mockRestore()
     }
   })
+
+  it('the LIVE handler routes minute 15 to token-expiry-warning, not membership', async () => {
+    // Loom's follow-up on the slot-reachability fix, and the assertion that closes the real gap.
+    //
+    // Every other case here drives minutes 0-9 only. Under the OLD `% 15` selector minute 15 maps
+    // to slot 0 (`membership`), so a fan-out COUNT at minute 15 is identical under bug and fix and
+    // proves nothing — the count is 1 either way. The route name is the only thing that separates
+    // them.
+    //
+    // This exercises the real scheduled() handler rather than the pure slots.ts function, so the
+    // wiring itself is under test: token-expiry-warning (slot 10) was unreachable in production
+    // and this is the assertion that would have caught it.
+    const info = vi.spyOn(console, 'info').mockImplementation(() => undefined)
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    try {
+      // A distinct hour per assertion: reportScheduledDispatch buckets observations per hour, so
+      // reusing one hour would silently suppress the second emission and pass vacuously.
+      await scheduledFanout(15, MAINTENANCE_CRON, 3)
+
+      const routes = info.mock.calls
+        .filter(([tag]) => tag === '[scheduled:dispatch]')
+        .map(([, payload]) => (payload as { route?: string }).route)
+
+      expect(routes).toContain('token-expiry-warning')
+      expect(routes).not.toContain('membership')
+    } finally {
+      info.mockRestore()
+      error.mockRestore()
+    }
+  })
 })

@@ -422,6 +422,34 @@ describe('Flight-002: expiring-soon detection & maintenance sweep', () => {
 
     // Pin the maintenance array structure and scheduled execution hook in src/index.ts
     expect(src).toMatch(/const maintenance:\s*ReadonlyArray<readonly \[string,\s*\(\)\s*=>\s*Promise<unknown>\]>\s*=\s*\[[\s\S]*?\['token-expiry-warning',\s*\(\)\s*=>\s*sweepExpiringTokensWarning\(env\)\]/)
-    expect(src).toContain("const heartbeat = maintenance[scheduledAt.getUTCMinutes() % 15]")
+    expect(src).toContain(
+      'const heartbeat = maintenance[maintenanceSlot(scheduledAt.getUTCMinutes(), maintenance.length)]',
+    )
+
+    // WHY THE PIN ABOVE CHANGED, and why the assertion below now exists.
+    //
+    // This previously pinned `maintenance[scheduledAt.getUTCMinutes() % 15]`. That selector could
+    // only ever address indices 0-9 — every minute the maintenance cron fires satisfies
+    // `minute % 15 in 0..9` — while the array holds eleven entries. token-expiry-warning sits at
+    // index [10] and therefore NEVER RAN in production.
+    //
+    // This test passed the entire time. It asserted the entry EXISTS in the array and that a
+    // selector line EXISTS, but never that the entry was REACHABLE — so it could not distinguish
+    // "wired up" from "wired to nothing", which is exactly the distinction it was written to
+    // defend. Pinning the buggy line as expected text additionally meant the defect had a test
+    // protecting it.
+    //
+    // The pin is therefore no longer purely textual: this asserts the sweep's own slot is actually
+    // selectable by a real firing minute of the cron.
+    const { MAINTENANCE_FIRING_MINUTES, maintenanceSlot } = await import('../src/scheduled/slots')
+    const heartbeatCount = 11 // keep in step with the maintenance array pinned above
+    const tokenExpirySlot = 10 // token-expiry-warning is the last entry
+    const reachable = new Set(
+      MAINTENANCE_FIRING_MINUTES.map((m) => maintenanceSlot(m, heartbeatCount)),
+    )
+    expect(
+      reachable.has(tokenExpirySlot),
+      'token-expiry-warning is in the maintenance array but no firing minute selects it — the sweep is wired to nothing',
+    ).toBe(true)
   })
 })
