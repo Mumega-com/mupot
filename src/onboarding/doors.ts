@@ -209,6 +209,68 @@ export async function selfGrant(env: Env, input: SelfGrantInput): Promise<DoorRe
 }
 
 /**
+ * grantSignupDefault — what a brand-new OAuth login receives, so the product works.
+ *
+ * THIS IS THE FUNCTION THAT ACTUALLY OPENS THE SYSTEM. `findOrCreateMember`
+ * (oauth-authorize.ts) writes a `members` row and nothing else — "C6 zero capabilities" —
+ * so a Google user today lands with an identity and no access, and 403s on every surface.
+ * The invite path writes member + capability + token in one batch. OAuth onboarding is
+ * half-implemented, and that is the whole reason the experience is dead on arrival.
+ *
+ * DELIBERATELY NOT `selfGrant`. This is OWNER-CONFIGURED (door.signup_capability), not
+ * self-selected, which is why it may use org scope while self-selection may not: the
+ * distinction that matters is WHO CHOSE, not which table gets written. A new user belongs
+ * to no squad yet, so org scope is the only one that can make a dashboard usable.
+ *
+ * FAILS CLOSED, TWICE OVER. No open door → grants nothing. Door open but
+ * signup_capability NULL → grants nothing. Both cases return `granted: false` and leave
+ * behaviour EXACTLY as it is today, so this landing cannot open a pot by itself; someone
+ * has to set the value on purpose.
+ *
+ * Idempotent: an existing grant on the same scope is never overwritten. A returning user
+ * who already earned `lead` must not be knocked back to `member` by logging in again.
+ */
+export async function grantSignupDefault(
+  env: Env,
+  memberId: string,
+): Promise<DoorResult<{ granted: boolean; capability?: string; receiptId?: string }>> {
+  const row = await env.DB.prepare(
+    `SELECT id, signup_capability FROM onboarding_doors
+      WHERE tenant = ?1 AND status = 'open' LIMIT 1`,
+  ).bind(env.TENANT_SLUG).first<{ id: string; signup_capability: string | null }>()
+
+  if (!row) return { ok: true, value: { granted: false } }            // no door → today's behaviour
+  if (!row.signup_capability) return { ok: true, value: { granted: false } } // door open, opening not configured
+
+  // Never clobber access someone already has, however they got it.
+  const existing = await env.DB.prepare(
+    `SELECT id FROM capabilities WHERE member_id = ?1 AND scope_type = 'org' AND scope_id IS NULL LIMIT 1`,
+  ).bind(memberId).first<{ id: string }>()
+  if (existing) return { ok: true, value: { granted: false } }
+
+  const grantId = crypto.randomUUID()
+  const receiptId = crypto.randomUUID()
+
+  // Same batch as every other door write: an unrecorded grant is what makes a door
+  // uncloseable, and this one runs on the busiest path in the product.
+  await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, provisional_door_id)
+       VALUES (?1, ?2, 'org', NULL, ?3, ?4)
+       ON CONFLICT (member_id, scope_type, scope_id) DO NOTHING`,
+    ).bind(grantId, memberId, row.signup_capability, row.id),
+    env.DB.prepare(
+      `INSERT INTO door_receipts
+         (id, tenant, door_id, actor_member_id, subject_member_id, scope_type, scope_id,
+          action, capability_before, capability_after)
+       VALUES (?1, ?2, ?3, ?4, ?4, 'org', NULL, 'signup_default', NULL, ?5)`,
+    ).bind(receiptId, env.TENANT_SLUG, row.id, memberId, row.signup_capability),
+  ])
+
+  return { ok: true, value: { granted: true, capability: row.signup_capability, receiptId } }
+}
+
+/**
  * Close the door. New self-grants fail immediately; existing provisional grants KEEP
  * WORKING until review rules on them.
  *

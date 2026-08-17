@@ -15,7 +15,7 @@ import { describe, expect, it } from 'vitest'
 import type { Env } from '../src/types'
 import {
   openDoor, getOpenDoor, selfGrant, closeDoor,
-  listPendingReceipts, applyDisposition, crystallizeDoor,
+  listPendingReceipts, applyDisposition, crystallizeDoor, grantSignupDefault,
 } from '../src/onboarding/doors'
 import { createSqliteD1 } from './helpers/sqlite-d1'
 
@@ -44,6 +44,16 @@ function makeDb() {
         .get(memberId, 'squad', scopeId) as { capability: string; provisional_door_id: string | null } | undefined,
     capCount: (memberId: string) =>
       (harness.sqlite.prepare('SELECT COUNT(*) AS n FROM capabilities WHERE member_id = ?').get(memberId) as { n: number }).n,
+    orgCap: (memberId: string) =>
+      harness.sqlite
+        .prepare("SELECT capability, provisional_door_id FROM capabilities WHERE member_id = ? AND scope_type = 'org' AND scope_id IS NULL")
+        .get(memberId) as { capability: string; provisional_door_id: string | null } | undefined,
+    seedOrgCap: (memberId: string, capability: string) =>
+      harness.sqlite
+        .prepare("INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES (?, ?, 'org', NULL, ?)")
+        .run(`orgcap-${memberId}`, memberId, capability),
+    setSignupCapability: (doorId: string, capability: string) =>
+      harness.sqlite.prepare('UPDATE onboarding_doors SET signup_capability = ? WHERE id = ?').run(capability, doorId),
     seedCap: (memberId: string, scopeId: string, capability: string) =>
       harness.sqlite
         .prepare("INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES (?, ?, 'squad', ?, ?)")
@@ -279,5 +289,70 @@ describe('crystallize — Athena approves, and the access stops being provisiona
     const again = await applyDisposition(db.env, receipt.id, 'revoked', 'agent:athena')
     expect(again.ok).toBe(false)
     if (!again.ok) expect(again.error).toBe('already_disposed')
+  })
+})
+
+describe('signup default — the half of OAuth onboarding that was missing', () => {
+  it('grants nothing when no door is open (today\'s behaviour, unchanged)', async () => {
+    const db = makeDb()
+    const r = await grantSignupDefault(db.env, SUBJECT)
+    expect(r.ok).toBe(true)
+    if (r.ok) expect(r.value.granted).toBe(false)
+    expect(db.capCount(SUBJECT)).toBe(0)
+  })
+
+  it('grants nothing when a door is open but signup_capability is unset', async () => {
+    const db = makeDb()
+    await open(db) // signup_capability defaults to NULL
+    const r = await grantSignupDefault(db.env, SUBJECT)
+    if (r.ok) expect(r.value.granted).toBe(false)
+    // Merging this migration must not open a pot by itself. Opening is an explicit act.
+    expect(db.capCount(SUBJECT)).toBe(0)
+  })
+
+  it('grants the owner-configured capability, with a receipt, when configured', async () => {
+    const db = makeDb()
+    const door = await open(db)
+    db.setSignupCapability(door.id, 'member')
+
+    const r = await grantSignupDefault(db.env, SUBJECT)
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.value.granted).toBe(true)
+      expect(r.value.capability).toBe('member')
+    }
+    // THIS is the 403 disappearing: the new user now holds real, usable access.
+    expect(db.orgCap(SUBJECT)?.capability).toBe('member')
+    expect(db.orgCap(SUBJECT)?.provisional_door_id).toBe(door.id)
+
+    const pending = await listPendingReceipts(db.env, door.id)
+    expect(pending).toHaveLength(1)
+    expect(pending[0]).toMatchObject({ scope_type: 'org', capability_after: 'member' })
+  })
+
+  it('never overwrites access the member already has', async () => {
+    const db = makeDb()
+    const door = await open(db)
+    db.setSignupCapability(door.id, 'observer')
+    db.seedOrgCap(SUBJECT, 'lead') // earned earlier, by some other path
+
+    const r = await grantSignupDefault(db.env, SUBJECT)
+    if (r.ok) expect(r.value.granted).toBe(false)
+    // A returning user must not be knocked back to the signup default by logging in again.
+    expect(db.orgCap(SUBJECT)?.capability).toBe('lead')
+  })
+
+  it('a signup grant reverses through the same review path as any other receipt', async () => {
+    const db = makeDb()
+    const door = await open(db)
+    db.setSignupCapability(door.id, 'member')
+    await grantSignupDefault(db.env, SUBJECT)
+    await closeDoor(db.env, door.id, 'member-owner')
+
+    const [receipt] = await listPendingReceipts(db.env, door.id)
+    await applyDisposition(db.env, receipt.id, 'revoked', 'agent:athena', 'not needed')
+
+    // capability_before was NULL, so revoking removes it entirely — baseline restored.
+    expect(db.orgCap(SUBJECT)).toBeUndefined()
   })
 })

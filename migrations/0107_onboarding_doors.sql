@@ -46,6 +46,20 @@ CREATE TABLE IF NOT EXISTS onboarding_doors (
   -- authority generator rather than fine-grained access. Opening it must be a conscious act.
   allowed_scopes TEXT NOT NULL DEFAULT '["squad"]'
                  CHECK (json_valid(allowed_scopes) AND json_type(allowed_scopes) = 'array'),
+  -- WHAT A BRAND-NEW OAUTH LOGIN RECEIVES. This is the column that actually opens the
+  -- product: findOrCreateMember writes a members row and NOTHING else ("C6 zero
+  -- capabilities", oauth-authorize.ts), so today a Google user lands with an identity and
+  -- no access and 403s on every surface. That is not a strict gate, it is half-implemented
+  -- onboarding — the invite path writes member + capability + token in one batch.
+  --
+  -- NULL means grant nothing, which is EXACTLY today's behaviour. So a pot with no open
+  -- door, or a door that leaves this NULL, is unchanged. Opening the product is an
+  -- explicit, owner-set value, never a side effect of this migration landing.
+  --
+  -- Scope is org because a brand-new user belongs to no squad yet; 'observer' or 'member'
+  -- at org scope is what makes the dashboard usable at all. 'admin'/'owner' are excluded.
+  signup_capability TEXT
+                 CHECK (signup_capability IS NULL OR signup_capability IN ('observer', 'member', 'lead')),
   opened_by      TEXT NOT NULL,
   opened_at      TEXT NOT NULL DEFAULT (datetime('now')),
   closed_by      TEXT,
@@ -82,7 +96,10 @@ CREATE TABLE IF NOT EXISTS door_receipts (
   subject_member_id  TEXT NOT NULL,
   scope_type         TEXT NOT NULL CHECK (scope_type IN ('org', 'department', 'squad')),
   scope_id           TEXT,
-  action             TEXT NOT NULL CHECK (action IN ('self_grant', 'agent_create')),
+  -- 'signup_default' is OWNER-CONFIGURED, not self-selected: the capability a brand-new
+  -- OAuth login receives so the product is usable at all. Recorded as a receipt like
+  -- everything else, so it reviews, expires and reverses through the same single path.
+  action             TEXT NOT NULL CHECK (action IN ('self_grant', 'agent_create', 'signup_default')),
   -- THE RESTORE KEY. NULL means "no grant existed" — so rejecting restores by DELETING;
   -- a non-NULL value means a grant was overwritten and rejecting must write it back.
   capability_before  TEXT,
