@@ -1906,13 +1906,36 @@ const toolFlightDispatch: ToolSpec = {
       // executor === dispatcher (the non-delegated, default case) this is the
       // exact same value as before; behaviour is unchanged for every existing
       // caller.
-      const caps = [executorAgent.budget_cap_cents, ...referencedSquads.map((item) => item.budget_cap_cents)]
-      if (caps.some((cap) => typeof cap !== 'number' || !Number.isSafeInteger(cap) || cap <= 0)) {
-        return fail(409, 'flight_budget_policy_missing')
+      // Every row in this set must carry a cap — the ceiling is the MINIMUM, so
+      // one unset row is genuinely unsafe and the AND is correct. What was wrong
+      // was the silence: budget_cap_cents is nullable with no default on both
+      // agents and squads (0009_work_unit.sql), and create_agent/create_squad
+      // leave it null whenever the caller omits it. So the common case is an
+      // undifferentiated 409 naming none of the rows the caller must go and fix,
+      // for a set the caller cannot see. Name them. (mupot#1148)
+      const budgetSources = [
+        { kind: 'agent' as const, id: executorAgent.id, slug: executorAgent.slug, cap: executorAgent.budget_cap_cents },
+        ...referencedSquads.map((item) => (
+          { kind: 'squad' as const, id: item.id, slug: item.slug, cap: item.budget_cap_cents }
+        )),
+      ]
+      const unconfigured = budgetSources.filter(
+        (source) => typeof source.cap !== 'number' || !Number.isSafeInteger(source.cap) || source.cap <= 0,
+      )
+      if (unconfigured.length > 0) {
+        return fail(409, 'flight_budget_policy_missing', {
+          unconfigured: unconfigured.map((source) => ({ kind: source.kind, id: source.id, slug: source.slug })),
+        })
       }
-      budgetCeilingMicroUsd = Math.min(...(caps as number[])) * 10_000
+      const binding = budgetSources.reduce((lowest, source) => (
+        (source.cap as number) < (lowest.cap as number) ? source : lowest
+      ))
+      budgetCeilingMicroUsd = (binding.cap as number) * 10_000
       if ((requestedBudget as number) > budgetCeilingMicroUsd) {
-        return fail(409, 'flight_budget_exceeds_cap', { cap_micro_usd: budgetCeilingMicroUsd })
+        return fail(409, 'flight_budget_exceeds_cap', {
+          cap_micro_usd: budgetCeilingMicroUsd,
+          binding: { kind: binding.kind, id: binding.id, slug: binding.slug },
+        })
       }
     }
     const references = await validateFlightMetaReferences(env, meta, projectId)

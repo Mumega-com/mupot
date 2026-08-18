@@ -348,6 +348,7 @@ function makeEnv(
   } as unknown as Env
   return {
     env,
+    squads,
     delivered,
     rows,
     tasks,
@@ -649,6 +650,123 @@ describe('MCP flight tools', () => {
       budget_micro_usd: 500_000,
     }, 'https://pot.example')
     expect(withinExecutorCap.ok, JSON.stringify(withinExecutorCap)).toBe(true)
+  })
+
+  // ── flight_budget_policy_missing names the rows (mupot#1148) ─────────────────
+  // budget_cap_cents is nullable with no default on BOTH agents and squads
+  // (0009_work_unit.sql), and create_agent/create_squad leave it null whenever
+  // the caller omits it — so the common case is an entity with no cap. The gate
+  // ANDs the executor agent against EVERY referenced squad, which is correct
+  // (the ceiling is the minimum, so one unset row really is unsafe), but it used
+  // to return a bare 409 naming nothing. The caller then had to guess which of
+  // N+1 rows to fix, across a set they cannot enumerate. Dara burned a whole
+  // FLIGHT-06 on this: budget_micro_usd of 4000000, 400000 and 1 all failed
+  // identically, because the value is never reached — this gate fires first.
+
+  it('names every unconfigured row when the executor agent has no budget cap', async () => {
+    const { env } = makeEnv('active', false, [
+      { id: DELEGATE_AGENT_ID, squad_id: SQUAD_ID, status: 'active', budget_cap_cents: null },
+    ])
+    const leadAuth = auth({
+      capabilities: [{ member_id: MEMBER_ID, scope_type: 'squad', scope_id: SQUAD_ID, capability: 'lead' }],
+    })
+    const result = await invokeTool(leadAuth, env, 'flight_dispatch', {
+      ...dispatchArgs,
+      executor_agent_id: DELEGATE_AGENT_ID,
+      budget_micro_usd: 500_000,
+    }, 'https://pot.example')
+
+    expect(result).toMatchObject({ ok: false, status: 409, error: 'flight_budget_policy_missing' })
+    // The squad IS configured (100), so only the agent may be named — otherwise
+    // the caller is sent to fix a row that is already correct.
+    expect((result as { detail: { unconfigured: unknown[] } }).detail.unconfigured).toEqual([
+      { kind: 'agent', id: DELEGATE_AGENT_ID, slug: DELEGATE_AGENT_ID },
+    ])
+  })
+
+  it('names the squad when the squad is the row without a budget cap', async () => {
+    const { env, squads } = makeEnv()
+    squads.set(SQUAD_ID, { ...squads.get(SQUAD_ID)!, budget_cap_cents: null as never })
+    const leadAuth = auth({
+      capabilities: [{ member_id: MEMBER_ID, scope_type: 'squad', scope_id: SQUAD_ID, capability: 'lead' }],
+    })
+    const result = await invokeTool(leadAuth, env, 'flight_dispatch', {
+      ...dispatchArgs,
+      budget_micro_usd: 500_000,
+    }, 'https://pot.example')
+
+    expect(result).toMatchObject({ ok: false, status: 409, error: 'flight_budget_policy_missing' })
+    expect((result as { detail: { unconfigured: unknown[] } }).detail.unconfigured).toEqual([
+      { kind: 'squad', id: SQUAD_ID, slug: 'mmhq' },
+    ])
+  })
+
+  it('names BOTH rows when agent and squad are each unconfigured — not just the first', async () => {
+    // The whole point of the detail is that the caller can fix everything in one
+    // pass. A first-match-only report would send them round the loop twice.
+    const { env, squads } = makeEnv('active', false, [
+      { id: DELEGATE_AGENT_ID, squad_id: SQUAD_ID, status: 'active', budget_cap_cents: null },
+    ])
+    squads.set(SQUAD_ID, { ...squads.get(SQUAD_ID)!, budget_cap_cents: null as never })
+    const leadAuth = auth({
+      capabilities: [{ member_id: MEMBER_ID, scope_type: 'squad', scope_id: SQUAD_ID, capability: 'lead' }],
+    })
+    const result = await invokeTool(leadAuth, env, 'flight_dispatch', {
+      ...dispatchArgs,
+      executor_agent_id: DELEGATE_AGENT_ID,
+      budget_micro_usd: 500_000,
+    }, 'https://pot.example')
+
+    expect(result).toMatchObject({ ok: false, status: 409, error: 'flight_budget_policy_missing' })
+    expect((result as { detail: { unconfigured: Array<{ kind: string }> } }).detail.unconfigured).toEqual([
+      { kind: 'agent', id: DELEGATE_AGENT_ID, slug: DELEGATE_AGENT_ID },
+      { kind: 'squad', id: SQUAD_ID, slug: 'mmhq' },
+    ])
+  })
+
+  it('a zero or negative cap is unconfigured, not a cap of zero', async () => {
+    const { env } = makeEnv('active', false, [
+      { id: DELEGATE_AGENT_ID, squad_id: SQUAD_ID, status: 'active', budget_cap_cents: 0 },
+    ])
+    const leadAuth = auth({
+      capabilities: [{ member_id: MEMBER_ID, scope_type: 'squad', scope_id: SQUAD_ID, capability: 'lead' }],
+    })
+    const result = await invokeTool(leadAuth, env, 'flight_dispatch', {
+      ...dispatchArgs,
+      executor_agent_id: DELEGATE_AGENT_ID,
+      budget_micro_usd: 1,
+    }, 'https://pot.example')
+
+    expect(result).toMatchObject({ ok: false, status: 409, error: 'flight_budget_policy_missing' })
+    expect((result as { detail: { unconfigured: Array<{ kind: string }> } }).detail.unconfigured)
+      .toEqual([{ kind: 'agent', id: DELEGATE_AGENT_ID, slug: DELEGATE_AGENT_ID }])
+  })
+
+  it('flight_budget_exceeds_cap names WHICH row is the binding constraint', async () => {
+    // cap_micro_usd alone tells the caller the number but not whose it is. With
+    // the executor at 50 and the squad at 100, the ceiling is 500_000 — and the
+    // row to go and raise is the agent, which the bare cap value never said.
+    const { env } = makeEnv('active', false, [
+      { id: DELEGATE_AGENT_ID, squad_id: SQUAD_ID, status: 'active', budget_cap_cents: 50 },
+    ])
+    const leadAuth = auth({
+      capabilities: [{ member_id: MEMBER_ID, scope_type: 'squad', scope_id: SQUAD_ID, capability: 'lead' }],
+    })
+    const result = await invokeTool(leadAuth, env, 'flight_dispatch', {
+      ...dispatchArgs,
+      executor_agent_id: DELEGATE_AGENT_ID,
+      budget_micro_usd: 600_000,
+    }, 'https://pot.example')
+
+    expect(result).toMatchObject({
+      ok: false,
+      status: 409,
+      error: 'flight_budget_exceeds_cap',
+      detail: {
+        cap_micro_usd: 500_000,
+        binding: { kind: 'agent', id: DELEGATE_AGENT_ID, slug: DELEGATE_AGENT_ID },
+      },
+    })
   })
 
   // ── signals_json casing (mupot#940) ───────────────────────────────────────────
