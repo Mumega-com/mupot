@@ -5,6 +5,18 @@
 -- observer|member|lead|admin. Honouring the input (mupot#1161 repair) would
 -- fail the CHECK on 'admin'. Widen to the Capability union used everywhere
 -- else. Existing rows stay as they are (almost all 'member' from the clamp).
+--
+-- PRAGMA foreign_keys = off/on below is DECORATIVE ON D1. wrangler d1
+-- migrations apply runs this file in one transaction; SQLite ignores
+-- PRAGMA foreign_keys inside an open transaction (0049, 0069, 0071, AGENTS.md).
+-- Enforcement stays ON. The INSERT therefore FK-checks every copied row
+-- against agents and squads. An orphan aborts the migration on production
+-- while passing locally, where the PRAGMA actually works.
+--
+-- Measured mumega 2026-08-18: 46 memberships, 0 orphan_agent, 0 orphan_squad.
+-- Digid and Viamar were NOT measured from this seat. Do not depend on that.
+-- Copy only rows whose parents exist. Orphans are dropped, not fatal.
+-- New orphans cannot accumulate while CASCADE is enforced (0112).
 
 PRAGMA foreign_keys = off;
 
@@ -18,7 +30,10 @@ CREATE TABLE memberships_new (
 );
 
 INSERT INTO memberships_new (id, agent_id, squad_id, capability)
-SELECT id, agent_id, squad_id, capability FROM memberships;
+SELECT m.id, m.agent_id, m.squad_id, m.capability
+  FROM memberships m
+ WHERE EXISTS (SELECT 1 FROM agents a WHERE a.id = m.agent_id)
+   AND EXISTS (SELECT 1 FROM squads s WHERE s.id = m.squad_id);
 
 DROP TABLE memberships;
 ALTER TABLE memberships_new RENAME TO memberships;

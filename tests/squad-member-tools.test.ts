@@ -705,3 +705,48 @@ describe('authorizeSquadMembershipWrite source still contains each check (delete
     expect(src).toMatch(/hasCapability\(/)
   })
 })
+
+describe('0111 memberships rebuild is defensive on D1 (FK pragma is a no-op)', () => {
+  const migration = readFileSync(join(MIGRATIONS_DIR, '0111_memberships_capability_admin.sql'), 'utf8')
+
+  it('says the PRAGMA is decorative on D1 — so nobody re-relies on it', () => {
+    expect(migration).toMatch(/DECORATIVE ON D1/)
+    expect(migration).toMatch(/PRAGMA foreign_keys inside an open transaction/)
+  })
+
+  it('copies only rows whose agent and squad parents exist', () => {
+    expect(migration).toMatch(
+      /WHERE EXISTS \(SELECT 1 FROM agents a WHERE a\.id = m\.agent_id\)/,
+    )
+    expect(migration).toMatch(
+      /AND EXISTS \(SELECT 1 FROM squads s WHERE s\.id = m\.squad_id\)/,
+    )
+  })
+
+  it('the 0111 INSERT SELECT drops an orphan rather than aborting', () => {
+    harness.sqlite.exec('PRAGMA foreign_keys = OFF')
+    harness.sqlite.exec(`
+      INSERT INTO memberships (id, agent_id, squad_id, capability)
+      VALUES ('mem-orphan-0111', 'agent-does-not-exist', 'squad-does-not-exist', 'member');
+    `)
+    harness.sqlite.exec(`
+      CREATE TABLE memberships_orphan_probe (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        squad_id TEXT NOT NULL,
+        capability TEXT NOT NULL
+      );
+    `)
+    const insert = migration.match(/INSERT INTO memberships_new[\s\S]*?;/)?.[0]
+    if (!insert) throw new Error('0111 INSERT not found')
+    harness.sqlite.exec(insert.replaceAll('memberships_new', 'memberships_orphan_probe'))
+    const copied = harness.sqlite.prepare(
+      'SELECT id FROM memberships_orphan_probe WHERE id = ?',
+    ).get('mem-orphan-0111')
+    expect(copied).toBeUndefined()
+    const kept = harness.sqlite.prepare(
+      'SELECT COUNT(*) AS n FROM memberships_orphan_probe',
+    ).get() as { n: number }
+    expect(kept.n).toBeGreaterThan(0)
+  })
+})

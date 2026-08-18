@@ -11,7 +11,8 @@
 -- the same way it fires here. Verified against node:sqlite with
 -- PRAGMA foreign_keys=ON: DELETE parent → child gone AND this trigger wrote
 -- a removal receipt. Fallback (transactional revoke, no cascade) is not
--- required.
+-- 0111 admits the same fact and copies with WHERE EXISTS so a no-op PRAGMA
+-- cannot abort the rebuild on an orphan. 0112 relies on enforcement staying ON.
 --
 -- Covers cascade and direct DELETE identically. Application-level remove
 -- receipts still record the operator; this trigger records the row death
