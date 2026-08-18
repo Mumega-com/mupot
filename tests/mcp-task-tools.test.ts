@@ -810,6 +810,140 @@ describe('MCP task cutover tools', () => {
     expect(updates).toHaveLength(0)
   })
 
+  // ── reassigning an EXISTING gate on a REVIEW task ────────────────────────────
+  // Measured blocker: cb512f05 (FLIGHT-06 L2) sits at status='review' with
+  // gate_owner='gate:agent-self-completion' and no supported call can move it —
+  // the historical-repair hatch requires gate_owner IS NULL. The lock itself is
+  // deliberate (BLOCK-2, proof-of-exploit 2026-08-13: re-gating into a peer's
+  // lane let two colluding agents launder a single-gate check, proven live), so
+  // the recovery path is narrow and every condition below is load-bearing.
+
+  const ADMIN_AUTH = () => auth({
+    capabilities: [{ member_id: MEMBER_ID, scope_type: 'org', scope_id: null, capability: 'admin' }],
+  })
+
+  it('an ordinary member CANNOT reassign the gate on a review task, reason or not', async () => {
+    const { env, updates } = makeEnv([task({ status: 'review', gate_owner: 'gate:agent-self-completion' })])
+    const res = await invokeTool(
+      auth(),
+      env,
+      'task_update',
+      { task_id: 'task-1', gate_owner: 'gate:athena', gate_owner_reason: 'looks stuck to me' },
+      URL,
+    )
+    // A supplied reason must not buy a member the capability. If this ever
+    // returns ok, gate laundering is live again.
+    expect(res.ok).toBe(false)
+    expect(res.error).toBe('gate_owner_locked')
+    expect(updates).toHaveLength(0)
+  })
+
+  it('an org admin CAN reassign the gate on a review task with a reason, and a receipt is written', async () => {
+    const { env, updates } = makeEnv(
+      [task({ status: 'review', gate_owner: 'gate:agent-self-completion' })],
+      {},
+      {},
+      { gateGrants: { 'gate:athena': ['agent-other'] } },
+    )
+    const res = await invokeTool(
+      ADMIN_AUTH(),
+      env,
+      'task_update',
+      {
+        task_id: 'task-1',
+        gate_owner: 'gate:athena',
+        gate_owner_reason: 'original holder retired; re-gating to athena',
+      },
+      URL,
+    )
+
+    expect(res.ok, JSON.stringify(res)).toBe(true)
+    const result = res.result as { task: Task }
+    expect(result.task.gate_owner).toBe('gate:athena')
+    // NO status/result/verdict movement — this path must never stand in for a verdict.
+    expect(result.task.status).toBe('review')
+    expect(result.task.result).toBeNull()
+
+    const receipt = updates.find((u) => u.sql.includes('gate_owner_reassignments'))
+    expect(receipt, 'no reassignment receipt written').toBeTruthy()
+    // The from/to pair is the whole point of the receipt: a record that says
+    // only "the gate changed" cannot show a laundering attempt.
+    expect(receipt!.args).toContain('gate:agent-self-completion')
+    expect(receipt!.args).toContain('gate:athena')
+    expect(receipt!.args).toContain('original holder retired; re-gating to athena')
+    expect(receipt!.args).toContain(MEMBER_ID)
+  })
+
+  it('an org admin WITHOUT a reason is refused, and told it is the reason that is missing', async () => {
+    const { env, updates } = makeEnv([task({ status: 'review', gate_owner: 'gate:agent-self-completion' })])
+    const res = await invokeTool(
+      ADMIN_AUTH(),
+      env,
+      'task_update',
+      { task_id: 'task-1', gate_owner: 'gate:athena' },
+      URL,
+    )
+    // Deliberately NOT gate_owner_locked: reporting a status problem when the
+    // status is fine sends the caller to fix the wrong thing.
+    expect(res.ok).toBe(false)
+    expect(res.error).toBe('gate_owner_reason_required')
+    expect(updates).toHaveLength(0)
+  })
+
+  it('a whitespace-only reason does not count as a reason', async () => {
+    const { env, updates } = makeEnv([task({ status: 'review', gate_owner: 'gate:agent-self-completion' })])
+    const res = await invokeTool(
+      ADMIN_AUTH(),
+      env,
+      'task_update',
+      { task_id: 'task-1', gate_owner: 'gate:athena', gate_owner_reason: '   ' },
+      URL,
+    )
+    expect(res.ok).toBe(false)
+    expect(res.error).toBe('gate_owner_reason_required')
+    expect(updates).toHaveLength(0)
+  })
+
+  it('the reassignment path does NOT extend to already-decided work', async () => {
+    // review is recoverable; approved/rejected/done are not. Rewriting the gate
+    // on decided work would let an owner retro-attribute a verdict.
+    for (const status of ['approved', 'rejected', 'done'] as const) {
+      const { env, updates } = makeEnv([task({ status, gate_owner: 'gate:agent-self-completion' })])
+      const res = await invokeTool(
+        ADMIN_AUTH(),
+        env,
+        'task_update',
+        { task_id: 'task-1', gate_owner: 'gate:athena', gate_owner_reason: 'because' },
+        URL,
+      )
+      expect(res.ok, `status ${status} must stay locked`).toBe(false)
+      expect(res.error).toBe('gate_owner_locked')
+      expect(updates).toHaveLength(0)
+    }
+  })
+
+  it('the NEW gate owner is woken — a reassignment leaves the task as stuck as before otherwise', async () => {
+    // The entering-review wake cannot cover this: its guard is
+    // `existing.status !== 'review'`, and a reassignment happens on a task that
+    // is ALREADY in review.
+    const { env, events } = makeEnv(
+      [task({ status: 'review', gate_owner: 'gate:agent-self-completion' })],
+      {},
+      {},
+      { gateGrants: { 'gate:athena': ['agent-other'] } },
+    )
+    const res = await invokeTool(
+      ADMIN_AUTH(),
+      env,
+      'task_update',
+      { task_id: 'task-1', gate_owner: 'gate:athena', gate_owner_reason: 'holder retired' },
+      URL,
+    )
+    expect(res.ok, JSON.stringify(res)).toBe(true)
+    const wakes = events.filter((e) => (e as { type?: string }).type === 'agent.wake')
+    expect(wakes.length, 'new gate owner was never woken').toBeGreaterThan(0)
+  })
+
   it('BLOCK-2 fix: member cannot re-gate a gated open task to another lane (gate laundering blocked)', async () => {
     const { env, updates } = makeEnv([task({ status: 'open', gate_owner: 'gate:kasra-core' })])
     const res = await invokeTool(auth(), env, 'task_update', { task_id: 'task-1', gate_owner: 'gate:athena' }, URL)
