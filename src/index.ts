@@ -363,6 +363,12 @@ export default {
     // 11. Token expiry warning (Flight-002) — sweep active tokens expiring within 7 days
     //     and emit proactive warning bus events (pages seat/operator before silent stall).
     const { sweepExpiringTokensWarning } = await import('./auth/token-lifecycle')
+    // 12. Flight watchdog (mupot#1138) — reap flights that blew their execution or
+    //     wake deadline. Reaps as the system actor 'mupot-watchdog'; 'escalate'
+    //     (human review gate open >24h) is counted, never reaped. Requires the
+    //     flight_reap_receipts table (migration 0109) to exist, or every reap
+    //     would transition a flight with no audit trail.
+    const { sweepStalledFlights } = await import('./flight/watchdog')
     const maintenance: ReadonlyArray<readonly [string, () => Promise<unknown>]> = [
       ['membership', () => reconcileMembership(env)],
       ['metabolism', () => runMetabolism(env)],
@@ -375,6 +381,7 @@ export default {
       ['project-loop', () => runProjectLoopTick(env, {})],
       ['agent-connection-retention', () => sweepAgentConnectionRetention(env)],
       ['token-expiry-warning', () => sweepExpiringTokensWarning(env)],
+      ['flight-watchdog', () => sweepStalledFlights(env)],
     ]
     const heartbeat = maintenance[maintenanceSlot(scheduledAt.getUTCMinutes(), maintenance.length)]
     if (heartbeat) waitFor(heartbeat[0], heartbeat[1]())

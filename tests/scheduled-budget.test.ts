@@ -176,4 +176,40 @@ describe('scheduled invocation budget', () => {
       error.mockRestore()
     }
   })
+
+  it('the LIVE handler routes minute 16 to flight-watchdog, and minute 15 still reaches token-expiry-warning', async () => {
+    // The wiring assertion for the twelfth heartbeat. Same reasoning as the minute-15 case above:
+    // a fan-out COUNT at minute 16 is 1 whether or not flight-watchdog is in the array, because
+    // SOME heartbeat always fires. Only the route NAME distinguishes wired from not-wired.
+    //
+    // Minute 16 is the slot-11 minute for a twelve-entry array: maintenanceSlot(16, 12) =
+    // (1*10 + 1) % 12 = 11. If the entry is dropped, appended in the wrong position, or the array
+    // changes length, this route disappears and the test fails.
+    //
+    // The second assertion is the regression guard that actually matters: appending a twelfth
+    // heartbeat SHIFTS the modulus. token-expiry-warning (#1146, slot 10) was dead in production
+    // once already, and re-breaking it by appending below it would otherwise be silent.
+    const info = vi.spyOn(console, 'info').mockImplementation(() => undefined)
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    try {
+      // Distinct hours: reportScheduledDispatch buckets observations per hour, so reusing an
+      // hour already driven above would suppress the emission and pass vacuously.
+      await scheduledFanout(16, MAINTENANCE_CRON, 5)
+      const watchdogRoutes = info.mock.calls
+        .filter(([tag]) => tag === '[scheduled:dispatch]')
+        .map(([, payload]) => (payload as { route?: string }).route)
+      expect(watchdogRoutes).toContain('flight-watchdog')
+
+      info.mockClear()
+      await scheduledFanout(15, MAINTENANCE_CRON, 7)
+      const expiryRoutes = info.mock.calls
+        .filter(([tag]) => tag === '[scheduled:dispatch]')
+        .map(([, payload]) => (payload as { route?: string }).route)
+      expect(expiryRoutes).toContain('token-expiry-warning')
+      expect(expiryRoutes).not.toContain('flight-watchdog')
+    } finally {
+      info.mockRestore()
+      error.mockRestore()
+    }
+  })
 })

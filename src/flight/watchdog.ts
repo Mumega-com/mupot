@@ -12,8 +12,12 @@
 //    - Only dispatched_by_agent_id, flight.agent, squad:lead on flight squad, org:admin,
 //      or system actor ('mupot-watchdog') may trigger a reap. Zero hardcoded name literals.
 // 3. Complete Auditability:
-//    - Every reap writes an immutable 'flight.reaped' event to flight_event_outbox
-//      capturing actor, reason, age_ms, previous status, and timestamp.
+//    - Every reap writes an immutable receipt to the flight_reap_receipts table
+//      (migration 0109) capturing actor, reason, age_ms, previous status, and
+//      timestamp. NOT flight_event_outbox: that table's flusher
+//      (deliverFlightLandedEvent) selects undelivered rows with no event_type
+//      filter and emits a hardcoded type:'flight.landed', so a reap parked there
+//      would be broadcast as a successful landing (mupot#1132 / #1147).
 
 import type { Env } from '../types'
 import type { FlightRow, FlightStatus } from './service'
@@ -160,10 +164,30 @@ export function evaluateFlightLiveness(
 /**
  * Scan database for non-terminal flights and evaluate liveness.
  */
-export async function listStalledFlights(
+export interface FlightStalledScan {
+  items: Array<{ flight: FlightRow; evaluation: FlightWatchdogEvaluation }>
+  /** Rows the candidate query actually returned, BEFORE liveness filtering. */
+  scanned: number
+  /** The LIMIT the candidate query ran under. */
+  limit: number
+  /**
+   * scanned === limit, so there may be further live flights this pass never
+   * looked at. The sweep is PARTIAL and must say so — a silently truncated
+   * scan reads exactly like a clean one that found nothing more.
+   */
+  capped: boolean
+}
+
+/**
+ * Scan for stalled flights, reporting whether the candidate window was capped.
+ *
+ * The LIMIT here errs SAFE: a capped scan under-reaps, it never false-clears.
+ * But it must not be silent. See sweepStalledFlights.
+ */
+export async function scanStalledFlights(
   env: Env,
   opts: { nowMs?: number; limit?: number } = {},
-): Promise<Array<{ flight: FlightRow; evaluation: FlightWatchdogEvaluation }>> {
+): Promise<FlightStalledScan> {
   const nowMs = opts.nowMs ?? Date.now()
   const limit = Math.min(Math.max(opts.limit ?? 100, 1), 500)
 
@@ -180,16 +204,24 @@ export async function listStalledFlights(
     .bind(env.TENANT_SLUG, limit)
     .all<FlightRow>()
 
-  const stalled: Array<{ flight: FlightRow; evaluation: FlightWatchdogEvaluation }> = []
+  const candidates = rows.results ?? []
+  const items: Array<{ flight: FlightRow; evaluation: FlightWatchdogEvaluation }> = []
 
-  for (const flight of rows.results ?? []) {
+  for (const flight of candidates) {
     const evaluation = evaluateFlightLiveness(flight, nowMs)
     if (evaluation.action === 'reap' || evaluation.action === 'escalate') {
-      stalled.push({ flight, evaluation })
+      items.push({ flight, evaluation })
     }
   }
 
-  return stalled
+  return { items, scanned: candidates.length, limit, capped: candidates.length >= limit }
+}
+
+export async function listStalledFlights(
+  env: Env,
+  opts: { nowMs?: number; limit?: number } = {},
+): Promise<Array<{ flight: FlightRow; evaluation: FlightWatchdogEvaluation }>> {
+  return (await scanStalledFlights(env, opts)).items
 }
 
 export interface ReapPrincipalContext {
@@ -406,5 +438,98 @@ export async function reapStalledFlight(
     age_ms: evalResult.ageMs,
     reason: gateReason,
     receipt,
+  }
+}
+
+/** Actor the scheduled sweep reaps as. Authorized by canReapFlight branch 1. */
+export const WATCHDOG_SYSTEM_ACTOR: FlightActor = { kind: 'system', id: 'mupot-watchdog' }
+
+export interface FlightWatchdogSweepResult {
+  /** Flights the liveness predicate flagged (reap + escalate). */
+  candidates: number
+  reaped: number
+  /** Flagged 'escalate' — counted and reported, NEVER reaped. */
+  escalated: number
+  /** Reap attempted and refused/errored. Does not abort the sweep. */
+  failed: number
+  /** The scan hit its LIMIT: this pass is PARTIAL, not a clean sweep. */
+  capped: boolean
+  scanned: number
+  limit: number
+}
+
+/**
+ * The scheduled sweep: find stalled flights and reap them as the system actor.
+ *
+ * Three properties this deliberately holds, each of which has already cost us
+ * something when absent elsewhere:
+ *
+ * 1. ESCALATE IS NEVER REAPED. listStalledFlights returns both actions; only
+ *    'reap' is acted on. 'escalate' means a human review gate has been open too
+ *    long (>24h) — a slow human is not a dead flight. reapStalledFlight would
+ *    refuse a 'waiting' flight anyway, but relying on that would make the
+ *    invariant a downstream accident instead of a local guarantee.
+ *
+ * 2. FAIL-SOFT PER FLIGHT. One flight that errors must not abort the pass and
+ *    strand every flight behind it. Failures are counted, not thrown.
+ *
+ * 3. A CAPPED SCAN SAYS SO. The candidate LIMIT errs safe (under-reaps, never
+ *    false-clears) but a truncated pass otherwise reports identically to a
+ *    complete one — 'reaped 3' reads as 'and that was all of them'. When the
+ *    scan is capped, that is logged explicitly.
+ *
+ * Nothing here reasons from ABSENCE. Every reap is driven by a flight row that
+ * is present and whose own timestamps are the evidence — never by a row failing
+ * to appear in a bounded window, which can mean 'outside the window' rather
+ * than 'gone'. See mupot#1138 for why that distinction is load-bearing.
+ */
+export async function sweepStalledFlights(
+  env: Env,
+  opts: { nowMs?: number; limit?: number } = {},
+): Promise<FlightWatchdogSweepResult> {
+  const nowMs = opts.nowMs ?? Date.now()
+  const scan = await scanStalledFlights(env, opts)
+
+  let reaped = 0
+  let escalated = 0
+  let failed = 0
+
+  for (const { flight, evaluation } of scan.items) {
+    if (evaluation.action === 'escalate') {
+      escalated += 1
+      continue
+    }
+
+    try {
+      const result = await reapStalledFlight(
+        env,
+        flight.id,
+        { actor: WATCHDOG_SYSTEM_ACTOR },
+        evaluation.reason,
+        nowMs,
+      )
+      if (result.transitioned) reaped += 1
+      else failed += 1
+    } catch {
+      // Fail-soft: a single bad flight must not strand the rest of the pass.
+      failed += 1
+    }
+  }
+
+  if (scan.capped) {
+    console.warn(
+      `[flight-watchdog] PARTIAL SWEEP — candidate scan hit its limit of ${scan.limit}; ` +
+        'further stalled flights were not evaluated this pass',
+    )
+  }
+
+  return {
+    candidates: scan.items.length,
+    reaped,
+    escalated,
+    failed,
+    capped: scan.capped,
+    scanned: scan.scanned,
+    limit: scan.limit,
   }
 }
