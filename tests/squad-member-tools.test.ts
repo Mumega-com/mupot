@@ -8,6 +8,7 @@ import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { invokeTool } from '../src/mcp'
 import { authorizeSquadMembershipWrite } from '../src/members/squad-membership'
+import { deleteAgent } from '../src/org/service'
 import type { AuthContext, CapabilityGrant, Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
@@ -303,11 +304,14 @@ describe('squad_member_add / remove / list (mupot#1161)', () => {
     ).get(AGENT_MEMBER_ID, TARGET_SQUAD_ID)
     expect(grant).toBeUndefined()
 
-    const receipt = harness.sqlite.prepare(
-      `SELECT action, result FROM membership_receipts
-        WHERE target_agent_id = ? AND action = 'remove'`,
-    ).get(AGENT_ID) as { action: string; result: string }
-    expect(receipt.result).toBe('removed')
+    const receipts = harness.sqlite.prepare(
+      `SELECT actor_member_id, result FROM membership_receipts
+        WHERE target_agent_id = ? AND action = 'remove' ORDER BY seq`,
+    ).all(AGENT_ID) as Array<{ actor_member_id: string; result: string }>
+    expect(receipts.every((row) => row.result === 'removed')).toBe(true)
+    expect(receipts.map((row) => row.actor_member_id).sort()).toEqual(
+      [OPERATOR_MEMBER_ID, 'system:cascade'].sort(),
+    )
   })
 
   it('refuses removing the home-squad membership', async () => {
@@ -387,6 +391,165 @@ describe('squad_member_add / remove / list (mupot#1161)', () => {
     expect(denial).toEqual({ ok: false, error: 'forbidden' })
   })
 
+  it('lead on the target may grant observer, member, and lead', async () => {
+    for (const capability of ['observer', 'member', 'lead'] as const) {
+      harness.sqlite.exec(
+        `DELETE FROM memberships WHERE agent_id = '${AGENT_ID}' AND squad_id = '${TARGET_SQUAD_ID}';
+         DELETE FROM capabilities WHERE member_id = '${AGENT_MEMBER_ID}' AND scope_id = '${TARGET_SQUAD_ID}';`,
+      )
+      const granted = await invokeTool(
+        leadAuth(),
+        env,
+        'squad_member_add',
+        { agent: AGENT_ID, squad: TARGET_SQUAD_ID, capability },
+        'https://pot.test',
+      )
+      expect(granted.ok, capability).toBe(true)
+    }
+  })
+
+  it('admin on the target may grant admin; lead may not', async () => {
+    const byAdmin = await invokeTool(
+      operatorAuth(),
+      env,
+      'squad_member_add',
+      { agent: AGENT_ID, squad: TARGET_SQUAD_ID, capability: 'admin' },
+      'https://pot.test',
+    )
+    expect(byAdmin.ok).toBe(true)
+
+    harness.sqlite.exec(
+      `DELETE FROM memberships WHERE agent_id = '${AGENT_ID}' AND squad_id = '${TARGET_SQUAD_ID}';
+       DELETE FROM capabilities WHERE member_id = '${AGENT_MEMBER_ID}' AND scope_id = '${TARGET_SQUAD_ID}';`,
+    )
+    const byLead = await invokeTool(
+      leadAuth(),
+      env,
+      'squad_member_add',
+      { agent: AGENT_ID, squad: TARGET_SQUAD_ID, capability: 'admin' },
+      'https://pot.test',
+    )
+    expect(byLead.ok).toBe(false)
+    if (byLead.ok) return
+    expect(byLead.error).toBe('cannot_grant_above_own_rank')
+  })
+
+  it('org-admin with no squad grant still adds — inheritance, not a local squad row', async () => {
+    const orgAdmin: AuthContext = {
+      ...operatorAuth(),
+      capabilities: [
+        {
+          member_id: OPERATOR_MEMBER_ID,
+          scope_type: 'org',
+          scope_id: null,
+          capability: 'admin',
+        },
+      ],
+    }
+    const granted = await invokeTool(
+      orgAdmin,
+      env,
+      'squad_member_add',
+      { agent: AGENT_ID, squad: TARGET_SQUAD_ID, capability: 'lead' },
+      'https://pot.test',
+    )
+    expect(granted.ok).toBe(true)
+  })
+
+  it('department-admin inherits onto a squad in that department', async () => {
+    const deptAdmin: AuthContext = {
+      ...operatorAuth(),
+      capabilities: [
+        {
+          member_id: OPERATOR_MEMBER_ID,
+          scope_type: 'department',
+          scope_id: DEPT_ID,
+          capability: 'admin',
+        },
+      ],
+    }
+    const granted = await invokeTool(
+      deptAdmin,
+      env,
+      'squad_member_add',
+      { agent: AGENT_ID, squad: TARGET_SQUAD_ID, capability: 'admin' },
+      'https://pot.test',
+    )
+    expect(granted.ok).toBe(true)
+  })
+
+  it('observer on the target cannot add', async () => {
+    const observer: AuthContext = {
+      ...leadAuth(),
+      capabilities: [
+        {
+          member_id: HADI_MEMBER_ID,
+          scope_type: 'squad',
+          scope_id: TARGET_SQUAD_ID,
+          capability: 'observer',
+        },
+      ],
+    }
+    const result = await invokeTool(
+      observer,
+      env,
+      'squad_member_add',
+      { agent: AGENT_ID, squad: TARGET_SQUAD_ID, capability: 'observer' },
+      'https://pot.test',
+    )
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error).toBe('forbidden')
+  })
+
+  it('lead on a different squad cannot add to the target', async () => {
+    const otherLead: AuthContext = {
+      ...leadAuth(),
+      capabilities: [
+        {
+          member_id: HADI_MEMBER_ID,
+          scope_type: 'squad',
+          scope_id: OTHER_SQUAD_ID,
+          capability: 'lead',
+        },
+      ],
+    }
+    const result = await invokeTool(
+      otherLead,
+      env,
+      'squad_member_add',
+      { agent: AGENT_ID, squad: TARGET_SQUAD_ID, capability: 'member' },
+      'https://pot.test',
+    )
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error).toBe('forbidden')
+  })
+
+  it('direct self-grant: boundAgentId equals the target even when the member has no binding', async () => {
+    const denial = await authorizeSquadMembershipWrite({
+      env,
+      auth: { ...operatorAuth(), boundAgentId: AGENT_ID },
+      targetAgentId: AGENT_ID,
+      squad: { id: TARGET_SQUAD_ID, department_id: DEPT_ID },
+      requestedCapability: 'member',
+    })
+    expect(denial).toEqual({ ok: false, error: 'self_grant' })
+  })
+
+  it('member on the target cannot remove either — same predicate as add', async () => {
+    const result = await invokeTool(
+      memberOnlyAuth(),
+      env,
+      'squad_member_remove',
+      { agent: CALLER_AGENT_ID, squad: TARGET_SQUAD_ID },
+      'https://pot.test',
+    )
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error).toBe('forbidden')
+  })
+
   it('rolls back the grant when the membership receipt insert aborts', async () => {
     harness.sqlite.exec(`
       CREATE TRIGGER fail_membership_receipt_insert
@@ -448,5 +611,97 @@ describe('squad_member_add / remove / list (mupot#1161)', () => {
       `SELECT capability FROM capabilities
         WHERE member_id = ? AND scope_type = 'squad' AND scope_id = ?`,
     ).get(AGENT_MEMBER_ID, TARGET_SQUAD_ID)).toEqual({ capability: 'member' })
+  })
+})
+
+describe('squad membership delete receipts (cascade, mupot#1164)', () => {
+  it('PRAGMA foreign_keys is on — the D1-equivalent condition for CASCADE+AFTER DELETE', () => {
+    expect(harness.sqlite.prepare('PRAGMA foreign_keys').get()).toEqual({ foreign_keys: 1 })
+  })
+
+  it('deleting an agent writes a removal receipt for every cascaded membership', async () => {
+    const unboundId = 'agent-unbound-del'
+    harness.sqlite.exec(`
+      INSERT INTO agents (id, squad_id, slug, name, status)
+      VALUES ('${unboundId}', '${TARGET_SQUAD_ID}', 'unbound-del', 'Unbound', 'active');
+      INSERT INTO memberships (id, agent_id, squad_id, capability)
+      VALUES ('mem-unbound-del', '${unboundId}', '${TARGET_SQUAD_ID}', 'lead');
+    `)
+    harness.sqlite.exec(`
+      INSERT INTO membership_receipts (
+        id, tenant, actor_member_id, target_agent_id, squad_id, action, capability, result
+      ) VALUES (
+        'add-unbound-del', '${TENANT}', '${OPERATOR_MEMBER_ID}', '${unboundId}',
+        '${TARGET_SQUAD_ID}', 'add', 'lead', 'created'
+      );
+    `)
+
+    await expect(deleteAgent(env, unboundId)).resolves.toEqual({ ok: true })
+    expect(harness.sqlite.prepare(
+      'SELECT COUNT(*) AS n FROM memberships WHERE agent_id = ?',
+    ).get(unboundId)).toEqual({ n: 0 })
+    const removal = harness.sqlite.prepare(
+      `SELECT actor_member_id, prior_capability, result
+         FROM membership_receipts
+        WHERE target_agent_id = ? AND action = 'remove'`,
+    ).get(unboundId) as { actor_member_id: string; prior_capability: string; result: string }
+    expect(removal).toEqual({
+      actor_member_id: 'system:cascade',
+      prior_capability: 'lead',
+      result: 'removed',
+    })
+    expect(harness.sqlite.prepare(
+      `SELECT COUNT(*) AS n FROM membership_receipts
+        WHERE target_agent_id = ? AND action = 'add'`,
+    ).get(unboundId)).toEqual({ n: 1 })
+  })
+
+  it('deleting a squad writes a removal receipt for every cascaded membership', () => {
+    const doomedSquad = 'squad-doomed'
+    const doomedAgent = 'agent-doomed'
+    harness.sqlite.exec(`
+      INSERT INTO squads (id, department_id, slug, name)
+      VALUES ('${doomedSquad}', '${DEPT_ID}', 'doomed', 'Doomed');
+      INSERT INTO agents (id, squad_id, slug, name, status)
+      VALUES ('${doomedAgent}', '${doomedSquad}', 'doomed', 'Doomed Agent', 'active');
+      INSERT INTO memberships (id, agent_id, squad_id, capability)
+      VALUES ('mem-doomed', '${doomedAgent}', '${doomedSquad}', 'admin');
+    `)
+
+    harness.sqlite.exec(`DELETE FROM squads WHERE id = '${doomedSquad}'`)
+    expect(harness.sqlite.prepare(
+      'SELECT COUNT(*) AS n FROM memberships WHERE squad_id = ?',
+    ).get(doomedSquad)).toEqual({ n: 0 })
+    const removal = harness.sqlite.prepare(
+      `SELECT actor_member_id, prior_capability, result
+         FROM membership_receipts
+        WHERE target_agent_id = ? AND action = 'remove'`,
+    ).get(doomedAgent) as { actor_member_id: string; prior_capability: string; result: string }
+    expect(removal).toEqual({
+      actor_member_id: 'system:cascade',
+      prior_capability: 'admin',
+      result: 'removed',
+    })
+  })
+})
+
+describe('authorizeSquadMembershipWrite source still contains each check (delete → red)', () => {
+  const src = readFileSync(join(__dirname, '../src/members/squad-membership.ts'), 'utf8')
+
+  it('keeps the direct boundAgentId self-grant check', () => {
+    expect(src).toMatch(/auth\.boundAgentId === targetAgentId/)
+  })
+
+  it('keeps the indirect bound-agent self-grant check', () => {
+    expect(src).toMatch(/callerBoundAgentId === targetAgentId/)
+  })
+
+  it('keeps the target-squad lead floor', () => {
+    expect(src).toMatch(/canOnSquad\([^;]*'lead'\)/s)
+  })
+
+  it('keeps the rank-ceiling hasCapability check', () => {
+    expect(src).toMatch(/cannot_grant_above_own_rank/)
+    expect(src).toMatch(/hasCapability\(/)
   })
 })
