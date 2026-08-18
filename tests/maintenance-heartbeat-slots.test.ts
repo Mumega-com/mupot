@@ -32,7 +32,7 @@ describe('maintenance heartbeat slot selection', () => {
     expect(MAINTENANCE_FIRING_MINUTES).not.toContain(25)
   })
 
-  it('reaches EVERY index for the current eleven heartbeats', () => {
+  it('reaches EVERY index for an eleven-heartbeat array', () => {
     const slots = reachableSlots(11)
     expect([...slots].sort((a, b) => a - b)).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
   })

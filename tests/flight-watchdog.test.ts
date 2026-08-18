@@ -35,6 +35,8 @@ import {
   canReapFlight,
   evaluateFlightLiveness,
   listStalledFlights,
+  scanStalledFlights,
+  sweepStalledFlights,
   reapStalledFlight,
   DEFAULT_RUNNING_STALL_TIMEOUT_MS,
   DEFAULT_SLEEPING_STALL_TIMEOUT_MS,
@@ -607,5 +609,107 @@ describe('reap audit receipt — flight_reap_receipts', () => {
     expect(() => insert('flight.landed', 'system', 'ev-system')).toThrow(/CHECK constraint failed/)
     expect(() => insert('flight.landed', 'agent', 'ev-ok')).not.toThrow()
     expect(outboxRows('fl-cause')).toHaveLength(1)
+  })
+})
+
+// ───────────────────────────────────────────────────────────────────────────────
+describe('sweepStalledFlights — the scheduled pass (mupot#1138)', () => {
+  it('reaps the stalled flights and writes one receipt each', async () => {
+    seedFlight({ id: 'fl-sweep-a', started_at: T0 })
+    seedFlight({ id: 'fl-sweep-b', started_at: T0 })
+    seedFlight({ id: 'fl-sweep-healthy', started_at: T0 })
+
+    const nowMs = T0 + 70 * MINUTE
+    const res = await sweepStalledFlights(env, { nowMs })
+
+    expect(res.reaped).toBe(3)
+    expect(res.failed).toBe(0)
+    expect(res.escalated).toBe(0)
+    expect((await loadFlight('fl-sweep-a')).status).toBe('failed')
+    expect(reapReceiptRows('fl-sweep-a'), 'one receipt per reaped flight').toHaveLength(1)
+    expect(reapReceiptRows('fl-sweep-b')).toHaveLength(1)
+  })
+
+  it('a healthy flight is left alone and gets no receipt', async () => {
+    seedFlight({ id: 'fl-sweep-young', started_at: T0 })
+
+    const res = await sweepStalledFlights(env, { nowMs: T0 + 15 * MINUTE })
+
+    expect(res.candidates).toBe(0)
+    expect(res.reaped).toBe(0)
+    expect((await loadFlight('fl-sweep-young')).status).toBe('running')
+    expect(reapReceiptRows('fl-sweep-young')).toHaveLength(0)
+  })
+
+  it('NEVER reaps an escalate — the human review gate survives the sweep', async () => {
+    // The hard invariant, asserted at the SWEEP level rather than the reaper level.
+    // reapStalledFlight already refuses a 'waiting' flight, but that makes the guarantee a
+    // downstream accident. This pins it locally: the sweep must not even attempt the reap.
+    seedFlight({ id: 'fl-sweep-waiting', status: 'waiting', started_at: T0 })
+
+    const res = await sweepStalledFlights(env, { nowMs: T0 + 48 * HOUR })
+
+    expect(res.escalated, 'the 24h-exceeded waiting gate is escalated').toBe(1)
+    expect(res.reaped).toBe(0)
+    expect(res.failed, 'escalate must not be counted as a failed reap attempt').toBe(0)
+    expect((await loadFlight('fl-sweep-waiting')).status).toBe('waiting')
+    expect(reapReceiptRows('fl-sweep-waiting'), 'no receipt — nothing was reaped').toHaveLength(0)
+  })
+
+  it('mixes reap and escalate in one pass without either contaminating the other', async () => {
+    seedFlight({ id: 'fl-mix-stalled', started_at: T0 })
+    seedFlight({ id: 'fl-mix-waiting', status: 'waiting', started_at: T0 })
+
+    const res = await sweepStalledFlights(env, { nowMs: T0 + 48 * HOUR })
+
+    expect(res.reaped).toBe(1)
+    expect(res.escalated).toBe(1)
+    expect((await loadFlight('fl-mix-stalled')).status).toBe('failed')
+    expect((await loadFlight('fl-mix-waiting')).status).toBe('waiting')
+  })
+
+  it('is idempotent — a second pass reaps nothing and adds no duplicate receipt', async () => {
+    seedFlight({ id: 'fl-sweep-twice', started_at: T0 })
+    const nowMs = T0 + 70 * MINUTE
+
+    const first = await sweepStalledFlights(env, { nowMs })
+    const second = await sweepStalledFlights(env, { nowMs })
+
+    expect(first.reaped).toBe(1)
+    expect(second.reaped, 'already failed — no longer a candidate').toBe(0)
+    expect(reapReceiptRows('fl-sweep-twice')).toHaveLength(1)
+  })
+
+  it('reports a CAPPED scan instead of passing a partial sweep off as a complete one', async () => {
+    // The silent-cap finding. Under-reaping is the safe direction, but a truncated pass
+    // otherwise reports identically to a clean one, so 'reaped 2' reads as 'that was all of
+    // them'. `capped` is the only thing that distinguishes the two.
+    // Distinct created_at: the candidate query is ORDER BY created_at ASC, so identical
+    // timestamps leave the tie-break unspecified and "which two got scanned" arbitrary.
+    seedFlight({ id: 'fl-cap-1', started_at: T0, created_at: T0 })
+    seedFlight({ id: 'fl-cap-2', started_at: T0, created_at: T0 + 1 })
+    seedFlight({ id: 'fl-cap-3', started_at: T0, created_at: T0 + 2 })
+
+    const capped = await sweepStalledFlights(env, { nowMs: T0 + 70 * MINUTE, limit: 2 })
+    expect(capped.capped, 'scanned === limit, so more may exist unseen').toBe(true)
+    expect(capped.scanned).toBe(2)
+    expect(capped.reaped).toBe(2)
+    expect(await loadFlight('fl-cap-3').then((f) => f.status), 'unseen, so untouched').toBe('running')
+
+    const complete = await sweepStalledFlights(env, { nowMs: T0 + 70 * MINUTE, limit: 50 })
+    expect(complete.capped, 'room to spare — this pass really did see everything').toBe(false)
+    expect(complete.reaped).toBe(1)
+  })
+
+  it('scanStalledFlights reports the window; listStalledFlights stays the plain array', async () => {
+    seedFlight({ id: 'fl-scan-1', started_at: T0 })
+    const nowMs = T0 + 70 * MINUTE
+
+    const scan = await scanStalledFlights(env, { nowMs })
+    const list = await listStalledFlights(env, { nowMs })
+
+    expect(scan.items).toHaveLength(1)
+    expect(scan.capped).toBe(false)
+    expect(list, 'the wrapper must stay behaviourally identical').toEqual(scan.items)
   })
 })
