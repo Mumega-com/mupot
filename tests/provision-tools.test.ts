@@ -273,6 +273,9 @@ describe('provision tools — advertised', () => {
     expect(names).toContain('verify_agent_connection')
     expect(names).toContain('register_agent_key')
     expect(names).toContain('grant_agent_capability')
+    expect(names).toContain('squad_member_add')
+    expect(names).toContain('squad_member_remove')
+    expect(names).toContain('squad_member_list')
   })
 
   it('advertises grant_agent_capability with its exact schema', async () => {
@@ -920,6 +923,8 @@ describe('provision tools — operator-principal invariant is exhaustive', () =>
     'create_department',
     'create_squad',
     'create_agent',
+    // Read-only membership listing. Observer+ on the target squad. No write.
+    'squad_member_list',
     // Deliberately allows one bound agent to deactivate ANOTHER agent —
     // only self-deactivation is blocked (see the 'cannot_deactivate_self'
     // guard in toolDeactivateAgent and the explicit assertion in
