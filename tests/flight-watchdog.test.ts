@@ -765,3 +765,86 @@ describe('sweepStalledFlights — the scheduled pass (mupot#1138)', () => {
     expect(list, 'the wrapper must stay behaviourally identical').toEqual(scan.items)
   })
 })
+
+// ───────────────────────────────────────────────────────────────────────────────
+describe("the sleeping/next_run_at invariant the reaper's absence-branch depends on", () => {
+  // WHY THIS TEST EXISTS. evaluateFlightLiveness reaps a 'sleeping' flight when
+  // next_run_at IS NULL, with ageMs 0 and timeoutMs 0 — zero grace. That is
+  // absence-reasoning: a NULL column taken as proof of death.
+  //
+  // It is safe ONLY because a single writer sets both columns in one atomic UPDATE. Nothing
+  // in the schema enforces that — no NOT NULL, no CHECK. A second writer, or a migration
+  // backfill, silently converts a dead branch into instant data loss on live flights.
+  //
+  // Loom's finding on #1151, and it is the correction that produced this file: I had called
+  // that invariant "recorded with a guard" when the guard was a GitHub comment. Prose is not
+  // enforcement. This is the guard — it goes RED the moment a second writer appears, which a
+  // comment never would.
+  //
+  // Source-parsed rather than schema-enforced on purpose: a CHECK constraint on `flights`
+  // would require a SQLite table rebuild across the trigger set that #1147 declined to touch
+  // for exactly that reason. This catches the same mistake at the moment someone makes it.
+
+  function flightSleepWrites(): string[] {
+    const { readFileSync, readdirSync, statSync } = require('node:fs') as typeof import('node:fs')
+    const { join } = require('node:path') as typeof import('node:path')
+    const root = join(__dirname, '..', 'src')
+    const found: string[] = []
+
+    const walk = (dir: string): void => {
+      for (const entry of readdirSync(dir)) {
+        const full = join(dir, entry)
+        if (statSync(full).isDirectory()) {
+          walk(full)
+          continue
+        }
+        if (!entry.endsWith('.ts')) continue
+        const src = readFileSync(full, 'utf8')
+        // UPDATE statements against `flights` that set status to 'sleeping', in any quoting
+        // or spacing style.
+        for (const m of src.matchAll(/UPDATE\s+flights\s+SET[\s\S]{0,400}?/gi)) {
+          const stmt = src.slice(m.index ?? 0, (m.index ?? 0) + 400)
+          if (/status\s*=\s*['"]sleeping['"]/i.test(stmt)) {
+            found.push(`${full}:: ${stmt.split('`')[0].replace(/\s+/g, ' ').slice(0, 200)}`)
+          }
+        }
+      }
+    }
+    walk(root)
+    return found
+  }
+
+  it('has EXACTLY ONE writer that puts a flight to sleep', () => {
+    const writers = flightSleepWrites()
+    expect(
+      writers.length,
+      `the reaper treats status='sleeping' AND next_run_at IS NULL as proof of death with zero ` +
+        `grace. That is only safe while ONE writer sets both atomically. Writers found:\n` +
+        writers.join('\n'),
+    ).toBe(1)
+  })
+
+  it('that writer sets next_run_at in the SAME statement, so the NULL state is unreachable', () => {
+    const [writer] = flightSleepWrites()
+    expect(writer, 'no sleeping writer found at all — the parser has drifted').toBeTruthy()
+    expect(
+      /next_run_at\s*=/i.test(writer),
+      `the sole sleeping writer does NOT set next_run_at in the same UPDATE, so a flight can ` +
+        `now exist as sleeping-with-null-next_run_at — which the reaper kills instantly, with ` +
+        `no age threshold. Writer:\n${writer}`,
+    ).toBe(true)
+  })
+
+  it('a flight really cannot be slept without a wake time (the runtime half of the same claim)', async () => {
+    const { sleepFlight } = await import('../src/flight/service')
+    seedFlight({ id: 'fl-sleep-inv', status: 'running', started_at: T0 })
+
+    await sleepFlight(env, 'fl-sleep-inv', T0 + 10 * MINUTE)
+
+    const flight = await loadFlight('fl-sleep-inv')
+    expect(flight.status).toBe('sleeping')
+    expect(flight.next_run_at, 'slept with no wake time — the reaper would kill this instantly').not.toBeNull()
+    // And prove the pairing matters: this row must NOT be reapable.
+    expect(evaluateFlightLiveness(flight, T0 + 11 * MINUTE).action).toBe('healthy')
+  })
+})
