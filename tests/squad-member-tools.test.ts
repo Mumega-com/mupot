@@ -343,6 +343,7 @@ describe('squad_member_add / remove / list (mupot#1161)', () => {
     const members = (listed.result as { members: Array<{ agent_id: string; grant_capability: string }> }).members
     const kasra = members.find((row) => row.agent_id === AGENT_ID)
     expect(kasra?.grant_capability).toBe('lead')
+    expect(kasra?.membership_capability).toBe('lead')
 
     const stranger = await invokeTool(
       memberOnlyAuth(),

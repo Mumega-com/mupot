@@ -216,7 +216,7 @@ export async function prepareAgentSquadAccess(
     id: prior.membership?.id ?? crypto.randomUUID(),
     agent_id: input.agentId,
     squad_id: input.squadId,
-    capability: 'member',
+    capability: input.capability,
   }
   const grant: CapabilityGrant = {
     member_id: input.memberId,
@@ -229,7 +229,7 @@ export async function prepareAgentSquadAccess(
   const membershipStatement = bindingGuard
     ? env.DB.prepare(
         `INSERT INTO memberships (id, agent_id, squad_id, capability)
-         SELECT ?, ?, ?, 'member'
+         SELECT ?, ?, ?, ?
           WHERE EXISTS (
             SELECT 1
               FROM agent_member_bindings
@@ -238,21 +238,22 @@ export async function prepareAgentSquadAccess(
                AND member_id = ?
           )
          ON CONFLICT(agent_id, squad_id)
-         DO UPDATE SET capability = 'member'`,
+         DO UPDATE SET capability = excluded.capability`,
       ).bind(
         membership.id,
         input.agentId,
         input.squadId,
+        input.capability,
         env.TENANT_SLUG,
         input.agentId,
         input.memberId,
       )
     : env.DB.prepare(
         `INSERT INTO memberships (id, agent_id, squad_id, capability)
-         VALUES (?, ?, ?, 'member')
+         VALUES (?, ?, ?, ?)
          ON CONFLICT(agent_id, squad_id)
-         DO UPDATE SET capability = 'member'`,
-      ).bind(membership.id, input.agentId, input.squadId)
+         DO UPDATE SET capability = excluded.capability`,
+      ).bind(membership.id, input.agentId, input.squadId, input.capability)
 
   const grantId = crypto.randomUUID()
   const capabilityStatement = bindingGuard
@@ -324,7 +325,7 @@ async function readCommittedAccess(
   ])
   if (
     !membership
-    || membership.capability !== 'member'
+    || membership.capability !== input.capability
     || !grant
     || grant.capability !== input.capability
   ) {
