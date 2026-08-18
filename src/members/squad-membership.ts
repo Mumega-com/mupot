@@ -1,10 +1,9 @@
-import { assertBatchWritten } from '../lib/receipt'
 import { canOnSquad, hasCapability } from '../auth/capability'
 import type { AuthContext, Capability, CapabilityGrant, Env, Squad } from '../types'
 import {
-  removeAgentSquadAccess,
+  commitAgentSquadAccess,
+  commitRemoveAgentSquadAccess,
   resolveBoundAgentForMember,
-  setAgentSquadAccess,
   type AgentAccessCapability,
 } from './agent-access'
 import { resolveAgentMemberBinding } from './service'
@@ -21,6 +20,17 @@ export type SquadMembershipWriteDenial =
   | 'self_grant'
   | 'forbidden'
   | 'cannot_grant_above_own_rank'
+
+export type SquadMembershipMutationError =
+  | SquadMembershipWriteDenial
+  | 'agent_identity_unminted'
+  | 'receipt_failed'
+  | 'agent_not_found'
+  | 'squad_not_found'
+  | 'agent_identity_conflict'
+  | 'home_squad_immutable'
+
+export type SquadMembershipTarget = Pick<Squad, 'id' | 'department_id'>
 
 export interface SquadMembershipListRow {
   agent_id: string
@@ -44,7 +54,7 @@ export async function authorizeSquadMembershipWrite(input: {
   env: Env
   auth: AuthContext
   targetAgentId: string
-  squad: Pick<Squad, 'id' | 'department_id'>
+  squad: SquadMembershipTarget
   requestedCapability: Capability | null
 }): Promise<{ ok: true } | { ok: false; error: SquadMembershipWriteDenial }> {
   if (!input.auth.memberId) {
@@ -112,11 +122,11 @@ export async function addSquadMember(input: {
   env: Env
   auth: AuthContext
   agentId: string
-  squad: Squad
+  squad: SquadMembershipTarget
   capability: AgentAccessCapability
 }): Promise<
   | { ok: true; receiptId: string; result: 'created' | 'updated' | 'unchanged'; memberId: string }
-  | { ok: false; error: SquadMembershipWriteDenial | 'agent_identity_unminted' | 'receipt_failed' | 'agent_not_found' | 'squad_not_found' | 'agent_identity_conflict' }
+  | { ok: false; error: SquadMembershipMutationError }
 > {
   const authorized = await authorizeSquadMembershipWrite({
     env: input.env,
@@ -143,35 +153,40 @@ export async function addSquadMember(input: {
     .bind(binding.memberId, input.squad.id)
     .first<{ capability: string }>()
 
-  const outcome = await setAgentSquadAccess(input.env, {
-    agentId: input.agentId,
-    memberId: binding.memberId,
-    squadId: input.squad.id,
-    capability: input.capability,
-  })
-  if (!outcome.ok) return outcome
-
   const receiptId = crypto.randomUUID()
-  const receiptWrite = await receiptInsert(input.env, {
-    id: receiptId,
-    actorMemberId: input.auth.memberId as string,
-    actorBoundAgentId: input.auth.boundAgentId ?? null,
-    targetAgentId: input.agentId,
-    squadId: input.squad.id,
-    action: 'add',
-    capability: input.capability,
-    priorCapability: priorGrant?.capability ?? null,
-    result: outcome.result === 'removed' ? 'unchanged' : outcome.result,
-  }).run()
+  let outcome
   try {
-    assertBatchWritten([receiptWrite], 'squad_member_add_receipt', 1)
+    outcome = await commitAgentSquadAccess(
+      input.env,
+      {
+        agentId: input.agentId,
+        memberId: binding.memberId,
+        squadId: input.squad.id,
+        capability: input.capability,
+      },
+      (prepared) => [
+        receiptInsert(input.env, {
+          id: receiptId,
+          actorMemberId: input.auth.memberId as string,
+          actorBoundAgentId: input.auth.boundAgentId ?? null,
+          targetAgentId: input.agentId,
+          squadId: input.squad.id,
+          action: 'add',
+          capability: input.capability,
+          priorCapability: priorGrant?.capability ?? null,
+          result: prepared.resultAfterCommit,
+        }),
+      ],
+    )
   } catch {
     return { ok: false, error: 'receipt_failed' }
   }
+  if (!outcome.ok) return outcome
+  const result = outcome.result === 'removed' ? 'unchanged' : outcome.result
   return {
     ok: true,
     receiptId,
-    result: outcome.result === 'removed' ? 'unchanged' : outcome.result,
+    result,
     memberId: binding.memberId,
   }
 }
@@ -180,20 +195,10 @@ export async function removeSquadMember(input: {
   env: Env
   auth: AuthContext
   agentId: string
-  squad: Squad
+  squad: SquadMembershipTarget
 }): Promise<
   | { ok: true; receiptId: string; result: 'removed' | 'unchanged' }
-  | {
-      ok: false
-      error:
-        | SquadMembershipWriteDenial
-        | 'agent_identity_unminted'
-        | 'receipt_failed'
-        | 'agent_not_found'
-        | 'squad_not_found'
-        | 'agent_identity_conflict'
-        | 'home_squad_immutable'
-    }
+  | { ok: false; error: SquadMembershipMutationError }
 > {
   const authorized = await authorizeSquadMembershipWrite({
     env: input.env,
@@ -220,32 +225,36 @@ export async function removeSquadMember(input: {
     .bind(binding.memberId, input.squad.id)
     .first<{ capability: string }>()
 
-  const outcome = await removeAgentSquadAccess(input.env, {
-    agentId: input.agentId,
-    memberId: binding.memberId,
-    squadId: input.squad.id,
-  })
+  const receiptId = crypto.randomUUID()
+  let outcome
+  try {
+    outcome = await commitRemoveAgentSquadAccess(
+      input.env,
+      {
+        agentId: input.agentId,
+        memberId: binding.memberId,
+        squadId: input.squad.id,
+      },
+      (_priorCapability) => [
+        receiptInsert(input.env, {
+          id: receiptId,
+          actorMemberId: input.auth.memberId as string,
+          actorBoundAgentId: input.auth.boundAgentId ?? null,
+          targetAgentId: input.agentId,
+          squadId: input.squad.id,
+          action: 'remove',
+          capability: null,
+          priorCapability: prior?.capability ?? null,
+          result: 'removed',
+        }),
+      ],
+    )
+  } catch {
+    return { ok: false, error: 'receipt_failed' }
+  }
   if (!outcome.ok) return outcome
   if (outcome.result === 'unchanged') {
     return { ok: true, receiptId: '', result: 'unchanged' }
-  }
-
-  const receiptId = crypto.randomUUID()
-  const receiptWrite = await receiptInsert(input.env, {
-    id: receiptId,
-    actorMemberId: input.auth.memberId as string,
-    actorBoundAgentId: input.auth.boundAgentId ?? null,
-    targetAgentId: input.agentId,
-    squadId: input.squad.id,
-    action: 'remove',
-    capability: null,
-    priorCapability: prior?.capability ?? null,
-    result: 'removed',
-  }).run()
-  try {
-    assertBatchWritten([receiptWrite], 'squad_member_remove_receipt', 1)
-  } catch {
-    return { ok: false, error: 'receipt_failed' }
   }
   return { ok: true, receiptId, result: 'removed' }
 }

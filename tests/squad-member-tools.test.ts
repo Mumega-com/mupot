@@ -386,4 +386,67 @@ describe('squad_member_add / remove / list (mupot#1161)', () => {
     })
     expect(denial).toEqual({ ok: false, error: 'forbidden' })
   })
+
+  it('rolls back the grant when the membership receipt insert aborts', async () => {
+    harness.sqlite.exec(`
+      CREATE TRIGGER fail_membership_receipt_insert
+      BEFORE INSERT ON membership_receipts
+      BEGIN
+        SELECT RAISE(ABORT, 'injected_receipt_failure');
+      END;
+    `)
+    const result = await invokeTool(
+      operatorAuth(),
+      env,
+      'squad_member_add',
+      { agent: AGENT_ID, squad: TARGET_SQUAD_ID, capability: 'lead' },
+      'https://pot.test',
+    )
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error).toBe('receipt_failed')
+    expect(harness.sqlite.prepare(
+      'SELECT COUNT(*) AS n FROM memberships WHERE agent_id = ? AND squad_id = ?',
+    ).get(AGENT_ID, TARGET_SQUAD_ID)).toEqual({ n: 0 })
+    expect(harness.sqlite.prepare(
+      `SELECT COUNT(*) AS n FROM capabilities
+        WHERE member_id = ? AND scope_type = 'squad' AND scope_id = ?`,
+    ).get(AGENT_MEMBER_ID, TARGET_SQUAD_ID)).toEqual({ n: 0 })
+  })
+
+  it('rolls back the removal when the membership receipt insert aborts', async () => {
+    const added = await invokeTool(
+      operatorAuth(),
+      env,
+      'squad_member_add',
+      { agent: AGENT_ID, squad: TARGET_SQUAD_ID, capability: 'member' },
+      'https://pot.test',
+    )
+    expect(added.ok).toBe(true)
+
+    harness.sqlite.exec(`
+      CREATE TRIGGER fail_membership_receipt_remove
+      BEFORE INSERT ON membership_receipts
+      BEGIN
+        SELECT RAISE(ABORT, 'injected_receipt_failure');
+      END;
+    `)
+    const removed = await invokeTool(
+      operatorAuth(),
+      env,
+      'squad_member_remove',
+      { agent: AGENT_ID, squad: TARGET_SQUAD_ID },
+      'https://pot.test',
+    )
+    expect(removed.ok).toBe(false)
+    if (removed.ok) return
+    expect(removed.error).toBe('receipt_failed')
+    expect(harness.sqlite.prepare(
+      'SELECT capability FROM memberships WHERE agent_id = ? AND squad_id = ?',
+    ).get(AGENT_ID, TARGET_SQUAD_ID)).toEqual({ capability: 'member' })
+    expect(harness.sqlite.prepare(
+      `SELECT capability FROM capabilities
+        WHERE member_id = ? AND scope_type = 'squad' AND scope_id = ?`,
+    ).get(AGENT_MEMBER_ID, TARGET_SQUAD_ID)).toEqual({ capability: 'member' })
+  })
 })
