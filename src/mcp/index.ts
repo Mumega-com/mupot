@@ -1899,6 +1899,10 @@ const toolFlightDispatch: ToolSpec = {
     }
 
     let budgetCeilingMicroUsd = 0
+    // Rows dispatching with NO dollar cap. Reported on the success payload so an
+    // uncapped flight is visible rather than silent — "unlimited" must be an
+    // observable state, not an absence.
+    let budgetUncapped: Array<{ kind: 'agent' | 'squad'; id: string; slug: string }> = []
     if ((requestedBudget as number) > 0) {
       // The EXECUTOR's cap governs, not the dispatcher's: execute.ts's meter
       // (checkAndReserve) enforces agents.budget_cap_cents keyed to the agent
@@ -1906,36 +1910,53 @@ const toolFlightDispatch: ToolSpec = {
       // executor === dispatcher (the non-delegated, default case) this is the
       // exact same value as before; behaviour is unchanged for every existing
       // caller.
-      // Every row in this set must carry a cap — the ceiling is the MINIMUM, so
-      // one unset row is genuinely unsafe and the AND is correct. What was wrong
-      // was the silence: budget_cap_cents is nullable with no default on both
-      // agents and squads (0009_work_unit.sql), and create_agent/create_squad
-      // leave it null whenever the caller omits it. So the common case is an
-      // undifferentiated 409 naming none of the rows the caller must go and fix,
-      // for a set the caller cannot see. Name them. (mupot#1148)
+      // AN UNSET budget_cap_cents MEANS UNLIMITED — the same thing it already
+      // means one layer down. meter.ts:151-156 resolves null/<=0 to "no dollar
+      // cap"; this gate used to resolve the identical value to "refuse the
+      // flight". One predicate, two copies, opposite meanings — and since
+      // budget_cap_cents is nullable with no default on both agents and squads
+      // (0009_work_unit.sql) and create_agent/create_squad leave it null
+      // whenever the caller omits it, the admission layer refused nearly every
+      // budgeted flight while the enforcement layer would have allowed it.
+      // That, not a missing default, is mupot#1148.
+      //
+      // Uncapped in DOLLARS is not unbounded: meter.ts still enforces
+      // MAX_DISPATCHES_PER_DAY (200) and MAX_TOKENS_PER_DAY (200_000) per agent
+      // regardless of any cap here, and the flight's own requested budget still
+      // bounds it. Note also that a cents cap models MARGINAL per-token spend,
+      // which is the wrong shape for agents running on a flat-rate subscription
+      // ration (Anthropic/OpenAI/Google plans) — those are capacity-limited, not
+      // dollar-limited. Modelling that is tracked separately; do not read this
+      // ceiling as the whole cost picture.
       const budgetSources = [
         { kind: 'agent' as const, id: executorAgent.id, slug: executorAgent.slug, cap: executorAgent.budget_cap_cents },
         ...referencedSquads.map((item) => (
           { kind: 'squad' as const, id: item.id, slug: item.slug, cap: item.budget_cap_cents }
         )),
       ]
-      const unconfigured = budgetSources.filter(
-        (source) => typeof source.cap !== 'number' || !Number.isSafeInteger(source.cap) || source.cap <= 0,
-      )
-      if (unconfigured.length > 0) {
-        return fail(409, 'flight_budget_policy_missing', {
-          unconfigured: unconfigured.map((source) => ({ kind: source.kind, id: source.id, slug: source.slug })),
-        })
-      }
-      const binding = budgetSources.reduce((lowest, source) => (
-        (source.cap as number) < (lowest.cap as number) ? source : lowest
-      ))
-      budgetCeilingMicroUsd = (binding.cap as number) * 10_000
-      if ((requestedBudget as number) > budgetCeilingMicroUsd) {
-        return fail(409, 'flight_budget_exceeds_cap', {
-          cap_micro_usd: budgetCeilingMicroUsd,
-          binding: { kind: binding.kind, id: binding.id, slug: binding.slug },
-        })
+      const isConfigured = (cap: number | null): cap is number =>
+        typeof cap === 'number' && Number.isSafeInteger(cap) && cap > 0
+      const configured = budgetSources.filter((source) => isConfigured(source.cap))
+      budgetUncapped = budgetSources
+        .filter((source) => !isConfigured(source.cap))
+        .map((source) => ({ kind: source.kind, id: source.id, slug: source.slug }))
+
+      if (configured.length > 0) {
+        // An unconfigured row is unlimited, so it can never be the minimum —
+        // the binding constraint is the lowest CONFIGURED cap.
+        const binding = configured.reduce((lowest, source) => (
+          (source.cap as number) < (lowest.cap as number) ? source : lowest
+        ))
+        budgetCeilingMicroUsd = (binding.cap as number) * 10_000
+        if ((requestedBudget as number) > budgetCeilingMicroUsd) {
+          return fail(409, 'flight_budget_exceeds_cap', {
+            cap_micro_usd: budgetCeilingMicroUsd,
+            binding: { kind: binding.kind, id: binding.id, slug: binding.slug },
+          })
+        }
+      } else {
+        // No dollar cap anywhere in the set. The request itself is the bound.
+        budgetCeilingMicroUsd = requestedBudget as number
       }
     }
     const references = await validateFlightMetaReferences(env, meta, projectId)
@@ -2041,10 +2062,10 @@ const toolFlightDispatch: ToolSpec = {
       }
 
       const dispatched = await getFlight(env, preflight.id)
-      return done({ flight: flightWithParsedMeta(dispatched ?? flight, meta), preflight, delivered: true })
+      return done({ flight: flightWithParsedMeta(dispatched ?? flight, meta), preflight, delivered: true, budget_uncapped: budgetUncapped })
     }
 
-    return done({ flight: flightWithParsedMeta(flight, meta), preflight, delivered: false })
+    return done({ flight: flightWithParsedMeta(flight, meta), preflight, delivered: false, budget_uncapped: budgetUncapped })
   },
 }
 

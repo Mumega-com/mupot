@@ -652,18 +652,16 @@ describe('MCP flight tools', () => {
     expect(withinExecutorCap.ok, JSON.stringify(withinExecutorCap)).toBe(true)
   })
 
-  // ── flight_budget_policy_missing names the rows (mupot#1148) ─────────────────
-  // budget_cap_cents is nullable with no default on BOTH agents and squads
-  // (0009_work_unit.sql), and create_agent/create_squad leave it null whenever
-  // the caller omits it — so the common case is an entity with no cap. The gate
-  // ANDs the executor agent against EVERY referenced squad, which is correct
-  // (the ceiling is the minimum, so one unset row really is unsafe), but it used
-  // to return a bare 409 naming nothing. The caller then had to guess which of
-  // N+1 rows to fix, across a set they cannot enumerate. Dara burned a whole
-  // FLIGHT-06 on this: budget_micro_usd of 4000000, 400000 and 1 all failed
-  // identically, because the value is never reached — this gate fires first.
+  // ── an unset budget cap means UNLIMITED (mupot#1148) ─────────────────────────
+  // meter.ts:151-156 already resolves null/<=0 to "no dollar cap". The dispatch
+  // gate used to resolve the SAME value to "refuse the flight" — one predicate,
+  // two copies, opposite meanings. Since budget_cap_cents is nullable with no
+  // default on both agents and squads (0009_work_unit.sql) and the create paths
+  // leave it null whenever omitted, admission refused nearly every budgeted
+  // flight that enforcement would have allowed. Dara's FLIGHT-06 saw 4000000,
+  // 400000 and 1 fail identically — the amount was never the variable.
 
-  it('names every unconfigured row when the executor agent has no budget cap', async () => {
+  it('dispatches when the executor agent has no cap, and reports it as uncapped', async () => {
     const { env } = makeEnv('active', false, [
       { id: DELEGATE_AGENT_ID, squad_id: SQUAD_ID, status: 'active', budget_cap_cents: null },
     ])
@@ -676,15 +674,15 @@ describe('MCP flight tools', () => {
       budget_micro_usd: 500_000,
     }, 'https://pot.example')
 
-    expect(result).toMatchObject({ ok: false, status: 409, error: 'flight_budget_policy_missing' })
-    // The squad IS configured (100), so only the agent may be named — otherwise
-    // the caller is sent to fix a row that is already correct.
-    expect((result as { detail: { unconfigured: unknown[] } }).detail.unconfigured).toEqual([
+    expect(result.ok, JSON.stringify(result)).toBe(true)
+    // Uncapped must be an OBSERVABLE state, not an absence — otherwise a flight
+    // running with no dollar ceiling is indistinguishable from a capped one.
+    expect((result as { result: { budget_uncapped: unknown[] } }).result.budget_uncapped).toEqual([
       { kind: 'agent', id: DELEGATE_AGENT_ID, slug: DELEGATE_AGENT_ID },
     ])
   })
 
-  it('names the squad when the squad is the row without a budget cap', async () => {
+  it('a squad with no cap does not block the flight, and is named as uncapped', async () => {
     const { env, squads } = makeEnv()
     squads.set(SQUAD_ID, { ...squads.get(SQUAD_ID)!, budget_cap_cents: null as never })
     const leadAuth = auth({
@@ -695,15 +693,13 @@ describe('MCP flight tools', () => {
       budget_micro_usd: 500_000,
     }, 'https://pot.example')
 
-    expect(result).toMatchObject({ ok: false, status: 409, error: 'flight_budget_policy_missing' })
-    expect((result as { detail: { unconfigured: unknown[] } }).detail.unconfigured).toEqual([
+    expect(result.ok, JSON.stringify(result)).toBe(true)
+    expect((result as { result: { budget_uncapped: unknown[] } }).result.budget_uncapped).toEqual([
       { kind: 'squad', id: SQUAD_ID, slug: 'mmhq' },
     ])
   })
 
-  it('names BOTH rows when agent and squad are each unconfigured — not just the first', async () => {
-    // The whole point of the detail is that the caller can fix everything in one
-    // pass. A first-match-only report would send them round the loop twice.
+  it('names BOTH uncapped rows when neither agent nor squad has a cap', async () => {
     const { env, squads } = makeEnv('active', false, [
       { id: DELEGATE_AGENT_ID, squad_id: SQUAD_ID, status: 'active', budget_cap_cents: null },
     ])
@@ -717,14 +713,41 @@ describe('MCP flight tools', () => {
       budget_micro_usd: 500_000,
     }, 'https://pot.example')
 
-    expect(result).toMatchObject({ ok: false, status: 409, error: 'flight_budget_policy_missing' })
-    expect((result as { detail: { unconfigured: Array<{ kind: string }> } }).detail.unconfigured).toEqual([
+    expect(result.ok, JSON.stringify(result)).toBe(true)
+    expect((result as { result: { budget_uncapped: unknown[] } }).result.budget_uncapped).toEqual([
       { kind: 'agent', id: DELEGATE_AGENT_ID, slug: DELEGATE_AGENT_ID },
       { kind: 'squad', id: SQUAD_ID, slug: 'mmhq' },
     ])
   })
 
-  it('a zero or negative cap is unconfigured, not a cap of zero', async () => {
+  it('an UNCAPPED row never becomes the binding minimum — the configured one governs', async () => {
+    // This is the case a naive "treat null as 0" fix gets wrong: the executor is
+    // uncapped and the squad is capped at 100 (= 1_000_000 microUSD). Unlimited
+    // must not collapse to zero and refuse, and it must not be picked as the
+    // lowest either. The squad's 100 governs, so 1_000_001 is refused and named.
+    const { env } = makeEnv('active', false, [
+      { id: DELEGATE_AGENT_ID, squad_id: SQUAD_ID, status: 'active', budget_cap_cents: null },
+    ])
+    const leadAuth = auth({
+      capabilities: [{ member_id: MEMBER_ID, scope_type: 'squad', scope_id: SQUAD_ID, capability: 'lead' }],
+    })
+    const within = await invokeTool(leadAuth, env, 'flight_dispatch', {
+      ...dispatchArgs, executor_agent_id: DELEGATE_AGENT_ID, budget_micro_usd: 1_000_000,
+    }, 'https://pot.example')
+    expect(within.ok, JSON.stringify(within)).toBe(true)
+
+    const over = await invokeTool(leadAuth, env, 'flight_dispatch', {
+      ...dispatchArgs, executor_agent_id: DELEGATE_AGENT_ID, budget_micro_usd: 1_000_001,
+    }, 'https://pot.example')
+    expect(over).toMatchObject({
+      ok: false,
+      status: 409,
+      error: 'flight_budget_exceeds_cap',
+      detail: { cap_micro_usd: 1_000_000, binding: { kind: 'squad', id: SQUAD_ID, slug: 'mmhq' } },
+    })
+  })
+
+  it('a zero or negative cap reads as unlimited, matching meter.ts — not as a cap of zero', async () => {
     const { env } = makeEnv('active', false, [
       { id: DELEGATE_AGENT_ID, squad_id: SQUAD_ID, status: 'active', budget_cap_cents: 0 },
     ])
@@ -732,20 +755,51 @@ describe('MCP flight tools', () => {
       capabilities: [{ member_id: MEMBER_ID, scope_type: 'squad', scope_id: SQUAD_ID, capability: 'lead' }],
     })
     const result = await invokeTool(leadAuth, env, 'flight_dispatch', {
-      ...dispatchArgs,
-      executor_agent_id: DELEGATE_AGENT_ID,
-      budget_micro_usd: 1,
+      ...dispatchArgs, executor_agent_id: DELEGATE_AGENT_ID, budget_micro_usd: 1,
     }, 'https://pot.example')
 
-    expect(result).toMatchObject({ ok: false, status: 409, error: 'flight_budget_policy_missing' })
-    expect((result as { detail: { unconfigured: Array<{ kind: string }> } }).detail.unconfigured)
+    expect(result.ok, JSON.stringify(result)).toBe(true)
+    expect((result as { result: { budget_uncapped: Array<{ kind: string }> } }).result.budget_uncapped)
       .toEqual([{ kind: 'agent', id: DELEGATE_AGENT_ID, slug: DELEGATE_AGENT_ID }])
   })
 
+  it('an uncapped flight carries its REQUESTED budget as remaining, not zero', async () => {
+    // budgetCeilingMicroUsd is written into signals.budgetRemainingMicroUsd, which
+    // preflight turns into budgetHeadroom (remaining >= estimate). If "unlimited"
+    // collapsed the ceiling to 0, the executing agent would be handed a signal
+    // saying it has NOTHING left — an uncapped flight reported as broke. Estimate
+    // is set below the request so the two cases are distinguishable.
+    const { env } = makeEnv('active', false, [
+      { id: DELEGATE_AGENT_ID, squad_id: SQUAD_ID, status: 'active', budget_cap_cents: null },
+    ])
+    const { env: squadEnv, squads } = makeEnv('active', false, [
+      { id: DELEGATE_AGENT_ID, squad_id: SQUAD_ID, status: 'active', budget_cap_cents: null },
+    ])
+    squads.set(SQUAD_ID, { ...squads.get(SQUAD_ID)!, budget_cap_cents: null as never })
+    void env
+    const leadAuth = auth({
+      capabilities: [{ member_id: MEMBER_ID, scope_type: 'squad', scope_id: SQUAD_ID, capability: 'lead' }],
+    })
+    const result = await invokeTool(leadAuth, squadEnv, 'flight_dispatch', {
+      ...dispatchArgs,
+      executor_agent_id: DELEGATE_AGENT_ID,
+      budget_micro_usd: 500_000,
+      signals_json: JSON.stringify({ ...signals, budgetEstimateMicroUsd: 400_000 }),
+    }, 'https://pot.example')
+
+    expect(result.ok, JSON.stringify(result)).toBe(true)
+    const preflight = (result as {
+      result: { preflight: { go: boolean; reasons: string[] } }
+    }).result.preflight
+    // Collapsing the uncapped ceiling to 0 makes headroom fail, which preflight
+    // reports as 'insufficient_budget' and which holds the flight at the gate.
+    expect(preflight.reasons).not.toContain('insufficient_budget')
+    expect(preflight.go).toBe(true)
+  })
+
   it('flight_budget_exceeds_cap names WHICH row is the binding constraint', async () => {
-    // cap_micro_usd alone tells the caller the number but not whose it is. With
-    // the executor at 50 and the squad at 100, the ceiling is 500_000 — and the
-    // row to go and raise is the agent, which the bare cap value never said.
+    // cap_micro_usd alone gives the number but not whose it is. Executor at 50,
+    // squad at 100 -> ceiling 500_000, and the row to raise is the AGENT.
     const { env } = makeEnv('active', false, [
       { id: DELEGATE_AGENT_ID, squad_id: SQUAD_ID, status: 'active', budget_cap_cents: 50 },
     ])
@@ -753,9 +807,7 @@ describe('MCP flight tools', () => {
       capabilities: [{ member_id: MEMBER_ID, scope_type: 'squad', scope_id: SQUAD_ID, capability: 'lead' }],
     })
     const result = await invokeTool(leadAuth, env, 'flight_dispatch', {
-      ...dispatchArgs,
-      executor_agent_id: DELEGATE_AGENT_ID,
-      budget_micro_usd: 600_000,
+      ...dispatchArgs, executor_agent_id: DELEGATE_AGENT_ID, budget_micro_usd: 600_000,
     }, 'https://pot.example')
 
     expect(result).toMatchObject({
