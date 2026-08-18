@@ -441,15 +441,39 @@ describe('Flight-002: expiring-soon detection & maintenance sweep', () => {
     //
     // The pin is therefore no longer purely textual: this asserts the sweep's own slot is actually
     // selectable by a real firing minute of the cron.
+    // COUNT AND INDEX ARE DERIVED FROM THE SOURCE, NEVER HARDCODED.
+    //
+    // These were literals (`heartbeatCount = 11`, `tokenExpirySlot = 10`, commented "the last
+    // entry"). Appending the twelfth heartbeat in #1138 made all three wrong at once while the
+    // test stayed GREEN: reachableSlots(11) still contains 10, so it kept asserting a property
+    // of an eleven-entry array that no longer exists. A pin describing a stale shape is not a
+    // weaker pin, it is a FALSE one — it reports on code nobody is running.
+    //
+    // Parsing the real array means appending, removing, or REORDERING a heartbeat is picked up
+    // here automatically, which is the only version of this assertion that cannot rot.
     const { MAINTENANCE_FIRING_MINUTES, maintenanceSlot } = await import('../src/scheduled/slots')
-    const heartbeatCount = 11 // keep in step with the maintenance array pinned above
-    const tokenExpirySlot = 10 // token-expiry-warning is the last entry
+
+    const arrayBlock = /const maintenance:[\s\S]*?=\s*\[([\s\S]*?)\n\s*\]/.exec(src)?.[1]
+    expect(arrayBlock, 'could not locate the maintenance array in src/index.ts').toBeTruthy()
+    const labels = [...(arrayBlock as string).matchAll(/\[\s*'([^']+)'\s*,/g)].map((m) => m[1])
+
+    expect(labels.length, 'parsed no heartbeats — the regex has drifted from the source').toBeGreaterThan(0)
+    expect(new Set(labels).size, `duplicate heartbeat labels: ${labels.join(', ')}`).toBe(labels.length)
+
+    const tokenExpirySlot = labels.indexOf('token-expiry-warning')
+    expect(tokenExpirySlot, 'token-expiry-warning is not in the maintenance array at all').toBeGreaterThanOrEqual(0)
+
     const reachable = new Set(
-      MAINTENANCE_FIRING_MINUTES.map((m) => maintenanceSlot(m, heartbeatCount)),
+      MAINTENANCE_FIRING_MINUTES.map((m) => maintenanceSlot(m, labels.length)),
     )
     expect(
       reachable.has(tokenExpirySlot),
-      'token-expiry-warning is in the maintenance array but no firing minute selects it — the sweep is wired to nothing',
+      `token-expiry-warning sits at index ${tokenExpirySlot} of ${labels.length} but no firing minute selects it — the sweep is wired to nothing`,
     ).toBe(true)
+
+    // Every OTHER heartbeat must be reachable too. token-expiry-warning died alone last time
+    // only because nobody was checking the rest.
+    const unreachable = labels.filter((_, i) => !reachable.has(i))
+    expect(unreachable, `heartbeats in the array that no firing minute selects: ${unreachable.join(', ')}`).toEqual([])
   })
 })

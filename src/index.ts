@@ -330,7 +330,7 @@ export default {
       return
     }
 
-    // Eleven independent maintenance heartbeats, staggered across each 15-minute
+    // Twelve independent maintenance heartbeats, staggered across each 15-minute
     // window and isolated from the Routine invocation budget on Workers Free.
     //  1. membership sync — reconcile channel membership → squad capabilities.
     //  2. metabolism — kick goal-bearing agents so their goal loops actually run
