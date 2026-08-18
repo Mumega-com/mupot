@@ -1308,7 +1308,11 @@ describe('MCP granted multi-squad flight lifecycle', () => {
            result, completed_at, gate_owner, created_at, updated_at)
         VALUES
           ('task-m000', '${OTHER_SQUAD_ID}', 'Cross-squad census', '', 'the census hash verifies',
-           'in_progress', NULL, NULL, NULL, NULL, NULL,
+           'in_progress', NULL, NULL,
+           'Census verified.
+Artifact: /tmp/fixture-marker.txt
+SHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+           NULL, NULL,
            '2026-07-12T00:00:00.000Z', '2026-07-12T00:00:00.000Z');
       `)
       const env = {

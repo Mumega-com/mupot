@@ -84,7 +84,14 @@ function makeEnv(opts: { task: Task | null; charter?: string | null; updateChang
   return { env: env as never, updates }
 }
 
-const okModel = (out: string): ModelPort => ({ chat: vi.fn(async () => out) })
+// mupot#76e25fc2 (FLIGHT-07B): every completion reaching review/done now needs
+// evidence in the shape Door 6 (execute.ts) requires — Artifact:/SHA256:.
+// Appended here, not asserted for byte-level truth (see
+// tests/artifact-verification.test.ts and tests/helpers/
+// artifact-verify-local.ts for that), so every existing okModel(...) call site
+// keeps testing what it always tested without each needing its own edit.
+const WITH_ARTIFACT_EVIDENCE = '\nArtifact: /tmp/fixture-marker.txt\nSHA256: ' + 'a'.repeat(64)
+const okModel = (out: string): ModelPort => ({ chat: vi.fn(async () => out + WITH_ARTIFACT_EVIDENCE) })
 const throwingModel = (msg: string): ModelPort => ({
   chat: vi.fn(async () => {
     throw new Error(msg)
@@ -162,12 +169,50 @@ describe('runTaskExecution — success', () => {
     expect(terminal.sql).toContain('execution_receipt_id = ?')
     expect(terminal.args).toContain('dispatch-receipt-1')
     expect(terminal.args[0]).toBe('review')
-    expect(terminal.args[1]).toBe('Here is the finished intro.')
+    expect(terminal.args[1]).toBe('Here is the finished intro.' + WITH_ARTIFACT_EVIDENCE)
     expect(terminal.args[2]).not.toBeNull() // completed_at stamped
 
     expect(events).toHaveLength(1)
     expect(events[0].type).toBe('task.review')
     expect(remembered).toHaveLength(1)
+  })
+
+  // mupot#76e25fc2 (FLIGHT-07B), Door 6. THE NEGATIVE TWIN of the test above —
+  // deliberately proving the check FIRES, not merely that valid evidence
+  // passes. Every other success-path fixture in this file supplies valid
+  // Artifact:/SHA256: evidence (via WITH_ARTIFACT_EVIDENCE), which is correct
+  // for testing what those tests are actually about — but it means NONE of
+  // them can distinguish "Door 6 is enforcing" from "Door 6 was deleted
+  // entirely". Confirmed by mutation: disabling Door 6's if-condition left
+  // every other test in this file green. This is the one that would catch it.
+  it('Door 6 REFUSES a completion with no artifact evidence — lands blocked, not review, with the model\'s own prose preserved in the note', async () => {
+    const { env, updates } = makeEnv({ task: makeTask(), charter: 'Be useful.' })
+    const events: BusEvent[] = []
+
+    const r = await runTaskExecution(env, AGENT, 'task-1', {
+      executionReceiptId: 'dispatch-receipt-2',
+      // No WITH_ARTIFACT_EVIDENCE — plain, unadorned model prose. The exact
+      // "prospective/refusal prose" shape the whole surface exists to catch.
+      model: { chat: vi.fn(async () => 'I believe this task is now complete.') },
+      emit: async (e) => {
+        events.push(e)
+      },
+      remember: async () => 'engram-2',
+    })
+
+    expect(r.ok).toBe(false)
+    expect(r.task_status).toBe('blocked')
+    expect(r.error).toBe('artifact_verification_failed')
+
+    const terminal = updates[updates.length - 1]
+    expect(terminal.args[0]).toBe('blocked')
+    // The rejection reason is IN the note, not the original prose replaced —
+    // an operator reading the board later can see WHY, not just that it failed.
+    expect(String(terminal.args[1])).toContain('artifact_verification_failed')
+    expect(String(terminal.args[1])).toContain('no_artifact_claimed')
+
+    expect(events).toHaveLength(1)
+    expect(events[0].type).toBe('task.blocked')
   })
 })
 
@@ -414,7 +459,7 @@ describe('runTaskExecution — cross-pot (source_pot) task end-to-end hardening 
     const model: ModelPort = {
       chat: vi.fn(async (messages: ModelMessage[]) => {
         captured = messages
-        return 'Handled — no directives followed.'
+        return 'Handled — no directives followed.\nArtifact: /tmp/fixture-marker.txt\nSHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
       }),
     }
 
@@ -441,7 +486,7 @@ describe('runTaskExecution — cross-pot (source_pot) task end-to-end hardening 
     const model: ModelPort = {
       chat: vi.fn(async (messages: ModelMessage[]) => {
         captured = messages
-        return 'Here is the intro.'
+        return 'Here is the intro.\nArtifact: /tmp/fixture-marker.txt\nSHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
       }),
     }
 
@@ -484,7 +529,7 @@ describe('runTaskExecution — content-intent short-circuit skipped for source_p
     const model: ModelPort = {
       chat: vi.fn(async (messages: ModelMessage[]) => {
         captured = messages
-        return 'Handled as an ordinary model turn, not a content-publish proposal.'
+        return 'Handled as an ordinary model turn, not a content-publish proposal.\nArtifact: /tmp/fixture-marker.txt\nSHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
       }),
     }
 
@@ -652,7 +697,7 @@ describe('buildExecutePrompt/buildExecuteSystem — external_source (Linear) get
     const model: ModelPort = {
       chat: vi.fn(async (messages: ModelMessage[]) => {
         captured = messages
-        return 'Handled — no directives followed.'
+        return 'Handled — no directives followed.\nArtifact: /tmp/fixture-marker.txt\nSHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
       }),
     }
 
@@ -800,9 +845,9 @@ describe('runTaskExecution — usage-derived cost reaches the meter (cache-telem
   // A model that reports DeepSeek-style usage: 1000 fresh input + 9000 cache-hit
   // input + 512 output, on deepseek-v4-pro (hit .003625 / miss .435 / out .87).
   const usageModel = (): ModelPort & { chatWithUsage: ReturnType<typeof vi.fn> } => ({
-    chat: vi.fn(async () => 'Work product.'),
+    chat: vi.fn(async () => 'Work product.' + WITH_ARTIFACT_EVIDENCE),
     chatWithUsage: vi.fn(async () => ({
-      text: 'Work product.',
+      text: 'Work product.' + WITH_ARTIFACT_EVIDENCE,
       usage: { input: 1000, output: 512, cacheRead: 9000 },
     })),
   })
@@ -832,7 +877,7 @@ describe('runTaskExecution — usage-derived cost reaches the meter (cache-telem
   it('falls back to the estimate when the model has no chatWithUsage', async () => {
     const agent: Agent = { ...AGENT, model: 'deepseek-v4-pro' }
     const { env } = makeEnv({ task: makeTask() })
-    const model: ModelPort = { chat: vi.fn(async () => 'Work product.') }
+    const model: ModelPort = { chat: vi.fn(async () => 'Work product.' + WITH_ARTIFACT_EVIDENCE) }
     const recordTokens = vi.fn()
     await runTaskExecution(env, agent, 'task-1', {
       model,

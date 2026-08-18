@@ -172,7 +172,9 @@ function makeEnv(opts: { task: Task | null }) {
   return { env: env as never as Env, updates }
 }
 
-const okModel: ModelPort = { chat: vi.fn(async () => 'Here is the completed work.') }
+// mupot#76e25fc2 (FLIGHT-07B): a completion reaching review/done needs
+// Artifact:/SHA256: evidence now.
+const okModel: ModelPort = { chat: vi.fn(async () => 'Here is the completed work.\nArtifact: /tmp/fixture-marker.txt\nSHA256: ' + 'a'.repeat(64)) }
 
 // Meter stub: always permits execution (checkAndReserve ok), recordTokens no-op.
 const permissiveMeter = {
