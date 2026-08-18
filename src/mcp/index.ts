@@ -1618,6 +1618,105 @@ const toolTaskVerdict: ToolSpec = {
   },
 }
 
+// task_verdict_reversal — the missing correction path (mupot#1181). Once a task
+// moves to approved/rejected, task_verdict refuses (status !== 'review') and
+// task_update makes those statuses non-patchable by design — so a wrong verdict
+// was PERMANENT, for anyone, through any tool. This does not add a second way to
+// write a verdict; it returns the task to 'review' so the EXISTING task_verdict
+// path re-verdicts it, with self-verdict prevention and gate-capability checks
+// applying exactly as they always do. Narrower than task_verdict, not looser:
+// org owner/admin only, mandatory reason, and the prior decision is preserved in
+// an append-only receipt (0114) before it is overwritten by the next verdict.
+const toolTaskVerdictReversal: ToolSpec = {
+  name: 'task_verdict_reversal',
+  scope: 'squad (of the task)',
+  min: 'admin',
+  args: '{ task_id: string, reason: string }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      task_id: STRING_SCHEMA,
+      reason: STRING_SCHEMA,
+    },
+    required: ['task_id', 'reason'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const taskRef = str(args.task_id)
+    if (!taskRef) return fail(400, 'invalid_args', 'task_id required')
+    const reason = typeof args.reason === 'string' ? args.reason.trim() : ''
+    if (!reason) return fail(400, 'reason_required', { detail: 'a non-empty reason is required to reverse a verdict' })
+
+    const taskRes = await getTask(env, taskRef)
+    if (!taskRes.ok) return taskRes
+    const task = taskRes.task
+
+    // Org owner/admin only, on BOTH authority planes — same fix as #1180's
+    // gate_owner_immutable check, applied here from the start rather than found
+    // the hard way a second time. See isOrgOwnerAdmin's own comment for why
+    // hasWorkspaceAdmin or auth.role alone are each individually wrong.
+    if (!isOrgOwnerAdmin(auth)) {
+      return fail(403, 'forbidden', { need: 'org_owner_or_admin' })
+    }
+    if (task.status !== 'approved' && task.status !== 'rejected') {
+      return fail(409, 'not_reversible', {
+        status: task.status,
+        detail: 'only an approved or rejected task carries a verdict to reverse',
+      })
+    }
+
+    // The verdict being reversed — read from task_verdicts (the gate-decision
+    // audit table), NOT task.result. task.result is the AGENT's own execution
+    // output; the decider's note lives in a separate row (src/tasks/service.ts
+    // writeVerdict). Conflating the two was the exact mistake that made a
+    // contaminated result field look like it spoke for the gate's judgement
+    // (mupot#1181's own origin story, hadi-mac a5e45082).
+    const priorVerdict = await env.DB.prepare(
+      `SELECT decided_by, note FROM task_verdicts WHERE task_id = ?1 ORDER BY decided_at DESC LIMIT 1`,
+    )
+      .bind(task.id)
+      .first<{ decided_by: string | null; note: string | null }>()
+
+    const now = new Date().toISOString()
+
+    // Conditional UPDATE, same K5 shape as writeVerdict's own flip: only succeeds
+    // while status still matches what we just read, so a concurrent second
+    // reversal (or an unrelated status change) cannot silently double-apply.
+    const flip = await env.DB.prepare(
+      `UPDATE tasks SET status = 'review', updated_at = ?1 WHERE id = ?2 AND status = ?3`,
+    )
+      .bind(now, task.id, task.status)
+      .run()
+    if (!flip.meta.changes || flip.meta.changes === 0) {
+      return fail(409, 'verdict_race', { detail: 'task status changed before the reversal could apply' })
+    }
+
+    const principal = verdictPrincipal(auth)
+    await env.DB.prepare(
+      `INSERT INTO verdict_reversals
+         (id, tenant, task_id, squad_id, from_status, prior_decided_by, prior_note,
+          reason, actor_id, actor_type)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'member')`,
+    )
+      .bind(
+        crypto.randomUUID(),
+        env.TENANT_SLUG,
+        task.id,
+        task.squad_id,
+        task.status,
+        priorVerdict?.decided_by ?? null,
+        priorVerdict?.note ?? null,
+        reason,
+        principal.id,
+      )
+      .run()
+
+    const reopened = await getTask(env, task.id)
+    if (!reopened.ok) return reopened
+    return done({ task: reopened.task })
+  },
+}
+
 // task_dispatch — wake the task's persisted assignee in execute mode. The caller
 // chooses only the task; the assignee and target squad are data-derived. Assignment
 // is revalidated immediately before emit, and runTaskExecution rechecks it again at
@@ -3757,6 +3856,7 @@ export const TOOLS: ToolSpec[] = [
   toolKanbanBoard,
   toolTaskUpdate,
   toolTaskVerdict,
+  toolTaskVerdictReversal,
   toolTaskDispatch,
   toolTaskIntakeAudit,
   toolRemember,
