@@ -788,9 +788,16 @@ describe("the sleeping/next_run_at invariant the reaper's absence-branch depends
   function flightSleepWrites(): string[] {
     const { readFileSync, readdirSync, statSync } = require('node:fs') as typeof import('node:fs')
     const { join } = require('node:path') as typeof import('node:path')
-    const root = join(__dirname, '..', 'src')
     const found: string[] = []
 
+    // BOTH src/ AND migrations/. Loom's follow-up on #1153: the first version of this walk
+    // covered src/**/*.ts only, so a MIGRATION BACKFILL — one of the exact two threats named
+    // in the comment above — would not have gone red. A guard that misses half the writer
+    // classes it names is the prose problem again, wearing a test as a disguise.
+    //
+    // At the time of writing the only `UPDATE flights` in migrations/ is 0094, which sets
+    // dispatched_by_agent_id, not status. That is the point: it is clean NOW, and nothing
+    // was watching it.
     const walk = (dir: string): void => {
       for (const entry of readdirSync(dir)) {
         const full = join(dir, entry)
@@ -798,7 +805,7 @@ describe("the sleeping/next_run_at invariant the reaper's absence-branch depends
           walk(full)
           continue
         }
-        if (!entry.endsWith('.ts')) continue
+        if (!entry.endsWith('.ts') && !entry.endsWith('.sql')) continue
         const src = readFileSync(full, 'utf8')
         // UPDATE statements against `flights` that set status to 'sleeping', in any quoting
         // or spacing style.
@@ -810,7 +817,8 @@ describe("the sleeping/next_run_at invariant the reaper's absence-branch depends
         }
       }
     }
-    walk(root)
+    walk(join(__dirname, '..', 'src'))
+    walk(join(__dirname, '..', 'migrations'))
     return found
   }
 
