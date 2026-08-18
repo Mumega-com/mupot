@@ -510,8 +510,18 @@ export async function sweepStalledFlights(
       )
       if (result.transitioned) reaped += 1
       else failed += 1
-    } catch {
+    } catch (error) {
       // Fail-soft: a single bad flight must not strand the rest of the pass.
+      //
+      // But fail-soft is not fail-SILENT. Swallowing the error whole leaves a reap that
+      // threw indistinguishable from one that was refused, and both merely increment the
+      // same counter — the exact shape logged as a silent no-op elsewhere in this repo
+      // (mupot#1143, #1150). The flight id and cause are recorded so a persistently
+      // failing flight is attributable rather than just a number.
+      console.error(
+        `[flight-watchdog] reap threw for flight ${flight.id}: ` +
+          `${error instanceof Error ? error.message : String(error)}`,
+      )
       failed += 1
     }
   }

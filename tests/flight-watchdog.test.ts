@@ -28,7 +28,7 @@
 // refuses outright), and both are pinned below, including an end-to-end sweep test that only
 // goes red when BOTH defences are removed.
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
 import {
@@ -699,6 +699,58 @@ describe('sweepStalledFlights — the scheduled pass (mupot#1138)', () => {
     const complete = await sweepStalledFlights(env, { nowMs: T0 + 70 * MINUTE, limit: 50 })
     expect(complete.capped, 'room to spare — this pass really did see everything').toBe(false)
     expect(complete.reaped).toBe(1)
+  })
+
+  it('fail-soft is not fail-silent: one throwing flight is logged, counted, and does NOT strand the rest', async () => {
+    // Loom's follow-up on #1151. The catch existed and was correct in shape, but it swallowed
+    // the error whole — a reap that THREW was indistinguishable from one that was REFUSED, and
+    // both just incremented `failed`. That is the same silent-no-op shape filed as #1143/#1150.
+    seedFlight({ id: 'fl-poison', started_at: T0, created_at: T0 })
+    seedFlight({ id: 'fl-survivor', started_at: T0, created_at: T0 + 1 })
+
+    // Poison the reap UPDATE for exactly one flight, at the real DB boundary, so the throw
+    // originates inside reapStalledFlight rather than being simulated around it.
+    const realPrepare = env.DB.prepare.bind(env.DB)
+    const poisoned = {
+      ...env,
+      DB: {
+        ...env.DB,
+        prepare(sql: string) {
+          const stmt = realPrepare(sql)
+          if (!sql.includes('UPDATE flights')) return stmt
+          const realBind = stmt.bind.bind(stmt)
+          return Object.assign(Object.create(stmt as object), {
+            // Throw at bind, not by swapping run(): spreading a statement drops its prototype
+            // methods, so the "poison" would fire as a TypeError on an unrelated call and the
+            // test would pass for the wrong reason. Ask me how I know.
+            bind(...args: unknown[]) {
+              if (args.includes('fl-poison')) throw new Error('d1 write exploded')
+              return realBind(...args)
+            },
+          })
+        },
+      },
+    } as unknown as Env
+
+    const errors: string[] = []
+    const spy = vi.spyOn(console, 'error').mockImplementation((...a: unknown[]) => {
+      errors.push(a.map(String).join(' '))
+    })
+    try {
+      const res = await sweepStalledFlights(poisoned, { nowMs: T0 + 70 * MINUTE })
+
+      expect(res.failed, 'the throwing flight is counted, not swallowed').toBe(1)
+      expect(res.reaped, 'the survivor is still reaped — one bad row strands nothing').toBe(1)
+      expect((await loadFlight('fl-survivor')).status).toBe('failed')
+      expect((await loadFlight('fl-poison')).status, 'the throw left it untouched').toBe('running')
+
+      const logged = errors.filter((line) => line.includes('[flight-watchdog]'))
+      expect(logged, 'a swallowed throw is unattributable — the flight id must be logged').toHaveLength(1)
+      expect(logged[0]).toContain('fl-poison')
+      expect(logged[0]).toContain('d1 write exploded')
+    } finally {
+      spy.mockRestore()
+    }
   })
 
   it('scanStalledFlights reports the window; listStalledFlights stays the plain array', async () => {
