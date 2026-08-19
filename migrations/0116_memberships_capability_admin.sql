@@ -18,14 +18,27 @@
 -- Copy only rows whose parents exist. Orphans are QUARANTINED, not silently
 -- dropped (#1172). Authority rows carrying owner/admin used to vanish during
 -- migration with no count, no receipt, no trail — and Digid/Viamar were not
--- measured. The quarantine table preserves them for inspection and audit.
--- New orphans cannot accumulate while CASCADE is enforced (0112).
+-- measured. The quarantine table preserves them for inspection and audit; it does
+-- NOT count them or write a receipt (see the quarantine statement below).
+-- New orphans cannot accumulate while CASCADE is enforced (0117).
 
 PRAGMA foreign_keys = off;
 
--- #1172: quarantine orphan memberships before the rebuild. This is the
--- agent_connection_migration_guard idiom from 0071:47-49 — count and
--- preserve rather than silently drop.
+-- #1172, PARTIAL: quarantine orphan memberships before the rebuild, so authority
+-- rows carrying owner/admin are PRESERVED rather than silently dropped.
+--
+-- COUNT AND RECEIPT ARE **NOT IMPLEMENTED** HERE. #1172 has two halves — "silently
+-- drops" and "no count, no receipt". Only the first is closed by this statement. The
+-- rows survive and are inspectable in the quarantine table; nothing emits a count and
+-- nothing writes a receipt. Said plainly because an earlier version of this comment
+-- claimed "count and preserve", and that phrasing caused the scope of #1172 to be
+-- misread twice in one night — once by the author, once by the gate.
+--
+-- It also cited "the agent_connection_migration_guard idiom from 0071:47-49". That
+-- citation was wrong: 0071:47-49 is a CHECK(ok=1) guard with INSERT...SELECT 0 arms
+-- that ABORTS the migration on bad rows. It preserves nothing and counts nothing —
+-- the opposite of what happens here. Citation removed rather than repaired; a
+-- reference nobody opens transfers borrowed authority, and this one was fabricated.
 CREATE TABLE IF NOT EXISTS memberships_orphan_quarantine_0116 AS
 SELECT m.id, m.agent_id, m.squad_id, m.capability
   FROM memberships m
