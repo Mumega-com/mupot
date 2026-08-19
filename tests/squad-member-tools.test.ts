@@ -939,4 +939,117 @@ describe('0116 memberships rebuild is defensive on D1 (FK pragma is a no-op)', (
     ).get() as { n: number }
     expect(kept.n).toBeGreaterThan(0)
   })
+
+  // ── #1171, residual (2) third leg. Athena's M6 mutation SURVIVED 35/35: reverting the
+  // app-path prior read from `memberships` back to `capabilities` broke nothing, because
+  // no test planted the one state where the two sources DISAGREE.
+  //
+  // They disagree exactly when a membership row exists and the capabilities grant does NOT.
+  // Reading from `capabilities` then yields null, classifyResult sees null and returns
+  // 'created' — a DEMOTION recorded as a first-time grant, with prior_capability blank. The
+  // audit trail loses the fact that authority was taken away.
+  //
+  // Two cases, because they fail for different reasons and one alone leaves a hole.
+
+  it('records the prior capability from memberships when the capabilities grant is ABSENT', async () => {
+    // Case A — the general defect. No owner involved, so this is independent of the rank
+    // guard: any membership without a matching capabilities row discriminates the two reads.
+    // Home is HOME_SQUAD_ID and the membership is on TARGET_SQUAD_ID so home_squad_immutable
+    // cannot fire and confound the result.
+    harness.sqlite.exec(`
+      INSERT INTO members (id, display_name, status, tenant)
+      VALUES ('member-nogrant', 'No Grant Member', 'active', '${TENANT}');
+      INSERT INTO agents (id, squad_id, slug, name, status)
+      VALUES ('agent-nogrant', '${HOME_SQUAD_ID}', 'nogrant', 'No Grant', 'active');
+      INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+      VALUES ('${TENANT}', 'agent-nogrant', 'member-nogrant', '2026-08-19T00:00:00Z');
+      INSERT INTO memberships (id, agent_id, squad_id, capability)
+      VALUES ('mem-nogrant', 'agent-nogrant', '${TARGET_SQUAD_ID}', 'member');
+    `)
+
+    // Precondition, asserted rather than assumed: the capabilities row really is absent.
+    // If a fixture ever starts creating one, this test would silently stop discriminating.
+    const before = harness.sqlite.prepare(
+      `SELECT capability FROM capabilities
+        WHERE member_id = ? AND scope_type = 'squad' AND scope_id = ?`,
+    ).get('member-nogrant', TARGET_SQUAD_ID)
+    expect(before).toBeUndefined()
+
+    const result = await invokeTool(
+      operatorAuth(),
+      env,
+      'squad_member_add',
+      { agent: 'agent-nogrant', squad: TARGET_SQUAD_ID, capability: 'observer' },
+      'https://pot.test',
+    )
+    expect(result.ok).toBe(true)
+
+    const receipt = harness.sqlite.prepare(
+      `SELECT prior_capability, capability, result
+         FROM membership_receipts WHERE target_agent_id = ?`,
+    ).get('agent-nogrant') as {
+      prior_capability: string | null
+      capability: string
+      result: string
+    }
+    // Reading from `capabilities` would make both of these wrong: null and 'created'.
+    expect(receipt.prior_capability).toBe('member')
+    expect(receipt.result).toBe('updated')
+    expect(receipt.capability).toBe('observer')
+  })
+
+  it('records prior_capability owner on a demotion, which the capabilities grant can never hold', async () => {
+    // Case B — the scenario named in #1171. Even when a capabilities row EXISTS it can never
+    // say 'owner', because isAgentAccessCapability filters that value out. So a
+    // demotion-from-owner is the one case where the wrong source is not merely stale but
+    // structurally incapable of holding the right answer.
+    //
+    // The actor holds 'owner' on the target squad: the #1169 target-rank guard refuses
+    // anyone below the target's current rank, so a lead or admin cannot reach this path
+    // at all (see the two cannot_affect_higher_rank cases above).
+    const ownerAuth: AuthContext = {
+      ...leadAuth(),
+      capabilities: [
+        {
+          member_id: HADI_MEMBER_ID,
+          scope_type: 'squad',
+          scope_id: TARGET_SQUAD_ID,
+          capability: 'owner',
+        },
+      ],
+    }
+
+    harness.sqlite.exec(`
+      INSERT INTO members (id, display_name, status, tenant)
+      VALUES ('member-demote-owner', 'Demote Owner Member', 'active', '${TENANT}');
+      INSERT INTO agents (id, squad_id, slug, name, status)
+      VALUES ('agent-demote-owner', '${HOME_SQUAD_ID}', 'demote-owner', 'Demote Owner', 'active');
+      INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+      VALUES ('${TENANT}', 'agent-demote-owner', 'member-demote-owner', '2026-08-19T00:00:00Z');
+      INSERT INTO memberships (id, agent_id, squad_id, capability)
+      VALUES ('mem-demote-owner', 'agent-demote-owner', '${TARGET_SQUAD_ID}', 'owner');
+    `)
+
+    const result = await invokeTool(
+      ownerAuth,
+      env,
+      'squad_member_add',
+      { agent: 'agent-demote-owner', squad: TARGET_SQUAD_ID, capability: 'member' },
+      'https://pot.test',
+    )
+    expect(result.ok).toBe(true)
+
+    const receipt = harness.sqlite.prepare(
+      `SELECT prior_capability, capability, result
+         FROM membership_receipts WHERE target_agent_id = ?`,
+    ).get('agent-demote-owner') as {
+      prior_capability: string | null
+      capability: string
+      result: string
+    }
+    // The whole point of #1171: this must read 'owner', not null and not 'created'.
+    expect(receipt.prior_capability).toBe('owner')
+    expect(receipt.result).toBe('updated')
+    expect(receipt.capability).toBe('member')
+  })
 })
