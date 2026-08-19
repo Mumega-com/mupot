@@ -641,15 +641,32 @@ describe('squad membership delete receipts (cascade, mupot#1164)', () => {
       'SELECT COUNT(*) AS n FROM memberships WHERE agent_id = ?',
     ).get(unboundId)).toEqual({ n: 0 })
     const removal = harness.sqlite.prepare(
-      `SELECT actor_member_id, prior_capability, result
+      `SELECT id, tenant, actor_member_id, prior_capability, result
          FROM membership_receipts
         WHERE target_agent_id = ? AND action = 'remove'`,
-    ).get(unboundId) as { actor_member_id: string; prior_capability: string; result: string }
-    expect(removal).toEqual({
-      actor_member_id: 'system:cascade',
-      prior_capability: 'lead',
-      result: 'removed',
-    })
+    ).get(unboundId) as {
+      id: string
+      tenant: string
+      actor_member_id: string
+      prior_capability: string
+      result: string
+    }
+    expect(removal.actor_member_id).toBe('system:cascade')
+    expect(removal.prior_capability).toBe('lead')
+    expect(removal.result).toBe('removed')
+
+    // #1170: the cascade trigger records tenant='system' with NO COALESCE fallback. A
+    // trigger cannot see env.TENANT_SLUG and therefore cannot know the tenant; the
+    // previous COALESCE chain GUESSED, and sometimes guessed wrong, hiding a revocation
+    // from a tenant-scoped audit while the matching grant stayed visible. Asserting the
+    // literal is the point — if a future reader reinstates a "helpful" fallback because
+    // 'system' looks like a placeholder, this goes red.
+    expect(removal.tenant).toBe('system')
+
+    // #1173: the receipt id carries a random suffix so a REUSED membership id cannot
+    // collide on the UNIQUE constraint. Shape, not value — the suffix is random by
+    // design. The pre-fix form ('cascade-' || OLD.id, no suffix) fails this.
+    expect(removal.id).toMatch(/^cascade-mem-unbound-del-[0-9a-f]{8}$/)
     expect(harness.sqlite.prepare(
       `SELECT COUNT(*) AS n FROM membership_receipts
         WHERE target_agent_id = ? AND action = 'add'`,
@@ -753,6 +770,67 @@ describe('target-rank guard — cannot affect a member at or above your own rank
       env,
       'squad_member_remove',
       { agent: 'agent-owner-target', squad: TARGET_SQUAD_ID },
+      'https://pot.test',
+    )
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error).toBe('cannot_affect_higher_rank')
+  })
+
+  it('lead cannot remove an owner whose membership is NOT on its home squad', async () => {
+    // Residual (1) from Athena's #1164 gate. The test above plants agent-owner-target
+    // with home squad == TARGET_SQUAD_ID, so home_squad_immutable is ALSO applicable on
+    // that path — two guards can fire and only one is under test. It is not vacuous (it
+    // asserts the specific error), but it never proves the general case: that rank alone
+    // stops a lead acting on an owner.
+    //
+    // Here the agent's home is HOME_SQUAD_ID and the owner membership is on
+    // TARGET_SQUAD_ID, so home_squad_immutable cannot apply and cannot_affect_higher_rank
+    // is the ONLY thing that can refuse. That makes this the discriminating case.
+    harness.sqlite.exec(`
+      INSERT INTO members (id, display_name, status, tenant)
+      VALUES ('member-owner-away', 'Owner Away Member', 'active', '${TENANT}');
+      INSERT INTO agents (id, squad_id, slug, name, status)
+      VALUES ('agent-owner-away', '${HOME_SQUAD_ID}', 'owner-away', 'Owner Away', 'active');
+      INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+      VALUES ('${TENANT}', 'agent-owner-away', 'member-owner-away', '2026-08-19T00:00:00Z');
+      INSERT INTO memberships (id, agent_id, squad_id, capability)
+      VALUES ('mem-owner-away', 'agent-owner-away', '${TARGET_SQUAD_ID}', 'owner');
+    `)
+    const result = await invokeTool(
+      leadAuth(),
+      env,
+      'squad_member_remove',
+      { agent: 'agent-owner-away', squad: TARGET_SQUAD_ID },
+      'https://pot.test',
+    )
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error).toBe('cannot_affect_higher_rank')
+  })
+
+  it('lead cannot demote an owner on a squad that is not the owner home squad', async () => {
+    // The add/demote half of the same discrimination — #1169 covers BOTH verbs, and a
+    // guard that only held on remove would pass the test above while leaving demotion open.
+    //
+    // Fixture is planted here rather than reused from the test above: the harness resets
+    // between cases, so borrowing that agent produced 'agent_not_found' and would have
+    // been a test passing for a reason unrelated to what it claims to check.
+    harness.sqlite.exec(`
+      INSERT INTO members (id, display_name, status, tenant)
+      VALUES ('member-owner-away2', 'Owner Away Two', 'active', '${TENANT}');
+      INSERT INTO agents (id, squad_id, slug, name, status)
+      VALUES ('agent-owner-away2', '${HOME_SQUAD_ID}', 'owner-away2', 'Owner Away Two', 'active');
+      INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+      VALUES ('${TENANT}', 'agent-owner-away2', 'member-owner-away2', '2026-08-19T00:00:00Z');
+      INSERT INTO memberships (id, agent_id, squad_id, capability)
+      VALUES ('mem-owner-away2', 'agent-owner-away2', '${TARGET_SQUAD_ID}', 'owner');
+    `)
+    const result = await invokeTool(
+      leadAuth(),
+      env,
+      'squad_member_add',
+      { agent: 'agent-owner-away2', squad: TARGET_SQUAD_ID, capability: 'member' },
       'https://pot.test',
     )
     expect(result.ok).toBe(false)
