@@ -47,6 +47,12 @@ import { createCredentialClaim, CLAIM_TTL_SECONDS } from '../auth/credential-cla
 import { revokeMemberToken } from '../members/service'
 import { setAgentSquadAccess, type AgentAccessCapability } from '../members/agent-access'
 import {
+  GRANTABLE_SQUAD_MEMBER_CAPABILITIES,
+  addSquadMember,
+  listSquadMembers,
+  removeSquadMember,
+} from '../members/squad-membership'
+import {
   provisionAgentConnection,
   type AgentConnectionOutcome,
 } from '../members/agent-connection'
@@ -100,13 +106,16 @@ async function emitProvisioned(
     | 'capability'
     | 'agent_deactivated'
     | 'agent_updated'
-    | 'squad_updated',
+    | 'squad_updated'
+    | 'membership'
+    | 'membership_removed',
   id: string,
   extra: {
     squad_id?: string
     agent_id?: string
     member_id?: string
     capability?: Capability
+    receipt_id?: string
     reason?: string
     // A profile correction keeps no history on the row (agents has no
     // updated_at), so the field-level before/after must ride on the event or
@@ -120,6 +129,7 @@ async function emitProvisioned(
     by: string
     member_id?: string
     capability?: Capability
+    receipt_id?: string
     reason?: string
     changed?: Record<string, { from: unknown; to: unknown }>
   }> = {
@@ -134,6 +144,7 @@ async function emitProvisioned(
       by: memberId,
       ...(extra.member_id ? { member_id: extra.member_id } : {}),
       ...(extra.capability ? { capability: extra.capability } : {}),
+      ...(extra.receipt_id ? { receipt_id: extra.receipt_id } : {}),
       ...(extra.reason ? { reason: extra.reason } : {}),
       ...(extra.changed ? { changed: extra.changed } : {}),
     },
@@ -1399,6 +1410,166 @@ const toolDeactivateAgent: ToolSpec = {
   },
 }
 
+function membershipWriteFail(error: string): ReturnType<typeof fail> {
+  if (error === 'self_grant') return fail(403, 'self_grant', 'nobody adds or removes themselves')
+  if (error === 'forbidden') return fail(403, 'forbidden', { need: 'lead', scope: 'squad' })
+  if (error === 'cannot_grant_above_own_rank') return fail(403, 'cannot_grant_above_own_rank')
+  if (error === 'missing_member_identity') return fail(403, 'forbidden', { need: 'member_identity' })
+  if (error === 'agent_not_found' || error === 'squad_not_found') return fail(404, error)
+  if (error === 'receipt_failed') return fail(500, error)
+  if (error === 'agent_identity_unminted') {
+    return fail(409, 'agent_identity_unminted', 'call mint_agent_token before granting membership')
+  }
+  if (error === 'home_squad_immutable') return fail(409, 'home_squad_immutable')
+  return fail(409, error)
+}
+
+// ── squad_member_add / remove / list (mupot#1161) ─────────────────────────────
+// Write path for the memberships table that has existed since 0001. Owner-granted
+// on the TARGET squad, never self-granted. Rank ceiling: cannot grant above own
+// capability on that squad. `owner` is not grantable. Add and remove share the
+// same authorizeSquadMembershipWrite predicate — no #1140 inversion.
+
+const toolSquadMemberAdd: ToolSpec = {
+  name: 'squad_member_add',
+  scope: 'target squad',
+  min: 'lead',
+  args: '{ agent: string (id|slug), squad: string (id|slug), capability: "observer"|"member"|"lead"|"admin" }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      agent: STRING_SCHEMA,
+      squad: STRING_SCHEMA,
+      capability: { type: 'string', enum: ['observer', 'member', 'lead', 'admin'] },
+    },
+    required: ['agent', 'squad', 'capability'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
+    const agentRef = str(args.agent)
+    if (!agentRef) return fail(400, 'invalid_args', 'agent required')
+    const squadRef = str(args.squad)
+    if (!squadRef) return fail(400, 'invalid_args', 'squad required')
+    const requested = str(args.capability)
+    if (!requested || !GRANTABLE_SQUAD_MEMBER_CAPABILITIES.has(requested as Capability)) {
+      return fail(400, 'invalid_capability', 'capability must be observer, member, lead, or admin — not owner')
+    }
+    const capability = requested as AgentAccessCapability
+
+    const agentResult = await resolveAgentRef(env, agentRef)
+    if (!agentResult.ok) return resolveFail(agentResult.reason, 'agent_not_found')
+    const squadResult = await resolveSquadRef(env, squadRef)
+    if (!squadResult.ok) return resolveFail(squadResult.reason, 'squad_not_found')
+
+    const outcome = await addSquadMember({
+      env,
+      auth,
+      agentId: agentResult.value.id,
+      squad: squadResult.value,
+      capability,
+    })
+    if (!outcome.ok) return membershipWriteFail(outcome.error)
+
+    await emitProvisioned(env, auth.memberId as string, 'membership', squadResult.value.id, {
+      squad_id: squadResult.value.id,
+      agent_id: agentResult.value.id,
+      member_id: outcome.memberId,
+      capability,
+      receipt_id: outcome.receiptId,
+    })
+    return done({
+      agent: { id: agentResult.value.id },
+      squad: { id: squadResult.value.id },
+      capability,
+      result: outcome.result,
+      receipt_id: outcome.receiptId,
+    })
+  },
+}
+
+const toolSquadMemberRemove: ToolSpec = {
+  name: 'squad_member_remove',
+  scope: 'target squad',
+  min: 'lead',
+  args: '{ agent: string (id|slug), squad: string (id|slug) }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      agent: STRING_SCHEMA,
+      squad: STRING_SCHEMA,
+    },
+    required: ['agent', 'squad'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
+    const agentRef = str(args.agent)
+    if (!agentRef) return fail(400, 'invalid_args', 'agent required')
+    const squadRef = str(args.squad)
+    if (!squadRef) return fail(400, 'invalid_args', 'squad required')
+
+    const agentResult = await resolveAgentRef(env, agentRef)
+    if (!agentResult.ok) return resolveFail(agentResult.reason, 'agent_not_found')
+    const squadResult = await resolveSquadRef(env, squadRef)
+    if (!squadResult.ok) return resolveFail(squadResult.reason, 'squad_not_found')
+
+    const outcome = await removeSquadMember({
+      env,
+      auth,
+      agentId: agentResult.value.id,
+      squad: squadResult.value,
+    })
+    if (!outcome.ok) return membershipWriteFail(outcome.error)
+
+    if (outcome.result === 'removed') {
+      await emitProvisioned(env, auth.memberId as string, 'membership_removed', squadResult.value.id, {
+        squad_id: squadResult.value.id,
+        agent_id: agentResult.value.id,
+        receipt_id: outcome.receiptId,
+      })
+    }
+    return done({
+      agent: { id: agentResult.value.id },
+      squad: { id: squadResult.value.id },
+      result: outcome.result,
+      receipt_id: outcome.receiptId || null,
+    })
+  },
+}
+
+const toolSquadMemberList: ToolSpec = {
+  name: 'squad_member_list',
+  scope: 'target squad',
+  min: 'observer',
+  args: '{ squad: string (id|slug) }',
+  inputSchema: {
+    type: 'object',
+    properties: { squad: STRING_SCHEMA },
+    required: ['squad'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const squadRef = str(args.squad)
+    if (!squadRef) return fail(400, 'invalid_args', 'squad required')
+    const squadResult = await resolveSquadRef(env, squadRef)
+    if (!squadResult.ok) return resolveFail(squadResult.reason, 'squad_not_found')
+
+    const outcome = await listSquadMembers({
+      env,
+      auth,
+      squadId: squadResult.value.id,
+    })
+    if (!outcome.ok) {
+      if (outcome.error === 'forbidden') {
+        return fail(403, 'forbidden', { need: 'observer', scope: 'squad' })
+      }
+      return fail(403, 'forbidden', { need: 'member_identity' })
+    }
+    return done({ squad: { id: squadResult.value.id }, members: outcome.members })
+  },
+}
+
 export const PROVISION_TOOLS: ToolSpec[] = [
   toolCreateDepartment,
   toolCreateSquad,
@@ -1410,6 +1581,9 @@ export const PROVISION_TOOLS: ToolSpec[] = [
   toolRevokeAgentToken,
   toolProvisionAgentConnection,
   toolGrantAgentCapability,
+  toolSquadMemberAdd,
+  toolSquadMemberRemove,
+  toolSquadMemberList,
   toolRegisterAgentKey,
   toolDeactivateAgent,
   toolUpdateAgent,

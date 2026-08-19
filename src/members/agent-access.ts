@@ -156,7 +156,7 @@ async function priorAccess(
 
 function classifyResult(
   membership: PriorMembership | null,
-  priorCapability: AgentAccessCapability | null,
+  priorCapability: string | null,
   requested: AgentAccessCapability,
 ): 'created' | 'updated' | 'unchanged' {
   if (priorCapability === null) return 'created'
@@ -216,7 +216,7 @@ export async function prepareAgentSquadAccess(
     id: prior.membership?.id ?? crypto.randomUUID(),
     agent_id: input.agentId,
     squad_id: input.squadId,
-    capability: 'member',
+    capability: input.capability,
   }
   const grant: CapabilityGrant = {
     member_id: input.memberId,
@@ -229,7 +229,7 @@ export async function prepareAgentSquadAccess(
   const membershipStatement = bindingGuard
     ? env.DB.prepare(
         `INSERT INTO memberships (id, agent_id, squad_id, capability)
-         SELECT ?, ?, ?, 'member'
+         SELECT ?, ?, ?, ?
           WHERE EXISTS (
             SELECT 1
               FROM agent_member_bindings
@@ -238,21 +238,22 @@ export async function prepareAgentSquadAccess(
                AND member_id = ?
           )
          ON CONFLICT(agent_id, squad_id)
-         DO UPDATE SET capability = 'member'`,
+         DO UPDATE SET capability = excluded.capability`,
       ).bind(
         membership.id,
         input.agentId,
         input.squadId,
+        input.capability,
         env.TENANT_SLUG,
         input.agentId,
         input.memberId,
       )
     : env.DB.prepare(
         `INSERT INTO memberships (id, agent_id, squad_id, capability)
-         VALUES (?, ?, ?, 'member')
+         VALUES (?, ?, ?, ?)
          ON CONFLICT(agent_id, squad_id)
-         DO UPDATE SET capability = 'member'`,
-      ).bind(membership.id, input.agentId, input.squadId)
+         DO UPDATE SET capability = excluded.capability`,
+      ).bind(membership.id, input.agentId, input.squadId, input.capability)
 
   const grantId = crypto.randomUUID()
   const capabilityStatement = bindingGuard
@@ -290,9 +291,13 @@ export async function prepareAgentSquadAccess(
       statements: [membershipStatement, capabilityStatement],
       priorMembership: prior.membership ? 'present' : 'absent',
       priorCapability: prior.capability,
+      // #1171: use the membership's own capability (from memberships table, can
+      // include 'owner') rather than the filtered capabilities grant (excludes
+      // 'owner' via isAgentAccessCapability, making a demotion-from-owner read
+      // as 'created').
       resultAfterCommit: classifyResult(
         prior.membership,
-        prior.capability,
+        prior.membership?.capability ?? null,
         input.capability,
       ),
       membership,
@@ -324,7 +329,7 @@ async function readCommittedAccess(
   ])
   if (
     !membership
-    || membership.capability !== 'member'
+    || membership.capability !== input.capability
     || !grant
     || grant.capability !== input.capability
   ) {
@@ -333,9 +338,10 @@ async function readCommittedAccess(
   return { membership, grant }
 }
 
-export async function setAgentSquadAccess(
+export async function commitAgentSquadAccess(
   env: Env,
   input: SetAgentSquadAccessInput,
+  extraStatementsFor: (prepared: PreparedAgentSquadAccess) => D1PreparedStatement[],
 ): Promise<AgentSquadAccessResult> {
   const state = await loadAgentBindingState(env, input.agentId)
   if (!state) return { ok: false, error: 'agent_not_found' }
@@ -352,7 +358,11 @@ export async function setAgentSquadAccess(
   })
   if (!prepared.ok) return prepared
 
-  const writes = await env.DB.batch(prepared.value.statements)
+  const extras = extraStatementsFor(prepared.value)
+  const writes = await env.DB.batch([
+    ...extras,
+    ...prepared.value.statements,
+  ])
   try {
     assertBatchWritten(writes, 'set_agent_squad_access', 1)
   } catch {
@@ -368,9 +378,17 @@ export async function setAgentSquadAccess(
   }
 }
 
-export async function removeAgentSquadAccess(
+export async function setAgentSquadAccess(
+  env: Env,
+  input: SetAgentSquadAccessInput,
+): Promise<AgentSquadAccessResult> {
+  return commitAgentSquadAccess(env, input, (_prepared) => [])
+}
+
+export async function commitRemoveAgentSquadAccess(
   env: Env,
   input: RemoveAgentSquadAccessInput,
+  extraStatementsFor: (priorCapability: AgentAccessCapability | null) => D1PreparedStatement[],
 ): Promise<AgentSquadAccessResult> {
   const state = await loadAgentBindingState(env, input.agentId)
   if (!state) return { ok: false, error: 'agent_not_found' }
@@ -389,7 +407,10 @@ export async function removeAgentSquadAccess(
     ...input,
     capability: 'member',
   })
+  const removing = prior.membership !== null || prior.capability !== null
+  const extras = removing ? extraStatementsFor(prior.capability) : []
   const writes = await env.DB.batch([
+    ...extras,
     env.DB.prepare(
       `DELETE FROM memberships
         WHERE agent_id = ?
@@ -403,17 +424,29 @@ export async function removeAgentSquadAccess(
     ).bind(input.memberId, input.squadId),
   ])
 
+  const membershipWrite = writes[extras.length]
+  const capabilityWrite = writes[extras.length + 1]
+  if (!membershipWrite || !capabilityWrite) {
+    return { ok: false, error: 'receipt_failed' }
+  }
   if (
     prior.membership !== null
-    && (writes[0].meta?.changes ?? writes[0].meta?.rows_written ?? 0) < 1
+    && (membershipWrite.meta?.changes ?? membershipWrite.meta?.rows_written ?? 0) < 1
   ) {
     return { ok: false, error: 'receipt_failed' }
   }
   if (
     prior.capability !== null
-    && (writes[1].meta?.changes ?? writes[1].meta?.rows_written ?? 0) < 1
+    && (capabilityWrite.meta?.changes ?? capabilityWrite.meta?.rows_written ?? 0) < 1
   ) {
     return { ok: false, error: 'receipt_failed' }
+  }
+  if (extras.length > 0) {
+    try {
+      assertBatchWritten(writes.slice(0, extras.length), 'remove_agent_squad_access_receipt', 1)
+    } catch {
+      return { ok: false, error: 'receipt_failed' }
+    }
   }
 
   const committed = await priorAccess(env, {
@@ -426,7 +459,7 @@ export async function removeAgentSquadAccess(
 
   return {
     ok: true,
-    result: prior.membership || prior.capability ? 'removed' : 'unchanged',
+    result: removing ? 'removed' : 'unchanged',
     membership: {
       id: prior.membership?.id ?? '',
       agent_id: input.agentId,
@@ -440,4 +473,11 @@ export async function removeAgentSquadAccess(
       capability: prior.capability ?? 'member',
     },
   }
+}
+
+export async function removeAgentSquadAccess(
+  env: Env,
+  input: RemoveAgentSquadAccessInput,
+): Promise<AgentSquadAccessResult> {
+  return commitRemoveAgentSquadAccess(env, input, (_priorCapability) => [])
 }

@@ -70,7 +70,7 @@ describe('canonical agent squad access', () => {
 
   afterEach(() => harness.close())
 
-  it('creates one neutral routing membership and one authoritative capability', async () => {
+  it('creates one membership at the requested tier and one matching capability', async () => {
     seedBoundAgent(harness.sqlite)
 
     await expect(setAgentSquadAccess(env, {
@@ -84,7 +84,7 @@ describe('canonical agent squad access', () => {
       membership: {
         agent_id: AGENT_ID,
         squad_id: TARGET_SQUAD_ID,
-        capability: 'member',
+        capability: 'admin',
       },
       grant: {
         member_id: MEMBER_ID,
@@ -95,6 +95,34 @@ describe('canonical agent squad access', () => {
     })
     expect(count(harness.sqlite, 'memberships')).toBe(1)
     expect(count(harness.sqlite, 'capabilities')).toBe(1)
+    expect(harness.sqlite.prepare(
+      'SELECT capability FROM memberships WHERE agent_id = ? AND squad_id = ?',
+    ).get(AGENT_ID, TARGET_SQUAD_ID)).toEqual({ capability: 'admin' })
+  })
+
+  it('does not reset an existing membership tier to member on ON CONFLICT (mupot#1161 clamp)', async () => {
+    seedBoundAgent(harness.sqlite)
+    await expect(setAgentSquadAccess(env, {
+      agentId: AGENT_ID,
+      memberId: MEMBER_ID,
+      squadId: TARGET_SQUAD_ID,
+      capability: 'lead',
+    })).resolves.toMatchObject({ ok: true, result: 'created' })
+
+    await expect(setAgentSquadAccess(env, {
+      agentId: AGENT_ID,
+      memberId: MEMBER_ID,
+      squadId: TARGET_SQUAD_ID,
+      capability: 'admin',
+    })).resolves.toMatchObject({
+      ok: true,
+      result: 'updated',
+      membership: { capability: 'admin' },
+      grant: { capability: 'admin' },
+    })
+    expect(harness.sqlite.prepare(
+      'SELECT capability FROM memberships WHERE agent_id = ? AND squad_id = ?',
+    ).get(AGENT_ID, TARGET_SQUAD_ID)).toEqual({ capability: 'admin' })
   })
 
   it('is idempotent and updates only authoritative rank without duplicating rows', async () => {
@@ -114,7 +142,7 @@ describe('canonical agent squad access', () => {
     })).resolves.toMatchObject({
       ok: true,
       result: 'updated',
-      membership: { capability: 'member' },
+      membership: { capability: 'lead' },
       grant: { capability: 'lead' },
     })
     expect(count(harness.sqlite, 'memberships')).toBe(1)

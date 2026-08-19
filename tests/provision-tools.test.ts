@@ -45,7 +45,12 @@ function makeEnv(opts: Opts = {}, captured: Captured[] = []): Env {
   const agentTokenMembers = opts.agentTokenMembers ?? ['member-agent-1']
   const existingGrantCapabilities = opts.existingGrantCapabilities ?? []
   let accessMembership = existingGrantCapabilities.length > 0
-    ? { id: 'existing-membership-id', agent_id: AGENT.id, squad_id: TARGET_SQUAD.id, capability: 'member' }
+    ? {
+        id: 'existing-membership-id',
+        agent_id: AGENT.id,
+        squad_id: TARGET_SQUAD.id,
+        capability: existingGrantCapabilities[0],
+      }
     : null
   let accessCapability: Capability | null = existingGrantCapabilities[0] ?? null
 
@@ -202,7 +207,7 @@ function makeEnv(opts: Opts = {}, captured: Captured[] = []): Env {
             id: stmts[0].args[0] as string,
             agent_id: stmts[0].args[1] as string,
             squad_id: stmts[0].args[2] as string,
-            capability: 'member',
+            capability: stmts[0].args[3] as Capability,
           }
           accessCapability = stmts[1].args[3] as Capability
           captured.push({ sql: stmts[0].sql, args: stmts[0].args })
@@ -273,6 +278,9 @@ describe('provision tools — advertised', () => {
     expect(names).toContain('verify_agent_connection')
     expect(names).toContain('register_agent_key')
     expect(names).toContain('grant_agent_capability')
+    expect(names).toContain('squad_member_add')
+    expect(names).toContain('squad_member_remove')
+    expect(names).toContain('squad_member_list')
   })
 
   it('advertises grant_agent_capability with its exact schema', async () => {
@@ -827,7 +835,7 @@ describe('grant_agent_capability', () => {
     expect(captured).toEqual([])
   })
 
-  it('never raises the immutable home squad above member', async () => {
+  it('writes the requested capability on the home squad (memberships clamp removed, mupot#1161)', async () => {
     const captured: Captured[] = []
     const res = await call(
       'grant_agent_capability',
@@ -835,7 +843,8 @@ describe('grant_agent_capability', () => {
       makeEnv({}, captured),
     )
     expect(res.status).toBe(200)
-    expect(captured.length).toBeGreaterThan(0)
+    expect(captured.find((row) => row.sql.includes('INSERT INTO memberships'))?.args[3]).toBe('lead')
+    expect(captured.find((row) => row.sql.includes('INSERT INTO capabilities'))?.args[4]).toBe('lead')
   })
 
   it('requires admin on the target squad rather than the agent home squad', async () => {
@@ -920,6 +929,8 @@ describe('provision tools — operator-principal invariant is exhaustive', () =>
     'create_department',
     'create_squad',
     'create_agent',
+    // Read-only membership listing. Observer+ on the target squad. No write.
+    'squad_member_list',
     // Deliberately allows one bound agent to deactivate ANOTHER agent —
     // only self-deactivation is blocked (see the 'cannot_deactivate_self'
     // guard in toolDeactivateAgent and the explicit assertion in

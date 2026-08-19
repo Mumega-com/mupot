@@ -99,7 +99,7 @@ describe('POST /members/:id/capabilities bound-agent delegation', () => {
     })
     expect(harness.sqlite.prepare(
       'SELECT capability FROM memberships WHERE agent_id = ? AND squad_id = ?',
-    ).get(AGENT_ID, TARGET_SQUAD_ID)).toEqual({ capability: 'member' })
+    ).get(AGENT_ID, TARGET_SQUAD_ID)).toEqual({ capability: 'lead' })
     expect(harness.sqlite.prepare(
       `SELECT capability FROM capabilities
         WHERE member_id = ? AND scope_type = 'squad' AND scope_id = ?`,

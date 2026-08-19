@@ -89,7 +89,7 @@ describe('POST /agents/:id/memberships canonical delegation', () => {
       membership: {
         agent_id: AGENT_ID,
         squad_id: TARGET_SQUAD_ID,
-        capability: 'member',
+        capability: 'admin',
       },
       grant: {
         member_id: MEMBER_ID,
@@ -103,7 +103,7 @@ describe('POST /agents/:id/memberships canonical delegation', () => {
     expect(updated.status).toBe(200)
     await expect(updated.json()).resolves.toMatchObject({
       result: 'updated',
-      membership: { capability: 'member' },
+      membership: { capability: 'lead' },
       grant: { capability: 'lead' },
     })
     expect(harness.sqlite.prepare(
