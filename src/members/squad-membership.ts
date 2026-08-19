@@ -20,6 +20,7 @@ export type SquadMembershipWriteDenial =
   | 'self_grant'
   | 'forbidden'
   | 'cannot_grant_above_own_rank'
+  | 'cannot_affect_higher_rank'
 
 export type SquadMembershipMutationError =
   | SquadMembershipWriteDenial
@@ -70,6 +71,28 @@ export async function authorizeSquadMembershipWrite(input: {
   if (!mayMutate) {
     return { ok: false, error: 'forbidden' }
   }
+  // ── Target-rank guard (#1169): the caller must be able to grant the TARGET's
+  // CURRENT rank, not just the requested one. Without this, a lead can strip or
+  // demote an admin/owner because the rank ceiling only guarded the grant side.
+  const targetMembership = await input.env.DB.prepare(
+    `SELECT capability FROM memberships WHERE agent_id = ?1 AND squad_id = ?2 LIMIT 1`,
+  )
+    .bind(input.targetAgentId, input.squad.id)
+    .first<{ capability: string }>()
+  const targetCurrentRank = (targetMembership?.capability ?? null) as Capability | null
+  if (targetCurrentRank !== null) {
+    const canAffectTarget = hasCapability(
+      grants,
+      'squad',
+      input.squad.id,
+      targetCurrentRank,
+      input.squad.department_id,
+    )
+    if (!canAffectTarget) {
+      return { ok: false, error: 'cannot_affect_higher_rank' }
+    }
+  }
+  // ── Requested-rank ceiling: the caller must be able to confer the requested rank.
   if (input.requestedCapability !== null) {
     const canGrant = hasCapability(
       grants,
@@ -142,15 +165,18 @@ export async function addSquadMember(input: {
     return { ok: false, error: 'agent_identity_unminted' }
   }
 
+  // #1171: read prior from memberships (the membership record), not capabilities
+  // (the RBAC grant). memberships.capability is authoritative for rank; the
+  // capabilities table may not have a row, and isAgentAccessCapability filters
+  // out 'owner', making a demotion-from-owner read as 'created'.
   const priorGrant = await input.env.DB.prepare(
     `SELECT capability
-       FROM capabilities
-      WHERE member_id = ?1
-        AND scope_type = 'squad'
-        AND scope_id = ?2
+       FROM memberships
+      WHERE agent_id = ?1
+        AND squad_id = ?2
       LIMIT 1`,
   )
-    .bind(binding.memberId, input.squad.id)
+    .bind(input.agentId, input.squad.id)
     .first<{ capability: string }>()
 
   const receiptId = crypto.randomUUID()
@@ -214,15 +240,15 @@ export async function removeSquadMember(input: {
     return { ok: false, error: 'agent_identity_unminted' }
   }
 
+  // #1171: read prior from memberships, not capabilities (see addSquadMember)
   const prior = await input.env.DB.prepare(
-    `SELECT c.capability
-       FROM capabilities c
-      WHERE c.member_id = ?1
-        AND c.scope_type = 'squad'
-        AND c.scope_id = ?2
+    `SELECT capability
+       FROM memberships
+      WHERE agent_id = ?1
+        AND squad_id = ?2
       LIMIT 1`,
   )
-    .bind(binding.memberId, input.squad.id)
+    .bind(input.agentId, input.squad.id)
     .first<{ capability: string }>()
 
   const receiptId = crypto.randomUUID()

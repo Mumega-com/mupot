@@ -28,12 +28,18 @@ BEGIN
     squad_id, action, capability, prior_capability, result
   )
   VALUES (
-    'cascade-' || OLD.id,
-    COALESCE(
-      (SELECT tenant FROM agent_member_bindings WHERE agent_id = OLD.agent_id LIMIT 1),
-      (SELECT tenant FROM members WHERE tenant IS NOT NULL LIMIT 1),
-      'system'
-    ),
+    -- #1173: include random suffix so a reused membership id cannot collide
+    -- on the UNIQUE constraint (INSERT OR IGNORE is the WRONG fix — it would
+    -- silently drop the receipt, recreating the original blocker this trigger
+    -- exists to close).
+    'cascade-' || OLD.id || '-' || lower(hex(randomblob(4))),
+    -- #1170: a trigger cannot see env.TENANT_SLUG, so it CANNOT determine the
+    -- tenant. The previous COALESCE chain guessed — sometimes wrongly — which
+    -- hid revocation receipts from a tenant-scoped audit while showing the
+    -- grant. 'system' is honest: the trigger records the row death, not the
+    -- tenant. Application-path receipts carry the correct tenant via
+    -- env.TENANT_SLUG. NO COALESCE FALLBACK.
+    'system',
     'system:cascade',
     NULL,
     OLD.agent_id,

@@ -15,10 +15,22 @@
 --
 -- Measured mumega 2026-08-18: 46 memberships, 0 orphan_agent, 0 orphan_squad.
 -- Digid and Viamar were NOT measured from this seat. Do not depend on that.
--- Copy only rows whose parents exist. Orphans are dropped, not fatal.
+-- Copy only rows whose parents exist. Orphans are QUARANTINED, not silently
+-- dropped (#1172). Authority rows carrying owner/admin used to vanish during
+-- migration with no count, no receipt, no trail — and Digid/Viamar were not
+-- measured. The quarantine table preserves them for inspection and audit.
 -- New orphans cannot accumulate while CASCADE is enforced (0112).
 
 PRAGMA foreign_keys = off;
+
+-- #1172: quarantine orphan memberships before the rebuild. This is the
+-- agent_connection_migration_guard idiom from 0071:47-49 — count and
+-- preserve rather than silently drop.
+CREATE TABLE IF NOT EXISTS memberships_orphan_quarantine_0111 AS
+SELECT m.id, m.agent_id, m.squad_id, m.capability
+  FROM memberships m
+ WHERE NOT EXISTS (SELECT 1 FROM agents a WHERE a.id = m.agent_id)
+    OR NOT EXISTS (SELECT 1 FROM squads s WHERE s.id = m.squad_id);
 
 CREATE TABLE memberships_new (
   id          TEXT PRIMARY KEY,

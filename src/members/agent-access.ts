@@ -156,7 +156,7 @@ async function priorAccess(
 
 function classifyResult(
   membership: PriorMembership | null,
-  priorCapability: AgentAccessCapability | null,
+  priorCapability: string | null,
   requested: AgentAccessCapability,
 ): 'created' | 'updated' | 'unchanged' {
   if (priorCapability === null) return 'created'
@@ -291,9 +291,13 @@ export async function prepareAgentSquadAccess(
       statements: [membershipStatement, capabilityStatement],
       priorMembership: prior.membership ? 'present' : 'absent',
       priorCapability: prior.capability,
+      // #1171: use the membership's own capability (from memberships table, can
+      // include 'owner') rather than the filtered capabilities grant (excludes
+      // 'owner' via isAgentAccessCapability, making a demotion-from-owner read
+      // as 'created').
       resultAfterCommit: classifyResult(
         prior.membership,
-        prior.capability,
+        prior.membership?.capability ?? null,
         input.capability,
       ),
       membership,

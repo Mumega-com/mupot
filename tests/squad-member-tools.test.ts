@@ -685,24 +685,136 @@ describe('squad membership delete receipts (cascade, mupot#1164)', () => {
   })
 })
 
-describe('authorizeSquadMembershipWrite source still contains each check (delete → red)', () => {
-  const src = readFileSync(join(__dirname, '../src/members/squad-membership.ts'), 'utf8')
+// #1174: the four source-grep tests that lived here were vacuous as evidence.
+// Three text-preserving mutants (isSelfGrant -> return false, if(false && ...) x2)
+// left them GREEN while behavioural tests went RED. The behavioural coverage in
+// the suites above is genuinely sound — cite that, never the greps. Removed.
 
-  it('keeps the direct boundAgentId self-grant check', () => {
-    expect(src).toMatch(/auth\.boundAgentId === targetAgentId/)
+describe('target-rank guard — cannot affect a member at or above your own rank (#1169)', () => {
+  // Seed an admin and an owner membership on the target squad so we can test
+  // that a lead cannot remove or demote them.
+  function seedWithHighRankTargets(sqlite: SqliteD1Harness['sqlite']): void {
+    sqlite.exec(`
+      INSERT INTO members (id, display_name, status, tenant)
+      VALUES
+        ('member-admin-target', 'Admin Target Member', 'active', '${TENANT}'),
+        ('member-owner-target', 'Owner Target Member', 'active', '${TENANT}');
+
+      INSERT INTO agents (id, squad_id, slug, name, status)
+      VALUES
+        ('agent-admin-target', '${TARGET_SQUAD_ID}', 'admin-target', 'Admin Target', 'active'),
+        ('agent-owner-target', '${TARGET_SQUAD_ID}', 'owner-target', 'Owner Target', 'active');
+
+      INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+      VALUES
+        ('${TENANT}', 'agent-admin-target', 'member-admin-target', '2026-08-19T00:00:00Z'),
+        ('${TENANT}', 'agent-owner-target', 'member-owner-target', '2026-08-19T00:00:00Z');
+
+      INSERT INTO memberships (id, agent_id, squad_id, capability)
+      VALUES
+        ('mem-admin-target', 'agent-admin-target', '${TARGET_SQUAD_ID}', 'admin'),
+        ('mem-owner-target', 'agent-owner-target', '${TARGET_SQUAD_ID}', 'owner');
+    `)
+  }
+
+  beforeEach(() => {
+    seedWithHighRankTargets(harness.sqlite)
   })
 
-  it('keeps the indirect bound-agent self-grant check', () => {
-    expect(src).toMatch(/callerBoundAgentId === targetAgentId/)
+  it('lead cannot remove an admin from the squad', async () => {
+    const result = await invokeTool(
+      leadAuth(),
+      env,
+      'squad_member_remove',
+      { agent: 'agent-admin-target', squad: TARGET_SQUAD_ID },
+      'https://pot.test',
+    )
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error).toBe('cannot_affect_higher_rank')
   })
 
-  it('keeps the target-squad lead floor', () => {
-    expect(src).toMatch(/canOnSquad\([^;]*'lead'\)/s)
+  it('lead cannot demote an admin to observer', async () => {
+    const result = await invokeTool(
+      leadAuth(),
+      env,
+      'squad_member_add',
+      { agent: 'agent-admin-target', squad: TARGET_SQUAD_ID, capability: 'observer' },
+      'https://pot.test',
+    )
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error).toBe('cannot_affect_higher_rank')
   })
 
-  it('keeps the rank-ceiling hasCapability check', () => {
-    expect(src).toMatch(/cannot_grant_above_own_rank/)
-    expect(src).toMatch(/hasCapability\(/)
+  it('lead cannot remove an owner from the squad', async () => {
+    const result = await invokeTool(
+      leadAuth(),
+      env,
+      'squad_member_remove',
+      { agent: 'agent-owner-target', squad: TARGET_SQUAD_ID },
+      'https://pot.test',
+    )
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error).toBe('cannot_affect_higher_rank')
+  })
+
+  it('admin can remove a lead (lower rank)', async () => {
+    // Agent's home squad is HOME_SQUAD_ID; the membership being removed is on TARGET_SQUAD_ID
+    harness.sqlite.exec(`
+      INSERT INTO members (id, display_name, status, tenant)
+      VALUES ('member-lead-target', 'Lead Target Member', 'active', '${TENANT}');
+      INSERT INTO agents (id, squad_id, slug, name, status)
+      VALUES ('agent-lead-target', '${HOME_SQUAD_ID}', 'lead-target', 'Lead Target', 'active');
+      INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+      VALUES ('${TENANT}', 'agent-lead-target', 'member-lead-target', '2026-08-19T00:00:00Z');
+      INSERT INTO memberships (id, agent_id, squad_id, capability)
+      VALUES ('mem-lead-target', 'agent-lead-target', '${TARGET_SQUAD_ID}', 'lead');
+    `)
+    const result = await invokeTool(
+      operatorAuth(),
+      env,
+      'squad_member_remove',
+      { agent: 'agent-lead-target', squad: TARGET_SQUAD_ID },
+      'https://pot.test',
+    )
+    expect(result.ok).toBe(true)
+  })
+
+  it('lead can remove a member (lower rank)', async () => {
+    // Agent's home squad is HOME_SQUAD_ID; the membership being removed is on TARGET_SQUAD_ID
+    harness.sqlite.exec(`
+      INSERT INTO members (id, display_name, status, tenant)
+      VALUES ('member-low-target', 'Low Target Member', 'active', '${TENANT}');
+      INSERT INTO agents (id, squad_id, slug, name, status)
+      VALUES ('agent-low-target', '${HOME_SQUAD_ID}', 'low-target', 'Low Target', 'active');
+      INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+      VALUES ('${TENANT}', 'agent-low-target', 'member-low-target', '2026-08-19T00:00:00Z');
+      INSERT INTO memberships (id, agent_id, squad_id, capability)
+      VALUES ('mem-low-target', 'agent-low-target', '${TARGET_SQUAD_ID}', 'member');
+    `)
+    const result = await invokeTool(
+      leadAuth(),
+      env,
+      'squad_member_remove',
+      { agent: 'agent-low-target', squad: TARGET_SQUAD_ID },
+      'https://pot.test',
+    )
+    expect(result.ok).toBe(true)
+  })
+
+  it('authorizeSquadMembershipWrite directly: lead vs admin target = cannot_affect_higher_rank', async () => {
+    const denial = await authorizeSquadMembershipWrite({
+      env,
+      auth: leadAuth(),
+      targetAgentId: 'agent-admin-target',
+      squad: { id: TARGET_SQUAD_ID, department_id: DEPT_ID },
+      requestedCapability: null,
+    })
+    expect(denial.ok).toBe(false)
+    if (denial.ok) return
+    expect(denial.error).toBe('cannot_affect_higher_rank')
   })
 })
 
