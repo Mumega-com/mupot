@@ -12,6 +12,7 @@
 // ever logged, echoed, or returned.
 
 import type { ChannelAdapter, Env, InboundMessage } from '../../types'
+import { timingSafeEqual } from '../../lib/crypto'
 
 interface TelegramSecrets {
   // adapter-local: the Bot API token (wrangler secret), not on the shared Env.
@@ -37,16 +38,6 @@ function idToString(v: unknown): string | null {
   if (typeof v === 'number' && Number.isFinite(v)) return String(v)
   if (typeof v === 'string' && v.trim().length > 0) return v.trim()
   return null
-}
-
-function timingSafeEqual(a: string, b: string): boolean {
-  const enc = new TextEncoder()
-  const ab = enc.encode(a)
-  const bb = enc.encode(b)
-  if (ab.length !== bb.length) return false
-  let diff = 0
-  for (let i = 0; i < ab.length; i++) diff |= (ab[i] ?? 0) ^ (bb[i] ?? 0)
-  return diff === 0
 }
 
 export const telegramAdapter: ChannelAdapter = {

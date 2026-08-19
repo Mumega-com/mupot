@@ -20,6 +20,7 @@
 
 import { Hono } from 'hono'
 import type { Env } from '../types'
+import { timingSafeEqual } from '../lib/crypto'
 
 const MAX_BODY_BYTES = 256 * 1024 // a multi-day, multi-agent rollup — generous but bounded
 const MAX_ROWS = 4096
@@ -39,14 +40,6 @@ async function hmacHex(secret: string, message: string): Promise<string> {
   return Array.from(new Uint8Array(sig))
     .map((b) => b.toString(16).padStart(2, '0'))
     .join('')
-}
-
-/** Constant-time compare of two equal-length hex strings. */
-function timingSafeEqual(a: string, b: string): boolean {
-  if (a.length !== b.length) return false
-  let diff = 0
-  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i)
-  return diff === 0
 }
 
 /** A finite non-negative safe integer (token counts, micro-USD, turns). */

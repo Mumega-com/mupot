@@ -49,6 +49,7 @@ import {
   validateHumanDirectiveText,
   type HumanDirectiveAction,
 } from '../brain/directive'
+import { timingSafeEqual } from '../lib/crypto'
 
 type AppEnv = { Bindings: Env }
 
@@ -68,16 +69,6 @@ async function readCappedBody(req: Request, maxBytes: number): Promise<CappedBod
   } catch {
     return { ok: false, reason: 'bad_utf8' }
   }
-}
-
-function timingSafeEqual(a: string, b: string): boolean {
-  const enc = new TextEncoder()
-  const ab = enc.encode(a)
-  const bb = enc.encode(b)
-  if (ab.length !== bb.length) return false
-  let diff = 0
-  for (let i = 0; i < ab.length; i++) diff |= (ab[i] ?? 0) ^ (bb[i] ?? 0)
-  return diff === 0
 }
 
 // ── attribution ───────────────────────────────────────────────────────────────

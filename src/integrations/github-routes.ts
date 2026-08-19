@@ -18,6 +18,7 @@ import type { Env } from '../types'
 import { createTask, syncTaskStatusFromIssue, syncCiResultToTask, closeGitHubPrMirrorTasks } from '../tasks/service'
 import { syncGitHubProject } from './github-projects'
 import { recordMergedPr } from '../agents/kpi-sources'
+import { timingSafeEqual } from '../lib/crypto'
 
 interface GitHubRouteEnv {
   GITHUB_WEBHOOK_SECRET?: string
@@ -29,17 +30,6 @@ function githubRouteEnv(env: Env): GitHubRouteEnv {
   // as unknown: GITHUB_* are optional extras not in the core Env shape (same adapter-
   // local pattern as the GHL adapter).
   return env as unknown as GitHubRouteEnv
-}
-
-// Constant-time comparison (no early-exit timing oracle).
-function timingSafeEqual(a: string, b: string): boolean {
-  const enc = new TextEncoder()
-  const ab = enc.encode(a)
-  const bb = enc.encode(b)
-  if (ab.length !== bb.length) return false
-  let diff = 0
-  for (let i = 0; i < ab.length; i++) diff |= (ab[i] ?? 0) ^ (bb[i] ?? 0)
-  return diff === 0
 }
 
 async function computeHmacHex(secret: string, message: string): Promise<string> {

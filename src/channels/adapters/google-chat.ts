@@ -29,6 +29,7 @@
 // Exports: `googleChatAdapter: ChannelAdapter` (platform 'google-chat').
 
 import type { ChannelAdapter, Env, InboundMessage, Capability } from '../../types'
+import { timingSafeEqual } from '../../lib/crypto'
 
 // ── env secret access ─────────────────────────────────────────────────────────
 // These are platform-specific secrets/vars. They are runtime-only (wrangler secrets /
@@ -77,15 +78,6 @@ function bearerToken(header: string | null): string | null {
   if (!m) return null
   const tok = m[1].trim()
   return tok.length > 0 ? tok : null
-}
-
-// Constant-time string compare (length + char xor). Avoids leaking the secret
-// character-by-character via early-exit timing. Both inputs are short bearer tokens.
-function safeEqual(a: string, b: string): boolean {
-  if (a.length !== b.length) return false
-  let diff = 0
-  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i)
-  return diff === 0
 }
 
 // A Google Chat space is addressed as a resource name: "spaces/AAAA...". The core
@@ -529,7 +521,7 @@ async function verify(req: Request, env: Env): Promise<boolean> {
   // Weaker fallback: fixed shared-token compare (constant-time). Only when no project
   // number is configured AND a verify token is explicitly set. Otherwise sealed.
   const fallback = asString(secrets.GOOGLE_CHAT_VERIFY_TOKEN)
-  if (fallback) return safeEqual(presented, fallback)
+  if (fallback) return timingSafeEqual(presented, fallback)
 
   return false
 }
