@@ -25,6 +25,7 @@ import type { Env } from '../types'
 import { createTask } from '../tasks/service'
 import { findByEmail, setProspectStatus } from '../loops/prospects'
 import type { ProspectStatus } from '../loops/prospects'
+import { timingSafeEqual } from '../lib/crypto'
 
 // ── Env extension for GHL route-specific bindings ─────────────────────────────
 //
@@ -49,18 +50,6 @@ export const GHL_INBOUND_MAX_BODY_BYTES = 256 * 1024
 // We compare byte-by-byte with a running XOR so there is no early exit.
 // Both arguments must be the same length — we pad/compare lengths separately
 // (length comparison leaks length, but the HMAC is fixed-length so this is fine).
-
-function timingSafeEqual(a: string, b: string): boolean {
-  const enc = new TextEncoder()
-  const ab = enc.encode(a)
-  const bb = enc.encode(b)
-  if (ab.length !== bb.length) return false
-  let diff = 0
-  for (let i = 0; i < ab.length; i++) {
-    diff |= (ab[i] ?? 0) ^ (bb[i] ?? 0)
-  }
-  return diff === 0
-}
 
 // ── HMAC-SHA256 computation ───────────────────────────────────────────────────
 
