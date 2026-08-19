@@ -1922,8 +1922,17 @@ const toolFlightDispatch: ToolSpec = {
       //
       // Uncapped in DOLLARS is not unbounded: meter.ts still enforces
       // MAX_DISPATCHES_PER_DAY (200) and MAX_TOKENS_PER_DAY (200_000) per agent
-      // regardless of any cap here, and the flight's own requested budget still
-      // bounds it. Note also that a cents cap models MARGINAL per-token spend,
+      // regardless of any cap here. Those day caps are the ONLY execution-time
+      // bound, and they are non-disablable (parseCap).
+      //
+      // The flight's own requested budget is NOT an execution-time bound, and an
+      // earlier version of this comment said it was (caught by Athena's gate on
+      // PR #1179, R1). It is checked at flight_land, against SELF-REPORTED cost,
+      // after the work is already done. A flight can overspend its requested
+      // budget arbitrarily during execution and nothing stops it; landing merely
+      // records the overrun. Do not read the requested budget as a ceiling.
+      //
+      // Note also that a cents cap models MARGINAL per-token spend,
       // which is the wrong shape for agents running on a flat-rate subscription
       // ration (Anthropic/OpenAI/Google plans) — those are capacity-limited, not
       // dollar-limited. Modelling that is tracked separately; do not read this
