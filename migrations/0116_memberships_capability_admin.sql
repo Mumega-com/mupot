@@ -1,4 +1,4 @@
--- 0111_memberships_capability_admin.sql
+-- 0116_memberships_capability_admin.sql
 --
 -- memberships.capability CHECK was ('owner','lead','member','observer').
 -- The write path (setAgentSquadAccess) accepts AgentAccessCapability
@@ -26,7 +26,7 @@ PRAGMA foreign_keys = off;
 -- #1172: quarantine orphan memberships before the rebuild. This is the
 -- agent_connection_migration_guard idiom from 0071:47-49 — count and
 -- preserve rather than silently drop.
-CREATE TABLE IF NOT EXISTS memberships_orphan_quarantine_0111 AS
+CREATE TABLE IF NOT EXISTS memberships_orphan_quarantine_0116 AS
 SELECT m.id, m.agent_id, m.squad_id, m.capability
   FROM memberships m
  WHERE NOT EXISTS (SELECT 1 FROM agents a WHERE a.id = m.agent_id)

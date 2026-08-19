@@ -818,8 +818,8 @@ describe('target-rank guard — cannot affect a member at or above your own rank
   })
 })
 
-describe('0111 memberships rebuild is defensive on D1 (FK pragma is a no-op)', () => {
-  const migration = readFileSync(join(MIGRATIONS_DIR, '0111_memberships_capability_admin.sql'), 'utf8')
+describe('0116 memberships rebuild is defensive on D1 (FK pragma is a no-op)', () => {
+  const migration = readFileSync(join(MIGRATIONS_DIR, '0116_memberships_capability_admin.sql'), 'utf8')
 
   it('says the PRAGMA is decorative on D1 — so nobody re-relies on it', () => {
     expect(migration).toMatch(/DECORATIVE ON D1/)
@@ -835,11 +835,11 @@ describe('0111 memberships rebuild is defensive on D1 (FK pragma is a no-op)', (
     )
   })
 
-  it('the 0111 INSERT SELECT drops an orphan rather than aborting', () => {
+  it('the 0116 INSERT SELECT excludes an orphan from the rebuild rather than aborting (the orphan is preserved separately by the quarantine table, #1172)', () => {
     harness.sqlite.exec('PRAGMA foreign_keys = OFF')
     harness.sqlite.exec(`
       INSERT INTO memberships (id, agent_id, squad_id, capability)
-      VALUES ('mem-orphan-0111', 'agent-does-not-exist', 'squad-does-not-exist', 'member');
+      VALUES ('mem-orphan-0116', 'agent-does-not-exist', 'squad-does-not-exist', 'member');
     `)
     harness.sqlite.exec(`
       CREATE TABLE memberships_orphan_probe (
@@ -850,11 +850,11 @@ describe('0111 memberships rebuild is defensive on D1 (FK pragma is a no-op)', (
       );
     `)
     const insert = migration.match(/INSERT INTO memberships_new[\s\S]*?;/)?.[0]
-    if (!insert) throw new Error('0111 INSERT not found')
+    if (!insert) throw new Error('0116 INSERT not found')
     harness.sqlite.exec(insert.replaceAll('memberships_new', 'memberships_orphan_probe'))
     const copied = harness.sqlite.prepare(
       'SELECT id FROM memberships_orphan_probe WHERE id = ?',
-    ).get('mem-orphan-0111')
+    ).get('mem-orphan-0116')
     expect(copied).toBeUndefined()
     const kept = harness.sqlite.prepare(
       'SELECT COUNT(*) AS n FROM memberships_orphan_probe',

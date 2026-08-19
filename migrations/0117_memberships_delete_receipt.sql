@@ -1,4 +1,4 @@
--- 0112_memberships_delete_receipt.sql
+-- 0117_memberships_delete_receipt.sql
 --
 -- memberships FKs CASCADE on agent/squad delete (0001 / 0111). Receipts do
 -- NOT cascade (0110). After honouring input.capability, a surviving add

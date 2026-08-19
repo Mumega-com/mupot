@@ -1,4 +1,4 @@
--- 0110_membership_receipts.sql — durable trail for squad_member_add / remove
+-- 0115_membership_receipts.sql — durable trail for squad_member_add / remove
 --
 -- memberships has existed since 0001 with no MCP write path. The new tools
 -- (mupot#1161) must not make an authority change inferable only from the
