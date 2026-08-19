@@ -607,6 +607,18 @@ export function hasWorkspaceAdmin(auth: AuthContext): boolean {
   return hasCapability(auth.capabilities, 'org', null, 'admin')
 }
 
+// Org owner/admin by EITHER route. hasWorkspaceAdmin alone is not enough: when
+// capabilities are present it ignores auth.role entirely, so a principal whose
+// ownership lives in the legacy role column but who holds only squad-scoped
+// capabilities is refused. And auth.role alone is not enough either: over MCP it
+// is always 'member' (assigned once at signup, no tool changes it), so a genuine
+// owner holding org->admin as a GRANT is refused. The two planes disagree — see
+// the dashboard/MCP split in mupot#530 — so an authority check that must not
+// fail closed on a real owner has to consult both.
+export function isOrgOwnerAdmin(auth: AuthContext): boolean {
+  return hasWorkspaceAdmin(auth) || auth.role === 'owner' || auth.role === 'admin'
+}
+
 async function canReadProjectForSquad(
   env: Env,
   auth: AuthContext,
@@ -1010,7 +1022,7 @@ const toolTaskUpdate: ToolSpec = {
   name: 'task_update',
   scope: 'squad (of the task)',
   min: 'member',
-  args: '{ task_id: string, project_id?: string|null, title?: string, body?: string, done_when?: string, status?: "open"|"in_progress"|"blocked"|"done"|"review", priority?: "P0"|"P1"|"P2"|"P3"|null, parent_task_id?: string|null, assignee_agent_id?: string|null, gate_owner?: string|null }',
+  args: '{ task_id: string, project_id?: string|null, title?: string, body?: string, done_when?: string, status?: "open"|"in_progress"|"blocked"|"done"|"review", priority?: "P0"|"P1"|"P2"|"P3"|null, parent_task_id?: string|null, assignee_agent_id?: string|null, gate_owner?: string|null, gate_owner_reason?: string }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -1026,6 +1038,7 @@ const toolTaskUpdate: ToolSpec = {
       parent_task_id: { type: ['string', 'null'], description: 'Parent task id, or null to promote this task to top level.' },
       assignee_agent_id: STRING_SCHEMA,
       gate_owner: STRING_SCHEMA,
+      gate_owner_reason: STRING_SCHEMA,
     },
     required: ['task_id'],
     additionalProperties: false,
@@ -1204,6 +1217,10 @@ const toolTaskUpdate: ToolSpec = {
       next.assignee_agent_id = check.value
       changed = true
     }
+    // Hoisted: the receipt write after the update commits needs both, and the
+    // gate_owner block below is where they are decided.
+    let reassignsGatedReview = false
+    let reassignReason = ''
     if (args.gate_owner !== undefined) {
       const lockStatuses: ReadonlySet<TaskStatus> = new Set(['review', 'approved', 'rejected', 'done'])
       const repairsHistoricalUngatedReview =
@@ -1212,7 +1229,49 @@ const toolTaskUpdate: ToolSpec = {
         typeof args.gate_owner === 'string' &&
         args.gate_owner.trim().length > 0 &&
         hasWorkspaceAdmin(auth)
-      if (lockStatuses.has(existing.status) && !repairsHistoricalUngatedReview) {
+      // REASSIGNMENT OF AN EXISTING GATE ON A REVIEW TASK.
+      //
+      // Measured blocker: cb512f05 (FLIGHT-06 L2) sits at status='review' with
+      // gate_owner='gate:agent-self-completion' and cannot be re-gated by any
+      // supported call — repairsHistoricalUngatedReview above requires
+      // gate_owner IS NULL, so a task that already carries a gate is stuck with
+      // its original holder forever, including when that holder is retired.
+      //
+      // The lock this narrows is DELIBERATE — BLOCK-2, proof-of-exploit
+      // 2026-08-13: re-gating into a peer's lane let two colluding agents
+      // launder a single-gate check, demonstrated live. So every condition here
+      // is load-bearing and none may be relaxed without redoing that analysis:
+      //   status='review' only — approved/rejected/done stay locked outright, so
+      //     this can never rewrite the gate on already-decided work
+      //   org owner/admin only — hasWorkspaceAdmin, NOT squad admin or lead
+      //   a non-empty reason is mandatory
+      //   gate_owner is the only column that moves; no status/result/verdict
+      // Written to an append-only receipt below: an owner may reassign a gate,
+      // but may not do it invisibly.
+      reassignReason =
+        typeof args.gate_owner_reason === 'string' ? args.gate_owner_reason.trim() : ''
+      const wantsGateReassign =
+        existing.status === 'review' &&
+        existing.gate_owner !== null &&
+        typeof args.gate_owner === 'string' &&
+        args.gate_owner.trim().length > 0 &&
+        args.gate_owner.trim() !== existing.gate_owner
+      // The reason check here is currently REDUNDANT with the explicit 400 below
+      // (an admin with no reason is refused there first, and a non-admin fails
+      // isOrgOwnerAdmin either way) — mutation-testing confirms removing it
+      // changes no reachable behaviour. It stays as defence in depth: if the 400
+      // guard is ever moved or narrowed, the mandatory-reason property must not
+      // silently disappear with it.
+      reassignsGatedReview = wantsGateReassign && isOrgOwnerAdmin(auth) && reassignReason.length > 0
+      // A missing reason from an otherwise-authorised owner is its own error.
+      // Folding it into gate_owner_locked would tell the caller "the status is
+      // wrong" when the status is fine and only the reason is absent.
+      if (wantsGateReassign && isOrgOwnerAdmin(auth) && reassignReason.length === 0) {
+        return fail(400, 'gate_owner_reason_required', {
+          detail: 'reassigning an existing gate_owner on a review task requires a non-empty gate_owner_reason',
+        })
+      }
+      if (lockStatuses.has(existing.status) && !repairsHistoricalUngatedReview && !reassignsGatedReview) {
         return fail(409, 'gate_owner_locked', { status: existing.status })
       }
       // BLOCK-2 fix (kasra-review 2026-08-13, proof-of-exploit): once set,
@@ -1221,8 +1280,18 @@ const toolTaskUpdate: ToolSpec = {
       // single-gate check (proven live). Only an org owner/admin may change or
       // clear an existing gate_owner.
       if (existing.gate_owner !== null && args.gate_owner !== existing.gate_owner) {
-        const isOwnerAdmin = auth.role === 'owner' || auth.role === 'admin'
-        if (!isOwnerAdmin) {
+        // Consults BOTH authority planes. The original check read only the
+        // coarse legacy `auth.role`, and over MCP that is always 'member'
+        // (assigned once at signup, changed by no tool) — so a genuine org owner
+        // holding org->admin as a GRANT was refused, and the documented
+        // owner/admin escape was unreachable on this path.
+        //
+        // Swapping it for hasWorkspaceAdmin alone is NOT the fix and was wrong
+        // when first tried here: with capabilities present that helper ignores
+        // auth.role, which refused a role-based owner that previously passed and
+        // broke an existing BLOCK-2 test. Both planes must be consulted, so the
+        // change is additive — nobody who passed before is refused now.
+        if (!isOrgOwnerAdmin(auth)) {
           return fail(403, 'gate_owner_immutable', {
             detail: 'once set, gate_owner can only be changed or cleared by an org owner/admin',
           })
@@ -1298,6 +1367,47 @@ const toolTaskUpdate: ToolSpec = {
     if (existing.status !== 'review' && next.status === 'review' && next.gate_owner) {
       await wakeGateOwnerOnReview(env, next, actor, auth.memberId as string)
     }
+
+    // GATE REASSIGNMENT RECEIPT + WAKE.
+    //
+    // Ordering is deliberate: the receipt is written BEFORE the wake. A wake is
+    // best-effort and may legitimately no-op (no unambiguous holder), but the
+    // record of who moved the gate, from where, to where and why must exist
+    // regardless. Writing it after a wake that threw would lose the one artifact
+    // that makes this path auditable.
+    //
+    // The receipt failing does NOT roll back the reassignment — the task update
+    // has already committed by this point, and pretending otherwise would be a
+    // false receipt of a different kind. It throws instead, loudly, so a missing
+    // receipt surfaces as an error rather than as silence.
+    if (reassignsGatedReview && existing.gate_owner && next.gate_owner) {
+      await env.DB.prepare(
+        `INSERT INTO gate_owner_reassignments
+           (id, tenant, task_id, squad_id, from_gate_owner, to_gate_owner, reason,
+            actor_id, actor_type, task_status)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'member', ?9)`,
+      )
+        .bind(
+          crypto.randomUUID(),
+          env.TENANT_SLUG,
+          next.id,
+          next.squad_id,
+          existing.gate_owner,
+          next.gate_owner,
+          reassignReason,
+          auth.memberId as string,
+          existing.status,
+        )
+        .run()
+
+      // Wake the NEW holder. The entering-review wake above cannot cover this:
+      // its guard is `existing.status !== 'review'`, and a reassignment happens
+      // on a task that is ALREADY in review — so without this the new gate owner
+      // is never told the gate is now theirs, and the task sits exactly as stuck
+      // as it was before, just under a different name.
+      await wakeGateOwnerOnReview(env, next, actor, auth.memberId as string)
+    }
+
     return done({ task: next })
   },
 }
