@@ -1191,19 +1191,36 @@ const toolTaskUpdate: ToolSpec = {
       // an UNGATED task straight to done via this same PATCH —
       // patchToDoneBypassesGate above only fires when a gate_owner is set, so
       // an ungated task's direct PATCH-to-done was the one path with NO
-      // verification at all, gate or artifact. task_update never sets
-      // `result` itself, so this checks whatever is already on the row — a
-      // caller completing via this path must have gotten real evidence onto
-      // the task by some other legitimate write first.
+      // verification at all, gate or artifact.
+      //
+      // SCOPED to existing.assignee_agent_id != null (gate BLOCK finding #4,
+      // 2026-08-18): `result` (migrations/0006) is written ONLY by the AgentDO
+      // execute-mode cortex cycle — a purely human/operational task never has
+      // one and was never meant to. Checking it unconditionally would block
+      // every non-agent task from ever reaching review/done. Restricting to
+      // agent-assigned tasks targets the actual threat (a5e45082: fabricated
+      // agent-produced evidence accepted as real) without touching tasks that
+      // were never agent-executed at all.
+      //
+      // KNOWN OPEN GAP, not fixed here (gate BLOCK finding #2): task_update
+      // never sets `result` itself — it only checks whatever is ALREADY on
+      // the row, written by execute.ts's finishTask. For an in-Worker AgentDO
+      // task that is exactly right (finishTask is the sole writer). For an
+      // EXTERNAL/bound-seat runtime there is currently no tool that lets it
+      // report a completion result back into `result` at all — meaning this
+      // gate's "external seat completes via task_update" path is not yet
+      // realizable, only the in-Worker path is. Filing as a separate follow-up
+      // (a completion-reporting primitive symmetric to task_dispatch) rather
+      // than building it under this PR's time box.
       const entersReview = args.status === 'review'
       const ungatedDirectDone = args.status === 'done' && existing.status !== 'approved' && existing.status !== 'rejected' && !effectiveGateOwner
-      if (entersReview || ungatedDirectDone) {
+      if ((entersReview || ungatedDirectDone) && existing.assignee_agent_id) {
         const artifactCheck = verifyTaskArtifactShape(existing.result)
         if (!artifactCheck.verified) {
           return fail(409, 'artifact_verification_failed', {
             reason: artifactCheck.reason,
             ...(artifactCheck.path ? { path: artifactCheck.path } : {}),
-            detail: 'a task can only enter review or be marked done directly when its result states both "Artifact: <path>" and "SHA256: <64-hex>"',
+            detail: 'an agent-assigned task can only enter review or be marked done directly when its result states both "Artifact: <path>" and "SHA256: <64-hex>"',
           })
         }
       }
@@ -1724,66 +1741,16 @@ const toolTaskDispatch: ToolSpec = {
       return fail(500, 'dispatch_failed', { receipt_id: receiptId })
     }
 
-    // DURABLE INBOX DELIVERY (mupot#76e25fc2 / FLIGHT-07B). The bus event above
-    // drives the in-Worker cloud AgentDO cortex cycle — but nothing else. This is
-    // #860 all over again (flight_dispatch: "the tool is called flight_dispatch
-    // and it did not dispatch... a flight would sit in running forever while its
-    // assigned seat's inbox stayed empty"). task_dispatch had EXACTLY that gap: it
-    // wrote its own audit receipt and emitted a bus event, and called that
-    // "dispatched" — but a bound seat runtime polling GET /api/inbox (the same
-    // non-DO consumer wakeGateOwnerOnReview and flight_dispatch both already
-    // deliver to) never received anything. The cloud AgentDO could then complete
-    // the task on behalf of a seat that was never told, which is indistinguishable
-    // from the seat having done the work.
-    //
-    // Same primitive, same shape as flight_dispatch's own #860 fix: a durable
-    // agent_messages row via sendAgentMessage, correlated to THIS dispatch receipt
-    // so a runtime that answers can be matched back to the exact dispatch that
-    // woke it (task_dispatch_receipts.claimed_at/consumed_at existed for this
-    // already and were simply never written to).
-    const dispatchOrigin = requiredCanonicalOrigin(env)
-    const inboxDelivery = await sendAgentMessage(
-      env,
-      {
-        fromAgent: 'mupot-tasks',
-        fromMember: memberId,
-        toAgent: task.assignee_agent_id,
-        kind: 'request',
-        requestId: `task.dispatch.${receiptId}`,
-        body: JSON.stringify({
-          version: 'task.dispatch/v1',
-          task_id: task.id,
-          dispatch_receipt_id: receiptId,
-          title: task.title,
-          done_when: task.done_when,
-          squad_id: task.squad_id,
-          ...(dispatchOrigin.ok ? { mcp_endpoint: mcpEndpoint(dispatchOrigin.origin) } : {}),
-        }),
-      },
-      {
-        system: true,
-        reason: 'task_dispatch delivers to the task\'s own assignee, which the caller already had to be',
-      },
-      // No projectId is passed, so sendAgentMessage's validateMessageProjectAccess
-      // block (gated on `input.projectId !== undefined`) never runs — unlike
-      // flight_dispatch's call, there is no project-membership check here to
-      // bypass, and no third opts argument is needed. Authorization for this send
-      // already happened above via memberCanOnSquad.
-    )
-    if (inboxDelivery.ok) {
-      await env.DB.prepare(
-        `UPDATE task_dispatch_receipts SET claimed_at = ? WHERE tenant = ? AND id = ?`,
-      ).bind(new Date().toISOString(), env.TENANT_SLUG, receiptId).run()
-    } else {
-      // NON-FATAL, matching the bus event's own failure handling above and
-      // wakeGateOwnerOnReview's documented convention: the cloud AgentDO path
-      // (already emitted) must still be able to complete a dispatch even if the
-      // durable-inbox side channel fails, and the caller already has a working
-      // dispatch receipt to retry against. Recorded, not swallowed.
-      await env.DB.prepare(
-        `UPDATE task_dispatch_receipts SET last_error = ? WHERE tenant = ? AND id = ?`,
-      ).bind(`inbox_delivery_failed: ${inboxDelivery.reason}`.slice(0, 500), env.TENANT_SLUG, receiptId).run()
-    }
+    // NOTE (mupot#76e25fc2 / FLIGHT-07B, reverted after gate BLOCK): this handler
+    // previously added a second, ad-hoc sendAgentMessage write here, believing
+    // task_dispatch had the same "silent drop" gap #860 fixed for flight_dispatch.
+    // It did not — src/bus/consumer.ts's 'agent.wake' case already recognizes this
+    // exact event shape via taskDispatchIdentity() (keyed on the dispatch_receipt_id
+    // in the payload above) and routes it through src/bus/fleet-bridge.ts's
+    // deliverDispatchToInbox, a #353-hardened, sticky-route bridge built specifically
+    // to prevent double execution. The added write used a different sender/request-id
+    // convention the real router never saw — a second, uncoordinated delivery path,
+    // not a fix. Reverted; the routing above was already correct.
 
     return done({
       dispatched: true,

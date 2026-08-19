@@ -1198,72 +1198,21 @@ describe('MCP task cutover tools', () => {
       },
     })
     const result = res.result as { receipt: { id: string } }
-    // TWO events now, not one — mupot#76e25fc2/FLIGHT-07B. The bus wake alone
-    // drove only the in-Worker cloud AgentDO cortex cycle; a bound seat runtime
-    // polling GET /api/inbox never received anything, which is the exact #860
-    // shape ("the tool is called flight_dispatch and it did not dispatch").
-    // sendAgentMessage's own bus emit (message.created) is the second event.
-    expect(events).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          type: 'agent.wake',
-          tenant: TENANT,
-          squad_id: SQUAD_ID,
-          agent_id: AGENT_ID,
-          actor: { kind: 'member', id: MEMBER_ID },
-          payload: {
-            task_id: 'task-1',
-            by: MEMBER_ID,
-            dispatch_receipt_id: result.receipt.id,
-          },
-        }),
-      ]),
-    )
-    const inboxEvent = events.find((e) => (e as { type?: string }).type === 'message.created') as
-      | { payload: { to_agent: string; from_agent: string; request_id: string; kind: string } }
-      | undefined
-    expect(inboxEvent, 'durable inbox delivery never fired').toBeTruthy()
-    expect(inboxEvent!.payload.to_agent).toBe(AGENT_ID)
-    expect(inboxEvent!.payload.from_agent).toBe('mupot-tasks')
-    expect(inboxEvent!.payload.kind).toBe('request')
-    // Correlated to THIS dispatch, not a generic wake — a runtime that answers
-    // can be matched back to the exact receipt that woke it.
-    expect(inboxEvent!.payload.request_id).toBe(`task.dispatch.${result.receipt.id}`)
-
+    expect(events).toEqual([
+      expect.objectContaining({
+        type: 'agent.wake',
+        tenant: TENANT,
+        squad_id: SQUAD_ID,
+        agent_id: AGENT_ID,
+        actor: { kind: 'member', id: MEMBER_ID },
+        payload: {
+          task_id: 'task-1',
+          by: MEMBER_ID,
+          dispatch_receipt_id: result.receipt.id,
+        },
+      }),
+    ])
     expect(updates.filter((update) => update.sql.includes('INSERT INTO task_dispatch_receipts'))).toHaveLength(1)
-    // The durable delivery succeeded, so claimed_at gets a real write too (a
-    // SECOND write against task_dispatch_receipts, an UPDATE this time) —
-    // those columns existed and were simply never populated before this fix.
-    expect(updates.some((update) => update.sql.includes('task_dispatch_receipts') && update.sql.includes('claimed_at'))).toBe(true)
-  })
-
-  it('a durable-inbox delivery FAILURE does not fail the dispatch — non-fatal, matching the bus wake\'s own error handling', async () => {
-    // Same convention as the bus-emit try/catch just above it: the cloud AgentDO
-    // path must still be able to complete a dispatch even if the durable-inbox
-    // side channel fails (e.g. the recipient's unread cap is hit), and the
-    // failure must be RECORDED, not swallowed silently.
-    const { env, updates } = makeEnv([task({ assignee_agent_id: AGENT_ID })])
-    const realPrepare = env.DB.prepare.bind(env.DB)
-    env.DB.prepare = ((sql: string) => {
-      const stmt = realPrepare(sql)
-      if (!sql.includes('INSERT INTO agent_messages')) return stmt
-      // Simulate the primitive's own atomic unread-cap guard refusing the write
-      // (INSERT ... SELECT ... WHERE (unread count) < cap -> changes === 0).
-      return { ...stmt, bind: (...args: unknown[]) => ({ ...stmt.bind(...args), run: async () => ({ meta: { changes: 0 } }) }) }
-    }) as typeof env.DB.prepare
-
-    const res = await invokeTool(auth(), env, 'task_dispatch', { task_id: 'task-1' }, 'https://pot.example')
-
-    // The dispatch itself still succeeds — the same non-fatal contract the bus
-    // event's own catch block already has.
-    expect(res.ok, JSON.stringify(res)).toBe(true)
-    const lastErrorWrite = updates.find(
-      (u) => u.sql.includes('task_dispatch_receipts') && u.sql.includes('last_error'),
-    )
-    expect(lastErrorWrite, 'delivery failure must be recorded, not swallowed').toBeTruthy()
-    expect(lastErrorWrite!.args.join(' ')).toContain('inbox_delivery_failed')
-    // And it must NOT be mistaken for success — no claimed_at write on failure.
-    expect(updates.some((u) => u.sql.includes('task_dispatch_receipts') && u.sql.includes('claimed_at'))).toBe(false)
   })
 
   it('task_dispatch refuses an unassigned task without emitting a wake', async () => {
@@ -1295,8 +1244,7 @@ describe('MCP task cutover tools', () => {
     const res = await invokeTool(auth(), env, 'task_dispatch', { task_id: 'task-1' }, 'https://pot.example')
 
     expect(res).toMatchObject({ ok: true, result: { agent_id: 'agent-other' } })
-    // 2, not 1 — bus wake + durable inbox delivery (mupot#76e25fc2/FLIGHT-07B).
-    expect(events).toHaveLength(2)
+    expect(events).toHaveLength(1)
   })
 
   it('task_dispatch fails closed when cross-squad authority was revoked', async () => {

@@ -116,6 +116,11 @@ describe('PATCH /:id completion timestamp', () => {
       ...approvedTask,
       status: 'in_progress',
       gate_owner: null,
+      // Valid provenance evidence — unrelated to what this test checks
+      // (completion timestamp stamping), but required now that the artifact
+      // gate (mupot#76e25fc2, FLIGHT-07B) also covers this REST route's
+      // ungated direct-done transition on an agent-assigned task.
+      result: `Done.\nArtifact: /tmp/marker.txt\nSHA256: ${'a'.repeat(64)}`,
     })
     const res = await tasksApp.fetch(
       new Request('https://pot.test/task-approved', {

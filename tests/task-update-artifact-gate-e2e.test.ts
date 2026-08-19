@@ -20,23 +20,33 @@ const SQUAD_ID = 'squad-1'
 const URL = 'https://pot.test'
 const MEMBER_ID = 'member-1'
 const AGENT_ID = 'agent-caller'
+// A distinct assignee, deliberately NOT the caller's boundAgentId — using the
+// caller itself as assignee would trip assigneeSelfClose on the ->done tests
+// (a different, earlier-checked guard) before ever reaching the artifact gate.
+const ASSIGNEE_ID = 'agent-assignee'
 const TASK_ID = 'task-under-test'
 const VALID_SHA = 'a'.repeat(64)
 
-function seed(sqlite: SqliteD1Harness['sqlite'], opts: { status: string; gateOwner: string | null; result: string | null }): void {
+function seed(sqlite: SqliteD1Harness['sqlite'], opts: { status: string; gateOwner: string | null; result: string | null; assigneeAgentId?: string | null }): void {
   sqlite.exec(`
     INSERT INTO departments (id, slug, name) VALUES ('${DEPT_ID}', 'test-dept', 'Test Department');
     INSERT INTO squads (id, department_id, slug, name) VALUES ('${SQUAD_ID}', '${DEPT_ID}', 'squad-one', 'Squad One');
     INSERT INTO agents (id, squad_id, slug, name, status) VALUES ('${AGENT_ID}', '${SQUAD_ID}', 'caller', 'Caller', 'active');
+    INSERT INTO agents (id, squad_id, slug, name, status) VALUES ('${ASSIGNEE_ID}', '${SQUAD_ID}', 'assignee', 'Assignee', 'active');
     INSERT INTO members (id, display_name, status, tenant) VALUES ('${MEMBER_ID}', 'Caller', 'active', '${TENANT}');
     INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
       VALUES ('cap-1', '${MEMBER_ID}', 'squad', '${SQUAD_ID}', 'admin');
   `)
   const resultLiteral = opts.result === null ? 'NULL' : `'${opts.result.replace(/'/g, "''")}'`
   const gateOwnerLiteral = opts.gateOwner === null ? 'NULL' : `'${opts.gateOwner}'`
+  // Defaults to ASSIGNEE_ID (agent-assigned task, the scope the gate actually
+  // covers per gate BLOCK finding #4) — pass assigneeAgentId: null explicitly
+  // for the human/operational-task-is-not-gated tests.
+  const assignee = opts.assigneeAgentId === undefined ? ASSIGNEE_ID : opts.assigneeAgentId
+  const assigneeLiteral = assignee === null ? 'NULL' : `'${assignee}'`
   sqlite.exec(`
-    INSERT INTO tasks (id, squad_id, title, body, status, done_when, gate_owner, result)
-    VALUES ('${TASK_ID}', '${SQUAD_ID}', 'Task under test', 'body', '${opts.status}', 'a real predicate', ${gateOwnerLiteral}, ${resultLiteral});
+    INSERT INTO tasks (id, squad_id, title, body, status, done_when, gate_owner, result, assignee_agent_id)
+    VALUES ('${TASK_ID}', '${SQUAD_ID}', 'Task under test', 'body', '${opts.status}', 'a real predicate', ${gateOwnerLiteral}, ${resultLiteral}, ${assigneeLiteral});
   `)
 }
 
@@ -126,6 +136,30 @@ describe('task_update artifact gate — real schema (mupot#76e25fc2, FLIGHT-07B)
       harness = createSqliteD1()
       applyAllMigrations(harness.sqlite)
       seed(harness.sqlite, { status: 'approved', gateOwner: 'gate:reviewer', result: null })
+      env = { TENANT_SLUG: TENANT, DB: harness.db } as Env
+
+      const res = await invokeTool(callerAuth(), env, 'task_update', { task_id: TASK_ID, status: 'done' }, URL)
+      expect(res.ok, JSON.stringify(res)).toBe(true)
+    })
+  })
+
+  describe('a task with no agent assignee — human/operational work, gate BLOCK finding #4', () => {
+    it('is NOT gated entering review with no result at all — `result` is an execute.ts-only field, never meant for this task', async () => {
+      harness = createSqliteD1()
+      applyAllMigrations(harness.sqlite)
+      seed(harness.sqlite, { status: 'in_progress', gateOwner: 'gate:reviewer', result: null, assigneeAgentId: null })
+      env = { TENANT_SLUG: TENANT, DB: harness.db } as Env
+
+      const res = await invokeTool(callerAuth(), env, 'task_update', { task_id: TASK_ID, status: 'review' }, URL)
+      expect(res.ok, JSON.stringify(res)).toBe(true)
+      const row = harness.sqlite.prepare('SELECT status FROM tasks WHERE id = ?').get(TASK_ID) as { status: string }
+      expect(row.status).toBe('review')
+    })
+
+    it('is NOT gated on a direct ungated done with no result at all', async () => {
+      harness = createSqliteD1()
+      applyAllMigrations(harness.sqlite)
+      seed(harness.sqlite, { status: 'in_progress', gateOwner: null, result: null, assigneeAgentId: null })
       env = { TENANT_SLUG: TENANT, DB: harness.db } as Env
 
       const res = await invokeTool(callerAuth(), env, 'task_update', { task_id: TASK_ID, status: 'done' }, URL)
