@@ -95,10 +95,10 @@ export async function memberTokenHashIsLive(
       WHERE t.token_hash = ?1
         AND t.tenant = ?2
         AND m.tenant = ?2
-        AND t.revoked_at IS NULL
+        AND ${TOKEN_LIVE_PREDICATE('?3')}
       LIMIT 1`,
   )
-    .bind(tokenHash, env.TENANT_SLUG)
+    .bind(tokenHash, env.TENANT_SLUG, nowSqlUtc())
     .first<{ member_id: string; status: string }>()
   return !!row && row.status === 'active' && row.member_id === expectedMemberId
 }

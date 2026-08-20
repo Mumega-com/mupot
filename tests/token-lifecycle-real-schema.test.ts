@@ -223,6 +223,14 @@ describe('both bearer doors consume the shared predicate', () => {
     expect(src).toContain('TOKEN_LIVE_PREDICATE(')
   })
 
+  it('auth/member-bearer.ts memberTokenHashIsLive uses TOKEN_LIVE_PREDICATE', () => {
+    const src = read('src/auth/member-bearer.ts')
+    expect(src).toContain('memberTokenHashIsLive')
+    const fn = src.slice(src.indexOf('export async function memberTokenHashIsLive'))
+    expect(fn).toContain('TOKEN_LIVE_PREDICATE(')
+    expect(fn).not.toContain('AND t.revoked_at IS NULL')
+  })
+
   it('no bearer lookup still hardcodes a bare revoked_at-only liveness check', () => {
     for (const p of ['src/mcp/index.ts', 'src/auth/member-bearer.ts']) {
       const src = read(p)
