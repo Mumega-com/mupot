@@ -61,6 +61,12 @@ function seedMember(
   }
 }
 
+function seedProject(sqlite: SqliteD1Harness['sqlite'], id = 'proj-a'): void {
+  sqlite.exec(
+    `INSERT INTO projects (id, slug, name, status) VALUES ('${id}', '${id}', 'A', 'active')`,
+  )
+}
+
 const sampleModule: ModulePresence = {
   id: 'm1',
   kind: 'agent_system',
@@ -317,9 +323,12 @@ describe('presence socket lease tags + revocation revalidation (mupot#545)', () 
   })
 
   it('subscriptionStillAuthorized is false when the token hash is revoked', async () => {
+    // orgAdmin + existing project: canReadProject would succeed. Fail-closed
+    // must be memberTokenHashIsLive (M1: always-live would make this true).
     const { harness, env } = realDbEnv()
     try {
-      seedMember(harness.sqlite, 'mem-1', 'dead', { revoked: true })
+      seedMember(harness.sqlite, 'mem-1', 'dead', { revoked: true, orgAdmin: true })
+      seedProject(harness.sqlite)
       await expect(
         subscriptionStillAuthorized(env, {
           projectId: 'proj-a',
@@ -336,9 +345,7 @@ describe('presence socket lease tags + revocation revalidation (mupot#545)', () 
     const { harness, env } = realDbEnv()
     try {
       seedMember(harness.sqlite, 'mem-1', 'live')
-      harness.sqlite.exec(
-        `INSERT INTO projects (id, slug, name, status) VALUES ('proj-a', 'proj-a', 'A', 'active')`,
-      )
+      seedProject(harness.sqlite)
       await expect(
         subscriptionStillAuthorized(env, {
           projectId: 'proj-a',
@@ -352,13 +359,13 @@ describe('presence socket lease tags + revocation revalidation (mupot#545)', () 
   })
 
   it('fanOutAuthorizedRoster closes revoked sockets and skips their send', async () => {
+    // Revoked principal keeps orgAdmin + project row so close is revocation,
+    // not the project-access path (M1: always-live would send to both).
     const { harness, env } = realDbEnv()
     try {
       seedMember(harness.sqlite, 'mem-live', 'hash-live', { orgAdmin: true })
-      seedMember(harness.sqlite, 'mem-revoked', 'hash-revoked', { revoked: true })
-      harness.sqlite.exec(
-        `INSERT INTO projects (id, slug, name, status) VALUES ('proj-a', 'proj-a', 'A', 'active')`,
-      )
+      seedMember(harness.sqlite, 'mem-revoked', 'hash-revoked', { revoked: true, orgAdmin: true })
+      seedProject(harness.sqlite)
       const live = {
         send: vi.fn(),
         close: vi.fn(),
