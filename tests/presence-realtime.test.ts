@@ -4,6 +4,8 @@
 
 import { describe, expect, it, vi } from 'vitest'
 import type { Env } from '../src/types'
+import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 import type { ModulePresence } from '../src/registry/service'
 import { PRESENCE_STALE_SECONDS } from '../src/registry/service'
 import {
@@ -27,6 +29,37 @@ import {
 } from '../src/registry/presence-subscription-auth'
 
 const NOW = new Date('2026-07-22T12:00:00.000Z')
+const TENANT = 't'
+
+function realDbEnv(): { harness: SqliteD1Harness; env: Env } {
+  const harness = createSqliteD1()
+  applyAllMigrations(harness.sqlite)
+  const env = { DB: harness.db, TENANT_SLUG: TENANT } as unknown as Env
+  return { harness, env }
+}
+
+function seedMember(
+  sqlite: SqliteD1Harness['sqlite'],
+  id: string,
+  hash: string,
+  opts: { revoked?: boolean; orgAdmin?: boolean } = {},
+): void {
+  sqlite.exec(
+    `INSERT INTO members (id, email, display_name, status, tenant)
+     VALUES ('${id}', '${id}@t.local', '${id}', 'active', '${TENANT}')`,
+  )
+  const revoked = opts.revoked ? "'2026-01-01 00:00:00'" : 'NULL'
+  sqlite.exec(
+    `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, revoked_at, expires_at, tenant)
+     VALUES ('tok-${id}', '${id}', '${hash}', 'test', 'workspace', datetime('now'), ${revoked}, NULL, '${TENANT}')`,
+  )
+  if (opts.orgAdmin) {
+    sqlite.exec(
+      `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+       VALUES ('cap-${id}', '${id}', 'org', NULL, 'admin')`,
+    )
+  }
+}
 
 const sampleModule: ModulePresence = {
   id: 'm1',
@@ -153,63 +186,65 @@ describe('sanitizeWebSocketCloseCode / reciprocateWebSocketClose', () => {
 
 describe('publishRosterPush', () => {
   it('no-ops when the gate is off (query-time presence stays sufficient)', async () => {
-    const env = { TENANT_SLUG: 't', DB: {} } as Env
-    const result = await publishRosterPush(env, 'proj-a', NOW)
-    expect(result).toEqual({ ok: true, skipped: true, reason: 'disabled' })
+    const { harness, env } = realDbEnv()
+    try {
+      const result = await publishRosterPush(env, 'proj-a', NOW)
+      expect(result).toEqual({ ok: true, skipped: true, reason: 'disabled' })
+    } finally {
+      harness.close()
+    }
   })
 
   it('publishes a roster frame to the project channel when gated on', async () => {
-    const fetchMock = vi.fn(async () => Response.json({ ok: true, sent: 3 }))
-    const idFromName = vi.fn((name: string) => ({ name }) as unknown as DurableObjectId)
-    const get = vi.fn(() => ({ fetch: fetchMock }))
-    const env = {
-      TENANT_SLUG: 'tenant-a',
-      REALTIME_PRESENCE: REALTIME_PRESENCE_FLAG,
-      PRESENCE_CHANNEL: { idFromName, get },
-      DB: {
-        prepare: () => ({
-          bind: () => ({
-            all: async () => ({ results: [] }),
-          }),
-        }),
-      },
-    } as unknown as Env
+    const { harness, env } = realDbEnv()
+    try {
+      const fetchMock = vi.fn(async () => Response.json({ ok: true, sent: 3 }))
+      const idFromName = vi.fn((name: string) => ({ name }) as unknown as DurableObjectId)
+      const get = vi.fn(() => ({ fetch: fetchMock }))
+      const gated = {
+        ...env,
+        TENANT_SLUG: 'tenant-a',
+        REALTIME_PRESENCE: REALTIME_PRESENCE_FLAG,
+        PRESENCE_CHANNEL: { idFromName, get },
+      } as unknown as Env
 
-    const result = await publishRosterPush(env, 'proj-a', NOW)
-    expect(result).toEqual({ ok: true, skipped: false, sent: 3 })
-    expect(idFromName).toHaveBeenCalledWith('tenant-a:presence:proj-a')
-    expect(fetchMock).toHaveBeenCalledOnce()
-    const req = fetchMock.mock.calls[0][0] as Request
-    expect(req.method).toBe('POST')
-    expect(new URL(req.url).pathname).toBe('/publish')
-    const body = parseRosterPush(await req.text())
-    expect(body.type).toBe('roster')
-    expect(body.project_id).toBe('proj-a')
+      const result = await publishRosterPush(gated, 'proj-a', NOW)
+      expect(result).toEqual({ ok: true, skipped: false, sent: 3 })
+      expect(idFromName).toHaveBeenCalledWith('tenant-a:presence:proj-a')
+      expect(fetchMock).toHaveBeenCalledOnce()
+      const req = fetchMock.mock.calls[0][0] as Request
+      expect(req.method).toBe('POST')
+      expect(new URL(req.url).pathname).toBe('/publish')
+      const body = parseRosterPush(await req.text())
+      expect(body.type).toBe('roster')
+      expect(body.project_id).toBe('proj-a')
+    } finally {
+      harness.close()
+    }
   })
 
   it('returns ok:false (does not throw) when the DO fetch fails', async () => {
-    const env = {
-      TENANT_SLUG: 'tenant-a',
-      REALTIME_PRESENCE: REALTIME_PRESENCE_FLAG,
-      PRESENCE_CHANNEL: {
-        idFromName: () => ({}),
-        get: () => ({
-          fetch: async () => {
-            throw new Error('do_down')
-          },
-        }),
-      },
-      DB: {
-        prepare: () => ({
-          bind: () => ({
-            all: async () => ({ results: [] }),
+    const { harness, env } = realDbEnv()
+    try {
+      const gated = {
+        ...env,
+        TENANT_SLUG: 'tenant-a',
+        REALTIME_PRESENCE: REALTIME_PRESENCE_FLAG,
+        PRESENCE_CHANNEL: {
+          idFromName: () => ({}),
+          get: () => ({
+            fetch: async () => {
+              throw new Error('do_down')
+            },
           }),
-        }),
-      },
-    } as unknown as Env
+        },
+      } as unknown as Env
 
-    const result = await publishRosterPush(env, null, NOW)
-    expect(result).toEqual({ ok: false, error: 'do_down' })
+      const result = await publishRosterPush(gated, null, NOW)
+      expect(result).toEqual({ ok: false, error: 'do_down' })
+    } finally {
+      harness.close()
+    }
   })
 })
 
@@ -282,111 +317,71 @@ describe('presence socket lease tags + revocation revalidation (mupot#545)', () 
   })
 
   it('subscriptionStillAuthorized is false when the token hash is revoked', async () => {
-    const env = {
-      TENANT_SLUG: 't',
-      DB: {
-        prepare: () => ({
-          bind: () => ({
-            first: async () => null,
-          }),
+    const { harness, env } = realDbEnv()
+    try {
+      seedMember(harness.sqlite, 'mem-1', 'dead', { revoked: true })
+      await expect(
+        subscriptionStillAuthorized(env, {
+          projectId: 'proj-a',
+          memberId: 'mem-1',
+          tokenHash: 'dead',
         }),
-      },
-    } as unknown as Env
-    await expect(
-      subscriptionStillAuthorized(env, {
-        projectId: 'proj-a',
-        memberId: 'mem-1',
-        tokenHash: 'dead',
-      }),
-    ).resolves.toBe(false)
+      ).resolves.toBe(false)
+    } finally {
+      harness.close()
+    }
   })
 
   it('subscriptionStillAuthorized is false when project access is gone', async () => {
-    let call = 0
-    const env = {
-      TENANT_SLUG: 't',
-      DB: {
-        prepare: (sql: string) => ({
-          bind: (..._args: unknown[]) => ({
-            first: async () => {
-              call += 1
-              if (sql.includes('member_tokens')) {
-                return { member_id: 'mem-1', status: 'active' }
-              }
-              // project visibility SELECT — no row = lost access
-              return null
-            },
-            all: async () => ({ results: [] }),
-          }),
+    const { harness, env } = realDbEnv()
+    try {
+      seedMember(harness.sqlite, 'mem-1', 'live')
+      harness.sqlite.exec(
+        `INSERT INTO projects (id, slug, name, status) VALUES ('proj-a', 'proj-a', 'A', 'active')`,
+      )
+      await expect(
+        subscriptionStillAuthorized(env, {
+          projectId: 'proj-a',
+          memberId: 'mem-1',
+          tokenHash: 'live',
         }),
-      },
-    } as unknown as Env
-
-    // resolveCapabilities returns [] (no grants) via all(); readableProject fails closed
-    await expect(
-      subscriptionStillAuthorized(env, {
-        projectId: 'proj-a',
-        memberId: 'mem-1',
-        tokenHash: 'live',
-      }),
-    ).resolves.toBe(false)
-    expect(call).toBeGreaterThan(0)
+      ).resolves.toBe(false)
+    } finally {
+      harness.close()
+    }
   })
 
   it('fanOutAuthorizedRoster closes revoked sockets and skips their send', async () => {
-    const live = {
-      send: vi.fn(),
-      close: vi.fn(),
-      tags: ['proj-a', 'mem-live', 'hash-live'],
+    const { harness, env } = realDbEnv()
+    try {
+      seedMember(harness.sqlite, 'mem-live', 'hash-live', { orgAdmin: true })
+      seedMember(harness.sqlite, 'mem-revoked', 'hash-revoked', { revoked: true })
+      harness.sqlite.exec(
+        `INSERT INTO projects (id, slug, name, status) VALUES ('proj-a', 'proj-a', 'A', 'active')`,
+      )
+      const live = {
+        send: vi.fn(),
+        close: vi.fn(),
+        tags: ['proj-a', 'mem-live', 'hash-live'],
+      }
+      const revoked = {
+        send: vi.fn(),
+        close: vi.fn(),
+        tags: ['proj-a', 'mem-revoked', 'hash-revoked'],
+      }
+      const sent = await fanOutAuthorizedRoster(
+        env,
+        [live, revoked],
+        (s) => s.tags,
+        'roster-frame',
+      )
+      expect(sent).toBe(1)
+      expect(live.send).toHaveBeenCalledWith('roster-frame')
+      expect(revoked.send).not.toHaveBeenCalled()
+      expect(revoked.close).toHaveBeenCalledWith(PRESENCE_AUTH_REVOKED_CLOSE_CODE, 'auth_revoked')
+    } finally {
+      harness.close()
     }
-    const revoked = {
-      send: vi.fn(),
-      close: vi.fn(),
-      tags: ['proj-a', 'mem-revoked', 'hash-revoked'],
-    }
-    const env = {
-      TENANT_SLUG: 't',
-      DB: {
-        prepare: (sql: string) => ({
-          bind: (...args: unknown[]) => ({
-            first: async () => {
-              if (sql.includes('member_tokens')) {
-                const hash = args[0]
-                if (hash === 'hash-live') return { member_id: 'mem-live', status: 'active' }
-                return null
-              }
-              // project row for live member with org admin path: return a project
-              return { id: 'proj-a' }
-            },
-            all: async () => ({
-              // grant org:admin so readableProject unrestricted path works for live
-              results: [
-                {
-                  id: 'g1',
-                  member_id: 'mem-live',
-                  scope_type: 'org',
-                  scope_id: null,
-                  capability: 'admin',
-                  granted_by: null,
-                  created_at: NOW.toISOString(),
-                },
-              ],
-            }),
-          }),
-        }),
-      },
-    } as unknown as Env
-
-    const sent = await fanOutAuthorizedRoster(
-      env,
-      [live, revoked],
-      (s) => s.tags,
-      'roster-frame',
-    )
-    expect(sent).toBe(1)
-    expect(live.send).toHaveBeenCalledWith('roster-frame')
-    expect(revoked.send).not.toHaveBeenCalled()
-    expect(revoked.close).toHaveBeenCalledWith(PRESENCE_AUTH_REVOKED_CLOSE_CODE, 'auth_revoked')
   })
 })
 
