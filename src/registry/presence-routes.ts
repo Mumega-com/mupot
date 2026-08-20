@@ -33,6 +33,7 @@ import { listPresence } from './service'
 import {
   isRealtimePresenceEnabled,
   presenceChannelName,
+  presenceLiveDoUpgradeRequest,
 } from './realtime'
 
 export const presenceApp = new Hono<{ Bindings: Env }>()
@@ -115,5 +116,5 @@ presenceApp.get('/live', async (c) => {
   // Lease identity for post-connect revalidation (mupot#545) — hash only, never raw token.
   doUrl.searchParams.set('member', authz.memberId)
   doUrl.searchParams.set('token_hash', authz.tokenHash)
-  return stub.fetch(new Request(doUrl.toString(), c.req.raw))
+  return stub.fetch(presenceLiveDoUpgradeRequest(doUrl, c.req.raw))
 })

@@ -14,8 +14,10 @@ import {
   fanOutWebSockets,
   isRealtimePresenceEnabled,
   nextPresenceExpiryMs,
+  parsePublishTrigger,
   parseRosterPush,
   presenceChannelName,
+  presenceLiveDoUpgradeRequest,
   publishRosterPush,
   reciprocateWebSocketClose,
   sanitizeWebSocketCloseCode,
@@ -221,9 +223,10 @@ describe('publishRosterPush', () => {
       const req = fetchMock.mock.calls[0][0] as Request
       expect(req.method).toBe('POST')
       expect(new URL(req.url).pathname).toBe('/publish')
-      const body = parseRosterPush(await req.text())
-      expect(body.type).toBe('roster')
+      const body = JSON.parse(await req.text()) as { type: string; project_id: string | null }
+      expect(body.type).toBe('publish')
       expect(body.project_id).toBe('proj-a')
+      expect(body).not.toHaveProperty('modules')
     } finally {
       harness.close()
     }
@@ -251,6 +254,87 @@ describe('publishRosterPush', () => {
     } finally {
       harness.close()
     }
+  })
+
+  it('returns ok:false (does not throw) when the DO response body is not JSON', async () => {
+    const { harness, env } = realDbEnv()
+    try {
+      const gated = {
+        ...env,
+        TENANT_SLUG: 'tenant-a',
+        REALTIME_PRESENCE: REALTIME_PRESENCE_FLAG,
+        PRESENCE_CHANNEL: {
+          idFromName: () => ({}),
+          get: () => ({
+            fetch: async () => new Response('not-json', { status: 200 }),
+          }),
+        },
+      } as unknown as Env
+
+      const result = await publishRosterPush(gated, 'proj-a', NOW)
+      expect(result.ok).toBe(false)
+    } finally {
+      harness.close()
+    }
+  })
+})
+
+describe('parsePublishTrigger (DO ignores stale roster frames)', () => {
+  it('reads project_id from a trigger, including null', () => {
+    expect(parsePublishTrigger(JSON.stringify({ type: 'publish', project_id: 'proj-a' }))).toEqual({
+      hasProjectId: true,
+      projectId: 'proj-a',
+    })
+    expect(parsePublishTrigger(JSON.stringify({ type: 'publish', project_id: null }))).toEqual({
+      hasProjectId: true,
+      projectId: null,
+    })
+  })
+
+  it('does not treat a roster snapshot as the source of truth', () => {
+    const stale = encodeRosterPush('proj-a', [sampleModule], NOW)
+    const parsed = JSON.parse(stale) as { type: string; modules: unknown[] }
+    expect(parsed.type).toBe('roster')
+    expect(parsed.modules).toHaveLength(1)
+    // project_id is present on a roster frame too — the DO still recomputes
+    // modules from D1; the trigger parser only carries the channel key.
+    expect(parsePublishTrigger(stale)).toEqual({ hasProjectId: true, projectId: 'proj-a' })
+  })
+
+  it('ignores empty / non-JSON / missing project_id', () => {
+    expect(parsePublishTrigger('')).toEqual({ hasProjectId: false, projectId: null })
+    expect(parsePublishTrigger('not-json')).toEqual({ hasProjectId: false, projectId: null })
+    expect(parsePublishTrigger(JSON.stringify({ type: 'publish' }))).toEqual({
+      hasProjectId: false,
+      projectId: null,
+    })
+  })
+})
+
+describe('presenceLiveDoUpgradeRequest (never hop Authorization)', () => {
+  it('copies the WebSocket upgrade headers and drops the bearer', () => {
+    const incoming = new Request('https://pot.example/api/presence/live?project=proj-a', {
+      method: 'GET',
+      headers: {
+        Authorization: 'Bearer super-secret-token',
+        Upgrade: 'websocket',
+        Connection: 'Upgrade',
+        'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==',
+        'Sec-WebSocket-Version': '13',
+        Cookie: 'session=nope',
+      },
+    })
+    const forwarded = presenceLiveDoUpgradeRequest(
+      new URL('https://presence-channel/subscribe?project=proj-a&member=m1&token_hash=abc'),
+      incoming,
+    )
+    expect(forwarded.headers.get('authorization')).toBeNull()
+    expect(forwarded.headers.get('cookie')).toBeNull()
+    expect(forwarded.headers.get('upgrade')).toBe('websocket')
+    expect(forwarded.headers.get('connection')).toBe('Upgrade')
+    expect(forwarded.headers.get('sec-websocket-key')).toBe('dGhlIHNhbXBsZSBub25jZQ==')
+    expect(forwarded.url).toContain('token_hash=abc')
+    expect(forwarded.url).not.toContain('super-secret-token')
   })
 })
 

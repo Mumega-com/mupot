@@ -290,7 +290,6 @@ block collapses into a changelog entry when it ships.
 
 ### Added
 
-<<<<<<< HEAD
 - Linear connector (flight-20260803-linear-posthog): `createLinearBoardPort`
   (`src/projects/providers/linear.ts`) now does real, read-only GraphQL reads
   against Linear (`src/integrations/linear-issues.ts`) through the existing
@@ -410,6 +409,14 @@ block collapses into a changelog entry when it ships.
 - `PresenceChannelDO` schedules a Durable Object alarm at the earliest heartbeat
   expiry so subscribers receive offline transitions without client-side sync
   (mupot#545).
+- Live roster publish recomputes inside `PresenceChannelDO` (does not disclose a
+  Worker-supplied snapshot), so a concurrent heartbeat cannot land an older
+  online frame after a newer offline, and expiry alarms match the disclosed
+  roster. `publishRosterPush` wraps fetch + JSON decode so a snapshot/push
+  failure cannot turn a committed deregister/heartbeat into an MCP error.
+- `GET /api/presence/live` forwards only WebSocket hop headers onto the DO —
+  Authorization is not copied. Leftover `<<<<<<< HEAD` conflict marker removed
+  from this changelog.
 
 ### Changed
 

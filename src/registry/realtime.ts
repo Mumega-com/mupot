@@ -9,7 +9,7 @@
 // is a no-op / route 404 — the pot behaves exactly as before ADR follow-through #2.
 
 import type { Env } from '../types'
-import { listPresence, type ModulePresence } from './service'
+import type { ModulePresence } from './service'
 
 export const REALTIME_PRESENCE_FLAG = '1'
 
@@ -144,34 +144,76 @@ export type PublishRosterResult =
  * publishRosterPush — best-effort live roster fan-out. Source of truth stays D1;
  * a failed push never rolls back register/heartbeat/deregister. Disabled gate →
  * skipped (not an error).
+ *
+ * The Worker does NOT snapshot D1 here. Snapshotting in the caller, then POSTing
+ * that body to the DO, races: a later heartbeat can land in D1, then an older
+ * offline snapshot can still be disclosed. The DO recomputes the roster itself
+ * (single-threaded per channel) so publish order cannot resurrect a stale frame.
  */
 export async function publishRosterPush(
   env: Env,
   projectId: string | null,
-  now: Date,
+  _now: Date,
 ): Promise<PublishRosterResult> {
   if (!isRealtimePresenceEnabled(env)) return { ok: true, skipped: true, reason: 'disabled' }
   const ns = env.PRESENCE_CHANNEL
   if (!ns) return { ok: true, skipped: true, reason: 'disabled' }
 
-  const modules = await listPresence(env, { projectId }, now)
-  const body = encodeRosterPush(projectId, modules, now)
   const stub = ns.get(ns.idFromName(presenceChannelName(env.TENANT_SLUG, projectId)))
-  let res: Response
   try {
-    res = await stub.fetch(
+    const res = await stub.fetch(
       new Request('https://presence-channel/publish', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body,
+        body: JSON.stringify({ type: 'publish', project_id: projectId }),
       }),
     )
+    if (!res.ok) return { ok: false, error: `publish_http_${res.status}` }
+    const payload = (await res.json()) as { sent?: unknown }
+    const sent = typeof payload.sent === 'number' ? payload.sent : 0
+    return { ok: true, skipped: false, sent }
   } catch (err) {
     const message = err instanceof Error ? err.message : 'publish_fetch_failed'
     return { ok: false, error: message }
   }
-  if (!res.ok) return { ok: false, error: `publish_http_${res.status}` }
-  const payload = (await res.json()) as { sent?: unknown }
-  const sent = typeof payload.sent === 'number' ? payload.sent : 0
-  return { ok: true, skipped: false, sent }
+}
+
+const PRESENCE_LIVE_HOP_HEADERS = [
+  'upgrade',
+  'connection',
+  'sec-websocket-key',
+  'sec-websocket-version',
+  'sec-websocket-protocol',
+  'sec-websocket-extensions',
+] as const
+
+/**
+ * Forward a WebSocket upgrade onto PresenceChannelDO without the caller's
+ * Authorization (or any other) header. The DO receives member + token_hash on
+ * the subscribe URL; a raw hop would leak the bearer into the DO.
+ */
+export function presenceLiveDoUpgradeRequest(doUrl: URL, incoming: Request): Request {
+  const headers = new Headers()
+  for (const name of PRESENCE_LIVE_HOP_HEADERS) {
+    const value = incoming.headers.get(name)
+    if (value) headers.set(name, value)
+  }
+  return new Request(doUrl.toString(), { method: 'GET', headers })
+}
+
+/** Worker→DO publish is a trigger, not a roster frame. Stale snapshots are ignored. */
+export function parsePublishTrigger(raw: string): { hasProjectId: boolean; projectId: string | null } {
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (parsed === null || typeof parsed !== 'object') {
+      return { hasProjectId: false, projectId: null }
+    }
+    if (!('project_id' in parsed)) return { hasProjectId: false, projectId: null }
+    const projectId = (parsed as { project_id: unknown }).project_id
+    if (projectId === null) return { hasProjectId: true, projectId: null }
+    if (typeof projectId === 'string') return { hasProjectId: true, projectId }
+  } catch {
+    // empty or non-JSON body: DO uses stored project id
+  }
+  return { hasProjectId: false, projectId: null }
 }

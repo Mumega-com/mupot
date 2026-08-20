@@ -18,6 +18,7 @@ import { listPresence, PRESENCE_STALE_SECONDS } from './service'
 import {
   encodeRosterPush,
   nextPresenceExpiryMs,
+  parsePublishTrigger,
   reciprocateWebSocketClose,
 } from './realtime'
 import {
@@ -40,11 +41,21 @@ export class PresenceChannelDO extends DurableObject<Env> {
     const url = new URL(req.url)
 
     if (url.pathname === '/publish' && req.method === 'POST') {
-      const body = await req.text()
-      if (!body) return Response.json({ error: 'empty_body' }, { status: 400 })
-      const projectId = await this.loadProjectId()
-      const sent = await this.discloseRoster(body)
-      await this.scheduleExpiryAlarm(projectId, new Date())
+      // Ignore any caller-supplied roster frame. The Worker used to POST a D1
+      // snapshot; concurrent heartbeat/deregister could then disclose an older
+      // online frame after a newer offline, and scheduleExpiryAlarm would drop
+      // the alarm. This DO is the ordered writer — recompute from D1 here.
+      const now = new Date()
+      let projectId = await this.loadProjectId()
+      const trigger = parsePublishTrigger(await req.text())
+      if (trigger.hasProjectId) {
+        projectId = trigger.projectId
+        await this.ctx.storage.put(PROJECT_ID_STORAGE_KEY, projectId)
+      }
+      const modules = await listPresence(this.env, { projectId }, now)
+      const frame = encodeRosterPush(projectId, modules, now)
+      const sent = await this.discloseRoster(frame)
+      await this.scheduleExpiryAlarm(projectId, now, modules)
       return Response.json({ ok: true, sent })
     }
 
@@ -72,7 +83,7 @@ export class PresenceChannelDO extends DurableObject<Env> {
       const now = new Date()
       const modules = await listPresence(this.env, { projectId }, now)
       server.send(encodeRosterPush(projectId, modules, now))
-      await this.scheduleExpiryAlarm(projectId, now)
+      await this.scheduleExpiryAlarm(projectId, now, modules)
 
       return new Response(null, { status: 101, webSocket: client })
     }
@@ -106,7 +117,7 @@ export class PresenceChannelDO extends DurableObject<Env> {
     const now = new Date()
     const modules = await listPresence(this.env, { projectId: lease.projectId }, now)
     ws.send(encodeRosterPush(lease.projectId, modules, now))
-    await this.scheduleExpiryAlarm(lease.projectId, now)
+    await this.scheduleExpiryAlarm(lease.projectId, now, modules)
   }
 
   async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
@@ -125,7 +136,7 @@ export class PresenceChannelDO extends DurableObject<Env> {
     const modules = await listPresence(this.env, { projectId }, now)
     const body = encodeRosterPush(projectId, modules, now)
     await this.discloseRoster(body)
-    await this.scheduleExpiryAlarm(projectId, now)
+    await this.scheduleExpiryAlarm(projectId, now, modules)
   }
 
   private async discloseRoster(body: string): Promise<number> {
@@ -143,9 +154,13 @@ export class PresenceChannelDO extends DurableObject<Env> {
     return stored
   }
 
-  private async scheduleExpiryAlarm(projectId: string | null, now: Date): Promise<void> {
-    const modules = await listPresence(this.env, { projectId }, now)
-    const nextMs = nextPresenceExpiryMs(modules, now.getTime(), PRESENCE_STALE_SECONDS)
+  private async scheduleExpiryAlarm(
+    projectId: string | null,
+    now: Date,
+    modules?: Awaited<ReturnType<typeof listPresence>>,
+  ): Promise<void> {
+    const roster = modules ?? (await listPresence(this.env, { projectId }, now))
+    const nextMs = nextPresenceExpiryMs(roster, now.getTime(), PRESENCE_STALE_SECONDS)
     if (nextMs === null) {
       await this.ctx.storage.deleteAlarm()
       return
