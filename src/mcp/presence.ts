@@ -47,6 +47,7 @@ import {
   type ModuleKind,
   type ActivityReport,
 } from '../registry/service'
+import { publishRosterPush } from '../registry/realtime'
 import { readAccess, readableProject } from './projects'
 import { type ToolSpec, fail, done, str, hasWorkspaceAdmin } from './index'
 
@@ -132,6 +133,7 @@ const toolPresenceRegister: ToolSpec = {
       model,
     })
     if (!result.ok) return fail(400, result.error)
+    await publishRosterPush(env, projectId ?? null, new Date())
     return done({ module: result.value })
   },
 }
@@ -212,6 +214,7 @@ const toolPresenceHeartbeat: ToolSpec = {
 
     const ok = await heartbeatModule(env, identity, projectId ?? null, new Date(), report)
     if (!ok) return fail(404, 'not_registered', 'call presence_register first')
+    await publishRosterPush(env, projectId ?? null, new Date())
     if (!report) return done({ ok: true })
 
     // Hand back the RESULTING row, not an acknowledgement. A stale-seq report is
@@ -245,6 +248,7 @@ const toolPresenceDeregister: ToolSpec = {
 
     const ok = await deregisterModule(env, identity, projectId ?? null)
     if (!ok) return fail(404, 'not_registered')
+    await publishRosterPush(env, projectId ?? null, new Date())
     return done({ ok: true })
   },
 }

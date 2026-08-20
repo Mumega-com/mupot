@@ -4,6 +4,7 @@ import type { Env } from '../src/types'
 
 vi.mock('../src/agents/agent-do', () => ({ AgentDO: class {} }))
 vi.mock('../src/agents/squad-do', () => ({ SquadCoordinatorDO: class {} }))
+vi.mock('../src/registry/presence-channel-do', () => ({ PresenceChannelDO: class {} }))
 vi.mock('../src/workflows/task-workflow', () => ({ TaskWorkflow: class {} }))
 vi.mock('../src/mcp/oauth-api-handler', () => ({ McpOAuthApiHandler: class {} }))
 vi.mock('@cloudflare/workers-oauth-provider', () => ({

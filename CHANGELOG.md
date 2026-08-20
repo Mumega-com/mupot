@@ -394,6 +394,29 @@ block collapses into a changelog entry when it ships.
     `scripts/test_steward_worker.py` — each verified to fail on the pre-fix commit
     for the right reason (the task IS auto-picked-up / IS auto-assigned), not
     because a helper is missing.
+- Gated Durable Object + WebSocket live-roster pub/sub channel (`PresenceChannelDO`,
+  `GET /api/presence/live`) — CF-native fan-out for the first real-time need; off until
+  `REALTIME_PRESENCE=1`. No Cloudflare Pub/Sub MQTT (ADR #473).
+
+### Fixed
+
+- `PresenceChannelDO.webSocketClose` sanitizes reserved/abnormal close codes
+  (1005/1006/1015 → 1000) before calling `ws.close()`, avoiding RangeError in the
+  hibernation close handler.
+- Presence live sockets revalidate the connect-time member token hash + project
+  read access before each roster disclosure, and close with `4001` on revoke /
+  deactivate / lost grant (mupot#545).
+- `PresenceChannelDO` schedules a Durable Object alarm at the earliest heartbeat
+  expiry so subscribers receive offline transitions without client-side sync
+  (mupot#545).
+- Live roster publish recomputes inside `PresenceChannelDO` (does not disclose a
+  Worker-supplied snapshot), so a concurrent heartbeat cannot land an older
+  online frame after a newer offline, and expiry alarms match the disclosed
+  roster. `publishRosterPush` wraps fetch + JSON decode so a snapshot/push
+  failure cannot turn a committed deregister/heartbeat into an MCP error.
+- `GET /api/presence/live` forwards only WebSocket hop headers onto the DO —
+  Authorization is not copied. Leftover `<<<<<<< HEAD` conflict marker removed
+  from this changelog.
 
 ### Changed
 
