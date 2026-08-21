@@ -1053,6 +1053,7 @@ const toolTaskUpdate: ToolSpec = {
       assignee_agent_id: STRING_SCHEMA,
       gate_owner: STRING_SCHEMA,
       gate_owner_reason: STRING_SCHEMA,
+      result: { type: ['string', 'null'], description: 'Task execution completion result (must include Artifact: <path> and SHA256: <64-hex> when entering review or completing)' },
     },
     required: ['task_id'],
     additionalProperties: false,
@@ -1074,6 +1075,10 @@ const toolTaskUpdate: ToolSpec = {
     let reversesVerdict = false
     let reversalReason = ''
 
+    if (args.result !== undefined) {
+      next.result = args.result === null ? null : str(args.result)
+      changed = true
+    }
     if (args.title !== undefined) {
       if (!str(args.title)) return fail(400, 'invalid_title')
       next.title = (args.title as string).trim()
@@ -1254,7 +1259,7 @@ const toolTaskUpdate: ToolSpec = {
       const entersReview = args.status === 'review'
       const ungatedDirectDone = args.status === 'done' && existing.status !== 'approved' && existing.status !== 'rejected' && !effectiveGateOwner
       if ((entersReview || ungatedDirectDone) && existing.assignee_agent_id) {
-        const artifactCheck = verifyTaskArtifactShape(existing.result)
+        const artifactCheck = verifyTaskArtifactShape(next.result ?? existing.result)
         if (!artifactCheck.verified) {
           return fail(409, 'artifact_verification_failed', {
             reason: artifactCheck.reason,
