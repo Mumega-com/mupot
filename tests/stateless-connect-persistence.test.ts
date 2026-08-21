@@ -160,6 +160,44 @@ describe('Issue #1192 — Stateless Connect Persistence (Real Schema)', () => {
     expect(orientBody.result.structuredContent.packet.agent.name).toBe('Hadi ChatGPT')
   })
 
+  it('unpaired_squad_capable_caller_connect_returns_session_local_and_retains_null_agent_id', async () => {
+    // Caller is an authorized squad member, but NOT the dedicated member registered in agent_member_bindings
+    seedFixture(harness.sqlite, {
+      memberId: 'member-peer-operator',
+      tokenId: 'tok-peer-operator',
+      tokenChannel: 'workspace',
+      squadCapability: 'member',
+      pairedAgentMember: false,
+    })
+    // Pair agent with a different dedicated member
+    harness.sqlite
+      .prepare(
+        `INSERT INTO members (id, email, display_name, status, tenant)
+         VALUES ('member-dedicated-agent', 'agent@mumega.test', 'Dedicated Agent Member', 'active', ?)`,
+      )
+      .run(TENANT)
+    harness.sqlite
+      .prepare(
+        `INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+         VALUES (?, ?, 'member-dedicated-agent', datetime('now'))`,
+      )
+      .run(TENANT, AGENT_ID)
+
+    const env = makeEnv(harness)
+
+    const connectRes = await callTool(env, 'connect', { agent_name: AGENT_SLUG })
+    expect(connectRes.status).toBe(200)
+    const connectBody = (await connectRes.json()) as any
+    expect(connectBody.result.structuredContent.connection_status).toBe('hot')
+    expect(connectBody.result.structuredContent.binding).toBe('session_local')
+
+    // D1 member_tokens row MUST remain null
+    const row = harness.sqlite
+      .prepare('SELECT agent_id FROM member_tokens WHERE id = ?')
+      .get('tok-peer-operator') as { agent_id: string | null }
+    expect(row.agent_id).toBeNull()
+  })
+
   it('unauthorized_squad_claim_refuses_d1_weld', async () => {
     seedFixture(harness.sqlite, {
       memberId: 'member-unauthorized',
