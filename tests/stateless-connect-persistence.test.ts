@@ -78,7 +78,17 @@ function seedFixture(
     )
     .run(opts.tokenId, opts.memberId, TOKEN_HASH, opts.tokenChannel ?? 'workspace', TENANT)
 
-  // 4. Capability grant
+  // 4. Agent Member Binding (for dedicated agent tokens)
+  if (opts.pairedAgentMember) {
+    sqlite
+      .prepare(
+        `INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+         VALUES (?, ?, ?, datetime('now'))`,
+      )
+      .run(TENANT, AGENT_ID, opts.memberId)
+  }
+
+  // 5. Capability grant
   if (opts.squadCapability) {
     sqlite
       .prepare(
@@ -125,6 +135,7 @@ describe('Issue #1192 — Stateless Connect Persistence (Real Schema)', () => {
       tokenId: 'tok-hadi-1',
       tokenChannel: 'workspace',
       squadCapability: 'member',
+      pairedAgentMember: true,
     })
     const env = makeEnv(harness)
 

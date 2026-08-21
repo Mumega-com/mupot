@@ -4011,22 +4011,19 @@ const toolConnect: ToolSpec = {
     // retain the agent identity on subsequent tool calls.
     let durable = false
     if (auth.tokenId && !auth.boundAgentId) {
-      if (auth.memberId) {
-        await env.DB.prepare(
-          `INSERT OR IGNORE INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
-           VALUES (?1, ?2, ?3, datetime('now'))`,
+      try {
+        const updateResult = await env.DB.prepare(
+          'UPDATE member_tokens SET agent_id = ?1 WHERE id = ?2 AND agent_id IS NULL',
         )
-          .bind(env.TENANT_SLUG, agentRef.id, auth.memberId)
+          .bind(agentRef.id, auth.tokenId)
           .run()
+
+        durable = (updateResult.meta?.changes ?? 0) > 0
+      } catch {
+        // If trigger prevents D1 update (e.g. agent_identity_conflict when caller is not the agent's dedicated member),
+        // retain session-local claim without failing the connection.
+        durable = false
       }
-
-      const updateResult = await env.DB.prepare(
-        'UPDATE member_tokens SET agent_id = ?1 WHERE id = ?2 AND agent_id IS NULL',
-      )
-        .bind(agentRef.id, auth.tokenId)
-        .run()
-
-      durable = (updateResult.meta?.changes ?? 0) > 0
     }
 
     return done({

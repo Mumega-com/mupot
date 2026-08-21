@@ -130,7 +130,7 @@ function makeEnv(opts: Opts = {}): Env {
           if (sql.includes('FROM capabilities')) return { results: grants }
           return { results: [] }
         },
-        async run() { return { meta: { changes: 0 } } },
+        async run() { return { success: true, meta: { changes: 1 } } },
       }
     },
     // DB.batch support (not used by connect, but keep for safety)
