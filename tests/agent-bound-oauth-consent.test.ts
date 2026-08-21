@@ -617,6 +617,20 @@ describe('C1. GET /oauth/google-callback renders the consent screen', () => {
     expect(html.toLowerCase()).toContain('unbound')
   })
 
+  it('requires an explicit user selection: none of the radio buttons are pre-checked, all have required', async () => {
+    const oauthProvider = stubOAuthProvider()
+    const { env } = httpEnv(harness, oauthProvider)
+    const { html } = await reachConsentScreen(env, oauthProvider, 'human@example.test')
+    // No radio input should be pre-checked (zero silent welds, zero silent unbound defaults)
+    expect(html).not.toMatch(/<input[^>]*type="radio"[^>]*checked/)
+    // All radio inputs must have required attribute
+    const radioMatches = html.match(/<input[^>]*type="radio"[^>]*>/g) || []
+    expect(radioMatches.length).toBeGreaterThan(0)
+    for (const r of radioMatches) {
+      expect(r).toContain('required')
+    }
+  })
+
   it('escapes agent name content — no stored-XSS via an admin-authored agent name', async () => {
     harness.sqlite.exec(
       `UPDATE agents SET name = '<script>alert(1)</script>' WHERE id = '${AGENT_A.id}'`,
@@ -993,6 +1007,28 @@ describe('C6. POST /oauth/consent — CSRF and replay protection', () => {
     const res = await handleOAuthAuthorize(req, env)
     expect(res.status).toBe(400)
     expect(oauthProvider.completeAuthorization).not.toHaveBeenCalled()
+  })
+
+  it('missing agent_id in POST body → 400, no mint (explicit choice required, zero silent unbound default)', async () => {
+    const oauthProvider = stubOAuthProvider()
+    const { env } = httpEnv(harness, oauthProvider)
+    const { consentCookie } = await reachConsentScreen(env, oauthProvider, 'human@example.test')
+
+    const before = (harness.sqlite.prepare('SELECT COUNT(*) AS n FROM member_tokens').all()[0] as { n: number }).n
+
+    // Submit form WITHOUT agent_id parameter
+    const form = new URLSearchParams({ consent_nonce: consentCookie, action: 'continue' })
+    const req = new Request('https://pot.test/oauth/consent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${consentCookie}` },
+      body: form.toString(),
+    })
+    const res = await handleOAuthAuthorize(req, env)
+    expect(res.status).toBe(400)
+    expect(await res.text()).toContain('Missing agent_id')
+    expect(oauthProvider.completeAuthorization).not.toHaveBeenCalled()
+    const after = (harness.sqlite.prepare('SELECT COUNT(*) AS n FROM member_tokens').all()[0] as { n: number }).n
+    expect(after).toBe(before)
   })
 })
 
