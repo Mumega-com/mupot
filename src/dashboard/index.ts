@@ -76,6 +76,13 @@ import {
 import { loadApprovals, loadPublishable, resultPreview } from './approvals'
 import { CONTENT_DEPARTMENT_KEY } from '../agents/execute'
 import { loadLoopsView, loopsBody } from './loops'
+import {
+  loadCircuitListView,
+  circuitListBody,
+  loadCircuitDetailView,
+  circuitDetailBody,
+  circuitNotFoundBody,
+} from './workflow-circuits'
 import { loadEconomy, economyBody, loadTodaySpendScalar } from './economy'
 import { loadDeployment, deploymentBody } from './deployment'
 import { loadVerifications, verificationsBody } from './verifications'
@@ -748,6 +755,26 @@ dashboardApp.get('/addons', async (c) => {
   } catch {
     return c.html(shell(c.env, 'Addons', errorBody('Addon catalog is unavailable.')), 500)
   }
+})
+
+// ── circuits (workflow-circuits addon: live state of every workflow circuit) ─
+// "Clear state of workflows" — the point of the whole addon, made SEEABLE
+// rather than only queryable via MCP tools. Read-only; no addon-active gate
+// (see listCircuits'/getCircuitState's own docstrings — a circuit-less tenant
+// is already an honest empty state). Tenant-wide, not project-scoped
+// (workflow_circuits carries no project_id column).
+dashboardApp.get('/circuits', async (c) => {
+  const view = await loadCircuitListView(c.env)
+  return c.html(shell(c.env, 'Circuits', circuitListBody(view)))
+})
+
+dashboardApp.get('/circuits/:id', async (c) => {
+  const circuitId = c.req.param('id')
+  const state = await loadCircuitDetailView(c.env, circuitId)
+  if (!state) {
+    return c.html(shell(c.env, 'Circuit not found', circuitNotFoundBody(circuitId)), 404)
+  }
+  return c.html(shell(c.env, `Circuit · ${state.name}`, circuitDetailBody(state)))
 })
 
 function currentUtcMarketingWindow(now = new Date()) {
@@ -3382,6 +3409,36 @@ function shell(
         }
       }
 
+      /* ── /circuits (workflow-circuits dashboard view) ── */
+      .circuit-table .circuit-cell { display: grid; gap: 3px; min-width: 0; overflow-wrap: anywhere; }
+      .circuit-mobile-label { display: none; }
+      .circuit-stack { display: grid; gap: 3px; min-width: 0; }
+      .circuit-mermaid {
+        overflow-x: auto; padding: 16px; border: 1px solid var(--border);
+        border-radius: var(--radius); background: #0A0F1E;
+      }
+      .circuit-mermaid svg { max-width: 100%; height: auto; display: block; margin: 0 auto; }
+      @media (max-width: 720px) {
+        .circuit-table { min-width: 0 !important; }
+        .circuit-table .ui-thead {
+          position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+          overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+        }
+        .circuit-table .ui-row {
+          grid-template-columns: minmax(0, 1fr) !important;
+          align-items: start; gap: 10px; padding: 14px;
+        }
+        .circuit-table .ui-td {
+          display: grid; grid-template-columns: minmax(7rem, 35%) minmax(0, 1fr);
+          gap: 12px; align-items: start;
+        }
+        .circuit-table .circuit-mobile-label {
+          display: block;
+          font-family: var(--font-mono); font-size: 10px; font-weight: 600;
+          letter-spacing: .6px; text-transform: uppercase; color: var(--dim);
+        }
+      }
+
       /* ── /approvals page styles (kept here to avoid duplication) ── */
     </style>
   </head>
@@ -3509,6 +3566,12 @@ function shell(
           <a class="nav-link" href="/coordination">
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M10 2v6M6 5l8 0M5 17l5-9 5 9M7.5 13h5"/></svg>
             <span class="nav-label">Control Tower</span>
+          </a>
+
+          <!-- Circuits (workflow-circuits addon: live node/edge state) -->
+          <a class="nav-link" href="/circuits">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><circle cx="5" cy="5" r="2.2"/><circle cx="15" cy="5" r="2.2"/><circle cx="10" cy="15" r="2.2"/><path d="M6.8 6.3 9 13.2M13.2 6.3 11 13.2"/></svg>
+            <span class="nav-label">Circuits</span>
           </a>
 
           <!-- Economy (collapsible) -->

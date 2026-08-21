@@ -332,6 +332,35 @@ export async function getCircuitState(env: Env, circuitId: string): Promise<Circ
   }
 }
 
+export interface CircuitSummary {
+  id: string
+  key: string
+  name: string
+  status: 'defined' | 'archived'
+  node_count: number
+  created_at: string
+}
+
+/** Tenant-wide circuit list for the dashboard's circuit-state view (#circuit-view
+ * flight). Deliberately as thin as getCircuitState: a plain read, no addon-active
+ * gate — an inactive/uninstalled addon simply has no rows to return, which is
+ * already an honest empty state (see src/dashboard/workflow-circuits.ts). Circuits
+ * are NOT project-scoped (workflow_circuits carries no project_id column), so this
+ * is tenant-wide by design, same scope defineCircuit writes into. */
+export async function listCircuits(env: Env): Promise<CircuitSummary[]> {
+  const result = await env.DB.prepare(
+    `SELECT c.id, c.key, c.name, c.status, c.created_at,
+            (SELECT COUNT(*) FROM workflow_circuit_nodes n
+              WHERE n.circuit_id = c.id AND n.tenant = c.tenant) AS node_count
+       FROM workflow_circuits c
+      WHERE c.tenant = ?1
+      ORDER BY c.created_at DESC, c.id DESC`,
+  ).bind(env.TENANT_SLUG).all<{
+    id: string; key: string; name: string; status: 'defined' | 'archived'; created_at: string; node_count: number
+  }>()
+  return (result.results ?? []).map((row) => ({ ...row }))
+}
+
 export async function approveGateEdge(
   env: Env,
   actor: WorkflowCircuitActor,
