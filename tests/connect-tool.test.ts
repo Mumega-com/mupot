@@ -63,9 +63,13 @@ function makeEnv(opts: Opts = {}): Env {
       return {
         sql,
         args: _args,
+        async run() {
+          return { success: true, meta: { changes: 1 } }
+        },
         async first() {
           if (sql.includes('FROM member_tokens')) {
             return {
+              token_id: 'token-bot-1',
               member_id: memberId,
               email: null,
               display_name: 'Bot',
@@ -221,10 +225,36 @@ describe('connect MCP tool (#128 — self-name-to-bind)', () => {
     expect(sc.claimed_agent.id).toBe(AGENT.id)
     expect(sc.claimed_agent.slug).toBe(AGENT.slug)
     expect(sc.claimed_agent.name).toBe(AGENT.name)
-    expect(sc.binding).toBe('session_local')
-    expect(sc.next_step).toMatch(/mint_agent_token/)
+    expect(sc.binding).toBe('durable')
     expect(sc.packet).toBeDefined()
     expect(typeof sc.brief).toBe('string')
+  })
+
+  it('Issue #1192: persists agent_id in D1 on connect so stateless REST calls retain identity', async () => {
+    let updateExecuted = false
+    const env = makeEnv({ boundAgentId: null })
+    const origPrepare = env.DB.prepare.bind(env.DB)
+    env.DB.prepare = (sql: string) => {
+      if (sql.includes('UPDATE member_tokens SET agent_id')) {
+        return {
+          bind(agentId: string, tokenId: string) {
+            expect(agentId).toBe(AGENT.id)
+            expect(tokenId).toBe('token-bot-1')
+            return {
+              async run() {
+                updateExecuted = true
+                return { success: true, meta: { changes: 1 } }
+              },
+            }
+          },
+        } as unknown as ReturnType<typeof origPrepare>
+      }
+      return origPrepare(sql)
+    }
+
+    const res = await callConnect(env, 'growth-lead')
+    expect(res.status).toBe(200)
+    expect(updateExecuted).toBe(true)
   })
 
   it('resolves by agent id (not just slug)', async () => {

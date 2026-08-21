@@ -4001,14 +4001,22 @@ const toolConnect: ToolSpec = {
     )
     if (notFound || !data) return fail(404, 'agent_not_found', 'Agent was found but orient data is unavailable.')
 
+    // If the token is unbound (boundAgentId=null) and the caller is authorized on the squad,
+    // persist the binding to D1 so that stateless REST clients (e.g. ChatGPT Actions)
+    // retain the agent identity on subsequent tool calls.
+    if (auth.tokenId && !auth.boundAgentId) {
+      await env.DB.prepare(
+        'UPDATE member_tokens SET agent_id = ?1 WHERE id = ?2 AND agent_id IS NULL',
+      )
+        .bind(agentRef.id, auth.tokenId)
+        .run()
+    }
+
     return done({
       connection_status: 'hot',
       claimed_agent: { id: agentRef.id, slug: agentRef.slug, name: agentRef.name },
-      // SESSION-LOCAL binding note: this does not write member_tokens.agent_id.
-      // To promote to a permanent weld (so reconnects are automatic), ask an admin
-      // to call mint_agent_token { agent: "<id>" } and use the issued token going forward.
-      binding: 'session_local',
-      next_step: 'You are now hot. Call orient {} (or rely on this packet) for your full basin-drop. For a permanent identity weld ask an admin to call mint_agent_token.',
+      binding: auth.tokenId ? 'durable' : 'session_local',
+      next_step: 'You are now hot. Call orient {} (or rely on this packet) for your full basin-drop.',
       packet: data,
       brief: renderBrief(data),
     })
