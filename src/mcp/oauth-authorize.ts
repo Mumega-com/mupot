@@ -596,7 +596,7 @@ function renderConsentPage(
 ): Response {
   const rows = agents.map((a) => `
         <label class="agent-option">
-          <input type="radio" name="agent_id" value="${escapeHtml(a.id)}">
+          <input type="radio" name="agent_id" value="${escapeHtml(a.id)}" required>
           <div>
             <div class="agent-title"><strong>${escapeHtml(a.name)}</strong> <code>${escapeHtml(a.slug)}</code></div>
             <div class="agent-meta">squad: ${escapeHtml(a.squad_name)} &middot; autonomy: ${escapeHtml(a.autonomy)} &middot; budget: ${formatBudgetCap(a.budget_cap_cents)} / ${escapeHtml(a.budget_window)}</div>
@@ -606,7 +606,7 @@ function renderConsentPage(
 
   const mintNewOption = squads.length > 0 ? `
         <label class="agent-option">
-          <input type="radio" name="agent_id" value="__mint_new__">
+          <input type="radio" name="agent_id" value="__mint_new__" required>
           <div style="width: 100%;">
             <div class="agent-title"><strong>Mint new agent seat</strong></div>
             <div class="agent-meta">Create and bind a new agent seat on one of your squads.</div>
@@ -658,15 +658,15 @@ ${agentsListed && agents.length === 0 ? EMPTY_STATE_HINT : ''}
 <form method="POST" action="/oauth/consent">
   <input type="hidden" name="consent_nonce" value="${escapeHtml(consentNonce)}">
   <fieldset>
-    <label class="agent-option">
-      <input type="radio" name="agent_id" value="" checked>
-      <div>
-        <div class="agent-title"><strong>No agent — continue unbound</strong></div>
-        <div class="agent-meta">Default. Zero standing capabilities, exactly as today.</div>
-      </div>
-    </label>
 ${rows}
 ${mintNewOption}
+    <label class="agent-option">
+      <input type="radio" name="agent_id" value="" required>
+      <div>
+        <div class="agent-title"><strong>No agent — continue unbound</strong></div>
+        <div class="agent-meta">Zero standing capabilities (read-only directory queries).</div>
+      </div>
+    </label>
   </fieldset>
   <div class="actions">
     <button type="submit" name="action" value="continue">Continue</button>
