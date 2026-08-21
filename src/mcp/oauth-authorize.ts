@@ -1166,6 +1166,10 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     const form = await request.formData()
     const consentNonce = String(form.get('consent_nonce') ?? '')
     const action = String(form.get('action') ?? '')
+
+    if (action === 'continue' && !form.has('agent_id')) {
+      return new Response('Missing agent_id: explicit consent choice is required', { status: 400 })
+    }
     const agentIdRaw = String(form.get('agent_id') ?? '').trim()
 
     if (!consentNonce) return new Response('Missing consent_nonce', { status: 400 })

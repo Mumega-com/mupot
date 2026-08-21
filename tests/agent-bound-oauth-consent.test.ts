@@ -1008,6 +1008,28 @@ describe('C6. POST /oauth/consent — CSRF and replay protection', () => {
     expect(res.status).toBe(400)
     expect(oauthProvider.completeAuthorization).not.toHaveBeenCalled()
   })
+
+  it('missing agent_id in POST body → 400, no mint (explicit choice required, zero silent unbound default)', async () => {
+    const oauthProvider = stubOAuthProvider()
+    const { env } = httpEnv(harness, oauthProvider)
+    const { consentCookie } = await reachConsentScreen(env, oauthProvider, 'human@example.test')
+
+    const before = (harness.sqlite.prepare('SELECT COUNT(*) AS n FROM member_tokens').all()[0] as { n: number }).n
+
+    // Submit form WITHOUT agent_id parameter
+    const form = new URLSearchParams({ consent_nonce: consentCookie, action: 'continue' })
+    const req = new Request('https://pot.test/oauth/consent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${consentCookie}` },
+      body: form.toString(),
+    })
+    const res = await handleOAuthAuthorize(req, env)
+    expect(res.status).toBe(400)
+    expect(await res.text()).toContain('Missing agent_id')
+    expect(oauthProvider.completeAuthorization).not.toHaveBeenCalled()
+    const after = (harness.sqlite.prepare('SELECT COUNT(*) AS n FROM member_tokens').all()[0] as { n: number }).n
+    expect(after).toBe(before)
+  })
 })
 
 // ════════════════════════════════════════════════════════════════════════════
