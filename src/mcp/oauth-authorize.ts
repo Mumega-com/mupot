@@ -25,7 +25,8 @@
 
 import type { Env, AuthContext, Capability, CapabilityGrant, CapabilityScopeType, ConnectionChannel } from '../types'
 import { resolveCapabilities, canOnSquad, hasCapability, capabilityRank } from '../auth/capability'
-import { sha256Hex, mintRawToken, resolveAgentMemberBinding } from '../members/service'
+import { sha256Hex, mintRawToken, resolveAgentMemberBinding, mintAgentBoundToken } from '../members/service'
+import { createAgent } from '../org/service'
 
 // ── OAuth props stored via completeAuthorization ─────────────────────────────
 // Encrypted by the library; read back via resolveExternalToken.
@@ -504,6 +505,28 @@ export async function listConsentableAgents(env: Env, memberId: string): Promise
   return out
 }
 
+export interface ConsentableSquad {
+  id: string
+  name: string
+  slug: string
+}
+
+/** Lists squads where the human holds admin capability, allowing them to mint a new agent seat directly. */
+export async function listConsentableSquads(env: Env, memberId: string): Promise<ConsentableSquad[]> {
+  const humanGrants = await resolveCapabilities(env, memberId)
+  const rows = await env.DB.prepare(
+    `SELECT id, name, slug FROM squads ORDER BY name ASC`,
+  ).all<{ id: string; name: string; slug: string }>()
+
+  const out: ConsentableSquad[] = []
+  for (const row of rows.results ?? []) {
+    if (await canOnSquad(env, humanGrants, row.id, 'admin')) {
+      out.push(row)
+    }
+  }
+  return out
+}
+
 /** Minimal, dependency-free HTML escaper — agent slug/name/squad name are
  *  admin-authored D1 content and must not be trusted as safe markup. */
 function escapeHtml(value: string): string {
@@ -568,6 +591,7 @@ function renderConsentPage(
   // about a board that, on the failure path, was never read. Render the claim only
   // when we actually know it. Defaults true so existing callers are unchanged.
   agentsListed = true,
+  squads: ConsentableSquad[] = [],
 ): Response {
   const rows = agents.map((a) => `
         <label class="agent-option">
@@ -578,6 +602,35 @@ function renderConsentPage(
             <div class="agent-caps">capabilities this session would carry: ${formatCapabilities(a.capabilities)}</div>
           </div>
         </label>`).join('\n')
+
+  const mintNewOption = squads.length > 0 ? `
+        <label class="agent-option">
+          <input type="radio" name="agent_id" value="__mint_new__">
+          <div style="width: 100%;">
+            <div class="agent-title"><strong>Mint new agent seat</strong></div>
+            <div class="agent-meta">Create and bind a new agent seat on one of your squads.</div>
+            <div style="margin-top: 0.5rem; display: flex; flex-direction: column; gap: 0.5rem;">
+              <div>
+                <label style="font-size: 0.8rem; display: block; margin-bottom: 0.2rem;">Agent Name</label>
+                <input type="text" name="new_agent_name" placeholder="e.g. Cursor Kasra" style="width: 100%; padding: 0.35rem; box-sizing: border-box;">
+              </div>
+              <div>
+                <label style="font-size: 0.8rem; display: block; margin-bottom: 0.2rem;">Agent Slug (optional)</label>
+                <input type="text" name="new_agent_slug" placeholder="e.g. cursor-kasra" style="width: 100%; padding: 0.35rem; box-sizing: border-box;">
+              </div>
+              <div>
+                <label style="font-size: 0.8rem; display: block; margin-bottom: 0.2rem;">Home Squad</label>
+                <select name="new_agent_squad_id" style="width: 100%; padding: 0.35rem; box-sizing: border-box;">
+                  ${squads.map((s) => `<option value="${escapeHtml(s.id)}">${escapeHtml(s.name)} (${escapeHtml(s.slug)})</option>`).join('\n')}
+                </select>
+              </div>
+              <div>
+                <label style="font-size: 0.8rem; display: block; margin-bottom: 0.2rem;">Purpose / Notes (optional)</label>
+                <input type="text" name="new_agent_purpose" placeholder="e.g. Cursor Agent CLI seat on muvps" style="width: 100%; padding: 0.35rem; box-sizing: border-box;">
+              </div>
+            </div>
+          </div>
+        </label>` : ''
 
   const html = `<!doctype html>
 <html>
@@ -612,6 +665,7 @@ ${agentsListed && agents.length === 0 ? EMPTY_STATE_HINT : ''}
       </div>
     </label>
 ${rows}
+${mintNewOption}
   </fieldset>
   <div class="actions">
     <button type="submit" name="action" value="continue">Continue</button>
@@ -1080,7 +1134,15 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       agentsListed = false
     }
 
-    const page = renderConsentPage(consentNonce, googleUser.email, agents, agentsListed)
+    let squads: ConsentableSquad[] = []
+    try {
+      squads = await listConsentableSquads(env, memberId)
+    } catch (err) {
+      console.error('[oauth-authorize] listConsentableSquads failed:', err)
+      squads = []
+    }
+
+    const page = renderConsentPage(consentNonce, googleUser.email, agents, agentsListed, squads)
     // B3-style: bind the consent nonce to this browser. Clears the earlier
     // google-callback CSRF cookie (its job is done) and sets the consent one,
     // scoped to the /oauth/consent path only.
@@ -1167,7 +1229,58 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     // authoritative, live source of truth rather than trusting the stored row.
     let boundAgentId: string | null = null
     let mintMemberId = pending.memberId
-    if (agentIdRaw) {
+    if (agentIdRaw === '__mint_new__') {
+      const newName = String(form.get('new_agent_name') ?? '').trim()
+      const newSlugRaw = String(form.get('new_agent_slug') ?? '').trim()
+      const squadId = String(form.get('new_agent_squad_id') ?? '').trim()
+      const purpose = String(form.get('new_agent_purpose') ?? '').trim() || null
+
+      if (!newName || !squadId) {
+        const rejected = new Response(
+          'Agent name and home squad are required to mint a new agent. Please sign in again.',
+          { status: 400, headers: { 'Content-Type': 'text/plain' } },
+        )
+        rejected.headers.set('Set-Cookie', clearConsentCookie)
+        return rejected
+      }
+
+      const humanGrants = await resolveCapabilities(env, pending.memberId)
+      const allowed = await canOnSquad(env, humanGrants, squadId, 'admin')
+      if (!allowed) {
+        const rejected = new Response(
+          'You do not have admin capability on the selected squad to mint a new agent.',
+          { status: 403, headers: { 'Content-Type': 'text/plain' } },
+        )
+        rejected.headers.set('Set-Cookie', clearConsentCookie)
+        return rejected
+      }
+
+      const slug = newSlugRaw || newName.toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '')
+      const createRes = await createAgent(env, squadId, {
+        name: newName,
+        slug,
+        role: 'member',
+        model: '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+        purpose,
+      })
+
+      if (!createRes.ok) {
+        const rejected = new Response(
+          `Failed to create agent: ${createRes.error}. Please sign in again.`,
+          { status: 400, headers: { 'Content-Type': 'text/plain' } },
+        )
+        rejected.headers.set('Set-Cookie', clearConsentCookie)
+        return rejected
+      }
+
+      const newAgent = createRes.value
+      const minted = await mintAgentBoundToken(env, newAgent, `oauth-consent:${pending.email}`, {
+        grantCapability: 'member',
+      })
+
+      boundAgentId = newAgent.id
+      mintMemberId = minted.memberId
+    } else if (agentIdRaw) {
       const eligible = await memberMayConsentToAgent(env, pending.memberId, agentIdRaw)
       if (!eligible) {
         const rejected = new Response(

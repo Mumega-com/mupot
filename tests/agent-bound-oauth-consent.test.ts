@@ -31,6 +31,7 @@ import {
   buildAuthContextFromProps,
   handleOAuthAuthorize,
   listConsentableAgents,
+  listConsentableSquads,
   memberMayConsentToAgent,
 } from '../src/mcp/oauth-authorize'
 import { invokeTool, mcpApp } from '../src/mcp/index'
@@ -76,6 +77,7 @@ const MEMBER_AGENT_E = 'member-agent-e'
 
 function seedBase(sqlite: SqliteD1Harness['sqlite']): void {
   sqlite.exec(`
+    INSERT INTO org_settings (key, value, updated_at) VALUES ('billing_state', '{"tier":"scale"}', '2026-08-01T00:00:00.000Z');
     INSERT INTO departments (id, slug, name) VALUES ('dept-eng', 'eng', 'Engineering');
     INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-a', 'dept-eng', 'squad-a', 'Squad A');
     INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-b', 'dept-eng', 'squad-b', 'Squad B');
@@ -245,6 +247,24 @@ describe('A. selection rule — a human may consent to agent A iff active + boun
     expect(await memberMayConsentToAgent(env, HUMAN, 'agent-f')).toBe(false)
     const list = await listConsentableAgents(env, HUMAN)
     expect(list.map((a) => a.id)).not.toContain('agent-f')
+  })
+})
+
+describe('A2. listConsentableSquads — squads where human holds admin to mint an agent seat', () => {
+  it('an admin human on squad-a sees squad-a in listConsentableSquads', async () => {
+    const env = envFor(harness)
+    const squads = await listConsentableSquads(env, HUMAN)
+    expect(squads.map((s) => s.id)).toContain('squad-a')
+    expect(squads.map((s) => s.id)).not.toContain('squad-b')
+  })
+
+  it('a member-only human on squad-a sees no squads to mint in', async () => {
+    harness.sqlite.exec(`
+      UPDATE capabilities SET capability = 'member' WHERE member_id = '${HUMAN}' AND scope_id = 'squad-a'
+    `)
+    const env = envFor(harness)
+    const squads = await listConsentableSquads(env, HUMAN)
+    expect(squads).toEqual([])
   })
 })
 
@@ -521,6 +541,7 @@ function httpEnv(harnessRef: SqliteD1Harness, oauthProvider: ReturnType<typeof s
     DB: harnessRef.db,
     TENANT_SLUG: TENANT,
     BRAND: 'mupot',
+    POT_TIER: 'scale',
     GOOGLE_CLIENT_ID: 'client-id.apps.googleusercontent.com',
     GOOGLE_CLIENT_SECRET: 'client-secret',
     SESSIONS: kv,
@@ -775,6 +796,104 @@ describe('C4b. POST /oauth/consent — continuing UNBOUND writes no consent rece
       `INSERT INTO oauth_consent_receipts (id, tenant, token_id, consenting_member_id, agent_id, agent_member_id, created_at)
        VALUES ('receipt-null-agent', '${TENANT}', 'tok-x', 'member-unbound-probe', NULL, 'member-x', datetime('now'))`,
     )).toThrow()
+  })
+})
+
+describe('C4c. POST /oauth/consent — Mint-in-Chooser (__mint_new__)', () => {
+  it('creates and binds a brand new agent seat when __mint_new__ is posted with valid squad admin grants', async () => {
+    const oauthProvider = stubOAuthProvider()
+    const { env } = httpEnv(harness, oauthProvider)
+    const { consentCookie } = await reachConsentScreen(env, oauthProvider, 'human@example.test')
+
+    const form = new URLSearchParams({
+      consent_nonce: consentCookie,
+      action: 'continue',
+      agent_id: '__mint_new__',
+      new_agent_name: 'Cursor Kasra',
+      new_agent_slug: 'cursor-kasra',
+      new_agent_squad_id: 'squad-a',
+      new_agent_purpose: 'Cursor Agent seat on muvps',
+    })
+    const req = new Request('https://pot.test/oauth/consent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${consentCookie}` },
+      body: form.toString(),
+    })
+    const res = await handleOAuthAuthorize(req, env)
+    const errText = res.status !== 302 ? await res.text() : ''
+    expect(errText).toBe('')
+    expect(res.status).toBe(302)
+    const call = oauthProvider.completeAuthorization.mock.calls[0][0]
+    expect(call.props.boundAgentId).toBeDefined()
+
+    // Verify agent was created in DB
+    const createdAgent = harness.sqlite.prepare(
+      `SELECT id, slug, name, squad_id, purpose FROM agents WHERE slug = 'cursor-kasra'`,
+    ).all()[0] as { id: string; slug: string; name: string; squad_id: string; purpose: string }
+    expect(createdAgent).toBeDefined()
+    expect(createdAgent.name).toBe('Cursor Kasra')
+    expect(createdAgent.squad_id).toBe('squad-a')
+    expect(createdAgent.purpose).toBe('Cursor Agent seat on muvps')
+
+    expect(call.props.boundAgentId).toBe(createdAgent.id)
+
+    // Verify dedicated member was created and bound
+    const binding = harness.sqlite.prepare(
+      `SELECT member_id FROM agent_member_bindings WHERE agent_id = ?`,
+    ).all(createdAgent.id)[0] as { member_id: string }
+    expect(binding).toBeDefined()
+    expect(call.props.memberId).toBe(binding.member_id)
+
+    // Verify receipt was written
+    const receipt = harness.sqlite.prepare(
+      `SELECT consenting_member_id, agent_id, agent_member_id FROM oauth_consent_receipts WHERE agent_id = ?`,
+    ).all(createdAgent.id)[0] as { consenting_member_id: string; agent_id: string; agent_member_id: string }
+    expect(receipt).toBeDefined()
+    expect(receipt.consenting_member_id).toBe(HUMAN)
+    expect(receipt.agent_id).toBe(createdAgent.id)
+    expect(receipt.agent_member_id).toBe(binding.member_id)
+  })
+
+  it('rejects minting if human lacks admin capability on the chosen squad (403)', async () => {
+    const oauthProvider = stubOAuthProvider()
+    const { env } = httpEnv(harness, oauthProvider)
+    const { consentCookie } = await reachConsentScreen(env, oauthProvider, 'human@example.test')
+
+    const form = new URLSearchParams({
+      consent_nonce: consentCookie,
+      action: 'continue',
+      agent_id: '__mint_new__',
+      new_agent_name: 'Unauthorized Agent',
+      new_agent_squad_id: 'squad-b', // human has no admin on squad-b
+    })
+    const req = new Request('https://pot.test/oauth/consent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${consentCookie}` },
+      body: form.toString(),
+    })
+    const res = await handleOAuthAuthorize(req, env)
+    expect(res.status).toBe(403)
+  })
+
+  it('rejects minting if required fields are missing (400)', async () => {
+    const oauthProvider = stubOAuthProvider()
+    const { env } = httpEnv(harness, oauthProvider)
+    const { consentCookie } = await reachConsentScreen(env, oauthProvider, 'human@example.test')
+
+    const form = new URLSearchParams({
+      consent_nonce: consentCookie,
+      action: 'continue',
+      agent_id: '__mint_new__',
+      new_agent_name: '', // missing name
+      new_agent_squad_id: 'squad-a',
+    })
+    const req = new Request('https://pot.test/oauth/consent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${consentCookie}` },
+      body: form.toString(),
+    })
+    const res = await handleOAuthAuthorize(req, env)
+    expect(res.status).toBe(400)
   })
 })
 
