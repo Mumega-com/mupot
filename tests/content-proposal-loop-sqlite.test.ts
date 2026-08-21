@@ -243,7 +243,9 @@ describe('content-publish loop — real SQLite, propose → approve → execute 
 
     const result = await runTaskExecution(env, agent, 'task-content-cross-pot', {
       executionReceiptId: 'receipt-cross-pot',
-      model: { chat: async () => 'Answered as ordinary text — not a publish request.' },
+      // mupot#76e25fc2 (FLIGHT-07B): a completion reaching review/done needs
+      // Artifact:/SHA256: evidence now.
+      model: { chat: async () => 'Answered as ordinary text — not a publish request.\nArtifact: /tmp/fixture-marker.txt\nSHA256: ' + 'a'.repeat(64) },
       // The content-intent short-circuit (which this test proves is SKIPPED)
       // never reaches the meter — only the fallthrough model path does. This
       // schema doesn't define execution_meter (unneeded by every other test in
@@ -265,7 +267,7 @@ describe('content-publish loop — real SQLite, propose → approve → execute 
     // gate_owner stamped (finishTask's COALESCE) so it is not a zombie in
     // review — the verdict endpoint 409s 'no_gate' with none set.
     expect(row.gate_owner).toBe('gate:agent-self-completion')
-    expect(row.result).toBe('Answered as ordinary text — not a publish request.')
+    expect(row.result).toBe('Answered as ordinary text — not a publish request.\nArtifact: /tmp/fixture-marker.txt\nSHA256: ' + 'a'.repeat(64))
 
     const proposalRow = harness.sqlite.prepare('SELECT * FROM department_proposals WHERE gate_id = ?').get('task-content-cross-pot')
     expect(proposalRow).toBeUndefined()

@@ -247,7 +247,9 @@ describe('cross-squad task assignment over HTTP', () => {
     })
     const taskId = (wake?.payload as { task_id: string }).task_id
 
-    const model: ModelPort = { chat: vi.fn(async () => 'Cross-squad work completed.') }
+    // mupot#76e25fc2 (FLIGHT-07B): a completion reaching review/done needs
+    // Artifact:/SHA256: evidence now.
+    const model: ModelPort = { chat: vi.fn(async () => 'Cross-squad work completed.\nArtifact: /tmp/fixture-marker.txt\nSHA256: ' + 'a'.repeat(64)) }
     const checkAndReserve = vi.fn(async () => ({
       ok: true as const,
       windowKey: '2026-07-12',
@@ -285,7 +287,7 @@ describe('cross-squad task assignment over HTTP', () => {
     ).get(taskId)).toEqual({
       status: 'review',
       assignee_agent_id: CROSS_AGENT_ID,
-      result: 'Cross-squad work completed.',
+      result: 'Cross-squad work completed.\nArtifact: /tmp/fixture-marker.txt\nSHA256: ' + 'a'.repeat(64),
       completed_at: expect.any(String),
     })
   })

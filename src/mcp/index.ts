@@ -91,6 +91,9 @@ import { classify, humanAge } from '../dashboard/fleet'
 import { resolveAgentRef } from '../org/resolve'
 import {
   sendToRef, readAgentInbox, sendAgentMessage,
+} from '../agents/messages'
+import { verifyTaskArtifactShape } from '../tasks/artifact-verification'
+import {
   leaseAgentInbox, ackAgentMessages, listDeadLetteredMessages, summarizeDeadLetters,
   MAX_DELIVERY_ATTEMPTS, DEFAULT_LEASE_SECONDS, MAX_LEASE_SECONDS,
 } from '../agents/messages'
@@ -1143,8 +1146,9 @@ const toolTaskUpdate: ToolSpec = {
       // (verdict 409s no_gate; review→open|in_progress is forbidden). Evaluate the
       // EFFECTIVE gate_owner after applying args.gate_owner — pre-review the gate
       // isn't locked, so it may be set in this same call.
+      let effectiveGateOwner: string | null = existing.gate_owner
       if (args.status === 'review') {
-        const effectiveGateOwner =
+        effectiveGateOwner =
           args.gate_owner === undefined
             ? existing.gate_owner
             : typeof args.gate_owner === 'string' && args.gate_owner.trim().length > 0
@@ -1175,6 +1179,49 @@ const toolTaskUpdate: ToolSpec = {
           assertCompletableDoneWhen(next.done_when)
         } catch (err) {
           return fail(409, 'done_when_placeholder', err instanceof Error ? err.message : 'done_when is not completable')
+        }
+      }
+      // PROVENANCE-SAFE ARTIFACT GATE (mupot#76e25fc2, FLIGHT-07B), checked
+      // LAST among the transition guards — deliberately: self-close and
+      // done_when-placeholder are structural/identity rules that hold
+      // regardless of evidence quality, and a caller blocked by one of those
+      // should be told THAT, not sent to go improve evidence that would still
+      // be refused anyway. Covers the path Door 6 in execute.ts does NOT
+      // reach: a DIRECT external caller moving a task into review, or moving
+      // an UNGATED task straight to done via this same PATCH —
+      // patchToDoneBypassesGate above only fires when a gate_owner is set, so
+      // an ungated task's direct PATCH-to-done was the one path with NO
+      // verification at all, gate or artifact.
+      //
+      // SCOPED to existing.assignee_agent_id != null (gate BLOCK finding #4,
+      // 2026-08-18): `result` (migrations/0006) is written ONLY by the AgentDO
+      // execute-mode cortex cycle — a purely human/operational task never has
+      // one and was never meant to. Checking it unconditionally would block
+      // every non-agent task from ever reaching review/done. Restricting to
+      // agent-assigned tasks targets the actual threat (a5e45082: fabricated
+      // agent-produced evidence accepted as real) without touching tasks that
+      // were never agent-executed at all.
+      //
+      // KNOWN OPEN GAP, not fixed here (gate BLOCK finding #2): task_update
+      // never sets `result` itself — it only checks whatever is ALREADY on
+      // the row, written by execute.ts's finishTask. For an in-Worker AgentDO
+      // task that is exactly right (finishTask is the sole writer). For an
+      // EXTERNAL/bound-seat runtime there is currently no tool that lets it
+      // report a completion result back into `result` at all — meaning this
+      // gate's "external seat completes via task_update" path is not yet
+      // realizable, only the in-Worker path is. Filing as a separate follow-up
+      // (a completion-reporting primitive symmetric to task_dispatch) rather
+      // than building it under this PR's time box.
+      const entersReview = args.status === 'review'
+      const ungatedDirectDone = args.status === 'done' && existing.status !== 'approved' && existing.status !== 'rejected' && !effectiveGateOwner
+      if ((entersReview || ungatedDirectDone) && existing.assignee_agent_id) {
+        const artifactCheck = verifyTaskArtifactShape(existing.result)
+        if (!artifactCheck.verified) {
+          return fail(409, 'artifact_verification_failed', {
+            reason: artifactCheck.reason,
+            ...(artifactCheck.path ? { path: artifactCheck.path } : {}),
+            detail: 'an agent-assigned task can only enter review or be marked done directly when its result states both "Artifact: <path>" and "SHA256: <64-hex>"',
+          })
         }
       }
       next.status = args.status
@@ -1693,6 +1740,17 @@ const toolTaskDispatch: ToolSpec = {
       ).bind(message, env.TENANT_SLUG, receiptId).run()
       return fail(500, 'dispatch_failed', { receipt_id: receiptId })
     }
+
+    // NOTE (mupot#76e25fc2 / FLIGHT-07B, reverted after gate BLOCK): this handler
+    // previously added a second, ad-hoc sendAgentMessage write here, believing
+    // task_dispatch had the same "silent drop" gap #860 fixed for flight_dispatch.
+    // It did not — src/bus/consumer.ts's 'agent.wake' case already recognizes this
+    // exact event shape via taskDispatchIdentity() (keyed on the dispatch_receipt_id
+    // in the payload above) and routes it through src/bus/fleet-bridge.ts's
+    // deliverDispatchToInbox, a #353-hardened, sticky-route bridge built specifically
+    // to prevent double execution. The added write used a different sender/request-id
+    // convention the real router never saw — a second, uncoordinated delivery path,
+    // not a fix. Reverted; the routing above was already correct.
 
     return done({
       dispatched: true,

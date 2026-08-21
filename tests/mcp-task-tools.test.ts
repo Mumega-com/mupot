@@ -3,6 +3,13 @@ import { TOOLS, invokeTool } from '../src/mcp'
 import { assigneeSelfClose, assigneeCannotMutateOwnAssignment } from '../src/tasks/service'
 import type { AuthContext, Capability, CapabilityGrant, Env, Task } from '../src/types'
 
+// mupot#76e25fc2 (FLIGHT-07B): the SHAPE of evidence the artifact gate
+// requires — a real fixture stand-in, not asserted for byte-level truth here
+// (that is tests/artifact-verification.test.ts and tests/helpers/
+// artifact-verify-local.ts's job). Fixtures for a review/done transition need
+// SOME valid-shaped result now; this is the shared one.
+const VALID_ARTIFACT_RESULT = 'Done.\nArtifact: /tmp/fixture-marker.txt\nSHA256: ' + 'a'.repeat(64)
+
 const TENANT = 'test-tenant'
 const MEMBER_ID = 'member-1'
 const SQUAD_ID = 'squad-1'
@@ -356,7 +363,7 @@ describe('MCP task cutover tools', () => {
   })
 
   it('allows a NON-assignee principal to close the same in_progress task to done', async () => {
-    const { env } = makeEnv([task({ status: 'in_progress', assignee_agent_id: AGENT_ID })])
+    const { env } = makeEnv([task({ status: 'in_progress', assignee_agent_id: AGENT_ID, result: VALID_ARTIFACT_RESULT })])
 
     // A different bound agent (still member+ on the squad) may verify + close.
     const res = await invokeTool(
@@ -780,7 +787,7 @@ describe('MCP task cutover tools', () => {
   })
 
   it('task_update allows in_progress → review when gate_owner is set in the same call', async () => {
-    const { env } = makeEnv([task({ status: 'in_progress', gate_owner: null })])
+    const { env } = makeEnv([task({ status: 'in_progress', gate_owner: null, result: VALID_ARTIFACT_RESULT })])
     const res = await invokeTool(
       auth(),
       env,
@@ -989,7 +996,7 @@ describe('MCP task cutover tools', () => {
   describe('review-wake — gate_owner resolution (wakeGateOwnerOnReview)', () => {
     it('emits exactly one agent.wake and one durable inbox row when exactly one agent holds the gate', async () => {
       const { env, events, updates } = makeEnv(
-        [task({ status: 'in_progress', gate_owner: null })],
+        [task({ status: 'in_progress', gate_owner: null, result: VALID_ARTIFACT_RESULT })],
         {},
         {},
         { gateGrants: { 'gate:kasra-core': ['agent-reviewer'] } },
@@ -1028,7 +1035,7 @@ describe('MCP task cutover tools', () => {
 
     it('emits no wake when zero agents hold the gate capability', async () => {
       const { env, events, updates } = makeEnv(
-        [task({ status: 'in_progress', gate_owner: null })],
+        [task({ status: 'in_progress', gate_owner: null, result: VALID_ARTIFACT_RESULT })],
         {},
         {},
         { gateGrants: {} },
@@ -1049,7 +1056,7 @@ describe('MCP task cutover tools', () => {
 
     it('emits no wake when multiple agents hold the gate capability (ambiguous holder)', async () => {
       const { env, events, updates } = makeEnv(
-        [task({ status: 'in_progress', gate_owner: null })],
+        [task({ status: 'in_progress', gate_owner: null, result: VALID_ARTIFACT_RESULT })],
         {},
         {},
         { gateGrants: { 'gate:kasra-core': ['agent-reviewer', 'agent-second'] } },
@@ -1070,7 +1077,7 @@ describe('MCP task cutover tools', () => {
 
     it('a bus emit failure does not fail the review transition (best-effort wake)', async () => {
       const { env, updates } = makeEnv(
-        [task({ status: 'in_progress', gate_owner: null })],
+        [task({ status: 'in_progress', gate_owner: null, result: VALID_ARTIFACT_RESULT })],
         {},
         {},
         { gateGrants: { 'gate:kasra-core': ['agent-reviewer'] }, busThrows: true },
@@ -1136,7 +1143,7 @@ describe('MCP task cutover tools', () => {
   })
 
   it('task_update records completion time for an ordinary in-progress task', async () => {
-    const { env } = makeEnv([task({ status: 'in_progress' })])
+    const { env } = makeEnv([task({ status: 'in_progress', result: VALID_ARTIFACT_RESULT })])
 
     const res = await invokeTool(
       auth(),
@@ -1205,7 +1212,7 @@ describe('MCP task cutover tools', () => {
         },
       }),
     ])
-    expect(updates.filter((update) => update.sql.includes('task_dispatch_receipts'))).toHaveLength(1)
+    expect(updates.filter((update) => update.sql.includes('INSERT INTO task_dispatch_receipts'))).toHaveLength(1)
   })
 
   it('task_dispatch refuses an unassigned task without emitting a wake', async () => {

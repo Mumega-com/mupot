@@ -178,7 +178,10 @@ describe('runTaskExecution — content-intent short-circuit', () => {
 
     const r = await runTaskExecution(env, AGENT, 'task-1', {
       executionReceiptId: 'dispatch-receipt-2',
-      model: { chat: vi.fn(async () => 'A normal LLM answer.') },
+      // mupot#76e25fc2 (FLIGHT-07B): completions reaching review/done need
+      // Artifact:/SHA256: evidence now — see tests/execute.test.ts's
+      // WITH_ARTIFACT_EVIDENCE for the shared shape.
+      model: { chat: vi.fn(async () => 'A normal LLM answer.\nArtifact: /tmp/fixture-marker.txt\nSHA256: ' + 'a'.repeat(64)) },
       emit: async (e) => {
         events.push(e)
       },

@@ -28,6 +28,7 @@
 import type { Env, Agent, Task, ModelMessage, ModelPort, BusEvent , TokenUsage } from '../types'
 import { TASK_SELECT_COLUMNS } from '../tasks/ranking'
 import { checkTransition, assertCompletableDoneWhen, assigneeSelfClose } from '../tasks/service'
+import { verifyTaskArtifactShape } from '../tasks/artifact-verification'
 import { resolveTaskAssignee } from '../tasks/assignee'
 import { createModel } from '../model'
 import { createBus } from '../bus'
@@ -304,6 +305,34 @@ export async function runTaskExecution(
           task_status: 'blocked',
           error: 'done_when_placeholder',
         }
+      }
+    }
+    // Door 6 — provenance-safe artifact verification (mupot#76e25fc2,
+    // FLIGHT-07B). Before this, a SUCCESS write here landed status='review' or
+    // 'done' with `result` set to whatever prose the model produced — verified
+    // by nothing. Applies to every completion claiming review/done, gated or
+    // not: an execution that never actually did the work must not be
+    // indistinguishable from one that did. See src/tasks/artifact-verification.ts
+    // for exactly what is and is not checked, and why (shape only — a CF
+    // Worker has no access to a caller's real files, node:fs is banned in
+    // src/ regardless, and this Door runs in that same environment).
+    const artifactCheck = verifyTaskArtifactShape(result)
+    if (!artifactCheck.verified) {
+      const note = capResult(
+        `artifact_verification_failed: ${artifactCheck.reason}` +
+        (artifactCheck.path ? ` (path: ${artifactCheck.path})` : '') +
+        '. A completion must state both "Artifact: <path>" and "SHA256: <64-hex>" — prose describing intended work is not evidence of work done.',
+      )
+      if (!(await finishTask(env, task.id, agent.id, executionReceiptId, 'blocked', note, finishedAt, recordedCostMicroUsd))) {
+        return { ok: false, task_id: task.id, decided: '', error: 'task_claim_lost' }
+      }
+      await emitSafe(emit, executionEvent('task.blocked', env, agent, task, 'blocked'))
+      return {
+        ok: false,
+        task_id: task.id,
+        decided: 'artifact_verification_failed',
+        task_status: 'blocked',
+        error: 'artifact_verification_failed',
       }
     }
     if (!(await finishTask(env, task.id, agent.id, executionReceiptId, successStatus, result, finishedAt, recordedCostMicroUsd, AGENT_SELF_COMPLETION_GATE_OWNER))) {

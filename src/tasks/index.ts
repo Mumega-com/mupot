@@ -28,6 +28,7 @@ import { orgAdminForbiddenPayload, ORG_ADMIN_REFUSAL_LINKS } from '../auth/refus
 import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, TaskEvidenceFenceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution, assigneeSelfClose, assigneeCannotMutateOwnAssignment, TaskIntakeContractError, assertValidIntakeContract, evaluateTaskIntakeContract, isTaskStatus, ALL_TASK_STATUSES } from './service'
 import type { TaskStatus } from './service'
 import { resolveTaskAssignee } from './assignee'
+import { verifyTaskArtifactShape } from './artifact-verification'
 export { resolveTaskAssignee as resolveAssignee } from './assignee'
 import { createBus } from '../bus'
 import type { BusEvent } from '../types'
@@ -692,19 +693,21 @@ tasksApp.patch('/:id', async (c) => {
     // Enforce the transition matrix.
     const transitionErr = checkTransition(existing.status, body.status)
     if (transitionErr) return c.json(transitionErr, 400)
+    // gate_owner may be set in this same PATCH (existing.status is pre-review,
+    // so the gate isn't locked yet), so evaluate the EFFECTIVE value after
+    // applying body.gate_owner — used by both the review-entry guard below and
+    // the artifact gate's ungated-direct-done check further down.
+    const effectiveGateOwner =
+      body.gate_owner === undefined
+        ? existing.gate_owner
+        : typeof body.gate_owner === 'string' && body.gate_owner.trim().length > 0
+          ? body.gate_owner.trim()
+          : null
     // GATE-EXIT GUARD: a task may only enter 'review' with a gate_owner. The only
     // legal exits from review are approved|rejected via the verdict endpoint, and
     // that endpoint 409s 'no_gate' without a gate_owner — so an ungated review task
-    // is a zombie with no legal exit. Refuse to create one. gate_owner may be set
-    // in this same PATCH (existing.status is pre-review, so the gate isn't locked
-    // yet), so evaluate the EFFECTIVE value after applying body.gate_owner.
+    // is a zombie with no legal exit. Refuse to create one.
     if (body.status === 'review') {
-      const effectiveGateOwner =
-        body.gate_owner === undefined
-          ? existing.gate_owner
-          : typeof body.gate_owner === 'string' && body.gate_owner.trim().length > 0
-            ? body.gate_owner.trim()
-            : null
       if (!effectiveGateOwner) {
         return c.json(
           { error: 'gate_required_for_review', detail: 'a task can only enter review with a gate_owner set' },
@@ -753,6 +756,30 @@ tasksApp.patch('/:id', async (c) => {
       } catch (err) {
         return c.json(
           { error: 'done_when_placeholder', detail: err instanceof Error ? err.message : 'done_when is a placeholder — set a real predicate first' },
+          409,
+        )
+      }
+    }
+    // PROVENANCE-SAFE ARTIFACT GATE (mupot#76e25fc2, FLIGHT-07B; extended to this
+    // route after gate BLOCK finding #3, 2026-08-18) — REST parity with the MCP
+    // task_update gate (src/mcp/index.ts). PATCH is a second write path into
+    // review/done and was the one bypass the MCP-only gate left open. Same scope
+    // restriction and same known gap apply — see the MCP gate's comment for the
+    // full reasoning: checked only for agent-assigned tasks (`result` is written
+    // solely by execute.ts's finishTask, so a human/operational task never has
+    // one and shouldn't be forced to produce evidence syntax it never claimed).
+    const entersReview = body.status === 'review'
+    const ungatedDirectDone = body.status === 'done' && existing.status !== 'approved' && existing.status !== 'rejected' && !effectiveGateOwner
+    if ((entersReview || ungatedDirectDone) && existing.assignee_agent_id) {
+      const artifactCheck = verifyTaskArtifactShape(existing.result)
+      if (!artifactCheck.verified) {
+        return c.json(
+          {
+            error: 'artifact_verification_failed',
+            reason: artifactCheck.reason,
+            ...(artifactCheck.path ? { path: artifactCheck.path } : {}),
+            detail: 'an agent-assigned task can only enter review or be marked done directly when its result states both "Artifact: <path>" and "SHA256: <64-hex>"',
+          },
           409,
         )
       }

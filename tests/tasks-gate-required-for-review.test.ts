@@ -19,7 +19,11 @@ const inProgressUngated: Task = {
   status: 'in_progress',
   assignee_agent_id: 'agent-1',
   github_issue_url: null,
-  result: null,
+  // Valid provenance evidence — unrelated to what this file tests (the
+  // gate-exit guard), but present so the artifact gate (mupot#76e25fc2,
+  // FLIGHT-07B) doesn't interfere with these fixtures now that it also
+  // covers this REST route.
+  result: `Done.\nArtifact: /tmp/marker.txt\nSHA256: ${'a'.repeat(64)}`,
   completed_at: null,
   gate_owner: null,
   created_at: '2026-07-14T01:00:00.000Z',
