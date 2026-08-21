@@ -93,16 +93,21 @@ export type FlightMetaReferenceResult =
 const D1_ID_QUERY_CHUNK_SIZE = 90
 
 export async function loadFlightSquads(env: Env, squadIds: string[]): Promise<Squad[]> {
-  const rows: Squad[] = []
+  const stmts = []
   for (let offset = 0; offset < squadIds.length; offset += D1_ID_QUERY_CHUNK_SIZE) {
     const chunk = squadIds.slice(offset, offset + D1_ID_QUERY_CHUNK_SIZE)
     const placeholders = chunk.map((_, index) => `?${index + 1}`).join(',')
-    const result = await env.DB.prepare(
-      `SELECT id, department_id, slug, name, charter, budget_cap_cents, budget_window, created_at
+    stmts.push(
+      env.DB.prepare(
+        `SELECT id, department_id, slug, name, charter, budget_cap_cents, budget_window, created_at
          FROM squads WHERE id IN (${placeholders})`,
+      ).bind(...chunk),
     )
-      .bind(...chunk)
-      .all<Squad>()
+  }
+  if (stmts.length === 0) return []
+  const results = await env.DB.batch<Squad>(stmts)
+  const rows: Squad[] = []
+  for (const result of results) {
     rows.push(...(result.results ?? []))
   }
   return rows
@@ -118,14 +123,20 @@ export async function validateFlightMetaReferences(
   const missingSquad = meta.squad_ids.find((id) => !foundSquads.has(id))
   if (missingSquad) return { ok: false, error: 'flight_squad_not_found', ref: missingSquad }
 
-  const taskRows: Array<{ id: string; squad_id: string; project_id: string | null }> = []
+  const stmts = []
   for (let offset = 0; offset < meta.task_ids.length; offset += D1_ID_QUERY_CHUNK_SIZE) {
     const chunk = meta.task_ids.slice(offset, offset + D1_ID_QUERY_CHUNK_SIZE)
     const placeholders = chunk.map((_, index) => `?${index + 1}`).join(',')
-    const result = await env.DB.prepare(`SELECT id, squad_id, project_id FROM tasks WHERE id IN (${placeholders})`)
-      .bind(...chunk)
-      .all<{ id: string; squad_id: string; project_id: string | null }>()
-    taskRows.push(...(result.results ?? []))
+    stmts.push(
+      env.DB.prepare(`SELECT id, squad_id, project_id FROM tasks WHERE id IN (${placeholders})`).bind(...chunk),
+    )
+  }
+  const taskRows: Array<{ id: string; squad_id: string; project_id: string | null }> = []
+  if (stmts.length > 0) {
+    const results = await env.DB.batch<{ id: string; squad_id: string; project_id: string | null }>(stmts)
+    for (const result of results) {
+      taskRows.push(...(result.results ?? []))
+    }
   }
   const tasksById = new Map(taskRows.map((row) => [row.id, row]))
   for (const taskId of meta.task_ids) {

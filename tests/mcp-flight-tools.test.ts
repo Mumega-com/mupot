@@ -335,8 +335,13 @@ function makeEnv(
           },
         }
       },
-      async batch(statements: Array<{ run: () => Promise<unknown> }>) {
-        return Promise.all(statements.map((statement) => statement.run()))
+      async batch(statements: Array<{ all: () => Promise<unknown>, run: () => Promise<unknown> }>) {
+        return Promise.all(statements.map((statement) => {
+          if ('all' in statement && typeof statement.all === 'function') {
+            return statement.all()
+          }
+          return statement.run()
+        }))
       },
     },
     BUS: {

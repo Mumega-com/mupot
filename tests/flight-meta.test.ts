@@ -43,6 +43,9 @@ function makeEnv(opts: { squad?: boolean; task?: boolean; taskSquad?: string } =
           },
         }
       },
+      batch: async (stmts: any[]) => {
+        return Promise.all(stmts.map((s) => s.all()))
+      },
     },
   } as unknown as Env
 }
@@ -167,6 +170,9 @@ describe('validateFlightMetaReferences', () => {
               }
             },
           }
+        },
+        batch: async (stmts: any[]) => {
+          return Promise.all(stmts.map((s) => s.all()))
         },
       },
     } as unknown as Env
