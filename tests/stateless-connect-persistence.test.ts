@@ -1,126 +1,107 @@
-import { describe, expect, it } from "vitest"
-import { mcpApp } from "../src/mcp"
-import type { CapabilityGrant, Env } from "../src/types"
+import { createHash } from 'node:crypto'
+import { beforeEach, afterEach, describe, expect, it } from 'vitest'
+import { mcpApp } from '../src/mcp'
+import type { Env } from '../src/types'
+import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 
 // Issue #1192: Stateless Connect Persistence & Security Invariant Test Suite
+//
+// Real SQLite schema via applyAllMigrations (satisfies test-schema-source ratchet).
+// Verifies that:
+// 1. connect() by an authorized caller atomically updates member_tokens.agent_id in D1.
+// 2. Subsequent stateless tool calls (orient, send) automatically read bound_agent_id.
+// 3. Unauthorized squad claims refuse D1 mutation and fail closed with 403.
+// 4. Directory unbound tokens fail closed on writes.
+// 5. explicit orient({agent}) never grants write authority.
 
-const SQUAD = { id: "squad-acme-eng", department_id: "dept-1" }
-const AGENT = {
-  id: "agent-growth-lead",
-  squad_id: "squad-acme-eng",
-  slug: "growth-lead",
-  name: "Growth Lead",
-}
+const TENANT = 'mumega'
+const SQUAD_ID = 'squad-hadi-mac'
+const AGENT_ID = 'agent-chatgpt-surface'
+const AGENT_SLUG = 'hadi-chatgpt'
+const RAW_TOKEN = 'test-stateless-bearer'
+const TOKEN_HASH = createHash('sha256').update(RAW_TOKEN).digest('hex')
 
-interface MockState {
-  boundAgentId: string | null
-  tokenChannel: string
-  grants: CapabilityGrant[]
-}
-
-function makeStatelessEnv(state: MockState): { env: Env; getState: () => MockState } {
-  const memberId = "member-bot-1"
-  const tokenId = "token-bot-1"
-
-  const handler = (sql: string) => ({
-    bind(...args: unknown[]) {
-      const bound = args[0]
-      return {
-        sql,
-        args,
-        async run() {
-          if (sql.includes("UPDATE member_tokens SET agent_id")) {
-            state.boundAgentId = args[0] as string
-            return { success: true, meta: { changes: 1 } }
-          }
-          return { success: true, meta: { changes: 0 } }
-        },
-        async first() {
-          if (sql.includes("FROM member_tokens")) {
-            return {
-              token_id: tokenId,
-              member_id: memberId,
-              email: null,
-              display_name: "Bot",
-              telegram_chat_id: null,
-              status: "active",
-              created_at: "2026-06-13 00:00:00",
-              channel: state.tokenChannel,
-              bound_agent_id: state.boundAgentId,
-            }
-          }
-          if (sql.includes("FROM squads") && sql.includes("WHERE id")) {
-            if (bound === SQUAD.id) return { id: SQUAD.id, name: "Acme Eng", charter: null, okr: null, department_id: SQUAD.department_id }
-            return null
-          }
-          if (sql.includes("FROM departments") && sql.includes("WHERE id")) {
-            return { id: SQUAD.department_id, name: "Engineering" }
-          }
-          if (sql.includes("FROM agents") && sql.includes("kpi_progress")) {
-            return {
-              id: AGENT.id,
-              squad_id: AGENT.squad_id,
-              slug: AGENT.slug,
-              name: AGENT.name,
-              role: "engineer",
-              status: "active",
-              effort: "standard",
-              autonomy: "draft",
-              kpi_progress: 0,
-              budget_cap_cents: null,
-              budget_window: "day",
-              okr: null,
-              kpi_target: null,
-            }
-          }
-          if (sql.includes("FROM agents") && sql.includes("WHERE id")) {
-            if (bound === AGENT.id) return { id: AGENT.id, squad_id: AGENT.squad_id, slug: AGENT.slug, name: AGENT.name }
-            return null
-          }
-          return null
-        },
-        async all() {
-          if (sql.includes("FROM capabilities")) return { results: state.grants }
-          if (sql.includes("FROM agents") && sql.includes("WHERE slug")) {
-            return { results: [{ id: AGENT.id, squad_id: AGENT.squad_id, slug: AGENT.slug, name: AGENT.name }] }
-          }
-          return { results: [] }
-        },
-      }
-    },
-  })
-
-  const env = {
-    TENANT_SLUG: "acme",
-    BRAND: "Acme Co",
-    OAUTH_PROVIDER: "google",
-    DB: { prepare: (sql: string) => handler(sql), batch: () => Promise.resolve([]) } as unknown as Env["DB"],
-    VEC: { query: async () => ({ matches: [] }) } as unknown as Env["VEC"],
-    BUS: { send: async () => {} } as unknown as Env["BUS"],
-    SESSIONS: {} as unknown as Env["SESSIONS"],
-    OAUTH_KV: {} as unknown as Env["OAUTH_KV"],
-    BLOBS: {} as unknown as Env["BLOBS"],
-    AI: {} as unknown as Env["AI"],
-    AGENT: {} as unknown as Env["AGENT"],
-    SQUAD: {} as unknown as Env["SQUAD"],
+function makeEnv(harness: SqliteD1Harness): Env {
+  return {
+    TENANT_SLUG: TENANT,
+    CANONICAL_HOST: 'mupot.mumega.com',
+    DB: harness.db,
+    VEC: { query: async () => ({ matches: [] }) } as unknown as Env['VEC'],
+    BUS: { send: async () => {} } as unknown as Env['BUS'],
+    SESSIONS: {} as unknown as Env['SESSIONS'],
+    OAUTH_KV: {} as unknown as Env['OAUTH_KV'],
+    BLOBS: {} as unknown as Env['BLOBS'],
+    AI: {} as unknown as Env['AI'],
+    AGENT: {} as unknown as Env['AGENT'],
+    SQUAD: {} as unknown as Env['SQUAD'],
   } as unknown as Env
+}
 
-  return { env, getState: () => state }
+function seedFixture(
+  sqlite: SqliteD1Harness['sqlite'],
+  opts: {
+    memberId: string
+    tokenId: string
+    tokenChannel?: string
+    squadCapability?: 'member' | 'admin' | null
+  },
+): void {
+  // 1. Department & Squad
+  sqlite
+    .prepare('INSERT INTO departments (id, slug, name) VALUES (?, ?, ?)')
+    .run('dept-eng', 'dept-eng', 'Engineering')
+  sqlite
+    .prepare('INSERT INTO squads (id, department_id, slug, name) VALUES (?, ?, ?, ?)')
+    .run(SQUAD_ID, 'dept-eng', 'hadi-mac', 'Hadi Mac')
+
+  // 2. Agent
+  sqlite
+    .prepare(
+      `INSERT INTO agents (id, squad_id, slug, name, role, model, status)
+       VALUES (?, ?, ?, ?, 'chat surface', 'test', 'active')`,
+    )
+    .run(AGENT_ID, SQUAD_ID, AGENT_SLUG, 'Hadi ChatGPT')
+
+  // 3. Member & Token
+  sqlite
+    .prepare(
+      `INSERT INTO members (id, email, display_name, status, tenant)
+       VALUES (?, ?, ?, 'active', ?)`,
+    )
+    .run(opts.memberId, `${opts.memberId}@mumega.test`, 'Hadi', TENANT)
+
+  sqlite
+    .prepare(
+      `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant)
+       VALUES (?, ?, ?, 'test', ?, datetime('now'), NULL, ?)`,
+    )
+    .run(opts.tokenId, opts.memberId, TOKEN_HASH, opts.tokenChannel ?? 'workspace', TENANT)
+
+  // 4. Capability grant
+  if (opts.squadCapability) {
+    sqlite
+      .prepare(
+        `INSERT INTO capabilities (member_id, scope_type, scope_id, capability, created_at)
+         VALUES (?, 'squad', ?, ?, datetime('now'))`,
+      )
+      .run(opts.memberId, SQUAD_ID, opts.squadCapability)
+  }
 }
 
 async function callTool(env: Env, toolName: string, args: Record<string, unknown> = {}) {
   return mcpApp.request(
-    "https://mcp.acme-example.co/",
+    'https://mupot.mumega.com/',
     {
-      method: "POST",
+      method: 'POST',
       headers: {
-        "content-type": "application/json",
-        "authorization": "Bearer test-token",
+        'content-type': 'application/json',
+        'authorization': `Bearer ${RAW_TOKEN}`,
       },
       body: JSON.stringify({
-        jsonrpc: "2.0",
-        id: 1,
-        method: "tools/call",
+        jsonrpc: '2.0',
+        id: `req-${Date.now()}`,
+        method: 'tools/call',
         params: { name: toolName, arguments: args },
       }),
     },
@@ -128,55 +109,99 @@ async function callTool(env: Env, toolName: string, args: Record<string, unknown
   )
 }
 
-describe("Issue #1192 — Stateless Connect Persistence Regression Suite", () => {
-  it("connect_then_orient_returns_claimed_agent across stateless calls", async () => {
-    const { env, getState } = makeStatelessEnv({
-      boundAgentId: null,
-      tokenChannel: "workspace",
-      grants: [{ member_id: "member-bot-1", scope_type: "squad", scope_id: SQUAD.id, capability: "member" }],
-    })
+describe('Issue #1192 — Stateless Connect Persistence (Real Schema)', () => {
+  let harness: SqliteD1Harness
 
-    // Step 1: Initial stateless connect call
-    const connectRes = await callTool(env, "connect", { agent_name: AGENT.slug })
+  beforeEach(() => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+  })
+
+  afterEach(() => harness.close())
+
+  it('connect_then_orient_returns_claimed_agent across stateless calls', async () => {
+    seedFixture(harness.sqlite, {
+      memberId: 'member-hadi-1',
+      tokenId: 'tok-hadi-1',
+      tokenChannel: 'workspace',
+      squadCapability: 'member',
+    })
+    const env = makeEnv(harness)
+
+    // Step 1: Stateless connect call
+    const connectRes = await callTool(env, 'connect', { agent_name: AGENT_SLUG })
     expect(connectRes.status).toBe(200)
     const connectBody = (await connectRes.json()) as any
-    expect(connectBody.result.structuredContent.connection_status).toBe("hot")
-    expect(connectBody.result.structuredContent.binding).toBe("durable")
-    expect(getState().boundAgentId).toBe(AGENT.id)
+    expect(connectBody.result.structuredContent.connection_status).toBe('hot')
+    expect(connectBody.result.structuredContent.binding).toBe('durable')
 
-    // Step 2: Next completely stateless orient call (reads D1 state directly)
-    const orientRes = await callTool(env, "orient", {})
+    // Verify D1 row was updated in real SQLite
+    const row = harness.sqlite
+      .prepare('SELECT agent_id FROM member_tokens WHERE id = ?')
+      .get('tok-hadi-1') as { agent_id: string | null }
+    expect(row.agent_id).toBe(AGENT_ID)
+
+    // Step 2: Next completely stateless orient call
+    const orientRes = await callTool(env, 'orient', {})
     expect(orientRes.status).toBe(200)
     const orientBody = (await orientRes.json()) as any
-    expect(orientBody.result.structuredContent.packet.agent.id).toBe(AGENT.id)
-    expect(orientBody.result.structuredContent.packet.agent.name).toBe(AGENT.name)
+    expect(orientBody.result.structuredContent.packet.agent.id).toBe(AGENT_ID)
+    expect(orientBody.result.structuredContent.packet.agent.name).toBe('Hadi ChatGPT')
   })
 
-  it("unauthorized_squad_claim_refuses_d1_weld", async () => {
-    const { env, getState } = makeStatelessEnv({
-      boundAgentId: null,
-      tokenChannel: "workspace",
-      grants: [], // No squad capability
+  it('unauthorized_squad_claim_refuses_d1_weld', async () => {
+    seedFixture(harness.sqlite, {
+      memberId: 'member-unauthorized',
+      tokenId: 'tok-unauth',
+      tokenChannel: 'workspace',
+      squadCapability: null, // No squad capability
     })
+    const env = makeEnv(harness)
 
-    const res = await callTool(env, "connect", { agent_name: AGENT.slug })
+    const res = await callTool(env, 'connect', { agent_name: AGENT_SLUG })
     expect(res.status).toBe(403)
-    expect(getState().boundAgentId).toBeNull() // D1 must not be modified
+
+    // D1 must NOT have updated
+    const row = harness.sqlite
+      .prepare('SELECT agent_id FROM member_tokens WHERE id = ?')
+      .get('tok-unauth') as { agent_id: string | null }
+    expect(row.agent_id).toBeNull()
   })
 
-  it("directory_unbound_bearer_writes_fail_closed", async () => {
-    const { env } = makeStatelessEnv({
-      boundAgentId: null,
-      tokenChannel: "directory",
-      grants: [],
+  it('directory_unbound_bearer_writes_fail_closed', async () => {
+    seedFixture(harness.sqlite, {
+      memberId: 'member-directory-unbound',
+      tokenId: 'tok-dir-unbound',
+      tokenChannel: 'directory',
+      squadCapability: null,
     })
+    const env = makeEnv(harness)
 
-    // An unbound directory session must fail closed on send
-    const sendRes = await callTool(env, "send", {
-      to: "peer-agent-id",
-      body: "Hello from unbound",
-      kind: "message",
+    const sendRes = await callTool(env, 'send', {
+      to: 'peer-agent-id',
+      body: 'Hello from unbound',
+      kind: 'message',
     })
     expect(sendRes.status).toBe(403)
+  })
+
+  it('explicit_orient_agent_never_grants_write', async () => {
+    seedFixture(harness.sqlite, {
+      memberId: 'member-reader',
+      tokenId: 'tok-reader',
+      tokenChannel: 'workspace',
+      squadCapability: 'member',
+    })
+    const env = makeEnv(harness)
+
+    // Calling orient with explicit agent does NOT bind the token for writes
+    const orientRes = await callTool(env, 'orient', { agent: AGENT_SLUG })
+    expect(orientRes.status).toBe(200)
+
+    // Token remains unbound in D1
+    const row = harness.sqlite
+      .prepare('SELECT agent_id FROM member_tokens WHERE id = ?')
+      .get('tok-reader') as { agent_id: string | null }
+    expect(row.agent_id).toBeNull()
   })
 })

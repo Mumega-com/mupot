@@ -4009,18 +4009,30 @@ const toolConnect: ToolSpec = {
     // If the token is unbound (boundAgentId=null) and the caller is authorized on the squad,
     // persist the binding to D1 so that stateless REST clients (e.g. ChatGPT Actions)
     // retain the agent identity on subsequent tool calls.
+    let durable = false
     if (auth.tokenId && !auth.boundAgentId) {
-      await env.DB.prepare(
+      if (auth.memberId) {
+        await env.DB.prepare(
+          `INSERT OR IGNORE INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+           VALUES (?1, ?2, ?3, datetime('now'))`,
+        )
+          .bind(env.TENANT_SLUG, agentRef.id, auth.memberId)
+          .run()
+      }
+
+      const updateResult = await env.DB.prepare(
         'UPDATE member_tokens SET agent_id = ?1 WHERE id = ?2 AND agent_id IS NULL',
       )
         .bind(agentRef.id, auth.tokenId)
         .run()
+
+      durable = (updateResult.meta?.changes ?? 0) > 0
     }
 
     return done({
       connection_status: 'hot',
       claimed_agent: { id: agentRef.id, slug: agentRef.slug, name: agentRef.name },
-      binding: auth.tokenId ? 'durable' : 'session_local',
+      binding: durable ? 'durable' : 'session_local',
       next_step: 'You are now hot. Call orient {} (or rely on this packet) for your full basin-drop.',
       packet: data,
       brief: renderBrief(data),
