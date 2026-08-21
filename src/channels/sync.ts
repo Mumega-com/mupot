@@ -21,6 +21,7 @@
 import type { Env, Capability, ChannelBinding } from '../types'
 import { capabilityRank } from '../auth/capability'
 import { getAdapter } from './registry'
+import { redactSecretPatterns } from '../lib/redact'
 
 // The base capability sync grants. Platform role mapping may raise it, but the
 // result is always clamped by the binding ceiling.
@@ -51,7 +52,7 @@ async function reconcileBinding(env: Env, binding: ChannelBinding): Promise<void
     console.error('channels.sync: listChannelMembers failed', {
       platform: binding.platform,
       channel: binding.external_channel_id,
-      error: err instanceof Error ? err.message : String(err),
+      error: redactSecretPatterns(err instanceof Error ? err.message : String(err)),
     })
     return
   }
@@ -207,7 +208,7 @@ export async function reconcileMembership(
       console.error('channels.sync: binding reconcile failed', {
         binding: binding.id,
         platform: binding.platform,
-        error: err instanceof Error ? err.message : String(err),
+        error: redactSecretPatterns(err instanceof Error ? err.message : String(err)),
       })
     }
   }

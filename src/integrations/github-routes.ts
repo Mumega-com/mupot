@@ -15,10 +15,10 @@
 
 import { Hono } from 'hono'
 import type { Env } from '../types'
+import { timingSafeEqual } from '../lib/crypto'
 import { createTask, syncTaskStatusFromIssue, syncCiResultToTask, closeGitHubPrMirrorTasks } from '../tasks/service'
 import { syncGitHubProject } from './github-projects'
 import { recordMergedPr } from '../agents/kpi-sources'
-import { timingSafeEqual } from '../lib/crypto'
 
 interface GitHubRouteEnv {
   GITHUB_WEBHOOK_SECRET?: string

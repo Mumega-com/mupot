@@ -1,0 +1,1 @@
+export { timingSafeEqual } from './crypto'

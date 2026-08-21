@@ -26,9 +26,9 @@
 
 import { Hono } from 'hono'
 import type { Env } from '../types'
+import { timingSafeEqual } from '../lib/crypto'
 import { createTask } from '../tasks/service'
 import type { CreateTaskOptions } from '../tasks/service'
-import { timingSafeEqual } from '../lib/crypto'
 
 // ── Normalized inbound event ────────────────────────────────────────────────
 //

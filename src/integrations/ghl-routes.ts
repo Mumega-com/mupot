@@ -22,10 +22,10 @@
 
 import { Hono } from 'hono'
 import type { Env } from '../types'
+import { timingSafeEqual } from '../lib/crypto'
 import { createTask } from '../tasks/service'
 import { findByEmail, setProspectStatus } from '../loops/prospects'
 import type { ProspectStatus } from '../loops/prospects'
-import { timingSafeEqual } from '../lib/crypto'
 
 // ── Env extension for GHL route-specific bindings ─────────────────────────────
 //
@@ -43,13 +43,6 @@ function ghlRouteEnv(env: Env): GHLRouteEnv {
 }
 
 export const GHL_INBOUND_MAX_BODY_BYTES = 256 * 1024
-
-// ── Constant-time comparison ──────────────────────────────────────────────────
-//
-// timingSafeEqual is the canonical approach (Web Crypto TextEncoder → ArrayBuffer).
-// We compare byte-by-byte with a running XOR so there is no early exit.
-// Both arguments must be the same length — we pad/compare lengths separately
-// (length comparison leaks length, but the HMAC is fixed-length so this is fine).
 
 // ── HMAC-SHA256 computation ───────────────────────────────────────────────────
 

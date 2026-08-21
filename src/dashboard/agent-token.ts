@@ -162,22 +162,22 @@ export function agentTokenMintedBody(
   tokenId: string,
   capability: string,
 ) {
-  const scopeLabel = squadName ? `${squadName} / ${agentName}` : agentName
+  const scopeLabel = squadName ? `${esc(squadName)} / ${esc(agentName)}` : esc(agentName)
   return html`
 <div class="crumbs"><a href="/">Overview</a> › <a href="/members">Access Tokens</a> › <a href="/admin/agent-token">Mint agent token</a> › Token minted</div>
 <h1>Agent token minted</h1>
 <div class="card">
   <p style="font-size:14px;color:var(--muted);margin:0 0 14px">
-    Bound to <strong>${scopeLabel}</strong> (slug: <code class="inline">${agentSlug}</code>) ·
-    Token ID: <code class="inline">${tokenId}</code> ·
-    Squad grant: <code class="inline">${capability}</code>
+    Bound to <strong>${honoRaw(scopeLabel)}</strong> (slug: <code class="inline">${honoRaw(esc(agentSlug))}</code>) ·
+    Token ID: <code class="inline">${honoRaw(esc(tokenId))}</code> ·
+    Squad grant: <code class="inline">${honoRaw(esc(capability))}</code>
   </p>
   <div class="warn-box" style="margin-bottom:14px">
     <strong>Shown once only.</strong> Copy this token now — it cannot be retrieved again.
-    Place it at <code class="inline">~/.fleet/agents/${agentSlug}.token</code> on the host.
+    Place it at <code class="inline">~/.fleet/agents/${honoRaw(esc(agentSlug))}.token</code> on the host.
     Never paste it in chat, bus messages, or version control.
   </div>
-  <code class="token" id="rawToken">${raw}</code>
+  <code class="token" id="rawToken">${honoRaw(esc(raw))}</code>
   <div style="margin-top:12px;display:flex;gap:10px;align-items:center">
     <button class="btn secondary sm" onclick="copyToken()">Copy</button>
     <a href="/admin/agent-token" class="btn secondary sm">Mint another</a>
