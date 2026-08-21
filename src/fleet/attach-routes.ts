@@ -133,9 +133,10 @@ const VALID_TYPES = new Set(['builder', 'reviewer', 'weaver', 'brain', 'comms', 
 // Attach runtimes include 'hermes' (standalone Hermes agent runtime, absent from the
 // daemon-report set which uses 'hermes-cron' for cron-only Hermes).
 // Goose / goosed are deliberately excluded — see docs/fleet/goose-non-adoption-2026-07-22.md.
+// Added 'prime-agent' and 'herdr' per F-09 / mupot#881 / mupot#893.
 const VALID_RUNTIMES = new Set([
   'codex', 'claude-code', 'nous', 'hermes', 'hermes-cron',
-  'systemd-user', 'tmux', 'python', 'pi',
+  'systemd-user', 'tmux', 'python', 'pi', 'prime-agent', 'herdr',
 ])
 
 const VALID_LIFECYCLES = new Set(['on_demand', 'always_on'])
