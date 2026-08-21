@@ -46,14 +46,14 @@ describe('addon registry', () => {
       ...FixtureAddon,
       key: 'previous-minor-native-addon',
       version: '1.0.0',
-      mupotCompatibility: '^0.28.0',
+      mupotCompatibility: '^0.29.0',
     }
 
     await registry.register(manifest)
 
     expect(registry.get(manifest.key)?.manifest).toMatchObject({
       version: '1.0.0',
-      mupotCompatibility: '^0.28.0',
+      mupotCompatibility: '^0.29.0',
     })
   })
 
@@ -65,7 +65,7 @@ describe('addon registry', () => {
       key: 'previous-minor-external-addon',
       trustClass: 'external_isolated',
       kind: 'external_mcp',
-      mupotCompatibility: '^0.28.0',
+      mupotCompatibility: '^0.29.0',
       departments: [],
       metrics: [],
       consoleSections: [],

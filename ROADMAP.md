@@ -8,13 +8,13 @@ numbers.
 
 | State | Version | Meaning |
 |---|---|---|
-| Cut version | `v0.29.0` | Release Truth and Sovereign Substrate. Constants cut, **not yet tagged**. |
+| Cut version | `v0.30.0` | Governed Tools, Marketing/CRO Pilot, Identity and Unified Access, and Console Consolidation. |
 | Last tagged release | `v0.25.0` | Project Routines and Needs You. |
-| Development target | `v0.30.0` | Governed Tools, Marketing/CRO Pilot, Identity and Unified Access, and Console Consolidation. |
-| Next planned | `v0.31.0` | Agent Computers and Recovery. |
+| Development target | `v0.31.0` | Agent Computers and Recovery. |
+| Next planned | `v0.32.0` | Compounding Project Knowledge. |
 
-Code merged or deployed after the `v0.29.0` cut is not retroactively part of
-`v0.29.0`. Capabilities remain preview until the release that owns them passes its
+Code merged or deployed after the `v0.30.0` cut is not retroactively part of
+`v0.30.0`. Capabilities remain preview until the release that owns them passes its
 gate and is tagged.
 
 ## Versioning unblocked — `v0.29.0` cut, tag still owed (2026-08-08)

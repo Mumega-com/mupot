@@ -87,6 +87,37 @@ export interface ReserveOpts {
 }
 
 /**
+ * isEnforceableCap — THE single predicate for "is this budget cap real?".
+ *
+ * Exported and shared on purpose. This condition previously existed as two copies:
+ * here (enforcement) and inline in src/mcp/index.ts (admission, deciding what gets
+ * reported in `budget_uncapped`). They drifted, and #1179 gate R6 caught it — the
+ * admission copy carried Number.isSafeInteger and this one did not, so three classes
+ * of value were reported as UNCAPPED while being enforced as caps:
+ *
+ *     10.5                     admission=false  meter=true   -> enforced as $10.50
+ *     Infinity                 admission=false  meter=true
+ *     MAX_SAFE_INTEGER + 2     admission=false  meter=true
+ *
+ * A flight would be admitted as unlimited, told so in telemetry, and then hit
+ * budget_cap_exceeded mid-execution.
+ *
+ * Syncing the two copies would have fixed today's drift and left the mechanism that
+ * produced it. One exported predicate, two call sites, is the fix — the copies cannot
+ * disagree if there is only one.
+ *
+ * Behaviour is deliberately UNCHANGED from the prior enforcement condition. Do not add
+ * an isFinite() or isSafeInteger() guard here to make it look safer: enforcement is the
+ * ground truth that admission reports, and tightening it turns a malformed stored value
+ * into unlimited spend. If a value should never reach the column, reject it at the write
+ * path (org/service.ts already validates Number.isInteger) — not by teaching the enforcer
+ * to ignore it.
+ */
+export function isEnforceableCap(cap: number | null | undefined): cap is number {
+  return typeof cap === 'number' && cap > 0
+}
+
+/**
  * checkAndReserve — call BEFORE the model call.
  *
  * Reads the current window counters and, if under cap, atomically increments
@@ -149,9 +180,9 @@ export async function checkAndReserve(
   // given — never rounded — so an intentful sub-cent cap can never collapse to unlimited.
   // Otherwise fall back to the cents cap (agents.budget_cap_cents).
   const capMicroUsd =
-    typeof opts.budgetCapMicroUsd === 'number' && opts.budgetCapMicroUsd > 0
+    isEnforceableCap(opts.budgetCapMicroUsd)
       ? opts.budgetCapMicroUsd
-      : typeof opts.budgetCapCents === 'number' && opts.budgetCapCents > 0
+      : isEnforceableCap(opts.budgetCapCents)
         ? opts.budgetCapCents * MICRO_USD_PER_CENT
         : null
   if (capMicroUsd !== null) {

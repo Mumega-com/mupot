@@ -132,6 +132,9 @@ import { AUTH_CONTEXT_HEADER } from './auth-header'
 import { isExternallySourced } from '../tasks/provenance'
 import { MUPOT_PUBLIC_API_VERSION } from '../version'
 import { MUPOT_MCP_INITIALIZE_INSTRUCTIONS } from './instructions'
+// The SAME predicate the meter enforces with. Imported rather than restated —
+// these were two copies and they drifted (#1179 gate R6).
+import { isEnforceableCap } from '../agents/meter'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
@@ -2053,8 +2056,11 @@ const toolFlightDispatch: ToolSpec = {
           { kind: 'squad' as const, id: item.id, slug: item.slug, cap: item.budget_cap_cents }
         )),
       ]
-      const isConfigured = (cap: number | null): cap is number =>
-        typeof cap === 'number' && Number.isSafeInteger(cap) && cap > 0
+      // This decides what we REPORT (budget_uncapped); the meter decides what is
+      // ENFORCED. When the two disagree, the report lies about the system's own
+      // behaviour — so it is now literally the meter's function, not a copy of its
+      // condition. See isEnforceableCap in src/agents/meter.ts for why (#1179 R6).
+      const isConfigured = isEnforceableCap
       const configured = budgetSources.filter((source) => isConfigured(source.cap))
       budgetUncapped = budgetSources
         .filter((source) => !isConfigured(source.cap))
