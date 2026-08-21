@@ -1053,6 +1053,7 @@ const toolTaskUpdate: ToolSpec = {
       assignee_agent_id: STRING_SCHEMA,
       gate_owner: STRING_SCHEMA,
       gate_owner_reason: STRING_SCHEMA,
+      result: { type: ['string', 'null'], description: 'Task execution completion result (must include Artifact: <path> and SHA256: <64-hex> when entering review or completing)' },
     },
     required: ['task_id'],
     additionalProperties: false,
@@ -1074,6 +1075,10 @@ const toolTaskUpdate: ToolSpec = {
     let reversesVerdict = false
     let reversalReason = ''
 
+    if (args.result !== undefined) {
+      next.result = args.result === null ? null : str(args.result)
+      changed = true
+    }
     if (args.title !== undefined) {
       if (!str(args.title)) return fail(400, 'invalid_title')
       next.title = (args.title as string).trim()
@@ -1254,7 +1259,7 @@ const toolTaskUpdate: ToolSpec = {
       const entersReview = args.status === 'review'
       const ungatedDirectDone = args.status === 'done' && existing.status !== 'approved' && existing.status !== 'rejected' && !effectiveGateOwner
       if ((entersReview || ungatedDirectDone) && existing.assignee_agent_id) {
-        const artifactCheck = verifyTaskArtifactShape(existing.result)
+        const artifactCheck = verifyTaskArtifactShape(next.result ?? existing.result)
         if (!artifactCheck.verified) {
           return fail(409, 'artifact_verification_failed', {
             reason: artifactCheck.reason,
@@ -4001,14 +4006,31 @@ const toolConnect: ToolSpec = {
     )
     if (notFound || !data) return fail(404, 'agent_not_found', 'Agent was found but orient data is unavailable.')
 
+    // If the token is unbound (boundAgentId=null) and the caller is authorized on the squad,
+    // persist the binding to D1 so that stateless REST clients (e.g. ChatGPT Actions)
+    // retain the agent identity on subsequent tool calls.
+    let durable = false
+    if (auth.tokenId && !auth.boundAgentId) {
+      try {
+        const updateResult = await env.DB.prepare(
+          'UPDATE member_tokens SET agent_id = ?1 WHERE id = ?2 AND agent_id IS NULL',
+        )
+          .bind(agentRef.id, auth.tokenId)
+          .run()
+
+        durable = (updateResult.meta?.changes ?? 0) > 0
+      } catch {
+        // If trigger prevents D1 update (e.g. agent_identity_conflict when caller is not the agent's dedicated member),
+        // retain session-local claim without failing the connection.
+        durable = false
+      }
+    }
+
     return done({
       connection_status: 'hot',
       claimed_agent: { id: agentRef.id, slug: agentRef.slug, name: agentRef.name },
-      // SESSION-LOCAL binding note: this does not write member_tokens.agent_id.
-      // To promote to a permanent weld (so reconnects are automatic), ask an admin
-      // to call mint_agent_token { agent: "<id>" } and use the issued token going forward.
-      binding: 'session_local',
-      next_step: 'You are now hot. Call orient {} (or rely on this packet) for your full basin-drop. For a permanent identity weld ask an admin to call mint_agent_token.',
+      binding: durable ? 'durable' : 'session_local',
+      next_step: 'You are now hot. Call orient {} (or rely on this packet) for your full basin-drop.',
       packet: data,
       brief: renderBrief(data),
     })
