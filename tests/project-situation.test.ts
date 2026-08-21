@@ -423,7 +423,8 @@ describe('loadProjectSituation', () => {
     const planFor = (fragment: string) => {
       const statement = probe.statements.find(candidate => candidate.sql.includes(fragment))
       expect(statement).toBeDefined()
-      const plan = harness!.sqlite.prepare(`EXPLAIN QUERY PLAN ${statement!.sql}`).all(...statement!.values)
+      const normalizedSql = statement!.sql.replace(/\?\d+/g, '?')
+      const plan = harness!.sqlite.prepare(`EXPLAIN QUERY PLAN ${normalizedSql}`).all(...statement!.values)
       return plan.map(row => String(row.detail ?? '')).join('\n')
     }
     for (const [fragment, index] of [

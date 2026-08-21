@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.30.0 — 2026-08-21
+
+- **Mint-in-Chooser Self-Service Agent Seat Binding** (`src/mcp/oauth-authorize.ts`, `tests/agent-bound-oauth-consent.test.ts`; #1189).
+  - Native self-service agent minting directly inside the OAuth consent chooser UI (`__mint_new__`), gated by squad administrator capability (`listConsentableSquads`).
+  - Server-side creation of agent records (`createAgent`), immutable token & dedicated member binding (`mintAgentBoundToken`), and append-only receipt auditing (`oauth_consent_receipts`).
+  - Eliminates ambient authority and prevents multiple agent seats from collapsing into a shared identity.
+
+- **Flight Watchdog & Governed Reap Circuit** (`src/flight/`, `src/scheduled/`; #1127, #1138, #1147, #1151, #1155, #1179).
+  - Automated flight liveness watchdog integrated into `scheduled()` maintenance loop to detect and reap stalled flights.
+  - Dedicated append-only `flight_reap_receipts` table distinguishing reaps from normal landings.
+  - Budget meter alignment where unset budget caps evaluate to unlimited (`isBudgetCap`).
+  - Supported re-gate path for review tasks (#1180).
+
+- **Identity & Token Lifecycle Management (Flight-002)** (`src/auth/`, `src/members/`, `src/scheduled/`; #1008, #1009, #1052, #1146).
+  - Default token expiration (`expires_at`), atomic rotation, and expiring-soon warning maintenance loop in `scheduled()`.
+  - Added `last_used_at` telemetry tracking for agent tokens (migration 0099).
+
+- **Agent Seat Activity & Disambiguated Roster (Flight-008)** (`src/presence/`, `src/dashboard/`; #1078, #1077, #1118).
+  - Seat activity telemetry measuring what an agent is doing alongside reachability and liveness.
+  - Disambiguated Agent Selector in dashboard and consolidated Hero-KPI aggregation.
+
+- **Fail-Closed 8-char Short-UUID Resolver & Handshake Hardening (Flight-003A)** (`src/mcp/`; #987, #1053, #1100, #1126).
+  - Deterministic short-UUID entity resolution and schema aliasing preventing ambiguous entity references.
+  - Canonical onboarding instructions returned in MCP `initialize` handshake (#1126).
+  - Redaction of raw credentials from mint tool results (#987, #1100).
+
+- **Task Backlog & Dispatch Separation (Flight-006)** (`src/tasks/`, `src/gates/`; #1071, #1072, #1073, #1075).
+  - Separated task backlog creation from execution dispatch with `task_create` dispatch flag.
+  - Server-joined canonical names and phase metric separation.
+  - Integrated Athena gate lane into mupot gate substrate.
+
+- **Tentacles Fan-Out Records & Dashboard Panel (Flight-004)** (`src/addons/`, `src/dashboard/`; #1056).
+  - Subagent seat fan-out records, MCP tools, and dedicated dashboard visualizer.
+
+- **Model Boundary Hardening & Stream Normalization (Flight-005)** (`src/model/`, `src/runners/`; #1058, #1059, #1069, #1070).
+  - Strict `text:string` chat boundary enforcement and non-throwing `parseDecision`/`parseProposals` parsing on non-string model outputs.
+  - Runner receipt status locks with D1 provenance clamping and optional Ed25519 signatures.
+
+- **Dashboard Modularization & Multi-Perspective Kanban** (`src/dashboard/`; #1042, #1048, #1055).
+  - Dashboard sub-routing with scoped radar views and multi-perspective squad & project Kanban board.
+  - Real-schema SSE stream endpoint (`/api/inbox/stream`) for real-time inbox message delivery (#706).
+
 ## 2026-08-15
 
 - **Session transcript** (`docs/session-transcripts/2026-08-15-primeagent-deepseek-v4-flash-0730.md`) — truncated transcription of the Athena gate seat session on prime-agent (deepseek-v4-flash): gate verdict confirmation (Flight 640f6b4d, #1040), correctness lenses #1052/#1053, CF token TTL fix, fleet responder retirement, mupot visibility review (Hadi-directed).
