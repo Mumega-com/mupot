@@ -1028,7 +1028,7 @@ const toolTaskUpdate: ToolSpec = {
   name: 'task_update',
   scope: 'squad (of the task)',
   min: 'member',
-  args: '{ task_id: string, project_id?: string|null, title?: string, body?: string, done_when?: string, status?: "open"|"in_progress"|"blocked"|"done"|"review", priority?: "P0"|"P1"|"P2"|"P3"|null, parent_task_id?: string|null, assignee_agent_id?: string|null, gate_owner?: string|null, gate_owner_reason?: string }',
+  args: '{ task_id: string, project_id?: string|null, title?: string, body?: string, done_when?: string, status?: "open"|"in_progress"|"blocked"|"done"|"review", priority?: "P0"|"P1"|"P2"|"P3"|null, parent_task_id?: string|null, assignee_agent_id?: string|null, gate_owner?: string|null, gate_owner_reason?: string, reversal_reason?: string }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -1038,6 +1038,8 @@ const toolTaskUpdate: ToolSpec = {
       body: STRING_SCHEMA,
       note: STRING_SCHEMA,
       reason: STRING_SCHEMA,
+      reversal_reason: STRING_SCHEMA,
+      verdict_reversal_reason: STRING_SCHEMA,
       done_when: STRING_SCHEMA,
       status: STRING_SCHEMA,
       priority: { type: ['string', 'null'], description: 'Rank, or null to return the task to UNTRIAGED.' },
@@ -1063,6 +1065,8 @@ const toolTaskUpdate: ToolSpec = {
 
     const next: Task = { ...existing }
     let changed = false
+    let reversesVerdict = false
+    let reversalReason = ''
 
     if (args.title !== undefined) {
       if (!str(args.title)) return fail(400, 'invalid_title')
@@ -1139,8 +1143,37 @@ const toolTaskUpdate: ToolSpec = {
             : undefined,
         })
       }
-      const transitionErr = checkTransition(existing.status, args.status)
-      if (transitionErr) return fail(400, 'invalid_transition', transitionErr)
+      const isVerdictReversal =
+        (existing.status === 'approved' || existing.status === 'rejected') &&
+        args.status === 'review'
+
+      if (isVerdictReversal) {
+        // VERDICT REVERSAL PATH (P0 fix, mupot#1181)
+        // Org owner/admin only, mandatory reason, append-only receipt to verdict_reversals table.
+        reversalReason =
+          typeof args.reversal_reason === 'string'
+            ? args.reversal_reason.trim()
+            : typeof args.verdict_reversal_reason === 'string'
+              ? args.verdict_reversal_reason.trim()
+              : typeof args.reason === 'string'
+                ? args.reason.trim()
+                : ''
+        if (!isOrgOwnerAdmin(auth)) {
+          return fail(403, 'forbidden', {
+            need: 'org_admin',
+            detail: 'verdict reversal on an approved/rejected task requires org owner/admin authority',
+          })
+        }
+        if (reversalReason.length === 0) {
+          return fail(400, 'verdict_reversal_reason_required', {
+            detail: 'reversing a verdict on an approved/rejected task to review requires a non-empty reversal_reason',
+          })
+        }
+        reversesVerdict = true
+      } else {
+        const transitionErr = checkTransition(existing.status, args.status)
+        if (transitionErr) return fail(400, 'invalid_transition', transitionErr)
+      }
       // GATE-EXIT GUARD (mirror of PATCH /api/tasks/:id): entering 'review'
       // requires a gate_owner, else the task is a zombie with no legal exit
       // (verdict 409s no_gate; review→open|in_progress is forbidden). Evaluate the
@@ -1321,7 +1354,7 @@ const toolTaskUpdate: ToolSpec = {
           detail: 'reassigning an existing gate_owner on a review task requires a non-empty gate_owner_reason',
         })
       }
-      if (lockStatuses.has(existing.status) && !repairsHistoricalUngatedReview && !reassignsGatedReview) {
+      if (lockStatuses.has(existing.status) && !repairsHistoricalUngatedReview && !reassignsGatedReview && !reversesVerdict) {
         return fail(409, 'gate_owner_locked', { status: existing.status })
       }
       // BLOCK-2 fix (kasra-review 2026-08-13, proof-of-exploit): once set,
@@ -1456,6 +1489,30 @@ const toolTaskUpdate: ToolSpec = {
       // is never told the gate is now theirs, and the task sits exactly as stuck
       // as it was before, just under a different name.
       await wakeGateOwnerOnReview(env, next, actor, auth.memberId as string)
+    }
+
+    // VERDICT REVERSAL RECEIPT.
+    //
+    // An org owner/admin may reverse an approved/rejected verdict back to review,
+    // but may never do so invisibly. The receipt is written to an append-only table.
+    if (reversesVerdict) {
+      await env.DB.prepare(
+        `INSERT INTO verdict_reversals
+           (id, tenant, task_id, squad_id, from_status, to_status, prior_verdict, reason,
+            actor_id, actor_type)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'review', ?6, ?7, ?8, 'member')`,
+      )
+        .bind(
+          crypto.randomUUID(),
+          env.TENANT_SLUG,
+          next.id,
+          next.squad_id,
+          existing.status,
+          existing.status,
+          reversalReason,
+          auth.memberId as string,
+        )
+        .run()
     }
 
     return done({ task: next })
@@ -1665,6 +1722,42 @@ const toolTaskVerdict: ToolSpec = {
       }
       throw err
     }
+  },
+}
+
+// task_verdict_reverse — reverse an errant verdict on an approved or rejected task
+// back to 'review'. Org owner/admin only with mandatory reason. P0 fix, mupot#1181.
+const toolTaskVerdictReverse: ToolSpec = {
+  name: 'task_verdict_reverse',
+  scope: 'squad (of the task)',
+  min: 'member',
+  args: '{ task_id: string, reason: string, gate_owner?: string|null, gate_owner_reason?: string }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      task_id: STRING_SCHEMA,
+      reason: STRING_SCHEMA,
+      reversal_reason: STRING_SCHEMA,
+      gate_owner: STRING_SCHEMA,
+      gate_owner_reason: STRING_SCHEMA,
+    },
+    required: ['task_id'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const taskRef = str(args.task_id)
+    if (!taskRef) return fail(400, 'invalid_args', 'task_id required')
+    const reason = str(args.reversal_reason) || str(args.reason)
+    if (!reason || reason.trim().length === 0) {
+      return fail(400, 'verdict_reversal_reason_required', { detail: 'reason is required to reverse a verdict' })
+    }
+    return toolTaskUpdate.run(auth, env, {
+      task_id: taskRef,
+      status: 'review',
+      reversal_reason: reason.trim(),
+      gate_owner: args.gate_owner,
+      gate_owner_reason: args.gate_owner_reason,
+    })
   },
 }
 
@@ -3874,6 +3967,7 @@ export const TOOLS: ToolSpec[] = [
   toolKanbanBoard,
   toolTaskUpdate,
   toolTaskVerdict,
+  toolTaskVerdictReverse,
   toolTaskDispatch,
   toolTaskIntakeAudit,
   toolRemember,

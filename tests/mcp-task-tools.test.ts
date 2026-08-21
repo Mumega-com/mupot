@@ -951,6 +951,133 @@ describe('MCP task cutover tools', () => {
     expect(wakes.length, 'new gate owner was never woken').toBeGreaterThan(0)
   })
 
+  // ── reversing an ERRANT VERDICT on an APPROVED or REJECTED task (mupot#1181) ─
+  it('an ordinary member CANNOT reverse an approved task verdict, reason or not', async () => {
+    const { env, updates } = makeEnv([task({ status: 'approved', gate_owner: 'gate:athena' })])
+    const res = await invokeTool(
+      auth(),
+      env,
+      'task_update',
+      { task_id: 'task-1', status: 'review', reversal_reason: 'I disagree with the approval' },
+      URL,
+    )
+    expect(res.ok).toBe(false)
+    expect(res.error).toBe('forbidden')
+    expect(updates).toHaveLength(0)
+  })
+
+  it('an org admin WITHOUT a reason cannot reverse an approved task verdict', async () => {
+    const { env, updates } = makeEnv([task({ status: 'approved', gate_owner: 'gate:athena' })])
+    const res = await invokeTool(
+      ADMIN_AUTH(),
+      env,
+      'task_update',
+      { task_id: 'task-1', status: 'review' },
+      URL,
+    )
+    expect(res.ok).toBe(false)
+    expect(res.error).toBe('verdict_reversal_reason_required')
+    expect(updates).toHaveLength(0)
+  })
+
+  it('an org admin WITH a reason reverses an approved task back to review, writes receipt and wakes gate owner', async () => {
+    const { env, updates, events } = makeEnv(
+      [task({ status: 'approved', gate_owner: 'gate:athena' })],
+      {},
+      {},
+      { gateGrants: { 'gate:athena': ['agent-other'] } },
+    )
+    const res = await invokeTool(
+      ADMIN_AUTH(),
+      env,
+      'task_update',
+      {
+        task_id: 'task-1',
+        status: 'review',
+        reversal_reason: 'new evidence proves flaw in implementation',
+      },
+      URL,
+    )
+    expect(res.ok, JSON.stringify(res)).toBe(true)
+    const result = res.result as { task: Task }
+    expect(result.task.status).toBe('review')
+
+    const receipt = updates.find((u) => u.sql.includes('verdict_reversals'))
+    expect(receipt, 'no verdict_reversals receipt written').toBeTruthy()
+    expect(receipt!.args).toContain('approved')
+    expect(receipt!.args).toContain('new evidence proves flaw in implementation')
+    expect(receipt!.args).toContain(MEMBER_ID)
+
+    const wakes = events.filter((e) => (e as { type?: string }).type === 'agent.wake')
+    expect(wakes.length, 'gate owner was not woken on review re-entry').toBeGreaterThan(0)
+  })
+
+  it('an org admin WITH a reason reverses a rejected task back to review', async () => {
+    const { env, updates } = makeEnv(
+      [task({ status: 'rejected', gate_owner: 'gate:athena' })],
+      {},
+      {},
+      { gateGrants: { 'gate:athena': ['agent-other'] } },
+    )
+    const res = await invokeTool(
+      ADMIN_AUTH(),
+      env,
+      'task_update',
+      {
+        task_id: 'task-1',
+        status: 'review',
+        reversal_reason: 'rejection was mistaken, tests were valid',
+      },
+      URL,
+    )
+    expect(res.ok, JSON.stringify(res)).toBe(true)
+    const result = res.result as { task: Task }
+    expect(result.task.status).toBe('review')
+
+    const receipt = updates.find((u) => u.sql.includes('verdict_reversals'))
+    expect(receipt).toBeTruthy()
+    expect(receipt!.args).toContain('rejected')
+  })
+
+  it('task_verdict_reverse tool reverses verdict to review with mandatory receipt', async () => {
+    const { env, updates } = makeEnv(
+      [task({ status: 'approved', gate_owner: 'gate:athena' })],
+      {},
+      {},
+      { gateGrants: { 'gate:athena': ['agent-other'] } },
+    )
+    const res = await invokeTool(
+      ADMIN_AUTH(),
+      env,
+      'task_verdict_reverse',
+      {
+        task_id: 'task-1',
+        reason: 'reversing approval to re-test',
+      },
+      URL,
+    )
+    expect(res.ok, JSON.stringify(res)).toBe(true)
+    const result = res.result as { task: Task }
+    expect(result.task.status).toBe('review')
+
+    const receipt = updates.find((u) => u.sql.includes('verdict_reversals'))
+    expect(receipt).toBeTruthy()
+  })
+
+  it('direct approved -> rejected or rejected -> approved status flip is still refused', async () => {
+    const { env, updates } = makeEnv([task({ status: 'approved', gate_owner: 'gate:athena' })])
+    const res = await invokeTool(
+      ADMIN_AUTH(),
+      env,
+      'task_update',
+      { task_id: 'task-1', status: 'rejected', reversal_reason: 'flipping status' },
+      URL,
+    )
+    expect(res.ok).toBe(false)
+    expect(res.error).toBe('invalid_status')
+    expect(updates).toHaveLength(0)
+  })
+
   it('BLOCK-2 fix: member cannot re-gate a gated open task to another lane (gate laundering blocked)', async () => {
     const { env, updates } = makeEnv([task({ status: 'open', gate_owner: 'gate:kasra-core' })])
     const res = await invokeTool(auth(), env, 'task_update', { task_id: 'task-1', gate_owner: 'gate:athena' }, URL)

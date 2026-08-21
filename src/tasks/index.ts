@@ -687,12 +687,46 @@ tasksApp.patch('/:id', async (c) => {
     }
     next.done_when = (body.done_when as string).trim()
   }
+  let reversesVerdict = false
+  let reversalReason = ''
   if (body.status !== undefined) {
     // PATCH may only set patchable statuses; approved|rejected require the verdict endpoint.
     if (!isPatchableStatus(body.status)) return c.json({ error: 'invalid_status' }, 400)
-    // Enforce the transition matrix.
-    const transitionErr = checkTransition(existing.status, body.status)
-    if (transitionErr) return c.json(transitionErr, 400)
+    
+    const isVerdictReversal =
+      (existing.status === 'approved' || existing.status === 'rejected') &&
+      body.status === 'review'
+
+    if (isVerdictReversal) {
+      // VERDICT REVERSAL PATH (P0 fix, mupot#1181)
+      reversalReason =
+        typeof body.reversal_reason === 'string'
+          ? body.reversal_reason.trim()
+          : typeof body.verdict_reversal_reason === 'string'
+            ? body.verdict_reversal_reason.trim()
+            : typeof body.reason === 'string'
+              ? body.reason.trim()
+              : ''
+      const auth = c.get('auth')
+      const isOwnerAdmin = legacyOwnerAdmin(auth)
+      if (!isOwnerAdmin) {
+        return c.json({
+          error: 'forbidden',
+          detail: 'verdict reversal on an approved/rejected task requires org owner/admin authority',
+        }, 403)
+      }
+      if (reversalReason.length === 0) {
+        return c.json({
+          error: 'verdict_reversal_reason_required',
+          detail: 'reversing a verdict on an approved/rejected task to review requires a non-empty reversal_reason',
+        }, 400)
+      }
+      reversesVerdict = true
+    } else {
+      // Enforce the transition matrix.
+      const transitionErr = checkTransition(existing.status, body.status)
+      if (transitionErr) return c.json(transitionErr, 400)
+    }
     // gate_owner may be set in this same PATCH (existing.status is pre-review,
     // so the gate isn't locked yet), so evaluate the EFFECTIVE value after
     // applying body.gate_owner — used by both the review-entry guard below and
@@ -868,7 +902,7 @@ tasksApp.patch('/:id', async (c) => {
       typeof body.gate_owner === 'string' &&
       body.gate_owner.trim().length > 0 &&
       legacyOwnerAdmin(c.get('auth'))
-    if (lockStatuses.has(existing.status) && !repairsHistoricalUngatedReview) {
+    if (lockStatuses.has(existing.status) && !repairsHistoricalUngatedReview && !reversesVerdict) {
       return c.json({ error: 'gate_owner_locked', status: existing.status }, 409)
     }
     // BLOCK-2 fix (kasra-review 2026-08-13, proof-of-exploit): once set,
@@ -968,6 +1002,29 @@ tasksApp.patch('/:id', async (c) => {
       next,
       auth.memberId ? { kind: 'member', id: auth.memberId } : undefined,
     )
+
+    if (reversesVerdict) {
+      const actorId = auth.memberId || auth.agentId || 'unknown'
+      const actorType = auth.agentId ? 'agent' : 'member'
+      await c.env.DB.prepare(
+        `INSERT INTO verdict_reversals
+           (id, tenant, task_id, squad_id, from_status, to_status, prior_verdict, reason,
+            actor_id, actor_type)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'review', ?6, ?7, ?8, ?9)`,
+      )
+        .bind(
+          crypto.randomUUID(),
+          c.env.TENANT_SLUG,
+          next.id,
+          next.squad_id,
+          existing.status,
+          existing.status,
+          reversalReason,
+          actorId,
+          actorType,
+        )
+        .run()
+    }
   }
 
   return c.json({ task: next })
