@@ -645,6 +645,9 @@ interface UpdateTaskBody {
   assignee_agent_id?: unknown
   gate_owner?: unknown
   project_id?: unknown
+  reversal_reason?: unknown
+  verdict_reversal_reason?: unknown
+  reason?: unknown
 }
 
 tasksApp.patch('/:id', async (c) => {
@@ -1004,8 +1007,8 @@ tasksApp.patch('/:id', async (c) => {
     )
 
     if (reversesVerdict) {
-      const actorId = auth.memberId || auth.agentId || 'unknown'
-      const actorType = auth.agentId ? 'agent' : 'member'
+      const actorId = auth.memberId || auth.boundAgentId || 'unknown'
+      const actorType = auth.boundAgentId ? 'agent' : 'member'
       await c.env.DB.prepare(
         `INSERT INTO verdict_reversals
            (id, tenant, task_id, squad_id, from_status, to_status, prior_verdict, reason,

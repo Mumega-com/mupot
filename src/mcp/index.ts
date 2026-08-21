@@ -98,6 +98,12 @@ import {
   MAX_DELIVERY_ATTEMPTS, DEFAULT_LEASE_SECONDS, MAX_LEASE_SECONDS,
 } from '../agents/messages'
 import { recordCheckin, sqliteUtcToMs } from '../fleet/presence'
+import {
+  readFleetAgentRow,
+  getFleetAgentLiveness,
+  derivePresence,
+  presenceTtlSec,
+} from '../fleet/registry'
 import { agentKeyFingerprint, loadActiveAgentKey } from '../fleet/agent-keys'
 import { PROVISION_TOOLS } from './provision'
 import { BOOTSTRAP_TOOLS } from './bootstrap'
@@ -1744,7 +1750,7 @@ const toolTaskVerdictReverse: ToolSpec = {
     required: ['task_id'],
     additionalProperties: false,
   },
-  async run(auth, env, args) {
+  async run(auth, env, args, ctx) {
     const taskRef = str(args.task_id)
     if (!taskRef) return fail(400, 'invalid_args', 'task_id required')
     const reason = str(args.reversal_reason) || str(args.reason)
@@ -1757,7 +1763,7 @@ const toolTaskVerdictReverse: ToolSpec = {
       reversal_reason: reason.trim(),
       gate_owner: args.gate_owner,
       gate_owner_reason: args.gate_owner_reason,
-    })
+    }, ctx)
   },
 }
 
@@ -3587,6 +3593,62 @@ const toolStatus: ToolSpec = {
   },
 }
 
+// fleet_agent_get — read an agent's fleet runtime and presence status.
+// Closes mupot#1184: the routing predicate (fleet_agents.runtime & derived presence)
+// previously had no agent-reachable read surface.
+const toolFleetAgentGet: ToolSpec = {
+  name: 'fleet_agent_get',
+  scope: 'agent fleet runtime & presence (read-only)',
+  min: 'authenticated',
+  args: '{ agent_id?: string }',
+  inputSchema: {
+    type: 'object',
+    properties: { agent_id: STRING_SCHEMA },
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const targetRef = str(args.agent_id) || auth.boundAgentId
+    if (!targetRef) return fail(400, 'invalid_args', 'agent_id required when caller is not agent-bound')
+
+    const resolved = await resolveAgentRef(env, targetRef)
+    if (!resolved.ok) {
+      return resolved.reason === 'ambiguous'
+        ? fail(409, 'ambiguous_slug', 'slug matches multiple agents — use the id instead')
+        : fail(404, 'agent_not_found')
+    }
+    const targetAgent = resolved.value
+
+    const grants = auth.capabilities ?? []
+    const claimGrants = auth.latentCapabilities ?? grants
+    const isSelf = auth.boundAgentId === targetAgent.id
+    const orgAdmin = hasCapability(claimGrants, 'org', null, 'admin')
+    const onSquad = await memberCanOnSquad(env, claimGrants, targetAgent.squad_id, 'observer')
+
+    if (!isSelf && !orgAdmin && !onSquad) {
+      return fail(403, 'forbidden', { need: 'observer', scope: 'squad' })
+    }
+
+    const routeInfo = await getFleetAgentLiveness(env, targetAgent.id)
+    const row = await readFleetAgentRow(env, targetAgent.id)
+    const ttlSec = presenceTtlSec(env)
+    const status = String(row?.status ?? 'unknown')
+    const lastReportedAt = String(row?.last_reported_at ?? '')
+    const derivedPresence = derivePresence(status, lastReportedAt, ttlSec, Date.now())
+
+    return done({
+      agent_id: targetAgent.id,
+      agent_slug: targetAgent.slug,
+      squad_id: targetAgent.squad_id,
+      runtime: routeInfo.runtime,
+      status: row?.status ?? null,
+      last_reported_at: row?.last_reported_at ?? null,
+      presence_ttl_sec: ttlSec,
+      derived_presence: derivedPresence,
+      live: routeInfo.live,
+    })
+  },
+}
+
 // boot_context — first-call coherence signal for any connecting principal.
 //
 // Problem (#126): boot_context must tell a first-run agent whether it has a claimed
@@ -3989,6 +4051,7 @@ export const TOOLS: ToolSpec[] = [
   toolPeers,
   toolCheckIn,
   toolStatus,
+  toolFleetAgentGet,
   toolBootContext,
   toolOrient,
   toolConnect,

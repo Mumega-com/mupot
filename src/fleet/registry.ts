@@ -123,7 +123,7 @@ export function derivePresence(
   status: string,
   lastReportedAt: string,
   ttlSec: number,
-  nowMs: number,
+  nowMs = Date.now(),
 ): Presence {
   if (status === 'stopped') return 'offline'
   if (!lastReportedAt) return 'stale'
@@ -296,7 +296,7 @@ export async function reportFleetAgents(env: Env, reportedBy: string, agents: un
 //      same effect as scoping the slug match to the agent's own squad — agents.slug's actual
 //      invariant is UNIQUE(squad_id, slug), so "unique tenant-wide" is the necessary and
 //      sufficient condition for a bare slug to unambiguously identify one specific agent.
-async function readFleetAgentRow(
+export async function readFleetAgentRow(
   env: Env,
   agentId: string,
 ): Promise<{ agent_id: string; runtime: string | null; status: string | null; last_reported_at: string | null } | null> {
