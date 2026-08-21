@@ -529,13 +529,21 @@ export async function listFlightProjectMismatchTaskIds(
 ): Promise<string[]> {
   if (projectId === null || taskIds.length === 0) return []
   const byId = new Map<string, string | null>()
+  const queries = []
   for (let offset = 0; offset < taskIds.length; offset += D1_TASK_ID_QUERY_CHUNK_SIZE) {
     const chunk = taskIds.slice(offset, offset + D1_TASK_ID_QUERY_CHUNK_SIZE)
     const placeholders = chunk.map(() => '?').join(',')
-    const rows = await env.DB.prepare(
-      `SELECT id, project_id FROM tasks WHERE id IN (${placeholders})`,
-    ).bind(...chunk).all<{ id: string; project_id: string | null }>()
-    for (const task of rows.results ?? []) byId.set(task.id, task.project_id)
+    queries.push(
+      env.DB.prepare(`SELECT id, project_id FROM tasks WHERE id IN (${placeholders})`).bind(...chunk)
+    )
+  }
+  if (queries.length > 0) {
+    const batchResults = await env.DB.batch<{ id: string; project_id: string | null }>(queries)
+    for (const rows of batchResults) {
+      for (const task of rows.results ?? []) {
+        byId.set(task.id, task.project_id)
+      }
+    }
   }
   return taskIds.filter((taskId) => byId.has(taskId) && byId.get(taskId) !== projectId)
 }
