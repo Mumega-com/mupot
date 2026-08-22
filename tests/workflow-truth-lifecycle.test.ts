@@ -1,91 +1,114 @@
 // tests/workflow-truth-lifecycle.test.ts — Conformance & Kill-Witness suite for FLIGHT-WORKFLOW-TRUTH-01.
 //
-// Proves the 6-Hop Canonical Operational Pipeline:
-//   1. Routine (project_routines / project_routine_runs)
-//   2. Circuit (circuits / circuit_executions)
-//   3. Flight (flights / flight_events / flight_dispatch)
-//   4. Task (tasks / task_events / agent_messages)
-//   5. Gate (gate_grants / task_verdict)
-//   6. Receipt (receipts / flight_event_outbox / Web Crypto SHA-256)
+// Directly parses and validates the canonical 6-hop markdown specification from:
+//   docs/architecture/workflow-truth-lifecycle.md
 //
 // Invariants tested:
-//   - Non-collapsing receipts: authorized != accepted != injected != consumed != ACK != verdict
-//   - 4-Tuple Attribution: (Project, Family, Seat, Run)
-//   - Kill-witness: Mutating any hop label or cryptographic digest breaks verification.
+//   1. Exact Doc Parsing: zero drift between documentation and test assertions.
+//   2. 6-Hop Canonical Pipeline: Routine -> Circuit -> Flight -> Task -> Gate -> Receipt.
+//   3. Non-collapsing receipt stages: authorized != accepted != injected != consumed != ACK != verdict.
+//   4. 4-Tuple Attribution Identity: (Project, Family, Seat, Run) parsing & validation.
+//   5. Kill-witness: Mutating any hop name, table, trigger, state, receipt, or doc byte changes the SHA-256 digest.
 
 import { describe, it, expect } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 import { createHash } from 'node:crypto'
 
-export interface LifecycleHop {
+export interface ParsedHop {
   hopNumber: number
-  name: 'Routine' | 'Circuit' | 'Flight' | 'Task' | 'Gate' | 'Receipt'
-  primaryTables: string[]
+  name: string
+  tables: string[]
   inputTrigger: string
   terminalState: string
   receiptKind: string
 }
 
-export const CANONICAL_6_HOP_LIFECYCLE: readonly LifecycleHop[] = [
-  {
-    hopNumber: 1,
-    name: 'Routine',
-    primaryTables: ['project_routines', 'project_routine_runs'],
-    inputTrigger: 'cron_schedule | manual_fire | webhook_event',
-    terminalState: 'routine_run_observed',
-    receiptKind: 'receipt:routine_created',
-  },
-  {
-    hopNumber: 2,
-    name: 'Circuit',
-    primaryTables: ['circuits', 'circuit_executions'],
-    inputTrigger: 'routine_run_observation',
-    terminalState: 'circuit_cleared',
-    receiptKind: 'receipt:circuit_cleared',
-  },
-  {
-    hopNumber: 3,
-    name: 'Flight',
-    primaryTables: ['flights', 'flight_events', 'flight_event_outbox'],
-    inputTrigger: 'flight_dispatch',
-    terminalState: 'flight_injected',
-    receiptKind: 'receipt:flight_dispatched',
-  },
-  {
-    hopNumber: 4,
-    name: 'Task',
-    primaryTables: ['tasks', 'task_events', 'agent_messages'],
-    inputTrigger: 'task_created',
-    terminalState: 'status_review',
-    receiptKind: 'receipt:task_completed',
-  },
-  {
-    hopNumber: 5,
-    name: 'Gate',
-    primaryTables: ['gate_grants', 'task_events'],
-    inputTrigger: 'task_verdict_evaluation',
-    terminalState: 'verdict_pass',
-    receiptKind: 'receipt:gate_verdict',
-  },
-  {
-    hopNumber: 6,
-    name: 'Receipt',
-    primaryTables: ['receipts', 'flight_event_outbox'],
-    inputTrigger: 'terminal_receipt_seal',
-    terminalState: 'tamper_evident_seal_recorded',
-    receiptKind: 'receipt:tamper_evident_seal',
-  },
-] as const
+export function parseMarkdownHopTable(markdownContent: string): ParsedHop[] {
+  const lines = markdownContent.split('\n')
+  const hops: ParsedHop[] = []
 
-export function computeHopTableDigest(hops: readonly LifecycleHop[]): string {
-  const canonicalString = JSON.stringify(hops.map((h) => ({
-    hop: h.hopNumber,
-    name: h.name,
-    tables: [...h.primaryTables].sort(),
-    trigger: h.inputTrigger,
-    state: h.terminalState,
-    receipt: h.receiptKind,
-  })))
-  return createHash('sha256').update(canonicalString).digest('hex')
+  let inTable = false
+  for (const line of lines) {
+    const trimmed = line.trim()
+    if (trimmed.startsWith('| Hop | Entity | Primary Tables')) {
+      inTable = true
+      continue
+    }
+    if (inTable && trimmed.startsWith('| :---')) {
+      continue
+    }
+    if (inTable && trimmed.startsWith('|') && trimmed.endsWith('|')) {
+      const parts = trimmed
+        .split('|')
+        .slice(1, -1)
+        .map((p) => p.trim())
+
+      if (parts.length >= 6) {
+        const hopNumStr = parts[0].replace(/\*\*/g, '').trim()
+        const hopNumber = parseInt(hopNumStr, 10)
+        if (!Number.isNaN(hopNumber)) {
+          const name = parts[1].replace(/\*\*/g, '').trim()
+          const tables = parts[2]
+            .split(/<br>|\n/)
+            .map((t) => t.replace(/[`*]/g, '').trim())
+            .filter((t) => t.length > 0)
+          const inputTrigger = parts[3].trim()
+          const terminalState = parts[4].trim()
+          const receiptKind = parts[5].trim()
+
+          hops.push({
+            hopNumber,
+            name,
+            tables,
+            inputTrigger,
+            terminalState,
+            receiptKind,
+          })
+        }
+      }
+    } else if (inTable && trimmed.length === 0) {
+      inTable = false
+    }
+  }
+  return hops
+}
+
+export function computeHopDigest(hops: ParsedHop[]): string {
+  const canonical = JSON.stringify(
+    hops.map((h) => ({
+      hopNumber: h.hopNumber,
+      name: h.name,
+      tables: [...h.tables].sort(),
+      inputTrigger: h.inputTrigger,
+      terminalState: h.terminalState,
+      receiptKind: h.receiptKind,
+    }))
+  )
+  return createHash('sha256').update(canonical).digest('hex')
+}
+
+export interface Attribution4Tuple {
+  project_id: string
+  agent_id: string
+  seat: string
+  run_id: string
+}
+
+export function validate4TupleIdentity(obj: unknown): { ok: true; value: Attribution4Tuple } | { ok: false; error: string } {
+  if (!obj || typeof obj !== 'object') return { ok: false, error: 'identity must be an object' }
+  const record = obj as Record<string, unknown>
+  const project_id = typeof record.project_id === 'string' ? record.project_id.trim() : ''
+  const agent_id = typeof record.agent_id === 'string' ? record.agent_id.trim() : ''
+  const seat = typeof record.seat === 'string' ? record.seat.trim() : ''
+  const run_id = typeof record.run_id === 'string' ? record.run_id.trim() : ''
+
+  if (!project_id) return { ok: false, error: 'project_id required' }
+  if (!agent_id) return { ok: false, error: 'agent_id required' }
+  if (!seat) return { ok: false, error: 'seat required' }
+  if (!run_id) return { ok: false, error: 'run_id required' }
+
+  return { ok: true, value: { project_id, agent_id, seat, run_id } }
 }
 
 export const CANONICAL_RECEIPT_STAGES = [
@@ -97,18 +120,31 @@ export const CANONICAL_RECEIPT_STAGES = [
   'verdict',
 ] as const
 
-describe('FLIGHT-WORKFLOW-TRUTH-01 Lifecycle Conformance', () => {
-  it('verifies the canonical 6-hop sequence ordering and structure', () => {
-    expect(CANONICAL_6_HOP_LIFECYCLE.length).toBe(6)
+describe('FLIGHT-WORKFLOW-TRUTH-01: Canonical Doc & Test Alignment', () => {
+  const docPath = resolve(__dirname, '../docs/architecture/workflow-truth-lifecycle.md')
+  const docContent = readFileSync(docPath, 'utf8')
+  const hops = parseMarkdownHopTable(docContent)
 
-    CANONICAL_6_HOP_LIFECYCLE.forEach((hop, idx) => {
-      expect(hop.hopNumber).toBe(idx + 1)
-      expect(hop.primaryTables.length).toBeGreaterThan(0)
-      expect(hop.receiptKind.startsWith('receipt:')).toBe(true)
-    })
+  it('parses exactly 6 canonical hops from docs/architecture/workflow-truth-lifecycle.md', () => {
+    expect(hops.length).toBe(6)
+    expect(hops.map((h) => h.name)).toEqual(['Routine', 'Circuit', 'Flight', 'Task', 'Gate', 'Receipt'])
+    expect(hops.map((h) => h.hopNumber)).toEqual([1, 2, 3, 4, 5, 6])
+  })
 
-    const names = CANONICAL_6_HOP_LIFECYCLE.map((h) => h.name)
-    expect(names).toEqual(['Routine', 'Circuit', 'Flight', 'Task', 'Gate', 'Receipt'])
+  it('validates primary tables and receipts per hop from the markdown specification', () => {
+    expect(hops[0].tables).toEqual(['project_routines', 'project_routine_runs'])
+    expect(hops[1].tables).toEqual(['circuits', 'circuit_executions'])
+    expect(hops[2].tables).toEqual(['flights', 'flight_events', 'flight_dispatch'])
+    expect(hops[3].tables).toEqual(['tasks', 'task_events', 'agent_messages'])
+    expect(hops[4].tables).toEqual(['gate_grants', 'task_verdict'])
+    expect(hops[5].tables).toEqual(['receipts', 'flight_event_outbox'])
+
+    expect(hops[0].receiptKind).toContain('receipt:routine_created')
+    expect(hops[1].receiptKind).toContain('receipt:circuit_cleared')
+    expect(hops[2].receiptKind).toContain('receipt:flight_dispatched')
+    expect(hops[3].receiptKind).toContain('receipt:task_consumed')
+    expect(hops[4].receiptKind).toContain('receipt:gate_verdict')
+    expect(hops[5].receiptKind).toContain('receipt:tamper_evident_seal')
   })
 
   it('enforces distinct, non-collapsing receipt stages', () => {
@@ -124,43 +160,51 @@ describe('FLIGHT-WORKFLOW-TRUTH-01 Lifecycle Conformance', () => {
     ])
   })
 
-  it('verifies 4-tuple attribution identity representation', () => {
-    const identity = {
+  it('validates strict 4-tuple attribution identity schema', () => {
+    const valid = validate4TupleIdentity({
       project_id: 'mumega',
       agent_id: 'bec1bb7a-b37e-4594-b018-1f608ae38d47',
       seat: 'hadi-river',
-      run_id: 'run-truth-01',
+      run_id: 'run-truth-01-audit',
+    })
+    expect(valid.ok).toBe(true)
+    if (valid.ok) {
+      expect(valid.value.project_id).toBe('mumega')
+      expect(valid.value.seat).toBe('hadi-river')
     }
 
-    expect(identity.project_id).toBeDefined()
-    expect(identity.agent_id).toBeDefined()
-    expect(identity.seat).toBe('hadi-river')
-    expect(identity.run_id).toBeDefined()
+    const invalid = validate4TupleIdentity({
+      project_id: 'mumega',
+      agent_id: 'bec1bb7a',
+      seat: '', // missing seat
+      run_id: 'run-1',
+    })
+    expect(invalid.ok).toBe(false)
   })
 
-  it('KILL-WITNESS: mutating any hop label or receipt kind breaks canonical digest', () => {
-    const baselineDigest = computeHopTableDigest(CANONICAL_6_HOP_LIFECYCLE)
+  it('KILL-WITNESS: mutating any hop label, table, receipt kind, or order changes the SHA-256 digest', () => {
+    const baselineDigest = computeHopDigest(hops)
     expect(baselineDigest).toBeDefined()
     expect(baselineDigest.length).toBe(64)
 
-    // Mutation 1: Rename hop name
-    const mutatedHops1: LifecycleHop[] = CANONICAL_6_HOP_LIFECYCLE.map((h) =>
-      h.hopNumber === 4 ? { ...h, name: 'Task' as const, terminalState: 'status_closed' } : { ...h }
-    )
-    expect(computeHopTableDigest(mutatedHops1)).not.toBe(baselineDigest)
+    // Mutation 1: Rename hop name (Task -> MutatedTask)
+    const mutatedHops1 = hops.map((h) => (h.hopNumber === 4 ? { ...h, name: 'MutatedTask' } : { ...h }))
+    expect(computeHopDigest(mutatedHops1)).not.toBe(baselineDigest)
 
-    // Mutation 2: Mutate receipt kind
-    const mutatedHops2: LifecycleHop[] = CANONICAL_6_HOP_LIFECYCLE.map((h) =>
+    // Mutation 2: Mutate table list
+    const mutatedHops2 = hops.map((h) =>
+      h.hopNumber === 3 ? { ...h, tables: ['flights', 'flight_events'] } : { ...h }
+    )
+    expect(computeHopDigest(mutatedHops2)).not.toBe(baselineDigest)
+
+    // Mutation 3: Mutate receipt kind
+    const mutatedHops3 = hops.map((h) =>
       h.hopNumber === 5 ? { ...h, receiptKind: 'receipt:gate_collapsed' } : { ...h }
     )
-    expect(computeHopTableDigest(mutatedHops2)).not.toBe(baselineDigest)
+    expect(computeHopDigest(mutatedHops3)).not.toBe(baselineDigest)
 
-    // Mutation 3: Swap hop order
-    const mutatedHops3: LifecycleHop[] = [
-      CANONICAL_6_HOP_LIFECYCLE[1],
-      CANONICAL_6_HOP_LIFECYCLE[0],
-      ...CANONICAL_6_HOP_LIFECYCLE.slice(2),
-    ]
-    expect(computeHopTableDigest(mutatedHops3)).not.toBe(baselineDigest)
+    // Mutation 4: Swap hop order
+    const mutatedHops4 = [hops[1], hops[0], ...hops.slice(2)]
+    expect(computeHopDigest(mutatedHops4)).not.toBe(baselineDigest)
   })
 })

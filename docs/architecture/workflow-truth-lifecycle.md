@@ -29,11 +29,11 @@ Prior to this specification, attribution gaps existed between agent families, ha
 
 | Hop | Entity | Primary Tables / Seams | Trigger / Input | Terminal State / Output | Invariant Receipt |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **1** | **Routine** | `project_routines`<br>`project_routine_runs` | `cron` schedule, `event` webhook, or `manual` fire | `routine_run_id`<br>`mode: "propose" \| "autonomous"` | `receipt:routine_created`<br>`receipt:routine_enabled` |
+| **1** | **Routine** | `project_routines`<br>`project_routine_runs` | `cron` schedule, `event` webhook, or `manual` fire | `routine_run_id`<br>`mode: propose / autonomous` | `receipt:routine_created`<br>`receipt:routine_enabled` |
 | **2** | **Circuit** | `circuits`<br>`circuit_executions` | Routine run observation & budget check | Pre-flight circuit clearance | `receipt:circuit_cleared` |
 | **3** | **Flight** | `flights`<br>`flight_events`<br>`flight_dispatch` | Goal, `done_when` array, budget cap, squad target | Flight dispatch envelope<br>`flight_id` | `receipt:flight_dispatched`<br>`receipt:flight_injected` |
-| **4** | **Task** | `tasks`<br>`task_events`<br>`agent_messages` | Atomic D1 task creation (`open` $\to$ `in_progress`) | Task result artifacts<br>`status: "review"` | `receipt:task_consumed`<br>`receipt:task_completed` |
-| **5** | **Gate** | `gate_grants`<br>`task_verdict` | Review payload, git head SHA, test evidence | Independent verdict:<br>`PASS` \| `HOLD` \| `BLOCK` | `receipt:gate_verdict` |
+| **4** | **Task** | `tasks`<br>`task_events`<br>`agent_messages` | Atomic D1 task creation (`open` $\to$ `in_progress`) | Task result artifacts<br>`status: review` | `receipt:task_consumed`<br>`receipt:task_completed` |
+| **5** | **Gate** | `gate_grants`<br>`task_verdict` | Review payload, git head SHA, test evidence | Independent verdict: `PASS` / `HOLD` / `BLOCK` | `receipt:gate_verdict` |
 | **6** | **Receipt** | `receipts`<br>`flight_event_outbox` | Canonical payload digest | Web Crypto SHA-256 seal<br>`receipt_id` | `receipt:tamper_evident_seal` |
 
 ---
