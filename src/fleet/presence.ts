@@ -83,23 +83,7 @@ export async function touchPresence(
   opts: { source?: unknown; label?: unknown } = {},
 ): Promise<boolean> {
   const source = normalizeSource(opts.source)
-  let label = typeof opts.label === 'string' ? opts.label.slice(0, 120) : ''
-
-  // If label is not explicitly provided, reuse the active seat label for this member
-  if (!label && env.DB) {
-    try {
-      const existing = await env.DB.prepare(
-        `SELECT label, source FROM presence WHERE tenant = ?1 AND member_id = ?2 ORDER BY last_seen_at DESC, rowid DESC LIMIT 1`,
-      )
-        .bind(env.TENANT_SLUG, id.memberId)
-        .first<{ label: string; source: string }>()
-      if (existing?.label) {
-        label = existing.label
-      }
-    } catch {
-      // Fail-soft: mock DB or schema variance
-    }
-  }
+  const label = typeof opts.label === 'string' ? opts.label.slice(0, 120) : ''
 
   const dkey = label
     ? `presence:touch:${env.TENANT_SLUG}:${id.memberId}:${label}`

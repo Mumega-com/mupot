@@ -3729,12 +3729,17 @@ const toolBootContext: ToolSpec = {
   },
   async run(auth, env, args, ctx) {
     if (auth.memberId) {
-      loadMemberIdentity(env, auth).then((id) => {
+      const seatLabel = (str(args.seat) || str(args.label) || ctx?.seat || '').trim()
+      const bootTouch = (async () => {
+        const id = await loadMemberIdentity(env, auth)
         if (id) {
-          const seatLabel = (str(args.seat) || str(args.label) || '').trim()
-          touchPresence(env, id, { source: args.source, label: seatLabel }).catch(() => {})
+          await touchPresence(env, id, { source: args.source ?? ctx?.source, label: seatLabel })
         }
-      }).catch(() => {})
+      })().catch(() => {})
+
+      if (ctx?.waitUntil) {
+        ctx.waitUntil(bootTouch)
+      }
     }
 
     // identity_status: derived from whether this token has an agent-identity binding.
@@ -4233,13 +4238,23 @@ function validateArgs(schema: JsonSchema, args: Record<string, unknown>): string
   return null
 }
 
+export interface ToolContext {
+  origin?: string
+  waitUntil?: (promise: Promise<unknown>) => void
+  seat?: string
+  source?: string
+}
+
 export async function invokeTool(
   auth: AuthContext,
   env: Env,
   toolName: unknown,
   argsValue: unknown,
-  origin: string,
+  originOrCtx: string | ToolContext = '',
 ): Promise<ToolOutcome & { tool?: string }> {
+  const ctx: ToolContext = typeof originOrCtx === 'string' ? { origin: originOrCtx } : (originOrCtx ?? {})
+  const origin = ctx.origin ?? ''
+
   if (typeof toolName !== 'string' || toolName.length === 0) {
     return { ...fail(400, 'invalid_request', 'tool required'), tool: undefined }
   }
@@ -4276,7 +4291,7 @@ export async function invokeTool(
   // return a generic internal_error — never echo an arbitrary throw (leak guard).
   let outcome: ToolOutcome
   try {
-    outcome = await spec.run(auth, env, args, { origin })
+    outcome = await spec.run(auth, env, args, ctx)
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     if (msg.startsWith('receipt_failed')) {
@@ -4285,18 +4300,41 @@ export async function invokeTool(
     return { ...fail(500, 'internal_error'), tool: spec.name }
   }
 
-  if (outcome.ok && auth.memberId && spec.name !== 'check_in') {
+  if (outcome.ok && auth.memberId && spec.name !== 'check_in' && spec.name !== 'boot_context') {
     // Zero-Touch Living Presence: automatically bump presence for active tool callers.
-    loadMemberIdentity(env, auth)
-      .then((id) => {
-        if (id) {
-          touchPresence(env, id).catch(() => {})
+    const touchPromise = (async () => {
+      const id = await loadMemberIdentity(env, auth)
+      if (id) {
+        let seat = ctx.seat
+        if (!seat && auth.tokenId && env.DB) {
+          try {
+            const tokRow = await env.DB.prepare(
+              `SELECT label FROM member_tokens WHERE id = ?1 AND tenant = ?2`,
+            ).bind(auth.tokenId, env.TENANT_SLUG).first<{ label: string | null }>()
+            if (tokRow?.label) seat = tokRow.label
+          } catch {
+            // Fail-soft
+          }
         }
-      })
-      .catch(() => {})
+        await touchPresence(env, id, { source: ctx.source, label: seat })
+      }
+    })().catch(() => {})
+
+    if (ctx.waitUntil) {
+      ctx.waitUntil(touchPromise)
+    }
   }
 
   return { ...outcome, tool: spec.name }
+}
+
+function safeWaitUntil(c: import('hono').Context<AppEnv>): ((p: Promise<unknown>) => void) | undefined {
+  try {
+    const ctx = c.executionCtx
+    return ctx ? (p: Promise<unknown>) => ctx.waitUntil(p) : undefined
+  } catch {
+    return undefined
+  }
 }
 
 async function handleJsonRpc(c: import('hono').Context<AppEnv>, body: JsonRpcRequest): Promise<Response> {
@@ -4327,7 +4365,13 @@ async function handleJsonRpc(c: import('hono').Context<AppEnv>, body: JsonRpcReq
     }
 
     const params = typeof body.params === 'object' && body.params !== null ? body.params as Record<string, unknown> : {}
-    const outcome = await invokeTool(auth, c.env, params.name, params.arguments, new URL(c.req.url).origin)
+    const ctx: ToolContext = {
+      origin: new URL(c.req.url).origin,
+      waitUntil: safeWaitUntil(c),
+      seat: c.req.header('x-mupot-seat'),
+      source: c.req.header('x-mupot-source'),
+    }
+    const outcome = await invokeTool(auth, c.env, params.name, params.arguments, ctx)
     if (outcome.ok) return rpcResult(id, mcpCallResult(outcome.tool as string, outcome.result))
 
     return rpcError(
@@ -4392,7 +4436,13 @@ mcpApp.post('/', async (c) => {
     return c.json({ error: 'forbidden', reason: 'tenant_scope' }, 403)
   }
 
-  const outcome = await invokeTool(auth, c.env, body.tool, body.args, new URL(c.req.url).origin)
+  const ctx: ToolContext = {
+    origin: new URL(c.req.url).origin,
+    waitUntil: safeWaitUntil(c),
+    seat: c.req.header('x-mupot-seat'),
+    source: c.req.header('x-mupot-source'),
+  }
+  const outcome = await invokeTool(auth, c.env, body.tool, body.args, ctx)
 
   if (outcome.ok) {
     return c.json({ ok: true, tool: outcome.tool, result: outcome.result })
@@ -4487,7 +4537,13 @@ mcpActionsApp.post('/actions/:tool', async (c) => {
     return c.json({ error: 'invalid_json' }, 400)
   }
 
-  const outcome = await invokeTool(auth, c.env, c.req.param('tool'), args, new URL(c.req.url).origin)
+  const ctx: ToolContext = {
+    origin: new URL(c.req.url).origin,
+    waitUntil: safeWaitUntil(c),
+    seat: c.req.header('x-mupot-seat'),
+    source: c.req.header('x-mupot-source'),
+  }
+  const outcome = await invokeTool(auth, c.env, c.req.param('tool'), args, ctx)
   if (outcome.ok) return c.json({ ok: true, tool: outcome.tool, result: outcome.result })
   return c.json({ ok: false, tool: outcome.tool, error: outcome.error, detail: outcome.detail }, outcome.status)
 })
