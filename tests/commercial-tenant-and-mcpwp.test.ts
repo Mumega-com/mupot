@@ -1,11 +1,32 @@
 // tests/commercial-tenant-and-mcpwp.test.ts — Unit and real schema tests for commercialization engine.
 
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, beforeAll, afterAll } from 'vitest'
+import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 import { planClientTenant, deriveClientSlug } from '../src/reseller/client-tenant'
 import { formatClientIntakeTask } from '../src/tasks/client-intake-template'
 import { formatStripeMeteringReceipt } from '../src/billing/metering-receipt'
+import { createTask } from '../src/tasks/service'
+import type { Env } from '../src/types'
 
-describe('Commercial Client Tenant Stand-Up Planner', () => {
+describe('Commercialization Engine & Real SQLite D1 Verification', () => {
+  let harness: SqliteD1Harness
+  let env: Env
+
+  beforeAll(async () => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    env = {
+      TENANT_SLUG: 'mumega',
+      DB: harness.db,
+    } as unknown as Env
+  })
+
+  afterAll(() => {
+    harness.close()
+  })
+
+  describe('Commercial Client Tenant Stand-Up Planner', () => {
   it('derives clean client slugs', () => {
     expect(deriveClientSlug('Viamar Logistics')).toBe('viamar-logistics')
     expect(deriveClientSlug('https://DentalNearYou.ca/')).toBe('dentalnearyou-ca')
@@ -117,5 +138,50 @@ describe('Stripe Execution Metering & Receipts', () => {
     expect(receipt.billedAmountFormatted).toBe('$0.50')
     expect(receipt.tokenUsageSummary).toContain('26,200 tokens')
     expect(receipt.lineItemDescription).toContain('[Mumega Autonomous Service] MCPWP-SEO')
+    expect(receipt.payloadSha256).toBeDefined()
+    expect(receipt.payloadSha256.length).toBe(64)
   })
+
+  it('proves client intake task creates real D1 task record', async () => {
+    // Seed department & squad
+    harness.sqlite.exec(`
+      INSERT INTO departments (id, slug, name, created_at) VALUES ('dept-viamar', 'viamar-dept', 'Viamar Logistics Dept', datetime('now'));
+      INSERT INTO squads (id, department_id, slug, name, created_at) VALUES ('squad-viamar-mcpwp', 'dept-viamar', 'viamar-mcpwp', 'Viamar WordPress Squad', datetime('now'));
+      INSERT INTO members (id, tenant, display_name, email, status, created_at) VALUES ('m-grok-seo', 'mumega', 'Grok SEO Lead', NULL, 'active', datetime('now'));
+    `)
+
+    const intake = formatClientIntakeTask({
+      clientSlug: 'viamar',
+      servicePackage: 'mcpwp-seo',
+      title: 'Optimize Freight Landing Page Meta',
+      description: 'Audit and update Yoast SEO titles and meta descriptions for Toronto commercial queries.',
+      targetUrl: 'https://viamar.ca/freight',
+      targetKeywords: ['toronto freight forwarder', 'ontario logistics'],
+      priority: 'P0',
+    })
+
+    const task = await createTask(
+      env,
+      {
+        squad_id: 'squad-viamar-mcpwp',
+        title: intake.title,
+        body: intake.body,
+        done_when: intake.doneWhen,
+        priority: intake.priority,
+      },
+      { actor: { kind: 'member', id: 'm-grok-seo' }, externalSource: intake.externalSource },
+    )
+
+    expect(task.id).toBeDefined()
+    expect(task.status).toBe('open')
+    expect(task.title).toContain('[MCPWP-SEO]')
+    expect(task.done_when).toContain('wp_get_posts/wp_get_pages')
+
+    // Read direct from SQLite to verify D1 persistence
+    const saved = harness.sqlite.prepare(`SELECT title, status, external_source FROM tasks WHERE id = ?`).get(task.id) as { title: string; status: string; external_source: string }
+    expect(saved.title).toBe(task.title)
+    expect(saved.status).toBe('open')
+    expect(saved.external_source).toBe('intake:mcpwp-seo:viamar')
+  })
+})
 })
