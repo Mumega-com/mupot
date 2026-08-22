@@ -3528,10 +3528,9 @@ const toolCheckIn: ToolSpec = {
     const id = await loadMemberIdentity(env, auth)
     if (!id) return fail(403, 'not_member_bound', 'check_in requires a member-token principal')
 
-    const explicitSeat = (str(args.seat) || str(args.name) || '').trim()
-    const seatLabel = explicitSeat || (str(args.label) || '').trim()
-    const dkey = explicitSeat
-      ? `checkin:${env.TENANT_SLUG}:${id.memberId}:${explicitSeat}`
+    const seatLabel = (str(args.seat) || str(args.name) || str(args.label) || '').trim()
+    const dkey = seatLabel
+      ? `checkin:${env.TENANT_SLUG}:${id.memberId}:${seatLabel}`
       : `checkin:${env.TENANT_SLUG}:${id.memberId}`
 
     try {

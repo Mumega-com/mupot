@@ -1,6 +1,7 @@
 // tests/unique-seat-checkin.test.ts — Unique seat identity on check_in & status attribution.
 // Proves that multiple seats sharing an agent family token can claim unique seat names,
-// debounce independently, coexist in presence without overwriting, and surface seat identity in status.
+// debounce independently across both seat and label args, coexist in presence without overwriting,
+// and surface seat identity in status.
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
@@ -111,7 +112,7 @@ describe('unique seat check_in and status telemetry (real SQLite D1)', () => {
     expect(presence.agent_id).toBe(familyAgentId)
   })
 
-  it('distinct seat names coexist in presence and debounce independently (kill-witness vs overwrite collapse)', async () => {
+  it('distinct seat names do not debounce each other (isolated debounce keys)', async () => {
     const auth: AuthContext = {
       memberId,
       boundAgentId: familyAgentId,
@@ -151,6 +152,41 @@ describe('unique seat check_in and status telemetry (real SQLite D1)', () => {
     expect(allSeats.length).toBeGreaterThanOrEqual(3)
   })
 
+  it('distinct label args do not debounce each other and both persist (kill-witness vs label debounce collapse)', async () => {
+    const auth: AuthContext = {
+      memberId,
+      boundAgentId: familyAgentId,
+      tenant,
+      role: 'member',
+      channel: 'workspace',
+      capabilities: [{ scope_type: 'squad', scope_id: squadId, capability: 'member' }],
+    }
+
+    // Label Alpha checks in
+    const resL1 = await invokeTool(auth, env, 'check_in', { source: 'tmux', label: 'Label Alpha' })
+    expect(resL1.ok).toBe(true)
+    if (resL1.ok) expect((resL1.result as any).debounced).toBe(false)
+
+    // Repeat Label Alpha immediately — debounced
+    const resL2 = await invokeTool(auth, env, 'check_in', { source: 'tmux', label: 'Label Alpha' })
+    expect(resL2.ok).toBe(true)
+    if (resL2.ok) expect((resL2.result as any).debounced).toBe(true)
+
+    // Label Beta checks in immediately on same memberId — NOT debounced because label differs
+    const resL3 = await invokeTool(auth, env, 'check_in', { source: 'tmux', label: 'Label Beta' })
+    expect(resL3.ok).toBe(true)
+    if (resL3.ok) {
+      expect((resL3.result as any).seat).toBe('Label Beta')
+      expect((resL3.result as any).debounced).toBe(false)
+    }
+
+    // Assert both Label Alpha and Label Beta exist in presence
+    const labelRows = harness.sqlite.prepare(
+      `SELECT label FROM presence WHERE member_id = ? AND tenant = ? AND label IN ('Label Alpha', 'Label Beta')`,
+    ).all(memberId, tenant) as Array<{ label: string }>
+    expect(labelRows.length).toBe(2)
+  })
+
   it('status() echoes seat_name and full seats list on self lookup', async () => {
     const auth: AuthContext = {
       memberId,
@@ -167,10 +203,12 @@ describe('unique seat check_in and status telemetry (real SQLite D1)', () => {
       const r = res.result as any
       expect(r.member_id).toBe(memberId)
       expect(r.bound_agent_id).toBe(familyAgentId)
-      expect(r.seat_name).toBe('Seat Beta') // Latest seat recorded in presence
+      expect(r.seat_name).toBe('Label Beta') // Latest seat recorded in presence
       expect(r.seats).toContain('Seat Alpha')
       expect(r.seats).toContain('Seat Beta')
       expect(r.seats).toContain('Mumega Ceo')
+      expect(r.seats).toContain('Label Alpha')
+      expect(r.seats).toContain('Label Beta')
     }
   })
 
@@ -190,10 +228,12 @@ describe('unique seat check_in and status telemetry (real SQLite D1)', () => {
       const r = res.result as any
       expect(r.agent.id).toBe(familyAgentId)
       expect(r.agent.name).toBe('hadi-grok-desktop')
-      expect(r.agent.seat_name).toBe('Seat Beta')
+      expect(r.agent.seat_name).toBe('Label Beta')
       expect(r.agent.seats).toContain('Seat Alpha')
       expect(r.agent.seats).toContain('Seat Beta')
       expect(r.agent.seats).toContain('Mumega Ceo')
+      expect(r.agent.seats).toContain('Label Alpha')
+      expect(r.agent.seats).toContain('Label Beta')
     }
   })
 })

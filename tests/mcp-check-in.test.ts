@@ -90,9 +90,9 @@ describe('MCP check_in tool', () => {
       agent_id: AGENT_ID,
       debounced: false,
     })
-    expect(kv.get).toEqual([`checkin:${TENANT}:${MEMBER_ID}`])
+    expect(kv.get).toEqual([`checkin:${TENANT}:${MEMBER_ID}:primary runtime`])
     expect(kv.put).toEqual([
-      { key: `checkin:${TENANT}:${MEMBER_ID}`, value: '1', opts: { expirationTtl: 30 } },
+      { key: `checkin:${TENANT}:${MEMBER_ID}:primary runtime`, value: '1', opts: { expirationTtl: 30 } },
     ])
     expect(writes).toHaveLength(1)
     expect(writes[0]).toEqual([
