@@ -43,6 +43,7 @@ export interface SendInput {
   requestId?: string
   inReplyTo?: string
   projectId?: string
+  targetSeat?: string
 }
 
 export interface SendResult {
@@ -63,6 +64,7 @@ export interface InboxMessage {
   in_reply_to: string | null
   created_at: string
   project_id: string | null
+  target_seat?: string | null
 }
 
 export interface InboxResult {
@@ -199,6 +201,9 @@ export async function sendAgentMessage(
     if (access !== null) return { ok: false, reason: access }
   }
 
+  if (input.targetSeat !== undefined && !isRef(input.targetSeat))
+    return { ok: false, reason: 'invalid_body', detail: 'target_seat must be a valid reference string' }
+
   const now = opts.now ?? (() => new Date().toISOString())
   const idGen = opts.idGen ?? (() => crypto.randomUUID())
   const routineFence = opts.routineRunFence
@@ -238,16 +243,17 @@ export async function sendAgentMessage(
       createdAt,
       maxUnread,
       input.projectId ?? null,
+      input.targetSeat ?? null,
     ]
     const result = routineFence
       ? await env.DB.prepare(
-        `INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id)
-              SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?12
+        `INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id, target_seat)
+              SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?12, ?13
                WHERE (SELECT COUNT(*) FROM agent_messages
                        WHERE tenant = ?2 AND to_agent = ?3 AND read_at IS NULL) < ?11
                  AND EXISTS (
                    SELECT 1 FROM routine_runs rr
-                    WHERE rr.id = ?13 AND rr.tenant = ?2 AND rr.project_id = ?12
+                    WHERE rr.id = ?14 AND rr.tenant = ?2 AND rr.project_id = ?12
                       AND rr.status = 'observing'
                       AND NOT EXISTS (
                         SELECT 1 FROM routine_run_events requested
@@ -257,8 +263,8 @@ export async function sendAgentMessage(
                  )`,
       ).bind(...values, routineFence.runId).run()
       : await env.DB.prepare(
-        `INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id)
-              SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?12
+        `INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id, target_seat)
+              SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?12, ?13
                WHERE (SELECT COUNT(*) FROM agent_messages
                        WHERE tenant = ?2 AND to_agent = ?3 AND read_at IS NULL) < ?11`,
       ).bind(...values).run()
@@ -305,6 +311,7 @@ export async function sendAgentMessage(
           message_id: id,
           seq,
           to_agent: input.toAgent,
+          target_seat: input.targetSeat ?? null,
           from_agent: input.fromAgent,
           from_member: input.fromMember,
           kind,
@@ -347,6 +354,7 @@ interface ExistingMessage {
   body: string
   in_reply_to: string | null
   project_id: string | null
+  target_seat: string | null
 }
 
 /** A same-(tenant, from_agent, request_id) row: idempotent no-op iff every immutable field
@@ -362,7 +370,8 @@ function idempotentOrConflict(
     existing.kind === kind &&
     existing.body === input.body &&
     (existing.in_reply_to ?? null) === (input.inReplyTo ?? null) &&
-    (existing.project_id ?? null) === (input.projectId ?? null)
+    (existing.project_id ?? null) === (input.projectId ?? null) &&
+    (existing.target_seat ?? null) === (input.targetSeat ?? null)
   return same
     ? { ok: true, id: existing.id, seq: Number(existing.seq), duplicate: true }
     : { ok: false, reason: 'request_id_conflict', detail: 'request_id reused with different content' }
@@ -375,7 +384,7 @@ async function findBySenderRequestId(
   requestId: string,
 ): Promise<ExistingMessage | null> {
   const row = await env.DB.prepare(
-    `SELECT id, seq, to_agent, kind, body, in_reply_to, project_id FROM agent_messages
+    `SELECT id, seq, to_agent, kind, body, in_reply_to, project_id, target_seat FROM agent_messages
       WHERE tenant = ?1 AND from_agent = ?2 AND request_id = ?3 LIMIT 1`,
   )
     .bind(tenant, fromAgent, requestId)
@@ -401,7 +410,7 @@ function readerCanRead(
 
 async function readAgentInboxForReader(
   env: Env,
-  input: { agent: string; limit?: number; peek?: boolean; keyFingerprint?: string; sinceSeq?: number },
+  input: { agent: string; limit?: number; peek?: boolean; keyFingerprint?: string; sinceSeq?: number; seat?: string },
   reader: InboxReader,
   opts: Opts,
 ): Promise<InboxResult | InboxFailure> {
@@ -427,7 +436,10 @@ async function readAgentInboxForReader(
   if (reader === 'signed' && !signedKeyFingerprint) return { ok: false, reason: 'consumer_fenced' }
   const now = opts.now ?? (() => new Date().toISOString())
 
-  const cols = 'seq, id, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id'
+  const targetSeat = typeof input.seat === 'string' && input.seat.trim().length > 0 ? input.seat.trim() : undefined
+  const seatClause = targetSeat ? 'AND (target_seat = ?6 OR target_seat IS NULL)' : ''
+
+  const cols = 'seq, id, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id, target_seat'
   try {
     let messages: InboxMessage[]
     const peekPolicyPredicate = reader === 'bearer'
@@ -442,12 +454,13 @@ async function readAgentInboxForReader(
       const statement = env.DB.prepare(
         `SELECT ${cols} FROM agent_messages
           WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL AND seq > ?3
+          ${seatClause}
           ${peekPolicyPredicate}
           ORDER BY seq ASC LIMIT ?4`,
       )
       const rows = await (reader === 'signed'
-        ? statement.bind(tenant, input.agent, sinceSeq, limit, signedKeyFingerprint)
-        : statement.bind(tenant, input.agent, sinceSeq, limit)).all<InboxMessage>()
+        ? statement.bind(tenant, input.agent, sinceSeq, limit, signedKeyFingerprint, targetSeat)
+        : statement.bind(tenant, input.agent, sinceSeq, limit, null, targetSeat)).all<InboxMessage>()
       messages = rows.results ?? []
     } else {
       // Atomic consume: mark the oldest `limit` unread as read and return exactly those rows.
@@ -458,6 +471,7 @@ async function readAgentInboxForReader(
           WHERE seq IN (
             SELECT seq FROM agent_messages
              WHERE tenant = ?2 AND to_agent = ?3 AND read_at IS NULL
+               ${seatClause}
                AND ${reader === 'bearer'
                  ? `COALESCE((SELECT mode FROM agent_inbox_fences
                                WHERE tenant = ?2 AND agent_id = ?3), 'bearer_only') = 'bearer_only'`
@@ -469,8 +483,8 @@ async function readAgentInboxForReader(
         RETURNING ${cols}`,
       )
         .bind(...(reader === 'signed'
-          ? [now(), tenant, input.agent, limit, signedKeyFingerprint]
-          : [now(), tenant, input.agent, limit]))
+          ? [now(), tenant, input.agent, limit, signedKeyFingerprint, targetSeat]
+          : [now(), tenant, input.agent, limit, null, targetSeat]))
         .all<InboxMessage>()
       messages = (rows.results ?? []).slice().sort((a, b) => Number(a.seq) - Number(b.seq))
     }
@@ -498,16 +512,18 @@ async function readAgentInboxForReader(
     const remainingStatement = env.DB.prepare(
       `SELECT COUNT(*) AS n FROM agent_messages
         WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL
+          ${seatClause}
           ${remainingPredicate}`,
     )
     const remainingRow = await (reader === 'signed'
-      ? remainingStatement.bind(tenant, input.agent, signedKeyFingerprint)
-      : remainingStatement.bind(tenant, input.agent)).first<{ n: number }>()
+      ? remainingStatement.bind(tenant, input.agent, signedKeyFingerprint, null, null, targetSeat)
+      : remainingStatement.bind(tenant, input.agent, null, null, null, targetSeat)).first<{ n: number }>()
     const remaining = Number(remainingRow?.n ?? 0)
 
     // normalize seq to number (D1 returns it as a number already, but be defensive)
     for (const m of messages) m.seq = Number(m.seq)
     for (const m of messages) m.project_id = m.project_id ?? null
+    for (const m of messages) m.target_seat = m.target_seat ?? null
     return { ok: true, messages, remaining }
   } catch (err) {
     return { ok: false, reason: 'db_error', detail: err instanceof Error ? err.message : String(err) }
@@ -516,7 +532,7 @@ async function readAgentInboxForReader(
 
 export function readAgentInbox(
   env: Env,
-  input: { agent: string; limit?: number; peek?: boolean; sinceSeq?: number },
+  input: { agent: string; limit?: number; peek?: boolean; sinceSeq?: number; seat?: string },
   opts: Opts = {},
 ): Promise<InboxResult | InboxFailure> {
   return readAgentInboxForReader(env, input, 'bearer', opts)
@@ -616,7 +632,7 @@ export type AckFailure = {
 }
 
 const LEASE_COLS =
-  'seq, id, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id, delivery_attempts, lease_expires_at'
+  'seq, id, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id, delivery_attempts, lease_expires_at, target_seat'
 
 /** The bearer half of the 0058 consumer fence, written once so lease/ack/dead-letter cannot
  *  drift from the predicate readAgentInboxForReader enforces. `?N` numbering is caller-chosen
@@ -641,7 +657,7 @@ async function bearerFenceBlocks(env: Env, tenant: string, agent: string): Promi
  */
 export async function leaseAgentInbox(
   env: Env,
-  input: { agent: string; limit?: number; leaseSeconds?: number },
+  input: { agent: string; limit?: number; leaseSeconds?: number; seat?: string },
   opts: Pick<Opts, 'now'> = {},
 ): Promise<LeaseResult | LeaseFailure> {
   const tenant = env.TENANT_SLUG
@@ -669,10 +685,14 @@ export async function leaseAgentInbox(
   if (!Number.isFinite(nowMs)) return { ok: false, reason: 'db_error', detail: 'clock' }
   const expiresIso = new Date(nowMs + leaseSeconds * 1000).toISOString()
 
+  const targetSeat = typeof input.seat === 'string' && input.seat.trim().length > 0 ? input.seat.trim() : undefined
+  const seatClause = (param: string) => (targetSeat ? `AND (target_seat = ${param} OR target_seat IS NULL)` : '')
+
   // "Not currently leased" — NULL means never leased; a lease at or before now has expired.
   // Both timestamps are ISO-8601 UTC with a fixed shape, so lexicographic <= IS chronological.
-  const leasable = (t: string, a: string, n: string) =>
+  const leasable = (t: string, a: string, n: string, sParam?: string) =>
     `tenant = ${t} AND to_agent = ${a} AND read_at IS NULL AND dead_lettered_at IS NULL
+       ${sParam ? seatClause(sParam) : ''}
        AND (lease_expires_at IS NULL OR lease_expires_at <= ${n})`
 
   try {
@@ -692,10 +712,10 @@ export async function leaseAgentInbox(
       `UPDATE agent_messages
           SET dead_lettered_at = ?4,
               dead_letter_reason = 'max_delivery_attempts_exceeded:' || delivery_attempts
-        WHERE ${leasable('?1', '?2', '?3')}
+        WHERE ${leasable('?1', '?2', '?3', '?6')}
           AND delivery_attempts >= ?5
           AND ${bearerFencePredicate('?1', '?2')}`,
-    ).bind(tenant, input.agent, nowIso, nowIso, MAX_DELIVERY_ATTEMPTS).run()
+    ).bind(tenant, input.agent, nowIso, nowIso, MAX_DELIVERY_ATTEMPTS, targetSeat).run()
 
     // Step 2 — the lease. ONE statement, same shape as the existing consume: the rows are
     // selected and stamped together, so two concurrent leases cannot hand out the same row.
@@ -708,18 +728,19 @@ export async function leaseAgentInbox(
               lease_expires_at = ?5
         WHERE seq IN (
           SELECT seq FROM agent_messages
-           WHERE ${leasable('?1', '?2', '?3')}
+           WHERE ${leasable('?1', '?2', '?3', '?6')}
              AND ${bearerFencePredicate('?1', '?2')}
            ORDER BY seq ASC LIMIT ?4
         )
         RETURNING ${LEASE_COLS}`,
-    ).bind(tenant, input.agent, nowIso, limit, expiresIso).all<LeasedMessage>()
+    ).bind(tenant, input.agent, nowIso, limit, expiresIso, targetSeat).all<LeasedMessage>()
 
     const messages = (rows.results ?? []).slice().sort((a, b) => Number(a.seq) - Number(b.seq))
     for (const m of messages) {
       m.seq = Number(m.seq)
       m.delivery_attempts = Number(m.delivery_attempts)
       m.project_id = m.project_id ?? null
+      m.target_seat = m.target_seat ?? null
     }
 
     // Post-check, mirroring readAgentInboxForReader. The pre-check above is NOT the fence —
@@ -739,8 +760,9 @@ export async function leaseAgentInbox(
                    AND (lease_expires_at IS NULL OR lease_expires_at <= ?3) THEN 1 ELSE 0 END) AS leasable,
          SUM(CASE WHEN dead_lettered_at IS NOT NULL THEN 1 ELSE 0 END) AS dead
         FROM agent_messages
-       WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL`,
-    ).bind(tenant, input.agent, nowIso).first<{ leasable: number | null; dead: number | null }>()
+       WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL
+         ${seatClause('?4')}`,
+    ).bind(tenant, input.agent, nowIso, targetSeat).first<{ leasable: number | null; dead: number | null }>()
 
     return {
       ok: true,
@@ -861,7 +883,7 @@ export async function listDeadLetteredMessages(
     // the flip exists to withhold.
     const rows = await env.DB.prepare(
       `SELECT seq, id, from_agent, from_member, kind, body, request_id, in_reply_to, created_at,
-              project_id, delivery_attempts, dead_lettered_at, dead_letter_reason
+              project_id, delivery_attempts, dead_lettered_at, dead_letter_reason, target_seat
          FROM agent_messages
         WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL AND dead_lettered_at IS NOT NULL
           AND ${bearerFencePredicate('?1', '?2')}
@@ -872,6 +894,7 @@ export async function listDeadLetteredMessages(
       m.seq = Number(m.seq)
       m.delivery_attempts = Number(m.delivery_attempts)
       m.project_id = m.project_id ?? null
+      m.target_seat = m.target_seat ?? null
     }
 
     if (messages.length === 0 && await bearerFenceBlocks(env, tenant, input.agent)) {
@@ -1081,6 +1104,7 @@ export async function sendToRef(
     requestId?: string
     inReplyTo?: string
     projectId?: string
+    targetSeat?: string
   },
   authz: SendTargetAuthz,
   opts: Opts = {},
@@ -1116,6 +1140,7 @@ export async function sendToRef(
       requestId: input.requestId,
       inReplyTo: input.inReplyTo,
       projectId: input.projectId,
+      targetSeat: input.targetSeat,
     },
     authz,
     opts,
