@@ -3578,9 +3578,12 @@ const toolStatus: ToolSpec = {
     const agentId = str(args.agent_id)
     if (!agentId) {
       // No agent specified → echo the member's own principal (who am I + caps + seat).
-      const presence = await env.DB.prepare(
-        `SELECT label FROM presence WHERE tenant = ?1 AND member_id = ?2 LIMIT 1`,
-      ).bind(env.TENANT_SLUG, auth.memberId).first<{ label: string }>()
+      const presenceRows = await env.DB.prepare(
+        `SELECT label, source, last_seen_at FROM presence WHERE tenant = ?1 AND member_id = ?2 ORDER BY last_seen_at DESC, rowid DESC LIMIT 10`,
+      ).bind(env.TENANT_SLUG, auth.memberId).all<{ label: string; source: string; last_seen_at: string }>()
+
+      const seats = (presenceRows.results ?? []).map((r) => r.label).filter(Boolean)
+      const latestSeat = seats[0] ?? null
 
       return done({
         member_id: auth.memberId,
@@ -3589,7 +3592,8 @@ const toolStatus: ToolSpec = {
         tenant: auth.tenant,
         role: auth.role,
         bound_agent_id: auth.boundAgentId ?? null,
-        seat_name: presence?.label || null,
+        seat_name: latestSeat,
+        seats,
         capabilities: auth.capabilities ?? [],
       })
     }
@@ -3603,9 +3607,12 @@ const toolStatus: ToolSpec = {
       return fail(403, 'forbidden', { need: 'observer', scope: 'squad' })
     }
 
-    const presence = await env.DB.prepare(
-      `SELECT label FROM presence WHERE tenant = ?1 AND agent_id = ?2 ORDER BY last_seen_at DESC LIMIT 1`,
-    ).bind(env.TENANT_SLUG, agent.id).first<{ label: string }>()
+    const presenceRows = await env.DB.prepare(
+      `SELECT label, source, last_seen_at FROM presence WHERE tenant = ?1 AND agent_id = ?2 ORDER BY last_seen_at DESC, rowid DESC LIMIT 10`,
+    ).bind(env.TENANT_SLUG, agent.id).all<{ label: string; source: string; last_seen_at: string }>()
+
+    const seats = (presenceRows.results ?? []).map((r) => r.label).filter(Boolean)
+    const latestSeat = seats[0] ?? null
 
     const stub = env.AGENT.get(env.AGENT.idFromName(agent.id))
     const res = await stub.fetch('https://agent/status')
@@ -3614,7 +3621,8 @@ const toolStatus: ToolSpec = {
       agent: {
         id: agent.id,
         name: agent.name,
-        seat_name: presence?.label || null,
+        seat_name: latestSeat,
+        seats,
         role: agent.role,
         model: agent.model,
         status: agent.status,

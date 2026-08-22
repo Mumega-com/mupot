@@ -1,6 +1,6 @@
 // tests/unique-seat-checkin.test.ts — Unique seat identity on check_in & status attribution.
 // Proves that multiple seats sharing an agent family token can claim unique seat names,
-// debounce independently, and surface seat identity in status telemetry.
+// debounce independently, coexist in presence without overwriting, and surface seat identity in status.
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
@@ -104,14 +104,14 @@ describe('unique seat check_in and status telemetry (real SQLite D1)', () => {
 
     // Verify presence table
     const presence = harness.sqlite.prepare(
-      `SELECT label, source, agent_id FROM presence WHERE member_id = ? AND tenant = ?`,
+      `SELECT label, source, agent_id FROM presence WHERE member_id = ? AND tenant = ? AND label = 'Mumega Ceo'`,
     ).get(memberId, tenant) as { label: string; source: string; agent_id: string }
     expect(presence.label).toBe('Mumega Ceo')
     expect(presence.source).toBe('tmux')
     expect(presence.agent_id).toBe(familyAgentId)
   })
 
-  it('distinct seat names do not debounce each other (isolated debounce keys)', async () => {
+  it('distinct seat names coexist in presence and debounce independently (kill-witness vs overwrite collapse)', async () => {
     const auth: AuthContext = {
       memberId,
       boundAgentId: familyAgentId,
@@ -121,25 +121,37 @@ describe('unique seat check_in and status telemetry (real SQLite D1)', () => {
       capabilities: [{ scope_type: 'squad', scope_id: squadId, capability: 'member' }],
     }
 
-    // Seat A checks in (debounced on second immediate call)
+    // Seat Alpha checks in
     const checkA1 = await invokeTool(auth, env, 'check_in', { source: 'tmux', seat: 'Seat Alpha' })
     expect(checkA1.ok).toBe(true)
     if (checkA1.ok) expect((checkA1.result as any).debounced).toBe(false)
 
+    // Repeat Seat Alpha immediately — debounced
     const checkA2 = await invokeTool(auth, env, 'check_in', { source: 'tmux', seat: 'Seat Alpha' })
     expect(checkA2.ok).toBe(true)
     if (checkA2.ok) expect((checkA2.result as any).debounced).toBe(true)
 
-    // Seat B checks in immediately on same memberId — NOT debounced because seat differs
+    // Seat Beta checks in immediately on same memberId — NOT debounced because seat differs
     const checkB1 = await invokeTool(auth, env, 'check_in', { source: 'tmux', seat: 'Seat Beta' })
     expect(checkB1.ok).toBe(true)
     if (checkB1.ok) {
       expect((checkB1.result as any).seat).toBe('Seat Beta')
       expect((checkB1.result as any).debounced).toBe(false)
     }
+
+    // KILL-WITNESS: Assert BOTH Seat Alpha AND Seat Beta exist in presence simultaneously (no overwrite collapse)
+    const allSeats = harness.sqlite.prepare(
+      `SELECT label, source FROM presence WHERE member_id = ? AND tenant = ? ORDER BY label ASC`,
+    ).all(memberId, tenant) as Array<{ label: string; source: string }>
+    
+    const labels = allSeats.map((s) => s.label)
+    expect(labels).toContain('Mumega Ceo')
+    expect(labels).toContain('Seat Alpha')
+    expect(labels).toContain('Seat Beta')
+    expect(allSeats.length).toBeGreaterThanOrEqual(3)
   })
 
-  it('status() echoes seat_name on self lookup', async () => {
+  it('status() echoes seat_name and full seats list on self lookup', async () => {
     const auth: AuthContext = {
       memberId,
       boundAgentId: familyAgentId,
@@ -156,10 +168,13 @@ describe('unique seat check_in and status telemetry (real SQLite D1)', () => {
       expect(r.member_id).toBe(memberId)
       expect(r.bound_agent_id).toBe(familyAgentId)
       expect(r.seat_name).toBe('Seat Beta') // Latest seat recorded in presence
+      expect(r.seats).toContain('Seat Alpha')
+      expect(r.seats).toContain('Seat Beta')
+      expect(r.seats).toContain('Mumega Ceo')
     }
   })
 
-  it('status(agent_id) includes seat_name on cross-agent lookup', async () => {
+  it('status(agent_id) includes seat_name and active seats on cross-agent lookup', async () => {
     const observerAuth: AuthContext = {
       memberId: observerMemberId,
       boundAgentId: observerAgentId,
@@ -176,6 +191,9 @@ describe('unique seat check_in and status telemetry (real SQLite D1)', () => {
       expect(r.agent.id).toBe(familyAgentId)
       expect(r.agent.name).toBe('hadi-grok-desktop')
       expect(r.agent.seat_name).toBe('Seat Beta')
+      expect(r.agent.seats).toContain('Seat Alpha')
+      expect(r.agent.seats).toContain('Seat Beta')
+      expect(r.agent.seats).toContain('Mumega Ceo')
     }
   })
 })
