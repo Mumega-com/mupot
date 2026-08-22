@@ -36,18 +36,15 @@ export interface StripeMeteringReceipt {
   lineItemDescription: string
 }
 
-export function computeReceiptSha256(canonicalPayload: string): string {
-  // Pure synchronous deterministic digest helper for receipt hashing
-  let h = 0x811c9dc5
-  for (let i = 0; i < canonicalPayload.length; i++) {
-    h ^= canonicalPayload.charCodeAt(i)
-    h = Math.imul(h, 0x01000193)
-  }
-  const hex = (h >>> 0).toString(16).padStart(8, '0')
-  return (hex + hex + hex + hex + hex + hex + hex + hex).slice(0, 64)
+export async function computeReceiptSha256(canonicalPayload: string): Promise<string> {
+  const enc = new TextEncoder()
+  const buf = await crypto.subtle.digest('SHA-256', enc.encode(canonicalPayload))
+  return Array.from(new Uint8Array(buf))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('')
 }
 
-export function formatStripeMeteringReceipt(input: ExecutionReceiptInput): StripeMeteringReceipt {
+export async function formatStripeMeteringReceipt(input: ExecutionReceiptInput): Promise<StripeMeteringReceipt> {
   const multiplier = input.rateMultiplier && input.rateMultiplier > 0 ? input.rateMultiplier : 2.5 // standard commercial margin
   const rawCostUsd = input.costMicroUsd / 1_000_000
   const billedCostUsd = rawCostUsd * multiplier
@@ -72,7 +69,7 @@ export function formatStripeMeteringReceipt(input: ExecutionReceiptInput): Strip
     completedAt,
   })
 
-  const payloadSha256 = computeReceiptSha256(canonicalPayload)
+  const payloadSha256 = await computeReceiptSha256(canonicalPayload)
   const receiptId = `rcpt_${input.taskId.slice(0, 8)}_${payloadSha256.slice(0, 12)}`
 
   return {

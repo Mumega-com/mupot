@@ -119,8 +119,8 @@ describe('Grok SEO & Client Task Intake Template', () => {
 })
 
 describe('Stripe Execution Metering & Receipts', () => {
-  it('formats execution line items with appropriate margin and minimums', () => {
-    const receipt = formatStripeMeteringReceipt({
+  it('formats execution line items with appropriate margin and minimums', async () => {
+    const receipt = await formatStripeMeteringReceipt({
       tenantSlug: 'viamar',
       clientName: 'Viamar Logistics',
       taskId: 'task-12345678-abcd',
@@ -129,6 +129,7 @@ describe('Stripe Execution Metering & Receipts', () => {
       executorSeat: 'cursor-mupot-setup',
       costMicroUsd: 150000, // $0.15 compute cost
       modelTokens: { input: 25000, output: 1200 },
+      completedAt: '2026-08-22T04:30:00.000Z',
     })
 
     expect(receipt.tenantSlug).toBe('viamar')
@@ -140,6 +141,37 @@ describe('Stripe Execution Metering & Receipts', () => {
     expect(receipt.lineItemDescription).toContain('[Mumega Autonomous Service] MCPWP-SEO')
     expect(receipt.payloadSha256).toBeDefined()
     expect(receipt.payloadSha256.length).toBe(64)
+  })
+
+  it('KILL-WITNESS: mutating any field in canonical payload changes the Web Crypto SHA-256 digest', async () => {
+    const inputA = {
+      tenantSlug: 'viamar',
+      clientName: 'Viamar Logistics',
+      taskId: 'task-12345678-abcd',
+      flightId: 'flight-999',
+      servicePackage: 'mcpwp-seo',
+      executorSeat: 'cursor-mupot-setup',
+      costMicroUsd: 150000,
+      completedAt: '2026-08-22T04:30:00.000Z',
+    }
+
+    const receiptA = await formatStripeMeteringReceipt(inputA)
+
+    // Mutate costMicroUsd slightly ($0.15 -> $0.16)
+    const receiptB = await formatStripeMeteringReceipt({
+      ...inputA,
+      costMicroUsd: 160000,
+    })
+
+    // Mutate executorSeat
+    const receiptC = await formatStripeMeteringReceipt({
+      ...inputA,
+      executorSeat: 'cursor-other-seat',
+    })
+
+    expect(receiptA.payloadSha256).not.toBe(receiptB.payloadSha256)
+    expect(receiptA.payloadSha256).not.toBe(receiptC.payloadSha256)
+    expect(receiptA.receiptId).not.toBe(receiptB.receiptId)
   })
 
   it('proves client intake task creates real D1 task record', async () => {
