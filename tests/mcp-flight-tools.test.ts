@@ -1278,7 +1278,8 @@ describe('MCP granted multi-squad flight lifecycle', () => {
           in_reply_to  TEXT,
           created_at   TEXT NOT NULL DEFAULT (datetime('now')),
           read_at      TEXT,
-          project_id   TEXT
+          project_id   TEXT,
+          target_seat  TEXT
         );
         CREATE TABLE agent_inbox_fences (
           tenant TEXT NOT NULL, agent_id TEXT NOT NULL, mode TEXT NOT NULL,
