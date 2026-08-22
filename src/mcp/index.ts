@@ -97,7 +97,7 @@ import {
   leaseAgentInbox, ackAgentMessages, listDeadLetteredMessages, summarizeDeadLetters,
   MAX_DELIVERY_ATTEMPTS, DEFAULT_LEASE_SECONDS, MAX_LEASE_SECONDS,
 } from '../agents/messages'
-import { recordCheckin, sqliteUtcToMs } from '../fleet/presence'
+import { recordCheckin, touchPresence, sqliteUtcToMs } from '../fleet/presence'
 import {
   readFleetAgentRow,
   getFleetAgentLiveness,
@@ -520,7 +520,12 @@ export function str(v: unknown): string | null {
 // Per-call context a tool may need beyond auth/args. `origin` is the public scheme+host
 // the caller reached us on (e.g. https://agents.digid.ca) — orient needs it to render the
 // pot's own MCP endpoint into the brief. Derived from the request URL at each call site.
-export type ToolCtx = { origin: string }
+export type ToolCtx = {
+  origin: string
+  waitUntil?: (promise: Promise<unknown>) => void
+  seat?: string
+  source?: string
+}
 
 export interface ToolSpec {
   name: string
@@ -3717,13 +3722,31 @@ const toolBootContext: ToolSpec = {
   name: 'boot_context',
   scope: 'self (read-only — no args required)',
   min: 'authenticated',
-  args: '{}  // no args — identity is derived entirely from the bearer token',
+  args: '{ source?: string, seat?: string, label?: string }',
   inputSchema: {
     type: 'object',
-    properties: {},
+    properties: {
+      source: STRING_SCHEMA,
+      seat: STRING_SCHEMA,
+      label: STRING_SCHEMA,
+    },
     additionalProperties: false,
   },
-  async run(auth, env, _args, ctx) {
+  async run(auth, env, args, ctx) {
+    if (auth.memberId) {
+      const seatLabel = (str(args.seat) || str(args.label) || ctx?.seat || '').trim()
+      const bootTouch = (async () => {
+        const id = await loadMemberIdentity(env, auth)
+        if (id) {
+          await touchPresence(env, id, { source: args.source ?? ctx?.source, label: seatLabel })
+        }
+      })().catch(() => {})
+
+      if (ctx?.waitUntil) {
+        ctx.waitUntil(bootTouch)
+      }
+    }
+
     // identity_status: derived from whether this token has an agent-identity binding.
     // The weld (migration 0019) sets member_tokens.agent_id when mint_agent_token runs.
     // auth.boundAgentId mirrors that field — it is resolved server-side from the token,
@@ -4225,8 +4248,17 @@ export async function invokeTool(
   env: Env,
   toolName: unknown,
   argsValue: unknown,
-  origin: string,
+  originOrCtx: string | Partial<ToolCtx> = '',
 ): Promise<ToolOutcome & { tool?: string }> {
+  const ctx: ToolCtx = typeof originOrCtx === 'string'
+    ? { origin: originOrCtx }
+    : {
+        origin: originOrCtx?.origin ?? '',
+        waitUntil: originOrCtx?.waitUntil,
+        seat: originOrCtx?.seat,
+        source: originOrCtx?.source,
+      }
+
   if (typeof toolName !== 'string' || toolName.length === 0) {
     return { ...fail(400, 'invalid_request', 'tool required'), tool: undefined }
   }
@@ -4263,7 +4295,7 @@ export async function invokeTool(
   // return a generic internal_error — never echo an arbitrary throw (leak guard).
   let outcome: ToolOutcome
   try {
-    outcome = await spec.run(auth, env, args, { origin })
+    outcome = await spec.run(auth, env, args, ctx)
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     if (msg.startsWith('receipt_failed')) {
@@ -4271,7 +4303,42 @@ export async function invokeTool(
     }
     return { ...fail(500, 'internal_error'), tool: spec.name }
   }
+
+  if (outcome.ok && auth.memberId && spec.name !== 'check_in' && spec.name !== 'boot_context') {
+    // Zero-Touch Living Presence: automatically bump presence for active tool callers.
+    const touchPromise = (async () => {
+      const id = await loadMemberIdentity(env, auth)
+      if (id) {
+        let seat = ctx.seat
+        if (!seat && auth.tokenId && env.DB) {
+          try {
+            const tokRow = await env.DB.prepare(
+              `SELECT label FROM member_tokens WHERE id = ?1 AND tenant = ?2`,
+            ).bind(auth.tokenId, env.TENANT_SLUG).first<{ label: string | null }>()
+            if (tokRow?.label) seat = tokRow.label
+          } catch {
+            // Fail-soft
+          }
+        }
+        await touchPresence(env, id, { source: ctx.source, label: seat })
+      }
+    })().catch(() => {})
+
+    if (ctx.waitUntil) {
+      ctx.waitUntil(touchPromise)
+    }
+  }
+
   return { ...outcome, tool: spec.name }
+}
+
+function safeWaitUntil(c: import('hono').Context<AppEnv>): ((p: Promise<unknown>) => void) | undefined {
+  try {
+    const ctx = c.executionCtx
+    return ctx ? (p: Promise<unknown>) => ctx.waitUntil(p) : undefined
+  } catch {
+    return undefined
+  }
 }
 
 async function handleJsonRpc(c: import('hono').Context<AppEnv>, body: JsonRpcRequest): Promise<Response> {
@@ -4302,7 +4369,13 @@ async function handleJsonRpc(c: import('hono').Context<AppEnv>, body: JsonRpcReq
     }
 
     const params = typeof body.params === 'object' && body.params !== null ? body.params as Record<string, unknown> : {}
-    const outcome = await invokeTool(auth, c.env, params.name, params.arguments, new URL(c.req.url).origin)
+    const ctx: ToolCtx = {
+      origin: new URL(c.req.url).origin,
+      waitUntil: safeWaitUntil(c),
+      seat: c.req.header('x-mupot-seat'),
+      source: c.req.header('x-mupot-source'),
+    }
+    const outcome = await invokeTool(auth, c.env, params.name, params.arguments, ctx)
     if (outcome.ok) return rpcResult(id, mcpCallResult(outcome.tool as string, outcome.result))
 
     return rpcError(
@@ -4367,7 +4440,13 @@ mcpApp.post('/', async (c) => {
     return c.json({ error: 'forbidden', reason: 'tenant_scope' }, 403)
   }
 
-  const outcome = await invokeTool(auth, c.env, body.tool, body.args, new URL(c.req.url).origin)
+  const ctx: ToolCtx = {
+    origin: new URL(c.req.url).origin,
+    waitUntil: safeWaitUntil(c),
+    seat: c.req.header('x-mupot-seat'),
+    source: c.req.header('x-mupot-source'),
+  }
+  const outcome = await invokeTool(auth, c.env, body.tool, body.args, ctx)
 
   if (outcome.ok) {
     return c.json({ ok: true, tool: outcome.tool, result: outcome.result })
@@ -4462,7 +4541,13 @@ mcpActionsApp.post('/actions/:tool', async (c) => {
     return c.json({ error: 'invalid_json' }, 400)
   }
 
-  const outcome = await invokeTool(auth, c.env, c.req.param('tool'), args, new URL(c.req.url).origin)
+  const ctx: ToolCtx = {
+    origin: new URL(c.req.url).origin,
+    waitUntil: safeWaitUntil(c),
+    seat: c.req.header('x-mupot-seat'),
+    source: c.req.header('x-mupot-source'),
+  }
+  const outcome = await invokeTool(auth, c.env, c.req.param('tool'), args, ctx)
   if (outcome.ok) return c.json({ ok: true, tool: outcome.tool, result: outcome.result })
   return c.json({ ok: false, tool: outcome.tool, error: outcome.error, detail: outcome.detail }, outcome.status)
 })

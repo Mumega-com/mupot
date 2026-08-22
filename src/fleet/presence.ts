@@ -73,6 +73,43 @@ export async function recordCheckin(
 }
 
 /**
+ * touchPresence — lightweight zero-touch presence heartbeat for active MCP/API requests.
+ * Debounced per (tenant, memberId, seatLabel) with a 60s KV TTL so high-frequency tool
+ * calls do not execute redundant D1 writes while keeping presence fresh (active <= 10m).
+ */
+export async function touchPresence(
+  env: Env,
+  id: PresenceIdentity,
+  opts: { source?: unknown; label?: unknown } = {},
+): Promise<boolean> {
+  const source = normalizeSource(opts.source)
+  const label = typeof opts.label === 'string' ? opts.label.slice(0, 120) : ''
+
+  const dkey = label
+    ? `presence:touch:${env.TENANT_SLUG}:${id.memberId}:${label}`
+    : `presence:touch:${env.TENANT_SLUG}:${id.memberId}`
+
+  try {
+    if (env.SESSIONS && (await env.SESSIONS.get(dkey))) {
+      return false // Debounced, already fresh (within 60s)
+    }
+    if (env.SESSIONS) {
+      await env.SESSIONS.put(dkey, '1', { expirationTtl: 60 })
+    }
+  } catch {
+    // Fail-soft: KV error should not prevent DB touch
+  }
+
+  try {
+    await recordCheckin(env, id, { source, label })
+    return true
+  } catch {
+    // Fail-soft: presence touch is a non-blocking liveness marker
+    return false
+  }
+}
+
+/**
  * listPresence — the pot's flock/check-in roster.
  *
  * `squadIds` (FLIGHT-001 #797): the caller's OWN accessible squad ids
