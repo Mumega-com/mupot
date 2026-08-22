@@ -249,6 +249,26 @@ describe('routine scheduler', () => {
     expect(count(harness, "SELECT COUNT(*) AS count FROM routine_run_events WHERE run_id = 'run-1' AND kind = 'retry_scheduled'")).toBe(1)
   })
 
+  it('does not recover an expired lease after cancellation is requested', async () => {
+    harness = makeHarness()
+    seedRoutine(harness, { id: 'routine-1', dueAt: '2026-07-19T17:00:00.000Z' })
+    seedRun(harness, { id: 'run-1', routineId: 'routine-1', status: 'leased', attempt: 1 })
+    harness.sqlite.exec(`
+      INSERT INTO routine_run_events (
+        id, tenant, project_id, run_id, kind, actor_type, actor_id, metadata_json, correlation_id
+      ) VALUES (
+        'cancel-request', 'tenant-a', 'project-active', 'run-1',
+        'cancellation_requested', 'member', 'owner-1', '{}', 'run-1'
+      );
+    `)
+
+    expect(await recoverExpiredRoutineLeases(envFor(harness), NOW)).toBe(0)
+    expect(harness.sqlite.prepare(
+      'SELECT status, lease_owner FROM routine_runs WHERE id = ?',
+    ).get('run-1')).toEqual({ status: 'leased', lease_owner: 'old-worker' })
+    expect(count(harness, "SELECT COUNT(*) AS count FROM routine_run_events WHERE run_id = 'run-1' AND kind = 'retry_scheduled'")).toBe(0)
+  })
+
   it('deduplicates concurrent recovery evidence', async () => {
     harness = makeHarness()
     seedRoutine(harness, { id: 'routine-1', dueAt: '2026-07-19T17:00:00.000Z' })

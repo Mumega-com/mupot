@@ -172,7 +172,7 @@ describe('Needs You projection', () => {
     const visible = await listNeedsYou(env, member(), { project_id: 'project-a' })
     expect(visible.items).toEqual([expect.objectContaining({
       kind: 'approval', source_type: 'task', source_id: 'approval-output',
-      allowed_actions: ['view'], safe_url: '/api/tasks/approval-output',
+      allowed_actions: ['view'], safe_url: '/projects/project-a#work',
     })])
 
     harness.sqlite.prepare(

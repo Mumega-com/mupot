@@ -2,6 +2,7 @@ import type { D1Result } from '@cloudflare/workers-types'
 import type { Env } from '../types'
 import { nextRoutineOccurrence, routineOccurrenceKey } from './schedule'
 import type { Routine, RoutinePolicySnapshot, RoutineSchedule } from './types'
+import { sqlNotCancellationPending } from './cancellation-fence'
 
 // D1 free-tier invocations allow 50 SQL statements. Worst-case scheduler work is
 // bounded below that ceiling before an external dispatch processor does any work.
@@ -335,7 +336,8 @@ export async function claimRoutineRun(
                AND earlier.status = 'queued'
                AND (earlier.created_at < routine_runs.created_at
                  OR (earlier.created_at = routine_runs.created_at AND earlier.id < routine_runs.id))
-          )`,
+          )
+          AND ${sqlNotCancellationPending('routine_runs')}`,
     ).bind(owner, leaseExpiresAt, nowIso, runId, env.TENANT_SLUG, nowIso),
     env.DB.prepare(
       `INSERT INTO routine_run_events (
@@ -378,6 +380,7 @@ export async function recoverExpiredRoutineLeases(
   const result = await env.DB.prepare(
     `SELECT id, tenant, project_id, attempt, policy_json FROM routine_runs
       WHERE tenant = ? AND status IN ('leased','observing') AND lease_expires_at <= ?
+        AND ${sqlNotCancellationPending('routine_runs')}
       ORDER BY lease_expires_at ASC, id ASC LIMIT ?`,
   ).bind(env.TENANT_SLUG, nowIso, MAX_RECOVERIES_PER_TICK).all<RecoverableRun>()
   let recovered = 0
@@ -394,7 +397,8 @@ export async function recoverExpiredRoutineLeases(
         `UPDATE routine_runs SET status = ?, lease_owner = NULL, lease_expires_at = NULL,
                 retry_at = ?, result_summary = ?, finished_at = ?, updated_at = ?
           WHERE id = ? AND tenant = ? AND status IN ('leased','observing')
-            AND lease_expires_at <= ?`,
+            AND lease_expires_at <= ?
+            AND ${sqlNotCancellationPending('routine_runs')}`,
       ).bind(
         exhausted ? 'failed' : 'queued', retryAt, exhausted ? 'retry_exhausted' : null,
         exhausted ? nowIso : null, nowIso, run.id, env.TENANT_SLUG, nowIso,

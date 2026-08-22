@@ -109,6 +109,15 @@ export interface CreateTaskOptions {
   // redundant AND reflects attacker-influenced PR/CI fields out under our token (a loop
   // + mention/ref injection). Webhook-origin tasks are inbound-only.
   skipMirror?: boolean
+  /** Internal atomic fence used by Routine dispatch before creating control work. */
+  routineRunFence?: { runId: string; tenant: string }
+}
+
+export class TaskCreateFenceError extends Error {
+  constructor() {
+    super('routine_dispatch_fenced')
+    this.name = 'TaskCreateFenceError'
+  }
 }
 
 export type TaskProjectErrorCode =
@@ -496,29 +505,49 @@ export async function createTask(
 
   let taskInsert
   try {
-    taskInsert = await env.DB.prepare(
-      `INSERT INTO tasks (id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    )
-      .bind(
-        task.id,
-        task.squad_id,
-        task.project_id,
-        task.title,
-        task.body,
-        task.done_when,
-        task.status,
-        task.assignee_agent_id,
-        task.github_issue_url,
-        task.result,
-        task.completed_at,
-        task.gate_owner,
-        task.created_at,
-        task.updated_at,
-      )
-      .run()
+    const fence = options.routineRunFence
+    const values = [
+      task.id,
+      task.squad_id,
+      task.project_id,
+      task.title,
+      task.body,
+      task.done_when,
+      task.status,
+      task.assignee_agent_id,
+      task.github_issue_url,
+      task.result,
+      task.completed_at,
+      task.gate_owner,
+      task.created_at,
+      task.updated_at,
+    ]
+    if (fence) {
+      taskInsert = await env.DB.prepare(
+        `INSERT INTO tasks (id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+          WHERE EXISTS (
+            SELECT 1 FROM routine_runs rr
+             WHERE rr.id = ? AND rr.tenant = ? AND rr.project_id = ?
+               AND rr.status IN ('leased','observing')
+               AND NOT EXISTS (
+                 SELECT 1 FROM routine_run_events requested
+                  WHERE requested.run_id = rr.id AND requested.tenant = rr.tenant
+                    AND requested.kind = 'cancellation_requested'
+               )
+          )`,
+      ).bind(...values, fence.runId, fence.tenant, task.project_id).run()
+    } else {
+      taskInsert = await env.DB.prepare(
+        `INSERT INTO tasks (id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).bind(...values).run()
+    }
   } catch (error) {
     mapTaskProjectInsertError(error)
+  }
+  if (options.routineRunFence && (taskInsert?.meta?.changes ?? 0) === 0) {
+    throw new TaskCreateFenceError()
   }
   // Receipt (#186): a 0-row INSERT resolves without throwing — verify the row
   // actually landed before we emit "created" and return the task as success.

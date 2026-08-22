@@ -2,14 +2,16 @@ import type { D1Result } from '@cloudflare/workers-types'
 import { sendAgentMessage as sendMessage } from '../agents/messages'
 import { hasCapability } from '../auth/capability'
 import { mcpEndpoint } from '../dashboard/connect'
-import { applyPreflight, createFlight, failFlight } from '../flight/service'
+import { applyPreflight, createFlight, failFlight, FlightCreateFenceError } from '../flight/service'
 import { FLIGHT_META_V1_SCHEMA, parseFlightMetaV1, type FlightMetaV1 } from '../flight/meta'
 import { getFleetAgentRuntimeStates } from '../fleet/registry'
-import { canonicalJsonDigest, sha256Hex } from '../lib/canonical-json'
+import { canonicalJsonDigest } from '../lib/canonical-json'
 import { loadProjectSituation } from '../projects/situation'
-import { createTask } from '../tasks/service'
+import { createTask, TaskCreateFenceError } from '../tasks/service'
 import type { CapabilityGrant, Env, Project, Task } from '../types'
 import type { RoutinePolicySnapshot } from './types'
+import { sqlNotCancellationPending } from './cancellation-fence'
+import { routineControlId, routineRequestId } from './identity'
 
 const ROUTINE_SENDER = 'mupot-routines'
 const ROUTINE_MEMBER = 'system:routines'
@@ -43,6 +45,8 @@ interface DispatchRunRow {
   project_created_at: string
   project_updated_at: string
   project_access_level: string | null
+  human_question_json: string | null
+  human_result_json: string | null
 }
 
 interface CandidateRow {
@@ -105,15 +109,6 @@ function parsePolicy(value: string): RoutinePolicySnapshot | null {
   }
 }
 
-async function deterministicUuid(kind: string, runId: string): Promise<string> {
-  const hex = await sha256Hex(`mupot:routine:${kind}:${runId}`)
-  const bytes = Array.from({ length: 16 }, (_, index) => hex.slice(index * 2, index * 2 + 2))
-  bytes[6] = (((Number.parseInt(bytes[6], 16) & 0x0f) | 0x50).toString(16)).padStart(2, '0')
-  bytes[8] = (((Number.parseInt(bytes[8], 16) & 0x3f) | 0x80).toString(16)).padStart(2, '0')
-  const normalized = bytes.join('')
-  return `${normalized.slice(0, 8)}-${normalized.slice(8, 12)}-${normalized.slice(12, 16)}-${normalized.slice(16, 20)}-${normalized.slice(20)}`
-}
-
 function projectFrom(row: DispatchRunRow): Project {
   return {
     id: row.project_id,
@@ -151,7 +146,15 @@ async function loadRun(env: Env, runId: string): Promise<DispatchRunRow | null> 
             p.description AS project_description, p.goal AS project_goal,
             p.status AS project_status, p.parent_project_id, p.target_date,
             p.created_at AS project_created_at, p.updated_at AS project_updated_at,
-            psa.access_level AS project_access_level
+            psa.access_level AS project_access_level,
+            (SELECT a.input_json FROM routine_run_actions a
+              WHERE a.run_id = rr.id AND a.tenant = rr.tenant
+                AND a.kind = 'ask_human' AND a.status = 'succeeded'
+              ORDER BY a.updated_at DESC, a.id DESC LIMIT 1) AS human_question_json,
+            (SELECT a.result_json FROM routine_run_actions a
+              WHERE a.run_id = rr.id AND a.tenant = rr.tenant
+                AND a.kind = 'ask_human' AND a.status = 'succeeded'
+              ORDER BY a.updated_at DESC, a.id DESC LIMIT 1) AS human_result_json
        FROM routine_runs rr
        JOIN routines r ON r.id = rr.routine_id AND r.tenant = rr.tenant
        JOIN projects p ON p.id = rr.project_id
@@ -258,7 +261,8 @@ async function appendStateEvent(
     env.DB.prepare(
       `UPDATE routine_runs SET status = ?, waiting_reason = ?, retry_at = ?,
               result_summary = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
-        WHERE id = ? AND tenant = ? AND status IN ('leased','observing')`,
+        WHERE id = ? AND tenant = ? AND status IN ('leased','observing')
+          AND ${sqlNotCancellationPending('routine_runs')}`,
     ).bind(
       input.status, input.waitingReason, input.retryAt, input.resultSummary,
       now, run.id, run.tenant,
@@ -334,7 +338,7 @@ async function ensureTask(
   policy: RoutinePolicySnapshot,
   agentId: string,
 ): Promise<Task | null> {
-  const id = await deterministicUuid('task', `${run.id}:${run.attempt}`)
+  const id = await routineControlId('task', `${run.id}:${run.attempt}`)
   const existing = await existingTask(env, id)
   const matches = (task: Task): boolean => (
     task.project_id === run.project_id
@@ -352,8 +356,12 @@ async function ensureTask(
       done_when: `A correlated routine.proposal/v1 for RoutineRun ${run.id} is accepted.`,
       status: 'open',
       assignee_agent_id: agentId,
-    }, { id, skipMirror: true, skipEvent: true })
+    }, {
+      id, skipMirror: true, skipEvent: true,
+      routineRunFence: { runId: run.id, tenant: run.tenant },
+    })
   } catch (error) {
+    if (error instanceof TaskCreateFenceError) return null
     const raced = await existingTask(env, id)
     if (raced) return matches(raced) ? raced : null
     throw error
@@ -368,7 +376,7 @@ async function ensureFlight(
   task: Task,
   budgetMicroUsd: number,
 ): Promise<string | null> {
-  const id = await deterministicUuid('flight', `${run.id}:${run.attempt}`)
+  const id = await routineControlId('flight', `${run.id}:${run.attempt}`)
   type ExistingFlight = { id: string; project_id: string | null; agent: string; status: string; budget_micro_usd: number | null; meta: string }
   const loadExisting = () => env.DB.prepare(
     'SELECT id, project_id, agent, status, budget_micro_usd, meta FROM flights WHERE id = ? AND tenant = ?',
@@ -412,7 +420,8 @@ async function ensureFlight(
     trigger_source: 'schedule',
     budget_micro_usd: budgetMicroUsd,
     meta,
-  }, { id }).catch(async (error) => {
+  }, { id, routineRunFence: { runId: run.id, tenant: run.tenant } }).catch(async (error) => {
+    if (error instanceof FlightCreateFenceError) return null
     const raced = await loadExisting()
     if (raced) return matches(raced) ? raced.id : null
     throw error
@@ -424,6 +433,18 @@ function proposalSchema(): Record<string, unknown> {
     version: 'routine.proposal/v1',
     required: ['version', 'run_id', 'project_id', 'situation_digest', 'summary', 'action'],
     action_kinds: ['create_task', 'dispatch_flight', 'request_review', 'ask_human', 'no_action'],
+  }
+}
+
+function humanResponse(run: DispatchRunRow): { question: string; answer: string } | null {
+  if (!run.human_question_json || !run.human_result_json) return null
+  try {
+    const question = JSON.parse(run.human_question_json) as Record<string, unknown>
+    const result = JSON.parse(run.human_result_json) as Record<string, unknown>
+    if (typeof question.question !== 'string' || typeof result.answer !== 'string') return null
+    return { question: question.question, answer: result.answer }
+  } catch {
+    return null
   }
 }
 
@@ -468,7 +489,8 @@ export async function dispatchRoutineRun(
   const reserved = await env.DB.prepare(
     `UPDATE routine_runs SET assigned_agent_id = ?, updated_at = ?
       WHERE id = ? AND tenant = ? AND status IN ('leased','observing')
-        AND (assigned_agent_id IS NULL OR assigned_agent_id = ?)`,
+        AND (assigned_agent_id IS NULL OR assigned_agent_id = ?)
+        AND ${sqlNotCancellationPending('routine_runs')}`,
   ).bind(selected.agentId, now.toISOString(), run.id, run.tenant, selected.agentId).run()
   if (!wrote(reserved)) return { ok: false, error: 'run_not_dispatchable' }
   run.assigned_agent_id = selected.agentId
@@ -488,7 +510,8 @@ export async function dispatchRoutineRun(
       `UPDATE routine_runs SET status = 'observing', assigned_agent_id = ?, task_id = ?,
               flight_id = ?, situation_digest = ?, updated_at = ?
         WHERE id = ? AND tenant = ? AND status IN ('leased','observing')
-          AND assigned_agent_id = ?`,
+          AND assigned_agent_id = ?
+          AND ${sqlNotCancellationPending('routine_runs')}`,
     ).bind(
       selected.agentId, task.id, flightId, situationDigest, nowIso,
       run.id, run.tenant, selected.agentId,
@@ -516,6 +539,7 @@ export async function dispatchRoutineRun(
   ])
   if (!wrote(observed[0])) return { ok: false, error: 'run_not_dispatchable' }
 
+  const response = humanResponse(run)
   const body = JSON.stringify({
     version: 'routine.run/v1',
     run_id: run.id,
@@ -525,6 +549,7 @@ export async function dispatchRoutineRun(
     situation_digest: situationDigest,
     mcp_endpoint: endpoint,
     proposal_schema: proposalSchema(),
+    ...(response ? { human_response: response } : {}),
   })
   const send = deps.sendAgentMessage ?? sendMessage
   const delivery = await send(env, {
@@ -533,10 +558,14 @@ export async function dispatchRoutineRun(
     toAgent: selected.inboxAgentId,
     body,
     kind: 'request',
-    requestId: `routine-run:${run.id}`,
+    requestId: routineRequestId(run.id, run.attempt),
     projectId: run.project_id,
-  }, { systemProjectAttribution: true })
+  }, {
+    systemProjectAttribution: true,
+    routineRunFence: { runId: run.id, projectId: run.project_id },
+  })
   if (!delivery.ok) {
+    if (delivery.reason === 'dispatch_fenced') return { ok: false, error: 'run_not_dispatchable' }
     return waitForAgent(env, run, now, delivery.reason === 'inbox_full' ? 'inbox_full' : 'delivery_failed')
   }
 
@@ -556,6 +585,7 @@ export async function dispatchRoutineRun(
               lease_owner = NULL, lease_expires_at = NULL, retry_at = NULL,
               assigned_agent_id = ?, task_id = ?, flight_id = ?, situation_digest = ?, updated_at = ?
         WHERE id = ? AND tenant = ? AND status = 'observing'
+          AND ${sqlNotCancellationPending('routine_runs')}
           AND EXISTS (
             SELECT 1 FROM tasks t
              WHERE t.id = ? AND t.project_id = ? AND t.squad_id = ?

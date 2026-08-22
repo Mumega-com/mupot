@@ -372,3 +372,37 @@ VALUES ('ca-local-github', 'conn-local-github', 'local', 'add', 'usr-local-owner
 
 INSERT OR REPLACE INTO github_installations (tenant, installation_id, account_login, installed_at, updated_at)
 VALUES ('local', '123456789', 'Mumega-com', datetime('now','-1 hour'), datetime('now','-1 hour'));
+
+-- v0.25 Project Routines local seed (propose-mode smoke)
+INSERT INTO routines (
+  id, tenant, project_id, name, objective, status, trigger_kind,
+  cron_expression, timezone, next_run_at, overlap_policy, execution_mode,
+  responsible_squad_id, preferred_agent_id, budget_micro_usd, max_attempts,
+  retry_backoff_seconds, revision, enabled_by, enabled_at, created_by, created_at, updated_at
+) VALUES (
+  'routine-local-propose', 'local', 'project-mupot', 'Local propose check',
+  'Choose one accountable next action for local smoke.',
+  'enabled', 'manual', NULL, 'UTC', NULL, 'skip', 'propose',
+  'sq-growth', 'agent-hermes', 100000, 3, 300, 1,
+  'usr-local-owner', datetime('now'), 'usr-local-owner', datetime('now'), datetime('now')
+)
+ON CONFLICT(id) DO UPDATE SET
+  tenant = excluded.tenant,
+  project_id = excluded.project_id,
+  name = excluded.name,
+  objective = excluded.objective,
+  status = excluded.status,
+  trigger_kind = excluded.trigger_kind,
+  cron_expression = excluded.cron_expression,
+  timezone = excluded.timezone,
+  next_run_at = excluded.next_run_at,
+  overlap_policy = excluded.overlap_policy,
+  execution_mode = excluded.execution_mode,
+  responsible_squad_id = excluded.responsible_squad_id,
+  preferred_agent_id = excluded.preferred_agent_id,
+  budget_micro_usd = excluded.budget_micro_usd,
+  max_attempts = excluded.max_attempts,
+  retry_backoff_seconds = excluded.retry_backoff_seconds,
+  enabled_by = excluded.enabled_by,
+  enabled_at = excluded.enabled_at,
+  updated_at = excluded.updated_at;
