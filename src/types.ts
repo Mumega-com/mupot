@@ -584,6 +584,7 @@ export interface MessageCreatedPayload {
   message_id: string
   seq: number
   to_agent: string
+  target_seat?: string | null
   from_agent: string
   from_member: string
   kind: string

@@ -2951,7 +2951,7 @@ const toolSend: ToolSpec = {
   name: 'send',
   scope: 'agent→agent (this pot); sender must be agent-bound',
   min: 'authenticated',
-  args: '{ to: string (agent id or unique slug), body: string, kind?: "message"|"request"|"ack", request_id?: string, in_reply_to?: string, project_id?: string }',
+  args: '{ to: string (agent id or unique slug), body: string, kind?: "message"|"request"|"ack", request_id?: string, in_reply_to?: string, project_id?: string, seat?: string }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -2961,6 +2961,7 @@ const toolSend: ToolSpec = {
       request_id: STRING_SCHEMA,
       in_reply_to: STRING_SCHEMA,
       project_id: STRING_SCHEMA,
+      seat: STRING_SCHEMA,
     },
     required: ['to', 'body'],
     additionalProperties: false,
@@ -2980,6 +2981,8 @@ const toolSend: ToolSpec = {
       return fail(400, 'invalid_args', 'in_reply_to must be a string')
     if (args.project_id !== undefined && typeof args.project_id !== 'string')
       return fail(400, 'invalid_args', 'project_id must be a string')
+    if (args.seat !== undefined && typeof args.seat !== 'string')
+      return fail(400, 'invalid_args', 'seat must be a string')
 
     // Gate 1 (#392): confine the send target for non-admin welded tokens (see the docstring on
     // sendToRef in src/agents/messages.ts). hasWorkspaceAdmin already handles the legacy-role
@@ -2996,6 +2999,7 @@ const toolSend: ToolSpec = {
         requestId: typeof args.request_id === 'string' ? args.request_id : undefined,
         inReplyTo: typeof args.in_reply_to === 'string' ? args.in_reply_to : undefined,
         projectId: typeof args.project_id === 'string' ? args.project_id : undefined,
+        targetSeat: typeof args.seat === 'string' && args.seat.trim().length > 0 ? args.seat.trim() : undefined,
       },
       { isAdmin: hasWorkspaceAdmin(auth), grants: auth.capabilities ?? [] },
     )
@@ -3016,7 +3020,14 @@ const toolSend: ToolSpec = {
             : 400
       return fail(status, res.reason, res.detail)
     }
-    return done({ id: res.id, seq: res.seq, duplicate: res.duplicate, to: res.toAgent, project_id: typeof args.project_id === 'string' ? args.project_id : null })
+    return done({
+      id: res.id,
+      seq: res.seq,
+      duplicate: res.duplicate,
+      to: res.toAgent,
+      project_id: typeof args.project_id === 'string' ? args.project_id : null,
+      target_seat: typeof args.seat === 'string' ? args.seat.trim() : null,
+    })
   },
 }
 
@@ -3136,10 +3147,10 @@ const toolInbox: ToolSpec = {
   name: 'inbox',
   scope: 'self (the caller agent reads its own inbox)',
   min: 'authenticated',
-  args: '{ limit?: number, peek?: boolean }',
+  args: '{ limit?: number, peek?: boolean, seat?: string }',
   inputSchema: {
     type: 'object',
-    properties: { limit: OPTIONAL_NUMBER_SCHEMA, peek: { type: 'boolean' } },
+    properties: { limit: OPTIONAL_NUMBER_SCHEMA, peek: { type: 'boolean' }, seat: STRING_SCHEMA },
     required: [],
     additionalProperties: false,
   },
@@ -3154,8 +3165,15 @@ const toolInbox: ToolSpec = {
     }
     if (args.peek !== undefined && typeof args.peek !== 'boolean')
       return fail(400, 'invalid_args', 'peek must be a boolean')
+    if (args.seat !== undefined && typeof args.seat !== 'string')
+      return fail(400, 'invalid_args', 'seat must be a string')
 
-    const res = await readAgentInbox(env, { agent, limit, peek: args.peek === true })
+    const res = await readAgentInbox(env, {
+      agent,
+      limit,
+      peek: args.peek === true,
+      seat: typeof args.seat === 'string' ? args.seat.trim() : undefined,
+    })
     if (!res.ok) {
       if (res.reason === 'db_error') return fail(500, res.reason) // no raw DB string to caller
       if (res.reason === 'consumer_fenced') return fail(409, res.reason)
@@ -3184,10 +3202,10 @@ const toolInboxLease: ToolSpec = {
   name: 'inbox_lease',
   scope: 'self (the caller agent leases from its own inbox)',
   min: 'authenticated',
-  args: '{ limit?: number, lease_seconds?: number }',
+  args: '{ limit?: number, lease_seconds?: number, seat?: string }',
   inputSchema: {
     type: 'object',
-    properties: { limit: OPTIONAL_NUMBER_SCHEMA, lease_seconds: OPTIONAL_NUMBER_SCHEMA },
+    properties: { limit: OPTIONAL_NUMBER_SCHEMA, lease_seconds: OPTIONAL_NUMBER_SCHEMA, seat: STRING_SCHEMA },
     required: [],
     additionalProperties: false,
   },
@@ -3206,8 +3224,15 @@ const toolInboxLease: ToolSpec = {
         return fail(400, 'invalid_args', 'lease_seconds must be a number')
       leaseSeconds = args.lease_seconds
     }
+    if (args.seat !== undefined && typeof args.seat !== 'string')
+      return fail(400, 'invalid_args', 'seat must be a string')
 
-    const res = await leaseAgentInbox(env, { agent, limit, leaseSeconds })
+    const res = await leaseAgentInbox(env, {
+      agent,
+      limit,
+      leaseSeconds,
+      seat: typeof args.seat === 'string' ? args.seat.trim() : undefined,
+    })
     if (!res.ok) {
       if (res.reason === 'db_error') return fail(500, res.reason) // no raw DB string to caller
       if (res.reason === 'consumer_fenced') return fail(409, res.reason)
