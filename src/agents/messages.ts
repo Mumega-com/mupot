@@ -437,44 +437,83 @@ async function readAgentInboxForReader(
   const now = opts.now ?? (() => new Date().toISOString())
 
   const targetSeat = typeof input.seat === 'string' && input.seat.trim().length > 0 ? input.seat.trim() : null
-  const signedFingerprint = reader === 'signed' ? (signedKeyFingerprint ?? null) : null
 
   const cols = 'seq, id, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id, target_seat'
   try {
     let messages: InboxMessage[]
     if (peek) {
-      const rows = await env.DB.prepare(
-        `SELECT ${cols} FROM agent_messages
-          WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL AND seq > ?3
-            AND (CASE WHEN ?6 IS NULL THEN target_seat IS NULL ELSE (target_seat = ?6 OR target_seat IS NULL) END)
-            AND (CASE WHEN ?5 IS NULL
-                      THEN COALESCE((SELECT mode FROM agent_inbox_fences WHERE tenant = ?1 AND agent_id = ?2), 'bearer_only') = 'bearer_only'
-                      ELSE EXISTS (SELECT 1 FROM agent_inbox_fences WHERE tenant = ?1 AND agent_id = ?2 AND mode = 'signed_only' AND key_fingerprint = ?5)
-                 END)
-          ORDER BY seq ASC LIMIT ?4`,
-      ).bind(tenant, input.agent, sinceSeq, limit, signedFingerprint, targetSeat).all<InboxMessage>()
-      messages = rows.results ?? []
+      if (reader === 'signed') {
+        const seatSql = targetSeat ? 'AND (target_seat = ?6 OR target_seat IS NULL)' : 'AND target_seat IS NULL'
+        const binds = targetSeat
+          ? [tenant, input.agent, sinceSeq, limit, signedKeyFingerprint, targetSeat]
+          : [tenant, input.agent, sinceSeq, limit, signedKeyFingerprint]
+        const rows = await env.DB.prepare(
+          `SELECT ${cols} FROM agent_messages
+            WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL AND seq > ?3
+              ${seatSql}
+              AND EXISTS (SELECT 1 FROM agent_inbox_fences
+                           WHERE tenant = ?1 AND agent_id = ?2
+                             AND mode = 'signed_only' AND key_fingerprint = ?5)
+            ORDER BY seq ASC LIMIT ?4`,
+        ).bind(...binds).all<InboxMessage>()
+        messages = rows.results ?? []
+      } else {
+        const seatSql = targetSeat ? 'AND (target_seat = ?5 OR target_seat IS NULL)' : 'AND target_seat IS NULL'
+        const binds = targetSeat
+          ? [tenant, input.agent, sinceSeq, limit, targetSeat]
+          : [tenant, input.agent, sinceSeq, limit]
+        const rows = await env.DB.prepare(
+          `SELECT ${cols} FROM agent_messages
+            WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL AND seq > ?3
+              ${seatSql}
+              AND COALESCE((SELECT mode FROM agent_inbox_fences
+                             WHERE tenant = ?1 AND agent_id = ?2), 'bearer_only') = 'bearer_only'
+            ORDER BY seq ASC LIMIT ?4`,
+        ).bind(...binds).all<InboxMessage>()
+        messages = rows.results ?? []
+      }
     } else {
       // Atomic consume: mark the oldest `limit` unread as read and return exactly those rows.
       // RETURNING order is unspecified → sort by seq after. Marking + reading in one statement
       // means a concurrent reader cannot also claim the same rows (delivered once).
-      const rows = await env.DB.prepare(
-        `UPDATE agent_messages SET read_at = ?1
-          WHERE seq IN (
-            SELECT seq FROM agent_messages
-             WHERE tenant = ?2 AND to_agent = ?3 AND read_at IS NULL
-               AND (CASE WHEN ?6 IS NULL THEN target_seat IS NULL ELSE (target_seat = ?6 OR target_seat IS NULL) END)
-               AND (CASE WHEN ?5 IS NULL
-                         THEN COALESCE((SELECT mode FROM agent_inbox_fences WHERE tenant = ?2 AND agent_id = ?3), 'bearer_only') = 'bearer_only'
-                         ELSE EXISTS (SELECT 1 FROM agent_inbox_fences WHERE tenant = ?2 AND agent_id = ?3 AND mode = 'signed_only' AND key_fingerprint = ?5)
-                    END)
-             ORDER BY seq ASC LIMIT ?4
-          )
-        RETURNING ${cols}`,
-      )
-        .bind(now(), tenant, input.agent, limit, signedFingerprint, targetSeat)
-        .all<InboxMessage>()
-      messages = (rows.results ?? []).slice().sort((a, b) => Number(a.seq) - Number(b.seq))
+      if (reader === 'signed') {
+        const seatSql = targetSeat ? 'AND (target_seat = ?6 OR target_seat IS NULL)' : 'AND target_seat IS NULL'
+        const binds = targetSeat
+          ? [now(), tenant, input.agent, limit, signedKeyFingerprint, targetSeat]
+          : [now(), tenant, input.agent, limit, signedKeyFingerprint]
+        const rows = await env.DB.prepare(
+          `UPDATE agent_messages SET read_at = ?1
+            WHERE seq IN (
+              SELECT seq FROM agent_messages
+               WHERE tenant = ?2 AND to_agent = ?3 AND read_at IS NULL
+                 ${seatSql}
+                 AND EXISTS (SELECT 1 FROM agent_inbox_fences
+                             WHERE tenant = ?2 AND agent_id = ?3
+                               AND mode = 'signed_only' AND key_fingerprint = ?5)
+               ORDER BY seq ASC LIMIT ?4
+            )
+          RETURNING ${cols}`,
+        ).bind(...binds).all<InboxMessage>()
+        messages = (rows.results ?? []).slice().sort((a, b) => Number(a.seq) - Number(b.seq))
+      } else {
+        const seatSql = targetSeat ? 'AND (target_seat = ?5 OR target_seat IS NULL)' : 'AND target_seat IS NULL'
+        const binds = targetSeat
+          ? [now(), tenant, input.agent, limit, targetSeat]
+          : [now(), tenant, input.agent, limit]
+        const rows = await env.DB.prepare(
+          `UPDATE agent_messages SET read_at = ?1
+            WHERE seq IN (
+              SELECT seq FROM agent_messages
+               WHERE tenant = ?2 AND to_agent = ?3 AND read_at IS NULL
+                 ${seatSql}
+                 AND COALESCE((SELECT mode FROM agent_inbox_fences
+                               WHERE tenant = ?2 AND agent_id = ?3), 'bearer_only') = 'bearer_only'
+               ORDER BY seq ASC LIMIT ?4
+            )
+          RETURNING ${cols}`,
+        ).bind(...binds).all<InboxMessage>()
+        messages = (rows.results ?? []).slice().sort((a, b) => Number(a.seq) - Number(b.seq))
+      }
     }
 
     const fence = await env.DB.prepare(
@@ -491,16 +530,35 @@ async function readAgentInboxForReader(
       return { ok: false, reason: 'consumer_fenced' }
     }
 
-    const remainingRow = await env.DB.prepare(
-      `SELECT COUNT(*) AS n FROM agent_messages
-        WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL
-          AND (CASE WHEN ?4 IS NULL THEN target_seat IS NULL ELSE (target_seat = ?4 OR target_seat IS NULL) END)
-          AND (CASE WHEN ?3 IS NULL
-                    THEN COALESCE((SELECT mode FROM agent_inbox_fences WHERE tenant = ?1 AND agent_id = ?2), 'bearer_only') = 'bearer_only'
-                    ELSE EXISTS (SELECT 1 FROM agent_inbox_fences WHERE tenant = ?1 AND agent_id = ?2 AND mode = 'signed_only' AND key_fingerprint = ?3)
-               END)`,
-    ).bind(tenant, input.agent, signedFingerprint, targetSeat).first<{ n: number }>()
-    const remaining = Number(remainingRow?.n ?? 0)
+    let remaining = 0
+    if (reader === 'signed') {
+      const seatSql = targetSeat ? 'AND (target_seat = ?4 OR target_seat IS NULL)' : 'AND target_seat IS NULL'
+      const binds = targetSeat
+        ? [tenant, input.agent, signedKeyFingerprint, targetSeat]
+        : [tenant, input.agent, signedKeyFingerprint]
+      const remainingRow = await env.DB.prepare(
+        `SELECT COUNT(*) AS n FROM agent_messages
+          WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL
+            ${seatSql}
+            AND EXISTS (SELECT 1 FROM agent_inbox_fences
+                         WHERE tenant = ?1 AND agent_id = ?2
+                           AND mode = 'signed_only' AND key_fingerprint = ?3)`,
+      ).bind(...binds).first<{ n: number }>()
+      remaining = Number(remainingRow?.n ?? 0)
+    } else {
+      const seatSql = targetSeat ? 'AND (target_seat = ?3 OR target_seat IS NULL)' : 'AND target_seat IS NULL'
+      const binds = targetSeat
+        ? [tenant, input.agent, targetSeat]
+        : [tenant, input.agent]
+      const remainingRow = await env.DB.prepare(
+        `SELECT COUNT(*) AS n FROM agent_messages
+          WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL
+            ${seatSql}
+            AND COALESCE((SELECT mode FROM agent_inbox_fences
+                           WHERE tenant = ?1 AND agent_id = ?2), 'bearer_only') = 'bearer_only'`,
+      ).bind(...binds).first<{ n: number }>()
+      remaining = Number(remainingRow?.n ?? 0)
+    }
 
     // normalize seq to number (D1 returns it as a number already, but be defensive)
     for (const m of messages) m.seq = Number(m.seq)

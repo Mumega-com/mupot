@@ -23,7 +23,8 @@ function fixture() {
       in_reply_to TEXT,
       created_at TEXT NOT NULL,
       read_at TEXT,
-      project_id TEXT
+      project_id TEXT,
+      target_seat TEXT
     );
     INSERT INTO members(id) VALUES ('owner');
     INSERT INTO agents(id) VALUES ('agent-a');
