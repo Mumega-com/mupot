@@ -3528,9 +3528,10 @@ const toolCheckIn: ToolSpec = {
     const id = await loadMemberIdentity(env, auth)
     if (!id) return fail(403, 'not_member_bound', 'check_in requires a member-token principal')
 
-    const seatLabel = (str(args.seat) || str(args.name) || str(args.label) || '').trim()
-    const dkey = seatLabel
-      ? `checkin:${env.TENANT_SLUG}:${id.memberId}:${seatLabel}`
+    const explicitSeat = (str(args.seat) || str(args.name) || '').trim()
+    const seatLabel = explicitSeat || (str(args.label) || '').trim()
+    const dkey = explicitSeat
+      ? `checkin:${env.TENANT_SLUG}:${id.memberId}:${explicitSeat}`
       : `checkin:${env.TENANT_SLUG}:${id.memberId}`
 
     try {
@@ -3578,12 +3579,18 @@ const toolStatus: ToolSpec = {
     const agentId = str(args.agent_id)
     if (!agentId) {
       // No agent specified → echo the member's own principal (who am I + caps + seat).
-      const presenceRows = await env.DB.prepare(
-        `SELECT label, source, last_seen_at FROM presence WHERE tenant = ?1 AND member_id = ?2 ORDER BY last_seen_at DESC, rowid DESC LIMIT 10`,
-      ).bind(env.TENANT_SLUG, auth.memberId).all<{ label: string; source: string; last_seen_at: string }>()
+      let seatName: string | null = null
+      let seats: string[] = []
+      try {
+        const presenceRows = await env.DB.prepare(
+          `SELECT label, source, last_seen_at FROM presence WHERE tenant = ?1 AND member_id = ?2 ORDER BY last_seen_at DESC, rowid DESC LIMIT 10`,
+        ).bind(env.TENANT_SLUG, auth.memberId).all<{ label: string; source: string; last_seen_at: string }>()
 
-      const seats = (presenceRows.results ?? []).map((r) => r.label).filter(Boolean)
-      const latestSeat = seats[0] ?? null
+        seats = (presenceRows.results ?? []).map((r) => r.label).filter(Boolean)
+        seatName = seats[0] ?? null
+      } catch {
+        // Fail-soft: self-echo operates even without DB or in mock capability floor tests
+      }
 
       return done({
         member_id: auth.memberId,
@@ -3592,7 +3599,7 @@ const toolStatus: ToolSpec = {
         tenant: auth.tenant,
         role: auth.role,
         bound_agent_id: auth.boundAgentId ?? null,
-        seat_name: latestSeat,
+        seat_name: seatName,
         seats,
         capabilities: auth.capabilities ?? [],
       })
