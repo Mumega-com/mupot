@@ -3495,17 +3495,19 @@ const toolPeers: ToolSpec = {
 // check_in — pot-native presence heartbeat over MCP. This mirrors
 // POST /api/fleet/checkin for runtimes that only have an MCP transport: identity
 // is the authenticated member token, source/label are descriptive only, and a
-// rapid repeat is debounced with the same tenant+member KV key as the HTTP route.
+// rapid repeat is debounced per (tenant, memberId, seat).
 const toolCheckIn: ToolSpec = {
   name: 'check_in',
   scope: 'self (member-token presence)',
   min: 'authenticated',
-  args: '{ source?: "claude-code"|"codex"|"hermes"|"openclaw"|"tmux"|"cowork"|"unknown", label?: string }',
+  args: '{ source?: "claude-code"|"codex"|"hermes"|"openclaw"|"tmux"|"cowork"|"unknown", label?: string, name?: string, seat?: string }',
   inputSchema: {
     type: 'object',
     properties: {
       source: STRING_SCHEMA,
       label: STRING_SCHEMA,
+      name: STRING_SCHEMA,
+      seat: STRING_SCHEMA,
     },
     additionalProperties: false,
   },
@@ -3516,14 +3518,30 @@ const toolCheckIn: ToolSpec = {
     if (args.label !== undefined && args.label !== null && typeof args.label !== 'string') {
       return fail(400, 'invalid_args', 'label must be a string')
     }
+    if (args.name !== undefined && args.name !== null && typeof args.name !== 'string') {
+      return fail(400, 'invalid_args', 'name must be a string')
+    }
+    if (args.seat !== undefined && args.seat !== null && typeof args.seat !== 'string') {
+      return fail(400, 'invalid_args', 'seat must be a string')
+    }
 
     const id = await loadMemberIdentity(env, auth)
     if (!id) return fail(403, 'not_member_bound', 'check_in requires a member-token principal')
 
-    const dkey = `checkin:${env.TENANT_SLUG}:${id.memberId}`
+    const seatLabel = (str(args.seat) || str(args.name) || str(args.label) || '').trim()
+    const dkey = seatLabel
+      ? `checkin:${env.TENANT_SLUG}:${id.memberId}:${seatLabel}`
+      : `checkin:${env.TENANT_SLUG}:${id.memberId}`
+
     try {
       if (await env.SESSIONS.get(dkey)) {
-        return done({ ok: true, agent: id.displayName, agent_id: id.boundAgentId, debounced: true })
+        return done({
+          ok: true,
+          seat: seatLabel || id.displayName,
+          agent: id.displayName,
+          agent_id: id.boundAgentId,
+          debounced: true,
+        })
       }
       await env.SESSIONS.put(dkey, '1', { expirationTtl: 30 })
     } catch {
@@ -3532,9 +3550,15 @@ const toolCheckIn: ToolSpec = {
 
     await recordCheckin(env, id, {
       source: args.source,
-      label: args.label,
+      label: seatLabel || args.label,
     })
-    return done({ ok: true, agent: id.displayName, agent_id: id.boundAgentId, debounced: false })
+    return done({
+      ok: true,
+      seat: seatLabel || id.displayName,
+      agent: id.displayName,
+      agent_id: id.boundAgentId,
+      debounced: false,
+    })
   },
 }
 
@@ -3553,9 +3577,20 @@ const toolStatus: ToolSpec = {
   async run(auth, env, args) {
     const agentId = str(args.agent_id)
     if (!agentId) {
-      // No agent specified → echo the member's own principal (who am I + caps).
-      // bound_agent_id + role are required by fail-closed operator clients (Hermes
-      // mupot plugin): omitting them surfaces as identity_mismatch / overprivileged.
+      // No agent specified → echo the member's own principal (who am I + caps + seat).
+      let seatName: string | null = null
+      let seats: string[] = []
+      try {
+        const presenceRows = await env.DB.prepare(
+          `SELECT label, source, last_seen_at FROM presence WHERE tenant = ?1 AND member_id = ?2 ORDER BY last_seen_at DESC, rowid DESC LIMIT 10`,
+        ).bind(env.TENANT_SLUG, auth.memberId).all<{ label: string; source: string; last_seen_at: string }>()
+
+        seats = (presenceRows.results ?? []).map((r) => r.label).filter(Boolean)
+        seatName = seats[0] ?? null
+      } catch {
+        // Fail-soft: self-echo operates even without DB or in mock capability floor tests
+      }
+
       return done({
         member_id: auth.memberId,
         email: auth.email,
@@ -3563,6 +3598,8 @@ const toolStatus: ToolSpec = {
         tenant: auth.tenant,
         role: auth.role,
         bound_agent_id: auth.boundAgentId ?? null,
+        seat_name: seatName,
+        seats,
         capabilities: auth.capabilities ?? [],
       })
     }
@@ -3570,16 +3607,18 @@ const toolStatus: ToolSpec = {
     const agent = await loadAgent(env, agentId)
     if (!agent) return fail(404, 'agent_not_found')
 
-    // A cross-agent lookup is NOT a self-op — gate it. `min: 'authenticated'` keeps
-    // the self-echo branch above open, but reading another agent's row + Durable
-    // Object runtime requires observer+ on THAT agent's squad (org/dept grants
-    // inherit). Without this an authenticated zero-grant member could enumerate and
-    // probe every agent's runtime. (Floor exempts 'authenticated' tools, so the
-    // gate must live here — #183 adversarial review, P1.)
+    // A cross-agent lookup is NOT a self-op — gate it.
     const grants = auth.capabilities ?? []
     if (!(await memberCanOnSquad(env, grants, agent.squad_id, 'observer'))) {
       return fail(403, 'forbidden', { need: 'observer', scope: 'squad' })
     }
+
+    const presenceRows = await env.DB.prepare(
+      `SELECT label, source, last_seen_at FROM presence WHERE tenant = ?1 AND agent_id = ?2 ORDER BY last_seen_at DESC, rowid DESC LIMIT 10`,
+    ).bind(env.TENANT_SLUG, agent.id).all<{ label: string; source: string; last_seen_at: string }>()
+
+    const seats = (presenceRows.results ?? []).map((r) => r.label).filter(Boolean)
+    const latestSeat = seats[0] ?? null
 
     const stub = env.AGENT.get(env.AGENT.idFromName(agent.id))
     const res = await stub.fetch('https://agent/status')
@@ -3588,6 +3627,8 @@ const toolStatus: ToolSpec = {
       agent: {
         id: agent.id,
         name: agent.name,
+        seat_name: latestSeat,
+        seats,
         role: agent.role,
         model: agent.model,
         status: agent.status,
