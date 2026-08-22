@@ -436,31 +436,23 @@ async function readAgentInboxForReader(
   if (reader === 'signed' && !signedKeyFingerprint) return { ok: false, reason: 'consumer_fenced' }
   const now = opts.now ?? (() => new Date().toISOString())
 
-  const targetSeat = typeof input.seat === 'string' && input.seat.trim().length > 0 ? input.seat.trim() : undefined
-  const seatClause = targetSeat ? 'AND (target_seat = ?6 OR target_seat IS NULL)' : 'AND target_seat IS NULL'
+  const targetSeat = typeof input.seat === 'string' && input.seat.trim().length > 0 ? input.seat.trim() : null
+  const signedFingerprint = reader === 'signed' ? (signedKeyFingerprint ?? null) : null
 
   const cols = 'seq, id, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id, target_seat'
   try {
     let messages: InboxMessage[]
-    const peekPolicyPredicate = reader === 'bearer'
-      ? `AND COALESCE((
-          SELECT mode FROM agent_inbox_fences
-           WHERE tenant = ?1 AND agent_id = ?2
-        ), 'bearer_only') = 'bearer_only'`
-      : `AND EXISTS (SELECT 1 FROM agent_inbox_fences
-                      WHERE tenant = ?1 AND agent_id = ?2
-                        AND mode = 'signed_only' AND key_fingerprint = ?5)`
     if (peek) {
-      const statement = env.DB.prepare(
+      const rows = await env.DB.prepare(
         `SELECT ${cols} FROM agent_messages
           WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL AND seq > ?3
-          ${seatClause}
-          ${peekPolicyPredicate}
+            AND (CASE WHEN ?6 IS NULL THEN target_seat IS NULL ELSE (target_seat = ?6 OR target_seat IS NULL) END)
+            AND (CASE WHEN ?5 IS NULL
+                      THEN COALESCE((SELECT mode FROM agent_inbox_fences WHERE tenant = ?1 AND agent_id = ?2), 'bearer_only') = 'bearer_only'
+                      ELSE EXISTS (SELECT 1 FROM agent_inbox_fences WHERE tenant = ?1 AND agent_id = ?2 AND mode = 'signed_only' AND key_fingerprint = ?5)
+                 END)
           ORDER BY seq ASC LIMIT ?4`,
-      )
-      const rows = await (reader === 'signed'
-        ? statement.bind(tenant, input.agent, sinceSeq, limit, signedKeyFingerprint, targetSeat)
-        : statement.bind(tenant, input.agent, sinceSeq, limit, null, targetSeat)).all<InboxMessage>()
+      ).bind(tenant, input.agent, sinceSeq, limit, signedFingerprint, targetSeat).all<InboxMessage>()
       messages = rows.results ?? []
     } else {
       // Atomic consume: mark the oldest `limit` unread as read and return exactly those rows.
@@ -471,20 +463,16 @@ async function readAgentInboxForReader(
           WHERE seq IN (
             SELECT seq FROM agent_messages
              WHERE tenant = ?2 AND to_agent = ?3 AND read_at IS NULL
-               ${seatClause}
-               AND ${reader === 'bearer'
-                 ? `COALESCE((SELECT mode FROM agent_inbox_fences
-                               WHERE tenant = ?2 AND agent_id = ?3), 'bearer_only') = 'bearer_only'`
-                 : `EXISTS (SELECT 1 FROM agent_inbox_fences
-                             WHERE tenant = ?2 AND agent_id = ?3
-                               AND mode = 'signed_only' AND key_fingerprint = ?5)`}
+               AND (CASE WHEN ?6 IS NULL THEN target_seat IS NULL ELSE (target_seat = ?6 OR target_seat IS NULL) END)
+               AND (CASE WHEN ?5 IS NULL
+                         THEN COALESCE((SELECT mode FROM agent_inbox_fences WHERE tenant = ?2 AND agent_id = ?3), 'bearer_only') = 'bearer_only'
+                         ELSE EXISTS (SELECT 1 FROM agent_inbox_fences WHERE tenant = ?2 AND agent_id = ?3 AND mode = 'signed_only' AND key_fingerprint = ?5)
+                    END)
              ORDER BY seq ASC LIMIT ?4
           )
         RETURNING ${cols}`,
       )
-        .bind(...(reader === 'signed'
-          ? [now(), tenant, input.agent, limit, signedKeyFingerprint, targetSeat]
-          : [now(), tenant, input.agent, limit, null, targetSeat]))
+        .bind(now(), tenant, input.agent, limit, signedFingerprint, targetSeat)
         .all<InboxMessage>()
       messages = (rows.results ?? []).slice().sort((a, b) => Number(a.seq) - Number(b.seq))
     }
@@ -503,21 +491,15 @@ async function readAgentInboxForReader(
       return { ok: false, reason: 'consumer_fenced' }
     }
 
-    const remainingPredicate = reader === 'bearer'
-      ? `AND COALESCE((SELECT mode FROM agent_inbox_fences
-                       WHERE tenant = ?1 AND agent_id = ?2), 'bearer_only') = 'bearer_only'`
-      : `AND EXISTS (SELECT 1 FROM agent_inbox_fences
-                     WHERE tenant = ?1 AND agent_id = ?2
-                       AND mode = 'signed_only' AND key_fingerprint = ?3)`
-    const remainingStatement = env.DB.prepare(
+    const remainingRow = await env.DB.prepare(
       `SELECT COUNT(*) AS n FROM agent_messages
         WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL
-          ${seatClause}
-          ${remainingPredicate}`,
-    )
-    const remainingRow = await (reader === 'signed'
-      ? remainingStatement.bind(tenant, input.agent, signedKeyFingerprint, null, null, targetSeat)
-      : remainingStatement.bind(tenant, input.agent, null, null, null, targetSeat)).first<{ n: number }>()
+          AND (CASE WHEN ?4 IS NULL THEN target_seat IS NULL ELSE (target_seat = ?4 OR target_seat IS NULL) END)
+          AND (CASE WHEN ?3 IS NULL
+                    THEN COALESCE((SELECT mode FROM agent_inbox_fences WHERE tenant = ?1 AND agent_id = ?2), 'bearer_only') = 'bearer_only'
+                    ELSE EXISTS (SELECT 1 FROM agent_inbox_fences WHERE tenant = ?1 AND agent_id = ?2 AND mode = 'signed_only' AND key_fingerprint = ?3)
+               END)`,
+    ).bind(tenant, input.agent, signedFingerprint, targetSeat).first<{ n: number }>()
     const remaining = Number(remainingRow?.n ?? 0)
 
     // normalize seq to number (D1 returns it as a number already, but be defensive)
@@ -685,28 +667,22 @@ export async function leaseAgentInbox(
   if (!Number.isFinite(nowMs)) return { ok: false, reason: 'db_error', detail: 'clock' }
   const expiresIso = new Date(nowMs + leaseSeconds * 1000).toISOString()
 
-  const targetSeat = typeof input.seat === 'string' && input.seat.trim().length > 0 ? input.seat.trim() : undefined
-  const seatClause = (param: string) => (targetSeat ? `AND (target_seat = ${param} OR target_seat IS NULL)` : 'AND target_seat IS NULL')
+  const targetSeat = typeof input.seat === 'string' && input.seat.trim().length > 0 ? input.seat.trim() : null
 
   // "Not currently leased" — NULL means never leased; a lease at or before now has expired.
   // Both timestamps are ISO-8601 UTC with a fixed shape, so lexicographic <= IS chronological.
-  const leasable = (t: string, a: string, n: string, sParam?: string) =>
+  const leasable = (t: string, a: string, nowParam: string, seatParam: string) =>
     `tenant = ${t} AND to_agent = ${a} AND read_at IS NULL AND dead_lettered_at IS NULL
-       ${sParam ? seatClause(sParam) : ''}
-       AND (lease_expires_at IS NULL OR lease_expires_at <= ${n})`
+     AND (lease_expires_at IS NULL OR lease_expires_at <= ${nowParam})
+     AND (CASE WHEN ${seatParam} IS NULL THEN target_seat IS NULL ELSE (target_seat = ${seatParam} OR target_seat IS NULL) END)`
+
+  const bearerFencePredicate = (t: string, a: string) =>
+    `COALESCE((SELECT mode FROM agent_inbox_fences WHERE tenant = ${t} AND agent_id = ${a}), 'bearer_only') = 'bearer_only'`
 
   try {
-    // No pre-flight fence check. An earlier draft had one; a mutation run showed it was
-    // unobservable — deleting it left the whole suite green — because BOTH statements below
-    // carry the fence predicate themselves and the post-check turns a lost race into a
-    // reason. A guard nothing can detect the removal of is not a guard, it is a comment that
-    // costs a query. The fence for this path is: the predicate in the sweep, the predicate in
-    // the lease, and the post-check.
-
-    // Step 1 — dead-letter sweep. A row that has already been handed out MAX_DELIVERY_ATTEMPTS
-    // times and has come back round (lease expired, still unacked) is poison: park it so the
-    // messages queued behind it drain on this very call. This is a separate statement from the
-    // lease on purpose — UPDATE…RETURNING returns every row it touched, so dead-lettering
+    // Step 1 — dead-letter overdue poisoned messages BEFORE the lease. Done here (not on
+    // release) so a message that crashed its consumer never blocks a subsequent lease:
+    // the next lease runs the reaper first and moves the row out of the way. Reaping
     // inside the lease would hand the poison message straight back to the caller.
     await env.DB.prepare(
       `UPDATE agent_messages
@@ -761,7 +737,7 @@ export async function leaseAgentInbox(
          SUM(CASE WHEN dead_lettered_at IS NOT NULL THEN 1 ELSE 0 END) AS dead
         FROM agent_messages
        WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL
-         ${seatClause('?4')}`,
+         AND (CASE WHEN ?4 IS NULL THEN target_seat IS NULL ELSE (target_seat = ?4 OR target_seat IS NULL) END)`,
     ).bind(tenant, input.agent, nowIso, targetSeat).first<{ leasable: number | null; dead: number | null }>()
 
     return {
