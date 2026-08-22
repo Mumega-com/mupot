@@ -437,7 +437,7 @@ async function readAgentInboxForReader(
   const now = opts.now ?? (() => new Date().toISOString())
 
   const targetSeat = typeof input.seat === 'string' && input.seat.trim().length > 0 ? input.seat.trim() : undefined
-  const seatClause = targetSeat ? 'AND (target_seat = ?6 OR target_seat IS NULL)' : ''
+  const seatClause = targetSeat ? 'AND (target_seat = ?6 OR target_seat IS NULL)' : 'AND target_seat IS NULL'
 
   const cols = 'seq, id, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id, target_seat'
   try {
@@ -686,7 +686,7 @@ export async function leaseAgentInbox(
   const expiresIso = new Date(nowMs + leaseSeconds * 1000).toISOString()
 
   const targetSeat = typeof input.seat === 'string' && input.seat.trim().length > 0 ? input.seat.trim() : undefined
-  const seatClause = (param: string) => (targetSeat ? `AND (target_seat = ${param} OR target_seat IS NULL)` : '')
+  const seatClause = (param: string) => (targetSeat ? `AND (target_seat = ${param} OR target_seat IS NULL)` : 'AND target_seat IS NULL')
 
   // "Not currently leased" — NULL means never leased; a lease at or before now has expired.
   // Both timestamps are ISO-8601 UTC with a fixed shape, so lexicographic <= IS chronological.

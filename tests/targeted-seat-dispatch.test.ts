@@ -233,4 +233,61 @@ describe('targeted seat dispatch & isolated mailboxes (Migration 0120)', () => {
       expect(msgs[0].target_seat).toBe('Mumega Ceo')
     }
   })
+
+  it('KILL-WITNESS: un-scoped inbox() call leaves targeted rows for Seat A completely UNREAD and unconsumed', async () => {
+    const senderAuth: AuthContext = {
+      memberId: senderMemberId,
+      boundAgentId: senderAgentId,
+      tenant,
+      role: 'member',
+      channel: 'workspace',
+      capabilities: [{ scope_type: 'squad', scope_id: squadId, capability: 'member' }],
+    }
+
+    const familyAuth: AuthContext = {
+      memberId: familyMemberId,
+      boundAgentId: familyAgentId,
+      tenant,
+      role: 'member',
+      channel: 'workspace',
+      capabilities: [{ scope_type: 'squad', scope_id: squadId, capability: 'member' }],
+    }
+
+    // Send targeted message to Seat Alpha
+    await invokeTool(senderAuth, env, 'send', {
+      to: familyAgentId,
+      body: 'Protected Seat Alpha Message',
+      seat: 'cursor-mupot-setup',
+      request_id: 'req-alpha-kill-witness',
+    })
+
+    // Send un-targeted broadcast message
+    await invokeTool(senderAuth, env, 'send', {
+      to: familyAgentId,
+      body: 'Broadcast Family Message',
+      request_id: 'req-broadcast-kill-witness',
+    })
+
+    // Generic un-scoped inbox() call (no seat arg) — represents legacy/unaware caller
+    const unScopedRead = await invokeTool(familyAuth, env, 'inbox', {
+      peek: false,
+    })
+    expect(unScopedRead.ok).toBe(true)
+    if (unScopedRead.ok) {
+      const msgs = (unScopedRead.result as any).messages as any[]
+      // MUST only receive and consume the broadcast message
+      expect(msgs).toHaveLength(1)
+      expect(msgs[0].body).toBe('Broadcast Family Message')
+      expect(msgs[0].target_seat).toBeNull()
+    }
+
+    // Verify in D1: Protected Seat Alpha Message MUST STILL HAVE read_at IS NULL
+    const alphaRow = harness.sqlite.prepare(
+      `SELECT body, target_seat, read_at FROM agent_messages WHERE request_id = 'req-alpha-kill-witness'`,
+    ).get() as { body: string; target_seat: string; read_at: string | null }
+
+    expect(alphaRow.body).toBe('Protected Seat Alpha Message')
+    expect(alphaRow.target_seat).toBe('cursor-mupot-setup')
+    expect(alphaRow.read_at).toBeNull() // Protected! Not drained by un-scoped call.
+  })
 })
