@@ -97,7 +97,7 @@ import {
   leaseAgentInbox, ackAgentMessages, listDeadLetteredMessages, summarizeDeadLetters,
   MAX_DELIVERY_ATTEMPTS, DEFAULT_LEASE_SECONDS, MAX_LEASE_SECONDS,
 } from '../agents/messages'
-import { recordCheckin, sqliteUtcToMs } from '../fleet/presence'
+import { recordCheckin, touchPresence, sqliteUtcToMs } from '../fleet/presence'
 import {
   readFleetAgentRow,
   getFleetAgentLiveness,
@@ -3717,13 +3717,26 @@ const toolBootContext: ToolSpec = {
   name: 'boot_context',
   scope: 'self (read-only — no args required)',
   min: 'authenticated',
-  args: '{}  // no args — identity is derived entirely from the bearer token',
+  args: '{ source?: string, seat?: string, label?: string }',
   inputSchema: {
     type: 'object',
-    properties: {},
+    properties: {
+      source: STRING_SCHEMA,
+      seat: STRING_SCHEMA,
+      label: STRING_SCHEMA,
+    },
     additionalProperties: false,
   },
-  async run(auth, env, _args, ctx) {
+  async run(auth, env, args, ctx) {
+    if (auth.memberId) {
+      loadMemberIdentity(env, auth).then((id) => {
+        if (id) {
+          const seatLabel = (str(args.seat) || str(args.label) || '').trim()
+          touchPresence(env, id, { source: args.source, label: seatLabel }).catch(() => {})
+        }
+      }).catch(() => {})
+    }
+
     // identity_status: derived from whether this token has an agent-identity binding.
     // The weld (migration 0019) sets member_tokens.agent_id when mint_agent_token runs.
     // auth.boundAgentId mirrors that field — it is resolved server-side from the token,
@@ -4271,6 +4284,18 @@ export async function invokeTool(
     }
     return { ...fail(500, 'internal_error'), tool: spec.name }
   }
+
+  if (outcome.ok && auth.memberId && spec.name !== 'check_in') {
+    // Zero-Touch Living Presence: automatically bump presence for active tool callers.
+    loadMemberIdentity(env, auth)
+      .then((id) => {
+        if (id) {
+          touchPresence(env, id).catch(() => {})
+        }
+      })
+      .catch(() => {})
+  }
+
   return { ...outcome, tool: spec.name }
 }
 
