@@ -520,7 +520,12 @@ export function str(v: unknown): string | null {
 // Per-call context a tool may need beyond auth/args. `origin` is the public scheme+host
 // the caller reached us on (e.g. https://agents.digid.ca) — orient needs it to render the
 // pot's own MCP endpoint into the brief. Derived from the request URL at each call site.
-export type ToolCtx = { origin: string }
+export type ToolCtx = {
+  origin: string
+  waitUntil?: (promise: Promise<unknown>) => void
+  seat?: string
+  source?: string
+}
 
 export interface ToolSpec {
   name: string
@@ -4238,22 +4243,21 @@ function validateArgs(schema: JsonSchema, args: Record<string, unknown>): string
   return null
 }
 
-export interface ToolContext {
-  origin?: string
-  waitUntil?: (promise: Promise<unknown>) => void
-  seat?: string
-  source?: string
-}
-
 export async function invokeTool(
   auth: AuthContext,
   env: Env,
   toolName: unknown,
   argsValue: unknown,
-  originOrCtx: string | ToolContext = '',
+  originOrCtx: string | Partial<ToolCtx> = '',
 ): Promise<ToolOutcome & { tool?: string }> {
-  const ctx: ToolContext = typeof originOrCtx === 'string' ? { origin: originOrCtx } : (originOrCtx ?? {})
-  const origin = ctx.origin ?? ''
+  const ctx: ToolCtx = typeof originOrCtx === 'string'
+    ? { origin: originOrCtx }
+    : {
+        origin: originOrCtx?.origin ?? '',
+        waitUntil: originOrCtx?.waitUntil,
+        seat: originOrCtx?.seat,
+        source: originOrCtx?.source,
+      }
 
   if (typeof toolName !== 'string' || toolName.length === 0) {
     return { ...fail(400, 'invalid_request', 'tool required'), tool: undefined }
@@ -4365,7 +4369,7 @@ async function handleJsonRpc(c: import('hono').Context<AppEnv>, body: JsonRpcReq
     }
 
     const params = typeof body.params === 'object' && body.params !== null ? body.params as Record<string, unknown> : {}
-    const ctx: ToolContext = {
+    const ctx: ToolCtx = {
       origin: new URL(c.req.url).origin,
       waitUntil: safeWaitUntil(c),
       seat: c.req.header('x-mupot-seat'),
@@ -4436,7 +4440,7 @@ mcpApp.post('/', async (c) => {
     return c.json({ error: 'forbidden', reason: 'tenant_scope' }, 403)
   }
 
-  const ctx: ToolContext = {
+  const ctx: ToolCtx = {
     origin: new URL(c.req.url).origin,
     waitUntil: safeWaitUntil(c),
     seat: c.req.header('x-mupot-seat'),
@@ -4537,7 +4541,7 @@ mcpActionsApp.post('/actions/:tool', async (c) => {
     return c.json({ error: 'invalid_json' }, 400)
   }
 
-  const ctx: ToolContext = {
+  const ctx: ToolCtx = {
     origin: new URL(c.req.url).origin,
     waitUntil: safeWaitUntil(c),
     seat: c.req.header('x-mupot-seat'),
