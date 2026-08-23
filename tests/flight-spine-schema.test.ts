@@ -610,22 +610,66 @@ describe('Flight Spine schema migrations', () => {
     `).run(TENANT)).toThrow(/check constraint/i)
   })
 
-  it('permits only the six approved decision classes and one open dedupe key', () => {
-    const classes = [
-      'credential', 'deployment_or_migration', 'destructive',
-      'spend', 'cross_tenant', 'business_choice',
-    ]
-    for (const [index, decisionClass] of classes.entries()) {
+  it('accepts the ten exact decision causes and rejects unknown, case, near-miss, and null', () => {
+    const causes = [
+      ['credential.mint', 'credential'],
+      ['credential.rotate', 'credential'],
+      ['credential.revoke', 'credential'],
+      ['deployment.production', 'deployment_or_migration'],
+      ['migration.production', 'deployment_or_migration'],
+      ['destructive.delete', 'destructive'],
+      ['destructive.destroy_runtime', 'destructive'],
+      ['spend.increase', 'spend'],
+      ['cross_tenant.expand', 'cross_tenant'],
+      ['business.choose', 'business_choice'],
+    ] as const
+
+    for (const [index, [decisionCause, decisionClass]] of causes.entries()) {
       harness.sqlite.prepare(`
         INSERT INTO decision_requests (
-          id, tenant, decision_class, dedupe_key, status,
+          id, tenant, decision_class, decision_cause, dedupe_key, status,
           exact_authority_required, question, options_json, consequences_json,
           evidence_json, requested_by_principal_kind, requested_by_principal_id,
           requested_by_member_id, expires_at, created_receipt_id, created_at
-        ) VALUES (?, ?, ?, ?, 'open', 'Hadi approval', 'Approve?', '[]', '[]', '{}',
+        ) VALUES (?, ?, ?, ?, ?, 'open', 'Hadi approval', 'Approve?', '[]', '[]', '{}',
           'agent', 'agent-worker', 'member-1', '2026-08-24T12:00:00.000Z', NULL,
           '2026-08-23T12:00:00.000Z')
-      `).run(`decision-${index}`, TENANT, decisionClass, `dedupe-${index}`)
+      `).run(
+        `decision-cause-${index}`,
+        TENANT,
+        decisionClass,
+        decisionCause,
+        `decision-cause-dedupe-${index}`,
+      )
+    }
+
+    expect(harness.sqlite.prepare(`
+      SELECT decision_cause
+      FROM decision_requests
+      WHERE id LIKE 'decision-cause-%'
+      ORDER BY decision_cause
+    `).all()).toHaveLength(10)
+
+    for (const [index, decisionCause] of [
+      'unknown',
+      'Credential.mint',
+      'credential-minted',
+    ].entries()) {
+      expect(() => harness.sqlite.prepare(`
+        INSERT INTO decision_requests (
+          id, tenant, decision_class, decision_cause, dedupe_key, status,
+          exact_authority_required, question, options_json, consequences_json,
+          evidence_json, requested_by_principal_kind, requested_by_principal_id,
+          requested_by_member_id, expires_at, created_at
+        ) VALUES (?, ?, 'credential', ?, ?, 'open', 'Hadi approval', 'Approve?',
+          '[]', '[]', '{}', 'agent', 'agent-worker', 'member-1',
+          '2026-08-24T12:00:00.000Z', '2026-08-23T12:00:00.000Z')
+      `).run(
+        `decision-invalid-cause-${index}`,
+        TENANT,
+        decisionCause,
+        `decision-invalid-cause-dedupe-${index}`,
+      )).toThrow(/check constraint/i)
     }
 
     expect(() => harness.sqlite.prepare(`
@@ -635,7 +679,49 @@ describe('Flight Spine schema migrations', () => {
         evidence_json, requested_by_principal_kind, requested_by_principal_id,
         requested_by_member_id, expires_at, created_at
       ) VALUES (
-        'decision-retry', ?, 'retry_exhaustion', 'retry', 'open',
+        'decision-missing-cause', ?, 'credential', 'missing-cause', 'open',
+        'Hadi approval', 'Approve?', '[]', '[]', '{}', 'agent', 'agent-worker', 'member-1',
+        '2026-08-24T12:00:00.000Z', '2026-08-23T12:00:00.000Z'
+      )
+    `).run(TENANT)).toThrow(/not null constraint/i)
+  })
+
+  it('permits only the six approved decision classes and one open dedupe key', () => {
+    const classes = [
+      ['credential', 'credential.mint'],
+      ['deployment_or_migration', 'deployment.production'],
+      ['destructive', 'destructive.delete'],
+      ['spend', 'spend.increase'],
+      ['cross_tenant', 'cross_tenant.expand'],
+      ['business_choice', 'business.choose'],
+    ] as const
+    for (const [index, [decisionClass, decisionCause]] of classes.entries()) {
+      harness.sqlite.prepare(`
+        INSERT INTO decision_requests (
+          id, tenant, decision_class, decision_cause, dedupe_key, status,
+          exact_authority_required, question, options_json, consequences_json,
+          evidence_json, requested_by_principal_kind, requested_by_principal_id,
+          requested_by_member_id, expires_at, created_receipt_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, 'open', 'Hadi approval', 'Approve?', '[]', '[]', '{}',
+          'agent', 'agent-worker', 'member-1', '2026-08-24T12:00:00.000Z', NULL,
+          '2026-08-23T12:00:00.000Z')
+      `).run(
+        `decision-${index}`,
+        TENANT,
+        decisionClass,
+        decisionCause,
+        `dedupe-${index}`,
+      )
+    }
+
+    expect(() => harness.sqlite.prepare(`
+      INSERT INTO decision_requests (
+        id, tenant, decision_class, decision_cause, dedupe_key, status,
+        exact_authority_required, question, options_json, consequences_json,
+        evidence_json, requested_by_principal_kind, requested_by_principal_id,
+        requested_by_member_id, expires_at, created_at
+      ) VALUES (
+        'decision-retry', ?, 'retry_exhaustion', 'business.choose', 'retry', 'open',
         'None', 'Retry?', '[]', '[]', '{}', 'agent', 'agent-worker', 'member-1',
         '2026-08-24T12:00:00.000Z', '2026-08-23T12:00:00.000Z'
       )
@@ -643,12 +729,12 @@ describe('Flight Spine schema migrations', () => {
 
     expect(() => harness.sqlite.prepare(`
       INSERT INTO decision_requests (
-        id, tenant, decision_class, dedupe_key, status,
+        id, tenant, decision_class, decision_cause, dedupe_key, status,
         exact_authority_required, question, options_json, consequences_json,
         evidence_json, requested_by_principal_kind, requested_by_principal_id,
         requested_by_member_id, expires_at, created_at
       ) VALUES (
-        'decision-duplicate', ?, 'credential', 'dedupe-0', 'open',
+        'decision-duplicate', ?, 'credential', 'credential.mint', 'dedupe-0', 'open',
         'Hadi approval', 'Again?', '[]', '[]', '{}', 'agent', 'agent-worker',
         'member-1', '2026-08-24T12:00:00.000Z', '2026-08-23T12:00:00.000Z'
       )

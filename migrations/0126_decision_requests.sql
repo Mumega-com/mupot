@@ -7,6 +7,12 @@ CREATE TABLE decision_requests (
     'credential','deployment_or_migration','destructive',
     'spend','cross_tenant','business_choice'
   )),
+  decision_cause TEXT NOT NULL CHECK (decision_cause IN (
+    'credential.mint','credential.rotate','credential.revoke',
+    'deployment.production','migration.production',
+    'destructive.delete','destructive.destroy_runtime',
+    'spend.increase','cross_tenant.expand','business.choose'
+  )),
   dedupe_key TEXT NOT NULL CHECK (length(trim(dedupe_key)) BETWEEN 1 AND 255),
   status TEXT NOT NULL DEFAULT 'open'
     CHECK (status IN ('open','resolved','expired','cancelled')),
@@ -64,7 +70,7 @@ CREATE TABLE decision_request_resolutions (
 );
 
 CREATE TRIGGER decision_requests_identity_immutable
-BEFORE UPDATE OF id, tenant, decision_class, dedupe_key,
+BEFORE UPDATE OF id, tenant, decision_class, decision_cause, dedupe_key,
   exact_authority_required, question, options_json, consequences_json,
   evidence_json, objective_id, flight_id, task_id,
   requested_by_principal_kind, requested_by_principal_id,
