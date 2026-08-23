@@ -665,14 +665,14 @@ export async function acquireRuntimeSeatLease(
        AND seat.current_fencing_epoch < ?3
        AND agent.status = 'active' AND member.status = 'active'
        AND token.channel = 'workspace'
-       AND ${TOKEN_LIVE_PREDICATE('?13').replaceAll('t.', 'token.')}
-       AND token.token_hash = ?14
-       AND squad.id = ?15 AND squad.department_id = ?16
+       AND ${TOKEN_LIVE_PREDICATE("datetime('now')").replaceAll('t.', 'token.')}
+       AND token.token_hash = ?13
+       AND squad.id = ?14 AND squad.department_id = ?15
        AND CASE membership.capability
          WHEN 'owner' THEN 5 WHEN 'admin' THEN 4 WHEN 'lead' THEN 3
          WHEN 'member' THEN 2 WHEN 'observer' THEN 1 ELSE 0 END >= 2
        AND (
-         ?17 = 1
+         ?16 = 1
          OR EXISTS (
            SELECT 1 FROM capabilities capability
             WHERE capability.member_id = member.id
@@ -697,7 +697,7 @@ export async function acquireRuntimeSeatLease(
          )
        )
        AND julianday(?7) IS NOT NULL
-       AND julianday(?7) > julianday(?6)
+       AND julianday(?7) > julianday('now')
        AND NOT EXISTS (
          SELECT 1 FROM runtime_seat_leases active
           WHERE active.tenant = seat.tenant AND active.runtime_seat_id = seat.id
@@ -721,7 +721,6 @@ export async function acquireRuntimeSeatLease(
       runtimeSeatId,
       env.TENANT_SLUG,
       actor.agentId,
-      leasedAt,
       actor.tokenHash,
       authority.squadId,
       authority.departmentId,
@@ -784,9 +783,9 @@ export async function renewRuntimeSeatLease(
        AND lease.generation = ?5 AND lease.fencing_epoch = ?6
        AND lease.lease_token_hash = ?7 AND lease.state = 'active'
        AND julianday(lease.expires_at) IS NOT NULL
-       AND julianday(lease.expires_at) > julianday(?2)
+       AND julianday(lease.expires_at) > julianday('now')
        AND julianday(?1) IS NOT NULL
-       AND julianday(?1) > julianday(?2)
+       AND julianday(?1) > julianday('now')
        AND julianday(?1) > julianday(lease.expires_at)
        AND EXISTS (
          SELECT 1
@@ -810,7 +809,7 @@ export async function renewRuntimeSeatLease(
             AND seat.current_fencing_epoch < lease.fencing_epoch
             AND agent.status = 'active' AND member.status = 'active'
             AND token.channel = 'workspace' AND token.token_hash = ?11
-            AND ${TOKEN_LIVE_PREDICATE('?2').replaceAll('t.', 'token.')}
+            AND ${TOKEN_LIVE_PREDICATE("datetime('now')").replaceAll('t.', 'token.')}
             AND squad.id = ?12 AND squad.department_id = ?13
             AND CASE membership.capability
               WHEN 'owner' THEN 5 WHEN 'admin' THEN 4 WHEN 'lead' THEN 3
@@ -886,7 +885,7 @@ export async function releaseRuntimeSeatLease(
          AND lease.generation = ?4 AND lease.fencing_epoch = ?5
          AND lease.lease_token_hash = ?6 AND lease.state = 'active'
          AND julianday(lease.expires_at) IS NOT NULL
-         AND julianday(lease.expires_at) > julianday(?1)
+         AND julianday(lease.expires_at) > julianday('now')
          AND EXISTS (
            SELECT 1
              FROM runtime_seats seat
@@ -909,7 +908,7 @@ export async function releaseRuntimeSeatLease(
               AND seat.current_fencing_epoch < lease.fencing_epoch
               AND agent.status = 'active' AND member.status = 'active'
               AND token.channel = 'workspace' AND token.token_hash = ?10
-              AND ${TOKEN_LIVE_PREDICATE('?1').replaceAll('t.', 'token.')}
+              AND ${TOKEN_LIVE_PREDICATE("datetime('now')").replaceAll('t.', 'token.')}
               AND squad.id = ?11 AND squad.department_id = ?12
               AND CASE membership.capability
                 WHEN 'owner' THEN 5 WHEN 'admin' THEN 4 WHEN 'lead' THEN 3

@@ -13,7 +13,7 @@ import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
 const TENANT = 'tenant-flight-seats'
-const NOW = '2026-08-23T16:00:00.000Z'
+const NOW = '2030-08-23T16:00:00.000Z'
 const MEMBER_ID = 'member-command-seat'
 const AGENT_ID = '087a0000-0000-4000-8000-000000000001'
 const TOKEN_ID = 'token-command-seat'
@@ -54,6 +54,24 @@ function count(table: string): number {
   ).get() as { count: number }).count)
 }
 
+function sqliteClockWindow(): {
+  preflight: Date
+  elapsedExpiry: string
+  futureExpiry: string
+  laterFutureExpiry: string
+} {
+  const row = harness.sqlite.prepare(`
+    SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now') AS now
+  `).get() as { now: string }
+  const sqliteNow = new Date(row.now).getTime()
+  return {
+    preflight: new Date(sqliteNow - 60_000),
+    elapsedExpiry: new Date(sqliteNow - 1_000).toISOString(),
+    futureExpiry: new Date(sqliteNow + 10 * 60_000).toISOString(),
+    laterFutureExpiry: new Date(sqliteNow + 20 * 60_000).toISOString(),
+  }
+}
+
 function envWithBeforeBatch(mutate: () => void): MemberTokenFingerprintEnv {
   const committedDb = env.DB
   let injected = false
@@ -68,24 +86,6 @@ function envWithBeforeBatch(mutate: () => void): MemberTokenFingerprintEnv {
         }
         return committedDb.batch(statements)
       },
-    } as D1Database,
-  }
-}
-
-function envWithBeforePrepare(pattern: RegExp, mutate: () => void): MemberTokenFingerprintEnv {
-  const committedDb = env.DB
-  let injected = false
-  return {
-    ...env,
-    DB: {
-      prepare(sql: string) {
-        if (!injected && pattern.test(sql)) {
-          injected = true
-          mutate()
-        }
-        return committedDb.prepare(sql)
-      },
-      batch: committedDb.batch.bind(committedDb),
     } as D1Database,
   }
 }
@@ -176,8 +176,8 @@ beforeEach(() => {
       agent_id, tenant, expires_at
     ) VALUES (
       '${TOKEN_ID}', '${MEMBER_ID}', '${TOKEN_HASH}', 'hadi-codex-cli',
-      'workspace', '2026-08-23T15:00:00.000Z', NULL, '${AGENT_ID}',
-      '${TENANT}', '2026-08-24T16:00:00.000Z'
+      'workspace', '2030-08-23T15:00:00.000Z', NULL, '${AGENT_ID}',
+      '${TENANT}', '2030-08-24T16:00:00.000Z'
     );
   `)
   env = {
@@ -267,7 +267,7 @@ describe('Flight Spine pending runtime seats', () => {
       generation: 1,
       consumerId: 'consumer-command',
       leaseTokenHash: LEASE_HASH_A,
-      expiresAt: '2026-08-23T16:10:00.000Z',
+      expiresAt: '2030-08-23T16:10:00.000Z',
     })).rejects.toMatchObject({ code: 'seat_not_active' })
   })
 
@@ -300,7 +300,7 @@ describe('Flight Spine server-only runtime-seat fencing', () => {
       generation: 1,
       consumerId: 'consumer-denied',
       leaseTokenHash: LEASE_HASH_A,
-      expiresAt: '2026-08-23T16:10:00.000Z',
+      expiresAt: '2030-08-23T16:10:00.000Z',
     })).rejects.toMatchObject({ code: 'lease_forbidden' })
     expect(count('runtime_seat_leases')).toBe(0)
     expect(count('execution_receipts')).toBe(0)
@@ -318,14 +318,14 @@ describe('Flight Spine server-only runtime-seat fencing', () => {
       generation: 1,
       consumerId: 'consumer-explicit-member',
       leaseTokenHash: LEASE_HASH_A,
-      expiresAt: '2026-08-23T16:10:00.000Z',
+      expiresAt: '2030-08-23T16:10:00.000Z',
     })
     const legacy = await acquireRuntimeSeatLease(env, auth(), {
       runtimeSeatId: 'seat-legacy-view',
       generation: 1,
       consumerId: 'consumer-legacy-member',
       leaseTokenHash: LEASE_HASH_B,
-      expiresAt: '2026-08-23T16:10:00.000Z',
+      expiresAt: '2030-08-23T16:10:00.000Z',
     })
 
     expect(explicit.state).toBe('active')
@@ -346,7 +346,7 @@ describe('Flight Spine server-only runtime-seat fencing', () => {
       generation: 1,
       consumerId: 'consumer-raced-authority',
       leaseTokenHash: LEASE_HASH_A,
-      expiresAt: '2026-08-23T16:10:00.000Z',
+      expiresAt: '2030-08-23T16:10:00.000Z',
     })).rejects.toBeTruthy()
     expect(count('runtime_seat_leases')).toBe(0)
     expect(count('execution_receipts')).toBe(0)
@@ -354,11 +354,11 @@ describe('Flight Spine server-only runtime-seat fencing', () => {
   })
 
   it.each([
-    '2026-08-23T16:10:00Z',
-    '2026-08-23 16:10:00.000Z',
-    'Sun, 23 Aug 2026 16:10:00 GMT',
-    '8/23/2026, 4:10:00 PM',
-    '2026-08-23T12:10:00.000-04:00',
+    '2030-08-23T16:10:00Z',
+    '2030-08-23 16:10:00.000Z',
+    'Fri, 23 Aug 2030 16:10:00 GMT',
+    '8/23/2030, 4:10:00 PM',
+    '2030-08-23T12:10:00.000-04:00',
     'not-a-date',
   ])('rejects noncanonical acquisition and renewal expiry %s', async (expiresAt) => {
     activateSeat()
@@ -376,7 +376,7 @@ describe('Flight Spine server-only runtime-seat fencing', () => {
       generation: 1,
       consumerId: 'consumer-valid-expiry',
       leaseTokenHash: LEASE_HASH_A,
-      expiresAt: '2026-08-23T16:10:00.000Z',
+      expiresAt: '2030-08-23T16:10:00.000Z',
     })
     await expect(renewRuntimeSeatLease(env, auth(), {
       runtimeSeatId: 'seat-live',
@@ -388,58 +388,150 @@ describe('Flight Spine server-only runtime-seat fencing', () => {
     expect(harness.sqlite.prepare(`
       SELECT expires_at, renewed_at FROM runtime_seat_leases WHERE id = ?
     `).get(active.id)).toEqual({
-      expires_at: '2026-08-23T16:10:00.000Z',
+      expires_at: '2030-08-23T16:10:00.000Z',
       renewed_at: null,
     })
   })
 
-  it('rolls back a near-future acquisition that expires after preflight but before DML', async () => {
+  it('uses SQLite statement time to roll back an acquisition whose lease expiry already elapsed', async () => {
     activateSeat()
-    const racedEnv = envWithBeforePrepare(
-      /SELECT sequence, receipt_id, receipt_hash\s+FROM execution_receipt_heads/,
-      () => vi.setSystemTime(new Date('2026-08-23T16:00:00.002Z')),
-    )
+    const clock = sqliteClockWindow()
+    vi.setSystemTime(clock.preflight)
 
-    await expect(acquireRuntimeSeatLease(racedEnv, auth(), {
+    await expect(acquireRuntimeSeatLease(env, auth(), {
       runtimeSeatId: 'seat-live',
       generation: 1,
-      consumerId: 'consumer-expiry-race',
+      consumerId: 'consumer-sqlite-lease-expiry',
       leaseTokenHash: LEASE_HASH_A,
-      expiresAt: '2026-08-23T16:00:00.001Z',
+      expiresAt: clock.elapsedExpiry,
     })).rejects.toBeTruthy()
     expect(count('runtime_seat_leases')).toBe(0)
     expect(count('execution_receipts')).toBe(0)
     expect(count('mutation_audit_entries')).toBe(0)
   })
 
-  it('rejects a renewal that expires after preflight without changing or wedging the lease', async () => {
+  it('uses SQLite statement time to roll back acquisition after the exact token expires', async () => {
     activateSeat()
+    const clock = sqliteClockWindow()
+    harness.sqlite.prepare(`
+      UPDATE member_tokens SET expires_at = ? WHERE id = ?
+    `).run(clock.elapsedExpiry, TOKEN_ID)
+    vi.setSystemTime(clock.preflight)
+
+    await expect(acquireRuntimeSeatLease(env, auth(), {
+      runtimeSeatId: 'seat-live',
+      generation: 1,
+      consumerId: 'consumer-sqlite-token-expiry',
+      leaseTokenHash: LEASE_HASH_A,
+      expiresAt: clock.futureExpiry,
+    })).rejects.toBeTruthy()
+    expect(count('runtime_seat_leases')).toBe(0)
+    expect(count('execution_receipts')).toBe(0)
+    expect(count('mutation_audit_entries')).toBe(0)
+  })
+
+  it('uses SQLite statement time to reject renewal of an already expired active lease', async () => {
+    activateSeat()
+    const clock = sqliteClockWindow()
+    vi.setSystemTime(clock.preflight)
     const active = await acquireRuntimeSeatLease(env, auth(), {
       runtimeSeatId: 'seat-live',
       generation: 1,
-      consumerId: 'consumer-renew-expiry-race',
+      consumerId: 'consumer-sqlite-renew-lease-expiry',
       leaseTokenHash: LEASE_HASH_A,
-      expiresAt: '2026-08-23T16:00:00.002Z',
+      expiresAt: clock.futureExpiry,
     })
-    const racedEnv = envWithBeforePrepare(
-      /SELECT seat\.id, seat\.tenant, seat\.agent_id/,
-      () => vi.setSystemTime(new Date('2026-08-23T16:00:00.004Z')),
-    )
-
-    await expect(renewRuntimeSeatLease(racedEnv, auth(), {
+    harness.sqlite.prepare(`
+      UPDATE runtime_seat_leases SET expires_at = ? WHERE id = ?
+    `).run(clock.elapsedExpiry, active.id)
+    const beforeLease = harness.sqlite.prepare(`
+      SELECT state, expires_at, renewed_at, released_at
+        FROM runtime_seat_leases WHERE id = ?
+    `).get(active.id)
+    const beforeReceipts = count('execution_receipts')
+    const beforeAudits = count('mutation_audit_entries')
+    await expect(renewRuntimeSeatLease(env, auth(), {
       runtimeSeatId: 'seat-live',
       generation: 1,
       fencingEpoch: active.fencingEpoch,
       leaseTokenHash: LEASE_HASH_A,
-      expiresAt: '2026-08-23T16:00:00.003Z',
+      expiresAt: clock.laterFutureExpiry,
     })).rejects.toMatchObject({ code: 'stale_lease' })
     expect(harness.sqlite.prepare(`
-      SELECT state, expires_at, renewed_at FROM runtime_seat_leases WHERE id = ?
-    `).get(active.id)).toEqual({
-      state: 'active',
-      expires_at: '2026-08-23T16:00:00.002Z',
-      renewed_at: null,
+      SELECT state, expires_at, renewed_at, released_at
+        FROM runtime_seat_leases WHERE id = ?
+    `).get(active.id)).toEqual(beforeLease)
+    expect(count('execution_receipts')).toBe(beforeReceipts)
+    expect(count('mutation_audit_entries')).toBe(beforeAudits)
+  })
+
+  it('uses SQLite statement time to reject renewal after the exact token expires', async () => {
+    activateSeat()
+    const clock = sqliteClockWindow()
+    vi.setSystemTime(clock.preflight)
+    const active = await acquireRuntimeSeatLease(env, auth(), {
+      runtimeSeatId: 'seat-live',
+      generation: 1,
+      consumerId: 'consumer-sqlite-renew-token-expiry',
+      leaseTokenHash: LEASE_HASH_A,
+      expiresAt: clock.futureExpiry,
     })
+    harness.sqlite.prepare(`
+      UPDATE member_tokens SET expires_at = ? WHERE id = ?
+    `).run(clock.elapsedExpiry, TOKEN_ID)
+    const beforeLease = harness.sqlite.prepare(`
+      SELECT state, expires_at, renewed_at, released_at
+        FROM runtime_seat_leases WHERE id = ?
+    `).get(active.id)
+    const beforeReceipts = count('execution_receipts')
+    const beforeAudits = count('mutation_audit_entries')
+    await expect(renewRuntimeSeatLease(env, auth(), {
+      runtimeSeatId: 'seat-live',
+      generation: 1,
+      fencingEpoch: active.fencingEpoch,
+      leaseTokenHash: LEASE_HASH_A,
+      expiresAt: clock.laterFutureExpiry,
+    })).rejects.toMatchObject({ code: 'stale_lease' })
+    expect(harness.sqlite.prepare(`
+      SELECT state, expires_at, renewed_at, released_at
+        FROM runtime_seat_leases WHERE id = ?
+    `).get(active.id)).toEqual(beforeLease)
+    expect(count('execution_receipts')).toBe(beforeReceipts)
+    expect(count('mutation_audit_entries')).toBe(beforeAudits)
+  })
+
+  it('uses SQLite statement time to reject release after the exact token expires', async () => {
+    activateSeat()
+    const clock = sqliteClockWindow()
+    vi.setSystemTime(clock.preflight)
+    const active = await acquireRuntimeSeatLease(env, auth(), {
+      runtimeSeatId: 'seat-live',
+      generation: 1,
+      consumerId: 'consumer-sqlite-release-token-expiry',
+      leaseTokenHash: LEASE_HASH_A,
+      expiresAt: clock.futureExpiry,
+    })
+    harness.sqlite.prepare(`
+      UPDATE member_tokens SET expires_at = ? WHERE id = ?
+    `).run(clock.elapsedExpiry, TOKEN_ID)
+    const beforeLease = harness.sqlite.prepare(`
+      SELECT state, expires_at, renewed_at, released_at
+        FROM runtime_seat_leases WHERE id = ?
+    `).get(active.id)
+    const beforeReceipts = count('execution_receipts')
+    const beforeAudits = count('mutation_audit_entries')
+    await expect(releaseRuntimeSeatLease(env, auth(), {
+      runtimeSeatId: 'seat-live',
+      generation: 1,
+      fencingEpoch: active.fencingEpoch,
+      leaseTokenHash: LEASE_HASH_A,
+    })).rejects.toMatchObject({ code: 'stale_lease' })
+    expect(harness.sqlite.prepare(`
+      SELECT state, expires_at, renewed_at, released_at
+        FROM runtime_seat_leases WHERE id = ?
+    `).get(active.id)).toEqual(beforeLease)
+    expect(count('execution_receipts')).toBe(beforeReceipts)
+    expect(count('mutation_audit_entries')).toBe(beforeAudits)
   })
 
   it('persists and loads the exact acquired receipt ID despite a competing same-tuple receipt', async () => {
@@ -459,7 +551,7 @@ describe('Flight Spine server-only runtime-seat fencing', () => {
       generation: 1,
       consumerId: 'consumer-exact-receipt',
       leaseTokenHash: LEASE_HASH_A,
-      expiresAt: '2026-08-23T16:10:00.000Z',
+      expiresAt: '2030-08-23T16:10:00.000Z',
     })
 
     expect(acquired.receiptId).not.toBe(competing.id)
@@ -476,7 +568,7 @@ describe('Flight Spine server-only runtime-seat fencing', () => {
       generation: 1,
       consumerId: 'consumer-origin',
       leaseTokenHash: LEASE_HASH_A,
-      expiresAt: '2026-08-23T16:10:00.000Z',
+      expiresAt: '2030-08-23T16:10:00.000Z',
     })
 
     expect(harness.sqlite.prepare(`
@@ -496,7 +588,7 @@ describe('Flight Spine server-only runtime-seat fencing', () => {
       generation: 1,
       consumerId: 'consumer-command',
       leaseTokenHash: LEASE_HASH_A,
-      expiresAt: '2026-08-23T16:10:00.000Z',
+      expiresAt: '2030-08-23T16:10:00.000Z',
     })
 
     expect(first).toMatchObject({
@@ -524,7 +616,7 @@ describe('Flight Spine server-only runtime-seat fencing', () => {
       generation: 1,
       consumerId: 'consumer-review',
       leaseTokenHash: LEASE_HASH_B,
-      expiresAt: '2026-08-23T16:10:00.000Z',
+      expiresAt: '2030-08-23T16:10:00.000Z',
     })).rejects.toMatchObject({ code: 'active_lease_exists' })
 
     await expect(renewRuntimeSeatLease(env, auth(), {
@@ -532,18 +624,18 @@ describe('Flight Spine server-only runtime-seat fencing', () => {
       generation: 1,
       fencingEpoch: 1,
       leaseTokenHash: LEASE_HASH_B,
-      expiresAt: '2026-08-23T16:20:00.000Z',
+      expiresAt: '2030-08-23T16:20:00.000Z',
     })).rejects.toMatchObject({ code: 'stale_lease' })
     const renewed = await renewRuntimeSeatLease(env, auth(), {
       runtimeSeatId: 'seat-live',
       generation: 1,
       fencingEpoch: 1,
       leaseTokenHash: LEASE_HASH_A,
-      expiresAt: '2026-08-23T16:20:00.000Z',
+      expiresAt: '2030-08-23T16:20:00.000Z',
     })
     expect(renewed).toMatchObject({
       fencingEpoch: 1,
-      expiresAt: '2026-08-23T16:20:00.000Z',
+      expiresAt: '2030-08-23T16:20:00.000Z',
       renewedAt: NOW,
     })
 
@@ -568,7 +660,7 @@ describe('Flight Spine server-only runtime-seat fencing', () => {
       generation: 1,
       fencingEpoch: 1,
       leaseTokenHash: LEASE_HASH_A,
-      expiresAt: '2026-08-23T16:30:00.000Z',
+      expiresAt: '2030-08-23T16:30:00.000Z',
     })).rejects.toMatchObject({ code: 'stale_lease' })
     await expect(releaseRuntimeSeatLease(env, auth(), {
       runtimeSeatId: 'seat-live',
@@ -582,7 +674,7 @@ describe('Flight Spine server-only runtime-seat fencing', () => {
       generation: 1,
       consumerId: 'consumer-review',
       leaseTokenHash: LEASE_HASH_B,
-      expiresAt: '2026-08-23T16:30:00.000Z',
+      expiresAt: '2030-08-23T16:30:00.000Z',
     })
     expect(second.fencingEpoch).toBe(2)
     expect(harness.sqlite.prepare(`
@@ -598,7 +690,7 @@ describe('Flight Spine server-only runtime-seat fencing', () => {
       generation: 1,
       consumerId: 'consumer-command',
       leaseTokenHash: LEASE_HASH_A,
-      expiresAt: '2026-08-23T16:10:00.000Z',
+      expiresAt: '2030-08-23T16:10:00.000Z',
     })
     await releaseRuntimeSeatLease(env, auth(), {
       runtimeSeatId: 'seat-live',
@@ -626,14 +718,14 @@ describe('Flight Spine server-only runtime-seat fencing', () => {
       generation: 1,
       consumerId: 'consumer-stale',
       leaseTokenHash: LEASE_HASH_B,
-      expiresAt: '2026-08-23T16:20:00.000Z',
+      expiresAt: '2030-08-23T16:20:00.000Z',
     })).rejects.toMatchObject({ code: 'stale_generation' })
     const current = await acquireRuntimeSeatLease(env, auth(), {
       runtimeSeatId: 'seat-live',
       generation: 2,
       consumerId: 'consumer-current',
       leaseTokenHash: LEASE_HASH_B,
-      expiresAt: '2026-08-23T16:20:00.000Z',
+      expiresAt: '2030-08-23T16:20:00.000Z',
     })
     expect(current.fencingEpoch).toBe(2)
     expect(() => harness.sqlite.prepare(`
@@ -651,7 +743,7 @@ describe('Flight Spine server-only runtime-seat fencing', () => {
       generation: 2,
       fencingEpoch: current.fencingEpoch,
       leaseTokenHash: LEASE_HASH_B,
-      expiresAt: '2026-08-23T16:30:00.000Z',
+      expiresAt: '2030-08-23T16:30:00.000Z',
     })).rejects.toMatchObject({ code: 'seat_revoked' })
     await expect(releaseRuntimeSeatLease(env, auth(), {
       runtimeSeatId: 'seat-live',
@@ -666,7 +758,6 @@ describe('Flight Spine server-only runtime-seat fencing', () => {
 
   const identityRaces = [
     ['token revoke', `UPDATE member_tokens SET revoked_at = '${NOW}' WHERE id = '${TOKEN_ID}'`],
-    ['token expiry', `UPDATE member_tokens SET expires_at = '2026-08-23T15:59:59.000Z' WHERE id = '${TOKEN_ID}'`],
     ['token hash replacement', `UPDATE member_tokens SET token_hash = '${'f'.repeat(64)}' WHERE id = '${TOKEN_ID}'`],
     ['member suspension', `UPDATE members SET status = 'suspended' WHERE id = '${MEMBER_ID}'`],
     ['agent pause', `UPDATE agents SET status = 'paused' WHERE id = '${AGENT_ID}'`],
@@ -684,7 +775,7 @@ describe('Flight Spine server-only runtime-seat fencing', () => {
           generation: 1,
           consumerId: `consumer-${operation}-race`,
           leaseTokenHash: LEASE_HASH_A,
-          expiresAt: '2026-08-23T16:10:00.000Z',
+          expiresAt: '2030-08-23T16:10:00.000Z',
         })
         const beforeLease = harness.sqlite.prepare(`
           SELECT state, expires_at, renewed_at, released_at
@@ -705,7 +796,7 @@ describe('Flight Spine server-only runtime-seat fencing', () => {
               generation: 1,
               fencingEpoch: active.fencingEpoch,
               leaseTokenHash: LEASE_HASH_A,
-              expiresAt: '2026-08-23T16:20:00.000Z',
+              expiresAt: '2030-08-23T16:20:00.000Z',
             })
           : releaseRuntimeSeatLease(racedEnv, auth(), {
               runtimeSeatId: 'seat-live',
