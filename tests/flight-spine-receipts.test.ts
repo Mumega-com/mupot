@@ -3,7 +3,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { canonicalJson, sha256Hex } from '../src/lib/canonical-json'
 import {
   appendExecutionReceipt,
+  composePreparedExecutionReceiptBatch,
   getExecutionReceipt,
+  prepareFreshExecutionReceiptChain,
+  rereadAndVerifyPreparedExecutionReceipts,
+  verifyPreparedExecutionReceiptBatchResult,
   verifyExecutionReceipt,
 } from '../src/flight-spine/receipts'
 import type { AuthContext, Env } from '../src/types'
@@ -71,6 +75,159 @@ afterEach(() => {
 })
 
 describe('Flight Spine execution receipt ledger', () => {
+  it('commits two prepared receipts and a domain row in one verified chain batch', async () => {
+    const prepared = await prepareFreshExecutionReceiptChain(env, memberAuth(), [
+      draft('prepared-objective'),
+      draft('prepared-flight', {
+        type: 'flight.materialized',
+        flightId: 'prepared-flight-1',
+        claims: { lanes: 2 },
+      }),
+    ])
+    const domainStatement = env.DB.prepare(`
+      INSERT INTO departments (id, slug, name)
+      VALUES ('prepared-domain', 'prepared-domain', 'Prepared Domain')
+    `)
+    const statements = composePreparedExecutionReceiptBatch(prepared, [domainStatement])
+
+    expect(prepared.receiptAndEdgeStatements).toHaveLength(3)
+    expect(prepared.expectedReceipts).toHaveLength(2)
+    expect(statements).toHaveLength(5)
+    expect(statements.at(-1)).toBe(prepared.finalHeadStatement)
+
+    const results = await env.DB.batch(statements)
+    const commit = verifyPreparedExecutionReceiptBatchResult(prepared, results)
+    const receipts = await rereadAndVerifyPreparedExecutionReceipts(env, prepared, results)
+
+    expect(commit).toEqual({
+      finalSequence: 2,
+      finalReceiptId: prepared.expectedReceipts[1].id,
+      finalReceiptHash: prepared.expectedReceipts[1].receiptHash,
+    })
+    expect(receipts).toHaveLength(2)
+    expect(receipts[0]).toMatchObject({
+      id: prepared.expectedReceipts[0].id,
+      sequence: 1,
+      predecessorReceiptId: null,
+      serverTimestamp: SERVER_TIME,
+    })
+    expect(receipts[1]).toMatchObject({
+      id: prepared.expectedReceipts[1].id,
+      sequence: 2,
+      predecessorReceiptId: receipts[0].id,
+      predecessorHash: receipts[0].receiptHash,
+      serverTimestamp: SERVER_TIME,
+    })
+    expect(harness.sqlite.prepare(`
+      SELECT id, slug, name FROM departments WHERE id = 'prepared-domain'
+    `).get()).toEqual({
+      id: 'prepared-domain',
+      slug: 'prepared-domain',
+      name: 'Prepared Domain',
+    })
+    expect(harness.sqlite.prepare(`
+      SELECT receipt_id, receipt_hash FROM execution_receipt_heads WHERE tenant = ?
+    `).get(TENANT)).toEqual({
+      receipt_id: receipts[1].id,
+      receipt_hash: receipts[1].receiptHash,
+    })
+    expect(harness.sqlite.prepare(`
+      SELECT from_receipt_id, to_receipt_id, relation
+        FROM execution_receipt_edges
+       WHERE tenant = ?
+    `).get(TENANT)).toEqual({
+      from_receipt_id: receipts[0].id,
+      to_receipt_id: receipts[1].id,
+      relation: 'predecessor',
+    })
+  })
+
+  it('rolls back prepared receipts, edges, head and domain rows when a domain statement fails', async () => {
+    const prepared = await prepareFreshExecutionReceiptChain(env, memberAuth(), [
+      draft('domain-failure-first'),
+      draft('domain-failure-second', { type: 'flight.materialized', flightId: 'flight-failure' }),
+    ])
+    const domainInsert = env.DB.prepare(`
+      INSERT INTO departments (id, slug, name)
+      VALUES ('domain-rollback', 'domain-rollback', 'Domain Rollback')
+    `)
+    const forcedFailure = env.DB.prepare(`
+      INSERT INTO departments (id, slug, name)
+      VALUES ('domain-rollback', 'domain-rollback-copy', 'Must Fail')
+    `)
+
+    await expect(env.DB.batch(composePreparedExecutionReceiptBatch(
+      prepared,
+      [domainInsert, forcedFailure],
+    ))).rejects.toThrow(/unique constraint/i)
+
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM execution_receipts').get())
+      .toEqual({ count: 0 })
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM execution_receipt_edges').get())
+      .toEqual({ count: 0 })
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM execution_receipt_heads').get())
+      .toEqual({ count: 0 })
+    expect(harness.sqlite.prepare(`
+      SELECT COUNT(*) AS count FROM departments WHERE id = 'domain-rollback'
+    `).get()).toEqual({ count: 0 })
+  })
+
+  it('rolls back prepared receipts, edges and domain rows when the final head CAS is stale', async () => {
+    const first = await appendExecutionReceipt(env, memberAuth(), draft('prepared-stale-base'))
+    const prepared = await prepareFreshExecutionReceiptChain(env, memberAuth(), [
+      draft('prepared-stale-first'),
+      draft('prepared-stale-second', { type: 'task.assigned', taskId: 'task-stale' }),
+    ])
+    const competitor = await appendExecutionReceipt(env, memberAuth(), draft('prepared-stale-competitor'))
+    const edgeCountBefore = harness.sqlite.prepare(`
+      SELECT COUNT(*) AS count FROM execution_receipt_edges WHERE tenant = ?
+    `).get(TENANT)
+    const headBefore = harness.sqlite.prepare(`
+      SELECT sequence, receipt_id, receipt_hash
+        FROM execution_receipt_heads
+       WHERE tenant = ?
+    `).get(TENANT)
+    const domainStatement = env.DB.prepare(`
+      INSERT INTO departments (id, slug, name)
+      VALUES ('stale-domain', 'stale-domain', 'Stale Domain')
+    `)
+
+    await expect(env.DB.batch(composePreparedExecutionReceiptBatch(
+      prepared,
+      [domainStatement],
+    ))).rejects.toThrow(/head sequence must advance/i)
+
+    expect(first.id).not.toBe(competitor.id)
+    expect(harness.sqlite.prepare(`
+      SELECT COUNT(*) AS count
+        FROM execution_receipts
+       WHERE idempotency_key IN ('prepared-stale-first', 'prepared-stale-second')
+    `).get()).toEqual({ count: 0 })
+    expect(harness.sqlite.prepare(`
+      SELECT COUNT(*) AS count FROM execution_receipt_edges WHERE tenant = ?
+    `).get(TENANT)).toEqual(edgeCountBefore)
+    expect(harness.sqlite.prepare(`
+      SELECT sequence, receipt_id, receipt_hash
+        FROM execution_receipt_heads
+       WHERE tenant = ?
+    `).get(TENANT)).toEqual(headBefore)
+    expect(harness.sqlite.prepare(`
+      SELECT COUNT(*) AS count FROM departments WHERE id = 'stale-domain'
+    `).get()).toEqual({ count: 0 })
+  })
+
+  it('rejects an existing idempotency key in the fresh-only prepared builder', async () => {
+    const existing = draft('prepared-existing-key')
+    const original = await appendExecutionReceipt(env, memberAuth(), existing)
+
+    await expect(prepareFreshExecutionReceiptChain(env, memberAuth(), [existing]))
+      .rejects.toMatchObject({
+        name: 'ExecutionReceiptError',
+        code: 'idempotency_conflict',
+      })
+    expect(await appendExecutionReceipt(env, memberAuth(), existing)).toEqual(original)
+  })
+
   it('creates a genesis receipt, then links its successor and advances the tenant head', async () => {
     const first = await appendExecutionReceipt(env, memberAuth(), draft('objective-accepted'))
     const second = await appendExecutionReceipt(env, memberAuth(), draft('flight-materialized', {

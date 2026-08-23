@@ -1,4 +1,4 @@
-import type { D1Database, D1PreparedStatement } from '@cloudflare/workers-types'
+import type { D1Database, D1PreparedStatement, D1Result } from '@cloudflare/workers-types'
 import type { AuthContext, Env } from '../types'
 import { canonicalJson, sha256Hex } from '../lib/canonical-json'
 import { assertBatchWritten } from '../lib/receipt'
@@ -87,6 +87,26 @@ interface NormalizedDraft {
   assignmentEpoch: number | null
   fencingEpoch: number | null
   leaseTokenHash: string | null
+}
+
+const PREPARED_RECEIPT_CHAIN = Symbol('prepared-execution-receipt-chain')
+
+export type PreparedExecutionReceiptFacts = Omit<ExecutionReceipt, 'sequence'>
+
+/** Internal service contract. Use composePreparedExecutionReceiptBatch to assemble it. */
+export interface PreparedExecutionReceiptChain {
+  readonly [PREPARED_RECEIPT_CHAIN]: true
+  readonly tenant: string
+  readonly expectedStartingHeadId: string | null
+  readonly receiptAndEdgeStatements: readonly D1PreparedStatement[]
+  readonly finalHeadStatement: D1PreparedStatement
+  readonly expectedReceipts: readonly PreparedExecutionReceiptFacts[]
+}
+
+export interface PreparedExecutionReceiptCommit {
+  readonly finalSequence: number
+  readonly finalReceiptId: string
+  readonly finalReceiptHash: string
 }
 
 const RECEIPT_COLUMNS = `
@@ -209,6 +229,227 @@ function canonicalPayload(input: {
     predecessor_hash: input.predecessorHash,
     server_timestamp: input.serverTimestamp,
   })
+}
+
+function prepareReceiptInsert(
+  db: ReceiptDb,
+  receipt: PreparedExecutionReceiptFacts,
+): D1PreparedStatement {
+  return db.prepare(`
+    INSERT INTO execution_receipts (
+      id, tenant, type, issuer_kind, issuer_id, actor_kind, actor_id,
+      seat_id, seat_generation, objective_id, flight_id, task_id, message_id,
+      assignment_epoch, fencing_epoch, lease_token_hash, idempotency_key,
+      claims_json, canonical_payload, payload_digest, predecessor_receipt_id,
+      predecessor_hash, receipt_hash, server_timestamp
+    ) VALUES (
+      ?1, ?2, ?3, 'mupot', ?4, ?5, ?6,
+      ?7, ?8, ?9, ?10, ?11, ?12,
+      ?13, ?14, ?15, ?16,
+      ?17, ?18, ?19, ?20,
+      ?21, ?22, ?23
+    )
+  `).bind(
+    receipt.id,
+    receipt.tenant,
+    receipt.type,
+    receipt.issuerId,
+    receipt.actorKind,
+    receipt.actorId,
+    receipt.seatId,
+    receipt.seatGeneration,
+    receipt.objectiveId,
+    receipt.flightId,
+    receipt.taskId,
+    receipt.messageId,
+    receipt.assignmentEpoch,
+    receipt.fencingEpoch,
+    receipt.leaseTokenHash,
+    receipt.idempotencyKey,
+    receipt.claimsJson,
+    receipt.canonicalPayload,
+    receipt.payloadDigest,
+    receipt.predecessorReceiptId,
+    receipt.predecessorHash,
+    receipt.receiptHash,
+    receipt.serverTimestamp,
+  )
+}
+
+function preparePredecessorEdge(
+  db: ReceiptDb,
+  tenant: string,
+  fromReceiptId: string,
+  toReceiptId: string,
+  serverTimestamp: string,
+): D1PreparedStatement {
+  return db.prepare(`
+    INSERT INTO execution_receipt_edges (
+      id, tenant, from_receipt_id, to_receipt_id, relation, created_at
+    ) VALUES (?1, ?2, ?3, ?4, 'predecessor', ?5)
+  `).bind(crypto.randomUUID(), tenant, fromReceiptId, toReceiptId, serverTimestamp)
+}
+
+function prepareFinalHeadCas(
+  db: ReceiptDb,
+  tenant: string,
+  finalReceipt: PreparedExecutionReceiptFacts,
+  expectedStartingHeadId: string | null,
+): D1PreparedStatement {
+  return db.prepare(`
+    INSERT INTO execution_receipt_heads (
+      tenant, sequence, receipt_id, receipt_hash, updated_at
+    )
+    SELECT tenant, sequence, id, receipt_hash, server_timestamp
+      FROM execution_receipts
+     WHERE tenant = ?1 AND id = ?2
+    ON CONFLICT (tenant) DO UPDATE SET
+      sequence = CASE
+        WHEN execution_receipt_heads.receipt_id IS ?3 THEN excluded.sequence
+        ELSE execution_receipt_heads.sequence
+      END,
+      receipt_id = CASE
+        WHEN execution_receipt_heads.receipt_id IS ?3 THEN excluded.receipt_id
+        ELSE execution_receipt_heads.receipt_id
+      END,
+      receipt_hash = CASE
+        WHEN execution_receipt_heads.receipt_id IS ?3 THEN excluded.receipt_hash
+        ELSE execution_receipt_heads.receipt_hash
+      END,
+      updated_at = CASE
+        WHEN execution_receipt_heads.receipt_id IS ?3 THEN excluded.updated_at
+        ELSE execution_receipt_heads.updated_at
+      END
+    RETURNING sequence, receipt_id, receipt_hash
+  `).bind(tenant, finalReceipt.id, expectedStartingHeadId)
+}
+
+/**
+ * Prepare a fresh-only receipt chain for composition with domain statements.
+ * Existing or repeated idempotency keys are conflicts; replay remains an
+ * appendExecutionReceipt concern.
+ */
+export async function prepareFreshExecutionReceiptChain(
+  env: Env,
+  auth: AuthContext,
+  inputs: readonly ExecutionReceiptDraft[],
+): Promise<PreparedExecutionReceiptChain> {
+  if (inputs.length === 0) throw new ExecutionReceiptError('invalid_draft')
+  const tenant = env.TENANT_SLUG
+  const actor = actorFromAuth(env, auth)
+  const issuerId = `mupot:${tenant}`
+  const drafts = inputs.map(normalizeDraft)
+  const seenKeys = new Set<string>()
+  for (const draft of drafts) {
+    if (seenKeys.has(draft.idempotencyKey)) {
+      throw new ExecutionReceiptError('idempotency_conflict')
+    }
+    seenKeys.add(draft.idempotencyKey)
+  }
+
+  const readDb = primaryDb(env)
+  const statementDb: ReceiptDb = env.DB
+  for (const draft of drafts) {
+    if (await receiptByIdempotencyKey(readDb, tenant, issuerId, draft.idempotencyKey)) {
+      throw new ExecutionReceiptError('idempotency_conflict')
+    }
+  }
+
+  const head = await readDb.prepare(`
+    SELECT sequence, receipt_id, receipt_hash
+      FROM execution_receipt_heads
+     WHERE tenant = ?1
+  `).bind(tenant).first<ReceiptHeadRow>()
+  const expectedStartingHeadId = head?.receipt_id ?? null
+  let predecessorReceiptId = expectedStartingHeadId
+  let predecessorHash = head?.receipt_hash ?? null
+  const serverTimestamp = new Date().toISOString()
+  const receiptAndEdgeStatements: D1PreparedStatement[] = []
+  const expectedReceipts: PreparedExecutionReceiptFacts[] = []
+
+  for (const draft of drafts) {
+    const payloadDigest = await sha256Hex(draft.claimsJson)
+    const payload = canonicalPayload({
+      tenant,
+      type: draft.type,
+      issuerId,
+      actor,
+      draft,
+      predecessorReceiptId,
+      predecessorHash,
+      serverTimestamp,
+    })
+    const receiptHash = await sha256Hex(payload)
+    const receipt: PreparedExecutionReceiptFacts = {
+      id: crypto.randomUUID(),
+      tenant,
+      type: draft.type,
+      issuerKind: 'mupot',
+      issuerId,
+      actorKind: actor.kind,
+      actorId: actor.id,
+      seatId: draft.seatId,
+      seatGeneration: draft.seatGeneration,
+      objectiveId: draft.objectiveId,
+      flightId: draft.flightId,
+      taskId: draft.taskId,
+      messageId: draft.messageId,
+      assignmentEpoch: draft.assignmentEpoch,
+      fencingEpoch: draft.fencingEpoch,
+      leaseTokenHash: draft.leaseTokenHash,
+      idempotencyKey: draft.idempotencyKey,
+      claimsJson: draft.claimsJson,
+      canonicalPayload: payload,
+      payloadDigest,
+      predecessorReceiptId,
+      predecessorHash,
+      receiptHash,
+      serverTimestamp,
+    }
+    receiptAndEdgeStatements.push(prepareReceiptInsert(statementDb, receipt))
+    if (predecessorReceiptId !== null) {
+      receiptAndEdgeStatements.push(preparePredecessorEdge(
+        statementDb,
+        tenant,
+        predecessorReceiptId,
+        receipt.id,
+        serverTimestamp,
+      ))
+    }
+    expectedReceipts.push(Object.freeze(receipt))
+    predecessorReceiptId = receipt.id
+    predecessorHash = receipt.receiptHash
+  }
+
+  const finalReceipt = expectedReceipts[expectedReceipts.length - 1]
+  return Object.freeze({
+    [PREPARED_RECEIPT_CHAIN]: true as const,
+    tenant,
+    expectedStartingHeadId,
+    receiptAndEdgeStatements: Object.freeze(receiptAndEdgeStatements),
+    finalHeadStatement: prepareFinalHeadCas(
+      statementDb,
+      tenant,
+      finalReceipt,
+      expectedStartingHeadId,
+    ),
+    expectedReceipts: Object.freeze(expectedReceipts),
+  })
+}
+
+/** The sole supported assembler: domain writes always precede one final head CAS. */
+export function composePreparedExecutionReceiptBatch(
+  prepared: PreparedExecutionReceiptChain,
+  domainStatements: readonly D1PreparedStatement[] = [],
+): D1PreparedStatement[] {
+  if (prepared[PREPARED_RECEIPT_CHAIN] !== true) {
+    throw new ExecutionReceiptError('invalid_draft')
+  }
+  return [
+    ...prepared.receiptAndEdgeStatements,
+    ...domainStatements,
+    prepared.finalHeadStatement,
+  ]
 }
 
 function mapReceipt(row: ReceiptRow): ExecutionReceipt {
@@ -366,6 +607,85 @@ async function verifyRowChain(
   return { ok: true }
 }
 
+export function verifyPreparedExecutionReceiptBatchResult(
+  prepared: PreparedExecutionReceiptChain,
+  batchResults: readonly D1Result<unknown>[],
+): PreparedExecutionReceiptCommit {
+  if (prepared[PREPARED_RECEIPT_CHAIN] !== true) {
+    throw new ExecutionReceiptError('persistence_conflict')
+  }
+  const preparedWriteCount = prepared.receiptAndEdgeStatements.length
+  if (batchResults.length < preparedWriteCount + 1) {
+    throw new ExecutionReceiptError('persistence_conflict')
+  }
+  try {
+    assertBatchWritten(
+      batchResults.slice(0, preparedWriteCount),
+      'execution_receipt.prepare',
+    )
+    assertBatchWritten(
+      [batchResults[batchResults.length - 1]],
+      'execution_receipt.head_cas',
+    )
+  } catch {
+    throw new ExecutionReceiptError('persistence_conflict')
+  }
+
+  const finalExpected = prepared.expectedReceipts[prepared.expectedReceipts.length - 1]
+  const returned = batchResults[batchResults.length - 1]?.results?.[0] as
+    | Partial<ReceiptHeadRow>
+    | undefined
+  const finalSequence = Number(returned?.sequence)
+  if (
+    returned === undefined
+    || !Number.isInteger(finalSequence)
+    || finalSequence <= 0
+    || returned.receipt_id !== finalExpected.id
+    || returned.receipt_hash !== finalExpected.receiptHash
+  ) {
+    throw new ExecutionReceiptError('persistence_conflict')
+  }
+  return {
+    finalSequence,
+    finalReceiptId: finalExpected.id,
+    finalReceiptHash: finalExpected.receiptHash,
+  }
+}
+
+export async function rereadAndVerifyPreparedExecutionReceipts(
+  env: Env,
+  prepared: PreparedExecutionReceiptChain,
+  batchResults: readonly D1Result<unknown>[],
+): Promise<ExecutionReceipt[]> {
+  if (env.TENANT_SLUG !== prepared.tenant) {
+    throw new ExecutionReceiptError('integrity_failure')
+  }
+  const commit = verifyPreparedExecutionReceiptBatchResult(prepared, batchResults)
+  const db = primaryDb(env)
+  const rows: ReceiptRow[] = []
+  const receipts: ExecutionReceipt[] = []
+  for (const expected of prepared.expectedReceipts) {
+    const row = await receiptById(db, prepared.tenant, expected.id)
+    if (row === null) throw new ExecutionReceiptError('integrity_failure')
+    const receipt = mapReceipt(row)
+    const actualFacts = { ...receipt } as Record<string, unknown>
+    delete actualFacts.sequence
+    if (canonicalJson(actualFacts) !== canonicalJson(expected)) {
+      throw new ExecutionReceiptError('integrity_failure')
+    }
+    rows.push(row)
+    receipts.push(receipt)
+  }
+
+  const finalRow = rows[rows.length - 1]
+  if (Number(finalRow.sequence) !== commit.finalSequence) {
+    throw new ExecutionReceiptError('integrity_failure')
+  }
+  const verified = await verifyRowChain(db, prepared.tenant, finalRow)
+  if (!verified.ok) throw new ExecutionReceiptError('integrity_failure')
+  return receipts
+}
+
 async function replayOrConflict(
   db: ReceiptDb,
   tenant: string,
@@ -397,142 +717,43 @@ export async function appendExecutionReceipt(
   const replay = await replayOrConflict(db, tenant, issuerId, actor, draft)
   if (replay !== null) return replay
 
-  const head = await db.prepare(`
-    SELECT sequence, receipt_id, receipt_hash
-      FROM execution_receipt_heads
-     WHERE tenant = ?1
-  `).bind(tenant).first<ReceiptHeadRow>()
-  const predecessorReceiptId = head?.receipt_id ?? null
-  const predecessorHash = head?.receipt_hash ?? null
-  const serverTimestamp = new Date().toISOString()
-  const payloadDigest = await sha256Hex(draft.claimsJson)
-  const payload = canonicalPayload({
-    tenant,
-    type: draft.type,
-    issuerId,
-    actor,
-    draft,
-    predecessorReceiptId,
-    predecessorHash,
-    serverTimestamp,
-  })
-  const receiptHash = await sha256Hex(payload)
-  const receiptId = crypto.randomUUID()
-  const statements: D1PreparedStatement[] = [
-    db.prepare(`
-      INSERT INTO execution_receipts (
-        id, tenant, type, issuer_kind, issuer_id, actor_kind, actor_id,
-        seat_id, seat_generation, objective_id, flight_id, task_id, message_id,
-        assignment_epoch, fencing_epoch, lease_token_hash, idempotency_key,
-        claims_json, canonical_payload, payload_digest, predecessor_receipt_id,
-        predecessor_hash, receipt_hash, server_timestamp
-      ) VALUES (
-        ?1, ?2, ?3, 'mupot', ?4, ?5, ?6,
-        ?7, ?8, ?9, ?10, ?11, ?12,
-        ?13, ?14, ?15, ?16,
-        ?17, ?18, ?19, ?20,
-        ?21, ?22, ?23
+  let prepared: PreparedExecutionReceiptChain
+  try {
+    prepared = await prepareFreshExecutionReceiptChain(env, auth, [input])
+  } catch (error) {
+    if (error instanceof ExecutionReceiptError && error.code === 'idempotency_conflict') {
+      const racedReplay = await replayOrConflict(
+        primaryDb(env),
+        tenant,
+        issuerId,
+        actor,
+        draft,
       )
-    `).bind(
-      receiptId,
-      tenant,
-      draft.type,
-      issuerId,
-      actor.kind,
-      actor.id,
-      draft.seatId,
-      draft.seatGeneration,
-      draft.objectiveId,
-      draft.flightId,
-      draft.taskId,
-      draft.messageId,
-      draft.assignmentEpoch,
-      draft.fencingEpoch,
-      draft.leaseTokenHash,
-      draft.idempotencyKey,
-      draft.claimsJson,
-      payload,
-      payloadDigest,
-      predecessorReceiptId,
-      predecessorHash,
-      receiptHash,
-      serverTimestamp,
-    ),
-  ]
-
-  if (predecessorReceiptId !== null) {
-    statements.push(db.prepare(`
-      INSERT INTO execution_receipt_edges (
-        id, tenant, from_receipt_id, to_receipt_id, relation, created_at
-      ) VALUES (?1, ?2, ?3, ?4, 'predecessor', ?5)
-    `).bind(crypto.randomUUID(), tenant, predecessorReceiptId, receiptId, serverTimestamp))
+      if (racedReplay !== null) return racedReplay
+    }
+    throw error
   }
 
-  statements.push(db.prepare(`
-    INSERT INTO execution_receipt_heads (
-      tenant, sequence, receipt_id, receipt_hash, updated_at
-    )
-    SELECT tenant, sequence, id, receipt_hash, server_timestamp
-      FROM execution_receipts
-     WHERE tenant = ?1 AND id = ?2
-    ON CONFLICT (tenant) DO UPDATE SET
-      sequence = CASE
-        WHEN execution_receipt_heads.receipt_id IS ?3 THEN excluded.sequence
-        ELSE execution_receipt_heads.sequence
-      END,
-      receipt_id = CASE
-        WHEN execution_receipt_heads.receipt_id IS ?3 THEN excluded.receipt_id
-        ELSE execution_receipt_heads.receipt_id
-      END,
-      receipt_hash = CASE
-        WHEN execution_receipt_heads.receipt_id IS ?3 THEN excluded.receipt_hash
-        ELSE execution_receipt_heads.receipt_hash
-      END,
-      updated_at = CASE
-        WHEN execution_receipt_heads.receipt_id IS ?3 THEN excluded.updated_at
-        ELSE execution_receipt_heads.updated_at
-      END
-    RETURNING sequence, receipt_id, receipt_hash
-  `).bind(tenant, receiptId, predecessorReceiptId))
-
-  let batchResults
+  let batchResults: D1Result<unknown>[]
   try {
-    batchResults = await db.batch<ReceiptHeadRow>(statements)
+    batchResults = await env.DB.batch(composePreparedExecutionReceiptBatch(prepared))
   } catch {
-    const racedReplay = await replayOrConflict(db, tenant, issuerId, actor, draft)
+    const recoveryDb = primaryDb(env)
+    const racedReplay = await replayOrConflict(recoveryDb, tenant, issuerId, actor, draft)
     if (racedReplay !== null) return racedReplay
-    const currentHead = await db.prepare(`
+    const currentHead = await recoveryDb.prepare(`
       SELECT sequence, receipt_id, receipt_hash
         FROM execution_receipt_heads
        WHERE tenant = ?1
     `).bind(tenant).first<ReceiptHeadRow>()
-    if ((currentHead?.receipt_id ?? null) !== predecessorReceiptId) {
+    if ((currentHead?.receipt_id ?? null) !== prepared.expectedStartingHeadId) {
       throw new ExecutionReceiptError('stale_head')
     }
     throw new ExecutionReceiptError('persistence_conflict')
   }
-  try {
-    assertBatchWritten(batchResults, 'execution_receipt.append')
-  } catch {
-    throw new ExecutionReceiptError('persistence_conflict')
-  }
-  const committedHead = batchResults[batchResults.length - 1]?.results?.[0]
-  if (
-    committedHead === undefined
-    || committedHead.receipt_id !== receiptId
-    || committedHead.receipt_hash !== receiptHash
-  ) {
-    throw new ExecutionReceiptError('persistence_conflict')
-  }
-
-  const persisted = await receiptById(db, tenant, receiptId)
-  if (persisted === null) throw new ExecutionReceiptError('integrity_failure')
-  if (Number(committedHead.sequence) !== Number(persisted.sequence)) {
-    throw new ExecutionReceiptError('integrity_failure')
-  }
-  const verified = await verifyRowChain(db, tenant, persisted)
-  if (!verified.ok) throw new ExecutionReceiptError('integrity_failure')
-  return mapReceipt(persisted)
+  const persisted = await rereadAndVerifyPreparedExecutionReceipts(env, prepared, batchResults)
+  if (persisted.length !== 1) throw new ExecutionReceiptError('integrity_failure')
+  return persisted[0]
 }
 
 export async function getExecutionReceipt(
