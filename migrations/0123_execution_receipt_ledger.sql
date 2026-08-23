@@ -15,7 +15,9 @@ CREATE TABLE execution_receipts (
     'recovery.takeover','flight.landed','host_control.requested',
     'host_control.observed','decision.created','decision.resolved'
   )),
-  issuer_kind TEXT NOT NULL CHECK (issuer_kind = 'mupot'),
+  issuer_kind TEXT NOT NULL CHECK (issuer_kind IN (
+    'mupot','adapter','runtime','artifact_service','gate','provider_verifier'
+  )),
   issuer_id TEXT NOT NULL CHECK (length(trim(issuer_id)) > 0),
   actor_kind TEXT NOT NULL CHECK (actor_kind IN ('member','agent','system','controller')),
   actor_id TEXT NOT NULL CHECK (length(trim(actor_id)) > 0),

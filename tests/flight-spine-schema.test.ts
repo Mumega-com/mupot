@@ -517,6 +517,69 @@ describe('Flight Spine schema migrations', () => {
     `).run(TENANT, SHA_A, SHA_B)).toThrow(/check constraint/i)
   })
 
+  it('accepts the six exact receipt issuer kinds and rejects near-misses', () => {
+    const issuerKinds = [
+      'mupot',
+      'adapter',
+      'runtime',
+      'artifact_service',
+      'gate',
+      'provider_verifier',
+    ] as const
+
+    for (const [index, issuerKind] of issuerKinds.entries()) {
+      harness.sqlite.prepare(`
+        INSERT INTO execution_receipts (
+          id, tenant, type, issuer_kind, issuer_id, actor_kind, actor_id,
+          idempotency_key, claims_json, canonical_payload, payload_digest,
+          receipt_hash, server_timestamp
+        ) VALUES (?, ?, 'provider.observed', ?, ?, 'system', 'system-1', ?,
+          '{}', '{}', ?, ?, '2026-08-23T12:00:00.000Z')
+      `).run(
+        `receipt-issuer-${index}`,
+        TENANT,
+        issuerKind,
+        `issuer-${index}`,
+        `issuer-key-${index}`,
+        SHA_A,
+        SHA_B,
+      )
+    }
+
+    expect(harness.sqlite.prepare(`
+      SELECT issuer_kind
+      FROM execution_receipts
+      WHERE id LIKE 'receipt-issuer-%'
+      ORDER BY issuer_kind
+    `).all()).toEqual([
+      { issuer_kind: 'adapter' },
+      { issuer_kind: 'artifact_service' },
+      { issuer_kind: 'gate' },
+      { issuer_kind: 'mupot' },
+      { issuer_kind: 'provider_verifier' },
+      { issuer_kind: 'runtime' },
+    ])
+
+    for (const [index, issuerKind] of ['artifact-service', 'unknown'].entries()) {
+      expect(() => harness.sqlite.prepare(`
+        INSERT INTO execution_receipts (
+          id, tenant, type, issuer_kind, issuer_id, actor_kind, actor_id,
+          idempotency_key, claims_json, canonical_payload, payload_digest,
+          receipt_hash, server_timestamp
+        ) VALUES (?, ?, 'provider.observed', ?, ?, 'system', 'system-1', ?,
+          '{}', '{}', ?, ?, '2026-08-23T12:00:00.000Z')
+      `).run(
+        `receipt-invalid-issuer-${index}`,
+        TENANT,
+        issuerKind,
+        `invalid-issuer-${index}`,
+        `invalid-issuer-key-${index}`,
+        SHA_A,
+        SHA_B,
+      )).toThrow(/check constraint/i)
+    }
+  })
+
   it('rejects invalid SHA-256 values', () => {
     expect(() => insertObjective('objective-invalid-digest')).not.toThrow()
     expect(() => harness.sqlite.prepare(`
