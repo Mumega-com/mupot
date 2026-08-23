@@ -478,6 +478,45 @@ describe('Flight Spine schema migrations', () => {
     `).run(TENANT, SHA_A, SHA_B)).not.toThrow()
   })
 
+  it('accepts dependency-linked and artifact-consumed receipt types but rejects a near-miss', () => {
+    for (const [id, type, taskId] of [
+      ['receipt-dependency-linked', 'flight.dependency_linked', null],
+      ['receipt-artifact-consumed', 'artifact.consumed', 'task-worker'],
+    ] as const) {
+      harness.sqlite.prepare(`
+        INSERT INTO execution_receipts (
+          id, tenant, type, issuer_kind, issuer_id, actor_kind, actor_id,
+          flight_id, task_id, idempotency_key, claims_json, canonical_payload,
+          payload_digest, receipt_hash, server_timestamp
+        ) VALUES (?, ?, ?, 'mupot', 'mupot-server', 'controller', 'controller-1',
+          'flight-parent', ?, ?, '{}', '{}', ?, ?, '2026-08-23T12:00:00.000Z')
+      `).run(id, TENANT, type, taskId, id, SHA_A, SHA_B)
+    }
+
+    expect(harness.sqlite.prepare(`
+      SELECT type
+      FROM execution_receipts
+      WHERE id IN ('receipt-dependency-linked', 'receipt-artifact-consumed')
+      ORDER BY type
+    `).all()).toEqual([
+      { type: 'artifact.consumed' },
+      { type: 'flight.dependency_linked' },
+    ])
+
+    expect(() => harness.sqlite.prepare(`
+      INSERT INTO execution_receipts (
+        id, tenant, type, issuer_kind, issuer_id, actor_kind, actor_id,
+        flight_id, idempotency_key, claims_json, canonical_payload,
+        payload_digest, receipt_hash, server_timestamp
+      ) VALUES (
+        'receipt-artifact-consume-near-miss', ?, 'artifact.consume', 'mupot',
+        'mupot-server', 'controller', 'controller-1', 'flight-parent',
+        'receipt-artifact-consume-near-miss', '{}', '{}', ?, ?,
+        '2026-08-23T12:00:00.000Z'
+      )
+    `).run(TENANT, SHA_A, SHA_B)).toThrow(/check constraint/i)
+  })
+
   it('rejects invalid SHA-256 values', () => {
     expect(() => insertObjective('objective-invalid-digest')).not.toThrow()
     expect(() => harness.sqlite.prepare(`

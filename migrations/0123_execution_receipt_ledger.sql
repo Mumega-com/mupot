@@ -7,10 +7,10 @@ CREATE TABLE execution_receipts (
   tenant TEXT NOT NULL,
   type TEXT NOT NULL CHECK (type IN (
     'objective.authorized','objective.accepted','composition.proposed',
-    'flight.materialized','task.assigned','message.accepted',
+    'flight.materialized','flight.dependency_linked','task.assigned','message.accepted',
     'seat.leased','host.persisted','effect.intent','runtime.injected',
     'runtime.consumed','provider.observed','provider.reconciled',
-    'runtime.ack','source.ack','artifact.stored','artifact.retrieved',
+    'runtime.ack','source.ack','artifact.stored','artifact.retrieved','artifact.consumed',
     'result.reported','gate.verdict','task.completed','cost.finalized',
     'recovery.takeover','flight.landed','host_control.requested',
     'host_control.observed','decision.created','decision.resolved'
