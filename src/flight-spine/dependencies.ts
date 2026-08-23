@@ -459,6 +459,8 @@ async function verifyConsumedReplay(
   principal: FlightSpinePrincipal,
   row: ConsumedArtifactRow,
   context: ConsumptionContext,
+  requestedTaskId: string,
+  requestedAssignmentId: string,
 ): Promise<void> {
   const receipt = await env.DB.prepare(`
     SELECT type, actor_kind, actor_id, seat_id, seat_generation, objective_id,
@@ -477,6 +479,8 @@ async function verifyConsumedReplay(
     claims_json: string
   }>()
   if (!receipt
+    || row.consuming_task_id !== requestedTaskId
+    || row.consuming_assignment_id !== requestedAssignmentId
     || receipt.type !== 'artifact.consumed'
     || receipt.actor_kind !== 'agent'
     || receipt.actor_id !== principal.agentId
@@ -484,7 +488,7 @@ async function verifyConsumedReplay(
     || Number(receipt.seat_generation) !== context.seatGeneration
     || receipt.objective_id !== context.objectiveId
     || receipt.flight_id !== context.parentFlightId
-    || receipt.task_id !== row.consuming_task_id
+    || receipt.task_id !== requestedTaskId
     || Number(receipt.assignment_epoch) !== context.assignmentEpoch
     || receipt.claims_json !== canonicalJson({
       dependencyId: row.flight_dependency_id,
@@ -517,7 +521,9 @@ export async function recordConsumedChildArtifact(
     if (existing.consuming_task_id !== consumingTaskId
       || existing.consuming_assignment_id !== consumingAssignmentId
     ) throw new DependencyError('dependency_conflict')
-    await verifyConsumedReplay(env, principal, existing, context)
+    await verifyConsumedReplay(
+      env, principal, existing, context, consumingTaskId, consumingAssignmentId,
+    )
     return mapConsumed(existing)
   }
 
@@ -655,7 +661,9 @@ export async function recordConsumedChildArtifact(
       env, auth, principal, dependency, artifactId, consumingTaskId, consumingAssignmentId,
     )
     if (raced) {
-      await verifyConsumedReplay(env, principal, raced, current)
+      await verifyConsumedReplay(
+        env, principal, raced, current, consumingTaskId, consumingAssignmentId,
+      )
       return mapConsumed(raced)
     }
     void error
@@ -663,6 +671,8 @@ export async function recordConsumedChildArtifact(
   }
   const persisted = await consumedByIdentity(env, dependencyId, artifactId, dependency.parent_flight_id)
   if (!persisted || persisted.id !== id) throw new DependencyError('consumption_conflict')
-  await verifyConsumedReplay(env, principal, persisted, context)
+  await verifyConsumedReplay(
+    env, principal, persisted, context, consumingTaskId, consumingAssignmentId,
+  )
   return mapConsumed(persisted)
 }

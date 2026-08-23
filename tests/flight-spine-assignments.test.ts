@@ -372,6 +372,11 @@ describe('Flight Spine composition materialization', () => {
       mutate: () => harness.sqlite.prepare("UPDATE flights SET status = 'landed' WHERE id = ?")
         .run(FLIGHT_ID),
     },
+    {
+      name: 'flight executor change',
+      mutate: () => harness.sqlite.prepare('UPDATE flights SET agent = ? WHERE id = ?')
+        .run(AGENTS.workerA, FLIGHT_ID),
+    },
   ])('rolls back the whole prepared batch on an in-batch $name', async ({ mutate }) => {
     const objectiveId = await acceptedObjective()
     const before = {

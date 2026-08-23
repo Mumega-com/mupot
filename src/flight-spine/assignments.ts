@@ -407,7 +407,7 @@ export async function materializeComposition(
        SELECT 1
          FROM flights flight
          JOIN objectives objective ON objective.id = ? AND objective.tenant = ?
-        WHERE flight.id = ? AND flight.tenant = ?
+        WHERE flight.id = ? AND flight.tenant = ? AND flight.agent = ?
           AND flight.status IN ('preflight', 'running')
           AND flight.project_id IS ?
           AND objective.squad_id = ? AND objective.project_id IS ?
@@ -504,6 +504,7 @@ export async function materializeComposition(
       env.TENANT_SLUG,
       flightId,
       env.TENANT_SLUG,
+      coordinator.assigneeAgentId,
       objective.projectId,
       objective.squadId,
       objective.projectId,

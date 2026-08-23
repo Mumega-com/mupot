@@ -102,7 +102,8 @@ async function seedArtifactFacts(dependencyId: string, objectiveId: string): Pro
       id, squad_id, title, done_when, status, assignee_agent_id, assignment_epoch
     ) VALUES
       ('task-child', '${SQUAD_ID}', 'Child output', 'Child artifact exists', 'done', '${CHILD_AGENT}', 1),
-      ('task-parent', '${SQUAD_ID}', 'Parent integration', 'Child artifact is consumed', 'open', '${PARENT_AGENT}', 1);
+      ('task-parent', '${SQUAD_ID}', 'Parent integration', 'Child artifact is consumed', 'open', '${PARENT_AGENT}', 1),
+      ('task-parent-2', '${SQUAD_ID}', 'Parent integration 2', 'Child artifact is consumed again', 'open', '${PARENT_AGENT}', 1);
     INSERT INTO runtime_seats (
       id, tenant, agent_id, seat_name, host_id, adapter_kind, state,
       current_generation, current_fencing_epoch, capabilities_json, created_at, updated_at
@@ -127,7 +128,9 @@ async function seedArtifactFacts(dependencyId: string, objectiveId: string): Pro
       ('lane-child', '${TENANT}', '${CHILD_FLIGHT}', 'child-worker', 'worker', 'task-child', 1,
        '${CHILD_AGENT}', 'seat-child', 'Child artifact exists', '[]', '${SERVER_TIME}'),
       ('lane-parent', '${TENANT}', '${PARENT_FLIGHT}', 'parent-integrator', 'integrator', 'task-parent', 1,
-       '${PARENT_AGENT}', 'seat-parent', 'Child artifact is consumed', '[]', '${SERVER_TIME}');
+       '${PARENT_AGENT}', 'seat-parent', 'Child artifact is consumed', '[]', '${SERVER_TIME}'),
+      ('lane-parent-2', '${TENANT}', '${PARENT_FLIGHT}', 'parent-worker-2', 'worker', 'task-parent-2', 1,
+       '${PARENT_AGENT}', 'seat-parent', 'Child artifact is consumed again', '[]', '${SERVER_TIME}');
     INSERT INTO flight_task_assignments (
       id, tenant, flight_id, lane_id, task_id, assignment_epoch, agent_id,
       runtime_seat_id, assigned_by_principal_kind, assigned_by_principal_id,
@@ -136,6 +139,8 @@ async function seedArtifactFacts(dependencyId: string, objectiveId: string): Pro
       ('assignment-child', '${TENANT}', '${CHILD_FLIGHT}', 'lane-child', 'task-child', 1,
        '${CHILD_AGENT}', 'seat-child', 'agent', '${PARENT_AGENT}', '${MEMBER_ID}', NULL, '${SERVER_TIME}'),
       ('assignment-parent', '${TENANT}', '${PARENT_FLIGHT}', 'lane-parent', 'task-parent', 1,
+       '${PARENT_AGENT}', 'seat-parent', 'agent', '${PARENT_AGENT}', '${MEMBER_ID}', NULL, '${SERVER_TIME}'),
+      ('assignment-parent-2', '${TENANT}', '${PARENT_FLIGHT}', 'lane-parent-2', 'task-parent-2', 1,
        '${PARENT_AGENT}', 'seat-parent', 'agent', '${PARENT_AGENT}', '${MEMBER_ID}', NULL, '${SERVER_TIME}');
   `)
   const storageReceipt = await appendExecutionReceipt(env, auth(), {
@@ -417,6 +422,48 @@ describe('Flight Spine parent-child dependencies', () => {
       SELECT COUNT(*) AS count FROM execution_receipts WHERE type = 'artifact.consumed'
     `).get()).toEqual({ count: 1 })
     expect(count('flight_dependency_artifacts')).toBe(1)
+  })
+
+  it('does not return a concurrent winner for a different requested task and assignment', async () => {
+    const objectiveId = await seedObjectiveAndFlights()
+    const dependency = await linkChildFlight(env, auth(), {
+      objectiveId,
+      parentFlightId: PARENT_FLIGHT,
+      childFlightId: CHILD_FLIGHT,
+    })
+    const artifact = await seedArtifactFacts(dependency.id, objectiveId)
+    const beforeEdges = count('execution_receipt_edges')
+    const racedEnv = envWithBeforeBatch(async () => {
+      await recordConsumedChildArtifact(env, auth(), {
+        flightDependencyId: dependency.id,
+        artifactId: artifact.artifactId,
+        consumingTaskId: 'task-parent-2',
+        consumingAssignmentId: 'assignment-parent-2',
+      })
+    })
+
+    await expect(recordConsumedChildArtifact(racedEnv, auth(), {
+      flightDependencyId: dependency.id,
+      artifactId: artifact.artifactId,
+      consumingTaskId: 'task-parent',
+      consumingAssignmentId: 'assignment-parent',
+    })).rejects.toMatchObject({ code: 'consumption_conflict' })
+
+    expect(harness.sqlite.prepare(`
+      SELECT consuming_task_id, consuming_assignment_id
+        FROM flight_dependency_artifacts
+    `).all()).toEqual([{
+      consuming_task_id: 'task-parent-2',
+      consuming_assignment_id: 'assignment-parent-2',
+    }])
+    expect(harness.sqlite.prepare(`
+      SELECT COUNT(*) AS count FROM execution_receipts WHERE type = 'artifact.consumed'
+    `).get()).toEqual({ count: 1 })
+    expect(harness.sqlite.prepare(`
+      SELECT COUNT(*) AS count FROM mutation_audit_entries
+       WHERE target_kind = 'flight_dependency_artifact'
+    `).get()).toEqual({ count: 1 })
+    expect(count('execution_receipt_edges') - beforeEdges).toBe(1)
   })
 
   it('rolls back a prepared consumption when the assignee changes before the batch', async () => {
