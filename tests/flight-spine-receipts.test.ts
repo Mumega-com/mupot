@@ -3,12 +3,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { canonicalJson, sha256Hex } from '../src/lib/canonical-json'
 import {
   appendExecutionReceipt,
-  executeAuditedDomainMutations,
+  executeAuditedProjectionMutations,
   executePreparedExecutionReceiptBatch,
   getExecutionReceipt,
   prepareAuditedDomainMutation,
+  prepareAuditedProjectionMutation,
   prepareFreshExecutionReceiptChain,
   type PreparedAtomicDomainMutation,
+  type PreparedAuditedProjectionMutation,
   verifyExecutionReceipt,
 } from '../src/flight-spine/receipts'
 import type { AuthContext, Env } from '../src/types'
@@ -62,15 +64,22 @@ function allowTestOnlyReceiptCorruption(): void {
   harness.sqlite.exec('DROP TRIGGER execution_receipts_no_update')
 }
 
-function expectNoReceiptChainState(): void {
-  for (const table of [
-    'execution_receipts',
-    'execution_receipt_edges',
-    'execution_receipt_heads',
-  ]) {
-    expect(harness.sqlite.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get())
-      .toEqual({ count: 0 })
+function receiptChainCounts(): { receipts: number; edges: number; heads: number } {
+  return {
+    receipts: Number(harness.sqlite.prepare(
+      'SELECT COUNT(*) AS count FROM execution_receipts',
+    ).get()?.count ?? 0),
+    edges: Number(harness.sqlite.prepare(
+      'SELECT COUNT(*) AS count FROM execution_receipt_edges',
+    ).get()?.count ?? 0),
+    heads: Number(harness.sqlite.prepare(
+      'SELECT COUNT(*) AS count FROM execution_receipt_heads',
+    ).get()?.count ?? 0),
   }
+}
+
+function expectNoReceiptChainState(): void {
+  expect(receiptChainCounts()).toEqual({ receipts: 0, edges: 0, heads: 0 })
 }
 
 function departmentAudit(auditId: string, targetId: string) {
@@ -99,6 +108,123 @@ function auditedDepartmentMutation(input: {
     sql: input.mutationSql,
     bindings: input.bindings ?? [],
     audit: departmentAudit(input.auditId, input.targetId),
+  })
+}
+
+function artifactAudit(auditId: string, targetKind: string, targetId: string) {
+  return {
+    ...departmentAudit(auditId, targetId),
+    handler: 'flight_spine_projection_test',
+    targetKind,
+  }
+}
+
+function auditedProjectionMutation(input: {
+  auditId: string
+  sql: string
+  bindings?: readonly (string | number | boolean | null)[]
+  targetKind: string
+  targetId: string
+  db?: D1Database
+}) {
+  return prepareAuditedProjectionMutation(input.db ?? env.DB, {
+    sql: input.sql,
+    bindings: input.bindings ?? [],
+    audit: artifactAudit(input.auditId, input.targetKind, input.targetId),
+  })
+}
+
+async function seedProjectionArtifactPrerequisites(receiptKey: string): Promise<string> {
+  harness.sqlite.exec(`
+    INSERT INTO departments (id, slug, name)
+      VALUES ('projection-dept', 'projection-dept', 'Projection Department');
+    INSERT INTO squads (id, department_id, slug, name)
+      VALUES ('projection-squad', 'projection-dept', 'projection-squad', 'Projection Squad');
+    INSERT INTO agents (id, squad_id, slug, name) VALUES
+      ('projection-agent', 'projection-squad', 'projection-agent', 'Projection Agent'),
+      ('projection-verifier', 'projection-squad', 'projection-verifier', 'Projection Verifier');
+    INSERT INTO flights (id, tenant, agent, goal, status)
+      VALUES ('projection-flight', '${TENANT}', 'projection-agent', 'Projection', 'running');
+    INSERT INTO tasks (
+      id, squad_id, title, done_when, status, assignee_agent_id, assignment_epoch
+    ) VALUES (
+      'projection-task', 'projection-squad', 'Projection task', 'Artifact exists',
+      'open', 'projection-agent', 1
+    );
+    INSERT INTO runtime_seats (
+      id, tenant, agent_id, seat_name, host_id, adapter_kind, state,
+      current_generation, current_fencing_epoch, capabilities_json, created_at, updated_at
+    ) VALUES (
+      'projection-seat', '${TENANT}', 'projection-agent', 'projection-seat',
+      'projection-host', 'test', 'pending', 0, 0, '[]', '${SERVER_TIME}', '${SERVER_TIME}'
+    );
+    INSERT INTO flight_lanes (
+      id, tenant, flight_id, lane_key, role, task_id, assignment_epoch,
+      agent_id, runtime_seat_id, done_when, dependency_lane_keys_json, created_at
+    ) VALUES (
+      'projection-lane', '${TENANT}', 'projection-flight', 'projection-worker',
+      'worker', 'projection-task', 1, 'projection-agent', 'projection-seat',
+      'Artifact exists', '[]', '${SERVER_TIME}'
+    );
+    INSERT INTO flight_task_assignments (
+      id, tenant, flight_id, lane_id, task_id, assignment_epoch, agent_id,
+      runtime_seat_id, assigned_by_principal_kind, assigned_by_principal_id,
+      assigned_by_member_id, assignment_receipt_id, assigned_at
+    ) VALUES (
+      'projection-assignment', '${TENANT}', 'projection-flight', 'projection-lane',
+      'projection-task', 1, 'projection-agent', 'projection-seat', 'member',
+      'member-1', NULL, NULL, '${SERVER_TIME}'
+    );
+  `)
+  const receipt = await appendExecutionReceipt(env, memberAuth(), {
+    type: 'result.reported',
+    idempotencyKey: receiptKey,
+    objectiveId: 'projection-objective',
+    flightId: 'projection-flight',
+    taskId: 'projection-task',
+    assignmentEpoch: 1,
+    claims: { artifactMetadataReady: true },
+  })
+  return receipt.id
+}
+
+function prepareArtifactProjection(input: {
+  auditId: string
+  artifactId: string
+  storageReceiptId: string
+  objectKey: string
+}) {
+  return auditedProjectionMutation({
+    auditId: input.auditId,
+    sql: `
+      INSERT INTO artifacts (
+        id, tenant, flight_id, producing_assignment_id, producing_task_id,
+        producing_agent_id, producing_runtime_seat_id, assignment_epoch,
+        object_key, digest, size_bytes, visibility, retention_until,
+        storage_receipt_id, created_at
+      ) VALUES (
+        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15
+      )
+    `,
+    bindings: [
+      input.artifactId,
+      TENANT,
+      'projection-flight',
+      'projection-assignment',
+      'projection-task',
+      'projection-agent',
+      'projection-seat',
+      1,
+      input.objectKey,
+      'a'.repeat(64),
+      128,
+      'tenant',
+      '2026-09-23T16:00:00.000Z',
+      input.storageReceiptId,
+      SERVER_TIME,
+    ],
+    targetKind: 'artifact',
+    targetId: input.artifactId,
   })
 }
 
@@ -153,81 +279,193 @@ describe('Flight Spine execution receipt ledger', () => {
       })
   })
 
-  it('executes one audited projection mutation without creating receipt-chain state', async () => {
-    const domain = auditedDepartmentMutation({
-      auditId: 'audit-projection-only',
-      mutationSql: `
-        INSERT INTO departments (id, slug, name) VALUES (?1, ?2, ?3)
-      `,
-      bindings: ['projection-only', 'projection-only', 'Projection Only'],
-      targetId: 'projection-only',
-    })
+  it('rejects nonallowlisted and obfuscated projection tables before preparation', () => {
+    let prepareCalls = 0
+    const observingDb = {
+      prepare(sql: string) {
+        prepareCalls += 1
+        return harness.db.prepare(sql)
+      },
+      batch: harness.db.batch.bind(harness.db),
+    } as D1Database
+    const rejectedSql = [
+      'INSERT INTO execution_receipts (id) VALUES (?1)',
+      'UPDATE execution_receipt_heads SET updated_at = ?1',
+      'DELETE FROM execution_receipt_edges WHERE id = ?1',
+      'INSERT INTO mutation_audit_entries (id) VALUES (?1)',
+      'INSERT INTO host_control_receipts (id) VALUES (?1)',
+      'UPDATE tasks SET title = ?1 WHERE id = ?2',
+      'DELETE FROM flights WHERE id = ?1',
+      'INSERT INTO departments (id, slug, name) VALUES (?1, ?2, ?3)',
+      'INSERT INTO Artifacts (id) VALUES (?1)',
+      'insert into artifacts (id) values (?1)',
+      'INSERT INTO "artifacts" (id) VALUES (?1)',
+      'INSERT INTO [artifacts] (id) VALUES (?1)',
+      'INSERT INTO `artifacts` (id) VALUES (?1)',
+      'INSERT INTO main.artifacts (id) VALUES (?1)',
+      'INSERT INTO artifacts_backup (id) VALUES (?1)',
+      '/* projection */ INSERT INTO artifacts (id) VALUES (?1)',
+      'UPDATE artifact_retrieval_receipts AS r SET retrieved_at = ?1',
+    ]
 
-    const audits = await executeAuditedDomainMutations(env, [domain])
+    for (const [index, sql] of rejectedSql.entries()) {
+      expect(() => prepareAuditedProjectionMutation(observingDb, {
+        sql,
+        bindings: [],
+        audit: artifactAudit(`audit-rejected-projection-${index}`, 'artifact', 'target'),
+      })).toThrowError(expect.objectContaining({
+        name: 'ExecutionReceiptError',
+        code: 'invalid_draft',
+      }))
+    }
+    expect(prepareCalls).toBe(0)
+    expectNoReceiptChainState()
+  })
+
+  it('commits an artifacts projection and audit without advancing the receipt chain', async () => {
+    const storageReceiptId = await seedProjectionArtifactPrerequisites('projection-storage-1')
+    const before = receiptChainCounts()
+    const projection = prepareArtifactProjection({
+      auditId: 'audit-artifact-projection',
+      artifactId: 'artifact-projection',
+      storageReceiptId,
+      objectKey: 'sha256/aa/artifact-projection',
+    })
+    const exposed = Object.fromEntries(Object.entries(projection))
+
+    expect(Object.isFrozen(projection)).toBe(true)
+    expect(Object.keys(projection)).toEqual(['expectedAuditId'])
+    expect(exposed.mutationStatement).toBeUndefined()
+    expect(exposed.guardStatement).toBeUndefined()
+    const audits = await executeAuditedProjectionMutations(env, [projection])
 
     expect(audits).toHaveLength(1)
     expect(audits[0]).toMatchObject({
-      id: 'audit-projection-only',
+      id: 'audit-artifact-projection',
       tenant: TENANT,
-      principal_kind: 'member',
-      handler: 'flight_spine_test',
-      operation: 'upsert',
-      target_kind: 'department',
-      target_id: 'projection-only',
+      handler: 'flight_spine_projection_test',
+      target_kind: 'artifact',
+      target_id: 'artifact-projection',
     })
     expect(harness.sqlite.prepare(`
-      SELECT id, slug, name FROM departments WHERE id = 'projection-only'
+      SELECT id, object_key, storage_receipt_id
+        FROM artifacts WHERE id = 'artifact-projection'
     `).get()).toEqual({
-      id: 'projection-only',
-      slug: 'projection-only',
-      name: 'Projection Only',
+      id: 'artifact-projection',
+      object_key: 'sha256/aa/artifact-projection',
+      storage_receipt_id: storageReceiptId,
     })
-    expectNoReceiptChainState()
+    expect(receiptChainCounts()).toEqual(before)
   })
 
-  it('rejects empty and forged audited projection handle sets without writing', async () => {
-    await expect(executeAuditedDomainMutations(env, [])).rejects.toMatchObject({
+  it('commits an artifact-retrieval projection without advancing the receipt chain', async () => {
+    const storageReceiptId = await seedProjectionArtifactPrerequisites('projection-storage-2')
+    await executeAuditedProjectionMutations(env, [prepareArtifactProjection({
+      auditId: 'audit-artifact-for-retrieval',
+      artifactId: 'artifact-for-retrieval',
+      storageReceiptId,
+      objectKey: 'sha256/aa/artifact-for-retrieval',
+    })])
+    const retrievalReceipt = await appendExecutionReceipt(env, memberAuth(), {
+      type: 'result.reported',
+      idempotencyKey: 'projection-retrieval-receipt',
+      flightId: 'projection-flight',
+      taskId: 'projection-task',
+      assignmentEpoch: 1,
+      claims: { artifactRetrieved: true },
+    })
+    const before = receiptChainCounts()
+    const projection = auditedProjectionMutation({
+      auditId: 'audit-artifact-retrieval-projection',
+      sql: `
+        INSERT INTO artifact_retrieval_receipts (
+          id, tenant, artifact_id, verifier_principal_kind,
+          verifier_principal_id, verifier_agent_id, verifier_runtime_seat_id,
+          recomputed_digest, retrieval_receipt_id, retrieved_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9)
+      `,
+      bindings: [
+        'retrieval-projection',
+        TENANT,
+        'artifact-for-retrieval',
+        'agent',
+        'projection-verifier',
+        'projection-verifier',
+        'a'.repeat(64),
+        retrievalReceipt.id,
+        SERVER_TIME,
+      ],
+      targetKind: 'artifact_retrieval_receipt',
+      targetId: 'retrieval-projection',
+    })
+
+    const audits = await executeAuditedProjectionMutations(env, [projection])
+
+    expect(audits[0]).toMatchObject({
+      id: 'audit-artifact-retrieval-projection',
+      target_kind: 'artifact_retrieval_receipt',
+      target_id: 'retrieval-projection',
+    })
+    expect(harness.sqlite.prepare(`
+      SELECT id, artifact_id, retrieval_receipt_id
+        FROM artifact_retrieval_receipts WHERE id = 'retrieval-projection'
+    `).get()).toEqual({
+      id: 'retrieval-projection',
+      artifact_id: 'artifact-for-retrieval',
+      retrieval_receipt_id: retrievalReceipt.id,
+    })
+    expect(receiptChainCounts()).toEqual(before)
+  })
+
+  it('rejects empty, forged and mixed projection handle sets without writing', async () => {
+    await expect(executeAuditedProjectionMutations(env, [])).rejects.toMatchObject({
       name: 'ExecutionReceiptError',
       code: 'invalid_draft',
     })
-    const forged = Object.freeze({ expectedAuditId: 'forged-audit' }) as PreparedAtomicDomainMutation
-    await expect(executeAuditedDomainMutations(env, [forged])).rejects.toMatchObject({
+    const forged = Object.freeze({
+      expectedAuditId: 'forged-projection',
+    }) as PreparedAuditedProjectionMutation
+    await expect(executeAuditedProjectionMutations(env, [forged])).rejects.toMatchObject({
       name: 'ExecutionReceiptError',
       code: 'invalid_draft',
     })
-    const shortResultDb = {
-      prepare: harness.db.prepare.bind(harness.db),
-      batch: async () => [],
-    } as D1Database
-    const shortResultEnv = { ...env, DB: shortResultDb }
-    const validButShort = auditedDepartmentMutation({
-      auditId: 'audit-projection-short-result',
+    const general = auditedDepartmentMutation({
+      auditId: 'audit-general-mixed',
       mutationSql: `
         INSERT INTO departments (id, slug, name) VALUES (?1, ?2, ?3)
       `,
-      bindings: ['projection-short', 'projection-short', 'Projection Short'],
-      targetId: 'projection-short',
-      db: shortResultDb,
+      bindings: ['general-mixed', 'general-mixed', 'General Mixed'],
+      targetId: 'general-mixed',
     })
-    await expect(executeAuditedDomainMutations(shortResultEnv, [validButShort]))
-      .rejects.toMatchObject({
-        name: 'ExecutionReceiptError',
-        code: 'persistence_conflict',
-      })
+    const projection = auditedProjectionMutation({
+      auditId: 'audit-projection-mixed',
+      sql: 'UPDATE artifacts SET object_key = object_key WHERE id = ?1',
+      bindings: ['missing-artifact'],
+      targetKind: 'artifact',
+      targetId: 'missing-artifact',
+    })
+    await expect(executeAuditedProjectionMutations(env, [
+      projection,
+      general as PreparedAuditedProjectionMutation,
+    ])).rejects.toMatchObject({
+      name: 'ExecutionReceiptError',
+      code: 'invalid_draft',
+    })
     expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM mutation_audit_entries').get())
       .toEqual({ count: 0 })
     expectNoReceiptChainState()
   })
 
-  it('rolls back an audited projection when its direct mutation affects zero rows', async () => {
-    const domain = auditedDepartmentMutation({
+  it('rolls back zero-row artifact projections without chain effects', async () => {
+    const projection = auditedProjectionMutation({
       auditId: 'audit-projection-zero',
-      mutationSql: 'UPDATE departments SET name = ?1 WHERE id = ?2',
-      bindings: ['After', 'projection-missing'],
+      sql: 'UPDATE artifacts SET object_key = object_key WHERE id = ?1',
+      bindings: ['projection-missing'],
+      targetKind: 'artifact',
       targetId: 'projection-missing',
     })
 
-    await expect(executeAuditedDomainMutations(env, [domain]))
+    await expect(executeAuditedProjectionMutations(env, [projection]))
       .rejects.toThrow(/check constraint/i)
 
     expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM mutation_audit_entries').get())
@@ -235,66 +473,90 @@ describe('Flight Spine execution receipt ledger', () => {
     expectNoReceiptChainState()
   })
 
-  it('rolls back an audited projection when its mutation affects multiple rows', async () => {
-    harness.sqlite.exec(`
-      INSERT INTO departments (id, slug, name) VALUES
-        ('projection-multi-a', 'projection-multi-a', 'Before A'),
-        ('projection-multi-b', 'projection-multi-b', 'Before B');
-    `)
-    const domain = auditedDepartmentMutation({
+  it('rolls back a multi-row artifacts projection and preserves its receipt baseline', async () => {
+    const storageReceiptId = await seedProjectionArtifactPrerequisites('projection-storage-multi-1')
+    const secondStorage = await appendExecutionReceipt(env, memberAuth(), {
+      type: 'result.reported',
+      idempotencyKey: 'projection-storage-multi-2',
+      flightId: 'projection-flight',
+      taskId: 'projection-task',
+      assignmentEpoch: 1,
+      claims: { secondArtifactMetadataReady: true },
+    })
+    const before = receiptChainCounts()
+    const projection = auditedProjectionMutation({
       auditId: 'audit-projection-multi',
-      mutationSql: `
-        UPDATE departments SET name = ?1
-         WHERE id IN (?2, ?3)
+      sql: `
+        INSERT INTO artifacts (
+          id, tenant, flight_id, producing_assignment_id, producing_task_id,
+          producing_agent_id, producing_runtime_seat_id, assignment_epoch,
+          object_key, digest, size_bytes, visibility, retention_until,
+          storage_receipt_id, created_at
+        ) VALUES
+          (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15),
+          (?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)
       `,
-      bindings: ['After', 'projection-multi-a', 'projection-multi-b'],
-      targetId: 'projection-multi-a,projection-multi-b',
+      bindings: [
+        'artifact-multi-a', TENANT, 'projection-flight', 'projection-assignment',
+        'projection-task', 'projection-agent', 'projection-seat', 1,
+        'sha256/aa/artifact-multi-a', 'a'.repeat(64), 128, 'tenant',
+        '2026-09-23T16:00:00.000Z', storageReceiptId, SERVER_TIME,
+        'artifact-multi-b', TENANT, 'projection-flight', 'projection-assignment',
+        'projection-task', 'projection-agent', 'projection-seat', 1,
+        'sha256/aa/artifact-multi-b', 'b'.repeat(64), 256, 'tenant',
+        '2026-09-23T16:00:00.000Z', secondStorage.id, SERVER_TIME,
+      ],
+      targetKind: 'artifact',
+      targetId: 'artifact-multi-a,artifact-multi-b',
     })
 
-    await expect(executeAuditedDomainMutations(env, [domain]))
+    await expect(executeAuditedProjectionMutations(env, [projection]))
       .rejects.toThrow(/check constraint/i)
 
     expect(harness.sqlite.prepare(`
-      SELECT id, name FROM departments
-       WHERE id IN ('projection-multi-a', 'projection-multi-b') ORDER BY id
-    `).all()).toEqual([
-      { id: 'projection-multi-a', name: 'Before A' },
-      { id: 'projection-multi-b', name: 'Before B' },
-    ])
+      SELECT COUNT(*) AS count FROM artifacts
+       WHERE id IN ('artifact-multi-a', 'artifact-multi-b')
+    `).get()).toEqual({ count: 0 })
     expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM mutation_audit_entries').get())
       .toEqual({ count: 0 })
-    expectNoReceiptChainState()
+    expect(receiptChainCounts()).toEqual(before)
   })
 
-  it('rolls back earlier audited projections when a later mutation hard-fails', async () => {
-    const first = auditedDepartmentMutation({
-      auditId: 'audit-projection-hard-first',
-      mutationSql: `
-        INSERT INTO departments (id, slug, name) VALUES (?1, ?2, ?3)
-      `,
-      bindings: ['projection-hard', 'projection-hard', 'First'],
-      targetId: 'projection-hard',
+  it('rolls back earlier artifacts projections when a later projection hard-fails', async () => {
+    const storageReceiptId = await seedProjectionArtifactPrerequisites('projection-storage-hard-1')
+    const secondStorage = await appendExecutionReceipt(env, memberAuth(), {
+      type: 'result.reported',
+      idempotencyKey: 'projection-storage-hard-2',
+      flightId: 'projection-flight',
+      taskId: 'projection-task',
+      assignmentEpoch: 1,
+      claims: { secondArtifactMetadataReady: true },
     })
-    const duplicate = auditedDepartmentMutation({
+    const before = receiptChainCounts()
+    const first = prepareArtifactProjection({
+      auditId: 'audit-projection-hard-first',
+      artifactId: 'artifact-hard',
+      storageReceiptId,
+      objectKey: 'sha256/aa/artifact-hard-first',
+    })
+    const duplicate = prepareArtifactProjection({
       auditId: 'audit-projection-hard-duplicate',
-      mutationSql: `
-        INSERT INTO departments (id, slug, name) VALUES (?1, ?2, ?3)
-      `,
-      bindings: ['projection-hard', 'projection-hard-copy', 'Duplicate'],
-      targetId: 'projection-hard',
+      artifactId: 'artifact-hard',
+      storageReceiptId: secondStorage.id,
+      objectKey: 'sha256/aa/artifact-hard-duplicate',
     })
 
-    await expect(executeAuditedDomainMutations(env, [first, duplicate]))
+    await expect(executeAuditedProjectionMutations(env, [first, duplicate]))
       .rejects.toThrow(/unique constraint/i)
 
     expect(harness.sqlite.prepare(`
-      SELECT COUNT(*) AS count FROM departments WHERE id = 'projection-hard'
+      SELECT COUNT(*) AS count FROM artifacts WHERE id = 'artifact-hard'
     `).get()).toEqual({ count: 0 })
     expect(harness.sqlite.prepare(`
       SELECT COUNT(*) AS count FROM mutation_audit_entries
        WHERE id LIKE 'audit-projection-hard-%'
     `).get()).toEqual({ count: 0 })
-    expectNoReceiptChainState()
+    expect(receiptChainCounts()).toEqual(before)
   })
 
   it('rejects every non-direct or compound SQL shape before preparing or executing it', () => {

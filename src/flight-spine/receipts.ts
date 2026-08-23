@@ -117,6 +117,7 @@ type CanonicalReceiptDraft = Omit<NormalizedDraft, 'type'> & {
 
 const PREPARED_RECEIPT_CHAIN = Symbol('prepared-execution-receipt-chain')
 const PREPARED_ATOMIC_DOMAIN_MUTATION = Symbol('prepared-atomic-domain-mutation')
+const PREPARED_AUDITED_PROJECTION_MUTATION = Symbol('prepared-audited-projection-mutation')
 
 export type PreparedExecutionReceiptFacts = Omit<ExecutionReceipt, 'sequence'>
 
@@ -130,6 +131,11 @@ export interface PreparedExecutionReceiptChain {
 
 export interface PreparedAtomicDomainMutation {
   readonly [PREPARED_ATOMIC_DOMAIN_MUTATION]: true
+  readonly expectedAuditId: string
+}
+
+export interface PreparedAuditedProjectionMutation {
+  readonly [PREPARED_AUDITED_PROJECTION_MUTATION]: true
   readonly expectedAuditId: string
 }
 
@@ -226,8 +232,8 @@ interface PreparedAtomicDomainMutationPieces {
   readonly audit: NormalizedAtomicDomainAuditMetadata
 }
 
-interface ResolvedAtomicDomainMutation {
-  readonly handle: PreparedAtomicDomainMutation
+interface ResolvedAuditedMutation {
+  readonly handle: { readonly expectedAuditId: string }
   readonly pieces: PreparedAtomicDomainMutationPieces
 }
 
@@ -262,6 +268,10 @@ const PREPARED_RECEIPT_PIECES = new WeakMap<
 >()
 const PREPARED_DOMAIN_PIECES = new WeakMap<
   PreparedAtomicDomainMutation,
+  PreparedAtomicDomainMutationPieces
+>()
+const PREPARED_PROJECTION_PIECES = new WeakMap<
+  PreparedAuditedProjectionMutation,
   PreparedAtomicDomainMutationPieces
 >()
 
@@ -752,6 +762,32 @@ export async function prepareFreshExecutionReceiptChain(
   return handle
 }
 
+function prepareAtomicMutationPieces(
+  db: D1Database,
+  normalized: ReturnType<typeof normalizeAtomicDomainMutationInput>,
+): PreparedAtomicDomainMutationPieces {
+  const unbound = db.prepare(normalized.sql)
+  return {
+    database: db,
+    mutationStatement: normalized.bindings.length === 0
+      ? unbound
+      : unbound.bind(...normalized.bindings),
+    audit: normalized.audit,
+  }
+}
+
+function assertProjectionSafeSql(sql: string): void {
+  const table = '(artifacts|artifact_retrieval_receipts)'
+  const insert = new RegExp(
+    `^INSERT(?:\\s+OR\\s+(?:ROLLBACK|ABORT|REPLACE|FAIL|IGNORE))?\\s+INTO\\s+${table}\\s*\\(`,
+  )
+  const update = new RegExp(`^UPDATE\\s+${table}\\s+SET\\b`)
+  const remove = new RegExp(`^DELETE\\s+FROM\\s+${table}(?:\\s+WHERE\\b|\\s*$)`)
+  if (!insert.test(sql) && !update.test(sql) && !remove.test(sql)) {
+    throw new ExecutionReceiptError('invalid_draft')
+  }
+}
+
 /**
  * Validate and internally prepare one direct, single-statement DML mutation.
  * Values arrive only through D1 bindings; callers cannot supply a prepared
@@ -762,19 +798,29 @@ export function prepareAuditedDomainMutation(
   input: AtomicDomainMutationInput,
 ): PreparedAtomicDomainMutation {
   const normalized = normalizeAtomicDomainMutationInput(input)
-  const unbound = db.prepare(normalized.sql)
-  const mutationStatement = normalized.bindings.length === 0
-    ? unbound
-    : unbound.bind(...normalized.bindings)
   const handle: PreparedAtomicDomainMutation = Object.freeze({
     [PREPARED_ATOMIC_DOMAIN_MUTATION]: true as const,
     expectedAuditId: normalized.audit.expectedAuditId,
   })
-  PREPARED_DOMAIN_PIECES.set(handle, {
-    database: db,
-    mutationStatement,
-    audit: normalized.audit,
+  PREPARED_DOMAIN_PIECES.set(handle, prepareAtomicMutationPieces(db, normalized))
+  return handle
+}
+
+/**
+ * Prepare one projection-safe artifact mutation. Only canonical, unquoted,
+ * unqualified `artifacts` and `artifact_retrieval_receipts` targets are valid.
+ */
+export function prepareAuditedProjectionMutation(
+  db: D1Database,
+  input: AtomicDomainMutationInput,
+): PreparedAuditedProjectionMutation {
+  const normalized = normalizeAtomicDomainMutationInput(input)
+  assertProjectionSafeSql(normalized.sql)
+  const handle: PreparedAuditedProjectionMutation = Object.freeze({
+    [PREPARED_AUDITED_PROJECTION_MUTATION]: true as const,
+    expectedAuditId: normalized.audit.expectedAuditId,
   })
+  PREPARED_PROJECTION_PIECES.set(handle, prepareAtomicMutationPieces(db, normalized))
   return handle
 }
 
@@ -944,11 +990,11 @@ function resolveAuditedDomainMutations(
   env: Env,
   domainMutations: readonly PreparedAtomicDomainMutation[],
   allowEmpty: boolean,
-): ResolvedAtomicDomainMutation[] {
+): ResolvedAuditedMutation[] {
   if (!allowEmpty && domainMutations.length === 0) {
     throw new ExecutionReceiptError('invalid_draft')
   }
-  const resolved: ResolvedAtomicDomainMutation[] = []
+  const resolved: ResolvedAuditedMutation[] = []
   const auditIds = new Set<string>()
   for (const handle of domainMutations) {
     const pieces = PREPARED_DOMAIN_PIECES.get(handle)
@@ -965,10 +1011,34 @@ function resolveAuditedDomainMutations(
   return resolved
 }
 
+function resolveAuditedProjectionMutations(
+  env: Env,
+  projectionMutations: readonly PreparedAuditedProjectionMutation[],
+): ResolvedAuditedMutation[] {
+  if (projectionMutations.length === 0) {
+    throw new ExecutionReceiptError('invalid_draft')
+  }
+  const resolved: ResolvedAuditedMutation[] = []
+  const auditIds = new Set<string>()
+  for (const handle of projectionMutations) {
+    const pieces = PREPARED_PROJECTION_PIECES.get(handle)
+    if (
+      pieces === undefined
+      || pieces.database !== env.DB
+      || auditIds.has(handle.expectedAuditId)
+    ) {
+      throw new ExecutionReceiptError('invalid_draft')
+    }
+    auditIds.add(handle.expectedAuditId)
+    resolved.push({ handle, pieces })
+  }
+  return resolved
+}
+
 function prepareAuditedDomainStatements(
   env: Env,
   tenant: string,
-  domainMutations: readonly ResolvedAtomicDomainMutation[],
+  domainMutations: readonly ResolvedAuditedMutation[],
 ): D1PreparedStatement[] {
   const statements: D1PreparedStatement[] = []
   for (const domain of domainMutations) {
@@ -982,7 +1052,7 @@ function prepareAuditedDomainStatements(
 
 function verifyAuditedDomainBatchResults(
   tenant: string,
-  domainMutations: readonly ResolvedAtomicDomainMutation[],
+  domainMutations: readonly ResolvedAuditedMutation[],
   batchResults: readonly D1Result<unknown>[],
   startIndex: number,
 ): number {
@@ -1037,7 +1107,7 @@ function expectedAtomicDomainAuditEntry(
 async function rereadAuditedDomainMutations(
   env: Env,
   tenant: string,
-  domainMutations: readonly ResolvedAtomicDomainMutation[],
+  domainMutations: readonly ResolvedAuditedMutation[],
 ): Promise<AtomicDomainAuditEntry[]> {
   const readDb = primaryDb(env)
   const audits: AtomicDomainAuditEntry[] = []
@@ -1063,7 +1133,7 @@ async function rereadAuditedDomainMutations(
 function verifyPreparedExecutionReceiptBatchResult(
   prepared: PreparedExecutionReceiptChain,
   receiptPieces: PreparedExecutionReceiptPieces,
-  domainMutations: readonly ResolvedAtomicDomainMutation[],
+  domainMutations: readonly ResolvedAuditedMutation[],
   batchResults: readonly D1Result<unknown>[],
 ): PreparedExecutionReceiptCommit {
   const receiptWriteCount = receiptPieces.receiptAndEdgeStatements.length
@@ -1188,14 +1258,14 @@ export function executePreparedExecutionReceiptBatch(
 }
 
 /**
- * Execute one or more opaque audited domain projections without creating or
+ * Execute one or more projection-safe artifact mutations without creating or
  * advancing any execution receipt, chain head, or semantic receipt edge.
  */
-export async function executeAuditedDomainMutations(
+export async function executeAuditedProjectionMutations(
   env: Env,
-  domainMutations: readonly PreparedAtomicDomainMutation[],
+  projectionMutations: readonly PreparedAuditedProjectionMutation[],
 ): Promise<AtomicDomainAuditEntry[]> {
-  const resolved = resolveAuditedDomainMutations(env, domainMutations, false)
+  const resolved = resolveAuditedProjectionMutations(env, projectionMutations)
   const statements = prepareAuditedDomainStatements(env, env.TENANT_SLUG, resolved)
   const batchResults = await env.DB.batch(statements)
   if (batchResults.length !== statements.length) {
