@@ -6,6 +6,7 @@ export type ExecutionReceiptType =
   | 'objective.accepted'
   | 'composition.proposed'
   | 'flight.materialized'
+  | 'flight.dependency_linked'
   | 'task.assigned'
   | 'message.accepted'
   | 'seat.leased'
@@ -19,6 +20,7 @@ export type ExecutionReceiptType =
   | 'source.ack'
   | 'artifact.stored'
   | 'artifact.retrieved'
+  | 'artifact.consumed'
   | 'result.reported'
   | 'gate.verdict'
   | 'task.completed'
@@ -32,17 +34,20 @@ export type ExecutionReceiptType =
 
 /**
  * Facts the Flight 2 control plane can issue itself. Runtime, host observation,
- * source/provider, artifact and gate issuers are deliberately deferred.
+ * source/provider, artifact storage/retrieval and gate issuers are deferred;
+ * dependency linking and artifact consumption are control-plane facts.
  */
 export type MupotExecutionReceiptType =
   | 'objective.authorized'
   | 'objective.accepted'
   | 'composition.proposed'
   | 'flight.materialized'
+  | 'flight.dependency_linked'
   | 'task.assigned'
   | 'message.accepted'
   | 'seat.leased'
   | 'effect.intent'
+  | 'artifact.consumed'
   | 'result.reported'
   | 'task.completed'
   | 'cost.finalized'

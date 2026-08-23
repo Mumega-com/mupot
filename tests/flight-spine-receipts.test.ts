@@ -613,6 +613,92 @@ describe('Flight Spine execution receipt ledger', () => {
     expect(receipt.canonicalPayload).not.toContain('forged')
   })
 
+  it('appends, replays and verifies a flight dependency-linked receipt', async () => {
+    const input: ExecutionReceiptDraft = {
+      type: 'flight.dependency_linked',
+      idempotencyKey: 'dependency-linked-key',
+      objectiveId: 'objective-dependency',
+      flightId: 'flight-parent',
+      claims: {
+        dependencyId: 'dependency-1',
+        parentFlightId: 'flight-parent',
+        childFlightId: 'flight-child',
+      },
+    }
+
+    const first = await appendExecutionReceipt(env, memberAuth(), input)
+    vi.setSystemTime(new Date('2026-08-23T18:00:00.000Z'))
+    const replay = await appendExecutionReceipt(env, memberAuth(), input)
+
+    expect(first).toMatchObject({
+      type: 'flight.dependency_linked',
+      objectiveId: 'objective-dependency',
+      flightId: 'flight-parent',
+      taskId: null,
+      assignmentEpoch: null,
+      claimsJson: '{"childFlightId":"flight-child","dependencyId":"dependency-1","parentFlightId":"flight-parent"}',
+    })
+    expect(replay).toEqual(first)
+    expect(await getExecutionReceipt(env, first.id)).toEqual(first)
+    expect(await verifyExecutionReceipt(env, first.id)).toEqual({ ok: true })
+    await expect(appendExecutionReceipt(env, memberAuth(), {
+      ...input,
+      claims: {
+        dependencyId: 'dependency-1',
+        parentFlightId: 'flight-parent',
+        childFlightId: 'flight-other',
+      },
+    })).rejects.toMatchObject({
+      name: 'ExecutionReceiptError',
+      code: 'idempotency_conflict',
+    })
+  })
+
+  it('appends, replays and verifies an artifact-consumed receipt with assignment epoch', async () => {
+    const input: ExecutionReceiptDraft = {
+      type: 'artifact.consumed',
+      idempotencyKey: 'artifact-consumed-key',
+      objectiveId: 'objective-artifact',
+      flightId: 'flight-parent',
+      taskId: 'task-parent',
+      assignmentEpoch: 3,
+      claims: {
+        artifactId: 'artifact-child',
+        flightDependencyId: 'dependency-1',
+        consumingAssignmentId: 'assignment-parent',
+      },
+    }
+
+    const first = await appendExecutionReceipt(env, agentAuth(), input)
+    vi.setSystemTime(new Date('2026-08-23T18:00:00.000Z'))
+    const replay = await appendExecutionReceipt(env, agentAuth(), input)
+
+    expect(first).toMatchObject({
+      type: 'artifact.consumed',
+      actorKind: 'agent',
+      actorId: 'agent-1',
+      objectiveId: 'objective-artifact',
+      flightId: 'flight-parent',
+      taskId: 'task-parent',
+      assignmentEpoch: 3,
+      claimsJson: '{"artifactId":"artifact-child","consumingAssignmentId":"assignment-parent","flightDependencyId":"dependency-1"}',
+    })
+    expect(replay).toEqual(first)
+    expect(await getExecutionReceipt(env, first.id)).toEqual(first)
+    expect(await verifyExecutionReceipt(env, first.id)).toEqual({ ok: true })
+    await expect(appendExecutionReceipt(env, agentAuth(), {
+      ...input,
+      claims: {
+        artifactId: 'artifact-other',
+        flightDependencyId: 'dependency-1',
+        consumingAssignmentId: 'assignment-parent',
+      },
+    })).rejects.toMatchObject({
+      name: 'ExecutionReceiptError',
+      code: 'idempotency_conflict',
+    })
+  })
+
   it('rejects receipt categories whose authoritative issuers arrive after Flight 2', async () => {
     const unsupportedTypes = [
       'host.persisted',
