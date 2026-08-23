@@ -95,7 +95,10 @@ CREATE TABLE runtime_seat_leases (
   expires_at TEXT NOT NULL CHECK (length(trim(expires_at)) > 0),
   renewed_at TEXT,
   released_at TEXT,
-  UNIQUE (tenant, runtime_seat_id, fencing_epoch)
+  UNIQUE (tenant, runtime_seat_id, fencing_epoch),
+  FOREIGN KEY (tenant, runtime_seat_id, generation)
+    REFERENCES runtime_seat_generations(tenant, runtime_seat_id, generation)
+    ON DELETE RESTRICT
 );
 
 CREATE UNIQUE INDEX idx_runtime_seat_leases_one_active
@@ -145,6 +148,74 @@ CREATE TABLE seat_attestations (
   UNIQUE (tenant, runtime_seat_id)
 );
 
+CREATE TRIGGER token_binding_attestations_validate_identity
+BEFORE INSERT ON token_binding_attestations
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM member_tokens token
+  JOIN members member
+    ON member.id = token.member_id
+   AND member.tenant = token.tenant
+  JOIN agents agent
+    ON agent.id = token.agent_id
+  JOIN agent_member_bindings binding
+    ON binding.tenant = token.tenant
+   AND binding.agent_id = token.agent_id
+   AND binding.member_id = token.member_id
+  WHERE token.id = NEW.token_id
+    AND token.tenant = NEW.tenant
+    AND token.member_id = NEW.member_id
+    AND token.agent_id = NEW.agent_id
+    AND token.channel = NEW.channel
+    AND token.channel = 'workspace'
+    AND token.revoked_at IS NULL
+    AND (token.expires_at IS NULL OR token.expires_at > NEW.issued_at)
+    AND token.created_at <= NEW.issued_at
+    AND member.status = 'active'
+    AND agent.status = 'active'
+)
+BEGIN
+  SELECT RAISE(ABORT, 'token binding identity mismatch');
+END;
+
+CREATE TRIGGER seat_attestations_validate_identity
+BEFORE INSERT ON seat_attestations
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM token_binding_attestations attestation
+  JOIN member_tokens token
+    ON token.id = attestation.token_id
+   AND token.tenant = attestation.tenant
+   AND token.member_id = attestation.member_id
+   AND token.agent_id = attestation.agent_id
+   AND token.channel = attestation.channel
+  JOIN members member
+    ON member.id = attestation.member_id
+   AND member.tenant = attestation.tenant
+  JOIN agents agent
+    ON agent.id = attestation.agent_id
+  JOIN runtime_seats seat
+    ON seat.id = NEW.runtime_seat_id
+   AND seat.tenant = attestation.tenant
+   AND seat.agent_id = attestation.agent_id
+  WHERE attestation.id = NEW.token_binding_attestation_id
+    AND attestation.tenant = NEW.tenant
+    AND attestation.member_id = NEW.member_id
+    AND attestation.agent_id = NEW.agent_id
+    AND attestation.channel = 'workspace'
+    AND attestation.issued_at <= NEW.issued_at
+    AND (attestation.expires_at IS NULL OR attestation.expires_at > NEW.issued_at)
+    AND token.revoked_at IS NULL
+    AND (token.expires_at IS NULL OR token.expires_at > NEW.issued_at)
+    AND member.status = 'active'
+    AND agent.status = 'active'
+    AND seat.state = 'pending'
+    AND NEW.seat_state = seat.state
+)
+BEGIN
+  SELECT RAISE(ABORT, 'seat attestation identity mismatch');
+END;
+
 CREATE TRIGGER runtime_seats_identity_immutable
 BEFORE UPDATE OF id, tenant, agent_id, seat_name, host_id, adapter_kind, created_at
 ON runtime_seats
@@ -182,6 +253,27 @@ CREATE TRIGGER runtime_seat_generations_no_delete
 BEFORE DELETE ON runtime_seat_generations
 BEGIN
   SELECT RAISE(ABORT, 'runtime seat generations are immutable');
+END;
+
+CREATE TRIGGER runtime_seat_leases_require_current_generation
+BEFORE INSERT ON runtime_seat_leases
+WHEN NEW.generation > 0
+ AND NEW.fencing_epoch > 0
+ AND NOT EXISTS (
+  SELECT 1
+  FROM runtime_seats seat
+  JOIN runtime_seat_generations generation
+    ON generation.tenant = seat.tenant
+   AND generation.runtime_seat_id = seat.id
+   AND generation.generation = NEW.generation
+  WHERE seat.id = NEW.runtime_seat_id
+    AND seat.tenant = NEW.tenant
+    AND seat.state = 'active'
+    AND seat.current_generation = NEW.generation
+    AND NEW.fencing_epoch > seat.current_fencing_epoch
+)
+BEGIN
+  SELECT RAISE(ABORT, 'runtime seat generation is not current and active');
 END;
 
 CREATE TRIGGER runtime_seat_leases_monotonic_insert

@@ -17,6 +17,30 @@ function seedLegacyRows(): void {
       VALUES
         ('agent-worker', 'squad-spine', 'worker', 'Worker'),
         ('agent-gate', 'squad-spine', 'gate', 'Gate');
+    INSERT INTO members (id, display_name, status, tenant)
+      VALUES
+        ('member-worker', 'Worker Member', 'active', '${TENANT}'),
+        ('member-gate', 'Gate Member', 'active', '${TENANT}');
+    INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+      VALUES
+        ('${TENANT}', 'agent-worker', 'member-worker', '2026-08-23T12:00:00.000Z'),
+        ('${TENANT}', 'agent-gate', 'member-gate', '2026-08-23T12:00:00.000Z');
+    INSERT INTO member_tokens (
+      id, member_id, token_hash, label, channel, created_at, revoked_at,
+      agent_id, tenant, expires_at
+    ) VALUES
+      ('token-worker', 'member-worker', 'hash-worker', 'worker', 'workspace',
+       '2026-08-23T12:00:00.000Z', NULL, 'agent-worker', '${TENANT}',
+       '2026-08-24T12:00:00.000Z'),
+      ('token-gate', 'member-gate', 'hash-gate', 'gate', 'workspace',
+       '2026-08-23T12:00:00.000Z', NULL, 'agent-gate', '${TENANT}',
+       '2026-08-24T12:00:00.000Z'),
+      ('token-directory', 'member-worker', 'hash-directory', 'directory', 'directory',
+       '2026-08-23T12:00:00.000Z', NULL, 'agent-worker', '${TENANT}',
+       '2026-08-24T12:00:00.000Z'),
+      ('token-revoked', 'member-worker', 'hash-revoked', 'revoked', 'workspace',
+       '2026-08-23T12:00:00.000Z', '2026-08-23T12:30:00.000Z',
+       'agent-worker', '${TENANT}', '2026-08-24T12:00:00.000Z');
     INSERT INTO flights (id, tenant, agent, goal, status)
       VALUES
         ('flight-parent', '${TENANT}', 'agent-worker', 'Parent', 'running'),
@@ -64,6 +88,36 @@ function insertRuntimeSeat(): void {
       '2026-08-23T12:00:00.000Z', '2026-08-23T12:00:00.000Z'
     )
   `).run(TENANT, SHA_A, SHA_B)
+}
+
+function insertPendingRuntimeSeat(
+  id: string,
+  agentId: string,
+  seatName: string,
+): void {
+  harness.sqlite.prepare(`
+    INSERT INTO runtime_seats (
+      id, tenant, agent_id, seat_name, host_id, adapter_kind, state,
+      current_generation, current_fencing_epoch, capabilities_json,
+      created_at, updated_at
+    ) VALUES (?, ?, ?, ?, 'host-1', 'codex-desktop', 'pending', 0, 0, '[]',
+      '2026-08-23T12:00:00.000Z', '2026-08-23T12:00:00.000Z')
+  `).run(id, TENANT, agentId, seatName)
+}
+
+function insertTokenBindingAttestation(
+  id: string,
+  tokenId = 'token-worker',
+  memberId = 'member-worker',
+  agentId = 'agent-worker',
+): void {
+  harness.sqlite.prepare(`
+    INSERT INTO token_binding_attestations (
+      id, tenant, token_id, member_id, agent_id, channel,
+      credential_fingerprint, issued_at, expires_at, created_at
+    ) VALUES (?, ?, ?, ?, ?, 'workspace', ?, '2026-08-23T13:00:00.000Z',
+      '2026-08-24T12:00:00.000Z', '2026-08-23T13:00:00.000Z')
+  `).run(id, TENANT, tokenId, memberId, agentId, `v1:${SHA_A}`)
 }
 
 function insertAssignment(): void {
@@ -243,6 +297,137 @@ describe('Flight Spine schema migrations', () => {
         '2026-08-23T12:00:02.000Z', '2026-08-23T12:01:02.000Z'
       )
     `).run(TENANT, SHA_B)).toThrow(/monotonic|fencing/i)
+  })
+
+  it('rejects token binding attestations whose member or agent differs from the token', () => {
+    expect(() => insertTokenBindingAttestation(
+      'attestation-wrong-member',
+      'token-worker',
+      'member-gate',
+      'agent-worker',
+    )).toThrow(/token binding identity mismatch/i)
+
+    expect(() => insertTokenBindingAttestation(
+      'attestation-wrong-agent',
+      'token-worker',
+      'member-worker',
+      'agent-gate',
+    )).toThrow(/token binding identity mismatch/i)
+  })
+
+  it('rejects token binding attestations for a non-workspace or revoked token', () => {
+    expect(() => insertTokenBindingAttestation(
+      'attestation-wrong-channel',
+      'token-directory',
+    )).toThrow(/token binding identity mismatch/i)
+
+    expect(() => insertTokenBindingAttestation(
+      'attestation-revoked',
+      'token-revoked',
+    )).toThrow(/token binding identity mismatch/i)
+  })
+
+  it('rejects a pending-seat attestation that contradicts token or seat ownership', () => {
+    insertTokenBindingAttestation('attestation-worker')
+    insertPendingRuntimeSeat('seat-gate-pending', 'agent-gate', 'gate-command')
+
+    expect(() => harness.sqlite.prepare(`
+      INSERT INTO seat_attestations (
+        id, tenant, runtime_seat_id, token_binding_attestation_id,
+        member_id, agent_id, seat_state, seat_claim_digest,
+        issued_at, expires_at, created_at
+      ) VALUES (
+        'seat-attestation-mismatch', ?, 'seat-gate-pending', 'attestation-worker',
+        'member-worker', 'agent-worker', 'pending', ?,
+        '2026-08-23T13:01:00.000Z', '2026-08-24T12:00:00.000Z',
+        '2026-08-23T13:01:00.000Z'
+      )
+    `).run(TENANT, SHA_A)).toThrow(/seat attestation identity mismatch/i)
+  })
+
+  it('rejects nonexistent, stale, or already-fenced seat generations when leasing', () => {
+    insertRuntimeSeat()
+
+    expect(() => harness.sqlite.prepare(`
+      INSERT INTO runtime_seat_leases (
+        id, tenant, runtime_seat_id, generation, fencing_epoch, consumer_id,
+        lease_token_hash, state, leased_at, expires_at
+      ) VALUES (
+        'lease-nonexistent-generation', ?, 'seat-1', 999, 1, 'consumer-1', ?,
+        'active', '2026-08-23T12:00:00.000Z', '2026-08-23T12:01:00.000Z'
+      )
+    `).run(TENANT, SHA_A)).toThrow(/runtime seat generation is not current and active/i)
+
+    harness.sqlite.prepare(`
+      INSERT INTO runtime_seat_generations (
+        id, tenant, runtime_seat_id, generation, host_id, process_id,
+        process_uid, sandbox_id, executable_digest, public_key,
+        broker_attestation_digest, started_at, created_at
+      ) VALUES (
+        'seat-generation-2', ?, 'seat-1', 2, 'host-1', 'pid-2', 'uid-1',
+        'sandbox-2', ?, 'public-key-2', ?,
+        '2026-08-23T12:02:00.000Z', '2026-08-23T12:02:00.000Z'
+      )
+    `).run(TENANT, SHA_A, SHA_B)
+    harness.sqlite.prepare(`
+      UPDATE runtime_seats
+      SET current_generation = 2, current_fencing_epoch = 2,
+          updated_at = '2026-08-23T12:02:00.000Z'
+      WHERE id = 'seat-1'
+    `).run()
+
+    expect(() => harness.sqlite.prepare(`
+      INSERT INTO runtime_seat_leases (
+        id, tenant, runtime_seat_id, generation, fencing_epoch, consumer_id,
+        lease_token_hash, state, leased_at, expires_at
+      ) VALUES (
+        'lease-stale-generation', ?, 'seat-1', 1, 3, 'consumer-1', ?, 'active',
+        '2026-08-23T12:02:01.000Z', '2026-08-23T12:03:01.000Z'
+      )
+    `).run(TENANT, SHA_A)).toThrow(/runtime seat generation is not current and active/i)
+
+    expect(() => harness.sqlite.prepare(`
+      INSERT INTO runtime_seat_leases (
+        id, tenant, runtime_seat_id, generation, fencing_epoch, consumer_id,
+        lease_token_hash, state, leased_at, expires_at
+      ) VALUES (
+        'lease-stale-fence', ?, 'seat-1', 2, 2, 'consumer-1', ?, 'active',
+        '2026-08-23T12:02:01.000Z', '2026-08-23T12:03:01.000Z'
+      )
+    `).run(TENANT, SHA_A)).toThrow(/runtime seat generation is not current and active/i)
+  })
+
+  it('requires execution receipt seat IDs and generations together and valid', () => {
+    insertRuntimeSeat()
+
+    for (const [id, seatId, seatGeneration] of [
+      ['receipt-seat-only', 'seat-1', null],
+      ['receipt-generation-only', null, 1],
+      ['receipt-zero-generation', 'seat-1', 0],
+      ['receipt-unknown-generation', 'seat-1', 999],
+    ] as const) {
+      expect(() => harness.sqlite.prepare(`
+        INSERT INTO execution_receipts (
+          id, tenant, type, issuer_kind, issuer_id, actor_kind, actor_id,
+          seat_id, seat_generation, idempotency_key, claims_json,
+          canonical_payload, payload_digest, receipt_hash, server_timestamp
+        ) VALUES (?, ?, 'runtime.consumed', 'mupot', 'mupot-server', 'agent',
+          'agent-worker', ?, ?, ?, '{}', '{}', ?, ?, '2026-08-23T12:00:00.000Z')
+      `).run(id, TENANT, seatId, seatGeneration, id, SHA_A, SHA_B))
+        .toThrow(/check constraint|foreign key constraint/i)
+    }
+
+    expect(() => harness.sqlite.prepare(`
+      INSERT INTO execution_receipts (
+        id, tenant, type, issuer_kind, issuer_id, actor_kind, actor_id,
+        seat_id, seat_generation, idempotency_key, claims_json,
+        canonical_payload, payload_digest, receipt_hash, server_timestamp
+      ) VALUES (
+        'receipt-valid-seat', ?, 'runtime.consumed', 'mupot', 'mupot-server',
+        'agent', 'agent-worker', 'seat-1', 1, 'receipt-valid-seat', '{}', '{}',
+        ?, ?, '2026-08-23T12:00:00.000Z'
+      )
+    `).run(TENANT, SHA_A, SHA_B)).not.toThrow()
   })
 
   it('rejects invalid SHA-256 values', () => {

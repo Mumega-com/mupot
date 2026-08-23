@@ -19,6 +19,9 @@ CREATE TABLE execution_receipts (
   issuer_id TEXT NOT NULL CHECK (length(trim(issuer_id)) > 0),
   actor_kind TEXT NOT NULL CHECK (actor_kind IN ('member','agent','system','controller')),
   actor_id TEXT NOT NULL CHECK (length(trim(actor_id)) > 0),
+  seat_id TEXT,
+  seat_generation INTEGER
+    CHECK (seat_generation IS NULL OR seat_generation > 0),
   objective_id TEXT,
   flight_id TEXT,
   task_id TEXT,
@@ -64,7 +67,14 @@ CREATE TABLE execution_receipts (
     (predecessor_receipt_id IS NULL AND predecessor_hash IS NULL)
     OR (predecessor_receipt_id IS NOT NULL AND predecessor_hash IS NOT NULL)
   ),
-  UNIQUE (tenant, issuer_kind, issuer_id, idempotency_key)
+  CHECK (
+    (seat_id IS NULL AND seat_generation IS NULL)
+    OR (seat_id IS NOT NULL AND seat_generation IS NOT NULL)
+  ),
+  UNIQUE (tenant, issuer_kind, issuer_id, idempotency_key),
+  FOREIGN KEY (tenant, seat_id, seat_generation)
+    REFERENCES runtime_seat_generations(tenant, runtime_seat_id, generation)
+    ON DELETE RESTRICT
 );
 
 CREATE INDEX idx_execution_receipts_tenant_sequence
@@ -75,6 +85,9 @@ CREATE INDEX idx_execution_receipts_flight_sequence
 CREATE INDEX idx_execution_receipts_task_sequence
   ON execution_receipts(tenant, task_id, sequence)
   WHERE task_id IS NOT NULL;
+CREATE INDEX idx_execution_receipts_seat_generation
+  ON execution_receipts(tenant, seat_id, seat_generation, sequence)
+  WHERE seat_id IS NOT NULL;
 
 CREATE TABLE execution_receipt_heads (
   tenant TEXT PRIMARY KEY,
