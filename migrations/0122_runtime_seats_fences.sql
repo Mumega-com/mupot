@@ -237,6 +237,23 @@ BEGIN
   SELECT RAISE(ABORT, 'runtime seat fencing epoch must be monotonic');
 END;
 
+CREATE TRIGGER runtime_seats_advance_requires_no_active_lease
+BEFORE UPDATE OF current_generation, current_fencing_epoch ON runtime_seats
+WHEN (
+  NEW.current_generation > OLD.current_generation
+  OR NEW.current_fencing_epoch > OLD.current_fencing_epoch
+)
+AND EXISTS (
+  SELECT 1
+  FROM runtime_seat_leases lease
+  WHERE lease.tenant = OLD.tenant
+    AND lease.runtime_seat_id = OLD.id
+    AND lease.state = 'active'
+)
+BEGIN
+  SELECT RAISE(ABORT, 'active runtime seat lease must end before advancing');
+END;
+
 CREATE TRIGGER runtime_seats_no_delete
 BEFORE DELETE ON runtime_seats
 BEGIN

@@ -299,6 +299,54 @@ describe('Flight Spine schema migrations', () => {
     `).run(TENANT, SHA_B)).toThrow(/monotonic|fencing/i)
   })
 
+  it('requires an active lease to end before advancing seat generation or fencing', () => {
+    insertRuntimeSeat()
+    harness.sqlite.prepare(`
+      INSERT INTO runtime_seat_leases (
+        id, tenant, runtime_seat_id, generation, fencing_epoch, consumer_id,
+        lease_token_hash, state, leased_at, expires_at
+      ) VALUES (
+        'lease-generation-1', ?, 'seat-1', 1, 1, 'consumer-1', ?, 'active',
+        '2026-08-23T12:00:00.000Z', '2026-08-23T12:01:00.000Z'
+      )
+    `).run(TENANT, SHA_A)
+    harness.sqlite.prepare(`
+      INSERT INTO runtime_seat_generations (
+        id, tenant, runtime_seat_id, generation, host_id, process_id,
+        process_uid, sandbox_id, executable_digest, public_key,
+        broker_attestation_digest, started_at, created_at
+      ) VALUES (
+        'seat-generation-2', ?, 'seat-1', 2, 'host-1', 'pid-2', 'uid-1',
+        'sandbox-2', ?, 'public-key-2', ?,
+        '2026-08-23T12:02:00.000Z', '2026-08-23T12:02:00.000Z'
+      )
+    `).run(TENANT, SHA_A, SHA_B)
+
+    expect(() => harness.sqlite.prepare(`
+      UPDATE runtime_seats
+      SET current_generation = 2, current_fencing_epoch = 1,
+          updated_at = '2026-08-23T12:02:00.000Z'
+      WHERE id = 'seat-1'
+    `).run()).toThrow(/active runtime seat lease must end before advancing/i)
+
+    harness.sqlite.prepare(`
+      UPDATE runtime_seat_leases
+      SET state = 'released', released_at = '2026-08-23T12:02:01.000Z'
+      WHERE id = 'lease-generation-1'
+    `).run()
+    expect(() => harness.sqlite.prepare(`
+      UPDATE runtime_seats
+      SET current_generation = 2, current_fencing_epoch = 1,
+          updated_at = '2026-08-23T12:02:02.000Z'
+      WHERE id = 'seat-1'
+    `).run()).not.toThrow()
+    expect(harness.sqlite.prepare(`
+      SELECT current_generation, current_fencing_epoch
+      FROM runtime_seats
+      WHERE id = 'seat-1'
+    `).get()).toEqual({ current_generation: 2, current_fencing_epoch: 1 })
+  })
+
   it('rejects token binding attestations whose member or agent differs from the token', () => {
     expect(() => insertTokenBindingAttestation(
       'attestation-wrong-member',
