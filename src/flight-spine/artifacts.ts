@@ -5,8 +5,9 @@ import {
   getExecutionReceipt,
   prepareAuditedProjectionMutation,
   verifyExecutionReceipt,
+  type AtomicDomainAuditMetadata,
 } from './receipts'
-import type { ExecutionReceipt } from './types'
+import { ExecutionReceiptError, type ExecutionReceipt } from './types'
 import {
   flightSpineAudit,
   requireFlightSpineSquadAuthority,
@@ -78,12 +79,14 @@ export type ArtifactErrorCode =
   | 'producer_scope_mismatch'
   | 'artifact_not_found'
   | 'artifact_conflict'
+  | 'artifact_audit_invalid'
   | 'retrieval_receipt_not_found'
   | 'retrieval_receipt_invalid'
   | 'digest_mismatch'
   | 'verifier_not_independent'
   | 'verifier_scope_mismatch'
   | 'retrieval_conflict'
+  | 'retrieval_audit_invalid'
 
 export class ArtifactError extends Error {
   readonly name = 'ArtifactError'
@@ -125,6 +128,32 @@ interface ArtifactRetrievalRow {
   recomputed_digest: string
   retrieval_receipt_id: string
   retrieved_at: string
+}
+
+interface ProjectionAuditRow {
+  id: string
+  tenant: string
+  principal_kind: string
+  principal_id: string
+  member_id: string | null
+  agent_id: string | null
+  credential_id: string | null
+  runtime_seat_id: string | null
+  runtime_generation: number | null
+  origin: string
+  handler: string
+  operation: string
+  target_kind: string
+  target_id: string
+  before_digest: string | null
+  after_digest: string | null
+  objective_id: string | null
+  flight_id: string | null
+  task_id: string | null
+  request_id: string
+  idempotency_key: string | null
+  evidence_json: string
+  recorded_at: string
 }
 
 interface ProducerContext {
@@ -189,9 +218,62 @@ function boundedText(value: unknown, maximum = 255): string {
   return normalized
 }
 
-function optionalText(value: unknown, maximum: number): string | null {
+function optionalCanonicalText(value: unknown, maximum: number): string | null {
   if (value === undefined || value === null) return null
-  return boundedText(value, maximum)
+  if (
+    typeof value !== 'string'
+    || value.length === 0
+    || value.length > maximum
+    || value !== value.trim()
+    || /[\u0000-\u001f\u007f]/.test(value)
+  ) {
+    throw new ArtifactError('invalid_artifact')
+  }
+  return value
+}
+
+function canonicalGitHubRemote(value: unknown): string | null {
+  const remote = optionalCanonicalText(value, 2_048)
+  if (remote === null) return null
+  if (remote.includes('%')) throw new ArtifactError('invalid_artifact')
+  const match = /^https:\/\/github\.com\/([^/?#]+)\/([^/?#]+)$/.exec(remote)
+  if (!match) throw new ArtifactError('invalid_artifact')
+  const owner = match[1]
+  const rawRepository = match[2]
+  const repository = rawRepository.endsWith('.git')
+    ? rawRepository.slice(0, -4)
+    : rawRepository
+  if (
+    !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/.test(owner)
+    || owner.includes('--')
+    || !/^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,98}[A-Za-z0-9])?$/.test(repository)
+  ) {
+    throw new ArtifactError('invalid_artifact')
+  }
+  return `https://github.com/${owner}/${repository}`
+}
+
+function canonicalRepositoryPath(value: unknown): string | null {
+  const path = optionalCanonicalText(value, 2_048)
+  if (path === null) return null
+  if (
+    path.startsWith('/')
+    || path.endsWith('/')
+    || path.includes('\\')
+    || path.includes('%')
+  ) {
+    throw new ArtifactError('invalid_artifact')
+  }
+  const segments = path.split('/')
+  if (segments.some((segment) => (
+    segment.length === 0
+    || segment === '.'
+    || segment === '..'
+    || !/^[A-Za-z0-9._-]+$/.test(segment)
+  ))) {
+    throw new ArtifactError('invalid_artifact')
+  }
+  return path
 }
 
 function assertInputKeys(
@@ -250,9 +332,9 @@ function normalizeArtifactInput(input: RecordArtifactMetadataInput): NormalizedA
   if (!['tenant', 'gate', 'public'].includes(input.visibility)) {
     throw new ArtifactError('invalid_artifact')
   }
-  const repositoryUrl = optionalText(input.repositoryUrl, 2_048)
-  const commitSha = optionalText(input.commitSha, 64)
-  const repositoryPath = optionalText(input.repositoryPath, 2_048)
+  const repositoryUrl = canonicalGitHubRemote(input.repositoryUrl)
+  const commitSha = optionalCanonicalText(input.commitSha, 64)
+  const repositoryPath = canonicalRepositoryPath(input.repositoryPath)
   const repositoryParts = [repositoryUrl, commitSha, repositoryPath]
   if (repositoryParts.some((value) => value === null) && repositoryParts.some((value) => value !== null)) {
     throw new ArtifactError('invalid_artifact')
@@ -347,6 +429,66 @@ function mapRetrieval(row: ArtifactRetrievalRow): ArtifactRetrieval {
   }
 }
 
+function expectedProjectionAudit(
+  tenant: string,
+  audit: AtomicDomainAuditMetadata,
+): Omit<ProjectionAuditRow, 'recorded_at'> {
+  return {
+    id: audit.expectedAuditId,
+    tenant,
+    principal_kind: audit.principalKind,
+    principal_id: audit.principalId,
+    member_id: audit.memberId ?? null,
+    agent_id: audit.agentId ?? null,
+    credential_id: audit.credentialId ?? null,
+    runtime_seat_id: audit.runtimeSeatId ?? null,
+    runtime_generation: audit.runtimeGeneration ?? null,
+    origin: audit.origin,
+    handler: audit.handler,
+    operation: audit.operation,
+    target_kind: audit.targetKind,
+    target_id: audit.targetId,
+    before_digest: audit.beforeDigest ?? null,
+    after_digest: audit.afterDigest ?? null,
+    objective_id: audit.objectiveId ?? null,
+    flight_id: audit.flightId ?? null,
+    task_id: audit.taskId ?? null,
+    request_id: audit.requestId,
+    idempotency_key: audit.idempotencyKey ?? null,
+    evidence_json: canonicalJson(audit.evidence),
+  }
+}
+
+async function requireProjectionAudit(
+  env: Env,
+  audit: AtomicDomainAuditMetadata,
+  errorCode: 'artifact_audit_invalid' | 'retrieval_audit_invalid',
+): Promise<void> {
+  const row = await env.DB.prepare(`
+    SELECT id, tenant, principal_kind, principal_id, member_id, agent_id,
+           credential_id, runtime_seat_id, runtime_generation, origin,
+           handler, operation, target_kind, target_id, before_digest,
+           after_digest, objective_id, flight_id, task_id, request_id,
+           idempotency_key, evidence_json, recorded_at
+      FROM mutation_audit_entries
+     WHERE tenant = ?1 AND id = ?2
+  `).bind(env.TENANT_SLUG, audit.expectedAuditId).first<ProjectionAuditRow>()
+  if (!row || typeof row.recorded_at !== 'string' || row.recorded_at.trim() === '') {
+    throw new ArtifactError(errorCode)
+  }
+  const actual = { ...row } as Partial<ProjectionAuditRow>
+  delete actual.recorded_at
+  if (canonicalJson(actual) !== canonicalJson(expectedProjectionAudit(env.TENANT_SLUG, audit))) {
+    throw new ArtifactError(errorCode)
+  }
+}
+
+function isProjectionConstraintConflict(error: unknown): boolean {
+  if (error instanceof ExecutionReceiptError) return false
+  const message = error instanceof Error ? error.message : String(error)
+  return /constraint failed|constraint violation/i.test(message)
+}
+
 async function requireReceipt(
   env: Env,
   id: string,
@@ -371,14 +513,11 @@ async function requireReceipt(
   return receipt
 }
 
-async function requireRetentionHorizon(env: Env, retentionUntil: string): Promise<void> {
-  const row = await env.DB.prepare(`
-    SELECT CASE
-      WHEN julianday(?1) IS NOT NULL
-       AND julianday(?1) >= julianday('now', '+30 days')
-      THEN 1 ELSE 0 END AS valid
-  `).bind(retentionUntil).first<{ valid: number }>()
-  if (Number(row?.valid) !== 1) throw new ArtifactError('retention_too_short')
+function requireRetentionHorizon(retentionUntil: string): void {
+  const minimum = Date.now() + (30 * 24 * 60 * 60 * 1_000)
+  if (Date.parse(retentionUntil) < minimum) {
+    throw new ArtifactError('retention_too_short')
+  }
 }
 
 async function requireProducerContext(
@@ -511,6 +650,7 @@ async function replayArtifactOrConflict(
   input: NormalizedArtifactInput,
   context: ProducerContext,
   createdAt: string,
+  audit: AtomicDomainAuditMetadata,
 ): Promise<ArtifactMetadata | null> {
   const rows = await artifactCandidates(env, input)
   if (rows.length === 0) return null
@@ -520,6 +660,7 @@ async function replayArtifactOrConflict(
   ) {
     throw new ArtifactError('artifact_conflict')
   }
+  await requireProjectionAudit(env, audit, 'artifact_audit_invalid')
   return mapArtifact(rows[0])
 }
 
@@ -554,6 +695,41 @@ async function artifactAuditDigest(
   }))
 }
 
+async function artifactAuditMetadata(
+  env: Env,
+  auth: AuthContext,
+  principal: FlightSpinePrincipal,
+  input: NormalizedArtifactInput,
+  context: ProducerContext,
+  receipt: ExecutionReceipt,
+): Promise<AtomicDomainAuditMetadata> {
+  const requestDigest = await sha256Hex(canonicalJson({
+    tenant: env.TENANT_SLUG,
+    artifactId: input.artifactId,
+    storageReceiptId: input.storageReceiptId,
+  }))
+  return flightSpineAudit(auth, principal, {
+    expectedAuditId: `audit:artifact:${requestDigest}`,
+    handler: 'flight_spine.record_artifact_metadata',
+    operation: 'insert',
+    targetKind: 'artifact',
+    targetId: input.artifactId,
+    afterDigest: await artifactAuditDigest(input, context, receipt),
+    objectiveId: receipt.objectiveId,
+    flightId: context.flightId,
+    taskId: context.taskId,
+    requestId: input.storageReceiptId,
+    idempotencyKey: `artifact:${requestDigest}`,
+    runtimeSeatId: context.runtimeSeatId,
+    runtimeGeneration: context.seatGeneration,
+    evidence: {
+      storageReceiptId: input.storageReceiptId,
+      digest: input.digest,
+      metadataOnly: true,
+    },
+  })
+}
+
 /**
  * Project immutable metadata from a cryptographically verified artifact-service
  * storage receipt. This records no bytes and never changes a task or result.
@@ -564,20 +740,21 @@ export async function recordArtifactMetadata(
   rawInput: RecordArtifactMetadataInput,
 ): Promise<ArtifactMetadata> {
   const input = normalizeArtifactInput(rawInput)
-  await requireRetentionHorizon(env, input.retentionUntil)
+  requireRetentionHorizon(input.retentionUntil)
   const receipt = await requireReceipt(env, input.storageReceiptId, 'artifact.stored')
   const principal = await resolveFlightSpinePrincipal(env, auth)
   const context = await requireProducerContext(env, auth, principal, input, receipt)
-  const replay = await replayArtifactOrConflict(env, input, context, receipt.serverTimestamp)
+  const audit = await artifactAuditMetadata(env, auth, principal, input, context, receipt)
+  const replay = await replayArtifactOrConflict(
+    env,
+    input,
+    context,
+    receipt.serverTimestamp,
+    audit,
+  )
   if (replay) return replay
 
-  const requestDigest = await sha256Hex(canonicalJson({
-    tenant: env.TENANT_SLUG,
-    artifactId: input.artifactId,
-    storageReceiptId: input.storageReceiptId,
-  }))
   const claimsJson = canonicalJson(metadataClaims(input))
-  const afterDigest = await artifactAuditDigest(input, context, receipt)
   const mutation = prepareAuditedProjectionMutation(env.DB, {
     sql: `INSERT INTO artifacts (
       id, tenant, flight_id, producing_assignment_id, producing_task_id,
@@ -693,32 +870,14 @@ export async function recordArtifactMetadata(
       principal.authorityMemberId,
       legacyAdmin(auth),
     ],
-    audit: flightSpineAudit(auth, principal, {
-      expectedAuditId: `audit:artifact:${requestDigest}`,
-      handler: 'flight_spine.record_artifact_metadata',
-      operation: 'insert',
-      targetKind: 'artifact',
-      targetId: input.artifactId,
-      afterDigest,
-      objectiveId: receipt.objectiveId,
-      flightId: context.flightId,
-      taskId: context.taskId,
-      requestId: input.storageReceiptId,
-      idempotencyKey: `artifact:${requestDigest}`,
-      runtimeSeatId: context.runtimeSeatId,
-      runtimeGeneration: context.seatGeneration,
-      evidence: {
-        storageReceiptId: input.storageReceiptId,
-        digest: input.digest,
-        metadataOnly: true,
-      },
-    }),
+    audit,
   })
 
   try {
     await executeAuditedProjectionMutations(env, [mutation])
-  } catch {
-    await requireRetentionHorizon(env, input.retentionUntil)
+  } catch (error) {
+    if (!isProjectionConstraintConflict(error)) throw error
+    requireRetentionHorizon(input.retentionUntil)
     const currentReceipt = await requireReceipt(env, input.storageReceiptId, 'artifact.stored')
     const currentPrincipal = await resolveFlightSpinePrincipal(env, auth)
     const currentContext = await requireProducerContext(
@@ -728,16 +887,31 @@ export async function recordArtifactMetadata(
       input,
       currentReceipt,
     )
+    const currentAudit = await artifactAuditMetadata(
+      env,
+      auth,
+      currentPrincipal,
+      input,
+      currentContext,
+      currentReceipt,
+    )
     const raced = await replayArtifactOrConflict(
       env,
       input,
       currentContext,
       currentReceipt.serverTimestamp,
+      currentAudit,
     )
     if (raced) return raced
-    throw new ArtifactError('artifact_conflict')
+    throw error
   }
-  const persisted = await replayArtifactOrConflict(env, input, context, receipt.serverTimestamp)
+  const persisted = await replayArtifactOrConflict(
+    env,
+    input,
+    context,
+    receipt.serverTimestamp,
+    audit,
+  )
   if (!persisted) throw new ArtifactError('artifact_conflict')
   return persisted
 }
@@ -878,20 +1052,78 @@ function retrievalMatches(
     && row.retrieved_at === retrievedAt
 }
 
-async function replayRetrievalOrConflict(
+async function retrievalAuditMetadata(
   env: Env,
+  auth: AuthContext,
+  principal: FlightSpinePrincipal,
   input: NormalizedRetrievalInput,
   context: VerifierContext,
-  retrievedAt: string,
+  receipt: ExecutionReceipt,
+  retrievalId: string,
+): Promise<AtomicDomainAuditMetadata> {
+  const requestDigest = await sha256Hex(canonicalJson({
+    tenant: env.TENANT_SLUG,
+    artifactId: input.artifactId,
+    retrievalReceiptId: input.retrievalReceiptId,
+  }))
+  const afterDigest = await sha256Hex(canonicalJson({
+    id: retrievalId,
+    artifactId: input.artifactId,
+    verifierPrincipalKind: 'agent',
+    verifierPrincipalId: context.agentId,
+    verifierRuntimeSeatId: context.runtimeSeatId,
+    recomputedDigest: input.recomputedDigest,
+    retrievalReceiptId: input.retrievalReceiptId,
+  }))
+  return flightSpineAudit(auth, principal, {
+    expectedAuditId: `audit:artifact-retrieval:${requestDigest}`,
+    handler: 'flight_spine.record_artifact_retrieval',
+    operation: 'insert',
+    targetKind: 'artifact_retrieval_receipt',
+    targetId: retrievalId,
+    afterDigest,
+    objectiveId: receipt.objectiveId,
+    flightId: context.flightId,
+    taskId: context.taskId,
+    requestId: input.retrievalReceiptId,
+    idempotencyKey: `artifact-retrieval:${requestDigest}`,
+    runtimeSeatId: context.runtimeSeatId,
+    runtimeGeneration: context.seatGeneration,
+    evidence: {
+      retrievalReceiptId: input.retrievalReceiptId,
+      artifactId: input.artifactId,
+      recomputedDigest: input.recomputedDigest,
+      metadataOnly: true,
+    },
+  })
+}
+
+async function replayRetrievalOrConflict(
+  env: Env,
+  auth: AuthContext,
+  principal: FlightSpinePrincipal,
+  input: NormalizedRetrievalInput,
+  context: VerifierContext,
+  receipt: ExecutionReceipt,
 ): Promise<ArtifactRetrieval | null> {
   const rows = await retrievalCandidates(env, input, context)
   if (rows.length === 0) return null
   if (
     rows.length !== 1
-    || !retrievalMatches(rows[0], env.TENANT_SLUG, input, context, retrievedAt)
+    || !retrievalMatches(rows[0], env.TENANT_SLUG, input, context, receipt.serverTimestamp)
   ) {
     throw new ArtifactError('retrieval_conflict')
   }
+  const audit = await retrievalAuditMetadata(
+    env,
+    auth,
+    principal,
+    input,
+    context,
+    receipt,
+    rows[0].id,
+  )
+  await requireProjectionAudit(env, audit, 'retrieval_audit_invalid')
   return mapRetrieval(rows[0])
 }
 
@@ -910,25 +1142,27 @@ export async function recordArtifactRetrieval(
   const receipt = await requireReceipt(env, input.retrievalReceiptId, 'artifact.retrieved')
   const principal = await resolveFlightSpinePrincipal(env, auth)
   const context = await requireVerifierContext(env, auth, principal, artifact, input, receipt)
-  const replay = await replayRetrievalOrConflict(env, input, context, receipt.serverTimestamp)
+  const replay = await replayRetrievalOrConflict(
+    env,
+    auth,
+    principal,
+    input,
+    context,
+    receipt,
+  )
   if (replay) return replay
 
   const id = crypto.randomUUID()
-  const requestDigest = await sha256Hex(canonicalJson({
-    tenant: env.TENANT_SLUG,
-    artifactId: input.artifactId,
-    retrievalReceiptId: input.retrievalReceiptId,
-  }))
   const claimsJson = canonicalJson(retrievalClaims(input))
-  const afterDigest = await sha256Hex(canonicalJson({
+  const audit = await retrievalAuditMetadata(
+    env,
+    auth,
+    principal,
+    input,
+    context,
+    receipt,
     id,
-    artifactId: input.artifactId,
-    verifierPrincipalKind: 'agent',
-    verifierPrincipalId: context.agentId,
-    verifierRuntimeSeatId: context.runtimeSeatId,
-    recomputedDigest: input.recomputedDigest,
-    retrievalReceiptId: input.retrievalReceiptId,
-  }))
+  )
   const mutation = prepareAuditedProjectionMutation(env.DB, {
     sql: `INSERT INTO artifact_retrieval_receipts (
       id, tenant, artifact_id, verifier_principal_kind, verifier_principal_id,
@@ -1037,32 +1271,13 @@ export async function recordArtifactRetrieval(
       principal.authorityMemberId,
       legacyAdmin(auth),
     ],
-    audit: flightSpineAudit(auth, principal, {
-      expectedAuditId: `audit:artifact-retrieval:${requestDigest}`,
-      handler: 'flight_spine.record_artifact_retrieval',
-      operation: 'insert',
-      targetKind: 'artifact_retrieval_receipt',
-      targetId: id,
-      afterDigest,
-      objectiveId: receipt.objectiveId,
-      flightId: context.flightId,
-      taskId: context.taskId,
-      requestId: input.retrievalReceiptId,
-      idempotencyKey: `artifact-retrieval:${requestDigest}`,
-      runtimeSeatId: context.runtimeSeatId,
-      runtimeGeneration: context.seatGeneration,
-      evidence: {
-        retrievalReceiptId: input.retrievalReceiptId,
-        artifactId: input.artifactId,
-        recomputedDigest: input.recomputedDigest,
-        metadataOnly: true,
-      },
-    }),
+    audit,
   })
 
   try {
     await executeAuditedProjectionMutations(env, [mutation])
-  } catch {
+  } catch (error) {
+    if (!isProjectionConstraintConflict(error)) throw error
     const currentArtifact = await artifactById(env, input.artifactId)
     if (!currentArtifact) throw new ArtifactError('artifact_not_found')
     const currentReceipt = await requireReceipt(env, input.retrievalReceiptId, 'artifact.retrieved')
@@ -1077,14 +1292,23 @@ export async function recordArtifactRetrieval(
     )
     const raced = await replayRetrievalOrConflict(
       env,
+      auth,
+      currentPrincipal,
       input,
       currentContext,
-      currentReceipt.serverTimestamp,
+      currentReceipt,
     )
     if (raced) return raced
-    throw new ArtifactError('retrieval_conflict')
+    throw error
   }
-  const persisted = await replayRetrievalOrConflict(env, input, context, receipt.serverTimestamp)
+  const persisted = await replayRetrievalOrConflict(
+    env,
+    auth,
+    principal,
+    input,
+    context,
+    receipt,
+  )
   if (!persisted) throw new ArtifactError('retrieval_conflict')
   return persisted
 }

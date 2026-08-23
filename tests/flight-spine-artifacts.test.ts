@@ -1,5 +1,5 @@
 import type { D1Database } from '@cloudflare/workers-types'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   recordArtifactMetadata,
   recordArtifactRetrieval,
@@ -292,6 +292,46 @@ function envWithBeforeBatch(mutate: () => Promise<void> | void): Env {
   }
 }
 
+function envWithAfterBatch(mutate: () => Promise<void> | void): Env {
+  return {
+    ...env,
+    DB: {
+      prepare: harness.db.prepare.bind(harness.db),
+      async batch(statements: Parameters<D1Database['batch']>[0]) {
+        const results = await harness.db.batch(statements)
+        await mutate()
+        return results
+      },
+    } as D1Database,
+  }
+}
+
+function envWithBatchError(error: Error): Env {
+  return {
+    ...env,
+    DB: {
+      prepare: harness.db.prepare.bind(harness.db),
+      async batch() {
+        throw error
+      },
+    } as D1Database,
+  }
+}
+
+function deleteAuditWhere(where: string): void {
+  harness.sqlite.exec('DROP TRIGGER mutation_audit_entries_no_delete')
+  harness.sqlite.exec(`DELETE FROM mutation_audit_entries WHERE ${where}`)
+}
+
+function corruptAuditWhere(where: string): void {
+  harness.sqlite.exec('DROP TRIGGER mutation_audit_entries_no_update')
+  harness.sqlite.exec(`
+    UPDATE mutation_audit_entries
+       SET handler = 'flight_spine.corrupted_artifact_audit'
+     WHERE ${where}
+  `)
+}
+
 beforeEach(async () => {
   harness = createSqliteD1()
   applyAllMigrations(harness.sqlite)
@@ -396,6 +436,7 @@ beforeEach(async () => {
 })
 
 afterEach(() => {
+  vi.useRealTimers()
   harness.close()
 })
 
@@ -542,6 +583,69 @@ describe('Flight Spine artifact metadata facts', () => {
     expect(count('mutation_audit_entries', "WHERE target_kind = 'artifact'")).toBe(0)
   })
 
+  it('canonicalizes one safe GitHub repository tuple and accepts a nested relative path', async () => {
+    const input = metadataInput({
+      repositoryUrl: 'https://github.com/Mumega/mupot.git',
+      commitSha: 'c'.repeat(40),
+      repositoryPath: 'packages/flight-spine/src/artifacts.ts',
+    })
+    await insertStorageReceipt(input, {
+      claims: storageClaims({
+        ...input,
+        repositoryUrl: 'https://github.com/Mumega/mupot',
+      }),
+    })
+
+    const artifact = await recordArtifactMetadata(env, producerAuth(), input)
+
+    expect(artifact.repositoryUrl).toBe('https://github.com/Mumega/mupot')
+    expect(artifact.commitSha).toBe('c'.repeat(40))
+    expect(artifact.repositoryPath).toBe('packages/flight-spine/src/artifacts.ts')
+  })
+
+  it('rejects unsafe repository remotes and repository-relative paths', async () => {
+    const cases = [
+      { repositoryUrl: 'http://github.com/Mumega/mupot', repositoryPath: 'src/file.ts' },
+      { repositoryUrl: 'https://user@github.com/Mumega/mupot', repositoryPath: 'src/file.ts' },
+      { repositoryUrl: 'https://github.com/Mumega/mupot?ref=main', repositoryPath: 'src/file.ts' },
+      { repositoryUrl: 'https://github.com/Mumega/mupot#readme', repositoryPath: 'src/file.ts' },
+      { repositoryUrl: 'https://github.com/Mumega/mupot/tree/main', repositoryPath: 'src/file.ts' },
+      { repositoryUrl: 'https://gitlab.com/Mumega/mupot', repositoryPath: 'src/file.ts' },
+      { repositoryUrl: 'https://github.com/Mumega/mupot/', repositoryPath: 'src/file.ts' },
+      { repositoryUrl: 'https://github.com/Mumega/mupot\n', repositoryPath: 'src/file.ts' },
+      { repositoryUrl: 'https://github.com/Mumega/mupot', repositoryPath: '/src/file.ts' },
+      { repositoryUrl: 'https://github.com/Mumega/mupot', repositoryPath: 'src/file.ts/' },
+      { repositoryUrl: 'https://github.com/Mumega/mupot', repositoryPath: 'src\\file.ts' },
+      { repositoryUrl: 'https://github.com/Mumega/mupot', repositoryPath: 'src//file.ts' },
+      { repositoryUrl: 'https://github.com/Mumega/mupot', repositoryPath: './src/file.ts' },
+      { repositoryUrl: 'https://github.com/Mumega/mupot', repositoryPath: '../src/file.ts' },
+      { repositoryUrl: 'https://github.com/Mumega/mupot', repositoryPath: 'src/../file.ts' },
+      { repositoryUrl: 'https://github.com/Mumega/mupot', repositoryPath: 'src/%2e%2e/file.ts' },
+      { repositoryUrl: 'https://github.com/Mumega/mupot', repositoryPath: 'src%2ffile.ts' },
+      { repositoryUrl: 'https://github.com/Mumega/mupot', repositoryPath: 'src/line\nbreak.ts' },
+      { repositoryUrl: 'https://github.com/Mumega/mupot', repositoryPath: 'https://example.test/file' },
+    ]
+
+    for (const [index, testCase] of cases.entries()) {
+      const digest = await sha256Hex(`unsafe-repository-case-${index}`)
+      const input = metadataInput({
+        artifactId: `artifact-unsafe-repository-${index}`,
+        storageReceiptId: `receipt-unsafe-repository-${index}`,
+        digest,
+        objectKey: `sha256/${digest.slice(0, 2)}/${digest}`,
+        repositoryUrl: testCase.repositoryUrl,
+        commitSha: 'd'.repeat(40),
+        repositoryPath: testCase.repositoryPath,
+      })
+      await insertStorageReceipt(input)
+      await expect(
+        recordArtifactMetadata(env, producerAuth(), input),
+        JSON.stringify(testCase),
+      ).rejects.toMatchObject({ code: 'invalid_artifact' })
+    }
+    expect(count('artifacts')).toBe(0)
+  })
+
   it('requires a verified artifact-service stored receipt with exact canonical claims', async () => {
     const wrongIssuer = metadataInput({
       artifactId: 'artifact-wrong-issuer',
@@ -612,6 +716,36 @@ describe('Flight Spine artifact metadata facts', () => {
     expect(count('mutation_audit_entries', "WHERE target_kind = 'artifact'")).toBe(0)
   })
 
+  it('uses SQLite statement time to reject retention that only passes the preflight clock', async () => {
+    const sqliteMillis = Date.parse(sqliteNow())
+    const preflight = new Date(sqliteMillis - 60_000)
+    const racedRetention = new Date(
+      sqliteMillis + (30 * 24 * 60 * 60 * 1_000) - 1_000,
+    ).toISOString()
+    vi.useFakeTimers()
+    vi.setSystemTime(preflight)
+    expect(Date.parse(racedRetention) - Date.now())
+      .toBeGreaterThan(30 * 24 * 60 * 60 * 1_000)
+    const input = metadataInput({
+      artifactId: 'artifact-retention-statement-time',
+      storageReceiptId: 'receipt-retention-statement-time',
+      retentionUntil: racedRetention,
+    })
+    await insertStorageReceipt(input)
+
+    let rejected: unknown
+    try {
+      await recordArtifactMetadata(env, producerAuth(), input)
+    } catch (error) {
+      rejected = error
+    }
+
+    expect(rejected).toBeTruthy()
+    expect(rejected).not.toMatchObject({ code: 'retention_too_short' })
+    expect(count('artifacts')).toBe(0)
+    expect(count('mutation_audit_entries', "WHERE target_kind = 'artifact'")).toBe(0)
+  })
+
   it('replays only byte-identical request identity and resolves an exact concurrent winner', async () => {
     const input = metadataInput()
     await insertStorageReceipt(input)
@@ -638,6 +772,42 @@ describe('Flight Spine artifact metadata facts', () => {
     expect(raced.id).toBe(racedInput.artifactId)
     expect(count('artifacts')).toBe(2)
     expect(count('mutation_audit_entries', "WHERE target_kind = 'artifact'")).toBe(2)
+  })
+
+  it('refuses a preexisting artifact projection when its deterministic audit is missing', async () => {
+    const input = metadataInput()
+    await insertStorageReceipt(input)
+    await recordArtifactMetadata(env, producerAuth(), input)
+    deleteAuditWhere(`target_kind = 'artifact' AND target_id = '${ARTIFACT_ID}'`)
+
+    await expect(recordArtifactMetadata(env, producerAuth(), input))
+      .rejects.toMatchObject({ code: 'artifact_audit_invalid' })
+  })
+
+  it('rethrows a postcommit artifact audit reread integrity failure instead of replaying success', async () => {
+    const input = metadataInput()
+    await insertStorageReceipt(input)
+    const corruptingEnv = envWithAfterBatch(() => {
+      deleteAuditWhere(`target_kind = 'artifact' AND target_id = '${ARTIFACT_ID}'`)
+    })
+
+    await expect(recordArtifactMetadata(corruptingEnv, producerAuth(), input))
+      .rejects.toMatchObject({ name: 'ExecutionReceiptError', code: 'integrity_failure' })
+    expect(count('artifacts')).toBe(1)
+    expect(count('mutation_audit_entries', "WHERE target_kind = 'artifact'")).toBe(0)
+  })
+
+  it('preserves a non-conflict projection executor error', async () => {
+    const input = metadataInput()
+    await insertStorageReceipt(input)
+    const failure = new Error('projection transport failed')
+
+    await expect(recordArtifactMetadata(
+      envWithBatchError(failure),
+      producerAuth(),
+      input,
+    )).rejects.toBe(failure)
+    expect(count('artifacts')).toBe(0)
   })
 })
 
@@ -774,6 +944,73 @@ describe('Flight Spine artifact retrieval and child consumption facts', () => {
     await expect(recordArtifactRetrieval(env, verifierAuth(), second))
       .rejects.toMatchObject({ code: 'retrieval_conflict' })
     expect(count('artifact_retrieval_receipts')).toBe(1)
+  })
+
+  it('returns an exact concurrent retrieval winner only with its deterministic audit', async () => {
+    await recordDefaultArtifact()
+    const input = retrievalInput()
+    await insertRetrievalReceipt(input)
+    let winner: Awaited<ReturnType<typeof recordArtifactRetrieval>> | null = null
+    const racedEnv = envWithBeforeBatch(async () => {
+      winner = await recordArtifactRetrieval(env, verifierAuth(), input)
+    })
+
+    const recovered = await recordArtifactRetrieval(racedEnv, verifierAuth(), input)
+
+    expect(recovered).toEqual(winner)
+    expect(count('artifact_retrieval_receipts')).toBe(1)
+    expect(harness.sqlite.prepare(`
+      SELECT target_id FROM mutation_audit_entries
+       WHERE target_kind = 'artifact_retrieval_receipt'
+    `).get()).toEqual({ target_id: recovered.id })
+  })
+
+  it('rejects a concurrent retrieval winner whose deterministic audit is missing', async () => {
+    await recordDefaultArtifact()
+    const input = retrievalInput({ retrievalReceiptId: 'receipt-retrieval-raced-no-audit' })
+    await insertRetrievalReceipt(input)
+    const racedEnv = envWithBeforeBatch(async () => {
+      const winner = await recordArtifactRetrieval(env, verifierAuth(), input)
+      deleteAuditWhere(`
+        target_kind = 'artifact_retrieval_receipt'
+        AND target_id = '${winner.id}'
+      `)
+    })
+
+    await expect(recordArtifactRetrieval(racedEnv, verifierAuth(), input))
+      .rejects.toMatchObject({ code: 'retrieval_audit_invalid' })
+    expect(count('artifact_retrieval_receipts')).toBe(1)
+  })
+
+  it('refuses a preexisting retrieval projection when its deterministic audit conflicts', async () => {
+    await recordDefaultArtifact()
+    const input = retrievalInput()
+    await insertRetrievalReceipt(input)
+    const retrieval = await recordArtifactRetrieval(env, verifierAuth(), input)
+    corruptAuditWhere(`
+      target_kind = 'artifact_retrieval_receipt'
+      AND target_id = '${retrieval.id}'
+    `)
+
+    await expect(recordArtifactRetrieval(env, verifierAuth(), input))
+      .rejects.toMatchObject({ code: 'retrieval_audit_invalid' })
+  })
+
+  it('rethrows a postcommit retrieval audit reread integrity failure instead of replaying success', async () => {
+    await recordDefaultArtifact()
+    const input = retrievalInput()
+    await insertRetrievalReceipt(input)
+    const corruptingEnv = envWithAfterBatch(() => {
+      deleteAuditWhere(`target_kind = 'artifact_retrieval_receipt'`)
+    })
+
+    await expect(recordArtifactRetrieval(corruptingEnv, verifierAuth(), input))
+      .rejects.toMatchObject({ name: 'ExecutionReceiptError', code: 'integrity_failure' })
+    expect(count('artifact_retrieval_receipts')).toBe(1)
+    expect(count(
+      'mutation_audit_entries',
+      "WHERE target_kind = 'artifact_retrieval_receipt'",
+    )).toBe(0)
   })
 
   it('records explicit consumption of the exact linked child artifact without completing a task', async () => {
