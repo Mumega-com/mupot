@@ -3,10 +3,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { canonicalJson, sha256Hex } from '../src/lib/canonical-json'
 import {
   appendExecutionReceipt,
+  executeAuditedDomainMutations,
   executePreparedExecutionReceiptBatch,
   getExecutionReceipt,
   prepareAuditedDomainMutation,
   prepareFreshExecutionReceiptChain,
+  type PreparedAtomicDomainMutation,
   verifyExecutionReceipt,
 } from '../src/flight-spine/receipts'
 import type { AuthContext, Env } from '../src/types'
@@ -58,6 +60,17 @@ function draft(
 
 function allowTestOnlyReceiptCorruption(): void {
   harness.sqlite.exec('DROP TRIGGER execution_receipts_no_update')
+}
+
+function expectNoReceiptChainState(): void {
+  for (const table of [
+    'execution_receipts',
+    'execution_receipt_edges',
+    'execution_receipt_heads',
+  ]) {
+    expect(harness.sqlite.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get())
+      .toEqual({ count: 0 })
+  }
 }
 
 function departmentAudit(auditId: string, targetId: string) {
@@ -138,6 +151,150 @@ describe('Flight Spine execution receipt ledger', () => {
         name: 'ExecutionReceiptError',
         code: 'invalid_draft',
       })
+  })
+
+  it('executes one audited projection mutation without creating receipt-chain state', async () => {
+    const domain = auditedDepartmentMutation({
+      auditId: 'audit-projection-only',
+      mutationSql: `
+        INSERT INTO departments (id, slug, name) VALUES (?1, ?2, ?3)
+      `,
+      bindings: ['projection-only', 'projection-only', 'Projection Only'],
+      targetId: 'projection-only',
+    })
+
+    const audits = await executeAuditedDomainMutations(env, [domain])
+
+    expect(audits).toHaveLength(1)
+    expect(audits[0]).toMatchObject({
+      id: 'audit-projection-only',
+      tenant: TENANT,
+      principal_kind: 'member',
+      handler: 'flight_spine_test',
+      operation: 'upsert',
+      target_kind: 'department',
+      target_id: 'projection-only',
+    })
+    expect(harness.sqlite.prepare(`
+      SELECT id, slug, name FROM departments WHERE id = 'projection-only'
+    `).get()).toEqual({
+      id: 'projection-only',
+      slug: 'projection-only',
+      name: 'Projection Only',
+    })
+    expectNoReceiptChainState()
+  })
+
+  it('rejects empty and forged audited projection handle sets without writing', async () => {
+    await expect(executeAuditedDomainMutations(env, [])).rejects.toMatchObject({
+      name: 'ExecutionReceiptError',
+      code: 'invalid_draft',
+    })
+    const forged = Object.freeze({ expectedAuditId: 'forged-audit' }) as PreparedAtomicDomainMutation
+    await expect(executeAuditedDomainMutations(env, [forged])).rejects.toMatchObject({
+      name: 'ExecutionReceiptError',
+      code: 'invalid_draft',
+    })
+    const shortResultDb = {
+      prepare: harness.db.prepare.bind(harness.db),
+      batch: async () => [],
+    } as D1Database
+    const shortResultEnv = { ...env, DB: shortResultDb }
+    const validButShort = auditedDepartmentMutation({
+      auditId: 'audit-projection-short-result',
+      mutationSql: `
+        INSERT INTO departments (id, slug, name) VALUES (?1, ?2, ?3)
+      `,
+      bindings: ['projection-short', 'projection-short', 'Projection Short'],
+      targetId: 'projection-short',
+      db: shortResultDb,
+    })
+    await expect(executeAuditedDomainMutations(shortResultEnv, [validButShort]))
+      .rejects.toMatchObject({
+        name: 'ExecutionReceiptError',
+        code: 'persistence_conflict',
+      })
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM mutation_audit_entries').get())
+      .toEqual({ count: 0 })
+    expectNoReceiptChainState()
+  })
+
+  it('rolls back an audited projection when its direct mutation affects zero rows', async () => {
+    const domain = auditedDepartmentMutation({
+      auditId: 'audit-projection-zero',
+      mutationSql: 'UPDATE departments SET name = ?1 WHERE id = ?2',
+      bindings: ['After', 'projection-missing'],
+      targetId: 'projection-missing',
+    })
+
+    await expect(executeAuditedDomainMutations(env, [domain]))
+      .rejects.toThrow(/check constraint/i)
+
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM mutation_audit_entries').get())
+      .toEqual({ count: 0 })
+    expectNoReceiptChainState()
+  })
+
+  it('rolls back an audited projection when its mutation affects multiple rows', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO departments (id, slug, name) VALUES
+        ('projection-multi-a', 'projection-multi-a', 'Before A'),
+        ('projection-multi-b', 'projection-multi-b', 'Before B');
+    `)
+    const domain = auditedDepartmentMutation({
+      auditId: 'audit-projection-multi',
+      mutationSql: `
+        UPDATE departments SET name = ?1
+         WHERE id IN (?2, ?3)
+      `,
+      bindings: ['After', 'projection-multi-a', 'projection-multi-b'],
+      targetId: 'projection-multi-a,projection-multi-b',
+    })
+
+    await expect(executeAuditedDomainMutations(env, [domain]))
+      .rejects.toThrow(/check constraint/i)
+
+    expect(harness.sqlite.prepare(`
+      SELECT id, name FROM departments
+       WHERE id IN ('projection-multi-a', 'projection-multi-b') ORDER BY id
+    `).all()).toEqual([
+      { id: 'projection-multi-a', name: 'Before A' },
+      { id: 'projection-multi-b', name: 'Before B' },
+    ])
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM mutation_audit_entries').get())
+      .toEqual({ count: 0 })
+    expectNoReceiptChainState()
+  })
+
+  it('rolls back earlier audited projections when a later mutation hard-fails', async () => {
+    const first = auditedDepartmentMutation({
+      auditId: 'audit-projection-hard-first',
+      mutationSql: `
+        INSERT INTO departments (id, slug, name) VALUES (?1, ?2, ?3)
+      `,
+      bindings: ['projection-hard', 'projection-hard', 'First'],
+      targetId: 'projection-hard',
+    })
+    const duplicate = auditedDepartmentMutation({
+      auditId: 'audit-projection-hard-duplicate',
+      mutationSql: `
+        INSERT INTO departments (id, slug, name) VALUES (?1, ?2, ?3)
+      `,
+      bindings: ['projection-hard', 'projection-hard-copy', 'Duplicate'],
+      targetId: 'projection-hard',
+    })
+
+    await expect(executeAuditedDomainMutations(env, [first, duplicate]))
+      .rejects.toThrow(/unique constraint/i)
+
+    expect(harness.sqlite.prepare(`
+      SELECT COUNT(*) AS count FROM departments WHERE id = 'projection-hard'
+    `).get()).toEqual({ count: 0 })
+    expect(harness.sqlite.prepare(`
+      SELECT COUNT(*) AS count FROM mutation_audit_entries
+       WHERE id LIKE 'audit-projection-hard-%'
+    `).get()).toEqual({ count: 0 })
+    expectNoReceiptChainState()
   })
 
   it('rejects every non-direct or compound SQL shape before preparing or executing it', () => {
@@ -901,6 +1058,96 @@ describe('Flight Spine execution receipt ledger', () => {
     expect(reread).toEqual(second)
     expect(reread?.predecessorReceiptId).toBe(first.id)
     expect(await verifyExecutionReceipt(env, second.id)).toEqual({ ok: true })
+  })
+
+  it('reads and verifies a cryptographically valid future artifact-service receipt', async () => {
+    const id = 'future-artifact-service-receipt'
+    const claims = { artifactId: 'artifact-future', objectKey: 'sha256/aa/future' }
+    const claimsJson = canonicalJson(claims)
+    const payloadDigest = await sha256Hex(claimsJson)
+    const payloadFacts = {
+      tenant: TENANT,
+      type: 'artifact.stored',
+      issuer_kind: 'artifact_service',
+      issuer_id: 'artifact-service-1',
+      actor_kind: 'agent',
+      actor_id: 'artifact-service-agent-1',
+      seat_id: null,
+      seat_generation: null,
+      objective_id: 'objective-future',
+      flight_id: 'flight-future',
+      task_id: 'task-future',
+      message_id: null,
+      assignment_epoch: 4,
+      fencing_epoch: null,
+      lease_token_hash: null,
+      idempotency_key: 'future-artifact-service-key',
+      claims,
+      predecessor_receipt_id: null,
+      predecessor_hash: null,
+      server_timestamp: SERVER_TIME,
+    } as const
+    const canonicalPayload = canonicalJson(payloadFacts)
+    const receiptHash = await sha256Hex(canonicalPayload)
+    harness.sqlite.prepare(`
+      INSERT INTO execution_receipts (
+        id, tenant, type, issuer_kind, issuer_id, actor_kind, actor_id,
+        objective_id, flight_id, task_id, assignment_epoch, idempotency_key,
+        claims_json, canonical_payload, payload_digest, predecessor_receipt_id,
+        predecessor_hash, receipt_hash, server_timestamp
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+    `).run(
+      id,
+      TENANT,
+      payloadFacts.type,
+      payloadFacts.issuer_kind,
+      payloadFacts.issuer_id,
+      payloadFacts.actor_kind,
+      payloadFacts.actor_id,
+      payloadFacts.objective_id,
+      payloadFacts.flight_id,
+      payloadFacts.task_id,
+      payloadFacts.assignment_epoch,
+      payloadFacts.idempotency_key,
+      claimsJson,
+      canonicalPayload,
+      payloadDigest,
+      receiptHash,
+      SERVER_TIME,
+    )
+
+    expect(await getExecutionReceipt(env, id)).toMatchObject({
+      id,
+      type: 'artifact.stored',
+      issuerKind: 'artifact_service',
+      issuerId: 'artifact-service-1',
+      actorKind: 'agent',
+      actorId: 'artifact-service-agent-1',
+      objectiveId: 'objective-future',
+      flightId: 'flight-future',
+      taskId: 'task-future',
+      assignmentEpoch: 4,
+      receiptHash,
+    })
+    expect(await verifyExecutionReceipt(env, id)).toEqual({ ok: true })
+
+    allowTestOnlyReceiptCorruption()
+    const mutatedPayload = canonicalJson({
+      ...payloadFacts,
+      issuer_kind: 'provider_verifier',
+      issuer_id: 'provider-verifier-1',
+    })
+    harness.sqlite.prepare(`
+      UPDATE execution_receipts
+         SET issuer_kind = 'provider_verifier',
+             issuer_id = 'provider-verifier-1',
+             canonical_payload = ?
+       WHERE id = ?
+    `).run(mutatedPayload, id)
+    expect(await verifyExecutionReceipt(env, id)).toEqual({
+      ok: false,
+      error: 'receipt_hash_mismatch',
+    })
   })
 
   it('rejects non-canonical mutated claims after database reread', async () => {

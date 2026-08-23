@@ -7,6 +7,7 @@ import {
   type ExecutionReceipt,
   type ExecutionReceiptActorKind,
   type ExecutionReceiptDraft,
+  type ExecutionReceiptIssuerKind,
   type ExecutionReceiptType,
   type ExecutionReceiptVerification,
   type JsonValue,
@@ -71,7 +72,7 @@ interface ReceiptRow {
   id: string
   tenant: string
   type: ExecutionReceiptType
-  issuer_kind: 'mupot'
+  issuer_kind: ExecutionReceiptIssuerKind
   issuer_id: string
   actor_kind: ExecutionReceiptActorKind
   actor_id: string
@@ -108,6 +109,10 @@ interface NormalizedDraft {
   assignmentEpoch: number | null
   fencingEpoch: number | null
   leaseTokenHash: string | null
+}
+
+type CanonicalReceiptDraft = Omit<NormalizedDraft, 'type'> & {
+  readonly type: ExecutionReceiptType
 }
 
 const PREPARED_RECEIPT_CHAIN = Symbol('prepared-execution-receipt-chain')
@@ -170,6 +175,32 @@ export interface AtomicDomainAuditMetadata {
   readonly evidence: JsonValue
 }
 
+export interface AtomicDomainAuditEntry {
+  readonly id: string
+  readonly tenant: string
+  readonly principal_kind: AtomicDomainAuditPrincipalKind
+  readonly principal_id: string
+  readonly member_id: string | null
+  readonly agent_id: string | null
+  readonly credential_id: string | null
+  readonly runtime_seat_id: string | null
+  readonly runtime_generation: number | null
+  readonly origin: AtomicDomainAuditOrigin
+  readonly handler: string
+  readonly operation: string
+  readonly target_kind: string
+  readonly target_id: string
+  readonly before_digest: string | null
+  readonly after_digest: string | null
+  readonly objective_id: string | null
+  readonly flight_id: string | null
+  readonly task_id: string | null
+  readonly request_id: string
+  readonly idempotency_key: string | null
+  readonly evidence_json: string
+  readonly recorded_at: string
+}
+
 export type AtomicDomainSqlBinding = string | number | boolean | null
 
 export interface AtomicDomainMutationInput {
@@ -193,6 +224,11 @@ interface PreparedAtomicDomainMutationPieces {
   readonly database: D1Database
   readonly mutationStatement: D1PreparedStatement
   readonly audit: NormalizedAtomicDomainAuditMetadata
+}
+
+interface ResolvedAtomicDomainMutation {
+  readonly handle: PreparedAtomicDomainMutation
+  readonly pieces: PreparedAtomicDomainMutationPieces
 }
 
 interface NormalizedAtomicDomainAuditMetadata {
@@ -427,9 +463,10 @@ function actorFromAuth(env: Env, auth: AuthContext): ReceiptActor {
 function canonicalPayload(input: {
   tenant: string
   type: ExecutionReceiptType
+  issuerKind: ExecutionReceiptIssuerKind
   issuerId: string
   actor: ReceiptActor
-  draft: NormalizedDraft
+  draft: CanonicalReceiptDraft
   predecessorReceiptId: string | null
   predecessorHash: string | null
   serverTimestamp: string
@@ -437,7 +474,7 @@ function canonicalPayload(input: {
   return canonicalJson({
     tenant: input.tenant,
     type: input.type,
-    issuer_kind: 'mupot',
+    issuer_kind: input.issuerKind,
     issuer_id: input.issuerId,
     actor_kind: input.actor.kind,
     actor_id: input.actor.id,
@@ -645,6 +682,7 @@ export async function prepareFreshExecutionReceiptChain(
     const payload = canonicalPayload({
       tenant,
       type: draft.type,
+      issuerKind: 'mupot',
       issuerId,
       actor,
       draft,
@@ -864,10 +902,11 @@ async function verifyRowChain(
     const expectedPayload = canonicalPayload({
       tenant: row.tenant,
       type: row.type,
+      issuerKind: row.issuer_kind,
       issuerId: row.issuer_id,
       actor: { kind: row.actor_kind, id: row.actor_id },
       draft: {
-        type: row.type as MupotExecutionReceiptType,
+        type: row.type,
         idempotencyKey: row.idempotency_key,
         claims,
         claimsJson,
@@ -901,13 +940,130 @@ function requireExactSingleWrite(result: D1Result<unknown> | undefined): void {
   }
 }
 
+function resolveAuditedDomainMutations(
+  env: Env,
+  domainMutations: readonly PreparedAtomicDomainMutation[],
+  allowEmpty: boolean,
+): ResolvedAtomicDomainMutation[] {
+  if (!allowEmpty && domainMutations.length === 0) {
+    throw new ExecutionReceiptError('invalid_draft')
+  }
+  const resolved: ResolvedAtomicDomainMutation[] = []
+  const auditIds = new Set<string>()
+  for (const handle of domainMutations) {
+    const pieces = PREPARED_DOMAIN_PIECES.get(handle)
+    if (
+      pieces === undefined
+      || pieces.database !== env.DB
+      || auditIds.has(handle.expectedAuditId)
+    ) {
+      throw new ExecutionReceiptError('invalid_draft')
+    }
+    auditIds.add(handle.expectedAuditId)
+    resolved.push({ handle, pieces })
+  }
+  return resolved
+}
+
+function prepareAuditedDomainStatements(
+  env: Env,
+  tenant: string,
+  domainMutations: readonly ResolvedAtomicDomainMutation[],
+): D1PreparedStatement[] {
+  const statements: D1PreparedStatement[] = []
+  for (const domain of domainMutations) {
+    statements.push(
+      domain.pieces.mutationStatement,
+      prepareAtomicDomainAuditGuard(env.DB, tenant, domain.pieces.audit),
+    )
+  }
+  return statements
+}
+
+function verifyAuditedDomainBatchResults(
+  tenant: string,
+  domainMutations: readonly ResolvedAtomicDomainMutation[],
+  batchResults: readonly D1Result<unknown>[],
+  startIndex: number,
+): number {
+  for (let index = 0; index < domainMutations.length; index += 1) {
+    const mutationResultIndex = startIndex + (index * 2)
+    const guardResultIndex = mutationResultIndex + 1
+    requireExactSingleWrite(batchResults[mutationResultIndex])
+    requireExactSingleWrite(batchResults[guardResultIndex])
+    const guardRows = batchResults[guardResultIndex].results as Record<string, unknown>[]
+    if (
+      guardRows.length !== 1
+      || guardRows[0]?.id !== domainMutations[index].handle.expectedAuditId
+      || guardRows[0]?.tenant !== tenant
+    ) {
+      throw new ExecutionReceiptError('persistence_conflict')
+    }
+  }
+  return startIndex + (domainMutations.length * 2)
+}
+
+function expectedAtomicDomainAuditEntry(
+  tenant: string,
+  audit: NormalizedAtomicDomainAuditMetadata,
+): AtomicDomainAuditEntry {
+  return {
+    id: audit.expectedAuditId,
+    tenant,
+    principal_kind: audit.principalKind,
+    principal_id: audit.principalId,
+    member_id: audit.memberId,
+    agent_id: audit.agentId,
+    credential_id: audit.credentialId,
+    runtime_seat_id: audit.runtimeSeatId,
+    runtime_generation: audit.runtimeGeneration,
+    origin: audit.origin,
+    handler: audit.handler,
+    operation: audit.operation,
+    target_kind: audit.targetKind,
+    target_id: audit.targetId,
+    before_digest: audit.beforeDigest,
+    after_digest: audit.afterDigest,
+    objective_id: audit.objectiveId,
+    flight_id: audit.flightId,
+    task_id: audit.taskId,
+    request_id: audit.requestId,
+    idempotency_key: audit.idempotencyKey,
+    evidence_json: audit.evidenceJson,
+    recorded_at: audit.recordedAt,
+  }
+}
+
+async function rereadAuditedDomainMutations(
+  env: Env,
+  tenant: string,
+  domainMutations: readonly ResolvedAtomicDomainMutation[],
+): Promise<AtomicDomainAuditEntry[]> {
+  const readDb = primaryDb(env)
+  const audits: AtomicDomainAuditEntry[] = []
+  for (const domain of domainMutations) {
+    const auditRow = await readDb.prepare(`
+      SELECT id, tenant, principal_kind, principal_id, member_id, agent_id,
+             credential_id, runtime_seat_id, runtime_generation, origin,
+             handler, operation, target_kind, target_id, before_digest,
+             after_digest, objective_id, flight_id, task_id, request_id,
+             idempotency_key, evidence_json, recorded_at
+        FROM mutation_audit_entries
+       WHERE tenant = ?1 AND id = ?2
+    `).bind(tenant, domain.handle.expectedAuditId).first<AtomicDomainAuditEntry>()
+    const expected = expectedAtomicDomainAuditEntry(tenant, domain.pieces.audit)
+    if (auditRow === null || canonicalJson(auditRow) !== canonicalJson(expected)) {
+      throw new ExecutionReceiptError('integrity_failure')
+    }
+    audits.push(auditRow)
+  }
+  return audits
+}
+
 function verifyPreparedExecutionReceiptBatchResult(
   prepared: PreparedExecutionReceiptChain,
   receiptPieces: PreparedExecutionReceiptPieces,
-  domainMutations: readonly {
-    readonly handle: PreparedAtomicDomainMutation
-    readonly pieces: PreparedAtomicDomainMutationPieces
-  }[],
+  domainMutations: readonly ResolvedAtomicDomainMutation[],
   batchResults: readonly D1Result<unknown>[],
 ): PreparedExecutionReceiptCommit {
   const receiptWriteCount = receiptPieces.receiptAndEdgeStatements.length
@@ -919,23 +1075,15 @@ function verifyPreparedExecutionReceiptBatchResult(
   for (let index = 0; index < receiptWriteCount; index += 1) {
     requireExactSingleWrite(batchResults[index])
   }
-  for (let index = 0; index < domainMutations.length; index += 1) {
-    const mutationResultIndex = receiptWriteCount + (index * 2)
-    const guardResultIndex = mutationResultIndex + 1
-    requireExactSingleWrite(batchResults[mutationResultIndex])
-    requireExactSingleWrite(batchResults[guardResultIndex])
-    const guardRows = batchResults[guardResultIndex].results as Record<string, unknown>[]
-    if (
-      guardRows.length !== 1
-      || guardRows[0]?.id !== domainMutations[index].handle.expectedAuditId
-      || guardRows[0]?.tenant !== prepared.tenant
-    ) {
-      throw new ExecutionReceiptError('persistence_conflict')
-    }
-  }
+  const finalResultIndex = verifyAuditedDomainBatchResults(
+    prepared.tenant,
+    domainMutations,
+    batchResults,
+    receiptWriteCount,
+  )
 
   const finalExpected = prepared.expectedReceipts[prepared.expectedReceipts.length - 1]
-  const finalResult = batchResults[batchResults.length - 1]
+  const finalResult = batchResults[finalResultIndex]
   requireExactSingleWrite(finalResult)
   const finalRows = finalResult.results as Record<string, unknown>[]
   const returned = finalRows[0] as
@@ -1002,36 +1150,16 @@ async function executePreparedExecutionReceiptBatchInternal(
   if (
     receiptPieces === undefined
     || prepared.tenant !== env.TENANT_SLUG
-    || (!allowNoDomain && domainMutations.length === 0)
   ) {
     throw new ExecutionReceiptError('invalid_draft')
   }
 
-  const resolvedDomains: {
-    readonly handle: PreparedAtomicDomainMutation
-    readonly pieces: PreparedAtomicDomainMutationPieces
-  }[] = []
-  const auditIds = new Set<string>()
-  for (const handle of domainMutations) {
-    const pieces = PREPARED_DOMAIN_PIECES.get(handle)
-    if (
-      pieces === undefined
-      || pieces.database !== env.DB
-      || auditIds.has(handle.expectedAuditId)
-    ) {
-      throw new ExecutionReceiptError('invalid_draft')
-    }
-    auditIds.add(handle.expectedAuditId)
-    resolvedDomains.push({ handle, pieces })
-  }
+  const resolvedDomains = resolveAuditedDomainMutations(env, domainMutations, allowNoDomain)
 
-  const statements: D1PreparedStatement[] = [...receiptPieces.receiptAndEdgeStatements]
-  for (const domain of resolvedDomains) {
-    statements.push(
-      domain.pieces.mutationStatement,
-      prepareAtomicDomainAuditGuard(env.DB, prepared.tenant, domain.pieces.audit),
-    )
-  }
+  const statements: D1PreparedStatement[] = [
+    ...receiptPieces.receiptAndEdgeStatements,
+    ...prepareAuditedDomainStatements(env, prepared.tenant, resolvedDomains),
+  ]
   statements.push(receiptPieces.finalHeadStatement)
 
   const batchResults = await env.DB.batch(statements)
@@ -1042,47 +1170,7 @@ async function executePreparedExecutionReceiptBatchInternal(
     batchResults,
   )
 
-  const readDb = primaryDb(env)
-  for (const domain of resolvedDomains) {
-    const auditRow = await readDb.prepare(`
-      SELECT id, tenant, principal_kind, principal_id, member_id, agent_id,
-             credential_id, runtime_seat_id, runtime_generation, origin,
-             handler, operation, target_kind, target_id, before_digest,
-             after_digest, objective_id, flight_id, task_id, request_id,
-             idempotency_key, evidence_json, recorded_at
-        FROM mutation_audit_entries
-       WHERE tenant = ?1 AND id = ?2
-    `).bind(prepared.tenant, domain.handle.expectedAuditId)
-      .first<Record<string, JsonValue>>()
-    const expectedAuditRow: Record<string, JsonValue> = {
-      id: domain.pieces.audit.expectedAuditId,
-      tenant: prepared.tenant,
-      principal_kind: domain.pieces.audit.principalKind,
-      principal_id: domain.pieces.audit.principalId,
-      member_id: domain.pieces.audit.memberId,
-      agent_id: domain.pieces.audit.agentId,
-      credential_id: domain.pieces.audit.credentialId,
-      runtime_seat_id: domain.pieces.audit.runtimeSeatId,
-      runtime_generation: domain.pieces.audit.runtimeGeneration,
-      origin: domain.pieces.audit.origin,
-      handler: domain.pieces.audit.handler,
-      operation: domain.pieces.audit.operation,
-      target_kind: domain.pieces.audit.targetKind,
-      target_id: domain.pieces.audit.targetId,
-      before_digest: domain.pieces.audit.beforeDigest,
-      after_digest: domain.pieces.audit.afterDigest,
-      objective_id: domain.pieces.audit.objectiveId,
-      flight_id: domain.pieces.audit.flightId,
-      task_id: domain.pieces.audit.taskId,
-      request_id: domain.pieces.audit.requestId,
-      idempotency_key: domain.pieces.audit.idempotencyKey,
-      evidence_json: domain.pieces.audit.evidenceJson,
-      recorded_at: domain.pieces.audit.recordedAt,
-    }
-    if (auditRow === null || canonicalJson(auditRow) !== canonicalJson(expectedAuditRow)) {
-      throw new ExecutionReceiptError('integrity_failure')
-    }
-  }
+  await rereadAuditedDomainMutations(env, prepared.tenant, resolvedDomains)
   return rereadAndVerifyPreparedExecutionReceipts(env, prepared, commit)
 }
 
@@ -1097,6 +1185,32 @@ export function executePreparedExecutionReceiptBatch(
   domainMutations: readonly PreparedAtomicDomainMutation[],
 ): Promise<ExecutionReceipt[]> {
   return executePreparedExecutionReceiptBatchInternal(env, prepared, domainMutations, false)
+}
+
+/**
+ * Execute one or more opaque audited domain projections without creating or
+ * advancing any execution receipt, chain head, or semantic receipt edge.
+ */
+export async function executeAuditedDomainMutations(
+  env: Env,
+  domainMutations: readonly PreparedAtomicDomainMutation[],
+): Promise<AtomicDomainAuditEntry[]> {
+  const resolved = resolveAuditedDomainMutations(env, domainMutations, false)
+  const statements = prepareAuditedDomainStatements(env, env.TENANT_SLUG, resolved)
+  const batchResults = await env.DB.batch(statements)
+  if (batchResults.length !== statements.length) {
+    throw new ExecutionReceiptError('persistence_conflict')
+  }
+  const nextResultIndex = verifyAuditedDomainBatchResults(
+    env.TENANT_SLUG,
+    resolved,
+    batchResults,
+    0,
+  )
+  if (nextResultIndex !== batchResults.length) {
+    throw new ExecutionReceiptError('persistence_conflict')
+  }
+  return rereadAuditedDomainMutations(env, env.TENANT_SLUG, resolved)
 }
 
 async function replayOrConflict(

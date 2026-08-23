@@ -59,6 +59,14 @@ export type MupotExecutionReceiptType =
 
 export type ExecutionReceiptActorKind = 'member' | 'agent'
 
+export type ExecutionReceiptIssuerKind =
+  | 'mupot'
+  | 'adapter'
+  | 'runtime'
+  | 'artifact_service'
+  | 'gate'
+  | 'provider_verifier'
+
 export interface ExecutionReceiptDraft {
   type: MupotExecutionReceiptType
   idempotencyKey: string
@@ -79,7 +87,7 @@ export interface ExecutionReceipt {
   id: string
   tenant: string
   type: ExecutionReceiptType
-  issuerKind: 'mupot'
+  issuerKind: ExecutionReceiptIssuerKind
   issuerId: string
   actorKind: ExecutionReceiptActorKind
   actorId: string
