@@ -3,11 +3,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { canonicalJson, sha256Hex } from '../src/lib/canonical-json'
 import {
   appendExecutionReceipt,
-  composePreparedExecutionReceiptBatch,
+  executePreparedExecutionReceiptBatch,
   getExecutionReceipt,
+  prepareAuditedDomainMutation,
   prepareFreshExecutionReceiptChain,
-  rereadAndVerifyPreparedExecutionReceipts,
-  verifyPreparedExecutionReceiptBatchResult,
   verifyExecutionReceipt,
 } from '../src/flight-spine/receipts'
 import type { AuthContext, Env } from '../src/types'
@@ -61,6 +60,42 @@ function allowTestOnlyReceiptCorruption(): void {
   harness.sqlite.exec('DROP TRIGGER execution_receipts_no_update')
 }
 
+function auditedDepartmentMutation(input: {
+  auditId: string
+  mutationSql: string
+  expectedId: string
+  expectedSlug: string
+  expectedName: string
+}) {
+  const mutationStatement = env.DB.prepare(input.mutationSql)
+  const guardStatement = env.DB.prepare(`
+    INSERT INTO mutation_audit_entries (
+      id, tenant, principal_kind, principal_id, origin, handler, operation,
+      target_kind, target_id, request_id, evidence_json, recorded_at
+    ) VALUES (
+      ?1, ?2,
+      CASE WHEN EXISTS (
+        SELECT 1 FROM departments WHERE id = ?3 AND slug = ?4 AND name = ?5
+      ) THEN 'member' ELSE 'invalid_guard_principal' END,
+      'member-1', 'rest', 'flight_spine_test', 'upsert',
+      'department', ?3, ?1, '{}', ?6
+    )
+    RETURNING id, tenant
+  `).bind(
+    input.auditId,
+    TENANT,
+    input.expectedId,
+    input.expectedSlug,
+    input.expectedName,
+    SERVER_TIME,
+  )
+  return prepareAuditedDomainMutation(
+    mutationStatement,
+    guardStatement,
+    input.auditId,
+  )
+}
+
 beforeEach(() => {
   vi.useFakeTimers()
   vi.setSystemTime(new Date(SERVER_TIME))
@@ -75,35 +110,66 @@ afterEach(() => {
 })
 
 describe('Flight Spine execution receipt ledger', () => {
-  it('commits two prepared receipts and a domain row in one verified chain batch', async () => {
+  it('exposes only frozen receipt metadata and opaque audited-domain handles', async () => {
     const prepared = await prepareFreshExecutionReceiptChain(env, memberAuth(), [
-      draft('prepared-objective'),
-      draft('prepared-flight', {
+      draft('opaque-prepared'),
+    ])
+    const domain = auditedDepartmentMutation({
+      auditId: 'audit-opaque-domain',
+      mutationSql: `
+        INSERT INTO departments (id, slug, name)
+        VALUES ('opaque-domain', 'opaque-domain', 'Opaque Domain')
+      `,
+      expectedId: 'opaque-domain',
+      expectedSlug: 'opaque-domain',
+      expectedName: 'Opaque Domain',
+    })
+    const exposedPrepared = Object.fromEntries(Object.entries(prepared))
+    const exposedDomain = Object.fromEntries(Object.entries(domain))
+
+    expect(Object.isFrozen(prepared)).toBe(true)
+    expect(Object.isFrozen(prepared.expectedReceipts)).toBe(true)
+    expect(Object.isFrozen(prepared.expectedReceipts[0])).toBe(true)
+    expect(Object.keys(prepared).sort()).toEqual([
+      'expectedReceipts',
+      'expectedStartingHeadId',
+      'tenant',
+    ])
+    expect(exposedPrepared.receiptAndEdgeStatements).toBeUndefined()
+    expect(exposedPrepared.finalHeadStatement).toBeUndefined()
+    expect(Object.isFrozen(domain)).toBe(true)
+    expect(Object.keys(domain)).toEqual(['expectedAuditId'])
+    expect(exposedDomain.mutationStatement).toBeUndefined()
+    expect(exposedDomain.guardStatement).toBeUndefined()
+    await expect(executePreparedExecutionReceiptBatch(env, prepared, []))
+      .rejects.toMatchObject({
+        name: 'ExecutionReceiptError',
+        code: 'invalid_draft',
+      })
+  })
+
+  it('commits two prepared receipts with one strict domain insert and audit guard', async () => {
+    const prepared = await prepareFreshExecutionReceiptChain(env, memberAuth(), [
+      draft('opaque-prepared-objective'),
+      draft('opaque-prepared-flight', {
         type: 'flight.materialized',
-        flightId: 'prepared-flight-1',
+        flightId: 'opaque-prepared-flight-1',
         claims: { lanes: 2 },
       }),
     ])
-    const domainStatement = env.DB.prepare(`
-      INSERT INTO departments (id, slug, name)
-      VALUES ('prepared-domain', 'prepared-domain', 'Prepared Domain')
-    `)
-    const statements = composePreparedExecutionReceiptBatch(prepared, [domainStatement])
-
-    expect(prepared.receiptAndEdgeStatements).toHaveLength(3)
-    expect(prepared.expectedReceipts).toHaveLength(2)
-    expect(statements).toHaveLength(5)
-    expect(statements.at(-1)).toBe(prepared.finalHeadStatement)
-
-    const results = await env.DB.batch(statements)
-    const commit = verifyPreparedExecutionReceiptBatchResult(prepared, results)
-    const receipts = await rereadAndVerifyPreparedExecutionReceipts(env, prepared, results)
-
-    expect(commit).toEqual({
-      finalSequence: 2,
-      finalReceiptId: prepared.expectedReceipts[1].id,
-      finalReceiptHash: prepared.expectedReceipts[1].receiptHash,
+    const domain = auditedDepartmentMutation({
+      auditId: 'audit-opaque-prepared-domain',
+      mutationSql: `
+        INSERT INTO departments (id, slug, name)
+        VALUES ('opaque-prepared-domain', 'opaque-prepared-domain', 'Opaque Prepared Domain')
+      `,
+      expectedId: 'opaque-prepared-domain',
+      expectedSlug: 'opaque-prepared-domain',
+      expectedName: 'Opaque Prepared Domain',
     })
+
+    const receipts = await executePreparedExecutionReceiptBatch(env, prepared, [domain])
+
     expect(receipts).toHaveLength(2)
     expect(receipts[0]).toMatchObject({
       id: prepared.expectedReceipts[0].id,
@@ -119,17 +185,22 @@ describe('Flight Spine execution receipt ledger', () => {
       serverTimestamp: SERVER_TIME,
     })
     expect(harness.sqlite.prepare(`
-      SELECT id, slug, name FROM departments WHERE id = 'prepared-domain'
+      SELECT id, slug, name FROM departments WHERE id = 'opaque-prepared-domain'
     `).get()).toEqual({
-      id: 'prepared-domain',
-      slug: 'prepared-domain',
-      name: 'Prepared Domain',
+      id: 'opaque-prepared-domain',
+      slug: 'opaque-prepared-domain',
+      name: 'Opaque Prepared Domain',
     })
     expect(harness.sqlite.prepare(`
-      SELECT receipt_id, receipt_hash FROM execution_receipt_heads WHERE tenant = ?
-    `).get(TENANT)).toEqual({
-      receipt_id: receipts[1].id,
-      receipt_hash: receipts[1].receiptHash,
+      SELECT id, tenant, principal_kind, target_kind, target_id
+        FROM mutation_audit_entries
+       WHERE id = 'audit-opaque-prepared-domain'
+    `).get()).toEqual({
+      id: 'audit-opaque-prepared-domain',
+      tenant: TENANT,
+      principal_kind: 'member',
+      target_kind: 'department',
+      target_id: 'opaque-prepared-domain',
     })
     expect(harness.sqlite.prepare(`
       SELECT from_receipt_id, to_receipt_id, relation
@@ -142,24 +213,40 @@ describe('Flight Spine execution receipt ledger', () => {
     })
   })
 
-  it('rolls back prepared receipts, edges, head and domain rows when a domain statement fails', async () => {
+  it('rolls back receipts, edges, head, domain and audit rows on a hard SQL failure', async () => {
     const prepared = await prepareFreshExecutionReceiptChain(env, memberAuth(), [
-      draft('domain-failure-first'),
-      draft('domain-failure-second', { type: 'flight.materialized', flightId: 'flight-failure' }),
+      draft('opaque-domain-failure-first'),
+      draft('opaque-domain-failure-second', {
+        type: 'flight.materialized',
+        flightId: 'opaque-flight-failure',
+      }),
     ])
-    const domainInsert = env.DB.prepare(`
-      INSERT INTO departments (id, slug, name)
-      VALUES ('domain-rollback', 'domain-rollback', 'Domain Rollback')
-    `)
-    const forcedFailure = env.DB.prepare(`
-      INSERT INTO departments (id, slug, name)
-      VALUES ('domain-rollback', 'domain-rollback-copy', 'Must Fail')
-    `)
+    const firstDomain = auditedDepartmentMutation({
+      auditId: 'audit-opaque-domain-rollback-first',
+      mutationSql: `
+        INSERT INTO departments (id, slug, name)
+        VALUES ('opaque-domain-rollback', 'opaque-domain-rollback', 'Opaque Domain Rollback')
+      `,
+      expectedId: 'opaque-domain-rollback',
+      expectedSlug: 'opaque-domain-rollback',
+      expectedName: 'Opaque Domain Rollback',
+    })
+    const duplicateDomain = auditedDepartmentMutation({
+      auditId: 'audit-opaque-domain-rollback-duplicate',
+      mutationSql: `
+        INSERT INTO departments (id, slug, name)
+        VALUES ('opaque-domain-rollback', 'opaque-domain-copy', 'Must Fail')
+      `,
+      expectedId: 'opaque-domain-rollback',
+      expectedSlug: 'opaque-domain-copy',
+      expectedName: 'Must Fail',
+    })
 
-    await expect(env.DB.batch(composePreparedExecutionReceiptBatch(
+    await expect(executePreparedExecutionReceiptBatch(
+      env,
       prepared,
-      [domainInsert, forcedFailure],
-    ))).rejects.toThrow(/unique constraint/i)
+      [firstDomain, duplicateDomain],
+    )).rejects.toThrow(/unique constraint/i)
 
     expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM execution_receipts').get())
       .toEqual({ count: 0 })
@@ -168,17 +255,57 @@ describe('Flight Spine execution receipt ledger', () => {
     expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM execution_receipt_heads').get())
       .toEqual({ count: 0 })
     expect(harness.sqlite.prepare(`
-      SELECT COUNT(*) AS count FROM departments WHERE id = 'domain-rollback'
+      SELECT COUNT(*) AS count FROM departments WHERE id = 'opaque-domain-rollback'
+    `).get()).toEqual({ count: 0 })
+    expect(harness.sqlite.prepare(`
+      SELECT COUNT(*) AS count FROM mutation_audit_entries
+       WHERE id LIKE 'audit-opaque-domain-rollback-%'
     `).get()).toEqual({ count: 0 })
   })
 
-  it('rolls back prepared receipts, edges and domain rows when the final head CAS is stale', async () => {
-    const first = await appendExecutionReceipt(env, memberAuth(), draft('prepared-stale-base'))
+  it('turns a semantic zero-write into a CHECK abort and rolls back the whole batch', async () => {
     const prepared = await prepareFreshExecutionReceiptChain(env, memberAuth(), [
-      draft('prepared-stale-first'),
-      draft('prepared-stale-second', { type: 'task.assigned', taskId: 'task-stale' }),
+      draft('opaque-semantic-zero-first'),
+      draft('opaque-semantic-zero-second', {
+        type: 'task.assigned',
+        taskId: 'opaque-semantic-zero-task',
+      }),
     ])
-    const competitor = await appendExecutionReceipt(env, memberAuth(), draft('prepared-stale-competitor'))
+    const semanticZero = auditedDepartmentMutation({
+      auditId: 'audit-opaque-semantic-zero',
+      mutationSql: `
+        UPDATE departments SET name = 'Expected Name' WHERE id = 'opaque-missing-domain'
+      `,
+      expectedId: 'opaque-missing-domain',
+      expectedSlug: 'opaque-missing-domain',
+      expectedName: 'Expected Name',
+    })
+
+    await expect(executePreparedExecutionReceiptBatch(env, prepared, [semanticZero]))
+      .rejects.toThrow(/check constraint/i)
+
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM execution_receipts').get())
+      .toEqual({ count: 0 })
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM execution_receipt_edges').get())
+      .toEqual({ count: 0 })
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM execution_receipt_heads').get())
+      .toEqual({ count: 0 })
+    expect(harness.sqlite.prepare(`
+      SELECT COUNT(*) AS count FROM departments WHERE id = 'opaque-missing-domain'
+    `).get()).toEqual({ count: 0 })
+    expect(harness.sqlite.prepare(`
+      SELECT COUNT(*) AS count FROM mutation_audit_entries
+       WHERE id = 'audit-opaque-semantic-zero'
+    `).get()).toEqual({ count: 0 })
+  })
+
+  it('rolls back receipts, edges, domain and audit rows when the opaque final CAS is stale', async () => {
+    const first = await appendExecutionReceipt(env, memberAuth(), draft('opaque-stale-base'))
+    const prepared = await prepareFreshExecutionReceiptChain(env, memberAuth(), [
+      draft('opaque-stale-first'),
+      draft('opaque-stale-second', { type: 'task.assigned', taskId: 'opaque-stale-task' }),
+    ])
+    const competitor = await appendExecutionReceipt(env, memberAuth(), draft('opaque-stale-competitor'))
     const edgeCountBefore = harness.sqlite.prepare(`
       SELECT COUNT(*) AS count FROM execution_receipt_edges WHERE tenant = ?
     `).get(TENANT)
@@ -187,21 +314,25 @@ describe('Flight Spine execution receipt ledger', () => {
         FROM execution_receipt_heads
        WHERE tenant = ?
     `).get(TENANT)
-    const domainStatement = env.DB.prepare(`
-      INSERT INTO departments (id, slug, name)
-      VALUES ('stale-domain', 'stale-domain', 'Stale Domain')
-    `)
+    const domain = auditedDepartmentMutation({
+      auditId: 'audit-opaque-stale-domain',
+      mutationSql: `
+        INSERT INTO departments (id, slug, name)
+        VALUES ('opaque-stale-domain', 'opaque-stale-domain', 'Opaque Stale Domain')
+      `,
+      expectedId: 'opaque-stale-domain',
+      expectedSlug: 'opaque-stale-domain',
+      expectedName: 'Opaque Stale Domain',
+    })
 
-    await expect(env.DB.batch(composePreparedExecutionReceiptBatch(
-      prepared,
-      [domainStatement],
-    ))).rejects.toThrow(/head sequence must advance/i)
+    await expect(executePreparedExecutionReceiptBatch(env, prepared, [domain]))
+      .rejects.toThrow(/head sequence must advance/i)
 
     expect(first.id).not.toBe(competitor.id)
     expect(harness.sqlite.prepare(`
       SELECT COUNT(*) AS count
         FROM execution_receipts
-       WHERE idempotency_key IN ('prepared-stale-first', 'prepared-stale-second')
+       WHERE idempotency_key IN ('opaque-stale-first', 'opaque-stale-second')
     `).get()).toEqual({ count: 0 })
     expect(harness.sqlite.prepare(`
       SELECT COUNT(*) AS count FROM execution_receipt_edges WHERE tenant = ?
@@ -212,8 +343,51 @@ describe('Flight Spine execution receipt ledger', () => {
        WHERE tenant = ?
     `).get(TENANT)).toEqual(headBefore)
     expect(harness.sqlite.prepare(`
-      SELECT COUNT(*) AS count FROM departments WHERE id = 'stale-domain'
+      SELECT COUNT(*) AS count FROM departments WHERE id = 'opaque-stale-domain'
     `).get()).toEqual({ count: 0 })
+    expect(harness.sqlite.prepare(`
+      SELECT COUNT(*) AS count FROM mutation_audit_entries
+       WHERE id = 'audit-opaque-stale-domain'
+    `).get()).toEqual({ count: 0 })
+  })
+
+  it('rejects duplicate intra-chain idempotency keys in the fresh builder', async () => {
+    await expect(prepareFreshExecutionReceiptChain(env, memberAuth(), [
+      draft('opaque-duplicate-key'),
+      draft('opaque-duplicate-key', { type: 'task.assigned', taskId: 'opaque-duplicate-task' }),
+    ])).rejects.toMatchObject({
+      name: 'ExecutionReceiptError',
+      code: 'idempotency_conflict',
+    })
+  })
+
+  it('rejects a batch result whose cardinality cannot map every opaque piece exactly', async () => {
+    const shortResultDb = {
+      prepare: harness.db.prepare.bind(harness.db),
+      batch: async () => [],
+    } as D1Database
+    const shortResultEnv = { ...env, DB: shortResultDb }
+    const prepared = await prepareFreshExecutionReceiptChain(shortResultEnv, memberAuth(), [
+      draft('opaque-short-result'),
+    ])
+    const domain = auditedDepartmentMutation({
+      auditId: 'audit-opaque-short-result',
+      mutationSql: `
+        INSERT INTO departments (id, slug, name)
+        VALUES ('opaque-short-domain', 'opaque-short-domain', 'Opaque Short Domain')
+      `,
+      expectedId: 'opaque-short-domain',
+      expectedSlug: 'opaque-short-domain',
+      expectedName: 'Opaque Short Domain',
+    })
+
+    await expect(executePreparedExecutionReceiptBatch(shortResultEnv, prepared, [domain]))
+      .rejects.toMatchObject({
+        name: 'ExecutionReceiptError',
+        code: 'persistence_conflict',
+      })
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM execution_receipts').get())
+      .toEqual({ count: 0 })
   })
 
   it('rejects an existing idempotency key in the fresh-only prepared builder', async () => {

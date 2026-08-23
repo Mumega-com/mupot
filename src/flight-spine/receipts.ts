@@ -1,7 +1,7 @@
 import type { D1Database, D1PreparedStatement, D1Result } from '@cloudflare/workers-types'
 import type { AuthContext, Env } from '../types'
 import { canonicalJson, sha256Hex } from '../lib/canonical-json'
-import { assertBatchWritten } from '../lib/receipt'
+import { rowsWritten } from '../lib/receipt'
 import {
   ExecutionReceiptError,
   type ExecutionReceipt,
@@ -90,24 +90,47 @@ interface NormalizedDraft {
 }
 
 const PREPARED_RECEIPT_CHAIN = Symbol('prepared-execution-receipt-chain')
+const PREPARED_ATOMIC_DOMAIN_MUTATION = Symbol('prepared-atomic-domain-mutation')
 
 export type PreparedExecutionReceiptFacts = Omit<ExecutionReceipt, 'sequence'>
 
-/** Internal service contract. Use composePreparedExecutionReceiptBatch to assemble it. */
+/** Opaque internal metadata handle. D1 statements remain module-private. */
 export interface PreparedExecutionReceiptChain {
   readonly [PREPARED_RECEIPT_CHAIN]: true
   readonly tenant: string
   readonly expectedStartingHeadId: string | null
-  readonly receiptAndEdgeStatements: readonly D1PreparedStatement[]
-  readonly finalHeadStatement: D1PreparedStatement
   readonly expectedReceipts: readonly PreparedExecutionReceiptFacts[]
 }
 
-export interface PreparedExecutionReceiptCommit {
+export interface PreparedAtomicDomainMutation {
+  readonly [PREPARED_ATOMIC_DOMAIN_MUTATION]: true
+  readonly expectedAuditId: string
+}
+
+interface PreparedExecutionReceiptCommit {
   readonly finalSequence: number
   readonly finalReceiptId: string
   readonly finalReceiptHash: string
 }
+
+interface PreparedExecutionReceiptPieces {
+  readonly receiptAndEdgeStatements: readonly D1PreparedStatement[]
+  readonly finalHeadStatement: D1PreparedStatement
+}
+
+interface PreparedAtomicDomainMutationPieces {
+  readonly mutationStatement: D1PreparedStatement
+  readonly guardStatement: D1PreparedStatement
+}
+
+const PREPARED_RECEIPT_PIECES = new WeakMap<
+  PreparedExecutionReceiptChain,
+  PreparedExecutionReceiptPieces
+>()
+const PREPARED_DOMAIN_PIECES = new WeakMap<
+  PreparedAtomicDomainMutation,
+  PreparedAtomicDomainMutationPieces
+>()
 
 const RECEIPT_COLUMNS = `
   sequence, id, tenant, type, issuer_kind, issuer_id, actor_kind, actor_id,
@@ -422,10 +445,14 @@ export async function prepareFreshExecutionReceiptChain(
   }
 
   const finalReceipt = expectedReceipts[expectedReceipts.length - 1]
-  return Object.freeze({
+  const frozenExpectedReceipts = Object.freeze(expectedReceipts)
+  const handle: PreparedExecutionReceiptChain = Object.freeze({
     [PREPARED_RECEIPT_CHAIN]: true as const,
     tenant,
     expectedStartingHeadId,
+    expectedReceipts: frozenExpectedReceipts,
+  })
+  PREPARED_RECEIPT_PIECES.set(handle, {
     receiptAndEdgeStatements: Object.freeze(receiptAndEdgeStatements),
     finalHeadStatement: prepareFinalHeadCas(
       statementDb,
@@ -433,23 +460,30 @@ export async function prepareFreshExecutionReceiptChain(
       finalReceipt,
       expectedStartingHeadId,
     ),
-    expectedReceipts: Object.freeze(expectedReceipts),
   })
+  return handle
 }
 
-/** The sole supported assembler: domain writes always precede one final head CAS. */
-export function composePreparedExecutionReceiptBatch(
-  prepared: PreparedExecutionReceiptChain,
-  domainStatements: readonly D1PreparedStatement[] = [],
-): D1PreparedStatement[] {
-  if (prepared[PREPARED_RECEIPT_CHAIN] !== true) {
+/**
+ * Opaque pairing for one strict domain INSERT and its in-transaction audit
+ * guard. The guard must RETURNING id, tenant and must violate a schema CHECK
+ * when the expected domain state does not exist.
+ */
+export function prepareAuditedDomainMutation(
+  mutationStatement: D1PreparedStatement,
+  guardStatement: D1PreparedStatement,
+  expectedAuditId: string,
+): PreparedAtomicDomainMutation {
+  const normalizedAuditId = expectedAuditId.trim()
+  if (normalizedAuditId === '') {
     throw new ExecutionReceiptError('invalid_draft')
   }
-  return [
-    ...prepared.receiptAndEdgeStatements,
-    ...domainStatements,
-    prepared.finalHeadStatement,
-  ]
+  const handle: PreparedAtomicDomainMutation = Object.freeze({
+    [PREPARED_ATOMIC_DOMAIN_MUTATION]: true as const,
+    expectedAuditId: normalizedAuditId,
+  })
+  PREPARED_DOMAIN_PIECES.set(handle, { mutationStatement, guardStatement })
+  return handle
 }
 
 function mapReceipt(row: ReceiptRow): ExecutionReceipt {
@@ -607,37 +641,56 @@ async function verifyRowChain(
   return { ok: true }
 }
 
-export function verifyPreparedExecutionReceiptBatchResult(
+function requireExactSingleWrite(result: D1Result<unknown> | undefined): void {
+  if (result === undefined || rowsWritten(result) !== 1) {
+    throw new ExecutionReceiptError('persistence_conflict')
+  }
+}
+
+function verifyPreparedExecutionReceiptBatchResult(
   prepared: PreparedExecutionReceiptChain,
+  receiptPieces: PreparedExecutionReceiptPieces,
+  domainMutations: readonly {
+    readonly handle: PreparedAtomicDomainMutation
+    readonly pieces: PreparedAtomicDomainMutationPieces
+  }[],
   batchResults: readonly D1Result<unknown>[],
 ): PreparedExecutionReceiptCommit {
-  if (prepared[PREPARED_RECEIPT_CHAIN] !== true) {
-    throw new ExecutionReceiptError('persistence_conflict')
-  }
-  const preparedWriteCount = prepared.receiptAndEdgeStatements.length
-  if (batchResults.length < preparedWriteCount + 1) {
-    throw new ExecutionReceiptError('persistence_conflict')
-  }
-  try {
-    assertBatchWritten(
-      batchResults.slice(0, preparedWriteCount),
-      'execution_receipt.prepare',
-    )
-    assertBatchWritten(
-      [batchResults[batchResults.length - 1]],
-      'execution_receipt.head_cas',
-    )
-  } catch {
+  const receiptWriteCount = receiptPieces.receiptAndEdgeStatements.length
+  const expectedResultCount = receiptWriteCount + (domainMutations.length * 2) + 1
+  if (batchResults.length !== expectedResultCount) {
     throw new ExecutionReceiptError('persistence_conflict')
   }
 
+  for (let index = 0; index < receiptWriteCount; index += 1) {
+    requireExactSingleWrite(batchResults[index])
+  }
+  for (let index = 0; index < domainMutations.length; index += 1) {
+    const mutationResultIndex = receiptWriteCount + (index * 2)
+    const guardResultIndex = mutationResultIndex + 1
+    requireExactSingleWrite(batchResults[mutationResultIndex])
+    requireExactSingleWrite(batchResults[guardResultIndex])
+    const guardRows = batchResults[guardResultIndex].results as Record<string, unknown>[]
+    if (
+      guardRows.length !== 1
+      || guardRows[0]?.id !== domainMutations[index].handle.expectedAuditId
+      || guardRows[0]?.tenant !== prepared.tenant
+    ) {
+      throw new ExecutionReceiptError('persistence_conflict')
+    }
+  }
+
   const finalExpected = prepared.expectedReceipts[prepared.expectedReceipts.length - 1]
-  const returned = batchResults[batchResults.length - 1]?.results?.[0] as
+  const finalResult = batchResults[batchResults.length - 1]
+  requireExactSingleWrite(finalResult)
+  const finalRows = finalResult.results as Record<string, unknown>[]
+  const returned = finalRows[0] as
     | Partial<ReceiptHeadRow>
     | undefined
   const finalSequence = Number(returned?.sequence)
   if (
-    returned === undefined
+    finalRows.length !== 1
+    || returned === undefined
     || !Number.isInteger(finalSequence)
     || finalSequence <= 0
     || returned.receipt_id !== finalExpected.id
@@ -652,15 +705,14 @@ export function verifyPreparedExecutionReceiptBatchResult(
   }
 }
 
-export async function rereadAndVerifyPreparedExecutionReceipts(
+async function rereadAndVerifyPreparedExecutionReceipts(
   env: Env,
   prepared: PreparedExecutionReceiptChain,
-  batchResults: readonly D1Result<unknown>[],
+  commit: PreparedExecutionReceiptCommit,
 ): Promise<ExecutionReceipt[]> {
   if (env.TENANT_SLUG !== prepared.tenant) {
     throw new ExecutionReceiptError('integrity_failure')
   }
-  const commit = verifyPreparedExecutionReceiptBatchResult(prepared, batchResults)
   const db = primaryDb(env)
   const rows: ReceiptRow[] = []
   const receipts: ExecutionReceipt[] = []
@@ -684,6 +736,83 @@ export async function rereadAndVerifyPreparedExecutionReceipts(
   const verified = await verifyRowChain(db, prepared.tenant, finalRow)
   if (!verified.ok) throw new ExecutionReceiptError('integrity_failure')
   return receipts
+}
+
+async function executePreparedExecutionReceiptBatchInternal(
+  env: Env,
+  prepared: PreparedExecutionReceiptChain,
+  domainMutations: readonly PreparedAtomicDomainMutation[],
+  allowNoDomain: boolean,
+): Promise<ExecutionReceipt[]> {
+  const receiptPieces = PREPARED_RECEIPT_PIECES.get(prepared)
+  if (
+    receiptPieces === undefined
+    || prepared.tenant !== env.TENANT_SLUG
+    || (!allowNoDomain && domainMutations.length === 0)
+  ) {
+    throw new ExecutionReceiptError('invalid_draft')
+  }
+
+  const resolvedDomains: {
+    readonly handle: PreparedAtomicDomainMutation
+    readonly pieces: PreparedAtomicDomainMutationPieces
+  }[] = []
+  const auditIds = new Set<string>()
+  for (const handle of domainMutations) {
+    const pieces = PREPARED_DOMAIN_PIECES.get(handle)
+    if (pieces === undefined || auditIds.has(handle.expectedAuditId)) {
+      throw new ExecutionReceiptError('invalid_draft')
+    }
+    auditIds.add(handle.expectedAuditId)
+    resolvedDomains.push({ handle, pieces })
+  }
+
+  const statements: D1PreparedStatement[] = [...receiptPieces.receiptAndEdgeStatements]
+  for (const domain of resolvedDomains) {
+    statements.push(domain.pieces.mutationStatement, domain.pieces.guardStatement)
+  }
+  statements.push(receiptPieces.finalHeadStatement)
+
+  const batchResults = await env.DB.batch(statements)
+  const commit = verifyPreparedExecutionReceiptBatchResult(
+    prepared,
+    receiptPieces,
+    resolvedDomains,
+    batchResults,
+  )
+
+  const readDb = primaryDb(env)
+  for (const domain of resolvedDomains) {
+    const auditRow = await readDb.prepare(`
+      SELECT id, tenant
+        FROM mutation_audit_entries
+       WHERE tenant = ?1 AND id = ?2
+    `).bind(prepared.tenant, domain.handle.expectedAuditId).first<{
+      id: string
+      tenant: string
+    }>()
+    if (
+      auditRow === null
+      || auditRow.id !== domain.handle.expectedAuditId
+      || auditRow.tenant !== prepared.tenant
+    ) {
+      throw new ExecutionReceiptError('integrity_failure')
+    }
+  }
+  return rereadAndVerifyPreparedExecutionReceipts(env, prepared, commit)
+}
+
+/**
+ * Execute one opaque receipt chain with one or more audited domain INSERTs.
+ * Task-specific builders must use strict INSERTs and a state-existence audit
+ * guard whose invalid path violates mutation_audit_entries CHECK constraints.
+ */
+export function executePreparedExecutionReceiptBatch(
+  env: Env,
+  prepared: PreparedExecutionReceiptChain,
+  domainMutations: readonly PreparedAtomicDomainMutation[],
+): Promise<ExecutionReceipt[]> {
+  return executePreparedExecutionReceiptBatchInternal(env, prepared, domainMutations, false)
 }
 
 async function replayOrConflict(
@@ -734,9 +863,9 @@ export async function appendExecutionReceipt(
     throw error
   }
 
-  let batchResults: D1Result<unknown>[]
+  let persisted: ExecutionReceipt[]
   try {
-    batchResults = await env.DB.batch(composePreparedExecutionReceiptBatch(prepared))
+    persisted = await executePreparedExecutionReceiptBatchInternal(env, prepared, [], true)
   } catch {
     const recoveryDb = primaryDb(env)
     const racedReplay = await replayOrConflict(recoveryDb, tenant, issuerId, actor, draft)
@@ -751,7 +880,6 @@ export async function appendExecutionReceipt(
     }
     throw new ExecutionReceiptError('persistence_conflict')
   }
-  const persisted = await rereadAndVerifyPreparedExecutionReceipts(env, prepared, batchResults)
   if (persisted.length !== 1) throw new ExecutionReceiptError('integrity_failure')
   return persisted[0]
 }
