@@ -60,23 +60,32 @@ function allowTestOnlyReceiptCorruption(): void {
   harness.sqlite.exec('DROP TRIGGER execution_receipts_no_update')
 }
 
+function departmentAudit(auditId: string, targetId: string) {
+  return {
+    expectedAuditId: auditId,
+    principalKind: 'member' as const,
+    principalId: 'member-1',
+    origin: 'rest' as const,
+    handler: 'flight_spine_test',
+    operation: 'upsert',
+    targetKind: 'department',
+    targetId,
+    requestId: auditId,
+    evidence: { test: 'flight-spine-receipts' },
+  }
+}
+
 function auditedDepartmentMutation(input: {
   auditId: string
   mutationSql: string
   targetId: string
+  bindings?: readonly (string | number | boolean | null)[]
+  db?: D1Database
 }) {
-  const mutationStatement = env.DB.prepare(input.mutationSql)
-  return prepareAuditedDomainMutation(mutationStatement, {
-    expectedAuditId: input.auditId,
-    principalKind: 'member',
-    principalId: 'member-1',
-    origin: 'rest',
-    handler: 'flight_spine_test',
-    operation: 'upsert',
-    targetKind: 'department',
-    targetId: input.targetId,
-    requestId: input.auditId,
-    evidence: { test: 'flight-spine-receipts' },
+  return prepareAuditedDomainMutation(input.db ?? env.DB, {
+    sql: input.mutationSql,
+    bindings: input.bindings ?? [],
+    audit: departmentAudit(input.auditId, input.targetId),
   })
 }
 
@@ -131,6 +140,46 @@ describe('Flight Spine execution receipt ledger', () => {
       })
   })
 
+  it('rejects every non-direct or compound SQL shape before preparing or executing it', () => {
+    let prepareCalls = 0
+    const observingDb = {
+      prepare(sql: string) {
+        prepareCalls += 1
+        return harness.db.prepare(sql)
+      },
+      batch: harness.db.batch.bind(harness.db),
+    } as D1Database
+    const rejectedSql = [
+      '',
+      'SELECT 1 WHERE 0',
+      'CREATE TABLE bypass_table (id TEXT)',
+      'ALTER TABLE departments ADD COLUMN bypass TEXT',
+      'DROP TABLE departments',
+      'PRAGMA foreign_keys = OFF',
+      'WITH candidate AS (SELECT 1) UPDATE departments SET name = name',
+      '-- trusted-looking comment\nUPDATE departments SET name = name',
+      '/* trusted-looking comment */ UPDATE departments SET name = name',
+      "UPDATE departments SET name = name; DELETE FROM departments",
+    ]
+
+    for (const [index, sql] of rejectedSql.entries()) {
+      expect(() => prepareAuditedDomainMutation(observingDb, {
+        sql,
+        bindings: [],
+        audit: departmentAudit(`audit-rejected-sql-${index}`, 'rejected-target'),
+      })).toThrowError(expect.objectContaining({
+        name: 'ExecutionReceiptError',
+        code: 'invalid_draft',
+      }))
+    }
+    expect(prepareCalls).toBe(0)
+    expect(harness.sqlite.prepare(`
+      SELECT COUNT(*) AS count FROM sqlite_master WHERE name = 'bypass_table'
+    `).get()).toEqual({ count: 0 })
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM execution_receipts').get())
+      .toEqual({ count: 0 })
+  })
+
   it('commits two receipts with one strict domain insert and executor-generated audit guard', async () => {
     const prepared = await prepareFreshExecutionReceiptChain(env, memberAuth(), [
       draft('opaque-prepared-objective'),
@@ -143,10 +192,11 @@ describe('Flight Spine execution receipt ledger', () => {
     const domain = auditedDepartmentMutation({
       auditId: 'audit-opaque-prepared-domain',
       mutationSql: `
-        INSERT INTO departments (id, slug, name)
-        VALUES ('opaque-prepared-domain', 'opaque-prepared-domain', 'Opaque Prepared Domain')
+        INSERT OR ABORT INTO departments (id, slug, name)
+        VALUES (?1, ?2, ?3)
       `,
       targetId: 'opaque-prepared-domain',
+      bindings: ['opaque-prepared-domain', 'opaque-prepared-domain', 'Opaque Prepared Domain'],
     })
 
     const receipts = await executePreparedExecutionReceiptBatch(env, prepared, [domain])
@@ -197,6 +247,56 @@ describe('Flight Spine execution receipt ledger', () => {
       to_receipt_id: receipts[1].id,
       relation: 'predecessor',
     })
+  })
+
+  it('commits one directly validated UPDATE with bound values', async () => {
+    harness.sqlite.prepare(`
+      INSERT INTO departments (id, slug, name) VALUES (?, ?, ?)
+    `).run('update-domain', 'update-domain', 'Before')
+    const prepared = await prepareFreshExecutionReceiptChain(env, memberAuth(), [
+      draft('direct-update-receipt'),
+    ])
+    const domain = auditedDepartmentMutation({
+      auditId: 'audit-direct-update',
+      mutationSql: 'UPDATE departments SET name = ?1 WHERE id = ?2',
+      bindings: ['After', 'update-domain'],
+      targetId: 'update-domain',
+    })
+
+    const receipts = await executePreparedExecutionReceiptBatch(env, prepared, [domain])
+
+    expect(receipts).toHaveLength(1)
+    expect(harness.sqlite.prepare(`
+      SELECT id, name FROM departments WHERE id = 'update-domain'
+    `).get()).toEqual({ id: 'update-domain', name: 'After' })
+    expect(harness.sqlite.prepare(`
+      SELECT target_id FROM mutation_audit_entries WHERE id = 'audit-direct-update'
+    `).get()).toEqual({ target_id: 'update-domain' })
+  })
+
+  it('commits one directly validated DELETE with a bound value', async () => {
+    harness.sqlite.prepare(`
+      INSERT INTO departments (id, slug, name) VALUES (?, ?, ?)
+    `).run('delete-domain', 'delete-domain', 'Delete Me')
+    const prepared = await prepareFreshExecutionReceiptChain(env, memberAuth(), [
+      draft('direct-delete-receipt'),
+    ])
+    const domain = auditedDepartmentMutation({
+      auditId: 'audit-direct-delete',
+      mutationSql: 'DELETE FROM departments WHERE id = ?1',
+      bindings: ['delete-domain'],
+      targetId: 'delete-domain',
+    })
+
+    const receipts = await executePreparedExecutionReceiptBatch(env, prepared, [domain])
+
+    expect(receipts).toHaveLength(1)
+    expect(harness.sqlite.prepare(`
+      SELECT COUNT(*) AS count FROM departments WHERE id = 'delete-domain'
+    `).get()).toEqual({ count: 0 })
+    expect(harness.sqlite.prepare(`
+      SELECT target_id FROM mutation_audit_entries WHERE id = 'audit-direct-delete'
+    `).get()).toEqual({ target_id: 'delete-domain' })
   })
 
   it('rolls back receipts, edges, head, domain and audit rows on a hard SQL failure', async () => {
@@ -396,6 +496,7 @@ describe('Flight Spine execution receipt ledger', () => {
         VALUES ('opaque-short-domain', 'opaque-short-domain', 'Opaque Short Domain')
       `,
       targetId: 'opaque-short-domain',
+      db: shortResultDb,
     })
 
     await expect(executePreparedExecutionReceiptBatch(shortResultEnv, prepared, [domain]))

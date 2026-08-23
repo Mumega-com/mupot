@@ -168,6 +168,14 @@ export interface AtomicDomainAuditMetadata {
   readonly evidence: JsonValue
 }
 
+export type AtomicDomainSqlBinding = string | number | boolean | null
+
+export interface AtomicDomainMutationInput {
+  readonly sql: string
+  readonly bindings?: readonly AtomicDomainSqlBinding[]
+  readonly audit: AtomicDomainAuditMetadata
+}
+
 interface PreparedExecutionReceiptCommit {
   readonly finalSequence: number
   readonly finalReceiptId: string
@@ -180,6 +188,7 @@ interface PreparedExecutionReceiptPieces {
 }
 
 interface PreparedAtomicDomainMutationPieces {
+  readonly database: D1Database
   readonly mutationStatement: D1PreparedStatement
   readonly audit: NormalizedAtomicDomainAuditMetadata
 }
@@ -303,6 +312,55 @@ function normalizeAtomicDomainAuditMetadata(
     idempotencyKey: optionalId(input.idempotencyKey),
     evidenceJson,
     recordedAt: new Date().toISOString(),
+  })
+}
+
+function normalizeAtomicDomainMutationInput(input: AtomicDomainMutationInput): {
+  readonly sql: string
+  readonly bindings: readonly AtomicDomainSqlBinding[]
+  readonly audit: NormalizedAtomicDomainAuditMetadata
+} {
+  if (typeof input !== 'object' || input === null) {
+    throw new ExecutionReceiptError('invalid_draft')
+  }
+  if (typeof input.sql !== 'string') throw new ExecutionReceiptError('invalid_draft')
+  const sql = input.sql.trim()
+  if (
+    sql.length === 0
+    || sql.length > 65_536
+    || sql.includes(';')
+    || sql.includes('--')
+    || sql.includes('/*')
+    || sql.includes('*/')
+  ) {
+    throw new ExecutionReceiptError('invalid_draft')
+  }
+  const firstToken = /^[A-Za-z]+/.exec(sql)?.[0]?.toUpperCase()
+  if (firstToken !== 'INSERT' && firstToken !== 'UPDATE' && firstToken !== 'DELETE') {
+    throw new ExecutionReceiptError('invalid_draft')
+  }
+
+  const rawBindings = input.bindings ?? []
+  if (!Array.isArray(rawBindings)) throw new ExecutionReceiptError('invalid_draft')
+  const bindings: AtomicDomainSqlBinding[] = []
+  for (const value of rawBindings) {
+    if (
+      value !== null
+      && typeof value !== 'string'
+      && typeof value !== 'number'
+      && typeof value !== 'boolean'
+    ) {
+      throw new ExecutionReceiptError('invalid_draft')
+    }
+    if (typeof value === 'number' && !Number.isFinite(value)) {
+      throw new ExecutionReceiptError('invalid_draft')
+    }
+    bindings.push(value)
+  }
+  return Object.freeze({
+    sql,
+    bindings: Object.freeze(bindings),
+    audit: normalizeAtomicDomainAuditMetadata(input.audit),
   })
 }
 
@@ -655,19 +713,28 @@ export async function prepareFreshExecutionReceiptChain(
 }
 
 /**
- * Opaque pairing for one strict one-row domain statement and bounded audit
- * metadata. The executor alone generates the adjacent changes()-based guard.
+ * Validate and internally prepare one direct, single-statement DML mutation.
+ * Values arrive only through D1 bindings; callers cannot supply a prepared
+ * statement, executable guard, identifier, or table name separately.
  */
 export function prepareAuditedDomainMutation(
-  mutationStatement: D1PreparedStatement,
-  auditMetadata: AtomicDomainAuditMetadata,
+  db: D1Database,
+  input: AtomicDomainMutationInput,
 ): PreparedAtomicDomainMutation {
-  const audit = normalizeAtomicDomainAuditMetadata(auditMetadata)
+  const normalized = normalizeAtomicDomainMutationInput(input)
+  const unbound = db.prepare(normalized.sql)
+  const mutationStatement = normalized.bindings.length === 0
+    ? unbound
+    : unbound.bind(...normalized.bindings)
   const handle: PreparedAtomicDomainMutation = Object.freeze({
     [PREPARED_ATOMIC_DOMAIN_MUTATION]: true as const,
-    expectedAuditId: audit.expectedAuditId,
+    expectedAuditId: normalized.audit.expectedAuditId,
   })
-  PREPARED_DOMAIN_PIECES.set(handle, { mutationStatement, audit })
+  PREPARED_DOMAIN_PIECES.set(handle, {
+    database: db,
+    mutationStatement,
+    audit: normalized.audit,
+  })
   return handle
 }
 
@@ -945,7 +1012,11 @@ async function executePreparedExecutionReceiptBatchInternal(
   const auditIds = new Set<string>()
   for (const handle of domainMutations) {
     const pieces = PREPARED_DOMAIN_PIECES.get(handle)
-    if (pieces === undefined || auditIds.has(handle.expectedAuditId)) {
+    if (
+      pieces === undefined
+      || pieces.database !== env.DB
+      || auditIds.has(handle.expectedAuditId)
+    ) {
       throw new ExecutionReceiptError('invalid_draft')
     }
     auditIds.add(handle.expectedAuditId)
