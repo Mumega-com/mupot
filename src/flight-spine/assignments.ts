@@ -236,6 +236,20 @@ async function requirePendingSeat(
   if (!seat) throw new AssignmentError('seat_not_assignable')
 }
 
+async function requireLiveGateBinding(
+  env: Env,
+  lanes: readonly NormalizedLane[],
+): Promise<void> {
+  const integrator = lanes.find((lane) => lane.role === 'integrator') as NormalizedLane
+  const gate = lanes.find((lane) => lane.role === 'gate') as NormalizedLane
+  const grant = await env.DB.prepare(`
+    SELECT id FROM gate_grants
+     WHERE capability = ?1 AND principal_type = 'agent' AND principal_id = ?2
+     LIMIT 1
+  `).bind(integrator.task.gate_owner, gate.assigneeAgentId).first<{ id: string }>()
+  if (!grant) throw new AssignmentError('invalid_gate_owner')
+}
+
 function mapAtomicFailure(error: unknown): never {
   const message = error instanceof Error ? error.message : String(error)
   if (message.includes('execution receipt head sequence must advance')) {
@@ -244,7 +258,7 @@ function mapAtomicFailure(error: unknown): never {
   if (message.includes('assignment_epoch') || message.includes('assignment epoch')) {
     throw new AssignmentError('stale_assignment_epoch')
   }
-  throw error
+  throw new AssignmentError('materialization_conflict')
 }
 
 export async function materializeComposition(
@@ -286,6 +300,7 @@ export async function materializeComposition(
   }
   assertRoleShape(lanes)
   assertDag(lanes)
+  await requireLiveGateBinding(env, lanes)
   const coordinator = lanes.find((lane) => lane.role === 'coordinator') as NormalizedLane
   if (flight.agent !== coordinator.assigneeAgentId) {
     throw new AssignmentError('flight_scope_mismatch')
@@ -375,15 +390,147 @@ export async function materializeComposition(
   const materializedReceipt = preparedReceipts.expectedReceipts[1]
   const assignmentReceipts = preparedReceipts.expectedReceipts.slice(2)
   const domainMutations: PreparedAtomicDomainMutation[] = []
+  const integratorLane = preparedLanes.find((lane) => lane.role === 'integrator') as PreparedLane
+  const gateLane = preparedLanes.find((lane) => lane.role === 'gate') as PreparedLane
+  const liveLaneFactsJson = canonicalJson(preparedLanes.map((lane) => ({
+    agentId: lane.assigneeAgentId,
+    runtimeSeatId: lane.runtimeSeatId,
+  })))
 
   const linkDigest = await sha256Hex(canonicalJson({ objectiveId, flightId }))
   domainMutations.push(prepareAuditedDomainMutation(env.DB, {
     sql: `INSERT INTO flight_objectives (
       id, tenant, flight_id, objective_id, materialization_receipt_id, linked_at
-    ) VALUES (?, ?, ?, ?, ?, ?)`,
+    )
+    SELECT ?, ?, ?, ?, ?, ?
+     WHERE EXISTS (
+       SELECT 1
+         FROM flights flight
+         JOIN objectives objective ON objective.id = ? AND objective.tenant = ?
+        WHERE flight.id = ? AND flight.tenant = ?
+          AND flight.status IN ('preflight', 'running')
+          AND flight.project_id IS ?
+          AND objective.squad_id = ? AND objective.project_id IS ?
+          AND objective.accepted_at = ?
+          AND flight.created_at > ?
+     )
+       AND EXISTS (
+         SELECT 1 FROM members member
+          WHERE member.id = ? AND member.tenant = ? AND member.status = 'active'
+       )
+       AND EXISTS (
+         SELECT 1 FROM members authority_member
+          WHERE authority_member.id = ? AND authority_member.tenant = ?
+            AND authority_member.status = 'active'
+       )
+       AND (
+         ? = 1
+         OR EXISTS (
+           SELECT 1
+             FROM capabilities capability
+             JOIN squads squad ON squad.id = ?
+            WHERE capability.member_id = ?
+              AND (
+                capability.scope_type = 'org'
+                OR (capability.scope_type = 'department'
+                  AND capability.scope_id = squad.department_id)
+                OR (capability.scope_type = 'squad' AND capability.scope_id = squad.id)
+              )
+              AND CASE capability.capability
+                WHEN 'owner' THEN 5 WHEN 'admin' THEN 4 WHEN 'lead' THEN 3
+                WHEN 'member' THEN 2 WHEN 'observer' THEN 1 ELSE 0 END >= 2
+         )
+         OR EXISTS (
+           SELECT 1 FROM channel_capability_grants capability
+            WHERE capability.member_id = ? AND capability.squad_id = ?
+              AND CASE capability.capability
+                WHEN 'owner' THEN 5 WHEN 'admin' THEN 4 WHEN 'lead' THEN 3
+                WHEN 'member' THEN 2 WHEN 'observer' THEN 1 ELSE 0 END >= 2
+         )
+       )
+       AND (
+         ? IS NULL
+         OR EXISTS (
+           SELECT 1
+             FROM agents agent
+             JOIN agent_member_bindings binding
+               ON binding.agent_id = agent.id AND binding.tenant = ?
+                AND binding.member_id = ?
+             JOIN memberships membership
+               ON membership.agent_id = agent.id AND membership.squad_id = ?
+            WHERE agent.id = ? AND agent.status = 'active'
+              AND CASE membership.capability
+                WHEN 'owner' THEN 5 WHEN 'admin' THEN 4 WHEN 'lead' THEN 3
+                WHEN 'member' THEN 2 WHEN 'observer' THEN 1 ELSE 0 END >= 2
+         )
+       )
+       AND (
+         ? IS NULL
+         OR EXISTS (
+           SELECT 1
+             FROM projects project
+             JOIN project_squad_access access
+               ON access.project_id = project.id AND access.squad_id = ?
+            WHERE project.id = ? AND project.status <> 'archived'
+              AND access.access_level IN ('write', 'admin')
+         )
+       )
+       AND NOT EXISTS (
+         SELECT 1
+           FROM json_each(?) lane
+           LEFT JOIN agents agent
+             ON agent.id = json_extract(lane.value, '$.agentId')
+            AND agent.status = 'active'
+           LEFT JOIN memberships membership
+             ON membership.agent_id = agent.id AND membership.squad_id = ?
+           LEFT JOIN runtime_seats seat
+             ON seat.id = json_extract(lane.value, '$.runtimeSeatId')
+            AND seat.tenant = ? AND seat.agent_id = agent.id AND seat.state = 'pending'
+          WHERE agent.id IS NULL
+             OR CASE membership.capability
+               WHEN 'owner' THEN 5 WHEN 'admin' THEN 4 WHEN 'lead' THEN 3
+               WHEN 'member' THEN 2 WHEN 'observer' THEN 1 ELSE 0 END < 2
+             OR (json_extract(lane.value, '$.runtimeSeatId') IS NOT NULL AND seat.id IS NULL)
+       )
+       AND EXISTS (
+         SELECT 1 FROM gate_grants grant_row
+          WHERE grant_row.capability = ? AND grant_row.principal_type = 'agent'
+            AND grant_row.principal_id = ?
+       )`,
     bindings: [
       crypto.randomUUID(), env.TENANT_SLUG, flightId, objectiveId,
       materializedReceipt.id, createdAt,
+      objectiveId,
+      env.TENANT_SLUG,
+      flightId,
+      env.TENANT_SLUG,
+      objective.projectId,
+      objective.squadId,
+      objective.projectId,
+      objective.acceptedAt,
+      Date.parse(objective.acceptedAt),
+      principal.memberId,
+      env.TENANT_SLUG,
+      principal.authorityMemberId,
+      env.TENANT_SLUG,
+      auth.capabilities === undefined && (auth.role === 'owner' || auth.role === 'admin') ? 1 : 0,
+      objective.squadId,
+      principal.authorityMemberId,
+      principal.authorityMemberId,
+      objective.squadId,
+      principal.agentId,
+      env.TENANT_SLUG,
+      principal.memberId,
+      objective.squadId,
+      principal.agentId,
+      objective.projectId,
+      objective.squadId,
+      objective.projectId,
+      liveLaneFactsJson,
+      objective.squadId,
+      env.TENANT_SLUG,
+      integratorLane.taskRow.gate_owner,
+      gateLane.assigneeAgentId,
     ],
     audit: flightSpineAudit(auth, principal, {
       expectedAuditId: `audit:${flightId}:objective-link`,
@@ -460,7 +607,38 @@ export async function materializeComposition(
       sql: `INSERT INTO flight_lanes (
         id, tenant, flight_id, lane_key, role, task_id, assignment_epoch,
         agent_id, runtime_seat_id, done_when, dependency_lane_keys_json, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+       WHERE EXISTS (
+         SELECT 1 FROM flight_objectives
+          WHERE tenant = ? AND flight_id = ? AND objective_id = ?
+       )
+         AND EXISTS (
+           SELECT 1
+             FROM agents agent
+             JOIN memberships membership
+               ON membership.agent_id = agent.id AND membership.squad_id = ?
+            WHERE agent.id = ? AND agent.status = 'active'
+              AND CASE membership.capability
+                WHEN 'owner' THEN 5 WHEN 'admin' THEN 4 WHEN 'lead' THEN 3
+                WHEN 'member' THEN 2 WHEN 'observer' THEN 1 ELSE 0 END >= 2
+         )
+         AND (
+           ? IS NULL
+           OR EXISTS (
+             SELECT 1 FROM runtime_seats seat
+              WHERE seat.id = ? AND seat.tenant = ? AND seat.agent_id = ?
+                AND seat.state = 'pending'
+           )
+         )
+         AND (
+           ? <> 'integrator'
+           OR EXISTS (
+             SELECT 1 FROM gate_grants grant_row
+              WHERE grant_row.capability = ? AND grant_row.principal_type = 'agent'
+                AND grant_row.principal_id = ?
+           )
+         )`,
       bindings: [
         lane.laneId,
         env.TENANT_SLUG,
@@ -474,6 +652,18 @@ export async function materializeComposition(
         lane.taskRow.done_when,
         canonicalJson(lane.dependencyLaneKeys),
         createdAt,
+        env.TENANT_SLUG,
+        flightId,
+        objectiveId,
+        objective.squadId,
+        lane.assigneeAgentId,
+        lane.runtimeSeatId,
+        lane.runtimeSeatId,
+        env.TENANT_SLUG,
+        lane.assigneeAgentId,
+        lane.role,
+        integratorLane.taskRow.gate_owner,
+        gateLane.assigneeAgentId,
       ],
       audit: flightSpineAudit(auth, principal, {
         expectedAuditId: `audit:${flightId}:lane:${lane.laneKey}`,
@@ -494,7 +684,18 @@ export async function materializeComposition(
         id, tenant, flight_id, lane_id, task_id, assignment_epoch, agent_id,
         runtime_seat_id, assigned_by_principal_kind, assigned_by_principal_id,
         assigned_by_member_id, assignment_receipt_id, assigned_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+       WHERE EXISTS (
+         SELECT 1 FROM tasks task
+          WHERE task.id = ? AND task.assignment_epoch = 1
+            AND task.assignee_agent_id = ?
+       )
+         AND EXISTS (
+           SELECT 1 FROM flight_lanes lane
+            WHERE lane.id = ? AND lane.tenant = ? AND lane.flight_id = ?
+              AND lane.task_id = ? AND lane.assignment_epoch = 1
+         )`,
       bindings: [
         lane.assignmentId,
         env.TENANT_SLUG,
@@ -509,6 +710,12 @@ export async function materializeComposition(
         principal.memberId,
         assignmentReceipt.id,
         createdAt,
+        lane.taskRow.id,
+        lane.assigneeAgentId,
+        lane.laneId,
+        env.TENANT_SLUG,
+        flightId,
+        lane.taskRow.id,
       ],
       audit: flightSpineAudit(auth, principal, {
         expectedAuditId: `audit:${flightId}:assignment:${lane.laneKey}`,

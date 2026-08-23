@@ -14,6 +14,7 @@ const LEAD_MEMBER_ID = 'member-objective-lead'
 const OTHER_MEMBER_ID = 'member-other'
 const AGENT_ID = 'agent-command'
 const SQUAD_ID = 'squad-command'
+const TARGET_SQUAD_ID = 'squad-target'
 const PROJECT_ID = 'project-command'
 
 let harness: SqliteD1Harness
@@ -80,6 +81,23 @@ function count(table: string): number {
   }).count)
 }
 
+function envWithBeforeBatch(mutate: () => void): Env {
+  let injected = false
+  return {
+    ...env,
+    DB: {
+      prepare: harness.db.prepare.bind(harness.db),
+      async batch(statements: Parameters<D1Database['batch']>[0]) {
+        if (!injected) {
+          injected = true
+          mutate()
+        }
+        return harness.db.batch(statements)
+      },
+    } as D1Database,
+  }
+}
+
 beforeEach(() => {
   vi.useFakeTimers()
   vi.setSystemTime(new Date(SERVER_TIME))
@@ -90,9 +108,9 @@ beforeEach(() => {
       VALUES ('department-command', 'command', 'Command');
     INSERT INTO squads (
       id, department_id, slug, name, budget_cap_cents, budget_window
-    ) VALUES (
-      '${SQUAD_ID}', 'department-command', 'command', 'Command', 100, 'day'
-    );
+    ) VALUES
+      ('${SQUAD_ID}', 'department-command', 'command', 'Command', 100, 'day'),
+      ('${TARGET_SQUAD_ID}', 'department-command', 'target', 'Target', 100, 'day');
     INSERT INTO agents (
       id, squad_id, slug, name, role, model, status, budget_cap_cents, budget_window
     ) VALUES (
@@ -100,7 +118,9 @@ beforeEach(() => {
       'active', 200, 'day'
     );
     INSERT INTO memberships (id, agent_id, squad_id, capability)
-      VALUES ('membership-command', '${AGENT_ID}', '${SQUAD_ID}', 'member');
+      VALUES
+        ('membership-command', '${AGENT_ID}', '${SQUAD_ID}', 'member'),
+        ('membership-target', '${AGENT_ID}', '${TARGET_SQUAD_ID}', 'member');
     INSERT INTO members (id, display_name, status, tenant)
       VALUES
         ('${MEMBER_ID}', 'Command Member', 'active', '${TENANT}'),
@@ -111,6 +131,7 @@ beforeEach(() => {
     INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
       VALUES
         ('capability-command', '${MEMBER_ID}', 'squad', '${SQUAD_ID}', 'member'),
+        ('capability-target', '${MEMBER_ID}', 'squad', '${TARGET_SQUAD_ID}', 'lead'),
         ('capability-objective-lead', '${LEAD_MEMBER_ID}', 'squad', '${SQUAD_ID}', 'lead'),
         ('capability-other', '${OTHER_MEMBER_ID}', 'squad', '${SQUAD_ID}', 'member');
     INSERT INTO projects (id, slug, name, status)
@@ -231,7 +252,7 @@ describe('Flight Spine objective acceptance', () => {
       .rejects.toMatchObject({ code: 'idempotency_conflict' })
 
     harness.sqlite.prepare("DELETE FROM capabilities WHERE id = 'capability-command'").run()
-    await expect(acceptObjective(env, auth(), input))
+    await expect(acceptObjective(env, auth({ capabilities: [] }), input))
       .rejects.toMatchObject({ code: 'objective_forbidden' })
     expect(count('objectives')).toBe(1)
     expect(count('execution_receipts')).toBe(2)
@@ -282,10 +303,58 @@ describe('Flight Spine objective acceptance', () => {
       "UPDATE capabilities SET capability = 'member' WHERE id = 'capability-objective-lead'",
     ).run()
 
-    await expect(acceptObjective(env, leadAuth(), objectiveInput({ budgetMicroUsd: 500_000 })))
+    await expect(acceptObjective(env, leadAuth({
+      capabilities: [{
+        member_id: LEAD_MEMBER_ID,
+        scope_type: 'squad',
+        scope_id: SQUAD_ID,
+        capability: 'member',
+      }],
+    }), objectiveInput({ budgetMicroUsd: 500_000 })))
       .rejects.toMatchObject({ code: 'objective_budget_forbidden' })
     expect(count('objectives')).toBe(0)
     expect(count('execution_receipts')).toBe(0)
+  })
+
+  it('honors an explicit empty directory capability view even when DB grants exist', async () => {
+    await expect(acceptObjective(env, auth({
+      channel: 'directory',
+      capabilities: [],
+    }), objectiveInput()))
+      .rejects.toMatchObject({ code: 'objective_forbidden' })
+    expect(count('objectives')).toBe(0)
+  })
+
+  it('honors a consent-clamped member view instead of widening to a live DB lead grant', async () => {
+    await expect(acceptObjective(env, leadAuth({
+      channel: 'directory',
+      capabilities: [{
+        member_id: LEAD_MEMBER_ID,
+        scope_type: 'squad',
+        scope_id: SQUAD_ID,
+        capability: 'member',
+      }],
+    }), objectiveInput({ budgetMicroUsd: 500_000 })))
+      .rejects.toMatchObject({ code: 'objective_budget_forbidden' })
+    expect(count('objectives')).toBe(0)
+  })
+
+  it('requires a bound agent membership to meet the requested minimum rank', async () => {
+    await expect(acceptObjective(env, auth({
+      capabilities: [{
+        member_id: MEMBER_ID,
+        scope_type: 'squad',
+        scope_id: TARGET_SQUAD_ID,
+        capability: 'lead',
+      }],
+    }), objectiveInput({
+      squadId: TARGET_SQUAD_ID,
+      projectId: null,
+      budgetMicroUsd: 500_000,
+      idempotencyKey: 'objective-target-agent-minimum',
+    })))
+      .rejects.toMatchObject({ code: 'objective_budget_forbidden' })
+    expect(count('objectives')).toBe(0)
   })
 
   it('enforces the lowest current agent or squad budget cap', async () => {
@@ -296,6 +365,47 @@ describe('Flight Spine objective acceptance', () => {
       })
     expect(count('objectives')).toBe(0)
     expect(count('execution_receipts')).toBe(0)
+  })
+
+  it('rolls back receipts, objective and audit when live capability is revoked before the batch', async () => {
+    const racedEnv = envWithBeforeBatch(() => {
+      harness.sqlite.prepare("DELETE FROM capabilities WHERE id = 'capability-command'").run()
+    })
+
+    await expect(acceptObjective(racedEnv, auth(), objectiveInput()))
+      .rejects.toMatchObject({ code: 'objective_persistence_conflict' })
+    expect(count('objectives')).toBe(0)
+    expect(count('objective_acceptance_keys')).toBe(0)
+    expect(count('execution_receipts')).toBe(0)
+    expect(count('mutation_audit_entries')).toBe(0)
+  })
+
+  it('rolls back the atomic acceptance when a squad cap drops below budget before the batch', async () => {
+    const racedEnv = envWithBeforeBatch(() => {
+      harness.sqlite.prepare('UPDATE squads SET budget_cap_cents = 10 WHERE id = ?')
+        .run(SQUAD_ID)
+    })
+
+    await expect(acceptObjective(
+      racedEnv,
+      leadAuth(),
+      objectiveInput({ budgetMicroUsd: 500_000 }),
+    )).rejects.toMatchObject({ code: 'objective_persistence_conflict' })
+    expect(count('objectives')).toBe(0)
+    expect(count('execution_receipts')).toBe(0)
+    expect(count('mutation_audit_entries')).toBe(0)
+  })
+
+  it('rolls back the atomic acceptance when the bound agent is disabled before the batch', async () => {
+    const racedEnv = envWithBeforeBatch(() => {
+      harness.sqlite.prepare("UPDATE agents SET status = 'paused' WHERE id = ?").run(AGENT_ID)
+    })
+
+    await expect(acceptObjective(racedEnv, auth(), objectiveInput()))
+      .rejects.toMatchObject({ code: 'objective_persistence_conflict' })
+    expect(count('objectives')).toBe(0)
+    expect(count('execution_receipts')).toBe(0)
+    expect(count('mutation_audit_entries')).toBe(0)
   })
 
   it('fails closed on tenant, squad and project scope mismatches before writing facts', async () => {

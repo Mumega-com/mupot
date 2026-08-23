@@ -127,6 +127,32 @@ function receiptHead(): { sequence: number; receipt_id: string; receipt_hash: st
   `).get(TENANT) as { sequence: number; receipt_id: string; receipt_hash: string }
 }
 
+function envWithBeforeBatch(mutate: () => void): Env {
+  let injected = false
+  return {
+    ...env,
+    DB: {
+      prepare: harness.db.prepare.bind(harness.db),
+      async batch(statements: Parameters<D1Database['batch']>[0]) {
+        if (!injected) {
+          injected = true
+          mutate()
+        }
+        return harness.db.batch(statements)
+      },
+    } as D1Database,
+  }
+}
+
+function expectNoMaterialization(before: { receipts: number; audits: number }): void {
+  expect(count('flight_objectives')).toBe(0)
+  expect(count('flight_lanes')).toBe(0)
+  expect(count('flight_task_assignments')).toBe(0)
+  expect(count('tasks')).toBe(1)
+  expect(count('execution_receipts')).toBe(before.receipts)
+  expect(count('mutation_audit_entries')).toBe(before.audits)
+}
+
 beforeEach(() => {
   vi.useFakeTimers()
   vi.setSystemTime(new Date(SERVER_TIME))
@@ -157,6 +183,12 @@ beforeEach(() => {
       VALUES ('${TENANT}', '${AGENTS.coordinator}', '${MEMBER_ID}', '${SERVER_TIME}');
     INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
       VALUES ('capability-coordinator', '${MEMBER_ID}', 'squad', '${SQUAD_ID}', 'member');
+    INSERT INTO gate_grants (
+      id, capability, principal_type, principal_id, granted_by, created_at
+    ) VALUES (
+      'gate-grant-independent', 'gate:independent', 'agent', '${AGENTS.gate}',
+      '${MEMBER_ID}', '${SERVER_TIME}'
+    );
     INSERT INTO tasks (id, squad_id, title, done_when, status)
       VALUES ('legacy-task', '${SQUAD_ID}', 'Legacy', 'Legacy remains epoch zero', 'open');
   `)
@@ -297,6 +329,62 @@ describe('Flight Spine composition materialization', () => {
     expect(count('mutation_audit_entries')).toBe(baseline.audits)
   })
 
+  it('requires the integrator gate_owner to bind exactly to the predeclared gate agent', async () => {
+    const objectiveId = await acceptedObjective()
+    const before = {
+      receipts: count('execution_receipts'),
+      audits: count('mutation_audit_entries'),
+    }
+    harness.sqlite.prepare("DELETE FROM gate_grants WHERE id = 'gate-grant-independent'").run()
+    await expect(materializeComposition(env, auth(), materializeInput(objectiveId)))
+      .rejects.toMatchObject({ code: 'invalid_gate_owner' })
+
+    harness.sqlite.prepare(`
+      INSERT INTO gate_grants (
+        id, capability, principal_type, principal_id, granted_by, created_at
+      ) VALUES ('wrong-gate', 'gate:independent', 'agent', ?, ?, ?)
+    `).run(AGENTS.workerA, MEMBER_ID, SERVER_TIME)
+    await expect(materializeComposition(env, auth(), materializeInput(objectiveId)))
+      .rejects.toMatchObject({ code: 'invalid_gate_owner' })
+    expectNoMaterialization(before)
+  })
+
+  it.each([
+    {
+      name: 'agent disable',
+      mutate: () => harness.sqlite.prepare("UPDATE agents SET status = 'paused' WHERE id = ?")
+        .run(AGENTS.workerA),
+    },
+    {
+      name: 'seat transition',
+      mutate: () => harness.sqlite.prepare(`
+        UPDATE runtime_seats SET state = 'revoked', revoked_at = ?, updated_at = ? WHERE id = ?
+      `).run(SERVER_TIME, SERVER_TIME, 'seat-worker-a'),
+    },
+    {
+      name: 'gate revoke',
+      mutate: () => harness.sqlite.prepare(
+        "DELETE FROM gate_grants WHERE id = 'gate-grant-independent'",
+      ).run(),
+    },
+    {
+      name: 'flight state change',
+      mutate: () => harness.sqlite.prepare("UPDATE flights SET status = 'landed' WHERE id = ?")
+        .run(FLIGHT_ID),
+    },
+  ])('rolls back the whole prepared batch on an in-batch $name', async ({ mutate }) => {
+    const objectiveId = await acceptedObjective()
+    const before = {
+      receipts: count('execution_receipts'),
+      audits: count('mutation_audit_entries'),
+    }
+    const racedEnv = envWithBeforeBatch(mutate)
+
+    await expect(materializeComposition(racedEnv, auth(), materializeInput(objectiveId)))
+      .rejects.toMatchObject({ code: 'materialization_conflict' })
+    expectNoMaterialization(before)
+  })
+
   it('keeps receipts, objective link, tasks, lanes, assignments and audits atomic on a task insert failure', async () => {
     const objectiveId = await acceptedObjective()
     const before = {
@@ -313,7 +401,7 @@ describe('Flight Spine composition materialization', () => {
     `)
 
     await expect(materializeComposition(env, auth(), materializeInput(objectiveId)))
-      .rejects.toThrow(/forced worker task failure/)
+      .rejects.toMatchObject({ code: 'materialization_conflict' })
 
     expect(count('flight_objectives')).toBe(0)
     expect(count('flight_lanes')).toBe(0)

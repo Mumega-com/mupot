@@ -93,6 +93,7 @@ export interface FlightSpinePrincipal {
   readonly kind: 'member' | 'agent'
   readonly id: string
   readonly memberId: string
+  readonly authorityMemberId: string
   readonly agentId: string | null
   readonly agentBudgetCapCents: number | null
 }
@@ -181,8 +182,19 @@ export async function resolveFlightSpinePrincipal(
   if (!member) throw new ObjectiveError('invalid_actor')
 
   const boundAgentId = auth.boundAgentId?.trim() || null
+  const authorityMemberId = auth.consentedByMemberId?.trim() || memberId
+  if (authorityMemberId !== memberId) {
+    const authorityMember = await env.DB.prepare(`
+      SELECT id FROM members
+       WHERE id = ?1 AND tenant = ?2 AND status = 'active'
+    `).bind(authorityMemberId, env.TENANT_SLUG).first<{ id: string }>()
+    if (!authorityMember) throw new ObjectiveError('invalid_actor')
+  }
   if (boundAgentId === null) {
-    return { kind: 'member', id: memberId, memberId, agentId: null, agentBudgetCapCents: null }
+    return {
+      kind: 'member', id: memberId, memberId, authorityMemberId,
+      agentId: null, agentBudgetCapCents: null,
+    }
   }
   const agent = await env.DB.prepare(`
     SELECT a.id, a.budget_cap_cents
@@ -199,6 +211,7 @@ export async function resolveFlightSpinePrincipal(
     kind: 'agent',
     id: agent.id,
     memberId,
+    authorityMemberId,
     agentId: agent.id,
     agentBudgetCapCents: agent.budget_cap_cents,
   }
@@ -219,7 +232,10 @@ export async function requireFlightSpineSquadAuthority(
 
   const legacyAdmin = auth.capabilities === undefined
     && (auth.role === 'owner' || auth.role === 'admin')
-  const grants = await resolveCapabilities(env, principal.memberId)
+  // A defined capability view is the auth layer's effective ambient authority.
+  // In particular, [] is the directory ceiling and a narrowed array can be a
+  // consent clamp; rereading wider DB grants here would undo both controls.
+  const grants = auth.capabilities ?? (await resolveCapabilities(env, principal.authorityMemberId))
   if (!legacyAdmin && !hasCapability(
     grants,
     'squad',
@@ -241,8 +257,10 @@ export async function requireFlightSpineSquadAuthority(
       scope_type: 'squad',
       scope_id: squad.id,
       capability: membership.capability,
-    }], 'squad', squad.id, 'member')) {
-      throw new ObjectiveError('objective_forbidden')
+    }], 'squad', squad.id, minimum)) {
+      throw new ObjectiveError(minimum === 'lead'
+        ? 'objective_budget_forbidden'
+        : 'objective_forbidden')
     }
   }
   return squad
@@ -453,7 +471,80 @@ export async function acceptObjective(
       created_by_member_id, squad_id, project_id, title, success_contract,
       authority_envelope, policy_json, budget_micro_usd, payload_json,
       payload_digest, accepted_at, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+     WHERE EXISTS (
+       SELECT 1 FROM members member
+        WHERE member.id = ? AND member.tenant = ? AND member.status = 'active'
+     )
+       AND EXISTS (
+         SELECT 1 FROM members authority_member
+          WHERE authority_member.id = ? AND authority_member.tenant = ?
+            AND authority_member.status = 'active'
+       )
+       AND EXISTS (
+         SELECT 1 FROM squads squad
+          WHERE squad.id = ?
+            AND (? = 0 OR squad.budget_cap_cents IS NULL
+              OR squad.budget_cap_cents <= 0
+              OR ? <= squad.budget_cap_cents * 10000)
+       )
+       AND (
+         ? = 1
+         OR EXISTS (
+           SELECT 1
+             FROM capabilities capability
+             JOIN squads squad ON squad.id = ?
+            WHERE capability.member_id = ?
+              AND (
+                capability.scope_type = 'org'
+                OR (capability.scope_type = 'department'
+                  AND capability.scope_id = squad.department_id)
+                OR (capability.scope_type = 'squad'
+                  AND capability.scope_id = squad.id)
+              )
+              AND CASE capability.capability
+                WHEN 'owner' THEN 5 WHEN 'admin' THEN 4 WHEN 'lead' THEN 3
+                WHEN 'member' THEN 2 WHEN 'observer' THEN 1 ELSE 0 END >= ?
+         )
+         OR EXISTS (
+           SELECT 1 FROM channel_capability_grants capability
+            WHERE capability.member_id = ? AND capability.squad_id = ?
+              AND CASE capability.capability
+                WHEN 'owner' THEN 5 WHEN 'admin' THEN 4 WHEN 'lead' THEN 3
+                WHEN 'member' THEN 2 WHEN 'observer' THEN 1 ELSE 0 END >= ?
+         )
+       )
+       AND (
+         ? IS NULL
+         OR EXISTS (
+           SELECT 1
+             FROM projects project
+             JOIN project_squad_access access
+               ON access.project_id = project.id AND access.squad_id = ?
+            WHERE project.id = ? AND project.status <> 'archived'
+              AND access.access_level IN ('write', 'admin')
+         )
+       )
+       AND (
+         ? IS NULL
+         OR EXISTS (
+           SELECT 1
+             FROM agents agent
+             JOIN agent_member_bindings binding
+               ON binding.agent_id = agent.id AND binding.tenant = ?
+                AND binding.member_id = ?
+             JOIN memberships membership
+               ON membership.agent_id = agent.id AND membership.squad_id = ?
+            WHERE agent.id = ? AND agent.status = 'active'
+              AND CASE membership.capability
+                WHEN 'owner' THEN 5 WHEN 'admin' THEN 4 WHEN 'lead' THEN 3
+                WHEN 'member' THEN 2 WHEN 'observer' THEN 1 ELSE 0 END >= ?
+              AND (? = 0 OR agent.budget_cap_cents IS NULL
+                OR agent.budget_cap_cents <= 0
+                OR ? <= agent.budget_cap_cents * 10000)
+         )
+       )`,
     bindings: [
       objectiveId,
       env.TENANT_SLUG,
@@ -471,6 +562,31 @@ export async function acceptObjective(
       input.payloadDigest,
       acceptedAt,
       acceptedAt,
+      principal.memberId,
+      env.TENANT_SLUG,
+      principal.authorityMemberId,
+      env.TENANT_SLUG,
+      input.squadId,
+      input.budgetMicroUsd,
+      input.budgetMicroUsd,
+      auth.capabilities === undefined && (auth.role === 'owner' || auth.role === 'admin') ? 1 : 0,
+      input.squadId,
+      principal.authorityMemberId,
+      minimum === 'lead' ? 3 : 2,
+      principal.authorityMemberId,
+      input.squadId,
+      minimum === 'lead' ? 3 : 2,
+      input.projectId,
+      input.squadId,
+      input.projectId,
+      principal.agentId,
+      env.TENANT_SLUG,
+      principal.memberId,
+      input.squadId,
+      principal.agentId,
+      minimum === 'lead' ? 3 : 2,
+      input.budgetMicroUsd,
+      input.budgetMicroUsd,
     ],
     audit: flightSpineAudit(auth, principal, {
       expectedAuditId: `audit:${objectiveId}:objective`,
@@ -518,7 +634,9 @@ export async function acceptObjective(
   } catch (error) {
     const raced = await objectiveByKey(env, input.idempotencyKey)
     if (raced) return replayObjectiveForPrincipal(raced, input, principal)
-    throw error
+    throw new ObjectiveError('objective_persistence_conflict', {
+      cause: error instanceof Error ? error.message : String(error),
+    })
   }
   const row = await objectiveById(env, objectiveId)
   if (!row) throw new ObjectiveError('objective_persistence_conflict')

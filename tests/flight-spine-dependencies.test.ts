@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { D1Database } from '@cloudflare/workers-types'
 import {
   linkChildFlight,
   recordConsumedChildArtifact,
@@ -76,9 +77,25 @@ function count(table: string): number {
   }).count)
 }
 
+function envWithBeforeBatch(mutate: () => Promise<void> | void): Env {
+  let injected = false
+  return {
+    ...env,
+    DB: {
+      prepare: harness.db.prepare.bind(harness.db),
+      async batch(statements: Parameters<D1Database['batch']>[0]) {
+        if (!injected) {
+          injected = true
+          await mutate()
+        }
+        return harness.db.batch(statements)
+      },
+    } as D1Database,
+  }
+}
+
 async function seedArtifactFacts(dependencyId: string, objectiveId: string): Promise<{
   artifactId: string
-  consumptionReceiptId: string
 }> {
   harness.sqlite.exec(`
     INSERT INTO tasks (
@@ -90,8 +107,19 @@ async function seedArtifactFacts(dependencyId: string, objectiveId: string): Pro
       id, tenant, agent_id, seat_name, host_id, adapter_kind, state,
       current_generation, current_fencing_epoch, capabilities_json, created_at, updated_at
     ) VALUES
-      ('seat-child', '${TENANT}', '${CHILD_AGENT}', 'child', 'host-child', 'test', 'pending', 0, 0, '[]', '${SERVER_TIME}', '${SERVER_TIME}'),
-      ('seat-parent', '${TENANT}', '${PARENT_AGENT}', 'parent', 'host-parent', 'test', 'pending', 0, 0, '[]', '${SERVER_TIME}', '${SERVER_TIME}');
+      ('seat-child', '${TENANT}', '${CHILD_AGENT}', 'child', 'host-child', 'test', 'active', 1, 0, '[]', '${SERVER_TIME}', '${SERVER_TIME}'),
+      ('seat-parent', '${TENANT}', '${PARENT_AGENT}', 'parent', 'host-parent', 'test', 'active', 1, 0, '[]', '${SERVER_TIME}', '${SERVER_TIME}');
+    INSERT INTO runtime_seat_generations (
+      id, tenant, runtime_seat_id, generation, host_id, process_id, process_uid,
+      sandbox_id, executable_digest, public_key, broker_attestation_digest,
+      started_at, created_at
+    ) VALUES
+      ('generation-child', '${TENANT}', 'seat-child', 1, 'host-child', 'pid-child',
+       'uid-child', 'sandbox-child', '${'a'.repeat(64)}', 'public-child',
+       '${'b'.repeat(64)}', '${SERVER_TIME}', '${SERVER_TIME}'),
+      ('generation-parent', '${TENANT}', 'seat-parent', 1, 'host-parent', 'pid-parent',
+       'uid-parent', 'sandbox-parent', '${'c'.repeat(64)}', 'public-parent',
+       '${'d'.repeat(64)}', '${SERVER_TIME}', '${SERVER_TIME}');
     INSERT INTO flight_lanes (
       id, tenant, flight_id, lane_key, role, task_id, assignment_epoch,
       agent_id, runtime_seat_id, done_when, dependency_lane_keys_json, created_at
@@ -137,16 +165,8 @@ async function seedArtifactFacts(dependencyId: string, objectiveId: string): Pro
     storageReceipt.id,
     SERVER_TIME,
   )
-  const consumptionReceipt = await appendExecutionReceipt(env, auth(), {
-    type: 'effect.intent',
-    idempotencyKey: 'child-artifact-consumption-fact',
-    objectiveId,
-    flightId: PARENT_FLIGHT,
-    taskId: 'task-parent',
-    assignmentEpoch: 1,
-    claims: { childArtifactId: artifactId, dependencyId },
-  })
-  return { artifactId, consumptionReceiptId: consumptionReceipt.id }
+  void dependencyId
+  return { artifactId }
 }
 
 beforeEach(() => {
@@ -209,6 +229,25 @@ describe('Flight Spine parent-child dependencies', () => {
       created_by_principal_id: PARENT_AGENT,
       created_by_member_id: MEMBER_ID,
     })
+    expect(harness.sqlite.prepare(`
+      SELECT type, actor_kind, actor_id, objective_id, flight_id, claims_json
+        FROM execution_receipts WHERE type = 'flight.dependency_linked'
+    `).get()).toEqual({
+      type: 'flight.dependency_linked',
+      actor_kind: 'agent',
+      actor_id: PARENT_AGENT,
+      objective_id: objectiveId,
+      flight_id: PARENT_FLIGHT,
+      claims_json: JSON.stringify({
+        childFlightId: CHILD_FLIGHT,
+        dependencyId: linked.id,
+        parentFlightId: PARENT_FLIGHT,
+      }),
+    })
+    expect(harness.sqlite.prepare(`
+      SELECT target_kind, target_id FROM mutation_audit_entries
+       WHERE target_kind = 'flight_dependency'
+    `).get()).toEqual({ target_kind: 'flight_dependency', target_id: linked.id })
 
     expect(await linkChildFlight(env, auth(), {
       objectiveId,
@@ -221,6 +260,10 @@ describe('Flight Spine parent-child dependencies', () => {
       childFlightId: CHILD_FLIGHT,
     })).rejects.toMatchObject({ code: 'unauthorized_tenant' })
     expect(count('flight_dependencies')).toBe(1)
+    expect(harness.sqlite.prepare(`
+      SELECT COUNT(*) AS count FROM execution_receipts
+       WHERE type = 'flight.dependency_linked'
+    `).get()).toEqual({ count: 1 })
   })
 
   it('rejects a child created before objective acceptance and a transitive dependency cycle', async () => {
@@ -255,6 +298,42 @@ describe('Flight Spine parent-child dependencies', () => {
     expect(count('flight_dependencies')).toBe(1)
   })
 
+  it('atomically resolves concurrent opposite links with one dependency and no loser receipt, edge or audit', async () => {
+    const objectiveId = await seedObjectiveAndFlights()
+    harness.sqlite.prepare(`
+      INSERT INTO flight_objectives (
+        id, tenant, flight_id, objective_id, materialization_receipt_id, linked_at
+      ) VALUES ('child-objective-link', ?, ?, ?, NULL, ?)
+    `).run(TENANT, CHILD_FLIGHT, objectiveId, SERVER_TIME)
+    const beforeEdges = count('execution_receipt_edges')
+    const racedEnv = envWithBeforeBatch(async () => {
+      await linkChildFlight(env, auth(), {
+        objectiveId,
+        parentFlightId: CHILD_FLIGHT,
+        childFlightId: PARENT_FLIGHT,
+      })
+    })
+
+    await expect(linkChildFlight(racedEnv, auth(), {
+      objectiveId,
+      parentFlightId: PARENT_FLIGHT,
+      childFlightId: CHILD_FLIGHT,
+    })).rejects.toMatchObject({ code: 'dependency_cycle' })
+
+    expect(harness.sqlite.prepare(`
+      SELECT parent_flight_id, child_flight_id FROM flight_dependencies
+    `).all()).toEqual([{ parent_flight_id: CHILD_FLIGHT, child_flight_id: PARENT_FLIGHT }])
+    expect(harness.sqlite.prepare(`
+      SELECT COUNT(*) AS count FROM execution_receipts
+       WHERE type = 'flight.dependency_linked'
+    `).get()).toEqual({ count: 1 })
+    expect(harness.sqlite.prepare(`
+      SELECT COUNT(*) AS count FROM mutation_audit_entries
+       WHERE target_kind = 'flight_dependency'
+    `).get()).toEqual({ count: 1 })
+    expect(count('execution_receipt_edges') - beforeEdges).toBe(1)
+  })
+
   it('records an explicit child-artifact consumption fact derived from the dependency', async () => {
     const objectiveId = await seedObjectiveAndFlights()
     const dependency = await linkChildFlight(env, auth(), {
@@ -269,7 +348,6 @@ describe('Flight Spine parent-child dependencies', () => {
       artifactId: artifact.artifactId,
       consumingTaskId: 'task-parent',
       consumingAssignmentId: 'assignment-parent',
-      consumptionReceiptId: artifact.consumptionReceiptId,
     })
 
     expect(consumed).toMatchObject({
@@ -279,7 +357,7 @@ describe('Flight Spine parent-child dependencies', () => {
       consumingFlightId: PARENT_FLIGHT,
       consumingTaskId: 'task-parent',
       consumingAssignmentId: 'assignment-parent',
-      consumptionReceiptId: artifact.consumptionReceiptId,
+      consumptionReceiptId: expect.any(String),
     })
     expect(harness.sqlite.prepare(`
       SELECT consuming_flight_id, consuming_task_id, consuming_assignment_id,
@@ -289,16 +367,117 @@ describe('Flight Spine parent-child dependencies', () => {
       consuming_flight_id: PARENT_FLIGHT,
       consuming_task_id: 'task-parent',
       consuming_assignment_id: 'assignment-parent',
-      consumption_receipt_id: artifact.consumptionReceiptId,
+      consumption_receipt_id: consumed.consumptionReceiptId,
+    })
+    expect(harness.sqlite.prepare(`
+      SELECT type, actor_kind, actor_id, seat_id, seat_generation, objective_id,
+             flight_id, task_id, assignment_epoch, claims_json
+        FROM execution_receipts WHERE id = ?
+    `).get(consumed.consumptionReceiptId)).toEqual({
+      type: 'artifact.consumed',
+      actor_kind: 'agent',
+      actor_id: PARENT_AGENT,
+      seat_id: 'seat-parent',
+      seat_generation: 1,
+      objective_id: objectiveId,
+      flight_id: PARENT_FLIGHT,
+      task_id: 'task-parent',
+      assignment_epoch: 1,
+      claims_json: JSON.stringify({ childArtifactId: artifact.artifactId, dependencyId: dependency.id }),
     })
     expect(await recordConsumedChildArtifact(env, auth(), {
       flightDependencyId: dependency.id,
       artifactId: artifact.artifactId,
       consumingTaskId: 'task-parent',
       consumingAssignmentId: 'assignment-parent',
-      consumptionReceiptId: artifact.consumptionReceiptId,
     })).toEqual(consumed)
     expect(count('flight_dependency_artifacts')).toBe(1)
+  })
+
+  it('rechecks the current assignment epoch before replaying an artifact consumption', async () => {
+    const objectiveId = await seedObjectiveAndFlights()
+    const dependency = await linkChildFlight(env, auth(), {
+      objectiveId,
+      parentFlightId: PARENT_FLIGHT,
+      childFlightId: CHILD_FLIGHT,
+    })
+    const artifact = await seedArtifactFacts(dependency.id, objectiveId)
+    const input = {
+      flightDependencyId: dependency.id,
+      artifactId: artifact.artifactId,
+      consumingTaskId: 'task-parent',
+      consumingAssignmentId: 'assignment-parent',
+    }
+    await recordConsumedChildArtifact(env, auth(), input)
+    harness.sqlite.prepare("UPDATE tasks SET assignment_epoch = 2 WHERE id = 'task-parent'").run()
+
+    await expect(recordConsumedChildArtifact(env, auth(), input))
+      .rejects.toMatchObject({ code: 'consumer_scope_mismatch' })
+    expect(harness.sqlite.prepare(`
+      SELECT COUNT(*) AS count FROM execution_receipts WHERE type = 'artifact.consumed'
+    `).get()).toEqual({ count: 1 })
+    expect(count('flight_dependency_artifacts')).toBe(1)
+  })
+
+  it('rolls back a prepared consumption when the assignee changes before the batch', async () => {
+    const objectiveId = await seedObjectiveAndFlights()
+    const dependency = await linkChildFlight(env, auth(), {
+      objectiveId,
+      parentFlightId: PARENT_FLIGHT,
+      childFlightId: CHILD_FLIGHT,
+    })
+    const artifact = await seedArtifactFacts(dependency.id, objectiveId)
+    const racedEnv = envWithBeforeBatch(() => {
+      harness.sqlite.prepare("UPDATE tasks SET assignee_agent_id = ? WHERE id = 'task-parent'")
+        .run(CHILD_AGENT)
+    })
+
+    await expect(recordConsumedChildArtifact(racedEnv, auth(), {
+      flightDependencyId: dependency.id,
+      artifactId: artifact.artifactId,
+      consumingTaskId: 'task-parent',
+      consumingAssignmentId: 'assignment-parent',
+    })).rejects.toMatchObject({ code: 'consumer_scope_mismatch' })
+    expect(count('flight_dependency_artifacts')).toBe(0)
+    expect(harness.sqlite.prepare(`
+      SELECT COUNT(*) AS count FROM execution_receipts WHERE type = 'artifact.consumed'
+    `).get()).toEqual({ count: 0 })
+    expect(harness.sqlite.prepare(`
+      SELECT COUNT(*) AS count FROM mutation_audit_entries
+       WHERE target_kind = 'flight_dependency_artifact'
+    `).get()).toEqual({ count: 0 })
+  })
+
+  it('rolls back the server receipt and audit when the consumption domain insert fails', async () => {
+    const objectiveId = await seedObjectiveAndFlights()
+    const dependency = await linkChildFlight(env, auth(), {
+      objectiveId,
+      parentFlightId: PARENT_FLIGHT,
+      childFlightId: CHILD_FLIGHT,
+    })
+    const artifact = await seedArtifactFacts(dependency.id, objectiveId)
+    harness.sqlite.exec(`
+      CREATE TRIGGER force_consumption_failure
+      BEFORE INSERT ON flight_dependency_artifacts
+      BEGIN
+        SELECT RAISE(ABORT, 'forced consumption failure');
+      END;
+    `)
+
+    await expect(recordConsumedChildArtifact(env, auth(), {
+      flightDependencyId: dependency.id,
+      artifactId: artifact.artifactId,
+      consumingTaskId: 'task-parent',
+      consumingAssignmentId: 'assignment-parent',
+    })).rejects.toMatchObject({ code: 'consumption_conflict' })
+    expect(count('flight_dependency_artifacts')).toBe(0)
+    expect(harness.sqlite.prepare(`
+      SELECT COUNT(*) AS count FROM execution_receipts WHERE type = 'artifact.consumed'
+    `).get()).toEqual({ count: 0 })
+    expect(harness.sqlite.prepare(`
+      SELECT COUNT(*) AS count FROM mutation_audit_entries
+       WHERE target_kind = 'flight_dependency_artifact'
+    `).get()).toEqual({ count: 0 })
   })
 
   it('rejects artifacts outside the linked child and task or assignment facts outside the parent', async () => {
@@ -315,7 +494,6 @@ describe('Flight Spine parent-child dependencies', () => {
       artifactId: artifact.artifactId,
       consumingTaskId: 'task-child',
       consumingAssignmentId: 'assignment-child',
-      consumptionReceiptId: artifact.consumptionReceiptId,
     })).rejects.toMatchObject({ code: 'consumer_scope_mismatch' })
 
     const unrelatedReceipt = await appendExecutionReceipt(env, auth(), {
@@ -333,7 +511,36 @@ describe('Flight Spine parent-child dependencies', () => {
       consumingTaskId: 'task-parent',
       consumingAssignmentId: 'assignment-parent',
       consumptionReceiptId: unrelatedReceipt.id,
-    })).rejects.toMatchObject({ code: 'consumption_receipt_mismatch' })
+    } as never)).rejects.toMatchObject({ code: 'invalid_dependency' })
+
+    await expect(recordConsumedChildArtifact(env, auth(), {
+      flightDependencyId: dependency.id,
+      artifactId: artifact.artifactId,
+      consumingTaskId: 'task-parent',
+      consumingAssignmentId: 'assignment-parent',
+      objectiveId: 'objective-forged',
+    } as never)).rejects.toMatchObject({ code: 'invalid_dependency' })
+
+    await expect(recordConsumedChildArtifact(env, auth({ boundAgentId: CHILD_AGENT }), {
+      flightDependencyId: dependency.id,
+      artifactId: artifact.artifactId,
+      consumingTaskId: 'task-parent',
+      consumingAssignmentId: 'assignment-parent',
+    })).rejects.toMatchObject({ code: 'invalid_actor' })
+
+    harness.sqlite.prepare(`
+      UPDATE runtime_seats SET state = 'revoked', revoked_at = ?, updated_at = ?
+       WHERE id = 'seat-parent'
+    `).run(SERVER_TIME, SERVER_TIME)
+    await expect(recordConsumedChildArtifact(env, auth(), {
+      flightDependencyId: dependency.id,
+      artifactId: artifact.artifactId,
+      consumingTaskId: 'task-parent',
+      consumingAssignmentId: 'assignment-parent',
+    })).rejects.toMatchObject({ code: 'consumer_scope_mismatch' })
+    harness.sqlite.prepare(`
+      UPDATE runtime_seats SET state = 'active', updated_at = ? WHERE id = 'seat-parent'
+    `).run(SERVER_TIME)
 
     // Artifact rows are immutable; seed a mismatched fact by temporarily dropping only the
     // schema trigger in this negative fixture, never in production code.
@@ -345,7 +552,6 @@ describe('Flight Spine parent-child dependencies', () => {
       artifactId: artifact.artifactId,
       consumingTaskId: 'task-parent',
       consumingAssignmentId: 'assignment-parent',
-      consumptionReceiptId: artifact.consumptionReceiptId,
     })).rejects.toMatchObject({ code: 'artifact_not_from_child' })
     expect(count('flight_dependency_artifacts')).toBe(0)
   })
