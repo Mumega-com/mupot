@@ -306,6 +306,19 @@ function envWithAfterBatch(mutate: () => Promise<void> | void): Env {
   }
 }
 
+function envWithAfterBatchError(error: Error): Env {
+  return {
+    ...env,
+    DB: {
+      prepare: harness.db.prepare.bind(harness.db),
+      async batch(statements: Parameters<D1Database['batch']>[0]) {
+        await harness.db.batch(statements)
+        throw error
+      },
+    } as D1Database,
+  }
+}
+
 function envWithBatchError(error: Error): Env {
   return {
     ...env,
@@ -711,7 +724,7 @@ describe('Flight Spine artifact metadata facts', () => {
     })
 
     await expect(recordArtifactMetadata(racedEnv, producerAuth(), input))
-      .rejects.toMatchObject({ code: 'producer_scope_mismatch' })
+      .rejects.toThrow(/check constraint/i)
     expect(count('artifacts')).toBe(0)
     expect(count('mutation_audit_entries', "WHERE target_kind = 'artifact'")).toBe(0)
   })
@@ -746,7 +759,7 @@ describe('Flight Spine artifact metadata facts', () => {
     expect(count('mutation_audit_entries', "WHERE target_kind = 'artifact'")).toBe(0)
   })
 
-  it('replays only byte-identical request identity and resolves an exact concurrent winner', async () => {
+  it('replays only byte-identical identity and requires retry after an artifact race', async () => {
     const input = metadataInput()
     await insertStorageReceipt(input)
     const first = await recordArtifactMetadata(env, producerAuth(), input)
@@ -764,12 +777,16 @@ describe('Flight Spine artifact metadata facts', () => {
       objectKey: `sha256/bb/${'b'.repeat(64)}`,
     })
     await insertStorageReceipt(racedInput)
+    let winner: Awaited<ReturnType<typeof recordArtifactMetadata>> | null = null
     const racedEnv = envWithBeforeBatch(async () => {
-      await recordArtifactMetadata(env, producerAuth(), racedInput)
+      winner = await recordArtifactMetadata(env, producerAuth(), racedInput)
     })
-    const raced = await recordArtifactMetadata(racedEnv, producerAuth(), racedInput)
 
-    expect(raced.id).toBe(racedInput.artifactId)
+    await expect(recordArtifactMetadata(racedEnv, producerAuth(), racedInput))
+      .rejects.toThrow(/unique constraint/i)
+    expect(winner).not.toBeNull()
+    const retried = await recordArtifactMetadata(env, producerAuth(), racedInput)
+    expect(retried).toEqual(winner)
     expect(count('artifacts')).toBe(2)
     expect(count('mutation_audit_entries', "WHERE target_kind = 'artifact'")).toBe(2)
   })
@@ -795,6 +812,24 @@ describe('Flight Spine artifact metadata facts', () => {
       .rejects.toMatchObject({ name: 'ExecutionReceiptError', code: 'integrity_failure' })
     expect(count('artifacts')).toBe(1)
     expect(count('mutation_audit_entries', "WHERE target_kind = 'artifact'")).toBe(0)
+  })
+
+  it('rejects a postcommit artifact error that mimics a D1 UNIQUE conflict', async () => {
+    const input = metadataInput()
+    await insertStorageReceipt(input)
+    const failure = new Error(
+      'D1_ERROR: UNIQUE constraint failed: artifacts.tenant, artifacts.object_key',
+    )
+
+    await expect(recordArtifactMetadata(
+      envWithAfterBatchError(failure),
+      producerAuth(),
+      input,
+    )).rejects.toBe(failure)
+    expect(count('artifacts')).toBe(1)
+    expect(count('mutation_audit_entries', "WHERE target_kind = 'artifact'")).toBe(1)
+    expect(await recordArtifactMetadata(env, producerAuth(), input))
+      .toMatchObject({ id: input.artifactId })
   })
 
   it('preserves a non-conflict projection executor error', async () => {
@@ -924,7 +959,7 @@ describe('Flight Spine artifact retrieval and child consumption facts', () => {
     })
 
     await expect(recordArtifactRetrieval(racedEnv, verifierAuth(), input))
-      .rejects.toMatchObject({ code: 'verifier_scope_mismatch' })
+      .rejects.toThrow(/check constraint/i)
     expect(count('artifact_retrieval_receipts')).toBe(0)
     expect(count(
       'mutation_audit_entries',
@@ -946,7 +981,7 @@ describe('Flight Spine artifact retrieval and child consumption facts', () => {
     expect(count('artifact_retrieval_receipts')).toBe(1)
   })
 
-  it('returns an exact concurrent retrieval winner only with its deterministic audit', async () => {
+  it('requires retry after a retrieval race and then returns the audited winner', async () => {
     await recordDefaultArtifact()
     const input = retrievalInput()
     await insertRetrievalReceipt(input)
@@ -955,17 +990,19 @@ describe('Flight Spine artifact retrieval and child consumption facts', () => {
       winner = await recordArtifactRetrieval(env, verifierAuth(), input)
     })
 
-    const recovered = await recordArtifactRetrieval(racedEnv, verifierAuth(), input)
-
-    expect(recovered).toEqual(winner)
+    await expect(recordArtifactRetrieval(racedEnv, verifierAuth(), input))
+      .rejects.toThrow(/unique constraint/i)
+    expect(winner).not.toBeNull()
+    const retried = await recordArtifactRetrieval(env, verifierAuth(), input)
+    expect(retried).toEqual(winner)
     expect(count('artifact_retrieval_receipts')).toBe(1)
     expect(harness.sqlite.prepare(`
       SELECT target_id FROM mutation_audit_entries
        WHERE target_kind = 'artifact_retrieval_receipt'
-    `).get()).toEqual({ target_id: recovered.id })
+    `).get()).toEqual({ target_id: retried.id })
   })
 
-  it('rejects a concurrent retrieval winner whose deterministic audit is missing', async () => {
+  it('rejects retry after a retrieval race whose deterministic audit is missing', async () => {
     await recordDefaultArtifact()
     const input = retrievalInput({ retrievalReceiptId: 'receipt-retrieval-raced-no-audit' })
     await insertRetrievalReceipt(input)
@@ -978,6 +1015,8 @@ describe('Flight Spine artifact retrieval and child consumption facts', () => {
     })
 
     await expect(recordArtifactRetrieval(racedEnv, verifierAuth(), input))
+      .rejects.toThrow(/unique constraint/i)
+    await expect(recordArtifactRetrieval(env, verifierAuth(), input))
       .rejects.toMatchObject({ code: 'retrieval_audit_invalid' })
     expect(count('artifact_retrieval_receipts')).toBe(1)
   })
@@ -1011,6 +1050,29 @@ describe('Flight Spine artifact retrieval and child consumption facts', () => {
       'mutation_audit_entries',
       "WHERE target_kind = 'artifact_retrieval_receipt'",
     )).toBe(0)
+  })
+
+  it('rejects a postcommit retrieval error that mimics a D1 UNIQUE conflict', async () => {
+    await recordDefaultArtifact()
+    const input = retrievalInput()
+    await insertRetrievalReceipt(input)
+    const failure = new Error(
+      'D1_ERROR: UNIQUE constraint failed: artifact_retrieval_receipts.tenant, '
+      + 'artifact_retrieval_receipts.retrieval_receipt_id',
+    )
+
+    await expect(recordArtifactRetrieval(
+      envWithAfterBatchError(failure),
+      verifierAuth(),
+      input,
+    )).rejects.toBe(failure)
+    expect(count('artifact_retrieval_receipts')).toBe(1)
+    expect(count(
+      'mutation_audit_entries',
+      "WHERE target_kind = 'artifact_retrieval_receipt'",
+    )).toBe(1)
+    expect(await recordArtifactRetrieval(env, verifierAuth(), input))
+      .toMatchObject({ retrievalReceiptId: input.retrievalReceiptId })
   })
 
   it('records explicit consumption of the exact linked child artifact without completing a task', async () => {

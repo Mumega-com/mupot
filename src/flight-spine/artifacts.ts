@@ -7,7 +7,7 @@ import {
   verifyExecutionReceipt,
   type AtomicDomainAuditMetadata,
 } from './receipts'
-import { ExecutionReceiptError, type ExecutionReceipt } from './types'
+import type { ExecutionReceipt } from './types'
 import {
   flightSpineAudit,
   requireFlightSpineSquadAuthority,
@@ -483,12 +483,6 @@ async function requireProjectionAudit(
   }
 }
 
-function isProjectionConstraintConflict(error: unknown): boolean {
-  if (error instanceof ExecutionReceiptError) return false
-  const message = error instanceof Error ? error.message : String(error)
-  return /constraint failed|constraint violation/i.test(message)
-}
-
 async function requireReceipt(
   env: Env,
   id: string,
@@ -873,38 +867,7 @@ export async function recordArtifactMetadata(
     audit,
   })
 
-  try {
-    await executeAuditedProjectionMutations(env, [mutation])
-  } catch (error) {
-    if (!isProjectionConstraintConflict(error)) throw error
-    requireRetentionHorizon(input.retentionUntil)
-    const currentReceipt = await requireReceipt(env, input.storageReceiptId, 'artifact.stored')
-    const currentPrincipal = await resolveFlightSpinePrincipal(env, auth)
-    const currentContext = await requireProducerContext(
-      env,
-      auth,
-      currentPrincipal,
-      input,
-      currentReceipt,
-    )
-    const currentAudit = await artifactAuditMetadata(
-      env,
-      auth,
-      currentPrincipal,
-      input,
-      currentContext,
-      currentReceipt,
-    )
-    const raced = await replayArtifactOrConflict(
-      env,
-      input,
-      currentContext,
-      currentReceipt.serverTimestamp,
-      currentAudit,
-    )
-    if (raced) return raced
-    throw error
-  }
+  await executeAuditedProjectionMutations(env, [mutation])
   const persisted = await replayArtifactOrConflict(
     env,
     input,
@@ -1274,33 +1237,7 @@ export async function recordArtifactRetrieval(
     audit,
   })
 
-  try {
-    await executeAuditedProjectionMutations(env, [mutation])
-  } catch (error) {
-    if (!isProjectionConstraintConflict(error)) throw error
-    const currentArtifact = await artifactById(env, input.artifactId)
-    if (!currentArtifact) throw new ArtifactError('artifact_not_found')
-    const currentReceipt = await requireReceipt(env, input.retrievalReceiptId, 'artifact.retrieved')
-    const currentPrincipal = await resolveFlightSpinePrincipal(env, auth)
-    const currentContext = await requireVerifierContext(
-      env,
-      auth,
-      currentPrincipal,
-      currentArtifact,
-      input,
-      currentReceipt,
-    )
-    const raced = await replayRetrievalOrConflict(
-      env,
-      auth,
-      currentPrincipal,
-      input,
-      currentContext,
-      currentReceipt,
-    )
-    if (raced) return raced
-    throw error
-  }
+  await executeAuditedProjectionMutations(env, [mutation])
   const persisted = await replayRetrievalOrConflict(
     env,
     auth,
