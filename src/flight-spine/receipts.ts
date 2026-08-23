@@ -32,6 +32,25 @@ const MUPOT_RECEIPT_TYPES = new Set<ExecutionReceiptType>([
   'decision.resolved',
 ])
 
+const ATOMIC_AUDIT_PRINCIPAL_KINDS = new Set<AtomicDomainAuditPrincipalKind>([
+  'member',
+  'agent',
+  'system',
+  'controller',
+  'admin',
+  'migration',
+  'fault_injector',
+])
+const ATOMIC_AUDIT_ORIGINS = new Set<AtomicDomainAuditOrigin>([
+  'mcp',
+  'rest',
+  'worker_callback',
+  'scheduled_job',
+  'controller',
+  'admin_ui',
+  'migration',
+])
+
 type ReceiptDb = Pick<D1Database, 'prepare' | 'batch'>
 
 interface ReceiptActor {
@@ -107,6 +126,48 @@ export interface PreparedAtomicDomainMutation {
   readonly expectedAuditId: string
 }
 
+export type AtomicDomainAuditPrincipalKind =
+  | 'member'
+  | 'agent'
+  | 'system'
+  | 'controller'
+  | 'admin'
+  | 'migration'
+  | 'fault_injector'
+
+export type AtomicDomainAuditOrigin =
+  | 'mcp'
+  | 'rest'
+  | 'worker_callback'
+  | 'scheduled_job'
+  | 'controller'
+  | 'admin_ui'
+  | 'migration'
+
+export interface AtomicDomainAuditMetadata {
+  readonly expectedAuditId: string
+  readonly principalKind: AtomicDomainAuditPrincipalKind
+  readonly principalId: string
+  readonly memberId?: string | null
+  readonly agentId?: string | null
+  readonly credentialId?: string | null
+  readonly runtimeSeatId?: string | null
+  readonly runtimeGeneration?: number | null
+  readonly origin: AtomicDomainAuditOrigin
+  readonly handler: string
+  readonly operation: string
+  readonly targetKind: string
+  readonly targetId: string
+  readonly beforeDigest?: string | null
+  readonly afterDigest?: string | null
+  readonly objectiveId?: string | null
+  readonly flightId?: string | null
+  readonly taskId?: string | null
+  readonly requestId: string
+  readonly idempotencyKey?: string | null
+  readonly evidence: JsonValue
+}
+
 interface PreparedExecutionReceiptCommit {
   readonly finalSequence: number
   readonly finalReceiptId: string
@@ -120,7 +181,32 @@ interface PreparedExecutionReceiptPieces {
 
 interface PreparedAtomicDomainMutationPieces {
   readonly mutationStatement: D1PreparedStatement
-  readonly guardStatement: D1PreparedStatement
+  readonly audit: NormalizedAtomicDomainAuditMetadata
+}
+
+interface NormalizedAtomicDomainAuditMetadata {
+  readonly expectedAuditId: string
+  readonly principalKind: AtomicDomainAuditPrincipalKind
+  readonly principalId: string
+  readonly memberId: string | null
+  readonly agentId: string | null
+  readonly credentialId: string | null
+  readonly runtimeSeatId: string | null
+  readonly runtimeGeneration: number | null
+  readonly origin: AtomicDomainAuditOrigin
+  readonly handler: string
+  readonly operation: string
+  readonly targetKind: string
+  readonly targetId: string
+  readonly beforeDigest: string | null
+  readonly afterDigest: string | null
+  readonly objectiveId: string | null
+  readonly flightId: string | null
+  readonly taskId: string | null
+  readonly requestId: string
+  readonly idempotencyKey: string | null
+  readonly evidenceJson: string
+  readonly recordedAt: string
 }
 
 const PREPARED_RECEIPT_PIECES = new WeakMap<
@@ -160,6 +246,64 @@ function optionalInteger(
     throw new ExecutionReceiptError('invalid_draft')
   }
   return value
+}
+
+function boundedRequiredText(value: string, maximum: number): string {
+  if (typeof value !== 'string') throw new ExecutionReceiptError('invalid_draft')
+  const normalized = value.trim()
+  if (normalized.length === 0 || normalized.length > maximum) {
+    throw new ExecutionReceiptError('invalid_draft')
+  }
+  return normalized
+}
+
+function optionalSha256(value: string | null | undefined): string | null {
+  const normalized = optionalId(value)
+  if (normalized !== null && !/^[0-9a-f]{64}$/.test(normalized)) {
+    throw new ExecutionReceiptError('invalid_draft')
+  }
+  return normalized
+}
+
+function normalizeAtomicDomainAuditMetadata(
+  input: AtomicDomainAuditMetadata,
+): NormalizedAtomicDomainAuditMetadata {
+  if (
+    !ATOMIC_AUDIT_PRINCIPAL_KINDS.has(input.principalKind)
+    || !ATOMIC_AUDIT_ORIGINS.has(input.origin)
+  ) {
+    throw new ExecutionReceiptError('invalid_draft')
+  }
+  let evidenceJson: string
+  try {
+    evidenceJson = canonicalJson(input.evidence)
+  } catch {
+    throw new ExecutionReceiptError('invalid_draft')
+  }
+  return Object.freeze({
+    expectedAuditId: boundedRequiredText(input.expectedAuditId, 255),
+    principalKind: input.principalKind,
+    principalId: boundedRequiredText(input.principalId, 255),
+    memberId: optionalId(input.memberId),
+    agentId: optionalId(input.agentId),
+    credentialId: optionalId(input.credentialId),
+    runtimeSeatId: optionalId(input.runtimeSeatId),
+    runtimeGeneration: optionalInteger(input.runtimeGeneration, 1),
+    origin: input.origin,
+    handler: boundedRequiredText(input.handler, 255),
+    operation: boundedRequiredText(input.operation, 255),
+    targetKind: boundedRequiredText(input.targetKind, 120),
+    targetId: boundedRequiredText(input.targetId, 2000),
+    beforeDigest: optionalSha256(input.beforeDigest),
+    afterDigest: optionalSha256(input.afterDigest),
+    objectiveId: optionalId(input.objectiveId),
+    flightId: optionalId(input.flightId),
+    taskId: optionalId(input.taskId),
+    requestId: boundedRequiredText(input.requestId, 2000),
+    idempotencyKey: optionalId(input.idempotencyKey),
+    evidenceJson,
+    recordedAt: new Date().toISOString(),
+  })
 }
 
 function normalizeDraft(draft: ExecutionReceiptDraft): NormalizedDraft {
@@ -347,6 +491,52 @@ function prepareFinalHeadCas(
   `).bind(tenant, finalReceipt.id, expectedStartingHeadId)
 }
 
+function prepareAtomicDomainAuditGuard(
+  db: ReceiptDb,
+  tenant: string,
+  audit: NormalizedAtomicDomainAuditMetadata,
+): D1PreparedStatement {
+  return db.prepare(`
+    INSERT INTO mutation_audit_entries (
+      id, tenant, principal_kind, principal_id, member_id, agent_id,
+      credential_id, runtime_seat_id, runtime_generation, origin, handler,
+      operation, target_kind, target_id, before_digest, after_digest,
+      objective_id, flight_id, task_id, request_id, idempotency_key,
+      evidence_json, recorded_at
+    ) VALUES (
+      ?1, ?2,
+      CASE WHEN changes() = 1 THEN ?3 ELSE 'invalid_atomic_change_count' END,
+      ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+      ?17, ?18, ?19, ?20, ?21, ?22, ?23
+    )
+    RETURNING id, tenant
+  `).bind(
+    audit.expectedAuditId,
+    tenant,
+    audit.principalKind,
+    audit.principalId,
+    audit.memberId,
+    audit.agentId,
+    audit.credentialId,
+    audit.runtimeSeatId,
+    audit.runtimeGeneration,
+    audit.origin,
+    audit.handler,
+    audit.operation,
+    audit.targetKind,
+    audit.targetId,
+    audit.beforeDigest,
+    audit.afterDigest,
+    audit.objectiveId,
+    audit.flightId,
+    audit.taskId,
+    audit.requestId,
+    audit.idempotencyKey,
+    audit.evidenceJson,
+    audit.recordedAt,
+  )
+}
+
 /**
  * Prepare a fresh-only receipt chain for composition with domain statements.
  * Existing or repeated idempotency keys are conflicts; replay remains an
@@ -465,24 +655,19 @@ export async function prepareFreshExecutionReceiptChain(
 }
 
 /**
- * Opaque pairing for one strict domain INSERT and its in-transaction audit
- * guard. The guard must RETURNING id, tenant and must violate a schema CHECK
- * when the expected domain state does not exist.
+ * Opaque pairing for one strict one-row domain statement and bounded audit
+ * metadata. The executor alone generates the adjacent changes()-based guard.
  */
 export function prepareAuditedDomainMutation(
   mutationStatement: D1PreparedStatement,
-  guardStatement: D1PreparedStatement,
-  expectedAuditId: string,
+  auditMetadata: AtomicDomainAuditMetadata,
 ): PreparedAtomicDomainMutation {
-  const normalizedAuditId = expectedAuditId.trim()
-  if (normalizedAuditId === '') {
-    throw new ExecutionReceiptError('invalid_draft')
-  }
+  const audit = normalizeAtomicDomainAuditMetadata(auditMetadata)
   const handle: PreparedAtomicDomainMutation = Object.freeze({
     [PREPARED_ATOMIC_DOMAIN_MUTATION]: true as const,
-    expectedAuditId: normalizedAuditId,
+    expectedAuditId: audit.expectedAuditId,
   })
-  PREPARED_DOMAIN_PIECES.set(handle, { mutationStatement, guardStatement })
+  PREPARED_DOMAIN_PIECES.set(handle, { mutationStatement, audit })
   return handle
 }
 
@@ -769,7 +954,10 @@ async function executePreparedExecutionReceiptBatchInternal(
 
   const statements: D1PreparedStatement[] = [...receiptPieces.receiptAndEdgeStatements]
   for (const domain of resolvedDomains) {
-    statements.push(domain.pieces.mutationStatement, domain.pieces.guardStatement)
+    statements.push(
+      domain.pieces.mutationStatement,
+      prepareAtomicDomainAuditGuard(env.DB, prepared.tenant, domain.pieces.audit),
+    )
   }
   statements.push(receiptPieces.finalHeadStatement)
 
@@ -784,18 +972,41 @@ async function executePreparedExecutionReceiptBatchInternal(
   const readDb = primaryDb(env)
   for (const domain of resolvedDomains) {
     const auditRow = await readDb.prepare(`
-      SELECT id, tenant
+      SELECT id, tenant, principal_kind, principal_id, member_id, agent_id,
+             credential_id, runtime_seat_id, runtime_generation, origin,
+             handler, operation, target_kind, target_id, before_digest,
+             after_digest, objective_id, flight_id, task_id, request_id,
+             idempotency_key, evidence_json, recorded_at
         FROM mutation_audit_entries
        WHERE tenant = ?1 AND id = ?2
-    `).bind(prepared.tenant, domain.handle.expectedAuditId).first<{
-      id: string
-      tenant: string
-    }>()
-    if (
-      auditRow === null
-      || auditRow.id !== domain.handle.expectedAuditId
-      || auditRow.tenant !== prepared.tenant
-    ) {
+    `).bind(prepared.tenant, domain.handle.expectedAuditId)
+      .first<Record<string, JsonValue>>()
+    const expectedAuditRow: Record<string, JsonValue> = {
+      id: domain.pieces.audit.expectedAuditId,
+      tenant: prepared.tenant,
+      principal_kind: domain.pieces.audit.principalKind,
+      principal_id: domain.pieces.audit.principalId,
+      member_id: domain.pieces.audit.memberId,
+      agent_id: domain.pieces.audit.agentId,
+      credential_id: domain.pieces.audit.credentialId,
+      runtime_seat_id: domain.pieces.audit.runtimeSeatId,
+      runtime_generation: domain.pieces.audit.runtimeGeneration,
+      origin: domain.pieces.audit.origin,
+      handler: domain.pieces.audit.handler,
+      operation: domain.pieces.audit.operation,
+      target_kind: domain.pieces.audit.targetKind,
+      target_id: domain.pieces.audit.targetId,
+      before_digest: domain.pieces.audit.beforeDigest,
+      after_digest: domain.pieces.audit.afterDigest,
+      objective_id: domain.pieces.audit.objectiveId,
+      flight_id: domain.pieces.audit.flightId,
+      task_id: domain.pieces.audit.taskId,
+      request_id: domain.pieces.audit.requestId,
+      idempotency_key: domain.pieces.audit.idempotencyKey,
+      evidence_json: domain.pieces.audit.evidenceJson,
+      recorded_at: domain.pieces.audit.recordedAt,
+    }
+    if (auditRow === null || canonicalJson(auditRow) !== canonicalJson(expectedAuditRow)) {
       throw new ExecutionReceiptError('integrity_failure')
     }
   }
@@ -803,9 +1014,9 @@ async function executePreparedExecutionReceiptBatchInternal(
 }
 
 /**
- * Execute one opaque receipt chain with one or more audited domain INSERTs.
- * Task-specific builders must use strict INSERTs and a state-existence audit
- * guard whose invalid path violates mutation_audit_entries CHECK constraints.
+ * Execute one opaque receipt chain with one or more audited domain statements.
+ * Task-specific builders supply strict one-row statements plus bounded audit
+ * metadata; the executor owns the adjacent changes()-based CHECK guard.
  */
 export function executePreparedExecutionReceiptBatch(
   env: Env,

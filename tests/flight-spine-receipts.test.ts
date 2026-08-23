@@ -63,37 +63,21 @@ function allowTestOnlyReceiptCorruption(): void {
 function auditedDepartmentMutation(input: {
   auditId: string
   mutationSql: string
-  expectedId: string
-  expectedSlug: string
-  expectedName: string
+  targetId: string
 }) {
   const mutationStatement = env.DB.prepare(input.mutationSql)
-  const guardStatement = env.DB.prepare(`
-    INSERT INTO mutation_audit_entries (
-      id, tenant, principal_kind, principal_id, origin, handler, operation,
-      target_kind, target_id, request_id, evidence_json, recorded_at
-    ) VALUES (
-      ?1, ?2,
-      CASE WHEN EXISTS (
-        SELECT 1 FROM departments WHERE id = ?3 AND slug = ?4 AND name = ?5
-      ) THEN 'member' ELSE 'invalid_guard_principal' END,
-      'member-1', 'rest', 'flight_spine_test', 'upsert',
-      'department', ?3, ?1, '{}', ?6
-    )
-    RETURNING id, tenant
-  `).bind(
-    input.auditId,
-    TENANT,
-    input.expectedId,
-    input.expectedSlug,
-    input.expectedName,
-    SERVER_TIME,
-  )
-  return prepareAuditedDomainMutation(
-    mutationStatement,
-    guardStatement,
-    input.auditId,
-  )
+  return prepareAuditedDomainMutation(mutationStatement, {
+    expectedAuditId: input.auditId,
+    principalKind: 'member',
+    principalId: 'member-1',
+    origin: 'rest',
+    handler: 'flight_spine_test',
+    operation: 'upsert',
+    targetKind: 'department',
+    targetId: input.targetId,
+    requestId: input.auditId,
+    evidence: { test: 'flight-spine-receipts' },
+  })
 }
 
 beforeEach(() => {
@@ -111,6 +95,7 @@ afterEach(() => {
 
 describe('Flight Spine execution receipt ledger', () => {
   it('exposes only frozen receipt metadata and opaque audited-domain handles', async () => {
+    expect(prepareAuditedDomainMutation).toHaveLength(2)
     const prepared = await prepareFreshExecutionReceiptChain(env, memberAuth(), [
       draft('opaque-prepared'),
     ])
@@ -120,9 +105,7 @@ describe('Flight Spine execution receipt ledger', () => {
         INSERT INTO departments (id, slug, name)
         VALUES ('opaque-domain', 'opaque-domain', 'Opaque Domain')
       `,
-      expectedId: 'opaque-domain',
-      expectedSlug: 'opaque-domain',
-      expectedName: 'Opaque Domain',
+      targetId: 'opaque-domain',
     })
     const exposedPrepared = Object.fromEntries(Object.entries(prepared))
     const exposedDomain = Object.fromEntries(Object.entries(domain))
@@ -148,7 +131,7 @@ describe('Flight Spine execution receipt ledger', () => {
       })
   })
 
-  it('commits two prepared receipts with one strict domain insert and audit guard', async () => {
+  it('commits two receipts with one strict domain insert and executor-generated audit guard', async () => {
     const prepared = await prepareFreshExecutionReceiptChain(env, memberAuth(), [
       draft('opaque-prepared-objective'),
       draft('opaque-prepared-flight', {
@@ -163,9 +146,7 @@ describe('Flight Spine execution receipt ledger', () => {
         INSERT INTO departments (id, slug, name)
         VALUES ('opaque-prepared-domain', 'opaque-prepared-domain', 'Opaque Prepared Domain')
       `,
-      expectedId: 'opaque-prepared-domain',
-      expectedSlug: 'opaque-prepared-domain',
-      expectedName: 'Opaque Prepared Domain',
+      targetId: 'opaque-prepared-domain',
     })
 
     const receipts = await executePreparedExecutionReceiptBatch(env, prepared, [domain])
@@ -192,15 +173,20 @@ describe('Flight Spine execution receipt ledger', () => {
       name: 'Opaque Prepared Domain',
     })
     expect(harness.sqlite.prepare(`
-      SELECT id, tenant, principal_kind, target_kind, target_id
+      SELECT id, tenant, principal_kind, handler, operation, target_kind,
+             target_id, request_id, evidence_json
         FROM mutation_audit_entries
        WHERE id = 'audit-opaque-prepared-domain'
     `).get()).toEqual({
       id: 'audit-opaque-prepared-domain',
       tenant: TENANT,
       principal_kind: 'member',
+      handler: 'flight_spine_test',
+      operation: 'upsert',
       target_kind: 'department',
       target_id: 'opaque-prepared-domain',
+      request_id: 'audit-opaque-prepared-domain',
+      evidence_json: '{"test":"flight-spine-receipts"}',
     })
     expect(harness.sqlite.prepare(`
       SELECT from_receipt_id, to_receipt_id, relation
@@ -227,9 +213,7 @@ describe('Flight Spine execution receipt ledger', () => {
         INSERT INTO departments (id, slug, name)
         VALUES ('opaque-domain-rollback', 'opaque-domain-rollback', 'Opaque Domain Rollback')
       `,
-      expectedId: 'opaque-domain-rollback',
-      expectedSlug: 'opaque-domain-rollback',
-      expectedName: 'Opaque Domain Rollback',
+      targetId: 'opaque-domain-rollback',
     })
     const duplicateDomain = auditedDepartmentMutation({
       auditId: 'audit-opaque-domain-rollback-duplicate',
@@ -237,9 +221,7 @@ describe('Flight Spine execution receipt ledger', () => {
         INSERT INTO departments (id, slug, name)
         VALUES ('opaque-domain-rollback', 'opaque-domain-copy', 'Must Fail')
       `,
-      expectedId: 'opaque-domain-rollback',
-      expectedSlug: 'opaque-domain-copy',
-      expectedName: 'Must Fail',
+      targetId: 'opaque-domain-rollback',
     })
 
     await expect(executePreparedExecutionReceiptBatch(
@@ -276,9 +258,7 @@ describe('Flight Spine execution receipt ledger', () => {
       mutationSql: `
         UPDATE departments SET name = 'Expected Name' WHERE id = 'opaque-missing-domain'
       `,
-      expectedId: 'opaque-missing-domain',
-      expectedSlug: 'opaque-missing-domain',
-      expectedName: 'Expected Name',
+      targetId: 'opaque-missing-domain',
     })
 
     await expect(executePreparedExecutionReceiptBatch(env, prepared, [semanticZero]))
@@ -296,6 +276,47 @@ describe('Flight Spine execution receipt ledger', () => {
     expect(harness.sqlite.prepare(`
       SELECT COUNT(*) AS count FROM mutation_audit_entries
        WHERE id = 'audit-opaque-semantic-zero'
+    `).get()).toEqual({ count: 0 })
+  })
+
+  it('turns a multi-row mutation into a CHECK abort and rolls back all changed rows', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO departments (id, slug, name) VALUES
+        ('multi-domain-a', 'multi-domain-a', 'Before A'),
+        ('multi-domain-b', 'multi-domain-b', 'Before B');
+    `)
+    const prepared = await prepareFreshExecutionReceiptChain(env, memberAuth(), [
+      draft('opaque-multi-first'),
+      draft('opaque-multi-second', { type: 'task.assigned', taskId: 'opaque-multi-task' }),
+    ])
+    const multiRow = auditedDepartmentMutation({
+      auditId: 'audit-opaque-multi-row',
+      mutationSql: `
+        UPDATE departments SET name = 'After'
+         WHERE id IN ('multi-domain-a', 'multi-domain-b')
+      `,
+      targetId: 'multi-domain-a,multi-domain-b',
+    })
+
+    await expect(executePreparedExecutionReceiptBatch(env, prepared, [multiRow]))
+      .rejects.toThrow(/check constraint/i)
+
+    expect(harness.sqlite.prepare(`
+      SELECT id, name FROM departments
+       WHERE id IN ('multi-domain-a', 'multi-domain-b') ORDER BY id
+    `).all()).toEqual([
+      { id: 'multi-domain-a', name: 'Before A' },
+      { id: 'multi-domain-b', name: 'Before B' },
+    ])
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM execution_receipts').get())
+      .toEqual({ count: 0 })
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM execution_receipt_edges').get())
+      .toEqual({ count: 0 })
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM execution_receipt_heads').get())
+      .toEqual({ count: 0 })
+    expect(harness.sqlite.prepare(`
+      SELECT COUNT(*) AS count FROM mutation_audit_entries
+       WHERE id = 'audit-opaque-multi-row'
     `).get()).toEqual({ count: 0 })
   })
 
@@ -320,9 +341,7 @@ describe('Flight Spine execution receipt ledger', () => {
         INSERT INTO departments (id, slug, name)
         VALUES ('opaque-stale-domain', 'opaque-stale-domain', 'Opaque Stale Domain')
       `,
-      expectedId: 'opaque-stale-domain',
-      expectedSlug: 'opaque-stale-domain',
-      expectedName: 'Opaque Stale Domain',
+      targetId: 'opaque-stale-domain',
     })
 
     await expect(executePreparedExecutionReceiptBatch(env, prepared, [domain]))
@@ -376,9 +395,7 @@ describe('Flight Spine execution receipt ledger', () => {
         INSERT INTO departments (id, slug, name)
         VALUES ('opaque-short-domain', 'opaque-short-domain', 'Opaque Short Domain')
       `,
-      expectedId: 'opaque-short-domain',
-      expectedSlug: 'opaque-short-domain',
-      expectedName: 'Opaque Short Domain',
+      targetId: 'opaque-short-domain',
     })
 
     await expect(executePreparedExecutionReceiptBatch(shortResultEnv, prepared, [domain]))
