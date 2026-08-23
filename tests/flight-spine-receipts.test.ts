@@ -7,7 +7,11 @@ import {
   verifyExecutionReceipt,
 } from '../src/flight-spine/receipts'
 import type { AuthContext, Env } from '../src/types'
-import type { ExecutionReceiptDraft, ExecutionReceiptType } from '../src/flight-spine/types'
+import type {
+  ExecutionReceipt,
+  ExecutionReceiptDraft,
+  ExecutionReceiptType,
+} from '../src/flight-spine/types'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
@@ -47,6 +51,10 @@ function draft(
     claims: { accepted: true },
     ...overrides,
   }
+}
+
+function allowTestOnlyReceiptCorruption(): void {
+  harness.sqlite.exec('DROP TRIGGER execution_receipts_no_update')
 }
 
 beforeEach(() => {
@@ -158,10 +166,17 @@ describe('Flight Spine execution receipt ledger', () => {
 
   it('rejects receipt categories whose authoritative issuers arrive after Flight 2', async () => {
     const unsupportedTypes = [
+      'host.persisted',
+      'runtime.injected',
       'runtime.consumed',
       'provider.observed',
+      'provider.reconciled',
+      'runtime.ack',
+      'source.ack',
       'artifact.stored',
+      'artifact.retrieved',
       'gate.verdict',
+      'host_control.observed',
     ] as const satisfies readonly ExecutionReceiptType[]
 
     for (const type of unsupportedTypes) {
@@ -206,6 +221,20 @@ describe('Flight Spine execution receipt ledger', () => {
       .toEqual({ count: 1 })
   })
 
+  it('rejects same-key replay by a different authenticated actor', async () => {
+    const input = draft('actor-conflict')
+    await appendExecutionReceipt(env, memberAuth(), input)
+    const otherActor = { ...memberAuth(), memberId: 'member-2', userId: 'user-2' }
+
+    await expect(appendExecutionReceipt(env, otherActor, input)).rejects.toMatchObject({
+      name: 'ExecutionReceiptError',
+      code: 'idempotency_conflict',
+    })
+    expect(harness.sqlite.prepare(`
+      SELECT COUNT(*) AS count FROM execution_receipts WHERE idempotency_key = 'actor-conflict'
+    `).get()).toEqual({ count: 1 })
+  })
+
   it('maps a concurrent stale tenant head to a typed conflict and rolls back the stale row', async () => {
     const first = await appendExecutionReceipt(env, memberAuth(), draft('race-genesis'))
     let injected = false
@@ -248,6 +277,52 @@ describe('Flight Spine execution receipt ledger', () => {
     expect(harness.sqlite.prepare(`
       SELECT COUNT(*) AS count FROM execution_receipts WHERE idempotency_key = 'stale-writer'
     `).get()).toEqual({ count: 0 })
+    expect(harness.sqlite.prepare(`
+      SELECT COUNT(*) AS count FROM execution_receipt_edges WHERE tenant = ?
+    `).get(TENANT)).toEqual({ count: 0 })
+    expect(harness.sqlite.prepare(`
+      SELECT sequence, receipt_id, receipt_hash
+        FROM execution_receipt_heads
+       WHERE tenant = ?
+    `).get(TENANT)).toEqual({
+      sequence: 2,
+      receipt_id: 'concurrent-receipt',
+      receipt_hash: 'b'.repeat(64),
+    })
+  })
+
+  it('returns a committed receipt when a successor advances the head before postwrite verification', async () => {
+    let competitorReceipt: ExecutionReceipt | null = null
+    const postCommitRaceDb = {
+      prepare: harness.db.prepare.bind(harness.db),
+      batch: async (statements: Parameters<D1Database['batch']>[0]) => {
+        const results = await harness.db.batch(statements)
+        competitorReceipt = await appendExecutionReceipt(env, memberAuth(), draft('postcommit-successor', {
+          type: 'flight.materialized',
+          flightId: 'flight-successor',
+          claims: { lanes: 2 },
+        }))
+        return results
+      },
+    } as D1Database
+    const racedEnv = { ...env, DB: postCommitRaceDb }
+
+    const first = await appendExecutionReceipt(racedEnv, memberAuth(), draft('postcommit-first'))
+    if (competitorReceipt === null) throw new Error('competitor receipt was not appended')
+    const second = competitorReceipt as ExecutionReceipt
+
+    expect(second.predecessorReceiptId).toBe(first.id)
+    expect(harness.sqlite.prepare(`
+      SELECT sequence, receipt_id, receipt_hash
+        FROM execution_receipt_heads
+       WHERE tenant = ?
+    `).get(TENANT)).toEqual({
+      sequence: second.sequence,
+      receipt_id: second.id,
+      receipt_hash: second.receiptHash,
+    })
+    expect(await verifyExecutionReceipt(env, first.id)).toEqual({ ok: true })
+    expect(await verifyExecutionReceipt(env, second.id)).toEqual({ ok: true })
   })
 
   it('isolates idempotency, reads and heads by tenant', async () => {
@@ -291,5 +366,100 @@ describe('Flight Spine execution receipt ledger', () => {
     expect(reread).toEqual(second)
     expect(reread?.predecessorReceiptId).toBe(first.id)
     expect(await verifyExecutionReceipt(env, second.id)).toEqual({ ok: true })
+  })
+
+  it('rejects non-canonical mutated claims after database reread', async () => {
+    const receipt = await appendExecutionReceipt(env, memberAuth(), draft('mutated-claims'))
+    allowTestOnlyReceiptCorruption()
+    harness.sqlite.prepare(`
+      UPDATE execution_receipts SET claims_json = ? WHERE id = ?
+    `).run('{"z":1,"a":2}', receipt.id)
+
+    expect(await verifyExecutionReceipt(env, receipt.id)).toEqual({
+      ok: false,
+      error: 'claims_not_canonical',
+    })
+  })
+
+  it('rejects canonical claims whose bytes no longer match the payload digest', async () => {
+    const receipt = await appendExecutionReceipt(env, memberAuth(), draft('mutated-canonical-claims'))
+    allowTestOnlyReceiptCorruption()
+    harness.sqlite.prepare(`
+      UPDATE execution_receipts SET claims_json = ? WHERE id = ?
+    `).run(canonicalJson({ accepted: false }), receipt.id)
+
+    expect(await verifyExecutionReceipt(env, receipt.id)).toEqual({
+      ok: false,
+      error: 'payload_digest_mismatch',
+    })
+  })
+
+  it('rejects a mutated payload digest after database reread', async () => {
+    const receipt = await appendExecutionReceipt(env, memberAuth(), draft('mutated-digest'))
+    allowTestOnlyReceiptCorruption()
+    harness.sqlite.prepare(`
+      UPDATE execution_receipts SET payload_digest = ? WHERE id = ?
+    `).run('c'.repeat(64), receipt.id)
+
+    expect(await verifyExecutionReceipt(env, receipt.id)).toEqual({
+      ok: false,
+      error: 'payload_digest_mismatch',
+    })
+  })
+
+  it('rejects a mutated canonical payload after database reread', async () => {
+    const receipt = await appendExecutionReceipt(env, memberAuth(), draft('mutated-payload'))
+    allowTestOnlyReceiptCorruption()
+    harness.sqlite.prepare(`
+      UPDATE execution_receipts SET canonical_payload = '{}' WHERE id = ?
+    `).run(receipt.id)
+
+    expect(await verifyExecutionReceipt(env, receipt.id)).toEqual({
+      ok: false,
+      error: 'canonical_payload_mismatch',
+    })
+  })
+
+  it('rejects a mutated receipt hash after database reread', async () => {
+    const receipt = await appendExecutionReceipt(env, memberAuth(), draft('mutated-hash'))
+    allowTestOnlyReceiptCorruption()
+    harness.sqlite.prepare(`
+      UPDATE execution_receipts SET receipt_hash = ? WHERE id = ?
+    `).run('c'.repeat(64), receipt.id)
+
+    expect(await verifyExecutionReceipt(env, receipt.id)).toEqual({
+      ok: false,
+      error: 'receipt_hash_mismatch',
+    })
+  })
+
+  it('rejects a predecessor hash that no longer matches the referenced receipt', async () => {
+    await appendExecutionReceipt(env, memberAuth(), draft('predecessor-first'))
+    const second = await appendExecutionReceipt(env, memberAuth(), draft('predecessor-second'))
+    allowTestOnlyReceiptCorruption()
+    harness.sqlite.prepare(`
+      UPDATE execution_receipts SET predecessor_hash = ? WHERE id = ?
+    `).run('c'.repeat(64), second.id)
+
+    expect(await verifyExecutionReceipt(env, second.id)).toEqual({
+      ok: false,
+      error: 'predecessor_mismatch',
+    })
+  })
+
+  it('detects a structurally cyclic predecessor chain before following it forever', async () => {
+    const first = await appendExecutionReceipt(env, memberAuth(), draft('cycle-first'))
+    const second = await appendExecutionReceipt(env, memberAuth(), draft('cycle-second'))
+    allowTestOnlyReceiptCorruption()
+    harness.sqlite.prepare(`
+      UPDATE execution_receipts
+         SET predecessor_receipt_id = ?, predecessor_hash = ?
+       WHERE id = ?
+    `).run(second.id, second.receiptHash, first.id)
+
+    expect(await verifyExecutionReceipt(env, second.id)).toEqual({
+      ok: false,
+      error: 'chain_cycle',
+    })
   })
 })

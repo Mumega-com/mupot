@@ -291,10 +291,33 @@ async function verifyRowChain(
   initial: ReceiptRow,
 ): Promise<ExecutionReceiptVerification> {
   const visited = new Set<string>()
+  const chain: ReceiptRow[] = []
   let row: ReceiptRow | null = initial
   while (row !== null) {
     if (visited.has(row.id)) return { ok: false, error: 'chain_cycle' }
     visited.add(row.id)
+    chain.push(row)
+    if (row.predecessor_receipt_id === null) break
+    row = await receiptById(db, tenant, row.predecessor_receipt_id)
+    if (row === null) return { ok: false, error: 'predecessor_mismatch' }
+  }
+
+  for (let index = 0; index < chain.length; index += 1) {
+    row = chain[index]
+    const predecessor = chain[index + 1] ?? null
+    if (row.predecessor_receipt_id === null) {
+      if (row.predecessor_hash !== null || predecessor !== null) {
+        return { ok: false, error: 'predecessor_mismatch' }
+      }
+    } else if (
+      row.predecessor_hash === null
+      || predecessor === null
+      || predecessor.id !== row.predecessor_receipt_id
+      || predecessor.receipt_hash !== row.predecessor_hash
+      || Number(predecessor.sequence) >= Number(row.sequence)
+    ) {
+      return { ok: false, error: 'predecessor_mismatch' }
+    }
 
     let claims: JsonValue
     let claimsJson: string
@@ -339,22 +362,6 @@ async function verifyRowChain(
     if (await sha256Hex(expectedPayload) !== row.receipt_hash) {
       return { ok: false, error: 'receipt_hash_mismatch' }
     }
-
-    if (row.predecessor_receipt_id === null) {
-      if (row.predecessor_hash !== null) return { ok: false, error: 'predecessor_mismatch' }
-      row = null
-      continue
-    }
-    if (row.predecessor_hash === null) return { ok: false, error: 'predecessor_mismatch' }
-    const predecessor = await receiptById(db, tenant, row.predecessor_receipt_id)
-    if (
-      predecessor === null
-      || predecessor.receipt_hash !== row.predecessor_hash
-      || Number(predecessor.sequence) >= Number(row.sequence)
-    ) {
-      return { ok: false, error: 'predecessor_mismatch' }
-    }
-    row = predecessor
   }
   return { ok: true }
 }
@@ -485,11 +492,12 @@ export async function appendExecutionReceipt(
         WHEN execution_receipt_heads.receipt_id IS ?3 THEN excluded.updated_at
         ELSE execution_receipt_heads.updated_at
       END
+    RETURNING sequence, receipt_id, receipt_hash
   `).bind(tenant, receiptId, predecessorReceiptId))
 
+  let batchResults
   try {
-    const results = await db.batch(statements)
-    assertBatchWritten(results, 'execution_receipt.append')
+    batchResults = await db.batch<ReceiptHeadRow>(statements)
   } catch {
     const racedReplay = await replayOrConflict(db, tenant, issuerId, actor, draft)
     if (racedReplay !== null) return racedReplay
@@ -503,20 +511,23 @@ export async function appendExecutionReceipt(
     }
     throw new ExecutionReceiptError('persistence_conflict')
   }
+  try {
+    assertBatchWritten(batchResults, 'execution_receipt.append')
+  } catch {
+    throw new ExecutionReceiptError('persistence_conflict')
+  }
+  const committedHead = batchResults[batchResults.length - 1]?.results?.[0]
+  if (
+    committedHead === undefined
+    || committedHead.receipt_id !== receiptId
+    || committedHead.receipt_hash !== receiptHash
+  ) {
+    throw new ExecutionReceiptError('persistence_conflict')
+  }
 
   const persisted = await receiptById(db, tenant, receiptId)
   if (persisted === null) throw new ExecutionReceiptError('integrity_failure')
-  const currentHead = await db.prepare(`
-    SELECT sequence, receipt_id, receipt_hash
-      FROM execution_receipt_heads
-     WHERE tenant = ?1
-  `).bind(tenant).first<ReceiptHeadRow>()
-  if (
-    currentHead === null
-    || currentHead.receipt_id !== receiptId
-    || currentHead.receipt_hash !== receiptHash
-    || Number(currentHead.sequence) !== Number(persisted.sequence)
-  ) {
+  if (Number(committedHead.sequence) !== Number(persisted.sequence)) {
     throw new ExecutionReceiptError('integrity_failure')
   }
   const verified = await verifyRowChain(db, tenant, persisted)
