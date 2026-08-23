@@ -198,6 +198,7 @@ export async function issueTokenBindingAttestation(
          AND agent.status = 'active'
          AND ${TOKEN_LIVE_PREDICATE('?8').replaceAll('t.', 'token.')}
          AND julianday(token.created_at) <= julianday(?8)
+         AND token.token_hash = ?9
       RETURNING id, tenant, token_id, member_id, agent_id, channel,
                 credential_fingerprint, issued_at, expires_at, created_at
     `).bind(
@@ -209,6 +210,7 @@ export async function issueTokenBindingAttestation(
       token.member_id,
       token.agent_id,
       nowSqlUtc(),
+      token.token_hash,
     ).all<TokenBindingAttestationRow>()
     const rows = written.results ?? []
     if (rows.length !== 1) throw new AttestationError('workspace_token_required')

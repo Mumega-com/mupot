@@ -1,4 +1,5 @@
 import type { AuthContext, Env } from '../types'
+import { hasCapability, resolveCapabilities } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { canonicalJson, sha256Hex } from '../lib/canonical-json'
 import type { MemberTokenFingerprintEnv } from '../members/service'
@@ -101,6 +102,7 @@ export type RuntimeSeatErrorCode =
   | 'duplicate_seat'
   | 'seat_registration_conflict'
   | 'workspace_token_required'
+  | 'lease_forbidden'
   | 'seat_not_found'
   | 'seat_not_active'
   | 'seat_revoked'
@@ -134,6 +136,9 @@ interface RuntimeSeatRow {
   revoked_at: string | null
   created_at: string
   updated_at: string
+  squad_id?: string
+  department_id?: string
+  membership_capability?: string | null
   maximum_fencing_epoch?: number
   active_lease_count?: number
 }
@@ -171,6 +176,14 @@ interface LeaseActor {
   memberId: string
   agentId: string
   tokenId: string
+  tokenHash: string
+}
+
+interface LeaseAuthority {
+  actor: LeaseActor
+  squadId: string
+  departmentId: string
+  legacyAdmin: boolean
 }
 
 const PENDING_SEAT_KEYS = new Set([
@@ -204,8 +217,15 @@ function leaseTokenHash(value: unknown): string {
 
 function futureTimestamp(value: unknown): string {
   const normalized = boundedText(value, 80)
-  const timestamp = Date.parse(normalized)
-  if (!Number.isFinite(timestamp) || timestamp <= Date.now()) {
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(normalized)) {
+    throw new RuntimeSeatError('invalid_seat')
+  }
+  const parsed = new Date(normalized)
+  if (
+    !Number.isFinite(parsed.getTime())
+    || parsed.toISOString() !== normalized
+    || parsed.getTime() <= Date.now()
+  ) {
     throw new RuntimeSeatError('invalid_seat')
   }
   return normalized
@@ -442,7 +462,6 @@ async function requireLeaseActor(env: Env, auth: AuthContext): Promise<LeaseActo
   const tokenId = auth.tokenId?.trim() ?? ''
   if (
     auth.tenant !== env.TENANT_SLUG
-    || auth.channel !== 'workspace'
     || memberId === ''
     || agentId === ''
     || tokenId === ''
@@ -450,7 +469,7 @@ async function requireLeaseActor(env: Env, auth: AuthContext): Promise<LeaseActo
     throw new RuntimeSeatError('workspace_token_required')
   }
   const row = await env.DB.prepare(`
-    SELECT token.id
+    SELECT token.id, token.token_hash
       FROM member_tokens token
       JOIN members member
         ON member.id = token.member_id AND member.tenant = token.tenant
@@ -465,9 +484,9 @@ async function requireLeaseActor(env: Env, auth: AuthContext): Promise<LeaseActo
        AND ${TOKEN_LIVE_PREDICATE('?5').replaceAll('t.', 'token.')}
      LIMIT 1
   `).bind(tokenId, env.TENANT_SLUG, memberId, agentId, nowSqlUtc())
-    .first<{ id: string }>()
+    .first<{ id: string; token_hash: string }>()
   if (!row) throw new RuntimeSeatError('workspace_token_required')
-  return { memberId, agentId, tokenId }
+  return { memberId, agentId, tokenId, tokenHash: row.token_hash }
 }
 
 async function readSeatForActor(
@@ -481,7 +500,8 @@ async function readSeatForActor(
            seat.current_fencing_epoch, seat.process_public_key,
            seat.credential_fingerprint, seat.capabilities_json,
            seat.last_heartbeat_at, seat.revoked_at, seat.created_at,
-           seat.updated_at,
+           seat.updated_at, agent.squad_id, squad.department_id,
+           membership.capability AS membership_capability,
            COALESCE((
              SELECT MAX(lease.fencing_epoch) FROM runtime_seat_leases lease
               WHERE lease.tenant = seat.tenant AND lease.runtime_seat_id = seat.id
@@ -492,12 +512,57 @@ async function readSeatForActor(
                 AND lease.state = 'active'
            ) AS active_lease_count
       FROM runtime_seats seat
+      JOIN agents agent ON agent.id = seat.agent_id
+      JOIN squads squad ON squad.id = agent.squad_id
+      LEFT JOIN memberships membership
+        ON membership.agent_id = agent.id AND membership.squad_id = squad.id
      WHERE seat.id = ?1 AND seat.tenant = ?2 AND seat.agent_id = ?3
      LIMIT 1
   `).bind(runtimeSeatId, env.TENANT_SLUG, actor.agentId).first<RuntimeSeatRow>()
   if (!row) throw new RuntimeSeatError('seat_not_found')
   if (row.state === 'revoked') throw new RuntimeSeatError('seat_revoked')
   return row
+}
+
+async function requireLeaseAuthority(
+  env: Env,
+  auth: AuthContext,
+  actor: LeaseActor,
+  seat: RuntimeSeatRow,
+): Promise<LeaseAuthority> {
+  const squadId = seat.squad_id ?? ''
+  const departmentId = seat.department_id ?? ''
+  const membershipCapability = seat.membership_capability ?? ''
+  if (
+    squadId === ''
+    || departmentId === ''
+    || !['member', 'lead', 'admin', 'owner'].includes(membershipCapability)
+  ) {
+    throw new RuntimeSeatError('lease_forbidden')
+  }
+  const legacyAdmin = auth.capabilities === undefined
+    && (auth.role === 'owner' || auth.role === 'admin')
+  const effectiveGrants = auth.capabilities ?? (await resolveCapabilities(env, actor.memberId))
+  if (!legacyAdmin && !hasCapability(
+    effectiveGrants,
+    'squad',
+    squadId,
+    'member',
+    departmentId,
+  )) {
+    throw new RuntimeSeatError('lease_forbidden')
+  }
+  const liveGrants = await resolveCapabilities(env, actor.memberId)
+  if (!legacyAdmin && !hasCapability(
+    liveGrants,
+    'squad',
+    squadId,
+    'member',
+    departmentId,
+  )) {
+    throw new RuntimeSeatError('lease_forbidden')
+  }
+  return { actor, squadId, departmentId, legacyAdmin }
 }
 
 async function leaseById(env: Env, leaseId: string): Promise<RuntimeSeatLease> {
@@ -507,14 +572,15 @@ async function leaseById(env: Env, leaseId: string): Promise<RuntimeSeatLease> {
            lease.leased_at, lease.expires_at, lease.renewed_at,
            lease.released_at, receipt.id AS receipt_id
       FROM runtime_seat_leases lease
-      LEFT JOIN execution_receipts receipt
-        ON receipt.tenant = lease.tenant
+      JOIN execution_receipts receipt
+        ON receipt.id = lease.id
+       AND receipt.tenant = lease.tenant
        AND receipt.type = 'seat.leased'
        AND receipt.seat_id = lease.runtime_seat_id
        AND receipt.seat_generation = lease.generation
        AND receipt.fencing_epoch = lease.fencing_epoch
+       AND receipt.lease_token_hash = lease.lease_token_hash
      WHERE lease.tenant = ?1 AND lease.id = ?2
-     ORDER BY receipt.sequence
      LIMIT 1
   `).bind(env.TENANT_SLUG, leaseId).first<RuntimeSeatLeaseRow>()
   if (!row) throw new RuntimeSeatError('lease_persistence_conflict')
@@ -541,6 +607,7 @@ export async function acquireRuntimeSeatLease(
   const expiresAt = futureTimestamp(input?.expiresAt)
   const actor = await requireLeaseActor(env, auth)
   const seat = await readSeatForActor(env, runtimeSeatId, actor)
+  const authority = await requireLeaseAuthority(env, auth, actor, seat)
   assertActiveGeneration(seat, generation)
   if (Number(seat.active_lease_count) !== 0) {
     throw new RuntimeSeatError('active_lease_exists')
@@ -549,8 +616,6 @@ export async function acquireRuntimeSeatLease(
     Number(seat.current_fencing_epoch),
     Number(seat.maximum_fencing_epoch),
   ) + 1
-  const leaseId = crypto.randomUUID()
-  const leasedAt = new Date().toISOString()
   const idempotencyDigest = await sha256Hex(canonicalJson({
     tenant: env.TENANT_SLUG,
     runtimeSeatId,
@@ -567,6 +632,10 @@ export async function acquireRuntimeSeatLease(
     claims: { consumerId, expiresAt },
   }])
   const receipt = prepared.expectedReceipts[0]
+  // Migration 0122 has no separate receipt-id column and migrations are frozen for
+  // this task. Use the immutable lease PK as the exact receipt FK-by-identity.
+  const leaseId = receipt.id
+  const leasedAt = new Date().toISOString()
   const domain = prepareAuditedDomainMutation(env.DB, {
     sql: `INSERT INTO runtime_seat_leases (
       id, tenant, runtime_seat_id, generation, fencing_epoch, consumer_id,
@@ -579,6 +648,9 @@ export async function acquireRuntimeSeatLease(
        AND generation.runtime_seat_id = seat.id
        AND generation.generation = ?2
       JOIN agents agent ON agent.id = seat.agent_id
+      JOIN squads squad ON squad.id = agent.squad_id
+      JOIN memberships membership
+        ON membership.agent_id = agent.id AND membership.squad_id = squad.id
       JOIN agent_member_bindings binding
         ON binding.tenant = seat.tenant
        AND binding.agent_id = seat.agent_id
@@ -594,6 +666,38 @@ export async function acquireRuntimeSeatLease(
        AND agent.status = 'active' AND member.status = 'active'
        AND token.channel = 'workspace'
        AND ${TOKEN_LIVE_PREDICATE('?13').replaceAll('t.', 'token.')}
+       AND token.token_hash = ?14
+       AND squad.id = ?15 AND squad.department_id = ?16
+       AND CASE membership.capability
+         WHEN 'owner' THEN 5 WHEN 'admin' THEN 4 WHEN 'lead' THEN 3
+         WHEN 'member' THEN 2 WHEN 'observer' THEN 1 ELSE 0 END >= 2
+       AND (
+         ?17 = 1
+         OR EXISTS (
+           SELECT 1 FROM capabilities capability
+            WHERE capability.member_id = member.id
+              AND (
+                capability.scope_type = 'org'
+                OR (capability.scope_type = 'department'
+                  AND capability.scope_id = squad.department_id)
+                OR (capability.scope_type = 'squad'
+                  AND capability.scope_id = squad.id)
+              )
+              AND CASE capability.capability
+                WHEN 'owner' THEN 5 WHEN 'admin' THEN 4 WHEN 'lead' THEN 3
+                WHEN 'member' THEN 2 WHEN 'observer' THEN 1 ELSE 0 END >= 2
+         )
+         OR EXISTS (
+           SELECT 1 FROM channel_capability_grants capability
+            WHERE capability.member_id = member.id
+              AND capability.squad_id = squad.id
+              AND CASE capability.capability
+                WHEN 'owner' THEN 5 WHEN 'admin' THEN 4 WHEN 'lead' THEN 3
+                WHEN 'member' THEN 2 WHEN 'observer' THEN 1 ELSE 0 END >= 2
+         )
+       )
+       AND julianday(?7) IS NOT NULL
+       AND julianday(?7) > julianday(?6)
        AND NOT EXISTS (
          SELECT 1 FROM runtime_seat_leases active
           WHERE active.tenant = seat.tenant AND active.runtime_seat_id = seat.id
@@ -617,7 +721,11 @@ export async function acquireRuntimeSeatLease(
       runtimeSeatId,
       env.TENANT_SLUG,
       actor.agentId,
-      nowSqlUtc(),
+      leasedAt,
+      actor.tokenHash,
+      authority.squadId,
+      authority.departmentId,
+      authority.legacyAdmin ? 1 : 0,
     ],
     audit: {
       expectedAuditId: `audit:${leaseId}:acquire`,
@@ -628,7 +736,7 @@ export async function acquireRuntimeSeatLease(
       credentialId: actor.tokenId,
       runtimeSeatId,
       runtimeGeneration: generation,
-      origin: 'mcp',
+      origin: 'worker_callback',
       handler: 'flight_spine.acquire_runtime_seat_lease',
       operation: 'acquire',
       targetKind: 'runtime_seat_lease',
@@ -666,6 +774,7 @@ export async function renewRuntimeSeatLease(
   const expiresAt = futureTimestamp(input?.expiresAt)
   const actor = await requireLeaseActor(env, auth)
   const seat = await readSeatForActor(env, runtimeSeatId, actor)
+  const authority = await requireLeaseAuthority(env, auth, actor, seat)
   assertActiveGeneration(seat, generation)
   const renewedAt = new Date().toISOString()
   const result = await env.DB.prepare(`
@@ -674,14 +783,63 @@ export async function renewRuntimeSeatLease(
      WHERE lease.tenant = ?3 AND lease.runtime_seat_id = ?4
        AND lease.generation = ?5 AND lease.fencing_epoch = ?6
        AND lease.lease_token_hash = ?7 AND lease.state = 'active'
-       AND julianday(lease.expires_at) > julianday(?8)
+       AND julianday(lease.expires_at) IS NOT NULL
+       AND julianday(lease.expires_at) > julianday(?2)
+       AND julianday(?1) IS NOT NULL
+       AND julianday(?1) > julianday(?2)
        AND julianday(?1) > julianday(lease.expires_at)
        AND EXISTS (
-         SELECT 1 FROM runtime_seats seat
+         SELECT 1
+           FROM runtime_seats seat
+           JOIN agents agent ON agent.id = seat.agent_id
+           JOIN squads squad ON squad.id = agent.squad_id
+           JOIN memberships membership
+             ON membership.agent_id = agent.id AND membership.squad_id = squad.id
+           JOIN agent_member_bindings binding
+             ON binding.tenant = seat.tenant
+            AND binding.agent_id = seat.agent_id
+            AND binding.member_id = ?9
+           JOIN members member
+             ON member.id = binding.member_id AND member.tenant = binding.tenant
+           JOIN member_tokens token
+             ON token.id = ?10 AND token.tenant = binding.tenant
+            AND token.member_id = binding.member_id AND token.agent_id = seat.agent_id
           WHERE seat.tenant = lease.tenant AND seat.id = lease.runtime_seat_id
-            AND seat.agent_id = ?9 AND seat.state = 'active'
+            AND seat.agent_id = ?8 AND seat.state = 'active'
             AND seat.current_generation = lease.generation
             AND seat.current_fencing_epoch < lease.fencing_epoch
+            AND agent.status = 'active' AND member.status = 'active'
+            AND token.channel = 'workspace' AND token.token_hash = ?11
+            AND ${TOKEN_LIVE_PREDICATE('?2').replaceAll('t.', 'token.')}
+            AND squad.id = ?12 AND squad.department_id = ?13
+            AND CASE membership.capability
+              WHEN 'owner' THEN 5 WHEN 'admin' THEN 4 WHEN 'lead' THEN 3
+              WHEN 'member' THEN 2 WHEN 'observer' THEN 1 ELSE 0 END >= 2
+            AND (
+              ?14 = 1
+              OR EXISTS (
+                SELECT 1 FROM capabilities capability
+                 WHERE capability.member_id = member.id
+                   AND (
+                     capability.scope_type = 'org'
+                     OR (capability.scope_type = 'department'
+                       AND capability.scope_id = squad.department_id)
+                     OR (capability.scope_type = 'squad'
+                       AND capability.scope_id = squad.id)
+                   )
+                   AND CASE capability.capability
+                     WHEN 'owner' THEN 5 WHEN 'admin' THEN 4 WHEN 'lead' THEN 3
+                     WHEN 'member' THEN 2 WHEN 'observer' THEN 1 ELSE 0 END >= 2
+              )
+              OR EXISTS (
+                SELECT 1 FROM channel_capability_grants capability
+                 WHERE capability.member_id = member.id
+                   AND capability.squad_id = squad.id
+                   AND CASE capability.capability
+                     WHEN 'owner' THEN 5 WHEN 'admin' THEN 4 WHEN 'lead' THEN 3
+                     WHEN 'member' THEN 2 WHEN 'observer' THEN 1 ELSE 0 END >= 2
+              )
+            )
        )
     RETURNING id
   `).bind(
@@ -692,8 +850,13 @@ export async function renewRuntimeSeatLease(
     generation,
     fencingEpoch,
     tokenHash,
-    nowSqlUtc(),
     actor.agentId,
+    actor.memberId,
+    actor.tokenId,
+    actor.tokenHash,
+    authority.squadId,
+    authority.departmentId,
+    authority.legacyAdmin ? 1 : 0,
   ).all<{ id: string }>()
   const rows = result.results ?? []
   if (rows.length !== 1) throw new RuntimeSeatError('stale_lease')
@@ -712,6 +875,7 @@ export async function releaseRuntimeSeatLease(
   const tokenHash = leaseTokenHash(input?.leaseTokenHash)
   const actor = await requireLeaseActor(env, auth)
   const seat = await readSeatForActor(env, runtimeSeatId, actor)
+  const authority = await requireLeaseAuthority(env, auth, actor, seat)
   assertActiveGeneration(seat, generation)
   const releasedAt = new Date().toISOString()
   const results = await env.DB.batch<{ id: string }>([
@@ -721,13 +885,60 @@ export async function releaseRuntimeSeatLease(
        WHERE lease.tenant = ?2 AND lease.runtime_seat_id = ?3
          AND lease.generation = ?4 AND lease.fencing_epoch = ?5
          AND lease.lease_token_hash = ?6 AND lease.state = 'active'
-         AND julianday(lease.expires_at) > julianday(?7)
+         AND julianday(lease.expires_at) IS NOT NULL
+         AND julianday(lease.expires_at) > julianday(?1)
          AND EXISTS (
-           SELECT 1 FROM runtime_seats seat
+           SELECT 1
+             FROM runtime_seats seat
+             JOIN agents agent ON agent.id = seat.agent_id
+             JOIN squads squad ON squad.id = agent.squad_id
+             JOIN memberships membership
+               ON membership.agent_id = agent.id AND membership.squad_id = squad.id
+             JOIN agent_member_bindings binding
+               ON binding.tenant = seat.tenant
+              AND binding.agent_id = seat.agent_id
+              AND binding.member_id = ?8
+             JOIN members member
+               ON member.id = binding.member_id AND member.tenant = binding.tenant
+             JOIN member_tokens token
+               ON token.id = ?9 AND token.tenant = binding.tenant
+              AND token.member_id = binding.member_id AND token.agent_id = seat.agent_id
             WHERE seat.tenant = lease.tenant AND seat.id = lease.runtime_seat_id
-              AND seat.agent_id = ?8 AND seat.state = 'active'
+              AND seat.agent_id = ?7 AND seat.state = 'active'
               AND seat.current_generation = lease.generation
               AND seat.current_fencing_epoch < lease.fencing_epoch
+              AND agent.status = 'active' AND member.status = 'active'
+              AND token.channel = 'workspace' AND token.token_hash = ?10
+              AND ${TOKEN_LIVE_PREDICATE('?1').replaceAll('t.', 'token.')}
+              AND squad.id = ?11 AND squad.department_id = ?12
+              AND CASE membership.capability
+                WHEN 'owner' THEN 5 WHEN 'admin' THEN 4 WHEN 'lead' THEN 3
+                WHEN 'member' THEN 2 WHEN 'observer' THEN 1 ELSE 0 END >= 2
+              AND (
+                ?13 = 1
+                OR EXISTS (
+                  SELECT 1 FROM capabilities capability
+                   WHERE capability.member_id = member.id
+                     AND (
+                       capability.scope_type = 'org'
+                       OR (capability.scope_type = 'department'
+                         AND capability.scope_id = squad.department_id)
+                       OR (capability.scope_type = 'squad'
+                         AND capability.scope_id = squad.id)
+                     )
+                     AND CASE capability.capability
+                       WHEN 'owner' THEN 5 WHEN 'admin' THEN 4 WHEN 'lead' THEN 3
+                       WHEN 'member' THEN 2 WHEN 'observer' THEN 1 ELSE 0 END >= 2
+                )
+                OR EXISTS (
+                  SELECT 1 FROM channel_capability_grants capability
+                   WHERE capability.member_id = member.id
+                     AND capability.squad_id = squad.id
+                     AND CASE capability.capability
+                       WHEN 'owner' THEN 5 WHEN 'admin' THEN 4 WHEN 'lead' THEN 3
+                       WHEN 'member' THEN 2 WHEN 'observer' THEN 1 ELSE 0 END >= 2
+                )
+              )
          )
       RETURNING id
     `).bind(
@@ -737,8 +948,13 @@ export async function releaseRuntimeSeatLease(
       generation,
       fencingEpoch,
       tokenHash,
-      nowSqlUtc(),
       actor.agentId,
+      actor.memberId,
+      actor.tokenId,
+      actor.tokenHash,
+      authority.squadId,
+      authority.departmentId,
+      authority.legacyAdmin ? 1 : 0,
     ),
     env.DB.prepare(`
       UPDATE runtime_seats AS seat

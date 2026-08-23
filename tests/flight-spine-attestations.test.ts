@@ -1,4 +1,5 @@
 import { createHmac } from 'node:crypto'
+import type { D1Database, D1PreparedStatement } from '@cloudflare/workers-types'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   issueTokenBindingAttestation,
@@ -18,6 +19,35 @@ const FINGERPRINT_SECRET = 'dedicated-test-member-token-fingerprint-secret'
 
 let harness: SqliteD1Harness
 let env: MemberTokenFingerprintEnv
+
+function envWithBeforeAttestationInsert(mutate: () => void): MemberTokenFingerprintEnv {
+  const committedDb = env.DB
+  let injected = false
+  const wrap = (statement: D1PreparedStatement): D1PreparedStatement => ({
+    bind(...values: unknown[]) {
+      return wrap(statement.bind(...values))
+    },
+    async all<T>() {
+      if (!injected) {
+        injected = true
+        mutate()
+      }
+      return statement.all<T>()
+    },
+  }) as D1PreparedStatement
+  return {
+    ...env,
+    DB: {
+      prepare(sql: string) {
+        const statement = committedDb.prepare(sql)
+        return sql.includes('INSERT INTO token_binding_attestations')
+          ? wrap(statement)
+          : statement
+      },
+      batch: committedDb.batch.bind(committedDb),
+    } as D1Database,
+  }
+}
 
 function auth(overrides: Partial<AuthContext> = {}): AuthContext {
   return {
@@ -154,6 +184,20 @@ describe('Flight Spine token-binding attestations', () => {
     )
     await expect(issueTokenBindingAttestation(env, auth()))
       .rejects.toMatchObject({ code: 'workspace_token_required' })
+  })
+
+  it('rejects a token-hash replacement between HMAC preflight and immutable insert', async () => {
+    const racedEnv = envWithBeforeAttestationInsert(() => {
+      harness.sqlite.prepare(`
+        UPDATE member_tokens SET token_hash = ? WHERE id = ?
+      `).run('b'.repeat(64), TOKEN_ID)
+    })
+
+    await expect(issueTokenBindingAttestation(racedEnv, auth()))
+      .rejects.toMatchObject({ code: 'workspace_token_required' })
+    expect(harness.sqlite.prepare(
+      'SELECT COUNT(*) AS count FROM token_binding_attestations',
+    ).get()).toEqual({ count: 0 })
   })
 
   it('persists immutable token-binding attestations', async () => {
