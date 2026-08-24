@@ -1,0 +1,109 @@
+{
+  "schema": "mupot.flight3.task0-bootstrap/v1",
+  "recorded_at": "2026-08-24T13:11:44Z",
+  "status": "task_1_open_with_readiness_caveats",
+  "plan": {
+    "commit": "21ecbd5db66c7341446da16184109146d37ad1b8",
+    "tree": "35da3c8d02dfe9f9963f9322c710d44ad655dd1d",
+    "independent_gate_commit": "19a139fdaf2e17f352ef0f8b5d8664df61520689",
+    "verdict": "PASS"
+  },
+  "authority": {
+    "executor_agent_id": "087a816b-ab9f-400f-8d53-f6f97b94a725",
+    "executor_slug": "hadi-codex",
+    "squad_id": "3674d955-067f-4821-86a0-c2fa03e30ff9",
+    "membership_capability": "lead",
+    "membership_update_receipt_id": "8da1bae6-7387-4d22-a9b6-8db488db76a4",
+    "agent_budget_cap_cents": 1000,
+    "agent_budget_window": "week",
+    "flight_budget_micro_usd": 10000000
+  },
+  "objective": {
+    "id": "objective-091c67ecb8d1862b6d242374019067f3",
+    "acceptance_receipt_id": "6ae2ecc7-8870-4f36-a14e-9a4fc7e8b88c",
+    "budget_micro_usd": 10000000,
+    "payload_digest": "68e728dc6a00c0a575438973d6e2c1b139488f2ac152308308a2ae5caf45ca16",
+    "accepted_at": "2026-08-24T13:02:07.750Z"
+  },
+  "circuit": {
+    "id": "063d95f2-24e9-49da-b8cf-2d59a9d95df5",
+    "key": "flight-spine-delivery-03-20260824",
+    "task_1_state": "active",
+    "dependency_edges": [
+      {"id": "13809704-a70f-4076-b123-fcce972f0b9b", "source": "task_1_schema", "target": "task_2_broker"},
+      {"id": "f25e1c99-fd6a-4124-bbf4-9377b2100ada", "source": "task_2_broker", "target": "task_3_delivery"},
+      {"id": "9c51067e-25e5-4c63-8469-bb6cddc7eead", "source": "task_3_delivery", "target": "task_4_mcp"},
+      {"id": "cd4de4c0-db59-4285-a813-7160c2dd078f", "source": "task_1_schema", "target": "task_5_launcher_runtime"},
+      {"id": "150293f0-b571-45c7-92ac-666badb64bba", "source": "task_5_launcher_runtime", "target": "task_6_adapter_provider"},
+      {"id": "199e83bf-39f0-42d4-9e2a-e53b18f59759", "source": "task_4_mcp", "target": "task_7_integration"},
+      {"id": "ed175d2a-b163-4c4b-afe5-1ee959c7db4e", "source": "task_6_adapter_provider", "target": "task_7_integration"},
+      {"id": "509c900f-f5a6-4cd4-a790-ff6655f617a2", "source": "task_7_integration", "target": "task_8_package"}
+    ],
+    "gate_edge": {
+      "id": "6b3169de-b4af-495b-9288-37ab0e5008a9",
+      "source": "task_8_package",
+      "target": "gate_review",
+      "approved": false
+    },
+    "landing_edge_id": "c76fdc3e-c795-4f85-b0a9-8cf442ea3d2f"
+  },
+  "flight": {
+    "id": "7dca1718-5ae2-4d63-b36a-ad18293c2c7c",
+    "status": "running",
+    "preflight_gate_verdict": "go",
+    "independent_gate_approved": false,
+    "score": 0.6758275326084104,
+    "budget_micro_usd": 10000000,
+    "cost_micro_usd": 0,
+    "preflight_go": true,
+    "legacy_dispatch_result_delivered_flag": true,
+    "runtime_delivery_proven": false,
+    "budget_uncapped": []
+  },
+  "tasks": [
+    {"key": "task_1_schema", "id": "a1beef08-406e-4894-b0c6-1d9b97cc98d2", "assignee_agent_id": "087a816b-ab9f-400f-8d53-f6f97b94a725", "status": "in_progress"},
+    {"key": "task_2_broker", "id": "96fe9483-90ff-4841-b0e3-b561f2a3f6c9", "assignee_agent_id": "bec1bb7a-b37e-4594-b018-1f608ae38d47", "status": "open"},
+    {"key": "task_3_delivery", "id": "e5453ed8-5ab5-44e3-b308-f6d1c53d1f4f", "assignee_agent_id": "7089044c-5e48-4d5f-b5b0-6937433c4e79", "status": "open"},
+    {"key": "task_4_mcp", "id": "525fd25b-cadb-413a-9da7-fd15c006c850", "assignee_agent_id": "087a816b-ab9f-400f-8d53-f6f97b94a725", "status": "open"},
+    {"key": "task_5_launcher_runtime", "id": "22c4495e-32a2-4f27-9bc6-21f192e4f452", "assignee_agent_id": "cb14cb85-f7c6-447b-a6dd-52db44872d2e", "status": "open"},
+    {"key": "task_6_adapter_provider", "id": "efe93c20-0857-4c54-8c30-af088a267d35", "assignee_agent_id": "870a5024-afd2-407e-86b3-fe2596e89bd1", "status": "open"},
+    {"key": "task_7_integration", "id": "f3340ba8-c6d5-444d-8980-aa9838436eec", "assignee_agent_id": "087a816b-ab9f-400f-8d53-f6f97b94a725", "status": "open"},
+    {"key": "task_8_package", "id": "daeb114e-eb10-458c-865e-9fb8f14838f4", "assignee_agent_id": "087a816b-ab9f-400f-8d53-f6f97b94a725", "status": "open", "gate_owner": "gate:hadi-grok"}
+  ],
+  "readiness": {
+    "requests": [
+      {"owner": "hadi-codex", "request_id": "6a24e4d7-a610-4255-ba93-aaae0e401e98", "message_id": "8d5d3493-46ec-4408-be8a-a4664d089590", "seq": 2244, "target_seat": null, "ack": "runtime_read"},
+      {"owner": "hadi-river", "request_id": "2ad0f604-db0e-461c-b8fc-a528fe0878a9", "message_id": "8bc0fc61-bfba-4f24-bfac-103e128ff421", "seq": 2245, "target_seat": null, "ack": null},
+      {"owner": "hadi-cursor", "request_id": "de6d755d-0099-4d40-9883-ce9709690301", "message_id": "8aec9db6-20f2-4e5f-af1e-c131f773133c", "seq": 2246, "target_seat": null, "ack": null},
+      {"owner": "hadi-opencode", "request_id": "bba3cccd-dff3-47d6-ad5b-16ed75862228", "message_id": "46283761-e690-4091-a76e-532c70758a20", "seq": 2247, "target_seat": null, "ack": null},
+      {"owner": "hadi-hermes", "request_id": "2b30a5f7-3f72-4631-b173-b722deefbc7b", "message_id": "551ab197-f96a-4a9f-bc60-42c6d1040d0f", "seq": 2248, "target_seat": null, "ack": null},
+      {"owner": "hadi-grok", "request_id": "23e34792-e34b-42b4-96d1-06f053805aa6", "message_id": "788ac3da-e7a5-4ce7-bab3-5605912b06e7", "seq": 2249, "target_seat": null, "ack": null}
+    ],
+    "hadi_codex_ack_message_id": "b5e339b2-50a2-4a6c-a15d-18ac46607bd4",
+    "hadi_codex_ack_seq": 2255,
+    "hadi_codex_inbox_ack": true,
+    "hadi_codex_runtime": "Codex Desktop",
+    "hadi_codex_registered_seat_id": "64dfb077-68aa-4709-af0f-f6a52cd5c6ca",
+    "hadi_codex_registered_seat_state": "pending",
+    "hadi_codex_active_generation": false,
+    "family_wide_bootstrap_messages": true,
+    "exact_target_seat_labels_available": false
+  },
+  "task_1_dispatch": {
+    "receipt_id": "24725200-79b6-49cd-a3ba-2a9deff4ef7e",
+    "dispatched_at": "2026-08-24T13:10:19.610Z",
+    "agent_id": "087a816b-ab9f-400f-8d53-f6f97b94a725",
+    "agent_message_found": false
+  },
+  "anomalies_and_caveats": [
+    "Bootstrap readiness messages were accepted family-wide with target_seat null because exact receiver seat labels were not available.",
+    "Only Hadi Codex returned a verified runtime_read ACK before Task 1 opened.",
+    "No Flight 3 delivery, consumption, correlated ACK, active generation, lease, artifact, result, gate, landing, or autonomy receipt is claimed.",
+    "P1 task creation was refused before flight or project linkage; the eight bootstrap tasks were created at P2 and linked immutably by the flight meta.",
+    "External-source task intake intentionally cleared initial assignees; an org-owner assignment pass restored exact sole owners.",
+    "Inactive Mupot OS Dev could not be assigned Task 5; active Hadi OpenCode was used instead.",
+    "One mistyped Hadi River UUID was rejected; the exact canonical UUID was then assigned.",
+    "Task 1 dispatch produced a dispatch receipt but no matching agent_messages row was visible to the canonical inbox."
+  ],
+  "implementation_started_before_task0_frozen": false
+}
