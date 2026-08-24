@@ -980,6 +980,49 @@ describe('Flight Spine MCP integration', () => {
     expect(JSON.stringify(receipt)).not.toContain('dependency-visible-child')
   })
 
+  it('returns receipt_not_found when an otherwise-visible dependency has syntactically invalid stored claims', async () => {
+    const objective = await acceptObjectiveFixture({
+      idempotencyKey: 'objective-invalid-json-dependency',
+    })
+    seedFlight({
+      id: 'flight-invalid-json-parent',
+      objectiveId: objective.id,
+    })
+    seedFlight({
+      id: 'flight-invalid-json-child',
+      objectiveId: objective.id,
+    })
+    seedDependency(
+      'dependency-invalid-json',
+      objective.id,
+      'flight-invalid-json-parent',
+      'flight-invalid-json-child',
+    )
+    const dependency = await appendExecutionReceipt(env, primaryAuth(), dependencyDraft(
+      'dependency-invalid-json-receipt',
+      objective.id,
+      'flight-invalid-json-parent',
+      'dependency-invalid-json',
+      'flight-invalid-json-child',
+    ))
+    expect((await invoke('execution_receipt_get', { receiptId: dependency.id })).ok).toBe(true)
+
+    harness.sqlite.exec(`
+      DROP TRIGGER execution_receipts_no_update;
+      PRAGMA ignore_check_constraints = ON;
+    `)
+    harness.sqlite.prepare(`
+      UPDATE execution_receipts SET claims_json = ? WHERE id = ?
+    `).run('{', dependency.id)
+    harness.sqlite.exec('PRAGMA ignore_check_constraints = OFF')
+
+    expect(await invoke('execution_receipt_get', { receiptId: dependency.id })).toMatchObject({
+      ok: false,
+      status: 404,
+      error: 'receipt_not_found',
+    })
+  })
+
   it('hides dependency receipts with malformed claims, parent mismatch, missing rows, or hidden child projects', async () => {
     const objective = await acceptObjectiveFixture({
       idempotencyKey: 'objective-invalid-dependencies',
