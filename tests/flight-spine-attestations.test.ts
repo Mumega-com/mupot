@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   issueTokenBindingAttestation,
 } from '../src/flight-spine/attestations'
-import type { AuthContext } from '../src/types'
+import type { AuthContext, Capability } from '../src/types'
 import type { MemberTokenFingerprintEnv } from '../src/members/service'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
@@ -16,6 +16,7 @@ const AGENT_ID = '087a0000-0000-4000-8000-000000000001'
 const TOKEN_ID = 'token-command-seat'
 const TOKEN_HASH = 'a'.repeat(64)
 const FINGERPRINT_SECRET = 'dedicated-test-member-token-fingerprint-secret'
+const TOKEN_EXPIRES_AT = '2099-08-24T16:00:00.000Z'
 
 let harness: SqliteD1Harness
 let env: MemberTokenFingerprintEnv
@@ -63,6 +64,15 @@ function auth(overrides: Partial<AuthContext> = {}): AuthContext {
   }
 }
 
+function squadCapability(capability: Capability): NonNullable<AuthContext['capabilities']> {
+  return [{
+    member_id: MEMBER_ID,
+    scope_type: 'squad',
+    scope_id: 'squad-command',
+    capability,
+  }]
+}
+
 function seedIdentity(): void {
   harness.sqlite.exec(`
     INSERT INTO departments (id, slug, name)
@@ -74,17 +84,21 @@ function seedIdentity(): void {
         '${AGENT_ID}', 'squad-command', 'hadi-codex', 'Hadi Codex',
         'member', 'test', 'active'
       );
+    INSERT INTO memberships (id, agent_id, squad_id, capability)
+      VALUES ('membership-command', '${AGENT_ID}', 'squad-command', 'member');
     INSERT INTO members (id, display_name, status, tenant)
       VALUES ('${MEMBER_ID}', 'Hadi Codex Member', 'active', '${TENANT}');
     INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
       VALUES ('${TENANT}', '${AGENT_ID}', '${MEMBER_ID}', '${NOW}');
+    INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+      VALUES ('capability-command', '${MEMBER_ID}', 'squad', 'squad-command', 'member');
     INSERT INTO member_tokens (
       id, member_id, token_hash, label, channel, created_at, revoked_at,
       agent_id, tenant, expires_at
     ) VALUES (
       '${TOKEN_ID}', '${MEMBER_ID}', '${TOKEN_HASH}', 'hadi-codex-cli',
-      'workspace', '2026-08-23T15:00:00.000Z', NULL, '${AGENT_ID}',
-      '${TENANT}', '2026-08-24T16:00:00.000Z'
+      'workspace', '2020-08-23T15:00:00.000Z', NULL, '${AGENT_ID}',
+      '${TENANT}', '${TOKEN_EXPIRES_AT}'
     );
   `)
 }
@@ -123,7 +137,7 @@ describe('Flight Spine token-binding attestations', () => {
       channel: 'workspace',
       credentialFingerprint: expected,
       issuedAt: NOW,
-      expiresAt: '2026-08-24T16:00:00.000Z',
+      expiresAt: TOKEN_EXPIRES_AT,
       createdAt: NOW,
     })
     expect(attestation.credentialFingerprint).toMatch(/^v1:[0-9a-f]{64}$/)
@@ -172,6 +186,86 @@ describe('Flight Spine token-binding attestations', () => {
 
     await expect(issueTokenBindingAttestation(env, auth()))
       .rejects.toMatchObject({ code: 'workspace_token_required' })
+  })
+
+  it.each([
+    ['directory zero ceiling', auth({ channel: 'directory', capabilities: [] })],
+    ['workspace empty ceiling', auth({ capabilities: [] })],
+    ['workspace observer ceiling', auth({ capabilities: squadCapability('observer') })],
+  ])('denies a %s before issuing an attestation', async (_label, deniedAuth) => {
+    await expect(issueTokenBindingAttestation(env, deniedAuth))
+      .rejects.toMatchObject({ code: 'workspace_token_required' })
+    expect(harness.sqlite.prepare(
+      'SELECT COUNT(*) AS count FROM token_binding_attestations',
+    ).get()).toEqual({ count: 0 })
+  })
+
+  it('uses SQLite statement time when token expiry elapses between preflight and insert', async () => {
+    const sqliteNow = new Date((harness.sqlite.prepare(`
+      SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now') AS now
+    `).get() as { now: string }).now).getTime()
+    const preflight = new Date(sqliteNow - 60_000)
+    const elapsedExpiry = new Date(sqliteNow - 1_000).toISOString()
+    vi.setSystemTime(preflight)
+    const racedEnv = envWithBeforeAttestationInsert(() => {
+      harness.sqlite.prepare(`
+        UPDATE member_tokens SET expires_at = ? WHERE id = ?
+      `).run(elapsedExpiry, TOKEN_ID)
+    })
+
+    await expect(issueTokenBindingAttestation(racedEnv, auth({
+      capabilities: squadCapability('member'),
+    }))).rejects.toMatchObject({ code: 'workspace_token_required' })
+    expect(harness.sqlite.prepare(
+      'SELECT COUNT(*) AS count FROM token_binding_attestations',
+    ).get()).toEqual({ count: 0 })
+  })
+
+  it.each([
+    ['removed agent membership', `DELETE FROM memberships WHERE id = 'membership-command'`],
+    ['downgraded agent membership', `UPDATE memberships SET capability = 'observer' WHERE id = 'membership-command'`],
+    ['revoked human grant', `DELETE FROM capabilities WHERE id = 'capability-command'`],
+    ['downgraded human grant', `UPDATE capabilities SET capability = 'observer' WHERE id = 'capability-command'`],
+  ])('denies a %s before issuing an attestation', async (_label, mutation) => {
+    harness.sqlite.exec(mutation)
+
+    await expect(issueTokenBindingAttestation(env, auth()))
+      .rejects.toMatchObject({ code: 'workspace_token_required' })
+    expect(harness.sqlite.prepare(
+      'SELECT COUNT(*) AS count FROM token_binding_attestations',
+    ).get()).toEqual({ count: 0 })
+  })
+
+  it.each([
+    ['removed agent membership', `DELETE FROM memberships WHERE id = 'membership-command'`],
+    ['downgraded agent membership', `UPDATE memberships SET capability = 'observer' WHERE id = 'membership-command'`],
+    ['revoked human grant', `DELETE FROM capabilities WHERE id = 'capability-command'`],
+    ['downgraded human grant', `UPDATE capabilities SET capability = 'observer' WHERE id = 'capability-command'`],
+  ])('does not replay an existing attestation after %s', async (_label, mutation) => {
+    const first = await issueTokenBindingAttestation(env, auth())
+    harness.sqlite.exec(mutation)
+
+    await expect(issueTokenBindingAttestation(env, auth()))
+      .rejects.toMatchObject({ code: 'workspace_token_required' })
+    expect(harness.sqlite.prepare(`
+      SELECT id FROM token_binding_attestations WHERE token_id = ?
+    `).get(TOKEN_ID)).toEqual({ id: first.id })
+  })
+
+  it.each([
+    ['agent membership removal', `DELETE FROM memberships WHERE id = 'membership-command'`],
+    ['agent membership downgrade', `UPDATE memberships SET capability = 'observer' WHERE id = 'membership-command'`],
+    ['human grant revocation', `DELETE FROM capabilities WHERE id = 'capability-command'`],
+    ['human grant downgrade', `UPDATE capabilities SET capability = 'observer' WHERE id = 'capability-command'`],
+  ])('rejects %s between authority preflight and immutable insert', async (_label, mutation) => {
+    const racedEnv = envWithBeforeAttestationInsert(() => harness.sqlite.exec(mutation))
+
+    await expect(issueTokenBindingAttestation(racedEnv, auth({
+      capabilities: squadCapability('member'),
+    }))).rejects.toMatchObject({ code: 'workspace_token_required' })
+    expect(harness.sqlite.prepare(
+      'SELECT COUNT(*) AS count FROM token_binding_attestations',
+    ).get()).toEqual({ count: 0 })
   })
 
   it('rechecks liveness before replaying an existing immutable attestation', async () => {

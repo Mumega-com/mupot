@@ -314,6 +314,109 @@ function mapLease(row: RuntimeSeatLeaseRow): RuntimeSeatLease {
   }
 }
 
+interface PendingSeatRegistrationAuthority {
+  squadId: string
+  departmentId: string
+  tokenHash: string
+}
+
+async function requirePendingSeatRegistrationAuthority(
+  env: MemberTokenFingerprintEnv,
+  auth: AuthContext,
+  attestation: TokenBindingAttestation,
+): Promise<PendingSeatRegistrationAuthority> {
+  const memberId = (auth.memberId ?? auth.userId).trim()
+  const agentId = auth.boundAgentId?.trim() ?? ''
+  const tokenId = auth.tokenId?.trim() ?? ''
+  if (
+    auth.tenant !== env.TENANT_SLUG
+    || auth.channel !== 'workspace'
+    || memberId === ''
+    || agentId === ''
+    || tokenId === ''
+    || attestation.tenant !== env.TENANT_SLUG
+    || attestation.tokenId !== tokenId
+    || attestation.memberId !== memberId
+    || attestation.agentId !== agentId
+    || attestation.channel !== 'workspace'
+  ) {
+    throw new RuntimeSeatError('workspace_token_required')
+  }
+
+  const row = await env.DB.prepare(`
+    SELECT token.token_hash, agent.squad_id, squad.department_id
+      FROM token_binding_attestations attestation
+      JOIN member_tokens token
+        ON token.id = attestation.token_id
+       AND token.tenant = attestation.tenant
+       AND token.member_id = attestation.member_id
+       AND token.agent_id = attestation.agent_id
+       AND token.channel = attestation.channel
+      JOIN members member
+        ON member.id = token.member_id AND member.tenant = token.tenant
+      JOIN agents agent ON agent.id = token.agent_id
+      JOIN squads squad ON squad.id = agent.squad_id
+      JOIN memberships membership
+        ON membership.agent_id = agent.id AND membership.squad_id = squad.id
+      JOIN agent_member_bindings binding
+        ON binding.tenant = token.tenant
+       AND binding.agent_id = token.agent_id
+       AND binding.member_id = token.member_id
+     WHERE attestation.id = ?1
+       AND attestation.tenant = ?2
+       AND attestation.token_id = ?3
+       AND attestation.member_id = ?4
+       AND attestation.agent_id = ?5
+       AND attestation.channel = 'workspace'
+       AND attestation.credential_fingerprint = ?6
+       AND (attestation.expires_at IS NULL
+            OR julianday(attestation.expires_at) > julianday(?7))
+       AND member.status = 'active'
+       AND agent.status = 'active'
+       AND CASE membership.capability
+         WHEN 'owner' THEN 5 WHEN 'admin' THEN 4 WHEN 'lead' THEN 3
+         WHEN 'member' THEN 2 WHEN 'observer' THEN 1 ELSE 0 END >= 2
+       AND ${TOKEN_LIVE_PREDICATE('?7').replaceAll('t.', 'token.')}
+       AND julianday(token.created_at) <= julianday(?7)
+     LIMIT 1
+  `).bind(
+    attestation.id,
+    env.TENANT_SLUG,
+    tokenId,
+    memberId,
+    agentId,
+    attestation.credentialFingerprint,
+    nowSqlUtc(),
+  ).first<{ token_hash: string; squad_id: string; department_id: string }>()
+  if (!row) throw new RuntimeSeatError('workspace_token_required')
+
+  const effectiveGrants = auth.capabilities ?? (await resolveCapabilities(env, memberId))
+  if (!hasCapability(
+    effectiveGrants,
+    'squad',
+    row.squad_id,
+    'member',
+    row.department_id,
+  )) {
+    throw new RuntimeSeatError('workspace_token_required')
+  }
+  const liveGrants = await resolveCapabilities(env, memberId)
+  if (!hasCapability(
+    liveGrants,
+    'squad',
+    row.squad_id,
+    'member',
+    row.department_id,
+  )) {
+    throw new RuntimeSeatError('workspace_token_required')
+  }
+  return {
+    squadId: row.squad_id,
+    departmentId: row.department_id,
+    tokenHash: row.token_hash,
+  }
+}
+
 /** Create only a pending command-seat identity and its immutable public claim. */
 export async function registerPendingRuntimeSeat(
   env: MemberTokenFingerprintEnv,
@@ -322,6 +425,7 @@ export async function registerPendingRuntimeSeat(
 ): Promise<RegisteredPendingRuntimeSeat> {
   const normalized = normalizePendingInput(input)
   const tokenAttestation = await issueTokenBindingAttestation(env, auth)
+  const authority = await requirePendingSeatRegistrationAuthority(env, auth, tokenAttestation)
   const seatId = crypto.randomUUID()
   const seatAttestationId = crypto.randomUUID()
   const createdAt = new Date().toISOString()
@@ -362,6 +466,9 @@ export async function registerPendingRuntimeSeat(
           JOIN members member
             ON member.id = token.member_id AND member.tenant = token.tenant
           JOIN agents agent ON agent.id = token.agent_id
+          JOIN squads squad ON squad.id = agent.squad_id
+          JOIN memberships membership
+            ON membership.agent_id = agent.id AND membership.squad_id = squad.id
           JOIN agent_member_bindings binding
             ON binding.tenant = token.tenant
            AND binding.agent_id = token.agent_id
@@ -373,10 +480,41 @@ export async function registerPendingRuntimeSeat(
            AND attestation.channel = 'workspace'
            AND attestation.credential_fingerprint = ?11
            AND (attestation.expires_at IS NULL
-                OR julianday(attestation.expires_at) > julianday(?12))
+                OR julianday(attestation.expires_at) > julianday('now'))
            AND member.status = 'active'
            AND agent.status = 'active'
-           AND ${TOKEN_LIVE_PREDICATE('?12').replaceAll('t.', 'token.')}
+           AND token.token_hash = ?12
+           AND squad.id = ?13
+           AND squad.department_id = ?14
+           AND CASE membership.capability
+             WHEN 'owner' THEN 5 WHEN 'admin' THEN 4 WHEN 'lead' THEN 3
+             WHEN 'member' THEN 2 WHEN 'observer' THEN 1 ELSE 0 END >= 2
+           AND (
+             EXISTS (
+               SELECT 1 FROM capabilities capability
+                WHERE capability.member_id = member.id
+                  AND (
+                    capability.scope_type = 'org'
+                    OR (capability.scope_type = 'department'
+                      AND capability.scope_id = squad.department_id)
+                    OR (capability.scope_type = 'squad'
+                      AND capability.scope_id = squad.id)
+                  )
+                  AND CASE capability.capability
+                    WHEN 'owner' THEN 5 WHEN 'admin' THEN 4 WHEN 'lead' THEN 3
+                    WHEN 'member' THEN 2 WHEN 'observer' THEN 1 ELSE 0 END >= 2
+             )
+             OR EXISTS (
+               SELECT 1 FROM channel_capability_grants capability
+                WHERE capability.member_id = member.id
+                  AND capability.squad_id = squad.id
+                  AND CASE capability.capability
+                    WHEN 'owner' THEN 5 WHEN 'admin' THEN 4 WHEN 'lead' THEN 3
+                    WHEN 'member' THEN 2 WHEN 'observer' THEN 1 ELSE 0 END >= 2
+             )
+           )
+           AND ${TOKEN_LIVE_PREDICATE("datetime('now')").replaceAll('t.', 'token.')}
+           AND julianday(token.created_at) <= julianday('now')
            AND NOT EXISTS (
              SELECT 1 FROM runtime_seats existing
               WHERE existing.tenant = token.tenant
@@ -395,7 +533,9 @@ export async function registerPendingRuntimeSeat(
         tokenAttestation.memberId,
         tokenAttestation.agentId,
         tokenAttestation.credentialFingerprint,
-        nowSqlUtc(),
+        authority.tokenHash,
+        authority.squadId,
+        authority.departmentId,
       ),
       env.DB.prepare(`
         INSERT INTO seat_attestations (

@@ -176,8 +176,8 @@ beforeEach(() => {
       agent_id, tenant, expires_at
     ) VALUES (
       '${TOKEN_ID}', '${MEMBER_ID}', '${TOKEN_HASH}', 'hadi-codex-cli',
-      'workspace', '2030-08-23T15:00:00.000Z', NULL, '${AGENT_ID}',
-      '${TENANT}', '2030-08-24T16:00:00.000Z'
+      'workspace', '2020-08-23T15:00:00.000Z', NULL, '${AGENT_ID}',
+      '${TENANT}', '2099-08-24T16:00:00.000Z'
     );
   `)
   env = {
@@ -284,6 +284,62 @@ describe('Flight Spine pending runtime seats', () => {
     expect(() => harness.sqlite.prepare(`
       DELETE FROM seat_attestations WHERE id = ?
     `).run(registered.attestation.id)).toThrow(/seat attestations are immutable/i)
+  })
+
+  it.each([
+    ['directory zero ceiling', auth({ channel: 'directory', capabilities: [] })],
+    ['workspace empty ceiling', auth({ capabilities: [] })],
+    ['workspace observer ceiling', auth({ capabilities: squadCapability('observer') })],
+  ])('denies %s without creating any registration facts', async (_label, deniedAuth) => {
+    await expect(registerPendingRuntimeSeat(
+      env,
+      deniedAuth,
+      pendingInput('codex-desktop-denied'),
+    )).rejects.toMatchObject({ code: 'workspace_token_required' })
+    expect(count('token_binding_attestations')).toBe(0)
+    expect(count('runtime_seats')).toBe(0)
+    expect(count('seat_attestations')).toBe(0)
+    expect(count('mutation_audit_entries')).toBe(0)
+  })
+
+  it.each([
+    ['agent membership removal', `DELETE FROM memberships WHERE id = 'membership-command'`],
+    ['agent membership downgrade', `UPDATE memberships SET capability = 'observer' WHERE id = 'membership-command'`],
+    ['human grant revocation', `DELETE FROM capabilities WHERE id = 'capability-command'`],
+    ['human grant downgrade', `UPDATE capabilities SET capability = 'observer' WHERE id = 'capability-command'`],
+    ['token hash replacement', `UPDATE member_tokens SET token_hash = '${'f'.repeat(64)}' WHERE id = '${TOKEN_ID}'`],
+  ])('rolls registration back when %s wins after attestation preflight', async (_label, mutation) => {
+    const racedEnv = envWithBeforeBatch(() => harness.sqlite.exec(mutation))
+
+    await expect(registerPendingRuntimeSeat(
+      racedEnv,
+      auth({ capabilities: squadCapability('member') }),
+      pendingInput('codex-desktop-raced'),
+    )).rejects.toBeTruthy()
+    expect(count('token_binding_attestations')).toBe(1)
+    expect(count('runtime_seats')).toBe(0)
+    expect(count('seat_attestations')).toBe(0)
+    expect(count('mutation_audit_entries')).toBe(0)
+  })
+
+  it('uses SQLite statement time when token expiry elapses before the registration batch', async () => {
+    const clock = sqliteClockWindow()
+    vi.setSystemTime(clock.preflight)
+    const racedEnv = envWithBeforeBatch(() => {
+      harness.sqlite.prepare(`
+        UPDATE member_tokens SET expires_at = ? WHERE id = ?
+      `).run(clock.elapsedExpiry, TOKEN_ID)
+    })
+
+    await expect(registerPendingRuntimeSeat(
+      racedEnv,
+      auth({ capabilities: squadCapability('member') }),
+      pendingInput('codex-desktop-expired-race'),
+    )).rejects.toBeTruthy()
+    expect(count('token_binding_attestations')).toBe(1)
+    expect(count('runtime_seats')).toBe(0)
+    expect(count('seat_attestations')).toBe(0)
+    expect(count('mutation_audit_entries')).toBe(0)
   })
 })
 

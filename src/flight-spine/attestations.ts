@@ -1,4 +1,5 @@
 import type { AuthContext } from '../types'
+import { hasCapability, resolveCapabilities } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import {
   deriveSafeMemberTokenFingerprint,
@@ -38,6 +39,8 @@ interface LiveTokenBindingRow {
   agent_id: string
   token_hash: string
   expires_at: string | null
+  squad_id: string
+  department_id: string
 }
 
 interface TokenBindingAttestationRow {
@@ -94,12 +97,17 @@ async function readLiveTokenBinding(
   const identity = authenticatedWorkspaceFacts(env, auth)
   const row = await env.DB.prepare(`
     SELECT token.id AS token_id, token.member_id, token.agent_id,
-           token.token_hash, token.expires_at
+           token.token_hash, token.expires_at, agent.squad_id,
+           squad.department_id
       FROM member_tokens token
       JOIN members member
         ON member.id = token.member_id
        AND member.tenant = token.tenant
       JOIN agents agent ON agent.id = token.agent_id
+      JOIN squads squad ON squad.id = agent.squad_id
+      JOIN memberships membership
+        ON membership.agent_id = agent.id
+       AND membership.squad_id = squad.id
       JOIN agent_member_bindings binding
         ON binding.tenant = token.tenant
        AND binding.agent_id = token.agent_id
@@ -111,6 +119,9 @@ async function readLiveTokenBinding(
        AND token.channel = 'workspace'
        AND member.status = 'active'
        AND agent.status = 'active'
+       AND CASE membership.capability
+         WHEN 'owner' THEN 5 WHEN 'admin' THEN 4 WHEN 'lead' THEN 3
+         WHEN 'member' THEN 2 WHEN 'observer' THEN 1 ELSE 0 END >= 2
        AND ${TOKEN_LIVE_PREDICATE('?5').replaceAll('t.', 'token.')}
        AND julianday(token.created_at) <= julianday(?5)
      LIMIT 1
@@ -122,6 +133,32 @@ async function readLiveTokenBinding(
     nowSqlUtc(),
   ).first<LiveTokenBindingRow>()
   if (!row) throw new AttestationError('workspace_token_required')
+
+  // `auth.capabilities` is the request's ambient authority ceiling. When it is
+  // present, an empty/observer view must stay denied even if D1 still contains a
+  // stronger grant. A second live read is the revocation check and never widens
+  // that ceiling.
+  const effectiveGrants = auth.capabilities
+    ?? (await resolveCapabilities(env, identity.memberId))
+  if (!hasCapability(
+    effectiveGrants,
+    'squad',
+    row.squad_id,
+    'member',
+    row.department_id,
+  )) {
+    throw new AttestationError('workspace_token_required')
+  }
+  const liveGrants = await resolveCapabilities(env, identity.memberId)
+  if (!hasCapability(
+    liveGrants,
+    'squad',
+    row.squad_id,
+    'member',
+    row.department_id,
+  )) {
+    throw new AttestationError('workspace_token_required')
+  }
   return row
 }
 
@@ -185,6 +222,10 @@ export async function issueTokenBindingAttestation(
           ON member.id = token.member_id
          AND member.tenant = token.tenant
         JOIN agents agent ON agent.id = token.agent_id
+        JOIN squads squad ON squad.id = agent.squad_id
+        JOIN memberships membership
+          ON membership.agent_id = agent.id
+         AND membership.squad_id = squad.id
         JOIN agent_member_bindings binding
           ON binding.tenant = token.tenant
          AND binding.agent_id = token.agent_id
@@ -196,9 +237,38 @@ export async function issueTokenBindingAttestation(
          AND token.channel = 'workspace'
          AND member.status = 'active'
          AND agent.status = 'active'
-         AND ${TOKEN_LIVE_PREDICATE('?8').replaceAll('t.', 'token.')}
-         AND julianday(token.created_at) <= julianday(?8)
-         AND token.token_hash = ?9
+         AND squad.id = ?9
+         AND squad.department_id = ?10
+         AND CASE membership.capability
+           WHEN 'owner' THEN 5 WHEN 'admin' THEN 4 WHEN 'lead' THEN 3
+           WHEN 'member' THEN 2 WHEN 'observer' THEN 1 ELSE 0 END >= 2
+         AND (
+           EXISTS (
+             SELECT 1 FROM capabilities capability
+              WHERE capability.member_id = member.id
+                AND (
+                  capability.scope_type = 'org'
+                  OR (capability.scope_type = 'department'
+                    AND capability.scope_id = squad.department_id)
+                  OR (capability.scope_type = 'squad'
+                    AND capability.scope_id = squad.id)
+                )
+                AND CASE capability.capability
+                  WHEN 'owner' THEN 5 WHEN 'admin' THEN 4 WHEN 'lead' THEN 3
+                  WHEN 'member' THEN 2 WHEN 'observer' THEN 1 ELSE 0 END >= 2
+           )
+           OR EXISTS (
+             SELECT 1 FROM channel_capability_grants capability
+              WHERE capability.member_id = member.id
+                AND capability.squad_id = squad.id
+                AND CASE capability.capability
+                  WHEN 'owner' THEN 5 WHEN 'admin' THEN 4 WHEN 'lead' THEN 3
+                  WHEN 'member' THEN 2 WHEN 'observer' THEN 1 ELSE 0 END >= 2
+           )
+         )
+         AND ${TOKEN_LIVE_PREDICATE("datetime('now')").replaceAll('t.', 'token.')}
+         AND julianday(token.created_at) <= julianday('now')
+         AND token.token_hash = ?8
       RETURNING id, tenant, token_id, member_id, agent_id, channel,
                 credential_fingerprint, issued_at, expires_at, created_at
     `).bind(
@@ -209,8 +279,9 @@ export async function issueTokenBindingAttestation(
       env.TENANT_SLUG,
       token.member_id,
       token.agent_id,
-      nowSqlUtc(),
       token.token_hash,
+      token.squad_id,
+      token.department_id,
     ).all<TokenBindingAttestationRow>()
     const rows = written.results ?? []
     if (rows.length !== 1) throw new AttestationError('workspace_token_required')
