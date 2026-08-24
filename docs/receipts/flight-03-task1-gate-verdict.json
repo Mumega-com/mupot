@@ -1,0 +1,48 @@
+{
+  "schema": "FLIGHT-03-TASK1-GATE-VERDICT",
+  "version": 1,
+  "verdict": "PASS",
+  "request_id": "9c4c9ad7-4f57-4977-942a-51077182b62d",
+  "review_wake_request_id": "review-wake:a1beef08-406e-4894-b0c6-1d9b97cc98d2:2026-08-24T14:26:26.095Z",
+  "gated_at": "2026-08-24T14:31:18Z",
+  "gate": {
+    "slug": "hadi-grok",
+    "uuid": "a065e61c-6a93-42fc-b070-b541631202f1",
+    "grant": "gate:hadi-grok",
+    "seat": "hadi-grok"
+  },
+  "task_id": "a1beef08-406e-4894-b0c6-1d9b97cc98d2",
+  "bindings": {
+    "repository": "https://github.com/Mumega-com/mupot.git",
+    "branch": "codex/flight03-fenced-delivery",
+    "plan_commit": "21ecbd5db66c7341446da16184109146d37ad1b8",
+    "task1_tip": "99e058a63d29f0da04d3bbd81c550c5c2e26dc68",
+    "repair_range": "c0fa1a2e73af6b21ffcebdaf64df1582560404ec..99e058a63d29f0da04d3bbd81c550c5c2e26dc68",
+    "frozen_base_origin_main": "890a0209c0846c9ce7b4f4561ab13523ddf9a21c",
+    "measured_repair_diff_sha256": "ff9981e594a0aa714c4802c6c8a933d184a1618505192708da371731efdfa516",
+    "measured_five_file_vs_plan_diff_sha256": "3ed91fc28b58003f432f737dc8399e130aa3ae749224a718b6f65f5055a1ef5d",
+    "cited_payload_sha256": "d3441d56f9445162da7037c12e65888c5069dc78502d162855a711f8dbea1624",
+    "cited_payload_sha256_reproduced": false
+  },
+  "independently_verified_this_tick": {
+    "tip_fetchable": true,
+    "five_plan_files_present": true,
+    "0127_0128_not_on_origin_main": true,
+    "migration_numbering_script_ok": true,
+    "focused_vitest": "4 files / 56 tests passed",
+    "migration_numbering_node_tests": "29 passed",
+    "typecheck": true,
+    "no_secrets": true,
+    "proof_exact_seat_trigger_tested": true,
+    "proof_read_at_before_source_ack_tested": true,
+    "max_three_attempts_and_retry_backoff_tested": true,
+    "product_not_edited_by_gate": true
+  },
+  "residuals_not_this_block": [
+    "Cited commit payload SHA256 d3441d56... was not reproduced from git diff/show/archive of c0fa1a2..99e058a or the five Task1 files. Tip commit 99e058a is fetchable and independently tested.",
+    "This PASS is Task1 schema only. Not Task8 candidate gate, not migrate, not deploy."
+  ],
+  "merge_authorized": false,
+  "migration_authorized": false,
+  "autonomy_claim": false
+}
