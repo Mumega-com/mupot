@@ -1,0 +1,53 @@
+{
+  "schema": "FLIGHT-SPINE-SCHEMA-02-LIVE-PROOF-GATE-VERDICT",
+  "version": 2,
+  "verdict": "BLOCK",
+  "request_id": "3ee3994f-95ac-4655-84a8-bd47f0281132",
+  "gated_at": "2026-08-24T12:34:00Z",
+  "gate": {
+    "slug": "hadi-grok",
+    "uuid": "a065e61c-6a93-42fc-b070-b541631202f1",
+    "grant": "gate:hadi-grok",
+    "seat": "hadi-grok"
+  },
+  "prior_block": {
+    "path": "docs/receipts/flight-02-live-proof-gate.json",
+    "commit": "5a4557eca9914830e5fa1e7067e3e97959ab5a2a",
+    "blob": "d215305a1e11d91ffa6163ce894d59c13f8b3b8b",
+    "preserved_unchanged": true
+  },
+  "bindings": {
+    "repository": "https://github.com/Mumega-com/mupot.git",
+    "branch": "codex/flight02-live-proof",
+    "receipt_path": "docs/receipts/flight-02-live-proof.json",
+    "receipt_commit_sha": "341d4fad4de584c48c75417cc08883b23948ef0a",
+    "receipt_sha256": "0ce32c08a355f6b9c75dbac71602a6a07d996ce1dc2a0874173d6a75706b8fe1"
+  },
+  "this_tick": {
+    "session_connect": "mupot__connect agent_name=hadi-grok session_local hot",
+    "mint_rotate_reveal": false,
+    "tools_list_contains_five_spine_tools": false,
+    "objective_get_callable": false,
+    "execution_receipt_get_callable": false,
+    "d1_read_attempted": false,
+    "inferred_from_health_sha": false
+  },
+  "observed": {
+    "search_tool_mupot__objective_get": "not in results",
+    "search_tool_mupot__execution_receipt_get": "not in results",
+    "search_tool_mupot__objective_accept": "not in results",
+    "search_tool_mupot__token_binding_attest": "not in results",
+    "search_tool_mupot__runtime_seat_register_pending": "not in results",
+    "use_tool_mupot__objective_get": "Tool not found: mupot__objective_get"
+  },
+  "defect": {
+    "id": "fresh_tools_list_missing_flight_spine",
+    "threat": "label-without-import-graph",
+    "detail": "After session-local reconnect as hadi-grok, this gate process still cannot prove tools/list contains objective_accept, objective_get, execution_receipt_get, token_binding_attest, runtime_seat_register_pending. mupot__objective_get is Tool not found. Instruction: exact BLOCK; do not infer. Full OAuth connector refresh is outside this process and was not performed. Tokens not minted/rotated/revealed."
+  },
+  "receipt_or_source_edited_by_gate": false,
+  "prior_verdict_edited_by_gate": false,
+  "merge_authorized": false,
+  "deployment_authorized_by_this_verdict": false,
+  "autonomy_claim": false
+}
