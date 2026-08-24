@@ -1,0 +1,28 @@
+{
+  "schema": "FLIGHT-SPINE-SCHEMA-02-CANDIDATE",
+  "version": 1,
+  "status": "awaiting_independent_gate",
+  "source_candidate_sha": "cd4eeac28089ab8f48236c7306f12b9d1ce4460b",
+  "source_tree_sha": "594840fb28514bf24a22a866a96dc95fa918b578",
+  "manifest": {
+    "path": "docs/receipts/flight-02-bootstrap-manifest.json",
+    "sha256": "0c38f32b9372ab269db6c4a720e3ee1993ec15ffd3d71909197bb70b619cf3d6"
+  },
+  "packager": {
+    "slug": "hadi-codex",
+    "uuid": "087a816b-ab9f-400f-8d53-f6f97b94a725"
+  },
+  "packaged_at": "2026-08-24T03:57:27Z",
+  "supported_claims": [
+    "Migrations 0121 through 0126 are additive above verified main head 0120.",
+    "The listed Flight Spine service interfaces and exactly five bounded MCP tools exist at the exact source SHA.",
+    "The fresh Task 8 migration, schema, compatibility, full-test, typecheck, secret, diff, and clean-source gates passed."
+  ],
+  "excluded_claims": [
+    "No production migration or deployment is authorized or performed.",
+    "No live token attestation, pending-seat registration, runtime delivery, consumption, ACK, artifact bytes, result, gate, landing, recovery, or autonomy is proven.",
+    "The legacy Mupot flight failed by watchdog TTL reap and did not land."
+  ],
+  "autonomy_claim": false,
+  "deployment_authorized": false
+}
