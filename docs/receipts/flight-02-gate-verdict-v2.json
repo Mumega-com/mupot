@@ -1,0 +1,116 @@
+{
+  "schema": "FLIGHT-SPINE-SCHEMA-02-GATE-VERDICT",
+  "version": 2,
+  "verdict": "PASS",
+  "request_id": "b12f97ad-daa3-4c04-b853-986da31a5de0",
+  "gated_at": "2026-08-24T04:26:15Z",
+  "gate": {
+    "slug": "hadi-grok",
+    "uuid": "a065e61c-6a93-42fc-b070-b541631202f1",
+    "grant": "gate:hadi-grok",
+    "seat": "hadi-grok",
+    "planned_identity_was_athena": true,
+    "actual_identity_is_hadi_grok": true
+  },
+  "prior_block": {
+    "path": "docs/receipts/flight-02-gate-verdict.json",
+    "commit": "76375e74cbf7004f7865032bd67fe9bf08bb2bd2",
+    "sha256": "c2c8e23baceba87125c69e27163031e4a55c9d9025b2c186d0c23470a05d6dd3",
+    "blob": "5825727d459cfd2ad923137acf2976c10f2e1222",
+    "preserved_unchanged": true,
+    "defect_id_closed": "raw_logs_not_fetchable"
+  },
+  "bindings": {
+    "repository": "https://github.com/Mumega-com/mupot.git",
+    "branch": "codex/flight02-spine-schema",
+    "evidence_package_commit_sha": "35b1314dfa5650458b7701f3e06c41501a8a21b8",
+    "source_candidate_sha": "cd4eeac28089ab8f48236c7306f12b9d1ce4460b",
+    "source_tree_sha": "594840fb28514bf24a22a866a96dc95fa918b578",
+    "manifest_path": "docs/receipts/flight-02-bootstrap-manifest.json",
+    "manifest_sha256": "7f49c6ae6fa21788ddfdfe29d50863f7628fa69fafb607b2c90eca9ab26d7df9",
+    "candidate_path": "docs/receipts/flight-02-candidate.json",
+    "candidate_sha256": "b3b33088eed2f82c413dbb3f7d10bad79cec5a51c272ace414ef5dfabcf20964",
+    "design_spec_path": "docs/superpowers/specs/2026-08-23-autonomous-three-squad-flight-system-design.md",
+    "design_spec_sha256": "d138b037216d3a54b84a53b1d0860a632aa27d4d2f0e0ddb3d74b9ea6304ccbd",
+    "flight_2_plan_path": "docs/superpowers/plans/2026-08-23-flight-02-spine-schema.md",
+    "flight_2_plan_sha256": "66c3b066348f7da5c5f52cdf57ebba9418808474e42b043852ac89981af9a717"
+  },
+  "independently_verified_this_tick": {
+    "evidence_package_fetchable": true,
+    "source_candidate_fetchable": true,
+    "source_tree_sha_matches": true,
+    "manifest_sha256_matches": true,
+    "candidate_sha256_matches": true,
+    "prior_block_blob_unchanged": true,
+    "package_does_not_edit_source_or_prior_verdict": true,
+    "changed_files_sha256_match_source": "35/35",
+    "migrations_0121_through_0126_additive_above_0120": true,
+    "exactly_five_mcp_tools_wired": true,
+    "exported_service_interfaces_present": true,
+    "raw_task8_logs_fetchable": true,
+    "raw_task8_logs_sha256_match": "11/11",
+    "governing_docs_fetchable_and_sha256_match": true,
+    "full_npm_test_log_records": "Test Files 408 passed (408); Tests 6370 passed (6370); __EXIT__ 0",
+    "secret_scan_log_records": "no secrets found; __EXIT__ 0"
+  },
+  "log_digests": {
+    "independently_verified": true,
+    "cited_and_matched": [
+      {
+        "log_path": ".superpowers/sdd/2026-08-23-flight-02-spine-schema/task-8-logs-cd4eeac/00-source-remote-preflight.log",
+        "sha256": "e228cc276ee7628c880e9196350f089cd7c69e2137628293608c7415bb14ed1c"
+      },
+      {
+        "log_path": ".superpowers/sdd/2026-08-23-flight-02-spine-schema/task-8-logs-cd4eeac/01-migration-numbering-script.log",
+        "sha256": "5edb108c5e18204273fbdddf0e885289f2d612f9a5bc21881cc9e12330fe9818"
+      },
+      {
+        "log_path": ".superpowers/sdd/2026-08-23-flight-02-spine-schema/task-8-logs-cd4eeac/02-migration-numbering-node.log",
+        "sha256": "cf32b25eab92abceca6d8882feaaa1866c67ac458c12a81bf894ffc1994b3afe"
+      },
+      {
+        "log_path": ".superpowers/sdd/2026-08-23-flight-02-spine-schema/task-8-logs-cd4eeac/03-schema-d1-helpers.log",
+        "sha256": "1c72ee23bdeffdc60f9980cfee5ffb1046a61e69cb007b3637abd6651b00f01d"
+      },
+      {
+        "log_path": ".superpowers/sdd/2026-08-23-flight-02-spine-schema/task-8-logs-cd4eeac/04-flight-spine-all.log",
+        "sha256": "072c57d8e3663c503f219f1e1e4dea40c3720a2978babe5c14a7357737b3cb0d"
+      },
+      {
+        "log_path": ".superpowers/sdd/2026-08-23-flight-02-spine-schema/task-8-logs-cd4eeac/05-required-compatibility.log",
+        "sha256": "fac0d546d3592d763d4b6b27460b9616d8bcedd2635ab26461fae5ba5c03bb7a"
+      },
+      {
+        "log_path": ".superpowers/sdd/2026-08-23-flight-02-spine-schema/task-8-logs-cd4eeac/06-full-npm-test.log",
+        "sha256": "e114c572c7cac5de459f77d0b564bf0baf31558d9137f5317399dd39b7c0d60e"
+      },
+      {
+        "log_path": ".superpowers/sdd/2026-08-23-flight-02-spine-schema/task-8-logs-cd4eeac/07-typecheck.log",
+        "sha256": "6d58c26d938fbadfa54da5a3750112b8ac6e58447e276c262c5fc999a8ab07d1"
+      },
+      {
+        "log_path": ".superpowers/sdd/2026-08-23-flight-02-spine-schema/task-8-logs-cd4eeac/08-no-secrets.log",
+        "sha256": "ee96b0eca1814862216032fc1753a86fec6e4132e4fceff793c9b7960407f68e"
+      },
+      {
+        "log_path": ".superpowers/sdd/2026-08-23-flight-02-spine-schema/task-8-logs-cd4eeac/09-base-source-diff-check.log",
+        "sha256": "30633a3b741b12777e9963ed0b69c23c93227eb4ce01e7bcd65b17a7801fd218"
+      },
+      {
+        "log_path": ".superpowers/sdd/2026-08-23-flight-02-spine-schema/task-8-logs-cd4eeac/10-clean-source-status.log",
+        "sha256": "d48b085f19636a4f354316ac75c844152c05f395ca7c246a3d953970a4a28995"
+      }
+    ]
+  },
+  "exclusions_recorded": true,
+  "legacy_mupot_stored_go_is_not_this_gate": true,
+  "autonomy_claim": false,
+  "deployment_authorized": false,
+  "merge_authorized": false,
+  "source_or_candidate_edited_by_gate": false,
+  "prior_verdict_edited_by_gate": false,
+  "residuals_not_this_block": [
+    "This PASS certifies the frozen source plus fetchable evidence package; it is not production parity, remote D1 migration, Worker deploy, live token attestation, pending-seat registration, or landing.",
+    "Gate did not re-execute npm test this tick; the authoritative 6370-pass claim is bound to fetchable log digest e114c572c7cac5de459f77d0b564bf0baf31558d9137f5317399dd39b7c0d60e."
+  ]
+}
