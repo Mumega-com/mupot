@@ -46,15 +46,15 @@ function input(overrides: Partial<MutationAuditInput> = {}): MutationAuditInput 
     operation: 'update',
     targetKind: 'task',
     targetId: 'task-audit',
-    before: { password: 'not-for-the-ledger', version: 1 },
+    before: { version: 1 },
     after: { version: 2 },
     runtimeSeatId: SEAT_ID,
     runtimeGeneration: 1,
     requestId: 'request-audit-1',
     idempotencyKey: 'audit-idempotency-1',
     evidence: {
-      apiToken: 'raw-token-value',
-      note: 'Authorization: Bearer raw-bearer-value',
+      receiptDigest: 'd'.repeat(64),
+      note: 'Authorization decision recorded without credential material.',
     },
     ...overrides,
   }
@@ -154,7 +154,7 @@ afterEach(() => {
 })
 
 describe('Flight Spine mutation audit', () => {
-  it('attributes the authenticated principal and canonical before/after digests without raw secrets', async () => {
+  it('attributes the authenticated principal and canonical before/after digests', async () => {
     const record = await auditMutation(env, auth(), input())
 
     expect(record).toMatchObject({
@@ -168,19 +168,64 @@ describe('Flight Spine mutation audit', () => {
       runtimeGeneration: 1,
       origin: 'rest',
       handler: 'flight_spine.test_mutation',
-      beforeDigest: sha256('{"password":"[redacted]","version":1}'),
+      beforeDigest: sha256('{"version":1}'),
       afterDigest: sha256('{"version":2}'),
     })
     expect(record.evidence).toEqual({
-      apiToken: '[redacted]',
-      note: 'Authorization: [redacted]',
+      note: 'Authorization decision recorded without credential material.',
+      receiptDigest: 'd'.repeat(64),
     })
-    const persisted = JSON.stringify(harness.sqlite.prepare(`
-      SELECT * FROM mutation_audit_entries WHERE id = ?
-    `).get(record.id))
-    expect(persisted).not.toContain('not-for-the-ledger')
-    expect(persisted).not.toContain('raw-token-value')
-    expect(persisted).not.toContain('raw-bearer-value')
+  })
+
+  it('rejects credential-shaped keys and values recursively while allowing safe near-misses', async () => {
+    const credentials = [
+      { Api_Token: 'safe-looking-but-sensitive-key' },
+      { nested: { client_secret: 'sensitive-by-key' } },
+      { nested: [{ PaSsWoRd: 'sensitive-by-key' }] },
+      { value: `gh${'p_'}${'a'.repeat(24)}` },
+      { value: `github_pat_${'a'.repeat(24)}` },
+      { value: `glpat-${'a'.repeat(20)}` },
+      { value: `AIza${'A'.repeat(35)}` },
+      { value: `sk_live_${'a'.repeat(20)}` },
+      { value: `rk_test_${'a'.repeat(20)}` },
+      { value: `xoxb-${'a'.repeat(20)}` },
+      { value: `sk-${'a'.repeat(24)}` },
+      { value: `AKIA${'A'.repeat(16)}` },
+      { value: `mupot_${'a'.repeat(20)}` },
+      { value: `eyJ${'a'.repeat(12)}.eyJ${'b'.repeat(12)}.${'c'.repeat(12)}` },
+      { value: `Basic ${'YWFh'.repeat(4)}` },
+      { value: 'api_token=safe-looking-but-sensitive-assignment' },
+      { value: 'https://user:password@example.test/path' },
+      { value: 'ssh://user:password@example.test/repository' },
+      { value: `-----BEGIN PRIVATE KEY-----\n${'a'.repeat(32)}\n-----END PRIVATE KEY-----` },
+    ]
+    for (const [index, evidence] of credentials.entries()) {
+      await expect(auditMutation(env, auth(), input({
+        requestId: `request-credential-${index}`,
+        evidence,
+      }))).rejects.toMatchObject({ name: 'MutationAuditError', code: 'invalid_audit' })
+    }
+
+    const safe = await auditMutation(env, auth(), input({
+      requestId: 'request-safe-near-misses',
+      evidence: {
+        tokenId: 'token-reference-1',
+        signatureDigest: 'f'.repeat(64),
+        values: [
+          'glpat-short', 'AIza-short', 'sk_live_short', 'Basic plan',
+          'https://example.test/path',
+        ],
+      },
+    }))
+    expect(safe.evidence).toEqual({
+      signatureDigest: 'f'.repeat(64),
+      tokenId: 'token-reference-1',
+      values: [
+        'glpat-short', 'AIza-short', 'sk_live_short', 'Basic plan',
+        'https://example.test/path',
+      ],
+    })
+    expect(count('mutation_audit_entries')).toBe(1)
   })
 
   it('returns an exact replay, rejects changed reuse, and leaves audit rows immutable', async () => {

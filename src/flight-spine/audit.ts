@@ -1,7 +1,7 @@
 import type { Env, AuthContext } from '../types'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { canonicalJson, sha256Hex } from '../lib/canonical-json'
-import { redactSecretPatterns, redactStructuredDetail } from '../lib/redact'
+import { isSensitiveDetailKey, redactSecretPatterns } from '../lib/redact'
 import { rowsWritten } from '../lib/receipt'
 import {
   resolveFlightSpinePrincipal,
@@ -79,6 +79,55 @@ export class MutationAuditError extends Error {
   constructor(readonly code: MutationAuditErrorCode) {
     super(code)
   }
+}
+
+const CREDENTIAL_VALUE_PATTERNS = [
+  /\bBearer\s+[^\s"']+/i,
+  /\bBasic\s+[A-Za-z0-9+/]{8,}={0,2}\b/i,
+  /\bxox[baprs]-[A-Za-z0-9-]{8,}\b/i,
+  /\bmupot_[A-Za-z0-9_-]{8,}\b/,
+  /\bgh[pousr]_[A-Za-z0-9_]{12,}\b/,
+  /\bgithub_pat_[A-Za-z0-9_]{12,}\b/,
+  /\bglpat-[A-Za-z0-9_-]{10,}\b/,
+  /\bsk-(?:proj-)?[A-Za-z0-9_-]{12,}\b/,
+  /\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{8,}\b/,
+  /\bAIza[A-Za-z0-9_-]{20,}\b/,
+  /\bAKIA[A-Z0-9]{16}\b/,
+  /\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/,
+  /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/,
+  /\b[a-z][a-z0-9+.-]*:\/\/[^\s/@:]+:[^\s/@]+@[^\s/]+/i,
+]
+
+function containsCredentialValue(value: string): boolean {
+  return redactSecretPatterns(value) !== value
+    || CREDENTIAL_VALUE_PATTERNS.some((pattern) => pattern.test(value))
+}
+
+/** Reject credential-shaped values and sensitive keys before any canonical bytes exist. */
+export function assertNoCredentialMaterial(value: unknown): void {
+  const visit = (item: unknown): void => {
+    if (typeof item === 'string') {
+      if (containsCredentialValue(item)) throw new MutationAuditError('invalid_audit')
+      return
+    }
+    if (item === null || typeof item === 'number' || typeof item === 'boolean') return
+    if (Array.isArray(item)) {
+      for (const entry of item) visit(entry)
+      return
+    }
+    if (typeof item !== 'object') throw new MutationAuditError('invalid_audit')
+    const prototype = Object.getPrototypeOf(item)
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw new MutationAuditError('invalid_audit')
+    }
+    for (const [key, entry] of Object.entries(item)) {
+      if (isSensitiveDetailKey(key) || containsCredentialValue(key)) {
+        throw new MutationAuditError('invalid_audit')
+      }
+      visit(entry)
+    }
+  }
+  visit(value)
 }
 
 interface MutationAuditRow {
@@ -161,10 +210,10 @@ export function safeBoundedText(value: unknown, maximum: number): string {
     normalized.length === 0
     || normalized.length > maximum
     || /[\u0000-\u001f\u007f]/.test(normalized)
-    || redactSecretPatterns(normalized) !== normalized
   ) {
     throw new MutationAuditError('invalid_audit')
   }
+  assertNoCredentialMaterial(normalized)
   return normalized
 }
 
@@ -175,8 +224,8 @@ export function safeOptionalId(value: unknown, maximum = 2_000): string | null {
 
 export function canonicalSafeJson(value: unknown): { value: JsonValue; json: string } {
   try {
-    const redacted = redactStructuredDetail(value)
-    const json = canonicalJson(redacted)
+    assertNoCredentialMaterial(value)
+    const json = canonicalJson(value)
     return { value: JSON.parse(json) as JsonValue, json }
   } catch (error) {
     if (error instanceof MutationAuditError) throw error
