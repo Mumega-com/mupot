@@ -355,6 +355,70 @@ CREATE TABLE runtime_broker_attestations (
   UNIQUE (tenant, canonical_payload_digest)
 );
 
+CREATE TRIGGER runtime_signing_challenges_validate_requester_identity
+BEFORE INSERT ON runtime_signing_challenges
+WHEN NOT EXISTS (
+  SELECT 1
+    FROM member_tokens token
+    JOIN members member
+      ON member.id = token.member_id
+     AND member.tenant = token.tenant
+    JOIN agents agent
+      ON agent.id = token.agent_id
+    JOIN agent_member_bindings binding
+      ON binding.tenant = token.tenant
+     AND binding.agent_id = token.agent_id
+     AND binding.member_id = token.member_id
+   WHERE token.id = NEW.requested_by_credential_id
+     AND token.tenant = NEW.tenant
+     AND token.member_id = NEW.requested_by_member_id
+     AND token.agent_id = NEW.requested_by_agent_id
+     AND token.channel = 'workspace'
+     AND token.revoked_at IS NULL
+     AND (token.expires_at IS NULL OR token.expires_at > NEW.issued_at)
+     AND token.created_at <= NEW.issued_at
+     AND member.status = 'active'
+     AND agent.status = 'active'
+)
+BEGIN
+  SELECT RAISE(ABORT, 'runtime signing challenge requester identity mismatch');
+END;
+
+CREATE TRIGGER runtime_brokers_validate_requester_identity
+BEFORE INSERT ON runtime_brokers
+WHEN NOT EXISTS (
+  SELECT 1
+    FROM member_tokens token
+    JOIN members member
+      ON member.id = token.member_id
+     AND member.tenant = token.tenant
+    JOIN agents agent
+      ON agent.id = token.agent_id
+    JOIN agent_member_bindings binding
+      ON binding.tenant = token.tenant
+     AND binding.agent_id = token.agent_id
+     AND binding.member_id = token.member_id
+    JOIN runtime_signing_challenges challenge
+      ON challenge.id = NEW.challenge_id
+     AND challenge.tenant = NEW.tenant
+     AND challenge.requested_by_agent_id = NEW.agent_id
+     AND challenge.requested_by_member_id = NEW.member_id
+     AND challenge.requested_by_credential_id = NEW.credential_id
+   WHERE token.id = NEW.credential_id
+     AND token.tenant = NEW.tenant
+     AND token.member_id = NEW.member_id
+     AND token.agent_id = NEW.agent_id
+     AND token.channel = 'workspace'
+     AND token.revoked_at IS NULL
+     AND (token.expires_at IS NULL OR token.expires_at > NEW.registered_at)
+     AND token.created_at <= NEW.registered_at
+     AND member.status = 'active'
+     AND agent.status = 'active'
+)
+BEGIN
+  SELECT RAISE(ABORT, 'runtime broker requester identity mismatch');
+END;
+
 CREATE TRIGGER runtime_signing_challenges_identity_immutable
 BEFORE UPDATE OF id, tenant, requested_by_agent_id, requested_by_member_id,
   requested_by_credential_id, domain, authority_kind,

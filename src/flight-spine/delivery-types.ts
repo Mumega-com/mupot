@@ -60,6 +60,8 @@ export interface RuntimeSigningChallenge {
   authorityKind: DeliveryAuthorityKind
   authorityId: string | null
   resourceId: string
+  requestedByMemberId: string
+  requestedByCredentialId: string
   issuedAt: string
   expiresAt: string
   nonce: string
@@ -95,6 +97,8 @@ export interface RuntimeDeliveryAuthority {
   publicKey: string
   keyFingerprint: string
   proofOfPossessionDigest: string
+  proofOfPossessionSignature: string
+  canonicalPayload: string
   challengeId: string
   registrationDigest: string
   state: 'pending' | 'active' | 'revoked'
@@ -105,11 +109,14 @@ export interface RuntimeDeliveryAuthority {
 
 export interface RegisteredRuntimeSigner {
   id: string
+  brokerId: string
   runtimeSeatId: string
   generation: number
   publicKey: string
   encryptionPublicKey: string
   proofOfPossessionDigest: string
+  proofOfPossessionSignature: string
+  canonicalPayload: string
   challengeId: string
   registrationDigest: string
   state: 'pending' | 'active' | 'revoked'

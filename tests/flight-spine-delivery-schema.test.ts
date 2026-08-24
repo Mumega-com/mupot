@@ -4,6 +4,7 @@ import { applyAllMigrations, resetMigrationCache } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
 const TENANT = 'tenant-flight-3'
+const OTHER_TENANT = 'tenant-flight-3-other'
 const T0 = '2026-08-24T12:00:00.000Z'
 const T5 = '2026-08-24T12:00:05.000Z'
 const T20 = '2026-08-24T12:00:20.000Z'
@@ -25,6 +26,51 @@ const FP_G = 'v1:' + '0'.repeat(64)
 
 let harness: SqliteD1Harness
 
+interface RequesterProvenance {
+  agentId: string
+  memberId: string
+  credentialId: string
+}
+
+const VALID_REQUESTER: RequesterProvenance = {
+  agentId: 'agent-broker',
+  memberId: 'member-broker',
+  credentialId: 'token-broker',
+}
+
+const INVALID_REQUESTERS: ReadonlyArray<readonly [string, RequesterProvenance]> = [
+  ['cross-tenant identity', {
+    agentId: 'agent-other',
+    memberId: 'member-other',
+    credentialId: 'token-other',
+  }],
+  ['same-tenant wrong member', {
+    agentId: 'agent-broker',
+    memberId: 'member-source',
+    credentialId: 'token-broker',
+  }],
+  ['credential bound to another agent', {
+    agentId: 'agent-broker',
+    memberId: 'member-source',
+    credentialId: 'token-source',
+  }],
+  ['missing agent-member binding', {
+    agentId: 'agent-unbound',
+    memberId: 'member-unbound',
+    credentialId: 'token-unbound',
+  }],
+  ['revoked credential', {
+    agentId: 'agent-broker',
+    memberId: 'member-broker',
+    credentialId: 'token-revoked',
+  }],
+  ['expired credential', {
+    agentId: 'agent-broker',
+    memberId: 'member-broker',
+    credentialId: 'token-expired',
+  }],
+]
+
 function seedBase(): void {
   harness.sqlite.exec([
     "INSERT INTO departments (id, slug, name) VALUES ('department-f3','f3','Flight 3');",
@@ -42,9 +88,29 @@ function seedBase(): void {
   ].join('\n'))
 }
 
+function seedRequesterProvenanceVariants(): void {
+  harness.sqlite.exec([
+    "INSERT INTO agents (id,squad_id,slug,name,status) VALUES ('agent-other','squad-f3','other','Other Tenant','active'),('agent-unbound','squad-f3','unbound','Unbound','active');",
+    "INSERT INTO members (id,tenant,display_name,status) VALUES ('member-other','" + OTHER_TENANT + "','Other Tenant','active'),('member-unbound','" + TENANT + "','Unbound','active');",
+    "INSERT INTO agent_member_bindings (tenant,agent_id,member_id,created_at) VALUES ('" + OTHER_TENANT + "','agent-other','member-other','" + T0 + "');",
+    "INSERT INTO member_tokens (id,member_id,tenant,token_hash,agent_id,label,channel,created_at,expires_at) VALUES ('token-other','member-other','" + OTHER_TENANT + "','hash-other','agent-other','other','workspace','" + T0 + "','" + T300 + "'),('token-expired','member-broker','" + TENANT + "','hash-expired','agent-broker','expired','workspace','" + T0 + "','" + T0 + "');",
+    "INSERT INTO member_tokens (id,member_id,tenant,token_hash,agent_id,label,channel,created_at,expires_at,revoked_at) VALUES ('token-revoked','member-broker','" + TENANT + "','hash-revoked','agent-broker','revoked','workspace','" + T0 + "','" + T300 + "','" + T0 + "');",
+    // Build one deliberately corrupted predecessor row to prove the new trigger
+    // independently rejects a missing binding. The production connection trigger
+    // normally prevents this state, but imported/legacy data must still fail closed.
+    'DROP TRIGGER member_tokens_agent_binding_insert;',
+    "INSERT INTO member_tokens (id,member_id,tenant,token_hash,agent_id,label,channel,created_at,expires_at) VALUES ('token-unbound','member-unbound','" + TENANT + "','hash-unbound','agent-unbound','unbound','workspace','" + T0 + "','" + T300 + "');",
+  ].join('\n'))
+}
+
 function columns(table: string): string[] {
   return harness.sqlite.prepare('PRAGMA table_info(' + table + ')').all()
     .map((row) => String(row.name))
+}
+
+function foreignKeyPairs(table: string): string[] {
+  return harness.sqlite.prepare('PRAGMA foreign_key_list(' + table + ')').all()
+    .map((row) => `${String(row.from)}->${String(row.table)}.${String(row.to)}`)
 }
 
 function insertChallenge(
@@ -54,11 +120,27 @@ function insertChallenge(
   authorityId: string | null,
   resourceId: string,
   nonce: string,
+  requester: RequesterProvenance = VALID_REQUESTER,
 ): void {
   harness.sqlite.prepare(
-    'INSERT INTO runtime_signing_challenges (id,tenant,requested_by_agent_id,requested_by_member_id,requested_by_credential_id,domain,authority_kind,authority_id,resource_id,nonce,signable_payload_template,signable_payload_digest,issued_at,expires_at,consumed_at,consumed_request_digest,created_at) VALUES (?,?,' +
-    "'agent-broker','member-broker','token-broker',?,?,?,?,?,'template',?,?,?,NULL,NULL,?)",
-  ).run(id, TENANT, domain, kind, authorityId, resourceId, nonce.padEnd(16,'x'), SHA_A, T0, T60, T0)
+    "INSERT INTO runtime_signing_challenges (id,tenant,requested_by_agent_id,requested_by_member_id,requested_by_credential_id,domain,authority_kind,authority_id,resource_id,nonce,signable_payload_template,signable_payload_digest,issued_at,expires_at,consumed_at,consumed_request_digest,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,'template',?,?,?,NULL,NULL,?)",
+  ).run(
+    id,TENANT,requester.agentId,requester.memberId,requester.credentialId,
+    domain,kind,authorityId,resourceId,nonce.padEnd(16,'x'),SHA_A,T0,T60,T0,
+  )
+}
+
+function insertBrokerWithRequester(
+  id: string,
+  challengeId: string,
+  requester: RequesterProvenance,
+): void {
+  harness.sqlite.prepare(
+    "INSERT INTO runtime_brokers (id,tenant,agent_id,member_id,credential_id,host_id,public_key,key_fingerprint,state,registration_digest,challenge_id,registered_at,expires_at,revoked_at,created_at) VALUES (?,?,?,?,?,?,'broker-public',?,'active',?,?,?, ?,NULL,?)",
+  ).run(
+    id,TENANT,requester.agentId,requester.memberId,requester.credentialId,
+    'host-' + id,'v1:' + '2'.repeat(64),'2'.repeat(64),challengeId,T0,T300,T0,
+  )
 }
 
 function seedBrokerAndSigners(authorityBrokerId = 'broker-1'): void {
@@ -362,6 +444,10 @@ describe('Flight 3 real migration schema', () => {
       'requested_by_member_id',
       'requested_by_credential_id',
     ]))
+    expect(foreignKeyPairs('runtime_signing_challenges')).toEqual(expect.arrayContaining([
+      'requested_by_member_id->members.id',
+      'requested_by_credential_id->member_tokens.id',
+    ]))
 
     harness.sqlite.prepare(
       "INSERT INTO runtime_signing_challenges (id,tenant,requested_by_agent_id,requested_by_member_id,requested_by_credential_id,domain,authority_kind,authority_id,resource_id,nonce,signable_payload_template,signable_payload_digest,issued_at,expires_at,consumed_at,consumed_request_digest,created_at) VALUES ('challenge-runtime-proof',?,'agent-broker','member-broker','token-broker','mupot-runtime-generation-runtime-proof:v1','runtime','runtime-signer-proof','seat-runtime:1','nonce-runtime-proof','runtime-proof-template',?,?,?,NULL,NULL,?)",
@@ -382,11 +468,47 @@ describe('Flight 3 real migration schema', () => {
 
     expect(() => harness.sqlite.prepare(
       "INSERT INTO runtime_signing_challenges (id,tenant,requested_by_agent_id,requested_by_member_id,requested_by_credential_id,domain,authority_kind,authority_id,resource_id,nonce,signable_payload_template,signable_payload_digest,issued_at,expires_at,created_at) VALUES ('challenge-bad-member',?,'agent-broker','missing-member','token-broker','mupot-runtime-generation-runtime-proof:v1','runtime','runtime-signer-bad-member','seat-other:1','nonce-bad-member-1','runtime-proof-template',?,?,?,?)",
-    ).run(TENANT,SHA_A,T0,T60,T0)).toThrow(/FOREIGN KEY/)
+    ).run(TENANT,SHA_A,T0,T60,T0)).toThrow(/requester identity mismatch/)
     expect(() => harness.sqlite.prepare(
       "INSERT INTO runtime_signing_challenges (id,tenant,requested_by_agent_id,requested_by_member_id,requested_by_credential_id,domain,authority_kind,authority_id,resource_id,nonce,signable_payload_template,signable_payload_digest,issued_at,expires_at,created_at) VALUES ('challenge-bad-credential',?,'agent-broker','member-broker','missing-token','mupot-runtime-generation-runtime-proof:v1','runtime','runtime-signer-bad-token','seat-other:2','nonce-bad-token-0001','runtime-proof-template',?,?,?,?)",
-    ).run(TENANT,SHA_A,T0,T60,T0)).toThrow(/FOREIGN KEY/)
+    ).run(TENANT,SHA_A,T0,T60,T0)).toThrow(/requester identity mismatch/)
   })
+
+  it.each(INVALID_REQUESTERS)(
+    'rejects a %s signing-challenge requester tuple',
+    (_label, requester) => {
+      seedRequesterProvenanceVariants()
+      expect(() => insertChallenge(
+        'challenge-invalid-requester',
+        'mupot-runtime-generation-runtime-proof:v1',
+        'runtime',
+        'runtime-signer-invalid-requester',
+        'seat-runtime:1',
+        'nonce-invalid-requester',
+        requester,
+      )).toThrow(/requester identity mismatch/)
+    },
+  )
+
+  it.each(INVALID_REQUESTERS)(
+    'rejects a %s runtime-broker requester tuple',
+    (_label, requester) => {
+      seedRequesterProvenanceVariants()
+      insertChallenge(
+        'challenge-valid-broker-requester',
+        'mupot-runtime-broker-register:v1',
+        'broker',
+        null,
+        'host-valid-broker-requester',
+        'nonce-valid-broker-requester',
+      )
+      expect(() => insertBrokerWithRequester(
+        'broker-invalid-requester',
+        'challenge-valid-broker-requester',
+        requester,
+      )).toThrow(/requester identity mismatch/)
+    },
+  )
 
   it('pins signer registrations to their broker and preserves exact signed registration bytes', () => {
     expect(columns('runtime_delivery_authorities')).toEqual(expect.arrayContaining([
