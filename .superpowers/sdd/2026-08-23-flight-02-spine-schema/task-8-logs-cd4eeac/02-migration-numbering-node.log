@@ -1,0 +1,182 @@
+__COMMAND__ node --test tests/migration-numbering.test.mjs
+__START__ 2026-08-24T03:43:54Z
+TAP version 13
+# Subtest: a well-formed migration name parses to its number
+ok 1 - a well-formed migration name parses to its number
+  ---
+  duration_ms: 0.835917
+  type: 'test'
+  ...
+# Subtest: names that are not exactly four digits do not parse
+ok 2 - names that are not exactly four digits do not parse
+  ---
+  duration_ms: 0.186625
+  type: 'test'
+  ...
+# Subtest: an added migration above the target head passes
+ok 3 - an added migration above the target head passes
+  ---
+  duration_ms: 0.218375
+  type: 'test'
+  ...
+# Subtest: THE PRODUCTION CASE: an added migration at a free slot BELOW the head fails
+ok 4 - THE PRODUCTION CASE: an added migration at a free slot BELOW the head fails
+  ---
+  duration_ms: 0.080583
+  type: 'test'
+  ...
+# Subtest: an added migration EQUAL to the head fails (boundary)
+ok 5 - an added migration EQUAL to the head fails (boundary)
+  ---
+  duration_ms: 0.153292
+  type: 'test'
+  ...
+# Subtest: a PR that adds no migrations passes
+ok 6 - a PR that adds no migrations passes
+  ---
+  duration_ms: 0.05925
+  type: 'test'
+  ...
+# Subtest: PRE-EXISTING duplicates on the target are not this PR's problem
+ok 7 - PRE-EXISTING duplicates on the target are not this PR's problem
+  ---
+  duration_ms: 0.147417
+  type: 'test'
+  ...
+# Subtest: two added migrations sharing a number fail even when BOTH are above the head
+ok 8 - two added migrations sharing a number fail even when BOTH are above the head
+  ---
+  duration_ms: 0.068959
+  type: 'test'
+  ...
+# Subtest: an added file with an unparseable name fails
+ok 9 - an added file with an unparseable name fails
+  ---
+  duration_ms: 0.405958
+  type: 'test'
+  ...
+# Subtest: an unparseable name already ON THE TARGET is tolerated
+ok 10 - an unparseable name already ON THE TARGET is tolerated
+  ---
+  duration_ms: 0.423042
+  type: 'test'
+  ...
+# Subtest: FAIL CLOSED: an unreadable merge target is a failure, never a pass
+ok 11 - FAIL CLOSED: an unreadable merge target is a failure, never a pass
+  ---
+  duration_ms: 0.157584
+  type: 'test'
+  ...
+# Subtest: a target with migrations but NONE parseable fails rather than inventing a head
+ok 12 - a target with migrations but NONE parseable fails rather than inventing a head
+  ---
+  duration_ms: 0.057958
+  type: 'test'
+  ...
+# Subtest: FAIL CLOSED, LOCAL SIDE: an unlistable working-tree migrations/ is a failure
+ok 13 - FAIL CLOSED, LOCAL SIDE: an unlistable working-tree migrations/ is a failure
+  ---
+  duration_ms: 0.042708
+  type: 'test'
+  ...
+# Subtest: a target with no migrations at all is bootstrap, and passes
+ok 14 - a target with no migrations at all is bootstrap, and passes
+  ---
+  duration_ms: 0.038125
+  type: 'test'
+  ...
+# Subtest: end to end: a migration above the head exits 0
+ok 15 - end to end: a migration above the head exits 0
+  ---
+  duration_ms: 223.399375
+  type: 'test'
+  ...
+# Subtest: end to end: a migration below the head exits 1 and names the fix
+ok 16 - end to end: a migration below the head exits 1 and names the fix
+  ---
+  duration_ms: 252.670917
+  type: 'test'
+  ...
+# Subtest: end to end: NO origin ref at all exits 1 — the guard fails loud, not open
+ok 17 - end to end: NO origin ref at all exits 1 — the guard fails loud, not open
+  ---
+  duration_ms: 102.887333
+  type: 'test'
+  ...
+# Subtest: end to end: a ref that genuinely has no migrations/ is bootstrap, and passes
+ok 18 - end to end: a ref that genuinely has no migrations/ is bootstrap, and passes
+  ---
+  duration_ms: 277.03925
+  type: 'test'
+  ...
+# Subtest: FAIL CLOSED at the GIT layer: ls-tree failing is a failure, not a bootstrap
+ok 19 - FAIL CLOSED at the GIT layer: ls-tree failing is a failure, not a bootstrap
+  ---
+  duration_ms: 812.583917
+  type: 'test'
+  ...
+# Subtest: PARTIAL working tree: a COMMITTED below-head migration is still caught when the file is not on disk
+ok 20 - PARTIAL working tree: a COMMITTED below-head migration is still caught when the file is not on disk
+  ---
+  duration_ms: 411.200917
+  type: 'test'
+  ...
+# Subtest: an UNCOMMITTED migration is still checked, so the pre-commit warning survives the union
+ok 21 - an UNCOMMITTED migration is still checked, so the pre-commit warning survives the union
+  ---
+  duration_ms: 265.37725
+  type: 'test'
+  ...
+# Subtest: FAIL CLOSED: only when BOTH local oracles fail is it local_unreadable
+ok 22 - FAIL CLOSED: only when BOTH local oracles fail is it local_unreadable
+  ---
+  duration_ms: 249.281667
+  type: 'test'
+  ...
+# Subtest: the union returns null, not [], when both local oracles fail
+ok 23 - the union returns null, not [], when both local oracles fail
+  ---
+  duration_ms: 0.106042
+  type: 'test'
+  ...
+# Subtest: end to end: BASE_REF selects a different merge target
+ok 24 - end to end: BASE_REF selects a different merge target
+  ---
+  duration_ms: 507.814291
+  type: 'test'
+  ...
+# Subtest: every tests/*.test.mjs is wired to a node --test step in CI
+ok 25 - every tests/*.test.mjs is wired to a node --test step in CI
+  ---
+  duration_ms: 27.806583
+  type: 'test'
+  ...
+# Subtest: STACKED PR: clearing the declared base is not enough — main head still binds
+ok 26 - STACKED PR: clearing the declared base is not enough — main head still binds
+  ---
+  duration_ms: 782.58475
+  type: 'test'
+  ...
+# Subtest: EVERY green message names the ref it actually compared against
+ok 27 - EVERY green message names the ref it actually compared against
+  ---
+  duration_ms: 704.552084
+  type: 'test'
+  ...
+# Subtest: end to end: a malformed BASE_REF is refused, not resolved
+ok 28 - end to end: a malformed BASE_REF is refused, not resolved
+  ---
+  duration_ms: 422.782292
+  type: 'test'
+  ...
+1..28
+# tests 28
+# suites 0
+# pass 28
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 5127.254459
+__END__ 2026-08-24T03:44:00Z
+__EXIT__ 0

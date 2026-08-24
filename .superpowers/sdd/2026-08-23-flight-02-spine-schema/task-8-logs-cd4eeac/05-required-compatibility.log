@@ -1,0 +1,25 @@
+__COMMAND__ npx vitest run tests/mcp-flight-spine.test.ts tests/flight-spine-integration.test.ts tests/mcp-task-tools.test.ts tests/mcp-flight-tools.test.ts tests/agent-inbox-lease-sqlite.test.ts tests/targeted-seat-dispatch.test.ts tests/runner-receipts.test.ts tests/agent-audit-immutable.test.ts
+__START__ 2026-08-24T03:44:20Z
+
+ RUN  v4.1.8 /Users/hadi/dev/mumega/mupot/.wt/flight02-spine-schema
+
+(node:9416) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:9414) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:9415) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:9412) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:9417) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:9413) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+
+ Test Files  8 passed (8)
+      Tests  212 passed (212)
+   Start at  23:44:21
+   Duration  7.84s (transform 21.24s, setup 0ms, import 30.47s, tests 11.08s, environment 1ms)
+
+__END__ 2026-08-24T03:44:29Z
+__EXIT__ 0

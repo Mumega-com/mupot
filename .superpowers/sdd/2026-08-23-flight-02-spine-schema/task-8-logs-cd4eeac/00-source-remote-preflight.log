@@ -1,0 +1,7 @@
+__COMMAND__ REMOTE_MAIN=$(git ls-remote origin refs/heads/main | cut -f1); CACHED_MAIN=$(git rev-parse origin/main); MAIN_HEAD=$(git ls-tree -r --name-only origin/main migrations | sed -n 's#^migrations/\([0-9][0-9][0-9][0-9]\)_.*#\1#p' | sort -n | tail -1); test "$REMOTE_MAIN" = "$CACHED_MAIN"; test "$CACHED_MAIN" = 66d857b4ec87fb715d9928a906ed1dbd869d2c19; test "$(git rev-parse HEAD)" = cd4eeac28089ab8f48236c7306f12b9d1ce4460b; test "$(git rev-parse HEAD^{tree})" = 594840fb28514bf24a22a866a96dc95fa918b578; git merge-base --is-ancestor 66d857b4ec87fb715d9928a906ed1dbd869d2c19 cd4eeac28089ab8f48236c7306f12b9d1ce4460b; test "$MAIN_HEAD" = 0120; test -z "$(git status --porcelain=v1 --untracked-files=all)"
+__START__ 2026-08-24T03:43:35Z
+__REMOTE_MAIN__ 66d857b4ec87fb715d9928a906ed1dbd869d2c19
+__CACHED_MAIN__ 66d857b4ec87fb715d9928a906ed1dbd869d2c19
+__MAIN_MIGRATION_HEAD__ 0120
+__END__ 2026-08-24T03:43:35Z
+__EXIT__ 0

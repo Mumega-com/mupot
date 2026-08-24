@@ -1,0 +1,13 @@
+__COMMAND__ npm run typecheck
+__START__ 2026-08-24T03:49:48Z
+
+> mupot@0.30.0 pretypecheck
+> node scripts/generate-build-info.mjs
+
+[build-info] Stamped commit: cd4eeac28089ab8f48236c7306f12b9d1ce4460b, clean: true, ref: codex/flight02-spine-schema, builtAt: 2026-08-24T03:44:29.701Z
+
+> mupot@0.30.0 typecheck
+> tsc --noEmit
+
+__END__ 2026-08-24T03:50:01Z
+__EXIT__ 0
