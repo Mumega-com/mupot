@@ -56,8 +56,8 @@ function insertChallenge(
   nonce: string,
 ): void {
   harness.sqlite.prepare(
-    'INSERT INTO runtime_signing_challenges (id,tenant,requested_by_agent_id,domain,authority_kind,authority_id,resource_id,nonce,signable_payload_template,signable_payload_digest,issued_at,expires_at,consumed_at,consumed_request_digest,created_at) VALUES (?,?,' +
-    "'agent-broker',?,?,?,?,?,'template',?,?,?,NULL,NULL,?)",
+    'INSERT INTO runtime_signing_challenges (id,tenant,requested_by_agent_id,requested_by_member_id,requested_by_credential_id,domain,authority_kind,authority_id,resource_id,nonce,signable_payload_template,signable_payload_digest,issued_at,expires_at,consumed_at,consumed_request_digest,created_at) VALUES (?,?,' +
+    "'agent-broker','member-broker','token-broker',?,?,?,?,?,'template',?,?,?,NULL,NULL,?)",
   ).run(id, TENANT, domain, kind, authorityId, resourceId, nonce.padEnd(16,'x'), SHA_A, T0, T60, T0)
 }
 
@@ -86,17 +86,18 @@ function seedBrokerAndSigners(authorityBrokerId = 'broker-1'): void {
     const challenge = 'challenge-' + kind
     insertChallenge(challenge,'mupot-delivery-authority-register:v1',kind,id,'seat-runtime:1','nonce-' + kind)
     harness.sqlite.prepare(
-      "INSERT INTO runtime_delivery_authorities (id,tenant,broker_id,runtime_seat_id,generation,authority_kind,public_key,key_fingerprint,proof_of_possession_digest,challenge_id,registration_digest,state,issued_at,expires_at,revoked_at,created_at) VALUES (?,?,?,'seat-runtime',1,?,?,?,?,?,?,'active',?,?,NULL,?)",
+      "INSERT INTO runtime_delivery_authorities (id,tenant,broker_id,runtime_seat_id,generation,authority_kind,public_key,key_fingerprint,proof_of_possession_digest,proof_of_possession_signature,canonical_payload,challenge_id,registration_digest,state,issued_at,expires_at,revoked_at,created_at) VALUES (?,?,?,'seat-runtime',1,?,?,?,?,?,?,?,?,'active',?,?,NULL,?)",
     ).run(
       id,TENANT,authorityBrokerId,kind,kind + '-public',fingerprint,digest,
-      challenge,digest,T0,T300,T0,
+      kind + '-proof-signature',kind + '-canonical-payload',challenge,digest,
+      T0,T300,T0,
     )
   }
 
   insertChallenge('challenge-runtime','mupot-runtime-signer-register:v1','runtime','runtime-signer-1','seat-runtime:1','nonce-runtime')
   harness.sqlite.prepare(
-    "INSERT INTO runtime_signer_registrations (id,tenant,runtime_seat_id,generation,signing_public_key,encryption_public_key,signing_key_fingerprint,encryption_key_fingerprint,proof_of_possession_digest,challenge_id,registration_digest,state,issued_at,expires_at,revoked_at,created_at) VALUES ('runtime-signer-1',?,'seat-runtime',1,'runtime-signing-public','runtime-encryption-public',?,?,?,'challenge-runtime',?,'active',?,?,NULL,?)",
-  ).run(TENANT,FP_E,FP_F,SHA_A,SHA_B,T0,T300,T0)
+    "INSERT INTO runtime_signer_registrations (id,tenant,broker_id,runtime_seat_id,generation,signing_public_key,encryption_public_key,signing_key_fingerprint,encryption_key_fingerprint,proof_of_possession_digest,proof_of_possession_signature,canonical_payload,challenge_id,registration_digest,state,issued_at,expires_at,revoked_at,created_at) VALUES ('runtime-signer-1',?,?,'seat-runtime',1,'runtime-signing-public','runtime-encryption-public',?,?,?,'runtime-proof-signature','runtime-canonical-payload','challenge-runtime',?,'active',?,?,NULL,?)",
+  ).run(TENANT,authorityBrokerId,FP_E,FP_F,SHA_A,SHA_B,T0,T300,T0)
 }
 
 function seedIngress(): void {
@@ -356,6 +357,121 @@ describe('Flight 3 real migration schema', () => {
     ]))
   })
 
+  it('binds signing challenges to immutable relay provenance and accepts the runtime-proof domain', () => {
+    expect(columns('runtime_signing_challenges')).toEqual(expect.arrayContaining([
+      'requested_by_member_id',
+      'requested_by_credential_id',
+    ]))
+
+    harness.sqlite.prepare(
+      "INSERT INTO runtime_signing_challenges (id,tenant,requested_by_agent_id,requested_by_member_id,requested_by_credential_id,domain,authority_kind,authority_id,resource_id,nonce,signable_payload_template,signable_payload_digest,issued_at,expires_at,consumed_at,consumed_request_digest,created_at) VALUES ('challenge-runtime-proof',?,'agent-broker','member-broker','token-broker','mupot-runtime-generation-runtime-proof:v1','runtime','runtime-signer-proof','seat-runtime:1','nonce-runtime-proof','runtime-proof-template',?,?,?,NULL,NULL,?)",
+    ).run(TENANT,SHA_A,T0,T60,T0)
+    harness.sqlite.prepare(
+      "INSERT INTO runtime_signed_request_replays (id,tenant,domain,authority_kind,authority_id,nonce,challenge_id,canonical_payload_digest,result_kind,result_id,issued_at,expires_at,created_at) VALUES ('replay-runtime-proof',?,'mupot-runtime-generation-runtime-proof:v1','runtime','runtime-signer-proof','signed-runtime-proof','challenge-runtime-proof',?,'runtime_generation_proof','runtime-signer-proof',?,?,?)",
+    ).run(TENANT,SHA_B,T0,T60,T0)
+
+    expect(harness.sqlite.prepare(
+      "SELECT domain FROM runtime_signed_request_replays WHERE id='replay-runtime-proof'",
+    ).get()?.domain).toBe('mupot-runtime-generation-runtime-proof:v1')
+    expect(() => harness.sqlite.exec(
+      "UPDATE runtime_signing_challenges SET requested_by_member_id='member-runtime' WHERE id='challenge-runtime-proof'",
+    )).toThrow(/immutable/)
+    expect(() => harness.sqlite.exec(
+      "UPDATE runtime_signing_challenges SET requested_by_credential_id='token-source' WHERE id='challenge-runtime-proof'",
+    )).toThrow(/immutable/)
+
+    expect(() => harness.sqlite.prepare(
+      "INSERT INTO runtime_signing_challenges (id,tenant,requested_by_agent_id,requested_by_member_id,requested_by_credential_id,domain,authority_kind,authority_id,resource_id,nonce,signable_payload_template,signable_payload_digest,issued_at,expires_at,created_at) VALUES ('challenge-bad-member',?,'agent-broker','missing-member','token-broker','mupot-runtime-generation-runtime-proof:v1','runtime','runtime-signer-bad-member','seat-other:1','nonce-bad-member-1','runtime-proof-template',?,?,?,?)",
+    ).run(TENANT,SHA_A,T0,T60,T0)).toThrow(/FOREIGN KEY/)
+    expect(() => harness.sqlite.prepare(
+      "INSERT INTO runtime_signing_challenges (id,tenant,requested_by_agent_id,requested_by_member_id,requested_by_credential_id,domain,authority_kind,authority_id,resource_id,nonce,signable_payload_template,signable_payload_digest,issued_at,expires_at,created_at) VALUES ('challenge-bad-credential',?,'agent-broker','member-broker','missing-token','mupot-runtime-generation-runtime-proof:v1','runtime','runtime-signer-bad-token','seat-other:2','nonce-bad-token-0001','runtime-proof-template',?,?,?,?)",
+    ).run(TENANT,SHA_A,T0,T60,T0)).toThrow(/FOREIGN KEY/)
+  })
+
+  it('pins signer registrations to their broker and preserves exact signed registration bytes', () => {
+    expect(columns('runtime_delivery_authorities')).toEqual(expect.arrayContaining([
+      'proof_of_possession_signature',
+      'canonical_payload',
+    ]))
+    expect(columns('runtime_signer_registrations')).toEqual(expect.arrayContaining([
+      'broker_id',
+      'proof_of_possession_signature',
+      'canonical_payload',
+    ]))
+
+    seedBrokerAndSigners()
+    expect(harness.sqlite.prepare(
+      "SELECT proof_of_possession_signature,canonical_payload FROM runtime_delivery_authorities WHERE id='authority-adapter'",
+    ).get()).toMatchObject({
+      proof_of_possession_signature: 'adapter-proof-signature',
+      canonical_payload: 'adapter-canonical-payload',
+    })
+    expect(harness.sqlite.prepare(
+      "SELECT broker_id,proof_of_possession_signature,canonical_payload FROM runtime_signer_registrations WHERE id='runtime-signer-1'",
+    ).get()).toMatchObject({
+      broker_id: 'broker-1',
+      proof_of_possession_signature: 'runtime-proof-signature',
+      canonical_payload: 'runtime-canonical-payload',
+    })
+
+    expect(() => harness.sqlite.exec(
+      "UPDATE runtime_delivery_authorities SET proof_of_possession_signature='changed' WHERE id='authority-adapter'",
+    )).toThrow(/immutable/)
+    expect(() => harness.sqlite.exec(
+      "UPDATE runtime_delivery_authorities SET canonical_payload='changed' WHERE id='authority-adapter'",
+    )).toThrow(/immutable/)
+    expect(() => harness.sqlite.exec(
+      "UPDATE runtime_signer_registrations SET proof_of_possession_signature='changed' WHERE id='runtime-signer-1'",
+    )).toThrow(/immutable/)
+    expect(() => harness.sqlite.exec(
+      "UPDATE runtime_signer_registrations SET canonical_payload='changed' WHERE id='runtime-signer-1'",
+    )).toThrow(/immutable/)
+    expect(() => harness.sqlite.exec(
+      "UPDATE runtime_signer_registrations SET broker_id='broker-1' WHERE id='runtime-signer-1'",
+    )).toThrow(/immutable/)
+
+    insertChallenge(
+      'challenge-runtime-missing-broker',
+      'mupot-runtime-signer-register:v1',
+      'runtime',
+      'runtime-signer-missing-broker',
+      'seat-other:1',
+      'nonce-runtime-missing-broker',
+    )
+    expect(() => harness.sqlite.prepare(
+      "INSERT INTO runtime_signer_registrations (id,tenant,broker_id,runtime_seat_id,generation,signing_public_key,encryption_public_key,signing_key_fingerprint,encryption_key_fingerprint,proof_of_possession_digest,proof_of_possession_signature,canonical_payload,challenge_id,registration_digest,state,issued_at,expires_at,revoked_at,created_at) VALUES ('runtime-signer-missing-broker',?,'missing-broker','seat-other',1,'signing-public-other','encryption-public-other',?,?,?,'runtime-proof-signature-other','runtime-canonical-payload-other','challenge-runtime-missing-broker',?,'active',?,?,NULL,?)",
+    ).run(TENANT,FP_G,'v1:' + '1'.repeat(64),SHA_C,SHA_D,T0,T300,T0)).toThrow(/FOREIGN KEY/)
+  })
+
+  it('aborts and rolls back a D1 batch when a compare-and-swap row count differs', async () => {
+    expect(columns('flight_spine_cas_abort')).toEqual(['must_be_zero'])
+
+    await expect(harness.db.batch([
+      harness.db.prepare(
+        "UPDATE agents SET name='Must Roll Back' WHERE id='agent-source'",
+      ),
+      harness.db.prepare(
+        'INSERT INTO flight_spine_cas_abort(must_be_zero) SELECT 1 WHERE changes() <> 0',
+      ),
+    ])).rejects.toThrow(/CHECK constraint failed/)
+
+    expect(harness.sqlite.prepare(
+      "SELECT name FROM agents WHERE id='agent-source'",
+    ).get()?.name).toBe('Source')
+
+    await expect(harness.db.batch([
+      harness.db.prepare(
+        "UPDATE agents SET name='Committed' WHERE id='agent-source'",
+      ),
+      harness.db.prepare(
+        'INSERT INTO flight_spine_cas_abort(must_be_zero) SELECT 1 WHERE changes() <> 1',
+      ),
+    ])).resolves.toHaveLength(2)
+    expect(harness.sqlite.prepare(
+      "SELECT name FROM agents WHERE id='agent-source'",
+    ).get()?.name).toBe('Committed')
+  })
+
   it('rejects null, label, and wrong-seat proof targets but accepts the exact runtime seat id', () => {
     seedBrokerAndSigners()
     seedIngress()
@@ -474,7 +590,7 @@ describe('Flight 3 real migration schema', () => {
       'adapter','authority-key-reuse','seat-other:1','nonce-key-reuse',
     )
     expect(() => harness.sqlite.prepare(
-      "INSERT INTO runtime_delivery_authorities (id,tenant,broker_id,runtime_seat_id,generation,authority_kind,public_key,key_fingerprint,proof_of_possession_digest,challenge_id,registration_digest,state,issued_at,expires_at,revoked_at,created_at) VALUES ('authority-key-reuse',?,'broker-1','seat-other',1,'adapter','reused-public',?,?, 'challenge-key-reuse',?,'active',?,?,NULL,?)",
+      "INSERT INTO runtime_delivery_authorities (id,tenant,broker_id,runtime_seat_id,generation,authority_kind,public_key,key_fingerprint,proof_of_possession_digest,proof_of_possession_signature,canonical_payload,challenge_id,registration_digest,state,issued_at,expires_at,revoked_at,created_at) VALUES ('authority-key-reuse',?,'broker-1','seat-other',1,'adapter','reused-public',?,?,'reused-proof-signature','reused-canonical-payload','challenge-key-reuse',?,'active',?,?,NULL,?)",
     ).run(TENANT,FP_C,SHA_A,SHA_B,T0,T300,T0)).toThrow()
     insertChallenge(
       'challenge-broker-key-reuse','mupot-runtime-broker-register:v1',

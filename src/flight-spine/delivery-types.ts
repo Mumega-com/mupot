@@ -40,6 +40,7 @@ export type RuntimeSigningDomain =
   | 'mupot-runtime-broker-register:v1'
   | 'mupot-delivery-authority-register:v1'
   | 'mupot-runtime-signer-register:v1'
+  | 'mupot-runtime-generation-runtime-proof:v1'
   | 'mupot-runtime-generation-activate:v1'
   | 'mupot-fenced-delivery-lease:v1'
   | 'mupot-fenced-delivery-evidence:v1'

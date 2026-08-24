@@ -2,14 +2,25 @@
 -- Public keys, digests, identifiers, and signatures only. Private keys and bearer values
 -- are deliberately absent.
 
+-- A zero-row guard target for compare-and-swap batches. A caller places
+-- `INSERT INTO flight_spine_cas_abort(must_be_zero)
+--  SELECT 1 WHERE changes() <> <expected>` immediately after its guarded DML.
+-- A mismatched row count violates the CHECK and rolls back the whole D1 batch.
+CREATE TABLE flight_spine_cas_abort (
+  must_be_zero INTEGER NOT NULL CHECK (must_be_zero = 0)
+);
+
 CREATE TABLE runtime_signing_challenges (
   id TEXT PRIMARY KEY,
   tenant TEXT NOT NULL,
   requested_by_agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE RESTRICT,
+  requested_by_member_id TEXT NOT NULL REFERENCES members(id) ON DELETE RESTRICT,
+  requested_by_credential_id TEXT NOT NULL REFERENCES member_tokens(id) ON DELETE RESTRICT,
   domain TEXT NOT NULL CHECK (domain IN (
     'mupot-runtime-broker-register:v1',
     'mupot-delivery-authority-register:v1',
     'mupot-runtime-signer-register:v1',
+    'mupot-runtime-generation-runtime-proof:v1',
     'mupot-runtime-generation-activate:v1',
     'mupot-fenced-delivery-lease:v1',
     'mupot-fenced-delivery-evidence:v1'
@@ -116,6 +127,10 @@ CREATE TABLE runtime_delivery_authorities (
       AND proof_of_possession_digest = lower(proof_of_possession_digest)
       AND proof_of_possession_digest NOT GLOB '*[^0-9a-f]*'
     ),
+  proof_of_possession_signature TEXT NOT NULL
+    CHECK (length(trim(proof_of_possession_signature)) BETWEEN 1 AND 8000),
+  canonical_payload TEXT NOT NULL
+    CHECK (length(canonical_payload) BETWEEN 1 AND 8000),
   challenge_id TEXT NOT NULL REFERENCES runtime_signing_challenges(id) ON DELETE RESTRICT,
   registration_digest TEXT NOT NULL
     CHECK (
@@ -138,6 +153,7 @@ CREATE TABLE runtime_delivery_authorities (
 CREATE TABLE runtime_signer_registrations (
   id TEXT PRIMARY KEY,
   tenant TEXT NOT NULL,
+  broker_id TEXT NOT NULL REFERENCES runtime_brokers(id) ON DELETE RESTRICT,
   runtime_seat_id TEXT NOT NULL REFERENCES runtime_seats(id) ON DELETE RESTRICT,
   generation INTEGER NOT NULL CHECK (generation > 0),
   signing_public_key TEXT NOT NULL
@@ -164,6 +180,10 @@ CREATE TABLE runtime_signer_registrations (
       AND proof_of_possession_digest = lower(proof_of_possession_digest)
       AND proof_of_possession_digest NOT GLOB '*[^0-9a-f]*'
     ),
+  proof_of_possession_signature TEXT NOT NULL
+    CHECK (length(trim(proof_of_possession_signature)) BETWEEN 1 AND 8000),
+  canonical_payload TEXT NOT NULL
+    CHECK (length(canonical_payload) BETWEEN 1 AND 8000),
   challenge_id TEXT NOT NULL REFERENCES runtime_signing_challenges(id) ON DELETE RESTRICT,
   registration_digest TEXT NOT NULL
     CHECK (
@@ -192,6 +212,7 @@ CREATE TABLE runtime_signed_request_replays (
     'mupot-runtime-broker-register:v1',
     'mupot-delivery-authority-register:v1',
     'mupot-runtime-signer-register:v1',
+    'mupot-runtime-generation-runtime-proof:v1',
     'mupot-runtime-generation-activate:v1',
     'mupot-fenced-delivery-lease:v1',
     'mupot-fenced-delivery-evidence:v1'
@@ -335,7 +356,8 @@ CREATE TABLE runtime_broker_attestations (
 );
 
 CREATE TRIGGER runtime_signing_challenges_identity_immutable
-BEFORE UPDATE OF id, tenant, requested_by_agent_id, domain, authority_kind,
+BEFORE UPDATE OF id, tenant, requested_by_agent_id, requested_by_member_id,
+  requested_by_credential_id, domain, authority_kind,
   authority_id, resource_id, nonce, signable_payload_template,
   signable_payload_digest, issued_at, expires_at, created_at
 ON runtime_signing_challenges
@@ -383,7 +405,8 @@ END;
 CREATE TRIGGER runtime_delivery_authorities_identity_immutable
 BEFORE UPDATE OF id, tenant, broker_id, runtime_seat_id, generation,
   authority_kind, public_key, key_fingerprint, proof_of_possession_digest,
-  challenge_id, registration_digest, issued_at, expires_at, created_at
+  proof_of_possession_signature, canonical_payload, challenge_id,
+  registration_digest, issued_at, expires_at, created_at
 ON runtime_delivery_authorities
 BEGIN
   SELECT RAISE(ABORT, 'runtime delivery authority is immutable');
@@ -407,10 +430,10 @@ BEGIN
 END;
 
 CREATE TRIGGER runtime_signer_registrations_identity_immutable
-BEFORE UPDATE OF id, tenant, runtime_seat_id, generation, signing_public_key,
+BEFORE UPDATE OF id, tenant, broker_id, runtime_seat_id, generation, signing_public_key,
   encryption_public_key, signing_key_fingerprint, encryption_key_fingerprint,
-  proof_of_possession_digest, challenge_id, registration_digest, issued_at,
-  expires_at, created_at
+  proof_of_possession_digest, proof_of_possession_signature, canonical_payload,
+  challenge_id, registration_digest, issued_at, expires_at, created_at
 ON runtime_signer_registrations
 BEGIN
   SELECT RAISE(ABORT, 'runtime signer registration is immutable');
@@ -483,6 +506,7 @@ WHEN NOT EXISTS (
     JOIN runtime_signer_registrations signer
       ON signer.id = NEW.runtime_signer_registration_id
      AND signer.tenant = broker.tenant
+     AND signer.broker_id = broker.id
      AND signer.runtime_seat_id = seat.id
      AND signer.generation = NEW.generation
     JOIN runtime_signing_challenges challenge
