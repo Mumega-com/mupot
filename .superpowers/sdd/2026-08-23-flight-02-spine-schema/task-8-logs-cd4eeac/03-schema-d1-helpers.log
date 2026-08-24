@@ -1,0 +1,17 @@
+__COMMAND__ npx vitest run tests/helpers-migrations.test.ts tests/flight-spine-schema.test.ts tests/migration-d1-compat.test.ts
+__START__ 2026-08-24T03:44:00Z
+
+ RUN  v4.1.8 /Users/hadi/dev/mumega/mupot/.wt/flight02-spine-schema
+
+(node:9243) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:9244) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+
+ Test Files  3 passed (3)
+      Tests  24 passed (24)
+   Start at  23:44:01
+   Duration  3.14s (transform 285ms, setup 0ms, import 370ms, tests 4.33s, environment 1ms)
+
+__END__ 2026-08-24T03:44:04Z
+__EXIT__ 0

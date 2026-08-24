@@ -65,19 +65,23 @@ describe('a length mismatch does not short-circuit', () => {
   // The inputs are large enough that the loop dominates everything else, so the two shapes
   // are separated by orders of magnitude rather than by microseconds.
   const SIZE = 2_000_000
+  const RUNS = 7
   const big = 'a'.repeat(SIZE)
   const bigDifferentFirstByte = 'b' + 'a'.repeat(SIZE - 1)
   const tiny = 'a'
 
-  const medianMs = (fn: () => void, runs = 7): number => {
-    const samples: number[] = []
-    for (let i = 0; i < runs; i += 1) {
-      const t0 = performance.now()
-      fn()
-      samples.push(performance.now() - t0)
-    }
+  const cpuMs = (fn: () => void): number => {
+    // Current-process CPU time excludes external scheduler wait, so unrelated host load
+    // cannot make one comparison shape appear slower merely because this process was paused.
+    const start = process.cpuUsage()
+    fn()
+    const elapsed = process.cpuUsage(start)
+    return (elapsed.user + elapsed.system) / 1_000
+  }
+
+  const medianMs = (samples: number[]): number => {
     samples.sort((x, y) => x - y)
-    return samples[Math.floor(runs / 2)] ?? 0
+    return samples[Math.floor(samples.length / 2)] ?? 0
   }
 
   it('spends comparable time on a length mismatch and a first-byte mismatch', () => {
@@ -87,28 +91,36 @@ describe('a length mismatch does not short-circuit', () => {
       timingSafeEqual(big, bigDifferentFirstByte)
     }
 
-    const lengthMismatch = medianMs(() => { timingSafeEqual(tiny, big) })
-    const byteMismatch = medianMs(() => { timingSafeEqual(big, bigDifferentFirstByte) })
+    const lengthSamples: number[] = []
+    const byteSamples: number[] = []
+    for (let i = 0; i < RUNS; i += 1) {
+      // Alternating order controls phase, JIT and GC bias instead of always charging the
+      // same comparison shape for whichever process-local work happens first or second.
+      if (i % 2 === 0) {
+        lengthSamples.push(cpuMs(() => { timingSafeEqual(tiny, big) }))
+        byteSamples.push(cpuMs(() => { timingSafeEqual(big, bigDifferentFirstByte) }))
+      } else {
+        byteSamples.push(cpuMs(() => { timingSafeEqual(big, bigDifferentFirstByte) }))
+        lengthSamples.push(cpuMs(() => { timingSafeEqual(tiny, big) }))
+      }
+    }
+
+    const lengthMismatch = medianMs(lengthSamples)
+    const byteMismatch = medianMs(byteSamples)
 
     expect(byteMismatch).toBeGreaterThan(0)
     const ratio = lengthMismatch / byteMismatch
 
-    // The threshold is calibrated against measurement, not guessed. Both shapes were run
-    // five times on the build host (Node 22, 4 vCPU):
+    // This is a regression gate for the known early-return defect, not a claim that CPU
+    // timing proves the production comparator is constant-time. The threshold is calibrated
+    // against measurement, not guessed. The early-return form does not reach zero because
+    // TextEncoder.encode runs in both shapes, so a skipped comparison loop still pays the
+    // fixed cost of encoding the 2 MB input.
     //
-    //     folded    0.775  0.791  0.810  0.811  0.904
-    //     early-return  0.090  0.162  0.297  0.297  0.343
-    //
-    // The early-return form does NOT sit near zero, which is the non-obvious part:
-    // TextEncoder.encode runs in both shapes, and a 2 MB encode is a large fixed cost that a
-    // skipped loop still pays. So the two distributions are 0.09-0.34 and 0.78-0.90, not
-    // 0-and-1.
-    //
-    // The first draft of this test used 0.4 and was wrong: it left only 17% headroom above
-    // the worst defective run, which is a false green waiting for a noisier box. 0.55 sits
-    // ~1.6x above the worst defect and ~1.4x below the best fix — the widest margin these
-    // two distributions allow. If this ever goes flaky, raise SIZE (which grows the loop
-    // faster than the encode) rather than lowering the threshold.
+    // With current-process CPU time and alternating order, the folded form measured
+    // 0.735-0.917 (20/20 above threshold) while the early-return mutation measured
+    // 0.0347-0.0766 (0/20 above threshold). If this ever goes flaky, investigate the
+    // measured distributions rather than lowering the threshold.
     expect(ratio).toBeGreaterThan(0.55)
   })
 })

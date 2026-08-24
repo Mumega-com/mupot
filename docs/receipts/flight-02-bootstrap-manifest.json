@@ -1,0 +1,527 @@
+{
+  "schema": "FLIGHT-SPINE-SCHEMA-02",
+  "version": 1,
+  "status": "blocked_then_repackaged_awaiting_regate",
+  "generated_at": "2026-08-24T04:18:31Z",
+  "initial_package_generated_at": "2026-08-24T03:52:59Z",
+  "autonomy_claim": false,
+  "deployment_authorized": false,
+  "repository": {
+    "url": "https://github.com/Mumega-com/mupot.git",
+    "branch": "codex/flight02-spine-schema",
+    "base_sha": "66d857b4ec87fb715d9928a906ed1dbd869d2c19",
+    "verified_remote_main_sha": "66d857b4ec87fb715d9928a906ed1dbd869d2c19",
+    "source_candidate_sha": "cd4eeac28089ab8f48236c7306f12b9d1ce4460b",
+    "source_tree_sha": "594840fb28514bf24a22a866a96dc95fa918b578",
+    "packaging_files_are_post_source_evidence": true
+  },
+  "governing_documents": {
+    "hadi_mac_commit": "817fa28255cb6045e9bdbedb79475823d01b8e26",
+    "hadi_mac_tree": "ef9ebbea9431513a8eb6e424e64281933eae81ac",
+    "design_spec": {
+      "path": "docs/superpowers/specs/2026-08-23-autonomous-three-squad-flight-system-design.md",
+      "sha256": "d138b037216d3a54b84a53b1d0860a632aa27d4d2f0e0ddb3d74b9ea6304ccbd"
+    },
+    "flight_2_plan": {
+      "path": "docs/superpowers/plans/2026-08-23-flight-02-spine-schema.md",
+      "sha256": "66c3b066348f7da5c5f52cdf57ebba9418808474e42b043852ac89981af9a717"
+    }
+  },
+  "task_commit_map": [
+    {
+      "task": 1,
+      "scope": "schema and additive migrations",
+      "ordered_commits": [
+        "2aa504aacd0a516b34f34bf6521ed6550606ca17",
+        "5e8e0568337651de76f390332636d7ee28a4ff99",
+        "cb226872cdb8ab669acc5e9db3d078b526a555d7",
+        "29e7d7fcca849ed07ca1339cf1fc325c90fd9ad0",
+        "4d0b714ac63f487c411d2824ddb44a143628373a",
+        "aec4babf384c3b7a407c2914b5edda9d970a44e3"
+      ],
+      "review_evidence": [
+        {
+          "reviewed_range": "5e8e0568337651de76f390332636d7ee28a4ff99..cb226872cdb8ab669acc5e9db3d078b526a555d7",
+          "verdict": "pass",
+          "reviewer_identity": "identity_not_persisted",
+          "diff_sha256": "a860d64cea6b8e39d8cb76604b78bea2550716ae47c92324ce152c7469317fa1"
+        },
+        {
+          "reviewed_range": "90aafb5de07ebb3c34510fc7bf3a0c4f26c33abd..4d0b714ac63f487c411d2824ddb44a143628373a",
+          "verdict": "pass",
+          "reviewer_identity": "identity_not_persisted",
+          "diff_sha256": "117d3dba5354fc5aa5e93bccf484c2557c93e77f427ba522a97a21f111a00624"
+        },
+        {
+          "reviewed_range": "058259cd87dfc26d2ecf38c8e52f80216e8d0e99..aec4babf384c3b7a407c2914b5edda9d970a44e3",
+          "verdict": "pass",
+          "reviewer_identity": "/root/flight02_task1_decision_cause_review",
+          "diff_sha256": "7b0525858127fdd0f78b7cd851f4ab5767fc3aabfa6b9c16baefed6a8823c93c"
+        }
+      ],
+      "report_sha256": "212dbc822446ad6f1072898e0252b11c2189ddc309606b1dc975f960e1ae453b"
+    },
+    {
+      "task": 2,
+      "scope": "execution receipt ledger and audited atomic seams",
+      "ordered_commits": [
+        "fa5e7581fc2462ea3cdfdac3a5ad815f51bef760",
+        "82b49cde6e2f838fac1bcfcbc208cd361b45b7b6",
+        "1b795477e74b02e8dc76d9eeaf7129b0db5ad5cc",
+        "e3662f55b5ec4bb127731d22fef00f765275adda",
+        "d0c6bc35d4b6598997795a12f1da95d2fbdef6d5",
+        "468b1c8cab53c227797bf8a564c6e4dc2e0ec9f0",
+        "6eec2b59caf158259865ff5c272c99faf27d161a",
+        "774e58abd1449c0f69703b7906014dc581993419",
+        "e745305fbc2a0abce3d8b8dd7de51dd28955ffee"
+      ],
+      "review_evidence": [
+        {
+          "reviewed_range": "fa5e7581fc2462ea3cdfdac3a5ad815f51bef760..82b49cde6e2f838fac1bcfcbc208cd361b45b7b6",
+          "verdict": "pass",
+          "reviewer_identity": "identity_not_persisted",
+          "diff_sha256": "3a858d734331dcb3c1f25fa917bde562c31276237c6c066e20d3462a99a6f56b"
+        },
+        {
+          "reviewed_range": "d0c6bc35d4b6598997795a12f1da95d2fbdef6d5..468b1c8cab53c227797bf8a564c6e4dc2e0ec9f0",
+          "verdict": "pass",
+          "reviewer_identity": "identity_not_persisted",
+          "diff_sha256": "185d0f510db80ea49ae0c453874d98100586e6afe7722241448557f2dffeb585"
+        },
+        {
+          "reviewed_range": "29e7d7fcca849ed07ca1339cf1fc325c90fd9ad0..6eec2b59caf158259865ff5c272c99faf27d161a",
+          "verdict": "pass",
+          "reviewer_identity": "identity_not_persisted",
+          "diff_sha256": "3a0f9080c8c52790aa1016d496ee652ca0757446973a9c1e6be7b7d938cb561d"
+        },
+        {
+          "reviewed_range": "774e58abd1449c0f69703b7906014dc581993419..e745305fbc2a0abce3d8b8dd7de51dd28955ffee",
+          "verdict": "pass",
+          "reviewer_identity": "identity_not_persisted",
+          "diff_sha256": "8c22bb6d0c1a59a7f66baee26ffad955a35cea213ddfd7be76ba1b3bf98c1715"
+        }
+      ],
+      "report_sha256": "1e0db1173d91d8f4a092d407671b18873bed5e39c688ddf6f4ef614397f41cb0"
+    },
+    {
+      "task": 3,
+      "scope": "objectives, assignments, dependencies, and consumption facts",
+      "ordered_commits": [
+        "47ccbc8c266dc74ffaedfce34436f894fa4af1d5",
+        "f2a1d9e75ecd6909591f825a927dc324f1a69cc8",
+        "5f3fe872a55d3164c799bfb9e5b76c50117304fa"
+      ],
+      "review_evidence": [
+        {
+          "reviewed_range": "f2a1d9e75ecd6909591f825a927dc324f1a69cc8..5f3fe872a55d3164c799bfb9e5b76c50117304fa",
+          "verdict": "pass",
+          "reviewer_identity": "identity_not_persisted",
+          "diff_sha256": "cff877e6f330cfd931fc614036e705f97558107a228c43a40080f7b0b6fcccf5"
+        }
+      ],
+      "report_sha256": "2bbdc49ed5a1b38594325f76d8b64d74873de4e145e20a9e7d4d66a448494f27"
+    },
+    {
+      "task": 4,
+      "scope": "token binding attestations and pending runtime seats",
+      "ordered_commits": [
+        "d91735d2f77a6025e8c9add75e4b7a71e53056be",
+        "b89da9e151b445b8c40440cbee11b842a2c703cc",
+        "90aafb5de07ebb3c34510fc7bf3a0c4f26c33abd",
+        "917c690e2b5213d42e15182fb531c121d1eaa6a8",
+        "9d2dc38c1d28e7049b4703d2a48ff035e5644ba4"
+      ],
+      "review_evidence": [
+        {
+          "reviewed_range": "b89da9e151b445b8c40440cbee11b842a2c703cc..90aafb5de07ebb3c34510fc7bf3a0c4f26c33abd",
+          "verdict": "pass",
+          "reviewer_identity": "identity_not_persisted",
+          "diff_sha256": "217e056f657cb39fb7cc1cf4c25a2dc284775ff5a825f47cca1388e20e139e72"
+        },
+        {
+          "reviewed_range": "917c690e2b5213d42e15182fb531c121d1eaa6a8..9d2dc38c1d28e7049b4703d2a48ff035e5644ba4",
+          "verdict": "pass",
+          "reviewer_identity": "/root/flight02_task4_membership_review",
+          "diff_sha256": "ecd43886b4285b54c4206cf254b99ad56ea0e9a35046ab7a13489cc55e28a97f"
+        }
+      ],
+      "report_sha256": "378d6aeb548ff2a702e064434faa0185a336db7b248fdda7928acb37c8de0e3b"
+    },
+    {
+      "task": 5,
+      "scope": "artifact metadata and retrieval facts",
+      "ordered_commits": [
+        "6d2960f153fe41edaf11580a6323fe74b8de87c5",
+        "5c56b960ea1a08facdef1c3e12d1a2b91e346e24",
+        "f39e4cb1597f102122741cc906186578dd1b4984"
+      ],
+      "review_evidence": [
+        {
+          "reviewed_range": "5c56b960ea1a08facdef1c3e12d1a2b91e346e24..f39e4cb1597f102122741cc906186578dd1b4984",
+          "verdict": "pass",
+          "reviewer_identity": "identity_not_persisted",
+          "diff_sha256": "bf0b27c73e1c81d4857eff146aa8fe2690ba7cf3c0d0ca6acf9135f1a8d26fcb"
+        }
+      ],
+      "report_sha256": "05e45b6442033b7241dfd5fd4c4d48e156e20b313c29141b6eabf5aafbec4d66"
+    },
+    {
+      "task": 6,
+      "scope": "audit, host-control facts, and Hadi decisions",
+      "ordered_commits": [
+        "058259cd87dfc26d2ecf38c8e52f80216e8d0e99",
+        "aec4babf384c3b7a407c2914b5edda9d970a44e3",
+        "e48b38d4a1563714a039eb178403213ecec5410a"
+      ],
+      "review_evidence": [
+        {
+          "reviewed_range": "aec4babf384c3b7a407c2914b5edda9d970a44e3..e48b38d4a1563714a039eb178403213ecec5410a",
+          "verdict": "pass",
+          "reviewer_identity": "identity_not_persisted",
+          "diff_sha256": "78239dbae2f3773f3defb5b7b7e541b1185a56ad66bfaaa756b4218e6f8042d9"
+        }
+      ],
+      "report_sha256": "ed4e3f2279a13704bfa92f64e7d165cea68991d29cf21bc3b9ae44c4ce1ffc07"
+    },
+    {
+      "task": 7,
+      "scope": "bounded MCP tools and compatibility integration",
+      "ordered_commits": [
+        "eaee3db5ecd745de806983d1a53940913ffa4e13",
+        "03654af88413843e702744fe974bd2d07494833c",
+        "8e81fa370f99a836ca6ae6ce96f1b7e7a40e564e"
+      ],
+      "review_evidence": [
+        {
+          "reviewed_range": "9d2dc38c1d28e7049b4703d2a48ff035e5644ba4..03654af88413843e702744fe974bd2d07494833c",
+          "verdict": "block_test_coverage",
+          "reviewer_identity": "/root/flight02_task7_mcp_review",
+          "diff_sha256": "dac187148749b1d412bbf0a0fd43b72f847598a924bd430fdc17af0dafcd6711"
+        },
+        {
+          "reviewed_range": "03654af88413843e702744fe974bd2d07494833c..8e81fa370f99a836ca6ae6ce96f1b7e7a40e564e",
+          "verdict": "pass",
+          "reviewer_identity": "/root/flight02_task7_mcp_review",
+          "diff_sha256": "7cdf6bce155c6317cca91168081255fd46d443a1714717914fb33ef35887e47e"
+        }
+      ],
+      "report_sha256": "64485a487441c0fd2281a16a27e28b2bfc46fc52554a5650848edbfee4af610e"
+    }
+  ],
+  "gate_reliability_commit": {
+    "sha": "cd4eeac28089ab8f48236c7306f12b9d1ce4460b",
+    "parent_sha": "8e81fa370f99a836ca6ae6ce96f1b7e7a40e564e",
+    "scope": "test_only_timing_gate_reliability",
+    "reviewer_identity": "/root/timing_gate_fix_review",
+    "review_verdict": "pass",
+    "diff_sha256": "8550064e5bcb4a26a3bd178edc6c4778d71d3f0e251fbfe7e40855da193e093d",
+    "historical_full_test_summaries": [
+      {
+        "reported_files_passed": 408,
+        "reported_tests_passed": 6370,
+        "reported_duration_seconds": 318.96,
+        "raw_log_available": false,
+        "authoritative_for_packaging": false
+      },
+      {
+        "reported_files_passed": 408,
+        "reported_tests_passed": 6370,
+        "reported_duration_seconds": 322.94,
+        "raw_log_available": false,
+        "authoritative_for_packaging": false
+      }
+    ]
+  },
+  "changed_files": [
+    { "status": "A", "path": "migrations/0121_flight_spine_objectives_assignments.sql", "byte_size": 7534, "sha256": "771a790e4cbd15082c7b3e4c66fcd1cf65e266a56ee17cd368ba8393be97bfce" },
+    { "status": "A", "path": "migrations/0122_runtime_seats_fences.sql", "byte_size": 12997, "sha256": "90a1b553e10899c1c637a43ce7b7c131b0b8c0331626210f751499818035b862" },
+    { "status": "A", "path": "migrations/0123_execution_receipt_ledger.sql", "byte_size": 5938, "sha256": "889ddff60aeab8445227e7dec81e1532721e3bb3984eccd8e7655d49d1ddc464" },
+    { "status": "A", "path": "migrations/0124_artifact_receipt_facts.sql", "byte_size": 4837, "sha256": "033d03de9f25e2002b1bf839c39597b0c8962bd5a8f8e186a0c92904be317721" },
+    { "status": "A", "path": "migrations/0125_mutation_host_control_audit.sql", "byte_size": 5101, "sha256": "528771167817fe5a4b0522042c9b825e29696f0cd8bd05f9827c36028ce27487" },
+    { "status": "A", "path": "migrations/0126_decision_requests.sql", "byte_size": 4294, "sha256": "154f9db4006d9a110b311fba094bd543b6bef55ccafca8e04dd94fd57ab83d9d" },
+    { "status": "A", "path": "src/flight-spine/artifacts.ts", "byte_size": 43117, "sha256": "281aee0d42da569ac4dcfe0d96eb408e5f6589c076bf9ec29b490522d8839468" },
+    { "status": "A", "path": "src/flight-spine/assignments.ts", "byte_size": 26837, "sha256": "6ecd5c920711b47698236c17c16c1f05e04c12019c8e50d742631b5cc9e7ebfb" },
+    { "status": "A", "path": "src/flight-spine/attestations.ts", "byte_size": 14314, "sha256": "bedad7c388abbd08d7cd2a171d7029158e2c71db3579b6fd222efd6accdc9028" },
+    { "status": "A", "path": "src/flight-spine/audit.ts", "byte_size": 15864, "sha256": "431b9cc92f096166572358dba750484e01f3d68bda4e5e5e88aa0c2f67ef321a" },
+    { "status": "A", "path": "src/flight-spine/decisions.ts", "byte_size": 44748, "sha256": "4a7444e5261b5f949ad03779dd3cc12eaa084d979d2a0d83c1aba119a9e0f446" },
+    { "status": "A", "path": "src/flight-spine/dependencies.ts", "byte_size": 27986, "sha256": "b00aa6a701870698e819f0f4f2bd826959bcee020181e4edb3c6796333ed8ad8" },
+    { "status": "A", "path": "src/flight-spine/host-control.ts", "byte_size": 25439, "sha256": "f6a79fdadb2fc4e3bd18210e2371b73ab8f6be687045b98dcf4b24be3775680a" },
+    { "status": "A", "path": "src/flight-spine/objectives.ts", "byte_size": 22922, "sha256": "9c3f219cb8dc7c8b76c90b0d629d1c83386498d2835e2c27fa40bd57f706a6b7" },
+    { "status": "A", "path": "src/flight-spine/receipts.ts", "byte_size": 45107, "sha256": "035ed847a6b3050c8ec712cbdeff87f5b81ebc3fa4a264face34e196f6638905" },
+    { "status": "A", "path": "src/flight-spine/seats.ts", "byte_size": 41475, "sha256": "e8655f1625a5b2d5c068172685184f2f0432abfd8c9bbdf51c425bcee2abceac" },
+    { "status": "A", "path": "src/flight-spine/types.ts", "byte_size": 3563, "sha256": "cc79dcf45496b23dbafe25e5f72971e3cd7f64f8e9d5e92138575c579e3287de" },
+    { "status": "A", "path": "src/mcp/flight-spine.ts", "byte_size": 20355, "sha256": "2b52fe8662cc4a2fd3e557cc5513319a9c44331dedc432b3f9be6fbfb83277d6" },
+    { "status": "M", "path": "src/mcp/index.ts", "byte_size": 203483, "sha256": "ccbd98d8a0a2128187506c7fee3af4bea2a38cc6dce67cd32cd6184a86d22a77" },
+    { "status": "M", "path": "src/members/service.ts", "byte_size": 20207, "sha256": "fe1375654b8f8db34d38b94cf4245181c93faf102c041a402cd0ad22fcdbf779" },
+    { "status": "M", "path": "src/tasks/service.ts", "byte_size": 59605, "sha256": "8c6b083030e6954272f2e86b5ee15c67f96f9a7532530c9d18981a3f4f7cacb3" },
+    { "status": "A", "path": "tests/flight-spine-artifacts.test.ts", "byte_size": 45711, "sha256": "c3421dc18c4dbc17a86914203a6bd3a790414ce8bb0658397a82e759bf14f3ba" },
+    { "status": "A", "path": "tests/flight-spine-assignments.test.ts", "byte_size": 18758, "sha256": "f14bd76806d09263a69625f95eae0afbc6262427d2e20c936c4cd604b1448949" },
+    { "status": "A", "path": "tests/flight-spine-attestations.test.ts", "byte_size": 17181, "sha256": "cd3eee2cb627755aa62ba946443124881cc47bde3e84e324ffeab71028fb2389" },
+    { "status": "A", "path": "tests/flight-spine-audit.test.ts", "byte_size": 9625, "sha256": "855923a58e13fc1989f5f10d57b2ef41e76385041f5daaf2fc564bc90d775805" },
+    { "status": "A", "path": "tests/flight-spine-decisions.test.ts", "byte_size": 18298, "sha256": "9fdab64ee63d320e2f59bbfc12838d99b5df44b2818c9cfcac3cbc96228bf488" },
+    { "status": "A", "path": "tests/flight-spine-dependencies.test.ts", "byte_size": 25606, "sha256": "ac6790bdb84fc5cf2585cc9988593cf2c05c943490789f1604f95359a1880473" },
+    { "status": "A", "path": "tests/flight-spine-host-control.test.ts", "byte_size": 17493, "sha256": "d775df0bbf2ecbe3b8b7be1a425c34c182c52b2cc86bcd2cf26dbfb6398c43e1" },
+    { "status": "A", "path": "tests/flight-spine-integration.test.ts", "byte_size": 37137, "sha256": "473ddf663ef9f7caa3d5633ae33f8a4f6ea3774b77bf38c9e3bbdb19b48519f1" },
+    { "status": "A", "path": "tests/flight-spine-objectives.test.ts", "byte_size": 15826, "sha256": "6a2068d6ac868443f0427063492ca3a1e168ee5cc7fb0630e875e229a5e925e5" },
+    { "status": "A", "path": "tests/flight-spine-receipts.test.ts", "byte_size": 57993, "sha256": "1eff2aa241ef0ab44c7a98048f7c58181986e966b1732f578e070bb8d91a3b09" },
+    { "status": "A", "path": "tests/flight-spine-schema.test.ts", "byte_size": 32045, "sha256": "4298b4b53a441266d8e0aa94a0870d225d72a553b5281b16c199e25e4d2a3320" },
+    { "status": "A", "path": "tests/flight-spine-seats.test.ts", "byte_size": 33021, "sha256": "7f537b4a07d3ae06c525b8a35ef2f82424941451eb4d841a4e275612ca87b0cb" },
+    { "status": "A", "path": "tests/mcp-flight-spine.test.ts", "byte_size": 6254, "sha256": "43a3a174704208290bf92c4d1f04f32eb54a5c4135a9f31a4023b69e1b1cfda9" },
+    { "status": "M", "path": "tests/timing-safe-equal.test.ts", "byte_size": 8058, "sha256": "0bb2023ff3408986b6fedd66e979e5376d02e7f6eb546dee964461363293cea2" }
+  ],
+  "migrations": {
+    "verified_main_head": "0120",
+    "candidate": [
+      { "number": "0121", "path": "migrations/0121_flight_spine_objectives_assignments.sql", "sha256": "771a790e4cbd15082c7b3e4c66fcd1cf65e266a56ee17cd368ba8393be97bfce" },
+      { "number": "0122", "path": "migrations/0122_runtime_seats_fences.sql", "sha256": "90a1b553e10899c1c637a43ce7b7c131b0b8c0331626210f751499818035b862" },
+      { "number": "0123", "path": "migrations/0123_execution_receipt_ledger.sql", "sha256": "889ddff60aeab8445227e7dec81e1532721e3bb3984eccd8e7655d49d1ddc464" },
+      { "number": "0124", "path": "migrations/0124_artifact_receipt_facts.sql", "sha256": "033d03de9f25e2002b1bf839c39597b0c8962bd5a8f8e186a0c92904be317721" },
+      { "number": "0125", "path": "migrations/0125_mutation_host_control_audit.sql", "sha256": "528771167817fe5a4b0522042c9b825e29696f0cd8bd05f9827c36028ce27487" },
+      { "number": "0126", "path": "migrations/0126_decision_requests.sql", "sha256": "154f9db4006d9a110b311fba094bd543b6bef55ccafca8e04dd94fd57ab83d9d" }
+    ],
+    "remote_application_performed": false
+  },
+  "exported_service_interfaces": {
+    "objectives": ["resolveFlightSpinePrincipal", "requireFlightSpineSquadAuthority", "flightSpineAudit", "acceptObjective", "getObjective"],
+    "assignments": ["materializeComposition"],
+    "dependencies": ["linkChildFlight", "recordConsumedChildArtifact"],
+    "attestations": ["issueTokenBindingAttestation"],
+    "seats": ["registerPendingRuntimeSeat", "acquireRuntimeSeatLease", "renewRuntimeSeatLease", "releaseRuntimeSeatLease"],
+    "receipts": ["prepareFreshExecutionReceiptChain", "prepareAuditedDomainMutation", "prepareAuditedProjectionMutation", "executePreparedExecutionReceiptBatch", "executeAuditedProjectionMutations", "appendExecutionReceipt", "getExecutionReceipt", "verifyExecutionReceipt"],
+    "artifacts": ["recordArtifactMetadata", "recordArtifactRetrieval"],
+    "audit": ["assertNoCredentialMaterial", "safeBoundedText", "safeOptionalId", "canonicalSafeJson", "auditMutation"],
+    "host_control": ["recordHostControlFact"],
+    "decisions": ["createDecisionRequest", "resolveDecisionRequest"]
+  },
+  "mcp_tools": [
+    "objective_accept",
+    "objective_get",
+    "execution_receipt_get",
+    "token_binding_attest",
+    "runtime_seat_register_pending"
+  ],
+  "verification": [
+    {
+      "name": "source_remote_preflight",
+      "command": "verify remote main, exact base/source/tree, ancestry, main migration head 0120, and clean source status",
+      "started_at": "2026-08-24T03:43:35Z",
+      "ended_at": "2026-08-24T03:43:35Z",
+      "exit_code": 0,
+      "counts": null,
+      "log_path": ".superpowers/sdd/2026-08-23-flight-02-spine-schema/task-8-logs-cd4eeac/00-source-remote-preflight.log",
+      "log_sha256": "e228cc276ee7628c880e9196350f089cd7c69e2137628293608c7415bb14ed1c"
+    },
+    {
+      "name": "migration_numbering_script",
+      "command": "node scripts/check-migration-numbering.mjs",
+      "started_at": "2026-08-24T03:43:54Z",
+      "ended_at": "2026-08-24T03:43:54Z",
+      "exit_code": 0,
+      "counts": { "candidate_migrations": 6, "verified_main_head": "0120" },
+      "log_path": ".superpowers/sdd/2026-08-23-flight-02-spine-schema/task-8-logs-cd4eeac/01-migration-numbering-script.log",
+      "log_sha256": "5edb108c5e18204273fbdddf0e885289f2d612f9a5bc21881cc9e12330fe9818"
+    },
+    {
+      "name": "migration_numbering_node_tests",
+      "command": "node --test tests/migration-numbering.test.mjs",
+      "started_at": "2026-08-24T03:43:54Z",
+      "ended_at": "2026-08-24T03:44:00Z",
+      "exit_code": 0,
+      "counts": { "tests_passed": 28, "tests_failed": 0 },
+      "log_path": ".superpowers/sdd/2026-08-23-flight-02-spine-schema/task-8-logs-cd4eeac/02-migration-numbering-node.log",
+      "log_sha256": "cf32b25eab92abceca6d8882feaaa1866c67ac458c12a81bf894ffc1994b3afe"
+    },
+    {
+      "name": "schema_d1_helpers",
+      "command": "npx vitest run tests/helpers-migrations.test.ts tests/flight-spine-schema.test.ts tests/migration-d1-compat.test.ts",
+      "started_at": "2026-08-24T03:44:00Z",
+      "ended_at": "2026-08-24T03:44:04Z",
+      "exit_code": 0,
+      "counts": { "files_passed": 3, "tests_passed": 24, "tests_failed": 0 },
+      "log_path": ".superpowers/sdd/2026-08-23-flight-02-spine-schema/task-8-logs-cd4eeac/03-schema-d1-helpers.log",
+      "log_sha256": "1c72ee23bdeffdc60f9980cfee5ffb1046a61e69cb007b3637abd6651b00f01d"
+    },
+    {
+      "name": "all_flight_spine_and_mcp",
+      "command": "npx vitest run all 12 flight-spine suites plus tests/mcp-flight-spine.test.ts",
+      "started_at": "2026-08-24T03:44:04Z",
+      "ended_at": "2026-08-24T03:44:20Z",
+      "exit_code": 0,
+      "counts": { "files_passed": 13, "tests_passed": 246, "tests_failed": 0 },
+      "log_path": ".superpowers/sdd/2026-08-23-flight-02-spine-schema/task-8-logs-cd4eeac/04-flight-spine-all.log",
+      "log_sha256": "072c57d8e3663c503f219f1e1e4dea40c3720a2978babe5c14a7357737b3cb0d"
+    },
+    {
+      "name": "required_eight_suite_compatibility",
+      "command": "npx vitest run tests/mcp-flight-spine.test.ts tests/flight-spine-integration.test.ts tests/mcp-task-tools.test.ts tests/mcp-flight-tools.test.ts tests/agent-inbox-lease-sqlite.test.ts tests/targeted-seat-dispatch.test.ts tests/runner-receipts.test.ts tests/agent-audit-immutable.test.ts",
+      "started_at": "2026-08-24T03:44:20Z",
+      "ended_at": "2026-08-24T03:44:29Z",
+      "exit_code": 0,
+      "counts": { "files_passed": 8, "tests_passed": 212, "tests_failed": 0 },
+      "log_path": ".superpowers/sdd/2026-08-23-flight-02-spine-schema/task-8-logs-cd4eeac/05-required-compatibility.log",
+      "log_sha256": "fac0d546d3592d763d4b6b27460b9616d8bcedd2635ab26461fae5ba5c03bb7a"
+    },
+    {
+      "name": "authoritative_full_repository_test",
+      "command": "npm test",
+      "started_at": "2026-08-24T03:44:29Z",
+      "ended_at": "2026-08-24T03:49:48Z",
+      "exit_code": 0,
+      "counts": { "files_passed": 408, "tests_passed": 6370, "tests_failed": 0, "duration_seconds": 317.85 },
+      "authoritative_for_packaging": true,
+      "log_path": ".superpowers/sdd/2026-08-23-flight-02-spine-schema/task-8-logs-cd4eeac/06-full-npm-test.log",
+      "log_sha256": "e114c572c7cac5de459f77d0b564bf0baf31558d9137f5317399dd39b7c0d60e"
+    },
+    {
+      "name": "typecheck",
+      "command": "npm run typecheck",
+      "started_at": "2026-08-24T03:49:48Z",
+      "ended_at": "2026-08-24T03:50:01Z",
+      "exit_code": 0,
+      "counts": null,
+      "log_path": ".superpowers/sdd/2026-08-23-flight-02-spine-schema/task-8-logs-cd4eeac/07-typecheck.log",
+      "log_sha256": "6d58c26d938fbadfa54da5a3750112b8ac6e58447e276c262c5fc999a8ab07d1"
+    },
+    {
+      "name": "source_secret_scan",
+      "command": "node scripts/no-secrets.mjs --root .",
+      "started_at": "2026-08-24T03:50:01Z",
+      "ended_at": "2026-08-24T03:50:02Z",
+      "exit_code": 0,
+      "counts": { "secrets_found": 0 },
+      "log_path": ".superpowers/sdd/2026-08-23-flight-02-spine-schema/task-8-logs-cd4eeac/08-no-secrets.log",
+      "log_sha256": "ee96b0eca1814862216032fc1753a86fec6e4132e4fceff793c9b7960407f68e"
+    },
+    {
+      "name": "base_source_diff_check",
+      "command": "git diff --check 66d857b4ec87fb715d9928a906ed1dbd869d2c19..cd4eeac28089ab8f48236c7306f12b9d1ce4460b",
+      "started_at": "2026-08-24T03:50:02Z",
+      "ended_at": "2026-08-24T03:50:02Z",
+      "exit_code": 0,
+      "counts": null,
+      "log_path": ".superpowers/sdd/2026-08-23-flight-02-spine-schema/task-8-logs-cd4eeac/09-base-source-diff-check.log",
+      "log_sha256": "30633a3b741b12777e9963ed0b69c23c93227eb4ce01e7bcd65b17a7801fd218"
+    },
+    {
+      "name": "clean_source_status",
+      "command": "verify exact source SHA, exact tree SHA, and empty git porcelain status",
+      "started_at": "2026-08-24T03:50:02Z",
+      "ended_at": "2026-08-24T03:50:02Z",
+      "exit_code": 0,
+      "counts": null,
+      "log_path": ".superpowers/sdd/2026-08-23-flight-02-spine-schema/task-8-logs-cd4eeac/10-clean-source-status.log",
+      "log_sha256": "d48b085f19636a4f354316ac75c844152c05f395ca7c246a3d953970a4a28995"
+    }
+  ],
+  "mupot_bootstrap_record": {
+    "circuit_id": "e13ce173-2988-4a4d-ab82-19837a627b5e",
+    "circuit_key": "flight-spine-schema-02-20260823",
+    "flight_id": "7721f334-ae4b-4805-8de4-c3379a18f153",
+    "flight_status": "failed",
+    "stored_gate_verdict": "go",
+    "stored_gate_reason": "watchdog_reap: running_exceeded_timeout",
+    "ended_at_epoch_ms": 1787507421502,
+    "landed": false,
+    "gate_verdict_is_not_candidate_gate": true,
+    "mupot_budget_micro_usd": 0,
+    "mupot_cost_micro_usd": 0,
+    "internal_planning_ceiling_micro_usd": 5000000,
+    "external_subscription_consumption": "unknown_not_metered_by_mupot",
+    "ttl": {
+      "planned_overall_seconds": 28800,
+      "planned_writer_seconds": 5400,
+      "planned_writer_renewal_seconds": 2700,
+      "planned_gate_seconds": 2700,
+      "observed_duration_seconds": null,
+      "observed_duration_unknown_reason": "start timestamp not retained in this evidence packet",
+      "outcome": "exceeded_and_watchdog_reaped"
+    },
+    "tasks": [
+      { "role": "coordinate", "task_id": "37e713ca-515a-40e4-b2cd-9aeb27b0f9dc" },
+      { "role": "schema", "task_id": "2a87fa15-8034-4439-9786-44b3b33ab002" },
+      { "role": "objectives_dependencies", "task_id": "acb1d32a-ca9c-437a-94c4-afdfaec29fbb" },
+      { "role": "integration", "task_id": "32938319-a888-4fd8-b3d4-ae3eb87bfa4c", "gate_owner": "gate:hadi-grok" }
+    ],
+    "dispatch_receipts": [
+      { "role": "coordinate", "receipt_id": "22cc7236-cbb4-4f35-a7b6-f0994ebadeed" },
+      { "role": "schema", "receipt_id": "30d20549-1884-49c4-89b9-802c36b6e69a" },
+      { "role": "objectives_dependencies_reassignment", "receipt_id": "18a3337e-ec9a-45a0-aa3e-a172c13e1100" }
+    ],
+    "unknown_identifiers": [
+      "The original River dispatch is known only by prefix 71917132 in retained controller context and is not promoted to a UUID.",
+      "The blocked Kasra/Core dispatch is known only by prefix f62f3d15 and is not part of the active Hadi-Mac flight.",
+      "No exact integration dispatch receipt was retained in the package evidence."
+    ],
+    "role_deviations": [
+      "The planned squad-core flight could not be materialized by canonical Hadi Codex; the governed record used Hadi-Mac without impersonating Kasra or widening authority.",
+      "River did not consume the objectives/dependencies dispatch; the task was reassigned to Hadi Codex with a new exact dispatch receipt.",
+      "The prepared Core/Kasra path remained blocked and unconsumed; wake_agent returned internal_error.",
+      "Hadi Codex performed the supervised bootstrap writer/integrator work; this is not an autonomous multi-worker flight.",
+      "The planned Athena candidate gate was not run. The integration task names gate:hadi-grok, and the independent candidate verdict remains pending."
+    ],
+    "known_operational_anomalies": [
+      "The task bridge created unrelated Mumega-com/mumega-com issues 1091 through 1099; they were left untouched to avoid an unverified sync mutation.",
+      "Cross-squad flight attempts were denied by the primary-squad model and were not bypassed.",
+      "The failed/watchdog-reaped flight record contradicts its stored go gate verdict; failed is the governing outcome."
+    ]
+  },
+  "evidence_bundle": {
+    "fetchable_at_package_tip": true,
+    "repackage_parent_commit": "76375e74cbf7004f7865032bd67fe9bf08bb2bd2",
+    "repackage_commit": "CONTAINING_COMMIT",
+    "objects": [
+      { "type": "raw_log", "path": ".superpowers/sdd/2026-08-23-flight-02-spine-schema/task-8-logs-cd4eeac/00-source-remote-preflight.log", "sha256": "e228cc276ee7628c880e9196350f089cd7c69e2137628293608c7415bb14ed1c" },
+      { "type": "raw_log", "path": ".superpowers/sdd/2026-08-23-flight-02-spine-schema/task-8-logs-cd4eeac/01-migration-numbering-script.log", "sha256": "5edb108c5e18204273fbdddf0e885289f2d612f9a5bc21881cc9e12330fe9818" },
+      { "type": "raw_log", "path": ".superpowers/sdd/2026-08-23-flight-02-spine-schema/task-8-logs-cd4eeac/02-migration-numbering-node.log", "sha256": "cf32b25eab92abceca6d8882feaaa1866c67ac458c12a81bf894ffc1994b3afe" },
+      { "type": "raw_log", "path": ".superpowers/sdd/2026-08-23-flight-02-spine-schema/task-8-logs-cd4eeac/03-schema-d1-helpers.log", "sha256": "1c72ee23bdeffdc60f9980cfee5ffb1046a61e69cb007b3637abd6651b00f01d" },
+      { "type": "raw_log", "path": ".superpowers/sdd/2026-08-23-flight-02-spine-schema/task-8-logs-cd4eeac/04-flight-spine-all.log", "sha256": "072c57d8e3663c503f219f1e1e4dea40c3720a2978babe5c14a7357737b3cb0d" },
+      { "type": "raw_log", "path": ".superpowers/sdd/2026-08-23-flight-02-spine-schema/task-8-logs-cd4eeac/05-required-compatibility.log", "sha256": "fac0d546d3592d763d4b6b27460b9616d8bcedd2635ab26461fae5ba5c03bb7a" },
+      { "type": "raw_log", "path": ".superpowers/sdd/2026-08-23-flight-02-spine-schema/task-8-logs-cd4eeac/06-full-npm-test.log", "sha256": "e114c572c7cac5de459f77d0b564bf0baf31558d9137f5317399dd39b7c0d60e" },
+      { "type": "raw_log", "path": ".superpowers/sdd/2026-08-23-flight-02-spine-schema/task-8-logs-cd4eeac/07-typecheck.log", "sha256": "6d58c26d938fbadfa54da5a3750112b8ac6e58447e276c262c5fc999a8ab07d1" },
+      { "type": "raw_log", "path": ".superpowers/sdd/2026-08-23-flight-02-spine-schema/task-8-logs-cd4eeac/08-no-secrets.log", "sha256": "ee96b0eca1814862216032fc1753a86fec6e4132e4fceff793c9b7960407f68e" },
+      { "type": "raw_log", "path": ".superpowers/sdd/2026-08-23-flight-02-spine-schema/task-8-logs-cd4eeac/09-base-source-diff-check.log", "sha256": "30633a3b741b12777e9963ed0b69c23c93227eb4ce01e7bcd65b17a7801fd218" },
+      { "type": "raw_log", "path": ".superpowers/sdd/2026-08-23-flight-02-spine-schema/task-8-logs-cd4eeac/10-clean-source-status.log", "sha256": "d48b085f19636a4f354316ac75c844152c05f395ca7c246a3d953970a4a28995" },
+      { "type": "governing_document", "path": "docs/superpowers/specs/2026-08-23-autonomous-three-squad-flight-system-design.md", "sha256": "d138b037216d3a54b84a53b1d0860a632aa27d4d2f0e0ddb3d74b9ea6304ccbd", "source_commit": "817fa28255cb6045e9bdbedb79475823d01b8e26" },
+      { "type": "governing_document", "path": "docs/superpowers/plans/2026-08-23-flight-02-spine-schema.md", "sha256": "66c3b066348f7da5c5f52cdf57ebba9418808474e42b043852ac89981af9a717", "source_commit": "817fa28255cb6045e9bdbedb79475823d01b8e26" }
+    ]
+  },
+  "independent_candidate_gate": {
+    "status": "blocked_then_repackaged_awaiting_regate",
+    "planned_identity": "Athena",
+    "planned_identity_uuid": "a9423609-e3bf-4797-8af8-4b9b7aecdf16",
+    "actual_task_gate_owner": "gate:hadi-grok",
+    "prior_verdict": {
+      "verdict": "BLOCK",
+      "path": "docs/receipts/flight-02-gate-verdict.json",
+      "commit": "76375e74cbf7004f7865032bd67fe9bf08bb2bd2",
+      "sha256": "c2c8e23baceba87125c69e27163031e4a55c9d9025b2c186d0c23470a05d6dd3",
+      "defect_id": "raw_logs_not_fetchable",
+      "preserved_unchanged": true
+    },
+    "next_verdict": {
+      "path": "docs/receipts/flight-02-gate-verdict-v2.json",
+      "present": false,
+      "verdict": null
+    }
+  },
+  "supported_claims": [
+    "The exact source candidate adds migrations 0121 through 0126 above verified main head 0120.",
+    "The exact source candidate contains the listed Flight Spine service interfaces and exactly five bounded MCP tools.",
+    "The exact raw Task 8 log bytes and governing-document bytes are fetchable in the evidence package and match their recorded SHA-256 digests.",
+    "The package is suitable for a fresh read-only independent candidate review."
+  ],
+  "excluded_claims": [
+    "No migration has been applied to a remote or production D1 database.",
+    "No Worker or other production service has been deployed from this source.",
+    "No canonical token has been minted, rotated, revoked, exposed, or live-attested by this package.",
+    "No pending seat has been live-registered through the MCP surface by this package.",
+    "No runtime broker, process generation, host wake, durable delivery, consumption, correlated ACK, or recovery loop is proven.",
+    "No artifact bytes, R2 storage, result execution, independent gate verdict, landing, controller rewrite, or full-route audit coverage is proven.",
+    "The failed legacy Mupot flight did not land and is not autonomy evidence.",
+    "Local test success is not production parity, deployment authorization, migration authorization, or autonomous squad proof."
+  ],
+  "credentials": {
+    "values_included": false,
+    "files_read_for_values": false
+  }
+}

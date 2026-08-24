@@ -269,6 +269,17 @@ export interface CreateTaskOptions {
   externalSource?: string | null
 }
 
+/**
+ * Internal composition seam: the fully validated task plus its one direct DML
+ * insert. It deliberately exposes no prepared statement and performs no write,
+ * mirror or event on its own.
+ */
+export interface PreparedGuardedTaskInsert {
+  readonly task: Task
+  readonly sql: string
+  readonly bindings: readonly (string | number | boolean | null)[]
+}
+
 export class TaskCreateFenceError extends Error {
   constructor() {
     super('routine_dispatch_fenced')
@@ -951,11 +962,11 @@ export function evaluateTaskIntakeContract(
   }
 }
 
-export async function createTask(
+export async function prepareGuardedTaskInsert(
   env: Env,
   input: CreateTaskInput,
   options: CreateTaskOptions = {},
-): Promise<Task> {
+): Promise<PreparedGuardedTaskInsert> {
   // Enforce Point-of-Capture Intake Contract before touching the DB.
   assertValidIntakeContract(input, { allowDeferredPredicate: options.allowDeferredPredicate })
 
@@ -1026,53 +1037,39 @@ export async function createTask(
     external_source: externalSource,
   }
 
-  let taskInsert
-  try {
-    const fence = options.routineRunFence
-    const baseColumns = 'id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at'
-    const baseValues = [
-      task.id,
-      task.squad_id,
-      task.project_id,
-      task.title,
-      task.body,
-      task.done_when,
-      task.status,
-      task.assignee_agent_id,
-      task.github_issue_url,
-      task.result,
-      task.completed_at,
-      task.gate_owner,
-      task.created_at,
-      task.updated_at,
-    ]
-    // external_source (migrations/0077) is appended CONDITIONALLY, only when actually set,
-    // rather than unconditionally on every INSERT. Two reasons: (1) it keeps the column
-    // list + bind-array position of every existing column stable for any caller/test that
-    // indexes into it positionally (same rationale a purely-additive column change should
-    // have anyway); (2) more importantly, it means the overwhelmingly common case — a
-    // local/trusted createTask call, externalSource unset — never references the column at
-    // all, so it stays compatible with hand-rolled/pinned-migration-subset test DB schemas
-    // (several exist in this repo) that predate 0077 and never needed to know about it.
-    // Only the small set of external-integration callers that actually pass externalSource
-    // require the column to exist in their DB.
-    // priority / parent_task_id (migrations/0079) follow the same conditional-append
-    // convention as external_source directly above: referenced ONLY when actually set, so
-    // the common create path never mentions them and stays compatible with any DB that
-    // predates 0079. Built as a list rather than another ternary pair — a third nested
-    // ternary over three optional columns is where an off-by-one bind lands.
-    const extraColumns: string[] = []
-    const extraValues: unknown[] = []
-    if (externalSource !== null) { extraColumns.push('external_source'); extraValues.push(externalSource) }
-    if (input.priority != null) { extraColumns.push('priority'); extraValues.push(input.priority) }
-    if (input.parent_task_id != null) { extraColumns.push('parent_task_id'); extraValues.push(input.parent_task_id) }
+  const fence = options.routineRunFence
+  const baseColumns = 'id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at'
+  const baseValues: (string | number | boolean | null)[] = [
+    task.id,
+    task.squad_id,
+    task.project_id,
+    task.title,
+    task.body,
+    task.done_when,
+    task.status,
+    task.assignee_agent_id,
+    task.github_issue_url,
+    task.result,
+    task.completed_at,
+    task.gate_owner,
+    task.created_at,
+    task.updated_at,
+  ]
+  // Keep optional legacy columns conditional so the common path remains compatible
+  // with pinned test schemas that predate them.
+  const extraColumns: string[] = []
+  const extraValues: (string | number | boolean | null)[] = []
+  if (externalSource !== null) { extraColumns.push('external_source'); extraValues.push(externalSource) }
+  if (input.priority != null) { extraColumns.push('priority'); extraValues.push(input.priority) }
+  if (input.parent_task_id != null) { extraColumns.push('parent_task_id'); extraValues.push(input.parent_task_id) }
 
-    const columns = extraColumns.length > 0 ? `${baseColumns}, ${extraColumns.join(', ')}` : baseColumns
-    const values = [...baseValues, ...extraValues]
-    const placeholders = values.map(() => '?').join(', ')
-    if (fence) {
-      taskInsert = await env.DB.prepare(
-        `INSERT INTO tasks (${columns})
+  const columns = extraColumns.length > 0 ? `${baseColumns}, ${extraColumns.join(', ')}` : baseColumns
+  const values = [...baseValues, ...extraValues]
+  const placeholders = values.map(() => '?').join(', ')
+  if (fence) {
+    return Object.freeze({
+      task,
+      sql: `INSERT INTO tasks (${columns})
          SELECT ${placeholders}
           WHERE EXISTS (
             SELECT 1 FROM routine_runs rr
@@ -1084,13 +1081,27 @@ export async function createTask(
                     AND requested.kind = 'cancellation_requested'
                )
           )`,
-      ).bind(...values, fence.runId, fence.tenant, task.project_id).run()
-    } else {
-      taskInsert = await env.DB.prepare(
-        `INSERT INTO tasks (${columns})
-         VALUES (${placeholders})`,
-      ).bind(...values).run()
-    }
+      bindings: Object.freeze([...values, fence.runId, fence.tenant, task.project_id]),
+    })
+  }
+  return Object.freeze({
+    task,
+    sql: `INSERT INTO tasks (${columns}) VALUES (${placeholders})`,
+    bindings: Object.freeze(values),
+  })
+}
+
+export async function createTask(
+  env: Env,
+  input: CreateTaskInput,
+  options: CreateTaskOptions = {},
+): Promise<Task> {
+  const prepared = await prepareGuardedTaskInsert(env, input, options)
+  const task = prepared.task
+  const externalSource = task.external_source ?? null
+  let taskInsert
+  try {
+    taskInsert = await env.DB.prepare(prepared.sql).bind(...prepared.bindings).run()
   } catch (error) {
     mapTaskProjectInsertError(error)
   }

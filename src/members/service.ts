@@ -39,6 +39,48 @@ export async function sha256Hex(raw: string): Promise<string> {
   return s
 }
 
+/** Dedicated secret binding for public, non-reversible member-token fingerprints.
+ *  It is intentionally not optional and has no fallback to any other Worker secret. */
+export interface MemberTokenFingerprintEnv extends Env {
+  MEMBER_TOKEN_FINGERPRINT_SECRET: string
+}
+
+export class MemberTokenFingerprintError extends Error {
+  readonly name = 'MemberTokenFingerprintError'
+  readonly code = 'fingerprint_not_configured' as const
+}
+
+/**
+ * Derive a versioned public fingerprint from the server-stored token hash.
+ * The stored hash is HMAC input only: it is never returned or embedded verbatim.
+ */
+export async function deriveSafeMemberTokenFingerprint(
+  env: MemberTokenFingerprintEnv,
+  tokenHash: string,
+): Promise<string> {
+  const secret = env.MEMBER_TOKEN_FINGERPRINT_SECRET
+  if (typeof secret !== 'string' || secret.trim().length === 0) {
+    throw new MemberTokenFingerprintError('fingerprint_not_configured')
+  }
+  const encoder = new TextEncoder()
+  const key = await crypto.subtle.importKey(
+    'raw',
+    encoder.encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  )
+  const digest = await crypto.subtle.sign(
+    'HMAC',
+    key,
+    encoder.encode(`mupot:member-token-fingerprint:v1:${tokenHash}`),
+  )
+  const hex = Array.from(new Uint8Array(digest))
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('')
+  return `v1:${hex}`
+}
+
 /** Cryptographically-random opaque token (URL-safe hex). Shown once, never stored raw.
  *  Exported for the invite-accept atomic batch; everything else uses mintMemberToken(). */
 export function mintRawToken(bytes = 32): string {

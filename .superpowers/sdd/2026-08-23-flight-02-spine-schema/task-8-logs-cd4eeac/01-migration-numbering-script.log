@@ -1,0 +1,5 @@
+__COMMAND__ node scripts/check-migration-numbering.mjs
+__START__ 2026-08-24T03:43:54Z
+migration numbering OK — 0121_flight_spine_objectives_assignments.sql, 0122_runtime_seats_fences.sql, 0123_execution_receipt_ledger.sql, 0124_artifact_receipt_facts.sql, 0125_mutation_host_control_audit.sql, 0126_decision_requests.sql sort above origin/main head 120
+__END__ 2026-08-24T03:43:54Z
+__EXIT__ 0

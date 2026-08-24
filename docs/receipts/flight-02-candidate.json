@@ -1,0 +1,42 @@
+{
+  "schema": "FLIGHT-SPINE-SCHEMA-02-CANDIDATE",
+  "version": 1,
+  "status": "awaiting_independent_gate",
+  "source_candidate_sha": "cd4eeac28089ab8f48236c7306f12b9d1ce4460b",
+  "source_tree_sha": "594840fb28514bf24a22a866a96dc95fa918b578",
+  "manifest": {
+    "path": "docs/receipts/flight-02-bootstrap-manifest.json",
+    "sha256": "7f49c6ae6fa21788ddfdfe29d50863f7628fa69fafb607b2c90eca9ab26d7df9"
+  },
+  "packager": {
+    "slug": "hadi-codex",
+    "uuid": "087a816b-ab9f-400f-8d53-f6f97b94a725"
+  },
+  "packaged_at": "2026-08-24T04:18:31Z",
+  "initial_packaged_at": "2026-08-24T03:57:27Z",
+  "prior_independent_gate": {
+    "verdict": "BLOCK",
+    "path": "docs/receipts/flight-02-gate-verdict.json",
+    "commit": "76375e74cbf7004f7865032bd67fe9bf08bb2bd2",
+    "sha256": "c2c8e23baceba87125c69e27163031e4a55c9d9025b2c186d0c23470a05d6dd3",
+    "defect_id": "raw_logs_not_fetchable",
+    "preserved_unchanged": true
+  },
+  "next_independent_gate": {
+    "verdict_path": "docs/receipts/flight-02-gate-verdict-v2.json",
+    "verdict_present": false
+  },
+  "supported_claims": [
+    "Migrations 0121 through 0126 are additive above verified main head 0120.",
+    "The listed Flight Spine service interfaces and exactly five bounded MCP tools exist at the exact source SHA.",
+    "The fresh Task 8 migration, schema, compatibility, full-test, typecheck, secret, diff, and clean-source gates passed.",
+    "The 11 cited raw logs and two governing documents are fetchable in the evidence package and match the manifest digests."
+  ],
+  "excluded_claims": [
+    "No production migration or deployment is authorized or performed.",
+    "No live token attestation, pending-seat registration, runtime delivery, consumption, ACK, artifact bytes, result, gate, landing, recovery, or autonomy is proven.",
+    "The legacy Mupot flight failed by watchdog TTL reap and did not land."
+  ],
+  "autonomy_claim": false,
+  "deployment_authorized": false
+}
