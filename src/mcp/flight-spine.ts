@@ -72,6 +72,26 @@ type VisibleTask = {
   projectId: string | null
 }
 
+export interface PublicExecutionReceipt {
+  id: string
+  type: ExecutionReceipt['type']
+  actorKind: ExecutionReceipt['actorKind']
+  actorId: string
+  objectiveId: string | null
+  flightId: string | null
+  taskId: string | null
+  assignmentEpoch: number | null
+  payloadDigest: string
+  receiptHash: string
+  serverTimestamp: string
+}
+
+interface DependencyReceiptClaims {
+  dependencyId: string
+  parentFlightId: string
+  childFlightId: string
+}
+
 function boundWorkspaceIdentity(
   auth: AuthContext,
 ): BoundWorkspaceIdentity | ToolOutcome {
@@ -266,51 +286,168 @@ async function visibleTask(
   return { id: task.id, squadId: task.squad_id, projectId: task.project_id }
 }
 
+function hasExactPublicTypeShape(receipt: ExecutionReceipt): boolean {
+  const objectiveOnly = receipt.objectiveId !== null
+    && receipt.flightId === null
+    && receipt.taskId === null
+    && receipt.assignmentEpoch === null
+  const objectiveAndFlight = receipt.objectiveId !== null
+    && receipt.flightId !== null
+    && receipt.taskId === null
+    && receipt.assignmentEpoch === null
+
+  switch (receipt.type) {
+    case 'objective.authorized':
+    case 'objective.accepted':
+      return objectiveOnly
+    case 'composition.proposed':
+    case 'flight.materialized':
+    case 'flight.dependency_linked':
+      return objectiveAndFlight
+    case 'task.assigned':
+      return receipt.objectiveId !== null
+        && receipt.flightId !== null
+        && receipt.taskId !== null
+        && receipt.assignmentEpoch !== null
+        && Number.isInteger(receipt.assignmentEpoch)
+        && receipt.assignmentEpoch > 0
+    default:
+      return false
+  }
+}
+
+function objectiveAndFlightAgree(
+  objective: AcceptedObjective,
+  flight: VisibleFlight,
+): boolean {
+  return flight.meta.objective_id === objective.id
+    && flight.projectId === objective.projectId
+    && flight.meta.squad_ids.includes(objective.squadId)
+}
+
+function objectiveAndTaskAgree(
+  objective: AcceptedObjective,
+  task: VisibleTask,
+): boolean {
+  return task.projectId === objective.projectId
+    && task.squadId === objective.squadId
+}
+
+function flightAndTaskAgree(flight: VisibleFlight, task: VisibleTask): boolean {
+  return flight.meta.task_ids.includes(task.id)
+    && flight.meta.squad_ids.includes(task.squadId)
+    && flight.projectId === task.projectId
+}
+
+function dependencyClaims(claimsJson: string): DependencyReceiptClaims | null {
+  let value: unknown
+  try {
+    value = JSON.parse(claimsJson)
+  } catch {
+    return null
+  }
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null
+  const record = value as Record<string, unknown>
+  const keys = Object.keys(record).sort()
+  if (keys.join('\n') !== 'childFlightId\ndependencyId\nparentFlightId') return null
+  const dependencyId = str(record.dependencyId)
+  const parentFlightId = str(record.parentFlightId)
+  const childFlightId = str(record.childFlightId)
+  if (!dependencyId || !parentFlightId || !childFlightId) return null
+  return { dependencyId, parentFlightId, childFlightId }
+}
+
+async function visibleDependency(
+  env: Env,
+  auth: AuthContext,
+  receipt: ExecutionReceipt,
+  objective: AcceptedObjective,
+): Promise<boolean> {
+  const claims = dependencyClaims(receipt.claimsJson)
+  if (
+    !claims
+    || receipt.objectiveId === null
+    || receipt.flightId === null
+    || claims.parentFlightId !== receipt.flightId
+    || claims.childFlightId === claims.parentFlightId
+  ) {
+    return false
+  }
+  const row = await env.DB.prepare(`
+    SELECT id FROM flight_dependencies
+     WHERE id = ?1 AND tenant = ?2 AND objective_id = ?3
+       AND parent_flight_id = ?4 AND child_flight_id = ?5
+     LIMIT 1
+  `).bind(
+    claims.dependencyId,
+    env.TENANT_SLUG,
+    receipt.objectiveId,
+    claims.parentFlightId,
+    claims.childFlightId,
+  ).first<{ id: string }>()
+  if (!row) return false
+  const child = await visibleFlight(env, auth, claims.childFlightId)
+  return child !== null && objectiveAndFlightAgree(objective, child)
+}
+
+function publicExecutionReceipt(receipt: ExecutionReceipt): PublicExecutionReceipt {
+  return {
+    id: receipt.id,
+    type: receipt.type,
+    actorKind: receipt.actorKind,
+    actorId: receipt.actorId,
+    objectiveId: receipt.objectiveId,
+    flightId: receipt.flightId,
+    taskId: receipt.taskId,
+    assignmentEpoch: receipt.assignmentEpoch,
+    payloadDigest: receipt.payloadDigest,
+    receiptHash: receipt.receiptHash,
+    serverTimestamp: receipt.serverTimestamp,
+  }
+}
+
 async function receiptIsVisible(
   env: Env,
   auth: AuthContext,
   receipt: ExecutionReceipt,
 ): Promise<boolean> {
-  if (auth.tenant !== env.TENANT_SLUG) return false
-  if (!PUBLIC_RECEIPT_TYPES.has(receipt.type)) return false
+  if (
+    auth.tenant !== env.TENANT_SLUG
+    || receipt.tenant !== env.TENANT_SLUG
+    || receipt.issuerKind !== 'mupot'
+    || receipt.issuerId !== `mupot:${env.TENANT_SLUG}`
+    || !PUBLIC_RECEIPT_TYPES.has(receipt.type)
+  ) {
+    return false
+  }
   // These fields describe runtime/message/lease facts, none of which this
   // bounded reader exposes even when another correlation happens to be visible.
   if (
     receipt.seatId !== null
+    || receipt.seatGeneration !== null
     || receipt.messageId !== null
     || receipt.fencingEpoch !== null
     || receipt.leaseTokenHash !== null
+    || !hasExactPublicTypeShape(receipt)
   ) {
     return false
   }
 
-  let resolved = false
-  let objective: AcceptedObjective | null = null
-  let flight: VisibleFlight | null = null
-  let task: VisibleTask | null = null
+  const objective = await visibleObjective(env, auth, receipt.objectiveId as string)
+  if (!objective) return false
+  if (receipt.flightId === null) return true
 
-  if (receipt.objectiveId !== null) {
-    objective = await visibleObjective(env, auth, receipt.objectiveId)
-    if (!objective) return false
-    resolved = true
+  const flight = await visibleFlight(env, auth, receipt.flightId)
+  if (!flight || !objectiveAndFlightAgree(objective, flight)) return false
+  if (receipt.type === 'flight.dependency_linked') {
+    return visibleDependency(env, auth, receipt, objective)
   }
-  if (receipt.flightId !== null) {
-    flight = await visibleFlight(env, auth, receipt.flightId)
-    if (!flight) return false
-    resolved = true
-  }
-  if (receipt.taskId !== null) {
-    task = await visibleTask(env, auth, receipt.taskId)
-    if (!task) return false
-    resolved = true
-  }
+  if (receipt.taskId === null) return true
 
-  if (objective && flight && flight.meta.objective_id !== objective.id) return false
-  if (flight && task && !flight.meta.task_ids.includes(task.id)) return false
-  if (objective && task && objective.projectId !== task.projectId) return false
-  if (flight && task && flight.projectId !== task.projectId) return false
-  if (flight && task && !flight.meta.squad_ids.includes(task.squadId)) return false
-  return resolved
+  const task = await visibleTask(env, auth, receipt.taskId)
+  return task !== null
+    && objectiveAndTaskAgree(objective, task)
+    && flightAndTaskAgree(flight, task)
 }
 
 const toolObjectiveAccept: ToolSpec = {
@@ -429,7 +566,7 @@ const toolExecutionReceiptGet: ToolSpec = {
     }
     const verification = await verifyExecutionReceipt(env, receipt.id)
     if (!verification.ok) return fail(409, 'receipt_integrity_failure')
-    return done({ receipt })
+    return done({ receipt: publicExecutionReceipt(receipt) })
   },
 }
 
