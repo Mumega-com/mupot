@@ -189,12 +189,13 @@ function insertAttempt(
   state = 'leased',
   endedAt: string | null = null,
   retryNotBefore = number === 1 ? T0 : number === 2 ? T5 : T35,
+  leasedAt = retryNotBefore,
 ): void {
   harness.sqlite.prepare(
     "INSERT INTO fenced_delivery_attempts (id,tenant,delivery_id,attempt_number,attempt_nonce,generation,prior_fencing_epoch,fencing_epoch,runtime_seat_lease_id,state,leased_at,expires_at,retry_not_before,ended_at,created_at) VALUES (?,?,?,?,?,1,?,?,?,?,?,?,?,?,?)",
   ).run(
     id,TENANT,deliveryId,number,'nonce-' + id,priorFence,fence,leaseId,state,
-    T0,T60,retryNotBefore,endedAt,T0,
+    leasedAt,T60,retryNotBefore,endedAt,T0,
   )
 }
 
@@ -585,6 +586,33 @@ describe('Flight 3 real migration schema', () => {
     )).toThrow()
   })
 
+  it('rejects a recovered attempt leased before its reservation retry boundary', () => {
+    seedBrokerAndSigners()
+    seedIngress()
+    insertDelivery('delivery-early-lease','message-early-lease')
+    insertProofMessage('delivery-early-lease','message-early-lease','seat-runtime')
+    insertLease('lease-early-1',1)
+    insertAttempt('attempt-early-1','delivery-early-lease',1,'lease-early-1',0,1)
+    harness.sqlite.exec([
+      "UPDATE fenced_deliveries SET state='leased',active_attempt_id='attempt-early-1',active_attempt_number=1,current_fencing_epoch=1 WHERE id='delivery-early-lease';",
+      "UPDATE runtime_seat_leases SET state='expired' WHERE id='lease-early-1';",
+      "UPDATE fenced_delivery_attempts SET state='expired',ended_at='" + T0 + "' WHERE id='attempt-early-1';",
+      "UPDATE fenced_deliveries SET state='expired',updated_at='" + T0 + "' WHERE id='delivery-early-lease';",
+    ].join('\n'))
+    reserveAndConsumeRecovery(
+      'reservation-early-lease','delivery-early-lease','attempt-early-1',1,1,2,T5,
+    )
+    insertLease('lease-early-2',2)
+    expect(() => insertAttempt(
+      'attempt-early-2','delivery-early-lease',2,'lease-early-2',1,2,
+      'leased',null,T5,T0,
+    )).toThrow(/retry boundary/)
+    expect(() => insertAttempt(
+      'attempt-boundary-2','delivery-early-lease',2,'lease-early-2',1,2,
+      'leased',null,T5,T5,
+    )).not.toThrow()
+  })
+
   it('waits 45 seconds after attempt three ends before terminal blocked escalation', () => {
     seedBrokerAndSigners()
     seedIngress()
@@ -624,6 +652,9 @@ describe('Flight 3 real migration schema', () => {
     harness.sqlite.exec(
       "UPDATE fenced_deliveries SET state='leased',active_attempt_id='attempt-final-3',active_attempt_number=3,current_fencing_epoch=3,updated_at='" + T35 + "' WHERE id='delivery-final-wait'",
     )
+    expect(() => harness.sqlite.exec(
+      "UPDATE fenced_deliveries SET state='blocked',updated_at='" + T80 + "' WHERE id='delivery-final-wait'",
+    )).toThrow(/final retry wait/)
     harness.sqlite.exec([
       "UPDATE runtime_seat_leases SET state='expired' WHERE id='lease-final-3';",
       "UPDATE fenced_delivery_attempts SET state='blocked',ended_at='" + T35 + "' WHERE id='attempt-final-3';",
@@ -635,6 +666,19 @@ describe('Flight 3 real migration schema', () => {
     expect(() => harness.sqlite.exec(
       "UPDATE fenced_deliveries SET state='blocked',updated_at='" + T80 + "' WHERE id='delivery-final-wait'",
     )).not.toThrow()
+  })
+
+  it('rejects terminal blocking when active attempt three does not exist', () => {
+    seedBrokerAndSigners()
+    seedIngress()
+    insertDelivery('delivery-missing-third','message-missing-third')
+    insertProofMessage('delivery-missing-third','message-missing-third','seat-runtime')
+    harness.sqlite.exec(
+      "UPDATE fenced_deliveries SET state='leased',active_attempt_id='missing-attempt-3',active_attempt_number=3,current_fencing_epoch=3,updated_at='" + T35 + "' WHERE id='delivery-missing-third'",
+    )
+    expect(() => harness.sqlite.exec(
+      "UPDATE fenced_deliveries SET state='blocked',updated_at='" + T80 + "' WHERE id='delivery-missing-third'",
+    )).toThrow(/final retry wait/)
   })
 
   it('keeps delivery digests immutable and rejects evidence for a stale attempt', () => {

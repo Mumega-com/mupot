@@ -431,16 +431,19 @@ CREATE TRIGGER fenced_deliveries_attempt_three_final_wait
 BEFORE UPDATE OF state ON fenced_deliveries
 WHEN NEW.state = 'blocked'
   AND OLD.active_attempt_number = 3
-  AND EXISTS (
+  AND NOT EXISTS (
     SELECT 1
       FROM fenced_delivery_attempts attempt
      WHERE attempt.id = OLD.active_attempt_id
        AND attempt.tenant = OLD.tenant
        AND attempt.delivery_id = OLD.id
        AND attempt.attempt_number = 3
+       AND attempt.generation = OLD.generation
+       AND attempt.fencing_epoch = OLD.current_fencing_epoch
        AND attempt.state = 'blocked'
        AND attempt.ended_at IS NOT NULL
-       AND julianday(NEW.updated_at) < julianday(attempt.ended_at, '+45 seconds')
+       AND julianday(NEW.updated_at) >=
+         julianday(attempt.ended_at, '+45 seconds')
   )
 BEGIN
   SELECT RAISE(ABORT, 'fenced delivery final retry wait not elapsed');
@@ -672,6 +675,18 @@ OR (
 )
 BEGIN
   SELECT RAISE(ABORT, 'fenced delivery attempt is not authorized');
+END;
+
+CREATE TRIGGER fenced_delivery_attempts_retry_boundary
+BEFORE INSERT ON fenced_delivery_attempts
+WHEN NEW.attempt_number > 1
+AND (
+  julianday(NEW.leased_at) IS NULL
+  OR julianday(NEW.retry_not_before) IS NULL
+  OR julianday(NEW.leased_at) < julianday(NEW.retry_not_before)
+)
+BEGIN
+  SELECT RAISE(ABORT, 'fenced delivery attempt retry boundary not reached');
 END;
 
 CREATE TRIGGER fenced_delivery_attempts_identity_immutable
