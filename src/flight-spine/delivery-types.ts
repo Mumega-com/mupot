@@ -147,6 +147,7 @@ export interface EncryptedEnvelopeReference {
   envelopeReceiptId: string
   envelopeRef: string
   ciphertextDigest: string
+  envelopeDigest: string
   payloadDigest: string
   runtimeInputDigest: string
   encryptionKeyId: string
@@ -179,6 +180,7 @@ export interface HostEnvelopeIngressReceipt {
   recipientEncryptionKeyId: string
   envelopeRef: string
   ciphertextDigest: string
+  envelopeDigest: string
   payloadDigest: string
   runtimeInputDigest: string
   byteLength: number
@@ -205,6 +207,7 @@ export interface SignedDeliveryEvidence {
   effectKey: string
   payloadDigest: string
   ciphertextDigest: string
+  envelopeDigest: string
   runtimeInputDigest: string
   providerEffectId: string | null
   occurredAt: string
@@ -302,10 +305,12 @@ export interface FencedDelivery {
   fencingEpoch: number
   activeAttemptId: string | null
   activeAttemptNumber: number
+  requestId: string
   effectKey: string
   envelopeReceiptId: string
   envelopeRef: string
   ciphertextDigest: string
+  envelopeDigest: string
   payloadDigest: string
   runtimeInputDigest: string
   state: FencedDeliveryState

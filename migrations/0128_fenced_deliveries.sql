@@ -56,6 +56,12 @@ CREATE TABLE host_envelope_ingress_receipts (
       AND ciphertext_digest = lower(ciphertext_digest)
       AND ciphertext_digest NOT GLOB '*[^0-9a-f]*'
     ),
+  envelope_digest TEXT NOT NULL
+    CHECK (
+      length(envelope_digest) = 64
+      AND envelope_digest = lower(envelope_digest)
+      AND envelope_digest NOT GLOB '*[^0-9a-f]*'
+    ),
   payload_digest TEXT NOT NULL
     CHECK (
       length(payload_digest) = 64
@@ -100,6 +106,7 @@ CREATE TABLE fenced_deliveries (
   generation INTEGER NOT NULL CHECK (generation > 0),
   ingress_receipt_id TEXT NOT NULL
     REFERENCES host_envelope_ingress_receipts(id) ON DELETE RESTRICT,
+  request_id TEXT NOT NULL CHECK (length(trim(request_id)) BETWEEN 1 AND 128),
   effect_key TEXT NOT NULL CHECK (length(trim(effect_key)) BETWEEN 1 AND 255),
   envelope_ref TEXT NOT NULL CHECK (length(trim(envelope_ref)) > 0),
   ciphertext_digest TEXT NOT NULL
@@ -107,6 +114,12 @@ CREATE TABLE fenced_deliveries (
       length(ciphertext_digest) = 64
       AND ciphertext_digest = lower(ciphertext_digest)
       AND ciphertext_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+  envelope_digest TEXT NOT NULL
+    CHECK (
+      length(envelope_digest) = 64
+      AND envelope_digest = lower(envelope_digest)
+      AND envelope_digest NOT GLOB '*[^0-9a-f]*'
     ),
   payload_digest TEXT NOT NULL
     CHECK (
@@ -143,6 +156,7 @@ CREATE TABLE fenced_deliveries (
   ),
   CHECK (state <> 'source_acked' OR source_acked_at IS NOT NULL),
   UNIQUE (tenant, message_id),
+  UNIQUE (tenant, source_agent_id, request_id),
   UNIQUE (tenant, source_agent_id, effect_key),
   UNIQUE (tenant, ingress_receipt_id)
 );
@@ -238,6 +252,7 @@ CREATE TABLE fenced_delivery_evidence (
   effect_key TEXT NOT NULL CHECK (length(trim(effect_key)) BETWEEN 1 AND 255),
   payload_digest TEXT NOT NULL,
   ciphertext_digest TEXT NOT NULL,
+  envelope_digest TEXT NOT NULL,
   runtime_input_digest TEXT NOT NULL,
   provider_effect_id TEXT,
   occurred_at TEXT NOT NULL CHECK (length(trim(occurred_at)) > 0),
@@ -259,6 +274,11 @@ CREATE TABLE fenced_delivery_evidence (
     length(ciphertext_digest) = 64
     AND ciphertext_digest = lower(ciphertext_digest)
     AND ciphertext_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  CHECK (
+    length(envelope_digest) = 64
+    AND envelope_digest = lower(envelope_digest)
+    AND envelope_digest NOT GLOB '*[^0-9a-f]*'
   ),
   CHECK (
     length(runtime_input_digest) = 64
@@ -368,6 +388,7 @@ OR NOT EXISTS (
      AND ingress.generation = NEW.generation
      AND ingress.envelope_ref = NEW.envelope_ref
      AND ingress.ciphertext_digest = NEW.ciphertext_digest
+     AND ingress.envelope_digest = NEW.envelope_digest
      AND ingress.payload_digest = NEW.payload_digest
      AND ingress.runtime_input_digest = NEW.runtime_input_digest
      AND seat.state = 'active'
@@ -380,8 +401,9 @@ END;
 CREATE TRIGGER fenced_deliveries_identity_immutable
 BEFORE UPDATE OF id, tenant, message_id, source_agent_id, source_member_id,
   objective_id, flight_id, task_id, assignment_epoch, runtime_seat_id,
-  generation, ingress_receipt_id, effect_key, envelope_ref,
-  ciphertext_digest, payload_digest, runtime_input_digest, accepted_at
+  generation, ingress_receipt_id, request_id, effect_key, envelope_ref,
+  ciphertext_digest, envelope_digest, payload_digest, runtime_input_digest,
+  accepted_at
 ON fenced_deliveries
 BEGIN
   SELECT RAISE(ABORT, 'fenced delivery identity and digests are immutable');
@@ -403,6 +425,25 @@ WHEN NOT (
 )
 BEGIN
   SELECT RAISE(ABORT, 'fenced delivery state transition is invalid');
+END;
+
+CREATE TRIGGER fenced_deliveries_attempt_three_final_wait
+BEFORE UPDATE OF state ON fenced_deliveries
+WHEN NEW.state = 'blocked'
+  AND OLD.active_attempt_number = 3
+  AND EXISTS (
+    SELECT 1
+      FROM fenced_delivery_attempts attempt
+     WHERE attempt.id = OLD.active_attempt_id
+       AND attempt.tenant = OLD.tenant
+       AND attempt.delivery_id = OLD.id
+       AND attempt.attempt_number = 3
+       AND attempt.state = 'blocked'
+       AND attempt.ended_at IS NOT NULL
+       AND julianday(NEW.updated_at) < julianday(attempt.ended_at, '+45 seconds')
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'fenced delivery final retry wait not elapsed');
 END;
 
 CREATE TRIGGER fenced_deliveries_source_ack_requires_chain
@@ -445,6 +486,7 @@ AND (
           AND evidence.effect_key = OLD.effect_key
           AND evidence.payload_digest = OLD.payload_digest
           AND evidence.ciphertext_digest = OLD.ciphertext_digest
+          AND evidence.envelope_digest = OLD.envelope_digest
           AND evidence.runtime_input_digest = OLD.runtime_input_digest
           AND (
             evidence.evidence_type = required.type
@@ -458,6 +500,18 @@ AND (
 )
 BEGIN
   SELECT RAISE(ABORT, 'fenced delivery source ack requires complete evidence');
+END;
+
+CREATE TRIGGER fenced_deliveries_source_ack_timestamp_once
+BEFORE UPDATE OF source_acked_at ON fenced_deliveries
+WHEN NOT (
+  OLD.state = 'runtime_acked'
+  AND NEW.state = 'source_acked'
+  AND OLD.source_acked_at IS NULL
+  AND NEW.source_acked_at IS NOT NULL
+)
+BEGIN
+  SELECT RAISE(ABORT, 'fenced delivery source ack timestamp is immutable');
 END;
 
 CREATE TRIGGER fenced_deliveries_no_delete
@@ -480,17 +534,55 @@ AND NOT EXISTS (
      AND delivery.message_id = NEW.id
      AND NEW.target_seat = seat.id
      AND NEW.to_agent = seat.agent_id
-     AND json_valid(NEW.body)
-     AND json_extract(NEW.body, '$.schema') = 'mupot-proof-ref:v1'
-     AND json_extract(NEW.body, '$.delivery_id') = delivery.id
-     AND json_extract(NEW.body, '$.envelope_ref') = delivery.envelope_ref
-     AND json_extract(NEW.body, '$.ciphertext_digest') = delivery.ciphertext_digest
-     AND json_extract(NEW.body, '$.payload_digest') = delivery.payload_digest
-     AND json_extract(NEW.body, '$.runtime_input_digest') = delivery.runtime_input_digest
-     AND length(NEW.body) <= 1000
 )
 BEGIN
   SELECT RAISE(ABORT, 'proof delivery requires exact runtime seat');
+END;
+
+CREATE TRIGGER agent_messages_proof_metadata_insert
+BEFORE INSERT ON agent_messages
+WHEN NEW.fenced_delivery_id IS NOT NULL
+AND NOT EXISTS (
+  SELECT 1
+    FROM fenced_deliveries delivery
+    JOIN host_envelope_ingress_receipts ingress
+      ON ingress.id = delivery.ingress_receipt_id
+     AND ingress.tenant = delivery.tenant
+   WHERE delivery.id = NEW.fenced_delivery_id
+     AND delivery.tenant = NEW.tenant
+     AND json_valid(NEW.body)
+     AND json_type(NEW.body) = 'object'
+     AND (SELECT COUNT(*) FROM json_each(NEW.body)) = 8
+     AND NOT EXISTS (
+       SELECT 1 FROM json_each(NEW.body)
+        WHERE key NOT IN (
+          'schema','ref','payload_digest','envelope_digest',
+          'ciphertext_digest','runtime_input_digest','size',
+          'recipient_generation'
+        )
+     )
+     AND json_type(NEW.body, '$.schema') = 'text'
+     AND json_extract(NEW.body, '$.schema') = 'mupot-proof-ref:v1'
+     AND json_type(NEW.body, '$.ref') = 'text'
+     AND json_extract(NEW.body, '$.ref') = delivery.envelope_ref
+     AND json_type(NEW.body, '$.payload_digest') = 'text'
+     AND json_extract(NEW.body, '$.payload_digest') = delivery.payload_digest
+     AND json_type(NEW.body, '$.envelope_digest') = 'text'
+     AND json_extract(NEW.body, '$.envelope_digest') = delivery.envelope_digest
+     AND json_type(NEW.body, '$.ciphertext_digest') = 'text'
+     AND json_extract(NEW.body, '$.ciphertext_digest') =
+       delivery.ciphertext_digest
+     AND json_type(NEW.body, '$.runtime_input_digest') = 'text'
+     AND json_extract(NEW.body, '$.runtime_input_digest') =
+       delivery.runtime_input_digest
+     AND json_type(NEW.body, '$.size') = 'integer'
+     AND json_extract(NEW.body, '$.size') = ingress.byte_length
+     AND json_type(NEW.body, '$.recipient_generation') = 'integer'
+     AND json_extract(NEW.body, '$.recipient_generation') = delivery.generation
+     AND length(NEW.body) <= 1000
+)
+BEGIN
+  SELECT RAISE(ABORT, 'proof message metadata mismatch');
 END;
 
 CREATE TRIGGER agent_messages_proof_identity_immutable
@@ -500,6 +592,25 @@ ON agent_messages
 WHEN OLD.fenced_delivery_id IS NOT NULL OR NEW.fenced_delivery_id IS NOT NULL
 BEGIN
   SELECT RAISE(ABORT, 'proof message identity is immutable');
+END;
+
+CREATE TRIGGER agent_messages_proof_source_insert
+BEFORE INSERT ON agent_messages
+WHEN NEW.fenced_delivery_id IS NOT NULL
+AND NOT EXISTS (
+  SELECT 1
+    FROM fenced_deliveries delivery
+   WHERE delivery.id = NEW.fenced_delivery_id
+     AND delivery.tenant = NEW.tenant
+     AND delivery.message_id = NEW.id
+     AND delivery.source_agent_id = NEW.from_agent
+     AND delivery.source_member_id = NEW.from_member
+     AND delivery.request_id = NEW.request_id
+     AND NEW.kind = 'request'
+     AND NEW.in_reply_to IS NULL
+)
+BEGIN
+  SELECT RAISE(ABORT, 'proof delivery source facts mismatch');
 END;
 
 CREATE TRIGGER agent_messages_proof_read_at_terminal
@@ -516,6 +627,13 @@ AND NOT EXISTS (
 )
 BEGIN
   SELECT RAISE(ABORT, 'proof delivery requires exact source ack');
+END;
+
+CREATE TRIGGER agent_messages_proof_no_delete
+BEFORE DELETE ON agent_messages
+WHEN OLD.fenced_delivery_id IS NOT NULL
+BEGIN
+  SELECT RAISE(ABORT, 'proof message is immutable');
 END;
 
 CREATE TRIGGER fenced_delivery_attempts_validate
@@ -549,6 +667,7 @@ OR (
        AND reservation.next_attempt_number = NEW.attempt_number
        AND reservation.prior_fencing_epoch = NEW.prior_fencing_epoch
        AND reservation.state = 'consumed'
+       AND reservation.retry_not_before = NEW.retry_not_before
   )
 )
 BEGIN
@@ -600,11 +719,15 @@ OR NOT EXISTS (
      AND (
        (
          NEW.next_attempt_number = 2
-         AND julianday(NEW.reserved_at) >= julianday(attempt.ended_at, '+5 seconds')
+         AND julianday(NEW.retry_not_before) =
+           julianday(attempt.ended_at, '+5 seconds')
+         AND julianday(NEW.reserved_at) >= julianday(NEW.retry_not_before)
        )
        OR (
          NEW.next_attempt_number = 3
-         AND julianday(NEW.reserved_at) >= julianday(attempt.ended_at, '+15 seconds')
+         AND julianday(NEW.retry_not_before) =
+           julianday(attempt.ended_at, '+15 seconds')
+         AND julianday(NEW.reserved_at) >= julianday(NEW.retry_not_before)
        )
      )
 )
@@ -658,6 +781,7 @@ WHEN NOT EXISTS (
      AND delivery.effect_key = NEW.effect_key
      AND delivery.payload_digest = NEW.payload_digest
      AND delivery.ciphertext_digest = NEW.ciphertext_digest
+     AND delivery.envelope_digest = NEW.envelope_digest
      AND delivery.runtime_input_digest = NEW.runtime_input_digest
      AND attempt.attempt_number = NEW.attempt_number
      AND attempt.generation = NEW.generation
@@ -676,14 +800,46 @@ OR NOT EXISTS (
 OR NOT EXISTS (
   SELECT 1
     FROM execution_receipts receipt
+    JOIN fenced_deliveries delivery
+      ON delivery.id = NEW.delivery_id
+     AND delivery.tenant = receipt.tenant
    WHERE receipt.id = NEW.execution_receipt_id
      AND receipt.tenant = NEW.tenant
      AND receipt.type = NEW.evidence_type
+     AND receipt.objective_id = delivery.objective_id
+     AND receipt.flight_id = delivery.flight_id
+     AND receipt.task_id = delivery.task_id
      AND receipt.seat_id = NEW.runtime_seat_id
      AND receipt.seat_generation = NEW.generation
      AND receipt.message_id = NEW.message_id
      AND receipt.assignment_epoch = NEW.assignment_epoch
      AND receipt.fencing_epoch = NEW.fencing_epoch
+     AND (
+       (
+         NEW.authority_kind = 'broker'
+         AND NEW.evidence_type = 'host.persisted'
+         AND receipt.issuer_kind = 'mupot'
+         AND receipt.issuer_id = 'mupot:' || NEW.tenant
+       )
+       OR (
+         NEW.authority_kind = 'adapter'
+         AND NEW.evidence_type IN ('effect.intent','runtime.injected')
+         AND receipt.issuer_kind = 'adapter'
+         AND receipt.issuer_id = NEW.authority_id
+       )
+       OR (
+         NEW.authority_kind = 'provider_verifier'
+         AND NEW.evidence_type IN ('provider.observed','provider.reconciled')
+         AND receipt.issuer_kind = 'provider_verifier'
+         AND receipt.issuer_id = NEW.authority_id
+       )
+       OR (
+         NEW.authority_kind = 'runtime'
+         AND NEW.evidence_type IN ('runtime.consumed','runtime.ack')
+         AND receipt.issuer_kind = 'runtime'
+         AND receipt.issuer_id = NEW.authority_id
+       )
+     )
 )
 OR NOT (
   (

@@ -462,18 +462,21 @@ WHEN NOT EXISTS (
     JOIN runtime_delivery_authorities ingress
       ON ingress.id = NEW.ingress_authority_registration_id
      AND ingress.tenant = broker.tenant
+     AND ingress.broker_id = broker.id
      AND ingress.runtime_seat_id = seat.id
      AND ingress.generation = NEW.generation
      AND ingress.authority_kind = 'ingress'
     JOIN runtime_delivery_authorities adapter
       ON adapter.id = NEW.adapter_authority_registration_id
      AND adapter.tenant = broker.tenant
+     AND adapter.broker_id = broker.id
      AND adapter.runtime_seat_id = seat.id
      AND adapter.generation = NEW.generation
      AND adapter.authority_kind = 'adapter'
     JOIN runtime_delivery_authorities provider
       ON provider.id = NEW.provider_verifier_authority_registration_id
      AND provider.tenant = broker.tenant
+     AND provider.broker_id = broker.id
      AND provider.runtime_seat_id = seat.id
      AND provider.generation = NEW.generation
      AND provider.authority_kind = 'provider_verifier'

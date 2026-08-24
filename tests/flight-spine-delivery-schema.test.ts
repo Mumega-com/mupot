@@ -6,7 +6,10 @@ import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 const TENANT = 'tenant-flight-3'
 const T0 = '2026-08-24T12:00:00.000Z'
 const T5 = '2026-08-24T12:00:05.000Z'
+const T20 = '2026-08-24T12:00:20.000Z'
+const T35 = '2026-08-24T12:00:35.000Z'
 const T60 = '2026-08-24T12:01:00.000Z'
+const T80 = '2026-08-24T12:01:20.000Z'
 const T300 = '2026-08-24T12:05:00.000Z'
 const SHA_A = 'a'.repeat(64)
 const SHA_B = 'b'.repeat(64)
@@ -18,6 +21,7 @@ const FP_C = 'v1:' + 'c'.repeat(64)
 const FP_D = 'v1:' + 'd'.repeat(64)
 const FP_E = 'v1:' + 'e'.repeat(64)
 const FP_F = 'v1:' + 'f'.repeat(64)
+const FP_G = 'v1:' + '0'.repeat(64)
 
 let harness: SqliteD1Harness
 
@@ -57,11 +61,21 @@ function insertChallenge(
   ).run(id, TENANT, domain, kind, authorityId, resourceId, nonce.padEnd(16,'x'), SHA_A, T0, T60, T0)
 }
 
-function seedBrokerAndSigners(): void {
+function seedBrokerAndSigners(authorityBrokerId = 'broker-1'): void {
   insertChallenge('challenge-broker','mupot-runtime-broker-register:v1','broker',null,'host-1','nonce-broker')
   harness.sqlite.prepare(
     "INSERT INTO runtime_brokers (id,tenant,agent_id,member_id,credential_id,host_id,public_key,key_fingerprint,state,registration_digest,challenge_id,registered_at,expires_at,revoked_at,created_at) VALUES ('broker-1',?,'agent-broker','member-broker','token-broker','host-1','broker-public',?,'active',?,'challenge-broker',?,?,NULL,?)",
   ).run(TENANT, FP_A, SHA_A, T0, T300, T0)
+
+  if (authorityBrokerId === 'broker-2') {
+    insertChallenge(
+      'challenge-broker-2','mupot-runtime-broker-register:v1',
+      'broker',null,'host-2','nonce-broker-2',
+    )
+    harness.sqlite.prepare(
+      "INSERT INTO runtime_brokers (id,tenant,agent_id,member_id,credential_id,host_id,public_key,key_fingerprint,state,registration_digest,challenge_id,registered_at,expires_at,revoked_at,created_at) VALUES ('broker-2',?,'agent-broker','member-broker','token-broker','host-2','broker-public-2',?,'active',?,'challenge-broker-2',?,?,NULL,?)",
+    ).run(TENANT,FP_G,'0'.repeat(64),T0,T300,T0)
+  }
 
   const authorities = [
     ['ingress','authority-ingress',FP_B,SHA_B],
@@ -72,8 +86,11 @@ function seedBrokerAndSigners(): void {
     const challenge = 'challenge-' + kind
     insertChallenge(challenge,'mupot-delivery-authority-register:v1',kind,id,'seat-runtime:1','nonce-' + kind)
     harness.sqlite.prepare(
-      "INSERT INTO runtime_delivery_authorities (id,tenant,broker_id,runtime_seat_id,generation,authority_kind,public_key,key_fingerprint,proof_of_possession_digest,challenge_id,registration_digest,state,issued_at,expires_at,revoked_at,created_at) VALUES (?,?,'broker-1','seat-runtime',1,?,?,?,?,?,?,'active',?,?,NULL,?)",
-    ).run(id,TENANT,kind,kind + '-public',fingerprint,digest,challenge,digest,T0,T300,T0)
+      "INSERT INTO runtime_delivery_authorities (id,tenant,broker_id,runtime_seat_id,generation,authority_kind,public_key,key_fingerprint,proof_of_possession_digest,challenge_id,registration_digest,state,issued_at,expires_at,revoked_at,created_at) VALUES (?,?,?,'seat-runtime',1,?,?,?,?,?,?,'active',?,?,NULL,?)",
+    ).run(
+      id,TENANT,authorityBrokerId,kind,kind + '-public',fingerprint,digest,
+      challenge,digest,T0,T300,T0,
+    )
   }
 
   insertChallenge('challenge-runtime','mupot-runtime-signer-register:v1','runtime','runtime-signer-1','seat-runtime:1','nonce-runtime')
@@ -87,31 +104,73 @@ function seedIngress(): void {
     "INSERT INTO encrypted_envelope_ingress_authorizations (id,tenant,source_agent_id,runtime_seat_id,generation,recipient_encryption_key_id,payload_digest,runtime_input_digest,maximum_bytes,upload_nonce,idempotency_key,issued_at,expires_at,consumed_at,created_at) VALUES ('ingress-auth-1',?,'agent-source','seat-runtime',1,'runtime-signer-1',?,?,65536,'upload-nonce-0001','ingress-key-1',?,?,NULL,?)",
   ).run(TENANT,SHA_A,SHA_B,T0,T60,T0)
   harness.sqlite.prepare(
-    "INSERT INTO host_envelope_ingress_receipts (id,tenant,authorization_id,runtime_seat_id,generation,recipient_encryption_key_id,envelope_ref,ciphertext_digest,payload_digest,runtime_input_digest,byte_length,stored_at,expires_at,host_authority_id,canonical_payload_digest,signature,created_at) VALUES ('ingress-receipt-1',?,'ingress-auth-1','seat-runtime',1,'runtime-signer-1',?,?,?,?,128,?,?,'authority-ingress',?,'ingress-signature',?)",
-  ).run(TENANT,'local-envelope:sha256:' + SHA_C,SHA_C,SHA_A,SHA_B,T0,T300,SHA_D,T0)
+    "INSERT INTO host_envelope_ingress_receipts (id,tenant,authorization_id,runtime_seat_id,generation,recipient_encryption_key_id,envelope_ref,ciphertext_digest,envelope_digest,payload_digest,runtime_input_digest,byte_length,stored_at,expires_at,host_authority_id,canonical_payload_digest,signature,created_at) VALUES ('ingress-receipt-1',?,'ingress-auth-1','seat-runtime',1,'runtime-signer-1',?,?,?,?,?,128,?,?,'authority-ingress',?,'ingress-signature',?)",
+  ).run(
+    TENANT,'local-envelope:sha256:' + SHA_C,SHA_C,SHA_D,SHA_A,SHA_B,
+    T0,T300,SHA_D,T0,
+  )
 }
 
 function insertDelivery(id: string, messageId: string, seat = 'seat-runtime'): void {
   harness.sqlite.prepare(
-    "INSERT INTO fenced_deliveries (id,tenant,message_id,source_agent_id,source_member_id,objective_id,flight_id,task_id,assignment_epoch,runtime_seat_id,generation,ingress_receipt_id,effect_key,envelope_ref,ciphertext_digest,payload_digest,runtime_input_digest,state,active_attempt_id,active_attempt_number,current_fencing_epoch,accepted_at,updated_at,source_acked_at) VALUES (?, ?, ?, 'agent-source','member-source','objective-f3','flight-f3','task-f3',1,?,1,'ingress-receipt-1',?, ?, ?, ?, ?,'accepted',NULL,0,0,?,?,NULL)",
-  ).run(id,TENANT,messageId,seat,'effect-' + id,'local-envelope:sha256:' + SHA_C,SHA_C,SHA_A,SHA_B,T0,T0)
+    "INSERT INTO fenced_deliveries (id,tenant,message_id,source_agent_id,source_member_id,objective_id,flight_id,task_id,assignment_epoch,runtime_seat_id,generation,ingress_receipt_id,request_id,effect_key,envelope_ref,ciphertext_digest,envelope_digest,payload_digest,runtime_input_digest,state,active_attempt_id,active_attempt_number,current_fencing_epoch,accepted_at,updated_at,source_acked_at) VALUES (?, ?, ?, 'agent-source','member-source','objective-f3','flight-f3','task-f3',1,?,1,'ingress-receipt-1',?,?, ?, ?, ?, ?, ?,'accepted',NULL,0,0,?,?,NULL)",
+  ).run(
+    id,TENANT,messageId,seat,'request-' + messageId,'effect-' + id,
+    'local-envelope:sha256:' + SHA_C,SHA_C,SHA_D,SHA_A,SHA_B,T0,T0,
+  )
 }
 
 function proofBody(deliveryId: string): string {
+  void deliveryId
   return JSON.stringify({
     schema: 'mupot-proof-ref:v1',
-    delivery_id: deliveryId,
-    envelope_ref: 'local-envelope:sha256:' + SHA_C,
-    ciphertext_digest: SHA_C,
+    ref: 'local-envelope:sha256:' + SHA_C,
     payload_digest: SHA_A,
+    envelope_digest: SHA_D,
+    ciphertext_digest: SHA_C,
     runtime_input_digest: SHA_B,
+    size: 128,
+    recipient_generation: 1,
   })
 }
 
-function insertProofMessage(deliveryId: string, messageId: string, targetSeat: string | null): void {
+function strictProofBody(extra: Record<string, unknown> = {}): string {
+  return JSON.stringify({
+    ...JSON.parse(proofBody('strict')),
+    ...extra,
+  })
+}
+
+interface ProofMessageOverrides {
+  toAgent?: string
+  fromAgent?: string
+  fromMember?: string
+  kind?: string
+  requestId?: string
+  body?: string
+}
+
+function insertProofMessage(
+  deliveryId: string,
+  messageId: string,
+  targetSeat: string | null,
+  overrides: ProofMessageOverrides = {},
+): void {
   harness.sqlite.prepare(
-    "INSERT INTO agent_messages (id,tenant,to_agent,from_agent,from_member,kind,body,request_id,created_at,target_seat,fenced_delivery_id) VALUES (?,?,'agent-runtime','agent-source','member-source','request',?,?,?, ?,?)",
-  ).run(messageId,TENANT,proofBody(deliveryId),'request-' + messageId,T0,targetSeat,deliveryId)
+    'INSERT INTO agent_messages (id,tenant,to_agent,from_agent,from_member,kind,body,request_id,created_at,target_seat,fenced_delivery_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+  ).run(
+    messageId,
+    TENANT,
+    overrides.toAgent ?? 'agent-runtime',
+    overrides.fromAgent ?? 'agent-source',
+    overrides.fromMember ?? 'member-source',
+    overrides.kind ?? 'request',
+    overrides.body ?? proofBody(deliveryId),
+    overrides.requestId ?? 'request-' + messageId,
+    T0,
+    targetSeat,
+    deliveryId,
+  )
 }
 
 function insertLease(id: string, fencingEpoch: number): void {
@@ -129,19 +188,40 @@ function insertAttempt(
   fence: number,
   state = 'leased',
   endedAt: string | null = null,
+  retryNotBefore = number === 1 ? T0 : number === 2 ? T5 : T35,
 ): void {
   harness.sqlite.prepare(
     "INSERT INTO fenced_delivery_attempts (id,tenant,delivery_id,attempt_number,attempt_nonce,generation,prior_fencing_epoch,fencing_epoch,runtime_seat_lease_id,state,leased_at,expires_at,retry_not_before,ended_at,created_at) VALUES (?,?,?,?,?,1,?,?,?,?,?,?,?,?,?)",
   ).run(
     id,TENANT,deliveryId,number,'nonce-' + id,priorFence,fence,leaseId,state,
-    T0,T60,number === 1 ? T0 : T5,endedAt,T0,
+    T0,T60,retryNotBefore,endedAt,T0,
   )
 }
 
-function insertReceipt(id: string, type: string, issuerKind: string, issuerId: string): void {
+interface ReceiptOverrides {
+  objectiveId?: string
+  flightId?: string
+  taskId?: string
+  messageId?: string
+}
+
+function insertReceipt(
+  id: string,
+  type: string,
+  issuerKind: string,
+  issuerId: string,
+  overrides: ReceiptOverrides = {},
+): void {
   harness.sqlite.prepare(
-    "INSERT INTO execution_receipts (id,tenant,type,issuer_kind,issuer_id,actor_kind,actor_id,seat_id,seat_generation,objective_id,flight_id,task_id,message_id,assignment_epoch,fencing_epoch,lease_token_hash,idempotency_key,claims_json,canonical_payload,payload_digest,predecessor_receipt_id,predecessor_hash,receipt_hash,server_timestamp) VALUES (?,?,?, ?,?,'agent','agent-runtime','seat-runtime',1,'objective-f3','flight-f3','task-f3','message-chain',1,1,NULL,?,'{}','{}',?,NULL,NULL,?,?)",
-  ).run(id,TENANT,type,issuerKind,issuerId,'key-' + id,SHA_A,SHA_B,T0)
+    "INSERT INTO execution_receipts (id,tenant,type,issuer_kind,issuer_id,actor_kind,actor_id,seat_id,seat_generation,objective_id,flight_id,task_id,message_id,assignment_epoch,fencing_epoch,lease_token_hash,idempotency_key,claims_json,canonical_payload,payload_digest,predecessor_receipt_id,predecessor_hash,receipt_hash,server_timestamp) VALUES (?,?,?, ?,?,'agent','agent-runtime','seat-runtime',1,?,?,?,?,1,1,NULL,?,'{}','{}',?,NULL,NULL,?,?)",
+  ).run(
+    id,TENANT,type,issuerKind,issuerId,
+    overrides.objectiveId ?? 'objective-f3',
+    overrides.flightId ?? 'flight-f3',
+    overrides.taskId ?? 'task-f3',
+    overrides.messageId ?? 'message-chain',
+    'key-' + id,SHA_A,SHA_B,T0,
+  )
 }
 
 function insertEvidence(
@@ -152,6 +232,8 @@ function insertEvidence(
   authorityKind: string,
   authorityId: string,
   issuerKind: string,
+  receiptIssuerId = authorityId,
+  receiptOverrides: ReceiptOverrides = {},
 ): void {
   const challenge = 'challenge-' + id
   insertChallenge(
@@ -163,12 +245,12 @@ function insertEvidence(
     'nonce-' + id,
   )
   const receiptId = 'receipt-' + id
-  insertReceipt(receiptId,evidenceType,issuerKind,authorityId)
+  insertReceipt(receiptId,evidenceType,issuerKind,receiptIssuerId,receiptOverrides)
   harness.sqlite.prepare(
-    "INSERT INTO fenced_delivery_evidence (id,tenant,delivery_id,attempt_id,attempt_number,authority_kind,authority_id,evidence_type,message_id,runtime_seat_id,generation,assignment_epoch,fencing_epoch,effect_key,payload_digest,ciphertext_digest,runtime_input_digest,provider_effect_id,occurred_at,issued_at,expires_at,nonce,challenge_id,canonical_payload_digest,signature,execution_receipt_id,created_at) VALUES (?,?,?, ?,1,?,?,?,'message-chain','seat-runtime',1,1,1,?,?,?,?,NULL,?,?,?,?,?,?,'signature',?,?)",
+    "INSERT INTO fenced_delivery_evidence (id,tenant,delivery_id,attempt_id,attempt_number,authority_kind,authority_id,evidence_type,message_id,runtime_seat_id,generation,assignment_epoch,fencing_epoch,effect_key,payload_digest,ciphertext_digest,envelope_digest,runtime_input_digest,provider_effect_id,occurred_at,issued_at,expires_at,nonce,challenge_id,canonical_payload_digest,signature,execution_receipt_id,created_at) VALUES (?,?,?, ?,1,?,?,?,'message-chain','seat-runtime',1,1,1,?,?,?,?,?,NULL,?,?,?,?,?,?,'signature',?,?)",
   ).run(
     id,TENANT,deliveryId,attemptId,authorityKind,authorityId,evidenceType,
-    'effect-' + deliveryId,SHA_A,SHA_C,SHA_B,T0,T0,T60,'nonce-evidence-' + id,
+    'effect-' + deliveryId,SHA_A,SHA_C,SHA_D,SHA_B,T0,T0,T60,'nonce-evidence-' + id,
     challenge,SHA_D,receiptId,T0,
   )
 }
@@ -194,6 +276,63 @@ function insertBrokerAttestation(
   )
 }
 
+function seedLeasedEvidenceDelivery(): void {
+  seedBrokerAndSigners()
+  seedIngress()
+  insertDelivery('delivery-evidence','message-chain')
+  insertProofMessage('delivery-evidence','message-chain','seat-runtime')
+  insertLease('lease-evidence',1)
+  insertAttempt('attempt-evidence','delivery-evidence',1,'lease-evidence',0,1)
+  harness.sqlite.exec(
+    "UPDATE fenced_deliveries SET state='leased',active_attempt_id='attempt-evidence',active_attempt_number=1,current_fencing_epoch=1 WHERE id='delivery-evidence'",
+  )
+}
+
+function insertRecoveryReservation(
+  id: string,
+  deliveryId: string,
+  priorAttemptId: string,
+  priorAttemptNumber: number,
+  priorFence: number,
+  nextAttemptNumber: number,
+  reservedAt: string,
+): void {
+  harness.sqlite.prepare(
+    "INSERT INTO fenced_delivery_recovery_reservations (id,tenant,delivery_id,prior_attempt_id,prior_attempt_number,prior_fencing_epoch,next_attempt_number,broker_id,consumer_id,idempotency_key,reservation_nonce,state,reserved_at,retry_not_before,expires_at,consumed_at,created_at) VALUES (?,?,?,?,?,?,?,'broker-1',?,?,?,'reserved',?,?,?,NULL,?)",
+  ).run(
+    id,TENANT,deliveryId,priorAttemptId,priorAttemptNumber,priorFence,
+    nextAttemptNumber,'consumer-' + id,'key-' + id,'nonce-' + id,
+    reservedAt,reservedAt,T300,reservedAt,
+  )
+}
+
+function reserveAndConsumeRecovery(
+  reservationId: string,
+  deliveryId: string,
+  priorAttemptId: string,
+  priorAttemptNumber: number,
+  priorFence: number,
+  nextAttemptNumber: number,
+  reservedAt: string,
+): void {
+  insertRecoveryReservation(
+    reservationId,deliveryId,priorAttemptId,priorAttemptNumber,priorFence,
+    nextAttemptNumber,reservedAt,
+  )
+  harness.sqlite.prepare(
+    'UPDATE fenced_delivery_attempts SET state=?,ended_at=? WHERE id=?',
+  ).run('recovery_reserved',reservedAt,priorAttemptId)
+  harness.sqlite.prepare(
+    'UPDATE fenced_deliveries SET state=?,updated_at=? WHERE id=?',
+  ).run('recovery_reserved',reservedAt,deliveryId)
+  harness.sqlite.prepare(
+    'UPDATE fenced_delivery_recovery_reservations SET state=?,consumed_at=? WHERE id=?',
+  ).run('consumed',reservedAt,reservationId)
+  harness.sqlite.prepare(
+    'UPDATE fenced_delivery_attempts SET state=?,ended_at=? WHERE id=?',
+  ).run('stale',reservedAt,priorAttemptId)
+}
+
 beforeEach(() => {
   resetMigrationCache()
   harness = createSqliteD1()
@@ -211,7 +350,8 @@ describe('Flight 3 real migration schema', () => {
     expect(tables).toHaveLength(12)
     expect(columns('agent_messages')).toContain('fenced_delivery_id')
     expect(columns('fenced_deliveries')).toEqual(expect.arrayContaining([
-      'payload_digest','ciphertext_digest','runtime_input_digest','ingress_receipt_id',
+      'payload_digest','ciphertext_digest','envelope_digest',
+      'runtime_input_digest','ingress_receipt_id',
     ]))
   })
 
@@ -233,6 +373,81 @@ describe('Flight 3 real migration schema', () => {
     expect(() => harness.sqlite.exec(
       "UPDATE agent_messages SET read_at='" + T60 + "' WHERE id='message-read'",
     )).toThrow(/exact source ack/)
+  })
+
+  it('rejects source_acked_at before the runtime_acked to source_acked transition', () => {
+    seedBrokerAndSigners()
+    seedIngress()
+    insertDelivery('delivery-early-ack','message-early-ack')
+    expect(() => harness.sqlite.exec(
+      "UPDATE fenced_deliveries SET source_acked_at='" + T60 + "' WHERE id='delivery-early-ack'",
+    )).toThrow(/source ack timestamp/)
+  })
+
+  it('refuses deletion of a proof message so the source record cannot be orphaned', () => {
+    seedBrokerAndSigners()
+    seedIngress()
+    insertDelivery('delivery-delete','message-delete')
+    insertProofMessage('delivery-delete','message-delete','seat-runtime')
+    expect(() => harness.sqlite.exec(
+      "DELETE FROM agent_messages WHERE id='message-delete'",
+    )).toThrow(/proof message/)
+  })
+
+  it.each([
+    ['source agent', { fromAgent: 'agent-broker' }],
+    ['source member', { fromMember: 'member-broker' }],
+    ['request kind', { kind: 'message' }],
+    ['request identity', { requestId: 'wrong-request-id' }],
+  ])('binds proof message %s to immutable delivery source facts', (_label, overrides) => {
+    seedBrokerAndSigners()
+    seedIngress()
+    insertDelivery('delivery-source','message-source')
+    expect(() => insertProofMessage(
+      'delivery-source','message-source','seat-runtime',overrides,
+    )).toThrow(/proof delivery source/)
+  })
+
+  it('accepts only the exact bounded opaque proof metadata body', () => {
+    seedBrokerAndSigners()
+    seedIngress()
+    insertDelivery('delivery-body','message-body')
+    expect(() => insertProofMessage(
+      'delivery-body','message-body','seat-runtime',{ body: strictProofBody() },
+    )).not.toThrow()
+  })
+
+  it.each(['plaintext','prompt'])('rejects an extra %s field in proof metadata', (field) => {
+    seedBrokerAndSigners()
+    seedIngress()
+    insertDelivery('delivery-extra','message-extra')
+    const body = JSON.stringify({
+      ...JSON.parse(proofBody('delivery-extra')),
+      [field]: 'sensitive runtime input',
+    })
+    expect(() => insertProofMessage(
+      'delivery-extra','message-extra','seat-runtime',{ body },
+    )).toThrow(/proof message metadata/)
+  })
+
+  it('rejects a string size in proof metadata', () => {
+    seedBrokerAndSigners()
+    seedIngress()
+    insertDelivery('delivery-size-type','message-size-type')
+    expect(() => insertProofMessage(
+      'delivery-size-type','message-size-type','seat-runtime',
+      { body: strictProofBody({ size: '128' }) },
+    )).toThrow(/proof message metadata/)
+  })
+
+  it('rejects a non-integer recipient generation in proof metadata', () => {
+    seedBrokerAndSigners()
+    seedIngress()
+    insertDelivery('delivery-generation-type','message-generation-type')
+    expect(() => insertProofMessage(
+      'delivery-generation-type','message-generation-type','seat-runtime',
+      { body: strictProofBody({ recipient_generation: 1.5 }) },
+    )).toThrow(/proof message metadata/)
   })
 
   it('makes challenges, signed nonces, authority keys, ingress receipts, and evidence append-only or unique', () => {
@@ -268,9 +483,10 @@ describe('Flight 3 real migration schema', () => {
       "INSERT INTO runtime_brokers (id,tenant,agent_id,member_id,credential_id,host_id,public_key,key_fingerprint,state,registration_digest,challenge_id,registered_at,expires_at,revoked_at,created_at) VALUES ('broker-key-reuse',?,'agent-broker','member-broker','token-broker','host-2','broker-reused',?,'active',?,'challenge-broker-key-reuse',?,?,NULL,?)",
     ).run(TENANT,FP_C,SHA_D,T0,T300,T0)).toThrow(/distinct/)
     expect(() => harness.sqlite.prepare(
-      "INSERT INTO host_envelope_ingress_receipts (id,tenant,authorization_id,runtime_seat_id,generation,recipient_encryption_key_id,envelope_ref,ciphertext_digest,payload_digest,runtime_input_digest,byte_length,stored_at,expires_at,host_authority_id,canonical_payload_digest,signature,created_at) VALUES ('ingress-receipt-changed',?,'ingress-auth-1','seat-runtime',1,'runtime-signer-1',?,?,?,?,128,?,?,'authority-ingress',?,'changed-signature',?)",
+      "INSERT INTO host_envelope_ingress_receipts (id,tenant,authorization_id,runtime_seat_id,generation,recipient_encryption_key_id,envelope_ref,ciphertext_digest,envelope_digest,payload_digest,runtime_input_digest,byte_length,stored_at,expires_at,host_authority_id,canonical_payload_digest,signature,created_at) VALUES ('ingress-receipt-changed',?,'ingress-auth-1','seat-runtime',1,'runtime-signer-1',?,?,?,?,?,128,?,?,'authority-ingress',?,'changed-signature',?)",
     ).run(
-      TENANT,'local-envelope:sha256:' + SHA_D,SHA_D,SHA_A,SHA_B,T0,T300,SHA_D,T0,
+      TENANT,'local-envelope:sha256:' + SHA_D,SHA_D,SHA_D,SHA_A,SHA_B,
+      T0,T300,SHA_D,T0,
     )).toThrow()
   })
 
@@ -295,6 +511,41 @@ describe('Flight 3 real migration schema', () => {
     expect(() => harness.sqlite.exec(
       "DELETE FROM runtime_broker_attestations WHERE id='attestation-valid'",
     )).toThrow(/immutable/)
+  })
+
+  it('rejects broker attestations that borrow authority registrations from another broker', () => {
+    seedBrokerAndSigners('broker-2')
+    expect(() => insertBrokerAttestation('attestation-cross-broker',SHA_C,SHA_A))
+      .toThrow(/registration mismatch/)
+  })
+
+  it.each([
+    ['broker','host.persisted','broker','broker-1','adapter','authority-adapter'],
+    ['adapter','effect.intent','adapter','authority-adapter','runtime','runtime-signer-1'],
+    ['provider','provider.observed','provider_verifier','authority-provider','adapter','authority-adapter'],
+    ['runtime','runtime.consumed','runtime','runtime-signer-1','adapter','authority-adapter'],
+  ])(
+    'rejects a substituted %s execution-receipt issuer',
+    (_label,type,authorityKind,authorityId,receiptIssuerKind,receiptIssuerId) => {
+      seedLeasedEvidenceDelivery()
+      expect(() => insertEvidence(
+        'evidence-wrong-issuer','delivery-evidence','attempt-evidence',
+        type,authorityKind,authorityId,receiptIssuerKind,receiptIssuerId,
+      )).toThrow(/evidence mismatch/)
+    },
+  )
+
+  it.each([
+    ['objective', { objectiveId: 'objective-other' }],
+    ['flight', { flightId: 'flight-other' }],
+    ['task', { taskId: 'task-other' }],
+  ])('rejects an execution receipt from another %s', (_label,receiptOverrides) => {
+    seedLeasedEvidenceDelivery()
+    expect(() => insertEvidence(
+      'evidence-cross-correlation','delivery-evidence','attempt-evidence',
+      'effect.intent','adapter','authority-adapter','adapter',
+      'authority-adapter',receiptOverrides,
+    )).toThrow(/evidence mismatch/)
   })
 
   it('enforces one active attempt, one recovery reservation, max three attempts, and retry backoff', () => {
@@ -334,6 +585,58 @@ describe('Flight 3 real migration schema', () => {
     )).toThrow()
   })
 
+  it('waits 45 seconds after attempt three ends before terminal blocked escalation', () => {
+    seedBrokerAndSigners()
+    seedIngress()
+    insertDelivery('delivery-final-wait','message-final-wait')
+    insertProofMessage('delivery-final-wait','message-final-wait','seat-runtime')
+
+    insertLease('lease-final-1',1)
+    insertAttempt('attempt-final-1','delivery-final-wait',1,'lease-final-1',0,1)
+    harness.sqlite.exec(
+      "UPDATE fenced_deliveries SET state='leased',active_attempt_id='attempt-final-1',active_attempt_number=1,current_fencing_epoch=1 WHERE id='delivery-final-wait'",
+    )
+    harness.sqlite.exec([
+      "UPDATE runtime_seat_leases SET state='expired' WHERE id='lease-final-1';",
+      "UPDATE fenced_delivery_attempts SET state='expired',ended_at='" + T0 + "' WHERE id='attempt-final-1';",
+      "UPDATE fenced_deliveries SET state='expired',updated_at='" + T0 + "' WHERE id='delivery-final-wait';",
+    ].join('\n'))
+    reserveAndConsumeRecovery(
+      'reservation-final-1','delivery-final-wait','attempt-final-1',1,1,2,T5,
+    )
+
+    insertLease('lease-final-2',2)
+    insertAttempt('attempt-final-2','delivery-final-wait',2,'lease-final-2',1,2)
+    harness.sqlite.exec(
+      "UPDATE fenced_deliveries SET state='leased',active_attempt_id='attempt-final-2',active_attempt_number=2,current_fencing_epoch=2,updated_at='" + T5 + "' WHERE id='delivery-final-wait'",
+    )
+    harness.sqlite.exec([
+      "UPDATE runtime_seat_leases SET state='expired' WHERE id='lease-final-2';",
+      "UPDATE fenced_delivery_attempts SET state='expired',ended_at='" + T20 + "' WHERE id='attempt-final-2';",
+      "UPDATE fenced_deliveries SET state='expired',updated_at='" + T20 + "' WHERE id='delivery-final-wait';",
+    ].join('\n'))
+    reserveAndConsumeRecovery(
+      'reservation-final-2','delivery-final-wait','attempt-final-2',2,2,3,T35,
+    )
+
+    insertLease('lease-final-3',3)
+    insertAttempt('attempt-final-3','delivery-final-wait',3,'lease-final-3',2,3)
+    harness.sqlite.exec(
+      "UPDATE fenced_deliveries SET state='leased',active_attempt_id='attempt-final-3',active_attempt_number=3,current_fencing_epoch=3,updated_at='" + T35 + "' WHERE id='delivery-final-wait'",
+    )
+    harness.sqlite.exec([
+      "UPDATE runtime_seat_leases SET state='expired' WHERE id='lease-final-3';",
+      "UPDATE fenced_delivery_attempts SET state='blocked',ended_at='" + T35 + "' WHERE id='attempt-final-3';",
+    ].join('\n'))
+
+    expect(() => harness.sqlite.exec(
+      "UPDATE fenced_deliveries SET state='blocked',updated_at='" + T35 + "' WHERE id='delivery-final-wait'",
+    )).toThrow(/final retry wait/)
+    expect(() => harness.sqlite.exec(
+      "UPDATE fenced_deliveries SET state='blocked',updated_at='" + T80 + "' WHERE id='delivery-final-wait'",
+    )).not.toThrow()
+  })
+
   it('keeps delivery digests immutable and rejects evidence for a stale attempt', () => {
     seedBrokerAndSigners()
     seedIngress()
@@ -369,15 +672,18 @@ describe('Flight 3 real migration schema', () => {
     )
 
     const chain = [
-      ['host.persisted','broker','broker-1','mupot','host_persisted'],
-      ['effect.intent','adapter','authority-adapter','adapter','effect_intent'],
-      ['provider.observed','provider_verifier','authority-provider','provider_verifier','provider_observed'],
-      ['runtime.injected','adapter','authority-adapter','adapter','runtime_injected'],
-      ['runtime.consumed','runtime','runtime-signer-1','runtime','runtime_consumed'],
-      ['runtime.ack','runtime','runtime-signer-1','runtime','runtime_acked'],
+      ['host.persisted','broker','broker-1','mupot','mupot:' + TENANT,'host_persisted'],
+      ['effect.intent','adapter','authority-adapter','adapter','authority-adapter','effect_intent'],
+      ['provider.observed','provider_verifier','authority-provider','provider_verifier','authority-provider','provider_observed'],
+      ['runtime.injected','adapter','authority-adapter','adapter','authority-adapter','runtime_injected'],
+      ['runtime.consumed','runtime','runtime-signer-1','runtime','runtime-signer-1','runtime_consumed'],
+      ['runtime.ack','runtime','runtime-signer-1','runtime','runtime-signer-1','runtime_acked'],
     ]
-    for (const [type,kind,authority,issuer,state] of chain) {
-      insertEvidence('evidence-' + state,'delivery-chain','attempt-chain',type,kind,authority,issuer)
+    for (const [type,kind,authority,issuer,receiptIssuerId,state] of chain) {
+      insertEvidence(
+        'evidence-' + state,'delivery-chain','attempt-chain',type,kind,
+        authority,issuer,receiptIssuerId,
+      )
       harness.sqlite.prepare(
         "UPDATE fenced_deliveries SET state=?,updated_at=? WHERE id='delivery-chain'",
       ).run(state,T0)
@@ -395,5 +701,11 @@ describe('Flight 3 real migration schema', () => {
     expect(() => harness.sqlite.exec(
       "DELETE FROM fenced_delivery_evidence WHERE id='evidence-runtime_acked'",
     )).toThrow(/immutable/)
+    expect(() => harness.sqlite.exec(
+      "UPDATE fenced_deliveries SET source_acked_at='" + T300 + "' WHERE id='delivery-chain'",
+    )).toThrow(/source ack timestamp/)
+    expect(() => harness.sqlite.exec(
+      "UPDATE agent_messages SET read_at='" + T300 + "' WHERE id='message-chain'",
+    )).toThrow(/exact source ack/)
   })
 })
