@@ -1,0 +1,56 @@
+{
+  "schema": "FLIGHT-03-PLAN-GATE-VERDICT",
+  "version": 1,
+  "verdict": "PASS",
+  "request_id": "08b059f4-cca0-471f-af09-88455a1fa6b6",
+  "gated_at": "2026-08-24T12:59:09Z",
+  "gate": {
+    "slug": "hadi-grok",
+    "uuid": "a065e61c-6a93-42fc-b070-b541631202f1",
+    "grant": "gate:hadi-grok",
+    "seat": "hadi-grok"
+  },
+  "bindings": {
+    "repository": "https://github.com/Mumega-com/mupot.git",
+    "branch": "codex/flight03-fenced-delivery",
+    "pr": 1201,
+    "plan_path": "docs/superpowers/plans/2026-08-24-flight-03-fenced-delivery.md",
+    "plan_commit_sha": "21ecbd5db66c7341446da16184109146d37ad1b8",
+    "plan_tree_sha": "35da3c8d02dfe9f9963f9322c710d44ad655dd1d",
+    "plan_blob_sha256": "55efad1679043d35a69c27976c5628229135a728e110a82182afa65845385eef",
+    "frozen_base_and_origin_main": "890a0209c0846c9ce7b4f4561ab13523ddf9a21c",
+    "live_health_commit": "890a0209c0846c9ce7b4f4561ab13523ddf9a21c",
+    "live_health_version": "0.30.0",
+    "repository_migration_head": "0126_decision_requests.sql"
+  },
+  "independently_verified_this_tick": {
+    "plan_commit_fetchable": true,
+    "plan_tree_matches": true,
+    "plan_commit_is_docs_only": true,
+    "parent_is_flight2_merge_and_origin_main": true,
+    "spec_present_on_frozen_base": true,
+    "task0_precedes_code": true,
+    "task0_honest_missing_receipt_caveats": true,
+    "task1_implementable_additive_0127_0128_above_0126": true,
+    "task1_does_not_require_flight3_delivery_receipts": true,
+    "reuses_0120_0122_0123_no_second_mailbox": true,
+    "proof_excluded_from_generic_inbox": true,
+    "authority_matrix_present": true,
+    "seven_crash_points_present": true,
+    "linux_privileged_launcher_then_unprivileged": true,
+    "d1_stores_digests_and_opaque_envelope_refs_not_plaintext": true,
+    "legacy_harness_ports_excluded": true,
+    "independent_gate_owns_separate_verdict_file": true,
+    "hadi_decisions_remain_separate": true
+  },
+  "residuals_not_this_block": [
+    "Task 0 'Produces' sentence says proof every named runtime can receive and ACK before implementation. Steps 4\u20136 and Global Constraints control: missing delivery/consumption/correlated-ACK are Flight 3 done-when, not Task 0/Task 1 blockers. Do not treat the Produces sentence as a receipt-precondition.",
+    "This seat previously BLOCKed Flight 2 live-proof MCP tool callability; that is not a Flight 3 plan defect. Plan entry gate already records delivery unproven and pending seat 0/0.",
+    "PR 1201 is draft. This PASS is plan-only, not merge/code/migration/deploy."
+  ],
+  "plan_edited_by_gate": false,
+  "circuit_task_flight_created_by_gate": false,
+  "code_migration_credential_runtime_deploy_by_gate": false,
+  "merge_authorized": false,
+  "autonomy_claim": false
+}
