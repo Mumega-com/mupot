@@ -56,6 +56,10 @@ interface TokenBindingAttestationRow {
   created_at: string
 }
 
+interface AuthorizedTokenBindingAttestationRow extends TokenBindingAttestationRow {
+  authority_ok: number
+}
+
 function mapAttestation(row: TokenBindingAttestationRow): TokenBindingAttestation {
   return {
     id: row.id,
@@ -162,17 +166,116 @@ async function readLiveTokenBinding(
   return row
 }
 
-async function readExisting(
+/**
+ * Linearization point for immutable-attestation replay and insert-conflict
+ * recovery. The row and its current authority verdict come from one SQLite
+ * statement, so a preflight result can never authorize a later plain read.
+ */
+async function readExistingWithCurrentAuthority(
   env: MemberTokenFingerprintEnv,
-  tokenId: string,
+  token: LiveTokenBindingRow,
+  fingerprint: string,
 ): Promise<TokenBindingAttestationRow | null> {
-  return env.DB.prepare(`
-    SELECT id, tenant, token_id, member_id, agent_id, channel,
-           credential_fingerprint, issued_at, expires_at, created_at
-      FROM token_binding_attestations
-     WHERE tenant = ?1 AND token_id = ?2 AND channel = 'workspace'
+  const row = await env.DB.prepare(`
+    SELECT attestation.id, attestation.tenant, attestation.token_id,
+           attestation.member_id, attestation.agent_id, attestation.channel,
+           attestation.credential_fingerprint, attestation.issued_at,
+           attestation.expires_at, attestation.created_at,
+           CASE WHEN
+             attestation.member_id = ?3
+             AND attestation.agent_id = ?4
+             AND attestation.credential_fingerprint = ?5
+             AND (attestation.expires_at IS NULL
+                  OR julianday(attestation.expires_at) > julianday('now'))
+             AND EXISTS (
+               SELECT 1
+                 FROM member_tokens token
+                 JOIN members member
+                   ON member.id = token.member_id
+                  AND member.tenant = token.tenant
+                 JOIN agents agent ON agent.id = token.agent_id
+                 JOIN squads squad ON squad.id = agent.squad_id
+                 JOIN memberships membership
+                   ON membership.agent_id = agent.id
+                  AND membership.squad_id = squad.id
+                 JOIN agent_member_bindings binding
+                   ON binding.tenant = token.tenant
+                  AND binding.agent_id = token.agent_id
+                  AND binding.member_id = token.member_id
+                WHERE token.id = attestation.token_id
+                  AND token.tenant = attestation.tenant
+                  AND token.member_id = attestation.member_id
+                  AND token.agent_id = attestation.agent_id
+                  AND token.channel = attestation.channel
+                  AND token.id = ?2
+                  AND token.tenant = ?1
+                  AND token.member_id = ?3
+                  AND token.agent_id = ?4
+                  AND token.channel = 'workspace'
+                  AND token.token_hash = ?6
+                  AND member.status = 'active'
+                  AND agent.status = 'active'
+                  AND agent.squad_id = ?7
+                  AND squad.id = ?7
+                  AND squad.department_id = ?8
+                  AND CASE membership.capability
+                    WHEN 'owner' THEN 5 WHEN 'admin' THEN 4 WHEN 'lead' THEN 3
+                    WHEN 'member' THEN 2 WHEN 'observer' THEN 1 ELSE 0 END >= 2
+                  AND ${TOKEN_LIVE_PREDICATE("datetime('now')").replaceAll('t.', 'token.')}
+                  AND julianday(token.created_at) <= julianday('now')
+                  AND (
+                    EXISTS (
+                      SELECT 1 FROM capabilities capability
+                       WHERE capability.member_id = member.id
+                         AND (
+                           capability.scope_type = 'org'
+                           OR (capability.scope_type = 'department'
+                             AND capability.scope_id = squad.department_id)
+                           OR (capability.scope_type = 'squad'
+                             AND capability.scope_id = squad.id)
+                         )
+                         AND CASE capability.capability
+                           WHEN 'owner' THEN 5 WHEN 'admin' THEN 4 WHEN 'lead' THEN 3
+                           WHEN 'member' THEN 2 WHEN 'observer' THEN 1 ELSE 0 END >= 2
+                    )
+                    OR EXISTS (
+                      SELECT 1 FROM channel_capability_grants capability
+                       WHERE capability.member_id = member.id
+                         AND capability.squad_id = squad.id
+                         AND CASE capability.capability
+                           WHEN 'owner' THEN 5 WHEN 'admin' THEN 4 WHEN 'lead' THEN 3
+                           WHEN 'member' THEN 2 WHEN 'observer' THEN 1 ELSE 0 END >= 2
+                    )
+                  )
+             )
+             THEN 1 ELSE 0 END AS authority_ok
+      FROM token_binding_attestations attestation
+     WHERE attestation.tenant = ?1
+       AND attestation.token_id = ?2
+       AND attestation.channel = 'workspace'
      LIMIT 1
-  `).bind(env.TENANT_SLUG, tokenId).first<TokenBindingAttestationRow>()
+  `).bind(
+    env.TENANT_SLUG,
+    token.token_id,
+    token.member_id,
+    token.agent_id,
+    fingerprint,
+    token.token_hash,
+    token.squad_id,
+    token.department_id,
+  ).first<AuthorizedTokenBindingAttestationRow>()
+  if (!row) return null
+  if (
+    row.member_id !== token.member_id
+    || row.agent_id !== token.agent_id
+    || row.credential_fingerprint !== fingerprint
+  ) {
+    throw new AttestationError('attestation_conflict')
+  }
+  if (Number(row.authority_ok) !== 1) {
+    throw new AttestationError('workspace_token_required')
+  }
+  return row
 }
 
 /**
@@ -195,15 +298,8 @@ export async function issueTokenBindingAttestation(
     throw error
   }
 
-  const existing = await readExisting(env, token.token_id)
+  const existing = await readExistingWithCurrentAuthority(env, token, fingerprint)
   if (existing) {
-    if (
-      existing.member_id !== token.member_id
-      || existing.agent_id !== token.agent_id
-      || existing.credential_fingerprint !== fingerprint
-    ) {
-      throw new AttestationError('attestation_conflict')
-    }
     return mapAttestation(existing)
   }
 
@@ -288,13 +384,8 @@ export async function issueTokenBindingAttestation(
     return mapAttestation(rows[0])
   } catch (error) {
     if (error instanceof AttestationError) throw error
-    const raced = await readExisting(env, token.token_id)
-    if (
-      raced
-      && raced.member_id === token.member_id
-      && raced.agent_id === token.agent_id
-      && raced.credential_fingerprint === fingerprint
-    ) {
+    const raced = await readExistingWithCurrentAuthority(env, token, fingerprint)
+    if (raced) {
       return mapAttestation(raced)
     }
     throw new AttestationError('attestation_conflict')

@@ -50,6 +50,88 @@ function envWithBeforeAttestationInsert(mutate: () => void): MemberTokenFingerpr
   }
 }
 
+function envWithBeforeExistingAttestationRead(mutate: () => void): MemberTokenFingerprintEnv {
+  const committedDb = env.DB
+  let injected = false
+  const wrap = (statement: D1PreparedStatement): D1PreparedStatement => ({
+    bind(...values: unknown[]) {
+      return wrap(statement.bind(...values))
+    },
+    async first<T>() {
+      if (!injected) {
+        injected = true
+        mutate()
+      }
+      return statement.first<T>()
+    },
+  }) as D1PreparedStatement
+  return {
+    ...env,
+    DB: {
+      prepare(sql: string) {
+        const statement = committedDb.prepare(sql)
+        return sql.includes('FROM token_binding_attestations')
+          ? wrap(statement)
+          : statement
+      },
+      batch: committedDb.batch.bind(committedDb),
+    } as D1Database,
+  }
+}
+
+function envWithAttestationInsertConflictThen(
+  mutate: () => void,
+): MemberTokenFingerprintEnv {
+  const committedDb = env.DB
+  let injected = false
+  const fingerprint = `v1:${createHmac('sha256', FINGERPRINT_SECRET)
+    .update(`mupot:member-token-fingerprint:v1:${TOKEN_HASH}`)
+    .digest('hex')}`
+  const wrap = (statement: D1PreparedStatement): D1PreparedStatement => ({
+    bind(...values: unknown[]) {
+      return wrap(statement.bind(...values))
+    },
+    async all<T>() {
+      if (injected) return statement.all<T>()
+      injected = true
+      harness.sqlite.prepare(`
+        INSERT INTO token_binding_attestations (
+          id, tenant, token_id, member_id, agent_id, channel,
+          credential_fingerprint, issued_at, expires_at, created_at
+        ) VALUES (?, ?, ?, ?, ?, 'workspace', ?, ?, ?, ?)
+      `).run(
+        'attestation-concurrent-winner',
+        TENANT,
+        TOKEN_ID,
+        MEMBER_ID,
+        AGENT_ID,
+        fingerprint,
+        NOW,
+        TOKEN_EXPIRES_AT,
+        NOW,
+      )
+      try {
+        return await statement.all<T>()
+      } catch (error) {
+        mutate()
+        throw error
+      }
+    },
+  }) as D1PreparedStatement
+  return {
+    ...env,
+    DB: {
+      prepare(sql: string) {
+        const statement = committedDb.prepare(sql)
+        return sql.includes('INSERT INTO token_binding_attestations')
+          ? wrap(statement)
+          : statement
+      },
+      batch: committedDb.batch.bind(committedDb),
+    } as D1Database,
+  }
+}
+
 function auth(overrides: Partial<AuthContext> = {}): AuthContext {
   return {
     userId: MEMBER_ID,
@@ -250,6 +332,39 @@ describe('Flight Spine token-binding attestations', () => {
     expect(harness.sqlite.prepare(`
       SELECT id FROM token_binding_attestations WHERE token_id = ?
     `).get(TOKEN_ID)).toEqual({ id: first.id })
+  })
+
+  it.each([
+    ['agent membership removal', `DELETE FROM memberships WHERE id = 'membership-command'`],
+    ['agent membership downgrade', `UPDATE memberships SET capability = 'observer' WHERE id = 'membership-command'`],
+    ['human grant removal', `DELETE FROM capabilities WHERE id = 'capability-command'`],
+    ['token revocation', `UPDATE member_tokens SET revoked_at = '${NOW}' WHERE id = '${TOKEN_ID}'`],
+  ])('denies existing replay when %s wins immediately before the authority-bearing read', async (_label, mutation) => {
+    const first = await issueTokenBindingAttestation(env, auth())
+    const racedEnv = envWithBeforeExistingAttestationRead(() => harness.sqlite.exec(mutation))
+
+    await expect(issueTokenBindingAttestation(racedEnv, auth({
+      capabilities: squadCapability('member'),
+    }))).rejects.toMatchObject({ code: 'workspace_token_required' })
+    expect(harness.sqlite.prepare(`
+      SELECT id FROM token_binding_attestations WHERE token_id = ?
+    `).get(TOKEN_ID)).toEqual({ id: first.id })
+  })
+
+  it.each([
+    ['agent membership removal', `DELETE FROM memberships WHERE id = 'membership-command'`],
+    ['agent membership downgrade', `UPDATE memberships SET capability = 'observer' WHERE id = 'membership-command'`],
+    ['human grant removal', `DELETE FROM capabilities WHERE id = 'capability-command'`],
+    ['token revocation', `UPDATE member_tokens SET revoked_at = '${NOW}' WHERE id = '${TOKEN_ID}'`],
+  ])('denies insert-conflict recovery when %s wins before the recovery read', async (_label, mutation) => {
+    const racedEnv = envWithAttestationInsertConflictThen(() => harness.sqlite.exec(mutation))
+
+    await expect(issueTokenBindingAttestation(racedEnv, auth({
+      capabilities: squadCapability('member'),
+    }))).rejects.toMatchObject({ code: 'workspace_token_required' })
+    expect(harness.sqlite.prepare(`
+      SELECT id FROM token_binding_attestations WHERE token_id = ?
+    `).all(TOKEN_ID)).toEqual([{ id: 'attestation-concurrent-winner' }])
   })
 
   it.each([
