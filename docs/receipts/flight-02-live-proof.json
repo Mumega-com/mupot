@@ -1,0 +1,223 @@
+{
+  "schema": "mupot.flight.live_proof_receipt",
+  "version": 1,
+  "receipt_id": "flight-02-live-proof",
+  "created_at": "2026-08-24T12:06:12Z",
+  "proof_kind": "production_bootstrap_control_plane",
+  "status": "PASS_WITH_EXPLICIT_RUNTIME_EXCLUSIONS",
+  "evidence_source_caveat": {
+    "controller_observed": [
+      "authenticated MCP initialize and tools/list responses",
+      "canonical boot and orient responses",
+      "identical MCP objective replay and readback responses",
+      "/mcp/health status pair: unauthenticated 401 and authenticated 404"
+    ],
+    "persistent_effects_and_digests_independently_reverified": true
+  },
+  "repository": {
+    "name": "Mumega-com/mupot",
+    "source_candidate_commit": "cd4eeac28089ab8f48236c7306f12b9d1ce4460b",
+    "evidence_package_commit": "35b1314dfa5650458b7701f3e06c41501a8a21b8",
+    "independent_gate_commit": "87ed4a9a69163289c80fa1b0de0a207fc845467e",
+    "independent_gate_identity": "hadi-grok",
+    "independent_gate_verdict": "PASS",
+    "merge_commit": "890a0209c0846c9ce7b4f4561ab13523ddf9a21c",
+    "merge_tree": "91d0b5010c570e3d372a14eba0200cb6be8aa79d"
+  },
+  "worker_deployment": {
+    "predeployment": {
+      "source_commit": "40fb834ba8b45b2b08d9d50f2a24010acc7970f9",
+      "worker_version_id": "de5907e2-4542-4629-bce5-ce86e1b26678"
+    },
+    "secret_update_worker_version_id": "98717388-d639-4cc3-9fbf-389055a49d70",
+    "deployed_worker_version_id": "46fb74c3-7777-4cc2-a23b-473e3e5a86d2",
+    "public_health": {
+      "commit": "890a0209c0846c9ce7b4f4561ab13523ddf9a21c",
+      "clean": true,
+      "version": "0.30.0",
+      "built_at": "2026-08-24T11:56:06.059Z"
+    },
+    "rollback_performed": false
+  },
+  "private_backup": {
+    "location_excluded": true,
+    "urls_excluded": true,
+    "contents_not_read": true,
+    "files": [
+      {
+        "role": "database_full_export",
+        "size_bytes": 12814871,
+        "mode": "0600",
+        "sha256": "13c57021bd2cdd2499a99bcfd1499b647a81a60647e12ce319508c7fa1552e3f"
+      },
+      {
+        "role": "database_schema_export",
+        "size_bytes": 162533,
+        "mode": "0600",
+        "sha256": "73e73233091fa662ecac112f3f1e5d5486f5e3bb0994eb4b80f67e867b26a8f3"
+      }
+    ],
+    "metadata_verified_at": "2026-08-24T12:06:12Z"
+  },
+  "fingerprint_secret": {
+    "binding_name": "MEMBER_TOKEN_FINGERPRINT_SECRET",
+    "deployed_binding_present": true,
+    "local_recovery_copy_present": true,
+    "local_recovery_copy_mode": "0600",
+    "value_excluded": true,
+    "recovery_location_excluded": true
+  },
+  "database": {
+    "database_id": "b78f4ca0-1d09-4e9a-a3db-96df238af6ce",
+    "migration_history": [
+      {
+        "migration": "0120_targeted_seat_messages.sql",
+        "applied_at": "2026-08-24 11:54:26"
+      },
+      {
+        "migrations": [
+          "0121_flight_spine_objectives_assignments.sql",
+          "0122_runtime_seats_fences.sql",
+          "0123_execution_receipt_ledger.sql",
+          "0124_artifact_receipt_facts.sql",
+          "0125_mutation_host_control_audit.sql",
+          "0126_decision_requests.sql"
+        ],
+        "applied_at_range": {
+          "from": "2026-08-24 11:55:28",
+          "through": "2026-08-24 11:55:30"
+        }
+      }
+    ],
+    "source_time_format": "YYYY-MM-DD HH:MM:SS",
+    "pending_migration_count": 0,
+    "verified_schema": {
+      "agent_messages_target_seat_column": true,
+      "agent_messages_target_seat_index": "idx_agent_messages_target_seat",
+      "tasks_assignment_epoch_column": true,
+      "flight_spine_tables": [
+        "objectives",
+        "objective_acceptance_keys",
+        "flight_objectives",
+        "flight_lanes",
+        "flight_task_assignments",
+        "flight_dependencies",
+        "runtime_seats",
+        "runtime_seat_generations",
+        "runtime_seat_leases",
+        "token_binding_attestations",
+        "seat_attestations",
+        "execution_receipts",
+        "execution_receipt_heads",
+        "execution_receipt_edges",
+        "artifacts",
+        "artifact_retrieval_receipts",
+        "flight_dependency_artifacts",
+        "mutation_audit_entries",
+        "host_control_receipts",
+        "decision_requests",
+        "decision_request_resolutions"
+      ]
+    }
+  },
+  "mcp": {
+    "authenticated_jsonrpc_initialize": {
+      "server_name": "mupot-mumega",
+      "server_version": "0.30.0",
+      "protocol_version": "2025-06-18"
+    },
+    "tool_count": 108,
+    "flight_spine_tools": [
+      "objective_accept",
+      "objective_get",
+      "execution_receipt_get",
+      "token_binding_attest",
+      "runtime_seat_register_pending"
+    ],
+    "flight_spine_tool_count": 5,
+    "jsonrpc_health": "PASS",
+    "root_health_route": {
+      "unauthenticated_status": 401,
+      "authenticated_status": 404,
+      "classification": "pre_existing_oauth_routing_and_documentation_defect",
+      "source_index_unchanged_from_predeployment_commit": true,
+      "follow_up_required": true,
+      "rollback_required": false
+    }
+  },
+  "canonical_boot": {
+    "agent_id": "087a816b-ab9f-400f-8d53-f6f97b94a725",
+    "agent_slug": "hadi-codex",
+    "member_id": "ee61d85f-9898-459c-8b47-141a03b2dbbb",
+    "tenant": "mumega",
+    "channel": "workspace",
+    "provenance": "minted",
+    "squad": "Hadi-Mac",
+    "membership_capability": "member",
+    "effective_squad_capability": "admin"
+  },
+  "bootstrap_runtime_seat": {
+    "token_binding_attestation_id": "a4e1100b-f516-43f2-b22c-24e7b2e1d7db",
+    "token_binding_attestation_issued_at": "2026-08-24T11:59:11.088Z",
+    "runtime_seat_id": "64dfb077-68aa-4709-af0f-f6a52cd5c6ca",
+    "seat_attestation_id": "857b9125-f948-4b72-ac8b-d6e435310a61",
+    "state": "pending",
+    "generation": 0,
+    "fence": 0,
+    "process_key": null,
+    "heartbeat": null,
+    "active_generation": null,
+    "active_lease": null,
+    "runtime_activation_claim": false
+  },
+  "objective_bootstrap": {
+    "objective_id": "objective-9565e9c3132c21db7416a0b1d64d4bda",
+    "agent_id": "087a816b-ab9f-400f-8d53-f6f97b94a725",
+    "member_id": "ee61d85f-9898-459c-8b47-141a03b2dbbb",
+    "authorized_receipt_id": "ba024c50-5d3e-4817-ac6d-72fb6518a046",
+    "accepted_receipt_id": "cfb70e2a-a9e3-47cd-9083-e71d5651bbb0",
+    "accepted_at": "2026-08-24T11:59:42.891Z",
+    "accepted_receipt_server_timestamp": "2026-08-24T11:59:42.952Z",
+    "accepted_receipt_payload_digest": "1ba58b77eab8407193bafb005ffd9e6f852467a0368337d3a1a20acf7c34caef",
+    "accepted_receipt_hash": "8f75fe0bf5ceb7d2152cd5da099b83ea0ea4d8af54f013d2076fdb92c5580150",
+    "public_objective_payload_digest": "5cb54cc419fbbcb0da86017761bf05977bd8907a9a3eba17a124cb2f6c126b92",
+    "budget": {
+      "amount": 0,
+      "currency": "USD"
+    },
+    "exact_agent_attribution": true,
+    "accept_replay_identical": true,
+    "readback_identical": true,
+    "flight_link_count": 0
+  },
+  "claims": {
+    "deployment_and_migration_proven": true,
+    "authenticated_mcp_bootstrap_proven": true,
+    "canonical_identity_proven": true,
+    "token_binding_attestation_proven": true,
+    "pending_runtime_seat_registration_proven": true,
+    "objective_authorization_acceptance_and_replay_proven": true,
+    "runtime_activation_proven": false,
+    "delivery_proven": false,
+    "consumption_proven": false,
+    "correlated_ack_proven": false,
+    "artifact_proven": false,
+    "result_proven": false,
+    "independent_runtime_gate_proven": false,
+    "landing_proven": false,
+    "autonomy_proven": false
+  },
+  "explicit_exclusions": [
+    "credential values and credential material",
+    "backup locations, URLs, and contents",
+    "runtime activation",
+    "message delivery",
+    "message consumption",
+    "correlated ACK",
+    "runtime artifact",
+    "runtime result",
+    "runtime gate verdict",
+    "flight landing",
+    "autonomous operation"
+  ]
+}

@@ -1,0 +1,71 @@
+{
+  "schema": "FLIGHT-SPINE-SCHEMA-02-LIVE-PROOF-GATE-VERDICT",
+  "version": 1,
+  "verdict": "BLOCK",
+  "request_id": "741327ae-26a7-411b-9f9a-42953ea97e00",
+  "gated_at": "2026-08-24T12:27:28Z",
+  "gate": {
+    "slug": "hadi-grok",
+    "uuid": "a065e61c-6a93-42fc-b070-b541631202f1",
+    "grant": "gate:hadi-grok",
+    "seat": "hadi-grok"
+  },
+  "bindings": {
+    "repository": "https://github.com/Mumega-com/mupot.git",
+    "branch": "codex/flight02-live-proof",
+    "receipt_path": "docs/receipts/flight-02-live-proof.json",
+    "receipt_commit_sha": "341d4fad4de584c48c75417cc08883b23948ef0a",
+    "receipt_sha256": "0ce32c08a355f6b9c75dbac71602a6a07d996ce1dc2a0874173d6a75706b8fe1",
+    "merge_commit_sha": "890a0209c0846c9ce7b4f4561ab13523ddf9a21c",
+    "merge_tree_sha": "91d0b5010c570e3d372a14eba0200cb6be8aa79d"
+  },
+  "independently_verified_this_tick": {
+    "receipt_commit_fetchable": true,
+    "receipt_sha256_matches": true,
+    "receipt_commit_is_docs_only": true,
+    "public_health_commit": "890a0209c0846c9ce7b4f4561ab13523ddf9a21c",
+    "public_health_version": "0.30.0",
+    "public_health_built_at": "2026-08-24T11:56:06.059Z",
+    "public_health_clean": true,
+    "unauthenticated_mcp_health_status": 401,
+    "merge_tree_matches": true,
+    "source_cd4eeac_ancestor_of_merge": true,
+    "v2_pass_87ed4a9_ancestor_of_merge": true,
+    "canonical_agent_hadi_codex_id_slug": true,
+    "inbox_api_exposes_target_seat_field": true,
+    "fleet_hadi_codex_not_live": true,
+    "objective_get_callable": false,
+    "execution_receipt_get_callable": false,
+    "token_binding_attest_not_invoked": true,
+    "runtime_seat_register_pending_not_invoked": true,
+    "backup_contents_not_read": true,
+    "secret_values_not_read": true
+  },
+  "mismatches": [
+    {
+      "claim": "mcp.flight_spine_tools (5) and tool_count 108; objective/receipt/pending-seat live readback",
+      "observed": "this independent-gate MCP session cannot call mupot__objective_get (tool not found). Search does not surface objective_get, execution_receipt_get, token_binding_attest, or runtime_seat_register_pending. Session catalog at boot was 103 mupot tools (103+5=108).",
+      "threat": "label-without-import-graph"
+    }
+  ],
+  "additional_unverified": [
+    "Worker version IDs and wrangler secret binding (secret_env_status for MEMBER_TOKEN_FINGERPRINT_SECRET returned unbound; that plane may differ from Worker secrets \u2014 values not read).",
+    "D1 migration ledger 0121-0126 and flight-spine tables (0120 target_seat is evidenced only by inbox JSON now including target_seat).",
+    "Pending runtime seat row, generation 0, no lease.",
+    "Objective-9565e9c3\u2026 two receipts and payload/hash digests.",
+    "Authenticated /mcp/health 404 (token not used this tick).",
+    "Backup file hashes (locations/contents excluded)."
+  ],
+  "exclusions_recorded_in_receipt": true,
+  "runtime_activation_not_proven": true,
+  "legacy_or_v2_source_pass_is_not_this_gate": true,
+  "autonomy_claim": false,
+  "deployment_authorized_by_this_verdict": false,
+  "merge_authorized": false,
+  "receipt_or_source_edited_by_gate": false,
+  "defect": {
+    "id": "flight_spine_mcp_tools_not_independently_callable",
+    "threat": "label-without-import-graph",
+    "detail": "Live proof claims five Flight Spine MCP tools and objective/receipt readback. Independent gate on https://mupot.mumega.com/mcp (public /health commit 890a0209) cannot call objective_get. Core live facts therefore not independently verified."
+  }
+}
