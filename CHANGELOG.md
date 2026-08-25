@@ -2,6 +2,11 @@
 
 ## 0.30.0 — 2026-08-21
 
+- **MCP `loop_control` governor tool** (`src/mcp/loops.ts`, `src/loops/decisions.ts`, `migrations/0129_loop_control_receipts.sql`; #1166).
+  - Agents can pause, kill, or budget-cap a running loop over MCP — the dashboard-only `setLoopControl` path is no longer the sole lever.
+  - Authorization: org-admin, or at least `lead` on the loop's owning squad. `kill` requires an attributed reason.
+  - Each action writes the live `loop_controls` signal the driver consumes *and* an append-only `loop_control_receipts` row, so a consumed signal still names who issued it and why.
+
 - **Mint-in-Chooser Self-Service Agent Seat Binding** (`src/mcp/oauth-authorize.ts`, `tests/agent-bound-oauth-consent.test.ts`; #1189).
   - Native self-service agent minting directly inside the OAuth consent chooser UI (`__mint_new__`), gated by squad administrator capability (`listConsentableSquads`).
   - Server-side creation of agent records (`createAgent`), immutable token & dedicated member binding (`mintAgentBoundToken`), and append-only receipt auditing (`oauth_consent_receipts`).
