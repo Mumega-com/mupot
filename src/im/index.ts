@@ -382,7 +382,8 @@ async function wakeReply(
     reason: 'im.wake',
   })
   if (!routed.ok) return `Tried to wake ${agent.name} but it didn't run. Try again shortly.`
-  return `Woke ${agent.name}. It's running one cycle now.`
+  if (routed.route === 'agent_do') return `Woke ${agent.name}. It's running one cycle now.`
+  return `Wake request for ${agent.name} was durably queued.`
 }
 
 // ── intent: fleet (cap: owner on org) ────────────────────────────────────────

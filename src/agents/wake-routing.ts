@@ -113,18 +113,24 @@ export async function routeAgentWake(env: Env, input: WakeRouteInput): Promise<W
   }
 
   const stub = env.AGENT.get(env.AGENT.idFromName(input.agent.id))
-  const response = await stub.fetch(`${DO_ORIGIN}/wake`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      agent_id: input.agent.id,
-      reason: input.reason,
-      squad_id: input.agent.squad_id,
-      context: input.context,
-      maxActions: input.maxActions,
-    }),
-  })
-  if (response.ok) {
+  let response: Response | null = null
+  try {
+    response = await stub.fetch(`${DO_ORIGIN}/wake`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        agent_id: input.agent.id,
+        reason: input.reason,
+        squad_id: input.agent.squad_id,
+        context: input.context,
+        maxActions: input.maxActions,
+      }),
+    })
+  } catch {
+    // A transport rejection is the same failed in-Worker route as a non-2xx response.
+    // Continue to the durable fallback; never reflect the thrown error to the caller.
+  }
+  if (response?.ok) {
     const runtime = await response.json<unknown>().catch(() => null)
     const result = { ok: true, route: 'agent_do', runtime } as const
     await emitRoutedObservation(env, input, result.route)
@@ -134,7 +140,7 @@ export async function routeAgentWake(env: Env, input: WakeRouteInput): Promise<W
   const fallback = await deliverWakeEnvelope(
     env,
     input,
-    input.agent.slug || input.agent.id,
+    external.agentId || input.agent.id,
     'fallback_inbox',
     idempotencyKey,
   )
