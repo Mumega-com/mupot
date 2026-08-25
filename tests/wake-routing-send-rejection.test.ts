@@ -2,18 +2,6 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
-
-const { sendAgentMessage } = vi.hoisted(() => ({
-  sendAgentMessage: vi.fn(async () => {
-    throw new Error('private pre-insert dependency detail')
-  }),
-}))
-
-vi.mock('../src/agents/messages', async (importOriginal) => ({
-  ...await importOriginal<typeof import('../src/agents/messages')>(),
-  sendAgentMessage,
-}))
-
 import { mcpApp } from '../src/mcp'
 
 const TENANT = 'mumega'
@@ -25,10 +13,9 @@ let harness: SqliteD1Harness | null = null
 afterEach(() => {
   harness?.close()
   harness = null
-  sendAgentMessage.mockClear()
 })
 
-function envWithMigratedSchema(): Env {
+function envWithMigratedSchema(): { env: Env; precheckAttempts: () => number } {
   harness = createSqliteD1()
   applyAllMigrations(harness.sqlite)
   harness.sqlite.exec(`
@@ -48,9 +35,34 @@ function envWithMigratedSchema(): Env {
       VALUES ('cap-reject', '${MEMBER_ID}', 'org', NULL, 'owner');
   `)
 
-  return {
+  let attempts = 0
+  const migratedDb = harness.db
+  const injectedDb = {
+    prepare(sql: string) {
+      if (
+        sql.includes('FROM agent_messages') &&
+        sql.includes('from_agent = ?2') &&
+        sql.includes('request_id = ?3')
+      ) {
+        return {
+          bind() {
+            return {
+              async first() {
+                attempts += 1
+                throw new Error('private migrated-db precheck detail')
+              },
+            }
+          },
+        }
+      }
+      return migratedDb.prepare(sql)
+    },
+    batch: migratedDb.batch.bind(migratedDb),
+  } as unknown as Env['DB']
+
+  const env = {
     TENANT_SLUG: TENANT,
-    DB: harness.db,
+    DB: injectedDb,
     BUS: { send: vi.fn(async () => undefined) },
     AGENT: {
       idFromName: vi.fn((id: string) => `do:${id}`),
@@ -59,10 +71,12 @@ function envWithMigratedSchema(): Env {
       })),
     },
   } as unknown as Env
+  return { env, precheckAttempts: () => attempts }
 }
 
 describe('wake envelope dependency rejection', () => {
   it('returns fixed MCP wake_failed without reflecting a pre-insert send rejection', async () => {
+    const fixture = envWithMigratedSchema()
     const response = await mcpApp.request('https://pot.test/', {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: 'Bearer wake-token' },
@@ -70,13 +84,13 @@ describe('wake envelope dependency rejection', () => {
         tool: 'wake_agent',
         args: { agent_id: AGENT_ID, reason: 'dependency-rejection' },
       }),
-    }, envWithMigratedSchema())
+    }, fixture.env)
     const text = await response.text()
 
     expect(response.status).toBe(409)
-    expect(sendAgentMessage).toHaveBeenCalledOnce()
+    expect(fixture.precheckAttempts()).toBe(1)
     expect(text).toContain('wake_failed')
-    expect(text).not.toContain('private pre-insert dependency detail')
+    expect(text).not.toContain('private migrated-db precheck detail')
     expect(text).not.toContain('do detail')
   })
 })
