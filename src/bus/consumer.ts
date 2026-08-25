@@ -214,6 +214,9 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
         console.error('bus: agent.wake missing agent_id', { tenant: event.tenant })
         return true
       }
+      if ((event.payload as { already_routed?: unknown })?.already_routed === true) {
+        return true
+      }
       const identity = taskDispatchIdentity(event)
       if (!identity) {
         await wakeAgent(env, event.agent_id, event)

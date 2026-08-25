@@ -50,6 +50,7 @@ import {
   type HumanDirectiveAction,
 } from '../brain/directive'
 import { timingSafeEqual } from '../lib/crypto'
+import { routeAgentWake } from '../agents/wake-routing'
 
 type AppEnv = { Bindings: Env }
 
@@ -375,28 +376,14 @@ async function wakeReply(
   }
   if (agent.status !== 'active') return `${agent.name} is paused; can't wake it.`
 
-  // Attributed wake announcement on the bus, then drive the DO synchronously —
-  // same contract as agentsApp / the MCP wake_agent tool.
-  const now = new Date().toISOString()
-  const event: BusEvent<{ by: string; reason: string }> = {
-    type: 'agent.wake',
-    tenant: env.TENANT_SLUG,
-    squad_id: agent.squad_id,
-    agent_id: agent.id,
-    actor: memberActor(member.id),
-    payload: { by: member.id, reason: 'im.wake' },
-    ts: now,
-  }
-  await createBus(env).emit(event)
-
-  const stub = env.AGENT.get(env.AGENT.idFromName(agent.id))
-  const res = await stub.fetch('https://agent/wake', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ agent_id: agent.id, reason: 'im.wake', squad_id: agent.squad_id }),
+  const routed = await routeAgentWake(env, {
+    agent,
+    byMemberId: member.id,
+    reason: 'im.wake',
   })
-  if (!res.ok) return `Tried to wake ${agent.name} but it didn't run. Try again shortly.`
-  return `Woke ${agent.name}. It's running one cycle now.`
+  if (!routed.ok) return `Tried to wake ${agent.name} but it didn't run. Try again shortly.`
+  if (routed.route === 'agent_do') return `Woke ${agent.name}. It's running one cycle now.`
+  return `Wake request for ${agent.name} was durably queued.`
 }
 
 // ── intent: fleet (cap: owner on org) ────────────────────────────────────────

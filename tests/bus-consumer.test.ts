@@ -26,6 +26,40 @@ function envForWake(responseStatus: number): Env {
 }
 
 describe('bus queue consumer', () => {
+  it('acknowledges an already-routed wake observation without executing another route', async () => {
+    const env = envForWake(200)
+    const item = message({
+      type: 'agent.wake',
+      tenant: 'test',
+      agent_id: 'agent-1',
+      payload: { already_routed: true, route: 'external_inbox' },
+      ts: '2026-08-25T00:00:00.000Z',
+    })
+
+    await handleQueue({ messages: [item] } as unknown as MessageBatch<BusEvent>, env)
+
+    expect(env.AGENT.idFromName).not.toHaveBeenCalled()
+    expect(item.ack).toHaveBeenCalledOnce()
+    expect(item.retry).not.toHaveBeenCalled()
+  })
+
+  it('retains AgentDO execution for a normal generic wake event', async () => {
+    const env = envForWake(200)
+    const item = message({
+      type: 'agent.wake',
+      tenant: 'test',
+      agent_id: 'agent-1',
+      payload: { reason: 'generic-bus-wake' },
+      ts: '2026-08-25T00:00:00.000Z',
+    })
+
+    await handleQueue({ messages: [item] } as unknown as MessageBatch<BusEvent>, env)
+
+    expect(env.AGENT.idFromName).toHaveBeenCalledOnce()
+    expect(item.ack).toHaveBeenCalledOnce()
+    expect(item.retry).not.toHaveBeenCalled()
+  })
+
   it('acknowledges terminal observation events', async () => {
     const item = message({
       type: 'task.updated',
