@@ -3969,11 +3969,6 @@ export function shell(
             <span class="nav-label">Work</span>
           </a>
 
-          <a class="nav-link" href="/studio">
-            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><rect x="3.4" y="4.2" width="5.4" height="11.6" rx="1.2"/><rect x="11.2" y="4.2" width="5.4" height="11.6" rx="1.2"/></svg>
-            <span class="nav-label">Studio</span>
-          </a>
-
           <a class="nav-link" href="/needs-you">
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M10 3.2a6.8 6.8 0 1 0 6.8 6.8"/><path d="M10 6.3v4.2l2.8 1.7"/><path d="M15.2 3.6v3.1h-3.1"/></svg>
             <span class="nav-label">Needs You</span>
@@ -3984,6 +3979,11 @@ export function shell(
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M10 3 4.5 5.2v4.3c0 3.4 2.3 5.8 5.5 7 3.2-1.2 5.5-3.6 5.5-7V5.2z"/><path d="M7.6 10l1.7 1.7 3.1-3.4"/></svg>
             <span class="nav-label">Approvals</span>
             <span class="nav-badge" id="approvals-badge" style="display:none;">0</span>
+          </a>
+
+          <a class="nav-link" href="/studio">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><rect x="3.4" y="4.2" width="5.4" height="11.6" rx="1.2"/><rect x="11.2" y="4.2" width="5.4" height="11.6" rx="1.2"/></svg>
+            <span class="nav-label">Studio</span>
           </a>
 
           <!-- Organization (collapsible) -->
