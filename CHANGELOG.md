@@ -2,7 +2,7 @@
 
 ## 0.30.0 — 2026-08-21
 
-- **MCP `loop_control` governor tool** (`src/mcp/loops.ts`, `src/loops/decisions.ts`, `migrations/0129_loop_control_receipts.sql`; #1166).
+- **MCP `loop_control` governor tool** (`src/mcp/loops.ts`, `src/loops/decisions.ts`, `migrations/0127_loop_control_receipts.sql`; #1166).
   - Agents can pause, kill, or budget-cap a running loop over MCP — the dashboard-only `setLoopControl` path is no longer the sole lever.
   - Authorization: org-admin, or at least `lead` on the loop's owning squad. `kill` requires an attributed reason.
   - Each action writes the live `loop_controls` signal the driver consumes *and* an append-only `loop_control_receipts` row, so a consumed signal still names who issued it and why.

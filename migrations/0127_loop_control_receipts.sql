@@ -1,4 +1,4 @@
--- 0129_loop_control_receipts.sql — durable audit for governor signals (#1166).
+-- 0127_loop_control_receipts.sql — durable audit for governor signals (#1166).
 --
 -- loop_controls (0021) is the LIVE signal the driver honors and then deletes
 -- (clearLoopControl). That makes it a poor audit trail: a pause/kill that was
