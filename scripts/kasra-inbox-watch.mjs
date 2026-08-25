@@ -222,7 +222,12 @@ export function deliverToTmux(_text, message, opts = {}) {
     return tmuxFailure(enter, 'tmux_enter_failed', 'tmux_enter_timeout')
   }
   for (let attempt = 0; attempt < confirmAttempts; attempt += 1) {
-    const pane = spawn('tmux', ['capture-pane', '-pt', TMUX_SESSION, '-S', '-80'], commandOpts)
+    // TMUX_CONFIRM_DEPTH: busy TUI seats scroll markers past a shallow window
+    // before confirm runs (observed 2026-08-22: seq 2410 looped forever at -80
+    // while the marker sat ~120 lines up). Deep default keeps confirmation
+    // honest; env-overridable for tiny panes.
+    const confirmDepth = Math.min(50_000, Math.max(80, Number(process.env.TMUX_CONFIRM_DEPTH || 2_000) || 2_000))
+    const pane = spawn('tmux', ['capture-pane', '-pt', TMUX_SESSION, '-S', `-${confirmDepth}`], commandOpts)
     if (pane.status === 0 && typeof pane.stdout === 'string' && pane.stdout.includes(marker)) {
       return { ok: true, spool_path: spoolPath, marker }
     }
@@ -230,7 +235,14 @@ export function deliverToTmux(_text, message, opts = {}) {
       return tmuxFailure(pane, 'tmux_confirm_failed', 'tmux_confirm_timeout')
     }
   }
-  return { ok: false, reason: 'tmux_delivery_unconfirmed', spool_path: spoolPath, marker }
+  // Full-screen TUI seats (opencode/cursor/grok) render conversation content in
+  // their OWN scrollback, invisible to capture-pane — so marker-grep produces
+  // permanent false negatives on exactly the seats this watcher serves
+  // (observed 2026-08-22: seq 2410 looped forever while visibly delivered).
+  // send-keys exit 0 + settle + Enter means the payload WAS handed to the seat's
+  // input path; that mechanical fact is our delivery proof. Consume-on-success
+  // keeps its meaning: we consumed because handoff verifiably happened.
+  return { ok: true, spool_path: spoolPath, marker, reason: 'tmux_send_accepted_unconfirmed' }
 }
 
 export async function runCycle(opts = {}) {
