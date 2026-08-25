@@ -92,6 +92,7 @@ import { resolveAgentRef } from '../org/resolve'
 import {
   sendToRef, readAgentInbox, sendAgentMessage,
 } from '../agents/messages'
+import { routeAgentWake } from '../agents/wake-routing'
 import { verifyTaskArtifactShape } from '../tasks/artifact-verification'
 import {
   leaseAgentInbox, ackAgentMessages, listDeadLetteredMessages, summarizeDeadLetters,
@@ -2875,30 +2876,22 @@ const toolWakeAgent: ToolSpec = {
         ? Math.max(0, Math.floor(args.maxActions))
         : undefined
 
-    // Announce the (attributed) wake on the bus, then drive the DO directly so the
-    // caller gets the cycle result synchronously — same pattern as agentsApp.
-    const event: BusEvent<{ by: string; reason: string }> = {
-      type: 'agent.wake',
-      tenant: env.TENANT_SLUG,
-      squad_id: agent.squad_id,
-      agent_id: agent.id,
-      actor: memberActor(auth.memberId as string),
-      payload: { by: auth.memberId as string, reason },
-      ts: new Date().toISOString(),
-    }
-    await createBus(env).emit(event)
-
-    const stub = env.AGENT.get(env.AGENT.idFromName(agent.id))
-    const res = await stub.fetch('https://agent/wake', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ agent_id: agent.id, reason, squad_id: agent.squad_id, context, maxActions }),
+    const routed = await routeAgentWake(env, {
+      agent,
+      byMemberId: auth.memberId as string,
+      reason,
+      context,
+      maxActions,
     })
-    const runtime = await res.json<unknown>()
-    // Do NOT reflect the raw Durable Object error body (WARN-4) — it may carry internal
-    // runtime detail into the caller / ChatGPT connector. Fixed reason on failure.
-    if (!res.ok) return fail(409, 'wake_failed')
-    return done({ agent_id: agent.id, runtime })
+    if (!routed.ok) return fail(409, 'wake_failed')
+    if (routed.route === 'agent_do') return done({ agent_id: agent.id, runtime: routed.runtime })
+    return done({
+      agent_id: agent.id,
+      route: routed.route,
+      delivered: routed.delivered,
+      seq: routed.seq,
+      duplicate: routed.duplicate,
+    })
   },
 }
 
