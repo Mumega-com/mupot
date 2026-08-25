@@ -252,8 +252,8 @@ export function studioPageHtml(data: StudioViewData): HtmlEscapedString | Promis
               </div>
             </div>
 
-            <pre class="studio-log" id="studio-log" hidden aria-label="Live agent execution log stream">[studio] waiting for dispatch…</pre>
-            <pre class="studio-diff" id="studio-diff" hidden aria-label="Diff viewer">// no diff yet — dispatch a flight to populate this tab</pre>
+            <pre class="studio-log" id="studio-log" aria-label="Live agent execution log stream">[studio] waiting for dispatch…</pre>
+            <pre class="studio-diff" id="studio-diff" aria-label="Diff viewer">// no diff yet — dispatch a flight to populate this tab</pre>
           </div>
         </section>
       </div>
@@ -375,6 +375,12 @@ const STUDIO_CSS = `
   }
   .studio-viewports { margin-left: auto; display: flex; gap: 6px; }
   .studio-stage { flex: 1; min-height: 0; display: flex; }
+  .studio-stage[data-tab="preview"] .studio-log,
+  .studio-stage[data-tab="preview"] .studio-diff,
+  .studio-stage[data-tab="log"] .studio-canvas-frame,
+  .studio-stage[data-tab="log"] .studio-diff,
+  .studio-stage[data-tab="diff"] .studio-canvas-frame,
+  .studio-stage[data-tab="diff"] .studio-log { display: none; }
   .studio-canvas-frame {
     flex: 1; display: flex; justify-content: center; align-items: stretch;
     padding: 8px 0 0;
@@ -455,9 +461,6 @@ const STUDIO_SCRIPT = `
       btn.setAttribute('aria-selected', on ? 'true' : 'false');
     });
     stage.setAttribute('data-tab', name);
-    canvas.parentElement.hidden = name !== 'preview';
-    logEl.hidden = name !== 'log';
-    diffEl.hidden = name !== 'diff';
   }
 
   document.querySelectorAll('.studio-tab').forEach(function (btn) {
