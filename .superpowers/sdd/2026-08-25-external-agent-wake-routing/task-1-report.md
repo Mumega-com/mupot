@@ -8,6 +8,8 @@ Plan/base commit: `33e33e4df3ab09b467815e63774f741ad7ff2f1d`
 
 Implementation commit: `a709770bd49914810ef84fa0fe2c64d2623346dc`
 
+Independent-gate correction commit: `8f0d1068e7fde88246df3f82a593d82f841836d3`
+
 ## Result
 
 Implemented the bounded external-agent wake-routing repair with one shared service used by
@@ -98,6 +100,66 @@ Result:
 no secrets found
 ```
 
+## Independent-gate corrections
+
+The first independent gate identified four bounded defects. They were reproduced before the
+correction commit:
+
+```text
+node scripts/check-test-schema-source.mjs
+npx vitest run tests/wake-routing.test.ts tests/bus-consumer.test.ts
+
+schema source  PASS after replacing the D1-shaped mock with createSqliteD1() plus
+               applyAllMigrations()
+Test Files     1 failed | 1 passed (2)
+Tests          5 failed | 36 passed (41)
+```
+
+The five expected RED failures proved:
+
+1. a cross-squad duplicate slug leaked fallback delivery to the ambiguous slug rather than the
+   canonical UUID;
+2. a rejected AgentDO `fetch()` escaped as HTTP 500 rather than taking durable fallback;
+3. the full canonical inbox did not fail closed because the unsafe slug bypassed it;
+4. the no-fleet fallback used the slug instead of the canonical UUID; and
+5. IM described durable external acceptance as a running synchronous cycle.
+
+The correction keeps the single liveness result for both decisions: a stale but unambiguous
+fleet identity remains the fallback target; an absent/ambiguous fleet identity falls back only
+to the canonical UUID. AgentDO response failures and transport rejections now share that same
+durable fallback. IM reports a running cycle only for `agent_do` and reports durable queueing for
+the inbox routes.
+
+Correction GREEN:
+
+```text
+node scripts/check-test-schema-source.mjs
+npx vitest run tests/wake-routing.test.ts tests/bus-consumer.test.ts
+
+schema source  PASS (baseline unchanged: files 26, mockDb 127)
+Test Files     2 passed (2)
+Tests          41 passed (41)
+```
+
+Relevant correction regressions:
+
+```text
+npx vitest run tests/wake-routing.test.ts tests/bus-consumer.test.ts \
+  tests/im-hermes.test.ts tests/mcp-jsonrpc.test.ts \
+  tests/fleet-agent-liveness.test.ts tests/agent-messages.test.ts
+node scripts/check-test-schema-source.mjs
+npm run typecheck
+node scripts/no-secrets.mjs --root .
+git diff --check
+
+Test Files     6 passed (6)
+Tests          111 passed (111)
+schema source  PASS
+TypeScript     PASS
+no-secrets     PASS
+diff check     PASS
+```
+
 ## Files
 
 - `src/agents/wake-routing.ts` — shared one-route selector, durable envelope, safe fallback,
@@ -122,6 +184,5 @@ no secrets found
 - No deployment, migration, credential, live canary, push, merge, or authority change occurred.
 - No `send`, broadcast, task dispatch, or `flight_dispatch` identity routing was changed or
   claimed solved.
-- Independent review was not performed inside this task because the assignment explicitly
-  prohibited spawning subagents. The exact implementation commit above is ready for the
-  separately owned Kasra/independent gate before any deployment or live canary.
+- Independent review returned the four corrections recorded above. The correction commit is
+  ready for the separately owned re-gate before any deployment or live canary.
