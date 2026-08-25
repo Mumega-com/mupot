@@ -42,17 +42,22 @@ async function deliverWakeEnvelope(
     ...(input.maxActions === undefined ? {} : { maxActions: input.maxActions }),
     idempotency_key: idempotencyKey,
   }
-  const sent = await sendAgentMessage(env, {
-    fromAgent: WAKE_ROUTER_SENDER,
-    fromMember: input.byMemberId,
-    toAgent: target,
-    kind: 'request',
-    body: JSON.stringify(envelope),
-    requestId: idempotencyKey,
-  }, {
-    system: true,
-    reason: 'wake target is resolved server-side from the canonical agent and fleet registry',
-  })
+  let sent: Awaited<ReturnType<typeof sendAgentMessage>>
+  try {
+    sent = await sendAgentMessage(env, {
+      fromAgent: WAKE_ROUTER_SENDER,
+      fromMember: input.byMemberId,
+      toAgent: target,
+      kind: 'request',
+      body: JSON.stringify(envelope),
+      requestId: idempotencyKey,
+    }, {
+      system: true,
+      reason: 'wake target is resolved server-side from the canonical agent and fleet registry',
+    })
+  } catch {
+    return { ok: false, reason: 'wake_failed' }
+  }
   if (!sent.ok) return { ok: false, reason: 'wake_failed' }
   return {
     ok: true,
