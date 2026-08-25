@@ -12,6 +12,8 @@ Independent-gate correction commit: `8f0d1068e7fde88246df3f82a593d82f841836d3`
 
 Final delivery-boundary correction commit: `cb061e318546c088d777d65498a69da2c99d5778`
 
+Evidence-only real-send test commit: `6acd0bdaa1087eef531fc6c0969acf3b46cf1ab1`
+
 ## Result
 
 Implemented the bounded external-agent wake-routing repair with one shared service used by
@@ -169,8 +171,13 @@ The final narrow gate found that `sendAgentMessage` can reject before returning 
 failure result (for example, during a pre-insert dependency read). The rejection previously
 escaped the MCP surface as HTTP 500.
 
-RED used a full `createSqliteD1()` + `applyAllMigrations()` schema and injected only the
-external send dependency rejection:
+The final test uses the real `sendAgentMessage`. It builds the complete schema with
+`createSqliteD1()` + `applyAllMigrations()`, delegates normal D1 statements to that migrated
+harness, and injects rejection only at the exact `agent_messages` sender/request-id precheck
+(`from_agent = ?2 AND request_id = ?3`) that the real service executes before insert.
+
+RED was proven in a temporary detached mutation worktree containing this exact test. Removing
+only `deliverWakeEnvelope`'s rejection containment produced:
 
 ```text
 npx vitest run tests/wake-routing-send-rejection.test.ts
@@ -179,6 +186,9 @@ Test Files  1 failed (1)
 Tests       1 failed (1)
 Observed    HTTP 500 instead of fixed HTTP 409 wake_failed
 ```
+
+The untouched candidate then ran the same test GREEN with HTTP 409, one observed real precheck
+attempt, and neither the injected migrated-DB detail nor the AgentDO body in the MCP response.
 
 `deliverWakeEnvelope` now contains any rejected send and returns the same fixed
 `{ok:false, reason:'wake_failed'}` contract as a typed send failure, without exposing raw
@@ -227,7 +237,7 @@ diff check      PASS
 - `src/bus/consumer.ts` — acknowledges `already_routed=true` observations without execution.
 - `tests/wake-routing.test.ts` — MCP and IM branch/field/failure coverage.
 - `tests/wake-routing-send-rejection.test.ts` — migrated-schema MCP proof for a rejected
-  pre-insert durable-send dependency.
+  real `sendAgentMessage` sender/request-id precheck; no production-module mock.
 - `tests/bus-consumer.test.ts` — no-double-action and generic-wake regression coverage.
 
 ## Risks and review boundary
