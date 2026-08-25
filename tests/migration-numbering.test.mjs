@@ -56,6 +56,23 @@ test('an added migration above the target head passes', () => {
   assert.equal(v.detail.head, 79)
 })
 
+test('Flight 3 reserves consecutive 0127 and 0128 strictly above a 0126 target', () => {
+  const target = ['0125_mutation_host_control_audit.sql', '0126_decision_requests.sql']
+  const local = [
+    ...target,
+    '0127_runtime_brokers.sql',
+    '0128_fenced_deliveries.sql',
+  ]
+  const v = evaluate(target, local)
+  assert.equal(v.ok, true)
+  assert.equal(v.reason, 'above_target_head')
+  assert.equal(v.detail.head, 126)
+  assert.deepEqual(v.detail.added, [
+    '0127_runtime_brokers.sql',
+    '0128_fenced_deliveries.sql',
+  ])
+})
+
 test('THE PRODUCTION CASE: an added migration at a free slot BELOW the head fails', () => {
   // Slot 0076 is empty on main (it jumps 0075 -> 0077) and four open PRs each claim it.
   // "The slot is free" is the intuition that makes this defect feel safe, and it is exactly
