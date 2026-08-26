@@ -53,6 +53,7 @@ import { McpOAuthApiHandler } from './mcp/oauth-api-handler'
 import { brainPhysicsIngestApp } from './dashboard/brain-ingest'
 import { billingAdminApp } from './billing/admin'
 import { billingRoutesApp } from './billing/routes'
+import { alertsApp } from './alerts/routes'
 import { ccSpendApp } from './economy/cc-spend'
 import { resellerApp } from './reseller/routes'
 import { potsApp } from './pots/routes'
@@ -122,6 +123,8 @@ app.route('/api/webhooks', supabaseWebhookApp)
 // Stripe Customer Billing & Inbound Webhooks:
 app.route('/api/billing', billingRoutesApp)
 app.route('/webhooks/stripe', billingRoutesApp)
+// Outbound Alert Webhooks:
+app.route('/api/alerts', alertsApp)
 app.route('/api/prospects', prospectsApp)
 app.route('/api/loops', loopsApp)
 // Flock check-in (Flock #45): agents POST presence with their member-token (bearer).
