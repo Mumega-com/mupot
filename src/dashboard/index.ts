@@ -239,12 +239,20 @@ import { makeMissionControlApp } from './mission-control-routes'
 export { controlTowerBody, potFleetBody } from './mission-control-views'
 import { getAuthContext, loadStudioData, studioPageHtml, dispatchStudioFlight } from './studio'
 import {
+<<<<<<< HEAD
+  copilotDrawerCss,
+  copilotPageBody,
+  copilotShellEmbed,
+  readStudioChatPayload,
+  streamStudioChat,
+=======
   COPILOT_CSS,
   COPILOT_SCRIPT,
   copilotDrawerMarkup,
   copilotPageBody,
   copilotSseResponse,
   parseCopilotChatBody,
+>>>>>>> main
 } from './copilot'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
@@ -3945,7 +3953,11 @@ export function shell(
       }
 
       /* ── /approvals page styles (kept here to avoid duplication) ── */
+<<<<<<< HEAD
+      ${raw(copilotDrawerCss())}
+=======
       ${raw(COPILOT_CSS)}
+>>>>>>> main
     </style>
   </head>
   <body>
@@ -4023,7 +4035,11 @@ export function shell(
           </a>
 
           <a class="nav-link" href="/copilot">
+<<<<<<< HEAD
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M10 3.2 12.1 7l4.2.7-3 3 .7 4.2L10 13.1 6 14.9l.7-4.2-3-3 4.2-.7z"/></svg>
+=======
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M4.2 13.6V6.4A2.2 2.2 0 0 1 6.4 4.2h7.2A2.2 2.2 0 0 1 15.8 6.4v4.2a2.2 2.2 0 0 1-2.2 2.2H8.1L4.2 15.8z"/><path d="M7 8.4h6M7 10.8h3.4"/></svg>
+>>>>>>> main
             <span class="nav-label">Co-Pilot</span>
           </a>
 
@@ -4302,7 +4318,11 @@ export function shell(
 
       })();
     </script>
+<<<<<<< HEAD
+    ${copilotShellEmbed()}
+=======
     <script>${raw(COPILOT_SCRIPT)}</script>
+>>>>>>> main
   </body>
 </html>`
 }
