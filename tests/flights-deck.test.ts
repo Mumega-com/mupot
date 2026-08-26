@@ -188,6 +188,8 @@ describe('flightsBody — KPI cards, table, badges, artifacts', () => {
     expect(out).toContain('id="fd-repo-select"')
     expect(out).toContain('id="fd-repo-custom-wrap" hidden')
     expect(out).toContain('data-copilot-open')
+    expect(out).toContain("event.key !== 'Escape'")
+    expect(out).not.toContain('.fd-cell-pipe, .fd-table th:nth-child(3) { display: none; }')
     expect(out).toContain('id="fd-search"')
     expect(out).toContain('Search goal, squad, or agent')
     expect(out).toContain('data-fd-tab="all"')

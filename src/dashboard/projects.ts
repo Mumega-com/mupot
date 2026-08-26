@@ -1004,8 +1004,9 @@ function situationTone(health: ProjectHealth): 'ok' | 'warn' | 'danger' | 'dim' 
   return 'primary'
 }
 
-function situationCount(value: number, truncated: boolean): string {
-  return `${value}${truncated ? '+' : ''}`
+function situationCount(value: number | undefined, truncated?: boolean): string {
+  const n = typeof value === 'number' && Number.isFinite(value) ? value : 0
+  return `${n}${truncated ? '+' : ''}`
 }
 
 function operatingSituationBand(
@@ -1309,6 +1310,9 @@ function newProjectWorkerModal(): Html {
         });
         modal.addEventListener('click', function (event) {
           if (event.target === modal) closeModal();
+        });
+        document.addEventListener('keydown', function (event) {
+          if (event.key === 'Escape' && !modal.hasAttribute('hidden')) closeModal();
         });
         nameInput.addEventListener('input', function () {
           if (!slugTouched) slugInput.value = slugFromName(nameInput.value);

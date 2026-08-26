@@ -436,7 +436,10 @@ describe('Athena receipts on /verifications', () => {
         pr_number: 42,
         commit_sha: 'abc123def4567890',
         verdict: 'APPROVED',
-        checks_json: '[]',
+        checks_json: JSON.stringify([
+          { id: 'no_hardcoded_secrets', name: 'No hardcoded secrets', passed: true },
+          { id: 'verified_unit_tests', name: 'Verified unit tests', passed: false },
+        ]),
         summary: 'Athena APPROVED Greet helper',
         created_at: '2026-08-26T12:00:00.000Z',
       },
@@ -444,6 +447,9 @@ describe('Athena receipts on /verifications', () => {
     expect(html).toContain('Athena PR gate audits')
     expect(html).toContain('Mumega-com/mupot')
     expect(html).toContain('APPROVED')
+    expect(html).toContain('CHECKS')
+    expect(html).toContain('✓ No hardcoded secrets')
+    expect(html).toContain('✗ Verified unit tests')
     expect(html).toContain('Athena APPROVED Greet helper')
   })
 })

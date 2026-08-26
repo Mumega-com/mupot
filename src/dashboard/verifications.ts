@@ -208,6 +208,41 @@ function shortSha(sha: string): string {
   return sha.length > 7 ? sha.slice(0, 7) : sha
 }
 
+export interface AthenaCheckBadge {
+  name: string
+  passed: boolean
+}
+
+export function parseAthenaGateChecks(raw: string): AthenaCheckBadge[] {
+  try {
+    const parsed = JSON.parse(raw) as unknown
+    if (!Array.isArray(parsed)) return []
+    return parsed
+      .filter((item): item is Record<string, unknown> => !!item && typeof item === 'object')
+      .map((item) => ({
+        name:
+          typeof item.name === 'string' && item.name.trim()
+            ? item.name
+            : typeof item.id === 'string'
+              ? item.id
+              : 'check',
+        passed: item.passed === true,
+      }))
+  } catch {
+    return []
+  }
+}
+
+function checkBadges(checksJson: string): HtmlEscapedString {
+  const checks = parseAthenaGateChecks(checksJson)
+  if (!checks.length) {
+    return html`<span style="color:var(--dim)">—</span>` as HtmlEscapedString
+  }
+  return html`<span style="display:flex;flex-wrap:wrap;gap:6px;">${checks.map((check) =>
+    pill(check.passed ? `✓ ${check.name}` : `✗ ${check.name}`, check.passed ? 'ok' : 'danger'),
+  )}</span>` as HtmlEscapedString
+}
+
 /**
  * Recent Athena GitHub webhook gate receipts — append-only audit of
  * `POST /api/webhooks/github` verdicts.
@@ -216,6 +251,7 @@ export function athenaGateReceiptsBody(receipts: AthenaGateReceipt[]): HtmlEscap
   const rows = receipts.map((item): HtmlEscapedString[] => [
     html`<span>${item.repo}</span><br /><small style="color:var(--dim)">#${String(item.pr_number)} @ ${shortSha(item.commit_sha)}</small>` as HtmlEscapedString,
     pill(item.verdict, verdictTone(item.verdict)) as HtmlEscapedString,
+    checkBadges(item.checks_json),
     html`${item.summary}` as HtmlEscapedString,
     html`${fmtWhen(item.created_at)}` as HtmlEscapedString,
   ])
@@ -223,7 +259,8 @@ export function athenaGateReceiptsBody(receipts: AthenaGateReceipt[]): HtmlEscap
   const table = dataTable({
     cols: [
       { label: 'PR', width: '1.4fr' },
-      { label: 'VERDICT', width: '180px' },
+      { label: 'VERDICT', width: '140px' },
+      { label: 'CHECKS', width: '1.6fr' },
       { label: 'SUMMARY', width: '2fr' },
       { label: 'WHEN', width: '180px' },
     ],

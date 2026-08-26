@@ -38,6 +38,7 @@ const {
   resolveCopilotAuthority,
   composeCopilotReply,
   DEEP_CHAT_REQUEST,
+  DEEP_CHAT_CONNECT,
   DEEP_CHAT_IMAGES,
   DEEP_CHAT_SPEECH,
   DEEP_CHAT_STYLE,
@@ -87,8 +88,9 @@ describe('Deep Chat markup', () => {
   it('renders the <deep-chat> custom element with vision, voice, and stream props', async () => {
     const markup = await markupOf(copilotDeepChatMarkup())
     expect(markup).toContain('<deep-chat')
-    expect(markup).toContain(`request='${JSON.stringify(DEEP_CHAT_REQUEST)}'`)
-    expect(markup).toContain('stream="true"')
+    expect(markup).toContain(`connect='${JSON.stringify(DEEP_CHAT_CONNECT)}'`)
+    expect(markup).not.toContain('request=')
+    expect(markup).not.toContain('stream="true"')
     expect(markup).toContain(`images='${JSON.stringify(DEEP_CHAT_IMAGES)}'`)
     expect(markup).toContain(`speechToText='${JSON.stringify(DEEP_CHAT_SPEECH)}'`)
     expect(markup).toContain(`textToSpeech='${JSON.stringify(DEEP_CHAT_SPEECH)}'`)

@@ -38,11 +38,15 @@ export interface ProjectPreviewSplitInput {
   prs?: { title: string; repo: string; pr_number: number }[]
 }
 
-const VIEWPORTS = [
-  { id: 'desktop', label: 'Desktop' },
-  { id: 'tablet', label: 'Tablet' },
-  { id: 'mobile', label: 'Mobile' },
+export const SANDBOX_VIEWPORTS = [
+  { id: 'desktop', label: '🖥️ Desktop' },
+  { id: 'tablet', label: '📟 Tablet' },
+  { id: 'mobile', label: '📱 Mobile' },
 ] as const
+
+/** 768px / 375px at the 16px root — keep rem so the canvas stays relative. */
+export const SANDBOX_TABLET_MAX_WIDTH = '48rem'
+export const SANDBOX_MOBILE_MAX_WIDTH = '23.4375rem'
 
 export function projectLivePreviewSplitHtml(input: ProjectPreviewSplitInput): HtmlEscapedString {
   const { project } = input
@@ -96,10 +100,13 @@ export function projectLivePreviewSplitHtml(input: ProjectPreviewSplitInput): Ht
       .project-preview-split .pane { min-width: 0; overflow-wrap: anywhere; display: grid; gap: 8px; }
       .project-preview-split .preview-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
       .project-preview-split .viewport-toggles { display: flex; flex-wrap: wrap; gap: 6px; }
+      .project-preview-split .viewport-toggles [aria-pressed="true"] {
+        background: var(--primary-soft, #f7f1dd); color: var(--primary); border-color: color-mix(in srgb, var(--primary) 35%, var(--border));
+      }
       .project-preview-split .preview-frame-wrap { min-width: 0; display: flex; justify-content: center; }
       .project-preview-split iframe { width: 100%; min-height: 28rem; border: 1px solid var(--border); border-radius: 12px; background: #0f1419; transition: max-width .18s ease; }
-      .project-preview-split[data-viewport="tablet"] iframe { max-width: 48rem; }
-      .project-preview-split[data-viewport="mobile"] iframe { max-width: 24.375rem; }
+      .project-preview-split[data-viewport="tablet"] iframe { max-width: ${SANDBOX_TABLET_MAX_WIDTH}; }
+      .project-preview-split[data-viewport="mobile"] iframe { max-width: ${SANDBOX_MOBILE_MAX_WIDTH}; }
       .project-preview-split ul { margin: 0; padding-left: 18px; display: grid; gap: 4px; }
       .project-preview-split .quick-prompts { display: flex; flex-wrap: wrap; gap: 6px; }
       .project-preview-split .sandbox-stream { display: grid; gap: 8px; }
@@ -113,13 +120,23 @@ export function projectLivePreviewSplitHtml(input: ProjectPreviewSplitInput): Ht
       <div class="preview-toolbar">
         <h2 class="ui-panel-title" style="margin:0;">Live preview</h2>
         <div class="viewport-toggles" role="group" aria-label="Device viewport">
-          ${VIEWPORTS.map((viewport) => html`<button
+          ${SANDBOX_VIEWPORTS.map((viewport) => html`<button
             type="button"
             class="btn secondary sm"
             data-viewport-toggle="${viewport.id}"
             aria-pressed="${viewport.id === 'desktop' ? 'true' : 'false'}"
           >${viewport.label}</button>`)}
-          <button type="button" class="btn sm" data-preview-refresh>Refresh</button>
+          <button type="button" class="btn sm" data-preview-refresh>Refresh Preview</button>
+          <a
+            class="btn secondary sm"
+            data-preview-external
+            href="${project.live_url || iframeSrc}"
+            target="_blank"
+            rel="noopener noreferrer"
+            aria-label="Open preview in a new tab"
+            title="Open preview in a new tab"
+          >↗</a>
+          <span class="ui-panel-sub" data-viewport-size>Desktop · 100%</span>
         </div>
       </div>
       <p class="ui-panel-sub">Project sub-worker via <code>/preview/${project.id}/</code>. Building or idle workers render a fallback page.</p>
@@ -183,6 +200,9 @@ export function projectLivePreviewSplitHtml(input: ProjectPreviewSplitInput): Ht
             root.querySelectorAll('[data-viewport-toggle]').forEach(function (other) {
               other.setAttribute('aria-pressed', other === btn ? 'true' : 'false');
             });
+            var sizes = { desktop: 'Desktop · 100%', tablet: 'Tablet · 768px', mobile: 'Mobile · 375px' };
+            var size = root.querySelector('[data-viewport-size]');
+            if (size) size.textContent = sizes[next] || sizes.desktop;
           });
         });
         var refresh = root.querySelector('[data-preview-refresh]');
