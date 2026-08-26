@@ -184,7 +184,7 @@ function chatPanel(opts: {
           <p>Ready. Ask about projects, flights, approvals, Studio, or how this pot is wired. Answers stream token by token.</p>
         </article>
       </div>
-      <form class="copilot-composer" data-copilot-form>
+      <div class="copilot-composer" data-copilot-form>
         <label class="copilot-sr" for="${opts.inputId}">Message Co-Pilot</label>
         <textarea
           id="${opts.inputId}"
@@ -193,10 +193,9 @@ function chatPanel(opts: {
           rows="2"
           maxlength="${String(COPILOT_MAX_MESSAGE_CHARS)}"
           placeholder="Ask Co-Pilot…"
-          required
         ></textarea>
-        <button type="submit" class="copilot-send" id="${opts.sendId}" data-copilot-send>Send</button>
-      </form>
+        <button type="button" class="copilot-send" id="${opts.sendId}" data-copilot-send>Send</button>
+      </div>
     </div>`
 }
 
@@ -552,11 +551,10 @@ export const COPILOT_SCRIPT = `
     var input = root.querySelector('[data-copilot-input]');
     var send = root.querySelector('[data-copilot-send]');
     var list = root.querySelector('[data-copilot-messages]');
-    if (!form || !input || !list) return;
+    if (!form || !input || !send || !list) return;
     root.setAttribute('data-copilot-bound', '1');
 
-    form.addEventListener('submit', function (e) {
-      e.preventDefault();
+    function sendMessage() {
       var message = (input.value || '').trim();
       if (!message || send.disabled) return;
       var hist = historyFrom(list);
@@ -573,12 +571,13 @@ export const COPILOT_SCRIPT = `
           send.disabled = false;
           input.focus();
         });
-    });
+    }
 
+    send.addEventListener('click', sendMessage);
     input.addEventListener('keydown', function (e) {
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
-        form.requestSubmit();
+        sendMessage();
       }
     });
   }
