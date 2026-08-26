@@ -5,13 +5,14 @@
 export const CURSOR_CLOUD_SEAT = 'cursor-builder'
 export const CURSOR_CLOUD_HARNESS = 'cursor-cloud'
 export const CURSOR_CLOUD_MODEL = 'claude-3-7-sonnet'
+export const CURSOR_CLOUD_PROVIDER = 'anthropic'
 export const CURSOR_CLOUD_EFFORT = 'high'
 export const CURSOR_CLOUD_MACHINE = 'cursor-cloud-vm'
 
 const SEAT_IDENTITY_MARKER = 'Identity: You are Cursor Cloud Flight Agent.'
 
-export function sevenAxisCheckInDeclaration(flightId: string): string {
-  return `${SEAT_IDENTITY_MARKER} On start, invoke check_in({ seat: "${CURSOR_CLOUD_SEAT}", harness: "${CURSOR_CLOUD_HARNESS}", model: "${CURSOR_CLOUD_MODEL}", effort: "${CURSOR_CLOUD_EFFORT}", machine: "${CURSOR_CLOUD_MACHINE}", flight_id: "${flightId}" })`
+export function sevenAxisCheckInDeclaration(flightId: string, seat = CURSOR_CLOUD_SEAT): string {
+  return `${SEAT_IDENTITY_MARKER} On start, invoke check_in({ seat: "${seat}", harness: "${CURSOR_CLOUD_HARNESS}", machine: "${CURSOR_CLOUD_MACHINE}", model: "${CURSOR_CLOUD_MODEL}", provider: "${CURSOR_CLOUD_PROVIDER}", effort: "${CURSOR_CLOUD_EFFORT}", flight_id: "${flightId}" })`
 }
 
 /** Prepend the exact 7-axis seat declaration. Idempotent if already injected. */
