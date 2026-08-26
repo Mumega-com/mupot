@@ -11,6 +11,12 @@ import { isOrgAdmin, resolveCapabilities } from '../auth/capability'
 import { bearerToken, resolveMemberByToken } from '../auth/member-bearer'
 import { createModel } from '../model'
 import type { AuthContext, Env, ModelMessage } from '../types'
+import {
+  buildCopilotPersonaPrompt,
+  copilotRecipientDef,
+  normalizeCopilotRecipient,
+  type CopilotRecipientId,
+} from './copilot'
 
 export const STUDIO_CHAT_ADMIN_TOOLS = [
   'squad_create',
@@ -42,7 +48,7 @@ export interface StudioChatTurn {
 }
 
 export type StudioChatEvent =
-  | { type: 'meta'; role: StudioChatRole; tools: readonly string[]; tenant: string; guest: boolean }
+  | { type: 'meta'; agent: CopilotRecipientId; role: StudioChatRole; tools: readonly string[]; tenant: string; guest: boolean }
   | { type: 'token'; text: string }
   | { type: 'proposal'; action: 'launch_cloud_build' }
   | { type: 'done' }
@@ -166,7 +172,10 @@ export async function loadStudioChatContext(env: Env): Promise<{ squads: string[
 export function buildStudioChatSystemPrompt(
   authority: StudioChatAuthority,
   context: { squads: string[] },
+  recipient: CopilotRecipientId | string = 'copilot',
 ): string {
+  const persona = buildCopilotPersonaPrompt(recipient)
+  const def = copilotRecipientDef(recipient)
   const squads = context.squads.length ? context.squads.join(', ') : '(none listed yet)'
   const tools = authority.role === 'admin'
     ? authority.tools.join(', ')
@@ -185,7 +194,8 @@ export function buildStudioChatSystemPrompt(
       ].join(' ')
 
   return [
-    'You are the Mupot Co-Pilot — the always-on operator assistant inside Mupot Studio.',
+    persona,
+    `Speaking as ${def.badge} (${def.handle} — ${def.title}).`,
     `Tenant: ${authority.tenant}. Operator: ${authority.operator} (${authority.guest ? 'guest' : authority.source}).`,
     `Active squads: ${squads}.`,
     `Authority: ${authority.role}. Tools: ${tools}.`,
@@ -195,21 +205,23 @@ export function buildStudioChatSystemPrompt(
 }
 
 export function parseStudioChatInput(body: unknown):
-  | { ok: true; messages: StudioChatTurn[]; userText: string }
+  | { ok: true; messages: StudioChatTurn[]; userText: string; recipient: CopilotRecipientId }
   | { ok: false; error: 'invalid_json' | 'message_required' } {
   if (body === null || typeof body !== 'object' || Array.isArray(body)) {
     return { ok: false, error: 'invalid_json' }
   }
   const rec = body as Record<string, unknown>
   const messages: StudioChatTurn[] = []
-  if (Array.isArray(rec.messages)) {
-    for (const item of rec.messages) {
-      if (!item || typeof item !== 'object') continue
-      const role = (item as { role?: unknown }).role
-      const content = (item as { content?: unknown }).content
-      if ((role === 'user' || role === 'assistant') && typeof content === 'string' && content.trim()) {
-        messages.push({ role, content: content.trim().slice(0, 8000) })
-      }
+  const historyOrMessages = [
+    ...(Array.isArray(rec.history) ? rec.history : []),
+    ...(Array.isArray(rec.messages) ? rec.messages : []),
+  ]
+  for (const item of historyOrMessages) {
+    if (!item || typeof item !== 'object') continue
+    const role = (item as { role?: unknown }).role
+    const content = (item as { content?: unknown }).content
+    if ((role === 'user' || role === 'assistant') && typeof content === 'string' && content.trim()) {
+      messages.push({ role, content: content.trim().slice(0, 8000) })
     }
   }
   const single =
@@ -224,30 +236,41 @@ export function parseStudioChatInput(body: unknown):
   }
   const lastUser = [...messages].reverse().find((turn) => turn.role === 'user')
   if (!lastUser) return { ok: false, error: 'message_required' }
-  return { ok: true, messages, userText: lastUser.content }
+  return { ok: true, messages, userText: lastUser.content, recipient: normalizeCopilotRecipient(rec.recipient) }
 }
 
 export function encodeStudioChatSse(event: StudioChatEvent): string {
   return `data: ${JSON.stringify(event)}\n\n`
 }
 
-export function fallbackStudioChatReply(authority: StudioChatAuthority, userText: string): string {
+export function fallbackStudioChatReply(
+  authority: StudioChatAuthority,
+  userText: string,
+  recipient: CopilotRecipientId | string = 'copilot',
+): string {
+  const def = copilotRecipientDef(recipient)
+  const voice =
+    def.id === 'copilot'
+      ? 'Mupot Co-Pilot'
+      : `${def.badge} — ${def.title}`
   if (authority.role === 'member') {
     if (MUTATION_RE.test(userText)) {
       return (
-        'I am running as member / guest (read-only). ' +
+        `I am ${voice}, running as member / guest (read-only). ` +
         'I cannot run squad_create, cursor_dispatch, task_create, or loop_control. ' +
         'Ask an admin to launch that work.'
       )
     }
     return (
-      `Mupot Co-Pilot — member / guest scope on tenant ${authority.tenant}. ` +
+      `${voice} — member / guest scope on tenant ${authority.tenant}. ` +
+      `I am speaking as ${def.handle}. ` +
       'I can answer questions and draft prompts, but I cannot mutate the pot.'
     )
   }
   const proposal = MUTATION_RE.test(userText) ? ' [[studio:launch-cloud-build]]' : ''
   return (
-    `Mupot Co-Pilot — admin authority on tenant ${authority.tenant}. ` +
+    `${voice} — admin authority on tenant ${authority.tenant}. ` +
+    `I am speaking as ${def.handle} (${def.title}). ` +
     `Tools available: ${authority.tools.join(', ')}. ` +
     'I can create squads, dispatch Cursor Cloud, open tasks, and govern loops.' +
     proposal
@@ -306,6 +329,7 @@ async function* tokensFromAiResult(result: unknown): AsyncGenerator<string> {
 function sseStreamFromTokens(
   authority: StudioChatAuthority,
   tokens: AsyncIterable<string>,
+  recipient: CopilotRecipientId = 'copilot',
 ): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder()
   return new ReadableStream<Uint8Array>({
@@ -315,6 +339,7 @@ function sseStreamFromTokens(
       }
       enqueue({
         type: 'meta',
+        agent: recipient,
         role: authority.role,
         tools: authority.tools,
         tenant: authority.tenant,
@@ -367,9 +392,10 @@ export async function streamStudioChat(
   authority: StudioChatAuthority,
   turns: StudioChatTurn[],
   userText: string,
+  recipient: CopilotRecipientId = 'copilot',
 ): Promise<ReadableStream<Uint8Array>> {
   const context = await loadStudioChatContext(env)
-  const system = buildStudioChatSystemPrompt(authority, context)
+  const system = buildStudioChatSystemPrompt(authority, context, recipient)
   const messages: ModelMessage[] = [
     { role: 'system', content: system },
     ...turns.map((turn) => ({ role: turn.role, content: turn.content })),
@@ -379,20 +405,24 @@ export async function streamStudioChat(
     for (const model of STUDIO_CHAT_MODELS) {
       try {
         const result = await runWorkersAiStream(env, model, messages, authority)
-        return sseStreamFromTokens(authority, tokensFromAiResult(result))
+        return sseStreamFromTokens(authority, tokensFromAiResult(result), recipient)
       } catch {
         // try the next model, then the non-stream LLM fallback
       }
     }
     try {
       const text = await createModel(env).chat(messages)
-      if (text.trim()) return sseStreamFromTokens(authority, fallbackTokens(text))
+      if (text.trim()) return sseStreamFromTokens(authority, fallbackTokens(text), recipient)
     } catch {
       // local fallback below
     }
   }
 
-  return sseStreamFromTokens(authority, fallbackTokens(fallbackStudioChatReply(authority, userText)))
+  return sseStreamFromTokens(
+    authority,
+    fallbackTokens(fallbackStudioChatReply(authority, userText, recipient)),
+    recipient,
+  )
 }
 
 export async function handleStudioChat(
@@ -408,7 +438,7 @@ export async function handleStudioChat(
   const parsed = parseStudioChatInput(body)
   if (!parsed.ok) return c.json({ error: parsed.error }, 400)
 
-  const stream = await streamStudioChat(c.env, authority, parsed.messages, parsed.userText)
+  const stream = await streamStudioChat(c.env, authority, parsed.messages, parsed.userText, parsed.recipient)
   return new Response(stream, {
     status: 200,
     headers: {
