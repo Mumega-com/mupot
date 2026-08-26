@@ -234,6 +234,7 @@ import '../departments/modules/agency' // side-effect: register AgencyModule (re
 import '../departments/modules/web-ops' // side-effect: register WebOpsModule (AI website-operations team — the wedge)
 import { makeMissionControlApp } from './mission-control-routes'
 export { controlTowerBody, potFleetBody } from './mission-control-views'
+import { getAuthContext, loadStudioData, studioPageHtml, dispatchStudioFlight } from './studio'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
@@ -1259,6 +1260,31 @@ dashboardApp.get('/flights', async (c) => {
     : { rows: await listFlights(c.env), scanLimited: false }
   const cards = buildBoard(result.rows, Date.now())
   return c.html(shell(c.env, 'Flights', flightsBody(cards, context?.project, result.scanLimited)))
+})
+
+// GET /studio — Lovable/Claude Design split-pane canvas (session auth).
+dashboardApp.get('/studio', async (c) => {
+  const auth = getAuthContext(c)
+  const data = await loadStudioData(c.env, auth)
+  return c.html(studioPageHtml(data))
+})
+
+// POST /api/studio/dispatch — create a flight + task from a Studio prompt.
+dashboardApp.post('/api/studio/dispatch', async (c) => {
+  const auth = getAuthContext(c)
+  let body: { prompt?: unknown; repoUrl?: unknown; model?: unknown }
+  try {
+    body = (await c.req.json()) as { prompt?: unknown; repoUrl?: unknown; model?: unknown }
+  } catch {
+    return c.json({ error: 'invalid_json' }, 400)
+  }
+  const result = await dispatchStudioFlight(c.env, auth, {
+    prompt: typeof body.prompt === 'string' ? body.prompt : '',
+    repoUrl: typeof body.repoUrl === 'string' ? body.repoUrl : undefined,
+    model: typeof body.model === 'string' ? body.model : undefined,
+  })
+  if (!result.ok) return c.json({ error: result.error }, result.status)
+  return c.json(result.result)
 })
 
 // ── radar (visual fleet + squad awareness — #21 slice 1, VIEW LAYER ONLY) ────
@@ -3955,6 +3981,11 @@ export function shell(
             <span class="nav-badge" id="approvals-badge" style="display:none;">0</span>
           </a>
 
+          <a class="nav-link" href="/studio">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><rect x="3.4" y="4.2" width="5.4" height="11.6" rx="1.2"/><rect x="11.2" y="4.2" width="5.4" height="11.6" rx="1.2"/></svg>
+            <span class="nav-label">Studio</span>
+          </a>
+
           <!-- Organization (collapsible) -->
           <div class="nav-section">
             <button class="nav-section-toggle" data-section="org" onclick="navToggle('org')">
@@ -3978,6 +4009,7 @@ export function shell(
             <div class="nav-children" id="children-work">
               <a class="nav-child" href="/dashboard/kanban">Kanban board</a>
               <a class="nav-child" href="/send">Tasks</a>
+              <a class="nav-child" href="/studio">Studio</a>
               <a class="nav-child" href="/flights">Flights</a>
               <a class="nav-child" href="/verifications">Verifications</a>
             </div>
