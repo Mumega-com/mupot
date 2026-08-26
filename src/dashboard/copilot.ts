@@ -330,7 +330,7 @@ export async function streamStudioChat(
       }
       try {
         enqueue({ type: 'meta', agent: request.recipient, role: authority, text: '' })
-        for (const chunk of chunkCopilotReply(reply)) {
+        for (const chunk of chunkCopilotReply(reply, 512)) {
           enqueue({ text: chunk, type: 'token' })
         }
         enqueue({ type: 'done', source: modelText ? 'model' : 'fallback', done: true, text: '' })
@@ -381,10 +381,11 @@ export function copilotRecipientSelectHtml(selectId: string): Html {
       html`<option value="${agent.id}" data-color="${agent.color}" data-letter="${agent.letter}">${agent.handle} — ${agent.title}</option>`,
   )
   return html`<label class="mupot-copilot-recipient">
+    <span class="copilot-recipient" hidden></span>
     <span class="mupot-copilot-avatar" data-copilot-avatar aria-hidden="true">C</span>
     <select
       id="${selectId}"
-      class="mupot-copilot-recipient-select copilot-recipient"
+      class="mupot-copilot-recipient-select"
       data-copilot-recipient
       data-copilot-storage-key="${COPILOT_RECIPIENT_STORAGE_KEY}"
       aria-label="Chat recipient"
@@ -756,6 +757,9 @@ function currentRecipient() {
 }
 
 window.mupotOpenCopilot = function () { setDrawerOpen(true); };
+document.querySelectorAll('[data-copilot-open]').forEach(function (btn) {
+  btn.addEventListener('click', function () { setDrawerOpen(true); });
+});
 
 function setDrawerOpen(open) {
   var drawer = document.getElementById('mupot-copilot-drawer');
