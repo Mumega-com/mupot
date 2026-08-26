@@ -8,6 +8,8 @@
 //   GET /                  org overview (dept → squad → agent tree)
 //   GET /squads/:id        squad board (charter + agents + tasks)
 //   GET /agents/:id        agent console (status + a 'wake' button)
+//   GET /copilot, /chat    dedicated Co-Pilot page (drawer also lives in shell())
+//   POST /api/studio/chat  SSE token stream for Co-Pilot
 //
 // Auth: gated by requireAuth. Because these are HTML pages (not an API),
 // unauthenticated requests are REDIRECTED to /auth/login rather than handed a
@@ -201,8 +203,9 @@ import { wakeFleetAgent, requestFleetControl, fleetScoped } from './fleet'
 import { emitControlRequest, emitSquadControlRequest } from '../fleet/control'
 import { listFlights } from '../flight/service'
 import { buildBoard } from '../flight/board'
-import type { FlightCard } from '../flight/board'
+import { flightsBody } from './flights-deck'
 import { wizardApp } from './wizard'
+import { studioApp } from './studio'
 import { isOnboardingComplete } from './settings'
 import { loadBrainView, brainBody, regimeBadgeClass, loadBrainPhysics } from './brain'
 import type { PhysicsSnapshot } from './brain'
@@ -236,11 +239,20 @@ import { makeMissionControlApp } from './mission-control-routes'
 export { controlTowerBody, potFleetBody } from './mission-control-views'
 import { getAuthContext, loadStudioData, studioPageHtml, dispatchStudioFlight } from './studio'
 import {
+<<<<<<< HEAD
   copilotDrawerCss,
   copilotPageBody,
   copilotShellEmbed,
   readStudioChatPayload,
   streamStudioChat,
+=======
+  COPILOT_CSS,
+  COPILOT_SCRIPT,
+  copilotDrawerMarkup,
+  copilotPageBody,
+  copilotSseResponse,
+  parseCopilotChatBody,
+>>>>>>> main
 } from './copilot'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
@@ -384,6 +396,7 @@ dashboardApp.use('*', async (c, next) => {
 // Mounted on the authenticated, tenant-guarded dashboard app. The wizard enforces
 // its own owner-only gate (org role 'owner' OR org-capability 'owner') internally.
 dashboardApp.route('/setup', wizardApp)
+dashboardApp.route('/api/studio', studioApp)
 
 // ── routes ───────────────────────────────────────────────────────────────────
 
@@ -1265,8 +1278,9 @@ dashboardApp.get('/flights', async (c) => {
   const result = context
     ? await loadProjectFlights(c.env, context)
     : { rows: await listFlights(c.env), scanLimited: false }
-  const cards = buildBoard(result.rows, Date.now())
-  return c.html(shell(c.env, 'Flights', flightsBody(cards, context?.project, result.scanLimited)))
+  const nowMs = Date.now()
+  const cards = buildBoard(result.rows, nowMs)
+  return c.html(shell(c.env, 'Flights', flightsBody(cards, context?.project, result.scanLimited, nowMs)))
 })
 
 // GET /studio — Lovable/Claude Design split-pane canvas (session auth).
@@ -1294,18 +1308,25 @@ dashboardApp.post('/api/studio/dispatch', async (c) => {
   return c.json(result.result)
 })
 
-// GET /copilot and GET /chat — full-height Deep Chat card (session auth).
-dashboardApp.get('/copilot', async (c) => c.html(shell(c.env, 'Co-Pilot', copilotPageBody())))
-dashboardApp.get('/chat', async (c) => c.html(shell(c.env, 'Co-Pilot', copilotPageBody())))
+// GET /copilot + /chat — dedicated full-page Co-Pilot (same chat as the drawer).
+dashboardApp.get('/copilot', async (c) => {
+  return c.html(shell(c.env, 'Co-Pilot', copilotPageBody(c.get('auth'))))
+})
+dashboardApp.get('/chat', async (c) => {
+  return c.html(shell(c.env, 'Co-Pilot', copilotPageBody(c.get('auth'))))
+})
 
-// POST /api/studio/chat — Deep Chat SSE stream. Accepts { messages, recipient }
-// and the shorter { message, recipient } body. Authority is derived from the
-// signed-in session (admin vs member), never from the request body.
+// POST /api/studio/chat — SSE token stream for the Co-Pilot drawer and page.
 dashboardApp.post('/api/studio/chat', async (c) => {
-  const auth = getAuthContext(c)
-  const parsed = await readStudioChatPayload(c.req.raw)
+  let body: unknown
+  try {
+    body = await c.req.json()
+  } catch {
+    return c.json({ error: 'invalid_json' }, 400)
+  }
+  const parsed = parseCopilotChatBody(body)
   if (!parsed.ok) return c.json({ error: parsed.error }, parsed.status)
-  return streamStudioChat(c.env, auth, parsed.value)
+  return copilotSseResponse(c.env, parsed.value, undefined, c.get('auth')?.role)
 })
 
 // ── radar (visual fleet + squad awareness — #21 slice 1, VIEW LAYER ONLY) ────
@@ -3838,6 +3859,7 @@ export function shell(
 
       /* ══ console-reskin primitives (src/dashboard/ui.ts) ══════════════════ */
       .ui-pagehead { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 4px; }
+      .ui-pagehead-right { margin-left: auto; }
       .ui-h1 { font-family: var(--font-display); font-weight: 400; font-size: 36px; line-height: 1.1; margin: 0; letter-spacing: -.01em; }
       .ui-sub { color: var(--dim); font-size: 13.5px; margin: 6px 0 18px; max-width: 680px; line-height: 1.5; }
       .ui-pill { display: inline-flex; align-items: center; gap: 6px; font-family: var(--font-mono); font-size: 10.5px; font-weight: 600; letter-spacing: .04em; padding: 3px 8px; border-radius: 999px;
@@ -3931,7 +3953,11 @@ export function shell(
       }
 
       /* ── /approvals page styles (kept here to avoid duplication) ── */
+<<<<<<< HEAD
       ${raw(copilotDrawerCss())}
+=======
+      ${raw(COPILOT_CSS)}
+>>>>>>> main
     </style>
   </head>
   <body>
@@ -4009,7 +4035,11 @@ export function shell(
           </a>
 
           <a class="nav-link" href="/copilot">
+<<<<<<< HEAD
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M10 3.2 12.1 7l4.2.7-3 3 .7 4.2L10 13.1 6 14.9l.7-4.2-3-3 4.2-.7z"/></svg>
+=======
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M4.2 13.6V6.4A2.2 2.2 0 0 1 6.4 4.2h7.2A2.2 2.2 0 0 1 15.8 6.4v4.2a2.2 2.2 0 0 1-2.2 2.2H8.1L4.2 15.8z"/><path d="M7 8.4h6M7 10.8h3.4"/></svg>
+>>>>>>> main
             <span class="nav-label">Co-Pilot</span>
           </a>
 
@@ -4159,6 +4189,8 @@ export function shell(
       </div><!-- /.content-wrap -->
     </div><!-- /.layout -->
 
+    ${copilotDrawerMarkup()}
+
     <script>
       (function () {
         // ── Theme ─────────────────────────────────────────────────────────────
@@ -4286,7 +4318,11 @@ export function shell(
 
       })();
     </script>
+<<<<<<< HEAD
     ${copilotShellEmbed()}
+=======
+    <script>${raw(COPILOT_SCRIPT)}</script>
+>>>>>>> main
   </body>
 </html>`
 }
@@ -5583,65 +5619,6 @@ function approvalsScript() {
         });
       })();
     </script>`)
-}
-
-// ── fleet views ───────────────────────────────────────────────────────────────
-
-// Pot-native flock: agents that checked in to THIS pot (no company bus). Read-only
-// inventory — who has access + who is in now. Control (wake/pause) is the bus path;
-// pot-native control is a later objective (#46).
-function flightsBody(cards: FlightCard[], project?: Project, scanLimited = false) {
-  const phaseColor = (p: string) =>
-    p === 'flying' ? 'var(--ok)' : p === 'sleeping' ? 'var(--warn)' : p === 'holding' || p === 'preflight' ? 'var(--accent)' : p === 'failed' || p === 'held' ? '#e5534b' : 'var(--dim)'
-  const arrow = (t: string | null) => (t === 'up' ? '▲' : t === 'down' ? '▼' : t === 'flat' ? '▬' : '')
-  const arrowColor = (t: string | null) => (t === 'up' ? 'var(--ok)' : t === 'down' ? '#e5534b' : 'var(--dim)')
-  const tr = (c: FlightCard) => `
-    <tr class="fl-row ${c.live ? '' : 'fl-dim'}">
-      <td><span class="fl-dot" style="background:${phaseColor(c.phase)}"></span>${escHtml(c.agent_name)}${c.squad_name ? ` <span style="color:var(--dim);font-size:11px">· ${escHtml(c.squad_name)}</span>` : ''}</td>
-      <td class="fl-label">${escHtml(c.goal)}</td>
-      <td><span class="fl-badge" style="color:${phaseColor(c.phase)}">${escHtml(c.phase)}</span></td>
-      <td class="fl-num">${c.metric_label && c.score_pct ? `${escHtml(c.metric_label)} ${escHtml(c.score_pct)} <span style="color:${arrowColor(c.trend)}">${arrow(c.trend)}</span>` : '<span style="color:var(--dim)">—</span>'}</td>
-      <td class="fl-num ${c.over_budget ? 'fl-over' : ''}">${escHtml(c.cost_usd)}${c.budget_usd ? `<span style="color:var(--dim)"> / ${escHtml(c.budget_usd)}</span>` : ''}</td>
-      <td>${c.next_departure ? escHtml(c.next_departure) : escHtml(c.age)}</td>
-    </tr>`
-  const flying = cards.filter((c) => c.phase === 'flying').length
-  const sleeping = cards.filter((c) => c.phase === 'sleeping').length
-  const table = cards.length
-    ? `<table class="fl-table">
-        <thead><tr><th>Agent</th><th>Goal</th><th>Phase</th><th>Metric</th><th>Cost / budget</th><th>Departure / age</th></tr></thead>
-        <tbody>${cards.map(tr).join('')}</tbody>
-      </table>`
-    : `<p class="empty">No flights yet. A flight = one bounded run of an agent toward a goal —
-       it appears here when a flight is created (preflight), and shows its accounted cost on land.</p>`
-  return html`
-    ${pageHeader({
-      crumbs: project ? `Projects / ${project.name} / Flights` : 'Overview / Flights',
-      title: 'Flights',
-      sub:
-        project
-          ? `Flights attributed to ${project.name}. Score, cost, and status remain read-only; control lives on Fleet.`
-          : 'Each flight is one bounded agent run toward a goal. Score is readiness at preflight / coherence on land, with its trend vs that agent’s last flight. Cost is metered (the black box). Read-only — control lives on Fleet.',
-    })}
-    ${kpiRow([
-      statCard({ label: 'Flying', value: String(flying), subTone: flying > 0 ? 'ok' : 'dim' }),
-      statCard({ label: 'Sleeping', value: String(sleeping), subTone: 'dim' }),
-    ])}
-    ${scanLimited ? html`<div class="card" role="status" style="border-color:var(--warn);margin-bottom:12px">
-      Flight history is partial because the project scan safety limit was reached.
-    </div>` : ''}
-    <style>
-      .fl-table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
-      .fl-table th { text-align: left; color: var(--muted); font-size: 12px; text-transform: uppercase;
-        letter-spacing: .5px; padding: 8px 10px; border-bottom: 1px solid var(--border); }
-      .fl-table td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
-      .fl-dim td { opacity: .55; }
-      .fl-dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:8px; }
-      .fl-label { color: var(--muted); max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-      .fl-badge { font-size: 11px; text-transform: uppercase; letter-spacing: .5px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); }
-      .fl-num { text-align: right; font-variant-numeric: tabular-nums; }
-      .fl-over { color: #e5534b; }
-    </style>
-    ${raw(`<div class="card" style="padding:0;overflow-x:auto">${table}</div>`)}`
 }
 
 // ── members + divisions views ─────────────────────────────────────────────────
