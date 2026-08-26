@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-08-26
+
+- **1-click project worker provisioner & sandbox studio** (`src/projects/provisioner.ts`, `src/dashboard/projects.ts`, `src/platform/routes.ts`).
+  - `/projects` ships a `[ + New Project Worker ]` modal (name, auto-slug, GitHub repo, template, worker name, `https://<slug>.mupot.mumega.com` preview, squad default `squad-cursor`).
+  - `POST /api/projects` stays admin-gated (`isOrgAdmin` + workspace admin floor), seeds `deploy_status: "idle"`, and returns `{ ok: true, project, redirect_url }`.
+  - `/projects/:id` is a split sandbox: live preview iframe with Desktop/Tablet/Mobile toggles + Refresh, Deep Chat Co-Pilot focused on the project repo with quick prompts, and a flight/deployment stream.
+
 ## 0.30.0 — 2026-08-21
 
 - **Athena GitHub webhook PR gate** (`src/athena/webhook.ts`, `src/athena/routes.ts`, `migrations/0130_athena_gate_receipts.sql`).
