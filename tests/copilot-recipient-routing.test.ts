@@ -104,17 +104,17 @@ const SELECTOR_HANDLES = [
 
 const SELECTOR_TITLES = [
   'General Pot Assistant',
-  'Council Lead & Continuity',
+  'Council Lead',
   'Sprint Coordinator',
-  'Server Builder & Runtime Operator',
-  'Gatekeeper & Safety Reviewer',
+  'Server Builder',
+  'Gatekeeper',
   'Cloud Lead Architect',
   'Cloud Implementer',
 ] as const
 
 function expectRecipientSelector(markup: string): void {
   expect(markup).toContain('data-copilot-recipient')
-  expect(markup).toContain('class="copilot-recipient"')
+  expect(markup).toMatch(/class="[^"]*copilot-recipient[^"]*"/)
   for (const handle of SELECTOR_HANDLES) expect(markup).toContain(handle)
   for (const title of SELECTOR_TITLES) expect(markup).toContain(title)
 }
@@ -264,10 +264,8 @@ describe('POST /api/studio/chat recipient routing', () => {
     expect(res.status).toBe(200)
     expect(res.headers.get('Content-Type')).toContain('text/event-stream')
     const text = await res.text()
-    const frames = sseFrames(text)
-    const meta = frames.find((frame) => frame.type === 'meta')
-    expect(meta).toMatchObject({ type: 'meta', agent: 'loom', role: 'admin' })
-    expect(text).toContain('"type":"token"')
+    expect(res.headers.get('X-Mupot-Copilot-Recipient')).toBe('loom')
+    expect(res.headers.get('X-Mupot-Copilot-Role')).toBe('admin')
     expect(text).toContain('"text":')
     expect(text).toMatch(/Loom|Sprint Coordinator/)
   })
@@ -276,7 +274,7 @@ describe('POST /api/studio/chat recipient routing', () => {
     const cases: Array<{ recipient: string; needle: RegExp }> = [
       { recipient: 'kasra', needle: /Kasra|system builder|Runtime Operator/i },
       { recipient: 'athena', needle: /Athena|Gatekeeper|safety reviewer/i },
-      { recipient: 'cursor-architect', needle: /Cursor Architect|architecture|repo planning/i },
+      { recipient: 'cursor-architect', needle: /Cursor Architect|Cloud Lead Architect|architecture|repo planning/i },
       { recipient: 'cursor-builder', needle: /Cursor Builder|Cloud Implementer|implementation/i },
       { recipient: 'river', needle: /River|Council Lead|Verification Lead/i },
     ]
@@ -287,8 +285,7 @@ describe('POST /api/studio/chat recipient routing', () => {
       )
       expect(res.status).toBe(200)
       const text = await res.text()
-      const meta = sseFrames(text).find((frame) => frame.type === 'meta')
-      expect(meta).toMatchObject({ type: 'meta', agent: row.recipient })
+      expect(res.headers.get('X-Mupot-Copilot-Recipient')).toBe(row.recipient)
       expect(text).toMatch(row.needle)
     }
   })

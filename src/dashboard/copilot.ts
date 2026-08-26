@@ -403,7 +403,7 @@ export function copilotRecipientSelectHtml(selectId: string): Html {
     (agent) =>
       html`<option value="${agent.id}" data-color="${agent.avatarColor}" data-letter="${agent.letter}" data-role="${agent.role}">${agent.handle} — ${agent.label}</option>`,
   )
-  return html`<label class="mupot-copilot-recipient copilot-recipient" data-copilot-recipient>
+  return html`<label class="copilot-recipient mupot-copilot-recipient" data-copilot-recipient>
     <span class="mupot-copilot-avatar" data-copilot-avatar aria-hidden="true">C</span>
     <select
       id="${selectId}"

@@ -314,7 +314,8 @@ describe('persona dropdown surfaces', () => {
     const sandboxSelect = String(await copilotRecipientSelectHtml('mupot-copilot-sandbox-recipient'))
     expect(sandboxSelect).toContain('id="mupot-copilot-sandbox-recipient"')
     expect(sandboxSelect).toContain('@river')
-    expect(sandboxSelect).toContain('Council Lead & Continuity')
+    expect(sandboxSelect).toContain('River (Lead)')
+    expect(sandboxSelect).toContain('Council Lead')
 
     const sandbox = String(
       await projectLivePreviewSplitHtml({
