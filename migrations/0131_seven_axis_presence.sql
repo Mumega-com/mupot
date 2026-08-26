@@ -9,6 +9,7 @@
 -- defaults; writers COALESCE so a heartbeat that omits an axis does not wipe
 -- a previously declared value.
 
+ALTER TABLE presence ADD COLUMN seat TEXT;
 ALTER TABLE presence ADD COLUMN harness TEXT NOT NULL DEFAULT 'unknown';
 ALTER TABLE presence ADD COLUMN machine TEXT;
 ALTER TABLE presence ADD COLUMN model TEXT;

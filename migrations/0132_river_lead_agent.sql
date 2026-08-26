@@ -4,14 +4,6 @@
 -- test chain still leaves ZERO rows (tests/helpers-migrations.test.ts).
 -- Runtime / local seed uses src/agents/river-lead.ts#ensureRiverLeadAgent.
 
-ALTER TABLE presence ADD COLUMN seat TEXT;
-ALTER TABLE presence ADD COLUMN harness TEXT;
-ALTER TABLE presence ADD COLUMN machine TEXT;
-ALTER TABLE presence ADD COLUMN model TEXT;
-ALTER TABLE presence ADD COLUMN provider TEXT;
-ALTER TABLE presence ADD COLUMN effort TEXT;
-ALTER TABLE presence ADD COLUMN flight_id TEXT;
-
 INSERT INTO agents (
   id,
   squad_id,
