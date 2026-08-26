@@ -30,6 +30,8 @@ import { handleStudioChat, type StudioChatRole } from './studio-chat'
 
 import { resolveTier } from '../billing/entitlement'
 import { listPresence } from '../fleet/presence'
+import { listConnectors, resolveConnector } from '../connectors/service'
+import { introspectSupabaseSchema } from '../connectors/supabase'
 
 export {
   STUDIO_CHAT_ADMIN_TOOLS,
@@ -71,6 +73,12 @@ export interface StudioAgentCard {
   isLive?: boolean
 }
 
+export interface StudioTableSummary {
+  name: string
+  columnCount: number
+  description?: string
+}
+
 export interface StudioViewData {
   brand: string
   tenant: string
@@ -79,6 +87,8 @@ export interface StudioViewData {
   branch: string
   flights: FlightRow[]
   agents?: StudioAgentCard[]
+  supabaseTables?: StudioTableSummary[]
+  hasSupabase?: boolean
   repoUrl?: string
   authorityRole?: StudioChatRole
 }
@@ -127,6 +137,26 @@ export async function loadStudioData(env: Env, auth: AuthContext): Promise<Studi
     agents = []
   }
 
+  let supabaseTables: StudioTableSummary[] = []
+  let hasSupabase = false
+  try {
+    const raw = await resolveConnector(env, 'pot', 'supabase')
+    if (raw) {
+      hasSupabase = true
+      const parsed = JSON.parse(raw)
+      if (parsed.url && parsed.apiKey) {
+        const schema = await introspectSupabaseSchema(parsed)
+        supabaseTables = schema.tables.map((t) => ({
+          name: t.name,
+          columnCount: t.columns.length,
+          description: t.description,
+        }))
+      }
+    }
+  } catch {
+    supabaseTables = []
+  }
+
   return {
     brand: env.BRAND || 'Mupot',
     tenant: env.TENANT_SLUG || 'default',
@@ -135,6 +165,8 @@ export async function loadStudioData(env: Env, auth: AuthContext): Promise<Studi
     branch: studioBranchLabel(env),
     flights,
     agents,
+    supabaseTables,
+    hasSupabase,
     authorityRole: isOrgAdmin(auth) ? 'admin' : 'member',
   }
 }
@@ -382,6 +414,7 @@ export function studioPageHtml(data: StudioViewData): HtmlEscapedString | Promis
         <section class="studio-pane studio-pane-right" aria-label="Preview canvas">
           <div class="studio-canvas-toolbar" role="tablist" aria-label="Canvas tabs">
             <button type="button" class="studio-tab is-active" role="tab" aria-selected="true" data-tab="preview" id="tab-preview">Preview</button>
+            <button type="button" class="studio-tab" role="tab" aria-selected="false" data-tab="database" id="tab-database">Data Tables ${data.supabaseTables && data.supabaseTables.length ? `(${data.supabaseTables.length})` : ''}</button>
             <button type="button" class="studio-tab" role="tab" aria-selected="false" data-tab="log" id="tab-log">Live log</button>
             <button type="button" class="studio-tab" role="tab" aria-selected="false" data-tab="diff" id="tab-diff">Diff viewer</button>
             <div class="studio-viewports" role="group" aria-label="Responsive viewport toggles">
@@ -399,6 +432,34 @@ export function studioPageHtml(data: StudioViewData): HtmlEscapedString | Promis
                   <h1>Design in the pot, land through the council.</h1>
                   <p>Desktop, tablet, and mobile frames share one live stage. Dispatch a flight to stream the agent log and open the diff.</p>
                 </div>
+              </div>
+            </div>
+
+            <div class="studio-database-view" id="studio-database-view" aria-label="Supabase Database Live Inspector">
+              <div class="studio-db-toolbar">
+                <div class="studio-db-left">
+                  <label class="studio-label" for="studio-db-select">Table</label>
+                  <select id="studio-db-select" class="studio-db-select">
+                    ${data.supabaseTables && data.supabaseTables.length
+                      ? data.supabaseTables.map((t) => html`<option value="${t.name}">${t.name} (${t.columnCount} cols)</option>`)
+                      : html`<option value="">${data.hasSupabase ? 'No tables found' : 'No Supabase connector active'}</option>`}
+                  </select>
+                </div>
+                <div class="studio-db-search-wrap">
+                  <label class="studio-label" for="studio-db-search">Filter / Search</label>
+                  <input type="text" id="studio-db-search" class="studio-db-search" placeholder="Search rows in active table…" />
+                </div>
+                <button type="button" class="studio-db-ask-agent" id="studio-db-ask-agent">✨ Ask Agent About Table</button>
+              </div>
+              <div class="studio-db-grid-wrap" id="studio-db-grid-wrap">
+                <table class="studio-db-table" id="studio-db-table">
+                  <thead id="studio-db-thead">
+                    <tr><th>id</th><th>status</th><th>data</th><th>created_at</th></tr>
+                  </thead>
+                  <tbody id="studio-db-tbody">
+                    <tr><td colspan="4" class="studio-db-empty">Select a table above or click Ask Agent to inspect live Supabase records.</td></tr>
+                  </tbody>
+                </table>
               </div>
             </div>
 
@@ -582,10 +643,50 @@ const STUDIO_CSS = `
   .studio-stage { flex: 1; min-height: 0; display: flex; }
   .studio-stage[data-tab="preview"] .studio-log,
   .studio-stage[data-tab="preview"] .studio-diff,
+  .studio-stage[data-tab="preview"] .studio-database-view,
   .studio-stage[data-tab="log"] .studio-canvas-frame,
   .studio-stage[data-tab="log"] .studio-diff,
+  .studio-stage[data-tab="log"] .studio-database-view,
   .studio-stage[data-tab="diff"] .studio-canvas-frame,
-  .studio-stage[data-tab="diff"] .studio-log { display: none; }
+  .studio-stage[data-tab="diff"] .studio-log,
+  .studio-stage[data-tab="diff"] .studio-database-view,
+  .studio-stage[data-tab="database"] .studio-canvas-frame,
+  .studio-stage[data-tab="database"] .studio-log,
+  .studio-stage[data-tab="database"] .studio-diff { display: none; }
+  .studio-stage[data-tab="database"] .studio-database-view { display: flex; }
+  .studio-database-view {
+    flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 12px;
+    padding: 14px; background: var(--studio-panel); border: 1px solid var(--studio-line);
+    border-radius: 14px; margin-top: 8px;
+  }
+  .studio-db-toolbar { display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap; }
+  .studio-db-left { min-width: 180px; }
+  .studio-db-select, .studio-db-search {
+    background: var(--studio-raised); color: var(--studio-text); border: 1px solid var(--studio-line);
+    border-radius: 8px; padding: 8px 10px; font: 13px var(--font-body); width: 100%;
+  }
+  .studio-db-search-wrap { flex: 1; min-width: 200px; }
+  .studio-db-ask-agent {
+    background: linear-gradient(135deg, var(--studio-magenta), #c084fc); color: #0a0a0c;
+    border: 0; border-radius: 999px; padding: 8px 14px; font: 700 12px var(--font-body);
+    cursor: pointer; height: 36px;
+  }
+  .studio-db-grid-wrap {
+    flex: 1; overflow: auto; background: #070709; border: 1px solid var(--studio-line);
+    border-radius: 10px;
+  }
+  .studio-db-table {
+    width: 100%; border-collapse: collapse; font: 12px/1.5 var(--font-mono); color: #d7fbe8;
+  }
+  .studio-db-table th {
+    background: #111116; color: var(--studio-cyan); text-align: left; padding: 8px 12px;
+    border-bottom: 1px solid var(--studio-line); position: sticky; top: 0; z-index: 2;
+  }
+  .studio-db-table td {
+    padding: 8px 12px; border-bottom: 1px solid rgba(255,255,255,.04); max-width: 320px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .studio-db-empty { text-align: center; color: var(--studio-muted); padding: 32px !important; }
   .studio-canvas-frame {
     flex: 1; display: flex; justify-content: center; align-items: stretch;
     padding: 8px 0 0;
@@ -649,6 +750,10 @@ const STUDIO_SCRIPT = `
   var chatSend = document.getElementById('studio-chat-send');
   var launchWrap = document.getElementById('studio-launch-wrap');
   var launchBtn = document.getElementById('studio-launch-cloud-build');
+  var dbSelect = document.getElementById('studio-db-select');
+  var dbThead = document.getElementById('studio-db-thead');
+  var dbTbody = document.getElementById('studio-db-tbody');
+  var dbAskBtn = document.getElementById('studio-db-ask-agent');
   var lastFlightId = null;
   var chatTurns = [];
 
@@ -662,7 +767,7 @@ const STUDIO_SCRIPT = `
     chatEl.scrollTop = chatEl.scrollHeight;
   }
   function appendLog(line) {
-    logEl.textContent = (logEl.textContent ? logEl.textContent + '\\n' : '') + line;
+    logEl.textContent = (logEl.textContent ? logEl.textContent + '\n' : '') + line;
     logEl.scrollTop = logEl.scrollHeight;
   }
   function setTab(name) {
@@ -672,6 +777,48 @@ const STUDIO_SCRIPT = `
       btn.setAttribute('aria-selected', on ? 'true' : 'false');
     });
     stage.setAttribute('data-tab', name);
+    if (name === 'database' && dbSelect && dbSelect.value) {
+      loadTableData(dbSelect.value);
+    }
+  }
+
+  async function loadTableData(tableName) {
+    if (!tableName || !dbTbody) return;
+    dbTbody.innerHTML = '<tr><td colspan="4" class="studio-db-empty">Loading records from ' + tableName + '…</td></tr>';
+    try {
+      var res = await fetch('/api/studio/database/query?table=' + encodeURIComponent(tableName) + '&limit=50');
+      var json = await res.json();
+      if (json.ok && json.data && json.data.length > 0) {
+        var cols = Object.keys(json.data[0]);
+        if (dbThead) {
+          dbThead.innerHTML = '<tr>' + cols.map(function(c) { return '<th>' + c + '</th>'; }).join('') + '</tr>';
+        }
+        dbTbody.innerHTML = json.data.map(function(row) {
+          return '<tr>' + cols.map(function(c) {
+            var val = row[c];
+            if (typeof val === 'object' && val !== null) val = JSON.stringify(val);
+            return '<td>' + (val !== null && val !== undefined ? String(val) : '') + '</td>';
+          }).join('') + '</tr>';
+        }).join('');
+      } else {
+        dbTbody.innerHTML = '<tr><td colspan="4" class="studio-db-empty">No records found in ' + tableName + '.</td></tr>';
+      }
+    } catch (e) {
+      dbTbody.innerHTML = '<tr><td colspan="4" class="studio-db-empty">Query failed. Check Supabase connector status.</td></tr>';
+    }
+  }
+
+  if (dbSelect) {
+    dbSelect.addEventListener('change', function() { loadTableData(dbSelect.value); });
+  }
+  if (dbAskBtn && dbSelect && promptEl) {
+    dbAskBtn.addEventListener('click', function() {
+      var t = dbSelect.value;
+      if (t) {
+        promptEl.value = 'Inspect table "' + t + '" in Supabase: analyze rows, summarize key metrics and anomalies, and prepare next actions.';
+        promptEl.focus();
+      }
+    });
   }
 
   document.querySelectorAll('.studio-tab').forEach(function (btn) {

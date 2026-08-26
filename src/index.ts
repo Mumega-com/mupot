@@ -46,6 +46,7 @@ import { fleetAttachApp } from './fleet/attach-routes'
 import { flightsApp } from './flight/routes'
 import { radarApp } from './dashboard/radar-routes'
 import { studioApp } from './dashboard/studio'
+import { studioDataApp } from './dashboard/studio-data-api'
 import { orientApp } from './orient/routes'
 import { handleOAuthAuthorize, resolveExternalToken as memberKeyResolver } from './mcp/oauth-authorize'
 import { McpOAuthApiHandler } from './mcp/oauth-api-handler'
@@ -139,6 +140,7 @@ app.route('/api/flights', flightsApp)
 app.route('/api/radar', radarApp)
 // Studio dispatch: optional Cursor Cloud launch + matching mupot task/flight.
 // Member-bearer (or dashboard session when mounted there). Before the '/' catch-all.
+app.route('/api/studio/database', studioDataApp)
 app.route('/api/studio', studioApp)
 // Orient seam (#digid-hybrid S1): an agent reads its basin-drop packet; the mind pushes
 // per-agent field state inbound. Before the '/' catch-all. See docs/superpowers/specs.
