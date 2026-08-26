@@ -2,6 +2,11 @@
 
 ## 0.30.0 — 2026-08-21
 
+- **Cursor Cloud SaaS engine & MCP tools** (`src/cursor/client.ts`, `src/mcp/cursor.ts`, `src/dashboard/studio.ts`).
+  - Typed client for `https://api.cursor.com/v1` (`createCursorAgent`, `dispatchCursorRun`, `getCursorAgent`, `getCursorRun`).
+  - MCP `cursor_dispatch` / `cursor_run_status` write matching task + flight records and return `agent_url`.
+  - `POST /api/studio/dispatch` optionally launches a Cursor Cloud agent when `CURSOR_API_TOKEN` is bound.
+
 - **Mint-in-Chooser Self-Service Agent Seat Binding** (`src/mcp/oauth-authorize.ts`, `tests/agent-bound-oauth-consent.test.ts`; #1189).
   - Native self-service agent minting directly inside the OAuth consent chooser UI (`__mint_new__`), gated by squad administrator capability (`listConsentableSquads`).
   - Server-side creation of agent records (`createAgent`), immutable token & dedicated member binding (`mintAgentBoundToken`), and append-only receipt auditing (`oauth_consent_receipts`).
