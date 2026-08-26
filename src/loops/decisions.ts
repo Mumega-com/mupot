@@ -19,6 +19,7 @@
 
 import type { Env } from '../types'
 import type { LoopCycleResult } from './runtime'
+import { assertWritten } from '../lib/receipt'
 
 // ── loop_decisions ────────────────────────────────────────────────────────────
 
@@ -118,9 +119,13 @@ export interface LoopControlRow {
 }
 
 /**
- * setLoopControl — upsert a governor control signal. The driver picks it up on
- * the next cycle. Tenant is always env-derived; loop_id must be validated by the
- * caller (it's an admin-gated endpoint so the loop must belong to this tenant).
+ * setLoopControl — upsert a governor control signal AND write an append-only
+ * receipt. The driver picks the live row up on the next cycle and then deletes
+ * it (clearLoopControl); the receipt is what survives that consume. Tenant is
+ * always env-derived; loop_id must be validated by the caller.
+ *
+ * `reason` is the attributed why (#1166). Empty is allowed for the dashboard
+ * path, which historically had no reason field; MCP callers should pass one.
  */
 export async function setLoopControl(
   env: Env,
@@ -128,9 +133,10 @@ export async function setLoopControl(
   action: LoopControlAction,
   issuedBy: string,
   value: string | null = null,
-): Promise<void> {
+  reason: string | null = null,
+): Promise<{ receipt_id: string }> {
   const now = new Date().toISOString()
-  await env.DB.prepare(
+  const signal = await env.DB.prepare(
     `INSERT INTO loop_controls (loop_id, tenant, action, value, issued_by, issued_at)
      VALUES (?, ?, ?, ?, ?, ?)
      ON CONFLICT(loop_id) DO UPDATE SET
@@ -141,6 +147,52 @@ export async function setLoopControl(
   )
     .bind(loopId, env.TENANT_SLUG, action, value, issuedBy, now)
     .run()
+  assertWritten(signal, 'loop_controls.upsert')
+
+  return recordLoopControlReceipt(env, {
+    loopId,
+    action,
+    issuedBy,
+    value,
+    reason: reason ?? '',
+    issuedAt: now,
+  })
+}
+
+/**
+ * recordLoopControlReceipt — append-only audit row. Separate from the live
+ * loop_controls signal so a consumed pause/kill still names who issued it and why.
+ */
+export async function recordLoopControlReceipt(
+  env: Env,
+  row: {
+    loopId: string
+    action: LoopControlAction
+    issuedBy: string
+    value: string | null
+    reason: string
+    issuedAt: string
+  },
+): Promise<{ receipt_id: string }> {
+  const receiptId = crypto.randomUUID()
+  const written = await env.DB.prepare(
+    `INSERT INTO loop_control_receipts
+       (id, tenant, loop_id, action, value, reason, actor_id, issued_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  )
+    .bind(
+      receiptId,
+      env.TENANT_SLUG,
+      row.loopId,
+      row.action,
+      row.value,
+      row.reason,
+      row.issuedBy,
+      row.issuedAt,
+    )
+    .run()
+  assertWritten(written, 'loop_control_receipts.insert')
+  return { receipt_id: receiptId }
 }
 
 /**
