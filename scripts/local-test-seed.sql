@@ -138,7 +138,7 @@ VALUES
 ON CONFLICT(project_id, squad_id) DO UPDATE SET
   access_level = excluded.access_level;
 
--- Default client worker projects (Viamar, DME) + squad-cursor.
+-- Default client worker projects (Worker Alpha, Worker Beta) + squad-cursor.
 INSERT INTO departments (id, slug, name, created_at)
 VALUES ('dept-cursor', 'cursor', 'Cursor Cloud', datetime('now'))
 ON CONFLICT(id) DO UPDATE SET slug = excluded.slug, name = excluded.name;
@@ -155,19 +155,19 @@ INSERT INTO projects (
   repo_url, worker_name, live_url, assigned_squad_id, deploy_status, created_at, updated_at
 ) VALUES
   (
-    'project-viamar', 'viamar', 'Viamar',
-    'Viamar client worker — freight and logistics surface.',
-    'Keep the Viamar Cloudflare worker healthy and ship feature flights against Digidinc/viamar.',
+    'project-worker-alpha', 'worker-alpha', 'Worker Alpha',
+    'Worker Alpha client worker surface.',
+    'Maintain the edge worker healthy and ship autonomous feature flights.',
     'active', NULL, NULL,
-    'https://github.com/Digidinc/viamar', 'viamar', 'https://viamar.mumega.com',
+    'https://github.com/Mumega-com/mupot', 'worker-alpha', 'https://mupot.mumega.com',
     'squad-cursor', 'healthy', datetime('now'), datetime('now')
   ),
   (
-    'project-dme', 'dme', 'DME',
-    'Digital Marketing Experts client worker.',
-    'Keep the DME Cloudflare worker healthy and ship feature flights against digidinc/dgd-dme.',
+    'project-worker-beta', 'worker-beta', 'Worker Beta',
+    'Worker Beta client worker surface.',
+    'Maintain the edge worker healthy and ship autonomous feature flights.',
     'active', NULL, NULL,
-    'https://github.com/digidinc/dgd-dme', 'dme', 'https://dme.mumega.com',
+    'https://github.com/Mumega-com/mupot', 'worker-beta', 'https://mupot.mumega.com',
     'squad-cursor', 'healthy', datetime('now'), datetime('now')
   )
 ON CONFLICT(id) DO UPDATE SET
@@ -184,8 +184,8 @@ ON CONFLICT(id) DO UPDATE SET
 
 INSERT INTO project_squad_access (project_id, squad_id, access_level, granted_at)
 VALUES
-  ('project-viamar', 'squad-cursor', 'admin', datetime('now')),
-  ('project-dme', 'squad-cursor', 'admin', datetime('now'))
+  ('project-worker-alpha', 'squad-cursor', 'admin', datetime('now')),
+  ('project-worker-beta', 'squad-cursor', 'admin', datetime('now'))
 ON CONFLICT(project_id, squad_id) DO UPDATE SET
   access_level = excluded.access_level;
 
