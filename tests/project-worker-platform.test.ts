@@ -90,25 +90,25 @@ describe('project worker platform — domain', () => {
     const created = await createProject(env, {
       slug: 'client-one',
       name: 'Client One',
-      repo_url: 'https://github.com/Digidinc/viamar',
-      live_url: 'https://viamar.mumega.com',
-      worker_name: 'viamar',
+      repo_url: 'https://github.com/Mumega-com/mupot',
+      live_url: 'https://mupot.mumega.com',
+      worker_name: 'worker-alpha',
       assigned_squad_id: 'squad-a',
     })
     expect(created.ok).toBe(true)
     if (!created.ok) return
     expect(created.value).toMatchObject({
       slug: 'client-one',
-      repo_url: 'https://github.com/Digidinc/viamar',
-      live_url: 'https://viamar.mumega.com',
-      worker_name: 'viamar',
+      repo_url: 'https://github.com/Mumega-com/mupot',
+      live_url: 'https://mupot.mumega.com',
+      worker_name: 'worker-alpha',
       assigned_squad_id: 'squad-a',
       deploy_status: 'healthy',
     })
-    expect(githubRepoSlug(created.value.repo_url)).toBe('Digidinc/viamar')
+    expect(githubRepoSlug(created.value.repo_url)).toBe('Mumega-com/mupot')
     expect(await getProject(env, created.value.id)).toMatchObject({
-      repo_url: 'https://github.com/Digidinc/viamar',
-      worker_name: 'viamar',
+      repo_url: 'https://github.com/Mumega-com/mupot',
+      worker_name: 'worker-alpha',
     })
   })
 
@@ -132,23 +132,23 @@ describe('project worker platform — domain', () => {
     const created = await createProject(env, {
       slug: 'ship',
       name: 'Ship',
-      repo_url: 'https://github.com/digidinc/dgd-dme',
-      live_url: 'https://dme.mumega.com',
-      worker_name: 'dme',
+      repo_url: 'https://github.com/Mumega-com/mupot',
+      live_url: 'https://mupot.mumega.com',
+      worker_name: 'worker-beta',
     })
     expect(created.ok).toBe(true)
     if (!created.ok) return
 
     const result = await deployProject(env, created.value.id, actor(), {
       commit_sha: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
-      prompt: 'Ship the next DME feature',
+      prompt: 'Ship the next feature flight',
     })
     expect(result.ok).toBe(true)
     if (!result.ok) return
     expect(result.deployment).toMatchObject({
       project_id: created.value.id,
       commit_sha: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
-      url: 'https://dme.mumega.com',
+      url: 'https://mupot.mumega.com',
       status: 'deploying',
       dispatched_by: 'member-a',
     })
@@ -167,12 +167,12 @@ describe('project worker platform — domain', () => {
     ).bind(result.deployment.id).run()).rejects.toThrow(/immutable/)
   })
 
-  it('provisions Viamar and DME onto squad-cursor', async () => {
+  it('provisions Worker Alpha and Worker Beta onto squad-cursor', async () => {
     harness = makeHarness()
     const env = envFor(harness)
     const provisioned = await provisionDefaultClientProjects(env)
     expect(provisioned.squad_id).toBe('squad-cursor')
-    expect(provisioned.projects.map((row) => row.project.slug).sort()).toEqual(['dme', 'viamar'])
+    expect(provisioned.projects.map((row) => row.project.slug).sort()).toEqual(['worker-alpha', 'worker-beta'])
     for (const spec of DEFAULT_CLIENT_PROJECTS) {
       const row = provisioned.projects.find((item) => item.project.slug === spec.slug)
       expect(row?.project).toMatchObject({
@@ -186,7 +186,7 @@ describe('project worker platform — domain', () => {
     }
     const again = await provisionDefaultClientProjects(env)
     expect(again.projects.every((row) => row.created === false)).toBe(true)
-    expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM projects WHERE slug IN (?, ?)').bind('viamar', 'dme').first())
+    expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM projects WHERE slug IN (?, ?)').bind('worker-alpha', 'worker-beta').first())
       .toEqual({ n: 2 })
   })
 })
@@ -209,12 +209,10 @@ describe('project worker platform — routes', () => {
     const response = await dashboardApp.fetch(new Request('https://pot.test/projects'), env)
     expect(response.status).toBe(200)
     const body = await response.text()
-    expect(body).toContain('Viamar')
-    expect(body).toContain('DME')
-    expect(body).toContain('Digidinc/viamar')
-    expect(body).toContain('digidinc/dgd-dme')
-    expect(body).toContain('https://viamar.mumega.com')
-    expect(body).toContain('https://dme.mumega.com')
+    expect(body).toContain('Worker Alpha')
+    expect(body).toContain('Worker Beta')
+    expect(body).toContain('Mumega-com/mupot')
+    expect(body).toContain('https://mupot.mumega.com')
     expect(body).toContain('🟢 Healthy')
     expect(body).toContain('squad-cursor')
     expect(body).toContain('🚀 Dispatch Feature Flight')
@@ -223,7 +221,7 @@ describe('project worker platform — routes', () => {
     const view = await loadProjectsPage(env, actor())
     const html = String(await projectsPageBody(view))
     expect(html).toContain('Dispatch Feature Flight')
-    expect(html).toContain('Digidinc/viamar')
+    expect(html).toContain('Mumega-com/mupot')
   })
 
   it('renders /projects/:id worker platform band', async () => {
@@ -231,18 +229,18 @@ describe('project worker platform — routes', () => {
     const env = envFor(harness)
     await provisionDefaultClientProjects(env)
     as(actor())
-    const viamar = await env.DB.prepare("SELECT id FROM projects WHERE slug = 'viamar'").first<{ id: string }>()
-    expect(viamar).toBeTruthy()
+    const alpha = await env.DB.prepare("SELECT id FROM projects WHERE slug = 'worker-alpha'").first<{ id: string }>()
+    expect(alpha).toBeTruthy()
 
     const response = await dashboardApp.fetch(
-      new Request(`https://pot.test/projects/${viamar!.id}`),
+      new Request(`https://pot.test/projects/${alpha!.id}`),
       env,
     )
     expect(response.status).toBe(200)
     const body = await response.text()
     expect(body).toContain('Worker platform')
-    expect(body).toContain('Digidinc/viamar')
-    expect(body).toContain('https://viamar.mumega.com')
+    expect(body).toContain('Mumega-com/mupot')
+    expect(body).toContain('https://mupot.mumega.com')
     expect(body).toContain('squad-cursor')
     expect(body).toContain('🚀 Dispatch Feature Flight')
     expect(body).toContain('Live preview')
@@ -250,7 +248,7 @@ describe('project worker platform — routes', () => {
     expect(body).toContain(`data-preview-iframe="${viamar!.id}"`)
     expect(body).toContain(`/preview/${viamar!.id}/`)
 
-    const detail = await loadProjectDetail(env, actor(), viamar!.id)
+    const detail = await loadProjectDetail(env, actor(), alpha!.id)
     expect(detail?.assignedSquadName).toBe('squad-cursor')
     expect(String(await projectDetailBody(detail!))).toContain('Dispatch Feature Flight')
   })
@@ -261,8 +259,8 @@ describe('project worker platform — routes', () => {
     const created = await createProject(env, {
       slug: 'api-deploy',
       name: 'API Deploy',
-      repo_url: 'https://github.com/Digidinc/viamar',
-      live_url: 'https://viamar.mumega.com',
+      repo_url: 'https://github.com/Mumega-com/mupot',
+      live_url: 'https://mupot.mumega.com',
     })
     expect(created.ok).toBe(true)
     if (!created.ok) return
