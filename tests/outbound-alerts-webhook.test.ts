@@ -12,7 +12,7 @@ import { alertsApp } from '../src/alerts/routes'
 describe('Outbound Customer Webhooks & Multi-Channel Alert Router (Flight 10)', () => {
   it('computes valid HMAC SHA-256 signature for webhook payloads', async () => {
     const payload = JSON.stringify({ event: 'flight.landed', tenant: 'gaf' })
-    const secret = 'whsec_placeholder_test_key'
+    const secret = 'placeholder-webhook-secret-key'
 
     const sig = await signWebhookPayload(secret, payload)
     expect(typeof sig).toBe('string')
@@ -48,7 +48,7 @@ describe('Outbound Customer Webhooks & Multi-Channel Alert Router (Flight 10)', 
     const mockSub = {
       id: 'sub_1',
       url: 'https://webhook.site/test-hook',
-      secret: 'whsec_placeholder_test_key',
+      secret: 'placeholder-webhook-secret-key',
       channel_type: 'generic',
       events: ['flight.landed'],
       enabled: true,
