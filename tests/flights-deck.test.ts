@@ -186,6 +186,7 @@ describe('flightsBody — KPI cards, table, badges, artifacts', () => {
     expect(out).toContain('id="fd-dispatch-open"')
     expect(out).toContain('id="fd-dispatch"')
     expect(out).toContain('id="fd-repo-select"')
+    expect(out).toContain('id="fd-repo-custom-wrap" hidden')
     expect(out).toContain('data-copilot-open')
     expect(out).toContain('id="fd-search"')
     expect(out).toContain('Search goal, squad, or agent')

@@ -324,13 +324,13 @@ const DECK_CSS = `
   .fd-deck { --fd-teal: #0f766e; --fd-amber: #ca8a04; --fd-red: #dc2626; }
   .fd-kpis .ui-stat-value { display: flex; align-items: center; gap: 10px; }
   .fd-radar {
-    width: 10px; height: 10px; border-radius: 50%; background: var(--ok);
-    box-shadow: 0 0 0 0 color-mix(in srgb, var(--ok) 55%, transparent);
-    animation: fd-radar 1.6s ease-out infinite;
+    width: 14px; height: 14px; border-radius: 50%; background: var(--ok);
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--ok) 60%, transparent);
+    animation: fd-radar 1.6s ease-out infinite; flex: none;
   }
   @keyframes fd-radar {
-    0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--ok) 55%, transparent); }
-    70% { box-shadow: 0 0 0 8px transparent; }
+    0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--ok) 60%, transparent); }
+    70% { box-shadow: 0 0 0 10px transparent; }
   }
   .fd-toolbar {
     display: flex; flex-wrap: wrap; gap: 12px; align-items: center;
@@ -427,6 +427,11 @@ const DECK_CSS = `
   @media (max-width: 900px) {
     .fd-cell-pipe, .fd-table th:nth-child(3) { display: none; }
   }
+  @media (max-width: 680px) {
+    .fd-cell-time, .fd-table th:nth-child(6) { display: none; }
+    .fd-toolbar { flex-direction: column; align-items: stretch; }
+    .fd-live-hint { margin-left: 0; }
+  }
 `
 
 const DECK_SCRIPT = `
@@ -473,6 +478,7 @@ const DECK_SCRIPT = `
   var closeBtn = document.getElementById('fd-dispatch-close');
   var cancelBtn = document.getElementById('fd-dispatch-cancel');
   var custom = document.getElementById('fd-repo-custom');
+  var customWrap = document.getElementById('fd-repo-custom-wrap');
   var select = document.getElementById('fd-repo-select');
 
   function setDispatchOpen(open) {
@@ -495,8 +501,10 @@ const DECK_SCRIPT = `
   if (backdrop) backdrop.addEventListener('click', function () { setDispatchOpen(false); });
   if (select && custom) {
     select.addEventListener('change', function () {
-      custom.hidden = select.value !== '__custom';
-      if (select.value === '__custom') custom.focus();
+      var other = select.value === '__custom';
+      custom.hidden = !other;
+      if (customWrap) customWrap.hidden = !other;
+      if (other) custom.focus();
     });
   }
 
@@ -697,9 +705,9 @@ export function flightsBody(
               ${raw(repoOptions)}
             </select>
           </label>
-          <label id="fd-repo-custom-wrap">
+          <label id="fd-repo-custom-wrap" hidden>
             Repo URL
-            <input id="fd-repo-custom" type="url" name="repoUrl" placeholder="https://github.com/org/repo" hidden />
+            <input id="fd-repo-custom" type="url" name="repoUrl" placeholder="https://github.com/org/repo" />
           </label>
           <div class="fd-dispatch-actions">
             <button type="submit" class="btn">Dispatch</button>
