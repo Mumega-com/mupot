@@ -245,8 +245,8 @@ describe('project worker platform — routes', () => {
     expect(body).toContain('🚀 Dispatch Feature Flight')
     expect(body).toContain('Live preview')
     expect(body).toContain('Code / Logs')
-    expect(body).toContain(`data-preview-iframe="${viamar!.id}"`)
-    expect(body).toContain(`/preview/${viamar!.id}/`)
+    expect(body).toContain(`data-preview-iframe="${alpha!.id}"`)
+    expect(body).toContain(`/preview/${alpha!.id}/`)
 
     const detail = await loadProjectDetail(env, actor(), alpha!.id)
     expect(detail?.assignedSquadName).toBe('squad-cursor')

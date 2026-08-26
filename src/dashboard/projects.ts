@@ -42,6 +42,11 @@ import type { ProjectProviderBinding } from '../projects/providers/port'
 import { emptyState, pageHeader, pill, sectionPanel } from './ui'
 import type { Html } from './ui'
 import { projectLivePreviewSplitHtml } from '../platform/routes'
+import {
+  DEFAULT_PROJECT_WORKER_SQUAD,
+  PROJECT_WORKER_SUBDOMAIN_ROOT,
+  PROJECT_WORKER_TEMPLATES,
+} from '../projects/provisioner'
 
 const MAX_PROJECTS = 100
 const PARENT_OPTIONS_PAGE_SIZE = 500
@@ -1199,8 +1204,155 @@ function projectsControls(view: ProjectsPageView): Html {
       </label>
       <button class="btn secondary" type="submit">Filter</button>
     </form>
-    ${view.canManage ? html`<a class="btn" href="/projects/new">Create project</a>` : ''}
+    ${view.canManage ? html`<div style="display:flex;flex-wrap:wrap;gap:8px;">
+      <button type="button" class="btn" data-open-project-worker-modal>+ New Project Worker</button>
+      <a class="btn secondary" href="/projects/new">Create project</a>
+    </div>` : ''}
   </div>`
+}
+
+function newProjectWorkerModal(): Html {
+  const templates = PROJECT_WORKER_TEMPLATES.map((template) => html`<option value="${template.id}">${template.label}</option>`)
+  return html`<div
+      id="project-worker-modal"
+      class="modal"
+      hidden
+      data-project-worker-modal
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="project-worker-modal-title"
+    >
+      <div class="modal-card" style="max-width:36rem;">
+        <h2 id="project-worker-modal-title" class="ui-panel-title">New Project Worker</h2>
+        <p class="ui-panel-sub">Provision a customer worker, bind a repo, and open the sandbox studio.</p>
+        <form id="project-worker-form" data-project-worker-form style="display:grid;gap:12px;margin-top:12px;">
+          <p role="alert" data-project-worker-error hidden style="margin:0;color:var(--danger,#c0392b);"></p>
+          <label style="display:grid;gap:5px;">
+            <span class="ui-panel-sub">Project Name</span>
+            <input name="name" required autocomplete="off" placeholder="Acme Storefront">
+          </label>
+          <label style="display:grid;gap:5px;">
+            <span class="ui-panel-sub">Slug</span>
+            <input name="slug" required pattern="[a-z0-9]+(?:-[a-z0-9]+)*" data-auto-slug placeholder="acme-storefront">
+            <span class="ui-panel-sub">Auto-generated from the project name. Edit to override.</span>
+          </label>
+          <label style="display:grid;gap:5px;">
+            <span class="ui-panel-sub">GitHub Repository URL</span>
+            <input name="repo_url" type="url" placeholder="https://github.com/org/repo">
+          </label>
+          <label style="display:grid;gap:5px;">
+            <span class="ui-panel-sub">Template</span>
+            <select name="template" data-project-template>
+              ${templates}
+            </select>
+          </label>
+          <label style="display:grid;gap:5px;">
+            <span class="ui-panel-sub">Worker Name</span>
+            <input name="worker_name" data-auto-worker placeholder="acme-storefront">
+          </label>
+          <p class="ui-panel-sub" style="margin:0;">
+            Custom subdomain:
+            <output data-subdomain-preview>https://${'<slug>'}.${PROJECT_WORKER_SUBDOMAIN_ROOT}</output>
+          </p>
+          <label style="display:grid;gap:5px;">
+            <span class="ui-panel-sub">Squad Assignment</span>
+            <input name="assigned_squad_id" value="${DEFAULT_PROJECT_WORKER_SQUAD}" placeholder="${DEFAULT_PROJECT_WORKER_SQUAD}">
+            <span class="ui-panel-sub">Defaults to ${DEFAULT_PROJECT_WORKER_SQUAD}.</span>
+          </label>
+          <div class="modal-actions">
+            <button class="btn" type="submit">Provision worker</button>
+            <button class="btn secondary" type="button" data-close-project-worker-modal>Cancel</button>
+          </div>
+        </form>
+      </div>
+    </div>
+    <script>
+      (function () {
+        var modal = document.getElementById('project-worker-modal');
+        if (!modal) return;
+        var form = modal.querySelector('[data-project-worker-form]');
+        var nameInput = form.querySelector('input[name="name"]');
+        var slugInput = form.querySelector('input[name="slug"]');
+        var workerInput = form.querySelector('input[name="worker_name"]');
+        var preview = form.querySelector('[data-subdomain-preview]');
+        var error = form.querySelector('[data-project-worker-error]');
+        var slugTouched = false;
+        var workerTouched = false;
+        var root = ${raw(JSON.stringify(PROJECT_WORKER_SUBDOMAIN_ROOT))};
+
+        function slugFromName(value) {
+          return String(value || '')
+            .trim()
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, '-')
+            .replace(/^-+|-+$/g, '')
+            .slice(0, 48)
+            .replace(/-+$/g, '');
+        }
+        function syncPreview() {
+          var slug = slugInput.value.trim() || '&lt;slug&gt;';
+          preview.textContent = 'https://' + slug + '.' + root;
+          if (!workerTouched && !workerInput.value) workerInput.placeholder = slugInput.value.trim() || 'acme-storefront';
+        }
+        function openModal() {
+          modal.removeAttribute('hidden');
+          nameInput.focus();
+        }
+        function closeModal() {
+          modal.setAttribute('hidden', '');
+        }
+        document.querySelectorAll('[data-open-project-worker-modal]').forEach(function (btn) {
+          btn.addEventListener('click', openModal);
+        });
+        modal.querySelectorAll('[data-close-project-worker-modal]').forEach(function (btn) {
+          btn.addEventListener('click', closeModal);
+        });
+        modal.addEventListener('click', function (event) {
+          if (event.target === modal) closeModal();
+        });
+        nameInput.addEventListener('input', function () {
+          if (!slugTouched) slugInput.value = slugFromName(nameInput.value);
+          if (!workerTouched) workerInput.value = slugInput.value;
+          syncPreview();
+        });
+        slugInput.addEventListener('input', function () {
+          slugTouched = true;
+          if (!workerTouched) workerInput.value = slugInput.value;
+          syncPreview();
+        });
+        workerInput.addEventListener('input', function () { workerTouched = true; });
+        form.addEventListener('submit', function (event) {
+          event.preventDefault();
+          error.hidden = true;
+          var body = {
+            name: nameInput.value,
+            slug: slugInput.value,
+            repo_url: form.querySelector('input[name="repo_url"]').value,
+            template: form.querySelector('select[name="template"]').value,
+            worker_name: workerInput.value,
+            assigned_squad_id: form.querySelector('input[name="assigned_squad_id"]').value,
+          };
+          fetch('/api/projects', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+          }).then(function (res) { return res.json().then(function (data) { return { res: res, data: data }; }); })
+            .then(function (result) {
+              if (result.data && result.data.ok && result.data.redirect_url) {
+                window.location.href = result.data.redirect_url;
+                return;
+              }
+              error.hidden = false;
+              error.textContent = (result.data && result.data.error) || ('Provision failed (' + result.res.status + ')');
+            })
+            .catch(function () {
+              error.hidden = false;
+              error.textContent = 'Provision failed.';
+            });
+        });
+        syncPreview();
+      })();
+    </script>`
 }
 
 export function projectsPageBody(view: ProjectsPageView) {
@@ -1208,7 +1360,7 @@ export function projectsPageBody(view: ProjectsPageView) {
     crumbs: 'Workspace / Projects',
     title: 'Projects',
     sub: 'Goals, squads, work, and evidence organized around durable outcomes.',
-  })}${projectsControls(view)}`
+  })}${projectsControls(view)}${view.canManage ? newProjectWorkerModal() : ''}`
   if (!view.nodes.length) {
     return html`
       ${header}

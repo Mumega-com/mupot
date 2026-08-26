@@ -242,11 +242,16 @@ export async function streamStudioChat(
   })
 }
 
-export function copilotDeepChatMarkup(): Html {
+export function copilotDeepChatMarkup(opts?: {
+  projectId?: string
+  projectRepo?: string
+}): Html {
   const request = JSON.stringify(DEEP_CHAT_REQUEST)
   const images = JSON.stringify(DEEP_CHAT_IMAGES)
   const speech = JSON.stringify(DEEP_CHAT_SPEECH)
   const styleJson = JSON.stringify(DEEP_CHAT_STYLE)
+  const projectId = opts?.projectId ?? ''
+  const projectRepo = opts?.projectRepo ?? ''
   return html`<deep-chat
       class="mupot-deep-chat"
       request='${raw(request)}'
@@ -255,6 +260,8 @@ export function copilotDeepChatMarkup(): Html {
       speechToText='${raw(speech)}'
       textToSpeech='${raw(speech)}'
       data-deep-chat-style='${raw(styleJson)}'
+      data-project-id="${projectId}"
+      data-project-repo="${projectRepo}"
       style="border-radius:12px;border:none;width:100%;height:100%"
     ></deep-chat>`
 }

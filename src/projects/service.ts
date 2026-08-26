@@ -2,7 +2,7 @@ import type { D1Result } from '@cloudflare/workers-types'
 import type { Env, Project, ProjectAccessLevel, ProjectSquadAccess, ProjectStatus } from '../types'
 import { isNonEmptyString, isValidSlug } from '../org/service'
 import { projectSelectSql } from './columns'
-import { isSafeHttpsUrl, isValidWorkerName } from './urls'
+import { isSafeHttpsUrl, isValidWorkerName, slugFromProjectName } from './urls'
 
 const PROJECT_STATUSES: readonly ProjectStatus[] = ['planned', 'active', 'paused', 'review', 'completed', 'archived']
 const PROJECT_ACCESS_LEVELS: readonly ProjectAccessLevel[] = ['read', 'write', 'admin']
@@ -208,8 +208,11 @@ export async function createProject(
   env: Env,
   input: CreateProjectInput,
 ): Promise<ProjectMutationResult<Project>> {
-  if (!isValidSlug(input.slug)) return { ok: false, error: 'invalid_slug' }
   if (!isNonEmptyString(input.name)) return { ok: false, error: 'invalid_name' }
+  const slug = typeof input.slug === 'string' && input.slug.trim()
+    ? input.slug.trim()
+    : slugFromProjectName(input.name)
+  if (!isValidSlug(slug)) return { ok: false, error: 'invalid_slug' }
 
   const description = optionalText(input.description, '')
   const goal = optionalText(input.goal, '')
@@ -239,7 +242,7 @@ export async function createProject(
   const now = new Date().toISOString()
   const project: Project = {
     id: crypto.randomUUID(),
-    slug: input.slug,
+    slug,
     name: input.name.trim(),
     description,
     goal,

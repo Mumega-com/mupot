@@ -2,7 +2,7 @@ import { Hono } from 'hono'
 import { csrf } from 'hono/csrf'
 import type { AuthContext, CapabilityGrant, Env, Project, ProjectStatus } from '../types'
 import { requireAuth } from '../auth'
-import { resolveCapabilities } from '../auth/capability'
+import { isOrgAdmin, resolveCapabilities } from '../auth/capability'
 import { canonicalFlightMetaSql } from '../flight/meta-sql'
 import { listProjectActivity, listProjectEvidence, type ProjectProjectionCursor } from './projections'
 import {
@@ -20,7 +20,7 @@ import {
   updateProject,
   upsertProjectSquadAccess,
 } from './service'
-import type { CreateProjectInput, ProjectMutationError, UpdateProjectInput } from './service'
+import type { ProjectMutationError, UpdateProjectInput } from './service'
 import { projectSelectSql } from './columns'
 import { deployProject } from './deploy'
 import { startProject, defaultStartGateDeps } from './start-gate'
@@ -30,6 +30,7 @@ import {
   proposeProjectRecommit,
   recommitPrincipalFromAuth,
 } from './circuit-breaker'
+import { prepareProjectWorkerProvision } from './provisioner'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 type ParentContext = Pick<Project, 'id' | 'slug' | 'name' | 'status' | 'parent_project_id'>
@@ -342,13 +343,25 @@ projectsApp.get('/', async (c) => {
 })
 
 projectsApp.post('/', async (c) => {
-  const access = await projectReadAccess(c.env, c.get('auth'))
-  if (!access.workspaceAdmin) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  const auth = c.get('auth')
+  const access = await projectReadAccess(c.env, auth)
+  // isOrgAdmin is the documented admin plane. workspaceAdmin is the project
+  // create floor and still fail-closes restricted capability sets (#530).
+  if (!isOrgAdmin(auth) || !access.workspaceAdmin) return c.json({ error: 'forbidden', need: 'admin' }, 403)
   const body = await jsonObject(c)
   if (!body) return c.json({ error: 'invalid_json' }, 400)
-  const result = await createProject(c.env, body as CreateProjectInput)
+  const prepared = await prepareProjectWorkerProvision(c.env, body)
+  if (!prepared.ok) {
+    if (prepared.error === 'invalid_template') return c.json({ error: prepared.error }, 400)
+    return c.json({ error: prepared.error }, mutationStatus(prepared.error))
+  }
+  const result = await createProject(c.env, prepared.value)
   if (!result.ok) return c.json({ error: result.error }, mutationStatus(result.error))
-  return c.json({ project: result.value }, 201)
+  return c.json({
+    ok: true,
+    project: result.value,
+    redirect_url: `/projects/${result.value.id}`,
+  }, 201)
 })
 
 projectsApp.get('/:id', async (c) => {
