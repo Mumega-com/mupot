@@ -149,8 +149,8 @@ export function projectLivePreviewSplitHtml(input: ProjectPreviewSplitInput): Ht
           projectRepo: project.repo_url ?? '',
         })}
       </div>
-      <section aria-label="Flight & Deployment Stream" data-flight-stream>
-        <h3 class="ui-panel-title" style="margin:0;">Flight & Deployment Stream</h3>
+      <section aria-label="${'Flight & Deployment Stream'}" data-flight-stream>
+        <h3 class="ui-panel-title" style="margin:0;">${'Flight & Deployment Stream'}</h3>
         <div class="sandbox-stream">
           ${streamCards.length
             ? streamCards
