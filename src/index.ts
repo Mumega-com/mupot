@@ -53,6 +53,7 @@ import { brainPhysicsIngestApp } from './dashboard/brain-ingest'
 import { billingAdminApp } from './billing/admin'
 import { ccSpendApp } from './economy/cc-spend'
 import { resellerApp } from './reseller/routes'
+import { potsApp } from './pots/routes'
 import { inboxApp } from './agents/inbox-routes'
 import { coordinationApp } from './coordination/routes'
 import { addonsApp } from './addons/routes'
@@ -153,6 +154,10 @@ app.route('/api/economy', ccSpendApp)
 // The live stand-up (CF account/repo/deploy/secrets/mint) is Hadi-go ops — this plans only.
 // Before the dashboard '/' catch-all.
 app.route('/api/reseller', resellerApp)
+
+// Sovereign pot 1-click provisioner via WFP dispatch namespace (mupot-pots).
+// Org-admin or Stripe webhook authenticated. Before the dashboard '/' catch-all.
+app.route('/api/pots', potsApp)
 
 // Agent inbox HTTP mirror (squad → mupot, S3 follow-on): the bash wake-hooks poll the pot for
 // delegations over HTTP (they can't speak MCP JSON-RPC). Member-bearer auth, self-scoped to the

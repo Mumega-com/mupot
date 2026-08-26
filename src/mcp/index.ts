@@ -130,6 +130,7 @@ import { RUNNER_TOOLS } from './runners'
 import { FLIGHT_SPINE_TOOLS } from './flight-spine'
 import { CURSOR_TOOLS } from './cursor'
 import { ATHENA_TOOLS } from './athena'
+import { POT_TOOLS } from './pots'
 import { dispatchFlight } from '../flight/dispatch'
 import {
   deliverFlightLandedEvent,
@@ -4253,6 +4254,7 @@ export const TOOLS: ToolSpec[] = [
   ...FLIGHT_SPINE_TOOLS,
   ...CURSOR_TOOLS,
   ...ATHENA_TOOLS,
+  ...POT_TOOLS,
 ]
 
 const TOOL_BY_NAME = new Map<string, ToolSpec>(TOOLS.map((t) => [t.name, t]))
