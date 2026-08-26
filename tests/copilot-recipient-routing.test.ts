@@ -111,10 +111,11 @@ const SELECTOR_TITLES = [
 ] as const
 
 function expectRecipientSelector(markup: string): void {
-  expect(markup).toContain('data-copilot-recipient')
-  expect(markup).toContain('class="copilot-recipient"')
-  for (const handle of SELECTOR_HANDLES) expect(markup).toContain(handle)
-  for (const title of SELECTOR_TITLES) expect(markup).toContain(title)
+  const decoded = markup.replace(/&amp;/g, '&')
+  expect(decoded).toContain('data-copilot-recipient')
+  expect(decoded).toContain('class="copilot-recipient"')
+  for (const handle of SELECTOR_HANDLES) expect(decoded).toContain(handle)
+  for (const title of SELECTOR_TITLES) expect(decoded).toContain(title)
 }
 
 describe('persona prompt builders', () => {
@@ -274,9 +275,11 @@ describe('POST /api/studio/chat recipient routing', () => {
       )
       expect(res.status).toBe(200)
       const text = await res.text()
-      const meta = sseFrames(text).find((frame) => frame.type === 'meta')
+      const frames = sseFrames(text)
+      const meta = frames.find((frame) => frame.type === 'meta')
+      const spoken = frames.filter((frame) => frame.type === 'token').map((frame) => frame.text).join('')
       expect(meta).toMatchObject({ type: 'meta', agent: row.recipient })
-      expect(text).toMatch(row.needle)
+      expect(spoken).toMatch(row.needle)
     }
   })
 
