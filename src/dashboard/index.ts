@@ -239,20 +239,11 @@ import { makeMissionControlApp } from './mission-control-routes'
 export { controlTowerBody, potFleetBody } from './mission-control-views'
 import { getAuthContext, loadStudioData, studioPageHtml, dispatchStudioFlight } from './studio'
 import {
-<<<<<<< HEAD
   copilotDrawerCss,
   copilotPageBody,
   copilotShellEmbed,
   readStudioChatPayload,
   streamStudioChat,
-=======
-  COPILOT_CSS,
-  COPILOT_SCRIPT,
-  copilotDrawerMarkup,
-  copilotPageBody,
-  copilotSseResponse,
-  parseCopilotChatBody,
->>>>>>> main
 } from './copilot'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
@@ -1308,25 +1299,18 @@ dashboardApp.post('/api/studio/dispatch', async (c) => {
   return c.json(result.result)
 })
 
-// GET /copilot + /chat — dedicated full-page Co-Pilot (same chat as the drawer).
-dashboardApp.get('/copilot', async (c) => {
-  return c.html(shell(c.env, 'Co-Pilot', copilotPageBody(c.get('auth'))))
-})
-dashboardApp.get('/chat', async (c) => {
-  return c.html(shell(c.env, 'Co-Pilot', copilotPageBody(c.get('auth'))))
-})
+// GET /copilot and GET /chat — full-height Deep Chat card (session auth).
+dashboardApp.get('/copilot', async (c) => c.html(shell(c.env, 'Co-Pilot', copilotPageBody())))
+dashboardApp.get('/chat', async (c) => c.html(shell(c.env, 'Co-Pilot', copilotPageBody())))
 
-// POST /api/studio/chat — SSE token stream for the Co-Pilot drawer and page.
+// POST /api/studio/chat — Deep Chat SSE stream. Accepts { messages, recipient }
+// and the shorter { message, recipient } body. Authority is derived from the
+// signed-in session (admin vs member), never from the request body.
 dashboardApp.post('/api/studio/chat', async (c) => {
-  let body: unknown
-  try {
-    body = await c.req.json()
-  } catch {
-    return c.json({ error: 'invalid_json' }, 400)
-  }
-  const parsed = parseCopilotChatBody(body)
+  const auth = getAuthContext(c)
+  const parsed = await readStudioChatPayload(c.req.raw)
   if (!parsed.ok) return c.json({ error: parsed.error }, parsed.status)
-  return copilotSseResponse(c.env, parsed.value, undefined, c.get('auth')?.role)
+  return streamStudioChat(c.env, auth, parsed.value)
 })
 
 // ── radar (visual fleet + squad awareness — #21 slice 1, VIEW LAYER ONLY) ────
@@ -3953,11 +3937,7 @@ export function shell(
       }
 
       /* ── /approvals page styles (kept here to avoid duplication) ── */
-<<<<<<< HEAD
       ${raw(copilotDrawerCss())}
-=======
-      ${raw(COPILOT_CSS)}
->>>>>>> main
     </style>
   </head>
   <body>
@@ -4189,7 +4169,6 @@ export function shell(
       </div><!-- /.content-wrap -->
     </div><!-- /.layout -->
 
-    ${copilotDrawerMarkup()}
 
     <script>
       (function () {
@@ -4318,11 +4297,7 @@ export function shell(
 
       })();
     </script>
-<<<<<<< HEAD
     ${copilotShellEmbed()}
-=======
-    <script>${raw(COPILOT_SCRIPT)}</script>
->>>>>>> main
   </body>
 </html>`
 }

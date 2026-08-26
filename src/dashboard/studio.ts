@@ -22,7 +22,8 @@ import { createCursorAgent, resolveCursorApiToken } from '../cursor/client'
 import type { AuthContext, Env } from '../types'
 import { createFlight, listFlights, type FlightRow } from '../flight/service'
 import { createTask } from '../tasks/service'
-import { MUPOT_FAVICON_32_PNG_B64, MUPOT_MARK_64_PNG_B64 } from './brand-assets'
+import { peekSessionAuth } from '../auth'
+import { readStudioChatPayload, streamStudioChat } from './copilot'
 import { handleStudioChat, type StudioChatRole } from './studio-chat'
 
 export {
@@ -822,15 +823,21 @@ async function resolveStudioApiAuth(c: {
 export const studioApp = new Hono<{ Bindings: Env; Variables: { auth?: AuthContext } }>()
 
 studioApp.post('/chat', async (c) => {
-  // Prefer an already-resolved dashboard session (getAuthContext) when this
-  // route is mounted behind requireAuth; otherwise peekSessionAuth / bearer.
-  try {
-    const auth = getAuthContext(c as Context<AppEnv>)
-    if (auth) c.set('auth', auth)
-  } catch {
-    // Public /api/studio mount — Variables.auth may be unset.
+  let auth = c.get('auth')
+  if (!auth) {
+    try {
+      auth = getAuthContext(c as Context<AppEnv>)
+    } catch {
+      auth = (await peekSessionAuth(c.env, c.req.raw)) ?? undefined
+    }
   }
-  return handleStudioChat(c)
+  const parsed = await readStudioChatPayload(c.req.raw)
+  if (!parsed.ok) return c.json({ error: parsed.error }, parsed.status)
+  return streamStudioChat(
+    c.env,
+    auth ?? ({ userId: 'guest', role: 'member', tenant: c.env.TENANT_SLUG || 'mumega' } as AuthContext),
+    parsed.value,
+  )
 })
 
 studioApp.post('/dispatch', async (c) => {

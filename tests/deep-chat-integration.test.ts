@@ -12,6 +12,7 @@ import { applyAllMigrations } from './helpers/migrations'
 const authState = vi.hoisted(() => ({ current: null as AuthContext | null }))
 
 vi.mock('../src/auth', () => ({
+  peekSessionAuth: async () => authState.current,
   requireAuth: async (
     c: {
       get: (key: 'auth') => AuthContext | undefined

@@ -91,8 +91,26 @@ export interface StudioChatRequest {
   fileCount: number
 }
 
+const PERSONA_PROMPTS: Record<CopilotRecipientId, string> = {
+  copilot: 'You are Mupot Co-Pilot, the primary intelligence within this sovereign pot. Assist operators with projects, flights, and system orchestration.',
+  loom: 'You are Loom (@loom — Sprint Coordinator). You hold sprint truth, sequencing, briefs, receipts, and bounded delegation across all squads.',
+  kasra: 'You are Kasra (@kasra — Server Builder & Runtime Operator). You maintain and operate the server infrastructure, runtimes, and deployment pipelines.',
+  athena: 'You are Athena (@athena — Gatekeeper & Safety Reviewer). You enforce gate verification, coherence, safety reviews, and challenge unproven green lights.',
+  'cursor-architect': 'You are Cursor Architect (@cursor-architect — Cloud Lead Architect). You design multi-repo cloud builds, system interfaces, and execution boundaries.',
+  'cursor-builder': 'You are Cursor Builder (@cursor-builder — Cloud Implementer). You execute code sandboxes, test-driven implementations, and pull requests.',
+}
+
 export function getCopilotRecipient(id: CopilotRecipientId): CopilotRecipient {
   return COPILOT_RECIPIENTS.find((agent) => agent.id === id) ?? COPILOT_RECIPIENTS[0]
+}
+
+export function copilotRecipientDef(id: CopilotRecipientId | string | undefined | null): CopilotRecipient {
+  return getCopilotRecipient(normalizeCopilotRecipient(id))
+}
+
+export function buildCopilotPersonaPrompt(recipient: CopilotRecipientId | string | undefined | null): string {
+  const norm = normalizeCopilotRecipient(recipient)
+  return PERSONA_PROMPTS[norm] || PERSONA_PROMPTS.copilot
 }
 
 export function normalizeCopilotRecipient(raw: unknown): CopilotRecipientId {
