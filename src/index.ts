@@ -301,6 +301,8 @@ function reportUnmatchedCron(scheduledAt: Date): void {
     scheduled_time: scheduledAt.toISOString(),
     expected_trigger_count: 2,
   })
+}
+
 export default {
   fetch: async (req: Request, env: Env, ctx: ExecutionContext) => {
     // ── Cloudflare Workers for Platforms (WFP) Sovereign Tenant Routing ──
