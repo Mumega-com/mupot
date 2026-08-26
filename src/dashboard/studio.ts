@@ -28,6 +28,9 @@ import { MUPOT_FAVICON_32_PNG_B64, MUPOT_MARK_64_PNG_B64 } from './brand-assets'
 import { readStudioChatPayload, streamStudioChat } from './copilot'
 import { handleStudioChat, type StudioChatRole } from './studio-chat'
 
+import { resolveTier } from '../billing/entitlement'
+import { listPresence } from '../fleet/presence'
+
 export {
   STUDIO_CHAT_ADMIN_TOOLS,
   studioChatAuthorityFromAuth,
@@ -56,12 +59,26 @@ export interface StudioDispatchOk {
   cursor_launched?: boolean
 }
 
+export interface StudioAgentCard {
+  id: string
+  slug: string
+  name: string
+  role: string
+  model: string
+  activeSeat?: string | null
+  harness?: string | null
+  provider?: string | null
+  isLive?: boolean
+}
+
 export interface StudioViewData {
   brand: string
   tenant: string
+  tier?: string
   operator: string
   branch: string
   flights: FlightRow[]
+  agents?: StudioAgentCard[]
   repoUrl?: string
   authorityRole?: StudioChatRole
 }
@@ -81,12 +98,43 @@ export function normalizeStudioModel(raw: string | undefined): StudioModel {
 
 export async function loadStudioData(env: Env, auth: AuthContext): Promise<StudioViewData> {
   const flights = await listFlights(env, 12)
+  const tier = await resolveTier(env)
+
+  let agents: StudioAgentCard[] = []
+  try {
+    const agentRows = await env.DB.prepare(
+      'SELECT id, slug, name, role, model FROM agents WHERE status = "active" ORDER BY created_at ASC LIMIT 16'
+    ).all<{ id: string; slug: string; name: string; role: string; model: string }>()
+
+    const presenceList = await listPresence(env)
+    const presenceMap = new Map(presenceList.map((p) => [p.bound_agent_id, p]))
+
+    agents = (agentRows.results || []).map((a) => {
+      const p = presenceMap.get(a.id)
+      return {
+        id: a.id,
+        slug: a.slug,
+        name: a.name,
+        role: a.role,
+        model: a.model,
+        activeSeat: p?.seat || null,
+        harness: p?.harness || null,
+        provider: p?.provider || null,
+        isLive: !!p && (Date.now() - new Date(p.last_seen_at).getTime() < 300_000),
+      }
+    })
+  } catch {
+    agents = []
+  }
+
   return {
     brand: env.BRAND || 'Mupot',
-    tenant: env.TENANT_SLUG,
+    tenant: env.TENANT_SLUG || 'default',
+    tier,
     operator: auth.email || auth.userId,
     branch: studioBranchLabel(env),
     flights,
+    agents,
     authorityRole: isOrgAdmin(auth) ? 'admin' : 'member',
   }
 }
@@ -233,9 +281,10 @@ export function studioPageHtml(data: StudioViewData): HtmlEscapedString | Promis
           <img src="${raw(`data:image/png;base64,${MUPOT_MARK_64_PNG_B64}`)}" alt="" width="28" height="28" />
           <span>
             <strong>${data.brand} Studio</strong>
-            <em>Interactive canvas</em>
+            <em>Interactive sovereign canvas</em>
           </span>
         </a>
+        ${data.tier ? html`<span class="studio-tier-badge">⚡ ${data.tier.toUpperCase()} TIER</span>` : ''}
         <p class="studio-operator">Signed in as <b>${data.operator}</b></p>
         <span id="studio-authority-badge" class="studio-authority ${authorityClass}" data-studio-role="${authorityRole}">${authorityLabel}</span>
         <nav class="studio-top-links" aria-label="Studio shortcuts">
@@ -278,6 +327,30 @@ export function studioPageHtml(data: StudioViewData): HtmlEscapedString | Promis
             <button type="button" class="studio-dispatch" id="studio-dispatch">Dispatch flight</button>
             <p class="studio-dispatch-status" id="studio-dispatch-status" role="status" aria-live="polite"></p>
           </div>
+
+          ${data.agents && data.agents.length ? html`
+          <section class="studio-card studio-agent-radar" aria-labelledby="studio-radar-heading">
+            <header class="studio-radar-header">
+              <h2 id="studio-radar-heading">Active Workforce Radar</h2>
+              <span class="studio-agent-count">${data.agents.length} Agents</span>
+            </header>
+            <div class="studio-agent-grid">
+              ${data.agents.map((agent) => html`
+                <div class="studio-agent-card ${agent.isLive ? 'is-live' : 'is-idle'}">
+                  <div class="studio-agent-top">
+                    <span class="studio-agent-dot" title="${agent.isLive ? 'Active 7-Axis Presence' : 'Standby'}"></span>
+                    <strong class="studio-agent-name">${agent.name}</strong>
+                    <span class="studio-agent-role ${agent.role === 'lead' ? 'is-lead' : 'is-member'}">${agent.role.toUpperCase()}</span>
+                  </div>
+                  <div class="studio-agent-details">
+                    <span class="studio-agent-chip studio-chip-model">${agent.model || 'claude-3-7-sonnet'}</span>
+                    <span class="studio-agent-chip studio-chip-seat">${agent.activeSeat || agent.slug}</span>
+                    ${agent.harness ? html`<span class="studio-agent-chip studio-chip-harness">${agent.harness}</span>` : ''}
+                  </div>
+                </div>
+              `)}
+            </div>
+          </section>` : ''}
 
           <section class="studio-card studio-copilot is-always-on" id="studio-copilot" data-always-on="true" aria-labelledby="studio-chat-heading">
             <header class="studio-copilot-head">
@@ -405,6 +478,35 @@ const STUDIO_CSS = `
   }
   .studio-authority-admin { color: var(--studio-ok); background: rgba(61,214,140,.12); border: 1px solid rgba(61,214,140,.35); }
   .studio-authority-member { color: #7dd3fc; background: rgba(56,189,248,.12); border: 1px solid rgba(56,189,248,.35); }
+  .studio-tier-badge {
+    display: inline-flex; align-items: center; gap: 4px;
+    background: rgba(34, 197, 94, 0.12); color: #4ade80; border: 1px solid rgba(34, 197, 94, 0.3);
+    border-radius: 999px; padding: 4px 10px; font: 700 11px var(--font-mono); letter-spacing: .04em;
+  }
+  .studio-agent-radar { border-color: rgba(34, 211, 238, 0.2); }
+  .studio-radar-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+  .studio-radar-header h2 { margin: 0; font-size: 13px; letter-spacing: .04em; text-transform: uppercase; color: var(--studio-muted); }
+  .studio-agent-count { font: 600 11px var(--font-mono); color: var(--studio-cyan); }
+  .studio-agent-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 8px; }
+  .studio-agent-card {
+    background: var(--studio-raised); border: 1px solid var(--studio-line);
+    border-radius: 10px; padding: 8px 10px; display: flex; flex-direction: column; gap: 6px;
+  }
+  .studio-agent-card.is-live { border-color: rgba(34, 197, 94, 0.35); background: rgba(34, 197, 94, 0.03); }
+  .studio-agent-top { display: flex; align-items: center; gap: 6px; }
+  .studio-agent-dot { width: 7px; height: 7px; border-radius: 50%; background: #64748b; }
+  .studio-agent-card.is-live .studio-agent-dot { background: #22c55e; box-shadow: 0 0 6px rgba(34, 197, 94, 0.6); }
+  .studio-agent-name { font-size: 12px; font-weight: 600; color: var(--studio-ink); flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .studio-agent-role {
+    font: 700 9px var(--font-mono); padding: 1px 5px; border-radius: 4px; letter-spacing: .03em;
+  }
+  .studio-agent-role.is-lead { background: rgba(232, 121, 249, 0.18); color: var(--studio-magenta); }
+  .studio-agent-role.is-member { background: rgba(56, 189, 248, 0.15); color: var(--studio-cyan); }
+  .studio-agent-details { display: flex; flex-wrap: wrap; gap: 4px; }
+  .studio-agent-chip {
+    font: 10px var(--font-mono); color: var(--studio-muted); background: rgba(255, 255, 255, 0.04);
+    padding: 1px 5px; border-radius: 4px;
+  }
   .studio-top-links { margin-left: auto; display: flex; gap: 14px; }
   .studio-top-links a { color: var(--studio-cyan); text-decoration: none; font-size: 13px; }
   .studio-split { display: flex; min-height: 0; }
