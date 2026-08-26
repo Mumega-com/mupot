@@ -5,11 +5,18 @@
 //   POST /api/studio/dispatch    create a flight + task from a prompt
 //
 // PURE-ISH VIEW + thin write path. Auth is the dashboard session
-// (`getAuthContext` / `c.get('auth')`). Writes reuse createTask + createFlight.
+// (`getAuthContext` / `c.get('auth')`) or a member-bearer token on the
+// `/api/studio` mount. Writes reuse createTask + createFlight. When
+// CURSOR_API_TOKEN is bound and the model is cursor-cloud, dispatch also
+// launches a Cursor Cloud agent.
 
+import { Hono } from 'hono'
 import { html, raw } from 'hono/html'
 import type { HtmlEscapedString } from 'hono/utils/html'
 import type { Context } from 'hono'
+import { resolveCapabilities, holdsCapabilityFloor, isOrgAdmin } from '../auth/capability'
+import { bearerToken, resolveMemberByToken } from '../auth/member-bearer'
+import { createCursorAgent, resolveCursorApiToken } from '../cursor/client'
 import type { AuthContext, Env } from '../types'
 import { createFlight, listFlights, type FlightRow } from '../flight/service'
 import { createTask } from '../tasks/service'
@@ -28,6 +35,10 @@ export interface StudioDispatchOk {
   flight_id: string
   task_id: string | null
   model: StudioModel
+  agent_id?: string | null
+  run_id?: string | null
+  agent_url?: string | null
+  cursor_launched?: boolean
 }
 
 export interface StudioViewData {
@@ -86,6 +97,21 @@ export async function dispatchStudioFlight(
   if (!home) return { ok: false, status: 409, error: 'no_squad' }
 
   const title = prompt.length > 80 ? `${prompt.slice(0, 77)}…` : prompt
+  let cursor: { agent_id: string; run_id: string; agent_url: string } | null = null
+  const token = model === 'cursor-cloud' ? resolveCursorApiToken(env) : null
+  if (token && repoUrl) {
+    try {
+      const launched = await createCursorAgent(token, { name: title, repoUrl, prompt })
+      cursor = {
+        agent_id: launched.agent.id,
+        run_id: launched.run.id,
+        agent_url: launched.agent.url,
+      }
+    } catch {
+      cursor = null
+    }
+  }
+
   const body = [
     prompt,
     '',
@@ -93,6 +119,9 @@ export async function dispatchStudioFlight(
     repoUrl ? `repo: ${repoUrl}` : null,
     `dispatched_by: ${auth.email || auth.userId}`,
     'source: mupot-studio',
+    cursor ? `cursor_agent: ${cursor.agent_id}` : null,
+    cursor ? `cursor_run: ${cursor.run_id}` : null,
+    cursor ? `cursor_url: ${cursor.agent_url}` : null,
   ]
     .filter((line) => line !== null)
     .join('\n')
@@ -121,7 +150,10 @@ export async function dispatchStudioFlight(
       squad_ids: [home.squadId],
       task_ids: [task.id],
       done_when: ['Studio canvas shows a reviewable preview and the flight can land.'],
-      artifact_refs: repoUrl ? [repoUrl] : [],
+      artifact_refs: [
+        ...(repoUrl ? [repoUrl] : []),
+        ...(cursor ? [cursor.agent_url] : []),
+      ],
       receipt_refs: [],
       confidentiality: 'internal',
       publication_target: 'none',
@@ -131,7 +163,16 @@ export async function dispatchStudioFlight(
 
   return {
     ok: true,
-    result: { ok: true, flight_id: flightId, task_id: task.id, model },
+    result: {
+      ok: true,
+      flight_id: flightId,
+      task_id: task.id,
+      model,
+      agent_id: cursor?.agent_id ?? null,
+      run_id: cursor?.run_id ?? null,
+      agent_url: cursor?.agent_url ?? null,
+      cursor_launched: cursor !== null,
+    },
   }
 }
 
@@ -567,3 +608,74 @@ async function resolveStudioHome(
   if (squad) return { agentId: 'studio', squadId: squad.id }
   return null
 }
+
+function sessionAuth(c: { get: (key: 'auth') => AuthContext | undefined }): AuthContext | null {
+  try {
+    return c.get('auth') ?? null
+  } catch {
+    return null
+  }
+}
+
+async function resolveStudioApiAuth(c: {
+  env: Env
+  req: { header: (name: string) => string | undefined }
+  get: (key: 'auth') => AuthContext | undefined
+}): Promise<{ ok: true; auth: AuthContext } | { ok: false; status: 401 | 403; error: string }> {
+  const existing = sessionAuth(c)
+  if (existing) {
+    if (isOrgAdmin(existing) || holdsCapabilityFloor(existing, 'member') || existing.role === 'admin' || existing.role === 'owner') {
+      return { ok: true, auth: existing }
+    }
+    return { ok: false, status: 403, error: 'forbidden' }
+  }
+
+  const identity = await resolveMemberByToken(c.env, bearerToken(c.req.header('authorization')))
+  if (!identity) return { ok: false, status: 401, error: 'unauthorized' }
+  const capabilities = await resolveCapabilities(c.env, identity.memberId)
+  const auth: AuthContext = {
+    userId: identity.memberId,
+    email: identity.email,
+    role: 'member',
+    tenant: c.env.TENANT_SLUG,
+    memberId: identity.memberId,
+    channel: 'workspace',
+    capabilities,
+    boundAgentId: identity.boundAgentId,
+    tokenId: identity.tokenId,
+  }
+  if (!isOrgAdmin(auth) && !holdsCapabilityFloor(auth, 'member')) {
+    return { ok: false, status: 403, error: 'forbidden' }
+  }
+  return { ok: true, auth }
+}
+
+export const studioApp = new Hono<{ Bindings: Env; Variables: { auth?: AuthContext } }>()
+
+studioApp.post('/dispatch', async (c) => {
+  const resolved = await resolveStudioApiAuth(c)
+  if (!resolved.ok) return c.json({ ok: false, error: resolved.error }, resolved.status)
+
+  let body: Record<string, unknown>
+  try {
+    body = await c.req.json() as Record<string, unknown>
+  } catch {
+    return c.json({ ok: false, error: 'invalid_json' }, 400)
+  }
+
+  const prompt = typeof body.prompt === 'string'
+    ? body.prompt
+    : typeof body.name === 'string'
+      ? body.name
+      : ''
+  const repoUrl = typeof body.repoUrl === 'string'
+    ? body.repoUrl
+    : typeof body.repo_url === 'string'
+      ? body.repo_url
+      : undefined
+  const model = typeof body.model === 'string' ? body.model : undefined
+
+  const result = await dispatchStudioFlight(c.env, resolved.auth, { prompt, repoUrl, model })
+  if (!result.ok) return c.json({ ok: false, error: result.error }, result.status)
+  return c.json(result.result)
+})

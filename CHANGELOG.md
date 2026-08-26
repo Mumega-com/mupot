@@ -2,6 +2,11 @@
 
 ## 0.30.0 — 2026-08-21
 
+- **Cursor Cloud SaaS engine & MCP tools** (`src/cursor/client.ts`, `src/mcp/cursor.ts`, `src/dashboard/studio.ts`).
+  - Typed client for `https://api.cursor.com/v1` (`createCursorAgent`, `dispatchCursorRun`, `getCursorAgent`, `getCursorRun`).
+  - MCP `cursor_dispatch` / `cursor_run_status` write matching task + flight records and return `agent_url`.
+  - `POST /api/studio/dispatch` optionally launches a Cursor Cloud agent when `CURSOR_API_TOKEN` is bound.
+
 - **MCP `loop_control` governor tool** (`src/mcp/loops.ts`, `src/loops/decisions.ts`, `migrations/0127_loop_control_receipts.sql`; #1166).
   - Agents can pause, kill, or budget-cap a running loop over MCP — the dashboard-only `setLoopControl` path is no longer the sole lever.
   - Authorization: org-admin, or at least `lead` on the loop's owning squad. `kill` requires an attributed reason.
