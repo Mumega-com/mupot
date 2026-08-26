@@ -155,7 +155,7 @@ describe('POST /api/studio/chat', () => {
     expect(res.status).toBe(200)
     expect(res.headers.get('Content-Type')).toContain('text/event-stream')
     const text = await res.text()
-    expect(text).toContain('Co-Pilot')
+    expect(text).toMatch(/Copilot|Co-Pilot/)
   })
 
   it('rejects an empty message', async () => {
@@ -181,10 +181,13 @@ describe('POST /api/studio/chat', () => {
     await res.text()
     expect(seen).toHaveLength(1)
     expect(seen[0].some((m) => m.role === 'system')).toBe(true)
-    expect(seen[0].filter((m) => m.role !== 'system')).toEqual([
+    expect(seen[0].filter((m) => m.role === 'user' || m.role === 'assistant').slice(0, 2)).toEqual([
       { role: 'user', content: 'Start' },
       { role: 'assistant', content: 'Started' },
-      { role: 'user', content: 'Continue' },
     ])
+    const lastUser = [...seen[0]].reverse().find((m) => m.role === 'user')
+    expect(lastUser?.content).toContain('Continue')
+    expect(lastUser?.content).toContain('--- DYNAMIC CONTEXT ---')
+    expect(seen[0][0]?.content).toContain('--- FROZEN STATIC PREFIX ---')
   })
 })

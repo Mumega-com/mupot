@@ -14,7 +14,7 @@ import {
 } from './dispatcher'
 import { githubRepoSlug } from '../projects/urls'
 import { PROJECT_SANDBOX_QUICK_PROMPTS } from '../projects/provisioner'
-import { copilotDeepChatMarkup } from '../dashboard/copilot'
+import { copilotDeepChatMarkup, copilotRecipientSelectHtml } from '../dashboard/copilot'
 
 type AppEnv = { Bindings: Env }
 
@@ -161,6 +161,7 @@ export function projectLivePreviewSplitHtml(input: ProjectPreviewSplitInput): Ht
         ${PROJECT_SANDBOX_QUICK_PROMPTS.map((prompt) => html`<button type="button" class="btn secondary sm" data-quick-prompt="${prompt}">${prompt}</button>`)}
       </div>
       <div class="sandbox-copilot" data-project-copilot="${project.id}" data-project-repo="${project.repo_url ?? ''}">
+        ${copilotRecipientSelectHtml('mupot-copilot-sandbox-recipient')}
         ${copilotDeepChatMarkup({
           projectId: project.id,
           projectRepo: project.repo_url ?? '',

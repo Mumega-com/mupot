@@ -10,10 +10,25 @@ import { classify, humanAge, type FleetLiveness } from '../dashboard/fleet'
 import type { AgentIdentity } from '../auth/member-bearer'
 import { listFlights } from '../flight/service'
 import { scheduleStates, attachSchedule, type ScheduleStatus } from './schedule-state'
+import {
+  parseSevenAxisCheckin,
+  sevenAxisHasValues,
+  type SevenAxisPresence,
+} from '../presence/seven-axis'
 
 // Allowed runtime sources — an unknown/invalid value normalizes to 'unknown'
 // (never trusts the client's raw string into storage unbounded).
-const SOURCES = new Set(['claude-code', 'codex', 'hermes', 'openclaw', 'tmux', 'cowork', 'unknown'])
+const SOURCES = new Set([
+  'claude-code',
+  'codex',
+  'hermes',
+  'openclaw',
+  'tmux',
+  'cowork',
+  'unknown',
+  'cursor-cloud',
+  'cursor-ide',
+])
 
 export const SEVEN_AXIS_HARNESSES = [
   'cursor-ide',
