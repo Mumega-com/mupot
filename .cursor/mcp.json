@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "mupot-gaf": {
+      "url": "https://mupot.mumega.com/mcp",
+      "headers": {
+        "Authorization": "Bearer mupot_0ab051746f4576729f8e1835bcf4d5122a5325113610bd873038df24cbbf9171",
+        "x-mupot-tenant-slug": "gaf"
+      }
+    }
+  }
+}
