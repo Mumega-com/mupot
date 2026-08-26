@@ -248,6 +248,11 @@ export interface Env {
   POSTHOG_PROJECT_ID?: string // PostHog project id (e.g. "436189"). Non-secret.
   POSTHOG_HOST?: string // PostHog API host. Default https://us.posthog.com. Non-secret; https only.
   POSTHOG_PERSONAL_API_KEY?: string // PostHog personal API key (read-scope). Secret. Absent ⇒ source unavailable.
+  // Cursor Cloud Agents API (src/cursor/client.ts). Secret via `wrangler secret put`.
+  // CURSOR_API_TOKEN is the pot's preferred name; CURSOR_API_KEY is accepted as an
+  // alias because that is the name Cursor's own docs use.
+  CURSOR_API_TOKEN?: string
+  CURSOR_API_KEY?: string
 }
 
 // ── Org domain (mirrors migrations/0001_init.sql + 0009_work_unit.sql) ──

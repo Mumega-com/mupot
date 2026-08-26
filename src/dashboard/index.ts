@@ -205,6 +205,7 @@ import { listFlights } from '../flight/service'
 import { buildBoard } from '../flight/board'
 import type { FlightCard } from '../flight/board'
 import { wizardApp } from './wizard'
+import { studioApp } from './studio'
 import { isOnboardingComplete } from './settings'
 import { loadBrainView, brainBody, regimeBadgeClass, loadBrainPhysics } from './brain'
 import type { PhysicsSnapshot } from './brain'
@@ -387,6 +388,7 @@ dashboardApp.use('*', async (c, next) => {
 // Mounted on the authenticated, tenant-guarded dashboard app. The wizard enforces
 // its own owner-only gate (org role 'owner' OR org-capability 'owner') internally.
 dashboardApp.route('/setup', wizardApp)
+dashboardApp.route('/api/studio', studioApp)
 
 // ── routes ───────────────────────────────────────────────────────────────────
 

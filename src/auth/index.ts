@@ -8,9 +8,10 @@
 // in KV and is re-loaded on every request.
 //
 // Exports:
-//   - authApp      : Hono sub-app mounted at ROUTES.auth ('/auth')
-//   - requireAuth  : Hono middleware → sets c.get('auth') = AuthContext | 401
-//   - requireRole  : factory → middleware enforcing a minimum org role | 403
+//   - authApp         : Hono sub-app mounted at ROUTES.auth ('/auth')
+//   - requireAuth     : Hono middleware → sets c.get('auth') = AuthContext | 401
+//   - peekSessionAuth : same cookie/KV read as requireAuth, null instead of 401
+//   - requireRole     : factory → middleware enforcing a minimum org role | 403
 
 import { Hono } from 'hono'
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie'
@@ -654,6 +655,71 @@ function setSessionCookie(
 // ── middleware ───────────────────────────────────────────────────────────────
 
 /**
+ * Load the dashboard session from the cookie + KV. Returns null when the cookie
+ * is absent, the session is missing/expired/corrupt, or SESSIONS is unbound.
+ * Does not write a response — callers that must refuse use requireAuth.
+ */
+async function loadAuthFromCookie(c: Context<AppEnv>): Promise<AuthContext | null> {
+  const sessionId = getCookie(c, COOKIE_NAME)
+  if (!sessionId) return null
+  if (!c.env.SESSIONS) return null
+  const raw = await c.env.SESSIONS.get(sessionKey(sessionId))
+  if (!raw) return null
+  let record: SessionRecord
+  try {
+    record = JSON.parse(raw) as SessionRecord
+  } catch {
+    // Corrupt session — treat as invalid, clear it.
+    await c.env.SESSIONS.delete(sessionKey(sessionId))
+    return null
+  }
+  const auth: AuthContext = {
+    userId: record.userId,
+    email: record.email,
+    role: record.role,
+    tenant: c.env.TENANT_SLUG, // tenant is environment-derived, not client-supplied
+  }
+
+  // Email→member bridge (the DASHBOARD member-resolution the members schema always
+  // specified — "workspace, IM, or the dashboard, all resolving to member_id +
+  // capabilities" — but which the web-session path never implemented). A plain
+  // Google web login is otherwise an org-role-only principal with no memberId and
+  // no fine-grained grants, so squad-scoped surfaces show it nothing. Resolve the
+  // member by VERIFIED email (the /callback + /handoff paths both reject an
+  // unverified email before minting a session) and attach its grants.
+  //
+  // INVARIANTS (this is a sensitive RBAC surface):
+  //  - role === 'member' ONLY. Owners/admins keep the pure legacy-role path; attaching
+  //    a lesser member grant to them would DEFINE auth.capabilities and thereby disable
+  //    the `capabilities === undefined` legacy-role escape in requireCapability →
+  //    downgrading an owner. Scoping is only ever needed for plain members.
+  //  - tenant-scoped — never resolve a member from another tenant (cross-tenant leak).
+  //  - status='active' — suspended members get nothing.
+  //  - fail-closed — no (or non-unique) match leaves memberId unset: identical to
+  //    today's behaviour, never an over-grant. members.email is UNIQUE so LIMIT 1 is
+  //    deterministic; the bridge is purely ADDITIVE (only grants scope, never removes).
+  if (auth.role === 'member' && auth.email && c.env.DB) {
+    // Case-insensitive email match (lower() both sides): email is case-insensitive
+    // in practice, but the session email (/callback stores it raw) and members.email
+    // (inserted as-provided, BINARY-collated UNIQUE) can differ in case — an operator
+    // invited as `Gavin@x` whom Google returns as `gavin@x` would otherwise silently
+    // resolve to no member. Still fail-closed (only ever under-grants).
+    const member = await c.env.DB.prepare(
+      "SELECT id FROM members WHERE lower(email) = lower(?1) AND tenant = ?2 AND status = 'active' LIMIT 1",
+    )
+      .bind(auth.email, c.env.TENANT_SLUG)
+      .first<{ id: string }>()
+    if (member) {
+      auth.memberId = member.id
+      auth.capabilities = await resolveCapabilities(c.env, member.id)
+      auth.channel = 'dashboard'
+    }
+  }
+
+  return auth
+}
+
+/**
  * requireAuth — load the session from KV via the cookie and populate
  * c.set('auth', AuthContext) scoped to THIS tenant (env.TENANT_SLUG). 401 if the
  * cookie is absent or the session is missing/expired. The tenant is taken from
@@ -661,71 +727,38 @@ function setSessionCookie(
  */
 function requireAuthMw(): MiddlewareHandler<AppEnv> {
   return async (c, next) => {
-    const sessionId = getCookie(c, COOKIE_NAME)
-    if (!sessionId) {
-      return c.json({ error: 'unauthenticated' }, 401)
-    }
-    const raw = await c.env.SESSIONS.get(sessionKey(sessionId))
-    if (!raw) {
-      return c.json({ error: 'unauthenticated' }, 401)
-    }
-    let record: SessionRecord
-    try {
-      record = JSON.parse(raw) as SessionRecord
-    } catch {
-      // Corrupt session — treat as invalid, clear it.
-      await c.env.SESSIONS.delete(sessionKey(sessionId))
-      return c.json({ error: 'unauthenticated' }, 401)
-    }
-    const auth: AuthContext = {
-      userId: record.userId,
-      email: record.email,
-      role: record.role,
-      tenant: c.env.TENANT_SLUG, // tenant is environment-derived, not client-supplied
-    }
-
-    // Email→member bridge (the DASHBOARD member-resolution the members schema always
-    // specified — "workspace, IM, or the dashboard, all resolving to member_id +
-    // capabilities" — but which the web-session path never implemented). A plain
-    // Google web login is otherwise an org-role-only principal with no memberId and
-    // no fine-grained grants, so squad-scoped surfaces show it nothing. Resolve the
-    // member by VERIFIED email (the /callback + /handoff paths both reject an
-    // unverified email before minting a session) and attach its grants.
-    //
-    // INVARIANTS (this is a sensitive RBAC surface):
-    //  - role === 'member' ONLY. Owners/admins keep the pure legacy-role path; attaching
-    //    a lesser member grant to them would DEFINE auth.capabilities and thereby disable
-    //    the `capabilities === undefined` legacy-role escape in requireCapability →
-    //    downgrading an owner. Scoping is only ever needed for plain members.
-    //  - tenant-scoped — never resolve a member from another tenant (cross-tenant leak).
-    //  - status='active' — suspended members get nothing.
-    //  - fail-closed — no (or non-unique) match leaves memberId unset: identical to
-    //    today's behaviour, never an over-grant. members.email is UNIQUE so LIMIT 1 is
-    //    deterministic; the bridge is purely ADDITIVE (only grants scope, never removes).
-    if (auth.role === 'member' && auth.email) {
-      // Case-insensitive email match (lower() both sides): email is case-insensitive
-      // in practice, but the session email (/callback stores it raw) and members.email
-      // (inserted as-provided, BINARY-collated UNIQUE) can differ in case — an operator
-      // invited as `Gavin@x` whom Google returns as `gavin@x` would otherwise silently
-      // resolve to no member. Still fail-closed (only ever under-grants).
-      const member = await c.env.DB.prepare(
-        "SELECT id FROM members WHERE lower(email) = lower(?1) AND tenant = ?2 AND status = 'active' LIMIT 1",
-      )
-        .bind(auth.email, c.env.TENANT_SLUG)
-        .first<{ id: string }>()
-      if (member) {
-        auth.memberId = member.id
-        auth.capabilities = await resolveCapabilities(c.env, member.id)
-        auth.channel = 'dashboard'
-      }
-    }
-
+    const auth = await loadAuthFromCookie(c)
+    if (!auth) return c.json({ error: 'unauthenticated' }, 401)
     c.set('auth', auth)
     await next()
   }
 }
 
 export const requireAuth: MiddlewareHandler<AppEnv> = requireAuthMw()
+
+/**
+ * Same cookie/KV resolution as requireAuth, but optional: returns null instead
+ * of writing 401. Used by surfaces that admit guests (Studio co-pilot chat)
+ * while still elevating a live admin/owner session when one is present.
+ * If auth is already on the context (dashboard requireAuth ran), that wins.
+ */
+export async function peekSessionAuth(c: Context<AppEnv>): Promise<AuthContext | null> {
+  try {
+    const existing = c.get('auth')
+    if (existing) return existing
+  } catch {
+    // Variable not registered on this context — fall through to the cookie.
+  }
+  const auth = await loadAuthFromCookie(c)
+  if (auth) {
+    try {
+      c.set('auth', auth)
+    } catch {
+      // Context may not declare the auth variable (public /api/studio mount).
+    }
+  }
+  return auth
+}
 
 /**
  * requireRole(min) — gate a route on a minimum org role (owner>admin>member).
