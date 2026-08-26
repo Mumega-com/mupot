@@ -373,15 +373,21 @@ describe('POST /api/webhooks/github', () => {
     const env = makeEnv(harness)
     const app = createAthenaWebhookApp({ id: () => 'receipt-hono' })
     const body = JSON.stringify(prPayload())
+    // The sub-app is mounted at /api/webhooks/github in src/index.ts, so its
+    // own route table is POST /. Isolated fetch must use that path.
+    const toApp = async (secret: string) => {
+      const signed = await signedRequest(body, {}, secret)
+      return new Request('https://pot.test/', {
+        method: 'POST',
+        headers: signed.headers,
+        body,
+      })
+    }
 
-    const forged = await app.fetch(
-      await signedRequest(body, {}, 'forged'),
-      env,
-      {} as ExecutionContext,
-    )
+    const forged = await app.fetch(await toApp('forged'), env, {} as ExecutionContext)
     expect(forged.status).toBe(401)
 
-    const ok = await app.fetch(await signedRequest(body), env, {} as ExecutionContext)
+    const ok = await app.fetch(await toApp(WEBHOOK_SECRET), env, {} as ExecutionContext)
     expect(ok.status).toBe(200)
     const json = await ok.json() as { verdict: string; receipt_id: string }
     expect(json).toMatchObject({ verdict: 'APPROVED', receipt_id: 'receipt-hono' })
