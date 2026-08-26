@@ -14,11 +14,14 @@
 // but the sub-select is simpler and indexed by (task_id).
 
 import type { Env, AuthContext } from '../types'
+import type { AthenaGateReceipt } from '../athena/webhook'
 import {
   pageHeader,
   dataTable,
   pill,
   emptyState,
+  sectionPanel,
+  type Tone,
 } from './ui'
 import type { HtmlEscapedString } from 'hono/utils/html'
 import { html } from 'hono/html'
@@ -145,7 +148,10 @@ function fmtWhen(iso: string): string {
  * tagged template.  pill() receives literal strings only.
  */
 export function verificationsBody(items: VerificationItem[]): HtmlEscapedString {
-  const header = pageHeader({ title: 'Verifications', sub: 'Latest gate decision per task.' })
+  const header = pageHeader({
+    title: 'Verifications',
+    sub: 'Latest gate decision per task, plus recent Athena PR gate audits.',
+  })
 
   if (items.length === 0) {
     return html`${header}${emptyState({
@@ -190,4 +196,43 @@ export function verificationsBody(items: VerificationItem[]): HtmlEscapedString 
   })
 
   return html`${header}${table}` as HtmlEscapedString
+}
+
+function verdictTone(verdict: string): Tone {
+  if (verdict === 'APPROVED') return 'ok'
+  if (verdict === 'BLOCKED') return 'danger'
+  return 'warn'
+}
+
+function shortSha(sha: string): string {
+  return sha.length > 7 ? sha.slice(0, 7) : sha
+}
+
+/**
+ * Recent Athena GitHub webhook gate receipts — append-only audit of
+ * `POST /api/webhooks/github` verdicts.
+ */
+export function athenaGateReceiptsBody(receipts: AthenaGateReceipt[]): HtmlEscapedString {
+  const rows = receipts.map((item): HtmlEscapedString[] => [
+    html`<span>${item.repo}</span><br /><small style="color:var(--dim)">#${String(item.pr_number)} @ ${shortSha(item.commit_sha)}</small>` as HtmlEscapedString,
+    pill(item.verdict, verdictTone(item.verdict)) as HtmlEscapedString,
+    html`${item.summary}` as HtmlEscapedString,
+    html`${fmtWhen(item.created_at)}` as HtmlEscapedString,
+  ])
+
+  const table = dataTable({
+    cols: [
+      { label: 'PR', width: '1.4fr' },
+      { label: 'VERDICT', width: '180px' },
+      { label: 'SUMMARY', width: '2fr' },
+      { label: 'WHEN', width: '180px' },
+    ],
+    rows,
+    empty: 'No Athena PR gate audits yet. Opened, synchronized, and reopened pull requests land here.',
+  })
+
+  return html`${sectionPanel({
+    title: 'Athena PR gate audits',
+    body: table,
+  })}` as HtmlEscapedString
 }

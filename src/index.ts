@@ -36,6 +36,7 @@ import { channelsApp, reconcileMembership } from './channels'
 import { channelsAdminApp } from './channels/admin'
 import { ghlInboundApp } from './integrations/ghl-routes'
 import { githubInboundApp } from './integrations/github-routes'
+import { athenaWebhookApp } from './athena/routes'
 import { eventIngestApp } from './events/ingest'
 import { prospectsApp } from './loops/prospects-routes'
 import { loopsApp } from './loops/routes'
@@ -109,6 +110,8 @@ app.route('/api/integrations/ghl', ghlInboundApp)
 app.route('/api/events', eventIngestApp)
 // GitHub weave: inbound webhook (HMAC-verified by GITHUB_WEBHOOK_SECRET) → work units.
 app.route('/api/integrations/github', githubInboundApp)
+// Athena PR gate: inbound GitHub pull_request webhook → review + comment + status + D1 receipt.
+app.route('/api/webhooks/github', athenaWebhookApp)
 app.route('/api/prospects', prospectsApp)
 app.route('/api/loops', loopsApp)
 // Flock check-in (Flock #45): agents POST presence with their member-token (bearer).

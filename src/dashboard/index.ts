@@ -109,7 +109,8 @@ import type { PublicSecretEnvRequest } from '../secret-env/types'
 import { loadLoopsView, loopsBody } from './loops'
 import { loadEconomy, economyBody, loadTodaySpendScalar } from './economy'
 import { loadDeployment, deploymentBody } from './deployment'
-import { loadVerifications, verificationsBody } from './verifications'
+import { loadVerifications, verificationsBody, athenaGateReceiptsBody } from './verifications'
+import { listAthenaGateReceipts } from '../athena/webhook'
 import { loadAudit, auditBody } from './audit'
 import { loadBilling, billingBody } from './billing'
 import { servicesBody } from './services'
@@ -1043,7 +1044,14 @@ dashboardApp.get('/economy/marketplace', (c) =>
 // Read-only. Visibility mirrors /approvals (owner/admin all; others gate-scoped).
 dashboardApp.get('/verifications', async (c) => {
   const items = await loadVerifications(c.env, c.get('auth'))
-  return c.html(shell(c.env, 'Verifications', verificationsBody(items)))
+  const athenaReceipts = await listAthenaGateReceipts(c.env)
+  return c.html(
+    shell(
+      c.env,
+      'Verifications',
+      html`${verificationsBody(items)}${athenaGateReceiptsBody(athenaReceipts)}`,
+    ),
+  )
 })
 
 // ── audit — immutable trail (connector actions + gate decisions). Owner/admin. ─

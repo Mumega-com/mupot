@@ -9,6 +9,11 @@
 
 ## 0.30.0 — 2026-08-21
 
+- **Athena GitHub webhook PR gate** (`src/athena/webhook.ts`, `src/athena/routes.ts`, `migrations/0130_athena_gate_receipts.sql`).
+  - `POST /api/webhooks/github` verifies `X-Hub-Signature-256` (or a fail-safe `GITHUB_TOKEN` bearer when the HMAC secret is unset), reviews `pull_request` `{opened, synchronize, reopened}` through `reviewPullRequest()`, and writes an immutable `athena_gate_receipts` row.
+  - When `GITHUB_TOKEN` is bound, posts the Markdown gate-audit comment and sets the `athena/gate` commit status check.
+  - `/verifications` shows recent Athena PR gate audits next to task verdicts.
+
 - **Co-Pilot multi-agent recipient routing** (`src/dashboard/copilot.ts`, `src/dashboard/studio-chat.ts`).
   - Drawer and `/copilot` page ship a persisted recipient selector (`@copilot`, `@loom`, `@kasra`, `@athena`, `@cursor-architect`, `@cursor-builder`).
   - `POST /api/studio/chat` accepts `{ message, history, recipient }` and streams `{ type: "meta", agent, role }` then `{ type: "token", text }` with persona-specific prompts.
