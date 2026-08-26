@@ -138,6 +138,57 @@ VALUES
 ON CONFLICT(project_id, squad_id) DO UPDATE SET
   access_level = excluded.access_level;
 
+-- Default client worker projects (Viamar, DME) + squad-cursor.
+INSERT INTO departments (id, slug, name, created_at)
+VALUES ('dept-cursor', 'cursor', 'Cursor Cloud', datetime('now'))
+ON CONFLICT(id) DO UPDATE SET slug = excluded.slug, name = excluded.name;
+
+INSERT INTO squads (id, department_id, slug, name, created_at)
+VALUES ('squad-cursor', 'dept-cursor', 'squad-cursor', 'squad-cursor', datetime('now'))
+ON CONFLICT(id) DO UPDATE SET
+  department_id = excluded.department_id,
+  slug = excluded.slug,
+  name = excluded.name;
+
+INSERT INTO projects (
+  id, slug, name, description, goal, status, parent_project_id, target_date,
+  repo_url, worker_name, live_url, assigned_squad_id, deploy_status, created_at, updated_at
+) VALUES
+  (
+    'project-viamar', 'viamar', 'Viamar',
+    'Viamar client worker — freight and logistics surface.',
+    'Keep the Viamar Cloudflare worker healthy and ship feature flights against Digidinc/viamar.',
+    'active', NULL, NULL,
+    'https://github.com/Digidinc/viamar', 'viamar', 'https://viamar.mumega.com',
+    'squad-cursor', 'healthy', datetime('now'), datetime('now')
+  ),
+  (
+    'project-dme', 'dme', 'DME',
+    'Digital Marketing Experts client worker.',
+    'Keep the DME Cloudflare worker healthy and ship feature flights against digidinc/dgd-dme.',
+    'active', NULL, NULL,
+    'https://github.com/digidinc/dgd-dme', 'dme', 'https://dme.mumega.com',
+    'squad-cursor', 'healthy', datetime('now'), datetime('now')
+  )
+ON CONFLICT(id) DO UPDATE SET
+  slug = excluded.slug,
+  name = excluded.name,
+  description = excluded.description,
+  goal = excluded.goal,
+  repo_url = excluded.repo_url,
+  worker_name = excluded.worker_name,
+  live_url = excluded.live_url,
+  assigned_squad_id = excluded.assigned_squad_id,
+  deploy_status = excluded.deploy_status,
+  updated_at = excluded.updated_at;
+
+INSERT INTO project_squad_access (project_id, squad_id, access_level, granted_at)
+VALUES
+  ('project-viamar', 'squad-cursor', 'admin', datetime('now')),
+  ('project-dme', 'squad-cursor', 'admin', datetime('now'))
+ON CONFLICT(project_id, squad_id) DO UPDATE SET
+  access_level = excluded.access_level;
+
 INSERT INTO agents (
   id, squad_id, slug, name, role, model, status, created_at, okr, kpi_target,
   kpi_progress, effort, autonomy, budget_cap_cents, budget_window

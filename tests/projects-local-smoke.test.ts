@@ -114,6 +114,7 @@ describe('local project workspace showcase', () => {
       `).all()
 
       expect(projects).toEqual([
+        { id: 'project-dme', name: 'DME', parent_project_id: null },
         { id: 'project-inkwell', name: 'Inkwell', parent_project_id: 'project-mumega-products' },
         { id: 'project-marketing-infrastructure', name: 'Marketing Infrastructure', parent_project_id: null },
         { id: 'project-mcpwp', name: 'MCPWP', parent_project_id: 'project-marketing-infrastructure' },
@@ -122,6 +123,7 @@ describe('local project workspace showcase', () => {
         { id: 'project-mumega-products', name: 'Mumega Products', parent_project_id: null },
         { id: 'project-mupot', name: 'Mupot', parent_project_id: 'project-mumega-products' },
         { id: 'project-sos', name: 'SOS', parent_project_id: 'project-mumega-products' },
+        { id: 'project-viamar', name: 'Viamar', parent_project_id: null },
       ])
     } finally {
       harness.close()
@@ -162,7 +164,7 @@ describe('local project workspace showcase', () => {
       expect(() => harness.sqlite.exec(readFileSync(SEED_PATH, 'utf8'))).not.toThrow()
       expect(snapshot()).toEqual(firstSeed)
       expect(firstSeed).toEqual({
-        projects: { count: 8 },
+        projects: { count: 10 },
         localTasks: { count: 5 },
         localFlights: { count: 3 },
         fleet: [
@@ -175,8 +177,10 @@ describe('local project workspace showcase', () => {
       expect(harness.sqlite.prepare(`
         SELECT id FROM projects WHERE parent_project_id IS NULL ORDER BY id
       `).all()).toEqual([
+        { id: 'project-dme' },
         { id: 'project-marketing-infrastructure' },
         { id: 'project-mumega-products' },
+        { id: 'project-viamar' },
       ])
       expect(harness.sqlite.prepare(`
         WITH RECURSIVE project_depth(id, depth) AS (
@@ -193,6 +197,7 @@ describe('local project workspace showcase', () => {
         FROM project_squad_access
         ORDER BY project_id
       `).all()).toEqual([
+        { project_id: 'project-dme', squad_id: 'squad-cursor', access_level: 'admin' },
         { project_id: 'project-inkwell', squad_id: 'sq-growth', access_level: 'write' },
         { project_id: 'project-marketing-infrastructure', squad_id: 'sq-growth', access_level: 'write' },
         { project_id: 'project-mcpwp', squad_id: 'sq-growth', access_level: 'write' },
@@ -201,6 +206,7 @@ describe('local project workspace showcase', () => {
         { project_id: 'project-mumega-products', squad_id: 'sq-growth', access_level: 'write' },
         { project_id: 'project-mupot', squad_id: 'sq-growth', access_level: 'write' },
         { project_id: 'project-sos', squad_id: 'sq-growth', access_level: 'write' },
+        { project_id: 'project-viamar', squad_id: 'squad-cursor', access_level: 'admin' },
       ])
     } finally {
       harness.close()

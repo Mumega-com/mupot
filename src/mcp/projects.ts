@@ -9,6 +9,8 @@ import {
   upsertProjectSquadAccess,
 } from '../projects/service'
 import type { ProjectMutationError } from '../projects/service'
+import { projectSelectSql } from '../projects/columns'
+import { deployProject } from '../projects/deploy'
 import { defaultStartGateDeps, startProject } from '../projects/start-gate'
 import { stripExternalLifecycleFields } from '../projects/lifecycle-input'
 import {
@@ -105,9 +107,7 @@ async function projectionReadableSquads(
 export async function readableProject(env: Env, projectId: string, access: ProjectReadAccess): Promise<Project | null> {
   const visibility = projectVisibilityClause(access)
   return env.DB.prepare(
-    `SELECT p.id, p.slug, p.name, p.description, p.goal, p.status, p.parent_project_id,
-            p.target_date, p.cycle_boundary_at, p.stalled, p.stall_threshold_days,
-            p.completion_proposed_by, p.created_at, p.updated_at
+    `SELECT ${projectSelectSql('p')}
        FROM projects p
       WHERE p.id = ? AND ${visibility.sql}`,
   ).bind(projectId, ...visibility.binds).first<Project>()
@@ -217,9 +217,7 @@ const toolProjectList: ToolSpec = {
     }
 
     const rows = await env.DB.prepare(
-      `SELECT p.id, p.slug, p.name, p.description, p.goal, p.status, p.parent_project_id,
-              p.target_date, p.cycle_boundary_at, p.stalled, p.stall_threshold_days,
-              p.completion_proposed_by, p.created_at, p.updated_at
+      `SELECT ${projectSelectSql('p')}
          FROM projects p
         WHERE ${clauses.join(' AND ')}
         ORDER BY p.parent_project_id IS NOT NULL, p.created_at, p.id
@@ -511,6 +509,46 @@ const toolProjectSquadRemove: ToolSpec = {
   },
 }
 
+const toolProjectDeploy: ToolSpec = {
+  name: 'project_deploy',
+  scope: 'workspace project worker deploy',
+  min: 'admin',
+  args: '{ project_id: string, commit_sha?: string, prompt?: string }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      project_id: STRING_SCHEMA,
+      commit_sha: STRING_SCHEMA,
+      prompt: STRING_SCHEMA,
+    },
+    required: ['project_id'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const denied = requireWorkspaceAdmin(auth)
+    if (denied) return denied
+    const projectId = str(args.project_id)
+    if (!projectId) return fail(400, 'invalid_project_id')
+    const result = await deployProject(env, projectId, auth, {
+      commit_sha: args.commit_sha,
+      prompt: args.prompt,
+    })
+    if (!result.ok) {
+      const code = result.error === 'project_not_found' ? 404 : result.error === 'receipt_failed' ? 409 : 400
+      return fail(code, result.error)
+    }
+    await emitProjectMutation(env, auth.memberId as string, 'updated', result.project.id, {
+      status: result.project.status,
+    })
+    return done({
+      deployment: result.deployment,
+      project: result.project,
+      flight_id: result.flight_id,
+      studio_url: result.studio_url,
+    })
+  },
+}
+
 export const PROJECT_TOOLS: ToolSpec[] = [
   toolProjectCreate,
   toolProjectList,
@@ -518,6 +556,7 @@ export const PROJECT_TOOLS: ToolSpec[] = [
   toolProjectContext,
   toolProjectUpdate,
   toolProjectRecommit,
+  toolProjectDeploy,
   toolProjectSquadList,
   toolProjectSquadSet,
   toolProjectSquadRemove,

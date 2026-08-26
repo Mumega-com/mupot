@@ -16,6 +16,10 @@ import {
   validProjectStatusTransitions,
 } from '../projects/service'
 import type { ProjectMutationError, UpdateProjectInput } from '../projects/service'
+import { projectSelectSql } from '../projects/columns'
+import { listProjectDeployments } from '../projects/deploy'
+import { githubRepoSlug, studioDispatchPath } from '../projects/urls'
+import type { ProjectDeployment } from '../types'
 import {
   projectReadAccessFromGrants,
   projectVisibilityClause,
@@ -74,14 +78,22 @@ export interface ProjectListMetrics {
   activeFlights: number
 }
 
+export interface ProjectWorkerCard {
+  assignedSquadName: string | null
+  recentFlights: { id: string; goal: string; status: string }[]
+  recentPrs: { title: string; repo: string; pr_number: number }[]
+}
+
 export type ProjectListChild = Project & {
   metrics: ProjectListMetrics
+  worker: ProjectWorkerCard
 }
 
 export interface ProjectListNode {
   project: Project | ParentContext
   contextOnly: boolean
   metrics: ProjectListMetrics | null
+  worker: ProjectWorkerCard | null
   children: ProjectListChild[]
 }
 
@@ -165,6 +177,10 @@ export interface ProjectDetailView {
   canManage: boolean
   boards: ProjectProviderBinding[]
   canManageBoards: boolean
+  assignedSquadName: string | null
+  recentFlights: { id: string; goal: string; status: string }[]
+  recentPrs: { title: string; repo: string; pr_number: number }[]
+  deployments: ProjectDeployment[]
 }
 
 export interface ProjectFormValues {
@@ -174,6 +190,10 @@ export interface ProjectFormValues {
   goal: string
   parent_project_id: string
   target_date: string
+  repo_url?: string
+  worker_name?: string
+  live_url?: string
+  assigned_squad_id?: string
 }
 
 export interface ProjectParentOption {
@@ -367,9 +387,7 @@ async function loadVisibleProjects(
     values.push(filters.search, filters.search)
   }
   const statement = env.DB.prepare(
-    `SELECT p.id, p.slug, p.name, p.description, p.goal, p.status, p.parent_project_id,
-            p.target_date, p.cycle_boundary_at, p.stalled, p.stall_threshold_days,
-            p.completion_proposed_by, p.created_at, p.updated_at
+    `SELECT ${projectSelectSql('p')}
        FROM projects p
       ${clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''}
       ORDER BY p.parent_project_id IS NOT NULL, p.created_at, p.id
@@ -436,6 +454,79 @@ async function loadListMetrics(
   }]))
 }
 
+const EMPTY_WORKER_CARD: ProjectWorkerCard = {
+  assignedSquadName: null,
+  recentFlights: [],
+  recentPrs: [],
+}
+
+async function loadWorkerCards(
+  env: Env,
+  projects: Project[],
+): Promise<Map<string, ProjectWorkerCard>> {
+  const cards = new Map<string, ProjectWorkerCard>()
+  if (!projects.length) return cards
+  const squadIds = [...new Set(projects.map((project) => project.assigned_squad_id).filter((id): id is string => Boolean(id)))]
+  const squadNames = new Map<string, string>()
+  if (squadIds.length) {
+    const rows = await env.DB.prepare(
+      `SELECT id, name, slug FROM squads
+        WHERE id IN (SELECT CAST(value AS TEXT) FROM json_each(?1))`,
+    ).bind(jsonIds(squadIds)).all<{ id: string; name: string; slug: string }>()
+    for (const row of rows.results ?? []) squadNames.set(row.id, row.slug || row.name)
+  }
+
+  const flights = await env.DB.prepare(
+    `SELECT id, project_id, goal, status
+       FROM flights
+      WHERE tenant = ?1
+        AND project_id IN (SELECT CAST(value AS TEXT) FROM json_each(?2))
+      ORDER BY created_at DESC, id DESC
+      LIMIT ?3`,
+  ).bind(env.TENANT_SLUG, jsonIds(projects.map((project) => project.id)), projects.length * 5)
+    .all<{ id: string; project_id: string; goal: string; status: string }>()
+
+  const flightsByProject = new Map<string, ProjectWorkerCard['recentFlights']>()
+  for (const flight of flights.results ?? []) {
+    const list = flightsByProject.get(flight.project_id) ?? []
+    if (list.length < 3) list.push({ id: flight.id, goal: flight.goal, status: flight.status })
+    flightsByProject.set(flight.project_id, list)
+  }
+
+  const repos = [...new Set(projects.map((project) => githubRepoSlug(project.repo_url)).filter((repo): repo is string => Boolean(repo)))]
+  const prsByRepo = new Map<string, ProjectWorkerCard['recentPrs']>()
+  if (repos.length) {
+    const rows = await env.DB.prepare(
+      `SELECT repo, pr_number, title
+         FROM github_prs_merged
+        WHERE tenant_id = ?1
+          AND repo IN (SELECT CAST(value AS TEXT) FROM json_each(?2))
+        ORDER BY merged_at DESC
+        LIMIT ?3`,
+    ).bind(env.TENANT_SLUG, jsonIds(repos), repos.length * 3)
+      .all<{ repo: string; pr_number: number; title: string | null }>()
+    for (const row of rows.results ?? []) {
+      const list = prsByRepo.get(row.repo) ?? []
+      if (list.length < 3) {
+        list.push({ title: row.title || `PR #${row.pr_number}`, repo: row.repo, pr_number: row.pr_number })
+      }
+      prsByRepo.set(row.repo, list)
+    }
+  }
+
+  for (const project of projects) {
+    const repo = githubRepoSlug(project.repo_url)
+    cards.set(project.id, {
+      assignedSquadName: project.assigned_squad_id
+        ? squadNames.get(project.assigned_squad_id) ?? project.assigned_squad_id
+        : null,
+      recentFlights: flightsByProject.get(project.id) ?? [],
+      recentPrs: repo ? prsByRepo.get(repo) ?? [] : [],
+    })
+  }
+  return cards
+}
+
 export async function loadProjectsPage(
   env: Env,
   auth: AuthContext,
@@ -445,7 +536,10 @@ export async function loadProjectsPage(
   const search = requestedFilters.search?.trim() ?? ''
   const status = requestedFilters.status ?? ''
   const { projects: displayed, capped } = await loadVisibleProjects(env, access, { search, status })
-  const metrics = await loadListMetrics(env, displayed.map((project) => project.id), access)
+  const [metrics, workerCards] = await Promise.all([
+    loadListMetrics(env, displayed.map((project) => project.id), access),
+    loadWorkerCards(env, displayed),
+  ])
   const displayedById = new Map(displayed.map((project) => [project.id, project]))
   const parentIds = [...new Set(displayed
     .map((project) => project.parent_project_id)
@@ -467,6 +561,7 @@ export async function loadProjectsPage(
         .map((project) => ({
           ...project,
           metrics: metrics.get(project.id) ?? { directSquads: 0, openWork: 0, activeFlights: 0 },
+          worker: workerCards.get(project.id) ?? EMPTY_WORKER_CARD,
         }))
       return {
         project: root,
@@ -474,6 +569,7 @@ export async function loadProjectsPage(
         metrics: fullRoot
           ? metrics.get(fullRoot.id) ?? { directSquads: 0, openWork: 0, activeFlights: 0 }
           : null,
+        worker: fullRoot ? workerCards.get(fullRoot.id) ?? EMPTY_WORKER_CARD : null,
         children,
       }
     })
@@ -643,7 +739,7 @@ export async function loadProjectDetail(
   if (!project || !await isReadableProject(env, project.id, access)) return null
 
   const squads = await loadReadableSquads(env, project.id, access)
-  const [aggregates, tasks, members, parent, situation, activity, evidence, boards, canManageBoards] = await Promise.all([
+  const [aggregates, tasks, members, parent, situation, activity, evidence, boards, canManageBoards, worker] = await Promise.all([
     loadProjectAggregates(env, project.id, access),
     loadReadableTasks(env, project.id, access),
     loadReadableProjectMembers(env, squads.rows),
@@ -653,7 +749,9 @@ export async function loadProjectDetail(
     listProjectEvidence(env, { projectId: project.id, readableSquadIds: access.readableSquadIds }),
     listProjectBindings(env, project.id),
     projectManageAccessContextFor(env, access, project.id).then((ctx) => ctx.authorized),
+    loadWorkerCards(env, [project]).then((cards) => cards.get(project.id) ?? EMPTY_WORKER_CARD),
   ])
+  const deployments = await listProjectDeployments(env, project.id, 8)
 
   return {
     project,
@@ -670,6 +768,10 @@ export async function loadProjectDetail(
     canManage: access.workspaceAdmin,
     boards,
     canManageBoards,
+    assignedSquadName: worker.assignedSquadName,
+    recentFlights: worker.recentFlights,
+    recentPrs: worker.recentPrs,
+    deployments,
   }
 }
 
@@ -681,6 +783,10 @@ export function projectFormValues(project?: Project): ProjectFormValues {
     goal: project?.goal ?? '',
     parent_project_id: project?.parent_project_id ?? '',
     target_date: project?.target_date ?? '',
+    repo_url: project?.repo_url ?? '',
+    worker_name: project?.worker_name ?? '',
+    live_url: project?.live_url ?? '',
+    assigned_squad_id: project?.assigned_squad_id ?? '',
   }
 }
 
@@ -693,6 +799,10 @@ export function submittedProjectFormValues(input: Record<string, unknown>): Proj
     goal: text(input.goal),
     parent_project_id: text(input.parent_project_id),
     target_date: text(input.target_date),
+    repo_url: text(input.repo_url),
+    worker_name: text(input.worker_name),
+    live_url: text(input.live_url),
+    assigned_squad_id: text(input.assigned_squad_id),
   }
 }
 
@@ -704,6 +814,10 @@ export function projectMutationInput(values: ProjectFormValues): UpdateProjectIn
     goal: values.goal,
     parent_project_id: values.parent_project_id || null,
     target_date: values.target_date || null,
+    ...(values.repo_url !== undefined ? { repo_url: values.repo_url || null } : {}),
+    ...(values.worker_name !== undefined ? { worker_name: values.worker_name || null } : {}),
+    ...(values.live_url !== undefined ? { live_url: values.live_url || null } : {}),
+    ...(values.assigned_squad_id !== undefined ? { assigned_squad_id: values.assigned_squad_id || null } : {}),
   }
 }
 
@@ -1008,6 +1122,66 @@ function statusLabel(status: ProjectStatus): string {
   return status.charAt(0).toUpperCase() + status.slice(1)
 }
 
+function deployBadge(status: Project['deploy_status'] | undefined): Html {
+  if (status === 'healthy') return html`<span class="tag" style="color:var(--ok);border-color:color-mix(in srgb, var(--ok) 45%, var(--border))">🟢 Healthy</span>`
+  if (status === 'deploying' || status === 'queued') {
+    return html`<span class="tag" style="color:var(--warn);border-color:color-mix(in srgb, var(--warn) 45%, var(--border))">Deploying</span>`
+  }
+  if (status === 'failed') {
+    return html`<span class="tag" style="color:var(--danger,#c0392b);border-color:color-mix(in srgb, var(--danger,#c0392b) 45%, var(--border))">Failed</span>`
+  }
+  return html`<span class="tag">Idle</span>`
+}
+
+function dispatchFlightButton(project: Project, compact = false): Html {
+  if (!project.repo_url) return html``
+  return html`<a class="btn ${compact ? 'sm' : ''}" href="${studioDispatchPath(project.repo_url)}">🚀 Dispatch Feature Flight</a>`
+}
+
+function projectWorkerCard(project: Project, worker: ProjectWorkerCard, brand: string): Html {
+  const repo = githubRepoSlug(project.repo_url)
+  const flights = worker.recentFlights.length
+    ? worker.recentFlights.map((flight) => html`<li style="min-width:0;overflow-wrap:anywhere;">${flight.goal} <span class="ui-panel-sub">${flight.status}</span></li>`)
+    : [html`<li class="ui-panel-sub">No Cursor Cloud flights yet.</li>`]
+  const prs = worker.recentPrs.length
+    ? worker.recentPrs.map((pr) => html`<li style="min-width:0;overflow-wrap:anywhere;"><a class="ui-link" href="https://github.com/${pr.repo}/pull/${String(pr.pr_number)}">${pr.title}</a></li>`)
+    : [html`<li class="ui-panel-sub">No recent PRs.</li>`]
+  return html`<article class="card" style="min-width:0;overflow-wrap:anywhere;display:grid;gap:10px;padding:16px;">
+    <div style="display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:8px;">
+      <div>
+        <a class="ui-agent-name" href="/projects/${encodeURIComponent(project.id)}">${project.name}</a>
+        <div class="ui-panel-sub">${brand}</div>
+      </div>
+      ${deployBadge(project.deploy_status)}
+    </div>
+    <div style="display:grid;gap:4px;">
+      <div class="ui-panel-sub">GitHub repository</div>
+      ${repo
+        ? html`<a class="ui-link" href="${project.repo_url ?? ''}">${repo}</a>`
+        : html`<span class="ui-panel-sub">No repository bound.</span>`}
+    </div>
+    <div style="display:grid;gap:4px;">
+      <div class="ui-panel-sub">Live worker</div>
+      ${project.live_url
+        ? html`<a class="ui-link" href="${project.live_url}">${project.live_url}</a>`
+        : html`<span class="ui-panel-sub">${project.worker_name || 'No live URL'}</span>`}
+    </div>
+    <div style="display:grid;gap:4px;">
+      <div class="ui-panel-sub">Assigned agent squad</div>
+      <span>${worker.assignedSquadName ?? 'Unassigned'}</span>
+    </div>
+    <div style="display:grid;gap:4px;">
+      <div class="ui-panel-sub">Recent Cursor Cloud flights</div>
+      <ul style="margin:0;padding-left:18px;">${flights}</ul>
+    </div>
+    <div style="display:grid;gap:4px;">
+      <div class="ui-panel-sub">Active PRs</div>
+      <ul style="margin:0;padding-left:18px;">${prs}</ul>
+    </div>
+    <div>${dispatchFlightButton(project)}</div>
+  </article>`
+}
+
 function projectsControls(view: ProjectsPageView): Html {
   return html`<div style="display:flex;flex-wrap:wrap;align-items:end;justify-content:space-between;gap:12px;margin:16px 0;">
     <form method="get" action="/projects" style="display:flex;flex:1 1 34rem;flex-wrap:wrap;align-items:end;gap:10px;min-width:0;">
@@ -1077,9 +1251,21 @@ export function projectsPageBody(view: ProjectsPageView) {
     ]
   })
 
+  const cards = view.nodes.flatMap((node) => {
+    const items: Html[] = []
+    if (!node.contextOnly && node.worker) {
+      items.push(projectWorkerCard(node.project as Project, node.worker, 'Mupot'))
+    }
+    for (const child of node.children) {
+      items.push(projectWorkerCard(child, child.worker, 'Mupot'))
+    }
+    return items
+  })
+
   return html`
     ${header}
     <p class="ui-panel-sub">${view.visibleProjectCount}${view.capped ? '+' : ''} matching visible project${view.visibleProjectCount === 1 ? '' : 's'} across root and child levels.</p>
+    ${cards.length ? html`<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,18rem),1fr));gap:12px;margin:16px 0;">${cards}</div>` : ''}
     ${sectionPanel({
       title: 'Project workspace',
       body: semanticDataTable({
@@ -1107,6 +1293,9 @@ function projectMutationMessage(error: ProjectMutationError): string {
     completion_gate_required: 'Project completion requires a structural gate and different-principal verdict.',
     start_gate_required: 'Activating a planned project requires the start gate (seed first task + resource commit).',
     invalid_target_date: 'Enter a valid target date.',
+    invalid_repo_url: 'Enter an https repository URL.',
+    invalid_live_url: 'Enter an https live worker URL.',
+    invalid_worker_name: 'Enter a lowercase worker name with letters, numbers, and hyphens.',
     slug_taken: 'That project slug is already in use.',
     project_not_found: 'The project no longer exists.',
     parent_not_found: 'The selected parent project was not found.',
@@ -1152,6 +1341,22 @@ function projectMetadataForm(opts: {
       <label style="display:grid;gap:5px;min-width:0;">
         <span class="ui-panel-sub">Target date</span>
         <input name="target_date" type="${opts.values.target_date === '' || isValidProjectTargetDate(opts.values.target_date) ? 'date' : 'text'}" value="${opts.values.target_date}" style="box-sizing:border-box;width:100%;min-width:0;">
+      </label>
+      <label style="display:grid;gap:5px;min-width:0;">
+        <span class="ui-panel-sub">GitHub repository</span>
+        <input name="repo_url" type="url" value="${opts.values.repo_url ?? ''}" placeholder="https://github.com/org/repo" style="box-sizing:border-box;width:100%;min-width:0;">
+      </label>
+      <label style="display:grid;gap:5px;min-width:0;">
+        <span class="ui-panel-sub">Worker name</span>
+        <input name="worker_name" value="${opts.values.worker_name ?? ''}" placeholder="client-worker" style="box-sizing:border-box;width:100%;min-width:0;">
+      </label>
+      <label style="display:grid;gap:5px;min-width:0;">
+        <span class="ui-panel-sub">Live URL</span>
+        <input name="live_url" type="url" value="${opts.values.live_url ?? ''}" placeholder="https://example.mumega.com" style="box-sizing:border-box;width:100%;min-width:0;">
+      </label>
+      <label style="display:grid;gap:5px;min-width:0;">
+        <span class="ui-panel-sub">Assigned squad id</span>
+        <input name="assigned_squad_id" value="${opts.values.assigned_squad_id ?? ''}" placeholder="squad-cursor" style="box-sizing:border-box;width:100%;min-width:0;">
       </label>
     </div>
     <label style="display:grid;gap:5px;min-width:0;">
@@ -1390,6 +1595,43 @@ export function projectDetailBody(view: ProjectDetailView, statusResult?: string
     })}
     ${resultMessage ? html`<p role="status" style="margin:8px 0;color:var(--ok,#16a34a);">${resultMessage}</p>` : ''}
     ${view.canManage ? html`<div style="display:flex;justify-content:flex-end;margin:8px 0;"><a class="btn secondary sm" href="/projects/${encodeURIComponent(project.id)}/settings">Project settings</a></div>` : ''}
+    <section aria-label="Worker platform" style="display:grid;gap:12px;padding:16px 0;border-top:1px solid var(--border);">
+      <div style="display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;">
+        <div style="display:flex;flex-wrap:wrap;align-items:center;gap:8px;">
+          <h2 class="ui-panel-title" style="margin:0;">Worker platform</h2>
+          ${deployBadge(project.deploy_status)}
+        </div>
+        ${dispatchFlightButton(project)}
+      </div>
+      <dl style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,12rem),1fr));gap:12px;margin:0;">
+        <div style="min-width:0;overflow-wrap:anywhere;"><dt class="ui-panel-sub">Brand</dt><dd style="margin:4px 0 0;">Mupot</dd></div>
+        <div style="min-width:0;overflow-wrap:anywhere;"><dt class="ui-panel-sub">GitHub repository</dt><dd style="margin:4px 0 0;">${
+          githubRepoSlug(project.repo_url)
+            ? html`<a class="ui-link" href="${project.repo_url ?? ''}">${githubRepoSlug(project.repo_url)}</a>`
+            : html`<span class="ui-panel-sub">No repository bound.</span>`
+        }</dd></div>
+        <div style="min-width:0;overflow-wrap:anywhere;"><dt class="ui-panel-sub">Live worker</dt><dd style="margin:4px 0 0;">${
+          project.live_url
+            ? html`<a class="ui-link" href="${project.live_url}">${project.live_url}</a>`
+            : html`<span class="ui-panel-sub">${project.worker_name || 'Not deployed'}</span>`
+        }</dd></div>
+        <div style="min-width:0;overflow-wrap:anywhere;"><dt class="ui-panel-sub">Assigned agent squad</dt><dd style="margin:4px 0 0;">${view.assignedSquadName ?? 'Unassigned'}</dd></div>
+      </dl>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,16rem),1fr));gap:12px;">
+        <div style="min-width:0;overflow-wrap:anywhere;">
+          <div class="ui-panel-sub">Recent Cursor Cloud flights</div>
+          ${view.recentFlights.length
+            ? html`<ul style="margin:6px 0 0;padding-left:18px;">${view.recentFlights.map((flight) => html`<li>${flight.goal} <span class="ui-panel-sub">${flight.status}</span></li>`)}</ul>`
+            : html`<div class="ui-panel-sub">No Cursor Cloud flights yet.</div>`}
+        </div>
+        <div style="min-width:0;overflow-wrap:anywhere;">
+          <div class="ui-panel-sub">Active PRs</div>
+          ${view.recentPrs.length
+            ? html`<ul style="margin:6px 0 0;padding-left:18px;">${view.recentPrs.map((pr) => html`<li><a class="ui-link" href="https://github.com/${pr.repo}/pull/${String(pr.pr_number)}">${pr.title}</a></li>`)}</ul>`
+            : html`<div class="ui-panel-sub">No recent PRs.</div>`}
+        </div>
+      </div>
+    </section>
     ${projectTabs(project.id)}
     <script type="application/json" id="project-situation-json">${raw(jsonScript(situation))}</script>
     <script type="application/json" id="project-activity-json">${raw(jsonScript({ rows: view.activity.rows }))}</script>

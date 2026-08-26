@@ -234,7 +234,9 @@ import '../departments/modules/agency' // side-effect: register AgencyModule (re
 import '../departments/modules/web-ops' // side-effect: register WebOpsModule (AI website-operations team — the wedge)
 import { makeMissionControlApp } from './mission-control-routes'
 export { controlTowerBody, potFleetBody } from './mission-control-views'
-import { getAuthContext, loadStudioData, studioPageHtml, dispatchStudioFlight } from './studio'
+import { getAuthContext, loadStudioData, studioPageHtml, dispatchStudioFlight, isSafeRepoUrl } from './studio'
+import { deployProject } from '../projects/deploy'
+import { studioDispatchPath } from '../projects/urls'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
@@ -1266,7 +1268,37 @@ dashboardApp.get('/flights', async (c) => {
 dashboardApp.get('/studio', async (c) => {
   const auth = getAuthContext(c)
   const data = await loadStudioData(c.env, auth)
+  const repo = c.req.query('repo')?.trim()
+  if (repo && isSafeRepoUrl(repo)) data.repoUrl = repo
   return c.html(studioPageHtml(data))
+})
+
+dashboardApp.post('/projects/:id/deploy', async (c) => {
+  if (!await canManageProjects(c.env, c.get('auth'))) {
+    return c.html(shell(c.env, 'Projects', errorBody('Deploying a project worker requires workspace admin.')), 403)
+  }
+  const projectId = c.req.param('id')
+  const result = await deployProject(c.env, projectId, c.get('auth'))
+  if (!result.ok) {
+    if (result.error === 'project_not_found') {
+      return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
+    }
+    return c.html(shell(c.env, 'Projects', errorBody(`Deploy failed: ${result.error}`)), 400)
+  }
+  return c.redirect(result.studio_url, 303)
+})
+
+dashboardApp.post('/projects/:id/dispatch-flight', async (c) => {
+  const detail = await loadProjectDetail(c.env, c.get('auth'), c.req.param('id'))
+  if (!detail) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
+  if (detail.canManage) {
+    const result = await deployProject(c.env, detail.project.id, c.get('auth'), {
+      prompt: `Dispatch a feature flight for ${detail.project.name}`,
+    })
+    if (result.ok) return c.redirect(result.studio_url, 303)
+  }
+  if (detail.project.repo_url) return c.redirect(studioDispatchPath(detail.project.repo_url), 303)
+  return c.redirect(`/projects/${encodeURIComponent(detail.project.id)}`, 303)
 })
 
 // POST /api/studio/dispatch — create a flight + task from a Studio prompt.
