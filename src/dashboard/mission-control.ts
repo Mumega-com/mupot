@@ -15,7 +15,7 @@ import type { DepartureCard } from '../coordination/journeys'
 import type { RunnerReceipt } from '../runners/types'
 import { renderBrainImage, renderAgentCard } from './radar-view'
 import { motherboardPageBody } from './motherboard'
-import { potFleetBody, controlTowerBody } from './mission-control-views'
+import { potFleetBody, controlTowerBody, renderSevenAxisSeatRoster } from './mission-control-views'
 import { renderTentaclesPanel } from './tentacles-view'
 
 export interface MissionControlData {
@@ -83,6 +83,16 @@ export function missionControlBody(data: MissionControlData): Html {
         grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
         gap: 14px;
       }
+      .seven-axis-roster { margin: 18px 0 22px; }
+      .seven-axis-title { font-size: 16px; margin: 0 0 4px; }
+      .seven-axis-count { font-size: 11px; font-weight: 600; color: var(--dim); margin-left: 8px; }
+      .seven-axis-sub { color: var(--dim); font-size: 12px; margin: 0 0 10px; }
+      .seven-axis-seat { font-weight: 600; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+      .axis-badge { display:inline-block; font-size:11px; letter-spacing:.02em; padding:2px 8px; border-radius:999px; border:1px solid var(--border); background:var(--surface); color:var(--text); white-space:nowrap; }
+      .axis-harness { color: var(--accent2, #0891b2); }
+      .axis-machine { color: var(--muted); }
+      .axis-model { color: var(--primary, #6366f1); }
+      .axis-effort { color: var(--ok); }
     </style>
 
     <p class="crumbs"><a href="/">Overview</a> / Mission Control</p>
@@ -114,6 +124,7 @@ export function missionControlBody(data: MissionControlData): Html {
       activeTab === 'radar'
         ? html`
             <div style="font-size:11px;color:var(--dim);margin-bottom:14px">ATC telemetry synchronized: ${generatedLabel}</div>
+            ${raw(renderSevenAxisSeatRoster(presence))}
             ${raw(renderBrainImage(radar, nowMs))}
             <h2 style="margin-top:24px">Active Agents</h2>
             ${

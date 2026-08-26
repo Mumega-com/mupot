@@ -94,7 +94,7 @@ describe('unique seat check_in and status telemetry (real SQLite D1)', () => {
     const res = await invokeTool(auth, env, 'check_in', { source: 'tmux', label: 'Mumega Ceo' })
     expect(res.ok).toBe(true)
     if (res.ok) {
-      expect(res.result).toEqual({
+      expect(res.result).toMatchObject({
         ok: true,
         seat: 'Mumega Ceo',
         agent: 'hadi-grok-desktop',

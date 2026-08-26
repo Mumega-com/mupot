@@ -17,7 +17,17 @@ fleetCheckinApp.post('/checkin', async (c) => {
   // Generic 401 — never distinguish missing vs bad token (no auth oracle).
   if (!id) return c.json({ error: 'unauthorized' }, 401)
 
-  const body = (await c.req.json().catch(() => ({}))) as { source?: unknown; label?: unknown }
+  const body = (await c.req.json().catch(() => ({}))) as {
+    source?: unknown
+    label?: unknown
+    seat?: unknown
+    harness?: unknown
+    machine?: unknown
+    model?: unknown
+    provider?: unknown
+    effort?: unknown
+    flight_id?: unknown
+  }
 
   // Debounce (adversarial P2): bound D1 writes to ~1 per 30s per agent so a valid
   // token cannot thrash D1 by spamming check-ins. A rapid re-check-in within the

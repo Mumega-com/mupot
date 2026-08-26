@@ -193,7 +193,8 @@ export async function loadFleet(env: Env, nowMs: number, auth: AuthContext): Pro
       )`
   }
   const statement = env.DB.prepare(
-    `SELECT member_id, display_name, source, label, agent_id, last_seen_at
+    `SELECT member_id, display_name, source, label, agent_id, last_seen_at,
+            harness, machine, model, provider, effort, flight_id
        FROM presence WHERE tenant = ?1${scopeClause} ORDER BY last_seen_at DESC LIMIT 200`,
   )
   const bound = idsJson === null ? statement.bind(env.TENANT_SLUG) : statement.bind(env.TENANT_SLUG, idsJson)

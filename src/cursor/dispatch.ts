@@ -31,6 +31,18 @@ export interface CursorCloudRecord {
   agentUrl: string
 }
 
+export {
+  CURSOR_CLOUD_SEAT,
+  CURSOR_CLOUD_HARNESS,
+  CURSOR_CLOUD_MODEL,
+  CURSOR_CLOUD_EFFORT,
+  CURSOR_CLOUD_MACHINE,
+  sevenAxisCheckInDeclaration,
+  injectSevenAxisSeatDeclaration,
+} from './seat-identity'
+
+import { injectSevenAxisSeatDeclaration } from './seat-identity'
+
 export interface RecordCursorCloudWorkInput {
   name: string
   repoUrl: string
@@ -39,6 +51,8 @@ export interface RecordCursorCloudWorkInput {
   agentId: string
   actor?: { kind: 'member' | 'agent'; id: string }
   cursor?: CursorCloudRecord
+  /** Reserved flight id so the injected check_in declaration matches the stored flight. */
+  flightId?: string
 }
 
 export interface RecordCursorCloudWorkResult {
@@ -51,7 +65,8 @@ export async function recordCursorCloudWork(
   input: RecordCursorCloudWorkInput,
 ): Promise<RecordCursorCloudWorkResult> {
   const title = input.name.trim()
-  const prompt = input.prompt.trim()
+  const reservedFlightId = input.flightId?.trim() || crypto.randomUUID()
+  const prompt = injectSevenAxisSeatDeclaration(input.prompt, reservedFlightId)
   const lines = [
     prompt,
     '',
@@ -102,6 +117,8 @@ export async function recordCursorCloudWork(
       },
     },
     CURSOR_CLOUD_PREFLIGHT_SIGNALS,
+    undefined,
+    { id: reservedFlightId },
   )
 
   return { task, flight }

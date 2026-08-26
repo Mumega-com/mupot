@@ -98,7 +98,14 @@ import {
   leaseAgentInbox, ackAgentMessages, listDeadLetteredMessages, summarizeDeadLetters,
   MAX_DELIVERY_ATTEMPTS, DEFAULT_LEASE_SECONDS, MAX_LEASE_SECONDS,
 } from '../agents/messages'
-import { recordCheckin, touchPresence, sqliteUtcToMs } from '../fleet/presence'
+import {
+  recordCheckin,
+  touchPresence,
+  sqliteUtcToMs,
+  normalizeSevenAxis,
+  SEVEN_AXIS_HARNESSES,
+  SEVEN_AXIS_EFFORTS,
+} from '../fleet/presence'
 import {
   readFleetAgentRow,
   getFleetAgentLiveness,
@@ -3520,13 +3527,13 @@ const toolPeers: ToolSpec = {
 
 // check_in — pot-native presence heartbeat over MCP. This mirrors
 // POST /api/fleet/checkin for runtimes that only have an MCP transport: identity
-// is the authenticated member token, source/label are descriptive only, and a
+// is the authenticated member token, source/label/7-axis are descriptive only, and a
 // rapid repeat is debounced per (tenant, memberId, seat).
 const toolCheckIn: ToolSpec = {
   name: 'check_in',
   scope: 'self (member-token presence)',
   min: 'authenticated',
-  args: '{ source?: "claude-code"|"codex"|"hermes"|"openclaw"|"tmux"|"cowork"|"unknown", label?: string, name?: string, seat?: string }',
+  args: '{ seat?: string, harness?: "cursor-ide"|"cursor-cloud"|"antigravity-cli"|"claude-code"|"prime"|"hermes"|"grok-cli"|"unknown", machine?: string, model?: string, provider?: string, effort?: "low"|"medium"|"high"|"extended-thinking-64k", flight_id?: string, source?: string, label?: string, name?: string }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -3534,40 +3541,56 @@ const toolCheckIn: ToolSpec = {
       label: STRING_SCHEMA,
       name: STRING_SCHEMA,
       seat: STRING_SCHEMA,
+      harness: { type: 'string', enum: [...SEVEN_AXIS_HARNESSES] },
+      machine: STRING_SCHEMA,
+      model: STRING_SCHEMA,
+      provider: STRING_SCHEMA,
+      effort: { type: 'string', enum: [...SEVEN_AXIS_EFFORTS] },
+      flight_id: STRING_SCHEMA,
     },
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    if (args.source !== undefined && args.source !== null && typeof args.source !== 'string') {
-      return fail(400, 'invalid_args', 'source must be a string')
-    }
-    if (args.label !== undefined && args.label !== null && typeof args.label !== 'string') {
-      return fail(400, 'invalid_args', 'label must be a string')
-    }
-    if (args.name !== undefined && args.name !== null && typeof args.name !== 'string') {
-      return fail(400, 'invalid_args', 'name must be a string')
-    }
-    if (args.seat !== undefined && args.seat !== null && typeof args.seat !== 'string') {
-      return fail(400, 'invalid_args', 'seat must be a string')
+    for (const key of ['source', 'label', 'name', 'seat', 'harness', 'machine', 'model', 'provider', 'effort', 'flight_id']) {
+      if (args[key] !== undefined && args[key] !== null && typeof args[key] !== 'string') {
+        return fail(400, 'invalid_args', `${key} must be a string`)
+      }
     }
 
     const id = await loadMemberIdentity(env, auth)
     if (!id) return fail(403, 'not_member_bound', 'check_in requires a member-token principal')
 
     const seatLabel = (str(args.seat) || str(args.name) || str(args.label) || '').trim()
+    const axis = normalizeSevenAxis({
+      seat: seatLabel,
+      label: seatLabel || args.label,
+      harness: args.harness,
+      machine: args.machine,
+      model: args.model,
+      provider: args.provider,
+      effort: args.effort,
+      flight_id: args.flight_id,
+    })
     const dkey = seatLabel
       ? `checkin:${env.TENANT_SLUG}:${id.memberId}:${seatLabel}`
       : `checkin:${env.TENANT_SLUG}:${id.memberId}`
 
+    const echo = {
+      ok: true as const,
+      seat: seatLabel || id.displayName,
+      agent: id.displayName,
+      agent_id: id.boundAgentId,
+      harness: axis.harness,
+      machine: axis.machine,
+      model: axis.model,
+      provider: axis.provider,
+      effort: axis.effort,
+      flight_id: axis.flight_id,
+    }
+
     try {
       if (await env.SESSIONS.get(dkey)) {
-        return done({
-          ok: true,
-          seat: seatLabel || id.displayName,
-          agent: id.displayName,
-          agent_id: id.boundAgentId,
-          debounced: true,
-        })
+        return done({ ...echo, debounced: true })
       }
       await env.SESSIONS.put(dkey, '1', { expirationTtl: 30 })
     } catch {
@@ -3577,14 +3600,15 @@ const toolCheckIn: ToolSpec = {
     await recordCheckin(env, id, {
       source: args.source,
       label: seatLabel || args.label,
+      seat: seatLabel,
+      harness: args.harness,
+      machine: args.machine,
+      model: args.model,
+      provider: args.provider,
+      effort: args.effort,
+      flight_id: args.flight_id,
     })
-    return done({
-      ok: true,
-      seat: seatLabel || id.displayName,
-      agent: id.displayName,
-      agent_id: id.boundAgentId,
-      debounced: false,
-    })
+    return done({ ...echo, debounced: false })
   },
 }
 
@@ -3606,13 +3630,38 @@ const toolStatus: ToolSpec = {
       // No agent specified → echo the member's own principal (who am I + caps + seat).
       let seatName: string | null = null
       let seats: string[] = []
+      let activeSeat: Record<string, unknown> | null = null
+      let seatRoster: Array<Record<string, unknown>> = []
       try {
         const presenceRows = await env.DB.prepare(
-          `SELECT label, source, last_seen_at FROM presence WHERE tenant = ?1 AND member_id = ?2 ORDER BY last_seen_at DESC, rowid DESC LIMIT 10`,
-        ).bind(env.TENANT_SLUG, auth.memberId).all<{ label: string; source: string; last_seen_at: string }>()
+          `SELECT label, source, last_seen_at, harness, machine, model, provider, effort, flight_id
+             FROM presence WHERE tenant = ?1 AND member_id = ?2 ORDER BY last_seen_at DESC, rowid DESC LIMIT 10`,
+        ).bind(env.TENANT_SLUG, auth.memberId).all<{
+          label: string
+          source: string
+          last_seen_at: string
+          harness: string | null
+          machine: string | null
+          model: string | null
+          provider: string | null
+          effort: string | null
+          flight_id: string | null
+        }>()
 
-        seats = (presenceRows.results ?? []).map((r) => r.label).filter(Boolean)
+        const rows = presenceRows.results ?? []
+        seats = rows.map((r) => r.label).filter(Boolean)
         seatName = seats[0] ?? null
+        seatRoster = rows.map((r) => ({
+          seat: r.label || null,
+          harness: r.harness || 'unknown',
+          machine: r.machine ?? null,
+          model: r.model ?? null,
+          provider: r.provider ?? null,
+          effort: r.effort ?? null,
+          flight_id: r.flight_id ?? null,
+          source: r.source,
+        }))
+        activeSeat = seatRoster[0] ?? null
       } catch {
         // Fail-soft: self-echo operates even without DB or in mock capability floor tests
       }
@@ -3626,6 +3675,8 @@ const toolStatus: ToolSpec = {
         bound_agent_id: auth.boundAgentId ?? null,
         seat_name: seatName,
         seats,
+        active_seat: activeSeat,
+        seat_roster: seatRoster,
         capabilities: auth.capabilities ?? [],
       })
     }
@@ -3640,11 +3691,33 @@ const toolStatus: ToolSpec = {
     }
 
     const presenceRows = await env.DB.prepare(
-      `SELECT label, source, last_seen_at FROM presence WHERE tenant = ?1 AND agent_id = ?2 ORDER BY last_seen_at DESC, rowid DESC LIMIT 10`,
-    ).bind(env.TENANT_SLUG, agent.id).all<{ label: string; source: string; last_seen_at: string }>()
+      `SELECT label, source, last_seen_at, harness, machine, model, provider, effort, flight_id
+         FROM presence WHERE tenant = ?1 AND agent_id = ?2 ORDER BY last_seen_at DESC, rowid DESC LIMIT 10`,
+    ).bind(env.TENANT_SLUG, agent.id).all<{
+      label: string
+      source: string
+      last_seen_at: string
+      harness: string | null
+      machine: string | null
+      model: string | null
+      provider: string | null
+      effort: string | null
+      flight_id: string | null
+    }>()
 
-    const seats = (presenceRows.results ?? []).map((r) => r.label).filter(Boolean)
+    const rows = presenceRows.results ?? []
+    const seats = rows.map((r) => r.label).filter(Boolean)
     const latestSeat = seats[0] ?? null
+    const seatRoster = rows.map((r) => ({
+      seat: r.label || null,
+      harness: r.harness || 'unknown',
+      machine: r.machine ?? null,
+      model: r.model ?? null,
+      provider: r.provider ?? null,
+      effort: r.effort ?? null,
+      flight_id: r.flight_id ?? null,
+      source: r.source,
+    }))
 
     const stub = env.AGENT.get(env.AGENT.idFromName(agent.id))
     const res = await stub.fetch('https://agent/status')
@@ -3655,6 +3728,8 @@ const toolStatus: ToolSpec = {
         name: agent.name,
         seat_name: latestSeat,
         seats,
+        active_seat: seatRoster[0] ?? null,
+        seat_roster: seatRoster,
         role: agent.role,
         model: agent.model,
         status: agent.status,

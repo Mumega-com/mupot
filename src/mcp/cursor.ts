@@ -5,6 +5,7 @@
 
 import { createCursorAgent, CursorApiError, getCursorRun, resolveCursorApiToken } from '../cursor/client'
 import { recordCursorCloudWork } from '../cursor/dispatch'
+import { injectSevenAxisSeatDeclaration } from '../cursor/seat-identity'
 import type { AuthContext, Capability, Env } from '../types'
 import {
   type ToolSpec,
@@ -77,9 +78,12 @@ export const toolCursorDispatch: ToolSpec = {
     const token = resolveCursorApiToken(env)
     if (!token) return fail(503, 'cursor_token_missing')
 
+    const reservedFlightId = crypto.randomUUID()
+    const launchedPrompt = injectSevenAxisSeatDeclaration(prompt, reservedFlightId)
+
     let launched
     try {
-      launched = await createCursorAgent(token, { name, repoUrl, prompt, model })
+      launched = await createCursorAgent(token, { name, repoUrl, prompt: launchedPrompt, model })
     } catch (error) {
       return cursorFailure(error)
     }
@@ -92,10 +96,11 @@ export const toolCursorDispatch: ToolSpec = {
       await recordCursorCloudWork(env, {
         name,
         repoUrl,
-        prompt,
+        prompt: launchedPrompt,
         squadId: loaded.agent.squad_id,
         agentId: loaded.agent.id,
         actor,
+        flightId: reservedFlightId,
         cursor: {
           agentId: launched.agent.id,
           runId: launched.run.id,

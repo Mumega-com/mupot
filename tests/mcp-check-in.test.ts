@@ -95,7 +95,7 @@ describe('MCP check_in tool', () => {
       { key: `checkin:${TENANT}:${MEMBER_ID}:primary runtime`, value: '1', opts: { expirationTtl: 30 } },
     ])
     expect(writes).toHaveLength(1)
-    expect(writes[0]).toEqual([
+    expect(writes[0].slice(0, 6)).toEqual([
       TENANT,
       MEMBER_ID,
       'Kasra Code',

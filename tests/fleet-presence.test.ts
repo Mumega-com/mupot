@@ -69,6 +69,7 @@ describe('recordCheckin', () => {
     expect(captured.args?.[1]).toBe('m1') // member_id (from token)
     expect(captured.args?.[3]).toBe('unknown') // source sanitized
     expect((captured.args?.[4] as string).length).toBe(120) // label capped
+    expect(captured.args?.length).toBeGreaterThanOrEqual(6)
     expect(captured.ran).toBe(true)
   })
 })

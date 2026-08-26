@@ -34,6 +34,22 @@
 //     than "this project's roster," so it fails closed to the org floor instead of
 //     silently granting it to every observer.
 
+// Flock 7-axis seat declaration (check_in / touchPresence) lives in
+// src/fleet/presence.ts and the MCP check_in tool in src/mcp/index.ts.
+// This file is the project-scoped MODULE roster (presence_register / heartbeat).
+// Re-export the seat-axis contract so MCP clients and tests have one import.
+
+export {
+  SEVEN_AXIS_HARNESSES,
+  SEVEN_AXIS_EFFORTS,
+  normalizeHarness,
+  normalizeEffort,
+  normalizeSevenAxis,
+  type SevenAxisHarness,
+  type SevenAxisEffort,
+  type SevenAxisDeclaration,
+} from '../fleet/presence'
+
 import type { AuthContext } from '../types'
 import {
   registerModule,
