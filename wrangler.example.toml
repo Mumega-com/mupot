@@ -55,6 +55,13 @@ FLEET_OPS_AGENT = "kasra"         # ops agent that receives control asks via age
 #   OAuth2.1 PROVIDER (MCP clients get tokens):     https://mupot.mumega.com/oauth/google-callback
 # (src/auth/index.ts callbackUrl() = <origin>/auth/callback ; src/index.ts mounts /oauth/google-callback)
 
+# ── Workers for Platforms: project sub-worker dispatch (optional) ──
+# When bound, `/preview/:project_id/*` and `https://<project>.mupot.mumega.com`
+# proxy to the project's user Worker. Absent ⇒ fallback preview renderer.
+# [[dispatch_namespaces]]
+# binding = "DISPATCHER"
+# namespace = "mupot-pots"
+
 # ── memory: D1 (relational org + engram metadata) ──
 [[d1_databases]]
 binding = "DB"

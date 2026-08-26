@@ -253,6 +253,11 @@ export interface Env {
   // alias because that is the name Cursor's own docs use.
   CURSOR_API_TOKEN?: string
   CURSOR_API_KEY?: string
+  // Workers for Platforms dispatch namespace (optional). When bound, project
+  // preview routes (`/preview/:project_id/*` and `https://<project>.mupot.mumega.com`)
+  // proxy to the project's user Worker. Absent ⇒ fallback preview renderer.
+  // Declared in wrangler.toml [[dispatch_namespaces]] binding="DISPATCHER".
+  DISPATCHER?: import('./platform/dispatcher').DispatchNamespace
 }
 
 // ── Org domain (mirrors migrations/0001_init.sql + 0009_work_unit.sql) ──
