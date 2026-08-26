@@ -8,6 +8,8 @@
 //   GET /                  org overview (dept → squad → agent tree)
 //   GET /squads/:id        squad board (charter + agents + tasks)
 //   GET /agents/:id        agent console (status + a 'wake' button)
+//   GET /copilot, /chat    dedicated Co-Pilot page (drawer also lives in shell())
+//   POST /api/studio/chat  SSE token stream for Co-Pilot
 //
 // Auth: gated by requireAuth. Because these are HTML pages (not an API),
 // unauthenticated requests are REDIRECTED to /auth/login rather than handed a
@@ -236,6 +238,14 @@ import '../departments/modules/web-ops' // side-effect: register WebOpsModule (A
 import { makeMissionControlApp } from './mission-control-routes'
 export { controlTowerBody, potFleetBody } from './mission-control-views'
 import { getAuthContext, loadStudioData, studioPageHtml, dispatchStudioFlight } from './studio'
+import {
+  COPILOT_CSS,
+  COPILOT_SCRIPT,
+  copilotDrawerMarkup,
+  copilotPageBody,
+  copilotSseResponse,
+  parseCopilotChatBody,
+} from './copilot'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
@@ -1287,6 +1297,27 @@ dashboardApp.post('/api/studio/dispatch', async (c) => {
   })
   if (!result.ok) return c.json({ error: result.error }, result.status)
   return c.json(result.result)
+})
+
+// GET /copilot + /chat — dedicated full-page Co-Pilot (same chat as the drawer).
+dashboardApp.get('/copilot', async (c) => {
+  return c.html(shell(c.env, 'Co-Pilot', copilotPageBody(c.get('auth'))))
+})
+dashboardApp.get('/chat', async (c) => {
+  return c.html(shell(c.env, 'Co-Pilot', copilotPageBody(c.get('auth'))))
+})
+
+// POST /api/studio/chat — SSE token stream for the Co-Pilot drawer and page.
+dashboardApp.post('/api/studio/chat', async (c) => {
+  let body: unknown
+  try {
+    body = await c.req.json()
+  } catch {
+    return c.json({ error: 'invalid_json' }, 400)
+  }
+  const parsed = parseCopilotChatBody(body)
+  if (!parsed.ok) return c.json({ error: parsed.error }, parsed.status)
+  return copilotSseResponse(c.env, parsed.value)
 })
 
 // ── radar (visual fleet + squad awareness — #21 slice 1, VIEW LAYER ONLY) ────
@@ -3912,6 +3943,7 @@ export function shell(
       }
 
       /* ── /approvals page styles (kept here to avoid duplication) ── */
+      ${raw(COPILOT_CSS)}
     </style>
   </head>
   <body>
@@ -3988,6 +4020,11 @@ export function shell(
             <span class="nav-label">Studio</span>
           </a>
 
+          <a class="nav-link" href="/copilot">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M4.2 13.6V6.4A2.2 2.2 0 0 1 6.4 4.2h7.2A2.2 2.2 0 0 1 15.8 6.4v4.2a2.2 2.2 0 0 1-2.2 2.2H8.1L4.2 15.8z"/><path d="M7 8.4h6M7 10.8h3.4"/></svg>
+            <span class="nav-label">Co-Pilot</span>
+          </a>
+
           <!-- Organization (collapsible) -->
           <div class="nav-section">
             <button class="nav-section-toggle" data-section="org" onclick="navToggle('org')">
@@ -4012,6 +4049,7 @@ export function shell(
               <a class="nav-child" href="/dashboard/kanban">Kanban board</a>
               <a class="nav-child" href="/send">Tasks</a>
               <a class="nav-child" href="/studio">Studio</a>
+              <a class="nav-child" href="/copilot">Co-Pilot</a>
               <a class="nav-child" href="/flights">Flights</a>
               <a class="nav-child" href="/verifications">Verifications</a>
             </div>
@@ -4132,6 +4170,8 @@ export function shell(
 
       </div><!-- /.content-wrap -->
     </div><!-- /.layout -->
+
+    ${copilotDrawerMarkup()}
 
     <script>
       (function () {
@@ -4260,6 +4300,7 @@ export function shell(
 
       })();
     </script>
+    <script>${raw(COPILOT_SCRIPT)}</script>
   </body>
 </html>`
 }

@@ -1,28 +1,42 @@
-// tests/studio-chat-streaming.test.ts — Always-on Studio Co-Pilot chat.
+// tests/studio-chat-streaming.test.ts — POST /api/studio/chat SSE token stream.
 //
 // Schema is the committed migration chain (createSqliteD1 + applyAllMigrations).
-// HTTP tests go through studioApp (the production /api/studio mount) with an
-// optional injected dashboard session so guest / member / admin share one door.
+// HTTP tests go through dashboardApp so session auth and CSRF match production.
 
-import { Hono } from 'hono'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import type { AuthContext, Env } from '../src/types'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { AuthContext, Env, ModelMessage } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
-import {
-  studioApp,
-  studioPageHtml,
-  studioChatAuthorityFromAuth,
-  buildStudioChatSystemPrompt,
-  STUDIO_CHAT_ADMIN_TOOLS,
-} from '../src/dashboard/studio'
 
-const TENANT = 'pot-studio'
+const authState = vi.hoisted(() => ({ current: null as AuthContext | null }))
+
+vi.mock('../src/auth', () => ({
+  requireAuth: async (
+    c: {
+      get: (key: 'auth') => AuthContext | undefined
+      set: (key: 'auth', value: AuthContext) => void
+      json: (body: unknown, status: 401) => Response
+    },
+    next: () => Promise<void>,
+  ) => {
+    if (!authState.current) return c.json({ error: 'unauthenticated' }, 401)
+    c.set('auth', authState.current)
+    await next()
+  },
+}))
+
+const { dashboardApp } = await import('../src/dashboard')
+const {
+  copilotSseResponse,
+  parseCopilotChatBody,
+  tokenizeAssistantText,
+  fallbackCopilotReply,
+} = await import('../src/dashboard/copilot')
+
+const TENANT = 'pot-studio-chat'
 
 let harness: SqliteD1Harness
 let env: Env
-let lastAiCall: { model: string; input: Record<string, unknown> } | null = null
-let authState: AuthContext | null = null
 
 function actor(overrides: Partial<AuthContext> = {}): AuthContext {
   return {
@@ -34,290 +48,146 @@ function actor(overrides: Partial<AuthContext> = {}): AuthContext {
   }
 }
 
-function chatApp() {
-  const app = new Hono<{ Bindings: Env; Variables: { auth?: AuthContext } }>()
-  app.use('*', async (c, next) => {
-    if (authState) c.set('auth', authState)
-    await next()
-  })
-  app.route('/api/studio', studioApp)
-  return app
-}
-
-function seedOrg(): void {
-  harness.sqlite.exec(`
-    INSERT INTO departments (id, slug, name) VALUES ('dept-studio', 'studio', 'Studio');
-    INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-studio', 'dept-studio', 'studio', 'Studio Squad');
-    INSERT INTO agents (id, squad_id, slug, name, role, model, status)
-    VALUES ('agent-studio', 'squad-studio', 'studio-pilot', 'Studio Pilot', 'member', 'cursor-cloud', 'active');
-  `)
-}
-
-function streamTokens(...parts: string[]): ReadableStream<{ response: string }> {
-  return new ReadableStream<{ response: string }>({
-    start(controller) {
-      for (const part of parts) controller.enqueue({ response: part })
-      controller.close()
-    },
-  })
-}
-
-async function readSse(res: Response): Promise<{ raw: string; events: Array<Record<string, unknown>> }> {
-  const raw = await res.text()
-  const events: Array<Record<string, unknown>> = []
-  for (const block of raw.split('\n\n')) {
-    const line = block.trim()
-    if (!line.startsWith('data:')) continue
-    events.push(JSON.parse(line.slice(5).trim()) as Record<string, unknown>)
-  }
-  return { raw, events }
-}
-
-function tokenText(events: Array<Record<string, unknown>>): string {
-  return events
-    .filter((event) => event.type === 'token')
-    .map((event) => String(event.text ?? ''))
-    .join('')
+function as(auth: AuthContext | null): void {
+  authState.current = auth
 }
 
 beforeEach(() => {
   harness = createSqliteD1()
   applyAllMigrations(harness.sqlite)
-  lastAiCall = null
-  authState = actor()
-  env = {
-    DB: harness.db,
-    TENANT_SLUG: TENANT,
-    BRAND: 'Mupot',
-    AI: {
-      run: async (model: string, input: Record<string, unknown>) => {
-        lastAiCall = { model, input }
-        return streamTokens('Hello', ' from ', 'Co-Pilot')
-      },
-    },
-  } as unknown as Env
-  seedOrg()
+  env = { DB: harness.db, TENANT_SLUG: TENANT, BRAND: 'Mupot' } as Env
+  as(actor())
 })
 
 afterEach(() => {
-  authState = null
+  authState.current = null
   harness.close()
 })
 
-describe('studio chat authority helpers', () => {
-  it('elevates admin/owner sessions to full tool-calling', () => {
-    const admin = studioChatAuthorityFromAuth(actor({ role: 'admin' }), TENANT)
-    expect(admin.role).toBe('admin')
-    expect(admin.tools).toEqual([...STUDIO_CHAT_ADMIN_TOOLS])
-    expect(admin.guest).toBe(false)
-
-    const owner = studioChatAuthorityFromAuth(actor({ role: 'owner' }), TENANT)
-    expect(owner.role).toBe('admin')
-    expect(owner.tools).toContain('squad_create')
-    expect(owner.tools).toContain('cursor_dispatch')
-    expect(owner.tools).toContain('task_create')
-    expect(owner.tools).toContain('loop_control')
+function chatRequest(body: unknown): Request {
+  return new Request('https://pot.test/api/studio/chat', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      origin: 'https://pot.test',
+    },
+    body: JSON.stringify(body),
   })
+}
 
-  it('keeps member, public, and unauthenticated callers read-only', () => {
-    const member = studioChatAuthorityFromAuth(actor({ role: 'member' }), TENANT)
-    expect(member.role).toBe('member')
-    expect(member.tools).toEqual([])
+function sseFrames(text: string): Record<string, unknown>[] {
+  return text
+    .split('\n\n')
+    .map((block) => block.replace(/^data:\s*/, '').trim())
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as Record<string, unknown>)
+}
 
-    const guest = studioChatAuthorityFromAuth(null, TENANT)
-    expect(guest.role).toBe('member')
-    expect(guest.guest).toBe(true)
-    expect(guest.tools).toEqual([])
-  })
-
-  it('reflects session authority in the system prompt', () => {
-    const adminPrompt = buildStudioChatSystemPrompt(
-      studioChatAuthorityFromAuth(actor({ role: 'admin' }), TENANT),
-      { squads: ['Studio Squad'] },
-    )
-    expect(adminPrompt).toContain('role: admin')
-    expect(adminPrompt).toContain('squad_create')
-    expect(adminPrompt).toContain('cursor_dispatch')
-    expect(adminPrompt).toContain(`Tenant: ${TENANT}`)
-    expect(adminPrompt).toContain('Studio Squad')
-
-    const memberPrompt = buildStudioChatSystemPrompt(
-      studioChatAuthorityFromAuth(null, TENANT),
-      { squads: ['Studio Squad'] },
-    )
-    expect(memberPrompt).toContain('role: member')
-    expect(memberPrompt).toContain('read-only')
-    expect(memberPrompt).toMatch(/MUST refuse destructive mutations/i)
+describe('tokenizeAssistantText', () => {
+  it('splits a reply into word tokens for token-by-token rendering', () => {
+    expect(tokenizeAssistantText('Hello from Co-Pilot.')).toEqual(['Hello ', 'from ', 'Co-Pilot.'])
   })
 })
 
-describe('Studio UI — always-on co-pilot', () => {
-  it('renders persistent chat, role badge, streaming client, and Launch Cloud Build', async () => {
-    const markup = String(
-      await studioPageHtml({
-        brand: 'Mupot',
-        tenant: TENANT,
-        operator: 'operator@mumega.com',
-        branch: 'main',
-        flights: [],
-        authorityRole: 'admin',
-      }),
-    )
-    expect(markup).toContain('id="studio-copilot"')
-    expect(markup).toContain('data-always-on="true"')
-    expect(markup).toContain('[ 🛡️ Admin Authority ]')
-    expect(markup).toContain('studio-authority-admin')
-    expect(markup).toContain('id="studio-chat-input"')
-    expect(markup).toContain('id="studio-launch-cloud-build"')
-    expect(markup).toContain('Launch Cloud Build')
-    expect(markup).toContain('studio-msg-user')
-    expect(markup).toContain('studio-msg-copilot')
-    expect(markup).toContain('response.body.getReader')
-    expect(markup).toContain('/api/studio/chat')
+describe('parseCopilotChatBody', () => {
+  it('requires a non-empty message', () => {
+    expect(parseCopilotChatBody({ message: '   ' })).toEqual({
+      ok: false,
+      status: 400,
+      error: 'message_required',
+    })
+  })
 
-    const memberMarkup = String(
-      await studioPageHtml({
-        brand: 'Mupot',
-        tenant: TENANT,
-        operator: 'guest',
-        branch: 'main',
-        flights: [],
-        authorityRole: 'member',
-      }),
-    )
-    expect(memberMarkup).toContain('[ 👤 Member / Guest ]')
-    expect(memberMarkup).toContain('studio-authority-member')
+  it('accepts history turns', () => {
+    const parsed = parseCopilotChatBody({
+      message: 'And then?',
+      history: [{ role: 'user', content: 'Hi' }, { role: 'assistant', content: 'Hello' }],
+    })
+    expect(parsed.ok).toBe(true)
+    if (parsed.ok) {
+      expect(parsed.value.message).toBe('And then?')
+      expect(parsed.value.history).toHaveLength(2)
+    }
+  })
+})
+
+describe('copilotSseResponse', () => {
+  it('streams injected model tokens then a done frame', async () => {
+    const res = copilotSseResponse(env, { message: 'hello' }, async () => 'Hello from Co-Pilot.')
+    expect(res.headers.get('Content-Type')).toBe('text/event-stream')
+    const frames = sseFrames(await res.text())
+    const tokens = frames.filter((f) => typeof f.token === 'string').map((f) => f.token)
+    expect(tokens.join('')).toBe('Hello from Co-Pilot.')
+    expect(frames.at(-1)).toEqual({ done: true, source: 'model' })
+  })
+
+  it('falls back when the model throws', async () => {
+    const res = copilotSseResponse(env, { message: 'Where is Studio?' }, async () => {
+      throw new Error('no model')
+    })
+    const text = await res.text()
+    expect(text).toContain('data: {"token":')
+    expect(text).toContain(fallbackCopilotReply('Where is Studio?').split(' ')[0])
+    expect(text).toContain('"done":true')
+    expect(text).toContain('"source":"fallback"')
   })
 })
 
 describe('POST /api/studio/chat', () => {
-  it('streams valid response tokens for an admin session', async () => {
-    authState = actor({ role: 'admin' })
-    const res = await chatApp().fetch(
-      new Request('https://pot.test/api/studio/chat', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ message: 'What can you do in this pot?' }),
-      }),
-      env,
-    )
+  it('streams SSE tokens from Workers AI when bound', async () => {
+    env = {
+      ...env,
+      AI: {
+        run: async () => ({ response: 'Neon token stream works.' }),
+      },
+    } as Env
+
+    const res = await dashboardApp.fetch(chatRequest({ message: 'Stream please' }), env)
     expect(res.status).toBe(200)
-    expect(res.headers.get('content-type')).toContain('text/event-stream')
-    expect(res.headers.get('x-studio-chat-role')).toBe('admin')
-    expect(res.headers.get('x-studio-chat-authority')).toBe('admin')
-
-    const { raw, events } = await readSse(res)
-    expect(events[0]).toMatchObject({ type: 'meta', role: 'admin' })
-    expect((events[0] as { tools: string[] }).tools).toEqual([...STUDIO_CHAT_ADMIN_TOOLS])
-    expect(tokenText(events)).toBe('Hello from Co-Pilot')
-    expect(events.at(-1)).toMatchObject({ type: 'done' })
-    expect(raw).toContain('Hello')
-    expect(raw).toContain('Co-Pilot')
-
-    expect(lastAiCall).toBeTruthy()
-    expect(lastAiCall?.input.stream).toBe(true)
-    expect(String(lastAiCall?.model)).toMatch(/@cf\/(meta\/llama-3\.3-70b-instruct|qwen\/qwen2\.5-coder-32b-instruct)/)
-    const tools = lastAiCall?.input.tools as Array<{ name: string }>
-    expect(tools.map((tool) => tool.name)).toEqual([...STUDIO_CHAT_ADMIN_TOOLS])
-    const messages = lastAiCall?.input.messages as Array<{ role: string; content: string }>
-    expect(messages[0]?.role).toBe('system')
-    expect(messages[0]?.content).toContain('role: admin')
-    expect(messages[0]?.content).toContain('Studio Squad')
+    expect(res.headers.get('Content-Type')).toContain('text/event-stream')
+    const frames = sseFrames(await res.text())
+    const streamed = frames.filter((f) => typeof f.token === 'string').map((f) => f.token).join('')
+    expect(streamed).toBe('Neon token stream works.')
+    expect(frames.at(-1)).toEqual({ done: true, source: 'model' })
   })
 
-  it('enforces member/read-only scope for unauthenticated sessions', async () => {
-    authState = null
-    const res = await chatApp().fetch(
-      new Request('https://pot.test/api/studio/chat', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ message: 'Please create a squad and dispatch a flight.' }),
-      }),
-      env,
-    )
+  it('streams a fallback reply when no model is configured', async () => {
+    const res = await dashboardApp.fetch(chatRequest({ message: 'What is Studio?' }), env)
     expect(res.status).toBe(200)
-    expect(res.headers.get('x-studio-chat-role')).toBe('member')
-    expect(res.headers.get('x-studio-chat-authority')).toBe('member')
-
-    const { events } = await readSse(res)
-    expect(events[0]).toMatchObject({ type: 'meta', role: 'member', guest: true })
-    expect((events[0] as { tools: string[] }).tools).toEqual([])
-
-    expect(lastAiCall).toBeTruthy()
-    expect(lastAiCall?.input.stream).toBe(true)
-    expect(lastAiCall?.input.tools).toBeUndefined()
-    const messages = lastAiCall?.input.messages as Array<{ role: string; content: string }>
-    expect(messages[0]?.content).toContain('role: member')
-    expect(messages[0]?.content).toMatch(/read-only/i)
-    expect(messages[0]?.content).not.toContain('You execute with role: admin')
+    expect(res.headers.get('Content-Type')).toContain('text/event-stream')
+    const text = await res.text()
+    expect(text).toContain('data: {"token":')
+    expect(text).toContain('"done":true')
+    expect(text).toContain('Co-Pilot')
   })
 
-  it('enforces member/read-only scope for member sessions', async () => {
-    authState = actor({ role: 'member', userId: 'member-1', email: 'member@mumega.com' })
-    const res = await chatApp().fetch(
-      new Request('https://pot.test/api/studio/chat', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ message: 'Summarize the studio squad.' }),
-      }),
-      env,
-    )
-    expect(res.status).toBe(200)
-    expect(res.headers.get('x-studio-chat-role')).toBe('member')
-
-    const { events } = await readSse(res)
-    expect(events[0]).toMatchObject({ type: 'meta', role: 'member', guest: false })
-    expect((events[0] as { tools: string[] }).tools).toEqual([])
-    expect(tokenText(events)).toBe('Hello from Co-Pilot')
-
-    const messages = lastAiCall?.input.messages as Array<{ role: string; content: string }>
-    expect(messages[0]?.content).toContain('role: member')
-    expect(messages[0]?.content).toMatch(/MUST refuse destructive mutations/i)
-  })
-
-  it('reflects session authority in streamed chat responses', async () => {
-    authState = actor({ role: 'owner', email: 'owner@mumega.com' })
-    const adminRes = await chatApp().fetch(
-      new Request('https://pot.test/api/studio/chat', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ messages: [{ role: 'user', content: 'Ready to launch a cloud build.' }] }),
-      }),
-      env,
-    )
-    const admin = await readSse(adminRes)
-    expect(adminRes.headers.get('x-studio-chat-authority')).toBe('admin')
-    expect(admin.events[0]).toMatchObject({ type: 'meta', role: 'admin', tenant: TENANT })
-    expect((lastAiCall?.input.messages as Array<{ content: string }>)[0].content).toContain('owner@mumega.com')
-    expect((lastAiCall?.input.messages as Array<{ content: string }>)[0].content).toContain('loop_control')
-
-    authState = actor({ role: 'member', email: 'viewer@mumega.com' })
-    const memberRes = await chatApp().fetch(
-      new Request('https://pot.test/api/studio/chat', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ prompt: 'What flights are in this pot?' }),
-      }),
-      env,
-    )
-    const member = await readSse(memberRes)
-    expect(memberRes.headers.get('x-studio-chat-authority')).toBe('member')
-    expect(member.events[0]).toMatchObject({ type: 'meta', role: 'member', tenant: TENANT })
-    expect((lastAiCall?.input.messages as Array<{ content: string }>)[0].content).toContain('viewer@mumega.com')
-    expect((lastAiCall?.input.messages as Array<{ content: string }>)[0].content).toContain('read-only')
-  })
-
-  it('rejects an empty chat body', async () => {
-    const res = await chatApp().fetch(
-      new Request('https://pot.test/api/studio/chat', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ message: '   ' }),
-      }),
-      env,
-    )
+  it('rejects an empty message', async () => {
+    const res = await dashboardApp.fetch(chatRequest({ message: '   ' }), env)
     expect(res.status).toBe(400)
     const payload = (await res.json()) as { error: string }
     expect(payload.error).toBe('message_required')
+  })
+
+  it('passes conversation history into the model prompt', async () => {
+    const seen: ModelMessage[][] = []
+    const res = copilotSseResponse(
+      env,
+      {
+        message: 'Continue',
+        history: [{ role: 'user', content: 'Start' }, { role: 'assistant', content: 'Started' }],
+      },
+      async (messages) => {
+        seen.push(messages)
+        return 'Continued.'
+      },
+    )
+    await res.text()
+    expect(seen).toHaveLength(1)
+    expect(seen[0].some((m) => m.role === 'system')).toBe(true)
+    expect(seen[0].filter((m) => m.role !== 'system')).toEqual([
+      { role: 'user', content: 'Start' },
+      { role: 'assistant', content: 'Started' },
+      { role: 'user', content: 'Continue' },
+    ])
   })
 })

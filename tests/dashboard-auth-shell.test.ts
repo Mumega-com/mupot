@@ -33,6 +33,7 @@ describe('dashboard authenticated account shell', () => {
       '/admin/divisions', '/agents', '/send', '/flights', '/verifications', '/radar', '/ops',
       '/addons', '/economy', '/economy/wallet', '/economy/marketplace', '/economy/billing',
       '/members', '/admin/members', '/audit', '/deployment', '/admin/github', '/admin/keys',
+      '/copilot',
     ]) {
       expect(sidebarNav).toContain(`href="${href}"`)
     }
