@@ -378,7 +378,7 @@ export function copilotDeepChatMarkup(opts?: {
 export function copilotRecipientSelectHtml(selectId: string): Html {
   const options = COPILOT_RECIPIENTS.map(
     (agent) =>
-      html`<option value="${agent.id}" data-color="${agent.color}" data-letter="${agent.letter}">${agent.handle} — ${agent.title}</option>`,
+      html`<option value="${agent.id}" data-color="${agent.color}" data-letter="${agent.letter}">${raw(`${agent.handle} — ${agent.title}`)}</option>`,
   )
   return html`<label class="mupot-copilot-recipient">
     <span class="copilot-recipient" hidden></span>
