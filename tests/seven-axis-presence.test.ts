@@ -275,7 +275,7 @@ describe('7-axis normalizers and Cursor Cloud seat injection', () => {
     const injected = injectSevenAxisSeatDeclaration('Ship the radar roster.', flightId)
     const identity = sevenAxisCheckInDeclaration(flightId)
     expect(identity).toBe(
-      `Identity: You are Cursor Cloud Flight Agent. On start, invoke check_in({ seat: "${CURSOR_CLOUD_SEAT}", harness: "${CURSOR_CLOUD_HARNESS}", model: "${CURSOR_CLOUD_MODEL}", effort: "${CURSOR_CLOUD_EFFORT}", machine: "${CURSOR_CLOUD_MACHINE}", flight_id: "${flightId}" })`,
+      `Identity: You are Cursor Cloud Flight Agent. On start, invoke check_in({ seat: "${CURSOR_CLOUD_SEAT}", harness: "${CURSOR_CLOUD_HARNESS}", machine: "${CURSOR_CLOUD_MACHINE}", model: "${CURSOR_CLOUD_MODEL}", provider: "anthropic", effort: "${CURSOR_CLOUD_EFFORT}", flight_id: "${flightId}" })`,
     )
     expect(injected.startsWith(identity)).toBe(true)
     expect(injected).toContain('Ship the radar roster.')
