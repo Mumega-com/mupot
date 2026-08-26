@@ -215,14 +215,15 @@ export async function recordCheckin(
   const axis = bindSevenAxis(opts)
   await env.DB.prepare(
     `INSERT INTO presence (
-        tenant, member_id, display_name, source, label, agent_id,
+        tenant, member_id, display_name, source, label, seat, agent_id,
         harness, machine, model, provider, effort, flight_id,
         first_seen_at, last_seen_at
       )
-      VALUES (?1, ?2, ?3, ?4, ?5, ?6, COALESCE(?7, 'unknown'), ?8, ?9, ?10, ?11, ?12, datetime('now'), datetime('now'))
+      VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, COALESCE(?7, 'unknown'), ?8, ?9, ?10, ?11, ?12, datetime('now'), datetime('now'))
       ON CONFLICT(tenant, member_id, label) DO UPDATE SET
         display_name = excluded.display_name,
         source       = excluded.source,
+        seat         = excluded.seat,
         agent_id     = excluded.agent_id,
         harness      = CASE WHEN ?7 IS NULL THEN presence.harness ELSE excluded.harness END,
         machine      = COALESCE(?8, presence.machine),

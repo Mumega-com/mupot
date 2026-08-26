@@ -301,13 +301,27 @@ function reportUnmatchedCron(scheduledAt: Date): void {
     scheduled_time: scheduledAt.toISOString(),
     expected_trigger_count: 2,
   })
-}
-
 export default {
-  // Hostname project-preview (`https://<project>.mupot.mumega.com`) is resolved
-  // before the OAuth wrapper so a project Worker is never shadowed by the pot UI.
-  // Path `/preview/:project_id` stays on the Hono app (platformApp above).
   fetch: async (req: Request, env: Env, ctx: ExecutionContext) => {
+    // ── Cloudflare Workers for Platforms (WFP) Sovereign Tenant Routing ──
+    // Routes `<tenant>.mupot.mumega.com` to the isolated User Worker in `mupot-pots`.
+    if (env.DISPATCHER) {
+      const url = new URL(req.url)
+      const headerSlug = req.headers.get('x-mupot-tenant-slug') || req.headers.get('x-pot-tenant')
+      const rootHost = env.PUBLIC_ORIGIN ? new URL(env.PUBLIC_ORIGIN).hostname : undefined
+      const { extractTenantSlug } = await import('./dispatcher')
+      const tenantSlug = extractTenantSlug(url.hostname, rootHost, headerSlug)
+
+      if (tenantSlug && tenantSlug !== (env.TENANT_SLUG || 'mumega') && tenantSlug !== 'mupot' && tenantSlug !== 'mumega') {
+        const dispatcher = (await import('./dispatcher')).default
+        return dispatcher.fetch(req, {
+          DISPATCHER: env.DISPATCHER,
+          FALLBACK_POT: env.TENANT_SLUG,
+          ROOT_DOMAIN: rootHost,
+        })
+      }
+    }
+
     const hosted = await maybeHandleHostnameDispatch(req, env)
     if (hosted) return hosted
     return oauthProvider.fetch(req, env, ctx)

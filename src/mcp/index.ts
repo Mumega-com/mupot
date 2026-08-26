@@ -3598,7 +3598,7 @@ const toolCheckIn: ToolSpec = {
     }
 
     await recordCheckin(env, id, {
-      source: args.source ?? axes.harness,
+      source: args.source ?? axis.harness,
       label: seatLabel || args.label,
       seat: seatLabel,
       harness: args.harness,

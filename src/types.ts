@@ -61,6 +61,8 @@ export interface Env {
   // calls the binding should guard `if (env.TASK_WORKFLOW)` or use the
   // startTaskPipeline helper which handles the absent-binding case gracefully.
   TASK_WORKFLOW?: WorkflowBinding<import('./workflows/pipeline').TaskPipelineParams>
+  // Cloudflare Workers for Platforms Dynamic Dispatch namespace
+  DISPATCHER?: import('./platform/dispatcher').DispatchNamespace
   // vars
   TENANT_SLUG: string
   // The tenant slug that owns THIS deployment's Worker-level operator secrets/config (as
