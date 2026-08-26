@@ -2,6 +2,10 @@
 
 ## 0.30.0 — 2026-08-21
 
+- **Co-Pilot multi-agent recipient routing** (`src/dashboard/copilot.ts`, `src/dashboard/studio-chat.ts`).
+  - Drawer and `/copilot` page ship a persisted recipient selector (`@copilot`, `@loom`, `@kasra`, `@athena`, `@cursor-architect`, `@cursor-builder`).
+  - `POST /api/studio/chat` accepts `{ message, history, recipient }` and streams `{ type: "meta", agent, role }` then `{ type: "token", text }` with persona-specific prompts.
+
 - **Cursor Cloud SaaS engine & MCP tools** (`src/cursor/client.ts`, `src/mcp/cursor.ts`, `src/dashboard/studio.ts`).
   - Typed client for `https://api.cursor.com/v1` (`createCursorAgent`, `dispatchCursorRun`, `getCursorAgent`, `getCursorRun`).
   - MCP `cursor_dispatch` / `cursor_run_status` write matching task + flight records and return `agent_url`.

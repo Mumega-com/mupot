@@ -1317,7 +1317,7 @@ dashboardApp.post('/api/studio/chat', async (c) => {
   }
   const parsed = parseCopilotChatBody(body)
   if (!parsed.ok) return c.json({ error: parsed.error }, parsed.status)
-  return copilotSseResponse(c.env, parsed.value)
+  return copilotSseResponse(c.env, parsed.value, undefined, c.get('auth')?.role)
 })
 
 // ── radar (visual fleet + squad awareness — #21 slice 1, VIEW LAYER ONLY) ────

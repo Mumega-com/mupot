@@ -117,9 +117,10 @@ describe('copilotSseResponse', () => {
     const res = copilotSseResponse(env, { message: 'hello' }, async () => 'Hello from Co-Pilot.')
     expect(res.headers.get('Content-Type')).toBe('text/event-stream')
     const frames = sseFrames(await res.text())
-    const tokens = frames.filter((f) => typeof f.token === 'string').map((f) => f.token)
+    expect(frames[0]).toEqual({ type: 'meta', agent: 'copilot', role: 'member' })
+    const tokens = frames.filter((f) => f.type === 'token').map((f) => f.text)
     expect(tokens.join('')).toBe('Hello from Co-Pilot.')
-    expect(frames.at(-1)).toEqual({ done: true, source: 'model' })
+    expect(frames.at(-1)).toEqual({ type: 'done', source: 'model', done: true })
   })
 
   it('falls back when the model throws', async () => {
@@ -127,7 +128,7 @@ describe('copilotSseResponse', () => {
       throw new Error('no model')
     })
     const text = await res.text()
-    expect(text).toContain('data: {"token":')
+    expect(text).toContain('"type":"token"')
     expect(text).toContain(fallbackCopilotReply('Where is Studio?').split(' ')[0])
     expect(text).toContain('"done":true')
     expect(text).toContain('"source":"fallback"')
