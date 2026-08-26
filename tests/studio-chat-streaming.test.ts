@@ -145,10 +145,9 @@ describe('POST /api/studio/chat', () => {
     const res = await dashboardApp.fetch(chatRequest({ message: 'Stream please' }), env)
     expect(res.status).toBe(200)
     expect(res.headers.get('Content-Type')).toContain('text/event-stream')
-    const text = await res.text()
-    const frames = sseFrames(text)
-    expect(frames.some((f) => f.token === 'Neon ' || String(f.token ?? '').includes('Neon'))).toBe(true)
-    expect(text).toContain('Neon token stream works.')
+    const frames = sseFrames(await res.text())
+    const streamed = frames.filter((f) => typeof f.token === 'string').map((f) => f.token).join('')
+    expect(streamed).toBe('Neon token stream works.')
     expect(frames.at(-1)).toEqual({ done: true, source: 'model' })
   })
 
