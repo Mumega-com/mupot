@@ -23,6 +23,7 @@ import { publicHealth } from './health'
 // Component routers (each subagent fills these in their folder).
 // Stubs are provided so the app type-checks before all components land.
 import { authApp } from './auth'
+import { ssoApp } from './auth/sso-routes'
 import { orgApp } from './org'
 import { agentsApp } from './agents'
 import { tasksApp, gatesApp } from './tasks'
@@ -88,6 +89,7 @@ export const app = new Hono<{ Bindings: Env }>()
 app.get('/health', (c) => c.json(publicHealth(c.env.TENANT_SLUG, c.env.RELEASE_SHA)))
 
 app.route(ROUTES.auth, authApp)
+app.route('/api/auth/sso', ssoApp)
 app.route(ROUTES.org, orgApp)
 app.route(ROUTES.agents, agentsApp)
 app.route(ROUTES.tasks, tasksApp)
