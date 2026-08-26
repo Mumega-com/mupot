@@ -725,6 +725,21 @@ export const COPILOT_SCRIPT = `
       setOpen(!drawer.classList.contains('is-open'));
     });
   }
+  document.querySelectorAll('[data-copilot-open]').forEach(function (el) {
+    el.addEventListener('click', function (e) {
+      e.preventDefault();
+      var recipient = el.getAttribute('data-copilot-recipient-open');
+      if (recipient) applyRecipient(recipient);
+      var prefill = el.getAttribute('data-copilot-prefill');
+      var input = drawer && drawer.querySelector('[data-copilot-input]');
+      if (prefill && input && !input.value) input.value = prefill;
+      setOpen(true);
+    });
+  });
+  window.mupotOpenCopilot = function (opts) {
+    if (opts && opts.recipient) applyRecipient(opts.recipient);
+    setOpen(true);
+  };
   if (closeBtn) closeBtn.addEventListener('click', function () { setOpen(false); });
   if (backdrop) backdrop.addEventListener('click', function () { setOpen(false); });
   document.addEventListener('keydown', function (e) {

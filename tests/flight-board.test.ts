@@ -8,7 +8,9 @@ function row(p: Partial<FlightRow> & { agent: string; status: FlightStatus }): F
   return {
     id: p.id ?? crypto.randomUUID(),
     tenant: 'test',
+    project_id: p.project_id ?? null,
     agent: p.agent,
+    dispatched_by_agent_id: p.dispatched_by_agent_id ?? p.agent,
     goal: p.goal ?? 'do the thing',
     status: p.status,
     trigger_source: 'manual',
@@ -19,9 +21,9 @@ function row(p: Partial<FlightRow> & { agent: string; status: FlightStatus }): F
     cost_micro_usd: p.cost_micro_usd ?? 0,
     next_run_at: p.next_run_at ?? null,
     created_at: p.created_at ?? NOW,
-    started_at: null,
-    ended_at: null,
-    meta: '{}',
+    started_at: p.started_at ?? null,
+    ended_at: p.ended_at ?? null,
+    meta: p.meta ?? '{}',
     agent_name: p.agent_name ?? null,
     squad_name: p.squad_name ?? null,
   }
@@ -189,5 +191,24 @@ describe('Flight-006 Slice 2 — phase metric separation + canonical names', () 
     expect(cards[0].squad_name).toBe('Fleet')
     expect(cards[1].agent_name).toBe('uuid-2')
     expect(cards[1].squad_name).toBeNull()
+  })
+
+  it('threads timestamps and raw meta for the flight deck', () => {
+    const [c] = buildBoard(
+      [
+        row({
+          agent: 'a',
+          status: 'running',
+          started_at: NOW - 60_000,
+          ended_at: null,
+          meta: '{"artifact_refs":["https://github.com/org/repo/pull/1"]}',
+        }),
+      ],
+      NOW,
+    )
+    expect(c.created_at).toBe(NOW)
+    expect(c.started_at).toBe(NOW - 60_000)
+    expect(c.ended_at).toBeNull()
+    expect(c.meta).toContain('github.com/org/repo/pull/1')
   })
 })

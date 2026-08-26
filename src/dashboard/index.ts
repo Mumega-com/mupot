@@ -203,7 +203,7 @@ import { wakeFleetAgent, requestFleetControl, fleetScoped } from './fleet'
 import { emitControlRequest, emitSquadControlRequest } from '../fleet/control'
 import { listFlights } from '../flight/service'
 import { buildBoard } from '../flight/board'
-import type { FlightCard } from '../flight/board'
+import { flightsBody } from './flights-deck'
 import { wizardApp } from './wizard'
 import { studioApp } from './studio'
 import { isOnboardingComplete } from './settings'
@@ -1270,8 +1270,9 @@ dashboardApp.get('/flights', async (c) => {
   const result = context
     ? await loadProjectFlights(c.env, context)
     : { rows: await listFlights(c.env), scanLimited: false }
-  const cards = buildBoard(result.rows, Date.now())
-  return c.html(shell(c.env, 'Flights', flightsBody(cards, context?.project, result.scanLimited)))
+  const nowMs = Date.now()
+  const cards = buildBoard(result.rows, nowMs)
+  return c.html(shell(c.env, 'Flights', flightsBody(cards, context?.project, result.scanLimited, nowMs)))
 })
 
 // GET /studio — Lovable/Claude Design split-pane canvas (session auth).
@@ -3850,6 +3851,7 @@ export function shell(
 
       /* ══ console-reskin primitives (src/dashboard/ui.ts) ══════════════════ */
       .ui-pagehead { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 4px; }
+      .ui-pagehead-right { margin-left: auto; }
       .ui-h1 { font-family: var(--font-display); font-weight: 400; font-size: 36px; line-height: 1.1; margin: 0; letter-spacing: -.01em; }
       .ui-sub { color: var(--dim); font-size: 13.5px; margin: 6px 0 18px; max-width: 680px; line-height: 1.5; }
       .ui-pill { display: inline-flex; align-items: center; gap: 6px; font-family: var(--font-mono); font-size: 10.5px; font-weight: 600; letter-spacing: .04em; padding: 3px 8px; border-radius: 999px;
@@ -5597,65 +5599,6 @@ function approvalsScript() {
         });
       })();
     </script>`)
-}
-
-// ── fleet views ───────────────────────────────────────────────────────────────
-
-// Pot-native flock: agents that checked in to THIS pot (no company bus). Read-only
-// inventory — who has access + who is in now. Control (wake/pause) is the bus path;
-// pot-native control is a later objective (#46).
-function flightsBody(cards: FlightCard[], project?: Project, scanLimited = false) {
-  const phaseColor = (p: string) =>
-    p === 'flying' ? 'var(--ok)' : p === 'sleeping' ? 'var(--warn)' : p === 'holding' || p === 'preflight' ? 'var(--accent)' : p === 'failed' || p === 'held' ? '#e5534b' : 'var(--dim)'
-  const arrow = (t: string | null) => (t === 'up' ? '▲' : t === 'down' ? '▼' : t === 'flat' ? '▬' : '')
-  const arrowColor = (t: string | null) => (t === 'up' ? 'var(--ok)' : t === 'down' ? '#e5534b' : 'var(--dim)')
-  const tr = (c: FlightCard) => `
-    <tr class="fl-row ${c.live ? '' : 'fl-dim'}">
-      <td><span class="fl-dot" style="background:${phaseColor(c.phase)}"></span>${escHtml(c.agent_name)}${c.squad_name ? ` <span style="color:var(--dim);font-size:11px">· ${escHtml(c.squad_name)}</span>` : ''}</td>
-      <td class="fl-label">${escHtml(c.goal)}</td>
-      <td><span class="fl-badge" style="color:${phaseColor(c.phase)}">${escHtml(c.phase)}</span></td>
-      <td class="fl-num">${c.metric_label && c.score_pct ? `${escHtml(c.metric_label)} ${escHtml(c.score_pct)} <span style="color:${arrowColor(c.trend)}">${arrow(c.trend)}</span>` : '<span style="color:var(--dim)">—</span>'}</td>
-      <td class="fl-num ${c.over_budget ? 'fl-over' : ''}">${escHtml(c.cost_usd)}${c.budget_usd ? `<span style="color:var(--dim)"> / ${escHtml(c.budget_usd)}</span>` : ''}</td>
-      <td>${c.next_departure ? escHtml(c.next_departure) : escHtml(c.age)}</td>
-    </tr>`
-  const flying = cards.filter((c) => c.phase === 'flying').length
-  const sleeping = cards.filter((c) => c.phase === 'sleeping').length
-  const table = cards.length
-    ? `<table class="fl-table">
-        <thead><tr><th>Agent</th><th>Goal</th><th>Phase</th><th>Metric</th><th>Cost / budget</th><th>Departure / age</th></tr></thead>
-        <tbody>${cards.map(tr).join('')}</tbody>
-      </table>`
-    : `<p class="empty">No flights yet. A flight = one bounded run of an agent toward a goal —
-       it appears here when a flight is created (preflight), and shows its accounted cost on land.</p>`
-  return html`
-    ${pageHeader({
-      crumbs: project ? `Projects / ${project.name} / Flights` : 'Overview / Flights',
-      title: 'Flights',
-      sub:
-        project
-          ? `Flights attributed to ${project.name}. Score, cost, and status remain read-only; control lives on Fleet.`
-          : 'Each flight is one bounded agent run toward a goal. Score is readiness at preflight / coherence on land, with its trend vs that agent’s last flight. Cost is metered (the black box). Read-only — control lives on Fleet.',
-    })}
-    ${kpiRow([
-      statCard({ label: 'Flying', value: String(flying), subTone: flying > 0 ? 'ok' : 'dim' }),
-      statCard({ label: 'Sleeping', value: String(sleeping), subTone: 'dim' }),
-    ])}
-    ${scanLimited ? html`<div class="card" role="status" style="border-color:var(--warn);margin-bottom:12px">
-      Flight history is partial because the project scan safety limit was reached.
-    </div>` : ''}
-    <style>
-      .fl-table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
-      .fl-table th { text-align: left; color: var(--muted); font-size: 12px; text-transform: uppercase;
-        letter-spacing: .5px; padding: 8px 10px; border-bottom: 1px solid var(--border); }
-      .fl-table td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
-      .fl-dim td { opacity: .55; }
-      .fl-dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:8px; }
-      .fl-label { color: var(--muted); max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-      .fl-badge { font-size: 11px; text-transform: uppercase; letter-spacing: .5px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); }
-      .fl-num { text-align: right; font-variant-numeric: tabular-nums; }
-      .fl-over { color: #e5534b; }
-    </style>
-    ${raw(`<div class="card" style="padding:0;overflow-x:auto">${table}</div>`)}`
 }
 
 // ── members + divisions views ─────────────────────────────────────────────────
