@@ -853,10 +853,10 @@ export const COPILOT_SCRIPT = `
     if (!form || !input || !list) return;
     root.setAttribute('data-copilot-bound', '1');
 
-    form.addEventListener('submit', function (e) {
-      e.preventDefault();
+    function doSend() {
       var message = (input.value || '').trim();
-      if (!message || send.disabled) return;
+      if (!message) return;
+      if (send && send.disabled) return;
       var recipient = normalizeRecipient((select && select.value) || currentRecipient());
       persistRecipient(recipient);
       applyRecipient(recipient);
@@ -865,26 +865,48 @@ export const COPILOT_SCRIPT = `
       appendMsg(list, 'You', message, 'copilot-msg-user');
       var assistant = appendMsg(list, def.badge, '', 'copilot-msg-assistant is-streaming', recipient);
       input.value = '';
-      send.disabled = true;
+      if (send) send.disabled = true;
+
       streamChat(list, assistant, message, hist, recipient)
-        .catch(function () {
+        .catch(function (err) {
+          console.error('[Co-Pilot] Chat error:', err);
           assistant.querySelector('p').textContent = 'Chat failed — try again.';
         })
         .finally(function () {
           assistant.classList.remove('is-streaming');
-          send.disabled = false;
+          if (send) send.disabled = false;
           input.focus();
         });
+    }
+
+    form.addEventListener('submit', function (e) {
+      e.preventDefault();
+      doSend();
     });
+
+    if (send) {
+      send.addEventListener('click', function (e) {
+        e.preventDefault();
+        doSend();
+      });
+    }
 
     input.addEventListener('keydown', function (e) {
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
-        form.requestSubmit();
+        doSend();
       }
     });
   }
 
-  document.querySelectorAll('[data-copilot-root]').forEach(bindRoot);
+  function initAll() {
+    document.querySelectorAll('[data-copilot-root]').forEach(bindRoot);
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initAll);
+  } else {
+    initAll();
+  }
 })();
 `
