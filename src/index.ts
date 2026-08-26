@@ -57,7 +57,8 @@ import { billingRoutesApp } from './billing/routes'
 import { alertsApp } from './alerts/routes'
 import { ccSpendApp } from './economy/cc-spend'
 import { resellerApp } from './reseller/routes'
-import { potsApp } from './pots/routes'
+import { potsApp, publicPotsApp } from './pots/routes'
+import { pricingPageHtml } from './dashboard/pricing'
 import { inboxApp } from './agents/inbox-routes'
 import { coordinationApp } from './coordination/routes'
 import { addonsApp } from './addons/routes'
@@ -125,6 +126,10 @@ app.route('/api/webhooks', supabaseWebhookApp)
 // Stripe Customer Billing & Inbound Webhooks:
 app.route('/api/billing', billingRoutesApp)
 app.route('/webhooks/stripe', billingRoutesApp)
+// Public Pricing & Self-Serve Sovereign Pot Provisioning:
+app.get('/pricing', (c) => c.html(pricingPageHtml(new URL(c.req.url).origin)))
+app.route('/api/pots/public', publicPotsApp)
+app.route('/api/pots', publicPotsApp)
 // Outbound Alert Webhooks:
 app.route('/api/alerts', alertsApp)
 app.route('/api/prospects', prospectsApp)

@@ -59,15 +59,9 @@ potsApp.get('/', async (c) => {
     return c.json(orgAdminForbiddenPayload('Listing sovereign tenant pots', auth, ORG_ADMIN_REFUSAL_LINKS), 403)
   }
 
-  const accountId = c.env.SECRET_ENV_CF_ACCOUNT_ID || 'e39eaf94f33092c4efd029d94ae1e9dd'
-  const apiToken = c.env.SECRET_ENV_CF_API_TOKEN
-  if (!apiToken) {
-    return c.json({ error: 'unconfigured', message: 'SECRET_ENV_CF_API_TOKEN not configured.' }, 503)
-  }
-
   try {
-    const pots = await listSovereignPots({ accountId, apiToken })
-    return c.json({ ok: true, count: pots.length, pots })
+    const list = await listSovereignPots(c.env)
+    return c.json({ ok: true, pots: list })
   } catch (err) {
     return c.json(
       {
@@ -78,3 +72,42 @@ potsApp.get('/', async (c) => {
     )
   }
 })
+
+export const publicPotsApp = new Hono<{ Bindings: Env }>()
+
+publicPotsApp.get('/slug-available', async (c) => {
+  const slug = c.req.query('slug') || ''
+  const { checkSlugAvailability } = await import('./checkout')
+  const result = await checkSlugAvailability(c.env, slug)
+  return c.json({ ok: true, result })
+})
+
+publicPotsApp.post('/checkout', async (c) => {
+  let body: { slug?: string; brand?: string; tier?: any; owner_email?: string }
+  try {
+    body = await c.req.json()
+  } catch {
+    return c.json({ ok: false, error: 'invalid_json' }, 400)
+  }
+
+  if (!body.slug || !body.owner_email) {
+    return c.json({ ok: false, error: 'slug_and_owner_email_required' }, 400)
+  }
+
+  const { createPotCheckoutSession } = await import('./checkout')
+  const origin = new URL(c.req.url).origin
+  const result = await createPotCheckoutSession(c.env, {
+    slug: body.slug,
+    brand: body.brand || body.slug.toUpperCase(),
+    tier: body.tier || 'starter',
+    ownerEmail: body.owner_email,
+    origin,
+  })
+
+  if (!result.ok) {
+    return c.json({ ok: false, error: result.error }, 400)
+  }
+
+  return c.json({ ok: true, url: result.url, session_id: result.sessionId })
+})
+
