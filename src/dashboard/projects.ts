@@ -41,6 +41,7 @@ import { listProjectBindings } from '../projects/providers/bindings'
 import type { ProjectProviderBinding } from '../projects/providers/port'
 import { emptyState, pageHeader, pill, sectionPanel } from './ui'
 import type { Html } from './ui'
+import { projectLivePreviewSplitHtml } from '../platform/routes'
 
 const MAX_PROJECTS = 100
 const PARENT_OPTIONS_PAGE_SIZE = 500
@@ -1632,6 +1633,12 @@ export function projectDetailBody(view: ProjectDetailView, statusResult?: string
         </div>
       </div>
     </section>
+    ${projectLivePreviewSplitHtml({
+      project,
+      deployments: view.deployments,
+      flights: view.recentFlights,
+      prs: view.recentPrs,
+    })}
     ${projectTabs(project.id)}
     <script type="application/json" id="project-situation-json">${raw(jsonScript(situation))}</script>
     <script type="application/json" id="project-activity-json">${raw(jsonScript({ rows: view.activity.rows }))}</script>

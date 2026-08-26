@@ -243,6 +243,10 @@ describe('project worker platform — routes', () => {
     expect(body).toContain('https://mupot.mumega.com')
     expect(body).toContain('squad-cursor')
     expect(body).toContain('🚀 Dispatch Feature Flight')
+    expect(body).toContain('Live preview')
+    expect(body).toContain('Code / Logs')
+    expect(body).toContain(`data-preview-iframe="${viamar!.id}"`)
+    expect(body).toContain(`/preview/${viamar!.id}/`)
 
     const detail = await loadProjectDetail(env, actor(), alpha!.id)
     expect(detail?.assignedSquadName).toBe('squad-cursor')

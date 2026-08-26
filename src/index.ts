@@ -63,6 +63,8 @@ import { projectLinkApp } from './addons/project-link/routes'
 import { presenceApp } from './registry/presence-routes'
 import { routinesApp } from './routines/routes'
 import { attentionApp } from './attention/routes'
+import { platformApp } from './platform/routes'
+import { maybeHandleHostnameDispatch } from './platform/dispatcher'
 
 // Durable Object classes — implemented in src/agents/.
 export { AgentDO } from './agents/agent-do'
@@ -193,6 +195,10 @@ app.all('/authorize', async (c) => handleOAuthAuthorize(c.req.raw, c.env))
 app.all('/oauth/google-callback', async (c) => handleOAuthAuthorize(c.req.raw, c.env))
 app.all('/oauth/consent', async (c) => handleOAuthAuthorize(c.req.raw, c.env))
 
+// Project sub-worker preview (`/preview/:project_id/*`) must precede the
+// dashboard '/' catch-all so the iframe is not redirected through login HTML.
+app.route('/', platformApp)
+
 app.route(ROUTES.dashboard, dashboardApp)
 
 // ── OAuthProvider wrapper (S-MUPOT-OAUTH) ────────────────────────────────────
@@ -295,11 +301,14 @@ function reportUnmatchedCron(scheduledAt: Date): void {
 }
 
 export default {
-  // The OAuth provider is the outer entry point. It handles OAuth paths and
-  // dispatches authenticated /mcp requests to McpOAuthApiHandler. Everything
-  // else falls through to the root Hono app via defaultHandler.
-  fetch: (req: Request, env: Env, ctx: ExecutionContext) =>
-    oauthProvider.fetch(req, env, ctx),
+  // Hostname project-preview (`https://<project>.mupot.mumega.com`) is resolved
+  // before the OAuth wrapper so a project Worker is never shadowed by the pot UI.
+  // Path `/preview/:project_id` stays on the Hono app (platformApp above).
+  fetch: async (req: Request, env: Env, ctx: ExecutionContext) => {
+    const hosted = await maybeHandleHostnameDispatch(req, env)
+    if (hosted) return hosted
+    return oauthProvider.fetch(req, env, ctx)
+  },
 
   // Queue delivery remains owned by the bus component.
   queue: handleQueue,
