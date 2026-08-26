@@ -142,6 +142,7 @@ crons = ["* * * * *", "0-9,15-24,30-39,45-54 * * * *"]
 # ── GHL act-channel secrets (issue #8) ──
 # These are secrets — do NOT add them under [vars]. Set via wrangler secret put:
 #
+#   npx wrangler secret put CURSOR_API_TOKEN     # Cursor Cloud Agents API key (optional SaaS engine)
 #   npx wrangler secret put GHL_API_KEY          # GHL location API key (outbound sends)
 #   npx wrangler secret put GHL_LOCATION_ID      # GHL location id (scopes all API calls)
 #   npx wrangler secret put GHL_WEBHOOK_SECRET   # HMAC-SHA256 secret for inbound webhook

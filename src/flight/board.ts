@@ -58,6 +58,12 @@ export interface FlightCard {
   trend: Trend | null
   next_departure: string | null
   age: string
+  created_at: number
+  started_at: number | null
+  ended_at: number | null
+  // Raw flights.meta JSON. The deck parses artifact/receipt refs from this;
+  // board itself stays phase/cost/score-only so existing board tests stay honest.
+  meta: string
 }
 
 // micro-USD (the meter's unit) → a "$0.0000" string. 4 dp keeps sub-cent flights legible.
@@ -131,6 +137,10 @@ export function buildBoard(rows: FlightRow[], nowMs: number): FlightCard[] {
       trend,
       next_departure: nextDeparture(row, nowMs),
       age: `${humanDur(nowMs - row.created_at)} ago`,
+      created_at: row.created_at,
+      started_at: row.started_at ?? null,
+      ended_at: row.ended_at ?? null,
+      meta: typeof row.meta === 'string' ? row.meta : '{}',
     }
   })
 }

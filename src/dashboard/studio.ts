@@ -3,17 +3,37 @@
 // A full-bleed dark split-pane operator surface:
 //   GET  /studio                 authenticated HTML canvas
 //   POST /api/studio/dispatch    create a flight + task from a prompt
+//   POST /api/studio/chat        always-on streaming Co-Pilot (SSE)
 //
 // PURE-ISH VIEW + thin write path. Auth is the dashboard session
-// (`getAuthContext` / `c.get('auth')`). Writes reuse createTask + createFlight.
+// (`getAuthContext` / `c.get('auth')`) or a member-bearer token on the
+// `/api/studio` mount. Writes reuse createTask + createFlight. When
+// CURSOR_API_TOKEN is bound and the model is cursor-cloud, dispatch also
+// launches a Cursor Cloud agent. Chat is always-on: admin/owner sessions
+// get full tool-calling; member / guest sessions stay read-only.
 
+import { Hono } from 'hono'
 import { html, raw } from 'hono/html'
 import type { HtmlEscapedString } from 'hono/utils/html'
 import type { Context } from 'hono'
+import { resolveCapabilities, holdsCapabilityFloor, isOrgAdmin } from '../auth/capability'
+import { bearerToken, resolveMemberByToken } from '../auth/member-bearer'
+import { createCursorAgent, resolveCursorApiToken } from '../cursor/client'
 import type { AuthContext, Env } from '../types'
 import { createFlight, listFlights, type FlightRow } from '../flight/service'
 import { createTask } from '../tasks/service'
-import { MUPOT_FAVICON_32_PNG_B64, MUPOT_MARK_64_PNG_B64 } from './brand-assets'
+import { peekSessionAuth } from '../auth'
+import { readStudioChatPayload, streamStudioChat } from './copilot'
+import { handleStudioChat, type StudioChatRole } from './studio-chat'
+
+export {
+  STUDIO_CHAT_ADMIN_TOOLS,
+  studioChatAuthorityFromAuth,
+  buildStudioChatSystemPrompt,
+  parseStudioChatInput,
+  handleStudioChat,
+} from './studio-chat'
+export type { StudioChatAuthority, StudioChatRole } from './studio-chat'
 
 export type StudioModel = 'cursor-cloud' | 'codex'
 
@@ -28,6 +48,10 @@ export interface StudioDispatchOk {
   flight_id: string
   task_id: string | null
   model: StudioModel
+  agent_id?: string | null
+  run_id?: string | null
+  agent_url?: string | null
+  cursor_launched?: boolean
 }
 
 export interface StudioViewData {
@@ -37,6 +61,7 @@ export interface StudioViewData {
   branch: string
   flights: FlightRow[]
   repoUrl?: string
+  authorityRole?: StudioChatRole
 }
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
@@ -60,6 +85,7 @@ export async function loadStudioData(env: Env, auth: AuthContext): Promise<Studi
     operator: auth.email || auth.userId,
     branch: studioBranchLabel(env),
     flights,
+    authorityRole: isOrgAdmin(auth) ? 'admin' : 'member',
   }
 }
 
@@ -87,6 +113,21 @@ export async function dispatchStudioFlight(
   if (!home) return { ok: false, status: 409, error: 'no_squad' }
 
   const title = prompt.length > 80 ? `${prompt.slice(0, 77)}…` : prompt
+  let cursor: { agent_id: string; run_id: string; agent_url: string } | null = null
+  const token = model === 'cursor-cloud' ? resolveCursorApiToken(env) : null
+  if (token && repoUrl) {
+    try {
+      const launched = await createCursorAgent(token, { name: title, repoUrl, prompt })
+      cursor = {
+        agent_id: launched.agent.id,
+        run_id: launched.run.id,
+        agent_url: launched.agent.url,
+      }
+    } catch {
+      cursor = null
+    }
+  }
+
   const body = [
     prompt,
     '',
@@ -94,6 +135,9 @@ export async function dispatchStudioFlight(
     repoUrl ? `repo: ${repoUrl}` : null,
     `dispatched_by: ${auth.email || auth.userId}`,
     'source: mupot-studio',
+    cursor ? `cursor_agent: ${cursor.agent_id}` : null,
+    cursor ? `cursor_run: ${cursor.run_id}` : null,
+    cursor ? `cursor_url: ${cursor.agent_url}` : null,
   ]
     .filter((line) => line !== null)
     .join('\n')
@@ -122,7 +166,10 @@ export async function dispatchStudioFlight(
       squad_ids: [home.squadId],
       task_ids: [task.id],
       done_when: ['Studio canvas shows a reviewable preview and the flight can land.'],
-      artifact_refs: repoUrl ? [repoUrl] : [],
+      artifact_refs: [
+        ...(repoUrl ? [repoUrl] : []),
+        ...(cursor ? [cursor.agent_url] : []),
+      ],
       receipt_refs: [],
       confidentiality: 'internal',
       publication_target: 'none',
@@ -132,7 +179,16 @@ export async function dispatchStudioFlight(
 
   return {
     ok: true,
-    result: { ok: true, flight_id: flightId, task_id: task.id, model },
+    result: {
+      ok: true,
+      flight_id: flightId,
+      task_id: task.id,
+      model,
+      agent_id: cursor?.agent_id ?? null,
+      run_id: cursor?.run_id ?? null,
+      agent_url: cursor?.agent_url ?? null,
+      cursor_launched: cursor !== null,
+    },
   }
 }
 
@@ -149,6 +205,10 @@ export function studioPageHtml(data: StudioViewData): HtmlEscapedString | Promis
       })
     : [html`<li class="studio-empty">No flights yet. Dispatch a prompt to open the first one.</li>`]
 
+  const authorityRole: StudioChatRole = data.authorityRole === 'admin' ? 'admin' : 'member'
+  const authorityLabel = authorityRole === 'admin' ? '[ 🛡️ Admin Authority ]' : '[ 👤 Member / Guest ]'
+  const authorityClass = authorityRole === 'admin' ? 'studio-authority-admin' : 'studio-authority-member'
+
   return html`<!doctype html>
 <html lang="en" data-theme="dark">
   <head>
@@ -163,7 +223,7 @@ export function studioPageHtml(data: StudioViewData): HtmlEscapedString | Promis
   </head>
   <body class="studio-body">
     <a class="skip-link" href="#studio-prompt">Skip to prompt</a>
-    <div class="studio" id="mupot-studio" data-tenant="${data.tenant}">
+    <div class="studio" id="mupot-studio" data-tenant="${data.tenant}" data-studio-role="${authorityRole}">
       <header class="studio-top">
         <a class="studio-brand" href="/" aria-label="Back to dashboard">
           <img src="${raw(`data:image/png;base64,${MUPOT_MARK_64_PNG_B64}`)}" alt="" width="28" height="28" />
@@ -173,6 +233,7 @@ export function studioPageHtml(data: StudioViewData): HtmlEscapedString | Promis
           </span>
         </a>
         <p class="studio-operator">Signed in as <b>${data.operator}</b></p>
+        <span id="studio-authority-badge" class="studio-authority ${authorityClass}" data-studio-role="${authorityRole}">${authorityLabel}</span>
         <nav class="studio-top-links" aria-label="Studio shortcuts">
           <a href="/flights">Flights</a>
           <a href="/send">Work</a>
@@ -214,14 +275,25 @@ export function studioPageHtml(data: StudioViewData): HtmlEscapedString | Promis
             <p class="studio-dispatch-status" id="studio-dispatch-status" role="status" aria-live="polite"></p>
           </div>
 
-          <section class="studio-card" aria-labelledby="studio-chat-heading">
-            <h2 id="studio-chat-heading">Agent chat history</h2>
-            <ol class="studio-chat" id="studio-chat">
+          <section class="studio-card studio-copilot is-always-on" id="studio-copilot" data-always-on="true" aria-labelledby="studio-chat-heading">
+            <header class="studio-copilot-head">
+              <h2 id="studio-chat-heading">Agent chat history</h2>
+              <span class="studio-authority ${authorityClass}" data-studio-role="${authorityRole}">${authorityLabel}</span>
+            </header>
+            <ol class="studio-chat" id="studio-chat" aria-live="polite">
               <li class="studio-msg studio-msg-system">
-                <span class="studio-msg-who">Studio</span>
-                <p>Ready. Write a directive, pick Cursor Cloud or Codex, and dispatch. Athena and Kasra hold the land gate.</p>
+                <span class="studio-msg-who">Co-Pilot</span>
+                <p>Always on. Ask me about this pot, or negotiate a flight. Athena and Kasra still hold the land gate.</p>
               </li>
             </ol>
+            <div id="studio-launch-wrap" class="studio-launch-wrap" hidden>
+              <button type="button" class="studio-launch-cloud-build" id="studio-launch-cloud-build">Launch Cloud Build</button>
+            </div>
+            <form id="studio-chat-form" class="studio-chat-composer">
+              <label class="studio-label" for="studio-chat-input">Message the Co-Pilot</label>
+              <textarea id="studio-chat-input" class="studio-chat-input" rows="3" maxlength="4000" placeholder="Ask the Co-Pilot…"></textarea>
+              <button type="submit" class="studio-chat-send" id="studio-chat-send">Send</button>
+            </form>
           </section>
 
           <section class="studio-card" aria-labelledby="studio-flights-heading">
@@ -322,6 +394,13 @@ const STUDIO_CSS = `
   .studio-brand strong { display: block; font-size: 15px; }
   .studio-brand em { display: block; font-style: normal; color: var(--studio-muted); font-size: 12px; }
   .studio-operator { margin: 0; color: var(--studio-muted); font-size: 13px; }
+  .studio-authority {
+    display: inline-flex; align-items: center; gap: 6px;
+    border-radius: 999px; padding: 4px 10px; font: 700 11px var(--font-mono);
+    letter-spacing: .02em; white-space: nowrap;
+  }
+  .studio-authority-admin { color: var(--studio-ok); background: rgba(61,214,140,.12); border: 1px solid rgba(61,214,140,.35); }
+  .studio-authority-member { color: #7dd3fc; background: rgba(56,189,248,.12); border: 1px solid rgba(56,189,248,.35); }
   .studio-top-links { margin-left: auto; display: flex; gap: 14px; }
   .studio-top-links a { color: var(--studio-cyan); text-decoration: none; font-size: 13px; }
   .studio-split { display: flex; min-height: 0; }
@@ -352,12 +431,31 @@ const STUDIO_CSS = `
   .studio-dispatch:hover, .studio-land:hover:not(:disabled) { filter: brightness(1.08); }
   .studio-land:disabled { opacity: .45; cursor: not-allowed; }
   .studio-dispatch-status { margin: 0; color: var(--studio-muted); font-size: 13px; }
+  .studio-copilot-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
+  .studio-copilot-head h2 { margin: 0; }
   .studio-chat, .studio-flights { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+  .studio-chat { max-height: 320px; overflow: auto; }
   .studio-msg, .studio-flight {
     background: var(--studio-raised); border-radius: 10px; padding: 10px 12px;
   }
+  .studio-msg-user { border-left: 3px solid var(--studio-cyan); }
+  .studio-msg-copilot, .studio-msg-agent { border-left: 3px solid var(--studio-gold); }
   .studio-msg-who { font-size: 11px; color: var(--studio-cyan); font-family: var(--font-mono); }
+  .studio-msg-copilot .studio-msg-who { color: var(--studio-gold); }
   .studio-msg p { margin: 4px 0 0; }
+  .studio-chat-composer { display: grid; gap: 8px; margin-top: 12px; }
+  .studio-chat-input {
+    width: 100%; background: var(--studio-raised); color: var(--studio-text);
+    border: 1px solid var(--studio-line); border-radius: 10px; padding: 10px 12px;
+    font: 14px/1.45 var(--font-body); resize: vertical; min-height: 72px;
+  }
+  .studio-chat-send, .studio-launch-cloud-build {
+    justify-self: start; border: 0; border-radius: 999px; padding: 8px 14px; cursor: pointer;
+    font: 600 13px var(--font-body); color: #061014;
+    background: linear-gradient(135deg, var(--studio-cyan), #67e8f9);
+  }
+  .studio-launch-wrap { margin: 10px 0 0; }
+  .studio-launch-cloud-build { background: linear-gradient(135deg, var(--studio-gold), #f5d76e); }
   .studio-flight { display: grid; grid-template-columns: auto 1fr auto; gap: 8px; align-items: center; font-size: 13px; }
   .studio-flight-status {
     font-family: var(--font-mono); font-size: 10px; text-transform: uppercase;
@@ -440,7 +538,13 @@ const STUDIO_SCRIPT = `
   var frame = document.getElementById('studio-canvas-frame');
   var canvas = document.getElementById('studio-canvas');
   var landBtn = document.getElementById('studio-land');
+  var chatInput = document.getElementById('studio-chat-input');
+  var chatForm = document.getElementById('studio-chat-form');
+  var chatSend = document.getElementById('studio-chat-send');
+  var launchWrap = document.getElementById('studio-launch-wrap');
+  var launchBtn = document.getElementById('studio-launch-cloud-build');
   var lastFlightId = null;
+  var chatTurns = [];
 
   function appendChat(who, text, cls) {
     var li = document.createElement('li');
@@ -530,6 +634,113 @@ const STUDIO_SCRIPT = `
     statusEl.textContent = 'Land / Deploy queued for council gate.';
     window.location.href = '/deployment';
   });
+
+  function showLaunchCloudBuild() {
+    if (launchWrap) launchWrap.hidden = false;
+  }
+
+  function applySseEvent(ev, state) {
+    if (!ev || typeof ev !== 'object') return;
+    if (ev.type === 'token' && ev.text) {
+      state.text += ev.text;
+      state.bodyEl.textContent = state.text;
+    }
+    if (ev.type === 'proposal' && ev.action === 'launch_cloud_build') showLaunchCloudBuild();
+    if (typeof ev.text === 'string' && ev.text.indexOf('[[studio:launch-cloud-build]]') !== -1) {
+      showLaunchCloudBuild();
+    }
+  }
+
+  async function streamCopilot(message) {
+    appendChat('You', message, 'studio-msg-user');
+    chatTurns.push({ role: 'user', content: message });
+    var li = document.createElement('li');
+    li.className = 'studio-msg studio-msg-copilot';
+    li.innerHTML = '<span class="studio-msg-who"></span><p></p>';
+    li.querySelector('.studio-msg-who').textContent = 'Co-Pilot';
+    chatEl.appendChild(li);
+    var bodyEl = li.querySelector('p');
+    if (chatSend) chatSend.disabled = true;
+    try {
+      var response = await fetch('/api/studio/chat', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ message: message, messages: chatTurns })
+      });
+      if (!response.body || typeof response.body.getReader !== 'function') {
+        bodyEl.textContent = 'Co-Pilot stream unavailable.';
+        return;
+      }
+      var reader = response.body.getReader();
+      var decoder = new TextDecoder();
+      var buf = '';
+      var state = { text: '', bodyEl: bodyEl };
+      while (true) {
+        var chunk = await reader.read();
+        if (chunk.done) break;
+        buf += decoder.decode(chunk.value, { stream: true });
+        var parts = buf.split('\\n\\n');
+        buf = parts.pop();
+        for (var i = 0; i < parts.length; i++) {
+          var block = parts[i];
+          var dataIdx = block.indexOf('data:');
+          if (dataIdx === -1) {
+            if (block.trim()) {
+              state.text += block;
+              bodyEl.textContent = state.text;
+            }
+            continue;
+          }
+          var payload = block.slice(dataIdx + 5).trim();
+          if (!payload || payload === '[DONE]') continue;
+          try {
+            applySseEvent(JSON.parse(payload), state);
+          } catch (err) {
+            state.text += payload;
+            bodyEl.textContent = state.text;
+          }
+        }
+        chatEl.scrollTop = chatEl.scrollHeight;
+      }
+      if (buf.trim()) {
+        var tailIdx = buf.indexOf('data:');
+        if (tailIdx !== -1) {
+          try { applySseEvent(JSON.parse(buf.slice(tailIdx + 5).trim()), state); } catch (err) { /* ignore trailing partial */ }
+        }
+      }
+      state.text = state.text.replace(/\\[\\[studio:launch-cloud-build\\]\\]/g, '').trim();
+      bodyEl.textContent = state.text;
+      if (/launch cloud build|flight proposal|cursor_dispatch/i.test(state.text)) showLaunchCloudBuild();
+      chatTurns.push({ role: 'assistant', content: state.text });
+    } catch (err) {
+      bodyEl.textContent = 'Co-Pilot is offline. Try again.';
+    } finally {
+      if (chatSend) chatSend.disabled = false;
+    }
+  }
+
+  if (chatForm) {
+    chatForm.addEventListener('submit', function (ev) {
+      ev.preventDefault();
+      var msg = ((chatInput && chatInput.value) || '').trim();
+      if (!msg) return;
+      if (chatInput) chatInput.value = '';
+      streamCopilot(msg);
+    });
+  }
+  if (launchBtn) {
+    launchBtn.addEventListener('click', function () {
+      if (promptEl && !promptEl.value.trim() && chatTurns.length) {
+        var lastUser = null;
+        for (var i = chatTurns.length - 1; i >= 0; i--) {
+          if (chatTurns[i].role === 'user') { lastUser = chatTurns[i].content; break; }
+        }
+        if (lastUser) promptEl.value = lastUser;
+      }
+      dispatchBtn.click();
+    });
+  }
 })();
 `
 
@@ -568,3 +779,92 @@ async function resolveStudioHome(
   if (squad) return { agentId: 'studio', squadId: squad.id }
   return null
 }
+
+function sessionAuth(c: { get: (key: 'auth') => AuthContext | undefined }): AuthContext | null {
+  try {
+    return c.get('auth') ?? null
+  } catch {
+    return null
+  }
+}
+
+async function resolveStudioApiAuth(c: {
+  env: Env
+  req: { header: (name: string) => string | undefined }
+  get: (key: 'auth') => AuthContext | undefined
+}): Promise<{ ok: true; auth: AuthContext } | { ok: false; status: 401 | 403; error: string }> {
+  const existing = sessionAuth(c)
+  if (existing) {
+    if (isOrgAdmin(existing) || holdsCapabilityFloor(existing, 'member') || existing.role === 'admin' || existing.role === 'owner') {
+      return { ok: true, auth: existing }
+    }
+    return { ok: false, status: 403, error: 'forbidden' }
+  }
+
+  const identity = await resolveMemberByToken(c.env, bearerToken(c.req.header('authorization')))
+  if (!identity) return { ok: false, status: 401, error: 'unauthorized' }
+  const capabilities = await resolveCapabilities(c.env, identity.memberId)
+  const auth: AuthContext = {
+    userId: identity.memberId,
+    email: identity.email,
+    role: 'member',
+    tenant: c.env.TENANT_SLUG,
+    memberId: identity.memberId,
+    channel: 'workspace',
+    capabilities,
+    boundAgentId: identity.boundAgentId,
+    tokenId: identity.tokenId,
+  }
+  if (!isOrgAdmin(auth) && !holdsCapabilityFloor(auth, 'member')) {
+    return { ok: false, status: 403, error: 'forbidden' }
+  }
+  return { ok: true, auth }
+}
+
+export const studioApp = new Hono<{ Bindings: Env; Variables: { auth?: AuthContext } }>()
+
+studioApp.post('/chat', async (c) => {
+  let auth = c.get('auth')
+  if (!auth) {
+    try {
+      auth = getAuthContext(c as Context<AppEnv>)
+    } catch {
+      auth = (await peekSessionAuth(c.env, c.req.raw)) ?? undefined
+    }
+  }
+  const parsed = await readStudioChatPayload(c.req.raw)
+  if (!parsed.ok) return c.json({ error: parsed.error }, parsed.status)
+  return streamStudioChat(
+    c.env,
+    auth ?? ({ userId: 'guest', role: 'member', tenant: c.env.TENANT_SLUG || 'mumega' } as AuthContext),
+    parsed.value,
+  )
+})
+
+studioApp.post('/dispatch', async (c) => {
+  const resolved = await resolveStudioApiAuth(c)
+  if (!resolved.ok) return c.json({ ok: false, error: resolved.error }, resolved.status)
+
+  let body: Record<string, unknown>
+  try {
+    body = await c.req.json() as Record<string, unknown>
+  } catch {
+    return c.json({ ok: false, error: 'invalid_json' }, 400)
+  }
+
+  const prompt = typeof body.prompt === 'string'
+    ? body.prompt
+    : typeof body.name === 'string'
+      ? body.name
+      : ''
+  const repoUrl = typeof body.repoUrl === 'string'
+    ? body.repoUrl
+    : typeof body.repo_url === 'string'
+      ? body.repo_url
+      : undefined
+  const model = typeof body.model === 'string' ? body.model : undefined
+
+  const result = await dispatchStudioFlight(c.env, resolved.auth, { prompt, repoUrl, model })
+  if (!result.ok) return c.json({ ok: false, error: result.error }, result.status)
+  return c.json(result.result)
+})

@@ -121,6 +121,7 @@ import { WORKFLOW_CIRCUIT_TOOLS } from './workflow-circuits'
 import { ROUTINE_TOOLS } from './routines'
 import { RUNNER_TOOLS } from './runners'
 import { FLIGHT_SPINE_TOOLS } from './flight-spine'
+import { CURSOR_TOOLS } from './cursor'
 import { dispatchFlight } from '../flight/dispatch'
 import {
   deliverFlightLandedEvent,
@@ -4174,6 +4175,7 @@ export const TOOLS: ToolSpec[] = [
   ...ROUTINE_TOOLS,
   ...RUNNER_TOOLS,
   ...FLIGHT_SPINE_TOOLS,
+  ...CURSOR_TOOLS,
 ]
 
 const TOOL_BY_NAME = new Map<string, ToolSpec>(TOOLS.map((t) => [t.name, t]))

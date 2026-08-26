@@ -44,6 +44,7 @@ export function pageHeader(opts: {
   sub?: string
   badge?: string
   badgeTone?: Tone
+  right?: Html
 }): Html {
   return html`
     ${opts.crumbs ? html`<p class="crumbs">${opts.crumbs}</p>` : ''}
@@ -52,6 +53,7 @@ export function pageHeader(opts: {
       ${opts.badge
         ? html`<span class="ui-pill" style="--pill:${raw(toneVar(opts.badgeTone))}">${opts.badge}</span>`
         : ''}
+      ${opts.right ? html`<div class="ui-pagehead-right">${opts.right}</div>` : ''}
     </div>
     ${opts.sub ? html`<p class="ui-sub">${opts.sub}</p>` : ''}`
 }
