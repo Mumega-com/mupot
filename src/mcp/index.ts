@@ -131,6 +131,12 @@ import { FLIGHT_SPINE_TOOLS } from './flight-spine'
 import { CURSOR_TOOLS } from './cursor'
 import { ATHENA_TOOLS } from './athena'
 import { POT_TOOLS } from './pots'
+import {
+  toolSupabaseConnect,
+  toolSupabaseSchema,
+  toolSupabaseQuery,
+  toolSupabaseMutate,
+} from './supabase-tools'
 import { dispatchFlight } from '../flight/dispatch'
 import {
   deliverFlightLandedEvent,
@@ -4255,6 +4261,10 @@ export const TOOLS: ToolSpec[] = [
   ...CURSOR_TOOLS,
   ...ATHENA_TOOLS,
   ...POT_TOOLS,
+  toolSupabaseConnect,
+  toolSupabaseSchema,
+  toolSupabaseQuery,
+  toolSupabaseMutate,
 ]
 
 const TOOL_BY_NAME = new Map<string, ToolSpec>(TOOLS.map((t) => [t.name, t]))

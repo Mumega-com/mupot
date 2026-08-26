@@ -44,6 +44,7 @@ export type ConnectorType =
   // uses the existing github_app connector + project_provider_bindings.
   | 'linear'
   | 'notion'
+  | 'supabase'
   | 'custom'
 export type ConnectorScopeType = 'squad' | 'agent' | 'pot'
 
@@ -62,6 +63,7 @@ const VALID_TYPES: readonly ConnectorType[] = [
   'crm',
   'linear',
   'notion',
+  'supabase',
   'custom',
 ]
 const VALID_SCOPE_TYPES: readonly ConnectorScopeType[] = ['squad', 'agent', 'pot']

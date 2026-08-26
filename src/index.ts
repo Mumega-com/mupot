@@ -67,6 +67,7 @@ import { routinesApp } from './routines/routes'
 import { attentionApp } from './attention/routes'
 import { platformApp } from './platform/routes'
 import { maybeHandleHostnameDispatch } from './platform/dispatcher'
+import { supabaseWebhookApp } from './connectors/supabase-webhook'
 
 // Durable Object classes — implemented in src/agents/.
 export { AgentDO } from './agents/agent-do'
@@ -113,6 +114,9 @@ app.route('/api/events', eventIngestApp)
 app.route('/api/integrations/github', githubInboundApp)
 // Athena PR gate: inbound GitHub pull_request webhook → review + comment + status + D1 receipt.
 app.route('/api/webhooks/github', athenaWebhookApp)
+// Supabase Database Webhook Ingest: database triggers → BusEvents & autonomous tasks.
+app.route('/webhooks', supabaseWebhookApp)
+app.route('/api/webhooks', supabaseWebhookApp)
 app.route('/api/prospects', prospectsApp)
 app.route('/api/loops', loopsApp)
 // Flock check-in (Flock #45): agents POST presence with their member-token (bearer).
