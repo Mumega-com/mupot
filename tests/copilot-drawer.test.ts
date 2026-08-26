@@ -76,6 +76,8 @@ describe('shell() Co-Pilot chrome', () => {
     expect(markup).toContain('transition: transform 0.25s ease')
     expect(markup).toContain('href="/copilot"')
     expect(markup).toContain('<span class="nav-label">Co-Pilot</span>')
+    expect(markup).toContain('[data-copilot-open]')
+    expect(markup).toContain('window.mupotOpenCopilot')
   })
 
   it('renders the member role badge by default in the drawer', async () => {
