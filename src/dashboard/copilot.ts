@@ -486,7 +486,8 @@ const COPILOT_CSS = `
   }
   .mupot-copilot-chat-host { flex: 1; min-height: 0; padding: 10px; }
   .mupot-copilot-chat-host .mupot-deep-chat,
-  deep-chat.mupot-deep-chat { display: block; width: 100%; height: 100%; min-height: 420px; }
+  deep-chat.mupot-deep-chat { display: block; width: 100%; height: 100%; min-height: 0; }
+  .copilot-page-host deep-chat.mupot-deep-chat { min-height: 420px; }
   .copilot-page-card {
     display: flex; flex-direction: column;
     min-height: calc(100vh - 168px); padding: 0 !important;
@@ -503,6 +504,20 @@ const COPILOT_CSS = `
   [data-theme="dark"] .mupot-copilot-recipient-select,
   [data-theme="dark"] .mupot-copilot-close {
     background: #0e1116; color: #e6edf3; border-color: #2a3140;
+  }
+  @media (max-width: 720px) {
+    .mupot-copilot-fab { right: 14px; bottom: 14px; padding: 10px 12px; }
+    .mupot-copilot-fab-label { display: none; }
+    .mupot-copilot-drawer { width: 100vw; }
+    .mupot-copilot-drawer-head {
+      grid-template-columns: 1fr auto; grid-template-areas: "title close" "persona persona";
+    }
+    .mupot-copilot-drawer-head > div { grid-area: title; }
+    .mupot-copilot-recipient { grid-area: persona; }
+    .mupot-copilot-close { grid-area: close; }
+    .mupot-copilot-recipient-select { max-width: none; width: 100%; }
+    .mupot-copilot-toolbar { flex-direction: column; align-items: stretch; }
+    .copilot-page-host { min-height: 420px; height: calc(100vh - 220px); }
   }
 `
 
@@ -643,6 +658,33 @@ function setDrawerOpen(open) {
   if (fab) fab.setAttribute('aria-expanded', open ? 'true' : 'false');
 }
 
+function visibleModal() {
+  return document.querySelector('.modal:not([hidden])');
+}
+
+function submitPrefill(text) {
+  if (!text) return;
+  document.querySelectorAll('deep-chat.mupot-deep-chat').forEach(function (chat) {
+    if (typeof chat.submitUserMessage === 'function') chat.submitUserMessage({ text: text });
+    else chat.setAttribute('data-pending-prompt', text);
+  });
+}
+
+function openCopilot(prefill) {
+  setDrawerOpen(true);
+  if (prefill) window.setTimeout(function () { submitPrefill(prefill); }, 40);
+}
+
+window.mupotOpenCopilot = function (prefill) {
+  openCopilot(typeof prefill === 'string' ? prefill : '');
+};
+
+document.querySelectorAll('[data-copilot-open]').forEach(function (btn) {
+  btn.addEventListener('click', function () {
+    openCopilot(btn.getAttribute('data-copilot-prefill') || '');
+  });
+});
+
 const onFullPage = location.pathname === '/copilot' || location.pathname === '/chat';
 if (onFullPage) document.body.classList.add('copilot-fullpage');
 
@@ -657,7 +699,10 @@ if (fab) fab.addEventListener('click', function () { setDrawerOpen(true); });
 if (closeBtn) closeBtn.addEventListener('click', function () { setDrawerOpen(false); });
 if (scrim) scrim.addEventListener('click', function () { setDrawerOpen(false); });
 document.addEventListener('keydown', function (e) {
-  if (e.key === 'Escape') setDrawerOpen(false);
+  if (e.key !== 'Escape' || visibleModal()) return;
+  var drawer = document.getElementById('mupot-copilot-drawer');
+  if (!drawer || !drawer.classList.contains('is-open')) return;
+  setDrawerOpen(false);
 });
 
 syncRecipient(currentRecipient());

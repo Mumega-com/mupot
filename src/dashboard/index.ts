@@ -3515,12 +3515,13 @@ export function shell(
       .btn.sm { padding: 5px 11px; font-size: 12px; margin-right: 6px; }
       .modal {
         position: fixed; inset: 0; background: rgba(0,0,0,.5); display: flex;
-        align-items: center; justify-content: center; z-index: 20; padding: 20px;
+        align-items: center; justify-content: center; z-index: 110; padding: 20px;
       }
       .modal[hidden] { display: none; }
       .modal-card {
         background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
         padding: 20px 22px; max-width: 460px; width: 100%;
+        max-height: calc(100vh - 40px); overflow-y: auto;
       }
       .modal-actions { display: flex; gap: 10px; margin-top: 4px; width: 100%; }
       pre.snippet {

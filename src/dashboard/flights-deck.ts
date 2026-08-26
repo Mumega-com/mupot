@@ -404,13 +404,13 @@ const DECK_CSS = `
   .fd-time-label { color: var(--dim); font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; margin-right: 6px; }
   .fd-empty { padding: 28px 18px; }
   .fd-dispatch-backdrop {
-    position: fixed; inset: 0; background: rgba(15, 23, 20, .35); z-index: 40;
+    position: fixed; inset: 0; background: rgba(15, 23, 20, .35); z-index: 88;
     opacity: 0; pointer-events: none; transition: opacity .2s ease;
   }
   .fd-dispatch-backdrop.is-open { opacity: 1; pointer-events: auto; }
   .fd-dispatch {
     position: fixed; top: 0; right: 0; bottom: 0; width: min(420px, 100vw);
-    background: var(--surface); border-left: 1px solid var(--border); z-index: 41;
+    background: var(--surface); border-left: 1px solid var(--border); z-index: 89;
     transform: translateX(100%); transition: transform .25s ease; display: flex; flex-direction: column;
     padding: 20px 22px;
   }
@@ -424,9 +424,6 @@ const DECK_CSS = `
   }
   .fd-dispatch-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
   .fd-dispatch-status { min-height: 18px; font-size: 12.5px; color: var(--muted); margin-top: 10px; }
-  @media (max-width: 900px) {
-    .fd-cell-pipe, .fd-table th:nth-child(3) { display: none; }
-  }
   @media (max-width: 680px) {
     .fd-cell-time, .fd-table th:nth-child(6) { display: none; }
     .fd-toolbar { flex-direction: column; align-items: stretch; }
@@ -499,6 +496,11 @@ const DECK_SCRIPT = `
   if (closeBtn) closeBtn.addEventListener('click', function () { setDispatchOpen(false); });
   if (cancelBtn) cancelBtn.addEventListener('click', function () { setDispatchOpen(false); });
   if (backdrop) backdrop.addEventListener('click', function () { setDispatchOpen(false); });
+  document.addEventListener('keydown', function (event) {
+    if (event.key !== 'Escape') return;
+    if (document.querySelector('.modal:not([hidden])')) return;
+    if (panel && panel.classList.contains('is-open')) setDispatchOpen(false);
+  });
   if (select && custom) {
     select.addEventListener('change', function () {
       var other = select.value === '__custom';

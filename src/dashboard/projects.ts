@@ -1310,6 +1310,9 @@ function newProjectWorkerModal(): Html {
         modal.addEventListener('click', function (event) {
           if (event.target === modal) closeModal();
         });
+        document.addEventListener('keydown', function (event) {
+          if (event.key === 'Escape' && !modal.hasAttribute('hidden')) closeModal();
+        });
         nameInput.addEventListener('input', function () {
           if (!slugTouched) slugInput.value = slugFromName(nameInput.value);
           if (!workerTouched) workerInput.value = slugInput.value;
