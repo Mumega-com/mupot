@@ -313,6 +313,7 @@ export const COPILOT_CSS = `
       .copilot-drawer {
         position: fixed; top: 0; right: 0; bottom: 0;
         width: ${COPILOT_DRAWER_WIDTH_PX}px; max-width: 100vw;
+        height: 100vh; max-height: 100vh; overflow: hidden;
         z-index: 9999;
         display: flex; flex-direction: column;
         background: var(--surface);
@@ -348,7 +349,7 @@ export const COPILOT_CSS = `
       }
       .copilot-close:hover { background: var(--hover); }
       .copilot-panel {
-        flex: 1; min-height: 0; display: flex; flex-direction: column;
+        flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden;
       }
       .copilot-messages {
         flex: 1; min-height: 0; overflow-y: auto;
@@ -387,7 +388,7 @@ export const COPILOT_CSS = `
       .copilot-composer {
         display: flex; gap: 8px; align-items: flex-end;
         padding: 12px 14px 16px; border-top: 1px solid var(--border);
-        background: var(--surface);
+        background: var(--surface); flex: none;
       }
       .copilot-input {
         flex: 1; min-height: 44px; max-height: 140px; resize: vertical;
@@ -408,10 +409,10 @@ export const COPILOT_CSS = `
         position: absolute; width: 1px; height: 1px; overflow: hidden;
         clip: rect(0,0,0,0);
       }
-      .copilot-page { display: flex; flex-direction: column; gap: 16px; }
+      .copilot-page { display: flex; flex-direction: column; gap: 16px; height: calc(100vh - 120px); }
       .copilot-page-card {
         display: flex; flex-direction: column;
-        min-height: calc(100vh - 220px);
+        flex: 1; min-height: 0;
         background: var(--surface);
         border: 1px solid var(--border);
         border-radius: 16px;
@@ -528,19 +529,28 @@ export const COPILOT_SCRIPT = `
       var chunk = await reader.read();
       if (chunk.done) break;
       buf += dec.decode(chunk.value, { stream: true });
-      var parts = buf.split('\\n\\n');
+      var parts = buf.split('\n\n');
       buf = parts.pop() || '';
       for (var i = 0; i < parts.length; i++) {
-        var line = parts[i].replace(/^data:\\s*/, '').trim();
-        if (!line) continue;
-        var ev = {};
-        try { ev = JSON.parse(line); } catch (e) { continue; }
-        if (ev.token) {
-          acc += ev.token;
-          p.textContent = acc;
-          list.scrollTop = list.scrollHeight;
+        var rawLine = parts[i].trim();
+        if (!rawLine) continue;
+        var lines = rawLine.split('\n');
+        for (var j = 0; j < lines.length; j++) {
+          var line = lines[j].replace(/^data:\s*/, '').trim();
+          if (!line) continue;
+          var ev = {};
+          try { ev = JSON.parse(line); } catch (e) { continue; }
+          if (ev.type === 'meta' && ev.role) {
+            applyRole(ev.role);
+          }
+          var tok = ev.text || ev.token || (ev.type === 'token' ? ev.text : '');
+          if (tok) {
+            acc += tok;
+            p.textContent = acc;
+            list.scrollTop = list.scrollHeight;
+          }
+          if (ev.error && !acc) p.textContent = 'Chat failed: ' + ev.error;
         }
-        if (ev.error && !acc) p.textContent = 'Chat failed: ' + ev.error;
       }
     }
     if (!acc && !p.textContent) p.textContent = 'No reply.';
