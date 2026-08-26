@@ -51,32 +51,36 @@ export interface CopilotRecipient {
   readonly title: string
   readonly letter: string
   readonly color: string
+  readonly badge: string
 }
 
 export const COPILOT_RECIPIENTS: readonly CopilotRecipient[] = [
-  { id: 'copilot', handle: '@copilot', name: 'Copilot', title: 'Operator assistant', letter: 'C', color: '#22d3ee' },
-  { id: 'loom', handle: '@loom', name: 'Loom', title: 'Narrative weaver', letter: 'L', color: '#d4a017' },
-  { id: 'kasra', handle: '@kasra', name: 'Kasra', title: 'Merge gate', letter: 'K', color: '#eab308' },
-  { id: 'athena', handle: '@athena', name: 'Athena', title: 'Adversarial review', letter: 'A', color: '#e879f9' },
+  { id: 'copilot', handle: '@copilot', name: 'Copilot', title: 'General Pot Assistant', letter: 'C', color: '#22d3ee', badge: '✨ Co-Pilot' },
+  { id: 'loom', handle: '@loom', name: 'Loom', title: 'Sprint Coordinator', letter: 'L', color: '#d4a017', badge: '🧶 Loom' },
+  { id: 'kasra', handle: '@kasra', name: 'Kasra', title: 'Server Builder & Runtime Operator', letter: 'K', color: '#eab308', badge: '🔨 Kasra' },
+  { id: 'athena', handle: '@athena', name: 'Athena', title: 'Gatekeeper & Safety Reviewer', letter: 'A', color: '#e879f9', badge: '🛡️ Athena' },
   {
     id: 'cursor-architect',
     handle: '@cursor-architect',
     name: 'Cursor Architect',
-    title: 'System design',
+    title: 'Cloud Lead Architect',
     letter: 'A',
     color: '#38bdf8',
+    badge: '☁️ Cursor Architect',
   },
   {
     id: 'cursor-builder',
     handle: '@cursor-builder',
     name: 'Cursor Builder',
-    title: 'Implementation',
+    title: 'Cloud Implementer',
     letter: 'B',
     color: '#34d399',
+    badge: '🛠️ Cursor Builder',
   },
 ]
 
 export const DEFAULT_COPILOT_RECIPIENT: CopilotRecipientId = 'copilot'
+export const COPILOT_RECIPIENT_STORAGE_KEY = 'mupot-copilot-recipient'
 
 export interface DeepChatMessage {
   role?: string
@@ -89,15 +93,16 @@ export interface StudioChatRequest {
   recipient: CopilotRecipientId
   messages: DeepChatMessage[]
   fileCount: number
+  history?: Array<{ role?: string; content?: string; text?: string }>
 }
 
 const PERSONA_PROMPTS: Record<CopilotRecipientId, string> = {
-  copilot: 'You are Mupot Co-Pilot, the primary intelligence within this sovereign pot. Assist operators with projects, flights, and system orchestration.',
-  loom: 'You are Loom (@loom — Sprint Coordinator). You hold sprint truth, sequencing, briefs, receipts, and bounded delegation across all squads.',
-  kasra: 'You are Kasra (@kasra — Server Builder & Runtime Operator). You maintain and operate the server infrastructure, runtimes, and deployment pipelines.',
-  athena: 'You are Athena (@athena — Gatekeeper & Safety Reviewer). You enforce gate verification, coherence, safety reviews, and challenge unproven green lights.',
-  'cursor-architect': 'You are Cursor Architect (@cursor-architect — Cloud Lead Architect). You design multi-repo cloud builds, system interfaces, and execution boundaries.',
-  'cursor-builder': 'You are Cursor Builder (@cursor-builder — Cloud Implementer). You execute code sandboxes, test-driven implementations, and pull requests.',
+  copilot: 'You are Mupot Co-Pilot, the operator assistant and primary intelligence within this sovereign pot. Assist operators with projects, flights, and system orchestration.',
+  loom: 'You are Loom (@loom — Sprint Coordinator). You hold council authority, sprint awareness, sequencing, briefs, receipts, and bounded delegation across all squads.',
+  kasra: 'You are Kasra (@kasra — Server Builder & Runtime Operator). You are the system builder and runtime operator who maintains server infrastructure, runtimes, and deployment pipelines.',
+  athena: 'You are Athena (@athena — Gatekeeper & Safety Reviewer). You are the adversarial gatekeeper who enforces gate verification, coherence, safety reviews, and challenge unproven green lights.',
+  'cursor-architect': 'You are Cursor Architect (@cursor-architect — Cloud Lead Architect). You design architecture, system design, repo planning, multi-repo cloud builds, and execution boundaries.',
+  'cursor-builder': 'You are Cursor Builder (@cursor-builder — Cloud Implementer). You execute code implementation, tests, and PR delivery through sandboxes and pull requests.',
 }
 
 export function getCopilotRecipient(id: CopilotRecipientId): CopilotRecipient {
@@ -114,10 +119,108 @@ export function buildCopilotPersonaPrompt(recipient: CopilotRecipientId | string
 }
 
 export function normalizeCopilotRecipient(raw: unknown): CopilotRecipientId {
-  const value = typeof raw === 'string' ? raw.trim().toLowerCase().replace(/^@/, '') : ''
+  const value = typeof raw === 'string'
+    ? raw.trim().toLowerCase().replace(/^@/, '').replace(/_/g, '-')
+    : ''
   return COPILOT_RECIPIENTS.some((agent) => agent.id === value)
     ? (value as CopilotRecipientId)
     : DEFAULT_COPILOT_RECIPIENT
+}
+
+export function copilotRoleBadge(role: string | null | undefined): string {
+  return role === 'member' || role === 'guest' ? '[ 👤 Member ]' : '[ 🛡️ Admin ]'
+}
+
+export function copilotRecipientBadge(id: CopilotRecipientId | string | undefined | null): string {
+  return copilotRecipientDef(id).badge
+}
+
+export function parseCopilotChatBody(
+  input: unknown,
+  headerRecipient?: string | null,
+): { ok: true; value: StudioChatRequest } | { ok: false; error: string; status?: 400 } {
+  if (input !== null && typeof input === 'object' && !Array.isArray(input)) {
+    const body = input as Record<string, unknown>
+    if (Array.isArray(body.history) && !Array.isArray(body.messages)) {
+      body.messages = body.history.map((turn) => {
+        const row = turn && typeof turn === 'object' ? turn as Record<string, unknown> : {}
+        return {
+          role: typeof row.role === 'string' ? row.role : 'user',
+          text: typeof row.content === 'string' ? row.content : typeof row.text === 'string' ? row.text : '',
+        }
+      })
+    }
+  }
+  const parsed = parseStudioChatPayload(input, headerRecipient)
+  if (!parsed.ok) return { ok: false, status: 400, error: parsed.error }
+  const history = input !== null && typeof input === 'object' && !Array.isArray(input)
+    && Array.isArray((input as Record<string, unknown>).history)
+    ? (input as { history: Array<{ role?: string; content?: string; text?: string }> }).history
+    : undefined
+  return { ok: true, value: { ...parsed.value, history } }
+}
+
+export function tokenizeAssistantText(text: string): string[] {
+  const tokens = text.match(/\S+\s*/g)
+  return tokens && tokens.length > 0 ? tokens : text ? [text] : ['']
+}
+
+export function fallbackCopilotReply(message: string, recipient: CopilotRecipientId = 'copilot'): string {
+  return composeCopilotReply(
+    { userId: 'system', email: null, role: 'member', tenant: 'pot' },
+    { message, recipient, messages: [{ role: 'user', text: message }], fileCount: 0 },
+  )
+}
+
+export function copilotSseResponse(
+  env: Env,
+  body: { message: string; recipient?: string; history?: Array<{ role?: string; content?: string; text?: string }> },
+  generate?: (messages: ModelMessage[]) => Promise<string>,
+  role: CopilotAuthority = 'member',
+): Response {
+  const recipient = normalizeCopilotRecipient(body.recipient)
+  const historyTurns = Array.isArray(body.history) ? body.history : []
+  const messages: ModelMessage[] = [
+    { role: 'system', content: buildCopilotPersonaPrompt(recipient) },
+    ...historyTurns
+      .filter((turn) => (turn.role === 'user' || turn.role === 'assistant') && typeof (turn.content ?? turn.text) === 'string')
+      .map((turn) => ({
+        role: turn.role as 'user' | 'assistant',
+        content: String(turn.content ?? turn.text),
+      })),
+    { role: 'user', content: body.message },
+  ]
+  void env
+
+  const encoder = new TextEncoder()
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const enqueue = (payload: unknown) => {
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}\n\n`))
+      }
+      enqueue({ type: 'meta', agent: recipient, role })
+      let source: 'model' | 'fallback' = 'model'
+      let text = ''
+      try {
+        text = generate ? (await generate(messages)) : fallbackCopilotReply(body.message, recipient)
+        if (!String(text).trim()) {
+          source = 'fallback'
+          text = fallbackCopilotReply(body.message, recipient)
+        }
+      } catch {
+        source = 'fallback'
+        text = fallbackCopilotReply(body.message, recipient)
+      }
+      for (const token of tokenizeAssistantText(String(text))) {
+        enqueue({ type: 'token', text: token })
+      }
+      enqueue({ type: 'done', source, done: true })
+      controller.close()
+    },
+  })
+  return new Response(stream, {
+    headers: { 'Content-Type': 'text/event-stream' },
+  })
 }
 
 export function resolveCopilotAuthority(auth: AuthContext): CopilotAuthority {
@@ -189,14 +292,15 @@ export function composeCopilotReply(
     authority === 'admin'
       ? 'Admin authority is live — I can brief, draft, and name gated tools you actually hold.'
       : 'Member-tier authority is live — I can brief and draft, but admin-gated tools stay closed.'
+  const voice = agent.id === 'copilot' ? 'Co-Pilot' : agent.name
   const generated = (modelText ?? '').trim()
   if (generated) {
-    return `${agent.handle} · ${roleLine}\n\n${generated}${vision}`
+    return `${agent.handle} · ${roleLine}\n\n${voice} (${agent.title})\n\n${generated}${vision}`
   }
   return [
     `${agent.handle} · ${roleLine}`,
     '',
-    `${agent.name} (${agent.title}) here.${vision}`,
+    `${voice} (${agent.title}) here.${vision}`,
     scoped,
     '',
     `You said: ${request.message}`,
@@ -221,10 +325,15 @@ export async function streamStudioChat(
   const encoder = new TextEncoder()
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
+      const enqueue = (payload: Record<string, unknown>) => {
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}\n\n`))
+      }
       try {
+        enqueue({ type: 'meta', agent: request.recipient, role: authority, text: '' })
         for (const chunk of chunkCopilotReply(reply)) {
-          controller.enqueue(encoder.encode(formatDeepChatSseChunk(chunk)))
+          enqueue({ text: chunk, type: 'token' })
         }
+        enqueue({ type: 'done', source: modelText ? 'model' : 'fallback', done: true, text: '' })
       } finally {
         controller.close()
       }
@@ -269,13 +378,15 @@ export function copilotDeepChatMarkup(opts?: {
 export function copilotRecipientSelectHtml(selectId: string): Html {
   const options = COPILOT_RECIPIENTS.map(
     (agent) =>
-      html`<option value="${agent.id}" data-color="${agent.color}" data-letter="${agent.letter}">${agent.handle} — ${agent.name}</option>`,
+      html`<option value="${agent.id}" data-color="${agent.color}" data-letter="${agent.letter}">${agent.handle} — ${agent.title}</option>`,
   )
   return html`<label class="mupot-copilot-recipient">
     <span class="mupot-copilot-avatar" data-copilot-avatar aria-hidden="true">C</span>
     <select
       id="${selectId}"
-      class="mupot-copilot-recipient-select"
+      class="mupot-copilot-recipient-select copilot-recipient"
+      data-copilot-recipient
+      data-copilot-storage-key="${COPILOT_RECIPIENT_STORAGE_KEY}"
       aria-label="Chat recipient"
     >${options}</select>
   </label>`
@@ -284,11 +395,13 @@ export function copilotRecipientSelectHtml(selectId: string): Html {
 export function copilotDrawerHtml(): Html {
   return html`<button
       type="button"
-      id="mupot-copilot-fab"
+      id="mupot-copilot-launcher"
       class="mupot-copilot-fab"
+      data-copilot-open
       aria-controls="mupot-copilot-drawer"
       aria-expanded="false"
-      title="Open Co-Pilot"
+      aria-label="Co-Pilot"
+      title="Co-Pilot"
     >
       <span aria-hidden="true">✦</span>
       <span class="mupot-copilot-fab-label">Co-Pilot</span>
@@ -299,30 +412,38 @@ export function copilotDrawerHtml(): Html {
       class="mupot-copilot-drawer"
       hidden
       aria-hidden="true"
-      aria-label="Mupot Co-Pilot"
+      aria-label="Co-Pilot"
     >
       <header class="mupot-copilot-drawer-head">
         <div>
-          <p class="mupot-copilot-kicker">Mupot</p>
+          <p class="mupot-copilot-kicker">Mupot Co-Pilot</p>
           <h2>Co-Pilot</h2>
+          <p class="mupot-copilot-role">${copilotRoleBadge('member')}</p>
         </div>
-        ${copilotRecipientSelectHtml('mupot-copilot-drawer-recipient')}
+        ${copilotRecipientSelectHtml('mupot-copilot-recipient')}
         <button type="button" id="mupot-copilot-close" class="mupot-copilot-close" aria-label="Close Co-Pilot">✕</button>
       </header>
       <div class="mupot-copilot-chat-host">${copilotDeepChatMarkup()}</div>
     </aside>`
 }
 
-export function copilotPageBody(): Html {
+export function copilotPageBody(auth?: AuthContext): Html {
+  const badge = copilotRoleBadge(auth?.role ?? 'admin')
   return html`${pageHeader({
       crumbs: 'Work / Co-Pilot',
-      title: 'Co-Pilot',
+      title: 'Mupot Co-Pilot',
       sub: 'Talk to @copilot, @loom, @kasra, @athena, @cursor-architect, or @cursor-builder. Vision, voice, and streaming are live.',
     })}
-    <section class="copilot-page-card ui-panel" aria-label="Co-Pilot chat">
+    <section id="mupot-copilot-page" class="copilot-page-card ui-panel" aria-label="Mupot Co-Pilot">
       <div class="mupot-copilot-toolbar">
         ${copilotRecipientSelectHtml('mupot-copilot-page-recipient')}
+        <p class="mupot-copilot-role">${badge}</p>
         <p class="mupot-copilot-toolbar-hint">Drag images, paste a screenshot, or use the microphone.</p>
+        <label class="mupot-copilot-legacy-input">
+          <span class="sr-only">Message</span>
+          <textarea id="mupot-copilot-page-input" name="message" rows="2"></textarea>
+        </label>
+        <button type="button" id="mupot-copilot-page-send" class="sr-only" data-copilot-send>Send</button>
       </div>
       <div class="mupot-copilot-chat-host copilot-page-host">${copilotDeepChatMarkup()}</div>
     </section>`
@@ -429,7 +550,7 @@ async function maybeModelReply(
 
 const COPILOT_CSS = `
   .mupot-copilot-fab {
-    position: fixed; right: 22px; bottom: 22px; z-index: 86;
+    position: fixed; right: 22px; bottom: 22px; z-index: 9999;
     display: flex; align-items: center; gap: 8px;
     border: 0; border-radius: 999px; padding: 10px 14px 10px 12px;
     background: linear-gradient(135deg, #22d3ee, #d4a017);
@@ -445,12 +566,12 @@ const COPILOT_CSS = `
   }
   .mupot-copilot-drawer {
     position: fixed; top: 0; right: 0; z-index: 91;
-    width: 440px; max-width: 100vw; height: 100vh;
+    width: 440px; max-width: 100vw; height: 100vh; /* fallback width: 420px */
     display: flex; flex-direction: column;
     background: var(--surface, #fff); color: var(--text, #171b19);
     border-left: 1px solid var(--border, #e7e9e7);
     box-shadow: -18px 0 50px rgba(10,10,12,.22);
-    transform: translateX(100%); transition: transform .22s cubic-bezier(.2,.8,.2,1);
+    transform: translateX(100%); transition: transform 0.25s ease;
   }
   .mupot-copilot-drawer.is-open { transform: translateX(0); }
   .mupot-copilot-drawer-head {
@@ -496,6 +617,11 @@ const COPILOT_CSS = `
     padding: 14px 16px; border-bottom: 1px solid var(--border, #e7e9e7);
   }
   .mupot-copilot-toolbar-hint { margin: 0; color: var(--dim, #7a827d); font-size: 12px; }
+  .mupot-copilot-role { margin: 0; font-size: 12px; color: var(--text2, #454c48); }
+  .mupot-copilot-legacy-input, .sr-only {
+    position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+    overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0;
+  }
   .copilot-page-host { min-height: 560px; height: calc(100vh - 260px); }
   [data-theme="dark"] .mupot-copilot-drawer {
     background: #161b22; color: #e6edf3; border-left-color: #2a3140;
@@ -514,7 +640,7 @@ const IMAGES = ${JSON.stringify(DEEP_CHAT_IMAGES)};
 const SPEECH = ${JSON.stringify(DEEP_CHAT_SPEECH)};
 const STYLE = ${JSON.stringify(DEEP_CHAT_STYLE)};
 const AGENTS = ${JSON.stringify(COPILOT_RECIPIENTS)};
-const STORE_KEY = 'mupot-copilot-recipient';
+const STORE_KEY = '${COPILOT_RECIPIENT_STORAGE_KEY}';
 
 function agentById(id) {
   return AGENTS.find(function (a) { return a.id === id; }) || AGENTS[0];
@@ -607,6 +733,7 @@ function applyDeepChatTheme(chat, recipient) {
 function syncRecipient(id) {
   var agent = agentById(id);
   try { sessionStorage.setItem(STORE_KEY, agent.id); } catch (e) {}
+  try { localStorage.setItem(STORE_KEY, agent.id); } catch (e) {}
   document.querySelectorAll('.mupot-copilot-recipient-select').forEach(function (sel) {
     sel.value = agent.id;
     var av = sel.parentElement && sel.parentElement.querySelector('[data-copilot-avatar]');
@@ -628,10 +755,12 @@ function currentRecipient() {
   }
 }
 
+window.mupotOpenCopilot = function () { setDrawerOpen(true); };
+
 function setDrawerOpen(open) {
   var drawer = document.getElementById('mupot-copilot-drawer');
   var scrim = document.getElementById('mupot-copilot-scrim');
-  var fab = document.getElementById('mupot-copilot-fab');
+  var fab = document.getElementById('mupot-copilot-launcher') || document.getElementById('mupot-copilot-fab');
   if (!drawer) return;
   drawer.hidden = false;
   drawer.classList.toggle('is-open', open);
@@ -650,7 +779,7 @@ document.querySelectorAll('.mupot-copilot-recipient-select').forEach(function (s
   sel.addEventListener('change', function () { syncRecipient(sel.value); });
 });
 
-var fab = document.getElementById('mupot-copilot-fab');
+var fab = document.getElementById('mupot-copilot-launcher') || document.getElementById('mupot-copilot-fab');
 var closeBtn = document.getElementById('mupot-copilot-close');
 var scrim = document.getElementById('mupot-copilot-scrim');
 if (fab) fab.addEventListener('click', function () { setDrawerOpen(true); });
@@ -664,3 +793,5 @@ syncRecipient(currentRecipient());
 new MutationObserver(function () { syncRecipient(currentRecipient()); })
   .observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
 `
+
+export const COPILOT_SCRIPT = COPILOT_BOOTSTRAP

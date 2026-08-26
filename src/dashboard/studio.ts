@@ -25,6 +25,7 @@ import { createTask } from '../tasks/service'
 import { peekSessionAuth } from '../auth'
 import { readStudioChatPayload, streamStudioChat } from './copilot'
 import { handleStudioChat, type StudioChatRole } from './studio-chat'
+import { MUPOT_FAVICON_32_PNG_B64 } from './brand-assets'
 
 export {
   STUDIO_CHAT_ADMIN_TOOLS,
