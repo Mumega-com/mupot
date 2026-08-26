@@ -57,7 +57,7 @@ describe('1-Click Supabase Data Connector & Engine (Flight 6)', () => {
 
     const config: SupabaseConfig = {
       url: 'https://gaf-roofing.supabase.co',
-      apiKey: 'sb-test-service-key-1234',
+      apiKey: 'example-supabase-key-placeholder',
     }
 
     const result = await introspectSupabaseSchema(config, mockFetch)
@@ -103,7 +103,7 @@ describe('1-Click Supabase Data Connector & Engine (Flight 6)', () => {
 
     const config: SupabaseConfig = {
       url: 'https://gaf-roofing.supabase.co',
-      apiKey: 'sb-test-service-key-1234',
+      apiKey: 'example-supabase-key-placeholder',
     }
 
     const queryResult = await executeSupabaseQuery(
@@ -140,7 +140,7 @@ describe('1-Click Supabase Data Connector & Engine (Flight 6)', () => {
 
     const config: SupabaseConfig = {
       url: 'https://gaf-roofing.supabase.co',
-      apiKey: 'sb-test-service-key-1234',
+      apiKey: 'example-supabase-key-placeholder',
     }
 
     const insertResult = await executeSupabaseMutation(
