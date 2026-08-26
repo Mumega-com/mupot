@@ -19,10 +19,12 @@ import type { Context } from 'hono'
 import { resolveCapabilities, holdsCapabilityFloor, isOrgAdmin } from '../auth/capability'
 import { bearerToken, resolveMemberByToken } from '../auth/member-bearer'
 import { createCursorAgent, resolveCursorApiToken } from '../cursor/client'
+import { injectSevenAxisSeatDeclaration } from '../cursor/seat-identity'
 import type { AuthContext, Env } from '../types'
 import { createFlight, listFlights, type FlightRow } from '../flight/service'
 import { createTask } from '../tasks/service'
 import { peekSessionAuth } from '../auth'
+import { MUPOT_FAVICON_32_PNG_B64, MUPOT_MARK_64_PNG_B64 } from './brand-assets'
 import { readStudioChatPayload, streamStudioChat } from './copilot'
 import { handleStudioChat, type StudioChatRole } from './studio-chat'
 
@@ -113,11 +115,13 @@ export async function dispatchStudioFlight(
   if (!home) return { ok: false, status: 409, error: 'no_squad' }
 
   const title = prompt.length > 80 ? `${prompt.slice(0, 77)}…` : prompt
+  const reservedFlightId = crypto.randomUUID()
+  const launchedPrompt = model === 'cursor-cloud' ? injectSevenAxisSeatDeclaration(prompt, reservedFlightId) : prompt
   let cursor: { agent_id: string; run_id: string; agent_url: string } | null = null
   const token = model === 'cursor-cloud' ? resolveCursorApiToken(env) : null
   if (token && repoUrl) {
     try {
-      const launched = await createCursorAgent(token, { name: title, repoUrl, prompt })
+      const launched = await createCursorAgent(token, { name: title, repoUrl, prompt: launchedPrompt })
       cursor = {
         agent_id: launched.agent.id,
         run_id: launched.run.id,
@@ -129,7 +133,7 @@ export async function dispatchStudioFlight(
   }
 
   const body = [
-    prompt,
+    launchedPrompt,
     '',
     `model: ${model}`,
     repoUrl ? `repo: ${repoUrl}` : null,
@@ -175,7 +179,7 @@ export async function dispatchStudioFlight(
       publication_target: 'none',
       parent_flight_id: null,
     },
-  })
+  }, { id: reservedFlightId })
 
   return {
     ok: true,

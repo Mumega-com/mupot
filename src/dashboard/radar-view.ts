@@ -55,6 +55,8 @@ import { html, raw } from 'hono/html'
 import type { Html } from './ui'
 import type { AgentCard, FleetRadar, StaleSignal } from './radar'
 import type { AgentRuntimeState } from './observatory'
+import type { PresenceView } from '../fleet/presence'
+import { renderSevenAxisSeatRoster } from './mission-control-views'
 
 // ── small pure helpers (self-contained — no cross-module CSS-class deps, so
 //    renderAgentCard/renderBrainImage stay usable/testable standalone) ─────────
@@ -353,7 +355,7 @@ export function renderBrainImage(radar: FleetRadar, nowMs: number = radar.genera
 // html-template dependency); radarPageBody wraps their output with `raw()`
 // since both already escape every dynamic field they interpolate.
 
-export function radarPageBody(radar: FleetRadar): Html {
+export function radarPageBody(radar: FleetRadar, presence: PresenceView[] = []): Html {
   const squadNameByAgent = new Map<string, string>()
   for (const s of radar.squads) {
     for (const id of s.member_agent_ids) squadNameByAgent.set(id, s.name)
@@ -370,6 +372,9 @@ export function radarPageBody(radar: FleetRadar): Html {
       .radar-grid {
         display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px;
       }
+      .seven-axis-roster { margin: 18px 0 22px; }
+      .seven-axis-title { font-size: 16px; margin: 0 0 4px; }
+      .axis-badge { display:inline-block; font-size:11px; padding:2px 8px; border-radius:999px; border:1px solid var(--border); }
     </style>
 
     <p class="crumbs"><a href="/">Overview</a> / Radar</p>
@@ -381,6 +386,7 @@ export function radarPageBody(radar: FleetRadar): Html {
     </p>
     <div style="font-size:11px;color:var(--dim);margin-bottom:14px">generated ${generatedLabel}</div>
 
+    ${raw(renderSevenAxisSeatRoster(presence))}
     ${raw(renderBrainImage(radar, nowMs))}
 
     <h2 style="margin-top:24px">Agents</h2>

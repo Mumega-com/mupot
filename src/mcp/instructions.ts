@@ -42,4 +42,18 @@ export const MUPOT_MCP_INITIALIZE_INSTRUCTIONS = `=== MUPOT AGENT ONBOARDING & R
 7. SYNTHETIC COUNCIL BUS & ACK PROTOCOL
    - Messages received over the internal fleet message bus (via 'send' / 'inbox' tools) containing '[request_id:<uuid>]' require an acknowledgment reply formatted as '{ack_for: <uuid>, ok: true} [your response]'.
    - (Note: this applies to fleet bus messages, not MCP JSON-RPC tool result envelopes).
-   - Critical handoffs require ACK within 30s; routine within 60s.`
+   - Critical handoffs require ACK within 30s; routine within 60s.
+
+8. 7-AXIS SEAT DECLARATION (TURN 1)
+   - On your first turn after boot_context/orient, invoke 'check_in' with your full 7-axis identity so the pot can distinguish this seat from sibling harnesses on the same member token.
+   - Required axes:
+       check_in({
+         seat: "<seat-id>",                 // e.g. "cursor-mac", "grok-desktop", "cursor-cloud-builder", "loom-hetzner"
+         harness: "<harness>",              // "cursor-ide" | "cursor-cloud" | "antigravity-cli" | "claude-code" | "prime" | "hermes" | "grok-cli" | "unknown"
+         machine: "<machine>",              // e.g. "hadi-mac", "hetzner-ash-1", "cursor-cloud-vm"
+         model: "<model>",                  // e.g. "claude-3-7-sonnet", "gemini-3.7-flash", "grok-4.6", "deepseek-v4-pro"
+         provider: "<provider>",            // e.g. "anthropic", "google", "xai", "deepseek-ai", "cloudflare-ai"
+         effort: "<effort>",                // "low" | "medium" | "high" | "extended-thinking-64k"
+         flight_id: "<uuid>"                // optional — active leased flight UUID
+       })
+   - Distinct seats on the same member persist independently. Do not reuse another harness's seat id.`

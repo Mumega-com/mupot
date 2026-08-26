@@ -51,4 +51,13 @@ describe('MUPOT_MCP_INITIALIZE_INSTRUCTIONS', () => {
     expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toContain('{ack_for: <uuid>, ok: true}')
     expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toContain('30s')
   })
+
+  it('instructs connecting clients to declare 7-axis identity on turn 1 via check_in', () => {
+    expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toContain('7-AXIS SEAT DECLARATION')
+    expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toContain('check_in')
+    expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toContain('harness')
+    expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toContain('cursor-cloud')
+    expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toContain('extended-thinking-64k')
+    expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toContain('flight_id')
+  })
 })
