@@ -653,6 +653,7 @@ describe('MCP project lifecycle control', () => {
       'project_list',
       'project_get',
       'project_update',
+      'project_deploy',
       'project_squad_list',
       'project_squad_set',
       'project_squad_remove',

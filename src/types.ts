@@ -422,6 +422,7 @@ export interface Task {
 
 export type ProjectStatus = 'planned' | 'active' | 'paused' | 'review' | 'completed' | 'archived'
 export type ProjectAccessLevel = 'read' | 'write' | 'admin'
+export type ProjectDeployStatus = 'idle' | 'queued' | 'deploying' | 'healthy' | 'failed'
 
 export interface Project {
   id: string
@@ -443,8 +444,31 @@ export interface Project {
    * Used for different-principal self-verdict blocking (slice 2).
    */
   completion_proposed_by: string | null
+  /** GitHub repository URL bound to this project's worker (migration 0129). */
+  repo_url: string | null
+  /** Cloudflare Worker script name for this project's live worker (migration 0129). */
+  worker_name: string | null
+  /** Public live URL for the project's worker (migration 0129). */
+  live_url: string | null
+  /** Squad that owns Cursor Cloud / deploy dispatch for this project (migration 0129). */
+  assigned_squad_id: string | null
+  /** Latest deploy pipeline status (migration 0129). Receipts live in project_deployments. */
+  deploy_status: ProjectDeployStatus
   created_at: string
   updated_at: string
+}
+
+/** Immutable build receipt for one project deploy dispatch (migration 0129). */
+export interface ProjectDeployment {
+  id: string
+  project_id: string
+  commit_sha: string | null
+  deployment_id: string
+  url: string | null
+  status: 'queued' | 'deploying' | 'healthy' | 'failed'
+  dispatched_by: string | null
+  flight_id: string | null
+  created_at: string
 }
 
 export interface ProjectSquadAccess {

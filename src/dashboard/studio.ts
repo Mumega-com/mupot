@@ -60,6 +60,7 @@ export interface StudioViewData {
   operator: string
   branch: string
   flights: FlightRow[]
+  repoUrl?: string
   authorityRole?: StudioChatRole
 }
 
@@ -265,7 +266,7 @@ export function studioPageHtml(data: StudioViewData): HtmlEscapedString | Promis
             </div>
             <div>
               <label class="studio-label" for="studio-repo">Repo URL</label>
-              <input id="studio-repo" class="studio-repo" type="url" name="repoUrl" placeholder="https://github.com/org/repo" />
+              <input id="studio-repo" class="studio-repo" type="url" name="repoUrl" placeholder="https://github.com/org/repo" value="${data.repoUrl ?? ''}" />
             </div>
           </div>
 
@@ -747,7 +748,7 @@ function shortId(id: string): string {
   return id.length > 8 ? id.slice(0, 8) : id
 }
 
-function isSafeRepoUrl(value: string): boolean {
+export function isSafeRepoUrl(value: string): boolean {
   try {
     const url = new URL(value)
     return url.protocol === 'https:' || url.protocol === 'http:'

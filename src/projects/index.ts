@@ -21,6 +21,8 @@ import {
   upsertProjectSquadAccess,
 } from './service'
 import type { CreateProjectInput, ProjectMutationError, UpdateProjectInput } from './service'
+import { projectSelectSql } from './columns'
+import { deployProject } from './deploy'
 import { startProject, defaultStartGateDeps } from './start-gate'
 import { stripExternalLifecycleFields } from './lifecycle-input'
 import {
@@ -178,9 +180,7 @@ async function readableProject(
 ): Promise<Project | null> {
   const visibility = projectVisibilityClause(access)
   return env.DB.prepare(
-    `SELECT p.id, p.slug, p.name, p.description, p.goal, p.status, p.parent_project_id, p.target_date,
-            p.cycle_boundary_at, p.stalled, p.stall_threshold_days, p.completion_proposed_by,
-            p.created_at, p.updated_at
+    `SELECT ${projectSelectSql('p')}
        FROM projects p
       WHERE p.id = ?
         AND ${visibility.sql}`,
@@ -315,9 +315,7 @@ projectsApp.get('/', async (c) => {
     binds.push(parentId)
   }
   const result = await c.env.DB.prepare(
-    `SELECT p.id, p.slug, p.name, p.description, p.goal, p.status, p.parent_project_id, p.target_date,
-            p.cycle_boundary_at, p.stalled, p.stall_threshold_days, p.completion_proposed_by,
-            p.created_at, p.updated_at
+    `SELECT ${projectSelectSql('p')}
        FROM projects p
       WHERE ${clauses.join(' AND ')}
       ORDER BY p.parent_project_id IS NOT NULL, p.created_at, p.id
@@ -439,6 +437,25 @@ projectsApp.patch('/:id', async (c) => {
   const result = await updateProject(c.env, c.req.param('id'), safeBody as UpdateProjectInput)
   if (!result.ok) return c.json({ error: result.error }, mutationStatus(result.error))
   return c.json({ project: result.value })
+})
+
+projectsApp.post('/:id/deploy', async (c) => {
+  const access = await projectReadAccess(c.env, c.get('auth'))
+  const operator = access.workspaceAdmin
+    || (c.get('auth').capabilities === undefined && (c.get('auth').role === 'owner' || c.get('auth').role === 'admin'))
+  if (!operator) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  const body = await jsonObject(c)
+  const result = await deployProject(c.env, c.req.param('id'), c.get('auth'), body ?? {})
+  if (!result.ok) {
+    const status = result.error === 'project_not_found' ? 404 : result.error === 'receipt_failed' ? 409 : 400
+    return c.json({ error: result.error }, status)
+  }
+  return c.json({
+    deployment: result.deployment,
+    project: result.project,
+    flight_id: result.flight_id,
+    studio_url: result.studio_url,
+  }, 201)
 })
 
 projectsApp.post('/:id/recommit', async (c) => {

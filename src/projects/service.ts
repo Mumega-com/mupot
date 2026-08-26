@@ -1,6 +1,8 @@
 import type { D1Result } from '@cloudflare/workers-types'
 import type { Env, Project, ProjectAccessLevel, ProjectSquadAccess, ProjectStatus } from '../types'
 import { isNonEmptyString, isValidSlug } from '../org/service'
+import { projectSelectSql } from './columns'
+import { isSafeHttpsUrl, isValidWorkerName } from './urls'
 
 const PROJECT_STATUSES: readonly ProjectStatus[] = ['planned', 'active', 'paused', 'review', 'completed', 'archived']
 const PROJECT_ACCESS_LEVELS: readonly ProjectAccessLevel[] = ['read', 'write', 'admin']
@@ -16,6 +18,7 @@ const PROJECT_STATUS_TRANSITIONS: Readonly<Record<ProjectStatus, readonly Projec
 
 export type ProjectMutationError =
   | 'invalid_slug' | 'invalid_name' | 'invalid_status' | 'invalid_status_transition' | 'invalid_target_date'
+  | 'invalid_repo_url' | 'invalid_live_url' | 'invalid_worker_name'
   | 'slug_taken' | 'project_not_found' | 'parent_not_found'
   | 'hierarchy_depth' | 'hierarchy_cycle' | 'active_children'
   | 'archived_project' | 'squad_not_found' | 'invalid_access_level'
@@ -35,6 +38,10 @@ export interface CreateProjectInput {
   status?: unknown
   parent_project_id?: unknown
   target_date?: unknown
+  repo_url?: unknown
+  worker_name?: unknown
+  live_url?: unknown
+  assigned_squad_id?: unknown
 }
 
 export interface UpdateProjectInput {
@@ -45,6 +52,10 @@ export interface UpdateProjectInput {
   status?: unknown
   parent_project_id?: unknown
   target_date?: unknown
+  repo_url?: unknown
+  worker_name?: unknown
+  live_url?: unknown
+  assigned_squad_id?: unknown
   /** Set when entering/leaving completion review (slice 2). */
   completion_proposed_by?: string | null
   /**
@@ -159,6 +170,40 @@ function optionalText(value: unknown, fallback: string): string | null {
   return typeof value === 'string' ? value : null
 }
 
+function optionalNullableUrl(
+  value: unknown,
+  existing: string | null,
+  error: 'invalid_repo_url' | 'invalid_live_url',
+): { ok: true; value: string | null } | { ok: false; error: ProjectMutationError } {
+  if (value === undefined) return { ok: true, value: existing }
+  if (value === null || value === '') return { ok: true, value: null }
+  if (!isSafeHttpsUrl(value)) return { ok: false, error }
+  return { ok: true, value }
+}
+
+function optionalWorkerName(
+  value: unknown,
+  existing: string | null,
+): { ok: true; value: string | null } | { ok: false; error: ProjectMutationError } {
+  if (value === undefined) return { ok: true, value: existing }
+  if (value === null || value === '') return { ok: true, value: null }
+  if (!isValidWorkerName(value)) return { ok: false, error: 'invalid_worker_name' }
+  return { ok: true, value }
+}
+
+async function optionalAssignedSquad(
+  env: Env,
+  value: unknown,
+  existing: string | null,
+): Promise<{ ok: true; value: string | null } | { ok: false; error: ProjectMutationError }> {
+  if (value === undefined) return { ok: true, value: existing }
+  if (value === null || value === '') return { ok: true, value: null }
+  if (typeof value !== 'string' || !value) return { ok: false, error: 'squad_not_found' }
+  const squad = await env.DB.prepare('SELECT 1 FROM squads WHERE id = ?').bind(value).first()
+  if (!squad) return { ok: false, error: 'squad_not_found' }
+  return { ok: true, value }
+}
+
 export async function createProject(
   env: Env,
   input: CreateProjectInput,
@@ -182,6 +227,15 @@ export async function createProject(
     if (parentError) return { ok: false, error: parentError }
   }
 
+  const repoUrl = optionalNullableUrl(input.repo_url, null, 'invalid_repo_url')
+  if (!repoUrl.ok) return repoUrl
+  const liveUrl = optionalNullableUrl(input.live_url, null, 'invalid_live_url')
+  if (!liveUrl.ok) return liveUrl
+  const workerName = optionalWorkerName(input.worker_name, null)
+  if (!workerName.ok) return workerName
+  const assignedSquad = await optionalAssignedSquad(env, input.assigned_squad_id, null)
+  if (!assignedSquad.ok) return assignedSquad
+
   const now = new Date().toISOString()
   const project: Project = {
     id: crypto.randomUUID(),
@@ -196,6 +250,11 @@ export async function createProject(
     stalled: 0,
     stall_threshold_days: null,
     completion_proposed_by: null,
+    repo_url: repoUrl.value,
+    worker_name: workerName.value,
+    live_url: liveUrl.value,
+    assigned_squad_id: assignedSquad.value,
+    deploy_status: liveUrl.value ? 'healthy' : 'idle',
     created_at: now,
     updated_at: now,
   }
@@ -204,12 +263,15 @@ export async function createProject(
     const result = await env.DB.prepare(
       `INSERT INTO projects
        (id, slug, name, description, goal, status, parent_project_id, target_date,
-        cycle_boundary_at, stalled, stall_threshold_days, completion_proposed_by, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        cycle_boundary_at, stalled, stall_threshold_days, completion_proposed_by,
+        repo_url, worker_name, live_url, assigned_squad_id, deploy_status,
+        created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).bind(
       project.id, project.slug, project.name, project.description, project.goal, project.status,
       project.parent_project_id, project.target_date,
       project.cycle_boundary_at, project.stalled, project.stall_threshold_days, project.completion_proposed_by,
+      project.repo_url, project.worker_name, project.live_url, project.assigned_squad_id, project.deploy_status,
       project.created_at, project.updated_at,
     ).run()
     if (!wrote(result)) return { ok: false, error: 'receipt_failed' }
@@ -235,8 +297,7 @@ export async function listProjects(env: Env, options: ListProjectsOptions = {}):
     where.push(options.parent_project_id === null ? 'parent_project_id IS NULL' : 'parent_project_id = ?')
     if (options.parent_project_id !== null) values.push(options.parent_project_id)
   }
-  const sql = `SELECT id, slug, name, description, goal, status, parent_project_id, target_date,
-      cycle_boundary_at, stalled, stall_threshold_days, completion_proposed_by, created_at, updated_at
+  const sql = `SELECT ${projectSelectSql()}
     FROM projects ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
     ORDER BY parent_project_id IS NOT NULL, created_at, id`
   const result = await env.DB.prepare(sql).bind(...values).all<Project>()
@@ -245,9 +306,7 @@ export async function listProjects(env: Env, options: ListProjectsOptions = {}):
 
 export async function getProject(env: Env, id: string): Promise<Project | null> {
   return env.DB.prepare(
-    `SELECT id, slug, name, description, goal, status, parent_project_id, target_date,
-            cycle_boundary_at, stalled, stall_threshold_days, completion_proposed_by, created_at, updated_at
-     FROM projects WHERE id = ?`,
+    `SELECT ${projectSelectSql()} FROM projects WHERE id = ?`,
   ).bind(id).first<Project>()
 }
 
@@ -331,6 +390,15 @@ export async function updateProject(
     }
   }
 
+  const nextRepoUrl = optionalNullableUrl(input.repo_url, existing.repo_url, 'invalid_repo_url')
+  if (!nextRepoUrl.ok) return nextRepoUrl
+  const nextLiveUrl = optionalNullableUrl(input.live_url, existing.live_url, 'invalid_live_url')
+  if (!nextLiveUrl.ok) return nextLiveUrl
+  const nextWorkerName = optionalWorkerName(input.worker_name, existing.worker_name)
+  if (!nextWorkerName.ok) return nextWorkerName
+  const nextAssignedSquad = await optionalAssignedSquad(env, input.assigned_squad_id, existing.assigned_squad_id)
+  if (!nextAssignedSquad.ok) return nextAssignedSquad
+
   if (nextStatus === 'archived' && existing.status !== 'archived' && await hasNonArchivedChildren(env, id)) {
     return { ok: false, error: 'active_children' }
   }
@@ -349,6 +417,10 @@ export async function updateProject(
     parent_project_id: nextParentProjectId as string | null,
     target_date: nextTargetDate,
     completion_proposed_by: nextProposedBy,
+    repo_url: nextRepoUrl.value,
+    worker_name: nextWorkerName.value,
+    live_url: nextLiveUrl.value,
+    assigned_squad_id: nextAssignedSquad.value,
     updated_at: nextUpdatedAt(existing.updated_at),
   }
   try {
@@ -356,11 +428,15 @@ export async function updateProject(
     // TOCTOU: a concurrent status flip between getProject and this UPDATE loses.
     const result = await env.DB.prepare(
       `UPDATE projects SET slug = ?, name = ?, description = ?, goal = ?, status = ?, parent_project_id = ?,
-       target_date = ?, completion_proposed_by = ?, updated_at = ?
+       target_date = ?, completion_proposed_by = ?,
+       repo_url = ?, worker_name = ?, live_url = ?, assigned_squad_id = ?,
+       updated_at = ?
        WHERE id = ? AND updated_at = ? AND status = ?`,
     ).bind(
       updated.slug, updated.name, updated.description, updated.goal, updated.status,
-      updated.parent_project_id, updated.target_date, updated.completion_proposed_by, updated.updated_at,
+      updated.parent_project_id, updated.target_date, updated.completion_proposed_by,
+      updated.repo_url, updated.worker_name, updated.live_url, updated.assigned_squad_id,
+      updated.updated_at,
       updated.id, existing.updated_at, existing.status,
     ).run()
     if (!wrote(result)) {

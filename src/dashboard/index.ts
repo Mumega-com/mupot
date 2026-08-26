@@ -237,7 +237,9 @@ import '../departments/modules/agency' // side-effect: register AgencyModule (re
 import '../departments/modules/web-ops' // side-effect: register WebOpsModule (AI website-operations team — the wedge)
 import { makeMissionControlApp } from './mission-control-routes'
 export { controlTowerBody, potFleetBody } from './mission-control-views'
-import { getAuthContext, loadStudioData, studioPageHtml, dispatchStudioFlight } from './studio'
+import { getAuthContext, loadStudioData, studioPageHtml, dispatchStudioFlight, isSafeRepoUrl } from './studio'
+import { deployProject } from '../projects/deploy'
+import { studioDispatchPath } from '../projects/urls'
 import {
   copilotDrawerCss,
   copilotPageBody,
@@ -1278,7 +1280,37 @@ dashboardApp.get('/flights', async (c) => {
 dashboardApp.get('/studio', async (c) => {
   const auth = getAuthContext(c)
   const data = await loadStudioData(c.env, auth)
+  const repo = c.req.query('repo')?.trim()
+  if (repo && isSafeRepoUrl(repo)) data.repoUrl = repo
   return c.html(studioPageHtml(data))
+})
+
+dashboardApp.post('/projects/:id/deploy', async (c) => {
+  if (!await canManageProjects(c.env, c.get('auth'))) {
+    return c.html(shell(c.env, 'Projects', errorBody('Deploying a project worker requires workspace admin.')), 403)
+  }
+  const projectId = c.req.param('id')
+  const result = await deployProject(c.env, projectId, c.get('auth'))
+  if (!result.ok) {
+    if (result.error === 'project_not_found') {
+      return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
+    }
+    return c.html(shell(c.env, 'Projects', errorBody(`Deploy failed: ${result.error}`)), 400)
+  }
+  return c.redirect(result.studio_url, 303)
+})
+
+dashboardApp.post('/projects/:id/dispatch-flight', async (c) => {
+  const detail = await loadProjectDetail(c.env, c.get('auth'), c.req.param('id'))
+  if (!detail) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
+  if (detail.canManage) {
+    const result = await deployProject(c.env, detail.project.id, c.get('auth'), {
+      prompt: `Dispatch a feature flight for ${detail.project.name}`,
+    })
+    if (result.ok) return c.redirect(result.studio_url, 303)
+  }
+  if (detail.project.repo_url) return c.redirect(studioDispatchPath(detail.project.repo_url), 303)
+  return c.redirect(`/projects/${encodeURIComponent(detail.project.id)}`, 303)
 })
 
 // POST /api/studio/dispatch — create a flight + task from a Studio prompt.
@@ -4015,11 +4047,7 @@ export function shell(
           </a>
 
           <a class="nav-link" href="/copilot">
-<<<<<<< HEAD
-            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M10 3.2 12.1 7l4.2.7-3 3 .7 4.2L10 13.1 6 14.9l.7-4.2-3-3 4.2-.7z"/></svg>
-=======
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M4.2 13.6V6.4A2.2 2.2 0 0 1 6.4 4.2h7.2A2.2 2.2 0 0 1 15.8 6.4v4.2a2.2 2.2 0 0 1-2.2 2.2H8.1L4.2 15.8z"/><path d="M7 8.4h6M7 10.8h3.4"/></svg>
->>>>>>> main
             <span class="nav-label">Co-Pilot</span>
           </a>
 
