@@ -21,9 +21,9 @@ function row(p: Partial<FlightRow> & { agent: string; status: FlightStatus }): F
     cost_micro_usd: p.cost_micro_usd ?? 0,
     next_run_at: p.next_run_at ?? null,
     created_at: p.created_at ?? NOW,
-    started_at: null,
-    ended_at: null,
-    meta: '{}',
+    started_at: p.started_at ?? null,
+    ended_at: p.ended_at ?? null,
+    meta: p.meta ?? '{}',
     agent_name: p.agent_name ?? null,
     squad_name: p.squad_name ?? null,
   }
