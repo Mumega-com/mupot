@@ -235,6 +235,13 @@ import '../departments/modules/web-ops' // side-effect: register WebOpsModule (A
 import { makeMissionControlApp } from './mission-control-routes'
 export { controlTowerBody, potFleetBody } from './mission-control-views'
 import { getAuthContext, loadStudioData, studioPageHtml, dispatchStudioFlight } from './studio'
+import {
+  copilotDrawerCss,
+  copilotPageBody,
+  copilotShellEmbed,
+  readStudioChatPayload,
+  streamStudioChat,
+} from './copilot'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
@@ -1285,6 +1292,20 @@ dashboardApp.post('/api/studio/dispatch', async (c) => {
   })
   if (!result.ok) return c.json({ error: result.error }, result.status)
   return c.json(result.result)
+})
+
+// GET /copilot and GET /chat — full-height Deep Chat card (session auth).
+dashboardApp.get('/copilot', async (c) => c.html(shell(c.env, 'Co-Pilot', copilotPageBody())))
+dashboardApp.get('/chat', async (c) => c.html(shell(c.env, 'Co-Pilot', copilotPageBody())))
+
+// POST /api/studio/chat — Deep Chat SSE stream. Accepts { messages, recipient }
+// and the shorter { message, recipient } body. Authority is derived from the
+// signed-in session (admin vs member), never from the request body.
+dashboardApp.post('/api/studio/chat', async (c) => {
+  const auth = getAuthContext(c)
+  const parsed = await readStudioChatPayload(c.req.raw)
+  if (!parsed.ok) return c.json({ error: parsed.error }, parsed.status)
+  return streamStudioChat(c.env, auth, parsed.value)
 })
 
 // ── radar (visual fleet + squad awareness — #21 slice 1, VIEW LAYER ONLY) ────
@@ -3910,6 +3931,7 @@ export function shell(
       }
 
       /* ── /approvals page styles (kept here to avoid duplication) ── */
+      ${raw(copilotDrawerCss())}
     </style>
   </head>
   <body>
@@ -3986,6 +4008,11 @@ export function shell(
             <span class="nav-label">Studio</span>
           </a>
 
+          <a class="nav-link" href="/copilot">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M10 3.2 12.1 7l4.2.7-3 3 .7 4.2L10 13.1 6 14.9l.7-4.2-3-3 4.2-.7z"/></svg>
+            <span class="nav-label">Co-Pilot</span>
+          </a>
+
           <!-- Organization (collapsible) -->
           <div class="nav-section">
             <button class="nav-section-toggle" data-section="org" onclick="navToggle('org')">
@@ -4010,6 +4037,7 @@ export function shell(
               <a class="nav-child" href="/dashboard/kanban">Kanban board</a>
               <a class="nav-child" href="/send">Tasks</a>
               <a class="nav-child" href="/studio">Studio</a>
+              <a class="nav-child" href="/copilot">Co-Pilot</a>
               <a class="nav-child" href="/flights">Flights</a>
               <a class="nav-child" href="/verifications">Verifications</a>
             </div>
@@ -4258,6 +4286,7 @@ export function shell(
 
       })();
     </script>
+    ${copilotShellEmbed()}
   </body>
 </html>`
 }
