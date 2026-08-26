@@ -47,7 +47,11 @@ Overall visual verdict: **WARN** — the five recent surfaces exist and are stru
 | A5 | WARN | FAB label “Co-Pilot” + icon is wide on a 375px viewport and sits on top of page content. | `.mupot-copilot-fab` |
 | A6 | FAIL (pre-existing) | `tests/copilot-drawer.test.ts` and `tests/copilot-recipient-routing.test.ts` still describe the **pre–Deep Chat** chrome (`#mupot-copilot-launcher`, `#mupot-copilot-page-input`, `copilotRoleBadge`, `copilotSseResponse`). They fail against shipped code. | tests vs `src/dashboard/copilot.ts` |
 
-**Could not verify live:** typing a message, SSE tokens, markdown copy buttons, and Deep Chat’s own unpkg network errors — all require a dashboard session.
+**Browser fixture (1200 / 375):** persona select, intro bubble, image + send + mic icons all render. Mic sits just outside the input (Deep Chat default). Full-page FAB still paints on the fixture URL (`/copilot.html`); production `/copilot` hides it via `body.copilot-fullpage`.
+
+**Console (fixture + will fire on prod):** Deep Chat 2.1.1 logged `The request property is deprecated` / `The stream property has been moved to the connect object` on every chat host. Fixed in this PR by switching to `connect`.
+
+**Could not verify live:** typing a message, SSE tokens, and markdown copy buttons — all require a dashboard session.
 
 **Fixes in this PR:** wire `window.mupotOpenCopilot` + `[data-copilot-open]`; Escape only closes an open drawer and yields to `.modal`; drawer chat `min-height: 0`; 720px breakpoint stacks the header, full-width select, and icon-only FAB.
 
@@ -126,7 +130,9 @@ Overall visual verdict: **WARN** — the five recent surfaces exist and are stru
 | D4 | INFO | Viewport labels lacked the 🖥️ 📟 📱 icons the brief named. | `VIEWPORTS` |
 | D5 | INFO | `/studio` and `/projects/:id` are two different “studios.” Operators can land in the wrong one from Dispatch Feature Flight (`/studio?repo=`). | `studioDispatchPath` |
 
-**Fixes in this PR:** pressed-state CSS; mobile `23.4375rem` (375px); `Refresh Preview`; ↗ external link (`live_url` or `/preview/:id/`); emoji viewport labels.
+**Browser fixture:** iframe measured **375px** after Mobile toggle (PASS). Tablet toggle is a no-op when the left pane is already < 768px (measured 516px) — a size chip now states `Tablet · 768px` so it is not a silent miss. Preview iframe 404s on the static fixture (`/preview/project-worker-alpha/`); production would hit the platform dispatcher. Routines band showed `undefined enabled` on an incomplete fixture situation — `situationCount` now coerces missing numbers to `0`.
+
+**Fixes in this PR:** pressed-state CSS; mobile `23.4375rem` (375px); `Refresh Preview`; ↗ external link; emoji viewport labels; viewport size chip; Deep Chat `connect` object.
 
 ---
 
@@ -164,10 +170,24 @@ Overall visual verdict: **WARN** — the five recent surfaces exist and are stru
 
 No 4xx/5xx on those probes. Authenticated XHR (`POST /api/studio/chat`, `/api/projects`, `/api/studio/dispatch`, live polling) was **not** exercised on production.
 
-### Known client risk (not reproduced live)
+### Fixture browser (headless Chrome, 1200 / 375)
 
-- Deep Chat loads from `https://unpkg.com/deep-chat@2.1.1/dist/deepChat.bundle.js`. A CDN blip becomes a blank chat host. No local fallback.
+| Check | Result |
+|---|---|
+| New Project Worker auto-slug | `https://acme-storefront.mupot.mumega.com` after typing “Acme Storefront” |
+| Modal Escape | closed |
+| Dispatch Escape | closed |
+| Sandbox Mobile iframe | **375px** |
+| Sandbox Tablet iframe | 516px (pane-capped; max-width 768px) |
+| Athena CHECKS | ✓ secrets/tests/RBAC/schema and ✗ secrets on BLOCKED row |
+| Deep Chat console | `request`/`stream` deprecation — **fixed** via `connect` |
+| Fixture-only 404s | `/auth/me`, `/approvals` (shell chrome); `/preview/:id/` (no dispatcher in static file) |
+
+### Known remaining client risk
+
+- Deep Chat still loads from unpkg. A CDN blip becomes a blank chat host.
 - Flight deck poll (`12s`) does a full HTML refetch and `replaceWith` on `#fd-kpis` / `#fd-board` — can reset scroll and steal focus while typing in search.
+- Deep Chat intro names the model “AI” even after `chat.names` is set — component default, not our CSS.
 
 ---
 

@@ -25,6 +25,7 @@ export const DEEP_CHAT_ESM = 'https://unpkg.com/deep-chat@2.1.1/dist/deepChat.bu
 export const STUDIO_CHAT_PATH = '/api/studio/chat'
 
 export const DEEP_CHAT_REQUEST = { url: STUDIO_CHAT_PATH, method: 'POST' } as const
+export const DEEP_CHAT_CONNECT = { ...DEEP_CHAT_REQUEST, stream: true } as const
 export const DEEP_CHAT_IMAGES = { files: { maxNumberOfFiles: 3 } } as const
 export const DEEP_CHAT_SPEECH = { webSpeech: true } as const
 export const DEEP_CHAT_STYLE = {
@@ -246,7 +247,7 @@ export function copilotDeepChatMarkup(opts?: {
   projectId?: string
   projectRepo?: string
 }): Html {
-  const request = JSON.stringify(DEEP_CHAT_REQUEST)
+  const connect = JSON.stringify(DEEP_CHAT_CONNECT)
   const images = JSON.stringify(DEEP_CHAT_IMAGES)
   const speech = JSON.stringify(DEEP_CHAT_SPEECH)
   const styleJson = JSON.stringify(DEEP_CHAT_STYLE)
@@ -254,8 +255,7 @@ export function copilotDeepChatMarkup(opts?: {
   const projectRepo = opts?.projectRepo ?? ''
   return html`<deep-chat
       class="mupot-deep-chat"
-      request='${raw(request)}'
-      stream="true"
+      connect='${raw(connect)}'
       images='${raw(images)}'
       speechToText='${raw(speech)}'
       textToSpeech='${raw(speech)}'
@@ -573,13 +573,13 @@ function applyDeepChatTheme(chat, recipient) {
   chat.style.border = STYLE.border;
   chat.style.width = STYLE.width;
   chat.style.height = STYLE.height;
-  chat.request = {
+  chat.connect = {
     url: REQUEST.url,
     method: REQUEST.method,
+    stream: true,
     headers: { 'X-Mupot-Recipient': recipient },
     additionalBodyProps: { recipient: recipient }
   };
-  chat.stream = true;
   chat.images = IMAGES;
   chat.speechToText = SPEECH;
   chat.textToSpeech = SPEECH;

@@ -136,6 +136,7 @@ export function projectLivePreviewSplitHtml(input: ProjectPreviewSplitInput): Ht
             aria-label="Open preview in a new tab"
             title="Open preview in a new tab"
           >↗</a>
+          <span class="ui-panel-sub" data-viewport-size>Desktop · 100%</span>
         </div>
       </div>
       <p class="ui-panel-sub">Project sub-worker via <code>/preview/${project.id}/</code>. Building or idle workers render a fallback page.</p>
@@ -199,6 +200,9 @@ export function projectLivePreviewSplitHtml(input: ProjectPreviewSplitInput): Ht
             root.querySelectorAll('[data-viewport-toggle]').forEach(function (other) {
               other.setAttribute('aria-pressed', other === btn ? 'true' : 'false');
             });
+            var sizes = { desktop: 'Desktop · 100%', tablet: 'Tablet · 768px', mobile: 'Mobile · 375px' };
+            var size = root.querySelector('[data-viewport-size]');
+            if (size) size.textContent = sizes[next] || sizes.desktop;
           });
         });
         var refresh = root.querySelector('[data-preview-refresh]');

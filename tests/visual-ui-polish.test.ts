@@ -48,6 +48,15 @@ describe('visual polish — sandbox viewport contract', () => {
     expect(SANDBOX_TABLET_MAX_WIDTH).toBe('48rem')
     expect(SANDBOX_MOBILE_MAX_WIDTH).toBe('23.4375rem')
   })
+
+  it('uses the Deep Chat 2.x connect object instead of deprecated request/stream attrs', async () => {
+    const { copilotDeepChatMarkup, DEEP_CHAT_CONNECT } = await import('../src/dashboard/copilot')
+    const markup = String(await copilotDeepChatMarkup())
+    expect(DEEP_CHAT_CONNECT.stream).toBe(true)
+    expect(markup).toContain("connect='")
+    expect(markup).not.toContain('request=')
+    expect(markup).not.toContain('stream="true"')
+  })
 })
 
 describe('visual polish — Athena check badges', () => {

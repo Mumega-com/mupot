@@ -80,6 +80,7 @@ export async function prepareProjectWorkerProvision(
   if (!isProjectWorkerTemplate(template)) return { ok: false, error: 'invalid_template' }
 
   const name = typeof body.name === 'string' ? body.name : ''
+  if (!name.trim()) return { ok: false, error: 'invalid_name' }
   const suppliedSlug = typeof body.slug === 'string' ? body.slug.trim() : ''
   const slug = suppliedSlug || slugFromProjectName(name)
   if (!isValidSlug(slug)) return { ok: false, error: 'invalid_slug' }

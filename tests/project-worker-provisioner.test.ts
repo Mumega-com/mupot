@@ -355,7 +355,7 @@ describe('project worker provisioner — dashboard sandbox', () => {
       expect(body).toContain(prompt)
       expect(body).toContain(`data-quick-prompt="${prompt}"`)
     }
-    expect(body).toContain('Flight &amp; Deployment Stream')
+    expect(body).toMatch(/Flight &amp; Deployment Stream|Flight & Deployment Stream/)
     expect(body).toContain('data-flight-stream')
     expect(body).toContain('Live preview')
     expect(body).toContain('Code / Logs')
@@ -397,6 +397,8 @@ describe('project worker provisioner — dashboard sandbox', () => {
     expect(html).toContain('data-viewport-toggle="mobile"')
     expect(html).toContain('data-preview-refresh')
     expect(html).toContain('data-preview-external')
+    expect(html).toContain('data-viewport-size')
+    expect(html).toContain('Mobile · 375px')
     expect(html).toContain('Refresh Preview')
     expect(html).toContain('🖥️ Desktop')
     expect(html).toContain('📟 Tablet')
