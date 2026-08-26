@@ -14,6 +14,7 @@
 
 import { html, raw } from 'hono/html'
 import type { HtmlEscapedString } from 'hono/utils/html'
+import { formatCachedPrompt, keepAliveCacheSession } from '../ai/cache-context'
 import type { AuthContext, Env, ModelMessage } from '../types'
 import { isOrgAdmin } from '../auth/capability'
 import { createModel } from '../model'
@@ -37,6 +38,7 @@ export const DEEP_CHAT_STYLE = {
 
 export type CopilotRecipientId =
   | 'copilot'
+  | 'river'
   | 'loom'
   | 'kasra'
   | 'athena'
@@ -52,32 +54,48 @@ export interface CopilotRecipient {
   readonly title: string
   readonly letter: string
   readonly color: string
+  readonly label: string
+  readonly role: string
+  readonly avatarColor: string
+  readonly badge: string
+}
+
+function recipient(
+  id: CopilotRecipientId,
+  handle: string,
+  name: string,
+  title: string,
+  letter: string,
+  color: string,
+  badge: string,
+  label = `${name} (${title})`,
+  role = title,
+): CopilotRecipient {
+  return { id, handle, name, title, letter, color, label, role, avatarColor: color, badge }
 }
 
 export const COPILOT_RECIPIENTS: readonly CopilotRecipient[] = [
-  { id: 'copilot', handle: '@copilot', name: 'Copilot', title: 'Operator assistant', letter: 'C', color: '#22d3ee' },
-  { id: 'loom', handle: '@loom', name: 'Loom', title: 'Narrative weaver', letter: 'L', color: '#d4a017' },
-  { id: 'kasra', handle: '@kasra', name: 'Kasra', title: 'Merge gate', letter: 'K', color: '#eab308' },
-  { id: 'athena', handle: '@athena', name: 'Athena', title: 'Adversarial review', letter: 'A', color: '#e879f9' },
-  {
-    id: 'cursor-architect',
-    handle: '@cursor-architect',
-    name: 'Cursor Architect',
-    title: 'System design',
-    letter: 'A',
-    color: '#38bdf8',
-  },
-  {
-    id: 'cursor-builder',
-    handle: '@cursor-builder',
-    name: 'Cursor Builder',
-    title: 'Implementation',
-    letter: 'B',
-    color: '#34d399',
-  },
+  recipient('copilot', '@copilot', 'Copilot', 'General Pot Assistant', 'C', '#22d3ee', '✨ Co-Pilot'),
+  recipient(
+    'river',
+    '@river',
+    'River',
+    'Council Lead & Continuity',
+    'R',
+    '#06b6d4',
+    '🌊 River',
+    'River (Lead)',
+    'Council Lead & Continuity',
+  ),
+  recipient('loom', '@loom', 'Loom', 'Sprint Coordinator', 'L', '#d4a017', '🧶 Loom'),
+  recipient('kasra', '@kasra', 'Kasra', 'Server Builder & Runtime Operator', 'K', '#eab308', '🔨 Kasra'),
+  recipient('athena', '@athena', 'Athena', 'Gatekeeper & Safety Reviewer', 'A', '#e879f9', '🛡️ Athena'),
+  recipient('cursor-architect', '@cursor-architect', 'Cursor Architect', 'Cloud Lead Architect', 'A', '#38bdf8', '☁️ Cursor Architect'),
+  recipient('cursor-builder', '@cursor-builder', 'Cursor Builder', 'Cloud Implementer', 'B', '#34d399', '🛠️ Cursor Builder'),
 ]
 
 export const DEFAULT_COPILOT_RECIPIENT: CopilotRecipientId = 'copilot'
+export const COPILOT_RECIPIENT_STORAGE_KEY = 'mupot-copilot-recipient'
 
 export interface DeepChatMessage {
   role?: string
@@ -93,12 +111,20 @@ export interface StudioChatRequest {
 }
 
 const PERSONA_PROMPTS: Record<CopilotRecipientId, string> = {
-  copilot: 'You are Mupot Co-Pilot, the primary intelligence within this sovereign pot. Assist operators with projects, flights, and system orchestration.',
-  loom: 'You are Loom (@loom — Sprint Coordinator). You hold sprint truth, sequencing, briefs, receipts, and bounded delegation across all squads.',
-  kasra: 'You are Kasra (@kasra — Server Builder & Runtime Operator). You maintain and operate the server infrastructure, runtimes, and deployment pipelines.',
-  athena: 'You are Athena (@athena — Gatekeeper & Safety Reviewer). You enforce gate verification, coherence, safety reviews, and challenge unproven green lights.',
-  'cursor-architect': 'You are Cursor Architect (@cursor-architect — Cloud Lead Architect). You design multi-repo cloud builds, system interfaces, and execution boundaries.',
-  'cursor-builder': 'You are Cursor Builder (@cursor-builder — Cloud Implementer). You execute code sandboxes, test-driven implementations, and pull requests.',
+  copilot:
+    'You are Mupot Co-Pilot, the primary intelligence and operator assistant within this sovereign pot. Assist operators with projects, flights, and system orchestration.',
+  river:
+    'You are River (@river — Council Lead & Verification Lead). You hold continuity, high-coherence steering, evidence rigor, and multi-squad direction. You guide operators and coordinate builder agents toward verified outcomes.',
+  loom:
+    'You are Loom (@loom — Sprint Coordinator). You hold sprint truth, sequencing, briefs, receipts, sprint awareness, and bounded delegation across all squads. You speak with council authority on the current cycle.',
+  kasra:
+    'You are Kasra (@kasra — Server Builder & Runtime Operator). You are the system builder and runtime operator. You maintain and operate the server infrastructure, runtimes, and deployment pipelines.',
+  athena:
+    'You are Athena (@athena — Gatekeeper & Safety Reviewer). You are the adversarial gatekeeper and safety reviewer. You enforce gate verification, coherence, safety reviews, and challenge unproven green lights.',
+  'cursor-architect':
+    'You are Cursor Architect (@cursor-architect — Cloud Lead Architect). You own architecture, system design, and repo planning for multi-repo cloud builds, system interfaces, and execution boundaries.',
+  'cursor-builder':
+    'You are Cursor Builder (@cursor-builder — Cloud Implementer). You execute code implementation, tests, and PR delivery through code sandboxes, test-driven implementations, and pull requests.',
 }
 
 export function getCopilotRecipient(id: CopilotRecipientId): CopilotRecipient {
@@ -115,10 +141,18 @@ export function buildCopilotPersonaPrompt(recipient: CopilotRecipientId | string
 }
 
 export function normalizeCopilotRecipient(raw: unknown): CopilotRecipientId {
-  const value = typeof raw === 'string' ? raw.trim().toLowerCase().replace(/^@/, '') : ''
+  const value = typeof raw === 'string' ? raw.trim().toLowerCase().replace(/^@/, '').replace(/_/g, '-') : ''
   return COPILOT_RECIPIENTS.some((agent) => agent.id === value)
     ? (value as CopilotRecipientId)
     : DEFAULT_COPILOT_RECIPIENT
+}
+
+export function copilotRecipientBadge(id: CopilotRecipientId | string | undefined | null): string {
+  return getCopilotRecipient(normalizeCopilotRecipient(id)).badge
+}
+
+export function copilotRoleBadge(role: string | undefined | null): string {
+  return role === 'admin' || role === 'owner' ? '[ 🛡️ Admin ]' : '[ 👤 Member ]'
 }
 
 export function resolveCopilotAuthority(auth: AuthContext): CopilotAuthority {
@@ -211,6 +245,104 @@ export function chunkCopilotReply(text: string, size = 48): string[] {
   return chunks
 }
 
+export function tokenizeAssistantText(text: string): string[] {
+  return text.match(/\S+\s*/g) ?? (text ? [text] : [])
+}
+
+export function fallbackCopilotReply(message: string, recipient: CopilotRecipientId | string = 'copilot'): string {
+  const agent = getCopilotRecipient(normalizeCopilotRecipient(recipient))
+  return `${agent.name} (${agent.title}) here. You said: ${message}`
+}
+
+export interface CopilotChatBody {
+  message: string
+  recipient: CopilotRecipientId
+  history: Array<{ role: 'user' | 'assistant'; content: string }>
+}
+
+export function parseCopilotChatBody(
+  input: unknown,
+): { ok: true; value: CopilotChatBody } | { ok: false; status: 400; error: string } {
+  const parsed = parseStudioChatPayload(input)
+  if (!parsed.ok) return { ok: false, status: 400, error: parsed.error }
+  const history = parsed.value.messages
+    .filter((m) => typeof m.text === 'string' && m.text.trim())
+    .map((m) => ({
+      role: (m.role === 'ai' || m.role === 'assistant' ? 'assistant' : 'user') as 'user' | 'assistant',
+      content: m.text as string,
+    }))
+  const body = input as Record<string, unknown>
+  if (Array.isArray(body.history)) {
+    for (const item of body.history) {
+      if (!item || typeof item !== 'object') continue
+      const role = (item as { role?: unknown }).role
+      const content = (item as { content?: unknown }).content
+      if ((role === 'user' || role === 'assistant') && typeof content === 'string' && content.trim()) {
+        history.push({ role, content: content.trim() })
+      }
+    }
+  }
+  return {
+    ok: true,
+    value: {
+      message: parsed.value.message,
+      recipient: parsed.value.recipient,
+      history,
+    },
+  }
+}
+
+export function copilotSseResponse(
+  env: Env,
+  body: { message: string; recipient?: string; history?: Array<{ role: 'user' | 'assistant'; content: string }> },
+  modelFn: (messages: ModelMessage[]) => Promise<string>,
+  role: CopilotAuthority = 'member',
+): Response {
+  const recipient = normalizeCopilotRecipient(body.recipient)
+  const agent = getCopilotRecipient(recipient)
+  const encoder = new TextEncoder()
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const enqueue = (event: Record<string, unknown>) => {
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`))
+      }
+      enqueue({ type: 'meta', agent: recipient, role })
+      const cached = formatCachedPrompt({
+        userMessage: body.message,
+        recipient,
+        persona: PERSONA_PROMPTS[recipient],
+        operatorRole: role,
+      })
+      const messages: ModelMessage[] = [
+        { role: 'system', content: `${cached.prefix} ${agent.title}` },
+        ...(body.history ?? []),
+        { role: 'user', content: cached.suffix },
+      ]
+      let source: 'model' | 'fallback' = 'model'
+      let text: string
+      try {
+        text = (await modelFn(messages)).trim()
+        if (!text) throw new Error('empty')
+      } catch {
+        source = 'fallback'
+        text = fallbackCopilotReply(body.message, recipient)
+      }
+      for (const token of tokenizeAssistantText(text)) {
+        enqueue({ type: 'token', text: token })
+      }
+      enqueue({ type: 'done', source, done: true })
+      controller.close()
+    },
+  })
+  return new Response(stream, {
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'X-Mupot-Copilot-Recipient': recipient,
+    },
+  })
+}
+
 export async function streamStudioChat(
   env: Env,
   auth: AuthContext,
@@ -269,9 +401,9 @@ export function copilotDeepChatMarkup(opts?: {
 export function copilotRecipientSelectHtml(selectId: string): Html {
   const options = COPILOT_RECIPIENTS.map(
     (agent) =>
-      html`<option value="${agent.id}" data-color="${agent.color}" data-letter="${agent.letter}">${agent.handle} — ${agent.name}</option>`,
+      html`<option value="${agent.id}" data-color="${agent.avatarColor}" data-letter="${agent.letter}" data-role="${agent.role}">${agent.handle} — ${agent.label}</option>`,
   )
-  return html`<label class="mupot-copilot-recipient">
+  return html`<label class="mupot-copilot-recipient copilot-recipient" data-copilot-recipient>
     <span class="mupot-copilot-avatar" data-copilot-avatar aria-hidden="true">C</span>
     <select
       id="${selectId}"
@@ -305,23 +437,25 @@ export function copilotDrawerHtml(): Html {
         <div>
           <p class="mupot-copilot-kicker">Mupot</p>
           <h2>Co-Pilot</h2>
+          <p class="mupot-copilot-role-badge">${copilotRoleBadge('member')}</p>
         </div>
-        ${copilotRecipientSelectHtml('mupot-copilot-drawer-recipient')}
+        ${copilotRecipientSelectHtml('mupot-copilot-recipient')}
         <button type="button" id="mupot-copilot-close" class="mupot-copilot-close" aria-label="Close Co-Pilot">✕</button>
       </header>
       <div class="mupot-copilot-chat-host">${copilotDeepChatMarkup()}</div>
     </aside>`
 }
 
-export function copilotPageBody(): Html {
+export function copilotPageBody(auth?: { role?: string } | null): Html {
   return html`${pageHeader({
       crumbs: 'Work / Co-Pilot',
       title: 'Co-Pilot',
-      sub: 'Talk to @copilot, @loom, @kasra, @athena, @cursor-architect, or @cursor-builder. Vision, voice, and streaming are live.',
+      sub: 'Talk to @river, @copilot, @loom, @kasra, @athena, @cursor-architect, or @cursor-builder. Vision, voice, and streaming are live.',
     })}
-    <section class="copilot-page-card ui-panel" aria-label="Co-Pilot chat">
+    <section id="mupot-copilot-page" class="copilot-page-card ui-panel" aria-label="Co-Pilot chat">
       <div class="mupot-copilot-toolbar">
         ${copilotRecipientSelectHtml('mupot-copilot-page-recipient')}
+        <span class="mupot-copilot-role-badge">${copilotRoleBadge(auth?.role)}</span>
         <p class="mupot-copilot-toolbar-hint">Drag images, paste a screenshot, or use the microphone.</p>
       </div>
       <div class="mupot-copilot-chat-host copilot-page-host">${copilotDeepChatMarkup()}</div>
@@ -395,30 +529,29 @@ async function maybeModelReply(
 ): Promise<string | undefined> {
   const ai = (env as Env & { AI?: { run?: unknown } }).AI
   if (!ai || typeof ai.run !== 'function') return undefined
-  const agent = getCopilotRecipient(request.recipient)
+  keepAliveCacheSession(`copilot:${request.recipient}:${auth.tenant || 'pot'}`)
+  const cached = formatCachedPrompt({
+    userMessage: request.message,
+    timestamp: new Date().toISOString(),
+    recipient: request.recipient,
+    persona: PERSONA_PROMPTS[request.recipient],
+    operator: auth.email || auth.userId,
+    operatorRole: authority,
+    tenant: auth.tenant,
+  })
+  const turns = request.messages
+    .filter((m) => typeof m.text === 'string' && m.text.trim())
+    .slice(-8)
+    .map((m) => ({
+      role: (m.role === 'ai' || m.role === 'assistant' ? 'assistant' : 'user') as 'user' | 'assistant',
+      content: m.text as string,
+    }))
+  const prior = turns.at(-1)?.role === 'user' ? turns.slice(0, -1) : turns
   const history: ModelMessage[] = [
-    {
-      role: 'system',
-      content: [
-        `You are ${agent.name} (${agent.handle}), ${agent.title}, speaking inside the Mupot Co-Pilot.`,
-        `The signed-in operator has role: ${authority}.`,
-        authority === 'member'
-          ? 'Do not claim you can take admin-only actions. Brief and draft only.'
-          : 'You may name admin-gated tools this operator can actually use.',
-        'Be concise. Do not invent deploy or merge outcomes.',
-      ].join(' '),
-    },
-    ...request.messages
-      .filter((m) => typeof m.text === 'string' && m.text.trim())
-      .slice(-8)
-      .map((m) => ({
-        role: (m.role === 'ai' || m.role === 'assistant' ? 'assistant' : 'user') as 'user' | 'assistant',
-        content: m.text as string,
-      })),
+    { role: 'system', content: cached.prefix },
+    ...prior,
+    { role: 'user', content: cached.suffix },
   ]
-  if (!history.some((m) => m.role === 'user')) {
-    history.push({ role: 'user', content: request.message })
-  }
   try {
     const text = await createModel(env).chat(history, { maxTokens: 512 })
     return text.trim() || undefined
@@ -497,6 +630,10 @@ const COPILOT_CSS = `
     padding: 14px 16px; border-bottom: 1px solid var(--border, #e7e9e7);
   }
   .mupot-copilot-toolbar-hint { margin: 0; color: var(--dim, #7a827d); font-size: 12px; }
+  .mupot-copilot-role-badge {
+    margin: 4px 0 0; font: 600 11px var(--font-mono, 'JetBrains Mono', ui-monospace, monospace);
+    color: var(--text2, #454c48);
+  }
   .copilot-page-host { min-height: 560px; height: calc(100vh - 260px); }
   [data-theme="dark"] .mupot-copilot-drawer {
     background: #161b22; color: #e6edf3; border-left-color: #2a3140;
@@ -529,7 +666,8 @@ const IMAGES = ${JSON.stringify(DEEP_CHAT_IMAGES)};
 const SPEECH = ${JSON.stringify(DEEP_CHAT_SPEECH)};
 const STYLE = ${JSON.stringify(DEEP_CHAT_STYLE)};
 const AGENTS = ${JSON.stringify(COPILOT_RECIPIENTS)};
-const STORE_KEY = 'mupot-copilot-recipient';
+const STORE_KEY = ${JSON.stringify(COPILOT_RECIPIENT_STORAGE_KEY)};
+const KEEP_ALIVE_MS = 180000;
 
 function agentById(id) {
   return AGENTS.find(function (a) { return a.id === id; }) || AGENTS[0];
@@ -537,7 +675,7 @@ function agentById(id) {
 
 function avatarDataUri(agent) {
   var svg = '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">'
-    + '<circle cx="32" cy="32" r="32" fill="' + agent.color + '"/>'
+    + '<circle cx="32" cy="32" r="32" fill="' + (agent.avatarColor || agent.color) + '"/>'
     + '<text x="32" y="41" text-anchor="middle" font-size="26" font-family="Hanken Grotesk,sans-serif" fill="#041016">'
     + agent.letter + '</text></svg>';
   return 'data:image/svg+xml;utf8,' + encodeURIComponent(svg);
@@ -621,13 +759,13 @@ function applyDeepChatTheme(chat, recipient) {
 
 function syncRecipient(id) {
   var agent = agentById(id);
-  try { sessionStorage.setItem(STORE_KEY, agent.id); } catch (e) {}
+  try { localStorage.setItem(STORE_KEY, agent.id); } catch (e) {}
   document.querySelectorAll('.mupot-copilot-recipient-select').forEach(function (sel) {
     sel.value = agent.id;
     var av = sel.parentElement && sel.parentElement.querySelector('[data-copilot-avatar]');
     if (av) {
       av.textContent = agent.letter;
-      av.style.background = agent.color;
+      av.style.background = agent.avatarColor || agent.color;
     }
   });
   document.querySelectorAll('deep-chat.mupot-deep-chat').forEach(function (chat) {
@@ -637,7 +775,7 @@ function syncRecipient(id) {
 
 function currentRecipient() {
   try {
-    return agentById(sessionStorage.getItem(STORE_KEY) || 'copilot').id;
+    return agentById(localStorage.getItem(STORE_KEY) || 'copilot').id;
   } catch (e) {
     return 'copilot';
   }
@@ -708,4 +846,15 @@ document.addEventListener('keydown', function (e) {
 syncRecipient(currentRecipient());
 new MutationObserver(function () { syncRecipient(currentRecipient()); })
   .observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+
+function keepAliveCache() {
+  fetch('/api/studio/chat/keepalive', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'X-Mupot-Recipient': currentRecipient() },
+    body: JSON.stringify({ recipient: currentRecipient() })
+  }).catch(function () {});
+}
+window.setInterval(keepAliveCache, KEEP_ALIVE_MS);
 `
+
+export const COPILOT_SCRIPT = COPILOT_BOOTSTRAP

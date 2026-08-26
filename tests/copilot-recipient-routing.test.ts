@@ -94,6 +94,7 @@ function sseFrames(text: string): Record<string, unknown>[] {
 
 const SELECTOR_HANDLES = [
   '@copilot',
+  '@river',
   '@loom',
   '@kasra',
   '@athena',
@@ -103,6 +104,7 @@ const SELECTOR_HANDLES = [
 
 const SELECTOR_TITLES = [
   'General Pot Assistant',
+  'Council Lead & Continuity',
   'Sprint Coordinator',
   'Server Builder & Runtime Operator',
   'Gatekeeper & Safety Reviewer',
@@ -168,6 +170,14 @@ describe('persona prompt builders', () => {
     expect(prompt).toMatch(/operator assistant/i)
   })
 
+  it('builds River as council lead and verification lead', () => {
+    const prompt = buildCopilotPersonaPrompt('river')
+    expect(prompt).toContain('River')
+    expect(prompt).toMatch(/council lead/i)
+    expect(prompt).toMatch(/verification lead/i)
+    expect(prompt).toMatch(/continuity/i)
+  })
+
   it('labels chat-turn badges with avatar and title', () => {
     expect(copilotRecipientBadge('loom')).toBe('🧶 Loom')
     expect(copilotRecipientBadge('kasra')).toBe('🔨 Kasra')
@@ -175,6 +185,7 @@ describe('persona prompt builders', () => {
     expect(copilotRecipientBadge('cursor-architect')).toBe('☁️ Cursor Architect')
     expect(copilotRecipientBadge('cursor-builder')).toBe('🛠️ Cursor Builder')
     expect(copilotRecipientBadge('copilot')).toBe('✨ Co-Pilot')
+    expect(copilotRecipientBadge('river')).toBe('🌊 River')
   })
 
   it('threads the recipient persona into the Studio system prompt', () => {
@@ -242,7 +253,8 @@ describe('recipient selector markup', () => {
     expectRecipientSelector(markup)
     expect(markup).toContain('id="mupot-copilot-page-recipient"')
     expect(markup).toContain('id="mupot-copilot-page"')
-    expect(COPILOT_RECIPIENTS).toHaveLength(6)
+    expect(COPILOT_RECIPIENTS).toHaveLength(7)
+    expect(markup).toContain('@river')
   })
 })
 
@@ -266,6 +278,7 @@ describe('POST /api/studio/chat recipient routing', () => {
       { recipient: 'athena', needle: /Athena|Gatekeeper|safety reviewer/i },
       { recipient: 'cursor-architect', needle: /Cursor Architect|architecture|repo planning/i },
       { recipient: 'cursor-builder', needle: /Cursor Builder|Cloud Implementer|implementation/i },
+      { recipient: 'river', needle: /River|Council Lead|Verification Lead/i },
     ]
     for (const row of cases) {
       const res = await dashboardApp.fetch(

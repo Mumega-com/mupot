@@ -1,0 +1,41 @@
+-- 0131_river_lead_agent.sql — River lead agent + 7-axis presence columns.
+--
+-- River is inserted only when squad-core already exists so the empty-schema
+-- test chain still leaves ZERO rows (tests/helpers-migrations.test.ts).
+-- Runtime / local seed uses src/agents/river-lead.ts#ensureRiverLeadAgent.
+
+ALTER TABLE presence ADD COLUMN seat TEXT;
+ALTER TABLE presence ADD COLUMN harness TEXT;
+ALTER TABLE presence ADD COLUMN machine TEXT;
+ALTER TABLE presence ADD COLUMN model TEXT;
+ALTER TABLE presence ADD COLUMN provider TEXT;
+ALTER TABLE presence ADD COLUMN effort TEXT;
+ALTER TABLE presence ADD COLUMN flight_id TEXT;
+
+INSERT INTO agents (
+  id,
+  squad_id,
+  slug,
+  name,
+  role,
+  model,
+  status,
+  purpose
+)
+SELECT
+  'river',
+  id,
+  'river',
+  'River',
+  'lead',
+  'gemini-3.7-flash',
+  'active',
+  'Council Lead & Autonomous Fleet Steering'
+FROM squads
+WHERE id = 'squad-core' OR slug = 'squad-core'
+LIMIT 1
+ON CONFLICT(id) DO UPDATE SET
+  role = excluded.role,
+  model = excluded.model,
+  purpose = excluded.purpose,
+  status = 'active';

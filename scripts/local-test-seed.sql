@@ -150,6 +150,32 @@ ON CONFLICT(id) DO UPDATE SET
   slug = excluded.slug,
   name = excluded.name;
 
+INSERT INTO departments (id, slug, name, created_at)
+VALUES ('dept-core', 'core', 'Council Core', datetime('now'))
+ON CONFLICT(id) DO UPDATE SET slug = excluded.slug, name = excluded.name;
+
+INSERT INTO squads (id, department_id, slug, name, created_at)
+VALUES ('squad-core', 'dept-core', 'squad-core', 'Squad Core', datetime('now'))
+ON CONFLICT(id) DO UPDATE SET
+  department_id = excluded.department_id,
+  slug = excluded.slug,
+  name = excluded.name;
+
+INSERT INTO agents (
+  id, squad_id, slug, name, role, model, status, purpose, created_at
+) VALUES (
+  'river', 'squad-core', 'river', 'River', 'lead', 'gemini-3.7-flash', 'active',
+  'Council Lead & Autonomous Fleet Steering', datetime('now')
+)
+ON CONFLICT(id) DO UPDATE SET
+  squad_id = excluded.squad_id,
+  slug = excluded.slug,
+  name = excluded.name,
+  role = excluded.role,
+  model = excluded.model,
+  purpose = excluded.purpose,
+  status = excluded.status;
+
 INSERT INTO projects (
   id, slug, name, description, goal, status, parent_project_id, target_date,
   repo_url, worker_name, live_url, assigned_squad_id, deploy_status, created_at, updated_at

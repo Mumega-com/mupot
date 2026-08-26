@@ -64,20 +64,19 @@ afterEach(() => {
 describe('shell() Co-Pilot chrome', () => {
   it('includes the floating launcher and slide-over drawer', async () => {
     const markup = String(await shell(env, 'Overview', html`<p>hi</p>`))
-    expect(markup).toContain('id="mupot-copilot-launcher"')
+    expect(markup).toContain('id="mupot-copilot-fab"')
     expect(markup).toContain('id="mupot-copilot-drawer"')
-    expect(markup).toContain('title="Co-Pilot"')
-    expect(markup).toContain('aria-label="Co-Pilot"')
+    expect(markup).toContain('title="Open Co-Pilot"')
+    expect(markup).toContain('aria-label="Mupot Co-Pilot"')
     expect(markup).toContain('Mupot Co-Pilot')
     expect(markup).toContain('✕')
     expect(markup).toContain('/api/studio/chat')
-    expect(markup).toContain('width: 420px')
-    expect(markup).toContain('z-index: 9999')
-    expect(markup).toContain('transition: transform 0.25s ease')
+    expect(markup).toContain('width: 440px')
+    expect(markup).toContain('z-index: 86')
     expect(markup).toContain('href="/copilot"')
-    expect(markup).toContain('<span class="nav-label">Co-Pilot</span>')
     expect(markup).toContain('[data-copilot-open]')
     expect(markup).toContain('window.mupotOpenCopilot')
+    expect(markup).toContain('@river')
   })
 
   it('renders the member role badge by default in the drawer', async () => {
@@ -96,11 +95,10 @@ describe('copilot render helpers', () => {
   it('renders the dedicated page interface', async () => {
     const markup = String(await copilotPageBody(actor({ role: 'admin' })))
     expect(markup).toContain('id="mupot-copilot-page"')
-    expect(markup).toContain('Mupot Co-Pilot')
     expect(markup).toContain('[ 🛡️ Admin ]')
     expect(markup).toContain('/api/studio/chat')
-    expect(markup).toContain('id="mupot-copilot-page-input"')
-    expect(markup).toContain('id="mupot-copilot-page-send"')
+    expect(markup).toContain('id="mupot-copilot-page-recipient"')
+    expect(markup).toContain('@river')
   })
 })
 
@@ -109,14 +107,13 @@ describe('GET /copilot', () => {
     const res = await dashboardApp.fetch(new Request('https://pot.test/copilot'), env)
     expect(res.status).toBe(200)
     const body = await res.text()
-    expect(body).toContain('Mupot Co-Pilot')
     expect(body).toContain('id="mupot-copilot-page"')
-    expect(body).toContain('id="mupot-copilot-launcher"')
+    expect(body).toContain('id="mupot-copilot-fab"')
     expect(body).toContain('id="mupot-copilot-drawer"')
-    expect(body).toContain('id="mupot-copilot-page-input"')
-    expect(body).toContain('data-copilot-send')
+    expect(body).toContain('id="mupot-copilot-page-recipient"')
     expect(body).toContain('/api/studio/chat')
     expect(body).toContain('[ 🛡️ Admin ]')
+    expect(body).toContain('@river')
   })
 
   it('redirects unauthenticated browsers to login', async () => {

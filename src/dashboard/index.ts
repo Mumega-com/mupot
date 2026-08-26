@@ -245,9 +245,11 @@ import {
   copilotDrawerCss,
   copilotPageBody,
   copilotShellEmbed,
+  normalizeCopilotRecipient,
   readStudioChatPayload,
   streamStudioChat,
 } from './copilot'
+import { keepAliveCacheSession } from '../ai/cache-context'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
@@ -1340,8 +1342,8 @@ dashboardApp.post('/api/studio/dispatch', async (c) => {
 })
 
 // GET /copilot and GET /chat — full-height Deep Chat card (session auth).
-dashboardApp.get('/copilot', async (c) => c.html(shell(c.env, 'Co-Pilot', copilotPageBody())))
-dashboardApp.get('/chat', async (c) => c.html(shell(c.env, 'Co-Pilot', copilotPageBody())))
+dashboardApp.get('/copilot', async (c) => c.html(shell(c.env, 'Co-Pilot', copilotPageBody(getAuthContext(c)))))
+dashboardApp.get('/chat', async (c) => c.html(shell(c.env, 'Co-Pilot', copilotPageBody(getAuthContext(c)))))
 
 // POST /api/studio/chat — Deep Chat SSE stream. Accepts { messages, recipient }
 // and the shorter { message, recipient } body. Authority is derived from the
@@ -1351,6 +1353,12 @@ dashboardApp.post('/api/studio/chat', async (c) => {
   const parsed = await readStudioChatPayload(c.req.raw)
   if (!parsed.ok) return c.json({ error: parsed.error }, parsed.status)
   return streamStudioChat(c.env, auth, parsed.value)
+})
+
+dashboardApp.post('/api/studio/chat/keepalive', async (c) => {
+  const auth = getAuthContext(c)
+  const recipient = normalizeCopilotRecipient(c.req.header('X-Mupot-Recipient'))
+  return c.json(keepAliveCacheSession(`copilot:${recipient}:${auth.tenant || c.env.TENANT_SLUG}`))
 })
 
 // ── radar (visual fleet + squad awareness — #21 slice 1, VIEW LAYER ONLY) ────

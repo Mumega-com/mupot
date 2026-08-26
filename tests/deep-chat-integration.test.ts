@@ -113,6 +113,7 @@ describe('Deep Chat markup', () => {
     expect(markup).toContain('@athena')
     expect(markup).toContain('@cursor-architect')
     expect(markup).toContain('@cursor-builder')
+    expect(markup).toContain('@river')
     expect(markup).toContain('✕')
     expect(markup).toContain('mupot-copilot-recipient-select')
     expect(markup).toContain('aria-label="Close Co-Pilot"')
@@ -142,6 +143,7 @@ describe('GET /copilot and GET /chat', () => {
     expect(body).toContain('@athena')
     expect(body).toContain('@cursor-architect')
     expect(body).toContain('@cursor-builder')
+    expect(body).toContain('@river')
     expect(body).toContain('unpkg.com/deep-chat@2.1.1')
   })
 

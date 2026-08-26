@@ -10,6 +10,7 @@ import { peekSessionAuth } from '../auth'
 import { isOrgAdmin, resolveCapabilities } from '../auth/capability'
 import { bearerToken, resolveMemberByToken } from '../auth/member-bearer'
 import { createModel } from '../model'
+import { formatCachedPrompt, keepAliveCacheSession } from '../ai/cache-context'
 import type { AuthContext, Env, ModelMessage } from '../types'
 import {
   buildCopilotPersonaPrompt,
@@ -193,15 +194,21 @@ export function buildStudioChatSystemPrompt(
         'Help with questions, drafts, and explanations only. Point the operator at an admin if they need a mutation.',
       ].join(' ')
 
-  return [
-    persona,
-    `Speaking as ${def.badge} (${def.handle} — ${def.title}).`,
-    `Tenant: ${authority.tenant}. Operator: ${authority.operator} (${authority.guest ? 'guest' : authority.source}).`,
-    `Active squads: ${squads}.`,
-    `Authority: ${authority.role}. Tools: ${tools}.`,
-    scope,
-    'Stay concise. Speak as a colleague who knows this pot, its squads, and the land gate (Athena + Kasra).',
-  ].join('\n')
+  return formatCachedPrompt({
+    userMessage: '(see conversation turns)',
+    persona: [
+      persona,
+      `Speaking as ${def.badge} (${def.handle} — ${def.title}).`,
+      `Authority: ${authority.role}. Tools: ${tools}.`,
+      scope,
+      'Stay concise. Speak as a colleague who knows this pot, its squads, and the land gate (Athena + Kasra).',
+    ].join('\n'),
+    recipient: def.id,
+    operator: `${authority.operator} (${authority.guest ? 'guest' : authority.source})`,
+    operatorRole: authority.role,
+    tenant: authority.tenant,
+    squads: context.squads,
+  }).prompt
 }
 
 export function parseStudioChatInput(body: unknown):
@@ -395,6 +402,7 @@ export async function streamStudioChat(
   recipient: CopilotRecipientId = 'copilot',
 ): Promise<ReadableStream<Uint8Array>> {
   const context = await loadStudioChatContext(env)
+  keepAliveCacheSession(`studio:${recipient}:${authority.tenant}`)
   const system = buildStudioChatSystemPrompt(authority, context, recipient)
   const messages: ModelMessage[] = [
     { role: 'system', content: system },

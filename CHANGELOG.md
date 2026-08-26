@@ -2,6 +2,11 @@
 
 ## 2026-08-26
 
+- **River lead agent onboarding, Co-Pilot routing, and warm-cache prompts** (`src/dashboard/copilot.ts`, `src/ai/cache-context.ts`, `migrations/0131_river_lead_agent.sql`).
+  - `@river` is a first-class Co-Pilot recipient (cyan, Council Lead & Continuity) on `/copilot`, the global drawer, and `/projects/:id` sandbox studio.
+  - Model prompts use a frozen static prefix (charter, architecture, tool schemas, River governance) with dynamic turns at the bottom, plus a keep-alive heartbeat.
+  - D1 registers River on `squad-core` (`gemini-3.7-flash`) when that squad exists; `check_in` records 7-axis presence for `seat: river-cursor`.
+
 - **1-click project worker provisioner & sandbox studio** (`src/projects/provisioner.ts`, `src/dashboard/projects.ts`, `src/platform/routes.ts`).
   - `/projects` ships a `[ + New Project Worker ]` modal (name, auto-slug, GitHub repo, template, worker name, `https://<slug>.mupot.mumega.com` preview, squad default `squad-cursor`).
   - `POST /api/projects` stays admin-gated (`isOrgAdmin` + workspace admin floor), seeds `deploy_status: "idle"`, and returns `{ ok: true, project, redirect_url }`.
