@@ -1115,6 +1115,30 @@ export type SendToRefResult =
       detail?: string
     }
 
+// Case (a) visibility: home squad OR guest membership on a squad the sender can observe.
+// #392 confined send to the recipient HOME squad only. That made guest members of a
+// shared flight squad (muvps-loom is lead on hadi-mac, home 813ca010) roster-visible
+// but unreachable — send_target_not_visible. Shared membership is the same authority
+// as joining the squad; it does not widen to tenant-wide send. Non-admin failures still
+// collapse to send_target_not_visible (no existence oracle).
+async function recipientVisibleOnSenderSquads(
+  env: Env,
+  grants: CapabilityGrant[],
+  recipient: { id: string; squad_id: string },
+): Promise<boolean> {
+  if (await canOnSquad(env, grants, recipient.squad_id, 'observer')) return true
+  const rows = await env.DB.prepare('SELECT squad_id FROM memberships WHERE agent_id = ?1')
+    .bind(recipient.id)
+    .all<{ squad_id: string }>()
+  const seen = new Set<string>([recipient.squad_id])
+  for (const row of rows.results ?? []) {
+    if (!row.squad_id || seen.has(row.squad_id)) continue
+    seen.add(row.squad_id)
+    if (await canOnSquad(env, grants, row.squad_id, 'observer')) return true
+  }
+  return false
+}
+
 // ── resolveVisibleSendTarget — the authorized pre-send visibility primitive ────────────
 // Oracle-close repair (P0 fix-forward on PR #868/e117832, Loom's gate finding): the
 // central-command mention-rate-wall charge (src/channels/index.ts dispatchMention) used to
@@ -1125,13 +1149,13 @@ export type SendToRefResult =
 // enumeration oracle, same class as BLOCK-3 above, reintroduced through the budget side-channel.
 //
 // This is CASE (a) of sendToRef's own gate below — resolveAgentRef, then (for a non-admin)
-// canOnSquad ≥observer — factored out so a pre-send caller (e.g. a rate-limit charge gate) can
-// ask "is this ref a REAL, VISIBLE-TO-THIS-CALLER recipient" using the EXACT SAME check
-// sendToRef applies before it will ever touch sendAgentMessage, rather than reimplementing (and
-// risking drift from) that logic. Any non-admin failure mode — doesn't resolve, resolves
-// ambiguously, resolves but isn't squad-visible — collapses to the same 'send_target_not_visible'
-// so nothing downstream of this primitive (a charge, a log line, a timing difference) can leak
-// which case occurred.
+// recipientVisibleOnSenderSquads — factored out so a pre-send caller (e.g. a rate-limit charge
+// gate) can ask "is this ref a REAL, VISIBLE-TO-THIS-CALLER recipient" using the EXACT SAME
+// check sendToRef applies before it will ever touch sendAgentMessage, rather than
+// reimplementing (and risking drift from) that logic. Any non-admin failure mode — doesn't
+// resolve, resolves ambiguously, resolves but isn't squad-visible — collapses to the same
+// 'send_target_not_visible' so nothing downstream of this primitive (a charge, a log line, a
+// timing difference) can leak which case occurred.
 //
 // Deliberately does NOT implement sendToRef's case (b) projectId fallback: that fallback is only
 // authoritative via sendAgentMessage's own project-access check (validateMessageProjectAccess),
@@ -1155,7 +1179,7 @@ export async function resolveVisibleSendTarget(
     return { ok: false, reason: resolved.reason === 'ambiguous' ? 'recipient_ambiguous' : 'recipient_not_found' }
   }
   if (authz.isAdmin) return { ok: true, value: resolved.value }
-  const squadVisible = await canOnSquad(env, authz.grants, resolved.value.squad_id, 'observer')
+  const squadVisible = await recipientVisibleOnSenderSquads(env, authz.grants, resolved.value)
   if (!squadVisible) return { ok: false, reason: 'send_target_not_visible' }
   return { ok: true, value: resolved.value }
 }
@@ -1187,7 +1211,7 @@ export async function sendToRef(
   // we're in the non-admin path.
   let squadVisible = true
   if (!authz.isAdmin) {
-    squadVisible = await canOnSquad(env, authz.grants, resolved.value.squad_id, 'observer')
+    squadVisible = await recipientVisibleOnSenderSquads(env, authz.grants, resolved.value)
     // Case (a) failed. Case (b) can only save it if a projectId is attached — otherwise there
     // is no other authorization surface to consult, so refuse now, before ever calling
     // sendAgentMessage (no DB write attempted, no existence oracle for the target).

@@ -114,6 +114,42 @@ describe('sendToRef — gate 1 send-target confinement (#392)', () => {
     }
   })
 
+  it('case (a): guest membership on a squad the sender can observe is visible (shared flight squad)', async () => {
+    const { db, close, sqlite } = migratedDb()
+    try {
+      sqlite.exec(`
+        INSERT INTO memberships (id, agent_id, squad_id, capability)
+        VALUES ('membership-target-guest', 'agent-target', 'squad-sender', 'member');
+      `)
+      const res = await sendToRef(
+        envWith(db),
+        { ...baseInput, toRef: 'agent-target' },
+        NON_ADMIN(grant('squad-sender')),
+      )
+      expect(res).toMatchObject({ ok: true, toAgent: 'agent-target' })
+    } finally {
+      close()
+    }
+  })
+
+  it('guest membership does not leak: a grant on an unrelated squad still cannot reach a guest of a different squad', async () => {
+    const { db, close, sqlite } = migratedDb()
+    try {
+      sqlite.exec(`
+        INSERT INTO memberships (id, agent_id, squad_id, capability)
+        VALUES ('membership-target-guest-2', 'agent-target', 'squad-sender', 'member');
+      `)
+      const res = await sendToRef(
+        envWith(db),
+        { ...baseInput, toRef: 'agent-target' },
+        NON_ADMIN(grant('squad-other')),
+      )
+      expect(res).toEqual({ ok: false, reason: 'send_target_not_visible' })
+    } finally {
+      close()
+    }
+  })
+
   it('non-leaking: a non-existent ref returns the SAME reason as a real-but-invisible agent', async () => {
     const { db, close } = migratedDb()
     try {
