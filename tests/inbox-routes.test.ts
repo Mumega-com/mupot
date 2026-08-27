@@ -134,6 +134,9 @@ function makeDb(
       const [ref] = b as [string]
       return agents.filter((a) => a.slug === ref)
     }
+    if (sql.includes('SELECT squad_id FROM memberships WHERE agent_id = ?1')) {
+      return []
+    }
     throw new Error('unhandled all: ' + sql)
   }
   function runSigned(sql: string, b: unknown[]) {
