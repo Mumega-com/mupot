@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-08-28
+
+- **Journey 1: Sovereign Edge Core & Continuum Intelligence** (Flights WFP-04, A2A-01, MEM-01, ID-03, SEC-02, MSG-01, EXEC-02, DELIV-03, FLIGHT-003, FLIGHT-004, FLIGHT-005, FLIGHT-ROUTER, FLIGHT-ROUTER-CRON, FLIGHT-002, FLIGHT-METER, FLIGHT-UNTRUSTED, FLIGHT-LOOP-UNHOLD, FLIGHT-IDENTITY-UNIFIED; PR #1236).
+  - **Edge-Native Active Router & Scheduled Cron**: Replaced VPS Python scripts with serverless `src/router/engine.ts` and `src/router/scheduled.ts` running in Cloudflare `workerd` on 5-minute scheduled crons.
+  - **Unified Principals & Token-Scoped Grants (#584)**: Migration `0140_token_grants_and_project_rbac.sql` establishing `token_grants` with `project` scope and least-privilege intersection math $\text{effective} = \text{intersect}(\text{principal}, \text{token\_grants})$.
+  - **Native In-Pot 2FA & Action-Hash Approvals (#725)**: Migration `0137_native_2fa_and_action_approvals.sql` creating single-use, action-hash-bound approval nonces and immutable receipts.
+  - **D1 Constitutional Governance Protocols (MU.100.001 / #723)**: Migration `0138_governance_consensus_and_ratification.sql` establishing durable proposals, single-vote terminal state guards, and SHA-256 document checksum binding.
+  - **Thread-Bound Delivery Turn Fencing & Leases (#1031, #1050)**: Migration `0136_delivery_turn_fencing_and_presence_leases.sql` binding delivery consumption strictly to `{threadId, turnId, generation, correlation, nonce_hash}`.
+  - **Unified Execution & Spend Metering (F8)**: Built `src/metering/service.ts` with `checkAndReserveExecution` pre-flight hard budget stop brakes.
+  - **Structural Ingress & Untrusted-Content Fencing (F6)**: Built `src/ingress/guards.ts` with `wrapIngressContent()` and `assertDirectiveAuthority()`.
+  - **Governed Autonomous Loop Driver**: Built `src/loops/driver.ts` running autonomous goal-seeking cycles under propose-only `/approvals` boundaries.
+
+- **Mupot OS & Device Fleet Control Architecture Specification** (`docs/architecture/mupot-os-device-fleet-architecture.md`, `ROADMAP.md`).
+  - Canonical specification `MU.200.001-DEVICE-OS` establishing the cloud-brain / physical-muscle architecture for Mupot OS appliances (Mac Mini, Linux workstations, Raspberry Pis).
+  - Defined Hardware Attestation & Device Pairing QR protocols, 7-axis device presence, local sandboxed execution (Apple MLX / Docker), and local peripheral capability gates.
+  - Introduced the **Journey Roadmap** framework in `ROADMAP.md` grouping discrete flights into strategic capability horizons.
+
 ## 2026-08-26
 
 - **River lead agent onboarding, Co-Pilot routing, and warm-cache prompts** (`src/dashboard/copilot.ts`, `src/ai/cache-context.ts`, `migrations/0131_river_lead_agent.sql`).

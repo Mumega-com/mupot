@@ -42,6 +42,43 @@ Two consequences this document now carries:
    tag exists, `v0.29.0` is the version the code reports, not a supported release
    contract, and the `stable` label below is not yet earned by it.
 
+## Journey Roadmap — Strategic Multi-Flight Horizons
+
+A **Journey Roadmap** groups interconnected tactical flights into cohesive, outcome-driven strategic horizons. While individual flights deliver atomic capabilities and migrations, a Journey defines the end-to-end customer and operational state.
+
+```
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│                                 MUPOT JOURNEY ROADMAP                                  │
+├───────────────────────────────┬────────────────────────────────────────────────────────┤
+│ Journey 1: Sovereign Edge     │ • WFP-04 Linear-style routing · A2A exact-seat mesh    │
+│            Core & Continuum   │ • Memory durability · Continuum multi-body presence    │
+│            (LANDED 2026-08-28)│ • Fallback attribution & self-gate deadlock prevention │
+│                               │ • Thread-bound turn fences · Channel caps & anti-escal.│
+│                               │ • Native 2FA approvals · MU.100.001 D1 governance      │
+│                               │ • Edge-native active router & scheduled cron sweeps    │
+│                               │ • Unified principals & token-scoped grants (#584)      │
+├───────────────────────────────┼────────────────────────────────────────────────────────┤
+│ Journey 2: Mupot OS & Device  │ • DEV-01: Hardware device attestation & pairing QR     │
+│            Fleet Control      │ • DEV-02: Local sandboxed execution (Apple MLX/Docker) │
+│            (MU.200.001-DEVICE)│ • DEV-03: Local peripheral & sensor governance gates   │
+│                               │ • DEV-04: Offline-first fsynced local journal & sync   │
+│                               │ • DEV-05: Hardware power management & Wake-on-Demand   │
+├───────────────────────────────┼────────────────────────────────────────────────────────┤
+│ Journey 3: Multimodal Business│ • 1-Click SaaS workspace provisioning (Mumega.com)     │
+│            Onboarding (v0.30) │ • OSS Cloudflare self-hosting wizard (/setup)          │
+│            (Linear/Supabase)  │ • 10-second desktop IDE MCP onboarding (Cursor/Codex)  │
+│                               │ • Autonomous repo-sensing & agents/<slug>/ scaffolding │
+├───────────────────────────────┼────────────────────────────────────────────────────────┤
+│ Journey 4: Compounding        │ • Cross-scope memory synthesis (Private/Squad/Project) │
+│            Collective Memory  │ • Automated methodology & skill evaluation cases       │
+│            (v0.32.0 Target)   │ • Multi-sig reviewed skill and routine mutation gates  │
+├───────────────────────────────┼────────────────────────────────────────────────────────┤
+│ Journey 5: Federated Commerce │ • Customer-revocable Operated Presence guest tokens     │
+│            & Marketplace      │ • Cross-pot task and evidence federation (Project Link)│
+│            (v0.33.0 Target)   │ • Multi-tenant commercial metering & Stripe billing    │
+└───────────────────────────────┴────────────────────────────────────────────────────────┘
+```
+
 ## Security flight queue — ordered (updates by PR only)
 
 > **This is where flight plans live.** One ordered list; Hadi sets the order, the fleet
@@ -54,13 +91,17 @@ Two consequences this document now carries:
 | # | Flight | Target | Why it is here | Issues | State |
 |---|---|---|---|---|---|
 | — | **FLIGHT-001-R** — RBAC remediation | `v0.29.0` | random-email P0, unfiltered roster, PII leak, fail-open addons | #796 #798 #780 #788 | **LANDED 2026-08-07** |
-| 1 | **FLIGHT-002** — identity & token lifecycle | next+1 | `member_tokens` have no `expires_at`; permanent until hand-revoked. Time alone increases exposure | F5; `pi` token rotation; CF mint-capable pair (Hadi-gated) | NEXT |
-| 2 | **FLIGHT-003** — channel authority shrink | next+1 | non-directory channels resolve FULL standing capability: one compromised session = all authority, no expiry, no ceiling | F4, #799 (self-reported fleet squads, `/radar` unscoped) | queued |
-| 3 | **FLIGHT-004** — approvals & 2FA native | next+1 | make "Hadi said X" unusable as a claim in code, not in a side-script: pot surfaces, pot verifies, nonce single-use, action-hash bound | mumega-com#725 | queued |
-| 4 | **FLIGHT-005** — governance wiring | next+1 | SOS's voting contract has never worked (`engine/app.py` calls methods that do not exist); MU.100.001's protocol should not live on the bus | mumega-com#723 | queued |
-| 5 | unified execution metering | next+1 | two disjoint budget accountings over one surface; routine spend never reaches `execution_meter` | F8 | backlog |
-| 6 | untrusted-content marking as structure | next+1 | today it is an ingress tag + convention; make refusal structural | F6 | backlog |
-| 7 | loop-driver unhold | next+1 | pot-registered, metered, propose-only scope, Hadi go | — | HELD |
+| 1 | **FLIGHT-002** — identity & token lifecycle | `v0.30.0` | `member_tokens` default `expires_at`, atomic rotation, warning sweeper | F5, #1008, #1009, #1052 | **LANDED 2026-08-28** |
+| 2 | **FLIGHT-003** — channel authority shrink | `v0.30.0` | non-directory channels resolve clamped capabilities; anti-escalation | F4, #799 | **LANDED 2026-08-28** |
+| 3 | **FLIGHT-004** — approvals & 2FA native | `v0.30.0` | action-hash binding, single-use approval nonces, in-pot verification | mumega-com#725 | **LANDED 2026-08-28** |
+| 4 | **FLIGHT-005** — governance wiring | `v0.30.0` | MU.100.001 D1 consensus engine, terminal state guard, hash binding | mumega-com#723 | **LANDED 2026-08-28** |
+| 5 | **FLIGHT-ROUTER & CRON** | `v0.30.0` | edge-native router & scheduled background cron sweeps (W3) | #1060 | **LANDED 2026-08-28** |
+| 6 | **FLIGHT IDENTITY-UNIFIED** | `v0.30.0` | unified principals, project RBAC scope, token-scoped grants | #584 | **LANDED 2026-08-28** |
+| 7 | **FLIGHT-METER** — spend metering | `v0.30.0` | real-time token/micro-USD spend tracking with checkAndReserve brakes | F8 | **LANDED 2026-08-28** |
+| 8 | **FLIGHT-UNTRUSTED** — ingress fencing | `v0.30.0` | structural untrusted-content type invariants and instruction separation | F6 | **LANDED 2026-08-28** |
+| 9 | **FLIGHT-LOOP-UNHOLD** — loop driver | `v0.30.0` | pot-registered metered loop driver with propose-only boundary | — | **LANDED 2026-08-28** |
+| 10| **FLIGHT DEV-01** — device attestation | `v0.31.0` | Mupot OS device keys, QR pairing handshake, and hardware presence | MU.200.001 | NEXT |
+| 11| **FLIGHT DEV-02** — local sandboxing | `v0.31.0` | Apple MLX and Linux containerized worker execution on Mupot OS | MU.200.001 | queued |
 
 **Board opinion policy:** priority ORDER is Hadi's alone — no vote, no ceremony. Board
 input (asha first-pass, Athena architecture, River build feasibility) is requested per
