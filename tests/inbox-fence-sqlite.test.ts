@@ -30,6 +30,7 @@ function fixture() {
     INSERT INTO agents(id) VALUES ('agent-a');
   `)
   harness.sqlite.exec(readFileSync(new URL('../migrations/0058_agent_inbox_fences.sql', import.meta.url), 'utf8'))
+  harness.sqlite.exec(readFileSync(new URL('../migrations/0136_agent_message_integrity.sql', import.meta.url), 'utf8'))
   const env = { TENANT_SLUG: 'tenant-a', DB: harness.db } as unknown as Env
   const seed = (id: string) => harness.sqlite.exec(`
     INSERT INTO agent_messages

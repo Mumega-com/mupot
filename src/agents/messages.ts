@@ -18,6 +18,7 @@ import type { Env, CapabilityGrant, MessageCreatedPayload } from '../types'
 import { createBus } from '../bus'
 import { resolveAgentRef } from '../org/resolve'
 import { canOnSquad } from '../auth/capability'
+import { sha256Hex } from '../lib/canonical-json'
 
 // ── tunables ────────────────────────────────────────────────────────────────────────────
 const MAX_BODY_CHARS = 8000
@@ -65,6 +66,30 @@ export interface InboxMessage {
   created_at: string
   project_id: string | null
   target_seat?: string | null
+  body_length: number | null
+  checksum_sha256: string | null
+  is_intact: boolean | null
+}
+
+async function annotateMessageIntegrity(messages: InboxMessage[]): Promise<void> {
+  for (const message of messages) {
+    const storedLength = typeof message.body_length === 'number'
+      && Number.isInteger(message.body_length)
+      && message.body_length >= 0
+      ? message.body_length
+      : null
+    const storedChecksum = typeof message.checksum_sha256 === 'string'
+      && /^[0-9a-f]{64}$/.test(message.checksum_sha256)
+      ? message.checksum_sha256
+      : null
+
+    message.body_length = storedLength
+    message.checksum_sha256 = storedChecksum
+    message.is_intact = storedLength === null || storedChecksum === null
+      ? null
+      : message.body.length === storedLength
+        && await sha256Hex(message.body) === storedChecksum
+  }
 }
 
 export interface InboxResult {
@@ -229,6 +254,8 @@ export async function sendAgentMessage(
   const maxUnread = opts.maxUnread ?? MAX_UNREAD_PER_RECIPIENT
   const id = idGen()
   const createdAt = now()
+  const bodyLength = input.body.length
+  const bodyChecksum = await sha256Hex(input.body)
   try {
     const values = [
       id,
@@ -244,16 +271,18 @@ export async function sendAgentMessage(
       maxUnread,
       input.projectId ?? null,
       input.targetSeat ?? null,
+      bodyLength,
+      bodyChecksum,
     ]
     const result = routineFence
       ? await env.DB.prepare(
-        `INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id, target_seat)
-              SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?12, ?13
+        `INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id, target_seat, body_length, checksum_sha256)
+              SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?12, ?13, ?14, ?15
                WHERE (SELECT COUNT(*) FROM agent_messages
                        WHERE tenant = ?2 AND to_agent = ?3 AND read_at IS NULL) < ?11
                  AND EXISTS (
                    SELECT 1 FROM routine_runs rr
-                    WHERE rr.id = ?14 AND rr.tenant = ?2 AND rr.project_id = ?12
+                    WHERE rr.id = ?16 AND rr.tenant = ?2 AND rr.project_id = ?12
                       AND rr.status = 'observing'
                       AND NOT EXISTS (
                         SELECT 1 FROM routine_run_events requested
@@ -263,8 +292,8 @@ export async function sendAgentMessage(
                  )`,
       ).bind(...values, routineFence.runId).run()
       : await env.DB.prepare(
-        `INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id, target_seat)
-              SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?12, ?13
+        `INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id, target_seat, body_length, checksum_sha256)
+              SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?12, ?13, ?14, ?15
                WHERE (SELECT COUNT(*) FROM agent_messages
                        WHERE tenant = ?2 AND to_agent = ?3 AND read_at IS NULL) < ?11`,
       ).bind(...values).run()
@@ -438,7 +467,7 @@ async function readAgentInboxForReader(
 
   const targetSeat = typeof input.seat === 'string' && input.seat.trim().length > 0 ? input.seat.trim() : null
 
-  const cols = 'seq, id, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id, target_seat'
+  const cols = 'seq, id, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id, target_seat, body_length, checksum_sha256'
   try {
     let messages: InboxMessage[]
     if (peek) {
@@ -564,6 +593,7 @@ async function readAgentInboxForReader(
     for (const m of messages) m.seq = Number(m.seq)
     for (const m of messages) m.project_id = m.project_id ?? null
     for (const m of messages) m.target_seat = m.target_seat ?? null
+    await annotateMessageIntegrity(messages)
     return { ok: true, messages, remaining }
   } catch (err) {
     return { ok: false, reason: 'db_error', detail: err instanceof Error ? err.message : String(err) }
@@ -672,7 +702,7 @@ export type AckFailure = {
 }
 
 const LEASE_COLS =
-  'seq, id, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id, delivery_attempts, lease_expires_at, target_seat'
+  'seq, id, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id, delivery_attempts, lease_expires_at, target_seat, body_length, checksum_sha256'
 
 /** The bearer half of the 0058 consumer fence, written once so lease/ack/dead-letter cannot
  *  drift from the predicate readAgentInboxForReader enforces. `?N` numbering is caller-chosen
@@ -776,6 +806,7 @@ export async function leaseAgentInbox(
       m.project_id = m.project_id ?? null
       m.target_seat = m.target_seat ?? null
     }
+    await annotateMessageIntegrity(messages)
 
     // Post-check, mirroring readAgentInboxForReader. The pre-check above is NOT the fence —
     // it cannot be, because a fence flip between it and the UPDATE would slip through. The
@@ -917,7 +948,8 @@ export async function listDeadLetteredMessages(
     // the flip exists to withhold.
     const rows = await env.DB.prepare(
       `SELECT seq, id, from_agent, from_member, kind, body, request_id, in_reply_to, created_at,
-              project_id, delivery_attempts, dead_lettered_at, dead_letter_reason, target_seat
+              project_id, delivery_attempts, dead_lettered_at, dead_letter_reason, target_seat,
+              body_length, checksum_sha256
          FROM agent_messages
         WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL AND dead_lettered_at IS NOT NULL
           AND ${bearerFencePredicate('?1', '?2')}
@@ -930,6 +962,7 @@ export async function listDeadLetteredMessages(
       m.project_id = m.project_id ?? null
       m.target_seat = m.target_seat ?? null
     }
+    await annotateMessageIntegrity(messages)
 
     if (messages.length === 0 && await bearerFenceBlocks(env, tenant, input.agent)) {
       return { ok: false, reason: 'consumer_fenced' }
