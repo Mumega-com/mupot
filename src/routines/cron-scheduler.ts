@@ -33,7 +33,7 @@ export async function evaluateAndDispatchDueRoutines(
   let rows: Routine[] = []
   try {
     const result = await env.DB.prepare(`
-      SELECT * FROM project_routines
+      SELECT * FROM routines
        WHERE tenant = ?1
          AND status = 'enabled'
          AND next_run_at IS NOT NULL
@@ -67,7 +67,7 @@ export async function evaluateAndDispatchDueRoutines(
 
       // 2. Check if a run for this occurrence already exists (idempotency guard)
       const existing = await env.DB.prepare(`
-        SELECT id FROM project_routine_runs
+        SELECT id FROM routine_runs
          WHERE routine_id = ?1 AND occurrence_key = ?2
          LIMIT 1
       `)
@@ -103,15 +103,19 @@ export async function evaluateAndDispatchDueRoutines(
         .run()
 
       // 4. Record routine run
+      const policyJson = JSON.stringify({
+        objective: routine.objective,
+        execution_mode: routine.execution_mode,
+        budget_micro_usd: routine.budget_micro_usd || 0,
+      })
+
       await env.DB.prepare(`
-        INSERT INTO project_routine_runs (
-          id, tenant, project_id, routine_id, status, run_type,
-          trigger_kind, occurrence_key, scheduled_for, created_at, updated_at,
-          task_id, assigned_squad_id, executed_by_agent_id, attempt_count
+        INSERT INTO routine_runs (
+          id, tenant, project_id, routine_id, routine_revision, policy_json,
+          status, trigger_kind, occurrence_key, scheduled_for, created_at
         ) VALUES (
-          ?1, ?2, ?3, ?4, 'queued', 'scheduled',
-          ?5, ?6, ?7, ?8, ?8,
-          ?9, ?10, ?11, 1
+          ?1, ?2, ?3, ?4, 1, ?5,
+          'queued', ?6, ?7, ?8, ?9
         )
       `)
         .bind(
@@ -119,13 +123,11 @@ export async function evaluateAndDispatchDueRoutines(
           env.TENANT_SLUG,
           routine.project_id,
           routine.id,
+          policyJson,
           routine.trigger_kind,
           occurrenceKey,
           routine.next_run_at,
           nowIso,
-          taskId,
-          routine.responsible_squad_id,
-          routine.preferred_agent_id || null,
         )
         .run()
 
@@ -135,16 +137,13 @@ export async function evaluateAndDispatchDueRoutines(
       const newStatus = newNextRunAt ? 'enabled' : 'completed'
 
       await env.DB.prepare(`
-        UPDATE project_routines
-           SET occurrence_count = occurrence_count + 1,
-               last_run_at = ?1,
-               next_run_at = ?2,
-               status = ?3,
-               updated_at = ?4
-         WHERE id = ?5 AND tenant = ?6
+        UPDATE routines
+           SET next_run_at = ?1,
+               status = ?2,
+               updated_at = ?3
+         WHERE id = ?4 AND tenant = ?5
       `)
         .bind(
-          nowIso,
           newNextRunAt,
           newStatus,
           nowIso,

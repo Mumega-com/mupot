@@ -179,6 +179,188 @@ export async function listSovereignPots(
   }))
 }
 
+export const DEFAULT_SOVEREIGN_WORKER_SCRIPT = `
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    const tenant = env.TENANT_SLUG || 'sovereign';
+    const brand = env.BRAND || tenant.toUpperCase();
+    const publicOrigin = env.PUBLIC_ORIGIN || url.origin;
+
+    // Health check endpoint
+    if (url.pathname === '/health' || url.pathname === '/api/health') {
+      let dbOk = false;
+      try {
+        if (env.DB) {
+          const res = await env.DB.prepare("SELECT 1 as alive").first();
+          dbOk = !!res?.alive;
+        }
+      } catch (e) {
+        dbOk = false;
+      }
+
+      return new Response(JSON.stringify({
+        ok: true,
+        status: 'healthy',
+        tenant,
+        brand,
+        isolated: true,
+        storage: { d1: dbOk, kv: !!env.SESSIONS },
+        public_origin: publicOrigin,
+        timestamp: new Date().toISOString()
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json', 'x-mupot-tenant': tenant }
+      });
+    }
+
+    // Studio / Dashboard view
+    if (url.pathname === '/' || url.pathname.startsWith('/studio') || url.pathname.startsWith('/copilot') || url.pathname.startsWith('/tasks')) {
+      const html = \`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>\${brand} · Sovereign Pot</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #09090b; color: #f4f4f5; margin: 0; padding: 32px; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; box-sizing: border-box; }
+    .container { max-width: 600px; width: 100%; background: #18181b; border: 1px solid #27272a; border-radius: 16px; padding: 36px; box-shadow: 0 25px 50px -12px rgba(0,0,0,0.5); }
+    .badge { display: inline-flex; align-items: center; gap: 6px; background: #064e3b; color: #34d399; font-size: 12px; font-weight: 600; padding: 4px 12px; border-radius: 9999px; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 20px; }
+    .dot { width: 8px; height: 8px; background: #34d399; border-radius: 50%; }
+    h1 { font-size: 28px; font-weight: 700; margin: 0 0 12px 0; color: #ffffff; }
+    p { font-size: 15px; line-height: 1.6; color: #a1a1aa; margin: 0 0 24px 0; }
+    .meta-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 24px; }
+    .meta-card { background: #121214; border: 1px solid #27272a; border-radius: 8px; padding: 12px 16px; }
+    .meta-label { font-size: 12px; color: #71717a; text-transform: uppercase; margin-bottom: 4px; }
+    .meta-value { font-size: 14px; font-weight: 600; color: #38bdf8; font-family: ui-monospace, monospace; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="badge"><div class="dot"></div>Sovereign Cloudflare Isolate</div>
+    <h1>\${brand}</h1>
+    <p>Dedicated autonomous agent control plane operating with isolated V8 runtime and private D1 storage.</p>
+    <div class="meta-grid">
+      <div class="meta-card"><div class="meta-label">Tenant Slug</div><div class="meta-value">\${tenant}</div></div>
+      <div class="meta-card"><div class="meta-label">Namespace</div><div class="meta-value">mupot-pots</div></div>
+      <div class="meta-card"><div class="meta-label">D1 Database</div><div class="meta-value">Dedicated</div></div>
+      <div class="meta-card"><div class="meta-label">KV Cache</div><div class="meta-value">Dedicated</div></div>
+    </div>
+  </div>
+</body>
+</html>\`;
+      return new Response(html, {
+        status: 200,
+        headers: { 'content-type': 'text/html; charset=utf-8', 'x-mupot-tenant': tenant }
+      });
+    }
+
+    // Default API / JSON response
+    return new Response(JSON.stringify({
+      ok: true,
+      tenant,
+      brand,
+      path: url.pathname,
+      message: 'Sovereign Pot User Worker Active',
+      timestamp: new Date().toISOString()
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json', 'x-mupot-tenant': tenant }
+    });
+  }
+};
+`
+
+export async function applyMigrationsToD1Database(
+  cf: CloudflareApiConfig,
+  databaseId: string,
+  migrationSqlList: string[],
+): Promise<{ applied: number; success: boolean }> {
+  let applied = 0
+  for (const sql of migrationSqlList) {
+    if (!sql || !sql.trim()) continue
+    await executeD1Query(cf, databaseId, sql)
+    applied++
+  }
+  return { applied, success: true }
+}
+
+export interface SovereignSeedOptions {
+  tenantSlug: string
+  brandName: string
+  adminEmail: string
+  adminMemberId: string
+  adminToken: string
+  leadAgentId: string
+  leadAgentName: string
+  leadAgentToken: string
+}
+
+export async function seedSovereignPotD1(
+  cf: CloudflareApiConfig,
+  databaseId: string,
+  opts: SovereignSeedOptions,
+): Promise<{ seeded: boolean }> {
+  const deptId = `dept-${opts.tenantSlug}-core`
+  const squadId = `squad-${opts.tenantSlug}-core`
+  const projId = `proj-${opts.tenantSlug}-main`
+  const adminTokenId = crypto.randomUUID()
+  const agentTokenId = crypto.randomUUID()
+
+  // Compute sha256 of admin & lead agent tokens for member_tokens / agent_keys table
+  const adminHashBuf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(opts.adminToken))
+  const adminHash = Array.from(new Uint8Array(adminHashBuf)).map((b) => b.toString(16).padStart(2, '0')).join('')
+  const agentHashBuf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(opts.leadAgentToken))
+  const agentHash = Array.from(new Uint8Array(agentHashBuf)).map((b) => b.toString(16).padStart(2, '0')).join('')
+
+  const statements = [
+    // 1. Root department
+    `INSERT INTO departments (id, tenant, slug, name, description, created_at)
+     VALUES ('${deptId}', '${opts.tenantSlug}', 'core', '${opts.brandName} Operations', 'Core Sovereign Operations Department', CURRENT_TIMESTAMP)
+     ON CONFLICT DO NOTHING;`,
+
+    // 2. Root core squad
+    `INSERT INTO squads (id, tenant, department_id, slug, name, description, created_at)
+     VALUES ('${squadId}', '${opts.tenantSlug}', '${deptId}', 'core', 'Core Squad', 'Primary Autonomous Agent Squad', CURRENT_TIMESTAMP)
+     ON CONFLICT DO NOTHING;`,
+
+    // 3. Lead agent
+    `INSERT INTO agents (id, tenant, squad_id, slug, name, role, model, status, created_at)
+     VALUES ('${opts.leadAgentId}', '${opts.tenantSlug}', '${squadId}', '${opts.tenantSlug}-lead', '${opts.leadAgentName}', 'lead', 'claude-3-7-sonnet', 'active', CURRENT_TIMESTAMP)
+     ON CONFLICT DO NOTHING;`,
+
+    // 4. Admin member
+    `INSERT INTO members (id, tenant, email, display_name, role, created_at)
+     VALUES ('${opts.adminMemberId}', '${opts.tenantSlug}', '${opts.adminEmail}', '${opts.brandName} Administrator', 'owner', CURRENT_TIMESTAMP)
+     ON CONFLICT DO NOTHING;`,
+
+    // 5. Admin member token
+    `INSERT INTO member_tokens (id, tenant, member_id, token_hash, token_prefix, label, created_at)
+     VALUES ('${adminTokenId}', '${opts.tenantSlug}', '${opts.adminMemberId}', '${adminHash}', '${opts.adminToken.slice(0, 12)}', 'Primary Admin Token', CURRENT_TIMESTAMP)
+     ON CONFLICT DO NOTHING;`,
+
+    // 6. Lead Agent key/token
+    `INSERT INTO agent_keys (id, tenant, agent_id, key_hash, label, created_at)
+     VALUES ('${agentTokenId}', '${opts.tenantSlug}', '${opts.leadAgentId}', '${agentHash}', 'Lead Agent Key', CURRENT_TIMESTAMP)
+     ON CONFLICT DO NOTHING;`,
+
+    // 7. Default project
+    `INSERT INTO projects (id, tenant, slug, name, description, created_at)
+     VALUES ('${projId}', '${opts.tenantSlug}', 'main', '${opts.brandName} Main', 'Primary Sovereign Pot Project', CURRENT_TIMESTAMP)
+     ON CONFLICT DO NOTHING;`,
+  ]
+
+  try {
+    for (const stmt of statements) {
+      await executeD1Query(cf, databaseId, stmt)
+    }
+    return { seeded: true }
+  } catch {
+    // Fail-open for partial tables if schema is not yet migrated
+    return { seeded: false }
+  }
+}
+
 export async function provisionSovereignPot(
   env: Env,
   input: SovereignPotProvisionInput,
@@ -209,24 +391,41 @@ export async function provisionSovereignPot(
   const kvTitle = `mupot-pot-${slug}-kv`
   const kv = await createKVNamespace(cf, kvTitle)
 
-  // 3. Generate initial IDs & Tokens
+  // 3. Apply migrations to isolated D1 database if provided
+  let migrationsApplied = 0
+  if (input.migrations && input.migrations.length > 0) {
+    const migRes = await applyMigrationsToD1Database(cf, d1.uuid, input.migrations)
+    migrationsApplied = migRes.applied
+  }
+
+  // 4. Generate initial IDs & Tokens
   const adminMemberId = crypto.randomUUID()
   const adminToken = `pot_adm_${crypto.randomUUID().replace(/-/g, '')}`
   const leadAgentId = crypto.randomUUID()
   const leadAgentToken = `pot_agt_${crypto.randomUUID().replace(/-/g, '')}`
-  const coreSquadId = `squad-${slug}-core`
-  const projectId = `proj-${slug}-main`
+  const leadAgentName = `${input.brand_name} Lead Agent`
 
-  // 4. If workerJsCode provided, upload to Dispatch Namespace
-  if (workerJsCode) {
-    await uploadUserWorkerToDispatch(cf, slug, workerJsCode, {
-      d1DatabaseId: d1.uuid,
-      kvNamespaceId: kv.id,
-      tenantSlug: slug,
-      brandName: input.brand_name,
-      publicOrigin,
-    })
-  }
+  // 5. Seed initial root entities into D1 database
+  const seedOutcome = await seedSovereignPotD1(cf, d1.uuid, {
+    tenantSlug: slug,
+    brandName: input.brand_name,
+    adminEmail: input.admin_email,
+    adminMemberId,
+    adminToken,
+    leadAgentId,
+    leadAgentName,
+    leadAgentToken,
+  })
+
+  // 6. Upload User Worker script to Dispatch Namespace
+  const scriptCode = workerJsCode || DEFAULT_SOVEREIGN_WORKER_SCRIPT
+  await uploadUserWorkerToDispatch(cf, slug, scriptCode, {
+    d1DatabaseId: d1.uuid,
+    kvNamespaceId: kv.id,
+    tenantSlug: slug,
+    brandName: input.brand_name,
+    publicOrigin,
+  })
 
   return {
     ok: true,
@@ -245,8 +444,10 @@ export async function provisionSovereignPot(
     admin_token: adminToken,
     admin_login_url: `${publicOrigin}/?token=${adminToken}`,
     lead_agent_id: leadAgentId,
-    lead_agent_name: `${input.brand_name} Lead Agent`,
+    lead_agent_name: leadAgentName,
     lead_agent_token: leadAgentToken,
+    migrations_applied: migrationsApplied,
+    seeded: seedOutcome.seeded,
     provisioned_at: new Date().toISOString(),
   }
 }

@@ -23,6 +23,19 @@
 import type { Context, MiddlewareHandler } from 'hono'
 import type { Env, AuthContext, Capability, CapabilityGrant, CapabilityScopeType } from '../types'
 
+/**
+ * Check if caller holds an action capability (e.g. 'action:manage_access').
+ * Org admin (without bound agent) bypasses; bound agents require explicit grant.
+ */
+export async function callerHoldsActionCapability(
+  env: Env,
+  auth: AuthContext,
+  action: string,
+): Promise<boolean> {
+  if (!auth.boundAgentId && isOrgAdmin(auth)) return true
+  return hasSurfaceCap(env, auth, action.startsWith('action:') ? action : `action:${action}`)
+}
+
 // ── ladder ────────────────────────────────────────────────────────────────────
 
 const RANK: Record<Capability, number> = {

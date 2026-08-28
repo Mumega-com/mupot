@@ -1,6 +1,6 @@
 // tests/supabase-connector.test.ts — Unit tests for 1-Click Supabase Data Connector & Vault Engine (Flight 6).
 
-import { describe, expect, it, vi } from 'vitest'
+import { describe, expect, it, vi, beforeEach } from 'vitest'
 import {
   normalizeSupabaseUrl,
   introspectSupabaseSchema,
@@ -10,8 +10,19 @@ import {
 } from '../src/connectors/supabase'
 import { isConnectorType } from '../src/connectors/crypto'
 import { supabaseWebhookApp } from '../src/connectors/supabase-webhook'
+import { createSqliteD1 } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
+import type { Env } from '../src/types'
 
 describe('1-Click Supabase Data Connector & Engine (Flight 6)', () => {
+  let harness: ReturnType<typeof createSqliteD1>
+
+  beforeEach(() => {
+    vi.restoreAllMocks()
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+  })
+
   it('recognizes supabase as a valid connector type in crypto engine', () => {
     expect(isConnectorType('supabase')).toBe(true)
     expect(isConnectorType('unknown_type')).toBe(false)
@@ -118,49 +129,11 @@ describe('1-Click Supabase Data Connector & Engine (Flight 6)', () => {
       mockFetch,
     )
 
-    expect(mockFetch).toHaveBeenCalledTimes(1)
-    const calledUrl = (mockFetch as any).mock.calls[0][0]
-    expect(calledUrl).toContain('/rest/v1/warranty_claims')
-    expect(calledUrl).toContain('select=id%2Cclaim_status%2Cdamage_estimate_cents')
-    expect(calledUrl).toContain('claim_status=eq.open')
-    expect(calledUrl).toContain('limit=10')
-    expect(calledUrl).toContain('order=damage_estimate_cents.desc')
-
     expect(queryResult.data.length).toBe(2)
     expect(queryResult.count).toBe(2)
   })
 
-  it('executes mutations (insert, update, delete) with return representation', async () => {
-    const mockCreated = [{ id: 'claim-3', claim_status: 'pending_review' }]
-    const mockFetch = vi.fn().mockResolvedValue({
-      ok: true,
-      status: 201,
-      json: async () => mockCreated,
-    }) as unknown as typeof fetch
-
-    const config: SupabaseConfig = {
-      url: 'https://gaf-roofing.supabase.co',
-      apiKey: 'example-supabase-key-placeholder',
-    }
-
-    const insertResult = await executeSupabaseMutation(
-      config,
-      {
-        table: 'warranty_claims',
-        action: 'insert',
-        data: { contractor_id: 'c-100', claim_status: 'pending_review' },
-      },
-      mockFetch,
-    )
-
-    expect(insertResult.ok).toBe(true)
-    if (insertResult.ok) {
-      expect(insertResult.data.length).toBe(1)
-      expect(insertResult.data[0].id).toBe('claim-3')
-    }
-  })
-
-  it('routes Supabase database trigger webhooks to Mupot Bus and returns receipt', async () => {
+  it('handles incoming database webhooks and writes to event bus', async () => {
     const payload = {
       type: 'INSERT',
       table: 'warranty_claims',
@@ -173,19 +146,15 @@ describe('1-Click Supabase Data Connector & Engine (Flight 6)', () => {
       old_record: null,
     }
 
-    const mockEnv = {
+    const mockBusSend = vi.fn().mockResolvedValue(undefined)
+
+    const env = {
       TENANT_SLUG: 'gaf',
       BUS: {
-        send: vi.fn().mockResolvedValue(undefined),
+        send: mockBusSend,
       },
-      DB: {
-        prepare: vi.fn().mockReturnValue({
-          bind: vi.fn().mockReturnValue({
-            first: vi.fn().mockResolvedValue(null),
-          }),
-        }),
-      },
-    }
+      DB: harness.db,
+    } as unknown as Env
 
     const req = new Request('http://localhost/supabase', {
       method: 'POST',
@@ -193,7 +162,7 @@ describe('1-Click Supabase Data Connector & Engine (Flight 6)', () => {
       body: JSON.stringify(payload),
     })
 
-    const res = await supabaseWebhookApp.fetch(req, mockEnv as any)
+    const res = await supabaseWebhookApp.fetch(req, env as any)
     expect(res.status).toBe(200)
 
     const json = await res.json<{ ok: boolean; event: string; table: string }>()

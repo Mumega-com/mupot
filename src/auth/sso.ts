@@ -102,31 +102,40 @@ export async function autoEnrollSsoMember(
 
   // Check if member already exists
   const existing = await env.DB.prepare(`
-    SELECT id, role, status FROM members
+    SELECT id, status FROM members
      WHERE tenant = ?1 AND lower(email) = ?2
      LIMIT 1
   `)
     .bind(env.TENANT_SLUG, email)
-    .first<{ id: string; role: 'member' | 'admin'; status: string }>()
+    .first<{ id: string; status: string }>()
 
   if (existing) {
     if (existing.status !== 'active') {
-      return { ok: false, email, role: existing.role, isNew: false, error: 'member_suspended' }
+      return { ok: false, email, role: 'member', isNew: false, error: 'member_suspended' }
     }
-    return { ok: true, memberId: existing.id, email, role: existing.role, isNew: false }
+    return { ok: true, memberId: existing.id, email, role: 'member', isNew: false }
   }
 
   // Provision new member
   const memberId = crypto.randomUUID()
   const role = config.default_role || 'member'
-  const nowIso = new Date().toISOString()
+  const displayName = profile.name || email.split('@')[0] || 'SSO User'
 
   await env.DB.prepare(`
     INSERT INTO members (
-      id, tenant, email, role, status, created_at, updated_at
-    ) VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?5)
+      id, tenant, email, display_name, status, created_at
+    ) VALUES (?1, ?2, ?3, ?4, 'active', CURRENT_TIMESTAMP)
   `)
-    .bind(memberId, env.TENANT_SLUG, email, role, nowIso)
+    .bind(memberId, env.TENANT_SLUG, email, displayName)
+    .run()
+
+  // Grant org capability if admin/member
+  await env.DB.prepare(`
+    INSERT INTO capabilities (
+      id, member_id, scope_type, scope_id, capability, created_at
+    ) VALUES (?1, ?2, 'org', NULL, ?3, CURRENT_TIMESTAMP)
+  `)
+    .bind(crypto.randomUUID(), memberId, role)
     .run()
 
   await bus.emit({

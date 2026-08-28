@@ -135,10 +135,16 @@ describe('Sovereign Pot Provisioner (Flight 2)', () => {
       let callCount = 0
       global.fetch = vi.fn().mockImplementation(async (url: string) => {
         callCount++
-        if (url.includes('/d1/database')) {
+        if (url.includes('/d1/database') && !url.includes('/query')) {
           return {
             status: 200,
             json: async () => ({ success: true, result: { uuid: 'd1-gaf-uuid', name: 'mupot-pot-gaf' } }),
+          }
+        }
+        if (url.includes('/d1/database') && url.includes('/query')) {
+          return {
+            status: 200,
+            json: async () => ({ success: true, result: [] }),
           }
         }
         if (url.includes('/storage/kv/namespaces')) {
@@ -169,6 +175,7 @@ describe('Sovereign Pot Provisioner (Flight 2)', () => {
           brand_name: 'GAF Materials',
           admin_email: 'admin@gaf.com',
           plan_tier: 'enterprise',
+          migrations: ['CREATE TABLE test_table (id TEXT PRIMARY KEY);'],
         },
         '// user worker bundle',
       )
@@ -181,22 +188,36 @@ describe('Sovereign Pot Provisioner (Flight 2)', () => {
       expect(result.admin_login_url).toBe(`https://gaf.mupot.mumega.com/?token=${result.admin_token}`)
       expect(result.lead_agent_id).toBeTruthy()
       expect(result.lead_agent_token).toMatch(/^pot_agt_/)
+      expect(result.migrations_applied).toBe(1)
+      expect(result.seeded).toBe(true)
     })
   })
 
   describe('MCP tools', () => {
     it('executes pot_provision tool when caller holds org admin capability', async () => {
       global.fetch = vi.fn().mockImplementation(async (url: string) => {
-        if (url.includes('/d1/database')) {
+        if (url.includes('/d1/database') && !url.includes('/query')) {
           return {
             status: 200,
             json: async () => ({ success: true, result: { uuid: 'd1-111', name: 'mupot-pot-viamar' } }),
+          }
+        }
+        if (url.includes('/d1/database') && url.includes('/query')) {
+          return {
+            status: 200,
+            json: async () => ({ success: true, result: [] }),
           }
         }
         if (url.includes('/storage/kv/namespaces')) {
           return {
             status: 200,
             json: async () => ({ success: true, result: { id: 'kv-222', title: 'mupot-pot-viamar-kv' } }),
+          }
+        }
+        if (url.includes('/workers/dispatch/namespaces')) {
+          return {
+            status: 200,
+            json: async () => ({ success: true, result: { id: 'viamar' } }),
           }
         }
         return { status: 404, json: async () => ({ success: false }) }

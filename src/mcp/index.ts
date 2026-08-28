@@ -34,7 +34,7 @@ import type {
   Squad,
   Task,
 } from '../types'
-import { resolveCapabilities, hasCapability, holdsCapabilityFloor, canOnSquad, hasSurfaceCap } from '../auth/capability'
+import { resolveCapabilities, hasCapability, holdsCapabilityFloor, canOnSquad, hasSurfaceCap, callerHoldsActionCapability } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc, touchTokenLastUsed } from '../auth/token-lifecycle'
 import { callerHoldsGateCapability, verdictPrincipal } from '../tasks/index'
 import { resolveSoleGateOwnerAgent } from '../gates/grants'
@@ -440,14 +440,7 @@ export async function memberCanOnSquad(
   return canOnSquad(env, grants, squadId, min)
 }
 
-export async function callerHoldsActionCapability(
-  env: Env,
-  auth: AuthContext,
-  action: string,
-): Promise<boolean> {
-  if (!auth.boundAgentId && hasWorkspaceAdmin(auth)) return true
-  return hasSurfaceCap(env, auth, action.startsWith('action:') ? action : `action:${action}`)
-}
+export { callerHoldsActionCapability } from '../auth/capability'
 
 
 // ── d1 helpers (read-only lookups; allow-listed table names) ──────────────────
