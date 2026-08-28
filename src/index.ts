@@ -74,6 +74,7 @@ import { attentionApp } from './attention/routes'
 import { platformApp } from './platform/routes'
 import { maybeHandleHostnameDispatch } from './platform/dispatcher'
 import { supabaseWebhookApp } from './connectors/supabase-webhook'
+import { routerRoutesApp } from './router/scheduled'
 
 // Durable Object classes — implemented in src/agents/.
 export { AgentDO } from './agents/agent-do'
@@ -214,6 +215,9 @@ app.route('/api/project-links', projectLinkApp)
 // daemon. Member-bearer auth, self-scoped for the mutating tools (MCP only — this
 // route is read-only). Before the dashboard '/' catch-all.
 app.route('/api/presence', presenceApp)
+
+// Active Router trigger API (FLIGHT-ROUTER-CRON)
+app.route('/api/router', routerRoutesApp)
 
 // ── OAuth 2.1 authorize leg (C3) ─────────────────────────────────────────────
 // /authorize, /oauth/google-callback, and /oauth/consent must be mounted BEFORE
@@ -436,6 +440,8 @@ export default {
     //     flight_reap_receipts table (migration 0109) to exist, or every reap
     //     would transition a flight with no audit trail.
     const { sweepStalledFlights } = await import('./flight/watchdog')
+    // 13. Active Router background sweep (FLIGHT-ROUTER-CRON) — match unassigned tasks to live continuum bodies.
+    const { runScheduledRouterSweep } = await import('./router/scheduled')
     const maintenance: ReadonlyArray<readonly [string, () => Promise<unknown>]> = [
       ['membership', () => reconcileMembership(env)],
       ['metabolism', () => runMetabolism(env)],
@@ -449,6 +455,7 @@ export default {
       ['agent-connection-retention', () => sweepAgentConnectionRetention(env)],
       ['token-expiry-warning', () => sweepExpiringTokensWarning(env)],
       ['flight-watchdog', () => sweepStalledFlights(env)],
+      ['router-sweep', () => runScheduledRouterSweep(env, scheduledAt)],
     ]
     const heartbeat = maintenance[maintenanceSlot(scheduledAt.getUTCMinutes(), maintenance.length)]
     if (heartbeat) waitFor(heartbeat[0], heartbeat[1]())
