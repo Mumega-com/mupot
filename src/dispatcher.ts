@@ -1,7 +1,8 @@
 // src/dispatcher.ts — Cloudflare Workers for Platforms (WFP) root dispatch router.
 //
-// Routes incoming requests for `<org>.mupot.mumega.com` or custom domains
-// to the dedicated isolated user Worker in the `mupot-pots` dispatch namespace.
+// Supports both Linear-style workspace path routing (`mupot.mumega.com/<workspace>/...`)
+// and subdomain / custom domain routing (`<workspace>.mupot.mumega.com` / `agents.viamar.ca`)
+// to dedicated isolated user Workers in the `mupot-pots` dispatch namespace.
 //
 // Invariants (docs/workers-for-platforms.md):
 //   1. Each user Worker runs in its own V8 isolate with dedicated D1, KV, R2, and Queue bindings.
@@ -31,30 +32,129 @@ export const DEFAULT_DISPATCH_LIMITS = {
   subRequests: 50,
 } as const
 
+export const RESERVED_ROOT_ROUTES = new Set([
+  'health',
+  'pricing',
+  'signup',
+  'login',
+  'auth',
+  'authorize',
+  'token',
+  'register',
+  'oauth',
+  'webhooks',
+  'channels',
+  'assets',
+  'static',
+  'favicon.ico',
+  'robots.txt',
+  '.well-known',
+  'api',
+])
+
+export interface TenantRoutingResult {
+  tenantSlug: string
+  rewrittenUrl?: string
+  isPathScoped: boolean
+  isSubdomain: boolean
+  isHeaderScoped: boolean
+}
+
+/**
+ * Resolves the tenant routing context from the request URL, headers, and hostname.
+ * Supports:
+ *   1. Header override: `X-Mupot-Tenant-Slug`, `X-Pot-Tenant`, `X-Mupot-Tenant`
+ *   2. Subdomain: `<tenant>.mupot.mumega.com`
+ *   3. Linear-style workspace path: `mupot.mumega.com/<tenant>/...`
+ *   4. Custom domain (CNAME): `agents.viamar.ca` -> `agents-viamar-ca`
+ */
+export function resolveTenantRouting(
+  urlOrString: URL | string,
+  rootDomain: string = DEFAULT_ROOT_DOMAIN,
+  headerSlug?: string | null,
+): TenantRoutingResult {
+  const url = typeof urlOrString === 'string'
+    ? urlOrString.startsWith('http://') || urlOrString.startsWith('https://')
+      ? new URL(urlOrString)
+      : new URL(`https://${urlOrString}`)
+    : urlOrString
+
+  // 1. Header resolution (highest precedence for direct API / MCP calls)
+  if (headerSlug && /^[a-z0-9-_]+$/i.test(headerSlug.trim())) {
+    return {
+      tenantSlug: headerSlug.trim().toLowerCase(),
+      isPathScoped: false,
+      isSubdomain: false,
+      isHeaderScoped: true,
+    }
+  }
+
+  const cleanHost = url.hostname.toLowerCase().split(':')[0]
+  const cleanRoot = rootDomain.toLowerCase().split(':')[0]
+  const isRootOrWww = cleanHost === cleanRoot || cleanHost === `www.${cleanRoot}`
+
+  // 2. Subdomain resolution (<tenant>.mupot.mumega.com)
+  if (!isRootOrWww && cleanHost.endsWith(`.${cleanRoot}`)) {
+    const sub = cleanHost.slice(0, -(cleanRoot.length + 1))
+    const parts = sub.split('.')
+    const tenantSlug = parts[parts.length - 1] || DEFAULT_FALLBACK_POT
+    return {
+      tenantSlug,
+      isPathScoped: false,
+      isSubdomain: true,
+      isHeaderScoped: false,
+    }
+  }
+
+  // 3. Linear-style path resolution (mupot.mumega.com/<workspace>/...)
+  const pathParts = url.pathname.split('/').filter(Boolean)
+  const firstSegment = pathParts[0]?.toLowerCase()
+
+  if (
+    firstSegment &&
+    /^[a-z0-9][a-z0-9-_]*$/i.test(firstSegment) &&
+    !RESERVED_ROOT_ROUTES.has(firstSegment)
+  ) {
+    const tenantSlug = firstSegment.toLowerCase()
+    const remainingSegments = pathParts.slice(1)
+    const rewrittenPath = '/' + remainingSegments.join('/')
+
+    const rewrittenUrl = new URL(url.toString())
+    rewrittenUrl.pathname = rewrittenPath === '/' ? '/' : rewrittenPath
+
+    return {
+      tenantSlug,
+      rewrittenUrl: rewrittenUrl.toString(),
+      isPathScoped: true,
+      isSubdomain: false,
+      isHeaderScoped: false,
+    }
+  }
+
+  // 4. Custom domain resolution or root fallback
+  const tenantSlug = isRootOrWww
+    ? DEFAULT_FALLBACK_POT
+    : cleanHost.replace(/[^a-z0-9-]/g, '-')
+
+  return {
+    tenantSlug,
+    isPathScoped: false,
+    isSubdomain: false,
+    isHeaderScoped: false,
+  }
+}
+
+/**
+ * Extracts the tenant slug from a hostname, URL, or explicit header.
+ * Backward-compatible helper used across dashboard and tests.
+ */
 export function extractTenantSlug(
-  hostname: string,
+  hostnameOrUrl: string,
   rootDomain: string = DEFAULT_ROOT_DOMAIN,
   headerSlug?: string | null,
 ): string {
-  if (headerSlug && /^[a-z0-9-_]+$/i.test(headerSlug.trim())) {
-    return headerSlug.trim().toLowerCase()
-  }
-
-  const cleanHost = hostname.toLowerCase().split(':')[0]
-  const cleanRoot = rootDomain.toLowerCase().split(':')[0]
-
-  if (cleanHost === cleanRoot || cleanHost === `www.${cleanRoot}`) {
-    return DEFAULT_FALLBACK_POT
-  }
-
-  if (cleanHost.endsWith(`.${cleanRoot}`)) {
-    const sub = cleanHost.slice(0, -(cleanRoot.length + 1))
-    const parts = sub.split('.')
-    return parts[parts.length - 1] || DEFAULT_FALLBACK_POT
-  }
-
-  // Custom domains (Cloudflare for SaaS CNAMEs) default to sanitized host slug
-  return cleanHost.replace(/[^a-z0-9-]/g, '-')
+  const routing = resolveTenantRouting(hostnameOrUrl, rootDomain, headerSlug)
+  return routing.tenantSlug
 }
 
 function renderUnprovisionedPotHtml(tenantSlug: string): string {
@@ -90,19 +190,45 @@ export default {
   async fetch(request: Request, env: DispatcherEnv): Promise<Response> {
     const url = new URL(request.url)
     const rootDomain = env.ROOT_DOMAIN || DEFAULT_ROOT_DOMAIN
-    const headerSlug = request.headers.get('x-mupot-tenant-slug') || request.headers.get('x-pot-tenant')
-    const tenantSlug = extractTenantSlug(url.hostname, rootDomain, headerSlug)
+    const headerSlug =
+      request.headers.get('x-mupot-tenant-slug') ||
+      request.headers.get('x-pot-tenant') ||
+      request.headers.get('x-mupot-tenant')
+
+    const routing = resolveTenantRouting(url, rootDomain, headerSlug)
+    const tenantSlug = routing.tenantSlug
 
     const limits = {
       cpuMs: env.DEFAULT_CPU_MS ?? DEFAULT_DISPATCH_LIMITS.cpuMs,
       subRequests: env.DEFAULT_SUBREQUESTS ?? DEFAULT_DISPATCH_LIMITS.subRequests,
     }
 
+    // Prepare the forward request. When Linear-style path routing is used (e.g. /viamar/studio),
+    // rewrite the target URL path to /studio and attach tenant context headers.
+    let forwardRequest: Request
+    if (routing.isPathScoped && routing.rewrittenUrl) {
+      const headers = new Headers(request.headers)
+      headers.set('x-mupot-tenant', tenantSlug)
+      headers.set('x-mupot-workspace-prefix', `/${tenantSlug}`)
+      forwardRequest = new Request(routing.rewrittenUrl, {
+        method: request.method,
+        headers,
+        body: request.method !== 'GET' && request.method !== 'HEAD' ? request.body : undefined,
+        // @ts-expect-error duplex required for request body streaming in fetch
+        duplex: request.body ? 'half' : undefined,
+      })
+    } else {
+      forwardRequest = request
+    }
+
     try {
       const userWorker = env.DISPATCHER.get(tenantSlug, {}, { limits })
-      return await userWorker.fetch(request)
+      return await userWorker.fetch(forwardRequest)
     } catch (err) {
-      const isNotFound = err instanceof Error && (err.message.includes('not found') || err.message.includes('No user worker'))
+      const isNotFound =
+        err instanceof Error &&
+        (err.message.includes('not found') || err.message.includes('No user worker'))
+
       if (isNotFound) {
         const acceptsHtml = request.headers.get('accept')?.includes('text/html')
         if (acceptsHtml && request.method === 'GET') {
@@ -133,4 +259,3 @@ export default {
     }
   },
 }
-

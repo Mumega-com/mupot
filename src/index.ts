@@ -331,13 +331,18 @@ function reportUnmatchedCron(scheduledAt: Date): void {
 export default {
   fetch: async (req: Request, env: Env, ctx: ExecutionContext) => {
     // ── Cloudflare Workers for Platforms (WFP) Sovereign Tenant Routing ──
-    // Routes `<tenant>.mupot.mumega.com` to the isolated User Worker in `mupot-pots`.
+    // Routes `<tenant>.mupot.mumega.com` or `mupot.mumega.com/<tenant>/...`
+    // to the isolated User Worker in `mupot-pots`.
     if (env.DISPATCHER) {
       const url = new URL(req.url)
-      const headerSlug = req.headers.get('x-mupot-tenant-slug') || req.headers.get('x-pot-tenant')
+      const headerSlug =
+        req.headers.get('x-mupot-tenant-slug') ||
+        req.headers.get('x-pot-tenant') ||
+        req.headers.get('x-mupot-tenant')
       const rootHost = env.PUBLIC_ORIGIN ? new URL(env.PUBLIC_ORIGIN).hostname : undefined
-      const { extractTenantSlug } = await import('./dispatcher')
-      const tenantSlug = extractTenantSlug(url.hostname, rootHost, headerSlug)
+      const { resolveTenantRouting } = await import('./dispatcher')
+      const routing = resolveTenantRouting(url, rootHost, headerSlug)
+      const tenantSlug = routing.tenantSlug
 
       if (tenantSlug && tenantSlug !== (env.TENANT_SLUG || 'mumega') && tenantSlug !== 'mupot' && tenantSlug !== 'mumega') {
         const dispatcher = (await import('./dispatcher')).default
