@@ -68,6 +68,7 @@ import {
   done,
   str,
   memberCanOnSquad,
+  callerHoldsActionCapability,
 } from './index'
 
 const STRING_SCHEMA = { type: 'string' }
@@ -460,7 +461,9 @@ const toolMintAgentToken: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args, _ctx) {
-    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
+    if (auth.boundAgentId && !(await callerHoldsActionCapability(env, auth, 'action:manage_access'))) {
+      return fail(403, 'operator_principal_required')
+    }
     const agentRef = str(args.agent)
     if (!agentRef) return fail(400, 'invalid_args', 'agent required')
 
@@ -591,7 +594,9 @@ const toolListAgentTokens: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args, _ctx) {
-    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
+    if (auth.boundAgentId && !(await callerHoldsActionCapability(env, auth, 'action:manage_access'))) {
+      return fail(403, 'operator_principal_required')
+    }
     const agentRef = str(args.agent)
     if (!agentRef) return fail(400, 'invalid_args', 'agent required')
 
@@ -646,7 +651,9 @@ const toolRevokeAgentToken: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args, _ctx) {
-    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
+    if (auth.boundAgentId && !(await callerHoldsActionCapability(env, auth, 'action:manage_access'))) {
+      return fail(403, 'operator_principal_required')
+    }
     const agentRef = str(args.agent)
     const tokenId = str(args.token_id)
     if (!agentRef) return fail(400, 'invalid_args', 'agent required')
@@ -768,7 +775,9 @@ const toolProvisionAgentConnection: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
+    if (auth.boundAgentId && !(await callerHoldsActionCapability(env, auth, 'action:manage_access'))) {
+      return fail(403, 'operator_principal_required')
+    }
     const requestId = str(args.request_id)
     const existingRef = str(args.existing_agent)
     const newAgent = args.new_agent
@@ -890,7 +899,9 @@ const toolGrantAgentCapability: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
+    if (auth.boundAgentId && !(await callerHoldsActionCapability(env, auth, 'action:manage_access'))) {
+      return fail(403, 'operator_principal_required')
+    }
     const agentRef = str(args.agent)
     if (!agentRef) return fail(400, 'invalid_args', 'agent required')
     const squadRef = str(args.squad)
@@ -966,7 +977,9 @@ const toolRegisterAgentKey: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
+    if (auth.boundAgentId && !(await callerHoldsActionCapability(env, auth, 'action:manage_access'))) {
+      return fail(403, 'operator_principal_required')
+    }
     const agentRef = str(args.agent)
     if (!agentRef) return fail(400, 'invalid_args', 'agent required')
 
@@ -1101,7 +1114,9 @@ const toolUpdateAgent: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
+    if (auth.boundAgentId && !(await callerHoldsActionCapability(env, auth, 'action:manage_access'))) {
+      return fail(403, 'operator_principal_required')
+    }
     const agentRef = str(args.agent)
     if (!agentRef) return fail(400, 'invalid_args', 'agent required')
 
@@ -1214,7 +1229,9 @@ const toolUpdateSquad: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
+    if (auth.boundAgentId && !(await callerHoldsActionCapability(env, auth, 'action:manage_access'))) {
+      return fail(403, 'operator_principal_required')
+    }
     const squadRef = str(args.squad)
     if (!squadRef) return fail(400, 'invalid_args', 'squad required')
 
@@ -1446,7 +1463,9 @@ const toolSquadMemberAdd: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
+    if (auth.boundAgentId && !(await callerHoldsActionCapability(env, auth, 'action:manage_access'))) {
+      return fail(403, 'operator_principal_required')
+    }
     const agentRef = str(args.agent)
     if (!agentRef) return fail(400, 'invalid_args', 'agent required')
     const squadRef = str(args.squad)
@@ -1503,7 +1522,9 @@ const toolSquadMemberRemove: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
+    if (auth.boundAgentId && !(await callerHoldsActionCapability(env, auth, 'action:manage_access'))) {
+      return fail(403, 'operator_principal_required')
+    }
     const agentRef = str(args.agent)
     if (!agentRef) return fail(400, 'invalid_args', 'agent required')
     const squadRef = str(args.squad)

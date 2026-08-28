@@ -440,6 +440,16 @@ export async function memberCanOnSquad(
   return canOnSquad(env, grants, squadId, min)
 }
 
+export async function callerHoldsActionCapability(
+  env: Env,
+  auth: AuthContext,
+  action: string,
+): Promise<boolean> {
+  if (!auth.boundAgentId && hasWorkspaceAdmin(auth)) return true
+  return hasSurfaceCap(env, auth, action.startsWith('action:') ? action : `action:${action}`)
+}
+
+
 // ── d1 helpers (read-only lookups; allow-listed table names) ──────────────────
 async function loadSquad(env: Env, squadId: string): Promise<Squad | null> {
   const { resolveSquadEntity } = await import('../lib/entity-resolver')

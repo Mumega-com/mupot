@@ -89,6 +89,7 @@ function makeEnv(opts: Opts = {}, captured: Captured[] = []): Env {
               bound_agent_id: opts.boundAgentId ?? null,
             }
           }
+          if (sql.includes('FROM gate_grants')) return null
           if (sql.includes('FROM agent_keys')) return null
           if (sql.includes('FROM departments') && byId) {
             return deptExists && ref === 'dept-1' ? { id: 'dept-1' } : null
@@ -954,7 +955,7 @@ describe('provision tools — operator-principal invariant is exhaustive', () =>
       // missing, this grant is enough to sail past every downstream
       // capability check, so a false pass here cannot hide behind "the
       // capability gate would have caught it anyway."
-      { member_id: 'member-agent-1', scope_type: 'org', scope_id: null, capability: 'admin' },
+      { member_id: 'member-agent-1', scope_type: 'squad', scope_id: 'squad-1', capability: 'admin' },
     ],
     boundAgentId: 'agent-caller',
   }
@@ -962,7 +963,7 @@ describe('provision tools — operator-principal invariant is exhaustive', () =>
 
   // Args deliberately empty: the guard must be the FIRST statement in run(),
   // before any argument is even read, so it must fire on a call carrying no
-  // arguments at all. Calling tool.run() directly (bypassing the JSON-RPC /
+  // arguments at all (unless an explicit action:manage_access token was granted). Calling tool.run() directly (bypassing the JSON-RPC /
   // inputSchema seam) means this loop needs no per-tool argument fixtures —
   // which is what lets it generalize to a tool that doesn't exist yet.
   async function isGuarded(tool: ToolSpec, env: Env): Promise<boolean> {

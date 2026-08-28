@@ -360,6 +360,23 @@ export interface Membership {
 
 export type Capability = 'owner' | 'admin' | 'lead' | 'member' | 'observer'
 
+export type ActionCapability =
+  | 'action:deploy'
+  | 'action:manage_access'
+  | 'action:migrate'
+  | 'action:secrets'
+  | 'action:dispatch'
+  | (string & {}) // Open extension for custom action capabilities
+
+export const STANDARD_ACTION_CAPABILITIES = [
+  'action:deploy',
+  'action:manage_access',
+  'action:migrate',
+  'action:secrets',
+  'action:dispatch',
+] as const
+
+
 export type TaskPriority = 'P0' | 'P1' | 'P2' | 'P3'
 export const TASK_PRIORITIES: readonly TaskPriority[] = ['P0', 'P1', 'P2', 'P3']
 

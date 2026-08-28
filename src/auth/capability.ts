@@ -349,9 +349,9 @@ export async function actorMaxRankOnScope(
  * Owner / admin roles bypass the check (rank is sufficient for them).
  */
 export async function hasSurfaceCap(env: Env, auth: AuthContext, surface: string): Promise<boolean> {
-  if (isOrgAdmin(auth)) return true
-  const principalId = auth.memberId ?? auth.userId
-  const principalType: 'member' | 'agent' = auth.memberId ? 'member' : 'agent'
+  if (isOrgAdmin(auth) && !auth.boundAgentId) return true
+  const principalId = auth.boundAgentId ?? auth.memberId ?? auth.userId
+  const principalType: 'member' | 'agent' = auth.boundAgentId ? 'agent' : auth.memberId ? 'member' : 'agent'
   if (!principalId) return false
   const row = await env.DB.prepare(
     `SELECT 1 FROM gate_grants
@@ -362,7 +362,22 @@ export async function hasSurfaceCap(env: Env, auth: AuthContext, surface: string
   )
     .bind(surface, principalType, principalId)
     .first<{ 1: number }>()
-  return row !== null
+  if (row !== null) return true
+
+  // If the agent is bound to a member, check if the member principal was granted the capability
+  if (auth.memberId && auth.boundAgentId) {
+    const memRow = await env.DB.prepare(
+      `SELECT 1 FROM gate_grants
+        WHERE capability     = ?1
+          AND principal_type = 'member'
+          AND principal_id   = ?2
+        LIMIT 1`,
+    )
+      .bind(surface, auth.memberId)
+      .first<{ 1: number }>()
+    return memRow !== null
+  }
+  return false
 }
 
 /**

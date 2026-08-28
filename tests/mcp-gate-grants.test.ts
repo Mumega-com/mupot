@@ -66,7 +66,7 @@ describe('grant_gate_capability', () => {
     expect(db.grants()).toHaveLength(0)
   })
 
-  it('rejects non-gate capability strings', async () => {
+  it('rejects invalid capability strings (neither gate:* nor action:*)', async () => {
     const db = makeDb()
     const out = await invokeTool(orgAdmin, db.env, 'grant_gate_capability', {
       capability: 'outreach:send',
@@ -76,6 +76,23 @@ describe('grant_gate_capability', () => {
     expect(out.ok).toBe(false)
     if (!out.ok) expect(out.error).toBe('invalid_capability')
     expect(db.grants()).toHaveLength(0)
+  })
+
+  it('accepts action capability strings (action:*)', async () => {
+    const db = makeDb()
+    const out = await invokeTool(orgAdmin, db.env, 'grant_gate_capability', {
+      capability: 'action:manage_access',
+      principal_type: 'agent',
+      principal_id: 'agent-admin-1',
+    }, ORIGIN)
+    expect(out.ok).toBe(true)
+    expect(db.grants()).toHaveLength(1)
+    expect(db.grants()[0]).toMatchObject({
+      capability: 'action:manage_access',
+      principal_type: 'agent',
+      principal_id: 'agent-admin-1',
+      granted_by: 'admin-member',
+    })
   })
 
   it('grants idempotently for org-admin', async () => {
