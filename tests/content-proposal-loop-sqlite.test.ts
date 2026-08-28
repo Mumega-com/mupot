@@ -72,7 +72,9 @@ function createSchema(sqlite: SqliteD1Harness['sqlite']): void {
       execution_receipt_id TEXT,
       execution_claim_expires_at INTEGER,
       source_pot         TEXT,
-      external_source    TEXT
+      external_source    TEXT,
+      substitute_executor_id TEXT,
+      fallback_reason    TEXT
     );
     CREATE TABLE task_verdicts (
       id TEXT PRIMARY KEY, task_id TEXT NOT NULL, verdict TEXT NOT NULL CHECK(verdict IN ('approved','rejected')),

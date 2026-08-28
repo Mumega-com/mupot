@@ -12,10 +12,9 @@
 //   - Structured receipt lifecycles (authorized, accepted, delivered, injected, consumed, ACK, artifact, verdict)
 
 import { Hono } from 'hono'
-import type { Env, AuthContext, Task, TaskPriority } from '../types'
-import { createTask, getTask, isDoneWhenValid, isPlaceholderDoneWhen } from '../tasks/service'
+import type { Env, AuthContext, TaskPriority } from '../types'
+import { createTask, getTask, TaskSelfGateError } from '../tasks/service'
 import { canOnSquad, isOrgAdmin, resolveCapabilities } from '../auth/capability'
-import { getFleetAgentLiveness } from '../fleet/registry'
 import { verifyTaskArtifactShape } from '../tasks/artifact-verification'
 import { createBus } from '../bus'
 
@@ -246,6 +245,9 @@ a2aApp.post('/api/a2a/tasks', async (c) => {
       } : null,
     }, 201)
   } catch (error: any) {
+    if (error instanceof TaskSelfGateError) {
+      return c.json({ ok: false, error: 'self_gate_conflict', detail: error.message }, 409)
+    }
     return c.json({ ok: false, error: error.code || 'task_creation_failed', detail: error.message }, 400)
   }
 })

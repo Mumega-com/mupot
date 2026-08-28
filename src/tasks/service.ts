@@ -10,7 +10,7 @@ import { assertWritten } from '../lib/receipt'
 import { resolveOutboundGitHubToken } from '../integrations/github-app'
 import { isBlankProvenance } from './provenance'
 import { hasProjectWriteForSquads } from '../projects/access'
-import { GATE_CAPABILITY_RE } from '../gates/grants'
+import { GATE_CAPABILITY_RE, resolveSoleGateOwnerAgent } from '../gates/grants'
 
 // gate_owner is used RAW as the grant capability in callerHoldsGateCapability
 // (src/tasks/index.ts): `SELECT 1 FROM gate_grants WHERE capability = <gate_owner>`.
@@ -47,6 +47,64 @@ export async function getTask(
 
 export function isValidGateOwnerForm(value: string): boolean {
   return GATE_CAPABILITY_RE.test(value)
+}
+
+export class TaskSelfGateError extends Error {
+  constructor(message = 'gate_owner cannot be the task assignee; self-approval is forbidden and causes deadlock') {
+    super(message)
+    this.name = 'TaskSelfGateError'
+  }
+}
+
+/**
+ * Self-Gate Deadlock Prevention (Issue #1030 / FLIGHT EXEC-02).
+ * Rejects gate_owner == assignee_agent_id at write time for all gates other than
+ * gate:agent-self-completion. A task where the gate_owner resolves to the assignee
+ * cannot be approved because self-verdicts are forbidden, permanently deadlocking the task.
+ */
+export async function isSelfGatedConflict(
+  env: Env,
+  gateOwner: string | null | undefined,
+  assigneeAgentId: string | null | undefined,
+): Promise<boolean> {
+  if (!gateOwner || !assigneeAgentId) return false
+  const trimmedGate = gateOwner.trim()
+  const trimmedAssignee = assigneeAgentId.trim()
+  if (!trimmedGate || !trimmedAssignee) return false
+  if (trimmedGate === 'gate:agent-self-completion') return false
+
+  // Direct equality or 'gate:' prefix equality
+  if (trimmedGate === trimmedAssignee) return true
+  if (trimmedGate === `gate:${trimmedAssignee}`) return true
+
+  // Resolve agent in DB by id or slug
+  try {
+    const agent = await env.DB.prepare(
+      `SELECT id, slug FROM agents WHERE id = ?1 OR slug = ?1 LIMIT 1`,
+    ).bind(trimmedAssignee).first<{ id: string; slug: string }>()
+
+    if (agent) {
+      if (trimmedGate === agent.id || trimmedGate === agent.slug) return true
+      if (trimmedGate === `gate:${agent.id}` || trimmedGate === `gate:${agent.slug}`) return true
+
+      const soleAgent = await resolveSoleGateOwnerAgent(env, trimmedGate)
+      if (soleAgent && (soleAgent === agent.id || soleAgent === agent.slug)) return true
+
+      const grant = await env.DB.prepare(
+        `SELECT 1 FROM gate_grants WHERE capability = ?1 AND principal_type = 'agent' AND (principal_id = ?2 OR principal_id = ?3) LIMIT 1`,
+      ).bind(trimmedGate, agent.id, agent.slug).first()
+      if (grant) return true
+    } else {
+      const soleAgent = await resolveSoleGateOwnerAgent(env, trimmedGate)
+      if (soleAgent && soleAgent === trimmedAssignee) return true
+      if (trimmedGate.startsWith('gate:') && trimmedGate.slice(5).trim() === trimmedAssignee) return true
+    }
+  } catch {
+    if (trimmedGate === trimmedAssignee || trimmedGate === `gate:${trimmedAssignee}`) return true
+    if (trimmedGate.startsWith('gate:') && trimmedGate.slice(5).trim() === trimmedAssignee) return true
+  }
+
+  return false
 }
 
 export type TaskStatus = Task['status']
@@ -479,6 +537,11 @@ export async function persistTaskUpdate(
   existing: Task,
   next: Task,
 ): Promise<void> {
+  // Self-Gate Deadlock Prevention (Issue #1030 / FLIGHT EXEC-02)
+  if (await isSelfGatedConflict(env, next.gate_owner, next.assignee_agent_id)) {
+    throw new TaskSelfGateError()
+  }
+
   // Chokepoint enforcement for priority discipline (Issue #1040 Phase 2):
   // When a task is escalated or mutated to P0/P1, validate intake contract requirements
   if ((existing.priority !== next.priority || existing.body !== next.body || existing.project_id !== next.project_id || existing.parent_task_id !== next.parent_task_id) && (next.priority === 'P0' || next.priority === 'P1')) {
@@ -489,7 +552,7 @@ export async function persistTaskUpdate(
   try {
     result = await env.DB.prepare(
       `UPDATE tasks
-          SET title = ?, body = ?, done_when = ?, status = ?, priority = ?, parent_task_id = ?, assignee_agent_id = ?, github_issue_url = ?, gate_owner = ?, project_id = ?, completed_at = ?, updated_at = ?
+          SET title = ?, body = ?, done_when = ?, status = ?, priority = ?, parent_task_id = ?, assignee_agent_id = ?, github_issue_url = ?, gate_owner = ?, project_id = ?, completed_at = ?, updated_at = ?, substitute_executor_id = ?, fallback_reason = ?
         WHERE id = ? AND updated_at = ? AND project_id IS ?`,
     )
       .bind(
@@ -505,6 +568,8 @@ export async function persistTaskUpdate(
         next.project_id,
         next.completed_at,
         next.updated_at,
+        next.substitute_executor_id ?? null,
+        next.fallback_reason ?? null,
         next.id,
         existing.updated_at,
         existing.project_id,
@@ -1038,6 +1103,10 @@ export async function prepareGuardedTaskInsert(
   // but that reached here another way (a legacy row, a future caller, a direct write).
   // Fail closed on anything that is not literally absent.
   const assigneeAgentId = externalSource !== null ? null : (input.assignee_agent_id ?? null)
+  // Self-Gate Deadlock Prevention (Issue #1030 / FLIGHT EXEC-02)
+  if (await isSelfGatedConflict(env, input.gate_owner, assigneeAgentId)) {
+    throw new TaskSelfGateError()
+  }
   const task: Task = {
     id: options.id ?? crypto.randomUUID(),
     squad_id: input.squad_id,
@@ -1053,6 +1122,8 @@ export async function prepareGuardedTaskInsert(
     result: null,
     completed_at: null,
     gate_owner: input.gate_owner ?? null,
+    substitute_executor_id: null,
+    fallback_reason: null,
     created_at: now,
     updated_at: now,
     external_source: externalSource,
@@ -1083,6 +1154,8 @@ export async function prepareGuardedTaskInsert(
   if (externalSource !== null) { extraColumns.push('external_source'); extraValues.push(externalSource) }
   if (input.priority != null) { extraColumns.push('priority'); extraValues.push(input.priority) }
   if (input.parent_task_id != null) { extraColumns.push('parent_task_id'); extraValues.push(input.parent_task_id) }
+  if (task.substitute_executor_id != null) { extraColumns.push('substitute_executor_id'); extraValues.push(task.substitute_executor_id) }
+  if (task.fallback_reason != null) { extraColumns.push('fallback_reason'); extraValues.push(task.fallback_reason) }
 
   const columns = extraColumns.length > 0 ? `${baseColumns}, ${extraColumns.join(', ')}` : baseColumns
   const values = [...baseValues, ...extraValues]

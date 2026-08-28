@@ -144,17 +144,31 @@ async function releaseTaskDispatchReceipt(env: Env, event: BusEvent, leaseExpire
   ).bind(message, event.tenant, identity.receiptId, identity.taskId, event.agent_id, leaseExpiresAt).run()
 }
 
-async function consumeTaskDispatchReceipt(env: Env, event: BusEvent, leaseExpiresAt?: number): Promise<boolean> {
+async function consumeTaskDispatchReceipt(
+  env: Env,
+  event: BusEvent,
+  leaseExpiresAt?: number,
+  substituteExecutorId?: string | null,
+  fallbackReason?: string | null,
+): Promise<boolean> {
   const identity = taskDispatchIdentity(event)
   if (!identity || !event.agent_id) return true
   const leaseClause = leaseExpiresAt === undefined ? '' : ' AND claim_expires_at = ?'
   const result = await env.DB.prepare(
     `UPDATE task_dispatch_receipts
-        SET consumed_at = ?, claim_expires_at = NULL, last_error = NULL
+        SET consumed_at = ?, claim_expires_at = NULL, last_error = NULL,
+            substitute_executor_id = COALESCE(substitute_executor_id, ?),
+            fallback_reason = COALESCE(fallback_reason, ?)
       WHERE tenant = ? AND id = ? AND task_id = ? AND agent_id = ?
         AND consumed_at IS NULL${leaseClause}`,
   ).bind(
-    new Date().toISOString(), event.tenant, identity.receiptId, identity.taskId, event.agent_id,
+    new Date().toISOString(),
+    substituteExecutorId ?? null,
+    fallbackReason ?? null,
+    event.tenant,
+    identity.receiptId,
+    identity.taskId,
+    event.agent_id,
     ...(leaseExpiresAt === undefined ? [] : [leaseExpiresAt]),
   ).run()
   return result.meta?.changes === 1
@@ -315,6 +329,8 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
         throw new Error('task dispatch receipt lease busy')
       }
 
+      let substituteExecutorId: string | null = null
+      let fallbackReason: string | null = null
       try {
         if (route.runtime && route.live) {
           // EXTERNAL route: deliver to inbox only. Deliberately do NOT wake-execute in-Worker
@@ -336,7 +352,18 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
           // today's behavior, unchanged. This is the only path that executes in-Worker, so a
           // dead external runtime can never strand the task (BLOCK-2 fix: exactly one route is
           // chosen and acted on per lease-holder).
-          await wakeAgent(env, event.agent_id, event)
+          fallbackReason = !route.runtime ? 'no_external_runtime' : (!route.live ? 'seat_unreachable' : 'fallback')
+          substituteExecutorId = `in-worker:${event.agent_id}`
+          const fallbackPayload = {
+            ...(typeof event.payload === 'object' && event.payload !== null ? event.payload : {}),
+            fallback: true,
+            substitute_executor_id: substituteExecutorId,
+            fallback_reason: fallbackReason,
+          }
+          await wakeAgent(env, event.agent_id, {
+            ...event,
+            payload: fallbackPayload,
+          })
         }
       } catch (error) {
         await releaseTaskDispatchReceipt(env, event, leaseExpiresAt, error)
@@ -345,7 +372,7 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
         }
         throw error
       }
-      if (!(await consumeTaskDispatchReceipt(env, event, leaseExpiresAt))) {
+      if (!(await consumeTaskDispatchReceipt(env, event, leaseExpiresAt, substituteExecutorId, fallbackReason))) {
         throw new Error('task dispatch receipt consume failed')
       }
       return true

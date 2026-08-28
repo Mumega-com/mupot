@@ -317,7 +317,7 @@ describe('MCP task cutover tools', () => {
     // which the tested behaviour does not involve at all. Kept and updated rather than
     // loosened: a positional assertion is brittle, but it is also the only thing that would
     // catch a bind/column misalignment, which is silent corruption rather than a crash.
-    // The two nulls below are priority and parent_task_id, both unset on this task.
+    // The nulls below include priority, parent_task_id, substitute_executor_id, and fallback_reason.
     expect(updates[0].args).toEqual([
       'Ship the adapter',
       'updated',
@@ -331,6 +331,8 @@ describe('MCP task cutover tools', () => {
       null,
       null,
       result.task.updated_at,
+      null,
+      null,
       'task-1',
       '2026-07-08T00:00:00.000Z',
       null,

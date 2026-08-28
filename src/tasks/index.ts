@@ -25,7 +25,7 @@ import { requireAuth } from '../auth'
 // row on PATCH), so we check inline rather than as static route middleware.
 import { resolveCapabilities, hasCapability, hasSurfaceCap, isOrgAdmin } from '../auth/capability'
 import { orgAdminForbiddenPayload, ORG_ADMIN_REFUSAL_LINKS } from '../auth/refusal'
-import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, TaskEvidenceFenceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution, assigneeSelfClose, assigneeCannotMutateOwnAssignment, TaskIntakeContractError, assertValidIntakeContract, evaluateTaskIntakeContract, isTaskStatus, ALL_TASK_STATUSES } from './service'
+import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, TaskEvidenceFenceError, TaskSelfGateError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution, assigneeSelfClose, assigneeCannotMutateOwnAssignment, TaskIntakeContractError, assertValidIntakeContract, evaluateTaskIntakeContract, isTaskStatus, ALL_TASK_STATUSES } from './service'
 import type { TaskStatus } from './service'
 import { resolveTaskAssignee } from './assignee'
 import { verifyTaskArtifactShape } from './artifact-verification'
@@ -599,6 +599,9 @@ tasksApp.post('/', async (c) => {
       skipEvent: body.dispatch === false,
     })
   } catch (error) {
+    if (error instanceof TaskSelfGateError) {
+      return c.json({ error: 'self_gate_conflict', detail: error.message }, 409)
+    }
     if (error instanceof TaskIntakeContractError) {
       return c.json({ error: error.code, detail: error.message }, 400)
     }
@@ -984,6 +987,9 @@ tasksApp.patch('/:id', async (c) => {
   try {
     await persistTaskUpdate(c.env, existing, next)
   } catch (error) {
+    if (error instanceof TaskSelfGateError) {
+      return c.json({ error: 'self_gate_conflict', detail: error.message }, 409)
+    }
     if (error instanceof TaskIntakeContractError) {
       return c.json({ error: error.code, detail: error.message }, 400)
     }

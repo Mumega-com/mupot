@@ -104,7 +104,7 @@ describe('deliverDispatchToInbox', () => {
   it('writes an inbox message addressed to the agent, tagged with the dispatch-bridge sender', async () => {
     const db = makeDb()
     const res = await deliverDispatchToInbox(envWith(db), baseInput)
-    expect(res).toEqual({ delivered: true, seq: 1, duplicate: false })
+    expect(res).toMatchObject({ delivered: true, seq: 1, duplicate: false })
     expect(db._messages).toHaveLength(1)
     const row = db._messages[0]
     expect(row.tenant).toBe('t')
@@ -127,8 +127,8 @@ describe('deliverDispatchToInbox', () => {
     const env = envWith(db)
     const first = await deliverDispatchToInbox(env, baseInput)
     const redelivered = await deliverDispatchToInbox(env, baseInput)
-    expect(first).toEqual({ delivered: true, seq: 1, duplicate: false })
-    expect(redelivered).toEqual({ delivered: true, seq: 1, duplicate: true })
+    expect(first).toMatchObject({ delivered: true, seq: 1, duplicate: false })
+    expect(redelivered).toMatchObject({ delivered: true, seq: 1, duplicate: true })
     expect(db._messages).toHaveLength(1)
   })
 

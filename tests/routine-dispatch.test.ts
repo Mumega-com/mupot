@@ -480,8 +480,8 @@ describe('routine runtime-neutral dispatch', () => {
     await expect(dispatchRoutineRun(envFor(harness, () => { statements += 1 }), 'run-1', NOW))
       .resolves.toMatchObject({ ok: true, status: 'dispatched' })
 
-    // Account for telemetry recording statement (32 statements total, well under free-tier 50 limit)
-    expect(statements).toBeLessThanOrEqual(50 - MAX_SCHEDULER_DB_STATEMENTS + 1)
+    // Account for telemetry recording statement and recipient validation (33 statements total, well under free-tier 50 limit)
+    expect(statements).toBeLessThanOrEqual(50 - MAX_SCHEDULER_DB_STATEMENTS + 2)
   })
 
   // mupot#611 item 3, end-to-end: loadCandidates (src/routines/dispatch.ts) used

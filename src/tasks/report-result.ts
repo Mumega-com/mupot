@@ -9,8 +9,8 @@
 // This module provides the authoritative reportTaskResult implementation for both MCP tool
 // (`task_report_result`) and HTTP route (`POST /api/tasks/:id/result`).
 
-import type { Env, AuthContext, Task, Capability } from '../types'
-import { getTask, isExternallySourced } from '../tasks/service'
+import type { Env, AuthContext, Task } from '../types'
+import { getTask, isSelfGatedConflict } from '../tasks/service'
 import { verifyTaskArtifactShape, type ArtifactVerification } from './artifact-verification'
 import { canOnSquad, isOrgAdmin, resolveCapabilities } from '../auth/capability'
 
@@ -105,6 +105,11 @@ export async function reportTaskResult(
 
   if (input.gateOwner !== undefined) {
     gateOwner = input.gateOwner ? input.gateOwner.trim() : null
+  }
+
+  // Self-Gate Deadlock Prevention (Issue #1030 / FLIGHT EXEC-02)
+  if (await isSelfGatedConflict(env, gateOwner, task.assignee_agent_id)) {
+    throw new TaskReportResultError('self_gate_conflict', 'gate_owner cannot be the task assignee; self-approval is forbidden and causes deadlock', 409)
   }
 
   if (input.status) {

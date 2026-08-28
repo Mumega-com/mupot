@@ -153,7 +153,7 @@ export const PRIORITY_RANK: Record<string, number> = { P0: 0, P1: 1, P2: 2, P3: 
 export const TASK_SELECT_COLUMNS =
   'id, squad_id, project_id, title, body, done_when, status, priority, parent_task_id, ' +
   'assignee_agent_id, github_issue_url, result, completed_at, gate_owner, source_pot, ' +
-  'external_source, created_at, updated_at'
+  'external_source, substitute_executor_id, fallback_reason, created_at, updated_at'
 
 export function priorityOrderSql(column = 'priority'): string {
   return `CASE ${column} WHEN 'P0' THEN 0 WHEN 'P1' THEN 1 WHEN 'P2' THEN 2 WHEN 'P3' THEN 3 ELSE 4 END`

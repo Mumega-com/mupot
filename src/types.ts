@@ -436,6 +436,14 @@ export interface Task {
   // fence) -- kept as a separate column rather than folded into source_pot because it is
   // a different untrusted-writer class (no pot-to-pot signature involved).
   external_source?: string | null
+  /**
+   * Explicit substitute executor attribution when in-Worker fallback executes for an unreachable seat (#1049).
+   */
+  substitute_executor_id?: string | null
+  /**
+   * Reason why substitute fallback execution fired (e.g. 'seat_unreachable', 'no_external_runtime') (#1049).
+   */
+  fallback_reason?: string | null
   created_at: string
   updated_at: string
 }

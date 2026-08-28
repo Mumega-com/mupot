@@ -1248,7 +1248,9 @@ describe('MCP granted multi-squad flight lifecycle', () => {
           id TEXT PRIMARY KEY, squad_id TEXT NOT NULL, project_id TEXT, title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '',
           done_when TEXT NOT NULL, status TEXT NOT NULL, priority TEXT, parent_task_id TEXT,
           assignee_agent_id TEXT, github_issue_url TEXT,
-          result TEXT, completed_at TEXT, gate_owner TEXT, source_pot TEXT, external_source TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+          result TEXT, completed_at TEXT, gate_owner TEXT, source_pot TEXT, external_source TEXT,
+          substitute_executor_id TEXT, fallback_reason TEXT,
+          created_at TEXT NOT NULL, updated_at TEXT NOT NULL
         );
         CREATE TABLE task_verdicts (
           id TEXT PRIMARY KEY, task_id TEXT NOT NULL, verdict TEXT NOT NULL, note TEXT,

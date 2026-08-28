@@ -165,13 +165,13 @@ SHA256: 8f4e2b6a9c1d3e5f7a0b2c4d6e8f1a3b5c7d9e0f2a4b6c8d0e1f3a5b7c9d1e2f`
         taskId: 'task-external-202',
         result: validResultText,
         status: 'review',
-        gateOwner: 'gate:hadi-grok',
+        gateOwner: 'gate:grok-desktop',
       })
 
       expect(outcome.ok).toBe(true)
       expect(outcome.task.result).toBe(validResultText)
       expect(outcome.task.status).toBe('review')
-      expect(outcome.task.gate_owner).toBe('gate:hadi-grok')
+      expect(outcome.task.gate_owner).toBe('gate:grok-desktop')
       expect(outcome.artifact.verified).toBe(true)
       if (outcome.artifact.verified) {
         expect(outcome.artifact.path).toBe('/tmp/canary-receipt.json')
@@ -182,7 +182,7 @@ SHA256: 8f4e2b6a9c1d3e5f7a0b2c4d6e8f1a3b5c7d9e0f2a4b6c8d0e1f3a5b7c9d1e2f`
       const row = await harness.db.prepare('SELECT result, status, gate_owner FROM tasks WHERE id = ?1').bind('task-external-202').first<{ result: string; status: string; gate_owner: string }>()
       expect(row?.result).toBe(validResultText)
       expect(row?.status).toBe('review')
-      expect(row?.gate_owner).toBe('gate:hadi-grok')
+      expect(row?.gate_owner).toBe('gate:grok-desktop')
     })
 
     it('rejects unverified prose or missing SHA256 during result reporting', async () => {
@@ -228,7 +228,7 @@ SHA256: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef`
         task_id: 'task-mcp-404',
         result: validResult,
         status: 'review',
-        gate_owner: 'gate:hadi-grok',
+        gate_owner: 'gate:grok-desktop',
       })
 
       expect(toolRes.ok).toBe(true)

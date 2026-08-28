@@ -66,6 +66,7 @@ import {
   writeVerdict,
   VerdictRaceError,
   TaskEvidenceFenceError,
+  TaskSelfGateError,
 } from '../tasks/service'
 import { loadKanbanData } from '../dashboard/kanban-routes'
 import type { TaskStatus } from '../tasks/service'
@@ -856,6 +857,7 @@ const toolTaskCreate: ToolSpec = {
         { actor: memberActor(auth.memberId as string), externalSource, skipEvent: args.dispatch === false },
       )
     } catch (error) {
+      if (error instanceof TaskSelfGateError) return fail(409, 'self_gate_conflict', error.message)
       if (error instanceof TaskIntakeContractError) return fail(400, error.code, error.message)
       if (error instanceof TaskProjectError) return taskProjectFailure(error)
       throw error
@@ -1483,6 +1485,7 @@ const toolTaskUpdate: ToolSpec = {
     try {
       await persistTaskUpdate(env, existing, next)
     } catch (error) {
+      if (error instanceof TaskSelfGateError) return fail(409, 'self_gate_conflict', error.message)
       if (error instanceof TaskIntakeContractError) return fail(400, error.code, error.message)
       if (error instanceof TaskUpdateConflictError) return fail(409, error.code)
       throw error
@@ -4550,9 +4553,13 @@ export async function invokeTool(
     outcome = await spec.run(auth, env, args, ctx)
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
+    if (err instanceof TaskSelfGateError) {
+      return { ...fail(409, 'self_gate_conflict', err.message), tool: spec.name }
+    }
     if (msg.startsWith('receipt_failed')) {
       return { ...fail(500, 'receipt_failed', msg), tool: spec.name }
     }
+    console.error('MCP tool execution threw unhandled error:', err)
     return { ...fail(500, 'internal_error'), tool: spec.name }
   }
 

@@ -85,6 +85,8 @@ function createSchema(sqlite: SqliteD1Harness['sqlite']): void {
       execution_claim_expires_at INTEGER,
       source_pot TEXT,
       external_source TEXT,
+      substitute_executor_id TEXT,
+      fallback_reason TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );

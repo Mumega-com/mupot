@@ -1,0 +1,52 @@
+{
+  "schema": "mupot.flight.execution_receipt/v1",
+  "flight_id": "flight-exec-02-fallback-and-gates",
+  "name": "FLIGHT EXEC-02: Transparent Fallback Execution & Self-Gate Deadlock Prevention (#1049 & #1030)",
+  "recorded_at": "2026-08-28T13:45:00Z",
+  "crew": {
+    "lead": {
+      "agent_id": "96e85516-720b-47fd-9cb6-655eecc919aa",
+      "slug": "river",
+      "name": "Cursor River Lead",
+      "seat": "river-cursor",
+      "harness": "cursor-cloud",
+      "machine": "cursor-cloud-vm",
+      "branch": "cursor/flight-river-lead-agent-onboarding-warm-cache-35a3"
+    },
+    "coordination": {
+      "agent_id": "17aa283f-8cdb-4c1f-864f-1974ee45a033",
+      "slug": "loom",
+      "seat": "muvps-loom"
+    },
+    "gate": {
+      "agent_id": "ea2b0370-9830-466d-8874-a690e504c551",
+      "slug": "kasra",
+      "gate_owner": "gate:kasra"
+    }
+  },
+  "deliverables": {
+    "transparent_substitute_attribution": {
+      "migration": "migrations/0135_fallback_execution_attribution.sql",
+      "columns_added": ["substitute_executor_id", "fallback_reason"],
+      "execution_flow": "When external seats are unreachable or have no live runtime, consumer.ts & agent-do.ts tag execution receipts, task completion updates, and task.completed events with in-worker substitute executor ID and fallback reason",
+      "unblocks": "#1049"
+    },
+    "self_gate_deadlock_prevention": {
+      "enforcement": "Rejects gate_owner == assignee_agent_id across createTask, persistTaskUpdate, reportTaskResult, and MCP task tools with 409 self_gate_conflict / TaskSelfGateError",
+      "exception": "Allows explicit gate:agent-self-completion",
+      "unblocks": "#1030"
+    }
+  },
+  "test_evidence": {
+    "test_files": [
+      "tests/flight-exec-02-fallback-and-gates.test.ts",
+      "tests/tasks-project-filter.test.ts",
+      "tests/mcp-task-tools.test.ts",
+      "tests/flight-a2a-exact-seat-mesh.test.ts",
+      "tests/fleet-bridge.test.ts",
+      "tests/routine-dispatch.test.ts"
+    ],
+    "status": "PASS",
+    "schema_discipline": "applyAllMigrations() compliant"
+  }
+}

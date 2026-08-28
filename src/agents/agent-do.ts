@@ -163,7 +163,16 @@ export class AgentDO extends DurableObject<Env> {
     if (taskId) {
       const cycle = this.getCycles() + 1
       const executionReceiptId = resolveDispatchReceiptId(input) ?? undefined
-      const r = await runTaskExecution(this.env, agent, taskId, { executionReceiptId })
+      const payloadObj = input.payload && typeof input.payload === 'object' ? (input.payload as Record<string, unknown>) : {}
+      const fallback = (input as any).fallback === true || payloadObj.fallback === true
+      const substituteExecutorId = (input as any).substitute_executor_id ?? payloadObj.substitute_executor_id
+      const fallbackReason = (input as any).fallback_reason ?? payloadObj.fallback_reason
+      const r = await runTaskExecution(this.env, agent, taskId, {
+        executionReceiptId,
+        fallback,
+        substituteExecutorId: typeof substituteExecutorId === 'string' ? substituteExecutorId : undefined,
+        fallbackReason: typeof fallbackReason === 'string' ? fallbackReason : undefined,
+      })
       this.recordCycle(cycle, `execute: ${r.decided || r.error || 'no-op'}`)
       return {
         ok: r.ok,
