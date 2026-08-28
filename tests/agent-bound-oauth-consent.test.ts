@@ -166,38 +166,50 @@ afterEach(() => {
 // A. Selection rule — listConsentableAgents / memberMayConsentToAgent
 // ════════════════════════════════════════════════════════════════════════════
 
-describe('A. selection rule — a human may consent to agent A iff active + bound + squad access', () => {
-  it('lists exactly the eligible agent: excludes no-access, unminted, and inactive', async () => {
+describe('A. selection rule — a human may consent to active agents (minted or unminted) on squads with admin access (#1162)', () => {
+  it('lists eligible agents: includes minted and unminted on accessible squads, excludes no-access and inactive', async () => {
     const env = envFor(harness)
     const list = await listConsentableAgents(env, HUMAN)
-    expect(list.map((a) => a.id)).toEqual([AGENT_A.id])
+    expect(list.map((a) => a.id).sort()).toEqual([AGENT_A.id, AGENT_C.id].sort())
+    const agentA = list.find((a) => a.id === AGENT_A.id)
+    const agentC = list.find((a) => a.id === AGENT_C.id)
+    expect(agentA?.minted).toBe(true)
+    expect(agentC?.minted).toBe(false)
   })
 
   it('the capability preview shown for the eligible agent is EXACTLY its own grant set', async () => {
     const env = envFor(harness)
     const list = await listConsentableAgents(env, HUMAN)
-    expect(list[0].capabilities).toEqual([
+    const agentA = list.find((a) => a.id === AGENT_A.id)
+    expect(agentA?.capabilities).toEqual([
       { member_id: MEMBER_AGENT_A, scope_type: 'squad', scope_id: AGENT_A.squad_id, capability: 'member' },
     ])
     // The human's own org:owner-shaped standing grant (if any were seeded) must never
     // appear here — this preview is the agent's grant set, not the human's.
-    expect(list[0].capabilities.some((c) => c.capability === 'owner')).toBe(false)
+    expect(agentA?.capabilities.some((c) => c.capability === 'owner')).toBe(false)
   })
 
-  it('org-wide grant on the human sees every active, bound agent (inheritance, same as canOnSquad)', async () => {
+  it('the capability preview for an unminted agent shows prospective home squad member grant', async () => {
+    const env = envFor(harness)
+    const list = await listConsentableAgents(env, HUMAN)
+    const agentC = list.find((a) => a.id === AGENT_C.id)
+    expect(agentC?.capabilities).toEqual([
+      { member_id: '', scope_type: 'squad', scope_id: AGENT_C.squad_id, capability: 'member' },
+    ])
+  })
+
+  it('org-wide grant on the human sees every active agent (minted and unminted across all squads)', async () => {
     harness.sqlite.exec(`
       INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
         VALUES ('cap-human-org', '${HUMAN}', 'org', NULL, 'admin');
     `)
     const env = envFor(harness)
     const list = await listConsentableAgents(env, HUMAN)
-    // Includes agent-e (squad-c) too — an org grant covers every scope, same as
-    // canOnSquad's own inheritance. Its capability PREVIEW is separately pinned by
-    // section D (clamped to the human's rank, never agent-e's raw 'admin').
-    expect(list.map((a) => a.id).sort()).toEqual([AGENT_A.id, AGENT_B.id, AGENT_E.id].sort())
+    // Includes agent-a, agent-b, agent-c, agent-e (active across all squads); agent-d is inactive so excluded
+    expect(list.map((a) => a.id).sort()).toEqual([AGENT_A.id, AGENT_B.id, AGENT_C.id, AGENT_E.id].sort())
   })
 
-  it('memberMayConsentToAgent: true for the eligible agent', async () => {
+  it('memberMayConsentToAgent: true for the eligible minted agent', async () => {
     const env = envFor(harness)
     expect(await memberMayConsentToAgent(env, HUMAN, AGENT_A.id)).toBe(true)
   })
@@ -207,9 +219,9 @@ describe('A. selection rule — a human may consent to agent A iff active + boun
     expect(await memberMayConsentToAgent(env, HUMAN, AGENT_B.id)).toBe(false)
   })
 
-  it('memberMayConsentToAgent: false — agent-c is unminted (no agent_member_bindings row)', async () => {
+  it('memberMayConsentToAgent: true — agent-c is unminted but human holds admin on its squad (#1162)', async () => {
     const env = envFor(harness)
-    expect(await memberMayConsentToAgent(env, HUMAN, AGENT_C.id)).toBe(false)
+    expect(await memberMayConsentToAgent(env, HUMAN, AGENT_C.id)).toBe(true)
   })
 
   it('memberMayConsentToAgent: false — agent-d is inactive (tombstone)', async () => {
@@ -229,19 +241,10 @@ describe('A. selection rule — a human may consent to agent A iff active + boun
     expect(await memberMayConsentToAgent(env, 'member-nobody', AGENT_A.id)).toBe(false)
   })
 
-  it('memberMayConsentToAgent: false — a binding for this agent exists ONLY in a DIFFERENT tenant (resolveAgentForConsent\'s `b.tenant = ?2` join, adversarial review 2026-08-10 — untested before this)', async () => {
-    // agent-f exists (globally — agents carries no tenant column at all, see the
-    // mintMemberId design comment above), active, but has NO agent_member_bindings
-    // row in OUR tenant ('mumega') — only in a hypothetical other tenant sharing
-    // the same D1. Without the tenant-scoped JOIN, resolveAgentForConsent would
-    // find that OTHER tenant's binding and treat agent-f as legitimately minted.
+  it('memberMayConsentToAgent: false — agent on squad-b where human lacks admin access', async () => {
     harness.sqlite.exec(`
       INSERT INTO agents (id, squad_id, slug, name, status)
-        VALUES ('agent-f', '${AGENT_A.squad_id}', 'agent-f', 'Agent F', 'active');
-      INSERT INTO members (id, email, display_name, status, created_at, tenant)
-        VALUES ('member-agent-f-other-tenant', NULL, 'Agent F (other tenant)', 'active', '2026-08-01T00:00:00.000Z', 'other-tenant');
-      INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
-        VALUES ('other-tenant', 'agent-f', 'member-agent-f-other-tenant', '2026-08-01T00:00:00.000Z');
+        VALUES ('agent-f', 'squad-b', 'agent-f', 'Agent F', 'active');
     `)
     const env = envFor(harness)
     expect(await memberMayConsentToAgent(env, HUMAN, 'agent-f')).toBe(false)
@@ -908,6 +911,74 @@ describe('C4c. POST /oauth/consent — Mint-in-Chooser (__mint_new__)', () => {
     })
     const res = await handleOAuthAuthorize(req, env)
     expect(res.status).toBe(400)
+  })
+})
+
+describe('C4d. POST /oauth/consent — Auto-minting unminted existing agent on consent (#1162)', () => {
+  it('auto-mints dedicated member and binding when consenting to an unminted agent on an accessible squad', async () => {
+    const oauthProvider = stubOAuthProvider()
+    const { env } = httpEnv(harness, oauthProvider)
+    const { consentCookie } = await reachConsentScreen(env, oauthProvider, 'human@example.test')
+
+    // Confirm AGENT_C is initially unminted
+    const beforeBinding = harness.sqlite.prepare(
+      'SELECT COUNT(*) AS n FROM agent_member_bindings WHERE agent_id = ?',
+    ).get(AGENT_C.id) as { n: number }
+    expect(beforeBinding.n).toBe(0)
+
+    const form = new URLSearchParams({
+      consent_nonce: consentCookie,
+      action: 'continue',
+      agent_id: AGENT_C.id,
+    })
+    const req = new Request('https://pot.test/oauth/consent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${consentCookie}` },
+      body: form.toString(),
+    })
+    const res = await handleOAuthAuthorize(req, env)
+    expect(res.status).toBe(302)
+
+    // Verify agent is now bound
+    const afterBinding = harness.sqlite.prepare(
+      'SELECT member_id FROM agent_member_bindings WHERE agent_id = ? AND tenant = ?',
+    ).get(AGENT_C.id, TENANT) as { member_id: string }
+    expect(afterBinding).toBeDefined()
+    expect(afterBinding.member_id).toBeDefined()
+
+    // Verify dedicated member row
+    const memberRow = harness.sqlite.prepare(
+      'SELECT status, display_name FROM members WHERE id = ?',
+    ).get(afterBinding.member_id) as { status: string; display_name: string }
+    expect(memberRow.status).toBe('active')
+    expect(memberRow.display_name).toBe(AGENT_C.name)
+
+    // Verify home squad capability grant
+    const grantRow = harness.sqlite.prepare(
+      'SELECT capability FROM capabilities WHERE member_id = ? AND scope_type = ? AND scope_id = ?',
+    ).get(afterBinding.member_id, 'squad', AGENT_C.squad_id) as { capability: string }
+    expect(grantRow.capability).toBe('member')
+
+    // Verify consent receipt was written
+    const receiptRow = harness.sqlite.prepare(
+      'SELECT agent_id, consenting_member_id, agent_member_id FROM oauth_consent_receipts WHERE agent_id = ?',
+    ).get(AGENT_C.id) as { agent_id: string; consenting_member_id: string; agent_member_id: string }
+    expect(receiptRow.agent_id).toBe(AGENT_C.id)
+    expect(receiptRow.consenting_member_id).toBe(HUMAN)
+    expect(receiptRow.agent_member_id).toBe(afterBinding.member_id)
+
+    // Verify completeAuthorization props
+    const call = oauthProvider.completeAuthorization.mock.calls[0][0]
+    expect(call.props.boundAgentId).toBe(AGENT_C.id)
+    expect(call.props.memberId).toBe(afterBinding.member_id)
+    expect(call.props.consentedByMemberId).toBe(HUMAN)
+
+    // Verify live authContext resolution
+    const authCtx = await buildAuthContextFromProps(env, call.props)
+    expect(authCtx?.boundAgentId).toBe(AGENT_C.id)
+    expect(authCtx?.capabilities).toEqual([
+      { member_id: afterBinding.member_id, scope_type: 'squad', scope_id: AGENT_C.squad_id, capability: 'member' },
+    ])
   })
 })
 
