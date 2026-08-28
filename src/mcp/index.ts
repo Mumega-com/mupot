@@ -114,6 +114,7 @@ import {
   presenceTtlSec,
 } from '../fleet/registry'
 import { agentKeyFingerprint, loadActiveAgentKey } from '../fleet/agent-keys'
+import { consumeDeliveryTurnFence } from '../flight-spine/delivery-turn-fencing'
 import { PROVISION_TOOLS } from './provision'
 import { BOOTSTRAP_TOOLS } from './bootstrap'
 import { CREDENTIAL_CLAIM_TOOLS } from './credential-claim'
@@ -4346,6 +4347,58 @@ const toolConnect: ToolSpec = {
   },
 }
 
+// mupot_delivery_consumed_v1 — thread-bound dynamic delivery consumption tool (FLIGHT DELIV-03 / #1031 & #1050).
+// Strictly verifies {threadId, turnId, nonce, correlation, generation} against the receiver's active turn fence.
+const toolMupotDeliveryConsumedV1: ToolSpec = {
+  name: 'mupot_delivery_consumed_v1',
+  scope: 'thread-bound delivery turn fence consumption',
+  min: 'authenticated',
+  args: '{ deliveryId: string, threadId: string, turnId: string, generation: number, correlation: string, nonce: string, summary?: string }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      deliveryId: STRING_SCHEMA,
+      threadId: STRING_SCHEMA,
+      turnId: STRING_SCHEMA,
+      generation: { type: 'number' },
+      correlation: STRING_SCHEMA,
+      nonce: STRING_SCHEMA,
+      summary: NULLABLE_STRING_SCHEMA,
+    },
+    required: ['deliveryId', 'threadId', 'turnId', 'generation', 'correlation', 'nonce'],
+    additionalProperties: false,
+  },
+  async run(_auth, env, args) {
+    const deliveryId = str(args.deliveryId)
+    const threadId = str(args.threadId)
+    const turnId = str(args.turnId)
+    const generation = typeof args.generation === 'number' ? args.generation : Number(args.generation)
+    const correlation = str(args.correlation)
+    const nonce = str(args.nonce)
+    const summary = typeof args.summary === 'string' ? args.summary : undefined
+
+    if (!deliveryId || !threadId || !turnId || !correlation || !nonce || !Number.isInteger(generation)) {
+      return fail(400, 'invalid_args', 'deliveryId, threadId, turnId, generation, correlation, and nonce are required')
+    }
+
+    const outcome = await consumeDeliveryTurnFence(env, {
+      deliveryId,
+      threadId,
+      turnId,
+      generation,
+      correlation,
+      nonce,
+      summary,
+    })
+
+    if (!outcome.ok) {
+      return fail(outcome.status, outcome.error, outcome.detail)
+    }
+
+    return done(outcome)
+  },
+}
+
 // Exported for the capability-floor test (#183) — the registry-completeness
 // assertion + the dispatch wiring proof read these directly.
 export const TOOLS: ToolSpec[] = [
@@ -4387,6 +4440,7 @@ export const TOOLS: ToolSpec[] = [
   toolBootContext,
   toolOrient,
   toolConnect,
+  toolMupotDeliveryConsumedV1,
   ...AGENT_CONNECTION_TOOLS,
   ...PROJECT_TOOLS,
   ...PROVISION_TOOLS,

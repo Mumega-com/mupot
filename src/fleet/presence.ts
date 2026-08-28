@@ -10,7 +10,7 @@ import { classify, humanAge, type FleetLiveness } from '../dashboard/fleet'
 import type { AgentIdentity } from '../auth/member-bearer'
 import { listFlights } from '../flight/service'
 import { scheduleStates, attachSchedule, type ScheduleStatus } from './schedule-state'
-import {
+export {
   parseSevenAxisCheckin,
   sevenAxisHasValues,
   type SevenAxisPresence,
@@ -79,6 +79,8 @@ export interface SevenAxisDeclaration {
   folder?: string | null
   thread?: string | null
   continuum_name?: string | null
+  session_epoch?: number | null
+  lease_ttl_sec?: number | null
 }
 
 export interface CheckinOpts {
@@ -94,6 +96,8 @@ export interface CheckinOpts {
   folder?: unknown
   thread?: unknown
   continuum_name?: unknown
+  session_epoch?: unknown
+  lease_ttl_sec?: unknown
 }
 
 export function resolveSeatLabel(opts: CheckinOpts): string {
@@ -124,6 +128,8 @@ export function normalizeSevenAxis(opts: CheckinOpts): SevenAxisDeclaration {
     folder: sanitizeAxisString(opts.folder),
     thread: sanitizeAxisString(opts.thread),
     continuum_name: sanitizeAxisString(opts.continuum_name),
+    session_epoch: typeof opts.session_epoch === 'number' && Number.isInteger(opts.session_epoch) && opts.session_epoch > 0 ? opts.session_epoch : null,
+    lease_ttl_sec: typeof opts.lease_ttl_sec === 'number' && Number.isInteger(opts.lease_ttl_sec) && opts.lease_ttl_sec > 0 ? opts.lease_ttl_sec : null,
   }
 }
 
@@ -214,6 +220,8 @@ function bindSevenAxis(opts: CheckinOpts): {
   folder: string | null
   thread: string | null
   continuum_name: string | null
+  session_epoch: number | null
+  lease_ttl_sec: number | null
 } {
   // Omitted axes bind NULL so ON CONFLICT COALESCE keeps a previously declared value.
   // An explicit empty / unknown-invalid harness still stores 'unknown'.
@@ -227,6 +235,8 @@ function bindSevenAxis(opts: CheckinOpts): {
     folder: sanitizeAxisString(opts.folder),
     thread: sanitizeAxisString(opts.thread),
     continuum_name: sanitizeAxisString(opts.continuum_name),
+    session_epoch: typeof opts.session_epoch === 'number' && Number.isInteger(opts.session_epoch) && opts.session_epoch > 0 ? opts.session_epoch : null,
+    lease_ttl_sec: typeof opts.lease_ttl_sec === 'number' && Number.isInteger(opts.lease_ttl_sec) && opts.lease_ttl_sec > 0 ? opts.lease_ttl_sec : null,
   }
 }
 
@@ -244,9 +254,10 @@ export async function recordCheckin(
     `INSERT INTO presence (
         tenant, member_id, display_name, source, label, seat, agent_id,
         harness, machine, model, provider, effort, flight_id, folder, thread, continuum_name,
+        session_epoch, lease_ttl_sec,
         first_seen_at, last_seen_at
       )
-      VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, COALESCE(?7, 'unknown'), ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, datetime('now'), datetime('now'))
+      VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, COALESCE(?7, 'unknown'), ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, COALESCE(?16, 1), COALESCE(?17, 180), datetime('now'), datetime('now'))
       ON CONFLICT(tenant, member_id, label) DO UPDATE SET
         display_name   = excluded.display_name,
         source         = excluded.source,
@@ -261,6 +272,8 @@ export async function recordCheckin(
         folder         = COALESCE(?13, presence.folder),
         thread         = COALESCE(?14, presence.thread),
         continuum_name = COALESCE(?15, presence.continuum_name),
+        session_epoch  = COALESCE(?16, presence.session_epoch),
+        lease_ttl_sec  = COALESCE(?17, presence.lease_ttl_sec),
         last_seen_at   = datetime('now')`,
   )
     .bind(
@@ -279,19 +292,23 @@ export async function recordCheckin(
       axis.folder,
       axis.thread,
       axis.continuum_name,
+      axis.session_epoch,
+      axis.lease_ttl_sec,
     )
     .run()
   return {
     seat: label,
-    harness: axis.harness ?? 'unknown',
+    harness: (axis.harness ?? 'unknown') as SevenAxisHarness,
     machine: axis.machine,
     model: axis.model,
     provider: axis.provider,
-    effort: axis.effort,
+    effort: axis.effort as SevenAxisEffort | null,
     flight_id: axis.flight_id,
     folder: axis.folder,
     thread: axis.thread,
     continuum_name: axis.continuum_name,
+    session_epoch: axis.session_epoch,
+    lease_ttl_sec: axis.lease_ttl_sec,
   }
 }
 

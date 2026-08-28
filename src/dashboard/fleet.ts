@@ -25,7 +25,7 @@ export interface FleetEntry {
   messages: number
 }
 
-export type FleetLiveness = 'active' | 'idle' | 'dead' | 'never'
+export type FleetLiveness = 'active' | 'idle' | 'dead' | 'never' | 'undispatchable'
 
 export interface FleetRow extends FleetEntry {
   liveness: FleetLiveness
@@ -35,7 +35,10 @@ export interface FleetRow extends FleetEntry {
 const ACTIVE_MS = 10 * 60 * 1000 // heartbeat convention: stale at 10 min
 const IDLE_MS = 24 * 60 * 60 * 1000
 
-export function classify(lastSeenMs: number | null, nowMs: number): FleetLiveness {
+export function classify(lastSeenMs: number | null, nowMs: number, labelOrName?: string | null): FleetLiveness {
+  if (labelOrName !== undefined && labelOrName !== null && labelOrName.trim().length === 0) {
+    return 'undispatchable'
+  }
   if (!lastSeenMs) return 'never'
   const age = nowMs - lastSeenMs
   if (age <= ACTIVE_MS) return 'active'
@@ -132,14 +135,17 @@ function rowFromPresence(
   nowMs: number,
 ): FleetRow {
   const lastSeenMs = sqliteUtcToMs(row.last_seen_at)
+  const effectiveLabel = (row.label ?? '').trim()
+  const isUndispatchable = effectiveLabel.length === 0
+  const liveness = isUndispatchable ? 'undispatchable' : classify(lastSeenMs, nowMs)
   return {
     agent: row.agent_id || row.member_id,
     label: row.label || row.source || row.display_name || '—',
     project: null,
-    active_token: classify(lastSeenMs, nowMs) === 'active',
+    active_token: liveness === 'active',
     last_seen_ms: lastSeenMs,
     messages: 0,
-    liveness: classify(lastSeenMs, nowMs),
+    liveness,
     last_seen_human: humanAge(lastSeenMs, nowMs),
   }
 }

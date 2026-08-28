@@ -90,7 +90,7 @@ const toolPresenceRegister: ToolSpec = {
   name: 'presence_register',
   scope: 'self (register/re-register this module in the project-scoped roster)',
   min: 'authenticated',
-  args: '{ adapter: string, project_id?: string|null, kind?: "agent_system"|"workflow"|"surface", capabilities?: string[], model?: string|null }',
+  args: '{ adapter: string, project_id?: string|null, kind?: "agent_system"|"workflow"|"surface", capabilities?: string[], model?: string|null, session_epoch?: number, lease_ttl_sec?: number }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -99,6 +99,8 @@ const toolPresenceRegister: ToolSpec = {
       kind: { type: 'string', enum: MODULE_KIND_ENUM },
       capabilities: OPTIONAL_STRING_ARRAY_SCHEMA,
       model: NULLABLE_STRING_SCHEMA,
+      session_epoch: { type: 'number', description: 'Monotonic per-session registration epoch (Issue #1031).' },
+      lease_ttl_sec: { type: 'number', description: 'Lease TTL window in seconds (Issue #1031).' },
     },
     required: ['adapter'],
     additionalProperties: false,
@@ -139,6 +141,8 @@ const toolPresenceRegister: ToolSpec = {
     }
 
     const model = typeof args.model === 'string' ? args.model : null
+    const sessionEpoch = typeof args.session_epoch === 'number' && Number.isInteger(args.session_epoch) && args.session_epoch > 0 ? args.session_epoch : null
+    const leaseTtlSec = typeof args.lease_ttl_sec === 'number' && Number.isInteger(args.lease_ttl_sec) && args.lease_ttl_sec > 0 ? args.lease_ttl_sec : null
 
     const result = await registerModule(env, {
       identity,
@@ -147,6 +151,8 @@ const toolPresenceRegister: ToolSpec = {
       projectId: projectId ?? null,
       capabilities,
       model,
+      sessionEpoch,
+      leaseTtlSec,
     })
     if (!result.ok) return fail(400, result.error)
     await publishRosterPush(env, projectId ?? null, new Date())
@@ -159,7 +165,7 @@ const toolPresenceHeartbeat: ToolSpec = {
   name: 'presence_heartbeat',
   scope: 'self (keep this module\'s registration online, and optionally report what it is doing)',
   min: 'authenticated',
-  args: '{ project_id?: string|null, state?: "working"|"idle"|"blocked"|"done", message?: string|null, seq?: number }',
+  args: '{ project_id?: string|null, state?: "working"|"idle"|"blocked"|"done", message?: string|null, seq?: number, session_epoch?: number, lease_ttl_sec?: number }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -172,6 +178,8 @@ const toolPresenceHeartbeat: ToolSpec = {
       state: { type: 'string', enum: [...ACTIVITY_STATES] },
       message: NULLABLE_STRING_SCHEMA,
       seq: { type: 'number' },
+      session_epoch: { type: 'number', description: 'Monotonic per-session registration epoch (Issue #1031).' },
+      lease_ttl_sec: { type: 'number', description: 'Lease TTL window in seconds (Issue #1031).' },
     },
     additionalProperties: false,
   },
@@ -228,7 +236,10 @@ const toolPresenceHeartbeat: ToolSpec = {
       return fail(400, 'invalid_args', 'seq/message are only meaningful alongside state')
     }
 
-    const ok = await heartbeatModule(env, identity, projectId ?? null, new Date(), report)
+    const sessionEpoch = typeof args.session_epoch === 'number' && Number.isInteger(args.session_epoch) && args.session_epoch > 0 ? args.session_epoch : null
+    const leaseTtlSec = typeof args.lease_ttl_sec === 'number' && Number.isInteger(args.lease_ttl_sec) && args.lease_ttl_sec > 0 ? args.lease_ttl_sec : null
+
+    const ok = await heartbeatModule(env, identity, projectId ?? null, new Date(), report, { sessionEpoch, leaseTtlSec })
     if (!ok) return fail(404, 'not_registered', 'call presence_register first')
     await publishRosterPush(env, projectId ?? null, new Date())
     if (!report) return done({ ok: true })
