@@ -13,6 +13,9 @@ export const SEVEN_AXIS_KEYS = [
   'provider',
   'effort',
   'flight_id',
+  'folder',
+  'thread',
+  'continuum_name',
 ] as const
 
 export type SevenAxisKey = (typeof SEVEN_AXIS_KEYS)[number]
@@ -42,6 +45,9 @@ export interface SevenAxisPresence {
   provider: string | null
   effort: SevenAxisEffort | null
   flight_id: string | null
+  folder?: string | null
+  thread?: string | null
+  continuum_name?: string | null
 }
 
 export function isRiverCursorSeat(seat: string | null | undefined): boolean {
@@ -73,6 +79,9 @@ export function parseSevenAxisCheckin(
     provider: optionalString(args.provider),
     effort: optionalEnum(args.effort, SEVEN_AXIS_EFFORTS),
     flight_id: optionalString(args.flight_id),
+    folder: optionalString(args.folder),
+    thread: optionalString(args.thread),
+    continuum_name: optionalString(args.continuum_name),
   }
 }
 

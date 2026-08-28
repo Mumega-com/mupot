@@ -137,6 +137,7 @@ import {
   toolSupabaseQuery,
   toolSupabaseMutate,
 } from './supabase-tools'
+import { toolMintBody } from './body-mint'
 import { dispatchFlight } from '../flight/dispatch'
 import {
   deliverFlightLandedEvent,
@@ -305,13 +306,27 @@ async function resolveAuth(c: {
   return authenticateMember(c)
 }
 
-// ── member memory scope ──────────────────────────────────────────────────────
-// The MemoryPort is keyed by an opaque id string. A member's OWN memory lives
-// under a namespaced key so it never collides with an agent id (which is a bare
-// uuid). recall/remember for a member always use this — a member can only touch
-// their own scope; there is no cross-member or agent memory access via this seam.
-function memberMemoryScope(memberId: string): string {
-  return `member:${memberId}`
+// Continuum identity extraction: extracts the root agent continuum name (e.g. "river" from "hadi-river", "river-cursor", "muvps_river")
+export function extractContinuumName(rawSlugOrName: string): string {
+  const cleaned = rawSlugOrName.toLowerCase().trim()
+  // Match prefix or suffix qualifiers: e.g. "hadi-river" -> "river", "river-cursor" -> "river", "muvps_kasra" -> "kasra"
+  const knownContinuums = ['river', 'kasra', 'loom', 'dara', 'athena', 'cairn', 'hermes']
+  for (const known of knownContinuums) {
+    if (cleaned === known || cleaned.endsWith(`-${known}`) || cleaned.endsWith(`_${known}`) || cleaned.startsWith(`${known}-`) || cleaned.startsWith(`${known}_`)) {
+      return known
+    }
+  }
+  return cleaned
+}
+
+// ── member & continuum memory scope ──────────────────────────────────────────
+// The MemoryPort is keyed by an opaque id string. A member/agent's memory lives
+// under a namespaced key so it never collides with other domains.
+function memberMemoryScope(principalId: string, continuumName?: string | null): string {
+  if (continuumName && continuumName.trim().length > 0) {
+    return `continuum:${extractContinuumName(continuumName)}`
+  }
+  return `member:${principalId}`
 }
 
 function squadMemoryScope(squadId: string): string {
@@ -2705,15 +2720,22 @@ const toolFlightList: ToolSpec = {
   },
 }
 
-// remember — write to the MEMBER's OWN memory scope. cap: authenticated member.
+// remember — write to the MEMBER's OWN or CONTINUUM memory scope. cap: authenticated member.
 const toolRemember: ToolSpec = {
   name: 'remember',
-  scope: 'self',
+  scope: 'self / continuum',
   min: 'authenticated',
-  args: '{ text: string, concepts?: string[] }',
+  args: '{ text: string, concepts?: string[], continuum?: string }',
   inputSchema: {
     type: 'object',
-    properties: { text: STRING_SCHEMA, concepts: OPTIONAL_STRING_ARRAY_SCHEMA },
+    properties: {
+      text: STRING_SCHEMA,
+      concepts: OPTIONAL_STRING_ARRAY_SCHEMA,
+      continuum: {
+        type: 'string',
+        description: 'Optional agent continuum name (e.g. "river", "kasra"). When provided, memory is shared across all concurrent bodies of this continuum.',
+      },
+    },
     required: ['text'],
     additionalProperties: false,
   },
@@ -2724,13 +2746,14 @@ const toolRemember: ToolSpec = {
     const concepts = readConcepts(args.concepts)
     if (concepts && !Array.isArray(concepts)) return concepts
 
+    const continuum = str(args.continuum) || null
     const principalId = auth.memberId || auth.boundAgentId || auth.userId
     if (!principalId) return fail(401, 'unauthenticated', 'no valid member or agent identity')
 
-    const scope = memberMemoryScope(principalId)
+    const scope = memberMemoryScope(principalId, continuum)
     try {
       const id = await createMemory(env).remember(scope, text, concepts)
-      return done({ engram_id: id })
+      return done({ engram_id: id, scope, continuum: continuum ? extractContinuumName(continuum) : undefined })
     } catch (err: any) {
       if (err?.name === 'MemoryError') {
         return fail(err.status, err.code, err.message)
@@ -2740,15 +2763,22 @@ const toolRemember: ToolSpec = {
   },
 }
 
-// recall — read from the MEMBER's OWN memory scope only. cap: authenticated.
+// recall — read from the MEMBER's OWN or CONTINUUM memory scope. cap: authenticated.
 const toolRecall: ToolSpec = {
   name: 'recall',
-  scope: 'self',
+  scope: 'self / continuum',
   min: 'authenticated',
-  args: '{ query: string, limit?: number }',
+  args: '{ query: string, limit?: number, continuum?: string }',
   inputSchema: {
     type: 'object',
-    properties: { query: STRING_SCHEMA, limit: OPTIONAL_NUMBER_SCHEMA },
+    properties: {
+      query: STRING_SCHEMA,
+      limit: OPTIONAL_NUMBER_SCHEMA,
+      continuum: {
+        type: 'string',
+        description: 'Optional agent continuum name (e.g. "river", "kasra") to recall shared continuum memory across bodies.',
+      },
+    },
     required: ['query'],
     additionalProperties: false,
   },
@@ -2763,13 +2793,14 @@ const toolRecall: ToolSpec = {
       return fail(400, 'invalid_args', 'limit must be a number')
     }
 
+    const continuum = str(args.continuum) || null
     const principalId = auth.memberId || auth.boundAgentId || auth.userId
     if (!principalId) return fail(401, 'unauthenticated', 'no valid member or agent identity')
 
-    const scope = memberMemoryScope(principalId)
+    const scope = memberMemoryScope(principalId, continuum)
     try {
       const hits = await createMemory(env).recall(scope, query, limit)
-      return done({ hits })
+      return done({ hits, scope, continuum: continuum ? extractContinuumName(continuum) : undefined })
     } catch (err: any) {
       if (err?.name === 'MemoryError') {
         return fail(err.status, err.code, err.message)
@@ -4369,6 +4400,7 @@ export const TOOLS: ToolSpec[] = [
   toolSupabaseSchema,
   toolSupabaseQuery,
   toolSupabaseMutate,
+  toolMintBody,
 ]
 
 const TOOL_BY_NAME = new Map<string, ToolSpec>(TOOLS.map((t) => [t.name, t]))
