@@ -2724,9 +2724,19 @@ const toolRemember: ToolSpec = {
     const concepts = readConcepts(args.concepts)
     if (concepts && !Array.isArray(concepts)) return concepts
 
-    const scope = memberMemoryScope(auth.memberId as string)
-    const id = await createMemory(env).remember(scope, text, concepts)
-    return done({ engram_id: id })
+    const principalId = auth.memberId || auth.boundAgentId || auth.userId
+    if (!principalId) return fail(401, 'unauthenticated', 'no valid member or agent identity')
+
+    const scope = memberMemoryScope(principalId)
+    try {
+      const id = await createMemory(env).remember(scope, text, concepts)
+      return done({ engram_id: id })
+    } catch (err: any) {
+      if (err?.name === 'MemoryError') {
+        return fail(err.status, err.code, err.message)
+      }
+      return fail(500, 'memory_operation_failed', err instanceof Error ? err.message : String(err))
+    }
   },
 }
 
@@ -2753,9 +2763,19 @@ const toolRecall: ToolSpec = {
       return fail(400, 'invalid_args', 'limit must be a number')
     }
 
-    const scope = memberMemoryScope(auth.memberId as string)
-    const hits = await createMemory(env).recall(scope, query, limit)
-    return done({ hits })
+    const principalId = auth.memberId || auth.boundAgentId || auth.userId
+    if (!principalId) return fail(401, 'unauthenticated', 'no valid member or agent identity')
+
+    const scope = memberMemoryScope(principalId)
+    try {
+      const hits = await createMemory(env).recall(scope, query, limit)
+      return done({ hits })
+    } catch (err: any) {
+      if (err?.name === 'MemoryError') {
+        return fail(err.status, err.code, err.message)
+      }
+      return fail(500, 'memory_operation_failed', err instanceof Error ? err.message : String(err))
+    }
   },
 }
 
@@ -2785,12 +2805,20 @@ const toolSquadRemember: ToolSpec = {
       args,
       'member',
       'squad_id required unless the token is agent-bound',
+      isOrgOwnerAdmin(auth),
     )
     if (!squadRes.ok) return squadRes
 
     const scope = squadMemoryScope(squadRes.squad.id)
-    const id = await createMemory(env).remember(scope, text, concepts)
-    return done({ engram_id: id, squad_id: squadRes.squad.id, scope })
+    try {
+      const id = await createMemory(env).remember(scope, text, concepts)
+      return done({ engram_id: id, squad_id: squadRes.squad.id, scope })
+    } catch (err: any) {
+      if (err?.name === 'MemoryError') {
+        return fail(err.status, err.code, err.message)
+      }
+      return fail(500, 'memory_operation_failed', err instanceof Error ? err.message : String(err))
+    }
   },
 }
 
@@ -2819,12 +2847,20 @@ const toolSquadRecall: ToolSpec = {
       args,
       'observer',
       'squad_id required unless the token is agent-bound',
+      isOrgOwnerAdmin(auth),
     )
     if (!squadRes.ok) return squadRes
 
     const scope = squadMemoryScope(squadRes.squad.id)
-    const hits = await createMemory(env).recall(scope, query, limit)
-    return done({ squad_id: squadRes.squad.id, scope, hits })
+    try {
+      const hits = await createMemory(env).recall(scope, query, limit)
+      return done({ squad_id: squadRes.squad.id, scope, hits })
+    } catch (err: any) {
+      if (err?.name === 'MemoryError') {
+        return fail(err.status, err.code, err.message)
+      }
+      return fail(500, 'memory_operation_failed', err instanceof Error ? err.message : String(err))
+    }
   },
 }
 
@@ -2868,8 +2904,15 @@ const toolProjectRemember: ToolSpec = {
     }
 
     const scope = projectMemoryScope(projectId)
-    const id = await createMemory(env).remember(scope, text, concepts)
-    return done({ engram_id: id, project_id: projectId, scope })
+    try {
+      const id = await createMemory(env).remember(scope, text, concepts)
+      return done({ engram_id: id, project_id: projectId, scope })
+    } catch (err: any) {
+      if (err?.name === 'MemoryError') {
+        return fail(err.status, err.code, err.message)
+      }
+      return fail(500, 'memory_operation_failed', err instanceof Error ? err.message : String(err))
+    }
   },
 }
 
@@ -2898,8 +2941,15 @@ const toolProjectRecall: ToolSpec = {
     if (!project) return fail(404, 'project_not_found')
 
     const scope = projectMemoryScope(projectId)
-    const hits = await createMemory(env).recall(scope, query, limit)
-    return done({ project_id: projectId, scope, hits })
+    try {
+      const hits = await createMemory(env).recall(scope, query, limit)
+      return done({ project_id: projectId, scope, hits })
+    } catch (err: any) {
+      if (err?.name === 'MemoryError') {
+        return fail(err.status, err.code, err.message)
+      }
+      return fail(500, 'memory_operation_failed', err instanceof Error ? err.message : String(err))
+    }
   },
 }
 
