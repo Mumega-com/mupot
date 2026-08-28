@@ -1,0 +1,58 @@
+{
+  "schema": "mupot.canary.artifact/v1",
+  "flight_id": "c6a2f8a8-99d1-4f7c-a0b0-a4299e13b28a",
+  "task_id": "32f8551a-2b59-4e18-aa90-ba25aae10047",
+  "recorded_at": "2026-08-28T00:03:30Z",
+  "worker": {
+    "agent_id": "96e85516-720b-47fd-9cb6-655eecc919aa",
+    "name": "Cursor River",
+    "slug": "cursor-river",
+    "seat": "river-cursor",
+    "harness": "cursor-cloud",
+    "machine": "cursor-cloud-vm",
+    "cloud_agent_id": "bc-23fa4ed2-908b-4f75-8085-e754041568c5",
+    "worktree_branch": "cursor/flight-river-lead-agent-onboarding-warm-cache-35a3",
+    "commit_sha": "21512d62d2946c103daec8bbd52e5a84093cb7aa"
+  },
+  "gate": {
+    "agent_id": "a065e61c-6a93-42fc-b070-b541631202f1",
+    "slug": "hadi-grok",
+    "role": "independent gate — hadi-mac",
+    "gate_owner": "gate:hadi-grok",
+    "authorship_stake": false
+  },
+  "delivery_contract": {
+    "accepted": {
+      "request_id": "flight.c6a2f8a8-99d1-4f7c-a0b0-a4299e13b28a",
+      "timestamp": "2026-08-28T00:01:16Z",
+      "status": "go",
+      "dispatched_by": "087a816b-ab9f-400f-8d53-f6f97b94a725"
+    },
+    "delivered": {
+      "wake_request": 2744,
+      "timestamp": "2026-08-28T00:01:20Z",
+      "channel": "mupot_fleet_wake"
+    },
+    "consumed": {
+      "seat": "river-cursor",
+      "timestamp": "2026-08-28T00:01:30Z",
+      "status": "in_progress"
+    },
+    "correlated_ack": {
+      "reply_id": "f0b0c150-c012-4b61-a32b-1c15cfd681ce",
+      "seq": 2749,
+      "timestamp": "2026-08-28T00:02:45Z",
+      "target": "087a816b-ab9f-400f-8d53-f6f97b94a725"
+    }
+  },
+  "verification": {
+    "no_in_worker_completion": true,
+    "no_credential_copy": true,
+    "no_merge": true,
+    "no_deploy": true,
+    "no_launchd": true,
+    "no_grok_private_home": true,
+    "closed_hadi_river_standdown": true,
+    "local_hadi_cursor_isolated": true
+  }
+}
