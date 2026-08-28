@@ -441,6 +441,20 @@ export async function landGovernedFlight(
        ON CONFLICT (tenant, flight_id, event_type) DO NOTHING`,
     ).bind(eventId, env.TENANT_SLUG, id, opts.actor.kind, opts.actor.id, receiptPayload, createdAt).run()
     receipt = await flightReceiptExists(env, id)
+
+    // FLIGHT-10: Record cryptographic receipt to flight_receipts ledger table if available
+    try {
+      const flightReceiptId = crypto.randomUUID()
+      const digestBuffer = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(receiptPayload))
+      const digestHex = Array.from(new Uint8Array(digestBuffer)).map((b) => b.toString(16).padStart(2, '0')).join('')
+      await env.DB.prepare(
+        `INSERT INTO flight_receipts (id, tenant, flight_id, agent_id, payload_digest, payload, recorded_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+           ON CONFLICT (tenant, flight_id) DO NOTHING`,
+      ).bind(flightReceiptId, env.TENANT_SLUG, id, opts.agent_id, digestHex, receiptPayload, createdAt).run()
+    } catch {
+      // Table may be absent in pre-migration environments; outbox remains canonical
+    }
   } catch (error) {
     // A receipt that fails to write must not un-land a landed flight — that is the whole
     // point of separating the two outcomes. Be honest about the consequence though: there
