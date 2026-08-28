@@ -4416,6 +4416,184 @@ import {
   ratifyGovernance,
   getGovernanceStatus,
 } from '../governance/service'
+import { runRouterTick } from '../router/engine'
+import { rotateMemberToken, sweepExpiringTokensWarning } from '../auth/token-lifecycle'
+import {
+  checkAndReserveExecution,
+  recordExecutionSpend,
+  getAgentSpendStatus,
+} from '../metering/service'
+import { runGovernedLoopDriverTick } from '../loops/driver'
+
+// loop_driver_tick — autonomous loop driver tick executing active loops under propose-only/founder brakes (FLIGHT-LOOP-UNHOLD)
+const toolLoopDriverTick: ToolSpec = {
+  name: 'loop_driver_tick',
+  scope: 'execute autonomous governed loop cycles with propose-only boundaries',
+  min: 'authenticated',
+  args: '{ loop_id?: string }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      loop_id: NULLABLE_STRING_SCHEMA,
+    },
+    additionalProperties: false,
+  },
+  async run(_auth, env, args) {
+    const loopId = typeof args.loop_id === 'string' ? args.loop_id.trim() : undefined
+    const result = await runGovernedLoopDriverTick(env, { loopId })
+    return done(result)
+  },
+}
+
+// execution_meter_check — check and reserve execution capacity with pre-flight budget stop (FLIGHT-METER / F8)
+const toolExecutionMeterCheck: ToolSpec = {
+  name: 'execution_meter_check',
+  scope: 'check and reserve model execution capacity against budget limits',
+  min: 'authenticated',
+  args: '{ agent_id: string, estimate_micro_usd?: number, budget_cap_cents?: number, budget_cap_micro_usd?: number, budget_window?: "day" | "week" }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      agent_id: STRING_SCHEMA,
+      estimate_micro_usd: { type: 'number' },
+      budget_cap_cents: { type: 'number' },
+      budget_cap_micro_usd: { type: 'number' },
+      budget_window: { type: 'string', enum: ['day', 'week'] },
+    },
+    required: ['agent_id'],
+    additionalProperties: false,
+  },
+  async run(_auth, env, args) {
+    const agentId = str(args.agent_id)
+    if (!agentId) return fail(400, 'invalid_args', 'agent_id is required')
+
+    const result = await checkAndReserveExecution(env, agentId, {
+      estimateMicroUsd: typeof args.estimate_micro_usd === 'number' ? args.estimate_micro_usd : undefined,
+      budgetCapCents: typeof args.budget_cap_cents === 'number' ? args.budget_cap_cents : undefined,
+      budgetCapMicroUsd: typeof args.budget_cap_micro_usd === 'number' ? args.budget_cap_micro_usd : undefined,
+      budgetWindow: args.budget_window as any,
+    })
+
+    if (!result.ok) return fail(429, result.reason, { retryAfterSec: result.retryAfterSec })
+    return done(result)
+  },
+}
+
+// execution_meter_status — query unified execution spend and budget status (FLIGHT-METER / F8)
+const toolExecutionMeterStatus: ToolSpec = {
+  name: 'execution_meter_status',
+  scope: 'inspect real-time spend and budget limits for an agent',
+  min: 'authenticated',
+  args: '{ agent_id: string, budget_cap_cents?: number, budget_cap_micro_usd?: number, budget_window?: "day" | "week" }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      agent_id: STRING_SCHEMA,
+      budget_cap_cents: { type: 'number' },
+      budget_cap_micro_usd: { type: 'number' },
+      budget_window: { type: 'string', enum: ['day', 'week'] },
+    },
+    required: ['agent_id'],
+    additionalProperties: false,
+  },
+  async run(_auth, env, args) {
+    const agentId = str(args.agent_id)
+    if (!agentId) return fail(400, 'invalid_args', 'agent_id is required')
+
+    const status = await getAgentSpendStatus(env, agentId, {
+      budgetCapCents: typeof args.budget_cap_cents === 'number' ? args.budget_cap_cents : undefined,
+      budgetCapMicroUsd: typeof args.budget_cap_micro_usd === 'number' ? args.budget_cap_micro_usd : undefined,
+      budgetWindow: args.budget_window as any,
+    })
+
+    return done(status)
+  },
+}
+
+// token_rotate — rotates a member token and mints replacement with same permissions (FLIGHT-002)
+const toolTokenRotate: ToolSpec = {
+  name: 'token_rotate',
+  scope: 'rotate active credential and mint replacement with automated audit',
+  min: 'admin',
+  args: '{ token_id: string, expiry_days?: number, reason?: string }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      token_id: STRING_SCHEMA,
+      expiry_days: { type: 'number' },
+      reason: NULLABLE_STRING_SCHEMA,
+    },
+    required: ['token_id'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const tokenId = str(args.token_id)
+    if (!tokenId) return fail(400, 'invalid_args', 'token_id is required')
+
+    const rotatedBy = auth.memberId ?? auth.userId
+    const expiryDays = typeof args.expiry_days === 'number' ? args.expiry_days : undefined
+    const reason = typeof args.reason === 'string' ? args.reason : undefined
+
+    const result = await rotateMemberToken(env, tokenId, {
+      rotatedBy,
+      expiryDays,
+      reason,
+    })
+
+    if (!result.ok) return fail(400, result.error ?? 'rotation_failed')
+    return done(result)
+  },
+}
+
+// token_sweep_expiring — sweep and notify active credentials expiring within threshold (FLIGHT-002)
+const toolTokenSweepExpiring: ToolSpec = {
+  name: 'token_sweep_expiring',
+  scope: 'sweep and inspect credentials expiring within warning threshold',
+  min: 'admin',
+  args: '{ warning_days?: number }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      warning_days: { type: 'number' },
+    },
+    additionalProperties: false,
+  },
+  async run(_auth, env, args) {
+    const warningDays = typeof args.warning_days === 'number' ? args.warning_days : 7
+    const result = await sweepExpiringTokensWarning(env, warningDays)
+    return done(result)
+  },
+}
+
+// router_tick — runs the edge-native active router matching unassigned tasks to continuum bodies (FLIGHT-ROUTER / W3)
+const toolRouterTick: ToolSpec = {
+  name: 'router_tick',
+  scope: 'edge-native active router matching unassigned tasks to continuum bodies',
+  min: 'authenticated',
+  args: '{ dry_run?: boolean, squad_id?: string, limit?: number }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      dry_run: { type: 'boolean' },
+      squad_id: NULLABLE_STRING_SCHEMA,
+      limit: { type: 'number' },
+    },
+    additionalProperties: false,
+  },
+  async run(_auth, env, args) {
+    const dryRun = args.dry_run !== false
+    const squadId = typeof args.squad_id === 'string' ? args.squad_id.trim() : undefined
+    const limit = typeof args.limit === 'number' ? args.limit : undefined
+
+    const result = await runRouterTick(env, {
+      dryRun,
+      squadId,
+      limit,
+    })
+
+    return done(result)
+  },
+}
 
 // governance_propose — create constitutional resolution / governance proposal (FLIGHT-005 / mumega-com#723)
 const toolGovernancePropose: ToolSpec = {
@@ -4742,6 +4920,12 @@ export const TOOLS: ToolSpec[] = [
   toolGovernanceVote,
   toolGovernanceRatify,
   toolGovernanceStatus,
+  toolRouterTick,
+  toolTokenRotate,
+  toolTokenSweepExpiring,
+  toolExecutionMeterCheck,
+  toolExecutionMeterStatus,
+  toolLoopDriverTick,
   ...AGENT_CONNECTION_TOOLS,
   ...PROJECT_TOOLS,
   ...PROVISION_TOOLS,

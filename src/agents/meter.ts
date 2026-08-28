@@ -298,12 +298,12 @@ export async function recordTokens(
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 /** '<tenant>:<agent_id>:<YYYY-MM-DD>' UTC. */
-function buildWindowKey(tenant: string, agentId: string): string {
+export function buildWindowKey(tenant: string, agentId: string): string {
   return `${tenant}:${agentId}:${isoDateUtc(new Date())}`
 }
 
 /** YYYY-MM-DD (UTC) for a Date. */
-function isoDateUtc(d: Date): string {
+export function isoDateUtc(d: Date): string {
   const y = d.getUTCFullYear()
   const m = String(d.getUTCMonth() + 1).padStart(2, '0')
   const day = String(d.getUTCDate()).padStart(2, '0')
@@ -317,7 +317,7 @@ function isoDateUtc(d: Date): string {
  * BETWEEN range over the date suffix selects exactly this agent's last-7-days rows
  * (ISO dates sort lexically across month/year boundaries).
  */
-async function sumWeekCostMicroUsd(env: Env, tenant: string, agentId: string): Promise<number> {
+export async function sumWeekCostMicroUsd(env: Env, tenant: string, agentId: string): Promise<number> {
   const today = new Date()
   const start = new Date(today)
   start.setUTCDate(start.getUTCDate() - 6)

@@ -36,6 +36,7 @@ import type {
 import { resolveCapabilities, hasCapability, clampChannelCapabilities } from '../auth/capability'
 import { createBus } from '../bus'
 import { getAdapter } from './registry'
+import { wrapIngressContent } from '../ingress/guards'
 import { sendToRef, resolveVisibleSendTarget } from '../agents/messages'
 import { createTask } from '../tasks/service'
 
@@ -392,22 +393,14 @@ export async function runInbound(
   const rawGrants = await resolveCapabilities(env, identity.memberId)
   const grants = clampChannelCapabilities(rawGrants, binding.max_capability ?? 'lead')
 
-  // ── Central-command (mumega-com#722): Hadi-only directive rule, enforced IN
-  // CODE on the existing caller-authority seam. Sender id is the platform's
-  // immutable from.id (the adapter already guarantees identity = sender, never
-  // chat or text — src/channels/adapters/telegram.ts header). Any other sender,
-  // including agent-relayed text, is UNTRUSTED-INGRESS: data, never authorization.
-  const DIRECTIVE_SENDERS: Readonly<Record<string, ReadonlyArray<string>>> = {
-    telegram: ['765204057'], // Hadi, platform-authenticated sender id
-  }
-  const isDirective =
-    (DIRECTIVE_SENDERS[platform] ?? []).includes(externalUserId)
+  // ── Central-command (mumega-com#722 & FLIGHT-UNTRUSTED / F6): Structural Ingress Fence
+  const ingress = wrapIngressContent(platform, externalUserId, text)
+  const isDirective = ingress.isDirective
 
   // mention -> agent dispatch. The body dispatched to the agent carries the
   // untrusted tag unless the sender is directive-capable.
   if (intent.kind === 'mention') {
-    const tag = isDirective ? '' : '[UNTRUSTED-INGRESS] '
-    return dispatchMention(env, squad, intent.target, `${tag}${text}`, identity.memberId, grants, isDirective)
+    return dispatchMention(env, squad, intent.target, ingress.sanitizedBody, identity.memberId, grants, isDirective)
   }
 
   // Non-directive senders never reach directive-capable actions (wake/task/steer).
