@@ -36,14 +36,44 @@ export async function callerHoldsActionCapability(
   return hasSurfaceCap(env, auth, action.startsWith('action:') ? action : `action:${action}`)
 }
 
-// ── ladder ────────────────────────────────────────────────────────────────────
-
-const RANK: Record<Capability, number> = {
+/**
+ * Capability ladder rank mapping.
+ */
+export const CAPABILITY_RANK: Record<Capability, number> = {
   observer: 1,
   member: 2,
   lead: 3,
   admin: 4,
   owner: 5,
+}
+
+const RANK = CAPABILITY_RANK
+
+/**
+ * Non-directory channel capability ceilings (#799 / FLIGHT-003).
+ * Non-directory channels (telegram, im, webhook, external relays) cannot hold standing admin/owner authority.
+ */
+export const DEFAULT_NON_DIRECTORY_CHANNEL_MAX_CAP: Capability = 'lead'
+
+/**
+ * Clamp a capability to a maximum ceiling.
+ */
+export function clampCapability(cap: Capability, maxCap: Capability = DEFAULT_NON_DIRECTORY_CHANNEL_MAX_CAP): Capability {
+  return RANK[cap] > RANK[maxCap] ? maxCap : cap
+}
+
+/**
+ * Clamp an array of capability grants to a maximum capability ceiling.
+ * Org-level grants above maxCap are clamped or scoped, preventing non-directory channel escalation.
+ */
+export function clampChannelCapabilities(
+  grants: CapabilityGrant[],
+  maxCap: Capability = DEFAULT_NON_DIRECTORY_CHANNEL_MAX_CAP,
+): CapabilityGrant[] {
+  return grants.map((g) => ({
+    ...g,
+    capability: clampCapability(g.capability, maxCap),
+  }))
 }
 
 function meets(have: Capability, min: Capability): boolean {
@@ -92,6 +122,9 @@ function meets(have: Capability, min: Capability): boolean {
  */
 export function isOrgAdmin(auth: AuthContext | null | undefined): boolean {
   if (!auth) return false
+  // Channel authority shrink (#799 / FLIGHT-003): non-directory channels (im, telegram, external webhooks)
+  // never resolve standing org-admin authority. An escalation requires explicit 2FA or web/directory login.
+  if (auth.channel === 'im') return false
   // Legacy plane — still honoured, so the bootstrap owner never regresses.
   if (auth.role === 'owner' || auth.role === 'admin') return true
   // Modern plane — an ORG-scope grant at admin rank or above.

@@ -34,7 +34,7 @@ import type {
   Squad,
   Task,
 } from '../types'
-import { resolveCapabilities, hasCapability, holdsCapabilityFloor, canOnSquad, hasSurfaceCap, callerHoldsActionCapability } from '../auth/capability'
+import { resolveCapabilities, hasCapability, holdsCapabilityFloor, canOnSquad, hasSurfaceCap, callerHoldsActionCapability, clampChannelCapabilities } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc, touchTokenLastUsed } from '../auth/token-lifecycle'
 import { callerHoldsGateCapability, verdictPrincipal } from '../tasks/index'
 import { resolveSoleGateOwnerAgent } from '../gates/grants'
@@ -426,7 +426,13 @@ export async function authenticateMember(c: {
   void touchTokenLastUsed(c.env, tokenHash)
   if (row.status !== 'active') return null
 
-  const capabilities = await resolveCapabilities(c.env, row.member_id)
+  let capabilities = await resolveCapabilities(c.env, row.member_id)
+
+  // Channel authority shrink (#799 / FLIGHT-003): non-directory IM tokens cannot carry standing admin/owner
+  const channel = row.channel ?? 'workspace'
+  if (channel === 'im') {
+    capabilities = clampChannelCapabilities(capabilities, 'lead')
+  }
 
   // role is the coarse org-role field on AuthContext; a member principal is
   // 'member' at the org-role layer. The REAL authorization is `capabilities`.
@@ -436,7 +442,7 @@ export async function authenticateMember(c: {
     role: 'member',
     tenant: c.env.TENANT_SLUG, // environment-derived, never from the client
     memberId: row.member_id,
-    channel: row.channel ?? 'workspace',
+    channel,
     capabilities,
     boundAgentId: row.bound_agent_id ?? null, // the weld: an agent-scoped token orients ITSELF
     tokenId: row.token_id,
@@ -658,6 +664,8 @@ async function resolveTaskSquad(
 // src/auth/capability.ts#isOrgAdmin (dashboard route gate), translated from coarse
 // session role to the capability-grant system real MCP callers carry.
 export function hasWorkspaceAdmin(auth: AuthContext): boolean {
+  // Channel authority shrink (#799 / FLIGHT-003): non-directory channels (im, telegram) cannot hold workspace admin
+  if (auth.channel === 'im') return false
   if (auth.capabilities === undefined) return auth.role === 'owner' || auth.role === 'admin'
   return hasCapability(auth.capabilities, 'org', null, 'admin')
 }
@@ -671,6 +679,8 @@ export function hasWorkspaceAdmin(auth: AuthContext): boolean {
 // the dashboard/MCP split in mupot#530 — so an authority check that must not
 // fail closed on a real owner has to consult both.
 export function isOrgOwnerAdmin(auth: AuthContext): boolean {
+  // Channel authority shrink (#799 / FLIGHT-003): non-directory channels (im, telegram) cannot hold org owner/admin
+  if (auth.channel === 'im') return false
   return hasWorkspaceAdmin(auth) || auth.role === 'owner' || auth.role === 'admin'
 }
 

@@ -1,0 +1,54 @@
+{
+  "schema": "mupot.flight.execution_receipt/v1",
+  "flight_id": "flight-003-channel-authority-shrink",
+  "name": "FLIGHT-003: Channel Authority Shrink & Scope Caps (#799)",
+  "recorded_at": "2026-08-28T18:35:00Z",
+  "crew": {
+    "lead": {
+      "agent_id": "96e85516-720b-47fd-9cb6-655eecc919aa",
+      "slug": "river",
+      "name": "Cursor River Lead",
+      "seat": "river-cursor",
+      "harness": "cursor-cloud",
+      "machine": "cursor-cloud-vm",
+      "branch": "cursor/flight-river-lead-agent-onboarding-warm-cache-35a3"
+    },
+    "coordination": {
+      "agent_id": "17aa283f-8cdb-4c1f-864f-1974ee45a033",
+      "slug": "loom",
+      "seat": "muvps-loom"
+    },
+    "gate": {
+      "agent_id": "ea2b0370-9830-466d-8874-a690e504c551",
+      "slug": "kasra",
+      "gate_owner": "gate:kasra"
+    }
+  },
+  "deliverables": {
+    "channel_capability_ceilings": {
+      "clamping": "clampChannelCapabilities and clampCapability clamp raw grants by channel/binding ceilings (e.g. max_capability, default lead/member)",
+      "integration": "src/auth/capability.ts, src/channels/index.ts, src/mcp/index.ts",
+      "unblocks": "#799"
+    },
+    "anti_escalation_and_scope_fences": {
+      "isOrgAdmin_channel_guard": "isOrgAdmin(auth) returns false for channel='im', preventing non-directory channel sessions from inheriting standing org-admin authority",
+      "scope_confinement": "Inbound mentions, status, and task creation remain strictly confined to visible squad and project scopes without ambient bypasses",
+      "legacy_role_bypass_eliminated": "legacyOwnerAdmin on channel sessions cannot bypass squad authorization"
+    }
+  },
+  "test_evidence": {
+    "test_files": [
+      "tests/flight-003-channel-authority-shrink.test.ts",
+      "tests/delivery-turn-fencing.test.ts",
+      "tests/flight-exec-02-fallback-and-gates.test.ts",
+      "tests/channel-central-command.test.ts",
+      "tests/im-hermes.test.ts",
+      "tests/helpers-migrations.test.ts",
+      "tests/mcp-task-tools.test.ts"
+    ],
+    "status": "PASS",
+    "tests_total": 158,
+    "tests_passed": 158,
+    "schema_discipline": "applyAllMigrations() compliant"
+  }
+}
