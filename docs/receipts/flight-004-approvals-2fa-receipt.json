@@ -1,0 +1,62 @@
+{
+  "schema": "mupot.flight.execution_receipt/v1",
+  "flight_id": "flight-004-native-2fa-approvals",
+  "name": "FLIGHT-004: Native In-Pot 2FA & Approvals (mumega-com#725)",
+  "recorded_at": "2026-08-28T19:09:00Z",
+  "crew": {
+    "lead": {
+      "agent_id": "96e85516-720b-47fd-9cb6-655eecc919aa",
+      "slug": "river",
+      "name": "Cursor River Lead",
+      "seat": "river-cursor",
+      "harness": "cursor-cloud",
+      "machine": "cursor-cloud-vm",
+      "branch": "cursor/flight-river-lead-agent-onboarding-warm-cache-35a3"
+    },
+    "coordination": {
+      "agent_id": "17aa283f-8cdb-4c1f-864f-1974ee45a033",
+      "slug": "loom",
+      "seat": "muvps-loom"
+    },
+    "gate": {
+      "agent_id": "ea2b0370-9830-466d-8874-a690e504c551",
+      "slug": "kasra",
+      "gate_owner": "gate:kasra"
+    }
+  },
+  "deliverables": {
+    "action_payload_hash_binding": {
+      "canonicalization": "Deterministic SHA-256 digest computation (computeActionPayloadHash) binding actionType, targetId, and sorted payload arguments",
+      "tamper_protection": "Consuming an approved token with altered parameters or payload fails closed with 400 action_payload_mismatch"
+    },
+    "single_use_challenge_lifecycle": {
+      "migration": "migrations/0137_native_2fa_and_action_approvals.sql defining approval_challenges and approval_receipts",
+      "replay_protection": "Atomic status transition from 'approved' to 'consumed' guarantees single-use consumption with 409 challenge_already_consumed on replay",
+      "expiration": "Expired challenges fail closed upon decision and consumption with 409 challenge_expired"
+    },
+    "mcp_native_tools": {
+      "tools": [
+        "approval_challenge_create",
+        "approval_verify",
+        "approval_consume"
+      ],
+      "authorization": "approval_verify enforces org-admin capability floor (isOrgAdmin) and verification method audit logging"
+    }
+  },
+  "test_evidence": {
+    "test_files": [
+      "tests/flight-004-approvals-2fa.test.ts",
+      "tests/flight-003-channel-authority-shrink.test.ts",
+      "tests/delivery-turn-fencing.test.ts",
+      "tests/flight-exec-02-fallback-and-gates.test.ts",
+      "tests/channel-central-command.test.ts",
+      "tests/im-hermes.test.ts",
+      "tests/helpers-migrations.test.ts",
+      "tests/mcp-task-tools.test.ts"
+    ],
+    "status": "PASS",
+    "tests_total": 165,
+    "tests_passed": 165,
+    "schema_discipline": "applyAllMigrations() compliant"
+  }
+}

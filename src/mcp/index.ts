@@ -4409,6 +4409,143 @@ const toolMupotDeliveryConsumedV1: ToolSpec = {
   },
 }
 
+import { createApprovalChallenge, decideApprovalChallenge, consumeApproval } from '../auth/approvals-2fa'
+
+// approval_challenge_create — creates an action-hash-bound 2FA/approval challenge for high-impact actions (FLIGHT-004 / mumega-com#725)
+const toolApprovalChallengeCreate: ToolSpec = {
+  name: 'approval_challenge_create',
+  scope: 'native in-pot 2fa and action-hash approval challenge creation',
+  min: 'authenticated',
+  args: '{ action_type: string, payload: object | string, target_id?: string, expires_in_sec?: number }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      action_type: STRING_SCHEMA,
+      payload: { anyOf: [{ type: 'object' }, { type: 'string' }] },
+      target_id: NULLABLE_STRING_SCHEMA,
+      expires_in_sec: { type: 'number' },
+    },
+    required: ['action_type', 'payload'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const actionType = str(args.action_type)
+    const payload = args.payload as Record<string, unknown> | string
+    const targetId = typeof args.target_id === 'string' ? args.target_id.trim() : null
+    const expiresInSec = typeof args.expires_in_sec === 'number' ? args.expires_in_sec : undefined
+
+    if (!actionType || !payload) {
+      return fail(400, 'invalid_args', 'action_type and payload are required')
+    }
+
+    const requesterId = auth.boundAgentId ?? auth.memberId ?? auth.userId
+    if (!requesterId) return fail(401, 'unauthenticated')
+
+    const challenge = await createApprovalChallenge(env, {
+      actionType,
+      payload,
+      targetId,
+      requesterId,
+      expiresInSec,
+    })
+
+    return done(challenge)
+  },
+}
+
+// approval_verify — operator/admin verdict and signature verification on a pending action challenge (FLIGHT-004 / mumega-com#725)
+const toolApprovalVerify: ToolSpec = {
+  name: 'approval_verify',
+  scope: 'native in-pot 2fa and operator action challenge verdict',
+  min: 'admin',
+  args: '{ challenge_id: string, nonce: string, verdict: "approved" | "rejected", verification_method?: string, signature?: string, note?: string }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      challenge_id: STRING_SCHEMA,
+      nonce: STRING_SCHEMA,
+      verdict: { type: 'string', enum: ['approved', 'rejected'] },
+      verification_method: NULLABLE_STRING_SCHEMA,
+      signature: NULLABLE_STRING_SCHEMA,
+      note: NULLABLE_STRING_SCHEMA,
+    },
+    required: ['challenge_id', 'nonce', 'verdict'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const challengeId = str(args.challenge_id)
+    const nonce = str(args.nonce)
+    const verdict = args.verdict === 'approved' ? 'approved' : args.verdict === 'rejected' ? 'rejected' : null
+    const verificationMethod = typeof args.verification_method === 'string' ? args.verification_method : undefined
+    const signature = typeof args.signature === 'string' ? args.signature : undefined
+    const note = typeof args.note === 'string' ? args.note : undefined
+
+    if (!challengeId || !nonce || !verdict) {
+      return fail(400, 'invalid_args', 'challenge_id, nonce, and verdict (approved|rejected) are required')
+    }
+
+    const outcome = await decideApprovalChallenge(env, auth, {
+      challengeId,
+      nonce,
+      verdict,
+      verificationMethod,
+      signature,
+      note,
+    })
+
+    if (!outcome.ok) {
+      return fail(outcome.status, outcome.error, outcome.detail)
+    }
+
+    return done(outcome)
+  },
+}
+
+// approval_consume — consumes an approved challenge exactly once before executing high-impact action (FLIGHT-004 / mumega-com#725)
+const toolApprovalConsume: ToolSpec = {
+  name: 'approval_consume',
+  scope: 'consume single-use approved challenge token against action hash',
+  min: 'authenticated',
+  args: '{ challenge_id: string, nonce: string, action_type: string, payload: object | string, target_id?: string }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      challenge_id: STRING_SCHEMA,
+      nonce: STRING_SCHEMA,
+      action_type: STRING_SCHEMA,
+      payload: { anyOf: [{ type: 'object' }, { type: 'string' }] },
+      target_id: NULLABLE_STRING_SCHEMA,
+    },
+    required: ['challenge_id', 'nonce', 'action_type', 'payload'],
+    additionalProperties: false,
+  },
+  async run(_auth, env, args) {
+    const challengeId = str(args.challenge_id)
+    const nonce = str(args.nonce)
+    const actionType = str(args.action_type)
+    const payload = args.payload as Record<string, unknown> | string
+    const targetId = typeof args.target_id === 'string' ? args.target_id.trim() : null
+
+    if (!challengeId || !nonce || !actionType || !payload) {
+      return fail(400, 'invalid_args', 'challenge_id, nonce, action_type, and payload are required')
+    }
+
+    const outcome = await consumeApproval(env, {
+      challengeId,
+      nonce,
+      actionType,
+      payload,
+      targetId,
+    })
+
+    if (!outcome.ok) {
+      return fail(outcome.status, outcome.error, outcome.detail)
+    }
+
+    return done(outcome)
+  },
+}
+
 // Exported for the capability-floor test (#183) — the registry-completeness
 // assertion + the dispatch wiring proof read these directly.
 export const TOOLS: ToolSpec[] = [
@@ -4451,6 +4588,9 @@ export const TOOLS: ToolSpec[] = [
   toolOrient,
   toolConnect,
   toolMupotDeliveryConsumedV1,
+  toolApprovalChallengeCreate,
+  toolApprovalVerify,
+  toolApprovalConsume,
   ...AGENT_CONNECTION_TOOLS,
   ...PROJECT_TOOLS,
   ...PROVISION_TOOLS,
