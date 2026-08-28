@@ -271,6 +271,7 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
       // its `agentId` here is what makes delivery actually reach the runtime's own poll query.
       const route = await getFleetAgentLiveness(env, event.agent_id)
       const deliveryTarget = route.agentId || event.agent_id
+      const targetSeat = (event.payload as { target_seat?: string } | undefined)?.target_seat || null
       if (await dispatchInboxDelivered(env, identity.receiptId)) {
         try {
           await deliverDispatchToInbox(env, {
@@ -280,6 +281,7 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
             receiptId: identity.receiptId,
             dispatchedByMemberId: dispatchMemberId(event),
             projectId: receipt.project_id,
+            targetSeat,
           })
         } catch (error) {
           if (error instanceof InboxFullError) {
@@ -327,6 +329,7 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
             receiptId: identity.receiptId,
             dispatchedByMemberId: dispatchMemberId(event),
             projectId: receipt.project_id,
+            targetSeat,
           })
         } else {
           // IN-WORKER route (fallback: no fleet row, empty runtime, or stale/dead presence) —

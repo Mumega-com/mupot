@@ -1033,6 +1033,46 @@ tasksApp.patch('/:id', async (c) => {
   return c.json({ task: next })
 })
 
+// ── POST /:id/result — external runtime & bound-seat completion evidence reporting (Issue #1183) ──
+tasksApp.post('/:id/result', async (c) => {
+  const id = c.req.param('id')
+  let body: { result?: unknown; status?: unknown; gate_owner?: unknown }
+  try {
+    body = (await c.req.json()) as { result?: unknown; status?: unknown; gate_owner?: unknown }
+  } catch {
+    return c.json({ error: 'invalid_json' }, 400)
+  }
+
+  const result = typeof body.result === 'string' ? body.result.trim() : ''
+  if (!result) {
+    return c.json({ error: 'invalid_args', detail: 'result is required' }, 400)
+  }
+
+  const status = (body.status === 'in_progress' || body.status === 'review' || body.status === 'done')
+    ? body.status
+    : undefined
+
+  const gateOwner = body.gate_owner !== undefined
+    ? (body.gate_owner === null ? null : String(body.gate_owner).trim())
+    : undefined
+
+  try {
+    const { reportTaskResult } = await import('./report-result')
+    const outcome = await reportTaskResult(c.env, c.get('auth'), {
+      taskId: id,
+      result,
+      status,
+      gateOwner,
+    })
+    return c.json(outcome)
+  } catch (err: any) {
+    if (err.name === 'TaskReportResultError') {
+      return c.json({ error: err.code, detail: err.message, ...(err.data || {}) }, err.status)
+    }
+    return c.json({ error: 'report_result_failed', detail: err instanceof Error ? err.message : String(err) }, 500)
+  }
+})
+
 // ── POST /:id/local-smoke-complete — local browser harness result injection ──
 //
 // This route exists only when LOCAL_TEST_AUTH=1. It lets the local Playwright

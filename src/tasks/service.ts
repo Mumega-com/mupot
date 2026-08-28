@@ -24,6 +24,27 @@ import { GATE_CAPABILITY_RE } from '../gates/grants'
 // accepting it would just let a different unverdictable value through — board
 // 247858f1.) Reject at WRITE TIME rather than silently coerce: a silent coerce is
 // how the next mismatch ships.
+export async function loadTask(env: Env, taskId: string): Promise<Task | null> {
+  const { resolveTaskEntity } = await import('../lib/entity-resolver')
+  const res = await resolveTaskEntity(env, taskId)
+  return res.ok ? res.entity : null
+}
+
+export async function getTask(
+  env: Env,
+  taskRef: string,
+): Promise<{ ok: true; task: Task } | { ok: false; error: string; reason?: string; candidates?: any[] }> {
+  const { resolveTaskEntity } = await import('../lib/entity-resolver')
+  const res = await resolveTaskEntity(env, taskRef)
+  if (!res.ok) {
+    if (res.reason === 'ambiguous') {
+      return { ok: false, error: 'ambiguous_task_id', reason: 'ambiguous', candidates: res.candidates }
+    }
+    return { ok: false, error: 'task_not_found', reason: 'task_not_found' }
+  }
+  return { ok: true, task: res.entity }
+}
+
 export function isValidGateOwnerForm(value: string): boolean {
   return GATE_CAPABILITY_RE.test(value)
 }

@@ -55,6 +55,8 @@ export interface DispatchBridgeInput {
   dispatchedByMemberId: string
   /** Authoritative tasks.project_id inherited by the bus consumer. */
   projectId?: string | null
+  /** Optional exact seat target (e.g. "hadi-grok", "river-cursor") to prevent sibling seat HoL blocking */
+  targetSeat?: string | null
 }
 
 export type BridgeResult = { delivered: true; seq: number; duplicate: boolean }
@@ -95,6 +97,7 @@ export async function deliverDispatchToInbox(env: Env, input: DispatchBridgeInpu
     fromAgent: DISPATCH_BRIDGE_SENDER,
     fromMember: input.dispatchedByMemberId,
     toAgent: input.agentId,
+    targetSeat: input.targetSeat ?? undefined,
     kind: 'request',
     body,
     requestId: dispatchInboxRequestId(input.receiptId),

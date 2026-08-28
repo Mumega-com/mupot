@@ -58,6 +58,7 @@ import { alertsApp } from './alerts/routes'
 import { ccSpendApp } from './economy/cc-spend'
 import { resellerApp } from './reseller/routes'
 import { potsApp, publicPotsApp } from './pots/routes'
+import { a2aApp } from './a2a/gateway'
 import { pricingPageHtml } from './dashboard/pricing'
 import { inboxApp } from './agents/inbox-routes'
 import { coordinationApp } from './coordination/routes'
@@ -88,6 +89,8 @@ export { McpOAuthApiHandler }
 export const app = new Hono<{ Bindings: Env }>()
 
 app.get('/health', (c) => c.json(publicHealth(c.env.TENANT_SLUG, c.env.RELEASE_SHA)))
+
+app.route('/', a2aApp)
 
 app.route(ROUTES.auth, authApp)
 app.route('/api/auth/sso', ssoApp)

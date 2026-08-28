@@ -1,0 +1,58 @@
+{
+  "schema": "mupot.flight.execution_receipt/v1",
+  "flight_id": "flight-a2a-01-exact-seat-mesh",
+  "name": "FLIGHT A2A-01: A2A Gateway & Exact-Seat Dispatch Mesh (#1198 & #1183)",
+  "recorded_at": "2026-08-28T09:03:00Z",
+  "crew": {
+    "lead": {
+      "agent_id": "96e85516-720b-47fd-9cb6-655eecc919aa",
+      "slug": "river",
+      "name": "Cursor River Lead",
+      "seat": "river-cursor",
+      "harness": "cursor-cloud",
+      "machine": "cursor-cloud-vm",
+      "branch": "cursor/flight-river-lead-agent-onboarding-warm-cache-35a3"
+    },
+    "coordination": {
+      "agent_id": "17aa283f-8cdb-4c1f-864f-1974ee45a033",
+      "slug": "loom",
+      "seat": "muvps-loom"
+    },
+    "gate": {
+      "agent_id": "a065e61c-6a93-42fc-b070-b541631202f1",
+      "slug": "hadi-grok",
+      "gate_owner": "gate:hadi-grok"
+    }
+  },
+  "deliverables": {
+    "a2a_gateway": {
+      "agent_card": "GET /.well-known/agent-card.json",
+      "task_submit": "POST /api/a2a/tasks",
+      "task_get": "GET /api/a2a/tasks/:id",
+      "protocols": [
+        "io.mumega.receipts/v1",
+        "io.mumega.exact-seat/v1",
+        "io.mumega.governance/v1"
+      ]
+    },
+    "exact_seat_routing": {
+      "targeted_wake": "agent.wake carries payload.target_seat",
+      "fleet_bridge": "deliverDispatchToInbox passes target_seat into sendAgentMessage",
+      "mailbox_partition": "agent_messages partition query per (tenant, to_agent, target_seat, read_at)",
+      "hol_blocking_prevented": true
+    },
+    "task_evidence_reporting": {
+      "mcp_tool": "task_report_result",
+      "rest_route": "POST /api/tasks/:id/result",
+      "artifact_verification": "Artifact: <path> + SHA256: <64-hex>",
+      "closes_issue": "#1183"
+    }
+  },
+  "test_evidence": {
+    "test_file": "tests/flight-a2a-exact-seat-mesh.test.ts",
+    "status": "PASS",
+    "tests_total": 6,
+    "tests_passed": 6,
+    "schema_discipline": "applyAllMigrations() compliant"
+  }
+}

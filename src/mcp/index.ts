@@ -1806,16 +1806,20 @@ const toolTaskDispatch: ToolSpec = {
   name: 'task_dispatch',
   scope: 'squad (of the task)',
   min: 'member',
-  args: '{ task_id: string }',
+  args: '{ task_id: string, target_seat?: string }',
   inputSchema: {
     type: 'object',
-    properties: { task_id: STRING_SCHEMA },
+    properties: {
+      task_id: STRING_SCHEMA,
+      target_seat: STRING_SCHEMA,
+    },
     required: ['task_id'],
     additionalProperties: false,
   },
   async run(auth, env, args) {
     const taskId = str(args.task_id)
     if (!taskId) return fail(400, 'invalid_args', 'task_id required')
+    const targetSeat = str(args.target_seat) || null
     const task = await loadTask(env, taskId)
     if (!task) return fail(404, 'task_not_found')
 
@@ -1850,13 +1854,18 @@ const toolTaskDispatch: ToolSpec = {
       dispatchedAt,
     ).run()
 
-    const event: BusEvent<{ task_id: string; by: string; dispatch_receipt_id: string }> = {
+    const event: BusEvent<{ task_id: string; by: string; dispatch_receipt_id: string; target_seat?: string }> = {
       type: 'agent.wake',
       tenant: env.TENANT_SLUG,
       squad_id: task.squad_id,
       agent_id: task.assignee_agent_id,
       actor: memberActor(memberId),
-      payload: { task_id: task.id, by: memberId, dispatch_receipt_id: receiptId },
+      payload: {
+        task_id: task.id,
+        by: memberId,
+        dispatch_receipt_id: receiptId,
+        ...(targetSeat ? { target_seat: targetSeat } : {}),
+      },
       ts: dispatchedAt,
     }
     try {
@@ -1871,21 +1880,11 @@ const toolTaskDispatch: ToolSpec = {
       return fail(500, 'dispatch_failed', { receipt_id: receiptId })
     }
 
-    // NOTE (mupot#76e25fc2 / FLIGHT-07B, reverted after gate BLOCK): this handler
-    // previously added a second, ad-hoc sendAgentMessage write here, believing
-    // task_dispatch had the same "silent drop" gap #860 fixed for flight_dispatch.
-    // It did not — src/bus/consumer.ts's 'agent.wake' case already recognizes this
-    // exact event shape via taskDispatchIdentity() (keyed on the dispatch_receipt_id
-    // in the payload above) and routes it through src/bus/fleet-bridge.ts's
-    // deliverDispatchToInbox, a #353-hardened, sticky-route bridge built specifically
-    // to prevent double execution. The added write used a different sender/request-id
-    // convention the real router never saw — a second, uncoordinated delivery path,
-    // not a fix. Reverted; the routing above was already correct.
-
     return done({
       dispatched: true,
       task_id: task.id,
       agent_id: task.assignee_agent_id,
+      target_seat: targetSeat,
       squad_id: task.squad_id,
       receipt: {
         id: receiptId,
@@ -1893,6 +1892,57 @@ const toolTaskDispatch: ToolSpec = {
         dispatched_at: dispatchedAt,
       },
     })
+  },
+}
+
+// task_report_result — report external runtime completion result and artifact claim (Issue #1183).
+// Allows external/bound-seat runtimes (Hadi-Grok on Mac, Codex, Cursor Cloud) to report verifiable
+// results with Artifact: <path> + SHA256: <64-hex> into tasks.result and transition the task.
+const toolTaskReportResult: ToolSpec = {
+  name: 'task_report_result',
+  scope: 'squad (of the task)',
+  min: 'member',
+  args: '{ task_id: string, result: string, status?: "in_progress"|"review"|"done", gate_owner?: string|null }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      task_id: STRING_SCHEMA,
+      result: STRING_SCHEMA,
+      status: { type: 'string', enum: ['in_progress', 'review', 'done'] },
+      gate_owner: STRING_SCHEMA,
+    },
+    required: ['task_id', 'result'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const taskId = str(args.task_id)
+    const result = str(args.result)
+    if (!taskId || !result) return fail(400, 'invalid_args', 'task_id and result required')
+
+    const statusCandidate = str(args.status)
+    const status = (statusCandidate === 'in_progress' || statusCandidate === 'review' || statusCandidate === 'done')
+      ? statusCandidate
+      : undefined
+
+    const gateOwner = args.gate_owner !== undefined
+      ? (args.gate_owner === null ? null : str(args.gate_owner))
+      : undefined
+
+    try {
+      const { reportTaskResult } = await import('../tasks/report-result')
+      const outcome = await reportTaskResult(env, auth, {
+        taskId,
+        result,
+        status,
+        gateOwner,
+      })
+      return done(outcome)
+    } catch (err: any) {
+      if (err.name === 'TaskReportResultError') {
+        return fail(err.status, err.code, err.message)
+      }
+      return fail(500, 'report_result_failed', err instanceof Error ? err.message : String(err))
+    }
   },
 }
 
@@ -4223,6 +4273,7 @@ export const TOOLS: ToolSpec[] = [
   toolTaskVerdict,
   toolTaskVerdictReverse,
   toolTaskDispatch,
+  toolTaskReportResult,
   toolTaskIntakeAudit,
   toolRemember,
   toolRecall,
