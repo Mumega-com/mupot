@@ -644,6 +644,10 @@ export interface MessageCreatedPayload {
   /** Present when this message answers another — threads a conversation. */
   in_reply_to?: string | null
   project_id?: string | null
+  /** Byte/char length of the message body at creation for truncation verification (#1046) */
+  body_length?: number
+  /** SHA-256 digest of the message body at creation for cryptographic integrity verification (#1046) */
+  checksum_sha256?: string
   created_at: string
 }
 

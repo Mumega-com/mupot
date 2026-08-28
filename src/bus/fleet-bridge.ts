@@ -59,7 +59,13 @@ export interface DispatchBridgeInput {
   targetSeat?: string | null
 }
 
-export type BridgeResult = { delivered: true; seq: number; duplicate: boolean }
+export type BridgeResult = {
+  delivered: true
+  seq: number
+  duplicate: boolean
+  body_length?: number
+  checksum_sha256?: string
+}
 
 /**
  * InboxFullError — distinguishes backpressure (the recipient is at MAX_UNREAD_PER_RECIPIENT, a
@@ -118,7 +124,13 @@ export async function deliverDispatchToInbox(env: Env, input: DispatchBridgeInpu
         (res.detail ? ` — ${res.detail}` : ''),
     )
   }
-  return { delivered: true, seq: res.seq, duplicate: res.duplicate }
+  return {
+    delivered: true,
+    seq: res.seq,
+    duplicate: res.duplicate,
+    body_length: res.body_length,
+    checksum_sha256: res.checksum_sha256,
+  }
 }
 
 /**

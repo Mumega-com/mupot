@@ -3156,7 +3156,8 @@ const toolSend: ToolSpec = {
           ? 404
           : res.reason === 'project_access_denied'
             ? 403
-          : res.reason === 'recipient_ambiguous' ||
+          : res.reason === 'target_agent_inactive' ||
+              res.reason === 'recipient_ambiguous' ||
               res.reason === 'request_id_conflict' ||
               res.reason === 'inbox_full' ||
               res.reason === 'project_archived'
@@ -3171,6 +3172,8 @@ const toolSend: ToolSpec = {
       to: res.toAgent,
       project_id: typeof args.project_id === 'string' ? args.project_id : null,
       target_seat: typeof args.seat === 'string' ? args.seat.trim() : null,
+      body_length: res.body_length,
+      checksum_sha256: res.checksum_sha256,
     })
   },
 }
@@ -3265,6 +3268,8 @@ const toolBroadcast: ToolSpec = {
           seq: res.seq,
           duplicate: res.duplicate,
           request_id: recipientRequestId ?? null,
+          body_length: res.body_length,
+          checksum_sha256: res.checksum_sha256,
         })
       } else {
         failures.push({ to: target.id, slug: target.slug, error: res.reason, detail: res.detail })

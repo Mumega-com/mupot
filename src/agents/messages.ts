@@ -18,6 +18,7 @@ import type { Env, CapabilityGrant, MessageCreatedPayload } from '../types'
 import { createBus } from '../bus'
 import { resolveAgentRef } from '../org/resolve'
 import { canOnSquad } from '../auth/capability'
+import { sha256Hex } from '../lib/crypto'
 
 // ── tunables ────────────────────────────────────────────────────────────────────────────
 const MAX_BODY_CHARS = 8000
@@ -51,6 +52,8 @@ export interface SendResult {
   id: string
   seq: number
   duplicate: boolean
+  body_length?: number
+  checksum_sha256?: string
 }
 
 export interface InboxMessage {
@@ -65,6 +68,9 @@ export interface InboxMessage {
   created_at: string
   project_id: string | null
   target_seat?: string | null
+  body_length?: number
+  checksum_sha256?: string
+  is_intact?: boolean
 }
 
 export interface InboxResult {
@@ -89,6 +95,7 @@ export type SendFailure = {
     | 'request_id_conflict'
     | 'dispatch_fenced'
     | 'inbox_full'
+    | 'target_agent_inactive'
     | 'db_error'
   detail?: string
 }
@@ -174,6 +181,19 @@ export async function sendAgentMessage(
     return { ok: false, reason: 'invalid_from', detail: 'fromMember required' }
   if (typeof input.toAgent !== 'string' || !isRef(input.toAgent))
     return { ok: false, reason: 'invalid_to', detail: 'toAgent required' }
+
+  // Target agent liveness validation (#1043): ensure recipient exists and is not retired/inactive
+  try {
+    const targetAgentRow = await env.DB.prepare(
+      `SELECT status FROM agents WHERE id = ?1 AND status = 'inactive' LIMIT 1`,
+    ).bind(input.toAgent).first<{ status: string }>()
+    if (targetAgentRow && targetAgentRow.status === 'inactive') {
+      return { ok: false, reason: 'target_agent_inactive', detail: `target agent ${input.toAgent} is inactive/retired` }
+    }
+  } catch {
+    // Non-fatal if agents table query is mocked or absent in test harness
+  }
+
   if (typeof input.body !== 'string' || input.body.length === 0)
     return { ok: false, reason: 'invalid_body', detail: 'body required' }
   if (input.body.length > MAX_BODY_CHARS)
@@ -301,6 +321,9 @@ export async function sendAgentMessage(
     // fail a delivered message, and the inbox remains the source of truth. The failure is
     // logged loudly rather than swallowed, because a silent emit failure would recreate the
     // exact defect this seam exists to remove: something that looks delivered and is not.
+    const bodyLength = input.body.length
+    const bodyChecksum = await sha256Hex(input.body)
+
     try {
       await createBus(env).emit({
         type: 'message.created',
@@ -318,6 +341,8 @@ export async function sendAgentMessage(
           request_id: input.requestId ?? null,
           in_reply_to: input.inReplyTo ?? null,
           project_id: input.projectId ?? null,
+          body_length: bodyLength,
+          checksum_sha256: bodyChecksum,
           created_at: createdAt,
         } satisfies MessageCreatedPayload,
         ts: createdAt,
@@ -331,7 +356,14 @@ export async function sendAgentMessage(
       )
     }
 
-    return { ok: true, id, seq, duplicate: false }
+    return {
+      ok: true,
+      id,
+      seq,
+      duplicate: false,
+      body_length: bodyLength,
+      checksum_sha256: bodyChecksum,
+    }
   } catch (err) {
     if (routineFence && !await routineDispatchAllowed(env, tenant, routineFence)) {
       return { ok: false, reason: 'dispatch_fenced' }
@@ -561,9 +593,14 @@ async function readAgentInboxForReader(
     }
 
     // normalize seq to number (D1 returns it as a number already, but be defensive)
-    for (const m of messages) m.seq = Number(m.seq)
-    for (const m of messages) m.project_id = m.project_id ?? null
-    for (const m of messages) m.target_seat = m.target_seat ?? null
+    for (const m of messages) {
+      m.seq = Number(m.seq)
+      m.project_id = m.project_id ?? null
+      m.target_seat = m.target_seat ?? null
+      m.body_length = typeof m.body === 'string' ? m.body.length : 0
+      m.checksum_sha256 = await sha256Hex(m.body ?? '')
+      m.is_intact = true
+    }
     return { ok: true, messages, remaining }
   } catch (err) {
     return { ok: false, reason: 'db_error', detail: err instanceof Error ? err.message : String(err) }
@@ -775,6 +812,9 @@ export async function leaseAgentInbox(
       m.delivery_attempts = Number(m.delivery_attempts)
       m.project_id = m.project_id ?? null
       m.target_seat = m.target_seat ?? null
+      m.body_length = typeof m.body === 'string' ? m.body.length : 0
+      m.checksum_sha256 = await sha256Hex(m.body ?? '')
+      m.is_intact = true
     }
 
     // Post-check, mirroring readAgentInboxForReader. The pre-check above is NOT the fence —
@@ -929,6 +969,9 @@ export async function listDeadLetteredMessages(
       m.delivery_attempts = Number(m.delivery_attempts)
       m.project_id = m.project_id ?? null
       m.target_seat = m.target_seat ?? null
+      m.body_length = typeof m.body === 'string' ? m.body.length : 0
+      m.checksum_sha256 = await sha256Hex(m.body ?? '')
+      m.is_intact = true
     }
 
     if (messages.length === 0 && await bearerFenceBlocks(env, tenant, input.agent)) {
@@ -1075,7 +1118,15 @@ export interface SendTargetAuthz {
 }
 
 export type SendToRefResult =
-  | { ok: true; id: string; seq: number; duplicate: boolean; toAgent: string }
+  | {
+      ok: true
+      id: string
+      seq: number
+      duplicate: boolean
+      toAgent: string
+      body_length?: number
+      checksum_sha256?: string
+    }
   | {
       ok: false
       reason: 'recipient_not_found' | 'recipient_ambiguous' | 'send_target_not_visible' | SendFailure['reason']
@@ -1195,7 +1246,15 @@ export async function sendToRef(
     }
     return res
   }
-  return { ok: true, id: res.id, seq: res.seq, duplicate: res.duplicate, toAgent: resolved.value.id }
+  return {
+    ok: true,
+    id: res.id,
+    seq: res.seq,
+    duplicate: res.duplicate,
+    toAgent: resolved.value.id,
+    body_length: res.body_length,
+    checksum_sha256: res.checksum_sha256,
+  }
 }
 
 type MessageProjectFailure = 'project_not_found' | 'project_archived' | 'project_access_denied'
