@@ -67,9 +67,23 @@ describe('persisted message-integrity baseline', () => {
       checksum_sha256: await sha256Hex(ORIGINAL_BODY),
     })
 
+    const inbox = await readAgentInbox(env, { agent: TO_AGENT, peek: true })
+    expect(inbox.ok).toBe(true)
+    if (!inbox.ok) return
+    expect(inbox.messages[0]).toMatchObject({
+      body_length: ORIGINAL_BODY.length,
+      checksum_sha256: await sha256Hex(ORIGINAL_BODY),
+      is_intact: true,
+    })
+
     await expect(env.DB.prepare(
       'UPDATE agent_messages SET checksum_sha256 = ?1 WHERE id = ?2',
     ).bind('0'.repeat(64), 'message-integrity-fixture').run()).rejects.toThrow(
+      /integrity baseline is immutable/,
+    )
+    await expect(env.DB.prepare(
+      'UPDATE agent_messages SET body_length = ?1 WHERE id = ?2',
+    ).bind(0, 'message-integrity-fixture').run()).rejects.toThrow(
       /integrity baseline is immutable/,
     )
   })
