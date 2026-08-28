@@ -4410,6 +4410,153 @@ const toolMupotDeliveryConsumedV1: ToolSpec = {
 }
 
 import { createApprovalChallenge, decideApprovalChallenge, consumeApproval } from '../auth/approvals-2fa'
+import {
+  proposeGovernance,
+  voteGovernance,
+  ratifyGovernance,
+  getGovernanceStatus,
+} from '../governance/service'
+
+// governance_propose — create constitutional resolution / governance proposal (FLIGHT-005 / mumega-com#723)
+const toolGovernancePropose: ToolSpec = {
+  name: 'governance_propose',
+  scope: 'propose constitutional resolution or governance amendment',
+  min: 'authenticated',
+  args: '{ resolution_id?: string, proposal_type?: string, title: string, description: string, target_document_path?: string, target_document_hash?: string, target_document_content?: string, threshold_council_count?: number, founder_seal_required?: boolean }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      resolution_id: NULLABLE_STRING_SCHEMA,
+      proposal_type: { type: 'string', enum: ['constitutional_amendment', 'policy_change', 'architectural_decision'] },
+      title: STRING_SCHEMA,
+      description: STRING_SCHEMA,
+      target_document_path: NULLABLE_STRING_SCHEMA,
+      target_document_hash: NULLABLE_STRING_SCHEMA,
+      target_document_content: NULLABLE_STRING_SCHEMA,
+      threshold_council_count: { type: 'number' },
+      founder_seal_required: { type: 'boolean' },
+    },
+    required: ['title', 'description'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const title = str(args.title)
+    const description = str(args.description)
+    if (!title || !description) return fail(400, 'invalid_args', 'title and description are required')
+
+    const outcome = await proposeGovernance(env, auth, {
+      resolutionId: str(args.resolution_id) ?? undefined,
+      proposalType: args.proposal_type as any,
+      title,
+      description,
+      targetDocumentPath: str(args.target_document_path),
+      targetDocumentHash: str(args.target_document_hash) ?? undefined,
+      targetDocumentContent: typeof args.target_document_content === 'string' ? args.target_document_content : undefined,
+      thresholdCouncilCount: typeof args.threshold_council_count === 'number' ? args.threshold_council_count : undefined,
+      founderSealRequired: typeof args.founder_seal_required === 'boolean' ? args.founder_seal_required : undefined,
+    })
+
+    if (!outcome.ok) return fail(outcome.status, outcome.error, outcome.detail)
+    return done(outcome.data)
+  },
+}
+
+// governance_vote — cast one-shot terminal vote on constitutional resolution (FLIGHT-005 / mumega-com#723)
+const toolGovernanceVote: ToolSpec = {
+  name: 'governance_vote',
+  scope: 'one-shot terminal voting on constitutional resolution',
+  min: 'authenticated',
+  args: '{ resolution_id: string, voter_seat: string, vote: "approve" | "reject" | "abstain", reason?: string, document_content?: string, document_hash?: string }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      resolution_id: STRING_SCHEMA,
+      voter_seat: STRING_SCHEMA,
+      vote: { type: 'string', enum: ['approve', 'reject', 'abstain'] },
+      reason: NULLABLE_STRING_SCHEMA,
+      document_content: NULLABLE_STRING_SCHEMA,
+      document_hash: NULLABLE_STRING_SCHEMA,
+    },
+    required: ['resolution_id', 'voter_seat', 'vote'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const resolutionId = str(args.resolution_id)
+    const voterSeat = str(args.voter_seat)
+    const vote = args.vote === 'approve' || args.vote === 'reject' || args.vote === 'abstain' ? args.vote : null
+
+    if (!resolutionId || !voterSeat || !vote) {
+      return fail(400, 'invalid_args', 'resolution_id, voter_seat, and vote (approve|reject|abstain) are required')
+    }
+
+    const outcome = await voteGovernance(env, auth, {
+      resolutionId,
+      voterSeat,
+      vote,
+      reason: typeof args.reason === 'string' ? args.reason : null,
+      documentContentToVerify: typeof args.document_content === 'string' ? args.document_content : undefined,
+      documentHashToVerify: typeof args.document_hash === 'string' ? args.document_hash : undefined,
+    })
+
+    if (!outcome.ok) return fail(outcome.status, outcome.error, outcome.detail)
+    return done(outcome.data)
+  },
+}
+
+// governance_ratify — ratify proposal when 2-of-4 Council + Founder Seal quorum met (FLIGHT-005 / mumega-com#723)
+const toolGovernanceRatify: ToolSpec = {
+  name: 'governance_ratify',
+  scope: 'ratify constitutional amendment upon 2-of-4 council + founder seal',
+  min: 'admin',
+  args: '{ resolution_id: string, document_content?: string, document_hash?: string }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      resolution_id: STRING_SCHEMA,
+      document_content: NULLABLE_STRING_SCHEMA,
+      document_hash: NULLABLE_STRING_SCHEMA,
+    },
+    required: ['resolution_id'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const resolutionId = str(args.resolution_id)
+    if (!resolutionId) return fail(400, 'invalid_args', 'resolution_id is required')
+
+    const outcome = await ratifyGovernance(env, auth, {
+      resolutionId,
+      documentContentToVerify: typeof args.document_content === 'string' ? args.document_content : undefined,
+      documentHashToVerify: typeof args.document_hash === 'string' ? args.document_hash : undefined,
+    })
+
+    if (!outcome.ok) return fail(outcome.status, outcome.error, outcome.detail)
+    return done(outcome.data)
+  },
+}
+
+// governance_status — inspect resolution status, vote tallies, and ratification (FLIGHT-005 / mumega-com#723)
+const toolGovernanceStatus: ToolSpec = {
+  name: 'governance_status',
+  scope: 'view governance resolution status and voting tallies',
+  min: 'authenticated',
+  args: '{ resolution_id: string }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      resolution_id: STRING_SCHEMA,
+    },
+    required: ['resolution_id'],
+    additionalProperties: false,
+  },
+  async run(_auth, env, args) {
+    const resolutionId = str(args.resolution_id)
+    if (!resolutionId) return fail(400, 'invalid_args', 'resolution_id is required')
+
+    const outcome = await getGovernanceStatus(env, resolutionId)
+    if (!outcome.ok) return fail(outcome.status, outcome.error, outcome.detail)
+    return done(outcome.data)
+  },
+}
 
 // approval_challenge_create — creates an action-hash-bound 2FA/approval challenge for high-impact actions (FLIGHT-004 / mumega-com#725)
 const toolApprovalChallengeCreate: ToolSpec = {
@@ -4591,6 +4738,10 @@ export const TOOLS: ToolSpec[] = [
   toolApprovalChallengeCreate,
   toolApprovalVerify,
   toolApprovalConsume,
+  toolGovernancePropose,
+  toolGovernanceVote,
+  toolGovernanceRatify,
+  toolGovernanceStatus,
   ...AGENT_CONNECTION_TOOLS,
   ...PROJECT_TOOLS,
   ...PROVISION_TOOLS,

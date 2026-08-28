@@ -1,0 +1,60 @@
+{
+  "schema": "mupot.flight.execution_receipt/v1",
+  "flight_id": "flight-005-governance-protocol",
+  "name": "FLIGHT-005: Governance Wiring & Constitutional Protocols (mumega-com#723 / MU.100.001)",
+  "recorded_at": "2026-08-28T19:14:00Z",
+  "crew": {
+    "lead": {
+      "agent_id": "96e85516-720b-47fd-9cb6-655eecc919aa",
+      "slug": "river",
+      "name": "Cursor River Lead",
+      "seat": "river-cursor",
+      "harness": "cursor-cloud",
+      "machine": "cursor-cloud-vm",
+      "branch": "cursor/flight-river-lead-agent-onboarding-warm-cache-35a3"
+    },
+    "coordination": {
+      "agent_id": "17aa283f-8cdb-4c1f-864f-1974ee45a033",
+      "slug": "loom",
+      "seat": "muvps-loom"
+    },
+    "gate": {
+      "agent_id": "ea2b0370-9830-466d-8874-a690e504c551",
+      "slug": "kasra",
+      "gate_owner": "gate:kasra"
+    }
+  },
+  "deliverables": {
+    "constitutional_consensus_engine": {
+      "durable_state": "D1 migration 0138_governance_consensus_and_ratification.sql defining governance_proposals, governance_votes, and ratified_amendments",
+      "terminal_state_guard": "Enforces single-vote per resolution ID (§1.3), rejecting re-acknowledgements and duplicate vote loops with 409 already_voted",
+      "cryptographic_hash_binding": "Votes and ratifications bind mechanically to the target document's SHA-256 hash, failing closed upon tampering with 400 hash_mismatch",
+      "multisig_threshold": "Requires 2-of-4 Synthetic Council quorum (river, athena, kasra, loom) + Founder Seal (kayhermes / Hadi)"
+    },
+    "mcp_governance_tools": {
+      "tools": [
+        "governance_propose",
+        "governance_vote",
+        "governance_ratify",
+        "governance_status"
+      ]
+    }
+  },
+  "test_evidence": {
+    "test_files": [
+      "tests/flight-005-governance-protocol.test.ts",
+      "tests/flight-004-approvals-2fa.test.ts",
+      "tests/flight-003-channel-authority-shrink.test.ts",
+      "tests/delivery-turn-fencing.test.ts",
+      "tests/flight-exec-02-fallback-and-gates.test.ts",
+      "tests/channel-central-command.test.ts",
+      "tests/im-hermes.test.ts",
+      "tests/helpers-migrations.test.ts",
+      "tests/mcp-task-tools.test.ts"
+    ],
+    "status": "PASS",
+    "tests_total": 170,
+    "tests_passed": 170,
+    "schema_discipline": "applyAllMigrations() compliant"
+  }
+}
