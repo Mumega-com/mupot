@@ -140,17 +140,79 @@ export function isOrgAdmin(auth: AuthContext | null | undefined): boolean {
  */
 export async function resolveCapabilities(env: Env, memberId: string): Promise<CapabilityGrant[]> {
   const rows = await env.DB.prepare(
-    `SELECT member_id, scope_type, scope_id, capability
+    `SELECT member_id, scope_type, scope_id, capability, NULL AS resource
        FROM capabilities
       WHERE member_id = ?1
      UNION ALL
-     SELECT member_id, 'squad' AS scope_type, squad_id AS scope_id, capability
+     SELECT member_id, 'squad' AS scope_type, squad_id AS scope_id, capability, NULL AS resource
        FROM channel_capability_grants
       WHERE member_id = ?1`,
   )
     .bind(memberId)
     .all<CapabilityGrant>()
   return rows.results ?? []
+}
+
+/**
+ * Load token-specific capability ceiling grants from D1.
+ * If token has NO rows in token_grants, returns null (meaning full principal ceiling).
+ */
+export async function resolveTokenGrants(env: Env, tokenId: string): Promise<CapabilityGrant[] | null> {
+  const rows = await env.DB.prepare(
+    `SELECT token_id AS member_id, scope_type, scope_id, capability, resource
+       FROM token_grants
+      WHERE token_id = ?1 AND tenant = ?2`,
+  )
+    .bind(tokenId, env.TENANT_SLUG)
+    .all<CapabilityGrant>()
+
+  const results = rows.results ?? []
+  return results.length > 0 ? results : null
+}
+
+/**
+ * Intersect principal capabilities with token-scoped capability grants.
+ * Mathematical property: effective = intersect(principal, token_grants).
+ * Least-privilege ceiling: a token can never exceed its principal's power,
+ * and cannot act on scopes not granted to the token.
+ */
+export function intersectCapabilities(
+  principalGrants: CapabilityGrant[],
+  tokenGrants: CapabilityGrant[] | null,
+): CapabilityGrant[] {
+  if (!tokenGrants) return principalGrants // Unscoped key retains principal ceiling
+
+  const effective: CapabilityGrant[] = []
+
+  for (const tGrant of tokenGrants) {
+    let highestPrincipalCap: Capability | null = null
+
+    for (const pGrant of principalGrants) {
+      if (pGrant.scope_type === 'org') {
+        if (!highestPrincipalCap || meets(pGrant.capability, highestPrincipalCap)) {
+          highestPrincipalCap = pGrant.capability
+        }
+      } else if (pGrant.scope_type === tGrant.scope_type && pGrant.scope_id === tGrant.scope_id) {
+        if (!highestPrincipalCap || meets(pGrant.capability, highestPrincipalCap)) {
+          highestPrincipalCap = pGrant.capability
+        }
+      }
+    }
+
+    if (highestPrincipalCap) {
+      // Clamped to min(token_grant, principal_grant)
+      const clampedCap = meets(highestPrincipalCap, tGrant.capability)
+        ? tGrant.capability
+        : highestPrincipalCap
+
+      effective.push({
+        ...tGrant,
+        capability: clampedCap,
+      })
+    }
+  }
+
+  return effective
 }
 
 // ── pure check ──────────────────────────────────────────────────────────────────

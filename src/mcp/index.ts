@@ -34,7 +34,7 @@ import type {
   Squad,
   Task,
 } from '../types'
-import { resolveCapabilities, hasCapability, holdsCapabilityFloor, canOnSquad, hasSurfaceCap, callerHoldsActionCapability, clampChannelCapabilities } from '../auth/capability'
+import { resolveCapabilities, resolveTokenGrants, intersectCapabilities, hasCapability, holdsCapabilityFloor, canOnSquad, hasSurfaceCap, callerHoldsActionCapability, clampChannelCapabilities } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc, touchTokenLastUsed } from '../auth/token-lifecycle'
 import { callerHoldsGateCapability, verdictPrincipal } from '../tasks/index'
 import { resolveSoleGateOwnerAgent } from '../gates/grants'
@@ -427,6 +427,13 @@ export async function authenticateMember(c: {
   if (row.status !== 'active') return null
 
   let capabilities = await resolveCapabilities(c.env, row.member_id)
+
+  // Token-scoped grants ceiling (#584 / FLIGHT IDENTITY-UNIFIED):
+  // effective = intersect(principal_capabilities, token_grants)
+  const tokenGrants = await resolveTokenGrants(c.env, row.token_id)
+  if (tokenGrants) {
+    capabilities = intersectCapabilities(capabilities, tokenGrants)
+  }
 
   // Channel authority shrink (#799 / FLIGHT-003): non-directory IM tokens cannot carry standing admin/owner
   const channel = row.channel ?? 'workspace'
@@ -4424,6 +4431,61 @@ import {
   getAgentSpendStatus,
 } from '../metering/service'
 import { runGovernedLoopDriverTick } from '../loops/driver'
+import { createAccessKey } from '../auth/unified-access'
+
+// create_access_key — unified minting of token-scoped access keys bundling client configs (FLIGHT IDENTITY-UNIFIED / #584)
+const toolCreateAccessKey: ToolSpec = {
+  name: 'create_access_key',
+  scope: 'mint fine-grained token-scoped access key with bundled desktop configs',
+  min: 'admin',
+  args: '{ principal_id: string, label: string, channel?: string, expiry_days?: number, grants?: array, agent_id?: string }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      principal_id: STRING_SCHEMA,
+      label: STRING_SCHEMA,
+      channel: { type: 'string', enum: ['workspace', 'im', 'dashboard', 'directory'] },
+      expiry_days: { type: 'number' },
+      grants: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            scope_type: { type: 'string', enum: ['org', 'department', 'squad', 'project'] },
+            scope_id: NULLABLE_STRING_SCHEMA,
+            capability: { type: 'string', enum: ['owner', 'admin', 'lead', 'member', 'observer'] },
+            resource: NULLABLE_STRING_SCHEMA,
+          },
+          required: ['scope_type', 'capability'],
+        },
+      },
+      agent_id: NULLABLE_STRING_SCHEMA,
+    },
+    required: ['principal_id', 'label'],
+    additionalProperties: false,
+  },
+  async run(_auth, env, args) {
+    const principalId = str(args.principal_id)
+    const label = str(args.label)
+    if (!principalId || !label) return fail(400, 'invalid_args', 'principal_id and label are required')
+
+    const channel = typeof args.channel === 'string' ? (args.channel as any) : undefined
+    const expiryDays = typeof args.expiry_days === 'number' ? args.expiry_days : undefined
+    const grants = Array.isArray(args.grants) ? (args.grants as any[]) : undefined
+    const agentId = typeof args.agent_id === 'string' ? args.agent_id.trim() : null
+
+    const result = await createAccessKey(env, {
+      principalId,
+      label,
+      channel,
+      expiryDays,
+      grants,
+      agentId,
+    })
+
+    return done(result)
+  },
+}
 
 // loop_driver_tick — autonomous loop driver tick executing active loops under propose-only/founder brakes (FLIGHT-LOOP-UNHOLD)
 const toolLoopDriverTick: ToolSpec = {
@@ -4926,6 +4988,7 @@ export const TOOLS: ToolSpec[] = [
   toolExecutionMeterCheck,
   toolExecutionMeterStatus,
   toolLoopDriverTick,
+  toolCreateAccessKey,
   ...AGENT_CONNECTION_TOOLS,
   ...PROJECT_TOOLS,
   ...PROVISION_TOOLS,

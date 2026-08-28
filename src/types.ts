@@ -594,7 +594,7 @@ export interface MemberToken {
   revoked_at: string | null
 }
 
-export type CapabilityScopeType = 'org' | 'department' | 'squad'
+export type CapabilityScopeType = 'org' | 'department' | 'squad' | 'project'
 
 // member × scope → capability. Enforced on every write path (humans AND agents).
 export interface CapabilityGrant {
@@ -602,6 +602,7 @@ export interface CapabilityGrant {
   scope_type: CapabilityScopeType
   scope_id: string | null // null for org-wide
   capability: Capability
+  resource?: string | null // optional finer filter: project id, tool-class, action-class
 }
 
 // ── Bus ──
