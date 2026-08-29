@@ -100,8 +100,12 @@ A **Journey Roadmap** groups interconnected tactical flights into cohesive, outc
 | 7 | **FLIGHT-METER** — spend metering | `v0.30.0` | real-time token/micro-USD spend tracking with checkAndReserve brakes | F8 | **LANDED 2026-08-28** |
 | 8 | **FLIGHT-UNTRUSTED** — ingress fencing | `v0.30.0` | structural untrusted-content type invariants and instruction separation | F6 | **LANDED 2026-08-28** |
 | 9 | **FLIGHT-LOOP-UNHOLD** — loop driver | `v0.30.0` | pot-registered metered loop driver with propose-only boundary | — | **LANDED 2026-08-28** |
-| 10| **FLIGHT DEV-01** — device attestation | `v0.31.0` | Mupot OS device keys, QR pairing handshake, and hardware presence | MU.200.001 | NEXT |
-| 11| **FLIGHT DEV-02** — local sandboxing | `v0.31.0` | Apple MLX and Linux containerized worker execution on Mupot OS | MU.200.001 | queued |
+| 10| **FLIGHT DEV-01** — device attestation | `v0.31.0` | Mupot OS device keys, QR pairing handshake, and hardware presence | MU.200.001 | **LANDED 2026-08-29** |
+| 11| **FLIGHT DEV-02** — local sandboxing | `v0.31.0` | Apple MLX and Linux containerized worker execution on Mupot OS | MU.200.001 | **LANDED 2026-08-29** |
+| 12| **FLIGHT DEV-03** — peripheral gates | `v0.31.0` | local ML, worktree fs, audio, vision, and GPIO capability governance | MU.200.001 | **LANDED 2026-08-29** |
+| 13| **FLIGHT DEV-04** — offline journal | `v0.31.0` | offline-first SQLite journal buffer and edge sync deduplication | MU.200.001 | **LANDED 2026-08-29** |
+| 14| **FLIGHT DEV-05** — power & wake | `v0.31.0` | hardware power states and Wake-on-Demand exact-seat mesh dispatch | MU.200.001 | **LANDED 2026-08-29** |
+| 15| **FLIGHT ONBOARD-REPO** | `v0.30.0` | autonomous repo sensing & `agents/<slug>/` workspace scaffolding | — | NEXT |
 
 **Board opinion policy:** priority ORDER is Hadi's alone — no vote, no ceremony. Board
 input (asha first-pass, Athena architecture, River build feasibility) is requested per

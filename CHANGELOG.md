@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-08-29
+
+- **Journey 2: Mupot OS & Physical Device Fleet Control** (Flights DEV-01, DEV-02, DEV-03, DEV-04, DEV-05; `MU.200.001-DEVICE`, PR #1236).
+  - **Hardware Attestation & Pairing QR Protocol (FLIGHT DEV-01)**: Migration `0141_device_fleet_and_attestation.sql` creating `device_keys` and `device_pairings`. Challenge-response pairing protocol with hardware-anchored Ed25519 public keys and MCP tools (`device_pair_challenge`, `device_pair_claim`).
+  - **Local Sandboxed Execution Engine & $0-Token Telemetry (FLIGHT DEV-02)**: Engine in `src/devices/executor.ts` interfacing with Apple Silicon MLX and Linux container workers, reporting local $0 token metrics with signed execution attestation (`device_report_exec`).
+  - **Hardware Peripheral & Sensor Governance (FLIGHT DEV-03)**: Capability gates in `src/devices/governance.ts` (`hardware:local-inference`, `hardware:fs-write`, `hardware:audio-stream`, `hardware:vision-capture`, `hardware:gpio-control`) with strict 2FA/org-admin barrier on physical robotics.
+  - **Offline-First SQLite Journal & Edge Sync (FLIGHT DEV-04)**: Buffered offline transaction journal in `src/devices/journal.ts` with sequence-ordered deduplication into `device_journals` (`device_sync_journal`).
+  - **Hardware Power Management & Wake-on-Demand Mesh (FLIGHT DEV-05)**: Power state tracking in `device_power_states` and hardware wake dispatch over the exact-seat fleet bus (`device_power_control`).
+
 ## 2026-08-28
 
 - **Journey 1: Sovereign Edge Core & Continuum Intelligence** (Flights WFP-04, A2A-01, MEM-01, ID-03, SEC-02, MSG-01, EXEC-02, DELIV-03, FLIGHT-003, FLIGHT-004, FLIGHT-005, FLIGHT-ROUTER, FLIGHT-ROUTER-CRON, FLIGHT-002, FLIGHT-METER, FLIGHT-UNTRUSTED, FLIGHT-LOOP-UNHOLD, FLIGHT-IDENTITY-UNIFIED; PR #1236).

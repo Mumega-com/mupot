@@ -4432,6 +4432,202 @@ import {
 } from '../metering/service'
 import { runGovernedLoopDriverTick } from '../loops/driver'
 import { createAccessKey } from '../auth/unified-access'
+import {
+  createDevicePairingChallenge,
+  claimDevicePairing,
+  verifyDeviceAttestation,
+} from '../devices/attestation'
+import { reportDeviceExecution } from '../devices/executor'
+import { checkHardwareCapability } from '../devices/governance'
+import { syncDeviceJournalEntries } from '../devices/journal'
+import { updateDevicePowerState, wakeHardwareDevice } from '../devices/power'
+
+// device_pair_challenge — create challenge and QR pairing code for hardware device enrollment (FLIGHT DEV-01)
+const toolDevicePairChallenge: ToolSpec = {
+  name: 'device_pair_challenge',
+  scope: 'initiate hardware device attestation pairing challenge',
+  min: 'authenticated',
+  args: '{ device_id: string, machine: string, public_key: string, arch?: "arm64"|"x86_64", os?: "darwin"|"linux", acceleration?: "apple-metal"|"cuda"|"rocm"|"none" }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      device_id: STRING_SCHEMA,
+      machine: STRING_SCHEMA,
+      public_key: STRING_SCHEMA,
+      arch: { type: 'string', enum: ['arm64', 'x86_64'] },
+      os: { type: 'string', enum: ['darwin', 'linux'] },
+      acceleration: { type: 'string', enum: ['apple-metal', 'cuda', 'rocm', 'none'] },
+    },
+    required: ['device_id', 'machine', 'public_key'],
+    additionalProperties: false,
+  },
+  async run(_auth, env, args) {
+    const deviceId = str(args.device_id)
+    const machine = str(args.machine)
+    const publicKey = str(args.public_key)
+    if (!deviceId || !machine || !publicKey) return fail(400, 'invalid_args', 'device_id, machine, and public_key are required')
+
+    const challenge = await createDevicePairingChallenge(env, {
+      deviceId,
+      machine,
+      publicKey,
+      arch: args.arch as any,
+      os: args.os as any,
+      acceleration: args.acceleration as any,
+    })
+
+    return done(challenge)
+  },
+}
+
+// device_pair_claim — claim and verify device pairing challenge as operator (FLIGHT DEV-01)
+const toolDevicePairClaim: ToolSpec = {
+  name: 'device_pair_claim',
+  scope: 'operator claim and enrollment of paired hardware device',
+  min: 'admin',
+  args: '{ pairing_code: string, device_id: string, signature: string }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      pairing_code: STRING_SCHEMA,
+      device_id: STRING_SCHEMA,
+      signature: STRING_SCHEMA,
+    },
+    required: ['pairing_code', 'device_id', 'signature'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const pairingCode = str(args.pairing_code)
+    const deviceId = str(args.device_id)
+    const signature = str(args.signature)
+    if (!pairingCode || !deviceId || !signature) return fail(400, 'invalid_args', 'pairing_code, device_id, and signature are required')
+
+    const outcome = await claimDevicePairing(env, auth, {
+      pairingCode,
+      deviceId,
+      signature,
+    })
+
+    if (!outcome.ok) return fail(outcome.status as any, outcome.error, outcome.detail)
+    return done(outcome.device)
+  },
+}
+
+// device_report_exec — report sandboxed hardware execution outcome with cryptographic proof (FLIGHT DEV-02)
+const toolDeviceReportExec: ToolSpec = {
+  name: 'device_report_exec',
+  scope: 'record attested execution outcome from Mupot OS device',
+  min: 'authenticated',
+  args: '{ device_id: string, task_id: string, result: object, signature_hex: string }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      device_id: STRING_SCHEMA,
+      task_id: STRING_SCHEMA,
+      result: { type: 'object' },
+      signature_hex: STRING_SCHEMA,
+    },
+    required: ['device_id', 'task_id', 'result', 'signature_hex'],
+    additionalProperties: false,
+  },
+  async run(_auth, env, args) {
+    const deviceId = str(args.device_id)
+    const taskId = str(args.task_id)
+    const result = args.result as any
+    const signatureHex = str(args.signature_hex)
+    if (!deviceId || !taskId || !result || !signatureHex) {
+      return fail(400, 'invalid_args', 'device_id, task_id, result, and signature_hex are required')
+    }
+
+    const outcome = await reportDeviceExecution(env, {
+      deviceId,
+      taskId,
+      result,
+      signatureHex,
+    })
+
+    if (!outcome.ok) return fail(outcome.status as any, outcome.error, outcome.detail)
+    return done(outcome)
+  },
+}
+
+// device_sync_journal — edge sync protocol for buffered offline transactions (FLIGHT DEV-04)
+const toolDeviceSyncJournal: ToolSpec = {
+  name: 'device_sync_journal',
+  scope: 'reconcile offline transaction journal entries from Mupot OS hardware',
+  min: 'authenticated',
+  args: '{ device_id: string, entries: array }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      device_id: STRING_SCHEMA,
+      entries: { type: 'array' },
+    },
+    required: ['device_id', 'entries'],
+    additionalProperties: false,
+  },
+  async run(_auth, env, args) {
+    const deviceId = str(args.device_id)
+    const entries = Array.isArray(args.entries) ? (args.entries as any[]) : []
+    if (!deviceId) return fail(400, 'invalid_args', 'device_id and entries are required')
+
+    const result = await syncDeviceJournalEntries(env, {
+      deviceId,
+      entries,
+    })
+
+    return done(result)
+  },
+}
+
+// device_power_control — update hardware power state or issue Wake-on-Demand (FLIGHT DEV-05)
+const toolDevicePowerControl: ToolSpec = {
+  name: 'device_power_control',
+  scope: 'hardware power management and Wake-on-Demand mesh dispatch',
+  min: 'authenticated',
+  args: '{ device_id: string, action: "update" | "wake", power_state?: string, battery_pct?: number, is_charging?: boolean, reason?: string, priority?: string }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      device_id: STRING_SCHEMA,
+      action: { type: 'string', enum: ['update', 'wake'] },
+      power_state: { type: 'string', enum: ['active', 'low_power', 'sleep', 'offline'] },
+      battery_pct: { type: 'number' },
+      is_charging: { type: 'boolean' },
+      reason: NULLABLE_STRING_SCHEMA,
+      priority: { type: 'string', enum: ['P0', 'P1', 'P2'] },
+    },
+    required: ['device_id', 'action'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const deviceId = str(args.device_id)
+    const action = str(args.action)
+    if (!deviceId || !action) return fail(400, 'invalid_args', 'device_id and action are required')
+
+    if (action === 'update') {
+      const powerState = (args.power_state as any) ?? 'active'
+      const updated = await updateDevicePowerState(env, {
+        deviceId,
+        powerState,
+        batteryPct: typeof args.battery_pct === 'number' ? args.battery_pct : undefined,
+        isCharging: typeof args.is_charging === 'boolean' ? args.is_charging : undefined,
+      })
+      return done(updated)
+    }
+
+    if (action === 'wake') {
+      const wakeRes = await wakeHardwareDevice(env, auth, {
+        deviceId,
+        reason: typeof args.reason === 'string' ? args.reason : undefined,
+        priority: (args.priority as any) ?? 'P1',
+      })
+      return done(wakeRes)
+    }
+
+    return fail(400, 'invalid_action')
+  },
+}
 
 // create_access_key — unified minting of token-scoped access keys bundling client configs (FLIGHT IDENTITY-UNIFIED / #584)
 const toolCreateAccessKey: ToolSpec = {
@@ -4989,6 +5185,11 @@ export const TOOLS: ToolSpec[] = [
   toolExecutionMeterStatus,
   toolLoopDriverTick,
   toolCreateAccessKey,
+  toolDevicePairChallenge,
+  toolDevicePairClaim,
+  toolDeviceReportExec,
+  toolDeviceSyncJournal,
+  toolDevicePowerControl,
   ...AGENT_CONNECTION_TOOLS,
   ...PROJECT_TOOLS,
   ...PROVISION_TOOLS,
