@@ -6,6 +6,7 @@ import {
   checkAndReserve,
   MAX_DISPATCHES_PER_DAY,
   MAX_TOKENS_PER_DAY,
+  type MeterBlockResult,
 } from '../src/agents/meter'
 import { TOOLS, invokeTool } from '../src/mcp'
 import type { LoopManifest } from '../src/loops/manifest'
@@ -424,6 +425,90 @@ describe('internal authorized reservation', () => {
       costWindow: 'day',
       estimateMicroUsd: expect.any(Number),
     })
+  })
+
+  it.each([
+    {
+      name: 'dispatch cap',
+      reason: 'rate_limited' as const,
+      costWindow: 'week' as const,
+      includes: ['dispatch_rate_limited', 'daily dispatch cap reached', 'next UTC day resets the dispatch window'],
+      excludes: ['token cap reached', 'cost cap reached'],
+    },
+    {
+      name: 'token cap',
+      reason: 'budget_exhausted' as const,
+      costWindow: 'week' as const,
+      includes: ['token_budget_exhausted', 'daily token cap reached', 'next UTC day resets the token window'],
+      excludes: ['dispatch cap reached', 'cost cap reached'],
+    },
+    {
+      name: 'daily cost cap',
+      reason: 'budget_cap_exceeded' as const,
+      costWindow: 'day' as const,
+      includes: ['cost_budget_exhausted', 'daily cost cap reached', 'next UTC day resets the cost window'],
+      excludes: ['dispatch cap reached', 'token cap reached'],
+    },
+    {
+      name: 'weekly cost cap',
+      reason: 'budget_cap_exceeded' as const,
+      costWindow: 'week' as const,
+      includes: ['cost_budget_exhausted', 'trailing 7-day cost cap reached', 'older spend leaves the trailing 7-day window'],
+      excludes: ['next UTC day', 'midnight', 'resets the cost window'],
+    },
+  ])('persists a truthful $name receipt without executing or reserving again', async ({
+    reason,
+    costWindow,
+    includes,
+    excludes,
+  }) => {
+    harness.sqlite.prepare(
+      `INSERT INTO tasks (id, squad_id, title, body, done_when, status, assignee_agent_id)
+       VALUES (?, ?, 'Execute safely', '', 'review receipt exists', 'open', ?)`,
+    ).run('task-meter-block', SQUAD_A, AGENT_A)
+    const { env } = trackedEnv(harness)
+    const decision: MeterBlockResult = {
+      ok: false,
+      reason,
+      windowKey: windowKey(AGENT_A),
+      count: 17,
+      tokens: 34_000,
+      retryAfterSec: 90,
+    }
+    const reserve = vi.fn(async () => decision)
+    const recordTokens = vi.fn(async () => undefined)
+    const model = { chat: vi.fn(async () => 'must not run') }
+    const beforeCount = (harness.sqlite.prepare(
+      'SELECT count FROM execution_meter WHERE window_key = ?',
+    ).get(windowKey(AGENT_A)) as { count: number }).count
+
+    const outcome = await runTaskExecution(
+      env,
+      agent({ budget_window: costWindow }),
+      'task-meter-block',
+      {
+        model,
+        emit: async () => undefined,
+        remember: async () => 'unused',
+        meter: { checkAndReserve: reserve, recordTokens },
+      },
+    )
+
+    const task = harness.sqlite.prepare(
+      'SELECT status, result FROM tasks WHERE id = ?',
+    ).get('task-meter-block') as { status: string; result: string }
+    const afterCount = (harness.sqlite.prepare(
+      'SELECT count FROM execution_meter WHERE window_key = ?',
+    ).get(windowKey(AGENT_A)) as { count: number }).count
+
+    expect(outcome).toMatchObject({ ok: false, task_status: 'blocked', error: reason })
+    expect(task.status).toBe('blocked')
+    for (const text of includes) expect(task.result).toContain(text)
+    for (const text of excludes) expect(task.result).not.toContain(text)
+    expect(reserve).toHaveBeenCalledTimes(1)
+    expect(recordTokens).not.toHaveBeenCalled()
+    expect(model.chat).not.toHaveBeenCalled()
+    expect(afterCount).toBe(beforeCount)
   })
 
   it('runGoalCycle builds the same server-owned policy for loop reservation', async () => {
