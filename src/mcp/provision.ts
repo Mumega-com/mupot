@@ -40,9 +40,10 @@ import type { AgentProfilePatch, UnitConfigPatch } from '../org/service'
 import {
   mintAgentBoundToken,
   isAgentTokenCapability,
+  AgentTokenReplacementError,
   resolveAgentMemberBinding,
 } from '../members/service'
-import { calculateExpiryTimestamp, DEFAULT_TOKEN_EXPIRY_DAYS } from '../auth/token-lifecycle'
+import { resolveAgentTokenExpiry } from '../auth/token-lifecycle'
 import { createCredentialClaim, CLAIM_TTL_SECONDS } from '../auth/credential-claim'
 import { revokeMemberToken } from '../members/service'
 import { setAgentSquadAccess, type AgentAccessCapability } from '../members/agent-access'
@@ -485,15 +486,13 @@ const toolMintAgentToken: ToolSpec = {
       return fail(400, 'invalid_capability', 'capability must be observer or member')
     }
 
-    // Flight-002: Expiry resolution (default 30 days, unless non_expiring=true is explicitly requested)
-    let expiresAt: string | null = null
-    const nonExpiring = Boolean(args.non_expiring)
-    if (!nonExpiring) {
-      const days = typeof args.expires_in_days === 'number' && args.expires_in_days > 0
-        ? Math.min(Math.max(args.expires_in_days, 1), 365)
-        : DEFAULT_TOKEN_EXPIRY_DAYS
-      expiresAt = calculateExpiryTimestamp(days)
-    }
+    const expiry = resolveAgentTokenExpiry({
+      expiresInDays: args.expires_in_days as number | undefined,
+      nonExpiring: args.non_expiring === true,
+      allowNonExpiring: hasCapability(grants, 'org', null, 'owner'),
+    })
+    if (!expiry.ok) return fail(400, expiry.code)
+    const expiresAt = expiry.expiresAt
 
     const rotatePriorTokenId = str(args.rotate_prior_token_id) ?? null
 
@@ -509,6 +508,9 @@ const toolMintAgentToken: ToolSpec = {
         revokePriorTokenId: rotatePriorTokenId,
       })
     } catch (err) {
+      if (err instanceof AgentTokenReplacementError) {
+        return fail(409, 'replacement_token_unavailable')
+      }
       if (err instanceof Error && err.message.startsWith('agent_home_capability_missing')) {
         return fail(409, 'agent_home_capability_missing', {
           detail: 'canonical agent member has no home-squad grant; grant one before minting',
