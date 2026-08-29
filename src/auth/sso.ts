@@ -102,18 +102,27 @@ export async function autoEnrollSsoMember(
 
   // Check if member already exists
   const existing = await env.DB.prepare(`
-    SELECT id, role, status FROM members
-     WHERE tenant = ?1 AND lower(email) = ?2
+    SELECT m.id, m.status,
+           EXISTS (
+             SELECT 1 FROM capabilities c
+              WHERE c.member_id = m.id
+                AND c.scope_type = 'org'
+                AND c.scope_id IS NULL
+                AND c.capability IN ('owner', 'admin')
+           ) AS is_admin
+      FROM members m
+     WHERE m.tenant = ?1 AND lower(m.email) = ?2
      LIMIT 1
   `)
     .bind(env.TENANT_SLUG, email)
-    .first<{ id: string; role: 'member' | 'admin'; status: string }>()
+    .first<{ id: string; status: string; is_admin: number }>()
 
   if (existing) {
+    const role = existing.is_admin === 1 ? 'admin' : 'member'
     if (existing.status !== 'active') {
-      return { ok: false, email, role: existing.role, isNew: false, error: 'member_suspended' }
+      return { ok: false, email, role, isNew: false, error: 'member_suspended' }
     }
-    return { ok: true, memberId: existing.id, email, role: existing.role, isNew: false }
+    return { ok: true, memberId: existing.id, email, role, isNew: false }
   }
 
   // Provision new member
@@ -121,13 +130,18 @@ export async function autoEnrollSsoMember(
   const role = config.default_role || 'member'
   const nowIso = new Date().toISOString()
 
-  await env.DB.prepare(`
-    INSERT INTO members (
-      id, tenant, email, role, status, created_at, updated_at
-    ) VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?5)
-  `)
-    .bind(memberId, env.TENANT_SLUG, email, role, nowIso)
-    .run()
+  await env.DB.batch([
+    env.DB.prepare(`
+      INSERT INTO members (
+        id, tenant, email, display_name, telegram_chat_id, status, created_at
+      ) VALUES (?1, ?2, ?3, ?4, NULL, 'active', ?5)
+    `).bind(memberId, env.TENANT_SLUG, email, profile.name?.trim() || email, nowIso),
+    env.DB.prepare(`
+      INSERT INTO capabilities (
+        id, member_id, scope_type, scope_id, capability, created_at
+      ) VALUES (?1, ?2, 'org', NULL, ?3, ?4)
+    `).bind(crypto.randomUUID(), memberId, role, nowIso),
+  ])
 
   await bus.emit({
     type: 'member.auto_enrolled',
