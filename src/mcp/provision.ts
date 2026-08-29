@@ -45,6 +45,8 @@ import {
   cancelAgentTokenReplacementReservation,
   findAgentTokenReplacementHandoff,
   markAgentTokenReplacementAuditSent,
+  markAgentTokenReplacementClaimReady,
+  isAgentTokenReplacementClaimReady,
   prepareAgentTokenReplacement,
   resolveAgentMemberBinding,
   stageAgentTokenReplacement,
@@ -544,6 +546,7 @@ const toolMintAgentToken: ToolSpec = {
         }
         try {
           await createCredentialClaim(env, prepared.raw, auth.memberId as string, handoff.claim.claimId)
+          await markAgentTokenReplacementClaimReady(env, handoff.id)
         } catch {
           try {
             await cancelAgentTokenReplacementReservation(env, handoff)
@@ -555,6 +558,12 @@ const toolMintAgentToken: ToolSpec = {
       }
 
       try {
+        if (!(await isAgentTokenReplacementClaimReady(env, handoff.id))) {
+          if (!(await credentialClaimIsAvailable(env, handoff.claim.claimId, auth.memberId as string))) {
+            return fail(503, 'replacement_handoff_pending')
+          }
+          await markAgentTokenReplacementClaimReady(env, handoff.id)
+        }
         if (handoff.auditState === 'pending') {
           await emitProvisioned(env, auth.memberId as string, 'token', handoff.replacementTokenId, {
             squad_id: agent.squad_id,

@@ -744,7 +744,7 @@ export async function cancelAgentTokenReplacementReservation(
   const writes = await env.DB.batch([
     env.DB.prepare(
       `DELETE FROM agent_token_rotation_handoffs
-        WHERE id = ? AND tenant = ? AND state = 'pending' AND audit_state = 'pending'`,
+        WHERE id = ? AND tenant = ? AND state = 'pending' AND audit_state = 'pending' AND claim_state = 'pending'`,
     ).bind(handoff.id, env.TENANT_SLUG),
     env.DB.prepare(
       `DELETE FROM member_tokens
@@ -758,6 +758,27 @@ export async function cancelAgentTokenReplacementReservation(
     ),
   ])
   assertBatchWritten(writes, 'cancel_agent_token_replacement_reservation', 1)
+}
+
+export async function isAgentTokenReplacementClaimReady(env: Env, handoffId: string): Promise<boolean> {
+  const row = await env.DB.prepare(
+    `SELECT claim_state FROM agent_token_rotation_handoffs WHERE id = ? AND tenant = ? LIMIT 1`,
+  ).bind(handoffId, env.TENANT_SLUG).first<{ claim_state: 'pending' | 'ready' }>()
+  return row?.claim_state === 'ready'
+}
+
+export async function markAgentTokenReplacementClaimReady(
+  env: Env,
+  handoffId: string,
+): Promise<void> {
+  const result = await env.DB.prepare(
+    `UPDATE agent_token_rotation_handoffs
+        SET claim_state = 'ready'
+      WHERE id = ? AND tenant = ? AND state = 'pending' AND audit_state = 'pending' AND claim_state = 'pending'`,
+  ).bind(handoffId, env.TENANT_SLUG).run()
+  if ((result.meta?.changes ?? 0) === 1) return
+  if (await isAgentTokenReplacementClaimReady(env, handoffId)) return
+  throw new AgentTokenReplacementError()
 }
 
 export async function markAgentTokenReplacementAuditSent(
