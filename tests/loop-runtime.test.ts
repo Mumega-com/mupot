@@ -1,26 +1,18 @@
 // tests/loop-runtime.test.ts — the manifest-driven Loop runtime (P2, #33).
-// Pure decision flow over injected seams (no model/D1/network): guards, budget gate,
-// perceive (incl. failing-source tolerance), reason→act routing, dry/acted, and the
-// default act router's gated-vs-ungated behavior.
+// Decision flow over the migration-backed tenant DB plus injected model/network seams:
+// guards, owner resolution, budget gate, perceive (incl. failing-source tolerance),
+// reason→act routing, dry/acted, and the default act router's gated-vs-ungated behavior.
 
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { runLoopCycle } from '../src/loops/runtime'
 import type { RuntimeDeps, ProposedAct } from '../src/loops/runtime'
 import type { LoopManifest } from '../src/loops/manifest'
 import type { Env } from '../src/types'
+import { applyAllMigrations } from './helpers/migrations'
+import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
-const ENV = {
-  TENANT_SLUG: 't',
-  DB: {
-    prepare() {
-      return {
-        bind(id: string) {
-          return { async first() { return { id, squad_id: 's1' } } }
-        },
-      }
-    },
-  },
-} as unknown as Env
+let harness: SqliteD1Harness
+let ENV: Env
 
 function makeLoop(over: Partial<LoopManifest> = {}): LoopManifest {
   return {
@@ -41,6 +33,31 @@ function makeLoop(over: Partial<LoopManifest> = {}): LoopManifest {
     ...over,
   }
 }
+
+function seedRuntimeOwners(sqlite: SqliteD1Harness['sqlite']): void {
+  sqlite.exec(`
+    INSERT INTO departments (id, slug, name)
+    VALUES ('d1', 'department', 'Department');
+    INSERT INTO squads (id, department_id, slug, name) VALUES
+      ('s1', 'd1', 'squad-one', 'Squad One'),
+      ('s2', 'd1', 'squad-two', 'Squad Two');
+    INSERT INTO agents (id, squad_id, slug, name, status) VALUES
+      ('a1', 's1', 'agent-one', 'Agent One', 'active'),
+      ('a-paused', 's2', 'agent-paused', 'Agent Paused', 'paused');
+    INSERT INTO loops (id, tenant, squad_id, agent_id, status, spec, created_at, updated_at)
+    VALUES ('l1', 't', NULL, 'a1', 'active', '{}', datetime('now'), datetime('now'));
+  `)
+}
+
+beforeEach(() => {
+  harness = createSqliteD1()
+  applyAllMigrations(harness.sqlite)
+  seedRuntimeOwners(harness.sqlite)
+  ENV = { TENANT_SLUG: 't', DB: harness.db } as Env
+  vi.clearAllMocks()
+})
+
+afterEach(() => harness.close())
 
 const meterOk: RuntimeDeps['meterCheck'] = vi.fn(async () => ({
   ok: true, windowKey: 'w', count: 1, tokens: 0,
@@ -71,6 +88,80 @@ describe('runLoopCycle — guards', () => {
     const r = await runLoopCycle(ENV, makeLoop({ agent_id: null, squad_id: null }), { meterCheck: meterOk })
     expect(r.ok).toBe(false)
     expect(r.error).toBe('loop_has_no_owner')
+  })
+})
+
+describe('runLoopCycle — canonical meter owner resolution', () => {
+  it('maps an active agent subject to its canonical squad without changing the meter key', async () => {
+    const meterCheck = vi.fn(async () => ({
+      ok: false as const,
+      reason: 'rate_limited' as const,
+      windowKey: 't:a1:2026-08-29',
+      count: 200,
+      tokens: 0,
+      retryAfterSec: 1,
+    }))
+
+    await runLoopCycle(ENV, makeLoop(), { meterCheck, observeKpi: async () => 0 })
+
+    expect(meterCheck).toHaveBeenCalledWith(ENV, {
+      tenant: 't',
+      meterSubjectId: 'a1',
+      squadId: 's1',
+      projectId: null,
+      maxDispatchDay: 200,
+      maxTokensDay: 200_000,
+      maxCostMicroUsd: 5_000_000,
+      costWindow: 'week',
+      estimateMicroUsd: expect.any(Number),
+    })
+  })
+
+  it('preserves a canonical squad as both meter subject and squad attribution', async () => {
+    const meterCheck = vi.fn(async () => ({
+      ok: false as const,
+      reason: 'rate_limited' as const,
+      windowKey: 't:s2:2026-08-29',
+      count: 200,
+      tokens: 0,
+      retryAfterSec: 1,
+    }))
+
+    await runLoopCycle(ENV, makeLoop({ agent_id: null, squad_id: 's2' }), {
+      meterCheck,
+      observeKpi: async () => 0,
+    })
+
+    expect(meterCheck).toHaveBeenCalledWith(ENV, expect.objectContaining({
+      tenant: 't',
+      meterSubjectId: 's2',
+      squadId: 's2',
+    }))
+  })
+
+  it.each([
+    ['inactive agent', { agent_id: 'a-paused', squad_id: null }],
+    ['missing agent', { agent_id: 'a-missing', squad_id: null }],
+    ['missing squad', { agent_id: null, squad_id: 's-missing' }],
+  ])('fails closed for a %s before meter reservation', async (_name, owner) => {
+    const meterCheck = vi.fn(async () => ({
+      ok: true as const,
+      windowKey: 'must-not-reserve',
+      count: 1,
+      tokens: 0,
+    }))
+
+    const result = await runLoopCycle(ENV, makeLoop(owner), {
+      meterCheck,
+      observeKpi: async () => 0,
+    })
+
+    expect(result).toMatchObject({
+      ok: false,
+      decided: 'inactive',
+      error: 'loop_owner_unavailable',
+    })
+    expect(meterCheck).not.toHaveBeenCalled()
   })
 })
 
