@@ -14,7 +14,12 @@
 import type { D1PreparedStatement } from '@cloudflare/workers-types'
 import type { Env, MemberToken, ConnectionChannel, Capability, CapabilityGrant } from '../types'
 import { assertBatchWritten } from '../lib/receipt'
-import { calculateExpiryTimestamp, DEFAULT_TOKEN_EXPIRY_DAYS } from '../auth/token-lifecycle'
+import {
+  calculateExpiryTimestamp,
+  DEFAULT_TOKEN_EXPIRY_DAYS,
+  nowSqlUtc,
+  TOKEN_LIVE_PREDICATE,
+} from '../auth/token-lifecycle'
 
 const CHANNELS: readonly ConnectionChannel[] = ['workspace', 'im', 'dashboard']
 export function isChannel(v: unknown): v is ConnectionChannel {
@@ -204,12 +209,35 @@ export interface PreparedAgentTokenMint extends AgentMintResult {
   statements: D1PreparedStatement[]
   bindingProof: AgentBindingProof
   replacementTokenId: string | null
+  label: string
+  expiresAt: string | null
 }
 
 export interface PrepareAgentTokenMintOptions {
   grantCapability?: AgentTokenCapability
   expiresAt?: string | null
   revokePriorTokenId?: string | null
+}
+
+export interface AgentTokenReplacementClaim {
+  claimId: string
+  fingerprint: string
+  expiresAt: string
+  mintedByMemberId: string
+}
+
+export interface AgentTokenReplacementHandoff {
+  id: string
+  tenant: string
+  agentId: string
+  memberId: string
+  priorTokenId: string
+  replacementTokenId: string
+  claim: AgentTokenReplacementClaim
+  auditState: 'pending' | 'sent'
+  state: 'pending' | 'active'
+  createdAt: string
+  activatedAt: string | null
 }
 
 /** Intentionally opaque to callers: a replacement identifier is never an ownership oracle. */
@@ -222,6 +250,10 @@ export class AgentTokenReplacementError extends Error {
   }
 }
 
+function replacementLivePredicate(alias: string, nowParam: string): string {
+  return TOKEN_LIVE_PREDICATE(nowParam).replaceAll('t.', `${alias}.`)
+}
+
 async function assertLiveReplacementToken(
   env: Env,
   agentId: string,
@@ -229,11 +261,12 @@ async function assertLiveReplacementToken(
   tokenId: string,
 ): Promise<void> {
   const prior = await env.DB.prepare(
-    `SELECT id FROM member_tokens
-      WHERE id = ? AND member_id = ? AND agent_id = ? AND tenant = ? AND revoked_at IS NULL
+    `SELECT t.id FROM member_tokens t
+      WHERE t.id = ? AND t.member_id = ? AND t.agent_id = ? AND t.tenant = ?
+        AND ${replacementLivePredicate('t', '?')}
       LIMIT 1`,
   )
-    .bind(tokenId, memberId, agentId, env.TENANT_SLUG)
+    .bind(tokenId, memberId, agentId, env.TENANT_SLUG, nowSqlUtc())
     .first<{ id: string }>()
   if (!prior) throw new AgentTokenReplacementError()
 }
@@ -255,6 +288,9 @@ export async function prepareAgentBoundTokenMint(
   const grantCapability = opts.grantCapability ?? 'member'
   if (!isAgentTokenCapability(grantCapability)) {
     throw new Error('invalid agent token capability')
+  }
+  if (opts.revokePriorTokenId !== undefined && opts.revokePriorTokenId !== null && opts.revokePriorTokenId.trim().length === 0) {
+    throw new AgentTokenReplacementError()
   }
 
   const binding = await resolveAgentMemberBinding(env, agent.id)
@@ -359,8 +395,9 @@ export async function prepareAgentBoundTokenMintForBinding(
         `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant, expires_at)
          SELECT ?, ?, ?, ?, 'workspace', ?, ?, ?, ?
           WHERE EXISTS (
-            SELECT 1 FROM member_tokens
-             WHERE id = ? AND member_id = ? AND agent_id = ? AND tenant = ? AND revoked_at IS NULL
+            SELECT 1 FROM member_tokens prior
+             WHERE prior.id = ? AND prior.member_id = ? AND prior.agent_id = ? AND prior.tenant = ?
+               AND ${replacementLivePredicate('prior', '?')}
           )`,
       ).bind(
         tokenId,
@@ -375,10 +412,12 @@ export async function prepareAgentBoundTokenMintForBinding(
         memberId,
         agent.id,
         env.TENANT_SLUG,
+        nowSqlUtc(),
       ),
       env.DB.prepare(
-        `UPDATE member_tokens SET revoked_at = ? WHERE id = ? AND member_id = ? AND agent_id = ? AND tenant = ? AND revoked_at IS NULL`,
-      ).bind(createdAt, revokePriorTokenId, memberId, agent.id, env.TENANT_SLUG),
+        `UPDATE member_tokens SET revoked_at = ? WHERE id = ? AND member_id = ? AND agent_id = ? AND tenant = ?
+          AND ${replacementLivePredicate('member_tokens', '?')}`,
+      ).bind(createdAt, revokePriorTokenId, memberId, agent.id, env.TENANT_SLUG, nowSqlUtc()),
     )
   } else {
     statements.push(
@@ -400,13 +439,15 @@ export async function prepareAgentBoundTokenMintForBinding(
   // marks it a system grant in the D3 audit trail. NOTE: gate:agent-self-completion is
   // deliberately NOT granted here — the verdict route treats that gate as assignee-or-org-admin only,
   // so a universal grant would be a dead authority surface (BLOCK-1, kasra-review).
-  statements.push(
-    env.DB.prepare(
+  if (!revokePriorTokenId) {
+    statements.push(
+      env.DB.prepare(
       `INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
        VALUES (?, ?, 'agent', ?, 'system:mint', ?)
        ON CONFLICT (capability, principal_type, principal_id) DO UPDATE SET created_at = created_at`,
-    ).bind(crypto.randomUUID(), `gate:${agent.slug}`, agent.id, createdAt),
-  )
+      ).bind(crypto.randomUUID(), `gate:${agent.slug}`, agent.id, createdAt),
+    )
+  }
 
   return {
     raw: rawToken,
@@ -416,6 +457,8 @@ export async function prepareAgentBoundTokenMintForBinding(
     grantCapability,
     statements,
     replacementTokenId: revokePriorTokenId,
+    label: safeLabel,
+    expiresAt,
     bindingDisposition: creating ? 'created' : 'reused',
     bindingProof: {
       agentId: agent.id,
@@ -505,6 +548,249 @@ export async function mintAgentBoundToken(
     )
     return commitPreparedAgentTokenMint(env, retry)
   }
+}
+
+/**
+ * Build a replacement token after ownership/liveness preflight, but do not make
+ * either credential live. The MCP handoff stores its claim/outbox state before
+ * calling stageAgentTokenReplacement, so a KV failure cannot revoke the prior.
+ */
+export async function prepareAgentTokenReplacement(
+  env: Env,
+  agent: AgentForMint,
+  label: string,
+  opts: Omit<PrepareAgentTokenMintOptions, 'revokePriorTokenId'> & { revokePriorTokenId: string },
+): Promise<PreparedAgentTokenMint> {
+  if (opts.revokePriorTokenId.trim().length === 0) throw new AgentTokenReplacementError()
+  const grantCapability = opts.grantCapability ?? 'member'
+  if (!isAgentTokenCapability(grantCapability)) throw new Error('invalid agent token capability')
+  const binding = await resolveAgentMemberBinding(env, agent.id)
+  if (binding.kind === 'unminted') throw new AgentTokenReplacementError()
+  await assertLiveReplacementToken(env, agent.id, binding.memberId, opts.revokePriorTokenId)
+  const prepared = await prepareAgentBoundTokenMintForBinding(
+    env,
+    agent,
+    label,
+    grantCapability,
+    binding,
+    opts.expiresAt,
+  )
+  return { ...prepared, replacementTokenId: opts.revokePriorTokenId }
+}
+
+function rowToReplacementHandoff(row: {
+  id: string
+  tenant: string
+  agent_id: string
+  member_id: string
+  prior_token_id: string
+  replacement_token_id: string
+  claim_id: string
+  claim_fingerprint: string
+  claim_expires_at: string
+  minted_by_member_id: string
+  audit_state: 'pending' | 'sent'
+  state: 'pending' | 'active'
+  created_at: string
+  activated_at: string | null
+}): AgentTokenReplacementHandoff {
+  return {
+    id: row.id,
+    tenant: row.tenant,
+    agentId: row.agent_id,
+    memberId: row.member_id,
+    priorTokenId: row.prior_token_id,
+    replacementTokenId: row.replacement_token_id,
+    claim: {
+      claimId: row.claim_id,
+      fingerprint: row.claim_fingerprint,
+      expiresAt: row.claim_expires_at,
+      mintedByMemberId: row.minted_by_member_id,
+    },
+    auditState: row.audit_state,
+    state: row.state,
+    createdAt: row.created_at,
+    activatedAt: row.activated_at,
+  }
+}
+
+export async function findAgentTokenReplacementHandoff(
+  env: Env,
+  agentId: string,
+  priorTokenId: string,
+): Promise<AgentTokenReplacementHandoff | null> {
+  const row = await env.DB.prepare(
+    `SELECT id, tenant, agent_id, member_id, prior_token_id, replacement_token_id,
+            claim_id, claim_fingerprint, claim_expires_at, minted_by_member_id,
+            audit_state, state, created_at, activated_at
+       FROM agent_token_rotation_handoffs
+      WHERE tenant = ? AND agent_id = ? AND prior_token_id = ?
+      LIMIT 1`,
+  ).bind(env.TENANT_SLUG, agentId, priorTokenId).first<{
+    id: string
+    tenant: string
+    agent_id: string
+    member_id: string
+    prior_token_id: string
+    replacement_token_id: string
+    claim_id: string
+    claim_fingerprint: string
+    claim_expires_at: string
+    minted_by_member_id: string
+    audit_state: 'pending' | 'sent'
+    state: 'pending' | 'active'
+    created_at: string
+    activated_at: string | null
+  }>()
+  return row ? rowToReplacementHandoff(row) : null
+}
+
+export async function stageAgentTokenReplacement(
+  env: Env,
+  agent: AgentForMint,
+  prepared: PreparedAgentTokenMint,
+  claim: AgentTokenReplacementClaim,
+): Promise<AgentTokenReplacementHandoff> {
+  const priorTokenId = prepared.replacementTokenId
+  if (!priorTokenId) throw new AgentTokenReplacementError()
+  const handoffId = crypto.randomUUID()
+  const now = nowSqlUtc()
+  const livePrior = replacementLivePredicate('prior', '?')
+  const writes = await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant, expires_at, revoked_at)
+       SELECT ?, ?, ?, ?, 'workspace', ?, ?, ?, ?, ?
+        WHERE EXISTS (
+          SELECT 1 FROM member_tokens prior
+           WHERE prior.id = ? AND prior.member_id = ? AND prior.agent_id = ? AND prior.tenant = ?
+             AND ${livePrior}
+        )`,
+    ).bind(
+      prepared.tokenId,
+      prepared.memberId,
+      await sha256Hex(prepared.raw),
+      prepared.label,
+      prepared.createdAt,
+      agent.id,
+      env.TENANT_SLUG,
+      prepared.expiresAt,
+      prepared.createdAt,
+      priorTokenId,
+      prepared.memberId,
+      agent.id,
+      env.TENANT_SLUG,
+      now,
+    ),
+    env.DB.prepare(
+      `INSERT INTO agent_token_rotation_handoffs (
+        id, tenant, agent_id, member_id, prior_token_id, replacement_token_id,
+        minted_by_member_id, claim_id, claim_fingerprint, claim_expires_at, created_at
+      )
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        WHERE EXISTS (
+          SELECT 1 FROM member_tokens prior
+           WHERE prior.id = ? AND prior.member_id = ? AND prior.agent_id = ? AND prior.tenant = ?
+             AND ${livePrior}
+        )`,
+    ).bind(
+      handoffId,
+      env.TENANT_SLUG,
+      agent.id,
+      prepared.memberId,
+      priorTokenId,
+      prepared.tokenId,
+      claim.mintedByMemberId,
+      claim.claimId,
+      claim.fingerprint,
+      claim.expiresAt,
+      prepared.createdAt,
+      priorTokenId,
+      prepared.memberId,
+      agent.id,
+      env.TENANT_SLUG,
+      now,
+    ),
+  ])
+  try {
+    assertBatchWritten(writes, 'stage_agent_token_replacement', 1)
+  } catch {
+    throw new AgentTokenReplacementError()
+  }
+  return {
+    id: handoffId,
+    tenant: env.TENANT_SLUG,
+    agentId: agent.id,
+    memberId: prepared.memberId,
+    priorTokenId,
+    replacementTokenId: prepared.tokenId,
+    claim,
+    auditState: 'pending',
+    state: 'pending',
+    createdAt: prepared.createdAt,
+    activatedAt: null,
+  }
+}
+
+export async function markAgentTokenReplacementAuditSent(
+  env: Env,
+  handoffId: string,
+): Promise<AgentTokenReplacementHandoff> {
+  const result = await env.DB.prepare(
+    `UPDATE agent_token_rotation_handoffs
+        SET audit_state = 'sent'
+      WHERE id = ? AND tenant = ? AND state = 'pending' AND audit_state = 'pending'`,
+  ).bind(handoffId, env.TENANT_SLUG).run()
+  if ((result.meta?.changes ?? 0) === 0) {
+    const existing = await env.DB.prepare(
+      `SELECT id, tenant, agent_id, member_id, prior_token_id, replacement_token_id,
+              claim_id, claim_fingerprint, claim_expires_at, minted_by_member_id,
+              audit_state, state, created_at, activated_at
+         FROM agent_token_rotation_handoffs WHERE id = ? AND tenant = ? LIMIT 1`,
+    ).bind(handoffId, env.TENANT_SLUG).first<{
+      id: string; tenant: string; agent_id: string; member_id: string; prior_token_id: string; replacement_token_id: string
+      claim_id: string; claim_fingerprint: string; claim_expires_at: string; minted_by_member_id: string
+      audit_state: 'pending' | 'sent'; state: 'pending' | 'active'; created_at: string; activated_at: string | null
+    }>()
+    if (existing?.audit_state === 'sent') return rowToReplacementHandoff(existing)
+    throw new AgentTokenReplacementError()
+  }
+  const row = await env.DB.prepare(
+    `SELECT id, tenant, agent_id, member_id, prior_token_id, replacement_token_id,
+            claim_id, claim_fingerprint, claim_expires_at, minted_by_member_id,
+            audit_state, state, created_at, activated_at
+       FROM agent_token_rotation_handoffs WHERE id = ? AND tenant = ? LIMIT 1`,
+  ).bind(handoffId, env.TENANT_SLUG).first<{
+    id: string; tenant: string; agent_id: string; member_id: string; prior_token_id: string; replacement_token_id: string
+    claim_id: string; claim_fingerprint: string; claim_expires_at: string; minted_by_member_id: string
+    audit_state: 'pending' | 'sent'; state: 'pending' | 'active'; created_at: string; activated_at: string | null
+  }>()
+  if (!row) throw new AgentTokenReplacementError()
+  return rowToReplacementHandoff(row)
+}
+
+export async function activateAgentTokenReplacement(
+  env: Env,
+  handoffId: string,
+): Promise<AgentTokenReplacementHandoff> {
+  const activatedAt = nowSqlUtc()
+  const result = await env.DB.prepare(
+    `UPDATE agent_token_rotation_handoffs
+        SET state = 'active', activated_at = ?
+      WHERE id = ? AND tenant = ? AND state = 'pending' AND audit_state = 'sent'`,
+  ).bind(activatedAt, handoffId, env.TENANT_SLUG).run()
+  if ((result.meta?.changes ?? 0) === 0) throw new AgentTokenReplacementError()
+  const row = await env.DB.prepare(
+    `SELECT id, tenant, agent_id, member_id, prior_token_id, replacement_token_id,
+            claim_id, claim_fingerprint, claim_expires_at, minted_by_member_id,
+            audit_state, state, created_at, activated_at
+       FROM agent_token_rotation_handoffs WHERE id = ? AND tenant = ? LIMIT 1`,
+  ).bind(handoffId, env.TENANT_SLUG).first<{
+    id: string; tenant: string; agent_id: string; member_id: string; prior_token_id: string; replacement_token_id: string
+    claim_id: string; claim_fingerprint: string; claim_expires_at: string; minted_by_member_id: string
+    audit_state: 'pending' | 'sent'; state: 'pending' | 'active'; created_at: string; activated_at: string | null
+  }>()
+  if (!row) throw new AgentTokenReplacementError()
+  return rowToReplacementHandoff(row)
 }
 
 /** Live (non-revoked) tokens for every member — for the dashboard roster. The

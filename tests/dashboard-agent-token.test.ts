@@ -13,7 +13,15 @@
 //  10. tsc strict — validated by build step
 
 import { describe, it, expect, vi } from 'vitest'
-import { mintAgentBoundToken, sha256Hex } from '../src/members/service'
+import {
+  activateAgentTokenReplacement,
+  findAgentTokenReplacementHandoff,
+  markAgentTokenReplacementAuditSent,
+  mintAgentBoundToken,
+  prepareAgentTokenReplacement,
+  sha256Hex,
+  stageAgentTokenReplacement,
+} from '../src/members/service'
 import { loadAgentTokenView } from '../src/dashboard/agent-token'
 import { dashboardApp } from '../src/dashboard/index'
 import type { Env } from '../src/types'
@@ -287,6 +295,21 @@ function createMigratedMintEnv(): {
 }
 
 describe('mintAgentBoundToken — canonical SQLite identity', () => {
+  it('first_mint_with_replacement_id_is_refused_with_zero_side_effects', async () => {
+    const harness = createMigratedMintEnv()
+    try {
+      await expect(prepareAgentTokenReplacement(harness.env, AGENT, 'first', {
+        revokePriorTokenId: 'prior-id',
+      })).rejects.toThrow('replacement_token_unavailable')
+      expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM member_tokens').get()).toEqual({ count: 0 })
+      expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM agent_member_bindings').get()).toEqual({ count: 0 })
+      expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM gate_grants').get()).toEqual({ count: 0 })
+      expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM agent_token_rotation_handoffs').get()).toEqual({ count: 0 })
+    } finally {
+      harness.close()
+    }
+  })
+
   it('does not persist a replacement when its requested prior token is not live for the agent', async () => {
     const harness = createMigratedMintEnv()
     try {
@@ -342,6 +365,28 @@ describe('mintAgentBoundToken — canonical SQLite identity', () => {
     }
   })
 
+  it('expired_prior_is_refused_with_zero_side_effects', async () => {
+    const harness = createMigratedMintEnv()
+    try {
+      const prior = await mintAgentBoundToken(harness.env, AGENT, 'prior')
+      harness.sqlite.prepare('UPDATE member_tokens SET expires_at = ? WHERE id = ?')
+        .run('2000-01-01 00:00:00', prior.tokenId)
+
+      await expect(mintAgentBoundToken(harness.env, AGENT, 'replacement', {
+        revokePriorTokenId: prior.tokenId,
+      })).rejects.toThrow('replacement_token_unavailable')
+
+      expect(harness.sqlite.prepare(
+        'SELECT COUNT(*) AS count FROM member_tokens WHERE tenant = ? AND agent_id = ?',
+      ).get('test', AGENT.id)).toEqual({ count: 1 })
+      expect(harness.sqlite.prepare(
+        'SELECT revoked_at FROM member_tokens WHERE id = ?',
+      ).get(prior.tokenId)).toEqual({ revoked_at: null })
+    } finally {
+      harness.close()
+    }
+  })
+
   it('allows exactly one concurrent replacement of the same prior token', async () => {
     const harness = createMigratedMintEnv()
     try {
@@ -359,6 +404,108 @@ describe('mintAgentBoundToken — canonical SQLite identity', () => {
       expect(harness.sqlite.prepare(
         'SELECT COUNT(*) AS count FROM member_tokens WHERE tenant = ? AND agent_id = ? AND revoked_at IS NULL',
       ).get('test', AGENT.id)).toEqual({ count: 1 })
+    } finally {
+      harness.close()
+    }
+  })
+
+  it('lost_concurrent_replacement_has_zero_token_binding_gate_claim_and_bus_effect', async () => {
+    const harness = createMigratedMintEnv()
+    try {
+      const prior = await mintAgentBoundToken(harness.env, AGENT, 'prior')
+      const gatesBefore = harness.sqlite.prepare('SELECT COUNT(*) AS count FROM gate_grants').get()
+      const [first, second] = await Promise.all([
+        prepareAgentTokenReplacement(harness.env, AGENT, 'replacement-a', { revokePriorTokenId: prior.tokenId }),
+        prepareAgentTokenReplacement(harness.env, AGENT, 'replacement-b', { revokePriorTokenId: prior.tokenId }),
+      ])
+      const staged = await Promise.allSettled([
+        stageAgentTokenReplacement(harness.env, AGENT, first, {
+          claimId: 'claim-race-a', fingerprint: '0123456789abcdef', expiresAt: '2099-01-01T00:00:00.000Z', mintedByMemberId: prior.memberId,
+        }),
+        stageAgentTokenReplacement(harness.env, AGENT, second, {
+          claimId: 'claim-race-b', fingerprint: 'fedcba9876543210', expiresAt: '2099-01-01T00:00:00.000Z', mintedByMemberId: prior.memberId,
+        }),
+      ])
+
+      expect(staged.filter((result) => result.status === 'fulfilled')).toHaveLength(1)
+      expect(staged.filter((result) => result.status === 'rejected')).toHaveLength(1)
+      expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM member_tokens WHERE agent_id = ?').get(AGENT.id))
+        .toEqual({ count: 2 })
+      expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM agent_member_bindings WHERE agent_id = ?').get(AGENT.id))
+        .toEqual({ count: 1 })
+      expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM gate_grants').get()).toEqual(gatesBefore)
+      expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM agent_token_rotation_handoffs').get()).toEqual({ count: 1 })
+    } finally {
+      harness.close()
+    }
+  })
+
+  it('replacement_bus_failure_preserves_prior_and_leaves_no_live_replacement', async () => {
+    const harness = createMigratedMintEnv()
+    try {
+      const prior = await mintAgentBoundToken(harness.env, AGENT, 'prior')
+      const gatesBefore = harness.sqlite.prepare('SELECT COUNT(*) AS count FROM gate_grants').get()
+      const prepared = await prepareAgentTokenReplacement(harness.env, AGENT, 'replacement', {
+        revokePriorTokenId: prior.tokenId,
+      })
+      const handoff = await stageAgentTokenReplacement(harness.env, AGENT, prepared, {
+        claimId: 'claim-bus-failure', fingerprint: '0123456789abcdef', expiresAt: '2099-01-01T00:00:00.000Z',
+        mintedByMemberId: prior.memberId,
+      })
+
+      // Simulated queue failure: no audit-sent transition means activation is never attempted.
+      expect(handoff.auditState).toBe('pending')
+      expect(harness.sqlite.prepare('SELECT revoked_at FROM member_tokens WHERE id = ?').get(prior.tokenId))
+        .toEqual({ revoked_at: null })
+      expect(harness.sqlite.prepare('SELECT revoked_at FROM member_tokens WHERE id = ?').get(handoff.replacementTokenId))
+        .toEqual({ revoked_at: handoff.createdAt })
+      expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM member_tokens WHERE revoked_at IS NULL AND agent_id = ?')
+        .get(AGENT.id)).toEqual({ count: 1 })
+      expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM gate_grants').get()).toEqual(gatesBefore)
+    } finally {
+      harness.close()
+    }
+  })
+
+  it('replacement_claim_failure_preserves_prior_and_leaves_no_live_replacement', async () => {
+    const harness = createMigratedMintEnv()
+    try {
+      const prior = await mintAgentBoundToken(harness.env, AGENT, 'prior')
+      // Claim creation is required before staging; simulating its failure means no stage occurs.
+      expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM member_tokens WHERE agent_id = ?').get(AGENT.id))
+        .toEqual({ count: 1 })
+      expect(harness.sqlite.prepare('SELECT revoked_at FROM member_tokens WHERE id = ?').get(prior.tokenId))
+        .toEqual({ revoked_at: null })
+      expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM agent_token_rotation_handoffs').get())
+        .toEqual({ count: 0 })
+    } finally {
+      harness.close()
+    }
+  })
+
+  it('replacement_retry_resumes_without_duplicate_live_token_or_audit', async () => {
+    const harness = createMigratedMintEnv()
+    try {
+      const prior = await mintAgentBoundToken(harness.env, AGENT, 'prior')
+      const prepared = await prepareAgentTokenReplacement(harness.env, AGENT, 'replacement', {
+        revokePriorTokenId: prior.tokenId,
+      })
+      const staged = await stageAgentTokenReplacement(harness.env, AGENT, prepared, {
+        claimId: 'claim-retry', fingerprint: '0123456789abcdef', expiresAt: '2099-01-01T00:00:00.000Z',
+        mintedByMemberId: prior.memberId,
+      })
+      const resumed = await findAgentTokenReplacementHandoff(harness.env, AGENT.id, prior.tokenId)
+      expect(resumed?.id).toBe(staged.id)
+      await markAgentTokenReplacementAuditSent(harness.env, staged.id)
+      await activateAgentTokenReplacement(harness.env, staged.id)
+
+      const completed = await findAgentTokenReplacementHandoff(harness.env, AGENT.id, prior.tokenId)
+      expect(completed?.id).toBe(staged.id)
+      expect(completed?.state).toBe('active')
+      expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM member_tokens WHERE agent_id = ? AND revoked_at IS NULL')
+        .get(AGENT.id)).toEqual({ count: 1 })
+      expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM agent_token_rotation_handoffs').get())
+        .toEqual({ count: 1 })
     } finally {
       harness.close()
     }

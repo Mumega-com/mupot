@@ -41,10 +41,15 @@ import {
   mintAgentBoundToken,
   isAgentTokenCapability,
   AgentTokenReplacementError,
+  activateAgentTokenReplacement,
+  findAgentTokenReplacementHandoff,
+  markAgentTokenReplacementAuditSent,
+  prepareAgentTokenReplacement,
   resolveAgentMemberBinding,
+  stageAgentTokenReplacement,
 } from '../members/service'
 import { resolveAgentTokenExpiry } from '../auth/token-lifecycle'
-import { createCredentialClaim, CLAIM_TTL_SECONDS } from '../auth/credential-claim'
+import { createCredentialClaim, credentialClaimIsAvailable, CLAIM_TTL_SECONDS } from '../auth/credential-claim'
 import { revokeMemberToken } from '../members/service'
 import { setAgentSquadAccess, type AgentAccessCapability } from '../members/agent-access'
 import {
@@ -123,6 +128,7 @@ async function emitProvisioned(
     // the change is unreversible from the trail.
     changed?: Record<string, { from: unknown; to: unknown }>
   } = {},
+  strict = false,
 ): Promise<void> {
   const event: BusEvent<{
     kind: string
@@ -156,7 +162,8 @@ async function emitProvisioned(
   // Emit is best-effort: swallow + log, never throw.
   try {
     await createBus(env).emit(event)
-  } catch {
+  } catch (error) {
+    if (strict) throw error
     console.error('provision: org.provisioned emit failed (non-fatal)', {
       tenant: env.TENANT_SLUG,
       kind,
@@ -494,12 +501,86 @@ const toolMintAgentToken: ToolSpec = {
     if (!expiry.ok) return fail(400, expiry.code)
     const expiresAt = expiry.expiresAt
 
-    const rotatePriorTokenId = str(args.rotate_prior_token_id) ?? null
+    const replacementSupplied = Object.prototype.hasOwnProperty.call(args, 'rotate_prior_token_id')
+    const rotatePriorTokenId = replacementSupplied ? str(args.rotate_prior_token_id) : null
+    if (replacementSupplied && !rotatePriorTokenId) {
+      return fail(400, 'invalid_replacement_token_id')
+    }
 
     const canonical = requiredCanonicalOrigin(env)
     if (!canonical.ok) return fail(503, canonical.error)
 
-    // Delegate to the shared atomic-mint helper (members/service.ts).
+    // Rotations use a durable pending handoff.  D1 cannot transact with KV or the
+    // queue, so the replacement stays revoked and the prior stays live until both
+    // claim and audit handoffs have succeeded; activation is then one D1 trigger.
+    if (rotatePriorTokenId) {
+      let handoff = await findAgentTokenReplacementHandoff(env, agent.id, rotatePriorTokenId)
+      if (handoff && handoff.claim.mintedByMemberId !== auth.memberId) {
+        return fail(409, 'replacement_token_unavailable')
+      }
+      if (!handoff) {
+        let prepared
+        let claim
+        try {
+          prepared = await prepareAgentTokenReplacement(env, agent, label, {
+            grantCapability,
+            expiresAt,
+            revokePriorTokenId: rotatePriorTokenId,
+          })
+          claim = await createCredentialClaim(env, prepared.raw, auth.memberId as string)
+          handoff = await stageAgentTokenReplacement(env, agent, prepared, {
+            claimId: claim.claim_id,
+            fingerprint: claim.fingerprint,
+            expiresAt: claim.expires_at,
+            mintedByMemberId: auth.memberId as string,
+          })
+        } catch (err) {
+          if (err instanceof AgentTokenReplacementError) return fail(409, 'replacement_token_unavailable')
+          return fail(503, 'replacement_handoff_unavailable')
+        }
+      }
+
+      try {
+        if (handoff.auditState === 'pending') {
+          await emitProvisioned(env, auth.memberId as string, 'token', handoff.replacementTokenId, {
+            squad_id: agent.squad_id,
+            agent_id: agent.id,
+            receipt_id: handoff.id,
+            reason: 'replacement_handoff_pending',
+          }, true)
+          handoff = await markAgentTokenReplacementAuditSent(env, handoff.id)
+        }
+        if (!(await credentialClaimIsAvailable(env, handoff.claim.claimId, auth.memberId as string))) {
+          return fail(503, 'replacement_handoff_pending')
+        }
+        if (handoff.state === 'pending') handoff = await activateAgentTokenReplacement(env, handoff.id)
+      } catch (err) {
+        if (err instanceof AgentTokenReplacementError) return fail(409, 'replacement_token_unavailable')
+        return fail(503, 'replacement_handoff_pending')
+      }
+
+      return done({
+        token: {
+          id: handoff.replacementTokenId,
+          member_id: handoff.memberId,
+          agent_id: agent.id,
+          label,
+          channel: 'workspace',
+          capability: grantCapability,
+          created_at: handoff.createdAt,
+        },
+        credential_claim: {
+          claim_id: handoff.claim.claimId,
+          fingerprint: handoff.claim.fingerprint,
+          expires_at: handoff.claim.expiresAt,
+          reveal_tool: 'reveal_credential_claim',
+        },
+        agent: { id: agent.id, slug: agent.slug, name: agent.name },
+        mcp_endpoint: mcpEndpoint(canonical.origin),
+      })
+    }
+
+    // Delegate ordinary mints to the shared atomic helper (members/service.ts).
     let minted
     try {
       minted = await mintAgentBoundToken(env, agent, label, {

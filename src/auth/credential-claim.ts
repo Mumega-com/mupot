@@ -100,6 +100,22 @@ export async function createCredentialClaim(
   }
 }
 
+/** Check that a staged handoff can still be activated without reading or consuming its raw value. */
+export async function credentialClaimIsAvailable(
+  env: Env,
+  claimId: string,
+  mintedBy: string,
+): Promise<boolean> {
+  const stored = await env.SESSIONS.get(CLAIM_KEY_PREFIX + claimId)
+  if (!stored) return false
+  try {
+    const record = JSON.parse(stored) as CredentialClaimRecord
+    return record.mintedBy === mintedBy && record.tenant === env.TENANT_SLUG && typeof record.raw === 'string'
+  } catch {
+    return false
+  }
+}
+
 export type RevealClaimResult =
   | { ok: true; raw: string }
   | { ok: false; reason: 'not_found_or_consumed' | 'wrong_owner' }
