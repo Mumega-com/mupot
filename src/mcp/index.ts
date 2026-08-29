@@ -2970,7 +2970,7 @@ const toolExecutionMeterStatus: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    if (args.agent_id !== undefined && args.agent_id !== null && !str(args.agent_id)) {
+    if (args.agent_id !== undefined && !str(args.agent_id)) {
       return fail(400, 'invalid_args', 'agent_id must be a non-empty string')
     }
     const agentId = str(args.agent_id) ?? undefined

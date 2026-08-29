@@ -111,6 +111,26 @@ describe('authorizeExecutionScope', () => {
     })).resolves.toEqual({ ok: false, status: 403, error: 'forbidden' })
   })
 
+  it('does not reveal whether an unauthorized router squad exists', async () => {
+    const caller = auth('lead-a')
+
+    const foreign = await authorizeExecutionScope(env, caller, {
+      action: 'router:read', squadId: SQUAD_B,
+    })
+    const missing = await authorizeExecutionScope(env, caller, {
+      action: 'router:read', squadId: 'missing-squad',
+    })
+
+    expect(foreign).toEqual({ ok: false, status: 403, error: 'forbidden' })
+    expect(missing).toEqual(foreign)
+  })
+
+  it('returns not found when an org admin names a missing router squad', async () => {
+    await expect(authorizeExecutionScope(env, auth('org-admin'), {
+      action: 'router:read', squadId: 'missing-squad',
+    })).resolves.toEqual({ ok: false, status: 404, error: 'not_found' })
+  })
+
   it('denies a directory session with an empty ambient ceiling despite a durable squad lead grant', async () => {
     const clamped = auth('lead-a', { channel: 'directory', capabilities: [] })
 
@@ -166,6 +186,51 @@ describe('authorizeExecutionScope', () => {
     await expect(authorizeExecutionScope(env, auth('lead-a'), {
       action: 'meter:read', agentId: AGENT_B,
     })).resolves.toEqual({ ok: false, status: 403, error: 'forbidden' })
+  })
+
+  it('does not reveal whether an unauthorized meter agent exists', async () => {
+    const caller = auth('lead-a')
+
+    const foreign = await authorizeExecutionScope(env, caller, {
+      action: 'meter:read', agentId: AGENT_B,
+    })
+    const missing = await authorizeExecutionScope(env, caller, {
+      action: 'meter:read', agentId: 'missing-agent',
+    })
+
+    expect(foreign).toEqual({ ok: false, status: 403, error: 'forbidden' })
+    expect(missing).toEqual(foreign)
+  })
+
+  it('returns not found when an org admin names a missing meter agent', async () => {
+    await expect(authorizeExecutionScope(env, auth('org-admin'), {
+      action: 'meter:read', agentId: 'missing-agent',
+    })).resolves.toEqual({ ok: false, status: 404, error: 'not_found' })
+  })
+
+  it('pre-denies bound-agent foreign ids without revealing their existence', async () => {
+    const caller = auth('agent-a-member', { boundAgentId: AGENT_A })
+    const prepares = { value: 0 }
+    const tracked = {
+      ...env,
+      DB: {
+        prepare(sql: string) {
+          prepares.value += 1
+          return env.DB.prepare(sql)
+        },
+      },
+    } as Env
+
+    const foreign = await authorizeExecutionScope(tracked, caller, {
+      action: 'meter:read', agentId: AGENT_B,
+    })
+    const missing = await authorizeExecutionScope(tracked, caller, {
+      action: 'meter:read', agentId: 'missing-agent',
+    })
+
+    expect(foreign).toEqual({ ok: false, status: 403, error: 'forbidden' })
+    expect(missing).toEqual(foreign)
+    expect(prepares.value).toBe(0)
   })
 
   it('allows an org admin to read any tenant agent meter', async () => {

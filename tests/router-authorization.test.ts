@@ -281,6 +281,64 @@ describe('router_tick authorization and squad fencing', () => {
     })
   })
 
+  it.each([
+    ['candidate moved squads', () => {
+      harness.sqlite.prepare('UPDATE agents SET squad_id = ? WHERE id = ?').run(SQUAD_B, AGENT_A)
+    }],
+    ['candidate became inactive', () => {
+      harness.sqlite.prepare('UPDATE agents SET status = ? WHERE id = ?').run('paused', AGENT_A)
+    }],
+    ['candidate presence became stale', () => {
+      harness.sqlite.prepare('UPDATE presence SET last_seen_at = ? WHERE agent_id = ?')
+        .run('2020-01-01T00:00:00.000Z', AGENT_A)
+    }],
+    ['candidate presence was removed', () => {
+      harness.sqlite.prepare('DELETE FROM presence WHERE agent_id = ?').run(AGENT_A)
+    }],
+  ])('does not claim after selection when %s', async (_name, interleave) => {
+    insertTask(harness.sqlite, 'task-a', SQUAD_A)
+    const { env, events } = makeEnv(harness, { beforeClaim: interleave })
+
+    const result = await routerTick(auth('lead-a', [grant('lead-a', 'lead', SQUAD_A)]), env, {
+      squad_id: SQUAD_A, dry_run: false,
+    })
+
+    expect(result).toMatchObject({ ok: true, result: { assigned: 0 } })
+    expect((result.result as { decisions: unknown[] }).decisions).toEqual([
+      { task_id: 'task-a', outcome: 'lost_claim', agent_id: AGENT_A },
+    ])
+    expect(events).toHaveLength(0)
+    expect(harness.sqlite.prepare('SELECT assignee_agent_id FROM tasks WHERE id = ?').get('task-a'))
+      .toEqual({ assignee_agent_id: null })
+  })
+
+  it.each([
+    ['project access was revoked', () => {
+      harness.sqlite.prepare('DELETE FROM project_squad_access WHERE project_id = ? AND squad_id = ?')
+        .run('project-a', SQUAD_A)
+    }],
+    ['project became inactive', () => {
+      harness.sqlite.prepare('UPDATE projects SET status = ? WHERE id = ?').run('paused', 'project-a')
+    }],
+  ])('does not claim a project task after selection when %s', async (_name, interleave) => {
+    harness.sqlite.exec(`INSERT INTO projects (id, slug, name, status) VALUES ('project-a', 'project-a', 'Project A', 'active')`)
+    harness.sqlite.exec(`INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('project-a', '${SQUAD_A}', 'write')`)
+    insertTask(harness.sqlite, 'task-a', SQUAD_A, 'project-a')
+    const { env, events } = makeEnv(harness, { beforeClaim: interleave })
+
+    const result = await routerTick(auth('lead-a', [grant('lead-a', 'lead', SQUAD_A)]), env, {
+      squad_id: SQUAD_A, dry_run: false,
+    })
+
+    expect(result).toMatchObject({ ok: true, result: { assigned: 0 } })
+    expect((result.result as { decisions: unknown[] }).decisions).toEqual([
+      { task_id: 'task-a', outcome: 'lost_claim', agent_id: AGENT_A },
+    ])
+    expect(events).toHaveLength(0)
+    expect(harness.sqlite.prepare('SELECT assignee_agent_id FROM tasks WHERE id = ?').get('task-a'))
+      .toEqual({ assignee_agent_id: null })
+  })
+
   it('dry-run performs zero writes and wakes', async () => {
     insertTask(harness.sqlite, 'task-a', SQUAD_A)
     const writes = { value: 0 }

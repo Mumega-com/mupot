@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { runTaskExecution } from '../src/agents/execute'
 import { runGoalCycle } from '../src/agents/loop'
 import {
+  buildAuthorizedMeterExecution,
   checkAndReserve,
   MAX_DISPATCHES_PER_DAY,
   MAX_TOKENS_PER_DAY,
@@ -109,10 +110,13 @@ function seed(sqlite: SqliteD1Harness['sqlite']): void {
 function trackedEnv(harness: SqliteD1Harness): {
   env: Env
   meterReads: { value: number }
+  dbPrepares: { value: number }
 } {
   const meterReads = { value: 0 }
+  const dbPrepares = { value: 0 }
   const db = {
     prepare(sql: string) {
+      dbPrepares.value += 1
       if (/\bFROM\s+execution_meter\b/i.test(sql)) meterReads.value += 1
       return harness.db.prepare(sql)
     },
@@ -125,6 +129,7 @@ function trackedEnv(harness: SqliteD1Harness): {
       EXEC_MAX_TOKENS_DAY: '34000',
     } as unknown as Env,
     meterReads,
+    dbPrepares,
   }
 }
 
@@ -260,6 +265,31 @@ describe('public meter status authorization', () => {
     expect(outcome).toMatchObject({ ok: false, status: 403, error: 'forbidden' })
     expect(meterReads.value).toBe(0)
   })
+
+  it.each([
+    ['null', null],
+    ['number', 7],
+    ['boolean', false],
+    ['object', {}],
+    ['array', []],
+  ])('rejects a defined non-string agent_id (%s) before any database access', async (_label, agentId) => {
+    const { env, dbPrepares } = trackedEnv(harness)
+    const before = harness.sqlite.prepare(
+      'SELECT count, tokens, cost_micro_usd FROM execution_meter WHERE window_key = ?',
+    ).get(windowKey(AGENT_A))
+
+    const outcome = await status(
+      env,
+      auth('agent-a-member', { boundAgentId: AGENT_A }),
+      { agent_id: agentId },
+    )
+
+    expect(outcome).toMatchObject({ ok: false, status: 400, error: 'invalid_args' })
+    expect(dbPrepares.value).toBe(0)
+    expect(harness.sqlite.prepare(
+      'SELECT count, tokens, cost_micro_usd FROM execution_meter WHERE window_key = ?',
+    ).get(windowKey(AGENT_A))).toEqual(before)
+  })
 })
 
 describe('public reservation boundary', () => {
@@ -323,6 +353,23 @@ describe('internal authorized reservation', () => {
   })
 
   afterEach(() => harness.close())
+
+  it.each([
+    ['Infinity', Number.POSITIVE_INFINITY],
+    ['NaN', Number.NaN],
+  ])('fails closed for a non-finite %s estimate before reservation', async (_label, estimateMicroUsd) => {
+    const { env, dbPrepares } = trackedEnv(harness)
+
+    expect(() => buildAuthorizedMeterExecution(env, {
+      meterSubjectId: AGENT_A,
+      squadId: SQUAD_A,
+      projectId: null,
+      maxCostMicroUsd: 1_000_000,
+      costWindow: 'day',
+      estimateMicroUsd,
+    })).toThrow('invalid_meter_estimate')
+    expect(dbPrepares.value).toBe(0)
+  })
 
   it('uses the server-authorized agent and preserves the atomic count reservation', async () => {
     const env = { DB: harness.db, TENANT_SLUG: TENANT } as Env
