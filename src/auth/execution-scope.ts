@@ -108,7 +108,10 @@ async function authorizeRouterScope(
   request: Extract<ExecutionScopeRequest, { action: 'router:read' | 'router:mutate' }>,
 ): Promise<ExecutionScopeDecision> {
   const required = request.action === 'router:read' ? 'observer' : 'lead'
-  if (!(await principalCanOnSquad(env, auth, request.squadId, required))) return forbidden()
+  const actorMemberId = auth.memberId
+  if (!actorMemberId || !(await principalCanOnSquad(env, auth, request.squadId, required))) {
+    return forbidden()
+  }
 
   const squad = await env.DB.prepare('SELECT id FROM squads WHERE id = ?1')
     .bind(request.squadId)

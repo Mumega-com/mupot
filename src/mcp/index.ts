@@ -2949,9 +2949,10 @@ const toolRouterTick: ToolSpec = {
       squadId,
     })
     if (!decision.ok) return fail(decision.status, decision.error)
+    if (!auth.memberId) return fail(403, 'forbidden')
 
     const limit = typeof args.limit === 'number' ? args.limit : undefined
-    const result = await runRouterTick(env, decision, { squadId, dryRun, limit })
+    const result = await runRouterTick(env, decision, { squadId, dryRun, limit }, { memberId: auth.memberId })
     return done(result)
   },
 }

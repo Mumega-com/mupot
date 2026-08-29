@@ -37,13 +37,14 @@ routerApp.post('/tick', async (c) => {
     action: 'router:mutate', squadId: body.squad_id,
   })
   if (!decision.ok) return c.json({ error: decision.error }, decision.status)
+  if (!auth.memberId) return c.json({ error: 'forbidden' }, 403)
 
   try {
     const result = await runRouterTick(c.env, decision, {
       squadId: body.squad_id,
       dryRun: body.dry_run === true,
       limit: body.limit,
-    })
+    }, { memberId: auth.memberId })
     return c.json({ ok: true, result })
   } catch {
     return c.json({ error: 'router_unavailable' }, 503)

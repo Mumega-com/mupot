@@ -259,6 +259,27 @@ describe('router_tick authorization and squad fencing', () => {
     expect(harness.sqlite.prepare('SELECT assignee_agent_id FROM tasks WHERE id = ?').get('task-a')).toEqual({ assignee_agent_id: null })
   })
 
+  it('does not claim after authorization when the actor lead grant is revoked before claim', async () => {
+    insertTask(harness.sqlite, 'task-a', SQUAD_A)
+    const { env, events } = makeEnv(harness, {
+      beforeClaim: () => {
+        harness.sqlite.prepare('DELETE FROM capabilities WHERE id = ?').run('lead-a-cap')
+      },
+    })
+
+    const result = await routerTick(auth('lead-a', [grant('lead-a', 'lead', SQUAD_A)]), env, {
+      squad_id: SQUAD_A, dry_run: false,
+    })
+
+    expect(result).toMatchObject({ ok: true, result: { assigned: 0 } })
+    expect((result.result as { decisions: unknown[] }).decisions).toEqual([
+      { task_id: 'task-a', outcome: 'lost_claim', agent_id: AGENT_A },
+    ])
+    expect(events).toHaveLength(0)
+    expect(harness.sqlite.prepare('SELECT assignee_agent_id FROM tasks WHERE id = ?').get('task-a'))
+      .toEqual({ assignee_agent_id: null })
+  })
+
   it('does not claim a task moved to another squad after selection', async () => {
     insertTask(harness.sqlite, 'task-a', SQUAD_A)
     const { env, events } = makeEnv(harness, {

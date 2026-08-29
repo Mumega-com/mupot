@@ -23,6 +23,10 @@ export interface RouterTickResult {
 
 type RouterDecision = Extract<ExecutionScopeDecision, { ok: true }>
 
+interface RouterClaimAuthority {
+  memberId: string
+}
+
 interface RouterTaskRow {
   id: string
   project_id: string | null
@@ -48,6 +52,7 @@ export async function runRouterTick(
   env: Env,
   decision: RouterDecision,
   input: RouterTickInput,
+  authority: RouterClaimAuthority,
 ): Promise<RouterTickResult> {
   if (decision.squadId !== input.squadId || decision.tenant !== env.TENANT_SLUG) {
     throw new Error('router_scope_mismatch')
@@ -124,6 +129,34 @@ export async function runRouterTick(
           AND assignee_agent_id IS NULL
           AND EXISTS (
             SELECT 1
+              FROM squads actor_squad
+             WHERE actor_squad.id = ?4
+               AND (
+                 EXISTS (
+                   SELECT 1
+                     FROM capabilities actor_grant
+                    WHERE actor_grant.member_id = ?6
+                      AND actor_grant.capability IN ('lead', 'admin', 'owner')
+                      AND (
+                        actor_grant.scope_type = 'org'
+                        OR (actor_grant.scope_type = 'squad' AND actor_grant.scope_id = ?4)
+                        OR (
+                          actor_grant.scope_type = 'department'
+                          AND actor_grant.scope_id = actor_squad.department_id
+                        )
+                      )
+                 )
+                 OR EXISTS (
+                   SELECT 1
+                     FROM channel_capability_grants actor_channel_grant
+                    WHERE actor_channel_grant.member_id = ?6
+                      AND actor_channel_grant.squad_id = ?4
+                      AND actor_channel_grant.capability IN ('lead', 'admin', 'owner')
+                 )
+               )
+          )
+          AND EXISTS (
+            SELECT 1
               FROM agents a
               JOIN presence presence_now
                 ON presence_now.agent_id = a.id
@@ -146,7 +179,7 @@ export async function runRouterTick(
                  AND project_now.status = 'active'
             )
           )`,
-    ).bind(candidate.id, now, task.id, squadId, decision.tenant).run()
+    ).bind(candidate.id, now, task.id, squadId, decision.tenant, authority.memberId).run()
 
     if (claim.meta.changes !== 1) {
       decisions.push({ task_id: task.id, outcome: 'lost_claim', agent_id: candidate.id })
