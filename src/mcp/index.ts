@@ -93,6 +93,8 @@ import {
   sendToRef, readAgentInbox, sendAgentMessage,
 } from '../agents/messages'
 import { routeAgentWake } from '../agents/wake-routing'
+import { authorizeExecutionScope } from '../auth/execution-scope'
+import { runRouterTick } from '../router/engine'
 import { verifyTaskArtifactShape } from '../tasks/artifact-verification'
 import {
   leaseAgentInbox, ackAgentMessages, listDeadLetteredMessages, summarizeDeadLetters,
@@ -552,6 +554,8 @@ export interface ToolSpec {
   min: Capability | 'authenticated'
   args: string // documented arg shape
   inputSchema: JsonSchema
+  // Simulations that promise zero writes opt out of the generic MCP presence touch.
+  touchesPresence?: boolean
   // ctx is the 4th param; tools that don't need it simply omit it from their signature
   // (a function of fewer params is assignable here — TS structural typing).
   run: (auth: AuthContext, env: Env, args: Record<string, unknown>, ctx: ToolCtx) => Promise<ToolOutcome>
@@ -568,6 +572,7 @@ const STRING_SCHEMA = { type: 'string' }
 const NULLABLE_STRING_SCHEMA = { type: ['string', 'null'] }
 const OPTIONAL_STRING_ARRAY_SCHEMA = { type: 'array', items: { type: 'string' } }
 const OPTIONAL_NUMBER_SCHEMA = { type: 'number' }
+const OPTIONAL_BOOLEAN_SCHEMA = { type: 'boolean' }
 
 const PATCH_ALLOWED_STATUSES: ReadonlySet<string> = new Set(['open', 'in_progress', 'blocked', 'done', 'review'])
 const BROADCAST_REQUEST_ID_RE = /^[A-Za-z0-9_.:-]{1,128}$/
@@ -2911,6 +2916,39 @@ const toolWakeAgent: ToolSpec = {
   },
 }
 
+// router_tick — one named squad only. Dry-run is observer-visible; mutation is lead-gated.
+const toolRouterTick: ToolSpec = {
+  name: 'router_tick',
+  scope: 'named squad',
+  min: 'authenticated',
+  touchesPresence: false,
+  args: '{ squad_id: string, dry_run?: boolean, limit?: number }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      squad_id: STRING_SCHEMA,
+      dry_run: OPTIONAL_BOOLEAN_SCHEMA,
+      limit: OPTIONAL_NUMBER_SCHEMA,
+    },
+    required: ['squad_id'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const squadId = str(args.squad_id)
+    if (!squadId) return fail(400, 'invalid_args', 'squad_id required')
+    const dryRun = args.dry_run === true
+    const decision = await authorizeExecutionScope(env, auth, {
+      action: dryRun ? 'router:read' : 'router:mutate',
+      squadId,
+    })
+    if (!decision.ok) return fail(decision.status, decision.error)
+
+    const limit = typeof args.limit === 'number' ? args.limit : undefined
+    const result = await runRouterTick(env, decision, { squadId, dryRun, limit })
+    return done(result)
+  },
+}
+
 // squad_message — message/dispatch a squad. cap: member+ on the squad. The message
 // becomes the dispatch context; the consumer routes it to the squad coordinator.
 const toolSquadMessage: ToolSpec = {
@@ -4228,6 +4266,7 @@ export const TOOLS: ToolSpec[] = [
   toolProjectRemember,
   toolProjectRecall,
   toolWakeAgent,
+  toolRouterTick,
   toolSquadMessage,
   toolSend,
   toolBroadcast,
@@ -4415,7 +4454,7 @@ export async function invokeTool(
     return { ...fail(500, 'internal_error'), tool: spec.name }
   }
 
-  if (outcome.ok && auth.memberId && spec.name !== 'check_in' && spec.name !== 'boot_context') {
+  if (outcome.ok && spec.touchesPresence !== false && auth.memberId && spec.name !== 'check_in' && spec.name !== 'boot_context') {
     // Zero-Touch Living Presence: automatically bump presence for active tool callers.
     const touchPromise = (async () => {
       const id = await loadMemberIdentity(env, auth)
