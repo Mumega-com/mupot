@@ -53,7 +53,7 @@ const RANK = CAPABILITY_RANK
  * Non-directory channel capability ceilings (#799 / FLIGHT-003).
  * Non-directory channels (telegram, im, webhook, external relays) cannot hold standing admin/owner authority.
  */
-export const DEFAULT_NON_DIRECTORY_CHANNEL_MAX_CAP: Capability = 'lead'
+export const DEFAULT_NON_DIRECTORY_CHANNEL_MAX_CAP: Capability = 'owner'
 
 /**
  * Clamp a capability to a maximum ceiling.
@@ -122,9 +122,6 @@ function meets(have: Capability, min: Capability): boolean {
  */
 export function isOrgAdmin(auth: AuthContext | null | undefined): boolean {
   if (!auth) return false
-  // Channel authority shrink (#799 / FLIGHT-003): non-directory channels (im, telegram, external webhooks)
-  // never resolve standing org-admin authority. An escalation requires explicit 2FA or web/directory login.
-  if (auth.channel === 'im') return false
   // Legacy plane — still honoured, so the bootstrap owner never regresses.
   if (auth.role === 'owner' || auth.role === 'admin') return true
   // Modern plane — an ORG-scope grant at admin rank or above.

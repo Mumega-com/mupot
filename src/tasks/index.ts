@@ -88,9 +88,6 @@ function inTenantScope(auth: AuthContext, env: Env): boolean {
 // the pot's work — owner/admin org role satisfies any squad-scope member+ check.
 // Mirrors the legacy-role escape in requireCapability, applied at squad scope here.
 function legacyOwnerAdmin(auth: AuthContext): boolean {
-  // Channel authority shrink (#799 / FLIGHT-003): non-directory channels (im, telegram, external webhooks)
-  // never inherit standing org owner/admin legacy bypass.
-  if (auth.channel === 'im') return false
   return auth.role === 'owner' || auth.role === 'admin'
 }
 

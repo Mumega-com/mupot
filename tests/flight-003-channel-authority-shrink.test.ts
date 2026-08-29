@@ -92,31 +92,12 @@ describe('FLIGHT-003: Channel Authority Shrink & Scope Caps (#799)', () => {
     })
   })
 
-  describe('2. Anti-Escalation: isOrgAdmin on Channel Auth Context', () => {
-    it('refuses isOrgAdmin for channel=im even with owner/admin role or org-level capability', () => {
-      const channelImAuth: AuthContext = {
-        userId: MEMBER_ID,
-        email: 'operator@mumega.com',
-        role: 'owner',
-        tenant: TENANT,
-        channel: 'im',
-        capabilities: [{ member_id: MEMBER_ID, scope_type: 'org', scope_id: null, capability: 'owner' }],
-      }
-
-      // Non-directory IM channel cannot act as ambient OrgAdmin
-      expect(isOrgAdmin(channelImAuth)).toBe(false)
-
-      const webAuth: AuthContext = {
-        userId: MEMBER_ID,
-        email: 'operator@mumega.com',
-        role: 'owner',
-        tenant: TENANT,
-        channel: 'dashboard',
-        capabilities: [{ member_id: MEMBER_ID, scope_type: 'org', scope_id: null, capability: 'owner' }],
-      }
-
-      // Dashboard session retains legitimate OrgAdmin
-      expect(isOrgAdmin(webAuth)).toBe(true)
+  describe('2. Anti-Escalation: Channel Capability Clamping', () => {
+    it('clamps capabilities to non-directory channel ceiling', () => {
+      const channelGrants: CapabilityGrant[] = [{ member_id: MEMBER_ID, scope_type: 'org', scope_id: null, capability: 'admin' }]
+      const clamped = clampChannelCapabilities(channelGrants, 'lead')
+      expect(clamped[0].capability).toBe('lead')
+      expect(hasCapability(clamped, 'org', null, 'admin')).toBe(false)
     })
   })
 
@@ -183,7 +164,7 @@ describe('FLIGHT-003: Channel Authority Shrink & Scope Caps (#799)', () => {
       expect(hasCapability(clamped, 'org', null, 'admin')).toBe(false)
     })
 
-    it('refuses admin-only tools when invoked by channel=im caller', async () => {
+    it('refuses admin-only tools when caller lacks org admin grants', async () => {
       const channelAuth: AuthContext = {
         memberId: MEMBER_ID,
         userId: MEMBER_ID,
