@@ -4,6 +4,7 @@ import type { Env } from '../types'
 import { nextRoutineOccurrence, routineOccurrenceKey } from './schedule'
 import type { Routine, RoutineSchedule } from './types'
 import { createBus } from '../bus'
+import { assertBatchWritten } from '../lib/receipt'
 
 export interface RoutineDispatchSummary {
   checked: number
@@ -33,7 +34,7 @@ export async function evaluateAndDispatchDueRoutines(
   let rows: Routine[] = []
   try {
     const result = await env.DB.prepare(`
-      SELECT * FROM project_routines
+      SELECT * FROM routines
        WHERE tenant = ?1
          AND status = 'enabled'
          AND next_run_at IS NOT NULL
@@ -72,7 +73,7 @@ export async function evaluateAndDispatchDueRoutines(
 
       // 2. Check if a run for this occurrence already exists (idempotency guard)
       const existing = await env.DB.prepare(`
-        SELECT id FROM project_routine_runs
+        SELECT id FROM routine_runs
          WHERE routine_id = ?1 AND occurrence_key = ?2
          LIMIT 1
       `)
@@ -84,18 +85,30 @@ export async function evaluateAndDispatchDueRoutines(
         continue
       }
 
-      // 3. Create corresponding autonomous task
+      // 3. Build the atomic task/run/advance write set.
       const taskId = crypto.randomUUID()
       const taskTitle = `[Routine] ${routine.name}`
       const taskBody = `Autonomous routine execution:\nObjective: ${routine.objective}\nMode: ${routine.execution_mode}`
+      const nextDate = nextRoutineOccurrence(scheduleObj, scheduledDate)
+      const newNextRunAt = nextDate ? nextDate.toISOString() : null
+      const newStatus = newNextRunAt ? 'enabled' : 'paused'
+      const policyJson = JSON.stringify({
+        execution_mode: routine.execution_mode,
+        overlap_policy: routine.overlap_policy,
+        responsible_squad_id: routine.responsible_squad_id,
+        preferred_agent_id: routine.preferred_agent_id,
+        budget_micro_usd: routine.budget_micro_usd,
+        max_attempts: routine.max_attempts,
+        retry_backoff_seconds: routine.retry_backoff_seconds,
+      })
 
-      await env.DB.prepare(`
-        INSERT INTO tasks (
-          id, squad_id, project_id, title, body, done_when, status,
-          assignee_agent_id, created_at, updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7, ?8, ?8)
-      `)
-        .bind(
+      const writes = await env.DB.batch([
+        env.DB.prepare(`
+          INSERT INTO tasks (
+            id, squad_id, project_id, title, body, done_when, status,
+            assignee_agent_id, created_at, updated_at
+          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7, ?8, ?8)
+        `).bind(
           taskId,
           routine.responsible_squad_id,
           routine.project_id,
@@ -104,61 +117,47 @@ export async function evaluateAndDispatchDueRoutines(
           routine.objective,
           routine.preferred_agent_id || null,
           nowIso,
-        )
-        .run()
-
-      // 4. Record routine run
-      await env.DB.prepare(`
-        INSERT INTO project_routine_runs (
-          id, tenant, project_id, routine_id, status, run_type,
-          trigger_kind, occurrence_key, scheduled_for, created_at, updated_at,
-          task_id, assigned_squad_id, executed_by_agent_id, attempt_count
-        ) VALUES (
-          ?1, ?2, ?3, ?4, 'queued', 'scheduled',
-          ?5, ?6, ?7, ?8, ?8,
-          ?9, ?10, ?11, 1
-        )
-      `)
-        .bind(
+        ),
+        env.DB.prepare(`
+          INSERT INTO routine_runs (
+            id, tenant, project_id, routine_id, routine_revision, policy_json,
+            occurrence_key, trigger_kind, scheduled_for, status,
+            assigned_agent_id, task_id, created_at, updated_at
+          ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6,
+            ?7, ?8, ?9, 'queued', ?10, ?11, ?12, ?12
+          )
+        `).bind(
           runId,
           env.TENANT_SLUG,
           routine.project_id,
           routine.id,
-          routine.trigger_kind,
+          routine.revision,
+          policyJson,
           occurrenceKey,
+          routine.trigger_kind,
           routine.next_run_at,
-          nowIso,
-          taskId,
-          routine.responsible_squad_id,
           routine.preferred_agent_id || null,
-        )
-        .run()
-
-      // 5. Calculate and advance next occurrence
-      const nextDate = nextRoutineOccurrence(scheduleObj, scheduledDate)
-      const newNextRunAt = nextDate ? nextDate.toISOString() : null
-      const newStatus = newNextRunAt ? 'enabled' : 'completed'
-
-      await env.DB.prepare(`
-        UPDATE project_routines
-           SET occurrence_count = occurrence_count + 1,
-               last_run_at = ?1,
-               next_run_at = ?2,
-               status = ?3,
-               updated_at = ?4
-         WHERE id = ?5 AND tenant = ?6
-      `)
-        .bind(
+          taskId,
           nowIso,
+        ),
+        env.DB.prepare(`
+          UPDATE routines
+             SET next_run_at = ?1,
+                 status = ?2,
+                 updated_at = ?3
+           WHERE id = ?4 AND tenant = ?5
+        `).bind(
           newNextRunAt,
           newStatus,
           nowIso,
           routine.id,
           env.TENANT_SLUG,
-        )
-        .run()
+        ),
+      ])
+      assertBatchWritten(writes, 'routine.schedule.dispatch')
 
-      // 6. Emit event to Bus
+      // 4. Emit the observation only after the durable batch lands.
       await bus.emit({
         type: 'routine.run.started',
         actor: { kind: 'routine', id: routine.id },
