@@ -554,8 +554,9 @@ export interface ToolSpec {
   min: Capability | 'authenticated'
   args: string // documented arg shape
   inputSchema: JsonSchema
-  // Simulations that promise zero writes opt out of the generic MCP presence touch.
-  touchesPresence?: boolean
+  // Framework-owned policy for post-success presence. It receives only schema-
+  // validated arguments, and defaults to the historic always-touch behavior.
+  shouldTouchPresence?: (args: Readonly<Record<string, unknown>>) => boolean
   // ctx is the 4th param; tools that don't need it simply omit it from their signature
   // (a function of fewer params is assignable here — TS structural typing).
   run: (auth: AuthContext, env: Env, args: Record<string, unknown>, ctx: ToolCtx) => Promise<ToolOutcome>
@@ -2921,7 +2922,7 @@ const toolRouterTick: ToolSpec = {
   name: 'router_tick',
   scope: 'named squad',
   min: 'authenticated',
-  touchesPresence: false,
+  shouldTouchPresence: (args) => args.dry_run !== true,
   args: '{ squad_id: string, dry_run?: boolean, limit?: number }',
   inputSchema: {
     type: 'object',
@@ -4376,6 +4377,7 @@ function validateArgs(schema: JsonSchema, args: Record<string, unknown>): string
     if (prop.type === 'number' && !(typeof value === 'number' && Number.isFinite(value))) {
       return `field ${key} must be a number`
     }
+    if (prop.type === 'boolean' && typeof value !== 'boolean') return `field ${key} must be a boolean`
     if (prop.type === 'array') {
       if (!Array.isArray(value)) return `field ${key} must be an array`
       if (prop.items?.type === 'string' && !value.every((v) => typeof v === 'string')) {
@@ -4454,7 +4456,7 @@ export async function invokeTool(
     return { ...fail(500, 'internal_error'), tool: spec.name }
   }
 
-  if (outcome.ok && spec.touchesPresence !== false && auth.memberId && spec.name !== 'check_in' && spec.name !== 'boot_context') {
+  if (outcome.ok && (spec.shouldTouchPresence?.(args) ?? true) && auth.memberId && spec.name !== 'check_in' && spec.name !== 'boot_context') {
     // Zero-Touch Living Presence: automatically bump presence for active tool callers.
     const touchPromise = (async () => {
       const id = await loadMemberIdentity(env, auth)
