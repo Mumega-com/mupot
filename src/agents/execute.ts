@@ -33,7 +33,12 @@ import { resolveTaskAssignee } from '../tasks/assignee'
 import { createModel } from '../model'
 import { createBus } from '../bus'
 import { createMemory } from '../memory'
-import { checkAndReserve, recordTokens, type RecordTokensUsage } from './meter'
+import {
+  buildAuthorizedExecution,
+  checkAndReserve,
+  recordTokens,
+  type RecordTokensUsage,
+} from './meter'
 import { costMicroUsd, costUsageMicroUsd } from './cost'
 import { detectContentIntent } from './content-intent'
 import type { ContentIntent } from './content-intent'
@@ -190,11 +195,10 @@ export async function runTaskExecution(
   // in the meter on every path that actually calls the model.
   const cycleCostMicroUsd = costMicroUsd(agent.model, EXECUTE_MAX_TOKENS)
 
-  const meterResult = await meter.checkAndReserve(env, agent.id, {
-    estimateMicroUsd: cycleCostMicroUsd,
-    budgetCapCents: agent.budget_cap_cents,
-    budgetWindow: agent.budget_window,
-  })
+  const meterResult = await meter.checkAndReserve(
+    env,
+    buildAuthorizedExecution(env, agent, task.project_id, cycleCostMicroUsd),
+  )
   if (!meterResult.ok) {
     const note = capResult(
       `rate_limited: ${meterResult.reason} — daily cap reached (window ${meterResult.windowKey}). ` +

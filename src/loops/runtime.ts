@@ -17,7 +17,12 @@ import type { Env, ModelPort } from '../types'
 import type { LoopManifest, ResourceRef } from './manifest'
 import { resolveResource } from './resources'
 import type { ResolvedResource, ResourceItem } from './resources'
-import { checkAndReserve, recordTokens } from '../agents/meter'
+import {
+  buildAuthorizedMeterExecution,
+  checkAndReserve,
+  isEnforceableCap,
+  recordTokens,
+} from '../agents/meter'
 import { costMicroUsd } from '../agents/cost'
 import { LOOP_PLANNING_MAX_TOKENS } from '../agents/loop'
 import { appendLoopDecision } from './decisions'
@@ -83,6 +88,39 @@ export interface RuntimeDeps {
   cycleNum?: number
 }
 
+interface ResolvedMeterSubject {
+  meterSubjectId: string
+  squadId: string
+}
+
+/** Resolve a persisted loop owner to a canonical, active tenant-local meter scope. */
+async function resolveMeterSubject(
+  env: Env,
+  loop: LoopManifest,
+): Promise<ResolvedMeterSubject | null> {
+  if (loop.tenant !== env.TENANT_SLUG) return null
+
+  if (loop.agent_id) {
+    const agent = await env.DB.prepare(
+      `SELECT id, squad_id
+         FROM agents
+        WHERE id = ?1
+          AND status = 'active'
+        LIMIT 1`,
+    ).bind(loop.agent_id).first<{ id: string; squad_id: string }>()
+    return agent ? { meterSubjectId: agent.id, squadId: agent.squad_id } : null
+  }
+
+  if (loop.squad_id) {
+    const squad = await env.DB.prepare('SELECT id FROM squads WHERE id = ?1 LIMIT 1')
+      .bind(loop.squad_id)
+      .first<{ id: string }>()
+    return squad ? { meterSubjectId: squad.id, squadId: squad.id } : null
+  }
+
+  return null
+}
+
 // effort → how many acts the loop may produce per cycle (mirrors agents/loop.ts).
 const EFFORT_ACT_BUDGET: Record<string, number> = { low: 0, standard: 1, high: 2, sprint: 3 }
 
@@ -146,10 +184,15 @@ export async function runLoopCycle(
     return finish({ ok: true, decided: 'kpi-met', perceived: 0, acted: 0, gated: 0, kpi: kpiBefore })
   }
 
-  // The meter is per-subject; a loop is owned by exactly one work-unit.
-  const subjectId = loop.agent_id ?? loop.squad_id
-  if (!subjectId) {
+  // The meter is per-subject; a loop is owned by exactly one work-unit. Resolve
+  // the persisted owner before reservation so a stale/missing owner cannot forge
+  // a meter key or scope.
+  if (!loop.agent_id && !loop.squad_id) {
     return finish({ ok: false, decided: 'inactive', perceived: 0, acted: 0, gated: 0, kpi: kpiBefore, error: 'loop_has_no_owner' })
+  }
+  const meterSubject = await resolveMeterSubject(env, loop)
+  if (!meterSubject) {
+    return finish({ ok: false, decided: 'inactive', perceived: 0, acted: 0, gated: 0, kpi: kpiBefore, error: 'loop_owner_unavailable' })
   }
 
   const effort = loop.budget.effort ?? 'standard'
@@ -159,11 +202,18 @@ export async function runLoopCycle(
   // it VERBATIM (budgetCapMicroUsd) so an intentful sub-cent cap can never round to
   // unlimited (the meter takes a precise micro cap; no lossy cents conversion here).
   const estimateMicroUsd = costMicroUsd(loopModel(loop), LOOP_PLANNING_MAX_TOKENS)
-  const meterResult = await meterCheck(env, subjectId, {
-    estimateMicroUsd,
-    budgetCapMicroUsd: loop.budget.cap_micro_usd ?? null,
-    budgetWindow: loop.budget.window ?? 'day',
-  })
+  const meterResult = await meterCheck(
+    env,
+    buildAuthorizedMeterExecution(env, {
+      ...meterSubject,
+      projectId: null,
+      maxCostMicroUsd: isEnforceableCap(loop.budget.cap_micro_usd)
+        ? loop.budget.cap_micro_usd
+        : 0,
+      costWindow: loop.budget.window ?? 'day',
+      estimateMicroUsd,
+    }),
+  )
   if (!meterResult.ok) {
     const decided: LoopDecided =
       meterResult.reason === 'budget_cap_exceeded' ? 'budget_exhausted' : 'rate_limited'
@@ -223,7 +273,7 @@ export async function runLoopCycle(
   // 7. record the planning spend (so the $cap sees the loop's own burn) + re-observe.
   const record = deps.recordTokens ?? recordTokens
   try {
-    await record(env, subjectId, LOOP_PLANNING_MAX_TOKENS, estimateMicroUsd)
+    await record(env, meterSubject.meterSubjectId, LOOP_PLANNING_MAX_TOKENS, estimateMicroUsd)
   } catch {
     // best-effort accounting
   }

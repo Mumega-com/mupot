@@ -163,7 +163,7 @@ import { MUPOT_PUBLIC_API_VERSION } from '../version'
 import { MUPOT_MCP_INITIALIZE_INSTRUCTIONS } from './instructions'
 // The SAME predicate the meter enforces with. Imported rather than restated —
 // these were two copies and they drifted (#1179 gate R6).
-import { isEnforceableCap } from '../agents/meter'
+import { getAuthorizedMeterStatus, isEnforceableCap } from '../agents/meter'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
@@ -2956,6 +2956,28 @@ const toolRouterTick: ToolSpec = {
   },
 }
 
+// execution_meter_status — read-only and scope-resolved before spend rows load.
+// Omit agent_id for canonical bound-agent self; named targets require same-squad
+// lead-or-higher or org-admin authority through authorizeExecutionScope.
+const toolExecutionMeterStatus: ToolSpec = {
+  name: 'execution_meter_status',
+  scope: 'bound agent self or authorized squad agent',
+  min: 'authenticated',
+  args: '{ agent_id?: string }',
+  inputSchema: {
+    type: 'object',
+    properties: { agent_id: STRING_SCHEMA },
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    if (args.agent_id !== undefined && args.agent_id !== null && !str(args.agent_id)) {
+      return fail(400, 'invalid_args', 'agent_id must be a non-empty string')
+    }
+    const agentId = str(args.agent_id) ?? undefined
+    return getAuthorizedMeterStatus(env, auth, agentId)
+  },
+}
+
 // squad_message — message/dispatch a squad. cap: member+ on the squad. The message
 // becomes the dispatch context; the consumer routes it to the squad coordinator.
 const toolSquadMessage: ToolSpec = {
@@ -4274,6 +4296,7 @@ export const TOOLS: ToolSpec[] = [
   toolProjectRecall,
   toolWakeAgent,
   toolRouterTick,
+  toolExecutionMeterStatus,
   toolSquadMessage,
   toolSend,
   toolBroadcast,
