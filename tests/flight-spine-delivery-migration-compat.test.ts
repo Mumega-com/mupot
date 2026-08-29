@@ -1,17 +1,13 @@
-import { spawnSync } from 'node:child_process'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { afterEach, describe, expect, it } from 'vitest'
 import { unstable_splitSqlQuery } from 'wrangler'
+import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
 const root = dirname(fileURLToPath(new URL('../package.json', import.meta.url)))
-const wrangler = join(root, 'node_modules', '.bin', 'wrangler')
-const config = join(root, 'wrangler-local-test.toml')
-const database = 'mupot-local-test'
-const temporaryDirectories: string[] = []
+const harnesses: SqliteD1Harness[] = []
 
 const prerequisiteSchema = `
 CREATE TABLE agent_messages (
@@ -63,40 +59,19 @@ CREATE TABLE fenced_delivery_evidence (
 );
 `
 
-function runD1(persistTo: string, command: string) {
-  return spawnSync(
-    wrangler,
-    [
-      'd1',
-      'execute',
-      database,
-      '--local',
-      '--config',
-      config,
-      '--persist-to',
-      persistTo,
-      '--command',
-      command,
-    ],
-    {
-      cwd: root,
-      encoding: 'utf8',
-      env: { ...process.env, CI: 'true' },
-      timeout: 30_000,
-    },
-  )
+function createLocalD1(): SqliteD1Harness {
+  const harness = createSqliteD1()
+  harnesses.push(harness)
+  harness.sqlite.exec(prerequisiteSchema)
+  return harness
 }
 
-function createLocalD1(): string {
-  const persistTo = mkdtempSync(join(tmpdir(), 'mupot-delivery-migration-'))
-  temporaryDirectories.push(persistTo)
-  const setup = runD1(persistTo, prerequisiteSchema)
-  expect(setup.status, `${setup.stdout}\n${setup.stderr}`).toBe(0)
-  return persistTo
+function migrationSql(migrationName: string): string {
+  return readFileSync(join(root, 'migrations', migrationName), 'utf8')
 }
 
 function sourceAckTrigger(migrationName: string): string {
-  const migration = readFileSync(join(root, 'migrations', migrationName), 'utf8')
+  const migration = migrationSql(migrationName)
   const trigger = unstable_splitSqlQuery(migration).find((statement) =>
     statement.includes('CREATE TRIGGER fenced_deliveries_source_ack_requires_chain'),
   )
@@ -104,46 +79,47 @@ function sourceAckTrigger(migrationName: string): string {
   return trigger as string
 }
 
+function installedSourceAckTrigger(harness: SqliteD1Harness): string | null {
+  const row = harness.sqlite.prepare(
+    `SELECT sql FROM sqlite_master
+      WHERE type = 'trigger'
+        AND name = 'fenced_deliveries_source_ack_requires_chain'`,
+  ).get() as { sql: string } | undefined
+  return row?.sql ?? null
+}
+
 afterEach(() => {
-  for (const directory of temporaryDirectories.splice(0)) {
-    rmSync(directory, { recursive: true, force: true })
-  }
+  for (const harness of harnesses.splice(0)) harness.close()
 })
 
 describe('fenced-delivery migration compatibility with local D1', () => {
   it('installs the source-ACK trigger from migration 0128', () => {
-    const persistTo = createLocalD1()
-    const installed = runD1(
-      persistTo,
-      sourceAckTrigger('0128_fenced_deliveries.sql'),
-    )
+    const harness = createLocalD1()
 
-    expect(installed.status, `${installed.stdout}\n${installed.stderr}`).toBe(0)
+    expect(() => harness.sqlite.exec(sourceAckTrigger('0128_fenced_deliveries.sql'))).not.toThrow()
+    expect(installedSourceAckTrigger(harness)).toContain(
+      'fenced delivery source ack requires complete evidence',
+    )
   })
 
   it('rebuilds a previously installed source-ACK trigger through migration 0133', () => {
-    const persistTo = createLocalD1()
-    const oldTrigger = runD1(
-      persistTo,
+    const harness = createLocalD1()
+    harness.sqlite.exec(
       `CREATE TRIGGER fenced_deliveries_source_ack_requires_chain
        BEFORE UPDATE OF state ON fenced_deliveries
        BEGIN
          SELECT RAISE(ABORT, 'old trigger');
        END;`,
     )
-    expect(oldTrigger.status, `${oldTrigger.stdout}\n${oldTrigger.stderr}`).toBe(0)
+    expect(installedSourceAckTrigger(harness)).toContain('old trigger')
 
-    const dropped = runD1(
-      persistTo,
-      'DROP TRIGGER IF EXISTS fenced_deliveries_source_ack_requires_chain',
+    expect(() => harness.sqlite.exec(
+      migrationSql('0133_source_ack_trigger_d1_compat.sql'),
+    )).not.toThrow()
+
+    expect(installedSourceAckTrigger(harness)).toContain(
+      'fenced delivery source ack requires complete evidence',
     )
-    expect(dropped.status, `${dropped.stdout}\n${dropped.stderr}`).toBe(0)
-
-    const repaired = runD1(
-      persistTo,
-      sourceAckTrigger('0133_source_ack_trigger_d1_compat.sql'),
-    )
-
-    expect(repaired.status, `${repaired.stdout}\n${repaired.stderr}`).toBe(0)
+    expect(installedSourceAckTrigger(harness)).not.toContain('old trigger')
   })
 })
