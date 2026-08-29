@@ -1,6 +1,6 @@
 // tests/pot-checkout-provisioning.test.ts — Unit tests for Self-Serve Pot Checkout & Provisioning (Flight 12).
 
-import { describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   checkSlugAvailability,
   createPotCheckoutSession,
@@ -8,31 +8,33 @@ import {
 } from '../src/pots/checkout'
 import { pricingPageHtml } from '../src/dashboard/pricing'
 import { publicPotsApp } from '../src/pots/routes'
+import type { Env } from '../src/types'
+import { applyAllMigrations } from './helpers/migrations'
+import { createSqliteD1 } from './helpers/sqlite-d1'
 
 describe('Public Pricing & Self-Serve Sovereign Pot Provisioning Portal (Flight 12)', () => {
+  let harness: ReturnType<typeof createSqliteD1>
+
+  beforeEach(() => {
+    vi.restoreAllMocks()
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+  })
   it('validates subdomain slug availability and reserved word protection', async () => {
-    const mockEnv = {
-      DB: {
-        prepare: vi.fn().mockReturnValue({
-          bind: vi.fn().mockReturnValue({
-            first: vi.fn().mockResolvedValue(null),
-          }),
-        }),
-      },
-    }
+    const env = { DB: harness.db } as unknown as Env
 
     // Valid slug
-    const resValid = await checkSlugAvailability(mockEnv as any, 'acme-corp')
+    const resValid = await checkSlugAvailability(env, 'acme-corp')
     expect(resValid.available).toBe(true)
     expect(resValid.slug).toBe('acme-corp')
 
     // Reserved slug
-    const resReserved = await checkSlugAvailability(mockEnv as any, 'admin')
+    const resReserved = await checkSlugAvailability(env, 'admin')
     expect(resReserved.available).toBe(false)
     expect(resReserved.reason).toContain('reserved')
 
     // Invalid format
-    const resInvalid = await checkSlugAvailability(mockEnv as any, '-bad_slug!')
+    const resInvalid = await checkSlugAvailability(env, '-bad_slug!')
     expect(resInvalid.available).toBe(false)
   })
 
@@ -46,19 +48,13 @@ describe('Public Pricing & Self-Serve Sovereign Pot Provisioning Portal (Flight 
       }),
     })
 
-    const mockEnv = {
+    const env = {
       STRIPE_SECRET_KEY: 'sk_test_placeholder_key',
-      DB: {
-        prepare: vi.fn().mockReturnValue({
-          bind: vi.fn().mockReturnValue({
-            first: vi.fn().mockResolvedValue(null),
-          }),
-        }),
-      },
-    }
+      DB: harness.db,
+    } as unknown as Env
 
     const result = await createPotCheckoutSession(
-      mockEnv as any,
+      env,
       {
         slug: 'novacorp',
         brand: 'Nova Corporation',
@@ -92,18 +88,12 @@ describe('Public Pricing & Self-Serve Sovereign Pot Provisioning Portal (Flight 
     // Mock global fetch for provisionPot sub-calls
     vi.stubGlobal('fetch', mockFetch)
 
-    const mockEnv = {
+    const env = {
       TENANT_SLUG: 'mumega',
       SECRET_ENV_CF_API_TOKEN: 'cf_token_placeholder',
       BUS: { send: mockBusSend },
-      DB: {
-        prepare: vi.fn().mockReturnValue({
-          bind: vi.fn().mockReturnValue({
-            run: vi.fn().mockResolvedValue({ meta: { changes: 1 } }),
-          }),
-        }),
-      },
-    }
+      DB: harness.db,
+    } as unknown as Env
 
     const sessionPayload = {
       customer: 'cus_123',
@@ -117,7 +107,7 @@ describe('Public Pricing & Self-Serve Sovereign Pot Provisioning Portal (Flight 
       },
     }
 
-    const outcome = await handlePotCreationCompleted(mockEnv as any, sessionPayload)
+    const outcome = await handlePotCreationCompleted(env, sessionPayload)
     expect(outcome.ok).toBe(true)
     expect(outcome.slug).toBe('acmecorp')
     expect(mockBusSend).toHaveBeenCalledTimes(1)
@@ -137,19 +127,13 @@ describe('Public Pricing & Self-Serve Sovereign Pot Provisioning Portal (Flight 
   })
 
   it('serves public REST API endpoints: GET /slug-available and POST /checkout', async () => {
-    const mockEnv = {
+    const env = {
       STRIPE_SECRET_KEY: 'sk_test_placeholder_key',
-      DB: {
-        prepare: vi.fn().mockReturnValue({
-          bind: vi.fn().mockReturnValue({
-            first: vi.fn().mockResolvedValue(null),
-          }),
-        }),
-      },
-    }
+      DB: harness.db,
+    } as unknown as Env
 
     const req = new Request('http://localhost/slug-available?slug=my-fleet-pot')
-    const res = await publicPotsApp.fetch(req, mockEnv as any)
+    const res = await publicPotsApp.fetch(req, env)
     expect(res.status).toBe(200)
     const json = await res.json<{ ok: boolean; result: { available: boolean } }>()
     expect(json.ok).toBe(true)
