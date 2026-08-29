@@ -46,6 +46,9 @@ interface Opts {
   /** Whether a requested replacement token passes the service's live-ownership preflight. */
   liveReplacementToken?: boolean
   memberBinding?: string | null
+  batches?: unknown[][]
+  busReject?: { value: boolean }
+  claimReject?: boolean
 }
 
 function makeEnv(opts: Opts = {}): Env {
@@ -53,10 +56,13 @@ function makeEnv(opts: Opts = {}): Env {
     { member_id: OPERATOR, scope_type: 'org', scope_id: null, capability: 'admin' },
   ]
   const revokeChanges = opts.revokeChanges ?? 1
+  let replacementHandoff: Record<string, unknown> | null = null
 
   const handler = (sql: string) => ({
     bind(...args: unknown[]) {
       return {
+        sql,
+        args,
         async first() {
           // ORDER MATTERS. revoke's ownership lookup is matched FIRST by its distinctive
           // projection; every other member_tokens read is the authn lookup. Getting this
@@ -65,7 +71,7 @@ function makeEnv(opts: Opts = {}): Env {
           if (sql.includes('FROM member_tokens') && sql.includes('agent_id, label, revoked_at')) {
             return opts.tokenRow === undefined ? TOKEN_MINE : opts.tokenRow
           }
-          if (sql.includes('SELECT id FROM member_tokens')) {
+          if (sql.includes('SELECT id FROM member_tokens') || sql.includes('SELECT t.id FROM member_tokens')) {
             return opts.liveReplacementToken ? { id: args[0] } : null
           }
           if (sql.includes('FROM member_tokens')) {
@@ -83,6 +89,7 @@ function makeEnv(opts: Opts = {}): Env {
           if (sql.includes('FROM agent_member_bindings')) {
             return opts.memberBinding ? { member_id: opts.memberBinding } : null
           }
+          if (sql.includes('FROM agent_token_rotation_handoffs')) return replacementHandoff
           if (sql.includes('FROM capabilities')) return { capability: 'member' }
           if (sql.includes('FROM agent_keys')) return null
           if (sql.includes('FROM squads')) {
@@ -105,6 +112,10 @@ function makeEnv(opts: Opts = {}): Env {
           return { results: [] }
         },
         async run() {
+          if (sql.includes("UPDATE agent_token_rotation_handoffs") && replacementHandoff) {
+            if (sql.includes("audit_state = 'sent'")) replacementHandoff.audit_state = 'sent'
+            if (sql.includes("state = 'active'")) replacementHandoff.state = 'active'
+          }
           return { meta: { changes: revokeChanges } }
         },
       }
@@ -114,18 +125,41 @@ function makeEnv(opts: Opts = {}): Env {
   return {
     DB: {
       prepare: (sql: string) => handler(sql),
-      batch: async (stmts: unknown[]) => stmts.map(() => ({ meta: { changes: 1 } })),
+      batch: async (stmts: unknown[]) => {
+        opts.batches?.push(stmts)
+        const handoffInsert = (stmts as Array<{ sql?: string; args?: unknown[] }>).find((stmt) =>
+          stmt.sql?.includes('INSERT INTO agent_token_rotation_handoffs'),
+        )
+        if (handoffInsert?.args) {
+          const args = handoffInsert.args
+          replacementHandoff = {
+            id: args[0], tenant: args[1], agent_id: args[2], member_id: args[3], prior_token_id: args[4],
+            replacement_token_id: args[5], minted_by_member_id: args[6], claim_id: args[7],
+            claim_fingerprint: args[8], claim_expires_at: args[9], audit_state: 'pending', state: 'pending',
+            created_at: args[10], activated_at: null,
+          }
+        }
+        return stmts.map(() => ({ meta: { changes: 1 } }))
+      },
     },
     TENANT_SLUG: 'mumega',
     PUBLIC_ORIGIN: 'https://mupot.mumega.com',
-    BUS: { send: async (e: unknown) => { (opts.busSent ??= []).push(e) } },
+    BUS: {
+      send: async (e: unknown) => {
+        if (opts.busReject?.value) throw new Error('bus unavailable')
+        ;(opts.busSent ??= []).push(e)
+      },
+    },
     // mupot#987: mint_agent_token stores raw behind a one-time SESSIONS-KV claim
     // (src/auth/credential-claim.ts) instead of returning it directly.
     SESSIONS: (() => {
       const store = new Map<string, string>()
       return {
         async get(key: string) { return store.get(key) ?? null },
-        async put(key: string, value: string) { store.set(key, value) },
+        async put(key: string, value: string) {
+          if (opts.claimReject) throw new Error('claim store unavailable')
+          store.set(key, value)
+        },
         async delete(key: string) { store.delete(key) },
       }
     })(),
@@ -393,12 +427,89 @@ describe('Flight-002: mint_agent_token expiry and rotation', () => {
     expect(body).not.toMatch(/credential_claim|mupot_|token_hash/)
   })
 
+  it('blank_or_whitespace_replacement_id_is_refused_without_token_claim_binding_gate_or_bus_effect', async () => {
+    for (const rotate_prior_token_id of ['', '   ']) {
+      const batches: unknown[][] = []
+      const busSent: unknown[] = []
+      const res = await call(
+        'mint_agent_token',
+        { agent: AGENT.slug, rotate_prior_token_id },
+        makeEnv({ batches, busSent }),
+      )
+
+      expect(res.status).toBe(400)
+      expect(await res.text()).toContain('invalid_replacement_token_id')
+      expect(batches).toHaveLength(0)
+      expect(busSent).toHaveLength(0)
+    }
+  })
+
   it('atomically rotates prior token on mint when rotate_prior_token_id provided', async () => {
     const env = makeEnv({ liveReplacementToken: true, memberBinding: 'member-agent-1' })
     const res = await call('mint_agent_token', { agent: AGENT.slug, rotate_prior_token_id: 'tok-old' }, env)
     expect(res.status).toBe(200)
     const body = (await res.json()) as { result: { structuredContent: { token: { id: string } } } }
     expect(body.result.structuredContent.token.id).toBeDefined()
+  })
+
+  it('replacement_bus_failure_preserves_prior_and_leaves_no_live_replacement', async () => {
+    const busReject = { value: true }
+    const batches: unknown[][] = []
+    const busSent: unknown[] = []
+    const env = makeEnv({
+      liveReplacementToken: true,
+      memberBinding: 'member-agent-1',
+      busReject,
+      batches,
+      busSent,
+    })
+
+    const res = await call('mint_agent_token', { agent: AGENT.slug, rotate_prior_token_id: 'tok-old' }, env)
+
+    expect(res.status).toBe(503)
+    expect(await res.text()).not.toMatch(/credential_claim|mupot_|token_hash/)
+    expect(batches).toHaveLength(1)
+    expect(busSent).toHaveLength(0)
+  })
+
+  it('replacement_claim_failure_preserves_prior_and_leaves_no_live_replacement', async () => {
+    const batches: unknown[][] = []
+    const busSent: unknown[] = []
+    const env = makeEnv({
+      liveReplacementToken: true,
+      memberBinding: 'member-agent-1',
+      claimReject: true,
+      batches,
+      busSent,
+    })
+
+    const res = await call('mint_agent_token', { agent: AGENT.slug, rotate_prior_token_id: 'tok-old' }, env)
+
+    expect(res.status).toBe(503)
+    expect(await res.text()).not.toMatch(/credential_claim|mupot_|token_hash/)
+    expect(batches).toHaveLength(0)
+    expect(busSent).toHaveLength(0)
+  })
+
+  it('replacement_retry_resumes_without_duplicate_live_token_or_audit', async () => {
+    const busReject = { value: true }
+    const batches: unknown[][] = []
+    const busSent: unknown[] = []
+    const env = makeEnv({
+      liveReplacementToken: true,
+      memberBinding: 'member-agent-1',
+      busReject,
+      batches,
+      busSent,
+    })
+    const args = { agent: AGENT.slug, rotate_prior_token_id: 'tok-old' }
+
+    expect((await call('mint_agent_token', args, env)).status).toBe(503)
+    busReject.value = false
+    expect((await call('mint_agent_token', args, env)).status).toBe(200)
+
+    expect(batches).toHaveLength(1)
+    expect(busSent).toHaveLength(1)
   })
 
   it('returns the same opaque replacement conflict for a missing or foreign prior token without a claim', async () => {
