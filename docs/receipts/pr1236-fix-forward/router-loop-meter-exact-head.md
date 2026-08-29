@@ -42,24 +42,28 @@ Both worktrees were clean at their stated start heads. The primary history was n
 
 Composition commands ran at `316877c35ca6419124e7e0b6529940c63d2db969` unless noted.
 
-| Gate | Exit | Result |
+| Literal command | Exit | Result |
 | --- | ---: | --- |
-| focused security suites | 0 | 4 files, 59 tests passed |
+| `npx vitest run tests/execution-scope.test.ts tests/router-authorization.test.ts tests/loop-driver-public-boundary.test.ts tests/meter-authorization.test.ts` | 0 | 4 files, 59 tests passed |
 | `npm run typecheck` | 0 | TypeScript clean |
 | `npm test` | 0 | 442 files, 6,698 tests passed |
-| no-secrets | 0 | no secrets found |
-| schema self + guard | 0 / 0 | 16/16; baseline files=26, mockDb=127 |
-| migration self + `BASE_REF=main` guard | 0 / 0 | 29/29; 0133 sorts above main head 132 |
-| reserved bindings | 0 | no reserved binding names |
-| operator-counts self + guard | 0 / 0 | 7/7; 48 dashboard files, zero duplicate implementations |
-| branch-staleness self + `BASE_REF=main` guard | 0 / 0 | 10/10; no contested files, 0 behind origin/main |
-| design-status policy | 0 | policy OK |
-| CI-spelled plugin `python -m compileall -q plugin` | 0 | PATH shim supplied `python`; exact command unchanged |
-| CI-spelled plugin `python -m pytest plugin/tests` | 0 | 105 passed |
+| `node scripts/no-secrets.mjs` | 0 | no secrets found |
+| `node --test tests/test-schema-source.test.mjs` | 0 | 16/16 passed |
+| `node scripts/check-test-schema-source.mjs` | 0 | baseline files=26, mockDb=127 |
+| `node --test tests/migration-numbering.test.mjs` | 0 | 29/29 passed |
+| `BASE_REF=main node scripts/check-migration-numbering.mjs` | 0 | 0133 sorts above main head 132 |
+| `node scripts/reserved-bindings.mjs` | 0 | no reserved binding names |
+| `npx vitest run tests/check-operator-counts-source.test.ts` | 0 | 7/7 passed |
+| `node scripts/check-operator-counts-source.mjs` | 0 | 48 dashboard files, zero duplicate implementations |
+| `node --test tests/branch-staleness.test.mjs` | 0 | 10/10 passed |
+| `BASE_REF=main node scripts/check-branch-staleness.mjs` | 0 | no contested files, 0 behind origin/main |
+| `node scripts/design-status-contract-policy.mjs` | 0 | policy OK |
+| `python -m compileall -q plugin` | 0 | PATH shim supplied `python`; exact command unchanged |
+| `python -m pytest plugin/tests` | 0 | 105 passed |
 | `bash scripts/ci-local-evidence.sh` | 0 | local D1, Wrangler, browser smoke, runtime conformance, routine lifecycle |
-| composition diff check | 0 | clean |
-| primary focused suites | 0 | 4 files, 59 tests at `3d2af417` |
-| primary diff check | 0 | clean at `3d2af417` |
+| `git diff --check origin/main...HEAD` (composition) | 0 | clean |
+| `npx vitest run tests/execution-scope.test.ts tests/router-authorization.test.ts tests/loop-driver-public-boundary.test.ts tests/meter-authorization.test.ts` (primary `3d2af417`) | 0 | 4 files, 59 tests passed |
+| `git diff --check origin/main...HEAD` (primary `3d2af417`) | 0 | clean |
 
 The first local-evidence run was interrupted by the harness with its local Wrangler child still alive. The exact local child was stopped, endpoint freedom verified, and the full command rerun to exit `0`; no remote endpoint or production database was selected.
 
