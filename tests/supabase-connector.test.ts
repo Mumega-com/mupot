@@ -207,4 +207,35 @@ describe('1-Click Supabase Data Connector & Engine (Flight 6)', () => {
     expect(json.table).toBe('warranty_claims')
     expect(mockBusSend).toHaveBeenCalledOnce()
   })
+
+  it.each([
+    ['an unsupported string type', 'TRUNCATE'],
+    ['a missing type', undefined],
+    ['a non-string type', 42],
+  ])('rejects %s before emitting an internal event', async (_label, type) => {
+    const payload: Record<string, unknown> = {
+      table: 'warranty_claims',
+      schema: 'public',
+      record: { id: 'claim-invalid' },
+    }
+    if (type !== undefined) payload.type = type
+
+    const mockBusSend = vi.fn().mockResolvedValue(undefined)
+    const env = {
+      TENANT_SLUG: 'gaf',
+      BUS: { send: mockBusSend },
+      DB: harness.db,
+    } as unknown as Env
+    const req = new Request('http://localhost/supabase', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+
+    const res = await supabaseWebhookApp.fetch(req, env)
+
+    expect(res.status).toBe(400)
+    await expect(res.json()).resolves.toEqual({ ok: false, error: 'invalid_event_type' })
+    expect(mockBusSend).not.toHaveBeenCalled()
+  })
 })
