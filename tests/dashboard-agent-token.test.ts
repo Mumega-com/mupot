@@ -12,14 +12,13 @@
 //   9. Existing provision-tools tests stay green (separate file)
 //  10. tsc strict — validated by build step
 
-import { readFileSync, readdirSync } from 'node:fs'
-import { join } from 'node:path'
 import { describe, it, expect, vi } from 'vitest'
 import { mintAgentBoundToken, sha256Hex } from '../src/members/service'
 import { loadAgentTokenView } from '../src/dashboard/agent-token'
 import { dashboardApp } from '../src/dashboard/index'
 import type { Env } from '../src/types'
 import { createSqliteD1 } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 
 // ── test fixtures ─────────────────────────────────────────────────────────────
 
@@ -266,17 +265,13 @@ describe('mintAgentBoundToken', () => {
   })
 })
 
-const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
-
 function createMigratedMintEnv(): {
   env: Env
   sqlite: ReturnType<typeof createSqliteD1>['sqlite']
   close(): void
 } {
   const harness = createSqliteD1()
-  for (const file of readdirSync(MIGRATIONS_DIR).filter((name) => name.endsWith('.sql')).sort()) {
-    harness.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
-  }
+  applyAllMigrations(harness.sqlite)
   harness.sqlite.exec(`
     INSERT INTO departments (id, slug, name) VALUES ('dept-mint', 'mint', 'Mint');
     INSERT INTO squads (id, department_id, slug, name)
@@ -292,6 +287,83 @@ function createMigratedMintEnv(): {
 }
 
 describe('mintAgentBoundToken — canonical SQLite identity', () => {
+  it('does not persist a replacement when its requested prior token is not live for the agent', async () => {
+    const harness = createMigratedMintEnv()
+    try {
+      const first = await mintAgentBoundToken(harness.env, AGENT, 'first')
+
+      expect(harness.sqlite.prepare(
+        'SELECT expires_at FROM member_tokens WHERE id = ?',
+      ).get(first.tokenId)).toEqual({ expires_at: expect.any(String) })
+
+      await expect(
+        mintAgentBoundToken(harness.env, AGENT, 'replacement', {
+          revokePriorTokenId: 'missing-prior-token',
+        }),
+      ).rejects.toThrow('replacement_token_unavailable')
+
+      expect(harness.sqlite.prepare(
+        'SELECT COUNT(*) AS count FROM member_tokens WHERE tenant = ? AND agent_id = ?',
+      ).get('test', AGENT.id)).toEqual({ count: 1 })
+      expect(harness.sqlite.prepare(
+        'SELECT revoked_at FROM member_tokens WHERE id = ?',
+      ).get(first.tokenId)).toEqual({ revoked_at: null })
+    } finally {
+      harness.close()
+    }
+  })
+
+  it('rejects foreign and already-revoked replacement priors without minting another token', async () => {
+    const harness = createMigratedMintEnv()
+    try {
+      const first = await mintAgentBoundToken(harness.env, AGENT, 'first')
+      const foreignAgent = { ...AGENT, id: 'agent-foreign', slug: 'foreign-agent', name: 'Foreign Agent' }
+      harness.sqlite.prepare(
+        `INSERT INTO agents (id, squad_id, slug, name, role, model, status)
+         VALUES (?, ?, ?, ?, 'member', 'test', 'active')`,
+      ).run(foreignAgent.id, foreignAgent.squad_id, foreignAgent.slug, foreignAgent.name)
+      const foreign = await mintAgentBoundToken(harness.env, foreignAgent, 'foreign')
+
+      await expect(mintAgentBoundToken(harness.env, AGENT, 'foreign-replacement', {
+        revokePriorTokenId: foreign.tokenId,
+      })).rejects.toThrow('replacement_token_unavailable')
+
+      harness.sqlite.prepare('UPDATE member_tokens SET revoked_at = ? WHERE id = ?')
+        .run('2026-08-29T00:00:00.000Z', first.tokenId)
+      await expect(mintAgentBoundToken(harness.env, AGENT, 'revoked-replacement', {
+        revokePriorTokenId: first.tokenId,
+      })).rejects.toThrow('replacement_token_unavailable')
+
+      expect(harness.sqlite.prepare(
+        'SELECT COUNT(*) AS count FROM member_tokens WHERE tenant = ? AND agent_id = ?',
+      ).get('test', AGENT.id)).toEqual({ count: 1 })
+    } finally {
+      harness.close()
+    }
+  })
+
+  it('allows exactly one concurrent replacement of the same prior token', async () => {
+    const harness = createMigratedMintEnv()
+    try {
+      const prior = await mintAgentBoundToken(harness.env, AGENT, 'prior')
+      const replacements = await Promise.allSettled([
+        mintAgentBoundToken(harness.env, AGENT, 'replacement-a', { revokePriorTokenId: prior.tokenId }),
+        mintAgentBoundToken(harness.env, AGENT, 'replacement-b', { revokePriorTokenId: prior.tokenId }),
+      ])
+
+      expect(replacements.filter((result) => result.status === 'fulfilled')).toHaveLength(1)
+      expect(replacements.filter((result) => result.status === 'rejected')).toHaveLength(1)
+      expect(harness.sqlite.prepare(
+        'SELECT COUNT(*) AS count FROM member_tokens WHERE tenant = ? AND agent_id = ?',
+      ).get('test', AGENT.id)).toEqual({ count: 2 })
+      expect(harness.sqlite.prepare(
+        'SELECT COUNT(*) AS count FROM member_tokens WHERE tenant = ? AND agent_id = ? AND revoked_at IS NULL',
+      ).get('test', AGENT.id)).toEqual({ count: 1 })
+    } finally {
+      harness.close()
+    }
+  })
+
   it('keeps one member and its committed home grant after every token is revoked', async () => {
     const harness = createMigratedMintEnv()
     try {
@@ -554,6 +626,18 @@ describe('POST /admin/agent-token/mint', () => {
     const text = await res.text()
     expect(text).toContain('Grant must be observer or member')
     expect(captured.length).toBe(0)
+  })
+
+  it.each(['0', '-1', 'not-a-number'])('400s invalid dashboard expiry %s before minting rows', async (expiresInDays) => {
+    const captured: Captured[] = []
+    const env = makeRouteEnv('admin', { captured })
+    const form = new URLSearchParams({ agent_id: AGENT.id, label: 'expiry-test', expires_in_days: expiresInDays })
+
+    const res = await dashboardApp.fetch(makeReq('/admin/agent-token/mint', 'POST', form), env)
+
+    expect(res.status).toBe(400)
+    expect(await res.text()).toContain('Expiry must be a whole number from 1 to 365 days')
+    expect(captured).toHaveLength(0)
   })
 
   it('503s before minting when PUBLIC_ORIGIN is not a secure canonical origin', async () => {

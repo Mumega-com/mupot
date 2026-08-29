@@ -14,6 +14,7 @@
 import type { D1PreparedStatement } from '@cloudflare/workers-types'
 import type { Env, MemberToken, ConnectionChannel, Capability, CapabilityGrant } from '../types'
 import { assertBatchWritten } from '../lib/receipt'
+import { calculateExpiryTimestamp, DEFAULT_TOKEN_EXPIRY_DAYS } from '../auth/token-lifecycle'
 
 const CHANNELS: readonly ConnectionChannel[] = ['workspace', 'im', 'dashboard']
 export function isChannel(v: unknown): v is ConnectionChannel {
@@ -202,12 +203,39 @@ export interface AgentBindingProof {
 export interface PreparedAgentTokenMint extends AgentMintResult {
   statements: D1PreparedStatement[]
   bindingProof: AgentBindingProof
+  replacementTokenId: string | null
 }
 
 export interface PrepareAgentTokenMintOptions {
   grantCapability?: AgentTokenCapability
   expiresAt?: string | null
   revokePriorTokenId?: string | null
+}
+
+/** Intentionally opaque to callers: a replacement identifier is never an ownership oracle. */
+export class AgentTokenReplacementError extends Error {
+  readonly code = 'replacement_token_unavailable' as const
+
+  constructor() {
+    super('replacement_token_unavailable')
+    this.name = 'AgentTokenReplacementError'
+  }
+}
+
+async function assertLiveReplacementToken(
+  env: Env,
+  agentId: string,
+  memberId: string,
+  tokenId: string,
+): Promise<void> {
+  const prior = await env.DB.prepare(
+    `SELECT id FROM member_tokens
+      WHERE id = ? AND member_id = ? AND agent_id = ? AND tenant = ? AND revoked_at IS NULL
+      LIMIT 1`,
+  )
+    .bind(tokenId, memberId, agentId, env.TENANT_SLUG)
+    .first<{ id: string }>()
+  if (!prior) throw new AgentTokenReplacementError()
 }
 
 /**
@@ -239,7 +267,7 @@ export async function prepareAgentBoundTokenMintForBinding(
   label: string,
   requestedCapability: AgentTokenCapability,
   binding: AgentMemberBinding,
-  expiresAt: string | null = null,
+  expiresAt: string | null = calculateExpiryTimestamp(DEFAULT_TOKEN_EXPIRY_DAYS),
   revokePriorTokenId: string | null = null,
 ): Promise<PreparedAgentTokenMint> {
   const creating = binding.kind === 'unminted'
@@ -288,6 +316,14 @@ export async function prepareAgentBoundTokenMintForBinding(
       : 'member'
   }
 
+  // Check the exact ownership/liveness predicate before creating any secret material.
+  // The INSERT below repeats the same predicate inside the D1 batch so a concurrent
+  // replacement has exactly one durable winner.
+  if (revokePriorTokenId) {
+    if (creating) throw new AgentTokenReplacementError()
+    await assertLiveReplacementToken(env, agent.id, memberId, revokePriorTokenId)
+  }
+
   const tokenId = crypto.randomUUID()
   const rawToken = mintRawToken()
   const tokenHash = await sha256Hex(rawToken)
@@ -312,21 +348,46 @@ export async function prepareAgentBoundTokenMintForBinding(
     )
   }
 
-  // If rotating a prior token, atomically revoke it in the same batch
+  // A rotation inserts the replacement only while the named prior token remains
+  // live and welded to this exact agent/member. This predicate is deliberately in
+  // the database transaction (not merely the preflight above): after one batch
+  // revokes the prior token, every concurrent loser inserts zero rows and commits
+  // no replacement credential or claim.
   if (revokePriorTokenId) {
     statements.push(
       env.DB.prepare(
-        `UPDATE member_tokens SET revoked_at = ? WHERE id = ? AND member_id = ? AND tenant = ? AND revoked_at IS NULL`,
-      ).bind(createdAt, revokePriorTokenId, memberId, env.TENANT_SLUG),
+        `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant, expires_at)
+         SELECT ?, ?, ?, ?, 'workspace', ?, ?, ?, ?
+          WHERE EXISTS (
+            SELECT 1 FROM member_tokens
+             WHERE id = ? AND member_id = ? AND agent_id = ? AND tenant = ? AND revoked_at IS NULL
+          )`,
+      ).bind(
+        tokenId,
+        memberId,
+        tokenHash,
+        safeLabel,
+        createdAt,
+        agent.id,
+        env.TENANT_SLUG,
+        expiresAt ?? null,
+        revokePriorTokenId,
+        memberId,
+        agent.id,
+        env.TENANT_SLUG,
+      ),
+      env.DB.prepare(
+        `UPDATE member_tokens SET revoked_at = ? WHERE id = ? AND member_id = ? AND agent_id = ? AND tenant = ? AND revoked_at IS NULL`,
+      ).bind(createdAt, revokePriorTokenId, memberId, agent.id, env.TENANT_SLUG),
+    )
+  } else {
+    statements.push(
+      env.DB.prepare(
+        `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant, expires_at)
+         VALUES (?, ?, ?, ?, 'workspace', ?, ?, ?, ?)`,
+      ).bind(tokenId, memberId, tokenHash, safeLabel, createdAt, agent.id, env.TENANT_SLUG, expiresAt ?? null),
     )
   }
-
-  statements.push(
-    env.DB.prepare(
-      `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant, expires_at)
-       VALUES (?, ?, ?, ?, 'workspace', ?, ?, ?, ?)`,
-    ).bind(tokenId, memberId, tokenHash, safeLabel, createdAt, agent.id, env.TENANT_SLUG, expiresAt ?? null),
-  )
 
   // D2 (2026-08-13, athena gate cluster map 247858f1; Hadi decision option A
   // "make it smooth now, tighten later"): the agent's OWN LANE gate is part of
@@ -354,6 +415,7 @@ export async function prepareAgentBoundTokenMintForBinding(
     createdAt,
     grantCapability,
     statements,
+    replacementTokenId: revokePriorTokenId,
     bindingDisposition: creating ? 'created' : 'reused',
     bindingProof: {
       agentId: agent.id,
@@ -378,7 +440,12 @@ async function commitPreparedAgentTokenMint(
   prepared: PreparedAgentTokenMint,
 ): Promise<AgentMintResult> {
   const writes = await env.DB.batch(prepared.statements)
-  assertBatchWritten(writes, 'mint_agent_bound_token', 1)
+  try {
+    assertBatchWritten(writes, 'mint_agent_bound_token', 1)
+  } catch (error) {
+    if (prepared.replacementTokenId) throw new AgentTokenReplacementError()
+    throw error
+  }
   return {
     raw: prepared.raw,
     tokenId: prepared.tokenId,
