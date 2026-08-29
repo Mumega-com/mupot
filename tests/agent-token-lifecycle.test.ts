@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { mcpApp } from '../src/mcp'
 import type { CapabilityGrant, Env } from '../src/types'
 import { resolveAgentTokenExpiry } from '../src/auth/token-lifecycle'
+import { discardCredentialClaim } from '../src/auth/credential-claim'
 
 // mupot#682 — list_agent_tokens / revoke_agent_token.
 //
@@ -544,6 +545,19 @@ describe('Flight-002: mint_agent_token expiry and rotation', () => {
     expect(first.status).toBe(200)
     const second = await revealRaw(env, claimId)
     expect(second.status).toBe(410)
+  })
+
+  it('a discarded replacement claim cannot reveal credential material', async () => {
+    const env = makeEnv()
+    const res = await call('mint_agent_token', { agent: AGENT.slug }, env)
+    const body = (await res.json()) as {
+      result: { structuredContent: { credential_claim: { claim_id: string } } }
+    }
+    const claimId = body.result.structuredContent.credential_claim.claim_id
+
+    await discardCredentialClaim(env, claimId)
+
+    expect((await revealRaw(env, claimId)).status).toBe(410)
   })
 })
 

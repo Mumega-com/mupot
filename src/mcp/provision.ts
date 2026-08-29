@@ -53,7 +53,12 @@ import {
   sha256Hex,
 } from '../members/service'
 import { resolveAgentTokenExpiry } from '../auth/token-lifecycle'
-import { createCredentialClaim, credentialClaimIsAvailable, CLAIM_TTL_SECONDS } from '../auth/credential-claim'
+import {
+  createCredentialClaim,
+  credentialClaimIsAvailable,
+  discardCredentialClaim,
+  CLAIM_TTL_SECONDS,
+} from '../auth/credential-claim'
 import { revokeMemberToken } from '../members/service'
 import { setAgentSquadAccess, type AgentAccessCapability } from '../members/agent-access'
 import {
@@ -558,10 +563,24 @@ const toolMintAgentToken: ToolSpec = {
       }
 
       try {
-        if (!(await isAgentTokenReplacementClaimReady(env, handoff.id))) {
-          if (!(await credentialClaimIsAvailable(env, handoff.claim.claimId, auth.memberId as string))) {
-            return fail(503, 'replacement_handoff_pending')
+        // D1 readiness records that claim creation completed once; it does not
+        // prove the one-time KV claim is still revealable on this retry. Check
+        // the live cross-system boundary before every audit attempt. If it has
+        // expired or been consumed, burn the key idempotently and discard only
+        // the inactive reservation so a later request can elect
+        // one fresh replacement while the prior remains live.
+        const claimReady = await isAgentTokenReplacementClaimReady(env, handoff.id)
+        if (!(await credentialClaimIsAvailable(env, handoff.claim.claimId, auth.memberId as string))) {
+          // A pending D1 state may still have its KV put in flight. Only a
+          // durable-ready claim that has since disappeared is stale enough to
+          // discard; an in-flight claim remains reserved and retryable.
+          if (claimReady) {
+            await discardCredentialClaim(env, handoff.claim.claimId)
+            await cancelAgentTokenReplacementReservation(env, handoff)
           }
+          return fail(503, 'replacement_handoff_pending')
+        }
+        if (!claimReady) {
           await markAgentTokenReplacementClaimReady(env, handoff.id)
         }
         if (handoff.auditState === 'pending') {
@@ -571,9 +590,16 @@ const toolMintAgentToken: ToolSpec = {
             receipt_id: handoff.id,
             reason: 'replacement_handoff_pending',
           }, true)
+          if (!(await credentialClaimIsAvailable(env, handoff.claim.claimId, auth.memberId as string))) {
+            await discardCredentialClaim(env, handoff.claim.claimId)
+            await cancelAgentTokenReplacementReservation(env, handoff)
+            return fail(503, 'replacement_handoff_pending')
+          }
           handoff = await markAgentTokenReplacementAuditSent(env, handoff.id)
         }
         if (!(await credentialClaimIsAvailable(env, handoff.claim.claimId, auth.memberId as string))) {
+          await discardCredentialClaim(env, handoff.claim.claimId)
+          await cancelAgentTokenReplacementReservation(env, handoff)
           return fail(503, 'replacement_handoff_pending')
         }
         if (handoff.state === 'pending') handoff = await activateAgentTokenReplacement(env, handoff.id)

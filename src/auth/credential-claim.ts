@@ -116,6 +116,13 @@ export async function credentialClaimIsAvailable(
   }
 }
 
+/** Ensure a claim can no longer reveal credential material before its inactive
+ * rotation reservation is discarded. Deletion is idempotent so a missing,
+ * expired, or already-consumed claim follows the same recovery path. */
+export async function discardCredentialClaim(env: Env, claimId: string): Promise<void> {
+  await env.SESSIONS.delete(CLAIM_KEY_PREFIX + claimId)
+}
+
 export type RevealClaimResult =
   | { ok: true; raw: string }
   | { ok: false; reason: 'not_found_or_consumed' | 'wrong_owner' }
