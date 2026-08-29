@@ -736,7 +736,10 @@ export async function stageAgentTokenReplacement(
   }
 }
 
-/** Remove an unclaimed, inactive reservation after KV claim creation fails. */
+/** Remove an inactive reservation after its KV claim is known unavailable.
+ * The caller must burn the claim key first; D1 then removes the durable
+ * reservation and inactive token atomically. Audit-sent is accepted so a
+ * pre-fix handoff stranded after BUS delivery can also recover. */
 export async function cancelAgentTokenReplacementReservation(
   env: Env,
   handoff: AgentTokenReplacementHandoff,
@@ -744,7 +747,8 @@ export async function cancelAgentTokenReplacementReservation(
   const writes = await env.DB.batch([
     env.DB.prepare(
       `DELETE FROM agent_token_rotation_handoffs
-        WHERE id = ? AND tenant = ? AND state = 'pending' AND audit_state = 'pending' AND claim_state = 'pending'`,
+        WHERE id = ? AND tenant = ? AND state = 'pending' AND audit_state IN ('pending', 'sent')
+          AND claim_state IN ('pending', 'ready')`,
     ).bind(handoff.id, env.TENANT_SLUG),
     env.DB.prepare(
       `DELETE FROM member_tokens
@@ -788,30 +792,33 @@ export async function markAgentTokenReplacementAuditSent(
   const result = await env.DB.prepare(
     `UPDATE agent_token_rotation_handoffs
         SET audit_state = 'sent'
-      WHERE id = ? AND tenant = ? AND state = 'pending' AND audit_state = 'pending'`,
+      WHERE id = ? AND tenant = ? AND state = 'pending'
+        AND audit_state = 'pending' AND claim_state = 'ready'`,
   ).bind(handoffId, env.TENANT_SLUG).run()
   if ((result.meta?.changes ?? 0) === 0) {
     const existing = await env.DB.prepare(
       `SELECT id, tenant, agent_id, member_id, prior_token_id, replacement_token_id,
               claim_id, claim_fingerprint, claim_expires_at, minted_by_member_id,
-              audit_state, state, created_at, activated_at
+              claim_state, audit_state, state, created_at, activated_at
          FROM agent_token_rotation_handoffs WHERE id = ? AND tenant = ? LIMIT 1`,
     ).bind(handoffId, env.TENANT_SLUG).first<{
       id: string; tenant: string; agent_id: string; member_id: string; prior_token_id: string; replacement_token_id: string
       claim_id: string; claim_fingerprint: string; claim_expires_at: string; minted_by_member_id: string
+      claim_state: 'pending' | 'ready'
       audit_state: 'pending' | 'sent'; state: 'pending' | 'active'; created_at: string; activated_at: string | null
     }>()
-    if (existing?.audit_state === 'sent') return rowToReplacementHandoff(existing)
+    if (existing?.audit_state === 'sent' && existing.claim_state === 'ready') return rowToReplacementHandoff(existing)
     throw new AgentTokenReplacementError()
   }
   const row = await env.DB.prepare(
     `SELECT id, tenant, agent_id, member_id, prior_token_id, replacement_token_id,
             claim_id, claim_fingerprint, claim_expires_at, minted_by_member_id,
-            audit_state, state, created_at, activated_at
+            claim_state, audit_state, state, created_at, activated_at
        FROM agent_token_rotation_handoffs WHERE id = ? AND tenant = ? LIMIT 1`,
   ).bind(handoffId, env.TENANT_SLUG).first<{
     id: string; tenant: string; agent_id: string; member_id: string; prior_token_id: string; replacement_token_id: string
     claim_id: string; claim_fingerprint: string; claim_expires_at: string; minted_by_member_id: string
+    claim_state: 'pending' | 'ready'
     audit_state: 'pending' | 'sent'; state: 'pending' | 'active'; created_at: string; activated_at: string | null
   }>()
   if (!row) throw new AgentTokenReplacementError()
@@ -826,7 +833,8 @@ export async function activateAgentTokenReplacement(
   const result = await env.DB.prepare(
     `UPDATE agent_token_rotation_handoffs
         SET state = 'active', activated_at = ?
-      WHERE id = ? AND tenant = ? AND state = 'pending' AND audit_state = 'sent'`,
+      WHERE id = ? AND tenant = ? AND state = 'pending'
+        AND audit_state = 'sent' AND claim_state = 'ready'`,
   ).bind(activatedAt, handoffId, env.TENANT_SLUG).run()
   if ((result.meta?.changes ?? 0) === 0) throw new AgentTokenReplacementError()
   const row = await env.DB.prepare(
