@@ -2937,6 +2937,12 @@ const toolRouterTick: ToolSpec = {
   async run(auth, env, args) {
     const squadId = str(args.squad_id)
     if (!squadId) return fail(400, 'invalid_args', 'squad_id required')
+    // The generic schema seam intentionally preserves historical optional-null
+    // behavior for unrelated tools. This boolean is not nullable: reject here,
+    // before choosing mutation authority or entering the presence policy.
+    if (args.dry_run !== undefined && typeof args.dry_run !== 'boolean') {
+      return fail(400, 'invalid_args', 'dry_run must be boolean')
+    }
     const dryRun = args.dry_run === true
     const decision = await authorizeExecutionScope(env, auth, {
       action: dryRun ? 'router:read' : 'router:mutate',
