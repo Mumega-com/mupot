@@ -25,11 +25,13 @@ AND (
        AND attempt.fencing_epoch = OLD.current_fencing_epoch
   )
   OR (
-    SELECT COUNT(DISTINCT CASE
-      WHEN evidence.evidence_type IN ('provider.observed','provider.reconciled')
-        THEN 'provider.result'
-      ELSE evidence.evidence_type
-    END)
+    SELECT
+      COALESCE(MAX(evidence.evidence_type = 'host.persisted'), 0)
+      + COALESCE(MAX(evidence.evidence_type = 'effect.intent'), 0)
+      + COALESCE(MAX(evidence.evidence_type IN ('provider.observed','provider.reconciled')), 0)
+      + COALESCE(MAX(evidence.evidence_type = 'runtime.injected'), 0)
+      + COALESCE(MAX(evidence.evidence_type = 'runtime.consumed'), 0)
+      + COALESCE(MAX(evidence.evidence_type = 'runtime.ack'), 0)
       FROM fenced_delivery_evidence evidence
      WHERE evidence.tenant = OLD.tenant
        AND evidence.delivery_id = OLD.id
@@ -44,15 +46,6 @@ AND (
        AND evidence.ciphertext_digest = OLD.ciphertext_digest
        AND evidence.envelope_digest = OLD.envelope_digest
        AND evidence.runtime_input_digest = OLD.runtime_input_digest
-       AND evidence.evidence_type IN (
-         'host.persisted',
-         'effect.intent',
-         'provider.observed',
-         'provider.reconciled',
-         'runtime.injected',
-         'runtime.consumed',
-         'runtime.ack'
-       )
   ) <> 6
 )
 BEGIN
