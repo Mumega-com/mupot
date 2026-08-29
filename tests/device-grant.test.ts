@@ -4,7 +4,7 @@ import { applyAllMigrations } from './helpers/migrations'
 import {
   createDeviceGrant,
   decideDeviceGrant,
-  listPendingDeviceGrants,
+  lookupDeviceGrant,
   pollDeviceGrant,
 } from '../src/auth/device-grant'
 import { deviceApp } from '../src/auth/device-routes'
@@ -83,6 +83,20 @@ function adminAuth(): AuthContext {
   }
 }
 
+async function ownerCookie(env: Env): Promise<string> {
+  const sid = 'sess-owner-1'
+  await env.SESSIONS.put(
+    `sess:${sid}`,
+    JSON.stringify({
+      userId: 'owner-1',
+      email: 'owner@example.test',
+      role: 'owner',
+      createdAt: new Date().toISOString(),
+    }),
+  )
+  return `mupot_session=${sid}`
+}
+
 let harness: SqliteD1Harness
 
 beforeEach(() => {
@@ -95,27 +109,25 @@ afterEach(() => {
   harness.close()
 })
 
-describe('device grant click-to-approve', () => {
-  it('creates a user_code for an active agent and lists it without the raw token', async () => {
+describe('device grant type-then-click', () => {
+  it('creates a user_code; lookup is by typed code; grant record has no raw token', async () => {
     const env = envFor(harness)
     const created = await createDeviceGrant(env, { agent: 'agent-a', origin: 'https://mupot.mumega.com' })
     expect(created.ok).toBe(true)
     if (!created.ok) return
     expect(created.value.user_code).toMatch(/^[A-Z0-9]{4}-[A-Z0-9]{4}$/)
-    expect(created.value.verification_uri).toBe('https://mupot.mumega.com/device')
-    const listed = await listPendingDeviceGrants(env)
-    expect(listed).toHaveLength(1)
-    expect(listed[0].raw_token).toBeNull()
-    expect(listed[0].user_code).toBe(created.value.user_code)
+    expect(created.value.device_code).toMatch(/^[a-f0-9]{64}$/)
+    const looked = await lookupDeviceGrant(env, created.value.user_code)
+    expect(looked?.agent_slug).toBe('agent-a')
+    expect(JSON.stringify(looked).includes('mupot_')).toBe(false)
   })
 
-  it('poll stays pending until Allow; Allow mints; poll returns raw once', async () => {
+  it('poll stays pending until Allow; poll returns TTL token once', async () => {
     const env = envFor(harness)
     const created = await createDeviceGrant(env, { agent: AGENT_A.slug, origin: 'https://pot.test' })
     expect(created.ok).toBe(true)
     if (!created.ok) return
-    const pending = await pollDeviceGrant(env, created.value.device_code)
-    expect(pending.status).toBe('authorization_pending')
+    expect((await pollDeviceGrant(env, created.value.device_code)).status).toBe('authorization_pending')
 
     const decided = await decideDeviceGrant(env, {
       user_code: created.value.user_code,
@@ -124,12 +136,10 @@ describe('device grant click-to-approve', () => {
     })
     expect(decided).toEqual({ ok: true, status: 'approved' })
 
-    const listed = await listPendingDeviceGrants(env)
-    expect(listed.every((g) => g.raw_token === null)).toBe(true)
-
     const first = await pollDeviceGrant(env, created.value.device_code)
     expect(first.status).toBe('ok')
     expect(first.access_token?.startsWith('mupot_')).toBe(true)
+    expect(first.expires_in).toBe(3600)
     expect(first.agent_slug).toBe('agent-a')
 
     const second = await pollDeviceGrant(env, created.value.device_code)
@@ -137,7 +147,7 @@ describe('device grant click-to-approve', () => {
     expect(second.access_token).toBeUndefined()
   })
 
-  it('Deny does not mint; poll is access_denied', async () => {
+  it('Deny does not mint; poll collapses to expired_token', async () => {
     const env = envFor(harness)
     const created = await createDeviceGrant(env, { agent: AGENT_A.slug, origin: 'https://pot.test' })
     expect(created.ok).toBe(true)
@@ -149,7 +159,7 @@ describe('device grant click-to-approve', () => {
     })
     expect(decided).toEqual({ ok: true, status: 'denied' })
     const polled = await pollDeviceGrant(env, created.value.device_code)
-    expect(polled.status).toBe('access_denied')
+    expect(polled.status).toBe('expired_token')
     expect(polled.access_token).toBeUndefined()
   })
 
@@ -164,40 +174,35 @@ describe('device grant click-to-approve', () => {
       auth: adminAuth(),
     })
     expect(decided).toEqual({ ok: false, error: 'forbidden' })
-    const polled = await pollDeviceGrant(env, created.value.device_code)
-    expect(polled.status).toBe('authorization_pending')
+    expect((await pollDeviceGrant(env, created.value.device_code)).status).toBe('authorization_pending')
   })
 
   it('unknown agent at create fails closed', async () => {
     const env = envFor(harness)
-    const created = await createDeviceGrant(env, { agent: 'grokbot-ceo', origin: 'https://pot.test' })
-    expect(created).toEqual({ ok: false, error: 'invalid_agent' })
+    expect(await createDeviceGrant(env, { agent: 'grokbot-ceo', origin: 'https://pot.test' })).toEqual({
+      ok: false,
+      error: 'invalid_agent',
+    })
   })
 
-  it('unknown device_code poll does not distinguish missing vs consumed', async () => {
+  it('GET /device without session redirects; logged-in page asks to type a code and does not list pending codes', async () => {
     const env = envFor(harness)
-    const missing = await pollDeviceGrant(env, 'NO-SUCH-CODE')
-    expect(missing.status).toBe('expired_token')
-  })
+    const created = await createDeviceGrant(env, { agent: 'agent-a', origin: 'http://pot.test' })
+    expect(created.ok).toBe(true)
+    if (!created.ok) return
 
-  it('POST /code returns the codes; GET /device without session redirects to login', async () => {
-    const env = envFor(harness)
-    const created = await deviceApp.fetch(
-      new Request('http://pot.test/code', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ agent: 'agent-a' }),
-      }),
-      env,
-    )
-    expect(created.status).toBe(200)
-    const body = (await created.json()) as { user_code: string; verification_uri: string; device_code: string }
-    expect(body.user_code).toMatch(/^[A-Z0-9]{4}-[A-Z0-9]{4}$/)
-    expect(body.verification_uri).toBe('http://pot.test/device')
-    expect(JSON.stringify(body).includes('mupot_')).toBe(false)
+    const anon = await deviceApp.fetch(new Request('http://pot.test/'), env)
+    expect(anon.status).toBe(302)
+    expect(anon.headers.get('location')).toBe('/auth/login')
 
-    const page = await deviceApp.fetch(new Request('http://pot.test/'), env)
-    expect(page.status).toBe(302)
-    expect(page.headers.get('location')).toBe('/auth/login')
+    const cookie = await ownerCookie(env)
+    const page = await deviceApp.fetch(new Request('http://pot.test/', { headers: { Cookie: cookie } }), env)
+    expect(page.status).toBe(200)
+    const html = await page.text()
+    expect(html).toContain('name="user_code"')
+    expect(html).toContain('Type the code')
+    expect(html).not.toContain(created.value.user_code)
+    expect(html).not.toContain('mupot_')
+    expect(html).not.toContain(created.value.device_code)
   })
 })
