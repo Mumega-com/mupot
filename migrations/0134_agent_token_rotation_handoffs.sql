@@ -1,4 +1,4 @@
--- 0133_agent_token_rotation_handoffs.sql — durable, fail-closed replacement handoff.
+-- 0134_agent_token_rotation_handoffs.sql — durable, fail-closed replacement handoff.
 --
 -- A rotation cannot atomically commit D1 state and either the queue or KV claim.
 -- The replacement token therefore lands revoked (inactive), with this durable

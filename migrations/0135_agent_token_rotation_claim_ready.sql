@@ -1,4 +1,4 @@
--- 0134 — audit/activation must wait for a durably recorded claim handoff.
+-- 0135 — audit/activation must wait for a durably recorded claim handoff.
 
 ALTER TABLE agent_token_rotation_handoffs
   ADD COLUMN claim_state TEXT NOT NULL DEFAULT 'pending'
