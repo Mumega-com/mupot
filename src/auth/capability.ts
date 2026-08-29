@@ -36,9 +36,8 @@ export async function callerHoldsActionCapability(
   return hasSurfaceCap(env, auth, action.startsWith('action:') ? action : `action:${action}`)
 }
 
-/**
- * Capability ladder rank mapping.
- */
+// ── ladder ────────────────────────────────────────────────────────────────────
+
 export const CAPABILITY_RANK: Record<Capability, number> = {
   observer: 1,
   member: 2,
@@ -51,21 +50,13 @@ const RANK = CAPABILITY_RANK
 
 /**
  * Non-directory channel capability ceilings (#799 / FLIGHT-003).
- * Non-directory channels (telegram, im, webhook, external relays) cannot hold standing admin/owner authority.
  */
-export const DEFAULT_NON_DIRECTORY_CHANNEL_MAX_CAP: Capability = 'owner'
+export const DEFAULT_NON_DIRECTORY_CHANNEL_MAX_CAP: Capability = 'lead'
 
-/**
- * Clamp a capability to a maximum ceiling.
- */
 export function clampCapability(cap: Capability, maxCap: Capability = DEFAULT_NON_DIRECTORY_CHANNEL_MAX_CAP): Capability {
   return RANK[cap] > RANK[maxCap] ? maxCap : cap
 }
 
-/**
- * Clamp an array of capability grants to a maximum capability ceiling.
- * Org-level grants above maxCap are clamped or scoped, preventing non-directory channel escalation.
- */
 export function clampChannelCapabilities(
   grants: CapabilityGrant[],
   maxCap: Capability = DEFAULT_NON_DIRECTORY_CHANNEL_MAX_CAP,

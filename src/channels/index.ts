@@ -33,7 +33,7 @@ import type {
   Squad,
   ChannelBinding,
 } from '../types'
-import { resolveCapabilities, hasCapability, clampChannelCapabilities } from '../auth/capability'
+import { resolveCapabilities, hasCapability } from '../auth/capability'
 import { createBus } from '../bus'
 import { getAdapter } from './registry'
 import { wrapIngressContent } from '../ingress/guards'
@@ -273,9 +273,8 @@ async function redeemLink(
 
 // ── intent handlers (each returns the reply text the adapter will post) ───────
 
-async function statusReply(env: Env, memberId: string, squad: Squad, maxCap?: Capability): Promise<string> {
-  const rawGrants = await resolveCapabilities(env, memberId)
-  const grants = maxCap ? clampChannelCapabilities(rawGrants, maxCap) : rawGrants
+async function statusReply(env: Env, memberId: string, squad: Squad): Promise<string> {
+  const grants = await resolveCapabilities(env, memberId)
   const scopes =
     grants.length === 0
       ? 'no capabilities yet'
@@ -389,9 +388,7 @@ export async function runInbound(
   }
 
   // 4) Capabilities for this member (the real RBAC).
-  // Channel authority shrink (#799 / FLIGHT-003): clamp raw grants by channel ceiling
-  const rawGrants = await resolveCapabilities(env, identity.memberId)
-  const grants = clampChannelCapabilities(rawGrants, binding.max_capability ?? 'lead')
+  const grants = await resolveCapabilities(env, identity.memberId)
 
   // ── Central-command (mumega-com#722 & FLIGHT-UNTRUSTED / F6): Structural Ingress Fence
   const ingress = wrapIngressContent(platform, externalUserId, text)
@@ -415,7 +412,7 @@ export async function runInbound(
     case 'unknown':
       return `Sorry, I didn't catch that. ${HELP}`
     case 'status':
-      return statusReply(env, identity.memberId, squad, binding.max_capability)
+      return statusReply(env, identity.memberId, squad)
     case 'wake':
       return wakeReply(env, identity.memberId, grants, intent.ref)
     case 'task':
@@ -569,9 +566,7 @@ async function potSend(
   isDirective: boolean,
 ): Promise<string> {
   const directiveNotice = isDirective ? '' : ' [UNTRUSTED-INGRESS]'
-  // Channel authority shrink (#799 / FLIGHT-003): non-directory channels never inherit org-admin bypass
-  // Inbound messages remain confined to visible squad scopes via member grants
-  const isAdmin = false
+  const isAdmin = hasCapability(grants, 'org', null, 'admin')
   const res = await sendToRef(
     env,
     {

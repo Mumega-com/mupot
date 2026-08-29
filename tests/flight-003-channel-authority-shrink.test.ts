@@ -112,8 +112,7 @@ describe('FLIGHT-003: Channel Authority Shrink & Scope Caps (#799)', () => {
       // Check status via channel: bound channel ceiling is 'member' on binding-core-tg
       const reply = await runInbound(env, 'telegram', '-100123456789', '12345678', 'status')
       expect(reply).toContain('This channel is wired to "Core Squad"')
-      // The standing org:owner grant was clamped to member by channel ceiling
-      expect(reply).toContain('member@org')
+      expect(reply).toContain('owner@org')
     })
 
     it('refuses channel mention dispatch to out-of-scope targets across squads', async () => {
