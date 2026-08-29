@@ -42,6 +42,7 @@ import {
   isAgentTokenCapability,
   AgentTokenReplacementError,
   assertAgentTokenReplacementPriorLive,
+  assertAgentTokenReplacementResumeLive,
   activateAgentTokenReplacement,
   cancelAgentTokenReplacementReservation,
   findAgentTokenReplacementHandoff,
@@ -607,8 +608,21 @@ const toolMintAgentToken: ToolSpec = {
           await markAgentTokenReplacementClaimReady(env, handoff.id)
         } catch {
           try {
-            if (claimCreated) await discardCredentialClaim(env, handoff.claim.claimId)
-            await cancelAgentTokenReplacementReservation(env, handoff)
+            // A successful claim put is the only durable copy of the raw
+            // replacement. If mark-ready failed transiently, keep both the
+            // pending reservation and claim so retry can finish the handoff.
+            // If a racing request already removed this exact reservation while
+            // the KV put was in flight, the late claim is orphaned and must be
+            // burned instead. Only a failed claim creation may safely cancel a
+            // reservation that is still present.
+            if (claimCreated) {
+              const durable = await findAgentTokenReplacementHandoff(env, agent.id, rotatePriorTokenId)
+              if (!durable || durable.id !== handoff.id) {
+                await discardCredentialClaim(env, handoff.claim.claimId)
+              }
+            } else {
+              await cancelAgentTokenReplacementReservation(env, handoff)
+            }
           } catch {
             // The reservation remains inactive and retryable; it never revokes the prior.
           }
@@ -618,7 +632,7 @@ const toolMintAgentToken: ToolSpec = {
 
       try {
         try {
-          await assertAgentTokenReplacementPriorLive(env, handoff)
+          await assertAgentTokenReplacementResumeLive(env, handoff)
         } catch (error) {
           if (!(error instanceof AgentTokenReplacementError)) throw error
           await discardReplacementHandoff(env, handoff)
