@@ -18,13 +18,12 @@
 //   gate. The DO alarm path is naturally serialised (one DO at a time). HTTP
 //   dispatch concurrency is bounded by the member RBAC gate that sits above this.
 //
-// Cap sources (precedence: env var → default const):
+// Cap sources (resolved server-side before reservation):
 //   dispatch count : env.EXEC_MAX_DISPATCH_DAY ?? MAX_DISPATCHES_PER_DAY (200)
 //   token spend    : env.EXEC_MAX_TOKENS_DAY   ?? MAX_TOKENS_PER_DAY     (200_000)
-//   dollar budget  : agents.budget_cap_cents (from migration 0009), passed by the
-//                    caller as ReserveOpts.budgetCapCents; enforced over the
-//                    agent's budget_window ('day' → today's cost row; 'week' →
-//                    trailing-7-day sum of cost_micro_usd). null/≤0 ⇒ unlimited.
+//   dollar budget  : agents.budget_cap_cents (migration 0009), converted to
+//                    micro-USD and enforced over agents.budget_window. Public
+//                    callers never supply an agent, cap, window, or estimate.
 //
 // The dollar cap (issue #4) IS enforced here as an ENFORCEMENT-LAYER pre-call gate:
 // checkAndReserve blocks BEFORE any model spend once the window's recorded
@@ -32,7 +31,9 @@
 // REACHED but not EXCEEDED. This is a sensitive surface (eligibility/veto) — do NOT
 // change the cap logic without a matching adversarial gate pass.
 
-import type { Env } from '../types'
+import { authorizeExecutionScope } from '../auth/execution-scope'
+import type { Agent, AuthContext, Env } from '../types'
+import type { ToolOutcome } from '../mcp/index'
 
 // ── Default caps (overridable via env vars) ───────────────────────────────────
 
@@ -66,24 +67,71 @@ export type MeterResult = MeterCheckResult | MeterBlockResult
 export const MICRO_USD_PER_CENT = 10_000
 
 /**
- * Options for the dollar-cap enforcement (issue #4). Both are supplied by the
- * trusted caller from the already-loaded agent row:
- *   estimateMicroUsd — a CONSERVATIVE upper bound on this cycle's spend (cost.ts).
- *   budgetCapCents   — agents.budget_cap_cents; null/≤0 ⇒ no dollar cap (unlimited).
- * Omitting opts entirely preserves the pre-#4 behaviour (count + token caps only).
+ * Internal reservation authority. Every field is derived by an already-authorized
+ * server orchestrator; no MCP or REST input schema accepts this shape.
  */
-export interface ReserveOpts {
-  estimateMicroUsd?: number
-  /** Dollar cap in CENTS (agents.budget_cap_cents). Converted to micro-USD internally. */
-  budgetCapCents?: number | null
-  /**
-   * Dollar cap in MICRO-USD, taken VERBATIM (no lossy cents rounding). Preferred when
-   * the caller already has a micro-USD cap (the Loop manifest). When both are given,
-   * this wins. A positive value here can never collapse to "unlimited".
-   */
-  budgetCapMicroUsd?: number | null
-  /** agents.budget_window — the span the dollar cap covers. Default 'day'. */
-  budgetWindow?: 'day' | 'week'
+export interface AuthorizedExecution {
+  tenant: string
+  meterSubjectId: string
+  squadId: string
+  projectId: string | null
+  maxDispatchDay: number
+  maxTokensDay: number
+  maxCostMicroUsd: number
+  costWindow: 'day' | 'week'
+  estimateMicroUsd: number
+}
+
+export interface AuthorizedMeterPolicy {
+  meterSubjectId: string
+  squadId: string
+  projectId: string | null
+  maxCostMicroUsd: number
+  costWindow: 'day' | 'week'
+  estimateMicroUsd: number
+}
+
+/** Add server-owned tenant and dispatch/token ceilings to a resolved meter subject. */
+export function buildAuthorizedMeterExecution(
+  env: Env,
+  policy: AuthorizedMeterPolicy,
+): AuthorizedExecution {
+  return {
+    tenant: env.TENANT_SLUG,
+    meterSubjectId: policy.meterSubjectId,
+    squadId: policy.squadId,
+    projectId: policy.projectId,
+    maxDispatchDay: parseCap(env, 'EXEC_MAX_DISPATCH_DAY', MAX_DISPATCHES_PER_DAY),
+    maxTokensDay: parseCap(env, 'EXEC_MAX_TOKENS_DAY', MAX_TOKENS_PER_DAY),
+    maxCostMicroUsd: policy.maxCostMicroUsd,
+    costWindow: policy.costWindow,
+    estimateMicroUsd:
+      Number.isFinite(policy.estimateMicroUsd) && policy.estimateMicroUsd > 0
+        ? Math.round(policy.estimateMicroUsd)
+        : 0,
+  }
+}
+
+/**
+ * Build internal meter authority from the canonical agent row and server policy.
+ * The estimate is produced by the execution/loop cost model, never request JSON.
+ */
+export function buildAuthorizedExecution(
+  env: Env,
+  agent: Pick<Agent, 'id' | 'squad_id' | 'budget_cap_cents' | 'budget_window'>,
+  projectId: string | null,
+  estimateMicroUsd: number,
+): AuthorizedExecution {
+  return buildAuthorizedMeterExecution(env, {
+    meterSubjectId: agent.id,
+    squadId: agent.squad_id,
+    projectId,
+    maxCostMicroUsd: isEnforceableCap(agent.budget_cap_cents)
+      ? agent.budget_cap_cents * MICRO_USD_PER_CENT
+      : 0,
+    costWindow: agent.budget_window === 'week' ? 'week' : 'day',
+    estimateMicroUsd,
+  })
 }
 
 /**
@@ -129,10 +177,13 @@ export function isEnforceableCap(cap: number | null | undefined): cap is number 
  */
 export async function checkAndReserve(
   env: Env,
-  agentId: string,
-  opts: ReserveOpts = {},
+  execution: AuthorizedExecution,
 ): Promise<MeterResult> {
-  const windowKey = buildWindowKey(env.TENANT_SLUG, agentId)
+  if (execution.tenant !== env.TENANT_SLUG) {
+    throw new Error('authorized_execution_tenant_mismatch')
+  }
+
+  const windowKey = buildWindowKey(execution.tenant, execution.meterSubjectId)
   const now = new Date().toISOString()
 
   // Read current state before the increment to check caps. We read first so
@@ -147,8 +198,8 @@ export async function checkAndReserve(
   const currentTokens = existing?.tokens ?? 0
   const currentCost = existing?.cost_micro_usd ?? 0
 
-  const maxDispatches = parseCap(env, 'EXEC_MAX_DISPATCH_DAY', MAX_DISPATCHES_PER_DAY)
-  const maxTokens = parseCap(env, 'EXEC_MAX_TOKENS_DAY', MAX_TOKENS_PER_DAY)
+  const maxDispatches = execution.maxDispatchDay
+  const maxTokens = execution.maxTokensDay
 
   if (currentCount >= maxDispatches) {
     return {
@@ -176,23 +227,16 @@ export async function checkAndReserve(
   // The estimate is a CONSERVATIVE upper bound (cost.ts over-estimates unknown models,
   // #15), so we never under-count. Block if already at/over the cap, or if the next
   // cycle could breach it. The cap may be REACHED but not EXCEEDED.
-  // Resolve the cap to micro-USD. A verbatim micro cap (the Loop manifest) is used as
-  // given — never rounded — so an intentful sub-cent cap can never collapse to unlimited.
-  // Otherwise fall back to the cents cap (agents.budget_cap_cents).
-  const capMicroUsd =
-    isEnforceableCap(opts.budgetCapMicroUsd)
-      ? opts.budgetCapMicroUsd
-      : isEnforceableCap(opts.budgetCapCents)
-        ? opts.budgetCapCents * MICRO_USD_PER_CENT
-        : null
+  const capMicroUsd = isEnforceableCap(execution.maxCostMicroUsd)
+    ? execution.maxCostMicroUsd
+    : null
   if (capMicroUsd !== null) {
-    const estimate =
-      opts.estimateMicroUsd && opts.estimateMicroUsd > 0 ? Math.round(opts.estimateMicroUsd) : 0
+    const estimate = execution.estimateMicroUsd
     // Enforce over the agent's budget_window: 'day' → today's cost row; 'week' →
     // trailing-7-day sum (so a weekly cap is not silently enforced as ~7 daily caps).
     const spanCost =
-      opts.budgetWindow === 'week'
-        ? await sumWeekCostMicroUsd(env, env.TENANT_SLUG, agentId)
+      execution.costWindow === 'week'
+        ? await sumWeekCostMicroUsd(env, execution.tenant, execution.meterSubjectId)
         : currentCost
     if (spanCost >= capMicroUsd || spanCost + estimate > capMicroUsd) {
       return {
@@ -230,6 +274,52 @@ export async function checkAndReserve(
     windowKey,
     count: post?.count ?? currentCount + 1,
     tokens: post?.tokens ?? 0,
+  }
+}
+
+/**
+ * Public read-only meter status. Authorization is resolved before the first
+ * execution_meter query, so denied callers cannot learn spend or counts.
+ */
+export async function getAuthorizedMeterStatus(
+  env: Env,
+  auth: AuthContext,
+  agentId?: string,
+): Promise<ToolOutcome> {
+  const targetAgentId = agentId ?? auth.boundAgentId ?? null
+  if (!targetAgentId) return { ok: false, status: 403, error: 'forbidden' }
+
+  try {
+    const decision = await authorizeExecutionScope(env, auth, {
+      action: 'meter:read',
+      agentId: targetAgentId,
+    })
+    if (!decision.ok) return decision
+    if (!decision.agentId) return { ok: false, status: 503, error: 'service_unavailable' }
+
+    const windowKey = buildWindowKey(decision.tenant, decision.agentId)
+    const current = await env.DB.prepare(
+      `SELECT count, tokens, cost_micro_usd
+         FROM execution_meter
+        WHERE window_key = ?1
+        LIMIT 1`,
+    ).bind(windowKey).first<{ count: number; tokens: number; cost_micro_usd: number }>()
+    const weekCost = await sumWeekCostMicroUsd(env, decision.tenant, decision.agentId)
+
+    return {
+      ok: true,
+      result: {
+        agent_id: decision.agentId,
+        squad_id: decision.squadId,
+        window_key: windowKey,
+        dispatches_day: current?.count ?? 0,
+        tokens_day: current?.tokens ?? 0,
+        cost_micro_usd_day: current?.cost_micro_usd ?? 0,
+        cost_micro_usd_week: weekCost,
+      },
+    }
+  } catch {
+    return { ok: false, status: 503, error: 'service_unavailable' }
   }
 }
 
