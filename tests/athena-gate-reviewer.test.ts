@@ -50,11 +50,13 @@ diff --git a/tests/greet.test.ts b/tests/greet.test.ts
 +})
 `
 
+const SYNTHETIC_OPENAI_KEY = ['sk', 'abcdefghijklmnopqrstuvwxyz123456'].join('-')
+
 const SECRET_DIFF = `diff --git a/src/client.ts b/src/client.ts
 --- a/src/client.ts
 +++ b/src/client.ts
 @@ -1,2 +1,3 @@
-+const API_KEY = "sk-abcdefghijklmnopqrstuvwxyz123456"
++const API_KEY = "${SYNTHETIC_OPENAI_KEY}"
  export const url = 'https://api.example.com'
 `
 
