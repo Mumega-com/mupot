@@ -14,9 +14,21 @@ export type ExecutionScopeDecision =
 const forbidden = (): ExecutionScopeDecision => ({ ok: false, status: 403, error: 'forbidden' })
 const notFound = (): ExecutionScopeDecision => ({ ok: false, status: 404, error: 'not_found' })
 
-async function principalGrants(env: Env, auth: AuthContext) {
-  if (!auth.memberId) return []
-  return resolveCapabilities(env, auth.memberId)
+async function principalCanOnSquad(
+  env: Env,
+  auth: AuthContext,
+  squadId: string,
+  min: 'observer' | 'lead',
+): Promise<boolean> {
+  if (!auth.memberId) return false
+
+  // A durable lookup catches revoked grants, but cannot restore authority the
+  // authenticated session has already had removed. In particular, directory
+  // sessions use capabilities: [] as their B1 ambient ceiling.
+  const durableGrants = await resolveCapabilities(env, auth.memberId)
+  if (!(await canOnSquad(env, durableGrants, squadId, min))) return false
+  if (auth.capabilities === undefined) return true
+  return canOnSquad(env, auth.capabilities, squadId, min)
 }
 
 async function authorizeRouterScope(
@@ -29,9 +41,8 @@ async function authorizeRouterScope(
     .first<{ id: string }>()
   if (!squad) return notFound()
 
-  const grants = await principalGrants(env, auth)
   const required = request.action === 'router:read' ? 'observer' : 'lead'
-  if (!(await canOnSquad(env, grants, squad.id, required))) return forbidden()
+  if (!(await principalCanOnSquad(env, auth, squad.id, required))) return forbidden()
 
   return {
     ok: true,
@@ -67,8 +78,7 @@ async function authorizeMeterScope(
     return forbidden()
   }
 
-  const grants = await principalGrants(env, auth)
-  if (!(await canOnSquad(env, grants, agent.squad_id, 'lead'))) return forbidden()
+  if (!(await principalCanOnSquad(env, auth, agent.squad_id, 'lead'))) return forbidden()
 
   return {
     ok: true,
