@@ -54,15 +54,18 @@ export type AgentTokenExpiryResolution =
  * Resolve the one expiry policy shared by every agent-token mint surface.
  *
  * Missing expiry input receives the standard 30-day lifetime.  Non-expiring
- * credentials are the explicit owner-only exception; zero, negative, non-finite,
- * fractional, and excessively long values are refusals rather than an accidental
- * conversion to a non-expiring token.
+ * credentials are the explicit owner-only exception; supplying both modes, or a
+ * zero, negative, non-finite, fractional, or excessively long value, is refused
+ * rather than converted to a non-expiring token.
  */
 export function resolveAgentTokenExpiry(input: {
   expiresInDays?: number
   nonExpiring?: boolean
   allowNonExpiring: boolean
 }): AgentTokenExpiryResolution {
+  if (input.nonExpiring && input.expiresInDays !== undefined) {
+    return { ok: false, code: 'invalid_expiry' }
+  }
   if (input.nonExpiring) {
     return input.allowNonExpiring
       ? { ok: true, expiresAt: null }

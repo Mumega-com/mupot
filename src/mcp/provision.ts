@@ -25,7 +25,7 @@
 //                        redeem via reveal_credential_claim)
 //   register_agent_key — admin on the agent's squad → public-only signed-runtime identity
 
-import type { Capability, CapabilityGrant, Env, BusEvent, Squad } from '../types'
+import type { Capability, CapabilityGrant, ConnectionChannel, Env, BusEvent, Squad } from '../types'
 import { hasCapability } from '../auth/capability'
 import {
   createDepartment,
@@ -41,12 +41,14 @@ import {
   mintAgentBoundToken,
   isAgentTokenCapability,
   AgentTokenReplacementError,
+  assertAgentTokenReplacementPriorLive,
   activateAgentTokenReplacement,
   cancelAgentTokenReplacementReservation,
   findAgentTokenReplacementHandoff,
   markAgentTokenReplacementAuditSent,
   markAgentTokenReplacementClaimReady,
   isAgentTokenReplacementClaimReady,
+  loadAgentTokenReplacementMetadata,
   prepareAgentTokenReplacement,
   resolveAgentMemberBinding,
   stageAgentTokenReplacement,
@@ -58,6 +60,7 @@ import {
   credentialClaimIsAvailable,
   discardCredentialClaim,
   CLAIM_TTL_SECONDS,
+  type CredentialClaimHandle,
 } from '../auth/credential-claim'
 import { revokeMemberToken } from '../members/service'
 import { setAgentSquadAccess, type AgentAccessCapability } from '../members/agent-access'
@@ -179,6 +182,54 @@ async function emitProvisioned(
       id,
     })
   }
+}
+
+function agentTokenMintResponse(
+  env: Env,
+  canonicalOrigin: string,
+  agent: { id: string; squad_id: string; slug: string; name: string },
+  token: {
+    id: string
+    memberId: string
+    label: string
+    channel: ConnectionChannel
+    capability: 'observer' | 'member'
+    createdAt: string
+  },
+  credentialClaim: CredentialClaimHandle,
+) {
+  return {
+    token: {
+      id: token.id,
+      member_id: token.memberId,
+      agent_id: agent.id,
+      label: token.label,
+      channel: token.channel,
+      capability: token.capability,
+      created_at: token.createdAt,
+    },
+    credential_claim: credentialClaim,
+    agent: { id: agent.id, slug: agent.slug, name: agent.name },
+    mcp_endpoint: mcpEndpoint(canonicalOrigin),
+    wake_contract: wakeContractForAgent(
+      agent.id,
+      agent.squad_id,
+      env.TENANT_SLUG,
+      canonicalOrigin,
+    ),
+    note:
+      'the raw token is NOT in this result. Call reveal_credential_claim '
+      + `{ claim_id: credential_claim.claim_id } within ${CLAIM_TTL_SECONDS / 60} minutes to redeem it — `
+      + 'exactly once, as this same caller. It is never retrievable again after that.',
+  }
+}
+
+async function discardReplacementHandoff(
+  env: Env,
+  handoff: Parameters<typeof cancelAgentTokenReplacementReservation>[1],
+): Promise<void> {
+  await discardCredentialClaim(env, handoff.claim.claimId)
+  await cancelAgentTokenReplacementReservation(env, handoff)
 }
 
 // Ref resolvers (id-first, slug-with-ambiguity-refusal) are shared in ../org/resolve
@@ -549,11 +600,14 @@ const toolMintAgentToken: ToolSpec = {
           if (err instanceof AgentTokenReplacementError) return fail(409, 'replacement_token_unavailable')
           return fail(503, 'replacement_handoff_unavailable')
         }
+        let claimCreated = false
         try {
           await createCredentialClaim(env, prepared.raw, auth.memberId as string, handoff.claim.claimId)
+          claimCreated = true
           await markAgentTokenReplacementClaimReady(env, handoff.id)
         } catch {
           try {
+            if (claimCreated) await discardCredentialClaim(env, handoff.claim.claimId)
             await cancelAgentTokenReplacementReservation(env, handoff)
           } catch {
             // The reservation remains inactive and retryable; it never revokes the prior.
@@ -563,6 +617,13 @@ const toolMintAgentToken: ToolSpec = {
       }
 
       try {
+        try {
+          await assertAgentTokenReplacementPriorLive(env, handoff)
+        } catch (error) {
+          if (!(error instanceof AgentTokenReplacementError)) throw error
+          await discardReplacementHandoff(env, handoff)
+          return fail(409, 'replacement_token_unavailable')
+        }
         // D1 readiness records that claim creation completed once; it does not
         // prove the one-time KV claim is still revealable on this retry. Check
         // the live cross-system boundary before every audit attempt. If it has
@@ -575,8 +636,7 @@ const toolMintAgentToken: ToolSpec = {
           // durable-ready claim that has since disappeared is stale enough to
           // discard; an in-flight claim remains reserved and retryable.
           if (claimReady) {
-            await discardCredentialClaim(env, handoff.claim.claimId)
-            await cancelAgentTokenReplacementReservation(env, handoff)
+            await discardReplacementHandoff(env, handoff)
           }
           return fail(503, 'replacement_handoff_pending')
         }
@@ -584,6 +644,13 @@ const toolMintAgentToken: ToolSpec = {
           await markAgentTokenReplacementClaimReady(env, handoff.id)
         }
         if (handoff.auditState === 'pending') {
+          try {
+            await assertAgentTokenReplacementPriorLive(env, handoff)
+          } catch (error) {
+            if (!(error instanceof AgentTokenReplacementError)) throw error
+            await discardReplacementHandoff(env, handoff)
+            return fail(409, 'replacement_token_unavailable')
+          }
           await emitProvisioned(env, auth.memberId as string, 'token', handoff.replacementTokenId, {
             squad_id: agent.squad_id,
             agent_id: agent.id,
@@ -591,15 +658,13 @@ const toolMintAgentToken: ToolSpec = {
             reason: 'replacement_handoff_pending',
           }, true)
           if (!(await credentialClaimIsAvailable(env, handoff.claim.claimId, auth.memberId as string))) {
-            await discardCredentialClaim(env, handoff.claim.claimId)
-            await cancelAgentTokenReplacementReservation(env, handoff)
+            await discardReplacementHandoff(env, handoff)
             return fail(503, 'replacement_handoff_pending')
           }
           handoff = await markAgentTokenReplacementAuditSent(env, handoff.id)
         }
         if (!(await credentialClaimIsAvailable(env, handoff.claim.claimId, auth.memberId as string))) {
-          await discardCredentialClaim(env, handoff.claim.claimId)
-          await cancelAgentTokenReplacementReservation(env, handoff)
+          await discardReplacementHandoff(env, handoff)
           return fail(503, 'replacement_handoff_pending')
         }
         if (handoff.state === 'pending') handoff = await activateAgentTokenReplacement(env, handoff.id)
@@ -608,25 +673,25 @@ const toolMintAgentToken: ToolSpec = {
         return fail(503, 'replacement_handoff_pending')
       }
 
-      return done({
-        token: {
-          id: handoff.replacementTokenId,
-          member_id: handoff.memberId,
-          agent_id: agent.id,
-          label,
-          channel: 'workspace',
-          capability: grantCapability,
-          created_at: handoff.createdAt,
-        },
-        credential_claim: {
-          claim_id: handoff.claim.claimId,
-          fingerprint: handoff.claim.fingerprint,
-          expires_at: handoff.claim.expiresAt,
-          reveal_tool: 'reveal_credential_claim',
-        },
-        agent: { id: agent.id, slug: agent.slug, name: agent.name },
-        mcp_endpoint: mcpEndpoint(canonical.origin),
-      })
+      let persisted
+      try {
+        persisted = await loadAgentTokenReplacementMetadata(env, handoff.id)
+      } catch {
+        return fail(503, 'replacement_handoff_pending')
+      }
+      return done(agentTokenMintResponse(env, canonical.origin, agent, {
+        id: handoff.replacementTokenId,
+        memberId: handoff.memberId,
+        label: persisted.label,
+        channel: persisted.channel,
+        capability: persisted.capability,
+        createdAt: persisted.createdAt,
+      }, {
+        claim_id: handoff.claim.claimId,
+        fingerprint: handoff.claim.fingerprint,
+        expires_at: handoff.claim.expiresAt,
+        reveal_tool: 'reveal_credential_claim',
+      }))
     }
 
     // Delegate ordinary mints to the shared atomic helper (members/service.ts).
@@ -671,30 +736,14 @@ const toolMintAgentToken: ToolSpec = {
     // bus HTTP surface. Returned alongside mcp_endpoint so the operator has the full
     // self-serve picture in one flow — no manual tmux or shell access required.
     const credentialClaim = await createCredentialClaim(env, minted.raw, auth.memberId as string)
-    return done({
-      token: {
-        id: minted.tokenId,
-        member_id: minted.memberId,
-        agent_id: agent.id,
-        label,
-        channel: 'workspace',
-        capability: minted.grantCapability,
-        created_at: minted.createdAt,
-      },
-      credential_claim: credentialClaim,
-      agent: { id: agent.id, slug: agent.slug, name: agent.name },
-      mcp_endpoint: mcpEndpoint(canonical.origin),
-      wake_contract: wakeContractForAgent(
-        agent.id,
-        agent.squad_id,
-        env.TENANT_SLUG,
-        canonical.origin,
-      ),
-      note:
-        'the raw token is NOT in this result. Call reveal_credential_claim '
-        + `{ claim_id: credential_claim.claim_id } within ${CLAIM_TTL_SECONDS / 60} minutes to redeem it — `
-        + 'exactly once, as this same caller. It is never retrievable again after that.',
-    })
+    return done(agentTokenMintResponse(env, canonical.origin, agent, {
+      id: minted.tokenId,
+      memberId: minted.memberId,
+      label: minted.label,
+      channel: 'workspace',
+      capability: minted.grantCapability,
+      createdAt: minted.createdAt,
+    }, credentialClaim))
   },
 }
 
