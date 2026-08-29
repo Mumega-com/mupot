@@ -305,6 +305,8 @@ function createReplacementSurfaceEnv(opts: {
   claimBarrier?: { entered(): void; wait: Promise<void> }
   kvNowMs?: { value: number }
   stageBatchError?: { value: Error | null }
+  markReadyFails?: { value: boolean }
+  cancelBatchFails?: { value: boolean }
 } = {}): {
   env: Env
   sqlite: ReturnType<typeof createSqliteD1>['sqlite']
@@ -325,7 +327,23 @@ function createReplacementSurfaceEnv(opts: {
     env: {
       ...harness.env,
       DB: {
-        prepare: db.prepare.bind(db),
+        prepare: (sql: string) => {
+          const statement = db.prepare(sql)
+          if (!sql.includes("SET claim_state = 'ready'")) return statement
+          return {
+            ...statement,
+            bind: (...values: unknown[]) => {
+              const bound = statement.bind(...values)
+              return {
+                ...bound,
+                run: async () => {
+                  if (opts.markReadyFails?.value) throw new Error('mark-ready unavailable')
+                  return bound.run()
+                },
+              } as unknown as D1PreparedStatement
+            },
+          } as unknown as D1PreparedStatement
+        },
         batch: async (statements: D1PreparedStatement[]) => {
           if (
             opts.stageBatchError?.value
@@ -333,6 +351,13 @@ function createReplacementSurfaceEnv(opts: {
               (statement as unknown as { sql?: string }).sql?.includes('agent_token_rotation_handoffs'))
           ) {
             throw opts.stageBatchError.value
+          }
+          if (
+            opts.cancelBatchFails?.value
+            && statements.some((statement) =>
+              (statement as unknown as { sql?: string }).sql?.includes('DELETE FROM agent_token_rotation_handoffs'))
+          ) {
+            throw new Error('cancel unavailable')
           }
           return db.batch(statements)
         },
@@ -954,6 +979,64 @@ describe('mintAgentBoundToken — canonical SQLite identity', () => {
       expect(content.wake_contract?.emit_url).toBe('https://mupot.mumega.com/bus/emit')
       expect(content.note).toContain('reveal_credential_claim')
       expect(JSON.stringify(content)).not.toMatch(/mupot_[0-9a-f]{64}|token_hash|"raw"\s*:/)
+    } finally {
+      surface.close()
+    }
+  })
+
+  it('lost_success_retry_returns_same_active_handoff_claim_without_burning_it', async () => {
+    const surface = createReplacementSurfaceEnv()
+    try {
+      await seedReplacementSurfaceOperator(surface)
+      const prior = await mintAgentBoundToken(surface.env, AGENT, 'prior')
+
+      expect((await callReplacementMint(surface.env, prior.tokenId)).status).toBe(200)
+      const completed = surface.sqlite.prepare(
+        'SELECT id, claim_id, replacement_token_id, state FROM agent_token_rotation_handoffs WHERE prior_token_id = ?',
+      ).get(prior.tokenId) as { id: string; claim_id: string; replacement_token_id: string; state: string }
+
+      const retry = await callReplacementMint(surface.env, prior.tokenId)
+      const body = (await retry.json()) as {
+        result: { structuredContent: { credential_claim: { claim_id: string }; token: { id: string } } }
+      }
+
+      expect(retry.status).toBe(200)
+      expect(body.result.structuredContent.credential_claim.claim_id).toBe(completed.claim_id)
+      expect(body.result.structuredContent.token.id).toBe(completed.replacement_token_id)
+      expect(completed.state).toBe('active')
+      expect(credentialClaimCount(surface)).toBe(1)
+      expect(surface.bus).toHaveLength(1)
+      expect(surface.sqlite.prepare('SELECT COUNT(*) AS count FROM agent_token_rotation_handoffs').get())
+        .toEqual({ count: 1 })
+      expect(surface.sqlite.prepare(
+        'SELECT COUNT(*) AS count FROM member_tokens WHERE agent_id = ? AND revoked_at IS NULL',
+      ).get(AGENT.id)).toEqual({ count: 1 })
+    } finally {
+      surface.close()
+    }
+  })
+
+  it('mark_ready_and_cancel_double_failure_preserves_claim_for_retry', async () => {
+    const markReadyFails = { value: true }
+    const cancelBatchFails = { value: true }
+    const surface = createReplacementSurfaceEnv({ markReadyFails, cancelBatchFails })
+    try {
+      await seedReplacementSurfaceOperator(surface)
+      const prior = await mintAgentBoundToken(surface.env, AGENT, 'prior')
+
+      expect((await callReplacementMint(surface.env, prior.tokenId)).status).toBe(503)
+      markReadyFails.value = false
+      cancelBatchFails.value = false
+
+      expect((await callReplacementMint(surface.env, prior.tokenId)).status).toBe(200)
+      expect(credentialClaimCount(surface)).toBe(1)
+      expect(surface.bus).toHaveLength(1)
+      expect(surface.sqlite.prepare(
+        "SELECT claim_state, audit_state, state FROM agent_token_rotation_handoffs",
+      ).get()).toEqual({ claim_state: 'ready', audit_state: 'sent', state: 'active' })
+      expect(surface.sqlite.prepare(
+        'SELECT COUNT(*) AS count FROM member_tokens WHERE agent_id = ? AND revoked_at IS NULL',
+      ).get(AGENT.id)).toEqual({ count: 1 })
     } finally {
       surface.close()
     }

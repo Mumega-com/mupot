@@ -287,6 +287,19 @@ export async function assertAgentTokenReplacementPriorLive(
   await assertLiveReplacementToken(env, handoff.agentId, handoff.memberId, handoff.priorTokenId)
 }
 
+/** Resume against the credential that must be live for the handoff's durable
+ * state. Pending handoffs still depend on their prior; active handoffs have
+ * intentionally revoked that prior and depend on the committed replacement. */
+export async function assertAgentTokenReplacementResumeLive(
+  env: Env,
+  handoff: AgentTokenReplacementHandoff,
+): Promise<void> {
+  const tokenId = handoff.state === 'active'
+    ? handoff.replacementTokenId
+    : handoff.priorTokenId
+  await assertLiveReplacementToken(env, handoff.agentId, handoff.memberId, tokenId)
+}
+
 /**
  * Prepare, but do not commit, an agent-bound token mint. Provisioning composes
  * these statements into its larger request/receipt transaction.
