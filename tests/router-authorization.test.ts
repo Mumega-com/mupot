@@ -335,6 +335,28 @@ describe('router_tick authorization and squad fencing', () => {
     expect(result).toMatchObject({ ok: false, status: 400, error: 'invalid_args' })
     expect(writes.value).toBe(0)
   })
+
+  it('rejects null dry_run before task, wake, or presence writes', async () => {
+    insertTask(harness.sqlite, 'task-a', SQUAD_A)
+    const writes = { value: 0 }
+    const { env, events } = makeEnv(harness, { writes })
+    const deferred: Promise<unknown>[] = []
+
+    const result = await invokeTool(
+      auth('lead-a', [grant('lead-a', 'lead', SQUAD_A)]),
+      env,
+      'router_tick',
+      { squad_id: SQUAD_A, dry_run: null },
+      { origin: 'https://pot.example', waitUntil: (promise) => deferred.push(promise) },
+    )
+    await Promise.all(deferred)
+
+    expect(result).toMatchObject({ ok: false, status: 400, error: 'invalid_args' })
+    expect(writes.value).toBe(0)
+    expect(events).toHaveLength(0)
+    expect(harness.sqlite.prepare('SELECT assignee_agent_id FROM tasks WHERE id = ?').get('task-a')).toEqual({ assignee_agent_id: null })
+    expect(harness.sqlite.prepare('SELECT member_id FROM presence WHERE tenant = ? AND member_id = ?').get(TENANT, 'lead-a')).toBeUndefined()
+  })
 })
 
 describe('root-mounted router REST route', () => {
