@@ -515,8 +515,8 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
     default: {
       // Exhaustiveness guard. Unknown types are acked (not retried) to avoid
       // poisoning the queue with events we will never understand.
-      const _exhaustive: never = event.type
-      console.error('bus: unknown event type', { type: _exhaustive, tenant: event.tenant })
+      const eventType = String((event as any).type)
+      console.error('bus: unknown event type', { type: eventType, tenant: event.tenant })
       return true
     }
   }

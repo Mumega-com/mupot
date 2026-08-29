@@ -60,7 +60,9 @@ potsApp.get('/', async (c) => {
   }
 
   try {
-    const list = await listSovereignPots(c.env)
+    const accountId = c.env.SECRET_ENV_CF_ACCOUNT_ID || 'e39eaf94f33092c4efd029d94ae1e9dd'
+    const apiToken = c.env.SECRET_ENV_CF_API_TOKEN || ''
+    const list = await listSovereignPots({ accountId, apiToken })
     return c.json({ ok: true, pots: list })
   } catch (err) {
     return c.json(

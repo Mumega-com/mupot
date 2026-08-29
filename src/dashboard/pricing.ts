@@ -1,9 +1,9 @@
 // src/dashboard/pricing.ts — Public Pricing & Sovereign Pot Self-Serve Onboarding Portal.
 
-import { html, raw } from 'hono/html'
+import { html } from 'hono/html'
 import type { HtmlEscapedString } from 'hono/utils/html'
 
-export function pricingPageHtml(origin: string = 'https://mupot.mumega.com'): HtmlEscapedString {
+export function pricingPageHtml(_origin: string = 'https://mupot.mumega.com'): Promise<HtmlEscapedString> | HtmlEscapedString {
   return html`<!doctype html>
 <html lang="en">
   <head>

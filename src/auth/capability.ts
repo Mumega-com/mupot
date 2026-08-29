@@ -140,11 +140,11 @@ export function isOrgAdmin(auth: AuthContext | null | undefined): boolean {
  */
 export async function resolveCapabilities(env: Env, memberId: string): Promise<CapabilityGrant[]> {
   const rows = await env.DB.prepare(
-    `SELECT member_id, scope_type, scope_id, capability, NULL AS resource
+    `SELECT member_id, scope_type, scope_id, capability
        FROM capabilities
       WHERE member_id = ?1
      UNION ALL
-     SELECT member_id, 'squad' AS scope_type, squad_id AS scope_id, capability, NULL AS resource
+     SELECT member_id, 'squad' AS scope_type, squad_id AS scope_id, capability
        FROM channel_capability_grants
       WHERE member_id = ?1`,
   )
@@ -159,7 +159,7 @@ export async function resolveCapabilities(env: Env, memberId: string): Promise<C
  */
 export async function resolveTokenGrants(env: Env, tokenId: string): Promise<CapabilityGrant[] | null> {
   const rows = await env.DB.prepare(
-    `SELECT token_id AS member_id, scope_type, scope_id, capability, resource
+    `SELECT token_id AS member_id, scope_type, scope_id, capability
        FROM token_grants
       WHERE token_id = ?1 AND tenant = ?2`,
   )

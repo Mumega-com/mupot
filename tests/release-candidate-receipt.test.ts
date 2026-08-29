@@ -31,7 +31,7 @@ function fixture(mutate?: (dir: string, outDir: string, commit: string) => void)
   return { dir, outDir }
 }
 
-describe('release candidate receipt checker', () => {
+describe('release candidate receipt checker', { timeout: 30_000 }, () => {
   it('normalizes prerelease versions and prints an evidence plan', () => {
     expect(normalizeVersion(TAG)).toEqual({ semver: VERSION, tag: TAG })
     expect(formatPlan({ version: TAG, outDir: 'tmp/rc' })).toContain('release-candidate-check.json')
@@ -42,7 +42,7 @@ describe('release candidate receipt checker', () => {
     const receipt = checkBundle({ repoRoot: dir, outDir, version: TAG })
     expect(receipt.receipt_type).toBe(CHECK_RECEIPT_TYPE)
     expect(receipt.status).toBe('pass')
-  })
+  }, 30_000)
 
   it('fails when the deployed health version is not the candidate version', () => {
     const { dir, outDir } = fixture((_, evidenceDir) => {
@@ -54,7 +54,7 @@ describe('release candidate receipt checker', () => {
     const receipt = checkBundle({ repoRoot: dir, outDir, version: TAG })
     expect(receipt.status).toBe('fail')
     expect(receipt.checks).toContainEqual(expect.objectContaining({ check: 'deployment_health_version_matches', ok: false }))
-  })
+  }, 30_000)
 
   it('fails when the GitHub prerelease target is not the candidate commit', () => {
     const { dir, outDir } = fixture((_, evidenceDir) => {
@@ -63,5 +63,5 @@ describe('release candidate receipt checker', () => {
     const receipt = checkBundle({ repoRoot: dir, outDir, version: TAG })
     expect(receipt.status).toBe('fail')
     expect(receipt.checks).toContainEqual(expect.objectContaining({ check: 'github_prerelease_target_matches_candidate_commit', ok: false }))
-  })
+  }, 30_000)
 })

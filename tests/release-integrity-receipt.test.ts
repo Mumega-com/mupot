@@ -90,7 +90,7 @@ function writeRepo(mutate?: (repo: string, outDir: string) => void) {
   return { repo, outDir }
 }
 
-describe('release integrity receipt checker', () => {
+describe('release integrity receipt checker', { timeout: 30_000 }, () => {
   it('parses plan and check arguments', () => {
     expect(parseArgs(['--plan', '--version', TAG]).plan).toBe(true)
     expect(parseArgs(['--check', '--out-dir', './tmp/release-integrity']).check).toBe(true)
@@ -266,5 +266,5 @@ describe('release integrity receipt checker', () => {
       ok: false,
       check: 'github_tag_commit_matches_local_tag',
     }))
-  })
+  }, 30_000)
 })

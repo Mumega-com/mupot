@@ -12,7 +12,7 @@
 import type { ToolSpec } from './index'
 import { fail, done, str } from './index'
 import type { Env, AuthContext } from '../types'
-import { recordCheckin, resolveSeatLabel } from '../fleet/presence'
+import { recordCheckin } from '../fleet/presence'
 import { extractContinuumName } from './index'
 
 export interface MintBodyInput {
@@ -102,6 +102,7 @@ export const toolMintBody: ToolSpec = {
       await recordCheckin(env, {
         memberId: principalId,
         displayName: auth.email || continuum,
+        email: auth.email ?? null,
         boundAgentId: auth.boundAgentId ?? null,
       }, {
         seat: compositeSeat,

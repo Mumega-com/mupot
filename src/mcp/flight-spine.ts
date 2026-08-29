@@ -659,7 +659,6 @@ import {
   validateRunSheet,
   getExecutableStages,
   computeArtifactSha256,
-  type RunSheetV1,
 } from '../flight/run-sheets'
 
 const toolRunSheetValidate: ToolSpec = {

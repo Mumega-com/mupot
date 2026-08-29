@@ -28,6 +28,7 @@ const TYPE_LABELS: Record<ConnectorType, string> = {
   crm:                   'CRM',
   linear:     'Linear',
   notion:     'Notion',
+  supabase:   'Supabase',
   custom:     'Custom',
 }
 

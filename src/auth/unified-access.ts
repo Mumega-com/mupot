@@ -15,7 +15,6 @@ export interface TokenScopeGrantInput {
   scope_type: CapabilityScopeType
   scope_id?: string | null
   capability: Capability
-  resource?: string | null
 }
 
 export interface CreateAccessKeyInput {
@@ -86,8 +85,8 @@ export async function createAccessKey(
       const grantId = crypto.randomUUID()
       await env.DB.prepare(
         `INSERT INTO token_grants
-           (id, token_id, tenant, scope_type, scope_id, capability, resource, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)`,
+           (id, token_id, tenant, scope_type, scope_id, capability, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
       )
         .bind(
           grantId,
@@ -96,7 +95,6 @@ export async function createAccessKey(
           g.scope_type,
           g.scope_id ?? null,
           g.capability,
-          g.resource ?? null,
           now,
         )
         .run()

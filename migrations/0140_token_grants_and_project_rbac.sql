@@ -18,7 +18,6 @@ CREATE TABLE IF NOT EXISTS token_grants (
   scope_type TEXT NOT NULL CHECK (scope_type IN ('org', 'department', 'squad', 'project')),
   scope_id TEXT, -- null for org
   capability TEXT NOT NULL CHECK (capability IN ('owner', 'admin', 'lead', 'member', 'observer')),
-  resource TEXT, -- optional fine-grain filter: e.g. project_id, 'cro:*', 'tools:read'
   created_at TEXT NOT NULL,
   FOREIGN KEY (token_id) REFERENCES member_tokens(id) ON DELETE CASCADE
 );

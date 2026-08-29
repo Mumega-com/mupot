@@ -26,11 +26,11 @@ import { createTask } from '../tasks/service'
 import { peekSessionAuth } from '../auth'
 import { MUPOT_FAVICON_32_PNG_B64, MUPOT_MARK_64_PNG_B64 } from './brand-assets'
 import { readStudioChatPayload, streamStudioChat } from './copilot'
-import { handleStudioChat, type StudioChatRole } from './studio-chat'
+import type { StudioChatRole } from './studio-chat'
 
 import { resolveTier } from '../billing/entitlement'
 import { listPresence } from '../fleet/presence'
-import { listConnectors, resolveConnector } from '../connectors/service'
+import { resolveConnector } from '../connectors/service'
 import { introspectSupabaseSchema } from '../connectors/supabase'
 
 export {
@@ -116,8 +116,8 @@ export async function loadStudioData(env: Env, auth: AuthContext): Promise<Studi
       'SELECT id, slug, name, role, model FROM agents WHERE status = "active" ORDER BY created_at ASC LIMIT 16'
     ).all<{ id: string; slug: string; name: string; role: string; model: string }>()
 
-    const presenceList = await listPresence(env)
-    const presenceMap = new Map(presenceList.map((p) => [p.bound_agent_id, p]))
+    const presenceList = await listPresence(env, Date.now())
+    const presenceMap = new Map(presenceList.map((p) => [p.agent_id, p]))
 
     agents = (agentRows.results || []).map((a) => {
       const p = presenceMap.get(a.id)
@@ -127,7 +127,7 @@ export async function loadStudioData(env: Env, auth: AuthContext): Promise<Studi
         name: a.name,
         role: a.role,
         model: a.model,
-        activeSeat: p?.seat || null,
+        activeSeat: p?.label || null,
         harness: p?.harness || null,
         provider: p?.provider || null,
         isLive: !!p && (Date.now() - new Date(p.last_seen_at).getTime() < 300_000),
@@ -1082,7 +1082,7 @@ studioApp.post('/chat', async (c) => {
     try {
       auth = getAuthContext(c as Context<AppEnv>)
     } catch {
-      auth = (await peekSessionAuth(c.env, c.req.raw)) ?? undefined
+      auth = (await peekSessionAuth(c as any)) ?? undefined
     }
   }
   const parsed = await readStudioChatPayload(c.req.raw)

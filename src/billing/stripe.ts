@@ -257,7 +257,8 @@ export async function handleStripeWebhookEvent(
         await bus.emit({
           type: 'billing.subscription.created',
           actor: { kind: 'external', id: `stripe:${customerId || 'checkout'}` },
-          target: { kind: 'pot', id: env.TENANT_SLUG },
+          tenant: env.TENANT_SLUG,
+          ts: new Date().toISOString(),
           payload: {
             tier,
             customer_id: customerId,
@@ -284,7 +285,8 @@ export async function handleStripeWebhookEvent(
         await bus.emit({
           type: 'billing.subscription.deleted',
           actor: { kind: 'external', id: `stripe:${sub.customer || 'sub'}` },
-          target: { kind: 'pot', id: env.TENANT_SLUG },
+          tenant: env.TENANT_SLUG,
+          ts: new Date().toISOString(),
           payload: {
             previous_subscription_id: sub.id,
             tier: 'free',

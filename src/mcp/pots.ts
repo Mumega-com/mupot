@@ -1,42 +1,10 @@
 // src/mcp/pots.ts — Sovereign Pot Provisioning MCP Tools.
 
-import type { AuthContext, Env } from '../types'
+import type { ToolSpec } from './index'
+import { fail, done, str } from './index'
 import { isOrgAdmin, callerHoldsActionCapability } from '../auth/capability'
 import { provisionSovereignPot, listSovereignPots } from '../pots/service'
 import type { SovereignPotProvisionInput } from '../pots/types'
-
-export interface ToolOutcome {
-  ok: boolean
-  status: number
-  body: unknown
-  tool?: string
-}
-
-export interface ToolSpec {
-  name: string
-  scope: string
-  min: 'authenticated' | 'member' | 'lead' | 'admin' | 'owner'
-  args: string
-  inputSchema: {
-    type: 'object'
-    properties: Record<string, unknown>
-    required?: string[]
-    additionalProperties?: boolean
-  }
-  run: (auth: AuthContext, env: Env, args: Record<string, unknown>, ctx?: unknown) => Promise<ToolOutcome>
-}
-
-function done(result: unknown): ToolOutcome {
-  return { ok: true, status: 200, body: result }
-}
-
-function fail(status: number, error: string, detail?: unknown): ToolOutcome {
-  return { ok: false, status, body: { ok: false, error, detail } }
-}
-
-function str(val: unknown): string | null {
-  return typeof val === 'string' && val.trim().length > 0 ? val.trim() : null
-}
 
 const STRING_SCHEMA = { type: 'string' }
 
@@ -83,7 +51,7 @@ export const toolPotProvision: ToolSpec = {
         migrations: Array.isArray(args.migrations) ? (args.migrations as string[]) : undefined,
       }
       const result = await provisionSovereignPot(env, input)
-      return done({ ok: true, pot: result })
+      return done({ pot: result })
     } catch (err) {
       return fail(500, 'provisioning_failed', err instanceof Error ? err.message : String(err))
     }
@@ -114,7 +82,7 @@ export const toolPotList: ToolSpec = {
 
     try {
       const pots = await listSovereignPots({ accountId, apiToken })
-      return done({ ok: true, count: pots.length, pots })
+      return done({ count: pots.length, pots })
     } catch (err) {
       return fail(500, 'list_failed', err instanceof Error ? err.message : String(err))
     }

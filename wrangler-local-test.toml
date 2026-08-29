@@ -84,6 +84,3 @@ new_classes = ["PresenceChannelDO"]
 name = "mupot-local-test-task-workflow"
 binding = "TASK_WORKFLOW"
 class_name = "TaskWorkflow"
-
-[triggers]
-crons = ["* * * * *", "0-9,15-24,30-39,45-54 * * * *"]

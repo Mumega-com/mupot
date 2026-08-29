@@ -1,7 +1,7 @@
 // src/connectors/supabase-webhook.ts — Inbound Webhook Router for Supabase Database Triggers.
 
 import { Hono } from 'hono'
-import type { Env, AuthContext } from '../types'
+import type { Env } from '../types'
 import { createBus } from '../bus'
 import { createTask } from '../tasks/service'
 import type { SupabaseWebhookPayload } from './supabase'
@@ -33,7 +33,8 @@ supabaseWebhookApp.post('/supabase', async (c) => {
   await bus.emit({
     type: eventName,
     actor: { kind: 'external', id: `supabase:${body.table}` },
-    target: { kind: 'pot', id: c.env.TENANT_SLUG },
+    tenant: c.env.TENANT_SLUG,
+    ts: new Date().toISOString(),
     payload: {
       type: body.type,
       table: body.table,
@@ -63,7 +64,7 @@ supabaseWebhookApp.post('/supabase', async (c) => {
             done_when: `Process and resolve Supabase ${body.table} trigger.`,
             assignee_agent_id: mappingRow.assignee_agent_id || null,
           },
-          { skipMirror: true, actor: { kind: 'system', id: `supabase:${body.table}` } },
+          { skipMirror: true, actor: { kind: 'member', id: `supabase:${body.table}` } },
         )
         taskId = task.id
       }

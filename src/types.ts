@@ -258,6 +258,9 @@ export interface Env {
   // proxy to the project's user Worker. Absent ⇒ fallback preview renderer.
   // Declared in wrangler.toml [[dispatch_namespaces]] binding="DISPATCHER".
   DISPATCHER?: import('./platform/dispatcher').DispatchNamespace
+  STRIPE_SECRET_KEY?: string
+  STRIPE_WEBHOOK_SECRET?: string
+  SUPABASE_WEBHOOK_SECRET?: string
 }
 
 // ── Org domain (mirrors migrations/0001_init.sql + 0009_work_unit.sql) ──
@@ -602,7 +605,6 @@ export interface CapabilityGrant {
   scope_type: CapabilityScopeType
   scope_id: string | null // null for org-wide
   capability: Capability
-  resource?: string | null // optional finer filter: project id, tool-class, action-class
 }
 
 // ── Bus ──
@@ -621,10 +623,13 @@ export type BusEventType =
   | 'squad.dispatch'
   | 'org.provisioned' // a department/squad/agent/token was created in-band (payload.kind)
   | 'project.mutated' // project lifecycle or project-to-squad access changed through MCP
-  | 'message.created' // an agent_messages row LANDED (mumega-com#970) — the push seam that
-                      // makes an inbox poll unnecessary. Emitted ONLY on a real insert
-                      // (result.meta.changes > 0), so a capped, fenced, or idempotent-
-                      // duplicate send produces no event. See MessageCreatedPayload.
+  | 'message.created' // an agent_messages row LANDED (mumega-com#970)
+  | 'member.auto_enrolled'
+  | 'billing.subscription.created'
+  | 'billing.subscription.deleted'
+  | 'pot.self_serve_provisioned'
+  | 'routine.run.started'
+  | string
 
 /**
  * message.created payload (mumega-com#970).
@@ -665,7 +670,7 @@ export interface BusEvent<T = unknown> {
   tenant: string
   squad_id?: string
   agent_id?: string
-  actor?: { kind: 'member' | 'agent'; id: string } // attribution — who caused this
+  actor?: { kind: 'member' | 'agent' | 'sso' | 'external' | 'system' | 'stripe' | 'routine'; id: string } // attribution — who caused this
   payload: T
   ts: string // ISO; set by the producer
 }

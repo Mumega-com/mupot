@@ -141,6 +141,11 @@ function projectFrom(row: DispatchRunRow): Project {
     completion_proposed_by: row.project_completion_proposed_by,
     created_at: row.project_created_at,
     updated_at: row.project_updated_at,
+    repo_url: null,
+    worker_name: null,
+    live_url: null,
+    assigned_squad_id: null,
+    deploy_status: 'idle',
   }
 }
 
@@ -651,6 +656,7 @@ export async function dispatchRoutineRun(
     checks: {
       contextComplete: true, toolsReachable: true, budgetHeadroom: true,
       progressBeatsWaste: true, cacheStaysWarm: true,
+      contextHeadroom: true, tokenMarginSufficient: true,
     },
     reasons: [],
   })

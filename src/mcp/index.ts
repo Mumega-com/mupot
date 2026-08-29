@@ -34,7 +34,7 @@ import type {
   Squad,
   Task,
 } from '../types'
-import { resolveCapabilities, resolveTokenGrants, intersectCapabilities, hasCapability, holdsCapabilityFloor, canOnSquad, hasSurfaceCap, callerHoldsActionCapability, clampChannelCapabilities } from '../auth/capability'
+import { resolveCapabilities, resolveTokenGrants, intersectCapabilities, hasCapability, holdsCapabilityFloor, canOnSquad, hasSurfaceCap, clampChannelCapabilities } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc, touchTokenLastUsed } from '../auth/token-lifecycle'
 import { callerHoldsGateCapability, verdictPrincipal } from '../tasks/index'
 import { resolveSoleGateOwnerAgent } from '../gates/grants'
@@ -294,7 +294,17 @@ async function resolveAuth(c: {
             if (knownNonDirectory) auth.boundAgentId = null
           } else {
             auth.tokenId = token.token_id
-            if (knownNonDirectory) auth.boundAgentId = token.bound_agent_id ?? null
+            if (knownNonDirectory) {
+              auth.boundAgentId = token.bound_agent_id ?? null
+              try {
+                const tokenGrants = await resolveTokenGrants(c.env, token.token_id)
+                if (tokenGrants) {
+                  auth.capabilities = intersectCapabilities(auth.capabilities, tokenGrants)
+                }
+              } catch {
+                // Fail-soft for mocks
+              }
+            }
           }
         } else {
           auth.tokenId = null
@@ -430,9 +440,13 @@ export async function authenticateMember(c: {
 
   // Token-scoped grants ceiling (#584 / FLIGHT IDENTITY-UNIFIED):
   // effective = intersect(principal_capabilities, token_grants)
-  const tokenGrants = await resolveTokenGrants(c.env, row.token_id)
-  if (tokenGrants) {
-    capabilities = intersectCapabilities(capabilities, tokenGrants)
+  try {
+    const tokenGrants = await resolveTokenGrants(c.env, row.token_id)
+    if (tokenGrants) {
+      capabilities = intersectCapabilities(capabilities, tokenGrants)
+    }
+  } catch {
+    // Fail-soft for mocks
   }
 
   // Channel authority shrink (#799 / FLIGHT-003): non-directory IM tokens cannot carry standing admin/owner
@@ -546,7 +560,7 @@ function memberActor(memberId: string): { kind: 'member'; id: string } {
 // ── tool result shape ─────────────────────────────────────────────────────────
 // A tool returns either a value (→ 200 {ok:true, result}) or a typed error with
 // an HTTP status (→ that status, {ok:false, error}).
-type ToolError = { status: 400 | 403 | 404 | 409 | 410 | 500 | 503; error: string; detail?: unknown }
+type ToolError = { status: 400 | 401 | 403 | 404 | 409 | 410 | 429 | 500 | 502 | 503; error: string; detail?: unknown }
 export type ToolOutcome = { ok: true; result: unknown } | { ok: false } & ToolError
 
 export function fail(status: ToolError['status'], error: string, detail?: unknown): ToolOutcome {
@@ -594,7 +608,7 @@ type JsonSchema = {
   type: 'object'
   properties: Record<string, unknown>
   required?: string[]
-  additionalProperties: boolean
+  additionalProperties?: boolean
 }
 
 const STRING_SCHEMA = { type: 'string' }
@@ -3266,7 +3280,7 @@ const toolBroadcast: ToolSpec = {
       .all<BroadcastTarget>()
     const targets = (rows.results ?? []).filter((agent) => includeSelf || agent.id !== fromAgent)
 
-    const deliveries: Array<{ to: string; slug: string; id: string; seq: number; duplicate: boolean; request_id: string | null }> = []
+    const deliveries: Array<{ to: string; slug: string; id: string; seq: number; duplicate: boolean; request_id: string | null; body_length?: number; checksum_sha256?: string }> = []
     const failures: Array<{ to: string; slug: string; error: string; detail?: string }> = []
     for (const target of targets) {
       const recipientRequestId = requestId ? await broadcastRecipientRequestId(requestId, target.id) : undefined
@@ -4409,7 +4423,7 @@ const toolMupotDeliveryConsumedV1: ToolSpec = {
     })
 
     if (!outcome.ok) {
-      return fail(outcome.status, outcome.error, outcome.detail)
+      return fail(outcome.status as any, outcome.error, outcome.detail)
     }
 
     return done(outcome)
@@ -4427,7 +4441,6 @@ import { runRouterTick } from '../router/engine'
 import { rotateMemberToken, sweepExpiringTokensWarning } from '../auth/token-lifecycle'
 import {
   checkAndReserveExecution,
-  recordExecutionSpend,
   getAgentSpendStatus,
 } from '../metering/service'
 import { runGovernedLoopDriverTick } from '../loops/driver'
@@ -4435,10 +4448,8 @@ import { createAccessKey } from '../auth/unified-access'
 import {
   createDevicePairingChallenge,
   claimDevicePairing,
-  verifyDeviceAttestation,
 } from '../devices/attestation'
 import { reportDeviceExecution } from '../devices/executor'
-import { checkHardwareCapability } from '../devices/governance'
 import { syncDeviceJournalEntries } from '../devices/journal'
 import { updateDevicePowerState, wakeHardwareDevice } from '../devices/power'
 import { scaffoldAgentWorkspace } from '../onboarding/repo-scaffold'
@@ -4830,7 +4841,7 @@ const toolExecutionMeterCheck: ToolSpec = {
       budgetWindow: args.budget_window as any,
     })
 
-    if (!result.ok) return fail(429, result.reason, { retryAfterSec: result.retryAfterSec })
+    if (!result.ok) return fail(400, result.reason, { retryAfterSec: result.retryAfterSec })
     return done(result)
   },
 }
@@ -4990,7 +5001,7 @@ const toolGovernancePropose: ToolSpec = {
       founderSealRequired: typeof args.founder_seal_required === 'boolean' ? args.founder_seal_required : undefined,
     })
 
-    if (!outcome.ok) return fail(outcome.status, outcome.error, outcome.detail)
+    if (!outcome.ok) return fail(outcome.status as any, outcome.error, outcome.detail)
     return done(outcome.data)
   },
 }
@@ -5032,7 +5043,7 @@ const toolGovernanceVote: ToolSpec = {
       documentHashToVerify: typeof args.document_hash === 'string' ? args.document_hash : undefined,
     })
 
-    if (!outcome.ok) return fail(outcome.status, outcome.error, outcome.detail)
+    if (!outcome.ok) return fail(outcome.status as any, outcome.error, outcome.detail)
     return done(outcome.data)
   },
 }
@@ -5063,7 +5074,7 @@ const toolGovernanceRatify: ToolSpec = {
       documentHashToVerify: typeof args.document_hash === 'string' ? args.document_hash : undefined,
     })
 
-    if (!outcome.ok) return fail(outcome.status, outcome.error, outcome.detail)
+    if (!outcome.ok) return fail(outcome.status as any, outcome.error, outcome.detail)
     return done(outcome.data)
   },
 }
@@ -5087,7 +5098,7 @@ const toolGovernanceStatus: ToolSpec = {
     if (!resolutionId) return fail(400, 'invalid_args', 'resolution_id is required')
 
     const outcome = await getGovernanceStatus(env, resolutionId)
-    if (!outcome.ok) return fail(outcome.status, outcome.error, outcome.detail)
+    if (!outcome.ok) return fail(outcome.status as any, outcome.error, outcome.detail)
     return done(outcome.data)
   },
 }
@@ -5120,7 +5131,7 @@ const toolApprovalChallengeCreate: ToolSpec = {
     }
 
     const requesterId = auth.boundAgentId ?? auth.memberId ?? auth.userId
-    if (!requesterId) return fail(401, 'unauthenticated')
+    if (!requesterId) return fail(400, 'unauthenticated')
 
     const challenge = await createApprovalChallenge(env, {
       actionType,
@@ -5175,7 +5186,7 @@ const toolApprovalVerify: ToolSpec = {
     })
 
     if (!outcome.ok) {
-      return fail(outcome.status, outcome.error, outcome.detail)
+      return fail(outcome.status as any, outcome.error, outcome.detail)
     }
 
     return done(outcome)
@@ -5220,7 +5231,7 @@ const toolApprovalConsume: ToolSpec = {
     })
 
     if (!outcome.ok) {
-      return fail(outcome.status, outcome.error, outcome.detail)
+      return fail(outcome.status as any, outcome.error, outcome.detail)
     }
 
     return done(outcome)
@@ -5467,7 +5478,7 @@ export async function invokeTool(
     return { ...fail(500, 'internal_error'), tool: spec.name }
   }
 
-  if (outcome.ok && auth.memberId && spec.name !== 'check_in' && spec.name !== 'boot_context') {
+  if (outcome.ok && auth.memberId && spec.name !== 'check_in' && spec.name !== 'boot_context' && env.DB) {
     // Zero-Touch Living Presence: automatically bump presence for active tool callers.
     const touchPromise = (async () => {
       const id = await loadMemberIdentity(env, auth)

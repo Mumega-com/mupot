@@ -24,8 +24,8 @@
 // /oauth/consent branch for the full design).
 
 import type { Env, AuthContext, Capability, CapabilityGrant, CapabilityScopeType, ConnectionChannel } from '../types'
-import { resolveCapabilities, canOnSquad, hasCapability, capabilityRank } from '../auth/capability'
-import { sha256Hex, mintRawToken, resolveAgentMemberBinding, mintAgentBoundToken } from '../members/service'
+import { resolveCapabilities, resolveTokenGrants, intersectCapabilities, canOnSquad, hasCapability, capabilityRank } from '../auth/capability'
+import { sha256Hex, mintRawToken, mintAgentBoundToken } from '../members/service'
 import { createAgent } from '../org/service'
 import { redactSecretPatterns } from '../lib/redact'
 
@@ -822,17 +822,27 @@ export async function buildAuthContextFromProps(
 
   if (!tokenRow || tokenRow.status !== 'active') return null
 
-  // Re-resolve capabilities every request (C2: revocation propagates immediately).
-  // The resolved grants are NOT used for the directory channel — see B1 comment above —
-  // but workspace/member API keys must preserve their live D1 grants.
-  const resolvedCapabilities = await resolveCapabilities(env, props.memberId)
-
   const channel =
     isConnectionChannel(tokenRow.channel)
       ? tokenRow.channel
       : isConnectionChannel(props.channel)
         ? props.channel
         : 'directory'
+
+  // Re-resolve capabilities every request (C2: revocation propagates immediately).
+  // The resolved grants are NOT used for the directory channel — see B1 comment above —
+  // but workspace/member API keys must preserve their live D1 grants.
+  let resolvedCapabilities = await resolveCapabilities(env, props.memberId)
+  if (channel !== 'directory') {
+    try {
+      const tokenGrants = await resolveTokenGrants(env, props.tokenId)
+      if (tokenGrants) {
+        resolvedCapabilities = intersectCapabilities(resolvedCapabilities, tokenGrants)
+      }
+    } catch {
+      // Fail-soft for mocks
+    }
+  }
 
   // mupot#903b: tokenRow.bound_agent_id is checked FIRST, regardless of channel — it
   // is the live DB truth (never props, which is client-influenced input echoed back
