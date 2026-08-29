@@ -54,11 +54,16 @@ export async function evaluateAndDispatchDueRoutines(
 
   for (const routine of rows) {
     try {
-      const scheduleObj: RoutineSchedule = {
-        kind: (routine.trigger_kind || 'cron') as 'cron' | 'once' | 'manual',
-        timezone: routine.timezone || 'UTC',
-        cronExpression: routine.cron_expression || undefined,
-        runOnceAt: routine.run_once_at || undefined,
+      let scheduleObj: RoutineSchedule
+      const timezone = routine.timezone || 'UTC'
+      if (routine.trigger_kind === 'manual') {
+        scheduleObj = { kind: 'manual', timezone }
+      } else if (routine.trigger_kind === 'once') {
+        if (!routine.run_once_at) throw new Error('once routine missing run_once_at')
+        scheduleObj = { kind: 'once', timezone, runOnceAt: routine.run_once_at }
+      } else {
+        if (!routine.cron_expression) throw new Error('cron routine missing cron_expression')
+        scheduleObj = { kind: 'cron', timezone, cronExpression: routine.cron_expression }
       }
 
       const scheduledDate = new Date(routine.next_run_at || nowIso)
@@ -157,7 +162,9 @@ export async function evaluateAndDispatchDueRoutines(
       await bus.emit({
         type: 'routine.run.started',
         actor: { kind: 'routine', id: routine.id },
-        target: { kind: 'task', id: taskId },
+        tenant: env.TENANT_SLUG,
+        agent_id: routine.preferred_agent_id || undefined,
+        ts: new Date().toISOString(),
         payload: {
           routine_id: routine.id,
           run_id: runId,

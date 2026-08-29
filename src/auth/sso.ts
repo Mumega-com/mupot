@@ -132,7 +132,8 @@ export async function autoEnrollSsoMember(
   await bus.emit({
     type: 'member.auto_enrolled',
     actor: { kind: 'sso', id: profile.provider || 'oauth' },
-    target: { kind: 'member', id: memberId },
+    tenant: env.TENANT_SLUG,
+    ts: new Date().toISOString(),
     payload: {
       email,
       role,

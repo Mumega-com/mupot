@@ -60,7 +60,12 @@ potsApp.get('/', async (c) => {
   }
 
   try {
-    const list = await listSovereignPots(c.env)
+    const accountId = c.env.SECRET_ENV_CF_ACCOUNT_ID
+    const apiToken = c.env.SECRET_ENV_CF_API_TOKEN
+    if (!accountId || !apiToken) {
+      return c.json({ error: 'unconfigured', message: 'Cloudflare API credentials are not configured.' }, 503)
+    }
+    const list = await listSovereignPots({ accountId, apiToken })
     return c.json({ ok: true, pots: list })
   } catch (err) {
     return c.json(
@@ -110,4 +115,3 @@ publicPotsApp.post('/checkout', async (c) => {
 
   return c.json({ ok: true, url: result.url, session_id: result.sessionId })
 })
-

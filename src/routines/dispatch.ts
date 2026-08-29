@@ -139,6 +139,11 @@ function projectFrom(row: DispatchRunRow): Project {
     stalled: Number(row.project_stalled),
     stall_threshold_days: row.project_stall_threshold_days,
     completion_proposed_by: row.project_completion_proposed_by,
+    repo_url: null,
+    worker_name: null,
+    live_url: null,
+    assigned_squad_id: null,
+    deploy_status: 'idle',
     created_at: row.project_created_at,
     updated_at: row.project_updated_at,
   }

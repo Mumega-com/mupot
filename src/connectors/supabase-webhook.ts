@@ -1,7 +1,7 @@
 // src/connectors/supabase-webhook.ts — Inbound Webhook Router for Supabase Database Triggers.
 
 import { Hono } from 'hono'
-import type { Env, AuthContext } from '../types'
+import type { BusEventType, Env } from '../types'
 import { createBus } from '../bus'
 import { createTask } from '../tasks/service'
 import type { SupabaseWebhookPayload } from './supabase'
@@ -28,12 +28,17 @@ supabaseWebhookApp.post('/supabase', async (c) => {
   }
 
   const bus = createBus(c.env)
-  const eventName = `supabase.record.${body.type.toLowerCase()}`
+  const eventName: BusEventType = body.type === 'INSERT'
+    ? 'supabase.record.insert'
+    : body.type === 'UPDATE'
+      ? 'supabase.record.update'
+      : 'supabase.record.delete'
 
   await bus.emit({
     type: eventName,
     actor: { kind: 'external', id: `supabase:${body.table}` },
-    target: { kind: 'pot', id: c.env.TENANT_SLUG },
+    tenant: c.env.TENANT_SLUG,
+    ts: new Date().toISOString(),
     payload: {
       type: body.type,
       table: body.table,

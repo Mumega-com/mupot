@@ -214,8 +214,6 @@ export async function provisionSovereignPot(
   const adminToken = `pot_adm_${crypto.randomUUID().replace(/-/g, '')}`
   const leadAgentId = crypto.randomUUID()
   const leadAgentToken = `pot_agt_${crypto.randomUUID().replace(/-/g, '')}`
-  const coreSquadId = `squad-${slug}-core`
-  const projectId = `proj-${slug}-main`
 
   // 4. If workerJsCode provided, upload to Dispatch Namespace
   if (workerJsCode) {

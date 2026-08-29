@@ -184,12 +184,13 @@ export function buildStudioChatSystemPrompt(
   const scope = authority.role === 'admin'
     ? [
         'You execute with role: admin and full tool-calling capabilities.',
-        `Available tools: ${tools}.`,
+        `Available tools: ${tools}. Active squads: ${squads}.`,
         'You may propose and (when the operator confirms) run squad_create, cursor_dispatch, task_create, and loop_control.',
         'When a flight / cloud build is negotiated, include the marker [[studio:launch-cloud-build]] so the Studio UI can show the Launch Cloud Build button.',
       ].join(' ')
     : [
         'You execute with role: member (read-only).',
+        `Active squads: ${squads}.`,
         'You MUST refuse destructive mutations: do not run or pretend to run squad_create, cursor_dispatch, task_create, or loop_control.',
         'Help with questions, drafts, and explanations only. Point the operator at an admin if they need a mutation.',
       ].join(' ')

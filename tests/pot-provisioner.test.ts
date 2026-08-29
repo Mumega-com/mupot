@@ -222,9 +222,9 @@ describe('Sovereign Pot Provisioner (Flight 2)', () => {
         plan_tier: 'enterprise',
       })
 
-      expect(outcome.status).toBe(200)
-      const data = outcome.body as { ok: boolean; pot: { slug: string; d1_database_id: string } }
-      expect(data.ok).toBe(true)
+      expect(outcome.ok).toBe(true)
+      if (!outcome.ok) throw new Error(outcome.error)
+      const data = outcome.result as { pot: { slug: string; d1_database_id: string } }
       expect(data.pot.slug).toBe('viamar')
       expect(data.pot.d1_database_id).toBe('d1-111')
     })

@@ -150,13 +150,14 @@ export async function handlePotCreationCompleted(
     await bus.emit({
       type: 'pot.self_serve_provisioned',
       actor: { kind: 'stripe', id: session.customer || 'checkout' },
-      target: { kind: 'pot', id: slug },
+      tenant: env.TENANT_SLUG,
+      ts: new Date().toISOString(),
       payload: {
         slug,
         brand,
         tier,
         owner_email: ownerEmail,
-        public_url: result.public_url,
+        public_url: result.public_origin,
       },
     })
 
