@@ -15,6 +15,7 @@
 import { describe, it, expect, vi } from 'vitest'
 import {
   activateAgentTokenReplacement,
+  cancelAgentTokenReplacementReservation,
   findAgentTokenReplacementHandoff,
   markAgentTokenReplacementAuditSent,
   mintAgentBoundToken,
@@ -24,6 +25,7 @@ import {
 } from '../src/members/service'
 import { loadAgentTokenView } from '../src/dashboard/agent-token'
 import { dashboardApp } from '../src/dashboard/index'
+import { mcpApp } from '../src/mcp'
 import type { Env } from '../src/types'
 import { createSqliteD1 } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
@@ -294,6 +296,78 @@ function createMigratedMintEnv(): {
   }
 }
 
+function createReplacementSurfaceEnv(opts: { busFails?: { value: boolean }; claimFails?: { value: boolean } } = {}): {
+  env: Env
+  sqlite: ReturnType<typeof createSqliteD1>['sqlite']
+  claims: Map<string, string>
+  bus: unknown[]
+  close(): void
+} {
+  const harness = createMigratedMintEnv()
+  const claims = new Map<string, string>()
+  const bus: unknown[] = []
+  const operatorRaw = 'replacement-surface-operator-token'
+  return {
+    env: {
+      ...harness.env,
+      PUBLIC_ORIGIN: 'https://mupot.mumega.com',
+      BUS: {
+        send: async (event: unknown) => {
+          if (opts.busFails?.value) throw new Error('bus unavailable')
+          bus.push(event)
+        },
+      },
+      SESSIONS: {
+        get: async (key: string) => claims.get(key) ?? null,
+        put: async (key: string, value: string) => {
+          if (opts.claimFails?.value) throw new Error('claim unavailable')
+          claims.set(key, value)
+        },
+        delete: async (key: string) => { claims.delete(key) },
+      },
+    } as unknown as Env,
+    sqlite: harness.sqlite,
+    claims,
+    bus,
+    close: harness.close,
+  }
+}
+
+async function seedReplacementSurfaceOperator(
+  surface: ReturnType<typeof createReplacementSurfaceEnv>,
+): Promise<void> {
+  const tokenHash = await sha256Hex('replacement-surface-operator-token')
+  surface.sqlite.prepare(
+    `INSERT INTO members (id, email, display_name, status, tenant)
+     VALUES ('operator-replacement', 'operator@example.test', 'Operator', 'active', 'test')`,
+  ).run()
+  surface.sqlite.prepare(
+    `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+     VALUES ('operator-replacement-owner', 'operator-replacement', 'org', NULL, 'owner')`,
+  ).run()
+  surface.sqlite.prepare(
+    `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, tenant)
+     VALUES ('operator-replacement-token', 'operator-replacement', ?, 'operator', 'workspace', '2026-08-29 00:00:00', 'test')`,
+  ).run(tokenHash)
+}
+
+async function callReplacementMint(env: Env, priorTokenId: string): Promise<Response> {
+  return mcpApp.request('https://mupot.mumega.com/', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer replacement-surface-operator-token' },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'tools/call',
+      params: { name: 'mint_agent_token', arguments: { agent: AGENT.id, rotate_prior_token_id: priorTokenId } },
+    }),
+  }, env)
+}
+
+function credentialClaimCount(surface: ReturnType<typeof createReplacementSurfaceEnv>): number {
+  return [...surface.claims.keys()].filter((key) => key.startsWith('cred-claim:')).length
+}
+
 describe('mintAgentBoundToken — canonical SQLite identity', () => {
   it('first_mint_with_replacement_id_is_refused_with_zero_side_effects', async () => {
     const harness = createMigratedMintEnv()
@@ -471,7 +545,16 @@ describe('mintAgentBoundToken — canonical SQLite identity', () => {
     const harness = createMigratedMintEnv()
     try {
       const prior = await mintAgentBoundToken(harness.env, AGENT, 'prior')
-      // Claim creation is required before staging; simulating its failure means no stage occurs.
+      const prepared = await prepareAgentTokenReplacement(harness.env, AGENT, 'replacement', {
+        revokePriorTokenId: prior.tokenId,
+      })
+      const handoff = await stageAgentTokenReplacement(harness.env, AGENT, prepared, {
+        claimId: 'claim-failure', fingerprint: '0123456789abcdef', expiresAt: '2099-01-01T00:00:00.000Z',
+        mintedByMemberId: prior.memberId,
+      })
+      await cancelAgentTokenReplacementReservation(harness.env, handoff)
+
+      // Claim creation failed after reservation, so compensation restores the prior-live state.
       expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM member_tokens WHERE agent_id = ?').get(AGENT.id))
         .toEqual({ count: 1 })
       expect(harness.sqlite.prepare('SELECT revoked_at FROM member_tokens WHERE id = ?').get(prior.tokenId))
@@ -508,6 +591,109 @@ describe('mintAgentBoundToken — canonical SQLite identity', () => {
         .toEqual({ count: 1 })
     } finally {
       harness.close()
+    }
+  })
+
+  it('concurrent_loser_never_creates_or_retains_revealable_claim', async () => {
+    const surface = createReplacementSurfaceEnv()
+    try {
+      await seedReplacementSurfaceOperator(surface)
+      const prior = await mintAgentBoundToken(surface.env, AGENT, 'prior')
+
+      const responses = await Promise.all([
+        callReplacementMint(surface.env, prior.tokenId),
+        callReplacementMint(surface.env, prior.tokenId),
+      ])
+
+      expect(responses.map((response) => response.status).sort()).toEqual([200, 409])
+      expect(credentialClaimCount(surface)).toBe(1)
+      expect(surface.bus).toHaveLength(1)
+      expect(surface.sqlite.prepare('SELECT COUNT(*) AS count FROM member_tokens WHERE agent_id = ?').get(AGENT.id))
+        .toEqual({ count: 2 })
+      expect(surface.sqlite.prepare('SELECT COUNT(*) AS count FROM member_tokens WHERE agent_id = ? AND revoked_at IS NULL').get(AGENT.id))
+        .toEqual({ count: 1 })
+      expect(surface.sqlite.prepare('SELECT COUNT(*) AS count FROM agent_member_bindings WHERE agent_id = ?').get(AGENT.id))
+        .toEqual({ count: 1 })
+      expect(surface.sqlite.prepare('SELECT COUNT(*) AS count FROM gate_grants').get())
+        .toEqual({ count: 1 })
+      expect(surface.sqlite.prepare('SELECT COUNT(*) AS count FROM agent_token_rotation_handoffs').get())
+        .toEqual({ count: 1 })
+    } finally {
+      surface.close()
+    }
+  })
+
+  it('concurrent_loser_returns_opaque_replacement_conflict', async () => {
+    const surface = createReplacementSurfaceEnv()
+    try {
+      await seedReplacementSurfaceOperator(surface)
+      const prior = await mintAgentBoundToken(surface.env, AGENT, 'prior')
+      const responses = await Promise.all([
+        callReplacementMint(surface.env, prior.tokenId),
+        callReplacementMint(surface.env, prior.tokenId),
+      ])
+      const loser = responses.find((response) => response.status === 409)
+      expect(loser).toBeDefined()
+      const body = await loser!.text()
+      expect(body).toContain('replacement_token_unavailable')
+      expect(body).not.toMatch(/credential_claim|mupot_|token_hash|prior/)
+    } finally {
+      surface.close()
+    }
+  })
+
+  it('all_replacement_failure_paths_leave_binding_gate_claim_bus_and_handoff_state_unchanged', async () => {
+    const busFails = { value: true }
+    const surface = createReplacementSurfaceEnv({ busFails })
+    try {
+      await seedReplacementSurfaceOperator(surface)
+      const prior = await mintAgentBoundToken(surface.env, AGENT, 'prior')
+      const gatesBefore = surface.sqlite.prepare('SELECT COUNT(*) AS count FROM gate_grants').get()
+
+      const response = await callReplacementMint(surface.env, prior.tokenId)
+
+      expect(response.status).toBe(503)
+      expect(surface.bus).toHaveLength(0)
+      expect(credentialClaimCount(surface)).toBe(1)
+      expect(surface.sqlite.prepare('SELECT revoked_at FROM member_tokens WHERE id = ?').get(prior.tokenId))
+        .toEqual({ revoked_at: null })
+      expect(surface.sqlite.prepare('SELECT COUNT(*) AS count FROM member_tokens WHERE agent_id = ? AND revoked_at IS NULL').get(AGENT.id))
+        .toEqual({ count: 1 })
+      expect(surface.sqlite.prepare('SELECT COUNT(*) AS count FROM agent_member_bindings WHERE agent_id = ?').get(AGENT.id))
+        .toEqual({ count: 1 })
+      expect(surface.sqlite.prepare('SELECT COUNT(*) AS count FROM gate_grants').get()).toEqual(gatesBefore)
+      expect(surface.sqlite.prepare("SELECT COUNT(*) AS count FROM agent_token_rotation_handoffs WHERE state = 'pending'").get())
+        .toEqual({ count: 1 })
+    } finally {
+      surface.close()
+    }
+  })
+
+  it('claim_failure_after_winner_reservation_preserves_prior_and_is_safely_retryable_or_recoverable', async () => {
+    const claimFails = { value: true }
+    const surface = createReplacementSurfaceEnv({ claimFails })
+    try {
+      await seedReplacementSurfaceOperator(surface)
+      const prior = await mintAgentBoundToken(surface.env, AGENT, 'prior')
+
+      expect((await callReplacementMint(surface.env, prior.tokenId)).status).toBe(503)
+      expect(credentialClaimCount(surface)).toBe(0)
+      expect(surface.bus).toHaveLength(0)
+      expect(surface.sqlite.prepare('SELECT COUNT(*) AS count FROM member_tokens WHERE agent_id = ?').get(AGENT.id))
+        .toEqual({ count: 1 })
+      expect(surface.sqlite.prepare('SELECT COUNT(*) AS count FROM agent_token_rotation_handoffs').get())
+        .toEqual({ count: 0 })
+      expect(surface.sqlite.prepare('SELECT revoked_at FROM member_tokens WHERE id = ?').get(prior.tokenId))
+        .toEqual({ revoked_at: null })
+
+      claimFails.value = false
+      expect((await callReplacementMint(surface.env, prior.tokenId)).status).toBe(200)
+      expect(credentialClaimCount(surface)).toBe(1)
+      expect(surface.bus).toHaveLength(1)
+      expect(surface.sqlite.prepare('SELECT COUNT(*) AS count FROM member_tokens WHERE agent_id = ? AND revoked_at IS NULL').get(AGENT.id))
+        .toEqual({ count: 1 })
+    } finally {
+      surface.close()
     }
   })
 

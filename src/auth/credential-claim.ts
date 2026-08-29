@@ -79,8 +79,8 @@ export async function createCredentialClaim(
   env: Env,
   raw: string,
   mintedBy: string,
+  claimId = crypto.randomUUID(),
 ): Promise<CredentialClaimHandle> {
-  const claimId = crypto.randomUUID()
   const fingerprint = (await sha256Hex(raw)).slice(0, 16)
   const nowMs = Date.now()
   const record: CredentialClaimRecord = {

@@ -42,11 +42,13 @@ import {
   isAgentTokenCapability,
   AgentTokenReplacementError,
   activateAgentTokenReplacement,
+  cancelAgentTokenReplacementReservation,
   findAgentTokenReplacementHandoff,
   markAgentTokenReplacementAuditSent,
   prepareAgentTokenReplacement,
   resolveAgentMemberBinding,
   stageAgentTokenReplacement,
+  sha256Hex,
 } from '../members/service'
 import { resolveAgentTokenExpiry } from '../auth/token-lifecycle'
 import { createCredentialClaim, credentialClaimIsAvailable, CLAIM_TTL_SECONDS } from '../auth/credential-claim'
@@ -520,22 +522,34 @@ const toolMintAgentToken: ToolSpec = {
       }
       if (!handoff) {
         let prepared
-        let claim
         try {
           prepared = await prepareAgentTokenReplacement(env, agent, label, {
             grantCapability,
             expiresAt,
             revokePriorTokenId: rotatePriorTokenId,
           })
-          claim = await createCredentialClaim(env, prepared.raw, auth.memberId as string)
+          // Election/reservation is D1-only and occurs before any revealable KV
+          // claim. A concurrent loser therefore has no claim to retain or reveal.
+          const claimId = crypto.randomUUID()
+          const claimExpiresAt = new Date(Date.now() + CLAIM_TTL_SECONDS * 1000).toISOString()
           handoff = await stageAgentTokenReplacement(env, agent, prepared, {
-            claimId: claim.claim_id,
-            fingerprint: claim.fingerprint,
-            expiresAt: claim.expires_at,
+            claimId,
+            fingerprint: (await sha256Hex(prepared.raw)).slice(0, 16),
+            expiresAt: claimExpiresAt,
             mintedByMemberId: auth.memberId as string,
           })
         } catch (err) {
           if (err instanceof AgentTokenReplacementError) return fail(409, 'replacement_token_unavailable')
+          return fail(503, 'replacement_handoff_unavailable')
+        }
+        try {
+          await createCredentialClaim(env, prepared.raw, auth.memberId as string, handoff.claim.claimId)
+        } catch {
+          try {
+            await cancelAgentTokenReplacementReservation(env, handoff)
+          } catch {
+            // The reservation remains inactive and retryable; it never revokes the prior.
+          }
           return fail(503, 'replacement_handoff_unavailable')
         }
       }
