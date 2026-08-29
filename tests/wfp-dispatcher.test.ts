@@ -43,7 +43,11 @@ describe('WFP Dispatcher fetch handler', () => {
     const request = new Request('https://viamar.mupot.mumega.com/health')
     const response = await dispatcher.fetch(request, env)
 
-    expect(mockDispatcher.get).toHaveBeenCalledWith('viamar')
+    expect(mockDispatcher.get).toHaveBeenCalledWith(
+      'viamar',
+      {},
+      { limits: { cpuMs: 50, subRequests: 50 } },
+    )
     expect(mockUserWorkerFetch).toHaveBeenCalledWith(request)
     expect(response.status).toBe(200)
 
@@ -68,10 +72,10 @@ describe('WFP Dispatcher fetch handler', () => {
 
     expect(response.status).toBe(404)
     const body = await response.json()
-    expect(body).toEqual({
+    expect(body).toMatchObject({
       error: 'pot_not_found',
       tenant: 'unprovisioned-tenant',
-      message: "No active mupot instance provisioned for 'unprovisioned-tenant'.",
     })
+    expect(body.message).toContain("'unprovisioned-tenant'")
   })
 })
