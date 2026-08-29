@@ -4,7 +4,7 @@ Status: proposed written specification after Hadi approved movement on 2026-08-2
 
 ## Objective
 
-Replace Mupot PR #1236 with a sequential series of bounded pull requests created from the current `origin/main`. Do not merge, extend, or use #1236 as a shared implementation branch. Each replacement slice must be independently understandable, adversarially tested, fully verified, reviewed internally, gated by Athena at its exact head, and receipted by Loom.
+Replace Mupot PR #1236 with a sequential series of bounded pull requests created from the current `origin/main`. Do not merge, extend, or use #1236 as a shared implementation branch. Each replacement slice must be independently understandable, adversarially tested, fully verified, reviewed by a bounded Kasra-controlled reviewer, and gated by Athena at its exact head.
 
 The program prepares merge-ready pull requests. Only Hadi may authorize a merge, deployment, credential operation, or production mutation.
 
@@ -30,22 +30,13 @@ The design must be refreshed if `origin/main` changes before a slice branch is c
 - Decides whether and when an Athena-GREEN slice is merged.
 - Separately authorizes deployment, credential use, or production mutation.
 
-### Loom
-
-- Owns sequence, governing brief/tasks, request IDs, and composition receipts.
-- Issues a new slice GO only after the prior slice reaches its required checkpoint.
-- Never substitutes a queued request for a delivered/consumed gate receipt.
-
 ### Kasra
 
 - Creates the isolated branch and worktree for each authorized slice.
 - Implements with test-first development and preserves exact evidence.
+- Owns sequence, governing brief/tasks, request IDs, and composition receipts while Loom is offline.
+- Uses bounded subagents for implementation and internal review without granting merge, deploy, credential, signature, or peer authority.
 - Does not self-gate, merge, deploy, rotate live credentials, or mutate production.
-
-### Lumen
-
-- Performs the mandatory internal review before external gate submission.
-- Returns findings to Kasra; Critical and Important findings must be resolved before Athena.
 
 ### Athena
 
@@ -60,9 +51,9 @@ Use sequential gate-and-land, not a stacked omnibus.
 1. A slice starts from freshly fetched `origin/main` after the prior required merge.
 2. Kasra implements and verifies in one isolated worktree.
 3. The slice opens as its own PR against `main`.
-4. Lumen performs internal review.
+4. A bounded reviewer subagent performs internal review.
 5. Athena gates the exact PR head.
-6. Loom composes the slice receipt.
+6. Kasra composes the slice receipt.
 7. Hadi may merge. Kasra waits for the exact merge SHA before starting the next slice.
 
 If Hadi chooses not to merge a GREEN slice, the program waits rather than stacking later feature work onto it. This keeps every PR independently main-ready and prevents parent-branch drift from invalidating exact-head gates.
@@ -82,14 +73,14 @@ Every behavioral change must first be expressed as a failing regression on the n
 
 ## Program sequence
 
-Loom accepted this order as a draft sequence in Mupot message `35165332-ab80-4d39-8db4-5b0874fbf61e` and ordered HOLD until the MSG-01 Athena verdict. The HOLD applies to implementation, not to this design artifact.
+The earlier Loom sequence is historical context. Hadi later directed Kasra and Athena to continue without Loom; current implementation still waits for the applicable Athena verdict and Hadi approvals.
 
 ### Gate dependency: finish MSG-01 review
 
 Before Slice 1 begins:
 
 - Athena returns a verdict for task `60c7ac1c` and draft PR #1237, naming the artifact and SHA256.
-- Loom records the verdict and either authorizes rework or issues Slice 1 GO.
+- Kasra records the verdict and either routes rework or presents the next bounded slice to Hadi.
 - Neither #1236 nor #1237 is merged by Kasra.
 
 ### Slice 1: repository CI foundation
@@ -168,22 +159,22 @@ Goal: scope automated execution to the caller's authorized domain and derive con
 Router:
 
 - dry-run requires observer on the named squad;
-- mutation requires lead/admin on the named squad or an internal scheduled-system authority;
-- tenant-wide mutation is org-admin/internal only;
+- mutation requires lead/admin on the named squad; the REST mutation additionally requires org-admin;
+- no public tenant-wide or omitted-squad router mode exists;
 - a task may only be assigned to an active agent authorized on `task.squad_id`;
 - no fallback crosses squad boundaries.
 
 Loop driver:
 
-- an explicit loop is resolved before authorization;
-- mutation requires owner/admin authority for that loop's squad/project;
-- all-loop sweeps are internal scheduled operations or org-admin only;
-- no ordinary authenticated principal can drive another squad's loop.
+- register no public `loop_driver_tick` in MCP or REST;
+- preserve the existing internal scheduled `runLoopsTick` path;
+- preserve existing explicit loop lifecycle/control authorization;
+- treat any future public recovery tick as a separate design requiring approval.
 
 Meter:
 
 - self-status is available only for the caller's bound agent;
-- another agent's status requires observer on that agent's squad;
+- another agent's status requires lead/admin on that agent's squad;
 - reservation requires the authorized execution path, not a public arbitrary-agent tool;
 - budget caps and windows come from durable agent/project policy, not caller overrides;
 - unauthorized callers cannot consume another agent's dispatch count or inspect spend telemetry.
@@ -230,7 +221,7 @@ Goal: prove the replacement series satisfies the original objective without inhe
 - verify required GitHub checks on each immutable PR head and the final main descendant;
 - run cross-slice adversarial cases for credential plus 2FA, governance plus canonical identity, router plus meter, and producer plus delivery consumption;
 - audit that #1236 remains unmerged and was not extended by this program;
-- produce one final Artifact+SHA256 packet for Lumen, Athena, and Loom.
+- produce one final Artifact+SHA256 packet for the bounded internal reviewer, Athena, and Kasra's composition receipt.
 
 ## Per-slice engineering protocol
 
@@ -246,9 +237,9 @@ Every slice follows the same lifecycle:
 8. Run typecheck, the complete Vitest suite, repository guards, migration compatibility, and `git diff --check`.
 9. Commit with a narrow conventional message and push the isolated branch.
 10. Open a draft PR with base/head SHAs, commands, exits, and explicit caveats.
-11. Request Lumen internal review and fix every Critical/Important finding.
+11. Request bounded internal review and fix every Critical/Important finding.
 12. Request Athena exact-head review with Artifact+SHA256.
-13. Ask Loom to compose the receipt.
+13. Compose the receipt under Kasra's coordinator authority.
 14. Wait for Hadi's explicit merge decision.
 
 No later slice starts merely because focused tests pass or a review request is queued.
@@ -271,9 +262,9 @@ The program is complete only when all of the following are true:
 1. Every Slice 1–7 deliverable exists on a bounded PR or final integration artifact.
 2. Every behavioral slice includes adversarial regression and mutation evidence.
 3. Every slice exact head has typecheck exit 0, full-suite exit 0, and all required CI checks successful.
-4. Lumen has no unresolved Critical/Important finding for each slice.
+4. The bounded internal reviewer has no unresolved Critical/Important finding for each slice.
 5. Athena has returned an Artifact+SHA256 verdict for each exact head.
-6. Loom has recorded a sequencing/composition receipt for each slice.
+6. Kasra has recorded a sequencing/composition receipt for each slice while Loom is offline.
 7. #1236 was neither merged nor extended by this program.
 8. Kasra did not merge, deploy, rotate credentials, or mutate production.
 9. Any merges needed for sequential progress were explicitly performed or authorized by Hadi and their exact SHAs are recorded.
