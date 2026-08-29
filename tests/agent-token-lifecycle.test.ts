@@ -487,7 +487,8 @@ describe('Flight-002: mint_agent_token expiry and rotation', () => {
 
     expect(res.status).toBe(503)
     expect(await res.text()).not.toMatch(/credential_claim|mupot_|token_hash/)
-    expect(batches).toHaveLength(0)
+    // Reservation then compensating cleanup; no claim or bus handoff is emitted.
+    expect(batches).toHaveLength(2)
     expect(busSent).toHaveLength(0)
   })
 

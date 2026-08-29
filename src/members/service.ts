@@ -656,7 +656,9 @@ export async function stageAgentTokenReplacement(
   const handoffId = crypto.randomUUID()
   const now = nowSqlUtc()
   const livePrior = replacementLivePredicate('prior', '?')
-  const writes = await env.DB.batch([
+  let writes
+  try {
+    writes = await env.DB.batch([
     env.DB.prepare(
       `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant, expires_at, revoked_at)
        SELECT ?, ?, ?, ?, 'workspace', ?, ?, ?, ?, ?
@@ -710,7 +712,10 @@ export async function stageAgentTokenReplacement(
       env.TENANT_SLUG,
       now,
     ),
-  ])
+    ])
+  } catch {
+    throw new AgentTokenReplacementError()
+  }
   try {
     assertBatchWritten(writes, 'stage_agent_token_replacement', 1)
   } catch {
@@ -729,6 +734,30 @@ export async function stageAgentTokenReplacement(
     createdAt: prepared.createdAt,
     activatedAt: null,
   }
+}
+
+/** Remove an unclaimed, inactive reservation after KV claim creation fails. */
+export async function cancelAgentTokenReplacementReservation(
+  env: Env,
+  handoff: AgentTokenReplacementHandoff,
+): Promise<void> {
+  const writes = await env.DB.batch([
+    env.DB.prepare(
+      `DELETE FROM agent_token_rotation_handoffs
+        WHERE id = ? AND tenant = ? AND state = 'pending' AND audit_state = 'pending'`,
+    ).bind(handoff.id, env.TENANT_SLUG),
+    env.DB.prepare(
+      `DELETE FROM member_tokens
+        WHERE id = ? AND tenant = ? AND member_id = ? AND agent_id = ? AND revoked_at = ?`,
+    ).bind(
+      handoff.replacementTokenId,
+      env.TENANT_SLUG,
+      handoff.memberId,
+      handoff.agentId,
+      handoff.createdAt,
+    ),
+  ])
+  assertBatchWritten(writes, 'cancel_agent_token_replacement_reservation', 1)
 }
 
 export async function markAgentTokenReplacementAuditSent(
