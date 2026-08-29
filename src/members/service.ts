@@ -13,7 +13,7 @@
 
 import type { D1PreparedStatement } from '@cloudflare/workers-types'
 import type { Env, MemberToken, ConnectionChannel, Capability, CapabilityGrant } from '../types'
-import { assertBatchWritten } from '../lib/receipt'
+import { assertBatchWritten, rowsWritten } from '../lib/receipt'
 import {
   calculateExpiryTimestamp,
   DEFAULT_TOKEN_EXPIRY_DAYS,
@@ -189,6 +189,7 @@ export interface AgentMintResult {
   raw: string
   tokenId: string
   memberId: string
+  label: string
   createdAt: string
   grantCapability: AgentTokenCapability
   bindingDisposition: 'created' | 'reused'
@@ -240,6 +241,13 @@ export interface AgentTokenReplacementHandoff {
   activatedAt: string | null
 }
 
+export interface AgentTokenReplacementMetadata {
+  label: string
+  channel: ConnectionChannel
+  capability: AgentTokenCapability
+  createdAt: string
+}
+
 /** Intentionally opaque to callers: a replacement identifier is never an ownership oracle. */
 export class AgentTokenReplacementError extends Error {
   readonly code = 'replacement_token_unavailable' as const
@@ -269,6 +277,14 @@ async function assertLiveReplacementToken(
     .bind(tokenId, memberId, agentId, env.TENANT_SLUG, nowSqlUtc())
     .first<{ id: string }>()
   if (!prior) throw new AgentTokenReplacementError()
+}
+
+/** Revalidate the exact tenant/member/agent prior bound to a durable handoff. */
+export async function assertAgentTokenReplacementPriorLive(
+  env: Env,
+  handoff: AgentTokenReplacementHandoff,
+): Promise<void> {
+  await assertLiveReplacementToken(env, handoff.agentId, handoff.memberId, handoff.priorTokenId)
 }
 
 /**
@@ -493,6 +509,7 @@ async function commitPreparedAgentTokenMint(
     raw: prepared.raw,
     tokenId: prepared.tokenId,
     memberId: prepared.memberId,
+    label: prepared.label,
     createdAt: prepared.createdAt,
     grantCapability: prepared.grantCapability,
     bindingDisposition: prepared.bindingDisposition,
@@ -713,14 +730,19 @@ export async function stageAgentTokenReplacement(
       now,
     ),
     ])
-  } catch {
+  } catch (error) {
+    if (
+      error instanceof Error
+      && /UNIQUE constraint failed:\s*agent_token_rotation_handoffs\./i.test(error.message)
+    ) {
+      throw new AgentTokenReplacementError()
+    }
+    throw error
+  }
+  if (writes.length === 2 && writes.every((write) => rowsWritten(write) === 0)) {
     throw new AgentTokenReplacementError()
   }
-  try {
-    assertBatchWritten(writes, 'stage_agent_token_replacement', 1)
-  } catch {
-    throw new AgentTokenReplacementError()
-  }
+  assertBatchWritten(writes, 'stage_agent_token_replacement', 1)
   return {
     id: handoffId,
     tenant: env.TENANT_SLUG,
@@ -733,6 +755,47 @@ export async function stageAgentTokenReplacement(
     state: 'pending',
     createdAt: prepared.createdAt,
     activatedAt: null,
+  }
+}
+
+/** Reload response metadata from the committed replacement row and canonical
+ * home-squad capability. Retry request arguments are never response truth. */
+export async function loadAgentTokenReplacementMetadata(
+  env: Env,
+  handoffId: string,
+): Promise<AgentTokenReplacementMetadata> {
+  const row = await env.DB.prepare(
+    `SELECT t.label AS replacement_label,
+            t.channel AS replacement_channel,
+            t.created_at AS replacement_created_at,
+            c.capability AS binding_capability
+       FROM agent_token_rotation_handoffs h
+       JOIN member_tokens t
+         ON t.id = h.replacement_token_id
+        AND t.tenant = h.tenant
+        AND t.member_id = h.member_id
+        AND t.agent_id = h.agent_id
+       JOIN agents a ON a.id = h.agent_id
+       JOIN capabilities c
+         ON c.member_id = h.member_id
+        AND c.scope_type = 'squad'
+        AND c.scope_id = a.squad_id
+      WHERE h.id = ? AND h.tenant = ?
+      LIMIT 1`,
+  ).bind(handoffId, env.TENANT_SLUG).first<{
+    replacement_label: string
+    replacement_channel: string
+    replacement_created_at: string
+    binding_capability: string
+  }>()
+  if (!row || !isChannel(row.replacement_channel)) {
+    throw new Error('replacement_metadata_unavailable')
+  }
+  return {
+    label: row.replacement_label,
+    channel: row.replacement_channel,
+    capability: isAgentTokenCapability(row.binding_capability) ? row.binding_capability : 'member',
+    createdAt: row.replacement_created_at,
   }
 }
 

@@ -50,6 +50,7 @@ interface Opts {
   batches?: unknown[][]
   busReject?: { value: boolean }
   claimReject?: boolean
+  claimWrites?: string[]
 }
 
 function makeEnv(opts: Opts = {}): Env {
@@ -89,6 +90,14 @@ function makeEnv(opts: Opts = {}): Env {
           }
           if (sql.includes('FROM agent_member_bindings')) {
             return opts.memberBinding ? { member_id: opts.memberBinding } : null
+          }
+          if (sql.includes('replacement_label')) {
+            return {
+              replacement_label: AGENT.slug,
+              replacement_channel: 'workspace',
+              replacement_created_at: replacementHandoff?.created_at,
+              binding_capability: 'member',
+            }
           }
           if (sql.includes('FROM agent_token_rotation_handoffs')) return replacementHandoff
           if (sql.includes('FROM capabilities')) return { capability: 'member' }
@@ -159,6 +168,7 @@ function makeEnv(opts: Opts = {}): Env {
         async get(key: string) { return store.get(key) ?? null },
         async put(key: string, value: string) {
           if (opts.claimReject) throw new Error('claim store unavailable')
+          opts.claimWrites?.push(key)
           store.set(key, value)
         },
         async delete(key: string) { store.delete(key) },
@@ -360,6 +370,40 @@ describe('Flight-002: mint_agent_token expiry and rotation', () => {
         code: 'invalid_expiry',
       })
     }
+  })
+
+  it('owner_cannot_combine_non_expiring_with_any_finite_expiry_mode_or_side_effect', async () => {
+    const owner = [{ member_id: OPERATOR, scope_type: 'org' as const, scope_id: null, capability: 'owner' as const }]
+    for (const expires_in_days of [0, -1, Number.NaN, 1.5, 366, 30]) {
+      const batches: unknown[][] = []
+      const busSent: unknown[] = []
+      const claimWrites: string[] = []
+      const env = makeEnv({ grants: owner, batches, busSent, claimWrites })
+
+      const res = await call('mint_agent_token', {
+        agent: AGENT.slug,
+        non_expiring: true,
+        expires_in_days,
+      }, env)
+
+      expect(res.status).toBe(400)
+      expect(batches).toHaveLength(0)
+      expect(claimWrites).toHaveLength(0)
+      expect(busSent).toHaveLength(0)
+      expect(await res.text()).not.toMatch(/credential_claim|mupot_[0-9a-f]{64}|token_hash/)
+    }
+  })
+
+  it('owner_expiry_request_chooses_exactly_one_explicit_mode', async () => {
+    const owner = [{ member_id: OPERATOR, scope_type: 'org' as const, scope_id: null, capability: 'owner' as const }]
+    expect((await call('mint_agent_token', {
+      agent: AGENT.slug,
+      non_expiring: true,
+    }, makeEnv({ grants: owner }))).status).toBe(200)
+    expect((await call('mint_agent_token', {
+      agent: AGENT.slug,
+      expires_in_days: 30,
+    }, makeEnv({ grants: owner }))).status).toBe(200)
   })
 
   // mupot#987: mint_agent_token's tool result must never carry the raw token —
