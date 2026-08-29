@@ -1,6 +1,6 @@
 // tests/supabase-connector.test.ts — Unit tests for 1-Click Supabase Data Connector & Vault Engine (Flight 6).
 
-import { describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   normalizeSupabaseUrl,
   introspectSupabaseSchema,
@@ -10,8 +10,18 @@ import {
 } from '../src/connectors/supabase'
 import { isConnectorType } from '../src/connectors/crypto'
 import { supabaseWebhookApp } from '../src/connectors/supabase-webhook'
+import type { Env } from '../src/types'
+import { applyAllMigrations } from './helpers/migrations'
+import { createSqliteD1 } from './helpers/sqlite-d1'
 
 describe('1-Click Supabase Data Connector & Engine (Flight 6)', () => {
+  let harness: ReturnType<typeof createSqliteD1>
+
+  beforeEach(() => {
+    vi.restoreAllMocks()
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+  })
   it('recognizes supabase as a valid connector type in crypto engine', () => {
     expect(isConnectorType('supabase')).toBe(true)
     expect(isConnectorType('unknown_type')).toBe(false)
@@ -173,19 +183,14 @@ describe('1-Click Supabase Data Connector & Engine (Flight 6)', () => {
       old_record: null,
     }
 
-    const mockEnv = {
+    const mockBusSend = vi.fn().mockResolvedValue(undefined)
+    const env = {
       TENANT_SLUG: 'gaf',
       BUS: {
-        send: vi.fn().mockResolvedValue(undefined),
+        send: mockBusSend,
       },
-      DB: {
-        prepare: vi.fn().mockReturnValue({
-          bind: vi.fn().mockReturnValue({
-            first: vi.fn().mockResolvedValue(null),
-          }),
-        }),
-      },
-    }
+      DB: harness.db,
+    } as unknown as Env
 
     const req = new Request('http://localhost/supabase', {
       method: 'POST',
@@ -193,12 +198,13 @@ describe('1-Click Supabase Data Connector & Engine (Flight 6)', () => {
       body: JSON.stringify(payload),
     })
 
-    const res = await supabaseWebhookApp.fetch(req, mockEnv as any)
+    const res = await supabaseWebhookApp.fetch(req, env)
     expect(res.status).toBe(200)
 
     const json = await res.json<{ ok: boolean; event: string; table: string }>()
     expect(json.ok).toBe(true)
     expect(json.event).toBe('supabase.record.insert')
     expect(json.table).toBe('warranty_claims')
+    expect(mockBusSend).toHaveBeenCalledOnce()
   })
 })
