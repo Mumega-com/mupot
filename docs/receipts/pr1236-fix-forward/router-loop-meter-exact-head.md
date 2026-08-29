@@ -54,8 +54,8 @@ Composition commands ran at `316877c35ca6419124e7e0b6529940c63d2db969` unless no
 | operator-counts self + guard | 0 / 0 | 7/7; 48 dashboard files, zero duplicate implementations |
 | branch-staleness self + `BASE_REF=main` guard | 0 / 0 | 10/10; no contested files, 0 behind origin/main |
 | design-status policy | 0 | policy OK |
-| CI-spelled plugin `python -m compileall` / `python -m pytest` | 127 / 127 | host has no `python`; not a green CI result |
-| diagnostic `python3` plugin compile / tests | 0 / 0 | Python 3.12.3; pytest 105 passed |
+| CI-spelled plugin `python -m compileall -q plugin` | 0 | PATH shim supplied `python`; exact command unchanged |
+| CI-spelled plugin `python -m pytest plugin/tests` | 0 | 105 passed |
 | `bash scripts/ci-local-evidence.sh` | 0 | local D1, Wrangler, browser smoke, runtime conformance, routine lifecycle |
 | composition diff check | 0 | clean |
 | primary focused suites | 0 | 4 files, 59 tests at `3d2af417` |
@@ -63,13 +63,20 @@ Composition commands ran at `316877c35ca6419124e7e0b6529940c63d2db969` unless no
 
 The first local-evidence run was interrupted by the harness with its local Wrangler child still alive. The exact local child was stopped, endpoint freedom verified, and the full command rerun to exit `0`; no remote endpoint or production database was selected.
 
+The host has `/usr/bin/python3` (resolved target `/usr/bin/python3.12`) but no
+`python` name. For the two exact CI-spelled plugin commands only, PATH was
+prefixed with disposable `/tmp/mupot-ir4-python-shim.qp1OoF`, whose sole
+`python` symlink pointed to that target; the directory and symlink were then
+removed. This is environment-equivalent to GitHub Actions `setup-python`,
+which supplies the `python` alias. No repository or runtime code changed.
+
 ## Deferred minors
 
 Task 4 deferred: optional `agent_id: null` despite string schema; successful manifest-cycle tests do not assert `recordTokens` subject-key parity; positive non-finite estimates normalize to zero rather than fail closed. These remain Minors, not resolved by this receipt.
 
 ## Primary versus composition posture
 
-Primary has focused and diff-hygiene evidence only; it is not independently full-gated here. Its historical pre-composition posture was red: Task 4 recorded 6,685 passing Vitest tests plus two inherited dispatcher failures and typecheck exit `2`. That is not a primary-head green claim. Composition is the only current full-suite/typecheck/guard evidence, and it remains non-CI-equivalent because the host lacks the CI-spelled `python` executable.
+Primary has focused and diff-hygiene evidence only; it is not independently full-gated here. Its historical pre-composition posture was red: Task 4 recorded 6,685 passing Vitest tests plus two inherited dispatcher failures and typecheck exit `2`. That is not a primary-head green claim. Composition is the only current full-suite/typecheck/guard evidence. Its exact plugin commands now have environment-equivalent PASS evidence through the disposable `setup-python`-equivalent alias described above.
 
 ## Gate and Athena posture
 
