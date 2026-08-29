@@ -139,6 +139,62 @@ describe('runLoopCycle — canonical meter owner resolution', () => {
     }))
   })
 
+  it('records a successful agent-owned cycle against the reserved meter subject', async () => {
+    const meterCheck = vi.fn(async () => ({
+      ok: true as const,
+      windowKey: 't:a1:2026-08-29',
+      count: 1,
+      tokens: 0,
+    }))
+    const recordTokens = vi.fn(async () => undefined)
+
+    const result = await runLoopCycle(ENV, makeLoop(), {
+      meterCheck,
+      resolve: resolveReturning([{ id: 'p1' }]),
+      reason: async () => [],
+      recordTokens,
+      observeKpi: async () => 0,
+    })
+
+    expect(result.ok).toBe(true)
+    expect(meterCheck).toHaveBeenCalledTimes(1)
+    expect(recordTokens).toHaveBeenCalledWith(
+      ENV,
+      'a1',
+      expect.any(Number),
+      expect.any(Number),
+    )
+    expect(recordTokens.mock.calls[0][1]).toBe(meterCheck.mock.calls[0][1].meterSubjectId)
+  })
+
+  it('records a successful squad-owned cycle against the reserved meter subject', async () => {
+    const meterCheck = vi.fn(async () => ({
+      ok: true as const,
+      windowKey: 't:s2:2026-08-29',
+      count: 1,
+      tokens: 0,
+    }))
+    const recordTokens = vi.fn(async () => undefined)
+
+    const result = await runLoopCycle(ENV, makeLoop({ agent_id: null, squad_id: 's2' }), {
+      meterCheck,
+      resolve: resolveReturning([{ id: 'p1' }]),
+      reason: async () => [],
+      recordTokens,
+      observeKpi: async () => 0,
+    })
+
+    expect(result.ok).toBe(true)
+    expect(meterCheck).toHaveBeenCalledTimes(1)
+    expect(recordTokens).toHaveBeenCalledWith(
+      ENV,
+      's2',
+      expect.any(Number),
+      expect.any(Number),
+    )
+    expect(recordTokens.mock.calls[0][1]).toBe(meterCheck.mock.calls[0][1].meterSubjectId)
+  })
+
   it.each([
     ['inactive agent', { agent_id: 'a-paused', squad_id: null }],
     ['missing agent', { agent_id: 'a-missing', squad_id: null }],

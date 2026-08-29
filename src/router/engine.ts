@@ -121,8 +121,32 @@ export async function runRouterTick(
         WHERE id = ?3
           AND squad_id = ?4
           AND status = 'open'
-          AND assignee_agent_id IS NULL`,
-    ).bind(candidate.id, now, task.id, squadId).run()
+          AND assignee_agent_id IS NULL
+          AND EXISTS (
+            SELECT 1
+              FROM agents a
+              JOIN presence presence_now
+                ON presence_now.agent_id = a.id
+               AND presence_now.tenant = ?5
+             WHERE a.id = ?1
+               AND a.squad_id = ?4
+               AND a.status = 'active'
+               AND presence_now.last_seen_at >= datetime('now', '-10 minutes')
+          )
+          AND (
+            project_id IS NULL
+            OR EXISTS (
+              SELECT 1
+                FROM projects project_now
+                JOIN project_squad_access access_now
+                  ON access_now.project_id = project_now.id
+                 AND access_now.squad_id = tasks.squad_id
+                 AND access_now.access_level IN ('write', 'admin')
+               WHERE project_now.id = tasks.project_id
+                 AND project_now.status = 'active'
+            )
+          )`,
+    ).bind(candidate.id, now, task.id, squadId, decision.tenant).run()
 
     if (claim.meta.changes !== 1) {
       decisions.push({ task_id: task.id, outcome: 'lost_claim', agent_id: candidate.id })

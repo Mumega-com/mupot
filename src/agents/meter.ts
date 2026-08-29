@@ -96,6 +96,9 @@ export function buildAuthorizedMeterExecution(
   env: Env,
   policy: AuthorizedMeterPolicy,
 ): AuthorizedExecution {
+  if (!Number.isFinite(policy.estimateMicroUsd)) {
+    throw new Error('invalid_meter_estimate')
+  }
   return {
     tenant: env.TENANT_SLUG,
     meterSubjectId: policy.meterSubjectId,
@@ -106,7 +109,7 @@ export function buildAuthorizedMeterExecution(
     maxCostMicroUsd: policy.maxCostMicroUsd,
     costWindow: policy.costWindow,
     estimateMicroUsd:
-      Number.isFinite(policy.estimateMicroUsd) && policy.estimateMicroUsd > 0
+      policy.estimateMicroUsd > 0
         ? Math.round(policy.estimateMicroUsd)
         : 0,
   }
