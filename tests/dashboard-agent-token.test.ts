@@ -18,6 +18,7 @@ import {
   cancelAgentTokenReplacementReservation,
   findAgentTokenReplacementHandoff,
   markAgentTokenReplacementAuditSent,
+  markAgentTokenReplacementClaimReady,
   mintAgentBoundToken,
   prepareAgentTokenReplacement,
   sha256Hex,
@@ -296,7 +297,11 @@ function createMigratedMintEnv(): {
   }
 }
 
-function createReplacementSurfaceEnv(opts: { busFails?: { value: boolean }; claimFails?: { value: boolean } } = {}): {
+function createReplacementSurfaceEnv(opts: {
+  busFails?: { value: boolean }
+  claimFails?: { value: boolean }
+  claimBarrier?: { entered(): void; wait: Promise<void> }
+} = {}): {
   env: Env
   sqlite: ReturnType<typeof createSqliteD1>['sqlite']
   claims: Map<string, string>
@@ -320,6 +325,8 @@ function createReplacementSurfaceEnv(opts: { busFails?: { value: boolean }; clai
       SESSIONS: {
         get: async (key: string) => claims.get(key) ?? null,
         put: async (key: string, value: string) => {
+          opts.claimBarrier?.entered()
+          if (opts.claimBarrier) await opts.claimBarrier.wait
           if (opts.claimFails?.value) throw new Error('claim unavailable')
           claims.set(key, value)
         },
@@ -330,6 +337,17 @@ function createReplacementSurfaceEnv(opts: { busFails?: { value: boolean }; clai
     claims,
     bus,
     close: harness.close,
+  }
+}
+
+function deferredBarrier(): { started: Promise<void>; entered(): void; release(): void; wait: Promise<void> } {
+  let start!: () => void
+  let release!: () => void
+  return {
+    started: new Promise<void>((resolve) => { start = resolve }),
+    wait: new Promise<void>((resolve) => { release = resolve }),
+    entered: start,
+    release,
   }
 }
 
@@ -579,6 +597,7 @@ describe('mintAgentBoundToken — canonical SQLite identity', () => {
       })
       const resumed = await findAgentTokenReplacementHandoff(harness.env, AGENT.id, prior.tokenId)
       expect(resumed?.id).toBe(staged.id)
+      await markAgentTokenReplacementClaimReady(harness.env, staged.id)
       await markAgentTokenReplacementAuditSent(harness.env, staged.id)
       await activateAgentTokenReplacement(harness.env, staged.id)
 
@@ -696,6 +715,57 @@ describe('mintAgentBoundToken — canonical SQLite identity', () => {
       surface.close()
     }
   })
+
+  it('claim_failure_racing_retry_cannot_mark_audit_sent_without_claim', async () => {
+    const claimFails = { value: true }
+    const barrier = deferredBarrier()
+    const surface = createReplacementSurfaceEnv({ claimFails, claimBarrier: barrier })
+    try {
+      await seedReplacementSurfaceOperator(surface)
+      const prior = await mintAgentBoundToken(surface.env, AGENT, 'prior')
+      const first = callReplacementMint(surface.env, prior.tokenId)
+      await barrier.started
+      const retry = await callReplacementMint(surface.env, prior.tokenId)
+      expect(retry.status).toBe(503)
+      expect(surface.bus).toHaveLength(0)
+      expect(surface.sqlite.prepare("SELECT audit_state FROM agent_token_rotation_handoffs").get())
+        .toEqual({ audit_state: 'pending' })
+      barrier.release()
+      expect((await first).status).toBe(503)
+      expect(surface.sqlite.prepare('SELECT COUNT(*) AS count FROM agent_token_rotation_handoffs').get())
+        .toEqual({ count: 0 })
+      expect(surface.sqlite.prepare('SELECT revoked_at FROM member_tokens WHERE id = ?').get(prior.tokenId))
+        .toEqual({ revoked_at: null })
+      expect(credentialClaimCount(surface)).toBe(0)
+      expect(surface.bus).toHaveLength(0)
+    } finally {
+      surface.close()
+    }
+  })
+
+  it('claim_failure_racing_retry_leaves_no_stranded_handoff', async () => {
+    const claimFails = { value: true }
+    const barrier = deferredBarrier()
+    const surface = createReplacementSurfaceEnv({ claimFails, claimBarrier: barrier })
+    try {
+      await seedReplacementSurfaceOperator(surface)
+      const prior = await mintAgentBoundToken(surface.env, AGENT, 'prior')
+      const first = callReplacementMint(surface.env, prior.tokenId)
+      await barrier.started
+      await callReplacementMint(surface.env, prior.tokenId)
+      barrier.release()
+      await first
+      expect(surface.sqlite.prepare('SELECT COUNT(*) AS count FROM agent_token_rotation_handoffs').get())
+        .toEqual({ count: 0 })
+      claimFails.value = false
+      expect((await callReplacementMint(surface.env, prior.tokenId)).status).toBe(200)
+      expect(surface.sqlite.prepare('SELECT COUNT(*) AS count FROM member_tokens WHERE agent_id = ? AND revoked_at IS NULL').get(AGENT.id))
+        .toEqual({ count: 1 })
+    } finally {
+      surface.close()
+    }
+  })
+
 
   it('keeps one member and its committed home grant after every token is revoked', async () => {
     const harness = createMigratedMintEnv()
