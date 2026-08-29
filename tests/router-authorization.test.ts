@@ -4,6 +4,19 @@ import type { AuthContext, CapabilityGrant, Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
+vi.mock('../src/agents/agent-do', () => ({ AgentDO: class {} }))
+vi.mock('../src/agents/squad-do', () => ({ SquadCoordinatorDO: class {} }))
+vi.mock('../src/registry/presence-channel-do', () => ({ PresenceChannelDO: class {} }))
+vi.mock('../src/workflows/task-workflow', () => ({ TaskWorkflow: class {} }))
+vi.mock('../src/mcp/oauth-api-handler', () => ({ McpOAuthApiHandler: class {} }))
+vi.mock('@cloudflare/workers-oauth-provider', () => ({
+  OAuthProvider: class {
+    fetch() { throw new Error('outer OAuth provider is not used by router root route tests') }
+  },
+}))
+
+const { app } = await import('../src/index')
+
 const TENANT = 'router-test'
 const SQUAD_A = 'squad-a'
 const SQUAD_B = 'squad-b'
@@ -33,16 +46,18 @@ function seed(sqlite: SqliteD1Harness['sqlite']): void {
     INSERT INTO squads (id, department_id, slug, name) VALUES
       ('${SQUAD_A}', 'dept', 'a', 'Squad A'),
       ('${SQUAD_B}', 'dept', 'b', 'Squad B');
-    INSERT INTO members (id, display_name, status, tenant) VALUES
-      ('member-a', 'Member A', 'active', '${TENANT}'),
-      ('lead-a', 'Lead A', 'active', '${TENANT}'),
-      ('lead-b', 'Lead B', 'active', '${TENANT}'),
-      ('observer-a', 'Observer A', 'active', '${TENANT}');
+    INSERT INTO members (id, email, display_name, status, tenant) VALUES
+      ('member-a', 'member-a@example.test', 'Member A', 'active', '${TENANT}'),
+      ('lead-a', 'lead-a@example.test', 'Lead A', 'active', '${TENANT}'),
+      ('lead-b', 'lead-b@example.test', 'Lead B', 'active', '${TENANT}'),
+      ('observer-a', 'observer-a@example.test', 'Observer A', 'active', '${TENANT}'),
+      ('org-admin', 'org-admin@example.test', 'Org Admin', 'active', '${TENANT}');
     INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES
       ('member-a-cap', 'member-a', 'squad', '${SQUAD_A}', 'member'),
       ('lead-a-cap', 'lead-a', 'squad', '${SQUAD_A}', 'lead'),
       ('lead-b-cap', 'lead-b', 'squad', '${SQUAD_B}', 'lead'),
-      ('observer-a-cap', 'observer-a', 'squad', '${SQUAD_A}', 'observer');
+      ('observer-a-cap', 'observer-a', 'squad', '${SQUAD_A}', 'observer'),
+      ('org-admin-cap', 'org-admin', 'org', NULL, 'admin');
     INSERT INTO agents (id, squad_id, slug, name, status) VALUES
       ('${AGENT_A}', '${SQUAD_A}', 'agent-a', 'Agent A', 'active'),
       ('${AGENT_B}', '${SQUAD_B}', 'agent-b', 'Agent B', 'active');
@@ -104,6 +119,39 @@ function makeEnv(harness: SqliteD1Harness, options: {
 
 async function routerTick(authContext: AuthContext, env: Env, args: Record<string, unknown>) {
   return invokeTool(authContext, env, 'router_tick', args, 'https://pot.example')
+}
+
+function rootEnv(harness: SqliteD1Harness, session: string | null): Env {
+  return {
+    DB: harness.db,
+    TENANT_SLUG: TENANT,
+    SESSIONS: {
+      get: async (key: string) => key === 'sess:router' ? session : null,
+      put: async () => undefined,
+      delete: async () => undefined,
+    },
+    BUS: { send: vi.fn(async () => undefined) },
+  } as unknown as Env
+}
+
+function rootRequest(path: string, body?: unknown, authenticated = false): Request {
+  return new Request(`https://pot.example${path}`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      ...(authenticated ? { Cookie: 'mupot_session=router' } : {}),
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  })
+}
+
+function sessionFor(memberId: string): string {
+  return JSON.stringify({
+    userId: memberId,
+    email: `${memberId}@example.test`,
+    role: 'member',
+    createdAt: '2026-08-29T00:00:00.000Z',
+  })
 }
 
 describe('router_tick authorization and squad fencing', () => {
@@ -248,5 +296,84 @@ describe('router_tick authorization and squad fencing', () => {
     ])
     expect(writes.value).toBe(0)
     expect(events).toHaveLength(0)
+  })
+
+  it('keeps the ordinary MCP presence update for router mutation', async () => {
+    insertTask(harness.sqlite, 'task-a', SQUAD_A)
+    const writes = { value: 0 }
+    const { env } = makeEnv(harness, { writes })
+    const deferred: Promise<unknown>[] = []
+
+    const result = await invokeTool(
+      auth('lead-a', [grant('lead-a', 'lead', SQUAD_A)]),
+      env,
+      'router_tick',
+      { squad_id: SQUAD_A, dry_run: false },
+      { origin: 'https://pot.example', waitUntil: (promise) => deferred.push(promise) },
+    )
+    await Promise.all(deferred)
+
+    expect(result).toMatchObject({ ok: true, result: { assigned: 1 } })
+    expect(writes.value).toBeGreaterThan(1)
+    expect(harness.sqlite.prepare('SELECT member_id FROM presence WHERE tenant = ? AND member_id = ?').get(TENANT, 'lead-a')).toEqual({ member_id: 'lead-a' })
+  })
+
+  it('rejects malformed dry_run before it can select a presence-touch branch', async () => {
+    const writes = { value: 0 }
+    const { env } = makeEnv(harness, { writes })
+    const deferred: Promise<unknown>[] = []
+
+    const result = await invokeTool(
+      auth('lead-a', [grant('lead-a', 'lead', SQUAD_A)]),
+      env,
+      'router_tick',
+      { squad_id: SQUAD_A, dry_run: 'false' },
+      { origin: 'https://pot.example', waitUntil: (promise) => deferred.push(promise) },
+    )
+    await Promise.all(deferred)
+
+    expect(result).toMatchObject({ ok: false, status: 400, error: 'invalid_args' })
+    expect(writes.value).toBe(0)
+  })
+})
+
+describe('root-mounted router REST route', () => {
+  let harness: SqliteD1Harness
+
+  beforeEach(() => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    seed(harness.sqlite)
+  })
+
+  afterEach(() => harness.close())
+
+  it('requires authentication on POST /api/router/tick', async () => {
+    const response = await app.fetch(rootRequest('/api/router/tick', { squad_id: SQUAD_A, dry_run: false }), rootEnv(harness, null))
+    expect(response.status).toBe(401)
+  })
+
+  it('rejects an authenticated non-admin on POST /api/router/tick', async () => {
+    const response = await app.fetch(
+      rootRequest('/api/router/tick', { squad_id: SQUAD_A, dry_run: false }, true),
+      rootEnv(harness, sessionFor('lead-a')),
+    )
+    expect(response.status).toBe(403)
+  })
+
+  it('runs the same named-squad engine only at POST /api/router/tick', async () => {
+    insertTask(harness.sqlite, 'task-a', SQUAD_A)
+    const env = rootEnv(harness, sessionFor('org-admin'))
+
+    const missingSquad = await app.fetch(rootRequest('/api/router/tick', { dry_run: false }, true), env)
+    expect(missingSquad.status).toBe(400)
+
+    const response = await app.fetch(rootRequest('/api/router/tick', { squad_id: SQUAD_A, dry_run: false }, true), env)
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toMatchObject({ ok: true, result: { squad_id: SQUAD_A, assigned: 1 } })
+    expect(harness.sqlite.prepare('SELECT assignee_agent_id FROM tasks WHERE id = ?').get('task-a')).toEqual({ assignee_agent_id: AGENT_A })
+
+    const duplicatedChild = await app.fetch(rootRequest('/api/router/tick/tick', { squad_id: SQUAD_A, dry_run: false }, true), env)
+    expect(duplicatedChild.status).toBe(404)
   })
 })
