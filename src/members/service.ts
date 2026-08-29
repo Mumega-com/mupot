@@ -13,7 +13,7 @@
 
 import type { D1PreparedStatement } from '@cloudflare/workers-types'
 import type { Env, MemberToken, ConnectionChannel, Capability, CapabilityGrant } from '../types'
-import { assertBatchWritten, rowsWritten } from '../lib/receipt'
+import { assertBatchWritten, assertWritten, rowsWritten } from '../lib/receipt'
 import {
   calculateExpiryTimestamp,
   DEFAULT_TOKEN_EXPIRY_DAYS,
@@ -235,11 +235,14 @@ export interface AgentTokenReplacementHandoff {
   priorTokenId: string
   replacementTokenId: string
   claim: AgentTokenReplacementClaim
+  claimPutLeaseExpiresAt: string
   auditState: 'pending' | 'sent'
   state: 'pending' | 'active'
   createdAt: string
   activatedAt: string | null
 }
+
+export const AGENT_TOKEN_REPLACEMENT_CLAIM_PUT_LEASE_SECONDS = 60
 
 export interface AgentTokenReplacementMetadata {
   label: string
@@ -618,6 +621,7 @@ function rowToReplacementHandoff(row: {
   claim_id: string
   claim_fingerprint: string
   claim_expires_at: string
+  claim_put_lease_expires_at: string
   minted_by_member_id: string
   audit_state: 'pending' | 'sent'
   state: 'pending' | 'active'
@@ -637,6 +641,7 @@ function rowToReplacementHandoff(row: {
       expiresAt: row.claim_expires_at,
       mintedByMemberId: row.minted_by_member_id,
     },
+    claimPutLeaseExpiresAt: row.claim_put_lease_expires_at,
     auditState: row.audit_state,
     state: row.state,
     createdAt: row.created_at,
@@ -652,7 +657,7 @@ export async function findAgentTokenReplacementHandoff(
   const row = await env.DB.prepare(
     `SELECT id, tenant, agent_id, member_id, prior_token_id, replacement_token_id,
             claim_id, claim_fingerprint, claim_expires_at, minted_by_member_id,
-            audit_state, state, created_at, activated_at
+            claim_put_lease_expires_at, audit_state, state, created_at, activated_at
        FROM agent_token_rotation_handoffs
       WHERE tenant = ? AND agent_id = ? AND prior_token_id = ?
       LIMIT 1`,
@@ -666,6 +671,7 @@ export async function findAgentTokenReplacementHandoff(
     claim_id: string
     claim_fingerprint: string
     claim_expires_at: string
+    claim_put_lease_expires_at: string
     minted_by_member_id: string
     audit_state: 'pending' | 'sent'
     state: 'pending' | 'active'
@@ -685,6 +691,9 @@ export async function stageAgentTokenReplacement(
   if (!priorTokenId) throw new AgentTokenReplacementError()
   const handoffId = crypto.randomUUID()
   const now = nowSqlUtc()
+  const claimPutLeaseExpiresAt = new Date(
+    Date.now() + AGENT_TOKEN_REPLACEMENT_CLAIM_PUT_LEASE_SECONDS * 1000,
+  ).toISOString()
   const livePrior = replacementLivePredicate('prior', '?')
   let writes
   try {
@@ -716,9 +725,10 @@ export async function stageAgentTokenReplacement(
     env.DB.prepare(
       `INSERT INTO agent_token_rotation_handoffs (
         id, tenant, agent_id, member_id, prior_token_id, replacement_token_id,
-        minted_by_member_id, claim_id, claim_fingerprint, claim_expires_at, created_at
+        minted_by_member_id, claim_id, claim_fingerprint, claim_expires_at,
+        claim_put_lease_expires_at, created_at
       )
-       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         WHERE EXISTS (
           SELECT 1 FROM member_tokens prior
            WHERE prior.id = ? AND prior.member_id = ? AND prior.agent_id = ? AND prior.tenant = ?
@@ -735,6 +745,7 @@ export async function stageAgentTokenReplacement(
       claim.claimId,
       claim.fingerprint,
       claim.expiresAt,
+      claimPutLeaseExpiresAt,
       prepared.createdAt,
       priorTokenId,
       prepared.memberId,
@@ -764,6 +775,7 @@ export async function stageAgentTokenReplacement(
     priorTokenId,
     replacementTokenId: prepared.tokenId,
     claim,
+    claimPutLeaseExpiresAt,
     auditState: 'pending',
     state: 'pending',
     createdAt: prepared.createdAt,
@@ -820,24 +832,49 @@ export async function cancelAgentTokenReplacementReservation(
   env: Env,
   handoff: AgentTokenReplacementHandoff,
 ): Promise<void> {
-  const writes = await env.DB.batch([
-    env.DB.prepare(
-      `DELETE FROM agent_token_rotation_handoffs
-        WHERE id = ? AND tenant = ? AND state = 'pending' AND audit_state IN ('pending', 'sent')
-          AND claim_state IN ('pending', 'ready')`,
-    ).bind(handoff.id, env.TENANT_SLUG),
-    env.DB.prepare(
-      `DELETE FROM member_tokens
-        WHERE id = ? AND tenant = ? AND member_id = ? AND agent_id = ? AND revoked_at = ?`,
-    ).bind(
-      handoff.replacementTokenId,
-      env.TENANT_SLUG,
-      handoff.memberId,
-      handoff.agentId,
-      handoff.createdAt,
-    ),
-  ])
-  assertBatchWritten(writes, 'cancel_agent_token_replacement_reservation', 1)
+  const result = await env.DB.prepare(
+    `DELETE FROM agent_token_rotation_handoffs
+      WHERE id = ? AND tenant = ? AND member_id = ? AND agent_id = ?
+        AND prior_token_id = ? AND replacement_token_id = ? AND claim_id = ?
+        AND state = 'pending' AND audit_state IN ('pending', 'sent')
+        AND claim_state IN ('pending', 'ready')`,
+  ).bind(
+    handoff.id,
+    env.TENANT_SLUG,
+    handoff.memberId,
+    handoff.agentId,
+    handoff.priorTokenId,
+    handoff.replacementTokenId,
+    handoff.claim.claimId,
+  ).run()
+  assertWritten(result, 'cancel_agent_token_replacement_reservation')
+}
+
+/** Reclaim an unready reservation only after its explicit KV put lease expires.
+ * The DELETE is the single-winner CAS; migration 0136 atomically removes the
+ * exact inactive replacement in the same SQLite statement. */
+export async function recoverExpiredAgentTokenReplacementReservation(
+  env: Env,
+  handoff: AgentTokenReplacementHandoff,
+): Promise<boolean> {
+  const result = await env.DB.prepare(
+    `DELETE FROM agent_token_rotation_handoffs
+      WHERE id = ? AND tenant = ? AND member_id = ? AND agent_id = ?
+        AND prior_token_id = ? AND replacement_token_id = ? AND claim_id = ?
+        AND state = 'pending' AND audit_state = 'pending' AND claim_state = 'pending'
+        AND claim_put_lease_expires_at IS NOT NULL
+        AND julianday(claim_put_lease_expires_at) <= julianday(?)`,
+  ).bind(
+    handoff.id,
+    env.TENANT_SLUG,
+    handoff.memberId,
+    handoff.agentId,
+    handoff.priorTokenId,
+    handoff.replacementTokenId,
+    handoff.claim.claimId,
+    nowSqlUtc(),
+  ).run()
+  return rowsWritten(result) === 1
 }
 
 export async function isAgentTokenReplacementClaimReady(env: Env, handoffId: string): Promise<boolean> {
@@ -875,11 +912,12 @@ export async function markAgentTokenReplacementAuditSent(
     const existing = await env.DB.prepare(
       `SELECT id, tenant, agent_id, member_id, prior_token_id, replacement_token_id,
               claim_id, claim_fingerprint, claim_expires_at, minted_by_member_id,
-              claim_state, audit_state, state, created_at, activated_at
+              claim_put_lease_expires_at, claim_state, audit_state, state, created_at, activated_at
          FROM agent_token_rotation_handoffs WHERE id = ? AND tenant = ? LIMIT 1`,
     ).bind(handoffId, env.TENANT_SLUG).first<{
       id: string; tenant: string; agent_id: string; member_id: string; prior_token_id: string; replacement_token_id: string
       claim_id: string; claim_fingerprint: string; claim_expires_at: string; minted_by_member_id: string
+      claim_put_lease_expires_at: string
       claim_state: 'pending' | 'ready'
       audit_state: 'pending' | 'sent'; state: 'pending' | 'active'; created_at: string; activated_at: string | null
     }>()
@@ -889,11 +927,12 @@ export async function markAgentTokenReplacementAuditSent(
   const row = await env.DB.prepare(
     `SELECT id, tenant, agent_id, member_id, prior_token_id, replacement_token_id,
             claim_id, claim_fingerprint, claim_expires_at, minted_by_member_id,
-            claim_state, audit_state, state, created_at, activated_at
+            claim_put_lease_expires_at, claim_state, audit_state, state, created_at, activated_at
        FROM agent_token_rotation_handoffs WHERE id = ? AND tenant = ? LIMIT 1`,
   ).bind(handoffId, env.TENANT_SLUG).first<{
     id: string; tenant: string; agent_id: string; member_id: string; prior_token_id: string; replacement_token_id: string
     claim_id: string; claim_fingerprint: string; claim_expires_at: string; minted_by_member_id: string
+    claim_put_lease_expires_at: string
     claim_state: 'pending' | 'ready'
     audit_state: 'pending' | 'sent'; state: 'pending' | 'active'; created_at: string; activated_at: string | null
   }>()
@@ -916,11 +955,12 @@ export async function activateAgentTokenReplacement(
   const row = await env.DB.prepare(
     `SELECT id, tenant, agent_id, member_id, prior_token_id, replacement_token_id,
             claim_id, claim_fingerprint, claim_expires_at, minted_by_member_id,
-            audit_state, state, created_at, activated_at
+            claim_put_lease_expires_at, audit_state, state, created_at, activated_at
        FROM agent_token_rotation_handoffs WHERE id = ? AND tenant = ? LIMIT 1`,
   ).bind(handoffId, env.TENANT_SLUG).first<{
     id: string; tenant: string; agent_id: string; member_id: string; prior_token_id: string; replacement_token_id: string
     claim_id: string; claim_fingerprint: string; claim_expires_at: string; minted_by_member_id: string
+    claim_put_lease_expires_at: string
     audit_state: 'pending' | 'sent'; state: 'pending' | 'active'; created_at: string; activated_at: string | null
   }>()
   if (!row) throw new AgentTokenReplacementError()

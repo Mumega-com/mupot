@@ -306,7 +306,7 @@ function createReplacementSurfaceEnv(opts: {
   kvNowMs?: { value: number }
   stageBatchError?: { value: Error | null }
   markReadyFails?: { value: boolean }
-  cancelBatchFails?: { value: boolean }
+  cancelFails?: { value: boolean }
 } = {}): {
   env: Env
   sqlite: ReturnType<typeof createSqliteD1>['sqlite']
@@ -329,7 +329,9 @@ function createReplacementSurfaceEnv(opts: {
       DB: {
         prepare: (sql: string) => {
           const statement = db.prepare(sql)
-          if (!sql.includes("SET claim_state = 'ready'")) return statement
+          const markReady = sql.includes("SET claim_state = 'ready'")
+          const cancelReservation = sql.includes('DELETE FROM agent_token_rotation_handoffs')
+          if (!markReady && !cancelReservation) return statement
           return {
             ...statement,
             bind: (...values: unknown[]) => {
@@ -337,7 +339,8 @@ function createReplacementSurfaceEnv(opts: {
               return {
                 ...bound,
                 run: async () => {
-                  if (opts.markReadyFails?.value) throw new Error('mark-ready unavailable')
+                  if (markReady && opts.markReadyFails?.value) throw new Error('mark-ready unavailable')
+                  if (cancelReservation && opts.cancelFails?.value) throw new Error('cancel unavailable')
                   return bound.run()
                 },
               } as unknown as D1PreparedStatement
@@ -352,10 +355,8 @@ function createReplacementSurfaceEnv(opts: {
           ) {
             throw opts.stageBatchError.value
           }
-          if (
-            opts.cancelBatchFails?.value
-            && statements.some((statement) =>
-              (statement as unknown as { sql?: string }).sql?.includes('DELETE FROM agent_token_rotation_handoffs'))
+          if (opts.cancelFails?.value && statements.some((statement) =>
+            (statement as unknown as { sql?: string }).sql?.includes('DELETE FROM agent_token_rotation_handoffs'))
           ) {
             throw new Error('cancel unavailable')
           }
@@ -1018,15 +1019,15 @@ describe('mintAgentBoundToken — canonical SQLite identity', () => {
 
   it('mark_ready_and_cancel_double_failure_preserves_claim_for_retry', async () => {
     const markReadyFails = { value: true }
-    const cancelBatchFails = { value: true }
-    const surface = createReplacementSurfaceEnv({ markReadyFails, cancelBatchFails })
+    const cancelFails = { value: true }
+    const surface = createReplacementSurfaceEnv({ markReadyFails, cancelFails })
     try {
       await seedReplacementSurfaceOperator(surface)
       const prior = await mintAgentBoundToken(surface.env, AGENT, 'prior')
 
       expect((await callReplacementMint(surface.env, prior.tokenId)).status).toBe(503)
       markReadyFails.value = false
-      cancelBatchFails.value = false
+      cancelFails.value = false
 
       expect((await callReplacementMint(surface.env, prior.tokenId)).status).toBe(200)
       expect(credentialClaimCount(surface)).toBe(1)
@@ -1038,6 +1039,112 @@ describe('mintAgentBoundToken — canonical SQLite identity', () => {
         'SELECT COUNT(*) AS count FROM member_tokens WHERE agent_id = ? AND revoked_at IS NULL',
       ).get(AGENT.id)).toEqual({ count: 1 })
     } finally {
+      surface.close()
+    }
+  })
+
+  it('expired_unready_handoff_is_reclaimed_once_then_rotation_can_restart', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-29T12:00:00.000Z'))
+    const surface = createReplacementSurfaceEnv({ kvNowMs: { value: Date.now() } })
+    try {
+      await seedReplacementSurfaceOperator(surface)
+      const prior = await mintAgentBoundToken(surface.env, AGENT, 'prior')
+      const prepared = await prepareAgentTokenReplacement(surface.env, AGENT, 'replacement', {
+        revokePriorTokenId: prior.tokenId,
+      })
+      await stageAgentTokenReplacement(surface.env, AGENT, prepared, {
+        claimId: 'claim-crash-after-stage',
+        fingerprint: '0123456789abcdef',
+        expiresAt: '2026-08-29T12:10:00.000Z',
+        mintedByMemberId: 'operator-replacement',
+      })
+
+      expect((await callReplacementMint(surface.env, prior.tokenId)).status).toBe(503)
+      expect(surface.sqlite.prepare('SELECT COUNT(*) AS count FROM agent_token_rotation_handoffs').get())
+        .toEqual({ count: 1 })
+
+      vi.setSystemTime(new Date('2026-08-29T12:01:01.000Z'))
+      surface.kvNowMs.value = Date.now()
+      expect((await callReplacementMint(surface.env, prior.tokenId)).status).toBe(503)
+      expect(surface.sqlite.prepare('SELECT COUNT(*) AS count FROM agent_token_rotation_handoffs').get())
+        .toEqual({ count: 0 })
+      expect(surface.sqlite.prepare('SELECT COUNT(*) AS count FROM member_tokens WHERE agent_id = ?').get(AGENT.id))
+        .toEqual({ count: 1 })
+      expect(surface.sqlite.prepare('SELECT revoked_at FROM member_tokens WHERE id = ?').get(prior.tokenId))
+        .toEqual({ revoked_at: null })
+
+      expect((await callReplacementMint(surface.env, prior.tokenId)).status).toBe(200)
+      expect(credentialClaimCount(surface)).toBe(1)
+      expect(surface.sqlite.prepare(
+        'SELECT COUNT(*) AS count FROM member_tokens WHERE agent_id = ? AND revoked_at IS NULL',
+      ).get(AGENT.id)).toEqual({ count: 1 })
+    } finally {
+      vi.useRealTimers()
+      surface.close()
+    }
+  })
+
+  it('claim_failure_and_cancel_failure_recover_after_put_lease_expiry', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-29T12:00:00.000Z'))
+    const claimFails = { value: true }
+    const cancelFails = { value: true }
+    const surface = createReplacementSurfaceEnv({ claimFails, cancelFails, kvNowMs: { value: Date.now() } })
+    try {
+      await seedReplacementSurfaceOperator(surface)
+      const prior = await mintAgentBoundToken(surface.env, AGENT, 'prior')
+
+      expect((await callReplacementMint(surface.env, prior.tokenId)).status).toBe(503)
+      expect(credentialClaimCount(surface)).toBe(0)
+      expect(surface.sqlite.prepare('SELECT COUNT(*) AS count FROM agent_token_rotation_handoffs').get())
+        .toEqual({ count: 1 })
+      expect((await callReplacementMint(surface.env, prior.tokenId)).status).toBe(503)
+
+      vi.setSystemTime(new Date('2026-08-29T12:01:01.000Z'))
+      surface.kvNowMs.value = Date.now()
+      claimFails.value = false
+      cancelFails.value = false
+      expect((await callReplacementMint(surface.env, prior.tokenId)).status).toBe(503)
+      expect(surface.sqlite.prepare('SELECT COUNT(*) AS count FROM agent_token_rotation_handoffs').get())
+        .toEqual({ count: 0 })
+
+      expect((await callReplacementMint(surface.env, prior.tokenId)).status).toBe(200)
+      expect(credentialClaimCount(surface)).toBe(1)
+      expect(surface.sqlite.prepare(
+        'SELECT COUNT(*) AS count FROM member_tokens WHERE agent_id = ? AND revoked_at IS NULL',
+      ).get(AGENT.id)).toEqual({ count: 1 })
+    } finally {
+      vi.useRealTimers()
+      surface.close()
+    }
+  })
+
+  it('late_claim_after_expired_lease_recovery_is_burned', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-29T12:00:00.000Z'))
+    const barrier = deferredBarrier()
+    const surface = createReplacementSurfaceEnv({ claimBarrier: barrier, kvNowMs: { value: Date.now() } })
+    try {
+      await seedReplacementSurfaceOperator(surface)
+      const prior = await mintAgentBoundToken(surface.env, AGENT, 'prior')
+      const first = callReplacementMint(surface.env, prior.tokenId)
+      await barrier.started
+
+      vi.setSystemTime(new Date('2026-08-29T12:01:01.000Z'))
+      surface.kvNowMs.value = Date.now()
+      expect((await callReplacementMint(surface.env, prior.tokenId)).status).toBe(503)
+      expect(surface.sqlite.prepare('SELECT COUNT(*) AS count FROM agent_token_rotation_handoffs').get())
+        .toEqual({ count: 0 })
+
+      barrier.release()
+      expect((await first).status).toBe(503)
+      expect(credentialClaimCount(surface)).toBe(0)
+      expect(surface.sqlite.prepare('SELECT COUNT(*) AS count FROM member_tokens WHERE agent_id = ?').get(AGENT.id))
+        .toEqual({ count: 1 })
+    } finally {
+      barrier.release()
+      vi.useRealTimers()
       surface.close()
     }
   })

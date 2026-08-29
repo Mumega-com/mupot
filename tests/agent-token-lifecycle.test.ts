@@ -51,6 +51,7 @@ interface Opts {
   busReject?: { value: boolean }
   claimReject?: boolean
   claimWrites?: string[]
+  cancellations?: string[]
 }
 
 function makeEnv(opts: Opts = {}): Env {
@@ -122,6 +123,10 @@ function makeEnv(opts: Opts = {}): Env {
           return { results: [] }
         },
         async run() {
+          if (sql.includes('DELETE FROM agent_token_rotation_handoffs')) {
+            opts.cancellations?.push(String(args[0]))
+            replacementHandoff = null
+          }
           if (sql.includes("UPDATE agent_token_rotation_handoffs") && replacementHandoff) {
             if (sql.includes("audit_state = 'sent'")) replacementHandoff.audit_state = 'sent'
             if (sql.includes("state = 'active'")) replacementHandoff.state = 'active'
@@ -145,8 +150,8 @@ function makeEnv(opts: Opts = {}): Env {
           replacementHandoff = {
             id: args[0], tenant: args[1], agent_id: args[2], member_id: args[3], prior_token_id: args[4],
             replacement_token_id: args[5], minted_by_member_id: args[6], claim_id: args[7],
-            claim_fingerprint: args[8], claim_expires_at: args[9], audit_state: 'pending', state: 'pending',
-            created_at: args[10], activated_at: null,
+            claim_fingerprint: args[8], claim_expires_at: args[9], claim_put_lease_expires_at: args[10],
+            audit_state: 'pending', state: 'pending', created_at: args[11], activated_at: null,
           }
         }
         return stmts.map(() => ({ meta: { changes: 1 } }))
@@ -520,20 +525,23 @@ describe('Flight-002: mint_agent_token expiry and rotation', () => {
   it('replacement_claim_failure_preserves_prior_and_leaves_no_live_replacement', async () => {
     const batches: unknown[][] = []
     const busSent: unknown[] = []
+    const cancellations: string[] = []
     const env = makeEnv({
       liveReplacementToken: true,
       memberBinding: 'member-agent-1',
       claimReject: true,
       batches,
       busSent,
+      cancellations,
     })
 
     const res = await call('mint_agent_token', { agent: AGENT.slug, rotate_prior_token_id: 'tok-old' }, env)
 
     expect(res.status).toBe(503)
     expect(await res.text()).not.toMatch(/credential_claim|mupot_|token_hash/)
-    // Reservation then compensating cleanup; no claim or bus handoff is emitted.
-    expect(batches).toHaveLength(2)
+    // Reservation then one atomic trigger-backed DELETE cleanup; no claim or bus handoff is emitted.
+    expect(batches).toHaveLength(1)
+    expect(cancellations).toHaveLength(1)
     expect(busSent).toHaveLength(0)
   })
 

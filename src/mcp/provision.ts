@@ -26,7 +26,7 @@
 //   register_agent_key — admin on the agent's squad → public-only signed-runtime identity
 
 import type { Capability, CapabilityGrant, ConnectionChannel, Env, BusEvent, Squad } from '../types'
-import { hasCapability } from '../auth/capability'
+import { hasCapability, isOrgAdmin } from '../auth/capability'
 import {
   createDepartment,
   createSquad,
@@ -49,6 +49,7 @@ import {
   markAgentTokenReplacementAuditSent,
   markAgentTokenReplacementClaimReady,
   isAgentTokenReplacementClaimReady,
+  recoverExpiredAgentTokenReplacementReservation,
   loadAgentTokenReplacementMetadata,
   prepareAgentTokenReplacement,
   resolveAgentMemberBinding,
@@ -533,6 +534,19 @@ const toolMintAgentToken: ToolSpec = {
     const agentRef = str(args.agent)
     if (!agentRef) return fail(400, 'invalid_args', 'agent required')
 
+    const replacementSupplied = Object.prototype.hasOwnProperty.call(args, 'rotate_prior_token_id')
+    const rotatePriorTokenId = replacementSupplied ? str(args.rotate_prior_token_id) : null
+    // Rotation is an org credential-authority act. This server-derived gate is
+    // deliberately before agent resolution and every token/handoff lookup so a
+    // scoped admin receives one uniform denial for existing, missing, and
+    // ambiguous targets.
+    if (replacementSupplied && !isOrgAdmin(auth)) {
+      return fail(403, 'forbidden', { need: 'admin', scope: 'org' })
+    }
+    if (replacementSupplied && !rotatePriorTokenId) {
+      return fail(400, 'invalid_replacement_token_id')
+    }
+
     const agentResult = await resolveAgentRef(env, agentRef)
     if (!agentResult.ok) return resolveFail(agentResult.reason, 'agent_not_found')
     const agent = agentResult.value
@@ -561,12 +575,6 @@ const toolMintAgentToken: ToolSpec = {
     })
     if (!expiry.ok) return fail(400, expiry.code)
     const expiresAt = expiry.expiresAt
-
-    const replacementSupplied = Object.prototype.hasOwnProperty.call(args, 'rotate_prior_token_id')
-    const rotatePriorTokenId = replacementSupplied ? str(args.rotate_prior_token_id) : null
-    if (replacementSupplied && !rotatePriorTokenId) {
-      return fail(400, 'invalid_replacement_token_id')
-    }
 
     const canonical = requiredCanonicalOrigin(env)
     if (!canonical.ok) return fail(503, canonical.error)
@@ -651,6 +659,12 @@ const toolMintAgentToken: ToolSpec = {
           // discard; an in-flight claim remains reserved and retryable.
           if (claimReady) {
             await discardReplacementHandoff(env, handoff)
+          } else {
+            // Before the durable put lease expires, absence may mean the KV put
+            // is still in flight, so fail closed without touching the winner.
+            // After expiry, one exact DELETE CAS reclaims the reservation and
+            // its inactive token atomically; concurrent retries are no-ops.
+            await recoverExpiredAgentTokenReplacementReservation(env, handoff)
           }
           return fail(503, 'replacement_handoff_pending')
         }
