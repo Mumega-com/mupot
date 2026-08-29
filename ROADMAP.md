@@ -105,7 +105,10 @@ A **Journey Roadmap** groups interconnected tactical flights into cohesive, outc
 | 12| **FLIGHT DEV-03** — peripheral gates | `v0.31.0` | local ML, worktree fs, audio, vision, and GPIO capability governance | MU.200.001 | **LANDED 2026-08-29** |
 | 13| **FLIGHT DEV-04** — offline journal | `v0.31.0` | offline-first SQLite journal buffer and edge sync deduplication | MU.200.001 | **LANDED 2026-08-29** |
 | 14| **FLIGHT DEV-05** — power & wake | `v0.31.0` | hardware power states and Wake-on-Demand exact-seat mesh dispatch | MU.200.001 | **LANDED 2026-08-29** |
-| 15| **FLIGHT ONBOARD-REPO** | `v0.30.0` | autonomous repo sensing & `agents/<slug>/` workspace scaffolding | — | NEXT |
+| 15| **FLIGHT ONBOARD-REPO** | `v0.30.0` | autonomous repo sensing & `agents/<slug>/` workspace scaffolding | — | **LANDED 2026-08-29** |
+| 16| **FLIGHT ONBOARD-SAAS** | `v0.30.0` | 1-click starter squad packs & business setup (/send first task) | — | **LANDED 2026-08-29** |
+| 17| **FLIGHT ONBOARD-MCP** | `v0.30.0` | 10-second desktop connect bundle generator (Cursor/Codex/Claude) | — | **LANDED 2026-08-29** |
+| 18| **FLIGHT MEM-SYNTHESIS** | `v0.32.0` | cross-scope semantic memory synthesis (Private/Squad/Project) | — | NEXT |
 
 **Board opinion policy:** priority ORDER is Hadi's alone — no vote, no ceremony. Board
 input (asha first-pass, Athena architecture, River build feasibility) is requested per

@@ -2,6 +2,11 @@
 
 ## 2026-08-29
 
+- **Journey 3: Multimodal Business Onboarding & Agent Repo Scaffolding** (Flights ONBOARD-REPO, ONBOARD-SAAS, ONBOARD-MCP; PR #1236).
+  - **Automated Git Repo Sensing & Scaffolding (FLIGHT ONBOARD-REPO)**: Migration `0142_onboarding_squad_packs.sql` establishing `agent_workspaces` and `workspace_onboarding_records`. Built `src/onboarding/repo-scaffold.ts` generating `agents/<slug>/` `.mcp.json`, `config.json`, `MEMORY.md`, and checkin payloads (`onboard_agent_workspace`).
+  - **1-Click Starter Squad Packs & Business Provisioning (FLIGHT ONBOARD-SAAS)**: Pre-packaged squads in `src/onboarding/squad-packs.ts` (`engineering_sprint`, `content_studio`, `business_ops`) with automated role-specialized agent creation and P1 starter task verification (`onboard_provision_pack`).
+  - **10-Second Desktop Connect Bundle Generator (FLIGHT ONBOARD-MCP)**: Streamable HTTP connection bundle generator in `src/onboarding/desktop-connect.ts` for Cursor, Codex, Claude Code, and Hermes (`onboard_desktop_bundle`).
+
 - **Journey 2: Mupot OS & Physical Device Fleet Control** (Flights DEV-01, DEV-02, DEV-03, DEV-04, DEV-05; `MU.200.001-DEVICE`, PR #1236).
   - **Hardware Attestation & Pairing QR Protocol (FLIGHT DEV-01)**: Migration `0141_device_fleet_and_attestation.sql` creating `device_keys` and `device_pairings`. Challenge-response pairing protocol with hardware-anchored Ed25519 public keys and MCP tools (`device_pair_challenge`, `device_pair_claim`).
   - **Local Sandboxed Execution Engine & $0-Token Telemetry (FLIGHT DEV-02)**: Engine in `src/devices/executor.ts` interfacing with Apple Silicon MLX and Linux container workers, reporting local $0 token metrics with signed execution attestation (`device_report_exec`).

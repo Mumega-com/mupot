@@ -4441,6 +4441,104 @@ import { reportDeviceExecution } from '../devices/executor'
 import { checkHardwareCapability } from '../devices/governance'
 import { syncDeviceJournalEntries } from '../devices/journal'
 import { updateDevicePowerState, wakeHardwareDevice } from '../devices/power'
+import { scaffoldAgentWorkspace } from '../onboarding/repo-scaffold'
+import { provisionStarterWorkspace } from '../onboarding/squad-packs'
+import { generateDesktopConnectBundle } from '../onboarding/desktop-connect'
+
+// onboard_agent_workspace — auto-scaffold external git repository agent workspace (Journey 3 / FLIGHT ONBOARD-REPO)
+const toolOnboardAgentWorkspace: ToolSpec = {
+  name: 'onboard_agent_workspace',
+  scope: 'auto-scaffold git repository agents/<slug>/ workspace and enroll in mupot',
+  min: 'authenticated',
+  args: '{ agent_name: string, agent_slug?: string, repo_url: string, harness?: string, machine: string, target_folder?: string }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      agent_name: STRING_SCHEMA,
+      agent_slug: NULLABLE_STRING_SCHEMA,
+      repo_url: STRING_SCHEMA,
+      harness: { type: 'string', enum: ['cursor-cloud', 'cursor-ide', 'codex-desktop', 'claude-code', 'hermes', 'unknown'] },
+      machine: STRING_SCHEMA,
+      target_folder: NULLABLE_STRING_SCHEMA,
+    },
+    required: ['agent_name', 'repo_url', 'machine'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const agentName = str(args.agent_name)
+    const repoUrl = str(args.repo_url)
+    const machine = str(args.machine)
+    if (!agentName || !repoUrl || !machine) {
+      return fail(400, 'invalid_args', 'agent_name, repo_url, and machine are required')
+    }
+
+    const result = await scaffoldAgentWorkspace(env, auth, {
+      agentName,
+      agentSlug: str(args.agent_slug) ?? undefined,
+      repoUrl,
+      harness: args.harness as any,
+      machine,
+      targetFolder: str(args.target_folder) ?? undefined,
+    })
+
+    return done(result)
+  },
+}
+
+// onboard_provision_pack — 1-click business starter squad pack setup (Journey 3 / FLIGHT ONBOARD-SAAS)
+const toolOnboardProvisionPack: ToolSpec = {
+  name: 'onboard_provision_pack',
+  scope: 'provision pre-built starter squad pack and starter tasks for business setup',
+  min: 'admin',
+  args: '{ company_name: string, starter_pack_key: "engineering_sprint"|"content_studio"|"business_ops", business_type?: string, model_preference?: string }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      company_name: STRING_SCHEMA,
+      starter_pack_key: { type: 'string', enum: ['engineering_sprint', 'content_studio', 'business_ops'] },
+      business_type: { type: 'string', enum: ['engineering', 'growth_agency', 'operations', 'ecommerce', 'custom'] },
+      model_preference: NULLABLE_STRING_SCHEMA,
+    },
+    required: ['company_name', 'starter_pack_key'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const companyName = str(args.company_name)
+    const starterPackKey = str(args.starter_pack_key)
+    if (!companyName || !starterPackKey) {
+      return fail(400, 'invalid_args', 'company_name and starter_pack_key are required')
+    }
+
+    const result = await provisionStarterWorkspace(env, auth, {
+      companyName,
+      starterPackKey,
+      businessType: args.business_type as any,
+      modelPreference: str(args.model_preference) ?? undefined,
+    })
+
+    return done(result)
+  },
+}
+
+// onboard_desktop_bundle — generate copy-pasteable desktop connect bundle for Cursor / Codex / Claude (Journey 3 / FLIGHT ONBOARD-MCP)
+const toolOnboardDesktopBundle: ToolSpec = {
+  name: 'onboard_desktop_bundle',
+  scope: 'generate 10-second desktop connection configs for Cursor, Codex, Claude Code, and Hermes',
+  min: 'authenticated',
+  args: '{ raw_token?: string }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      raw_token: NULLABLE_STRING_SCHEMA,
+    },
+    additionalProperties: false,
+  },
+  async run(_auth, env, args) {
+    const rawToken = str(args.raw_token) ?? undefined
+    const bundle = generateDesktopConnectBundle(env, { rawToken })
+    return done(bundle)
+  },
+}
 
 // device_pair_challenge — create challenge and QR pairing code for hardware device enrollment (FLIGHT DEV-01)
 const toolDevicePairChallenge: ToolSpec = {
@@ -5190,6 +5288,9 @@ export const TOOLS: ToolSpec[] = [
   toolDeviceReportExec,
   toolDeviceSyncJournal,
   toolDevicePowerControl,
+  toolOnboardAgentWorkspace,
+  toolOnboardProvisionPack,
+  toolOnboardDesktopBundle,
   ...AGENT_CONNECTION_TOOLS,
   ...PROJECT_TOOLS,
   ...PROVISION_TOOLS,
