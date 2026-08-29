@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { authorizeExecutionScope } from '../src/auth/execution-scope'
-import type { AuthContext, Env } from '../src/types'
+import type { AuthContext, CapabilityGrant, Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
@@ -11,6 +11,25 @@ const SQUAD_B = 'squad-b'
 const AGENT_A = 'agent-a'
 const AGENT_B = 'agent-b'
 
+function grant(
+  member_id: string,
+  capability: CapabilityGrant['capability'],
+  scope_id: string | null,
+): CapabilityGrant {
+  return { member_id, scope_type: scope_id === null ? 'org' : 'squad', scope_id, capability }
+}
+
+function ambientCapabilities(memberId: string): CapabilityGrant[] {
+  switch (memberId) {
+    case 'observer-a': return [grant(memberId, 'observer', SQUAD_A)]
+    case 'member-a': return [grant(memberId, 'member', SQUAD_A)]
+    case 'lead-a': return [grant(memberId, 'lead', SQUAD_A)]
+    case 'lead-b': return [grant(memberId, 'lead', SQUAD_B)]
+    case 'org-admin': return [grant(memberId, 'admin', null)]
+    default: return []
+  }
+}
+
 function auth(memberId: string, overrides: Partial<AuthContext> = {}): AuthContext {
   return {
     userId: memberId,
@@ -19,7 +38,7 @@ function auth(memberId: string, overrides: Partial<AuthContext> = {}): AuthConte
     role: 'member',
     tenant: TENANT,
     channel: 'workspace',
-    capabilities: [],
+    capabilities: ambientCapabilities(memberId),
     boundAgentId: null,
     ...overrides,
   }
@@ -92,6 +111,34 @@ describe('authorizeExecutionScope', () => {
     })).resolves.toEqual({ ok: false, status: 403, error: 'forbidden' })
   })
 
+  it('denies a directory session with an empty ambient ceiling despite a durable squad lead grant', async () => {
+    const clamped = auth('lead-a', { channel: 'directory', capabilities: [] })
+
+    await expect(authorizeExecutionScope(env, clamped, {
+      action: 'router:read', squadId: SQUAD_A,
+    })).resolves.toEqual({ ok: false, status: 403, error: 'forbidden' })
+    await expect(authorizeExecutionScope(env, clamped, {
+      action: 'router:mutate', squadId: SQUAD_A,
+    })).resolves.toEqual({ ok: false, status: 403, error: 'forbidden' })
+    await expect(authorizeExecutionScope(env, clamped, {
+      action: 'meter:read', agentId: AGENT_A,
+    })).resolves.toEqual({ ok: false, status: 403, error: 'forbidden' })
+  })
+
+  it('allows only router reads through a directory observer ceiling over a durable lead grant', async () => {
+    const observerCeiling = auth('lead-a', {
+      channel: 'directory',
+      capabilities: [grant('lead-a', 'observer', SQUAD_A)],
+    })
+
+    await expect(authorizeExecutionScope(env, observerCeiling, {
+      action: 'router:read', squadId: SQUAD_A,
+    })).resolves.toEqual({ ok: true, tenant: TENANT, squadId: SQUAD_A, agentId: null, source: 'principal' })
+    await expect(authorizeExecutionScope(env, observerCeiling, {
+      action: 'router:mutate', squadId: SQUAD_A,
+    })).resolves.toEqual({ ok: false, status: 403, error: 'forbidden' })
+  })
+
   it('allows a bound agent to read only its own meter', async () => {
     await expect(authorizeExecutionScope(env, auth('agent-a-member', { boundAgentId: AGENT_A }), {
       action: 'meter:read', agentId: AGENT_A,
@@ -125,6 +172,14 @@ describe('authorizeExecutionScope', () => {
     await expect(authorizeExecutionScope(env, auth('org-admin'), {
       action: 'meter:read', agentId: AGENT_B,
     })).resolves.toEqual({ ok: true, tenant: TENANT, squadId: SQUAD_B, agentId: AGENT_B, source: 'principal' })
+  })
+
+  it('does not resurrect a revoked durable grant from a broader ambient ceiling', async () => {
+    harness.sqlite.prepare('DELETE FROM capabilities WHERE id = ?').run('lead-a-squad-a')
+
+    await expect(authorizeExecutionScope(env, auth('lead-a'), {
+      action: 'router:mutate', squadId: SQUAD_A,
+    })).resolves.toEqual({ ok: false, status: 403, error: 'forbidden' })
   })
 
   it('uses D1 grants and the environment tenant instead of caller authority claims', async () => {
