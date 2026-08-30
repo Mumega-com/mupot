@@ -16,7 +16,18 @@ import type { RuntimeDeps } from '../src/loops/runtime'
 import type { LoopManifest } from '../src/loops/manifest'
 import type { Env } from '../src/types'
 
-const ENV = { TENANT_SLUG: 't' } as unknown as Env
+const ENV = {
+  TENANT_SLUG: 't',
+  DB: {
+    prepare() {
+      return {
+        bind(id: string) {
+          return { async first() { return { id, squad_id: 's1' } } }
+        },
+      }
+    },
+  },
+} as unknown as Env
 
 function makeLoop(over: Partial<LoopManifest> = {}): LoopManifest {
   return {

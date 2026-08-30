@@ -73,6 +73,7 @@ import { attentionApp } from './attention/routes'
 import { platformApp } from './platform/routes'
 import { maybeHandleHostnameDispatch } from './platform/dispatcher'
 import { supabaseWebhookApp } from './connectors/supabase-webhook'
+import { routerApp } from './router/routes'
 
 // Durable Object classes — implemented in src/agents/.
 export { AgentDO } from './agents/agent-do'
@@ -134,6 +135,7 @@ app.route('/api/pots', publicPotsApp)
 app.route('/api/alerts', alertsApp)
 app.route('/api/prospects', prospectsApp)
 app.route('/api/loops', loopsApp)
+app.route('/api/router', routerApp)
 // Flock check-in (Flock #45): agents POST presence with their member-token (bearer).
 // Inbound only — the pot needs no egress. Mounted before the dashboard '/' catch-all.
 app.route('/api/fleet', fleetCheckinApp)

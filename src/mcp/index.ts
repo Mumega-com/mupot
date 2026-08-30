@@ -93,6 +93,8 @@ import {
   sendToRef, readAgentInbox, sendAgentMessage,
 } from '../agents/messages'
 import { routeAgentWake } from '../agents/wake-routing'
+import { authorizeExecutionScope } from '../auth/execution-scope'
+import { runRouterTick } from '../router/engine'
 import { verifyTaskArtifactShape } from '../tasks/artifact-verification'
 import {
   leaseAgentInbox, ackAgentMessages, listDeadLetteredMessages, summarizeDeadLetters,
@@ -161,7 +163,7 @@ import { MUPOT_PUBLIC_API_VERSION } from '../version'
 import { MUPOT_MCP_INITIALIZE_INSTRUCTIONS } from './instructions'
 // The SAME predicate the meter enforces with. Imported rather than restated —
 // these were two copies and they drifted (#1179 gate R6).
-import { isEnforceableCap } from '../agents/meter'
+import { getAuthorizedMeterStatus, isEnforceableCap } from '../agents/meter'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
@@ -552,6 +554,9 @@ export interface ToolSpec {
   min: Capability | 'authenticated'
   args: string // documented arg shape
   inputSchema: JsonSchema
+  // Framework-owned policy for post-success presence. It receives only schema-
+  // validated arguments, and defaults to the historic always-touch behavior.
+  shouldTouchPresence?: (args: Readonly<Record<string, unknown>>) => boolean
   // ctx is the 4th param; tools that don't need it simply omit it from their signature
   // (a function of fewer params is assignable here — TS structural typing).
   run: (auth: AuthContext, env: Env, args: Record<string, unknown>, ctx: ToolCtx) => Promise<ToolOutcome>
@@ -568,6 +573,7 @@ const STRING_SCHEMA = { type: 'string' }
 const NULLABLE_STRING_SCHEMA = { type: ['string', 'null'] }
 const OPTIONAL_STRING_ARRAY_SCHEMA = { type: 'array', items: { type: 'string' } }
 const OPTIONAL_NUMBER_SCHEMA = { type: 'number' }
+const OPTIONAL_BOOLEAN_SCHEMA = { type: 'boolean' }
 
 const PATCH_ALLOWED_STATUSES: ReadonlySet<string> = new Set(['open', 'in_progress', 'blocked', 'done', 'review'])
 const BROADCAST_REQUEST_ID_RE = /^[A-Za-z0-9_.:-]{1,128}$/
@@ -2911,6 +2917,68 @@ const toolWakeAgent: ToolSpec = {
   },
 }
 
+// router_tick — one named squad only. Dry-run is observer-visible; mutation is lead-gated.
+const toolRouterTick: ToolSpec = {
+  name: 'router_tick',
+  scope: 'named squad',
+  min: 'authenticated',
+  shouldTouchPresence: (args) => args.dry_run !== true,
+  args: '{ squad_id: string, dry_run?: boolean, limit?: number }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      squad_id: STRING_SCHEMA,
+      dry_run: OPTIONAL_BOOLEAN_SCHEMA,
+      limit: OPTIONAL_NUMBER_SCHEMA,
+    },
+    required: ['squad_id'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const squadId = str(args.squad_id)
+    if (!squadId) return fail(400, 'invalid_args', 'squad_id required')
+    // The generic schema seam intentionally preserves historical optional-null
+    // behavior for unrelated tools. This boolean is not nullable: reject here,
+    // before choosing mutation authority or entering the presence policy.
+    if (args.dry_run !== undefined && typeof args.dry_run !== 'boolean') {
+      return fail(400, 'invalid_args', 'dry_run must be boolean')
+    }
+    const dryRun = args.dry_run === true
+    const decision = await authorizeExecutionScope(env, auth, {
+      action: dryRun ? 'router:read' : 'router:mutate',
+      squadId,
+    })
+    if (!decision.ok) return fail(decision.status, decision.error)
+    if (!auth.memberId) return fail(403, 'forbidden')
+
+    const limit = typeof args.limit === 'number' ? args.limit : undefined
+    const result = await runRouterTick(env, decision, { squadId, dryRun, limit }, { memberId: auth.memberId })
+    return done(result)
+  },
+}
+
+// execution_meter_status — read-only and scope-resolved before spend rows load.
+// Omit agent_id for canonical bound-agent self; named targets require same-squad
+// lead-or-higher or org-admin authority through authorizeExecutionScope.
+const toolExecutionMeterStatus: ToolSpec = {
+  name: 'execution_meter_status',
+  scope: 'bound agent self or authorized squad agent',
+  min: 'authenticated',
+  args: '{ agent_id?: string }',
+  inputSchema: {
+    type: 'object',
+    properties: { agent_id: STRING_SCHEMA },
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    if (args.agent_id !== undefined && !str(args.agent_id)) {
+      return fail(400, 'invalid_args', 'agent_id must be a non-empty string')
+    }
+    const agentId = str(args.agent_id) ?? undefined
+    return getAuthorizedMeterStatus(env, auth, agentId)
+  },
+}
+
 // squad_message — message/dispatch a squad. cap: member+ on the squad. The message
 // becomes the dispatch context; the consumer routes it to the squad coordinator.
 const toolSquadMessage: ToolSpec = {
@@ -4228,6 +4296,8 @@ export const TOOLS: ToolSpec[] = [
   toolProjectRemember,
   toolProjectRecall,
   toolWakeAgent,
+  toolRouterTick,
+  toolExecutionMeterStatus,
   toolSquadMessage,
   toolSend,
   toolBroadcast,
@@ -4337,6 +4407,7 @@ function validateArgs(schema: JsonSchema, args: Record<string, unknown>): string
     if (prop.type === 'number' && !(typeof value === 'number' && Number.isFinite(value))) {
       return `field ${key} must be a number`
     }
+    if (prop.type === 'boolean' && typeof value !== 'boolean') return `field ${key} must be a boolean`
     if (prop.type === 'array') {
       if (!Array.isArray(value)) return `field ${key} must be an array`
       if (prop.items?.type === 'string' && !value.every((v) => typeof v === 'string')) {
@@ -4415,7 +4486,7 @@ export async function invokeTool(
     return { ...fail(500, 'internal_error'), tool: spec.name }
   }
 
-  if (outcome.ok && auth.memberId && spec.name !== 'check_in' && spec.name !== 'boot_context') {
+  if (outcome.ok && (spec.shouldTouchPresence?.(args) ?? true) && auth.memberId && spec.name !== 'check_in' && spec.name !== 'boot_context') {
     // Zero-Touch Living Presence: automatically bump presence for active tool callers.
     const touchPromise = (async () => {
       const id = await loadMemberIdentity(env, auth)

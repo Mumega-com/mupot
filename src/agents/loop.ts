@@ -53,7 +53,7 @@ import { autonomyImpliesGate } from '../org/service'
 import { createTask } from '../tasks/service'
 import { createModel } from '../model'
 import { createMemory } from '../memory'
-import { checkAndReserve, recordTokens } from './meter'
+import { buildAuthorizedExecution, checkAndReserve, recordTokens } from './meter'
 import { costMicroUsd, costUsageMicroUsd } from './cost'
 import { buildSensorium, renderSensorium } from './sensorium'
 import type { AgentRuntime, Sensorium } from './sensorium'
@@ -293,11 +293,10 @@ export async function runGoalCycle(
   // ── Guard 6: meter check (economic governor) ─────────────────────────────────
   const meterCheck = deps.meterCheck ?? checkAndReserve
   const estimateMicroUsd = costMicroUsd(agent.model, LOOP_PLANNING_MAX_TOKENS)
-  const meterResult = await meterCheck(env, agent.id, {
-    estimateMicroUsd,
-    budgetCapCents: agent.budget_cap_cents,
-    budgetWindow: agent.budget_window,
-  })
+  const meterResult = await meterCheck(
+    env,
+    buildAuthorizedExecution(env, agent, null, estimateMicroUsd),
+  )
   if (!meterResult.ok) {
     const decided: GoalCycleDecided =
       meterResult.reason === 'budget_cap_exceeded' ? 'budget_exhausted' : 'rate_limited'

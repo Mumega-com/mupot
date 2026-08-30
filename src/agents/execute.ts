@@ -33,7 +33,13 @@ import { resolveTaskAssignee } from '../tasks/assignee'
 import { createModel } from '../model'
 import { createBus } from '../bus'
 import { createMemory } from '../memory'
-import { checkAndReserve, recordTokens, type RecordTokensUsage } from './meter'
+import {
+  buildAuthorizedExecution,
+  checkAndReserve,
+  recordTokens,
+  type MeterBlockResult,
+  type RecordTokensUsage,
+} from './meter'
 import { costMicroUsd, costUsageMicroUsd } from './cost'
 import { detectContentIntent } from './content-intent'
 import type { ContentIntent } from './content-intent'
@@ -190,16 +196,15 @@ export async function runTaskExecution(
   // in the meter on every path that actually calls the model.
   const cycleCostMicroUsd = costMicroUsd(agent.model, EXECUTE_MAX_TOKENS)
 
-  const meterResult = await meter.checkAndReserve(env, agent.id, {
-    estimateMicroUsd: cycleCostMicroUsd,
-    budgetCapCents: agent.budget_cap_cents,
-    budgetWindow: agent.budget_window,
-  })
+  const authorizedExecution = buildAuthorizedExecution(
+    env,
+    agent,
+    task.project_id,
+    cycleCostMicroUsd,
+  )
+  const meterResult = await meter.checkAndReserve(env, authorizedExecution)
   if (!meterResult.ok) {
-    const note = capResult(
-      `rate_limited: ${meterResult.reason} — daily cap reached (window ${meterResult.windowKey}). ` +
-      `Retry after ${meterResult.retryAfterSec}s (next UTC day resets the window).`,
-    )
+    const note = capResult(meterBlockNote(meterResult, authorizedExecution.costWindow))
     const finishedAt = new Date().toISOString()
     if (!(await finishTask(env, task.id, agent.id, executionReceiptId, 'blocked', note, finishedAt))) {
       return { ok: false, task_id: task.id, decided: '', error: 'task_claim_lost' }
@@ -382,6 +387,27 @@ export async function runTaskExecution(
       cacheWrite: chatUsage?.cacheWrite,
     })
     return { ok: false, task_id: task.id, decided: '', task_status: 'blocked', error: msg }
+  }
+}
+
+function meterBlockNote(
+  result: MeterBlockResult,
+  costWindow: 'day' | 'week',
+): string {
+  const window = `(window ${result.windowKey})`
+  switch (result.reason) {
+    case 'rate_limited':
+      return `dispatch_rate_limited: daily dispatch cap reached ${window}. ` +
+        `Retry after ${result.retryAfterSec}s (next UTC day resets the dispatch window).`
+    case 'budget_exhausted':
+      return `token_budget_exhausted: daily token cap reached ${window}. ` +
+        `Retry after ${result.retryAfterSec}s (next UTC day resets the token window).`
+    case 'budget_cap_exceeded':
+      return costWindow === 'week'
+        ? `cost_budget_exhausted: trailing 7-day cost cap reached. ` +
+            `Recheck as older spend leaves the trailing 7-day window. Meter subject window: ${result.windowKey}.`
+        : `cost_budget_exhausted: daily cost cap reached ${window}. ` +
+            `Retry after ${result.retryAfterSec}s (next UTC day resets the cost window).`
   }
 }
 
