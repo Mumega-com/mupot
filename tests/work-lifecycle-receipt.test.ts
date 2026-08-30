@@ -66,7 +66,8 @@ describe('work lifecycle receipt checker', () => {
       taskId: TARGET.task_id,
     })
 
-    expect(plan).toContain('Mupot v0.23 real work-lifecycle evidence plan')
+    expect(plan).toContain('Mupot real work-lifecycle evidence plan')
+    expect(plan).not.toContain('v0.23')
     expect(plan).toContain(STEP_RECEIPT_TYPE)
     expect(plan).toContain('task-created.json')
     expect(plan).toContain('work-lifecycle-check.json')

@@ -12,13 +12,14 @@
 - **Landed stabilization train:** PR #1243 (`8be1cac7`, credential rotation),
   PR #1242 (`fb10d79b`, router/loop/meter authorization), PR #1237
   (`b980f565`, immutable message integrity), PR #1245 (`31644899`, addon binding
-  ordering), and PR #1235 (`4d41d9bd`, guest-squad send visibility) are on main
-  with post-merge CI and CodeQL evidence.
-- **Athena-GREEN, not yet landed:** PR #1241 at exact head `92ddd540` exposes a
-  strictly validated, peek-only MCP inbox cursor. It remains draft pending Hadi's
-  separate merge approval and is not counted as shipped.
-- **Still required for the stable candidate:** resolve #1241, close or explicitly
-  defer obsolete PRs, collect the fresh receipts in
+  ordering), PR #1235 (`4d41d9bd`, guest-squad send visibility), and PR #1241
+  (`a3d46acb`, strictly validated peek-only inbox cursor) are on main with
+  post-merge CI and CodeQL evidence.
+- **Release-surface hygiene complete:** obsolete/conflicting #1211, #1217,
+  #1236, and #1238 were closed with replacement or deferral evidence; branches
+  were preserved.
+- **Still required for the stable candidate:** land the corrected release
+  metadata/tooling, collect the fresh receipts in
   [the v0.30.0 release contract](docs/releases/v0.30.0.md), and pass the exact
   release gate recorded in [ROADMAP.md](ROADMAP.md).
 - **Release-excluded:** the #1236 omnibus, project-worker/sandbox expansion, device

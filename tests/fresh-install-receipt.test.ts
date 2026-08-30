@@ -87,7 +87,8 @@ describe('fresh install receipt checker', () => {
       operator: TARGET.operator,
     })
 
-    expect(plan).toContain('Mupot v0.23 fresh self-host install evidence plan')
+    expect(plan).toContain('Mupot fresh self-host install evidence plan')
+    expect(plan).not.toContain('v0.23')
     expect(plan).toContain(STEP_RECEIPT_TYPE)
     expect(plan).toContain('provision-resources.json')
     expect(plan).toContain('fresh-install-check.json')

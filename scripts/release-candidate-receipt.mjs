@@ -28,8 +28,16 @@ export function normalizeVersion(version) {
   return { semver, tag: `v${semver}` }
 }
 
+export function normalizeSourceVersion(version) {
+  const semver = String(version || '').trim().replace(/^v/i, '')
+  if (!/^\d+\.\d+\.\d+(?:-rc\.\d+)?$/.test(semver)) {
+    throw new Error(`expected a source version like v0.30.0 or v0.30.0-rc.1, got ${version}`)
+  }
+  return semver
+}
+
 export function parseArgs(argv) {
-  const opts = { version: DEFAULT_VERSION, repo: DEFAULT_REPO, repoRoot: process.cwd(), outDir: '', deploymentJson: '', releaseJson: '', plan: false, check: false, summary: false, help: false }
+  const opts = { version: DEFAULT_VERSION, sourceVersion: '', repo: DEFAULT_REPO, repoRoot: process.cwd(), outDir: '', deploymentJson: '', releaseJson: '', plan: false, check: false, summary: false, help: false }
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i]
     const next = () => {
@@ -38,6 +46,7 @@ export function parseArgs(argv) {
       return argv[i]
     }
     if (arg === '--version') opts.version = next()
+    else if (arg === '--source-version') opts.sourceVersion = next()
     else if (arg === '--repo') opts.repo = next()
     else if (arg === '--repo-root') opts.repoRoot = resolve(next())
     else if (arg === '--out-dir') opts.outDir = resolve(next())
@@ -52,6 +61,25 @@ export function parseArgs(argv) {
   return opts
 }
 
+export function usage() {
+  return [
+    'Usage: node scripts/release-candidate-receipt.mjs --plan|--check [options]',
+    '',
+    'Options:',
+    '  --plan                         print the release-candidate evidence plan',
+    '  --check                        check a completed evidence directory',
+    '  --summary                      with --check, print a compact summary',
+    '  --version <rc-version>         RC tag/prerelease identity, for example v0.30.0-rc.1',
+    '  --source-version <version>     package/API/live source version; defaults to the RC version',
+    '  --repo <owner/repo>            GitHub repository identity',
+    '  --repo-root <path>             local checkout root',
+    '  --out-dir <path>               evidence directory',
+    '  --deployment-json <path>       deployment evidence override',
+    '  --release-json <path>          GitHub prerelease evidence override',
+    '  -h, --help                     show this help',
+  ].join('\n')
+}
+
 function defaultOutDir(opts) {
   return opts.outDir || `tmp/release-candidate/${normalizeVersion(opts.version || DEFAULT_VERSION).tag}`
 }
@@ -63,21 +91,22 @@ function command(parts, suffix = '') {
 
 export function formatPlan(opts = {}) {
   const { semver, tag } = normalizeVersion(opts.version || DEFAULT_VERSION)
+  const sourceVersion = normalizeSourceVersion(opts.sourceVersion || semver)
   const outDir = defaultOutDir({ ...opts, version: tag })
   const repo = opts.repo || DEFAULT_REPO
   return [
     'Mupot release-candidate deployment evidence plan',
     '',
-    `Goal: prove ${tag} is tagged, published as a GitHub prerelease, and deployed with the same public API version.`,
+    `Goal: prove ${tag} is tagged, published as a GitHub prerelease, and deployed from one exact commit with source package/API version ${sourceVersion}.`,
     '',
     command(['mkdir', '-p', outDir]),
     '',
     'Capture a redacted live deployment observation:',
     command(['curl', '-fsS', '<base-url>/health'], ` > ${outDir}/health.json`),
-    'Write deployment.json with receipt_type "mupot-release-candidate-deployment/v1", observed_at, target { base_url, rc_version, commit, tag }, and health from the public response.',
+    `Write deployment.json with receipt_type "mupot-release-candidate-deployment/v1", observed_at, target { base_url, rc_version: "${tag}", source_version: "${sourceVersion}", commit, tag: "${tag}" }, and health from the public response including { version: "${sourceVersion}", commit, clean: true }.`,
     command(['gh', 'release', 'view', tag, '--repo', repo, '--json', 'tagName,name,isDraft,isPrerelease,targetCommitish,url,publishedAt'], ` > ${outDir}/github-release.json`),
     '',
-    command(['node', 'scripts/release-candidate-receipt.mjs', '--check', '--version', tag, '--repo', repo, '--out-dir', outDir], ` > ${outDir}/release-candidate-check.json`),
+    command(['node', 'scripts/release-candidate-receipt.mjs', '--check', '--version', tag, '--source-version', `v${sourceVersion}`, '--repo', repo, '--out-dir', outDir], ` > ${outDir}/release-candidate-check.json`),
     '',
     `The checked candidate version is ${semver}; use its observed_at as the authoritative lower bound for the production soak.`,
     '',
@@ -115,6 +144,7 @@ function publicApiVersion(text) {
 
 export function checkBundle(opts = {}) {
   const { semver, tag } = normalizeVersion(opts.version || DEFAULT_VERSION)
+  const sourceVersion = normalizeSourceVersion(opts.sourceVersion || semver)
   const root = resolve(opts.repoRoot || process.cwd())
   const outDir = resolve(defaultOutDir({ ...opts, version: tag }))
   const checks = []
@@ -131,17 +161,20 @@ export function checkBundle(opts = {}) {
   const health = deployment?.value?.health ?? {}
   const githubRelease = release?.value ?? {}
 
-  push(checks, packageJson?.value?.version === semver, 'package_version_matches_expected', { expected: semver, actual: packageJson?.value?.version ?? null })
-  push(checks, publicApiVersion(versionText) === semver, 'public_api_version_matches_expected', { expected: semver, actual: publicApiVersion(versionText) || null })
+  push(checks, packageJson?.value?.version === sourceVersion, 'package_version_matches_source', { expected: sourceVersion, actual: packageJson?.value?.version ?? null })
+  push(checks, publicApiVersion(versionText) === sourceVersion, 'public_api_version_matches_source', { expected: sourceVersion, actual: publicApiVersion(versionText) || null })
   push(checks, Boolean(head), 'git_head_resolved', { commit: head || null })
   push(checks, tagCommit === head && Boolean(tagCommit), 'git_tag_points_to_candidate_commit', { tag, tag_commit: tagCommit || null, head_commit: head || null })
   push(checks, deployment?.value?.receipt_type === DEPLOYMENT_RECEIPT_TYPE, 'deployment_receipt_type', { expected: DEPLOYMENT_RECEIPT_TYPE, actual: deployment?.value?.receipt_type ?? null })
   push(checks, Number.isFinite(Date.parse(observedAt)), 'deployment_observed_at_iso', { observed_at: observedAt || null })
   push(checks, target.rc_version === tag && target.tag === tag, 'deployment_target_version_matches', { expected: tag, actual_version: target.rc_version ?? null, actual_tag: target.tag ?? null })
+  push(checks, target.source_version === sourceVersion, 'deployment_target_source_version_matches', { expected: sourceVersion, actual: target.source_version ?? null })
   push(checks, target.commit === head && Boolean(target.commit), 'deployment_target_commit_matches', { expected: head || null, actual: target.commit ?? null })
   push(checks, /^https:\/\/[^\s]+$/.test(String(target.base_url ?? '')), 'deployment_base_url_valid', { base_url: target.base_url ?? null })
   push(checks, health.ok === true && health.service === 'mupot', 'deployment_health_ok', { ok: health.ok ?? null, service: health.service ?? null })
-  push(checks, health.version === semver, 'deployment_health_version_matches', { expected: semver, actual: health.version ?? null })
+  push(checks, health.version === sourceVersion, 'deployment_health_version_matches_source', { expected: sourceVersion, actual: health.version ?? null })
+  push(checks, health.commit === head && Boolean(health.commit), 'deployment_health_commit_matches_candidate_commit', { expected: head || null, actual: health.commit ?? null })
+  push(checks, health.clean === true, 'deployment_health_clean', { expected: true, actual: health.clean ?? null })
   push(checks, githubRelease.tagName === tag, 'github_prerelease_tag_matches', { expected: tag, actual: githubRelease.tagName ?? null })
   push(checks, githubRelease.isPrerelease === true && githubRelease.isDraft === false, 'github_release_is_published_prerelease', { is_prerelease: githubRelease.isPrerelease ?? null, is_draft: githubRelease.isDraft ?? null })
   push(checks, githubRelease.targetCommitish === head && Boolean(githubRelease.targetCommitish), 'github_prerelease_target_matches_candidate_commit', { expected: head || null, actual: githubRelease.targetCommitish ?? null })
@@ -151,7 +184,7 @@ export function checkBundle(opts = {}) {
     receipt_type: CHECK_RECEIPT_TYPE,
     status: failed.length === 0 ? 'pass' : 'fail',
     checked_at: new Date().toISOString(),
-    target: { repo: opts.repo || DEFAULT_REPO, rc_version: tag, commit: head || null, base_url: target.base_url ?? null },
+    target: { repo: opts.repo || DEFAULT_REPO, rc_version: tag, source_version: sourceVersion, commit: head || null, base_url: target.base_url ?? null },
     artifacts: {
       package: packageJson ? { path: join(root, 'package.json'), sha256: packageJson.sha256 } : null,
       deployment: deployment ? { path: opts.deploymentJson || join(outDir, 'deployment.json'), sha256: deployment.sha256 } : null,
@@ -169,7 +202,7 @@ export function formatSummary(receipt) {
 function main() {
   const opts = parseArgs(process.argv.slice(2))
   if (opts.help || (!opts.plan && !opts.check)) {
-    console.log('Usage: node scripts/release-candidate-receipt.mjs --plan|--check [options]')
+    console.log(usage())
     return
   }
   if (opts.plan) process.stdout.write(formatPlan(opts))

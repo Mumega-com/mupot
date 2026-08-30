@@ -85,7 +85,7 @@ describe('external PR-cycle receipt checker', () => {
     expect(parseArgs(['--check', '--out-dir', './tmp/external']).check).toBe(true)
   })
 
-  it('prints the #150 evidence plan', () => {
+  it('prints a release-neutral external PR-cycle evidence plan', () => {
     const plan = formatPlan({
       outDir: 'tmp/external-pr-cycle/task-pr-cycle-1',
       pot: TARGET.pot,
@@ -97,7 +97,8 @@ describe('external PR-cycle receipt checker', () => {
       baseUrl: TARGET.base_url,
     })
 
-    expect(plan).toContain('Mupot #150 external PR-cycle evidence plan')
+    expect(plan).toContain('Mupot external PR-cycle evidence plan')
+    expect(plan).not.toContain('#150')
     expect(plan).toContain(STEP_RECEIPT_TYPE)
     expect(plan).toContain('board_item: write board-item.json')
     expect(plan).toContain('pull_request: write pull-request.json')
@@ -124,6 +125,7 @@ describe('external PR-cycle receipt checker', () => {
     expect(receipt.target.repo).toBe(TARGET.repo)
     expect(receipt.artifacts.pull_request.status).toBe('pass')
     expect(receipt.checks.find((check) => check.check === 'issue_and_pr_same_repo')?.ok).toBe(true)
+    expect(receipt.next_steps.join(' ')).not.toContain('#150')
   })
 
   it('accepts the aggregate output file created by shell redirection', () => {

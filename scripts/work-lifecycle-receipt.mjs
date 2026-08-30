@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Mupot v0.23 real work-lifecycle evidence checker.
+// Mupot real work-lifecycle evidence checker.
 //
 // This validates one actual product task cycle: task creation, real-agent
 // execution, approval, completion, and audit visibility.
@@ -131,7 +131,7 @@ export function formatPlan(opts = {}) {
   const outDir = defaultOutDir(opts)
   const lines = []
 
-  lines.push('Mupot v0.23 real work-lifecycle evidence plan')
+  lines.push('Mupot real work-lifecycle evidence plan')
   lines.push('')
   lines.push('Goal: prove one actual product task moves from creation to real-agent execution, approval, completion, and audit visibility.')
   lines.push('')

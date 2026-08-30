@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Mupot external board -> task -> agent -> GitHub PR evidence checker.
 //
-// This is the #150 release proof gate. The real cycle runs against GitHub and a
+// This is the external PR-cycle release proof gate. The real cycle runs against GitHub and a
 // live pot; this script validates the redacted evidence bundle afterward.
 
 import { createHash } from 'node:crypto'
@@ -116,7 +116,7 @@ export function usage() {
     'Usage: node scripts/external-pr-cycle-receipt.mjs --plan|--check [options]',
     '',
     'Options:',
-    '  --plan                 print the #150 evidence plan',
+    '  --plan                 print the external PR-cycle evidence plan',
     '  --check                check a completed evidence directory',
     '  --summary              with --check, print a compact text summary',
     '  --out-dir <path>       evidence directory',
@@ -162,7 +162,7 @@ export function formatPlan(opts = {}) {
   const baseUrl = opts.baseUrl || 'https://<pot-host>'
   const lines = []
 
-  lines.push('Mupot #150 external PR-cycle evidence plan')
+  lines.push('Mupot external PR-cycle evidence plan')
   lines.push('')
   lines.push('Goal: prove one real GitHub board item became a Mupot task, reached a named runtime agent, produced a GitHub PR, linked back to the task, and surfaced CI/status feedback.')
   lines.push('')
@@ -254,7 +254,7 @@ export function formatPlan(opts = {}) {
     baseUrl,
   ]))
   lines.push('')
-  lines.push('Attach the evidence directory plus external-pr-cycle-check.json to #150 only when the aggregate receipt reports status "pass".')
+  lines.push('Attach the evidence directory plus external-pr-cycle-check.json to the active release tracker only when the aggregate receipt reports status "pass".')
 
   return `${lines.join('\n')}\n`
 }
@@ -547,7 +547,7 @@ export function checkBundle(opts = {}) {
     },
     checks,
     next_steps: failed.length === 0
-      ? ['attach the external PR-cycle evidence directory and this check receipt to #150']
+      ? ['attach the external PR-cycle evidence directory and this check receipt to the active release tracker']
       : ['fix failing external PR-cycle evidence, rerun the real step if needed, then rerun external-pr-cycle-receipt --check'],
   }
 }

@@ -63,13 +63,15 @@ describe('GitHub App permissions receipt checker', () => {
     expect(ghOpts.organization).toBe('Mumega-com')
   })
 
-  it('prints the #151 evidence plan', () => {
+  it('prints a release-neutral GitHub App evidence plan', () => {
     const plan = formatPlan({
       outDir: 'tmp/github-app-permissions/mupot',
       app: 'mupot',
     })
 
-    expect(plan).toContain('Mupot v0.23 GitHub App least-privilege evidence plan')
+    expect(plan).toContain('Mupot GitHub App least-privilege evidence plan')
+    expect(plan).not.toContain('v0.23')
+    expect(plan).not.toContain('#151')
     expect(plan).toContain('GET /app')
     expect(plan).toContain('--export-gh')
     expect(plan).toContain('--export-app')
@@ -275,7 +277,7 @@ describe('GitHub App permissions receipt checker', () => {
     expect(JSON.parse(readFileSync(result.installationPath, 'utf8')).permissions).toEqual(REQUIRED_APP_PERMISSIONS)
   })
 
-  it('passes when the App has only the v0.23 least-privilege set', () => {
+  it('passes when the App has only the required least-privilege set', () => {
     const dir = tempDir()
     writeApp(dir)
 
@@ -284,6 +286,7 @@ describe('GitHub App permissions receipt checker', () => {
     expect(receipt.receipt_type).toBe(CHECK_RECEIPT_TYPE)
     expect(receipt.status).toBe('pass')
     expect(receipt.summary.required_app_permissions).toBe(Object.keys(REQUIRED_APP_PERMISSIONS).length)
+    expect(receipt.next_steps.join(' ')).not.toContain('#151')
   })
 
   it('fails when workflows permission is still enabled', () => {

@@ -134,7 +134,7 @@ export function formatPlan(opts = {}) {
   const outDir = defaultOutDir(opts)
   const lines = []
 
-  lines.push('Mupot v0.23 staging recovery rehearsal')
+  lines.push('Mupot staging recovery rehearsal')
   lines.push('')
   lines.push('Goal: prove backup, upgrade, restore, rollback, Queue/DLQ behavior, failure reporting, and final health on a staging pot.')
   lines.push('')

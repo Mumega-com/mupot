@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Mupot v0.23 fresh self-host install evidence checker.
+// Mupot fresh self-host install evidence checker.
 //
 // The real install runs in a fresh Cloudflare account/pot. This checker validates
 // the redacted receipt bundle proving that an operator deployed the pot, finished
@@ -147,7 +147,7 @@ export function formatPlan(opts = {}) {
   const outDir = defaultOutDir(opts)
   const lines = []
 
-  lines.push('Mupot v0.23 fresh self-host install evidence plan')
+  lines.push('Mupot fresh self-host install evidence plan')
   lines.push('')
   lines.push('Goal: prove a fresh operator can deploy a pot to Cloudflare and finish owner setup without manual database edits.')
   lines.push('')

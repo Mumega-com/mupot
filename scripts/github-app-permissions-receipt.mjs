@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Mupot v0.23 GitHub App least-privilege evidence checker.
+// Mupot GitHub App least-privilege evidence checker.
 //
 // This checker turns #151 into a falsifiable release receipt: after the live
 // GitHub App definition is remediated and the installation is re-accepted, a
@@ -120,9 +120,9 @@ export function formatPlan(opts = {}) {
   const outDir = defaultOutDir(opts)
   const lines = []
 
-  lines.push('Mupot v0.23 GitHub App least-privilege evidence plan')
+  lines.push('Mupot GitHub App least-privilege evidence plan')
   lines.push('')
-  lines.push('Goal: prove #151 is fixed by checking the live GitHub App definition after permissions are reduced and the installation is re-accepted.')
+  lines.push('Goal: prove the live GitHub App definition is least-privilege and the installation has accepted the same permission set.')
   lines.push('')
   lines.push('Required live App permissions:')
   for (const [permission, level] of Object.entries(REQUIRED_APP_PERMISSIONS)) {
@@ -583,7 +583,7 @@ export function checkBundle(opts = {}) {
     },
     checks,
     next_steps: failed.length === 0
-      ? [`attach github-app-permissions-check.json, ${APP_FILE}, and ${INSTALLATION_FILE} to #151, then close #151`]
+      ? [`attach github-app-permissions-check.json, ${APP_FILE}, and ${INSTALLATION_FILE} to the active release tracker`]
       : ['fix the live GitHub App permissions, re-accept the installation, export GET /app again, then rerun this check'],
   }
 }

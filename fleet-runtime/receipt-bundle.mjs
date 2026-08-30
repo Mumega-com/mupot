@@ -227,7 +227,7 @@ function usage() {
     '  --verify-only                 read-only recheck; reuse host/runtime/control receipts',
     '  --status                      read-only host-go evidence status for an in-progress bundle',
     '  --status-summary              with --status, print a compact text checklist instead of JSON',
-    '  --host-go-plan                print the #274 live-host command plan; writes nothing',
+    '  --host-go-plan                print the live-host command plan; writes nothing',
     '  --base-url <url>              pot URL used in --host-go-plan probe commands',
     '  --check-manifest              read-only hash/status check; writes nothing',
     '  --export                      copy manifest, artifacts, and export/check sidecars to --export-dir and check it',
@@ -274,7 +274,7 @@ function formatHostGoPlan(opts = {}) {
   const multipleAgents = agents.length > 1
   const lines = []
 
-  lines.push('Mupot host-go plan (#274)')
+  lines.push('Mupot host-go plan')
   lines.push('')
   lines.push('Manual prerequisites before running the live receipt steps:')
   lines.push('- Edit ~/.fleet/daemon.json, ~/.fleet/inbox-handler.json, ~/.fleet/control.json, and ~/.fleet/flights.json for the real pot/tenant.')
