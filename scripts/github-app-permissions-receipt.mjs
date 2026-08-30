@@ -295,14 +295,33 @@ function ghApiJson(args, ghExec, errorMessage) {
   }
 }
 
+function ghApiNdjson(args, ghExec, errorMessage) {
+  let raw
+  try {
+    raw = ghExec('gh', ['api', ...args], { encoding: 'utf8' })
+  } catch {
+    throw new Error(errorMessage)
+  }
+
+  const values = []
+  for (const line of String(raw).split(/\r?\n/)) {
+    const trimmed = line.trim()
+    if (!trimmed) continue
+    try {
+      values.push(JSON.parse(trimmed))
+    } catch {
+      throw new Error('gh api returned invalid JSON')
+    }
+  }
+  return values
+}
+
 function installationFromGh(organization, installationId, ghExec) {
-  const pages = ghApiJson(
-    ['--paginate', '--slurp', `orgs/${encodeURIComponent(organization)}/installations`],
+  const installations = ghApiNdjson(
+    ['--paginate', `orgs/${encodeURIComponent(organization)}/installations`, '--jq', '.installations[] | @json'],
     ghExec,
     'gh api could not read the organization installations; authenticate gh as an organization owner or App manager',
   )
-  const installations = (Array.isArray(pages) ? pages : [pages])
-    .flatMap((page) => Array.isArray(page?.installations) ? page.installations : [])
   const matches = installations.filter((installation) => String(installation?.id ?? '') === String(installationId))
   if (matches.length !== 1) {
     throw new Error(`organization installation ${installationId} was not found exactly once under ${organization}`)
