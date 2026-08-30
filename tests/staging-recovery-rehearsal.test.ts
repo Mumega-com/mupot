@@ -109,6 +109,7 @@ describe('staging recovery rehearsal checker', () => {
     expect(receipt.target.pot).toBe('staging')
     expect(receipt.artifacts.queue_dlq.status).toBe('pass')
     expect(receipt.timeline.map((step) => step.step)).toEqual(REQUIRED_STEPS.map((step) => step.step))
+    expect(receipt.next_steps.join(' ')).not.toContain('v0.23 release issue')
     expect(receipt.checks.find((check) => check.check === 'target_base_url_matches_expected')?.ok).toBe(true)
   })
 

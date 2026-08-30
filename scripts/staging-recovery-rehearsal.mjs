@@ -515,7 +515,7 @@ export function checkBundle(opts = {}) {
     },
     checks,
     next_steps: failed.length === 0
-      ? ['attach the staging recovery evidence directory and this check receipt to the v0.23 release issue']
+      ? ['attach the staging recovery evidence directory and this check receipt to the active release tracker']
       : ['fix failing staging evidence, rerun the rehearsal step if needed, then rerun staging-recovery-rehearsal --check'],
   }
 }

@@ -89,6 +89,7 @@ describe('work lifecycle receipt checker', () => {
     expect(receipt.status).toBe('pass')
     expect(receipt.summary.step_receipts).toBe(REQUIRED_STEPS.length)
     expect(receipt.target.task_id).toBe(TARGET.task_id)
+    expect(receipt.next_steps.join(' ')).not.toContain('v0.23 release issue')
   })
 
   it('fails when human approval evidence is missing', () => {

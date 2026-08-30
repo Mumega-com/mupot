@@ -396,7 +396,7 @@ export function checkBundle(opts = {}) {
     artifacts,
     checks,
     next_steps: failed.length === 0
-      ? ['attach the work-lifecycle evidence directory and this check receipt to the v0.23 release issue']
+      ? ['attach the work-lifecycle evidence directory and this check receipt to the active release tracker']
       : ['fix failing work-lifecycle evidence, rerun the product task cycle if needed, then rerun work-lifecycle-receipt --check'],
   }
 }

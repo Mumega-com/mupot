@@ -525,7 +525,7 @@ export function checkBundle(opts = {}) {
     artifacts,
     checks,
     next_steps: failed.length === 0
-      ? ['attach the fresh-install evidence directory and this check receipt to the v0.23 release issue']
+      ? ['attach the fresh-install evidence directory and this check receipt to the active release tracker']
       : ['fix failing fresh-install evidence or rerun the install without manual database edits, then rerun fresh-install-receipt --check'],
   }
 }

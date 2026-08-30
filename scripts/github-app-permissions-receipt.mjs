@@ -3,7 +3,7 @@
 //
 // This checker turns #151 into a falsifiable release receipt: after the live
 // GitHub App definition is remediated and the installation is re-accepted, a
-// redacted GET /app export must show only the permissions v0.23 needs.
+// redacted GET /app export must show only the release contract's permissions.
 
 import { createHash, createSign } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
