@@ -55,8 +55,8 @@ outer sender, target address, project, creation time, lease expiry, and
 
 ## Runtime Receipt Operation
 
-MCP tool `task_dispatch_runtime_receipt` and REST route
-`POST /api/tasks/:id/runtime-receipts` accept:
+MCP tool `task_dispatch_runtime_receipt` and its generated REST Action
+`POST /actions/task_dispatch_runtime_receipt` accept:
 
 ```json
 {
@@ -72,7 +72,7 @@ MCP tool `task_dispatch_runtime_receipt` and REST route
 }
 ```
 
-The task ID comes from the route or the MCP arguments and must match the persisted
+The task ID is an explicit correlation argument and must match the persisted
 dispatch. The authenticated workspace token supplies the member and bound agent.
 
 ### Current-authority checks
@@ -121,8 +121,9 @@ principal, credential, task, dispatch, message, stage, attempt, and request dige
 ## Operator UI and Readback
 
 The `/send` Dispatch-now form adds an editable, required `done_when` field. It sends
-that exact value instead of the current generic hard-coded predicate. The page
-reads the created task back before dispatch status polling.
+that exact value instead of the current generic hard-coded predicate. This is issue
+#1240's first supported UI option; the existing create-and-dispatch operation remains
+one request and subsequent polling reads the created task plus its receipt timeline.
 
 Task JSON readback and the dashboard show separate receipt stages:
 

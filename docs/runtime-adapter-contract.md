@@ -452,6 +452,24 @@ consumer stamps `consumed_at` only after the assigned AgentDO accepts
 the task-scoped wake. Emission or wake failure leaves an attempt count and bounded
 error for operator diagnosis.
 
+For a live external runtime, the durable inbox body is `runtime.dispatch/v1` and
+includes only task, dispatch, squad, and the public route address selected by
+Mupot. The authenticated outer inbox row remains authoritative for sender,
+recipient, project, message sequence, lease, and delivery attempt. Queue delivery
+is transport evidence only.
+
+The assigned runtime records later stages with
+`task_dispatch_runtime_receipt` (or the generated REST Action of the same name).
+The operation requires an agent-bound workspace credential and revalidates the
+current token, assignment, squad/project authority, exact dispatch/message body,
+outer sender, public route, lease, and attempt. The unique key is dispatch receipt
++ stage + attempt: an identical retry returns the original receipt; changed
+content is rejected. `runtime_consumed` claims the task `in_progress`,
+`completed` moves it to `review`, and `failed` moves it to `blocked`. None of
+those stages writes `done`; the independent verdict surface remains mandatory.
+
+See [`operations/runtime-dispatch-v1.md`](./operations/runtime-dispatch-v1.md).
+
 Statuses:
 
 - `open`

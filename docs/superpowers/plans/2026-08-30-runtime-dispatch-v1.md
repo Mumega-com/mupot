@@ -51,7 +51,7 @@
 - Modify: `tests/bus-consumer.test.ts`
 
 **Interfaces:**
-- `DispatchBridgeInput.runtimeAddress` is required and data-derived.
+- The envelope derives `runtime_address` from the bridge's already data-derived `agentId`; no second caller-controlled address exists.
 - Envelope schema is exactly `runtime.dispatch/v1` with no private runtime identifier.
 
 - [ ] **Step 1: Write failing tests** proving the version/address fields, caller inability to override address, sticky route behavior, and no duplicate inbox row on Queue replay.
@@ -71,7 +71,7 @@
 
 **Interfaces:**
 - MCP: `task_dispatch_runtime_receipt({ task_id, dispatch_receipt_id, message_id, stage, runtime_receipt_hash, attempt, artifact_refs?, artifact_sha256?, result?, reason? })`.
-- REST: `POST /api/tasks/:id/runtime-receipts` with the same body minus `task_id`.
+- REST: generated `POST /actions/task_dispatch_runtime_receipt` with the identical arguments and authenticated principal.
 
 - [ ] **Step 1: Write failing contract tests** for tool advertisement, strict schemas, REST/MCP equivalent responses, directory/unbound/wrong-agent denial, revoked capability, wrong task/dispatch/message/attempt, and safe error bodies.
 - [ ] **Step 2: Run the two new suites and verify RED.**
@@ -93,7 +93,7 @@
 - [ ] **Step 1: Write failing rendered-page and request tests** proving the field exists, blank predicates block dispatch, exact text is submitted, the generic hard-coded predicate is absent, and `review` renders separately from `done`.
 - [ ] **Step 2: Run the focused dashboard suite and verify RED.**
 - [ ] **Step 3: Add the required field and validation** and use its value in the create payload.
-- [ ] **Step 4: Read the created task back before polling** and surface mismatched predicates as a stopped dispatch error.
+- [ ] **Step 4: Preserve the existing create-and-dispatch request and use subsequent polling to read the task plus receipt timeline.**
 - [ ] **Step 5: Render `review`, `blocked`, and terminal gate states distinctly.**
 - [ ] **Step 6: Run focused tests and typecheck.**
 - [ ] **Step 7: Commit** `fix(dashboard): preserve exact dispatch predicates`.
