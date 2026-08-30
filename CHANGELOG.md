@@ -18,6 +18,11 @@
 - **Release-surface hygiene complete:** obsolete/conflicting #1211, #1217,
   #1236, and #1238 were closed with replacement or deferral evidence; branches
   were preserved.
+- **Post-freeze main drift recorded:** PR #1249 landed externally as merge
+  commit `16390d1e` after #1241, adding exact external-runtime dispatch receipt
+  paths. Its code is present in the candidate base but remains preview rather
+  than a newly promoted stable-release claim. Earlier #1250 heads based on
+  `a3d46acb` were re-gated only after restacking on this main commit.
 - **Still required for the stable candidate:** land the corrected release
   metadata/tooling, collect the fresh receipts in
   [the v0.30.0 release contract](docs/releases/v0.30.0.md), and pass the exact
