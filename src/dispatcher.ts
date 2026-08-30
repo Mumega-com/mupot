@@ -57,6 +57,53 @@ export function extractTenantSlug(
   return cleanHost.replace(/[^a-z0-9-]/g, '-')
 }
 
+const PATH_TENANT_RE = /^\/t\/([a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?)(\/.*)?$/i
+
+/** Apex path ` /t/{tenant}/{interface} ` e.g. `/t/gaf/mcp`. */
+export function extractPathTenant(pathname: string): { slug: string; remainder: string } | null {
+  const match = pathname.match(PATH_TENANT_RE)
+  if (!match) return null
+  const slug = match[1].toLowerCase()
+  const rest = match[2]
+  const remainder = rest && rest.length > 0 ? rest : '/'
+  return { slug, remainder }
+}
+
+export type ApexPathTenant =
+  | { kind: 'home'; request: Request; slug: string }
+  | { kind: 'dispatch'; request: Request; slug: string }
+
+function rewriteRequest(request: Request, hostname: string, pathname: string): Request {
+  const url = new URL(request.url)
+  url.hostname = hostname
+  url.pathname = pathname
+  return new Request(url, request)
+}
+
+/**
+ * On the colony apex, `/t/{slug}/{interface}` is the tenant URL.
+ * Home slug stays on this Worker with the prefix stripped.
+ * Any other slug is rewritten to `{slug}.{rootDomain}{interface}` for WFP dispatch.
+ */
+export function resolveApexPathTenant(
+  request: Request,
+  homeSlug: string,
+  rootDomain: string = DEFAULT_ROOT_DOMAIN,
+): ApexPathTenant | null {
+  const url = new URL(request.url)
+  const parsed = extractPathTenant(url.pathname)
+  if (!parsed) return null
+  const home = homeSlug.toLowerCase()
+  if (parsed.slug === home) {
+    return { kind: 'home', slug: parsed.slug, request: rewriteRequest(request, url.hostname, parsed.remainder) }
+  }
+  return {
+    kind: 'dispatch',
+    slug: parsed.slug,
+    request: rewriteRequest(request, `${parsed.slug}.${rootDomain}`, parsed.remainder),
+  }
+}
+
 function renderUnprovisionedPotHtml(tenantSlug: string): string {
   return `<!DOCTYPE html>
 <html lang="en">

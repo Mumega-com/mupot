@@ -333,15 +333,40 @@ function reportUnmatchedCron(scheduledAt: Date): void {
 export default {
   fetch: async (req: Request, env: Env, ctx: ExecutionContext) => {
     // ── Cloudflare Workers for Platforms (WFP) Sovereign Tenant Routing ──
-    // Routes `<tenant>.mupot.mumega.com` to the isolated User Worker in `mupot-pots`.
-    if (env.DISPATCHER) {
-      const url = new URL(req.url)
-      const headerSlug = req.headers.get('x-mupot-tenant-slug') || req.headers.get('x-pot-tenant')
-      const rootHost = env.PUBLIC_ORIGIN ? new URL(env.PUBLIC_ORIGIN).hostname : undefined
-      const { extractTenantSlug } = await import('./dispatcher')
-      const tenantSlug = extractTenantSlug(url.hostname, rootHost, headerSlug)
+    // Hostname: `<tenant>.mupot.mumega.com`
+    // Apex path: `mupot.mumega.com/t/{tenant}/{interface}` e.g. `/t/gaf/mcp`
+    const url = new URL(req.url)
+    const rootHost = env.PUBLIC_ORIGIN ? new URL(env.PUBLIC_ORIGIN).hostname : 'mupot.mumega.com'
+    const homeSlug = (env.TENANT_SLUG || 'mumega').toLowerCase()
+    const { extractTenantSlug, resolveApexPathTenant } = await import('./dispatcher')
 
-      if (tenantSlug && tenantSlug !== (env.TENANT_SLUG || 'mumega') && tenantSlug !== 'mupot' && tenantSlug !== 'mumega') {
+    const pathTenant = resolveApexPathTenant(req, homeSlug, rootHost)
+    if (pathTenant?.kind === 'home') {
+      req = pathTenant.request
+    } else if (pathTenant?.kind === 'dispatch') {
+      if (!env.DISPATCHER) {
+        return new Response(
+          JSON.stringify({
+            error: 'unconfigured',
+            tenant: pathTenant.slug,
+            message: 'Cloudflare dispatch namespace is not bound; cannot route /t/{tenant}.',
+          }),
+          { status: 503, headers: { 'content-type': 'application/json' } },
+        )
+      }
+      const dispatcher = (await import('./dispatcher')).default
+      return dispatcher.fetch(pathTenant.request, {
+        DISPATCHER: env.DISPATCHER,
+        FALLBACK_POT: env.TENANT_SLUG,
+        ROOT_DOMAIN: rootHost,
+      })
+    }
+
+    if (env.DISPATCHER) {
+      const headerSlug = req.headers.get('x-mupot-tenant-slug') || req.headers.get('x-pot-tenant')
+      const tenantSlug = extractTenantSlug(new URL(req.url).hostname, rootHost, headerSlug)
+
+      if (tenantSlug && tenantSlug !== homeSlug && tenantSlug !== 'mupot' && tenantSlug !== 'mumega') {
         const dispatcher = (await import('./dispatcher')).default
         return dispatcher.fetch(req, {
           DISPATCHER: env.DISPATCHER,

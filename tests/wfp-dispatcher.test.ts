@@ -1,7 +1,12 @@
 // tests/wfp-dispatcher.test.ts — Unit tests for Cloudflare Workers for Platforms dispatch router.
 
 import { describe, it, expect, vi } from 'vitest'
-import dispatcher, { extractTenantSlug, type DispatcherEnv } from '../src/dispatcher'
+import dispatcher, {
+  extractTenantSlug,
+  extractPathTenant,
+  resolveApexPathTenant,
+  type DispatcherEnv,
+} from '../src/dispatcher'
 
 describe('WFP Dispatcher Router (extractTenantSlug)', () => {
   it('routes root domain to fallback pot', () => {
@@ -17,6 +22,63 @@ describe('WFP Dispatcher Router (extractTenantSlug)', () => {
 
   it('handles custom domains by transforming host to slug', () => {
     expect(extractTenantSlug('agents.viamar.ca', 'mupot.mumega.com')).toBe('agents-viamar-ca')
+  })
+})
+
+describe('apex path tenant /t/{tenant}/{interface}', () => {
+  it('parses /t/gaf/mcp into tenant gaf and remainder /mcp', () => {
+    expect(extractPathTenant('/t/gaf/mcp')).toEqual({ slug: 'gaf', remainder: '/mcp' })
+    expect(extractPathTenant('/t/gaf/mcp/')).toEqual({ slug: 'gaf', remainder: '/mcp/' })
+    expect(extractPathTenant('/t/gaf')).toEqual({ slug: 'gaf', remainder: '/' })
+    expect(extractPathTenant('/t/gaf/')).toEqual({ slug: 'gaf', remainder: '/' })
+  })
+
+  it('ignores paths that are not /t/{tenant}', () => {
+    expect(extractPathTenant('/mcp')).toBeNull()
+    expect(extractPathTenant('/tasks')).toBeNull()
+    expect(extractPathTenant('/t/')).toBeNull()
+    expect(extractPathTenant('/tentacles')).toBeNull()
+  })
+
+  it('rewrites the home pot onto this Worker so /t/mumega/mcp is /mcp', () => {
+    const req = new Request('https://mupot.mumega.com/t/mumega/mcp')
+    const resolved = resolveApexPathTenant(req, 'mumega', 'mupot.mumega.com')
+    expect(resolved?.kind).toBe('home')
+    if (resolved?.kind !== 'home') throw new Error('expected home')
+    expect(new URL(resolved.request.url).pathname).toBe('/mcp')
+    expect(new URL(resolved.request.url).hostname).toBe('mupot.mumega.com')
+  })
+
+  it('rewrites a foreign tenant onto the dispatch hostname so /t/gaf/mcp is gaf.mupot.mumega.com/mcp', () => {
+    const req = new Request('https://mupot.mumega.com/t/gaf/mcp')
+    const resolved = resolveApexPathTenant(req, 'mumega', 'mupot.mumega.com')
+    expect(resolved?.kind).toBe('dispatch')
+    if (resolved?.kind !== 'dispatch') throw new Error('expected dispatch')
+    expect(resolved.slug).toBe('gaf')
+    expect(new URL(resolved.request.url).hostname).toBe('gaf.mupot.mumega.com')
+    expect(new URL(resolved.request.url).pathname).toBe('/mcp')
+  })
+
+  it('dispatches a rewritten /t/gaf/mcp request to the gaf user Worker', async () => {
+    const mockUserWorkerFetch = vi.fn().mockResolvedValue(new Response('ok', { status: 200 }))
+    const mockDispatcher = {
+      get: vi.fn().mockReturnValue({ fetch: mockUserWorkerFetch }),
+    }
+    const env: DispatcherEnv = {
+      DISPATCHER: mockDispatcher,
+      ROOT_DOMAIN: 'mupot.mumega.com',
+    }
+    const apex = new Request('https://mupot.mumega.com/t/gaf/mcp', { method: 'POST' })
+    const resolved = resolveApexPathTenant(apex, 'mumega', 'mupot.mumega.com')
+    if (resolved?.kind !== 'dispatch') throw new Error('expected dispatch')
+    const response = await dispatcher.fetch(resolved.request, env)
+    expect(mockDispatcher.get).toHaveBeenCalledWith(
+      'gaf',
+      {},
+      { limits: { cpuMs: 50, subRequests: 50 } },
+    )
+    expect(new URL(mockUserWorkerFetch.mock.calls[0][0].url).pathname).toBe('/mcp')
+    expect(response.status).toBe(200)
   })
 })
 
