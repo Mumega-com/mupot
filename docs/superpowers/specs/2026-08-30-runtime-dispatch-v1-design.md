@@ -1,8 +1,11 @@
 # Runtime Dispatch v1 and Exact Runtime Receipts Design
 
-**Issue:** Mumega-com/mupot#1240  
-**Status:** approved by Hadi on 2026-08-30  
-**Executor:** Hadi Codex (`087a816b-ab9f-400f-8d53-f6f97b94a725`)  
+**Issue:** Mumega-com/mupot#1240
+
+**Status:** approved by Hadi on 2026-08-30
+
+**Executor:** Hadi Codex
+
 **Independent gate:** Hadi-grok
 
 ## Outcome
