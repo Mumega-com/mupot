@@ -5485,6 +5485,9 @@ function sendScript(projectId?: string) {
            if (!/^gate:[A-Za-z0-9][A-Za-z0-9:_-]{0,120}$/.test(gateOwner)) {
              status.textContent = 'Gate owner must use the gate:<owner> form.'; return;
            }
+           if (gateOwner === 'gate:agent-self-completion') {
+             status.textContent = 'Self-completion is not an independent gate.'; return;
+           }
           var val = selectedAgentValue();
           var parts = val.split('|');
           var agentId = parts[0];

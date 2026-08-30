@@ -29,7 +29,7 @@ import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerd
 import type { TaskStatus } from './service'
 import { resolveTaskAssignee } from './assignee'
 import { verifyTaskArtifactShape } from './artifact-verification'
-import { listTaskDispatchReceiptTimeline } from './runtime-receipts'
+import { hasIndependentRuntimeGate, listTaskDispatchReceiptTimeline } from './runtime-receipts'
 export { resolveTaskAssignee as resolveAssignee } from './assignee'
 import { createBus } from '../bus'
 import type { BusEvent } from '../types'
@@ -561,6 +561,16 @@ tasksApp.post('/', async (c) => {
       { error: 'invalid_gate_owner', detail: "gate_owner must be of the form 'gate:<owner>' — nothing else can match an insertable grant" },
       400,
     )
+  }
+  if (
+    body.dispatch === true
+    && assigneeAgentId !== null
+    && !(await hasIndependentRuntimeGate(c.env, gateOwner, assigneeAgentId))
+  ) {
+    return c.json({
+      error: 'independent_gate_required',
+      detail: 'Dispatch-now requires an active different-agent gate grant with a live credential.',
+    }, 409)
   }
 
   // priority: optional rank. Omitted/null = untriaged (a real state, not a default).

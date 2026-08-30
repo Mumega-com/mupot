@@ -48,9 +48,12 @@ later delivery attempt. No later attempt for that `dispatch_receipt_id` can reco
 `runtime_consumed`, even after restart or re-lease. Recovery requires a separately
 governed dispatch, not resurrection of failed evidence.
 
-`completed` also requires a valid explicit `gate:<owner>` on the task. `/send`
-requires the operator to provide it. Ungated runtime work stays `in_progress`
-instead of entering an unverdictable review state; self-approval is never inferred.
+`completed` also requires a valid explicit `gate:<owner>` backed by a currently
+active, credentialed gate agent distinct from the assignee. `/send` requires the
+operator to provide it and the server verifies the grant for Dispatch-now.
+Nonexistent, revoked, inactive, assignee-only, and `gate:agent-self-completion`
+gates cannot enter review. Ungated runtime work stays `in_progress` instead of
+becoming a zombie review; self-approval is never inferred.
 
 The operation requires an active agent-bound workspace token for the persisted
 assignee. It rechecks the current token, member capability, assignment, project,

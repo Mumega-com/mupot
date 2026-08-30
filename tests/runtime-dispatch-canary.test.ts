@@ -41,14 +41,19 @@ function canary() {
     ) VALUES (
       '${TOKEN}', '${MEMBER}', 'hash-canary', 'canary', 'workspace', '${T0}',
       '${AGENT}', '${TENANT}', '2099-01-01T00:00:00.000Z'
+    ), (
+      'token-gate', 'member-gate', 'hash-gate', 'gate', 'workspace', '${T0}',
+      'agent-gate', '${TENANT}', '2099-01-01T00:00:00.000Z'
     );
+    INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
+      VALUES ('gate-grant', 'gate:independent', 'agent', 'agent-gate', '${MEMBER}', '${T0}');
     INSERT INTO tasks (
       id, squad_id, title, body, done_when, status, assignee_agent_id, gate_owner,
       created_at, updated_at
     ) VALUES (
       '${TASK}', '${SQUAD}', 'Synthetic runtime canary', 'Synthetic local-only work',
       'One runtime receipt and one independent verdict exist.', 'open', '${AGENT}',
-      'gate:agent:agent-gate', '${T0}', '${T0}'
+      'gate:independent', '${T0}', '${T0}'
     );
     INSERT INTO task_dispatch_receipts (
       id, tenant, task_id, squad_id, agent_id, actor_kind, actor_id,

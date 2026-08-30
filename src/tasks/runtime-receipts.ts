@@ -1,4 +1,5 @@
 import { canOnSquad, resolveCapabilities } from '../auth/capability'
+import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { canonicalJson, sha256Hex } from '../lib/canonical-json'
 import type { AuthContext, Env } from '../types'
 import { resolveTaskAssignee } from './assignee'
@@ -103,6 +104,39 @@ interface ReceiptRow extends Omit<TaskDispatchRuntimeReceipt, 'artifact_refs'> {
 
 const SHA256_RE = /^[0-9a-f]{64}$/
 const STAGES = new Set<TaskDispatchRuntimeStage>(['runtime_consumed', 'completed', 'failed'])
+
+export async function hasIndependentRuntimeGate(
+  env: Env,
+  gateOwner: string | null | undefined,
+  assigneeAgentId: string,
+): Promise<boolean> {
+  if (
+    gateOwner === null || gateOwner === undefined
+    || gateOwner === 'gate:agent-self-completion'
+    || !isValidGateOwnerForm(gateOwner)
+  ) return false
+  const row = await env.DB.prepare(`
+    SELECT 1 AS allowed
+      FROM gate_grants grant_row
+      JOIN agents gate_agent
+        ON grant_row.principal_type = 'agent'
+       AND gate_agent.id = grant_row.principal_id
+       AND gate_agent.status = 'active'
+     WHERE grant_row.capability = ?1
+       AND gate_agent.id <> ?2
+       AND EXISTS (
+         SELECT 1
+           FROM member_tokens t
+           JOIN members gate_member
+             ON gate_member.id = t.member_id AND gate_member.status = 'active'
+          WHERE t.agent_id = gate_agent.id
+            AND t.tenant = ?3
+            AND ${TOKEN_LIVE_PREDICATE('?4')}
+       )
+     LIMIT 1
+  `).bind(gateOwner, assigneeAgentId, env.TENANT_SLUG, nowSqlUtc()).first<{ allowed: number }>()
+  return row !== null
+}
 
 function text(value: unknown, maximum = 255): string {
   if (typeof value !== 'string') throw new TaskDispatchRuntimeReceiptError('runtime_receipt_invalid')
@@ -292,10 +326,11 @@ export async function recordTaskDispatchRuntimeReceipt(
     throw new TaskDispatchRuntimeReceiptError('runtime_receipt_forbidden')
   }
   const runtimeAddress = validateEnvelope(delivery, input, now, replay !== null)
-  if (
-    input.stage === 'completed'
-    && (delivery.task_gate_owner === null || !isValidGateOwnerForm(delivery.task_gate_owner))
-  ) {
+  if (input.stage === 'completed' && !(await hasIndependentRuntimeGate(
+    env,
+    delivery.task_gate_owner,
+    agentId,
+  ))) {
     throw new TaskDispatchRuntimeReceiptError('runtime_gate_required')
   }
   if (
@@ -353,6 +388,26 @@ export async function recordTaskDispatchRuntimeReceipt(
              WHERE id = ?3 AND assignee_agent_id = ?4
                AND status = 'in_progress' AND execution_receipt_id = ?5
                AND gate_owner IS NOT NULL
+               AND gate_owner <> 'gate:agent-self-completion'
+               AND EXISTS (
+                 SELECT 1
+                   FROM gate_grants grant_row
+                   JOIN agents gate_agent
+                     ON grant_row.principal_type = 'agent'
+                    AND gate_agent.id = grant_row.principal_id
+                    AND gate_agent.status = 'active'
+                  WHERE grant_row.capability = tasks.gate_owner
+                    AND gate_agent.id <> tasks.assignee_agent_id
+                    AND EXISTS (
+                      SELECT 1
+                        FROM member_tokens t
+                        JOIN members gate_member
+                          ON gate_member.id = t.member_id AND gate_member.status = 'active'
+                       WHERE t.agent_id = gate_agent.id
+                         AND t.tenant = ?6
+                         AND ${TOKEN_LIVE_PREDICATE('?8')}
+                    )
+               )
                AND EXISTS (
                  SELECT 1 FROM task_dispatch_runtime_receipts consumed
                   WHERE consumed.tenant = ?6
@@ -362,7 +417,7 @@ export async function recordTaskDispatchRuntimeReceipt(
                )
             RETURNING status
           `).bind(result, now, input.taskId, agentId, input.dispatchReceiptId,
-            env.TENANT_SLUG, input.attempt)
+            env.TENANT_SLUG, input.attempt, nowSqlUtc())
         : env.DB.prepare(`
             UPDATE tasks SET status = 'blocked', result = ?1, updated_at = ?2
              WHERE id = ?3 AND assignee_agent_id = ?4

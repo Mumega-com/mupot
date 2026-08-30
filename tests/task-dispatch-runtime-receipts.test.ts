@@ -341,6 +341,105 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
     }
   })
 
+  it.each([
+    {
+      name: 'nonexistent gate grant',
+      mutate: (fixture: ReturnType<typeof runtimeFixture>) => {
+        fixture.harness.sqlite.prepare("UPDATE tasks SET gate_owner = 'gate:missing' WHERE id = ?").run(TASK_ID)
+      },
+    },
+    {
+      name: 'gate held only by the assignee',
+      mutate: (fixture: ReturnType<typeof runtimeFixture>) => {
+        fixture.harness.sqlite.exec(`
+          DELETE FROM gate_grants;
+          INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
+          VALUES ('gate-self-only', 'gate:self-only', 'agent', '${AGENT_ID}', '${MEMBER_ID}', '${T0}');
+          UPDATE tasks SET gate_owner = 'gate:self-only' WHERE id = '${TASK_ID}';
+        `)
+      },
+    },
+    {
+      name: 'self-completion gate',
+      mutate: (fixture: ReturnType<typeof runtimeFixture>) => {
+        fixture.harness.sqlite.prepare(
+          "UPDATE tasks SET gate_owner = 'gate:agent-self-completion' WHERE id = ?",
+        ).run(TASK_ID)
+      },
+    },
+    {
+      name: 'revoked gate credential',
+      mutate: (fixture: ReturnType<typeof runtimeFixture>) => {
+        fixture.harness.sqlite.prepare('UPDATE member_tokens SET revoked_at = ? WHERE id = ?')
+          .run(T0, GATE_TOKEN_ID)
+      },
+    },
+    {
+      name: 'inactive gate agent',
+      mutate: (fixture: ReturnType<typeof runtimeFixture>) => {
+        fixture.harness.sqlite.prepare("UPDATE agents SET status = 'paused' WHERE id = ?")
+          .run(GATE_AGENT_ID)
+      },
+    },
+  ])('refuses completion for $name', async ({ mutate }) => {
+    const fixture = runtimeFixture()
+    try {
+      mutate(fixture)
+      await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+        taskId: TASK_ID, dispatchReceiptId: DISPATCH_ID, messageId: MESSAGE_ID,
+        stage: 'runtime_consumed', runtimeReceiptHash: RUNTIME_HASH, attempt: 1,
+      })
+      await expect(recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+        taskId: TASK_ID, dispatchReceiptId: DISPATCH_ID, messageId: MESSAGE_ID,
+        stage: 'completed', runtimeReceiptHash: 'b'.repeat(64), attempt: 1,
+        result: 'Must not enter zombie review.',
+      })).rejects.toMatchObject({ code: 'runtime_gate_required' })
+      expect(fixture.harness.sqlite.prepare('SELECT status FROM tasks WHERE id = ?').get(TASK_ID))
+        .toEqual({ status: 'in_progress' })
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
+  it('fails atomically when the independent gate credential is revoked after precheck', async () => {
+    const fixture = runtimeFixture()
+    try {
+      await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+        taskId: TASK_ID, dispatchReceiptId: DISPATCH_ID, messageId: MESSAGE_ID,
+        stage: 'runtime_consumed', runtimeReceiptHash: RUNTIME_HASH, attempt: 1,
+      })
+      let flipped = false
+      const racedDb = {
+        ...fixture.env.DB,
+        prepare: fixture.env.DB.prepare.bind(fixture.env.DB),
+        batch: async (statements: Parameters<Env['DB']['batch']>[0]) => {
+          if (!flipped) {
+            flipped = true
+            fixture.harness.sqlite.prepare('UPDATE member_tokens SET revoked_at = ? WHERE id = ?')
+              .run(T0, GATE_TOKEN_ID)
+          }
+          return fixture.env.DB.batch(statements)
+        },
+      } as Env['DB']
+      await expect(recordTaskDispatchRuntimeReceipt(
+        { ...fixture.env, DB: racedDb },
+        fixture.auth,
+        {
+          taskId: TASK_ID, dispatchReceiptId: DISPATCH_ID, messageId: MESSAGE_ID,
+          stage: 'completed', runtimeReceiptHash: 'c'.repeat(64), attempt: 1,
+          result: 'Race must roll back.',
+        },
+      )).rejects.toMatchObject({ code: 'runtime_receipt_transition_conflict' })
+      expect(fixture.harness.sqlite.prepare('SELECT status FROM tasks WHERE id = ?').get(TASK_ID))
+        .toEqual({ status: 'in_progress' })
+      expect(fixture.harness.sqlite.prepare(
+        "SELECT COUNT(*) AS count FROM task_dispatch_runtime_receipts WHERE stage = 'completed'",
+      ).get()).toEqual({ count: 0 })
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
   it('moves runtime completion through review to a different granted gate agent verdict', async () => {
     const fixture = runtimeFixture()
     try {
@@ -588,6 +687,45 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
       expect(restFixture.harness.sqlite.prepare(
         "SELECT origin FROM mutation_audit_entries WHERE handler = 'task_dispatch_runtime_receipt'",
       ).get()).toEqual({ origin: 'rest' })
+    } finally {
+      mcpFixture.harness.close()
+      restFixture.harness.close()
+    }
+  })
+
+  it('MCP and REST both reject completion through a nonexistent gate', async () => {
+    const mcpFixture = runtimeFixture()
+    const restFixture = runtimeFixture()
+    try {
+      for (const fixture of [mcpFixture, restFixture]) {
+        fixture.harness.sqlite.prepare("UPDATE tasks SET gate_owner = 'gate:missing' WHERE id = ?")
+          .run(TASK_ID)
+        await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+          taskId: TASK_ID, dispatchReceiptId: DISPATCH_ID, messageId: MESSAGE_ID,
+          stage: 'runtime_consumed', runtimeReceiptHash: RUNTIME_HASH, attempt: 1,
+        })
+      }
+      const args = {
+        task_id: TASK_ID, dispatch_receipt_id: DISPATCH_ID, message_id: MESSAGE_ID,
+        stage: 'completed', runtime_receipt_hash: 'd'.repeat(64), attempt: 1,
+        result: 'Must remain in progress.',
+      }
+      const mcp = await invokeTool(
+        mcpFixture.auth, mcpFixture.env, 'task_dispatch_runtime_receipt', args, 'https://pot.test',
+      )
+      expect(mcp).toMatchObject({ ok: false, status: 409, error: 'runtime_gate_required' })
+
+      const response = await mcpActionsApp.request(
+        'https://pot.test/actions/task_dispatch_runtime_receipt',
+        {
+          method: 'POST',
+          headers: { authorization: 'Bearer test-token', 'content-type': 'application/json' },
+          body: JSON.stringify(args),
+        },
+        restFixture.env,
+      )
+      expect(response.status).toBe(409)
+      await expect(response.json()).resolves.toMatchObject({ ok: false, error: 'runtime_gate_required' })
     } finally {
       mcpFixture.harness.close()
       restFixture.harness.close()

@@ -469,8 +469,9 @@ content is rejected. `runtime_consumed` claims the task `in_progress`,
 those stages writes `done`; the independent verdict surface remains mandatory.
 A failed dispatch is terminally fenced and cannot later be revived as
 `runtime_consumed` by any later attempt for that dispatch/message. Completion
-also requires an explicit valid independent `gate:<owner>`; ungated work cannot
-enter review.
+also requires an explicit `gate:<owner>` with a currently active, credentialed
+different-agent grant. Nonexistent, revoked, inactive, assignee-only, and
+self-completion gates cannot enter review.
 
 Task readback and runtime write responses expose allowlisted DTOs. Credential/audit
 IDs and exact message/dispatch/private receipt correlation IDs remain only in a
