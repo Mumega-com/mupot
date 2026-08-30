@@ -423,12 +423,12 @@ export function formatPlan(opts = {}) {
   lines.push(commandLine([
     'gh',
     'pr',
-    'checks',
+    'view',
+    checksPr,
     '--repo',
     repo,
-    checksPr,
     '--json',
-    'name,state,link,bucket',
+    'statusCheckRollup',
   ], ` > ${shellQuote(join(outDir, 'github-checks.json'))}`))
   lines.push(commandLine([
     'gh',
@@ -580,6 +580,12 @@ function checkEntries(parsed) {
   return []
 }
 
+function checkName(entry) {
+  if (typeof entry?.name === 'string' && entry.name.length > 0) return entry.name
+  if (typeof entry?.context === 'string' && entry.context.length > 0) return entry.context
+  return ''
+}
+
 function expectedPrNumber(checksPr) {
   const raw = String(checksPr ?? '').trim()
   if (!raw) return null
@@ -596,7 +602,23 @@ function checkSucceeded(entry) {
   const conclusion = String(entry?.conclusion ?? '').toUpperCase()
   const state = String(entry?.state ?? entry?.status ?? '').toUpperCase()
   const bucket = String(entry?.bucket ?? '').toLowerCase()
-  return conclusion === 'SUCCESS' || state === 'SUCCESS' || state === 'COMPLETED' && conclusion === 'SUCCESS' || bucket === 'pass'
+  if (conclusion) return conclusion === 'SUCCESS' && state === 'COMPLETED'
+  if (entry?.state !== undefined) return state === 'SUCCESS'
+  if (entry?.status !== undefined) return false
+  return bucket === 'pass'
+}
+
+function checkObservation(entry) {
+  return {
+    name: checkName(entry) || null,
+    context: entry?.context ?? null,
+    conclusion: entry?.conclusion ?? null,
+    status: entry?.status ?? null,
+    state: entry?.state ?? entry?.status ?? null,
+    bucket: entry?.bucket ?? null,
+    detailsUrl: entry?.detailsUrl ?? null,
+    targetUrl: entry?.targetUrl ?? null,
+  }
 }
 
 function permissionDisplay(value) {
@@ -707,16 +729,11 @@ export function checkBundle(opts = {}) {
   artifacts['github-checks.json'] = artifactMeta(checksPath, checksJson)
   const exportedChecks = checkEntries(checksJson)
   for (const requiredName of REQUIRED_CHECKS) {
-    const matching = exportedChecks.filter((entry) => String(entry?.name ?? '') === requiredName)
+    const matching = exportedChecks.filter((entry) => checkName(entry) === requiredName)
     pushCheck(checks, matching.length > 0, 'required_ci_check_exported', { check_name: requiredName })
     pushCheck(checks, matching.some(checkSucceeded), 'required_ci_check_passed', {
       check_name: requiredName,
-      observed: matching.map((entry) => ({
-        name: entry?.name ?? null,
-        conclusion: entry?.conclusion ?? null,
-        state: entry?.state ?? entry?.status ?? null,
-        bucket: entry?.bucket ?? null,
-      })),
+      observed: matching.map(checkObservation),
     })
   }
 
@@ -744,16 +761,11 @@ export function checkBundle(opts = {}) {
   })
   const prChecks = checkEntries(prJson)
   for (const requiredName of REQUIRED_CHECKS) {
-    const matching = prChecks.filter((entry) => String(entry?.name ?? '') === requiredName)
+    const matching = prChecks.filter((entry) => checkName(entry) === requiredName)
     pushCheck(checks, matching.length > 0, 'required_pr_rollup_check_exported', { check_name: requiredName })
     pushCheck(checks, matching.some(checkSucceeded), 'required_pr_rollup_check_passed', {
       check_name: requiredName,
-      observed: matching.map((entry) => ({
-        name: entry?.name ?? null,
-        conclusion: entry?.conclusion ?? null,
-        state: entry?.state ?? entry?.status ?? null,
-        bucket: entry?.bucket ?? null,
-      })),
+      observed: matching.map(checkObservation),
     })
   }
 
@@ -771,15 +783,11 @@ export function checkBundle(opts = {}) {
   artifacts['github-commit-checks.json'] = artifactMeta(commitChecksPath, commitChecksJson)
   const releaseCommitChecks = checkEntries(commitChecksJson)
   for (const requiredName of REQUIRED_COMMIT_CHECKS) {
-    const matching = releaseCommitChecks.filter((entry) => String(entry?.name ?? '') === requiredName)
+    const matching = releaseCommitChecks.filter((entry) => checkName(entry) === requiredName)
     pushCheck(checks, matching.length > 0, 'required_release_commit_check_exported', { check_name: requiredName })
     pushCheck(checks, matching.some(checkSucceeded), 'required_release_commit_check_passed', {
       check_name: requiredName,
-      observed: matching.map((entry) => ({
-        name: entry?.name ?? null,
-        conclusion: entry?.conclusion ?? null,
-        state: entry?.state ?? entry?.status ?? null,
-      })),
+      observed: matching.map(checkObservation),
     })
   }
 

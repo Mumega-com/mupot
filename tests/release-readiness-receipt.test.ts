@@ -233,6 +233,21 @@ async function writeBundle(dir: string, mutate?: (dir: string) => void) {
   mutate?.(dir)
 }
 
+function passingStatusCheckRollup() {
+  return REQUIRED_CHECKS.map((name, index) => index % 2 === 0
+    ? {
+        name,
+        conclusion: 'SUCCESS',
+        status: 'COMPLETED',
+        detailsUrl: `https://github.test/checks/${encodeURIComponent(name)}`,
+      }
+    : {
+        context: name,
+        state: 'SUCCESS',
+        targetUrl: `https://github.test/status/${encodeURIComponent(name)}`,
+      })
+}
+
 describe('release readiness receipt checker', () => {
   it('parses plan and check arguments', () => {
     expect(parseArgs(['--plan', '--version', 'v0.23.0']).plan).toBe(true)
@@ -324,7 +339,8 @@ describe('release readiness receipt checker', () => {
     expect(plan).toContain('gh pr view 285 --repo Mumega-com/mupot')
     expect(plan).toContain('mergeCommit')
     expect(plan).toContain('github-checks.json')
-    expect(plan).toContain('gh pr checks --repo Mumega-com/mupot 285')
+    expect(plan).toContain('gh pr view 285 --repo Mumega-com/mupot --json statusCheckRollup > tmp/release-readiness/v0.23.0/github-checks.json')
+    expect(plan).not.toContain('gh pr checks --json')
     expect(plan).toContain(`repos/Mumega-com/mupot/commits/${RELEASE_SHA}`)
     expect(plan).toContain('github-commit.json')
     expect(plan).toContain('github-commit-checks.json')
@@ -532,6 +548,41 @@ describe('release readiness receipt checker', () => {
       ok: false,
       check: 'required_ci_check_passed',
       check_name: 'local-evidence',
+    }))
+  })
+
+  it('passes when github-checks.json contains the gh pr view statusCheckRollup object', async () => {
+    const dir = tempDir()
+    await writeBundle(dir, () => {
+      writeJson(join(dir, 'github-checks.json'), { statusCheckRollup: passingStatusCheckRollup() })
+    })
+
+    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285', releaseSha: RELEASE_SHA })
+
+    expect(receipt.status).toBe('pass')
+  })
+
+  it.each([
+    ['missing', (rollup: ReturnType<typeof passingStatusCheckRollup>) => rollup.filter((entry) => (entry.name ?? entry.context) !== 'plugin'), 'required_ci_check_exported'],
+    ['pending', (rollup: ReturnType<typeof passingStatusCheckRollup>) => rollup.map((entry) => (entry.name ?? entry.context) === 'plugin'
+      ? { context: 'plugin', state: 'PENDING', targetUrl: 'https://github.test/status/plugin' }
+      : entry), 'required_ci_check_passed'],
+    ['failing', (rollup: ReturnType<typeof passingStatusCheckRollup>) => rollup.map((entry) => (entry.name ?? entry.context) === 'plugin'
+      ? { context: 'plugin', state: 'FAILURE', targetUrl: 'https://github.test/status/plugin' }
+      : entry), 'required_ci_check_passed'],
+  ])('fails closed when a required statusCheckRollup check is %s', async (_state, makeRollup, failedCheck) => {
+    const dir = tempDir()
+    await writeBundle(dir, () => {
+      writeJson(join(dir, 'github-checks.json'), { statusCheckRollup: makeRollup(passingStatusCheckRollup()) })
+    })
+
+    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285', releaseSha: RELEASE_SHA })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: failedCheck,
+      check_name: 'plugin',
     }))
   })
 
