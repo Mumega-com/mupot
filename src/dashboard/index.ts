@@ -5245,6 +5245,10 @@ export function sendPageBody(
             <span class="lbl">What do you need done?</span>
             <textarea id="send-body" rows="6" placeholder="Describe the task in your own words…"></textarea>
           </label>
+          <label class="block" style="margin-top:14px">
+            <span class="lbl">Done when (verifiable)</span>
+            <input id="send-done" placeholder="e.g. Artifact: path and SHA256: digest are reported">
+          </label>
           <div style="margin-top:14px">
             <button id="send-btn" class="btn">Dispatch now</button>
             <span id="send-hint" style="margin-left:12px;color:var(--dim);font-size:13px;">wakes your agent now and the result lands here</span>
@@ -5270,7 +5274,7 @@ export function sendPageBody(
     <style>
       .block { display: flex; flex-direction: column; gap: 6px; }
       .block .lbl { font-size: 13px; color: var(--muted); }
-      #send-body, #bk-title, #bk-body, #bk-done, #bk-priority, #bk-squad, #bk-assignee {
+      #send-body, #send-done, #bk-title, #bk-body, #bk-done, #bk-priority, #bk-squad, #bk-assignee {
         font: inherit; padding: 9px 11px; border-radius: 8px; border: 1px solid var(--border);
         background: var(--bg); color: var(--text); width: 100%; resize: vertical;
       }
@@ -5369,6 +5373,7 @@ function sendScript(projectId?: string) {
         var projectId = ${JSON.stringify(projectId ?? null).replace(/</g, '\\u003c')};
         var btn = document.getElementById('send-btn');
         var bodyEl = document.getElementById('send-body');
+        var doneEl = document.getElementById('send-done');
         var status = document.getElementById('send-status');
         var resultBox = document.getElementById('send-result');
         if (!btn) return;
@@ -5405,11 +5410,12 @@ function sendScript(projectId?: string) {
               });
             } catch (e) { continue; }
             if (!res.ok) { continue; }
-            var data = await res.json();
-            var t = data.task;
-            if (!t) { continue; }
+             var data = await res.json();
+             var t = data.task;
+             if (!t) { continue; }
+             t.dispatch_timeline = data.dispatch_timeline || { transport: [], runtime: [] };
             if (t.status === 'in_progress') { status.textContent = 'Working… (' + fmtSecs(Date.now() - startedAt) + ')'; continue; }
-            if (t.status === 'done' || t.status === 'blocked') {
+            if (t.status === 'done' || t.status === 'approved' || t.status === 'review' || t.status === 'blocked' || t.status === 'rejected') {
               return render(t, startedAt);
             }
             // still 'open' (dispatch in flight) — keep waiting.
@@ -5418,23 +5424,56 @@ function sendScript(projectId?: string) {
           status.textContent = 'Still working after ' + fmtSecs(MAX_MS) + '. It will keep running — refresh later to see the result.';
         }
 
-        function render(t, startedAt) {
+         function render(t, startedAt) {
           var took = fmtSecs(Date.now() - startedAt);
           if (t.status === 'done') {
             status.textContent = 'Done in ' + took + '.';
+          } else if (t.status === 'approved') {
+            status.textContent = 'Approved in ' + took + '.';
+          } else if (t.status === 'review') {
+            status.textContent = 'Awaiting independent gate — work is complete but not approved.';
+          } else if (t.status === 'rejected') {
+            status.textContent = 'Gate rejected the work — see the note below.';
           } else {
             status.textContent = 'Blocked — see the note below.';
           }
           var when = t.completed_at || '';
           var who = t.assignee_agent_id || 'your agent';
-          var meta = (t.status === 'done' ? 'Completed by ' : 'Blocked · ') + esc(who) + (when ? ' at ' + esc(when) : '');
-          resultBox.hidden = false;
-          resultBox.innerHTML = '<div class="done-meta">' + meta + '</div>' + esc(t.result || '(no output)');
+          var label = t.status === 'done' ? 'Completed by '
+            : t.status === 'approved' ? 'Approved · '
+            : t.status === 'review' ? 'Review pending · '
+            : t.status === 'rejected' ? 'Rejected · '
+            : 'Blocked · ';
+           var meta = label + esc(who) + (when ? ' at ' + esc(when) : '');
+           var timeline = t.dispatch_timeline || { transport: [], runtime: [] };
+           var stages = [];
+           if ((timeline.transport || []).some(function (row) { return !!row.transport_delivered_at; })) {
+             stages.push('Transport delivered');
+           }
+           if ((timeline.runtime || []).some(function (row) { return row.stage === 'runtime_consumed'; })) {
+             stages.push('Runtime consumed');
+           }
+           if ((timeline.runtime || []).some(function (row) { return row.stage === 'completed'; })) {
+             stages.push('Runtime completed');
+           }
+           if ((timeline.runtime || []).some(function (row) { return row.stage === 'failed'; })) {
+             stages.push('Runtime failed');
+           }
+           if (t.status === 'review' || t.status === 'approved' || t.status === 'rejected' || t.status === 'done') {
+             stages.push('Gate verdict: ' + t.status);
+           }
+           var receiptStages = stages.length
+             ? '<div class="done-meta">' + stages.map(esc).join(' · ') + '</div>'
+             : '';
+           resultBox.hidden = false;
+           resultBox.innerHTML = '<div class="done-meta">' + meta + '</div>' + receiptStages + esc(t.result || '(no output)');
         }
 
         btn.addEventListener('click', async function () {
           var text = (bodyEl.value || '').trim();
+          var doneWhen = (doneEl.value || '').trim();
           if (!text) { status.textContent = 'Write what you need first.'; return; }
+          if (!doneWhen) { status.textContent = 'A verifiable done-when is required.'; return; }
           var val = selectedAgentValue();
           var parts = val.split('|');
           var agentId = parts[0];
@@ -5450,7 +5489,7 @@ function sendScript(projectId?: string) {
             var payload = {
               squad_id: squadId,
               title: title,
-              done_when: 'The task result explains the completed work and names any follow-up needed.',
+              done_when: doneWhen,
               body: text,
               assignee_agent_id: agentId,
               dispatch: shouldDispatch()
