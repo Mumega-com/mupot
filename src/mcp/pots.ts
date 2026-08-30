@@ -54,6 +54,10 @@ export const toolPotProvision: ToolSpec = {
       return fail(400, 'invalid_args', 'Missing required fields: slug, brand_name, admin_email.')
     }
 
+    if (!env.SECRET_ENV_CF_API_TOKEN) {
+      return fail(503, 'unconfigured', 'Cloudflare API Token not configured for pot provisioning.')
+    }
+
     try {
       const input: SovereignPotProvisionInput = {
         slug,
