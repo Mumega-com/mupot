@@ -662,7 +662,12 @@ describe('S353 v2 — route-to-one-executor dispatch bridge', () => {
     // mismatched seed body here would (correctly) surface as request_id_conflict rather than
     // simulating "attempt 1 already delivered this exact dispatch."
     const body = JSON.stringify({
-      type: 'task_dispatch', task_id: 'task-1', dispatch_receipt_id: 'receipt-1', squad_id: '',
+      version: 'runtime.dispatch/v1',
+      type: 'task_dispatch',
+      task_id: 'task-1',
+      dispatch_receipt_id: 'receipt-1',
+      squad_id: '',
+      runtime_address: 'agent-1-ext',
     })
     db._messages.push({
       seq: 1, id: 'm1', tenant: 'test', to_agent: 'agent-1-ext', from_agent: 'mupot-dispatch',

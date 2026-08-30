@@ -72,6 +72,11 @@ import type { TaskStatus } from '../tasks/service'
 import { isTaskPriority, TASK_PRIORITIES } from '../types'
 import type { TaskPriority } from '../types'
 import { resolveTaskAssignee } from '../tasks/assignee'
+import {
+  recordTaskDispatchRuntimeReceipt,
+  TaskDispatchRuntimeReceiptError,
+  type TaskDispatchRuntimeStage,
+} from '../tasks/runtime-receipts'
 // #22 v1 ATC ranking: pure scorer + the radar's existing agent runtime-state
 // loader (dashboard/radar.ts already uses this same loader for the fleet
 // view — not a new query shape).
@@ -542,6 +547,7 @@ export function str(v: unknown): string | null {
 // pot's own MCP endpoint into the brief. Derived from the request URL at each call site.
 export type ToolCtx = {
   origin: string
+  transport: 'mcp' | 'rest'
   waitUntil?: (promise: Promise<unknown>) => void
   seat?: string
   source?: string
@@ -1896,6 +1902,74 @@ const toolTaskDispatch: ToolSpec = {
         dispatched_at: dispatchedAt,
       },
     })
+  },
+}
+
+function runtimeReceiptFailure(error: TaskDispatchRuntimeReceiptError): ToolOutcome {
+  if (error.code === 'runtime_receipt_invalid') return fail(400, error.code)
+  if (error.code === 'agent_bound_workspace_credential_required' || error.code === 'runtime_receipt_forbidden') {
+    return fail(403, error.code)
+  }
+  if (error.code === 'runtime_delivery_not_found') return fail(404, error.code)
+  if (
+    error.code === 'runtime_delivery_stale'
+    || error.code === 'runtime_receipt_conflict'
+    || error.code === 'runtime_artifact_required'
+    || error.code === 'runtime_gate_required'
+    || error.code === 'runtime_receipt_transition_conflict'
+  ) return fail(409, error.code)
+  return fail(500, error.code)
+}
+
+const toolTaskDispatchRuntimeReceipt: ToolSpec = {
+  name: 'task_dispatch_runtime_receipt',
+  scope: 'assigned task runtime receipt',
+  min: 'member',
+  args: '{ task_id, dispatch_receipt_id, message_id, stage, runtime_receipt_hash, attempt, artifact_refs?, artifact_sha256?, result?, reason? }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      task_id: STRING_SCHEMA,
+      dispatch_receipt_id: STRING_SCHEMA,
+      message_id: STRING_SCHEMA,
+      stage: { type: 'string', enum: ['runtime_consumed', 'completed', 'failed'] },
+      runtime_receipt_hash: STRING_SCHEMA,
+      attempt: OPTIONAL_NUMBER_SCHEMA,
+      artifact_refs: OPTIONAL_STRING_ARRAY_SCHEMA,
+      artifact_sha256: NULLABLE_STRING_SCHEMA,
+      result: NULLABLE_STRING_SCHEMA,
+      reason: NULLABLE_STRING_SCHEMA,
+    },
+    required: [
+      'task_id',
+      'dispatch_receipt_id',
+      'message_id',
+      'stage',
+      'runtime_receipt_hash',
+      'attempt',
+    ],
+    additionalProperties: false,
+  },
+  async run(auth, env, args, ctx) {
+    try {
+      return done(await recordTaskDispatchRuntimeReceipt(env, auth, {
+        taskId: str(args.task_id) ?? '',
+        dispatchReceiptId: str(args.dispatch_receipt_id) ?? '',
+        messageId: str(args.message_id) ?? '',
+        stage: args.stage as TaskDispatchRuntimeStage,
+        runtimeReceiptHash: str(args.runtime_receipt_hash) ?? '',
+        attempt: args.attempt as number,
+        artifactRefs: Array.isArray(args.artifact_refs)
+          ? args.artifact_refs.filter((value): value is string => typeof value === 'string')
+          : undefined,
+        artifactSha256: args.artifact_sha256 as string | null | undefined,
+        result: args.result as string | null | undefined,
+        reason: args.reason as string | null | undefined,
+      }, { origin: ctx.transport }))
+    } catch (error) {
+      if (error instanceof TaskDispatchRuntimeReceiptError) return runtimeReceiptFailure(error)
+      throw error
+    }
   },
 }
 
@@ -4303,6 +4377,7 @@ export const TOOLS: ToolSpec[] = [
   toolTaskVerdict,
   toolTaskVerdictReverse,
   toolTaskDispatch,
+  toolTaskDispatchRuntimeReceipt,
   toolTaskIntakeAudit,
   toolRemember,
   toolRecall,
@@ -4448,9 +4523,10 @@ export async function invokeTool(
   originOrCtx: string | Partial<ToolCtx> = '',
 ): Promise<ToolOutcome & { tool?: string }> {
   const ctx: ToolCtx = typeof originOrCtx === 'string'
-    ? { origin: originOrCtx }
+    ? { origin: originOrCtx, transport: 'mcp' }
     : {
         origin: originOrCtx?.origin ?? '',
+        transport: originOrCtx?.transport ?? 'mcp',
         waitUntil: originOrCtx?.waitUntil,
         seat: originOrCtx?.seat,
         source: originOrCtx?.source,
@@ -4568,6 +4644,7 @@ async function handleJsonRpc(c: import('hono').Context<AppEnv>, body: JsonRpcReq
     const params = typeof body.params === 'object' && body.params !== null ? body.params as Record<string, unknown> : {}
     const ctx: ToolCtx = {
       origin: new URL(c.req.url).origin,
+      transport: 'mcp',
       waitUntil: safeWaitUntil(c),
       seat: c.req.header('x-mupot-seat'),
       source: c.req.header('x-mupot-source'),
@@ -4639,6 +4716,7 @@ mcpApp.post('/', async (c) => {
 
   const ctx: ToolCtx = {
     origin: new URL(c.req.url).origin,
+    transport: 'mcp',
     waitUntil: safeWaitUntil(c),
     seat: c.req.header('x-mupot-seat'),
     source: c.req.header('x-mupot-source'),
@@ -4740,6 +4818,7 @@ mcpActionsApp.post('/actions/:tool', async (c) => {
 
   const ctx: ToolCtx = {
     origin: new URL(c.req.url).origin,
+    transport: 'rest',
     waitUntil: safeWaitUntil(c),
     seat: c.req.header('x-mupot-seat'),
     source: c.req.header('x-mupot-source'),

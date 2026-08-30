@@ -85,10 +85,15 @@ export class InboxFullError extends Error {}
  */
 export async function deliverDispatchToInbox(env: Env, input: DispatchBridgeInput): Promise<BridgeResult> {
   const body = JSON.stringify({
+    version: 'runtime.dispatch/v1',
     type: 'task_dispatch',
     task_id: input.taskId,
     dispatch_receipt_id: input.receiptId,
     squad_id: input.squadId,
+    // The consumer already resolved agentId from the persisted fleet route. Do
+    // not accept a second caller-controlled address that could diverge from the
+    // actual durable inbox target.
+    runtime_address: input.agentId,
   })
 
   const res = await sendAgentMessage(env, {
