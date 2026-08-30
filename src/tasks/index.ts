@@ -29,6 +29,7 @@ import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerd
 import type { TaskStatus } from './service'
 import { resolveTaskAssignee } from './assignee'
 import { verifyTaskArtifactShape } from './artifact-verification'
+import { listTaskDispatchReceiptTimeline } from './runtime-receipts'
 export { resolveTaskAssignee as resolveAssignee } from './assignee'
 import { createBus } from '../bus'
 import type { BusEvent } from '../types'
@@ -472,7 +473,8 @@ tasksApp.get('/:id', async (c) => {
     return c.json({ error: 'forbidden', need: 'member' }, 403)
   }
 
-  return c.json({ task })
+  const dispatchTimeline = await listTaskDispatchReceiptTimeline(c.env, task.id)
+  return c.json({ task, dispatch_timeline: dispatchTimeline })
 })
 
 // ── POST / — create a task (optionally dispatch it for execution) ─────────────

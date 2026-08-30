@@ -356,3 +356,51 @@ export async function recordTaskDispatchRuntimeReceipt(
   if (!persisted || !task) throw new TaskDispatchRuntimeReceiptError('runtime_receipt_persistence_conflict')
   return { receipt: publicReceipt(persisted), task_status: task.status }
 }
+
+export interface TaskDispatchReceiptTimeline {
+  transport: Array<{
+    dispatch_receipt_id: string
+    agent_id: string
+    dispatched_at: string
+    transport_delivered_at: string | null
+  }>
+  runtime: TaskDispatchRuntimeReceipt[]
+  task_status: string
+}
+
+export async function listTaskDispatchReceiptTimeline(
+  env: Env,
+  taskId: string,
+  limit = 20,
+): Promise<TaskDispatchReceiptTimeline> {
+  const boundedLimit = Number.isInteger(limit) ? Math.max(1, Math.min(limit, 100)) : 20
+  const task = await env.DB.prepare('SELECT status FROM tasks WHERE id = ?1 LIMIT 1')
+    .bind(taskId).first<{ status: string }>()
+  if (!task) throw new TaskDispatchRuntimeReceiptError('runtime_delivery_not_found')
+  const transport = await env.DB.prepare(`
+    SELECT id AS dispatch_receipt_id, agent_id, created_at AS dispatched_at,
+           consumed_at AS transport_delivered_at
+      FROM task_dispatch_receipts
+     WHERE tenant = ?1 AND task_id = ?2
+     ORDER BY created_at, id
+     LIMIT ?3
+  `).bind(env.TENANT_SLUG, taskId, boundedLimit).all<{
+    dispatch_receipt_id: string
+    agent_id: string
+    dispatched_at: string
+    transport_delivered_at: string | null
+  }>()
+  const runtime = await env.DB.prepare(`
+    SELECT * FROM task_dispatch_runtime_receipts
+     WHERE tenant = ?1 AND task_id = ?2
+     ORDER BY created_at,
+       CASE stage WHEN 'runtime_consumed' THEN 0 WHEN 'completed' THEN 1 ELSE 2 END,
+       id
+     LIMIT ?3
+  `).bind(env.TENANT_SLUG, taskId, boundedLimit).all<ReceiptRow>()
+  return {
+    transport: transport.results ?? [],
+    runtime: (runtime.results ?? []).map(publicReceipt),
+    task_status: task.status,
+  }
+}

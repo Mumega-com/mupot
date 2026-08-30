@@ -2,7 +2,8 @@ import { describe, expect, it } from 'vitest'
 
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1 } from './helpers/sqlite-d1'
-import { recordTaskDispatchRuntimeReceipt } from '../src/tasks/runtime-receipts'
+import { listTaskDispatchReceiptTimeline, recordTaskDispatchRuntimeReceipt } from '../src/tasks/runtime-receipts'
+import { invokeTool, mcpActionsApp } from '../src/mcp'
 import type { AuthContext, Env } from '../src/types'
 
 const TENANT = 'tenant-runtime-receipt'
@@ -37,7 +38,7 @@ function runtimeFixture() {
       id, member_id, token_hash, label, channel, created_at, revoked_at,
       agent_id, tenant, expires_at
     ) VALUES (
-      '${TOKEN_ID}', '${MEMBER_ID}', 'hash-runtime-1', 'runtime', 'workspace', '${T0}', NULL,
+      '${TOKEN_ID}', '${MEMBER_ID}', '4c5dc9b7708905f77f5e5d16316b5dfb425e68cb326dcd55a860e90a7707031e', 'runtime', 'workspace', '${T0}', NULL,
       '${AGENT_ID}', '${TENANT}', '2099-01-01T00:00:00.000Z'
     );
     INSERT INTO tasks (
@@ -337,6 +338,91 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
           artifact_sha256: sha,
         },
       })
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
+  it('uses the same service through MCP and the bearer REST Actions surface', async () => {
+    const mcpFixture = runtimeFixture()
+    const restFixture = runtimeFixture()
+    const args = {
+      task_id: TASK_ID,
+      dispatch_receipt_id: DISPATCH_ID,
+      message_id: MESSAGE_ID,
+      stage: 'runtime_consumed',
+      runtime_receipt_hash: RUNTIME_HASH,
+      attempt: 1,
+    }
+    try {
+      const mcp = await invokeTool(
+        mcpFixture.auth,
+        mcpFixture.env,
+        'task_dispatch_runtime_receipt',
+        args,
+        'https://pot.test',
+      )
+      expect(mcp).toMatchObject({
+        ok: true,
+        result: { receipt: { stage: 'runtime_consumed' }, task_status: 'in_progress' },
+      })
+
+      const response = await mcpActionsApp.request(
+        'https://pot.test/actions/task_dispatch_runtime_receipt',
+        {
+          method: 'POST',
+          headers: {
+            authorization: 'Bearer test-token',
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify(args),
+        },
+        restFixture.env,
+      )
+      expect(response.status).toBe(200)
+      await expect(response.json()).resolves.toMatchObject({
+        ok: true,
+        result: { receipt: { stage: 'runtime_consumed' }, task_status: 'in_progress' },
+      })
+    } finally {
+      mcpFixture.harness.close()
+      restFixture.harness.close()
+    }
+  })
+
+  it('reads transport and runtime stages independently for one visible task', async () => {
+    const fixture = runtimeFixture()
+    try {
+      await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+        taskId: TASK_ID,
+        dispatchReceiptId: DISPATCH_ID,
+        messageId: MESSAGE_ID,
+        stage: 'runtime_consumed',
+        runtimeReceiptHash: RUNTIME_HASH,
+        attempt: 1,
+      })
+      await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+        taskId: TASK_ID,
+        dispatchReceiptId: DISPATCH_ID,
+        messageId: MESSAGE_ID,
+        stage: 'completed',
+        runtimeReceiptHash: '2'.repeat(64),
+        attempt: 1,
+        result: 'Implemented and tested.',
+      })
+
+      const timeline = await listTaskDispatchReceiptTimeline(fixture.env, TASK_ID)
+      expect(timeline.transport).toEqual([{
+        dispatch_receipt_id: DISPATCH_ID,
+        agent_id: AGENT_ID,
+        dispatched_at: T0,
+        transport_delivered_at: T0,
+      }])
+      expect(timeline.runtime.map((receipt) => receipt.stage)).toEqual([
+        'runtime_consumed',
+        'completed',
+      ])
+      expect(timeline.task_status).toBe('review')
     } finally {
       fixture.harness.close()
     }
