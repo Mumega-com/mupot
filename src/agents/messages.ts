@@ -335,13 +335,24 @@ export async function sendAgentMessage(
         const existing = await findBySenderRequestId(env, tenant, input.fromAgent, input.requestId)
         if (existing) return idempotentOrConflict(existing, input, kind)
       }
-      if (guestVisibilityFence && !await guestVisibilityFenceIsCurrent(
-        env,
-        input.fromMember,
-        input.toAgent,
-        guestVisibilityFence,
-      )) {
-        return { ok: false, reason: 'send_target_not_visible' }
+      if (guestVisibilityFence) {
+        const guestStillAllowed = await guestVisibilityFenceIsCurrent(
+          env,
+          input.fromMember,
+          input.toAgent,
+          guestVisibilityFence,
+        )
+        const projectStillAllowed = input.projectId !== undefined
+          && await validateMessageProjectAccess(
+            env,
+            input.projectId,
+            input.fromAgent,
+            input.toAgent,
+            opts.systemProjectAttribution === true,
+          ) === null
+        if (!guestStillAllowed && !projectStillAllowed) {
+          return { ok: false, reason: 'send_target_not_visible' }
+        }
       }
       return { ok: false, reason: 'inbox_full', detail: `recipient at unread cap ${maxUnread}` }
     }
@@ -1173,6 +1184,16 @@ function ambientVisibilityGrants(
   return result
 }
 
+function capabilityRankSql(value: string): string {
+  return `(CASE ${value}
+    WHEN 'observer' THEN 1
+    WHEN 'member' THEN 2
+    WHEN 'lead' THEN 3
+    WHEN 'admin' THEN 4
+    WHEN 'owner' THEN 5
+    ELSE 0 END)`
+}
+
 async function recipientVisibilityOnSenderSquads(
   env: Env,
   memberId: string,
@@ -1188,28 +1209,29 @@ async function recipientVisibilityOnSenderSquads(
   // exists on a durable capability plane at this read.
   const ambient = ambientVisibilityGrants(grants, memberId)
   if (ambient.length === 0) return { visible: false }
-  const valuesSql = ambient.map((_, index) => {
-    const first = 4 + index * 3
-    return `(?${first}, ?${first + 1}, ?${first + 2})`
-  }).join(', ')
-  const binds = ambient.flatMap((grant) => [grant.scope_type, grant.scope_id, grant.capability])
+  const ambientJson = JSON.stringify(ambient)
   const row = await env.DB.prepare(
-    `WITH ambient(scope_type, scope_id, capability) AS (VALUES ${valuesSql}),
+    `WITH ambient(scope_type, scope_id, capability) AS (
+            SELECT json_extract(value, '$.scope_type'),
+                   json_extract(value, '$.scope_id'),
+                   json_extract(value, '$.capability')
+              FROM json_each(?4)
+          ),
           durable_grants(scope_type, scope_id, capability) AS (
-            SELECT c.scope_type, c.scope_id, c.capability
+            SELECT c.scope_type, c.scope_id, a.capability
               FROM capabilities c
               JOIN ambient a
                 ON a.scope_type = c.scope_type
                AND a.scope_id IS c.scope_id
-               AND a.capability = c.capability
+               AND ${capabilityRankSql('c.capability')} >= ${capabilityRankSql('a.capability')}
              WHERE c.member_id = ?1
             UNION ALL
-            SELECT 'squad', cg.squad_id, cg.capability
+            SELECT 'squad', cg.squad_id, a.capability
               FROM channel_capability_grants cg
               JOIN ambient a
                 ON a.scope_type = 'squad'
                AND a.scope_id = cg.squad_id
-               AND a.capability = cg.capability
+               AND ${capabilityRankSql('cg.capability')} >= ${capabilityRankSql('a.capability')}
              WHERE cg.member_id = ?1
           )
      SELECT m.squad_id, d.scope_type, d.scope_id, d.capability
@@ -1222,7 +1244,7 @@ async function recipientVisibilityOnSenderSquads(
       WHERE m.agent_id = ?2
         AND m.squad_id <> ?3
       LIMIT 1`,
-  ).bind(memberId, recipient.id, recipient.squad_id, ...binds).first<{
+  ).bind(memberId, recipient.id, recipient.squad_id, ambientJson).first<{
     squad_id: string
     scope_type: CapabilityGrant['scope_type']
     scope_id: string | null
@@ -1245,35 +1267,59 @@ function guestVisibilityWriteFenceSql(first: number): string {
   const scopeType = `?${first + 1}`
   const scopeId = `?${first + 2}`
   const capability = `?${first + 3}`
-  return `AND EXISTS (
-    SELECT 1
-      FROM memberships m
-      JOIN squads s ON s.id = m.squad_id
-     WHERE m.agent_id = ?3
-       AND m.squad_id = ${squad}
-       AND (
-         ${scopeType} = 'org'
-         OR (${scopeType} = 'squad' AND ${scopeId} = m.squad_id)
-         OR (${scopeType} = 'department' AND ${scopeId} = s.department_id)
-       )
-       AND (
-         EXISTS (
-           SELECT 1 FROM capabilities c
-            WHERE c.member_id = ?5
-              AND c.scope_type = ${scopeType}
-              AND c.scope_id IS ${scopeId}
-              AND c.capability = ${capability}
+  return `AND (
+    EXISTS (
+      SELECT 1
+        FROM memberships m
+        JOIN squads s ON s.id = m.squad_id
+       WHERE m.agent_id = ?3
+         AND m.squad_id = ${squad}
+         AND (
+           ${scopeType} = 'org'
+           OR (${scopeType} = 'squad' AND ${scopeId} = m.squad_id)
+           OR (${scopeType} = 'department' AND ${scopeId} = s.department_id)
          )
-         OR (
-           ${scopeType} = 'squad'
-           AND EXISTS (
-             SELECT 1 FROM channel_capability_grants cg
-              WHERE cg.member_id = ?5
-                AND cg.squad_id = ${scopeId}
-                AND cg.capability = ${capability}
+         AND (
+           EXISTS (
+             SELECT 1 FROM capabilities c
+              WHERE c.member_id = ?5
+                AND c.scope_type = ${scopeType}
+                AND c.scope_id IS ${scopeId}
+                AND ${capabilityRankSql('c.capability')} >= ${capabilityRankSql(capability)}
+           )
+           OR (
+             ${scopeType} = 'squad'
+             AND EXISTS (
+               SELECT 1 FROM channel_capability_grants cg
+                WHERE cg.member_id = ?5
+                  AND cg.squad_id = ${scopeId}
+                  AND ${capabilityRankSql('cg.capability')} >= ${capabilityRankSql(capability)}
+             )
            )
          )
-       )
+    )
+    OR (
+      ?12 IS NOT NULL
+      AND EXISTS (
+        SELECT 1 FROM projects p
+         WHERE p.id = ?12
+           AND p.status <> 'archived'
+           AND EXISTS (
+             SELECT 1 FROM memberships sender_membership
+             JOIN project_squad_access sender_access
+               ON sender_access.squad_id = sender_membership.squad_id
+              AND sender_access.project_id = p.id
+              WHERE sender_membership.agent_id = ?4
+           )
+           AND EXISTS (
+             SELECT 1 FROM memberships recipient_membership
+             JOIN project_squad_access recipient_access
+               ON recipient_access.squad_id = recipient_membership.squad_id
+              AND recipient_access.project_id = p.id
+              WHERE recipient_membership.agent_id = ?3
+           )
+      )
+    )
   )`
 }
 
@@ -1300,7 +1346,7 @@ async function guestVisibilityFenceIsCurrent(
              WHERE c.member_id = ?3
                AND c.scope_type = ?4
                AND c.scope_id IS ?5
-               AND c.capability = ?6
+               AND ${capabilityRankSql('c.capability')} >= ${capabilityRankSql('?6')}
           )
           OR (
             ?4 = 'squad'
@@ -1308,7 +1354,7 @@ async function guestVisibilityFenceIsCurrent(
               SELECT 1 FROM channel_capability_grants cg
                WHERE cg.member_id = ?3
                  AND cg.squad_id = ?5
-                 AND cg.capability = ?6
+                 AND ${capabilityRankSql('cg.capability')} >= ${capabilityRankSql('?6')}
             )
           )
         )

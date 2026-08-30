@@ -53,11 +53,17 @@ function withDbHooks(
   hooks: {
     beforeMessageInsert?: () => void
     onPrepare?: (sql: string) => void
+    maxBindValues?: number
   },
 ): Env {
   let insertHookFired = false
   const wrap = (statement: any, sql: string): any => ({
-    bind: (...values: unknown[]) => wrap(statement.bind(...values), sql),
+    bind: (...values: unknown[]) => {
+      if (hooks.maxBindValues !== undefined && values.length > hooks.maxBindValues) {
+        throw new Error(`D1 bind limit exceeded: ${values.length} > ${hooks.maxBindValues}`)
+      }
+      return wrap(statement.bind(...values), sql)
+    },
     first: (...args: unknown[]) => statement.first(...args),
     all: (...args: unknown[]) => statement.all(...args),
     raw: (...args: unknown[]) => statement.raw(...args),
@@ -278,6 +284,111 @@ describe('sendToRef — gate 1 send-target confinement (#392)', () => {
         NON_ADMIN(grant('squad-other')),
       )
       expect(res).toEqual({ ok: false, reason: 'send_target_not_visible' })
+    } finally {
+      close()
+    }
+  })
+
+  it('supports more than 33 ambient grants without exceeding the D1 bind ceiling', async () => {
+    const { db, close, sqlite } = migratedDb()
+    try {
+      sqlite.exec(`
+        INSERT INTO memberships (id, agent_id, squad_id, capability)
+        VALUES ('membership-target-many-grants', 'agent-target', 'squad-sender', 'member');
+        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES ('cap-target-many-grants', 'member-sender', 'squad', 'squad-sender', 'observer');
+      `)
+      const ambient: CapabilityGrant[] = Array.from({ length: 40 }, (_, index) => ({
+        member_id: 'member-sender',
+        scope_type: 'squad',
+        scope_id: `decoy-squad-${index}`,
+        capability: 'observer',
+      }))
+      ambient.push(...grant('squad-sender'))
+
+      const d1Bounded = withDbHooks(envWith(db), { maxBindValues: 100 })
+      await expect(sendToRef(
+        d1Bounded,
+        { ...baseInput, toRef: 'agent-target' },
+        NON_ADMIN(ambient),
+      )).resolves.toMatchObject({ ok: true, toAgent: 'agent-target' })
+    } finally {
+      close()
+    }
+  })
+
+  it('accepts an ambient observer ceiling backed by a durable manual lead grant', async () => {
+    const { db, close, sqlite } = migratedDb()
+    try {
+      sqlite.exec(`
+        INSERT INTO memberships (id, agent_id, squad_id, capability)
+        VALUES ('membership-target-manual-clamp', 'agent-target', 'squad-sender', 'member');
+        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES ('cap-target-manual-clamp', 'member-sender', 'squad', 'squad-sender', 'lead');
+      `)
+
+      await expect(sendToRef(
+        envWith(db),
+        { ...baseInput, toRef: 'agent-target' },
+        NON_ADMIN(grant('squad-sender', 'observer')),
+      )).resolves.toMatchObject({ ok: true, toAgent: 'agent-target' })
+    } finally {
+      close()
+    }
+  })
+
+  it('accepts an ambient observer ceiling backed by a durable channel lead grant', async () => {
+    const { db, close, sqlite } = migratedDb()
+    try {
+      sqlite.exec(`
+        INSERT INTO memberships (id, agent_id, squad_id, capability)
+        VALUES ('membership-target-channel-clamp', 'agent-target', 'squad-sender', 'member');
+        INSERT INTO channel_bindings (
+          id, platform, external_channel_id, squad_id, max_capability
+        ) VALUES (
+          'binding-channel-clamp', 'test', 'channel-clamp', 'squad-sender', 'lead'
+        );
+        INSERT INTO channel_capability_grants (
+          id, binding_id, member_id, squad_id, capability
+        ) VALUES (
+          'cap-target-channel-clamp', 'binding-channel-clamp',
+          'member-sender', 'squad-sender', 'lead'
+        );
+      `)
+
+      await expect(sendToRef(
+        envWith(db),
+        { ...baseInput, toRef: 'agent-target' },
+        NON_ADMIN(grant('squad-sender', 'observer')),
+      )).resolves.toMatchObject({ ok: true, toAgent: 'agent-target' })
+    } finally {
+      close()
+    }
+  })
+
+  it('keeps project-authorized OR semantics when guest membership disappears before insert', async () => {
+    const { db, close, sqlite } = migratedDb()
+    try {
+      sqlite.exec(`
+        INSERT INTO memberships (id, agent_id, squad_id, capability)
+        VALUES ('membership-target-project-race', 'agent-target', 'squad-sender', 'member');
+        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES ('cap-target-project-race', 'member-sender', 'squad', 'squad-sender', 'observer');
+      `)
+      const raced = withDbHooks(envWith(db), {
+        beforeMessageInsert: () => {
+          sqlite.prepare("DELETE FROM memberships WHERE id = 'membership-target-project-race'").run()
+        },
+      })
+
+      await expect(sendToRef(
+        raced,
+        { ...baseInput, toRef: 'agent-target', projectId: 'project-shared' },
+        NON_ADMIN(grant('squad-sender')),
+      )).resolves.toMatchObject({ ok: true, toAgent: 'agent-target' })
+      expect(sqlite.prepare(
+        "SELECT COUNT(*) AS n FROM agent_messages WHERE to_agent = 'agent-target' AND project_id = 'project-shared'",
+      ).get()).toEqual({ n: 1 })
     } finally {
       close()
     }
