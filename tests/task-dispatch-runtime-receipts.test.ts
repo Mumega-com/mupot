@@ -201,6 +201,31 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
     }
   })
 
+  it('returns the original receipt after the source inbox row is acknowledged', async () => {
+    const fixture = runtimeFixture()
+    try {
+      const input = {
+        taskId: TASK_ID,
+        dispatchReceiptId: DISPATCH_ID,
+        messageId: MESSAGE_ID,
+        stage: 'runtime_consumed' as const,
+        runtimeReceiptHash: RUNTIME_HASH,
+        attempt: 1,
+      }
+      const first = await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, input)
+      fixture.harness.sqlite.prepare(
+        'UPDATE agent_messages SET read_at = ?, lease_expires_at = NULL WHERE id = ?',
+      ).run('2026-08-30T18:05:00.000Z', MESSAGE_ID)
+      const replay = await recordTaskDispatchRuntimeReceipt({ ...fixture.env }, fixture.auth, input)
+      expect(replay.receipt.id).toBe(first.receipt.id)
+      expect(fixture.harness.sqlite.prepare(
+        'SELECT COUNT(*) AS count FROM task_dispatch_runtime_receipts',
+      ).get()).toEqual({ count: 1 })
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
   it('reauthorizes an idempotent replay and refuses it after capability revocation', async () => {
     const fixture = runtimeFixture()
     try {

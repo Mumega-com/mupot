@@ -150,7 +150,12 @@ async function loadDelivery(
   return row
 }
 
-function validateEnvelope(row: DeliveryRow, input: RecordTaskDispatchRuntimeReceiptInput, now: string): string {
+function validateEnvelope(
+  row: DeliveryRow,
+  input: RecordTaskDispatchRuntimeReceiptInput,
+  now: string,
+  allowAcknowledgedReplay: boolean,
+): string {
   if (
     row.dispatch_consumed_at === null
     || row.agent_status !== 'active'
@@ -158,11 +163,13 @@ function validateEnvelope(row: DeliveryRow, input: RecordTaskDispatchRuntimeRece
     || row.message_request_id !== `dispatch-inbox:${input.dispatchReceiptId}`
     || row.message_project_id !== row.task_project_id
     || row.dispatch_project_id !== row.task_project_id
-    || row.message_read_at !== null
     || row.message_dead_lettered_at !== null
     || row.message_delivery_attempts !== input.attempt
-    || row.message_lease_expires_at === null
-    || row.message_lease_expires_at <= now
+    || (!allowAcknowledgedReplay && (
+      row.message_read_at !== null
+      || row.message_lease_expires_at === null
+      || row.message_lease_expires_at <= now
+    ))
   ) throw new TaskDispatchRuntimeReceiptError('runtime_delivery_stale')
 
   let parsed: unknown
@@ -216,6 +223,23 @@ export async function recordTaskDispatchRuntimeReceipt(
   if ((input.stage === 'completed' && result === null) || (input.stage === 'failed' && reason === null)) {
     throw new TaskDispatchRuntimeReceiptError('runtime_receipt_invalid')
   }
+  const requestJson = canonicalJson({
+    task_id: input.taskId,
+    dispatch_receipt_id: input.dispatchReceiptId,
+    message_id: input.messageId,
+    stage: input.stage,
+    runtime_receipt_hash: input.runtimeReceiptHash,
+    attempt: input.attempt,
+    artifact_refs: artifactRefs,
+    artifact_sha256: artifactSha256,
+    result,
+    reason,
+  })
+  const requestDigest = await sha256Hex(requestJson)
+  const replay = await env.DB.prepare(`
+    SELECT * FROM task_dispatch_runtime_receipts
+     WHERE tenant = ?1 AND dispatch_receipt_id = ?2 AND stage = ?3 AND attempt = ?4
+  `).bind(env.TENANT_SLUG, input.dispatchReceiptId, input.stage, input.attempt).first<ReceiptRow>()
 
   const now = new Date().toISOString()
   const token = await env.DB.prepare(`
@@ -235,7 +259,7 @@ export async function recordTaskDispatchRuntimeReceipt(
   if (!(await canOnSquad(env, grants, delivery.task_squad_id, 'member')) || assignee.value !== agentId) {
     throw new TaskDispatchRuntimeReceiptError('runtime_receipt_forbidden')
   }
-  const runtimeAddress = validateEnvelope(delivery, input, now)
+  const runtimeAddress = validateEnvelope(delivery, input, now, replay !== null)
   if (
     input.stage === 'completed'
     && (/Artifact:/i.test(delivery.task_done_when) || /SHA256:/i.test(delivery.task_done_when))
@@ -249,23 +273,6 @@ export async function recordTaskDispatchRuntimeReceipt(
       throw new TaskDispatchRuntimeReceiptError('runtime_artifact_required')
     }
   }
-  const requestJson = canonicalJson({
-    task_id: input.taskId,
-    dispatch_receipt_id: input.dispatchReceiptId,
-    message_id: input.messageId,
-    stage: input.stage,
-    runtime_receipt_hash: input.runtimeReceiptHash,
-    attempt: input.attempt,
-    artifact_refs: artifactRefs,
-    artifact_sha256: artifactSha256,
-    result,
-    reason,
-  })
-  const requestDigest = await sha256Hex(requestJson)
-  const replay = await env.DB.prepare(`
-    SELECT * FROM task_dispatch_runtime_receipts
-     WHERE tenant = ?1 AND dispatch_receipt_id = ?2 AND stage = ?3 AND attempt = ?4
-  `).bind(env.TENANT_SLUG, input.dispatchReceiptId, input.stage, input.attempt).first<ReceiptRow>()
   if (replay) {
     if (replay.request_digest !== requestDigest) {
       throw new TaskDispatchRuntimeReceiptError('runtime_receipt_conflict')
@@ -365,6 +372,13 @@ export interface TaskDispatchReceiptTimeline {
     transport_delivered_at: string | null
   }>
   runtime: TaskDispatchRuntimeReceipt[]
+  gate: Array<{
+    id: string
+    verdict: 'approved' | 'rejected'
+    note: string | null
+    decided_by: string
+    decided_at: string
+  }>
   task_status: string
 }
 
@@ -398,9 +412,23 @@ export async function listTaskDispatchReceiptTimeline(
        id
      LIMIT ?3
   `).bind(env.TENANT_SLUG, taskId, boundedLimit).all<ReceiptRow>()
+  const gate = await env.DB.prepare(`
+    SELECT id, verdict, note, decided_by, decided_at
+      FROM task_verdicts
+     WHERE task_id = ?1
+     ORDER BY decided_at, id
+     LIMIT ?2
+  `).bind(taskId, boundedLimit).all<{
+    id: string
+    verdict: 'approved' | 'rejected'
+    note: string | null
+    decided_by: string
+    decided_at: string
+  }>()
   return {
     transport: transport.results ?? [],
     runtime: (runtime.results ?? []).map(publicReceipt),
+    gate: gate.results ?? [],
     task_status: task.status,
   }
 }

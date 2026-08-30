@@ -5413,7 +5413,7 @@ function sendScript(projectId?: string) {
              var data = await res.json();
              var t = data.task;
              if (!t) { continue; }
-             t.dispatch_timeline = data.dispatch_timeline || { transport: [], runtime: [] };
+             t.dispatch_timeline = data.dispatch_timeline || { transport: [], runtime: [], gate: [] };
             if (t.status === 'in_progress') { status.textContent = 'Working… (' + fmtSecs(Date.now() - startedAt) + ')'; continue; }
             if (t.status === 'done' || t.status === 'approved' || t.status === 'review' || t.status === 'blocked' || t.status === 'rejected') {
               return render(t, startedAt);
@@ -5445,7 +5445,7 @@ function sendScript(projectId?: string) {
             : t.status === 'rejected' ? 'Rejected · '
             : 'Blocked · ';
            var meta = label + esc(who) + (when ? ' at ' + esc(when) : '');
-           var timeline = t.dispatch_timeline || { transport: [], runtime: [] };
+           var timeline = t.dispatch_timeline || { transport: [], runtime: [], gate: [] };
            var stages = [];
            if ((timeline.transport || []).some(function (row) { return !!row.transport_delivered_at; })) {
              stages.push('Transport delivered');
@@ -5459,8 +5459,9 @@ function sendScript(projectId?: string) {
            if ((timeline.runtime || []).some(function (row) { return row.stage === 'failed'; })) {
              stages.push('Runtime failed');
            }
-           if (t.status === 'review' || t.status === 'approved' || t.status === 'rejected' || t.status === 'done') {
-             stages.push('Gate verdict: ' + t.status);
+           var gateReceipts = timeline.gate || [];
+           if (gateReceipts.length > 0) {
+             stages.push('Gate verdict: ' + gateReceipts[gateReceipts.length - 1].verdict);
            }
            var receiptStages = stages.length
              ? '<div class="done-meta">' + stages.map(esc).join(' · ') + '</div>'
