@@ -41,6 +41,18 @@ export interface TaskDispatchRuntimeReceipt {
   created_at: string
 }
 
+export interface PublicTaskDispatchRuntimeReceipt {
+  stage: TaskDispatchRuntimeStage
+  attempt: number
+  runtime_address: string
+  runtime_receipt_hash: string
+  artifact_refs: string[]
+  artifact_sha256: string | null
+  result: string | null
+  reason: string | null
+  created_at: string
+}
+
 export type TaskDispatchRuntimeReceiptErrorCode =
   | 'agent_bound_workspace_credential_required'
   | 'runtime_receipt_invalid'
@@ -109,6 +121,21 @@ function publicReceipt(row: ReceiptRow): TaskDispatchRuntimeReceipt {
   }
   const { artifact_refs_json: _artifactRefsJson, ...receipt } = row
   return { ...receipt, artifact_refs: refs }
+}
+
+function publicTimelineReceipt(row: ReceiptRow): PublicTaskDispatchRuntimeReceipt {
+  const receipt = publicReceipt(row)
+  return {
+    stage: receipt.stage,
+    attempt: receipt.attempt,
+    runtime_address: receipt.runtime_address,
+    runtime_receipt_hash: receipt.runtime_receipt_hash,
+    artifact_refs: receipt.artifact_refs,
+    artifact_sha256: receipt.artifact_sha256,
+    result: receipt.result,
+    reason: receipt.reason,
+    created_at: receipt.created_at,
+  }
 }
 
 async function loadDelivery(
@@ -196,6 +223,7 @@ export async function recordTaskDispatchRuntimeReceipt(
   env: Env,
   auth: AuthContext,
   input: RecordTaskDispatchRuntimeReceiptInput,
+  options: { origin?: 'mcp' | 'rest' } = {},
 ): Promise<{ receipt: TaskDispatchRuntimeReceipt; task_status: string }> {
   const memberId = auth.memberId?.trim() ?? ''
   const credentialId = auth.tokenId?.trim() ?? ''
@@ -301,8 +329,15 @@ export async function recordTaskDispatchRuntimeReceipt(
            WHERE id = ?3 AND assignee_agent_id = ?4
              AND status IN ('open', 'blocked', 'rejected')
              AND (execution_receipt_id IS NULL OR execution_receipt_id = ?1)
+             AND NOT EXISTS (
+               SELECT 1 FROM task_dispatch_runtime_receipts failed
+                WHERE failed.tenant = ?5
+                  AND failed.dispatch_receipt_id = ?1
+                  AND failed.stage = 'failed'
+                  AND failed.attempt = ?6
+             )
           RETURNING status
-        `).bind(input.dispatchReceiptId, now, input.taskId, agentId)
+        `).bind(input.dispatchReceiptId, now, input.taskId, agentId, env.TENANT_SLUG, input.attempt)
       : input.stage === 'completed'
         ? env.DB.prepare(`
             UPDATE tasks SET status = 'review', result = ?1, updated_at = ?2
@@ -335,11 +370,11 @@ export async function recordTaskDispatchRuntimeReceipt(
         ) VALUES (
           ?1, ?2,
           CASE WHEN changes() = 1 THEN 'agent' ELSE 'invalid_runtime_receipt_transition' END,
-          ?3, ?4, ?3, ?5, 'mcp', 'task_dispatch_runtime_receipt',
-          ?6, 'task', ?7, ?7, ?8, ?8, ?9, ?10
+          ?3, ?4, ?3, ?5, ?6, 'task_dispatch_runtime_receipt',
+          ?7, 'task', ?8, ?8, ?9, ?9, ?10, ?11
         )
-      `).bind(auditId, env.TENANT_SLUG, agentId, memberId, credentialId, input.stage,
-        input.taskId, requestId, evidence, now),
+      `).bind(auditId, env.TENANT_SLUG, agentId, memberId, credentialId,
+        options.origin ?? 'mcp', input.stage, input.taskId, requestId, evidence, now),
       env.DB.prepare(`
         INSERT INTO task_dispatch_runtime_receipts (
           id, tenant, dispatch_receipt_id, task_id, agent_id, message_id,
@@ -366,14 +401,12 @@ export async function recordTaskDispatchRuntimeReceipt(
 
 export interface TaskDispatchReceiptTimeline {
   transport: Array<{
-    dispatch_receipt_id: string
     agent_id: string
     dispatched_at: string
     transport_delivered_at: string | null
   }>
-  runtime: TaskDispatchRuntimeReceipt[]
+  runtime: PublicTaskDispatchRuntimeReceipt[]
   gate: Array<{
-    id: string
     verdict: 'approved' | 'rejected'
     note: string | null
     decided_by: string
@@ -392,14 +425,13 @@ export async function listTaskDispatchReceiptTimeline(
     .bind(taskId).first<{ status: string }>()
   if (!task) throw new TaskDispatchRuntimeReceiptError('runtime_delivery_not_found')
   const transport = await env.DB.prepare(`
-    SELECT id AS dispatch_receipt_id, agent_id, created_at AS dispatched_at,
+    SELECT agent_id, created_at AS dispatched_at,
            consumed_at AS transport_delivered_at
       FROM task_dispatch_receipts
      WHERE tenant = ?1 AND task_id = ?2
      ORDER BY created_at, id
      LIMIT ?3
   `).bind(env.TENANT_SLUG, taskId, boundedLimit).all<{
-    dispatch_receipt_id: string
     agent_id: string
     dispatched_at: string
     transport_delivered_at: string | null
@@ -413,13 +445,12 @@ export async function listTaskDispatchReceiptTimeline(
      LIMIT ?3
   `).bind(env.TENANT_SLUG, taskId, boundedLimit).all<ReceiptRow>()
   const gate = await env.DB.prepare(`
-    SELECT id, verdict, note, decided_by, decided_at
+    SELECT verdict, note, decided_by, decided_at
       FROM task_verdicts
      WHERE task_id = ?1
      ORDER BY decided_at, id
      LIMIT ?2
   `).bind(taskId, boundedLimit).all<{
-    id: string
     verdict: 'approved' | 'rejected'
     note: string | null
     decided_by: string
@@ -427,7 +458,7 @@ export async function listTaskDispatchReceiptTimeline(
   }>()
   return {
     transport: transport.results ?? [],
-    runtime: (runtime.results ?? []).map(publicReceipt),
+    runtime: (runtime.results ?? []).map(publicTimelineReceipt),
     gate: gate.results ?? [],
     task_status: task.status,
   }

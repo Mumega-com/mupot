@@ -43,9 +43,16 @@ Stages:
   required; task becomes `review`.
 - `failed`: include a bounded reason; task becomes `blocked`.
 
+A `failed` receipt terminally fences that dispatch attempt. The same
+`dispatch_receipt_id + attempt` can never later record `runtime_consumed`, even
+after restart or lease renewal. Recovery requires a separately governed dispatch,
+not resurrection of failed evidence.
+
 The operation requires an active agent-bound workspace token for the persisted
 assignee. It rechecks the current token, member capability, assignment, project,
 message, sender, route, lease, and attempt before every new row and replay.
+Mutation audit rows record the framework-derived invocation surface (`mcp` or
+`rest`); request headers cannot choose that value.
 
 ## Idempotency and recovery
 
@@ -62,6 +69,11 @@ a new key and cannot consume the prior attempt's receipt.
 
 Do not call `inbox_ack` until governed handling is complete. Do not send an ACK to
 `mupot-dispatch`; it is a system attribution literal, not an agent identity.
+
+Ordinary task readers receive a redacted timeline: stage, attempt, public route,
+evidence hashes/artifacts, result/reason, and timestamps. Credential, mutation
+audit, message, dispatch-correlation, and private receipt row IDs remain confined
+to the exact runtime write response or privileged audit storage.
 
 ## Disable and rollback
 

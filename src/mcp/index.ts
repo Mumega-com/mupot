@@ -547,6 +547,7 @@ export function str(v: unknown): string | null {
 // pot's own MCP endpoint into the brief. Derived from the request URL at each call site.
 export type ToolCtx = {
   origin: string
+  transport: 'mcp' | 'rest'
   waitUntil?: (promise: Promise<unknown>) => void
   seat?: string
   source?: string
@@ -1948,7 +1949,7 @@ const toolTaskDispatchRuntimeReceipt: ToolSpec = {
     ],
     additionalProperties: false,
   },
-  async run(auth, env, args) {
+  async run(auth, env, args, ctx) {
     try {
       return done(await recordTaskDispatchRuntimeReceipt(env, auth, {
         taskId: str(args.task_id) ?? '',
@@ -1963,7 +1964,7 @@ const toolTaskDispatchRuntimeReceipt: ToolSpec = {
         artifactSha256: args.artifact_sha256 as string | null | undefined,
         result: args.result as string | null | undefined,
         reason: args.reason as string | null | undefined,
-      }))
+      }, { origin: ctx.transport }))
     } catch (error) {
       if (error instanceof TaskDispatchRuntimeReceiptError) return runtimeReceiptFailure(error)
       throw error
@@ -4506,9 +4507,10 @@ export async function invokeTool(
   originOrCtx: string | Partial<ToolCtx> = '',
 ): Promise<ToolOutcome & { tool?: string }> {
   const ctx: ToolCtx = typeof originOrCtx === 'string'
-    ? { origin: originOrCtx }
+    ? { origin: originOrCtx, transport: 'mcp' }
     : {
         origin: originOrCtx?.origin ?? '',
+        transport: originOrCtx?.transport ?? 'mcp',
         waitUntil: originOrCtx?.waitUntil,
         seat: originOrCtx?.seat,
         source: originOrCtx?.source,
@@ -4626,6 +4628,7 @@ async function handleJsonRpc(c: import('hono').Context<AppEnv>, body: JsonRpcReq
     const params = typeof body.params === 'object' && body.params !== null ? body.params as Record<string, unknown> : {}
     const ctx: ToolCtx = {
       origin: new URL(c.req.url).origin,
+      transport: 'mcp',
       waitUntil: safeWaitUntil(c),
       seat: c.req.header('x-mupot-seat'),
       source: c.req.header('x-mupot-source'),
@@ -4697,6 +4700,7 @@ mcpApp.post('/', async (c) => {
 
   const ctx: ToolCtx = {
     origin: new URL(c.req.url).origin,
+    transport: 'mcp',
     waitUntil: safeWaitUntil(c),
     seat: c.req.header('x-mupot-seat'),
     source: c.req.header('x-mupot-source'),
@@ -4798,6 +4802,7 @@ mcpActionsApp.post('/actions/:tool', async (c) => {
 
   const ctx: ToolCtx = {
     origin: new URL(c.req.url).origin,
+    transport: 'rest',
     waitUntil: safeWaitUntil(c),
     seat: c.req.header('x-mupot-seat'),
     source: c.req.header('x-mupot-source'),

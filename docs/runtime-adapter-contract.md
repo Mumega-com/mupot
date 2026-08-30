@@ -467,6 +467,13 @@ outer sender, public route, lease, and attempt. The unique key is dispatch recei
 content is rejected. `runtime_consumed` claims the task `in_progress`,
 `completed` moves it to `review`, and `failed` moves it to `blocked`. None of
 those stages writes `done`; the independent verdict surface remains mandatory.
+A failed dispatch attempt is terminally fenced and cannot later be revived as
+`runtime_consumed` for the same attempt.
+
+Task readback exposes a redacted stage timeline. Credential/audit IDs and exact
+message/dispatch correlation IDs are available only to the bound runtime's write
+response or a privileged audit surface. The shared write service also records the
+framework-derived `mcp` versus `rest` origin in its mutation audit row.
 
 See [`operations/runtime-dispatch-v1.md`](./operations/runtime-dispatch-v1.md).
 
