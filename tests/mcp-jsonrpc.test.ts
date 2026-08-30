@@ -87,6 +87,11 @@ describe('mcp JSON-RPC compatibility', () => {
       // #142 capsule keystone: done_when is now required alongside squad_id + title.
       required: ['squad_id', 'title', 'done_when'],
     })
+    expect(body.result.tools.find((t) => t.name === 'inbox')?.inputSchema).toMatchObject({
+      type: 'object',
+      properties: { since_seq: { type: 'number' } },
+      additionalProperties: false,
+    })
   })
 
   it('requires bearer auth for JSON-RPC tools/call', async () => {

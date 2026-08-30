@@ -3225,10 +3225,15 @@ const toolInbox: ToolSpec = {
   name: 'inbox',
   scope: 'self (the caller agent reads its own inbox)',
   min: 'authenticated',
-  args: '{ limit?: number, peek?: boolean, seat?: string }',
+  args: '{ limit?: number, peek?: boolean, seat?: string, since_seq?: number (peek only) }',
   inputSchema: {
     type: 'object',
-    properties: { limit: OPTIONAL_NUMBER_SCHEMA, peek: { type: 'boolean' }, seat: STRING_SCHEMA },
+    properties: {
+      limit: OPTIONAL_NUMBER_SCHEMA,
+      peek: { type: 'boolean' },
+      seat: STRING_SCHEMA,
+      since_seq: OPTIONAL_NUMBER_SCHEMA,
+    },
     required: [],
     additionalProperties: false,
   },
@@ -3245,11 +3250,21 @@ const toolInbox: ToolSpec = {
       return fail(400, 'invalid_args', 'peek must be a boolean')
     if (args.seat !== undefined && typeof args.seat !== 'string')
       return fail(400, 'invalid_args', 'seat must be a string')
+    let sinceSeq: number | undefined
+    const rawSinceSeq = args.since_seq
+    if (rawSinceSeq !== undefined) {
+      if (typeof rawSinceSeq !== 'number' || !Number.isSafeInteger(rawSinceSeq) || rawSinceSeq < 0)
+        return fail(400, 'invalid_args', 'since_seq must be a non-negative safe integer')
+      if (args.peek !== true)
+        return fail(400, 'invalid_args', 'since_seq requires peek=true; use inbox_lease and inbox_ack for reliable consumption')
+      sinceSeq = rawSinceSeq
+    }
 
     const res = await readAgentInbox(env, {
       agent,
       limit,
       peek: args.peek === true,
+      sinceSeq,
       seat: typeof args.seat === 'string' ? args.seat.trim() : undefined,
     })
     if (!res.ok) {
