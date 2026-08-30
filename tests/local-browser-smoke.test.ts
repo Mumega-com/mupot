@@ -45,7 +45,9 @@ describe('local browser route evidence', () => {
   it('exercises project-context send and flight pages and verifies task attribution', () => {
     expect(browserSmokeSource).toContain("page.goto(`${baseUrl}/send?project_id=project-mupot`")
     expect(browserSmokeSource).toContain("page.locator('#send-done').fill(sendTaskDoneWhen)")
+    expect(browserSmokeSource).toContain("page.locator('#send-gate').fill(sendTaskGateOwner)")
     expect(browserSmokeSource).toContain('submittedTask.done_when !== sendTaskDoneWhen')
+    expect(browserSmokeSource).toContain('submittedTask.gate_owner !== sendTaskGateOwner')
     expect(browserSmokeSource).toContain("page.goto(`${baseUrl}/flights?project_id=project-mupot`")
     expect(browserSmokeSource).toContain('submittedTask.project_id !== \'project-mupot\'')
   })

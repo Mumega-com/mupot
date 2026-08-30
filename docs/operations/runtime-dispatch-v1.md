@@ -43,10 +43,14 @@ Stages:
   required; task becomes `review`.
 - `failed`: include a bounded reason; task becomes `blocked`.
 
-A `failed` receipt terminally fences that dispatch attempt. The same
-`dispatch_receipt_id + attempt` can never later record `runtime_consumed`, even
-after restart or lease renewal. Recovery requires a separately governed dispatch,
-not resurrection of failed evidence.
+A `failed` receipt terminally fences the entire dispatch/message across every
+later delivery attempt. No later attempt for that `dispatch_receipt_id` can record
+`runtime_consumed`, even after restart or re-lease. Recovery requires a separately
+governed dispatch, not resurrection of failed evidence.
+
+`completed` also requires a valid explicit `gate:<owner>` on the task. `/send`
+requires the operator to provide it. Ungated runtime work stays `in_progress`
+instead of entering an unverdictable review state; self-approval is never inferred.
 
 The operation requires an active agent-bound workspace token for the persisted
 assignee. It rechecks the current token, member capability, assignment, project,
@@ -70,10 +74,12 @@ a new key and cannot consume the prior attempt's receipt.
 Do not call `inbox_ack` until governed handling is complete. Do not send an ACK to
 `mupot-dispatch`; it is a system attribution literal, not an agent identity.
 
-Ordinary task readers receive a redacted timeline: stage, attempt, public route,
+Runtime write responses and ordinary task readers receive allowlisted DTOs only:
+stage, attempt, public route,
 evidence hashes/artifacts, result/reason, and timestamps. Credential, mutation
 audit, message, dispatch-correlation, and private receipt row IDs remain confined
-to the exact runtime write response or privileged audit storage.
+to privileged audit storage. Timeline principal UUIDs are replaced with safe agent
+name/slug and gate-decider display labels.
 
 ## Disable and rollback
 

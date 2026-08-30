@@ -5249,6 +5249,10 @@ export function sendPageBody(
             <span class="lbl">Done when (verifiable)</span>
             <input id="send-done" placeholder="e.g. Artifact: path and SHA256: digest are reported">
           </label>
+          <label class="block" style="margin-top:14px">
+            <span class="lbl">Independent gate owner</span>
+            <input id="send-gate" placeholder="e.g. gate:reviewer">
+          </label>
           <div style="margin-top:14px">
             <button id="send-btn" class="btn">Dispatch now</button>
             <span id="send-hint" style="margin-left:12px;color:var(--dim);font-size:13px;">wakes your agent now and the result lands here</span>
@@ -5274,7 +5278,7 @@ export function sendPageBody(
     <style>
       .block { display: flex; flex-direction: column; gap: 6px; }
       .block .lbl { font-size: 13px; color: var(--muted); }
-      #send-body, #send-done, #bk-title, #bk-body, #bk-done, #bk-priority, #bk-squad, #bk-assignee {
+      #send-body, #send-done, #send-gate, #bk-title, #bk-body, #bk-done, #bk-priority, #bk-squad, #bk-assignee {
         font: inherit; padding: 9px 11px; border-radius: 8px; border: 1px solid var(--border);
         background: var(--bg); color: var(--text); width: 100%; resize: vertical;
       }
@@ -5374,6 +5378,7 @@ function sendScript(projectId?: string) {
         var btn = document.getElementById('send-btn');
         var bodyEl = document.getElementById('send-body');
         var doneEl = document.getElementById('send-done');
+        var gateEl = document.getElementById('send-gate');
         var status = document.getElementById('send-status');
         var resultBox = document.getElementById('send-result');
         if (!btn) return;
@@ -5472,9 +5477,14 @@ function sendScript(projectId?: string) {
 
         btn.addEventListener('click', async function () {
           var text = (bodyEl.value || '').trim();
-          var doneWhen = (doneEl.value || '').trim();
-          if (!text) { status.textContent = 'Write what you need first.'; return; }
-          if (!doneWhen) { status.textContent = 'A verifiable done-when is required.'; return; }
+           var doneWhen = (doneEl.value || '').trim();
+           var gateOwner = (gateEl.value || '').trim();
+           if (!text) { status.textContent = 'Write what you need first.'; return; }
+           if (!doneWhen) { status.textContent = 'A verifiable done-when is required.'; return; }
+           if (!gateOwner) { status.textContent = 'An independent gate owner is required.'; return; }
+           if (!/^gate:[A-Za-z0-9][A-Za-z0-9:_-]{0,120}$/.test(gateOwner)) {
+             status.textContent = 'Gate owner must use the gate:<owner> form.'; return;
+           }
           var val = selectedAgentValue();
           var parts = val.split('|');
           var agentId = parts[0];
@@ -5490,7 +5500,8 @@ function sendScript(projectId?: string) {
             var payload = {
               squad_id: squadId,
               title: title,
-              done_when: doneWhen,
+               done_when: doneWhen,
+               gate_owner: gateOwner,
               body: text,
               assignee_agent_id: agentId,
               dispatch: shouldDispatch()

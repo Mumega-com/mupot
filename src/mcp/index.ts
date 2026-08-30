@@ -1915,6 +1915,7 @@ function runtimeReceiptFailure(error: TaskDispatchRuntimeReceiptError): ToolOutc
     error.code === 'runtime_delivery_stale'
     || error.code === 'runtime_receipt_conflict'
     || error.code === 'runtime_artifact_required'
+    || error.code === 'runtime_gate_required'
     || error.code === 'runtime_receipt_transition_conflict'
   ) return fail(409, error.code)
   return fail(500, error.code)

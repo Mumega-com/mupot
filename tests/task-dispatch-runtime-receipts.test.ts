@@ -14,6 +14,9 @@ const TASK_ID = 'task-runtime-1'
 const AGENT_ID = 'agent-runtime-1'
 const MEMBER_ID = 'member-runtime-1'
 const TOKEN_ID = 'token-runtime-1'
+const GATE_AGENT_ID = 'agent-gate-1'
+const GATE_MEMBER_ID = 'member-gate-1'
+const GATE_TOKEN_ID = 'token-gate-1'
 const SQUAD_ID = 'squad-runtime-1'
 const RUNTIME_ADDRESS = 'hadi-codex'
 const RUNTIME_HASH = 'a'.repeat(64)
@@ -26,26 +29,35 @@ function runtimeFixture() {
       VALUES ('department-runtime-1', 'runtime', 'Runtime');
     INSERT INTO squads (id, department_id, slug, name)
       VALUES ('${SQUAD_ID}', 'department-runtime-1', 'runtime', 'Runtime');
-    INSERT INTO agents (id, squad_id, slug, name, status)
-      VALUES ('${AGENT_ID}', '${SQUAD_ID}', '${RUNTIME_ADDRESS}', 'Hadi Codex', 'active');
-    INSERT INTO members (id, display_name, status, tenant)
-      VALUES ('${MEMBER_ID}', 'Runtime Member', 'active', '${TENANT}');
-    INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
-      VALUES ('cap-runtime-1', '${MEMBER_ID}', 'squad', '${SQUAD_ID}', 'member');
-    INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
-      VALUES ('${TENANT}', '${AGENT_ID}', '${MEMBER_ID}', '${T0}');
+    INSERT INTO agents (id, squad_id, slug, name, status) VALUES
+      ('${AGENT_ID}', '${SQUAD_ID}', '${RUNTIME_ADDRESS}', 'Hadi Codex', 'active'),
+      ('${GATE_AGENT_ID}', '${SQUAD_ID}', 'independent-gate', 'Independent Gate', 'active');
+    INSERT INTO members (id, display_name, status, tenant) VALUES
+      ('${MEMBER_ID}', 'Runtime Member', 'active', '${TENANT}'),
+      ('${GATE_MEMBER_ID}', 'Gate Member', 'active', '${TENANT}');
+    INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES
+      ('cap-runtime-1', '${MEMBER_ID}', 'squad', '${SQUAD_ID}', 'member'),
+      ('cap-gate-1', '${GATE_MEMBER_ID}', 'squad', '${SQUAD_ID}', 'member');
+    INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES
+      ('${TENANT}', '${AGENT_ID}', '${MEMBER_ID}', '${T0}'),
+      ('${TENANT}', '${GATE_AGENT_ID}', '${GATE_MEMBER_ID}', '${T0}');
     INSERT INTO member_tokens (
       id, member_id, token_hash, label, channel, created_at, revoked_at,
       agent_id, tenant, expires_at
     ) VALUES (
       '${TOKEN_ID}', '${MEMBER_ID}', '4c5dc9b7708905f77f5e5d16316b5dfb425e68cb326dcd55a860e90a7707031e', 'runtime', 'workspace', '${T0}', NULL,
       '${AGENT_ID}', '${TENANT}', '2099-01-01T00:00:00.000Z'
+    ), (
+      '${GATE_TOKEN_ID}', '${GATE_MEMBER_ID}', 'hash-gate-1', 'gate', 'workspace', '${T0}', NULL,
+      '${GATE_AGENT_ID}', '${TENANT}', '2099-01-01T00:00:00.000Z'
     );
+    INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
+      VALUES ('gate-grant-1', 'gate:independent', 'agent', '${GATE_AGENT_ID}', '${MEMBER_ID}', '${T0}');
     INSERT INTO tasks (
-      id, squad_id, title, body, done_when, status, assignee_agent_id, created_at, updated_at
+      id, squad_id, title, body, done_when, status, assignee_agent_id, gate_owner, created_at, updated_at
     ) VALUES (
       '${TASK_ID}', '${SQUAD_ID}', 'Runtime receipt task', 'Do the work',
-      'The exact runtime consumption is receipted.', 'open', '${AGENT_ID}', '${T0}', '${T0}'
+      'The exact runtime consumption is receipted.', 'open', '${AGENT_ID}', 'gate:independent', '${T0}', '${T0}'
     );
     INSERT INTO task_dispatch_receipts (
       id, tenant, task_id, squad_id, agent_id, actor_kind, actor_id,
@@ -80,7 +92,22 @@ function runtimeFixture() {
       capability: 'member',
     }],
   }
-  return { harness, env: { TENANT_SLUG: TENANT, DB: harness.db } as Env, auth }
+  const gateAuth: AuthContext = {
+    userId: GATE_MEMBER_ID,
+    tenant: TENANT,
+    channel: 'workspace',
+    role: 'member',
+    memberId: GATE_MEMBER_ID,
+    tokenId: GATE_TOKEN_ID,
+    boundAgentId: GATE_AGENT_ID,
+    capabilities: [{
+      member_id: GATE_MEMBER_ID,
+      scope_type: 'squad',
+      scope_id: SQUAD_ID,
+      capability: 'member',
+    }],
+  }
+  return { harness, env: { TENANT_SLUG: TENANT, DB: harness.db } as Env, auth, gateAuth }
 }
 
 describe('task dispatch runtime receipt schema', () => {
@@ -154,12 +181,10 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
 
       expect(result).toMatchObject({
         receipt: {
-          task_id: TASK_ID,
-          dispatch_receipt_id: DISPATCH_ID,
-          message_id: MESSAGE_ID,
-          agent_id: AGENT_ID,
           stage: 'runtime_consumed',
           attempt: 1,
+          runtime_address: RUNTIME_ADDRESS,
+          runtime_receipt_hash: RUNTIME_HASH,
         },
         task_status: 'in_progress',
       })
@@ -187,7 +212,7 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
       }
       const first = await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, input)
       const replay = await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, input)
-      expect(replay.receipt.id).toBe(first.receipt.id)
+      expect(replay.receipt).toEqual(first.receipt)
       expect(fixture.harness.sqlite.prepare(
         'SELECT COUNT(*) AS count FROM task_dispatch_runtime_receipts',
       ).get()).toEqual({ count: 1 })
@@ -217,7 +242,7 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
         'UPDATE agent_messages SET read_at = ?, lease_expires_at = NULL WHERE id = ?',
       ).run('2026-08-30T18:05:00.000Z', MESSAGE_ID)
       const replay = await recordTaskDispatchRuntimeReceipt({ ...fixture.env }, fixture.auth, input)
-      expect(replay.receipt.id).toBe(first.receipt.id)
+      expect(replay.receipt).toEqual(first.receipt)
       expect(fixture.harness.sqlite.prepare(
         'SELECT COUNT(*) AS count FROM task_dispatch_runtime_receipts',
       ).get()).toEqual({ count: 1 })
@@ -296,6 +321,54 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
     }
   })
 
+  it('refuses runtime completion when the task has no independent gate owner', async () => {
+    const fixture = runtimeFixture()
+    try {
+      fixture.harness.sqlite.prepare('UPDATE tasks SET gate_owner = NULL WHERE id = ?').run(TASK_ID)
+      await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+        taskId: TASK_ID, dispatchReceiptId: DISPATCH_ID, messageId: MESSAGE_ID,
+        stage: 'runtime_consumed', runtimeReceiptHash: RUNTIME_HASH, attempt: 1,
+      })
+      await expect(recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+        taskId: TASK_ID, dispatchReceiptId: DISPATCH_ID, messageId: MESSAGE_ID,
+        stage: 'completed', runtimeReceiptHash: '9'.repeat(64), attempt: 1,
+        result: 'Completed but ungated.',
+      })).rejects.toMatchObject({ code: 'runtime_gate_required' })
+      expect(fixture.harness.sqlite.prepare('SELECT status FROM tasks WHERE id = ?').get(TASK_ID))
+        .toEqual({ status: 'in_progress' })
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
+  it('moves runtime completion through review to a different granted gate agent verdict', async () => {
+    const fixture = runtimeFixture()
+    try {
+      await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+        taskId: TASK_ID, dispatchReceiptId: DISPATCH_ID, messageId: MESSAGE_ID,
+        stage: 'runtime_consumed', runtimeReceiptHash: RUNTIME_HASH, attempt: 1,
+      })
+      await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+        taskId: TASK_ID, dispatchReceiptId: DISPATCH_ID, messageId: MESSAGE_ID,
+        stage: 'completed', runtimeReceiptHash: 'a'.repeat(64), attempt: 1,
+        result: 'Ready for independent review.',
+      })
+      const verdict = await invokeTool(
+        fixture.gateAuth,
+        fixture.env,
+        'task_verdict',
+        { task_id: TASK_ID, verdict: 'approved', note: 'Independent gate PASS' },
+        'https://pot.test',
+      )
+      expect(verdict).toMatchObject({ ok: true, result: { task: { status: 'approved' } } })
+      expect(fixture.harness.sqlite.prepare(
+        'SELECT verdict, decided_by FROM task_verdicts WHERE task_id = ?',
+      ).get(TASK_ID)).toEqual({ verdict: 'approved', decided_by: GATE_AGENT_ID })
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
   it('records a bounded failure and moves current work to blocked without redispatch', async () => {
     const fixture = runtimeFixture()
     try {
@@ -349,7 +422,7 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
     }
   })
 
-  it('keeps the failed fence after restart and a renewed source lease', async () => {
+  it('keeps the failed fence across restart and a re-lease as attempt two', async () => {
     const fixture = runtimeFixture()
     try {
       await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
@@ -362,7 +435,7 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
         reason: 'Host stopped.',
       })
       fixture.harness.sqlite.prepare(
-        'UPDATE agent_messages SET read_at = NULL, lease_expires_at = ? WHERE id = ?',
+        'UPDATE agent_messages SET read_at = NULL, lease_expires_at = ?, delivery_attempts = 2 WHERE id = ?',
       ).run('2099-01-01T00:00:00.000Z', MESSAGE_ID)
       const restartedEnv = { ...fixture.env }
       await expect(recordTaskDispatchRuntimeReceipt(restartedEnv, fixture.auth, {
@@ -371,7 +444,7 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
         messageId: MESSAGE_ID,
         stage: 'runtime_consumed',
         runtimeReceiptHash: '6'.repeat(64),
-        attempt: 1,
+        attempt: 2,
       })).rejects.toMatchObject({ code: 'runtime_receipt_transition_conflict' })
       expect(fixture.harness.sqlite.prepare('SELECT status FROM tasks WHERE id = ?').get(TASK_ID))
         .toEqual({ status: 'blocked' })
@@ -380,10 +453,10 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
     }
   })
 
-  it('never leaves concurrent failed and runtime_consumed calls in progress', async () => {
+  it('rejects concurrent attempt-two consumption after attempt one failed', async () => {
     const fixture = runtimeFixture()
     try {
-      const failed = recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+      await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
         taskId: TASK_ID,
         dispatchReceiptId: DISPATCH_ID,
         messageId: MESSAGE_ID,
@@ -392,15 +465,19 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
         attempt: 1,
         reason: 'Concurrent failure won.',
       })
-      const consumed = recordTaskDispatchRuntimeReceipt({ ...fixture.env }, fixture.auth, {
+      fixture.harness.sqlite.prepare(
+        'UPDATE agent_messages SET lease_expires_at = ?, delivery_attempts = 2 WHERE id = ?',
+      ).run('2099-01-01T00:00:00.000Z', MESSAGE_ID)
+      const consume = () => recordTaskDispatchRuntimeReceipt({ ...fixture.env }, fixture.auth, {
         taskId: TASK_ID,
         dispatchReceiptId: DISPATCH_ID,
         messageId: MESSAGE_ID,
         stage: 'runtime_consumed',
         runtimeReceiptHash: '8'.repeat(64),
-        attempt: 1,
+        attempt: 2,
       })
-      await Promise.allSettled([failed, consumed])
+      const outcomes = await Promise.allSettled([consume(), consume()])
+      expect(outcomes.every((outcome) => outcome.status === 'rejected')).toBe(true)
       expect(fixture.harness.sqlite.prepare('SELECT status FROM tasks WHERE id = ?').get(TASK_ID))
         .toEqual({ status: 'blocked' })
       expect(fixture.harness.sqlite.prepare(
@@ -501,6 +578,10 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
         ok: true,
         result: { receipt: { stage: 'runtime_consumed' }, task_status: 'in_progress' },
       })
+      expect(Object.keys((mcp.result as { receipt: Record<string, unknown> }).receipt).sort()).toEqual([
+        'artifact_refs', 'artifact_sha256', 'attempt', 'created_at', 'reason', 'result',
+        'runtime_address', 'runtime_receipt_hash', 'stage',
+      ])
       expect(mcpFixture.harness.sqlite.prepare(
         "SELECT origin FROM mutation_audit_entries WHERE handler = 'task_dispatch_runtime_receipt'",
       ).get()).toEqual({ origin: 'mcp' })
@@ -536,10 +617,12 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
 
       const timeline = await listTaskDispatchReceiptTimeline(fixture.env, TASK_ID)
       expect(timeline.transport).toEqual([{
-        agent_id: AGENT_ID,
+        agent_slug: RUNTIME_ADDRESS,
+        agent_name: 'Hadi Codex',
         dispatched_at: T0,
         transport_delivered_at: T0,
       }])
+      expect(timeline.transport[0]).not.toHaveProperty('agent_id')
       expect(timeline.runtime.map((receipt) => receipt.stage)).toEqual([
         'runtime_consumed',
         'completed',

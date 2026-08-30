@@ -3,6 +3,7 @@ import { canonicalJson, sha256Hex } from '../lib/canonical-json'
 import type { AuthContext, Env } from '../types'
 import { resolveTaskAssignee } from './assignee'
 import { verifyTaskArtifactShape } from './artifact-verification'
+import { isValidGateOwnerForm } from './service'
 
 export type TaskDispatchRuntimeStage = 'runtime_consumed' | 'completed' | 'failed'
 
@@ -61,6 +62,7 @@ export type TaskDispatchRuntimeReceiptErrorCode =
   | 'runtime_receipt_forbidden'
   | 'runtime_receipt_conflict'
   | 'runtime_artifact_required'
+  | 'runtime_gate_required'
   | 'runtime_receipt_transition_conflict'
   | 'runtime_receipt_persistence_conflict'
 
@@ -82,6 +84,7 @@ interface DeliveryRow {
   task_squad_id: string
   task_project_id: string | null
   task_done_when: string
+  task_gate_owner: string | null
   agent_status: string
   message_to_agent: string
   message_from_agent: string
@@ -153,6 +156,7 @@ async function loadDelivery(
       task.squad_id AS task_squad_id,
       task.project_id AS task_project_id,
       task.done_when AS task_done_when,
+      task.gate_owner AS task_gate_owner,
       agent.status AS agent_status,
       message.to_agent AS message_to_agent,
       message.from_agent AS message_from_agent,
@@ -224,7 +228,7 @@ export async function recordTaskDispatchRuntimeReceipt(
   auth: AuthContext,
   input: RecordTaskDispatchRuntimeReceiptInput,
   options: { origin?: 'mcp' | 'rest' } = {},
-): Promise<{ receipt: TaskDispatchRuntimeReceipt; task_status: string }> {
+): Promise<{ receipt: PublicTaskDispatchRuntimeReceipt; task_status: string }> {
   const memberId = auth.memberId?.trim() ?? ''
   const credentialId = auth.tokenId?.trim() ?? ''
   const agentId = auth.boundAgentId?.trim() ?? ''
@@ -290,6 +294,12 @@ export async function recordTaskDispatchRuntimeReceipt(
   const runtimeAddress = validateEnvelope(delivery, input, now, replay !== null)
   if (
     input.stage === 'completed'
+    && (delivery.task_gate_owner === null || !isValidGateOwnerForm(delivery.task_gate_owner))
+  ) {
+    throw new TaskDispatchRuntimeReceiptError('runtime_gate_required')
+  }
+  if (
+    input.stage === 'completed'
     && (/Artifact:/i.test(delivery.task_done_when) || /SHA256:/i.test(delivery.task_done_when))
   ) {
     const verified = verifyTaskArtifactShape(result)
@@ -308,7 +318,7 @@ export async function recordTaskDispatchRuntimeReceipt(
     const task = await env.DB.prepare('SELECT status FROM tasks WHERE id = ?1')
       .bind(input.taskId).first<{ status: string }>()
     if (!task) throw new TaskDispatchRuntimeReceiptError('runtime_delivery_not_found')
-    return { receipt: publicReceipt(replay), task_status: task.status }
+    return { receipt: publicTimelineReceipt(replay), task_status: task.status }
   }
 
   const receiptId = crypto.randomUUID()
@@ -334,15 +344,15 @@ export async function recordTaskDispatchRuntimeReceipt(
                 WHERE failed.tenant = ?5
                   AND failed.dispatch_receipt_id = ?1
                   AND failed.stage = 'failed'
-                  AND failed.attempt = ?6
              )
           RETURNING status
-        `).bind(input.dispatchReceiptId, now, input.taskId, agentId, env.TENANT_SLUG, input.attempt)
+        `).bind(input.dispatchReceiptId, now, input.taskId, agentId, env.TENANT_SLUG)
       : input.stage === 'completed'
         ? env.DB.prepare(`
             UPDATE tasks SET status = 'review', result = ?1, updated_at = ?2
              WHERE id = ?3 AND assignee_agent_id = ?4
                AND status = 'in_progress' AND execution_receipt_id = ?5
+               AND gate_owner IS NOT NULL
                AND EXISTS (
                  SELECT 1 FROM task_dispatch_runtime_receipts consumed
                   WHERE consumed.tenant = ?6
@@ -396,12 +406,13 @@ export async function recordTaskDispatchRuntimeReceipt(
   const task = await env.DB.prepare('SELECT status FROM tasks WHERE id = ?1')
     .bind(input.taskId).first<{ status: string }>()
   if (!persisted || !task) throw new TaskDispatchRuntimeReceiptError('runtime_receipt_persistence_conflict')
-  return { receipt: publicReceipt(persisted), task_status: task.status }
+  return { receipt: publicTimelineReceipt(persisted), task_status: task.status }
 }
 
 export interface TaskDispatchReceiptTimeline {
   transport: Array<{
-    agent_id: string
+    agent_slug: string
+    agent_name: string
     dispatched_at: string
     transport_delivered_at: string | null
   }>
@@ -409,7 +420,7 @@ export interface TaskDispatchReceiptTimeline {
   gate: Array<{
     verdict: 'approved' | 'rejected'
     note: string | null
-    decided_by: string
+    decided_by_display: string
     decided_at: string
   }>
   task_status: string
@@ -425,14 +436,17 @@ export async function listTaskDispatchReceiptTimeline(
     .bind(taskId).first<{ status: string }>()
   if (!task) throw new TaskDispatchRuntimeReceiptError('runtime_delivery_not_found')
   const transport = await env.DB.prepare(`
-    SELECT agent_id, created_at AS dispatched_at,
-           consumed_at AS transport_delivered_at
-      FROM task_dispatch_receipts
-     WHERE tenant = ?1 AND task_id = ?2
-     ORDER BY created_at, id
+    SELECT agent.slug AS agent_slug, agent.name AS agent_name,
+           dispatch.created_at AS dispatched_at,
+           dispatch.consumed_at AS transport_delivered_at
+      FROM task_dispatch_receipts dispatch
+      JOIN agents agent ON agent.id = dispatch.agent_id
+     WHERE dispatch.tenant = ?1 AND dispatch.task_id = ?2
+     ORDER BY dispatch.created_at, dispatch.id
      LIMIT ?3
   `).bind(env.TENANT_SLUG, taskId, boundedLimit).all<{
-    agent_id: string
+    agent_slug: string
+    agent_name: string
     dispatched_at: string
     transport_delivered_at: string | null
   }>()
@@ -445,15 +459,20 @@ export async function listTaskDispatchReceiptTimeline(
      LIMIT ?3
   `).bind(env.TENANT_SLUG, taskId, boundedLimit).all<ReceiptRow>()
   const gate = await env.DB.prepare(`
-    SELECT verdict, note, decided_by, decided_at
-      FROM task_verdicts
-     WHERE task_id = ?1
-     ORDER BY decided_at, id
+    SELECT verdict.verdict, verdict.note,
+           COALESCE(NULLIF(agent.name, ''), NULLIF(member.display_name, ''), 'Independent gate')
+             AS decided_by_display,
+           verdict.decided_at
+      FROM task_verdicts verdict
+      LEFT JOIN agents agent ON agent.id = verdict.decided_by
+      LEFT JOIN members member ON member.id = verdict.decided_by
+     WHERE verdict.task_id = ?1
+     ORDER BY verdict.decided_at, verdict.id
      LIMIT ?2
   `).bind(taskId, boundedLimit).all<{
     verdict: 'approved' | 'rejected'
     note: string | null
-    decided_by: string
+    decided_by_display: string
     decided_at: string
   }>()
   return {

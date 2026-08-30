@@ -95,7 +95,7 @@ describe('runtime.dispatch/v1 synthetic restart canary', () => {
       const consumed = await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, consumedInput)
       const restartedEnv = { ...fixture.env }
       const consumedReplay = await recordTaskDispatchRuntimeReceipt(restartedEnv, fixture.auth, consumedInput)
-      expect(consumedReplay.receipt.id).toBe(consumed.receipt.id)
+      expect(consumedReplay.receipt).toEqual(consumed.receipt)
 
       const completedInput = {
         ...consumedInput,
@@ -105,7 +105,7 @@ describe('runtime.dispatch/v1 synthetic restart canary', () => {
       }
       const completed = await recordTaskDispatchRuntimeReceipt(restartedEnv, fixture.auth, completedInput)
       const completionReplay = await recordTaskDispatchRuntimeReceipt({ ...fixture.env }, fixture.auth, completedInput)
-      expect(completionReplay.receipt.id).toBe(completed.receipt.id)
+      expect(completionReplay.receipt).toEqual(completed.receipt)
 
       const task = fixture.harness.sqlite.prepare('SELECT * FROM tasks WHERE id = ?').get(TASK) as Task
       expect(task.status).toBe('review')
@@ -119,8 +119,9 @@ describe('runtime.dispatch/v1 synthetic restart canary', () => {
       expect(timeline.transport).toHaveLength(1)
       expect(timeline.runtime.map((receipt) => receipt.stage)).toEqual(['runtime_consumed', 'completed'])
       expect(timeline.gate).toEqual([
-        expect.objectContaining({ verdict: 'approved', decided_by: 'agent-gate' }),
+        expect.objectContaining({ verdict: 'approved', decided_by_display: 'Hadi Grok Canary' }),
       ])
+      expect(timeline.gate[0]).not.toHaveProperty('decided_by')
       expect(timeline.task_status).toBe('approved')
       expect(fixture.harness.sqlite.prepare(
         'SELECT COUNT(*) AS count FROM task_dispatch_runtime_receipts',
