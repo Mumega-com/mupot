@@ -1,18 +1,39 @@
 # Changelog
 
-## 2026-08-26
+## Release status — 2026-08-30
+
+- **Current source version:** `0.30.0` in `package.json` and the public version constants.
+- **Latest tagged stable release:** `v0.25.0`. Neither `v0.29.0` nor `v0.30.0`
+  currently has a release tag or GitHub release, so source-version headings below are
+  preview history, not a supported stable contract.
+- **v0.30.0 stabilization candidate:** PR #1239 landed as merge commit
+  `f3389d65172b9660efaa82999675739046a987e9`, restoring a green main migration,
+  typecheck, full-suite, schema-source, no-secrets, and local-evidence baseline.
+- **Athena-GREEN, not yet landed:** PR #1243 (credential-rotation recovery) and
+  PR #1242 (router/loop/meter authorization). Each must be refreshed against the
+  preceding merged main before it can enter the stable release candidate.
+- **Still required for the stable candidate:** revalidate/reconstruct the message
+  reliability work in #1235, #1237, and #1241; close or explicitly defer obsolete
+  PRs; run the exact release gate recorded in [ROADMAP.md](ROADMAP.md).
+- **Release-excluded:** the #1236 omnibus, project-worker/sandbox expansion, device
+  fleet, new onboarding journeys, and other unbounded feature work. Useful donor
+  material must return through separate reviewed PRs after `v0.30.0`.
+
+No entry in this section claims a deployment. Tagging, publishing, and deploying
+`v0.30.0` each require separate receipts and approval.
+
+## Preview on main — 2026-08-26 (not a tagged release)
 
 - **River lead agent onboarding, Co-Pilot routing, and warm-cache prompts** (`src/dashboard/copilot.ts`, `src/ai/cache-context.ts`, `migrations/0131_river_lead_agent.sql`).
   - `@river` is a first-class Co-Pilot recipient (cyan, Council Lead & Continuity) on `/copilot`, the global drawer, and `/projects/:id` sandbox studio.
   - Model prompts use a frozen static prefix (charter, architecture, tool schemas, River governance) with dynamic turns at the bottom, plus a keep-alive heartbeat.
   - D1 registers River on `squad-core` (`gemini-3.7-flash`) when that squad exists; `check_in` records 7-axis presence for `seat: river-cursor`.
 
-- **1-click project worker provisioner & sandbox studio** (`src/projects/provisioner.ts`, `src/dashboard/projects.ts`, `src/platform/routes.ts`).
-  - `/projects` ships a `[ + New Project Worker ]` modal (name, auto-slug, GitHub repo, template, worker name, `https://<slug>.mupot.mumega.com` preview, squad default `squad-cursor`).
-  - `POST /api/projects` stays admin-gated (`isOrgAdmin` + workspace admin floor), seeds `deploy_status: "idle"`, and returns `{ ok: true, project, redirect_url }`.
-  - `/projects/:id` is a split sandbox: live preview iframe with Desktop/Tablet/Mobile toggles + Refresh, Deep Chat Co-Pilot focused on the project repo with quick prompts, and a flight/deployment stream.
+## 0.30.0 source cut — 2026-08-21 (preview; not tagged)
 
-## 0.30.0 — 2026-08-21
+This heading records when the source version advanced to `0.30.0`. It is not a
+stable-release date. Features listed here remain preview until the stabilization
+scope and release gate in [ROADMAP.md](ROADMAP.md) pass at one exact main commit.
 
 - **Athena GitHub webhook PR gate** (`src/athena/webhook.ts`, `src/athena/routes.ts`, `migrations/0130_athena_gate_receipts.sql`).
   - `POST /api/webhooks/github` verifies `X-Hub-Signature-256` (or a fail-safe `GITHUB_TOKEN` bearer when the HMAC secret is unset), reviews `pull_request` `{opened, synchronize, reopened}` through `reviewPullRequest()`, and writes an immutable `athena_gate_receipts` row.
@@ -79,7 +100,7 @@
 
 
 
-## 0.29.0 — 2026-08-08
+## 0.29.0 source cut — 2026-08-08 (untagged)
 
 - **Build-Time Release Identity & Version Truth** (`src/health.ts`, `scripts/generate-build-info.mjs`; #443, #571).
   - `/health` and deployment consoles now stamp exact commit identity (`commit`), branch (`ref`), build timestamp (`built_at`), and working-tree cleanliness (`clean`) by construction via `src/build-info.ts` fallback when runtime environment variables are omitted.
@@ -362,7 +383,10 @@ All notable changes to mupot. Semver; pre-1.0 minor bumps may break.
 this changelog (shipped, dated) share version numbers and feed each other — a roadmap
 block collapses into a changelog entry when it ships.
 
-## [Unreleased]
+## [Unreleased — accumulated changes after v0.25.0]
+
+These entries are present on `main` or retained as unreleased history. They are not a
+stable contract until the `v0.30.0` stabilization gate promotes them explicitly.
 
 ### Added
 
