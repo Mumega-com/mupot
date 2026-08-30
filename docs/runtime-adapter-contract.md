@@ -470,8 +470,13 @@ those stages writes `done`; the independent verdict surface remains mandatory.
 A failed dispatch is terminally fenced and cannot later be revived as
 `runtime_consumed` by any later attempt for that dispatch/message. Completion
 also requires an explicit `gate:<owner>` with a currently active, credentialed
-different-agent grant. Nonexistent, revoked, inactive, assignee-only, and
-self-completion gates cannot enter review.
+different-agent grant. The member identity bound to that credential must also
+hold effective `member+` authority on the task squad through canonical org,
+department, exact-squad, or channel-derived inheritance. Nonexistent, revoked,
+inactive, cross-squad-without-authority, observer-only, assignee-only, and
+self-completion gates cannot enter review. Completion repeats this scope check in
+the atomic mutation fence, so authority revoked after precheck cannot create an
+unverdictable review task.
 
 Task readback and runtime write responses expose allowlisted DTOs. Credential/audit
 IDs and exact message/dispatch/private receipt correlation IDs remain only in a

@@ -381,6 +381,19 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
           .run(GATE_AGENT_ID)
       },
     },
+    {
+      name: 'cross-squad gate without task-squad member authority',
+      mutate: (fixture: ReturnType<typeof runtimeFixture>) => {
+        fixture.harness.sqlite.exec(`
+          INSERT INTO squads (id, department_id, slug, name)
+          VALUES ('squad-gate-only', 'department-runtime-1', 'gate-only', 'Gate Only');
+          UPDATE agents SET squad_id = 'squad-gate-only' WHERE id = '${GATE_AGENT_ID}';
+          DELETE FROM capabilities WHERE id = 'cap-gate-1';
+          INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+          VALUES ('cap-gate-other', '${GATE_MEMBER_ID}', 'squad', 'squad-gate-only', 'member');
+        `)
+      },
+    },
   ])('refuses completion for $name', async ({ mutate }) => {
     const fixture = runtimeFixture()
     try {
@@ -401,7 +414,7 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
     }
   })
 
-  it('fails atomically when the independent gate credential is revoked after precheck', async () => {
+  it('fails atomically when the gate task-squad capability is revoked after precheck', async () => {
     const fixture = runtimeFixture()
     try {
       await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
@@ -415,8 +428,8 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
         batch: async (statements: Parameters<Env['DB']['batch']>[0]) => {
           if (!flipped) {
             flipped = true
-            fixture.harness.sqlite.prepare('UPDATE member_tokens SET revoked_at = ? WHERE id = ?')
-              .run(T0, GATE_TOKEN_ID)
+            fixture.harness.sqlite.prepare('DELETE FROM capabilities WHERE id = ?')
+              .run('cap-gate-1')
           }
           return fixture.env.DB.batch(statements)
         },

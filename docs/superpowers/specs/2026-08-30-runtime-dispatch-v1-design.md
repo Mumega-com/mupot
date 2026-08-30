@@ -109,7 +109,11 @@ key returns `409 runtime_receipt_conflict`.
   `tasks.execution_receipt_id` to the dispatch receipt. It never completes work.
 - `completed`: requires an earlier consumed receipt for the same attempt and an
   `in_progress` task bound to the same dispatch. It records result/evidence and
-  moves the task to `review`, never `done`.
+  moves the task to `review`, never `done`. The independent gate agent must have
+  a live bound credential whose member identity currently holds effective
+  `member+` authority on the task squad through the canonical org, department,
+  exact-squad, or channel-derived inheritance rules. The atomic update repeats
+  this predicate to fence capability revocation after the precheck.
 - `failed`: requires consumed or a still-current delivery attempt, stores a bounded
   reason, and moves the task to `blocked`. It never redispatches automatically.
 

@@ -565,11 +565,11 @@ tasksApp.post('/', async (c) => {
   if (
     body.dispatch === true
     && assigneeAgentId !== null
-    && !(await hasIndependentRuntimeGate(c.env, gateOwner, assigneeAgentId))
+    && !(await hasIndependentRuntimeGate(c.env, gateOwner, assigneeAgentId, squad.id))
   ) {
     return c.json({
       error: 'independent_gate_required',
-      detail: 'Dispatch-now requires an active different-agent gate grant with a live credential.',
+      detail: 'Dispatch-now requires an active different-agent gate grant with a live credential and member authority on the task squad.',
     }, 409)
   }
 

@@ -109,6 +109,7 @@ export async function hasIndependentRuntimeGate(
   env: Env,
   gateOwner: string | null | undefined,
   assigneeAgentId: string,
+  taskSquadId: string,
 ): Promise<boolean> {
   if (
     gateOwner === null || gateOwner === undefined
@@ -122,6 +123,7 @@ export async function hasIndependentRuntimeGate(
         ON grant_row.principal_type = 'agent'
        AND gate_agent.id = grant_row.principal_id
        AND gate_agent.status = 'active'
+      JOIN squads task_squad ON task_squad.id = ?4
      WHERE grant_row.capability = ?1
        AND gate_agent.id <> ?2
        AND EXISTS (
@@ -131,10 +133,34 @@ export async function hasIndependentRuntimeGate(
              ON gate_member.id = t.member_id AND gate_member.status = 'active'
           WHERE t.agent_id = gate_agent.id
             AND t.tenant = ?3
-            AND ${TOKEN_LIVE_PREDICATE('?4')}
+            AND ${TOKEN_LIVE_PREDICATE('?5')}
+            AND (
+              EXISTS (
+                SELECT 1
+                  FROM capabilities capability
+                 WHERE capability.member_id = t.member_id
+                   AND capability.capability IN ('member', 'lead', 'admin', 'owner')
+                   AND (
+                     capability.scope_type = 'org'
+                     OR (capability.scope_type = 'squad' AND capability.scope_id = ?4)
+                     OR (
+                       capability.scope_type = 'department'
+                       AND capability.scope_id = task_squad.department_id
+                     )
+                   )
+              )
+              OR EXISTS (
+                SELECT 1
+                  FROM channel_capability_grants channel_grant
+                 WHERE channel_grant.member_id = t.member_id
+                   AND channel_grant.squad_id = ?4
+                   AND channel_grant.capability IN ('member', 'lead', 'admin', 'owner')
+              )
+            )
        )
      LIMIT 1
-  `).bind(gateOwner, assigneeAgentId, env.TENANT_SLUG, nowSqlUtc()).first<{ allowed: number }>()
+  `).bind(gateOwner, assigneeAgentId, env.TENANT_SLUG, taskSquadId, nowSqlUtc())
+    .first<{ allowed: number }>()
   return row !== null
 }
 
@@ -330,6 +356,7 @@ export async function recordTaskDispatchRuntimeReceipt(
     env,
     delivery.task_gate_owner,
     agentId,
+    delivery.task_squad_id,
   ))) {
     throw new TaskDispatchRuntimeReceiptError('runtime_gate_required')
   }
@@ -406,6 +433,36 @@ export async function recordTaskDispatchRuntimeReceipt(
                        WHERE t.agent_id = gate_agent.id
                          AND t.tenant = ?6
                          AND ${TOKEN_LIVE_PREDICATE('?8')}
+                         AND (
+                           EXISTS (
+                             SELECT 1
+                               FROM capabilities capability
+                              WHERE capability.member_id = t.member_id
+                                AND capability.capability IN ('member', 'lead', 'admin', 'owner')
+                                AND (
+                                  capability.scope_type = 'org'
+                                  OR (
+                                    capability.scope_type = 'squad'
+                                    AND capability.scope_id = tasks.squad_id
+                                  )
+                                  OR (
+                                    capability.scope_type = 'department'
+                                    AND capability.scope_id = (
+                                      SELECT task_squad.department_id
+                                        FROM squads task_squad
+                                       WHERE task_squad.id = tasks.squad_id
+                                    )
+                                  )
+                                )
+                           )
+                           OR EXISTS (
+                             SELECT 1
+                               FROM channel_capability_grants channel_grant
+                              WHERE channel_grant.member_id = t.member_id
+                                AND channel_grant.squad_id = tasks.squad_id
+                                AND channel_grant.capability IN ('member', 'lead', 'admin', 'owner')
+                           )
+                         )
                     )
                )
                AND EXISTS (

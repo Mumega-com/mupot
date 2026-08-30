@@ -49,11 +49,17 @@ later delivery attempt. No later attempt for that `dispatch_receipt_id` can reco
 governed dispatch, not resurrection of failed evidence.
 
 `completed` also requires a valid explicit `gate:<owner>` backed by a currently
-active, credentialed gate agent distinct from the assignee. `/send` requires the
-operator to provide it and the server verifies the grant for Dispatch-now.
-Nonexistent, revoked, inactive, assignee-only, and `gate:agent-self-completion`
-gates cannot enter review. Ungated runtime work stays `in_progress` instead of
-becoming a zombie review; self-approval is never inferred.
+active, credentialed gate agent distinct from the assignee. The member identity
+bound to that gate credential must currently hold effective `member` or higher
+authority on the task squad through the canonical org, department, exact-squad,
+or channel-derived inheritance rules. `/send` requires the operator to provide
+the gate and the server verifies the grant plus task-squad authority for
+Dispatch-now. Nonexistent, revoked, inactive, cross-squad-without-authority,
+assignee-only, observer-only, and `gate:agent-self-completion` gates cannot enter
+review. The same checks run atomically with completion so a capability revocation
+between precheck and mutation rolls the transition back. Ungated runtime work
+stays `in_progress` instead of becoming a zombie review; self-approval is never
+inferred.
 
 The operation requires an active agent-bound workspace token for the persisted
 assignee. It rechecks the current token, member capability, assignment, project,
