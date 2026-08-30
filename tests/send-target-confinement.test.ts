@@ -48,6 +48,39 @@ function envWith(DB: Env['DB']): Env {
   return { DB, TENANT_SLUG: 'tenant' } as Env
 }
 
+function withDbHooks(
+  env: Env,
+  hooks: {
+    beforeMessageInsert?: () => void
+    onPrepare?: (sql: string) => void
+  },
+): Env {
+  let insertHookFired = false
+  const wrap = (statement: any, sql: string): any => ({
+    bind: (...values: unknown[]) => wrap(statement.bind(...values), sql),
+    first: (...args: unknown[]) => statement.first(...args),
+    all: (...args: unknown[]) => statement.all(...args),
+    raw: (...args: unknown[]) => statement.raw(...args),
+    run: async (...args: unknown[]) => {
+      if (!insertHookFired && sql.includes('INSERT INTO agent_messages')) {
+        insertHookFired = true
+        hooks.beforeMessageInsert?.()
+      }
+      return statement.run(...args)
+    },
+  })
+  return {
+    ...env,
+    DB: {
+      ...env.DB,
+      prepare: (sql: string) => {
+        hooks.onPrepare?.(sql)
+        return wrap(env.DB.prepare(sql), sql)
+      },
+    },
+  } as Env
+}
+
 function grant(scopeId: string, capability: CapabilityGrant['capability'] = 'observer'): CapabilityGrant[] {
   return [{ member_id: 'member-sender', scope_type: 'squad', scope_id: scopeId, capability }]
 }
@@ -120,6 +153,8 @@ describe('sendToRef — gate 1 send-target confinement (#392)', () => {
       sqlite.exec(`
         INSERT INTO memberships (id, agent_id, squad_id, capability)
         VALUES ('membership-target-guest', 'agent-target', 'squad-sender', 'member');
+        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES ('cap-target-guest', 'member-sender', 'squad', 'squad-sender', 'observer');
       `)
       const res = await sendToRef(
         envWith(db),
@@ -132,12 +167,110 @@ describe('sendToRef — gate 1 send-target confinement (#392)', () => {
     }
   })
 
+  it('guest membership removal before the message insert revokes visibility atomically', async () => {
+    const { db, close, sqlite } = migratedDb()
+    try {
+      sqlite.exec(`
+        INSERT INTO memberships (id, agent_id, squad_id, capability)
+        VALUES ('membership-target-race', 'agent-target', 'squad-sender', 'member');
+        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES ('cap-target-race', 'member-sender', 'squad', 'squad-sender', 'observer');
+      `)
+      const raced = withDbHooks(envWith(db), {
+        beforeMessageInsert: () => {
+          sqlite.prepare("DELETE FROM memberships WHERE id = 'membership-target-race'").run()
+        },
+      })
+
+      await expect(sendToRef(
+        raced,
+        { ...baseInput, toRef: 'agent-target' },
+        NON_ADMIN(grant('squad-sender')),
+      )).resolves.toEqual({ ok: false, reason: 'send_target_not_visible' })
+      expect(sqlite.prepare(
+        "SELECT COUNT(*) AS n FROM agent_messages WHERE to_agent = 'agent-target'",
+      ).get()).toEqual({ n: 0 })
+    } finally {
+      close()
+    }
+  })
+
+  it('sender grant removal before the message insert revokes guest visibility atomically', async () => {
+    const { db, close, sqlite } = migratedDb()
+    try {
+      sqlite.exec(`
+        INSERT INTO memberships (id, agent_id, squad_id, capability)
+        VALUES ('membership-target-grant-race', 'agent-target', 'squad-sender', 'member');
+        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES ('cap-target-grant-race', 'member-sender', 'squad', 'squad-sender', 'observer');
+      `)
+      const raced = withDbHooks(envWith(db), {
+        beforeMessageInsert: () => {
+          sqlite.prepare("DELETE FROM capabilities WHERE id = 'cap-target-grant-race'").run()
+        },
+      })
+
+      await expect(sendToRef(
+        raced,
+        { ...baseInput, toRef: 'agent-target' },
+        NON_ADMIN(grant('squad-sender')),
+      )).resolves.toEqual({ ok: false, reason: 'send_target_not_visible' })
+      expect(sqlite.prepare(
+        "SELECT COUNT(*) AS n FROM agent_messages WHERE to_agent = 'agent-target'",
+      ).get()).toEqual({ n: 0 })
+    } finally {
+      close()
+    }
+  })
+
+  it('guest visibility uses one bounded query regardless of recipient membership count', async () => {
+    const { db, close, sqlite } = migratedDb()
+    try {
+      for (let index = 0; index < 6; index += 1) {
+        sqlite.prepare(
+          'INSERT INTO squads (id, department_id, slug, name) VALUES (?, ?, ?, ?)',
+        ).run(`squad-guest-${index}`, 'dept', `guest-${index}`, `Guest ${index}`)
+        sqlite.prepare(
+          'INSERT INTO memberships (id, agent_id, squad_id, capability) VALUES (?, ?, ?, ?)',
+        ).run(`membership-guest-${index}`, 'agent-target', `squad-guest-${index}`, 'observer')
+      }
+      sqlite.exec(`
+        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES ('cap-query-shape', 'member-sender', 'squad', 'squad-sender', 'observer');
+      `)
+      let legacyMembershipReads = 0
+      let departmentReads = 0
+      const observed = withDbHooks(envWith(db), {
+        onPrepare: (sql) => {
+          if (sql.includes('SELECT squad_id FROM memberships WHERE agent_id = ?1')) {
+            legacyMembershipReads += 1
+          }
+          if (sql.includes('SELECT department_id FROM squads WHERE id = ?1')) {
+            departmentReads += 1
+          }
+        },
+      })
+
+      await expect(sendToRef(
+        observed,
+        { ...baseInput, toRef: 'agent-target' },
+        NON_ADMIN(grant('squad-sender')),
+      )).resolves.toEqual({ ok: false, reason: 'send_target_not_visible' })
+      expect(legacyMembershipReads).toBe(0)
+      expect(departmentReads).toBeLessThanOrEqual(1)
+    } finally {
+      close()
+    }
+  })
+
   it('guest membership does not leak: a grant on an unrelated squad still cannot reach a guest of a different squad', async () => {
     const { db, close, sqlite } = migratedDb()
     try {
       sqlite.exec(`
         INSERT INTO memberships (id, agent_id, squad_id, capability)
         VALUES ('membership-target-guest-2', 'agent-target', 'squad-sender', 'member');
+        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES ('cap-target-guest-other', 'member-sender', 'squad', 'squad-other', 'observer');
       `)
       const res = await sendToRef(
         envWith(db),
