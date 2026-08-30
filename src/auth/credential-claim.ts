@@ -79,8 +79,8 @@ export async function createCredentialClaim(
   env: Env,
   raw: string,
   mintedBy: string,
+  claimId = crypto.randomUUID(),
 ): Promise<CredentialClaimHandle> {
-  const claimId = crypto.randomUUID()
   const fingerprint = (await sha256Hex(raw)).slice(0, 16)
   const nowMs = Date.now()
   const record: CredentialClaimRecord = {
@@ -98,6 +98,29 @@ export async function createCredentialClaim(
     expires_at: new Date(nowMs + CLAIM_TTL_SECONDS * 1000).toISOString(),
     reveal_tool: 'reveal_credential_claim',
   }
+}
+
+/** Check that a staged handoff can still be activated without reading or consuming its raw value. */
+export async function credentialClaimIsAvailable(
+  env: Env,
+  claimId: string,
+  mintedBy: string,
+): Promise<boolean> {
+  const stored = await env.SESSIONS.get(CLAIM_KEY_PREFIX + claimId)
+  if (!stored) return false
+  try {
+    const record = JSON.parse(stored) as CredentialClaimRecord
+    return record.mintedBy === mintedBy && record.tenant === env.TENANT_SLUG && typeof record.raw === 'string'
+  } catch {
+    return false
+  }
+}
+
+/** Ensure a claim can no longer reveal credential material before its inactive
+ * rotation reservation is discarded. Deletion is idempotent so a missing,
+ * expired, or already-consumed claim follows the same recovery path. */
+export async function discardCredentialClaim(env: Env, claimId: string): Promise<void> {
+  await env.SESSIONS.delete(CLAIM_KEY_PREFIX + claimId)
 }
 
 export type RevealClaimResult =

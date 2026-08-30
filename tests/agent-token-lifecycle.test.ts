@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import { mcpApp } from '../src/mcp'
 import type { CapabilityGrant, Env } from '../src/types'
+import { resolveAgentTokenExpiry } from '../src/auth/token-lifecycle'
+import { discardCredentialClaim } from '../src/auth/credential-claim'
 
 // mupot#682 — list_agent_tokens / revoke_agent_token.
 //
@@ -42,6 +44,14 @@ interface Opts {
   revokeChanges?: number
   /** collects every BUS.send payload so a probe can assert NO side effect */
   busSent?: unknown[]
+  /** Whether a requested replacement token passes the service's live-ownership preflight. */
+  liveReplacementToken?: boolean
+  memberBinding?: string | null
+  batches?: unknown[][]
+  busReject?: { value: boolean }
+  claimReject?: boolean
+  claimWrites?: string[]
+  cancellations?: string[]
 }
 
 function makeEnv(opts: Opts = {}): Env {
@@ -49,10 +59,13 @@ function makeEnv(opts: Opts = {}): Env {
     { member_id: OPERATOR, scope_type: 'org', scope_id: null, capability: 'admin' },
   ]
   const revokeChanges = opts.revokeChanges ?? 1
+  let replacementHandoff: Record<string, unknown> | null = null
 
   const handler = (sql: string) => ({
     bind(...args: unknown[]) {
       return {
+        sql,
+        args,
         async first() {
           // ORDER MATTERS. revoke's ownership lookup is matched FIRST by its distinctive
           // projection; every other member_tokens read is the authn lookup. Getting this
@@ -60,6 +73,9 @@ function makeEnv(opts: Opts = {}): Env {
           // reaching the logic under test — which is exactly what happened first try.
           if (sql.includes('FROM member_tokens') && sql.includes('agent_id, label, revoked_at')) {
             return opts.tokenRow === undefined ? TOKEN_MINE : opts.tokenRow
+          }
+          if (sql.includes('SELECT id FROM member_tokens') || sql.includes('SELECT t.id FROM member_tokens')) {
+            return opts.liveReplacementToken ? { id: args[0] } : null
           }
           if (sql.includes('FROM member_tokens')) {
             return {
@@ -73,7 +89,19 @@ function makeEnv(opts: Opts = {}): Env {
               bound_agent_id: opts.boundAgentId ?? null,
             }
           }
-          if (sql.includes('FROM agent_member_bindings')) return null
+          if (sql.includes('FROM agent_member_bindings')) {
+            return opts.memberBinding ? { member_id: opts.memberBinding } : null
+          }
+          if (sql.includes('replacement_label')) {
+            return {
+              replacement_label: AGENT.slug,
+              replacement_channel: 'workspace',
+              replacement_created_at: replacementHandoff?.created_at,
+              binding_capability: 'member',
+            }
+          }
+          if (sql.includes('FROM agent_token_rotation_handoffs')) return replacementHandoff
+          if (sql.includes('FROM capabilities')) return { capability: 'member' }
           if (sql.includes('FROM agent_keys')) return null
           if (sql.includes('FROM squads')) {
             const ref = args[0]
@@ -95,6 +123,14 @@ function makeEnv(opts: Opts = {}): Env {
           return { results: [] }
         },
         async run() {
+          if (sql.includes('DELETE FROM agent_token_rotation_handoffs')) {
+            opts.cancellations?.push(String(args[0]))
+            replacementHandoff = null
+          }
+          if (sql.includes("UPDATE agent_token_rotation_handoffs") && replacementHandoff) {
+            if (sql.includes("audit_state = 'sent'")) replacementHandoff.audit_state = 'sent'
+            if (sql.includes("state = 'active'")) replacementHandoff.state = 'active'
+          }
           return { meta: { changes: revokeChanges } }
         },
       }
@@ -104,18 +140,42 @@ function makeEnv(opts: Opts = {}): Env {
   return {
     DB: {
       prepare: (sql: string) => handler(sql),
-      batch: async (stmts: unknown[]) => stmts.map(() => ({ meta: { changes: 1 } })),
+      batch: async (stmts: unknown[]) => {
+        opts.batches?.push(stmts)
+        const handoffInsert = (stmts as Array<{ sql?: string; args?: unknown[] }>).find((stmt) =>
+          stmt.sql?.includes('INSERT INTO agent_token_rotation_handoffs'),
+        )
+        if (handoffInsert?.args) {
+          const args = handoffInsert.args
+          replacementHandoff = {
+            id: args[0], tenant: args[1], agent_id: args[2], member_id: args[3], prior_token_id: args[4],
+            replacement_token_id: args[5], minted_by_member_id: args[6], claim_id: args[7],
+            claim_fingerprint: args[8], claim_expires_at: args[9], claim_put_lease_expires_at: args[10],
+            audit_state: 'pending', state: 'pending', created_at: args[11], activated_at: null,
+          }
+        }
+        return stmts.map(() => ({ meta: { changes: 1 } }))
+      },
     },
     TENANT_SLUG: 'mumega',
     PUBLIC_ORIGIN: 'https://mupot.mumega.com',
-    BUS: { send: async (e: unknown) => { (opts.busSent ??= []).push(e) } },
+    BUS: {
+      send: async (e: unknown) => {
+        if (opts.busReject?.value) throw new Error('bus unavailable')
+        ;(opts.busSent ??= []).push(e)
+      },
+    },
     // mupot#987: mint_agent_token stores raw behind a one-time SESSIONS-KV claim
     // (src/auth/credential-claim.ts) instead of returning it directly.
     SESSIONS: (() => {
       const store = new Map<string, string>()
       return {
         async get(key: string) { return store.get(key) ?? null },
-        async put(key: string, value: string) { store.set(key, value) },
+        async put(key: string, value: string) {
+          if (opts.claimReject) throw new Error('claim store unavailable')
+          opts.claimWrites?.push(key)
+          store.set(key, value)
+        },
         async delete(key: string) { store.delete(key) },
       }
     })(),
@@ -297,6 +357,60 @@ describe('no tool may emit a secret', () => {
 })
 
 describe('Flight-002: mint_agent_token expiry and rotation', () => {
+  it('allows non-expiring agent tokens only through the explicit owner exception', () => {
+    expect(resolveAgentTokenExpiry({ nonExpiring: true, allowNonExpiring: false })).toEqual({
+      ok: false,
+      code: 'non_expiring_owner_required',
+    })
+    expect(resolveAgentTokenExpiry({ nonExpiring: true, allowNonExpiring: true })).toMatchObject({
+      ok: true,
+      expiresAt: null,
+    })
+  })
+
+  it('rejects zero, negative, and non-finite expiry inputs rather than minting non-expiring tokens', () => {
+    for (const expiresInDays of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(resolveAgentTokenExpiry({ expiresInDays, allowNonExpiring: false })).toEqual({
+        ok: false,
+        code: 'invalid_expiry',
+      })
+    }
+  })
+
+  it('owner_cannot_combine_non_expiring_with_any_finite_expiry_mode_or_side_effect', async () => {
+    const owner = [{ member_id: OPERATOR, scope_type: 'org' as const, scope_id: null, capability: 'owner' as const }]
+    for (const expires_in_days of [0, -1, Number.NaN, 1.5, 366, 30]) {
+      const batches: unknown[][] = []
+      const busSent: unknown[] = []
+      const claimWrites: string[] = []
+      const env = makeEnv({ grants: owner, batches, busSent, claimWrites })
+
+      const res = await call('mint_agent_token', {
+        agent: AGENT.slug,
+        non_expiring: true,
+        expires_in_days,
+      }, env)
+
+      expect(res.status).toBe(400)
+      expect(batches).toHaveLength(0)
+      expect(claimWrites).toHaveLength(0)
+      expect(busSent).toHaveLength(0)
+      expect(await res.text()).not.toMatch(/credential_claim|mupot_[0-9a-f]{64}|token_hash/)
+    }
+  })
+
+  it('owner_expiry_request_chooses_exactly_one_explicit_mode', async () => {
+    const owner = [{ member_id: OPERATOR, scope_type: 'org' as const, scope_id: null, capability: 'owner' as const }]
+    expect((await call('mint_agent_token', {
+      agent: AGENT.slug,
+      non_expiring: true,
+    }, makeEnv({ grants: owner }))).status).toBe(200)
+    expect((await call('mint_agent_token', {
+      agent: AGENT.slug,
+      expires_in_days: 30,
+    }, makeEnv({ grants: owner }))).status).toBe(200)
+  })
+
   // mupot#987: mint_agent_token's tool result must never carry the raw token —
   // only a single-use credential_claim, redeemed via reveal_credential_claim.
   async function revealRaw(env: Env, claimId: string): Promise<{ status: number; raw?: string }> {
@@ -332,7 +446,9 @@ describe('Flight-002: mint_agent_token expiry and rotation', () => {
   })
 
   it('mints non-expiring agent token when explicitly requested', async () => {
-    const env = makeEnv()
+    const env = makeEnv({
+      grants: [{ member_id: OPERATOR, scope_type: 'org', scope_id: null, capability: 'owner' }],
+    })
     const res = await call('mint_agent_token', { agent: AGENT.slug, non_expiring: true }, env)
     expect(res.status).toBe(200)
     const body = (await res.json()) as {
@@ -343,12 +459,131 @@ describe('Flight-002: mint_agent_token expiry and rotation', () => {
     expect(revealed.raw).toMatch(/^mupot_/)
   })
 
+  it('refuses non-expiring mint requests from a non-owner before creating a credential claim', async () => {
+    const res = await call('mint_agent_token', { agent: AGENT.slug, non_expiring: true }, makeEnv())
+
+    expect(res.status).toBe(400)
+    const body = await res.text()
+    expect(body).toContain('non_expiring_owner_required')
+    expect(body).not.toMatch(/credential_claim|mupot_|token_hash/)
+  })
+
+  it('refuses zero expiry through the MCP surface before creating a credential claim', async () => {
+    const res = await call('mint_agent_token', { agent: AGENT.slug, expires_in_days: 0 }, makeEnv())
+
+    expect(res.status).toBe(400)
+    const body = await res.text()
+    expect(body).toContain('invalid_expiry')
+    expect(body).not.toMatch(/credential_claim|mupot_|token_hash/)
+  })
+
+  it('blank_or_whitespace_replacement_id_is_refused_without_token_claim_binding_gate_or_bus_effect', async () => {
+    for (const rotate_prior_token_id of ['', '   ']) {
+      const batches: unknown[][] = []
+      const busSent: unknown[] = []
+      const res = await call(
+        'mint_agent_token',
+        { agent: AGENT.slug, rotate_prior_token_id },
+        makeEnv({ batches, busSent }),
+      )
+
+      expect(res.status).toBe(400)
+      expect(await res.text()).toContain('invalid_replacement_token_id')
+      expect(batches).toHaveLength(0)
+      expect(busSent).toHaveLength(0)
+    }
+  })
+
   it('atomically rotates prior token on mint when rotate_prior_token_id provided', async () => {
-    const env = makeEnv()
+    const env = makeEnv({ liveReplacementToken: true, memberBinding: 'member-agent-1' })
     const res = await call('mint_agent_token', { agent: AGENT.slug, rotate_prior_token_id: 'tok-old' }, env)
     expect(res.status).toBe(200)
     const body = (await res.json()) as { result: { structuredContent: { token: { id: string } } } }
     expect(body.result.structuredContent.token.id).toBeDefined()
+  })
+
+  it('replacement_bus_failure_preserves_prior_and_leaves_no_live_replacement', async () => {
+    const busReject = { value: true }
+    const batches: unknown[][] = []
+    const busSent: unknown[] = []
+    const env = makeEnv({
+      liveReplacementToken: true,
+      memberBinding: 'member-agent-1',
+      busReject,
+      batches,
+      busSent,
+    })
+
+    const res = await call('mint_agent_token', { agent: AGENT.slug, rotate_prior_token_id: 'tok-old' }, env)
+
+    expect(res.status).toBe(503)
+    expect(await res.text()).not.toMatch(/credential_claim|mupot_|token_hash/)
+    expect(batches).toHaveLength(1)
+    expect(busSent).toHaveLength(0)
+  })
+
+  it('replacement_claim_failure_preserves_prior_and_leaves_no_live_replacement', async () => {
+    const batches: unknown[][] = []
+    const busSent: unknown[] = []
+    const cancellations: string[] = []
+    const env = makeEnv({
+      liveReplacementToken: true,
+      memberBinding: 'member-agent-1',
+      claimReject: true,
+      batches,
+      busSent,
+      cancellations,
+    })
+
+    const res = await call('mint_agent_token', { agent: AGENT.slug, rotate_prior_token_id: 'tok-old' }, env)
+
+    expect(res.status).toBe(503)
+    expect(await res.text()).not.toMatch(/credential_claim|mupot_|token_hash/)
+    // Reservation then one atomic trigger-backed DELETE cleanup; no claim or bus handoff is emitted.
+    expect(batches).toHaveLength(1)
+    expect(cancellations).toHaveLength(1)
+    expect(busSent).toHaveLength(0)
+  })
+
+  it('replacement_retry_resumes_without_duplicate_live_token_or_audit', async () => {
+    const busReject = { value: true }
+    const batches: unknown[][] = []
+    const busSent: unknown[] = []
+    const env = makeEnv({
+      liveReplacementToken: true,
+      memberBinding: 'member-agent-1',
+      busReject,
+      batches,
+      busSent,
+    })
+    const args = { agent: AGENT.slug, rotate_prior_token_id: 'tok-old' }
+
+    expect((await call('mint_agent_token', args, env)).status).toBe(503)
+    busReject.value = false
+    expect((await call('mint_agent_token', args, env)).status).toBe(200)
+
+    expect(batches).toHaveLength(1)
+    expect(busSent).toHaveLength(1)
+  })
+
+  it('returns the same opaque replacement conflict for a missing or foreign prior token without a claim', async () => {
+    const missing = await call(
+      'mint_agent_token',
+      { agent: AGENT.slug, rotate_prior_token_id: 'missing-prior-token' },
+      makeEnv(),
+    )
+    const foreign = await call(
+      'mint_agent_token',
+      { agent: AGENT.slug, rotate_prior_token_id: 'foreign-prior-token' },
+      makeEnv(),
+    )
+    expect(missing.status).toBe(409)
+    expect(foreign.status).toBe(409)
+    const missingBody = await missing.text()
+    const foreignBody = await foreign.text()
+    expect(missingBody).toBe(foreignBody)
+    expect(missingBody).toContain('replacement_token_unavailable')
+    expect(missingBody).not.toMatch(/credential_claim|mupot_|token_hash/)
   })
 
   it('a claim can only be redeemed once — the second reveal is refused (mupot#987)', async () => {
@@ -362,6 +597,19 @@ describe('Flight-002: mint_agent_token expiry and rotation', () => {
     expect(first.status).toBe(200)
     const second = await revealRaw(env, claimId)
     expect(second.status).toBe(410)
+  })
+
+  it('a discarded replacement claim cannot reveal credential material', async () => {
+    const env = makeEnv()
+    const res = await call('mint_agent_token', { agent: AGENT.slug }, env)
+    const body = (await res.json()) as {
+      result: { structuredContent: { credential_claim: { claim_id: string } } }
+    }
+    const claimId = body.result.structuredContent.credential_claim.claim_id
+
+    await discardCredentialClaim(env, claimId)
+
+    expect((await revealRaw(env, claimId)).status).toBe(410)
   })
 })
 

@@ -608,6 +608,34 @@ describe('mint_agent_token', () => {
     expect(cap.length).toBe(0)
   })
 
+  it('refuses squad-admin rotation before agent lookup without an existence oracle', async () => {
+    const grants: CapabilityGrant[] = [
+      { member_id: 'member-operator', scope_type: 'squad', scope_id: SQUAD.id, capability: 'admin' },
+    ]
+    const cases = [
+      { agent: AGENT.slug, env: makeEnv({ grants }) },
+      { agent: 'ghost', env: makeEnv({ grants, agentExists: false }) },
+      { agent: 'dup', env: makeEnv({ grants }) },
+    ]
+
+    const responses = await Promise.all(cases.map(({ agent, env }) => call(
+      'mint_agent_token',
+      { agent, rotate_prior_token_id: 'opaque-prior-id' },
+      env,
+    )))
+    const bodies = await Promise.all(responses.map((response) => response.json())) as Array<{
+      error: { message: string; data?: unknown }
+    }>
+
+    expect(responses.map((response) => response.status)).toEqual([403, 403, 403])
+    expect(bodies.map((body) => body.error.message)).toEqual(['forbidden', 'forbidden', 'forbidden'])
+    expect(bodies.map((body) => body.error.data)).toEqual([
+      { need: 'admin', scope: 'org' },
+      { need: 'admin', scope: 'org' },
+      { need: 'admin', scope: 'org' },
+    ])
+  })
+
   it('404s when the agent does not exist', async () => {
     const res = await call('mint_agent_token', { agent: 'ghost' }, makeEnv({ agentExists: false }))
     expect(res.status).toBe(404)

@@ -44,6 +44,40 @@ export function nowSqlUtc(): string {
 }
 
 export const DEFAULT_TOKEN_EXPIRY_DAYS = 30
+const MAX_TOKEN_EXPIRY_DAYS = 365
+
+export type AgentTokenExpiryResolution =
+  | { ok: true; expiresAt: string | null }
+  | { ok: false; code: 'invalid_expiry' | 'non_expiring_owner_required' }
+
+/**
+ * Resolve the one expiry policy shared by every agent-token mint surface.
+ *
+ * Missing expiry input receives the standard 30-day lifetime.  Non-expiring
+ * credentials are the explicit owner-only exception; supplying both modes, or a
+ * zero, negative, non-finite, fractional, or excessively long value, is refused
+ * rather than converted to a non-expiring token.
+ */
+export function resolveAgentTokenExpiry(input: {
+  expiresInDays?: number
+  nonExpiring?: boolean
+  allowNonExpiring: boolean
+}): AgentTokenExpiryResolution {
+  if (input.nonExpiring && input.expiresInDays !== undefined) {
+    return { ok: false, code: 'invalid_expiry' }
+  }
+  if (input.nonExpiring) {
+    return input.allowNonExpiring
+      ? { ok: true, expiresAt: null }
+      : { ok: false, code: 'non_expiring_owner_required' }
+  }
+
+  const days = input.expiresInDays ?? DEFAULT_TOKEN_EXPIRY_DAYS
+  if (!Number.isFinite(days) || !Number.isInteger(days) || days < 1 || days > MAX_TOKEN_EXPIRY_DAYS) {
+    return { ok: false, code: 'invalid_expiry' }
+  }
+  return { ok: true, expiresAt: calculateExpiryTimestamp(days) }
+}
 
 /** Calculate a standard SQLite-compatible UTC ISO timestamp given days in the future.
  *  Returns null if days is null or 0 (meaning non-expiring). */

@@ -1998,12 +1998,20 @@ dashboardApp.post('/admin/agent-token/mint', async (c) => {
   }
   const agent = agentResult.value
 
-  const expiresInDaysRaw = typeof form.expires_in_days === 'string' ? Number(form.expires_in_days) : 30
-  let expiresAt: string | null = null
-  if (!isNaN(expiresInDaysRaw) && expiresInDaysRaw > 0) {
-    const { calculateExpiryTimestamp } = await import('../auth/token-lifecycle')
-    expiresAt = calculateExpiryTimestamp(expiresInDaysRaw)
+  const expiresInDays = typeof form.expires_in_days === 'string' ? Number(form.expires_in_days) : undefined
+  const { resolveAgentTokenExpiry } = await import('../auth/token-lifecycle')
+  const expiry = resolveAgentTokenExpiry({
+    expiresInDays,
+    allowNonExpiring: auth.role === 'owner' || hasCapability(auth.capabilities ?? [], 'org', null, 'owner'),
+  })
+  if (!expiry.ok) {
+    const view = await loadAgentTokenView(c.env)
+    return c.html(
+      shell(c.env, 'Mint agent token', agentTokenPageBody(view, 'Expiry must be a whole number from 1 to 365 days.')),
+      400,
+    )
   }
+  const expiresAt = expiry.expiresAt
 
   // Delegate to the shared atomic-mint helper. A first mint creates the member,
   // binding, home capability, and welded token; later mints add only the token.

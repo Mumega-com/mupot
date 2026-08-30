@@ -25,8 +25,8 @@
 //                        redeem via reveal_credential_claim)
 //   register_agent_key — admin on the agent's squad → public-only signed-runtime identity
 
-import type { Capability, CapabilityGrant, Env, BusEvent, Squad } from '../types'
-import { hasCapability } from '../auth/capability'
+import type { Capability, CapabilityGrant, ConnectionChannel, Env, BusEvent, Squad } from '../types'
+import { hasCapability, isOrgAdmin } from '../auth/capability'
 import {
   createDepartment,
   createSquad,
@@ -40,10 +40,30 @@ import type { AgentProfilePatch, UnitConfigPatch } from '../org/service'
 import {
   mintAgentBoundToken,
   isAgentTokenCapability,
+  AgentTokenReplacementError,
+  assertAgentTokenReplacementPriorLive,
+  assertAgentTokenReplacementResumeLive,
+  activateAgentTokenReplacement,
+  cancelAgentTokenReplacementReservation,
+  findAgentTokenReplacementHandoff,
+  markAgentTokenReplacementAuditSent,
+  markAgentTokenReplacementClaimReady,
+  isAgentTokenReplacementClaimReady,
+  recoverExpiredAgentTokenReplacementReservation,
+  loadAgentTokenReplacementMetadata,
+  prepareAgentTokenReplacement,
   resolveAgentMemberBinding,
+  stageAgentTokenReplacement,
+  sha256Hex,
 } from '../members/service'
-import { calculateExpiryTimestamp, DEFAULT_TOKEN_EXPIRY_DAYS } from '../auth/token-lifecycle'
-import { createCredentialClaim, CLAIM_TTL_SECONDS } from '../auth/credential-claim'
+import { resolveAgentTokenExpiry } from '../auth/token-lifecycle'
+import {
+  createCredentialClaim,
+  credentialClaimIsAvailable,
+  discardCredentialClaim,
+  CLAIM_TTL_SECONDS,
+  type CredentialClaimHandle,
+} from '../auth/credential-claim'
 import { revokeMemberToken } from '../members/service'
 import { setAgentSquadAccess, type AgentAccessCapability } from '../members/agent-access'
 import {
@@ -122,6 +142,7 @@ async function emitProvisioned(
     // the change is unreversible from the trail.
     changed?: Record<string, { from: unknown; to: unknown }>
   } = {},
+  strict = false,
 ): Promise<void> {
   const event: BusEvent<{
     kind: string
@@ -155,13 +176,62 @@ async function emitProvisioned(
   // Emit is best-effort: swallow + log, never throw.
   try {
     await createBus(env).emit(event)
-  } catch {
+  } catch (error) {
+    if (strict) throw error
     console.error('provision: org.provisioned emit failed (non-fatal)', {
       tenant: env.TENANT_SLUG,
       kind,
       id,
     })
   }
+}
+
+function agentTokenMintResponse(
+  env: Env,
+  canonicalOrigin: string,
+  agent: { id: string; squad_id: string; slug: string; name: string },
+  token: {
+    id: string
+    memberId: string
+    label: string
+    channel: ConnectionChannel
+    capability: 'observer' | 'member'
+    createdAt: string
+  },
+  credentialClaim: CredentialClaimHandle,
+) {
+  return {
+    token: {
+      id: token.id,
+      member_id: token.memberId,
+      agent_id: agent.id,
+      label: token.label,
+      channel: token.channel,
+      capability: token.capability,
+      created_at: token.createdAt,
+    },
+    credential_claim: credentialClaim,
+    agent: { id: agent.id, slug: agent.slug, name: agent.name },
+    mcp_endpoint: mcpEndpoint(canonicalOrigin),
+    wake_contract: wakeContractForAgent(
+      agent.id,
+      agent.squad_id,
+      env.TENANT_SLUG,
+      canonicalOrigin,
+    ),
+    note:
+      'the raw token is NOT in this result. Call reveal_credential_claim '
+      + `{ claim_id: credential_claim.claim_id } within ${CLAIM_TTL_SECONDS / 60} minutes to redeem it — `
+      + 'exactly once, as this same caller. It is never retrievable again after that.',
+  }
+}
+
+async function discardReplacementHandoff(
+  env: Env,
+  handoff: Parameters<typeof cancelAgentTokenReplacementReservation>[1],
+): Promise<void> {
+  await discardCredentialClaim(env, handoff.claim.claimId)
+  await cancelAgentTokenReplacementReservation(env, handoff)
 }
 
 // Ref resolvers (id-first, slug-with-ambiguity-refusal) are shared in ../org/resolve
@@ -464,6 +534,19 @@ const toolMintAgentToken: ToolSpec = {
     const agentRef = str(args.agent)
     if (!agentRef) return fail(400, 'invalid_args', 'agent required')
 
+    const replacementSupplied = Object.prototype.hasOwnProperty.call(args, 'rotate_prior_token_id')
+    const rotatePriorTokenId = replacementSupplied ? str(args.rotate_prior_token_id) : null
+    // Rotation is an org credential-authority act. This server-derived gate is
+    // deliberately before agent resolution and every token/handoff lookup so a
+    // scoped admin receives one uniform denial for existing, missing, and
+    // ambiguous targets.
+    if (replacementSupplied && !isOrgAdmin(auth)) {
+      return fail(403, 'forbidden', { need: 'admin', scope: 'org' })
+    }
+    if (replacementSupplied && !rotatePriorTokenId) {
+      return fail(400, 'invalid_replacement_token_id')
+    }
+
     const agentResult = await resolveAgentRef(env, agentRef)
     if (!agentResult.ok) return resolveFail(agentResult.reason, 'agent_not_found')
     const agent = agentResult.value
@@ -485,22 +568,161 @@ const toolMintAgentToken: ToolSpec = {
       return fail(400, 'invalid_capability', 'capability must be observer or member')
     }
 
-    // Flight-002: Expiry resolution (default 30 days, unless non_expiring=true is explicitly requested)
-    let expiresAt: string | null = null
-    const nonExpiring = Boolean(args.non_expiring)
-    if (!nonExpiring) {
-      const days = typeof args.expires_in_days === 'number' && args.expires_in_days > 0
-        ? Math.min(Math.max(args.expires_in_days, 1), 365)
-        : DEFAULT_TOKEN_EXPIRY_DAYS
-      expiresAt = calculateExpiryTimestamp(days)
-    }
-
-    const rotatePriorTokenId = str(args.rotate_prior_token_id) ?? null
+    const expiry = resolveAgentTokenExpiry({
+      expiresInDays: args.expires_in_days as number | undefined,
+      nonExpiring: args.non_expiring === true,
+      allowNonExpiring: hasCapability(grants, 'org', null, 'owner'),
+    })
+    if (!expiry.ok) return fail(400, expiry.code)
+    const expiresAt = expiry.expiresAt
 
     const canonical = requiredCanonicalOrigin(env)
     if (!canonical.ok) return fail(503, canonical.error)
 
-    // Delegate to the shared atomic-mint helper (members/service.ts).
+    // Rotations use a durable pending handoff.  D1 cannot transact with KV or the
+    // queue, so the replacement stays revoked and the prior stays live until both
+    // claim and audit handoffs have succeeded; activation is then one D1 trigger.
+    if (rotatePriorTokenId) {
+      let handoff = await findAgentTokenReplacementHandoff(env, agent.id, rotatePriorTokenId)
+      if (handoff && handoff.claim.mintedByMemberId !== auth.memberId) {
+        return fail(409, 'replacement_token_unavailable')
+      }
+      if (!handoff) {
+        let prepared
+        try {
+          prepared = await prepareAgentTokenReplacement(env, agent, label, {
+            grantCapability,
+            expiresAt,
+            revokePriorTokenId: rotatePriorTokenId,
+          })
+          // Election/reservation is D1-only and occurs before any revealable KV
+          // claim. A concurrent loser therefore has no claim to retain or reveal.
+          const claimId = crypto.randomUUID()
+          const claimExpiresAt = new Date(Date.now() + CLAIM_TTL_SECONDS * 1000).toISOString()
+          handoff = await stageAgentTokenReplacement(env, agent, prepared, {
+            claimId,
+            fingerprint: (await sha256Hex(prepared.raw)).slice(0, 16),
+            expiresAt: claimExpiresAt,
+            mintedByMemberId: auth.memberId as string,
+          })
+        } catch (err) {
+          if (err instanceof AgentTokenReplacementError) return fail(409, 'replacement_token_unavailable')
+          return fail(503, 'replacement_handoff_unavailable')
+        }
+        let claimCreated = false
+        try {
+          await createCredentialClaim(env, prepared.raw, auth.memberId as string, handoff.claim.claimId)
+          claimCreated = true
+          await markAgentTokenReplacementClaimReady(env, handoff.id)
+        } catch {
+          try {
+            // A successful claim put is the only durable copy of the raw
+            // replacement. If mark-ready failed transiently, keep both the
+            // pending reservation and claim so retry can finish the handoff.
+            // If a racing request already removed this exact reservation while
+            // the KV put was in flight, the late claim is orphaned and must be
+            // burned instead. Only a failed claim creation may safely cancel a
+            // reservation that is still present.
+            if (claimCreated) {
+              const durable = await findAgentTokenReplacementHandoff(env, agent.id, rotatePriorTokenId)
+              if (!durable || durable.id !== handoff.id) {
+                await discardCredentialClaim(env, handoff.claim.claimId)
+              }
+            } else {
+              await cancelAgentTokenReplacementReservation(env, handoff)
+            }
+          } catch {
+            // The reservation remains inactive and retryable; it never revokes the prior.
+          }
+          return fail(503, 'replacement_handoff_unavailable')
+        }
+      }
+
+      try {
+        try {
+          await assertAgentTokenReplacementResumeLive(env, handoff)
+        } catch (error) {
+          if (!(error instanceof AgentTokenReplacementError)) throw error
+          await discardReplacementHandoff(env, handoff)
+          return fail(409, 'replacement_token_unavailable')
+        }
+        // D1 readiness records that claim creation completed once; it does not
+        // prove the one-time KV claim is still revealable on this retry. Check
+        // the live cross-system boundary before every audit attempt. If it has
+        // expired or been consumed, burn the key idempotently and discard only
+        // the inactive reservation so a later request can elect
+        // one fresh replacement while the prior remains live.
+        const claimReady = await isAgentTokenReplacementClaimReady(env, handoff.id)
+        if (!(await credentialClaimIsAvailable(env, handoff.claim.claimId, auth.memberId as string))) {
+          // A pending D1 state may still have its KV put in flight. Only a
+          // durable-ready claim that has since disappeared is stale enough to
+          // discard; an in-flight claim remains reserved and retryable.
+          if (claimReady) {
+            await discardReplacementHandoff(env, handoff)
+          } else {
+            // Before the durable put lease expires, absence may mean the KV put
+            // is still in flight, so fail closed without touching the winner.
+            // After expiry, one exact DELETE CAS reclaims the reservation and
+            // its inactive token atomically; concurrent retries are no-ops.
+            await recoverExpiredAgentTokenReplacementReservation(env, handoff)
+          }
+          return fail(503, 'replacement_handoff_pending')
+        }
+        if (!claimReady) {
+          await markAgentTokenReplacementClaimReady(env, handoff.id)
+        }
+        if (handoff.auditState === 'pending') {
+          try {
+            await assertAgentTokenReplacementPriorLive(env, handoff)
+          } catch (error) {
+            if (!(error instanceof AgentTokenReplacementError)) throw error
+            await discardReplacementHandoff(env, handoff)
+            return fail(409, 'replacement_token_unavailable')
+          }
+          await emitProvisioned(env, auth.memberId as string, 'token', handoff.replacementTokenId, {
+            squad_id: agent.squad_id,
+            agent_id: agent.id,
+            receipt_id: handoff.id,
+            reason: 'replacement_handoff_pending',
+          }, true)
+          if (!(await credentialClaimIsAvailable(env, handoff.claim.claimId, auth.memberId as string))) {
+            await discardReplacementHandoff(env, handoff)
+            return fail(503, 'replacement_handoff_pending')
+          }
+          handoff = await markAgentTokenReplacementAuditSent(env, handoff.id)
+        }
+        if (!(await credentialClaimIsAvailable(env, handoff.claim.claimId, auth.memberId as string))) {
+          await discardReplacementHandoff(env, handoff)
+          return fail(503, 'replacement_handoff_pending')
+        }
+        if (handoff.state === 'pending') handoff = await activateAgentTokenReplacement(env, handoff.id)
+      } catch (err) {
+        if (err instanceof AgentTokenReplacementError) return fail(409, 'replacement_token_unavailable')
+        return fail(503, 'replacement_handoff_pending')
+      }
+
+      let persisted
+      try {
+        persisted = await loadAgentTokenReplacementMetadata(env, handoff.id)
+      } catch {
+        return fail(503, 'replacement_handoff_pending')
+      }
+      return done(agentTokenMintResponse(env, canonical.origin, agent, {
+        id: handoff.replacementTokenId,
+        memberId: handoff.memberId,
+        label: persisted.label,
+        channel: persisted.channel,
+        capability: persisted.capability,
+        createdAt: persisted.createdAt,
+      }, {
+        claim_id: handoff.claim.claimId,
+        fingerprint: handoff.claim.fingerprint,
+        expires_at: handoff.claim.expiresAt,
+        reveal_tool: 'reveal_credential_claim',
+      }))
+    }
+
+    // Delegate ordinary mints to the shared atomic helper (members/service.ts).
     let minted
     try {
       minted = await mintAgentBoundToken(env, agent, label, {
@@ -509,6 +731,9 @@ const toolMintAgentToken: ToolSpec = {
         revokePriorTokenId: rotatePriorTokenId,
       })
     } catch (err) {
+      if (err instanceof AgentTokenReplacementError) {
+        return fail(409, 'replacement_token_unavailable')
+      }
       if (err instanceof Error && err.message.startsWith('agent_home_capability_missing')) {
         return fail(409, 'agent_home_capability_missing', {
           detail: 'canonical agent member has no home-squad grant; grant one before minting',
@@ -539,30 +764,14 @@ const toolMintAgentToken: ToolSpec = {
     // bus HTTP surface. Returned alongside mcp_endpoint so the operator has the full
     // self-serve picture in one flow — no manual tmux or shell access required.
     const credentialClaim = await createCredentialClaim(env, minted.raw, auth.memberId as string)
-    return done({
-      token: {
-        id: minted.tokenId,
-        member_id: minted.memberId,
-        agent_id: agent.id,
-        label,
-        channel: 'workspace',
-        capability: minted.grantCapability,
-        created_at: minted.createdAt,
-      },
-      credential_claim: credentialClaim,
-      agent: { id: agent.id, slug: agent.slug, name: agent.name },
-      mcp_endpoint: mcpEndpoint(canonical.origin),
-      wake_contract: wakeContractForAgent(
-        agent.id,
-        agent.squad_id,
-        env.TENANT_SLUG,
-        canonical.origin,
-      ),
-      note:
-        'the raw token is NOT in this result. Call reveal_credential_claim '
-        + `{ claim_id: credential_claim.claim_id } within ${CLAIM_TTL_SECONDS / 60} minutes to redeem it — `
-        + 'exactly once, as this same caller. It is never retrievable again after that.',
-    })
+    return done(agentTokenMintResponse(env, canonical.origin, agent, {
+      id: minted.tokenId,
+      memberId: minted.memberId,
+      label: minted.label,
+      channel: 'workspace',
+      capability: minted.grantCapability,
+      createdAt: minted.createdAt,
+    }, credentialClaim))
   },
 }
 
