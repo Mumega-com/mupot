@@ -9,12 +9,18 @@
 - **v0.30.0 stabilization candidate:** PR #1239 landed as merge commit
   `f3389d65172b9660efaa82999675739046a987e9`, restoring a green main migration,
   typecheck, full-suite, schema-source, no-secrets, and local-evidence baseline.
-- **Athena-GREEN, not yet landed:** PR #1243 (credential-rotation recovery) and
-  PR #1242 (router/loop/meter authorization). Each must be refreshed against the
-  preceding merged main before it can enter the stable release candidate.
-- **Still required for the stable candidate:** revalidate/reconstruct the message
-  reliability work in #1235, #1237, and #1241; close or explicitly defer obsolete
-  PRs; run the exact release gate recorded in [ROADMAP.md](ROADMAP.md).
+- **Landed stabilization train:** PR #1243 (`8be1cac7`, credential rotation),
+  PR #1242 (`fb10d79b`, router/loop/meter authorization), PR #1237
+  (`b980f565`, immutable message integrity), PR #1245 (`31644899`, addon binding
+  ordering), and PR #1235 (`4d41d9bd`, guest-squad send visibility) are on main
+  with post-merge CI and CodeQL evidence.
+- **Athena-GREEN, not yet landed:** PR #1241 at exact head `92ddd540` exposes a
+  strictly validated, peek-only MCP inbox cursor. It remains draft pending Hadi's
+  separate merge approval and is not counted as shipped.
+- **Still required for the stable candidate:** resolve #1241, close or explicitly
+  defer obsolete PRs, collect the fresh receipts in
+  [the v0.30.0 release contract](docs/releases/v0.30.0.md), and pass the exact
+  release gate recorded in [ROADMAP.md](ROADMAP.md).
 - **Release-excluded:** the #1236 omnibus, project-worker/sandbox expansion, device
   fleet, new onboarding journeys, and other unbounded feature work. Useful donor
   material must return through separate reviewed PRs after `v0.30.0`.
@@ -29,7 +35,7 @@ No entry in this section claims a deployment. Tagging, publishing, and deploying
   - Model prompts use a frozen static prefix (charter, architecture, tool schemas, River governance) with dynamic turns at the bottom, plus a keep-alive heartbeat.
   - D1 registers River on `squad-core` (`gemini-3.7-flash`) when that squad exists; `check_in` records 7-axis presence for `seat: river-cursor`.
 
-## 0.30.0 source cut — 2026-08-21 (preview; not tagged)
+## [0.30.0] — source cut 2026-08-21 (release candidate; not tagged)
 
 This heading records when the source version advanced to `0.30.0`. It is not a
 stable-release date. Features listed here remain preview until the stabilization

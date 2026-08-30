@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Mupot v0.23 release-integrity evidence checker.
+// Mupot release-integrity evidence checker.
 //
 // This runs after the real release blockers pass. It keeps the final publish
 // step falsifiable by checking local release metadata plus exported GitHub
@@ -7,13 +7,13 @@
 
 import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { basename, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 export const CHECK_RECEIPT_TYPE = 'mupot-release-integrity/v1'
 
-const DEFAULT_VERSION = 'v0.23.0'
+const DEFAULT_VERSION = `v${JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version}`
 const DEFAULT_REPO = 'Mumega-com/mupot'
 
 const SECRET_VALUE_PATTERNS = [
@@ -71,7 +71,7 @@ export function usage() {
     '  --plan                    print the final release-integrity evidence plan',
     '  --check                   check local metadata plus GitHub evidence JSON',
     '  --summary                 with --check, print a compact text summary',
-    '  --version <version>       expected final version; default v0.23.0',
+    '  --version <version>       expected final version; default current package version',
     '  --repo <owner/repo>       GitHub repo; default Mumega-com/mupot',
     '  --repo-root <path>        local repo root; default cwd',
     '  --out-dir <path>          evidence directory',
@@ -100,7 +100,7 @@ export function normalizeVersion(version) {
   const raw = String(version || '').trim()
   const semver = raw.replace(/^v/i, '')
   if (!/^\d+\.\d+\.\d+$/.test(semver)) {
-    throw new Error(`expected a final semver release like v0.23.0, got ${version}`)
+    throw new Error(`expected a final semver release like v1.2.3, got ${version}`)
   }
   return { semver, tag: `v${semver}` }
 }
@@ -114,12 +114,12 @@ export function formatPlan(opts = {}) {
   const tagPath = join(outDir, 'github-tag.json')
   const lines = []
 
-  lines.push('Mupot v0.23 release-integrity evidence plan')
+  lines.push(`Mupot ${tag} release-integrity evidence plan`)
   lines.push('')
   lines.push(`Goal: prove package version, public API version, changelog, roadmap, Git tag, milestone, and GitHub Release all agree on ${tag}.`)
   lines.push('')
   lines.push('Run only after the prepublication readiness receipt passes and the exact release commit is tagged and published.')
-  lines.push('Remove release-control trackers #281, #284, and #345 from the product milestone, then close that milestone only after its product-objective issue count reaches zero.')
+  lines.push('Move release-control trackers outside the product milestone, then close that milestone only after its product-objective issue count reaches zero.')
   lines.push('')
   lines.push(commandLine(['mkdir', '-p', outDir]))
   lines.push('')
@@ -227,6 +227,16 @@ function repoPath(repoRoot, path) {
   return join(repoRoot, path)
 }
 
+function releaseDocumentPath(repoRoot, tag) {
+  const releaseDir = repoPath(repoRoot, 'docs/releases')
+  const canonical = join(releaseDir, `${tag}.md`)
+  if (existsSync(canonical) || !existsSync(releaseDir)) return canonical
+  const compatible = readdirSync(releaseDir)
+    .filter((name) => name.startsWith(`${tag}-`) && name.endsWith('.md'))
+    .sort()
+  return compatible.length === 1 ? join(releaseDir, compatible[0]) : canonical
+}
+
 function extractPublicApiVersion(versionSource) {
   const match = versionSource.match(/MUPOT_PUBLIC_API_VERSION\s*=\s*['"]([^'"]+)['"]/)
   return match ? match[1] : ''
@@ -272,7 +282,7 @@ export function checkBundle(opts = {}) {
   const mcpPath = repoPath(repoRoot, 'src/mcp/index.ts')
   const changelogPath = repoPath(repoRoot, 'CHANGELOG.md')
   const roadmapPath = repoPath(repoRoot, 'ROADMAP.md')
-  const releaseDocPath = repoPath(repoRoot, 'docs/releases/v0.23.0-trusted-runtime.md')
+  const releaseDocPath = releaseDocumentPath(repoRoot, tag)
 
   const packageText = readText(checks, packagePath, 'package')
   const packageLockText = readText(checks, packageLockPath, 'package_lock')
@@ -415,9 +425,9 @@ export function checkBundle(opts = {}) {
     artifacts,
     checks,
     next_steps: failed.length === 0
-      ? ['attach release-integrity-check.json to #281, close #281, then run final release readiness']
+      ? ['attach release-integrity-check.json to the release tracker, then run final release readiness']
       : milestoneState !== 'closed' || milestoneOpenIssues !== 0
-        ? ['remove release-control trackers #281, #284, and #345 from the product milestone, close the zero-open product milestone, then rerun']
+        ? ['move release-control trackers outside the product milestone, close the zero-open product milestone, then rerun']
         : ['align failing release metadata, export fresh GitHub milestone/release JSON, then rerun release-integrity-receipt --check'],
   }
 }

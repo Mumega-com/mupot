@@ -34,6 +34,33 @@ const HOST_BASE_URL = 'https://pot.example.org'
 const HOST_TENANT = 'tenant-a'
 const RELEASE_SHA = 'a'.repeat(40)
 
+function v030Contract() {
+  return {
+    schema_version: 1,
+    version: 'v0.30.0',
+    name: 'Stabilized Control Plane',
+    receipt_types: {
+      prepublication: 'mupot-v030-prepublication-readiness/v1',
+      final: 'mupot-v030-release-readiness/v1',
+    },
+    receipts: [
+      ...REQUIRED_RECEIPTS.map((receipt) => ({
+        objective: receipt.objective,
+        file: receipt.file,
+        receipt_type: receipt.receipt_type,
+        phases: receipt.file === 'release-integrity-check.json' ? ['final'] : ['prepublication', 'final'],
+      })),
+      {
+        objective: 11,
+        file: 'stable-deployment-check.json',
+        receipt_type: 'mupot-stable-deployment/v1',
+        phases: ['prepublication', 'final'],
+      },
+    ],
+    issues: [],
+  }
+}
+
 function hostProbeReceipt() {
   return {
     receipt_type: 'mupot-fleet-cutover-probe/v1',
@@ -213,6 +240,70 @@ describe('release readiness receipt checker', () => {
     expect(parseArgs(['--plan', '--checks-pr', '285']).checksPr).toBe('285')
     expect(parseArgs(['--plan', '--release-sha', RELEASE_SHA]).releaseSha).toBe(RELEASE_SHA)
     expect(parseArgs(['--plan', '--phase', 'prepublication']).phase).toBe('prepublication')
+    expect(parseArgs(['--plan', '--contract', 'docs/releases/v0.30.0-contract.json']).contractPath)
+      .toContain('docs/releases/v0.30.0-contract.json')
+  })
+
+  it('builds a v0.30 plan from an explicit release contract without legacy issue trackers', () => {
+    const plan = formatPlan({
+      outDir: 'tmp/release-readiness/v0.30.0',
+      version: 'v0.30.0',
+      repo: 'Mumega-com/mupot',
+      checksPr: '1249',
+      releaseSha: RELEASE_SHA,
+      phase: 'prepublication',
+      contract: v030Contract(),
+    })
+
+    expect(plan).toContain('Mupot v0.30.0 prepublication-readiness evidence plan')
+    expect(plan).toContain('stable-deployment-check.json')
+    expect(plan).not.toContain('issue #')
+    expect(plan).not.toContain('github-issues.json')
+    expect(plan).not.toContain('#274')
+  })
+
+  it('checks v0.30 evidence from the explicit contract without requiring legacy tracker issues', async () => {
+    const dir = tempDir()
+    await writeBundle(dir)
+    writeJson(join(dir, 'stable-deployment-check.json'), {
+      receipt_type: 'mupot-stable-deployment/v1',
+      status: 'pass',
+      target: { version: 'v0.30.0', commit: RELEASE_SHA },
+    })
+
+    const receipt = checkBundle({
+      outDir: dir,
+      version: 'v0.30.0',
+      checksPr: '285',
+      releaseSha: RELEASE_SHA,
+      phase: 'final',
+      contract: v030Contract(),
+    })
+
+    expect(receipt.receipt_type).toBe('mupot-v030-release-readiness/v1')
+    expect(receipt.status).toBe('pass')
+    expect(receipt.version).toBe('v0.30.0')
+    expect(receipt.summary.required_issues).toBe(0)
+    expect(receipt.required.issues).toEqual([])
+    expect(receipt.checks).not.toContainEqual(expect.objectContaining({ label: 'github_issues' }))
+  })
+
+  it('fails closed when a release contract contains an unknown field', () => {
+    expect(() => formatPlan({
+      version: 'v0.30.0',
+      phase: 'prepublication',
+      contract: { ...v030Contract(), required_issues: [] },
+    })).toThrow(/unknown field required_issues/)
+  })
+
+  it.each([
+    ['issue', '151', /receipts\[0\]\.issue invalid/],
+    ['objective', { name: 'install' }, /receipts\[0\]\.objective invalid/],
+  ])('fails closed when a release-contract receipt has malformed %s', (field, value, expected) => {
+    const contract = v030Contract()
+    contract.receipts[0] = { ...contract.receipts[0], [field]: value }
+
+    expect(() => formatPlan({ version: 'v0.30.0', contract })).toThrow(expected)
   })
 
   it('prints the final release-readiness evidence plan', () => {
@@ -224,8 +315,8 @@ describe('release readiness receipt checker', () => {
       releaseSha: RELEASE_SHA,
     })
 
-    expect(plan).toContain('Mupot v0.23 final release-readiness evidence plan')
-    expect(plan).toContain('complete exported #274 attachable directory')
+    expect(plan).toContain('Mupot v0.23.0 final release-readiness evidence plan')
+    expect(plan).toContain('complete exported host attachment directory')
     expect(plan).toContain('reruns the read-only fleet manifest verifier')
     expect(plan).toContain('fresh-install-check.json')
     expect(plan).toContain('github-issues.json')
