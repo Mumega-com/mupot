@@ -1,7 +1,7 @@
 // src/alerts/dispatcher.ts — Outbound Customer Webhook Dispatcher & Multi-Channel Alert Router.
 
 import type { Env } from '../types'
-import { getJSON, setJSON } from '../dashboard/settings'
+import { getJSON } from '../dashboard/settings'
 
 export type AlertChannelType = 'generic' | 'slack' | 'discord'
 

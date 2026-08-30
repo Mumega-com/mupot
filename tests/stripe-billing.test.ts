@@ -1,6 +1,6 @@
 // tests/stripe-billing.test.ts — Unit tests for Stripe Checkout, Customer Portal & Subscription Webhook Engine (Flight 7).
 
-import { describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   createStripeCheckout,
   createStripePortal,
@@ -9,8 +9,18 @@ import {
   TIER_PRICING,
 } from '../src/billing/stripe'
 import { billingRoutesApp } from '../src/billing/routes'
+import type { Env } from '../src/types'
+import { applyAllMigrations } from './helpers/migrations'
+import { createSqliteD1 } from './helpers/sqlite-d1'
 
 describe('Stripe Checkout & Subscription Billing Engine (Flight 7)', () => {
+  let harness: ReturnType<typeof createSqliteD1>
+
+  beforeEach(() => {
+    vi.restoreAllMocks()
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+  })
   it('defines pricing for starter, pro, and scale tiers', () => {
     expect(TIER_PRICING.starter.monthlyCents).toBe(4900)
     expect(TIER_PRICING.pro.monthlyCents).toBe(9900)
@@ -29,14 +39,15 @@ describe('Stripe Checkout & Subscription Billing Engine (Flight 7)', () => {
       json: async () => mockSession,
     }) as unknown as typeof fetch
 
-    const mockEnv = {
+    const env = {
       STRIPE_SECRET_KEY: 'sk_test_placeholder_key_example',
       TENANT_SLUG: 'gaf',
       BRAND: 'GAF Materials',
-    }
+      DB: harness.db,
+    } as unknown as Env
 
     const result = await createStripeCheckout(
-      mockEnv as any,
+      env,
       {
         tier: 'scale',
         interval: 'month',
@@ -71,12 +82,13 @@ describe('Stripe Checkout & Subscription Billing Engine (Flight 7)', () => {
       json: async () => mockPortal,
     }) as unknown as typeof fetch
 
-    const mockEnv = {
+    const env = {
       STRIPE_SECRET_KEY: 'sk_test_placeholder_key_example',
-    }
+      DB: harness.db,
+    } as unknown as Env
 
     const result = await createStripePortal(
-      mockEnv as any,
+      env,
       'cus_test_123',
       'https://gaf.mupot.mumega.com',
       mockFetch,
@@ -135,42 +147,33 @@ describe('Stripe Checkout & Subscription Billing Engine (Flight 7)', () => {
       },
     }
 
-    const mockEnv = {
+    const env = {
       TENANT_SLUG: 'gaf',
       BUS: {
         send: vi.fn().mockResolvedValue(undefined),
       },
-      DB: {
-        prepare: vi.fn().mockReturnValue({
-          bind: vi.fn().mockReturnValue({
-            first: vi.fn().mockResolvedValue(null),
-            run: vi.fn().mockResolvedValue({ meta: { changes: 1 } }),
-          }),
-        }),
-      },
-    }
+      DB: harness.db,
+    } as unknown as Env
 
-    const result = await handleStripeWebhookEvent(mockEnv as any, event)
+    const result = await handleStripeWebhookEvent(env, event)
     expect(result.ok).toBe(true)
     expect(result.action).toBe('upgraded')
     expect(result.tier).toBe('scale')
   })
 
   it('serves GET /api/billing/status with current tier and features', async () => {
-    const mockEnv = {
+    await harness.db.prepare(
+      `INSERT INTO org_settings (key, value, updated_at)
+       VALUES ('billing_state', ?1, CURRENT_TIMESTAMP)`,
+    ).bind(JSON.stringify({ tier: 'scale' })).run()
+    const env = {
       TENANT_SLUG: 'gaf',
       BRAND: 'GAF Materials',
-      DB: {
-        prepare: vi.fn().mockReturnValue({
-          bind: vi.fn().mockReturnValue({
-            first: vi.fn().mockResolvedValue({ value: JSON.stringify({ tier: 'scale' }) }),
-          }),
-        }),
-      },
-    }
+      DB: harness.db,
+    } as unknown as Env
 
     const req = new Request('http://localhost/status')
-    const res = await billingRoutesApp.fetch(req, mockEnv as any)
+    const res = await billingRoutesApp.fetch(req, env)
     expect(res.status).toBe(200)
 
     const json = await res.json<{ ok: boolean; tier: string; brand: string }>()

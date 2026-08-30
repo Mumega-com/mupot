@@ -293,7 +293,7 @@ export function parseCopilotChatBody(
 }
 
 export function copilotSseResponse(
-  env: Env,
+  _env: Env,
   body: { message: string; recipient?: string; history?: Array<{ role: 'user' | 'assistant'; content: string }> },
   modelFn: (messages: ModelMessage[]) => Promise<string>,
   role: CopilotAuthority = 'member',

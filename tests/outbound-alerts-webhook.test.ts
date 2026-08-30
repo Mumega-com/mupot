@@ -1,6 +1,6 @@
 // tests/outbound-alerts-webhook.test.ts — Unit tests for Outbound Webhook & Multi-Channel Alert Router (Flight 10).
 
-import { describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   signWebhookPayload,
   formatSlackPayload,
@@ -8,8 +8,18 @@ import {
   dispatchOutboundAlert,
 } from '../src/alerts/dispatcher'
 import { alertsApp } from '../src/alerts/routes'
+import type { Env } from '../src/types'
+import { applyAllMigrations } from './helpers/migrations'
+import { createSqliteD1 } from './helpers/sqlite-d1'
 
 describe('Outbound Customer Webhooks & Multi-Channel Alert Router (Flight 10)', () => {
+  let harness: ReturnType<typeof createSqliteD1>
+
+  beforeEach(() => {
+    vi.restoreAllMocks()
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+  })
   it('computes valid HMAC SHA-256 signature for webhook payloads', async () => {
     const payload = JSON.stringify({ event: 'flight.landed', tenant: 'gaf' })
     const secret = 'placeholder-webhook-secret-key'
@@ -55,20 +65,17 @@ describe('Outbound Customer Webhooks & Multi-Channel Alert Router (Flight 10)', 
       created_at: new Date().toISOString(),
     }
 
-    const mockEnv = {
+    await harness.db.prepare(
+      `INSERT INTO org_settings (key, value, updated_at)
+       VALUES ('alert_webhooks', ?1, CURRENT_TIMESTAMP)`,
+    ).bind(JSON.stringify([mockSub])).run()
+    const env = {
       TENANT_SLUG: 'gaf',
-      DB: {
-        prepare: vi.fn().mockReturnValue({
-          bind: vi.fn().mockReturnValue({
-            first: vi.fn().mockResolvedValue({ value: JSON.stringify([mockSub]) }),
-            run: vi.fn().mockResolvedValue({ meta: { changes: 1 } }),
-          }),
-        }),
-      },
-    }
+      DB: harness.db,
+    } as unknown as Env
 
     const results = await dispatchOutboundAlert(
-      mockEnv as any,
+      env,
       {
         eventId: 'evt_123',
         eventType: 'flight.landed',
@@ -90,43 +97,24 @@ describe('Outbound Customer Webhooks & Multi-Channel Alert Router (Flight 10)', 
   })
 
   it('handles REST API subscription lifecycle: list, create, and test ping', async () => {
-    let storedSubs: any[] = []
-
-    const mockEnv = {
+    const env = {
       TENANT_SLUG: 'gaf',
       PUBLIC_ORIGIN: 'https://gaf.mupot.mumega.com',
-      DB: {
-        prepare: vi.fn((sql: string) => ({
-          bind: vi.fn((...args: any[]) => ({
-            first: vi.fn().mockImplementation(async () => {
-              if (sql.includes('SELECT')) {
-                return { value: JSON.stringify(storedSubs) }
-              }
-              return null
-            }),
-            run: vi.fn().mockImplementation(async () => {
-              if (sql.includes('INSERT') || sql.includes('UPDATE')) {
-                storedSubs = JSON.parse(args[1] || '[]')
-              }
-              return { meta: { changes: 1 } }
-            }),
-          })),
-        })),
-      },
-    }
+      DB: harness.db,
+    } as unknown as Env
 
     // 1. Create Webhook
     const createReq = new Request('http://localhost/webhooks', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        url: 'https://hooks.slack.com/services/T00/B00/placeholder',
+        url: 'https://webhook.site/test-endpoint',
         channel_type: 'slack',
         events: ['flight.landed'],
       }),
     })
 
-    const createRes = await alertsApp.fetch(createReq, mockEnv as any)
+    const createRes = await alertsApp.fetch(createReq, env)
     expect(createRes.status).toBe(200)
     const createJson = await createRes.json<{ ok: boolean; webhook: any }>()
     expect(createJson.ok).toBe(true)
@@ -134,7 +122,9 @@ describe('Outbound Customer Webhooks & Multi-Channel Alert Router (Flight 10)', 
 
     // 2. List Webhooks
     const listReq = new Request('http://localhost/webhooks')
-    const listRes = await alertsApp.fetch(listReq, mockEnv as any)
+    const listRes = await alertsApp.fetch(listReq, env)
     expect(listRes.status).toBe(200)
+    const listJson = await listRes.json<{ ok: boolean; webhooks: unknown[] }>()
+    expect(listJson.webhooks).toHaveLength(1)
   })
 })

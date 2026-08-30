@@ -8,7 +8,7 @@ import {
   executeSupabaseMutation,
   type SupabaseConfig,
 } from '../connectors/supabase'
-import { listConnectors, resolveConnector } from '../connectors/service'
+import { resolveConnector } from '../connectors/service'
 
 export const studioDataApp = new Hono<{ Bindings: Env; Variables: { auth?: AuthContext } }>()
 

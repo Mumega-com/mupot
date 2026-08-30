@@ -62,7 +62,7 @@ export function controlTowerBody(cards: DepartureCard[]): Html {
     ${raw(table)}`
 }
 
-function axisBadge(label: string, value: string | null | undefined, tone: 'primary' | 'ok' | 'warn' | 'dim' | 'accent2' = 'dim'): string {
+function axisBadge(label: string, value: string | null | undefined, _tone: 'primary' | 'ok' | 'warn' | 'dim' | 'accent2' = 'dim'): string {
   if (!value) return ''
   return `<span class="axis-badge axis-${escAttr(label.toLowerCase())}" data-axis="${escAttr(label.toLowerCase())}" title="${escHtml(label)}">${escHtml(value)}</span>`
 }

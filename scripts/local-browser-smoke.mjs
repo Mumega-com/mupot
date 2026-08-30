@@ -387,9 +387,14 @@ async function runProjectWorkspaceWorkflow() {
     fail('project task context did not render an authorized picker', { projectSendText })
   }
   await page.goto(`${baseUrl}/flights?project_id=project-mupot`, { waitUntil: 'networkidle', timeout: 20_000 })
-  const projectFlightsText = await textSnippet(page.locator('body'), 3000)
-  if (!projectFlightsText.includes('Flights attributed to Mupot') || !projectFlightsText.includes('Run local browser smoke')) {
-    fail('project flight context did not render filtered flights', { projectFlightsText })
+  const projectFlightCrumbs = (await page.locator('#fd-deck p.crumbs').textContent())?.trim()
+  const projectFlightRows = await page.locator('#fd-board').getByText('Run local browser smoke', { exact: true }).count()
+  if (projectFlightCrumbs !== 'Projects / Mupot / Flights' || projectFlightRows !== 1) {
+    fail('project flight context did not render filtered flights', {
+      projectFlightCrumbs,
+      projectFlightRows,
+      projectFlightsText: await textSnippet(page.locator('body'), 3000),
+    })
   }
 
   await page.goto(`${baseUrl}/projects/new`, { waitUntil: 'networkidle', timeout: 20_000 })

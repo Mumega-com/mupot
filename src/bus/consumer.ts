@@ -482,6 +482,24 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
           throw new Error(`message.created delivery failed: ${outcome.kind}`)
       }
     }
+    case 'member.auto_enrolled':
+    case 'billing.subscription.created':
+    case 'billing.subscription.deleted':
+    case 'pot.self_serve_provisioned':
+    case 'routine.run.started':
+    case 'supabase.record.insert':
+    case 'supabase.record.update':
+    case 'supabase.record.delete': {
+      // These producers have already committed their durable effect before
+      // publishing. This consumer records and acknowledges the observation
+      // without replaying the originating mutation.
+      console.log(`bus: ${event.type}`, {
+        tenant: event.tenant,
+        squad_id: event.squad_id,
+        agent_id: event.agent_id,
+      })
+      return true
+    }
     default: {
       // Exhaustiveness guard. Unknown types are acked (not retried) to avoid
       // poisoning the queue with events we will never understand.

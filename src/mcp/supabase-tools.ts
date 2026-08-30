@@ -2,6 +2,7 @@
 
 import type { ToolSpec } from './index'
 import { fail, done, str, hasWorkspaceAdmin, memberCanOnSquad } from './index'
+import type { AuthContext, Env } from '../types'
 import {
   introspectSupabaseSchema,
   executeSupabaseQuery,
@@ -21,12 +22,12 @@ const OPTIONAL_STRING_SCHEMA = { type: 'string' }
 const OBJECT_SCHEMA = { type: 'object' }
 
 async function resolveSupabaseCredentials(
-  env: any,
-  auth: any,
+  env: Env,
+  _auth: AuthContext,
   connectorId?: string,
 ): Promise<SupabaseConfig | null> {
   if (connectorId) {
-    const raw = await resolveConnector(env, connectorId)
+    const raw = await resolveConnector(env, connectorId, 'supabase')
     if (!raw) return null
     try {
       const parsed = JSON.parse(raw)
@@ -37,11 +38,11 @@ async function resolveSupabaseCredentials(
   }
 
   // Look for any active supabase connector available in pot/squad scope
-  const connectors = await listConnectors(env, { type: 'supabase' })
-  const active = connectors.find((c) => !c.revoked_at)
+  const connectors = await listConnectors(env)
+  const active = connectors.find((c) => c.type === 'supabase' && !c.revoked_at)
   if (!active) return null
 
-  const raw = await resolveConnector(env, active.id)
+  const raw = await resolveConnector(env, active.id, 'supabase')
   if (!raw) return null
   try {
     return JSON.parse(raw)
@@ -132,7 +133,7 @@ export const toolSupabaseSchema: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    const connectorId = str(args.connector_id)
+    const connectorId = str(args.connector_id) ?? undefined
     const creds = await resolveSupabaseCredentials(env, auth, connectorId)
     if (!creds) {
       return fail(404, 'supabase_connector_not_found', 'No active Supabase connector configured for this squad/pot.')
@@ -176,7 +177,7 @@ export const toolSupabaseQuery: ToolSpec = {
     const table = str(args.table)
     if (!table) return fail(400, 'invalid_args', 'table is required')
 
-    const connectorId = str(args.connector_id)
+    const connectorId = str(args.connector_id) ?? undefined
     const creds = await resolveSupabaseCredentials(env, auth, connectorId)
     if (!creds) {
       return fail(404, 'supabase_connector_not_found', 'No active Supabase connector found.')
@@ -230,7 +231,7 @@ export const toolSupabaseMutate: ToolSpec = {
       return fail(400, 'invalid_args', 'table and action (insert|update|delete) are required')
     }
 
-    const connectorId = str(args.connector_id)
+    const connectorId = str(args.connector_id) ?? undefined
     const creds = await resolveSupabaseCredentials(env, auth, connectorId)
     if (!creds) {
       return fail(404, 'supabase_connector_not_found', 'No active Supabase connector found.')

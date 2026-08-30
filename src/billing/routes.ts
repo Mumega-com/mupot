@@ -13,7 +13,6 @@ import {
   type StripeEvent,
 } from './stripe'
 import { getJSON } from '../dashboard/settings'
-import { hasWorkspaceAdmin } from '../mcp/index'
 
 export const billingRoutesApp = new Hono<{ Bindings: Env; Variables: { auth?: AuthContext } }>()
 

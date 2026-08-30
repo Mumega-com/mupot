@@ -513,7 +513,7 @@ function memberActor(memberId: string): { kind: 'member'; id: string } {
 // ── tool result shape ─────────────────────────────────────────────────────────
 // A tool returns either a value (→ 200 {ok:true, result}) or a typed error with
 // an HTTP status (→ that status, {ok:false, error}).
-type ToolError = { status: 400 | 403 | 404 | 409 | 410 | 500 | 503; error: string; detail?: unknown }
+type ToolError = { status: 400 | 403 | 404 | 409 | 410 | 500 | 502 | 503; error: string; detail?: unknown }
 export type ToolOutcome = { ok: true; result: unknown } | { ok: false } & ToolError
 
 export function fail(status: ToolError['status'], error: string, detail?: unknown): ToolOutcome {

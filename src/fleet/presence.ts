@@ -10,11 +10,6 @@ import { classify, humanAge, type FleetLiveness } from '../dashboard/fleet'
 import type { AgentIdentity } from '../auth/member-bearer'
 import { listFlights } from '../flight/service'
 import { scheduleStates, attachSchedule, type ScheduleStatus } from './schedule-state'
-import {
-  parseSevenAxisCheckin,
-  sevenAxisHasValues,
-  type SevenAxisPresence,
-} from '../presence/seven-axis'
 
 // Allowed runtime sources — an unknown/invalid value normalizes to 'unknown'
 // (never trusts the client's raw string into storage unbounded).
@@ -184,11 +179,11 @@ export function sqliteUtcToMs(s: string | null): number | null {
 }
 
 function bindSevenAxis(opts: CheckinOpts): {
-  harness: string | null
+  harness: SevenAxisHarness | null
   machine: string | null
   model: string | null
   provider: string | null
-  effort: string | null
+  effort: SevenAxisEffort | null
   flight_id: string | null
 } {
   // Omitted axes bind NULL so ON CONFLICT COALESCE keeps a previously declared value.

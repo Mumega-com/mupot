@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it } from 'vitest'
 import type { AuthContext, Capability, CapabilityGrant, Env } from '../src/types'
 import {
   decideVerdict,
@@ -7,6 +7,10 @@ import {
   type GateCheck,
 } from '../src/athena/reviewer'
 import { TOOLS, invokeTool } from '../src/mcp/index'
+import { applyAllMigrations } from './helpers/migrations'
+import { createSqliteD1 } from './helpers/sqlite-d1'
+
+let harness: ReturnType<typeof createSqliteD1>
 
 function auth(overrides: Partial<AuthContext> = {}): AuthContext {
   return {
@@ -50,11 +54,13 @@ diff --git a/tests/greet.test.ts b/tests/greet.test.ts
 +})
 `
 
+const SYNTHETIC_OPENAI_KEY = ['sk', 'abcdefghijklmnopqrstuvwxyz123456'].join('-')
+
 const SECRET_DIFF = `diff --git a/src/client.ts b/src/client.ts
 --- a/src/client.ts
 +++ b/src/client.ts
 @@ -1,2 +1,3 @@
-+const API_KEY = "sk-abcdefghijklmnopqrstuvwxyz123456"
++const API_KEY = "${SYNTHETIC_OPENAI_KEY}"
  export const url = 'https://api.example.com'
 `
 
@@ -182,7 +188,13 @@ describe('Athena gate reviewer — safety rules', () => {
 })
 
 describe('athena_review_pr MCP tool', () => {
-  const env = { TENANT_SLUG: 'test', DB: { prepare() { throw new Error('reviewer is pure') } } } as unknown as Env
+  let env: Env
+
+  beforeEach(() => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    env = { TENANT_SLUG: 'test', DB: harness.db } as unknown as Env
+  })
 
   it('registers on the MCP surface with additionalProperties:false', () => {
     expect(TOOLS.map((tool) => tool.name)).toEqual(expect.arrayContaining(['athena_review_pr']))
