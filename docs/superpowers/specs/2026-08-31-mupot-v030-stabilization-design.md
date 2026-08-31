@@ -198,7 +198,7 @@ It must:
 - correct ROADMAP release order and current state;
 - update `docs/releases/v0.30.0.md` commands to the actual audit and recursive fleet commands;
 - activate release evidence context, issue scope, soak, raw-health, clean-status, and SHA/time requirements in `v0.30.0-contract.json`;
-- create the external `v0.30.0 - Stabilized Control Plane` milestone without repurposing an unrelated milestone;
+- create the external `v0.30.0 - Stabilized Control Plane` milestone without repurposing an unrelated milestone, attach the closed release-blocker issues so the milestone is non-empty, and require zero open scoped issues at freeze;
 - record release-excluded #1246, #1247, and #1248 with branches preserved;
 - keep tag, release, deployment, stable milestone closure, and publication claims pending.
 
