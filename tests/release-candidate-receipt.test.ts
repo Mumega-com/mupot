@@ -26,7 +26,8 @@ function fixture(mutate?: (dir: string, outDir: string, commit: string) => void,
     target: { base_url: 'https://mupot.example.com', rc_version: TAG, source_version: sourceVersion, tag: TAG, commit },
     health: { ok: true, service: 'mupot', tenant: 'example', version: sourceVersion, commit, clean: true },
   }))
-  writeFileSync(join(outDir, 'github-release.json'), JSON.stringify({ tagName: TAG, isPrerelease: true, isDraft: false, targetCommitish: commit }))
+  writeFileSync(join(outDir, 'github-release.json'), JSON.stringify({ tagName: TAG, isPrerelease: true, isDraft: false, targetCommitish: commit, publishedAt: '2026-07-10T16:00:00.000Z' }))
+  writeFileSync(join(outDir, 'github-tag.json'), JSON.stringify({ sha: commit, html_url: `https://github.test/commit/${commit}` }))
   mutate?.(dir, outDir, commit)
   return { dir, outDir }
 }
@@ -35,6 +36,19 @@ describe('release candidate receipt checker', () => {
   it('normalizes prerelease versions and prints an evidence plan', () => {
     expect(normalizeVersion(TAG)).toEqual({ semver: VERSION, tag: TAG })
     expect(formatPlan({ version: TAG, outDir: 'tmp/rc' })).toContain('release-candidate-check.json')
+  })
+
+  it('shell-quotes every evidence redirection target in plans', () => {
+    const outDir = "tmp/rc plan;unsafe'path"
+    const plan = formatPlan({ version: TAG, outDir })
+    const redirects = plan.match(/^.* > .*$/gm) ?? []
+
+    expect(redirects).toHaveLength(4)
+    for (const line of redirects) {
+      expect(line).toMatch(/ > '.*'$/)
+      expect(line).not.toContain(` > ${outDir}/`)
+    }
+    expect(plan).toContain("'tmp/rc plan;unsafe'\\''path/github-tag.json'")
   })
 
   it('parses and prints an explicit source version separately from the RC identity', () => {
@@ -126,12 +140,72 @@ describe('release candidate receipt checker', () => {
     expect(receipt.checks).toContainEqual(expect.objectContaining({ check: 'deployment_target_source_version_matches', ok: false }))
   })
 
-  it('fails when the GitHub prerelease target is not the candidate commit', () => {
+  it('accepts a branch-valued GitHub prerelease target when the remote tag resolves the candidate commit', () => {
     const { dir, outDir } = fixture((_, evidenceDir) => {
-      writeFileSync(join(evidenceDir, 'github-release.json'), JSON.stringify({ tagName: TAG, isPrerelease: true, isDraft: false, targetCommitish: 'main' }))
+      writeFileSync(join(evidenceDir, 'github-release.json'), JSON.stringify({ tagName: TAG, isPrerelease: true, isDraft: false, targetCommitish: 'main', publishedAt: '2026-07-10T16:00:00.000Z' }))
+    })
+    const receipt = checkBundle({ repoRoot: dir, outDir, version: TAG })
+    expect(receipt.status).toBe('pass')
+  })
+
+  it('fails when the GitHub tag export is missing its canonical commit SHA', () => {
+    const { dir, outDir } = fixture((_, evidenceDir) => {
+      writeFileSync(join(evidenceDir, 'github-tag.json'), JSON.stringify({ html_url: 'https://github.test/commit/missing' }))
     })
     const receipt = checkBundle({ repoRoot: dir, outDir, version: TAG })
     expect(receipt.status).toBe('fail')
-    expect(receipt.checks).toContainEqual(expect.objectContaining({ check: 'github_prerelease_target_matches_candidate_commit', ok: false }))
+    expect(receipt.checks).toContainEqual(expect.objectContaining({ check: 'github_tag_commit_sha_present', ok: false }))
+  })
+
+  it('fails when the GitHub tag resolves another commit', () => {
+    const { dir, outDir } = fixture((_, evidenceDir) => {
+      writeFileSync(join(evidenceDir, 'github-tag.json'), JSON.stringify({ sha: 'f'.repeat(40), html_url: 'https://github.test/commit/wrong' }))
+    })
+    const receipt = checkBundle({ repoRoot: dir, outDir, version: TAG })
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({ check: 'github_tag_commit_matches_candidate_commit', ok: false }))
+  })
+
+  it.each([
+    ['missing', undefined],
+    ['null', null],
+    ['array', ['a'.repeat(40)]],
+    ['object', { sha: 'a'.repeat(40) }],
+    ['uppercase', 'A'.repeat(40)],
+  ] as const)('fails closed when the GitHub tag SHA is %s', (_, sha) => {
+    const { dir, outDir } = fixture((_, evidenceDir) => {
+      writeFileSync(join(evidenceDir, 'github-tag.json'), JSON.stringify({ sha, html_url: 'https://github.test/commit/invalid' }))
+    })
+    const receipt = checkBundle({ repoRoot: dir, outDir, version: TAG })
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      check: 'github_tag_commit_sha_present',
+      ok: false,
+      actual: sha ?? null,
+    }))
+  })
+
+  it.each([
+    ['missing', undefined],
+    ['null', null],
+    ['malformed', 'not-a-timestamp'],
+    ['non-ISO', 'July 10, 2026'],
+  ] as const)('fails when the GitHub prerelease publication timestamp is %s', (_, publishedAt) => {
+    const { dir, outDir } = fixture((_, evidenceDir) => {
+      writeFileSync(join(evidenceDir, 'github-release.json'), JSON.stringify({
+        tagName: TAG,
+        isPrerelease: true,
+        isDraft: false,
+        targetCommitish: 'main',
+        publishedAt,
+      }))
+    })
+    const receipt = checkBundle({ repoRoot: dir, outDir, version: TAG })
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      check: 'github_prerelease_published_at_present',
+      ok: false,
+      actual: publishedAt ?? null,
+    }))
   })
 })

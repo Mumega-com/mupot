@@ -229,14 +229,30 @@ describe('release integrity receipt checker', () => {
     }))
   })
 
-  it('fails when the stable release is unpublished or targets another commit', () => {
+  it('accepts a branch-valued stable release target when the remote tag resolves locally', () => {
     const { repo, outDir } = writeRepo()
     writeFileSync(join(outDir, 'github-release.json'), JSON.stringify({
       tagName: TAG,
       name: `${TAG} - Trusted Runtime`,
       isDraft: false,
       isPrerelease: false,
-      targetCommitish: 'f'.repeat(40),
+      targetCommitish: 'main',
+      publishedAt: '2026-07-13T00:00:00Z',
+    }, null, 2))
+
+    const receipt = checkBundle({ repoRoot: repo, outDir, version: TAG })
+
+    expect(receipt.status).toBe('pass')
+  })
+
+  it('fails when the stable release is unpublished', () => {
+    const { repo, outDir } = writeRepo()
+    writeFileSync(join(outDir, 'github-release.json'), JSON.stringify({
+      tagName: TAG,
+      name: `${TAG} - Trusted Runtime`,
+      isDraft: false,
+      isPrerelease: false,
+      targetCommitish: 'main',
       publishedAt: null,
     }, null, 2))
 
@@ -247,9 +263,25 @@ describe('release integrity receipt checker', () => {
       ok: false,
       check: 'github_release_published_at_present',
     }))
+  })
+
+  it.each([
+    ['missing', undefined],
+    ['null', null],
+    ['array', ['a'.repeat(40)]],
+    ['object', { sha: 'a'.repeat(40) }],
+    ['uppercase', 'A'.repeat(40)],
+  ] as const)('fails closed when the GitHub tag SHA is %s', (_, sha) => {
+    const { repo, outDir } = writeRepo()
+    writeFileSync(join(outDir, 'github-tag.json'), JSON.stringify({ sha, html_url: 'https://github.test/commit/invalid' }, null, 2))
+
+    const receipt = checkBundle({ repoRoot: repo, outDir, version: TAG })
+
+    expect(receipt.status).toBe('fail')
     expect(receipt.checks).toContainEqual(expect.objectContaining({
       ok: false,
-      check: 'github_release_target_matches_tag_commit',
+      check: 'github_tag_commit_sha_present',
+      actual: sha ?? null,
     }))
   })
 

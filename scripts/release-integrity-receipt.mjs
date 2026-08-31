@@ -353,14 +353,16 @@ export function checkBundle(opts = {}) {
   // a moving branch name. Resolve the published tag through GitHub instead.
   const githubTag = parseJsonFile(checks, githubTagPath, 'github_tag')
   artifacts.github_tag = artifactMeta(githubTagPath, githubTag ? JSON.stringify(githubTag) : null)
-  const githubTagSha = String(field(githubTag, 'sha') ?? '')
-  pushCheck(checks, /^[0-9a-f]{40}$/i.test(githubTagSha), 'github_tag_commit_sha_present', {
+  const githubTagShaRaw = field(githubTag, 'sha')
+  const githubTagSha = typeof githubTagShaRaw === 'string' ? githubTagShaRaw : ''
+  const githubTagShaValid = /^[0-9a-f]{40}$/.test(githubTagSha)
+  pushCheck(checks, githubTagShaValid, 'github_tag_commit_sha_present', {
     path: githubTagPath,
-    actual: githubTagSha || null,
+    actual: githubTagShaRaw ?? null,
   })
-  pushCheck(checks, Boolean(tagSha && githubTagSha && githubTagSha === tagSha), 'github_tag_commit_matches_local_tag', {
+  pushCheck(checks, Boolean(tagSha && githubTagShaValid && githubTagSha === tagSha), 'github_tag_commit_matches_local_tag', {
     expected: tagSha || null,
-    actual: githubTagSha || null,
+    actual: githubTagShaRaw ?? null,
   })
 
   const milestoneJson = parseJsonFile(checks, milestonePath, 'github_milestone')
@@ -380,17 +382,12 @@ export function checkBundle(opts = {}) {
   const releaseName = String(field(release, 'name') ?? '')
   const releaseDraft = Boolean(field(release, 'draft', 'isDraft'))
   const releasePrerelease = Boolean(field(release, 'prerelease', 'isPrerelease'))
-  const releaseTarget = String(field(release, 'target_commitish', 'targetCommitish') ?? '')
   const releasePublishedAt = String(field(release, 'published_at', 'publishedAt') ?? '')
   pushCheck(checks, Boolean(release), 'github_release_present_for_version', { path: releasePath })
   pushCheck(checks, releaseTag === tag, 'github_release_tag_matches_expected', { expected: tag, actual: releaseTag || null })
   pushCheck(checks, releaseName.includes(tag) || releaseName.includes(semver), 'github_release_name_matches_version', { expected: tag, actual: releaseName || null })
   pushCheck(checks, releaseDraft === false, 'github_release_is_not_draft', { actual: releaseDraft })
   pushCheck(checks, releasePrerelease === false, 'github_release_is_not_prerelease', { actual: releasePrerelease })
-  pushCheck(checks, Boolean(tagSha && releaseTarget === tagSha), 'github_release_target_matches_tag_commit', {
-    expected: tagSha || null,
-    actual: releaseTarget || null,
-  })
   pushCheck(checks, Boolean(releasePublishedAt && !Number.isNaN(Date.parse(releasePublishedAt))), 'github_release_published_at_present', {
     actual: releasePublishedAt || null,
   })
@@ -412,7 +409,7 @@ export function checkBundle(opts = {}) {
       package_lock_root_version: packageLockRootVersion || null,
       public_api_version: publicApiVersion || null,
       git_tag_sha: tagSha || null,
-      github_tag_sha: githubTagSha || null,
+      github_tag_sha: githubTagShaValid ? githubTagSha : null,
       git_head_sha: headSha || null,
       milestone_title: milestoneTitle || null,
       release_tag: releaseTag || null,

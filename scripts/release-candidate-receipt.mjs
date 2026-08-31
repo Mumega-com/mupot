@@ -84,9 +84,13 @@ function defaultOutDir(opts) {
   return opts.outDir || `tmp/release-candidate/${normalizeVersion(opts.version || DEFAULT_VERSION).tag}`
 }
 
+function shellQuote(value) {
+  const raw = String(value)
+  return /^[A-Za-z0-9_./:=@%+~,#-]+$/.test(raw) ? raw : `'${raw.replace(/'/g, `'\\''`)}'`
+}
+
 function command(parts, suffix = '') {
-  const quote = (value) => /^[A-Za-z0-9_./:=@%+~,#-]+$/.test(value) ? value : `'${value.replace(/'/g, `'\\''`)}'`
-  return `${parts.map((part) => quote(String(part))).join(' ')}${suffix}`
+  return `${parts.map((part) => shellQuote(part)).join(' ')}${suffix}`
 }
 
 export function formatPlan(opts = {}) {
@@ -94,6 +98,10 @@ export function formatPlan(opts = {}) {
   const sourceVersion = normalizeSourceVersion(opts.sourceVersion || semver)
   const outDir = defaultOutDir({ ...opts, version: tag })
   const repo = opts.repo || DEFAULT_REPO
+  const healthPath = `${outDir}/health.json`
+  const releasePath = `${outDir}/github-release.json`
+  const tagPath = `${outDir}/github-tag.json`
+  const checkPath = `${outDir}/release-candidate-check.json`
   return [
     'Mupot release-candidate deployment evidence plan',
     '',
@@ -102,11 +110,12 @@ export function formatPlan(opts = {}) {
     command(['mkdir', '-p', outDir]),
     '',
     'Capture a redacted live deployment observation:',
-    command(['curl', '-fsS', '<base-url>/health'], ` > ${outDir}/health.json`),
+    command(['curl', '-fsS', '<base-url>/health'], ` > ${shellQuote(healthPath)}`),
     `Write deployment.json with receipt_type "mupot-release-candidate-deployment/v1", observed_at, target { base_url, rc_version: "${tag}", source_version: "${sourceVersion}", commit, tag: "${tag}" }, and health from the public response including { version: "${sourceVersion}", commit, clean: true }.`,
-    command(['gh', 'release', 'view', tag, '--repo', repo, '--json', 'tagName,name,isDraft,isPrerelease,targetCommitish,url,publishedAt'], ` > ${outDir}/github-release.json`),
+    command(['gh', 'release', 'view', tag, '--repo', repo, '--json', 'tagName,name,isDraft,isPrerelease,targetCommitish,url,publishedAt'], ` > ${shellQuote(releasePath)}`),
+    command(['gh', 'api', `repos/${repo}/commits/${tag}`, '--jq', '{sha: .sha, html_url: .html_url}'], ` > ${shellQuote(tagPath)}`),
     '',
-    command(['node', 'scripts/release-candidate-receipt.mjs', '--check', '--version', tag, '--source-version', `v${sourceVersion}`, '--repo', repo, '--out-dir', outDir], ` > ${outDir}/release-candidate-check.json`),
+    command(['node', 'scripts/release-candidate-receipt.mjs', '--check', '--version', tag, '--source-version', `v${sourceVersion}`, '--repo', repo, '--out-dir', outDir], ` > ${shellQuote(checkPath)}`),
     '',
     `The checked candidate version is ${semver}; use its observed_at as the authoritative lower bound for the production soak.`,
     '',
@@ -142,6 +151,12 @@ function publicApiVersion(text) {
   return text.match(/MUPOT_PUBLIC_API_VERSION\s*=\s*['"]([^'"]+)['"]/)?.[1] ?? ''
 }
 
+function isIsoTimestamp(value) {
+  return typeof value === 'string'
+    && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value)
+    && !Number.isNaN(Date.parse(value))
+}
+
 export function checkBundle(opts = {}) {
   const { semver, tag } = normalizeVersion(opts.version || DEFAULT_VERSION)
   const sourceVersion = normalizeSourceVersion(opts.sourceVersion || semver)
@@ -154,12 +169,17 @@ export function checkBundle(opts = {}) {
   push(checks, Boolean(versionText), 'public_api_version_source_present', { path: versionPath })
   const deployment = readJson(checks, opts.deploymentJson || join(outDir, 'deployment.json'), 'deployment')
   const release = readJson(checks, opts.releaseJson || join(outDir, 'github-release.json'), 'github_release')
+  const githubTag = readJson(checks, join(outDir, 'github-tag.json'), 'github_tag')
   const head = git(['rev-parse', 'HEAD'], root)
   const tagCommit = git(['rev-list', '-n', '1', tag], root)
   const observedAt = deployment?.value?.observed_at ?? ''
   const target = deployment?.value?.target ?? {}
   const health = deployment?.value?.health ?? {}
   const githubRelease = release?.value ?? {}
+  const githubTagShaRaw = githubTag?.value?.sha
+  const githubTagSha = typeof githubTagShaRaw === 'string' ? githubTagShaRaw : ''
+  const githubTagShaValid = /^[0-9a-f]{40}$/.test(githubTagSha)
+  const githubReleasePublishedAt = githubRelease.publishedAt
 
   push(checks, packageJson?.value?.version === sourceVersion, 'package_version_matches_source', { expected: sourceVersion, actual: packageJson?.value?.version ?? null })
   push(checks, publicApiVersion(versionText) === sourceVersion, 'public_api_version_matches_source', { expected: sourceVersion, actual: publicApiVersion(versionText) || null })
@@ -177,18 +197,21 @@ export function checkBundle(opts = {}) {
   push(checks, health.clean === true, 'deployment_health_clean', { expected: true, actual: health.clean ?? null })
   push(checks, githubRelease.tagName === tag, 'github_prerelease_tag_matches', { expected: tag, actual: githubRelease.tagName ?? null })
   push(checks, githubRelease.isPrerelease === true && githubRelease.isDraft === false, 'github_release_is_published_prerelease', { is_prerelease: githubRelease.isPrerelease ?? null, is_draft: githubRelease.isDraft ?? null })
-  push(checks, githubRelease.targetCommitish === head && Boolean(githubRelease.targetCommitish), 'github_prerelease_target_matches_candidate_commit', { expected: head || null, actual: githubRelease.targetCommitish ?? null })
+  push(checks, isIsoTimestamp(githubReleasePublishedAt), 'github_prerelease_published_at_present', { actual: githubReleasePublishedAt ?? null })
+  push(checks, githubTagShaValid, 'github_tag_commit_sha_present', { actual: githubTagShaRaw ?? null })
+  push(checks, githubTagShaValid && githubTagSha === head && githubTagSha === tagCommit, 'github_tag_commit_matches_candidate_commit', { expected: head || null, actual: githubTagShaRaw ?? null })
 
   const failed = checks.filter((check) => !check.ok)
   return {
     receipt_type: CHECK_RECEIPT_TYPE,
     status: failed.length === 0 ? 'pass' : 'fail',
     checked_at: new Date().toISOString(),
-    target: { repo: opts.repo || DEFAULT_REPO, rc_version: tag, source_version: sourceVersion, commit: head || null, base_url: target.base_url ?? null },
+    target: { repo: opts.repo || DEFAULT_REPO, rc_version: tag, source_version: sourceVersion, commit: head || null, github_tag_sha: githubTagShaValid ? githubTagSha : null, base_url: target.base_url ?? null },
     artifacts: {
       package: packageJson ? { path: join(root, 'package.json'), sha256: packageJson.sha256 } : null,
       deployment: deployment ? { path: opts.deploymentJson || join(outDir, 'deployment.json'), sha256: deployment.sha256 } : null,
       github_release: release ? { path: opts.releaseJson || join(outDir, 'github-release.json'), sha256: release.sha256 } : null,
+      github_tag: githubTag ? { path: join(outDir, 'github-tag.json'), sha256: githubTag.sha256 } : null,
     },
     summary: { passed: checks.length - failed.length, failed: failed.length, total: checks.length },
     checks,
