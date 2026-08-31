@@ -34,8 +34,10 @@ const digest = (value) => createHash('sha256').update(value).digest('hex')
 const HEARTBEAT_SHA = digest(HEARTBEAT_DEFINITION)
 const CONTROL_SHA = digest(CONTROL_DEFINITION)
 const STARTER_SHA = digest(STARTER_MANIFEST)
-const NEXT_STEP_ATTACH = 'attach manifest.json and cutover-gate.json to the cutover record; SOS removal is permitted only for the proven agent(s)'
-const NEXT_STEP_HOLD = 'do not remove SOS wiring yet; rerun until manifest.json and cutover-gate.json are status pass'
+const NEUTRAL_ATTACH = 'attach manifest.json and cutover-gate.json to the Host-Go handoff record; handoff is permitted only for the proven agent(s)'
+const NEUTRAL_HOLD = 'do not complete the Host-Go handoff yet; rerun until manifest.json and cutover-gate.json are status pass'
+const LEGACY_ATTACH = 'attach manifest.json and cutover-gate.json to the cutover record; SOS removal is permitted only for the proven agent(s)'
+const LEGACY_HOLD = 'do not remove SOS wiring yet; rerun until manifest.json and cutover-gate.json are status pass'
 const HOST_PANEL_PUBLIC_KEY_CHECK = {
   ok: true,
   component: 'fleet-control-daemon',
@@ -413,8 +415,10 @@ function serviceAwareHostReceipt(sourceService = serviceReceipt()) {
   return receipt
 }
 
-function priorBundleManifest(status = 'pass', artifactDigests = {}) {
+function priorBundleManifest(status = 'pass', artifactDigests = {}, options = {}) {
   const ok = status === 'pass'
+  const cutoverReceiptType = options.cutoverReceiptType ?? 'mupot-sos-cutover-gate/v1'
+  const cutoverNextSteps = options.cutoverNextSteps ?? [LEGACY_ATTACH]
   const meta = (path, receiptType, sha256 = digest(`prior:${path}`)) => ({ path, receipt_type: receiptType, status, sha256 })
   const checks = [
     { ok, component: 'receipt-bundle', check: 'selected_agents_present', agents: ['agent-one'] },
@@ -451,10 +455,10 @@ function priorBundleManifest(status = 'pass', artifactDigests = {}) {
         meta('control-start.json', 'mupot-fleet-control-receipt/v1', artifactDigests.lifecycle_control_start),
         meta('control-stop.json', 'mupot-fleet-control-receipt/v1', artifactDigests.lifecycle_control_stop),
       ],
-      cutover_gate: meta('cutover-gate.json', 'mupot-sos-cutover-gate/v1'),
+      cutover_gate: meta('cutover-gate.json', cutoverReceiptType, artifactDigests.cutover_gate),
       manifest: 'manifest.json',
     },
-    next_steps: ['attach manifest.json and cutover-gate.json to the cutover record; SOS removal is permitted only for the proven agent(s)'],
+    next_steps: cutoverNextSteps,
     checks,
   }
 }
@@ -465,6 +469,108 @@ function seedCutoverEvidence(outDir, host = hostReceipt()) {
   writeJson(join(outDir, 'runtime-agent-one.json'), runtimeReceipt('agent-one'))
   writeJson(join(outDir, 'control-start.json'), controlReceipt('agent-one', 'start'))
   writeJson(join(outDir, 'control-stop.json'), controlReceipt('agent-one', 'stop'))
+}
+
+function legacyCutoverReceipt({ agentId = 'agent-one', hostPath, runtimePath, startPath, stopPath }) {
+  const checks = [
+    { ok: true, component: 'cutover-receipt', check: 'host_receipt_read', path: hostPath },
+    { ok: true, component: 'cutover-receipt', check: 'host_receipt_type', path: hostPath, expected: 'mupot-fleet-host-receipt/v1', actual: 'mupot-fleet-host-receipt/v1' },
+    { ok: true, component: 'cutover-receipt', check: 'host_receipt_status_pass', path: hostPath, actual: 'pass' },
+    { ok: true, component: 'cutover-receipt', check: 'runtime_receipt_read', path: runtimePath },
+    { ok: true, component: 'cutover-receipt', check: 'runtime_receipt_type', path: runtimePath, expected: 'mupot-fleet-runtime-receipt/v1', actual: 'mupot-fleet-runtime-receipt/v1' },
+    { ok: true, component: 'cutover-receipt', check: 'runtime_receipt_status_pass', path: runtimePath, actual: 'pass' },
+    { ok: true, component: 'cutover-receipt', check: 'control_receipt_read', path: startPath },
+    { ok: true, component: 'cutover-receipt', check: 'control_receipt_type', path: startPath, expected: 'mupot-fleet-control-receipt/v1', actual: 'mupot-fleet-control-receipt/v1' },
+    { ok: true, component: 'cutover-receipt', check: 'control_receipt_status_pass', path: startPath, actual: 'pass' },
+    { ok: true, component: 'cutover-receipt', check: 'control_receipt_read', path: stopPath },
+    { ok: true, component: 'cutover-receipt', check: 'control_receipt_type', path: stopPath, expected: 'mupot-fleet-control-receipt/v1', actual: 'mupot-fleet-control-receipt/v1' },
+    { ok: true, component: 'cutover-receipt', check: 'control_receipt_status_pass', path: stopPath, actual: 'pass' },
+    { ok: true, component: 'cutover-receipt', check: 'runtime_receipt_for_agent', agent_id: agentId, path: runtimePath },
+    { ok: true, component: 'cutover-receipt', check: 'runtime_signed_attach_for_agent', agent_id: agentId, path: runtimePath },
+    { ok: true, component: 'cutover-receipt', check: 'runtime_inbox_handoff_for_agent', agent_id: agentId, path: runtimePath },
+    { ok: true, component: 'cutover-receipt', check: 'control_verb_for_agent', agent_id: agentId, required_verb: 'start', matched_verb: 'start', matched_action: 'open' },
+    { ok: true, component: 'cutover-receipt', check: 'control_verb_for_agent', agent_id: agentId, required_verb: 'stop', matched_verb: 'stop', matched_action: 'close' },
+  ]
+  return {
+    receipt_type: 'mupot-sos-cutover-gate/v1',
+    generated_at: '2026-07-08T00:03:00.000Z',
+    status: 'pass',
+    summary: summarizeFixture(checks),
+    inputs: {
+      agents: [agentId],
+      host_receipt: hostPath,
+      runtime_receipts: [runtimePath],
+      control_receipts: [startPath, stopPath],
+      required_control_verbs: ['start', 'stop'],
+    },
+    checks,
+  }
+}
+
+function neutralCutoverReceipt(paths) {
+  const legacy = legacyCutoverReceipt(paths)
+  const checks = [
+    ...legacy.checks,
+    {
+      ok: true,
+      component: 'host-go-cutover',
+      check: 'no_live_sos_wiring',
+      substrate: 'mupot-herdr',
+      finding_count: 0,
+      findings: [],
+    },
+  ]
+  return {
+    ...legacy,
+    receipt_type: 'mupot-host-go-cutover/v1',
+    summary: summarizeFixture(checks),
+    inputs: {
+      substrate: 'mupot-herdr',
+      live_sos_wiring: false,
+      ...legacy.inputs,
+    },
+    checks,
+  }
+}
+
+function seedBundleForMode(gateType, outDir = tmpDir()) {
+  const paths = {
+    hostPath: writeJson(join(outDir, 'host.json'), hostReceipt()),
+    runtimePath: writeJson(join(outDir, 'runtime-agent-one.json'), runtimeReceipt('agent-one')),
+    startPath: writeJson(join(outDir, 'control-start.json'), controlReceipt('agent-one', 'start')),
+    stopPath: writeJson(join(outDir, 'control-stop.json'), controlReceipt('agent-one', 'stop')),
+  }
+  writeJson(join(outDir, 'install.json'), installReceipt('pass'))
+  writeJson(join(outDir, 'probe-start.json'), probeReceipt('pass', 'start'))
+  writeJson(join(outDir, 'probe-stop.json'), probeReceipt('pass', 'stop'))
+  const gate = gateType === 'mupot-host-go-cutover/v1'
+    ? neutralCutoverReceipt(paths)
+    : legacyCutoverReceipt(paths)
+  const gatePath = writeJson(join(outDir, 'cutover-gate.json'), gate)
+  const artifactDigests = {
+    install: sha256(join(outDir, 'install.json')),
+    probe_start: sha256(join(outDir, 'probe-start.json')),
+    probe_stop: sha256(join(outDir, 'probe-stop.json')),
+    host: sha256(paths.hostPath),
+    runtime_inbox: sha256(paths.runtimePath),
+    lifecycle_control_start: sha256(paths.startPath),
+    lifecycle_control_stop: sha256(paths.stopPath),
+    cutover_gate: sha256(gatePath),
+  }
+  const manifest = priorBundleManifest('pass', artifactDigests, {
+    cutoverReceiptType: gateType,
+    cutoverNextSteps: [gateType === 'mupot-host-go-cutover/v1' ? NEUTRAL_ATTACH : LEGACY_ATTACH],
+  })
+  manifest.inputs.out_dir = outDir
+  manifest.artifacts.out_dir = outDir
+  writeJson(join(outDir, 'manifest.json'), manifest)
+  chmodSync(outDir, 0o700)
+  for (const name of readdirSync(outDir).filter((entry) => entry.endsWith('.json'))) chmodSync(join(outDir, name), 0o600)
+  return outDir
+}
+
+function seedLegacyCutoverEvidence(outDir) {
+  return seedBundleForMode('mupot-sos-cutover-gate/v1', outDir)
 }
 
 function starterPaths(overrides = {}) {
@@ -767,7 +873,8 @@ test('receipt bundle writes host, runtime, control, cutover gate, and manifest',
   assert.equal(bundle.artifacts.probes.length, 1)
   assert.equal(bundle.artifacts.probes[0].receipt_type, 'mupot-fleet-cutover-probe/v1')
   assert.equal(bundle.artifacts.cutover_gate.status, 'pass')
-  assert.ok(bundle.next_steps.some((s) => s.includes('SOS removal is permitted only for the proven agent')))
+  assert.equal(bundle.artifacts.cutover_gate.receipt_type, 'mupot-host-go-cutover/v1')
+  assert.deepEqual(bundle.next_steps, [NEUTRAL_ATTACH])
   assert.ok(existsSync(join(outDir, 'install.json')))
   assert.ok(existsSync(join(outDir, 'probe-start-probe.json')))
   assert.ok(existsSync(join(outDir, 'host.json')))
@@ -793,6 +900,28 @@ test('receipt bundle writes host, runtime, control, cutover gate, and manifest',
   assert.ok(manifest.checks.some((c) => c.check === 'probe_receipt_status_pass' && c.ok === true))
   assert.ok(manifest.checks.some((c) => c.check === 'cutover_gate_status_pass' && c.ok === true))
   assert.ok(manifest.checks.some((c) => c.check === 'manifest_written' && c.ok === true))
+})
+
+test('new bundle rejects an injected legacy cutover gate', async () => {
+  const outDir = tmpDir()
+  seedCutoverEvidence(outDir)
+  const bundle = await buildBundle({
+    outDir,
+    agents: ['agent-one'],
+    verifyOnly: true,
+    cutoverBuilder: async ({ agents, hostPath, runtimePaths, controlPaths }) => legacyCutoverReceipt({
+      agentId: agents[0],
+      hostPath,
+      runtimePath: runtimePaths[0],
+      startPath: controlPaths.find((path) => path.endsWith('control-start.json')),
+      stopPath: controlPaths.find((path) => path.endsWith('control-stop.json')),
+    }),
+  })
+
+  assert.equal(bundle.status, 'fail')
+  assert.equal(bundle.artifacts.cutover_gate.receipt_type, 'mupot-sos-cutover-gate/v1')
+  assert.ok(bundle.checks.some((entry) => entry.check === 'cutover_gate_status_pass' && entry.ok === false))
+  assert.deepEqual(bundle.next_steps, [NEUTRAL_HOLD])
 })
 
 test('starter-ready bundle requires, exports, and summarizes service continuity evidence', async () => {
@@ -1505,11 +1634,11 @@ test('receipt bundle fails when an included probe receipt did not queue inputs',
 
   assert.equal(bundle.status, 'fail')
   assert.ok(bundle.checks.some((c) => c.check === 'probe_receipt_status_pass' && c.ok === false && c.actual === 'fail'))
-  assert.deepEqual(bundle.next_steps, [NEXT_STEP_HOLD])
+  assert.deepEqual(bundle.next_steps, [NEUTRAL_HOLD])
   assert.ok(inspectBundleStatus({ outDir, agents: ['agent-one'] }).next_steps.some((s) => s.includes('queue inbox and lifecycle inputs')))
   const manifest = JSON.parse(readFileSync(join(outDir, 'manifest.json'), 'utf8'))
   assert.equal(manifest.artifacts.probes[0].status, 'fail')
-  assert.ok(manifest.next_steps.some((s) => s.includes('do not remove SOS wiring yet')))
+  assert.deepEqual(manifest.next_steps, [NEUTRAL_HOLD])
 })
 
 test('receipt bundle can reuse existing host, runtime, and control receipts', async () => {
@@ -1613,7 +1742,7 @@ test('receipt bundle fails when reused host receipt lacks public-only panel key 
     c.check === 'host_candidate_ignored' &&
     c.required_checks_pass === false
   ))
-  assert.deepEqual(bundle.next_steps, [NEXT_STEP_HOLD])
+  assert.deepEqual(bundle.next_steps, [NEUTRAL_HOLD])
   assert.ok(inspectBundleStatus({ outDir, agents: ['agent-one'] }).next_steps.some((s) => s.includes('panel_public_key_public_only')))
 })
 
@@ -1661,6 +1790,64 @@ test('verify-only rechecks an existing bundle without live receipt builders', as
   assert.ok(manifest.next_steps.some((s) => s.includes('attach manifest.json and cutover-gate.json')))
 })
 
+test('manifest checker preserves a strict historical SOS cutover bundle', () => {
+  const outDir = seedLegacyCutoverEvidence(tmpDir())
+  const check = checkBundleManifest({ outDir })
+  assert.equal(check.status, 'pass', JSON.stringify(check.checks.filter((entry) => entry.ok !== true), null, 2))
+})
+
+for (const [gateType, nextSteps] of [
+  ['mupot-host-go-cutover/v1', [LEGACY_ATTACH]],
+  ['mupot-sos-cutover-gate/v1', [NEUTRAL_ATTACH]],
+]) {
+  test(`manifest rejects mixed cutover mode ${gateType}`, () => {
+    const outDir = seedBundleForMode(gateType)
+    const manifestPath = join(outDir, 'manifest.json')
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+    manifest.next_steps = nextSteps
+    writeJson(manifestPath, manifest)
+    assert.equal(checkBundleManifest({ outDir }).status, 'fail')
+  })
+}
+
+for (const [name, mutate] of [
+  ['missing substrate input', (gate) => { delete gate.inputs.substrate }],
+  ['wrong substrate input', (gate) => { gate.inputs.substrate = 'other-substrate' }],
+  ['non-boolean live SOS input', (gate) => { gate.inputs.live_sos_wiring = 'false' }],
+  ['live SOS input set true', (gate) => { gate.inputs.live_sos_wiring = true }],
+  ['missing no-live-SOS check', (gate) => { gate.checks.pop() }],
+  ['nonzero finding count', (gate) => { gate.checks.at(-1).finding_count = 1 }],
+  ['nonempty findings', (gate) => { gate.checks.at(-1).findings = [{ location: 'host.checks[0].path', marker: 'sos_path' }] }],
+  ['wrong no-live-SOS component', (gate) => { gate.checks.at(-1).component = 'cutover-receipt' }],
+  ['wrong no-live-SOS check name', (gate) => { gate.checks.at(-1).check = 'no_sos' }],
+  ['unknown top-level field', (gate) => { gate.extra = true }],
+  ['unknown input field', (gate) => { gate.inputs.extra = true }],
+  ['unknown check field', (gate) => { gate.checks.at(-1).extra = true }],
+]) {
+  test(`manifest rejects forged neutral pass with ${name}`, () => {
+    const outDir = seedBundleForMode('mupot-host-go-cutover/v1')
+    const gatePath = join(outDir, 'cutover-gate.json')
+    const gate = JSON.parse(readFileSync(gatePath, 'utf8'))
+    mutate(gate)
+    gate.summary = summarizeFixture(gate.checks)
+    writeJson(gatePath, gate)
+
+    const manifestPath = join(outDir, 'manifest.json')
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+    manifest.artifacts.cutover_gate.sha256 = sha256(gatePath)
+    writeJson(manifestPath, manifest)
+
+    let check
+    assert.doesNotThrow(() => { check = checkBundleManifest({ outDir }) })
+    assert.equal(check.status, 'fail')
+    assert.ok(check.checks.some((entry) =>
+      entry.check === 'artifact_receipt_json_read' &&
+      entry.artifact === 'cutover_gate' &&
+      entry.ok === false
+    ))
+  })
+}
+
 test('manifest check verifies copied bundle hashes without rewriting files', async () => {
   const outDir = tmpDir()
   writeJson(join(outDir, 'probe-start.json'), probeReceipt())
@@ -1704,7 +1891,7 @@ test('manifest check verifies copied bundle hashes without rewriting files', asy
   assert.ok(check.checks.some((c) =>
     c.check === 'artifact_receipt_type_expected' &&
     c.artifact === 'cutover_gate' &&
-    c.expected === 'mupot-sos-cutover-gate/v1' &&
+    c.expected === 'mupot-host-go-cutover/v1' &&
     c.ok === true
   ))
   assert.ok(check.checks.some((c) =>
@@ -2121,7 +2308,7 @@ test('status reports a complete host-go bundle as pass', async () => {
   assert.ok(status.checks.some((c) => c.check === 'manifest_check_pass' && c.ok === true))
   assert.ok(status.checks.some((c) => c.check === 'copied_bundle_no_secret_material' && c.ok === true))
   assert.ok(status.checks.some((c) => c.check === 'copied_bundle_only_manifest_artifacts' && c.ok === true))
-  assert.ok(status.next_steps.some((s) => s.includes('SOS removal is permitted only for the proven agent')))
+  assert.ok(status.next_steps.includes(NEUTRAL_ATTACH))
 })
 
 test('status reports missing host-go evidence and next steps for a partial bundle', () => {
@@ -2157,7 +2344,7 @@ test('status reports missing host-go evidence and next steps for a partial bundl
   assert.ok(status.next_steps.some((s) => s.includes('save installer output')))
   assert.ok(status.next_steps.some((s) => s.includes('queue inbox and lifecycle inputs')))
   assert.ok(status.next_steps.some((s) => s.includes('runtime-agent-one.json')))
-  assert.ok(status.next_steps.some((s) => s.includes('do not remove SOS wiring yet')))
+  assert.ok(status.next_steps.includes(NEUTRAL_HOLD))
 })
 
 test('status reports stale host receipt missing public-only panel key evidence', () => {
@@ -2251,7 +2438,7 @@ test('manifest check fails when next_steps contradict readiness', async () => {
 
   const manifestPath = join(outDir, 'manifest.json')
   const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
-  manifest.next_steps = ['do not remove SOS wiring yet; rerun until manifest.json and cutover-gate.json are status pass']
+  manifest.next_steps = [NEUTRAL_HOLD]
   writeJson(manifestPath, manifest)
 
   const check = checkBundleManifest({ manifestPath })
@@ -2275,7 +2462,7 @@ test('manifest check enforces a closed ordered next_steps policy', async () => {
   await buildBundle({ outDir, agents: ['agent-one'], verifyOnly: true })
   const manifestPath = join(outDir, 'manifest.json')
   const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
-  manifest.next_steps.push('leave SOS wiring installed forever')
+  manifest.next_steps.push('complete the handoff without the exact policy')
   writeJson(manifestPath, manifest)
 
   const check = checkBundleManifest({ outDir })
@@ -2292,7 +2479,7 @@ test('manifest check rejects instructions before the sole non-ready hold step', 
   await buildBundle({ outDir, agents: ['agent-one'], verifyOnly: true })
   const manifestPath = join(outDir, 'manifest.json')
   const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
-  manifest.next_steps = ['remove SOS wiring now despite the failed gate', NEXT_STEP_HOLD]
+  manifest.next_steps = ['complete the handoff now despite the failed gate', NEUTRAL_HOLD]
   writeJson(manifestPath, manifest)
 
   const check = checkBundleManifest({ outDir })
@@ -2300,7 +2487,7 @@ test('manifest check rejects instructions before the sole non-ready hold step', 
   assert.ok(check.checks.some((entry) => entry.check === 'next_steps_exact_policy' && entry.ok === false))
 })
 
-test('legacy SOS-only manifest check preserves the pre-Task-7 check surface', async () => {
+test('generic Host-Go manifest check preserves the pre-Task-7 check surface', async () => {
   const outDir = tmpDir()
   seedCutoverEvidence(outDir)
   const bundle = await buildBundle({ outDir, agents: ['agent-one'], verifyOnly: true })
@@ -3033,7 +3220,7 @@ test('receipt bundle fails when the final cutover gate lacks stop evidence', asy
 
   assert.equal(bundle.status, 'fail')
   assert.ok(bundle.checks.some((c) => c.check === 'cutover_gate_status_pass' && c.ok === false && c.actual === 'fail'))
-  assert.deepEqual(bundle.next_steps, [NEXT_STEP_HOLD])
+  assert.deepEqual(bundle.next_steps, [NEUTRAL_HOLD])
   assert.ok(inspectBundleStatus({ outDir, agents: ['agent-one'] }).next_steps.some((s) => s.includes('agent-one:stop')))
   const gate = JSON.parse(readFileSync(join(outDir, 'cutover-gate.json'), 'utf8'))
   assert.ok(gate.checks.some((c) => c.check === 'control_verb_for_agent' && c.required_verb === 'stop' && c.ok === false))
@@ -3172,6 +3359,8 @@ test('formatHostGoPlan prints a release-neutral live-host command sequence witho
   assert.ok(plan.includes('--export-dir ~/.fleet/receipts/agent-one-attach --export'))
   assert.ok(plan.includes('--out-dir ~/.fleet/receipts/agent-one-attach --check-manifest'))
   assert.ok(plan.includes('export-receipt.json, and manifest-check.json all report status "pass"'))
+  assert.doesNotMatch(plan, /SOS removal/)
+  assert.doesNotMatch(plan, /SOS wiring/)
   assert.doesNotMatch(plan, /mupot_[A-Za-z0-9]/)
   assert.doesNotMatch(plan, /Bearer\s+[A-Za-z0-9]/)
 })
