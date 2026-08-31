@@ -3882,7 +3882,7 @@ function inspectBundleStatus(opts = {}) {
   const requiredControlVerbs = requiredStatusControlVerbs(opts, manifest)
   const controlEvidence = controlEvidenceFromArtifacts(artifacts)
   const hostReceipt = artifacts.host?.path ? projectionContent(readReceipt(artifacts.host.path)) : null
-  const declaredCutoverMode = exactCutoverArtifactMeta(artifacts.cutover_gate)
+  const declaredCutoverMode = verifiedManifestCutoverMode(manifest, manifestCheck)
   const normalizedCutover = normalizePassingCutoverReceipt(gateReceipt)
   const cutoverMode = declaredCutoverMode && normalizedCutover?.mode === declaredCutoverMode
     ? declaredCutoverMode
@@ -3950,7 +3950,7 @@ function inspectBundleStatus(opts = {}) {
   }
   statusCheck(checks, 'cutover_gate_mode_valid', Boolean(cutoverMode), {
     path: artifacts.cutover_gate?.path ?? join(outDir || '<out-dir>', 'cutover-gate.json'),
-    expected: artifacts.cutover_gate?.receipt_type ?? null,
+    expected: manifest?.artifacts?.cutover_gate?.receipt_type ?? null,
     actual: gateReceipt?.receipt_type ?? null,
   })
   statusCheck(checks, 'cutover_gate_pass', Boolean(cutoverMode && gateReceipt?.status === 'pass'), {
@@ -3989,7 +3989,7 @@ function inspectBundleStatus(opts = {}) {
     bundleStatus: summary.status,
     requiredControlVerbs,
     controlEvidence,
-    cutoverMode: cutoverMode ?? (!gateReceipt ? 'neutral' : null),
+    cutoverMode,
   })
   addHostGoStatusNextSteps(next, { outDir, artifacts, agents, gateReceipt, cutoverMode, manifestCheck, requiredControlVerbs, controlEvidence })
   const hostGoChecklist = hostGoStatusChecklist({ outDir, artifacts, agents, gateReceipt, cutoverMode, manifestCheck, requiredControlVerbs, controlEvidence })

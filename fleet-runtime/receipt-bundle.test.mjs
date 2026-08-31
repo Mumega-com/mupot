@@ -2563,6 +2563,36 @@ test('status reports a complete host-go bundle as pass', async () => {
   assert.ok(status.next_steps.includes(NEUTRAL_ATTACH))
 })
 
+test('status rejects manifest cutover metadata and gate content disagreement without selecting a policy', () => {
+  const outDir = seedBundleForMode('mupot-host-go-cutover/v1')
+  const manifestPath = join(outDir, 'manifest.json')
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+  manifest.artifacts.cutover_gate.receipt_type = 'mupot-sos-cutover-gate/v1'
+  manifest.next_steps = [LEGACY_ATTACH]
+  writeJson(manifestPath, manifest)
+
+  const status = inspectBundleStatus({ outDir })
+
+  assert.equal(status.status, 'fail')
+  assert.equal(status.manifest_check.status, 'fail')
+  assert.ok(status.checks.some((entry) =>
+    entry.check === 'cutover_gate_mode_valid' &&
+    entry.expected === 'mupot-sos-cutover-gate/v1' &&
+    entry.actual === 'mupot-host-go-cutover/v1' &&
+    entry.ok === false
+  ))
+  assert.equal(status.next_steps.some((step) => [NEUTRAL_ATTACH, NEUTRAL_HOLD, LEGACY_ATTACH, LEGACY_HOLD].includes(step)), false)
+})
+
+test('status selects no cutover policy when the gate is missing', () => {
+  const outDir = tmpDir()
+  const status = inspectBundleStatus({ outDir, agents: ['agent-one'] })
+
+  assert.equal(status.status, 'fail')
+  assert.ok(status.checks.some((entry) => entry.check === 'cutover_gate_mode_valid' && entry.ok === false))
+  assert.equal(status.next_steps.some((step) => [NEUTRAL_ATTACH, NEUTRAL_HOLD, LEGACY_ATTACH, LEGACY_HOLD].includes(step)), false)
+})
+
 test('status reports missing host-go evidence and next steps for a partial bundle', () => {
   const outDir = tmpDir()
   writeJson(join(outDir, 'host.json'), hostReceipt())
@@ -2596,7 +2626,7 @@ test('status reports missing host-go evidence and next steps for a partial bundl
   assert.ok(status.next_steps.some((s) => s.includes('save installer output')))
   assert.ok(status.next_steps.some((s) => s.includes('queue inbox and lifecycle inputs')))
   assert.ok(status.next_steps.some((s) => s.includes('runtime-agent-one.json')))
-  assert.ok(status.next_steps.includes(NEUTRAL_HOLD))
+  assert.equal(status.next_steps.some((step) => [NEUTRAL_ATTACH, NEUTRAL_HOLD, LEGACY_ATTACH, LEGACY_HOLD].includes(step)), false)
 })
 
 test('status reports stale host receipt missing public-only panel key evidence', () => {
