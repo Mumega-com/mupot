@@ -9,12 +9,24 @@
 - **v0.30.0 stabilization candidate:** PR #1239 landed as merge commit
   `f3389d65172b9660efaa82999675739046a987e9`, restoring a green main migration,
   typecheck, full-suite, schema-source, no-secrets, and local-evidence baseline.
-- **Athena-GREEN, not yet landed:** PR #1243 (credential-rotation recovery) and
-  PR #1242 (router/loop/meter authorization). Each must be refreshed against the
-  preceding merged main before it can enter the stable release candidate.
-- **Still required for the stable candidate:** revalidate/reconstruct the message
-  reliability work in #1235, #1237, and #1241; close or explicitly defer obsolete
-  PRs; run the exact release gate recorded in [ROADMAP.md](ROADMAP.md).
+- **Landed stabilization train:** PR #1243 (`8be1cac7`, credential rotation),
+  PR #1242 (`fb10d79b`, router/loop/meter authorization), PR #1237
+  (`b980f565`, immutable message integrity), PR #1245 (`31644899`, addon binding
+  ordering), PR #1235 (`4d41d9bd`, guest-squad send visibility), and PR #1241
+  (`a3d46acb`, strictly validated peek-only inbox cursor) are on main with
+  post-merge CI and CodeQL evidence.
+- **Release-surface hygiene complete:** obsolete/conflicting #1211, #1217,
+  #1236, and #1238 were closed with replacement or deferral evidence; branches
+  were preserved.
+- **Post-freeze main drift recorded:** PR #1249 landed externally as merge
+  commit `16390d1e` after #1241, adding exact external-runtime dispatch receipt
+  paths. Its code is present in the candidate base but remains preview rather
+  than a newly promoted stable-release claim. Earlier #1250 heads based on
+  `a3d46acb` were re-gated only after restacking on this main commit.
+- **Still required for the stable candidate:** land the corrected release
+  metadata/tooling, collect the fresh receipts in
+  [the v0.30.0 release contract](docs/releases/v0.30.0.md), and pass the exact
+  release gate recorded in [ROADMAP.md](ROADMAP.md).
 - **Release-excluded:** the #1236 omnibus, project-worker/sandbox expansion, device
   fleet, new onboarding journeys, and other unbounded feature work. Useful donor
   material must return through separate reviewed PRs after `v0.30.0`.
@@ -29,7 +41,7 @@ No entry in this section claims a deployment. Tagging, publishing, and deploying
   - Model prompts use a frozen static prefix (charter, architecture, tool schemas, River governance) with dynamic turns at the bottom, plus a keep-alive heartbeat.
   - D1 registers River on `squad-core` (`gemini-3.7-flash`) when that squad exists; `check_in` records 7-axis presence for `seat: river-cursor`.
 
-## 0.30.0 source cut — 2026-08-21 (preview; not tagged)
+## [0.30.0] — source cut 2026-08-21 (release candidate; not tagged)
 
 This heading records when the source version advanced to `0.30.0`. It is not a
 stable-release date. Features listed here remain preview until the stabilization

@@ -55,11 +55,12 @@ Three consequences this document now carries:
 | # | Candidate | Purpose | State | Required next action |
 |---|---|---|---|---|
 | 0 | PR #1239 — CI foundation | Restore migration, typecheck, full-suite, schema, secrets, and local-evidence truth | **LANDED 2026-08-30** as `f3389d65`; post-merge CI 13/13 | Keep as the release baseline |
-| 1 | PR #1243 — credential rotation | Org authorization before lookup; resumable, lease-fenced handoff recovery | Athena GREEN on old stacked base | Retarget to current `main`, refresh full CI/Athena, then Hadi merge decision |
-| 2 | PR #1242 — router/loop/meter authorization | Explicit squad authority, claim-time grant check, internal loop tick, server-owned meter caps | Athena GREEN on old stacked base | After #1243 lands, rebase on combined `main`, refresh full CI/Athena, then Hadi merge decision |
-| 3 | Message reliability — #1235/#1237/#1241 | Guest visibility, immutable integrity baseline, starvation-free inbox cursor | Old bases; not release-ready | Revalidate each invariant on fresh main and reconstruct as bounded PRs in dependency order |
-| 4 | PR hygiene — #1211/#1217/#1236/#1238 | Remove obsolete/conflicting work from the release surface | Open but excluded | Link replacement evidence; close, archive, or explicitly defer |
-| 5 | `v0.30.0` release candidate | One exact main SHA, upgrade/fresh migration proof, browser/runtime/MCP smoke, release receipt | Not started | Freeze features after rows 1–4, run release gate, request Athena and Hadi tag approval |
+| 1 | PR #1243 — credential rotation | Org authorization before lookup; resumable, lease-fenced handoff recovery | **LANDED 2026-08-30** as `8be1cac7` | Retain exact-head gate receipt in the release bundle |
+| 2 | PR #1242 — router/loop/meter authorization | Explicit squad authority, claim-time grant check, internal loop tick, server-owned meter caps | **LANDED 2026-08-30** as `fb10d79b` | Retain exact-head gate receipt in the release bundle |
+| 3 | Message reliability — #1235/#1237/#1241 | Guest visibility, immutable integrity baseline, starvation-free inbox cursor | **LANDED** — #1237 `b980f565`, #1235 `4d41d9bd`, and #1241 `a3d46acb`; post-main CI/CodeQL green | Retain exact-head and landing receipts in the release bundle |
+| 4 | PR hygiene — #1211/#1217/#1236/#1238 | Remove obsolete/conflicting work from the release surface | **COMPLETE** — all four closed with replacement/deferral evidence; branches preserved | Keep release-excluded work out of the freeze |
+| 4a | PR #1249 — external runtime dispatch receipts | Exact external dispatch, gate, replay, cancellation, and public receipt paths | **LANDED OUTSIDE THE ORDERED TRAIN** as `16390d1e`; present in main as preview | Restack the release head on it, retain exact combined gates, and do not promote new stable claims without a separate scope decision |
+| 5 | `v0.30.0` release candidate | One exact main SHA, upgrade/fresh migration proof, browser/runtime/MCP smoke, release receipt | **IN PREPARATION** — [release contract](docs/releases/v0.30.0.md) defined; evidence remains pending | Merge corrected metadata/tooling after exact-head gates, freeze one SHA, collect contract receipts, then request separate RC publication/deployment approvals |
 
 **Board opinion policy:** priority ORDER is Hadi's alone — no vote, no ceremony. Board
 input (asha first-pass, Athena architecture, River build feasibility) is requested per

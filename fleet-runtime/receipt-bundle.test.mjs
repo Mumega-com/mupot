@@ -3146,7 +3146,7 @@ test('parseArgs accepts host-go plan options', () => {
   assert.deepEqual(opts.agents, ['agent-one'])
 })
 
-test('formatHostGoPlan prints the full #274 live-host command sequence without token values', () => {
+test('formatHostGoPlan prints a release-neutral live-host command sequence without token values', () => {
   const plan = formatHostGoPlan({
     agents: ['agent-one'],
     outDir: '~/.fleet/receipts/agent-one',
@@ -3156,7 +3156,8 @@ test('formatHostGoPlan prints the full #274 live-host command sequence without t
     requiredControlVerbs: ['start', 'stop'],
   })
 
-  assert.ok(plan.includes('Mupot host-go plan (#274)'))
+  assert.ok(plan.includes('Mupot host-go plan'))
+  assert.doesNotMatch(plan, /#274/)
   assert.ok(plan.includes('node fleet-runtime/install.mjs > ~/.fleet/receipts/install.json'))
   assert.ok(plan.includes('node ~/.fleet/runtime/receipt-bundle.mjs --agent agent-one --out-dir ~/.fleet/receipts/agent-one --require-control-verb start,stop --install-receipt ~/.fleet/receipts/install.json --skip-runtime --skip-control'))
   assert.ok(plan.includes('# Requires MUPOT_AGENT_TOKEN and MUPOT_OWNER_TOKEN in the environment.'))

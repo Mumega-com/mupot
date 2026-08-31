@@ -66,7 +66,8 @@ describe('work lifecycle receipt checker', () => {
       taskId: TARGET.task_id,
     })
 
-    expect(plan).toContain('Mupot v0.23 real work-lifecycle evidence plan')
+    expect(plan).toContain('Mupot real work-lifecycle evidence plan')
+    expect(plan).not.toContain('v0.23')
     expect(plan).toContain(STEP_RECEIPT_TYPE)
     expect(plan).toContain('task-created.json')
     expect(plan).toContain('work-lifecycle-check.json')
@@ -88,6 +89,7 @@ describe('work lifecycle receipt checker', () => {
     expect(receipt.status).toBe('pass')
     expect(receipt.summary.step_receipts).toBe(REQUIRED_STEPS.length)
     expect(receipt.target.task_id).toBe(TARGET.task_id)
+    expect(receipt.next_steps.join(' ')).not.toContain('v0.23 release issue')
   })
 
   it('fails when human approval evidence is missing', () => {

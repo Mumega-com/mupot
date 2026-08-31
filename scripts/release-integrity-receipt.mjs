@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Mupot v0.23 release-integrity evidence checker.
+// Mupot release-integrity evidence checker.
 //
 // This runs after the real release blockers pass. It keeps the final publish
 // step falsifiable by checking local release metadata plus exported GitHub
@@ -7,13 +7,13 @@
 
 import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { basename, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 export const CHECK_RECEIPT_TYPE = 'mupot-release-integrity/v1'
 
-const DEFAULT_VERSION = 'v0.23.0'
+const DEFAULT_VERSION = `v${JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version}`
 const DEFAULT_REPO = 'Mumega-com/mupot'
 
 const SECRET_VALUE_PATTERNS = [
@@ -71,7 +71,7 @@ export function usage() {
     '  --plan                    print the final release-integrity evidence plan',
     '  --check                   check local metadata plus GitHub evidence JSON',
     '  --summary                 with --check, print a compact text summary',
-    '  --version <version>       expected final version; default v0.23.0',
+    '  --version <version>       expected final version; default current package version',
     '  --repo <owner/repo>       GitHub repo; default Mumega-com/mupot',
     '  --repo-root <path>        local repo root; default cwd',
     '  --out-dir <path>          evidence directory',
@@ -100,7 +100,7 @@ export function normalizeVersion(version) {
   const raw = String(version || '').trim()
   const semver = raw.replace(/^v/i, '')
   if (!/^\d+\.\d+\.\d+$/.test(semver)) {
-    throw new Error(`expected a final semver release like v0.23.0, got ${version}`)
+    throw new Error(`expected a final semver release like v1.2.3, got ${version}`)
   }
   return { semver, tag: `v${semver}` }
 }
@@ -114,12 +114,12 @@ export function formatPlan(opts = {}) {
   const tagPath = join(outDir, 'github-tag.json')
   const lines = []
 
-  lines.push('Mupot v0.23 release-integrity evidence plan')
+  lines.push(`Mupot ${tag} release-integrity evidence plan`)
   lines.push('')
   lines.push(`Goal: prove package version, public API version, changelog, roadmap, Git tag, milestone, and GitHub Release all agree on ${tag}.`)
   lines.push('')
   lines.push('Run only after the prepublication readiness receipt passes and the exact release commit is tagged and published.')
-  lines.push('Remove release-control trackers #281, #284, and #345 from the product milestone, then close that milestone only after its product-objective issue count reaches zero.')
+  lines.push('Move release-control trackers outside the product milestone, then close that milestone only after its product-objective issue count reaches zero.')
   lines.push('')
   lines.push(commandLine(['mkdir', '-p', outDir]))
   lines.push('')
@@ -227,6 +227,16 @@ function repoPath(repoRoot, path) {
   return join(repoRoot, path)
 }
 
+function releaseDocumentPath(repoRoot, tag) {
+  const releaseDir = repoPath(repoRoot, 'docs/releases')
+  const canonical = join(releaseDir, `${tag}.md`)
+  if (existsSync(canonical) || !existsSync(releaseDir)) return canonical
+  const compatible = readdirSync(releaseDir)
+    .filter((name) => name.startsWith(`${tag}-`) && name.endsWith('.md'))
+    .sort()
+  return compatible.length === 1 ? join(releaseDir, compatible[0]) : canonical
+}
+
 function extractPublicApiVersion(versionSource) {
   const match = versionSource.match(/MUPOT_PUBLIC_API_VERSION\s*=\s*['"]([^'"]+)['"]/)
   return match ? match[1] : ''
@@ -272,7 +282,7 @@ export function checkBundle(opts = {}) {
   const mcpPath = repoPath(repoRoot, 'src/mcp/index.ts')
   const changelogPath = repoPath(repoRoot, 'CHANGELOG.md')
   const roadmapPath = repoPath(repoRoot, 'ROADMAP.md')
-  const releaseDocPath = repoPath(repoRoot, 'docs/releases/v0.23.0-trusted-runtime.md')
+  const releaseDocPath = releaseDocumentPath(repoRoot, tag)
 
   const packageText = readText(checks, packagePath, 'package')
   const packageLockText = readText(checks, packageLockPath, 'package_lock')
@@ -343,14 +353,16 @@ export function checkBundle(opts = {}) {
   // a moving branch name. Resolve the published tag through GitHub instead.
   const githubTag = parseJsonFile(checks, githubTagPath, 'github_tag')
   artifacts.github_tag = artifactMeta(githubTagPath, githubTag ? JSON.stringify(githubTag) : null)
-  const githubTagSha = String(field(githubTag, 'sha') ?? '')
-  pushCheck(checks, /^[0-9a-f]{40}$/i.test(githubTagSha), 'github_tag_commit_sha_present', {
+  const githubTagShaRaw = field(githubTag, 'sha')
+  const githubTagSha = typeof githubTagShaRaw === 'string' ? githubTagShaRaw : ''
+  const githubTagShaValid = /^[0-9a-f]{40}$/.test(githubTagSha)
+  pushCheck(checks, githubTagShaValid, 'github_tag_commit_sha_present', {
     path: githubTagPath,
-    actual: githubTagSha || null,
+    actual: githubTagShaRaw ?? null,
   })
-  pushCheck(checks, Boolean(tagSha && githubTagSha && githubTagSha === tagSha), 'github_tag_commit_matches_local_tag', {
+  pushCheck(checks, Boolean(tagSha && githubTagShaValid && githubTagSha === tagSha), 'github_tag_commit_matches_local_tag', {
     expected: tagSha || null,
-    actual: githubTagSha || null,
+    actual: githubTagShaRaw ?? null,
   })
 
   const milestoneJson = parseJsonFile(checks, milestonePath, 'github_milestone')
@@ -370,17 +382,12 @@ export function checkBundle(opts = {}) {
   const releaseName = String(field(release, 'name') ?? '')
   const releaseDraft = Boolean(field(release, 'draft', 'isDraft'))
   const releasePrerelease = Boolean(field(release, 'prerelease', 'isPrerelease'))
-  const releaseTarget = String(field(release, 'target_commitish', 'targetCommitish') ?? '')
   const releasePublishedAt = String(field(release, 'published_at', 'publishedAt') ?? '')
   pushCheck(checks, Boolean(release), 'github_release_present_for_version', { path: releasePath })
   pushCheck(checks, releaseTag === tag, 'github_release_tag_matches_expected', { expected: tag, actual: releaseTag || null })
   pushCheck(checks, releaseName.includes(tag) || releaseName.includes(semver), 'github_release_name_matches_version', { expected: tag, actual: releaseName || null })
   pushCheck(checks, releaseDraft === false, 'github_release_is_not_draft', { actual: releaseDraft })
   pushCheck(checks, releasePrerelease === false, 'github_release_is_not_prerelease', { actual: releasePrerelease })
-  pushCheck(checks, Boolean(tagSha && releaseTarget === tagSha), 'github_release_target_matches_tag_commit', {
-    expected: tagSha || null,
-    actual: releaseTarget || null,
-  })
   pushCheck(checks, Boolean(releasePublishedAt && !Number.isNaN(Date.parse(releasePublishedAt))), 'github_release_published_at_present', {
     actual: releasePublishedAt || null,
   })
@@ -402,7 +409,7 @@ export function checkBundle(opts = {}) {
       package_lock_root_version: packageLockRootVersion || null,
       public_api_version: publicApiVersion || null,
       git_tag_sha: tagSha || null,
-      github_tag_sha: githubTagSha || null,
+      github_tag_sha: githubTagShaValid ? githubTagSha : null,
       git_head_sha: headSha || null,
       milestone_title: milestoneTitle || null,
       release_tag: releaseTag || null,
@@ -415,9 +422,9 @@ export function checkBundle(opts = {}) {
     artifacts,
     checks,
     next_steps: failed.length === 0
-      ? ['attach release-integrity-check.json to #281, close #281, then run final release readiness']
+      ? ['attach release-integrity-check.json to the release tracker, then run final release readiness']
       : milestoneState !== 'closed' || milestoneOpenIssues !== 0
-        ? ['remove release-control trackers #281, #284, and #345 from the product milestone, close the zero-open product milestone, then rerun']
+        ? ['move release-control trackers outside the product milestone, close the zero-open product milestone, then rerun']
         : ['align failing release metadata, export fresh GitHub milestone/release JSON, then rerun release-integrity-receipt --check'],
   }
 }

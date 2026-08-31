@@ -11,7 +11,7 @@ import {
   parseArgs,
 } from '../scripts/release-integrity-receipt.mjs'
 
-const VERSION = '0.23.0'
+const VERSION = '0.30.0'
 const TAG = `v${VERSION}`
 
 function tempDir() {
@@ -52,7 +52,7 @@ function writeRepo(mutate?: (repo: string, outDir: string) => void) {
   ].join('\n'))
   writeFileSync(join(repo, 'CHANGELOG.md'), `# Changelog\n\n## [${VERSION}] - 2026-07-09\n\n- Trusted Runtime.\n`)
   writeFileSync(join(repo, 'ROADMAP.md'), `# Roadmap\n\n## ${TAG} - Trusted Runtime\n\nRelease metadata aligned.\n`)
-  writeFileSync(join(repo, 'docs', 'releases', 'v0.23.0-trusted-runtime.md'), `# Mupot ${TAG} - Trusted Runtime\n\nRelease integrity must pass.\n`)
+  writeFileSync(join(repo, 'docs', 'releases', `${TAG}.md`), `# Mupot ${TAG} - Stabilized Control Plane\n\nRelease integrity must pass.\n`)
   writeFileSync(join(outDir, 'github-milestone.json'), JSON.stringify({
     title: `${TAG} - Trusted Runtime`,
     state: 'closed',
@@ -104,11 +104,11 @@ describe('release integrity receipt checker', () => {
       outDir: `tmp/release-integrity/${TAG}`,
     })
 
-    expect(plan).toContain('Mupot v0.23 release-integrity evidence plan')
-    expect(plan).toContain('Remove release-control trackers #281, #284, and #345 from the product milestone')
+    expect(plan).toContain(`Mupot ${TAG} release-integrity evidence plan`)
+    expect(plan).toContain('Move release-control trackers outside the product milestone')
     expect(plan).toContain('gh api repos/Mumega-com/mupot/milestones')
-    expect(plan).toContain('gh release view v0.23.0')
-    expect(plan).toContain('repos/Mumega-com/mupot/commits/v0.23.0')
+    expect(plan).toContain(`gh release view ${TAG}`)
+    expect(plan).toContain(`repos/Mumega-com/mupot/commits/${TAG}`)
     expect(plan).toContain('github-tag.json')
     expect(plan).toContain('release-integrity-check.json')
     expect(plan).not.toContain('production soak')
@@ -131,7 +131,7 @@ describe('release integrity receipt checker', () => {
     expect(receipt.target.release_tag).toBe(TAG)
     expect(receipt.target.github_tag_sha).toBe(receipt.target.git_tag_sha)
     expect(receipt.next_steps).toContain(
-      'attach release-integrity-check.json to #281, close #281, then run final release readiness',
+      'attach release-integrity-check.json to the release tracker, then run final release readiness',
     )
   })
 
@@ -161,12 +161,12 @@ describe('release integrity receipt checker', () => {
     const { repo, outDir } = writeRepo((repoRoot) => {
       writeFileSync(join(repoRoot, 'package-lock.json'), JSON.stringify({
         name: 'mupot',
-        version: '0.23.0-rc.1',
+        version: `${VERSION}-rc.1`,
         lockfileVersion: 3,
         packages: {
           '': {
             name: 'mupot',
-            version: '0.23.0-rc.1',
+            version: `${VERSION}-rc.1`,
           },
         },
       }, null, 2))
@@ -206,7 +206,7 @@ describe('release integrity receipt checker', () => {
       check: 'github_milestone_has_no_open_issues',
     }))
     expect(receipt.next_steps).toContain(
-      'remove release-control trackers #281, #284, and #345 from the product milestone, close the zero-open product milestone, then rerun',
+      'move release-control trackers outside the product milestone, close the zero-open product milestone, then rerun',
     )
   })
 
@@ -229,14 +229,30 @@ describe('release integrity receipt checker', () => {
     }))
   })
 
-  it('fails when the stable release is unpublished or targets another commit', () => {
+  it('accepts a branch-valued stable release target when the remote tag resolves locally', () => {
     const { repo, outDir } = writeRepo()
     writeFileSync(join(outDir, 'github-release.json'), JSON.stringify({
       tagName: TAG,
       name: `${TAG} - Trusted Runtime`,
       isDraft: false,
       isPrerelease: false,
-      targetCommitish: 'f'.repeat(40),
+      targetCommitish: 'main',
+      publishedAt: '2026-07-13T00:00:00Z',
+    }, null, 2))
+
+    const receipt = checkBundle({ repoRoot: repo, outDir, version: TAG })
+
+    expect(receipt.status).toBe('pass')
+  })
+
+  it('fails when the stable release is unpublished', () => {
+    const { repo, outDir } = writeRepo()
+    writeFileSync(join(outDir, 'github-release.json'), JSON.stringify({
+      tagName: TAG,
+      name: `${TAG} - Trusted Runtime`,
+      isDraft: false,
+      isPrerelease: false,
+      targetCommitish: 'main',
       publishedAt: null,
     }, null, 2))
 
@@ -247,9 +263,25 @@ describe('release integrity receipt checker', () => {
       ok: false,
       check: 'github_release_published_at_present',
     }))
+  })
+
+  it.each([
+    ['missing', undefined],
+    ['null', null],
+    ['array', ['a'.repeat(40)]],
+    ['object', { sha: 'a'.repeat(40) }],
+    ['uppercase', 'A'.repeat(40)],
+  ] as const)('fails closed when the GitHub tag SHA is %s', (_, sha) => {
+    const { repo, outDir } = writeRepo()
+    writeFileSync(join(outDir, 'github-tag.json'), JSON.stringify({ sha, html_url: 'https://github.test/commit/invalid' }, null, 2))
+
+    const receipt = checkBundle({ repoRoot: repo, outDir, version: TAG })
+
+    expect(receipt.status).toBe('fail')
     expect(receipt.checks).toContainEqual(expect.objectContaining({
       ok: false,
-      check: 'github_release_target_matches_tag_commit',
+      check: 'github_tag_commit_sha_present',
+      actual: sha ?? null,
     }))
   })
 

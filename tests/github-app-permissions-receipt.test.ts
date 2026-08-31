@@ -63,13 +63,15 @@ describe('GitHub App permissions receipt checker', () => {
     expect(ghOpts.organization).toBe('Mumega-com')
   })
 
-  it('prints the #151 evidence plan', () => {
+  it('prints a release-neutral GitHub App evidence plan', () => {
     const plan = formatPlan({
       outDir: 'tmp/github-app-permissions/mupot',
       app: 'mupot',
     })
 
-    expect(plan).toContain('Mupot v0.23 GitHub App least-privilege evidence plan')
+    expect(plan).toContain('Mupot GitHub App least-privilege evidence plan')
+    expect(plan).not.toContain('v0.23')
+    expect(plan).not.toContain('#151')
     expect(plan).toContain('GET /app')
     expect(plan).toContain('--export-gh')
     expect(plan).toContain('--export-app')
@@ -238,8 +240,19 @@ describe('GitHub App permissions receipt checker', () => {
           permissions: REQUIRED_APP_PERMISSIONS,
         })
       }
-      return JSON.stringify([{
-        installations: [{
+      return [
+        JSON.stringify({
+          id: 111111,
+          app_id: 123456,
+          app_slug: 'other-app',
+          account: { login: 'Mumega-com', id: 999, type: 'Organization' },
+          repository_selection: 'all',
+          permissions: REQUIRED_APP_PERMISSIONS,
+          created_at: '2026-06-01T00:00:00.000Z',
+          updated_at: '2026-06-10T00:00:00.000Z',
+          suspended_at: null,
+        }),
+        JSON.stringify({
           id: Number(INSTALLATION_ID),
           app_id: 123456,
           app_slug: 'mupot',
@@ -249,8 +262,8 @@ describe('GitHub App permissions receipt checker', () => {
           created_at: '2026-07-01T00:00:00.000Z',
           updated_at: '2026-07-10T00:00:00.000Z',
           suspended_at: null,
-        }],
-      }])
+        }),
+      ].join('\n')
     }
 
     const result = await exportGhAppDefinition({
@@ -265,7 +278,7 @@ describe('GitHub App permissions receipt checker', () => {
       args: ['api', 'apps/mupot'],
     }, {
       file: 'gh',
-      args: ['api', '--paginate', '--slurp', 'orgs/Mumega-com/installations'],
+      args: ['api', '--paginate', 'orgs/Mumega-com/installations', '--jq', '.installations[] | @json'],
     }])
     expect(result.source).toEqual({
       app: 'gh api apps/mupot',
@@ -275,7 +288,68 @@ describe('GitHub App permissions receipt checker', () => {
     expect(JSON.parse(readFileSync(result.installationPath, 'utf8')).permissions).toEqual(REQUIRED_APP_PERMISSIONS)
   })
 
-  it('passes when the App has only the v0.23 least-privilege set', () => {
+  it('accepts CRLF-delimited installation output and trailing blank lines', async () => {
+    const dir = tempDir()
+    const ghExec = (file: string, args: string[]) => {
+      if (args.at(-1) === 'apps/mupot') {
+        return JSON.stringify({
+          id: 123456,
+          slug: 'mupot',
+          permissions: REQUIRED_APP_PERMISSIONS,
+        })
+      }
+      return `${JSON.stringify({ id: Number(INSTALLATION_ID), app_id: 123456, app_slug: 'mupot', permissions: REQUIRED_APP_PERMISSIONS })}\r\n\r\n`
+    }
+
+    const result = await exportGhAppDefinition({
+      outDir: dir,
+      app: 'mupot',
+      organization: 'Mumega-com',
+      installationId: INSTALLATION_ID,
+    }, { ghExec })
+
+    expect(JSON.parse(readFileSync(result.installationPath, 'utf8')).id).toBe(Number(INSTALLATION_ID))
+  })
+
+  it('fails with a fixed non-leaking error when gh emits malformed installation JSON', async () => {
+    const dir = tempDir()
+    const secret = 'installation-secret-token'
+    const ghExec = (file: string, args: string[]) => {
+      if (args.at(-1) === 'apps/mupot') {
+        return JSON.stringify({ id: 123456, slug: 'mupot', permissions: REQUIRED_APP_PERMISSIONS })
+      }
+      return `${JSON.stringify({ id: Number(INSTALLATION_ID), app_id: 123456, app_slug: 'mupot', permissions: REQUIRED_APP_PERMISSIONS })}\n${secret}`
+    }
+
+    const exportPromise = exportGhAppDefinition({
+      outDir: dir,
+      app: 'mupot',
+      organization: 'Mumega-com',
+      installationId: INSTALLATION_ID,
+    }, { ghExec })
+    await expect(exportPromise).rejects.toThrow('gh api returned invalid JSON')
+    await expect(exportPromise).rejects.not.toThrow(secret)
+  })
+
+  it.each([
+    ['empty output', ''],
+    ['missing target', JSON.stringify({ id: 111111, app_id: 123456, app_slug: 'other-app' })],
+    ['duplicate target', `${JSON.stringify({ id: Number(INSTALLATION_ID), app_id: 123456, app_slug: 'mupot' })}\n${JSON.stringify({ id: Number(INSTALLATION_ID), app_id: 123456, app_slug: 'mupot' })}`],
+  ])('fails when installation output has %s', async (_caseName, installations) => {
+    const dir = tempDir()
+    const ghExec = (file: string, args: string[]) => args.at(-1) === 'apps/mupot'
+      ? JSON.stringify({ id: 123456, slug: 'mupot', permissions: REQUIRED_APP_PERMISSIONS })
+      : installations
+
+    await expect(exportGhAppDefinition({
+      outDir: dir,
+      app: 'mupot',
+      organization: 'Mumega-com',
+      installationId: INSTALLATION_ID,
+    }, { ghExec })).rejects.toThrow(`organization installation ${INSTALLATION_ID} was not found exactly once under Mumega-com`)
+  })
+
+  it('passes when the App has only the required least-privilege set', () => {
     const dir = tempDir()
     writeApp(dir)
 
@@ -284,6 +358,7 @@ describe('GitHub App permissions receipt checker', () => {
     expect(receipt.receipt_type).toBe(CHECK_RECEIPT_TYPE)
     expect(receipt.status).toBe('pass')
     expect(receipt.summary.required_app_permissions).toBe(Object.keys(REQUIRED_APP_PERMISSIONS).length)
+    expect(receipt.next_steps.join(' ')).not.toContain('#151')
   })
 
   it('fails when workflows permission is still enabled', () => {
