@@ -573,6 +573,27 @@ function seedLegacyCutoverEvidence(outDir) {
   return seedBundleForMode('mupot-sos-cutover-gate/v1', outDir)
 }
 
+function rewriteCutoverMode(outDir, gateType) {
+  const paths = {
+    hostPath: join(outDir, 'host.json'),
+    runtimePath: join(outDir, 'runtime-agent-one.json'),
+    startPath: join(outDir, 'control-start.json'),
+    stopPath: join(outDir, 'control-stop.json'),
+  }
+  const gate = gateType === 'mupot-host-go-cutover/v1'
+    ? neutralCutoverReceipt(paths)
+    : legacyCutoverReceipt(paths)
+  const gatePath = writeJson(join(outDir, 'cutover-gate.json'), gate)
+  const manifestPath = join(outDir, 'manifest.json')
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+  manifest.artifacts.cutover_gate.receipt_type = gateType
+  manifest.artifacts.cutover_gate.status = 'pass'
+  manifest.artifacts.cutover_gate.sha256 = sha256(gatePath)
+  manifest.next_steps = [gateType === 'mupot-host-go-cutover/v1' ? NEUTRAL_ATTACH : LEGACY_ATTACH]
+  writeJson(manifestPath, manifest)
+  return manifest
+}
+
 function starterPaths(overrides = {}) {
   const sourceDir = overrides.sourceDir ?? tmpDir()
   const service = overrides.service ?? serviceReceipt()
@@ -778,6 +799,21 @@ function seedStarterEvidence(outDir, sources) {
   writeJson(join(outDir, 'runtime-agent-one.json'), evidence.runtime)
   writeJson(join(outDir, 'control-start.json'), evidence.controlStart)
   writeJson(join(outDir, 'control-stop.json'), evidence.controlStop)
+}
+
+async function exportPortableBundleForMode(gateType) {
+  const outDir = tmpDir()
+  const sources = starterPaths()
+  seedStarterEvidence(outDir, sources)
+  const bundle = await buildBundle({ outDir, agents: ['agent-one'], verifyOnly: true, ...sources })
+  assert.equal(bundle.status, 'pass', JSON.stringify(bundle.checks.filter((entry) => entry.ok !== true), null, 2))
+  rewriteCutoverMode(outDir, gateType)
+  const sourceCheck = checkBundleManifest({ outDir })
+  assert.equal(sourceCheck.status, 'pass', JSON.stringify(sourceCheck.checks.filter((entry) => entry.ok !== true), null, 2))
+  const exportDir = tmpDir()
+  const exportReceipt = exportBundle({ outDir, exportDir })
+  assert.equal(exportReceipt.status, 'pass', JSON.stringify(exportReceipt.checks.filter((entry) => entry.ok !== true), null, 2))
+  return { outDir, sources, exportDir, exportReceipt }
 }
 
 const STARTER_ROLE_FILES = Object.freeze({
@@ -1069,6 +1105,56 @@ test('starter-ready bundle requires, exports, and summarizes service continuity 
   }
   assert.deepEqual(absoluteStrings(copiedCheck), [])
   assert.deepEqual(absoluteStrings(inspectBundleStatus({ outDir: exportDir })), [])
+})
+
+for (const [name, gateType, attachPolicy] of [
+  ['neutral', 'mupot-host-go-cutover/v1', NEUTRAL_ATTACH],
+  ['historical legacy', 'mupot-sos-cutover-gate/v1', LEGACY_ATTACH],
+]) {
+  test(`portable export preserves ${name} cutover type, provenance, and status`, async () => {
+    const { exportDir, exportReceipt } = await exportPortableBundleForMode(gateType)
+    assert.deepEqual(exportReceipt.next_steps, [attachPolicy])
+
+    const manifest = JSON.parse(readFileSync(join(exportDir, 'manifest.json'), 'utf8'))
+    assert.equal(manifest.artifacts.cutover_gate.receipt_type, gateType)
+    const mapping = manifest.provenance.projections.find((entry) => entry.role === 'cutover_gate')
+    assert.equal(mapping.source_receipt_type, gateType)
+    const projection = JSON.parse(readFileSync(join(exportDir, mapping.path), 'utf8'))
+    assert.equal(projection.source_receipt_type, gateType)
+    assert.equal(projection.content.receipt_type, gateType)
+    assert.equal(JSON.parse(readFileSync(join(exportDir, mapping.source_path), 'utf8')).receipt_type, gateType)
+
+    const check = checkBundleManifest({ outDir: exportDir })
+    assert.equal(check.status, 'pass', JSON.stringify(check.checks.filter((entry) => entry.ok !== true), null, 2))
+    assert.ok(check.checks.some((entry) =>
+      entry.check === 'artifact_receipt_type_expected' &&
+      entry.artifact === 'cutover_gate' &&
+      entry.expected === gateType &&
+      entry.ok === true
+    ))
+    const status = inspectBundleStatus({ outDir: exportDir })
+    assert.equal(status.status, 'pass', JSON.stringify(status.checks.filter((entry) => entry.ok !== true), null, 2))
+    assert.deepEqual(status.next_steps, [attachPolicy])
+  })
+}
+
+test('portable provenance rejects a mapping that changes only the cutover receipt type', async () => {
+  const { exportDir } = await exportPortableBundleForMode('mupot-host-go-cutover/v1')
+  const manifestPath = join(exportDir, 'manifest.json')
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+  const mapping = manifest.provenance.projections.find((entry) => entry.role === 'cutover_gate')
+  mapping.source_receipt_type = 'mupot-sos-cutover-gate/v1'
+  writeJson(manifestPath, manifest)
+
+  const check = checkBundleManifest({ outDir: exportDir })
+  assert.equal(check.status, 'fail')
+  assert.ok(check.checks.some((entry) =>
+    entry.check === 'provenance_source_type_match' &&
+    entry.artifact === 'cutover_gate' &&
+    entry.expected === 'mupot-host-go-cutover/v1' &&
+    entry.actual === 'mupot-sos-cutover-gate/v1' &&
+    entry.ok === false
+  ))
 })
 
 test('starter-ready accepts daemon-state lifecycle receipts and binds them to the running control service', async () => {
@@ -1817,6 +1903,121 @@ test('manifest checker preserves a strict historical SOS cutover bundle', () => 
   const outDir = seedLegacyCutoverEvidence(tmpDir())
   const check = checkBundleManifest({ outDir })
   assert.equal(check.status, 'pass', JSON.stringify(check.checks.filter((entry) => entry.ok !== true), null, 2))
+})
+
+for (const [name, gateType, attachPolicy] of [
+  ['neutral', 'mupot-host-go-cutover/v1', NEUTRAL_ATTACH],
+  ['historical legacy', 'mupot-sos-cutover-gate/v1', LEGACY_ATTACH],
+]) {
+  test(`copied ${name} bundle preserves exact cutover mode through manifest, export, and status`, () => {
+    const outDir = seedBundleForMode(gateType)
+    const copiedDir = tmpDir()
+    for (const file of readdirSync(outDir)) copyFileSync(join(outDir, file), join(copiedDir, file))
+    chmodSync(copiedDir, 0o700)
+    for (const file of readdirSync(copiedDir)) chmodSync(join(copiedDir, file), 0o600)
+
+    const check = checkBundleManifest({ outDir: copiedDir })
+    assert.equal(check.status, 'pass', JSON.stringify(check.checks.filter((entry) => entry.ok !== true), null, 2))
+    assert.ok(check.checks.some((entry) =>
+      entry.check === 'artifact_receipt_type_expected' &&
+      entry.artifact === 'cutover_gate' &&
+      entry.expected === gateType &&
+      entry.ok === true
+    ))
+
+    const exportDir = tmpDir()
+    const exportReceipt = exportBundle({ outDir: copiedDir, exportDir })
+    assert.equal(exportReceipt.status, 'pass', JSON.stringify(exportReceipt.checks.filter((entry) => entry.ok !== true), null, 2))
+    assert.deepEqual(exportReceipt.next_steps, [attachPolicy])
+    const exportedManifest = JSON.parse(readFileSync(join(exportDir, 'manifest.json'), 'utf8'))
+    assert.equal(exportedManifest.artifacts.cutover_gate.receipt_type, gateType)
+    assert.equal(exportReceipt.artifacts.copied.find((entry) => entry.label === 'cutover_gate').receipt_type, gateType)
+    assert.equal(checkBundleManifest({ outDir: exportDir }).status, 'pass')
+
+    const status = inspectBundleStatus({ outDir: exportDir })
+    assert.equal(status.status, 'pass', JSON.stringify(status.checks.filter((entry) => entry.ok !== true), null, 2))
+    assert.deepEqual(status.next_steps, [attachPolicy])
+    assert.equal(checklistById(status, 'cutover_gate_passed').status, 'pass')
+  })
+}
+
+test('manifest rejects cutover metadata and gate-file type disagreement without a fallback mode', () => {
+  const outDir = seedBundleForMode('mupot-host-go-cutover/v1')
+  const manifestPath = join(outDir, 'manifest.json')
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+  manifest.artifacts.cutover_gate.receipt_type = 'mupot-sos-cutover-gate/v1'
+  manifest.next_steps = [LEGACY_ATTACH]
+  writeJson(manifestPath, manifest)
+
+  const check = checkBundleManifest({ outDir })
+  assert.equal(check.status, 'fail')
+  assert.ok(check.checks.some((entry) => entry.check === 'cutover_gate_mode_valid' && entry.ok === false))
+  assert.ok(check.checks.some((entry) =>
+    entry.check === 'artifact_receipt_type_expected' &&
+    entry.artifact === 'cutover_gate' &&
+    entry.expected === 'mupot-sos-cutover-gate/v1' &&
+    entry.actual === 'mupot-host-go-cutover/v1' &&
+    entry.ok === false
+  ))
+})
+
+for (const [gateType, wrongPolicy] of [
+  ['mupot-host-go-cutover/v1', LEGACY_ATTACH],
+  ['mupot-sos-cutover-gate/v1', NEUTRAL_ATTACH],
+]) {
+  test(`export checker rejects ${gateType} policy disagreement`, () => {
+    const outDir = seedBundleForMode(gateType)
+    const exportDir = tmpDir()
+    assert.equal(exportBundle({ outDir, exportDir }).status, 'pass')
+    const sidecarPath = join(exportDir, 'export-receipt.json')
+    const sidecar = JSON.parse(readFileSync(sidecarPath, 'utf8'))
+    sidecar.next_steps = [wrongPolicy]
+    writeJson(sidecarPath, sidecar)
+
+    const check = checkBundleManifest({ outDir: exportDir })
+    assert.equal(check.status, 'fail')
+    assert.ok(check.checks.some((entry) =>
+      entry.check === 'export_sidecar_semantics_complete' &&
+      entry.sidecar === 'export-receipt.json' &&
+      entry.ok === false
+    ))
+  })
+}
+
+test('copied neutral bundle rejects a forged no-live-SOS pass', () => {
+  const outDir = seedBundleForMode('mupot-host-go-cutover/v1')
+  const gatePath = join(outDir, 'cutover-gate.json')
+  const gate = JSON.parse(readFileSync(gatePath, 'utf8'))
+  gate.checks.at(-1).finding_count = 1
+  gate.checks.at(-1).findings = [{ location: 'host.checks[0].path', marker: 'sos_path' }]
+  gate.summary = summarizeFixture(gate.checks)
+  writeJson(gatePath, gate)
+  const manifestPath = join(outDir, 'manifest.json')
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+  manifest.artifacts.cutover_gate.sha256 = sha256(gatePath)
+  writeJson(manifestPath, manifest)
+
+  const check = checkBundleManifest({ outDir })
+  assert.equal(check.status, 'fail')
+  assert.ok(check.checks.some((entry) => entry.check === 'cutover_gate_mode_valid' && entry.ok === false))
+})
+
+test('copied legacy gate cannot be interpreted with the neutral schema', () => {
+  const outDir = seedBundleForMode('mupot-sos-cutover-gate/v1')
+  const gatePath = join(outDir, 'cutover-gate.json')
+  const gate = JSON.parse(readFileSync(gatePath, 'utf8'))
+  gate.receipt_type = 'mupot-host-go-cutover/v1'
+  writeJson(gatePath, gate)
+  const manifestPath = join(outDir, 'manifest.json')
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+  manifest.artifacts.cutover_gate.receipt_type = 'mupot-host-go-cutover/v1'
+  manifest.artifacts.cutover_gate.sha256 = sha256(gatePath)
+  manifest.next_steps = [NEUTRAL_ATTACH]
+  writeJson(manifestPath, manifest)
+
+  const check = checkBundleManifest({ outDir })
+  assert.equal(check.status, 'fail')
+  assert.ok(check.checks.some((entry) => entry.check === 'cutover_gate_mode_valid' && entry.ok === false))
 })
 
 for (const [gateType, nextSteps] of [

@@ -526,6 +526,13 @@ function exactArtifactMeta(value, expectedType = null, requirePass = true) {
     (!requirePass || value.status === 'pass') && SHA256_RE.test(value.sha256 ?? '')
 }
 
+function exactCutoverArtifactMeta(meta) {
+  const mode = cutoverModeForType(meta?.receipt_type)
+  return mode && exactArtifactMeta(meta, CUTOVER_MODE[mode].receiptType)
+    ? mode
+    : null
+}
+
 function serviceActivationSchemaExact(receipt, manager) {
   const keys = ['receipt_type', 'generated_at', 'status', 'platform', 'service_manager', 'action', 'definitions', 'services', 'linger', 'commands', 'preserved_data', 'next_steps', 'checks']
   if (!hasExactKeys(receipt, keys) || receipt.receipt_type !== EXPECTED.service || receipt.status !== 'pass' || receipt.action !== 'install' ||
@@ -892,9 +899,9 @@ function priorBundleManifestPasses(prior, starter, agentId, admittedDigests = nu
     prior.integrity.algorithm !== 'sha256' || !exactStringArray(prior.next_steps, { nonEmpty: true }) ||
     !exactStringArray(prior.inputs.agents, { nonEmpty: true, unique: true }) || !prior.inputs.agents.includes(agentId)) return false
   const artifacts = prior.artifacts
-  const cutoverMode = cutoverModeForType(artifacts.cutover_gate?.receipt_type)
+  const cutoverMode = exactCutoverArtifactMeta(artifacts.cutover_gate)
   if (!exactArtifactMeta(artifacts.install, EXPECTED.install) || !exactArtifactMeta(artifacts.host, EXPECTED.host) ||
-    !cutoverMode || !exactArtifactMeta(artifacts.cutover_gate, CUTOVER_MODE[cutoverMode].receiptType) ||
+    !cutoverMode ||
     JSON.stringify(prior.next_steps) !== JSON.stringify([CUTOVER_MODE[cutoverMode].attach]) || !Array.isArray(artifacts.probes) || artifacts.probes.length === 0 ||
     artifacts.probes.some((meta) => !exactArtifactMeta(meta, EXPECTED.probe)) || !Array.isArray(artifacts.runtimes) || artifacts.runtimes.length === 0 ||
     artifacts.runtimes.some((meta) => !exactArtifactMeta(meta, EXPECTED.runtime)) || !Array.isArray(artifacts.controls) || artifacts.controls.length < 2 ||
@@ -1302,7 +1309,8 @@ function fileSha256(path, root = '') {
 }
 
 function receiptMeta(path) {
-  const receipt = readReceipt(path)
+  const rawReceipt = readReceipt(path)
+  const receipt = projectionSchemaExact(rawReceipt) ? rawReceipt.content : rawReceipt
   return {
     path,
     receipt_type: receipt?.receipt_type ?? null,
@@ -1385,7 +1393,7 @@ function expectedArtifactType(label, cutoverMode = null) {
   if (label === 'starter') return EXPECTED.starter
   if (label.startsWith('runtime:')) return EXPECTED.runtime
   if (label.startsWith('control:')) return EXPECTED.control
-  if (label === 'cutover_gate') return cutoverMode ? CUTOVER_MODE[cutoverMode].receiptType : EXPECTED.cutover_gate
+  if (label === 'cutover_gate') return cutoverMode ? CUTOVER_MODE[cutoverMode].receiptType : null
   return null
 }
 
@@ -2270,7 +2278,7 @@ function expectedExportCopiedArtifacts(manifestDir, manifest) {
 
 function verifiedManifestCutoverMode(manifest, manifestCheck) {
   if (manifestCheck?.status !== 'pass') return null
-  return cutoverModeForType(manifest?.artifacts?.cutover_gate?.receipt_type)
+  return exactCutoverArtifactMeta(manifest?.artifacts?.cutover_gate)
 }
 
 function expectedExportReceiptChecks(receipt, manifestDir, manifest, expectedManifestCheck) {
@@ -2693,6 +2701,7 @@ function checkBundleManifest(opts = {}) {
       }
     }
 
+    let resolvedCutoverMode = null
     for (const entry of entries) {
       const expectedLocalPath = typeof entry.path === 'string' && entry.path.length > 0
         ? (manifestStarterMode(manifest) && !isAbsolute(entry.path) && isPortableStarterPath(entry.path)
@@ -2709,12 +2718,30 @@ function checkBundleManifest(opts = {}) {
       const receipt = projectionSchemaExact(projection) ? projection.content : rawReceipt
       if (receipt) receiptRecords.push({ label: entry.label, receipt, checkedPath })
       const normalizedCutover = entry.label === 'cutover_gate' ? normalizePassingCutoverReceipt(receipt) : null
+      const declaredCutoverMode = entry.label === 'cutover_gate'
+        ? exactCutoverArtifactMeta(artifactMetaForLabel(manifest, entry.label))
+        : null
+      const cutoverMode = declaredCutoverMode && normalizedCutover?.mode === declaredCutoverMode
+        ? declaredCutoverMode
+        : null
+      if (entry.label === 'cutover_gate') {
+        resolvedCutoverMode = cutoverMode
+        checks.push({
+          ok: Boolean(cutoverMode),
+          component: 'receipt-bundle-check',
+          check: 'cutover_gate_mode_valid',
+          artifact: entry.label,
+          path: checkedPath || null,
+          expected: artifactMetaForLabel(manifest, entry.label)?.receipt_type ?? null,
+          actual: receipt?.receipt_type ?? null,
+        })
+      }
       const artifactSchemaExact = entry.label === 'cutover_gate'
         ? Boolean(normalizedCutover)
         : !manifestStarterMode(manifest) || starterArtifactSchemaExact(entry.label, receipt, receiptRecords, agents)
       const actual = checkedPath ? fileSha256(checkedPath) : null
       const expectedOk = typeof entry.sha256 === 'string' && /^[a-f0-9]{64}$/.test(entry.sha256)
-      const expectedType = expectedArtifactType(entry.label, normalizedCutover?.mode ?? null)
+      const expectedType = expectedArtifactType(entry.label, declaredCutoverMode)
       if (provenance) {
         const mapping = provenance.projections.find((candidate) => candidate.path === basename(entry.path ?? ''))
         const projectionContentSha = projectionSchemaExact(projection) ? sha256Bytes(jsonBytes(projection.content)) : null
@@ -2816,7 +2843,9 @@ function checkBundleManifest(opts = {}) {
         actual: receipt?.receipt_type ?? null,
       })
       checks.push({
-        ok: !expectedType || receipt?.receipt_type === expectedType,
+        ok: entry.label === 'cutover_gate'
+          ? Boolean(expectedType && receipt?.receipt_type === expectedType)
+          : !expectedType || receipt?.receipt_type === expectedType,
         component: 'receipt-bundle-check',
         check: 'artifact_receipt_type_expected',
         artifact: entry.label,
@@ -2890,9 +2919,7 @@ function checkBundleManifest(opts = {}) {
       const directoryCheck = checks.find((check) => check.check === 'bundle_directory_read')
       if (directoryCheck) directoryCheck.ok = directoryCheck.ok && directoryMode === 0o700
     }
-    const cutoverRecord = receiptRecords.find((record) => record.label === 'cutover_gate')
-    const cutoverMode = normalizePassingCutoverReceipt(cutoverRecord?.receipt)?.mode ?? null
-    addNextStepChecks(checks, manifestPath, manifest, summarize(checks), cutoverMode)
+    addNextStepChecks(checks, manifestPath, manifest, summarize(checks), resolvedCutoverMode)
   }
 
   const summary = summarize(checks)
@@ -3550,11 +3577,11 @@ function inferStatusAgents(opts, manifest, artifacts) {
 
   const ids = []
   for (const meta of artifacts.runtimes ?? []) {
-    const receipt = readReceipt(meta.path)
+    const receipt = projectionContent(readReceipt(meta.path))
     for (const agent of receiptTargetAgents('runtime:status', receipt)) ids.push(agent)
   }
   for (const meta of artifacts.probes ?? []) {
-    const receipt = readReceipt(meta.path)
+    const receipt = projectionContent(readReceipt(meta.path))
     for (const agent of receiptTargetAgents('probe:status', receipt)) ids.push(agent)
   }
   return sortStrings(ids)
@@ -3574,7 +3601,7 @@ function passingProbeAgents(artifacts) {
   const agents = []
   for (const meta of artifacts.probes ?? []) {
     if (meta?.receipt_type !== EXPECTED.probe || meta?.status !== 'pass') continue
-    const receipt = readReceipt(meta.path)
+    const receipt = projectionContent(readReceipt(meta.path))
     agents.push(...receiptTargetAgents('probe:status', receipt))
   }
   return sortStrings(agents)
@@ -3592,7 +3619,7 @@ function controlEvidenceFromArtifacts(artifacts) {
   const receipts = []
   for (const meta of artifacts.controls ?? []) {
     if (meta?.receipt_type !== EXPECTED.control || meta?.status !== 'pass') continue
-    const receipt = readReceipt(meta.path)
+    const receipt = projectionContent(readReceipt(meta.path))
     if (receipt?.receipt_type === EXPECTED.control && receipt?.status === 'pass') receipts.push(receipt)
   }
   return controlRuns(receipts)
@@ -3600,7 +3627,7 @@ function controlEvidenceFromArtifacts(artifacts) {
 
 function hostReceiptMetaReady(meta) {
   if (meta?.receipt_type !== EXPECTED.host || meta?.status !== 'pass') return false
-  return hostReceiptRequiredChecksPass(readReceipt(meta.path))
+  return hostReceiptRequiredChecksPass(projectionContent(readReceipt(meta.path)))
 }
 
 function controlRunSatisfiesRequiredVerb(run, requiredVerb) {
@@ -3629,7 +3656,7 @@ function missingControlEvidenceForAgents({ agents, requiredControlVerbs, control
   return sortStrings(missing)
 }
 
-function addHostGoStatusNextSteps(steps, { outDir, artifacts, agents, gateReceipt, manifestCheck, requiredControlVerbs, controlEvidence }) {
+function addHostGoStatusNextSteps(steps, { outDir, artifacts, agents, gateReceipt, cutoverMode, manifestCheck, requiredControlVerbs, controlEvidence }) {
   const add = (text) => {
     if (!steps.includes(text)) steps.push(text)
   }
@@ -3663,7 +3690,7 @@ function addHostGoStatusNextSteps(steps, { outDir, artifacts, agents, gateReceip
   } else if (passingMetaCount(artifacts.controls, EXPECTED.control) === 0) {
     add('queue start and stop lifecycle controls with cutover-probe.mjs, then collect each control receipt with control-receipt.mjs --observe-state')
   }
-  if (artifacts.cutover_gate?.receipt_type !== EXPECTED.cutover_gate || gateReceipt?.status !== 'pass') {
+  if (!cutoverMode || gateReceipt?.status !== 'pass') {
     add('run receipt-bundle --verify-only after host/runtime/control receipts are present so cutover-gate.json is rebuilt')
   }
   if (artifacts.manifest?.receipt_type !== 'mupot-fleet-receipt-bundle/v1' || artifacts.manifest?.status !== 'pass') {
@@ -3691,7 +3718,7 @@ function hostGoChecklistItem(id, title, ok, nextAction, evidence = {}) {
   }
 }
 
-function hostGoStatusChecklist({ outDir, artifacts, agents, gateReceipt, manifestCheck, requiredControlVerbs, controlEvidence }) {
+function hostGoStatusChecklist({ outDir, artifacts, agents, gateReceipt, cutoverMode, manifestCheck, requiredControlVerbs, controlEvidence }) {
   const probeAgents = passingProbeAgents(artifacts)
   const missingProbeAgents = sortStrings((agents ?? []).filter((agentId) => !probeAgents.includes(agentId)))
   const missingRuntimeAgents = sortStrings((agents ?? []).filter((agentId) => !hasPassingRuntimeMeta(artifacts, agentId)))
@@ -3701,7 +3728,7 @@ function hostGoStatusChecklist({ outDir, artifacts, agents, gateReceipt, manifes
   const secretSafe = manifestCheck ? secretChecks.length > 0 && secretChecks.every((check) => check.ok === true) : false
   const scopeSafe = manifestCheck ? scopeChecks.length > 0 && scopeChecks.every((check) => check.ok === true) : false
   const manifestPass = artifacts.manifest?.receipt_type === 'mupot-fleet-receipt-bundle/v1' && artifacts.manifest?.status === 'pass'
-  const gatePass = artifacts.cutover_gate?.receipt_type === EXPECTED.cutover_gate && gateReceipt?.status === 'pass'
+  const gatePass = Boolean(cutoverMode && gateReceipt?.status === 'pass')
   const manifestCheckPass = manifestCheck?.status === 'pass'
   const installOk = artifacts.install?.receipt_type === EXPECTED.install && (artifacts.install?.status === 'pass' || artifacts.install?.status === 'warn')
   const hostOk = hostReceiptMetaReady(artifacts.host)
@@ -3850,11 +3877,16 @@ function inspectBundleStatus(opts = {}) {
     } : {}),
   }
   const agents = inferStatusAgents(opts, manifest, artifacts)
-  const gateReceipt = outDir ? readReceipt(join(outDir, 'cutover-gate.json')) : null
+  const gateReceipt = outDir ? projectionContent(readReceipt(join(outDir, 'cutover-gate.json'))) : null
   const manifestCheck = manifest ? checkBundleManifest({ manifestPath }) : null
   const requiredControlVerbs = requiredStatusControlVerbs(opts, manifest)
   const controlEvidence = controlEvidenceFromArtifacts(artifacts)
-  const hostReceipt = artifacts.host?.path ? readReceipt(artifacts.host.path) : null
+  const hostReceipt = artifacts.host?.path ? projectionContent(readReceipt(artifacts.host.path)) : null
+  const declaredCutoverMode = exactCutoverArtifactMeta(artifacts.cutover_gate)
+  const normalizedCutover = normalizePassingCutoverReceipt(gateReceipt)
+  const cutoverMode = declaredCutoverMode && normalizedCutover?.mode === declaredCutoverMode
+    ? declaredCutoverMode
+    : null
 
   statusCheck(checks, 'selected_agents_recorded', agents.length > 0, { agents })
   statusCheck(checks, 'install_receipt_present', artifacts.install?.receipt_type === EXPECTED.install, {
@@ -3916,7 +3948,12 @@ function inspectBundleStatus(opts = {}) {
       })
     }
   }
-  statusCheck(checks, 'cutover_gate_pass', artifacts.cutover_gate?.receipt_type === EXPECTED.cutover_gate && gateReceipt?.status === 'pass', {
+  statusCheck(checks, 'cutover_gate_mode_valid', Boolean(cutoverMode), {
+    path: artifacts.cutover_gate?.path ?? join(outDir || '<out-dir>', 'cutover-gate.json'),
+    expected: artifacts.cutover_gate?.receipt_type ?? null,
+    actual: gateReceipt?.receipt_type ?? null,
+  })
+  statusCheck(checks, 'cutover_gate_pass', Boolean(cutoverMode && gateReceipt?.status === 'pass'), {
     path: artifacts.cutover_gate?.path ?? join(outDir || '<out-dir>', 'cutover-gate.json'),
     receipt_type: artifacts.cutover_gate?.receipt_type ?? null,
     status: gateReceipt?.status ?? null,
@@ -3952,9 +3989,10 @@ function inspectBundleStatus(opts = {}) {
     bundleStatus: summary.status,
     requiredControlVerbs,
     controlEvidence,
+    cutoverMode: cutoverMode ?? (!gateReceipt ? 'neutral' : null),
   })
-  addHostGoStatusNextSteps(next, { outDir, artifacts, agents, gateReceipt, manifestCheck, requiredControlVerbs, controlEvidence })
-  const hostGoChecklist = hostGoStatusChecklist({ outDir, artifacts, agents, gateReceipt, manifestCheck, requiredControlVerbs, controlEvidence })
+  addHostGoStatusNextSteps(next, { outDir, artifacts, agents, gateReceipt, cutoverMode, manifestCheck, requiredControlVerbs, controlEvidence })
+  const hostGoChecklist = hostGoStatusChecklist({ outDir, artifacts, agents, gateReceipt, cutoverMode, manifestCheck, requiredControlVerbs, controlEvidence })
 
   const receipt = {
     receipt_type: 'mupot-fleet-receipt-bundle-status/v1',
@@ -4293,7 +4331,7 @@ function missingControlVerbs(gateReceipt) {
   return [...new Set(missing)].sort()
 }
 
-function buildDetailedNextSteps({ artifacts, agents, gateReceipt, outDir, bundleStatus, requiredControlVerbs, controlEvidence }) {
+function buildDetailedNextSteps({ artifacts, agents, gateReceipt, cutoverMode, outDir, bundleStatus, requiredControlVerbs, controlEvidence }) {
   const steps = []
   const add = (text) => {
     if (!steps.includes(text)) steps.push(text)
@@ -4340,12 +4378,12 @@ function buildDetailedNextSteps({ artifacts, agents, gateReceipt, outDir, bundle
     add('queue lifecycle control with cutover-probe.mjs and collect it with control-receipt.mjs --observe-state, or use one restart receipt when acceptable')
   }
 
-  if (bundleStatus !== 'pass' || gateReceipt?.status !== 'pass') {
-    add(CUTOVER_MODE.neutral.hold)
+  if (cutoverMode && (bundleStatus !== 'pass' || gateReceipt?.status !== 'pass')) {
+    add(CUTOVER_MODE[cutoverMode].hold)
   }
 
-  if (bundleStatus === 'pass' && gateReceipt?.status === 'pass') {
-    add(CUTOVER_MODE.neutral.attach)
+  if (cutoverMode && bundleStatus === 'pass' && gateReceipt?.status === 'pass') {
+    add(CUTOVER_MODE[cutoverMode].attach)
   }
 
   return steps
