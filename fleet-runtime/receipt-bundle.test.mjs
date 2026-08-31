@@ -3625,7 +3625,7 @@ test('formatHostGoPlan prints a release-neutral live-host command sequence witho
     requiredControlVerbs: ['start', 'stop'],
   })
 
-  assert.ok(plan.includes('Mupot host-go plan'))
+  assert.ok(plan.includes('Mupot/Herdr Host-Go handoff plan'))
   assert.doesNotMatch(plan, /#274/)
   assert.ok(plan.includes('node fleet-runtime/install.mjs > ~/.fleet/receipts/install.json'))
   assert.ok(plan.includes('node ~/.fleet/runtime/receipt-bundle.mjs --agent agent-one --out-dir ~/.fleet/receipts/agent-one --require-control-verb start,stop --install-receipt ~/.fleet/receipts/install.json --skip-runtime --skip-control'))
@@ -3643,6 +3643,8 @@ test('formatHostGoPlan prints a release-neutral live-host command sequence witho
   assert.ok(plan.includes('export-receipt.json, and manifest-check.json all report status "pass"'))
   assert.doesNotMatch(plan, /SOS removal/)
   assert.doesNotMatch(plan, /SOS wiring/)
+  assert.doesNotMatch(plan, /mupot-sos-cutover-gate\/v1/)
+  assert.match(plan, /Host-Go handoff/)
   assert.doesNotMatch(plan, /mupot_[A-Za-z0-9]/)
   assert.doesNotMatch(plan, /Bearer\s+[A-Za-z0-9]/)
 })

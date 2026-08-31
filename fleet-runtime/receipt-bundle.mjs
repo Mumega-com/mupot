@@ -295,7 +295,7 @@ function formatHostGoPlan(opts = {}) {
   const multipleAgents = agents.length > 1
   const lines = []
 
-  lines.push('Mupot host-go plan')
+  lines.push('Mupot/Herdr Host-Go handoff plan')
   lines.push('')
   lines.push('Manual prerequisites before running the live receipt steps:')
   lines.push('- Edit ~/.fleet/daemon.json, ~/.fleet/inbox-handler.json, ~/.fleet/control.json, and ~/.fleet/flights.json for the real pot/tenant.')
