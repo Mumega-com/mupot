@@ -61,6 +61,11 @@ function optionalEnum<T extends string>(value: unknown, allowed: readonly T[]): 
   return (allowed as readonly string[]).includes(trimmed) ? (trimmed as T) : null
 }
 
+function optionalExactEnum<T extends string>(value: unknown, allowed: readonly T[]): T | null {
+  if (typeof value !== 'string') return null
+  return (allowed as readonly string[]).includes(value) ? (value as T) : null
+}
+
 export function parseSevenAxisCheckin(
   args: Record<string, unknown>,
   fallbackSeat = '',
@@ -68,7 +73,7 @@ export function parseSevenAxisCheckin(
   const seat = optionalString(args.seat) || optionalString(args.name) || optionalString(args.label) || fallbackSeat
   return {
     seat,
-    harness: optionalEnum(args.harness, SEVEN_AXIS_HARNESSES),
+    harness: optionalExactEnum(args.harness, SEVEN_AXIS_HARNESSES),
     machine: optionalString(args.machine),
     model: optionalString(args.model),
     provider: optionalString(args.provider),
