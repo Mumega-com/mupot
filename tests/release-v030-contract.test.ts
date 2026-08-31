@@ -1,4 +1,4 @@
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -15,6 +15,29 @@ const CONTRACT_RELATIVE = 'docs/releases/v0.30.0-contract.json'
 const CONTRACT = join(process.cwd(), CONTRACT_RELATIVE)
 
 describe('v0.30.0 repository release contract', () => {
+  const contract = JSON.parse(readFileSync(CONTRACT, 'utf8')) as {
+    receipts: Array<{ file: string; receipt_type: string }>
+  }
+
+  it('requires the neutral Host-Go cutover receipt', () => {
+    expect(contract.receipts).toContainEqual(expect.objectContaining({
+      file: 'host-go/cutover-gate.json',
+      receipt_type: 'mupot-host-go-cutover/v1',
+    }))
+    expect(JSON.stringify(contract)).not.toContain('mupot-sos-cutover-gate/v1')
+    const plan = readinessPlan({
+      version: VERSION,
+      contractPath: CONTRACT_RELATIVE,
+      outDir: 'tmp/release-readiness/v0.30.0',
+      repo: 'Mumega-com/mupot',
+      checksPr: '1250',
+      releaseSha: 'a'.repeat(40),
+      phase: 'prepublication',
+    })
+    expect(plan).toContain('mupot-host-go-cutover/v1')
+    expect(plan).not.toContain('mupot-sos-cutover-gate/v1')
+  })
+
   it('keeps the caller contract path portable in generated commands', () => {
     const opts = readinessArgs([
       '--plan',
