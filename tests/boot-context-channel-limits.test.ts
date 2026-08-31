@@ -47,6 +47,7 @@ afterEach(() => harness.close())
 
 interface BootResult {
   channel?: string
+  next_step?: string
   channel_limits?: {
     ambient_authority?: string
     why?: string
@@ -74,17 +75,21 @@ describe('boot_context explains the directory channel (mupot#712)', () => {
     const r = await boot('directory')
     const can = (r.channel_limits?.you_can ?? []).join(' ')
     expect(can).toContain('connect')
+    expect(can).toContain('bootstrap_self')
     expect(can).toContain('orient')
     expect(can).toContain('status')
   })
 
-  it('it names the ACTION that gets write access, and rules out the wrong one', async () => {
+  it('it gives existing and new agents self-service next steps', async () => {
     const r = await boot('directory')
+    const next = r.next_step ?? ''
     const fix = r.channel_limits?.to_get_write_access ?? ''
-    expect(fix).toContain('mint_agent_token')
-    // The misleading action: "ask for a squad grant". It changes nothing here, and it
-    // nearly produced a redundant grant for a member who already held org:owner.
-    expect(fix.toLowerCase()).toContain('will not help')
+    expect(next).toContain('connect { agent_name')
+    expect(next).toContain('bootstrap_self { agent_name')
+    expect(next).toMatch(/reconnect.*select/i)
+    expect(fix).toContain('bootstrap_self')
+    expect(fix).toMatch(/reconnect.*select/i)
+    expect(fix).not.toMatch(/ask an org-admin/i)
   })
 
   it('it explains WHY, so the limit reads as design rather than breakage', async () => {

@@ -71,9 +71,17 @@ describe('bootstrap_self via invokeTool — an unbound directory session with ZE
     expect(out.ok).toBe(true)
     if (!out.ok) throw new Error(`expected success, got ${out.error}`)
     const result = out.result as {
-      agent: { name: string }
+      agent: { id: string; name: string }
       token: { id: string; capability: string }
       credential_claim: { claim_id: string; fingerprint: string; expires_at: string }
+      next_actions: {
+        current_session_bound: boolean
+        recommended: string
+        agent_id: string
+        credential_claim_use: string
+        steps: string[]
+      }
+      note: string
     }
     expect(result.agent.name).toBe('Aria')
     // mupot#987: the raw token must never appear in this tool result — only a
@@ -82,6 +90,19 @@ describe('bootstrap_self via invokeTool — an unbound directory session with ZE
     expect(JSON.stringify(out.result)).not.toMatch(/"raw"\s*:/)
     expect(result.credential_claim.claim_id).toBeTruthy()
     expect(result.credential_claim.fingerprint).toMatch(/^[0-9a-f]{16}$/)
+    expect(result.next_actions).toEqual({
+      current_session_bound: false,
+      recommended: 'reconnect_and_select_agent',
+      agent_id: result.agent.id,
+      credential_claim_use: 'local_or_headless_only',
+      steps: [
+        'Reconnect the Mupot MCP connector.',
+        'Select the newly created agent at the consent screen.',
+        'Call boot_context, orient, then check_in.',
+      ],
+    })
+    expect(result.note).toMatch(/reconnect.*select/i)
+    expect(result.note).toMatch(/do not reveal.*interactive OAuth/i)
 
     const revealed = await invokeTool(
       unboundDirectoryAuth(),

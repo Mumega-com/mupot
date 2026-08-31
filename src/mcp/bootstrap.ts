@@ -65,10 +65,22 @@ const toolBootstrapSelf: ToolSpec = {
         // is the difference between "you can bind this session" and "you cannot".
         founder_grant: result.founder_grant,
         audit_id: result.audit_id,
+        next_actions: {
+          current_session_bound: false,
+          recommended: 'reconnect_and_select_agent',
+          agent_id: result.agent.id,
+          credential_claim_use: 'local_or_headless_only',
+          steps: [
+            'Reconnect the Mupot MCP connector.',
+            'Select the newly created agent at the consent screen.',
+            'Call boot_context, orient, then check_in.',
+          ],
+        },
         note:
-          `${result.directory_session_note} The raw token is NOT in this result — call `
-          + 'reveal_credential_claim { claim_id: credential_claim.claim_id } to redeem it '
-          + 'once, as this same caller, before it expires.',
+          `${result.directory_session_note} Recommended for an interactive OAuth client: reconnect `
+          + 'the Mupot connector and select the newly created agent. The current session remains '
+          + 'unbound. Do not reveal the credential claim during interactive OAuth; reveal it only '
+          + 'for a deliberate local or headless client setup before it expires.',
       })
     }
 

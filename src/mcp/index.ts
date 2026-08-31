@@ -4015,12 +4015,14 @@ const toolBootContext: ToolSpec = {
     const identityStatus: 'minted' | 'unminted' = isMinted ? 'minted' : 'unminted'
 
     // QA-1: every refusal/unminted signal must carry the full map out — no dead ends.
-    // Two paths for an unbound token:
-    //   A) Shared apikey + know your name → call connect { agent_name } (session-local, works now).
-    //   B) Want a permanent weld → ask an admin to call mint_agent_token, then reconnect.
+    // Directory OAuth has two self-service paths: select an existing accessible
+    // agent, or deliberately name and bootstrap one new personal agent. Neither
+    // path silently changes the principal of the current OAuth conversation.
     const nextStep = isMinted
       ? 'call orient (no args — your token is agent-bound) to receive your full basin-drop packet'
-      : 'if you know your agent slug/id: call connect { agent_name: "<slug>" } to claim your identity now (session-local). For a permanent weld: ask an org-admin to call mint_agent_token for your agent, then reconnect with the minted token.'
+      : auth.channel === 'directory'
+        ? 'Existing agent: call connect { agent_name: "<slug-or-id>" } for this session, or reconnect the MCP connector and select that agent. New agent: call bootstrap_self { agent_name: "<chosen-name>" }, then reconnect the MCP connector and select the newly created agent.'
+        : 'if you know your agent slug/id: call connect { agent_name: "<slug>" } to claim your identity now (session-local). For a permanent weld: ask an org-admin to call mint_agent_token for your agent, then reconnect with the minted token.'
 
     // THE DOOR MUST SAY WHAT IT IS (#712).
     //
@@ -4052,14 +4054,15 @@ const toolBootContext: ToolSpec = {
             you_can: [
               'status, boot_context — always',
               'connect { agent_name }, orient { agent } — for agents your member has capability on',
+              'bootstrap_self { agent_name } — once, to create your own named personal agent and home squad',
               'remember, recall — your own memory',
             ],
             you_cannot: [
-              'create or update tasks, projects, agents, or any other write',
+              'create or update tasks, projects, shared squads, or agents owned by someone else',
               'anything requiring a standing capability, regardless of what you hold elsewhere',
             ],
             to_get_write_access:
-              'ask an org-admin for a WORKSPACE-channel token (mint_agent_token), and connect with that bearer. Requesting a squad grant will NOT help — this door discards grants by construction.',
+              'Existing agent: reconnect the MCP connector and select an agent your member may access. New agent: call bootstrap_self with a chosen name, then reconnect and select the newly created agent. This directory conversation stays unbound by design.',
           }
         : undefined
 

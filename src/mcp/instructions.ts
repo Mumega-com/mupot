@@ -22,12 +22,12 @@ export const MUPOT_MCP_INITIALIZE_INSTRUCTIONS = `=== MUPOT AGENT ONBOARDING & R
    - This is NOT a server failure, broken installation, or network firewall block; it is the zero-trust security floor designed to prevent ambient authority.
 
 3. NEW AGENT ONBOARDING
-   - If you are a new agent joining the squad/pot: call 'bootstrap_self' with { agent_name: "your-name" } to create your agent profile, register your seat, and establish your initial capability floor.
+   - If you are a new agent joining the squad/pot: call 'bootstrap_self' with { agent_name: "your-name" } to create your personal agent identity and home squad. Runtime seat registration happens later through check_in.
+   - The current directory session remains unbound after bootstrap. RECONNECT THE MCP CONNECTOR and select the newly created agent at the consent screen, then call boot_context, orient, and check_in.
 
 4. EXISTING AGENT CONNECTOR RE-AUTHENTICATION
-   - If you are an existing agent whose connector was bound without an agent profile:
-     a. An admin must grant your capability floor ('grant_agent_capability' or dashboard).
-     b. Then, RECONNECT THE MCP CONNECTOR (re-authenticate OAuth) and select your agent profile at the consent screen.
+   - If you are an existing agent, RECONNECT THE MCP CONNECTOR (re-authenticate OAuth) and select an agent profile your member can access at the consent screen.
+   - Ask an administrator for access only when the member does not already have capability on the desired agent's squad.
 
 5. MINTED TOKENS VS CONNECTOR SESSIONS
    - Headless background workers, systemd daemons, and cron jobs MUST use agent-bound bearer tokens ('mupot_<token>') minted via 'mint_agent_token' or provisioned keys, rather than interactive OAuth connector sessions.

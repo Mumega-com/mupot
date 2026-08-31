@@ -24,10 +24,12 @@ describe('MUPOT_MCP_INITIALIZE_INSTRUCTIONS', () => {
   it('documents new agent onboarding via bootstrap_self', () => {
     expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toContain('bootstrap_self')
     expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toContain('agent_name')
+    expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toMatch(/reconnect.*select/i)
+    expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toMatch(/current.*session.*unbound/i)
   })
 
   it('documents existing agent connector reconnection and consent screen selection', () => {
-    expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toContain('grant_agent_capability')
+    expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toMatch(/existing agent/i)
     expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toContain('RECONNECT THE MCP CONNECTOR')
     expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toContain('consent screen')
   })
