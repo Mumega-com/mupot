@@ -258,10 +258,56 @@ describe('7-axis multi-harness seat onboarding (real SQLite D1)', () => {
     expect(seats.find((s) => s.label === 'cursor-mac')?.harness).toBe('cursor-ide')
     expect(seats.find((s) => s.label === 'cursor-cloud-builder')?.flight_id).toBe(flightId)
   })
+
+  it('check_in accepts and persists an exact Codex CLI harness', async () => {
+    const res = await invokeTool(auth(), env, 'check_in', {
+      seat: 'hadi-codex-cli',
+      harness: 'codex-cli',
+      machine: 'hadi-mac',
+      model: 'gpt-5.6-sol',
+      provider: 'openai',
+      effort: 'high',
+      source: 'codex',
+    })
+
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+    expect(res.result).toMatchObject({
+      seat: 'hadi-codex-cli',
+      harness: 'codex-cli',
+      machine: 'hadi-mac',
+      model: 'gpt-5.6-sol',
+      provider: 'openai',
+      effort: 'high',
+    })
+
+    const row = harness.sqlite.prepare(
+      `SELECT label, harness, machine, model, provider, effort, source
+         FROM presence WHERE tenant = ? AND member_id = ? AND label = 'hadi-codex-cli'`,
+    ).get(tenant, memberId) as {
+      label: string
+      harness: string
+      machine: string
+      model: string
+      provider: string
+      effort: string
+      source: string
+    }
+    expect(row).toEqual({
+      label: 'hadi-codex-cli',
+      harness: 'codex-cli',
+      machine: 'hadi-mac',
+      model: 'gpt-5.6-sol',
+      provider: 'openai',
+      effort: 'high',
+      source: 'codex',
+    })
+  })
 })
 
 describe('7-axis normalizers and Cursor Cloud seat injection', () => {
   it('normalizes unknown harness/effort without storing raw client junk', () => {
+    expect(normalizeHarness('codex-cli')).toBe('codex-cli')
     expect(normalizeHarness('cursor-cloud')).toBe('cursor-cloud')
     expect(normalizeHarness('evil-runtime')).toBe('unknown')
     expect(normalizeHarness(42)).toBe('unknown')

@@ -22,6 +22,7 @@ export const SEVEN_AXIS_HARNESSES = [
   'cursor-cloud',
   'antigravity-cli',
   'claude-code',
+  'codex-cli',
   'prime',
   'hermes',
   'grok-cli',
