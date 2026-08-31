@@ -594,8 +594,11 @@ function expectedPrNumber(checksPr) {
 }
 
 function expectedReleaseSha(releaseSha) {
-  const raw = String(releaseSha ?? '').trim().toLowerCase()
-  return /^[0-9a-f]{40}$/.test(raw) ? raw : null
+  return canonicalReleaseSha(releaseSha)
+}
+
+function canonicalReleaseSha(value) {
+  return typeof value === 'string' && /^[0-9a-f]{40}$/.test(value) ? value : null
 }
 
 function checkSucceeded(entry) {
@@ -682,17 +685,54 @@ export function checkBundle(opts = {}) {
     })
   }
 
+  if (requiredReceipts.some((receipt) => receipt.file === 'release-candidate-check.json')) {
+    const candidateReceipt = receiptValues.get('release-candidate-check.json')
+    const candidateTarget = candidateReceipt?.target ?? {}
+    const candidateCommitValue = candidateTarget.commit ?? null
+    const candidateCommit = canonicalReleaseSha(candidateCommitValue)
+    const candidateSourceVersion = candidateTarget.source_version ?? null
+    const sourceVersion = version.replace(/^v/i, '')
+    pushCheck(checks, Boolean(releaseSha && candidateCommit === releaseSha), 'release_candidate_commit_matches_release_sha', {
+      expected: releaseSha,
+      actual: candidateCommitValue,
+    })
+    pushCheck(checks, candidateSourceVersion === sourceVersion, 'release_candidate_source_version_matches_release', {
+      expected: sourceVersion,
+      actual: candidateSourceVersion,
+    })
+  }
+
+  if (requiredReceipts.some((receipt) => receipt.file === 'release-integrity-check.json')) {
+    const integrityReceipt = receiptValues.get('release-integrity-check.json')
+    const integrityTarget = integrityReceipt?.target ?? {}
+    const sourceVersion = version.replace(/^v/i, '')
+    const integrityVersion = integrityTarget.version ?? null
+    pushCheck(checks, integrityVersion === sourceVersion, 'release_integrity_version_matches_release', {
+      expected: sourceVersion,
+      actual: integrityVersion,
+    })
+    for (const field of ['git_head_sha', 'git_tag_sha', 'github_tag_sha']) {
+      const actualValue = integrityTarget[field] ?? null
+      const actual = canonicalReleaseSha(actualValue)
+      pushCheck(checks, Boolean(releaseSha && actual === releaseSha), `release_integrity_${field}_matches_release_sha`, {
+        expected: releaseSha,
+        actual: actualValue,
+      })
+    }
+  }
+
   if (requiredReceipts.some((receipt) => receipt.file === 'stable-deployment-check.json')) {
     const stableDeployment = receiptValues.get('stable-deployment-check.json')
-    const stableCommit = String(stableDeployment?.target?.commit ?? stableDeployment?.target?.release_sha ?? '').toLowerCase()
-    const stableVersion = String(stableDeployment?.target?.version ?? stableDeployment?.target?.tag ?? '')
+    const stableCommitValue = stableDeployment?.target?.commit ?? stableDeployment?.target?.release_sha ?? null
+    const stableCommit = canonicalReleaseSha(stableCommitValue)
+    const stableVersion = stableDeployment?.target?.version ?? stableDeployment?.target?.tag ?? null
     pushCheck(checks, Boolean(releaseSha && stableCommit === releaseSha), 'stable_deployment_commit_matches_release_sha', {
       expected: releaseSha,
-      actual: stableCommit || null,
+      actual: stableCommitValue,
     })
-    pushCheck(checks, stableVersion === version, 'stable_deployment_version_matches_release', {
+    pushCheck(checks, typeof stableVersion === 'string' && stableVersion === version, 'stable_deployment_version_matches_release', {
       expected: version,
-      actual: stableVersion || null,
+      actual: stableVersion,
     })
   }
 
@@ -754,10 +794,11 @@ export function checkBundle(opts = {}) {
     expected: 'main',
     actual: prJson?.baseRefName ?? null,
   })
-  const mergeCommitSha = String(prJson?.mergeCommit?.oid ?? '').toLowerCase()
+  const mergeCommitValue = prJson?.mergeCommit?.oid ?? null
+  const mergeCommitSha = canonicalReleaseSha(mergeCommitValue)
   pushCheck(checks, Boolean(releaseSha && mergeCommitSha === releaseSha), 'release_pr_merge_commit_matches_release_sha', {
     expected: releaseSha,
-    actual: mergeCommitSha || null,
+    actual: mergeCommitValue,
   })
   const prChecks = checkEntries(prJson)
   for (const requiredName of REQUIRED_CHECKS) {
@@ -772,10 +813,11 @@ export function checkBundle(opts = {}) {
   const commitPath = join(outDir, 'github-commit.json')
   const commitJson = readJson(checks, commitPath, 'github_commit')
   artifacts['github-commit.json'] = artifactMeta(commitPath, commitJson)
-  const exportedCommitSha = String(commitJson?.sha ?? '').toLowerCase()
+  const exportedCommitValue = commitJson?.sha ?? null
+  const exportedCommitSha = canonicalReleaseSha(exportedCommitValue)
   pushCheck(checks, Boolean(releaseSha && exportedCommitSha === releaseSha), 'github_commit_matches_release_sha', {
     expected: releaseSha,
-    actual: exportedCommitSha || null,
+    actual: exportedCommitValue,
   })
 
   const commitChecksPath = join(outDir, 'github-commit-checks.json')

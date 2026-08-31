@@ -33,6 +33,22 @@ function sha256(path: string) {
 const HOST_BASE_URL = 'https://pot.example.org'
 const HOST_TENANT = 'tenant-a'
 const RELEASE_SHA = 'a'.repeat(40)
+const MISSING = Symbol('missing')
+const MALFORMED_SHA_VALUES = [
+  ['missing', MISSING],
+  ['null', null],
+  ['array-of-valid-sha', [RELEASE_SHA]],
+  ['object', { sha: RELEASE_SHA }],
+  ['number', 123],
+  ['uppercase', RELEASE_SHA.toUpperCase()],
+] as const
+
+const RELEASE_SHA_BINDINGS = [
+  { file: 'release-candidate-check.json', phase: 'prepublication', field: 'commit', check: 'release_candidate_commit_matches_release_sha' },
+  { file: 'release-integrity-check.json', phase: 'final', field: 'git_head_sha', check: 'release_integrity_git_head_sha_matches_release_sha' },
+  { file: 'release-integrity-check.json', phase: 'final', field: 'git_tag_sha', check: 'release_integrity_git_tag_sha_matches_release_sha' },
+  { file: 'release-integrity-check.json', phase: 'final', field: 'github_tag_sha', check: 'release_integrity_github_tag_sha_matches_release_sha' },
+] as const
 
 function v030Contract() {
   return {
@@ -144,14 +160,26 @@ async function writeHostBundle(exportDir: string) {
   if (exported.status !== 'pass') throw new Error('failed to build passing host bundle fixture')
 }
 
-async function writeBundle(dir: string, mutate?: (dir: string) => void) {
+async function writeBundle(dir: string, mutate?: (dir: string) => void, releaseVersion = 'v0.23.0') {
   mkdirSync(join(dir, 'host-go'), { recursive: true })
+  const sourceVersion = releaseVersion.replace(/^v/i, '')
   for (const required of REQUIRED_RECEIPTS) {
     if (required.file.startsWith('host-go/')) continue
+    const target = required.file === 'release-candidate-check.json'
+      ? { commit: RELEASE_SHA, source_version: sourceVersion }
+      : required.file === 'release-integrity-check.json'
+        ? {
+            version: sourceVersion,
+            git_head_sha: RELEASE_SHA,
+            git_tag_sha: RELEASE_SHA,
+            github_tag_sha: RELEASE_SHA,
+          }
+        : undefined
     writeJson(join(dir, required.file), {
       receipt_type: required.receipt_type,
       status: 'pass',
       checked_at: '2026-07-10T00:00:00.000Z',
+      ...(target ? { target } : {}),
       evidence: {
         objective: required.objective,
         issue: required.issue,
@@ -279,7 +307,7 @@ describe('release readiness receipt checker', () => {
 
   it('checks v0.30 evidence from the explicit contract without requiring legacy tracker issues', async () => {
     const dir = tempDir()
-    await writeBundle(dir)
+    await writeBundle(dir, undefined, 'v0.30.0')
     writeJson(join(dir, 'stable-deployment-check.json'), {
       receipt_type: 'mupot-stable-deployment/v1',
       status: 'pass',
@@ -423,6 +451,209 @@ describe('release readiness receipt checker', () => {
     expect(receipt.required.receipts).toContainEqual(expect.objectContaining({
       file: 'stable-deployment-check.json',
       receipt_type: 'mupot-stable-deployment/v1',
+    }))
+  })
+
+  it('fails when the required release-candidate receipt targets another commit', async () => {
+    const dir = tempDir()
+    await writeBundle(dir, () => {
+      writeJson(join(dir, 'release-candidate-check.json'), {
+        receipt_type: 'mupot-release-candidate/v1',
+        status: 'pass',
+        target: { commit: 'b'.repeat(40), source_version: '0.23.0' },
+      })
+    })
+
+    const receipt = checkBundle({
+      outDir: dir,
+      version: 'v0.23.0',
+      checksPr: '285',
+      releaseSha: RELEASE_SHA,
+      phase: 'prepublication',
+    })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'release_candidate_commit_matches_release_sha',
+      expected: RELEASE_SHA,
+      actual: 'b'.repeat(40),
+    }))
+  })
+
+  it('fails when the required release-candidate receipt targets another source version', async () => {
+    const dir = tempDir()
+    await writeBundle(dir, () => {
+      writeJson(join(dir, 'release-candidate-check.json'), {
+        receipt_type: 'mupot-release-candidate/v1',
+        status: 'pass',
+        target: { commit: RELEASE_SHA, source_version: '0.22.0' },
+      })
+    })
+
+    const receipt = checkBundle({
+      outDir: dir,
+      version: 'v0.23.0',
+      checksPr: '285',
+      releaseSha: RELEASE_SHA,
+      phase: 'prepublication',
+    })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'release_candidate_source_version_matches_release',
+      expected: '0.23.0',
+      actual: '0.22.0',
+    }))
+  })
+
+  it.each([
+    ['version', '0.22.0', 'release_integrity_version_matches_release', '0.23.0'],
+    ['git_head_sha', 'b'.repeat(40), 'release_integrity_git_head_sha_matches_release_sha', RELEASE_SHA],
+    ['git_tag_sha', 'b'.repeat(40), 'release_integrity_git_tag_sha_matches_release_sha', RELEASE_SHA],
+    ['github_tag_sha', 'b'.repeat(40), 'release_integrity_github_tag_sha_matches_release_sha', RELEASE_SHA],
+  ])('fails when the required release-integrity receipt %s binding is wrong', async (field, value, check, expected) => {
+    const dir = tempDir()
+    await writeBundle(dir, () => {
+      writeJson(join(dir, 'release-integrity-check.json'), {
+        receipt_type: 'mupot-release-integrity/v1',
+        status: 'pass',
+        target: {
+          version: '0.23.0',
+          git_head_sha: RELEASE_SHA,
+          git_tag_sha: RELEASE_SHA,
+          github_tag_sha: RELEASE_SHA,
+          [field]: value,
+        },
+      })
+    })
+
+    const receipt = checkBundle({
+      outDir: dir,
+      version: 'v0.23.0',
+      checksPr: '285',
+      releaseSha: RELEASE_SHA,
+      phase: 'final',
+    })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check,
+      expected,
+      actual: value,
+    }))
+  })
+
+  it.each(MALFORMED_SHA_VALUES)('fails closed for %s release-candidate and integrity SHA values', async (_label, value) => {
+    for (const binding of RELEASE_SHA_BINDINGS) {
+      const dir = tempDir()
+      await writeBundle(dir, () => {
+        const path = join(dir, binding.file)
+        const target = JSON.parse(readFileSync(path, 'utf8'))
+        if (value === MISSING) delete target.target[binding.field]
+        else target.target[binding.field] = value
+        writeJson(path, target)
+      })
+
+      const receipt = checkBundle({
+        outDir: dir,
+        version: 'v0.23.0',
+        checksPr: '285',
+        releaseSha: RELEASE_SHA,
+        phase: binding.phase,
+      })
+
+      expect(receipt.status).toBe('fail')
+      expect(receipt.checks).toContainEqual(expect.objectContaining({
+        ok: false,
+        check: binding.check,
+      }))
+    }
+  })
+
+  it('fails closed when the expected release SHA is not a string', async () => {
+    const dir = tempDir()
+    await writeBundle(dir)
+
+    const receipt = checkBundle({
+      outDir: dir,
+      version: 'v0.23.0',
+      checksPr: '285',
+      releaseSha: [RELEASE_SHA],
+    })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'release_sha_specified',
+      actual: [RELEASE_SHA],
+    }))
+  })
+
+  it.each([
+    ['uppercase', RELEASE_SHA.toUpperCase()],
+    ['whitespace-padded', ` ${RELEASE_SHA} `],
+    ['wrong-length', 'a'.repeat(39)],
+    ['non-hex', `${'a'.repeat(39)}g`],
+  ])('fails closed for %s expected release SHA input', async (_label, releaseSha) => {
+    const dir = tempDir()
+    await writeBundle(dir)
+
+    const receipt = checkBundle({
+      outDir: dir,
+      version: 'v0.23.0',
+      checksPr: '285',
+      releaseSha,
+    })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'release_sha_specified',
+      actual: releaseSha,
+    }))
+  })
+
+  it.each([
+    ['stable deployment commit', 'stable-deployment-check.json', 'prepublication', 'commit', 'stable_deployment_commit_matches_release_sha'],
+    ['stable deployment release_sha', 'stable-deployment-check.json', 'prepublication', 'release_sha', 'stable_deployment_commit_matches_release_sha'],
+    ['stable deployment version', 'stable-deployment-check.json', 'prepublication', 'version', 'stable_deployment_version_matches_release'],
+    ['pull request merge commit', 'github-pr.json', 'final', 'merge_commit', 'release_pr_merge_commit_matches_release_sha'],
+    ['exported commit', 'github-commit.json', 'final', 'sha', 'github_commit_matches_release_sha'],
+  ])('fails closed for array-valued %s binding', async (_label, file, phase, field, check) => {
+    const dir = tempDir()
+    await writeBundle(dir, () => {
+      if (file === 'stable-deployment-check.json') {
+        writeJson(join(dir, file), {
+          receipt_type: 'mupot-stable-deployment/v1',
+          status: 'pass',
+          target: field === 'release_sha'
+            ? { version: 'v0.23.0', release_sha: [RELEASE_SHA] }
+            : { version: field === 'version' ? ['v0.23.0'] : 'v0.23.0', commit: field === 'commit' ? [RELEASE_SHA] : RELEASE_SHA },
+        })
+        return
+      }
+      const path = join(dir, file)
+      const target = JSON.parse(readFileSync(path, 'utf8'))
+      if (field === 'merge_commit') target.mergeCommit.oid = [RELEASE_SHA]
+      else target.sha = [RELEASE_SHA]
+      writeJson(path, target)
+    })
+
+    const receipt = checkBundle({
+      outDir: dir,
+      version: 'v0.23.0',
+      checksPr: '285',
+      releaseSha: RELEASE_SHA,
+      phase,
+    })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check,
     }))
   })
 
