@@ -51,6 +51,9 @@ const RELEASE_SHA_BINDINGS = [
 ] as const
 
 function v030Contract() {
+  const neutralReceipts = REQUIRED_RECEIPTS.map((receipt) => receipt.file === 'host-go/cutover-gate.json'
+    ? { ...receipt, receipt_type: 'mupot-host-go-cutover/v1' }
+    : receipt)
   return {
     schema_version: 1,
     version: 'v0.30.0',
@@ -60,7 +63,7 @@ function v030Contract() {
       final: 'mupot-v030-release-readiness/v1',
     },
     receipts: [
-      ...REQUIRED_RECEIPTS.map((receipt) => ({
+      ...neutralReceipts.map((receipt) => ({
         objective: receipt.objective,
         file: receipt.file,
         receipt_type: receipt.receipt_type,
@@ -160,6 +163,32 @@ async function writeHostBundle(exportDir: string) {
   if (exported.status !== 'pass') throw new Error('failed to build passing host bundle fixture')
 }
 
+function legacyCutoverReceipt() {
+  const checks = [
+    ['host', 'host.json', 'mupot-fleet-host-receipt/v1'],
+    ['runtime', 'runtime-agent-one.json', 'mupot-fleet-runtime-receipt/v1'],
+    ['control', 'control-start.json', 'mupot-fleet-control-receipt/v1'],
+    ['control', 'control-stop.json', 'mupot-fleet-control-receipt/v1'],
+  ].flatMap(([label, path, type]) => [
+    { ok: true, component: 'cutover-receipt', check: `${label}_receipt_read`, path },
+    { ok: true, component: 'cutover-receipt', check: `${label}_receipt_type`, path, expected: type, actual: type },
+    { ok: true, component: 'cutover-receipt', check: `${label}_receipt_status_pass`, path, actual: 'pass' },
+  ])
+  checks.push(
+    { ok: true, component: 'cutover-receipt', check: 'runtime_receipt_for_agent', agent_id: 'agent-one', path: 'runtime-agent-one.json' },
+    { ok: true, component: 'cutover-receipt', check: 'runtime_signed_attach_for_agent', agent_id: 'agent-one', path: 'runtime-agent-one.json' },
+    { ok: true, component: 'cutover-receipt', check: 'runtime_inbox_handoff_for_agent', agent_id: 'agent-one', path: 'runtime-agent-one.json' },
+    { ok: true, component: 'cutover-receipt', check: 'control_verb_for_agent', agent_id: 'agent-one', required_verb: 'start', matched_verb: 'start', matched_action: 'open' },
+    { ok: true, component: 'cutover-receipt', check: 'control_verb_for_agent', agent_id: 'agent-one', required_verb: 'stop', matched_verb: 'stop', matched_action: 'close' },
+  )
+  return {
+    receipt_type: 'mupot-sos-cutover-gate/v1', generated_at: '2026-07-08T00:03:00.000Z', status: 'pass',
+    summary: { status: 'pass', passed: checks.length, failed: 0, warnings: 0 },
+    inputs: { agents: ['agent-one'], host_receipt: 'host.json', runtime_receipts: ['runtime-agent-one.json'], control_receipts: ['control-start.json', 'control-stop.json'], required_control_verbs: ['start', 'stop'] },
+    checks,
+  }
+}
+
 async function writeBundle(dir: string, mutate?: (dir: string) => void, releaseVersion = 'v0.23.0') {
   mkdirSync(join(dir, 'host-go'), { recursive: true })
   const sourceVersion = releaseVersion.replace(/^v/i, '')
@@ -186,7 +215,40 @@ async function writeBundle(dir: string, mutate?: (dir: string) => void, releaseV
       },
     })
   }
-  await writeHostBundle(join(dir, 'host-go'))
+  if (releaseVersion === 'v0.30.0') {
+    await writeHostBundle(join(dir, 'host-go'))
+  } else {
+    const hostDir = join(dir, 'host-go')
+    // Historical v0.23 fixtures are explicit legacy evidence. The manifest and
+    // sidecars are supplied by the checked-in historical bundle shape below.
+    await writeHostBundle(hostDir)
+    const gatePath = join(hostDir, 'cutover-gate.json')
+    const oldGateSha = sha256(gatePath)
+    const manifestPath = join(hostDir, 'manifest.json')
+    const oldManifestSha = sha256(manifestPath)
+    writeJson(gatePath, legacyCutoverReceipt())
+    const newGateSha = sha256(gatePath)
+    let newManifestSha = ''
+    const replace = (value: unknown): unknown => {
+      if (Array.isArray(value)) return value.map(replace)
+      if (!value || typeof value !== 'object') {
+        if (value === 'mupot-host-go-cutover/v1') return 'mupot-sos-cutover-gate/v1'
+        if (value === oldGateSha) return newGateSha
+        if (value === oldManifestSha) return newManifestSha
+        if (value === 'attach manifest.json and cutover-gate.json to the Host-Go handoff record; handoff is permitted only for the proven agent(s)') return 'attach manifest.json and cutover-gate.json to the cutover record; SOS removal is permitted only for the proven agent(s)'
+        return value
+      }
+      return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, replace(child)]))
+    }
+    const manifest = replace(JSON.parse(readFileSync(manifestPath, 'utf8'))) as Record<string, unknown>
+    writeJson(manifestPath, manifest)
+    newManifestSha = sha256(manifestPath)
+    for (const file of ['export-receipt.json', 'manifest-check.json']) {
+      const path = join(hostDir, file)
+      const sidecar = replace(JSON.parse(readFileSync(path, 'utf8')))
+      writeJson(path, sidecar)
+    }
+  }
 
   writeJson(join(dir, 'github-issues.json'), REQUIRED_ISSUES.map((number) => ({
     number,
@@ -387,7 +449,6 @@ describe('release readiness receipt checker', () => {
     await writeBundle(dir)
 
     const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285', releaseSha: RELEASE_SHA })
-
     expect(receipt.receipt_type).toBe(CHECK_RECEIPT_TYPE)
     expect(receipt.status).toBe('pass')
     expect(receipt.summary.required_receipts).toBe(REQUIRED_RECEIPTS.length)
