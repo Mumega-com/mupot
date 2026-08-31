@@ -1,8 +1,15 @@
 // tests/mcp-instructions.test.ts — Unit and mutation tests for MCP initialize onboarding instructions
 
 import { describe, expect, it } from 'vitest'
+import { SEVEN_AXIS_HARNESSES } from '../src/fleet/presence'
 import { MUPOT_MCP_INITIALIZE_INSTRUCTIONS } from '../src/mcp/instructions'
 import { TOOLS } from '../src/mcp/index'
+
+function extractQuotedHarnesses(text: string, pattern: RegExp, surface: string): string[] {
+  const match = text.match(pattern)
+  if (!match) throw new Error(`could not extract check_in harnesses from ${surface}`)
+  return match[1].split('|').map((value) => JSON.parse(value.trim()) as string)
+}
 
 describe('MUPOT_MCP_INITIALIZE_INSTRUCTIONS', () => {
   it('is a non-empty string with substantive onboarding guidance', () => {
@@ -67,5 +74,26 @@ describe('MUPOT_MCP_INITIALIZE_INSTRUCTIONS', () => {
     expect(toolCheckIn?.inputSchema.properties.harness).toMatchObject({
       enum: expect.arrayContaining(['codex-cli']),
     })
+  })
+
+  it('keeps every check_in harness surface exactly aligned with the canonical enum', () => {
+    const toolCheckIn = TOOLS.find((tool) => tool.name === 'check_in')
+    if (!toolCheckIn) throw new Error('check_in tool is missing from the public catalog')
+
+    const schemaHarnesses = (toolCheckIn.inputSchema.properties.harness as { enum: string[] }).enum
+    const catalogHarnesses = extractQuotedHarnesses(
+      toolCheckIn.args,
+      /harness\?:\s*((?:"[^"]+"\|?)+), machine\?:/,
+      'public check_in catalog args',
+    )
+    const instructionHarnesses = extractQuotedHarnesses(
+      MUPOT_MCP_INITIALIZE_INSTRUCTIONS,
+      /harness:\s+"<harness>",\s+\/\/\s+(.+)\n/,
+      'static initialize instructions',
+    )
+
+    expect(schemaHarnesses).toEqual(SEVEN_AXIS_HARNESSES)
+    expect(catalogHarnesses).toEqual(SEVEN_AXIS_HARNESSES)
+    expect(instructionHarnesses).toEqual(SEVEN_AXIS_HARNESSES)
   })
 })
