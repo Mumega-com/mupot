@@ -22,7 +22,7 @@
     {
       "objective": 2,
       "file": "host-go/cutover-gate.json",
-      "receipt_type": "mupot-sos-cutover-gate/v1",
+      "receipt_type": "mupot-host-go-cutover/v1",
       "phases": ["prepublication", "final"]
     },
     {
