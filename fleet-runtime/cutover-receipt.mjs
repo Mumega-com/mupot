@@ -18,7 +18,7 @@ const EXPECTED = {
 export const HOST_GO_CUTOVER_RECEIPT_TYPE = 'mupot-host-go-cutover/v1'
 export const LEGACY_SOS_CUTOVER_RECEIPT_TYPE = 'mupot-sos-cutover-gate/v1'
 
-const SCANNED_FIELD_RE = /(?:^|_)(?:path|config|file|dir|probe|command|argv|script|service|name|unit|label|binding|env|endpoint|adapter|runtime|base_url)(?:$|_)/i
+const SCANNED_FIELD_RE = /(?:^|_)(?:path|config|file|dir|probe|commands?|argv|script|service|name|unit|label|binding|env|endpoint|adapter|runtime|base_url)(?:$|_)/i
 const SOS_MARKERS = Object.freeze([
   ['sos_binding', /(?:^|[^A-Za-z0-9])SOS(?:_[A-Z0-9_]+)?(?:$|[^A-Za-z0-9])/i],
   ['sos_path', /(?:^|[/\\])\.sos(?:[/\\]|$)|(?:^|[/\\])sos(?:[/\\]|$)/i],
@@ -31,9 +31,11 @@ const FIELD_MARKERS = Object.freeze([
   ['sos_binding', /(?:^|_)(?:binding|env)(?:$|_)/i],
   ['sos_path', /(?:^|_)(?:path|config|file|dir)(?:$|_)/i],
   ['sos_service', /(?:^|_)(?:service|name|unit|label)(?:$|_)/i],
-  ['sos_command', /(?:^|_)(?:probe|command|argv|script|adapter|runtime)(?:$|_)/i],
+  ['sos_command', /(?:^|_)(?:probe|commands?|argv|script|adapter|runtime)(?:$|_)/i],
   ['sos_endpoint', /(?:^|_)(?:endpoint|base_url)(?:$|_)/i],
 ])
+const INHERITED_VALUE_FIELD_RE = /^(?:value|url|executable)$/i
+const FIELD_STATE_FLAG_RE = /_configured$/i
 
 const CONTROL_VERBS = new Set(['start', 'stop', 'restart'])
 
@@ -193,26 +195,30 @@ export function collectLiveSosFindings({ host, runtimes = [], controls = [] } = 
       findings.push({ location, marker })
     }
   }
-  const visit = (value, location, field = '') => {
+  const visit = (value, location, field = '', inheritedMarker = null) => {
+    const marker = SCANNED_FIELD_RE.test(field) && !FIELD_STATE_FLAG_RE.test(field)
+      ? FIELD_MARKERS.find(([, fieldPattern]) => fieldPattern.test(field))?.[0] ?? inheritedMarker
+      : inheritedMarker
     if (Array.isArray(value)) {
-      value.forEach((entry, index) => visit(entry, `${location}[${index}]`, field))
+      value.forEach((entry, index) => visit(entry, `${location}[${index}]`, '', marker))
       return
     }
     if (value && typeof value === 'object') {
       for (const [key, entry] of Object.entries(value)) {
         const childLocation = location ? `${location}.${key}` : key
         if (/^sos(?:_|$)/i.test(key)) add(childLocation, 'sos_binding')
-        visit(entry, childLocation, key)
+        const childInheritsMarker = Array.isArray(entry) || (entry && typeof entry === 'object') || INHERITED_VALUE_FIELD_RE.test(key)
+        visit(entry, childLocation, key, childInheritsMarker ? marker : null)
       }
       return
     }
-    if (typeof value !== 'string' || !SCANNED_FIELD_RE.test(field)) return
-    for (const [marker, fieldPattern] of FIELD_MARKERS) {
-      if (!fieldPattern.test(field)) continue
-      const [, markerPattern] = SOS_MARKERS.find(([name]) => name === marker)
-      if (markerPattern.test(value)) add(location, marker)
-      break
+    if (!marker || value == null) return
+    if (typeof value !== 'string') {
+      add(location, marker)
+      return
     }
+    const [, markerPattern] = SOS_MARKERS.find(([name]) => name === marker)
+    if (markerPattern.test(value)) add(location, marker)
   }
   visit(host, 'host')
   runtimes.forEach((receipt, index) => visit(receipt, `runtimes[${index}]`))

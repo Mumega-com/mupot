@@ -137,6 +137,62 @@ test('collectLiveSosFindings classifies lowercase binding values case-insensitiv
   }), [{ location: 'host.inputs.token_binding', marker: 'sos_binding' }])
 })
 
+test('collectLiveSosFindings preserves nested field categories for every closed SOS marker', () => {
+  const findings = collectLiveSosFindings({
+    host: {
+      inputs: {
+        token_binding: { env: { value: 'SOS_TOKEN_FILE' } },
+        daemon_config: { value: '/home/operator/.sos/daemon.json' },
+        unrelated: { executable: '/opt/sos/bin/ignored', url: 'https://sos.ignored.example' },
+      },
+      checks: [{ service: { value: 'sos-agent.service', pid: 1234 } }],
+      commands: [{ executable: '/opt/sos/bin/agent-probe', code: 0 }],
+    },
+    runtimes: [{ command: { executable: '/opt/sos/bin/runtime-probe' } }],
+    controls: [{ endpoint: { url: 'https://sos.internal.example/v1' } }],
+  })
+
+  assert.deepEqual(findings, [
+    { location: 'controls[0].endpoint.url', marker: 'sos_endpoint' },
+    { location: 'host.checks[0].service.value', marker: 'sos_service' },
+    { location: 'host.commands[0].executable', marker: 'sos_command' },
+    { location: 'host.inputs.daemon_config.value', marker: 'sos_path' },
+    { location: 'host.inputs.token_binding.env.value', marker: 'sos_binding' },
+    { location: 'runtimes[0].command.executable', marker: 'sos_command' },
+  ])
+})
+
+test('collectLiveSosFindings fails closed and redacts malformed nested scanned values', () => {
+  const findings = collectLiveSosFindings({
+    host: {
+      inputs: {
+        daemon_config: 42,
+        sos_env: 'SOS_TOKEN_FILE',
+        token_binding: true,
+      },
+      command: Symbol('do-not-expose'),
+    },
+  })
+
+  assert.deepEqual(findings, [
+    { location: 'host.command', marker: 'sos_command' },
+    { location: 'host.inputs.daemon_config', marker: 'sos_path' },
+    { location: 'host.inputs.sos_env', marker: 'sos_binding' },
+    { location: 'host.inputs.token_binding', marker: 'sos_binding' },
+  ])
+  assert.doesNotMatch(JSON.stringify(findings), /42|true|do-not-expose|SOS_TOKEN_FILE/)
+  assert.deepEqual(collectLiveSosFindings({
+    host: {
+      inputs: {
+        token_binding: true,
+        sos_env: 'SOS_TOKEN_FILE',
+        daemon_config: 42,
+      },
+      command: Symbol('do-not-expose'),
+    },
+  }), findings)
+})
+
 test('cutover receipt fails when runtime receipt did not prove inbox handoff', async () => {
   const dir = tmpDir()
   const host = writeJson(dir, 'host.json', hostReceipt())

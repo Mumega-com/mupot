@@ -573,6 +573,17 @@ function seedLegacyCutoverEvidence(outDir) {
   return seedBundleForMode('mupot-sos-cutover-gate/v1', outDir)
 }
 
+function injectLiveSosHostEvidence(outDir) {
+  const hostPath = join(outDir, 'host.json')
+  const host = JSON.parse(readFileSync(hostPath, 'utf8'))
+  host.inputs.daemon_config = '/home/operator/.sos/daemon.json'
+  writeJson(hostPath, host)
+  const manifestPath = join(outDir, 'manifest.json')
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+  manifest.artifacts.host.sha256 = sha256(hostPath)
+  writeJson(manifestPath, manifest)
+}
+
 function rewriteCutoverMode(outDir, gateType) {
   const paths = {
     hostPath: join(outDir, 'host.json'),
@@ -2000,6 +2011,51 @@ test('copied neutral bundle rejects a forged no-live-SOS pass', () => {
   const check = checkBundleManifest({ outDir })
   assert.equal(check.status, 'fail')
   assert.ok(check.checks.some((entry) => entry.check === 'cutover_gate_mode_valid' && entry.ok === false))
+})
+
+test('copied neutral bundle recomputes no-live-SOS from hashed source receipts', () => {
+  const outDir = seedBundleForMode('mupot-host-go-cutover/v1')
+  injectLiveSosHostEvidence(outDir)
+
+  const check = checkBundleManifest({ outDir })
+
+  assert.equal(check.status, 'fail')
+  const recomputed = check.checks.find((entry) => entry.check === 'neutral_source_receipts_no_live_sos')
+  assert.deepEqual(recomputed?.findings, [
+    { location: 'host.inputs.daemon_config', marker: 'sos_path' },
+  ])
+  assert.equal(recomputed?.finding_count, 1)
+  assert.doesNotMatch(JSON.stringify(recomputed), /home|operator|daemon\.json/)
+})
+
+test('exported neutral bundle recomputes no-live-SOS before emitting attach policy', () => {
+  const outDir = seedBundleForMode('mupot-host-go-cutover/v1')
+  injectLiveSosHostEvidence(outDir)
+  const exportDir = tmpDir()
+
+  const exportReceipt = exportBundle({ outDir, exportDir })
+  const check = checkBundleManifest({ outDir: exportDir })
+
+  assert.equal(exportReceipt.status, 'fail')
+  assert.equal(exportReceipt.next_steps.includes(NEUTRAL_ATTACH), false)
+  assert.equal(check.status, 'fail')
+  assert.ok(check.checks.some((entry) =>
+    entry.check === 'neutral_source_receipts_no_live_sos' &&
+    entry.ok === false &&
+    entry.finding_count === 1 &&
+    entry.findings[0]?.location === 'host.inputs.daemon_config' &&
+    entry.findings[0]?.marker === 'sos_path'
+  ))
+})
+
+test('legacy bundle does not recompute neutral no-live-SOS evidence', () => {
+  const outDir = seedBundleForMode('mupot-sos-cutover-gate/v1')
+  injectLiveSosHostEvidence(outDir)
+
+  const check = checkBundleManifest({ outDir })
+
+  assert.equal(check.status, 'pass', JSON.stringify(check.checks.filter((entry) => entry.ok !== true), null, 2))
+  assert.equal(check.checks.some((entry) => entry.check === 'neutral_source_receipts_no_live_sos'), false)
 })
 
 test('copied legacy gate cannot be interpreted with the neutral schema', () => {

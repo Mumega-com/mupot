@@ -36,6 +36,7 @@ import {
   HOST_GO_CUTOVER_RECEIPT_TYPE,
   LEGACY_SOS_CUTOVER_RECEIPT_TYPE,
   buildReceipt as buildCutoverReceipt,
+  collectLiveSosFindings,
   controlRuns,
 } from './cutover-receipt.mjs'
 import {
@@ -2901,6 +2902,22 @@ function checkBundleManifest(opts = {}) {
       if (entry.label === 'cutover_gate' && receipt) {
         addCutoverGateConsistencyChecks(checks, manifestPath, manifest, entries, receipt)
       }
+    }
+
+    if (resolvedCutoverMode === 'neutral') {
+      const findings = collectLiveSosFindings({
+        host: receiptRecords.find((record) => record.label === 'host')?.receipt,
+        runtimes: receiptRecords.filter((record) => record.label.startsWith('runtime:')).map((record) => record.receipt),
+        controls: receiptRecords.filter((record) => record.label.startsWith('control:')).map((record) => record.receipt),
+      })
+      checks.push({
+        ok: findings.length === 0,
+        component: 'receipt-bundle-check',
+        check: 'neutral_source_receipts_no_live_sos',
+        finding_count: findings.length,
+        findings,
+      })
+      if (findings.length > 0) resolvedCutoverMode = null
     }
 
     addTargetConsistencyChecks(checks, manifestPath, entries, receiptRecords, agents)
