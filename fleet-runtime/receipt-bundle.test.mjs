@@ -924,6 +924,29 @@ test('new bundle rejects an injected legacy cutover gate', async () => {
   assert.deepEqual(bundle.next_steps, [NEUTRAL_HOLD])
 })
 
+test('new bundle fails closed when an injected cutover builder returns null', async () => {
+  const outDir = tmpDir()
+  seedCutoverEvidence(outDir)
+  let bundle
+
+  await assert.doesNotReject(async () => {
+    bundle = await buildBundle({
+      outDir,
+      agents: ['agent-one'],
+      verifyOnly: true,
+      cutoverBuilder: async () => null,
+    })
+  })
+
+  assert.equal(bundle.status, 'fail')
+  assert.ok(bundle.checks.some((entry) =>
+    entry.check === 'cutover_gate_status_pass' &&
+    entry.ok === false &&
+    entry.actual === null
+  ))
+  assert.deepEqual(bundle.next_steps, [NEUTRAL_HOLD])
+})
+
 test('starter-ready bundle requires, exports, and summarizes service continuity evidence', async () => {
   const outDir = tmpDir()
   const sources = starterPaths()
@@ -2066,6 +2089,34 @@ test('export writes a clean self-contained attachable bundle', async () => {
   assert.equal(tamperedSidecar.status, 'fail')
   assert.ok(tamperedSidecar.checks.some((check) => check.check === 'export_sidecar_receipt_json_read' && check.sidecar === 'export-receipt.json' && check.ok === false))
   assert.equal(checkBundleManifest({ outDir }).status, 'fail')
+})
+
+test('export preserves the strict historical legacy cutover policy', () => {
+  const outDir = seedLegacyCutoverEvidence(tmpDir())
+  const exportDir = tmpDir()
+
+  const receipt = exportBundle({ outDir, exportDir })
+
+  assert.equal(receipt.status, 'pass', JSON.stringify(receipt.checks.filter((entry) => entry.ok === false), null, 2))
+  assert.deepEqual(receipt.next_steps, [LEGACY_ATTACH])
+  const persisted = JSON.parse(readFileSync(join(exportDir, 'export-receipt.json'), 'utf8'))
+  assert.deepEqual(persisted.next_steps, [LEGACY_ATTACH])
+  assert.equal(checkBundleManifest({ outDir: exportDir }).status, 'pass')
+})
+
+test('export checker accepts the exact legacy attach policy', () => {
+  const outDir = seedLegacyCutoverEvidence(tmpDir())
+  const exportDir = tmpDir()
+  const receipt = exportBundle({ outDir, exportDir })
+  assert.equal(receipt.status, 'pass')
+
+  const exportReceiptPath = join(exportDir, 'export-receipt.json')
+  const persisted = JSON.parse(readFileSync(exportReceiptPath, 'utf8'))
+  persisted.next_steps = [LEGACY_ATTACH]
+  writeJson(exportReceiptPath, persisted)
+
+  const check = checkBundleManifest({ outDir: exportDir })
+  assert.equal(check.status, 'pass', JSON.stringify(check.checks.filter((entry) => entry.ok === false), null, 2))
 })
 
 test('manifest check fails when exported bundle sidecar receipts are missing', async () => {

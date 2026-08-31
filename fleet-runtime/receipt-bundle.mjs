@@ -2268,13 +2268,19 @@ function expectedExportCopiedArtifacts(manifestDir, manifest) {
   return copied
 }
 
+function verifiedManifestCutoverMode(manifest, manifestCheck) {
+  if (manifestCheck?.status !== 'pass') return null
+  return cutoverModeForType(manifest?.artifacts?.cutover_gate?.receipt_type)
+}
+
 function expectedExportReceiptChecks(receipt, manifestDir, manifest, expectedManifestCheck) {
   const provenance = usablePortableProvenance(manifest)
+  const cutoverMode = verifiedManifestCutoverMode(manifest, expectedManifestCheck)
   const copiedByLabel = new Map(receipt.artifacts.copied.map((entry) => [entry.label, entry]))
   const manifestCopy = copiedByLabel.get('manifest')
-  if (!manifestCopy || !hasExactKeys(manifestCopy, ['label', 'source', 'path', 'sha256']) || manifestCopy.source !== 'manifest.json' || manifestCopy.path !== 'manifest.json' ||
+  if (!cutoverMode || !manifestCopy || !hasExactKeys(manifestCopy, ['label', 'source', 'path', 'sha256']) || manifestCopy.source !== 'manifest.json' || manifestCopy.path !== 'manifest.json' ||
     receipt.inputs.manifest !== 'manifest.json' || receipt.inputs.export_dir !== basename(manifestDir) || receipt.inputs.out_dir !== '.' ||
-    JSON.stringify(receipt.next_steps) !== JSON.stringify([CUTOVER_MODE.neutral.attach])) return null
+    JSON.stringify(receipt.next_steps) !== JSON.stringify([CUTOVER_MODE[cutoverMode].attach])) return null
 
   let manifestCopySha = manifestCopy.sha256
   if (provenance) {
@@ -3307,7 +3313,7 @@ function overwriteExportSidecar(path, receipt, opts = {}) {
   atomicWriteFile(path, jsonBytes(portable), { force: true })
 }
 
-function makeExportReceipt({ checks, manifestPath, opts, exportDir, copied, manifestCheck }) {
+function makeExportReceipt({ checks, manifestPath, opts, exportDir, copied, manifestCheck, cutoverMode }) {
   const checkSnapshot = JSON.parse(JSON.stringify(checks)).map((check) => {
     if (check.check === 'export_dir_separate_from_source') return { ...check, source_dir: '.' }
     if (check.check === 'sidecar_receipt_written') {
@@ -3347,8 +3353,8 @@ function makeExportReceipt({ checks, manifestPath, opts, exportDir, copied, mani
       summary: manifestCheck.summary,
       manifest: manifestCheck.manifest,
     } : null,
-    next_steps: summary.status === 'pass'
-      ? [CUTOVER_MODE.neutral.attach]
+    next_steps: summary.status === 'pass' && cutoverMode
+      ? [CUTOVER_MODE[cutoverMode].attach]
       : ['fix the source receipts or export directory, rerun receipt-bundle --export, then attach only the exported directory after it passes'],
     checks: checkSnapshot,
   }
@@ -3453,6 +3459,7 @@ function exportBundle(opts = {}) {
 
   let manifestCheck = exportDirReady ? checkBundleManifest({ outDir: exportDir, allowMissingSidecars: true, skipExportSidecars: true }) : null
   const canonicalManifestCheck = manifestCheck
+  const cutoverMode = verifiedManifestCutoverMode(manifest, canonicalManifestCheck)
   checks.push({
     ok: manifestCheck?.status === 'pass',
     component: 'receipt-bundle-export',
@@ -3464,7 +3471,7 @@ function exportBundle(opts = {}) {
   const exportReceiptPath = exportDir ? join(exportDir, EXPORT_RECEIPT_FILE) : ''
   const manifestCheckPath = exportDir ? join(exportDir, MANIFEST_CHECK_RECEIPT_FILE) : ''
   if (exportDirReady && manifestCheck) {
-    const baseReceipt = makeExportReceipt({ checks, manifestPath, opts, exportDir, copied, manifestCheck })
+    const baseReceipt = makeExportReceipt({ checks, manifestPath, opts, exportDir, copied, manifestCheck, cutoverMode })
     const sidecarOpts = { ...opts, sourceDir, exportDir }
     writeExportSidecar(manifestCheckPath, manifestCheck, sidecarOpts, checks, 'manifest_check')
     writeExportSidecar(exportReceiptPath, baseReceipt, sidecarOpts, checks, 'export_receipt')
@@ -3478,7 +3485,7 @@ function exportBundle(opts = {}) {
     })
   }
 
-  let receipt = makeExportReceipt({ checks, manifestPath, opts, exportDir, copied, manifestCheck: canonicalManifestCheck })
+  let receipt = makeExportReceipt({ checks, manifestPath, opts, exportDir, copied, manifestCheck: canonicalManifestCheck, cutoverMode })
   if (exportDirReady && manifestCheck) {
     const sidecarOpts = { ...opts, sourceDir, exportDir }
     try {
@@ -3501,7 +3508,7 @@ function exportBundle(opts = {}) {
         reason: String(err && err.message ? err.message : err),
       })
     }
-    receipt = makeExportReceipt({ checks, manifestPath, opts, exportDir, copied, manifestCheck: canonicalManifestCheck })
+    receipt = makeExportReceipt({ checks, manifestPath, opts, exportDir, copied, manifestCheck: canonicalManifestCheck, cutoverMode })
     try {
       overwriteExportSidecar(exportReceiptPath, receipt, sidecarOpts)
     } catch {
@@ -4482,11 +4489,11 @@ async function buildBundle(opts) {
   writeJson(gatePath, gateReceipt, { ...opts, force: true }, checks, 'cutover')
   const normalizedGate = normalizePassingCutoverReceipt(gateReceipt)
   checks.push({
-    ok: gateReceipt.status === 'pass' && normalizedGate?.mode === 'neutral',
+    ok: normalizedGate?.mode === 'neutral',
     component: 'receipt-bundle',
     check: 'cutover_gate_status_pass',
     path: gatePath,
-    actual: gateReceipt.status,
+    actual: gateReceipt?.status ?? null,
   })
   artifacts.cutover_gate = receiptMeta(gatePath)
   secureBundleJsonFiles(outDir, checks)
