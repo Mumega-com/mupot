@@ -31,12 +31,15 @@ simple: deploy one pot, connect a runtime worker, grant scoped capabilities,
 send it work, gate risky actions, observe what happened, and verify the result
 against a real tool of record such as GitHub.
 
-The version the code reports is `v0.29.0 Release Truth and Sovereign Substrate` — cut,
-but not yet tagged. The last tagged release is `v0.25.0 Project Routines and Needs You`;
-the active development target is `v0.30.0 Governed Tools and Console Consolidation`. See the
+The version the code reports is `0.30.0`, but it is not yet a tagged stable release.
+The last tagged release is `v0.25.0 Project Routines and Needs You`; the next stable
+candidate is `v0.30.0 Stabilized Control Plane`, and `v0.31.0` work remains held until
+that release closes. See the
 [version roadmap](./ROADMAP.md), the
+[next release flights](./docs/releases/next-flights.md), the
 [control-plane requirements](./docs/control-plane-roadmap.md), the
-[v0.23.0 Trusted Runtime release record](./docs/releases/v0.23.0-trusted-runtime.md), the
+[v0.30.0 release contract](./docs/releases/v0.30.0.md), the
+[historical v0.23.0 Trusted Runtime release record](./docs/releases/v0.23.0-trusted-runtime.md), the
 [runtime adapter contract](./docs/runtime-adapter-contract.md), the
 [self-hosting guide](./docs/SELF-HOST.md), the
 [production runbook](./docs/production-runbook.md),

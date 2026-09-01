@@ -8,10 +8,11 @@ numbers.
 
 | State | Version | Meaning |
 |---|---|---|
-| Current source version | `0.30.0` | Present on `main`; preview until the stabilization gate passes and `v0.30.0` is tagged. |
+| Current source version | `0.30.0` | Present on `main` at `55c1c3ef` as of 2026-09-01; preview until the stabilization gate passes and `v0.30.0` is tagged. |
+| Current production version | `0.30.0` | Deployed at `16390d1e`; behind current `main` and not a stable-release claim. |
 | Last tagged release | `v0.25.0` | Project Routines and Needs You. |
 | Next stable candidate | `v0.30.0` | Stabilization-only: security train, messaging reliability, release proof, and backlog closure. |
-| Future development target | `v0.31.0` | Agent Computers and Recovery; held until `v0.30.0` is stable. |
+| Future development target | `v0.31.0` | Canonical receiver, Agent Computers, and Recovery; held until `v0.30.0` is stable. |
 
 `0.30.0` is the version the source currently reports. It is **not** yet a stable
 release: no `v0.30.0` tag or GitHub release exists. Code on `main` remains preview
@@ -60,17 +61,27 @@ Three consequences this document now carries:
 | 3 | Message reliability — #1235/#1237/#1241 | Guest visibility, immutable integrity baseline, starvation-free inbox cursor | **LANDED** — #1237 `b980f565`, #1235 `4d41d9bd`, and #1241 `a3d46acb`; post-main CI/CodeQL green | Retain exact-head and landing receipts in the release bundle |
 | 4 | PR hygiene — #1211/#1217/#1236/#1238 | Remove obsolete/conflicting work from the release surface | **COMPLETE** — all four closed with replacement/deferral evidence; branches preserved | Keep release-excluded work out of the freeze |
 | 4a | PR #1249 — external runtime dispatch receipts | Exact external dispatch, gate, replay, cancellation, and public receipt paths | **LANDED OUTSIDE THE ORDERED TRAIN** as `16390d1e`; present in main as preview | Restack the release head on it, retain exact combined gates, and do not promote new stable claims without a separate scope decision |
-| 5 | `v0.30.0` release candidate | One exact main SHA, upgrade/fresh migration proof, browser/runtime/MCP smoke, release receipt | **IN PREPARATION** — [release contract](docs/releases/v0.30.0.md) defined; evidence remains pending | Merge corrected metadata/tooling after exact-head gates, freeze one SHA, collect contract receipts, then request separate RC publication/deployment approvals |
+| 5 | PR #1250 — versioned release contract | Version-aware release receipts, exact RC/stable identity, and metadata truth | **LANDED 2026-08-31** as `ccfdb4b3`; CI, CodeQL, independent review, and Athena green | Use its contract and checkers for the frozen release SHA |
+| 6 | PR #1251 — neutral Host-Go evidence | Mupot/Herdr-neutral host cutover receipt with `no_live_sos_wiring` | **LANDED 2026-08-31** as `c6ef9876`; historical receipt parsing preserved | Produce fresh neutral host evidence for the release bundle |
+| 7 | PR #1252 — exact Codex CLI harness | Accept exact `codex-cli` declarations across persistence, parser, schema, and instructions | **LANDED 2026-09-01** as `55c1c3ef`; post-main CI and CodeQL green; not deployed | Keep as preview in v0.30, freeze `main`, and require a fresh seat check-in after any later deployment |
+| 8 | `v0.30.0` release candidate | One exact main SHA, upgrade/fresh migration proof, browser/runtime/MCP smoke, release receipt | **READY TO FREEZE** — [release contract](docs/releases/v0.30.0.md) and [flight runway](docs/releases/next-flights.md) defined; evidence remains pending | Freeze one SHA, collect contract receipts, then request separate RC publication/deployment approvals |
+
+The ordered release flights and post-stable receiver convergence are maintained in
+[docs/releases/next-flights.md](docs/releases/next-flights.md). Open #1246–#1248 and
+#1253–#1254 are outside the v0.30 freeze; none may silently move the release head.
 
 **Board opinion policy:** priority ORDER is Hadi's alone — no vote, no ceremony. Board
 input (asha first-pass, Athena architecture, River build feasibility) is requested per
 flight when SCOPE is unclear, and is advisory. Ratification voting (MU.100.001 §1.3)
 applies to constitution amendments only — never to sequencing work.
 
-## Operating loop — current live state (2026-08-03, updates by PR only)
+## Historical operating-loop snapshot — 2026-08-03
 
 > Cross-cutting runtime plan; version-scoped features above own their releases.
-> "Where is the plan?" — here. Shipped record: CHANGELOG.md.
+> This section preserves the measured 2026-08-03 loop state; it is not the current
+> release queue. Current release execution lives in
+> [docs/releases/next-flights.md](docs/releases/next-flights.md). Shipped record:
+> CHANGELOG.md.
 
 **Ideal output** — a self-perpetuating loop, humans only at decision points:
 `board task → caged lane builds (cheap model) → cross-vendor review → gate verdict
@@ -214,13 +225,13 @@ Pot
 Making **Project** the organizing center (v0.24) is not a single feature — it
 resets what the rest of the product should be. Two consequences are now scheduled:
 
-- **Console consolidation (v0.26).** Much of the current navigation became
+- **Console consolidation (post-v0.30; version assignment held).** Much of the current navigation became
   redundant, duplicated, or orphaned the moment Project tabs existed. A 2026-07-20
   audit found duplicate menu destinations, a "Work" menu that is only a compose
   form, self-declared-dead stubs, and real pages with no nav entry.
   → [console-navigation-consolidation.md](docs/architecture/console-navigation-consolidation.md)
   and [#584](https://github.com/Mumega-com/mupot/issues/584).
-- **Identity & Unified Access (v0.26).** The token/agent model predates Project and
+- **Identity & Unified Access (post-v0.30; version assignment held).** The token/agent model predates Project and
   cannot express it: authority lives on the member not the token, agents are welded
   onto members, keys can't be fine-grained, and Project isn't a valid RBAC scope.
   → [identity-and-access-redesign.md](docs/architecture/identity-and-access-redesign.md).
@@ -434,7 +445,7 @@ Original proposed scope (not committed to the `v0.30.0` stable contract):
 - AI visibility collection, recommendation review, approved action, and outcome receipt;
 - **guest-credential precursor:** the scoped, no-raw-secret credential path is the
   same governance family as the Operated Presence guest token (least-privilege,
-  capability-ceiling, expiry) — prove it here so v0.29 presence rides a hardened primitive.
+  capability-ceiling, expiry) — prove it before v0.33 Operated Presence rides the primitive.
 
 **Also proposed — Console consolidation.** Complete the Project pivot's navigation
 consequence under [#584](https://github.com/Mumega-com/mupot/issues/584):
@@ -476,7 +487,7 @@ elevation is approval-gated** (Zero-Standing-Privilege, per Teleport/CyberArk); 
 Entra converge on agent-as-principal but keep the human owner). **Audience note: agents
 are the primary operators, humans the exception** — setup runs through an admin agent
 over MCP, so this identity/access model is the flagship and the console consolidation
-(v0.26) is a thin bootstrap/oversight shell, not the main surface.
+(post-v0.30) is a thin bootstrap/oversight shell, not the main surface.
 
 - **one principal** table with `kind ∈ human|agent` (People and Agents become
   `kind`-filtered views); stop minting agents into the members table; `members`/
@@ -508,13 +519,22 @@ Activation:
 Regardless of its future target, this scope excludes accounting, payments,
 unrestricted tool catalogs, and silent credential fallback into runtime environments.
 
-### v0.31.0: Agent Computers and Recovery - planned
+### v0.31.0: Canonical Receiver, Agent Computers, and Recovery - planned
 
-**One promise:** Substantial flights can run in isolated, recoverable computers without
-making one Mac, pod, or agent harness the system of record.
+**One promise:** Substantial flights run through one identity-bound receiver into
+isolated, recoverable computers without making one Mac, pod, receiver, or agent harness
+the system of record.
 
 Must ship:
 
+- one canonical Mupot-to-Codex receiver and host runner, reconciling the Hadi-admin
+  operational implementation with the Hadi-dev contract and policy lane;
+- bearer-derived agent identity plus a server-authorized seat/session context shared by
+  `check_in`, inbox lease/ACK, send, and runtime receipts;
+- a standardized cross-platform runner CLI/service with polling fallback and a governed
+  push subscription path; push becomes default only after soak and replay gates pass;
+- an exact receipt chain from dispatch through runtime consumption, correlated ACK,
+  artifact hash, review, and independent verdict;
 - explicit runtime Session and Execution Workspace lifecycle;
 - ephemeral and approved persistent workspace modes;
 - Kubernetes Job or compatible sandbox adapter for isolated flights;
@@ -526,6 +546,8 @@ Must ship:
 Activation:
 
 - Existing trusted Agent Host remains the default executor.
+- The canonical receiver and runner remain default-disabled until one bounded synthetic
+  live canary passes identity, replay, artifact, rollback, and no-duplicate-work gates.
 - Isolated computer mode starts opt-in by Project/Routine and becomes default only
   after recovery and cost gates pass.
 - `reuse` and `pinned` sessions remain opt-in.
@@ -538,6 +560,8 @@ memory with evidence or allowing agents to widen their own authority.
 Must ship:
 
 - project resources and document/artifact index;
+- a background memory-dreamer worker that produces reviewable, source-linked proposals
+  rather than silently rewriting Project or agent memory;
 - explicit session, agent, Project, pot, and evidence memory scopes;
 - proposed skill, routine, methodology, and memory changes through review;
 - revision activation, rollback, evaluation cases, and activation receipts;
@@ -607,7 +631,11 @@ study. Feature count alone cannot satisfy the GA gate.
 | Governed connector actions | `preview; post-v0.30 target required` | Connector and grant required |
 | Unified principals + token-scoped access | `planned; post-v0.30 target required` | Additive migration; fail-closed transition required |
 | Marketing & CRO addon | `preview; post-v0.30 target required` | Opt-in per Project |
+| Canonical Mupot-to-Codex receiver and runner | `v0.31.0` | Default-disabled until synthetic live canary passes |
+| Governed realtime push subscription | `v0.31.0` | Polling fallback retained; default-on only after soak |
+| Exact runtime consumption, ACK, and artifact receipts | `v0.31.0` | Enforced for the canonical receiver |
 | Isolated Agent Computers | `v0.31.0` | Initially opt-in |
+| Memory dreamer worker | `v0.32.0` | Proposal-only; promotion gated |
 | Reviewed knowledge and coherence evaluation | `v0.32.0` | Promotion gated |
 | Commercial installation and operations | `v0.33.0` | License/entitlement dependent |
 | Operated Presence (metered guest check-in/out) | `v0.33.0` | Owner opt-in per engagement, fail-closed, revocable |
