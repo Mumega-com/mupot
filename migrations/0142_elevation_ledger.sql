@@ -53,7 +53,12 @@ CREATE TABLE IF NOT EXISTS elevation_requests (
   requested_actions_json      TEXT NOT NULL,   -- JSON array of 'action:*' keys (see elevation-actions.ts)
   requested_scope_type        TEXT NOT NULL CHECK (requested_scope_type IN ('org','department','squad')),
   requested_scope_id          TEXT NOT NULL DEFAULT '',
-  requested_duration_minutes  INTEGER NOT NULL CHECK (requested_duration_minutes IN (15, 60, 240, 480, 1440)),
+  -- Kept in lockstep with ELEVATION_DURATION_PRESETS_MINUTES
+  -- (src/auth/elevation-actions.ts) — 1446 is Hadi's own explicit duration
+  -- (verbatim "time limited 1446", mupot task f5fe1222), added before this
+  -- migration was ever applied anywhere, so the CHECK is edited in place
+  -- rather than via a follow-up ALTER-TABLE migration.
+  requested_duration_minutes  INTEGER NOT NULL CHECK (requested_duration_minutes IN (15, 60, 240, 480, 1440, 1446)),
   reason                      TEXT NOT NULL,
   status                      TEXT NOT NULL DEFAULT 'pending'
                                  CHECK (status IN ('pending','approved','denied','expired','revoked')),

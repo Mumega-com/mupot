@@ -131,7 +131,11 @@ export function elevationActionEffect(key: string): ElevationActionEffect | null
 
 export const ALL_ELEVATION_ACTION_KEYS: readonly string[] = Object.freeze(Object.keys(ELEVATION_ACTIONS))
 
-export const ELEVATION_DURATION_PRESETS_MINUTES = Object.freeze([15, 60, 240, 480, 1440] as const)
+// 1446 minutes (~24.1 hours) is Hadi's own explicit duration — asked for
+// twice, verbatim "time limited 1446" (mupot task f5fe1222). It is not a
+// round-hour value; formatMinutes() in src/dashboard/elevation.ts renders it
+// as "1446 minutes (~24 hours)" rather than pretending it is exactly a day.
+export const ELEVATION_DURATION_PRESETS_MINUTES = Object.freeze([15, 60, 240, 480, 1440, 1446] as const)
 export type ElevationDurationMinutes = (typeof ELEVATION_DURATION_PRESETS_MINUTES)[number]
 export const ELEVATION_DEFAULT_DURATION_MINUTES: ElevationDurationMinutes = 60
 
