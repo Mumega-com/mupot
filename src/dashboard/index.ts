@@ -237,6 +237,7 @@ import '../departments/modules/growth' // side-effect: register GrowthModule so 
 import '../departments/modules/agency' // side-effect: register AgencyModule (reusable agency/AEO template)
 import '../departments/modules/web-ops' // side-effect: register WebOpsModule (AI website-operations team — the wedge)
 import { makeMissionControlApp } from './mission-control-routes'
+import { makeElevationApp } from './elevation'
 export { controlTowerBody, potFleetBody } from './mission-control-views'
 import { getAuthContext, loadStudioData, studioPageHtml, dispatchStudioFlight, isSafeRepoUrl } from './studio'
 import { deployProject } from '../projects/deploy'
@@ -1375,6 +1376,13 @@ dashboardApp.post('/api/studio/chat/keepalive', async (c) => {
 // dashboard already uses everywhere else. GET /api/radar's own bearer check
 // Mount Mission Control Sub-app (unified /radar + 301 redirects)
 dashboardApp.route('/', makeMissionControlApp(shell))
+
+// Mount Elevation Sub-app (Delivery Sequence step 5, mumega-com#1173):
+// GET /elevation (pending requests), GET /elevation/:id (approval screen),
+// GET /elevation/grants (live grants + revoke + usage). Human-only,
+// structurally — inherits dashboardApp's cookie-only requireAuth gate above;
+// see src/dashboard/elevation.ts's module header for the full argument.
+dashboardApp.route('/', makeElevationApp(shell))
 
 // Mount Kanban Sub-app
 dashboardApp.route('/', kanbanApp)
@@ -3512,6 +3520,7 @@ export function shell(
       }
       .btn:disabled { opacity: .5; cursor: not-allowed; }
       .btn.secondary { background: transparent; color: var(--primary); }
+      .btn.danger { background: var(--danger,#c0392b); border-color: var(--danger,#c0392b); color: #fff; }
       .status-line { margin-top: 12px; font-size: 13px; color: var(--muted); min-height: 18px; }
       .empty { color: var(--dim); font-size: 14px; padding: 8px 0; }
       .tag { font-size: 11px; padding: 1px 7px; border-radius: 6px; border: 1px solid var(--border); color: var(--muted); }
@@ -4064,6 +4073,12 @@ export function shell(
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M10 3 4.5 5.2v4.3c0 3.4 2.3 5.8 5.5 7 3.2-1.2 5.5-3.6 5.5-7V5.2z"/><path d="M7.6 10l1.7 1.7 3.1-3.4"/></svg>
             <span class="nav-label">Approvals</span>
             <span class="nav-badge" id="approvals-badge" style="display:none;">0</span>
+          </a>
+
+          <!-- Elevation (Delivery Sequence step 5, mumega-com#1173) -->
+          <a class="nav-link" href="/elevation">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M10 3v11"/><path d="M6 10l4 4 4-4"/><rect x="4" y="15.5" width="12" height="2" rx="1"/></svg>
+            <span class="nav-label">Elevation</span>
           </a>
 
           <a class="nav-link" href="/studio">
