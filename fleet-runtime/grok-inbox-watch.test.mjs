@@ -539,63 +539,123 @@ test('resolveDeliveryMechanism refuses an unrecognized value rather than guessin
   assert.equal(result.mechanism, 'ssh')
 })
 
-test('deliverViaHerdr spools BEFORE any herdr command runs, and confirms via herdr agent read', () => {
+test('deliverViaHerdr reads a baseline via agent get BEFORE prompting, and confirms via revision advancing — never via agent read', () => {
   const dir = mkdtempSync(join(tmpdir(), 'grok-spool-'))
   try {
     const calls = []
+    let getCallCount = 0
     const result = deliverViaHerdr('', REQUEST, {
       spoolDir: dir,
       herdrTarget: 'muvps_loom',
       herdrBin: 'herdr',
+      pollIntervalMs: 1,
       spawn: (command, args) => {
         calls.push({ command, args })
+        if (command === 'herdr' && args[0] === 'agent' && args[1] === 'get') {
+          getCallCount += 1
+          assert.equal(args[2], 'muvps_loom', 'agent get must target the configured herdr target')
+          const revision = getCallCount === 1 ? 3437 : 3438
+          return { status: 0, stdout: JSON.stringify({ result: { agent: { revision, state_change_seq: revision } } }) }
+        }
         if (command === 'herdr' && args[0] === 'agent' && args[1] === 'prompt') {
-          // spool must already be on disk by the time the prompt is submitted
-          assert.equal(statSync(dir).isDirectory(), true)
+          assert.equal(getCallCount, 1, 'the baseline agent get must happen BEFORE the prompt is submitted')
+          assert.equal(statSync(dir).isDirectory(), true, 'spool must already be on disk by the time the prompt is submitted')
           assert.equal(args[2], 'muvps_loom', 'prompt must target the configured herdr target')
           return { status: 0, stdout: '' }
         }
         if (command === 'sleep') return { status: 0, stdout: '' }
-        if (command === 'herdr' && args[0] === 'agent' && args[1] === 'read') {
-          assert.equal(args[2], 'muvps_loom')
-          return { status: 0, stdout: `some pane text ${deliveryMarker(REQUEST)} more text` }
+        if (command === 'herdr' && args[1] === 'read') {
+          throw new Error('deliverViaHerdr must never call `herdr agent read` for confirmation (mupot#1258 herdr follow-up: pane reads are unreliable by construction)')
         }
         throw new Error(`unexpected spawn: ${command} ${JSON.stringify(args)}`)
       },
     })
     assert.equal(result.ok, true)
+    // The marker is still embedded in the delivered text for a human
+    // reading the pane later, even though confirmation no longer depends
+    // on finding it.
     assert.equal(result.marker, deliveryMarker(REQUEST))
     assert.ok(result.spool_path)
-    assert.equal(calls[0].command, 'herdr', 'first subprocess call must be the herdr prompt, after the spool write')
-    assert.equal(calls[0].args[1], 'prompt')
+    assert.equal(calls[0].args[1], 'get', 'first subprocess call must be the baseline agent get, after the spool write')
+    assert.equal(calls[1].args[1], 'prompt', 'second call must be the prompt, after the baseline is captured')
     assert.ok(calls.every((c) => c.command !== 'tmux'), 'herdr delivery must never shell out to tmux')
+    assert.ok(calls.every((c) => !(c.command === 'herdr' && c.args[1] === 'read')), 'herdr delivery must never call agent read for confirmation')
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
 })
 
-test('an unconfirmed herdr delivery returns ok:false and does not fabricate a marker match', () => {
+test('an agent_not_idle-shaped pane-read error does not cause a false negative, because confirmation never calls agent read', () => {
+  // This is the exact live failure this rebuild exists to fix (mupot#1258
+  // herdr follow-up canary, verified by hand against production): a
+  // genuinely delivered prompt landed while muvps_loom was working, and
+  // `herdr agent read --source recent-unwrapped --lines 60` refused with
+  // {"error":{"code":"agent_not_idle",...}}. A pane-read-based confirmation
+  // would read that refusal as "unconfirmed" and wrongly refuse to
+  // consume. This mock wires `agent read` to return exactly that shape and
+  // proves the new confirmation path never touches it at all.
   const dir = mkdtempSync(join(tmpdir(), 'grok-spool-'))
   try {
+    let getCallCount = 0
+    let readCalled = false
+    const result = deliverViaHerdr('', REQUEST, {
+      spoolDir: dir,
+      pollIntervalMs: 1,
+      spawn: (command, args) => {
+        if (command === 'herdr' && args[1] === 'get') {
+          getCallCount += 1
+          // agent get is documented (and verified live) to return cleanly
+          // regardless of busy state, unlike agent read.
+          const revision = getCallCount === 1 ? 3437 : 3438
+          return { status: 0, stdout: JSON.stringify({ result: { agent: { revision, state_change_seq: revision, agent_status: 'working' } } }) }
+        }
+        if (command === 'herdr' && args[1] === 'prompt') return { status: 0, stdout: '' }
+        if (command === 'sleep') return { status: 0, stdout: '' }
+        if (command === 'herdr' && args[1] === 'read') {
+          readCalled = true
+          return { status: 1, signal: null, stdout: '', stderr: JSON.stringify({ error: { code: 'agent_not_idle', message: 'cannot read 60 lines while muvps_loom is working' } }) }
+        }
+        throw new Error(`unexpected spawn: ${command} ${JSON.stringify(args)}`)
+      },
+    })
+    assert.equal(result.ok, true, 'a busy (working) target must still confirm successfully via the revision counter')
+    assert.equal(readCalled, false, 'confirmation must never call agent read, so an agent_not_idle response is never even reachable')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('an unconfirmed herdr delivery (revision/state_change_seq never advance) returns ok:false, still spools, and never reads the pane', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'grok-spool-'))
+  try {
+    let readCalled = false
     const result = deliverViaHerdr('', REQUEST, {
       spoolDir: dir,
       confirmAttempts: 2,
+      pollIntervalMs: 1,
       spawn: (command, args) => {
+        if (command === 'herdr' && args[1] === 'get') {
+          return { status: 0, stdout: JSON.stringify({ result: { agent: { revision: 100, state_change_seq: 100 } } }) }
+        }
         if (command === 'herdr' && args[1] === 'prompt') return { status: 0, stdout: '' }
         if (command === 'sleep') return { status: 0, stdout: '' }
-        if (command === 'herdr' && args[1] === 'read') return { status: 0, stdout: 'pane has no marker in it' }
-        throw new Error(`unexpected spawn: ${command}`)
+        if (command === 'herdr' && args[1] === 'read') {
+          readCalled = true
+          return { status: 0, stdout: '' }
+        }
+        throw new Error(`unexpected spawn: ${command} ${JSON.stringify(args)}`)
       },
     })
     assert.equal(result.ok, false)
     assert.equal(result.reason, 'herdr_delivery_unconfirmed')
     assert.ok(result.spool_path, 'the spooled copy still exists even though delivery was never confirmed')
+    assert.equal(readCalled, false, 'confirmation must never fall back to a pane read')
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
 })
 
-test('a herdr binary that is missing fails loudly (ok:false) rather than falling back to tmux', () => {
+test('a herdr binary that is missing fails loudly at the baseline read (ok:false), never prompting blind and never falling back to tmux', () => {
   const dir = mkdtempSync(join(tmpdir(), 'grok-spool-'))
   try {
     const calls = []
@@ -608,20 +668,24 @@ test('a herdr binary that is missing fails loudly (ok:false) rather than falling
       },
     })
     assert.equal(result.ok, false)
-    assert.equal(result.reason, 'herdr_prompt_failed')
+    assert.equal(result.reason, 'herdr_state_unavailable')
     assert.match(result.detail, /ENOENT/)
-    assert.deepEqual(calls, ['herdr'], 'must fail on the herdr call itself, never attempt a tmux command')
+    assert.deepEqual(calls, ['herdr'], 'must fail on the baseline agent-get call itself, never prompt, never attempt a tmux command')
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
 })
 
-test('a herdr binary that exits non-zero fails loudly with its own stderr as detail', () => {
+test('a herdr binary that exits non-zero on the prompt call (after a good baseline read) fails loudly with its own stderr as detail', () => {
   const dir = mkdtempSync(join(tmpdir(), 'grok-spool-'))
   try {
     const result = deliverViaHerdr('', REQUEST, {
       spoolDir: dir,
-      spawn: () => ({ status: 1, signal: null, stdout: '', stderr: 'herdr: agent muvps_loom not found' }),
+      spawn: (command, args) => {
+        if (args[1] === 'get') return { status: 0, stdout: JSON.stringify({ result: { agent: { revision: 1, state_change_seq: 1 } } }) }
+        if (args[1] === 'prompt') return { status: 1, signal: null, stdout: '', stderr: 'herdr: agent muvps_loom not found' }
+        throw new Error(`unexpected spawn: ${command} ${JSON.stringify(args)}`)
+      },
     })
     assert.equal(result.ok, false)
     assert.equal(result.reason, 'herdr_prompt_failed')
@@ -630,6 +694,70 @@ test('a herdr binary that exits non-zero fails loudly with its own stderr as det
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test('an unparseable herdr agent get response fails loudly rather than guessing a counter value', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'grok-spool-'))
+  try {
+    const result = deliverViaHerdr('', REQUEST, {
+      spoolDir: dir,
+      spawn: (command, args) => {
+        if (args[1] === 'get') return { status: 0, stdout: 'not json' }
+        throw new Error(`unexpected spawn: ${command} ${JSON.stringify(args)}`)
+      },
+    })
+    assert.equal(result.ok, false)
+    assert.equal(result.reason, 'herdr_state_unparseable')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a herdr agent get response missing both counters fails loudly rather than assuming no change', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'grok-spool-'))
+  try {
+    const result = deliverViaHerdr('', REQUEST, {
+      spoolDir: dir,
+      spawn: (command, args) => {
+        if (args[1] === 'get') return { status: 0, stdout: JSON.stringify({ result: { agent: { agent_status: 'idle' } } }) }
+        throw new Error(`unexpected spawn: ${command} ${JSON.stringify(args)}`)
+      },
+    })
+    assert.equal(result.ok, false)
+    assert.equal(result.reason, 'herdr_state_missing_fields')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('herdr agent get envelope extraction tolerates top-level, .agent, and .result.agent shapes (the exact envelope is not independently pinned down)', () => {
+  const shapes = [
+    (rev) => JSON.stringify({ revision: rev, state_change_seq: rev }),
+    (rev) => JSON.stringify({ agent: { revision: rev, state_change_seq: rev } }),
+    (rev) => JSON.stringify({ result: { agent: { revision: rev, state_change_seq: rev } } }),
+  ]
+  for (const shape of shapes) {
+    const dir = mkdtempSync(join(tmpdir(), 'grok-spool-'))
+    try {
+      let getCallCount = 0
+      const result = deliverViaHerdr('', REQUEST, {
+        spoolDir: dir,
+        pollIntervalMs: 1,
+        spawn: (command, args) => {
+          if (args[1] === 'get') {
+            getCallCount += 1
+            return { status: 0, stdout: shape(getCallCount === 1 ? 1 : 2) }
+          }
+          if (args[1] === 'prompt') return { status: 0, stdout: '' }
+          throw new Error(`unexpected spawn: ${command} ${JSON.stringify(args)}`)
+        },
+      })
+      assert.equal(result.ok, true, `envelope shape must resolve a counter: ${shape(1)}`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }
+})
+
 
 test('runCycle uses herdr by default (no GROK_DELIVERY set, no mechanism override) and never touches deliverToTmux', async () => {
   let herdrCalled = false

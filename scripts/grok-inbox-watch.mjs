@@ -5,8 +5,9 @@
 // pi.sendUserMessage equivalent. The only place an outside process can speak
 // into a running grok-cli session is its terminal pane: this polls the seat's
 // welded bearer inbox, spools each message to disk, delivers a bounded
-// preview into the target tmux pane with request_id / in_reply_to preserved,
-// confirms the paste actually landed, and ONLY THEN consumes the batch from
+// preview into the target pane, confirms delivery actually landed (see the
+// DELIVERY MECHANISM note below for what "confirms" means per mechanism —
+// it is NOT the same proof on both), and ONLY THEN consumes the batch from
 // mupot. Never pairs a consuming read with a delivery it cannot prove
 // happened — see fleet-runtime/claude-code-inbox-adapter.mjs's YC27 note for
 // the failure mode this order exists to rule out.
@@ -92,7 +93,7 @@
 //   TMUX_PREVIEW_MAX_CHARS    default 1000, clamped to 320..2000 (shared by herdr delivery)
 //   TMUX_CONFIRM_ATTEMPTS     default 3, clamped to 1..5 (shared by herdr delivery)
 //   TMUX_ENTER_DELAY_MS       default payload-scaled 250..2500 (tmux only)
-//   HERDR_CONFIRM_DELAY_MS    default payload-scaled 250..2500 (herdr only)
+//   HERDR_POLL_INTERVAL_MS    default 750, clamped to 100..5000 (herdr only — gap between agent-get polls)
 
 import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -393,23 +394,53 @@ export function deliverToTmux(_text, message, opts = {}) {
 
 /**
  * herdr delivery — the DEFAULT mechanism (see the DELIVERY MECHANISM header
- * note; this estate has no tmux server). Identical contract to
- * deliverToTmux: spool BEFORE any subprocess call, submit the bounded
- * preview via `herdr agent prompt <target> <text>`, give it the same
- * payload-scaled settle window deliverToTmux gives a swallowed Enter, then
- * PROVE delivery by reading the pane back (`herdr agent read`) and looking
- * for the same per-message marker deliverToTmux confirms with
- * capture-pane — never trust the prompt call's own success/exit code as
- * proof the text actually landed in the agent's transcript. An unconfirmed
- * delivery returns `ok:false` with the same shape deliverToTmux uses, which
- * is what makes runCycle's existing "never consume what wasn't confirmed
- * delivered" logic apply unchanged.
+ * note; this estate has no tmux server). Same spool-before-anything
+ * discipline as deliverToTmux, but confirmation is NOT pane-text-based —
+ * that was tried and disproven live against production (mupot#1258 herdr
+ * follow-up canary, 2026-09-01/02):
+ *
+ *   1. `herdr agent read <target>` REFUSES a longer pane-history read while
+ *      the agent is working (`{"error":{"code":"agent_not_idle",...}}`) —
+ *      and "working" is exactly the state a delivery lands in for a busy
+ *      builder, the normal case, not an edge case. A short default-length
+ *      read did return content while busy, so the refusal isn't even
+ *      triggered consistently by busy-state alone.
+ *   2. Even when a pane read DOES succeed, the delivered marker was
+ *      confirmed live to NOT reliably appear intact — the pane wraps and
+ *      truncates, so `grep -c` for the marker returned 0 on a delivery that
+ *      had, independently, genuinely landed (confirmed by hand via
+ *      `herdr agent read --source recent-unwrapped`).
+ *
+ * The signal that DOES work, verified live the same way: `herdr agent get
+ * <target>` returns `revision` and `state_change_seq`, and BOTH advance on
+ * a successful prompt submission — including while the agent is working,
+ * where `agent get` (unlike a long `agent read`) returns cleanly rather
+ * than refusing. So confirmation here is: read the agent's state BEFORE
+ * prompting, submit, then poll `agent get` until EITHER counter has
+ * advanced past its captured baseline, within confirmAttempts. Advanced ->
+ * ok:true. Not advanced within the attempt budget -> ok:false — the exact
+ * same shape deliverToTmux uses on an unconfirmed delivery, so runCycle's
+ * existing "never consume what wasn't confirmed delivered" logic applies
+ * unchanged.
+ *
+ * HONEST LIMIT (state this plainly, do not imply more — see README): a
+ * revision/state_change_seq advance proves herdr ACCEPTED the prompt and
+ * the pane CHANGED. It does NOT prove the grok body parsed or acted on the
+ * message content — a strictly weaker claim than the tmux marker-match
+ * approach made (which itself only proved the text reached the pane, never
+ * that it was read). This is the strongest confirmation signal available
+ * on a herdr host; it is not proof of comprehension.
+ *
+ * The per-message marker is still embedded in the delivered preview (see
+ * formatBoundedTmuxPreview) — useful for a human scrolling the pane later —
+ * but confirmation never depends on finding it again.
  */
 export function deliverViaHerdr(_text, message, opts = {}) {
   const spawn = opts.spawn ?? spawnSync
   const timeoutMs = Math.min(15_000, Math.max(100, Number(opts.timeoutMs ?? TMUX_DELIVERY_TIMEOUT_MS) || TMUX_DELIVERY_TIMEOUT_MS))
   const previewMaxChars = opts.previewMaxChars ?? TMUX_PREVIEW_MAX_CHARS
   const confirmAttempts = Math.min(5, Math.max(1, Number(opts.confirmAttempts ?? TMUX_CONFIRM_ATTEMPTS) || TMUX_CONFIRM_ATTEMPTS))
+  const pollIntervalMs = Math.min(5_000, Math.max(100, Number(opts.pollIntervalMs ?? process.env.HERDR_POLL_INTERVAL_MS) || 750))
   const herdrTarget = opts.herdrTarget ?? HERDR_TARGET
   const herdrBin = opts.herdrBin ?? HERDR_BIN
   const spool = opts.spoolMessage ?? ((value) => spoolMessage(value, opts))
@@ -422,6 +453,15 @@ export function deliverViaHerdr(_text, message, opts = {}) {
   const preview = formatBoundedTmuxPreview(message, spoolPath, previewMaxChars)
   const marker = deliveryMarker(message)
   const commandOpts = { encoding: 'utf8', timeout: timeoutMs }
+  const getState = opts.herdrAgentState ?? herdrAgentState
+
+  // Baseline BEFORE prompting — if we can't read state now, we have no way
+  // to prove an advance later, so this fails loudly here rather than
+  // prompting blind and hoping.
+  const baseline = getState(spawn, herdrBin, herdrTarget, commandOpts)
+  if (!baseline.ok) {
+    return { ok: false, reason: baseline.reason, detail: baseline.detail }
+  }
 
   const prompt = spawn(herdrBin, ['agent', 'prompt', herdrTarget, preview], commandOpts)
   if (prompt.status !== 0) {
@@ -431,29 +471,73 @@ export function deliverViaHerdr(_text, message, opts = {}) {
     return subprocessFailure(prompt, 'herdr_prompt_failed', 'herdr_prompt_timeout')
   }
 
-  // Mirrors deliverToTmux's settle delay: a prompt submission can return
-  // before the agent has actually ingested the text into its own
-  // transcript, so give the same payload-scaled window before the first
-  // read-back attempt.
-  const requestedDelay = Number(opts.confirmDelayMs ?? process.env.HERDR_CONFIRM_DELAY_MS)
-  const settleMs = Number.isFinite(requestedDelay) && requestedDelay > 0
-    ? Math.min(2_500, Math.max(0, requestedDelay))
-    : Math.min(2_500, 250 + Math.floor(preview.length / 40))
-  const settle = spawn('sleep', [String(settleMs / 1_000)], commandOpts)
-  if (settle.status !== 0) {
-    return subprocessFailure(settle, 'herdr_settle_failed', 'herdr_settle_timeout')
-  }
-
   for (let attempt = 0; attempt < confirmAttempts; attempt += 1) {
-    const read = spawn(herdrBin, ['agent', 'read', herdrTarget, '--source', 'recent'], commandOpts)
-    if (read.status === 0 && typeof read.stdout === 'string' && read.stdout.includes(marker)) {
+    const current = getState(spawn, herdrBin, herdrTarget, commandOpts)
+    if (!current.ok) {
+      // `agent get` is documented (and verified live) to return cleanly
+      // regardless of busy state, unlike a long `agent read` — a failure
+      // here is a real problem, not a transient "still working" state, so
+      // this fails loudly rather than treating it as inconclusive-and-retry.
+      return { ok: false, reason: current.reason, detail: current.detail, spool_path: spoolPath, marker }
+    }
+    if (herdrStateAdvanced(baseline, current)) {
       return { ok: true, spool_path: spoolPath, marker }
     }
-    if (read.status !== 0 && (read?.error?.code === 'ETIMEDOUT' || read?.signal === 'SIGTERM')) {
-      return subprocessFailure(read, 'herdr_confirm_failed', 'herdr_confirm_timeout')
+    if (attempt < confirmAttempts - 1) {
+      const poll = spawn('sleep', [String(pollIntervalMs / 1_000)], commandOpts)
+      if (poll.status !== 0) {
+        return subprocessFailure(poll, 'herdr_poll_failed', 'herdr_poll_timeout')
+      }
     }
   }
   return { ok: false, reason: 'herdr_delivery_unconfirmed', spool_path: spoolPath, marker }
+}
+
+function coerceCounter(value) {
+  const n = Number(value)
+  return Number.isFinite(n) ? n : null
+}
+
+/**
+ * `herdr agent get <target>` — used for both the pre-prompt baseline and
+ * every post-prompt poll (see deliverViaHerdr's docstring for why this
+ * replaced a pane-text marker match). The exact JSON envelope `agent get`
+ * wraps its fields in was not independently pinned down here — only
+ * `agent prompt`'s own `{"result":{"agent":{...}}}` shape is directly
+ * confirmed live — so this checks every plausible location (top-level,
+ * `.agent`, `.result.agent`) and fails loudly rather than guessing a
+ * counter value if none of them carry a numeric `revision` or
+ * `state_change_seq`.
+ */
+function herdrAgentState(spawn, herdrBin, herdrTarget, commandOpts) {
+  const result = spawn(herdrBin, ['agent', 'get', herdrTarget], commandOpts)
+  if (result.status !== 0) {
+    return subprocessFailure(result, 'herdr_state_unavailable', 'herdr_state_timeout')
+  }
+  let parsed
+  try {
+    parsed = JSON.parse(result.stdout)
+  } catch (error) {
+    return { ok: false, reason: 'herdr_state_unparseable', detail: error instanceof Error ? error.message : String(error) }
+  }
+  const agent = parsed?.result?.agent ?? parsed?.agent ?? parsed
+  const revision = coerceCounter(agent?.revision)
+  const stateChangeSeq = coerceCounter(agent?.state_change_seq)
+  if (revision === null && stateChangeSeq === null) {
+    return { ok: false, reason: 'herdr_state_missing_fields', detail: 'herdr agent get returned neither a numeric revision nor state_change_seq' }
+  }
+  return { ok: true, revision, stateChangeSeq }
+}
+
+// EITHER counter advancing counts — Hadi's live verification showed both
+// revision and state_change_seq move together on a real prompt, but this
+// does not require both fields to be present or moving in lockstep, only
+// that at least one available counter is strictly greater than its
+// captured baseline.
+function herdrStateAdvanced(baseline, current) {
+  if (baseline.revision !== null && current.revision !== null && current.revision > baseline.revision) return true
+  if (baseline.stateChangeSeq !== null && current.stateChangeSeq !== null && current.stateChangeSeq > baseline.stateChangeSeq) return true
+  return false
 }
 
 export async function runCycle(opts = {}) {

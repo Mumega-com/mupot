@@ -27,9 +27,10 @@ Codex CLI before it — the most reliable way to hand it a message from outside 
 into the pane it is actually running in. So the receive path is a **polling daemon**, not a
 hook: it peeks the seat's mupot inbox, spools each message to disk (mode 0600) *before*
 touching the terminal, delivers a bounded preview into the target pane with `request_id` /
-`in_reply_to` preserved, confirms the delivery actually landed (by reading the pane back and
-looking for a per-message delivery marker), and **only then** consumes the batch from mupot.
-A crash, a killed process, or a dead pane between "delivered" and "confirmed" never loses the
+`in_reply_to` preserved, confirms the delivery actually landed, and **only then** consumes
+the batch from mupot. *What "confirms" means differs by mechanism* — see
+[Delivery mechanism](#delivery-mechanism-herdr-default-or-tmux-opt-in-only) below. A crash, a
+killed process, or a dead pane/target between "delivered" and "confirmed" never loses the
 message — the worst case is a spooled duplicate on disk, never a hole. See the long comment
 block at the top of the script for the exact ordering and why each step exists.
 
@@ -57,19 +58,43 @@ flag falls back to. The mechanism is always resolved explicitly
 reachable: an unrecognized `GROK_DELIVERY` value refuses to start rather than silently
 picking whichever mechanism looks available.
 
-Both mechanisms share the identical contract and discipline: spool before any subprocess
-call, deliver a bounded preview carrying a per-message marker, then **prove** delivery by
-reading the target back and confirming the marker actually landed — never trust the
-delivery command's own exit code as proof. An unconfirmed delivery, under either mechanism,
-returns `ok:false` and the caller (`runCycle`) never consumes the batch. herdr delivery uses
-`herdr agent prompt <target> <text>` to submit and `herdr agent read <target> --source
-recent` to confirm, in place of tmux's `send-keys` / `capture-pane`.
+Both mechanisms share the same discipline — spool before any subprocess call, never trust
+the delivery command's own exit code as proof, and an unconfirmed delivery returns
+`ok:false` and the caller (`runCycle`) never consumes the batch — but **the two mechanisms
+prove delivery differently, and herdr's proof is weaker. Say so plainly:**
+
+- **tmux** (`deliverToTmux`) types the preview via `send-keys`, then confirms by
+  `capture-pane`-ing the pane and finding the per-message delivery marker in the rendered
+  text. That marker match is reasonably strong evidence the text actually reached the
+  terminal buffer.
+- **herdr** (`deliverViaHerdr`) does **not** use a pane-text match at all, and this is a
+  deliberate change from an earlier version of this connector, made after a live canary
+  against production disproved the pane-text approach on herdr in two independent ways:
+  `herdr agent read` **refuses** a longer pane-history read while the target is working
+  (`{"error":{"code":"agent_not_idle",...}}`) — and "working" is the normal state for a busy
+  builder, not an edge case — and even when a short read *does* succeed, herdr's pane wraps
+  and truncates, so an intact marker match is not reliable even then (confirmed live: a
+  message that had genuinely landed still produced zero marker matches). Instead,
+  `deliverViaHerdr` reads the target's `revision`/`state_change_seq` counters via `herdr
+  agent get <target>` *before* submitting, then polls the same counters after `herdr agent
+  prompt <target> <text>` until one of them advances — `agent get` was verified live to
+  return cleanly regardless of busy state, unlike `agent read`.
+
+  **Honest limit, stated plainly rather than implied:** a `revision`/`state_change_seq`
+  advance proves herdr *accepted* the prompt and the target's pane *changed*. It does **not**
+  prove the grok body parsed or acted on the message content — a strictly weaker claim than
+  even the tmux marker match made (which itself only proved the text reached the pane, never
+  that anything read it). This is the strongest confirmation signal available on a herdr
+  host today, not proof of comprehension. The per-message marker is still embedded in the
+  delivered text on both mechanisms — useful for a human scrolling the pane later — but
+  herdr confirmation never depends on finding it again.
 
 | variable | mechanism | default | notes |
 |---|---|---|---|
 | `GROK_DELIVERY` | both | `herdr` | `herdr` or `tmux` — selected explicitly, never inferred |
 | `HERDR_TARGET` | herdr | `= GROK_SEAT` | the herdr agent name prompts are delivered into (usually the seat, not assumed to be) |
 | `HERDR_BIN` | herdr | `herdr` | resolved to an absolute path by `install.sh` (a systemd unit's PATH may not include `~/.local/bin`) |
+| `HERDR_POLL_INTERVAL_MS` | herdr | `750` (clamped 100–5000) | gap between `agent get` polls while waiting for `revision`/`state_change_seq` to advance |
 | `TMUX_SESSION` | tmux | `= GROK_SEAT` | the pane grok-cli's TUI is actually running in |
 
 ### A note on grok-cli's own hooks system
