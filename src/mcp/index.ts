@@ -96,7 +96,7 @@ import { enrollUrl } from '../dashboard/enroll'
 import { classify, humanAge } from '../dashboard/fleet'
 import { resolveAgentRef } from '../org/resolve'
 import {
-  sendToRef, readAgentInbox, sendAgentMessage,
+  sendToRef, readAgentInbox, sendAgentMessage, checkSendReachability,
 } from '../agents/messages'
 import { routeAgentWake } from '../agents/wake-routing'
 import { authorizeExecutionScope } from '../auth/execution-scope'
@@ -3189,6 +3189,76 @@ const toolSend: ToolSpec = {
   },
 }
 
+// can_reach — ask the pot whether a send would be authorized, WITHOUT sending.
+//
+// The gap this closes: reachability was only observable by attempting a write.
+// When gate verdicts stopped arriving directly and had to be hand-carried, no
+// agent could ask the pot why — the answer existed only as the error string of a
+// message you had to send to find out. Diagnosing it took eight tool calls and a
+// source read.
+//
+// Deliberately NOT a scan surface. A single NAMED target only: no list input, no
+// wildcard, no squad sweep. And the reason vocabulary is exactly what `send`
+// would have returned to the same caller, which for a non-admin is the single
+// collapsed send_target_not_visible — a read-only diagnostic must never be a
+// wider oracle than the write it describes.
+//
+// Ruled by Athena, 2026-09-01: "Require an explicitly NAMED target (no
+// list/scan input) so it cannot become a batch oracle."
+const toolCanReach: ToolSpec = {
+  name: 'can_reach',
+  scope: 'self → one named agent (read-only)',
+  min: 'authenticated',
+  args: '{ to: string (agent id or unique slug), project_id?: string }',
+  inputSchema: {
+    type: 'object',
+    properties: { to: STRING_SCHEMA, project_id: STRING_SCHEMA },
+    required: ['to'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args, ctx) {
+    const fromAgent = auth.boundAgentId
+    if (!fromAgent) {
+      return fail(403, 'not_agent_bound', {
+        detail: 'can_reach requires an agent-bound token (member_tokens.agent_id)',
+        enroll_url: enrollUrl(canonicalOrigin(env, ctx.origin), ctx.seat),
+      })
+    }
+    const to = str(args.to)
+    if (!to) return fail(400, 'invalid_args', 'to required')
+    if (args.project_id !== undefined && typeof args.project_id !== 'string')
+      return fail(400, 'invalid_args', 'project_id must be a string')
+
+    const res = await checkSendReachability(
+      env,
+      {
+        fromAgent,
+        fromMember: auth.memberId as string,
+        toRef: to,
+        projectId: typeof args.project_id === 'string' ? args.project_id : undefined,
+      },
+      { isAdmin: hasWorkspaceAdmin(auth), grants: auth.capabilities ?? [] },
+    )
+
+    // 200 either way: "no" is the answer to the question, not a failure to
+    // answer it. A 403 here would make the honest negative indistinguishable
+    // from the caller lacking permission to ask.
+    return done({
+      to: to,
+      reachable: res.reachable,
+      via: res.via,
+      reason: res.reason,
+      target: res.target,
+      project_id: typeof args.project_id === 'string' ? args.project_id : null,
+      // Name the lever when the squad arm failed and no project was offered:
+      // the project edge is how the gate reaches this seat today.
+      ...(!res.reachable && args.project_id === undefined
+        ? { hint: 'if both agents share a project, retry with project_id to test the project arm' }
+        : {}),
+    })
+  },
+}
+
 type BroadcastTarget = Pick<Agent, 'id' | 'slug' | 'name'>
 
 // broadcast — fan out a durable message to every active agent in one squad. This
@@ -4463,6 +4533,7 @@ export const TOOLS: ToolSpec[] = [
   toolExecutionMeterStatus,
   toolSquadMessage,
   toolSend,
+  toolCanReach,
   toolBroadcast,
   toolInbox,
   toolInboxLease,

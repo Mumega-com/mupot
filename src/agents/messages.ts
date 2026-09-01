@@ -1421,6 +1421,110 @@ export async function resolveVisibleSendTarget(
   return { ok: true, value: resolved.value }
 }
 
+// ── can this caller reach that agent? (read-only) ────────────────────────────
+//
+// Until now the only way to ask was to attempt a send and read the error. That
+// is how a real reachability defect stayed invisible for a week: gate verdicts
+// from Athena to this seat were being hand-carried by Loom because her token
+// could not see the builder, and nobody could ask the pot why without writing a
+// message to find out.
+//
+// THIS FUNCTION LIVES BESIDE sendToRef ON PURPOSE. It re-implements no policy:
+// it walks the same three decisions in the same order, so the two cannot drift
+// into disagreeing about who can reach whom. Two properties are load-bearing:
+//
+//  1. IT MUST NOT BE A WIDER ORACLE THAN send. For a non-admin, sendToRef
+//     collapses every failure — ref absent, ambiguous, resolved-but-invisible,
+//     and (per the #401 existence-oracle closure at the tail of sendToRef) every
+//     project failure once squad visibility has failed — into the single string
+//     send_target_not_visible. This mirrors that collapse exactly. Returning the
+//     richer vocabulary to a non-admin would hand them a distinction send
+//     deliberately refuses them, which would make a read-only diagnostic MORE
+//     revealing than the write it describes.
+//
+//  2. IT MUST HONOUR THE PROJECT ARM, or it lies by omission. The exported
+//     resolveVisibleSendTarget implements only case (a), squad visibility.
+//     sendToRef also honours case (b): when (a) fails but a projectId is
+//     present, validateMessageProjectAccess is the authority (memberships JOIN
+//     project_squad_access on BOTH sides). Answering on (a) alone would have
+//     reported "cannot reach" for exactly the project-scoped path that is
+//     currently working between the gate and this seat — certifying the human
+//     relay as permanent.
+export type ReachVia = 'admin' | 'squad' | 'project'
+
+/** Only the reasons a non-admin can actually observe are reachable in practice;
+ *  the richer two are admin-only, exactly as in sendToRef. */
+export type ReachReason =
+  | 'recipient_not_found'
+  | 'recipient_ambiguous'
+  | 'send_target_not_visible'
+
+export interface ReachabilityResult {
+  reachable: boolean
+  /** Which arm authorized it. Null when unreachable. */
+  via: ReachVia | null
+  /** Null when reachable. For a non-admin this is always 'send_target_not_visible'. */
+  reason: ReachReason | null
+  /** Only ever populated when reachable — never leaks a resolved target the
+   *  caller may not reach. */
+  target: { id: string; slug: string; name: string; squad_id: string } | null
+}
+
+function unreachable(reason: ReachReason): ReachabilityResult {
+  return { reachable: false, via: null, reason, target: null }
+}
+
+export async function checkSendReachability(
+  env: Env,
+  input: { fromAgent: string; fromMember: string; toRef: string; projectId?: string },
+  authz: SendTargetAuthz,
+): Promise<ReachabilityResult> {
+  const resolved = await resolveAgentRef(env, input.toRef)
+  if (!resolved.ok) {
+    if (!authz.isAdmin) return unreachable('send_target_not_visible')
+    return unreachable(
+      resolved.reason === 'ambiguous' ? 'recipient_ambiguous' : 'recipient_not_found',
+    )
+  }
+  const target = {
+    id: resolved.value.id,
+    slug: resolved.value.slug,
+    name: resolved.value.name,
+    squad_id: resolved.value.squad_id,
+  }
+  if (authz.isAdmin) return { reachable: true, via: 'admin', reason: null, target }
+
+  // Same fence sendToRef applies: grants must all belong to the sending member.
+  if (authz.grants.some((grant) => grant.member_id !== input.fromMember)) {
+    return unreachable('send_target_not_visible')
+  }
+
+  const visibility = await recipientVisibilityOnSenderSquads(
+    env,
+    input.fromMember,
+    authz.grants,
+    resolved.value,
+  )
+  if (visibility.visible) return { reachable: true, via: 'squad', reason: null, target }
+
+  // Case (a) failed. Only a project can save it, and only the same way send lets
+  // it: BOTH sides on a squad with project_squad_access to a live project.
+  if (input.projectId === undefined) return unreachable('send_target_not_visible')
+
+  const projectFailure = await validateMessageProjectAccess(
+    env,
+    input.projectId,
+    input.fromAgent,
+    resolved.value.id,
+  )
+  // #401 collapse: squad visibility already failed, so ANY specific project
+  // reason here would distinguish a real-but-unreachable agent from a
+  // nonexistent one. send refuses to make that distinction; so does this.
+  if (projectFailure !== null) return unreachable('send_target_not_visible')
+
+  return { reachable: true, via: 'project', reason: null, target }
+}
+
 export async function sendToRef(
   env: Env,
   input: {
