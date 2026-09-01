@@ -190,6 +190,14 @@ describe('deactivate_agent — happy path', () => {
       detached: 1,
       tokens_revoked: 1,
       keys_removed: 1,
+      // Delivery Sequence step 2 (mumega-com#1173, fact 3): deactivate_agent
+      // now also retires any live agent_sessions row for this agent — see
+      // revokeAllAgentSessionsForAgent in src/auth/agent-sessions.ts. This
+      // mock's generic DB.prepare(...).run() handler reports changes:1 for
+      // any unrecognized UPDATE, which is what that call goes through
+      // (outside the batch() above, on purpose — see the call site's own
+      // comment on why it must not join that batch).
+      agent_sessions_revoked: 1,
     })
 
     // SOFT delete — an UPDATE, never a DELETE FROM agents.

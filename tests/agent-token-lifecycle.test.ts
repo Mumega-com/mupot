@@ -71,7 +71,13 @@ function makeEnv(opts: Opts = {}): Env {
           // projection; every other member_tokens read is the authn lookup. Getting this
           // backwards makes the mock swallow authentication and every test 401s before
           // reaching the logic under test — which is exactly what happened first try.
-          if (sql.includes('FROM member_tokens') && sql.includes('agent_id, label, revoked_at')) {
+          // Delivery Sequence step 2 (mumega-com#1173) added `channel` to this
+          // projection (revokeTokenOwnershipQuery in src/mcp/token-queries.ts) so
+          // revoke_agent_token can also retire the matching agent_sessions row —
+          // match on the query's distinguishing shape rather than an exact column
+          // list, so a future column addition doesn't silently re-break this mock
+          // the way it did here.
+          if (sql.includes('FROM member_tokens') && sql.includes('agent_id, label') && sql.includes('revoked_at')) {
             return opts.tokenRow === undefined ? TOKEN_MINE : opts.tokenRow
           }
           if (sql.includes('SELECT id FROM member_tokens') || sql.includes('SELECT t.id FROM member_tokens')) {

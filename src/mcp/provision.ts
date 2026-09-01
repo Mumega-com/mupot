@@ -81,6 +81,14 @@ import { createBus } from '../bus'
 import { resolveDepartmentRef, resolveSquadRef, resolveAgentRef } from '../org/resolve'
 import { listAgentTokensQuery, revokeTokenOwnershipQuery } from './token-queries'
 import { isValidEd25519PublicX, registerAgentPublicKey } from '../fleet/agent-keys'
+import {
+  deriveAgentAuthKind,
+  evaluateAgentSession,
+  listAgentSessions,
+  revokeAgentSessionByCredentialSafe,
+  revokeAgentSessionById,
+  revokeAllAgentSessionsForAgent,
+} from '../auth/agent-sessions'
 import { assertWritten, rowsWritten } from '../lib/receipt'
 import {
   type ToolSpec,
@@ -128,7 +136,8 @@ async function emitProvisioned(
     | 'agent_updated'
     | 'squad_updated'
     | 'membership'
-    | 'membership_removed',
+    | 'membership_removed'
+    | 'agent_session_revoked',
   id: string,
   extra: {
     squad_id?: string
@@ -878,7 +887,7 @@ const toolRevokeAgentToken: ToolSpec = {
       revokeTokenOwnershipQuery(),
     )
       .bind(tokenId, env.TENANT_SLUG)
-      .first<{ id: string; member_id: string; agent_id: string | null; label: string; revoked_at: string | null }>()
+      .first<{ id: string; member_id: string; agent_id: string | null; label: string; channel: ConnectionChannel; revoked_at: string | null }>()
 
     if (!row || row.agent_id !== agent.id) {
       // Same 404 whether the token is absent or belongs elsewhere — do not turn this
@@ -888,6 +897,17 @@ const toolRevokeAgentToken: ToolSpec = {
 
     // Idempotent: revoking an already-revoked token succeeds and reports revoked:false.
     const revoked = await revokeMemberToken(env, row.member_id, tokenId)
+
+    // Delivery Sequence step 2 (mumega-com#1173) — fact 3: a credential revoke
+    // must also retire the agent_sessions row keyed to THIS SAME credential,
+    // or a live-looking session survives the death of the token that backed
+    // it. Best-effort/self-guarding (revokeAgentSessionByCredentialSafe): this
+    // tool must keep working unmodified against a tenant where migration 0141
+    // has not been applied yet.
+    const sessionAuthKind = deriveAgentAuthKind(row.channel)
+    if (sessionAuthKind) {
+      await revokeAgentSessionByCredentialSafe(env, env.TENANT_SLUG, sessionAuthKind, tokenId, 'token_revoked')
+    }
 
     await emitProvisioned(env, auth.memberId as string, 'token_revoked', tokenId, {
       squad_id: agent.squad_id,
@@ -902,6 +922,109 @@ const toolRevokeAgentToken: ToolSpec = {
       note: revoked
         ? 'Token revoked. It fails authentication immediately — grants are re-resolved per request.'
         : 'Token was already revoked; no change.',
+    })
+  },
+}
+
+// mupot task f5fe1222 / mumega-com#1173, Delivery Sequence step 2 — the
+// human-facing half of "listable, independently expirable, revocable by the
+// human and by the agent itself" for agent_sessions. Gated IDENTICALLY to
+// list_agent_tokens/revoke_agent_token above (admin on the agent's squad,
+// operator-principal only) — an agent session is a runtime-identity record
+// about a credential, same trust tier as the credential-listing tools it
+// sits beside. See end_agent_session (src/mcp/index.ts) for the AGENT's own
+// self-service half — that tool is gated the OPPOSITE way (bound-agent only,
+// and can only ever target its own exact current session, never one it
+// names), so the two surfaces never overlap in what they can reach.
+
+const toolListAgentSessions: ToolSpec = {
+  name: 'list_agent_sessions',
+  scope: "agent's squad",
+  min: 'admin',
+  args: '{ agent: string (id|slug) }',
+  inputSchema: {
+    type: 'object',
+    properties: { agent: STRING_SCHEMA },
+    required: ['agent'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args, _ctx) {
+    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
+    const agentRef = str(args.agent)
+    if (!agentRef) return fail(400, 'invalid_args', 'agent required')
+
+    const agentResult = await resolveAgentRef(env, agentRef)
+    if (!agentResult.ok) return resolveFail(agentResult.reason, 'agent_not_found')
+    const agent = agentResult.value
+
+    const grants = auth.capabilities ?? []
+    if (!(await memberCanOnSquad(env, grants, agent.squad_id, 'admin'))) {
+      return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
+    }
+
+    const rows = await listAgentSessions(env, env.TENANT_SLUG, agent.id)
+    const sessions = rows.map((row) => ({
+      id: row.id,
+      auth_kind: row.auth_kind,
+      seat: row.seat,
+      created_at: row.created_at,
+      last_seen_at: row.last_seen_at,
+      idle_expires_at: row.idle_expires_at,
+      absolute_expires_at: row.absolute_expires_at,
+      revoked_at: row.revoked_at,
+      revoke_reason: row.revoke_reason,
+      live: evaluateAgentSession(row).ok,
+    }))
+    return done({
+      agent: { id: agent.id, slug: agent.slug, name: agent.name },
+      sessions,
+      live_count: sessions.filter((s) => s.live).length,
+    })
+  },
+}
+
+const toolRevokeAgentSession: ToolSpec = {
+  name: 'revoke_agent_session',
+  scope: "agent's squad",
+  min: 'admin',
+  args: '{ agent: string (id|slug), session_id: string }',
+  inputSchema: {
+    type: 'object',
+    properties: { agent: STRING_SCHEMA, session_id: STRING_SCHEMA },
+    required: ['agent', 'session_id'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args, _ctx) {
+    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
+    const agentRef = str(args.agent)
+    const sessionId = str(args.session_id)
+    if (!agentRef) return fail(400, 'invalid_args', 'agent required')
+    if (!sessionId) return fail(400, 'invalid_args', 'session_id required')
+
+    const agentResult = await resolveAgentRef(env, agentRef)
+    if (!agentResult.ok) return resolveFail(agentResult.reason, 'agent_not_found')
+    const agent = agentResult.value
+
+    const grants = auth.capabilities ?? []
+    if (!(await memberCanOnSquad(env, grants, agent.squad_id, 'admin'))) {
+      return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
+    }
+
+    // Ownership-scoped inside revokeAgentSessionById itself (tenant + agent_id
+    // + id) — a caller can never revoke a session that resolves to a
+    // different agent's row, regardless of what id it names. Idempotent:
+    // revoking an already-dead session succeeds and reports revoked:false.
+    const { revoked } = await revokeAgentSessionById(env, env.TENANT_SLUG, agent.id, sessionId, 'human_revoke')
+
+    await emitProvisioned(env, auth.memberId as string, 'agent_session_revoked', sessionId, {
+      squad_id: agent.squad_id,
+      agent_id: agent.id,
+    })
+
+    return done({
+      session: { id: sessionId, agent_id: agent.id },
+      revoked,
+      already_revoked: !revoked,
     })
   },
 }
@@ -1594,6 +1717,23 @@ const toolDeactivateAgent: ToolSpec = {
     const detached = rowsWritten(results[2]) + (safeSlug ? rowsWritten(results[4]) : 0)
     const keysRemoved = rowsWritten(results[3]) + (safeSlug ? rowsWritten(results[5]) : 0)
 
+    // Delivery Sequence step 2 (mumega-com#1173) — fact 3: deactivate_agent
+    // revoked agents.status, member_tokens, fleet_agents, and agent_keys, but
+    // NOTHING revoked a live agent_sessions row, which would keep reading as
+    // an active runtime identity even after the credential backing it is
+    // dead. Deliberately OUTSIDE the batch above (not statement [6]): the
+    // four existing writes must keep succeeding byte-for-byte unmodified in a
+    // tenant where migration 0141 has not been applied yet — a table-missing
+    // error inside env.DB.batch would fail the WHOLE batch atomically and
+    // break a currently-shipped tool. revokeAllAgentSessionsForAgent
+    // self-guards that exact case (see src/auth/agent-sessions.ts).
+    const { revokedCount: agentSessionsRevoked } = await revokeAllAgentSessionsForAgent(
+      env,
+      env.TENANT_SLUG,
+      agent.id,
+      'agent_deactivated',
+    )
+
     await emitProvisioned(env, auth.memberId as string, 'agent_deactivated', agent.id, {
       squad_id: agent.squad_id,
       agent_id: agent.id,
@@ -1606,6 +1746,7 @@ const toolDeactivateAgent: ToolSpec = {
       detached,
       tokens_revoked: tokensRevoked,
       keys_removed: keysRemoved,
+      agent_sessions_revoked: agentSessionsRevoked,
       // Ambiguous slug (shared with an agent in another squad) → the
       // slug-keyed fleet_agents/agent_keys sweep above was skipped on
       // purpose (never sweep another agent's row). That means a signed
@@ -1788,6 +1929,8 @@ export const PROVISION_TOOLS: ToolSpec[] = [
   toolMintAgentToken,
   toolListAgentTokens,
   toolRevokeAgentToken,
+  toolListAgentSessions,
+  toolRevokeAgentSession,
   toolProvisionAgentConnection,
   toolGrantAgentCapability,
   toolSquadMemberAdd,

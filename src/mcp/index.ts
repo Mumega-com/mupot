@@ -40,6 +40,11 @@ import { callerHoldsGateCapability, verdictPrincipal } from '../tasks/index'
 import { resolveSoleGateOwnerAgent } from '../gates/grants'
 import { isChannel } from '../members/service'
 import { resolveConsentedAgentCapabilities } from './oauth-authorize'
+import {
+  getOrCreateAgentSession,
+  resolveAgentSessionContext,
+  revokeAgentSessionByCredential,
+} from '../auth/agent-sessions'
 import { createBus } from '../bus'
 import { createMemory } from '../memory'
 import {
@@ -3739,6 +3744,33 @@ const toolCheckIn: ToolSpec = {
       ? `checkin:${env.TENANT_SLUG}:${id.memberId}:${seatLabel}`
       : `checkin:${env.TENANT_SLUG}:${id.memberId}`
 
+    // Delivery Sequence step 2 (mupot task f5fe1222, mumega-com#1173):
+    // check_in is the agent-authentication touchpoint — the closest thing an
+    // already-authenticated agent credential has to a human "login" event.
+    // Ensure the exact runtime session (this credential, this tenant) has a
+    // first-class, listable, independently-expirable, revocable row, same as
+    // a human dashboard login gets one via registerWebSession. Runs for every
+    // bound-agent principal, unconditional on the KV presence debounce below
+    // (getOrCreateAgentSession self-coalesces its own writes to 5 minutes —
+    // see src/auth/agent-sessions.ts touchAgentSession). A pure human/
+    // operator principal (auth.boundAgentId unset) or a not-yet-applied
+    // migration 0141 both resolve to `null` here — never a thrown error, so
+    // check_in keeps working unmodified in either case (see
+    // resolveAgentSessionContext's 'not_agent_session' and
+    // getOrCreateAgentSession's missing-table guard).
+    let agentSessionResult: Awaited<ReturnType<typeof getOrCreateAgentSession>> = null
+    const sessionContext = resolveAgentSessionContext(auth, seatLabel)
+    if (sessionContext.ok) {
+      agentSessionResult = await getOrCreateAgentSession(env, {
+        tenant: env.TENANT_SLUG,
+        agentId: sessionContext.context.agentId,
+        memberId: sessionContext.context.memberId,
+        authKind: sessionContext.context.authKind,
+        credentialId: sessionContext.context.credentialId,
+        seat: sessionContext.context.seat,
+      })
+    }
+
     const echo = {
       ok: true as const,
       seat: seatLabel || id.displayName,
@@ -3750,6 +3782,17 @@ const toolCheckIn: ToolSpec = {
       provider: axis.provider,
       effort: axis.effort,
       flight_id: axis.flight_id,
+      ...(agentSessionResult
+        ? {
+            agent_session: {
+              id: agentSessionResult.session.id,
+              created: agentSessionResult.created,
+              last_seen_at: agentSessionResult.session.last_seen_at,
+              idle_expires_at: agentSessionResult.session.idle_expires_at,
+              absolute_expires_at: agentSessionResult.session.absolute_expires_at,
+            },
+          }
+        : {}),
     }
 
     try {
@@ -3773,6 +3816,50 @@ const toolCheckIn: ToolSpec = {
       flight_id: args.flight_id,
     })
     return done({ ...echo, debounced: false })
+  },
+}
+
+// end_agent_session — Delivery Sequence step 2 (mupot task f5fe1222,
+// mumega-com#1173): the AGENT's own self-service half of "revocable by the
+// human and by the agent itself". Deliberately takes NO id argument — the
+// target is always the caller's own EXACT current session, derived entirely
+// from its own authenticated credential via resolveAgentSessionContext
+// (Security Invariant 1: session identity is derived from authentication,
+// never request text). An agent can therefore never end another agent's
+// session, another session of its OWN agent identity, or guess an id to
+// reach one — there is no id parameter for it to name one with. This is the
+// mirror image of list_agent_sessions/revoke_agent_session in
+// src/mcp/provision.ts, which are gated the OPPOSITE way (operator-principal
+// only, never a bound-agent caller) and DO take an explicit session_id,
+// because a human admin legitimately manages sessions other than "the one
+// making this exact call".
+const toolEndAgentSession: ToolSpec = {
+  name: 'end_agent_session',
+  scope: 'self (exact current agent session)',
+  min: 'authenticated',
+  args: '{}',
+  inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  shouldTouchPresence: () => false,
+  async run(auth, env, _args) {
+    const sessionContext = resolveAgentSessionContext(auth)
+    if (!sessionContext.ok) return fail(403, sessionContext.reason)
+
+    const { revoked, sessionId } = await revokeAgentSessionByCredential(
+      env,
+      env.TENANT_SLUG,
+      sessionContext.context.authKind,
+      sessionContext.context.credentialId,
+      'agent_self_revoke',
+    )
+    return done({
+      revoked,
+      session_id: sessionId,
+      note: revoked
+        ? 'This exact runtime session ended. Ordinary standing access is unaffected; any elevation granted to this session (Delivery Sequence step 3) ends with it.'
+        : sessionId
+          ? 'Session was already ended; no change.'
+          : 'No tracked session found for this credential (not yet migrated, or none was ever created).',
+    })
   },
 }
 
@@ -4399,6 +4486,7 @@ export const TOOLS: ToolSpec[] = [
   toolInboxFenceSet,
   toolPeers,
   toolCheckIn,
+  toolEndAgentSession,
   toolStatus,
   toolFleetAgentGet,
   toolBootContext,

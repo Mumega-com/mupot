@@ -29,8 +29,12 @@ export function listAgentTokensQuery(includeRevoked: boolean): string {
       ORDER BY created_at ASC`
 }
 
-/** The ownership lookup `revoke_agent_token` executes. Bind: ?1 = token id, ?2 = tenant. */
+/** The ownership lookup `revoke_agent_token` executes. Bind: ?1 = token id, ?2 = tenant.
+ *  `channel` was added for Delivery Sequence step 2 (mumega-com#1173): revoking a
+ *  token must also retire the agent_sessions row keyed to that SAME credential
+ *  (src/auth/agent-sessions.ts deriveAgentAuthKind needs the channel to know
+ *  which auth_kind bucket to look in). */
 export function revokeTokenOwnershipQuery(): string {
-  return `SELECT id, member_id, agent_id, label, revoked_at
+  return `SELECT id, member_id, agent_id, label, channel, revoked_at
        FROM member_tokens WHERE id = ?1 AND tenant = ?2 LIMIT 1`
 }
