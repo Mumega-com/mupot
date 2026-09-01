@@ -62,6 +62,23 @@ describe('resolveSupervisor', () => {
     ]
     expect(resolveSupervisor(m, 'self')).toBeNull()
   })
+  it('an admin other-agent is eligible (CAP_RANK used to omit admin, scoring 0)', () => {
+    const m: SquadMember[] = [
+      { agent_id: 'self', name: 'Me', role: 'member', capability: 'member' },
+      { agent_id: 'adm1', name: 'Admin', role: 'admin', capability: 'admin' },
+    ]
+    expect(resolveSupervisor(m, 'self')?.agent_id).toBe('adm1')
+  })
+  it('owner still outranks admin, admin outranks lead', () => {
+    const m: SquadMember[] = [
+      { agent_id: 'self', name: 'Me', role: 'writer', capability: 'member' },
+      { agent_id: 'lead1', name: 'Lead', role: 'lead', capability: 'lead' },
+      { agent_id: 'adm1', name: 'Admin', role: 'admin', capability: 'admin' },
+      { agent_id: 'own1', name: 'Owner', role: 'owner', capability: 'owner' },
+    ]
+    expect(resolveSupervisor(m, 'self')?.agent_id).toBe('own1')
+    expect(resolveSupervisor(m.filter((x) => x.capability !== 'owner'), 'self')?.agent_id).toBe('adm1')
+  })
 })
 
 describe('autonomyDirective', () => {

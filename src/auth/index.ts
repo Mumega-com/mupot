@@ -19,6 +19,7 @@ import type { Context, MiddlewareHandler } from 'hono'
 import type { Env, AuthContext } from '../types'
 import { verifyHandoffClaim } from './handoff-verify'
 import { resolveCapabilities } from './capability'
+import { resolveVerifiedHumanMemberId } from '../members/human-identity'
 
 // ── tunables ──
 const COOKIE_NAME = 'mupot_session'
@@ -704,14 +705,10 @@ async function loadAuthFromCookie(c: Context<AppEnv>): Promise<AuthContext | nul
     // (inserted as-provided, BINARY-collated UNIQUE) can differ in case — an operator
     // invited as `Gavin@x` whom Google returns as `gavin@x` would otherwise silently
     // resolve to no member. Still fail-closed (only ever under-grants).
-    const member = await c.env.DB.prepare(
-      "SELECT id FROM members WHERE lower(email) = lower(?1) AND tenant = ?2 AND status = 'active' LIMIT 1",
-    )
-      .bind(auth.email, c.env.TENANT_SLUG)
-      .first<{ id: string }>()
-    if (member) {
-      auth.memberId = member.id
-      auth.capabilities = await resolveCapabilities(c.env, member.id)
+    const memberId = await resolveVerifiedHumanMemberId(c.env, auth.email)
+    if (memberId) {
+      auth.memberId = memberId
+      auth.capabilities = await resolveCapabilities(c.env, memberId)
       auth.channel = 'dashboard'
     }
   }

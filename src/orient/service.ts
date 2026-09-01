@@ -85,7 +85,7 @@ export interface SquadMember {
   capability: string // owner | lead | member | observer
 }
 
-const CAP_RANK: Record<string, number> = { owner: 4, lead: 3, member: 2, observer: 1 }
+const CAP_RANK: Record<string, number> = { owner: 5, admin: 4, lead: 3, member: 2, observer: 1 }
 
 /**
  * The supervisor = the highest-capability OTHER agent in the squad (owner > lead).
@@ -97,7 +97,7 @@ export function resolveSupervisor(members: SquadMember[], selfAgentId: string): 
   for (const m of members) {
     if (m.agent_id === selfAgentId) continue
     const rank = CAP_RANK[m.capability] ?? 0
-    if (rank >= 3 && (!best || rank > (CAP_RANK[best.capability] ?? 0))) best = m // lead/owner only
+    if (rank >= 3 && (!best || rank > (CAP_RANK[best.capability] ?? 0))) best = m // lead/admin/owner
   }
   return best
 }
