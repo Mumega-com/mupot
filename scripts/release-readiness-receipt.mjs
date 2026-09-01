@@ -27,6 +27,14 @@ const DEFAULT_VERSION = `v${JSON.parse(readFileSync(new URL('../package.json', i
 const DEFAULT_REPO = 'Mumega-com/mupot'
 const LEGACY_VERSION = 'v0.23.0'
 const RELEASE_PHASES = new Set(['prepublication', 'final'])
+const RELEASE_SHA_PATH_BY_RECEIPT = new Map([
+  ['fresh-install-check.json', 'target.release_sha'],
+  ['host-go/manifest.json', 'inputs.release_sha'],
+  ['work-lifecycle-check.json', 'target.release_sha'],
+  ['external-pr-cycle-check.json', 'target.release_sha'],
+  ['staging-recovery-check.json', 'target.git_sha'],
+])
+const RELEASE_SHA_PATHS = new Set(RELEASE_SHA_PATH_BY_RECEIPT.values())
 
 export const REQUIRED_RECEIPTS = [
   { objective: 1, issue: 282, file: 'fresh-install-check.json', receipt_type: 'mupot-fresh-install/v1' },
@@ -248,7 +256,7 @@ function validateContract(raw, expectedVersion, source = 'inline') {
     }
     rejectUnknownContractFields(
       receipt,
-      new Set(['objective', 'file', 'receipt_type', 'phases', 'issue']),
+      new Set(['objective', 'file', 'receipt_type', 'release_sha_path', 'phases', 'issue']),
       source,
       `receipts[${index}]`,
     )
@@ -258,6 +266,15 @@ function validateContract(raw, expectedVersion, source = 'inline') {
     }
     if (seenFiles.has(file)) throw new Error(`invalid release contract ${source}: duplicate receipt file ${file}`)
     seenFiles.add(file)
+    const releaseShaPathDeclared = Object.hasOwn(receipt, 'release_sha_path')
+    const releaseShaPath = receipt.release_sha_path
+    if (releaseShaPathDeclared
+      && (typeof releaseShaPath !== 'string' || !RELEASE_SHA_PATHS.has(releaseShaPath))) {
+      throw new Error(`invalid release contract ${source}: receipts[${index}].release_sha_path invalid`)
+    }
+    if (releaseShaPathDeclared && RELEASE_SHA_PATH_BY_RECEIPT.get(file) !== releaseShaPath) {
+      throw new Error(`invalid release contract ${source}: receipts[${index}].release_sha_path incompatible with ${file}`)
+    }
     const objective = receipt.objective
     if (!((Number.isInteger(objective) && objective > 0)
       || (typeof objective === 'string' && objective.trim().length > 0))) {
@@ -279,6 +296,7 @@ function validateContract(raw, expectedVersion, source = 'inline') {
       file,
       receipt_type: receiptType,
       phases: [...new Set(receipt.phases)],
+      ...(releaseShaPathDeclared ? { release_sha_path: releaseShaPath } : {}),
       ...(Number.isInteger(receipt.issue) && receipt.issue > 0 ? { issue: receipt.issue } : {}),
     }
   })
@@ -601,6 +619,23 @@ function canonicalReleaseSha(value) {
   return typeof value === 'string' && /^[0-9a-f]{40}$/.test(value) ? value : null
 }
 
+function declaredReceiptReleaseSha(receipt, file, releaseShaPath) {
+  switch (`${file}:${releaseShaPath}`) {
+    case 'fresh-install-check.json:target.release_sha':
+      return receipt?.target?.release_sha
+    case 'host-go/manifest.json:inputs.release_sha':
+      return receipt?.inputs?.release_sha
+    case 'work-lifecycle-check.json:target.release_sha':
+      return receipt?.target?.release_sha
+    case 'external-pr-cycle-check.json:target.release_sha':
+      return receipt?.target?.release_sha
+    case 'staging-recovery-check.json:target.git_sha':
+      return receipt?.target?.git_sha
+    default:
+      return undefined
+  }
+}
+
 function checkSucceeded(entry) {
   const conclusion = String(entry?.conclusion ?? '').toUpperCase()
   const state = String(entry?.state ?? entry?.status ?? '').toUpperCase()
@@ -683,6 +718,16 @@ export function checkBundle(opts = {}) {
       objective: required.objective,
       issue: required.issue,
     })
+    if (required.release_sha_path) {
+      const releaseShaValue = declaredReceiptReleaseSha(receipt, required.file, required.release_sha_path)
+      const receiptReleaseSha = canonicalReleaseSha(releaseShaValue)
+      pushCheck(checks, Boolean(releaseSha && receiptReleaseSha === releaseSha), 'receipt_release_sha_matches_release_sha', {
+        file: required.file,
+        release_sha_path: required.release_sha_path,
+        expected: releaseSha,
+        actual: releaseShaValue ?? null,
+      })
+    }
   }
 
   if (requiredReceipts.some((receipt) => receipt.file === 'release-candidate-check.json')) {
