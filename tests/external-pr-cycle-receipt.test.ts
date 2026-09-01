@@ -11,6 +11,8 @@ import {
   parseArgs,
 } from '../scripts/external-pr-cycle-receipt.mjs'
 
+const RELEASE_SHA = '8a2bd44c5f0efcc23791e3b08d9f5472d1a6c4be'
+
 const TARGET = {
   pot: 'mumega',
   base_url: 'https://mupot.mumega.test',
@@ -57,7 +59,7 @@ function baseReceipt(step: string, evidence: Record<string, unknown> = evidenceF
     step,
     status: 'pass',
     observed_at: '2026-07-09T21:00:00.000Z',
-    target: TARGET,
+    target: { ...TARGET },
     evidence,
     links: {
       issue_url: TARGET.issue_url,
@@ -261,5 +263,82 @@ describe('external PR-cycle receipt checker', () => {
       previous_step: 'pull_request',
       step: 'task_linkback',
     }))
+  })
+
+  it('binds every external PR-cycle receipt to the requested release SHA', () => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt) => {
+      receipt.target = { ...(receipt.target as Record<string, unknown>), release_sha: RELEASE_SHA }
+    })
+
+    const parsed = parseArgs(['--check', '--out-dir', dir, '--release-sha', RELEASE_SHA])
+    const plan = formatPlan({ outDir: dir, releaseSha: RELEASE_SHA })
+    const receipt = checkBundle(parsed)
+
+    expect(parsed.releaseSha).toBe(RELEASE_SHA)
+    expect(plan).toContain('"release_sha": "8a2bd44c5f0efcc23791e3b08d9f5472d1a6c4be"')
+    expect(plan).toContain('--release-sha 8a2bd44c5f0efcc23791e3b08d9f5472d1a6c4be')
+    expect(receipt.status).toBe('pass')
+    expect(receipt.target.release_sha).toBe(RELEASE_SHA)
+  })
+
+  it('rejects an external PR-cycle bundle when a bound step omits the release SHA', () => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt, step) => {
+      receipt.target = { ...(receipt.target as Record<string, unknown>), release_sha: RELEASE_SHA }
+      if (step === 'agent_execution') delete (receipt.target as Record<string, unknown>).release_sha
+    })
+
+    expect(checkBundle({ outDir: dir, releaseSha: RELEASE_SHA }).status).toBe('fail')
+  })
+
+  it('rejects an external PR-cycle bundle with different valid release SHAs', () => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt, step) => {
+      receipt.target = {
+        ...(receipt.target as Record<string, unknown>),
+        release_sha: step === 'pull_request' ? '7b2bd44c5f0efcc23791e3b08d9f5472d1a6c4be' : RELEASE_SHA,
+      }
+    })
+
+    expect(checkBundle({ outDir: dir }).status).toBe('fail')
+  })
+
+  it.each([
+    ['malformed', 'not-a-sha'],
+    ['uppercase', RELEASE_SHA.toUpperCase()],
+    ['array', [RELEASE_SHA]],
+    ['object', { sha: RELEASE_SHA }],
+  ])('rejects %s external PR-cycle release SHA values without coercion', (_kind, releaseSha) => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt) => {
+      receipt.target = { ...(receipt.target as Record<string, unknown>), release_sha: releaseSha }
+    })
+
+    expect(checkBundle({ outDir: dir }).status).toBe('fail')
+  })
+
+  it('rejects malformed or uppercase external PR-cycle CLI release SHAs', () => {
+    expect(() => parseArgs(['--check', '--release-sha', 'not-a-sha'])).toThrow('invalid release SHA')
+    expect(() => parseArgs(['--check', '--release-sha', RELEASE_SHA.toUpperCase()])).toThrow('invalid release SHA')
+  })
+
+  it('rejects an external PR-cycle bundle whose SHA differs from the requested release', () => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt) => {
+      receipt.target = { ...(receipt.target as Record<string, unknown>), release_sha: RELEASE_SHA }
+    })
+
+    expect(checkBundle({ outDir: dir, releaseSha: '7b2bd44c5f0efcc23791e3b08d9f5472d1a6c4be' }).status).toBe('fail')
+  })
+
+  it('keeps a historical external PR-cycle bundle without release SHAs valid', () => {
+    const dir = tempDir()
+    writeBundle(dir)
+
+    const receipt = checkBundle({ outDir: dir })
+
+    expect(receipt.status).toBe('pass')
+    expect(receipt.target.release_sha).toBeNull()
   })
 })

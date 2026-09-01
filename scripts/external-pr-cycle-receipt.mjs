@@ -79,6 +79,7 @@ export function parseArgs(argv) {
     issueUrl: '',
     prUrl: '',
     baseUrl: '',
+    releaseSha: '',
     plan: false,
     check: false,
     summary: false,
@@ -101,6 +102,11 @@ export function parseArgs(argv) {
     else if (arg === '--issue-url') opts.issueUrl = stripTrailingSlash(next())
     else if (arg === '--pr-url') opts.prUrl = stripTrailingSlash(next())
     else if (arg === '--base-url') opts.baseUrl = stripTrailingSlash(next())
+    else if (arg === '--release-sha') {
+      const releaseSha = next()
+      if (!isCanonicalReleaseSha(releaseSha)) throw new Error('invalid release SHA: expected 40 lowercase hexadecimal characters')
+      opts.releaseSha = releaseSha
+    }
     else if (arg === '--plan') opts.plan = true
     else if (arg === '--check') opts.check = true
     else if (arg === '--summary') opts.summary = true
@@ -127,6 +133,7 @@ export function usage() {
     '  --issue-url <url>      expected GitHub board issue URL',
     '  --pr-url <url>         expected GitHub PR URL',
     '  --base-url <url>       expected Mupot base URL',
+    '  --release-sha <sha>    expected 40-character lowercase release SHA',
     '  -h, --help             show this help',
   ].join('\n')
 }
@@ -160,6 +167,7 @@ export function formatPlan(opts = {}) {
   const issueUrl = opts.issueUrl || 'https://github.com/<owner>/<repo>/issues/<number>'
   const prUrl = opts.prUrl || 'https://github.com/<owner>/<repo>/pull/<number>'
   const baseUrl = opts.baseUrl || 'https://<pot-host>'
+  const releaseSha = opts.releaseSha || ''
   const lines = []
 
   lines.push('Mupot external PR-cycle evidence plan')
@@ -195,6 +203,7 @@ export function formatPlan(opts = {}) {
       task_id: taskId,
       issue_url: issueUrl,
       pr_url: prUrl,
+      ...(releaseSha ? { release_sha: releaseSha } : {}),
     },
     evidence: {
       '<required_key>': true,
@@ -230,6 +239,7 @@ export function formatPlan(opts = {}) {
     prUrl,
     '--base-url',
     baseUrl,
+    ...(releaseSha ? ['--release-sha', releaseSha] : []),
   ], ` > ${shellQuote(join(outDir, 'external-pr-cycle-check.json'))}`))
   lines.push(commandLine([
     'node',
@@ -252,6 +262,7 @@ export function formatPlan(opts = {}) {
     prUrl,
     '--base-url',
     baseUrl,
+    ...(releaseSha ? ['--release-sha', releaseSha] : []),
   ]))
   lines.push('')
   lines.push('Attach the evidence directory plus external-pr-cycle-check.json to the active release tracker only when the aggregate receipt reports status "pass".')
@@ -344,6 +355,15 @@ function evidenceValuePass(value) {
 function targetValue(receipt, key) {
   const value = receipt?.target?.[key]
   return typeof value === 'string' ? stripTrailingSlash(value) : ''
+}
+
+function releaseShaValue(receipt) {
+  const target = receipt?.target && typeof receipt.target === 'object' ? receipt.target : {}
+  return target.release_sha
+}
+
+function isCanonicalReleaseSha(value) {
+  return typeof value === 'string' && /^[0-9a-f]{40}$/.test(value)
 }
 
 function linkValue(receipt, key) {
@@ -494,6 +514,32 @@ export function checkBundle(opts = {}) {
       values,
     })
     target[field] = values.length === 1 ? values[0] : null
+  }
+
+  const releaseShaValues = receipts.map(({ receipt }) => releaseShaValue(receipt))
+  const releaseShaPresent = releaseShaValues.some((value) => value !== undefined)
+  const releaseShaConsistent = receipts.length === REQUIRED_STEPS.length
+    && releaseShaValues.every(isCanonicalReleaseSha)
+    && new Set(releaseShaValues).size === 1
+  if (releaseShaPresent || opts.releaseSha) {
+    for (const { step, path, receipt } of receipts) {
+      pushCheck(checks, isCanonicalReleaseSha(releaseShaValue(receipt)), 'target_release_sha_valid', {
+        step,
+        path,
+        value: releaseShaValue(receipt) ?? null,
+      })
+    }
+    pushCheck(checks, releaseShaConsistent, 'target_release_sha_consistent_across_steps', {
+      values: [...new Set(releaseShaValues.filter(isCanonicalReleaseSha))],
+    })
+  }
+  target.release_sha = releaseShaConsistent ? releaseShaValues[0] : null
+  if (opts.releaseSha) {
+    pushCheck(checks, isCanonicalReleaseSha(opts.releaseSha), 'expected_release_sha_valid', { expected: opts.releaseSha })
+    pushCheck(checks, target.release_sha === opts.releaseSha, 'target_release_sha_matches_expected', {
+      expected: opts.releaseSha,
+      actual: target.release_sha,
+    })
   }
 
   const repoFromIssue = githubIssueOrPrRepo(target.issue_url)

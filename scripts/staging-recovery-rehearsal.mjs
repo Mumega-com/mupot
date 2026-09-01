@@ -68,6 +68,7 @@ export function parseArgs(argv) {
     outDir: '',
     pot: '',
     baseUrl: '',
+    releaseSha: '',
     plan: false,
     check: false,
     summary: false,
@@ -85,6 +86,11 @@ export function parseArgs(argv) {
     if (arg === '--out-dir') opts.outDir = resolve(next())
     else if (arg === '--pot') opts.pot = next()
     else if (arg === '--base-url') opts.baseUrl = stripTrailingSlash(next())
+    else if (arg === '--release-sha') {
+      const releaseSha = next()
+      if (!isCanonicalReleaseSha(releaseSha)) throw new Error('invalid release SHA: expected 40 lowercase hexadecimal characters')
+      opts.releaseSha = releaseSha
+    }
     else if (arg === '--plan') opts.plan = true
     else if (arg === '--check') opts.check = true
     else if (arg === '--summary') opts.summary = true
@@ -105,6 +111,7 @@ export function usage() {
     '  --out-dir <path>       evidence directory; default shown in --plan',
     '  --pot <slug>           expected pot slug for target consistency checks',
     '  --base-url <url>       expected staging base URL for target consistency checks',
+    '  --release-sha <sha>    expected 40-character lowercase release SHA',
     '  --summary              with --check, print a compact text summary',
     '  -h, --help             show this help',
   ].join('\n')
@@ -131,6 +138,7 @@ function defaultOutDir(opts) {
 export function formatPlan(opts = {}) {
   const pot = opts.pot || '<pot>'
   const baseUrl = opts.baseUrl || 'https://<staging-pot-host>'
+  const releaseSha = opts.releaseSha || ''
   const outDir = defaultOutDir(opts)
   const lines = []
 
@@ -190,6 +198,7 @@ export function formatPlan(opts = {}) {
     pot,
     '--base-url',
     baseUrl,
+    ...(releaseSha ? ['--release-sha', releaseSha] : []),
   ], ` > ${shellQuote(join(outDir, 'staging-recovery-check.json'))}`))
   lines.push(commandLine([
     'node',
@@ -202,6 +211,7 @@ export function formatPlan(opts = {}) {
     pot,
     '--base-url',
     baseUrl,
+    ...(releaseSha ? ['--release-sha', releaseSha] : []),
   ]))
   lines.push('')
   lines.push('Attach the evidence directory plus staging-recovery-check.json only when the aggregate receipt reports status "pass".')
@@ -303,6 +313,10 @@ function evidenceString(receipt, key) {
 
 function isGitSha(value) {
   return /^[0-9a-f]{40}$/i.test(value)
+}
+
+function isCanonicalReleaseSha(value) {
+  return typeof value === 'string' && /^[0-9a-f]{40}$/.test(value)
 }
 
 export function checkBundle(opts = {}) {
@@ -496,6 +510,13 @@ export function checkBundle(opts = {}) {
     active_validation_git_sha: activeValidationSha || null,
     target_git_sha: target.git_sha,
   })
+  if (opts.releaseSha) {
+    pushCheck(checks, isCanonicalReleaseSha(opts.releaseSha), 'expected_release_sha_valid', { expected: opts.releaseSha })
+    pushCheck(checks, target.git_sha === opts.releaseSha, 'target_git_sha_matches_expected_release_sha', {
+      expected: opts.releaseSha,
+      actual: target.git_sha,
+    })
+  }
 
   const failed = checks.filter((check) => check.ok === false)
   const passed = checks.filter((check) => check.ok === true)

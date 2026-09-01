@@ -24,6 +24,7 @@ const TARGET = {
 const START = Date.parse('2026-07-09T20:00:00.000Z')
 const STEP_WINDOW_MS = 5 * 60 * 1000
 const STEP_DURATION_MS = 2 * 60 * 1000
+const RELEASE_SHA = '8a2bd44c5f0efcc23791e3b08d9f5472d1a6c4be'
 
 function iso(ms: number) {
   return new Date(ms).toISOString()
@@ -42,7 +43,7 @@ function baseReceipt(step: string, evidence: Record<string, unknown>) {
     status: 'pass',
     started_at: iso(startedAt),
     completed_at: iso(startedAt + STEP_DURATION_MS),
-    target: TARGET,
+    target: { ...TARGET },
     commands: [
       { command: `run ${step}`, ok: true, exit_code: 0 },
     ],
@@ -322,5 +323,74 @@ describe('fresh install receipt checker', () => {
       ok: false,
       check: 'receipt_has_no_secret_material',
     }))
+  })
+
+  it('binds every fresh-install receipt to the requested release SHA', () => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt) => {
+      receipt.target = { ...(receipt.target as Record<string, unknown>), release_sha: RELEASE_SHA }
+    })
+
+    const parsed = parseArgs(['--check', '--out-dir', dir, '--release-sha', RELEASE_SHA])
+    const plan = formatPlan({ outDir: dir, releaseSha: RELEASE_SHA })
+    const receipt = checkBundle(parsed)
+
+    expect(parsed.releaseSha).toBe(RELEASE_SHA)
+    expect(plan).toContain('"release_sha": "8a2bd44c5f0efcc23791e3b08d9f5472d1a6c4be"')
+    expect(plan).toContain('--release-sha 8a2bd44c5f0efcc23791e3b08d9f5472d1a6c4be')
+    expect(receipt.status).toBe('pass')
+    expect(receipt.target.release_sha).toBe(RELEASE_SHA)
+  })
+
+  it('rejects a fresh-install bundle when a bound step omits the release SHA', () => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt, file) => {
+      receipt.target = { ...(receipt.target as Record<string, unknown>), release_sha: RELEASE_SHA }
+      if (file === 'migrations-applied.json') delete (receipt.target as Record<string, unknown>).release_sha
+    })
+
+    expect(checkBundle({ outDir: dir, releaseSha: RELEASE_SHA }).status).toBe('fail')
+  })
+
+  it('rejects a fresh-install bundle with different valid release SHAs', () => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt, file) => {
+      receipt.target = {
+        ...(receipt.target as Record<string, unknown>),
+        release_sha: file === 'worker-deployed.json' ? '7b2bd44c5f0efcc23791e3b08d9f5472d1a6c4be' : RELEASE_SHA,
+      }
+    })
+
+    expect(checkBundle({ outDir: dir }).status).toBe('fail')
+  })
+
+  it.each([
+    ['malformed', 'not-a-sha'],
+    ['uppercase', RELEASE_SHA.toUpperCase()],
+    ['array', [RELEASE_SHA]],
+    ['object', { sha: RELEASE_SHA }],
+  ])('rejects %s fresh-install release SHA values without coercion', (_kind, releaseSha) => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt) => {
+      receipt.target = { ...(receipt.target as Record<string, unknown>), release_sha: releaseSha }
+    })
+
+    expect(checkBundle({ outDir: dir }).status).toBe('fail')
+  })
+
+  it('rejects malformed or uppercase fresh-install CLI release SHAs', () => {
+    expect(() => parseArgs(['--check', '--release-sha', 'not-a-sha'])).toThrow('invalid release SHA')
+    expect(() => parseArgs(['--check', '--release-sha', RELEASE_SHA.toUpperCase()])).toThrow('invalid release SHA')
+    expect(checkBundle({ outDir: tempDir(), releaseSha: '7b2bd44c5f0efcc23791e3b08d9f5472d1a6c4be' }).status).toBe('fail')
+  })
+
+  it('keeps a historical fresh-install bundle without release SHAs valid', () => {
+    const dir = tempDir()
+    writeBundle(dir)
+
+    const receipt = checkBundle({ outDir: dir })
+
+    expect(receipt.status).toBe('pass')
+    expect(receipt.target.release_sha).toBeNull()
   })
 })

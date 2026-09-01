@@ -16,6 +16,7 @@ const STEP_WINDOW_MS = 10 * 60 * 1000
 const STEP_DURATION_MS = 3 * 60 * 1000
 const PREVIOUS_SHA = '1b4f53eaa9428cfe5ec0416d4e355315cfa2d0a8'
 const TARGET_SHA = '60cdac144a1312e1461fd386a311840ca1a1fa6a'
+const OTHER_SHA = '8a2bd44c5f0efcc23791e3b08d9f5472d1a6c4be'
 
 function iso(ms: number) {
   return new Date(ms).toISOString()
@@ -281,5 +282,92 @@ describe('staging recovery rehearsal checker', () => {
       check: 'step_receipt_no_secret_material',
       step: 'failure_reporting',
     }))
+  })
+
+  it('binds the staging recovery source-validated target SHA to the requested release SHA', () => {
+    const dir = tempDir()
+    writeBundle(dir)
+
+    const parsed = parseArgs(['--check', '--out-dir', dir, '--release-sha', TARGET_SHA])
+    const plan = formatPlan({ pot: 'staging', outDir: dir, releaseSha: TARGET_SHA })
+    const receipt = checkBundle(parsed)
+
+    expect(parsed.releaseSha).toBe(TARGET_SHA)
+    expect(plan).toContain('--release-sha 60cdac144a1312e1461fd386a311840ca1a1fa6a')
+    expect(receipt.status).toBe('pass')
+    expect(receipt.target.git_sha).toBe(TARGET_SHA)
+    expect(receipt.target).not.toHaveProperty('release_sha')
+  })
+
+  it('rejects malformed or uppercase staging recovery CLI release SHAs', () => {
+    expect(() => parseArgs(['--check', '--release-sha', 'not-a-sha'])).toThrow('invalid release SHA')
+    expect(() => parseArgs(['--check', '--release-sha', TARGET_SHA.toUpperCase()])).toThrow('invalid release SHA')
+  })
+
+  it('rejects a staging recovery bundle whose source-validated target SHA differs from the requested release', () => {
+    const dir = tempDir()
+    writeBundle(dir)
+
+    const receipt = checkBundle({ outDir: dir, releaseSha: OTHER_SHA })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'target_git_sha_matches_expected_release_sha',
+      expected: OTHER_SHA,
+      actual: TARGET_SHA,
+    }))
+  })
+
+  it('fails the source chain when target.git_sha changes', () => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt) => {
+      receipt.target = { ...(receipt.target as Record<string, string>), git_sha: OTHER_SHA }
+    })
+
+    const receipt = checkBundle({ outDir: dir })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'upgrade_deploys_target_git_sha',
+    }))
+  })
+
+  it('fails the source chain when upgrade evidence deployed_sha changes', () => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt, step) => {
+      if (step === 'upgrade') (receipt.evidence as Record<string, string>).deployed_sha = OTHER_SHA
+    })
+
+    const receipt = checkBundle({ outDir: dir })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'upgrade_deploys_target_git_sha',
+    }))
+  })
+
+  it('fails the source chain when final validation evidence SHA changes', () => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt, step) => {
+      if (step === 'final_validation') (receipt.evidence as Record<string, string>).active_validation_git_sha = OTHER_SHA
+    })
+
+    const receipt = checkBundle({ outDir: dir })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'final_validation_runs_target_git_sha',
+    }))
+  })
+
+  it('keeps a historical staging recovery bundle valid without a requested release SHA', () => {
+    const dir = tempDir()
+    writeBundle(dir)
+
+    expect(checkBundle({ outDir: dir }).status).toBe('pass')
   })
 })
