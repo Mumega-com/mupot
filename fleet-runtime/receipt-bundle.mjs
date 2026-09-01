@@ -640,7 +640,7 @@ function probeResponseSchemaExact(value) {
 }
 
 function normalizePassingProbeReceipt(receipt) {
-  const releaseBound = Object.hasOwn(receipt?.inputs ?? {}, 'release_sha') || Object.hasOwn(receipt ?? {}, 'health')
+  const releaseBound = probeHasReleaseBinding(receipt)
   const topKeys = ['receipt_type', 'generated_at', 'status', 'summary', 'inputs', ...(releaseBound ? ['health'] : []), 'actions', 'checks']
   const inputKeys = ['base_url', 'agent', ...(releaseBound ? ['release_sha'] : []), 'queue_inbox', 'control_verbs', 'inbox_kind', 'agent_token_env', 'owner_token_env']
   if (!exactSummaryEnvelope(receipt, topKeys) || receipt.receipt_type !== EXPECTED.probe || receipt.status !== 'pass' ||
@@ -691,6 +691,31 @@ function normalizePassingProbeReceipt(receipt) {
     if (expected.kind === 'inbox_probe' ? !nonEmptyString(action.request_id) : action.verb !== expected.verb || !nonEmptyString(action.nonce)) return null
   }
   return receipt
+}
+
+function probeHasReleaseBinding(receipt) {
+  return Object.hasOwn(receipt?.inputs ?? {}, 'release_sha') || Object.hasOwn(receipt ?? {}, 'health')
+}
+
+function validateProbeReceiptSet(paths, expectedReleaseSha = null, root = '') {
+  const releaseBound = typeof expectedReleaseSha === 'string'
+  const expectedValid = !releaseBound || RELEASE_SHA_RE.test(expectedReleaseSha)
+  const records = (paths ?? []).map((path) => {
+    const raw = readReceipt(path, root)
+    const projectionValid = !projectionSchemaExact(raw) || raw.projection_sha256 === sha256Bytes(jsonBytes(raw.content))
+    const receipt = projectionContent(raw)
+    const normalized = projectionValid ? normalizePassingProbeReceipt(receipt) : null
+    const probeBound = probeHasReleaseBinding(receipt)
+    const valid = expectedValid && (releaseBound
+      ? normalized?.inputs?.release_sha === expectedReleaseSha
+      : !probeBound && receipt?.receipt_type === EXPECTED.probe && receipt?.status === 'pass')
+    return { path, releaseBound: probeBound, valid }
+  })
+  return {
+    records,
+    paths: records.filter((record) => record.valid).map((record) => record.path),
+    allValid: records.every((record) => record.valid),
+  }
 }
 
 const RUNTIME_CHECK_KEYS = new Map([
@@ -913,7 +938,7 @@ function normalizePassingCutoverReceipt(receipt) {
   return normalized ? { mode, receipt: normalized } : null
 }
 
-function priorBundleManifestPasses(prior, starter, agentId, admittedDigests = null) {
+function priorBundleManifestPasses(prior, starter, agentId, admittedDigests = null, probePaths = []) {
   const topKeys = ['receipt_type', 'generated_at', 'status', 'summary', 'integrity', 'inputs', 'artifacts', 'next_steps', 'checks']
   if (!exactSummaryEnvelope(prior, topKeys) || !manifestSchemaExact(prior) || prior.receipt_type !== 'mupot-fleet-receipt-bundle/v1' || prior.status !== 'pass' ||
     prior.integrity.algorithm !== 'sha256' || !exactStringArray(prior.next_steps, { nonEmpty: true }) ||
@@ -926,6 +951,9 @@ function priorBundleManifestPasses(prior, starter, agentId, admittedDigests = nu
     artifacts.probes.some((meta) => !exactArtifactMeta(meta, EXPECTED.probe)) || !Array.isArray(artifacts.runtimes) || artifacts.runtimes.length === 0 ||
     artifacts.runtimes.some((meta) => !exactArtifactMeta(meta, EXPECTED.runtime)) || !Array.isArray(artifacts.controls) || artifacts.controls.length < 2 ||
     artifacts.controls.some((meta) => !exactArtifactMeta(meta, EXPECTED.control))) return false
+  const expectedReleaseSha = Object.hasOwn(prior.inputs, 'release_sha') ? prior.inputs.release_sha : null
+  const probeValidation = validateProbeReceiptSet(probePaths, expectedReleaseSha)
+  if (probePaths.length !== artifacts.probes.length || !probeValidation.allValid) return false
   const starterDigests = admittedDigests ?? new Map(starter.artifacts.map((artifact) => [artifact.role, artifact.sha256]))
   if (artifacts.install.sha256 !== starterDigests.get('install') || artifacts.host.sha256 !== starterDigests.get('host') ||
     !artifacts.runtimes.some((meta) => meta.sha256 === starterDigests.get('runtime_inbox')) ||
@@ -1078,9 +1106,11 @@ function normalizeStarterEvidence({ serviceReceipt, continuousReceipt, starterRe
   if (!normalizeRuntimeInboxReceipt(roleReceipts.runtime_inbox, continuous.agent_id, host.target) || !lifecycleStart || !lifecycleStop ||
     [lifecycleStart, lifecycleStop].some((lifecycle) => lifecycle.control_pid !== null && lifecycle.control_pid !== continuous.control_pid)) return null
   const prior = roleReceipts.receipt_bundle_manifest
-  if (!priorBundleManifestPasses(prior, starter, continuous.agent_id, admittedDigests)) return null
-  const probePaths = prior.artifacts.probes.map((meta) => admittedPriorArtifactPath(starterPath, meta))
-  if (probePaths.some((path) => !path) || [lifecycleStart, lifecycleStop].some((lifecycle) =>
+  const probePaths = Array.isArray(prior?.artifacts?.probes)
+    ? prior.artifacts.probes.map((meta) => admittedPriorArtifactPath(starterPath, meta))
+    : []
+  if (probePaths.some((path) => !path) || !priorBundleManifestPasses(prior, starter, continuous.agent_id, admittedDigests, probePaths) ||
+    [lifecycleStart, lifecycleStop].some((lifecycle) =>
     lifecycle.evidence_mode === 'daemon_state' && !admittedProbeBinding(probePaths, lifecycle, dirname(starterPath)))) return null
   return { service_manager: service.manager, platform: service.platform, definition_hashes: service.definitions, observed_deltas: { heartbeat_tick: continuous.heartbeat_delta, control_poll: continuous.control_delta }, starter_manifest_sha256: starter.manifest.sha256, agent_id: continuous.agent_id, tenant: hostReceipt.target?.tenant ?? null }
 }
@@ -1544,15 +1574,15 @@ function admittedPriorArtifactPath(starterPath, meta) {
   return digestMatches ? candidate : ''
 }
 
-function validateStateObservedControls(controlPaths, probePaths, hostPath, agents, checks) {
-  const hostReceipt = readReceipt(hostPath)
+function validateStateObservedControls(controlPaths, probePaths, hostPath, agents, checks, component = 'receipt-bundle') {
+  const hostReceipt = projectionContent(readReceipt(hostPath))
   const host = normalizeServiceAwareHostReceipt(hostReceipt, agents)
   const controlPid = host
     ? hostReceipt.checks.find((check) => check.component === 'host-services' && check.check === 'control_service_running')?.service?.pid
     : null
   const selected = []
   for (const path of controlPaths) {
-    const receipt = readReceipt(path)
+    const receipt = projectionContent(readReceipt(path))
     if (receipt?.inputs?.evidence_mode !== 'daemon_state') {
       selected.push(path)
       continue
@@ -1562,15 +1592,15 @@ function validateStateObservedControls(controlPaths, probePaths, hostPath, agent
       ? normalizeLifecycleReceipt(receipt, request.agent_id, request.verb, hostReceipt?.target)
       : null
     if (!lifecycle) {
-      checks.push({ ok: false, component: 'receipt-bundle', check: 'control_evidence_contract_valid', path })
+      checks.push({ ok: false, component, check: 'control_evidence_contract_valid', path })
       continue
     }
-    checks.push({ ok: true, component: 'receipt-bundle', check: 'control_evidence_contract_valid', path })
+    checks.push({ ok: true, component, check: 'control_evidence_contract_valid', path })
     const probePath = admittedProbeBinding(probePaths, lifecycle)
     const probeOk = Boolean(probePath)
     const pidOk = Number.isInteger(controlPid) && controlPid > 0 && lifecycle.control_pid === controlPid
-    checks.push({ ok: probeOk, component: 'receipt-bundle', check: 'control_probe_binding_valid', path, agent_id: request.agent_id, verb: request.verb, probe_path: probePath })
-    checks.push({ ok: pidOk, component: 'receipt-bundle', check: 'control_observed_service_pid_match', path, agent_id: request.agent_id, verb: request.verb, observed_pid: lifecycle.control_pid, service_pid: controlPid })
+    checks.push({ ok: probeOk, component, check: 'control_probe_binding_valid', path, agent_id: request.agent_id, verb: request.verb, probe_path: probePath })
+    checks.push({ ok: pidOk, component, check: 'control_observed_service_pid_match', path, agent_id: request.agent_id, verb: request.verb, observed_pid: lifecycle.control_pid, service_pid: controlPid })
     if (probeOk && pidOk) selected.push(path)
   }
   return selected
@@ -2745,21 +2775,6 @@ function checkBundleManifest(opts = {}) {
       const projection = provenance ? rawReceipt : null
       const receipt = projectionSchemaExact(projection) ? projection.content : rawReceipt
       if (receipt) receiptRecords.push({ label: entry.label, receipt, checkedPath })
-      if (entry.label.startsWith('probe:')) {
-        const manifestReleaseBound = Object.hasOwn(manifest.inputs ?? {}, 'release_sha')
-        const probeReleaseBound = Object.hasOwn(receipt?.inputs ?? {}, 'release_sha') || Object.hasOwn(receipt ?? {}, 'health')
-        if (manifestReleaseBound || probeReleaseBound) {
-          const normalizedProbe = normalizePassingProbeReceipt(receipt)
-          checks.push({
-            ok: manifestReleaseBound && RELEASE_SHA_RE.test(manifest.inputs.release_sha) &&
-              normalizedProbe?.inputs?.release_sha === manifest.inputs.release_sha,
-            component: 'receipt-bundle-check',
-            check: 'probe_release_sha_matches_manifest',
-            artifact: entry.label,
-            path: checkedPath || null,
-          })
-        }
-      }
       const normalizedCutover = entry.label === 'cutover_gate' ? normalizePassingCutoverReceipt(receipt) : null
       const declaredCutoverMode = entry.label === 'cutover_gate'
         ? exactCutoverArtifactMeta(artifactMetaForLabel(manifest, entry.label))
@@ -2945,6 +2960,31 @@ function checkBundleManifest(opts = {}) {
         addCutoverGateConsistencyChecks(checks, manifestPath, manifest, entries, receipt)
       }
     }
+
+    const declaredProbeRecords = receiptRecords.filter((record) => record.label.startsWith('probe:'))
+    const manifestReleaseDeclared = Object.hasOwn(manifest.inputs ?? {}, 'release_sha')
+    const probeValidation = validateProbeReceiptSet(
+      declaredProbeRecords.map((record) => record.checkedPath),
+      manifestReleaseDeclared ? manifest.inputs.release_sha : null,
+    )
+    for (const record of probeValidation.records) {
+      if (!manifestReleaseDeclared && !record.releaseBound) continue
+      checks.push({
+        ok: record.valid,
+        component: 'receipt-bundle-check',
+        check: 'probe_release_sha_matches_manifest',
+        artifact: declaredProbeRecords.find((candidate) => candidate.checkedPath === record.path)?.label ?? null,
+        path: record.path || null,
+      })
+    }
+    validateStateObservedControls(
+      receiptRecords.filter((record) => record.label.startsWith('control:')).map((record) => record.checkedPath),
+      probeValidation.paths,
+      receiptRecords.find((record) => record.label === 'host')?.checkedPath ?? '',
+      agents,
+      checks,
+      'receipt-bundle-check',
+    )
 
     if (resolvedCutoverMode === 'neutral') {
       const findings = collectLiveSosFindings({
@@ -4132,17 +4172,6 @@ function addProbeReceiptStatusChecks(checks, path, receipt, { exact = false } = 
   })
 }
 
-function addProbeReleaseShaCheck(checks, path, receipt, releaseSha) {
-  if (!releaseSha) return
-  const normalized = normalizePassingProbeReceipt(receipt)
-  checks.push({
-    ok: Boolean(RELEASE_SHA_RE.test(releaseSha) && normalized && normalized.inputs.release_sha === releaseSha),
-    component: 'receipt-bundle',
-    check: 'probe_release_sha_matches_bundle',
-    path,
-  })
-}
-
 async function runAndWrite(label, path, builder, builderOpts, opts, checks) {
   try {
     const receipt = await builder(builderOpts)
@@ -4291,7 +4320,6 @@ function includeProbeReceipts(outDir, opts, checks) {
       const receipt = readReceipt(path)
       checks.push({ ok: true, component: 'receipt-bundle', check: 'probe_receipt_reused', path })
       addProbeReceiptStatusChecks(checks, path, receipt, { exact: starterModeSelected(opts) })
-      addProbeReleaseShaCheck(checks, path, receipt, opts.releaseSha)
       metas.push(receiptMeta(path))
     }
     return metas
@@ -4310,7 +4338,6 @@ function includeProbeReceipts(outDir, opts, checks) {
     if (resolve(source) === resolve(dest)) {
       checks.push({ ok: true, component: 'receipt-bundle', check: 'probe_receipt_reused', path: dest })
       addProbeReceiptStatusChecks(checks, dest, receipt, { exact: starterModeSelected(opts) })
-      addProbeReleaseShaCheck(checks, dest, receipt, opts.releaseSha)
       metas.push(receiptMeta(dest))
       return
     }
@@ -4318,7 +4345,6 @@ function includeProbeReceipts(outDir, opts, checks) {
     const wrote = writeJson(dest, receipt, opts, checks, 'probe')
     if (wrote) {
       addProbeReceiptStatusChecks(checks, dest, receipt, { exact: starterModeSelected(opts) })
-      addProbeReleaseShaCheck(checks, dest, receipt, opts.releaseSha)
     }
     metas.push(existsSync(dest) ? receiptMeta(dest) : { path: dest, receipt_type: null, status: null })
   })
@@ -4507,6 +4533,20 @@ async function buildBundle(opts) {
 
   artifacts.install = includeInstallReceipt(outDir, opts, checks)
   artifacts.probes = includeProbeReceipts(outDir, opts, checks)
+  const probeValidation = validateProbeReceiptSet(
+    artifacts.probes.map((probe) => probe?.path).filter(Boolean),
+    opts.releaseSha || null,
+  )
+  if (opts.releaseSha) {
+    for (const record of probeValidation.records) {
+      checks.push({
+        ok: record.valid,
+        component: 'receipt-bundle',
+        check: 'probe_release_sha_matches_bundle',
+        path: record.path,
+      })
+    }
+  }
   if (starterMode) {
     checks.push({ ok: true, component: 'receipt-bundle', check: 'starter_ready_mode_selected' })
     for (const roleSpec of STARTER_RECEIPT_ROLES) {
@@ -4569,7 +4609,7 @@ async function buildBundle(opts) {
   const controlCandidates = passPaths(listReceiptFiles(outDir, 'control-'), EXPECTED.control, checks, 'control')
   const controlPaths = validateStateObservedControls(
     controlCandidates,
-    listReceiptFiles(outDir, 'probe-'),
+    probeValidation.paths,
     hostPaths[0] ?? '',
     agents,
     checks,

@@ -503,6 +503,43 @@ async function buildBoundBundle(releaseSha = RELEASE_SHA) {
   return { outDir, bundle }
 }
 
+async function buildHiddenHistoricalProbeBundle() {
+  const outDir = tmpDir()
+  const hiddenStartPath = writeJson(join(outDir, 'probe-hidden-start.json'), probeReceipt('pass', 'start'))
+  const boundStopPath = writeJson(join(tmpDir(), 'bound-stop.json'), boundProbeReceipt('pass', 'stop'))
+  const service = serviceReceipt()
+  writeJson(join(outDir, 'host.json'), serviceAwareHostReceipt(service))
+  writeJson(join(outDir, 'runtime-agent-one.json'), runtimeReceipt('agent-one'))
+  writeJson(join(outDir, 'control-start.json'), stateControlReceipt('agent-one', 'start', 102, { probePath: hiddenStartPath }))
+  writeJson(join(outDir, 'control-stop.json'), stateControlReceipt('agent-one', 'stop', 102, { probePath: boundStopPath }))
+  const bundle = await buildBundle({
+    outDir,
+    agents: ['agent-one'],
+    releaseSha: RELEASE_SHA,
+    probeReceiptPaths: [boundStopPath],
+    verifyOnly: true,
+  })
+  return { outDir, bundle }
+}
+
+function copyDeclaredBundle(outDir) {
+  const copiedDir = tmpDir()
+  const manifest = JSON.parse(readFileSync(join(outDir, 'manifest.json'), 'utf8'))
+  const metas = [
+    manifest.artifacts.install,
+    ...manifest.artifacts.probes,
+    manifest.artifacts.host,
+    ...manifest.artifacts.runtimes,
+    ...manifest.artifacts.controls,
+    manifest.artifacts.cutover_gate,
+  ].filter(Boolean)
+  for (const meta of metas) copyFileSync(meta.path, join(copiedDir, basename(meta.path)))
+  copyFileSync(join(outDir, 'manifest.json'), join(copiedDir, 'manifest.json'))
+  chmodSync(copiedDir, 0o700)
+  for (const name of readdirSync(copiedDir)) chmodSync(join(copiedDir, name), 0o600)
+  return copiedDir
+}
+
 function legacyCutoverReceipt({ agentId = 'agent-one', hostPath, runtimePath, startPath, stopPath }) {
   const checks = [
     { ok: true, component: 'cutover-receipt', check: 'host_receipt_read', path: hostPath },
@@ -1078,6 +1115,62 @@ test('historical unbound bundle remains valid without release fields', async () 
   assert.equal(bundle.status, 'pass')
   assert.equal(Object.hasOwn(bundle.inputs, 'release_sha'), false)
   assert.equal(checkBundleManifest({ outDir }).status, 'pass')
+})
+
+test('release-bound build refuses lifecycle control evidence bound only to a hidden historical probe', async () => {
+  const { bundle } = await buildHiddenHistoricalProbeBundle()
+
+  assert.equal(bundle.status, 'fail')
+  assert.ok(bundle.checks.some((check) =>
+    check.check === 'control_probe_binding_valid' &&
+    check.verb === 'start' &&
+    check.ok === false
+  ))
+})
+
+test('manifest recheck recomputes lifecycle control bindings from declared probes', async () => {
+  const { outDir } = await buildHiddenHistoricalProbeBundle()
+  const copiedDir = copyDeclaredBundle(outDir)
+
+  const checked = checkBundleManifest({ outDir: copiedDir })
+  assert.equal(checked.status, 'fail')
+  assert.ok(checked.checks.some((check) =>
+    check.component === 'receipt-bundle-check' &&
+    check.check === 'control_probe_binding_valid' &&
+    check.verb === 'start' &&
+    check.ok === false
+  ))
+})
+
+test('starter prior manifest rejects probes bound to a different release SHA', async () => {
+  const priorReleaseSha = 'b'.repeat(40)
+  const sources = starterPaths({
+    probeStart: boundProbeReceipt('pass', 'start', RELEASE_SHA),
+    probeStop: boundProbeReceipt('pass', 'stop', RELEASE_SHA),
+  })
+  sources.evidence.priorManifest.inputs.release_sha = priorReleaseSha
+  sources.evidence.priorManifest.checks.push(
+    { ok: true, component: 'receipt-bundle', check: 'release_sha_valid' },
+    { ok: true, component: 'receipt-bundle', check: 'probe_release_sha_matches_bundle', path: 'probe-start.json' },
+    { ok: true, component: 'receipt-bundle', check: 'probe_release_sha_matches_bundle', path: 'probe-stop.json' },
+  )
+  sources.evidence.priorManifest.summary = summarizeFixture(sources.evidence.priorManifest.checks)
+  rewriteStarterEvidence(sources, 'receipt_bundle_manifest')
+
+  const outDir = tmpDir()
+  seedStarterEvidence(outDir, sources)
+  const bundle = await buildBundle({
+    outDir,
+    agents: ['agent-one'],
+    releaseSha: RELEASE_SHA,
+    verifyOnly: true,
+    ...sources,
+  })
+
+  assert.equal(bundle.status, 'fail')
+  assert.ok(bundle.checks.some((check) =>
+    check.check === 'starter_evidence_contracts_valid' && check.ok === false
+  ))
 })
 
 test('new bundle rejects an injected legacy cutover gate', async () => {
