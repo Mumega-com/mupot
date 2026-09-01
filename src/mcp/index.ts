@@ -96,7 +96,7 @@ import { enrollUrl } from '../dashboard/enroll'
 import { classify, humanAge } from '../dashboard/fleet'
 import { resolveAgentRef } from '../org/resolve'
 import {
-  sendToRef, readAgentInbox, sendAgentMessage, checkSendReachability,
+  sendToRef, readAgentInbox, sendAgentMessage,
 } from '../agents/messages'
 import { routeAgentWake } from '../agents/wake-routing'
 import { authorizeExecutionScope } from '../auth/execution-scope'
@@ -3189,76 +3189,6 @@ const toolSend: ToolSpec = {
   },
 }
 
-// can_reach — ask the pot whether a send would be authorized, WITHOUT sending.
-//
-// The gap this closes: reachability was only observable by attempting a write.
-// When gate verdicts stopped arriving directly and had to be hand-carried, no
-// agent could ask the pot why — the answer existed only as the error string of a
-// message you had to send to find out. Diagnosing it took eight tool calls and a
-// source read.
-//
-// Deliberately NOT a scan surface. A single NAMED target only: no list input, no
-// wildcard, no squad sweep. And the reason vocabulary is exactly what `send`
-// would have returned to the same caller, which for a non-admin is the single
-// collapsed send_target_not_visible — a read-only diagnostic must never be a
-// wider oracle than the write it describes.
-//
-// Ruled by Athena, 2026-09-01: "Require an explicitly NAMED target (no
-// list/scan input) so it cannot become a batch oracle."
-const toolCanReach: ToolSpec = {
-  name: 'can_reach',
-  scope: 'self → one named agent (read-only)',
-  min: 'authenticated',
-  args: '{ to: string (agent id or unique slug), project_id?: string }',
-  inputSchema: {
-    type: 'object',
-    properties: { to: STRING_SCHEMA, project_id: STRING_SCHEMA },
-    required: ['to'],
-    additionalProperties: false,
-  },
-  async run(auth, env, args, ctx) {
-    const fromAgent = auth.boundAgentId
-    if (!fromAgent) {
-      return fail(403, 'not_agent_bound', {
-        detail: 'can_reach requires an agent-bound token (member_tokens.agent_id)',
-        enroll_url: enrollUrl(canonicalOrigin(env, ctx.origin), ctx.seat),
-      })
-    }
-    const to = str(args.to)
-    if (!to) return fail(400, 'invalid_args', 'to required')
-    if (args.project_id !== undefined && typeof args.project_id !== 'string')
-      return fail(400, 'invalid_args', 'project_id must be a string')
-
-    const res = await checkSendReachability(
-      env,
-      {
-        fromAgent,
-        fromMember: auth.memberId as string,
-        toRef: to,
-        projectId: typeof args.project_id === 'string' ? args.project_id : undefined,
-      },
-      { isAdmin: hasWorkspaceAdmin(auth), grants: auth.capabilities ?? [] },
-    )
-
-    // 200 either way: "no" is the answer to the question, not a failure to
-    // answer it. A 403 here would make the honest negative indistinguishable
-    // from the caller lacking permission to ask.
-    return done({
-      to: to,
-      reachable: res.reachable,
-      via: res.via,
-      reason: res.reason,
-      target: res.target,
-      project_id: typeof args.project_id === 'string' ? args.project_id : null,
-      // Name the lever when the squad arm failed and no project was offered:
-      // the project edge is how the gate reaches this seat today.
-      ...(!res.reachable && args.project_id === undefined
-        ? { hint: 'if both agents share a project, retry with project_id to test the project arm' }
-        : {}),
-    })
-  },
-}
-
 type BroadcastTarget = Pick<Agent, 'id' | 'slug' | 'name'>
 
 // broadcast — fan out a durable message to every active agent in one squad. This
@@ -3695,37 +3625,11 @@ type PeerRow = Agent & {
   presence_source: string | null
   presence_label: string | null
   presence_last_seen_at: string | null
-  membership_capability: string | null
 }
 
 // peers — read the caller's squad roster for coordination. This is not a global
 // directory: agent-bound tokens default to their own squad, and explicit squad
 // reads require observer+ on that squad.
-//
-// ── WHY THIS READS TWO SOURCES ───────────────────────────────────────────────
-//
-// The pot has two different notions of "in a squad" and they do not agree:
-//
-//   agents.squad_id   the agent's HOME squad — one per agent, set at creation
-//   memberships       the join table — an agent may be in several squads
-//
-// This tool used to read only `agents.squad_id`, which meant the one tool whose
-// entire job is "who is around me" could not see anyone who had JOINED the
-// squad rather than been born in it. Measured on the live pot, squad hadi-mac
-// (3674d955): peers returned 22 agents, squad_member_list returned 26. The four
-// it could not see were grokbot-ceo, Kasra, Loom and River — the gate agent, the
-// flight coordinator and the lead. Precisely the neighbours that matter, hidden
-// by the tool whose purpose is to show them.
-//
-// Reading memberships ALONE would be the same bug mirrored. createAgent does
-// insert a home-squad membership row (src/org/service.ts), but only for agents
-// created through that path; anything older or repaired by hand may have a home
-// squad and no row. So this is a LEFT JOIN with an OR, not a swap: an agent
-// appears if either source says it belongs, and each row carries `via` so the
-// caller can tell which — an edge labelled with why it exists.
-//
-// Ruled by Athena, 2026-09-01: "land P1 ALONE and FIRST ... resolve via the
-// memberships join (union home squad)."
 const toolPeers: ToolSpec = {
   name: 'peers',
   scope: 'squad roster (read-only)',
@@ -3750,7 +3654,6 @@ const toolPeers: ToolSpec = {
 
     const rows = await env.DB.prepare(
       `SELECT a.id, a.squad_id, a.slug, a.name, a.role, a.model, a.status, a.created_at,
-              mem.capability AS membership_capability,
               (SELECT p.source FROM presence p
                 WHERE p.tenant = ?2 AND p.agent_id = a.id
                 ORDER BY p.last_seen_at DESC LIMIT 1) AS presence_source,
@@ -3761,10 +3664,7 @@ const toolPeers: ToolSpec = {
                 WHERE p.tenant = ?2 AND p.agent_id = a.id
                 ORDER BY p.last_seen_at DESC LIMIT 1) AS presence_last_seen_at
          FROM agents a
-         LEFT JOIN memberships mem
-                ON mem.agent_id = a.id
-               AND mem.squad_id = ?1
-        WHERE mem.agent_id IS NOT NULL OR a.squad_id = ?1
+        WHERE a.squad_id = ?1
         ORDER BY a.slug ASC
         LIMIT ?3`,
     )
@@ -3774,13 +3674,6 @@ const toolPeers: ToolSpec = {
     const nowMs = Date.now()
     const peers = (rows.results ?? []).map((row) => {
       const lastSeenMs = sqliteUtcToMs(row.presence_last_seen_at)
-      // Label the edge with why it exists. A caller debugging "why can that
-      // agent see this squad" needs the reason, not just the membership.
-      const via: string[] = []
-      if (row.membership_capability !== null && row.membership_capability !== undefined) {
-        via.push('membership')
-      }
-      if (row.squad_id === squadRes.squad.id) via.push('home_squad')
       return {
         id: row.id,
         slug: row.slug,
@@ -3790,8 +3683,6 @@ const toolPeers: ToolSpec = {
         status: row.status,
         squad_id: row.squad_id,
         is_self: auth.boundAgentId === row.id,
-        via,
-        membership_capability: row.membership_capability ?? null,
         presence: {
           source: row.presence_source ?? null,
           label: row.presence_label ?? '',
@@ -4533,7 +4424,6 @@ export const TOOLS: ToolSpec[] = [
   toolExecutionMeterStatus,
   toolSquadMessage,
   toolSend,
-  toolCanReach,
   toolBroadcast,
   toolInbox,
   toolInboxLease,
