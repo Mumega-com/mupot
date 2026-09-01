@@ -49,7 +49,7 @@ export const MUPOT_MCP_INITIALIZE_INSTRUCTIONS = `=== MUPOT AGENT ONBOARDING & R
    - Required axes:
        check_in({
          seat: "<seat-id>",                 // e.g. "cursor-mac", "grok-desktop", "cursor-cloud-builder", "loom-hetzner"
-         harness: "<harness>",              // "cursor-ide" | "cursor-cloud" | "antigravity-cli" | "claude-code" | "prime" | "hermes" | "grok-cli" | "unknown"
+         harness: "<harness>",              // "cursor-ide" | "cursor-cloud" | "antigravity-cli" | "claude-code" | "codex-cli" | "prime" | "hermes" | "grok-cli" | "unknown"
          machine: "<machine>",              // e.g. "hadi-mac", "hetzner-ash-1", "cursor-cloud-vm"
          model: "<model>",                  // e.g. "claude-3-7-sonnet", "gemini-3.7-flash", "grok-4.6", "deepseek-v4-pro"
          provider: "<provider>",            // e.g. "anthropic", "google", "xai", "deepseek-ai", "cloudflare-ai"
