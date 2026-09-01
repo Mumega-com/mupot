@@ -3625,11 +3625,37 @@ type PeerRow = Agent & {
   presence_source: string | null
   presence_label: string | null
   presence_last_seen_at: string | null
+  membership_capability: string | null
 }
 
 // peers — read the caller's squad roster for coordination. This is not a global
 // directory: agent-bound tokens default to their own squad, and explicit squad
 // reads require observer+ on that squad.
+//
+// ── WHY THIS READS TWO SOURCES ───────────────────────────────────────────────
+//
+// The pot has two different notions of "in a squad" and they do not agree:
+//
+//   agents.squad_id   the agent's HOME squad — one per agent, set at creation
+//   memberships       the join table — an agent may be in several squads
+//
+// This tool used to read only `agents.squad_id`, which meant the one tool whose
+// entire job is "who is around me" could not see anyone who had JOINED the
+// squad rather than been born in it. Measured on the live pot, squad hadi-mac
+// (3674d955): peers returned 22 agents, squad_member_list returned 26. The four
+// it could not see were grokbot-ceo, Kasra, Loom and River — the gate agent, the
+// flight coordinator and the lead. Precisely the neighbours that matter, hidden
+// by the tool whose purpose is to show them.
+//
+// Reading memberships ALONE would be the same bug mirrored. createAgent does
+// insert a home-squad membership row (src/org/service.ts), but only for agents
+// created through that path; anything older or repaired by hand may have a home
+// squad and no row. So this is a LEFT JOIN with an OR, not a swap: an agent
+// appears if either source says it belongs, and each row carries `via` so the
+// caller can tell which — an edge labelled with why it exists.
+//
+// Ruled by Athena, 2026-09-01: "land P1 ALONE and FIRST ... resolve via the
+// memberships join (union home squad)."
 const toolPeers: ToolSpec = {
   name: 'peers',
   scope: 'squad roster (read-only)',
@@ -3654,6 +3680,7 @@ const toolPeers: ToolSpec = {
 
     const rows = await env.DB.prepare(
       `SELECT a.id, a.squad_id, a.slug, a.name, a.role, a.model, a.status, a.created_at,
+              mem.capability AS membership_capability,
               (SELECT p.source FROM presence p
                 WHERE p.tenant = ?2 AND p.agent_id = a.id
                 ORDER BY p.last_seen_at DESC LIMIT 1) AS presence_source,
@@ -3664,7 +3691,10 @@ const toolPeers: ToolSpec = {
                 WHERE p.tenant = ?2 AND p.agent_id = a.id
                 ORDER BY p.last_seen_at DESC LIMIT 1) AS presence_last_seen_at
          FROM agents a
-        WHERE a.squad_id = ?1
+         LEFT JOIN memberships mem
+                ON mem.agent_id = a.id
+               AND mem.squad_id = ?1
+        WHERE mem.agent_id IS NOT NULL OR a.squad_id = ?1
         ORDER BY a.slug ASC
         LIMIT ?3`,
     )
@@ -3674,6 +3704,13 @@ const toolPeers: ToolSpec = {
     const nowMs = Date.now()
     const peers = (rows.results ?? []).map((row) => {
       const lastSeenMs = sqliteUtcToMs(row.presence_last_seen_at)
+      // Label the edge with why it exists. A caller debugging "why can that
+      // agent see this squad" needs the reason, not just the membership.
+      const via: string[] = []
+      if (row.membership_capability !== null && row.membership_capability !== undefined) {
+        via.push('membership')
+      }
+      if (row.squad_id === squadRes.squad.id) via.push('home_squad')
       return {
         id: row.id,
         slug: row.slug,
@@ -3683,6 +3720,8 @@ const toolPeers: ToolSpec = {
         status: row.status,
         squad_id: row.squad_id,
         is_self: auth.boundAgentId === row.id,
+        via,
+        membership_capability: row.membership_capability ?? null,
         presence: {
           source: row.presence_source ?? null,
           label: row.presence_label ?? '',
