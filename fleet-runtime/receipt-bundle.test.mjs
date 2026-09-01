@@ -1117,6 +1117,29 @@ test('historical unbound bundle remains valid without release fields', async () 
   assert.equal(checkBundleManifest({ outDir }).status, 'pass')
 })
 
+test('construction without release SHA rejects bound probe evidence', async (t) => {
+  for (const [name, seedProbes] of [
+    ['bound-only set', (outDir) => {
+      writeJson(join(outDir, 'probe-start.json'), boundProbeReceipt('pass', 'start'))
+    }],
+    ['mixed set', (outDir) => {
+      writeJson(join(outDir, 'probe-stop.json'), boundProbeReceipt('pass', 'stop'))
+    }],
+  ]) {
+    await t.test(name, async () => {
+      const outDir = tmpDir()
+      seedCutoverEvidence(outDir)
+      seedProbes(outDir)
+      const bundle = await buildBundle({ outDir, agents: ['agent-one'], verifyOnly: true })
+
+      assert.equal(bundle.status, 'fail')
+      assert.ok(bundle.checks.some((check) =>
+        check.check === 'probe_release_sha_matches_bundle' && check.ok === false
+      ))
+    })
+  }
+})
+
 test('release-bound build refuses lifecycle control evidence bound only to a hidden historical probe', async () => {
   const { bundle } = await buildHiddenHistoricalProbeBundle()
 

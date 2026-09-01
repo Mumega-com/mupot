@@ -2970,7 +2970,7 @@ function checkBundleManifest(opts = {}) {
     for (const record of probeValidation.records) {
       if (!manifestReleaseDeclared && !record.releaseBound) continue
       checks.push({
-        ok: record.valid,
+        ok: probeValidation.allValid && record.valid,
         component: 'receipt-bundle-check',
         check: 'probe_release_sha_matches_manifest',
         artifact: declaredProbeRecords.find((candidate) => candidate.checkedPath === record.path)?.label ?? null,
@@ -4537,7 +4537,7 @@ async function buildBundle(opts) {
     artifacts.probes.map((probe) => probe?.path).filter(Boolean),
     opts.releaseSha || null,
   )
-  if (opts.releaseSha) {
+  if (opts.releaseSha || !probeValidation.allValid) {
     for (const record of probeValidation.records) {
       checks.push({
         ok: record.valid,
