@@ -26,16 +26,51 @@ grok-cli's TUI ([OpenTUI](https://github.com/sst/opentui)) runs in a terminal, a
 Codex CLI before it — the most reliable way to hand it a message from outside is to type
 into the pane it is actually running in. So the receive path is a **polling daemon**, not a
 hook: it peeks the seat's mupot inbox, spools each message to disk (mode 0600) *before*
-touching the terminal, types a bounded preview into the target `tmux` pane with
-`request_id` / `in_reply_to` preserved, confirms the paste actually landed (by capturing the
-pane and looking for a per-message delivery marker), and **only then** consumes the batch
-from mupot. A crash, a killed process, or a dead pane between "typed" and "confirmed" never
-loses the message — the worst case is a spooled duplicate on disk, never a hole. See the
-long comment block at the top of the script for the exact ordering and why each step exists.
+touching the terminal, delivers a bounded preview into the target pane with `request_id` /
+`in_reply_to` preserved, confirms the delivery actually landed (by reading the pane back and
+looking for a per-message delivery marker), and **only then** consumes the batch from mupot.
+A crash, a killed process, or a dead pane between "delivered" and "confirmed" never loses the
+message — the worst case is a spooled duplicate on disk, never a hole. See the long comment
+block at the top of the script for the exact ordering and why each step exists.
 
 ```
-peek → spool → deliver (type + confirm) → consume
+peek → spool → deliver (type/prompt + confirm) → consume
 ```
+
+### Delivery mechanism: herdr (default) or tmux (opt-in only)
+
+**On a herdr host, tmux delivery cannot work, and this is not a corner case for this estate —
+it is the normal case.** The Hetzner production host has no tmux server running at all;
+herdr owns every pane over its own socket (`~/.config/herdr/herdr.sock`), and Hadi's Mac is
+herdr too. A watcher launched with tmux delivery on either of those peeks its inbox
+correctly, spools correctly, and then fails every `tmux send-keys` call with
+`tmux_send_failed` — mupot delivered the mail, the connector saw it, and it still never
+reaches the agent, because there is no tmux process to send into. That is exactly the
+incident this default exists to prevent: eight real messages sat `peeked` but undelivered
+against a tmux target that could never have worked on this host.
+
+`GROK_DELIVERY` (env) / `--delivery` (install.sh) therefore **defaults to `herdr`**. `tmux`
+remains fully supported — `deliverToTmux` is unchanged — as an explicit opt-in for a host
+that genuinely runs a tmux server, but it is the exception, never the default a forgotten
+flag falls back to. The mechanism is always resolved explicitly
+(`resolveDeliveryMechanism`) and **never inferred** from what happens to be installed or
+reachable: an unrecognized `GROK_DELIVERY` value refuses to start rather than silently
+picking whichever mechanism looks available.
+
+Both mechanisms share the identical contract and discipline: spool before any subprocess
+call, deliver a bounded preview carrying a per-message marker, then **prove** delivery by
+reading the target back and confirming the marker actually landed — never trust the
+delivery command's own exit code as proof. An unconfirmed delivery, under either mechanism,
+returns `ok:false` and the caller (`runCycle`) never consumes the batch. herdr delivery uses
+`herdr agent prompt <target> <text>` to submit and `herdr agent read <target> --source
+recent` to confirm, in place of tmux's `send-keys` / `capture-pane`.
+
+| variable | mechanism | default | notes |
+|---|---|---|---|
+| `GROK_DELIVERY` | both | `herdr` | `herdr` or `tmux` — selected explicitly, never inferred |
+| `HERDR_TARGET` | herdr | `= GROK_SEAT` | the herdr agent name prompts are delivered into (usually the seat, not assumed to be) |
+| `HERDR_BIN` | herdr | `herdr` | resolved to an absolute path by `install.sh` (a systemd unit's PATH may not include `~/.local/bin`) |
+| `TMUX_SESSION` | tmux | `= GROK_SEAT` | the pane grok-cli's TUI is actually running in |
 
 ### A note on grok-cli's own hooks system
 
@@ -67,7 +102,10 @@ refuses to guess. `GROK_SEAT` and `GROK_AGENT_ID` have no default at all:
 | `GROK_SEAT` | **yes** | — | this body's seat label; also selects the default token path |
 | `GROK_AGENT_ID` | **yes** | — | the agent id the token MUST resolve to (`boot_context.bound_agent_id`) |
 | `GROK_TOKEN_FILE` | no | `~/.fleet/agents/<GROK_SEAT>-agent-bound.token` | must be **agent-bound**, not an operator token |
-| `TMUX_SESSION` | no | `= GROK_SEAT` | the pane grok-cli's TUI is actually running in |
+| `GROK_DELIVERY` | no | `herdr` | `herdr` (this estate's default, no tmux server exists) or `tmux` (explicit opt-in) — see [Delivery mechanism](#delivery-mechanism-herdr-default-or-tmux-opt-in-only) above |
+| `HERDR_TARGET` | no | `= GROK_SEAT` | herdr only — the herdr agent name prompts land in |
+| `HERDR_BIN` | no | `herdr` | herdr only — resolved to an absolute path by `install.sh` |
+| `TMUX_SESSION` | no | `= GROK_SEAT` | tmux only — the pane grok-cli's TUI is actually running in |
 | `MUPOT_MCP` | no | `https://mupot.mumega.com/mcp` | |
 | `INTERVAL_SEC` | no | `30` (clamped 5–60) | |
 | `GROK_INBOX_LOCK_FILE` | no | `~/.fleet/locks/grok-inbox-watch-<seat>.lock` | one drainer per seat |
@@ -103,11 +141,12 @@ agent-scoped, not seat-scoped. See the script's header comment for the full trac
 ./bridge/install.sh --seat muvps_loom --agent-id <bound-agent-id>
 ```
 
-This verifies the credential, the seat, and the agent-id binding against the **live** pot
-(`--self-test`, peeks nothing) before writing anything, then renders one systemd user unit —
-`~/.config/systemd/user/grok-inbox-watch-<seat>.service` — and stops. **It does not enable or
-start the unit.** Turning a receive path on for a live seat is an operator decision, made by
-whoever owns that seat, at a moment they choose:
+Delivery defaults to `herdr` — the command above is complete for any herdr host (which is
+this whole estate today). This verifies the credential, the seat, and the agent-id binding
+against the **live** pot (`--self-test`, peeks nothing) before writing anything, then renders
+one systemd user unit — `~/.config/systemd/user/grok-inbox-watch-<seat>.service` — and stops.
+**It does not enable or start the unit.** Turning a receive path on for a live seat is an
+operator decision, made by whoever owns that seat, at a moment they choose:
 
 ```bash
 systemctl --user daemon-reload
@@ -118,7 +157,8 @@ journalctl --user -u grok-inbox-watch-<seat>.service -f
 ```bash
 ./bridge/install.sh --seat <seat> --agent-id <id> --dry-run           # verify only, write nothing
 ./bridge/install.sh --seat <seat> --agent-id <id> --token-file <path> # non-standard token layout
-./bridge/install.sh --seat <seat> --agent-id <id> --tmux-session grok:1
+./bridge/install.sh --seat <seat> --agent-id <id> --herdr-target <name>          # if the herdr agent name differs from --seat
+./bridge/install.sh --seat <seat> --agent-id <id> --delivery tmux --tmux-session grok:1  # explicit opt-in, unusual host only
 ./bridge/install.sh --uninstall --seat <seat>                         # remove the unit file
 ```
 

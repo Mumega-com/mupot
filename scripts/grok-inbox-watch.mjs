@@ -59,19 +59,40 @@
 //   node scripts/grok-inbox-watch.mjs --once       # single cycle (canary / systemd oneshot)
 //   node scripts/grok-inbox-watch.mjs --self-test   # prove credential + seat, consume nothing
 //
+// DELIVERY MECHANISM (mupot#1258 herdr follow-up)
+//
+// This estate runs on herdr — the Hetzner host has no tmux server at all
+// (herdr owns the panes over its own socket, ~/.config/herdr/herdr.sock) and
+// Hadi's Mac is herdr too. GROK_DELIVERY therefore defaults to 'herdr', not
+// 'tmux'. tmux delivery (deliverToTmux) still exists and is a valid explicit
+// choice for the unusual host that genuinely runs a tmux server, but it is
+// the exception, never the peer — a default that must be set correctly on
+// every install is exactly the kind of thing that gets forgotten on the
+// fifth seat at 2am. The mechanism is ALWAYS resolved explicitly
+// (resolveDeliveryMechanism) and never inferred from what happens to be
+// installed: an unrecognized GROK_DELIVERY value refuses to start rather
+// than silently falling back to whichever mechanism looks reachable.
+//
 // Env (all required unless noted):
 //   MUPOT_MCP                default https://mupot.mumega.com/mcp
 //   GROK_SEAT                required — this body's seat label, e.g. muvps_loom
 //   GROK_TOKEN_FILE           default ~/.fleet/agents/<GROK_SEAT>-agent-bound.token
 //   GROK_AGENT_ID             required — the agent id this token MUST resolve to
-//   TMUX_SESSION              default = GROK_SEAT — the pane grok-cli's TUI runs in
+//   GROK_DELIVERY             default 'herdr' — 'herdr' (default, this estate has no tmux
+//                             server) or 'tmux' (explicit opt-in on a host that has one)
+//   HERDR_TARGET              default = GROK_SEAT — the herdr agent name prompts land in
+//                             (usually equal to the seat, but not assumed to be)
+//   HERDR_BIN                 default 'herdr' (resolved to an absolute path by install.sh,
+//                             since a systemd user unit's PATH may not include ~/.local/bin)
+//   TMUX_SESSION              default = GROK_SEAT — the pane grok-cli's TUI runs in (tmux only)
 //   INTERVAL_SEC              default 30  (clamped 5..60)
 //   GROK_INBOX_LOCK_FILE      default ~/.fleet/locks/grok-inbox-watch-<seat>.lock
 //   GROK_INBOX_SPOOL_DIR      default ~/.fleet/inbox-spool/grok-<seat>
-//   TMUX_DELIVERY_TIMEOUT_MS  default 5000, clamped to 100..15000
-//   TMUX_PREVIEW_MAX_CHARS    default 1000, clamped to 320..2000
-//   TMUX_CONFIRM_ATTEMPTS     default 3, clamped to 1..5
-//   TMUX_ENTER_DELAY_MS       default payload-scaled 250..2500
+//   TMUX_DELIVERY_TIMEOUT_MS  default 5000, clamped to 100..15000 (shared by herdr delivery)
+//   TMUX_PREVIEW_MAX_CHARS    default 1000, clamped to 320..2000 (shared by herdr delivery)
+//   TMUX_CONFIRM_ATTEMPTS     default 3, clamped to 1..5 (shared by herdr delivery)
+//   TMUX_ENTER_DELAY_MS       default payload-scaled 250..2500 (tmux only)
+//   HERDR_CONFIRM_DELAY_MS    default payload-scaled 250..2500 (herdr only)
 
 import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -105,6 +126,14 @@ const SEAT = typeof process.env.GROK_SEAT === 'string' ? process.env.GROK_SEAT.t
 const EXPECTED_AGENT_ID = typeof process.env.GROK_AGENT_ID === 'string' ? process.env.GROK_AGENT_ID.trim() : ''
 const TOKEN_FILE = process.env.GROK_TOKEN_FILE || defaultTokenFilePath(SEAT)
 const TMUX_SESSION = process.env.TMUX_SESSION || SEAT
+// herdr is the default delivery mechanism (this estate has no tmux server —
+// see the DELIVERY MECHANISM header note); tmux is an explicit opt-in only.
+const DELIVERY_MECHANISMS = new Set(['herdr', 'tmux'])
+const GROK_DELIVERY = typeof process.env.GROK_DELIVERY === 'string' && process.env.GROK_DELIVERY.trim()
+  ? process.env.GROK_DELIVERY.trim()
+  : 'herdr'
+const HERDR_TARGET = process.env.HERDR_TARGET || SEAT
+const HERDR_BIN = process.env.HERDR_BIN || 'herdr'
 const LOCK_FILE = process.env.GROK_INBOX_LOCK_FILE || defaultLockFilePath(SEAT)
 const INTERVAL_SEC = Math.min(60, Math.max(5, Number(process.env.INTERVAL_SEC || 30) || 30))
 const TMUX_DELIVERY_TIMEOUT_MS = Math.min(15_000, Math.max(100, Number(process.env.TMUX_DELIVERY_TIMEOUT_MS || 5_000) || 5_000))
@@ -129,6 +158,7 @@ const TERMINAL_REASONS = new Set([
   'fence_mode_missing',
   'invalid_fence_mode',
   'consumer_fenced',
+  'invalid_delivery_mechanism',
 ])
 
 // A REVOKED/expired token doesn't surface as a returned {ok:false, reason}
@@ -173,6 +203,23 @@ export function checkRequiredConfig(overrides = {}) {
     return { ok: false, reason: 'missing_config', missing }
   }
   return { ok: true }
+}
+
+/**
+ * Delivery mechanism is SELECTED, never inferred. herdr is the default (this
+ * estate has no tmux server on the Hetzner host or Hadi's Mac — see the
+ * DELIVERY MECHANISM header note); tmux remains available as an explicit
+ * opt-in for a host that genuinely runs one. An unrecognized value refuses
+ * rather than silently picking whichever mechanism happens to look
+ * reachable — that silent-fallback shape is exactly what let 8 messages sit
+ * undelivered against a tmux target that could never have worked here.
+ */
+export function resolveDeliveryMechanism(overrides = {}) {
+  const mechanism = overrides.mechanism ?? GROK_DELIVERY
+  if (!DELIVERY_MECHANISMS.has(mechanism)) {
+    return { ok: false, reason: 'invalid_delivery_mechanism', mechanism }
+  }
+  return { ok: true, mechanism }
 }
 
 function readToken() {
@@ -281,7 +328,13 @@ export function formatBoundedTmuxPreview(message, spoolPath, maxChars = TMUX_PRE
   return `${fixed}${body}`.slice(0, cap)
 }
 
-function tmuxFailure(result, failed, timedOut) {
+// Generic spawnSync-result classifier — shared by both delivery mechanisms
+// (tmux and herdr), not tmux-specific despite the historical call sites
+// below. A missing binary (spawnSync ENOENT) or a non-zero exit both land
+// in the `failed` branch with the subprocess's own stderr/error message as
+// detail — the same "fail loudly, never silently pick a different
+// mechanism" behavior for a missing herdr binary as for a missing tmux one.
+function subprocessFailure(result, failed, timedOut) {
   if (result?.error?.code === 'ETIMEDOUT' || result?.signal === 'SIGTERM') {
     return { ok: false, reason: timedOut, detail: result?.error?.message || 'timed out' }
   }
@@ -306,7 +359,7 @@ export function deliverToTmux(_text, message, opts = {}) {
   const commandOpts = { encoding: 'utf8', timeout: timeoutMs }
   const type = spawn('tmux', ['send-keys', '-t', tmuxSession, '-l', preview], commandOpts)
   if (type.status !== 0) {
-    return tmuxFailure(type, 'tmux_send_failed', 'tmux_send_timeout')
+    return subprocessFailure(type, 'tmux_send_failed', 'tmux_send_timeout')
   }
   // grok-cli, like cursor-agent before it, can swallow Enter while still
   // ingesting a paste (the live Athena fix on kasra's watcher, ac6cc29). The
@@ -319,12 +372,12 @@ export function deliverToTmux(_text, message, opts = {}) {
     : Math.min(2_500, 250 + Math.floor(preview.length / 40))
   const settle = spawn('sleep', [String(settleMs / 1_000)], commandOpts)
   if (settle.status !== 0) {
-    return tmuxFailure(settle, 'tmux_settle_failed', 'tmux_settle_timeout')
+    return subprocessFailure(settle, 'tmux_settle_failed', 'tmux_settle_timeout')
   }
   // Enter as a separate key so multiline bodies stay literal under -l.
   const enter = spawn('tmux', ['send-keys', '-t', tmuxSession, 'Enter'], commandOpts)
   if (enter.status !== 0) {
-    return tmuxFailure(enter, 'tmux_enter_failed', 'tmux_enter_timeout')
+    return subprocessFailure(enter, 'tmux_enter_failed', 'tmux_enter_timeout')
   }
   for (let attempt = 0; attempt < confirmAttempts; attempt += 1) {
     const pane = spawn('tmux', ['capture-pane', '-pt', tmuxSession, '-S', '-80'], commandOpts)
@@ -332,10 +385,75 @@ export function deliverToTmux(_text, message, opts = {}) {
       return { ok: true, spool_path: spoolPath, marker }
     }
     if (pane.status !== 0 && (pane?.error?.code === 'ETIMEDOUT' || pane?.signal === 'SIGTERM')) {
-      return tmuxFailure(pane, 'tmux_confirm_failed', 'tmux_confirm_timeout')
+      return subprocessFailure(pane, 'tmux_confirm_failed', 'tmux_confirm_timeout')
     }
   }
   return { ok: false, reason: 'tmux_delivery_unconfirmed', spool_path: spoolPath, marker }
+}
+
+/**
+ * herdr delivery — the DEFAULT mechanism (see the DELIVERY MECHANISM header
+ * note; this estate has no tmux server). Identical contract to
+ * deliverToTmux: spool BEFORE any subprocess call, submit the bounded
+ * preview via `herdr agent prompt <target> <text>`, give it the same
+ * payload-scaled settle window deliverToTmux gives a swallowed Enter, then
+ * PROVE delivery by reading the pane back (`herdr agent read`) and looking
+ * for the same per-message marker deliverToTmux confirms with
+ * capture-pane — never trust the prompt call's own success/exit code as
+ * proof the text actually landed in the agent's transcript. An unconfirmed
+ * delivery returns `ok:false` with the same shape deliverToTmux uses, which
+ * is what makes runCycle's existing "never consume what wasn't confirmed
+ * delivered" logic apply unchanged.
+ */
+export function deliverViaHerdr(_text, message, opts = {}) {
+  const spawn = opts.spawn ?? spawnSync
+  const timeoutMs = Math.min(15_000, Math.max(100, Number(opts.timeoutMs ?? TMUX_DELIVERY_TIMEOUT_MS) || TMUX_DELIVERY_TIMEOUT_MS))
+  const previewMaxChars = opts.previewMaxChars ?? TMUX_PREVIEW_MAX_CHARS
+  const confirmAttempts = Math.min(5, Math.max(1, Number(opts.confirmAttempts ?? TMUX_CONFIRM_ATTEMPTS) || TMUX_CONFIRM_ATTEMPTS))
+  const herdrTarget = opts.herdrTarget ?? HERDR_TARGET
+  const herdrBin = opts.herdrBin ?? HERDR_BIN
+  const spool = opts.spoolMessage ?? ((value) => spoolMessage(value, opts))
+  let spoolPath
+  try {
+    spoolPath = spool(message)
+  } catch (error) {
+    return { ok: false, reason: 'message_spool_failed', detail: error instanceof Error ? error.message : String(error) }
+  }
+  const preview = formatBoundedTmuxPreview(message, spoolPath, previewMaxChars)
+  const marker = deliveryMarker(message)
+  const commandOpts = { encoding: 'utf8', timeout: timeoutMs }
+
+  const prompt = spawn(herdrBin, ['agent', 'prompt', herdrTarget, preview], commandOpts)
+  if (prompt.status !== 0) {
+    // Covers both a non-zero herdr exit AND a missing binary (spawnSync
+    // ENOENT) — either way this fails loudly here, it never falls back to
+    // deliverToTmux. See subprocessFailure's comment.
+    return subprocessFailure(prompt, 'herdr_prompt_failed', 'herdr_prompt_timeout')
+  }
+
+  // Mirrors deliverToTmux's settle delay: a prompt submission can return
+  // before the agent has actually ingested the text into its own
+  // transcript, so give the same payload-scaled window before the first
+  // read-back attempt.
+  const requestedDelay = Number(opts.confirmDelayMs ?? process.env.HERDR_CONFIRM_DELAY_MS)
+  const settleMs = Number.isFinite(requestedDelay) && requestedDelay > 0
+    ? Math.min(2_500, Math.max(0, requestedDelay))
+    : Math.min(2_500, 250 + Math.floor(preview.length / 40))
+  const settle = spawn('sleep', [String(settleMs / 1_000)], commandOpts)
+  if (settle.status !== 0) {
+    return subprocessFailure(settle, 'herdr_settle_failed', 'herdr_settle_timeout')
+  }
+
+  for (let attempt = 0; attempt < confirmAttempts; attempt += 1) {
+    const read = spawn(herdrBin, ['agent', 'read', herdrTarget, '--source', 'recent'], commandOpts)
+    if (read.status === 0 && typeof read.stdout === 'string' && read.stdout.includes(marker)) {
+      return { ok: true, spool_path: spoolPath, marker }
+    }
+    if (read.status !== 0 && (read?.error?.code === 'ETIMEDOUT' || read?.signal === 'SIGTERM')) {
+      return subprocessFailure(read, 'herdr_confirm_failed', 'herdr_confirm_timeout')
+    }
+  }
+  return { ok: false, reason: 'herdr_delivery_unconfirmed', spool_path: spoolPath, marker }
 }
 
 export async function runCycle(opts = {}) {
@@ -351,9 +469,24 @@ export async function runCycle(opts = {}) {
     log('config_refuse', config)
     return { ok: false, reason: config.reason, missing: config.missing, consumed: 0, delivered: 0 }
   }
+  // Mechanism is resolved explicitly, before anything delivery-related runs
+  // — never inferred from what happens to be reachable. opts.deliverToTmux,
+  // if injected, overrides mechanism selection entirely (existing tests use
+  // this as a generic "use this delivery function" hook, predating the
+  // mechanism concept); opts.deliverViaHerdr is the equivalent injection
+  // point for herdr-specific tests.
+  const mechanism = opts.resolveDeliveryMechanism
+    ? opts.resolveDeliveryMechanism()
+    : resolveDeliveryMechanism({ mechanism: opts.deliveryMechanism })
+  if (!mechanism.ok) {
+    log('config_refuse', mechanism)
+    return { ok: false, reason: mechanism.reason, consumed: 0, delivered: 0 }
+  }
   const token = opts.token ?? readToken()
   const mcp = opts.mcpCall ?? mcpCall
-  const deliver = opts.deliverToTmux ?? deliverToTmux
+  const deliver = opts.deliverToTmux ?? (mechanism.mechanism === 'herdr'
+    ? (opts.deliverViaHerdr ?? deliverViaHerdr)
+    : deliverToTmux)
 
   // seat passed here (not omitted, per the header note) so boot_context's
   // presence/label bookkeeping reflects which body actually opened it.
@@ -543,6 +676,19 @@ export async function main(opts = {}) {
     return
   }
 
+  // Delivery mechanism resolved and validated at preflight too, same
+  // reasoning as configCheck: an invalid GROK_DELIVERY value can never
+  // self-heal by retrying, and must not be allowed to take the singleton
+  // lock before failing.
+  const mechanismCheck = opts.resolveDeliveryMechanism
+    ? opts.resolveDeliveryMechanism()
+    : resolveDeliveryMechanism({ mechanism: opts.deliveryMechanism })
+  if (!mechanismCheck.ok) {
+    log('config_refuse_preflight', mechanismCheck)
+    exit(1)
+    return
+  }
+
   // Validate identity/token AND the consumer fence BEFORE taking the
   // singleton lock (mirrors codex-inbox-watch.mjs's #540 fix, two rounds of
   // adversarial review there). A watcher launched with a wrong/expired
@@ -613,6 +759,8 @@ export async function main(opts = {}) {
     mcp: MUPOT_MCP,
     seat,
     agent_id: expectedAgentId,
+    delivery: mechanismCheck.mechanism,
+    herdr_target: opts.herdrTarget ?? HERDR_TARGET,
     tmux_session: opts.tmuxSession ?? TMUX_SESSION,
     interval_sec: INTERVAL_SEC,
     once: ONCE,

@@ -12,8 +12,10 @@ import {
   defaultSpoolDir,
   defaultTokenFilePath,
   deliverToTmux,
+  deliverViaHerdr,
   deliveryMarker,
   main,
+  resolveDeliveryMechanism,
   runCycle,
   selfTest,
   spoolMessage,
@@ -505,5 +507,253 @@ test('main() releases and exits when a cycle THROWS an HTTP 401 mid-loop (revoke
     sleep: neverCalled('sleep'),
   })
   assert.equal(released, true, 'must release the lock rather than hold it forever')
+  assert.deepEqual(exits, [1])
+})
+
+// ── delivery mechanism: herdr is the DEFAULT, never inferred (herdr follow-up to mupot#1258) ──
+//
+// This estate has no tmux server (the Hetzner host and Hadi's Mac are both
+// herdr-owned panes), so GROK_DELIVERY defaults to 'herdr'. tmux remains an
+// explicit opt-in. These tests cover: the default, explicit selection,
+// refusing an unrecognized value (never silently falling back), herdr
+// delivery succeeding only once genuinely confirmed, an unconfirmed herdr
+// delivery consuming nothing, and a missing/failing herdr binary failing
+// loudly rather than falling back to tmux.
+
+test('resolveDeliveryMechanism defaults to herdr with no override and no env set', () => {
+  const result = resolveDeliveryMechanism({})
+  assert.equal(result.ok, true)
+  assert.equal(result.mechanism, 'herdr')
+})
+
+test('resolveDeliveryMechanism accepts an explicit tmux opt-in', () => {
+  const result = resolveDeliveryMechanism({ mechanism: 'tmux' })
+  assert.equal(result.ok, true)
+  assert.equal(result.mechanism, 'tmux')
+})
+
+test('resolveDeliveryMechanism refuses an unrecognized value rather than guessing', () => {
+  const result = resolveDeliveryMechanism({ mechanism: 'ssh' })
+  assert.equal(result.ok, false)
+  assert.equal(result.reason, 'invalid_delivery_mechanism')
+  assert.equal(result.mechanism, 'ssh')
+})
+
+test('deliverViaHerdr spools BEFORE any herdr command runs, and confirms via herdr agent read', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'grok-spool-'))
+  try {
+    const calls = []
+    const result = deliverViaHerdr('', REQUEST, {
+      spoolDir: dir,
+      herdrTarget: 'muvps_loom',
+      herdrBin: 'herdr',
+      spawn: (command, args) => {
+        calls.push({ command, args })
+        if (command === 'herdr' && args[0] === 'agent' && args[1] === 'prompt') {
+          // spool must already be on disk by the time the prompt is submitted
+          assert.equal(statSync(dir).isDirectory(), true)
+          assert.equal(args[2], 'muvps_loom', 'prompt must target the configured herdr target')
+          return { status: 0, stdout: '' }
+        }
+        if (command === 'sleep') return { status: 0, stdout: '' }
+        if (command === 'herdr' && args[0] === 'agent' && args[1] === 'read') {
+          assert.equal(args[2], 'muvps_loom')
+          return { status: 0, stdout: `some pane text ${deliveryMarker(REQUEST)} more text` }
+        }
+        throw new Error(`unexpected spawn: ${command} ${JSON.stringify(args)}`)
+      },
+    })
+    assert.equal(result.ok, true)
+    assert.equal(result.marker, deliveryMarker(REQUEST))
+    assert.ok(result.spool_path)
+    assert.equal(calls[0].command, 'herdr', 'first subprocess call must be the herdr prompt, after the spool write')
+    assert.equal(calls[0].args[1], 'prompt')
+    assert.ok(calls.every((c) => c.command !== 'tmux'), 'herdr delivery must never shell out to tmux')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('an unconfirmed herdr delivery returns ok:false and does not fabricate a marker match', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'grok-spool-'))
+  try {
+    const result = deliverViaHerdr('', REQUEST, {
+      spoolDir: dir,
+      confirmAttempts: 2,
+      spawn: (command, args) => {
+        if (command === 'herdr' && args[1] === 'prompt') return { status: 0, stdout: '' }
+        if (command === 'sleep') return { status: 0, stdout: '' }
+        if (command === 'herdr' && args[1] === 'read') return { status: 0, stdout: 'pane has no marker in it' }
+        throw new Error(`unexpected spawn: ${command}`)
+      },
+    })
+    assert.equal(result.ok, false)
+    assert.equal(result.reason, 'herdr_delivery_unconfirmed')
+    assert.ok(result.spool_path, 'the spooled copy still exists even though delivery was never confirmed')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a herdr binary that is missing fails loudly (ok:false) rather than falling back to tmux', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'grok-spool-'))
+  try {
+    const calls = []
+    const result = deliverViaHerdr('', REQUEST, {
+      spoolDir: dir,
+      spawn: (command) => {
+        calls.push(command)
+        // Simulate Node's own spawnSync ENOENT shape for a missing binary.
+        return { status: null, signal: null, error: { code: 'ENOENT', message: 'spawn herdr ENOENT' }, stdout: '', stderr: '' }
+      },
+    })
+    assert.equal(result.ok, false)
+    assert.equal(result.reason, 'herdr_prompt_failed')
+    assert.match(result.detail, /ENOENT/)
+    assert.deepEqual(calls, ['herdr'], 'must fail on the herdr call itself, never attempt a tmux command')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a herdr binary that exits non-zero fails loudly with its own stderr as detail', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'grok-spool-'))
+  try {
+    const result = deliverViaHerdr('', REQUEST, {
+      spoolDir: dir,
+      spawn: () => ({ status: 1, signal: null, stdout: '', stderr: 'herdr: agent muvps_loom not found' }),
+    })
+    assert.equal(result.ok, false)
+    assert.equal(result.reason, 'herdr_prompt_failed')
+    assert.match(result.detail, /not found/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('runCycle uses herdr by default (no GROK_DELIVERY set, no mechanism override) and never touches deliverToTmux', async () => {
+  let herdrCalled = false
+  const mcpCall = async (_token, name, args) => {
+    if (name === 'boot_context') return { bound_agent_id: AGENT }
+    if (name === 'inbox_consumer_status') return { mode: 'bearer_only' }
+    if (name === 'inbox' && args.peek === true) return { messages: [REQUEST], remaining: 0 }
+    if (name === 'inbox' && args.peek === false) return { messages: [REQUEST], remaining: 0 }
+    throw new Error(`unexpected ${name}`)
+  }
+
+  const result = await runCycle({
+    seat: SEAT,
+    expectedAgentId: AGENT,
+    token: 'test-token-not-real',
+    mcpCall,
+    // deliberately NOT injecting deliverToTmux — proves the default path
+    // (no explicit mechanism override, no GROK_DELIVERY env) selects herdr.
+    deliverViaHerdr: (_text, message) => {
+      herdrCalled = true
+      return { ok: true, spool_path: '/tmp/whatever', marker: deliveryMarker(message) }
+    },
+  })
+
+  assert.equal(herdrCalled, true, 'the default mechanism must be herdr')
+  assert.equal(result.ok, true)
+  assert.equal(result.consumed, 1)
+  assert.equal(result.delivered, 1)
+})
+
+test('runCycle refuses consume when herdr delivery is unconfirmed (no silent drop)', async () => {
+  let consumed = false
+  const mcpCall = async (_token, name, args) => {
+    if (name === 'boot_context') return { bound_agent_id: AGENT }
+    if (name === 'inbox_consumer_status') return { mode: 'bearer_only' }
+    if (name === 'inbox' && args.peek === true) return { messages: [REQUEST], remaining: 0 }
+    if (name === 'inbox' && args.peek === false) {
+      consumed = true
+      return { messages: [REQUEST], remaining: 0 }
+    }
+    throw new Error(`unexpected ${name}`)
+  }
+
+  const result = await runCycle({
+    seat: SEAT,
+    expectedAgentId: AGENT,
+    token: 'test-token-not-real',
+    mcpCall,
+    deliverViaHerdr: () => ({ ok: false, reason: 'herdr_delivery_unconfirmed' }),
+  })
+
+  assert.equal(result.ok, false)
+  assert.equal(result.reason, 'delivery_incomplete')
+  assert.equal(result.consumed, 0)
+  assert.equal(consumed, false, 'an unconfirmed herdr delivery must never reach the consume call')
+})
+
+test('runCycle honors an explicit tmux opt-in via opts.deliveryMechanism (mechanism chosen, not inferred)', async () => {
+  let tmuxUsed = false
+  let herdrCalled = false
+  const mcpCall = async (_token, name, args) => {
+    if (name === 'boot_context') return { bound_agent_id: AGENT }
+    if (name === 'inbox_consumer_status') return { mode: 'bearer_only' }
+    if (name === 'inbox' && args.peek === true) return { messages: [REQUEST], remaining: 0 }
+    if (name === 'inbox' && args.peek === false) return { messages: [REQUEST], remaining: 0 }
+    throw new Error(`unexpected ${name}`)
+  }
+
+  const result = await runCycle({
+    seat: SEAT,
+    expectedAgentId: AGENT,
+    token: 'test-token-not-real',
+    mcpCall,
+    deliveryMechanism: 'tmux',
+    deliverToTmux: (_text, message) => {
+      tmuxUsed = true
+      return { ok: true, spool_path: '/tmp/whatever', marker: deliveryMarker(message) }
+    },
+    deliverViaHerdr: () => {
+      herdrCalled = true
+      return { ok: true }
+    },
+  })
+
+  assert.equal(tmuxUsed, true)
+  assert.equal(herdrCalled, false, 'an explicit tmux opt-in must never fall through to herdr')
+  assert.equal(result.ok, true)
+})
+
+test('runCycle fails loudly on an invalid GROK_DELIVERY value before calling mupot at all', async () => {
+  let mcpCalled = false
+  const result = await runCycle({
+    seat: SEAT,
+    expectedAgentId: AGENT,
+    token: 'test-token-not-real',
+    deliveryMechanism: 'carrier-pigeon',
+    mcpCall: async () => {
+      mcpCalled = true
+      throw new Error('must not be reached')
+    },
+  })
+  assert.equal(result.ok, false)
+  assert.equal(result.reason, 'invalid_delivery_mechanism')
+  assert.equal(result.consumed, 0)
+  assert.equal(result.delivered, 0)
+  assert.equal(mcpCalled, false, 'an invalid mechanism must refuse before any mupot call, never guess a fallback')
+})
+
+test('main() refuses an invalid GROK_DELIVERY value before ever acquiring the lock', async () => {
+  const exits = []
+  let lockAcquired = false
+  await main({
+    seat: SEAT,
+    expectedAgentId: AGENT,
+    deliveryMechanism: 'carrier-pigeon',
+    readTokenFn: () => 'test-token',
+    mcpCall: neverCalled('mcpCall'),
+    acquireLock: async () => {
+      lockAcquired = true
+      return { ok: true, reason: 'lock_acquired', holder_pid: process.pid, release: () => {} }
+    },
+    exit: (code) => exits.push(code),
+    sleep: neverCalled('sleep'),
+  })
+  assert.equal(lockAcquired, false, 'must refuse before ever taking the singleton lock')
   assert.deepEqual(exits, [1])
 })
