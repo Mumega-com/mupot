@@ -89,7 +89,14 @@ function passingEvidence(step: string): Record<string, unknown> {
     case 'failure_reporting':
       return { ops_failure_visible: true, tail_or_log_reference: 'wrangler-tail-error-window-1' }
     case 'final_validation':
-      return { health: true, mcp_health: true, owner_login: true, agent_presence: true, active_validation_git_sha: TARGET_SHA }
+      return {
+        health: true,
+        mcp_health: true,
+        owner_login: true,
+        agent_presence: true,
+        active_validation_git_sha: TARGET_SHA,
+        source_health: sourceHealth(TARGET_SHA),
+      }
     default:
       throw new Error(`unknown step ${step}`)
   }
@@ -330,6 +337,37 @@ describe('staging recovery rehearsal checker', () => {
     }))
   })
 
+  it('rejects bound staging recovery without CLI SHA or final-validation source health', () => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt, step) => {
+      if (step === 'final_validation') {
+        delete (receipt.evidence as Record<string, unknown>).source_health
+      }
+    })
+
+    const result = checkBundle({ outDir: dir })
+    expect(result.status).toBe('fail')
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'source_health_matches_expected_release_sha',
+      step: 'final_validation',
+    }))
+  })
+
+  it('accepts bound staging recovery without CLI SHA when source health matches target git SHA', () => {
+    const dir = tempDir()
+    writeBundle(dir)
+
+    const result = checkBundle({ outDir: dir })
+    expect(result.status).toBe('pass')
+    expect(result.target.git_sha).toBe(TARGET_SHA)
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      ok: true,
+      check: 'source_health_matches_expected_release_sha',
+      step: 'final_validation',
+    }))
+  })
+
   it.each([
     ['missing', MISSING],
     ['null', null],
@@ -444,10 +482,16 @@ describe('staging recovery rehearsal checker', () => {
     }))
   })
 
-  it('keeps a historical staging recovery bundle valid without a requested release SHA', () => {
+  it('keeps a no-CLI staging recovery bundle valid with target-bound source health', () => {
     const dir = tempDir()
     writeBundle(dir)
 
-    expect(checkBundle({ outDir: dir }).status).toBe('pass')
+    const result = checkBundle({ outDir: dir })
+    expect(result.status).toBe('pass')
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      ok: true,
+      check: 'source_health_matches_expected_release_sha',
+      step: 'final_validation',
+    }))
   })
 })

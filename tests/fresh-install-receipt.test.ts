@@ -367,6 +367,35 @@ describe('fresh install receipt checker', () => {
     }))
   })
 
+  it('rejects a bound fresh-install bundle without CLI SHA or designated source health', () => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt) => {
+      receipt.target = { ...(receipt.target as Record<string, unknown>), release_sha: RELEASE_SHA }
+    })
+
+    const result = checkBundle({ outDir: dir })
+    expect(result.status).toBe('fail')
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'source_health_matches_expected_release_sha',
+      step: 'post_setup_validation',
+    }))
+  })
+
+  it('accepts a bound fresh-install bundle without CLI SHA when source health matches', () => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt, file) => bindReleaseReceipt(receipt, file))
+
+    const result = checkBundle({ outDir: dir })
+    expect(result.status).toBe('pass')
+    expect(result.target.release_sha).toBe(RELEASE_SHA)
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      ok: true,
+      check: 'source_health_matches_expected_release_sha',
+      step: 'post_setup_validation',
+    }))
+  })
+
   it.each([
     ['missing', MISSING],
     ['null', null],
@@ -466,5 +495,8 @@ describe('fresh install receipt checker', () => {
 
     expect(receipt.status).toBe('pass')
     expect(receipt.target.release_sha).toBeNull()
+    expect(receipt.checks).not.toContainEqual(expect.objectContaining({
+      check: 'source_health_matches_expected_release_sha',
+    }))
   })
 })

@@ -441,14 +441,17 @@ export function checkBundle(opts = {}) {
     })
   }
   target.release_sha = releaseShaConsistent ? releaseShaValues[0] : null
+  const effectiveReleaseSha = opts.releaseSha || target.release_sha
   if (opts.releaseSha) {
     pushCheck(checks, isCanonicalReleaseSha(opts.releaseSha), 'expected_release_sha_valid', { expected: opts.releaseSha })
     pushCheck(checks, target.release_sha === opts.releaseSha, 'target_release_sha_matches_expected', {
       expected: opts.releaseSha,
       actual: target.release_sha,
     })
+  }
+  if (releaseShaPresent || opts.releaseSha) {
     const sourceReceipt = receipts.find(({ spec }) => spec.step === SOURCE_HEALTH_STEP)
-    const sourceHealth = validateSourceHealth(sourceReceipt?.receipt, opts.releaseSha)
+    const sourceHealth = validateSourceHealth(sourceReceipt?.receipt, effectiveReleaseSha)
     pushCheck(checks, sourceHealth.valid, 'source_health_matches_expected_release_sha', {
       step: SOURCE_HEALTH_STEP,
       path: sourceReceipt?.path ?? join(outDir, 'agent-execution.json'),

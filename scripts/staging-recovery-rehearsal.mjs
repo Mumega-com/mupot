@@ -543,21 +543,22 @@ export function checkBundle(opts = {}) {
     active_validation_git_sha: activeValidationSha || null,
     target_git_sha: target.git_sha,
   })
+  const effectiveReleaseSha = opts.releaseSha || (isCanonicalReleaseSha(target.git_sha) ? target.git_sha : null)
   if (opts.releaseSha) {
     pushCheck(checks, isCanonicalReleaseSha(opts.releaseSha), 'expected_release_sha_valid', { expected: opts.releaseSha })
     pushCheck(checks, target.git_sha === opts.releaseSha, 'target_git_sha_matches_expected_release_sha', {
       expected: opts.releaseSha,
       actual: target.git_sha,
     })
-    const sourceReceipt = receipts.find(({ step }) => step === SOURCE_HEALTH_STEP)
-    const sourceHealth = validateSourceHealth(sourceReceipt?.receipt, opts.releaseSha)
-    pushCheck(checks, sourceHealth.valid, 'source_health_matches_expected_release_sha', {
-      step: SOURCE_HEALTH_STEP,
-      path: sourceReceipt?.path ?? join(outDir, 'final-validation.json'),
-      artifact_sha256: artifacts[SOURCE_HEALTH_STEP]?.sha256 ?? null,
-      source_health: sourceHealth.observed,
-    })
   }
+  const sourceReceipt = receipts.find(({ step }) => step === SOURCE_HEALTH_STEP)
+  const sourceHealth = validateSourceHealth(sourceReceipt?.receipt, effectiveReleaseSha)
+  pushCheck(checks, sourceHealth.valid, 'source_health_matches_expected_release_sha', {
+    step: SOURCE_HEALTH_STEP,
+    path: sourceReceipt?.path ?? join(outDir, 'final-validation.json'),
+    artifact_sha256: artifacts[SOURCE_HEALTH_STEP]?.sha256 ?? null,
+    source_health: sourceHealth.observed,
+  })
 
   const failed = checks.filter((check) => check.ok === false)
   const passed = checks.filter((check) => check.ok === true)
