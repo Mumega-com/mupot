@@ -92,6 +92,7 @@ import {
 import { loadAgentRuntimeStates, type AgentRuntimeState } from '../dashboard/observatory'
 import { buildOrient, renderBrief } from '../orient/service'
 import { mcpEndpoint, canonicalOrigin, requiredCanonicalOrigin } from '../dashboard/connect'
+import { enrollUrl } from '../dashboard/enroll'
 import { classify, humanAge } from '../dashboard/fleet'
 import { resolveAgentRef } from '../org/resolve'
 import {
@@ -3118,9 +3119,14 @@ const toolSend: ToolSpec = {
     required: ['to', 'body'],
     additionalProperties: false,
   },
-  async run(auth, env, args) {
+  async run(auth, env, args, ctx) {
     const fromAgent = auth.boundAgentId
-    if (!fromAgent) return fail(403, 'not_agent_bound', 'send requires an agent-bound token (member_tokens.agent_id)')
+    if (!fromAgent) {
+      return fail(403, 'not_agent_bound', {
+        detail: 'send requires an agent-bound token (member_tokens.agent_id)',
+        enroll_url: enrollUrl(canonicalOrigin(env, ctx.origin), ctx.seat),
+      })
+    }
     const to = str(args.to)
     const body = str(args.body)
     if (!to) return fail(400, 'invalid_args', 'to required')
@@ -3299,13 +3305,14 @@ const toolInbox: ToolSpec = {
   name: 'inbox',
   scope: 'self (the caller agent reads its own inbox)',
   min: 'authenticated',
-  args: '{ limit?: number, peek?: boolean, seat?: string, since_seq?: number (peek only) }',
+  args: '{ limit?: number, peek?: boolean, seat?: string, all_seats?: boolean, since_seq?: number (peek only) }',
   inputSchema: {
     type: 'object',
     properties: {
       limit: OPTIONAL_NUMBER_SCHEMA,
       peek: { type: 'boolean' },
       seat: STRING_SCHEMA,
+      all_seats: { type: 'boolean' },
       since_seq: OPTIONAL_NUMBER_SCHEMA,
     },
     required: [],
@@ -3313,7 +3320,12 @@ const toolInbox: ToolSpec = {
   },
   async run(auth, env, args, ctx) {
     const agent = auth.boundAgentId
-    if (!agent) return fail(403, 'not_agent_bound', 'inbox requires an agent-bound token (member_tokens.agent_id)')
+    if (!agent) {
+      return fail(403, 'not_agent_bound', {
+        detail: 'inbox requires an agent-bound token (member_tokens.agent_id)',
+        enroll_url: enrollUrl(canonicalOrigin(env, ctx.origin), ctx.seat),
+      })
+    }
     let limit: number | undefined
     if (args.limit !== undefined) {
       if (typeof args.limit !== 'number' || !Number.isFinite(args.limit))
@@ -3334,22 +3346,40 @@ const toolInbox: ToolSpec = {
       sinceSeq = rawSinceSeq
     }
 
+    if (args.all_seats !== undefined && typeof args.all_seats !== 'boolean')
+      return fail(400, 'invalid_args', 'all_seats must be a boolean')
+    if (args.all_seats === true && typeof args.seat === 'string')
+      return fail(400, 'invalid_args', 'seat and all_seats are mutually exclusive')
+
     // A harness that declares its seat via the x-mupot-seat header should not also
     // have to pass it on every read — the header already identifies the partition.
-    const seatArg = args.seat ?? ctx.seat
+    // all_seats overrides that default: it is the deliberate whole-mailbox drain, and
+    // the header must not silently narrow a read the caller explicitly widened.
+    const allSeats = args.all_seats === true
+    const seatArg = allSeats ? undefined : (args.seat ?? ctx.seat)
     const res = await readAgentInbox(env, {
       agent,
       limit,
       peek: args.peek === true,
       sinceSeq,
       seat: typeof seatArg === 'string' ? seatArg.trim() : undefined,
+      allSeats,
     })
     if (!res.ok) {
       if (res.reason === 'db_error') return fail(500, res.reason) // no raw DB string to caller
       if (res.reason === 'consumer_fenced') return fail(409, res.reason)
       return fail(400, res.reason, res.detail)
     }
-    return done({ messages: res.messages, remaining: res.remaining, consumed: args.peek !== true })
+    // unread_total/seats are what make a thin read diagnosable: a caller reading its own
+    // seat partition can still see that mail is queued elsewhere, instead of reading an
+    // empty array as an empty mailbox (#0120 isolation without the old invisibility).
+    return done({
+      messages: res.messages,
+      remaining: res.remaining,
+      unread_total: res.unread_total,
+      ...(res.seats ? { seats: res.seats } : {}),
+      consumed: args.peek !== true,
+    })
   },
 }
 
@@ -3372,16 +3402,26 @@ const toolInboxLease: ToolSpec = {
   name: 'inbox_lease',
   scope: 'self (the caller agent leases from its own inbox)',
   min: 'authenticated',
-  args: '{ limit?: number, lease_seconds?: number, seat?: string }',
+  args: '{ limit?: number, lease_seconds?: number, seat?: string, all_seats?: boolean }',
   inputSchema: {
     type: 'object',
-    properties: { limit: OPTIONAL_NUMBER_SCHEMA, lease_seconds: OPTIONAL_NUMBER_SCHEMA, seat: STRING_SCHEMA },
+    properties: {
+      limit: OPTIONAL_NUMBER_SCHEMA,
+      lease_seconds: OPTIONAL_NUMBER_SCHEMA,
+      seat: STRING_SCHEMA,
+      all_seats: { type: 'boolean' },
+    },
     required: [],
     additionalProperties: false,
   },
   async run(auth, env, args, ctx) {
     const agent = auth.boundAgentId
-    if (!agent) return fail(403, 'not_agent_bound', 'inbox_lease requires an agent-bound token (member_tokens.agent_id)')
+    if (!agent) {
+      return fail(403, 'not_agent_bound', {
+        detail: 'inbox_lease requires an agent-bound token (member_tokens.agent_id)',
+        enroll_url: enrollUrl(canonicalOrigin(env, ctx.origin), ctx.seat),
+      })
+    }
     let limit: number | undefined
     if (args.limit !== undefined) {
       if (typeof args.limit !== 'number' || !Number.isFinite(args.limit))
@@ -3397,12 +3437,19 @@ const toolInboxLease: ToolSpec = {
     if (args.seat !== undefined && typeof args.seat !== 'string')
       return fail(400, 'invalid_args', 'seat must be a string')
 
-    const seatArg = args.seat ?? ctx.seat
+    if (args.all_seats !== undefined && typeof args.all_seats !== 'boolean')
+      return fail(400, 'invalid_args', 'all_seats must be a boolean')
+    if (args.all_seats === true && typeof args.seat === 'string')
+      return fail(400, 'invalid_args', 'seat and all_seats are mutually exclusive')
+
+    const allSeats = args.all_seats === true
+    const seatArg = allSeats ? undefined : (args.seat ?? ctx.seat)
     const res = await leaseAgentInbox(env, {
       agent,
       limit,
       leaseSeconds,
       seat: typeof seatArg === 'string' ? seatArg.trim() : undefined,
+      allSeats,
     })
     if (!res.ok) {
       if (res.reason === 'db_error') return fail(500, res.reason) // no raw DB string to caller
@@ -4017,14 +4064,18 @@ const toolBootContext: ToolSpec = {
     // never from client input.
     const isMinted = auth.boundAgentId !== null
     const identityStatus: 'minted' | 'unminted' = isMinted ? 'minted' : 'unminted'
+    const enrollHref = enrollUrl(
+      canonicalOrigin(env, ctx.origin),
+      (str(args.seat) || str(args.label) || ctx?.seat || '').trim() || null,
+    )
 
     // QA-1: every refusal/unminted signal must carry the full map out — no dead ends.
-    // Two paths for an unbound token:
-    //   A) Shared apikey + know your name → call connect { agent_name } (session-local, works now).
-    //   B) Want a permanent weld → ask an admin to call mint_agent_token, then reconnect.
+    // Primary action is the seat-enrollment page (choose or coin a key). The
+    // connect / mint_agent_token paths stay named so existing harnesses and
+    // tests that match those strings still find them.
     const nextStep = isMinted
       ? 'call orient (no args — your token is agent-bound) to receive your full basin-drop packet'
-      : 'if you know your agent slug/id: call connect { agent_name: "<slug>" } to claim your identity now (session-local). For a permanent weld: ask an org-admin to call mint_agent_token for your agent, then reconnect with the minted token.'
+      : `Open ${enrollHref} to choose or coin a seat key. If you know your agent slug/id: call connect { agent_name: "<slug>" } to claim your identity now (session-local). For a permanent weld: ask an org-admin to call mint_agent_token for your agent, then reconnect with the minted token.`
 
     // THE DOOR MUST SAY WHAT IT IS (#712).
     //
@@ -4079,6 +4130,7 @@ const toolBootContext: ToolSpec = {
       identity_status: identityStatus,
       bound_agent_id: auth.boundAgentId ?? null,
       next_step: nextStep,
+      ...(isMinted ? {} : { enroll_url: enrollHref }),
       // Present ONLY on the directory channel — its absence is itself information.
       ...(directoryNote ? { channel_limits: directoryNote } : {}),
     })
@@ -4275,6 +4327,7 @@ const toolConnect: ToolSpec = {
       // member who already held org:owner — the grant would have changed nothing, because
       // the directory door discards grants by construction. Name the real cause and the
       // door that works (mupot#678).
+      const enrollHref = enrollUrl(canonicalOrigin(env, ctx.origin), ctx.seat)
       if (auth.channel === 'directory') {
         return fail(403, 'forbidden', {
           reason: 'directory_channel_zero_capability',
@@ -4290,9 +4343,11 @@ const toolConnect: ToolSpec = {
             // the exact failure this refusal exists to remove. Not hypothetical: six
             // hadi/codex agent records share slugs today. (codex gate, #681.)
             `squad to run mint_agent_token { agent: "${agentRef.id}" }, then connect with that bearer.`,
+            `Open ${enrollHref} to choose or coin a seat key.`,
           ].join(' '),
           need: 'workspace-channel token',
           scope: 'channel',
+          enroll_url: enrollHref,
         })
       }
       return fail(403, 'forbidden', {
@@ -4300,9 +4355,11 @@ const toolConnect: ToolSpec = {
         detail: [
           `Your token does not have member-or-higher capability on the squad for agent "${agentRef.slug}".`,
           'Ask an org-admin to grant you squad membership, or verify you are using the right token.',
+          `Open ${enrollHref} to choose or coin a seat key.`,
         ].join(' '),
         need: 'member',
         scope: 'squad',
+        enroll_url: enrollHref,
       })
     }
 

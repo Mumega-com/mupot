@@ -79,6 +79,15 @@ import { findPreset, isValidPresetId } from '../auth/role-presets'
 
 // Agent-bound token mint UI.
 import { loadAgentTokenView, agentTokenPageBody, agentTokenMintedBody } from './agent-token'
+import {
+  authorizeEnrollMint,
+  enrollClientSnippet,
+  enrollForbiddenBody,
+  enrollMintedBody,
+  enrollPageBody,
+  loadEnrollView,
+  normalizeEnrollSeat,
+} from './enroll'
 import { loadControlCenterView, controlCenterPageBody } from './control-center'
 import { loadJoinPreview, confirmJoin, joinPreviewPageBody, joinConfirmedBody } from './join-agent'
 import { mintAgentBoundToken, isAgentTokenCapability } from '../members/service'
@@ -2040,6 +2049,104 @@ dashboardApp.post('/admin/agent-token/mint', async (c) => {
         minted.raw,
         minted.tokenId,
         minted.grantCapability,
+      ),
+    ),
+  )
+})
+
+// ── seat enrollment (GET /enroll, POST /enroll/mint) ─────────────────────────
+//
+// Seat-aware sibling of /admin/agent-token. A signed-in human picks an agent
+// they may act as (OAuth consent eligibility) and coins a workspace-channel
+// key labelled with this seat. Minting reuses mintAgentBoundToken; the gate
+// is mint_agent_token's (admin on the agent's squad), never a wider one.
+
+dashboardApp.get('/enroll', async (c) => {
+  const auth = c.get('auth')
+  const view = await loadEnrollView(c.env, auth, {
+    seat: c.req.query('seat'),
+    agent: c.req.query('agent'),
+  })
+  return c.html(shell(c.env, 'Enroll seat', enrollPageBody(view)))
+})
+
+dashboardApp.post('/enroll/mint', async (c) => {
+  const auth = c.get('auth')
+  const form = await c.req.parseBody()
+  const agentIdRaw = typeof form.agent_id === 'string' ? form.agent_id.trim() : ''
+  const seat = normalizeEnrollSeat(typeof form.seat === 'string' ? form.seat : '')
+
+  if (auth.boundAgentId) {
+    return c.html(
+      shell(c.env, 'Enroll seat', errorBody('An operator principal is required.')),
+      403,
+    )
+  }
+
+  const canonical = requiredCanonicalOrigin(c.env)
+  if (!canonical.ok) {
+    return c.html(
+      shell(
+        c.env,
+        'Enroll seat',
+        errorBody('A secure public origin must be configured before provisioning a token.'),
+      ),
+      503,
+    )
+  }
+
+  if (!agentIdRaw) {
+    const view = await loadEnrollView(c.env, auth, { seat, agent: agentIdRaw })
+    return c.html(shell(c.env, 'Enroll seat', enrollPageBody(view, 'Pick an agent.')), 400)
+  }
+
+  const agentResult = await resolveAgentRef(c.env, agentIdRaw)
+  if (!agentResult.ok) {
+    const view = await loadEnrollView(c.env, auth, { seat, agent: agentIdRaw })
+    const msg = agentResult.reason === 'ambiguous'
+      ? 'Agent slug is ambiguous — use the agent id instead.'
+      : 'Agent not found in this pot.'
+    const status = agentResult.reason === 'ambiguous' ? 409 : 404
+    return c.html(shell(c.env, 'Enroll seat', enrollPageBody(view, msg)), status)
+  }
+  const agent = agentResult.value
+
+  const authorized = await authorizeEnrollMint(c.env, auth, agent.squad_id)
+  if (!authorized.ok) {
+    if (authorized.reason === 'operator_principal_required') {
+      return c.html(
+        shell(c.env, 'Enroll seat', errorBody('An operator principal is required.')),
+        403,
+      )
+    }
+    const squadRow = await c.env.DB.prepare('SELECT name FROM squads WHERE id = ?1 LIMIT 1')
+      .bind(agent.squad_id)
+      .first<{ name: string }>()
+    return c.html(
+      shell(c.env, 'Enroll seat', enrollForbiddenBody(auth, agent.name, squadRow?.name ?? null)),
+      403,
+    )
+  }
+
+  const minted = await mintAgentBoundToken(c.env, agent, seat)
+  const squadRow = await c.env.DB.prepare('SELECT name FROM squads WHERE id = ?1 LIMIT 1')
+    .bind(agent.squad_id)
+    .first<{ name: string }>()
+  const snippet = enrollClientSnippet(agent.slug, canonical.origin, seat)
+
+  return c.html(
+    shell(
+      c.env,
+      'Seat key coined',
+      enrollMintedBody(
+        agent.name,
+        agent.slug,
+        squadRow?.name ?? null,
+        minted.raw,
+        minted.tokenId,
+        minted.grantCapability,
+        seat,
+        snippet,
       ),
     ),
   )
@@ -4142,6 +4249,11 @@ export function shell(
           <a class="nav-link" href="/members">
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><circle cx="7.3" cy="7.5" r="2.5"/><circle cx="13.6" cy="8.5" r="2"/><path d="M3.4 16c0-2.3 1.8-3.8 3.9-3.8s3.9 1.5 3.9 3.8M12.4 12.5c2 0 3.9 1.1 3.9 3.5"/></svg>
             <span class="nav-label">Access tokens</span>
+          </a>
+
+          <a class="nav-link" href="/enroll">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><rect x="4" y="7" width="12" height="9" rx="1.5"/><path d="M7.5 7V5.8a2.5 2.5 0 0 1 5 0V7"/><path d="M10 11.2v2"/></svg>
+            <span class="nav-label">Enroll seat</span>
           </a>
 
           <!-- People & roles (grants roster) -->
