@@ -44,7 +44,15 @@ import {
   getOrCreateAgentSession,
   resolveAgentSessionContext,
   revokeAgentSessionByCredential,
+  loadLiveAgentSessionByCredential,
 } from '../auth/agent-sessions'
+import {
+  createElevationRequest,
+  loadElevationRequestById,
+  loadLiveElevationGrantsForSession,
+  evaluateElevationGrant,
+} from '../auth/elevation'
+import { ALL_ELEVATION_ACTION_KEYS, ELEVATION_ACTIONS, ELEVATION_DURATION_PRESETS_MINUTES } from '../auth/elevation-actions'
 import { createBus } from '../bus'
 import { createMemory } from '../memory'
 import {
@@ -3863,6 +3871,154 @@ const toolEndAgentSession: ToolSpec = {
   },
 }
 
+// request_elevation / elevation_status — Delivery Sequence step 3 (mupot
+// task f5fe1222, mumega-com#1173): the AGENT-facing half of "Fix the ability
+// that I can make agents admin by a safe way and time limited." An agent
+// asks for named actions on a scope for its EXACT current session; a human
+// decides separately (POST /elevation/requests/:id/decide in src/auth —
+// operator-principal-only, mirrors the /auth/sessions* dashboard routes).
+//
+// Security Invariant 1 (identity is derived from authentication, never
+// request text): agentSessionId/agentId/memberId below all come from
+// resolveAgentSessionContext(auth), exactly like end_agent_session — there
+// is no argument an agent could pass to name a DIFFERENT session or a
+// different agent's request. request_elevation therefore cannot be used by
+// one agent to elevate another, by construction (constraint 5), and never
+// by a pure human/operator principal either (resolveAgentSessionContext
+// fails closed with 'not_agent_session' for those).
+const toolRequestElevation: ToolSpec = {
+  name: 'request_elevation',
+  scope: 'self (exact current agent session)',
+  min: 'authenticated',
+  args: '{ actions: string[], scope_type: "org"|"department"|"squad", scope_id?: string, duration_minutes: number, reason: string }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      actions: { type: 'array', items: { type: 'string', enum: [...ALL_ELEVATION_ACTION_KEYS] }, minItems: 1 },
+      scope_type: { type: 'string', enum: ['org', 'department', 'squad'] },
+      scope_id: STRING_SCHEMA,
+      duration_minutes: { type: 'number', enum: [...ELEVATION_DURATION_PRESETS_MINUTES] },
+      reason: STRING_SCHEMA,
+    },
+    required: ['actions', 'scope_type', 'duration_minutes', 'reason'],
+    additionalProperties: false,
+  },
+  shouldTouchPresence: () => false,
+  async run(auth, env, args) {
+    const sessionContext = resolveAgentSessionContext(auth)
+    if (!sessionContext.ok) return fail(403, sessionContext.reason)
+
+    const liveSession = await loadLiveAgentSessionByCredential(
+      env,
+      env.TENANT_SLUG,
+      sessionContext.context.authKind,
+      sessionContext.context.credentialId,
+    )
+    if (!liveSession) {
+      return fail(409, 'not_agent_session', 'No tracked runtime session for this credential (migration not applied yet, or none created — call check_in first).')
+    }
+
+    const actions = Array.isArray(args.actions) ? args.actions.filter((a): a is string => typeof a === 'string') : []
+    const scopeType = str(args.scope_type)
+    const scopeId = str(args.scope_id) ?? ''
+    const durationMinutes = typeof args.duration_minutes === 'number' ? args.duration_minutes : NaN
+    const reason = str(args.reason)
+
+    if (!scopeType || (scopeType !== 'org' && scopeType !== 'department' && scopeType !== 'squad')) {
+      return fail(400, 'invalid_args', 'scope_type must be org|department|squad')
+    }
+    if (!reason) return fail(400, 'invalid_args', 'reason required')
+
+    const result = await createElevationRequest(env, {
+      tenant: env.TENANT_SLUG,
+      agentSessionId: liveSession.id,
+      agentId: sessionContext.context.agentId,
+      memberId: sessionContext.context.memberId,
+      actions,
+      scopeType: scopeType as 'org' | 'department' | 'squad',
+      scopeId,
+      durationMinutes,
+      reason,
+    })
+    if (!result.ok) return fail(400, result.reason, result.detail)
+
+    return done({
+      request: {
+        id: result.request.id,
+        status: result.request.status,
+        actions: JSON.parse(result.request.requested_actions_json),
+        scope_type: result.request.requested_scope_type,
+        scope_id: result.request.requested_scope_id,
+        duration_minutes: result.request.requested_duration_minutes,
+        reason: result.request.reason,
+        created_at: result.request.created_at,
+        decision_expires_at: result.request.decision_expires_at,
+      },
+      note: 'Pending human approval. No authority is granted yet — poll elevation_status or wait for it to be reflected on your next call.',
+    })
+  },
+}
+
+const toolElevationStatus: ToolSpec = {
+  name: 'elevation_status',
+  scope: 'self (exact current agent session)',
+  min: 'authenticated',
+  args: '{ request_id?: string }',
+  inputSchema: {
+    type: 'object',
+    properties: { request_id: STRING_SCHEMA },
+    additionalProperties: false,
+  },
+  shouldTouchPresence: () => false,
+  async run(auth, env, args) {
+    const sessionContext = resolveAgentSessionContext(auth)
+    if (!sessionContext.ok) return fail(403, sessionContext.reason)
+
+    const liveSession = await loadLiveAgentSessionByCredential(
+      env,
+      env.TENANT_SLUG,
+      sessionContext.context.authKind,
+      sessionContext.context.credentialId,
+    )
+    if (!liveSession) return fail(409, 'not_agent_session', 'No tracked runtime session for this credential.')
+
+    const requestId = str(args.request_id)
+    let requestView: Record<string, unknown> | null = null
+    if (requestId) {
+      const request = await loadElevationRequestById(env, env.TENANT_SLUG, requestId)
+      // Never a cross-session existence oracle: a request for a DIFFERENT
+      // session reads identically to "not found".
+      if (request && request.agent_session_id === liveSession.id) {
+        requestView = {
+          id: request.id,
+          status: request.status,
+          actions: JSON.parse(request.requested_actions_json),
+          scope_type: request.requested_scope_type,
+          scope_id: request.requested_scope_id,
+          decision_expires_at: request.decision_expires_at,
+          decided_at: request.decided_at,
+        }
+      }
+    }
+
+    const liveGrants = await loadLiveElevationGrantsForSession(env, env.TENANT_SLUG, liveSession.id)
+    return done({
+      session_id: liveSession.id,
+      request: requestView,
+      active_elevations: liveGrants.map((g) => ({
+        id: g.id,
+        action: g.action,
+        label: ELEVATION_ACTIONS[g.action]?.label ?? g.action,
+        scope_type: g.scope_type,
+        scope_id: g.scope_id,
+        effect: g.effect,
+        expires_at: g.expires_at,
+        live: evaluateElevationGrant(g).ok,
+      })),
+    })
+  },
+}
+
 // status — read-only agent runtime telemetry. cap: any authenticated member.
 // Read-only and tenant-scoped (the agent row is resolved from this pot's D1).
 const toolStatus: ToolSpec = {
@@ -4487,6 +4643,8 @@ export const TOOLS: ToolSpec[] = [
   toolPeers,
   toolCheckIn,
   toolEndAgentSession,
+  toolRequestElevation,
+  toolElevationStatus,
   toolStatus,
   toolFleetAgentGet,
   toolBootContext,

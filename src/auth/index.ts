@@ -16,22 +16,33 @@
 import { Hono } from 'hono'
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie'
 import type { Context, MiddlewareHandler } from 'hono'
-import type { Env, AuthContext } from '../types'
+import type { CapabilityGrant, CapabilityScopeType, Env, AuthContext } from '../types'
 import { verifyHandoffClaim } from './handoff-verify'
-import { resolveCapabilities } from './capability'
+import { hasCapability, resolveCapabilities } from './capability'
 import { linkLoginIdentity } from './login-identity'
 import {
   createWebSession,
   evaluateWebSession,
   hashWebSessionId,
+  hasRecentReauth,
   listWebSessions,
   loadWebSession,
+  loadWebSessionByHash,
   markRecentReauth,
   revokeAllWebSessions,
   revokeWebSession,
   revokeWebSessionByHash,
   touchWebSession,
 } from './web-sessions'
+import {
+  decideElevationRequest,
+  listActiveElevationGrants,
+  listElevationUsage,
+  listPendingElevationRequests,
+  loadElevationGrantById,
+  revokeElevationGrant,
+} from './elevation'
+import { ELEVATION_ACTIONS } from './elevation-actions'
 
 // ── tunables ──
 const COOKIE_NAME = 'mupot_session'
@@ -837,6 +848,200 @@ authApp.post('/sessions/revoke-all', requireAuthMw(), async (c) => {
     exceptIdHash,
   )
   return c.json({ revoked_count: revokedCount })
+})
+
+// ── elevation approval (Delivery Sequence step 3) ────────────────────────────
+//
+// mupot task f5fe1222, mumega-com#1173: "Fix the ability that I can make
+// agents admin by a safe way and time limited. I will not give you token."
+// This is the HUMAN half — approval MUST be created by an operator-
+// principal BROWSER session (design doc's Approval Flow: "Mupot returns a
+// door... Human opens Mupot"), the exact same web_sessions primitive step 1
+// built, not a generic MCP bearer call. requireAuthMw() + webSessionMemberId
+// is the identical gate GET/POST /sessions* above already use — an owner or
+// admin login that never bridged to a members row (no webSessionMemberId)
+// gets `forbidden`, same as those routes.
+//
+// The agent-facing half (request_elevation / elevation_status) lives in
+// src/mcp/index.ts, MCP-tool-gated — an agent has no browser.
+
+function scopeAuthorityOk(
+  capabilities: CapabilityGrant[] | undefined,
+  scopeType: CapabilityScopeType,
+  scopeId: string,
+  squadDepartmentId: string | null,
+): boolean {
+  return hasCapability(capabilities ?? [], scopeType, scopeId || null, 'admin', squadDepartmentId)
+}
+
+async function resolveSquadDepartmentId(env: Env, scopeType: string, scopeId: string): Promise<string | null> {
+  if (scopeType !== 'squad' || !scopeId) return null
+  const row = await env.DB.prepare(`SELECT department_id FROM squads WHERE id = ?1 LIMIT 1`)
+    .bind(scopeId)
+    .first<{ department_id: string }>()
+  return row?.department_id ?? null
+}
+
+// GET /auth/elevation/requests → pending elevation requests the CALLER has
+// admin authority to decide (Security Invariant 12: UI visibility follows
+// effective authorization — a request on a scope the operator cannot admin
+// is not even listed, not shown-then-403'd).
+authApp.get('/elevation/requests', requireAuthMw(), async (c) => {
+  const auth = c.get('auth')
+  if (!auth.webSessionMemberId) return c.json({ requests: [] })
+  const capabilities = auth.capabilities ?? (await resolveCapabilities(c.env, auth.webSessionMemberId))
+  const all = await listPendingElevationRequests(c.env, c.env.TENANT_SLUG)
+  const visible: Array<Record<string, unknown>> = []
+  for (const r of all) {
+    const deptId = await resolveSquadDepartmentId(c.env, r.requested_scope_type, r.requested_scope_id)
+    if (!scopeAuthorityOk(capabilities, r.requested_scope_type as CapabilityScopeType, r.requested_scope_id, deptId)) continue
+    visible.push({
+      id: r.id,
+      agent_session_id: r.agent_session_id,
+      agent_id: r.agent_id,
+      actions: JSON.parse(r.requested_actions_json).map((a: string) => ({
+        key: a,
+        label: ELEVATION_ACTIONS[a]?.label ?? a,
+        effect: ELEVATION_ACTIONS[a]?.effect ?? null,
+        effect_note: ELEVATION_ACTIONS[a]?.effectNote ?? null,
+      })),
+      scope_type: r.requested_scope_type,
+      scope_id: r.requested_scope_id,
+      duration_minutes: r.requested_duration_minutes,
+      reason: r.reason,
+      created_at: r.created_at,
+      decision_expires_at: r.decision_expires_at,
+    })
+  }
+  return c.json({ requests: visible })
+})
+
+// POST /auth/elevation/requests/:id/decide → the single-decision transaction.
+// Body: { decision: 'approve'|'deny', actions?: string[], duration_minutes?: number, note?: string }.
+// `actions`/`duration_minutes` may only NARROW the request (decideElevationRequest
+// enforces this — the route never widens what it forwards). Sensitive
+// actions (SENSITIVE_STEP_UP_ACTIONS) require the caller's web session to
+// have proven a fresh reauth within the last 5 minutes — same primitive
+// GET /auth/reauth exists for.
+authApp.post('/elevation/requests/:id/decide', requireAuthMw(), async (c) => {
+  const auth = c.get('auth')
+  if (!auth.webSessionMemberId || !auth.webSessionIdHash) return c.json({ error: 'forbidden' }, 403)
+
+  let body: Record<string, unknown>
+  try {
+    body = (await c.req.json()) as Record<string, unknown>
+  } catch {
+    return c.json({ error: 'invalid_json' }, 400)
+  }
+  const decision = body.decision === 'approve' || body.decision === 'deny' ? body.decision : null
+  if (!decision) return c.json({ error: 'invalid_args', detail: 'decision must be approve|deny' }, 400)
+
+  const capabilities = auth.capabilities ?? (await resolveCapabilities(c.env, auth.webSessionMemberId))
+  const currentWebSession = await loadWebSessionByHash(c.env, c.env.TENANT_SLUG, auth.webSessionIdHash)
+  const recentReauthOk = currentWebSession ? hasRecentReauth(currentWebSession) : false
+
+  const result = await decideElevationRequest(c.env, {
+    tenant: c.env.TENANT_SLUG,
+    requestId: c.req.param('id'),
+    decision,
+    selectedActions: Array.isArray(body.actions) ? body.actions.filter((a): a is string => typeof a === 'string') : undefined,
+    scopeType: typeof body.scope_type === 'string' ? (body.scope_type as CapabilityScopeType) : undefined,
+    scopeId: typeof body.scope_id === 'string' ? body.scope_id : undefined,
+    durationMinutes: typeof body.duration_minutes === 'number' ? body.duration_minutes : undefined,
+    decidedByMemberId: auth.webSessionMemberId,
+    decidedByCapabilities: capabilities,
+    decidedByWebSessionHash: auth.webSessionIdHash,
+    recentReauthOk,
+    note: typeof body.note === 'string' ? body.note : undefined,
+  })
+
+  if (!result.ok) {
+    const status = result.reason === 'not_found' ? 404 : result.reason === 'forbidden' ? 403 : 409
+    return c.json({ ok: false, reason: result.reason, detail: 'detail' in result ? result.detail : undefined }, status)
+  }
+  return c.json({
+    ok: true,
+    request: { id: result.request.id, status: result.request.status },
+    grants: result.grants.map((g) => ({
+      id: g.id,
+      action: g.action,
+      scope_type: g.scope_type,
+      scope_id: g.scope_id,
+      effect: g.effect,
+      expires_at: g.expires_at,
+    })),
+  })
+})
+
+// GET /auth/elevation/active → every LIVE grant the caller has admin
+// authority over (same visibility scoping as the pending-requests list).
+authApp.get('/elevation/active', requireAuthMw(), async (c) => {
+  const auth = c.get('auth')
+  if (!auth.webSessionMemberId) return c.json({ grants: [] })
+  const capabilities = auth.capabilities ?? (await resolveCapabilities(c.env, auth.webSessionMemberId))
+  const all = await listActiveElevationGrants(c.env, c.env.TENANT_SLUG)
+  const visible: Array<Record<string, unknown>> = []
+  for (const g of all) {
+    const deptId = await resolveSquadDepartmentId(c.env, g.scope_type, g.scope_id)
+    if (!scopeAuthorityOk(capabilities, g.scope_type, g.scope_id, deptId)) continue
+    visible.push({
+      id: g.id,
+      agent_session_id: g.agent_session_id,
+      action: g.action,
+      label: ELEVATION_ACTIONS[g.action]?.label ?? g.action,
+      scope_type: g.scope_type,
+      scope_id: g.scope_id,
+      effect: g.effect,
+      approved_by_member_id: g.approved_by_member_id,
+      created_at: g.created_at,
+      expires_at: g.expires_at,
+    })
+  }
+  return c.json({ grants: visible })
+})
+
+// POST /auth/elevation/:id/revoke → explicit human revoke, scoped to the
+// caller's own admin authority over the grant's scope (never a bare
+// "any admin anywhere can revoke any grant" — matches list_agent_sessions/
+// revoke_agent_session's squad-scoped pattern in src/mcp/provision.ts).
+authApp.post('/elevation/:id/revoke', requireAuthMw(), async (c) => {
+  const auth = c.get('auth')
+  if (!auth.webSessionMemberId) return c.json({ error: 'forbidden' }, 403)
+  const grant = await loadElevationGrantById(c.env, c.env.TENANT_SLUG, c.req.param('id'))
+  if (!grant) return c.json({ error: 'not_found' }, 404)
+  const capabilities = auth.capabilities ?? (await resolveCapabilities(c.env, auth.webSessionMemberId))
+  const deptId = await resolveSquadDepartmentId(c.env, grant.scope_type, grant.scope_id)
+  if (!scopeAuthorityOk(capabilities, grant.scope_type, grant.scope_id, deptId)) {
+    return c.json({ error: 'forbidden', need: 'admin', scope: { type: grant.scope_type, id: grant.scope_id } }, 403)
+  }
+  const { revoked } = await revokeElevationGrant(c.env, c.env.TENANT_SLUG, grant.id, 'human_revoke')
+  return c.json({ revoked })
+})
+
+// GET /auth/elevation/:id/usage → itemised usage log for one grant —
+// queryable after expiry/revocation (constraint 7: "an elevation that
+// expires without a list of what it was used for is unauditable exactly
+// when it matters"). Same scope-authority gate as revoke.
+authApp.get('/elevation/:id/usage', requireAuthMw(), async (c) => {
+  const auth = c.get('auth')
+  if (!auth.webSessionMemberId) return c.json({ usage: [] })
+  const grant = await loadElevationGrantById(c.env, c.env.TENANT_SLUG, c.req.param('id'))
+  if (!grant) return c.json({ error: 'not_found' }, 404)
+  const capabilities = auth.capabilities ?? (await resolveCapabilities(c.env, auth.webSessionMemberId))
+  const deptId = await resolveSquadDepartmentId(c.env, grant.scope_type, grant.scope_id)
+  if (!scopeAuthorityOk(capabilities, grant.scope_type, grant.scope_id, deptId)) {
+    return c.json({ error: 'forbidden', need: 'admin', scope: { type: grant.scope_type, id: grant.scope_id } }, 403)
+  }
+  const usage = await listElevationUsage(c.env, c.env.TENANT_SLUG, grant.id)
+  return c.json({
+    usage: usage.map((u) => ({
+      id: u.id,
+      action: u.action,
+      tool_name: u.tool_name,
+      detail: u.detail_json ? JSON.parse(u.detail_json) : null,
+      occurred_at: u.occurred_at,
+    })),
+  })
 })
 
 // ── user upsert (AuthZ side) ─────────────────────────────────────────────────

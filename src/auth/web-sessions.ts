@@ -222,6 +222,39 @@ export async function touchWebSession(
   }
 }
 
+/**
+ * loadWebSessionByHash — direct id_hash lookup, no raw cookie value
+ * involved. Added for Delivery Sequence step 3 (mupot task f5fe1222,
+ * mumega-com#1173): the elevation ledger stores `approved_by_web_session_hash`
+ * and must be able to re-check that EXACT session's current liveness on
+ * every elevated-action check (src/auth/elevation.ts hasElevatedAction) and
+ * when rendering/deciding an approval (src/auth this file's /elevation/*
+ * routes) — neither caller ever has the raw session value to re-hash, only
+ * the hash already on file. Self-guarding like every other read in this
+ * module: a not-yet-migrated tenant reads as "not found", never a 500.
+ */
+export async function loadWebSessionByHash(
+  env: Env,
+  tenant: string,
+  idHash: string,
+): Promise<WebSessionRecord | null> {
+  try {
+    const row = await env.DB.prepare(
+      `SELECT id_hash, tenant, member_id, login_identity_id, created_at, last_seen_at,
+              idle_expires_at, absolute_expires_at, recent_reauth_at, revoked_at, revoke_reason
+         FROM web_sessions
+        WHERE id_hash = ?1 AND tenant = ?2
+        LIMIT 1`,
+    )
+      .bind(idHash, tenant)
+      .first<WebSessionRecord>()
+    return row ?? null
+  } catch (err) {
+    if (isMissingTableError(err)) return null
+    throw err
+  }
+}
+
 // ── list ──────────────────────────────────────────────────────────────────────
 
 /** listWebSessions — every session (live or not) for a member, newest first.

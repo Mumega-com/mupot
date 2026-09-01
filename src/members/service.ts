@@ -20,6 +20,7 @@ import {
   nowSqlUtc,
   TOKEN_LIVE_PREDICATE,
 } from '../auth/token-lifecycle'
+import { revokeAgentSessionByCredentialSafe } from '../auth/agent-sessions'
 
 const CHANNELS: readonly ConnectionChannel[] = ['workspace', 'im', 'dashboard']
 export function isChannel(v: unknown): v is ConnectionChannel {
@@ -940,6 +941,39 @@ export async function markAgentTokenReplacementAuditSent(
   return rowToReplacementHandoff(row)
 }
 
+/**
+ * activateAgentTokenReplacement — flips the handoff (and, via the D1 trigger
+ * `agent_token_rotation_handoff_activate`, the underlying member_tokens rows:
+ * prior revoked, replacement activated) atomically inside the guarded UPDATE.
+ *
+ * Delivery Sequence step 3 (mupot task f5fe1222, mumega-com#1173) — ★
+ * Athena's hard gate condition from the step-2 review: a rotated-away
+ * agent_sessions row previously survived to its own ceiling even though the
+ * credential backing it was dead, because nothing here touched
+ * agent_sessions at all. That was ruled inert AT STEP 2 (the dead credential
+ * cannot authenticate, so the row cannot be resolved into a live session by
+ * anything auth-derived) but explicitly DANGEROUS once elevation exists: an
+ * elevation grant binds to one exact agent_sessions.id, and a rotated-away
+ * row that still reads as "live" in agent_sessions would be an ambiguous
+ * second live row for the same agent alongside its replacement's fresh
+ * session — ambiguous exactly where the ledger needs one unambiguous
+ * answer to "is the session this grant is bound to still alive". So: on a
+ * successful activation, retire the OLD row for prior_token_id explicitly,
+ * the same way a credential revoke already does (revoke_agent_token,
+ * deactivate_agent — see src/mcp/provision.ts) — session-bound elevation
+ * dies with the credential it rotated away from, not just with the
+ * credential that replaces it.
+ *
+ * authKind is hardcoded 'workspace_token': this rotation-handoff mechanism
+ * (migrations 0134-0136) exists ONLY for workspace-bearer token rotation —
+ * the claim/fingerprint/audit-handoff shape has no OAuth/directory-channel
+ * analogue in this codebase (an OAuth session's continuity is instead
+ * proven-or-not by refresh, per the design doc's "Agent runtime session").
+ * Best-effort/self-guarding (revokeAgentSessionByCredentialSafe): this
+ * function must keep working unmodified in a tenant where migration 0141
+ * (agent_sessions) has not been applied yet, exactly like every other
+ * agent_sessions call site added in step 2.
+ */
 export async function activateAgentTokenReplacement(
   env: Env,
   handoffId: string,
@@ -964,6 +998,15 @@ export async function activateAgentTokenReplacement(
     audit_state: 'pending' | 'sent'; state: 'pending' | 'active'; created_at: string; activated_at: string | null
   }>()
   if (!row) throw new AgentTokenReplacementError()
+
+  await revokeAgentSessionByCredentialSafe(
+    env,
+    row.tenant,
+    'workspace_token',
+    row.prior_token_id,
+    'token_rotated',
+  )
+
   return rowToReplacementHandoff(row)
 }
 
