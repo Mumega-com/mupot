@@ -97,6 +97,42 @@ export function enrollClientSnippet(slug: string, origin: string, seat: string):
  *
  * This page is a convenience surface. It must never mint what mint_agent_token
  * would refuse.
+ *
+ * ── THE SQUAD-ADMIN vs ORG-ADMIN DELTA, AS A DECISION (not an oversight) ──────
+ *
+ * Three doors mint the same artifact and they do NOT agree on the bar:
+ *
+ *   mint_agent_token (MCP)        squad admin on the target agent's squad
+ *   POST /enroll/mint (here)      squad admin on the target agent's squad
+ *   POST /admin/agent-token/mint  isOrgAdmin
+ *
+ * This route deliberately matches the MCP primitive, not its dashboard sibling.
+ * The reasoning, recorded so nobody has to re-derive it from a diff:
+ *
+ *   1. The looser-looking bar is the ALREADY-REACHABLE one. A squad admin who
+ *      can mint via mint_agent_token today gains no new power from this page —
+ *      it is the same capability behind a form instead of a tool call. Gating
+ *      the page at org admin would not close a hole; it would only push the
+ *      same person back to the MCP tool to do the identical thing, which is how
+ *      you teach people to route around the surface you can see.
+ *   2. The org-admin bar on /admin/agent-token is an over-restriction of ONE
+ *      surface, not the pot's intended policy. Treating it as the policy would
+ *      mean the MCP tool has been over-permissive since it shipped — a much
+ *      larger claim, and one no gate has made.
+ *   3. Squad admin is not a weak scope here: the grant the minted token records
+ *      is hard-clamped to squad scope and capability <= 'member'
+ *      (prepareAgentBoundTokenMintForBinding, "THE ESCALATION GUARD"). A squad
+ *      admin minting on their own squad cannot manufacture authority they do
+ *      not already hold.
+ *
+ * If the intended policy is in fact org admin everywhere, the fix is to raise
+ * mint_agent_token — the primitive — and let both dashboard routes inherit it.
+ * Do not raise this route alone: that re-creates the divergence in the other
+ * direction and leaves the tool as the soft path.
+ *
+ * Reviewed by Athena, 2026-09-01 (adversarial pass on PR #1254): "NO widening
+ * beyond mint_agent_token's bar ... that bar is an over-restriction of one
+ * surface; enroll matches the MCP primitive."
  */
 export async function authorizeEnrollMint(
   env: Env,
@@ -109,6 +145,70 @@ export async function authorizeEnrollMint(
     return { ok: false, reason: 'squad_admin_required' }
   }
   return { ok: true }
+}
+
+// ── per-member mint throttle ──────────────────────────────────────────────────
+//
+// A brake on a runaway loop, NOT an authorization boundary — CSRF (the
+// dashboard-wide Origin check) and squad-admin authz are what actually stop an
+// attacker. This only bounds how fast a principal who is already allowed to mint
+// can do so, which matters because every mint is a live credential and the page
+// is one form submit away from a held-down key.
+//
+// Keyed on the MEMBER, same reasoning as checkBootstrapSelfRateLimit: an
+// IP-keyed limiter is bypassed by rotating IPs, but the member id comes from a
+// verified Google identity and cannot be rotated at will. Independent budget
+// from that limiter and from the OAuth door's B2 — three different actions, and
+// sharing a counter would let one starve another.
+//
+// The ceiling is 10/hour rather than bootstrap_self's 5 because THIS page's
+// stated purpose is enrolling several seats in one sitting (laptop, server,
+// cloud) — 5 would refuse a legitimate first setup. 10 still stops a loop dead.
+export const ENROLL_MINT_RL_MAX = 10
+export const ENROLL_MINT_RL_TTL = 3600 // seconds (1 hour)
+
+export interface EnrollRateLimitResult {
+  allowed: boolean
+  retryAfter: number
+}
+
+/** Consumed BEFORE the mint and before the agent is resolved: a refused or
+ *  malformed attempt is exactly the abuse shape worth throttling, so it burns
+ *  budget too. Fail-open on KV trouble — same posture as the sibling limiters;
+ *  the authz gate below is what must never fail open, and it does not. */
+export async function checkEnrollMintRateLimit(
+  env: Env,
+  memberId: string,
+): Promise<EnrollRateLimitResult> {
+  const key = `enroll-mint-rl:${memberId}`
+  try {
+    const raw = await env.SESSIONS.get(key)
+    const count = raw !== null ? parseInt(raw, 10) : 0
+    if (count >= ENROLL_MINT_RL_MAX) return { allowed: false, retryAfter: ENROLL_MINT_RL_TTL }
+    await env.SESSIONS.put(key, String(count + 1), { expirationTtl: ENROLL_MINT_RL_TTL })
+    return { allowed: true, retryAfter: 0 }
+  } catch {
+    return { allowed: true, retryAfter: 0 }
+  }
+}
+
+export function enrollThrottledBody(retryAfterSeconds: number) {
+  const minutes = Math.max(1, Math.ceil(retryAfterSeconds / 60))
+  return html`
+<h1>Too many keys, too fast</h1>
+<div class="card">
+  <p style="margin:0 0 10px;font-size:14px">
+    This account has coined ${ENROLL_MINT_RL_MAX} seat keys in the last hour, which is
+    the ceiling. Nothing is wrong with your permissions — try again in about
+    ${minutes} minute${minutes === 1 ? '' : 's'}.
+  </p>
+  <p style="margin:0;font-size:14px">
+    If you are enrolling a large fleet, mint through
+    <code class="inline">mint_agent_token</code> instead of this page; it is the
+    same write path without the browser-shaped throttle.
+  </p>
+</div>
+<p style="margin-top:16px"><a href="/enroll">← Back to enrollment</a></p>`
 }
 
 export async function loadEnrollView(

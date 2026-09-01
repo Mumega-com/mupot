@@ -12,7 +12,8 @@ import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
 import { dashboardApp } from '../src/dashboard/index'
 import { mcpApp } from '../src/mcp'
-import { enrollUrl } from '../src/dashboard/enroll'
+import { enrollUrl, ENROLL_MINT_RL_MAX, ENROLL_MINT_RL_TTL } from '../src/dashboard/enroll'
+import { mintAgentBoundToken } from '../src/members/service'
 import type { Env } from '../src/types'
 
 const TENANT = 'pot-a'
@@ -66,13 +67,36 @@ function makeHarness(): SqliteD1Harness {
   return harness
 }
 
-function envFor(harness: SqliteD1Harness, sessions: Record<string, string> = {}): Env {
+/**
+ * A SESSIONS stand-in that actually STORES what is put into it. The plain mock
+ * below is read-only, which silently fed the mint throttle a failing `put` and
+ * sent it down its fail-open branch — a limiter that is never exercised looks
+ * identical to one that works. Anything asserting on throttle behaviour must
+ * use this, not the read-only mock.
+ */
+function statefulSessions(seed: Record<string, string> = {}) {
+  const store = new Map<string, string>(Object.entries(seed))
+  return {
+    store,
+    kv: {
+      get: async (key: string) => store.get(key) ?? null,
+      put: async (key: string, value: string) => { store.set(key, value) },
+      delete: async (key: string) => { store.delete(key) },
+    },
+  }
+}
+
+function envFor(
+  harness: SqliteD1Harness,
+  sessions: Record<string, string> = {},
+  sessionsKv?: unknown,
+): Env {
   return {
     DB: harness.db,
     TENANT_SLUG: TENANT,
     BRAND: 'Test Pot',
     PUBLIC_ORIGIN: ORIGIN,
-    SESSIONS: {
+    SESSIONS: sessionsKv ?? {
       get: async (key: string) => sessions[key] ?? null,
     },
     OAUTH_KV: { get: async () => null, put: async () => undefined },
@@ -286,6 +310,196 @@ describe('POST /enroll/mint — coin a seat key (real schema)', () => {
     expect(labels).toContain('cursor-river')
     expect(labels).toContain('cursor-cloud')
     expect(labels.filter((l) => l === 'cursor-river' || l === 'cursor-cloud')).toHaveLength(2)
+  })
+})
+
+describe('POST /enroll/mint — issuance audit (0139)', () => {
+  let harness: SqliteD1Harness | undefined
+  afterEach(() => {
+    harness?.close()
+    harness = undefined
+  })
+
+  it('records WHO coined the key, on which surface and seat, in the same batch as the token', async () => {
+    harness = makeHarness()
+    const env = envFor(harness, { 'sess:s-admin': sessionRecord('admin@pot.test') })
+
+    const res = await dashboardApp.fetch(
+      dashboardPost('/enroll/mint', 's-admin', { agent_id: AGENT_A, seat: 'cursor-river' }),
+      env,
+    )
+    expect(res.status).toBe(200)
+
+    const rows = harness.sqlite
+      .prepare(`SELECT * FROM agent_token_issuance_audit`)
+      .all() as Array<Record<string, string>>
+    expect(rows).toHaveLength(1)
+    const row = rows[0]
+    expect(row.actor_member_id).toBe(HUMAN_ADMIN)
+    expect(row.actor_principal).toBe('admin@pot.test')
+    expect(row.surface).toBe('enroll')
+    expect(row.seat_label).toBe('cursor-river')
+    expect(row.agent_id).toBe(AGENT_A)
+    expect(row.tenant).toBe(TENANT)
+
+    // The audit must point at the token that actually landed.
+    const minted = harness.sqlite
+      .prepare(`SELECT id, member_id FROM member_tokens WHERE agent_id = ? AND label = ?`)
+      .get(AGENT_A, 'cursor-river') as { id: string; member_id: string }
+    expect(row.token_id).toBe(minted.id)
+    expect(row.member_id).toBe(minted.member_id)
+  })
+
+  it('never copies the token hash or raw secret into the trail', async () => {
+    harness = makeHarness()
+    const env = envFor(harness, { 'sess:s-admin': sessionRecord('admin@pot.test') })
+    const res = await dashboardApp.fetch(
+      dashboardPost('/enroll/mint', 's-admin', { agent_id: AGENT_A, seat: 'cursor-river' }),
+      env,
+    )
+    const raw = ((await res.text()).match(/mupot_[0-9a-f]{64}/) ?? [])[0]
+    expect(raw).toBeDefined()
+
+    const serialised = JSON.stringify(
+      harness.sqlite.prepare(`SELECT * FROM agent_token_issuance_audit`).all(),
+    )
+    expect(serialised).not.toContain(raw)
+    expect(serialised).not.toContain(sha256(raw as string))
+  })
+
+  it('writes NO audit row when the mint is refused', async () => {
+    harness = makeHarness()
+    const env = envFor(harness, { 'sess:s-plain': sessionRecord('member@pot.test') })
+    const res = await dashboardApp.fetch(
+      dashboardPost('/enroll/mint', 's-plain', { agent_id: AGENT_A, seat: 'stolen-seat' }),
+      env,
+    )
+    expect(res.status).toBe(403)
+    const rows = harness.sqlite
+      .prepare(`SELECT COUNT(*) AS n FROM agent_token_issuance_audit`)
+      .get() as { n: number }
+    expect(rows.n).toBe(0)
+  })
+
+  it('leaves the trail empty for mint paths that do not declare an issuer', async () => {
+    // mintAgentBoundToken without issuedBy is the pre-0139 behaviour verbatim:
+    // a token, no audit row. Proves the option is opt-in and cannot half-fire.
+    harness = makeHarness()
+    const env = envFor(harness)
+    const agent = { id: AGENT_A, slug: 'cursor-river', name: 'Cursor River', squad_id: SQUAD_A }
+    await mintAgentBoundToken(env, agent as never, 'no-issuer-seat')
+
+    const minted = harness.sqlite
+      .prepare(`SELECT id FROM member_tokens WHERE label = ?`)
+      .get('no-issuer-seat')
+    expect(minted).toBeDefined()
+    const rows = harness.sqlite
+      .prepare(`SELECT COUNT(*) AS n FROM agent_token_issuance_audit`)
+      .get() as { n: number }
+    expect(rows.n).toBe(0)
+  })
+})
+
+describe('POST /enroll/mint — per-member throttle', () => {
+  let harness: SqliteD1Harness | undefined
+  afterEach(() => {
+    harness?.close()
+    harness = undefined
+  })
+
+  it('refuses with 429 + Retry-After once the hourly ceiling is reached, and mints nothing further', async () => {
+    harness = makeHarness()
+    const sessions = statefulSessions({ 'sess:s-admin': sessionRecord('admin@pot.test') })
+    const env = envFor(harness, {}, sessions.kv)
+
+    for (let i = 0; i < ENROLL_MINT_RL_MAX; i++) {
+      const ok = await dashboardApp.fetch(
+        dashboardPost('/enroll/mint', 's-admin', { agent_id: AGENT_A, seat: `seat-${i}` }),
+        env,
+      )
+      expect(ok.status).toBe(200)
+    }
+
+    const before = harness.sqlite
+      .prepare(`SELECT COUNT(*) AS n FROM member_tokens`)
+      .get() as { n: number }
+
+    const blocked = await dashboardApp.fetch(
+      dashboardPost('/enroll/mint', 's-admin', { agent_id: AGENT_A, seat: 'one-too-many' }),
+      env,
+    )
+    expect(blocked.status).toBe(429)
+    expect(blocked.headers.get('Retry-After')).toBe(String(ENROLL_MINT_RL_TTL))
+    const body = await blocked.text()
+    expect(body).not.toMatch(/mupot_[0-9a-f]{64}/)
+
+    const after = harness.sqlite
+      .prepare(`SELECT COUNT(*) AS n FROM member_tokens`)
+      .get() as { n: number }
+    expect(after.n).toBe(before.n)
+    expect(
+      harness.sqlite.prepare(`SELECT id FROM member_tokens WHERE label = ?`).get('one-too-many'),
+    ).toBeUndefined()
+  })
+
+  it('is keyed on the member — exhausting one human does not throttle another', async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(
+      `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+       VALUES ('cap-admin-2', '${HUMAN_MEMBER}', 'squad', '${SQUAD_B}', 'admin');`,
+    )
+    const sessions = statefulSessions({
+      'sess:s-admin': sessionRecord('admin@pot.test'),
+      'sess:s-plain': sessionRecord('member@pot.test'),
+    })
+    const env = envFor(harness, {}, sessions.kv)
+
+    for (let i = 0; i < ENROLL_MINT_RL_MAX; i++) {
+      await dashboardApp.fetch(
+        dashboardPost('/enroll/mint', 's-admin', { agent_id: AGENT_A, seat: `seat-${i}` }),
+        env,
+      )
+    }
+    const exhausted = await dashboardApp.fetch(
+      dashboardPost('/enroll/mint', 's-admin', { agent_id: AGENT_A, seat: 'blocked' }),
+      env,
+    )
+    expect(exhausted.status).toBe(429)
+
+    const other = await dashboardApp.fetch(
+      dashboardPost('/enroll/mint', 's-plain', { agent_id: AGENT_B, seat: 'other-human' }),
+      env,
+    )
+    // 200, not merely "not 429": a 403 here would also dodge the throttle
+    // assertion while proving nothing about the second human being able to mint.
+    expect(other.status).toBe(200)
+  })
+
+  it('burns budget on a REFUSED attempt — the abuse shape must not be free', async () => {
+    harness = makeHarness()
+    const sessions = statefulSessions({ 'sess:s-plain': sessionRecord('member@pot.test') })
+    const env = envFor(harness, {}, sessions.kv)
+
+    const denied = await dashboardApp.fetch(
+      dashboardPost('/enroll/mint', 's-plain', { agent_id: AGENT_A, seat: 'nope' }),
+      env,
+    )
+    expect(denied.status).toBe(403)
+    expect(sessions.store.get(`enroll-mint-rl:${HUMAN_MEMBER}`)).toBe('1')
+  })
+
+  it('fails open when the KV binding is unavailable', async () => {
+    harness = makeHarness()
+    const env = envFor(harness, {}, {
+      get: async (key: string) =>
+        key === 'sess:s-admin' ? sessionRecord('admin@pot.test') : null,
+      put: async () => { throw new Error('KV down') },
+    })
+    const res = await dashboardApp.fetch(
+      dashboardPost('/enroll/mint', 's-admin', { agent_id: AGENT_A, seat: 'kv-down' }),
+      env,
+    )
+    expect(res.status).toBe(200)
   })
 })
 

@@ -85,6 +85,8 @@ import {
   enrollForbiddenBody,
   enrollMintedBody,
   enrollPageBody,
+  enrollThrottledBody,
+  checkEnrollMintRateLimit,
   loadEnrollView,
   normalizeEnrollSeat,
 } from './enroll'
@@ -2083,6 +2085,25 @@ dashboardApp.post('/enroll/mint', async (c) => {
     )
   }
 
+  // Throttle before anything is resolved or minted. A refused attempt burns
+  // budget on purpose — a loop hammering this form with a bad agent id is the
+  // shape worth braking, and it would otherwise cost nothing.
+  const actorMemberId = auth.memberId
+  if (!actorMemberId) {
+    return c.html(
+      shell(c.env, 'Enroll seat', errorBody('No member identity resolved for this session.')),
+      403,
+    )
+  }
+  const throttle = await checkEnrollMintRateLimit(c.env, actorMemberId)
+  if (!throttle.allowed) {
+    return c.html(
+      shell(c.env, 'Enroll seat', enrollThrottledBody(throttle.retryAfter)),
+      429,
+      { 'Retry-After': String(throttle.retryAfter) },
+    )
+  }
+
   const canonical = requiredCanonicalOrigin(c.env)
   if (!canonical.ok) {
     return c.html(
@@ -2128,7 +2149,15 @@ dashboardApp.post('/enroll/mint', async (c) => {
     )
   }
 
-  const minted = await mintAgentBoundToken(c.env, agent, seat)
+  // issuedBy puts the issuance row in the same batch as the token (0139), so
+  // this page cannot hand out a credential nobody can attribute.
+  const minted = await mintAgentBoundToken(c.env, agent, seat, {
+    issuedBy: {
+      memberId: actorMemberId,
+      principal: (auth.email && auth.email.trim().length > 0) ? auth.email.trim() : actorMemberId,
+      surface: 'enroll',
+    },
+  })
   const squadRow = await c.env.DB.prepare('SELECT name FROM squads WHERE id = ?1 LIMIT 1')
     .bind(agent.squad_id)
     .first<{ name: string }>()
