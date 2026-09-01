@@ -44,6 +44,40 @@ export function nowSqlUtc(): string {
 }
 
 export const DEFAULT_TOKEN_EXPIRY_DAYS = 30
+const MAX_TOKEN_EXPIRY_DAYS = 365
+
+export type AgentTokenExpiryResolution =
+  | { ok: true; expiresAt: string | null }
+  | { ok: false; code: 'invalid_expiry' | 'non_expiring_owner_required' }
+
+/**
+ * Resolve the one expiry policy shared by every agent-token mint surface.
+ *
+ * Missing expiry input receives the standard 30-day lifetime.  Non-expiring
+ * credentials are the explicit owner-only exception; supplying both modes, or a
+ * zero, negative, non-finite, fractional, or excessively long value, is refused
+ * rather than converted to a non-expiring token.
+ */
+export function resolveAgentTokenExpiry(input: {
+  expiresInDays?: number
+  nonExpiring?: boolean
+  allowNonExpiring: boolean
+}): AgentTokenExpiryResolution {
+  if (input.nonExpiring && input.expiresInDays !== undefined) {
+    return { ok: false, code: 'invalid_expiry' }
+  }
+  if (input.nonExpiring) {
+    return input.allowNonExpiring
+      ? { ok: true, expiresAt: null }
+      : { ok: false, code: 'non_expiring_owner_required' }
+  }
+
+  const days = input.expiresInDays ?? DEFAULT_TOKEN_EXPIRY_DAYS
+  if (!Number.isFinite(days) || !Number.isInteger(days) || days < 1 || days > MAX_TOKEN_EXPIRY_DAYS) {
+    return { ok: false, code: 'invalid_expiry' }
+  }
+  return { ok: true, expiresAt: calculateExpiryTimestamp(days) }
+}
 
 /** Calculate a standard SQLite-compatible UTC ISO timestamp given days in the future.
  *  Returns null if days is null or 0 (meaning non-expiring). */
@@ -138,96 +172,5 @@ export async function sweepExpiringTokensWarning(
   } catch (error) {
     console.error('expiring tokens warning sweep failed', error)
     return { warned: 0, tokens: [] }
-  }
-}
-
-export interface RotateTokenResult {
-  ok: boolean
-  tokenId?: string
-  rawToken?: string
-  expiresAt?: string | null
-  error?: string
-}
-
-/**
- * Rotates an existing member token: mints replacement with same attributes/capabilities and revokes old.
- */
-export async function rotateMemberToken(
-  env: Env,
-  oldTokenId: string,
-  options: { rotatedBy: string; expiryDays?: number; reason?: string }
-): Promise<RotateTokenResult> {
-  const oldRow = await env.DB.prepare(
-    `SELECT id, member_id, label, channel, agent_id, expires_at
-       FROM member_tokens
-      WHERE id = ?1 AND tenant = ?2 AND revoked_at IS NULL LIMIT 1`,
-  )
-    .bind(oldTokenId, env.TENANT_SLUG)
-    .first<{ id: string; member_id: string; label: string; channel: any; agent_id: string | null; expires_at: string | null }>()
-
-  if (!oldRow) {
-    return { ok: false, error: 'token_not_found_or_revoked' }
-  }
-
-  // Mint new raw secret and compute hash
-  const rawTokenBytes = new Uint8Array(32)
-  crypto.getRandomValues(rawTokenBytes)
-  const rawToken = Array.from(rawTokenBytes).map((b) => b.toString(16).padStart(2, '0')).join('')
-
-  const hashBuffer = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(rawToken))
-  const tokenHash = Array.from(new Uint8Array(hashBuffer)).map((b) => b.toString(16).padStart(2, '0')).join('')
-
-  const newTokenId = crypto.randomUUID()
-  const expiryDays = options.expiryDays !== undefined ? options.expiryDays : DEFAULT_TOKEN_EXPIRY_DAYS
-  const expiresAt = calculateExpiryTimestamp(expiryDays)
-  const now = nowSqlUtc()
-
-  // 1. Insert new token
-  await env.DB.prepare(
-    `INSERT INTO member_tokens
-       (id, member_id, token_hash, label, channel, agent_id, expires_at, created_at, tenant)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)`,
-  )
-    .bind(
-      newTokenId,
-      oldRow.member_id,
-      tokenHash,
-      oldRow.label,
-      oldRow.channel,
-      oldRow.agent_id,
-      expiresAt,
-      now,
-      env.TENANT_SLUG,
-    )
-    .run()
-
-  // 2. Revoke old token
-  await env.DB.prepare(
-    `UPDATE member_tokens SET revoked_at = ?1 WHERE id = ?2 AND tenant = ?3`,
-  )
-    .bind(now, oldRow.id, env.TENANT_SLUG)
-    .run()
-
-  // 3. Record rotation audit
-  await env.DB.prepare(
-    `INSERT INTO token_rotations (id, tenant, old_token_id, new_token_id, rotated_by, reason, rotated_at)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
-  )
-    .bind(
-      crypto.randomUUID(),
-      env.TENANT_SLUG,
-      oldRow.id,
-      newTokenId,
-      options.rotatedBy,
-      options.reason ?? 'automated_rotation',
-      now,
-    )
-    .run()
-
-  return {
-    ok: true,
-    tokenId: newTokenId,
-    rawToken,
-    expiresAt,
   }
 }

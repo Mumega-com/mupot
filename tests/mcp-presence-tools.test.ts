@@ -247,7 +247,7 @@ describe('presence_heartbeat / presence_deregister — self-scoped only', () => 
     // report — see src/mcp/presence.ts). Keeping it exact means any FUTURE field has
     // to be added deliberately here, with someone asking whether it can name another
     // principal — which is the property this test actually guards.
-    expect(keys).toEqual(['project_id', 'state', 'message', 'seq', 'session_epoch', 'lease_ttl_sec'])
+    expect(keys).toEqual(['project_id', 'state', 'message', 'seq'])
 
     // …and state the invariant directly rather than leaving it implied by the list.
     // A pinned list catches a new field; it does not say WHY the field is dangerous.

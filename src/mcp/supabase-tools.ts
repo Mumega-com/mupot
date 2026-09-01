@@ -2,7 +2,7 @@
 
 import type { ToolSpec } from './index'
 import { fail, done, str, hasWorkspaceAdmin, memberCanOnSquad } from './index'
-import type { Env, AuthContext } from '../types'
+import type { AuthContext, Env } from '../types'
 import {
   introspectSupabaseSchema,
   executeSupabaseQuery,
@@ -147,7 +147,7 @@ export const toolSupabaseSchema: ToolSpec = {
         type_definitions: schema.typeDefinitions,
       })
     } catch (error) {
-      return fail(500, 'supabase_introspection_failed', {
+      return fail(502, 'supabase_introspection_failed', {
         error: error instanceof Error ? error.message : String(error),
       })
     }
@@ -200,7 +200,7 @@ export const toolSupabaseQuery: ToolSpec = {
         data: result.data,
       })
     } catch (error) {
-      return fail(500, 'supabase_query_failed', {
+      return fail(502, 'supabase_query_failed', {
         error: error instanceof Error ? error.message : String(error),
       })
     }
@@ -245,7 +245,7 @@ export const toolSupabaseMutate: ToolSpec = {
     })
 
     if (!result.ok) {
-      return fail(500, 'supabase_mutation_failed', { error: result.error })
+      return fail(502, 'supabase_mutation_failed', { error: result.error })
     }
 
     return done({

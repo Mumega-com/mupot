@@ -248,50 +248,6 @@ describe('squad_member_add / remove / list (mupot#1161)', () => {
     expect(added.error).toBe('operator_principal_required')
   })
 
-  it('bound-agent callers WITH action:manage_access can add and remove squad members', async () => {
-    // Grant action:manage_access to CALLER_AGENT_ID
-    harness.sqlite.exec(`
-      INSERT INTO gate_grants (id, principal_type, principal_id, capability, granted_by, created_at)
-      VALUES ('grant-manage-access', 'agent', '${CALLER_AGENT_ID}', 'action:manage_access', '${OPERATOR_MEMBER_ID}', datetime('now'));
-    `)
-    const boundLead: AuthContext = { ...leadAuth(), boundAgentId: CALLER_AGENT_ID }
-    const added = await invokeTool(
-      boundLead,
-      env,
-      'squad_member_add',
-      { agent: AGENT_ID, squad: TARGET_SQUAD_ID, capability: 'member' },
-      'https://pot.test',
-    )
-    expect(added.ok).toBe(true)
-
-    const removed = await invokeTool(
-      boundLead,
-      env,
-      'squad_member_remove',
-      { agent: AGENT_ID, squad: TARGET_SQUAD_ID },
-      'https://pot.test',
-    )
-    expect(removed.ok).toBe(true)
-  })
-
-  it('refuses squad_member_add for unminted agent target (agent_identity_unminted)', async () => {
-    const unmintedId = 'agent-unminted-test'
-    harness.sqlite.exec(`
-      INSERT INTO agents (id, squad_id, slug, name, status)
-      VALUES ('${unmintedId}', '${HOME_SQUAD_ID}', 'unminted-test', 'Unminted Test', 'active');
-    `)
-    const result = await invokeTool(
-      operatorAuth(),
-      env,
-      'squad_member_add',
-      { agent: unmintedId, squad: TARGET_SQUAD_ID, capability: 'member' },
-      'https://pot.test',
-    )
-    expect(result.ok).toBe(false)
-    if (result.ok) return
-    expect(result.error).toBe('agent_identity_unminted')
-  })
-
   it('refuses self-grant even for a lead on the target squad', async () => {
     const result = await invokeTool(
       leadAuth(),

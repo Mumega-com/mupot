@@ -90,7 +90,8 @@ describe('staging recovery rehearsal checker', () => {
   it('prints the required staging recovery evidence plan', () => {
     const plan = formatPlan({ pot: 'staging', baseUrl: 'https://staging.mupot.test', outDir: 'tmp/stage' })
 
-    expect(plan).toContain('Mupot v0.23 staging recovery rehearsal')
+    expect(plan).toContain('Mupot staging recovery rehearsal')
+    expect(plan).not.toContain('v0.23')
     expect(plan).toContain(STEP_RECEIPT_TYPE)
     expect(plan).toContain('upgrade: write upgrade.json')
     expect(plan).toContain('queue_dlq: write queue-dlq.json')
@@ -108,6 +109,7 @@ describe('staging recovery rehearsal checker', () => {
     expect(receipt.target.pot).toBe('staging')
     expect(receipt.artifacts.queue_dlq.status).toBe('pass')
     expect(receipt.timeline.map((step) => step.step)).toEqual(REQUIRED_STEPS.map((step) => step.step))
+    expect(receipt.next_steps.join(' ')).not.toContain('v0.23 release issue')
     expect(receipt.checks.find((check) => check.check === 'target_base_url_matches_expected')?.ok).toBe(true)
   })
 

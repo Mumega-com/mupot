@@ -3,7 +3,7 @@
 import { html } from 'hono/html'
 import type { HtmlEscapedString } from 'hono/utils/html'
 
-export function pricingPageHtml(_origin: string = 'https://mupot.mumega.com'): Promise<HtmlEscapedString> | HtmlEscapedString {
+export function pricingPageHtml(_origin: string = 'https://mupot.mumega.com'): HtmlEscapedString | Promise<HtmlEscapedString> {
   return html`<!doctype html>
 <html lang="en">
   <head>

@@ -23,48 +23,14 @@
 import type { Context, MiddlewareHandler } from 'hono'
 import type { Env, AuthContext, Capability, CapabilityGrant, CapabilityScopeType } from '../types'
 
-/**
- * Check if caller holds an action capability (e.g. 'action:manage_access').
- * Org admin (without bound agent) bypasses; bound agents require explicit grant.
- */
-export async function callerHoldsActionCapability(
-  env: Env,
-  auth: AuthContext,
-  action: string,
-): Promise<boolean> {
-  if (!auth.boundAgentId && isOrgAdmin(auth)) return true
-  return hasSurfaceCap(env, auth, action.startsWith('action:') ? action : `action:${action}`)
-}
-
 // ── ladder ────────────────────────────────────────────────────────────────────
 
-export const CAPABILITY_RANK: Record<Capability, number> = {
+const RANK: Record<Capability, number> = {
   observer: 1,
   member: 2,
   lead: 3,
   admin: 4,
   owner: 5,
-}
-
-const RANK = CAPABILITY_RANK
-
-/**
- * Non-directory channel capability ceilings (#799 / FLIGHT-003).
- */
-export const DEFAULT_NON_DIRECTORY_CHANNEL_MAX_CAP: Capability = 'lead'
-
-export function clampCapability(cap: Capability, maxCap: Capability = DEFAULT_NON_DIRECTORY_CHANNEL_MAX_CAP): Capability {
-  return RANK[cap] > RANK[maxCap] ? maxCap : cap
-}
-
-export function clampChannelCapabilities(
-  grants: CapabilityGrant[],
-  maxCap: Capability = DEFAULT_NON_DIRECTORY_CHANNEL_MAX_CAP,
-): CapabilityGrant[] {
-  return grants.map((g) => ({
-    ...g,
-    capability: clampCapability(g.capability, maxCap),
-  }))
 }
 
 function meets(have: Capability, min: Capability): boolean {
@@ -139,68 +105,6 @@ export async function resolveCapabilities(env: Env, memberId: string): Promise<C
     .bind(memberId)
     .all<CapabilityGrant>()
   return rows.results ?? []
-}
-
-/**
- * Load token-specific capability ceiling grants from D1.
- * If token has NO rows in token_grants, returns null (meaning full principal ceiling).
- */
-export async function resolveTokenGrants(env: Env, tokenId: string): Promise<CapabilityGrant[] | null> {
-  const rows = await env.DB.prepare(
-    `SELECT token_id AS member_id, scope_type, scope_id, capability
-       FROM token_grants
-      WHERE token_id = ?1 AND tenant = ?2`,
-  )
-    .bind(tokenId, env.TENANT_SLUG)
-    .all<CapabilityGrant>()
-
-  const results = rows.results ?? []
-  return results.length > 0 ? results : null
-}
-
-/**
- * Intersect principal capabilities with token-scoped capability grants.
- * Mathematical property: effective = intersect(principal, token_grants).
- * Least-privilege ceiling: a token can never exceed its principal's power,
- * and cannot act on scopes not granted to the token.
- */
-export function intersectCapabilities(
-  principalGrants: CapabilityGrant[],
-  tokenGrants: CapabilityGrant[] | null,
-): CapabilityGrant[] {
-  if (!tokenGrants) return principalGrants // Unscoped key retains principal ceiling
-
-  const effective: CapabilityGrant[] = []
-
-  for (const tGrant of tokenGrants) {
-    let highestPrincipalCap: Capability | null = null
-
-    for (const pGrant of principalGrants) {
-      if (pGrant.scope_type === 'org') {
-        if (!highestPrincipalCap || meets(pGrant.capability, highestPrincipalCap)) {
-          highestPrincipalCap = pGrant.capability
-        }
-      } else if (pGrant.scope_type === tGrant.scope_type && pGrant.scope_id === tGrant.scope_id) {
-        if (!highestPrincipalCap || meets(pGrant.capability, highestPrincipalCap)) {
-          highestPrincipalCap = pGrant.capability
-        }
-      }
-    }
-
-    if (highestPrincipalCap) {
-      // Clamped to min(token_grant, principal_grant)
-      const clampedCap = meets(highestPrincipalCap, tGrant.capability)
-        ? tGrant.capability
-        : highestPrincipalCap
-
-      effective.push({
-        ...tGrant,
-        capability: clampedCap,
-      })
-    }
-  }
-
-  return effective
 }
 
 // ── pure check ──────────────────────────────────────────────────────────────────
@@ -445,9 +349,9 @@ export async function actorMaxRankOnScope(
  * Owner / admin roles bypass the check (rank is sufficient for them).
  */
 export async function hasSurfaceCap(env: Env, auth: AuthContext, surface: string): Promise<boolean> {
-  if (isOrgAdmin(auth) && !auth.boundAgentId) return true
-  const principalId = auth.boundAgentId ?? auth.memberId ?? auth.userId
-  const principalType: 'member' | 'agent' = auth.boundAgentId ? 'agent' : auth.memberId ? 'member' : 'agent'
+  if (isOrgAdmin(auth)) return true
+  const principalId = auth.memberId ?? auth.userId
+  const principalType: 'member' | 'agent' = auth.memberId ? 'member' : 'agent'
   if (!principalId) return false
   const row = await env.DB.prepare(
     `SELECT 1 FROM gate_grants
@@ -458,22 +362,7 @@ export async function hasSurfaceCap(env: Env, auth: AuthContext, surface: string
   )
     .bind(surface, principalType, principalId)
     .first<{ 1: number }>()
-  if (row !== null) return true
-
-  // If the agent is bound to a member, check if the member principal was granted the capability
-  if (auth.memberId && auth.boundAgentId) {
-    const memRow = await env.DB.prepare(
-      `SELECT 1 FROM gate_grants
-        WHERE capability     = ?1
-          AND principal_type = 'member'
-          AND principal_id   = ?2
-        LIMIT 1`,
-    )
-      .bind(surface, auth.memberId)
-      .first<{ 1: number }>()
-    return memRow !== null
-  }
-  return false
+  return row !== null
 }
 
 /**

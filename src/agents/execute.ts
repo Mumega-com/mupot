@@ -33,7 +33,13 @@ import { resolveTaskAssignee } from '../tasks/assignee'
 import { createModel } from '../model'
 import { createBus } from '../bus'
 import { createMemory } from '../memory'
-import { checkAndReserve, recordTokens, type RecordTokensUsage } from './meter'
+import {
+  buildAuthorizedExecution,
+  checkAndReserve,
+  recordTokens,
+  type MeterBlockResult,
+  type RecordTokensUsage,
+} from './meter'
 import { costMicroUsd, costUsageMicroUsd } from './cost'
 import { detectContentIntent } from './content-intent'
 import type { ContentIntent } from './content-intent'
@@ -83,9 +89,6 @@ export interface ExecuteDeps {
     checkAndReserve: typeof checkAndReserve
     recordTokens: typeof recordTokens
   }
-  fallback?: boolean
-  fallbackReason?: string
-  substituteExecutorId?: string
 }
 
 export async function runTaskExecution(
@@ -100,9 +103,6 @@ export async function runTaskExecution(
     deps.remember ?? ((id: string, text: string, concepts?: string[]) => createMemory(env).remember(id, text, concepts))
   const meter = deps.meter ?? { checkAndReserve, recordTokens }
   const executionReceiptId = deps.executionReceiptId ?? crypto.randomUUID()
-  const fallback = deps.fallback === true
-  const substituteExecutorId = deps.substituteExecutorId ?? (fallback ? `in-worker:${agent.id}` : null)
-  const fallbackReason = deps.fallbackReason ?? (fallback ? 'seat_unreachable' : null)
 
   // Load within this tenant DB, then fail closed on assignment and current
   // authority. The coarse response intentionally does not reveal which check failed.
@@ -180,7 +180,7 @@ export async function runTaskExecution(
   // was written for — untrusted external text steering a gated content-write action.
   const contentIntent = isExternallySourced(task) ? null : detectContentIntent(task)
   if (contentIntent) {
-    return finishContentProposal(env, task, agent, executionReceiptId, contentIntent, emit, substituteExecutorId, fallbackReason)
+    return finishContentProposal(env, task, agent, executionReceiptId, contentIntent, emit)
   }
 
   // ── Rate-limit check (issue #4): enforce per-agent daily dispatch + token caps ──
@@ -196,21 +196,20 @@ export async function runTaskExecution(
   // in the meter on every path that actually calls the model.
   const cycleCostMicroUsd = costMicroUsd(agent.model, EXECUTE_MAX_TOKENS)
 
-  const meterResult = await meter.checkAndReserve(env, agent.id, {
-    estimateMicroUsd: cycleCostMicroUsd,
-    budgetCapCents: agent.budget_cap_cents,
-    budgetWindow: agent.budget_window,
-  })
+  const authorizedExecution = buildAuthorizedExecution(
+    env,
+    agent,
+    task.project_id,
+    cycleCostMicroUsd,
+  )
+  const meterResult = await meter.checkAndReserve(env, authorizedExecution)
   if (!meterResult.ok) {
-    const note = capResult(
-      `rate_limited: ${meterResult.reason} — daily cap reached (window ${meterResult.windowKey}). ` +
-      `Retry after ${meterResult.retryAfterSec}s (next UTC day resets the window).`,
-    )
+    const note = capResult(meterBlockNote(meterResult, authorizedExecution.costWindow))
     const finishedAt = new Date().toISOString()
-    if (!(await finishTask(env, task.id, agent.id, executionReceiptId, 'blocked', note, finishedAt, 0, null, substituteExecutorId, fallbackReason))) {
+    if (!(await finishTask(env, task.id, agent.id, executionReceiptId, 'blocked', note, finishedAt))) {
       return { ok: false, task_id: task.id, decided: '', error: 'task_claim_lost' }
     }
-    await emitSafe(emit, executionEvent('task.blocked', env, agent, task, 'blocked', substituteExecutorId, fallbackReason))
+    await emitSafe(emit, executionEvent('task.blocked', env, agent, task, 'blocked'))
     return {
       ok: false,
       task_id: task.id,
@@ -300,10 +299,10 @@ export async function runTaskExecution(
           `done_when_placeholder: cannot mark done — done_when is a placeholder sentinel ("${String(task.done_when).trim()}"). ` +
           'Update done_when to a real, checkable predicate before retrying.',
         )
-        if (!(await finishTask(env, task.id, agent.id, executionReceiptId, 'blocked', note, finishedAt, recordedCostMicroUsd, null, substituteExecutorId, fallbackReason))) {
+        if (!(await finishTask(env, task.id, agent.id, executionReceiptId, 'blocked', note, finishedAt, recordedCostMicroUsd))) {
           return { ok: false, task_id: task.id, decided: '', error: 'task_claim_lost' }
         }
-        await emitSafe(emit, executionEvent('task.blocked', env, agent, task, 'blocked', substituteExecutorId, fallbackReason))
+        await emitSafe(emit, executionEvent('task.blocked', env, agent, task, 'blocked'))
         return {
           ok: false,
           task_id: task.id,
@@ -329,10 +328,10 @@ export async function runTaskExecution(
         (artifactCheck.path ? ` (path: ${artifactCheck.path})` : '') +
         '. A completion must state both "Artifact: <path>" and "SHA256: <64-hex>" — prose describing intended work is not evidence of work done.',
       )
-      if (!(await finishTask(env, task.id, agent.id, executionReceiptId, 'blocked', note, finishedAt, recordedCostMicroUsd, null, substituteExecutorId, fallbackReason))) {
+      if (!(await finishTask(env, task.id, agent.id, executionReceiptId, 'blocked', note, finishedAt, recordedCostMicroUsd))) {
         return { ok: false, task_id: task.id, decided: '', error: 'task_claim_lost' }
       }
-      await emitSafe(emit, executionEvent('task.blocked', env, agent, task, 'blocked', substituteExecutorId, fallbackReason))
+      await emitSafe(emit, executionEvent('task.blocked', env, agent, task, 'blocked'))
       return {
         ok: false,
         task_id: task.id,
@@ -341,7 +340,7 @@ export async function runTaskExecution(
         error: 'artifact_verification_failed',
       }
     }
-    if (!(await finishTask(env, task.id, agent.id, executionReceiptId, successStatus, result, finishedAt, recordedCostMicroUsd, AGENT_SELF_COMPLETION_GATE_OWNER, substituteExecutorId, fallbackReason))) {
+    if (!(await finishTask(env, task.id, agent.id, executionReceiptId, successStatus, result, finishedAt, recordedCostMicroUsd, AGENT_SELF_COMPLETION_GATE_OWNER))) {
       await recordTokensSafe(meter.recordTokens, env, agent.id, EXECUTE_MAX_TOKENS, recordedCostMicroUsd, {
       input: chatUsage?.input,
       output: chatUsage?.output,
@@ -352,7 +351,7 @@ export async function runTaskExecution(
     }
     // Every execution success now lands 'review' (BLOCK-2 close) — a different
     // principal's verdict (or a non-assignee close) is what actually completes it.
-    await emitSafe(emit, executionEvent('task.review', env, agent, task, successStatus, substituteExecutorId, fallbackReason))
+    await emitSafe(emit, executionEvent('task.review', env, agent, task, successStatus))
     // best-effort memory so the agent's future recalls compound on what it did.
     await rememberSafe(remember, agent.id, `Executed task "${task.title}" → ${successStatus}.`)
     // Best-effort token + cost accounting: record EXECUTE_MAX_TOKENS as a conservative
@@ -370,7 +369,7 @@ export async function runTaskExecution(
     const note = capResult(`Execution failed: ${msg}`)
     const finishedAt = new Date().toISOString()
     // NEVER leave in_progress stuck — land it in blocked with the error note.
-    if (!(await finishTask(env, task.id, agent.id, executionReceiptId, 'blocked', note, finishedAt, recordedCostMicroUsd, null, substituteExecutorId, fallbackReason))) {
+    if (!(await finishTask(env, task.id, agent.id, executionReceiptId, 'blocked', note, finishedAt, recordedCostMicroUsd))) {
       await recordTokensSafe(meter.recordTokens, env, agent.id, EXECUTE_MAX_TOKENS, recordedCostMicroUsd, {
       input: chatUsage?.input,
       output: chatUsage?.output,
@@ -379,7 +378,7 @@ export async function runTaskExecution(
     })
       return { ok: false, task_id: task.id, decided: '', error: 'task_claim_lost' }
     }
-    await emitSafe(emit, executionEvent('task.blocked', env, agent, task, 'blocked', substituteExecutorId, fallbackReason))
+    await emitSafe(emit, executionEvent('task.blocked', env, agent, task, 'blocked'))
     // Still count tokens + cost on model failure: the call was attempted.
     await recordTokensSafe(meter.recordTokens, env, agent.id, EXECUTE_MAX_TOKENS, recordedCostMicroUsd, {
       input: chatUsage?.input,
@@ -388,6 +387,27 @@ export async function runTaskExecution(
       cacheWrite: chatUsage?.cacheWrite,
     })
     return { ok: false, task_id: task.id, decided: '', task_status: 'blocked', error: msg }
+  }
+}
+
+function meterBlockNote(
+  result: MeterBlockResult,
+  costWindow: 'day' | 'week',
+): string {
+  const window = `(window ${result.windowKey})`
+  switch (result.reason) {
+    case 'rate_limited':
+      return `dispatch_rate_limited: daily dispatch cap reached ${window}. ` +
+        `Retry after ${result.retryAfterSec}s (next UTC day resets the dispatch window).`
+    case 'budget_exhausted':
+      return `token_budget_exhausted: daily token cap reached ${window}. ` +
+        `Retry after ${result.retryAfterSec}s (next UTC day resets the token window).`
+    case 'budget_cap_exceeded':
+      return costWindow === 'week'
+        ? `cost_budget_exhausted: trailing 7-day cost cap reached. ` +
+            `Recheck as older spend leaves the trailing 7-day window. Meter subject window: ${result.windowKey}.`
+        : `cost_budget_exhausted: daily cost cap reached ${window}. ` +
+            `Retry after ${result.retryAfterSec}s (next UTC day resets the cost window).`
   }
 }
 
@@ -509,8 +529,6 @@ async function finishTask(
   // real gate_owner is never overwritten. Non-review callers (blocked path)
   // pass no fallback, so this is a no-op for them.
   gateOwnerFallback: string | null = null,
-  substituteExecutorId: string | null = null,
-  fallbackReason: string | null = null,
 ): Promise<boolean> {
   // Structural invariant, enforced via the SHARED chokepoint (assigneeSelfClose,
   // src/tasks/service.ts): this function's own WHERE clause requires
@@ -528,14 +546,11 @@ async function finishTask(
   const dbResult = await env.DB.prepare(
     `UPDATE tasks
         SET status = ?, result = ?, completed_at = ?, updated_at = ?, cost_micro_usd = ?,
-            execution_claim_expires_at = NULL, gate_owner = COALESCE(gate_owner, ?),
-            substitute_executor_id = COALESCE(substitute_executor_id, ?),
-            fallback_reason = COALESCE(fallback_reason, ?)
+            execution_claim_expires_at = NULL, gate_owner = COALESCE(gate_owner, ?)
       WHERE id = ? AND assignee_agent_id = ? AND execution_receipt_id = ? AND status = 'in_progress'`,
   )
     .bind(
       status, result, completedAt, completedAt, Math.max(0, Math.round(costMicroUsd)), gateOwnerFallback,
-      substituteExecutorId, fallbackReason,
       taskId, agentId, executionReceiptId,
     )
     .run()
@@ -595,8 +610,6 @@ async function finishContentProposal(
   executionReceiptId: string,
   intent: ContentIntent,
   emit: (event: BusEvent) => Promise<void>,
-  substituteExecutorId?: string | null,
-  fallbackReason?: string | null,
 ): Promise<ExecuteResult> {
   const finishedAt = new Date().toISOString()
 
@@ -605,10 +618,10 @@ async function finishContentProposal(
     const note = capResult(
       `content_proposal_failed: department '${CONTENT_DEPARTMENT_KEY}' is not registered — cannot propose a content-publish gate.`,
     )
-    if (!(await finishTask(env, task.id, agent.id, executionReceiptId, 'blocked', note, finishedAt, 0, null, substituteExecutorId, fallbackReason))) {
+    if (!(await finishTask(env, task.id, agent.id, executionReceiptId, 'blocked', note, finishedAt))) {
       return { ok: false, task_id: task.id, decided: '', error: 'task_claim_lost' }
     }
-    await emitSafe(emit, executionEvent('task.blocked', env, agent, task, 'blocked', substituteExecutorId, fallbackReason))
+    await emitSafe(emit, executionEvent('task.blocked', env, agent, task, 'blocked'))
     return { ok: false, task_id: task.id, decided: '', task_status: 'blocked', error: 'department_not_registered' }
   }
 
@@ -667,10 +680,10 @@ async function finishContentProposal(
     const note = capResult(
       `Proposed content-publish ("${intent.title}") to ${intent.executor} — awaiting approval at /approvals.`,
     )
-    if (!(await finishContentProposalWrite(env, gateId, agent.id, executionReceiptId, note, finishedAt, substituteExecutorId, fallbackReason))) {
+    if (!(await finishContentProposalWrite(env, gateId, agent.id, executionReceiptId, note, finishedAt))) {
       return { ok: false, task_id: task.id, decided: '', error: 'task_claim_lost' }
     }
-    await emitSafe(emit, executionEvent('task.review', env, agent, task, 'review', substituteExecutorId, fallbackReason))
+    await emitSafe(emit, executionEvent('task.review', env, agent, task, 'review'))
     await rememberSafe(
       (id, text, concepts) => createMemory(env).remember(id, text, concepts),
       agent.id,
@@ -681,10 +694,10 @@ async function finishContentProposal(
     const reason = err instanceof CtxError ? err.code : 'propose_failed'
     const msg = err instanceof Error ? err.message : 'propose_failed'
     const note = capResult(`content_proposal_failed: ${msg}`)
-    if (!(await finishTask(env, task.id, agent.id, executionReceiptId, 'blocked', note, finishedAt, 0, null, substituteExecutorId, fallbackReason))) {
+    if (!(await finishTask(env, task.id, agent.id, executionReceiptId, 'blocked', note, finishedAt))) {
       return { ok: false, task_id: task.id, decided: '', error: 'task_claim_lost' }
     }
-    await emitSafe(emit, executionEvent('task.blocked', env, agent, task, 'blocked', substituteExecutorId, fallbackReason))
+    await emitSafe(emit, executionEvent('task.blocked', env, agent, task, 'blocked'))
     return { ok: false, task_id: task.id, decided: '', task_status: 'blocked', error: reason }
   }
 }
@@ -706,19 +719,14 @@ async function finishContentProposalWrite(
   executionReceiptId: string,
   result: string,
   completedAt: string,
-  substituteExecutorId: string | null = null,
-  fallbackReason: string | null = null,
 ): Promise<boolean> {
   const dbResult = await env.DB.prepare(
     `UPDATE tasks
         SET status = 'review', result = ?, completed_at = ?, updated_at = ?,
-            gate_owner = COALESCE(gate_owner, ?),
-            substitute_executor_id = COALESCE(substitute_executor_id, ?),
-            fallback_reason = COALESCE(fallback_reason, ?),
-            execution_claim_expires_at = NULL
+            gate_owner = COALESCE(gate_owner, ?), execution_claim_expires_at = NULL
       WHERE id = ? AND assignee_agent_id = ? AND execution_receipt_id = ? AND status = 'in_progress'`,
   )
-    .bind(result, completedAt, completedAt, CONTENT_GATE_OWNER, substituteExecutorId, fallbackReason, taskId, agentId, executionReceiptId)
+    .bind(result, completedAt, completedAt, CONTENT_GATE_OWNER, taskId, agentId, executionReceiptId)
     .run()
   return dbResult.meta?.changes === 1
 }
@@ -796,32 +804,14 @@ function executionEvent(
   agent: Agent,
   task: Task,
   status: Task['status'],
-  substituteExecutorId?: string | null,
-  fallbackReason?: string | null,
-): BusEvent<{
-  task_id: string
-  project_id: string | null
-  agent_id: string
-  status: Task['status']
-  title: string
-  substitute_executor_id?: string | null
-  fallback_reason?: string | null
-}> {
+): BusEvent<{ task_id: string; project_id: string | null; agent_id: string; status: Task['status']; title: string }> {
   return {
     type,
     tenant: env.TENANT_SLUG,
     squad_id: task.squad_id,
     agent_id: agent.id,
     actor: { kind: 'agent', id: agent.id },
-    payload: {
-      task_id: task.id,
-      project_id: task.project_id,
-      agent_id: agent.id,
-      status,
-      title: task.title,
-      substitute_executor_id: substituteExecutorId ?? null,
-      fallback_reason: fallbackReason ?? null,
-    },
+    payload: { task_id: task.id, project_id: task.project_id, agent_id: agent.id, status, title: task.title },
     ts: new Date().toISOString(),
   }
 }

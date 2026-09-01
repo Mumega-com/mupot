@@ -28,11 +28,11 @@ export type GateGrantValidationError =
   | 'invalid_principal_type'
   | 'invalid_principal_id'
 
-/** Gate and action capabilities.
- *  Named `gate:<owner>` (e.g. gate:kasra-core) or `action:<name>` (e.g. action:deploy, action:manage_access).
- *  HTTP/MCP grant paths accept gate:* and action:* by design. */
-export const GATE_OR_ACTION_CAPABILITY_RE = /^(gate|action):[a-zA-Z0-9][a-zA-Z0-9:_-]{0,120}$/
-export const GATE_CAPABILITY_RE = GATE_OR_ACTION_CAPABILITY_RE
+/** Gate capabilities are named `gate:<owner>` (e.g. gate:kasra-core).
+ *  HTTP/MCP grant paths accept gate:* only by design — surface caps
+ *  (content:write, outreach:send-gated, …) also live in gate_grants but are
+ *  minted via preset/dashboard, not grant_gate_capability. */
+export const GATE_CAPABILITY_RE = /^gate:[a-zA-Z0-9][a-zA-Z0-9:_-]{0,120}$/
 
 export function parseGateGrantArgs(input: {
   capability?: unknown
@@ -40,7 +40,7 @@ export function parseGateGrantArgs(input: {
   principal_id?: unknown
 }): { ok: true; capability: string; principalType: GatePrincipalType; principalId: string }
   | { ok: false; error: GateGrantValidationError } {
-  if (typeof input.capability !== 'string' || !GATE_OR_ACTION_CAPABILITY_RE.test(input.capability.trim())) {
+  if (typeof input.capability !== 'string' || !GATE_CAPABILITY_RE.test(input.capability.trim())) {
     return { ok: false, error: 'invalid_capability' }
   }
   if (input.principal_type !== 'member' && input.principal_type !== 'agent') {

@@ -1082,7 +1082,7 @@ studioApp.post('/chat', async (c) => {
     try {
       auth = getAuthContext(c as Context<AppEnv>)
     } catch {
-      auth = (await peekSessionAuth(c as any)) ?? undefined
+      auth = (await peekSessionAuth(c as unknown as Context<AppEnv>)) ?? undefined
     }
   }
   const parsed = await readStudioChatPayload(c.req.raw)

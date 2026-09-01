@@ -1,6 +1,6 @@
 // tests/outbound-alerts-webhook.test.ts — Unit tests for Outbound Webhook & Multi-Channel Alert Router (Flight 10).
 
-import { describe, expect, it, vi, beforeEach } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   signWebhookPayload,
   formatSlackPayload,
@@ -8,9 +8,9 @@ import {
   dispatchOutboundAlert,
 } from '../src/alerts/dispatcher'
 import { alertsApp } from '../src/alerts/routes'
-import { createSqliteD1 } from './helpers/sqlite-d1'
-import { applyAllMigrations } from './helpers/migrations'
 import type { Env } from '../src/types'
+import { applyAllMigrations } from './helpers/migrations'
+import { createSqliteD1 } from './helpers/sqlite-d1'
 
 describe('Outbound Customer Webhooks & Multi-Channel Alert Router (Flight 10)', () => {
   let harness: ReturnType<typeof createSqliteD1>
@@ -20,7 +20,6 @@ describe('Outbound Customer Webhooks & Multi-Channel Alert Router (Flight 10)', 
     harness = createSqliteD1()
     applyAllMigrations(harness.sqlite)
   })
-
   it('computes valid HMAC SHA-256 signature for webhook payloads', async () => {
     const payload = JSON.stringify({ event: 'flight.landed', tenant: 'gaf' })
     const secret = 'placeholder-webhook-secret-key'
@@ -66,11 +65,10 @@ describe('Outbound Customer Webhooks & Multi-Channel Alert Router (Flight 10)', 
       created_at: new Date().toISOString(),
     }
 
-    // Seed webhook subscriptions into org_settings
     await harness.db.prepare(
-      `INSERT INTO org_settings (key, value, updated_at) VALUES ('alert_webhooks', ?1, CURRENT_TIMESTAMP)`,
+      `INSERT INTO org_settings (key, value, updated_at)
+       VALUES ('alert_webhooks', ?1, CURRENT_TIMESTAMP)`,
     ).bind(JSON.stringify([mockSub])).run()
-
     const env = {
       TENANT_SLUG: 'gaf',
       DB: harness.db,
@@ -111,22 +109,22 @@ describe('Outbound Customer Webhooks & Multi-Channel Alert Router (Flight 10)', 
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         url: 'https://webhook.site/test-endpoint',
+        channel_type: 'slack',
         events: ['flight.landed'],
       }),
     })
 
-    const createRes = await alertsApp.fetch(createReq, env as any)
+    const createRes = await alertsApp.fetch(createReq, env)
     expect(createRes.status).toBe(200)
-    const createJson = await createRes.json<{ ok: boolean; webhook: { id: string; url: string } }>()
+    const createJson = await createRes.json<{ ok: boolean; webhook: any }>()
     expect(createJson.ok).toBe(true)
-    expect(createJson.webhook.url).toBe('https://webhook.site/test-endpoint')
+    expect(createJson.webhook.channel_type).toBe('slack')
 
     // 2. List Webhooks
     const listReq = new Request('http://localhost/webhooks')
-    const listRes = await alertsApp.fetch(listReq, env as any)
+    const listRes = await alertsApp.fetch(listReq, env)
     expect(listRes.status).toBe(200)
-    const listJson = await listRes.json<{ ok: boolean; webhooks: any[] }>()
-    expect(listJson.ok).toBe(true)
-    expect(listJson.webhooks.length).toBe(1)
+    const listJson = await listRes.json<{ ok: boolean; webhooks: unknown[] }>()
+    expect(listJson.webhooks).toHaveLength(1)
   })
 })

@@ -1,37 +1,20 @@
 // src/mcp/pots.ts — Sovereign Pot Provisioning MCP Tools.
 
-import type { AuthContext, Env } from '../types'
-import { isOrgAdmin, callerHoldsActionCapability } from '../auth/capability'
+import type { ToolOutcome, ToolSpec } from './index'
+import { isOrgAdmin } from '../auth/capability'
 import { provisionSovereignPot, listSovereignPots } from '../pots/service'
 import type { SovereignPotProvisionInput } from '../pots/types'
 
-export interface ToolOutcome {
-  ok: boolean
-  status: number
-  body: unknown
-  tool?: string
+function done(result: unknown): ToolOutcome {
+  return { ok: true, result }
 }
 
-export interface ToolSpec {
-  name: string
-  scope: string
-  min: 'authenticated' | 'member' | 'lead' | 'admin' | 'owner'
-  args: string
-  inputSchema: {
-    type: 'object'
-    properties: Record<string, unknown>
-    required?: string[]
-    additionalProperties: boolean
-  }
-  run: (auth: AuthContext, env: Env, args: Record<string, unknown>, ctx?: unknown) => Promise<any>
-}
-
-function done(result: unknown): any {
-  return { ok: true, status: 200, body: result }
-}
-
-function fail(status: number, error: string, detail?: unknown): any {
-  return { ok: false, status, body: { ok: false, error, detail } }
+function fail(
+  status: Extract<ToolOutcome, { ok: false }>['status'],
+  error: string,
+  detail?: unknown,
+): ToolOutcome {
+  return { ok: false, status, error, detail }
 }
 
 function str(val: unknown): string | null {
@@ -59,9 +42,8 @@ export const toolPotProvision: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    const canProvision = isOrgAdmin(auth) || (await callerHoldsActionCapability(env, auth, 'action:manage_access'))
-    if (!canProvision) {
-      return fail(403, 'forbidden', 'Only org administrators or callers with action:manage_access can provision sovereign pots.')
+    if (!isOrgAdmin(auth)) {
+      return fail(403, 'forbidden', 'Only org administrators can provision sovereign pots.')
     }
 
     const slug = str(args.slug)
@@ -80,10 +62,9 @@ export const toolPotProvision: ToolSpec = {
         admin_name: str(args.admin_name) || undefined,
         plan_tier: (str(args.plan_tier) as any) || 'enterprise',
         custom_domain: str(args.custom_domain) || undefined,
-        migrations: Array.isArray(args.migrations) ? (args.migrations as string[]) : undefined,
       }
       const result = await provisionSovereignPot(env, input)
-      return done({ ok: true, pot: result })
+      return done({ pot: result })
     } catch (err) {
       return fail(500, 'provisioning_failed', err instanceof Error ? err.message : String(err))
     }
@@ -101,9 +82,8 @@ export const toolPotList: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env) {
-    const canList = isOrgAdmin(auth) || (await callerHoldsActionCapability(env, auth, 'action:manage_access'))
-    if (!canList) {
-      return fail(403, 'forbidden', 'Only org administrators or callers with action:manage_access can list sovereign pots.')
+    if (!isOrgAdmin(auth)) {
+      return fail(403, 'forbidden', 'Only org administrators can list sovereign pots.')
     }
 
     const accountId = env.SECRET_ENV_CF_ACCOUNT_ID || 'e39eaf94f33092c4efd029d94ae1e9dd'
@@ -114,7 +94,7 @@ export const toolPotList: ToolSpec = {
 
     try {
       const pots = await listSovereignPots({ accountId, apiToken })
-      return done({ ok: true, count: pots.length, pots })
+      return done({ count: pots.length, pots })
     } catch (err) {
       return fail(500, 'list_failed', err instanceof Error ? err.message : String(err))
     }

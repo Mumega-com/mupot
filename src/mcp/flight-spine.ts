@@ -655,67 +655,10 @@ const toolRuntimeSeatRegisterPending: ToolSpec = {
   },
 }
 
-import {
-  validateRunSheet,
-  getExecutableStages,
-  computeArtifactSha256,
-} from '../flight/run-sheets'
-
-const toolRunSheetValidate: ToolSpec = {
-  name: 'run_sheet_validate',
-  scope: 'declarative flight run sheet validation',
-  min: 'observer',
-  args: '{ run_sheet: object }',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      run_sheet: OBJECT_SCHEMA,
-    },
-    required: ['run_sheet'],
-    additionalProperties: false,
-  },
-  async run(_auth, _env, args) {
-    const res = validateRunSheet(args.run_sheet)
-    if (!res.ok) {
-      return fail(400, 'invalid_run_sheet', { errors: res.errors })
-    }
-    const executable = getExecutableStages(res.runSheet)
-    return done({
-      valid: true,
-      goalId: res.runSheet.goalId,
-      stagesCount: res.runSheet.stages.length,
-      nextExecutableStages: executable.map((s) => ({ id: s.id, name: s.name, type: s.type, targetSeat: s.targetSeat })),
-    })
-  },
-}
-
-const toolRunSheetArtifactHash: ToolSpec = {
-  name: 'run_sheet_artifact_hash',
-  scope: 'compute deterministic SHA-256 hash for flight artifact',
-  min: 'observer',
-  args: '{ content: string }',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      content: STRING_SCHEMA,
-    },
-    required: ['content'],
-    additionalProperties: false,
-  },
-  async run(_auth, _env, args) {
-    const content = str(args.content)
-    if (content === undefined || content === null) return fail(400, 'invalid_args', 'content is required')
-    const sha256 = await computeArtifactSha256(content)
-    return done({ sha256, byteLength: new TextEncoder().encode(content).length })
-  },
-}
-
 export const FLIGHT_SPINE_TOOLS: ToolSpec[] = [
   toolObjectiveAccept,
   toolObjectiveGet,
   toolExecutionReceiptGet,
   toolTokenBindingAttest,
   toolRuntimeSeatRegisterPending,
-  toolRunSheetValidate,
-  toolRunSheetArtifactHash,
 ]

@@ -1,12 +1,12 @@
 // tests/studio-supabase-data.test.ts — Unit tests for Studio Canvas Supabase Data Feed & Inspector (Flight 8).
 
-import { describe, expect, it, vi, beforeEach } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { studioDataApp } from '../src/dashboard/studio-data-api'
 import { studioPageHtml, type StudioViewData } from '../src/dashboard/studio'
 import { encryptConnectorSecret } from '../src/connectors/crypto'
-import { createSqliteD1 } from './helpers/sqlite-d1'
-import { applyAllMigrations } from './helpers/migrations'
 import type { Env } from '../src/types'
+import { applyAllMigrations } from './helpers/migrations'
+import { createSqliteD1 } from './helpers/sqlite-d1'
 
 const TEST_MASTER_KEY = '000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f'
 
@@ -18,7 +18,6 @@ describe('Studio Canvas Supabase Data Feed & Inspector (Flight 8)', () => {
     harness = createSqliteD1()
     applyAllMigrations(harness.sqlite)
   })
-
   it('serves GET /tables with introspected schema', async () => {
     const mockOpenApi = {
       paths: {
@@ -75,12 +74,10 @@ describe('Studio Canvas Supabase Data Feed & Inspector (Flight 8)', () => {
 
     const encSecret = await encryptConnectorSecret(TEST_MASTER_KEY, 'conn_1', 'supabase', secretPayload)
 
-    // Insert connector row into real D1 table
     await harness.db.prepare(
       `INSERT INTO connectors (id, tenant, type, label, encrypted_secret, created_by, created_at)
        VALUES ('conn_1', 'gaf', 'supabase', 'Supabase Prod', ?1, 'admin_1', CURRENT_TIMESTAMP)`,
     ).bind(encSecret).run()
-
     const env = {
       TENANT_SLUG: 'gaf',
       CONNECTOR_MASTER_KEY: TEST_MASTER_KEY,
@@ -88,7 +85,7 @@ describe('Studio Canvas Supabase Data Feed & Inspector (Flight 8)', () => {
     } as unknown as Env
 
     const req = new Request('http://localhost/tables')
-    const res = await studioDataApp.fetch(req, env as any)
+    const res = await studioDataApp.fetch(req, env)
     expect(res.status).toBe(200)
 
     const json = await res.json<{ ok: boolean; tables: Array<{ name: string; columns: any[] }> }>()
@@ -123,7 +120,6 @@ describe('Studio Canvas Supabase Data Feed & Inspector (Flight 8)', () => {
       `INSERT INTO connectors (id, tenant, type, label, encrypted_secret, created_by, created_at)
        VALUES ('conn_1', 'gaf', 'supabase', 'Supabase Prod', ?1, 'admin_1', CURRENT_TIMESTAMP)`,
     ).bind(encSecret).run()
-
     const env = {
       TENANT_SLUG: 'gaf',
       CONNECTOR_MASTER_KEY: TEST_MASTER_KEY,
@@ -131,12 +127,37 @@ describe('Studio Canvas Supabase Data Feed & Inspector (Flight 8)', () => {
     } as unknown as Env
 
     const req = new Request('http://localhost/query?table=contractors&limit=10')
-    const res = await studioDataApp.fetch(req, env as any)
+    const res = await studioDataApp.fetch(req, env)
     expect(res.status).toBe(200)
 
-    const json = await res.json<{ ok: boolean; data: any[]; count: number }>()
+    const json = await res.json<{ ok: boolean; table: string; count: number; data: any[] }>()
     expect(json.ok).toBe(true)
+    expect(json.table).toBe('contractors')
     expect(json.data.length).toBe(2)
-    expect(json.count).toBe(2)
+    expect(json.data[0].company_name).toBe('Alpha Roofing')
+  })
+
+  it('loads StudioViewData with Supabase table metadata and renders Data Tables tab', async () => {
+    const viewData: StudioViewData = {
+      brand: 'GAF Materials',
+      tenant: 'gaf',
+      tier: 'scale',
+      operator: 'hadi@mumega.com',
+      branch: 'main',
+      flights: [],
+      agents: [],
+      hasSupabase: true,
+      supabaseTables: [
+        { name: 'contractors', columnCount: 5, description: 'Roofing contractors' },
+        { name: 'warranty_claims', columnCount: 8, description: 'Warranty claims' },
+      ],
+    }
+
+    const html = String(studioPageHtml(viewData))
+    expect(html).toContain('Data Tables (2)')
+    expect(html).toContain('studio-database-view')
+    expect(html).toContain('contractors (5 cols)')
+    expect(html).toContain('warranty_claims (8 cols)')
+    expect(html).toContain('✨ Ask Agent About Table')
   })
 })

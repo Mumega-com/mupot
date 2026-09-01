@@ -89,7 +89,7 @@ describe('targeted seat dispatch & isolated mailboxes (Migration 0120)', () => {
       tenant,
       role: 'member',
       channel: 'workspace',
-      capabilities: [{ scope_type: 'squad', scope_id: squadId, capability: 'member' }],
+      capabilities: [{ member_id: senderMemberId, scope_type: 'squad', scope_id: squadId, capability: 'member' }],
     }
 
     // Send targeted message to Seat Alpha
@@ -139,7 +139,7 @@ describe('targeted seat dispatch & isolated mailboxes (Migration 0120)', () => {
       tenant,
       role: 'member',
       channel: 'workspace',
-      capabilities: [{ scope_type: 'squad', scope_id: squadId, capability: 'member' }],
+      capabilities: [{ member_id: familyMemberId, scope_type: 'squad', scope_id: squadId, capability: 'member' }],
     }
 
     // Seat Alpha (cursor-mupot-setup) reads its inbox with consume
@@ -182,7 +182,7 @@ describe('targeted seat dispatch & isolated mailboxes (Migration 0120)', () => {
       tenant,
       role: 'member',
       channel: 'workspace',
-      capabilities: [{ scope_type: 'squad', scope_id: squadId, capability: 'member' }],
+      capabilities: [{ member_id: senderMemberId, scope_type: 'squad', scope_id: squadId, capability: 'member' }],
     }
 
     const familyAuth: AuthContext = {
@@ -191,7 +191,7 @@ describe('targeted seat dispatch & isolated mailboxes (Migration 0120)', () => {
       tenant,
       role: 'member',
       channel: 'workspace',
-      capabilities: [{ scope_type: 'squad', scope_id: squadId, capability: 'member' }],
+      capabilities: [{ member_id: familyMemberId, scope_type: 'squad', scope_id: squadId, capability: 'member' }],
     }
 
     // Send two new messages
@@ -241,7 +241,7 @@ describe('targeted seat dispatch & isolated mailboxes (Migration 0120)', () => {
       tenant,
       role: 'member',
       channel: 'workspace',
-      capabilities: [{ scope_type: 'squad', scope_id: squadId, capability: 'member' }],
+      capabilities: [{ member_id: senderMemberId, scope_type: 'squad', scope_id: squadId, capability: 'member' }],
     }
 
     const familyAuth: AuthContext = {
@@ -250,7 +250,7 @@ describe('targeted seat dispatch & isolated mailboxes (Migration 0120)', () => {
       tenant,
       role: 'member',
       channel: 'workspace',
-      capabilities: [{ scope_type: 'squad', scope_id: squadId, capability: 'member' }],
+      capabilities: [{ member_id: familyMemberId, scope_type: 'squad', scope_id: squadId, capability: 'member' }],
     }
 
     // Send targeted message to Seat Alpha

@@ -55,17 +55,9 @@ export interface DispatchBridgeInput {
   dispatchedByMemberId: string
   /** Authoritative tasks.project_id inherited by the bus consumer. */
   projectId?: string | null
-  /** Optional exact seat target (e.g. "hadi-grok", "river-cursor") to prevent sibling seat HoL blocking */
-  targetSeat?: string | null
 }
 
-export type BridgeResult = {
-  delivered: true
-  seq: number
-  duplicate: boolean
-  body_length?: number
-  checksum_sha256?: string
-}
+export type BridgeResult = { delivered: true; seq: number; duplicate: boolean }
 
 /**
  * InboxFullError — distinguishes backpressure (the recipient is at MAX_UNREAD_PER_RECIPIENT, a
@@ -93,17 +85,21 @@ export class InboxFullError extends Error {}
  */
 export async function deliverDispatchToInbox(env: Env, input: DispatchBridgeInput): Promise<BridgeResult> {
   const body = JSON.stringify({
+    version: 'runtime.dispatch/v1',
     type: 'task_dispatch',
     task_id: input.taskId,
     dispatch_receipt_id: input.receiptId,
     squad_id: input.squadId,
+    // The consumer already resolved agentId from the persisted fleet route. Do
+    // not accept a second caller-controlled address that could diverge from the
+    // actual durable inbox target.
+    runtime_address: input.agentId,
   })
 
   const res = await sendAgentMessage(env, {
     fromAgent: DISPATCH_BRIDGE_SENDER,
     fromMember: input.dispatchedByMemberId,
     toAgent: input.agentId,
-    targetSeat: input.targetSeat ?? undefined,
     kind: 'request',
     body,
     requestId: dispatchInboxRequestId(input.receiptId),
@@ -124,13 +120,7 @@ export async function deliverDispatchToInbox(env: Env, input: DispatchBridgeInpu
         (res.detail ? ` — ${res.detail}` : ''),
     )
   }
-  return {
-    delivered: true,
-    seq: res.seq,
-    duplicate: res.duplicate,
-    body_length: res.body_length,
-    checksum_sha256: res.checksum_sha256,
-  }
+  return { delivered: true, seq: res.seq, duplicate: res.duplicate }
 }
 
 /**

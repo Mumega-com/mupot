@@ -10,11 +10,6 @@ import { classify, humanAge, type FleetLiveness } from '../dashboard/fleet'
 import type { AgentIdentity } from '../auth/member-bearer'
 import { listFlights } from '../flight/service'
 import { scheduleStates, attachSchedule, type ScheduleStatus } from './schedule-state'
-export {
-  parseSevenAxisCheckin,
-  sevenAxisHasValues,
-  type SevenAxisPresence,
-} from '../presence/seven-axis'
 
 // Allowed runtime sources — an unknown/invalid value normalizes to 'unknown'
 // (never trusts the client's raw string into storage unbounded).
@@ -76,11 +71,6 @@ export interface SevenAxisDeclaration {
   provider: string | null
   effort: SevenAxisEffort | null
   flight_id: string | null
-  folder?: string | null
-  thread?: string | null
-  continuum_name?: string | null
-  session_epoch?: number | null
-  lease_ttl_sec?: number | null
 }
 
 export interface CheckinOpts {
@@ -93,25 +83,11 @@ export interface CheckinOpts {
   provider?: unknown
   effort?: unknown
   flight_id?: unknown
-  folder?: unknown
-  thread?: unknown
-  continuum_name?: unknown
-  session_epoch?: unknown
-  lease_ttl_sec?: unknown
 }
 
 export function resolveSeatLabel(opts: CheckinOpts): string {
   const seat = sanitizeAxisString(opts.seat)
   if (seat) return seat
-  // If machine, harness, folder or thread are provided, build composite seat label
-  const machine = sanitizeAxisString(opts.machine)
-  const harness = opts.harness ? String(opts.harness) : null
-  const folder = sanitizeAxisString(opts.folder)
-  const thread = sanitizeAxisString(opts.thread)
-  if (machine || folder || thread) {
-    const parts = [machine || 'local', harness || 'unknown', folder || 'root', thread || 'main']
-    return parts.join(':')
-  }
   const label = typeof opts.label === 'string' ? opts.label.trim().slice(0, 120) : ''
   return label
 }
@@ -125,11 +101,6 @@ export function normalizeSevenAxis(opts: CheckinOpts): SevenAxisDeclaration {
     provider: sanitizeAxisString(opts.provider),
     effort: normalizeEffort(opts.effort),
     flight_id: sanitizeAxisString(opts.flight_id, 64),
-    folder: sanitizeAxisString(opts.folder),
-    thread: sanitizeAxisString(opts.thread),
-    continuum_name: sanitizeAxisString(opts.continuum_name),
-    session_epoch: typeof opts.session_epoch === 'number' && Number.isInteger(opts.session_epoch) && opts.session_epoch > 0 ? opts.session_epoch : null,
-    lease_ttl_sec: typeof opts.lease_ttl_sec === 'number' && Number.isInteger(opts.lease_ttl_sec) && opts.lease_ttl_sec > 0 ? opts.lease_ttl_sec : null,
   }
 }
 
@@ -149,9 +120,6 @@ export interface PresenceRow {
   provider?: string | null
   effort?: string | null
   flight_id?: string | null
-  folder?: string | null
-  thread?: string | null
-  continuum_name?: string | null
 }
 
 export interface PresenceView extends PresenceRow {
@@ -211,17 +179,12 @@ export function sqliteUtcToMs(s: string | null): number | null {
 }
 
 function bindSevenAxis(opts: CheckinOpts): {
-  harness: string | null
+  harness: SevenAxisHarness | null
   machine: string | null
   model: string | null
   provider: string | null
-  effort: string | null
+  effort: SevenAxisEffort | null
   flight_id: string | null
-  folder: string | null
-  thread: string | null
-  continuum_name: string | null
-  session_epoch: number | null
-  lease_ttl_sec: number | null
 } {
   // Omitted axes bind NULL so ON CONFLICT COALESCE keeps a previously declared value.
   // An explicit empty / unknown-invalid harness still stores 'unknown'.
@@ -232,11 +195,6 @@ function bindSevenAxis(opts: CheckinOpts): {
     provider: sanitizeAxisString(opts.provider),
     effort: normalizeEffort(opts.effort),
     flight_id: sanitizeAxisString(opts.flight_id, 64),
-    folder: sanitizeAxisString(opts.folder),
-    thread: sanitizeAxisString(opts.thread),
-    continuum_name: sanitizeAxisString(opts.continuum_name),
-    session_epoch: typeof opts.session_epoch === 'number' && Number.isInteger(opts.session_epoch) && opts.session_epoch > 0 ? opts.session_epoch : null,
-    lease_ttl_sec: typeof opts.lease_ttl_sec === 'number' && Number.isInteger(opts.lease_ttl_sec) && opts.lease_ttl_sec > 0 ? opts.lease_ttl_sec : null,
   }
 }
 
@@ -253,28 +211,22 @@ export async function recordCheckin(
   await env.DB.prepare(
     `INSERT INTO presence (
         tenant, member_id, display_name, source, label, seat, agent_id,
-        harness, machine, model, provider, effort, flight_id, folder, thread, continuum_name,
-        session_epoch, lease_ttl_sec,
+        harness, machine, model, provider, effort, flight_id,
         first_seen_at, last_seen_at
       )
-      VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, COALESCE(?7, 'unknown'), ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, COALESCE(?16, 1), COALESCE(?17, 180), datetime('now'), datetime('now'))
+      VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, COALESCE(?7, 'unknown'), ?8, ?9, ?10, ?11, ?12, datetime('now'), datetime('now'))
       ON CONFLICT(tenant, member_id, label) DO UPDATE SET
-        display_name   = excluded.display_name,
-        source         = excluded.source,
-        seat           = excluded.seat,
-        agent_id       = excluded.agent_id,
-        harness        = CASE WHEN ?7 IS NULL THEN presence.harness ELSE excluded.harness END,
-        machine        = COALESCE(?8, presence.machine),
-        model          = COALESCE(?9, presence.model),
-        provider       = COALESCE(?10, presence.provider),
-        effort         = COALESCE(?11, presence.effort),
-        flight_id      = COALESCE(?12, presence.flight_id),
-        folder         = COALESCE(?13, presence.folder),
-        thread         = COALESCE(?14, presence.thread),
-        continuum_name = COALESCE(?15, presence.continuum_name),
-        session_epoch  = COALESCE(?16, presence.session_epoch),
-        lease_ttl_sec  = COALESCE(?17, presence.lease_ttl_sec),
-        last_seen_at   = datetime('now')`,
+        display_name = excluded.display_name,
+        source       = excluded.source,
+        seat         = excluded.seat,
+        agent_id     = excluded.agent_id,
+        harness      = CASE WHEN ?7 IS NULL THEN presence.harness ELSE excluded.harness END,
+        machine      = COALESCE(?8, presence.machine),
+        model        = COALESCE(?9, presence.model),
+        provider     = COALESCE(?10, presence.provider),
+        effort       = COALESCE(?11, presence.effort),
+        flight_id    = COALESCE(?12, presence.flight_id),
+        last_seen_at = datetime('now')`,
   )
     .bind(
       env.TENANT_SLUG,
@@ -289,26 +241,16 @@ export async function recordCheckin(
       axis.provider,
       axis.effort,
       axis.flight_id,
-      axis.folder,
-      axis.thread,
-      axis.continuum_name,
-      axis.session_epoch,
-      axis.lease_ttl_sec,
     )
     .run()
   return {
     seat: label,
-    harness: (axis.harness ?? 'unknown') as SevenAxisHarness,
+    harness: axis.harness ?? 'unknown',
     machine: axis.machine,
     model: axis.model,
     provider: axis.provider,
-    effort: axis.effort as SevenAxisEffort | null,
+    effort: axis.effort,
     flight_id: axis.flight_id,
-    folder: axis.folder,
-    thread: axis.thread,
-    continuum_name: axis.continuum_name,
-    session_epoch: axis.session_epoch,
-    lease_ttl_sec: axis.lease_ttl_sec,
   }
 }
 
@@ -351,7 +293,7 @@ export async function touchPresence(
 }
 
 const PRESENCE_SELECT = `SELECT member_id, display_name, source, label, agent_id, last_seen_at, first_seen_at,
-       harness, machine, model, provider, effort, flight_id, folder, thread, continuum_name
+       harness, machine, model, provider, effort, flight_id
        FROM presence WHERE tenant = ?1`
 
 /**
@@ -407,9 +349,6 @@ export async function listPresence(env: Env, nowMs: number, squadIds?: string[] 
       provider: r.provider ?? null,
       effort: r.effort ?? null,
       flight_id: r.flight_id ?? null,
-      folder: r.folder ?? null,
-      thread: r.thread ?? null,
-      continuum_name: r.continuum_name ?? null,
       liveness: classify(ms, nowMs),
       last_seen_human: humanAge(ms, nowMs),
     }

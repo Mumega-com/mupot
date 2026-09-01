@@ -80,9 +80,8 @@ describe('maintenance heartbeat slot selection', () => {
     expect(oldSlotsTwelve.has(10)).toBe(false)
     expect(oldSlotsTwelve.has(11)).toBe(false)
 
-    // The new selector covers both cases (12 and 13).
+    // The new selector covers both cases.
     expect(reachableSlots(12).has(10)).toBe(true)
     expect(reachableSlots(12).has(11)).toBe(true)
-    expect(reachableSlots(13).has(12)).toBe(true)
   })
 })

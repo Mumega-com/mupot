@@ -35,8 +35,8 @@ import type {
 } from '../types'
 import { resolveCapabilities, hasCapability } from '../auth/capability'
 import { createBus } from '../bus'
+import { sha256Hex } from '../lib/canonical-json'
 import { getAdapter } from './registry'
-import { wrapIngressContent } from '../ingress/guards'
 import { sendToRef, resolveVisibleSendTarget } from '../agents/messages'
 import { createTask } from '../tasks/service'
 
@@ -390,14 +390,22 @@ export async function runInbound(
   // 4) Capabilities for this member (the real RBAC).
   const grants = await resolveCapabilities(env, identity.memberId)
 
-  // ── Central-command (mumega-com#722 & FLIGHT-UNTRUSTED / F6): Structural Ingress Fence
-  const ingress = wrapIngressContent(platform, externalUserId, text)
-  const isDirective = ingress.isDirective
+  // ── Central-command (mumega-com#722): Hadi-only directive rule, enforced IN
+  // CODE on the existing caller-authority seam. Sender id is the platform's
+  // immutable from.id (the adapter already guarantees identity = sender, never
+  // chat or text — src/channels/adapters/telegram.ts header). Any other sender,
+  // including agent-relayed text, is UNTRUSTED-INGRESS: data, never authorization.
+  const DIRECTIVE_SENDERS: Readonly<Record<string, ReadonlyArray<string>>> = {
+    telegram: ['765204057'], // Hadi, platform-authenticated sender id
+  }
+  const isDirective =
+    (DIRECTIVE_SENDERS[platform] ?? []).includes(externalUserId)
 
   // mention -> agent dispatch. The body dispatched to the agent carries the
   // untrusted tag unless the sender is directive-capable.
   if (intent.kind === 'mention') {
-    return dispatchMention(env, squad, intent.target, ingress.sanitizedBody, identity.memberId, grants, isDirective)
+    const tag = isDirective ? '' : '[UNTRUSTED-INGRESS] '
+    return dispatchMention(env, squad, intent.target, `${tag}${text}`, identity.memberId, grants, isDirective)
   }
 
   // Non-directive senders never reach directive-capable actions (wake/task/steer).
@@ -612,10 +620,13 @@ async function sosBusSend(
 ): Promise<string> {
   const id = crypto.randomUUID()
   const tenant = env.TENANT_SLUG ?? 'mumega'
+  const auditBody = `[sos-bus] ${body}`
+  const auditChecksum = await sha256Hex(auditBody)
   await env.DB.prepare(
-    `INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, created_at)
-     VALUES (?1, ?2, ?3, ?4, 'system', 'message', ?5, datetime('now'))`
-  ).bind(id, tenant, target, 'central-command', `[sos-bus] ${body}`).run()
+    `INSERT INTO agent_messages
+       (id, tenant, to_agent, from_agent, from_member, kind, body, created_at, body_length, checksum_sha256)
+     VALUES (?1, ?2, ?3, ?4, 'system', 'message', ?5, datetime('now'), ?6, ?7)`
+  ).bind(id, tenant, target, 'central-command', auditBody, auditBody.length, auditChecksum).run()
 
   return `@${target} is SOS-native and NOT REACHED: no SOS bridge exists, so this message was only recorded for audit (id: ${id.slice(0, 8)}). Nobody received it — deliver it another way.`
 }

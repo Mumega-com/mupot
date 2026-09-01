@@ -25,10 +25,11 @@ import { requireAuth } from '../auth'
 // row on PATCH), so we check inline rather than as static route middleware.
 import { resolveCapabilities, hasCapability, hasSurfaceCap, isOrgAdmin } from '../auth/capability'
 import { orgAdminForbiddenPayload, ORG_ADMIN_REFUSAL_LINKS } from '../auth/refusal'
-import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, TaskEvidenceFenceError, TaskSelfGateError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution, assigneeSelfClose, assigneeCannotMutateOwnAssignment, TaskIntakeContractError, assertValidIntakeContract, evaluateTaskIntakeContract, isTaskStatus, ALL_TASK_STATUSES } from './service'
+import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, TaskEvidenceFenceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution, assigneeSelfClose, assigneeCannotMutateOwnAssignment, TaskIntakeContractError, assertValidIntakeContract, evaluateTaskIntakeContract, isTaskStatus, ALL_TASK_STATUSES } from './service'
 import type { TaskStatus } from './service'
 import { resolveTaskAssignee } from './assignee'
 import { verifyTaskArtifactShape } from './artifact-verification'
+import { hasIndependentRuntimeGate, listTaskDispatchReceiptTimeline } from './runtime-receipts'
 export { resolveTaskAssignee as resolveAssignee } from './assignee'
 import { createBus } from '../bus'
 import type { BusEvent } from '../types'
@@ -472,7 +473,8 @@ tasksApp.get('/:id', async (c) => {
     return c.json({ error: 'forbidden', need: 'member' }, 403)
   }
 
-  return c.json({ task })
+  const dispatchTimeline = await listTaskDispatchReceiptTimeline(c.env, task.id)
+  return c.json({ task, dispatch_timeline: dispatchTimeline })
 })
 
 // ── POST / — create a task (optionally dispatch it for execution) ─────────────
@@ -560,6 +562,16 @@ tasksApp.post('/', async (c) => {
       400,
     )
   }
+  if (
+    body.dispatch === true
+    && assigneeAgentId !== null
+    && !(await hasIndependentRuntimeGate(c.env, gateOwner, assigneeAgentId, squad.id))
+  ) {
+    return c.json({
+      error: 'independent_gate_required',
+      detail: 'Dispatch-now requires an active different-agent gate grant with a live credential and member authority on the task squad.',
+    }, 409)
+  }
 
   // priority: optional rank. Omitted/null = untriaged (a real state, not a default).
   // Mirrors the PATCH route's null-vs-valid semantics.
@@ -599,9 +611,6 @@ tasksApp.post('/', async (c) => {
       skipEvent: body.dispatch === false,
     })
   } catch (error) {
-    if (error instanceof TaskSelfGateError) {
-      return c.json({ error: 'self_gate_conflict', detail: error.message }, 409)
-    }
     if (error instanceof TaskIntakeContractError) {
       return c.json({ error: error.code, detail: error.message }, 400)
     }
@@ -987,9 +996,6 @@ tasksApp.patch('/:id', async (c) => {
   try {
     await persistTaskUpdate(c.env, existing, next)
   } catch (error) {
-    if (error instanceof TaskSelfGateError) {
-      return c.json({ error: 'self_gate_conflict', detail: error.message }, 409)
-    }
     if (error instanceof TaskIntakeContractError) {
       return c.json({ error: error.code, detail: error.message }, 400)
     }
@@ -1037,46 +1043,6 @@ tasksApp.patch('/:id', async (c) => {
   }
 
   return c.json({ task: next })
-})
-
-// ── POST /:id/result — external runtime & bound-seat completion evidence reporting (Issue #1183) ──
-tasksApp.post('/:id/result', async (c) => {
-  const id = c.req.param('id')
-  let body: { result?: unknown; status?: unknown; gate_owner?: unknown }
-  try {
-    body = (await c.req.json()) as { result?: unknown; status?: unknown; gate_owner?: unknown }
-  } catch {
-    return c.json({ error: 'invalid_json' }, 400)
-  }
-
-  const result = typeof body.result === 'string' ? body.result.trim() : ''
-  if (!result) {
-    return c.json({ error: 'invalid_args', detail: 'result is required' }, 400)
-  }
-
-  const status = (body.status === 'in_progress' || body.status === 'review' || body.status === 'done')
-    ? body.status
-    : undefined
-
-  const gateOwner = body.gate_owner !== undefined
-    ? (body.gate_owner === null ? null : String(body.gate_owner).trim())
-    : undefined
-
-  try {
-    const { reportTaskResult } = await import('./report-result')
-    const outcome = await reportTaskResult(c.env, c.get('auth'), {
-      taskId: id,
-      result,
-      status,
-      gateOwner,
-    })
-    return c.json(outcome)
-  } catch (err: any) {
-    if (err.name === 'TaskReportResultError') {
-      return c.json({ error: err.code, detail: err.message, ...(err.data || {}) }, err.status)
-    }
-    return c.json({ error: 'report_result_failed', detail: err instanceof Error ? err.message : String(err) }, 500)
-  }
 })
 
 // ── POST /:id/local-smoke-complete — local browser harness result injection ──

@@ -3,18 +3,25 @@
 **Status:** ready to run after the durable inbox routes are deployed to `mupot.mumega.com`
 and Hadi wires the host-side runtime handlers.
 **Audience:** Hadi (operator — mints, config, deploy) + Kasra (prep, verify).
-**Discipline:** every step ends in a RECEIPT, not a grade. Keep the SOS bus live as fallback until each surface is verified on mupot.
+**Discipline:** every step ends in a RECEIPT, not a grade. The current target is
+the Mupot/Herdr Host-Go handoff; its selected evidence chain must have
+`no_live_sos_wiring`.
 
-This runbook migrates the kasra squad — five arms (`kasra-code`, `kasra-comms`, `kasra-review`, `kasra-research`, `brain`) plus `kasra` itself — off the SOS bus (`mcp.mumega.com` SSE / local Redis streams) onto the mupot pot's MCP seam.
+This runbook records the Mupot/Herdr Host-Go handoff for the kasra squad — five
+arms (`kasra-code`, `kasra-comms`, `kasra-review`, `kasra-research`, `brain`)
+plus `kasra` itself — through the mupot pot's MCP seam.
 
 Every claim below is grounded in code. Where a step still needs host/operator
 wiring, it is flagged as such — not papered over.
 
 ---
 
-## 0. What the arms call today vs what mupot exposes
+## 0. Historical interface inventory vs current Mupot surface
 
-The arms' frontmatter lists `mcp__mumega-bus__*` tools (SOS bus). The mupot seam (`src/mcp/index.ts`) registers a SMALLER, differently-shaped tool surface. The full mupot tool set is the `TOOLS` array (`src/mcp/index.ts`) + `PROVISION_TOOLS` (`src/mcp/provision.ts`):
+This is a historical inventory, not a live operating instruction. The mupot
+seam (`src/mcp/index.ts`) registers a smaller, differently-shaped tool surface.
+The full mupot tool set is the `TOOLS` array (`src/mcp/index.ts`) +
+`PROVISION_TOOLS` (`src/mcp/provision.ts`):
 
 | mupot tool | file | min capability | scope |
 |---|---|---|---|
@@ -207,9 +214,9 @@ Each arm must present its OWN welded token so `auth.boundAgentId` resolves to th
 
 ---
 
-## 3. Rewire the cold-start wake hooks
+## 3. Host-Go wake-hook evidence
 
-### 3.1 What the hooks do today (Redis-direct)
+### 3.1 Historical hook inventory (Redis-direct)
 
 - **`~/.claude/hooks/check-inbox.sh`** — Stop-hook. Reads three Redis streams directly via `redis-cli XREVRANGE`: `sos:stream:project:sos:agent:<agent>`, `…global…`, `…legacy…` (`check-inbox.sh:45-47, 63-83`). Parses payloads, injects pending messages as context, and for worker arms BLOCKS the Stop when a new `[request_id:` delegation lands so the arm auto-continues (`check-inbox.sh:147-157`).
 - **`agents/kasra/branches/activation-watcher.sh`** — cron/poll loop. For each worker, `redis-cli XRANGE` the project stream past a cursor (`activation-watcher.sh:58, 70`), pipes the raw dump to `verify-delegation.py`, and on a verified launch decision spawns a headless `claude -p --agent <W>` session (`activation-watcher.sh:104-110`).
@@ -266,9 +273,9 @@ and exiting `0` so the daemon consumes the batch.
 
 ---
 
-## 4. Cutover order + rollback
+## 4. Host-Go handoff order + rollback
 
-**Principle:** memory + identity FIRST (idempotent, reversible, no message-loss risk), messaging SECOND, wake-hooks LAST (gated by live host receipts, not by route availability). Keep SOS bus running the whole time; flip one arm at a time; verify each with a receipt.
+**Principle:** memory + identity FIRST (idempotent, reversible, no message-loss risk), messaging SECOND, wake-hooks LAST (gated by live host receipts, not by route availability). Verify each selected evidence chain with a receipt.
 
 ### Sequence
 
@@ -280,28 +287,32 @@ and exiting `0` so the daemon consumes the batch.
    - Private memory remains per-member-token: `remember`/`recall` use `scope = member:<memberId>` (`src/mcp/index.ts`), which the MemoryPort maps to `engrams.agent_id` and filters Vectorize by `{ agentId: scope, tenant }` (`src/memory/index.ts`).
    - Then verify shared squad memory: `squad_remember { text: "shared-cutover-probe-<ts>" }` from arm A returns `{ engram_id, squad_id, scope: "squad:<id>" }`, and `squad_recall { query: "shared-cutover-probe" }` from arm B in the same squad returns the probe.
    - Shared memory uses `scope = squad:<squadId>` and the same tenant-filtered MemoryPort. Writes require `member` on the target squad; reads require `observer` on the target squad.
-   - Rollback: revert the arm's `recall`/`remember`/`squad_recall`/`squad_remember` prefixes to `mcp__mumega-bus__*`. Zero data loss — bus memory untouched.
+   - Rollback: restore the previously recorded runtime configuration. Zero data loss —
+     private and squad memory remain scoped by their recorded identities.
 
 3. **Messaging cutover (per arm, reversible).** Repoint `send`/`inbox` for one arm (start with **kasra-review** — zero-gap, section 2.4). Receipt:
    - From arm A's token: `send { to: "<arm-B-slug>", body: "ping", request_id: "<uuid>" }` → `{ id, seq, duplicate:false, to }` (`src/mcp/index.ts`).
    - From arm B's token: `inbox {}` → the ping appears in `messages[]`, `remaining` decrements (`src/mcp/index.ts`). That round-trip is the receipt.
    - Note: `send` requires BOTH ends agent-bound (`src/mcp/index.ts`) and same-tenant (recipient resolved via `resolveAgentRef`, this pot only, `src/mcp/index.ts`). Cross-pot messaging is NOT possible — by design.
-   - Rollback: revert prefixes to `mcp__mumega-bus__*`. SOS bus still carries traffic for un-migrated arms.
+   - Rollback: restore the previously recorded runtime configuration and retain the
+     receipt that identifies the affected arm.
 
 4. **Absorb the remaining per-arm surfaces (section 1.4).**
    - kasra-code and brain can now move task reads/updates to Mupot via `task_list`,
-     `task_board`, and `task_update`; verify one list/update receipt before removing
-     their SOS task tools.
-   - `check_in` can now move to Mupot MCP directly; verify one check-in receipt before removing any SOS presence/check-in hook.
-   - `peers` can now move to Mupot MCP directly; verify that kasra-comms or brain sees its squad roster before removing the SOS `peers` hook.
-   - kasra-comms `broadcast` can now move to Mupot MCP directly; verify one fan-out receipt and one recipient inbox receipt before removing the SOS `broadcast` hook.
+     `task_board`, and `task_update`; verify one list/update receipt before the
+     runtime handoff.
+   - `check_in` can now move to Mupot MCP directly; verify one check-in receipt.
+   - `peers` can now move to Mupot MCP directly; verify that kasra-comms or brain
+     sees its squad roster.
+   - kasra-comms `broadcast` can now move to Mupot MCP directly; verify one
+     fan-out receipt and one recipient inbox receipt.
 
 5. **Wake-hooks cutover — host wiring step.** `/api/inbox/signed` and the
    maintained local handler now exist in this branch; do NOT migrate the hooks
    until the target host has a passing receipt bundle. Until then: arms can run
-   on mupot for memory + messaging, but cold-start delegation still flows
-   through SOS Redis (`activation-watcher.sh`). This is a fine intermediate
-   state — the hooks are the LAST thing to move.
+   on mupot for memory + messaging. The neutral gate proves only that the
+   selected evidence chain has no live SOS dependency; it makes no claim about
+   unrelated host services.
    - Host install: run `npm run fleet:install` from a checkout, or
      `node fleet-runtime/install.mjs`, to lay down `~/.fleet/runtime`, editable
      config templates, receipt directories, and systemd user units. For evidence
@@ -345,10 +356,10 @@ and exiting `0` so the daemon consumes the batch.
      a signed `fleet-control.v1` request and reached the flight layer.
      The preceding host receipt must verify `panel_public_key_public_only` so the
      host stores only the panel public Ed25519 JWK, never `FLEET_PANEL_SK`.
-   - Final cutover gate: after saving the host, runtime, and start/stop control
+   - Final Host-Go gate: after saving the host, runtime, and start/stop control
      receipts, run `node ~/.fleet/runtime/cutover-receipt.mjs --agent <agent_id> --host <host.json> --runtime <runtime.json> --control <control-start.json> --control <control-stop.json>`.
-     A `mupot-sos-cutover-gate/v1` `status:"pass"` is the receipt that permits
-     removing that agent's SOS bus/wake path.
+     A `mupot-host-go-cutover/v1` `status:"pass"` records the Mupot/Herdr
+     handoff and includes `no_live_sos_wiring` for the selected evidence chain.
    - Preferred evidence pack: run `node ~/.fleet/runtime/receipt-bundle.mjs
      --agent <agent_id> --out-dir ~/.fleet/receipts/<agent_id>
      --install-receipt ~/.fleet/receipts/install.json --skip-runtime
@@ -415,7 +426,9 @@ and exiting `0` so the daemon consumes the batch.
      `manifest.json.next_steps` is advisory and should explain the next missing
      operator action when the bundle is not ready.
 
-6. **Decommission SOS per surface, not all-at-once.** Only after an arm's memory + messaging + wake are all verified on mupot AND stable for a few cycles, drop that arm's `mumega-bus` allowlist entries. Keep the bus token valid (don't revoke) until the whole squad is migrated and Hadi signs off — the bus is the rollback floor.
+6. **Record the completed Host-Go handoff.** After an arm's memory, messaging,
+   and wake evidence is complete, attach the verified bundle and record the
+   selected Mupot/Herdr handoff scope.
 
 ### Receipt summary (what "done" looks like, per step)
 
@@ -433,19 +446,16 @@ and exiting `0` so the daemon consumes the batch.
 | runtime live | `runtime-receipt.mjs --agent <id>` emits `mupot-fleet-runtime-receipt/v1` with `status:"pass"` |
 | control live | `control-receipt.mjs` emits `mupot-fleet-control-receipt/v1` with `status:"pass"` |
 | probe queue | `cutover-probe.mjs` emits `mupot-fleet-cutover-probe/v1` after queuing inbox/control evidence inputs |
-| SOS cutover gate | `cutover-receipt.mjs` emits `mupot-sos-cutover-gate/v1` with `status:"pass"` for that agent |
+| Host-Go gate | `cutover-receipt.mjs` emits `mupot-host-go-cutover/v1` with `status:"pass"` and `no_live_sos_wiring` for that agent |
 | receipt bundle | `receipt-bundle.mjs` writes optional `install.json`, optional `probe-*.json`, `mupot-fleet-receipt-bundle/v1` `manifest.json` with receipt-artifact SHA-256 hashes and advisory `next_steps`, and `cutover-gate.json`; `--verify-only` rechecks saved evidence without live host polling; `--status` emits `mupot-fleet-receipt-bundle-status/v1` for in-progress host-go evidence without writing files; `--export` emits `mupot-fleet-receipt-bundle-export/v1`, creates a clean attachable directory, writes `export-receipt.json` plus `manifest-check.json`, and checks it; `--check-manifest` emits `mupot-fleet-receipt-bundle-check/v1` without rewriting files, verifies copied evidence and sidecars, rejects secret material or extra files, and rejects contradictory `next_steps`; `manifest.json` and `cutover-gate.json` must both report `status:"pass"` |
 | wake-hook (post-route) | watcher launches a session from a mupot `inbox` poll, logged in `watcher.log` |
 
 ---
 
-## 5. What stays on SOS / Hadi-go vs Kasra
+## 5. Mupot/Herdr handoff authority
 
-### Stays on SOS (do not migrate yet)
-- **Cold-start wake-hooks** — keep on SOS until the target host's receipt bundle
-  proves install, queued probes, signed inbox handoff, signed lifecycle control,
-  and the final cutover gate.
-- **The SOS bus token itself** — keep live as the rollback floor until the full squad is verified on mupot.
+The Host-Go receipt is scoped to the selected host/runtime/control evidence
+chain. It neither changes nor inventories unrelated services.
 
 ### Hadi-go (his DIRECT approval / runtime lane — per CLAUDE.md SECURITY APPROVAL PROTOCOL)
 - **Minting all six tokens** (token/identity mint — high-stakes, `src/mcp/provision.ts`). His direct go.
@@ -454,7 +464,6 @@ and exiting `0` so the daemon consumes the batch.
 - **Deploying the signed fleet/inbox routes** (`/api/fleet/detach-signed` and `/api/inbox/signed`; mupot worker deploy — arms never deploy; CLAUDE.md hard rule).
 - **Installing `fleet-control-daemon.mjs` on the host** (runtime start/stop lane; host process control).
 - **Installing/configuring `inbox-handler.mjs` on the host** (runtime wake-hook lane; launches local sessions from Mupot inbox batches).
-- **Revoking the SOS bus token** (final decommission — irreversible-ish; his sign-off).
 
 ### Kasra (mine — prep + verify, no mint, no deploy, no config write)
 - **Prep the exact mint calls** (section 1.3) and the config diffs (section 2.4) — hand to Hadi.
@@ -475,8 +484,8 @@ and exiting `0` so the daemon consumes the batch.
    receipt for config/key/handler readiness before live attach/inbox/control
    smoke, and `fleet-runtime/runtime-receipt.mjs` gives a one-cycle live receipt
    for signed attach plus inbox handoff once an agent is actually up.
-2. **Final SOS removal gate** — `fleet-runtime/cutover-receipt.mjs` now verifies
+2. **Final Host-Go gate** — `fleet-runtime/cutover-receipt.mjs` now verifies
    saved host/runtime/control receipts and refuses `status:"pass"` unless the
    selected agent has host readiness, runtime inbox handoff, and start+stop
-   lifecycle evidence. Run it before deleting any SOS runtime wiring.
+   lifecycle evidence plus `no_live_sos_wiring`.
 3. **Dropping `verify-delegation.py` HMAC** — safe only after the host handler diff proves it reads from signed Mupot inbox batches and does not trust client-supplied routing. Security-relevant; must pass diverse review.

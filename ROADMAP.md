@@ -8,16 +8,17 @@ numbers.
 
 | State | Version | Meaning |
 |---|---|---|
-| Cut version | `v0.30.0` | Governed Tools, Marketing/CRO Pilot, Identity and Unified Access, and Console Consolidation. |
+| Current source version | `0.30.0` | Present on `main`; preview until the stabilization gate passes and `v0.30.0` is tagged. |
 | Last tagged release | `v0.25.0` | Project Routines and Needs You. |
-| Development target | `v0.31.0` | Agent Computers and Recovery. |
-| Next planned | `v0.32.0` | Compounding Project Knowledge. |
+| Next stable candidate | `v0.30.0` | Stabilization-only: security train, messaging reliability, release proof, and backlog closure. |
+| Future development target | `v0.31.0` | Agent Computers and Recovery; held until `v0.30.0` is stable. |
 
-Code merged or deployed after the `v0.30.0` cut is not retroactively part of
-`v0.30.0`. Capabilities remain preview until the release that owns them passes its
-gate and is tagged.
+`0.30.0` is the version the source currently reports. It is **not** yet a stable
+release: no `v0.30.0` tag or GitHub release exists. Code on `main` remains preview
+until one exact commit passes the release gate below and is tagged. Deployment alone
+does not make a capability stable.
 
-## Versioning unblocked — `v0.29.0` cut, tag still owed (2026-08-08)
+## Versioning truth — source cuts exist, release tags are still owed
 
 [#805](https://github.com/Mumega-com/mupot/issues/805) is resolved. The blocker was
 that the version constants were pinned by a published tenant receipt and the
@@ -28,7 +29,7 @@ assertions were decoupled from the live constants — and
 `package.json`, `src/version.ts` (`MUPOT_PUBLIC_API_VERSION`), and `CHANGELOG.md`
 (`## 0.29.0 — 2026-08-08`) all read `0.29.0`.
 
-Two consequences this document now carries:
+Three consequences this document now carries:
 
 1. **`0.29.0` was renumbered out of the plan.** The cut went forward without shipping
    the promises of `v0.26.0`, `v0.27.0`, and `v0.28.0`, so those numbers can no longer
@@ -38,77 +39,28 @@ Two consequences this document now carries:
    Operations `v0.29.0`→`v0.33.0`. **No promise was dropped, delivered, or reworded —
    only the number moved.** Anything from those scopes already on `main` is `preview`
    under the activation states below, not shipped.
-2. **`v0.29.0` is cut but not tagged.** `git tag` still tops out at `v0.25.0`. Until the
-   tag exists, `v0.29.0` is the version the code reports, not a supported release
-   contract, and the `stable` label below is not yet earned by it.
+2. **`0.29.0` was a source cut and was never tagged.** `git tag` still tops out at
+   `v0.25.0`; current source has since advanced to `0.30.0`. The old source cut is
+   historical evidence, not a current or supported release contract.
+3. **The source advanced again to `0.30.0` on 2026-08-21 without a tag.** That makes
+   `0.30.0` the current code version, not a released contract. The next stable tag is
+   `v0.30.0`; no retrospective `v0.29.0` stable release is planned in this roadmap.
 
-## Journey Roadmap — Strategic Multi-Flight Horizons
+## v0.30.0 stabilization train — ordered (updates by PR only)
 
-A **Journey Roadmap** groups interconnected tactical flights into cohesive, outcome-driven strategic horizons. While individual flights deliver atomic capabilities and migrations, a Journey defines the end-to-end customer and operational state.
+> This is the only active release queue. Hadi sets merge order; every candidate is
+> independently gated at an exact head. Work outside this table is post-`v0.30.0`
+> unless a new roadmap PR explicitly changes the release contract.
 
-```
-┌────────────────────────────────────────────────────────────────────────────────────────┐
-│                                 MUPOT JOURNEY ROADMAP                                  │
-├───────────────────────────────┬────────────────────────────────────────────────────────┤
-│ Journey 1: Sovereign Edge     │ • WFP-04 Linear-style routing · A2A exact-seat mesh    │
-│            Core & Continuum   │ • Memory durability · Continuum multi-body presence    │
-│            (LANDED 2026-08-28)│ • Fallback attribution & self-gate deadlock prevention │
-│                               │ • Thread-bound turn fences · Channel caps & anti-escal.│
-│                               │ • Native 2FA approvals · MU.100.001 D1 governance      │
-│                               │ • Edge-native active router & scheduled cron sweeps    │
-│                               │ • Unified principals & token-scoped grants (#584)      │
-├───────────────────────────────┼────────────────────────────────────────────────────────┤
-│ Journey 2: Mupot OS & Device  │ • DEV-01: Hardware device attestation & pairing QR     │
-│            Fleet Control      │ • DEV-02: Local sandboxed execution (Apple MLX/Docker) │
-│            (MU.200.001-DEVICE)│ • DEV-03: Local peripheral & sensor governance gates   │
-│                               │ • DEV-04: Offline-first fsynced local journal & sync   │
-│                               │ • DEV-05: Hardware power management & Wake-on-Demand   │
-├───────────────────────────────┼────────────────────────────────────────────────────────┤
-│ Journey 3: Multimodal Business│ • 1-Click SaaS workspace provisioning (Mumega.com)     │
-│            Onboarding (v0.30) │ • OSS Cloudflare self-hosting wizard (/setup)          │
-│            (Linear/Supabase)  │ • 10-second desktop IDE MCP onboarding (Cursor/Codex)  │
-│                               │ • Autonomous repo-sensing & agents/<slug>/ scaffolding │
-├───────────────────────────────┼────────────────────────────────────────────────────────┤
-│ Journey 4: Compounding        │ • Cross-scope memory synthesis (Private/Squad/Project) │
-│            Collective Memory  │ • Automated methodology & skill evaluation cases       │
-│            (v0.32.0 Target)   │ • Multi-sig reviewed skill and routine mutation gates  │
-├───────────────────────────────┼────────────────────────────────────────────────────────┤
-│ Journey 5: Federated Commerce │ • Customer-revocable Operated Presence guest tokens     │
-│            & Marketplace      │ • Cross-pot task and evidence federation (Project Link)│
-│            (v0.33.0 Target)   │ • Multi-tenant commercial metering & Stripe billing    │
-└───────────────────────────────┴────────────────────────────────────────────────────────┘
-```
-
-## Security flight queue — ordered (updates by PR only)
-
-> **This is where flight plans live.** One ordered list; Hadi sets the order, the fleet
-> executes top-down. Detail lives in the linked issues — this table is the index, not a
-> second store. **Every flight names a target version** (rule 2: no unmilestoned
-> implementation) — #805 is resolved, so flights name concrete numbers again — `v0.30.0` and later. A flight is
-> declared by writing a manifest (`/tmp/flight-active.md`,
-> archived to `agents/kasra/.remember/flights/` on landing).
-
-| # | Flight | Target | Why it is here | Issues | State |
-|---|---|---|---|---|---|
-| — | **FLIGHT-001-R** — RBAC remediation | `v0.29.0` | random-email P0, unfiltered roster, PII leak, fail-open addons | #796 #798 #780 #788 | **LANDED 2026-08-07** |
-| 1 | **FLIGHT-002** — identity & token lifecycle | `v0.30.0` | `member_tokens` default `expires_at`, atomic rotation, warning sweeper | F5, #1008, #1009, #1052 | **LANDED 2026-08-28** |
-| 2 | **FLIGHT-003** — channel authority shrink | `v0.30.0` | non-directory channels resolve clamped capabilities; anti-escalation | F4, #799 | **LANDED 2026-08-28** |
-| 3 | **FLIGHT-004** — approvals & 2FA native | `v0.30.0` | action-hash binding, single-use approval nonces, in-pot verification | mumega-com#725 | **LANDED 2026-08-28** |
-| 4 | **FLIGHT-005** — governance wiring | `v0.30.0` | MU.100.001 D1 consensus engine, terminal state guard, hash binding | mumega-com#723 | **LANDED 2026-08-28** |
-| 5 | **FLIGHT-ROUTER & CRON** | `v0.30.0` | edge-native router & scheduled background cron sweeps (W3) | #1060 | **LANDED 2026-08-28** |
-| 6 | **FLIGHT IDENTITY-UNIFIED** | `v0.30.0` | unified principals, project RBAC scope, token-scoped grants | #584 | **LANDED 2026-08-28** |
-| 7 | **FLIGHT-METER** — spend metering | `v0.30.0` | real-time token/micro-USD spend tracking with checkAndReserve brakes | F8 | **LANDED 2026-08-28** |
-| 8 | **FLIGHT-UNTRUSTED** — ingress fencing | `v0.30.0` | structural untrusted-content type invariants and instruction separation | F6 | **LANDED 2026-08-28** |
-| 9 | **FLIGHT-LOOP-UNHOLD** — loop driver | `v0.30.0` | pot-registered metered loop driver with propose-only boundary | — | **LANDED 2026-08-28** |
-| 10| **FLIGHT DEV-01** — device attestation | `v0.31.0` | Mupot OS device keys, QR pairing handshake, and hardware presence | MU.200.001 | **LANDED 2026-08-29** |
-| 11| **FLIGHT DEV-02** — local sandboxing | `v0.31.0` | Apple MLX and Linux containerized worker execution on Mupot OS | MU.200.001 | **LANDED 2026-08-29** |
-| 12| **FLIGHT DEV-03** — peripheral gates | `v0.31.0` | local ML, worktree fs, audio, vision, and GPIO capability governance | MU.200.001 | **LANDED 2026-08-29** |
-| 13| **FLIGHT DEV-04** — offline journal | `v0.31.0` | offline-first SQLite journal buffer and edge sync deduplication | MU.200.001 | **LANDED 2026-08-29** |
-| 14| **FLIGHT DEV-05** — power & wake | `v0.31.0` | hardware power states and Wake-on-Demand exact-seat mesh dispatch | MU.200.001 | **LANDED 2026-08-29** |
-| 15| **FLIGHT ONBOARD-REPO** | `v0.30.0` | autonomous repo sensing & `agents/<slug>/` workspace scaffolding | — | **LANDED 2026-08-29** |
-| 16| **FLIGHT ONBOARD-SAAS** | `v0.30.0` | 1-click starter squad packs & business setup (/send first task) | — | **LANDED 2026-08-29** |
-| 17| **FLIGHT ONBOARD-MCP** | `v0.30.0` | 10-second desktop connect bundle generator (Cursor/Codex/Claude) | — | **LANDED 2026-08-29** |
-| 18| **FLIGHT MEM-SYNTHESIS** | `v0.32.0` | cross-scope semantic memory synthesis (Private/Squad/Project) | — | NEXT |
+| # | Candidate | Purpose | State | Required next action |
+|---|---|---|---|---|
+| 0 | PR #1239 — CI foundation | Restore migration, typecheck, full-suite, schema, secrets, and local-evidence truth | **LANDED 2026-08-30** as `f3389d65`; post-merge CI 13/13 | Keep as the release baseline |
+| 1 | PR #1243 — credential rotation | Org authorization before lookup; resumable, lease-fenced handoff recovery | **LANDED 2026-08-30** as `8be1cac7` | Retain exact-head gate receipt in the release bundle |
+| 2 | PR #1242 — router/loop/meter authorization | Explicit squad authority, claim-time grant check, internal loop tick, server-owned meter caps | **LANDED 2026-08-30** as `fb10d79b` | Retain exact-head gate receipt in the release bundle |
+| 3 | Message reliability — #1235/#1237/#1241 | Guest visibility, immutable integrity baseline, starvation-free inbox cursor | **LANDED** — #1237 `b980f565`, #1235 `4d41d9bd`, and #1241 `a3d46acb`; post-main CI/CodeQL green | Retain exact-head and landing receipts in the release bundle |
+| 4 | PR hygiene — #1211/#1217/#1236/#1238 | Remove obsolete/conflicting work from the release surface | **COMPLETE** — all four closed with replacement/deferral evidence; branches preserved | Keep release-excluded work out of the freeze |
+| 4a | PR #1249 — external runtime dispatch receipts | Exact external dispatch, gate, replay, cancellation, and public receipt paths | **LANDED OUTSIDE THE ORDERED TRAIN** as `16390d1e`; present in main as preview | Restack the release head on it, retain exact combined gates, and do not promote new stable claims without a separate scope decision |
+| 5 | `v0.30.0` release candidate | One exact main SHA, upgrade/fresh migration proof, browser/runtime/MCP smoke, release receipt | **IN PREPARATION** — [release contract](docs/releases/v0.30.0.md) defined; evidence remains pending | Merge corrected metadata/tooling after exact-head gates, freeze one SHA, collect contract receipts, then request separate RC publication/deployment approvals |
 
 **Board opinion policy:** priority ORDER is Hadi's alone — no vote, no ceremony. Board
 input (asha first-pass, Athena architecture, River build feasibility) is requested per
@@ -438,15 +390,39 @@ label of the addon or channel that carries it.
 Not in `v0.29.0`: any promise from `v0.30.0`–`v0.33.0`. Parts of those scopes are on
 `main` and are `preview`, not shipped.
 
-Owed before this can be labelled `stable`: a `v0.29.0` tag, and a release record under
-`docs/releases/` matching the pattern the `v0.23.0` and `v0.24.0` entries set.
+`v0.29.0` will not be retroactively tagged as stable. Its source-cut history remains
+recorded here and in the changelog; the next supported contract is `v0.30.0`, whose
+release record must explain the untagged `0.29.0` and `0.30.0` source interval.
 
-### v0.30.0: Governed Tools and Marketing/CRO Pilot - planned
+### v0.30.0: Stabilization and Governed Operations - release candidate
+
+**Release ruling (2026-08-30):** `v0.30.0` is a stabilization release. Features
+already present on `main` may remain available as `preview` or `opt-in`, but broad new
+product scope is not a release blocker and must not enter the stabilization train.
+
+The stable contract requires:
+
+1. land the credential-rotation and router/loop/meter authorization train in the
+   exact order above, with fresh checks after every base change;
+2. reconstruct and gate the message reliability invariants from #1235, #1237, and
+   #1241 on current main, including migration renumbering and cross-surface reads;
+3. close or defer every release-excluded open PR so the release surface is legible;
+4. prove fresh install and upgrade migration paths, typecheck, complete tests, plugin,
+   dependency audit, every repository guard, local browser/runtime evidence, and
+   Mupot connect/send/inbox/ACK/task/gate/routine/flight smoke at one exact SHA;
+5. obtain an Athena release Artifact+SHA verdict and Hadi's separate authorization for
+   the `v0.30.0` tag, GitHub release, and any deployment.
+
+Explicitly deferred until after stable `v0.30.0`: the #1236 omnibus, project-worker
+sandbox expansion (#1217), device fleet, new onboarding journeys, unrestricted tool
+catalogs, payments, and any feature that cannot be expressed as a bounded reviewed PR.
+
+#### Deferred product direction (requires a new post-v0.30 version assignment)
 
 **One promise:** A Project routine can use a real business system without exposing
 its raw credential to the model, and Marketing/CRO proves the path end to end.
 
-Must ship:
+Original proposed scope (not committed to the `v0.30.0` stable contract):
 
 - evolve the existing addon registry and encrypted connector vault into one governed
   tool path: definition, credential profile, grant, binding, action policy, and receipt;
@@ -460,7 +436,7 @@ Must ship:
   same governance family as the Operated Presence guest token (least-privilege,
   capability-ceiling, expiry) — prove it here so v0.29 presence rides a hardened primitive.
 
-**Also ship — Console consolidation.** Complete the Project pivot's navigation
+**Also proposed — Console consolidation.** Complete the Project pivot's navigation
 consequence under [#584](https://github.com/Mumega-com/mupot/issues/584):
 
 - collapse project-scoped work, team, activity, and evidence into Project tabs;
@@ -470,7 +446,7 @@ consequence under [#584](https://github.com/Mumega-com/mupot/issues/584):
 - require browser evidence that no sidebar item is a stub or duplicate and no retained
   page is reachable only by typing its URL.
 
-**Also ship — Identity & Unified Access (the token/agent model rework).** A
+**Also proposed — Identity & Unified Access (the token/agent model rework).** A
 2026-07-20 three-lens deep audit (security / simplicity / durability, code + live
 D1) found authorization lives on the *member* not the *token*; **three** disjoint
 human-identity planes (`users` web-login + `members` token + `agents`); **six**
@@ -484,7 +460,7 @@ unscoped and writes standing principal grants that survive revocation. Full find
 Target model:
 [docs/architecture/identity-and-access-redesign.md](docs/architecture/identity-and-access-redesign.md).
 
-Security non-negotiables for this release (from the adversarial gate):
+Security non-negotiables for any future identity/access release (from the adversarial gate):
 `effective = intersect(principal, token_grants)` with **empty grants ⇒ zero, never
 full**; mint **never** mutates the principal; one `buildAuthContext` chokepoint
 enforcing ceiling + `expires_at` + intersection at every door; expiry server-clock
@@ -517,9 +493,9 @@ over MCP, so this identity/access model is the flagship and the console consolid
 - enforce the ceiling in `buildAuthContext` (generalize the directory-door zero-cap
   pattern); revocation of a token or grant takes effect immediately.
 
-This is the **Access** surface of the v0.26 console consolidation — ship the menu and
-the model together. It also retires the split-token RBAC edge and supplies the exact
-scoped+TTL credential the v0.29 Operated Presence check-in/out needs.
+This was previously planned as the **Access** surface of console consolidation. If
+rescheduled, the menu and identity model must still ship together; neither is implied
+by the `v0.30.0` stabilization tag.
 
 Activation:
 
@@ -529,8 +505,8 @@ Activation:
 - Identity migration: additive and flagged; existing tokens get an implicit
   full-ceiling grant so behavior is unchanged until a key is deliberately scoped.
 
-Not in `v0.30.0`: accounting, payments, unrestricted tool catalogs, or silent
-credential fallback into runtime environments.
+Regardless of its future target, this scope excludes accounting, payments,
+unrestricted tool catalogs, and silent credential fallback into runtime environments.
 
 ### v0.31.0: Agent Computers and Recovery - planned
 
@@ -617,7 +593,7 @@ study. Feature count alone cannot satisfy the GA gate.
 
 ## Capability ledger
 
-| Capability | Stable version | Activation |
+| Capability | Release state | Activation |
 |---|---|---|
 | Identity, squads, tasks, gates, flights, receipts | `v0.23.0` | Default-on |
 | Signed runtime and scoped MCP work | `v0.23.0` | Host enrollment required |
@@ -627,10 +603,10 @@ study. Feature count alone cannot satisfy the GA gate.
 | Mac/Kubernetes Agent Host | `v0.24.0` | Opt-in per host/profile |
 | Routines and RoutineRun | `v0.25.0` | Each Routine explicitly enabled |
 | Needs You review inbox | `v0.25.0` | Default-on projection |
-| Console consolidation (project-centered nav) | `v0.30.0` | Default-on; no dead/duplicate/orphan menus |
-| Governed connector actions | `v0.30.0` | Connector and grant required |
-| Unified principals + token-scoped access | `v0.30.0` | Additive migration; implicit full-ceiling grant until scoped |
-| Marketing & CRO addon | `v0.30.0` | Opt-in per Project |
+| Console consolidation (project-centered nav) | `preview; post-v0.30 target required` | Default-on only after its own release gate |
+| Governed connector actions | `preview; post-v0.30 target required` | Connector and grant required |
+| Unified principals + token-scoped access | `planned; post-v0.30 target required` | Additive migration; fail-closed transition required |
+| Marketing & CRO addon | `preview; post-v0.30 target required` | Opt-in per Project |
 | Isolated Agent Computers | `v0.31.0` | Initially opt-in |
 | Reviewed knowledge and coherence evaluation | `v0.32.0` | Promotion gated |
 | Commercial installation and operations | `v0.33.0` | License/entitlement dependent |

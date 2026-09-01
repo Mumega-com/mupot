@@ -24,8 +24,8 @@
 // /oauth/consent branch for the full design).
 
 import type { Env, AuthContext, Capability, CapabilityGrant, CapabilityScopeType, ConnectionChannel } from '../types'
-import { resolveCapabilities, resolveTokenGrants, intersectCapabilities, canOnSquad, hasCapability, capabilityRank } from '../auth/capability'
-import { sha256Hex, mintRawToken, mintAgentBoundToken } from '../members/service'
+import { resolveCapabilities, canOnSquad, hasCapability, capabilityRank } from '../auth/capability'
+import { sha256Hex, mintRawToken, resolveAgentMemberBinding, mintAgentBoundToken } from '../members/service'
 import { createAgent } from '../org/service'
 import { redactSecretPatterns } from '../lib/redact'
 
@@ -294,7 +294,6 @@ export interface ConsentableAgent {
   budget_cap_cents: number | null
   budget_window: string
   capabilities: CapabilityGrant[]
-  minted?: boolean
 }
 
 interface ConsentAgentRow {
@@ -386,25 +385,18 @@ export async function resolveConsentedAgentCapabilities(
   // This single query also folds in what used to be a separate
   // resolveAgentMemberBinding call — same tenant-scoped binding row either way.
   const row = await env.DB.prepare(
-    `SELECT a.status AS status, a.squad_id AS squad_id, b.member_id AS bound_member_id, m.status AS member_status
+    `SELECT a.status AS status, a.squad_id AS squad_id, b.member_id AS bound_member_id
        FROM agents a
-       LEFT JOIN agent_member_bindings b ON b.tenant = ?2 AND b.agent_id = a.id
-       LEFT JOIN members m ON m.id = b.member_id AND m.tenant = b.tenant
+       JOIN agent_member_bindings b ON b.tenant = ?2 AND b.agent_id = a.id
       WHERE a.id = ?1
       LIMIT 1`,
-  ).bind(agentId, env.TENANT_SLUG).first<{
-    status: string
-    squad_id: string
-    bound_member_id: string | null
-    member_status: string | null
-  }>()
+  ).bind(agentId, env.TENANT_SLUG).first<{ status: string; squad_id: string; bound_member_id: string }>()
   // Defence in depth: even if some future path flips agents.status without going
   // through deactivate_agent's token-revocation sweep, capability resolution here
   // independently fails closed. 'paused' is deliberately excluded too — see the
   // selection-rule block above.
   if (!row || row.status !== 'active') return []
-  // If bound but member is not active (e.g. suspended) -> fail closed
-  if (row.bound_member_id && row.member_status !== 'active') return []
+  const agentGrants = await resolveCapabilities(env, row.bound_member_id)
 
   // Re-validate the CONSENTING HUMAN, live, every call (P0-2). Floor is 'admin'
   // (P0-3) — the SAME bar mint_agent_token requires to create this class of weld
@@ -417,24 +409,23 @@ export async function resolveConsentedAgentCapabilities(
   const humanGrants = await resolveCapabilities(env, consentingMemberId)
   if (!(await canOnSquad(env, humanGrants, row.squad_id, 'admin'))) return []
 
-  let agentGrants: CapabilityGrant[] = []
-  if (row.bound_member_id) {
-    agentGrants = await resolveCapabilities(env, row.bound_member_id)
-  } else {
-    // Unminted prospective grant: standard default member capability on home squad
-    agentGrants = [
-      {
-        member_id: '',
-        scope_type: 'squad',
-        scope_id: row.squad_id,
-        capability: 'member',
-      },
-    ]
-  }
-
   // Clamp every grant to min(agent's own rank, human's own live rank) on that
   // SAME scope (P0-1). Never widen: a scope the human holds nothing on is
   // dropped, not defaulted to the agent's value or to 'observer'.
+  //
+  // Mutation-check note (2026-08-10, gate correction): the `effectiveRank <= 0`
+  // line below is individually an EQUIVALENT MUTANT of the `!clampedCapability`
+  // line right after it — RANK_ORDER contains no capability of rank 0
+  // (observer=1..owner=5), so `.find(c => capabilityRank(c) === 0)` already
+  // returns undefined and the SECOND guard alone drops the grant just as
+  // completely. Verified directly: removing only the first line, leaving the
+  // second untouched, passes all 65 tests in tests/agent-bound-oauth-consent.test.ts
+  // unchanged. The fail-closed BEHAVIOUR (a zero-rank grant is dropped, not
+  // defaulted) is real and IS covered — by the second line — this comment exists
+  // so nobody reads a future refactor that touches only the first line as
+  // removing live protection, and so this file does not misdescribe which line
+  // a passing test actually depends on (see this PR's own mutation-table history
+  // for why that distinction matters).
   const clamped: CapabilityGrant[] = []
   for (const g of agentGrants) {
     const humanRank = await humanMaxRankOnScope(env, humanGrants, g.scope_type, g.scope_id)
@@ -470,9 +461,10 @@ async function resolveAgentForConsent(env: Env, agentId: string): Promise<Consen
             a.budget_cap_cents AS budget_cap_cents, a.budget_window AS budget_window
        FROM agents a
        JOIN squads sq ON sq.id = a.squad_id
+       JOIN agent_member_bindings b ON b.tenant = ?2 AND b.agent_id = a.id
       WHERE a.id = ?1 AND a.status = 'active'
       LIMIT 1`,
-  ).bind(agentId).first<ConsentAgentRow>()
+  ).bind(agentId, env.TENANT_SLUG).first<ConsentAgentRow>()
 }
 
 /** Re-validates a client-submitted agent_id against the SAME rule the consent
@@ -494,14 +486,13 @@ export async function listConsentableAgents(env: Env, memberId: string): Promise
   const rows = await env.DB.prepare(
     `SELECT a.id AS id, a.slug AS slug, a.name AS name, a.squad_id AS squad_id,
             sq.name AS squad_name, a.autonomy AS autonomy,
-            a.budget_cap_cents AS budget_cap_cents, a.budget_window AS budget_window,
-            b.member_id AS bound_member_id
+            a.budget_cap_cents AS budget_cap_cents, a.budget_window AS budget_window
        FROM agents a
        JOIN squads sq ON sq.id = a.squad_id
-       LEFT JOIN agent_member_bindings b ON b.tenant = ?1 AND b.agent_id = a.id
+       JOIN agent_member_bindings b ON b.tenant = ?1 AND b.agent_id = a.id
       WHERE a.status = 'active'
       ORDER BY sq.name ASC, a.name ASC`,
-  ).bind(env.TENANT_SLUG).all<ConsentAgentRow & { bound_member_id?: string | null }>()
+  ).bind(env.TENANT_SLUG).all<ConsentAgentRow>()
 
   const out: ConsentableAgent[] = []
   for (const row of rows.results ?? []) {
@@ -510,18 +501,7 @@ export async function listConsentableAgents(env: Env, memberId: string): Promise
     // viewing/consenting human, so this is honest about exactly what the session
     // would carry, never the agent's raw (possibly higher) grant.
     const capabilities = await resolveConsentedAgentCapabilities(env, row.id, memberId)
-    out.push({
-      id: row.id,
-      slug: row.slug,
-      name: row.name,
-      squad_id: row.squad_id,
-      squad_name: row.squad_name,
-      autonomy: row.autonomy,
-      budget_cap_cents: row.budget_cap_cents,
-      budget_window: row.budget_window,
-      capabilities,
-      minted: Boolean(row.bound_member_id),
-    })
+    out.push({ ...row, capabilities })
   }
   return out
 }
@@ -618,8 +598,8 @@ function renderConsentPage(
         <label class="agent-option">
           <input type="radio" name="agent_id" value="${escapeHtml(a.id)}" required>
           <div>
-            <div class="agent-title"><strong>${escapeHtml(a.name)}</strong> <code>${escapeHtml(a.slug)}</code>${a.minted === false ? ' <span style="font-size: 0.75rem; background: #e0e7ff; color: #3730a3; padding: 0.1rem 0.4rem; border-radius: 4px;">unminted</span>' : ''}</div>
-            <div class="agent-meta">squad: ${escapeHtml(a.squad_name)} &middot; autonomy: ${escapeHtml(a.autonomy)} &middot; budget: ${formatBudgetCap(a.budget_cap_cents)} / ${escapeHtml(a.budget_window)}${a.minted === false ? ' &middot; <em>will be auto-provisioned on consent</em>' : ''}</div>
+            <div class="agent-title"><strong>${escapeHtml(a.name)}</strong> <code>${escapeHtml(a.slug)}</code></div>
+            <div class="agent-meta">squad: ${escapeHtml(a.squad_name)} &middot; autonomy: ${escapeHtml(a.autonomy)} &middot; budget: ${formatBudgetCap(a.budget_cap_cents)} / ${escapeHtml(a.budget_window)}</div>
             <div class="agent-caps">capabilities this session would carry: ${formatCapabilities(a.capabilities)}</div>
           </div>
         </label>`).join('\n')
@@ -822,27 +802,17 @@ export async function buildAuthContextFromProps(
 
   if (!tokenRow || tokenRow.status !== 'active') return null
 
+  // Re-resolve capabilities every request (C2: revocation propagates immediately).
+  // The resolved grants are NOT used for the directory channel — see B1 comment above —
+  // but workspace/member API keys must preserve their live D1 grants.
+  const resolvedCapabilities = await resolveCapabilities(env, props.memberId)
+
   const channel =
     isConnectionChannel(tokenRow.channel)
       ? tokenRow.channel
       : isConnectionChannel(props.channel)
         ? props.channel
         : 'directory'
-
-  // Re-resolve capabilities every request (C2: revocation propagates immediately).
-  // The resolved grants are NOT used for the directory channel — see B1 comment above —
-  // but workspace/member API keys must preserve their live D1 grants.
-  let resolvedCapabilities = await resolveCapabilities(env, props.memberId)
-  if (channel !== 'directory') {
-    try {
-      const tokenGrants = await resolveTokenGrants(env, props.tokenId)
-      if (tokenGrants) {
-        resolvedCapabilities = intersectCapabilities(resolvedCapabilities, tokenGrants)
-      }
-    } catch {
-      // Fail-soft for mocks
-    }
-  }
 
   // mupot#903b: tokenRow.bound_agent_id is checked FIRST, regardless of channel — it
   // is the live DB truth (never props, which is client-influenced input echoed back
@@ -1325,46 +1295,25 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
         rejected.headers.set('Set-Cookie', clearConsentCookie)
         return rejected
       }
-
-      const bindingRow = await env.DB.prepare(
-        `SELECT b.member_id, m.status AS member_status
-           FROM agent_member_bindings b
-           LEFT JOIN members m
-             ON m.id = b.member_id
-            AND m.tenant = b.tenant
-          WHERE b.tenant = ?1
-            AND b.agent_id = ?2
-          LIMIT 1`,
-      ).bind(env.TENANT_SLUG, agentIdRaw).first<{ member_id: string; member_status: string | null }>()
-
-      if (bindingRow) {
-        if (bindingRow.member_status !== 'active') {
-          const rejected = new Response(
-            'The selected agent is no longer available for this connection. Please sign in again.',
-            { status: 403, headers: { 'Content-Type': 'text/plain' } },
-          )
-          rejected.headers.set('Set-Cookie', clearConsentCookie)
-          return rejected
-        }
-        boundAgentId = agentIdRaw
-        mintMemberId = bindingRow.member_id
-      } else {
-        // Unminted agent — auto-mint identity upon consent!
-        const agent = await resolveAgentForConsent(env, agentIdRaw)
-        if (!agent) {
-          const rejected = new Response(
-            'The selected agent is no longer available for this connection. Please sign in again.',
-            { status: 403, headers: { 'Content-Type': 'text/plain' } },
-          )
-          rejected.headers.set('Set-Cookie', clearConsentCookie)
-          return rejected
-        }
-        const minted = await mintAgentBoundToken(env, agent, `oauth-consent:${pending.email}`, {
-          grantCapability: 'member',
-        })
-        boundAgentId = agent.id
-        mintMemberId = minted.memberId
+      // memberMayConsentToAgent already proved a binding row exists (its JOIN
+      // agent_member_bindings requires one) — this is a live re-read of that same
+      // fact, not a second trust decision. `binding.kind !== 'bound'` here would mean
+      // the binding vanished between the two statements; agent_member_bindings has no
+      // DELETE path while any member_tokens row references the agent (0071's
+      // `agent_member_bindings_delete_requires_no_tokens` trigger) and this is the
+      // FIRST token for this consent, so that race is not reachable — fail closed
+      // anyway rather than assume it.
+      const binding = await resolveAgentMemberBinding(env, agentIdRaw)
+      if (binding.kind !== 'bound') {
+        const rejected = new Response(
+          'The selected agent is no longer available for this connection. Please sign in again.',
+          { status: 403, headers: { 'Content-Type': 'text/plain' } },
+        )
+        rejected.headers.set('Set-Cookie', clearConsentCookie)
+        return rejected
       }
+      boundAgentId = agentIdRaw
+      mintMemberId = binding.memberId
     }
 
     // mupot#903b P2-6 (adversarial review, 2026-08-10) — DECIDED, not overlooked:

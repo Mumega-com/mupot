@@ -144,31 +144,17 @@ async function releaseTaskDispatchReceipt(env: Env, event: BusEvent, leaseExpire
   ).bind(message, event.tenant, identity.receiptId, identity.taskId, event.agent_id, leaseExpiresAt).run()
 }
 
-async function consumeTaskDispatchReceipt(
-  env: Env,
-  event: BusEvent,
-  leaseExpiresAt?: number,
-  substituteExecutorId?: string | null,
-  fallbackReason?: string | null,
-): Promise<boolean> {
+async function consumeTaskDispatchReceipt(env: Env, event: BusEvent, leaseExpiresAt?: number): Promise<boolean> {
   const identity = taskDispatchIdentity(event)
   if (!identity || !event.agent_id) return true
   const leaseClause = leaseExpiresAt === undefined ? '' : ' AND claim_expires_at = ?'
   const result = await env.DB.prepare(
     `UPDATE task_dispatch_receipts
-        SET consumed_at = ?, claim_expires_at = NULL, last_error = NULL,
-            substitute_executor_id = COALESCE(substitute_executor_id, ?),
-            fallback_reason = COALESCE(fallback_reason, ?)
+        SET consumed_at = ?, claim_expires_at = NULL, last_error = NULL
       WHERE tenant = ? AND id = ? AND task_id = ? AND agent_id = ?
         AND consumed_at IS NULL${leaseClause}`,
   ).bind(
-    new Date().toISOString(),
-    substituteExecutorId ?? null,
-    fallbackReason ?? null,
-    event.tenant,
-    identity.receiptId,
-    identity.taskId,
-    event.agent_id,
+    new Date().toISOString(), event.tenant, identity.receiptId, identity.taskId, event.agent_id,
     ...(leaseExpiresAt === undefined ? [] : [leaseExpiresAt]),
   ).run()
   return result.meta?.changes === 1
@@ -285,7 +271,6 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
       // its `agentId` here is what makes delivery actually reach the runtime's own poll query.
       const route = await getFleetAgentLiveness(env, event.agent_id)
       const deliveryTarget = route.agentId || event.agent_id
-      const targetSeat = (event.payload as { target_seat?: string } | undefined)?.target_seat || null
       if (await dispatchInboxDelivered(env, identity.receiptId)) {
         try {
           await deliverDispatchToInbox(env, {
@@ -295,7 +280,6 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
             receiptId: identity.receiptId,
             dispatchedByMemberId: dispatchMemberId(event),
             projectId: receipt.project_id,
-            targetSeat,
           })
         } catch (error) {
           if (error instanceof InboxFullError) {
@@ -329,8 +313,6 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
         throw new Error('task dispatch receipt lease busy')
       }
 
-      let substituteExecutorId: string | null = null
-      let fallbackReason: string | null = null
       try {
         if (route.runtime && route.live) {
           // EXTERNAL route: deliver to inbox only. Deliberately do NOT wake-execute in-Worker
@@ -345,25 +327,13 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
             receiptId: identity.receiptId,
             dispatchedByMemberId: dispatchMemberId(event),
             projectId: receipt.project_id,
-            targetSeat,
           })
         } else {
           // IN-WORKER route (fallback: no fleet row, empty runtime, or stale/dead presence) —
           // today's behavior, unchanged. This is the only path that executes in-Worker, so a
           // dead external runtime can never strand the task (BLOCK-2 fix: exactly one route is
           // chosen and acted on per lease-holder).
-          fallbackReason = !route.runtime ? 'no_external_runtime' : (!route.live ? 'seat_unreachable' : 'fallback')
-          substituteExecutorId = `in-worker:${event.agent_id}`
-          const fallbackPayload = {
-            ...(typeof event.payload === 'object' && event.payload !== null ? event.payload : {}),
-            fallback: true,
-            substitute_executor_id: substituteExecutorId,
-            fallback_reason: fallbackReason,
-          }
-          await wakeAgent(env, event.agent_id, {
-            ...event,
-            payload: fallbackPayload,
-          })
+          await wakeAgent(env, event.agent_id, event)
         }
       } catch (error) {
         await releaseTaskDispatchReceipt(env, event, leaseExpiresAt, error)
@@ -372,7 +342,7 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
         }
         throw error
       }
-      if (!(await consumeTaskDispatchReceipt(env, event, leaseExpiresAt, substituteExecutorId, fallbackReason))) {
+      if (!(await consumeTaskDispatchReceipt(env, event, leaseExpiresAt))) {
         throw new Error('task dispatch receipt consume failed')
       }
       return true
@@ -512,11 +482,29 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
           throw new Error(`message.created delivery failed: ${outcome.kind}`)
       }
     }
+    case 'member.auto_enrolled':
+    case 'billing.subscription.created':
+    case 'billing.subscription.deleted':
+    case 'pot.self_serve_provisioned':
+    case 'routine.run.started':
+    case 'supabase.record.insert':
+    case 'supabase.record.update':
+    case 'supabase.record.delete': {
+      // These producers have already committed their durable effect before
+      // publishing. This consumer records and acknowledges the observation
+      // without replaying the originating mutation.
+      console.log(`bus: ${event.type}`, {
+        tenant: event.tenant,
+        squad_id: event.squad_id,
+        agent_id: event.agent_id,
+      })
+      return true
+    }
     default: {
       // Exhaustiveness guard. Unknown types are acked (not retried) to avoid
       // poisoning the queue with events we will never understand.
-      const eventType = String((event as any).type)
-      console.error('bus: unknown event type', { type: eventType, tenant: event.tenant })
+      const _exhaustive: never = event.type
+      console.error('bus: unknown event type', { type: _exhaustive, tenant: event.tenant })
       return true
     }
   }

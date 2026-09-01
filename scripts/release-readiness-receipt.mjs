@@ -1,9 +1,9 @@
 #!/usr/bin/env node
-// Mupot v0.23 aggregate release-readiness checker.
+// Mupot aggregate release-readiness checker.
 //
 // This is the final completion-audit receipt. It does not create evidence; it
 // verifies that every objective-specific receipt and exported GitHub state is
-// present before v0.23.0 is treated as shippable.
+// present before a release is treated as shippable.
 
 import { createHash } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
@@ -23,8 +23,10 @@ export { REQUIRED_APP_PERMISSIONS } from './github-app-permissions-receipt.mjs'
 export const CHECK_RECEIPT_TYPE = 'mupot-v023-release-readiness/v1'
 export const PREPUBLICATION_CHECK_RECEIPT_TYPE = 'mupot-v023-prepublication-readiness/v1'
 
-const DEFAULT_VERSION = 'v0.23.0'
+const DEFAULT_VERSION = `v${JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version}`
 const DEFAULT_REPO = 'Mumega-com/mupot'
+const LEGACY_VERSION = 'v0.23.0'
+const RELEASE_PHASES = new Set(['prepublication', 'final'])
 
 export const REQUIRED_RECEIPTS = [
   { objective: 1, issue: 282, file: 'fresh-install-check.json', receipt_type: 'mupot-fresh-install/v1' },
@@ -90,6 +92,7 @@ export function parseArgs(argv) {
     checksPr: '',
     releaseSha: '',
     phase: 'final',
+    contractPath: '',
     plan: false,
     check: false,
     summary: false,
@@ -110,6 +113,7 @@ export function parseArgs(argv) {
     else if (arg === '--checks-pr') opts.checksPr = next()
     else if (arg === '--release-sha') opts.releaseSha = next()
     else if (arg === '--phase') opts.phase = normalizePhase(next())
+    else if (arg === '--contract') opts.contractPath = next()
     else if (arg === '--plan') opts.plan = true
     else if (arg === '--check') opts.check = true
     else if (arg === '--summary') opts.summary = true
@@ -129,7 +133,8 @@ export function usage() {
     '  --check             check the completed aggregate evidence directory',
     '  --summary           with --check, print a compact text summary',
     '  --out-dir <path>    aggregate evidence directory',
-    '  --version <version> expected version; default v0.23.0',
+    '  --version <version> expected version; default current package version',
+    '  --contract <path>    versioned release contract JSON; required outside legacy v0.23.0',
     '  --repo <owner/repo> GitHub repo; default Mumega-com/mupot',
     '  --checks-pr <number> PR number whose required checks prove this release candidate',
     '  --release-sha <sha>  exact merged release commit whose checks must pass',
@@ -163,6 +168,193 @@ function normalizePhase(phase) {
   return value
 }
 
+function legacyContract(version) {
+  const receipts = new Map()
+  const addReceipt = (receipt, phase) => {
+    const prior = receipts.get(receipt.file) ?? { ...receipt, phases: [] }
+    if (!prior.phases.includes(phase)) prior.phases.push(phase)
+    receipts.set(receipt.file, prior)
+  }
+  for (const receipt of REQUIRED_RECEIPTS) addReceipt(receipt, 'final')
+  for (const receipt of PREPUBLICATION_REQUIRED_RECEIPTS) addReceipt(receipt, 'prepublication')
+
+  const issues = new Map()
+  const addIssue = (number, phase) => {
+    const prior = issues.get(number) ?? { number, phases: [] }
+    if (!prior.phases.includes(phase)) prior.phases.push(phase)
+    issues.set(number, prior)
+  }
+  for (const number of REQUIRED_ISSUES) addIssue(number, 'final')
+  for (const number of PREPUBLICATION_REQUIRED_ISSUES) addIssue(number, 'prepublication')
+
+  return {
+    schema_version: 0,
+    version,
+    name: 'Trusted Runtime legacy contract',
+    receipt_types: {
+      prepublication: PREPUBLICATION_CHECK_RECEIPT_TYPE,
+      final: CHECK_RECEIPT_TYPE,
+    },
+    receipts: [...receipts.values()],
+    issues: [...issues.values()],
+    source: 'legacy-v0.23.0',
+    source_path: null,
+  }
+}
+
+function rejectUnknownContractFields(value, allowed, source, label) {
+  for (const key of Object.keys(value)) {
+    if (!allowed.has(key)) throw new Error(`invalid release contract ${source}: ${label} unknown field ${key}`)
+  }
+}
+
+function validateContract(raw, expectedVersion, source = 'inline') {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error(`invalid release contract ${source}: expected object`)
+  }
+  rejectUnknownContractFields(
+    raw,
+    new Set(['schema_version', 'version', 'name', 'receipt_types', 'receipts', 'issues']),
+    source,
+    'contract',
+  )
+  if (raw.schema_version !== 1) {
+    throw new Error(`invalid release contract ${source}: schema_version must be 1`)
+  }
+  const version = normalizeTag(raw.version)
+  if (version !== expectedVersion) {
+    throw new Error(`invalid release contract ${source}: version ${version} does not match ${expectedVersion}`)
+  }
+  if (typeof raw.name !== 'string' || raw.name.trim().length === 0) {
+    throw new Error(`invalid release contract ${source}: name required`)
+  }
+  const receiptTypes = raw.receipt_types
+  if (!receiptTypes || typeof receiptTypes !== 'object' || Array.isArray(receiptTypes)) {
+    throw new Error(`invalid release contract ${source}: receipt_types must be an object`)
+  }
+  rejectUnknownContractFields(receiptTypes, RELEASE_PHASES, source, 'receipt_types')
+  for (const phase of RELEASE_PHASES) {
+    if (typeof receiptTypes?.[phase] !== 'string' || !/^[a-z0-9-]+\/v\d+$/.test(receiptTypes[phase])) {
+      throw new Error(`invalid release contract ${source}: receipt_types.${phase} invalid`)
+    }
+  }
+  if (!Array.isArray(raw.receipts) || raw.receipts.length === 0) {
+    throw new Error(`invalid release contract ${source}: receipts required`)
+  }
+  const seenFiles = new Set()
+  const receipts = raw.receipts.map((receipt, index) => {
+    if (!receipt || typeof receipt !== 'object' || Array.isArray(receipt)) {
+      throw new Error(`invalid release contract ${source}: receipts[${index}] must be an object`)
+    }
+    rejectUnknownContractFields(
+      receipt,
+      new Set(['objective', 'file', 'receipt_type', 'phases', 'issue']),
+      source,
+      `receipts[${index}]`,
+    )
+    const file = String(receipt.file ?? '')
+    if (!file || file.startsWith('/') || file.split('/').includes('..') || !/^[A-Za-z0-9._/-]+$/.test(file)) {
+      throw new Error(`invalid release contract ${source}: receipts[${index}].file invalid`)
+    }
+    if (seenFiles.has(file)) throw new Error(`invalid release contract ${source}: duplicate receipt file ${file}`)
+    seenFiles.add(file)
+    const objective = receipt.objective
+    if (!((Number.isInteger(objective) && objective > 0)
+      || (typeof objective === 'string' && objective.trim().length > 0))) {
+      throw new Error(`invalid release contract ${source}: receipts[${index}].objective invalid`)
+    }
+    if (receipt.issue !== undefined && (!Number.isInteger(receipt.issue) || receipt.issue <= 0)) {
+      throw new Error(`invalid release contract ${source}: receipts[${index}].issue invalid`)
+    }
+    const receiptType = String(receipt.receipt_type ?? '')
+    if (!/^[A-Za-z0-9._-]+\/v\d+$/.test(receiptType)) {
+      throw new Error(`invalid release contract ${source}: receipts[${index}].receipt_type invalid`)
+    }
+    if (!Array.isArray(receipt.phases) || receipt.phases.length === 0
+      || receipt.phases.some((phase) => !RELEASE_PHASES.has(phase))) {
+      throw new Error(`invalid release contract ${source}: receipts[${index}].phases invalid`)
+    }
+    return {
+      objective,
+      file,
+      receipt_type: receiptType,
+      phases: [...new Set(receipt.phases)],
+      ...(Number.isInteger(receipt.issue) && receipt.issue > 0 ? { issue: receipt.issue } : {}),
+    }
+  })
+
+  if (!Array.isArray(raw.issues)) throw new Error(`invalid release contract ${source}: issues must be an array`)
+  const seenIssues = new Set()
+  const issues = raw.issues.map((issue, index) => {
+    if (!issue || typeof issue !== 'object' || Array.isArray(issue)) {
+      throw new Error(`invalid release contract ${source}: issues[${index}] must be an object`)
+    }
+    rejectUnknownContractFields(issue, new Set(['number', 'phases']), source, `issues[${index}]`)
+    const number = Number(issue?.number)
+    if (!Number.isInteger(number) || number <= 0 || seenIssues.has(number)) {
+      throw new Error(`invalid release contract ${source}: issues[${index}].number invalid`)
+    }
+    seenIssues.add(number)
+    if (!Array.isArray(issue.phases) || issue.phases.length === 0
+      || issue.phases.some((phase) => !RELEASE_PHASES.has(phase))) {
+      throw new Error(`invalid release contract ${source}: issues[${index}].phases invalid`)
+    }
+    return { number, phases: [...new Set(issue.phases)] }
+  })
+
+  return {
+    schema_version: 1,
+    version,
+    name: raw.name.trim(),
+    receipt_types: {
+      prepublication: receiptTypes.prepublication,
+      final: receiptTypes.final,
+    },
+    receipts,
+    issues,
+    source,
+    source_path: null,
+    source_sha256: source === 'inline'
+      ? createHash('sha256').update(JSON.stringify(raw)).digest('hex')
+      : null,
+  }
+}
+
+function resolveContract(opts, version) {
+  if (opts.contract !== undefined) return validateContract(opts.contract, version)
+  const defaultArg = `docs/releases/${version}-contract.json`
+  const defaultPath = resolve(process.cwd(), defaultArg)
+  const pathArg = opts.contractPath || (existsSync(defaultPath) ? defaultArg : '')
+  const path = pathArg ? resolve(pathArg) : ''
+  if (path) {
+    let parsed
+    let text
+    try {
+      text = readFileSync(path, 'utf8')
+      parsed = JSON.parse(text)
+    } catch (err) {
+      throw new Error(`invalid release contract ${path}: ${err instanceof Error ? err.message : String(err)}`)
+    }
+    return {
+      ...validateContract(parsed, version, path),
+      source: path,
+      source_path: path,
+      source_arg: pathArg,
+      source_sha256: createHash('sha256').update(text).digest('hex'),
+    }
+  }
+  if (version === LEGACY_VERSION) return legacyContract(version)
+  throw new Error(`release contract required for ${version}; pass --contract docs/releases/${version}-contract.json`)
+}
+
+function contractPhase(contract, phase) {
+  return {
+    receiptType: contract.receipt_types[phase],
+    receipts: contract.receipts.filter((receipt) => receipt.phases.includes(phase)),
+    issues: contract.issues.filter((issue) => issue.phases.includes(phase)).map((issue) => issue.number),
+  }
+}
+
 function defaultOutDir(opts) {
   const tag = normalizeTag(opts.version || DEFAULT_VERSION)
   return opts.outDir || `tmp/release-readiness/${tag}`
@@ -170,47 +362,54 @@ function defaultOutDir(opts) {
 
 export function formatPlan(opts = {}) {
   const version = normalizeTag(opts.version || DEFAULT_VERSION)
+  const contract = resolveContract(opts, version)
   const repo = opts.repo || DEFAULT_REPO
   const checksPr = opts.checksPr || '<release-pr-number>'
   const releaseSha = opts.releaseSha || '<release-commit-sha>'
   const phase = normalizePhase(opts.phase)
-  const requiredReceipts = phase === 'prepublication' ? PREPUBLICATION_REQUIRED_RECEIPTS : REQUIRED_RECEIPTS
+  const phaseContract = contractPhase(contract, phase)
+  const requiredReceipts = phaseContract.receipts
+  const requiredIssues = phaseContract.issues
   const outputFile = phase === 'prepublication' ? 'prepublication-readiness-check.json' : 'release-readiness-check.json'
   const outDir = defaultOutDir({ ...opts, version })
   const lines = []
 
   lines.push(phase === 'prepublication'
-    ? 'Mupot v0.23 prepublication-readiness evidence plan'
-    : 'Mupot v0.23 final release-readiness evidence plan')
+    ? `Mupot ${version} prepublication-readiness evidence plan`
+    : `Mupot ${version} final release-readiness evidence plan`)
   lines.push('')
   lines.push(phase === 'prepublication'
     ? `Goal: prove the exact merged and deployed ${version} commit is safe to publish.`
-    : `Goal: prove every v0.23.0 Trusted Runtime objective has passing postpublication evidence.`)
+    : `Goal: prove every ${version} ${contract.name} objective has passing postpublication evidence.`)
   lines.push('')
   lines.push(commandLine(['mkdir', '-p', join(outDir, 'host-go')]))
   lines.push('')
-  lines.push(`Copy the complete exported #274 attachable directory into ${join(outDir, 'host-go')}; include every manifest artifact and both sidecars, not only the four files listed below.`)
+  lines.push(`Copy the complete exported host attachment directory into ${join(outDir, 'host-go')}; include every manifest artifact and both sidecars, not only the files listed below.`)
   lines.push('The final checker reruns the read-only fleet manifest verifier against that copied directory.')
   lines.push('')
   lines.push('Copy or attach these passing receipt files into the aggregate directory:')
   for (const receipt of requiredReceipts) {
-    lines.push(`- ${receipt.file} (${receipt.receipt_type}, issue #${receipt.issue}, objective ${receipt.objective})`)
+    const issue = receipt.issue ? `, issue #${receipt.issue}` : ''
+    lines.push(`- ${receipt.file} (${receipt.receipt_type}${issue}, objective ${receipt.objective})`)
   }
   lines.push('')
-  lines.push('Export GitHub issue state, the release PR, and checks from the exact merged release commit:')
-  lines.push(commandLine([
-    'gh',
-    'issue',
-    'list',
-    '--repo',
-    repo,
-    '--state',
-    'all',
-    '--json',
-    'number,title,state,labels,url',
-    '--limit',
-    '300',
-  ], ` > ${shellQuote(join(outDir, 'github-issues.json'))}`))
+  lines.push('Export the release PR and checks from the exact merged release commit:')
+  if (requiredIssues.length > 0) {
+    lines.push('Export GitHub issue state required by this release contract:')
+    lines.push(commandLine([
+      'gh',
+      'issue',
+      'list',
+      '--repo',
+      repo,
+      '--state',
+      'all',
+      '--json',
+      'number,title,state,labels,url',
+      '--limit',
+      '300',
+    ], ` > ${shellQuote(join(outDir, 'github-issues.json'))}`))
+  }
   lines.push(commandLine([
     'gh',
     'pr',
@@ -224,12 +423,12 @@ export function formatPlan(opts = {}) {
   lines.push(commandLine([
     'gh',
     'pr',
-    'checks',
+    'view',
+    checksPr,
     '--repo',
     repo,
-    checksPr,
     '--json',
-    'name,state,link,bucket',
+    'statusCheckRollup',
   ], ` > ${shellQuote(join(outDir, 'github-checks.json'))}`))
   lines.push(commandLine([
     'gh',
@@ -244,7 +443,7 @@ export function formatPlan(opts = {}) {
     `repos/${repo}/commits/${releaseSha}/check-runs?per_page=100`,
   ], ` > ${shellQuote(join(outDir, 'github-commit-checks.json'))}`))
   lines.push('')
-  lines.push('Export the live GitHub App definition and re-accepted installation after #151 is remediated with the authenticated GitHub CLI. The final release plan deliberately does not read, copy, print, or rotate the Worker-confined App private key:')
+  lines.push('Export the live GitHub App definition and re-accepted installation after least-privilege remediation is verified with the authenticated GitHub CLI. The final release plan deliberately does not read, copy, print, or rotate the Worker-confined App private key:')
   lines.push(`The export command writes ${join(outDir, APP_FILE)} and ${join(outDir, INSTALLATION_FILE)}.`)
   lines.push(commandLine([
     'npm',
@@ -282,6 +481,7 @@ export function formatPlan(opts = {}) {
   ], ` > ${shellQuote(join(outDir, 'github-app-permissions-check.json'))}`))
   lines.push('')
   lines.push('Check the aggregate evidence:')
+  const contractArgs = contract.source_arg ? ['--contract', contract.source_arg] : []
   lines.push(commandLine([
     'node',
     'scripts/release-readiness-receipt.mjs',
@@ -298,6 +498,7 @@ export function formatPlan(opts = {}) {
     releaseSha,
     '--phase',
     phase,
+    ...contractArgs,
   ], ` > ${shellQuote(join(outDir, outputFile))}`))
   lines.push(commandLine([
     'node',
@@ -316,6 +517,7 @@ export function formatPlan(opts = {}) {
     releaseSha,
     '--phase',
     phase,
+    ...contractArgs,
   ]))
   return `${lines.join('\n')}\n`
 }
@@ -378,6 +580,12 @@ function checkEntries(parsed) {
   return []
 }
 
+function checkName(entry) {
+  if (typeof entry?.name === 'string' && entry.name.length > 0) return entry.name
+  if (typeof entry?.context === 'string' && entry.context.length > 0) return entry.context
+  return ''
+}
+
 function expectedPrNumber(checksPr) {
   const raw = String(checksPr ?? '').trim()
   if (!raw) return null
@@ -386,15 +594,34 @@ function expectedPrNumber(checksPr) {
 }
 
 function expectedReleaseSha(releaseSha) {
-  const raw = String(releaseSha ?? '').trim().toLowerCase()
-  return /^[0-9a-f]{40}$/.test(raw) ? raw : null
+  return canonicalReleaseSha(releaseSha)
+}
+
+function canonicalReleaseSha(value) {
+  return typeof value === 'string' && /^[0-9a-f]{40}$/.test(value) ? value : null
 }
 
 function checkSucceeded(entry) {
   const conclusion = String(entry?.conclusion ?? '').toUpperCase()
   const state = String(entry?.state ?? entry?.status ?? '').toUpperCase()
   const bucket = String(entry?.bucket ?? '').toLowerCase()
-  return conclusion === 'SUCCESS' || state === 'SUCCESS' || state === 'COMPLETED' && conclusion === 'SUCCESS' || bucket === 'pass'
+  if (conclusion) return conclusion === 'SUCCESS' && state === 'COMPLETED'
+  if (entry?.state !== undefined) return state === 'SUCCESS'
+  if (entry?.status !== undefined) return false
+  return bucket === 'pass'
+}
+
+function checkObservation(entry) {
+  return {
+    name: checkName(entry) || null,
+    context: entry?.context ?? null,
+    conclusion: entry?.conclusion ?? null,
+    status: entry?.status ?? null,
+    state: entry?.state ?? entry?.status ?? null,
+    bucket: entry?.bucket ?? null,
+    detailsUrl: entry?.detailsUrl ?? null,
+    targetUrl: entry?.targetUrl ?? null,
+  }
 }
 
 function permissionDisplay(value) {
@@ -423,14 +650,16 @@ function pushPermissionChecks(checks, parsed, prefix) {
 export function checkBundle(opts = {}) {
   const version = normalizeTag(opts.version || DEFAULT_VERSION)
   const phase = normalizePhase(opts.phase)
+  const contract = resolveContract(opts, version)
+  const phaseContract = contractPhase(contract, phase)
   const outDir = resolve(defaultOutDir({ ...opts, version }))
   const checksPr = expectedPrNumber(opts.checksPr)
   const releaseSha = expectedReleaseSha(opts.releaseSha)
   const checks = []
   const artifacts = {}
   const receiptValues = new Map()
-  const requiredReceipts = phase === 'prepublication' ? PREPUBLICATION_REQUIRED_RECEIPTS : REQUIRED_RECEIPTS
-  const requiredIssues = phase === 'prepublication' ? PREPUBLICATION_REQUIRED_ISSUES : REQUIRED_ISSUES
+  const requiredReceipts = phaseContract.receipts
+  const requiredIssues = phaseContract.issues
 
   pushCheck(checks, existsSync(outDir), 'evidence_directory_present', { out_dir: outDir })
   pushCheck(checks, checksPr !== null, 'checks_pr_specified', { actual: opts.checksPr ?? null })
@@ -456,17 +685,54 @@ export function checkBundle(opts = {}) {
     })
   }
 
-  if (phase === 'prepublication') {
+  if (requiredReceipts.some((receipt) => receipt.file === 'release-candidate-check.json')) {
+    const candidateReceipt = receiptValues.get('release-candidate-check.json')
+    const candidateTarget = candidateReceipt?.target ?? {}
+    const candidateCommitValue = candidateTarget.commit ?? null
+    const candidateCommit = canonicalReleaseSha(candidateCommitValue)
+    const candidateSourceVersion = candidateTarget.source_version ?? null
+    const sourceVersion = version.replace(/^v/i, '')
+    pushCheck(checks, Boolean(releaseSha && candidateCommit === releaseSha), 'release_candidate_commit_matches_release_sha', {
+      expected: releaseSha,
+      actual: candidateCommitValue,
+    })
+    pushCheck(checks, candidateSourceVersion === sourceVersion, 'release_candidate_source_version_matches_release', {
+      expected: sourceVersion,
+      actual: candidateSourceVersion,
+    })
+  }
+
+  if (requiredReceipts.some((receipt) => receipt.file === 'release-integrity-check.json')) {
+    const integrityReceipt = receiptValues.get('release-integrity-check.json')
+    const integrityTarget = integrityReceipt?.target ?? {}
+    const sourceVersion = version.replace(/^v/i, '')
+    const integrityVersion = integrityTarget.version ?? null
+    pushCheck(checks, integrityVersion === sourceVersion, 'release_integrity_version_matches_release', {
+      expected: sourceVersion,
+      actual: integrityVersion,
+    })
+    for (const field of ['git_head_sha', 'git_tag_sha', 'github_tag_sha']) {
+      const actualValue = integrityTarget[field] ?? null
+      const actual = canonicalReleaseSha(actualValue)
+      pushCheck(checks, Boolean(releaseSha && actual === releaseSha), `release_integrity_${field}_matches_release_sha`, {
+        expected: releaseSha,
+        actual: actualValue,
+      })
+    }
+  }
+
+  if (requiredReceipts.some((receipt) => receipt.file === 'stable-deployment-check.json')) {
     const stableDeployment = receiptValues.get('stable-deployment-check.json')
-    const stableCommit = String(stableDeployment?.target?.commit ?? stableDeployment?.target?.release_sha ?? '').toLowerCase()
-    const stableVersion = String(stableDeployment?.target?.version ?? stableDeployment?.target?.tag ?? '')
+    const stableCommitValue = stableDeployment?.target?.commit ?? stableDeployment?.target?.release_sha ?? null
+    const stableCommit = canonicalReleaseSha(stableCommitValue)
+    const stableVersion = stableDeployment?.target?.version ?? stableDeployment?.target?.tag ?? null
     pushCheck(checks, Boolean(releaseSha && stableCommit === releaseSha), 'stable_deployment_commit_matches_release_sha', {
       expected: releaseSha,
-      actual: stableCommit || null,
+      actual: stableCommitValue,
     })
-    pushCheck(checks, stableVersion === version, 'stable_deployment_version_matches_release', {
+    pushCheck(checks, typeof stableVersion === 'string' && stableVersion === version, 'stable_deployment_version_matches_release', {
       expected: version,
-      actual: stableVersion || null,
+      actual: stableVersion,
     })
   }
 
@@ -483,17 +749,19 @@ export function checkBundle(opts = {}) {
     failures: hostGoFailures,
   })
 
-  const issuesPath = join(outDir, 'github-issues.json')
-  const issuesJson = readJson(checks, issuesPath, 'github_issues')
-  artifacts['github-issues.json'] = artifactMeta(issuesPath, issuesJson)
-  const issues = issueEntries(issuesJson)
-  for (const issueNumber of requiredIssues) {
-    const issue = issues.find((entry) => Number(entry?.number) === issueNumber)
-    pushCheck(checks, Boolean(issue), 'required_issue_exported', { issue: issueNumber })
-    pushCheck(checks, String(issue?.state ?? '').toUpperCase() === 'CLOSED', 'required_issue_closed', {
-      issue: issueNumber,
-      actual: issue?.state ?? null,
-    })
+  if (requiredIssues.length > 0) {
+    const issuesPath = join(outDir, 'github-issues.json')
+    const issuesJson = readJson(checks, issuesPath, 'github_issues')
+    artifacts['github-issues.json'] = artifactMeta(issuesPath, issuesJson)
+    const issues = issueEntries(issuesJson)
+    for (const issueNumber of requiredIssues) {
+      const issue = issues.find((entry) => Number(entry?.number) === issueNumber)
+      pushCheck(checks, Boolean(issue), 'required_issue_exported', { issue: issueNumber })
+      pushCheck(checks, String(issue?.state ?? '').toUpperCase() === 'CLOSED', 'required_issue_closed', {
+        issue: issueNumber,
+        actual: issue?.state ?? null,
+      })
+    }
   }
 
   const checksPath = join(outDir, 'github-checks.json')
@@ -501,16 +769,11 @@ export function checkBundle(opts = {}) {
   artifacts['github-checks.json'] = artifactMeta(checksPath, checksJson)
   const exportedChecks = checkEntries(checksJson)
   for (const requiredName of REQUIRED_CHECKS) {
-    const matching = exportedChecks.filter((entry) => String(entry?.name ?? '') === requiredName)
+    const matching = exportedChecks.filter((entry) => checkName(entry) === requiredName)
     pushCheck(checks, matching.length > 0, 'required_ci_check_exported', { check_name: requiredName })
     pushCheck(checks, matching.some(checkSucceeded), 'required_ci_check_passed', {
       check_name: requiredName,
-      observed: matching.map((entry) => ({
-        name: entry?.name ?? null,
-        conclusion: entry?.conclusion ?? null,
-        state: entry?.state ?? entry?.status ?? null,
-        bucket: entry?.bucket ?? null,
-      })),
+      observed: matching.map(checkObservation),
     })
   }
 
@@ -531,33 +794,30 @@ export function checkBundle(opts = {}) {
     expected: 'main',
     actual: prJson?.baseRefName ?? null,
   })
-  const mergeCommitSha = String(prJson?.mergeCommit?.oid ?? '').toLowerCase()
+  const mergeCommitValue = prJson?.mergeCommit?.oid ?? null
+  const mergeCommitSha = canonicalReleaseSha(mergeCommitValue)
   pushCheck(checks, Boolean(releaseSha && mergeCommitSha === releaseSha), 'release_pr_merge_commit_matches_release_sha', {
     expected: releaseSha,
-    actual: mergeCommitSha || null,
+    actual: mergeCommitValue,
   })
   const prChecks = checkEntries(prJson)
   for (const requiredName of REQUIRED_CHECKS) {
-    const matching = prChecks.filter((entry) => String(entry?.name ?? '') === requiredName)
+    const matching = prChecks.filter((entry) => checkName(entry) === requiredName)
     pushCheck(checks, matching.length > 0, 'required_pr_rollup_check_exported', { check_name: requiredName })
     pushCheck(checks, matching.some(checkSucceeded), 'required_pr_rollup_check_passed', {
       check_name: requiredName,
-      observed: matching.map((entry) => ({
-        name: entry?.name ?? null,
-        conclusion: entry?.conclusion ?? null,
-        state: entry?.state ?? entry?.status ?? null,
-        bucket: entry?.bucket ?? null,
-      })),
+      observed: matching.map(checkObservation),
     })
   }
 
   const commitPath = join(outDir, 'github-commit.json')
   const commitJson = readJson(checks, commitPath, 'github_commit')
   artifacts['github-commit.json'] = artifactMeta(commitPath, commitJson)
-  const exportedCommitSha = String(commitJson?.sha ?? '').toLowerCase()
+  const exportedCommitValue = commitJson?.sha ?? null
+  const exportedCommitSha = canonicalReleaseSha(exportedCommitValue)
   pushCheck(checks, Boolean(releaseSha && exportedCommitSha === releaseSha), 'github_commit_matches_release_sha', {
     expected: releaseSha,
-    actual: exportedCommitSha || null,
+    actual: exportedCommitValue,
   })
 
   const commitChecksPath = join(outDir, 'github-commit-checks.json')
@@ -565,15 +825,11 @@ export function checkBundle(opts = {}) {
   artifacts['github-commit-checks.json'] = artifactMeta(commitChecksPath, commitChecksJson)
   const releaseCommitChecks = checkEntries(commitChecksJson)
   for (const requiredName of REQUIRED_COMMIT_CHECKS) {
-    const matching = releaseCommitChecks.filter((entry) => String(entry?.name ?? '') === requiredName)
+    const matching = releaseCommitChecks.filter((entry) => checkName(entry) === requiredName)
     pushCheck(checks, matching.length > 0, 'required_release_commit_check_exported', { check_name: requiredName })
     pushCheck(checks, matching.some(checkSucceeded), 'required_release_commit_check_passed', {
       check_name: requiredName,
-      observed: matching.map((entry) => ({
-        name: entry?.name ?? null,
-        conclusion: entry?.conclusion ?? null,
-        state: entry?.state ?? entry?.status ?? null,
-      })),
+      observed: matching.map(checkObservation),
     })
   }
 
@@ -614,7 +870,7 @@ export function checkBundle(opts = {}) {
   const failed = checks.filter((check) => check.ok === false)
   const passed = checks.filter((check) => check.ok === true)
   return {
-    receipt_type: phase === 'prepublication' ? PREPUBLICATION_CHECK_RECEIPT_TYPE : CHECK_RECEIPT_TYPE,
+    receipt_type: phaseContract.receiptType,
     status: failed.length === 0 ? 'pass' : 'fail',
     phase,
     checked_at: new Date().toISOString(),
@@ -623,6 +879,13 @@ export function checkBundle(opts = {}) {
     checks_pr: checksPr,
     release_sha: releaseSha,
     out_dir: outDir,
+    contract: {
+      schema_version: contract.schema_version,
+      version: contract.version,
+      name: contract.name,
+      source: contract.source,
+      sha256: contract.source_sha256,
+    },
     summary: {
       passed: passed.length,
       failed: failed.length,

@@ -87,7 +87,8 @@ describe('fresh install receipt checker', () => {
       operator: TARGET.operator,
     })
 
-    expect(plan).toContain('Mupot v0.23 fresh self-host install evidence plan')
+    expect(plan).toContain('Mupot fresh self-host install evidence plan')
+    expect(plan).not.toContain('v0.23')
     expect(plan).toContain(STEP_RECEIPT_TYPE)
     expect(plan).toContain('provision-resources.json')
     expect(plan).toContain('fresh-install-check.json')
@@ -109,6 +110,7 @@ describe('fresh install receipt checker', () => {
     expect(receipt.summary.step_receipts).toBe(REQUIRED_STEPS.length)
     expect(receipt.target.pot).toBe(TARGET.pot)
     expect(receipt.timeline.map((step) => step.step)).toEqual(REQUIRED_STEPS.map((step) => step.step))
+    expect(receipt.next_steps.join(' ')).not.toContain('v0.23 release issue')
   })
 
   it('fails when install steps overlap or run out of order', () => {

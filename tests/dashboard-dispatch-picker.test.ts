@@ -289,4 +289,30 @@ describe('sendPageBody — offered rows carry server-derived model/squad/seat ba
     expect(html).not.toContain('class="agent-option')
     expect(html).not.toContain('class="badge badge-seat')
   })
+
+  it('requires and submits the operator exact done_when and renders review as awaiting gate', () => {
+    const agents: DispatchableAgent[] = [
+      {
+        id: 'agent-live', slug: 'agent-live', name: 'Live Agent', role: 'builder',
+        model: 'codex', squad_id: 'squad-a', squad_name: 'Squad Alpha',
+        seat_status: 'live', last_seen: isoStamp(NOW),
+      },
+    ]
+    const html = String(sendPageBody([], agents, pickDispatchDefault(agents)))
+    expect(html).toContain('id="send-done"')
+    expect(html).toContain('id="send-gate"')
+    expect(html).toContain('A verifiable done-when is required.')
+    expect(html).toContain('An independent gate owner is required.')
+    expect(html).toContain('Self-completion is not an independent gate.')
+    expect(html).toContain("gateOwner === 'gate:agent-self-completion'")
+    expect(html).toContain('done_when: doneWhen')
+    expect(html).toContain('gate_owner: gateOwner')
+    expect(html).not.toContain('The task result explains the completed work and names any follow-up needed.')
+    expect(html).toContain("t.status === 'review'")
+    expect(html).toContain('Awaiting independent gate')
+    expect(html).toContain('Transport delivered')
+    expect(html).toContain('Runtime consumed')
+    expect(html).toContain('Runtime completed')
+    expect(html).toContain('Gate verdict')
+  })
 })

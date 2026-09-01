@@ -101,8 +101,6 @@ interface ModuleRegistryRow {
   model?: string | null
   last_heartbeat: string
   registered_at: string
-  session_epoch?: number | null
-  lease_ttl_sec?: number | null
   activity?: string | null
   activity_message?: string | null
   activity_seq?: number | null
@@ -125,8 +123,6 @@ export interface ModulePresence {
   model?: string | null
   last_heartbeat: string
   registered_at: string
-  session_epoch?: number
-  lease_ttl_sec?: number
   /**
    * EFFECTIVE activity — what a reader may act on.
    *
@@ -165,7 +161,7 @@ export interface ModulePresence {
   activity_stale: boolean
 }
 
-const SELECT_COLUMNS = `id, tenant, kind, adapter, project_id, identity, status, capabilities, model, last_heartbeat, registered_at, session_epoch, lease_ttl_sec, activity, activity_message, activity_seq, activity_at, activity_report_at`
+const SELECT_COLUMNS = `id, tenant, kind, adapter, project_id, identity, status, capabilities, model, last_heartbeat, registered_at, activity, activity_message, activity_seq, activity_at, activity_report_at`
 
 function parseCapabilities(raw: string): string[] {
   try {
@@ -257,8 +253,6 @@ function hydrate(row: ModuleRegistryRow, nowMs: number): ModulePresence | null {
     model: row.model ?? null,
     last_heartbeat: row.last_heartbeat,
     registered_at: row.registered_at,
-    session_epoch: typeof row.session_epoch === 'number' ? row.session_epoch : 1,
-    lease_ttl_sec: typeof row.lease_ttl_sec === 'number' ? row.lease_ttl_sec : PRESENCE_STALE_SECONDS,
     activity: effectiveActivity(storedActivity, status, ageSeconds),
     activity_reported: storedActivity,
     activity_message: typeof row.activity_message === 'string' ? row.activity_message : null,
@@ -297,8 +291,6 @@ export interface RegisterModuleInput {
   projectId: string | null
   capabilities?: string[]
   model?: string | null
-  sessionEpoch?: number | null
-  leaseTtlSec?: number | null
 }
 
 /**
@@ -326,21 +318,17 @@ export async function registerModule(
   const nowIso = now.toISOString()
   const capabilitiesJson = JSON.stringify(input.capabilities ?? [])
   const model = input.model?.trim() || null
-  const sessionEpoch = typeof input.sessionEpoch === 'number' && Number.isInteger(input.sessionEpoch) && input.sessionEpoch > 0 ? input.sessionEpoch : 1
-  const leaseTtlSec = typeof input.leaseTtlSec === 'number' && Number.isInteger(input.leaseTtlSec) && input.leaseTtlSec > 0 ? input.leaseTtlSec : PRESENCE_STALE_SECONDS
 
   await env.DB.prepare(
     `INSERT INTO module_registry
-       (id, tenant, kind, adapter, project_id, identity, status, capabilities, model, session_epoch, lease_ttl_sec, last_heartbeat, registered_at)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'online', ?7, ?8, ?10, ?11, ?9, ?9)
+       (id, tenant, kind, adapter, project_id, identity, status, capabilities, model, last_heartbeat, registered_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'online', ?7, ?8, ?9, ?9)
      ON CONFLICT (tenant, identity, project_key) DO UPDATE SET
        kind           = excluded.kind,
        adapter        = excluded.adapter,
        status         = 'online',
        capabilities   = excluded.capabilities,
        model          = excluded.model,
-       session_epoch  = excluded.session_epoch,
-       lease_ttl_sec  = excluded.lease_ttl_sec,
        last_heartbeat = excluded.last_heartbeat,
        -- REGISTRATION IS THE LIFECYCLE BOUNDARY: reset the activity fields.
        --
@@ -366,7 +354,7 @@ export async function registerModule(
        activity_report_at = NULL,
        activity_seq     = 0`,
   )
-    .bind(id, tenant, input.kind, adapter, input.projectId, identity, capabilitiesJson, model, nowIso, sessionEpoch, leaseTtlSec)
+    .bind(id, tenant, input.kind, adapter, input.projectId, identity, capabilitiesJson, model, nowIso)
     .run()
 
   const row = await env.DB.prepare(`SELECT ${SELECT_COLUMNS} FROM module_registry WHERE tenant = ?1 AND identity = ?2 AND project_id IS ?3 LIMIT 1`)
@@ -391,22 +379,16 @@ export async function heartbeatModule(
   projectId: string | null,
   now: Date = new Date(),
   report?: ActivityReport,
-  opts?: { sessionEpoch?: number | null; leaseTtlSec?: number | null },
 ): Promise<boolean> {
   const nowIso = now.toISOString()
-  const sessionEpoch = typeof opts?.sessionEpoch === 'number' && Number.isInteger(opts.sessionEpoch) && opts.sessionEpoch > 0 ? opts.sessionEpoch : null
-  const leaseTtlSec = typeof opts?.leaseTtlSec === 'number' && Number.isInteger(opts.leaseTtlSec) && opts.leaseTtlSec > 0 ? opts.leaseTtlSec : null
 
   if (!report) {
     const res = await env.DB.prepare(
       `UPDATE module_registry
-          SET last_heartbeat = ?1,
-              status = 'online',
-              session_epoch = COALESCE(?5, session_epoch),
-              lease_ttl_sec = COALESCE(?6, lease_ttl_sec)
+          SET last_heartbeat = ?1, status = 'online'
         WHERE tenant = ?2 AND identity = ?3 AND project_id IS ?4`,
     )
-      .bind(nowIso, env.TENANT_SLUG, identity, projectId, sessionEpoch, leaseTtlSec)
+      .bind(nowIso, env.TENANT_SLUG, identity, projectId)
       .run()
     return (res.meta?.changes ?? 0) > 0
   }
@@ -414,12 +396,29 @@ export async function heartbeatModule(
   const message =
     typeof report.message === 'string' ? report.message.slice(0, ACTIVITY_MESSAGE_MAX) || null : null
 
+  // THE SEQ GUARD IS IN THE SET, NOT THE WHERE — and that placement is the whole
+  // correctness of this statement.
+  //
+  // Putting `activity_seq < ?7` in the WHERE clause would make an out-of-order report
+  // drop the HEARTBEAT along with the activity, so a seat whose reports briefly raced
+  // would age into 'offline' while perfectly alive. Liveness must never depend on
+  // report ordering. Here the row always matches, last_heartbeat always advances, and
+  // only the four activity columns are gated.
+  //
+  // Every right-hand side sees the OLD row (SQLite evaluates all SET expressions
+  // against the pre-update values), which is what makes two things work at once:
+  // `?7 > activity_seq` compares against the stored seq, and `activity IS NOT ?5`
+  // compares the stored activity against the incoming one — NULL-safe via IS NOT, so
+  // a first-ever report (stored NULL) correctly counts as a change.
+  //
+  // activity_at therefore advances ONLY on a real transition. A seat re-asserting
+  // 'working' every 30 seconds keeps a fresh heartbeat and a fresh seq while its
+  // activity_at stays pinned to when the turn actually began — which is exactly the
+  // signal that lets a reader tell a long turn from a wedge.
   const res = await env.DB.prepare(
     `UPDATE module_registry
         SET last_heartbeat   = ?1,
             status           = 'online',
-            session_epoch    = COALESCE(?8, session_epoch),
-            lease_ttl_sec    = COALESCE(?9, lease_ttl_sec),
             activity         = CASE WHEN ?7 > activity_seq THEN ?5 ELSE activity END,
             activity_message = CASE WHEN ?7 > activity_seq THEN ?6 ELSE activity_message END,
             activity_at      = CASE WHEN ?7 > activity_seq AND activity IS NOT ?5
@@ -430,7 +429,7 @@ export async function heartbeatModule(
             activity_report_at = CASE WHEN ?7 > activity_seq THEN ?1 ELSE activity_report_at END
       WHERE tenant = ?2 AND identity = ?3 AND project_id IS ?4`,
   )
-    .bind(nowIso, env.TENANT_SLUG, identity, projectId, report.state, message, report.seq, sessionEpoch, leaseTtlSec)
+    .bind(nowIso, env.TENANT_SLUG, identity, projectId, report.state, message, report.seq)
     .run()
   return (res.meta?.changes ?? 0) > 0
 }

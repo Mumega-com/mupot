@@ -34,7 +34,7 @@ import type {
   Squad,
   Task,
 } from '../types'
-import { resolveCapabilities, resolveTokenGrants, intersectCapabilities, hasCapability, holdsCapabilityFloor, canOnSquad, hasSurfaceCap } from '../auth/capability'
+import { resolveCapabilities, hasCapability, holdsCapabilityFloor, canOnSquad, hasSurfaceCap } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc, touchTokenLastUsed } from '../auth/token-lifecycle'
 import { callerHoldsGateCapability, verdictPrincipal } from '../tasks/index'
 import { resolveSoleGateOwnerAgent } from '../gates/grants'
@@ -66,13 +66,17 @@ import {
   writeVerdict,
   VerdictRaceError,
   TaskEvidenceFenceError,
-  TaskSelfGateError,
 } from '../tasks/service'
 import { loadKanbanData } from '../dashboard/kanban-routes'
 import type { TaskStatus } from '../tasks/service'
 import { isTaskPriority, TASK_PRIORITIES } from '../types'
 import type { TaskPriority } from '../types'
 import { resolveTaskAssignee } from '../tasks/assignee'
+import {
+  recordTaskDispatchRuntimeReceipt,
+  TaskDispatchRuntimeReceiptError,
+  type TaskDispatchRuntimeStage,
+} from '../tasks/runtime-receipts'
 // #22 v1 ATC ranking: pure scorer + the radar's existing agent runtime-state
 // loader (dashboard/radar.ts already uses this same loader for the fleet
 // view — not a new query shape).
@@ -94,6 +98,8 @@ import {
   sendToRef, readAgentInbox, sendAgentMessage,
 } from '../agents/messages'
 import { routeAgentWake } from '../agents/wake-routing'
+import { authorizeExecutionScope } from '../auth/execution-scope'
+import { runRouterTick } from '../router/engine'
 import { verifyTaskArtifactShape } from '../tasks/artifact-verification'
 import {
   leaseAgentInbox, ackAgentMessages, listDeadLetteredMessages, summarizeDeadLetters,
@@ -114,7 +120,6 @@ import {
   presenceTtlSec,
 } from '../fleet/registry'
 import { agentKeyFingerprint, loadActiveAgentKey } from '../fleet/agent-keys'
-import { consumeDeliveryTurnFence } from '../flight-spine/delivery-turn-fencing'
 import { PROVISION_TOOLS } from './provision'
 import { BOOTSTRAP_TOOLS } from './bootstrap'
 import { CREDENTIAL_CLAIM_TOOLS } from './credential-claim'
@@ -132,14 +137,13 @@ import { RUNNER_TOOLS } from './runners'
 import { FLIGHT_SPINE_TOOLS } from './flight-spine'
 import { CURSOR_TOOLS } from './cursor'
 import { ATHENA_TOOLS } from './athena'
-import { toolPotProvision, toolPotList } from './pots'
+import { POT_TOOLS } from './pots'
 import {
   toolSupabaseConnect,
   toolSupabaseSchema,
   toolSupabaseQuery,
   toolSupabaseMutate,
 } from './supabase-tools'
-import { toolMintBody } from './body-mint'
 import { dispatchFlight } from '../flight/dispatch'
 import {
   deliverFlightLandedEvent,
@@ -164,7 +168,7 @@ import { MUPOT_PUBLIC_API_VERSION } from '../version'
 import { MUPOT_MCP_INITIALIZE_INSTRUCTIONS } from './instructions'
 // The SAME predicate the meter enforces with. Imported rather than restated —
 // these were two copies and they drifted (#1179 gate R6).
-import { isEnforceableCap } from '../agents/meter'
+import { getAuthorizedMeterStatus, isEnforceableCap } from '../agents/meter'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
@@ -294,17 +298,7 @@ async function resolveAuth(c: {
             if (knownNonDirectory) auth.boundAgentId = null
           } else {
             auth.tokenId = token.token_id
-            if (knownNonDirectory) {
-              auth.boundAgentId = token.bound_agent_id ?? null
-              try {
-                const tokenGrants = await resolveTokenGrants(c.env, token.token_id)
-                if (tokenGrants) {
-                  auth.capabilities = intersectCapabilities(auth.capabilities, tokenGrants)
-                }
-              } catch {
-                // Fail-soft for mocks
-              }
-            }
+            if (knownNonDirectory) auth.boundAgentId = token.bound_agent_id ?? null
           }
         } else {
           auth.tokenId = null
@@ -318,27 +312,13 @@ async function resolveAuth(c: {
   return authenticateMember(c)
 }
 
-// Continuum identity extraction: extracts the root agent continuum name (e.g. "river" from "hadi-river", "river-cursor", "muvps_river")
-export function extractContinuumName(rawSlugOrName: string): string {
-  const cleaned = rawSlugOrName.toLowerCase().trim()
-  // Match prefix or suffix qualifiers: e.g. "hadi-river" -> "river", "river-cursor" -> "river", "muvps_kasra" -> "kasra"
-  const knownContinuums = ['river', 'kasra', 'loom', 'dara', 'athena', 'cairn', 'hermes']
-  for (const known of knownContinuums) {
-    if (cleaned === known || cleaned.endsWith(`-${known}`) || cleaned.endsWith(`_${known}`) || cleaned.startsWith(`${known}-`) || cleaned.startsWith(`${known}_`)) {
-      return known
-    }
-  }
-  return cleaned
-}
-
-// ── member & continuum memory scope ──────────────────────────────────────────
-// The MemoryPort is keyed by an opaque id string. A member/agent's memory lives
-// under a namespaced key so it never collides with other domains.
-function memberMemoryScope(principalId: string, continuumName?: string | null): string {
-  if (continuumName && continuumName.trim().length > 0) {
-    return `continuum:${extractContinuumName(continuumName)}`
-  }
-  return `member:${principalId}`
+// ── member memory scope ──────────────────────────────────────────────────────
+// The MemoryPort is keyed by an opaque id string. A member's OWN memory lives
+// under a namespaced key so it never collides with an agent id (which is a bare
+// uuid). recall/remember for a member always use this — a member can only touch
+// their own scope; there is no cross-member or agent memory access via this seam.
+function memberMemoryScope(memberId: string): string {
+  return `member:${memberId}`
 }
 
 function squadMemoryScope(squadId: string): string {
@@ -436,19 +416,10 @@ export async function authenticateMember(c: {
   void touchTokenLastUsed(c.env, tokenHash)
   if (row.status !== 'active') return null
 
-  let capabilities = await resolveCapabilities(c.env, row.member_id)
+  const capabilities = await resolveCapabilities(c.env, row.member_id)
 
-  // Token-scoped grants ceiling (#584 / FLIGHT IDENTITY-UNIFIED):
-  // effective = intersect(principal_capabilities, token_grants)
-  try {
-    const tokenGrants = await resolveTokenGrants(c.env, row.token_id)
-    if (tokenGrants) {
-      capabilities = intersectCapabilities(capabilities, tokenGrants)
-    }
-  } catch {
-    // Fail-soft for mocks
-  }
-
+  // role is the coarse org-role field on AuthContext; a member principal is
+  // 'member' at the org-role layer. The REAL authorization is `capabilities`.
   const auth: AuthContext = {
     userId: row.member_id,
     email: row.email,
@@ -475,9 +446,6 @@ export async function memberCanOnSquad(
 ): Promise<boolean> {
   return canOnSquad(env, grants, squadId, min)
 }
-
-export { callerHoldsActionCapability } from '../auth/capability'
-
 
 // ── d1 helpers (read-only lookups; allow-listed table names) ──────────────────
 async function loadSquad(env: Env, squadId: string): Promise<Squad | null> {
@@ -552,7 +520,7 @@ function memberActor(memberId: string): { kind: 'member'; id: string } {
 // ── tool result shape ─────────────────────────────────────────────────────────
 // A tool returns either a value (→ 200 {ok:true, result}) or a typed error with
 // an HTTP status (→ that status, {ok:false, error}).
-type ToolError = { status: 400 | 401 | 403 | 404 | 409 | 410 | 429 | 500 | 502 | 503; error: string; detail?: unknown }
+type ToolError = { status: 400 | 403 | 404 | 409 | 410 | 500 | 502 | 503; error: string; detail?: unknown }
 export type ToolOutcome = { ok: true; result: unknown } | { ok: false } & ToolError
 
 export function fail(status: ToolError['status'], error: string, detail?: unknown): ToolOutcome {
@@ -579,6 +547,7 @@ export function str(v: unknown): string | null {
 // pot's own MCP endpoint into the brief. Derived from the request URL at each call site.
 export type ToolCtx = {
   origin: string
+  transport: 'mcp' | 'rest'
   waitUntil?: (promise: Promise<unknown>) => void
   seat?: string
   source?: string
@@ -591,6 +560,9 @@ export interface ToolSpec {
   min: Capability | 'authenticated'
   args: string // documented arg shape
   inputSchema: JsonSchema
+  // Framework-owned policy for post-success presence. It receives only schema-
+  // validated arguments, and defaults to the historic always-touch behavior.
+  shouldTouchPresence?: (args: Readonly<Record<string, unknown>>) => boolean
   // ctx is the 4th param; tools that don't need it simply omit it from their signature
   // (a function of fewer params is assignable here — TS structural typing).
   run: (auth: AuthContext, env: Env, args: Record<string, unknown>, ctx: ToolCtx) => Promise<ToolOutcome>
@@ -600,13 +572,14 @@ type JsonSchema = {
   type: 'object'
   properties: Record<string, unknown>
   required?: string[]
-  additionalProperties?: boolean
+  additionalProperties: boolean
 }
 
 const STRING_SCHEMA = { type: 'string' }
 const NULLABLE_STRING_SCHEMA = { type: ['string', 'null'] }
 const OPTIONAL_STRING_ARRAY_SCHEMA = { type: 'array', items: { type: 'string' } }
 const OPTIONAL_NUMBER_SCHEMA = { type: 'number' }
+const OPTIONAL_BOOLEAN_SCHEMA = { type: 'boolean' }
 
 const PATCH_ALLOWED_STATUSES: ReadonlySet<string> = new Set(['open', 'in_progress', 'blocked', 'done', 'review'])
 const BROADCAST_REQUEST_ID_RE = /^[A-Za-z0-9_.:-]{1,128}$/
@@ -877,7 +850,6 @@ const toolTaskCreate: ToolSpec = {
         { actor: memberActor(auth.memberId as string), externalSource, skipEvent: args.dispatch === false },
       )
     } catch (error) {
-      if (error instanceof TaskSelfGateError) return fail(409, 'self_gate_conflict', error.message)
       if (error instanceof TaskIntakeContractError) return fail(400, error.code, error.message)
       if (error instanceof TaskProjectError) return taskProjectFailure(error)
       throw error
@@ -1505,7 +1477,6 @@ const toolTaskUpdate: ToolSpec = {
     try {
       await persistTaskUpdate(env, existing, next)
     } catch (error) {
-      if (error instanceof TaskSelfGateError) return fail(409, 'self_gate_conflict', error.message)
       if (error instanceof TaskIntakeContractError) return fail(400, error.code, error.message)
       if (error instanceof TaskUpdateConflictError) return fail(409, error.code)
       throw error
@@ -1844,20 +1815,16 @@ const toolTaskDispatch: ToolSpec = {
   name: 'task_dispatch',
   scope: 'squad (of the task)',
   min: 'member',
-  args: '{ task_id: string, target_seat?: string }',
+  args: '{ task_id: string }',
   inputSchema: {
     type: 'object',
-    properties: {
-      task_id: STRING_SCHEMA,
-      target_seat: STRING_SCHEMA,
-    },
+    properties: { task_id: STRING_SCHEMA },
     required: ['task_id'],
     additionalProperties: false,
   },
   async run(auth, env, args) {
     const taskId = str(args.task_id)
     if (!taskId) return fail(400, 'invalid_args', 'task_id required')
-    const targetSeat = str(args.target_seat) || null
     const task = await loadTask(env, taskId)
     if (!task) return fail(404, 'task_not_found')
 
@@ -1892,18 +1859,13 @@ const toolTaskDispatch: ToolSpec = {
       dispatchedAt,
     ).run()
 
-    const event: BusEvent<{ task_id: string; by: string; dispatch_receipt_id: string; target_seat?: string }> = {
+    const event: BusEvent<{ task_id: string; by: string; dispatch_receipt_id: string }> = {
       type: 'agent.wake',
       tenant: env.TENANT_SLUG,
       squad_id: task.squad_id,
       agent_id: task.assignee_agent_id,
       actor: memberActor(memberId),
-      payload: {
-        task_id: task.id,
-        by: memberId,
-        dispatch_receipt_id: receiptId,
-        ...(targetSeat ? { target_seat: targetSeat } : {}),
-      },
+      payload: { task_id: task.id, by: memberId, dispatch_receipt_id: receiptId },
       ts: dispatchedAt,
     }
     try {
@@ -1918,11 +1880,21 @@ const toolTaskDispatch: ToolSpec = {
       return fail(500, 'dispatch_failed', { receipt_id: receiptId })
     }
 
+    // NOTE (mupot#76e25fc2 / FLIGHT-07B, reverted after gate BLOCK): this handler
+    // previously added a second, ad-hoc sendAgentMessage write here, believing
+    // task_dispatch had the same "silent drop" gap #860 fixed for flight_dispatch.
+    // It did not — src/bus/consumer.ts's 'agent.wake' case already recognizes this
+    // exact event shape via taskDispatchIdentity() (keyed on the dispatch_receipt_id
+    // in the payload above) and routes it through src/bus/fleet-bridge.ts's
+    // deliverDispatchToInbox, a #353-hardened, sticky-route bridge built specifically
+    // to prevent double execution. The added write used a different sender/request-id
+    // convention the real router never saw — a second, uncoordinated delivery path,
+    // not a fix. Reverted; the routing above was already correct.
+
     return done({
       dispatched: true,
       task_id: task.id,
       agent_id: task.assignee_agent_id,
-      target_seat: targetSeat,
       squad_id: task.squad_id,
       receipt: {
         id: receiptId,
@@ -1933,53 +1905,70 @@ const toolTaskDispatch: ToolSpec = {
   },
 }
 
-// task_report_result — report external runtime completion result and artifact claim (Issue #1183).
-// Allows external/bound-seat runtimes (Hadi-Grok on Mac, Codex, Cursor Cloud) to report verifiable
-// results with Artifact: <path> + SHA256: <64-hex> into tasks.result and transition the task.
-const toolTaskReportResult: ToolSpec = {
-  name: 'task_report_result',
-  scope: 'squad (of the task)',
+function runtimeReceiptFailure(error: TaskDispatchRuntimeReceiptError): ToolOutcome {
+  if (error.code === 'runtime_receipt_invalid') return fail(400, error.code)
+  if (error.code === 'agent_bound_workspace_credential_required' || error.code === 'runtime_receipt_forbidden') {
+    return fail(403, error.code)
+  }
+  if (error.code === 'runtime_delivery_not_found') return fail(404, error.code)
+  if (
+    error.code === 'runtime_delivery_stale'
+    || error.code === 'runtime_receipt_conflict'
+    || error.code === 'runtime_artifact_required'
+    || error.code === 'runtime_gate_required'
+    || error.code === 'runtime_receipt_transition_conflict'
+  ) return fail(409, error.code)
+  return fail(500, error.code)
+}
+
+const toolTaskDispatchRuntimeReceipt: ToolSpec = {
+  name: 'task_dispatch_runtime_receipt',
+  scope: 'assigned task runtime receipt',
   min: 'member',
-  args: '{ task_id: string, result: string, status?: "in_progress"|"review"|"done", gate_owner?: string|null }',
+  args: '{ task_id, dispatch_receipt_id, message_id, stage, runtime_receipt_hash, attempt, artifact_refs?, artifact_sha256?, result?, reason? }',
   inputSchema: {
     type: 'object',
     properties: {
       task_id: STRING_SCHEMA,
-      result: STRING_SCHEMA,
-      status: { type: 'string', enum: ['in_progress', 'review', 'done'] },
-      gate_owner: STRING_SCHEMA,
+      dispatch_receipt_id: STRING_SCHEMA,
+      message_id: STRING_SCHEMA,
+      stage: { type: 'string', enum: ['runtime_consumed', 'completed', 'failed'] },
+      runtime_receipt_hash: STRING_SCHEMA,
+      attempt: OPTIONAL_NUMBER_SCHEMA,
+      artifact_refs: OPTIONAL_STRING_ARRAY_SCHEMA,
+      artifact_sha256: NULLABLE_STRING_SCHEMA,
+      result: NULLABLE_STRING_SCHEMA,
+      reason: NULLABLE_STRING_SCHEMA,
     },
-    required: ['task_id', 'result'],
+    required: [
+      'task_id',
+      'dispatch_receipt_id',
+      'message_id',
+      'stage',
+      'runtime_receipt_hash',
+      'attempt',
+    ],
     additionalProperties: false,
   },
-  async run(auth, env, args) {
-    const taskId = str(args.task_id)
-    const result = str(args.result)
-    if (!taskId || !result) return fail(400, 'invalid_args', 'task_id and result required')
-
-    const statusCandidate = str(args.status)
-    const status = (statusCandidate === 'in_progress' || statusCandidate === 'review' || statusCandidate === 'done')
-      ? statusCandidate
-      : undefined
-
-    const gateOwner = args.gate_owner !== undefined
-      ? (args.gate_owner === null ? null : str(args.gate_owner))
-      : undefined
-
+  async run(auth, env, args, ctx) {
     try {
-      const { reportTaskResult } = await import('../tasks/report-result')
-      const outcome = await reportTaskResult(env, auth, {
-        taskId,
-        result,
-        status,
-        gateOwner,
-      })
-      return done(outcome)
-    } catch (err: any) {
-      if (err.name === 'TaskReportResultError') {
-        return fail(err.status, err.code, err.message)
-      }
-      return fail(500, 'report_result_failed', err instanceof Error ? err.message : String(err))
+      return done(await recordTaskDispatchRuntimeReceipt(env, auth, {
+        taskId: str(args.task_id) ?? '',
+        dispatchReceiptId: str(args.dispatch_receipt_id) ?? '',
+        messageId: str(args.message_id) ?? '',
+        stage: args.stage as TaskDispatchRuntimeStage,
+        runtimeReceiptHash: str(args.runtime_receipt_hash) ?? '',
+        attempt: args.attempt as number,
+        artifactRefs: Array.isArray(args.artifact_refs)
+          ? args.artifact_refs.filter((value): value is string => typeof value === 'string')
+          : undefined,
+        artifactSha256: args.artifact_sha256 as string | null | undefined,
+        result: args.result as string | null | undefined,
+        reason: args.reason as string | null | undefined,
+      }, { origin: ctx.transport }))
+    } catch (error) {
+      if (error instanceof TaskDispatchRuntimeReceiptError) return runtimeReceiptFailure(error)
+      throw error
     }
   },
 }
@@ -2743,22 +2732,15 @@ const toolFlightList: ToolSpec = {
   },
 }
 
-// remember — write to the MEMBER's OWN or CONTINUUM memory scope. cap: authenticated member.
+// remember — write to the MEMBER's OWN memory scope. cap: authenticated member.
 const toolRemember: ToolSpec = {
   name: 'remember',
-  scope: 'self / continuum',
+  scope: 'self',
   min: 'authenticated',
-  args: '{ text: string, concepts?: string[], continuum?: string }',
+  args: '{ text: string, concepts?: string[] }',
   inputSchema: {
     type: 'object',
-    properties: {
-      text: STRING_SCHEMA,
-      concepts: OPTIONAL_STRING_ARRAY_SCHEMA,
-      continuum: {
-        type: 'string',
-        description: 'Optional agent continuum name (e.g. "river", "kasra"). When provided, memory is shared across all concurrent bodies of this continuum.',
-      },
-    },
+    properties: { text: STRING_SCHEMA, concepts: OPTIONAL_STRING_ARRAY_SCHEMA },
     required: ['text'],
     additionalProperties: false,
   },
@@ -2769,39 +2751,21 @@ const toolRemember: ToolSpec = {
     const concepts = readConcepts(args.concepts)
     if (concepts && !Array.isArray(concepts)) return concepts
 
-    const continuum = str(args.continuum) || null
-    const principalId = auth.memberId || auth.boundAgentId || auth.userId
-    if (!principalId) return fail(401, 'unauthenticated', 'no valid member or agent identity')
-
-    const scope = memberMemoryScope(principalId, continuum)
-    try {
-      const id = await createMemory(env).remember(scope, text, concepts)
-      return done({ engram_id: id, scope, continuum: continuum ? extractContinuumName(continuum) : undefined })
-    } catch (err: any) {
-      if (err?.name === 'MemoryError') {
-        return fail(err.status, err.code, err.message)
-      }
-      return fail(500, 'memory_operation_failed', err instanceof Error ? err.message : String(err))
-    }
+    const scope = memberMemoryScope(auth.memberId as string)
+    const id = await createMemory(env).remember(scope, text, concepts)
+    return done({ engram_id: id })
   },
 }
 
-// recall — read from the MEMBER's OWN or CONTINUUM memory scope. cap: authenticated.
+// recall — read from the MEMBER's OWN memory scope only. cap: authenticated.
 const toolRecall: ToolSpec = {
   name: 'recall',
-  scope: 'self / continuum',
+  scope: 'self',
   min: 'authenticated',
-  args: '{ query: string, limit?: number, continuum?: string }',
+  args: '{ query: string, limit?: number }',
   inputSchema: {
     type: 'object',
-    properties: {
-      query: STRING_SCHEMA,
-      limit: OPTIONAL_NUMBER_SCHEMA,
-      continuum: {
-        type: 'string',
-        description: 'Optional agent continuum name (e.g. "river", "kasra") to recall shared continuum memory across bodies.',
-      },
-    },
+    properties: { query: STRING_SCHEMA, limit: OPTIONAL_NUMBER_SCHEMA },
     required: ['query'],
     additionalProperties: false,
   },
@@ -2816,20 +2780,9 @@ const toolRecall: ToolSpec = {
       return fail(400, 'invalid_args', 'limit must be a number')
     }
 
-    const continuum = str(args.continuum) || null
-    const principalId = auth.memberId || auth.boundAgentId || auth.userId
-    if (!principalId) return fail(401, 'unauthenticated', 'no valid member or agent identity')
-
-    const scope = memberMemoryScope(principalId, continuum)
-    try {
-      const hits = await createMemory(env).recall(scope, query, limit)
-      return done({ hits, scope, continuum: continuum ? extractContinuumName(continuum) : undefined })
-    } catch (err: any) {
-      if (err?.name === 'MemoryError') {
-        return fail(err.status, err.code, err.message)
-      }
-      return fail(500, 'memory_operation_failed', err instanceof Error ? err.message : String(err))
-    }
+    const scope = memberMemoryScope(auth.memberId as string)
+    const hits = await createMemory(env).recall(scope, query, limit)
+    return done({ hits })
   },
 }
 
@@ -2859,20 +2812,12 @@ const toolSquadRemember: ToolSpec = {
       args,
       'member',
       'squad_id required unless the token is agent-bound',
-      isOrgOwnerAdmin(auth),
     )
     if (!squadRes.ok) return squadRes
 
     const scope = squadMemoryScope(squadRes.squad.id)
-    try {
-      const id = await createMemory(env).remember(scope, text, concepts)
-      return done({ engram_id: id, squad_id: squadRes.squad.id, scope })
-    } catch (err: any) {
-      if (err?.name === 'MemoryError') {
-        return fail(err.status, err.code, err.message)
-      }
-      return fail(500, 'memory_operation_failed', err instanceof Error ? err.message : String(err))
-    }
+    const id = await createMemory(env).remember(scope, text, concepts)
+    return done({ engram_id: id, squad_id: squadRes.squad.id, scope })
   },
 }
 
@@ -2901,20 +2846,12 @@ const toolSquadRecall: ToolSpec = {
       args,
       'observer',
       'squad_id required unless the token is agent-bound',
-      isOrgOwnerAdmin(auth),
     )
     if (!squadRes.ok) return squadRes
 
     const scope = squadMemoryScope(squadRes.squad.id)
-    try {
-      const hits = await createMemory(env).recall(scope, query, limit)
-      return done({ squad_id: squadRes.squad.id, scope, hits })
-    } catch (err: any) {
-      if (err?.name === 'MemoryError') {
-        return fail(err.status, err.code, err.message)
-      }
-      return fail(500, 'memory_operation_failed', err instanceof Error ? err.message : String(err))
-    }
+    const hits = await createMemory(env).recall(scope, query, limit)
+    return done({ squad_id: squadRes.squad.id, scope, hits })
   },
 }
 
@@ -2958,15 +2895,8 @@ const toolProjectRemember: ToolSpec = {
     }
 
     const scope = projectMemoryScope(projectId)
-    try {
-      const id = await createMemory(env).remember(scope, text, concepts)
-      return done({ engram_id: id, project_id: projectId, scope })
-    } catch (err: any) {
-      if (err?.name === 'MemoryError') {
-        return fail(err.status, err.code, err.message)
-      }
-      return fail(500, 'memory_operation_failed', err instanceof Error ? err.message : String(err))
-    }
+    const id = await createMemory(env).remember(scope, text, concepts)
+    return done({ engram_id: id, project_id: projectId, scope })
   },
 }
 
@@ -2995,15 +2925,8 @@ const toolProjectRecall: ToolSpec = {
     if (!project) return fail(404, 'project_not_found')
 
     const scope = projectMemoryScope(projectId)
-    try {
-      const hits = await createMemory(env).recall(scope, query, limit)
-      return done({ project_id: projectId, scope, hits })
-    } catch (err: any) {
-      if (err?.name === 'MemoryError') {
-        return fail(err.status, err.code, err.message)
-      }
-      return fail(500, 'memory_operation_failed', err instanceof Error ? err.message : String(err))
-    }
+    const hits = await createMemory(env).recall(scope, query, limit)
+    return done({ project_id: projectId, scope, hits })
   },
 }
 
@@ -3065,6 +2988,68 @@ const toolWakeAgent: ToolSpec = {
       seq: routed.seq,
       duplicate: routed.duplicate,
     })
+  },
+}
+
+// router_tick — one named squad only. Dry-run is observer-visible; mutation is lead-gated.
+const toolRouterTick: ToolSpec = {
+  name: 'router_tick',
+  scope: 'named squad',
+  min: 'authenticated',
+  shouldTouchPresence: (args) => args.dry_run !== true,
+  args: '{ squad_id: string, dry_run?: boolean, limit?: number }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      squad_id: STRING_SCHEMA,
+      dry_run: OPTIONAL_BOOLEAN_SCHEMA,
+      limit: OPTIONAL_NUMBER_SCHEMA,
+    },
+    required: ['squad_id'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const squadId = str(args.squad_id)
+    if (!squadId) return fail(400, 'invalid_args', 'squad_id required')
+    // The generic schema seam intentionally preserves historical optional-null
+    // behavior for unrelated tools. This boolean is not nullable: reject here,
+    // before choosing mutation authority or entering the presence policy.
+    if (args.dry_run !== undefined && typeof args.dry_run !== 'boolean') {
+      return fail(400, 'invalid_args', 'dry_run must be boolean')
+    }
+    const dryRun = args.dry_run === true
+    const decision = await authorizeExecutionScope(env, auth, {
+      action: dryRun ? 'router:read' : 'router:mutate',
+      squadId,
+    })
+    if (!decision.ok) return fail(decision.status, decision.error)
+    if (!auth.memberId) return fail(403, 'forbidden')
+
+    const limit = typeof args.limit === 'number' ? args.limit : undefined
+    const result = await runRouterTick(env, decision, { squadId, dryRun, limit }, { memberId: auth.memberId })
+    return done(result)
+  },
+}
+
+// execution_meter_status — read-only and scope-resolved before spend rows load.
+// Omit agent_id for canonical bound-agent self; named targets require same-squad
+// lead-or-higher or org-admin authority through authorizeExecutionScope.
+const toolExecutionMeterStatus: ToolSpec = {
+  name: 'execution_meter_status',
+  scope: 'bound agent self or authorized squad agent',
+  min: 'authenticated',
+  args: '{ agent_id?: string }',
+  inputSchema: {
+    type: 'object',
+    properties: { agent_id: STRING_SCHEMA },
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    if (args.agent_id !== undefined && !str(args.agent_id)) {
+      return fail(400, 'invalid_args', 'agent_id must be a non-empty string')
+    }
+    const agentId = str(args.agent_id) ?? undefined
+    return getAuthorizedMeterStatus(env, auth, agentId)
   },
 }
 
@@ -3179,8 +3164,7 @@ const toolSend: ToolSpec = {
           ? 404
           : res.reason === 'project_access_denied'
             ? 403
-          : res.reason === 'target_agent_inactive' ||
-              res.reason === 'recipient_ambiguous' ||
+          : res.reason === 'recipient_ambiguous' ||
               res.reason === 'request_id_conflict' ||
               res.reason === 'inbox_full' ||
               res.reason === 'project_archived'
@@ -3195,8 +3179,6 @@ const toolSend: ToolSpec = {
       to: res.toAgent,
       project_id: typeof args.project_id === 'string' ? args.project_id : null,
       target_seat: typeof args.seat === 'string' ? args.seat.trim() : null,
-      body_length: res.body_length,
-      checksum_sha256: res.checksum_sha256,
     })
   },
 }
@@ -3268,7 +3250,7 @@ const toolBroadcast: ToolSpec = {
       .all<BroadcastTarget>()
     const targets = (rows.results ?? []).filter((agent) => includeSelf || agent.id !== fromAgent)
 
-    const deliveries: Array<{ to: string; slug: string; id: string; seq: number; duplicate: boolean; request_id: string | null; body_length?: number; checksum_sha256?: string }> = []
+    const deliveries: Array<{ to: string; slug: string; id: string; seq: number; duplicate: boolean; request_id: string | null }> = []
     const failures: Array<{ to: string; slug: string; error: string; detail?: string }> = []
     for (const target of targets) {
       const recipientRequestId = requestId ? await broadcastRecipientRequestId(requestId, target.id) : undefined
@@ -3291,8 +3273,6 @@ const toolBroadcast: ToolSpec = {
           seq: res.seq,
           duplicate: res.duplicate,
           request_id: recipientRequestId ?? null,
-          body_length: res.body_length,
-          checksum_sha256: res.checksum_sha256,
         })
       } else {
         failures.push({ to: target.id, slug: target.slug, error: res.reason, detail: res.detail })
@@ -3319,10 +3299,15 @@ const toolInbox: ToolSpec = {
   name: 'inbox',
   scope: 'self (the caller agent reads its own inbox)',
   min: 'authenticated',
-  args: '{ limit?: number, peek?: boolean, seat?: string }',
+  args: '{ limit?: number, peek?: boolean, seat?: string, since_seq?: number (peek only) }',
   inputSchema: {
     type: 'object',
-    properties: { limit: OPTIONAL_NUMBER_SCHEMA, peek: { type: 'boolean' }, seat: STRING_SCHEMA },
+    properties: {
+      limit: OPTIONAL_NUMBER_SCHEMA,
+      peek: { type: 'boolean' },
+      seat: STRING_SCHEMA,
+      since_seq: OPTIONAL_NUMBER_SCHEMA,
+    },
     required: [],
     additionalProperties: false,
   },
@@ -3339,11 +3324,21 @@ const toolInbox: ToolSpec = {
       return fail(400, 'invalid_args', 'peek must be a boolean')
     if (args.seat !== undefined && typeof args.seat !== 'string')
       return fail(400, 'invalid_args', 'seat must be a string')
+    let sinceSeq: number | undefined
+    const rawSinceSeq = args.since_seq
+    if (rawSinceSeq !== undefined) {
+      if (typeof rawSinceSeq !== 'number' || !Number.isSafeInteger(rawSinceSeq) || rawSinceSeq < 0)
+        return fail(400, 'invalid_args', 'since_seq must be a non-negative safe integer')
+      if (args.peek !== true)
+        return fail(400, 'invalid_args', 'since_seq requires peek=true; use inbox_lease and inbox_ack for reliable consumption')
+      sinceSeq = rawSinceSeq
+    }
 
     const res = await readAgentInbox(env, {
       agent,
       limit,
       peek: args.peek === true,
+      sinceSeq,
       seat: typeof args.seat === 'string' ? args.seat.trim() : undefined,
     })
     if (!res.ok) {
@@ -4366,866 +4361,6 @@ const toolConnect: ToolSpec = {
   },
 }
 
-// mupot_delivery_consumed_v1 — thread-bound dynamic delivery consumption tool (FLIGHT DELIV-03 / #1031 & #1050).
-// Strictly verifies {threadId, turnId, nonce, correlation, generation} against the receiver's active turn fence.
-const toolMupotDeliveryConsumedV1: ToolSpec = {
-  name: 'mupot_delivery_consumed_v1',
-  scope: 'thread-bound delivery turn fence consumption',
-  min: 'authenticated',
-  args: '{ deliveryId: string, threadId: string, turnId: string, generation: number, correlation: string, nonce: string, summary?: string }',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      deliveryId: STRING_SCHEMA,
-      threadId: STRING_SCHEMA,
-      turnId: STRING_SCHEMA,
-      generation: { type: 'number' },
-      correlation: STRING_SCHEMA,
-      nonce: STRING_SCHEMA,
-      summary: NULLABLE_STRING_SCHEMA,
-    },
-    required: ['deliveryId', 'threadId', 'turnId', 'generation', 'correlation', 'nonce'],
-    additionalProperties: false,
-  },
-  async run(_auth, env, args) {
-    const deliveryId = str(args.deliveryId)
-    const threadId = str(args.threadId)
-    const turnId = str(args.turnId)
-    const generation = typeof args.generation === 'number' ? args.generation : Number(args.generation)
-    const correlation = str(args.correlation)
-    const nonce = str(args.nonce)
-    const summary = typeof args.summary === 'string' ? args.summary : undefined
-
-    if (!deliveryId || !threadId || !turnId || !correlation || !nonce || !Number.isInteger(generation)) {
-      return fail(400, 'invalid_args', 'deliveryId, threadId, turnId, generation, correlation, and nonce are required')
-    }
-
-    const outcome = await consumeDeliveryTurnFence(env, {
-      deliveryId,
-      threadId,
-      turnId,
-      generation,
-      correlation,
-      nonce,
-      summary,
-    })
-
-    if (!outcome.ok) {
-      return fail(outcome.status as any, outcome.error, outcome.detail)
-    }
-
-    return done(outcome)
-  },
-}
-
-import { createApprovalChallenge, decideApprovalChallenge, consumeApproval } from '../auth/approvals-2fa'
-import {
-  proposeGovernance,
-  voteGovernance,
-  ratifyGovernance,
-  getGovernanceStatus,
-} from '../governance/service'
-import { runRouterTick } from '../router/engine'
-import { rotateMemberToken, sweepExpiringTokensWarning } from '../auth/token-lifecycle'
-import {
-  checkAndReserveExecution,
-  getAgentSpendStatus,
-} from '../metering/service'
-import { runGovernedLoopDriverTick } from '../loops/driver'
-import { createAccessKey } from '../auth/unified-access'
-import {
-  createDevicePairingChallenge,
-  claimDevicePairing,
-} from '../devices/attestation'
-import { reportDeviceExecution } from '../devices/executor'
-import { syncDeviceJournalEntries } from '../devices/journal'
-import { updateDevicePowerState, wakeHardwareDevice } from '../devices/power'
-import { scaffoldAgentWorkspace } from '../onboarding/repo-scaffold'
-import { provisionStarterWorkspace } from '../onboarding/squad-packs'
-import { generateDesktopConnectBundle } from '../onboarding/desktop-connect'
-
-// onboard_agent_workspace — auto-scaffold external git repository agent workspace (Journey 3 / FLIGHT ONBOARD-REPO)
-const toolOnboardAgentWorkspace: ToolSpec = {
-  name: 'onboard_agent_workspace',
-  scope: 'auto-scaffold git repository agents/<slug>/ workspace and enroll in mupot',
-  min: 'authenticated',
-  args: '{ agent_name: string, agent_slug?: string, repo_url: string, harness?: string, machine: string, target_folder?: string }',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      agent_name: STRING_SCHEMA,
-      agent_slug: NULLABLE_STRING_SCHEMA,
-      repo_url: STRING_SCHEMA,
-      harness: { type: 'string', enum: ['cursor-cloud', 'cursor-ide', 'codex-desktop', 'claude-code', 'hermes', 'unknown'] },
-      machine: STRING_SCHEMA,
-      target_folder: NULLABLE_STRING_SCHEMA,
-    },
-    required: ['agent_name', 'repo_url', 'machine'],
-    additionalProperties: false,
-  },
-  async run(auth, env, args) {
-    const agentName = str(args.agent_name)
-    const repoUrl = str(args.repo_url)
-    const machine = str(args.machine)
-    if (!agentName || !repoUrl || !machine) {
-      return fail(400, 'invalid_args', 'agent_name, repo_url, and machine are required')
-    }
-
-    const result = await scaffoldAgentWorkspace(env, auth, {
-      agentName,
-      agentSlug: str(args.agent_slug) ?? undefined,
-      repoUrl,
-      harness: args.harness as any,
-      machine,
-      targetFolder: str(args.target_folder) ?? undefined,
-    })
-
-    return done(result)
-  },
-}
-
-// onboard_provision_pack — 1-click business starter squad pack setup (Journey 3 / FLIGHT ONBOARD-SAAS)
-const toolOnboardProvisionPack: ToolSpec = {
-  name: 'onboard_provision_pack',
-  scope: 'provision pre-built starter squad pack and starter tasks for business setup',
-  min: 'admin',
-  args: '{ company_name: string, starter_pack_key: "engineering_sprint"|"content_studio"|"business_ops", business_type?: string, model_preference?: string }',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      company_name: STRING_SCHEMA,
-      starter_pack_key: { type: 'string', enum: ['engineering_sprint', 'content_studio', 'business_ops'] },
-      business_type: { type: 'string', enum: ['engineering', 'growth_agency', 'operations', 'ecommerce', 'custom'] },
-      model_preference: NULLABLE_STRING_SCHEMA,
-    },
-    required: ['company_name', 'starter_pack_key'],
-    additionalProperties: false,
-  },
-  async run(auth, env, args) {
-    const companyName = str(args.company_name)
-    const starterPackKey = str(args.starter_pack_key)
-    if (!companyName || !starterPackKey) {
-      return fail(400, 'invalid_args', 'company_name and starter_pack_key are required')
-    }
-
-    const result = await provisionStarterWorkspace(env, auth, {
-      companyName,
-      starterPackKey,
-      businessType: args.business_type as any,
-      modelPreference: str(args.model_preference) ?? undefined,
-    })
-
-    return done(result)
-  },
-}
-
-// onboard_desktop_bundle — generate copy-pasteable desktop connect bundle for Cursor / Codex / Claude (Journey 3 / FLIGHT ONBOARD-MCP)
-const toolOnboardDesktopBundle: ToolSpec = {
-  name: 'onboard_desktop_bundle',
-  scope: 'generate 10-second desktop connection configs for Cursor, Codex, Claude Code, and Hermes',
-  min: 'authenticated',
-  args: '{ raw_token?: string }',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      raw_token: NULLABLE_STRING_SCHEMA,
-    },
-    additionalProperties: false,
-  },
-  async run(_auth, env, args) {
-    const rawToken = str(args.raw_token) ?? undefined
-    const bundle = generateDesktopConnectBundle(env, { rawToken })
-    return done(bundle)
-  },
-}
-
-// device_pair_challenge — create challenge and QR pairing code for hardware device enrollment (FLIGHT DEV-01)
-const toolDevicePairChallenge: ToolSpec = {
-  name: 'device_pair_challenge',
-  scope: 'initiate hardware device attestation pairing challenge',
-  min: 'authenticated',
-  args: '{ device_id: string, machine: string, public_key: string, arch?: "arm64"|"x86_64", os?: "darwin"|"linux", acceleration?: "apple-metal"|"cuda"|"rocm"|"none" }',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      device_id: STRING_SCHEMA,
-      machine: STRING_SCHEMA,
-      public_key: STRING_SCHEMA,
-      arch: { type: 'string', enum: ['arm64', 'x86_64'] },
-      os: { type: 'string', enum: ['darwin', 'linux'] },
-      acceleration: { type: 'string', enum: ['apple-metal', 'cuda', 'rocm', 'none'] },
-    },
-    required: ['device_id', 'machine', 'public_key'],
-    additionalProperties: false,
-  },
-  async run(_auth, env, args) {
-    const deviceId = str(args.device_id)
-    const machine = str(args.machine)
-    const publicKey = str(args.public_key)
-    if (!deviceId || !machine || !publicKey) return fail(400, 'invalid_args', 'device_id, machine, and public_key are required')
-
-    const challenge = await createDevicePairingChallenge(env, {
-      deviceId,
-      machine,
-      publicKey,
-      arch: args.arch as any,
-      os: args.os as any,
-      acceleration: args.acceleration as any,
-    })
-
-    return done(challenge)
-  },
-}
-
-// device_pair_claim — claim and verify device pairing challenge as operator (FLIGHT DEV-01)
-const toolDevicePairClaim: ToolSpec = {
-  name: 'device_pair_claim',
-  scope: 'operator claim and enrollment of paired hardware device',
-  min: 'admin',
-  args: '{ pairing_code: string, device_id: string, signature: string }',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      pairing_code: STRING_SCHEMA,
-      device_id: STRING_SCHEMA,
-      signature: STRING_SCHEMA,
-    },
-    required: ['pairing_code', 'device_id', 'signature'],
-    additionalProperties: false,
-  },
-  async run(auth, env, args) {
-    const pairingCode = str(args.pairing_code)
-    const deviceId = str(args.device_id)
-    const signature = str(args.signature)
-    if (!pairingCode || !deviceId || !signature) return fail(400, 'invalid_args', 'pairing_code, device_id, and signature are required')
-
-    const outcome = await claimDevicePairing(env, auth, {
-      pairingCode,
-      deviceId,
-      signature,
-    })
-
-    if (!outcome.ok) return fail(outcome.status as any, outcome.error, outcome.detail)
-    return done(outcome.device)
-  },
-}
-
-// device_report_exec — report sandboxed hardware execution outcome with cryptographic proof (FLIGHT DEV-02)
-const toolDeviceReportExec: ToolSpec = {
-  name: 'device_report_exec',
-  scope: 'record attested execution outcome from Mupot OS device',
-  min: 'authenticated',
-  args: '{ device_id: string, task_id: string, result: object, signature_hex: string }',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      device_id: STRING_SCHEMA,
-      task_id: STRING_SCHEMA,
-      result: { type: 'object' },
-      signature_hex: STRING_SCHEMA,
-    },
-    required: ['device_id', 'task_id', 'result', 'signature_hex'],
-    additionalProperties: false,
-  },
-  async run(_auth, env, args) {
-    const deviceId = str(args.device_id)
-    const taskId = str(args.task_id)
-    const result = args.result as any
-    const signatureHex = str(args.signature_hex)
-    if (!deviceId || !taskId || !result || !signatureHex) {
-      return fail(400, 'invalid_args', 'device_id, task_id, result, and signature_hex are required')
-    }
-
-    const outcome = await reportDeviceExecution(env, {
-      deviceId,
-      taskId,
-      result,
-      signatureHex,
-    })
-
-    if (!outcome.ok) return fail(outcome.status as any, outcome.error, outcome.detail)
-    return done(outcome)
-  },
-}
-
-// device_sync_journal — edge sync protocol for buffered offline transactions (FLIGHT DEV-04)
-const toolDeviceSyncJournal: ToolSpec = {
-  name: 'device_sync_journal',
-  scope: 'reconcile offline transaction journal entries from Mupot OS hardware',
-  min: 'authenticated',
-  args: '{ device_id: string, entries: array }',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      device_id: STRING_SCHEMA,
-      entries: { type: 'array' },
-    },
-    required: ['device_id', 'entries'],
-    additionalProperties: false,
-  },
-  async run(_auth, env, args) {
-    const deviceId = str(args.device_id)
-    const entries = Array.isArray(args.entries) ? (args.entries as any[]) : []
-    if (!deviceId) return fail(400, 'invalid_args', 'device_id and entries are required')
-
-    const result = await syncDeviceJournalEntries(env, {
-      deviceId,
-      entries,
-    })
-
-    return done(result)
-  },
-}
-
-// device_power_control — update hardware power state or issue Wake-on-Demand (FLIGHT DEV-05)
-const toolDevicePowerControl: ToolSpec = {
-  name: 'device_power_control',
-  scope: 'hardware power management and Wake-on-Demand mesh dispatch',
-  min: 'authenticated',
-  args: '{ device_id: string, action: "update" | "wake", power_state?: string, battery_pct?: number, is_charging?: boolean, reason?: string, priority?: string }',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      device_id: STRING_SCHEMA,
-      action: { type: 'string', enum: ['update', 'wake'] },
-      power_state: { type: 'string', enum: ['active', 'low_power', 'sleep', 'offline'] },
-      battery_pct: { type: 'number' },
-      is_charging: { type: 'boolean' },
-      reason: NULLABLE_STRING_SCHEMA,
-      priority: { type: 'string', enum: ['P0', 'P1', 'P2'] },
-    },
-    required: ['device_id', 'action'],
-    additionalProperties: false,
-  },
-  async run(auth, env, args) {
-    const deviceId = str(args.device_id)
-    const action = str(args.action)
-    if (!deviceId || !action) return fail(400, 'invalid_args', 'device_id and action are required')
-
-    if (action === 'update') {
-      const powerState = (args.power_state as any) ?? 'active'
-      const updated = await updateDevicePowerState(env, {
-        deviceId,
-        powerState,
-        batteryPct: typeof args.battery_pct === 'number' ? args.battery_pct : undefined,
-        isCharging: typeof args.is_charging === 'boolean' ? args.is_charging : undefined,
-      })
-      return done(updated)
-    }
-
-    if (action === 'wake') {
-      const wakeRes = await wakeHardwareDevice(env, auth, {
-        deviceId,
-        reason: typeof args.reason === 'string' ? args.reason : undefined,
-        priority: (args.priority as any) ?? 'P1',
-      })
-      return done(wakeRes)
-    }
-
-    return fail(400, 'invalid_action')
-  },
-}
-
-// create_access_key — unified minting of token-scoped access keys bundling client configs (FLIGHT IDENTITY-UNIFIED / #584)
-const toolCreateAccessKey: ToolSpec = {
-  name: 'create_access_key',
-  scope: 'mint fine-grained token-scoped access key with bundled desktop configs',
-  min: 'admin',
-  args: '{ principal_id: string, label: string, channel?: string, expiry_days?: number, grants?: array, agent_id?: string }',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      principal_id: STRING_SCHEMA,
-      label: STRING_SCHEMA,
-      channel: { type: 'string', enum: ['workspace', 'im', 'dashboard', 'directory'] },
-      expiry_days: { type: 'number' },
-      grants: {
-        type: 'array',
-        items: {
-          type: 'object',
-          properties: {
-            scope_type: { type: 'string', enum: ['org', 'department', 'squad', 'project'] },
-            scope_id: NULLABLE_STRING_SCHEMA,
-            capability: { type: 'string', enum: ['owner', 'admin', 'lead', 'member', 'observer'] },
-            resource: NULLABLE_STRING_SCHEMA,
-          },
-          required: ['scope_type', 'capability'],
-        },
-      },
-      agent_id: NULLABLE_STRING_SCHEMA,
-    },
-    required: ['principal_id', 'label'],
-    additionalProperties: false,
-  },
-  async run(_auth, env, args) {
-    const principalId = str(args.principal_id)
-    const label = str(args.label)
-    if (!principalId || !label) return fail(400, 'invalid_args', 'principal_id and label are required')
-
-    const channel = typeof args.channel === 'string' ? (args.channel as any) : undefined
-    const expiryDays = typeof args.expiry_days === 'number' ? args.expiry_days : undefined
-    const grants = Array.isArray(args.grants) ? (args.grants as any[]) : undefined
-    const agentId = typeof args.agent_id === 'string' ? args.agent_id.trim() : null
-
-    const result = await createAccessKey(env, {
-      principalId,
-      label,
-      channel,
-      expiryDays,
-      grants,
-      agentId,
-    })
-
-    return done(result)
-  },
-}
-
-// loop_driver_tick — autonomous loop driver tick executing active loops under propose-only/founder brakes (FLIGHT-LOOP-UNHOLD)
-const toolLoopDriverTick: ToolSpec = {
-  name: 'loop_driver_tick',
-  scope: 'execute autonomous governed loop cycles with propose-only boundaries',
-  min: 'authenticated',
-  args: '{ loop_id?: string }',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      loop_id: NULLABLE_STRING_SCHEMA,
-    },
-    additionalProperties: false,
-  },
-  async run(_auth, env, args) {
-    const loopId = typeof args.loop_id === 'string' ? args.loop_id.trim() : undefined
-    const result = await runGovernedLoopDriverTick(env, { loopId })
-    return done(result)
-  },
-}
-
-// execution_meter_check — check and reserve execution capacity with pre-flight budget stop (FLIGHT-METER / F8)
-const toolExecutionMeterCheck: ToolSpec = {
-  name: 'execution_meter_check',
-  scope: 'check and reserve model execution capacity against budget limits',
-  min: 'authenticated',
-  args: '{ agent_id: string, estimate_micro_usd?: number, budget_cap_cents?: number, budget_cap_micro_usd?: number, budget_window?: "day" | "week" }',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      agent_id: STRING_SCHEMA,
-      estimate_micro_usd: { type: 'number' },
-      budget_cap_cents: { type: 'number' },
-      budget_cap_micro_usd: { type: 'number' },
-      budget_window: { type: 'string', enum: ['day', 'week'] },
-    },
-    required: ['agent_id'],
-    additionalProperties: false,
-  },
-  async run(_auth, env, args) {
-    const agentId = str(args.agent_id)
-    if (!agentId) return fail(400, 'invalid_args', 'agent_id is required')
-
-    const result = await checkAndReserveExecution(env, agentId, {
-      estimateMicroUsd: typeof args.estimate_micro_usd === 'number' ? args.estimate_micro_usd : undefined,
-      budgetCapCents: typeof args.budget_cap_cents === 'number' ? args.budget_cap_cents : undefined,
-      budgetCapMicroUsd: typeof args.budget_cap_micro_usd === 'number' ? args.budget_cap_micro_usd : undefined,
-      budgetWindow: args.budget_window as any,
-    })
-
-    if (!result.ok) return fail(400, result.reason, { retryAfterSec: result.retryAfterSec })
-    return done(result)
-  },
-}
-
-// execution_meter_status — query unified execution spend and budget status (FLIGHT-METER / F8)
-const toolExecutionMeterStatus: ToolSpec = {
-  name: 'execution_meter_status',
-  scope: 'inspect real-time spend and budget limits for an agent',
-  min: 'authenticated',
-  args: '{ agent_id: string, budget_cap_cents?: number, budget_cap_micro_usd?: number, budget_window?: "day" | "week" }',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      agent_id: STRING_SCHEMA,
-      budget_cap_cents: { type: 'number' },
-      budget_cap_micro_usd: { type: 'number' },
-      budget_window: { type: 'string', enum: ['day', 'week'] },
-    },
-    required: ['agent_id'],
-    additionalProperties: false,
-  },
-  async run(_auth, env, args) {
-    const agentId = str(args.agent_id)
-    if (!agentId) return fail(400, 'invalid_args', 'agent_id is required')
-
-    const status = await getAgentSpendStatus(env, agentId, {
-      budgetCapCents: typeof args.budget_cap_cents === 'number' ? args.budget_cap_cents : undefined,
-      budgetCapMicroUsd: typeof args.budget_cap_micro_usd === 'number' ? args.budget_cap_micro_usd : undefined,
-      budgetWindow: args.budget_window as any,
-    })
-
-    return done(status)
-  },
-}
-
-// token_rotate — rotates a member token and mints replacement with same permissions (FLIGHT-002)
-const toolTokenRotate: ToolSpec = {
-  name: 'token_rotate',
-  scope: 'rotate active credential and mint replacement with automated audit',
-  min: 'admin',
-  args: '{ token_id: string, expiry_days?: number, reason?: string }',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      token_id: STRING_SCHEMA,
-      expiry_days: { type: 'number' },
-      reason: NULLABLE_STRING_SCHEMA,
-    },
-    required: ['token_id'],
-    additionalProperties: false,
-  },
-  async run(auth, env, args) {
-    const tokenId = str(args.token_id)
-    if (!tokenId) return fail(400, 'invalid_args', 'token_id is required')
-
-    const rotatedBy = auth.memberId ?? auth.userId
-    const expiryDays = typeof args.expiry_days === 'number' ? args.expiry_days : undefined
-    const reason = typeof args.reason === 'string' ? args.reason : undefined
-
-    const result = await rotateMemberToken(env, tokenId, {
-      rotatedBy,
-      expiryDays,
-      reason,
-    })
-
-    if (!result.ok) return fail(400, result.error ?? 'rotation_failed')
-    return done(result)
-  },
-}
-
-// token_sweep_expiring — sweep and notify active credentials expiring within threshold (FLIGHT-002)
-const toolTokenSweepExpiring: ToolSpec = {
-  name: 'token_sweep_expiring',
-  scope: 'sweep and inspect credentials expiring within warning threshold',
-  min: 'admin',
-  args: '{ warning_days?: number }',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      warning_days: { type: 'number' },
-    },
-    additionalProperties: false,
-  },
-  async run(_auth, env, args) {
-    const warningDays = typeof args.warning_days === 'number' ? args.warning_days : 7
-    const result = await sweepExpiringTokensWarning(env, warningDays)
-    return done(result)
-  },
-}
-
-// router_tick — runs the edge-native active router matching unassigned tasks to continuum bodies (FLIGHT-ROUTER / W3)
-const toolRouterTick: ToolSpec = {
-  name: 'router_tick',
-  scope: 'edge-native active router matching unassigned tasks to continuum bodies',
-  min: 'authenticated',
-  args: '{ dry_run?: boolean, squad_id?: string, limit?: number }',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      dry_run: { type: 'boolean' },
-      squad_id: NULLABLE_STRING_SCHEMA,
-      limit: { type: 'number' },
-    },
-    additionalProperties: false,
-  },
-  async run(_auth, env, args) {
-    const dryRun = args.dry_run !== false
-    const squadId = typeof args.squad_id === 'string' ? args.squad_id.trim() : undefined
-    const limit = typeof args.limit === 'number' ? args.limit : undefined
-
-    const result = await runRouterTick(env, {
-      dryRun,
-      squadId,
-      limit,
-    })
-
-    return done(result)
-  },
-}
-
-// governance_propose — create constitutional resolution / governance proposal (FLIGHT-005 / mumega-com#723)
-const toolGovernancePropose: ToolSpec = {
-  name: 'governance_propose',
-  scope: 'propose constitutional resolution or governance amendment',
-  min: 'authenticated',
-  args: '{ resolution_id?: string, proposal_type?: string, title: string, description: string, target_document_path?: string, target_document_hash?: string, target_document_content?: string, threshold_council_count?: number, founder_seal_required?: boolean }',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      resolution_id: NULLABLE_STRING_SCHEMA,
-      proposal_type: { type: 'string', enum: ['constitutional_amendment', 'policy_change', 'architectural_decision'] },
-      title: STRING_SCHEMA,
-      description: STRING_SCHEMA,
-      target_document_path: NULLABLE_STRING_SCHEMA,
-      target_document_hash: NULLABLE_STRING_SCHEMA,
-      target_document_content: NULLABLE_STRING_SCHEMA,
-      threshold_council_count: { type: 'number' },
-      founder_seal_required: { type: 'boolean' },
-    },
-    required: ['title', 'description'],
-    additionalProperties: false,
-  },
-  async run(auth, env, args) {
-    const title = str(args.title)
-    const description = str(args.description)
-    if (!title || !description) return fail(400, 'invalid_args', 'title and description are required')
-
-    const outcome = await proposeGovernance(env, auth, {
-      resolutionId: str(args.resolution_id) ?? undefined,
-      proposalType: args.proposal_type as any,
-      title,
-      description,
-      targetDocumentPath: str(args.target_document_path),
-      targetDocumentHash: str(args.target_document_hash) ?? undefined,
-      targetDocumentContent: typeof args.target_document_content === 'string' ? args.target_document_content : undefined,
-      thresholdCouncilCount: typeof args.threshold_council_count === 'number' ? args.threshold_council_count : undefined,
-      founderSealRequired: typeof args.founder_seal_required === 'boolean' ? args.founder_seal_required : undefined,
-    })
-
-    if (!outcome.ok) return fail(outcome.status as any, outcome.error, outcome.detail)
-    return done(outcome.data)
-  },
-}
-
-// governance_vote — cast one-shot terminal vote on constitutional resolution (FLIGHT-005 / mumega-com#723)
-const toolGovernanceVote: ToolSpec = {
-  name: 'governance_vote',
-  scope: 'one-shot terminal voting on constitutional resolution',
-  min: 'authenticated',
-  args: '{ resolution_id: string, voter_seat: string, vote: "approve" | "reject" | "abstain", reason?: string, document_content?: string, document_hash?: string }',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      resolution_id: STRING_SCHEMA,
-      voter_seat: STRING_SCHEMA,
-      vote: { type: 'string', enum: ['approve', 'reject', 'abstain'] },
-      reason: NULLABLE_STRING_SCHEMA,
-      document_content: NULLABLE_STRING_SCHEMA,
-      document_hash: NULLABLE_STRING_SCHEMA,
-    },
-    required: ['resolution_id', 'voter_seat', 'vote'],
-    additionalProperties: false,
-  },
-  async run(auth, env, args) {
-    const resolutionId = str(args.resolution_id)
-    const voterSeat = str(args.voter_seat)
-    const vote = args.vote === 'approve' || args.vote === 'reject' || args.vote === 'abstain' ? args.vote : null
-
-    if (!resolutionId || !voterSeat || !vote) {
-      return fail(400, 'invalid_args', 'resolution_id, voter_seat, and vote (approve|reject|abstain) are required')
-    }
-
-    const outcome = await voteGovernance(env, auth, {
-      resolutionId,
-      voterSeat,
-      vote,
-      reason: typeof args.reason === 'string' ? args.reason : null,
-      documentContentToVerify: typeof args.document_content === 'string' ? args.document_content : undefined,
-      documentHashToVerify: typeof args.document_hash === 'string' ? args.document_hash : undefined,
-    })
-
-    if (!outcome.ok) return fail(outcome.status as any, outcome.error, outcome.detail)
-    return done(outcome.data)
-  },
-}
-
-// governance_ratify — ratify proposal when 2-of-4 Council + Founder Seal quorum met (FLIGHT-005 / mumega-com#723)
-const toolGovernanceRatify: ToolSpec = {
-  name: 'governance_ratify',
-  scope: 'ratify constitutional amendment upon 2-of-4 council + founder seal',
-  min: 'admin',
-  args: '{ resolution_id: string, document_content?: string, document_hash?: string }',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      resolution_id: STRING_SCHEMA,
-      document_content: NULLABLE_STRING_SCHEMA,
-      document_hash: NULLABLE_STRING_SCHEMA,
-    },
-    required: ['resolution_id'],
-    additionalProperties: false,
-  },
-  async run(auth, env, args) {
-    const resolutionId = str(args.resolution_id)
-    if (!resolutionId) return fail(400, 'invalid_args', 'resolution_id is required')
-
-    const outcome = await ratifyGovernance(env, auth, {
-      resolutionId,
-      documentContentToVerify: typeof args.document_content === 'string' ? args.document_content : undefined,
-      documentHashToVerify: typeof args.document_hash === 'string' ? args.document_hash : undefined,
-    })
-
-    if (!outcome.ok) return fail(outcome.status as any, outcome.error, outcome.detail)
-    return done(outcome.data)
-  },
-}
-
-// governance_status — inspect resolution status, vote tallies, and ratification (FLIGHT-005 / mumega-com#723)
-const toolGovernanceStatus: ToolSpec = {
-  name: 'governance_status',
-  scope: 'view governance resolution status and voting tallies',
-  min: 'authenticated',
-  args: '{ resolution_id: string }',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      resolution_id: STRING_SCHEMA,
-    },
-    required: ['resolution_id'],
-    additionalProperties: false,
-  },
-  async run(_auth, env, args) {
-    const resolutionId = str(args.resolution_id)
-    if (!resolutionId) return fail(400, 'invalid_args', 'resolution_id is required')
-
-    const outcome = await getGovernanceStatus(env, resolutionId)
-    if (!outcome.ok) return fail(outcome.status as any, outcome.error, outcome.detail)
-    return done(outcome.data)
-  },
-}
-
-// approval_challenge_create — creates an action-hash-bound 2FA/approval challenge for high-impact actions (FLIGHT-004 / mumega-com#725)
-const toolApprovalChallengeCreate: ToolSpec = {
-  name: 'approval_challenge_create',
-  scope: 'native in-pot 2fa and action-hash approval challenge creation',
-  min: 'authenticated',
-  args: '{ action_type: string, payload: object | string, target_id?: string, expires_in_sec?: number }',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      action_type: STRING_SCHEMA,
-      payload: { anyOf: [{ type: 'object' }, { type: 'string' }] },
-      target_id: NULLABLE_STRING_SCHEMA,
-      expires_in_sec: { type: 'number' },
-    },
-    required: ['action_type', 'payload'],
-    additionalProperties: false,
-  },
-  async run(auth, env, args) {
-    const actionType = str(args.action_type)
-    const payload = args.payload as Record<string, unknown> | string
-    const targetId = typeof args.target_id === 'string' ? args.target_id.trim() : null
-    const expiresInSec = typeof args.expires_in_sec === 'number' ? args.expires_in_sec : undefined
-
-    if (!actionType || !payload) {
-      return fail(400, 'invalid_args', 'action_type and payload are required')
-    }
-
-    const requesterId = auth.boundAgentId ?? auth.memberId ?? auth.userId
-    if (!requesterId) return fail(400, 'unauthenticated')
-
-    const challenge = await createApprovalChallenge(env, {
-      actionType,
-      payload,
-      targetId,
-      requesterId,
-      expiresInSec,
-    })
-
-    return done(challenge)
-  },
-}
-
-// approval_verify — operator/admin verdict and signature verification on a pending action challenge (FLIGHT-004 / mumega-com#725)
-const toolApprovalVerify: ToolSpec = {
-  name: 'approval_verify',
-  scope: 'native in-pot 2fa and operator action challenge verdict',
-  min: 'admin',
-  args: '{ challenge_id: string, nonce: string, verdict: "approved" | "rejected", verification_method?: string, signature?: string, note?: string }',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      challenge_id: STRING_SCHEMA,
-      nonce: STRING_SCHEMA,
-      verdict: { type: 'string', enum: ['approved', 'rejected'] },
-      verification_method: NULLABLE_STRING_SCHEMA,
-      signature: NULLABLE_STRING_SCHEMA,
-      note: NULLABLE_STRING_SCHEMA,
-    },
-    required: ['challenge_id', 'nonce', 'verdict'],
-    additionalProperties: false,
-  },
-  async run(auth, env, args) {
-    const challengeId = str(args.challenge_id)
-    const nonce = str(args.nonce)
-    const verdict = args.verdict === 'approved' ? 'approved' : args.verdict === 'rejected' ? 'rejected' : null
-    const verificationMethod = typeof args.verification_method === 'string' ? args.verification_method : undefined
-    const signature = typeof args.signature === 'string' ? args.signature : undefined
-    const note = typeof args.note === 'string' ? args.note : undefined
-
-    if (!challengeId || !nonce || !verdict) {
-      return fail(400, 'invalid_args', 'challenge_id, nonce, and verdict (approved|rejected) are required')
-    }
-
-    const outcome = await decideApprovalChallenge(env, auth, {
-      challengeId,
-      nonce,
-      verdict,
-      verificationMethod,
-      signature,
-      note,
-    })
-
-    if (!outcome.ok) {
-      return fail(outcome.status as any, outcome.error, outcome.detail)
-    }
-
-    return done(outcome)
-  },
-}
-
-// approval_consume — consumes an approved challenge exactly once before executing high-impact action (FLIGHT-004 / mumega-com#725)
-const toolApprovalConsume: ToolSpec = {
-  name: 'approval_consume',
-  scope: 'consume single-use approved challenge token against action hash',
-  min: 'authenticated',
-  args: '{ challenge_id: string, nonce: string, action_type: string, payload: object | string, target_id?: string }',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      challenge_id: STRING_SCHEMA,
-      nonce: STRING_SCHEMA,
-      action_type: STRING_SCHEMA,
-      payload: { anyOf: [{ type: 'object' }, { type: 'string' }] },
-      target_id: NULLABLE_STRING_SCHEMA,
-    },
-    required: ['challenge_id', 'nonce', 'action_type', 'payload'],
-    additionalProperties: false,
-  },
-  async run(_auth, env, args) {
-    const challengeId = str(args.challenge_id)
-    const nonce = str(args.nonce)
-    const actionType = str(args.action_type)
-    const payload = args.payload as Record<string, unknown> | string
-    const targetId = typeof args.target_id === 'string' ? args.target_id.trim() : null
-
-    if (!challengeId || !nonce || !actionType || !payload) {
-      return fail(400, 'invalid_args', 'challenge_id, nonce, action_type, and payload are required')
-    }
-
-    const outcome = await consumeApproval(env, {
-      challengeId,
-      nonce,
-      actionType,
-      payload,
-      targetId,
-    })
-
-    if (!outcome.ok) {
-      return fail(outcome.status as any, outcome.error, outcome.detail)
-    }
-
-    return done(outcome)
-  },
-}
-
 // Exported for the capability-floor test (#183) — the registry-completeness
 // assertion + the dispatch wiring proof read these directly.
 export const TOOLS: ToolSpec[] = [
@@ -5242,7 +4377,7 @@ export const TOOLS: ToolSpec[] = [
   toolTaskVerdict,
   toolTaskVerdictReverse,
   toolTaskDispatch,
-  toolTaskReportResult,
+  toolTaskDispatchRuntimeReceipt,
   toolTaskIntakeAudit,
   toolRemember,
   toolRecall,
@@ -5251,6 +4386,8 @@ export const TOOLS: ToolSpec[] = [
   toolProjectRemember,
   toolProjectRecall,
   toolWakeAgent,
+  toolRouterTick,
+  toolExecutionMeterStatus,
   toolSquadMessage,
   toolSend,
   toolBroadcast,
@@ -5267,29 +4404,6 @@ export const TOOLS: ToolSpec[] = [
   toolBootContext,
   toolOrient,
   toolConnect,
-  toolMupotDeliveryConsumedV1,
-  toolApprovalChallengeCreate,
-  toolApprovalVerify,
-  toolApprovalConsume,
-  toolGovernancePropose,
-  toolGovernanceVote,
-  toolGovernanceRatify,
-  toolGovernanceStatus,
-  toolRouterTick,
-  toolTokenRotate,
-  toolTokenSweepExpiring,
-  toolExecutionMeterCheck,
-  toolExecutionMeterStatus,
-  toolLoopDriverTick,
-  toolCreateAccessKey,
-  toolDevicePairChallenge,
-  toolDevicePairClaim,
-  toolDeviceReportExec,
-  toolDeviceSyncJournal,
-  toolDevicePowerControl,
-  toolOnboardAgentWorkspace,
-  toolOnboardProvisionPack,
-  toolOnboardDesktopBundle,
   ...AGENT_CONNECTION_TOOLS,
   ...PROJECT_TOOLS,
   ...PROVISION_TOOLS,
@@ -5306,13 +4420,11 @@ export const TOOLS: ToolSpec[] = [
   ...FLIGHT_SPINE_TOOLS,
   ...CURSOR_TOOLS,
   ...ATHENA_TOOLS,
-  toolPotProvision as any,
-  toolPotList as any,
+  ...POT_TOOLS,
   toolSupabaseConnect,
   toolSupabaseSchema,
   toolSupabaseQuery,
   toolSupabaseMutate,
-  toolMintBody,
 ]
 
 const TOOL_BY_NAME = new Map<string, ToolSpec>(TOOLS.map((t) => [t.name, t]))
@@ -5385,6 +4497,7 @@ function validateArgs(schema: JsonSchema, args: Record<string, unknown>): string
     if (prop.type === 'number' && !(typeof value === 'number' && Number.isFinite(value))) {
       return `field ${key} must be a number`
     }
+    if (prop.type === 'boolean' && typeof value !== 'boolean') return `field ${key} must be a boolean`
     if (prop.type === 'array') {
       if (!Array.isArray(value)) return `field ${key} must be an array`
       if (prop.items?.type === 'string' && !value.every((v) => typeof v === 'string')) {
@@ -5410,9 +4523,10 @@ export async function invokeTool(
   originOrCtx: string | Partial<ToolCtx> = '',
 ): Promise<ToolOutcome & { tool?: string }> {
   const ctx: ToolCtx = typeof originOrCtx === 'string'
-    ? { origin: originOrCtx }
+    ? { origin: originOrCtx, transport: 'mcp' }
     : {
         origin: originOrCtx?.origin ?? '',
+        transport: originOrCtx?.transport ?? 'mcp',
         waitUntil: originOrCtx?.waitUntil,
         seat: originOrCtx?.seat,
         source: originOrCtx?.source,
@@ -5457,17 +4571,13 @@ export async function invokeTool(
     outcome = await spec.run(auth, env, args, ctx)
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
-    if (err instanceof TaskSelfGateError) {
-      return { ...fail(409, 'self_gate_conflict', err.message), tool: spec.name }
-    }
     if (msg.startsWith('receipt_failed')) {
       return { ...fail(500, 'receipt_failed', msg), tool: spec.name }
     }
-    console.error('MCP tool execution threw unhandled error:', err)
     return { ...fail(500, 'internal_error'), tool: spec.name }
   }
 
-  if (outcome.ok && auth.memberId && spec.name !== 'check_in' && spec.name !== 'boot_context' && env.DB) {
+  if (outcome.ok && (spec.shouldTouchPresence?.(args) ?? true) && auth.memberId && spec.name !== 'check_in' && spec.name !== 'boot_context') {
     // Zero-Touch Living Presence: automatically bump presence for active tool callers.
     const touchPromise = (async () => {
       const id = await loadMemberIdentity(env, auth)
@@ -5534,6 +4644,7 @@ async function handleJsonRpc(c: import('hono').Context<AppEnv>, body: JsonRpcReq
     const params = typeof body.params === 'object' && body.params !== null ? body.params as Record<string, unknown> : {}
     const ctx: ToolCtx = {
       origin: new URL(c.req.url).origin,
+      transport: 'mcp',
       waitUntil: safeWaitUntil(c),
       seat: c.req.header('x-mupot-seat'),
       source: c.req.header('x-mupot-source'),
@@ -5605,6 +4716,7 @@ mcpApp.post('/', async (c) => {
 
   const ctx: ToolCtx = {
     origin: new URL(c.req.url).origin,
+    transport: 'mcp',
     waitUntil: safeWaitUntil(c),
     seat: c.req.header('x-mupot-seat'),
     source: c.req.header('x-mupot-source'),
@@ -5706,6 +4818,7 @@ mcpActionsApp.post('/actions/:tool', async (c) => {
 
   const ctx: ToolCtx = {
     origin: new URL(c.req.url).origin,
+    transport: 'rest',
     waitUntil: safeWaitUntil(c),
     seat: c.req.header('x-mupot-seat'),
     source: c.req.header('x-mupot-source'),

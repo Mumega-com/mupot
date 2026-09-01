@@ -89,7 +89,6 @@ function makeEnv(opts: Opts = {}, captured: Captured[] = []): Env {
               bound_agent_id: opts.boundAgentId ?? null,
             }
           }
-          if (sql.includes('FROM gate_grants')) return null
           if (sql.includes('FROM agent_keys')) return null
           if (sql.includes('FROM departments') && byId) {
             return deptExists && ref === 'dept-1' ? { id: 'dept-1' } : null
@@ -609,6 +608,34 @@ describe('mint_agent_token', () => {
     expect(cap.length).toBe(0)
   })
 
+  it('refuses squad-admin rotation before agent lookup without an existence oracle', async () => {
+    const grants: CapabilityGrant[] = [
+      { member_id: 'member-operator', scope_type: 'squad', scope_id: SQUAD.id, capability: 'admin' },
+    ]
+    const cases = [
+      { agent: AGENT.slug, env: makeEnv({ grants }) },
+      { agent: 'ghost', env: makeEnv({ grants, agentExists: false }) },
+      { agent: 'dup', env: makeEnv({ grants }) },
+    ]
+
+    const responses = await Promise.all(cases.map(({ agent, env }) => call(
+      'mint_agent_token',
+      { agent, rotate_prior_token_id: 'opaque-prior-id' },
+      env,
+    )))
+    const bodies = await Promise.all(responses.map((response) => response.json())) as Array<{
+      error: { message: string; data?: unknown }
+    }>
+
+    expect(responses.map((response) => response.status)).toEqual([403, 403, 403])
+    expect(bodies.map((body) => body.error.message)).toEqual(['forbidden', 'forbidden', 'forbidden'])
+    expect(bodies.map((body) => body.error.data)).toEqual([
+      { need: 'admin', scope: 'org' },
+      { need: 'admin', scope: 'org' },
+      { need: 'admin', scope: 'org' },
+    ])
+  })
+
   it('404s when the agent does not exist', async () => {
     const res = await call('mint_agent_token', { agent: 'ghost' }, makeEnv({ agentExists: false }))
     expect(res.status).toBe(404)
@@ -955,7 +982,7 @@ describe('provision tools — operator-principal invariant is exhaustive', () =>
       // missing, this grant is enough to sail past every downstream
       // capability check, so a false pass here cannot hide behind "the
       // capability gate would have caught it anyway."
-      { member_id: 'member-agent-1', scope_type: 'squad', scope_id: 'squad-1', capability: 'admin' },
+      { member_id: 'member-agent-1', scope_type: 'org', scope_id: null, capability: 'admin' },
     ],
     boundAgentId: 'agent-caller',
   }
@@ -963,7 +990,7 @@ describe('provision tools — operator-principal invariant is exhaustive', () =>
 
   // Args deliberately empty: the guard must be the FIRST statement in run(),
   // before any argument is even read, so it must fire on a call carrying no
-  // arguments at all (unless an explicit action:manage_access token was granted). Calling tool.run() directly (bypassing the JSON-RPC /
+  // arguments at all. Calling tool.run() directly (bypassing the JSON-RPC /
   // inputSchema seam) means this loop needs no per-tool argument fixtures —
   // which is what lets it generalize to a tool that doesn't exist yet.
   async function isGuarded(tool: ToolSpec, env: Env): Promise<boolean> {

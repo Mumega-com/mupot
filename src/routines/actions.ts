@@ -210,13 +210,13 @@ function projectFrom(run: RunContext): Project {
     stalled: Number(run.project_stalled),
     stall_threshold_days: run.project_stall_threshold_days,
     completion_proposed_by: run.project_completion_proposed_by,
-    created_at: run.project_created_at,
-    updated_at: run.project_updated_at,
     repo_url: null,
     worker_name: null,
     live_url: null,
     assigned_squad_id: null,
     deploy_status: 'idle',
+    created_at: run.project_created_at,
+    updated_at: run.project_updated_at,
   }
 }
 

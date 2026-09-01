@@ -363,23 +363,6 @@ export interface Membership {
 
 export type Capability = 'owner' | 'admin' | 'lead' | 'member' | 'observer'
 
-export type ActionCapability =
-  | 'action:deploy'
-  | 'action:manage_access'
-  | 'action:migrate'
-  | 'action:secrets'
-  | 'action:dispatch'
-  | (string & {}) // Open extension for custom action capabilities
-
-export const STANDARD_ACTION_CAPABILITIES = [
-  'action:deploy',
-  'action:manage_access',
-  'action:migrate',
-  'action:secrets',
-  'action:dispatch',
-] as const
-
-
 export type TaskPriority = 'P0' | 'P1' | 'P2' | 'P3'
 export const TASK_PRIORITIES: readonly TaskPriority[] = ['P0', 'P1', 'P2', 'P3']
 
@@ -439,14 +422,6 @@ export interface Task {
   // fence) -- kept as a separate column rather than folded into source_pot because it is
   // a different untrusted-writer class (no pot-to-pot signature involved).
   external_source?: string | null
-  /**
-   * Explicit substitute executor attribution when in-Worker fallback executes for an unreachable seat (#1049).
-   */
-  substitute_executor_id?: string | null
-  /**
-   * Reason why substitute fallback execution fired (e.g. 'seat_unreachable', 'no_external_runtime') (#1049).
-   */
-  fallback_reason?: string | null
   created_at: string
   updated_at: string
 }
@@ -597,7 +572,7 @@ export interface MemberToken {
   revoked_at: string | null
 }
 
-export type CapabilityScopeType = 'org' | 'department' | 'squad' | 'project'
+export type CapabilityScopeType = 'org' | 'department' | 'squad'
 
 // member × scope → capability. Enforced on every write path (humans AND agents).
 export interface CapabilityGrant {
@@ -623,13 +598,18 @@ export type BusEventType =
   | 'squad.dispatch'
   | 'org.provisioned' // a department/squad/agent/token was created in-band (payload.kind)
   | 'project.mutated' // project lifecycle or project-to-squad access changed through MCP
-  | 'message.created' // an agent_messages row LANDED (mumega-com#970)
+  | 'message.created' // an agent_messages row LANDED (mumega-com#970) — the push seam that
+                      // makes an inbox poll unnecessary. Emitted ONLY on a real insert
+                      // (result.meta.changes > 0), so a capped, fenced, or idempotent-
+                      // duplicate send produces no event. See MessageCreatedPayload.
   | 'member.auto_enrolled'
   | 'billing.subscription.created'
   | 'billing.subscription.deleted'
   | 'pot.self_serve_provisioned'
   | 'routine.run.started'
-  | string
+  | 'supabase.record.insert'
+  | 'supabase.record.update'
+  | 'supabase.record.delete'
 
 /**
  * message.created payload (mumega-com#970).
@@ -658,10 +638,6 @@ export interface MessageCreatedPayload {
   /** Present when this message answers another — threads a conversation. */
   in_reply_to?: string | null
   project_id?: string | null
-  /** Byte/char length of the message body at creation for truncation verification (#1046) */
-  body_length?: number
-  /** SHA-256 digest of the message body at creation for cryptographic integrity verification (#1046) */
-  checksum_sha256?: string
   created_at: string
 }
 
@@ -670,7 +646,10 @@ export interface BusEvent<T = unknown> {
   tenant: string
   squad_id?: string
   agent_id?: string
-  actor?: { kind: 'member' | 'agent' | 'sso' | 'external' | 'system' | 'stripe' | 'routine'; id: string } // attribution — who caused this
+  actor?: {
+    kind: 'member' | 'agent' | 'sso' | 'external' | 'system' | 'stripe' | 'routine'
+    id: string
+  } // attribution — who caused this
   payload: T
   ts: string // ISO; set by the producer
 }

@@ -2,7 +2,7 @@
 
 **Status:** LIVE (2026-06-30) — the full squad (kasra, codex, river, mumega-brain) is
 registered + member-bound + signature-authenticated on mupot via Ed25519 signed-attach.
-Identity is real; liveness (heartbeat) + coordination + SOS-retirement are the remaining
+Identity is real; liveness (heartbeat) + coordination + the Mupot/Herdr Host-Go handoff are the remaining
 build. Synthesises fleet-control, the hermit-crab identity model, and the bus-reflection
 migration into one definition.
 
@@ -41,17 +41,18 @@ for agents — it owns, controls, and observes them, while the runtime does the 
 An agent is **"running on mupot"** when **all** of these hold:
 1. It is **registered** in mupot — identity + type + RBAC. *(✅ done for the squad.)*
 2. Its **lifecycle is controlled via mupot** — open/close it on a chosen runtime, signed.
-3. It **coordinates through mupot's reflected bus** — not the fragile SOS bus.
+3. It **coordinates through mupot's reflected bus**.
 4. Its **runtime is a binding** (claude-code / codex / claude / hermes) that reports
    status (heartbeat/presence) back to mupot, and can be swapped without identity loss.
-5. The **SOS bus is retired** for that agent — its shell points at mupot endpoints.
+5. Its selected Host-Go evidence chain passes `no_live_sos_wiring` and its shell
+   points at Mupot/Herdr endpoints.
 
 ## Reflect the BUS, not the process
 
 The migration reflects the bus **primitives** (send/inbox/presence/wake/request/ack)
-onto mupot's durable CF-native substrate (Queues + Durable Objects + D1) — it does **not**
-port the SOS python process. The SOS bus froze the colony for 2 days (Redis-on-VPS,
-06-25→06-26); mupot's substrate is the durable replacement. Agents talk **through mupot**.
+onto mupot's durable CF-native substrate (Queues + Durable Objects + D1). Agents
+talk **through mupot**; historical bus-process details are not part of the
+current Host-Go evidence chain.
 
 ## Open / close (the lifecycle verb)
 
@@ -80,10 +81,10 @@ Discord is a **view + control surface** onto mupot-managed agents, not a separat
 - ✅ **Substrate / home**: identity + RBAC (Slice A), inbox (Slice D), signed HTTP
   inbox reads for daemon drain, Discord roles + reach surface (Slice B),
   fleet-control signed start/stop + agent registry.
-- ⬜ **The gap = runtime cutover (Slices F/G + Hermes-per-pot, #18):** the squad's shells
-  still execute against the SOS bus / local sessions. "Running on mupot" is only true once
-  each agent's runtime points at mupot's reflected bus, reports presence to the registry,
-  is open/close-controlled, and SOS is retired for it. **That is the next real build** —
+- ⬜ **The gap = runtime handoff (Slices F/G + Hermes-per-pot, #18):** "Running on
+  mupot" is only true once each agent's runtime points at mupot's reflected bus,
+  reports presence to the registry, is open/close-controlled, and has a passing
+  Mupot/Herdr Host-Go evidence chain. **That is the next real build** —
   not more substrate.
 
 ## Build order from here
@@ -93,8 +94,8 @@ Discord is a **view + control surface** onto mupot-managed agents, not a separat
    identity+RBAC+inbox from mupot, emits presence, drains its mupot inbox, and on signal
    from mupot can close. One thin adapter per runtime.
 3. **open/close API + Discord/dashboard control** — signed, surfaced in `#agent-bus`.
-4. **Cutover** — point the squad's shells at mupot (retire SOS for the squad); survive a
-   host reboot by repopulating presence from mupot, not local Redis.
+4. **Host-Go handoff** — point the squad's shells at Mupot/Herdr and survive a
+   host reboot by repopulating presence from mupot.
 
 See also: fleet-control (`agents/fleet-control/SPEC.md` in mumega.com), hermit-crab harness,
 S196 brief (`agents/loom/briefs/S196-dogfood-mupot-migration.md`), Hermes-per-pot (#18).
@@ -137,7 +138,7 @@ unsigned `lifecycle` under a signed upsert) — all fixed, re-gate GREEN. PRs: m
 4. Runtime binding reports presence + swappable — ⛏ partial (fleet daemon code now
    heartbeats, drains signed inbox, and signed-detaches on shutdown; live host
    install plus live `runtime-receipt.mjs` evidence remains).
-5. SOS retired — ⬜ not yet.
+5. Mupot/Herdr Host-Go handoff — ⬜ not yet.
 
 ### Punch-list to LIVE
 **Phase 1 — liveness (make `running` true)** ← biggest gap, critical path
@@ -157,19 +158,19 @@ unsigned `lifecycle` under a signed upsert) — all fixed, re-gate GREEN. PRs: m
    ✅ dashboard host-control path uses a least-privilege runtime feed with derived
    presence + lifecycle intent; IM/Hermes queues the same signed control requests.
 
-**Phase 3 — coordinate through mupot (not SOS)**
-5. Runtime loops consume the mupot inbox (send/inbox/wake/ack) instead of the SOS bus.
+**Phase 3 — coordinate through Mupot/Herdr**
+5. Runtime loops consume the mupot inbox (send/inbox/wake/ack).
    The pot now exposes `/api/inbox/signed` so the fleet daemon can deliver inbox
    batches without storing a bearer token; `fleet-runtime/inbox-handler.mjs`
    persists batches before consume, and host hook rollout remains the cutover work.
 6. Reflect any missing primitives (wake/request/ack) on the durable substrate (Queues+DO+D1).
-7. Repoint squad wake-hooks / bus identity SOS → mupot.
+7. Bind squad wake-hooks and runtime identity to the Mupot/Herdr handoff.
 
-**Phase 4 — retire SOS** (8) decommission the python bus for the squad once nothing depends on it.
-Use `fleet-runtime/cutover-receipt.mjs` as the per-agent final gate: it combines
-saved host, runtime, and start/stop control receipts and emits
-`mupot-sos-cutover-gate/v1`. Only a `status:"pass"` gate should allow removing
-that agent's SOS bus/wake path.
+**Phase 4 — Host-Go handoff** (8) use `fleet-runtime/cutover-receipt.mjs` as the
+per-agent final gate. It combines saved host, runtime, and start/stop control
+receipts and emits `mupot-host-go-cutover/v1`. A `status:"pass"` gate includes
+`no_live_sos_wiring` and authorizes the Mupot/Herdr handoff for the selected
+evidence chain.
 For the live host rollout, `fleet-runtime/receipt-bundle.mjs` is the preferred
 operator command because it saves the host/runtime/control receipts,
 `cutover-gate.json`, and `manifest.json` under one attachable evidence directory.

@@ -7,11 +7,12 @@
 
 import { describe, expect, it, vi, beforeEach } from 'vitest'
 import {
-  checkAndReserve,
+  checkAndReserve as checkAuthorizedExecution,
   recordTokens,
   MAX_DISPATCHES_PER_DAY,
   MAX_TOKENS_PER_DAY,
   MICRO_USD_PER_CENT,
+  type AuthorizedExecution,
 } from '../src/agents/meter'
 import type { Env } from '../src/types'
 
@@ -137,6 +138,42 @@ function makeEnv(
     ...overrides,
   }
   return env as unknown as Env
+}
+
+interface ReservationPolicy {
+  estimateMicroUsd?: number
+  budgetCapCents?: number | null
+  budgetCapMicroUsd?: number | null
+  budgetWindow?: 'day' | 'week'
+}
+
+// These legacy meter tests exercise reservation mechanics directly. Adapt their
+// policy fixtures to the new internal-only authority object without restoring the
+// removed public/caller-shaped production signature.
+function checkAndReserve(env: Env, agentId: string, policy: ReservationPolicy = {}) {
+  const dispatch = Number.parseInt(env.EXEC_MAX_DISPATCH_DAY ?? '', 10)
+  const tokens = Number.parseInt(env.EXEC_MAX_TOKENS_DAY ?? '', 10)
+  const centsCap = typeof policy.budgetCapCents === 'number' && policy.budgetCapCents > 0
+    ? policy.budgetCapCents * MICRO_USD_PER_CENT
+    : 0
+  const microCap = typeof policy.budgetCapMicroUsd === 'number' && policy.budgetCapMicroUsd > 0
+    ? policy.budgetCapMicroUsd
+    : 0
+  const execution: AuthorizedExecution = {
+    tenant: env.TENANT_SLUG,
+    meterSubjectId: agentId,
+    squadId: 'test-squad',
+    projectId: null,
+    maxDispatchDay: Number.isFinite(dispatch) && dispatch > 0 ? dispatch : MAX_DISPATCHES_PER_DAY,
+    maxTokensDay: Number.isFinite(tokens) && tokens > 0 ? tokens : MAX_TOKENS_PER_DAY,
+    maxCostMicroUsd: microCap || centsCap,
+    costWindow: policy.budgetWindow === 'week' ? 'week' : 'day',
+    estimateMicroUsd:
+      typeof policy.estimateMicroUsd === 'number' && policy.estimateMicroUsd > 0
+        ? Math.round(policy.estimateMicroUsd)
+        : 0,
+  }
+  return checkAuthorizedExecution(env, execution)
 }
 
 // Build the expected window key for today UTC — mirrors meter.ts buildWindowKey.

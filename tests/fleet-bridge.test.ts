@@ -88,6 +88,7 @@ function envWith(db: ReturnType<typeof makeDb>, tenant = 't'): Env {
 
 const baseInput = {
   agentId: 'hermes-mac',
+  runtimeAddress: 'hermes-mac',
   squadId: 'squad-1',
   taskId: 'task-1',
   receiptId: 'receipt-1',
@@ -104,7 +105,7 @@ describe('deliverDispatchToInbox', () => {
   it('writes an inbox message addressed to the agent, tagged with the dispatch-bridge sender', async () => {
     const db = makeDb()
     const res = await deliverDispatchToInbox(envWith(db), baseInput)
-    expect(res).toMatchObject({ delivered: true, seq: 1, duplicate: false })
+    expect(res).toEqual({ delivered: true, seq: 1, duplicate: false })
     expect(db._messages).toHaveLength(1)
     const row = db._messages[0]
     expect(row.tenant).toBe('t')
@@ -115,10 +116,12 @@ describe('deliverDispatchToInbox', () => {
     expect(row.request_id).toBe('dispatch-inbox:receipt-1')
     const body = JSON.parse(row.body) as Record<string, unknown>
     expect(body).toEqual({
+      version: 'runtime.dispatch/v1',
       type: 'task_dispatch',
       task_id: 'task-1',
       dispatch_receipt_id: 'receipt-1',
       squad_id: 'squad-1',
+      runtime_address: 'hermes-mac',
     })
   })
 
@@ -127,8 +130,8 @@ describe('deliverDispatchToInbox', () => {
     const env = envWith(db)
     const first = await deliverDispatchToInbox(env, baseInput)
     const redelivered = await deliverDispatchToInbox(env, baseInput)
-    expect(first).toMatchObject({ delivered: true, seq: 1, duplicate: false })
-    expect(redelivered).toMatchObject({ delivered: true, seq: 1, duplicate: true })
+    expect(first).toEqual({ delivered: true, seq: 1, duplicate: false })
+    expect(redelivered).toEqual({ delivered: true, seq: 1, duplicate: true })
     expect(db._messages).toHaveLength(1)
   })
 

@@ -1998,12 +1998,20 @@ dashboardApp.post('/admin/agent-token/mint', async (c) => {
   }
   const agent = agentResult.value
 
-  const expiresInDaysRaw = typeof form.expires_in_days === 'string' ? Number(form.expires_in_days) : 30
-  let expiresAt: string | null = null
-  if (!isNaN(expiresInDaysRaw) && expiresInDaysRaw > 0) {
-    const { calculateExpiryTimestamp } = await import('../auth/token-lifecycle')
-    expiresAt = calculateExpiryTimestamp(expiresInDaysRaw)
+  const expiresInDays = typeof form.expires_in_days === 'string' ? Number(form.expires_in_days) : undefined
+  const { resolveAgentTokenExpiry } = await import('../auth/token-lifecycle')
+  const expiry = resolveAgentTokenExpiry({
+    expiresInDays,
+    allowNonExpiring: auth.role === 'owner' || hasCapability(auth.capabilities ?? [], 'org', null, 'owner'),
+  })
+  if (!expiry.ok) {
+    const view = await loadAgentTokenView(c.env)
+    return c.html(
+      shell(c.env, 'Mint agent token', agentTokenPageBody(view, 'Expiry must be a whole number from 1 to 365 days.')),
+      400,
+    )
   }
+  const expiresAt = expiry.expiresAt
 
   // Delegate to the shared atomic-mint helper. A first mint creates the member,
   // binding, home capability, and welded token; later mints add only the token.
@@ -5237,6 +5245,14 @@ export function sendPageBody(
             <span class="lbl">What do you need done?</span>
             <textarea id="send-body" rows="6" placeholder="Describe the task in your own words…"></textarea>
           </label>
+          <label class="block" style="margin-top:14px">
+            <span class="lbl">Done when (verifiable)</span>
+            <input id="send-done" placeholder="e.g. Artifact: path and SHA256: digest are reported">
+          </label>
+          <label class="block" style="margin-top:14px">
+            <span class="lbl">Independent gate owner</span>
+            <input id="send-gate" placeholder="e.g. gate:reviewer">
+          </label>
           <div style="margin-top:14px">
             <button id="send-btn" class="btn">Dispatch now</button>
             <span id="send-hint" style="margin-left:12px;color:var(--dim);font-size:13px;">wakes your agent now and the result lands here</span>
@@ -5262,7 +5278,7 @@ export function sendPageBody(
     <style>
       .block { display: flex; flex-direction: column; gap: 6px; }
       .block .lbl { font-size: 13px; color: var(--muted); }
-      #send-body, #bk-title, #bk-body, #bk-done, #bk-priority, #bk-squad, #bk-assignee {
+      #send-body, #send-done, #send-gate, #bk-title, #bk-body, #bk-done, #bk-priority, #bk-squad, #bk-assignee {
         font: inherit; padding: 9px 11px; border-radius: 8px; border: 1px solid var(--border);
         background: var(--bg); color: var(--text); width: 100%; resize: vertical;
       }
@@ -5361,6 +5377,8 @@ function sendScript(projectId?: string) {
         var projectId = ${JSON.stringify(projectId ?? null).replace(/</g, '\\u003c')};
         var btn = document.getElementById('send-btn');
         var bodyEl = document.getElementById('send-body');
+        var doneEl = document.getElementById('send-done');
+        var gateEl = document.getElementById('send-gate');
         var status = document.getElementById('send-status');
         var resultBox = document.getElementById('send-result');
         if (!btn) return;
@@ -5397,11 +5415,12 @@ function sendScript(projectId?: string) {
               });
             } catch (e) { continue; }
             if (!res.ok) { continue; }
-            var data = await res.json();
-            var t = data.task;
-            if (!t) { continue; }
+             var data = await res.json();
+             var t = data.task;
+             if (!t) { continue; }
+             t.dispatch_timeline = data.dispatch_timeline || { transport: [], runtime: [], gate: [] };
             if (t.status === 'in_progress') { status.textContent = 'Working… (' + fmtSecs(Date.now() - startedAt) + ')'; continue; }
-            if (t.status === 'done' || t.status === 'blocked') {
+            if (t.status === 'done' || t.status === 'approved' || t.status === 'review' || t.status === 'blocked' || t.status === 'rejected') {
               return render(t, startedAt);
             }
             // still 'open' (dispatch in flight) — keep waiting.
@@ -5410,23 +5429,65 @@ function sendScript(projectId?: string) {
           status.textContent = 'Still working after ' + fmtSecs(MAX_MS) + '. It will keep running — refresh later to see the result.';
         }
 
-        function render(t, startedAt) {
+         function render(t, startedAt) {
           var took = fmtSecs(Date.now() - startedAt);
           if (t.status === 'done') {
             status.textContent = 'Done in ' + took + '.';
+          } else if (t.status === 'approved') {
+            status.textContent = 'Approved in ' + took + '.';
+          } else if (t.status === 'review') {
+            status.textContent = 'Awaiting independent gate — work is complete but not approved.';
+          } else if (t.status === 'rejected') {
+            status.textContent = 'Gate rejected the work — see the note below.';
           } else {
             status.textContent = 'Blocked — see the note below.';
           }
           var when = t.completed_at || '';
           var who = t.assignee_agent_id || 'your agent';
-          var meta = (t.status === 'done' ? 'Completed by ' : 'Blocked · ') + esc(who) + (when ? ' at ' + esc(when) : '');
-          resultBox.hidden = false;
-          resultBox.innerHTML = '<div class="done-meta">' + meta + '</div>' + esc(t.result || '(no output)');
+          var label = t.status === 'done' ? 'Completed by '
+            : t.status === 'approved' ? 'Approved · '
+            : t.status === 'review' ? 'Review pending · '
+            : t.status === 'rejected' ? 'Rejected · '
+            : 'Blocked · ';
+           var meta = label + esc(who) + (when ? ' at ' + esc(when) : '');
+           var timeline = t.dispatch_timeline || { transport: [], runtime: [], gate: [] };
+           var stages = [];
+           if ((timeline.transport || []).some(function (row) { return !!row.transport_delivered_at; })) {
+             stages.push('Transport delivered');
+           }
+           if ((timeline.runtime || []).some(function (row) { return row.stage === 'runtime_consumed'; })) {
+             stages.push('Runtime consumed');
+           }
+           if ((timeline.runtime || []).some(function (row) { return row.stage === 'completed'; })) {
+             stages.push('Runtime completed');
+           }
+           if ((timeline.runtime || []).some(function (row) { return row.stage === 'failed'; })) {
+             stages.push('Runtime failed');
+           }
+           var gateReceipts = timeline.gate || [];
+           if (gateReceipts.length > 0) {
+             stages.push('Gate verdict: ' + gateReceipts[gateReceipts.length - 1].verdict);
+           }
+           var receiptStages = stages.length
+             ? '<div class="done-meta">' + stages.map(esc).join(' · ') + '</div>'
+             : '';
+           resultBox.hidden = false;
+           resultBox.innerHTML = '<div class="done-meta">' + meta + '</div>' + receiptStages + esc(t.result || '(no output)');
         }
 
         btn.addEventListener('click', async function () {
           var text = (bodyEl.value || '').trim();
-          if (!text) { status.textContent = 'Write what you need first.'; return; }
+           var doneWhen = (doneEl.value || '').trim();
+           var gateOwner = (gateEl.value || '').trim();
+           if (!text) { status.textContent = 'Write what you need first.'; return; }
+           if (!doneWhen) { status.textContent = 'A verifiable done-when is required.'; return; }
+           if (!gateOwner) { status.textContent = 'An independent gate owner is required.'; return; }
+           if (!/^gate:[A-Za-z0-9][A-Za-z0-9:_-]{0,120}$/.test(gateOwner)) {
+             status.textContent = 'Gate owner must use the gate:<owner> form.'; return;
+           }
+           if (gateOwner === 'gate:agent-self-completion') {
+             status.textContent = 'Self-completion is not an independent gate.'; return;
+           }
           var val = selectedAgentValue();
           var parts = val.split('|');
           var agentId = parts[0];
@@ -5442,7 +5503,8 @@ function sendScript(projectId?: string) {
             var payload = {
               squad_id: squadId,
               title: title,
-              done_when: 'The task result explains the completed work and names any follow-up needed.',
+               done_when: doneWhen,
+               gate_owner: gateOwner,
               body: text,
               assignee_agent_id: agentId,
               dispatch: shouldDispatch()

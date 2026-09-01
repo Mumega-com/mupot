@@ -15,8 +15,6 @@ export interface SovereignPotProvisionInput {
   plan_tier?: SovereignPotTier
   /** Optional custom domain (CNAME) */
   custom_domain?: string
-  /** Optional migration SQL statements to apply */
-  migrations?: string[]
   /** Cloudflare API token override (falls back to env.SECRET_ENV_CF_API_TOKEN) */
   cf_api_token?: string
   /** Cloudflare Account ID override (falls back to env.SECRET_ENV_CF_ACCOUNT_ID) */
@@ -42,8 +40,6 @@ export interface SovereignPotProvisionResult {
   lead_agent_id: string
   lead_agent_name: string
   lead_agent_token: string
-  migrations_applied?: number
-  seeded?: boolean
   provisioned_at: string
 }
 

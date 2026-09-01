@@ -1,4 +1,4 @@
-import { describe, expect, it, beforeEach } from 'vitest'
+import { beforeEach, describe, expect, it } from 'vitest'
 import type { AuthContext, Capability, CapabilityGrant, Env } from '../src/types'
 import {
   decideVerdict,
@@ -7,8 +7,8 @@ import {
   type GateCheck,
 } from '../src/athena/reviewer'
 import { TOOLS, invokeTool } from '../src/mcp/index'
-import { createSqliteD1 } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
+import { createSqliteD1 } from './helpers/sqlite-d1'
 
 let harness: ReturnType<typeof createSqliteD1>
 
@@ -54,15 +54,15 @@ diff --git a/tests/greet.test.ts b/tests/greet.test.ts
 +})
 `
 
-const SECRET_DIFF = [
-  'diff --git a/src/client.ts b/src/client.ts',
-  '--- a/src/client.ts',
-  '+++ b/src/client.ts',
-  '@@ -1,2 +1,3 @@',
-  '+const API_KEY = "sk-' + 'abcdefghijklmnopqrstuvwxyz123456"',
-  " export const url = 'https://api.example.com'",
-  '',
-].join('\n')
+const SYNTHETIC_OPENAI_KEY = ['sk', 'abcdefghijklmnopqrstuvwxyz123456'].join('-')
+
+const SECRET_DIFF = `diff --git a/src/client.ts b/src/client.ts
+--- a/src/client.ts
++++ b/src/client.ts
+@@ -1,2 +1,3 @@
++const API_KEY = "${SYNTHETIC_OPENAI_KEY}"
+ export const url = 'https://api.example.com'
+`
 
 const RBAC_DIFF = `diff --git a/src/mcp/index.ts b/src/mcp/index.ts
 --- a/src/mcp/index.ts

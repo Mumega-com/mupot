@@ -1,308 +1,210 @@
-// src/router/engine.ts — Edge-Native Active Router & Continuum Loop (FLIGHT-ROUTER / W3).
-//
-// Ports router.py to Cloudflare edge-native TypeScript execution:
-// 1. Unassigned Task Discovery: scans open tasks with assignee_agent_id IS NULL.
-// 2. Safety Guards:
-//    - Filters GitHub webhook mirror event noise (`[GH <repo>] PR #...`).
-//    - Filters HUMAN_ONLY decision/deploy/credential operations.
-//    - Ambiguity detection: ambiguous keyword matches remain unassigned with human queue reasons.
-// 3. Continuum Body & Active Seat Matching:
-//    - Inspects live seats in D1 `presence` (status: active/live within lease_ttl_sec).
-//    - Matches task capability requirement to live continuum bodies across harnesses:
-//      * code/engineering/test -> Cursor / Codex / Grok CLI bodies
-//      * audit/verification/docs -> Asha / Prime / Athena bodies
-//      * comms/social/web -> Hermes / Mubot / WordPress bodies
-// 4. Atomic Assignment & Wake:
-//    - Assigns task to matched agent and emits `agent.wake` bus event over exact-seat mesh.
-
-import type { Env, Task, BusEvent } from '../types'
 import { createBus } from '../bus'
+import type { ExecutionScopeDecision } from '../auth/execution-scope'
+import type { BusEvent, Env } from '../types'
 
-export const HUMAN_ONLY_KEYWORDS = [
-  'decide', 'decision', 'countersign', 'approve', 'approval', 'policy', 'strategy',
-  'pricing', 'hire', 'budget', 'legal', 'contract', 'owner', 'mint', 'revoke',
-  'credential', 'token', 'secret', 'deploy', 'production', 'incident',
-] as const
-
-export const GH_MIRROR_RE = /^\[GH [^\]]+\] PR #\d+ /i
-
-export interface LaneCapability {
-  name: string
-  continuumName: string
-  preferredHarnesses: string[]
-  keywords: string[]
-}
-
-export const CANONICAL_ROUTER_LANES: Record<string, LaneCapability> = {
-  'tech-code': {
-    name: 'tech-code',
-    continuumName: 'river',
-    preferredHarnesses: ['cursor-cloud', 'cursor-ide', 'claude-code', 'codex-desktop', 'grok-cli'],
-    keywords: [
-      'fix', 'bug', 'test', 'ci', 'migration', 'refactor', 'typecheck', 'guard',
-      'gate', 'regression', 'schema', 'endpoint', 'route', 'worker', 'defect', 'feature',
-      'fencing', 'delivery', 'router', 'build',
-    ],
-  },
-  'builder-kasra': {
-    name: 'builder-kasra',
-    continuumName: 'kasra',
-    preferredHarnesses: ['codex-desktop', 'cursor-ide', 'tmux'],
-    keywords: [
-      'merge', 'pr', 'release', 'worktree', 'pipeline', 'infra', 'compiler', 'engine',
-    ],
-  },
-  'audit-athena': {
-    name: 'audit-athena',
-    continuumName: 'athena',
-    preferredHarnesses: ['claude-code', 'cursor-cloud'],
-    keywords: [
-      'audit', 'verify', 'verification', 'inventory', 'docs', 'documentation',
-      'readme', 'review', 'report', 'investigate', 'reconcile', 'triage', 'coherence',
-    ],
-  },
-  'comms-hermes': {
-    name: 'comms-hermes',
-    continuumName: 'hermes',
-    preferredHarnesses: ['hermes', 'telegram', 'openclaw'],
-    keywords: [
-      'telegram', 'chat', 'notify', 'announce', 'outreach', 'email', 'digest',
-    ],
-  },
-}
-
-export interface RouteMatchResult {
-  lane: LaneCapability | null
-  matchedKeywords: string[]
-  reason: string
-}
-
-export interface RouterDecision {
-  taskId: string
-  taskTitle: string
-  action: 'assigned' | 'skipped' | 'unrouted'
-  assignedAgentId?: string
-  assignedContinuum?: string
-  reason: string
+export interface RouterTickInput {
+  squadId: string
+  dryRun: boolean
+  limit?: number
 }
 
 export interface RouterTickResult {
-  scannedCount: number
-  assignedCount: number
-  skippedCount: number
-  unroutedCount: number
-  decisions: RouterDecision[]
+  squad_id: string
+  dry_run: boolean
+  scanned: number
+  assigned: number
+  unrouted: number
+  decisions: Array<{
+    task_id: string
+    outcome: 'would_assign' | 'assigned' | 'unrouted' | 'lost_claim'
+    agent_id: string | null
+  }>
+}
+
+type RouterDecision = Extract<ExecutionScopeDecision, { ok: true }>
+
+interface RouterClaimAuthority {
+  memberId: string
+}
+
+interface RouterTaskRow {
+  id: string
+  project_id: string | null
+  project_routable: number
+}
+
+interface RouterAgentRow {
+  id: string
+}
+
+function boundedLimit(limit: number | undefined): number {
+  if (!Number.isFinite(limit)) return 25
+  return Math.min(50, Math.max(1, Math.floor(limit as number)))
 }
 
 /**
- * Pure classification of task text against lane keywords and safety guards.
- */
-export function classifyTaskForRouting(
-  title: string,
-  body: string = '',
-  lanes: Record<string, LaneCapability> = CANONICAL_ROUTER_LANES,
-): RouteMatchResult {
-  const cleanTitle = title.trim()
-  if (GH_MIRROR_RE.test(cleanTitle)) {
-    return {
-      lane: null,
-      matchedKeywords: [],
-      reason: 'GitHub PR mirror notification — not actionable work; never route to a lane',
-    }
-  }
-
-  const text = `${cleanTitle} ${body}`.toLowerCase()
-
-  // 1. Check HUMAN_ONLY keywords first
-  for (const humanWord of HUMAN_ONLY_KEYWORDS) {
-    const re = new RegExp(`(?<![a-z0-9])${humanWord}(?![a-z0-9])`, 'i')
-    if (re.test(text)) {
-      return {
-        lane: null,
-        matchedKeywords: [humanWord],
-        reason: `human-only signal "${humanWord}" — decisions, credentials and deploys are not delegated`,
-      }
-    }
-  }
-
-  // 2. Score lanes using word boundaries
-  const hits: Array<{ lane: LaneCapability; count: number; matches: string[] }> = []
-
-  for (const lane of Object.values(lanes)) {
-    const matched: string[] = []
-    for (const kw of lane.keywords) {
-      const re = new RegExp(`(?<![a-z0-9])${kw}(?![a-z0-9])`, 'i')
-      if (re.test(text)) {
-        matched.push(kw)
-      }
-    }
-    if (matched.length > 0) {
-      hits.push({ lane, count: matched.length, matches: matched })
-    }
-  }
-
-  if (hits.length === 0) {
-    return {
-      lane: null,
-      matchedKeywords: [],
-      reason: 'no lane keyword matched — needs human triage or a more descriptive title',
-    }
-  }
-
-  hits.sort((a, b) => b.count - a.count)
-  const top = hits[0]
-  const second = hits.length > 1 ? hits[1] : null
-
-  if (second && second.count === top.count) {
-    return {
-      lane: null,
-      matchedKeywords: [...top.matches, ...second.matches],
-      reason: `ambiguous match — ${top.lane.name} and ${second.lane.name} match equally (${top.matches.join(',')} vs ${second.matches.join(',')})`,
-    }
-  }
-
-  return {
-    lane: top.lane,
-    matchedKeywords: top.matches,
-    reason: `matched keywords: ${top.matches.join(', ')}`,
-  }
-}
-
-export interface LivePresenceSeat {
-  member_id: string
-  agent_id: string | null
-  seat: string
-  harness: string
-  continuum_name: string | null
-  last_seen_at: string
-}
-
-/**
- * Scans active D1 presence and matches task to live continuum bodies.
+ * Run one explicitly-authorized squad router tick.
+ *
+ * The decision is issued before this function is entered. Every subsequent D1
+ * read and mutation remains bound to that same server-resolved squad id.
  */
 export async function runRouterTick(
   env: Env,
-  options: { dryRun?: boolean; squadId?: string; limit?: number } = {},
+  decision: RouterDecision,
+  input: RouterTickInput,
+  authority: RouterClaimAuthority,
 ): Promise<RouterTickResult> {
-  const dryRun = options.dryRun !== false
-  const limit = options.limit && options.limit > 0 ? options.limit : 50
-
-  // 1. Fetch unassigned open tasks
-  let taskQuery = `SELECT id, squad_id, title, body, status, priority, assignee_agent_id
-                     FROM tasks
-                    WHERE status = 'open' AND assignee_agent_id IS NULL`
-  const params: unknown[] = []
-
-  if (options.squadId) {
-    taskQuery += ` AND squad_id = ?1`
-    params.push(options.squadId)
+  if (decision.squadId !== input.squadId || decision.tenant !== env.TENANT_SLUG) {
+    throw new Error('router_scope_mismatch')
   }
-  taskQuery += ` ORDER BY created_at ASC LIMIT ?${params.length + 1}`
-  params.push(limit)
 
-  const taskRows = await env.DB.prepare(taskQuery).bind(...params).all<Task>()
-  const tasks = taskRows.results ?? []
+  const squadId = decision.squadId
+  const limit = boundedLimit(input.limit)
+  const tasks = await env.DB.prepare(
+    `SELECT t.id,
+            t.project_id,
+            CASE WHEN t.project_id IS NULL THEN 1
+                 WHEN EXISTS (
+                   SELECT 1
+                     FROM projects p
+                     JOIN project_squad_access psa
+                       ON psa.project_id = p.id
+                      AND psa.squad_id = t.squad_id
+                      AND psa.access_level IN ('write', 'admin')
+                    WHERE p.id = t.project_id
+                      AND p.status = 'active'
+                 ) THEN 1
+                 ELSE 0 END AS project_routable
+       FROM tasks t
+      WHERE t.squad_id = ?1
+        AND t.status = 'open'
+        AND t.assignee_agent_id IS NULL
+      ORDER BY t.created_at ASC, t.id ASC
+      LIMIT ?2`,
+  ).bind(squadId, limit).all<RouterTaskRow>()
 
-  // 2. Fetch live presence seats and agents
-  const [presenceRows, agentRows] = await Promise.all([
-    env.DB.prepare(
-      `SELECT member_id, agent_id, seat, harness, continuum_name, last_seen_at
-         FROM presence
-        WHERE tenant = ?1
-          AND datetime(last_seen_at) >= datetime('now', '-300 seconds')`,
-    ).bind(env.TENANT_SLUG).all<LivePresenceSeat>(),
-    env.DB.prepare(
-      `SELECT id, slug, name, squad_id, status FROM agents WHERE status = 'active'`,
-    ).all<{ id: string; slug: string; name: string; squad_id: string }>(),
-  ])
+  const decisions: RouterTickResult['decisions'] = []
+  let assigned = 0
+  let unrouted = 0
 
-  const liveSeats = presenceRows.results ?? []
-  const agents = agentRows.results ?? []
-
-  const decisions: RouterDecision[] = []
-  let assignedCount = 0
-  let skippedCount = 0
-  let unroutedCount = 0
-
-  for (const task of tasks) {
-    const match = classifyTaskForRouting(task.title, task.body)
-
-    if (!match.lane) {
-      if (match.reason.includes('GitHub PR mirror')) {
-        skippedCount++
-        decisions.push({ taskId: task.id, taskTitle: task.title, action: 'skipped', reason: match.reason })
-      } else {
-        unroutedCount++
-        decisions.push({ taskId: task.id, taskTitle: task.title, action: 'unrouted', reason: match.reason })
-      }
+  for (const task of tasks.results ?? []) {
+    if (task.project_routable !== 1) {
+      unrouted += 1
+      decisions.push({ task_id: task.id, outcome: 'unrouted', agent_id: null })
       continue
     }
 
-    // Resolve target agent by continuum name on this task squad or any active agent matching continuum
-    const targetContinuum = match.lane.continuumName
-    const liveMatch = liveSeats.find((s) => s.continuum_name === targetContinuum || (s.agent_id && agents.some((a) => a.id === s.agent_id && a.slug.includes(targetContinuum))))
+    const candidate = await env.DB.prepare(
+      `SELECT DISTINCT a.id
+         FROM agents a
+         JOIN presence p
+           ON p.agent_id = a.id
+          AND p.tenant = ?1
+        WHERE a.squad_id = ?2
+          AND a.status = 'active'
+          AND p.last_seen_at >= datetime('now', '-10 minutes')
+        ORDER BY a.id ASC
+        LIMIT 1`,
+    ).bind(decision.tenant, squadId).first<RouterAgentRow>()
 
-    let matchedAgent = agents.find((a) => a.squad_id === task.squad_id && a.slug.toLowerCase().includes(targetContinuum))
-    if (!matchedAgent && liveMatch?.agent_id) {
-      matchedAgent = agents.find((a) => a.id === liveMatch.agent_id)
-    }
-    if (!matchedAgent) {
-      matchedAgent = agents.find((a) => a.slug.toLowerCase().includes(targetContinuum))
-    }
-    if (!matchedAgent && agents.length > 0) {
-      matchedAgent = agents.find((a) => a.squad_id === task.squad_id) || agents[0]
-    }
-
-    if (!matchedAgent) {
-      unroutedCount++
-      decisions.push({
-        taskId: task.id,
-        taskTitle: task.title,
-        action: 'unrouted',
-        reason: `matched lane ${match.lane.name} (${targetContinuum}) but no active agent registered`,
-      })
+    if (!candidate) {
+      unrouted += 1
+      decisions.push({ task_id: task.id, outcome: 'unrouted', agent_id: null })
       continue
     }
 
-    if (!dryRun) {
-      const nowIso = new Date().toISOString()
-      await env.DB.prepare(
-        `UPDATE tasks
-            SET assignee_agent_id = ?1,
-                updated_at = ?2
-          WHERE id = ?3 AND assignee_agent_id IS NULL`,
-      )
-        .bind(matchedAgent.id, nowIso, task.id)
-        .run()
-
-      // Emit wake event
-      const wakeEvent: BusEvent<{ task_id: string; by: string }> = {
-        type: 'agent.wake',
-        tenant: env.TENANT_SLUG,
-        squad_id: task.squad_id,
-        agent_id: matchedAgent.id,
-        payload: { task_id: task.id, by: 'router.edge' },
-        ts: nowIso,
-      }
-      await createBus(env).emit(wakeEvent)
+    if (input.dryRun) {
+      decisions.push({ task_id: task.id, outcome: 'would_assign', agent_id: candidate.id })
+      continue
     }
 
-    assignedCount++
-    decisions.push({
-      taskId: task.id,
-      taskTitle: task.title,
-      action: 'assigned',
-      assignedAgentId: matchedAgent.id,
-      assignedContinuum: targetContinuum,
-      reason: `${match.reason} (assigned to ${matchedAgent.name} [${matchedAgent.id}])`,
-    })
+    const now = new Date().toISOString()
+    const claim = await env.DB.prepare(
+      `UPDATE tasks
+          SET assignee_agent_id = ?1,
+              updated_at = ?2
+        WHERE id = ?3
+          AND squad_id = ?4
+          AND status = 'open'
+          AND assignee_agent_id IS NULL
+          AND EXISTS (
+            SELECT 1
+              FROM squads actor_squad
+             WHERE actor_squad.id = ?4
+               AND (
+                 EXISTS (
+                   SELECT 1
+                     FROM capabilities actor_grant
+                    WHERE actor_grant.member_id = ?6
+                      AND actor_grant.capability IN ('lead', 'admin', 'owner')
+                      AND (
+                        actor_grant.scope_type = 'org'
+                        OR (actor_grant.scope_type = 'squad' AND actor_grant.scope_id = ?4)
+                        OR (
+                          actor_grant.scope_type = 'department'
+                          AND actor_grant.scope_id = actor_squad.department_id
+                        )
+                      )
+                 )
+                 OR EXISTS (
+                   SELECT 1
+                     FROM channel_capability_grants actor_channel_grant
+                    WHERE actor_channel_grant.member_id = ?6
+                      AND actor_channel_grant.squad_id = ?4
+                      AND actor_channel_grant.capability IN ('lead', 'admin', 'owner')
+                 )
+               )
+          )
+          AND EXISTS (
+            SELECT 1
+              FROM agents a
+              JOIN presence presence_now
+                ON presence_now.agent_id = a.id
+               AND presence_now.tenant = ?5
+             WHERE a.id = ?1
+               AND a.squad_id = ?4
+               AND a.status = 'active'
+               AND presence_now.last_seen_at >= datetime('now', '-10 minutes')
+          )
+          AND (
+            project_id IS NULL
+            OR EXISTS (
+              SELECT 1
+                FROM projects project_now
+                JOIN project_squad_access access_now
+                  ON access_now.project_id = project_now.id
+                 AND access_now.squad_id = tasks.squad_id
+                 AND access_now.access_level IN ('write', 'admin')
+               WHERE project_now.id = tasks.project_id
+                 AND project_now.status = 'active'
+            )
+          )`,
+    ).bind(candidate.id, now, task.id, squadId, decision.tenant, authority.memberId).run()
+
+    if (claim.meta.changes !== 1) {
+      decisions.push({ task_id: task.id, outcome: 'lost_claim', agent_id: candidate.id })
+      continue
+    }
+
+    const wake: BusEvent<{ task_id: string; reason: string }> = {
+      type: 'agent.wake',
+      tenant: decision.tenant,
+      squad_id: squadId,
+      agent_id: candidate.id,
+      payload: { task_id: task.id, reason: 'router.tick' },
+      ts: now,
+    }
+    await createBus(env).emit(wake)
+    assigned += 1
+    decisions.push({ task_id: task.id, outcome: 'assigned', agent_id: candidate.id })
   }
 
   return {
-    scannedCount: tasks.length,
-    assignedCount,
-    skippedCount,
-    unroutedCount,
+    squad_id: squadId,
+    dry_run: input.dryRun,
+    scanned: (tasks.results ?? []).length,
+    assigned,
+    unrouted,
     decisions,
   }
 }

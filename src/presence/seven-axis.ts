@@ -13,11 +13,6 @@ export const SEVEN_AXIS_KEYS = [
   'provider',
   'effort',
   'flight_id',
-  'folder',
-  'thread',
-  'continuum_name',
-  'session_epoch',
-  'lease_ttl_sec',
 ] as const
 
 export type SevenAxisKey = (typeof SEVEN_AXIS_KEYS)[number]
@@ -47,11 +42,6 @@ export interface SevenAxisPresence {
   provider: string | null
   effort: SevenAxisEffort | null
   flight_id: string | null
-  folder?: string | null
-  thread?: string | null
-  continuum_name?: string | null
-  session_epoch?: number | null
-  lease_ttl_sec?: number | null
 }
 
 export function isRiverCursorSeat(seat: string | null | undefined): boolean {
@@ -70,15 +60,6 @@ function optionalEnum<T extends string>(value: unknown, allowed: readonly T[]): 
   return (allowed as readonly string[]).includes(trimmed) ? (trimmed as T) : null
 }
 
-function optionalPositiveInt(value: unknown): number | null {
-  if (typeof value === 'number' && Number.isInteger(value) && value > 0) return value
-  if (typeof value === 'string') {
-    const parsed = parseInt(value.trim(), 10)
-    if (Number.isInteger(parsed) && parsed > 0) return parsed
-  }
-  return null
-}
-
 export function parseSevenAxisCheckin(
   args: Record<string, unknown>,
   fallbackSeat = '',
@@ -92,11 +73,6 @@ export function parseSevenAxisCheckin(
     provider: optionalString(args.provider),
     effort: optionalEnum(args.effort, SEVEN_AXIS_EFFORTS),
     flight_id: optionalString(args.flight_id),
-    folder: optionalString(args.folder),
-    thread: optionalString(args.thread),
-    continuum_name: optionalString(args.continuum_name),
-    session_epoch: optionalPositiveInt(args.session_epoch),
-    lease_ttl_sec: optionalPositiveInt(args.lease_ttl_sec),
   }
 }
 

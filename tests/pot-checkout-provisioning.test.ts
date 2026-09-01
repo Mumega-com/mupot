@@ -1,6 +1,6 @@
 // tests/pot-checkout-provisioning.test.ts — Unit tests for Self-Serve Pot Checkout & Provisioning (Flight 12).
 
-import { describe, expect, it, vi, beforeEach } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   checkSlugAvailability,
   createPotCheckoutSession,
@@ -8,9 +8,9 @@ import {
 } from '../src/pots/checkout'
 import { pricingPageHtml } from '../src/dashboard/pricing'
 import { publicPotsApp } from '../src/pots/routes'
-import { createSqliteD1 } from './helpers/sqlite-d1'
-import { applyAllMigrations } from './helpers/migrations'
 import type { Env } from '../src/types'
+import { applyAllMigrations } from './helpers/migrations'
+import { createSqliteD1 } from './helpers/sqlite-d1'
 
 describe('Public Pricing & Self-Serve Sovereign Pot Provisioning Portal (Flight 12)', () => {
   let harness: ReturnType<typeof createSqliteD1>
@@ -20,11 +20,8 @@ describe('Public Pricing & Self-Serve Sovereign Pot Provisioning Portal (Flight 
     harness = createSqliteD1()
     applyAllMigrations(harness.sqlite)
   })
-
   it('validates subdomain slug availability and reserved word protection', async () => {
-    const env = {
-      DB: harness.db,
-    } as unknown as Env
+    const env = { DB: harness.db } as unknown as Env
 
     // Valid slug
     const resValid = await checkSlugAvailability(env, 'acme-corp')
@@ -136,7 +133,7 @@ describe('Public Pricing & Self-Serve Sovereign Pot Provisioning Portal (Flight 
     } as unknown as Env
 
     const req = new Request('http://localhost/slug-available?slug=my-fleet-pot')
-    const res = await publicPotsApp.fetch(req, env as any)
+    const res = await publicPotsApp.fetch(req, env)
     expect(res.status).toBe(200)
     const json = await res.json<{ ok: boolean; result: { available: boolean } }>()
     expect(json.ok).toBe(true)

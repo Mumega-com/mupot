@@ -134,7 +134,7 @@ export function formatPlan(opts = {}) {
   const outDir = defaultOutDir(opts)
   const lines = []
 
-  lines.push('Mupot v0.23 staging recovery rehearsal')
+  lines.push('Mupot staging recovery rehearsal')
   lines.push('')
   lines.push('Goal: prove backup, upgrade, restore, rollback, Queue/DLQ behavior, failure reporting, and final health on a staging pot.')
   lines.push('')
@@ -515,7 +515,7 @@ export function checkBundle(opts = {}) {
     },
     checks,
     next_steps: failed.length === 0
-      ? ['attach the staging recovery evidence directory and this check receipt to the v0.23 release issue']
+      ? ['attach the staging recovery evidence directory and this check receipt to the active release tracker']
       : ['fix failing staging evidence, rerun the rehearsal step if needed, then rerun staging-recovery-rehearsal --check'],
   }
 }

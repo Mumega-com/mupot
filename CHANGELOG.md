@@ -1,49 +1,51 @@
 # Changelog
 
-## 2026-08-29
+## Release status — 2026-08-30
 
-- **Journey 3: Multimodal Business Onboarding & Agent Repo Scaffolding** (Flights ONBOARD-REPO, ONBOARD-SAAS, ONBOARD-MCP; PR #1236).
-  - **Automated Git Repo Sensing & Scaffolding (FLIGHT ONBOARD-REPO)**: Migration `0142_onboarding_squad_packs.sql` establishing `agent_workspaces` and `workspace_onboarding_records`. Built `src/onboarding/repo-scaffold.ts` generating `agents/<slug>/` `.mcp.json`, `config.json`, `MEMORY.md`, and checkin payloads (`onboard_agent_workspace`).
-  - **1-Click Starter Squad Packs & Business Provisioning (FLIGHT ONBOARD-SAAS)**: Pre-packaged squads in `src/onboarding/squad-packs.ts` (`engineering_sprint`, `content_studio`, `business_ops`) with automated role-specialized agent creation and P1 starter task verification (`onboard_provision_pack`).
-  - **10-Second Desktop Connect Bundle Generator (FLIGHT ONBOARD-MCP)**: Streamable HTTP connection bundle generator in `src/onboarding/desktop-connect.ts` for Cursor, Codex, Claude Code, and Hermes (`onboard_desktop_bundle`).
+- **Current source version:** `0.30.0` in `package.json` and the public version constants.
+- **Latest tagged stable release:** `v0.25.0`. Neither `v0.29.0` nor `v0.30.0`
+  currently has a release tag or GitHub release, so source-version headings below are
+  preview history, not a supported stable contract.
+- **v0.30.0 stabilization candidate:** PR #1239 landed as merge commit
+  `f3389d65172b9660efaa82999675739046a987e9`, restoring a green main migration,
+  typecheck, full-suite, schema-source, no-secrets, and local-evidence baseline.
+- **Landed stabilization train:** PR #1243 (`8be1cac7`, credential rotation),
+  PR #1242 (`fb10d79b`, router/loop/meter authorization), PR #1237
+  (`b980f565`, immutable message integrity), PR #1245 (`31644899`, addon binding
+  ordering), PR #1235 (`4d41d9bd`, guest-squad send visibility), and PR #1241
+  (`a3d46acb`, strictly validated peek-only inbox cursor) are on main with
+  post-merge CI and CodeQL evidence.
+- **Release-surface hygiene complete:** obsolete/conflicting #1211, #1217,
+  #1236, and #1238 were closed with replacement or deferral evidence; branches
+  were preserved.
+- **Post-freeze main drift recorded:** PR #1249 landed externally as merge
+  commit `16390d1e` after #1241, adding exact external-runtime dispatch receipt
+  paths. Its code is present in the candidate base but remains preview rather
+  than a newly promoted stable-release claim. Earlier #1250 heads based on
+  `a3d46acb` were re-gated only after restacking on this main commit.
+- **Still required for the stable candidate:** land the corrected release
+  metadata/tooling, collect the fresh receipts in
+  [the v0.30.0 release contract](docs/releases/v0.30.0.md), and pass the exact
+  release gate recorded in [ROADMAP.md](ROADMAP.md).
+- **Release-excluded:** the #1236 omnibus, project-worker/sandbox expansion, device
+  fleet, new onboarding journeys, and other unbounded feature work. Useful donor
+  material must return through separate reviewed PRs after `v0.30.0`.
 
-- **Journey 2: Mupot OS & Physical Device Fleet Control** (Flights DEV-01, DEV-02, DEV-03, DEV-04, DEV-05; `MU.200.001-DEVICE`, PR #1236).
-  - **Hardware Attestation & Pairing QR Protocol (FLIGHT DEV-01)**: Migration `0141_device_fleet_and_attestation.sql` creating `device_keys` and `device_pairings`. Challenge-response pairing protocol with hardware-anchored Ed25519 public keys and MCP tools (`device_pair_challenge`, `device_pair_claim`).
-  - **Local Sandboxed Execution Engine & $0-Token Telemetry (FLIGHT DEV-02)**: Engine in `src/devices/executor.ts` interfacing with Apple Silicon MLX and Linux container workers, reporting local $0 token metrics with signed execution attestation (`device_report_exec`).
-  - **Hardware Peripheral & Sensor Governance (FLIGHT DEV-03)**: Capability gates in `src/devices/governance.ts` (`hardware:local-inference`, `hardware:fs-write`, `hardware:audio-stream`, `hardware:vision-capture`, `hardware:gpio-control`) with strict 2FA/org-admin barrier on physical robotics.
-  - **Offline-First SQLite Journal & Edge Sync (FLIGHT DEV-04)**: Buffered offline transaction journal in `src/devices/journal.ts` with sequence-ordered deduplication into `device_journals` (`device_sync_journal`).
-  - **Hardware Power Management & Wake-on-Demand Mesh (FLIGHT DEV-05)**: Power state tracking in `device_power_states` and hardware wake dispatch over the exact-seat fleet bus (`device_power_control`).
+No entry in this section claims a deployment. Tagging, publishing, and deploying
+`v0.30.0` each require separate receipts and approval.
 
-## 2026-08-28
-
-- **Journey 1: Sovereign Edge Core & Continuum Intelligence** (Flights WFP-04, A2A-01, MEM-01, ID-03, SEC-02, MSG-01, EXEC-02, DELIV-03, FLIGHT-003, FLIGHT-004, FLIGHT-005, FLIGHT-ROUTER, FLIGHT-ROUTER-CRON, FLIGHT-002, FLIGHT-METER, FLIGHT-UNTRUSTED, FLIGHT-LOOP-UNHOLD, FLIGHT-IDENTITY-UNIFIED; PR #1236).
-  - **Edge-Native Active Router & Scheduled Cron**: Replaced VPS Python scripts with serverless `src/router/engine.ts` and `src/router/scheduled.ts` running in Cloudflare `workerd` on 5-minute scheduled crons.
-  - **Unified Principals & Token-Scoped Grants (#584)**: Migration `0140_token_grants_and_project_rbac.sql` establishing `token_grants` with `project` scope and least-privilege intersection math $\text{effective} = \text{intersect}(\text{principal}, \text{token\_grants})$.
-  - **Native In-Pot 2FA & Action-Hash Approvals (#725)**: Migration `0137_native_2fa_and_action_approvals.sql` creating single-use, action-hash-bound approval nonces and immutable receipts.
-  - **D1 Constitutional Governance Protocols (MU.100.001 / #723)**: Migration `0138_governance_consensus_and_ratification.sql` establishing durable proposals, single-vote terminal state guards, and SHA-256 document checksum binding.
-  - **Thread-Bound Delivery Turn Fencing & Leases (#1031, #1050)**: Migration `0136_delivery_turn_fencing_and_presence_leases.sql` binding delivery consumption strictly to `{threadId, turnId, generation, correlation, nonce_hash}`.
-  - **Unified Execution & Spend Metering (F8)**: Built `src/metering/service.ts` with `checkAndReserveExecution` pre-flight hard budget stop brakes.
-  - **Structural Ingress & Untrusted-Content Fencing (F6)**: Built `src/ingress/guards.ts` with `wrapIngressContent()` and `assertDirectiveAuthority()`.
-  - **Governed Autonomous Loop Driver**: Built `src/loops/driver.ts` running autonomous goal-seeking cycles under propose-only `/approvals` boundaries.
-
-- **Mupot OS & Device Fleet Control Architecture Specification** (`docs/architecture/mupot-os-device-fleet-architecture.md`, `ROADMAP.md`).
-  - Canonical specification `MU.200.001-DEVICE-OS` establishing the cloud-brain / physical-muscle architecture for Mupot OS appliances (Mac Mini, Linux workstations, Raspberry Pis).
-  - Defined Hardware Attestation & Device Pairing QR protocols, 7-axis device presence, local sandboxed execution (Apple MLX / Docker), and local peripheral capability gates.
-  - Introduced the **Journey Roadmap** framework in `ROADMAP.md` grouping discrete flights into strategic capability horizons.
-
-## 2026-08-26
+## Preview on main — 2026-08-26 (not a tagged release)
 
 - **River lead agent onboarding, Co-Pilot routing, and warm-cache prompts** (`src/dashboard/copilot.ts`, `src/ai/cache-context.ts`, `migrations/0131_river_lead_agent.sql`).
   - `@river` is a first-class Co-Pilot recipient (cyan, Council Lead & Continuity) on `/copilot`, the global drawer, and `/projects/:id` sandbox studio.
   - Model prompts use a frozen static prefix (charter, architecture, tool schemas, River governance) with dynamic turns at the bottom, plus a keep-alive heartbeat.
   - D1 registers River on `squad-core` (`gemini-3.7-flash`) when that squad exists; `check_in` records 7-axis presence for `seat: river-cursor`.
 
-- **1-click project worker provisioner & sandbox studio** (`src/projects/provisioner.ts`, `src/dashboard/projects.ts`, `src/platform/routes.ts`).
-  - `/projects` ships a `[ + New Project Worker ]` modal (name, auto-slug, GitHub repo, template, worker name, `https://<slug>.mupot.mumega.com` preview, squad default `squad-cursor`).
-  - `POST /api/projects` stays admin-gated (`isOrgAdmin` + workspace admin floor), seeds `deploy_status: "idle"`, and returns `{ ok: true, project, redirect_url }`.
-  - `/projects/:id` is a split sandbox: live preview iframe with Desktop/Tablet/Mobile toggles + Refresh, Deep Chat Co-Pilot focused on the project repo with quick prompts, and a flight/deployment stream.
+## [0.30.0] — source cut 2026-08-21 (release candidate; not tagged)
 
-## 0.30.0 — 2026-08-21
+This heading records when the source version advanced to `0.30.0`. It is not a
+stable-release date. Features listed here remain preview until the stabilization
+scope and release gate in [ROADMAP.md](ROADMAP.md) pass at one exact main commit.
 
 - **Athena GitHub webhook PR gate** (`src/athena/webhook.ts`, `src/athena/routes.ts`, `migrations/0130_athena_gate_receipts.sql`).
   - `POST /api/webhooks/github` verifies `X-Hub-Signature-256` (or a fail-safe `GITHUB_TOKEN` bearer when the HMAC secret is unset), reviews `pull_request` `{opened, synchronize, reopened}` through `reviewPullRequest()`, and writes an immutable `athena_gate_receipts` row.
@@ -110,7 +112,7 @@
 
 
 
-## 0.29.0 — 2026-08-08
+## 0.29.0 source cut — 2026-08-08 (untagged)
 
 - **Build-Time Release Identity & Version Truth** (`src/health.ts`, `scripts/generate-build-info.mjs`; #443, #571).
   - `/health` and deployment consoles now stamp exact commit identity (`commit`), branch (`ref`), build timestamp (`built_at`), and working-tree cleanliness (`clean`) by construction via `src/build-info.ts` fallback when runtime environment variables are omitted.
@@ -393,7 +395,10 @@ All notable changes to mupot. Semver; pre-1.0 minor bumps may break.
 this changelog (shipped, dated) share version numbers and feed each other — a roadmap
 block collapses into a changelog entry when it ships.
 
-## [Unreleased]
+## [Unreleased — accumulated changes after v0.25.0]
+
+These entries are present on `main` or retained as unreleased history. They are not a
+stable contract until the `v0.30.0` stabilization gate promotes them explicitly.
 
 ### Added
 

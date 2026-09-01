@@ -1,6 +1,6 @@
 // tests/stripe-billing.test.ts — Unit tests for Stripe Checkout, Customer Portal & Subscription Webhook Engine (Flight 7).
 
-import { describe, expect, it, vi, beforeEach } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   createStripeCheckout,
   createStripePortal,
@@ -9,9 +9,9 @@ import {
   TIER_PRICING,
 } from '../src/billing/stripe'
 import { billingRoutesApp } from '../src/billing/routes'
-import { createSqliteD1 } from './helpers/sqlite-d1'
-import { applyAllMigrations } from './helpers/migrations'
 import type { Env } from '../src/types'
+import { applyAllMigrations } from './helpers/migrations'
+import { createSqliteD1 } from './helpers/sqlite-d1'
 
 describe('Stripe Checkout & Subscription Billing Engine (Flight 7)', () => {
   let harness: ReturnType<typeof createSqliteD1>
@@ -21,7 +21,6 @@ describe('Stripe Checkout & Subscription Billing Engine (Flight 7)', () => {
     harness = createSqliteD1()
     applyAllMigrations(harness.sqlite)
   })
-
   it('defines pricing for starter, pro, and scale tiers', () => {
     expect(TIER_PRICING.starter.monthlyCents).toBe(4900)
     expect(TIER_PRICING.pro.monthlyCents).toBe(9900)
@@ -163,11 +162,10 @@ describe('Stripe Checkout & Subscription Billing Engine (Flight 7)', () => {
   })
 
   it('serves GET /api/billing/status with current tier and features', async () => {
-    // Seed billing_state in org_settings
     await harness.db.prepare(
-      `INSERT INTO org_settings (key, value, updated_at) VALUES ('billing_state', ?1, CURRENT_TIMESTAMP)`,
+      `INSERT INTO org_settings (key, value, updated_at)
+       VALUES ('billing_state', ?1, CURRENT_TIMESTAMP)`,
     ).bind(JSON.stringify({ tier: 'scale' })).run()
-
     const env = {
       TENANT_SLUG: 'gaf',
       BRAND: 'GAF Materials',
@@ -175,7 +173,7 @@ describe('Stripe Checkout & Subscription Billing Engine (Flight 7)', () => {
     } as unknown as Env
 
     const req = new Request('http://localhost/status')
-    const res = await billingRoutesApp.fetch(req, env as any)
+    const res = await billingRoutesApp.fetch(req, env)
     expect(res.status).toBe(200)
 
     const json = await res.json<{ ok: boolean; tier: string; brand: string }>()

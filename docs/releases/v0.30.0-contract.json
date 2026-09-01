@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "version": "v0.30.0",
+  "name": "Stabilized Control Plane",
+  "receipt_types": {
+    "prepublication": "mupot-v030-prepublication-readiness/v1",
+    "final": "mupot-v030-release-readiness/v1"
+  },
+  "receipts": [
+    {
+      "objective": 1,
+      "file": "fresh-install-check.json",
+      "receipt_type": "mupot-fresh-install/v1",
+      "phases": ["prepublication", "final"]
+    },
+    {
+      "objective": 2,
+      "file": "host-go/manifest.json",
+      "receipt_type": "mupot-fleet-receipt-bundle/v1",
+      "phases": ["prepublication", "final"]
+    },
+    {
+      "objective": 2,
+      "file": "host-go/cutover-gate.json",
+      "receipt_type": "mupot-host-go-cutover/v1",
+      "phases": ["prepublication", "final"]
+    },
+    {
+      "objective": 6,
+      "file": "host-go/export-receipt.json",
+      "receipt_type": "mupot-fleet-receipt-bundle-export/v1",
+      "phases": ["prepublication", "final"]
+    },
+    {
+      "objective": 6,
+      "file": "host-go/manifest-check.json",
+      "receipt_type": "mupot-fleet-receipt-bundle-check/v1",
+      "phases": ["prepublication", "final"]
+    },
+    {
+      "objective": 3,
+      "file": "github-app-permissions-check.json",
+      "receipt_type": "mupot-github-app-permissions/v1",
+      "phases": ["prepublication", "final"]
+    },
+    {
+      "objective": 4,
+      "file": "work-lifecycle-check.json",
+      "receipt_type": "mupot-work-lifecycle/v1",
+      "phases": ["prepublication", "final"]
+    },
+    {
+      "objective": 5,
+      "file": "external-pr-cycle-check.json",
+      "receipt_type": "mupot-external-pr-cycle/v1",
+      "phases": ["prepublication", "final"]
+    },
+    {
+      "objective": 7,
+      "file": "staging-recovery-check.json",
+      "receipt_type": "mupot-staging-recovery-rehearsal/v1",
+      "phases": ["prepublication", "final"]
+    },
+    {
+      "objective": 8,
+      "file": "release-candidate-check.json",
+      "receipt_type": "mupot-release-candidate/v1",
+      "phases": ["prepublication", "final"]
+    },
+    {
+      "objective": 9,
+      "file": "stable-deployment-check.json",
+      "receipt_type": "mupot-stable-deployment/v1",
+      "phases": ["prepublication", "final"]
+    },
+    {
+      "objective": 10,
+      "file": "release-integrity-check.json",
+      "receipt_type": "mupot-release-integrity/v1",
+      "phases": ["final"]
+    }
+  ],
+  "issues": []
+}

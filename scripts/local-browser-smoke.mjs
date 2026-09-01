@@ -14,6 +14,8 @@ const runtimeContract = 'runtime-adapter/v1'
 const hermesLifecycle = 'Hermes IM lifecycle: Telegram update -> IM webhook -> chat_id member mapping -> capability gate -> fleet/approval/task effect -> reply'
 const smokeRunId = new Date().toISOString().replace(/[:.]/g, '-')
 const sendTaskTitle = `Browser workflow smoke ${smokeRunId}`
+const sendTaskDoneWhen = 'The browser-created task preserves this exact completion predicate and renders its result.'
+const sendTaskGateOwner = 'gate:local'
 const approvalTaskTitle = `Approval workflow smoke ${smokeRunId}`
 const hermesApprovalTaskTitle = `Hermes approval smoke ${smokeRunId}`
 const hermesTaskTitle = `Hermes dashboard refresh ${smokeRunId}`
@@ -387,9 +389,14 @@ async function runProjectWorkspaceWorkflow() {
     fail('project task context did not render an authorized picker', { projectSendText })
   }
   await page.goto(`${baseUrl}/flights?project_id=project-mupot`, { waitUntil: 'networkidle', timeout: 20_000 })
-  const projectFlightsText = await textSnippet(page.locator('body'), 3000)
-  if (!projectFlightsText.includes('Flights attributed to Mupot') || !projectFlightsText.includes('Run local browser smoke')) {
-    fail('project flight context did not render filtered flights', { projectFlightsText })
+  const projectFlightCrumbs = (await page.locator('#fd-deck p.crumbs').textContent())?.trim()
+  const projectFlightRows = await page.locator('#fd-board').getByText('Run local browser smoke', { exact: true }).count()
+  if (projectFlightCrumbs !== 'Projects / Mupot / Flights' || projectFlightRows !== 1) {
+    fail('project flight context did not render filtered flights', {
+      projectFlightCrumbs,
+      projectFlightRows,
+      projectFlightsText: await textSnippet(page.locator('body'), 3000),
+    })
   }
 
   await page.goto(`${baseUrl}/projects/new`, { waitUntil: 'networkidle', timeout: 20_000 })
@@ -600,6 +607,8 @@ async function runSendTaskWorkflow() {
     '',
     'Verify the browser harness can create a task, preserve done_when, and render a visible result.',
   ].join('\n'))
+  await page.locator('#send-done').fill(sendTaskDoneWhen)
+  await page.locator('#send-gate').fill(sendTaskGateOwner)
   // Flight-008 Slice 3 (mupot#1062): the /send dispatch-now picker is a radio-card
   // group (name="send-agent"), not a <select> — the browser can no longer supply
   // an implicit "first option" default, so the smoke workflow must explicitly
@@ -624,7 +633,13 @@ async function runSendTaskWorkflow() {
   if (submittedTask.project_id !== 'project-mupot') {
     fail('send smoke task lost project context', { submittedTask })
   }
-  if (typeof created?.task?.done_when !== 'string' || created.task.done_when.length === 0) {
+  if (submittedTask.done_when !== sendTaskDoneWhen) {
+    fail('send smoke request changed the exact done_when', { submittedTask })
+  }
+  if (submittedTask.gate_owner !== sendTaskGateOwner) {
+    fail('send smoke request changed the independent gate owner', { submittedTask })
+  }
+  if (created?.task?.done_when !== sendTaskDoneWhen) {
     fail('send task create did not preserve done_when', { created })
   }
 

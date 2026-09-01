@@ -1,15 +1,15 @@
 // tests/enterprise-sso.test.ts — Unit tests for Enterprise Google & SAML SSO & Domain Auto-Enrollment (Flight 11).
 
-import { describe, expect, it, vi, beforeEach } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   isDomainAllowed,
   autoEnrollSsoMember,
   type SsoConfig,
 } from '../src/auth/sso'
 import { ssoApp } from '../src/auth/sso-routes'
-import { createSqliteD1 } from './helpers/sqlite-d1'
-import { applyAllMigrations } from './helpers/migrations'
 import type { Env } from '../src/types'
+import { applyAllMigrations } from './helpers/migrations'
+import { createSqliteD1 } from './helpers/sqlite-d1'
 
 describe('Enterprise Google & SAML SSO & Domain Auto-Enrollment (Flight 11)', () => {
   let harness: ReturnType<typeof createSqliteD1>
@@ -19,7 +19,6 @@ describe('Enterprise Google & SAML SSO & Domain Auto-Enrollment (Flight 11)', ()
     harness = createSqliteD1()
     applyAllMigrations(harness.sqlite)
   })
-
   it('validates allowed corporate domains correctly', () => {
     const config: SsoConfig = {
       enabled: true,
@@ -36,16 +35,14 @@ describe('Enterprise Google & SAML SSO & Domain Auto-Enrollment (Flight 11)', ()
 
   it('auto-enrolls new member from allowed domain and emits BusEvent', async () => {
     const mockBusSend = vi.fn().mockResolvedValue(undefined)
-
-    // Seed SSO config into org_settings table
-    const ssoConfig = JSON.stringify({
+    await harness.db.prepare(
+      `INSERT INTO org_settings (key, value, updated_at)
+       VALUES ('sso_config', ?1, CURRENT_TIMESTAMP)`,
+    ).bind(JSON.stringify({
       enabled: true,
       allowed_domains: ['gaf.com'],
       default_role: 'member',
-    })
-    await harness.db.prepare(
-      `INSERT INTO org_settings (key, value, updated_at) VALUES ('sso_config', ?1, CURRENT_TIMESTAMP)`,
-    ).bind(ssoConfig).run()
+    })).run()
 
     const env = {
       TENANT_SLUG: 'gaf',
@@ -64,22 +61,22 @@ describe('Enterprise Google & SAML SSO & Domain Auto-Enrollment (Flight 11)', ()
     expect(result.email).toBe('engineer@gaf.com')
     expect(result.role).toBe('member')
     expect(mockBusSend).toHaveBeenCalledTimes(1)
-
-    // Verify member exists in real D1 table
-    const member = await harness.db.prepare('SELECT email, status FROM members WHERE email = ?1').bind('engineer@gaf.com').first<{ email: string; status: string }>()
-    expect(member?.email).toBe('engineer@gaf.com')
-    expect(member?.status).toBe('active')
+    const stored = await harness.db.prepare(
+      'SELECT email, status FROM members WHERE email = ?1',
+    ).bind('engineer@gaf.com').first<{ email: string; status: string }>()
+    expect(stored).toMatchObject({ email: 'engineer@gaf.com', status: 'active' })
+    const grant = await harness.db.prepare(
+      `SELECT capability FROM capabilities
+        WHERE member_id = ?1 AND scope_type = 'org' AND scope_id IS NULL`,
+    ).bind(result.memberId).first<{ capability: string }>()
+    expect(grant?.capability).toBe('member')
   })
 
   it('blocks auto-enrollment for unauthorized domains', async () => {
-    const ssoConfig = JSON.stringify({
-      enabled: true,
-      allowed_domains: ['gaf.com'],
-    })
     await harness.db.prepare(
-      `INSERT INTO org_settings (key, value, updated_at) VALUES ('sso_config', ?1, CURRENT_TIMESTAMP)`,
-    ).bind(ssoConfig).run()
-
+      `INSERT INTO org_settings (key, value, updated_at)
+       VALUES ('sso_config', ?1, CURRENT_TIMESTAMP)`,
+    ).bind(JSON.stringify({ enabled: true, allowed_domains: ['gaf.com'] })).run()
     const env = {
       TENANT_SLUG: 'gaf',
       BUS: { send: vi.fn() },
@@ -96,14 +93,10 @@ describe('Enterprise Google & SAML SSO & Domain Auto-Enrollment (Flight 11)', ()
   })
 
   it('serves SSO REST endpoints: GET /config, POST /validate, and POST /enroll', async () => {
-    const ssoConfig = JSON.stringify({
-      enabled: true,
-      allowed_domains: ['gaf.com'],
-    })
     await harness.db.prepare(
-      `INSERT INTO org_settings (key, value, updated_at) VALUES ('sso_config', ?1, CURRENT_TIMESTAMP)`,
-    ).bind(ssoConfig).run()
-
+      `INSERT INTO org_settings (key, value, updated_at)
+       VALUES ('sso_config', ?1, CURRENT_TIMESTAMP)`,
+    ).bind(JSON.stringify({ enabled: true, allowed_domains: ['gaf.com'] })).run()
     const env = {
       TENANT_SLUG: 'gaf',
       BUS: { send: vi.fn().mockResolvedValue(undefined) },
@@ -111,22 +104,23 @@ describe('Enterprise Google & SAML SSO & Domain Auto-Enrollment (Flight 11)', ()
     } as unknown as Env
 
     // 1. GET /config
-    const reqConfig = new Request('http://localhost/config')
-    const resConfig = await ssoApp.fetch(reqConfig, env as any)
-    expect(resConfig.status).toBe(200)
-    const jsonConfig = await resConfig.json<{ ok: boolean; config: SsoConfig }>()
-    expect(jsonConfig.ok).toBe(true)
-    expect(jsonConfig.config.allowed_domains).toContain('gaf.com')
+    const getReq = new Request('http://localhost/config')
+    const getRes = await ssoApp.fetch(getReq, env)
+    expect(getRes.status).toBe(200)
+    const getJson = await getRes.json<{ ok: boolean; config: SsoConfig }>()
+    expect(getJson.ok).toBe(true)
+    expect(getJson.config.allowed_domains).toContain('gaf.com')
 
     // 2. POST /validate
-    const reqValidate = new Request('http://localhost/validate', {
+    const valReq = new Request('http://localhost/validate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ email: 'user@gaf.com' }),
     })
-    const resValidate = await ssoApp.fetch(reqValidate, env as any)
-    expect(resValidate.status).toBe(200)
-    const jsonValidate = await resValidate.json<{ ok: boolean; allowed: boolean }>()
-    expect(jsonValidate.allowed).toBe(true)
+    const valRes = await ssoApp.fetch(valReq, env)
+    expect(valRes.status).toBe(200)
+    const valJson = await valRes.json<{ ok: boolean; allowed: boolean }>()
+    expect(valJson.ok).toBe(true)
+    expect(valJson.allowed).toBe(true)
   })
 })

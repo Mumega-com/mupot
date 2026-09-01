@@ -58,7 +58,6 @@ import { alertsApp } from './alerts/routes'
 import { ccSpendApp } from './economy/cc-spend'
 import { resellerApp } from './reseller/routes'
 import { potsApp, publicPotsApp } from './pots/routes'
-import { a2aApp } from './a2a/gateway'
 import { pricingPageHtml } from './dashboard/pricing'
 import { inboxApp } from './agents/inbox-routes'
 import { coordinationApp } from './coordination/routes'
@@ -74,7 +73,7 @@ import { attentionApp } from './attention/routes'
 import { platformApp } from './platform/routes'
 import { maybeHandleHostnameDispatch } from './platform/dispatcher'
 import { supabaseWebhookApp } from './connectors/supabase-webhook'
-import { routerRoutesApp } from './router/scheduled'
+import { routerApp } from './router/routes'
 
 // Durable Object classes — implemented in src/agents/.
 export { AgentDO } from './agents/agent-do'
@@ -90,8 +89,6 @@ export { McpOAuthApiHandler }
 export const app = new Hono<{ Bindings: Env }>()
 
 app.get('/health', (c) => c.json(publicHealth(c.env.TENANT_SLUG, c.env.RELEASE_SHA)))
-
-app.route('/', a2aApp)
 
 app.route(ROUTES.auth, authApp)
 app.route('/api/auth/sso', ssoApp)
@@ -138,6 +135,7 @@ app.route('/api/pots', publicPotsApp)
 app.route('/api/alerts', alertsApp)
 app.route('/api/prospects', prospectsApp)
 app.route('/api/loops', loopsApp)
+app.route('/api/router', routerApp)
 // Flock check-in (Flock #45): agents POST presence with their member-token (bearer).
 // Inbound only — the pot needs no egress. Mounted before the dashboard '/' catch-all.
 app.route('/api/fleet', fleetCheckinApp)
@@ -215,9 +213,6 @@ app.route('/api/project-links', projectLinkApp)
 // daemon. Member-bearer auth, self-scoped for the mutating tools (MCP only — this
 // route is read-only). Before the dashboard '/' catch-all.
 app.route('/api/presence', presenceApp)
-
-// Active Router trigger API (FLIGHT-ROUTER-CRON)
-app.route('/api/router', routerRoutesApp)
 
 // ── OAuth 2.1 authorize leg (C3) ─────────────────────────────────────────────
 // /authorize, /oauth/google-callback, and /oauth/consent must be mounted BEFORE
@@ -338,18 +333,13 @@ function reportUnmatchedCron(scheduledAt: Date): void {
 export default {
   fetch: async (req: Request, env: Env, ctx: ExecutionContext) => {
     // ── Cloudflare Workers for Platforms (WFP) Sovereign Tenant Routing ──
-    // Routes `<tenant>.mupot.mumega.com` or `mupot.mumega.com/<tenant>/...`
-    // to the isolated User Worker in `mupot-pots`.
+    // Routes `<tenant>.mupot.mumega.com` to the isolated User Worker in `mupot-pots`.
     if (env.DISPATCHER) {
       const url = new URL(req.url)
-      const headerSlug =
-        req.headers.get('x-mupot-tenant-slug') ||
-        req.headers.get('x-pot-tenant') ||
-        req.headers.get('x-mupot-tenant')
+      const headerSlug = req.headers.get('x-mupot-tenant-slug') || req.headers.get('x-pot-tenant')
       const rootHost = env.PUBLIC_ORIGIN ? new URL(env.PUBLIC_ORIGIN).hostname : undefined
-      const { resolveTenantRouting } = await import('./dispatcher')
-      const routing = resolveTenantRouting(url, rootHost, headerSlug)
-      const tenantSlug = routing.tenantSlug
+      const { extractTenantSlug } = await import('./dispatcher')
+      const tenantSlug = extractTenantSlug(url.hostname, rootHost, headerSlug)
 
       if (tenantSlug && tenantSlug !== (env.TENANT_SLUG || 'mumega') && tenantSlug !== 'mupot' && tenantSlug !== 'mumega') {
         const dispatcher = (await import('./dispatcher')).default
@@ -440,8 +430,6 @@ export default {
     //     flight_reap_receipts table (migration 0109) to exist, or every reap
     //     would transition a flight with no audit trail.
     const { sweepStalledFlights } = await import('./flight/watchdog')
-    // 13. Active Router background sweep (FLIGHT-ROUTER-CRON) — match unassigned tasks to live continuum bodies.
-    const { runScheduledRouterSweep } = await import('./router/scheduled')
     const maintenance: ReadonlyArray<readonly [string, () => Promise<unknown>]> = [
       ['membership', () => reconcileMembership(env)],
       ['metabolism', () => runMetabolism(env)],
@@ -455,7 +443,6 @@ export default {
       ['agent-connection-retention', () => sweepAgentConnectionRetention(env)],
       ['token-expiry-warning', () => sweepExpiringTokensWarning(env)],
       ['flight-watchdog', () => sweepStalledFlights(env)],
-      ['router-sweep', () => runScheduledRouterSweep(env, scheduledAt)],
     ]
     const heartbeat = maintenance[maintenanceSlot(scheduledAt.getUTCMinutes(), maintenance.length)]
     if (heartbeat) waitFor(heartbeat[0], heartbeat[1]())

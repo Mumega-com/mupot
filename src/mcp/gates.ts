@@ -27,9 +27,9 @@ function grantedBy(auth: AuthContext): string | null {
 
 const toolGrantGateCapability: ToolSpec = {
   name: 'grant_gate_capability',
-  scope: 'org (org-admin grants gate:<owner> or action:<name> authority to a principal)',
+  scope: 'org (org-admin grants gate:<owner> verdict authority to a principal)',
   min: 'admin',
-  args: '{ capability: string (gate:<owner>|action:<name>), principal_type: "member"|"agent", principal_id: string }',
+  args: '{ capability: string (gate:<owner>), principal_type: "member"|"agent", principal_id: string }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -70,9 +70,9 @@ const toolGrantGateCapability: ToolSpec = {
 
 const toolRevokeGateCapability: ToolSpec = {
   name: 'revoke_gate_capability',
-  scope: 'org (org-admin revokes a gate:<owner> or action:<name> grant)',
+  scope: 'org (org-admin revokes a gate:<owner> grant)',
   min: 'admin',
-  args: '{ capability: string (gate:<owner>|action:<name>), principal_type: "member"|"agent", principal_id: string }',
+  args: '{ capability: string (gate:<owner>), principal_type: "member"|"agent", principal_id: string }',
   inputSchema: {
     type: 'object',
     properties: {

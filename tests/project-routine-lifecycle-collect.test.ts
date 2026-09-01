@@ -483,7 +483,7 @@ describe('project routine lifecycle collector', () => {
       external_action_executed: false,
       external_action_approved: false,
     })
-  }, 45_000)
+  })
 
   it('rejects a routine envelope whose Situation digest does not match the project read', async () => {
     const mismatched = {

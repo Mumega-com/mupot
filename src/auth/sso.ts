@@ -102,41 +102,46 @@ export async function autoEnrollSsoMember(
 
   // Check if member already exists
   const existing = await env.DB.prepare(`
-    SELECT id, status FROM members
-     WHERE tenant = ?1 AND lower(email) = ?2
+    SELECT m.id, m.status,
+           EXISTS (
+             SELECT 1 FROM capabilities c
+              WHERE c.member_id = m.id
+                AND c.scope_type = 'org'
+                AND c.scope_id IS NULL
+                AND c.capability IN ('owner', 'admin')
+           ) AS is_admin
+      FROM members m
+     WHERE m.tenant = ?1 AND lower(m.email) = ?2
      LIMIT 1
   `)
     .bind(env.TENANT_SLUG, email)
-    .first<{ id: string; status: string }>()
+    .first<{ id: string; status: string; is_admin: number }>()
 
   if (existing) {
+    const role = existing.is_admin === 1 ? 'admin' : 'member'
     if (existing.status !== 'active') {
-      return { ok: false, email, role: 'member', isNew: false, error: 'member_suspended' }
+      return { ok: false, email, role, isNew: false, error: 'member_suspended' }
     }
-    return { ok: true, memberId: existing.id, email, role: 'member', isNew: false }
+    return { ok: true, memberId: existing.id, email, role, isNew: false }
   }
 
   // Provision new member
   const memberId = crypto.randomUUID()
   const role = config.default_role || 'member'
-  const displayName = profile.name || email.split('@')[0] || 'SSO User'
+  const nowIso = new Date().toISOString()
 
-  await env.DB.prepare(`
-    INSERT INTO members (
-      id, tenant, email, display_name, status, created_at
-    ) VALUES (?1, ?2, ?3, ?4, 'active', CURRENT_TIMESTAMP)
-  `)
-    .bind(memberId, env.TENANT_SLUG, email, displayName)
-    .run()
-
-  // Grant org capability if admin/member
-  await env.DB.prepare(`
-    INSERT INTO capabilities (
-      id, member_id, scope_type, scope_id, capability, created_at
-    ) VALUES (?1, ?2, 'org', NULL, ?3, CURRENT_TIMESTAMP)
-  `)
-    .bind(crypto.randomUUID(), memberId, role)
-    .run()
+  await env.DB.batch([
+    env.DB.prepare(`
+      INSERT INTO members (
+        id, tenant, email, display_name, telegram_chat_id, status, created_at
+      ) VALUES (?1, ?2, ?3, ?4, NULL, 'active', ?5)
+    `).bind(memberId, env.TENANT_SLUG, email, profile.name?.trim() || email, nowIso),
+    env.DB.prepare(`
+      INSERT INTO capabilities (
+        id, member_id, scope_type, scope_id, capability, created_at
+      ) VALUES (?1, ?2, 'org', NULL, ?3, ?4)
+    `).bind(crypto.randomUUID(), memberId, role, nowIso),
+  ])
 
   await bus.emit({
     type: 'member.auto_enrolled',

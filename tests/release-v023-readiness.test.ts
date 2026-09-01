@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import { MUPOT_PUBLIC_API_VERSION } from '../src/version'
+import { REQUIRED_RECEIPTS } from '../scripts/release-readiness-receipt.mjs'
 
 const read = (path: string) => readFileSync(new URL(path, import.meta.url), 'utf8')
 
@@ -15,6 +16,13 @@ const workflow = read('../.github/workflows/ci.yml')
 const runbook = read('../docs/production-runbook.md')
 
 describe('v0.23.0 Trusted Runtime release gate', () => {
+  it('keeps the historical SOS cutover receipt as the v0.23 default', () => {
+    expect(REQUIRED_RECEIPTS).toContainEqual(expect.objectContaining({
+      file: 'host-go/cutover-gate.json',
+      receipt_type: 'mupot-sos-cutover-gate/v1',
+    }))
+  })
+
   it('is the named current release target across top-level docs', () => {
     for (const doc of [releaseDoc, roadmap, controlRoadmap, readme]) {
       expect(doc).toContain('v0.23.0')
@@ -99,21 +107,24 @@ describe('v0.23.0 Trusted Runtime release gate', () => {
     }
   })
 
-  it('publishes final stable metadata while retaining the RC evidence boundary', () => {
-    // Current cut is v0.29.0 (Release Truth); v0.23.0 history is retained permanently
-    // below. The roadmap pin is DERIVED from the live constant on purpose: a hardcoded
-    // version here goes stale silently at the next cut, which is exactly how the roadmap
-    // came to advertise v0.25.0 stable while the constants already read 0.29.0 (#805/#806).
+  it('distinguishes current source metadata from the tagged stable release', () => {
+    // The source version and stable tag are separate facts. Derive the current source
+    // value from the live constant, but require the roadmap to label it as source and
+    // candidate truth rather than claiming an untagged version is already cut/stable.
     expect(pkg.version).toBe(MUPOT_PUBLIC_API_VERSION)
     expect(publicApiVersion).toContain(`MUPOT_PUBLIC_API_VERSION = '${MUPOT_PUBLIC_API_VERSION}'`)
     expect(changelog).toContain('## [0.25.0] — 2026-07-27')
     expect(changelog).toContain('## [0.24.0] — 2026-07-19')
     expect(changelog).toContain('## [0.23.0] — 2026-07-13')
     expect(changelog).toContain('## [0.23.0-rc.1] — 2026-07-10')
-    expect(roadmap).toContain(`Cut version | \`v${MUPOT_PUBLIC_API_VERSION}\``)
+    expect(roadmap).toContain(`Current source version | \`${MUPOT_PUBLIC_API_VERSION}\``)
+    expect(roadmap).toContain(`Next stable candidate | \`v${MUPOT_PUBLIC_API_VERSION}\``)
     expect(roadmap).toContain('Last tagged release | `v0.25.0`')
-    // Plan number, not derivable from any constant — moves only by deliberate renumber.
-    expect(roadmap).toContain('Console consolidation (project-centered nav) | `v0.30.0`')
+    // Stabilization deliberately removed broad product scope from the v0.30 contract.
+    // A later roadmap change must assign a new target before implementation resumes.
+    expect(roadmap).toContain(
+      'Console consolidation (project-centered nav) | `preview; post-v0.30 target required`',
+    )
     expect(releaseDoc).toContain('The RC uses its own package/API version and prerelease evidence, never the final tag.')
   })
 
