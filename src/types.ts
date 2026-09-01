@@ -535,6 +535,34 @@ export interface AuthContext {
    */
   consentedByMemberId?: string | null
   tokenId?: string | null // exact live member_tokens row used for this request; server-derived only
+  /**
+   * The current web_sessions.id_hash for this dashboard login, when this
+   * session was registered in the D1 session registry at mint time (i.e. its
+   * login resolved to a real members row — src/auth/index.ts
+   * registerWebSession). Undefined for every non-dashboard channel and for a
+   * dashboard login that never bridged to a members row (documented Delivery
+   * Sequence step-1 gap). Server-derived only — never accept this from a
+   * caller; it exists so a request can name "my own current session" (e.g.
+   * for GET /auth/sessions' is_current flag, or a future step-up gate)
+   * without trusting anything the client supplies.
+   */
+  webSessionIdHash?: string | null
+  /**
+   * The member_id that OWNS the current web_sessions row named by
+   * webSessionIdHash — set directly from that D1 row, independent of
+   * `memberId` above. Deliberately a SEPARATE field: `memberId` (and
+   * `capabilities`) are gated to role === 'member' ONLY by the email→member
+   * bridge in loadAuthFromCookie, to avoid ever DEFINING `capabilities` for
+   * a legacy owner/admin login (which would disable the
+   * `capabilities === undefined` legacy-role escape in requireCapability —
+   * see that bridge's own invariant comment). registerWebSession has no such
+   * restriction — it registers a D1 session for ANY login whose email
+   * matches a members row, regardless of legacy role — so "which member owns
+   * my own current session" (used by GET/POST /auth/sessions*) must be read
+   * from here, never from `memberId`, or an owner/admin's own sessions
+   * become unlistable/unrevocable through those routes.
+   */
+  webSessionMemberId?: string
 }
 
 // ── Members & capabilities — humans are first-class network nodes ──
