@@ -658,6 +658,7 @@ export async function dispatchRoutineRun(
       progressBeatsWaste: true, cacheStaysWarm: true,
     },
     reasons: [],
+    evidence: 'self-reported',
   })
 
   await logSubagentTokenUsage(env.DB, {

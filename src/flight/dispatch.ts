@@ -40,6 +40,7 @@ export interface DispatchResult {
   status: 'running' | 'held'
   reasons: string[]
   score: number
+  evidence: 'self-reported'
   clearance?: ClearanceResult
 }
 
@@ -75,6 +76,7 @@ export async function dispatchFlight(
         score: preflight.score,
         checks: preflight.checks,
         reasons: [...preflight.reasons, 'flight_clearance_hold', ...clearanceReasonTags(clearance as ClearanceResult)],
+        evidence: 'self-reported',
       }
 
   const id = await createFlight(env, flight, { id: extra.id })
@@ -85,6 +87,7 @@ export async function dispatchFlight(
     status: status as 'running' | 'held',
     reasons: combined.reasons,
     score: combined.score,
+    evidence: combined.evidence,
     clearance,
   }
 }

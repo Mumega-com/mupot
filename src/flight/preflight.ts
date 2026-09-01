@@ -43,6 +43,11 @@ export interface PreflightResult {
   score: number // 0..1 readiness score (admission to launch — NOT the brain's C(t))
   checks: PreflightChecks
   reasons: string[] // why NO-GO (empty when go)
+  // Every FlightSignals field is supplied by the caller. Nothing in this module
+  // reads live cache TTL, tool reachability, or spend. A dispatcher that wants
+  // GO can declare stepSeconds=180 and clear cache_would_cool. Until a signal is
+  // measured by the pot, the verdict is self-reported — never evidence.
+  evidence: 'self-reported'
 }
 
 const clamp01 = (x: number): number => (x < 0 ? 0 : x > 1 ? 1 : x)
@@ -92,5 +97,5 @@ export function preflightCheck(s: FlightSignals, opts: PreflightOptions = {}): P
   if (!checks.cacheStaysWarm) reasons.push('cache_would_cool')
   if (score < scoreThreshold) reasons.push('low_readiness')
 
-  return { go: reasons.length === 0, score, checks, reasons }
+  return { go: reasons.length === 0, score, checks, reasons, evidence: 'self-reported' }
 }

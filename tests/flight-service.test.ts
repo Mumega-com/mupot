@@ -95,8 +95,8 @@ function makeEnv(tenant = 'digid'): { env: Env; rows: Map<string, FlightRow> } {
   return { env, rows }
 }
 
-const GO: PreflightResult = { go: true, score: 0.82, checks: {} as never, reasons: [] }
-const NOGO: PreflightResult = { go: false, score: 0.2, checks: {} as never, reasons: ['would_wander', 'cache_would_cool'] }
+const GO: PreflightResult = { go: true, score: 0.82, checks: {} as never, reasons: [], evidence: 'self-reported' }
+const NOGO: PreflightResult = { go: false, score: 0.2, checks: {} as never, reasons: ['would_wander', 'cache_would_cool'], evidence: 'self-reported' }
 
 describe('createFlight', () => {
   it('creates a flight in preflight', async () => {

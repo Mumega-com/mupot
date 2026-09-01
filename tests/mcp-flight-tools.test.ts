@@ -667,6 +667,45 @@ describe('MCP flight tools', () => {
   // flight that enforcement would have allowed. Dara's FLIGHT-06 saw 4000000,
   // 400000 and 1 fail identically — the amount was never the variable.
 
+  it('does not return flight_budget_policy_missing for an unset executor cap (pre-#1179 AND-gate is gone)', async () => {
+    // Issue #1148 described: ANY unset budget_cap_cents among executor+squads
+    // returned 409 flight_budget_policy_missing before the requested amount was
+    // compared. Prod (PR #1179) reports budget_uncapped and still creates the
+    // flight. This test is RED under the old AND-gate and GREEN under current.
+    const { env } = makeEnv('active', false, [
+      { id: DELEGATE_AGENT_ID, squad_id: SQUAD_ID, status: 'active', budget_cap_cents: null },
+    ])
+    const leadAuth = auth({
+      capabilities: [{ member_id: MEMBER_ID, scope_type: 'squad', scope_id: SQUAD_ID, capability: 'lead' }],
+    })
+    const result = await invokeTool(leadAuth, env, 'flight_dispatch', {
+      ...dispatchArgs,
+      executor_agent_id: DELEGATE_AGENT_ID,
+      budget_micro_usd: 500_000,
+    }, 'https://pot.example')
+
+    expect(result.ok, JSON.stringify(result)).toBe(true)
+    expect((result as { error?: string }).error).not.toBe('flight_budget_policy_missing')
+    expect((result as { result: { flight?: { id?: string }; budget_uncapped: unknown[] } }).result.flight?.id)
+      .toBeTruthy()
+  })
+
+  it('preflight GO carries evidence=self-reported — caller-asserted, not measured', async () => {
+    const { env } = makeEnv()
+    const leadAuth = auth({
+      capabilities: [{ member_id: MEMBER_ID, scope_type: 'squad', scope_id: SQUAD_ID, capability: 'lead' }],
+    })
+    const result = await invokeTool(leadAuth, env, 'flight_dispatch', {
+      ...dispatchArgs,
+      budget_micro_usd: 500_000,
+      signals_json: JSON.stringify({ ...signals, stepSeconds: 180 }),
+    }, 'https://pot.example')
+    expect(result.ok, JSON.stringify(result)).toBe(true)
+    const preflight = (result as { result: { preflight: { go: boolean; evidence: string } } }).result.preflight
+    expect(preflight.go).toBe(true)
+    expect(preflight.evidence).toBe('self-reported')
+  })
+
   it('dispatches when the executor agent has no cap, and reports it as uncapped', async () => {
     const { env } = makeEnv('active', false, [
       { id: DELEGATE_AGENT_ID, squad_id: SQUAD_ID, status: 'active', budget_cap_cents: null },

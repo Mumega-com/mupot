@@ -648,7 +648,7 @@ describe('flight project attribution', () => {
        WHERE project_id = 'project-a' AND squad_id = 'squad-a'
     `)
 
-    await applyPreflight(env, landedId, { go: true, score: 1, checks: {} as never, reasons: [] })
+    await applyPreflight(env, landedId, { go: true, score: 1, checks: {} as never, reasons: [], evidence: 'self-reported' })
     await landFlight(env, landedId, { cost_micro_usd: 25, score: 1 })
     await failFlight(env, failedId, 'settled failure')
 

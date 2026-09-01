@@ -296,6 +296,19 @@ export interface ConsentableAgent {
   capabilities: CapabilityGrant[]
 }
 
+export type ConsentIneligibleReason = 'unminted' | 'no_capability_on_squad' | 'retired'
+
+export interface IneligibleAgent {
+  id: string
+  slug: string
+  name: string
+  squad_id: string
+  squad_name: string
+  status: string
+  reason: ConsentIneligibleReason
+  remedy: string
+}
+
 interface ConsentAgentRow {
   id: string
   slug: string
@@ -506,6 +519,58 @@ export async function listConsentableAgents(env: Env, memberId: string): Promise
   return out
 }
 
+const INELIGIBLE_REMEDY: Record<ConsentIneligibleReason, string> = {
+  unminted:
+    'An admin on this agent\'s home squad must run mint_agent_token for it, then sign in again.',
+  no_capability_on_squad:
+    'You need admin on this agent\'s home squad (the same bar as mint_agent_token). Ask an admin to grant it, or choose an agent on a squad you already admin.',
+  retired:
+    'This agent is not active. An admin must reactivate it before it can be bound.',
+}
+
+/** Agents that exist but cannot be bound from this session, WITH a reason.
+ *  mupot#1162: fail closed on authority (they stay unselectable), never on
+ *  information (omitting them made unminted look like nonexistent). Rule 2
+ *  (must already be minted) and rule 3 (human admin on home squad) are
+ *  unchanged — this list is not a consent door. */
+export async function listIneligibleAgents(env: Env, memberId: string): Promise<IneligibleAgent[]> {
+  const humanGrants = await resolveCapabilities(env, memberId)
+  const rows = await env.DB.prepare(
+    `SELECT a.id AS id, a.slug AS slug, a.name AS name, a.squad_id AS squad_id,
+            sq.name AS squad_name, a.status AS status,
+            CASE WHEN b.agent_id IS NULL THEN 0 ELSE 1 END AS minted
+       FROM agents a
+       JOIN squads sq ON sq.id = a.squad_id
+       LEFT JOIN agent_member_bindings b
+         ON b.tenant = ?1 AND b.agent_id = a.id
+      ORDER BY sq.name ASC, a.name ASC`,
+  ).bind(env.TENANT_SLUG).all<ConsentAgentRow & { status: string; minted: number }>()
+
+  const out: IneligibleAgent[] = []
+  for (const row of rows.results ?? []) {
+    const minted = Number(row.minted) === 1
+    const active = row.status === 'active'
+    const adminOnSquad = await canOnSquad(env, humanGrants, row.squad_id, 'admin')
+    if (active && minted && adminOnSquad) continue
+    const reason: ConsentIneligibleReason = !active
+      ? 'retired'
+      : !minted
+        ? 'unminted'
+        : 'no_capability_on_squad'
+    out.push({
+      id: row.id,
+      slug: row.slug,
+      name: row.name,
+      squad_id: row.squad_id,
+      squad_name: row.squad_name,
+      status: row.status,
+      reason,
+      remedy: INELIGIBLE_REMEDY[reason],
+    })
+  }
+  return out
+}
+
 export interface ConsentableSquad {
   id: string
   name: string
@@ -593,6 +658,7 @@ function renderConsentPage(
   // when we actually know it. Defaults true so existing callers are unchanged.
   agentsListed = true,
   squads: ConsentableSquad[] = [],
+  ineligible: IneligibleAgent[] = [],
 ): Response {
   const rows = agents.map((a) => `
         <label class="agent-option">
@@ -633,6 +699,20 @@ function renderConsentPage(
           </div>
         </label>` : ''
 
+  const ineligibleRows = ineligible.map((a) => `
+        <div class="ineligible-row" data-agent-id="${escapeHtml(a.id)}" data-reason="${escapeHtml(a.reason)}">
+          <div class="agent-title"><strong>${escapeHtml(a.name)}</strong> <code>${escapeHtml(a.slug)}</code></div>
+          <div class="agent-meta">squad: ${escapeHtml(a.squad_name)} &middot; ${escapeHtml(a.reason)}</div>
+          <div class="agent-caps">${escapeHtml(a.remedy)}</div>
+        </div>`).join('\n')
+
+  const ineligibleSection = ineligible.length > 0 ? `
+<section class="ineligible">
+  <h2>Not selectable</h2>
+  <p>These agents exist. They cannot be bound from this session. Authority is unchanged.</p>
+${ineligibleRows}
+</section>` : ''
+
   const html = `<!doctype html>
 <html>
 <head>
@@ -646,6 +726,9 @@ function renderConsentPage(
   .agent-caps { font-family: monospace; }
   .empty-hint { font-size: 0.85rem; color: #444; background: #f5f5f5; border-radius: 8px; padding: 0.75rem; }
   .empty-hint code { font-family: monospace; }
+  .ineligible { margin-top: 1.5rem; }
+  .ineligible h2 { font-size: 1rem; }
+  .ineligible-row { border: 1px dashed #999; border-radius: 8px; padding: 0.75rem; margin: 0.5rem 0; background: #fafafa; }
   fieldset { border: none; padding: 0; }
   .actions { margin-top: 1.5rem; display: flex; gap: 0.75rem; }
   button { padding: 0.5rem 1rem; font-size: 1rem; }
@@ -673,6 +756,7 @@ ${mintNewOption}
     <button type="submit" name="action" value="decline">Decline</button>
   </div>
 </form>
+${ineligibleSection}
 </body>
 </html>`
 
@@ -1143,7 +1227,17 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       squads = []
     }
 
-    const page = renderConsentPage(consentNonce, googleUser.email, agents, agentsListed, squads)
+    let ineligible: IneligibleAgent[] = []
+    if (agentsListed) {
+      try {
+        ineligible = await listIneligibleAgents(env, memberId)
+      } catch (err) {
+        console.error('[oauth-authorize] listIneligibleAgents failed:', redactSecretPatterns(err instanceof Error ? err.message : String(err)))
+        ineligible = []
+      }
+    }
+
+    const page = renderConsentPage(consentNonce, googleUser.email, agents, agentsListed, squads, ineligible)
     // B3-style: bind the consent nonce to this browser. Clears the earlier
     // google-callback CSRF cookie (its job is done) and sets the consent one,
     // scoped to the /oauth/consent path only.

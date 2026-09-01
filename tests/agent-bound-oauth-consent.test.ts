@@ -32,6 +32,7 @@ import {
   handleOAuthAuthorize,
   listConsentableAgents,
   listConsentableSquads,
+  listIneligibleAgents,
   memberMayConsentToAgent,
 } from '../src/mcp/oauth-authorize'
 import { invokeTool, mcpApp } from '../src/mcp/index'
@@ -227,6 +228,22 @@ describe('A. selection rule — a human may consent to agent A iff active + boun
     const list = await listConsentableAgents(env, 'member-nobody')
     expect(list).toEqual([])
     expect(await memberMayConsentToAgent(env, 'member-nobody', AGENT_A.id)).toBe(false)
+  })
+
+  it('listIneligibleAgents names unminted / no_capability / retired and never includes the selectable agent', async () => {
+    const env = envFor(harness)
+    const ineligible = await listIneligibleAgents(env, HUMAN)
+    const byId = Object.fromEntries(ineligible.map((a) => [a.id, a]))
+    expect(byId[AGENT_A.id]).toBeUndefined()
+    expect(byId[AGENT_B.id]?.reason).toBe('no_capability_on_squad')
+    expect(byId[AGENT_C.id]?.reason).toBe('unminted')
+    expect(byId[AGENT_D.id]?.reason).toBe('retired')
+    expect(byId[AGENT_E.id]?.reason).toBe('no_capability_on_squad')
+    expect(byId[AGENT_C.id]?.remedy).toMatch(/mint_agent_token/)
+    // Authority unchanged: ineligible agents still cannot be consented to.
+    expect(await memberMayConsentToAgent(env, HUMAN, AGENT_C.id)).toBe(false)
+    expect(await memberMayConsentToAgent(env, HUMAN, AGENT_B.id)).toBe(false)
+    expect(await memberMayConsentToAgent(env, HUMAN, AGENT_D.id)).toBe(false)
   })
 
   it('memberMayConsentToAgent: false — a binding for this agent exists ONLY in a DIFFERENT tenant (resolveAgentForConsent\'s `b.tenant = ?2` join, adversarial review 2026-08-10 — untested before this)', async () => {
@@ -603,11 +620,26 @@ describe('C1. GET /oauth/google-callback renders the consent screen', () => {
     expect(oauthProvider.completeAuthorization).not.toHaveBeenCalled()
   })
 
-  it('does NOT show an agent the human has no squad access to', async () => {
+  it('does not offer an agent the human has no squad access to as selectable', async () => {
     const oauthProvider = stubOAuthProvider()
     const { env } = httpEnv(harness, oauthProvider)
     const { html } = await reachConsentScreen(env, oauthProvider, 'human@example.test')
-    expect(html).not.toContain(AGENT_B.slug)
+    expect(html).not.toMatch(/name="agent_id" value="agent-b"/)
+    expect(html).toContain(`data-agent-id="${AGENT_B.id}"`)
+    expect(html).toContain('data-reason="no_capability_on_squad"')
+  })
+
+  it('lists unminted and retired agents as ineligible, never as radios', async () => {
+    const oauthProvider = stubOAuthProvider()
+    const { env } = httpEnv(harness, oauthProvider)
+    const { html } = await reachConsentScreen(env, oauthProvider, 'human@example.test')
+    expect(html).not.toMatch(/name="agent_id" value="agent-c"/)
+    expect(html).not.toMatch(/name="agent_id" value="agent-d"/)
+    expect(html).toContain(`data-agent-id="${AGENT_C.id}"`)
+    expect(html).toContain('data-reason="unminted"')
+    expect(html).toContain(`data-agent-id="${AGENT_D.id}"`)
+    expect(html).toContain('data-reason="retired"')
+    expect(html).toContain('mint_agent_token')
   })
 
   it('always offers "continue unbound" as an explicit option', async () => {
@@ -1084,7 +1116,9 @@ describe('D0. P0-3 — the weld floor is admin, not member', () => {
     const oauthProvider = stubOAuthProvider()
     const { env } = httpEnv(harness, oauthProvider)
     const { consentCookie, html } = await reachConsentScreen(env, oauthProvider, 'human@example.test')
-    expect(html).not.toContain(AGENT_A.slug)
+    expect(html).not.toMatch(/name="agent_id" value="agent-a"/)
+    expect(html).toContain(`data-agent-id="${AGENT_A.id}"`)
+    expect(html).toContain('data-reason="no_capability_on_squad"')
     const before = harness.sqlite.prepare('SELECT COUNT(*) AS n FROM member_tokens').all()[0] as { n: number }
 
     const form = new URLSearchParams({ consent_nonce: consentCookie, action: 'continue', agent_id: AGENT_A.id })

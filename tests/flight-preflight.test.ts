@@ -44,6 +44,14 @@ describe('preflightCheck — GO', () => {
     expect(r.checks.contextComplete).toBe(true)
     expect(r.checks.progressBeatsWaste).toBe(true)
     expect(r.checks.cacheStaysWarm).toBe(true)
+    expect(r.evidence).toBe('self-reported')
+  })
+
+  it('GO is still labelled self-reported when the caller declares a short stepSeconds', () => {
+    const r = preflightCheck({ ...HEALTHY, stepSeconds: 180 })
+    expect(r.go).toBe(true)
+    expect(r.checks.cacheStaysWarm).toBe(true)
+    expect(r.evidence).toBe('self-reported')
   })
 })
 
