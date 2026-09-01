@@ -321,8 +321,11 @@ export type DecideElevationResult =
 
 /** resolveScopeDepartmentId — squads inherit a department grant (mirrors
  *  hasCapability's own department→squad inheritance); org/department scope
- *  need no lookup. */
-async function resolveScopeDepartmentId(
+ *  need no lookup. Exported (step 4, authorization convergence) so a tool
+ *  wiring hasElevatedAction against a squad-scoped action can supply the
+ *  same squadDepartmentId this module uses internally, without a second,
+ *  possibly-drifting copy of the squads.department_id lookup. */
+export async function resolveScopeDepartmentId(
   env: Env,
   scopeType: CapabilityScopeType,
   scopeId: string,
@@ -589,7 +592,18 @@ export interface ElevationUsageLogRow {
   occurred_at: string
 }
 
-async function recordElevationUsage(
+/** recordElevationUsage — exported (step 4) so a tool that must record a
+ *  SECOND, post-effect usage entry (e.g. mint_agent_token recording the
+ *  actual minted token id once it exists, which the pre-mint authorization
+ *  log entry cannot yet contain) can reuse the exact same write path rather
+ *  than a second hand-rolled INSERT. Rule (step-4 task): "if the log write
+ *  fails, the action must fail" — this function does NOT swallow write
+ *  failures (only a missing-table error, same narrow-cast as every other
+ *  reader/writer in this module); a caller that awaits this after a
+ *  sensitive effect has already committed must let a thrown error surface
+ *  as a failed tool result rather than silently reporting success with an
+ *  incomplete audit trail. */
+export async function recordElevationUsage(
   env: Env,
   tenant: string,
   grantId: string,
@@ -772,6 +786,107 @@ export async function hasElevatedAction(
   }
 
   return { granted: true, grant: match }
+}
+
+// ── bound-agent collapse gate (step 4, authorization convergence) ──────────
+//
+// Several operator-gated tools (mint_agent_token, grant_agent_capability, …)
+// refuse EVERY bound-agent caller with one uniform 403 BEFORE resolving
+// anything about the request's target (design Security Invariant: "wrong
+// tenant: not found, never a cross-tenant existence oracle" — the same
+// asymmetry protects a stranger from using a sensitive tool's error shape to
+// probe whether an agent/squad exists). Once a live elevation grant can
+// substitute for that operator floor, the collapse must still hold for a
+// bound session that holds ZERO live grants for the action in question — it
+// must get the exact same unconditional refusal, with nothing about the
+// call's arguments resolved. A session that DOES hold some live grant for
+// the action is no longer a stranger to it (a human already vetted this
+// exact agent session for this exact action) and may proceed to a
+// scope-specific hasElevatedAction check, exactly as a standing-capability
+// admin who lacks capability on THIS particular squad already does today.
+//
+// This is therefore a CHEAP EXISTENCE PROBE, not an authorization decision:
+// it does not re-check approver authority/session liveness (hasElevatedAction
+// does that once a caller has a specific scope to check) and it NEVER logs
+// usage — a probe that may return false must never appear in
+// elevation_usage_log as though something happened.
+/** Shared by both probes below: the caller's own live agent_sessions row, or
+ *  null for anything that is not a live bound-agent session. */
+async function loadLiveSessionForBoundAgent(
+  env: Env,
+  auth: AuthContext,
+  nowMs: number,
+): Promise<Awaited<ReturnType<typeof loadLiveAgentSessionByCredential>>> {
+  if (!auth.boundAgentId) return null
+  const sessionCtx = resolveAgentSessionContext(auth)
+  if (!sessionCtx.ok) return null
+  const liveSession = await loadLiveAgentSessionByCredential(
+    env,
+    auth.tenant,
+    sessionCtx.context.authKind,
+    sessionCtx.context.credentialId,
+  )
+  if (!liveSession) return null
+  if (!evaluateAgentSession(liveSession, nowMs).ok) return null
+  return liveSession
+}
+
+export async function boundAgentHasAnyLiveGrantForAction(
+  env: Env,
+  auth: AuthContext,
+  action: string,
+  nowMs: number = Date.now(),
+): Promise<boolean> {
+  const liveSession = await loadLiveSessionForBoundAgent(env, auth, nowMs)
+  if (!liveSession) return false
+  const grants = await loadLiveElevationGrantsForSession(env, auth.tenant, liveSession.id, nowMs)
+  return grants.some((g) => g.action === action)
+}
+
+/**
+ * boundAgentHasAnyLiveElevationGrant — the ACTION-AGNOSTIC sibling, used
+ * ONLY by the MCP dispatcher's AAGATE capability floor (src/mcp/index.ts
+ * invokeTool) as a narrowly tool-named allowlist bypass (step 4). AAGATE
+ * rejects a caller BEFORE a tool's handler ever runs when the caller holds
+ * no standing capability at `spec.min` on ANY scope — which means a
+ * bound-agent session with ZERO standing capability never reaches a
+ * handler's own precise hasElevatedAction check at all, no matter what it
+ * is elevated for. This probe answers only "does this live session hold
+ * SOME live elevation grant, for any action" — exactly as scope/action
+ * -agnostic as the floor's own holdsCapabilityFloor — so a caller who
+ * legitimately holds elevation for the WRONG action still reaches the
+ * handler and gets a precise, auditable refusal there (hasElevatedAction),
+ * rather than being turned away by the floor with no chance to explain
+ * itself. It grants nothing by itself and never logs usage.
+ */
+export async function boundAgentHasAnyLiveElevationGrant(
+  env: Env,
+  auth: AuthContext,
+  nowMs: number = Date.now(),
+): Promise<boolean> {
+  const liveSession = await loadLiveSessionForBoundAgent(env, auth, nowMs)
+  if (!liveSession) return false
+  const grants = await loadLiveElevationGrantsForSession(env, auth.tenant, liveSession.id, nowMs)
+  return grants.length > 0
+}
+
+/** elevationRemedyMessage — a refusal must name the remedy (step-4 task rule
+ *  "FAIL CLOSED, EXPLAIN OPENLY"). One canonical human-readable string per
+ *  HasElevatedActionResult deny reason, reused by every wired tool so the
+ *  wording cannot drift per call site. */
+const ELEVATION_DENY_REMEDY: Record<ElevatedActionDenyReason, string> = {
+  not_agent_session: 'elevation applies only to an authenticated bound agent session; a human/operator principal cannot use it to grant itself anything',
+  no_live_session: 'this agent session is not currently live — check_in or re-authenticate, then request a fresh elevation',
+  session_revoked: 'this agent session was revoked — any elevation bound to it ended the instant rotation/revocation completed',
+  session_expired_idle: 'this agent session expired from inactivity — re-authenticate and request a fresh elevation',
+  session_expired_absolute: 'this agent session reached its absolute lifetime — re-authenticate and request a fresh elevation',
+  no_matching_grant: 'no live elevation grant covers this action and scope for this exact session — ask an org/department/squad admin to approve request_elevation for it',
+  approver_authority_lost: 'the human who approved this grant no longer holds the required capability on this scope — ask a current admin to approve a fresh elevation',
+  approver_session_ended: 'the human who approved this grant is no longer signed in — ask a current admin to approve a fresh elevation',
+}
+
+export function elevationRemedyMessage(reason: ElevatedActionDenyReason): string {
+  return ELEVATION_DENY_REMEDY[reason]
 }
 
 export type { CapabilityScopeType, AgentAuthKind }

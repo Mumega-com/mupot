@@ -51,6 +51,7 @@ import {
   loadElevationRequestById,
   loadLiveElevationGrantsForSession,
   evaluateElevationGrant,
+  boundAgentHasAnyLiveElevationGrant,
 } from '../auth/elevation'
 import { ALL_ELEVATION_ACTION_KEYS, ELEVATION_ACTIONS, ELEVATION_DURATION_PRESETS_MINUTES } from '../auth/elevation-actions'
 import { createBus } from '../bus'
@@ -4761,6 +4762,19 @@ function validateArgs(schema: JsonSchema, args: Record<string, unknown>): string
   return null
 }
 
+// Step 4 (mumega-com#1173, "authorization convergence") — the EXPLICIT,
+// reviewed set of tools whose AAGATE floor rejection a live session-bound
+// elevation grant may bypass. Adding a tool here does NOT authorize
+// anything by itself; the tool's own handler still performs the real,
+// scope-precise hasElevatedAction check (and every other tool not listed
+// here is completely unaffected — see invokeTool's AAGATE block). Keep this
+// list and the tool's in-handler wiring in sync: a name here with no
+// matching elevation branch in the handler is a silent floor hole; a
+// handler wired for elevation with no name here can never be reached by an
+// elevated bound agent (dead code, caught in review by mumega-com#1173's
+// own adversarial pass on this exact branch).
+const ELEVATION_FLOOR_BYPASS_TOOLS: ReadonlySet<string> = new Set(['mint_agent_token', 'grant_agent_capability'])
+
 export async function invokeTool(
   auth: AuthContext,
   env: Env,
@@ -4801,7 +4815,30 @@ export async function invokeTool(
   // its precise per-scope check (the floor is scope-agnostic — see capability.ts).
   // Check authz FIRST so unauthorized callers get 403 regardless of body validity.
   if (spec.min !== 'authenticated' && !hasWorkspaceAdmin(auth) && !holdsCapabilityFloor(auth, spec.min)) {
-    return { ...fail(403, 'forbidden', { need: spec.min }), tool: spec.name }
+    // Elevation-floor bypass (step 4, mumega-com#1173 "authorization
+    // convergence") — a small, EXPLICIT, tool-NAMED allowlist. For every
+    // tool not in this set, and for every caller that is not a bound agent,
+    // this branch is skipped entirely and the floor behaves byte-for-byte as
+    // it did before this step: same rejection, same message, no added D1
+    // read. Only a bound-agent session holding at least one LIVE elevation
+    // grant (for ANY action — this probe is exactly as scope/action-agnostic
+    // as holdsCapabilityFloor itself, which also only checks "min on ANY
+    // scope") gets ONE chance past the floor. It does not grant anything:
+    // each listed tool's own handler re-derives the PRECISE action+scope
+    // match via hasElevatedAction and refuses on its own, with a named
+    // remedy, if the live grant does not actually cover what it asked for.
+    // A caller with zero live elevation grants at all gets the exact same
+    // `forbidden {need: spec.min}` the floor has always returned — the
+    // pre-elevation collapse that stops a stranger from learning anything
+    // about a sensitive tool's target is therefore preserved AT THE FLOOR,
+    // before schema validation even runs.
+    const mayBeElevated =
+      auth.boundAgentId != null &&
+      ELEVATION_FLOOR_BYPASS_TOOLS.has(spec.name) &&
+      (await boundAgentHasAnyLiveElevationGrant(env, auth))
+    if (!mayBeElevated) {
+      return { ...fail(403, 'forbidden', { need: spec.min }), tool: spec.name }
+    }
   }
 
   const schemaError = validateArgs(spec.inputSchema, args)

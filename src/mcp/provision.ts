@@ -97,6 +97,14 @@ import {
   str,
   memberCanOnSquad,
 } from './index'
+import {
+  hasElevatedAction,
+  boundAgentHasAnyLiveGrantForAction,
+  resolveScopeDepartmentId as resolveElevationSquadDepartmentId,
+  elevationRemedyMessage,
+  recordElevationUsage,
+  type ElevationGrantRecord,
+} from '../auth/elevation'
 
 const STRING_SCHEMA = { type: 'string' }
 const OPTIONAL_NUMBER_SCHEMA = { type: 'number' }
@@ -539,7 +547,23 @@ const toolMintAgentToken: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args, _ctx) {
-    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
+    // Elevation collapse gate (step 4, mumega-com#1173 "authorization
+    // convergence"): a bound-agent session holding ZERO live elevation
+    // grants for action:mint_token gets the EXACT SAME unconditional
+    // operator_principal_required refusal as before this step, at the exact
+    // same point — before `agent` or any other arg is even read. That is the
+    // collapse that stops a stranger from using this tool's error shape to
+    // probe agent existence (Security Invariant: "wrong tenant: not found,
+    // never a cross-tenant existence oracle" — same asymmetry). A session
+    // that DOES hold some live grant for this action is no longer a
+    // stranger to it — a human already vetted this exact session for this
+    // exact action — so it proceeds to a scope-specific check below, once
+    // the target agent (and therefore its squad) is known.
+    let mayBeElevated = false
+    if (auth.boundAgentId) {
+      mayBeElevated = await boundAgentHasAnyLiveGrantForAction(env, auth, 'action:mint_token')
+      if (!mayBeElevated) return fail(403, 'operator_principal_required')
+    }
     const agentRef = str(args.agent)
     if (!agentRef) return fail(400, 'invalid_args', 'agent required')
 
@@ -548,7 +572,9 @@ const toolMintAgentToken: ToolSpec = {
     // Rotation is an org credential-authority act. This server-derived gate is
     // deliberately before agent resolution and every token/handoff lookup so a
     // scoped admin receives one uniform denial for existing, missing, and
-    // ambiguous targets.
+    // ambiguous targets. Elevation does NOT substitute here — action:mint_token
+    // authorizes ordinary minting only; revoking the prior credential mid-batch
+    // is a heavier org-trust act this step deliberately leaves standing-admin-only.
     if (replacementSupplied && !isOrgAdmin(auth)) {
       return fail(403, 'forbidden', { need: 'admin', scope: 'org' })
     }
@@ -563,8 +589,24 @@ const toolMintAgentToken: ToolSpec = {
     // Gate: admin on the agent's squad (org/department admin inherit). Minting a
     // credential that IS an agent is an org-trust act → admin, never lead/member.
     const grants = auth.capabilities ?? []
+    let elevatedGrant: ElevationGrantRecord | null = null
     if (!(await memberCanOnSquad(env, grants, agent.squad_id, 'admin'))) {
-      return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
+      if (!mayBeElevated) return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
+      const squadDepartmentId = await resolveElevationSquadDepartmentId(env, 'squad', agent.squad_id)
+      const elevated = await hasElevatedAction(env, auth, 'action:mint_token', 'squad', agent.squad_id, {
+        squadDepartmentId,
+        toolName: 'mint_agent_token',
+        detail: { agent_id: agent.id, squad_id: agent.squad_id, rotation: Boolean(rotatePriorTokenId) },
+      })
+      if (!elevated.granted) {
+        return fail(403, 'forbidden', {
+          need: 'admin',
+          scope: 'squad',
+          elevation_denied: elevated.reason,
+          remedy: elevationRemedyMessage(elevated.reason),
+        })
+      }
+      elevatedGrant = elevated.grant
     }
 
     // Cap the label length (parity with the HTTP mint path, members/index.ts) — a
@@ -758,6 +800,28 @@ const toolMintAgentToken: ToolSpec = {
       agent_id: agent.id,
       reason: expiresAt ? `expires_at:${expiresAt}` : 'non_expiring:immortal',
     })
+
+    // action:mint_token's effect is classified 'revocable_if_recorded'
+    // (elevation-actions.ts): the minted token is revocable via
+    // revoke_agent_token ONLY if the usage log names its id — the
+    // authorization-time log entry written inside hasElevatedAction above
+    // could not yet contain it (the token did not exist then). This SECOND,
+    // itemized entry closes that gap. It is deliberately NOT wrapped in
+    // try/catch: a failure here must fail the tool call even though the
+    // mint already committed, rather than report success with an elevation
+    // usage trail that cannot name what was minted.
+    if (elevatedGrant) {
+      await recordElevationUsage(
+        env,
+        auth.tenant,
+        elevatedGrant.id,
+        elevatedGrant.agent_session_id,
+        'action:mint_token',
+        'mint_agent_token',
+        { minted_token_id: minted.tokenId, agent_id: agent.id, squad_id: agent.squad_id },
+        Date.now(),
+      )
+    }
 
     // SECURITY (mupot#987): the raw token NEVER appears in this tool result. Every
     // MCP client that persists a conversation (all of them) writes the tool result
@@ -1222,7 +1286,15 @@ const toolGrantAgentCapability: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
+    // Elevation collapse gate — see the identical pattern + rationale on
+    // mint_agent_token above (step 4, mumega-com#1173). A bound-agent
+    // session with ZERO live grants for action:manage_access gets the exact
+    // same unconditional refusal, before any arg is resolved.
+    let mayBeElevated = false
+    if (auth.boundAgentId) {
+      mayBeElevated = await boundAgentHasAnyLiveGrantForAction(env, auth, 'action:manage_access')
+      if (!mayBeElevated) return fail(403, 'operator_principal_required')
+    }
     const agentRef = str(args.agent)
     if (!agentRef) return fail(400, 'invalid_args', 'agent required')
     const squadRef = str(args.squad)
@@ -1242,10 +1314,34 @@ const toolGrantAgentCapability: ToolSpec = {
     const squad = squadResult.value
 
     const grants = auth.capabilities ?? []
+    let elevatedGrant: ElevationGrantRecord | null = null
     if (!(await memberCanOnSquad(env, grants, squad.id, 'admin'))) {
-      return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
+      if (!mayBeElevated) return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
+      const squadDepartmentId = await resolveElevationSquadDepartmentId(env, 'squad', squad.id)
+      const elevated = await hasElevatedAction(env, auth, 'action:manage_access', 'squad', squad.id, {
+        squadDepartmentId,
+        toolName: 'grant_agent_capability',
+        detail: { agent_id: agent.id, squad_id: squad.id, capability },
+      })
+      if (!elevated.granted) {
+        return fail(403, 'forbidden', {
+          need: 'admin',
+          scope: 'squad',
+          elevation_denied: elevated.reason,
+          remedy: elevationRemedyMessage(elevated.reason),
+        })
+      }
+      elevatedGrant = elevated.grant
     }
-    if (!callerCanGrantAgentCapability(grants, squad, capability)) {
+    // callerCanGrantAgentCapability enforces a rank ceiling against the
+    // caller's STANDING grants — meaningless for an elevated caller, whose
+    // `grants` may be empty. It is not skipped arbitrarily: hasElevatedAction
+    // above already re-derived that the APPROVING human currently holds
+    // 'admin' on this exact squad (or its department/org), and 'admin' is
+    // already the maximum value GRANTABLE_AGENT_CAPABILITIES allows (never
+    // 'owner') — so the ceiling the standing check exists to enforce is
+    // structurally already satisfied whenever elevatedGrant is set.
+    if (!elevatedGrant && !callerCanGrantAgentCapability(grants, squad, capability)) {
       return fail(403, 'cannot_grant_above_own_rank')
     }
 
