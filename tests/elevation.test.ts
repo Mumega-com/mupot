@@ -114,8 +114,7 @@ describe('elevation ledger (D1, real migration chain)', () => {
     )
   }
 
-  async function seedApproverWebSession(nowMs: number) {
-    const raw = 'raw-admin-session'
+  async function seedApproverWebSession(nowMs: number, raw = 'raw-admin-session') {
     const record = await createWebSession(env, raw, { tenant: TENANT, memberId: ADMIN_MEMBER, loginIdentityId: 'identity-admin' }, nowMs)
     return record
   }
@@ -444,7 +443,7 @@ describe('elevation ledger (D1, real migration chain)', () => {
 
   // ── enforcement: hasElevatedAction ──────────────────────────────────────
 
-  async function approveManageAccess(nowMs: number, agentSessionId: string, durationMinutes = 60) {
+  async function approveManageAccess(nowMs: number, agentSessionId: string, durationMinutes = 60, approverRaw = 'raw-admin-session') {
     const created = await createElevationRequest(
       env,
       {
@@ -454,7 +453,7 @@ describe('elevation ledger (D1, real migration chain)', () => {
       nowMs,
     )
     if (!created.ok) throw new Error('setup failed')
-    const approverSession = await seedApproverWebSession(nowMs)
+    const approverSession = await seedApproverWebSession(nowMs, approverRaw)
     const decision = await decideElevationRequest(
       env,
       {
@@ -699,5 +698,217 @@ describe('elevation ledger (D1, real migration chain)', () => {
     expect(await listActiveElevationGrants(env, TENANT, t0)).toHaveLength(1)
     await revokeElevationGrant(env, TENANT, grant.id, 'human_revoke', t0)
     expect(await listActiveElevationGrants(env, TENANT, t0)).toHaveLength(0)
+  })
+
+  // ── P0 FIX REGRESSION (2026-09-01, kasra/session-elevation-p0-fix) ──────
+  // Real local e2e (wrangler dev + curl) found: elevation_grants carried
+  // UNIQUE(agent_session_id, action, scope_type, scope_id), and rows are
+  // NEVER deleted (revoke/expiry only stamp revoked_at/let expires_at
+  // lapse, kept for audit) — so approving a SECOND, entirely legitimate
+  // elevation for the same tuple crashed with a raw D1_ERROR UNIQUE
+  // constraint violation (bare 500 to the human), AND the request's status
+  // flip to 'approved' happened in a SEPARATE statement before the grant
+  // INSERT, so the crash left the request permanently stuck at
+  // status='approved' with zero grant rows (status='pending' is required to
+  // re-decide — bricked). Fixed by dropping the table constraint
+  // (migrations/0142_elevation_ledger.sql) and enforcing "at most one LIVE
+  // grant per tuple" inside decideElevationRequest's own single `.batch()`
+  // transaction (src/auth/elevation.ts).
+  describe('P0 fix: re-elevation after revoke/expiry, live-grant uniqueness, and decision atomicity', () => {
+    async function countLiveGrantsForTuple(agentSessionId: string, action: string, nowMs: number): Promise<number> {
+      const row = await env.DB.prepare(
+        `SELECT COUNT(*) AS n FROM elevation_grants
+          WHERE tenant = ?1 AND agent_session_id = ?2 AND action = ?3 AND scope_type = 'squad' AND scope_id = ?4
+            AND revoked_at IS NULL AND expires_at > ?5`,
+      )
+        .bind(TENANT, agentSessionId, action, SQUAD, new Date(nowMs).toISOString())
+        .first<{ n: number }>()
+      return Number(row?.n ?? 0)
+    }
+
+    it('re-elevating the SAME tuple after the first grant is REVOKED succeeds, and the revoked row survives untouched', async () => {
+      const t0 = Date.now()
+      const session = await seedAgentSession(t0)
+      const { grant: first } = await approveManageAccess(t0, session.id, 60)
+      expect((await hasElevatedAction(env, agentAuth(), 'action:manage_access', 'squad', SQUAD, { nowMs: t0, recordUsage: false })).granted).toBe(true)
+
+      const { revoked } = await revokeElevationGrant(env, TENANT, first.id, 'human_revoke', t0 + 1000)
+      expect(revoked).toBe(true)
+
+      // Re-request + re-approve the IDENTICAL tuple (session, action, scope).
+      const { grant: second } = await approveManageAccess(t0 + 2000, session.id, 60, 'raw-admin-session-2')
+      expect(second.id).not.toBe(first.id)
+      expect((await hasElevatedAction(env, agentAuth(), 'action:manage_access', 'squad', SQUAD, { nowMs: t0 + 3000, recordUsage: false })).granted).toBe(true)
+
+      // The dead row survives, with revoked_at still set — audit is never
+      // deleted or overwritten.
+      const firstRow = await env.DB.prepare(`SELECT * FROM elevation_grants WHERE id = ?1`).bind(first.id).first<{
+        id: string
+        revoked_at: string | null
+        revoke_reason: string | null
+        action: string
+      }>()
+      expect(firstRow).not.toBeNull()
+      expect(firstRow?.revoked_at).not.toBeNull()
+      expect(firstRow?.revoke_reason).toBe('human_revoke')
+      expect(firstRow?.action).toBe('action:manage_access')
+
+      // Exactly one LIVE row for the tuple now (the second grant).
+      expect(await countLiveGrantsForTuple(session.id, 'action:manage_access', t0 + 3000)).toBe(1)
+    })
+
+    it('re-elevating the SAME tuple after the first grant EXPIRES succeeds, and the expired row survives untouched', async () => {
+      const t0 = Date.parse('2026-09-01T00:00:00.000Z')
+      const session = await seedAgentSession(t0)
+      // 15-minute grant — let it lapse by moving the explicit clock forward.
+      // Every function here takes nowMs as an injected parameter (house
+      // rule, see module header) — nothing reads Date.now() internally, so
+      // this pins the clock deterministically rather than sleeping.
+      const { grant: first } = await approveManageAccess(t0, session.id, 15)
+      const tExpired = t0 + 16 * 60 * 1000 // 16 minutes later — past the 15-minute grant
+      expect((await hasElevatedAction(env, agentAuth(), 'action:manage_access', 'squad', SQUAD, { nowMs: tExpired, recordUsage: false })).granted).toBe(false)
+
+      // Re-request + re-approve the IDENTICAL tuple at the later clock time.
+      const { grant: second } = await approveManageAccess(tExpired, session.id, 60, 'raw-admin-session-2')
+      expect(second.id).not.toBe(first.id)
+      expect(
+        (await hasElevatedAction(env, agentAuth(), 'action:manage_access', 'squad', SQUAD, { nowMs: tExpired + 1000, recordUsage: false })).granted,
+      ).toBe(true)
+
+      // The dead (expired, never revoked) row survives untouched.
+      const firstRow = await env.DB.prepare(`SELECT * FROM elevation_grants WHERE id = ?1`).bind(first.id).first<{
+        id: string
+        revoked_at: string | null
+        expires_at: string
+        action: string
+      }>()
+      expect(firstRow).not.toBeNull()
+      expect(firstRow?.revoked_at).toBeNull() // never revoked — only expired
+      expect(Date.parse(firstRow?.expires_at ?? '')).toBeLessThanOrEqual(tExpired)
+      expect(firstRow?.action).toBe('action:manage_access')
+
+      expect(await countLiveGrantsForTuple(session.id, 'action:manage_access', tExpired + 1000)).toBe(1)
+    })
+
+    it('two simultaneously-live grants for the identical tuple remain impossible: a second pending request for the same tuple is refused while the first grant is still live', async () => {
+      const t0 = Date.now()
+      const session = await seedAgentSession(t0)
+      const { grant: first } = await approveManageAccess(t0, session.id, 60)
+      expect((await hasElevatedAction(env, agentAuth(), 'action:manage_access', 'squad', SQUAD, { nowMs: t0, recordUsage: false })).granted).toBe(true)
+
+      // A SECOND, independent request for the exact same tuple, while the
+      // first grant is still live (not revoked, not expired).
+      const secondRequest = await createElevationRequest(
+        env,
+        {
+          tenant: TENANT, agentSessionId: session.id, agentId: AGENT_ID, memberId: AGENT_MEMBER,
+          actions: ['action:manage_access'], scopeType: 'squad', scopeId: SQUAD, durationMinutes: 60, reason: 'need it again',
+        },
+        t0 + 1000,
+      )
+      if (!secondRequest.ok) throw new Error('setup failed')
+      const approverSession = await seedApproverWebSession(t0 + 1000, 'raw-admin-session-2')
+
+      const decision = await decideElevationRequest(
+        env,
+        {
+          tenant: TENANT, requestId: secondRequest.request.id, decision: 'approve',
+          selectedActions: ['action:manage_access'],
+          decidedByMemberId: ADMIN_MEMBER, decidedByCapabilities: capabilities,
+          decidedByWebSessionHash: approverSession.id_hash, recentReauthOk: true,
+        },
+        t0 + 1000,
+      )
+      // Never a bare 500 / unhandled exception — a clean, typed refusal.
+      expect(decision.ok).toBe(false)
+      if (!decision.ok) {
+        expect(decision.reason).toBe('live_grant_conflict')
+        if (decision.reason === 'live_grant_conflict') {
+          expect(decision.detail).toContain('action:manage_access')
+        }
+      }
+
+      // Still exactly ONE live grant for the tuple (the first one) — no
+      // duplicate live grant was ever created.
+      expect(await countLiveGrantsForTuple(session.id, 'action:manage_access', t0 + 1000)).toBe(1)
+      const liveRows = await env.DB.prepare(
+        `SELECT id FROM elevation_grants
+          WHERE tenant = ?1 AND agent_session_id = ?2 AND action = 'action:manage_access'
+            AND scope_type = 'squad' AND scope_id = ?3 AND revoked_at IS NULL AND expires_at > ?4`,
+      )
+        .bind(TENANT, session.id, SQUAD, new Date(t0 + 1000).toISOString())
+        .all<{ id: string }>()
+      expect(liveRows.results?.map((r) => r.id)).toEqual([first.id])
+    })
+
+    it('a failed decision (blocked by the live-grant guard) leaves the request status = "pending" with ZERO grant rows for it — never stranded at "approved"', async () => {
+      const t0 = Date.now()
+      const session = await seedAgentSession(t0)
+      await approveManageAccess(t0, session.id, 60) // live grant already occupies the tuple
+
+      const secondRequest = await createElevationRequest(
+        env,
+        {
+          tenant: TENANT, agentSessionId: session.id, agentId: AGENT_ID, memberId: AGENT_MEMBER,
+          actions: ['action:manage_access'], scopeType: 'squad', scopeId: SQUAD, durationMinutes: 60, reason: 'need it again',
+        },
+        t0 + 1000,
+      )
+      if (!secondRequest.ok) throw new Error('setup failed')
+      const approverSession = await seedApproverWebSession(t0 + 1000, 'raw-admin-session-2')
+
+      const decision = await decideElevationRequest(
+        env,
+        {
+          tenant: TENANT, requestId: secondRequest.request.id, decision: 'approve',
+          selectedActions: ['action:manage_access'],
+          decidedByMemberId: ADMIN_MEMBER, decidedByCapabilities: capabilities,
+          decidedByWebSessionHash: approverSession.id_hash, recentReauthOk: true,
+        },
+        t0 + 1000,
+      )
+      expect(decision.ok).toBe(false)
+
+      // Assert DIRECTLY against the DB — not against the function's return
+      // value — that the second request is still 'pending' (re-decidable)
+      // and has NO grant rows, i.e. the old P0 (stuck at 'approved' with
+      // zero grants) cannot recur.
+      const reloadedRow = await env.DB.prepare(`SELECT status, decided_at FROM elevation_requests WHERE id = ?1`)
+        .bind(secondRequest.request.id)
+        .first<{ status: string; decided_at: string | null }>()
+      expect(reloadedRow?.status).toBe('pending')
+      expect(reloadedRow?.decided_at).toBeNull()
+
+      const grantRowsForSecondRequest = await env.DB.prepare(`SELECT COUNT(*) AS n FROM elevation_grants WHERE elevation_request_id = ?1`)
+        .bind(secondRequest.request.id)
+        .first<{ n: number }>()
+      expect(Number(grantRowsForSecondRequest?.n ?? 0)).toBe(0)
+
+      // And it IS still re-decidable: revoke the blocking grant, then
+      // re-approve the SAME (previously stuck) request and confirm it goes
+      // through.
+      const liveBlocker = await env.DB.prepare(
+        `SELECT id FROM elevation_grants
+          WHERE tenant = ?1 AND agent_session_id = ?2 AND action = 'action:manage_access'
+            AND revoked_at IS NULL AND expires_at > ?3`,
+      )
+        .bind(TENANT, session.id, new Date(t0 + 1000).toISOString())
+        .first<{ id: string }>()
+      if (!liveBlocker) throw new Error('setup failed: expected a live blocking grant')
+      await revokeElevationGrant(env, TENANT, liveBlocker.id, 'human_revoke', t0 + 2000)
+
+      const retried = await decideElevationRequest(
+        env,
+        {
+          tenant: TENANT, requestId: secondRequest.request.id, decision: 'approve',
+          selectedActions: ['action:manage_access'],
+          decidedByMemberId: ADMIN_MEMBER, decidedByCapabilities: capabilities,
+          decidedByWebSessionHash: approverSession.id_hash, recentReauthOk: true,
+        },
+        t0 + 3000,
+      )
+      expect(retried.ok).toBe(true)
+      if (retried.ok) expect(retried.request.status).toBe('approved')
+    })
   })
 })

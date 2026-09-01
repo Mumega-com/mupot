@@ -101,8 +101,11 @@ CREATE TABLE IF NOT EXISTS elevation_grants (
   created_at                    TEXT NOT NULL,
   expires_at                    TEXT NOT NULL,
   revoked_at                    TEXT,
-  revoke_reason                 TEXT,
-  UNIQUE(agent_session_id, action, scope_type, scope_id)
+  revoke_reason                 TEXT
+  -- NO UNIQUE(agent_session_id, action, scope_type, scope_id) here — see the
+  -- "P0 FIX" comment below idx_elevation_grants_request for why, and
+  -- src/auth/elevation.ts's decideElevationRequest for the app-level
+  -- enforcement that replaces it.
 );
 
 CREATE INDEX IF NOT EXISTS idx_elevation_grants_live
@@ -113,6 +116,32 @@ CREATE INDEX IF NOT EXISTS idx_elevation_grants_request
 
 CREATE INDEX IF NOT EXISTS idx_elevation_grants_approver
   ON elevation_grants(tenant, approved_by_web_session_hash);
+
+-- P0 FIX (2026-09-01, mupot task f5fe1222 e2e run, kasra/session-elevation-
+-- p0-fix): elevation_grants originally carried
+-- UNIQUE(agent_session_id, action, scope_type, scope_id). Rows here are
+-- NEVER deleted (see table comment above — revoke sets revoked_at, expiry
+-- lets expires_at lapse, both kept for audit), so that constraint collided
+-- with a DEAD (revoked/expired) row forever: approving a SECOND, entirely
+-- legitimate elevation for the same tuple (an agent's access expired or was
+-- revoked, and it later re-requests the exact same permission — a normal
+-- lifecycle event, not an edge case) crashed with a raw D1_ERROR UNIQUE
+-- constraint violation, surfaced to the approving human as a bare 500. A
+-- PARTIAL unique index (`WHERE revoked_at IS NULL`) would fix the revoke
+-- case but not expiry — SQLite partial indexes can't express a
+-- runtime-relative predicate like `expires_at > now()`. So the constraint
+-- is DROPPED entirely (this migration has never been applied to any real
+-- database — see this file's own header — so it is edited in place rather
+-- than stacked as a follow-up migration patching something live). "At most
+-- one LIVE grant per tuple" is instead enforced in application code, inside
+-- decideElevationRequest's own atomic write (src/auth/elevation.ts) — the
+-- status flip and every grant INSERT are one `.batch()` transaction, each
+-- statement guarded by the SAME "no unrevoked, unexpired grant already
+-- exists for this tuple" NOT EXISTS clause, so a genuine conflict leaves
+-- BOTH the flip and every insert as no-ops (request stays 'pending',
+-- re-decidable) rather than a partial write.
+CREATE INDEX IF NOT EXISTS idx_elevation_grants_tuple
+  ON elevation_grants(tenant, agent_session_id, action, scope_type, scope_id, revoked_at, expires_at);
 
 -- Itemised usage: one row per action actually taken under a grant. Queryable
 -- after the grant expires or is revoked — an elevation that leaves no trace

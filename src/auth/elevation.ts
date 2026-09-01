@@ -318,6 +318,13 @@ export type DecideElevationResult =
   | { ok: false; reason: 'invalid_elevation_request'; detail: string }
   | { ok: false; reason: 'forbidden'; need: 'admin'; scope: { type: CapabilityScopeType; id: string } }
   | { ok: false; reason: 'reauth_required' }
+  /** A live (unrevoked, unexpired) grant already exists for one of the
+   *  selected actions on this EXACT (agent_session_id, scope_type, scope_id)
+   *  tuple. The request is left untouched at 'pending' — re-decidable once
+   *  the conflicting grant is revoked or lapses. See migrations/0142's
+   *  comment on elevation_grants for why this is an app-level check inside
+   *  decideElevationRequest's own atomic write, not a table constraint. */
+  | { ok: false; reason: 'live_grant_conflict'; detail: string }
 
 /** resolveScopeDepartmentId — squads inherit a department grant (mirrors
  *  hasCapability's own department→squad inheritance); org/department scope
@@ -341,14 +348,34 @@ export async function resolveScopeDepartmentId(
  * decideElevationRequest — THE single-decision transaction. Security
  * Invariant 6 ("Approval is single-decision and atomic. Concurrent
  * Allow/Deny or double-Allow yields one terminal decision and one grant
- * set."): the status flip is one guarded UPDATE (`WHERE status = 'pending'`)
- * — SQLite serializes it, so at most one concurrent caller ever observes
- * `changes === 1`; every other concurrent/later caller sees 0 and returns
- * 'already_decided' WITHOUT inserting any grant. The grant-row insert is
- * one `.batch()` call, which is all-or-nothing (assertBatchWritten) — a
- * mid-batch D1 failure leaves the request 'approved' with zero grants
- * rather than a PARTIAL grant set (a detectable data-integrity gap, never a
- * silent extra authority).
+ * set."): the status flip and every grant INSERT are ONE `.batch()` call
+ * (a real transaction — BEGIN IMMEDIATE...COMMIT/ROLLBACK, see
+ * tests/helpers/sqlite-d1.ts) so they land together or not at all. A
+ * mid-batch D1 failure therefore CANNOT leave the request stuck at
+ * 'approved' with zero grants (the P0 this replaced: the flip used to be a
+ * separate statement executed BEFORE the grant insert).
+ *
+ * The flip UPDATE and every grant INSERT each carry a "no live conflicting
+ * grant" guard clause (`flipGuardSql` / `liveActionConflictGuard` below) —
+ * the flip's covers ALL selected actions at once, each insert's covers just
+ * its own action (see the comment at their definitions for why they differ).
+ * elevation_grants has NO table-level UNIQUE constraint (dropped
+ * from migrations/0142_elevation_ledger.sql — see that file's comment for
+ * why: revoked/expired rows are NEVER deleted, by design, for audit, and a
+ * plain UNIQUE(agent_session_id, action, scope_type, scope_id) collided
+ * with those dead rows forever, crashing a legitimate re-elevation with a
+ * raw D1_ERROR). Enforcing "at most one LIVE grant per tuple" here, inside
+ * the same transaction as the status flip, means: (a) a normal re-request
+ * after revoke/expiry succeeds cleanly because the guard's
+ * `revoked_at IS NULL AND expires_at > now` predicate excludes the dead
+ * row; (b) a genuine conflict (two live grants for the same tuple) makes
+ * BOTH the flip and every insert affect 0 rows — same transaction, same
+ * pre-existing-state view — so the request is left exactly as it was
+ * ('pending', re-decidable), never stuck at 'approved' with a partial or
+ * zero grant set; (c) nothing here ever throws a raw constraint-violation
+ * exception up to the HTTP layer — a conflict is a typed
+ * `live_grant_conflict` result the route already renders as a clear 409,
+ * never a bare 500.
  */
 export async function decideElevationRequest(
   env: Env,
@@ -429,16 +456,6 @@ export async function decideElevationRequest(
     return { ok: false, reason: 'reauth_required' }
   }
 
-  const flip = await env.DB.prepare(
-    `UPDATE elevation_requests
-        SET status = 'approved', decided_at = ?1, decided_by_member_id = ?2,
-            decided_by_web_session_hash = ?3, decision_note = ?4
-      WHERE id = ?5 AND tenant = ?6 AND status = 'pending'`,
-  )
-    .bind(nowIso, input.decidedByMemberId, input.decidedByWebSessionHash, input.note ?? null, request.id, input.tenant)
-    .run()
-  if (Number(flip.meta?.changes ?? 0) === 0) return { ok: false, reason: 'already_decided', status: 'approved' }
-
   const expiresAt = new Date(nowMs + durationMinutes * 60 * 1000).toISOString()
   const grants: ElevationGrantRecord[] = selected.map((action) => ({
     id: crypto.randomUUID(),
@@ -457,13 +474,75 @@ export async function decideElevationRequest(
     revoke_reason: null,
   }))
 
-  const batchResults = await env.DB.batch(
-    grants.map((g) =>
-      env.DB.prepare(
+  // "At most one LIVE grant per (agent_session_id, action, scope_type,
+  // scope_id) tuple" — enforced here, not by a table constraint (see the
+  // function doc comment above).
+  //
+  // The FLIP's guard checks ALL selected actions at once ("can this
+  // decision proceed at all") — it is always the first statement in the
+  // batch, so no grant row from this decision exists yet when it runs; no
+  // self-exclusion needed.
+  //
+  // Each INSERT's guard checks ONLY its OWN action (not the whole selected
+  // set) — deliberately narrower than the flip's. Two reasons: (1) it needs
+  // no self-exclusion, because a sibling insert in the SAME batch (a
+  // different action, from a multi-action approval) can never collide on
+  // `action = <this row's own action>`; (2) it independently re-proves,
+  // inside this exact transaction, that nothing else raced in for THIS
+  // action between the flip and this insert. Concretely: two callers
+  // "concurrently" double-approving the IDENTICAL pending request (same
+  // requestId, same selectedActions — Security Invariant 6) hand batch()
+  // byte-identical statement text; a shared `elevation_request_id != ?`
+  // exclusion would have blinded the SECOND caller's insert to the FIRST
+  // caller's already-committed row (same request id on both), letting it
+  // insert a duplicate live grant even though its own flip failed on
+  // `status = 'pending'`. Checking only `action = ?` (no request-id
+  // exclusion at all) closes that hole: the second caller's insert sees the
+  // first caller's freshly-committed row for that action and correctly
+  // no-ops.
+  function liveActionConflictGuard(action: string): { sql: string; params: unknown[] } {
+    return {
+      sql: `NOT EXISTS (
+        SELECT 1 FROM elevation_grants g
+         WHERE g.tenant = ? AND g.agent_session_id = ? AND g.scope_type = ? AND g.scope_id = ?
+           AND g.action = ? AND g.revoked_at IS NULL AND g.expires_at > ?
+      )`,
+      params: [input.tenant, request.agent_session_id, scopeType, scopeId, action, nowIso],
+    }
+  }
+
+  const flipGuardInClause = selected.map(() => '?').join(', ')
+  const flipGuardSql = `NOT EXISTS (
+        SELECT 1 FROM elevation_grants g
+         WHERE g.tenant = ? AND g.agent_session_id = ? AND g.scope_type = ? AND g.scope_id = ?
+           AND g.action IN (${flipGuardInClause})
+           AND g.revoked_at IS NULL AND g.expires_at > ?
+      )`
+  const flipGuardParams = [input.tenant, request.agent_session_id, scopeType, scopeId, ...selected, nowIso]
+
+  const batchResults = await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE elevation_requests
+          SET status = 'approved', decided_at = ?, decided_by_member_id = ?,
+              decided_by_web_session_hash = ?, decision_note = ?
+        WHERE id = ? AND tenant = ? AND status = 'pending' AND ${flipGuardSql}`,
+    ).bind(
+      nowIso,
+      input.decidedByMemberId,
+      input.decidedByWebSessionHash,
+      input.note ?? null,
+      request.id,
+      input.tenant,
+      ...flipGuardParams,
+    ),
+    ...grants.map((g) => {
+      const guard = liveActionConflictGuard(g.action)
+      return env.DB.prepare(
         `INSERT INTO elevation_grants
            (id, tenant, elevation_request_id, agent_session_id, action, scope_type, scope_id, effect,
             approved_by_member_id, approved_by_web_session_hash, created_at, expires_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)`,
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+          WHERE ${guard.sql}`,
       ).bind(
         g.id,
         g.tenant,
@@ -477,10 +556,42 @@ export async function decideElevationRequest(
         g.approved_by_web_session_hash,
         g.created_at,
         g.expires_at,
-      ),
-    ),
-  )
-  assertBatchWritten(batchResults, 'elevation_grants.insert', 1)
+        ...guard.params,
+      )
+    }),
+  ])
+
+  const flipResult = batchResults[0]
+  if (Number(flipResult.meta?.changes ?? 0) === 0) {
+    const reloaded = await loadElevationRequestById(env, input.tenant, request.id)
+    if (reloaded && reloaded.status === 'pending') {
+      // The guard blocked us, not a concurrent decider — request is
+      // untouched, re-decidable once the conflicting grant clears.
+      const conflict = await env.DB.prepare(
+        `SELECT action FROM elevation_grants
+          WHERE tenant = ? AND agent_session_id = ? AND scope_type = ? AND scope_id = ?
+            AND action IN (${flipGuardInClause})
+            AND revoked_at IS NULL AND expires_at > ?
+          LIMIT 1`,
+      )
+        .bind(input.tenant, request.agent_session_id, scopeType, scopeId, ...selected, nowIso)
+        .first<{ action: string }>()
+      return {
+        ok: false,
+        reason: 'live_grant_conflict',
+        detail: conflict
+          ? `an unrevoked, unexpired grant for "${conflict.action}" already exists for this exact agent session and scope — revoke it or wait for it to expire, then re-approve`
+          : 'a live grant for one of the selected actions already exists for this exact agent session and scope',
+      }
+    }
+    return { ok: false, reason: 'already_decided', status: reloaded?.status ?? 'approved' }
+  }
+
+  // Flip succeeded ⇒ the guard passed inside this same transaction ⇒ every
+  // insert (same guard, same pre-existing-state view) must also have
+  // written exactly one row. Verified anyway, defensively, exactly as
+  // before.
+  assertBatchWritten(batchResults.slice(1), 'elevation_grants.insert', 1)
 
   const updatedRequest = await loadElevationRequestById(env, input.tenant, request.id)
   return { ok: true, request: updatedRequest ?? { ...request, status: 'approved' }, grants }
