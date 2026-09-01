@@ -3334,6 +3334,8 @@ const toolInbox: ToolSpec = {
       sinceSeq = rawSinceSeq
     }
 
+    // A harness that declares its seat via the x-mupot-seat header should not also
+    // have to pass it on every read — the header already identifies the partition.
     const seatArg = args.seat ?? ctx.seat
     const res = await readAgentInbox(env, {
       agent,
@@ -4189,17 +4191,13 @@ const toolConnect: ToolSpec = {
   min: 'authenticated',
   // QA-3 guard: fictional slugs only in the args documentation. Real tenant slugs must
   // never appear here — this string is the public tool description served to connectors.
-  args: '{ agent_name: string, seat?: string }  // agent slug or id (e.g. "growth-lead", "researcher"); optional seat claims a per-seat identity on this token (or send x-mupot-seat)',
+  args: '{ agent_name: string }  // the agent slug or id you are connecting as (e.g. "growth-lead", "researcher"); must already exist in this pot',
   inputSchema: {
     type: 'object',
     properties: {
       agent_name: {
         type: 'string',
         description: 'The slug or id of the agent you are connecting as. Must already exist in this pot. Examples: "growth-lead", "researcher" (fictional — use your actual agent slug).',
-      },
-      seat: {
-        type: 'string',
-        description: 'Optional seat id for this harness (e.g. "cursor-ide"). When set, connect writes a per-seat binding even if the token is already welded. Equivalent to the x-mupot-seat header.',
       },
     },
     required: ['agent_name'],
@@ -4336,54 +4334,31 @@ const toolConnect: ToolSpec = {
     )
     if (notFound || !data) return fail(404, 'agent_not_found', 'Agent was found but orient data is unavailable.')
 
-    // Seat binding: one token, many harnesses. A seat (arg or x-mupot-seat header)
-    // writes a per-seat identity that survives a token already welded to someone
-    // else — the weld is the default, not the ceiling. Without a seat we still try
-    // the historic first-weld. We never report "session_local" for a write we did
-    // not persist: that claim was a no-op lie and the reason seats could not
-    // become their own agents.
-    let binding: 'seat' | 'durable' | 'none' = 'none'
-    let boundSeat: string | undefined
-    const effectiveSeat = str(args.seat)?.trim() || ctx.seat?.trim() || ''
-    try {
-      if (effectiveSeat && auth.tokenId && auth.memberId) {
-        await env.DB.prepare(
-          `INSERT INTO seat_agent_bindings (tenant, token_id, seat, agent_id, member_id)
-           VALUES (?1, ?2, ?3, ?4, ?5)
-           ON CONFLICT(tenant, token_id, seat) DO UPDATE SET
-             agent_id = excluded.agent_id,
-             member_id = excluded.member_id,
-             last_seen_at = datetime('now')`,
-        )
-          .bind(env.TENANT_SLUG, auth.tokenId, effectiveSeat, agentRef.id, auth.memberId)
-          .run()
-        binding = 'seat'
-        boundSeat = effectiveSeat
-      } else if (auth.tokenId && !auth.boundAgentId) {
+    // If the token is unbound (boundAgentId=null) and the caller is authorized on the squad,
+    // persist the binding to D1 so that stateless REST clients (e.g. ChatGPT Actions)
+    // retain the agent identity on subsequent tool calls.
+    let durable = false
+    if (auth.tokenId && !auth.boundAgentId) {
+      try {
         const updateResult = await env.DB.prepare(
           'UPDATE member_tokens SET agent_id = ?1 WHERE id = ?2 AND agent_id IS NULL',
         )
           .bind(agentRef.id, auth.tokenId)
           .run()
 
-        if ((updateResult.meta?.changes ?? 0) > 0) binding = 'durable'
+        durable = (updateResult.meta?.changes ?? 0) > 0
+      } catch {
+        // If trigger prevents D1 update (e.g. agent_identity_conflict when caller is not the agent's dedicated member),
+        // retain session-local claim without failing the connection.
+        durable = false
       }
-    } catch {
-      // Trigger abort (agent_identity_conflict) or a missing table must not fail
-      // the connection — the packet still orients the caller; binding just did
-      // not stick.
-      binding = 'none'
     }
 
-    const alreadyWeldedNoSeat = !effectiveSeat && Boolean(auth.boundAgentId)
     return done({
       connection_status: 'hot',
       claimed_agent: { id: agentRef.id, slug: agentRef.slug, name: agentRef.name },
-      binding,
-      ...(boundSeat ? { seat: boundSeat } : {}),
-      next_step: alreadyWeldedNoSeat
-        ? 'This token is already welded to another agent, so nothing was persisted. Pass a seat (or send the x-mupot-seat header) to claim a per-seat identity on this token.'
-        : 'You are now hot. Call orient {} (or rely on this packet) for your full basin-drop.',
+      binding: durable ? 'durable' : 'session_local',
+      next_step: 'You are now hot. Call orient {} (or rely on this packet) for your full basin-drop.',
       packet: data,
       brief: renderBrief(data),
     })
@@ -4577,39 +4552,6 @@ export async function invokeTool(
     return { ...fail(400, 'invalid_args', 'args must be an object'), tool: spec.name }
   }
 
-  // Seat-scoped identity: when a seat binding exists, this call IS that agent,
-  // not the token weld. Capabilities stay the member's — the seat is an identity
-  // discriminator, not an authz grant. Authorization happened at connect time and
-  // is re-verified here by matching member_id, so a binding one principal wrote
-  // can never be used by another that merely presents the same token id. Fail-soft:
-  // any DB error leaves the weld in place. Do not mutate `auth` — other requests
-  // may share the object.
-  let actingAuth = auth
-  const seatKey = ctx.seat?.trim() ?? ''
-  if (seatKey && auth.tokenId && auth.memberId && env.DB) {
-    try {
-      const bound = await env.DB.prepare(
-        `SELECT agent_id FROM seat_agent_bindings
-          WHERE tenant = ?1 AND token_id = ?2 AND seat = ?3 AND member_id = ?4`,
-      )
-        .bind(env.TENANT_SLUG, auth.tokenId, seatKey, auth.memberId)
-        .first<{ agent_id: string }>()
-      if (bound?.agent_id) {
-        actingAuth = { ...auth, boundAgentId: bound.agent_id }
-        const refresh = env.DB.prepare(
-          `UPDATE seat_agent_bindings SET last_seen_at = datetime('now')
-            WHERE tenant = ?1 AND token_id = ?2 AND seat = ?3 AND member_id = ?4`,
-        )
-          .bind(env.TENANT_SLUG, auth.tokenId, seatKey, auth.memberId)
-          .run()
-          .catch(() => {})
-        if (ctx.waitUntil) ctx.waitUntil(refresh)
-      }
-    } catch {
-      // no override — proceed with the token weld
-    }
-  }
-
   // AAGATE (#183) — deny-by-default capability FLOOR. `spec.min` is enforced HERE,
   // centrally, BEFORE argument validation. A tool that declares a capability minimum
   // can no longer fail-open if its handler omits the inline scope check: a caller
@@ -4630,7 +4572,7 @@ export async function invokeTool(
   // return a generic internal_error — never echo an arbitrary throw (leak guard).
   let outcome: ToolOutcome
   try {
-    outcome = await spec.run(actingAuth, env, args, ctx)
+    outcome = await spec.run(auth, env, args, ctx)
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     if (msg.startsWith('receipt_failed')) {
