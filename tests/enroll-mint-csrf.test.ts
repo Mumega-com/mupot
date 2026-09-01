@@ -67,9 +67,16 @@ function envFor(harness: SqliteD1Harness, sessions: Record<string, string> = {})
     TENANT_SLUG: TENANT,
     BRAND: 'Test Pot',
     PUBLIC_ORIGIN: ORIGIN,
-    SESSIONS: {
-      get: async (key: string) => sessions[key] ?? null,
-    },
+    // Writable, because the mint throttle fails CLOSED: a read-only KV mock
+    // makes every mint here 429 and the CSRF boundary untestable.
+    SESSIONS: (() => {
+      const store = new Map<string, string>(Object.entries(sessions))
+      return {
+        get: async (key: string) => store.get(key) ?? null,
+        put: async (key: string, value: string) => { store.set(key, value) },
+        delete: async (key: string) => { store.delete(key) },
+      }
+    })(),
     OAUTH_KV: { get: async () => null, put: async () => undefined },
     VEC: { query: async () => ({ matches: [] }) },
     BUS: { send: async () => {} },

@@ -167,15 +167,36 @@ export async function authorizeEnrollMint(
 export const ENROLL_MINT_RL_MAX = 10
 export const ENROLL_MINT_RL_TTL = 3600 // seconds (1 hour)
 
+/** How long to ask the caller to wait when the counter itself is unreadable.
+ *  Short on purpose: a KV blip should cost a minute, not an hour. */
+export const ENROLL_MINT_RL_UNAVAILABLE_RETRY = 60 // seconds
+
 export interface EnrollRateLimitResult {
   allowed: boolean
   retryAfter: number
+  /** Why it was refused. `unavailable` means the counter could not be read or
+   *  written, not that the ceiling was reached — the copy differs and so does
+   *  the wait. */
+  reason?: 'throttled' | 'unavailable'
 }
 
-/** Consumed BEFORE the mint and before the agent is resolved: a refused or
- *  malformed attempt is exactly the abuse shape worth throttling, so it burns
- *  budget too. Fail-open on KV trouble — same posture as the sibling limiters;
- *  the authz gate below is what must never fail open, and it does not. */
+/**
+ * Consumed BEFORE the mint and before the agent is resolved: a refused or
+ * malformed attempt is exactly the abuse shape worth throttling, so it burns
+ * budget too.
+ *
+ * FAILS CLOSED on KV trouble, unlike its sibling limiters. The sibling posture
+ * is defensible for a read or a bootstrap; it is not defensible here, because
+ * every success on this route is a live credential. Failing open would switch
+ * the 10/hour brake off precisely during an outage — the window where nobody is
+ * watching the graphs — while leaving no trace that the ceiling was skipped.
+ * The cost is a refused mint during a KV incident, which is recoverable; an
+ * unbounded mint loop is not.
+ *
+ * Ruled by Athena, 2026-09-01 (PR #1254 caveat 1): "a credential-minting
+ * surface must refuse on KV trouble ... fail-open turns the 10/hour brake off
+ * during an outage while the authz gate still holds."
+ */
 export async function checkEnrollMintRateLimit(
   env: Env,
   memberId: string,
@@ -184,11 +205,17 @@ export async function checkEnrollMintRateLimit(
   try {
     const raw = await env.SESSIONS.get(key)
     const count = raw !== null ? parseInt(raw, 10) : 0
-    if (count >= ENROLL_MINT_RL_MAX) return { allowed: false, retryAfter: ENROLL_MINT_RL_TTL }
+    if (count >= ENROLL_MINT_RL_MAX) {
+      return { allowed: false, retryAfter: ENROLL_MINT_RL_TTL, reason: 'throttled' }
+    }
     await env.SESSIONS.put(key, String(count + 1), { expirationTtl: ENROLL_MINT_RL_TTL })
     return { allowed: true, retryAfter: 0 }
   } catch {
-    return { allowed: true, retryAfter: 0 }
+    return {
+      allowed: false,
+      retryAfter: ENROLL_MINT_RL_UNAVAILABLE_RETRY,
+      reason: 'unavailable',
+    }
   }
 }
 
@@ -206,6 +233,25 @@ export function enrollThrottledBody(retryAfterSeconds: number) {
     If you are enrolling a large fleet, mint through
     <code class="inline">mint_agent_token</code> instead of this page; it is the
     same write path without the browser-shaped throttle.
+  </p>
+</div>
+<p style="margin-top:16px"><a href="/enroll">← Back to enrollment</a></p>`
+}
+
+/** The fail-closed refusal. Distinct copy from the ceiling case so an operator
+ *  reading a 429 can tell an outage from a busy hour without a log dive. */
+export function enrollUnavailableBody(retryAfterSeconds: number) {
+  return html`
+<h1>Cannot coin a key right now</h1>
+<div class="card">
+  <p style="margin:0 0 10px;font-size:14px">
+    The mint rate limit could not be checked, so this page refused rather than
+    mint without a ceiling. Your permissions are fine and nothing was created.
+    Try again in about ${retryAfterSeconds} seconds.
+  </p>
+  <p style="margin:0;font-size:14px">
+    If this persists, the session store is unhealthy — say so when you report it,
+    and use <code class="inline">mint_agent_token</code> in the meantime.
   </p>
 </div>
 <p style="margin-top:16px"><a href="/enroll">← Back to enrollment</a></p>`

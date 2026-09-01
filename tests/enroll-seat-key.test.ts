@@ -12,7 +12,12 @@ import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
 import { dashboardApp } from '../src/dashboard/index'
 import { mcpApp } from '../src/mcp'
-import { enrollUrl, ENROLL_MINT_RL_MAX, ENROLL_MINT_RL_TTL } from '../src/dashboard/enroll'
+import {
+  enrollUrl,
+  ENROLL_MINT_RL_MAX,
+  ENROLL_MINT_RL_TTL,
+  ENROLL_MINT_RL_UNAVAILABLE_RETRY,
+} from '../src/dashboard/enroll'
 import { mintAgentBoundToken } from '../src/members/service'
 import type { Env } from '../src/types'
 
@@ -68,11 +73,14 @@ function makeHarness(): SqliteD1Harness {
 }
 
 /**
- * A SESSIONS stand-in that actually STORES what is put into it. The plain mock
- * below is read-only, which silently fed the mint throttle a failing `put` and
- * sent it down its fail-open branch — a limiter that is never exercised looks
- * identical to one that works. Anything asserting on throttle behaviour must
- * use this, not the read-only mock.
+ * A SESSIONS stand-in that actually STORES what is put into it.
+ *
+ * This is now the DEFAULT for `envFor`, not an opt-in. The earlier read-only
+ * mock had no `put`, so every throttle check threw and took the fail-open
+ * branch — which made a never-exercised limiter look identical to a working
+ * one. Now that the limiter fails CLOSED, the same mock would turn every mint
+ * in this file into a 429, which is a louder failure but still a fixture lie.
+ * Model the binding honestly instead: a KV that can be written to.
  */
 function statefulSessions(seed: Record<string, string> = {}) {
   const store = new Map<string, string>(Object.entries(seed))
@@ -96,9 +104,7 @@ function envFor(
     TENANT_SLUG: TENANT,
     BRAND: 'Test Pot',
     PUBLIC_ORIGIN: ORIGIN,
-    SESSIONS: sessionsKv ?? {
-      get: async (key: string) => sessions[key] ?? null,
-    },
+    SESSIONS: sessionsKv ?? statefulSessions(sessions).kv,
     OAUTH_KV: { get: async () => null, put: async () => undefined },
     VEC: { query: async () => ({ matches: [] }) },
     BUS: { send: async () => {} },
@@ -488,18 +494,61 @@ describe('POST /enroll/mint — per-member throttle', () => {
     expect(sessions.store.get(`enroll-mint-rl:${HUMAN_MEMBER}`)).toBe('1')
   })
 
-  it('fails open when the KV binding is unavailable', async () => {
+  // Fail-CLOSED, and the assertion that matters is the token count, not the
+  // status: a 429 with a minted token would still be the hole.
+  it('fails CLOSED when the KV binding is unavailable, and mints nothing', async () => {
     harness = makeHarness()
     const env = envFor(harness, {}, {
       get: async (key: string) =>
         key === 'sess:s-admin' ? sessionRecord('admin@pot.test') : null,
       put: async () => { throw new Error('KV down') },
     })
+
+    const before = harness.sqlite
+      .prepare(`SELECT COUNT(*) AS n FROM member_tokens`)
+      .get() as { n: number }
+
     const res = await dashboardApp.fetch(
       dashboardPost('/enroll/mint', 's-admin', { agent_id: AGENT_A, seat: 'kv-down' }),
       env,
     )
-    expect(res.status).toBe(200)
+    expect(res.status).toBe(429)
+    expect(res.headers.get('Retry-After')).toBe(String(ENROLL_MINT_RL_UNAVAILABLE_RETRY))
+
+    const after = harness.sqlite
+      .prepare(`SELECT COUNT(*) AS n FROM member_tokens`)
+      .get() as { n: number }
+    expect(after.n).toBe(before.n)
+    expect(
+      harness.sqlite.prepare(`SELECT id FROM member_tokens WHERE label = ?`).get('kv-down'),
+    ).toBeUndefined()
+
+    const body = await res.text()
+    expect(body).not.toMatch(/mupot_[0-9a-f]{64}/)
+    // Outage copy, not ceiling copy: an operator must be able to tell a broken
+    // session store from a busy hour without reading logs.
+    expect(body).toMatch(/could not be checked/i)
+  })
+
+  // A read failure and a write failure are different code paths into the same
+  // catch; pin both so a future refactor cannot restore fail-open on one of them.
+  it('fails CLOSED when the counter cannot be READ either', async () => {
+    harness = makeHarness()
+    const env = envFor(harness, {}, {
+      get: async (key: string) => {
+        if (key === 'sess:s-admin') return sessionRecord('admin@pot.test')
+        throw new Error('KV down')
+      },
+      put: async () => undefined,
+    })
+    const res = await dashboardApp.fetch(
+      dashboardPost('/enroll/mint', 's-admin', { agent_id: AGENT_A, seat: 'kv-read-down' }),
+      env,
+    )
+    expect(res.status).toBe(429)
+    expect(
+      harness.sqlite.prepare(`SELECT id FROM member_tokens WHERE label = ?`).get('kv-read-down'),
+    ).toBeUndefined()
   })
 })
 

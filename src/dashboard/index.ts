@@ -86,6 +86,7 @@ import {
   enrollMintedBody,
   enrollPageBody,
   enrollThrottledBody,
+  enrollUnavailableBody,
   checkEnrollMintRateLimit,
   loadEnrollView,
   normalizeEnrollSeat,
@@ -2097,11 +2098,12 @@ dashboardApp.post('/enroll/mint', async (c) => {
   }
   const throttle = await checkEnrollMintRateLimit(c.env, actorMemberId)
   if (!throttle.allowed) {
-    return c.html(
-      shell(c.env, 'Enroll seat', enrollThrottledBody(throttle.retryAfter)),
-      429,
-      { 'Retry-After': String(throttle.retryAfter) },
-    )
+    const body = throttle.reason === 'unavailable'
+      ? enrollUnavailableBody(throttle.retryAfter)
+      : enrollThrottledBody(throttle.retryAfter)
+    return c.html(shell(c.env, 'Enroll seat', body), 429, {
+      'Retry-After': String(throttle.retryAfter),
+    })
   }
 
   const canonical = requiredCanonicalOrigin(c.env)
