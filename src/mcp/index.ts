@@ -3713,7 +3713,7 @@ const toolCheckIn: ToolSpec = {
   name: 'check_in',
   scope: 'self (member-token presence)',
   min: 'authenticated',
-  args: '{ seat?: string, harness?: "cursor-ide"|"cursor-cloud"|"antigravity-cli"|"claude-code"|"prime"|"hermes"|"grok-cli"|"unknown", machine?: string, model?: string, provider?: string, effort?: "low"|"medium"|"high"|"extended-thinking-64k", flight_id?: string, source?: string, label?: string, name?: string }',
+  args: '{ seat?: string, harness?: "cursor-ide"|"cursor-cloud"|"antigravity-cli"|"claude-code"|"codex-cli"|"prime"|"hermes"|"grok-cli"|"unknown", machine?: string, model?: string, provider?: string, effort?: "low"|"medium"|"high"|"extended-thinking-64k", flight_id?: string, source?: string, label?: string, name?: string }',
   inputSchema: {
     type: 'object',
     properties: {
