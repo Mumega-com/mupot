@@ -134,6 +134,62 @@ describe('POST /enroll/mint — CSRF (dashboard-wide hono/csrf)', () => {
     expect(stolen).toBeUndefined()
   })
 
+  // The honest boundary of the CSRF claim, and the invariant that makes the
+  // route safe anyway.
+  //
+  // hono/csrf only fires when the content-type is a form-element type
+  // (x-www-form-urlencoded, multipart/form-data, text/plain) or absent. A POST
+  // declaring application/json therefore walks straight past the middleware --
+  // verified here, not assumed: it reaches the handler and returns 400, not the
+  // 403 Forbidden the middleware would have produced.
+  //
+  // It mints NOTHING, and the reason is worth stating because it is implicit:
+  // the handler reads c.req.parseBody(), which only understands the very
+  // content-types csrf() guards. So the bypass hands the handler an empty body
+  // and dies on "Pick an agent." The protection survives on a COUPLING between
+  // the middleware's content-type filter and the handler's parser.
+  //
+  // That coupling is unwritten and one refactor from breaking: switch this
+  // handler to c.req.json() to accept an API-shaped client and CSRF protection
+  // silently evaporates, with no test failing to say so. This test is that
+  // test. If it starts failing because the route learned to read JSON, the
+  // route needs its own CSRF check -- do not just update the assertion.
+  //
+  // (A real browser cannot mount this anyway: a cross-origin application/json
+  // POST is not a simple request and needs a CORS preflight the dashboard never
+  // grants, and the session cookie is SameSite=Lax so it would not be attached
+  // cross-site regardless. This is defence in depth, not the only defence.)
+  it('a JSON content-type POST bypasses hono/csrf but cannot mint — the parseBody coupling', async () => {
+    harness = makeHarness()
+    const env = envFor(harness, { 'sess:s-admin': sessionRecord('admin@pot.test') })
+    const before = memberTokenCount(harness)
+
+    const hdrs = new Headers({
+      Origin: 'https://evil.example',
+      'content-type': 'application/json',
+      Cookie: 'mupot_session=s-admin',
+    })
+    const res = await dashboardApp.fetch(
+      new Request(`${ORIGIN}/enroll/mint`, {
+        method: 'POST',
+        headers: hdrs,
+        body: JSON.stringify({ agent_id: AGENT_A, seat: 'json-bypass-seat' }),
+      }),
+      env,
+    )
+
+    // Past the middleware: this is the handler's refusal, not hono/csrf's.
+    const body = await res.text()
+    expect(res.status).toBe(400)
+    expect(body).not.toBe(CSRF_FORBIDDEN_BODY)
+
+    // And nothing was issued.
+    expect(memberTokenCount(harness)).toBe(before)
+    expect(
+      harness.sqlite.prepare(`SELECT id FROM member_tokens WHERE label = ?`).get('json-bypass-seat'),
+    ).toBeUndefined()
+  })
+
   it('passes same-origin POST through the CSRF layer (auth refusal is HTML, not plain Forbidden)', async () => {
     harness = makeHarness()
     const env = envFor(harness, { 'sess:s-plain': sessionRecord('member@pot.test') })
