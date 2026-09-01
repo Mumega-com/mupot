@@ -1,8 +1,8 @@
-// tests/inbox-seat-visibility.test.ts — seat-targeted inbox rows must not vanish when inbox() omits seat.
+// tests/inbox-seat-visibility.test.ts — seat-targeted inbox visibility without cross-seat drain.
 //
-// Regression for production defect: messages with target_seat were inserted (wake fired) but
-// unreadable via inbox() without a matching seat arg because every no-seat path filtered to
-// `target_seat IS NULL` only. Schema from the full migration chain (#684 ratchet).
+// 0120 isolates seat mailboxes: an un-scoped read consumes only broadcasts. Seat-targeted
+// backlog must still be visible via seats/unread_total; draining across seats requires allSeats.
+// Schema from the full migration chain (#684 ratchet).
 
 import { describe, expect, it } from 'vitest'
 
@@ -67,28 +67,38 @@ function seatCounts(seats: Array<{ seat: string | null; unread: number }> | unde
 }
 
 describe('inbox seat visibility', () => {
-  it('returns seat-targeted messages when inbox() omits seat (core regression)', async () => {
+  it('no-seat read returns only broadcasts and does not consume seat-targeted rows', async () => {
     const f = fixture()
     try {
-      f.seed('seat-only', 'wake me', 'cursor-cloud-vm')
+      f.seed('bcast', 'broadcast', null)
+      f.seed('targeted', 'wake me', 'cursor-cloud-vm')
       const res = await readAgentInbox(f.env, { agent: 'agent-a' })
       expect(res).toMatchObject({ ok: true })
       if (!res.ok) throw new Error('unreachable')
       expect(res.messages).toHaveLength(1)
-      expect(res.messages[0].body).toBe('wake me')
-      expect(res.messages[0].target_seat).toBe('cursor-cloud-vm')
-      // Pre-change SQL used `AND target_seat IS NULL` on the no-seat path — this row would be excluded.
+      expect(res.messages[0].body).toBe('broadcast')
+      expect(res.messages[0].target_seat).toBeNull()
+      expect(f.readAt('targeted')).toBeNull()
+      expect(res.unread_total).toBe(1)
+      expect(seatCounts(res.seats).get('cursor-cloud-vm')).toBe(1)
+      expect(res.remaining).toBe(0)
     } finally { f.harness.close() }
   })
 
-  it('no-seat read returns broadcast and seat-targeted messages together in seq order', async () => {
+  it('no-seat peek surfaces seat backlog in seats/unread_total without consuming it', async () => {
     const f = fixture()
     try {
       f.seed('m1', 'broadcast', null, '2026-09-01T00:00:01.000Z')
       f.seed('m2', 'seat-a', 'seat-alpha', '2026-09-01T00:00:02.000Z')
       f.seed('m3', 'seat-b', 'seat-beta', '2026-09-01T00:00:03.000Z')
       const res = await readAgentInbox(f.env, { agent: 'agent-a', peek: true, limit: 10 })
-      expect(res.ok && res.messages.map((m) => m.id)).toEqual(['m1', 'm2', 'm3'])
+      expect(res.ok && res.messages.map((m) => m.id)).toEqual(['m1'])
+      expect(res.unread_total).toBe(3)
+      const counts = seatCounts(res.seats)
+      expect(counts.get(null)).toBe(1)
+      expect(counts.get('seat-alpha')).toBe(1)
+      expect(counts.get('seat-beta')).toBe(1)
+      expect(res.remaining).toBe(1)
     } finally { f.harness.close() }
   })
 
@@ -100,48 +110,92 @@ describe('inbox seat visibility', () => {
       f.seed('beta', 'for-beta', 'seat-beta')
       const res = await readAgentInbox(f.env, { agent: 'agent-a', seat: 'seat-alpha', peek: true })
       expect(res.ok && res.messages.map((m) => m.id).sort()).toEqual(['alpha', 'bcast'])
+      expect(res.unread_total).toBe(3)
     } finally { f.harness.close() }
   })
 
-  it('consume marks exactly the returned rows read; a second read does not re-deliver', async () => {
+  it('allSeats drains every unread row across seats', async () => {
+    const f = fixture()
+    try {
+      f.seed('m1', 'broadcast', null, '2026-09-01T00:00:01.000Z')
+      f.seed('m2', 'seat-a', 'seat-alpha', '2026-09-01T00:00:02.000Z')
+      f.seed('m3', 'seat-b', 'seat-beta', '2026-09-01T00:00:03.000Z')
+      const res = await readAgentInbox(f.env, { agent: 'agent-a', allSeats: true, limit: 10 })
+      expect(res.ok && res.messages.map((m) => m.id)).toEqual(['m1', 'm2', 'm3'])
+      expect(res.unread_total).toBe(0)
+      expect(res.remaining).toBe(0)
+      expect(f.readAt('m1')).not.toBeNull()
+      expect(f.readAt('m2')).not.toBeNull()
+      expect(f.readAt('m3')).not.toBeNull()
+    } finally { f.harness.close() }
+  })
+
+  it('allSeats and seat together are refused', async () => {
+    const f = fixture()
+    try {
+      f.seed('m1', 'one', 'seat-a')
+      expect(await readAgentInbox(f.env, { agent: 'agent-a', seat: 'seat-a', allSeats: true }))
+        .toMatchObject({ ok: false, reason: 'invalid_seat' })
+      expect(await leaseAgentInbox(f.env, { agent: 'agent-a', seat: 'seat-a', allSeats: true }, clock(T0)))
+        .toMatchObject({ ok: false, reason: 'invalid_seat' })
+    } finally { f.harness.close() }
+  })
+
+  it('consume marks only the partition-scoped rows read', async () => {
     const f = fixture()
     try {
       f.seed('m1', 'one', 'seat-a')
       f.seed('m2', 'two', null)
-      const first = await readAgentInbox(f.env, { agent: 'agent-a', limit: 1 })
+      const first = await readAgentInbox(f.env, { agent: 'agent-a', seat: 'seat-a', limit: 1 })
       expect(first.ok && first.messages.map((m) => m.id)).toEqual(['m1'])
       expect(f.readAt('m1')).not.toBeNull()
       expect(f.readAt('m2')).toBeNull()
 
-      const second = await readAgentInbox(f.env, { agent: 'agent-a' })
+      const second = await readAgentInbox(f.env, { agent: 'agent-a', seat: 'seat-a' })
       expect(second.ok && second.messages.map((m) => m.id)).toEqual(['m2'])
       expect(f.readAt('m2')).not.toBeNull()
 
-      const third = await readAgentInbox(f.env, { agent: 'agent-a' })
+      const third = await readAgentInbox(f.env, { agent: 'agent-a', seat: 'seat-a' })
       expect(third.ok && third.messages).toEqual([])
     } finally { f.harness.close() }
   })
 
-  it('peek path surfaces seat-targeted rows without consuming them', async () => {
+  it('peek path surfaces seat-targeted rows only with seat or allSeats', async () => {
     const f = fixture()
     try {
       f.seed('targeted', 'peek me', 'seat-x')
-      const peek = await readAgentInbox(f.env, { agent: 'agent-a', peek: true })
-      expect(peek.ok && peek.messages[0]?.body).toBe('peek me')
+      const noSeat = await readAgentInbox(f.env, { agent: 'agent-a', peek: true })
+      expect(noSeat.ok && noSeat.messages).toEqual([])
+      expect(noSeat.unread_total).toBe(1)
+
+      const withSeat = await readAgentInbox(f.env, { agent: 'agent-a', seat: 'seat-x', peek: true })
+      expect(withSeat.ok && withSeat.messages[0]?.body).toBe('peek me')
       expect(f.readAt('targeted')).toBeNull()
 
-      const consume = await readAgentInbox(f.env, { agent: 'agent-a' })
+      const consume = await readAgentInbox(f.env, { agent: 'agent-a', seat: 'seat-x' })
       expect(consume.ok && consume.messages[0]?.body).toBe('peek me')
       expect(f.readAt('targeted')).not.toBeNull()
     } finally { f.harness.close() }
   })
 
-  it('lease path without seat returns seat-targeted and broadcast rows', async () => {
+  it('lease path without seat returns only broadcast rows', async () => {
     const f = fixture()
     try {
       f.seed('bcast', 'broadcast', null)
       f.seed('seat', 'leased', 'seat-lease')
       const res = await leaseAgentInbox(f.env, { agent: 'agent-a' }, clock(T0))
+      expect(res.ok && res.messages.map((m) => m.id)).toEqual(['bcast'])
+      expect(f.readAt('bcast')).toBeNull()
+      expect(f.readAt('seat')).toBeNull()
+    } finally { f.harness.close() }
+  })
+
+  it('lease path with allSeats returns seat-targeted and broadcast rows', async () => {
+    const f = fixture()
+    try {
+      f.seed('bcast', 'broadcast', null)
+      f.seed('seat', 'leased', 'seat-lease')
+      const res = await leaseAgentInbox(f.env, { agent: 'agent-a', allSeats: true }, clock(T0))
       expect(res.ok && res.messages.map((m) => m.id).sort()).toEqual(['bcast', 'seat'])
       expect(f.readAt('bcast')).toBeNull()
       expect(f.readAt('seat')).toBeNull()
@@ -175,7 +229,8 @@ describe('inbox seat visibility', () => {
       expect(counts.get(null)).toBe(1)
       expect(counts.get('seat-alpha')).toBe(2)
       expect(counts.get('seat-beta')).toBe(1)
-      expect(res.remaining).toBe(4)
+      expect(res.unread_total).toBe(4)
+      expect(res.remaining).toBe(1)
     } finally { f.harness.close() }
   })
 
@@ -193,9 +248,10 @@ describe('inbox seat visibility', () => {
       const signed = await readVerifiedSignedAgentInbox(f.env, {
         agent: 'agent-a',
         keyFingerprint: 'a'.repeat(64),
+        seat: 'seat-signed',
         peek: true,
       })
-      expect(signed).toMatchObject({ ok: true, messages: [{ id: 'm1' }] })
+      expect(signed).toMatchObject({ ok: true, messages: [{ id: 'm1' }], unread_total: 1 })
     } finally { f.harness.close() }
   })
 })

@@ -96,6 +96,8 @@ export interface InboxResult {
   ok: true
   messages: InboxMessage[]
   remaining: number
+  /** Every unread row for this agent (fence-honouring), independent of seat partition. */
+  unread_total: number
   /** Per-seat unread counts — makes seat-targeted backlog visible when inbox() omits seat. */
   seats?: Array<{ seat: string | null; unread: number }>
 }
@@ -123,7 +125,7 @@ export type SendFailure = {
 
 export type InboxFailure = {
   ok: false
-  reason: 'no_tenant' | 'invalid_agent' | 'invalid_limit' | 'consumer_fenced' | 'db_error'
+  reason: 'no_tenant' | 'invalid_agent' | 'invalid_limit' | 'invalid_seat' | 'consumer_fenced' | 'db_error'
   detail?: string
 }
 
@@ -482,11 +484,68 @@ function readerCanRead(
   return mode === (reader === 'signed' ? 'signed_only' : 'bearer_only')
 }
 
-// Seat is a routing preference, not a hiding place. Omitting seat must return every unread
-// row for the agent; the old `target_seat IS NULL` filter made seat-targeted messages
-// permanently invisible (wake fired, inbox() empty).
-function inboxSeatFilter(seatParam: string): string {
-  return `AND (target_seat = ${seatParam} OR target_seat IS NULL)`
+type InboxSeatMode =
+  | { kind: 'broadcast' }
+  | { kind: 'seat'; seat: string }
+  | { kind: 'all' }
+
+function resolveInboxSeatMode(input: {
+  seat?: string
+  allSeats?: boolean
+}): InboxSeatMode | { reason: 'invalid_seat'; detail: string } {
+  const seat = typeof input.seat === 'string' && input.seat.trim().length > 0 ? input.seat.trim() : null
+  if (input.allSeats === true && seat !== null) {
+    return { reason: 'invalid_seat', detail: 'seat and allSeats are mutually exclusive' }
+  }
+  if (input.allSeats === true) return { kind: 'all' }
+  if (seat !== null) return { kind: 'seat', seat }
+  return { kind: 'broadcast' }
+}
+
+// 0120: an un-scoped read must never drain a live sibling seat's mail; visibility is via
+// seats/unread_total, and draining across seats requires allSeats.
+function inboxSeatPredicate(mode: InboxSeatMode, seatParam: string): string {
+  switch (mode.kind) {
+    case 'all':
+      return ''
+    case 'broadcast':
+      return 'AND target_seat IS NULL'
+    case 'seat':
+      return `AND (target_seat = ${seatParam} OR target_seat IS NULL)`
+  }
+}
+
+async function unreadTotalForReader(
+  env: Env,
+  tenant: string,
+  agent: string,
+  reader: InboxReader,
+  signedKeyFingerprint: string | undefined,
+): Promise<number | undefined> {
+  try {
+    if (reader === 'signed') {
+      if (!signedKeyFingerprint) return 0
+      const row = await env.DB.prepare(
+        `SELECT COUNT(*) AS unread
+           FROM agent_messages
+          WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL
+            AND EXISTS (SELECT 1 FROM agent_inbox_fences
+                         WHERE tenant = ?1 AND agent_id = ?2
+                           AND mode = 'signed_only' AND key_fingerprint = ?3)`,
+      ).bind(tenant, agent, signedKeyFingerprint).first<{ unread: number }>()
+      return Number(row?.unread ?? 0)
+    }
+    const row = await env.DB.prepare(
+      `SELECT COUNT(*) AS unread
+         FROM agent_messages
+        WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL
+          AND COALESCE((SELECT mode FROM agent_inbox_fences
+                         WHERE tenant = ?1 AND agent_id = ?2), 'bearer_only') = 'bearer_only'`,
+    ).bind(tenant, agent).first<{ unread: number }>()
+    return Number(row?.unread ?? 0)
+  } catch {
+    return undefined
+  }
 }
 
 async function unreadSeatBreakdownForReader(
@@ -528,7 +587,7 @@ async function unreadSeatBreakdownForReader(
 
 async function readAgentInboxForReader(
   env: Env,
-  input: { agent: string; limit?: number; peek?: boolean; keyFingerprint?: string; sinceSeq?: number; seat?: string },
+  input: { agent: string; limit?: number; peek?: boolean; keyFingerprint?: string; sinceSeq?: number; seat?: string; allSeats?: boolean },
   reader: InboxReader,
   opts: Opts,
 ): Promise<InboxResult | InboxFailure> {
@@ -536,6 +595,10 @@ async function readAgentInboxForReader(
   if (!tenant) return { ok: false, reason: 'no_tenant' }
   if (typeof input.agent !== 'string' || !isRef(input.agent))
     return { ok: false, reason: 'invalid_agent', detail: 'agent required' }
+
+  const seatModeResolved = resolveInboxSeatMode(input)
+  if ('reason' in seatModeResolved) return { ok: false, ...seatModeResolved }
+  const seatMode = seatModeResolved
 
   let limit = DEFAULT_INBOX_LIMIT
   if (input.limit !== undefined) {
@@ -554,16 +617,14 @@ async function readAgentInboxForReader(
   if (reader === 'signed' && !signedKeyFingerprint) return { ok: false, reason: 'consumer_fenced' }
   const now = opts.now ?? (() => new Date().toISOString())
 
-  const targetSeat = typeof input.seat === 'string' && input.seat.trim().length > 0 ? input.seat.trim() : null
-
   const cols = 'seq, id, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id, target_seat, body_length, checksum_sha256'
   try {
     let messages: InboxMessage[]
     if (peek) {
       if (reader === 'signed') {
-        const seatSql = targetSeat ? inboxSeatFilter('?6') : ''
-        const binds = targetSeat
-          ? [tenant, input.agent, sinceSeq, limit, signedKeyFingerprint, targetSeat]
+        const seatSql = inboxSeatPredicate(seatMode, '?6')
+        const binds = seatMode.kind === 'seat'
+          ? [tenant, input.agent, sinceSeq, limit, signedKeyFingerprint, seatMode.seat]
           : [tenant, input.agent, sinceSeq, limit, signedKeyFingerprint]
         const rows = await env.DB.prepare(
           `SELECT ${cols} FROM agent_messages
@@ -576,9 +637,9 @@ async function readAgentInboxForReader(
         ).bind(...binds).all<InboxMessage>()
         messages = rows.results ?? []
       } else {
-        const seatSql = targetSeat ? inboxSeatFilter('?5') : ''
-        const binds = targetSeat
-          ? [tenant, input.agent, sinceSeq, limit, targetSeat]
+        const seatSql = inboxSeatPredicate(seatMode, '?5')
+        const binds = seatMode.kind === 'seat'
+          ? [tenant, input.agent, sinceSeq, limit, seatMode.seat]
           : [tenant, input.agent, sinceSeq, limit]
         const rows = await env.DB.prepare(
           `SELECT ${cols} FROM agent_messages
@@ -595,9 +656,9 @@ async function readAgentInboxForReader(
       // RETURNING order is unspecified → sort by seq after. Marking + reading in one statement
       // means a concurrent reader cannot also claim the same rows (delivered once).
       if (reader === 'signed') {
-        const seatSql = targetSeat ? inboxSeatFilter('?6') : ''
-        const binds = targetSeat
-          ? [now(), tenant, input.agent, limit, signedKeyFingerprint, targetSeat]
+        const seatSql = inboxSeatPredicate(seatMode, '?6')
+        const binds = seatMode.kind === 'seat'
+          ? [now(), tenant, input.agent, limit, signedKeyFingerprint, seatMode.seat]
           : [now(), tenant, input.agent, limit, signedKeyFingerprint]
         const rows = await env.DB.prepare(
           `UPDATE agent_messages SET read_at = ?1
@@ -614,9 +675,9 @@ async function readAgentInboxForReader(
         ).bind(...binds).all<InboxMessage>()
         messages = (rows.results ?? []).slice().sort((a, b) => Number(a.seq) - Number(b.seq))
       } else {
-        const seatSql = targetSeat ? inboxSeatFilter('?5') : ''
-        const binds = targetSeat
-          ? [now(), tenant, input.agent, limit, targetSeat]
+        const seatSql = inboxSeatPredicate(seatMode, '?5')
+        const binds = seatMode.kind === 'seat'
+          ? [now(), tenant, input.agent, limit, seatMode.seat]
           : [now(), tenant, input.agent, limit]
         const rows = await env.DB.prepare(
           `UPDATE agent_messages SET read_at = ?1
@@ -650,9 +711,9 @@ async function readAgentInboxForReader(
 
     let remaining = 0
     if (reader === 'signed') {
-      const seatSql = targetSeat ? inboxSeatFilter('?4') : ''
-      const binds = targetSeat
-        ? [tenant, input.agent, signedKeyFingerprint, targetSeat]
+      const seatSql = inboxSeatPredicate(seatMode, '?4')
+      const binds = seatMode.kind === 'seat'
+        ? [tenant, input.agent, signedKeyFingerprint, seatMode.seat]
         : [tenant, input.agent, signedKeyFingerprint]
       const remainingRow = await env.DB.prepare(
         `SELECT COUNT(*) AS n FROM agent_messages
@@ -664,9 +725,9 @@ async function readAgentInboxForReader(
       ).bind(...binds).first<{ n: number }>()
       remaining = Number(remainingRow?.n ?? 0)
     } else {
-      const seatSql = targetSeat ? inboxSeatFilter('?3') : ''
-      const binds = targetSeat
-        ? [tenant, input.agent, targetSeat]
+      const seatSql = inboxSeatPredicate(seatMode, '?3')
+      const binds = seatMode.kind === 'seat'
+        ? [tenant, input.agent, seatMode.seat]
         : [tenant, input.agent]
       const remainingRow = await env.DB.prepare(
         `SELECT COUNT(*) AS n FROM agent_messages
@@ -683,10 +744,15 @@ async function readAgentInboxForReader(
     for (const m of messages) m.project_id = m.project_id ?? null
     for (const m of messages) m.target_seat = m.target_seat ?? null
     await annotateMessageIntegrity(messages)
-    const seats = await unreadSeatBreakdownForReader(env, tenant, input.agent, reader, signedKeyFingerprint)
+    const [seats, unreadTotalRaw] = await Promise.all([
+      unreadSeatBreakdownForReader(env, tenant, input.agent, reader, signedKeyFingerprint),
+      unreadTotalForReader(env, tenant, input.agent, reader, signedKeyFingerprint),
+    ])
+    const unread_total = unreadTotalRaw
+      ?? (seats ? seats.reduce((n, s) => n + s.unread, 0) : remaining)
     return seats !== undefined
-      ? { ok: true, messages, remaining, seats }
-      : { ok: true, messages, remaining }
+      ? { ok: true, messages, remaining, unread_total, seats }
+      : { ok: true, messages, remaining, unread_total }
   } catch (err) {
     return { ok: false, reason: 'db_error', detail: err instanceof Error ? err.message : String(err) }
   }
@@ -694,7 +760,7 @@ async function readAgentInboxForReader(
 
 export function readAgentInbox(
   env: Env,
-  input: { agent: string; limit?: number; peek?: boolean; sinceSeq?: number; seat?: string },
+  input: { agent: string; limit?: number; peek?: boolean; sinceSeq?: number; seat?: string; allSeats?: boolean },
   opts: Opts = {},
 ): Promise<InboxResult | InboxFailure> {
   return readAgentInboxForReader(env, input, 'bearer', opts)
@@ -783,7 +849,7 @@ export interface AckResult {
 
 export type LeaseFailure = {
   ok: false
-  reason: 'no_tenant' | 'invalid_agent' | 'invalid_limit' | 'invalid_lease' | 'consumer_fenced' | 'db_error'
+  reason: 'no_tenant' | 'invalid_agent' | 'invalid_limit' | 'invalid_lease' | 'invalid_seat' | 'consumer_fenced' | 'db_error'
   detail?: string
 }
 
@@ -819,13 +885,17 @@ async function bearerFenceBlocks(env: Env, tenant: string, agent: string): Promi
  */
 export async function leaseAgentInbox(
   env: Env,
-  input: { agent: string; limit?: number; leaseSeconds?: number; seat?: string },
+  input: { agent: string; limit?: number; leaseSeconds?: number; seat?: string; allSeats?: boolean },
   opts: Pick<Opts, 'now'> = {},
 ): Promise<LeaseResult | LeaseFailure> {
   const tenant = env.TENANT_SLUG
   if (!tenant) return { ok: false, reason: 'no_tenant' }
   if (typeof input.agent !== 'string' || !isRef(input.agent))
     return { ok: false, reason: 'invalid_agent', detail: 'agent required' }
+
+  const seatModeResolved = resolveInboxSeatMode(input)
+  if ('reason' in seatModeResolved) return { ok: false, ...seatModeResolved }
+  const seatMode = seatModeResolved
 
   let limit = DEFAULT_INBOX_LIMIT
   if (input.limit !== undefined) {
@@ -847,17 +917,17 @@ export async function leaseAgentInbox(
   if (!Number.isFinite(nowMs)) return { ok: false, reason: 'db_error', detail: 'clock' }
   const expiresIso = new Date(nowMs + leaseSeconds * 1000).toISOString()
 
-  const targetSeat = typeof input.seat === 'string' && input.seat.trim().length > 0 ? input.seat.trim() : null
-
   // "Not currently leased" — NULL means never leased; a lease at or before now has expired.
   // Both timestamps are ISO-8601 UTC with a fixed shape, so lexicographic <= IS chronological.
-  const leasable = (t: string, a: string, nowParam: string, seatParam: string | null) =>
+  const leasable = (t: string, a: string, nowParam: string, mode: InboxSeatMode, seatParam: string) =>
     `tenant = ${t} AND to_agent = ${a} AND read_at IS NULL AND dead_lettered_at IS NULL
-     AND (lease_expires_at IS NULL OR lease_expires_at <= ${nowParam})${
-       seatParam ? ` AND (target_seat = ${seatParam} OR target_seat IS NULL)` : ''}`
+     AND (lease_expires_at IS NULL OR lease_expires_at <= ${nowParam})${inboxSeatPredicate(mode, seatParam)}`
 
   const bearerFencePredicate = (t: string, a: string) =>
     `COALESCE((SELECT mode FROM agent_inbox_fences WHERE tenant = ${t} AND agent_id = ${a}), 'bearer_only') = 'bearer_only'`
+
+  const seatBind = seatMode.kind === 'seat' ? [seatMode.seat] : []
+  const leasableSeatParam = seatMode.kind === 'seat' ? '?6' : '?6'
 
   try {
     // Step 1 — dead-letter overdue poisoned messages BEFORE the lease. Done here (not on
@@ -868,26 +938,24 @@ export async function leaseAgentInbox(
       `UPDATE agent_messages
           SET dead_lettered_at = ?4,
               dead_letter_reason = 'max_delivery_attempts_exceeded:' || delivery_attempts
-        WHERE ${leasable('?1', '?2', '?3', targetSeat ? '?6' : null)}
+        WHERE ${leasable('?1', '?2', '?3', seatMode, leasableSeatParam)}
           AND delivery_attempts >= ?5
           AND ${bearerFencePredicate('?1', '?2')}`,
-    ).bind(tenant, input.agent, nowIso, nowIso, MAX_DELIVERY_ATTEMPTS, ...(targetSeat ? [targetSeat] : [])).run()
+    ).bind(tenant, input.agent, nowIso, nowIso, MAX_DELIVERY_ATTEMPTS, ...seatBind).run()
 
     // Step 2 — the lease. ONE statement, same shape as the existing consume: the rows are
     // selected and stamped together, so two concurrent leases cannot hand out the same row.
     // The loser's subquery re-evaluates against the winner's committed lease_expires_at (now
     // in the future) and selects nothing. delivery_attempts increments here, on hand-out —
     // the count is "times delivered", which is what the dead-letter rule needs to be true.
-    const leaseBinds = targetSeat
-      ? [tenant, input.agent, nowIso, limit, expiresIso, targetSeat]
-      : [tenant, input.agent, nowIso, limit, expiresIso]
+    const leaseBinds = [tenant, input.agent, nowIso, limit, expiresIso, ...seatBind]
     const rows = await env.DB.prepare(
       `UPDATE agent_messages
           SET delivery_attempts = delivery_attempts + 1,
               lease_expires_at = ?5
         WHERE seq IN (
           SELECT seq FROM agent_messages
-           WHERE ${leasable('?1', '?2', '?3', targetSeat ? '?6' : null)}
+           WHERE ${leasable('?1', '?2', '?3', seatMode, leasableSeatParam)}
              AND ${bearerFencePredicate('?1', '?2')}
            ORDER BY seq ASC LIMIT ?4
         )
@@ -914,9 +982,9 @@ export async function leaseAgentInbox(
       return { ok: false, reason: 'consumer_fenced' }
     }
 
-    const countsSeatSql = targetSeat ? 'AND (target_seat = ?4 OR target_seat IS NULL)' : ''
-    const countsBinds = targetSeat
-      ? [tenant, input.agent, nowIso, targetSeat]
+    const countsSeatSql = inboxSeatPredicate(seatMode, '?4')
+    const countsBinds = seatMode.kind === 'seat'
+      ? [tenant, input.agent, nowIso, seatMode.seat]
       : [tenant, input.agent, nowIso]
     const counts = await env.DB.prepare(
       `SELECT
@@ -1164,7 +1232,7 @@ export async function deleteAgentConnectionMessage(
 /** Called only by the cryptographic verify-and-read boundary in fleet/signed-inbox.ts. */
 export function readVerifiedSignedAgentInbox(
   env: Env,
-  input: { agent: string; limit?: number; peek?: boolean; keyFingerprint: string },
+  input: { agent: string; limit?: number; peek?: boolean; keyFingerprint: string; seat?: string; allSeats?: boolean },
   opts: Pick<Opts, 'now'> = {},
 ): Promise<InboxResult | InboxFailure> {
   return readAgentInboxForReader(env, input, 'signed', opts)

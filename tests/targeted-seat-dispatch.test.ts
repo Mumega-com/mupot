@@ -11,6 +11,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
 import { invokeTool } from '../src/mcp/index'
+import { readAgentInbox } from '../src/agents/messages'
 import type { AuthContext, Env } from '../src/types'
 
 const sha256 = async (s: string) => {
@@ -289,5 +290,60 @@ describe('targeted seat dispatch & isolated mailboxes (Migration 0120)', () => {
     expect(alphaRow.body).toBe('Protected Seat Alpha Message')
     expect(alphaRow.target_seat).toBe('cursor-mupot-setup')
     expect(alphaRow.read_at).toBeNull() // Protected! Not drained by un-scoped call.
+  })
+
+  it('un-scoped readAgentInbox reports seat-targeted backlog via seats and unread_total', async () => {
+    const senderAuth: AuthContext = {
+      memberId: senderMemberId,
+      boundAgentId: senderAgentId,
+      tenant,
+      role: 'member',
+      channel: 'workspace',
+      capabilities: [{ member_id: senderMemberId, scope_type: 'squad', scope_id: squadId, capability: 'member' }],
+    }
+
+    await invokeTool(senderAuth, env, 'send', {
+      to: familyAgentId,
+      body: 'Visibility witness targeted',
+      seat: 'cursor-mupot-setup',
+      request_id: 'req-alpha-visibility',
+    })
+
+    const peek = await readAgentInbox(env, { agent: familyAgentId, peek: true })
+    expect(peek.ok).toBe(true)
+    if (peek.ok) {
+      expect(peek.messages).toHaveLength(0)
+      expect(peek.seats?.find((s) => s.seat === 'cursor-mupot-setup')?.unread).toBeGreaterThanOrEqual(1)
+      expect(peek.unread_total).toBeGreaterThanOrEqual(1)
+    }
+  })
+
+  it('allSeats readAgentInbox drains seat-targeted rows deliberately', async () => {
+    const senderAuth: AuthContext = {
+      memberId: senderMemberId,
+      boundAgentId: senderAgentId,
+      tenant,
+      role: 'member',
+      channel: 'workspace',
+      capabilities: [{ member_id: senderMemberId, scope_type: 'squad', scope_id: squadId, capability: 'member' }],
+    }
+
+    await invokeTool(senderAuth, env, 'send', {
+      to: familyAgentId,
+      body: 'Drain me with allSeats',
+      seat: 'cursor-mupot-setup',
+      request_id: 'req-alpha-allseats',
+    })
+
+    const drained = await readAgentInbox(env, { agent: familyAgentId, allSeats: true })
+    expect(drained.ok).toBe(true)
+    if (drained.ok) {
+      expect(drained.messages.some((m) => m.body === 'Drain me with allSeats')).toBe(true)
+    }
+
+    const row = harness.sqlite.prepare(
+      `SELECT read_at FROM agent_messages WHERE request_id = 'req-alpha-allseats'`,
+    ).get() as { read_at: string | null }
+    expect(row.read_at).not.toBeNull()
   })
 })
