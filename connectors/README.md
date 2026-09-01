@@ -17,7 +17,7 @@ the auth proof it needs: usually a **member token** for MCP clients, or
 | Surface | Endpoint | Auth | Used by |
 |---------|----------|------|---------|
 | MCP (discover) | `GET  https://<your-pot>/mcp/tools` | none (shape only) | all MCP clients |
-| MCP (invoke) | `POST https://<your-pot>/mcp` `{tool, args}` | `Authorization: Bearer <MEMBER_TOKEN>` | Claude, Codex, brain-node |
+| MCP (invoke) | `POST https://<your-pot>/mcp` `{tool, args}` | `Authorization: Bearer <MEMBER_TOKEN>` | Claude, Codex, Grok, brain-node |
 | IM relay | `POST https://<your-pot>/im/webhook` `{message:{chat:{id},text}}` | `X-Telegram-Bot-Api-Secret-Token: <IM_WEBHOOK_SECRET>` | Hermes |
 
 The MCP tool surface (from `GET /mcp/tools`):
@@ -38,6 +38,7 @@ The MCP tool surface (from `GET /mcp/tools`):
 | **Claude** | the **mind** — reasons, plans, drives work | Claude Code / Desktop `.mcp.json` → `/mcp` + a `/mupot` skill | [`claude/`](./claude/) |
 | **Hermes** | the **mouth & ears** — relays IM (Telegram) users in and out | sends Telegram secret-token header, relays chat to `/im/webhook` | [`hermes/`](./hermes/) |
 | **Codex** | secondary mind | MCP config snippet → same `/mcp` + token | [`codex/`](./codex/) |
+| **Grok** | secondary mind (terminal-native) | agent-bound token → send via `/mcp`; receive via a tmux-poller daemon (grok-cli has no verified hook re-injection contract) | [`grok/`](./grok/) |
 | **brain-node** | the sovereign Python **brain as a network node** | member token → points its motor at `/mcp` tools instead of localhost | [`brain-node/`](./brain-node/) |
 
 ## Getting a member token (what you paste in)
@@ -48,7 +49,7 @@ mints it for you:
 1. Log into your pot's dashboard as owner/admin.
 2. Invite the person (or create the gateway/brain "service" member).
 3. Mint a token for them: `POST /api/members/:id/tokens` with a `channel`:
-   - `workspace` → Claude, Codex, brain-node (an MCP client)
+   - `workspace` → Claude, Codex, Grok, brain-node (an MCP client)
    - `im` → token-bearing IM clients outside the Telegram Hermes webhook path
    - `dashboard` → web only (not used by connectors)
 4. The **raw token is shown exactly once.** Copy it straight into the connector
