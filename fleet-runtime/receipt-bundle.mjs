@@ -86,6 +86,7 @@ function cutoverModeForType(receiptType) {
 const EXPORT_RECEIPT_FILE = 'export-receipt.json'
 const MANIFEST_CHECK_RECEIPT_FILE = 'manifest-check.json'
 const SHA256_RE = /^[a-f0-9]{64}$/
+const RELEASE_SHA_RE = /^[a-f0-9]{40}$/
 const SERVICE_KEYS = ['heartbeat', 'control']
 const CONTINUOUS_CHECKS = ['linger_enabled', 'observation_completed_before_deadline', 'services_running', 'heartbeat_tick_advanced', 'control_poll_advanced', 'agent_probe_alive', 'signed_heartbeat_2xx', 'heartbeat_fresh_under_ttl', 'inbox_consume_not_failed']
 const PROJECTION_RECEIPT_TYPE = 'mupot-fleet-portable-evidence-projection/v1'
@@ -159,6 +160,7 @@ function parseArgs(argv) {
     outDir: '',
     exportDir: '',
     controlLabel: '',
+    releaseSha: '',
     manifestPath: '',
     requiredControlVerbs: ['start', 'stop'],
     skipHost: false,
@@ -191,6 +193,11 @@ function parseArgs(argv) {
     else if (arg === '--out-dir') opts.outDir = pathArg(next())
     else if (arg === '--export-dir') opts.exportDir = pathArg(next())
     else if (arg === '--control-label') opts.controlLabel = safeName(next())
+    else if (arg === '--release-sha') {
+      const releaseSha = next()
+      if (!RELEASE_SHA_RE.test(releaseSha)) throw new Error('release sha must be 40 lowercase hexadecimal characters')
+      opts.releaseSha = releaseSha
+    }
     else if (arg === '--manifest') opts.manifestPath = pathArg(next())
     else if (arg === '--require-control-verb') {
       const verbs = splitValues(next())
@@ -242,6 +249,7 @@ function usage() {
     '  --starter-receipt <path>      starter verification receipt for starter-ready mode',
     '  --export-dir <path>           write a clean attachable copy, then check the copied manifest',
     '  --control-label <label>       filename label for this live control receipt, e.g. start or stop',
+    '  --release-sha <sha>            require every probe to bind matching clean /health at this lowercase Git SHA',
     '  --manifest <path>             manifest path for --check-manifest',
     '  --skip-host                   reuse existing host.json from the bundle directory',
     '  --skip-runtime                reuse existing runtime-*.json receipts from the bundle directory',
@@ -294,6 +302,7 @@ function formatHostGoPlan(opts = {}) {
   const baseUrl = opts.baseUrl || process.env.MUPOT_BASE_URL || 'https://YOUR-POT.example.com'
   const installReceipt = opts.installReceiptPath || '~/.fleet/receipts/install.json'
   const multipleAgents = agents.length > 1
+  const releaseArgs = opts.releaseSha ? ['--release-sha', opts.releaseSha] : []
   const lines = []
 
   lines.push('Mupot/Herdr Host-Go handoff plan')
@@ -314,7 +323,7 @@ function formatHostGoPlan(opts = {}) {
       ? `${outDir}-attach`
       : opts.exportDir || `${outDir}-attach`
     const agentArgs = ['--agent', agentId]
-    const commonReceiptArgs = ['node', '~/.fleet/runtime/receipt-bundle.mjs', ...agentArgs, '--out-dir', outDir, ...requiredControlVerbArgs(requiredControlVerbs)]
+    const commonReceiptArgs = ['node', '~/.fleet/runtime/receipt-bundle.mjs', ...agentArgs, '--out-dir', outDir, ...requiredControlVerbArgs(requiredControlVerbs), ...releaseArgs]
 
     lines.push(`${multipleAgents ? `Agent ${agentId}` : 'Agent evidence'}:`)
     lines.push('')
@@ -327,7 +336,7 @@ function formatHostGoPlan(opts = {}) {
     requiredControlVerbs.forEach((verb, index) => {
       const probePath = join(outDir, `probe-${safeName(verb)}.json`)
       const controlReceiptPath = join(outDir, `control-${safeName(verb)}.json`)
-      const queueArgs = ['node', '~/.fleet/runtime/cutover-probe.mjs', '--base-url', baseUrl, '--agent', agentId]
+      const queueArgs = ['node', '~/.fleet/runtime/cutover-probe.mjs', '--base-url', baseUrl, '--agent', agentId, ...releaseArgs]
       if (index === 0) queueArgs.push('--queue-inbox')
       queueArgs.push('--control', verb)
 
@@ -631,17 +640,26 @@ function probeResponseSchemaExact(value) {
 }
 
 function normalizePassingProbeReceipt(receipt) {
-  const topKeys = ['receipt_type', 'generated_at', 'status', 'summary', 'inputs', 'actions', 'checks']
+  const releaseBound = Object.hasOwn(receipt?.inputs ?? {}, 'release_sha') || Object.hasOwn(receipt ?? {}, 'health')
+  const topKeys = ['receipt_type', 'generated_at', 'status', 'summary', 'inputs', ...(releaseBound ? ['health'] : []), 'actions', 'checks']
+  const inputKeys = ['base_url', 'agent', ...(releaseBound ? ['release_sha'] : []), 'queue_inbox', 'control_verbs', 'inbox_kind', 'agent_token_env', 'owner_token_env']
   if (!exactSummaryEnvelope(receipt, topKeys) || receipt.receipt_type !== EXPECTED.probe || receipt.status !== 'pass' ||
-    !hasExactKeys(receipt.inputs, ['base_url', 'agent', 'queue_inbox', 'control_verbs', 'inbox_kind', 'agent_token_env', 'owner_token_env']) ||
+    !hasExactKeys(receipt.inputs, inputKeys) ||
     !nonEmptyString(receipt.inputs.base_url) || !nonEmptyString(receipt.inputs.agent) || typeof receipt.inputs.queue_inbox !== 'boolean' ||
     !exactStringArray(receipt.inputs.control_verbs, { unique: true }) || receipt.inputs.control_verbs.some((verb) => !CONTROL_VERBS.has(verb)) ||
     !nonEmptyString(receipt.inputs.inbox_kind) || !nonEmptyString(receipt.inputs.agent_token_env) || !nonEmptyString(receipt.inputs.owner_token_env) ||
     (!receipt.inputs.queue_inbox && receipt.inputs.control_verbs.length === 0) || !Array.isArray(receipt.actions)) return null
+  if (releaseBound && (!RELEASE_SHA_RE.test(receipt.inputs.release_sha) ||
+    !hasExactKeys(receipt.health, ['ok', 'service', 'commit', 'clean']) || receipt.health.ok !== true || receipt.health.service !== 'mupot' ||
+    receipt.health.commit !== receipt.inputs.release_sha || receipt.health.clean !== true)) return null
   const expectedChecks = [
     ['base_url_valid', ['ok', 'component', 'check']],
     ['target_agent_present', ['ok', 'component', 'check', 'agent']],
     ['probe_action_selected', ['ok', 'component', 'check']],
+    ...(releaseBound ? [
+      ['release_sha_valid', ['ok', 'component', 'check']],
+      ['release_health_matches', ['ok', 'component', 'check', 'status']],
+    ] : []),
     ...(receipt.inputs.queue_inbox ? [
       ['agent_token_present', ['ok', 'component', 'check', 'env']],
       ['inbox_probe_queued', ['ok', 'component', 'check', 'status', 'response_ok']],
@@ -654,7 +672,8 @@ function normalizePassingProbeReceipt(receipt) {
     const check = receipt.checks[index]
     const [name, keys] = expectedChecks[index]
     if (!hasExactKeys(check, keys) || check.ok !== true || check.component !== 'cutover-probe' || check.check !== name) return null
-    if (Object.hasOwn(check, 'status') && (!Number.isInteger(check.status) || check.status < 200 || check.status >= 300 || check.response_ok !== true)) return null
+    if (Object.hasOwn(check, 'status') && (!Number.isInteger(check.status) || check.status < 200 || check.status >= 300 ||
+      (name !== 'release_health_matches' && check.response_ok !== true))) return null
   }
   if (receipt.checks[1].agent !== receipt.inputs.agent) return null
   const actions = []
@@ -936,6 +955,12 @@ function priorBundleManifestPasses(prior, starter, agentId, admittedDigests = nu
       }
       if (check.check === 'probe_receipt_status_pass') {
         return hasExactKeys(check, ['ok', 'component', 'check', 'path', 'actual']) && nonEmptyString(check.path) && check.actual === 'pass'
+      }
+      if (check.check === 'release_sha_valid') {
+        return hasExactKeys(check, ['ok', 'component', 'check']) && RELEASE_SHA_RE.test(prior.inputs.release_sha ?? '')
+      }
+      if (check.check === 'probe_release_sha_matches_bundle') {
+        return hasExactKeys(check, ['ok', 'component', 'check', 'path']) && RELEASE_SHA_RE.test(prior.inputs.release_sha ?? '') && nonEmptyString(check.path)
       }
       if (['host_receipt_reused', 'runtime_receipts_reused', 'control_receipts_reused'].includes(check.check)) {
         return hasExactKeys(check, ['ok', 'component', 'check'])
@@ -1708,13 +1733,15 @@ function addNextStepChecks(checks, manifestPath, manifest, hardGateSummary, mode
 function manifestSchemaExact(manifest) {
   const starter = manifestStarterMode(manifest)
   const portable = Object.hasOwn(manifest ?? {}, 'provenance')
+  const releaseBound = Object.hasOwn(manifest?.inputs ?? {}, 'release_sha')
   const topKeys = ['receipt_type', 'generated_at', 'status', 'summary', 'integrity', 'inputs', 'artifacts', 'next_steps', 'checks', ...(portable ? ['provenance'] : [])]
-  const inputKeys = ['agents', 'out_dir', 'daemon_config', 'inbox_handler_config', 'control_config', 'install_receipt', 'probe_receipts', 'control_label', 'required_control_verbs', 'exec_probes', 'verify_only', 'skip_host', 'skip_runtime', 'skip_control', ...(starter ? ['bundle_mode'] : [])]
+  const inputKeys = ['agents', 'out_dir', 'daemon_config', 'inbox_handler_config', 'control_config', 'install_receipt', 'probe_receipts', 'control_label', ...(releaseBound ? ['release_sha'] : []), 'required_control_verbs', 'exec_probes', 'verify_only', 'skip_host', 'skip_runtime', 'skip_control', ...(starter ? ['bundle_mode'] : [])]
   const artifactKeys = ['out_dir', 'install', 'probes', 'host', 'runtimes', 'controls', 'cutover_gate', 'manifest', ...(starter ? ['service', 'continuous', 'starter'] : [])]
   const metaKeys = ['path', 'receipt_type', 'status', 'sha256']
   if (!hasExactKeys(manifest, topKeys) || !hasExactKeys(manifest.summary, ['status', 'passed', 'failed', 'warnings']) ||
     !hasExactKeys(manifest.integrity, ['algorithm', 'covers', 'excludes']) || !hasExactKeys(manifest.inputs, inputKeys) || !hasExactKeys(manifest.artifacts, artifactKeys) ||
     !Array.isArray(manifest.next_steps) || !Array.isArray(manifest.checks) || !Array.isArray(manifest.artifacts.probes) || !Array.isArray(manifest.artifacts.runtimes) || !Array.isArray(manifest.artifacts.controls)) return false
+  if (releaseBound && !RELEASE_SHA_RE.test(manifest.inputs.release_sha)) return false
   if (portable) {
     if (!starter || !hasExactKeys(manifest.provenance, ['schema', 'source_path', 'source_sha256', 'projections']) ||
       manifest.provenance.schema !== PROVENANCE_SCHEMA || typeof manifest.provenance.source_path !== 'string' ||
@@ -2718,6 +2745,21 @@ function checkBundleManifest(opts = {}) {
       const projection = provenance ? rawReceipt : null
       const receipt = projectionSchemaExact(projection) ? projection.content : rawReceipt
       if (receipt) receiptRecords.push({ label: entry.label, receipt, checkedPath })
+      if (entry.label.startsWith('probe:')) {
+        const manifestReleaseBound = Object.hasOwn(manifest.inputs ?? {}, 'release_sha')
+        const probeReleaseBound = Object.hasOwn(receipt?.inputs ?? {}, 'release_sha') || Object.hasOwn(receipt ?? {}, 'health')
+        if (manifestReleaseBound || probeReleaseBound) {
+          const normalizedProbe = normalizePassingProbeReceipt(receipt)
+          checks.push({
+            ok: manifestReleaseBound && RELEASE_SHA_RE.test(manifest.inputs.release_sha) &&
+              normalizedProbe?.inputs?.release_sha === manifest.inputs.release_sha,
+            component: 'receipt-bundle-check',
+            check: 'probe_release_sha_matches_manifest',
+            artifact: entry.label,
+            path: checkedPath || null,
+          })
+        }
+      }
       const normalizedCutover = entry.label === 'cutover_gate' ? normalizePassingCutoverReceipt(receipt) : null
       const declaredCutoverMode = entry.label === 'cutover_gate'
         ? exactCutoverArtifactMeta(artifactMetaForLabel(manifest, entry.label))
@@ -4090,6 +4132,17 @@ function addProbeReceiptStatusChecks(checks, path, receipt, { exact = false } = 
   })
 }
 
+function addProbeReleaseShaCheck(checks, path, receipt, releaseSha) {
+  if (!releaseSha) return
+  const normalized = normalizePassingProbeReceipt(receipt)
+  checks.push({
+    ok: Boolean(RELEASE_SHA_RE.test(releaseSha) && normalized && normalized.inputs.release_sha === releaseSha),
+    component: 'receipt-bundle',
+    check: 'probe_release_sha_matches_bundle',
+    path,
+  })
+}
+
 async function runAndWrite(label, path, builder, builderOpts, opts, checks) {
   try {
     const receipt = await builder(builderOpts)
@@ -4238,6 +4291,7 @@ function includeProbeReceipts(outDir, opts, checks) {
       const receipt = readReceipt(path)
       checks.push({ ok: true, component: 'receipt-bundle', check: 'probe_receipt_reused', path })
       addProbeReceiptStatusChecks(checks, path, receipt, { exact: starterModeSelected(opts) })
+      addProbeReleaseShaCheck(checks, path, receipt, opts.releaseSha)
       metas.push(receiptMeta(path))
     }
     return metas
@@ -4256,12 +4310,16 @@ function includeProbeReceipts(outDir, opts, checks) {
     if (resolve(source) === resolve(dest)) {
       checks.push({ ok: true, component: 'receipt-bundle', check: 'probe_receipt_reused', path: dest })
       addProbeReceiptStatusChecks(checks, dest, receipt, { exact: starterModeSelected(opts) })
+      addProbeReleaseShaCheck(checks, dest, receipt, opts.releaseSha)
       metas.push(receiptMeta(dest))
       return
     }
 
     const wrote = writeJson(dest, receipt, opts, checks, 'probe')
-    if (wrote) addProbeReceiptStatusChecks(checks, dest, receipt, { exact: starterModeSelected(opts) })
+    if (wrote) {
+      addProbeReceiptStatusChecks(checks, dest, receipt, { exact: starterModeSelected(opts) })
+      addProbeReleaseShaCheck(checks, dest, receipt, opts.releaseSha)
+    }
     metas.push(existsSync(dest) ? receiptMeta(dest) : { path: dest, receipt_type: null, status: null })
   })
   return metas
@@ -4425,6 +4483,9 @@ async function buildBundle(opts) {
   const skipRuntime = Boolean(opts.skipRuntime || verifyOnly)
   const skipControl = Boolean(opts.skipControl || verifyOnly)
   checks.push({ ok: agents.length > 0, component: 'receipt-bundle', check: 'selected_agents_present', agents })
+  if (opts.releaseSha) {
+    checks.push({ ok: RELEASE_SHA_RE.test(opts.releaseSha), component: 'receipt-bundle', check: 'release_sha_valid' })
+  }
   ensureDir(outDir, checks)
 
   const hostBuilder = opts.hostBuilder ?? buildHostReceipt
@@ -4573,6 +4634,7 @@ async function buildBundle(opts) {
       install_receipt: opts.installReceiptPath || null,
       probe_receipts: opts.probeReceiptPaths ?? [],
       control_label: opts.controlLabel || null,
+      ...(opts.releaseSha ? { release_sha: opts.releaseSha } : {}),
       required_control_verbs: requiredControlVerbs,
       exec_probes: Boolean(opts.execProbes),
       verify_only: verifyOnly,

@@ -16,6 +16,7 @@ import { verifyStarterBundle } from './starter-manifest.mjs'
 
 const POT_URL = 'https://pot.example.org'
 const POT_TENANT = 'tenant-a'
+const RELEASE_SHA = 'a'.repeat(40)
 const HEARTBEAT_DEFINITION = '[Service]\nExecStart=heartbeat\n'
 const CONTROL_DEFINITION = '[Service]\nExecStart=control\n'
 const STARTER_MANIFEST_VALUE = {
@@ -158,6 +159,24 @@ function probeReceipt(status = 'pass', verb = 'start') {
     ],
     checks,
   }
+}
+
+function boundProbeReceipt(status = 'pass', verb = 'start', releaseSha = RELEASE_SHA) {
+  const receipt = probeReceipt(status, verb)
+  const healthOk = status === 'pass'
+  receipt.inputs.release_sha = releaseSha
+  receipt.health = {
+    ok: healthOk,
+    service: 'mupot',
+    commit: releaseSha,
+    clean: healthOk,
+  }
+  receipt.checks.splice(3, 0,
+    { ok: true, component: 'cutover-probe', check: 'release_sha_valid' },
+    { ok: healthOk, component: 'cutover-probe', check: 'release_health_matches', status: 200 },
+  )
+  receipt.summary = summarizeFixture(receipt.checks)
+  return receipt
 }
 
 function hostReceipt(status = 'pass', opts = {}) {
@@ -469,6 +488,19 @@ function seedCutoverEvidence(outDir, host = hostReceipt()) {
   writeJson(join(outDir, 'runtime-agent-one.json'), runtimeReceipt('agent-one'))
   writeJson(join(outDir, 'control-start.json'), controlReceipt('agent-one', 'start'))
   writeJson(join(outDir, 'control-stop.json'), controlReceipt('agent-one', 'stop'))
+}
+
+async function buildBoundBundle(releaseSha = RELEASE_SHA) {
+  const outDir = tmpDir()
+  seedCutoverEvidence(outDir)
+  writeJson(join(outDir, 'probe-start.json'), boundProbeReceipt('pass', 'start', releaseSha))
+  const bundle = await buildBundle({
+    outDir,
+    agents: ['agent-one'],
+    releaseSha,
+    verifyOnly: true,
+  })
+  return { outDir, bundle }
 }
 
 function legacyCutoverReceipt({ agentId = 'agent-one', hostPath, runtimePath, startPath, stopPath }) {
@@ -947,6 +979,105 @@ test('receipt bundle writes host, runtime, control, cutover gate, and manifest',
   assert.ok(manifest.checks.some((c) => c.check === 'probe_receipt_status_pass' && c.ok === true))
   assert.ok(manifest.checks.some((c) => c.check === 'cutover_gate_status_pass' && c.ok === true))
   assert.ok(manifest.checks.some((c) => c.check === 'manifest_written' && c.ok === true))
+})
+
+test('release-bound bundle rejects a required probe with missing or mismatched release SHA', async (t) => {
+  for (const [name, probe] of [
+    ['missing', probeReceipt('pass', 'start')],
+    ['mismatched', boundProbeReceipt('pass', 'start', 'b'.repeat(40))],
+  ]) {
+    await t.test(name, async () => {
+      const outDir = tmpDir()
+      seedCutoverEvidence(outDir)
+      writeJson(join(outDir, 'probe-start.json'), probe)
+      const bundle = await buildBundle({
+        outDir,
+        agents: ['agent-one'],
+        releaseSha: RELEASE_SHA,
+        verifyOnly: true,
+      })
+
+      assert.equal(bundle.status, 'fail')
+      assert.ok(bundle.checks.some((check) =>
+        check.check === 'probe_release_sha_matches_bundle' && check.ok === false
+      ))
+    })
+  }
+})
+
+test('release-bound bundle emits the SHA, exports cleanly, and rechecks copied probes', async () => {
+  const { outDir, bundle } = await buildBoundBundle()
+  assert.equal(bundle.status, 'pass', JSON.stringify(bundle.checks.filter((check) => check.ok !== true), null, 2))
+  assert.equal(bundle.inputs.release_sha, RELEASE_SHA)
+
+  const manifest = JSON.parse(readFileSync(join(outDir, 'manifest.json'), 'utf8'))
+  assert.equal(manifest.inputs.release_sha, RELEASE_SHA)
+  assert.equal(checkBundleManifest({ outDir }).status, 'pass')
+
+  const exportDir = tmpDir()
+  const exported = exportBundle({ outDir, exportDir })
+  assert.equal(exported.status, 'pass', JSON.stringify(exported.checks.filter((check) => check.ok !== true), null, 2))
+  assert.equal(checkBundleManifest({ outDir: exportDir }).status, 'pass')
+  assert.equal(JSON.parse(readFileSync(join(exportDir, 'manifest.json'), 'utf8')).inputs.release_sha, RELEASE_SHA)
+  assert.equal(readFileSync(join(exportDir, 'export-receipt.json'), 'utf8').includes(RELEASE_SHA), false)
+  assert.equal(readFileSync(join(exportDir, 'manifest-check.json'), 'utf8').includes(RELEASE_SHA), false)
+})
+
+test('manifest recheck derives the release SHA from the manifest and fails closed on missing, malformed, or mismatched binding', async (t) => {
+  for (const [name, mutate] of [
+    ['missing', (manifest) => { delete manifest.inputs.release_sha }],
+    ['uppercase', (manifest) => { manifest.inputs.release_sha = RELEASE_SHA.toUpperCase() }],
+    ['mismatched', (manifest) => { manifest.inputs.release_sha = 'b'.repeat(40) }],
+  ]) {
+    await t.test(name, async () => {
+      const { outDir, bundle } = await buildBoundBundle()
+      assert.equal(bundle.status, 'pass')
+      const manifestPath = join(outDir, 'manifest.json')
+      const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+      mutate(manifest)
+      writeJson(manifestPath, manifest)
+      chmodSync(manifestPath, 0o600)
+
+      const checked = checkBundleManifest({ outDir })
+      assert.equal(checked.status, 'fail')
+      assert.ok(checked.checks.some((check) =>
+        check.check === 'probe_release_sha_matches_manifest' && check.ok === false
+      ))
+    })
+  }
+})
+
+test('tampering an exported bound probe fails semantic recheck even after its manifest digest is updated', async () => {
+  const { outDir, bundle } = await buildBoundBundle()
+  assert.equal(bundle.status, 'pass')
+  const exportDir = tmpDir()
+  assert.equal(exportBundle({ outDir, exportDir }).status, 'pass')
+
+  const manifestPath = join(exportDir, 'manifest.json')
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+  const probePath = join(exportDir, basename(manifest.artifacts.probes[0].path))
+  const probe = JSON.parse(readFileSync(probePath, 'utf8'))
+  probe.health.commit = 'b'.repeat(40)
+  writeJson(probePath, probe)
+  chmodSync(probePath, 0o600)
+  manifest.artifacts.probes[0].sha256 = sha256(probePath)
+  writeJson(manifestPath, manifest)
+  chmodSync(manifestPath, 0o600)
+
+  const checked = checkBundleManifest({ outDir: exportDir })
+  assert.equal(checked.status, 'fail')
+  assert.ok(checked.checks.some((check) =>
+    check.check === 'probe_release_sha_matches_manifest' && check.ok === false
+  ))
+})
+
+test('historical unbound bundle remains valid without release fields', async () => {
+  const outDir = tmpDir()
+  seedCutoverEvidence(outDir)
+  const bundle = await buildBundle({ outDir, agents: ['agent-one'], verifyOnly: true })
+  assert.equal(bundle.status, 'pass')
+  assert.equal(Object.hasOwn(bundle.inputs, 'release_sha'), false)
+  assert.equal(checkBundleManifest({ outDir }).status, 'pass')
 })
 
 test('new bundle rejects an injected legacy cutover gate', async () => {
@@ -3662,13 +3793,43 @@ test('parseArgs accepts read-only host-go status', () => {
 })
 
 test('parseArgs accepts host-go plan options', () => {
-  const opts = parseArgs(['--agent', 'agent-one', '--out-dir', './receipts/agent-one', '--export-dir', './receipts/agent-one-attach', '--base-url', 'https://pot.example.org', '--host-go-plan'])
+  const opts = parseArgs(['--agent', 'agent-one', '--out-dir', './receipts/agent-one', '--export-dir', './receipts/agent-one-attach', '--base-url', 'https://pot.example.org', '--release-sha', RELEASE_SHA, '--host-go-plan'])
 
   assert.equal(opts.hostGoPlan, true)
   assert.equal(opts.baseUrl, 'https://pot.example.org')
+  assert.equal(opts.releaseSha, RELEASE_SHA)
   assert.ok(opts.outDir.endsWith('/receipts/agent-one'))
   assert.ok(opts.exportDir.endsWith('/receipts/agent-one-attach'))
   assert.deepEqual(opts.agents, ['agent-one'])
+})
+
+test('parseArgs rejects malformed or uppercase release SHA', () => {
+  assert.throws(() => parseArgs(['--release-sha', 'abc']), /release sha/i)
+  assert.throws(() => parseArgs(['--release-sha', RELEASE_SHA.toUpperCase()]), /release sha/i)
+})
+
+test('release-bound Host-Go plan passes the SHA to every probe and bundle build command', () => {
+  const plan = formatHostGoPlan({
+    agents: ['agent-one'],
+    outDir: '~/.fleet/receipts/agent-one',
+    exportDir: '~/.fleet/receipts/agent-one-attach',
+    installReceiptPath: '~/.fleet/receipts/install.json',
+    baseUrl: POT_URL,
+    releaseSha: RELEASE_SHA,
+    requiredControlVerbs: ['start', 'stop'],
+  })
+
+  const probeCommands = plan.split('\n').filter((line) => line.includes('/cutover-probe.mjs'))
+  const bundleBuildCommands = plan.split('\n').filter((line) =>
+    line.includes('/receipt-bundle.mjs') &&
+    !line.includes('--status') &&
+    !line.includes('--export') &&
+    !line.includes('--check-manifest')
+  )
+  assert.equal(probeCommands.length, 2)
+  assert.ok(probeCommands.every((line) => line.includes(`--release-sha ${RELEASE_SHA}`)))
+  assert.ok(bundleBuildCommands.length > 0)
+  assert.ok(bundleBuildCommands.every((line) => line.includes(`--release-sha ${RELEASE_SHA}`)))
 })
 
 test('formatHostGoPlan prints a release-neutral live-host command sequence without token values', () => {
