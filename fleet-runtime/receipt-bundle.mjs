@@ -364,8 +364,8 @@ function formatHostGoPlan(opts = {}) {
     lines.push(commandLine([...commonReceiptArgs, '--verify-only']))
     lines.push('')
     lines.push(`${requiredControlVerbs.length + 3}. Export the attachable bundle and check the copied evidence:`)
-    lines.push(commandLine(['node', '~/.fleet/runtime/receipt-bundle.mjs', '--out-dir', outDir, '--export-dir', exportDir, '--export']))
-    lines.push(commandLine(['node', '~/.fleet/runtime/receipt-bundle.mjs', '--out-dir', exportDir, '--check-manifest']))
+    lines.push(commandLine(['node', '~/.fleet/runtime/receipt-bundle.mjs', '--out-dir', outDir, '--export-dir', exportDir, '--export', ...releaseArgs]))
+    lines.push(commandLine(['node', '~/.fleet/runtime/receipt-bundle.mjs', '--out-dir', exportDir, '--check-manifest', ...releaseArgs]))
     lines.push('')
     lines.push('Attach only the exported directory after manifest.json, cutover-gate.json, export-receipt.json, and manifest-check.json all report status "pass".')
     lines.push('')
@@ -938,7 +938,7 @@ function normalizePassingCutoverReceipt(receipt) {
   return normalized ? { mode, receipt: normalized } : null
 }
 
-function priorBundleManifestPasses(prior, starter, agentId, admittedDigests = null, probePaths = []) {
+function priorBundleManifestPasses(prior, starter, agentId, expectedReleaseSha = null, admittedDigests = null, probePaths = []) {
   const topKeys = ['receipt_type', 'generated_at', 'status', 'summary', 'integrity', 'inputs', 'artifacts', 'next_steps', 'checks']
   if (!exactSummaryEnvelope(prior, topKeys) || !manifestSchemaExact(prior) || prior.receipt_type !== 'mupot-fleet-receipt-bundle/v1' || prior.status !== 'pass' ||
     prior.integrity.algorithm !== 'sha256' || !exactStringArray(prior.next_steps, { nonEmpty: true }) ||
@@ -951,7 +951,10 @@ function priorBundleManifestPasses(prior, starter, agentId, admittedDigests = nu
     artifacts.probes.some((meta) => !exactArtifactMeta(meta, EXPECTED.probe)) || !Array.isArray(artifacts.runtimes) || artifacts.runtimes.length === 0 ||
     artifacts.runtimes.some((meta) => !exactArtifactMeta(meta, EXPECTED.runtime)) || !Array.isArray(artifacts.controls) || artifacts.controls.length < 2 ||
     artifacts.controls.some((meta) => !exactArtifactMeta(meta, EXPECTED.control))) return false
-  const expectedReleaseSha = Object.hasOwn(prior.inputs, 'release_sha') ? prior.inputs.release_sha : null
+  const priorReleaseDeclared = Object.hasOwn(prior.inputs, 'release_sha')
+  if (expectedReleaseSha !== null) {
+    if (!RELEASE_SHA_RE.test(expectedReleaseSha) || !priorReleaseDeclared || prior.inputs.release_sha !== expectedReleaseSha) return false
+  } else if (priorReleaseDeclared) return false
   const probeValidation = validateProbeReceiptSet(probePaths, expectedReleaseSha)
   if (probePaths.length !== artifacts.probes.length || !probeValidation.allValid) return false
   const starterDigests = admittedDigests ?? new Map(starter.artifacts.map((artifact) => [artifact.role, artifact.sha256]))
@@ -1063,7 +1066,7 @@ function roleReceiptPath(starterPath, reference) {
   return regularFileStat(candidate) && pathContainedBy(candidate, dirname(starterPath)) ? candidate : ''
 }
 
-function normalizeStarterEvidence({ serviceReceipt, continuousReceipt, starterReceipt, hostReceipt, agents, starterPath = '', outerManifestPath = '' }) {
+function normalizeStarterEvidence({ serviceReceipt, continuousReceipt, starterReceipt, hostReceipt, agents, starterPath = '', outerManifestPath = '', expectedReleaseSha = null }) {
   const service = normalizePassingServiceReceipt(serviceReceipt)
   const continuous = normalizeContinuousReceipt(continuousReceipt, agents, service)
   const starter = normalizeStarterReceipt(starterReceipt)
@@ -1109,7 +1112,7 @@ function normalizeStarterEvidence({ serviceReceipt, continuousReceipt, starterRe
   const probePaths = Array.isArray(prior?.artifacts?.probes)
     ? prior.artifacts.probes.map((meta) => admittedPriorArtifactPath(starterPath, meta))
     : []
-  if (probePaths.some((path) => !path) || !priorBundleManifestPasses(prior, starter, continuous.agent_id, admittedDigests, probePaths) ||
+  if (probePaths.some((path) => !path) || !priorBundleManifestPasses(prior, starter, continuous.agent_id, expectedReleaseSha, admittedDigests, probePaths) ||
     [lifecycleStart, lifecycleStop].some((lifecycle) =>
     lifecycle.evidence_mode === 'daemon_state' && !admittedProbeBinding(probePaths, lifecycle, dirname(starterPath)))) return null
   return { service_manager: service.manager, platform: service.platform, definition_hashes: service.definitions, observed_deltas: { heartbeat_tick: continuous.heartbeat_delta, control_poll: continuous.control_delta }, starter_manifest_sha256: starter.manifest.sha256, agent_id: continuous.agent_id, tenant: hostReceipt.target?.tenant ?? null }
@@ -1796,7 +1799,17 @@ function manifestSchemaExact(manifest) {
   return metas.every((meta) => hasExactKeys(meta, metaKeys))
 }
 
-function addStarterEvidenceValidation(checks, component, artifacts, agents, extra = {}) {
+function manifestMatchesExpectedReleaseSha(manifest, expectedReleaseSha) {
+  return Boolean(
+    RELEASE_SHA_RE.test(expectedReleaseSha) &&
+    manifest &&
+    manifestSchemaExact(manifest) &&
+    Object.hasOwn(manifest.inputs ?? {}, 'release_sha') &&
+    manifest.inputs.release_sha === expectedReleaseSha
+  )
+}
+
+function addStarterEvidenceValidation(checks, component, artifacts, agents, extra = {}, expectedReleaseSha = null) {
   const starterPath = artifacts.starter?.path ?? ''
   const outerManifestPath = typeof extra.path === 'string'
     ? extra.path
@@ -1811,6 +1824,7 @@ function addStarterEvidenceValidation(checks, component, artifacts, agents, extr
     agents,
     starterPath,
     outerManifestPath,
+    expectedReleaseSha,
   })
   checks.push({ ok: Boolean(evidence), component, check: 'starter_evidence_contracts_valid', ...extra })
   return evidence
@@ -2349,6 +2363,8 @@ function expectedExportReceiptChecks(receipt, manifestDir, manifest, expectedMan
     JSON.stringify(receipt.next_steps) !== JSON.stringify([CUTOVER_MODE[cutoverMode].attach])) return null
 
   let manifestCopySha = manifestCopy.sha256
+  const releaseShaEnforced = receipt.checks.some((check) => check.check === 'source_manifest_release_sha_matches_expected')
+  const sourceManifestChecked = receipt.checks.some((check) => check.check === 'source_manifest_check_pass')
   if (provenance) {
     const sourcePath = provenanceSourcePath(manifestDir, provenance.source_path, 'outer_manifest')
     const sourceBytes = sourcePath ? readRegularBytes(sourcePath, manifestDir) : null
@@ -2362,7 +2378,8 @@ function expectedExportReceiptChecks(receipt, manifestDir, manifest, expectedMan
     { ok: true, component: 'receipt-bundle-export', check: 'export_dir_selected', path: receipt.inputs.export_dir },
     { ok: true, component: 'receipt-bundle-export', check: 'export_dir_separate_from_source', source_dir: '.', export_dir: receipt.inputs.export_dir },
     { ok: true, component: 'receipt-bundle-export', check: 'source_manifest_read', path: receipt.inputs.manifest },
-    ...(manifestStarterMode(manifest) ? [{ ok: true, component: 'receipt-bundle-export', check: 'source_manifest_check_pass', path: receipt.inputs.manifest, status: 'pass' }] : []),
+    ...(releaseShaEnforced ? [{ ok: true, component: 'receipt-bundle-export', check: 'source_manifest_release_sha_matches_expected', path: receipt.inputs.manifest }] : []),
+    ...(sourceManifestChecked ? [{ ok: true, component: 'receipt-bundle-export', check: 'source_manifest_check_pass', path: receipt.inputs.manifest, status: 'pass' }] : []),
     { ok: true, component: 'receipt-bundle', check: 'out_dir_ready', path: receipt.inputs.export_dir },
     { ok: true, component: 'receipt-bundle-export', check: 'manifest_copied', source: 'portable-manifest', path: 'manifest.json', sha256: manifestCopySha },
   ]
@@ -2652,6 +2669,15 @@ function checkBundleManifest(opts = {}) {
       component: 'receipt-bundle-check',
       check: 'manifest_read',
       path: manifestPath,
+    })
+  }
+
+  if (opts.releaseSha) {
+    checks.push({
+      ok: manifestMatchesExpectedReleaseSha(manifest, opts.releaseSha),
+      component: 'receipt-bundle-check',
+      check: 'manifest_release_sha_matches_expected',
+      path: manifestPath || null,
     })
   }
 
@@ -3009,7 +3035,14 @@ function checkBundleManifest(opts = {}) {
         const record = receiptRecords.find((entry) => entry.label === role)
         if (record) contractArtifacts[role] = { path: record.checkedPath }
       }
-      addStarterEvidenceValidation(checks, 'receipt-bundle-check', contractArtifacts, agents, { path: manifestPath })
+      addStarterEvidenceValidation(
+        checks,
+        'receipt-bundle-check',
+        contractArtifacts,
+        agents,
+        { path: manifestPath },
+        manifestReleaseDeclared ? manifest.inputs.release_sha : null,
+      )
     }
     let directoryMode = null
     try { directoryMode = statSync(manifestDir).mode & 0o777 } catch {}
@@ -3493,6 +3526,7 @@ function exportBundle(opts = {}) {
   const exportDir = opts.exportDir ? pathArg(opts.exportDir) : ''
   let manifest = null
   let sourceCheck = null
+  let releaseShaMatches = !opts.releaseSha
   let exportDirReady = false
   const copied = []
 
@@ -3524,15 +3558,25 @@ function exportBundle(opts = {}) {
       check: 'source_manifest_read',
       path: manifestPath,
     })
-    if (manifest && manifestStarterMode(manifest)) {
-      sourceCheck = checkBundleManifest({ manifestPath })
-      checks.push({ ok: sourceCheck.status === 'pass', component: 'receipt-bundle-export', check: 'source_manifest_check_pass', path: manifestPath, status: sourceCheck.status })
-    }
+  }
+
+  if (opts.releaseSha) {
+    releaseShaMatches = manifestMatchesExpectedReleaseSha(manifest, opts.releaseSha)
+    checks.push({
+      ok: releaseShaMatches,
+      component: 'receipt-bundle-export',
+      check: 'source_manifest_release_sha_matches_expected',
+      path: manifestPath || null,
+    })
+  }
+  if (manifest && (manifestStarterMode(manifest) || opts.releaseSha)) {
+    sourceCheck = checkBundleManifest({ manifestPath })
+    checks.push({ ok: sourceCheck.status === 'pass', component: 'receipt-bundle-export', check: 'source_manifest_check_pass', path: manifestPath, status: sourceCheck.status })
   }
 
   if (exportDir) exportDirReady = ensureDir(exportDir, checks)
 
-  if (manifest && (!manifestStarterMode(manifest) || sourceCheck?.status === 'pass') && exportDirReady && sourceDir && resolve(sourceDir) !== resolve(exportDir)) {
+  if (manifest && releaseShaMatches && (!(manifestStarterMode(manifest) || opts.releaseSha) || sourceCheck?.status === 'pass') && exportDirReady && sourceDir && resolve(sourceDir) !== resolve(exportDir)) {
     const manifestDest = join(exportDir, 'manifest.json')
     if (writeExportManifest(manifest, manifestDest, { ...opts, sourceDir }, checks)) {
       copied.push({ label: 'manifest', source: manifestPath, path: manifestDest, sha256: fileSha256(manifestDest) })
@@ -3649,7 +3693,7 @@ function firstMeta(path) {
   return existsSync(path) ? receiptMeta(path) : null
 }
 
-function starterEvidence(artifacts, agents) {
+function starterEvidence(artifacts, agents, expectedReleaseSha = null) {
   const service = artifacts.service?.path ? projectionContent(readReceipt(artifacts.service.path)) : null
   const continuous = artifacts.continuous?.path ? projectionContent(readReceipt(artifacts.continuous.path)) : null
   const starter = artifacts.starter?.path ? projectionContent(readReceipt(artifacts.starter.path)) : null
@@ -3662,6 +3706,7 @@ function starterEvidence(artifacts, agents) {
     agents,
     starterPath: artifacts.starter?.path ?? '',
     outerManifestPath: typeof artifacts.manifest === 'string' ? artifacts.manifest : artifacts.manifest?.path ?? '',
+    expectedReleaseSha,
   })
 }
 
@@ -4018,7 +4063,14 @@ function inspectBundleStatus(opts = {}) {
         status: meta?.status ?? null,
       })
     }
-    addStarterEvidenceValidation(checks, 'receipt-bundle-status', artifacts, agents)
+    addStarterEvidenceValidation(
+      checks,
+      'receipt-bundle-status',
+      artifacts,
+      agents,
+      {},
+      Object.hasOwn(manifest?.inputs ?? {}, 'release_sha') ? manifest.inputs.release_sha : null,
+    )
   }
   statusCheck(checks, 'probe_receipt_pass_present', passingMetaCount(artifacts.probes, EXPECTED.probe) > 0, {
     count: artifacts.probes.length,
@@ -4110,7 +4162,13 @@ function inspectBundleStatus(opts = {}) {
       manifest: manifestCheck.manifest,
     } : null,
     host_go_checklist: hostGoChecklist,
-    ...(starterMode ? { starter_ready: starterEvidence(artifacts, agents) } : {}),
+    ...(starterMode ? {
+      starter_ready: starterEvidence(
+        artifacts,
+        agents,
+        Object.hasOwn(manifest?.inputs ?? {}, 'release_sha') ? manifest.inputs.release_sha : null,
+      ),
+    } : {}),
     next_steps: next,
     checks,
   }
@@ -4632,7 +4690,7 @@ async function buildBundle(opts) {
     if (receipt) targetReceiptRecords.push({ label: entry.label, receipt, checkedPath: entry.path })
   }
   addTargetConsistencyChecks(checks, artifacts.manifest, targetEntries, targetReceiptRecords, agents)
-  if (starterMode) addStarterEvidenceValidation(checks, 'receipt-bundle', artifacts, agents)
+  if (starterMode) addStarterEvidenceValidation(checks, 'receipt-bundle', artifacts, agents, {}, opts.releaseSha || null)
 
   const gatePath = join(outDir, 'cutover-gate.json')
   const gateReceipt = await cutoverBuilder({

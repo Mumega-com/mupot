@@ -51,6 +51,8 @@ const SECRET_VALUE_PATTERNS = [
 
 const SECRET_FIELD_RE = /(?:^|[_-])(authorization|bearer|token|access[_-]?token|refresh[_-]?token|secret|password|passwd|api[_-]?key|private[_-]?key|client[_-]?secret|cookie)(?:$|[_-])/i
 const SAFE_REFERENCE_FIELD_RE = /(?:^|[_-])(env|name|names|ref|path|file|id|ids|label|labels)$/i
+const SOURCE_HEALTH_STEP = 'agent_execution'
+const SOURCE_HEALTH_KEYS = ['ok', 'service', 'commit', 'clean']
 
 export function parseArgs(argv) {
   const opts = {
@@ -176,6 +178,21 @@ export function formatPlan(opts = {}) {
       { label: '<screenshot, API response, audit row, or receipt label>', path: '<redacted attachable artifact path>' },
     ],
   }, null, 2))
+  if (releaseSha) {
+    lines.push('')
+    lines.push(`${SOURCE_HEALTH_STEP}: record the authorized collector's redacted source health observation:`)
+    lines.push(JSON.stringify({
+      step: SOURCE_HEALTH_STEP,
+      evidence: {
+        source_health: {
+          ok: true,
+          service: 'mupot',
+          commit: releaseSha,
+          clean: true,
+        },
+      },
+    }, null, 2))
+  }
   lines.push('')
   lines.push('Check the completed bundle:')
   lines.push(commandLine([
@@ -302,6 +319,22 @@ function isCanonicalReleaseSha(value) {
   return typeof value === 'string' && /^[0-9a-f]{40}$/.test(value)
 }
 
+function validateSourceHealth(receipt, expectedReleaseSha) {
+  const health = receipt?.evidence?.source_health
+  const object = health !== null && typeof health === 'object' && !Array.isArray(health)
+  const exact = object && Object.keys(health).length === SOURCE_HEALTH_KEYS.length && SOURCE_HEALTH_KEYS.every((key) => Object.hasOwn(health, key))
+  const observed = object ? {
+    ok: typeof health.ok === 'boolean' ? health.ok : null,
+    service: health.service === 'mupot' ? 'mupot' : null,
+    commit: isCanonicalReleaseSha(health.commit) ? health.commit : null,
+    clean: typeof health.clean === 'boolean' ? health.clean : null,
+  } : null
+  return {
+    valid: Boolean(exact && health.ok === true && health.service === 'mupot' && health.commit === expectedReleaseSha && health.clean === true),
+    observed,
+  }
+}
+
 function checkReceiptBasics(checks, receipt, path, step) {
   pushCheck(checks, receipt.receipt_type === STEP_RECEIPT_TYPE, 'receipt_type_matches', {
     path,
@@ -413,6 +446,14 @@ export function checkBundle(opts = {}) {
     pushCheck(checks, target.release_sha === opts.releaseSha, 'target_release_sha_matches_expected', {
       expected: opts.releaseSha,
       actual: target.release_sha,
+    })
+    const sourceReceipt = receipts.find(({ spec }) => spec.step === SOURCE_HEALTH_STEP)
+    const sourceHealth = validateSourceHealth(sourceReceipt?.receipt, opts.releaseSha)
+    pushCheck(checks, sourceHealth.valid, 'source_health_matches_expected_release_sha', {
+      step: SOURCE_HEALTH_STEP,
+      path: sourceReceipt?.path ?? join(outDir, 'agent-execution.json'),
+      artifact_sha256: artifacts[SOURCE_HEALTH_STEP]?.sha256 ?? null,
+      source_health: sourceHealth.observed,
     })
   }
 

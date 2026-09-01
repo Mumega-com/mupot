@@ -86,35 +86,34 @@ function setReceiptReleaseSha(receipt: Record<string, any>, releaseShaPath: stri
 }
 
 function v030Contract() {
-  const neutralReceipts = REQUIRED_RECEIPTS.map((receipt) => receipt.file === 'host-go/cutover-gate.json'
-    ? { ...receipt, receipt_type: 'mupot-host-go-cutover/v1' }
-    : receipt)
-  return {
-    schema_version: 1,
-    version: 'v0.30.0',
-    name: 'Stabilized Control Plane',
-    receipt_types: {
-      prepublication: 'mupot-v030-prepublication-readiness/v1',
-      final: 'mupot-v030-release-readiness/v1',
-    },
-    receipts: [
-      ...neutralReceipts.map((receipt) => ({
-        objective: receipt.objective,
-        file: receipt.file,
-        receipt_type: receipt.receipt_type,
-        phases: receipt.file === 'release-integrity-check.json' ? ['final'] : ['prepublication', 'final'],
-        ...(releaseShaPathFor(receipt.file) ? { release_sha_path: releaseShaPathFor(receipt.file) } : {}),
-      })),
-      {
-        objective: 11,
-        file: 'stable-deployment-check.json',
-        receipt_type: 'mupot-stable-deployment/v1',
-        phases: ['prepublication', 'final'],
-      },
-    ],
-    issues: [],
-  }
+  return JSON.parse(readFileSync(join(process.cwd(), 'docs/releases/v0.30.0-contract.json'), 'utf8'))
 }
+
+const V030_CONTRACT_MUTATIONS = [
+  ['one missing SHA binding', (contract: any) => {
+    delete contract.receipts.find((receipt: any) => receipt.release_sha_path).release_sha_path
+  }],
+  ['all missing SHA bindings', (contract: any) => {
+    contract.receipts = contract.receipts.map(({ release_sha_path: _releaseShaPath, ...receipt }: any) => receipt)
+  }],
+  ['missing receipt', (contract: any) => {
+    contract.receipts = contract.receipts.slice(1)
+  }],
+  ['altered receipt phase', (contract: any) => {
+    contract.receipts[0].phases = ['final']
+  }],
+  ['altered receipt type', (contract: any) => {
+    contract.receipts[0].receipt_type = 'mupot-fresh-install/v2'
+  }],
+  ['extra receipt', (contract: any) => {
+    contract.receipts.push({
+      objective: 'extra',
+      file: 'extra-check.json',
+      receipt_type: 'mupot-extra/v1',
+      phases: ['prepublication', 'final'],
+    })
+  }],
+] as const
 
 function hostProbeReceipt(releaseSha?: string) {
   const checks = [
@@ -611,30 +610,52 @@ describe('release readiness receipt checker', () => {
     }
   })
 
-  it('retains custom-contract behavior when no release SHA paths are declared', async () => {
-    const dir = tempDir()
-    await writePassingV030Bundle(dir)
+  it.each(['inline', 'path'] as const)('rejects every non-canonical v0.30 contract mutation loaded by %s', (source) => {
+    for (const [label, mutate] of V030_CONTRACT_MUTATIONS) {
+      const contract = v030Contract()
+      mutate(contract)
+      const opts: Record<string, unknown> = { version: 'v0.30.0', phase: 'prepublication' }
+      if (source === 'inline') opts.contract = contract
+      else {
+        const contractPath = join(tempDir(), `v0.30.0-${label.replaceAll(' ', '-')}.json`)
+        writeJson(contractPath, contract)
+        opts.contractPath = contractPath
+      }
+
+      expect(() => formatPlan(opts), `${source}: ${label}`).toThrow(/does not match canonical v0\.30\.0 contract/)
+    }
+  })
+
+  it('accepts the exact canonical v0.30 contract from inline and path sources', () => {
     const contract = v030Contract()
-    contract.receipts = contract.receipts.map(({ release_sha_path: _releaseShaPath, ...receipt }) => receipt)
-    for (const binding of V030_RELEASE_SHA_BINDINGS.filter((entry) => entry.release_sha_path !== 'inputs.release_sha')) {
-      const path = join(dir, binding.file)
-      const receiptJson = JSON.parse(readFileSync(path, 'utf8'))
-      setReceiptReleaseSha(receiptJson, binding.release_sha_path, MISSING)
-      writeJson(path, receiptJson)
+    const contractPath = join(tempDir(), 'v0.30.0-contract.json')
+    writeJson(contractPath, contract)
+
+    expect(formatPlan({ version: 'v0.30.0', contract })).toContain('Mupot v0.30.0 final release-readiness evidence plan')
+    expect(formatPlan({ version: 'v0.30.0', contractPath })).toContain('Mupot v0.30.0 final release-readiness evidence plan')
+  })
+
+  it('retains custom-contract behavior for historical versions without SHA paths', () => {
+    const contract = {
+      schema_version: 1,
+      version: 'v0.29.0',
+      name: 'Historical custom contract',
+      receipt_types: {
+        prepublication: 'mupot-v029-prepublication-readiness/v1',
+        final: 'mupot-v029-release-readiness/v1',
+      },
+      receipts: [{
+        objective: 'historical',
+        file: 'historical-check.json',
+        receipt_type: 'mupot-historical-check/v1',
+        phases: ['final'],
+      }],
+      issues: [],
     }
 
-    const receipt = checkBundle({
-      outDir: dir,
-      version: 'v0.30.0',
-      checksPr: '285',
-      releaseSha: RELEASE_SHA,
-      phase: 'final',
-      contract,
-    })
-
-    expect(receipt.status).toBe('pass')
-    expect(receipt.required.receipts).not.toContainEqual(expect.objectContaining({ release_sha_path: expect.anything() }))
-    expect(receipt.checks).not.toContainEqual(expect.objectContaining({ check: 'receipt_release_sha_matches_release_sha' }))
+    const plan = formatPlan({ version: 'v0.29.0', contract })
+    expect(plan).toContain('historical-check.json')
+    expect(plan).not.toContain('release_sha_path')
   })
 
   it('prints the final release-readiness evidence plan', () => {

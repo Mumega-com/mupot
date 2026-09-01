@@ -6,7 +6,7 @@ import { spawnSync } from 'node:child_process'
 import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
-import { buildBundle, checkBundleManifest, exportBundle, formatHostGoPlan, formatStatusSummary, inspectBundleStatus, parseArgs, safeName } from './receipt-bundle.mjs'
+import { buildBundle, checkBundleManifest, exportBundle, formatHostGoPlan, formatStatusSummary, inspectBundleStatus, normalizeStarterEvidence, parseArgs, safeName } from './receipt-bundle.mjs'
 import { buildReceipt as buildHostReceipt } from './host-receipt.mjs'
 import { createServiceContext } from './service-context.mjs'
 import { renderLaunchd } from './launchd-service-manager.mjs'
@@ -930,6 +930,29 @@ function rewriteStarterEvidence(sources, role) {
   rewriteStarterReceipt(sources)
 }
 
+function bindPriorManifestRelease(sources, releaseSha) {
+  sources.evidence.priorManifest.inputs.release_sha = releaseSha
+  sources.evidence.priorManifest.checks.push(
+    { ok: true, component: 'receipt-bundle', check: 'release_sha_valid' },
+    { ok: true, component: 'receipt-bundle', check: 'probe_release_sha_matches_bundle', path: 'probe-start.json' },
+    { ok: true, component: 'receipt-bundle', check: 'probe_release_sha_matches_bundle', path: 'probe-stop.json' },
+  )
+  sources.evidence.priorManifest.summary = summarizeFixture(sources.evidence.priorManifest.checks)
+  rewriteStarterEvidence(sources, 'receipt_bundle_manifest')
+}
+
+function normalizeStarterSources(sources, expectedReleaseSha = null) {
+  return normalizeStarterEvidence({
+    serviceReceipt: sources.evidence.service,
+    continuousReceipt: sources.evidence.continuous,
+    starterReceipt: sources.evidence.starter,
+    hostReceipt: sources.evidence.host,
+    agents: ['agent-one'],
+    starterPath: sources.starterReceiptPath,
+    expectedReleaseSha,
+  })
+}
+
 function nestStarterSources(sources) {
   const manifestDir = join(sources.sourceDir, 'manifest')
   const evidenceDir = join(sources.sourceDir, 'evidence')
@@ -1060,6 +1083,37 @@ test('release-bound bundle emits the SHA, exports cleanly, and rechecks copied p
   assert.equal(readFileSync(join(exportDir, 'manifest-check.json'), 'utf8').includes(RELEASE_SHA), false)
 })
 
+test('export and manifest check enforce the caller expected release SHA', async (t) => {
+  await t.test('expected A over bound B fails with named checks', async () => {
+    const { outDir } = await buildBoundBundle('b'.repeat(40))
+    const checked = checkBundleManifest({ outDir, releaseSha: RELEASE_SHA })
+    assert.equal(checked.status, 'fail')
+    assert.ok(checked.checks.some((check) =>
+      check.check === 'manifest_release_sha_matches_expected' && check.ok === false
+    ))
+
+    const exported = exportBundle({ outDir, exportDir: tmpDir(), releaseSha: RELEASE_SHA })
+    assert.equal(exported.status, 'fail')
+    assert.ok(exported.checks.some((check) =>
+      check.check === 'source_manifest_release_sha_matches_expected' && check.ok === false
+    ))
+  })
+
+  await t.test('expected A over bound A passes', async () => {
+    const { outDir } = await buildBoundBundle(RELEASE_SHA)
+    assert.equal(checkBundleManifest({ outDir, releaseSha: RELEASE_SHA }).status, 'pass')
+    assert.equal(exportBundle({ outDir, exportDir: tmpDir(), releaseSha: RELEASE_SHA }).status, 'pass')
+  })
+
+  await t.test('expected A over an unbound historical manifest fails', async () => {
+    const outDir = tmpDir()
+    seedCutoverEvidence(outDir)
+    assert.equal((await buildBundle({ outDir, agents: ['agent-one'], verifyOnly: true })).status, 'pass')
+    assert.equal(checkBundleManifest({ outDir, releaseSha: RELEASE_SHA }).status, 'fail')
+    assert.equal(exportBundle({ outDir, exportDir: tmpDir(), releaseSha: RELEASE_SHA }).status, 'fail')
+  })
+})
+
 test('manifest recheck derives the release SHA from the manifest and fails closed on missing, malformed, or mismatched binding', async (t) => {
   for (const [name, mutate] of [
     ['missing', (manifest) => { delete manifest.inputs.release_sha }],
@@ -1171,14 +1225,7 @@ test('starter prior manifest rejects probes bound to a different release SHA', a
     probeStart: boundProbeReceipt('pass', 'start', RELEASE_SHA),
     probeStop: boundProbeReceipt('pass', 'stop', RELEASE_SHA),
   })
-  sources.evidence.priorManifest.inputs.release_sha = priorReleaseSha
-  sources.evidence.priorManifest.checks.push(
-    { ok: true, component: 'receipt-bundle', check: 'release_sha_valid' },
-    { ok: true, component: 'receipt-bundle', check: 'probe_release_sha_matches_bundle', path: 'probe-start.json' },
-    { ok: true, component: 'receipt-bundle', check: 'probe_release_sha_matches_bundle', path: 'probe-stop.json' },
-  )
-  sources.evidence.priorManifest.summary = summarizeFixture(sources.evidence.priorManifest.checks)
-  rewriteStarterEvidence(sources, 'receipt_bundle_manifest')
+  bindPriorManifestRelease(sources, priorReleaseSha)
 
   const outDir = tmpDir()
   seedStarterEvidence(outDir, sources)
@@ -1194,6 +1241,87 @@ test('starter prior manifest rejects probes bound to a different release SHA', a
   assert.ok(bundle.checks.some((check) =>
     check.check === 'starter_evidence_contracts_valid' && check.ok === false
   ))
+})
+
+test('starter prior release binding follows the outer bundle SHA without downgrade', async (t) => {
+  await t.test('outer A rejects internally consistent prior and nested probes B', async () => {
+    const priorReleaseSha = 'b'.repeat(40)
+    const sources = starterPaths({
+      probeStart: boundProbeReceipt('pass', 'start', priorReleaseSha),
+      probeStop: boundProbeReceipt('pass', 'stop', priorReleaseSha),
+    })
+    bindPriorManifestRelease(sources, priorReleaseSha)
+    assert.equal(normalizeStarterSources(sources, RELEASE_SHA), null)
+    const outDir = tmpDir()
+    seedStarterEvidence(outDir, sources)
+    writeJson(join(outDir, 'probe-start.json'), boundProbeReceipt('pass', 'start', RELEASE_SHA))
+    writeJson(join(outDir, 'probe-stop.json'), boundProbeReceipt('pass', 'stop', RELEASE_SHA))
+
+    const bundle = await buildBundle({
+      outDir,
+      agents: ['agent-one'],
+      releaseSha: RELEASE_SHA,
+      verifyOnly: true,
+      ...sources,
+    })
+
+    assert.equal(bundle.status, 'fail')
+    assert.ok(bundle.checks.some((check) =>
+      check.check === 'starter_evidence_contracts_valid' && check.ok === false
+    ))
+  })
+
+  await t.test('outer A accepts prior and nested probes A', async () => {
+    const sources = starterPaths({
+      probeStart: boundProbeReceipt('pass', 'start', RELEASE_SHA),
+      probeStop: boundProbeReceipt('pass', 'stop', RELEASE_SHA),
+    })
+    bindPriorManifestRelease(sources, RELEASE_SHA)
+    assert.ok(normalizeStarterSources(sources, RELEASE_SHA))
+    const outDir = tmpDir()
+    seedStarterEvidence(outDir, sources)
+
+    const bundle = await buildBundle({
+      outDir,
+      agents: ['agent-one'],
+      releaseSha: RELEASE_SHA,
+      verifyOnly: true,
+      ...sources,
+    })
+
+    assert.equal(bundle.status, 'pass', JSON.stringify(bundle.checks.filter((check) => check.ok !== true), null, 2))
+  })
+
+  await t.test('unbound outer rejects a bound prior bundle', async () => {
+    const priorReleaseSha = 'b'.repeat(40)
+    const sources = starterPaths({
+      probeStart: boundProbeReceipt('pass', 'start', priorReleaseSha),
+      probeStop: boundProbeReceipt('pass', 'stop', priorReleaseSha),
+    })
+    bindPriorManifestRelease(sources, priorReleaseSha)
+    assert.equal(normalizeStarterSources(sources), null)
+    const outDir = tmpDir()
+    seedStarterEvidence(outDir, sources)
+    writeJson(join(outDir, 'probe-start.json'), probeReceipt('pass', 'start'))
+    writeJson(join(outDir, 'probe-stop.json'), probeReceipt('pass', 'stop'))
+
+    const bundle = await buildBundle({ outDir, agents: ['agent-one'], verifyOnly: true, ...sources })
+
+    assert.equal(bundle.status, 'fail')
+    assert.ok(bundle.checks.some((check) =>
+      check.check === 'starter_evidence_contracts_valid' && check.ok === false
+    ))
+  })
+
+  await t.test('fully unbound outer and prior history remains valid', async () => {
+    const sources = starterPaths()
+    assert.ok(normalizeStarterSources(sources))
+    const outDir = tmpDir()
+    seedStarterEvidence(outDir, sources)
+
+    const bundle = await buildBundle({ outDir, agents: ['agent-one'], verifyOnly: true, ...sources })
+    assert.equal(bundle.status, 'pass', JSON.stringify(bundle.checks.filter((check) => check.ok !== true), null, 2))
+  })
 })
 
 test('new bundle rejects an injected legacy cutover gate', async () => {
@@ -3924,7 +4052,7 @@ test('parseArgs rejects malformed or uppercase release SHA', () => {
   assert.throws(() => parseArgs(['--release-sha', RELEASE_SHA.toUpperCase()]), /release sha/i)
 })
 
-test('release-bound Host-Go plan passes the SHA to every probe and bundle build command', () => {
+test('release-bound Host-Go plan passes the SHA to every probe, build, export, and check command', () => {
   const plan = formatHostGoPlan({
     agents: ['agent-one'],
     outDir: '~/.fleet/receipts/agent-one',
@@ -3936,16 +4064,22 @@ test('release-bound Host-Go plan passes the SHA to every probe and bundle build 
   })
 
   const probeCommands = plan.split('\n').filter((line) => line.includes('/cutover-probe.mjs'))
-  const bundleBuildCommands = plan.split('\n').filter((line) =>
+  const releaseSensitiveBundleCommands = plan.split('\n').filter((line) =>
     line.includes('/receipt-bundle.mjs') &&
-    !line.includes('--status') &&
-    !line.includes('--export') &&
-    !line.includes('--check-manifest')
+    !line.includes('--status')
   )
+  const exportCommands = releaseSensitiveBundleCommands.filter((line) => line.includes('--export'))
+  const checkCommands = releaseSensitiveBundleCommands.filter((line) => line.includes('--check-manifest'))
+  const bundleBuildCommands = releaseSensitiveBundleCommands.filter((line) => !line.includes('--export') && !line.includes('--check-manifest'))
   assert.equal(probeCommands.length, 2)
   assert.ok(probeCommands.every((line) => line.includes(`--release-sha ${RELEASE_SHA}`)))
   assert.ok(bundleBuildCommands.length > 0)
   assert.ok(bundleBuildCommands.every((line) => line.includes(`--release-sha ${RELEASE_SHA}`)))
+  assert.equal(exportCommands.length, 1)
+  assert.ok(exportCommands.every((line) => line.includes(`--release-sha ${RELEASE_SHA}`)))
+  assert.equal(checkCommands.length, 1)
+  assert.ok(checkCommands.every((line) => line.includes(`--release-sha ${RELEASE_SHA}`)))
+  assert.ok(releaseSensitiveBundleCommands.every((line) => line.includes(`--release-sha ${RELEASE_SHA}`)))
 })
 
 test('formatHostGoPlan prints a release-neutral live-host command sequence without token values', () => {
