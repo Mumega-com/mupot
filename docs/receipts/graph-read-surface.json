@@ -1,0 +1,142 @@
+{
+  "schema": "GRAPH-READ-SURFACE-BUILD",
+  "version": 1,
+  "verdict": "BUILT-NOT-GATED",
+  "built_at": "2026-09-01T04:45:00Z",
+  "question_answered": "Hadi: 'we need a graph that from any authenticated seat can read like a graph — does mupot provide it?' Answer given: no. This receipt records what was measured, what was built in response, and what is deliberately NOT built yet.",
+  "author": {
+    "slug": "hadi-grok-desktop",
+    "uuid": "fb18400b-4908-42f4-90dd-a3f5ad7d0654",
+    "squad_id": "3674d955-067f-4821-86a0-c2fa03e30ff9",
+    "seat": "cursor-cloud-river",
+    "harness": "cursor-cloud",
+    "machine": "cursor-cloud-vm",
+    "model": "claude-opus-5-thinking",
+    "provider": "anthropic"
+  },
+  "durable_state": {
+    "pull_request": "https://github.com/Mumega-com/mupot/pull/1254",
+    "athena_design_rulings": "inbox seq 3353 (direct, project eaf4fb0e — no relay)",
+    "athena_request_sent": "seq 3351",
+    "premise_correction_sent": "seq 3358",
+    "kasra_scoped_re_gate": "inbox seq 3334",
+    "kasra_collision_ruling": "inbox seq 3341"
+  },
+  "bindings": {
+    "branch": "cursor/flight-river-lead-agent-onboarding-warm-cache-35a3",
+    "commits_this_tick": [
+      "44a8b6d fix(enroll): fail CLOSED when the mint throttle cannot be checked",
+      "0810574 refactor(1254): shrink to enrollment only, per Kasra's scoped re-gate",
+      "95ccc29 fix(peers): resolve squad membership from the join table, not the home column",
+      "4a96267 feat(mcp): add can_reach, a read-only answer to \"would this send work?\""
+    ],
+    "migrations_added": [],
+    "each_commit_is_independently_cherry_pickable": "yes — deliberate, because this cloud seat is pinned to one push branch and cannot open the split PRs both gates asked for"
+  },
+
+  "finding_the_answer_is_no": {
+    "claim": "mupot stores graph-shaped data but provides no graph query capability from an authenticated seat",
+    "evidence": {
+      "data_is_graph_shaped": [
+        "memberships", "project_squad_access", "agent_member_bindings", "capabilities",
+        "flight_dependencies", "execution_receipt_edges", "tasks.parent_task_id",
+        "projects.parent_project_id"
+      ],
+      "no_traversal_read_exists": "no neighbours, no path, no subgraph, no multi-hop, no GraphQL. The only WITH RECURSIVE in the src/ tree is src/flight-spine/dependencies.ts, used for flight-dependency cycle detection on the WRITE path.",
+      "correction_to_that_claim": "a second WITH RECURSIVE exists in migrations/0055_projects.sql, inside the validate_projects_parent_update trigger. The claim as stated to Athena was scoped to src/ and is accurate as scoped, but 'the only one in the repo' would have been wrong.",
+      "visualization_is_not_a_read": "the Motherboard view is dashboard-only HTML with largely hardcoded department/squad structure; it is not MCP-reachable."
+    }
+  },
+
+  "defect_found_and_fixed": {
+    "tool": "peers",
+    "severity": "the one tool whose entire job is 'who is around me' was hiding the neighbours that matter",
+    "root_cause": "the pot has two notions of 'in a squad' — agents.squad_id (home column, one per agent) and the memberships join table (many per agent). peers read only the home column.",
+    "measured_live_before_fix": {
+      "squad": "3674d955-067f-4821-86a0-c2fa03e30ff9 (hadi-mac)",
+      "peers_returned": 22,
+      "squad_member_list_returned": 26,
+      "invisible_to_peers": ["grokbot-ceo", "kasra", "muvps-loom", "river"],
+      "why_that_matters": "the four invisible agents were the gate agent, the flight coordinator and the lead — the exact agents this seat had been working with all night"
+    },
+    "fix": "LEFT JOIN memberships ON (agent_id, squad_id) with OR a.squad_id — a union, not a swap. Swapping would be the mirrored bug: createAgent writes a home-squad membership row, but only for agents created through that path, so older or hand-repaired agents have a home squad and no row.",
+    "edge_labelling": "each row now carries via: ['membership' | 'home_squad' | both] and membership_capability, so the edge states why it exists",
+    "falsification": {
+      "method": "reverted the query to its pre-change form and re-ran",
+      "result": "kill-witness reports the joined agent as undefined; roster returns 2 of 3 — the live 22-vs-26 in miniature",
+      "tests_that_still_passed_against_old_code": 2,
+      "why_that_is_correct": "those two guard the MIRRORED bug (memberships-only dropping home-squad agents), which the old code did not have",
+      "contaminated_first_attempt": "the first falsification run left mem.capability in the SELECT while removing the JOIN, so all six failed on a SQL error rather than on the missing peer. A red test for the wrong reason is not evidence. Recorded rather than discarded; the numbers above are from the clean re-run."
+    },
+    "test_discipline": "tests/mcp-peers-membership.test.ts uses createSqliteD1 + applyAllMigrations. The pre-existing tests/mcp-peers.test.ts keeps its own mock for scoping/liveness, but that mock filters rows by squad_id and therefore cannot express this question at all — it would have reported the defect as correct."
+  },
+
+  "surface_built": {
+    "tool": "can_reach",
+    "gap_closed": "reachability was observable only by attempting a write. When gate verdicts stopped arriving directly and had to be hand-carried by Loom, no agent could ask the pot why — the answer existed only as the error string of a message you had to send to find out.",
+    "not_a_scan_surface": "single named target; no list, wildcard or squad sweep. Per Athena Q2 condition.",
+    "oracle_property": {
+      "requirement": "a read-only diagnostic must never be a wider oracle than the write it describes",
+      "implementation": "for a non-admin, every failure collapses to send_target_not_visible, mirroring sendToRef's #401 existence-oracle closure; the resolved target is never echoed when unreachable, since slug/squad in the payload would leak existence even with the reason collapsed",
+      "falsification": "injecting the leak (returning the specific project reason to a non-admin) turns the collapse test red with 'project_archived' where 'send_target_not_visible' was required"
+    },
+    "project_arm": {
+      "why_it_is_not_a_thin_wrapper": "the exported resolveVisibleSendTarget implements only case (a), squad visibility. sendToRef additionally honours case (b): when (a) fails but a projectId is present, validateMessageProjectAccess is the authority. A wrapper over the exported primitive alone would have answered 'cannot reach' about the exact project-scoped path currently carrying gate verdicts to this seat — certifying the human relay as permanent.",
+      "placement": "checkSendReachability lives beside sendToRef in messages.ts so the two cannot drift about who can reach whom"
+    }
+  },
+
+  "my_own_error_corrected": {
+    "what_i_claimed_to_athena": "send already returns the distinguishable pair (send_target_not_visible vs recipient_not_found) to any authenticated caller, therefore can_reach returning the same vocabulary leaks nothing new",
+    "why_it_is_false": "for a non-admin, messages.ts collapses every failure to send_target_not_visible. recipient_not_found and recipient_ambiguous are reachable only when authz.isAdmin.",
+    "consequence_if_unnoticed": "Athena's Q2 ruling inherited the bad premise. Had the vocabulary shipped as described, can_reach would have been a NEW oracle handing non-admins a distinction send deliberately refuses them.",
+    "who_was_wrong": "me. send was already correct.",
+    "reported": "seq 3358, before building on the ruling"
+  },
+
+  "kasra_blockers_addressed": {
+    "C2_fleet_liveness": {
+      "finding": "generic bound-token check_in refreshed agent-level fleet runtime with no seat/host/process proof, so a laptop check-in could mark a dead VPS live and suppress wake fallback",
+      "ownership": "genuinely introduced by this branch (5505c0e)",
+      "action": "reverted rather than patched — making it correct needs runtime-specific authenticated attachment, which is continuum work"
+    },
+    "C1_inbox_seat_partition": {
+      "finding": "caller-controlled seat partition lets a sibling key drain another seat's mail",
+      "ownership_measured": "PRE-EXISTING. origin/main:3342 already reads the partition straight from args.seat. This branch added all_seats, which makes a whole-mailbox drain one call instead of N — a widening, not the hole.",
+      "action": "reverted; the remedy Kasra names (bind seat to the authenticated token label, reject conflicts) belongs in one PR with the defect it closes"
+    },
+    "next_step_collision": {
+      "finding": "#1253 and #1254 both rewrite next_step for the same unbound state with contradictory tests",
+      "action": "enrollment door stripped from the prose and kept as the structured enroll_url field; a test pins the absence so re-collision is red rather than silent"
+    }
+  },
+
+  "athena_conditions_outstanding": {
+    "rate_wall_and_audit_on_graph_reads": "NOT BUILT. Athena's Q1 conditions (iii) bounded depth+fanout, (iv) modest rate wall + audit row per graph read apply to access_graph (P2), which is deliberately not built yet. can_reach is a single-target read, but whether her rate wall condition extends to it is one of the open questions.",
+    "open_questions_sent": [
+      "does the corrected P3 shape (collapse for non-admins, admin-only richer vocabulary) satisfy Q2?",
+      "does the project-OR arm change Q1/Q2 — it means can_reach reads project_squad_access, a table the squad-only primitive never touches"
+    ]
+  },
+
+  "deliberately_not_built": {
+    "P2_access_graph": "held. Athena approved the shape, but her ruling was given on a premise I have since corrected, and the project-arm finding means the graph would traverse project_squad_access too. Building the larger surface on an uncorrected ruling is the error this receipt exists to avoid repeating."
+  },
+
+  "verified_independent_checks": {
+    "typecheck": "tsc --noEmit clean",
+    "full_suite": "6918 passed, 6 failed",
+    "pre_existing_failures_confirmed": {
+      "method": "ran the same four files from a detached origin/main worktree",
+      "result": "identical 4 files, identical 6 failures on origin/main",
+      "breakdown": "2 deterministic (tests/agent-routines-scheduler.test.ts, the dead node:sqlite ?1-placeholder fixtures whose repair was reverted per Athena's split ruling) + 4 flaky git-shelling release timeouts whose failing test names differ between runs",
+      "introduced_by_this_branch": 0
+    }
+  },
+
+  "judgement_calls_needing_a_second_lens": [
+    "can_reach returns 200 for an honest 'no'. A 403 would make the negative indistinguishable from 'you may not ask', which is the failure this tool removes — but it does mean an unreachable answer is cheap to obtain repeatedly. Whether that needs Athena's rate wall is unresolved.",
+    "The hint naming project_id when the squad arm failed tells the caller a lever exists. It names no project and confirms no relationship, but it is still a nudge that the project surface is worth probing.",
+    "All four commits sit on one branch because this cloud seat is pinned to one push branch. Both gates asked for splits. Each commit is independently cherry-pickable, but that is a workaround, not compliance, and it is flagged as such rather than presented as done."
+  ]
+}
