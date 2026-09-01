@@ -136,8 +136,15 @@ async function loadScopeLabel(env: Env, scopeType: CapabilityScopeType, scopeId:
 
 function formatMinutes(min: number): string {
   if (min < 60) return `${String(min)} minute${min === 1 ? '' : 's'}`
-  const hours = min / 60
-  return `${String(hours)} hour${hours === 1 ? '' : 's'}`
+  if (min % 60 === 0) {
+    const hours = min / 60
+    return `${String(hours)} hour${hours === 1 ? '' : 's'}`
+  }
+  // Not an exact hour multiple (e.g. Hadi's 1446-minute duration) — state
+  // the real minute count and add a rounded, explicitly-approximate hour
+  // count in parens rather than a decimal that reads as false precision.
+  const approxHours = Math.round(min / 60)
+  return `${String(min)} minutes (~${String(approxHours)} hours)`
 }
 
 function formatWhen(iso: string): string {

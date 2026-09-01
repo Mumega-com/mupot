@@ -264,6 +264,29 @@ describe('elevation dashboard screens — integration through dashboardApp (real
     expect(bodyText).toContain('value="240"')
     expect(bodyText).not.toContain('value="480"')
     expect(bodyText).not.toContain('value="1440"')
+    // 1446 is Hadi's own explicit duration (mupot task f5fe1222) — the
+    // "no widening control exists in the DOM" property from step 5 must
+    // hold for it exactly like every other preset: a request for less than
+    // 1446 minutes must never render it as a selectable option.
+    expect(bodyText).not.toContain('value="1446"')
+  })
+
+  it('the 1446-minute duration (Hadi\'s own explicit duration, mupot task f5fe1222) is selectable when requested, and never offered above what was requested', async () => {
+    const env = makeEnv('admin@x.test')
+    const { session } = await seedFixture(env)
+    const request = await seedPendingRequest(env, session.id, { durationMinutes: 1446 })
+    const cookie = await devLogin(env)
+
+    const res = await dashboardApp.request(`/elevation/${request.id}`, { headers: { cookie: `mupot_session=${cookie}` } }, env)
+    expect(res.status).toBe(200)
+    const bodyText = await res.text()
+    // All shorter presets remain available (narrowing is still allowed)...
+    expect(bodyText).toContain('value="15"')
+    expect(bodyText).toContain('value="1440"')
+    // ...and the new 1446 option is present, rendered in plain language a
+    // human reads — not a raw decimal-hour figure.
+    expect(bodyText).toContain('value="1446"')
+    expect(bodyText).toContain('1446 minutes (~24 hours)')
   })
 
   it('the approval screen shows the unmissable irreversible warning when a requested action is permanent', async () => {
