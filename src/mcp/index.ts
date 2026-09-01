@@ -3305,14 +3305,13 @@ const toolInbox: ToolSpec = {
   name: 'inbox',
   scope: 'self (the caller agent reads its own inbox)',
   min: 'authenticated',
-  args: '{ limit?: number, peek?: boolean, seat?: string, all_seats?: boolean, since_seq?: number (peek only) }',
+  args: '{ limit?: number, peek?: boolean, seat?: string, since_seq?: number (peek only) }',
   inputSchema: {
     type: 'object',
     properties: {
       limit: OPTIONAL_NUMBER_SCHEMA,
       peek: { type: 'boolean' },
       seat: STRING_SCHEMA,
-      all_seats: { type: 'boolean' },
       since_seq: OPTIONAL_NUMBER_SCHEMA,
     },
     required: [],
@@ -3346,40 +3345,19 @@ const toolInbox: ToolSpec = {
       sinceSeq = rawSinceSeq
     }
 
-    if (args.all_seats !== undefined && typeof args.all_seats !== 'boolean')
-      return fail(400, 'invalid_args', 'all_seats must be a boolean')
-    if (args.all_seats === true && typeof args.seat === 'string')
-      return fail(400, 'invalid_args', 'seat and all_seats are mutually exclusive')
-
-    // A harness that declares its seat via the x-mupot-seat header should not also
-    // have to pass it on every read — the header already identifies the partition.
-    // all_seats overrides that default: it is the deliberate whole-mailbox drain, and
-    // the header must not silently narrow a read the caller explicitly widened.
-    const allSeats = args.all_seats === true
-    const seatArg = allSeats ? undefined : (args.seat ?? ctx.seat)
     const res = await readAgentInbox(env, {
       agent,
       limit,
       peek: args.peek === true,
       sinceSeq,
-      seat: typeof seatArg === 'string' ? seatArg.trim() : undefined,
-      allSeats,
+      seat: typeof args.seat === 'string' ? args.seat.trim() : undefined,
     })
     if (!res.ok) {
       if (res.reason === 'db_error') return fail(500, res.reason) // no raw DB string to caller
       if (res.reason === 'consumer_fenced') return fail(409, res.reason)
       return fail(400, res.reason, res.detail)
     }
-    // unread_total/seats are what make a thin read diagnosable: a caller reading its own
-    // seat partition can still see that mail is queued elsewhere, instead of reading an
-    // empty array as an empty mailbox (#0120 isolation without the old invisibility).
-    return done({
-      messages: res.messages,
-      remaining: res.remaining,
-      unread_total: res.unread_total,
-      ...(res.seats ? { seats: res.seats } : {}),
-      consumed: args.peek !== true,
-    })
+    return done({ messages: res.messages, remaining: res.remaining, consumed: args.peek !== true })
   },
 }
 
@@ -3402,15 +3380,10 @@ const toolInboxLease: ToolSpec = {
   name: 'inbox_lease',
   scope: 'self (the caller agent leases from its own inbox)',
   min: 'authenticated',
-  args: '{ limit?: number, lease_seconds?: number, seat?: string, all_seats?: boolean }',
+  args: '{ limit?: number, lease_seconds?: number, seat?: string }',
   inputSchema: {
     type: 'object',
-    properties: {
-      limit: OPTIONAL_NUMBER_SCHEMA,
-      lease_seconds: OPTIONAL_NUMBER_SCHEMA,
-      seat: STRING_SCHEMA,
-      all_seats: { type: 'boolean' },
-    },
+    properties: { limit: OPTIONAL_NUMBER_SCHEMA, lease_seconds: OPTIONAL_NUMBER_SCHEMA, seat: STRING_SCHEMA },
     required: [],
     additionalProperties: false,
   },
@@ -3437,19 +3410,11 @@ const toolInboxLease: ToolSpec = {
     if (args.seat !== undefined && typeof args.seat !== 'string')
       return fail(400, 'invalid_args', 'seat must be a string')
 
-    if (args.all_seats !== undefined && typeof args.all_seats !== 'boolean')
-      return fail(400, 'invalid_args', 'all_seats must be a boolean')
-    if (args.all_seats === true && typeof args.seat === 'string')
-      return fail(400, 'invalid_args', 'seat and all_seats are mutually exclusive')
-
-    const allSeats = args.all_seats === true
-    const seatArg = allSeats ? undefined : (args.seat ?? ctx.seat)
     const res = await leaseAgentInbox(env, {
       agent,
       limit,
       leaseSeconds,
-      seat: typeof seatArg === 'string' ? seatArg.trim() : undefined,
-      allSeats,
+      seat: typeof args.seat === 'string' ? args.seat.trim() : undefined,
     })
     if (!res.ok) {
       if (res.reason === 'db_error') return fail(500, res.reason) // no raw DB string to caller
@@ -4070,12 +4035,20 @@ const toolBootContext: ToolSpec = {
     )
 
     // QA-1: every refusal/unminted signal must carry the full map out — no dead ends.
-    // Primary action is the seat-enrollment page (choose or coin a key). The
-    // connect / mint_agent_token paths stay named so existing harnesses and
-    // tests that match those strings still find them.
+    // Two paths for an unbound token:
+    //   A) Shared apikey + know your name → call connect { agent_name } (session-local, works now).
+    //   B) Want a permanent weld → ask an admin to call mint_agent_token, then reconnect.
+    //
+    // The enrollment door is deliberately NOT in this string. It ships as the
+    // structured `enroll_url` field below instead. Kasra's collision ruling
+    // (2026-09-01): #1253 and this branch both rewrite next_step for the same
+    // unbound state with contradictory tests, and no PR owns the whole truth —
+    // the durable contract is onboarding_state + available_doors[], with prose
+    // as at most a summary. Two PRs racing to own one sentence is how the
+    // sentence ends up describing neither state correctly.
     const nextStep = isMinted
       ? 'call orient (no args — your token is agent-bound) to receive your full basin-drop packet'
-      : `Open ${enrollHref} to choose or coin a seat key. If you know your agent slug/id: call connect { agent_name: "<slug>" } to claim your identity now (session-local). For a permanent weld: ask an org-admin to call mint_agent_token for your agent, then reconnect with the minted token.`
+      : 'if you know your agent slug/id: call connect { agent_name: "<slug>" } to claim your identity now (session-local). For a permanent weld: ask an org-admin to call mint_agent_token for your agent, then reconnect with the minted token.'
 
     // THE DOOR MUST SAY WHAT IT IS (#712).
     //

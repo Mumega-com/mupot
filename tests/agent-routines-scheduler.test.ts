@@ -44,13 +44,7 @@ describe('Autonomous Agent Cron Routine Scheduler (Flight 9)', () => {
        ) VALUES (
          'routine_claim_audit', 'gaf', 'proj_gaf', 'Daily Warranty Claim Audit',
          'Audit all pending warranty claims and flag anomalies.', 'enabled', 'cron',
-         -- Anonymous '?', not '?1'. This fixture is prepared against node:sqlite
-         -- directly (harness.sqlite), not through the D1 shim, and node:sqlite's
-         -- positional run() rejects NUMBERED placeholders with "column index out
-         -- of range". The throw happened in beforeEach, so both tests in this
-         -- file errored before reaching the scheduler: the autonomous loop has
-         -- had no live coverage here at all, while the file read as merely red.
-         '0 8 * * *', 'UTC', 'skip', 'propose', 'squad_claims', 'agent_auditor', ?,
+         '0 8 * * *', 'UTC', 'skip', 'propose', 'squad_claims', 'agent_auditor', ?1,
          'admin_1', CURRENT_TIMESTAMP, 'admin_1'
        )`,
     ).run(pastIso)
@@ -92,7 +86,7 @@ describe('Autonomous Agent Cron Routine Scheduler (Flight 9)', () => {
          occurrence_key, trigger_kind, scheduled_for, status
        ) VALUES (
          'existing_run_123', 'gaf', 'proj_gaf', 'routine_claim_audit', 1, '{}',
-         ?, 'cron', ?, 'queued'
+         ?1, 'cron', ?2, 'queued'
        )`,
     ).run(occurrenceKey, pastIso)
 

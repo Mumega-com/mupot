@@ -574,7 +574,26 @@ describe('MCP unbound session surfaces enroll_url', () => {
     expect(sc.enroll_url).toBeDefined()
     expect(sc.enroll_url).toContain('/enroll')
     expect(sc.enroll_url).toContain('cursor-river')
-    expect(sc.next_step).toContain('/enroll')
+  })
+
+  // Kasra's collision ruling: #1253 and this branch both rewrite next_step for
+  // the same unbound state, with tests that contradict each other. Enrollment
+  // ships as structured data; the prose is left to whichever PR owns it. Pin the
+  // absence, so re-adding the door to the sentence is a red test and not a
+  // silent re-collision.
+  it('does NOT put the enrollment door in next_step prose — structured field only', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+    const res = await callTool(env, 'boot_context', { seat: 'cursor-river' })
+    const body = (await res.json()) as {
+      result: { structuredContent: { enroll_url?: string; next_step: string } }
+    }
+    const sc = body.result.structuredContent
+    expect(sc.enroll_url).toContain('/enroll')
+    expect(sc.next_step).not.toContain('/enroll')
+    // The pre-existing doors must survive the strip, or #1253's tests break too.
+    expect(sc.next_step).toContain('connect')
+    expect(sc.next_step).toContain('mint_agent_token')
   })
 
   it('inbox with no agent binding returns not_agent_bound AND an enroll_url', async () => {

@@ -30,6 +30,7 @@ export const SEVEN_AXIS_HARNESSES = [
   'cursor-cloud',
   'antigravity-cli',
   'claude-code',
+  'codex-cli',
   'prime',
   'hermes',
   'grok-cli',
@@ -166,22 +167,10 @@ export function activeSeatRoster(rows: PresenceView[]): SeatAxisView[] {
   return rows.filter((r) => r.liveness === 'active').map(seatAxisFromPresence)
 }
 
-export type PresenceIdentity = Pick<
+type PresenceIdentity = Pick<
   AgentIdentity,
   'memberId' | 'displayName' | 'email' | 'boundAgentId'
 >
-
-// An actively-checking-in bound seat must not read as stale to fleet wake routing.
-export async function bridgeCheckinToFleet(env: Env, id: PresenceIdentity): Promise<void> {
-  if (!id.boundAgentId) return
-  await env.DB.prepare(
-    `UPDATE fleet_agents
-        SET last_reported_at = datetime('now'), updated_at = datetime('now')
-      WHERE tenant = ?1 AND agent_id = ?2`,
-  )
-    .bind(env.TENANT_SLUG, id.boundAgentId)
-    .run()
-}
 
 // SQLite datetime('now') → "YYYY-MM-DD HH:MM:SS" (UTC, no tz). Convert to epoch ms.
 export function sqliteUtcToMs(s: string | null): number | null {
@@ -255,11 +244,6 @@ export async function recordCheckin(
       axis.flight_id,
     )
     .run()
-  try {
-    await bridgeCheckinToFleet(env, id)
-  } catch {
-    // Fail-soft: fleet bridge is a non-blocking liveness marker
-  }
   return {
     seat: label,
     harness: axis.harness ?? 'unknown',
