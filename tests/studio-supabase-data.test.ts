@@ -82,9 +82,15 @@ describe('Studio Canvas Supabase Data Feed & Inspector (Flight 8)', () => {
       TENANT_SLUG: 'gaf',
       CONNECTOR_MASTER_KEY: TEST_MASTER_KEY,
       DB: harness.db,
+      SESSIONS: {
+        get: async (key: string) => (key === 'sess:owner-session' ? JSON.stringify({ userId: 'owner-user', email: 'owner@gaf.com', role: 'owner', createdAt: '2026-09-01T00:00:00.000Z' }) : null),
+        put: async () => undefined,
+        delete: async () => undefined,
+      },
     } as unknown as Env
 
-    const req = new Request('http://localhost/tables')
+    // Raw data access is org-admin gated (P0 2026-09-02): drive it as a dashboard owner.
+    const req = new Request('http://localhost/tables', { headers: { cookie: 'mupot_session=owner-session' } })
     const res = await studioDataApp.fetch(req, env)
     expect(res.status).toBe(200)
 
@@ -124,9 +130,14 @@ describe('Studio Canvas Supabase Data Feed & Inspector (Flight 8)', () => {
       TENANT_SLUG: 'gaf',
       CONNECTOR_MASTER_KEY: TEST_MASTER_KEY,
       DB: harness.db,
+      SESSIONS: {
+        get: async (key: string) => (key === 'sess:owner-session' ? JSON.stringify({ userId: 'owner-user', email: 'owner@gaf.com', role: 'owner', createdAt: '2026-09-01T00:00:00.000Z' }) : null),
+        put: async () => undefined,
+        delete: async () => undefined,
+      },
     } as unknown as Env
 
-    const req = new Request('http://localhost/query?table=contractors&limit=10')
+    const req = new Request('http://localhost/query?table=contractors&limit=10', { headers: { cookie: 'mupot_session=owner-session' } })
     const res = await studioDataApp.fetch(req, env)
     expect(res.status).toBe(200)
 

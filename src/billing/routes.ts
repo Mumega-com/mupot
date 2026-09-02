@@ -13,13 +13,21 @@ import {
   type StripeEvent,
 } from './stripe'
 import { getJSON } from '../dashboard/settings'
+// requireAuth is owned by the auth component; it sets c.get('auth').
+import { requireAuth } from '../auth'
+import { requireOrgCapability } from '../auth/capability'
 
-export const billingRoutesApp = new Hono<{ Bindings: Env; Variables: { auth?: AuthContext } }>()
+export const billingRoutesApp = new Hono<{ Bindings: Env; Variables: { auth: AuthContext } }>()
+
+// P0/P1 (2026-09-02): /status, /checkout and /portal had no auth. /portal returned a
+// live Stripe Customer Portal URL (invoices, payment method, cancel/downgrade) to
+// anyone. Gates are per-route because this app is also mounted at /webhooks/stripe
+// and POST /webhook must stay reachable by Stripe (it is signature-verified).
 
 /**
  * GET /api/billing/status — Returns current plan tier, features, limits, and pricing.
  */
-billingRoutesApp.get('/status', async (c) => {
+billingRoutesApp.get('/status', requireAuth, requireOrgCapability('member'), async (c) => {
   const tier = await resolveTier(c.env)
   const limits = PLAN_LIMITS[tier]
   const customerId = await getJSON<string>(c.env, 'stripe_customer_id')
@@ -41,7 +49,7 @@ billingRoutesApp.get('/status', async (c) => {
 /**
  * POST /api/billing/checkout — Creates a Stripe Checkout Session for self-serve upgrade.
  */
-billingRoutesApp.post('/checkout', async (c) => {
+billingRoutesApp.post('/checkout', requireAuth, requireOrgCapability('admin'), async (c) => {
   let body: { tier?: unknown; interval?: unknown; customer_email?: unknown }
   try {
     body = await c.req.json()
@@ -75,7 +83,7 @@ billingRoutesApp.post('/checkout', async (c) => {
 /**
  * POST /api/billing/portal — Creates a Stripe Customer Portal link.
  */
-billingRoutesApp.post('/portal', async (c) => {
+billingRoutesApp.post('/portal', requireAuth, requireOrgCapability('admin'), async (c) => {
   const customerId = await getJSON<string>(c.env, 'stripe_customer_id')
   if (!customerId) {
     return c.json({ error: 'no_active_stripe_customer', detail: 'No billing record exists yet. Upgrade to a paid plan first.' }, 404)

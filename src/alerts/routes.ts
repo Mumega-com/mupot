@@ -8,13 +8,22 @@ import {
   type WebhookSubscription,
   type AlertChannelType,
 } from './dispatcher'
+// requireAuth is owned by the auth component; it sets c.get('auth').
+import { requireAuth } from '../auth'
+import { requireOrgCapability } from '../auth/capability'
 
-export const alertsApp = new Hono<{ Bindings: Env; Variables: { auth?: AuthContext } }>()
+export const alertsApp = new Hono<{ Bindings: Env; Variables: { auth: AuthContext } }>()
+
+// P0 (2026-09-02): mounted at /api/alerts with no middleware and no inline check —
+// anonymous callers could register an exfiltration sink (events default '*'),
+// delete the tenant's real alerting, list sink URLs (a Slack/Discord webhook URL IS
+// the credential), and force outbound POSTs. Alert routing is org-admin only.
+alertsApp.use('*', requireAuth)
 
 /**
  * GET /api/alerts/webhooks — List configured outbound webhook subscriptions (secrets masked).
  */
-alertsApp.get('/webhooks', async (c) => {
+alertsApp.get('/webhooks', requireOrgCapability('admin'), async (c) => {
   const subscriptions = (await getJSON<WebhookSubscription[]>(c.env, 'alert_webhooks')) || []
   const safe = subscriptions.map((s) => ({
     id: s.id,
@@ -32,7 +41,7 @@ alertsApp.get('/webhooks', async (c) => {
 /**
  * POST /api/alerts/webhooks — Create or update an outbound webhook subscription.
  */
-alertsApp.post('/webhooks', async (c) => {
+alertsApp.post('/webhooks', requireOrgCapability('admin'), async (c) => {
   let body: {
     url?: unknown
     channel_type?: unknown
@@ -94,7 +103,7 @@ alertsApp.post('/webhooks', async (c) => {
 /**
  * DELETE /api/alerts/webhooks/:id — Remove a webhook subscription.
  */
-alertsApp.delete('/webhooks/:id', async (c) => {
+alertsApp.delete('/webhooks/:id', requireOrgCapability('admin'), async (c) => {
   const id = c.req.param('id')
   const subscriptions = (await getJSON<WebhookSubscription[]>(c.env, 'alert_webhooks')) || []
   const filtered = subscriptions.filter((s) => s.id !== id)
@@ -110,7 +119,7 @@ alertsApp.delete('/webhooks/:id', async (c) => {
 /**
  * POST /api/alerts/test — Trigger a test alert to verify notification delivery.
  */
-alertsApp.post('/test', async (c) => {
+alertsApp.post('/test', requireOrgCapability('admin'), async (c) => {
   let body: { event_type?: string } = {}
   try {
     body = await c.req.json()
