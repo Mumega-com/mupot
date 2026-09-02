@@ -10,6 +10,7 @@ import { classify, humanAge, type FleetLiveness } from '../dashboard/fleet'
 import type { AgentIdentity } from '../auth/member-bearer'
 import { listFlights } from '../flight/service'
 import { scheduleStates, attachSchedule, type ScheduleStatus } from './schedule-state'
+import { GROK_CLI } from './runtime-vocabulary'
 
 // Allowed runtime sources — an unknown/invalid value normalizes to 'unknown'
 // (never trusts the client's raw string into storage unbounded).
@@ -33,7 +34,7 @@ export const SEVEN_AXIS_HARNESSES = [
   'codex-cli',
   'prime',
   'hermes',
-  'grok-cli',
+  GROK_CLI,
   'unknown',
 ] as const
 
