@@ -535,6 +535,8 @@ export interface AuthContext {
    */
   consentedByMemberId?: string | null
   tokenId?: string | null // exact live member_tokens row used for this request; server-derived only
+  webSessionIdHash?: string | null
+  webSessionMemberId?: string
 }
 
 // ── Members & capabilities — humans are first-class network nodes ──

@@ -3,6 +3,7 @@
 import type { Env } from '../types'
 import { getJSON, setJSON } from '../dashboard/settings'
 import { createBus } from '../bus'
+import { resolveHumanMemberId } from '../members/resolve-human-member'
 
 export interface SsoConfig {
   enabled: boolean
@@ -100,29 +101,34 @@ export async function autoEnrollSsoMember(
 
   const bus = createBus(env)
 
-  // Check if member already exists
-  const existing = await env.DB.prepare(`
-    SELECT m.id, m.status,
-           EXISTS (
-             SELECT 1 FROM capabilities c
-              WHERE c.member_id = m.id
-                AND c.scope_type = 'org'
-                AND c.scope_id IS NULL
-                AND c.capability IN ('owner', 'admin')
-           ) AS is_admin
-      FROM members m
-     WHERE m.tenant = ?1 AND lower(m.email) = ?2
-     LIMIT 1
-  `)
-    .bind(env.TENANT_SLUG, email)
-    .first<{ id: string; status: string; is_admin: number }>()
-
-  if (existing) {
-    const role = existing.is_admin === 1 ? 'admin' : 'member'
-    if (existing.status !== 'active') {
-      return { ok: false, email, role, isNew: false, error: 'member_suspended' }
+  const resolvedId = await resolveHumanMemberId(env, {
+    tenant: env.TENANT_SLUG,
+    provider: profile.provider || null,
+    email,
+  })
+  if (resolvedId) {
+    const existing = await env.DB.prepare(
+      `SELECT m.id, m.status,
+              EXISTS (
+                SELECT 1 FROM capabilities c
+                 WHERE c.member_id = m.id
+                   AND c.scope_type = 'org'
+                   AND c.scope_id IS NULL
+                   AND c.capability IN ('owner', 'admin')
+              ) AS is_admin
+         FROM members m
+        WHERE m.id = ?1 AND m.tenant = ?2
+        LIMIT 1`,
+    )
+      .bind(resolvedId, env.TENANT_SLUG)
+      .first<{ id: string; status: string; is_admin: number }>()
+    if (existing) {
+      const role = existing.is_admin === 1 ? 'admin' : 'member'
+      if (existing.status !== 'active') {
+        return { ok: false, email, role, isNew: false, error: 'member_suspended' }
+      }
+      return { ok: true, memberId: existing.id, email, role, isNew: false }
     }
-    return { ok: true, memberId: existing.id, email, role, isNew: false }
   }
 
   // Provision new member

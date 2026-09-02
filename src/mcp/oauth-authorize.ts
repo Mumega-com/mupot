@@ -129,49 +129,10 @@ async function findOrCreateMember(
   env: Env,
   email: string,
   displayName: string,
+  loginIdentity?: { provider: string; subject: string },
 ): Promise<string> { // returns member_id
-  const existing = await env.DB.prepare(
-    'SELECT id FROM members WHERE email = ?1 LIMIT 1',
-  ).bind(email).first<{ id: string }>()
-  if (existing) return existing.id
-
-  const memberId = crypto.randomUUID()
-  await env.DB.prepare(
-    `INSERT INTO members (id, email, display_name, telegram_chat_id, status, created_at, tenant)
-     VALUES (?1, ?2, ?3, NULL, 'active', datetime('now'), ?4)`,
-  ).bind(memberId, email, displayName.trim().slice(0, 128) || email, env.TENANT_SLUG).run()
-
-  // ── THE HALF THAT WAS MISSING (mupot#1121, 2026-08-17) ──────────────────────────────
-  //
-  // Until now this function created an IDENTITY and no ACCESS. The comment further down
-  // this file records it as intentional — "C6 zero capabilities" — but the effect is that
-  // a verified Google user lands with a members row, zero capability grants, and a 403 on
-  // every capability-gated surface. Compare the INVITE path (src/members/index.ts:246),
-  // which writes member + capability + token in a single batch. The gates were never the
-  // problem; OAuth onboarding was half-implemented.
-  //
-  // grantSignupDefault reads the tenant's open onboarding door and applies the capability
-  // the OWNER configured there. It FAILS CLOSED twice: no open door grants nothing, and an
-  // open door with signup_capability NULL grants nothing. Both leave behaviour byte-for-byte
-  // as it is today, so merging this cannot open a pot — someone has to set the value.
-  //
-  // The grant is written with its receipt in one batch, so it reviews, reverses and expires
-  // through the same path as everything else that came through the door.
-  //
-  // Non-fatal by design: a login must not fail because the door lookup did. A user with no
-  // capability sees today's behaviour; a hard failure here would lock out every login.
-  try {
-    const { grantSignupDefault } = await import('../onboarding/doors')
-    await grantSignupDefault(env, memberId)
-  } catch (err) {
-    console.error('oauth: signup default grant failed (non-fatal, member still created)', {
-      tenant: env.TENANT_SLUG,
-      member_id: memberId,
-      error: err instanceof Error ? err.message : String(err),
-    })
-  }
-
-  return memberId
+  const { findOrCreateHumanMember } = await import('../members/human-identity')
+  return findOrCreateHumanMember(env, email, displayName, loginIdentity)
 }
 
 // ── Token mint for OAuth seat ─────────────────────────────────────────────────
@@ -1098,7 +1059,10 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     // Find-or-create the mupot member row for this verified email.
     let memberId: string
     try {
-      memberId = await findOrCreateMember(env, googleUser.email, googleUser.name)
+      memberId = await findOrCreateMember(env, googleUser.email, googleUser.name, {
+        provider: 'google',
+        subject: googleUser.id,
+      })
     } catch (err) {
       console.error('[oauth-authorize] member find-or-create failed:', redactSecretPatterns(err instanceof Error ? err.message : String(err)))
       return new Response('Member provisioning failed', { status: 500 })

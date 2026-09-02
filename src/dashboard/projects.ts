@@ -7,6 +7,7 @@ import type {
   ProjectStatus,
 } from '../types'
 import { resolveCapabilities } from '../auth/capability'
+import { resolveHumanMemberId } from '../members/resolve-human-member'
 import { parseFlightMetaV1 } from '../flight/meta'
 import { canonicalFlightMetaSql } from '../flight/meta-sql'
 import type { FlightRow } from '../flight/service'
@@ -232,11 +233,9 @@ export interface ProjectFlightsResult {
 
 async function memberIdFor(env: Env, auth: AuthContext): Promise<string | null> {
   if (auth.memberId) return auth.memberId
+  if (auth.webSessionMemberId) return auth.webSessionMemberId
   if (!auth.email) return null
-  const member = await env.DB.prepare(
-    "SELECT id FROM members WHERE email = ? AND tenant = ? AND status = 'active'",
-  ).bind(auth.email, env.TENANT_SLUG).first<{ id: string }>()
-  return member?.id ?? null
+  return resolveHumanMemberId(env, { tenant: env.TENANT_SLUG, email: auth.email })
 }
 
 async function projectAccess(env: Env, auth: AuthContext): Promise<ProjectAccess> {
