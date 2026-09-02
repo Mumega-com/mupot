@@ -17,9 +17,9 @@ supabaseWebhookApp.post('/supabase', async (c) => {
 
   // P1 (2026-09-02): this was `if (expectedSecret && ...)` — an UNSET secret skipped
   // the check entirely, so any anonymous POST emitted bus events and could
-  // createTask() via task_intake_rules. Every other inbound verifier in this pot
-  // fails closed with 503 not_configured; this one now does too, and compares in
-  // constant time like the rest.
+  // createTask() via task_intake_rules. Inbound verifiers in this pot fail closed
+  // with 503 not_configured (the Stripe webhook had the same gap, fixed the same
+  // day in src/billing/routes.ts); this one does too, and compares in constant time.
   if (!expectedSecret) {
     return c.json({ ok: false, error: 'not_configured' }, 503)
   }
