@@ -9,8 +9,8 @@ ownership remains in [ROADMAP.md](../../ROADMAP.md); the shipped record remains 
 
 | Surface | Exact state |
 |---|---|
-| Current `main` | `7d58d36be5a67a6e859f4513bc9fc65523aab1a8` (`0.30.0`, #1272 merge) |
-| Current production | `7d58d36be5a67a6e859f4513bc9fc65523aab1a8` (`0.30.0`, `clean:true`, #1272 merge, built 2026-09-02T20:01:42Z) |
+| Current `main` | `0.30.0` — not pinned here; read `git rev-parse origin/main` |
+| Current production | `0.30.0` — read live `/health`; last recorded deploy `7d58d36be5a67a6e859f4513bc9fc65523aab1a8`, `clean:true`, 2026-09-02T20:01:42Z (#1272) |
 | Latest tagged stable release | `v0.25.0` |
 | Next stable candidate | `v0.30.0` |
 | Next development release | `v0.31.0` |
