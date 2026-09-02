@@ -885,3 +885,126 @@ test('main() refuses an invalid GROK_DELIVERY value before ever acquiring the lo
   assert.equal(lockAcquired, false, 'must refuse before ever taking the singleton lock')
   assert.deepEqual(exits, [1])
 })
+
+// ── per-message consume, one confirmed delivery per cycle (mupot#1258 herdr follow-up) ──
+//
+// Live canary (2026-09-01/02) surfaced a design flaw in the ORIGINAL batch
+// policy this connector inherited from codex/kasra-inbox-watch.mjs: a
+// confirmed herdr delivery makes the target busy, so a second message in
+// the same cycle can never be confirmed. Consuming only when the WHOLE
+// peeked batch delivered meant a genuinely confirmed message
+// (`delivered:1`) was silently discarded (`consumed:0`) and redelivered as
+// a duplicate forever, on any backlog a single cycle could not fully
+// clear. These tests cover the fix: at most one message attempted per
+// cycle, consumed per-message the instant (and only if) it is confirmed.
+
+// A minimal in-memory stand-in for the mupot inbox server: peek never
+// mutates the queue; consume removes exactly `limit` messages from the
+// FRONT (matching the real `inbox` tool's by-count, not by-id, semantics).
+function makeStatefulInbox(initialMessages) {
+  let queue = [...initialMessages]
+  return async (_token, name, args) => {
+    if (name === 'boot_context') return { bound_agent_id: AGENT }
+    if (name === 'inbox_consumer_status') return { mode: 'bearer_only' }
+    if (name === 'inbox' && args.peek === true) {
+      return { messages: queue.slice(0, args.limit), remaining: Math.max(0, queue.length - args.limit) }
+    }
+    if (name === 'inbox' && args.peek === false) {
+      const taken = queue.slice(0, args.limit)
+      queue = queue.slice(args.limit)
+      return { messages: taken, remaining: queue.length }
+    }
+    throw new Error(`unexpected mcp call: ${name} ${JSON.stringify(args)}`)
+  }
+}
+
+test('a partial batch consumes exactly the confirmed message and no others', async () => {
+  const MSG1 = { ...REQUEST, seq: 501, id: 'msg-1', request_id: 'req-1' }
+  const MSG2 = { ...REQUEST, seq: 502, id: 'msg-2', request_id: 'req-2' }
+  const mcpCall = makeStatefulInbox([MSG1, MSG2])
+  let deliverCalls = 0
+  const result = await runCycle({
+    seat: SEAT,
+    expectedAgentId: AGENT,
+    token: 'test-token-not-real',
+    mcpCall,
+    deliverViaHerdr: (_text, message) => {
+      deliverCalls += 1
+      assert.equal(message.id, 'msg-1', 'only the front message may ever be attempted')
+      return { ok: true, spool_path: '/tmp/x', marker: deliveryMarker(message) }
+    },
+  })
+  assert.equal(deliverCalls, 1, 'only the first peeked message may be attempted')
+  assert.equal(result.ok, true)
+  assert.equal(result.delivered, 1)
+  assert.equal(result.consumed, 1)
+  assert.equal(result.peeked, 2, 'the peek still reports the full batch that was visible')
+  assert.deepEqual(result.receipts.map((r) => r.id), ['msg-1'])
+})
+
+test('a cycle stops after the first confirmed delivery — messages 2 and 3 are never attempted', async () => {
+  const MSG1 = { ...REQUEST, seq: 511, id: 'msg-a', request_id: 'req-a' }
+  const MSG2 = { ...REQUEST, seq: 512, id: 'msg-b', request_id: 'req-b' }
+  const MSG3 = { ...REQUEST, seq: 513, id: 'msg-c', request_id: 'req-c' }
+  const mcpCall = makeStatefulInbox([MSG1, MSG2, MSG3])
+  const attempted = []
+  const result = await runCycle({
+    seat: SEAT,
+    expectedAgentId: AGENT,
+    token: 'test-token-not-real',
+    mcpCall,
+    deliverViaHerdr: (_text, message) => {
+      attempted.push(message.id)
+      return { ok: true, spool_path: '/tmp/x', marker: deliveryMarker(message) }
+    },
+  })
+  assert.deepEqual(attempted, ['msg-a'])
+  assert.equal(result.consumed, 1)
+  // msg-b and msg-c must still be queued server-side for the next cycle.
+  const remainder = await mcpCall('test-token-not-real', 'inbox', { limit: 10, peek: true, seat: SEAT })
+  assert.deepEqual(remainder.messages.map((m) => m.id), ['msg-b', 'msg-c'])
+})
+
+test('an unconfirmed message is retried on the next cycle and is never consumed', async () => {
+  const MSG1 = { ...REQUEST, seq: 601, id: 'msg-unconfirmed', request_id: 'req-u' }
+  const mcpCall = makeStatefulInbox([MSG1])
+  let deliverAttempts = 0
+  const deliverViaHerdr = () => {
+    deliverAttempts += 1
+    return { ok: false, reason: 'herdr_delivery_unconfirmed' }
+  }
+
+  const first = await runCycle({ seat: SEAT, expectedAgentId: AGENT, token: 'x', mcpCall, deliverViaHerdr })
+  assert.equal(first.ok, false)
+  assert.equal(first.reason, 'delivery_incomplete')
+  assert.equal(first.consumed, 0)
+  assert.equal(first.delivered, 0)
+
+  const second = await runCycle({ seat: SEAT, expectedAgentId: AGENT, token: 'x', mcpCall, deliverViaHerdr })
+  assert.equal(second.ok, false)
+  assert.equal(second.consumed, 0)
+  assert.equal(second.peeked, 1, 'the same message must still be queued — never consumed despite two unconfirmed attempts')
+  assert.equal(deliverAttempts, 2, 'the still-queued message must be retried on the next cycle')
+})
+
+test('a backlog drains one message per cycle, in order, and a delivered-then-consumed message never reappears', async () => {
+  const MSG1 = { ...REQUEST, seq: 701, id: 'msg-a', request_id: 'req-a' }
+  const MSG2 = { ...REQUEST, seq: 702, id: 'msg-b', request_id: 'req-b' }
+  const MSG3 = { ...REQUEST, seq: 703, id: 'msg-c', request_id: 'req-c' }
+  const mcpCall = makeStatefulInbox([MSG1, MSG2, MSG3])
+  const deliverViaHerdr = (_text, message) => ({ ok: true, spool_path: '/tmp/x', marker: deliveryMarker(message) })
+
+  const drained = []
+  for (let i = 0; i < 3; i += 1) {
+    const result = await runCycle({ seat: SEAT, expectedAgentId: AGENT, token: 'x', mcpCall, deliverViaHerdr })
+    assert.equal(result.ok, true)
+    assert.equal(result.delivered, 1)
+    assert.equal(result.consumed, 1)
+    drained.push(result.receipts[0].id)
+  }
+  assert.deepEqual(drained, ['msg-a', 'msg-b', 'msg-c'], 'each cycle drains exactly the next queued message, in order, none repeated')
+
+  const empty = await runCycle({ seat: SEAT, expectedAgentId: AGENT, token: 'x', mcpCall, deliverViaHerdr })
+  assert.equal(empty.reason, 'inbox_empty')
+  assert.equal(empty.consumed, 0)
+})

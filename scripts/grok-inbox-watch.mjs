@@ -7,10 +7,29 @@
 // welded bearer inbox, spools each message to disk, delivers a bounded
 // preview into the target pane, confirms delivery actually landed (see the
 // DELIVERY MECHANISM note below for what "confirms" means per mechanism —
-// it is NOT the same proof on both), and ONLY THEN consumes the batch from
-// mupot. Never pairs a consuming read with a delivery it cannot prove
+// it is NOT the same proof on both), and ONLY THEN consumes THAT message
+// from mupot. Never pairs a consuming read with a delivery it cannot prove
 // happened — see fleet-runtime/claude-code-inbox-adapter.mjs's YC27 note for
 // the failure mode this order exists to rule out.
+//
+// ONE MESSAGE PER CYCLE, CONSUMED PER-MESSAGE — NOT PER-BATCH (mupot#1258
+// herdr follow-up, live canary 2026-09-01/02): the codex/kasra watchers this
+// connector is modeled on consume a whole peeked batch atomically, refusing
+// consume unless every peeked message delivered (fleet-runtime/claude-code-
+// inbox-adapter.mjs's planInboxConsume). That policy is correct for their
+// transport but wrong for herdr's: a confirmed herdr delivery makes the
+// target BUSY, and a prompt to a busy target cannot be confirmed (the
+// revision counter never advances — see deliverViaHerdr), so a second
+// message in the same cycle is guaranteed unconfirmable. Applying the
+// batch-wide policy here meant one genuinely confirmed delivery
+// (`delivered:1`) was silently discarded (`consumed:0`) and redelivered as
+// a duplicate next cycle, forever, unless a whole backlog happened to clear
+// in a single pass — with a busy agent, possibly never. This script instead
+// attempts and consumes AT MOST ONE message per cycle: deliver messages[0],
+// and only if confirmed, consume exactly that one message and stop — the
+// rest of the peeked batch is left on the server for the next tick. With a
+// 30s default interval a backlog drains steadily, one message at a time,
+// without interrupting the target mid-task.
 //
 // mupot#1258 — the incident this script was written for: four briefs sent to
 // `muvps_loom` (a grok-cli seat) were accepted by mupot, ids returned, rows
@@ -104,7 +123,6 @@ import { spawnSync } from 'node:child_process'
 import {
   bearerConsumerAllowed,
   formatClaudeCodeNudge,
-  planInboxConsume,
   verifyConsumedBatch,
 } from '../fleet-runtime/claude-code-inbox-adapter.mjs'
 import { acquireSingletonLock } from '../fleet-runtime/singleton-lock.mjs'
@@ -599,50 +617,60 @@ export async function runCycle(opts = {}) {
     return { ok: true, reason: 'inbox_empty', consumed: 0, delivered: 0, remaining: Number(peeked.remaining ?? 0) }
   }
 
-  let deliveredCount = 0
-  const receipts = []
-  for (const message of messages) {
-    const nudge = formatClaudeCodeNudge(message)
-    const handoff = deliver(nudge, message)
-    if (!handoff.ok) {
-      log('deliver_fail', {
-        reason: handoff.reason,
-        seq: message.seq,
-        id: message.id,
-        request_id: message.request_id ?? null,
-      })
-      break
-    }
-    deliveredCount += 1
-    receipts.push({
+  // ONE message per cycle, never a batch (mupot#1258 herdr follow-up, live
+  // canary 2026-09-01/02): a confirmed delivery makes the target busy, and a
+  // prompt to a busy target cannot be confirmed (deliverViaHerdr's revision
+  // counter never advances) — so attempting a second message in the same
+  // cycle only manufactures a guaranteed-unconfirmable delivery and burns
+  // herdr calls. This is the real behavior of the transport, not a bug to
+  // route around. Consume is per-message too, not per-batch: an earlier
+  // batch-wide "consume only if every peeked message delivered" policy
+  // (still how planInboxConsume works, and still correct for the tmux-based
+  // codex/kasra watchers that share it) meant one confirmed delivery here
+  // was silently discarded — `delivered:1, consumed:0` — and redelivered
+  // next cycle as a duplicate, forever, on any backlog a single cycle could
+  // not fully clear. The rest of the peeked batch is left untouched on the
+  // server for the next cycle; only messages[0] is ever attempted.
+  const message = messages[0]
+  const nudge = formatClaudeCodeNudge(message)
+  const handoff = deliver(nudge, message)
+  if (!handoff.ok) {
+    log('deliver_fail', {
+      reason: handoff.reason,
       seq: message.seq,
       id: message.id,
       request_id: message.request_id ?? null,
-      in_reply_to: message.in_reply_to ?? null,
-      kind: message.kind,
     })
-  }
-
-  const plan = planInboxConsume({ peekedCount: messages.length, deliveredCount })
-  if (plan.consume === 0) {
-    log('consume_skipped', { reason: plan.reason, peeked: messages.length, delivered: deliveredCount })
+    log('consume_skipped', { reason: 'delivery_incomplete', peeked: messages.length, delivered: 0 })
     return {
       ok: false,
-      reason: plan.reason,
+      reason: 'delivery_incomplete',
       consumed: 0,
-      delivered: deliveredCount,
+      delivered: 0,
       peeked: messages.length,
-      receipts,
+      receipts: [],
     }
   }
 
-  const consumed = await mcp(token, 'inbox', { limit: plan.consume, peek: false, seat })
+  const receipt = {
+    seq: message.seq,
+    id: message.id,
+    request_id: message.request_id ?? null,
+    in_reply_to: message.in_reply_to ?? null,
+    kind: message.kind,
+  }
+
+  // Consume exactly the one confirmed message, never the rest of the peeked
+  // batch. `inbox` consumes front-of-queue by count (not by id), so
+  // limit:1 targets the same message we just delivered PROVIDED nothing
+  // else drained the queue underneath us between peek and consume;
+  // verifyConsumedBatch's identity check (not a bare count match) is what
+  // catches that case — same discipline the batch version used, just over
+  // a one-element expected array instead of the whole peeked batch.
+  const consumed = await mcp(token, 'inbox', { limit: 1, peek: false, seat })
   const consumedMessages = Array.isArray(consumed.messages) ? consumed.messages : []
 
-  // Compare identities, not counts: `inbox` consumes by limit, so a concurrent
-  // consumer can shift the window and leave the count matching while the rows
-  // differ. Those swapped-in rows leave the queue undelivered.
-  const verified = verifyConsumedBatch({ expected: messages, consumed: consumedMessages })
+  const verified = verifyConsumedBatch({ expected: [message], consumed: consumedMessages })
   if (!verified.ok) {
     log('consume_unverified', {
       agent_id: identity.agent_id,
@@ -651,25 +679,25 @@ export async function runCycle(opts = {}) {
       missing: verified.missing,
       peeked: messages.length,
       consumed: consumedMessages.length,
-      receipts,
+      receipts: [receipt],
     })
   } else {
     log('inbox_consumed', {
       agent_id: identity.agent_id,
       count: consumedMessages.length,
-      receipts,
+      receipts: [receipt],
     })
   }
   return {
     ok: verified.ok,
     reason: verified.ok ? 'delivered_and_consumed' : verified.reason,
     consumed: consumedMessages.length,
-    delivered: deliveredCount,
+    delivered: 1,
     peeked: messages.length,
     dropped: verified.dropped,
     missing: verified.missing,
     remaining: Number(consumed.remaining ?? peeked.remaining ?? 0),
-    receipts,
+    receipts: [receipt],
     agent_id: identity.agent_id,
   }
 }
