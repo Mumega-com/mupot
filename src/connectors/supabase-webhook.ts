@@ -5,6 +5,7 @@ import type { BusEventType, Env } from '../types'
 import { createBus } from '../bus'
 import { createTask } from '../tasks/service'
 import type { SupabaseWebhookPayload } from './supabase'
+import { timingSafeEqual } from '../lib/crypto'
 
 export const supabaseWebhookApp = new Hono<{ Bindings: Env }>()
 
@@ -14,7 +15,15 @@ supabaseWebhookApp.post('/supabase', async (c) => {
   const secretHeader = c.req.header('x-supabase-webhook-secret') || c.req.query('secret')
   const expectedSecret = c.env.SUPABASE_WEBHOOK_SECRET
 
-  if (expectedSecret && secretHeader !== expectedSecret) {
+  // P1 (2026-09-02): this was `if (expectedSecret && ...)` — an UNSET secret skipped
+  // the check entirely, so any anonymous POST emitted bus events and could
+  // createTask() via task_intake_rules. Every other inbound verifier in this pot
+  // fails closed with 503 not_configured; this one now does too, and compares in
+  // constant time like the rest.
+  if (!expectedSecret) {
+    return c.json({ ok: false, error: 'not_configured' }, 503)
+  }
+  if (!secretHeader || !timingSafeEqual(secretHeader, expectedSecret)) {
     return c.json({ ok: false, error: 'invalid_webhook_secret' }, 401)
   }
 
