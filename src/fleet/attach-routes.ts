@@ -27,6 +27,7 @@ import { bearerToken, resolveMemberByToken } from '../auth/member-bearer'
 import { getAgentView } from './registry'
 import { verifySignedAttach } from './signed-attach'
 import { verifySignedDetach } from './signed-detach'
+import { FLEET_RUNTIME_KINDS } from './runtime-vocabulary'
 
 // ── shared upsert ───────────────────────────────────────────────────────────────────
 
@@ -130,14 +131,9 @@ const AGENT_ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/
 
 const VALID_TYPES = new Set(['builder', 'reviewer', 'weaver', 'brain', 'comms', 'generic'])
 
-// Attach runtimes include 'hermes' (standalone Hermes agent runtime, absent from the
-// daemon-report set which uses 'hermes-cron' for cron-only Hermes).
+// Attach runtimes: single source `FLEET_RUNTIME_KINDS` (includes grok-cli).
 // Goose / goosed are deliberately excluded — see docs/fleet/goose-non-adoption-2026-07-22.md.
-// Added 'prime-agent' and 'herdr' per F-09 / mupot#881 / mupot#893.
-const VALID_RUNTIMES = new Set([
-  'codex', 'claude-code', 'nous', 'hermes', 'hermes-cron',
-  'systemd-user', 'tmux', 'python', 'pi', 'prime-agent', 'herdr',
-])
+const VALID_RUNTIMES = new Set(FLEET_RUNTIME_KINDS)
 
 const VALID_LIFECYCLES = new Set(['on_demand', 'always_on'])
 

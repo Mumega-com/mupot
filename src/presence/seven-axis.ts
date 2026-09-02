@@ -4,6 +4,7 @@
 // Cursor Cloud seat is `river-cursor`.
 
 import { RIVER_CURSOR_SEAT } from '../agents/river-lead'
+import { GROK_CLI } from '../fleet/runtime-vocabulary'
 
 export const SEVEN_AXIS_KEYS = [
   'seat',
@@ -25,7 +26,7 @@ export const SEVEN_AXIS_HARNESSES = [
   'codex-cli',
   'prime',
   'hermes',
-  'grok-cli',
+  GROK_CLI,
   'unknown',
 ] as const
 

@@ -67,6 +67,17 @@ describe('lane A: runtime=pi + model on /attach (real D1)', () => {
     expect(res.status).toBe(403)
   })
 
+  it('accepts runtime grok-cli (shared vocabulary with check_in)', async () => {
+    const res = await fleetAttachApp.request('/attach', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer tok-loom', 'content-type': 'application/json' },
+      body: JSON.stringify({ agent_id: 'a-loom', runtime: 'grok-cli', type: 'weaver' }),
+    }, env)
+    expect(res.status).toBe(200)
+    const fleet = harness.sqlite.prepare(`SELECT runtime FROM fleet_agents WHERE agent_id = 'a-loom'`).get() as { runtime: string }
+    expect(fleet.runtime).toBe('grok-cli')
+  })
+
   it('accepts runtime pi with no model (optional)', async () => {
     const res = await fleetAttachApp.request('/attach', {
       method: 'POST',
