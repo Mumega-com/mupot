@@ -141,7 +141,6 @@ interface InviteRow {
 
 export const membersApp = new Hono<AppEnv>()
 
-
 membersApp.get('/health', (c) =>
   c.json({ ok: true, component: 'members', tenant: c.env.TENANT_SLUG }),
 )

@@ -75,9 +75,13 @@ describe('CSRF on cookie-authenticated top-level mounts', () => {
       }, env)
       expect(cross.status, `${tc.name} cross-origin`).toBe(403)
 
+      // Same-origin leg uses text/plain ON PURPOSE: hono/csrf only evaluates the three
+      // CORS-simple content types, so a JSON control would never enter the origin
+      // comparison and the pair would be vacuous (arm finding: csrf({origin:'never'})
+      // stayed green with a JSON control).
       const same = await tc.app.request(tc.path, {
         method: tc.method ?? 'POST',
-        headers: { 'content-type': 'application/json', origin: SAME, cookie: OWNER },
+        headers: { 'content-type': 'text/plain;charset=UTF-8', origin: SAME, cookie: OWNER },
         body: JSON.stringify(tc.body),
       }, env)
       expect(same.status, `${tc.name} same-origin must not be a csrf 403`).not.toBe(403)
@@ -102,5 +106,16 @@ describe('CSRF on cookie-authenticated top-level mounts', () => {
       body: 'token=bogus',
     }, env)
     expect(r.status).not.toBe(403)
+  })
+})
+
+describe('studio: csrf is cookie-conditional', () => {
+  let harness: SqliteD1Harness
+  beforeEach(() => { harness = createSqliteD1(); applyAllMigrations(harness.sqlite) })
+  afterEach(() => harness.close())
+  it('a bearer/CLI POST with no cookie and no content-type is not 403 by csrf (reaches auth → 401)', async () => {
+    const env = { TENANT_SLUG: TENANT, DB: harness.db, SESSIONS: { get: async () => null, put: async () => undefined, delete: async () => undefined } } as unknown as Env
+    const r = await studioApp.request('/dispatch', { method: 'POST', headers: { authorization: 'Bearer mupot_bogus' }, body: '{}' }, env)
+    expect(r.status).toBe(401)
   })
 })

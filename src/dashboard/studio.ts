@@ -1082,7 +1082,12 @@ export const studioApp = new Hono<{ Bindings: Env; Variables: { auth?: AuthConte
 // (mumega.com) and does not stop a sibling *.mupot.mumega.com origin, and text/plain
 // skips CORS preflight. hono/csrf guards the three CORS-simple content types only —
 // its coverage depends on this Worker having NO cors() anywhere. Same convention as tasksApp.
-studioApp.use('*', csrf())
+// Studio is ALSO a bearer surface (/dispatch via resolveStudioApiAuth) and admits
+// guests on /chat. Unconditional csrf() would 403 any bearer/CLI POST without a
+// content-type (hono defaults a missing content-type to text/plain). Apply csrf only
+// when a session cookie rides the request — same shape as src/addons/routes.ts.
+const studioCsrf = csrf()
+studioApp.use('*', (c, next) => (c.req.header('cookie')?.includes('mupot_session=') ? studioCsrf(c, next) : next()))
 
 studioApp.post('/chat', async (c) => {
   let auth = c.get('auth')
