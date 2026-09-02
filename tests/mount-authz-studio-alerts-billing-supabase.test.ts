@@ -93,11 +93,13 @@ describe('mount authz: studio-data, alerts, billing, supabase webhook', () => {
       const row = await env.DB.prepare(`SELECT value FROM org_settings WHERE key = 'alert_webhooks'`).first()
       expect(row).toBeNull()
     })
-    it('member-tier: 403 need=admin on list and create', async () => {
+    it('member-tier: 403 need=admin on list, create, delete and test — every route, not just the first two', async () => {
       const r = await alertsApp.request('/webhooks', withCookie(MEMBER), env)
       expect(r.status).toBe(403)
       expect(await r.json()).toEqual({ error: 'forbidden', need: 'admin' })
       expect((await alertsApp.request('/webhooks', json({ url: 'https://attacker.test/x' }, MEMBER), env)).status).toBe(403)
+      expect((await alertsApp.request('/webhooks/any', withCookie(MEMBER, 'DELETE'), env)).status).toBe(403)
+      expect((await alertsApp.request('/test', json({}, MEMBER), env)).status).toBe(403)
     })
     it('owner: list works through the chain', async () => {
       const r = await alertsApp.request('/webhooks', withCookie(OWNER), env)
