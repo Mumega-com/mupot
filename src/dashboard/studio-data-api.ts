@@ -12,6 +12,7 @@ import { resolveConnector } from '../connectors/service'
 // requireAuth is owned by the auth component; it sets c.get('auth').
 import { requireAuth } from '../auth'
 import { requireOrgCapability } from '../auth/capability'
+import { csrf } from 'hono/csrf'
 
 export const studioDataApp = new Hono<{ Bindings: Env; Variables: { auth: AuthContext } }>()
 
@@ -19,6 +20,8 @@ export const studioDataApp = new Hono<{ Bindings: Env; Variables: { auth: AuthCo
 // and no inline check — anonymous arbitrary Supabase read/write/delete on any pot
 // with a connector bound. connectors/service.ts states isAdmin is enforced at the
 // ROUTE layer; this is that layer. Raw database access is org-admin only.
+// CSRF: see alerts/routes.ts — cookie-authenticated mutate on a top-level mount.
+studioDataApp.use('*', csrf())
 studioDataApp.use('*', requireAuth)
 
 async function resolveActiveSupabaseConfig(env: Env): Promise<SupabaseConfig | null> {

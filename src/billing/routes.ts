@@ -13,6 +13,7 @@ import {
   type StripeEvent,
 } from './stripe'
 import { getJSON } from '../dashboard/settings'
+import { csrf } from 'hono/csrf'
 // requireAuth is owned by the auth component; it sets c.get('auth').
 import { requireAuth } from '../auth'
 import { requireOrgCapability } from '../auth/capability'
@@ -49,7 +50,7 @@ billingRoutesApp.get('/status', requireAuth, requireOrgCapability('member'), asy
 /**
  * POST /api/billing/checkout — Creates a Stripe Checkout Session for self-serve upgrade.
  */
-billingRoutesApp.post('/checkout', requireAuth, requireOrgCapability('admin'), async (c) => {
+billingRoutesApp.post('/checkout', csrf(), requireAuth, requireOrgCapability('admin'), async (c) => {
   let body: { tier?: unknown; interval?: unknown; customer_email?: unknown }
   try {
     body = await c.req.json()
@@ -83,7 +84,7 @@ billingRoutesApp.post('/checkout', requireAuth, requireOrgCapability('admin'), a
 /**
  * POST /api/billing/portal — Creates a Stripe Customer Portal link.
  */
-billingRoutesApp.post('/portal', requireAuth, requireOrgCapability('admin'), async (c) => {
+billingRoutesApp.post('/portal', csrf(), requireAuth, requireOrgCapability('admin'), async (c) => {
   const customerId = await getJSON<string>(c.env, 'stripe_customer_id')
   if (!customerId) {
     return c.json({ error: 'no_active_stripe_customer', detail: 'No billing record exists yet. Upgrade to a paid plan first.' }, 404)
@@ -111,11 +112,17 @@ billingRoutesApp.post('/webhook', async (c) => {
     return c.json({ error: 'empty_payload' }, 400)
   }
 
-  if (secret) {
-    const verified = await verifyStripeSignature(rawBody, sigHeader, secret)
-    if (!verified) {
-      return c.json({ error: 'invalid_stripe_signature' }, 401)
-    }
+  // P0 (2026-09-02): this was `if (secret) { verify }` — an UNSET STRIPE_WEBHOOK_SECRET
+  // skipped verification entirely, so an anonymous POST with a forged
+  // checkout.session.completed (tenant_slug in the body, far-future `created`)
+  // upgraded the pot to the top tier and pinned it against real Stripe events.
+  // Fail closed like every other inbound verifier: 503 when unconfigured.
+  if (!secret) {
+    return c.json({ error: 'not_configured' }, 503)
+  }
+  const verified = await verifyStripeSignature(rawBody, sigHeader, secret)
+  if (!verified) {
+    return c.json({ error: 'invalid_stripe_signature' }, 401)
   }
 
   let event: StripeEvent

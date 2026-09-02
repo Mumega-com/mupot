@@ -11,6 +11,7 @@ import {
 // requireAuth is owned by the auth component; it sets c.get('auth').
 import { requireAuth } from '../auth'
 import { requireOrgCapability } from '../auth/capability'
+import { csrf } from 'hono/csrf'
 
 export const alertsApp = new Hono<{ Bindings: Env; Variables: { auth: AuthContext } }>()
 
@@ -18,6 +19,10 @@ export const alertsApp = new Hono<{ Bindings: Env; Variables: { auth: AuthContex
 // anonymous callers could register an exfiltration sink (events default '*'),
 // delete the tenant's real alerting, list sink URLs (a Slack/Discord webhook URL IS
 // the credential), and force outbound POSTs. Alert routing is org-admin only.
+// CSRF: cookie-authenticated mutations on a top-level mount do not inherit
+// dashboardApp's csrf(); SameSite=Lax is site-scoped (mumega.com) and does not
+// stop a sibling *.mupot.mumega.com origin. Same convention as tasksApp.
+alertsApp.use('*', csrf())
 alertsApp.use('*', requireAuth)
 
 /**
