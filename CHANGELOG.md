@@ -33,8 +33,9 @@
 - **Release preparation landed:** #1250 (`ccfdb4b3`, versioned v0.30 contract),
   #1251 (`c6ef9876`, evidence-chain-neutral Host-Go receipt), and #1252
   (`55c1c3ef`, exact `codex-cli` harness vocabulary) are now on `main`. All were
-  exact-head gated with terminal-successful CI and CodeQL. #1252 is not present
-  in the current production deployment and does not backfill old presence rows.
+  exact-head gated with terminal-successful CI and CodeQL. #1252 is present in the
+  current production deployment as of the 2026-09-02 `7d58d36b` deploy (`55c1c3ef` is
+  an ancestor of it) and does not backfill old presence rows.
 - **Still required for the stable candidate:** freeze one exact `main` SHA,
   collect the fresh receipts in [the v0.30.0 release contract](docs/releases/v0.30.0.md),
   execute the [next release flights](docs/releases/next-flights.md), and pass the
