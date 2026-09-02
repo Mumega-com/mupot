@@ -1746,3 +1746,148 @@ describe('fixture sanity', () => {
     expect(files).toContain('CREATE TABLE')
   })
 })
+
+// ─────────────────────────────────────────────────────────────────────────────
+// C10. The newcomer. This is the customer-onboarding funnel, not a corner case.
+//
+// findOrCreateMember auto-creates a members row for any verified Google email,
+// and unless an onboarding door is configured that member holds NOTHING. With no
+// capabilities they have no consentable agent, and no squad they may mint on, so
+// the create-a-seat option does not render either. The screen used to collapse to
+// a single choice — continue unbound — and an unbound session is mute on the
+// directory channel: send/inbox/inbox_lease/inbox_ack all refuse it.
+//
+// The exit ramp (bootstrapSelf) already existed and was already gated to exactly
+// this principal. It was reachable only as a tool call, which asked a customer to
+// know a tool name. These tests hold the door open on the screen itself.
+// ─────────────────────────────────────────────────────────────────────────────
+describe('C10. a brand-new customer with no capabilities', () => {
+  const NEWCOMER = 'newcomer@example.test'
+
+  it('is never shown an empty picker — the first-agent door is offered instead', async () => {
+    const oauthProvider = stubOAuthProvider()
+    const { env } = httpEnv(harness, oauthProvider)
+    const { html } = await reachConsentScreen(env, oauthProvider, NEWCOMER)
+
+    expect(html).toContain('__bootstrap__')
+    expect(html).toContain('Name your first agent')
+    // And not the old dead end that told them to go invoke a tool by name.
+    expect(html).not.toContain('bootstrap_self')
+  })
+
+  it('does not offer the door to someone who already has an agent to choose', async () => {
+    const oauthProvider = stubOAuthProvider()
+    const { env } = httpEnv(harness, oauthProvider)
+    const { html } = await reachConsentScreen(env, oauthProvider, 'human@example.test')
+    expect(html).not.toContain('__bootstrap__')
+  })
+
+  it('creates the agent and binds THIS session to it, in one pass', async () => {
+    const oauthProvider = stubOAuthProvider()
+    const { env } = httpEnv(harness, oauthProvider)
+    const { consentCookie } = await reachConsentScreen(env, oauthProvider, NEWCOMER)
+
+    const form = new URLSearchParams({
+      consent_nonce: consentCookie,
+      action: 'continue',
+      agent_id: '__bootstrap__',
+      first_agent_name: 'Ada',
+    })
+    const res = await handleOAuthAuthorize(new Request('https://pot.test/oauth/consent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${consentCookie}` },
+      body: form.toString(),
+    }), env)
+
+    expect(res.status).toBe(302)
+    expect(oauthProvider.completeAuthorization).toHaveBeenCalledTimes(1)
+
+    // The session is BOUND — the whole point. An unbound session would be mute.
+    const call = oauthProvider.completeAuthorization.mock.calls[0][0]
+    expect(call.props.boundAgentId).toBeTruthy()
+
+    const agent = harness.sqlite.prepare(
+      `SELECT id, name, squad_id FROM agents WHERE id = '${call.props.boundAgentId}'`,
+    ).all()[0]
+    expect(agent).toBeTruthy()
+    expect(agent.name).toBe('Ada')
+  })
+
+  it('clamps the new agent to member on its own squad — never lead or above', async () => {
+    const oauthProvider = stubOAuthProvider()
+    const { env } = httpEnv(harness, oauthProvider)
+    const { consentCookie } = await reachConsentScreen(env, oauthProvider, NEWCOMER)
+
+    await handleOAuthAuthorize(new Request('https://pot.test/oauth/consent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${consentCookie}` },
+      body: new URLSearchParams({
+        consent_nonce: consentCookie, action: 'continue', agent_id: '__bootstrap__', first_agent_name: 'Ada',
+      }).toString(),
+    }), env)
+
+    const call = oauthProvider.completeAuthorization.mock.calls[0][0]
+    const caps = harness.sqlite.prepare(
+      `SELECT capability, scope_type FROM capabilities WHERE member_id = '${call.props.memberId}'`,
+    ).all() as Array<{ capability: string; scope_type: string }>
+    expect(caps.length).toBeGreaterThan(0)
+    for (const c of caps) {
+      expect(['observer', 'member']).toContain(c.capability)
+      expect(c.scope_type).toBe('squad')
+    }
+  })
+
+  it('refuses an unnamed agent without destroying the session, so retrying works', async () => {
+    const oauthProvider = stubOAuthProvider()
+    const { env } = httpEnv(harness, oauthProvider)
+    const { consentCookie } = await reachConsentScreen(env, oauthProvider, NEWCOMER)
+
+    const before = harness.sqlite.prepare('SELECT COUNT(*) AS n FROM agents').all()[0].n
+
+    const res = await handleOAuthAuthorize(new Request('https://pot.test/oauth/consent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${consentCookie}` },
+      body: new URLSearchParams({
+        consent_nonce: consentCookie, action: 'continue', agent_id: '__bootstrap__', first_agent_name: '   ',
+      }).toString(),
+    }), env)
+
+    expect(res.status).toBe(400)
+    // The consent session must SURVIVE a recoverable mistake. Clearing it here is
+    // what turned a typo into "sign in again and hit the identical wall".
+    expect(res.headers.get('Set-Cookie') ?? '').not.toContain('Max-Age=0')
+    expect(await res.text()).not.toContain('sign in again')
+    // Nothing was created.
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM agents').all()[0].n).toBe(before)
+    expect(oauthProvider.completeAuthorization).not.toHaveBeenCalled()
+  })
+
+  it('is idempotent once per member — a second attempt creates no second agent', async () => {
+    const oauthProvider = stubOAuthProvider()
+    const { env } = httpEnv(harness, oauthProvider)
+
+    const first = await reachConsentScreen(env, oauthProvider, NEWCOMER)
+    await handleOAuthAuthorize(new Request('https://pot.test/oauth/consent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${first.consentCookie}` },
+      body: new URLSearchParams({
+        consent_nonce: first.consentCookie, action: 'continue', agent_id: '__bootstrap__', first_agent_name: 'Ada',
+      }).toString(),
+    }), env)
+    const afterFirst = harness.sqlite.prepare('SELECT COUNT(*) AS n FROM agents').all()[0].n
+
+    const second = await reachConsentScreen(env, oauthProvider, NEWCOMER)
+    const res = await handleOAuthAuthorize(new Request('https://pot.test/oauth/consent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${second.consentCookie}` },
+      body: new URLSearchParams({
+        consent_nonce: second.consentCookie, action: 'continue', agent_id: '__bootstrap__', first_agent_name: 'Bob',
+      }).toString(),
+    }), env)
+
+    expect(res.status).toBe(400)
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM agents').all()[0].n).toBe(afterFirst)
+    // The message must tell them what to do, not just what failed.
+    expect((await res.text()).toLowerCase()).toContain('already created your first agent')
+  })
+})
