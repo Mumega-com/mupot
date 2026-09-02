@@ -410,14 +410,83 @@ describe('targeted seat dispatch & isolated mailboxes (Migration 0120 + mupot#12
 
     // inbox_ack takes no `seat` arg — Alpha's token CAN ack it purely because it knows the
     // id and both tokens are welded to the same to_agent. This is documented, pre-existing,
-    // unchanged-by-this-PR behavior (see the comment above toolInboxAck in src/mcp/index.ts):
-    // ids are unguessable crypto.randomUUID()s, and the leak channel that would let Alpha
-    // ever LEARN this id (a mismatched args.seat on inbox/inbox_lease) is exactly what this
-    // PR closes.
+    // unchanged-by-this-PR behavior (see the comment above toolInboxAck in src/mcp/index.ts).
+    // NOTE (corrected on kasra-review's round-2 gate): this test only proves ackAgentMessages
+    // never checks target_seat — it does NOT prove Alpha has no way to learn a seat-B id. Two
+    // separate, pre-existing, out-of-scope channels still leak ids/bodies across seats
+    // (inbox_dead_letters, project_context message projections) — see toolInboxAck's own
+    // comment and mumega-com#1176. Not fixed here.
     const ackByAlpha = await invokeTool(familyAuthAlpha, env, 'inbox_ack', { ids: [target.id] })
     expect(ackByAlpha.ok).toBe(true)
     if (ackByAlpha.ok) {
       expect((ackByAlpha.result as any).acked).toContain(target.id)
     }
+  })
+
+  // mupot#1272 adversarial-gate P1 (kasra-review round 2, proved A/B against base): the
+  // read side above is now strictly seat-bound, but `send` only checked isRef(target_seat) —
+  // any syntactically valid string, typo included. A target_seat matching no LIVE token
+  // label for the recipient created an ORPHAN row no MCP surface could ever read back
+  // (inbox/inbox_lease are label-bound; inbox_ack needs an id nobody can obtain;
+  // inbox_dead_letters needs delivery_attempts/dead_lettered_at, which only the lease path
+  // sets, and lease can't see the row either) — and MAX_UNREAD_PER_RECIPIENT (per to_agent,
+  // seat-blind) meant enough orphans permanently DoS'd the whole agent's inbox. Closed by
+  // validating target_seat against a live member_tokens.label for the recipient inside
+  // sendAgentMessage itself (src/agents/messages.ts), so both the MCP `send` tool and the
+  // REST `POST /api/inbox/send` route get it from one place.
+  it('send to a seat matching no LIVE token label is refused seat_unknown and creates NO orphan row', async () => {
+    const before = harness.sqlite.prepare(
+      `SELECT COUNT(*) AS n FROM agent_messages WHERE to_agent = ?`,
+    ).get(familyAgentId) as { n: number }
+
+    // Case-mismatch of the real SEAT_BETA label ('Mumega Ceo') — exactly the human-typo shape
+    // the reviewer's PoC used.
+    const res = await invokeTool(senderAuth, env, 'send', {
+      to: familyAgentId,
+      body: 'Orphan attempt — typo seat',
+      seat: 'mumega ceo',
+      request_id: 'req-orphan-attempt',
+    })
+    expect(res.ok).toBe(false)
+    if (!res.ok) {
+      expect(res.status).toBe(400)
+      expect(res.error).toBe('seat_unknown')
+    }
+
+    // Recovery assertion: the row this would have orphaned was never written.
+    const after = harness.sqlite.prepare(
+      `SELECT COUNT(*) AS n FROM agent_messages WHERE to_agent = ?`,
+    ).get(familyAgentId) as { n: number }
+    expect(after.n).toBe(before.n)
+    expect(
+      harness.sqlite.prepare(`SELECT id FROM agent_messages WHERE request_id = 'req-orphan-attempt'`).get(),
+    ).toBeUndefined()
+  })
+
+  it('send to a real bound seat still succeeds — positive control for the new write-side guard', async () => {
+    const res = await invokeTool(senderAuth, env, 'send', {
+      to: familyAgentId,
+      body: 'Positive control send',
+      seat: SEAT_ALPHA,
+      request_id: 'req-positive-control-send',
+    })
+    expect(res.ok).toBe(true)
+
+    const read = await invokeTool(familyAuthAlpha, env, 'inbox', { peek: true })
+    expect(read.ok).toBe(true)
+    if (read.ok) {
+      const msgs = (read.result as any).messages as any[]
+      expect(msgs.some((m) => m.body === 'Positive control send')).toBe(true)
+    }
+  })
+
+  it('args.seat = "" (empty string) normalizes to unscoped, not a mismatch — matches pre-fix behavior', async () => {
+    // familyAuthAlpha's bound seat is SEAT_ALPHA; an empty-string args.seat must NOT be
+    // compared against it (that would spuriously 403 seat_mismatch, since '' !== SEAT_ALPHA).
+    const res = await invokeTool(familyAuthAlpha, env, 'inbox', { seat: '', peek: true })
+    expect(res.ok).toBe(true)
+
+    const whitespaceRes = await invokeTool(familyAuthAlpha, env, 'inbox_lease', { seat: '   ' })
+    expect(whitespaceRes.ok).toBe(true)
   })
 })

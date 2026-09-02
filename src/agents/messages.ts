@@ -19,6 +19,7 @@ import { createBus } from '../bus'
 import { resolveAgentRef } from '../org/resolve'
 import { canOnSquad } from '../auth/capability'
 import { sha256Hex } from '../lib/canonical-json'
+import { TOKEN_LIVE_PREDICATE } from '../auth/token-lifecycle'
 
 // ── tunables ────────────────────────────────────────────────────────────────────────────
 const MAX_BODY_CHARS = 8000
@@ -115,6 +116,7 @@ export type SendFailure = {
     | 'dispatch_fenced'
     | 'send_target_not_visible'
     | 'inbox_full'
+    | 'seat_unknown'
     | 'db_error'
   detail?: string
 }
@@ -236,10 +238,42 @@ export async function sendAgentMessage(
     if (access !== null) return { ok: false, reason: access }
   }
 
-  if (input.targetSeat !== undefined && !isRef(input.targetSeat))
-    return { ok: false, reason: 'invalid_body', detail: 'target_seat must be a valid reference string' }
-
   const now = opts.now ?? (() => new Date().toISOString())
+
+  // mupot#1272 adversarial-gate P1 (kasra-code, flight-20260902-seat-bind, round 2): the
+  // seat-bind fix earlier in this PR made `inbox`/`inbox_lease` read-side STRICT — a caller can
+  // only ever read the ONE seat its own live token is labelled with (resolveBoundSeat,
+  // src/mcp/index.ts). Left alone, `send`'s write side only checked isRef(targetSeat) — any
+  // syntactically valid string, typo or case-mismatch included. A `target_seat` that matches no
+  // LIVE token label for the recipient creates an ORPHAN row: no `inbox`/`inbox_lease` caller can
+  // ever be bound to that seat (there is no such token), `inbox_ack` needs an id nobody can
+  // obtain, and `inbox_dead_letters` needs `dead_lettered_at`, which only the LEASE path sets —
+  // and lease can never see the row either, so `delivery_attempts` stays 0 forever. Worse,
+  // MAX_UNREAD_PER_RECIPIENT is per `to_agent` and seat-BLIND: enough orphans pin the whole
+  // agent's inbox at `inbox_full`, for every seat, with no drain path — a permanent DoS any
+  // peer with send rights could trigger with nothing more than a typo. Proven A/B against base
+  // by kasra-review on this same PR. Validating at the WRITE side, once, here — rather than in
+  // the MCP `send` tool handler — is deliberate: this primitive is also the REST send path
+  // (`POST /api/inbox/send`, src/agents/inbox-routes.ts), and both must refuse the same orphan
+  // shape, not just the MCP one.
+  if (input.targetSeat !== undefined) {
+    if (!isRef(input.targetSeat))
+      return { ok: false, reason: 'invalid_body', detail: 'target_seat must be a valid reference string' }
+    const liveSeatToken = await env.DB.prepare(
+      `SELECT 1 FROM member_tokens t
+        WHERE t.tenant = ?1 AND t.agent_id = ?2 AND t.label = ?3
+          AND ${TOKEN_LIVE_PREDICATE('?4')}
+        LIMIT 1`,
+    ).bind(tenant, input.toAgent, input.targetSeat, now()).first()
+    if (!liveSeatToken) {
+      return {
+        ok: false,
+        reason: 'seat_unknown',
+        detail: 'target_seat does not match a live token label held by the recipient',
+      }
+    }
+  }
+
   const idGen = opts.idGen ?? (() => crypto.randomUUID())
   const routineFence = opts.routineRunFence
   if (routineFence && input.projectId !== routineFence.projectId) {

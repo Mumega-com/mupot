@@ -3349,9 +3349,18 @@ async function resolveBoundSeat(env: Env, auth: AuthContext): Promise<string | n
 // accepted ONLY as a same-value compat echo; anything else is refused, never silently
 // downgraded to the token's real seat or to unscoped.
 function resolveInboxSeatArg(
-  requestedSeat: string | undefined,
+  requestedSeatRaw: string | undefined,
   boundSeat: string | null,
 ): { ok: true; seat: string | undefined } | { ok: false; outcome: ToolOutcome } {
+  // mupot#1272 adversarial-gate P1, item 3: an empty/whitespace-only `args.seat` ('' or ' ')
+  // is "no seat requested," matching the PRE-FIX normalization that lived in
+  // readAgentInboxForReader/leaseAgentInbox (`input.seat.trim().length > 0 ? ... : null`,
+  // src/agents/messages.ts). Without this, a caller passing `seat: ''` fell into the mismatch
+  // branch below (boundSeat, if any, is never '') and got a spurious seat_mismatch instead of
+  // the unscoped read it got before this PR.
+  const requestedSeat = requestedSeatRaw !== undefined && requestedSeatRaw.trim().length === 0
+    ? undefined
+    : requestedSeatRaw
   if (requestedSeat !== undefined) {
     if (boundSeat === null) {
       return {
@@ -3537,24 +3546,26 @@ const toolInboxLease: ToolSpec = {
 //
 // mupot#1254 C1 seat-bind (kasra-code, flight-20260902-seat-bind): deliberately UNCHANGED.
 // inbox_ack has no `seat` argument at all — it is scoped by `to_agent = agent` only
-// (ackAgentMessages, src/agents/messages.ts), same as before this fix, and that is by the
-// ORIGINAL design of this tool ("Only the bound recipient may ack, and only rows addressed
-// to them" — see ackAgentMessages' own docstring), not an oversight this PR needs to close:
-//   - `ids` are opaque `crypto.randomUUID()`s (src/agents/messages.ts:243), not derivable
-//     from a seat name or any other guessable input — knowing an id is already a real
-//     capability, the same "id as bearer capability" shape `send_target_not_visible`
-//     deliberately collapses onto (see ackAgentMessages' comment on `refused`).
-//   - The one place a seat-B caller could learn a seat-A id via a mismatched `args.seat`
-//     was `inbox`/`inbox_lease` — exactly the hole `resolveBoundSeat` above closes. Once
-//     that channel is shut, an agent-bound caller has no seat-scoped way to enumerate
-//     another seat's ids through inbox_ack's own surface.
-//   - `inbox_dead_letters` (self scope, a few tools below) is a SEPARATE, pre-existing,
-//     already-unseated surface: it returns EVERY dead-lettered message body for
-//     `to_agent = agent` with no seat filter at all, so a seat-B caller who ALSO holds a
-//     bound token for the same agent can already read seat-A's parked mail there today.
-//     That is a real cross-seat leak, but it is not caused or worsened by args.seat and is
-//     out of this PR's named scope (index.ts:~3353/3417/3444 — see the flight brief); flagged
-//     for a follow-up rather than folded in here silently.
+// (ackAgentMessages, src/agents/messages.ts:922-929 — filters tenant/to_agent/fence, never
+// target_seat), same as before this fix, and that is by the ORIGINAL design of this tool
+// ("Only the bound recipient may ack, and only rows addressed to them" — see
+// ackAgentMessages' own docstring). `ids` are opaque `crypto.randomUUID()`s
+// (src/agents/messages.ts:265ish), not derivable from a seat name — knowing an id is already
+// a real capability, the same "id as bearer capability" shape `send_target_not_visible`
+// deliberately collapses onto.
+//
+// CORRECTED on kasra-review's round-2 gate of this PR (3ac8eb18): an earlier version of this
+// comment claimed "the one place a seat-B caller could learn a seat-A id was a mismatched
+// args.seat on inbox/inbox_lease — exactly the hole this PR closes," implying the id-leak
+// surface was fully closed. That was false, refuted with a live PoC: `inbox_dead_letters`
+// (self scope, a few tools below, src/agents/messages.ts:~990 `listDeadLetteredMessages`)
+// returns id+body for EVERY seat of `to_agent` with NO seat filter at all, and
+// `project_context`'s message projections (src/projects/projections.ts ~337-346, ~563-570,
+// gated only by `messageReadableSql` — squad readability, no seat concept) do the same. A
+// seat-B caller who can reach either surface can still learn a seat-A id today and hand it
+// straight to inbox_ack. Neither channel is caused or worsened by args.seat, and NEITHER IS
+// FIXED IN THIS PR — scope stays the 3 tools named in the flight brief
+// (index.ts inbox/inbox_lease/inbox_ack). Tracked as mumega-com#1176.
 const toolInboxAck: ToolSpec = {
   name: 'inbox_ack',
   scope: 'self (the caller agent acks messages addressed to itself)',
