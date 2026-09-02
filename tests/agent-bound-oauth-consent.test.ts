@@ -1891,3 +1891,50 @@ describe('C10. a brand-new customer with no capabilities', () => {
     expect((await res.text()).toLowerCase()).toContain('already created your first agent')
   })
 })
+
+// The fail-closed branch: bootstrapSelf SUCCEEDS but this session still cannot be
+// bound. Reachable through the documented adopted-home-squad case — when a home
+// squad already exists for this member and they hold a NON-admin capability on it,
+// the founder grant is adopted rather than written (never widened), so the human
+// does not clear the consent screen's admin floor. The agent is real and theirs;
+// only the automatic binding fails. Without this test that whole branch is
+// uncovered: deleting its condition changed no result.
+describe('C11. the agent was created but this session could not be bound', () => {
+  const ADOPTED = 'adopted@example.test'
+  const ADOPTED_MEMBER = 'member-adopted-home'
+
+  beforeEach(() => {
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status, created_at, tenant)
+        VALUES ('${ADOPTED_MEMBER}', '${ADOPTED}', 'Adopted', 'active', '2026-09-01T00:00:00.000Z', 'mumega');
+      INSERT INTO departments (id, slug, name, kind)
+        VALUES ('dept-adopted', 'dept-home-${ADOPTED_MEMBER}', 'Home', 'home');
+      INSERT INTO squads (id, department_id, slug, name, kind)
+        VALUES ('squad-adopted', 'dept-adopted', 'home-${ADOPTED_MEMBER}', 'Home', 'home');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES ('cap-adopted-not-admin', '${ADOPTED_MEMBER}', 'squad', 'squad-adopted', 'member');
+    `)
+  })
+
+  it('says the agent was created and how to reach it, instead of reporting failure', async () => {
+    const oauthProvider = stubOAuthProvider()
+    const { env } = httpEnv(harness, oauthProvider)
+    const { consentCookie } = await reachConsentScreen(env, oauthProvider, ADOPTED)
+
+    const res = await handleOAuthAuthorize(new Request('https://pot.test/oauth/consent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${consentCookie}` },
+      body: new URLSearchParams({
+        consent_nonce: consentCookie, action: 'continue', agent_id: '__bootstrap__', first_agent_name: 'Ada',
+      }).toString(),
+    }), env)
+
+    expect(res.status).toBe(403)
+    const body = await res.text()
+    // The agent EXISTS and is theirs. Saying "failed" here would be false.
+    expect(body).toContain('was created')
+    expect(body).toContain('reconnect')
+    // No token is issued for a session that could not be bound.
+    expect(oauthProvider.completeAuthorization).not.toHaveBeenCalled()
+  })
+})

@@ -1565,9 +1565,11 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
         return new Response(message, { status, headers: { 'Content-Type': 'text/plain' } })
       }
 
-      if (!firstName) {
-        return rejectSoftly('Give your agent a name, then continue. Nothing was created.', 400)
-      }
+      // No local name check. bootstrapSelf already owns that rule (naming is its
+      // condition 1) and returns agent_name_required, which is mapped below. A
+      // second copy of the same predicate here was redundant and untested — a
+      // mutation deleting it changed nothing, which is exactly how two copies of
+      // one rule drift apart later.
 
       const bootstrapped = await bootstrapSelf(
         env,
