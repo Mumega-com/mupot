@@ -39,6 +39,7 @@ The MCP tool surface (from `GET /mcp/tools`):
 | **Hermes** | the **mouth & ears** — relays IM (Telegram) users in and out | sends Telegram secret-token header, relays chat to `/im/webhook` | [`hermes/`](./hermes/) |
 | **Codex** | secondary mind | MCP config snippet → same `/mcp` + token | [`codex/`](./codex/) |
 | **brain-node** | the sovereign Python **brain as a network node** | member token → points its motor at `/mcp` tools instead of localhost | [`brain-node/`](./brain-node/) |
+| **Grok** | TUI mind — Stop-hook receive at end of turn (idle-wake is a separate herdr polling artifact) | MCP + [`grok/bridge/`](./grok/bridge/) Stop hook | [`grok/`](./grok/) |
 
 ## Getting a member token (what you paste in)
 
