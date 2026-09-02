@@ -208,8 +208,24 @@ describe('search haystack — what typing into the filter can find', () => {
     expect(hay).toContain('admin')
   })
 
-  it('is lower-cased so matching does not depend on how the user types', () => {
-    expect(hay).toBe(hay.toLowerCase())
+  // This assertion was originally `expect(hay).toBe(hay.toLowerCase())`, which is
+  // self-referential: with all-lowercase fixtures it holds whether or not the
+  // code lowercases anything, and deleting the .toLowerCase() call left it green.
+  // A mutation caught it. The fixture now carries capitals so the behaviour is
+  // observable.
+  it('lower-cases mixed-case content so matching does not depend on how the user types', () => {
+    const mixed = searchHaystack({
+      name: 'Hadi GROK Desktop',
+      slug: 'Hadi-Grok-Desktop',
+      squad_name: 'Core Platform',
+      grants: [grant('org', 'mumega', 'admin')],
+      names: { ...names, org: 'Mumega' },
+    })
+    expect(mixed).toContain('hadi grok desktop')
+    expect(mixed).toContain('core platform')
+    expect(mixed).toContain('mumega')
+    expect(mixed).not.toContain('GROK')
+    expect(mixed).not.toContain('Core Platform')
   })
 
   it('never contains a raw scope id once that scope has a name', () => {
