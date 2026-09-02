@@ -3,13 +3,14 @@
 ## Release status — 2026-09-02
 
 - **Current source version:** `0.30.0` on `main` at
-  `75a6f16ba248b84a32558cd094bdca529747da76` (#1256 merge). Authoritative value is
+  `7d58d36be5a67a6e859f4513bc9fc65523aab1a8` (#1272 merge). Authoritative value is
   `git rev-parse origin/main`; this line is an as-of snapshot and goes stale on the
   next merge.
 - **Current production deployment:** `0.30.0` at
-  `05757a5ee6f4314195ebd49371544bb5f82b66e4`, `clean:false` (built 2026-09-02T01:03Z from
-  `main`, #1254). Authoritative value is the live `/health` `commit` field. Production
-  is behind current `main`; neither deployment is a stable-release claim.
+  `7d58d36be5a67a6e859f4513bc9fc65523aab1a8`, `clean:true` (built 2026-09-02T20:01:42Z from
+  `main`, #1272). Authoritative value is the live `/health` `commit` field. Production
+  and `main` are at the same commit as of this snapshot; neither is a stable-release
+  claim, because a stable release requires a tag, not a deployment.
 - **Latest tagged stable release:** `v0.25.0`. Neither `v0.29.0` nor `v0.30.0`
   currently has a release tag or GitHub release, so source-version headings below are
   preview history, not a supported stable contract.
