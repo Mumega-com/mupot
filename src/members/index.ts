@@ -38,6 +38,7 @@ import type {
 
 // requireAuth is owned by the auth component; it sets c.get('auth').
 import { requireAuth } from '../auth'
+import { csrf } from 'hono/csrf'
 import { assertBatchWritten } from '../lib/receipt'
 // The FROZEN capability API — everyone codes against these exact signatures.
 import { requireCapability, capabilityRank, actorMaxRankOnScope } from '../auth/capability'
@@ -139,6 +140,7 @@ interface InviteRow {
 // ── app ──────────────────────────────────────────────────────────────────────
 
 export const membersApp = new Hono<AppEnv>()
+
 
 membersApp.get('/health', (c) =>
   c.json({ ok: true, component: 'members', tenant: c.env.TENANT_SLUG }),
@@ -283,6 +285,14 @@ membersApp.post('/invites/:id/accept', async (c) => {
 
 // ── global guards for the remaining (session-backed) routes ───────────────────
 
+// CSRF (2026-09-02, adversarial class finding): cookie-authenticated mutations on a
+// top-level mount do not inherit dashboardApp's csrf(); SameSite=Lax is site-scoped
+// (mumega.com) and does not stop a sibling *.mupot.mumega.com origin, and text/plain
+// skips CORS preflight. hono/csrf guards the three CORS-simple content types only —
+// its coverage depends on this Worker having NO cors() anywhere. Same convention as tasksApp.
+// Registered AFTER /invites/:id/accept on purpose: that route is public token
+// redemption (no session), so CSRF is not its threat model and CLI redeems keep working.
+membersApp.use('*', csrf())
 membersApp.use('*', requireAuth)
 membersApp.use('*', async (c, next) => {
   const auth = c.get('auth')

@@ -18,6 +18,7 @@ import type { HtmlEscapedString } from 'hono/utils/html'
 import type { Context } from 'hono'
 import { resolveCapabilities, holdsCapabilityFloor, isOrgAdmin } from '../auth/capability'
 import { bearerToken, resolveMemberByToken } from '../auth/member-bearer'
+import { csrf } from 'hono/csrf'
 import { createCursorAgent, resolveCursorApiToken } from '../cursor/client'
 import { injectSevenAxisSeatDeclaration } from '../cursor/seat-identity'
 import type { AuthContext, Env } from '../types'
@@ -1075,6 +1076,13 @@ async function resolveStudioApiAuth(c: {
 }
 
 export const studioApp = new Hono<{ Bindings: Env; Variables: { auth?: AuthContext } }>()
+
+// CSRF (2026-09-02, adversarial class finding): /chat (guest or cookie) and /dispatch (bearer or cookie) mutations on a
+// top-level mount do not inherit dashboardApp's csrf(); SameSite=Lax is site-scoped
+// (mumega.com) and does not stop a sibling *.mupot.mumega.com origin, and text/plain
+// skips CORS preflight. hono/csrf guards the three CORS-simple content types only —
+// its coverage depends on this Worker having NO cors() anywhere. Same convention as tasksApp.
+studioApp.use('*', csrf())
 
 studioApp.post('/chat', async (c) => {
   let auth = c.get('auth')
