@@ -10,6 +10,7 @@ import { Hono, type MiddlewareHandler } from 'hono'
 import { z } from 'zod'
 import type { Env, AuthContext, Capability, ChannelBinding } from '../types'
 import { requireAuth } from '../auth'
+import { csrf } from 'hono/csrf'
 import { requireOrgCapability, actorMaxRankOnScope } from '../auth/capability'
 import { getAdapter } from './registry'
 import { discordGet, createGuildRole, getDiscordAdminToken } from './adapters/discord'
@@ -34,6 +35,12 @@ const tenantGuard: MiddlewareHandler<AppEnv> = async (c, next) => {
   }
   await next()
 }
+// CSRF (2026-09-02, adversarial class finding): cookie-authenticated mutations on a
+// top-level mount do not inherit dashboardApp's csrf(); SameSite=Lax is site-scoped
+// (mumega.com) and does not stop a sibling *.mupot.mumega.com origin, and text/plain
+// skips CORS preflight. hono/csrf guards the three CORS-simple content types only —
+// its coverage depends on this Worker having NO cors() anywhere. Same convention as tasksApp.
+channelsAdminApp.use('*', csrf())
 channelsAdminApp.use('*', requireAuth, tenantGuard)
 
 // ── bindings ───────────────────────────────────────────────────────────────────

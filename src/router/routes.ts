@@ -1,5 +1,6 @@
 import { Hono } from 'hono'
 import { requireAuth } from '../auth'
+import { csrf } from 'hono/csrf'
 import { authorizeExecutionScope } from '../auth/execution-scope'
 import { isOrgAdmin } from '../auth/capability'
 import type { AuthContext, Env } from '../types'
@@ -9,6 +10,12 @@ type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
 export const routerApp = new Hono<AppEnv>()
 
+// CSRF (2026-09-02, adversarial class finding): cookie-authenticated mutations on a
+// top-level mount do not inherit dashboardApp's csrf(); SameSite=Lax is site-scoped
+// (mumega.com) and does not stop a sibling *.mupot.mumega.com origin, and text/plain
+// skips CORS preflight. hono/csrf guards the three CORS-simple content types only —
+// its coverage depends on this Worker having NO cors() anywhere. Same convention as tasksApp.
+routerApp.use('*', csrf())
 routerApp.use('*', requireAuth)
 
 // POST /api/router/tick — an org-admin operational trigger for one named squad.

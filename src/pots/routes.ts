@@ -3,6 +3,7 @@
 import { Hono } from 'hono'
 import type { Env, AuthContext } from '../types'
 import { requireAuth } from '../auth'
+import { csrf } from 'hono/csrf'
 import { isOrgAdmin } from '../auth/capability'
 import { orgAdminForbiddenPayload, ORG_ADMIN_REFUSAL_LINKS } from '../auth/refusal'
 import { provisionSovereignPot, listSovereignPots } from './service'
@@ -12,6 +13,12 @@ type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
 export const potsApp = new Hono<AppEnv>()
 
+// CSRF (2026-09-02, adversarial class finding): cookie-authenticated mutations on a
+// top-level mount do not inherit dashboardApp's csrf(); SameSite=Lax is site-scoped
+// (mumega.com) and does not stop a sibling *.mupot.mumega.com origin, and text/plain
+// skips CORS preflight. hono/csrf guards the three CORS-simple content types only —
+// its coverage depends on this Worker having NO cors() anywhere. Same convention as tasksApp.
+potsApp.use('*', csrf())
 potsApp.use('*', requireAuth)
 
 // POST /api/pots/provision — Provision an isolated sovereign pot (D1, KV, WFP User Worker)

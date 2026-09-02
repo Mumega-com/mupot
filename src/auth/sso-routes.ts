@@ -4,6 +4,7 @@ import { Hono } from 'hono'
 import type { Env, AuthContext } from '../types'
 // requireAuth is owned by the auth component; it sets c.get('auth').
 import { requireAuth } from './index'
+import { csrf } from 'hono/csrf'
 import { requireOrgCapability } from './capability'
 import {
   getSsoConfig,
@@ -24,6 +25,12 @@ export const ssoApp = new Hono<{ Bindings: Env; Variables: { auth: AuthContext }
 // Gate: every route requires an authenticated principal; config read/write and
 // enrollment require org admin; domain validation requires org member. There are
 // no in-repo callers of these routes, so nothing legitimate relied on the gap.
+// CSRF (2026-09-02, adversarial class finding): cookie-authenticated mutations on a
+// top-level mount do not inherit dashboardApp's csrf(); SameSite=Lax is site-scoped
+// (mumega.com) and does not stop a sibling *.mupot.mumega.com origin, and text/plain
+// skips CORS preflight. hono/csrf guards the three CORS-simple content types only —
+// its coverage depends on this Worker having NO cors() anywhere. Same convention as tasksApp.
+ssoApp.use('*', csrf())
 ssoApp.use('*', requireAuth)
 
 /**
