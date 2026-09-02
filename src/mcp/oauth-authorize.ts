@@ -25,6 +25,7 @@
 
 import type { Env, AuthContext, Capability, CapabilityGrant, CapabilityScopeType, ConnectionChannel } from '../types'
 import { resolveCapabilities, canOnSquad, hasCapability, capabilityRank } from '../auth/capability'
+import { bootstrapSelf, type BootstrapSelfFailure } from '../members/bootstrap-self'
 import {
   carriesOrgAdmin,
   highestCapability,
@@ -676,6 +677,27 @@ function renderConsentPage(
         </label>`
   }).join('\n')
 
+  // The zero state. When a person has no agent to choose AND no squad they may
+  // mint on, every other option on this screen is unavailable to them, and the
+  // screen collapses to "continue unbound" — which is mute. Never render an
+  // empty picker: offer the creating act in place of the emptiness.
+  const canOfferFirstAgent = agentsListed && agents.length === 0 && squads.length === 0
+
+  const firstAgentPanel = canOfferFirstAgent ? `
+        <label class="agent-option first-run">
+          <input type="radio" name="agent_id" value="__bootstrap__" required data-label="your first agent" data-top="member on its own squad">
+          <div class="opt-body">
+            <div class="agent-title"><strong>Name your first agent</strong></div>
+            <div class="agent-meta">This creates your workspace and an agent you own. It becomes a member of its own squad, and you administer that squad.</div>
+            <div class="fields">
+              <div class="field">
+                <span class="flabel">What should it be called?</span>
+                <input type="text" name="first_agent_name" placeholder="Ada" autocomplete="off" maxlength="128">
+              </div>
+            </div>
+          </div>
+        </label>` : ''
+
   const mintPanel = squads.length > 0 ? `
         <label class="agent-option mint">
           <input type="radio" name="agent_id" value="__mint_new__" required data-label="a new agent seat" data-top="member on its home squad">
@@ -761,6 +783,7 @@ function renderConsentPage(
   .agent-option:hover { border-color:var(--ink-3) }
   .agent-option:has(input:checked) { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) }
   .agent-option.is-org-admin { border-left:3px solid var(--admin) }
+  .agent-option.first-run { border-left:3px solid var(--accent) }
   .agent-option input { margin-top:.3rem; flex:none; accent-color:var(--accent) }
     .opt-body { min-width:0; flex:1 }
   .agent-title { display:flex; flex-wrap:wrap; gap:.4rem; align-items:baseline }
@@ -820,7 +843,8 @@ function renderConsentPage(
 
   <div class="panels" id="panels">
     <div class="panel" id="p-existing">
-      ${agentsListed && agents.length === 0 ? EMPTY_STATE_HINT : ''}
+      ${agentsListed && agents.length === 0 && !canOfferFirstAgent ? EMPTY_STATE_HINT : ''}
+      ${canOfferFirstAgent ? '<p class="empty-hint">You do not have an agent yet. Open <strong>New agent</strong> to name your first one and continue in one step.</p>' : ''}
       ${agents.length > 0 ? `<input class="filter" type="search" id="agent-filter" placeholder="Filter by name, squad, or capability — try &quot;admin&quot;" autocomplete="off">
       <p class="count-line" id="filter-count"></p>` : ''}
 ${rows}
@@ -829,6 +853,7 @@ ${rows}
 
     <p class="panel-title">Create a new agent seat</p>
     <div class="panel" id="p-new">
+${firstAgentPanel}
 ${mintPanel}
     </div>
 
@@ -914,7 +939,11 @@ ${mintPanel}
   tabs.forEach(function (t) {
     t.addEventListener('click', function () { selectTab(t.getAttribute('data-panel')) })
   })
-  selectTab('p-existing')
+  // Land on the tab that actually has something in it. A newcomer whose only
+  // option is to create their first agent should not have to find that tab.
+  selectTab(document.querySelector('#p-new .first-run') && !document.querySelector('#p-existing .agent-option')
+    ? 'p-new'
+    : 'p-existing')
 
   // The required attribute is correct in the markup: with no scripting every panel is
   // visible, so the browser can enforce it and focus whatever is invalid. Once
@@ -1513,7 +1542,78 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     // authoritative, live source of truth rather than trusting the stored row.
     let boundAgentId: string | null = null
     let mintMemberId = pending.memberId
-    if (agentIdRaw === '__mint_new__') {
+    if (agentIdRaw === '__bootstrap__') {
+      // First-run door. A brand-new customer holds no capabilities, so they have
+      // no consentable agent AND no squad they may mint on — the screen offered
+      // them exactly one thing, "continue unbound", and an unbound session is
+      // mute on the directory channel. bootstrapSelf is the exit ramp that
+      // already exists for precisely this principal; until now it was reachable
+      // only as a tool call, which asked a customer to know a tool name.
+      //
+      // This widens NOTHING. Same operation, same gate (unbound directory
+      // session), same clamp (the new agent is a member on its own home squad,
+      // never lead or above), same idempotent-once-per-member guarantee enforced
+      // by a unique index rather than a check. The only change is that the door
+      // is visible.
+      const firstName = String(form.get('first_agent_name') ?? '').trim()
+
+      const rejectSoftly = (message: string, status: 400 | 403 | 429 | 500) => {
+        // Deliberately NOT clearing the consent cookie. This is a recoverable
+        // condition on the signup funnel; destroying the session here is what
+        // turns "you mistyped a name" into "sign in again and hit the identical
+        // wall", which is the loop this flow was reported for.
+        return new Response(message, { status, headers: { 'Content-Type': 'text/plain' } })
+      }
+
+      // No local name check. bootstrapSelf already owns that rule (naming is its
+      // condition 1) and returns agent_name_required, which is mapped below. A
+      // second copy of the same predicate here was redundant and untested — a
+      // mutation deleting it changed nothing, which is exactly how two copies of
+      // one rule drift apart later.
+
+      const bootstrapped = await bootstrapSelf(
+        env,
+        { channel: 'directory', boundAgentId: null, memberId: pending.memberId },
+        firstName,
+      )
+
+      if (!bootstrapped.ok) {
+        const explain: Record<BootstrapSelfFailure, { message: string; status: 400 | 403 | 429 | 500 }> = {
+          agent_name_required: { message: 'Give your agent a name, then continue. Nothing was created.', status: 400 },
+          not_unbound_directory_session: {
+            message: 'This connection already has an identity, so a first agent cannot be created from it. Choose an existing agent instead.',
+            status: 403,
+          },
+          rate_limited: { message: 'Too many attempts. Wait a minute and try again. Nothing was created.', status: 429 },
+          already_bootstrapped: {
+            message: 'You have already created your first agent. Go back and choose it from the list. If it is not listed, reconnect and it will be.',
+            status: 400,
+          },
+          provisioning_failed: { message: 'Creating the agent did not complete, and nothing was left behind. Try again.', status: 500 },
+        }
+        const { message, status } = explain[bootstrapped.error]
+        console.error('[oauth-authorize] first-agent bootstrap refused:', bootstrapped.error)
+        return rejectSoftly(message, status)
+      }
+
+      // Re-validate through the SAME gate the ordinary path uses. bootstrapSelf
+      // grants the founding human admin on the new home squad, which is what
+      // makes the agent consentable — but that is asserted by reading it here,
+      // never assumed from the fact that we just created it.
+      const eligible = await memberMayConsentToAgent(env, pending.memberId, bootstrapped.agent.id)
+      const binding = eligible ? await resolveAgentMemberBinding(env, bootstrapped.agent.id) : null
+      if (!eligible || !binding || binding.kind !== 'bound') {
+        // The agent EXISTS and is theirs; only this session could not be bound to
+        // it. Say exactly that, because "sign in again" would read as failure.
+        return rejectSoftly(
+          `Your agent "${bootstrapped.agent.name}" was created. This connection could not be bound to it automatically — reconnect and choose it from the list.`,
+          403,
+        )
+      }
+
+      boundAgentId = bootstrapped.agent.id
+      mintMemberId = binding.memberId
+    } else if (agentIdRaw === '__mint_new__') {
       const newName = String(form.get('new_agent_name') ?? '').trim()
       const newSlugRaw = String(form.get('new_agent_slug') ?? '').trim()
       const squadId = String(form.get('new_agent_squad_id') ?? '').trim()
