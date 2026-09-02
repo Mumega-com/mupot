@@ -91,6 +91,18 @@ import {
   loadEnrollView,
   normalizeEnrollSeat,
 } from './enroll'
+import {
+  createAgentFlow,
+  createProjectFlow,
+  createSquadFlow,
+  describeOperatorFlowError,
+  linkProjectSquadFlow,
+  loadOperatorConsoleView,
+  operatorConsoleBody,
+  requireOperatorConsoleAuthority,
+  setAgentCapabilityFlow,
+  type OperatorConsoleNotice,
+} from './operator-console'
 import { loadControlCenterView, controlCenterPageBody } from './control-center'
 import { loadJoinPreview, confirmJoin, joinPreviewPageBody, joinConfirmedBody } from './join-agent'
 import { mintAgentBoundToken, isAgentTokenCapability } from '../members/service'
@@ -2181,6 +2193,124 @@ dashboardApp.post('/enroll/mint', async (c) => {
       ),
     ),
   )
+})
+
+// ── operator console (GET /operator, POST /operator/*) ───────────────────────
+//
+// The rest of what /enroll does not: see the whole roster (including what
+// this operator cannot yet use, and why), create an agent/squad/project,
+// link project↔squad, and set what an agent can access. See
+// src/dashboard/operator-console.ts for the full design rationale.
+//
+// Every route here re-checks requireOperatorConsoleAuthority (no bound-agent
+// caller, org-admin only) even though the underlying service/MCP-tool gates
+// would refuse anyway — the same belt-and-suspenders posture as every other
+// admin-only route on this dashboard (isOrgAdmin checked at the route AND
+// inside the write path it calls).
+
+function operatorConsoleForbidden(auth: AuthContext, reason: 'operator_principal_required' | 'org_admin_required') {
+  return reason === 'operator_principal_required'
+    ? errorBody('An operator principal is required.')
+    : orgAdminForbiddenBody('The operator console', auth)
+}
+
+dashboardApp.get('/operator', async (c) => {
+  const auth = c.get('auth')
+  const authority = requireOperatorConsoleAuthority(auth)
+  if (!authority.ok) {
+    return c.html(shell(c.env, 'Operator console', operatorConsoleForbidden(auth, authority.reason)), 403)
+  }
+  const view = await loadOperatorConsoleView(c.env, auth)
+  return c.html(shell(c.env, 'Operator console', operatorConsoleBody(view)))
+})
+
+dashboardApp.post('/operator/agents', async (c) => {
+  const auth = c.get('auth')
+  const authority = requireOperatorConsoleAuthority(auth)
+  if (!authority.ok) {
+    return c.html(shell(c.env, 'Operator console', operatorConsoleForbidden(auth, authority.reason)), 403)
+  }
+  const form = await c.req.parseBody()
+  const squadRef = typeof form.squad === 'string' ? form.squad : ''
+  const name = typeof form.name === 'string' ? form.name : ''
+  const result = await createAgentFlow(c.env, auth, { squadRef, name })
+  const notice: OperatorConsoleNotice = result.ok
+    ? {
+        kind: 'success',
+        message: `Agent "${result.value.name}" created in squad "${result.value.squadName}" (slug ${result.value.slug}). Mint a key for it from the roster below to activate it.`,
+      }
+    : { kind: 'error', message: describeOperatorFlowError(result.error, result.detail) }
+  const view = await loadOperatorConsoleView(c.env, auth)
+  return c.html(shell(c.env, 'Operator console', operatorConsoleBody(view, notice)), result.ok ? 200 : 400)
+})
+
+dashboardApp.post('/operator/squads', async (c) => {
+  const auth = c.get('auth')
+  const authority = requireOperatorConsoleAuthority(auth)
+  if (!authority.ok) {
+    return c.html(shell(c.env, 'Operator console', operatorConsoleForbidden(auth, authority.reason)), 403)
+  }
+  const form = await c.req.parseBody()
+  const departmentRef = typeof form.department === 'string' ? form.department : ''
+  const name = typeof form.name === 'string' ? form.name : ''
+  const result = await createSquadFlow(c.env, auth, { departmentRef, name })
+  const notice: OperatorConsoleNotice = result.ok
+    ? { kind: 'success', message: `Squad "${result.value.name}" created (slug ${result.value.slug}).` }
+    : { kind: 'error', message: describeOperatorFlowError(result.error, result.detail) }
+  const view = await loadOperatorConsoleView(c.env, auth)
+  return c.html(shell(c.env, 'Operator console', operatorConsoleBody(view, notice)), result.ok ? 200 : 400)
+})
+
+dashboardApp.post('/operator/projects', async (c) => {
+  const auth = c.get('auth')
+  const authority = requireOperatorConsoleAuthority(auth)
+  if (!authority.ok) {
+    return c.html(shell(c.env, 'Operator console', operatorConsoleForbidden(auth, authority.reason)), 403)
+  }
+  const form = await c.req.parseBody()
+  const name = typeof form.name === 'string' ? form.name : ''
+  const result = await createProjectFlow(c.env, auth, { name })
+  const notice: OperatorConsoleNotice = result.ok
+    ? { kind: 'success', message: `Project "${result.value.name}" created (slug ${result.value.slug}). Link it to a squad below to give agents access.` }
+    : { kind: 'error', message: describeOperatorFlowError(result.error, result.detail) }
+  const view = await loadOperatorConsoleView(c.env, auth)
+  return c.html(shell(c.env, 'Operator console', operatorConsoleBody(view, notice)), result.ok ? 200 : 400)
+})
+
+dashboardApp.post('/operator/projects/link', async (c) => {
+  const auth = c.get('auth')
+  const authority = requireOperatorConsoleAuthority(auth)
+  if (!authority.ok) {
+    return c.html(shell(c.env, 'Operator console', operatorConsoleForbidden(auth, authority.reason)), 403)
+  }
+  const form = await c.req.parseBody()
+  const projectId = typeof form.project_id === 'string' ? form.project_id : ''
+  const squadId = typeof form.squad_id === 'string' ? form.squad_id : ''
+  const accessLevel = typeof form.access_level === 'string' ? form.access_level : ''
+  const result = await linkProjectSquadFlow(c.env, auth, { projectId, squadId, accessLevel })
+  const notice: OperatorConsoleNotice = result.ok
+    ? { kind: 'success', message: `Squad access set to "${result.value.accessLevel}" on this project.` }
+    : { kind: 'error', message: describeOperatorFlowError(result.error, result.detail) }
+  const view = await loadOperatorConsoleView(c.env, auth)
+  return c.html(shell(c.env, 'Operator console', operatorConsoleBody(view, notice)), result.ok ? 200 : 400)
+})
+
+dashboardApp.post('/operator/capability', async (c) => {
+  const auth = c.get('auth')
+  const authority = requireOperatorConsoleAuthority(auth)
+  if (!authority.ok) {
+    return c.html(shell(c.env, 'Operator console', operatorConsoleForbidden(auth, authority.reason)), 403)
+  }
+  const form = await c.req.parseBody()
+  const agentRef = typeof form.agent === 'string' ? form.agent : ''
+  const squadRef = typeof form.squad === 'string' ? form.squad : ''
+  const capability = typeof form.capability === 'string' ? form.capability : ''
+  const result = await setAgentCapabilityFlow(c.env, auth, { agentRef, squadRef, capability })
+  const notice: OperatorConsoleNotice = result.ok
+    ? { kind: 'success', message: `Capability "${result.value.capability}" ${result.value.result} on that squad.` }
+    : { kind: 'error', message: describeOperatorFlowError(result.error, result.detail) }
+  const view = await loadOperatorConsoleView(c.env, auth)
+  return c.html(shell(c.env, 'Operator console', operatorConsoleBody(view, notice)), result.ok ? 200 : 400)
 })
 
 // ── connector credential vault ───────────────────────────────────────────────
