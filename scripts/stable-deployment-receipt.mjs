@@ -213,6 +213,7 @@ export function checkBundle(opts = {}) {
   push(checks, target.commit === releaseSha && Boolean(target.commit), 'deployment_target_commit_matches_release_sha', { expected: releaseSha || null, actual: target.commit ?? null })
   push(checks, /^https:\/\/[^\s]+$/.test(String(target.base_url ?? '')), 'deployment_base_url_valid', { base_url: target.base_url ?? null })
   push(checks, health.ok === true && health.service === 'mupot', 'deployment_health_ok', { ok: health.ok ?? null, service: health.service ?? null })
+  push(checks, health.clean === true, 'deployment_health_clean', { actual: typeof health.clean === 'boolean' ? health.clean : null })
   push(checks, health.version === semver, 'deployment_health_version_matches', { expected: semver, actual: health.version ?? null })
   push(checks, health.commit === releaseSha && Boolean(health.commit), 'deployment_health_commit_matches_release_sha', { expected: releaseSha || null, actual: health.commit ?? null })
 
