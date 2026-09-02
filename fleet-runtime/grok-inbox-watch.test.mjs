@@ -586,14 +586,11 @@ test('deliverViaHerdr reads a baseline via agent get BEFORE prompting, and confi
 })
 
 test('an agent_not_idle-shaped pane-read error does not cause a false negative, because confirmation never calls agent read', () => {
-  // This is the exact live failure this rebuild exists to fix (mupot#1258
-  // herdr follow-up canary, verified by hand against production): a
-  // genuinely delivered prompt landed while muvps_loom was working, and
-  // `herdr agent read --source recent-unwrapped --lines 60` refused with
-  // {"error":{"code":"agent_not_idle",...}}. A pane-read-based confirmation
-  // would read that refusal as "unconfirmed" and wrongly refuse to
-  // consume. This mock wires `agent read` to return exactly that shape and
-  // proves the new confirmation path never touches it at all.
+  // Pane-read confirmation was the prior false-negative: a genuine idle
+  // prompt landed, then `herdr agent read --lines 60` refused
+  // agent_not_idle. Confirmation is agent get / revision only, so that
+  // refusal is unreachable. Status is idle so this is a real prompt, not
+  // the busy-skip path.
   const dir = mkdtempSync(join(tmpdir(), 'grok-spool-'))
   try {
     let getCallCount = 0
@@ -604,10 +601,8 @@ test('an agent_not_idle-shaped pane-read error does not cause a false negative, 
       spawn: (command, args) => {
         if (command === 'herdr' && args[1] === 'get') {
           getCallCount += 1
-          // agent get is documented (and verified live) to return cleanly
-          // regardless of busy state, unlike agent read.
           const revision = getCallCount === 1 ? 3437 : 3438
-          return { status: 0, stdout: JSON.stringify({ result: { agent: { revision, state_change_seq: revision, agent_status: 'working' } } }) }
+          return { status: 0, stdout: JSON.stringify({ result: { agent: { revision, state_change_seq: revision, agent_status: 'idle' } } }) }
         }
         if (command === 'herdr' && args[1] === 'prompt') return { status: 0, stdout: '' }
         if (command === 'sleep') return { status: 0, stdout: '' }
@@ -618,8 +613,35 @@ test('an agent_not_idle-shaped pane-read error does not cause a false negative, 
         throw new Error(`unexpected spawn: ${command} ${JSON.stringify(args)}`)
       },
     })
-    assert.equal(result.ok, true, 'a busy (working) target must still confirm successfully via the revision counter')
+    assert.equal(result.ok, true)
     assert.equal(readCalled, false, 'confirmation must never call agent read, so an agent_not_idle response is never even reachable')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a working or blocked target is NOT prompted — that was the seq 3586 re-inject loop', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'grok-spool-'))
+  try {
+    const calls = []
+    const result = deliverViaHerdr('', REQUEST, {
+      spoolDir: dir,
+      spawn: (command, args) => {
+        calls.push({ command, args })
+        if (command === 'herdr' && args[1] === 'get') {
+          return { status: 0, stdout: JSON.stringify({ result: { agent: { revision: 5812, state_change_seq: 1221, agent_status: 'working' } } }) }
+        }
+        if (command === 'herdr' && args[1] === 'prompt') {
+          throw new Error('must not prompt a working herdr target')
+        }
+        throw new Error(`unexpected spawn: ${command} ${JSON.stringify(args)}`)
+      },
+    })
+    assert.equal(result.ok, false)
+    assert.equal(result.reason, 'herdr_target_busy')
+    assert.equal(result.detail, 'working')
+    assert.ok(result.spool_path, 'spool still exists so the body file is on disk for a later idle cycle')
+    assert.equal(calls.some((c) => c.args?.[1] === 'prompt'), false)
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

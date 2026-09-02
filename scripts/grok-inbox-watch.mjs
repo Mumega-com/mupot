@@ -431,15 +431,25 @@ export function deliverToTmux(_text, message, opts = {}) {
  *
  * The signal that DOES work, verified live the same way: `herdr agent get
  * <target>` returns `revision` and `state_change_seq`, and BOTH advance on
- * a successful prompt submission — including while the agent is working,
- * where `agent get` (unlike a long `agent read`) returns cleanly rather
- * than refusing. So confirmation here is: read the agent's state BEFORE
- * prompting, submit, then poll `agent get` until EITHER counter has
- * advanced past its captured baseline, within confirmAttempts. Advanced ->
- * ok:true. Not advanced within the attempt budget -> ok:false — the exact
- * same shape deliverToTmux uses on an unconfirmed delivery, so runCycle's
- * existing "never consume what wasn't confirmed delivered" logic applies
- * unchanged.
+ * a successful prompt submission when the target is idle. `agent get`
+ * (unlike a long `agent read`) returns cleanly while busy too — we use that
+ * to READ status, not to justify prompting over a live turn.
+ *
+ * DO NOT PROMPT WHILE working/blocked (live, 2026-09-02, muvps_loom seq
+ * 3586): `herdr agent prompt` returns 0, confirmation often does NOT see a
+ * revision advance (`herdr_delivery_unconfirmed`), consume is skipped, and
+ * the next 30s cycle prompts AGAIN. Each of those prompts still lands in
+ * the pane and interrupts the turn in progress. That is the inbox
+ * re-inject loop. If the baseline `agent_status` is working or blocked,
+ * return ok:false reason herdr_target_busy WITHOUT prompting. runCycle
+ * then skips consume; the next idle cycle delivers once.
+ *
+ * Confirmation after a prompt to an idle target: poll `agent get` until
+ * EITHER counter has advanced past its captured baseline, within
+ * confirmAttempts. Advanced -> ok:true. Not advanced within the attempt
+ * budget -> ok:false — the exact same shape deliverToTmux uses on an
+ * unconfirmed delivery, so runCycle's existing "never consume what wasn't
+ * confirmed delivered" logic applies unchanged.
  *
  * HONEST LIMIT (state this plainly, do not imply more — see README): a
  * revision/state_change_seq advance proves herdr ACCEPTED the prompt and
@@ -479,6 +489,17 @@ export function deliverViaHerdr(_text, message, opts = {}) {
   const baseline = getState(spawn, herdrBin, herdrTarget, commandOpts)
   if (!baseline.ok) {
     return { ok: false, reason: baseline.reason, detail: baseline.detail }
+  }
+
+  const status = typeof baseline.agentStatus === 'string' ? baseline.agentStatus : ''
+  if (status === 'working' || status === 'blocked') {
+    return {
+      ok: false,
+      reason: 'herdr_target_busy',
+      detail: status,
+      spool_path: spoolPath,
+      marker,
+    }
   }
 
   const prompt = spawn(herdrBin, ['agent', 'prompt', herdrTarget, preview], commandOpts)
@@ -544,7 +565,8 @@ function herdrAgentState(spawn, herdrBin, herdrTarget, commandOpts) {
   if (revision === null && stateChangeSeq === null) {
     return { ok: false, reason: 'herdr_state_missing_fields', detail: 'herdr agent get returned neither a numeric revision nor state_change_seq' }
   }
-  return { ok: true, revision, stateChangeSeq }
+  const agentStatus = typeof agent?.agent_status === 'string' ? agent.agent_status : null
+  return { ok: true, revision, stateChangeSeq, agentStatus }
 }
 
 // EITHER counter advancing counts — Hadi's live verification showed both
