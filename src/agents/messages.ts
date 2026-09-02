@@ -116,7 +116,6 @@ export type SendFailure = {
     | 'dispatch_fenced'
     | 'send_target_not_visible'
     | 'inbox_full'
-    | 'seat_unknown'
     | 'db_error'
   detail?: string
 }
@@ -256,6 +255,18 @@ export async function sendAgentMessage(
   // the MCP `send` tool handler — is deliberate: this primitive is also the REST send path
   // (`POST /api/inbox/send`, src/agents/inbox-routes.ts), and both must refuse the same orphan
   // shape, not just the MCP one.
+  //
+  // mupot#1272 adversarial-gate round 3 (kasra-review): the FIRST version of this guard refused
+  // with a distinct `seat_unknown` reason + a confirming detail string — which is itself a new
+  // enumeration oracle. Proven live: any caller who can send to agent X can distinguish
+  // "seat exists but is not X's live label" from "no such seat at all" by the refusal alone,
+  // side-effect-free, and seat labels are NOT opaque (`oauth:<email-localpart>`,
+  // `[preset:<id>:<scope>]`, machine names — see the label-corpus finding on this PR's earlier
+  // review round). Collapsed onto the SAME `send_target_not_visible` string this function
+  // already uses for its OTHER internal existence/visibility refusals a few lines below (and
+  // that `sendToRef` collapses non-admin/invisible-target failures onto, #401) — no detail, no
+  // distinguishing shape. A sender cannot tell "bad seat" from "bad recipient" from any other
+  // reason this string already covers.
   if (input.targetSeat !== undefined) {
     if (!isRef(input.targetSeat))
       return { ok: false, reason: 'invalid_body', detail: 'target_seat must be a valid reference string' }
@@ -266,11 +277,7 @@ export async function sendAgentMessage(
         LIMIT 1`,
     ).bind(tenant, input.toAgent, input.targetSeat, now()).first()
     if (!liveSeatToken) {
-      return {
-        ok: false,
-        reason: 'seat_unknown',
-        detail: 'target_seat does not match a live token label held by the recipient',
-      }
+      return { ok: false, reason: 'send_target_not_visible' }
     }
   }
 

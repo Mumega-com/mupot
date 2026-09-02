@@ -434,7 +434,14 @@ describe('targeted seat dispatch & isolated mailboxes (Migration 0120 + mupot#12
   // validating target_seat against a live member_tokens.label for the recipient inside
   // sendAgentMessage itself (src/agents/messages.ts), so both the MCP `send` tool and the
   // REST `POST /api/inbox/send` route get it from one place.
-  it('send to a seat matching no LIVE token label is refused seat_unknown and creates NO orphan row', async () => {
+  //
+  // ROUND 3 (kasra-review): the first version of this test asserted a distinct
+  // `seat_unknown` reason + a confirming detail string — that shape IS an enumeration
+  // oracle (a sender can distinguish "seat exists, not live/yours" from "no such seat/
+  // target" for free). Refusal is now collapsed onto `send_target_not_visible` — the SAME
+  // string this codebase already uses for "no such recipient" / "recipient not visible to
+  // you" — with no detail at all.
+  it('send to a seat matching no LIVE token label is refused with the SAME non-disclosing shape as an invisible target, and creates NO orphan row', async () => {
     const before = harness.sqlite.prepare(
       `SELECT COUNT(*) AS n FROM agent_messages WHERE to_agent = ?`,
     ).get(familyAgentId) as { n: number }
@@ -449,8 +456,15 @@ describe('targeted seat dispatch & isolated mailboxes (Migration 0120 + mupot#12
     })
     expect(res.ok).toBe(false)
     if (!res.ok) {
-      expect(res.status).toBe(400)
-      expect(res.error).toBe('seat_unknown')
+      // 404 + 'send_target_not_visible' is the EXACT status/reason a nonexistent or
+      // not-yours recipient gets (see the ternary in toolSend, src/mcp/index.ts) — a bad
+      // seat must be indistinguishable from a bad recipient.
+      expect(res.status).toBe(404)
+      expect(res.error).toBe('send_target_not_visible')
+      // No confirming detail string — nothing in the response should name the seat, the
+      // recipient's real seats, or otherwise distinguish this refusal from any other
+      // send_target_not_visible.
+      expect((res as { detail?: unknown }).detail).toBeUndefined()
     }
 
     // Recovery assertion: the row this would have orphaned was never written.
@@ -480,13 +494,125 @@ describe('targeted seat dispatch & isolated mailboxes (Migration 0120 + mupot#12
     }
   })
 
-  it('args.seat = "" (empty string) normalizes to unscoped, not a mismatch — matches pre-fix behavior', async () => {
-    // familyAuthAlpha's bound seat is SEAT_ALPHA; an empty-string args.seat must NOT be
-    // compared against it (that would spuriously 403 seat_mismatch, since '' !== SEAT_ALPHA).
+  it('args.seat = "" (empty string) normalizes to "no seat requested" — the token\'s own bound seat applies, not a spurious mismatch', async () => {
+    // ROUND 3 comment fix (kasra-review nit): this does NOT reproduce "pre-fix behavior" —
+    // pre-fix, seat:'' gave broadcast-ONLY (the read-side normalization lived in
+    // readAgentInboxForReader/leaseAgentInbox and target_seat was never auto-applied from the
+    // token at all). Post-fix, '' is treated as "args.seat was not really supplied," which
+    // means the bound token's OWN seat (SEAT_ALPHA here) is what actually gets used — the same
+    // always-apply-your-own-seat semantic every other omitted-args.seat call gets. What this
+    // test actually pins: '' must NOT be compared against boundSeat as if it were a real,
+    // different value (which would spuriously 403 seat_mismatch, since '' !== SEAT_ALPHA).
     const res = await invokeTool(familyAuthAlpha, env, 'inbox', { seat: '', peek: true })
     expect(res.ok).toBe(true)
 
     const whitespaceRes = await invokeTool(familyAuthAlpha, env, 'inbox_lease', { seat: '   ' })
     expect(whitespaceRes.ok).toBe(true)
+  })
+
+  // mupot#1272 adversarial-gate round 3 (kasra-review, Pattern 6): "delete the whole guard"
+  // going red proves the guard RUNS, not that any one of its WHERE conjuncts matters. Mutating
+  // src/agents/messages.ts's new send-side check (`t.tenant = ?1 AND t.agent_id = ?2 AND
+  // t.label = ?3 AND TOKEN_LIVE_PREDICATE(?4)`) one conjunct at a time found THREE that
+  // survived deletion with zero test coverage — one test per conjunct below closes that.
+  describe('send-side seat guard — each WHERE conjunct proven individually', () => {
+    it('a REVOKED token\'s label is not live — send refused (closes the TOKEN_LIVE_PREDICATE conjunct)', async () => {
+      const agentForMint = { id: familyAgentId, slug: 'hadi-grok-desktop', name: 'hadi-grok-desktop', squad_id: squadId }
+      const revoked = await mintAgentBoundToken(env, agentForMint as never, 'revoked-seat')
+      harness.sqlite.exec(`UPDATE member_tokens SET revoked_at = datetime('now') WHERE id = '${revoked.tokenId}'`)
+
+      const before = harness.sqlite.prepare(
+        `SELECT COUNT(*) AS n FROM agent_messages WHERE to_agent = ?`,
+      ).get(familyAgentId) as { n: number }
+
+      const res = await invokeTool(senderAuth, env, 'send', {
+        to: familyAgentId,
+        body: 'Revoked-seat attempt',
+        seat: 'revoked-seat',
+        request_id: 'req-revoked-seat-attempt',
+      })
+      expect(res.ok).toBe(false)
+      if (!res.ok) {
+        expect(res.status).toBe(404)
+        expect(res.error).toBe('send_target_not_visible')
+      }
+
+      const after = harness.sqlite.prepare(
+        `SELECT COUNT(*) AS n FROM agent_messages WHERE to_agent = ?`,
+      ).get(familyAgentId) as { n: number }
+      expect(after.n).toBe(before.n)
+    })
+
+    it('a live label bound to a DIFFERENT agent is not accepted — send refused (closes the t.agent_id conjunct, the deliberate-orphan-manufacture case)', async () => {
+      // A REAL, LIVE token — just welded to senderAgentId, not familyAgentId. Without the
+      // t.agent_id conjunct, this would let anyone who knows ANY live seat label anywhere in
+      // the tenant manufacture an orphan on an unrelated recipient.
+      const senderForMint = { id: senderAgentId, slug: 'sender-agent', name: 'Sender Agent', squad_id: squadId }
+      await mintAgentBoundToken(env, senderForMint as never, 'cross-agent-seat')
+
+      const before = harness.sqlite.prepare(
+        `SELECT COUNT(*) AS n FROM agent_messages WHERE to_agent = ?`,
+      ).get(familyAgentId) as { n: number }
+
+      const res = await invokeTool(senderAuth, env, 'send', {
+        to: familyAgentId,
+        body: 'Cross-agent-seat attempt',
+        seat: 'cross-agent-seat',
+        request_id: 'req-cross-agent-seat-attempt',
+      })
+      expect(res.ok).toBe(false)
+      if (!res.ok) {
+        expect(res.status).toBe(404)
+        expect(res.error).toBe('send_target_not_visible')
+      }
+
+      const after = harness.sqlite.prepare(
+        `SELECT COUNT(*) AS n FROM agent_messages WHERE to_agent = ?`,
+      ).get(familyAgentId) as { n: number }
+      expect(after.n).toBe(before.n)
+
+      // Positive control: the SAME label, on the RIGHT agent, works (proves the refusal above
+      // was about agent scoping, not the label itself).
+      await mintAgentBoundToken(env, { id: familyAgentId, slug: 'hadi-grok-desktop', name: 'hadi-grok-desktop', squad_id: squadId } as never, 'cross-agent-seat')
+      const positiveControl = await invokeTool(senderAuth, env, 'send', {
+        to: familyAgentId,
+        body: 'Same label, right agent',
+        seat: 'cross-agent-seat',
+        request_id: 'req-cross-agent-seat-positive',
+      })
+      expect(positiveControl.ok).toBe(true)
+    })
+
+    it('CANNOT build a cross-tenant token for an existing agent in this harness — and the reason is itself a real, enforced schema invariant', () => {
+      // ROUND 3 answer to "if the harness can build a cross-tenant token do it, otherwise
+      // say explicitly it cannot and why rather than faking it": it cannot, for an EXISTING
+      // agent, and this is not a gap in the harness — it is `member_tokens_agent_binding_insert`
+      // (migrations/0071_agent_connections.sql), a trigger that ALREADY refuses to insert any
+      // member_tokens row whose (tenant, agent_id, member_id) does not match a live
+      // agent_member_bindings row. familyAgentId's only real binding is
+      // (tenant='mumega', agent_id=familyAgentId, member_id=familyMemberId) — attempting a
+      // member_tokens row for the SAME agent under a different tenant string aborts BEFORE it
+      // ever reaches my new guard's `t.tenant = ?1` conjunct. Proving that with a real failing
+      // INSERT (not asserting it in prose) is the honest version of "cannot":
+      expect(() => {
+        harness.sqlite.exec(`
+          INSERT INTO member_tokens (id, member_id, tenant, token_hash, agent_id, label, channel, created_at)
+          VALUES ('tok-cross-tenant', '${familyMemberId}', 'a-different-tenant', 'cross-tenant-token-hash-stub', '${familyAgentId}', 'cross-tenant-seat', 'workspace', datetime('now'));
+        `)
+      }).toThrow(/agent_identity_conflict/)
+
+      // Manufacturing the matching agent_member_bindings row under the fictitious tenant
+      // first (to get PAST that trigger) is possible in raw SQL — agent_member_bindings'
+      // primary key is the COMPOSITE (tenant, agent_id), not agent_id alone, so nothing at
+      // the schema level stops a second binding row for the same agent under a different
+      // tenant string. I deliberately did NOT do that here: it would prove something about
+      // this SQLite harness's constraint enforcement, not about mupot as deployed. A real
+      // mupot pot is ONE D1 database per tenant — env.TENANT_SLUG is a fixed Worker-level
+      // config value, never attacker-influenced, never read from a request — so a token
+      // "existing under a different tenant" is not a reachable state to defend against in the
+      // first place; fabricating one here would be testing a state that cannot occur, dressed
+      // up as coverage. The `t.tenant = ?1` conjunct in the new guard's SQL therefore stays
+      // UNPROVEN BY MUTATION in this suite, honestly — recorded as a gap, not silently closed.
+    })
   })
 })
