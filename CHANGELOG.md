@@ -2,15 +2,19 @@
 
 ## Release status — 2026-09-02
 
-- **Current source version:** `0.30.0` on `main` at
-  `7d58d36be5a67a6e859f4513bc9fc65523aab1a8` (#1272 merge). Authoritative value is
-  `git rev-parse origin/main`; this line is an as-of snapshot and goes stale on the
-  next merge.
-- **Current production deployment:** `0.30.0` at
-  `7d58d36be5a67a6e859f4513bc9fc65523aab1a8`, `clean:true` (built 2026-09-02T20:01:42Z from
-  `main`, #1272). Authoritative value is the live `/health` `commit` field. Production
-  and `main` are at the same commit as of this snapshot; neither is a stable-release
-  claim, because a stable release requires a tag, not a deployment.
+- **Current source version:** `0.30.0` on `main`. **This document does not pin the `main`
+  commit.** Any SHA written here is false the moment the commit writing it is merged, so
+  read it with `git rev-parse origin/main`.
+- **Current production deployment:** `0.30.0`. Read the exact commit and `clean` flag from
+  the live `/health` endpoint. A SHA is recorded here only when a deployment happens, and a
+  deployment is a gated event, so this line does not rot on every merge the way a `main` SHA
+  does. Most recent recorded deployment: `7d58d36be5a67a6e859f4513bc9fc65523aab1a8`,
+  `clean:true`, 2026-09-02T20:01:42Z (#1272 seat binding).
+- **Relationship between the two:** deliberately not asserted here. `main` advances on every
+  merge and production only on a deploy, so any "level with" or "behind" claim is stale
+  almost immediately. Compare `git rev-parse origin/main` against live `/health` to see the
+  real gap. Neither is a stable-release claim, because a stable release requires a tag, not
+  a deployment.
 - **Latest tagged stable release:** `v0.25.0`. Neither `v0.29.0` nor `v0.30.0`
   currently has a release tag or GitHub release, so source-version headings below are
   preview history, not a supported stable contract.

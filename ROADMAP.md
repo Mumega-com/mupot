@@ -8,8 +8,8 @@ numbers.
 
 | State | Version | Meaning |
 |---|---|---|
-| Current source version | `0.30.0` | Present on `main` at `7d58d36b` as of 2026-09-02 (authoritative: `git rev-parse origin/main`); preview until the stabilization gate passes and `v0.30.0` is tagged. |
-| Current production version | `0.30.0` | Deployed at `7d58d36b`, `clean:true` (authoritative: live `/health`); level with `main` at this snapshot and still not a stable-release claim, which requires a tag. |
+| Current source version | `0.30.0` | Present on `main`; the commit is deliberately not pinned here, because any SHA in a versioned file is false once that file merges — read `git rev-parse origin/main`. Preview until the stabilization gate passes and `v0.30.0` is tagged. |
+| Current production version | `0.30.0` | Last recorded deploy `7d58d36b`, `clean:true`, 2026-09-02 (authoritative: live `/health`). The gap to `main` is not asserted here; compare the two sources. Still not a stable-release claim, which requires a tag. |
 | Last tagged release | `v0.25.0` | Project Routines and Needs You. |
 | Next stable candidate | `v0.30.0` | Stabilization-only: security train, messaging reliability, release proof, and backlog closure. |
 | Future development target | `v0.31.0` | Canonical receiver, Agent Computers, and Recovery; held until `v0.30.0` is stable. |
