@@ -1625,19 +1625,22 @@ describe('G. consent screen escaping — slug, squad name, budget window (not ju
   // survived its escapeHtml call being deleted, undetected, exactly like slug/
   // squad_name/budget_window above before this file covered them.
 
-  it('formatCapabilities escapes a malicious scope_id inside the capability PREVIEW itself — capabilities.scope_id has no FK, nothing stops a stray value from reaching here', async () => {
+  it('the grant list escapes a malicious scope_id — capabilities.scope_id has no FK, nothing stops a stray value from reaching the render', async () => {
     // capabilities.scope_id (migrations/0002_members.sql) is free TEXT, no FK — the
-    // capability PREVIEW line (formatCapabilities) interpolates scope_type:scope_id
-    // for every grant the session would carry, escaped as a whole.
+    // grant list renders a scope for every grant the session would carry. Since the
+    // consent screen now NAMES scopes (summarizeGrants + scopeLabel in
+    // src/mcp/consent-view.ts), an id with no matching squad row falls back to the
+    // raw id — so a hostile scope_id still reaches the markup and still has to be
+    // escaped there. The rendering changed; this hazard did not.
     //
     // The P0-1 clamp drops any grant on a scope the human holds nothing on — a
     // first version of this test gave agent-a's dedicated member a grant on a
     // nonsense scope_id and nothing else, which the clamp silently dropped before
-    // formatCapabilities ever saw it (100% green even with .map(escapeHtml)
+    // the render ever saw it (100% green even with .map(escapeHtml)
     // deleted — the exact "different mechanism, same visible result" trap noted
     // elsewhere in this suite). Fixed by ALSO granting the human an exact-match
     // capability on that same literal scope_id string, so the clamp lets the
-    // grant through and formatCapabilities is the thing actually under test.
+    // grant through and the escaping is the thing actually under test.
     const hostileScopeId = '"><script>alert(6)</script>'
     harness.sqlite.exec(`
       INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
@@ -1649,10 +1652,13 @@ describe('G. consent screen escaping — slug, squad name, budget window (not ju
     const { env } = httpEnv(harness, oauthProvider)
     const { html } = await reachConsentScreen(env, oauthProvider, 'human@example.test')
     expect(html).not.toContain('<script>alert(6)</script>')
-    // Positive check: the grant actually reached the preview (unescaped form would
-    // show scope_id verbatim) — proves this test exercises formatCapabilities, not
-    // a dropped-by-the-clamp no-op.
-    expect(html).toContain('capabilities this session would carry:')
+    // Positive control, and deliberately stronger than the anchor string it
+    // replaces: assert the hostile scope_id is present in ESCAPED form. That
+    // proves both halves at once — the grant survived the clamp and reached the
+    // render, and what reached it was escaped. An anchor that merely checked for
+    // a fixed label would pass even if this particular grant had been dropped,
+    // which is the vacuous-green trap this test was written to avoid.
+    expect(html).toContain('&quot;&gt;&lt;script&gt;alert(6)&lt;/script&gt;')
   })
 
   it('escapes a.autonomy', async () => {
