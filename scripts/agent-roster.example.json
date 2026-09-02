@@ -1,0 +1,20 @@
+{
+  "_comment": "Example roster for scripts/bulk-provision-agents.mjs. Copy this file, fill in the real ~30 agents, and run with --roster pointing at the copy. See docs/playbooks/bulk-agent-provisioning.md for the full ceremony.",
+  "agents": [
+    {
+      "slug": "example-content-lead",
+      "name": "Example Content Lead",
+      "squad": "content",
+      "capability": "member",
+      "role": "lead",
+      "purpose": "Owns the content squad's editorial pipeline (informational only — not written to the agent profile by this script; run update_agent afterward if you need it persisted).",
+      "model": "claude-sonnet-4-5"
+    },
+    {
+      "slug": "example-ops-observer",
+      "name": "Example Ops Observer",
+      "squad": "ops",
+      "capability": "observer"
+    }
+  ]
+}
