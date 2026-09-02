@@ -271,6 +271,17 @@ async function registerWebSession(
     if (existingIdentity) {
       memberId = existingIdentity.member_id
       loginIdentityId = existingIdentity.id
+      // verified_email is evidence, not the join key — refresh it on a
+      // step-1 hit so an IdP email change does not leave the primary
+      // address resolving to null (write-once P0-2).
+      const nextEmail = email.trim().toLowerCase()
+      const prev = existingIdentity.verified_email?.trim().toLowerCase() ?? ''
+      if (nextEmail && nextEmail !== prev) {
+        await env.DB.prepare(
+          `UPDATE human_login_identities SET verified_email = ?1
+            WHERE id = ?2 AND tenant = ?3 AND revoked_at IS NULL`,
+        ).bind(email, existingIdentity.id, tenant).run()
+      }
     } else {
       const resolved = await resolveHumanMemberId(env, {
         tenant,

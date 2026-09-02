@@ -106,7 +106,18 @@ export async function autoEnrollSsoMember(
     provider: profile.provider || null,
     email,
   })
-  if (resolvedId) {
+  let existingId = resolvedId
+  if (!existingId) {
+    // UNIQUE members.email: a resolver miss (write-once verified_email drift)
+    // must not INSERT a colliding row. Treat the existing row as the member.
+    const colliding = await env.DB.prepare(
+      `SELECT id FROM members WHERE lower(email) = ?1 AND tenant = ?2 LIMIT 1`,
+    )
+      .bind(email, env.TENANT_SLUG)
+      .first<{ id: string }>()
+    existingId = colliding?.id
+  }
+  if (existingId) {
     const existing = await env.DB.prepare(
       `SELECT m.id, m.status,
               EXISTS (
@@ -120,7 +131,7 @@ export async function autoEnrollSsoMember(
         WHERE m.id = ?1 AND m.tenant = ?2
         LIMIT 1`,
     )
-      .bind(resolvedId, env.TENANT_SLUG)
+      .bind(existingId, env.TENANT_SLUG)
       .first<{ id: string; status: string; is_admin: number }>()
     if (existing) {
       const role = existing.is_admin === 1 ? 'admin' : 'member'

@@ -63,10 +63,15 @@ async function ownerAliasMemberId(env: Env, email: string): Promise<string | nul
  * 2. Live identity whose verified_email matches — ONLY when provider/subject
  *    are absent. A supplied join key that missed must NOT fall through to
  *    email; that is account takeover (fresh subject + victim verified_email).
- * 3. members.email bootstrap — ONLY if that member has no live identity.
- *    Bootstrap onto a member who already has a live identity is the same
- *    takeover one hop down.
- * 4. owner_login_emails → unique org owner.
+ *    When provider is present without a subject, the match is also scoped
+ *    to that provider (0143: authorization is the join key, not a display
+ *    email across providers).
+ * 3. members.email. A supplied-but-missed join key may bootstrap ONLY a
+ *    member with no live identity (steal protection). Email-only still
+ *    resolves the primary members.email even if that member already has a
+ *    live identity whose verified_email differs (write-once email drift).
+ * 4. owner_login_emails → unique org owner. Same join-key gate as step 2:
+ *    never after a supplied-but-missed subject.
  * Missing identity table (migration not applied) falls through to email bootstrap.
  * Any other D1 failure is rethrown — silent email-first is the inversion Athena banned.
  */
@@ -83,6 +88,7 @@ export async function resolveHumanMemberId(
   input: ResolveHumanMemberInput,
 ): Promise<string | null> {
   const tenant = input.tenant
+  const joinKeyPresent = !!(input.provider && input.providerSubject)
   try {
     if (input.provider && input.providerSubject) {
       const ident = await resolveLoginIdentity(env, tenant, input.provider, input.providerSubject)
@@ -90,15 +96,21 @@ export async function resolveHumanMemberId(
     }
 
     const email = input.email ? normalizeEmail(input.email) : ''
-    // Step 2 is gated on a missing join key. The docstring always said this;
-    // the ungated version let a never-seen provider_subject inherit a victim
-    // member via verified_email, then registerWebSession persisted it.
-    if (email && !(input.provider && input.providerSubject)) {
-      const identByEmail = await env.DB.prepare(
-        `SELECT member_id FROM human_login_identities
-          WHERE tenant = ?1 AND lower(verified_email) = ?2 AND revoked_at IS NULL
-          LIMIT 2`,
-      ).bind(tenant, email).all<{ member_id: string }>()
+    // Step 2 is gated on a missing join key. The ungated version let a
+    // never-seen provider_subject inherit a victim member via verified_email.
+    if (email && !joinKeyPresent) {
+      const identByEmail = input.provider
+        ? await env.DB.prepare(
+            `SELECT member_id FROM human_login_identities
+              WHERE tenant = ?1 AND lower(verified_email) = ?2 AND revoked_at IS NULL
+                AND provider = ?3
+              LIMIT 2`,
+          ).bind(tenant, email, input.provider).all<{ member_id: string }>()
+        : await env.DB.prepare(
+            `SELECT member_id FROM human_login_identities
+              WHERE tenant = ?1 AND lower(verified_email) = ?2 AND revoked_at IS NULL
+              LIMIT 2`,
+          ).bind(tenant, email).all<{ member_id: string }>()
       const rows = identByEmail.results ?? []
       if (rows.length === 1) return rows[0].member_id
       if (rows.length > 1) return null
@@ -110,22 +122,28 @@ export async function resolveHumanMemberId(
   const email = input.email ? normalizeEmail(input.email) : ''
   if (!email) return null
 
-  // One members query: bind (email, tenant) stays the same shape existing
-  // session mocks match. Bootstrap is refused in SQL when a live identity
-  // already exists — a second lookup would steal the mock's next first()
-  // and 404 a loop or fail-close a member who never had an identity.
+  // Bind (email, tenant) stays the mock-matched shape. Steal protection
+  // (NOT EXISTS live identity) applies only when a join key was supplied
+  // and missed — that is the fresh-subject takeover. Email-only must still
+  // resolve the member's own primary address when verified_email drifted.
   try {
-    const byEmail = await env.DB.prepare(
-      `SELECT id FROM members
-        WHERE lower(email) = ?1 AND tenant = ?2 AND status = 'active'
-          AND NOT EXISTS (
-            SELECT 1 FROM human_login_identities h
-             WHERE h.tenant = members.tenant
-               AND h.member_id = members.id
-               AND h.revoked_at IS NULL
-          )
-        LIMIT 1`,
-    ).bind(email, tenant).first<{ id: string }>()
+    const byEmail = joinKeyPresent
+      ? await env.DB.prepare(
+          `SELECT id FROM members
+            WHERE lower(email) = ?1 AND tenant = ?2 AND status = 'active'
+              AND NOT EXISTS (
+                SELECT 1 FROM human_login_identities h
+                 WHERE h.tenant = members.tenant
+                   AND h.member_id = members.id
+                   AND h.revoked_at IS NULL
+              )
+            LIMIT 1`,
+        ).bind(email, tenant).first<{ id: string }>()
+      : await env.DB.prepare(
+          `SELECT id FROM members
+            WHERE lower(email) = ?1 AND tenant = ?2 AND status = 'active'
+            LIMIT 1`,
+        ).bind(email, tenant).first<{ id: string }>()
     if (byEmail) return byEmail.id
   } catch (err) {
     if (!isMissingHumanLoginIdentitiesTable(err)) throw err
@@ -137,5 +155,8 @@ export async function resolveHumanMemberId(
     if (byEmail) return byEmail.id
   }
 
+  // Step 4: same join-key gate as step 2. A missed subject must not
+  // inherit the org owner via an operator alias.
+  if (joinKeyPresent) return null
   return ownerAliasMemberId(env, email)
 }
