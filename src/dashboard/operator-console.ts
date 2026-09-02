@@ -338,6 +338,11 @@ export async function createAgentFlow(
   auth: AuthContext,
   input: { squadRef: string; name: string },
 ): Promise<FlowResult<{ id: string; slug: string; name: string; squadName: string }>> {
+  // Every MCP tool this flow mirrors independently refuses an agent-bound
+  // caller (operator_principal_required) rather than relying solely on a
+  // shared gate — this flow does the same, so it stays safe if it is ever
+  // reached from anywhere other than the route-level check in index.ts.
+  if (auth.boundAgentId) return { ok: false, error: 'operator_principal_required' }
   const squadRef = input.squadRef.trim()
   const name = input.name.trim()
   if (!squadRef) return { ok: false, error: 'invalid_args', detail: 'Choose a squad.' }
@@ -396,6 +401,11 @@ export async function createSquadFlow(
   auth: AuthContext,
   input: { departmentRef: string; name: string },
 ): Promise<FlowResult<{ id: string; slug: string; name: string }>> {
+  // Every MCP tool this flow mirrors independently refuses an agent-bound
+  // caller (operator_principal_required) rather than relying solely on a
+  // shared gate — this flow does the same, so it stays safe if it is ever
+  // reached from anywhere other than the route-level check in index.ts.
+  if (auth.boundAgentId) return { ok: false, error: 'operator_principal_required' }
   const departmentRef = input.departmentRef.trim()
   const name = input.name.trim()
   if (!departmentRef) return { ok: false, error: 'invalid_args', detail: 'Choose a department.' }
@@ -439,6 +449,11 @@ export async function createProjectFlow(
   auth: AuthContext,
   input: { name: string },
 ): Promise<FlowResult<{ id: string; slug: string; name: string }>> {
+  // Every MCP tool this flow mirrors independently refuses an agent-bound
+  // caller (operator_principal_required) rather than relying solely on a
+  // shared gate — this flow does the same, so it stays safe if it is ever
+  // reached from anywhere other than the route-level check in index.ts.
+  if (auth.boundAgentId) return { ok: false, error: 'operator_principal_required' }
   const name = input.name.trim()
   if (!name) return { ok: false, error: 'invalid_args', detail: 'Name the project.' }
   if (!isOrgAdmin(auth)) return { ok: false, error: 'forbidden', detail: 'admin on the org is required' }
@@ -459,6 +474,11 @@ export async function linkProjectSquadFlow(
   auth: AuthContext,
   input: { projectId: string; squadId: string; accessLevel: string },
 ): Promise<FlowResult<{ projectId: string; squadId: string; accessLevel: string }>> {
+  // Every MCP tool this flow mirrors independently refuses an agent-bound
+  // caller (operator_principal_required) rather than relying solely on a
+  // shared gate — this flow does the same, so it stays safe if it is ever
+  // reached from anywhere other than the route-level check in index.ts.
+  if (auth.boundAgentId) return { ok: false, error: 'operator_principal_required' }
   const projectId = input.projectId.trim()
   const squadId = input.squadId.trim()
   if (!projectId) return { ok: false, error: 'invalid_args', detail: 'Choose a project.' }
@@ -493,6 +513,11 @@ export async function setAgentCapabilityFlow(
   auth: AuthContext,
   input: { agentRef: string; squadRef: string; capability: string },
 ): Promise<FlowResult<{ agentId: string; squadId: string; capability: string; result: string }>> {
+  // Every MCP tool this flow mirrors independently refuses an agent-bound
+  // caller (operator_principal_required) rather than relying solely on a
+  // shared gate — this flow does the same, so it stays safe if it is ever
+  // reached from anywhere other than the route-level check in index.ts.
+  if (auth.boundAgentId) return { ok: false, error: 'operator_principal_required' }
   const agentRef = input.agentRef.trim()
   const squadRef = input.squadRef.trim()
   if (!agentRef) return { ok: false, error: 'invalid_args', detail: 'Choose an agent.' }
