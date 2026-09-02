@@ -1,12 +1,15 @@
 # Changelog
 
-## Release status — 2026-09-01
+## Release status — 2026-09-02
 
 - **Current source version:** `0.30.0` on `main` at
-  `55c1c3efc194b352550e1b3f6b19e6e96e200ff1`.
+  `75a6f16ba248b84a32558cd094bdca529747da76` (#1256 merge). Authoritative value is
+  `git rev-parse origin/main`; this line is an as-of snapshot and goes stale on the
+  next merge.
 - **Current production deployment:** `0.30.0` at
-  `16390d1ea4b9684286237a12443e979e84cb7cdd`, `clean:true`. Production is
-  behind current `main`; neither deployment is a stable-release claim.
+  `05757a5ee6f4314195ebd49371544bb5f82b66e4`, `clean:false` (built 2026-09-02T01:03Z from
+  `main`, #1254). Authoritative value is the live `/health` `commit` field. Production
+  is behind current `main`; neither deployment is a stable-release claim.
 - **Latest tagged stable release:** `v0.25.0`. Neither `v0.29.0` nor `v0.30.0`
   currently has a release tag or GitHub release, so source-version headings below are
   preview history, not a supported stable contract.

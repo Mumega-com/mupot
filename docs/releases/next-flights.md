@@ -5,12 +5,12 @@ tagged stable release, followed by the first `v0.31.0` runtime flight. Version
 ownership remains in [ROADMAP.md](../../ROADMAP.md); the shipped record remains in
 [CHANGELOG.md](../../CHANGELOG.md).
 
-## Release truth at 2026-09-01
+## Release truth at 2026-09-02
 
 | Surface | Exact state |
 |---|---|
-| Current `main` | `55c1c3efc194b352550e1b3f6b19e6e96e200ff1` (`0.30.0`) |
-| Current production | `16390d1ea4b9684286237a12443e979e84cb7cdd` (`0.30.0`, `clean:true`) |
+| Current `main` | `75a6f16ba248b84a32558cd094bdca529747da76` (`0.30.0`, #1256 merge) |
+| Current production | `05757a5ee6f4314195ebd49371544bb5f82b66e4` (`0.30.0`, `clean:false`, #1254 merge, built 2026-09-02T01:03Z) |
 | Latest tagged stable release | `v0.25.0` |
 | Next stable candidate | `v0.30.0` |
 | Next development release | `v0.31.0` |
