@@ -1,12 +1,16 @@
 # Changelog
 
-## Release status — 2026-09-01
+## Release status — 2026-09-02
 
 - **Current source version:** `0.30.0` on `main` at
-  `55c1c3efc194b352550e1b3f6b19e6e96e200ff1`.
+  `7d58d36be5a67a6e859f4513bc9fc65523aab1a8` (#1272 merge). Authoritative value is
+  `git rev-parse origin/main`; this line is an as-of snapshot and goes stale on the
+  next merge.
 - **Current production deployment:** `0.30.0` at
-  `16390d1ea4b9684286237a12443e979e84cb7cdd`, `clean:true`. Production is
-  behind current `main`; neither deployment is a stable-release claim.
+  `7d58d36be5a67a6e859f4513bc9fc65523aab1a8`, `clean:true` (built 2026-09-02T20:01:42Z from
+  `main`, #1272). Authoritative value is the live `/health` `commit` field. Production
+  and `main` are at the same commit as of this snapshot; neither is a stable-release
+  claim, because a stable release requires a tag, not a deployment.
 - **Latest tagged stable release:** `v0.25.0`. Neither `v0.29.0` nor `v0.30.0`
   currently has a release tag or GitHub release, so source-version headings below are
   preview history, not a supported stable contract.
@@ -29,8 +33,9 @@
 - **Release preparation landed:** #1250 (`ccfdb4b3`, versioned v0.30 contract),
   #1251 (`c6ef9876`, evidence-chain-neutral Host-Go receipt), and #1252
   (`55c1c3ef`, exact `codex-cli` harness vocabulary) are now on `main`. All were
-  exact-head gated with terminal-successful CI and CodeQL. #1252 is not present
-  in the current production deployment and does not backfill old presence rows.
+  exact-head gated with terminal-successful CI and CodeQL. #1252 is present in the
+  current production deployment as of the 2026-09-02 `7d58d36b` deploy (`55c1c3ef` is
+  an ancestor of it) and does not backfill old presence rows.
 - **Still required for the stable candidate:** freeze one exact `main` SHA,
   collect the fresh receipts in [the v0.30.0 release contract](docs/releases/v0.30.0.md),
   execute the [next release flights](docs/releases/next-flights.md), and pass the
