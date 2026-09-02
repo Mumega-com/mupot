@@ -70,3 +70,57 @@ describe('identity: step-2 provider scoping + SSO enroll never INSERTs a collidi
     expect(n?.n).toBe(1)
   })
 })
+
+// C. registerWebSession refreshes verified_email on a step-1 hit (P0-2 fix).
+//    Survived mutation on 6c8d5795: inverting the refresh condition left the
+//    suite green. Drive the real /dev-login → registerWebSession chain with a
+//    pre-linked identity whose verified_email is stale.
+import { authApp } from '../src/auth'
+
+describe('identity: step-1 hit refreshes stale verified_email', () => {
+  let harness: SqliteD1Harness
+
+  beforeEach(() => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+  })
+  afterEach(() => harness.close())
+
+  it('C: same subject logging in with a new IdP email updates human_login_identities.verified_email', async () => {
+    const store = new Map<string, string>()
+    const env = {
+      TENANT_SLUG: TENANT,
+      LOCAL_TEST_AUTH: '1',
+      LOCAL_TEST_AUTH_EMAIL: 'hadi@digid.ca',
+      DB: harness.db,
+      SESSIONS: {
+        get: async (k: string) => store.get(k) ?? null,
+        put: async (k: string, v: string) => void store.set(k, v),
+        delete: async (k: string) => void store.delete(k),
+      },
+    } as unknown as Env
+    await env.DB.prepare(
+      `INSERT INTO members (id, tenant, email, display_name, status, created_at)
+       VALUES ('mem-hadi', ?1, 'owner@mumega.test', 'Hadi', 'active', datetime('now'))`,
+    ).bind(TENANT).run()
+    // dev-login's subject IS the email string; link that subject with a STALE verified_email.
+    const linked = await linkLoginIdentity(env, {
+      tenant: TENANT,
+      provider: 'local-test',
+      providerSubject: 'hadi@digid.ca',
+      verifiedEmail: 'old-alias@corp.test',
+      memberId: 'mem-hadi',
+    })
+    expect(linked.ok).toBe(true)
+
+    const res = await authApp.request('/dev-login', {}, env)
+    expect(res.status).toBe(302)
+
+    const row = await env.DB.prepare(
+      `SELECT verified_email, member_id FROM human_login_identities
+        WHERE tenant = ?1 AND provider = 'local-test' AND provider_subject = 'hadi@digid.ca' AND revoked_at IS NULL`,
+    ).bind(TENANT).first<{ verified_email: string; member_id: string }>()
+    expect(row?.member_id).toBe('mem-hadi')
+    expect(row?.verified_email?.toLowerCase()).toBe('hadi@digid.ca')
+  })
+})
