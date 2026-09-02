@@ -115,7 +115,7 @@ export async function autoEnrollSsoMember(
     )
       .bind(email, env.TENANT_SLUG)
       .first<{ id: string }>()
-    existingId = colliding?.id
+    existingId = colliding?.id ?? null
   }
   if (existingId) {
     const existing = await env.DB.prepare(
