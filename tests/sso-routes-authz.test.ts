@@ -73,7 +73,10 @@ describe('SSO routes require an authenticated org principal (P0)', () => {
 
   it('member-tier: config write and enroll are 403; validate is allowed', async () => {
     const c = 'mupot_session=member-s'
-    expect((await ssoApp.request('/config', {}, env)).status).toBe(401)
+    // Config READ is admin-only too: a member cookie must get 403, not the config.
+    const cfgR = await ssoApp.request('/config', { headers: { cookie: c } }, env)
+    expect(cfgR.status).toBe(403)
+    expect(await cfgR.json()).toEqual({ error: 'forbidden', need: 'admin' })
     const cfgW = await ssoApp.request('/config', json({ default_role: 'admin' }, c), env)
     expect(cfgW.status).toBe(403)
     expect(await cfgW.json()).toEqual({ error: 'forbidden', need: 'admin' })
