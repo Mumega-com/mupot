@@ -92,6 +92,7 @@ import {
 import { loadAgentRuntimeStates, type AgentRuntimeState } from '../dashboard/observatory'
 import { buildOrient, renderBrief } from '../orient/service'
 import { mcpEndpoint, canonicalOrigin, requiredCanonicalOrigin } from '../dashboard/connect'
+import { enrollUrl } from '../dashboard/enroll'
 import { classify, humanAge } from '../dashboard/fleet'
 import { resolveAgentRef } from '../org/resolve'
 import {
@@ -3118,9 +3119,14 @@ const toolSend: ToolSpec = {
     required: ['to', 'body'],
     additionalProperties: false,
   },
-  async run(auth, env, args) {
+  async run(auth, env, args, ctx) {
     const fromAgent = auth.boundAgentId
-    if (!fromAgent) return fail(403, 'not_agent_bound', 'send requires an agent-bound token (member_tokens.agent_id)')
+    if (!fromAgent) {
+      return fail(403, 'not_agent_bound', {
+        detail: 'send requires an agent-bound token (member_tokens.agent_id)',
+        enroll_url: enrollUrl(canonicalOrigin(env, ctx.origin), ctx.seat),
+      })
+    }
     const to = str(args.to)
     const body = str(args.body)
     if (!to) return fail(400, 'invalid_args', 'to required')
@@ -3311,9 +3317,14 @@ const toolInbox: ToolSpec = {
     required: [],
     additionalProperties: false,
   },
-  async run(auth, env, args) {
+  async run(auth, env, args, ctx) {
     const agent = auth.boundAgentId
-    if (!agent) return fail(403, 'not_agent_bound', 'inbox requires an agent-bound token (member_tokens.agent_id)')
+    if (!agent) {
+      return fail(403, 'not_agent_bound', {
+        detail: 'inbox requires an agent-bound token (member_tokens.agent_id)',
+        enroll_url: enrollUrl(canonicalOrigin(env, ctx.origin), ctx.seat),
+      })
+    }
     let limit: number | undefined
     if (args.limit !== undefined) {
       if (typeof args.limit !== 'number' || !Number.isFinite(args.limit))
@@ -3376,9 +3387,14 @@ const toolInboxLease: ToolSpec = {
     required: [],
     additionalProperties: false,
   },
-  async run(auth, env, args) {
+  async run(auth, env, args, ctx) {
     const agent = auth.boundAgentId
-    if (!agent) return fail(403, 'not_agent_bound', 'inbox_lease requires an agent-bound token (member_tokens.agent_id)')
+    if (!agent) {
+      return fail(403, 'not_agent_bound', {
+        detail: 'inbox_lease requires an agent-bound token (member_tokens.agent_id)',
+        enroll_url: enrollUrl(canonicalOrigin(env, ctx.origin), ctx.seat),
+      })
+    }
     let limit: number | undefined
     if (args.limit !== undefined) {
       if (typeof args.limit !== 'number' || !Number.isFinite(args.limit))
@@ -4013,11 +4029,23 @@ const toolBootContext: ToolSpec = {
     // never from client input.
     const isMinted = auth.boundAgentId !== null
     const identityStatus: 'minted' | 'unminted' = isMinted ? 'minted' : 'unminted'
+    const enrollHref = enrollUrl(
+      canonicalOrigin(env, ctx.origin),
+      (str(args.seat) || str(args.label) || ctx?.seat || '').trim() || null,
+    )
 
     // QA-1: every refusal/unminted signal must carry the full map out — no dead ends.
     // Two paths for an unbound token:
     //   A) Shared apikey + know your name → call connect { agent_name } (session-local, works now).
     //   B) Want a permanent weld → ask an admin to call mint_agent_token, then reconnect.
+    //
+    // The enrollment door is deliberately NOT in this string. It ships as the
+    // structured `enroll_url` field below instead. Kasra's collision ruling
+    // (2026-09-01): #1253 and this branch both rewrite next_step for the same
+    // unbound state with contradictory tests, and no PR owns the whole truth —
+    // the durable contract is onboarding_state + available_doors[], with prose
+    // as at most a summary. Two PRs racing to own one sentence is how the
+    // sentence ends up describing neither state correctly.
     const nextStep = isMinted
       ? 'call orient (no args — your token is agent-bound) to receive your full basin-drop packet'
       : 'if you know your agent slug/id: call connect { agent_name: "<slug>" } to claim your identity now (session-local). For a permanent weld: ask an org-admin to call mint_agent_token for your agent, then reconnect with the minted token.'
@@ -4075,6 +4103,7 @@ const toolBootContext: ToolSpec = {
       identity_status: identityStatus,
       bound_agent_id: auth.boundAgentId ?? null,
       next_step: nextStep,
+      ...(isMinted ? {} : { enroll_url: enrollHref }),
       // Present ONLY on the directory channel — its absence is itself information.
       ...(directoryNote ? { channel_limits: directoryNote } : {}),
     })
@@ -4271,6 +4300,7 @@ const toolConnect: ToolSpec = {
       // member who already held org:owner — the grant would have changed nothing, because
       // the directory door discards grants by construction. Name the real cause and the
       // door that works (mupot#678).
+      const enrollHref = enrollUrl(canonicalOrigin(env, ctx.origin), ctx.seat)
       if (auth.channel === 'directory') {
         return fail(403, 'forbidden', {
           reason: 'directory_channel_zero_capability',
@@ -4286,9 +4316,11 @@ const toolConnect: ToolSpec = {
             // the exact failure this refusal exists to remove. Not hypothetical: six
             // hadi/codex agent records share slugs today. (codex gate, #681.)
             `squad to run mint_agent_token { agent: "${agentRef.id}" }, then connect with that bearer.`,
+            `Open ${enrollHref} to choose or coin a seat key.`,
           ].join(' '),
           need: 'workspace-channel token',
           scope: 'channel',
+          enroll_url: enrollHref,
         })
       }
       return fail(403, 'forbidden', {
@@ -4296,9 +4328,11 @@ const toolConnect: ToolSpec = {
         detail: [
           `Your token does not have member-or-higher capability on the squad for agent "${agentRef.slug}".`,
           'Ask an org-admin to grant you squad membership, or verify you are using the right token.',
+          `Open ${enrollHref} to choose or coin a seat key.`,
         ].join(' '),
         need: 'member',
         scope: 'squad',
+        enroll_url: enrollHref,
       })
     }
 

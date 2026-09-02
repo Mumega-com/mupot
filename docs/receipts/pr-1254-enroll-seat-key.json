@@ -1,0 +1,91 @@
+{
+  "schema": "PR-1254-ENROLL-SEAT-KEY-BUILD",
+  "version": 1,
+  "verdict": "BUILT-NOT-GATED",
+  "built_at": "2026-09-01T01:35:00Z",
+  "author": {
+    "slug": "hadi-grok-desktop",
+    "uuid": "fb18400b-4908-42f4-90dd-a3f5ad7d0654",
+    "squad": "hadi-mac",
+    "squad_id": "3674d955-067f-4821-86a0-c2fa03e30ff9",
+    "autonomy": "draft",
+    "seat": "cursor-cloud-river",
+    "harness": "cursor-cloud",
+    "machine": "cursor-cloud-vm",
+    "model": "claude-opus-5-thinking",
+    "provider": "anthropic"
+  },
+  "durable_state": {
+    "pull_request": "https://github.com/Mumega-com/mupot/pull/1254",
+    "pot_task_id": "e8460d52-18a5-401e-a2c0-4a1d0c96521a",
+    "github_issue": "https://github.com/Mumega-com/mumega-com/issues/1164"
+  },
+  "bindings": {
+    "repository": "https://github.com/Mumega-com/mupot.git",
+    "branch": "cursor/flight-river-lead-agent-onboarding-warm-cache-35a3",
+    "head": "e1740cf5e304b94451d154873b5667fcf5d21c3e",
+    "base_origin_main": "c6ef9876db7575d86de85df378049663d627033b",
+    "merge_base": "c6ef9876db7575d86de85df378049663d627033b",
+    "commits": [
+      "36957ca chore(branch): reset branch content to origin/main",
+      "83f6975 chore(branch): drop dismantled #1236 stack files",
+      "e5b81cf feat(identity): resolve agent identity from (token, seat) — REVERTED by 19349f6",
+      "0312138 fix(inbox): stop hiding seat-targeted messages — SUPERSEDED by d5b5189",
+      "5505c0e fix(presence): bridge MCP check-in liveness into fleet_agents",
+      "19349f6 revert(identity): drop seat_agent_bindings in favour of per-seat keys",
+      "d5b5189 fix(inbox): keep 0120 seat isolation; make the backlog visible instead",
+      "e1740cf feat(enroll): send the human to a page to choose an agent or coin a seat key"
+    ],
+    "files_changed_vs_main": [
+      "src/agents/messages.ts",
+      "src/dashboard/enroll.ts",
+      "src/dashboard/index.ts",
+      "src/fleet/presence.ts",
+      "src/mcp/index.ts",
+      "tests/enroll-seat-key.test.ts",
+      "tests/inbox-seat-visibility.test.ts",
+      "tests/presence-fleet-liveness-bridge.test.ts",
+      "tests/targeted-seat-dispatch.test.ts"
+    ],
+    "migrations_added": [],
+    "migration_note": "No migration. member_tokens already has no UNIQUE on (member_id, agent_id) and its label is the seat name (migrations/0002_members.sql). Many keys per person and per seat already worked; the gap was the door, not the data model."
+  },
+  "independently_verified_this_tick": {
+    "typecheck": true,
+    "full_suite": "6906 passed / 5 failed (451 files, 192.88s)",
+    "github_ci": "14/14 checks green on e1740cf",
+    "baseline_method": "detached origin/main worktree at c6ef987 with node_modules symlinked; suspect suites re-run there",
+    "all_five_failures_reproduce_on_clean_main": true,
+    "kill_witness_passes_with_original_assertions": true,
+    "privilege_escalation_guard_tested": "non-squad-admin POST /enroll/mint refused 403, member_tokens row count unchanged",
+    "token_hash_never_rendered_tested": true,
+    "enroll_url_present_on_unbound_boot_context_tested": true,
+    "enroll_url_present_on_not_agent_bound_inbox_tested": true,
+    "seat_isolation_preserved_no_seat_read_consumes_broadcasts_only": true,
+    "multiple_keys_per_seat_and_person_end_to_end_tested": true
+  },
+  "pre_existing_failures_not_caused_by_this_branch": [
+    "tests/agent-routines-scheduler.test.ts x2 — 'column index out of range' at test line 50; reproduces identically at c6ef987",
+    "tests/release-candidate-receipt.test.ts, tests/release-integrity-receipt.test.ts, tests/release-sha.test.ts — 15s timeouts; reproduce at c6ef987; the specific test that times out varies per run (loaded VM), the set does not"
+  ],
+  "regressions_introduced_and_fixed_before_pr": [
+    "tests/stateless-connect-persistence.test.ts — binding 'none' vs 'session_local', caused by e5b81cf; removed by the 19349f6 revert",
+    "tests/targeted-seat-dispatch.test.ts KILL-WITNESS — caused by 0312138 widening no-seat reads; corrected by d5b5189"
+  ],
+  "judgement_calls_needing_a_second_lens": [
+    "Reverted seat_agent_bindings (a table welding one token to many agent identities) after the owner pointed out per-seat KEYS are the supported mechanism. A side identity table next to member_tokens is a second identity system; keys already do this with better properties.",
+    "Overrode a swarm worker that cured the inbox invisibility by widening no-seat reads to return every row. That reinstates exactly what migrations/0120_targeted_seat_messages.sql exists to prevent — an un-scoped reader draining a live sibling seat's mail — trading silent invisibility for silent misdelivery.",
+    "Replaced orgAdminForbiddenBody on the /enroll mint refusal. Its copy asserts the action 'requires owner or admin at ORG scope' and that 'a squad or department grant will not help'; both are false for a canOnSquad(...,'admin') gate. That is the #678 misdirection pattern."
+  ],
+  "residuals_not_this_block": [
+    "No deploy. No live-pot exercise of GET /enroll or POST /enroll/mint against mupot.mumega.com. Route-level vitest coverage only.",
+    "No browser walkthrough of the rendered page; HTML asserted by string, not by a real render.",
+    "The two pre-existing agent-routines-scheduler failures on main are untouched and unexplained by this work.",
+    "enroll_url is emitted from the MCP surface but was not observed end-to-end from a genuinely unbound live session — the session that built this is already minted."
+  ],
+  "merge_authorized": false,
+  "migration_authorized": false,
+  "deploy_authorized": false,
+  "autonomy_claim": false,
+  "gate_required": "Kasra gates; Athena runs the parallel adversarial pass. CI green is not product green."
+}
