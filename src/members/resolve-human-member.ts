@@ -68,6 +68,9 @@ async function ownerAliasMemberId(env: Env, email: string): Promise<string | nul
  */
 export function isMissingHumanLoginIdentitiesTable(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err)
+  // Match D1/SQLite's current "no such table" wording only. If the engine
+  // rewords it, this returns false and the caller THROWS — fail SAFE (an
+  // error, not a wrong human). Do not widen the regex to "be helpful".
   return /no such table:\s*human_login_identities/i.test(msg)
 }
 
