@@ -11,7 +11,12 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
-import { linkLoginIdentity, resolveLoginIdentity } from '../src/auth/login-identity'
+import {
+  linkLoginIdentity,
+  listLoginIdentities,
+  resolveLoginIdentity,
+  revokeLoginIdentity,
+} from '../src/auth/login-identity'
 
 const TENANT = 'mumega'
 
@@ -102,7 +107,9 @@ describe('human_login_identities (D1, real migration chain)', () => {
     })
     expect(linked.ok).toBe(true)
     const id = linked.ok ? linked.identity.id : ''
-    await env.DB.prepare('UPDATE human_login_identities SET revoked_at = datetime(\'now\') WHERE id = ?1').bind(id).run()
+    const revoked = await revokeLoginIdentity(env, TENANT, 'm1', id)
+    expect(revoked.revoked).toBe(true)
+    expect(revoked.identity?.revoked_at).not.toBeNull()
 
     expect(await resolveLoginIdentity(env, TENANT, 'google', 'sub-revoked')).toBeNull()
 
@@ -147,5 +154,51 @@ describe('human_login_identities (D1, real migration chain)', () => {
     })
     expect(google.ok && bootstrap.ok).toBe(true)
     if (google.ok && bootstrap.ok) expect(google.identity.id).not.toBe(bootstrap.identity.id)
+  })
+
+  it('revokeLoginIdentity is ownership-scoped — a different member cannot revoke it', async () => {
+    await seedMember('m1', 'a@x.test')
+    await seedMember('m2', 'b@x.test')
+    const linked = await linkLoginIdentity(env, {
+      tenant: TENANT, provider: 'google', providerSubject: 'sub-owned', verifiedEmail: 'a@x.test', memberId: 'm1',
+    })
+    expect(linked.ok).toBe(true)
+    const id = linked.ok ? linked.identity.id : ''
+    const attempt = await revokeLoginIdentity(env, TENANT, 'm2', id)
+    expect(attempt.revoked).toBe(false)
+    expect(attempt.identity).toBeNull()
+    expect((await resolveLoginIdentity(env, TENANT, 'google', 'sub-owned'))?.member_id).toBe('m1')
+  })
+
+  it('revokeLoginIdentity is idempotent — a second revoke is a no-op', async () => {
+    await seedMember('m1', 'a@x.test')
+    const linked = await linkLoginIdentity(env, {
+      tenant: TENANT, provider: 'google', providerSubject: 'sub-twice', verifiedEmail: 'a@x.test', memberId: 'm1',
+    })
+    const id = linked.ok ? linked.identity.id : ''
+    expect((await revokeLoginIdentity(env, TENANT, 'm1', id)).revoked).toBe(true)
+    expect((await revokeLoginIdentity(env, TENANT, 'm1', id)).revoked).toBe(false)
+  })
+
+  it('listLoginIdentities returns live and revoked rows for that member only', async () => {
+    await seedMember('m1', 'a@x.test')
+    await seedMember('m2', 'b@x.test')
+    const live = await linkLoginIdentity(env, {
+      tenant: TENANT, provider: 'google', providerSubject: 'sub-live', verifiedEmail: 'a@x.test', memberId: 'm1',
+    })
+    const dead = await linkLoginIdentity(env, {
+      tenant: TENANT, provider: 'google', providerSubject: 'sub-dead', verifiedEmail: 'a@x.test', memberId: 'm1',
+    })
+    await linkLoginIdentity(env, {
+      tenant: TENANT, provider: 'google', providerSubject: 'sub-other', verifiedEmail: 'b@x.test', memberId: 'm2',
+    })
+    if (dead.ok) await revokeLoginIdentity(env, TENANT, 'm1', dead.identity.id)
+    const listed = await listLoginIdentities(env, TENANT, 'm1')
+    expect(listed).toHaveLength(2)
+    expect(listed.map((r) => r.id).sort()).toEqual(
+      [live.ok ? live.identity.id : '', dead.ok ? dead.identity.id : ''].sort(),
+    )
+    expect(listed.find((r) => r.provider_subject === 'sub-dead')?.revoked_at).not.toBeNull()
+    expect(listed.find((r) => r.provider_subject === 'sub-live')?.revoked_at).toBeNull()
   })
 })

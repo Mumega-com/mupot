@@ -90,6 +90,32 @@ describe('identity-first at all five sites (interaction)', () => {
     expect(id).toBeNull()
   })
 
+  // Own fresh-subject test (Kasra 3584): the five-sites fixture reuses
+  // sub-hadi everywhere else, so it only ever hits step 1. A never-seen
+  // subject reporting the identity's verified_email must not land on A.
+  // (mem-login's members.email matches that string and has no live identity,
+  // so bootstrap to mem-login is allowed — that is not the takeover.)
+  it('a FRESH provider_subject does not acquire A via a colliding verified_email', async () => {
+    const id = await resolveHumanMemberId(env, {
+      tenant: TENANT,
+      provider: 'google',
+      providerSubject: 'sub-attacker-never-seen',
+      email: 'hadi@digid.ca',
+    })
+    expect(id).not.toBe('mem-hadi')
+  })
+
+  it('members.email bootstrap does not reach A who already has a live identity', async () => {
+    const id = await resolveHumanMemberId(env, {
+      tenant: TENANT,
+      provider: 'google',
+      providerSubject: 'sub-attacker-never-seen',
+      email: 'owner@mumega.test',
+    })
+    expect(id).not.toBe('mem-hadi')
+    expect(id).toBeNull()
+  })
+
   it('transient D1 error does not silently fall through to members.email', async () => {
     const real = env.DB
     env.DB = {

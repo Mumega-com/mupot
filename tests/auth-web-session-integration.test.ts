@@ -236,6 +236,93 @@ describe('web-session registry — integration through authApp (real D1)', () =>
     expect((await me(env, cookie2)).status).toBe(401)
   })
 
+  it('a FRESH local-test subject reporting a colliding verified_email does not persist a binding to the victim', async () => {
+    // Full chain: registerWebSession → resolveHumanMemberId (step 2 was the
+    // P0) → linkLoginIdentity. Dev-login uses provider local-test and
+    // subject = email, so this is the handoff-shaped join key.
+    const env = makeEnv('victim@corp.test')
+    env.DB = harness.db
+    await seedMember(env, 'mem-victim', 'owner@mumega.test')
+    await seedMember(env, 'mem-fresh', 'fresh@mumega.test')
+    const linked = await linkLoginIdentity(env, {
+      tenant: TENANT,
+      provider: 'google',
+      providerSubject: 'sub-victim',
+      verifiedEmail: 'victim@corp.test',
+      memberId: 'mem-victim',
+    })
+    expect(linked.ok).toBe(true)
+
+    const cookie = await devLogin(env)
+    const stolen = await env.DB.prepare(
+      `SELECT member_id FROM human_login_identities
+        WHERE tenant = ?1 AND provider = 'local-test' AND provider_subject = 'victim@corp.test'`,
+    )
+      .bind(TENANT)
+      .first<{ member_id: string }>()
+    expect(stolen).toBeNull()
+
+    const { body: profile } = await me(env, cookie)
+    expect(profile?.webSessionMemberId).not.toBe('mem-victim')
+  })
+
+  it('GET /auth/identities lists the caller\'s identities; POST revoke writes revoked_at and kills bound sessions', async () => {
+    const env = makeEnv('owner@x.test')
+    env.DB = harness.db
+    await seedMember(env, 'm1', 'owner@x.test')
+    const cookie = await devLogin(env)
+    expect((await me(env, cookie)).status).toBe(200)
+
+    const listRes = await authApp.request('/identities', { headers: { cookie: `mupot_session=${cookie}` } }, env)
+    expect(listRes.status).toBe(200)
+    const listed = (await listRes.json()) as { identities: Array<{ id: string; live: boolean; provider: string }> }
+    expect(listed.identities).toHaveLength(1)
+    expect(listed.identities[0]?.live).toBe(true)
+    expect(listed.identities[0]?.provider).toBe('local-test')
+    const identityId = listed.identities[0]!.id
+
+    const revokeRes = await authApp.request(
+      `/identities/${identityId}/revoke`,
+      { method: 'POST', headers: { cookie: `mupot_session=${cookie}` } },
+      env,
+    )
+    expect(revokeRes.status).toBe(200)
+    await expect(revokeRes.json()).resolves.toEqual({ revoked: true, sessions_revoked: 1 })
+
+    const row = await harness.db.prepare(
+      'SELECT revoked_at FROM human_login_identities WHERE id = ?1',
+    )
+      .bind(identityId)
+      .first<{ revoked_at: string | null }>()
+    expect(row?.revoked_at).not.toBeNull()
+    expect((await me(env, cookie)).status).toBe(401)
+  })
+
+  it('a member can NEVER revoke a DIFFERENT member\'s identity by naming its id', async () => {
+    const envA = makeEnv('a@x.test')
+    envA.DB = harness.db
+    await seedMember(envA, 'm-a', 'a@x.test')
+    const cookieA = await devLogin(envA)
+    const listA = await authApp.request('/identities', { headers: { cookie: `mupot_session=${cookieA}` } }, envA)
+    const bodyA = (await listA.json()) as { identities: Array<{ id: string }> }
+    const idA = bodyA.identities[0]!.id
+
+    const envB = makeEnv('b@x.test')
+    envB.DB = harness.db
+    envB.SESSIONS = kv()
+    await seedMember(envB, 'm-b', 'b@x.test')
+    const cookieB = await devLogin(envB)
+
+    const attempt = await authApp.request(
+      `/identities/${idA}/revoke`,
+      { method: 'POST', headers: { cookie: `mupot_session=${cookieB}` } },
+      envB,
+    )
+    expect(attempt.status).toBe(200)
+    await expect(attempt.json()).resolves.toEqual({ revoked: false, sessions_revoked: 0 })
+    expect((await me(envA, cookieA)).status).toBe(200)
+  })
+
   it('logout revokes the D1 web_sessions row, not just the KV blob', async () => {
     const env = makeEnv('owner@x.test')
     env.DB = harness.db

@@ -19,18 +19,25 @@ import type { Context, MiddlewareHandler } from 'hono'
 import type { Env, AuthContext } from '../types'
 import { verifyHandoffClaim } from './handoff-verify'
 import { resolveCapabilities } from './capability'
-import { linkLoginIdentity, resolveLoginIdentity } from './login-identity'
+import {
+  linkLoginIdentity,
+  listLoginIdentities,
+  resolveLoginIdentity,
+  revokeLoginIdentity,
+} from './login-identity'
 import { resolveHumanMemberId } from '../members/resolve-human-member'
 import {
   createWebSession,
   evaluateWebSession,
   hashWebSessionId,
   listWebSessions,
+  loadLiveReauthIdentity,
   loadWebSession,
   markRecentReauth,
   revokeAllWebSessions,
   revokeWebSession,
   revokeWebSessionByHash,
+  revokeWebSessionsForLoginIdentity,
   touchWebSession,
 } from './web-sessions'
 
@@ -576,15 +583,7 @@ authApp.get('/callback', async (c) => {
   // revoked, or mismatched target is refused outright — never falls back to
   // an ordinary login for a request that explicitly asked to step up.
   if (reauthTarget) {
-    const identity = await env.DB.prepare(
-      `SELECT hli.provider AS provider, hli.provider_subject AS provider_subject
-         FROM web_sessions ws
-         JOIN human_login_identities hli ON hli.id = ws.login_identity_id
-        WHERE ws.id_hash = ?1 AND ws.tenant = ?2 AND ws.revoked_at IS NULL
-        LIMIT 1`,
-    )
-      .bind(reauthTarget.webSessionIdHash, env.TENANT_SLUG)
-      .first<{ provider: string; provider_subject: string }>()
+    const identity = await loadLiveReauthIdentity(env, env.TENANT_SLUG, reauthTarget.webSessionIdHash)
 
     if (!identity || identity.provider !== 'google' || identity.provider_subject !== info.sub) {
       return c.json({ error: 'reauth_identity_mismatch' }, 403)
@@ -853,6 +852,55 @@ authApp.post('/sessions/revoke-all', requireAuthMw(), async (c) => {
     exceptIdHash,
   )
   return c.json({ revoked_count: revokedCount })
+})
+
+// GET /auth/identities → every login identity for the caller's OWN member.
+// Same ownership scope as /auth/sessions: webSessionMemberId, never
+// cross-member. Empty (not an error) when the session never registered.
+authApp.get('/identities', requireAuthMw(), async (c) => {
+  const auth = c.get('auth')
+  if (!auth.webSessionMemberId) return c.json({ identities: [] })
+  const rows = await listLoginIdentities(c.env, c.env.TENANT_SLUG, auth.webSessionMemberId)
+  return c.json({
+    identities: rows.map((row) => ({
+      id: row.id,
+      provider: row.provider,
+      provider_subject: row.provider_subject,
+      verified_email: row.verified_email,
+      created_at: row.created_at,
+      revoked_at: row.revoked_at,
+      live: row.revoked_at === null,
+    })),
+  })
+})
+
+// POST /auth/identities/:id/revoke → revoke exactly one of the caller's OWN
+// identities. Ownership-scoped in revokeLoginIdentity (tenant +
+// webSessionMemberId + id). Also kills every live web_session bound to that
+// identity — otherwise the attacker keeps a cookie minted under the stolen
+// binding, and reauth would still succeed until hli.revoked_at is checked.
+authApp.post('/identities/:id/revoke', requireAuthMw(), async (c) => {
+  const auth = c.get('auth')
+  if (!auth.webSessionMemberId) return c.json({ error: 'forbidden' }, 403)
+  const identityId = c.req.param('id')
+  const { revoked, identity } = await revokeLoginIdentity(
+    c.env,
+    c.env.TENANT_SLUG,
+    auth.webSessionMemberId,
+    identityId,
+  )
+  let sessions_revoked = 0
+  if (revoked && identity) {
+    const killed = await revokeWebSessionsForLoginIdentity(
+      c.env,
+      c.env.TENANT_SLUG,
+      auth.webSessionMemberId,
+      identity.id,
+      'identity_revoked',
+    )
+    sessions_revoked = killed.revokedCount
+  }
+  return c.json({ revoked, sessions_revoked })
 })
 
 // ── user upsert (AuthZ side) ─────────────────────────────────────────────────

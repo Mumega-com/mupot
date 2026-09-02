@@ -23,11 +23,13 @@ import {
   hasRecentReauth,
   hashWebSessionId,
   listWebSessions,
+  loadLiveReauthIdentity,
   loadWebSession,
   markRecentReauth,
   revokeAllWebSessions,
   revokeWebSession,
   revokeWebSessionByHash,
+  revokeWebSessionsForLoginIdentity,
   touchWebSession,
 } from '../src/auth/web-sessions'
 
@@ -297,6 +299,41 @@ describe('web-session registry (D1, real migration chain)', () => {
       .first<{ recent_reauth_at: string }>()
     expect(hasRecentReauth({ recent_reauth_at: row!.recent_reauth_at }, markedAt + RECENT_REAUTH_WINDOW_MS)).toBe(true)
     expect(hasRecentReauth({ recent_reauth_at: row!.recent_reauth_at }, markedAt + RECENT_REAUTH_WINDOW_MS + 1)).toBe(false)
+  })
+
+  it('loadLiveReauthIdentity requires BOTH the session and the identity to be live', async () => {
+    const id1 = await seedMemberAndIdentity('m1', 'a@x.test', 'google', 'sub-m1')
+    const created = await createWebSession(env, 'raw-reauth-ident', { tenant: TENANT, memberId: 'm1', loginIdentityId: id1 })
+
+    const live = await loadLiveReauthIdentity(env, TENANT, created.id_hash)
+    expect(live).toEqual({ provider: 'google', provider_subject: 'sub-m1' })
+
+    await env.DB.prepare('UPDATE human_login_identities SET revoked_at = ?1 WHERE id = ?2')
+      .bind(new Date().toISOString(), id1)
+      .run()
+    // Session row is still live — that is the hole the reauth join had.
+    expect((await loadWebSession(env, TENANT, 'raw-reauth-ident')).ok).toBe(true)
+    expect(await loadLiveReauthIdentity(env, TENANT, created.id_hash)).toBeNull()
+  })
+
+  it('revokeWebSessionsForLoginIdentity kills only sessions bound to that identity', async () => {
+    const id1 = await seedMemberAndIdentity('m1', 'a@x.test', 'google', 'sub-a')
+    const now = new Date().toISOString()
+    const id2 = 'id-m1-other'
+    await env.DB.prepare(
+      `INSERT INTO human_login_identities
+         (id, tenant, provider, provider_subject, verified_email, member_id, created_at)
+       VALUES (?1, ?2, 'google', 'sub-b', 'a@x.test', 'm1', ?3)`,
+    )
+      .bind(id2, TENANT, now)
+      .run()
+    await createWebSession(env, 'raw-a', { tenant: TENANT, memberId: 'm1', loginIdentityId: id1 })
+    await createWebSession(env, 'raw-b', { tenant: TENANT, memberId: 'm1', loginIdentityId: id2 })
+
+    const { revokedCount } = await revokeWebSessionsForLoginIdentity(env, TENANT, 'm1', id1, 'identity_revoked')
+    expect(revokedCount).toBe(1)
+    expect((await loadWebSession(env, TENANT, 'raw-a')).ok).toBe(false)
+    expect((await loadWebSession(env, TENANT, 'raw-b')).ok).toBe(true)
   })
 
   it('markRecentReauth never resurrects a revoked session', async () => {

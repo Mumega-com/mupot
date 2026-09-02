@@ -143,3 +143,54 @@ export async function linkLoginIdentity(
     },
   }
 }
+
+/** listLoginIdentities — every identity (live or revoked) for a member. */
+export async function listLoginIdentities(
+  env: Env,
+  tenant: string,
+  memberId: string,
+): Promise<LoginIdentityRecord[]> {
+  const rows = await env.DB.prepare(
+    `SELECT id, tenant, provider, provider_subject, verified_email, member_id,
+            linked_by_member_id, created_at, revoked_at
+       FROM human_login_identities
+      WHERE tenant = ?1 AND member_id = ?2
+      ORDER BY created_at DESC`,
+  )
+    .bind(tenant, memberId)
+    .all<LoginIdentityRecord>()
+  return rows.results ?? []
+}
+
+/**
+ * revokeLoginIdentity — set revoked_at on exactly one identity, scoped to
+ * tenant + owning member. Idempotent: already-revoked is a no-op
+ * ({ revoked: false }), never an error. A revoked identity will not resolve
+ * and will not silently re-link (identity_revoked).
+ */
+export async function revokeLoginIdentity(
+  env: Env,
+  tenant: string,
+  memberId: string,
+  identityId: string,
+  nowMs: number = Date.now(),
+): Promise<{ revoked: boolean; identity: LoginIdentityRecord | null }> {
+  const nowIso = new Date(nowMs).toISOString()
+  const result = await env.DB.prepare(
+    `UPDATE human_login_identities SET revoked_at = ?1
+      WHERE id = ?2 AND tenant = ?3 AND member_id = ?4 AND revoked_at IS NULL`,
+  )
+    .bind(nowIso, identityId, tenant, memberId)
+    .run()
+  const changes = Number(result.meta?.changes ?? 0)
+  const identity = await env.DB.prepare(
+    `SELECT id, tenant, provider, provider_subject, verified_email, member_id,
+            linked_by_member_id, created_at, revoked_at
+       FROM human_login_identities
+      WHERE id = ?1 AND tenant = ?2 AND member_id = ?3
+      LIMIT 1`,
+  )
+    .bind(identityId, tenant, memberId)
+    .first<LoginIdentityRecord>()
+  return { revoked: changes > 0, identity: identity ?? null }
+}

@@ -300,6 +300,54 @@ export async function revokeWebSessionByHash(
 }
 
 /**
+ * revokeWebSessionsForLoginIdentity — kill every LIVE session bound to one
+ * login identity. Used when that identity is revoked: session revoke alone
+ * does not unbind the subject, and leaving the sessions live would let the
+ * attacker keep using a cookie minted under the stolen binding.
+ */
+export async function revokeWebSessionsForLoginIdentity(
+  env: Env,
+  tenant: string,
+  memberId: string,
+  loginIdentityId: string,
+  reason: string,
+  nowMs: number = Date.now(),
+): Promise<{ revokedCount: number }> {
+  const nowIso = new Date(nowMs).toISOString()
+  const result = await env.DB.prepare(
+    `UPDATE web_sessions SET revoked_at = ?1, revoke_reason = ?2
+      WHERE tenant = ?3 AND member_id = ?4 AND login_identity_id = ?5 AND revoked_at IS NULL`,
+  )
+    .bind(nowIso, reason, tenant, memberId, loginIdentityId)
+    .run()
+  return { revokedCount: Number(result.meta?.changes ?? 0) }
+}
+
+/**
+ * loadLiveReauthIdentity — the identity a reauth callback must match.
+ * Both the session AND the identity must be live: a revoked identity on a
+ * still-live session must not satisfy a step-up.
+ */
+export async function loadLiveReauthIdentity(
+  env: Env,
+  tenant: string,
+  webSessionIdHash: string,
+): Promise<{ provider: string; provider_subject: string } | null> {
+  const row = await env.DB.prepare(
+    `SELECT hli.provider AS provider, hli.provider_subject AS provider_subject
+       FROM web_sessions ws
+       JOIN human_login_identities hli ON hli.id = ws.login_identity_id
+      WHERE ws.id_hash = ?1 AND ws.tenant = ?2
+        AND ws.revoked_at IS NULL
+        AND hli.revoked_at IS NULL
+      LIMIT 1`,
+  )
+    .bind(webSessionIdHash, tenant)
+    .first<{ provider: string; provider_subject: string }>()
+  return row ?? null
+}
+
+/**
  * revokeAllWebSessions — "sign out all devices". Revokes every LIVE session
  * for the member; pass exceptIdHash to keep the current session alive (the
  * common "sign out other devices" variant) — omit it for a full sign-out.
