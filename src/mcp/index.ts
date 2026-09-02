@@ -3298,9 +3298,89 @@ const toolBroadcast: ToolSpec = {
   },
 }
 
+// ── seat binding (mupot#1254 C1 — caller-controlled inbox seat partition) ──────
+//
+// origin/main (pre-fix) read the seat partition straight off `args.seat` — a caller bound
+// to ANY of an agent's tokens could pass ANY other seat's label and read/lease its mail.
+// The fix binds the partition to the ONE seat identity a caller cannot forge: the live
+// `member_tokens.label` row for `auth.tokenId` (re-derived server-side from the live
+// tenant/member-scoped token every request — see resolveAuth/authenticateMember above,
+// `AuthContext.tokenId`'s own doc comment: "server-derived only"). That label IS the seat
+// name — migration 0139 spells it out verbatim ("member_tokens.label, i.e. the seat
+// name"), and it is set once at mint time: explicitly by the /enroll form (src/dashboard/
+// enroll.ts, POST /enroll/mint) or mint_agent_token's own `label` arg, or implicitly
+// (mint_agent_token defaults an unlabelled mint to the agent's own slug — src/mcp/
+// provision.ts:563). A token minted before this feature, or never given an explicit seat,
+// simply has label = '' (the column default) or = the agent's slug — either way a single,
+// stable, server-controlled value, never a per-request claim.
+//
+// Two things this is explicitly NOT:
+//   - `ctx.seat` (used a few lines below for enroll_url) is the `x-mupot-seat` REQUEST
+//     HEADER (see handleJsonRpc's ToolCtx construction) — a plain client-supplied value,
+//     exactly as forgeable as args.seat. It is fine as a cosmetic hint for the enrollment
+//     door; it must never be treated as an authenticated seat.
+//   - `runtime_seats` (migrations 0121+, src/flight-spine/seats.ts) is a DIFFERENT "seat"
+//     concept — host/process assignment for the flight-spine scheduler — unrelated to
+//     inbox mailbox partitioning. Do not conflate the two when reading migration history.
+//
+// A null return means "this token has no seat label bound," not "lookup failed open":
+// on a DB error we return null too, which — same as an empty label — refuses any
+// caller-supplied args.seat (seat_not_bound) rather than silently trusting it. The scoping
+// feature fails closed; the unscoped (broadcast-only) read/lease untouched by this fix
+// still works, exactly as it did before.
+async function resolveBoundSeat(env: Env, auth: AuthContext): Promise<string | null> {
+  if (!auth.tokenId || !env.DB) return null
+  try {
+    const row = await env.DB.prepare(
+      `SELECT label FROM member_tokens WHERE id = ?1 AND tenant = ?2`,
+    ).bind(auth.tokenId, env.TENANT_SLUG).first<{ label: string | null }>()
+    const label = row?.label?.trim()
+    return label && label.length > 0 ? label : null
+  } catch {
+    return null
+  }
+}
+
+// A bound token's seat is now authoritative: it applies EVEN WHEN args.seat is omitted
+// (this is what lets a seat-labelled token receive mail addressed to its own seat without
+// every caller having to echo its own identity back at it — the same class of bug #889
+// closed for the "wrong token file" case; here it was "right token, seat mail simply never
+// matched because nothing derived the seat from the token"). An explicit args.seat is
+// accepted ONLY as a same-value compat echo; anything else is refused, never silently
+// downgraded to the token's real seat or to unscoped.
+function resolveInboxSeatArg(
+  requestedSeat: string | undefined,
+  boundSeat: string | null,
+): { ok: true; seat: string | undefined } | { ok: false; outcome: ToolOutcome } {
+  if (requestedSeat !== undefined) {
+    if (boundSeat === null) {
+      return {
+        ok: false,
+        outcome: fail(
+          403,
+          'seat_not_bound',
+          'this token has no seat label bound; args.seat cannot be used until the token is minted with a seat label (see /enroll or mint_agent_token { label })',
+        ),
+      }
+    }
+    if (requestedSeat !== boundSeat) {
+      return {
+        ok: false,
+        outcome: fail(
+          403,
+          'seat_mismatch',
+          `this token is bound to seat "${boundSeat}"; args.seat must match it or be omitted`,
+        ),
+      }
+    }
+  }
+  return { ok: true, seat: boundSeat ?? undefined }
+}
+
 // inbox — read (and by default CONSUME) the CALLER's own inbox. cap: agent-bound member.
 // Self-scoped: an agent only ever reads to_agent = its own welded id; it cannot read another
-// agent's inbox. peek=true reads without consuming.
+// agent's inbox. peek=true reads without consuming. The seat partition within that inbox is
+// bound to the caller's own token (resolveBoundSeat above) — args.seat can only confirm it.
 const toolInbox: ToolSpec = {
   name: 'inbox',
   scope: 'self (the caller agent reads its own inbox)',
@@ -3345,12 +3425,19 @@ const toolInbox: ToolSpec = {
       sinceSeq = rawSinceSeq
     }
 
+    const boundSeat = await resolveBoundSeat(env, auth)
+    const seatArg = resolveInboxSeatArg(
+      typeof args.seat === 'string' ? args.seat.trim() : undefined,
+      boundSeat,
+    )
+    if (!seatArg.ok) return seatArg.outcome
+
     const res = await readAgentInbox(env, {
       agent,
       limit,
       peek: args.peek === true,
       sinceSeq,
-      seat: typeof args.seat === 'string' ? args.seat.trim() : undefined,
+      seat: seatArg.seat,
     })
     if (!res.ok) {
       if (res.reason === 'db_error') return fail(500, res.reason) // no raw DB string to caller
@@ -3410,11 +3497,18 @@ const toolInboxLease: ToolSpec = {
     if (args.seat !== undefined && typeof args.seat !== 'string')
       return fail(400, 'invalid_args', 'seat must be a string')
 
+    const boundSeat = await resolveBoundSeat(env, auth)
+    const seatArg = resolveInboxSeatArg(
+      typeof args.seat === 'string' ? args.seat.trim() : undefined,
+      boundSeat,
+    )
+    if (!seatArg.ok) return seatArg.outcome
+
     const res = await leaseAgentInbox(env, {
       agent,
       limit,
       leaseSeconds,
-      seat: typeof args.seat === 'string' ? args.seat.trim() : undefined,
+      seat: seatArg.seat,
     })
     if (!res.ok) {
       if (res.reason === 'db_error') return fail(500, res.reason) // no raw DB string to caller
@@ -3440,6 +3534,27 @@ const toolInboxLease: ToolSpec = {
 // behind it. Idempotent: re-acking an already-read id is success, not an error, because the
 // alternative is every caller re-implementing the retry bookkeeping this tool exists to
 // remove. Ids that are not this agent's are refused without saying whether they exist.
+//
+// mupot#1254 C1 seat-bind (kasra-code, flight-20260902-seat-bind): deliberately UNCHANGED.
+// inbox_ack has no `seat` argument at all — it is scoped by `to_agent = agent` only
+// (ackAgentMessages, src/agents/messages.ts), same as before this fix, and that is by the
+// ORIGINAL design of this tool ("Only the bound recipient may ack, and only rows addressed
+// to them" — see ackAgentMessages' own docstring), not an oversight this PR needs to close:
+//   - `ids` are opaque `crypto.randomUUID()`s (src/agents/messages.ts:243), not derivable
+//     from a seat name or any other guessable input — knowing an id is already a real
+//     capability, the same "id as bearer capability" shape `send_target_not_visible`
+//     deliberately collapses onto (see ackAgentMessages' comment on `refused`).
+//   - The one place a seat-B caller could learn a seat-A id via a mismatched `args.seat`
+//     was `inbox`/`inbox_lease` — exactly the hole `resolveBoundSeat` above closes. Once
+//     that channel is shut, an agent-bound caller has no seat-scoped way to enumerate
+//     another seat's ids through inbox_ack's own surface.
+//   - `inbox_dead_letters` (self scope, a few tools below) is a SEPARATE, pre-existing,
+//     already-unseated surface: it returns EVERY dead-lettered message body for
+//     `to_agent = agent` with no seat filter at all, so a seat-B caller who ALSO holds a
+//     bound token for the same agent can already read seat-A's parked mail there today.
+//     That is a real cross-seat leak, but it is not caused or worsened by args.seat and is
+//     out of this PR's named scope (index.ts:~3353/3417/3444 — see the flight brief); flagged
+//     for a follow-up rather than folded in here silently.
 const toolInboxAck: ToolSpec = {
   name: 'inbox_ack',
   scope: 'self (the caller agent acks messages addressed to itself)',
