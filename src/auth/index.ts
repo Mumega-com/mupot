@@ -19,7 +19,7 @@ import type { Context, MiddlewareHandler } from 'hono'
 import type { Env, AuthContext } from '../types'
 import { verifyHandoffClaim } from './handoff-verify'
 import { resolveCapabilities } from './capability'
-import { linkLoginIdentity } from './login-identity'
+import { linkLoginIdentity, resolveLoginIdentity } from './login-identity'
 import {
   createWebSession,
   evaluateWebSession,
@@ -245,34 +245,53 @@ async function registerWebSession(
   if (!loginIdentity || !email || !env.DB) return false
   try {
     const tenant = env.TENANT_SLUG
-    // Same case-insensitive, tenant-scoped, active-only match as the
-    // email→member bridge in loadAuthFromCookie — one predicate, kept in
-    // sync by inspection since both read the same members table shape.
-    const member = await env.DB.prepare(
-      "SELECT id FROM members WHERE lower(email) = lower(?1) AND tenant = ?2 AND status = 'active' LIMIT 1",
-    )
-      .bind(email, tenant)
-      .first<{ id: string }>()
-    if (!member) return false
-
-    const linked = await linkLoginIdentity(env, {
+    // Join key first: (tenant, provider, provider_subject) is the authority
+    // binding, not display email. An explicit prior link (the one-time owner
+    // ceremony, or any previous successful bind) MUST win over "whichever
+    // members.email happens to equal this login email" — that email match is
+    // the #1162 dual-member defect (hadi@digid.ca is a member row that holds
+    // admin on nothing; mem-hadi is the owner). Email is only the bootstrap
+    // when no live identity exists yet.
+    const existingIdentity = await resolveLoginIdentity(
+      env,
       tenant,
-      provider: loginIdentity.provider,
-      providerSubject: loginIdentity.subject,
-      verifiedEmail: email,
-      memberId: member.id,
-    })
-    // identity_bound_to_other_member / identity_revoked: never proceed. This
-    // must never happen for a legitimate login (the join key is derived from
-    // the SAME provider subject every time for the same human) — if it does,
-    // something is cross-wired, and the fail-safe response is "no new D1
-    // session row", not "attach this session to somebody else's identity".
-    if (!linked.ok) return false
+      loginIdentity.provider,
+      loginIdentity.subject,
+    )
+    let memberId: string
+    let loginIdentityId: string
+    if (existingIdentity) {
+      memberId = existingIdentity.member_id
+      loginIdentityId = existingIdentity.id
+    } else {
+      const member = await env.DB.prepare(
+        "SELECT id FROM members WHERE lower(email) = lower(?1) AND tenant = ?2 AND status = 'active' LIMIT 1",
+      )
+        .bind(email, tenant)
+        .first<{ id: string }>()
+      if (!member) return false
+
+      const linked = await linkLoginIdentity(env, {
+        tenant,
+        provider: loginIdentity.provider,
+        providerSubject: loginIdentity.subject,
+        verifiedEmail: email,
+        memberId: member.id,
+      })
+      // identity_bound_to_other_member / identity_revoked: never proceed. This
+      // must never happen for a legitimate first-link (the join key is derived
+      // from the SAME provider subject every time for the same human) — if it
+      // does, something is cross-wired, and the fail-safe response is "no new
+      // D1 session row", not "attach this session to somebody else's identity".
+      if (!linked.ok) return false
+      memberId = member.id
+      loginIdentityId = linked.identity.id
+    }
 
     await createWebSession(env, sessionId, {
       tenant,
-      memberId: member.id,
-      loginIdentityId: linked.identity.id,
+      memberId,
+      loginIdentityId,
     })
     return true
   } catch (err) {

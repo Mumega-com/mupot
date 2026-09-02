@@ -15,6 +15,7 @@
 // calls.
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { authApp } from '../src/auth'
+import { linkLoginIdentity } from '../src/auth/login-identity'
 import type { Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
@@ -80,6 +81,39 @@ describe('web-session registry — integration through authApp (real D1)', () =>
     const res = await authApp.request('/sessions', { headers: { cookie: `mupot_session=${cookie}` } }, env)
     return { status: res.status, body: (await res.json()) as { sessions: Record<string, unknown>[] } }
   }
+
+  it('an existing login-identity binding wins over email match — #1162 dual member', async () => {
+    // Login email matches mem-login (no standing admin). The owner member is
+    // mem-hadi with a different email. An explicit prior link of the IdP
+    // subject to mem-hadi must win; email-string match must not steal it.
+    const env = makeEnv('hadi@digid.ca')
+    env.DB = harness.db
+    await seedMember(env, 'mem-hadi', 'owner@mumega.test')
+    await seedMember(env, 'mem-login', 'hadi@digid.ca')
+    const linked = await linkLoginIdentity(env, {
+      tenant: TENANT,
+      provider: 'local-test',
+      providerSubject: 'hadi@digid.ca',
+      verifiedEmail: 'hadi@digid.ca',
+      memberId: 'mem-hadi',
+    })
+    expect(linked.ok).toBe(true)
+
+    const cookie = await devLogin(env)
+    const row = await env.DB.prepare(
+      `SELECT ws.member_id AS member_id
+         FROM web_sessions ws
+         JOIN human_login_identities hli ON hli.id = ws.login_identity_id
+        WHERE hli.provider = 'local-test' AND hli.provider_subject = 'hadi@digid.ca'
+          AND ws.revoked_at IS NULL
+        LIMIT 1`,
+    ).first<{ member_id: string }>()
+    expect(row?.member_id).toBe('mem-hadi')
+
+    const { body } = await sessions(env, cookie)
+    expect(body.sessions).toHaveLength(1)
+    expect(body.sessions[0]?.is_current).toBe(true)
+  })
 
   it('a login that resolves to a members row is registered — GET /auth/sessions lists it, marked is_current', async () => {
     const env = makeEnv('owner@x.test')
