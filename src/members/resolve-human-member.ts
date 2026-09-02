@@ -64,7 +64,13 @@ async function ownerAliasMemberId(env: Env, email: string): Promise<string | nul
  * 3. members.email bootstrap.
  * 4. owner_login_emails → unique org owner.
  * Missing identity table (migration not applied) falls through to email bootstrap.
+ * Any other D1 failure is rethrown — silent email-first is the inversion Athena banned.
  */
+export function isMissingHumanLoginIdentitiesTable(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err)
+  return /no such table:\s*human_login_identities/i.test(msg)
+}
+
 export async function resolveHumanMemberId(
   env: Env,
   input: ResolveHumanMemberInput,
@@ -87,8 +93,8 @@ export async function resolveHumanMemberId(
       if (rows.length === 1) return rows[0].member_id
       if (rows.length > 1) return null
     }
-  } catch {
-    // Table missing or D1 error: no live identity; bootstrap by email.
+  } catch (err) {
+    if (!isMissingHumanLoginIdentitiesTable(err)) throw err
   }
 
   const email = input.email ? normalizeEmail(input.email) : ''

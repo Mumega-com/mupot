@@ -73,4 +73,35 @@ describe('identity-first at all five sites (interaction)', () => {
     expect(result.memberId).toBe('mem-hadi')
     expect(result.isNew).toBe(false)
   })
+
+  it('two live identities sharing verified_email fail closed (null), not first-row', async () => {
+    const second = await linkLoginIdentity(env, {
+      tenant: TENANT,
+      provider: 'google',
+      providerSubject: 'sub-other',
+      verifiedEmail: 'hadi@digid.ca',
+      memberId: 'mem-login',
+    })
+    expect(second.ok).toBe(true)
+    const id = await resolveHumanMemberId(env, {
+      tenant: TENANT,
+      email: 'hadi@digid.ca',
+    })
+    expect(id).toBeNull()
+  })
+
+  it('transient D1 error does not silently fall through to members.email', async () => {
+    const real = env.DB
+    env.DB = {
+      prepare: (sql: string) => {
+        if (typeof sql === 'string' && sql.includes('human_login_identities')) {
+          throw new Error('D1 timeout')
+        }
+        return real.prepare(sql)
+      },
+    } as unknown as Env['DB']
+    await expect(
+      resolveHumanMemberId(env, { tenant: TENANT, email: 'hadi@digid.ca' }),
+    ).rejects.toThrow(/D1 timeout/)
+  })
 })
