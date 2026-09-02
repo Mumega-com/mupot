@@ -3,11 +3,23 @@
 Grok TUI already speaks MCP, so **send** works with an agent-bound token. This
 folder is the other half: **receive at end of turn**.
 
-It is **not** the idle-wake path. `scripts/grok-inbox-watch.mjs` on
-`kasra/grok-connector` (herdr `agent prompt`, 30s tick) starts a turn for a
-sitting prompt. A Stop hook cannot: Stop fires only on genuine turn completion
-(`reason == end_turn`). A seat with only this hook goes silent exactly when it
-is doing nothing. The two artifacts compose; they must not share a consume.
+## Why two connectors
+
+Stop covers in-session turn-end. herdr prompt wakes an idle seat. Neither
+covers the other. A Stop-only seat goes silent exactly when it is idle — which
+was the broken case. That is the whole justification for a second connector
+when `kasra/grok-connector` (`72b9b22e`, `scripts/grok-inbox-watch.mjs`) already
+runs.
+
+The two artifacts compose. They must not share a consume.
+
+**Consume policy is transport-specific.** Same invariant — never consume an
+unconfirmed message — two correct implementations:
+
+- Stop-hook (this branch): all-or-nothing `planInboxConsume`. One `{decision:block}` can carry the whole peeked batch.
+- herdr polling (`72b9b22e`): per-message consume. Only one confirmed delivery per cycle is possible; all-or-nothing would redeliver the confirmed row forever.
+
+Do not re-impose `planInboxConsume` on the polling artifact.
 
 ## Install (do not run from an ungated task)
 
