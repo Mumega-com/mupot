@@ -10,7 +10,8 @@
 // authentication resolves to unauthenticated, never to access.
 
 import { describe, expect, it, vi, afterEach } from 'vitest'
-import { authLookupOrNull, redactCredentials } from '../src/auth/fail-closed'
+import { authLookupOrNull } from '../src/auth/fail-closed'
+import { redactSecretPatterns } from '../src/lib/redact'
 import { resolveMemberByToken } from '../src/auth/member-bearer'
 import type { Env } from '../src/types'
 
@@ -49,12 +50,32 @@ describe('a failure to evaluate auth is not permission', () => {
     expect(logged).not.toContain('mupot_deadbeef')
   })
 
-  it('redacts every credential shape, not just the one that caught me', () => {
-    for (const secret of ['mupot_deadbeefcafe', 'pot_adm_0123456789ab', 'sk-abcdef012345', 'a'.repeat(40)]) {
-      expect(redactCredentials(`boom ${secret} end`)).not.toContain(secret)
+  it('redacts every credential shape live in this estate', () => {
+    // The list my hand-rolled version missed is most of this list. Using the canonical
+    // redactor is the fix; these assert it actually covers what we hold.
+    const secrets = [
+      'mupot_deadbeefcafe1234',
+      'pot_adm_0123456789abcdef',
+      'pot_agt_0123456789abcdef',
+      'cfat_0123456789abcdefghij',
+      'ghp_0123456789abcdefghij',
+      'sk-proj-0123456789abcdef',
+      'xoxb-0123456789-abcdefgh',
+      'eyJhbGciOi.eyJzdWIi.abcdef',
+    ]
+    for (const secret of secrets) {
+      expect(redactSecretPatterns(`boom ${secret} end`)).not.toContain(secret)
     }
-    // And does not eat ordinary text.
-    expect(redactCredentials('D1_ERROR: network timeout')).toBe('D1_ERROR: network timeout')
+    // `Bearer <anything>` too — the shape my version missed entirely.
+    expect(redactSecretPatterns('Authorization: Bearer someopaquevalue')).not.toContain('someopaquevalue')
+  })
+
+  it('does not eat text we deliberately log', () => {
+    // A generic long-hex rule would have redacted commit SHAs, which are not secret and are
+    // the most useful thing in a deploy log. Redaction must be targeted, not greedy.
+    expect(redactSecretPatterns('D1_ERROR: network timeout')).toBe('D1_ERROR: network timeout')
+    expect(redactSecretPatterns('commit 77b6cb5250b4f148c04261b9905cf6d9656af829'))
+      .toContain('77b6cb5250b4f148c04261b9905cf6d9656af829')
   })
 
   it('records WHICH lookup failed — a 1101 gave us no stack at all', async () => {

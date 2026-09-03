@@ -24,6 +24,16 @@
 // dedupe), and the two that exist have already drifted in which error surface they
 // produce. Four private catch blocks would drift the same way; one shared decision cannot.
 
+// Redaction uses the CANONICAL redactSecretPatterns from src/lib/redact.ts.
+//
+// The first version of this file carried its own CREDENTIAL_PATTERNS list, written from
+// memory of what our tokens look like. An adversarial pass found it was a reinvention of an
+// existing helper AND weaker than it: mine missed `Bearer <token>`, JWTs, Slack tokens, AWS
+// keys, private-key blocks and key=value assignments, all of which the canonical already
+// handled. Writing a second copy of a security predicate produced the worse one, which is
+// the argument against ever writing the second copy.
+import { redactSecretPatterns } from '../lib/redact'
+
 /**
  * Run an authentication lookup so that a THROWN error resolves to `null`
  * (unauthenticated) rather than escaping as an unhandled exception.
@@ -35,27 +45,6 @@
  * @param site  where this ran, for the log line — a 1101 gave us no stack, so the whole
  *              point of logging here is knowing WHICH lookup threw next time.
  */
-/** Credential shapes that must never reach a log line. This runs on the authentication
- *  path, so the values in scope ARE secrets — and a D1 error message can echo the query
- *  and its bound parameters. Redacting by construction beats trusting that upstream error
- *  text happens to be clean, because the day it is not, the secret is in Workers Logs
- *  permanently and nobody notices.
- *
- *  Caught by its own test: the first version of this helper logged `err.message` verbatim
- *  and leaked a `mupot_` token straight through. */
-const CREDENTIAL_PATTERNS: readonly RegExp[] = [
-  /\bmupot_[A-Za-z0-9_-]{6,}/gi,   // member/agent bearer keys
-  /\bpot_(?:adm|agt)_[A-Za-z0-9_-]{6,}/gi, // pot admin / agent tokens
-  /\bsk-[A-Za-z0-9_-]{8,}/gi,      // provider keys
-  /\b[a-f0-9]{32,}\b/gi,           // token hashes and long hex digests
-]
-
-export function redactCredentials(text: string): string {
-  let out = text
-  for (const re of CREDENTIAL_PATTERNS) out = out.replace(re, '[redacted]')
-  return out
-}
-
 export async function authLookupOrNull<T>(
   site: string,
   lookup: () => Promise<T | null>,
@@ -67,7 +56,7 @@ export async function authLookupOrNull<T>(
     // row — this runs on the authentication path and the inputs are credentials.
     console.error('auth lookup failed — failing closed to unauthenticated', {
       site,
-      error: redactCredentials(err instanceof Error ? err.message : String(err)),
+      error: redactSecretPatterns(err instanceof Error ? err.message : String(err)),
     })
     return null
   }
