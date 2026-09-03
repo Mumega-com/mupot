@@ -39,6 +39,44 @@ import type { Env } from '../types'
 
 export type PanelState = 'ready' | 'empty' | 'unavailable'
 
+/**
+ * The page cap for every panel read. Exposed rather than inlined because a count
+ * that reached this number is a LOWER BOUND, not a measurement, and callers must
+ * be able to say so.
+ */
+export const PANEL_ROW_CAP = 200
+export const COLLABORATION_ROW_CAP = 500
+
+/**
+ * How long a single panel read may take before it is abandoned.
+ *
+ * A panel that hangs must not hold the page. The independence contract said
+ * panels degrade individually; without a deadline that was only true for reads
+ * that FAILED, not for reads that never returned. Athena caught exactly that.
+ */
+export const PANEL_TIMEOUT_MS = 3_000
+
+/**
+ * Races a panel read against a deadline. A read that does not return in time
+ * becomes 'unavailable' with a visible reason — the same honest state a thrown
+ * read produces — rather than stalling every other panel behind it.
+ */
+export async function withDeadline<T>(
+  work: Promise<PanelResult<T>>,
+  ms = PANEL_TIMEOUT_MS,
+  label = 'This took too long to read.',
+): Promise<PanelResult<T>> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const deadline = new Promise<PanelResult<T>>((resolve) => {
+    timer = setTimeout(() => resolve(unavailable<T>(label)), ms)
+  })
+  try {
+    return await Promise.race([work, deadline])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
 export interface PanelResult<T> {
   state: PanelState
   /** Present only when state === 'ready'. */
@@ -63,7 +101,10 @@ export function ready<T>(data: T): PanelResult<T> {
 // ── flights ──────────────────────────────────────────────────────────────────
 
 export interface FlightSummary {
+  /** Rows counted. When `truncated`, this is a FLOOR, not a total. */
   total: number
+  /** True when the read hit its cap, so every count here is a lower bound. */
+  truncated: boolean
   landed: number
   failed: number
   held: number
@@ -84,6 +125,7 @@ export function summariseFlights(
 ): FlightSummary {
   const summary: FlightSummary = {
     total: rows.length,
+    truncated: rows.length >= PANEL_ROW_CAP,
     landed: 0,
     failed: 0,
     held: 0,
@@ -115,7 +157,7 @@ export async function loadFlightPanel(env: Env, agentId: string): Promise<PanelR
          FROM flights
         WHERE tenant = ?1 AND agent = ?2
         ORDER BY created_at DESC
-        LIMIT 200`,
+        LIMIT ${PANEL_ROW_CAP}`,
     ).bind(env.TENANT_SLUG, agentId).all<{
       id: string; goal: string; status: string; cost_micro_usd: number | null; created_at: string
     }>()
@@ -133,7 +175,10 @@ export async function loadFlightPanel(env: Env, agentId: string): Promise<PanelR
 // ── work (tasks) ─────────────────────────────────────────────────────────────
 
 export interface WorkSummary {
+  /** Rows counted. When `truncated`, this is a FLOOR, not a total. */
   total: number
+  /** True when the read hit its cap, so every count here is a lower bound. */
+  truncated: boolean
   open: number
   done: number
   /** Tasks that carry a GitHub issue link — the ones with an outside record. */
@@ -146,7 +191,11 @@ const DONE_STATES = new Set(['done', 'approved'])
 export function summariseWork(
   rows: { id: string; title: string; status: string; github_issue_url: string | null }[],
 ): WorkSummary {
-  const summary: WorkSummary = { total: rows.length, open: 0, done: 0, tracked: 0, recent: [] }
+  const summary: WorkSummary = {
+    total: rows.length,
+    truncated: rows.length >= PANEL_ROW_CAP,
+    open: 0, done: 0, tracked: 0, recent: [],
+  }
   for (const r of rows) {
     if (DONE_STATES.has(r.status)) summary.done += 1
     else summary.open += 1
@@ -163,7 +212,7 @@ export async function loadWorkPanel(env: Env, agentId: string): Promise<PanelRes
          FROM tasks
         WHERE assignee_agent_id = ?1
         ORDER BY updated_at DESC
-        LIMIT 200`,
+        LIMIT ${PANEL_ROW_CAP}`,
     ).bind(agentId).all<{
       id: string; title: string; status: string; github_issue_url: string | null
     }>()
@@ -192,7 +241,10 @@ export interface Collaborator {
 
 export interface CollaborationSummary {
   collaborators: Collaborator[]
+  /** Messages attributed. When `truncated`, this is a FLOOR, not a total. */
   totalMessages: number
+  /** True when the read hit its cap, so counts and peers may both be incomplete. */
+  truncated: boolean
 }
 
 /**
@@ -241,7 +293,7 @@ export function summariseCollaboration(
   const collaborators = [...byPeer.values()].sort(
     (a, b) => (b.sent + b.received) - (a.sent + a.received),
   )
-  return { collaborators, totalMessages: counted }
+  return { collaborators, totalMessages: counted, truncated: rows.length >= COLLABORATION_ROW_CAP }
 }
 
 export async function loadCollaborationPanel(
@@ -254,7 +306,7 @@ export async function loadCollaborationPanel(
          FROM agent_messages
         WHERE tenant = ?1 AND (from_agent = ?2 OR to_agent = ?2)
         ORDER BY created_at DESC
-        LIMIT 500`,
+        LIMIT ${COLLABORATION_ROW_CAP}`,
     ).bind(env.TENANT_SLUG, agentId).all<{ from_agent: string; to_agent: string; created_at: string }>()
     const rows = res.results ?? []
     if (rows.length === 0) return empty()

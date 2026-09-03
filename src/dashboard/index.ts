@@ -80,6 +80,7 @@ import { findPreset, isValidPresetId } from '../auth/role-presets'
 // Agent-bound token mint UI.
 import { loadAgentTokenView, agentTokenPageBody, agentTokenMintedBody } from './agent-token'
 import {
+  withDeadline,
   loadCollaborationPanel,
   loadFlightPanel,
   loadWorkPanel,
@@ -1725,13 +1726,19 @@ dashboardApp.get('/agents/:id', async (c) => {
   // Mirror the wake API's real gate (lead+ on the agent's squad) so squad leads
   // see a working button — the API re-checks server-side either way.
   const canWake = await canOnSquad(c.env, auth, agent.squad_id)
-  // Panels resolve independently and in parallel: one failing read must degrade
-  // its own section and nothing else. Each returns a typed state, so "we could
-  // not read this" never renders as "this agent has done nothing".
+  // Panels resolve independently: one failing read degrades its own section and
+  // nothing else, and each returns a typed state so "we could not read this"
+  // never renders as "this agent has done nothing".
+  //
+  // Each read carries its OWN deadline. Athena's gate on 0df79b09 caught that
+  // Promise.all alone does not deliver the independence this comment claims — a
+  // read that never RETURNS still stalls the whole page, so independence held
+  // only for reads that failed, not for reads that hung. allSettled would not
+  // fix it either; the missing piece is a deadline, not error handling.
   const [flights, work, collaboration] = await Promise.all([
-    loadFlightPanel(c.env, agent.id),
-    loadWorkPanel(c.env, agent.id),
-    loadCollaborationPanel(c.env, agent.id),
+    withDeadline(loadFlightPanel(c.env, agent.id), undefined, 'Flight history took too long to read.'),
+    withDeadline(loadWorkPanel(c.env, agent.id), undefined, 'Assigned work took too long to read.'),
+    withDeadline(loadCollaborationPanel(c.env, agent.id), undefined, 'Collaboration history took too long to read.'),
   ])
   return c.html(
     shell(c.env, `Agent · ${agent.name}`, agentConsoleBody(agent, squad, canWake, flights, work, collaboration)),
@@ -5318,13 +5325,14 @@ function agentConsoleBody(
     ${renderPanel('flights', flights, (d) => html`
       <div class="card">
         <dl class="kv">
-          <dt>Flown</dt><dd>${d.total}</dd>
+          <dt>Flown</dt><dd>${d.truncated ? html`at least ${d.total}` : html`${d.total}`}</dd>
           <dt>Landed</dt><dd>${d.landed}</dd>
           <dt>Failed</dt><dd>${d.failed}</dd>
           <dt>Held</dt><dd>${d.held}</dd>
           <dt>Running</dt><dd>${d.running}</dd>
           <dt>Spend</dt><dd>${formatCost(d.costMicroUsd)}</dd>
         </dl>
+        ${d.truncated ? html`<p class="dim">Read capped — counts above are a floor, not a total.</p>` : ''}
         <ul>
           ${d.recent.map((f) => html`<li>
             <a href="/flights/${f.id}">${f.goal.slice(0, 90)}</a> — ${f.status} · ${f.created_at}
@@ -5336,11 +5344,12 @@ function agentConsoleBody(
     ${renderPanel('work', work, (d) => html`
       <div class="card">
         <dl class="kv">
-          <dt>Assigned</dt><dd>${d.total}</dd>
+          <dt>Assigned</dt><dd>${d.truncated ? html`at least ${d.total}` : html`${d.total}`}</dd>
           <dt>Open</dt><dd>${d.open}</dd>
           <dt>Done</dt><dd>${d.done}</dd>
           <dt>Tracked in GitHub</dt><dd>${d.tracked}</dd>
         </dl>
+        ${d.truncated ? html`<p class="dim">Read capped — counts above are a floor, not a total.</p>` : ''}
         <ul>
           ${d.recent.map((t) => html`<li>
             ${t.github_issue_url
@@ -5353,7 +5362,7 @@ function agentConsoleBody(
     <h2>Works with</h2>
     ${renderPanel('collaboration', collaboration, (d) => html`
       <div class="card">
-        <p class="dim">${d.totalMessages} messages exchanged. Edges are real messages — shared squad membership is not shown here, because co-location is not collaboration.</p>
+        <p class="dim">${d.truncated ? html`At least ${d.totalMessages}` : html`${d.totalMessages}`} messages exchanged. Edges are real messages — shared squad membership is not shown here, because co-location is not collaboration.</p>
         <ul>
           ${d.collaborators.slice(0, 10).map((p) => html`<li>
             <a href="/agents/${p.agentId}">${p.name}</a> — sent ${p.sent}, received ${p.received} · last ${p.lastAt}

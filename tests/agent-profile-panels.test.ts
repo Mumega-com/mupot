@@ -3,6 +3,9 @@ import {
   PANELS,
   formatCost,
   panelByKey,
+  COLLABORATION_ROW_CAP,
+  PANEL_ROW_CAP,
+  withDeadline,
   summariseCollaboration,
   summariseFlights,
   summariseWork,
@@ -244,5 +247,80 @@ describe('collaboration — who this agent actually works with', () => {
 
   it('returns nothing for an agent that has exchanged nothing', () => {
     expect(summariseCollaboration(ME, [], names)).toMatchObject({ collaborators: [], totalMessages: 0 })
+  })
+})
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Athena's gate on 0df79b09 — BLOCK. Both findings, held here so they cannot
+// silently return.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('truncation — a capped read is a FLOOR, never a measurement', () => {
+  // The PR's own thesis is that an unknown must never be presented as a
+  // measurement. It then exposed rows.length as "Flown" and "Assigned" while
+  // capping the read. Athena caught the design being violated by its own author.
+  it('flags a flight read that hit the cap', () => {
+    const capped = Array.from({ length: PANEL_ROW_CAP }, (_, i) => ({
+      id: `f${i}`, goal: 'g', status: 'landed', cost_micro_usd: 0, created_at: `d${i}`,
+    }))
+    expect(summariseFlights(capped).truncated).toBe(true)
+  })
+
+  it('does not flag a flight read that came back under the cap', () => {
+    const under = Array.from({ length: PANEL_ROW_CAP - 1 }, (_, i) => ({
+      id: `f${i}`, goal: 'g', status: 'landed', cost_micro_usd: 0, created_at: `d${i}`,
+    }))
+    expect(summariseFlights(under).truncated).toBe(false)
+  })
+
+  it('flags a work read that hit the cap', () => {
+    const capped = Array.from({ length: PANEL_ROW_CAP }, (_, i) => ({
+      id: `t${i}`, title: 't', status: 'open', github_issue_url: null,
+    }))
+    expect(summariseWork(capped).truncated).toBe(true)
+  })
+
+  it('does not flag a work read under the cap', () => {
+    expect(summariseWork([{ id: 't', title: 't', status: 'open', github_issue_url: null }]).truncated).toBe(false)
+  })
+
+  it('flags a collaboration read that hit its own, larger cap', () => {
+    const capped = Array.from({ length: COLLABORATION_ROW_CAP }, (_, i) => ({
+      from_agent: 'me', to_agent: 'peer', created_at: `d${i}`,
+    }))
+    expect(summariseCollaboration('me', capped, new Map()).truncated).toBe(true)
+  })
+
+  it('does not flag a collaboration read under the cap', () => {
+    expect(summariseCollaboration('me', [{ from_agent: 'me', to_agent: 'p', created_at: 'd' }], new Map()).truncated).toBe(false)
+  })
+
+  it('an empty read is not truncated — absent and capped are different states', () => {
+    expect(summariseFlights([]).truncated).toBe(false)
+    expect(summariseWork([]).truncated).toBe(false)
+    expect(summariseCollaboration('me', [], new Map()).truncated).toBe(false)
+  })
+})
+
+describe('deadline — a hung read must not hold the page', () => {
+  // Promise.all alone did not deliver the independence the code claimed:
+  // independence held for reads that FAILED, not for reads that never returned.
+  it('returns unavailable when a read exceeds its deadline', async () => {
+    const never = new Promise<never>(() => {})
+    const r = await withDeadline(never as never, 10, 'took too long')
+    expect(r.state).toBe('unavailable')
+    expect(r.reason).toBe('took too long')
+  })
+
+  it('returns the real result when the read beats the deadline', async () => {
+    const r = await withDeadline(Promise.resolve(ready('data')), 1_000)
+    expect(r.state).toBe('ready')
+    expect(r.data).toBe('data')
+  })
+
+  it('does not convert an already-empty result into unavailable', async () => {
+    const r = await withDeadline(Promise.resolve(empty<string>()), 1_000)
+    expect(r.state).toBe('empty')
   })
 })
