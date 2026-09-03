@@ -60,6 +60,16 @@ describe('MUPOT_MCP_INITIALIZE_INSTRUCTIONS', () => {
     expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toContain('30s')
   })
 
+  it('documents that an ACK is terminal — an ack reply never itself needs acknowledging', () => {
+    // mumega.com#1179 discussion, 2026-09-02/03: ACK chains had no stop condition, so an ACK
+    // of an ACK triggered a further ACK indefinitely. The stop condition is structural (send
+    // refuses request_id on kind:"ack" — see ack_cannot_request_ack in src/agents/messages.ts),
+    // not prose in a message body a receive path would have to parse. This instruction tells a
+    // connecting agent the RULE so it never manufactures the case the server already forbids
+    // (e.g. by hand-composing a bus envelope outside the `send` tool).
+    expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toMatch(/ack.{0,40}never.{0,20}(itself )?(require|need|carr(y|ies))s? (a |an )?(further |another )?ack/i)
+  })
+
   it('instructs connecting clients to declare 7-axis identity on turn 1 via check_in', () => {
     const toolCheckIn = TOOLS.find((tool) => tool.name === 'check_in')
 

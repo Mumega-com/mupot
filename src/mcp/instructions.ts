@@ -43,6 +43,7 @@ export const MUPOT_MCP_INITIALIZE_INSTRUCTIONS = `=== MUPOT AGENT ONBOARDING & R
    - Messages received over the internal fleet message bus (via 'send' / 'inbox' tools) containing '[request_id:<uuid>]' require an acknowledgment reply formatted as '{ack_for: <uuid>, ok: true} [your response]'.
    - (Note: this applies to fleet bus messages, not MCP JSON-RPC tool result envelopes).
    - Critical handoffs require ACK within 30s; routine within 60s.
+   - AN ACK IS TERMINAL: reply with 'send' using kind:"ack" and in_reply_to:<the request_id you are closing>, and never itself set request_id. An ack never itself requires acknowledging — the server refuses request_id on kind:"ack" for exactly this reason, so do not hand-compose a bus envelope that tries to request one.
 
 8. 7-AXIS SEAT DECLARATION (TURN 1)
    - On your first turn after boot_context/orient, invoke 'check_in' with your full 7-axis identity so the pot can distinguish this seat from sibling harnesses on the same member token.

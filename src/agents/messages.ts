@@ -109,6 +109,7 @@ export type SendFailure = {
     | 'invalid_kind'
     | 'invalid_request_id'
     | 'invalid_in_reply_to'
+    | 'ack_cannot_request_ack'
     | 'project_not_found'
     | 'project_archived'
     | 'project_access_denied'
@@ -222,6 +223,23 @@ export async function sendAgentMessage(
     return { ok: false, reason: 'invalid_request_id', detail: 'request_id must match [A-Za-z0-9_.:-]{1,128}' }
   if (input.inReplyTo !== undefined && !RID_RE.test(input.inReplyTo))
     return { ok: false, reason: 'invalid_in_reply_to', detail: 'in_reply_to must match [A-Za-z0-9_.:-]{1,128}' }
+
+  // ACK-chain terminal marker (mumega.com#1179 discussion). request_id is the ONLY signal the
+  // ACK protocol — and every automated receive path keyed on it (the mupot-inbox.sh Stop hook:
+  // "if a message carries request_id, ACK with kind=ack") — uses to decide the recipient owes a
+  // reply. An ack that itself sets request_id asks its own recipient to ACK the ack, and their
+  // ack would ask the same of the next reply: the chain never terminates on its own. Refusing
+  // this at the send boundary (not by convention in a body string, which no automated acker
+  // reads) makes kind:"ack" non-ack-able by construction — nothing downstream can ever be
+  // instructed to ACK an ack, because an ack can never carry the field that instruction keys on.
+  // in_reply_to is untouched: an ack still must say which request it closes.
+  if (kind === 'ack' && input.requestId !== undefined) {
+    return {
+      ok: false,
+      reason: 'ack_cannot_request_ack',
+      detail: 'a kind:"ack" message may not itself set request_id — that would ask its recipient to ACK the ACK, and the chain would never terminate',
+    }
+  }
 
   if (input.projectId !== undefined) {
     if (typeof input.projectId !== 'string' || !isRef(input.projectId)) {
