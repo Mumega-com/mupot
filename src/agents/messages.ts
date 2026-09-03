@@ -20,6 +20,7 @@ import { resolveAgentRef } from '../org/resolve'
 import { canOnSquad } from '../auth/capability'
 import { sha256Hex } from '../lib/canonical-json'
 import { TOKEN_LIVE_PREDICATE } from '../auth/token-lifecycle'
+import { evaluateReplyExpectation, type ReplyBasis } from './reply-expectation'
 
 // ── tunables ────────────────────────────────────────────────────────────────────────────
 const MAX_BODY_CHARS = 8000
@@ -70,9 +71,15 @@ export interface InboxMessage {
   body_length: number | null
   checksum_sha256: string | null
   is_intact: boolean | null
+  /** Does this message ask its recipient for a reply? Server-computed, never client-supplied.
+   *  See ./reply-expectation — one predicate over kind, request_id and the body prose token. */
+  expects_reply?: boolean
+  /** Which input decided expects_reply. 'body_token' is the weak, quotable one — a consumer
+   *  that acts only on structured intent should require 'request_id_field'. */
+  reply_basis?: ReplyBasis
 }
 
-async function annotateMessageIntegrity(messages: InboxMessage[]): Promise<void> {
+async function annotateMessages(messages: InboxMessage[]): Promise<void> {
   for (const message of messages) {
     const storedLength = typeof message.body_length === 'number'
       && Number.isInteger(message.body_length)
@@ -90,6 +97,17 @@ async function annotateMessageIntegrity(messages: InboxMessage[]): Promise<void>
       ? null
       : message.body.length === storedLength
         && await sha256Hex(message.body) === storedChecksum
+
+    // Reply expectation rides in the SAME pass as integrity, deliberately. Both are read-time
+    // annotations that every inbox surface needs, and three call sites already exist (read,
+    // lease, dead-letters). A second, separate pass would be three more places to forget one.
+    const expectation = evaluateReplyExpectation({
+      kind: message.kind,
+      requestId: message.request_id,
+      body: message.body,
+    })
+    message.expects_reply = expectation.expected
+    message.reply_basis = expectation.basis
   }
 }
 
@@ -109,7 +127,6 @@ export type SendFailure = {
     | 'invalid_kind'
     | 'invalid_request_id'
     | 'invalid_in_reply_to'
-    | 'ack_cannot_request_ack'
     | 'project_not_found'
     | 'project_archived'
     | 'project_access_denied'
@@ -223,23 +240,6 @@ export async function sendAgentMessage(
     return { ok: false, reason: 'invalid_request_id', detail: 'request_id must match [A-Za-z0-9_.:-]{1,128}' }
   if (input.inReplyTo !== undefined && !RID_RE.test(input.inReplyTo))
     return { ok: false, reason: 'invalid_in_reply_to', detail: 'in_reply_to must match [A-Za-z0-9_.:-]{1,128}' }
-
-  // ACK-chain terminal marker (mumega.com#1179 discussion). request_id is the ONLY signal the
-  // ACK protocol — and every automated receive path keyed on it (the mupot-inbox.sh Stop hook:
-  // "if a message carries request_id, ACK with kind=ack") — uses to decide the recipient owes a
-  // reply. An ack that itself sets request_id asks its own recipient to ACK the ack, and their
-  // ack would ask the same of the next reply: the chain never terminates on its own. Refusing
-  // this at the send boundary (not by convention in a body string, which no automated acker
-  // reads) makes kind:"ack" non-ack-able by construction — nothing downstream can ever be
-  // instructed to ACK an ack, because an ack can never carry the field that instruction keys on.
-  // in_reply_to is untouched: an ack still must say which request it closes.
-  if (kind === 'ack' && input.requestId !== undefined) {
-    return {
-      ok: false,
-      reason: 'ack_cannot_request_ack',
-      detail: 'a kind:"ack" message may not itself set request_id — that would ask its recipient to ACK the ACK, and the chain would never terminate',
-    }
-  }
 
   if (input.projectId !== undefined) {
     if (typeof input.projectId !== 'string' || !isRef(input.projectId)) {
@@ -695,7 +695,7 @@ async function readAgentInboxForReader(
     for (const m of messages) m.seq = Number(m.seq)
     for (const m of messages) m.project_id = m.project_id ?? null
     for (const m of messages) m.target_seat = m.target_seat ?? null
-    await annotateMessageIntegrity(messages)
+    await annotateMessages(messages)
     return { ok: true, messages, remaining }
   } catch (err) {
     return { ok: false, reason: 'db_error', detail: err instanceof Error ? err.message : String(err) }
@@ -908,7 +908,7 @@ export async function leaseAgentInbox(
       m.project_id = m.project_id ?? null
       m.target_seat = m.target_seat ?? null
     }
-    await annotateMessageIntegrity(messages)
+    await annotateMessages(messages)
 
     // Post-check, mirroring readAgentInboxForReader. The pre-check above is NOT the fence —
     // it cannot be, because a fence flip between it and the UPDATE would slip through. The
@@ -1064,7 +1064,7 @@ export async function listDeadLetteredMessages(
       m.project_id = m.project_id ?? null
       m.target_seat = m.target_seat ?? null
     }
-    await annotateMessageIntegrity(messages)
+    await annotateMessages(messages)
 
     if (messages.length === 0 && await bearerFenceBlocks(env, tenant, input.agent)) {
       return { ok: false, reason: 'consumer_fenced' }
