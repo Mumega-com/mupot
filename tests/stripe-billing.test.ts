@@ -170,9 +170,15 @@ describe('Stripe Checkout & Subscription Billing Engine (Flight 7)', () => {
       TENANT_SLUG: 'gaf',
       BRAND: 'GAF Materials',
       DB: harness.db,
+      SESSIONS: {
+        get: async (key: string) => (key === 'sess:owner-session' ? JSON.stringify({ userId: 'owner-user', email: 'owner@gaf.com', role: 'owner', createdAt: '2026-09-01T00:00:00.000Z' }) : null),
+        put: async () => undefined,
+        delete: async () => undefined,
+      },
     } as unknown as Env
 
-    const req = new Request('http://localhost/status')
+    // /status is authenticated (P0 2026-09-02): drive it as a dashboard owner.
+    const req = new Request('http://localhost/status', { headers: { cookie: 'mupot_session=owner-session' } })
     const res = await billingRoutesApp.fetch(req, env)
     expect(res.status).toBe(200)
 

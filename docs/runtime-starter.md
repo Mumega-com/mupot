@@ -175,6 +175,11 @@ node "$HOME/.fleet/runtime/receipt-bundle.mjs" \
 Attach only the copied bundle when `manifest.json`, `cutover-gate.json`,
 `export-receipt.json`, and `manifest-check.json` all report `pass`.
 
+For a Mupot/Herdr Host-Go handoff, the passing `cutover-gate.json` must be
+`mupot-host-go-cutover/v1` and include the `no_live_sos_wiring` check. This
+neutral gate proves only that the selected host/runtime/control evidence chain
+has no live SOS dependency; it does not alter unrelated host services.
+
 ## Kubernetes Agent Host
 
 The Kubernetes template is under `deploy/kubernetes/agent-host`. The repository

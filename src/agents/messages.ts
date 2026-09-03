@@ -19,6 +19,8 @@ import { createBus } from '../bus'
 import { resolveAgentRef } from '../org/resolve'
 import { canOnSquad } from '../auth/capability'
 import { sha256Hex } from '../lib/canonical-json'
+import { TOKEN_LIVE_PREDICATE } from '../auth/token-lifecycle'
+import { evaluateReplyExpectation, type ReplyBasis } from './reply-expectation'
 
 // ── tunables ────────────────────────────────────────────────────────────────────────────
 const MAX_BODY_CHARS = 8000
@@ -69,9 +71,15 @@ export interface InboxMessage {
   body_length: number | null
   checksum_sha256: string | null
   is_intact: boolean | null
+  /** Does this message ask its recipient for a reply? Server-computed, never client-supplied.
+   *  See ./reply-expectation — one predicate over kind, request_id and the body prose token. */
+  expects_reply?: boolean
+  /** Which input decided expects_reply. 'body_token' is the weak, quotable one — a consumer
+   *  that acts only on structured intent should require 'request_id_field'. */
+  reply_basis?: ReplyBasis
 }
 
-async function annotateMessageIntegrity(messages: InboxMessage[]): Promise<void> {
+async function annotateMessages(messages: InboxMessage[]): Promise<void> {
   for (const message of messages) {
     const storedLength = typeof message.body_length === 'number'
       && Number.isInteger(message.body_length)
@@ -89,13 +97,58 @@ async function annotateMessageIntegrity(messages: InboxMessage[]): Promise<void>
       ? null
       : message.body.length === storedLength
         && await sha256Hex(message.body) === storedChecksum
+
+    // Reply expectation rides in the SAME pass as integrity, deliberately. Both are read-time
+    // annotations that every inbox surface needs, and three call sites already exist (read,
+    // lease, dead-letters). A second, separate pass would be three more places to forget one.
+    const expectation = evaluateReplyExpectation({
+      kind: message.kind,
+      requestId: message.request_id,
+      body: message.body,
+    })
+    message.expects_reply = expectation.expected
+    message.reply_basis = expectation.basis
   }
 }
 
 export interface InboxResult {
   ok: true
   messages: InboxMessage[]
+  /**
+   * Unread rows NOT in `messages`.
+   *
+   * WAS POLYSEMOUS AND IS NOT ANY MORE. This field used to be counted after the
+   * consuming path had already marked the returned rows read (see the UPDATEs
+   * above the count), so on `peek` it INCLUDED the returned rows and on a
+   * consume it EXCLUDED them — one field, two meanings, selected by a different
+   * argument. A caller that learned the rule on one path and applied it on the
+   * other was silently wrong, and nothing in the response said which reading
+   * applied.
+   *
+   * It now means the same thing on both paths: what is left over, never
+   * including what you were just handed. Prefer `complete` over doing arithmetic
+   * on this.
+   */
   remaining: number
+  /**
+   * TRUE when `messages` is everything there was. FALSE when the read was capped
+   * and more exists.
+   *
+   * This exists because deriving truncation from a length and a count is the
+   * single most reliable way to manufacture a false measurement in this system.
+   * On 2026-09-03 that same mistake was made FOUR times in one night by three
+   * different agents across two substrates — the seatlink bridge dropped
+   * genuinely-unread mail; a gate consumed rows it never read, unrecoverably; an
+   * agent-profile page rendered a capped count as a total in the very commit
+   * arguing that an unknown must never be presented as a measurement; and a CI
+   * watcher read a half-populated result as settled. Every one was committed by
+   * someone actively hunting the same bug elsewhere.
+   *
+   * That is not a diligence problem. A capped response is successful,
+   * well-formed, and indistinguishable from a complete one at the call site, so
+   * the correct behaviour has to be the one that requires no work.
+   */
+  complete: boolean
 }
 
 export type SendFailure = {
@@ -113,6 +166,7 @@ export type SendFailure = {
     | 'project_access_denied'
     | 'request_id_conflict'
     | 'dispatch_fenced'
+    | 'send_target_not_visible'
     | 'inbox_full'
     | 'db_error'
   detail?: string
@@ -124,6 +178,13 @@ export type InboxFailure = {
   detail?: string
 }
 
+interface GuestVisibilityFence {
+  squadId: string
+  scopeType: CapabilityGrant['scope_type']
+  scopeId: string | null
+  capability: CapabilityGrant['capability']
+}
+
 interface Opts {
   now?: () => string
   idGen?: () => string
@@ -133,6 +194,8 @@ interface Opts {
   systemProjectAttribution?: boolean
   /** Internal atomic fence for a Routine dispatch envelope. */
   routineRunFence?: { runId: string; projectId: string }
+  /** Current durable guest-membership authority must still exist in the message INSERT. */
+  guestVisibilityFence?: GuestVisibilityFence
 }
 
 function isRef(v: string): boolean {
@@ -226,10 +289,50 @@ export async function sendAgentMessage(
     if (access !== null) return { ok: false, reason: access }
   }
 
-  if (input.targetSeat !== undefined && !isRef(input.targetSeat))
-    return { ok: false, reason: 'invalid_body', detail: 'target_seat must be a valid reference string' }
-
   const now = opts.now ?? (() => new Date().toISOString())
+
+  // mupot#1272 adversarial-gate P1 (kasra-code, flight-20260902-seat-bind, round 2): the
+  // seat-bind fix earlier in this PR made `inbox`/`inbox_lease` read-side STRICT — a caller can
+  // only ever read the ONE seat its own live token is labelled with (resolveBoundSeat,
+  // src/mcp/index.ts). Left alone, `send`'s write side only checked isRef(targetSeat) — any
+  // syntactically valid string, typo or case-mismatch included. A `target_seat` that matches no
+  // LIVE token label for the recipient creates an ORPHAN row: no `inbox`/`inbox_lease` caller can
+  // ever be bound to that seat (there is no such token), `inbox_ack` needs an id nobody can
+  // obtain, and `inbox_dead_letters` needs `dead_lettered_at`, which only the LEASE path sets —
+  // and lease can never see the row either, so `delivery_attempts` stays 0 forever. Worse,
+  // MAX_UNREAD_PER_RECIPIENT is per `to_agent` and seat-BLIND: enough orphans pin the whole
+  // agent's inbox at `inbox_full`, for every seat, with no drain path — a permanent DoS any
+  // peer with send rights could trigger with nothing more than a typo. Proven A/B against base
+  // by kasra-review on this same PR. Validating at the WRITE side, once, here — rather than in
+  // the MCP `send` tool handler — is deliberate: this primitive is also the REST send path
+  // (`POST /api/inbox/send`, src/agents/inbox-routes.ts), and both must refuse the same orphan
+  // shape, not just the MCP one.
+  //
+  // mupot#1272 adversarial-gate round 3 (kasra-review): the FIRST version of this guard refused
+  // with a distinct `seat_unknown` reason + a confirming detail string — which is itself a new
+  // enumeration oracle. Proven live: any caller who can send to agent X can distinguish
+  // "seat exists but is not X's live label" from "no such seat at all" by the refusal alone,
+  // side-effect-free, and seat labels are NOT opaque (`oauth:<email-localpart>`,
+  // `[preset:<id>:<scope>]`, machine names — see the label-corpus finding on this PR's earlier
+  // review round). Collapsed onto the SAME `send_target_not_visible` string this function
+  // already uses for its OTHER internal existence/visibility refusals a few lines below (and
+  // that `sendToRef` collapses non-admin/invisible-target failures onto, #401) — no detail, no
+  // distinguishing shape. A sender cannot tell "bad seat" from "bad recipient" from any other
+  // reason this string already covers.
+  if (input.targetSeat !== undefined) {
+    if (!isRef(input.targetSeat))
+      return { ok: false, reason: 'invalid_body', detail: 'target_seat must be a valid reference string' }
+    const liveSeatToken = await env.DB.prepare(
+      `SELECT 1 FROM member_tokens t
+        WHERE t.tenant = ?1 AND t.agent_id = ?2 AND t.label = ?3
+          AND ${TOKEN_LIVE_PREDICATE('?4')}
+        LIMIT 1`,
+    ).bind(tenant, input.toAgent, input.targetSeat, now()).first()
+    if (!liveSeatToken) {
+      return { ok: false, reason: 'send_target_not_visible' }
+    }
+  }
+
   const idGen = opts.idGen ?? (() => crypto.randomUUID())
   const routineFence = opts.routineRunFence
   if (routineFence && input.projectId !== routineFence.projectId) {
@@ -257,7 +360,7 @@ export async function sendAgentMessage(
   const bodyLength = input.body.length
   const bodyChecksum = await sha256Hex(input.body)
   try {
-    const values = [
+    const values: unknown[] = [
       id,
       tenant,
       input.toAgent,
@@ -274,15 +377,28 @@ export async function sendAgentMessage(
       bodyLength,
       bodyChecksum,
     ]
+    let guestVisibilitySql = ''
+    const guestVisibilityFence = opts.guestVisibilityFence
+    if (guestVisibilityFence) {
+      guestVisibilitySql = guestVisibilityWriteFenceSql(values.length + 1)
+      values.push(
+        guestVisibilityFence.squadId,
+        guestVisibilityFence.scopeType,
+        guestVisibilityFence.scopeId,
+        guestVisibilityFence.capability,
+      )
+    }
+    const routineRunParam = values.length + 1
     const result = routineFence
       ? await env.DB.prepare(
         `INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id, target_seat, body_length, checksum_sha256)
               SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?12, ?13, ?14, ?15
                WHERE (SELECT COUNT(*) FROM agent_messages
                        WHERE tenant = ?2 AND to_agent = ?3 AND read_at IS NULL) < ?11
+                 ${guestVisibilitySql}
                  AND EXISTS (
                    SELECT 1 FROM routine_runs rr
-                    WHERE rr.id = ?16 AND rr.tenant = ?2 AND rr.project_id = ?12
+                    WHERE rr.id = ?${routineRunParam} AND rr.tenant = ?2 AND rr.project_id = ?12
                       AND rr.status = 'observing'
                       AND NOT EXISTS (
                         SELECT 1 FROM routine_run_events requested
@@ -295,7 +411,8 @@ export async function sendAgentMessage(
         `INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id, target_seat, body_length, checksum_sha256)
               SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?12, ?13, ?14, ?15
                WHERE (SELECT COUNT(*) FROM agent_messages
-                       WHERE tenant = ?2 AND to_agent = ?3 AND read_at IS NULL) < ?11`,
+                       WHERE tenant = ?2 AND to_agent = ?3 AND read_at IS NULL) < ?11
+                 ${guestVisibilitySql}`,
       ).bind(...values).run()
     if ((result.meta?.changes ?? 0) === 0) {
       if (routineFence && !await routineDispatchAllowed(env, tenant, routineFence)) {
@@ -310,6 +427,25 @@ export async function sendAgentMessage(
       if (input.requestId !== undefined) {
         const existing = await findBySenderRequestId(env, tenant, input.fromAgent, input.requestId)
         if (existing) return idempotentOrConflict(existing, input, kind)
+      }
+      if (guestVisibilityFence) {
+        const guestStillAllowed = await guestVisibilityFenceIsCurrent(
+          env,
+          input.fromMember,
+          input.toAgent,
+          guestVisibilityFence,
+        )
+        const projectStillAllowed = input.projectId !== undefined
+          && await validateMessageProjectAccess(
+            env,
+            input.projectId,
+            input.fromAgent,
+            input.toAgent,
+            opts.systemProjectAttribution === true,
+          ) === null
+        if (!guestStillAllowed && !projectStillAllowed) {
+          return { ok: false, reason: 'send_target_not_visible' }
+        }
       }
       return { ok: false, reason: 'inbox_full', detail: `recipient at unread cap ${maxUnread}` }
     }
@@ -562,13 +698,30 @@ async function readAgentInboxForReader(
     let remaining = 0
     if (reader === 'signed') {
       const seatSql = targetSeat ? 'AND (target_seat = ?4 OR target_seat IS NULL)' : 'AND target_seat IS NULL'
-      const binds = targetSeat
+      const binds: (string | number | null | undefined)[] = targetSeat
         ? [tenant, input.agent, signedKeyFingerprint, targetSeat]
         : [tenant, input.agent, signedKeyFingerprint]
+      // The cursor MUST be in the COUNT, not only in the page. Without it a
+      // paginating caller is told rows exist below a cursor it has already
+      // passed, so page two of two reports a phantom remainder and the loop
+      // never terminates. Found by test, not by reading.
+      // NOTE: unreachable today and deliberately kept. readVerifiedSignedAgentInbox's
+      // input type has no sinceSeq, so no caller can reach the signed path with a
+      // cursor — a mutation removing this survives, and that is expected rather than
+      // an untested branch. It stays so that adding sinceSeq to the signed reader
+      // later cannot silently reintroduce the phantom-remainder bug the bearer path
+      // had. Reported as a surviving mutation rather than buried.
+      const sinceSql = sinceSeq > 0 ? `AND seq > ?${binds.length + 1}` : ''
+      if (sinceSeq > 0) binds.push(sinceSeq)
+      // The cursor MUST be in the count, not only in the page. Without it a
+      // paginating caller is told rows exist below its cursor that it has
+      // already passed, so page two of two reports a phantom remainder and the
+      // loop never terminates. Caught by test, not by reading.
       const remainingRow = await env.DB.prepare(
         `SELECT COUNT(*) AS n FROM agent_messages
           WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL
             ${seatSql}
+            ${sinceSql}
             AND EXISTS (SELECT 1 FROM agent_inbox_fences
                          WHERE tenant = ?1 AND agent_id = ?2
                            AND mode = 'signed_only' AND key_fingerprint = ?3)`,
@@ -576,13 +729,16 @@ async function readAgentInboxForReader(
       remaining = Number(remainingRow?.n ?? 0)
     } else {
       const seatSql = targetSeat ? 'AND (target_seat = ?3 OR target_seat IS NULL)' : 'AND target_seat IS NULL'
-      const binds = targetSeat
+      const binds: (string | number | null)[] = targetSeat
         ? [tenant, input.agent, targetSeat]
         : [tenant, input.agent]
+      const sinceSql = sinceSeq > 0 ? `AND seq > ?${binds.length + 1}` : ''
+      if (sinceSeq > 0) binds.push(sinceSeq)
       const remainingRow = await env.DB.prepare(
         `SELECT COUNT(*) AS n FROM agent_messages
           WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL
             ${seatSql}
+            ${sinceSql}
             AND COALESCE((SELECT mode FROM agent_inbox_fences
                            WHERE tenant = ?1 AND agent_id = ?2), 'bearer_only') = 'bearer_only'`,
       ).bind(...binds).first<{ n: number }>()
@@ -593,8 +749,13 @@ async function readAgentInboxForReader(
     for (const m of messages) m.seq = Number(m.seq)
     for (const m of messages) m.project_id = m.project_id ?? null
     for (const m of messages) m.target_seat = m.target_seat ?? null
-    await annotateMessageIntegrity(messages)
-    return { ok: true, messages, remaining }
+    await annotateMessages(messages)
+    // On the CONSUMING path the returned rows were already marked read above, so
+    // this count already excludes them. On the PEEK path nothing was marked, so
+    // the count still includes them and has to be reduced by what we are handing
+    // back. Same meaning either way afterwards: what is LEFT OVER.
+    const leftOver = peek ? Math.max(0, remaining - messages.length) : remaining
+    return { ok: true, messages, remaining: leftOver, complete: leftOver === 0 }
   } catch (err) {
     return { ok: false, reason: 'db_error', detail: err instanceof Error ? err.message : String(err) }
   }
@@ -666,6 +827,15 @@ export interface LeaseResult {
   messages: LeasedMessage[]
   /** Unread, not dead-lettered, not currently leased — i.e. how many MORE could be leased now. */
   remaining: number
+  /**
+   * TRUE when this lease took everything currently leasable. Same contract as
+   * InboxResult.complete, and present for the same reason: every read surface
+   * should answer "did I get it all?" without the caller doing arithmetic.
+   * Dead-lettered rows are NOT leasable, so they do not make a lease incomplete —
+   * `dead_lettered` reports those separately and a non-zero value means a seat is
+   * stuck, which is a different problem from a capped read.
+   */
+  complete: boolean
   /** Unread rows parked by the dead-letter rule. Non-zero means a seat is stuck. */
   dead_lettered: number
   lease_seconds: number
@@ -806,7 +976,7 @@ export async function leaseAgentInbox(
       m.project_id = m.project_id ?? null
       m.target_seat = m.target_seat ?? null
     }
-    await annotateMessageIntegrity(messages)
+    await annotateMessages(messages)
 
     // Post-check, mirroring readAgentInboxForReader. The pre-check above is NOT the fence —
     // it cannot be, because a fence flip between it and the UPDATE would slip through. The
@@ -829,10 +999,12 @@ export async function leaseAgentInbox(
          AND (CASE WHEN ?4 IS NULL THEN target_seat IS NULL ELSE (target_seat = ?4 OR target_seat IS NULL) END)`,
     ).bind(tenant, input.agent, nowIso, targetSeat).first<{ leasable: number | null; dead: number | null }>()
 
+    const leasableLeft = Number(counts?.leasable ?? 0)
     return {
       ok: true,
       messages,
-      remaining: Number(counts?.leasable ?? 0),
+      remaining: leasableLeft,
+      complete: leasableLeft === 0,
       dead_lettered: Number(counts?.dead ?? 0),
       lease_seconds: leaseSeconds,
     }
@@ -962,7 +1134,7 @@ export async function listDeadLetteredMessages(
       m.project_id = m.project_id ?? null
       m.target_seat = m.target_seat ?? null
     }
-    await annotateMessageIntegrity(messages)
+    await annotateMessages(messages)
 
     if (messages.length === 0 && await bearerFenceBlocks(env, tenant, input.agent)) {
       return { ok: false, reason: 'consumer_fenced' }
@@ -1115,6 +1287,218 @@ export type SendToRefResult =
       detail?: string
     }
 
+// Case (a) visibility: home squad OR guest membership on a squad the sender can observe.
+// #392 confined send to the recipient HOME squad only. That made guest members of a
+// shared flight squad (muvps-loom is lead on hadi-mac, home 813ca010) roster-visible
+// but unreachable — send_target_not_visible. Shared membership is the same authority
+// as joining the squad; it does not widen to tenant-wide send. Non-admin failures still
+// collapse to send_target_not_visible (no existence oracle).
+function ambientVisibilityGrants(
+  grants: CapabilityGrant[],
+  memberId: string,
+): Array<Pick<CapabilityGrant, 'scope_type' | 'scope_id' | 'capability'>> {
+  const seen = new Set<string>()
+  const result: Array<Pick<CapabilityGrant, 'scope_type' | 'scope_id' | 'capability'>> = []
+  for (const grant of grants) {
+    if (grant.member_id !== memberId) continue
+    const key = `${grant.scope_type}\u0000${grant.scope_id ?? ''}\u0000${grant.capability}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    result.push({
+      scope_type: grant.scope_type,
+      scope_id: grant.scope_id,
+      capability: grant.capability,
+    })
+  }
+  return result
+}
+
+function capabilityRankSql(value: string): string {
+  return `(CASE ${value}
+    WHEN 'observer' THEN 1
+    WHEN 'member' THEN 2
+    WHEN 'lead' THEN 3
+    WHEN 'admin' THEN 4
+    WHEN 'owner' THEN 5
+    ELSE 0 END)`
+}
+
+async function recipientVisibilityOnSenderSquads(
+  env: Env,
+  memberId: string,
+  grants: CapabilityGrant[],
+  recipient: { id: string; squad_id: string },
+): Promise<{ visible: boolean; guestFence?: GuestVisibilityFence }> {
+  if (await canOnSquad(env, grants, recipient.squad_id, 'observer')) {
+    return { visible: true }
+  }
+
+  // Guest visibility is one bounded query, not one canOnSquad call per membership.
+  // The ambient grants are a ceiling: a row is usable only when the same grant still
+  // exists on a durable capability plane at this read.
+  const ambient = ambientVisibilityGrants(grants, memberId)
+  if (ambient.length === 0) return { visible: false }
+  const ambientJson = JSON.stringify(ambient)
+  const row = await env.DB.prepare(
+    `WITH ambient(scope_type, scope_id, capability) AS (
+            SELECT json_extract(value, '$.scope_type'),
+                   json_extract(value, '$.scope_id'),
+                   json_extract(value, '$.capability')
+              FROM json_each(?4)
+          ),
+          durable_grants(scope_type, scope_id, capability) AS (
+            SELECT c.scope_type, c.scope_id, a.capability
+              FROM capabilities c
+              JOIN ambient a
+                ON a.scope_type = c.scope_type
+               AND a.scope_id IS c.scope_id
+               AND ${capabilityRankSql('c.capability')} >= ${capabilityRankSql('a.capability')}
+             WHERE c.member_id = ?1
+            UNION ALL
+            SELECT 'squad', cg.squad_id, a.capability
+              FROM channel_capability_grants cg
+              JOIN ambient a
+                ON a.scope_type = 'squad'
+               AND a.scope_id = cg.squad_id
+               AND ${capabilityRankSql('cg.capability')} >= ${capabilityRankSql('a.capability')}
+             WHERE cg.member_id = ?1
+          )
+     SELECT m.squad_id, d.scope_type, d.scope_id, d.capability
+       FROM memberships m
+       JOIN squads s ON s.id = m.squad_id
+       JOIN durable_grants d
+         ON d.scope_type = 'org'
+         OR (d.scope_type = 'squad' AND d.scope_id = m.squad_id)
+         OR (d.scope_type = 'department' AND d.scope_id = s.department_id)
+      WHERE m.agent_id = ?2
+        AND m.squad_id <> ?3
+      LIMIT 1`,
+  ).bind(memberId, recipient.id, recipient.squad_id, ambientJson).first<{
+    squad_id: string
+    scope_type: CapabilityGrant['scope_type']
+    scope_id: string | null
+    capability: CapabilityGrant['capability']
+  }>()
+  if (!row) return { visible: false }
+  return {
+    visible: true,
+    guestFence: {
+      squadId: row.squad_id,
+      scopeType: row.scope_type,
+      scopeId: row.scope_id,
+      capability: row.capability,
+    },
+  }
+}
+
+function guestVisibilityWriteFenceSql(first: number): string {
+  const squad = `?${first}`
+  const scopeType = `?${first + 1}`
+  const scopeId = `?${first + 2}`
+  const capability = `?${first + 3}`
+  return `AND (
+    EXISTS (
+      SELECT 1
+        FROM memberships m
+        JOIN squads s ON s.id = m.squad_id
+       WHERE m.agent_id = ?3
+         AND m.squad_id = ${squad}
+         AND (
+           ${scopeType} = 'org'
+           OR (${scopeType} = 'squad' AND ${scopeId} = m.squad_id)
+           OR (${scopeType} = 'department' AND ${scopeId} = s.department_id)
+         )
+         AND (
+           EXISTS (
+             SELECT 1 FROM capabilities c
+              WHERE c.member_id = ?5
+                AND c.scope_type = ${scopeType}
+                AND c.scope_id IS ${scopeId}
+                AND ${capabilityRankSql('c.capability')} >= ${capabilityRankSql(capability)}
+           )
+           OR (
+             ${scopeType} = 'squad'
+             AND EXISTS (
+               SELECT 1 FROM channel_capability_grants cg
+                WHERE cg.member_id = ?5
+                  AND cg.squad_id = ${scopeId}
+                  AND ${capabilityRankSql('cg.capability')} >= ${capabilityRankSql(capability)}
+             )
+           )
+         )
+    )
+    OR (
+      ?12 IS NOT NULL
+      AND EXISTS (
+        SELECT 1 FROM projects p
+         WHERE p.id = ?12
+           AND p.status <> 'archived'
+           AND EXISTS (
+             SELECT 1 FROM memberships sender_membership
+             JOIN project_squad_access sender_access
+               ON sender_access.squad_id = sender_membership.squad_id
+              AND sender_access.project_id = p.id
+              WHERE sender_membership.agent_id = ?4
+           )
+           AND EXISTS (
+             SELECT 1 FROM memberships recipient_membership
+             JOIN project_squad_access recipient_access
+               ON recipient_access.squad_id = recipient_membership.squad_id
+              AND recipient_access.project_id = p.id
+              WHERE recipient_membership.agent_id = ?3
+           )
+      )
+    )
+  )`
+}
+
+async function guestVisibilityFenceIsCurrent(
+  env: Env,
+  memberId: string,
+  recipientAgentId: string,
+  fence: GuestVisibilityFence,
+): Promise<boolean> {
+  const row = await env.DB.prepare(
+    `SELECT 1
+       FROM memberships m
+       JOIN squads s ON s.id = m.squad_id
+      WHERE m.agent_id = ?1
+        AND m.squad_id = ?2
+        AND (
+          ?4 = 'org'
+          OR (?4 = 'squad' AND ?5 = m.squad_id)
+          OR (?4 = 'department' AND ?5 = s.department_id)
+        )
+        AND (
+          EXISTS (
+            SELECT 1 FROM capabilities c
+             WHERE c.member_id = ?3
+               AND c.scope_type = ?4
+               AND c.scope_id IS ?5
+               AND ${capabilityRankSql('c.capability')} >= ${capabilityRankSql('?6')}
+          )
+          OR (
+            ?4 = 'squad'
+            AND EXISTS (
+              SELECT 1 FROM channel_capability_grants cg
+               WHERE cg.member_id = ?3
+                 AND cg.squad_id = ?5
+                 AND ${capabilityRankSql('cg.capability')} >= ${capabilityRankSql('?6')}
+            )
+          )
+        )
+      LIMIT 1`,
+  ).bind(
+    recipientAgentId,
+    fence.squadId,
+    memberId,
+    fence.scopeType,
+    fence.scopeId,
+    fence.capability,
+  ).first()
+  return row !== null
+}
+
 // ── resolveVisibleSendTarget — the authorized pre-send visibility primitive ────────────
 // Oracle-close repair (P0 fix-forward on PR #868/e117832, Loom's gate finding): the
 // central-command mention-rate-wall charge (src/channels/index.ts dispatchMention) used to
@@ -1125,22 +1509,21 @@ export type SendToRefResult =
 // enumeration oracle, same class as BLOCK-3 above, reintroduced through the budget side-channel.
 //
 // This is CASE (a) of sendToRef's own gate below — resolveAgentRef, then (for a non-admin)
-// canOnSquad ≥observer — factored out so a pre-send caller (e.g. a rate-limit charge gate) can
-// ask "is this ref a REAL, VISIBLE-TO-THIS-CALLER recipient" using the EXACT SAME check
-// sendToRef applies before it will ever touch sendAgentMessage, rather than reimplementing (and
-// risking drift from) that logic. Any non-admin failure mode — doesn't resolve, resolves
-// ambiguously, resolves but isn't squad-visible — collapses to the same 'send_target_not_visible'
-// so nothing downstream of this primitive (a charge, a log line, a timing difference) can leak
-// which case occurred.
+// recipientVisibleOnSenderSquads — factored out so a pre-send caller (e.g. a rate-limit charge
+// gate) can ask "is this ref a REAL, VISIBLE-TO-THIS-CALLER recipient" using the EXACT SAME
+// check sendToRef applies before it will ever touch sendAgentMessage, rather than
+// reimplementing (and risking drift from) that logic. Any non-admin failure mode — doesn't
+// resolve, resolves ambiguously, resolves but isn't squad-visible — collapses to the same
+// 'send_target_not_visible' so nothing downstream of this primitive (a charge, a log line, a
+// timing difference) can leak which case occurred.
 //
 // Deliberately does NOT implement sendToRef's case (b) projectId fallback: that fallback is only
 // authoritative via sendAgentMessage's own project-access check (validateMessageProjectAccess),
 // which this resolve-only primitive cannot decide. A caller with a projectId must still go
 // through sendToRef itself for the send-time decision — this primitive is for pre-send
 // visibility gating (e.g. rate-limit charge keys) only, never a substitute for the real send.
-// sendToRef itself is intentionally left untouched by this addition (zero behavior change to
-// already-reviewed, already-gated send-authz code) — it continues to implement case (a) and (b)
-// inline exactly as before.
+// sendToRef consumes this decision and carries any matched guest grant into the atomic message
+// INSERT, so a membership/grant removed after preflight cannot authorize the write.
 export async function resolveVisibleSendTarget(
   env: Env,
   toRef: string,
@@ -1155,8 +1538,15 @@ export async function resolveVisibleSendTarget(
     return { ok: false, reason: resolved.reason === 'ambiguous' ? 'recipient_ambiguous' : 'recipient_not_found' }
   }
   if (authz.isAdmin) return { ok: true, value: resolved.value }
-  const squadVisible = await canOnSquad(env, authz.grants, resolved.value.squad_id, 'observer')
-  if (!squadVisible) return { ok: false, reason: 'send_target_not_visible' }
+  const memberIds = [...new Set(authz.grants.map((grant) => grant.member_id).filter(Boolean))]
+  if (memberIds.length !== 1) return { ok: false, reason: 'send_target_not_visible' }
+  const visibility = await recipientVisibilityOnSenderSquads(
+    env,
+    memberIds[0],
+    authz.grants,
+    resolved.value,
+  )
+  if (!visibility.visible) return { ok: false, reason: 'send_target_not_visible' }
   return { ok: true, value: resolved.value }
 }
 
@@ -1186,8 +1576,19 @@ export async function sendToRef(
   // the fallback-collapse below either) and is only computed — and only matters — once we know
   // we're in the non-admin path.
   let squadVisible = true
+  let guestVisibilityFence: GuestVisibilityFence | undefined
   if (!authz.isAdmin) {
-    squadVisible = await canOnSquad(env, authz.grants, resolved.value.squad_id, 'observer')
+    if (authz.grants.some((grant) => grant.member_id !== input.fromMember)) {
+      return { ok: false, reason: 'send_target_not_visible' }
+    }
+    const visibility = await recipientVisibilityOnSenderSquads(
+      env,
+      input.fromMember,
+      authz.grants,
+      resolved.value,
+    )
+    squadVisible = visibility.visible
+    guestVisibilityFence = visibility.guestFence
     // Case (a) failed. Case (b) can only save it if a projectId is attached — otherwise there
     // is no other authorization surface to consult, so refuse now, before ever calling
     // sendAgentMessage (no DB write attempted, no existence oracle for the target).
@@ -1210,7 +1611,7 @@ export async function sendToRef(
       targetSeat: input.targetSeat,
     },
     authz,
-    opts,
+    guestVisibilityFence ? { ...opts, guestVisibilityFence } : opts,
   )
   if (!res.ok) {
     // Existence-oracle closure (re-gate fix, #401): once squad-visibility (case a) has failed,

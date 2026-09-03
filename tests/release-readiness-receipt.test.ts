@@ -33,19 +33,123 @@ function sha256(path: string) {
 const HOST_BASE_URL = 'https://pot.example.org'
 const HOST_TENANT = 'tenant-a'
 const RELEASE_SHA = 'a'.repeat(40)
+const OTHER_RELEASE_SHA = 'b'.repeat(40)
+const MISSING = Symbol('missing')
+const MALFORMED_SHA_VALUES = [
+  ['missing', MISSING],
+  ['null', null],
+  ['array-of-valid-sha', [RELEASE_SHA]],
+  ['object', { sha: RELEASE_SHA }],
+  ['number', 123],
+  ['uppercase', RELEASE_SHA.toUpperCase()],
+] as const
 
-function hostProbeReceipt() {
+const RELEASE_SHA_BINDINGS = [
+  { file: 'release-candidate-check.json', phase: 'prepublication', field: 'commit', check: 'release_candidate_commit_matches_release_sha' },
+  { file: 'release-integrity-check.json', phase: 'final', field: 'git_head_sha', check: 'release_integrity_git_head_sha_matches_release_sha' },
+  { file: 'release-integrity-check.json', phase: 'final', field: 'git_tag_sha', check: 'release_integrity_git_tag_sha_matches_release_sha' },
+  { file: 'release-integrity-check.json', phase: 'final', field: 'github_tag_sha', check: 'release_integrity_github_tag_sha_matches_release_sha' },
+] as const
+
+const V030_RELEASE_SHA_BINDINGS = [
+  { file: 'fresh-install-check.json', release_sha_path: 'target.release_sha' },
+  { file: 'host-go/manifest.json', release_sha_path: 'inputs.release_sha' },
+  { file: 'work-lifecycle-check.json', release_sha_path: 'target.release_sha' },
+  { file: 'external-pr-cycle-check.json', release_sha_path: 'target.release_sha' },
+  { file: 'staging-recovery-check.json', release_sha_path: 'target.git_sha' },
+] as const
+
+function releaseShaPathFor(file: string) {
+  return V030_RELEASE_SHA_BINDINGS.find((binding) => binding.file === file)?.release_sha_path
+}
+
+function setReceiptReleaseSha(receipt: Record<string, any>, releaseShaPath: string, value: unknown) {
+  switch (releaseShaPath) {
+    case 'target.release_sha':
+      receipt.target ??= {}
+      if (value === MISSING) delete receipt.target.release_sha
+      else receipt.target.release_sha = value
+      return
+    case 'inputs.release_sha':
+      receipt.inputs ??= {}
+      if (value === MISSING) delete receipt.inputs.release_sha
+      else receipt.inputs.release_sha = value
+      return
+    case 'target.git_sha':
+      receipt.target ??= {}
+      if (value === MISSING) delete receipt.target.git_sha
+      else receipt.target.git_sha = value
+      return
+    default:
+      throw new Error(`unsupported test release SHA path: ${releaseShaPath}`)
+  }
+}
+
+function v030Contract() {
+  return JSON.parse(readFileSync(join(process.cwd(), 'docs/releases/v0.30.0-contract.json'), 'utf8'))
+}
+
+const V030_CONTRACT_MUTATIONS = [
+  ['one missing SHA binding', (contract: any) => {
+    delete contract.receipts.find((receipt: any) => receipt.release_sha_path).release_sha_path
+  }],
+  ['all missing SHA bindings', (contract: any) => {
+    contract.receipts = contract.receipts.map(({ release_sha_path: _releaseShaPath, ...receipt }: any) => receipt)
+  }],
+  ['missing receipt', (contract: any) => {
+    contract.receipts = contract.receipts.slice(1)
+  }],
+  ['altered receipt phase', (contract: any) => {
+    contract.receipts[0].phases = ['final']
+  }],
+  ['altered receipt type', (contract: any) => {
+    contract.receipts[0].receipt_type = 'mupot-fresh-install/v2'
+  }],
+  ['extra receipt', (contract: any) => {
+    contract.receipts.push({
+      objective: 'extra',
+      file: 'extra-check.json',
+      receipt_type: 'mupot-extra/v1',
+      phases: ['prepublication', 'final'],
+    })
+  }],
+] as const
+
+function hostProbeReceipt(releaseSha?: string) {
+  const checks = [
+    { ok: true, component: 'cutover-probe', check: 'base_url_valid' },
+    { ok: true, component: 'cutover-probe', check: 'target_agent_present', agent: 'agent-one' },
+    { ok: true, component: 'cutover-probe', check: 'probe_action_selected' },
+    ...(releaseSha ? [
+      { ok: true, component: 'cutover-probe', check: 'release_sha_valid' },
+      { ok: true, component: 'cutover-probe', check: 'release_health_matches', status: 200 },
+    ] : []),
+    { ok: true, component: 'cutover-probe', check: 'agent_token_present', env: 'MUPOT_AGENT_TOKEN' },
+    { ok: true, component: 'cutover-probe', check: 'inbox_probe_queued', status: 202, response_ok: true },
+    { ok: true, component: 'cutover-probe', check: 'owner_token_present', env: 'MUPOT_OWNER_TOKEN' },
+    { ok: true, component: 'cutover-probe', check: 'control_request_queued', agent_id: 'agent-one', verb: 'start', status: 202, response_ok: true },
+  ]
   return {
     receipt_type: 'mupot-fleet-cutover-probe/v1',
     generated_at: '2026-07-08T00:00:30.000Z',
     status: 'pass',
-    summary: { status: 'pass', passed: 2, failed: 0, warnings: 0 },
-    inputs: { base_url: HOST_BASE_URL, agent: 'agent-one', queue_inbox: true, control_verbs: ['start'] },
+    summary: { status: 'pass', passed: checks.length, failed: 0, warnings: 0 },
+    inputs: {
+      base_url: HOST_BASE_URL,
+      agent: 'agent-one',
+      ...(releaseSha ? { release_sha: releaseSha } : {}),
+      queue_inbox: true,
+      control_verbs: ['start'],
+      inbox_kind: 'request',
+      agent_token_env: 'MUPOT_AGENT_TOKEN',
+      owner_token_env: 'MUPOT_OWNER_TOKEN',
+    },
+    ...(releaseSha ? { health: { ok: true, service: 'mupot', commit: releaseSha, clean: true } } : {}),
     actions: [
-      { kind: 'inbox_probe', target_agent: 'agent-one', request_id: 'probe-1-inbox', ok: true },
-      { kind: 'control_request', target_agent: 'agent-one', verb: 'start', ok: true },
+      { kind: 'inbox_probe', target_agent: 'agent-one', request_id: 'probe-1-inbox', status: 202, ok: true, response: { ok: true } },
+      { kind: 'control_request', target_agent: 'agent-one', verb: 'start', status: 202, ok: true, nonce: 'nonce-start', response: { ok: true } },
     ],
-    checks: [{ ok: true, component: 'cutover-probe', check: 'inbox_probe_queued' }],
+    checks,
   }
 }
 
@@ -97,9 +201,9 @@ function controlReceipt(verb: 'start' | 'stop') {
   }
 }
 
-async function writeHostBundle(exportDir: string) {
+async function writeHostBundle(exportDir: string, releaseSha?: string) {
   const sourceDir = tempDir()
-  writeJson(join(sourceDir, 'probe-start.json'), hostProbeReceipt())
+  writeJson(join(sourceDir, 'probe-start.json'), hostProbeReceipt(releaseSha))
   writeJson(join(sourceDir, 'host.json'), hostReceipt())
   writeJson(join(sourceDir, 'runtime-agent-one.json'), runtimeReceipt())
   writeJson(join(sourceDir, 'control-start.json'), controlReceipt('start'))
@@ -112,26 +216,125 @@ async function writeHostBundle(exportDir: string) {
     controlPath: '/tmp/control.json',
     verifyOnly: true,
     requiredControlVerbs: ['start', 'stop'],
+    ...(releaseSha ? { releaseSha } : {}),
   })
   const exported = exportBundle({ outDir: sourceDir, exportDir })
   if (exported.status !== 'pass') throw new Error('failed to build passing host bundle fixture')
 }
 
-async function writeBundle(dir: string, mutate?: (dir: string) => void) {
+function legacyCutoverReceipt() {
+  const checks = [
+    ['host', 'host.json', 'mupot-fleet-host-receipt/v1'],
+    ['runtime', 'runtime-agent-one.json', 'mupot-fleet-runtime-receipt/v1'],
+    ['control', 'control-start.json', 'mupot-fleet-control-receipt/v1'],
+    ['control', 'control-stop.json', 'mupot-fleet-control-receipt/v1'],
+  ].flatMap(([label, path, type]) => [
+    { ok: true, component: 'cutover-receipt', check: `${label}_receipt_read`, path },
+    { ok: true, component: 'cutover-receipt', check: `${label}_receipt_type`, path, expected: type, actual: type },
+    { ok: true, component: 'cutover-receipt', check: `${label}_receipt_status_pass`, path, actual: 'pass' },
+  ])
+  checks.push(
+    { ok: true, component: 'cutover-receipt', check: 'runtime_receipt_for_agent', agent_id: 'agent-one', path: 'runtime-agent-one.json' },
+    { ok: true, component: 'cutover-receipt', check: 'runtime_signed_attach_for_agent', agent_id: 'agent-one', path: 'runtime-agent-one.json' },
+    { ok: true, component: 'cutover-receipt', check: 'runtime_inbox_handoff_for_agent', agent_id: 'agent-one', path: 'runtime-agent-one.json' },
+    { ok: true, component: 'cutover-receipt', check: 'control_verb_for_agent', agent_id: 'agent-one', required_verb: 'start', matched_verb: 'start', matched_action: 'open' },
+    { ok: true, component: 'cutover-receipt', check: 'control_verb_for_agent', agent_id: 'agent-one', required_verb: 'stop', matched_verb: 'stop', matched_action: 'close' },
+  )
+  return {
+    receipt_type: 'mupot-sos-cutover-gate/v1', generated_at: '2026-07-08T00:03:00.000Z', status: 'pass',
+    summary: { status: 'pass', passed: checks.length, failed: 0, warnings: 0 },
+    inputs: { agents: ['agent-one'], host_receipt: 'host.json', runtime_receipts: ['runtime-agent-one.json'], control_receipts: ['control-start.json', 'control-stop.json'], required_control_verbs: ['start', 'stop'] },
+    checks,
+  }
+}
+
+function legacyManifest(outDir: string) {
+  const meta = (path: string, receipt_type: string) => ({ path, receipt_type, status: 'pass', sha256: sha256(join(outDir, path)) })
+  const checks = [
+    { ok: true, component: 'receipt-bundle', check: 'selected_agents_present', agents: ['agent-one'] },
+    { ok: true, component: 'receipt-bundle', check: 'install_receipt_status_non_fail', path: 'install.json', accepted: ['pass', 'warn'], actual: 'pass' },
+    { ok: true, component: 'receipt-bundle', check: 'probe_receipt_present', count: 1 },
+    { ok: true, component: 'receipt-bundle', check: 'host_candidate_selected', path: 'host.json' },
+    { ok: true, component: 'receipt-bundle', check: 'runtime_candidate_selected', path: 'runtime-agent-one.json' },
+    { ok: true, component: 'receipt-bundle', check: 'control_candidate_selected', path: 'control-start.json' },
+    { ok: true, component: 'receipt-bundle', check: 'control_candidate_selected', path: 'control-stop.json' },
+    { ok: true, component: 'receipt-bundle', check: 'cutover_gate_status_pass', path: 'cutover-gate.json', actual: 'pass' },
+    { ok: true, component: 'receipt-bundle', check: 'manifest_written', path: 'manifest.json' },
+  ]
+  return {
+    receipt_type: 'mupot-fleet-receipt-bundle/v1', generated_at: '2026-07-08T00:04:00.000Z', status: 'pass',
+    summary: { status: 'pass', passed: checks.length, failed: 0, warnings: 0 },
+    integrity: { algorithm: 'sha256', covers: 'receipt artifact files', excludes: ['manifest.json'] },
+    inputs: { agents: ['agent-one'], out_dir: outDir, daemon_config: 'daemon.json', inbox_handler_config: 'inbox.json', control_config: 'control.json', install_receipt: 'install.json', probe_receipts: ['probe-start.json'], control_label: null, required_control_verbs: ['start', 'stop'], exec_probes: false, verify_only: true, skip_host: true, skip_runtime: true, skip_control: true },
+    artifacts: {
+      out_dir: outDir,
+      install: meta('install.json', 'mupot-fleet-install-receipt/v1'),
+      probes: [meta('probe-start.json', 'mupot-fleet-cutover-probe/v1')],
+      host: meta('host.json', 'mupot-fleet-host-receipt/v1'),
+      runtimes: [meta('runtime-agent-one.json', 'mupot-fleet-runtime-receipt/v1')],
+      controls: [meta('control-start.json', 'mupot-fleet-control-receipt/v1'), meta('control-stop.json', 'mupot-fleet-control-receipt/v1')],
+      cutover_gate: meta('cutover-gate.json', 'mupot-sos-cutover-gate/v1'),
+      manifest: 'manifest.json',
+    },
+    next_steps: ['attach manifest.json and cutover-gate.json to the cutover record; SOS removal is permitted only for the proven agent(s)'],
+    checks,
+  }
+}
+
+async function writeLegacyHostBundle(exportDir: string) {
+  const sourceDir = tempDir()
+  writeJson(join(sourceDir, 'install.json'), { receipt_type: 'mupot-fleet-install-receipt/v1', status: 'pass', generated_at: '2026-07-08T00:00:00.000Z' })
+  writeJson(join(sourceDir, 'probe-start.json'), hostProbeReceipt())
+  writeJson(join(sourceDir, 'host.json'), hostReceipt())
+  writeJson(join(sourceDir, 'runtime-agent-one.json'), runtimeReceipt())
+  writeJson(join(sourceDir, 'control-start.json'), controlReceipt('start'))
+  writeJson(join(sourceDir, 'control-stop.json'), controlReceipt('stop'))
+  writeJson(join(sourceDir, 'cutover-gate.json'), legacyCutoverReceipt())
+  writeJson(join(sourceDir, 'manifest.json'), legacyManifest(sourceDir))
+  const exported = exportBundle({ outDir: sourceDir, exportDir })
+  if (exported.status !== 'pass') throw new Error('failed to build historical legacy host bundle fixture')
+}
+
+async function writeBundle(dir: string, mutate?: (dir: string) => void, releaseVersion = 'v0.23.0') {
   mkdirSync(join(dir, 'host-go'), { recursive: true })
+  const sourceVersion = releaseVersion.replace(/^v/i, '')
   for (const required of REQUIRED_RECEIPTS) {
     if (required.file.startsWith('host-go/')) continue
+    const target = required.file === 'release-candidate-check.json'
+      ? { commit: RELEASE_SHA, source_version: sourceVersion }
+      : required.file === 'release-integrity-check.json'
+        ? {
+            version: sourceVersion,
+            git_head_sha: RELEASE_SHA,
+            git_tag_sha: RELEASE_SHA,
+            github_tag_sha: RELEASE_SHA,
+          }
+        : releaseVersion === 'v0.30.0' && releaseShaPathFor(required.file)?.startsWith('target.')
+          ? {}
+          : undefined
+    if (releaseVersion === 'v0.30.0') {
+      const releaseShaPath = releaseShaPathFor(required.file)
+      if (releaseShaPath && releaseShaPath !== 'inputs.release_sha') {
+        setReceiptReleaseSha({ target }, releaseShaPath, RELEASE_SHA)
+      }
+    }
     writeJson(join(dir, required.file), {
       receipt_type: required.receipt_type,
       status: 'pass',
       checked_at: '2026-07-10T00:00:00.000Z',
+      ...(target ? { target } : {}),
       evidence: {
         objective: required.objective,
         issue: required.issue,
       },
     })
   }
-  await writeHostBundle(join(dir, 'host-go'))
+  if (releaseVersion === 'v0.30.0') {
+    await writeHostBundle(join(dir, 'host-go'), RELEASE_SHA)
+  } else {
+    const hostDir = join(dir, 'host-go')
+    await writeLegacyHostBundle(hostDir)
+  }
 
   writeJson(join(dir, 'github-issues.json'), REQUIRED_ISSUES.map((number) => ({
     number,
@@ -206,6 +409,30 @@ async function writeBundle(dir: string, mutate?: (dir: string) => void) {
   mutate?.(dir)
 }
 
+async function writePassingV030Bundle(dir: string) {
+  await writeBundle(dir, undefined, 'v0.30.0')
+  writeJson(join(dir, 'stable-deployment-check.json'), {
+    receipt_type: 'mupot-stable-deployment/v1',
+    status: 'pass',
+    target: { version: 'v0.30.0', commit: RELEASE_SHA },
+  })
+}
+
+function passingStatusCheckRollup() {
+  return REQUIRED_CHECKS.map((name, index) => index % 2 === 0
+    ? {
+        name,
+        conclusion: 'SUCCESS',
+        status: 'COMPLETED',
+        detailsUrl: `https://github.test/checks/${encodeURIComponent(name)}`,
+      }
+    : {
+        context: name,
+        state: 'SUCCESS',
+        targetUrl: `https://github.test/status/${encodeURIComponent(name)}`,
+      })
+}
+
 describe('release readiness receipt checker', () => {
   it('parses plan and check arguments', () => {
     expect(parseArgs(['--plan', '--version', 'v0.23.0']).plan).toBe(true)
@@ -213,6 +440,222 @@ describe('release readiness receipt checker', () => {
     expect(parseArgs(['--plan', '--checks-pr', '285']).checksPr).toBe('285')
     expect(parseArgs(['--plan', '--release-sha', RELEASE_SHA]).releaseSha).toBe(RELEASE_SHA)
     expect(parseArgs(['--plan', '--phase', 'prepublication']).phase).toBe('prepublication')
+    expect(parseArgs(['--plan', '--contract', 'docs/releases/v0.30.0-contract.json']).contractPath)
+      .toContain('docs/releases/v0.30.0-contract.json')
+  })
+
+  it('builds a v0.30 plan from an explicit release contract without legacy issue trackers', () => {
+    const plan = formatPlan({
+      outDir: 'tmp/release-readiness/v0.30.0',
+      version: 'v0.30.0',
+      repo: 'Mumega-com/mupot',
+      checksPr: '1249',
+      releaseSha: RELEASE_SHA,
+      phase: 'prepublication',
+      contract: v030Contract(),
+    })
+
+    expect(plan).toContain('Mupot v0.30.0 prepublication-readiness evidence plan')
+    expect(plan).toContain('stable-deployment-check.json')
+    expect(plan).not.toContain('issue #')
+    expect(plan).not.toContain('github-issues.json')
+    expect(plan).not.toContain('#274')
+  })
+
+  it('checks v0.30 evidence from the explicit contract without requiring legacy tracker issues', async () => {
+    const dir = tempDir()
+    await writePassingV030Bundle(dir)
+
+    const receipt = checkBundle({
+      outDir: dir,
+      version: 'v0.30.0',
+      checksPr: '285',
+      releaseSha: RELEASE_SHA,
+      phase: 'final',
+      contract: v030Contract(),
+    })
+
+    expect(receipt.receipt_type).toBe('mupot-v030-release-readiness/v1')
+    expect(receipt.status).toBe('pass')
+    expect(receipt.version).toBe('v0.30.0')
+    expect(receipt.summary.required_issues).toBe(0)
+    expect(receipt.required.issues).toEqual([])
+    expect(receipt.checks).not.toContainEqual(expect.objectContaining({ label: 'github_issues' }))
+    for (const binding of V030_RELEASE_SHA_BINDINGS) {
+      expect(receipt.checks).toContainEqual(expect.objectContaining({
+        ok: true,
+        check: 'receipt_release_sha_matches_release_sha',
+        file: binding.file,
+        release_sha_path: binding.release_sha_path,
+        expected: RELEASE_SHA,
+        actual: RELEASE_SHA,
+      }))
+    }
+  })
+
+  it('preserves every valid release SHA declaration in the normalized contract', () => {
+    const receipt = checkBundle({
+      outDir: tempDir(),
+      version: 'v0.30.0',
+      checksPr: '285',
+      releaseSha: RELEASE_SHA,
+      phase: 'final',
+      contract: v030Contract(),
+    })
+
+    expect(receipt.required.receipts).toEqual(expect.arrayContaining(
+      V030_RELEASE_SHA_BINDINGS.map((binding) => expect.objectContaining(binding)),
+    ))
+  })
+
+  it('fails closed when a release contract contains an unknown field', () => {
+    expect(() => formatPlan({
+      version: 'v0.30.0',
+      phase: 'prepublication',
+      contract: { ...v030Contract(), required_issues: [] },
+    })).toThrow(/unknown field required_issues/)
+  })
+
+  it.each([
+    ['issue', '151', /receipts\[0\]\.issue invalid/],
+    ['objective', { name: 'install' }, /receipts\[0\]\.objective invalid/],
+  ])('fails closed when a release-contract receipt has malformed %s', (field, value, expected) => {
+    const contract = v030Contract()
+    contract.receipts[0] = { ...contract.receipts[0], [field]: value }
+
+    expect(() => formatPlan({ version: 'v0.30.0', contract })).toThrow(expected)
+  })
+
+  it.each([
+    ['unknown path', 'target.commit'],
+    ['empty path', ''],
+    ['null path', null],
+    ['boolean path', true],
+    ['non-string path', 123],
+    ['array path', ['target.release_sha']],
+    ['object path', { path: 'target.release_sha' }],
+  ])('fails closed for a release-contract receipt with %s', (_label, releaseShaPath) => {
+    const contract = v030Contract()
+    contract.receipts[0] = { ...contract.receipts[0], release_sha_path: releaseShaPath as any }
+
+    expect(() => formatPlan({ version: 'v0.30.0', contract })).toThrow(/release_sha_path invalid/)
+  })
+
+  it('fails closed when a declared release SHA path is incompatible with its receipt file', () => {
+    const contract = v030Contract()
+    contract.receipts[0] = { ...contract.receipts[0], release_sha_path: 'inputs.release_sha' }
+
+    expect(() => formatPlan({ version: 'v0.30.0', contract })).toThrow(/release_sha_path incompatible/)
+  })
+
+  it.each(V030_RELEASE_SHA_BINDINGS.flatMap((binding) => [
+    ['missing', binding, MISSING],
+    ['malformed', binding, 'not-a-release-sha'],
+    ['array', binding, [RELEASE_SHA]],
+    ['object', binding, { sha: RELEASE_SHA }],
+    ['number', binding, 123],
+    ['uppercase', binding, RELEASE_SHA.toUpperCase()],
+    ['different valid SHA', binding, OTHER_RELEASE_SHA],
+  ] as const))('fails v0.30 readiness for %s %s evidence', async (_label, binding, value) => {
+    const dir = tempDir()
+    await writePassingV030Bundle(dir)
+    const path = join(dir, binding.file)
+    const receiptJson = JSON.parse(readFileSync(path, 'utf8'))
+    setReceiptReleaseSha(receiptJson, binding.release_sha_path, value)
+    writeJson(path, receiptJson)
+
+    const receipt = checkBundle({
+      outDir: dir,
+      version: 'v0.30.0',
+      checksPr: '285',
+      releaseSha: RELEASE_SHA,
+      phase: 'final',
+      contract: v030Contract(),
+    })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'receipt_release_sha_matches_release_sha',
+      file: binding.file,
+      release_sha_path: binding.release_sha_path,
+      expected: RELEASE_SHA,
+      actual: value === MISSING ? null : value,
+    }))
+  })
+
+  it('cannot make stale v0.30 receipt evidence pass by changing only the expected release SHA', async () => {
+    const dir = tempDir()
+    await writePassingV030Bundle(dir)
+
+    const receipt = checkBundle({
+      outDir: dir,
+      version: 'v0.30.0',
+      checksPr: '285',
+      releaseSha: OTHER_RELEASE_SHA,
+      phase: 'final',
+      contract: v030Contract(),
+    })
+
+    expect(receipt.status).toBe('fail')
+    for (const binding of V030_RELEASE_SHA_BINDINGS) {
+      expect(receipt.checks).toContainEqual(expect.objectContaining({
+        ok: false,
+        check: 'receipt_release_sha_matches_release_sha',
+        file: binding.file,
+        release_sha_path: binding.release_sha_path,
+        expected: OTHER_RELEASE_SHA,
+        actual: RELEASE_SHA,
+      }))
+    }
+  })
+
+  it.each(['inline', 'path'] as const)('rejects every non-canonical v0.30 contract mutation loaded by %s', (source) => {
+    for (const [label, mutate] of V030_CONTRACT_MUTATIONS) {
+      const contract = v030Contract()
+      mutate(contract)
+      const opts: Record<string, unknown> = { version: 'v0.30.0', phase: 'prepublication' }
+      if (source === 'inline') opts.contract = contract
+      else {
+        const contractPath = join(tempDir(), `v0.30.0-${label.replaceAll(' ', '-')}.json`)
+        writeJson(contractPath, contract)
+        opts.contractPath = contractPath
+      }
+
+      expect(() => formatPlan(opts), `${source}: ${label}`).toThrow(/does not match canonical v0\.30\.0 contract/)
+    }
+  })
+
+  it('accepts the exact canonical v0.30 contract from inline and path sources', () => {
+    const contract = v030Contract()
+    const contractPath = join(tempDir(), 'v0.30.0-contract.json')
+    writeJson(contractPath, contract)
+
+    expect(formatPlan({ version: 'v0.30.0', contract })).toContain('Mupot v0.30.0 final release-readiness evidence plan')
+    expect(formatPlan({ version: 'v0.30.0', contractPath })).toContain('Mupot v0.30.0 final release-readiness evidence plan')
+  })
+
+  it('retains custom-contract behavior for historical versions without SHA paths', () => {
+    const contract = {
+      schema_version: 1,
+      version: 'v0.29.0',
+      name: 'Historical custom contract',
+      receipt_types: {
+        prepublication: 'mupot-v029-prepublication-readiness/v1',
+        final: 'mupot-v029-release-readiness/v1',
+      },
+      receipts: [{
+        objective: 'historical',
+        file: 'historical-check.json',
+        receipt_type: 'mupot-historical-check/v1',
+        phases: ['final'],
+      }],
+      issues: [],
+    }
+
+    const plan = formatPlan({ version: 'v0.29.0', contract })
+    expect(plan).toContain('historical-check.json')
+    expect(plan).not.toContain('release_sha_path')
   })
 
   it('prints the final release-readiness evidence plan', () => {
@@ -224,8 +667,8 @@ describe('release readiness receipt checker', () => {
       releaseSha: RELEASE_SHA,
     })
 
-    expect(plan).toContain('Mupot v0.23 final release-readiness evidence plan')
-    expect(plan).toContain('complete exported #274 attachable directory')
+    expect(plan).toContain('Mupot v0.23.0 final release-readiness evidence plan')
+    expect(plan).toContain('complete exported host attachment directory')
     expect(plan).toContain('reruns the read-only fleet manifest verifier')
     expect(plan).toContain('fresh-install-check.json')
     expect(plan).toContain('github-issues.json')
@@ -233,7 +676,8 @@ describe('release readiness receipt checker', () => {
     expect(plan).toContain('gh pr view 285 --repo Mumega-com/mupot')
     expect(plan).toContain('mergeCommit')
     expect(plan).toContain('github-checks.json')
-    expect(plan).toContain('gh pr checks --repo Mumega-com/mupot 285')
+    expect(plan).toContain('gh pr view 285 --repo Mumega-com/mupot --json statusCheckRollup > tmp/release-readiness/v0.23.0/github-checks.json')
+    expect(plan).not.toContain('gh pr checks --json')
     expect(plan).toContain(`repos/Mumega-com/mupot/commits/${RELEASE_SHA}`)
     expect(plan).toContain('github-commit.json')
     expect(plan).toContain('github-commit-checks.json')
@@ -252,7 +696,6 @@ describe('release readiness receipt checker', () => {
     await writeBundle(dir)
 
     const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285', releaseSha: RELEASE_SHA })
-
     expect(receipt.receipt_type).toBe(CHECK_RECEIPT_TYPE)
     expect(receipt.status).toBe('pass')
     expect(receipt.summary.required_receipts).toBe(REQUIRED_RECEIPTS.length)
@@ -316,6 +759,209 @@ describe('release readiness receipt checker', () => {
     expect(receipt.required.receipts).toContainEqual(expect.objectContaining({
       file: 'stable-deployment-check.json',
       receipt_type: 'mupot-stable-deployment/v1',
+    }))
+  })
+
+  it('fails when the required release-candidate receipt targets another commit', async () => {
+    const dir = tempDir()
+    await writeBundle(dir, () => {
+      writeJson(join(dir, 'release-candidate-check.json'), {
+        receipt_type: 'mupot-release-candidate/v1',
+        status: 'pass',
+        target: { commit: 'b'.repeat(40), source_version: '0.23.0' },
+      })
+    })
+
+    const receipt = checkBundle({
+      outDir: dir,
+      version: 'v0.23.0',
+      checksPr: '285',
+      releaseSha: RELEASE_SHA,
+      phase: 'prepublication',
+    })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'release_candidate_commit_matches_release_sha',
+      expected: RELEASE_SHA,
+      actual: 'b'.repeat(40),
+    }))
+  })
+
+  it('fails when the required release-candidate receipt targets another source version', async () => {
+    const dir = tempDir()
+    await writeBundle(dir, () => {
+      writeJson(join(dir, 'release-candidate-check.json'), {
+        receipt_type: 'mupot-release-candidate/v1',
+        status: 'pass',
+        target: { commit: RELEASE_SHA, source_version: '0.22.0' },
+      })
+    })
+
+    const receipt = checkBundle({
+      outDir: dir,
+      version: 'v0.23.0',
+      checksPr: '285',
+      releaseSha: RELEASE_SHA,
+      phase: 'prepublication',
+    })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'release_candidate_source_version_matches_release',
+      expected: '0.23.0',
+      actual: '0.22.0',
+    }))
+  })
+
+  it.each([
+    ['version', '0.22.0', 'release_integrity_version_matches_release', '0.23.0'],
+    ['git_head_sha', 'b'.repeat(40), 'release_integrity_git_head_sha_matches_release_sha', RELEASE_SHA],
+    ['git_tag_sha', 'b'.repeat(40), 'release_integrity_git_tag_sha_matches_release_sha', RELEASE_SHA],
+    ['github_tag_sha', 'b'.repeat(40), 'release_integrity_github_tag_sha_matches_release_sha', RELEASE_SHA],
+  ])('fails when the required release-integrity receipt %s binding is wrong', async (field, value, check, expected) => {
+    const dir = tempDir()
+    await writeBundle(dir, () => {
+      writeJson(join(dir, 'release-integrity-check.json'), {
+        receipt_type: 'mupot-release-integrity/v1',
+        status: 'pass',
+        target: {
+          version: '0.23.0',
+          git_head_sha: RELEASE_SHA,
+          git_tag_sha: RELEASE_SHA,
+          github_tag_sha: RELEASE_SHA,
+          [field]: value,
+        },
+      })
+    })
+
+    const receipt = checkBundle({
+      outDir: dir,
+      version: 'v0.23.0',
+      checksPr: '285',
+      releaseSha: RELEASE_SHA,
+      phase: 'final',
+    })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check,
+      expected,
+      actual: value,
+    }))
+  })
+
+  it.each(MALFORMED_SHA_VALUES)('fails closed for %s release-candidate and integrity SHA values', async (_label, value) => {
+    for (const binding of RELEASE_SHA_BINDINGS) {
+      const dir = tempDir()
+      await writeBundle(dir, () => {
+        const path = join(dir, binding.file)
+        const target = JSON.parse(readFileSync(path, 'utf8'))
+        if (value === MISSING) delete target.target[binding.field]
+        else target.target[binding.field] = value
+        writeJson(path, target)
+      })
+
+      const receipt = checkBundle({
+        outDir: dir,
+        version: 'v0.23.0',
+        checksPr: '285',
+        releaseSha: RELEASE_SHA,
+        phase: binding.phase,
+      })
+
+      expect(receipt.status).toBe('fail')
+      expect(receipt.checks).toContainEqual(expect.objectContaining({
+        ok: false,
+        check: binding.check,
+      }))
+    }
+  })
+
+  it('fails closed when the expected release SHA is not a string', async () => {
+    const dir = tempDir()
+    await writeBundle(dir)
+
+    const receipt = checkBundle({
+      outDir: dir,
+      version: 'v0.23.0',
+      checksPr: '285',
+      releaseSha: [RELEASE_SHA],
+    })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'release_sha_specified',
+      actual: [RELEASE_SHA],
+    }))
+  })
+
+  it.each([
+    ['uppercase', RELEASE_SHA.toUpperCase()],
+    ['whitespace-padded', ` ${RELEASE_SHA} `],
+    ['wrong-length', 'a'.repeat(39)],
+    ['non-hex', `${'a'.repeat(39)}g`],
+  ])('fails closed for %s expected release SHA input', async (_label, releaseSha) => {
+    const dir = tempDir()
+    await writeBundle(dir)
+
+    const receipt = checkBundle({
+      outDir: dir,
+      version: 'v0.23.0',
+      checksPr: '285',
+      releaseSha,
+    })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'release_sha_specified',
+      actual: releaseSha,
+    }))
+  })
+
+  it.each([
+    ['stable deployment commit', 'stable-deployment-check.json', 'prepublication', 'commit', 'stable_deployment_commit_matches_release_sha'],
+    ['stable deployment release_sha', 'stable-deployment-check.json', 'prepublication', 'release_sha', 'stable_deployment_commit_matches_release_sha'],
+    ['stable deployment version', 'stable-deployment-check.json', 'prepublication', 'version', 'stable_deployment_version_matches_release'],
+    ['pull request merge commit', 'github-pr.json', 'final', 'merge_commit', 'release_pr_merge_commit_matches_release_sha'],
+    ['exported commit', 'github-commit.json', 'final', 'sha', 'github_commit_matches_release_sha'],
+  ])('fails closed for array-valued %s binding', async (_label, file, phase, field, check) => {
+    const dir = tempDir()
+    await writeBundle(dir, () => {
+      if (file === 'stable-deployment-check.json') {
+        writeJson(join(dir, file), {
+          receipt_type: 'mupot-stable-deployment/v1',
+          status: 'pass',
+          target: field === 'release_sha'
+            ? { version: 'v0.23.0', release_sha: [RELEASE_SHA] }
+            : { version: field === 'version' ? ['v0.23.0'] : 'v0.23.0', commit: field === 'commit' ? [RELEASE_SHA] : RELEASE_SHA },
+        })
+        return
+      }
+      const path = join(dir, file)
+      const target = JSON.parse(readFileSync(path, 'utf8'))
+      if (field === 'merge_commit') target.mergeCommit.oid = [RELEASE_SHA]
+      else target.sha = [RELEASE_SHA]
+      writeJson(path, target)
+    })
+
+    const receipt = checkBundle({
+      outDir: dir,
+      version: 'v0.23.0',
+      checksPr: '285',
+      releaseSha: RELEASE_SHA,
+      phase,
+    })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check,
     }))
   })
 
@@ -441,6 +1087,41 @@ describe('release readiness receipt checker', () => {
       ok: false,
       check: 'required_ci_check_passed',
       check_name: 'local-evidence',
+    }))
+  })
+
+  it('passes when github-checks.json contains the gh pr view statusCheckRollup object', async () => {
+    const dir = tempDir()
+    await writeBundle(dir, () => {
+      writeJson(join(dir, 'github-checks.json'), { statusCheckRollup: passingStatusCheckRollup() })
+    })
+
+    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285', releaseSha: RELEASE_SHA })
+
+    expect(receipt.status).toBe('pass')
+  })
+
+  it.each([
+    ['missing', (rollup: ReturnType<typeof passingStatusCheckRollup>) => rollup.filter((entry) => (entry.name ?? entry.context) !== 'plugin'), 'required_ci_check_exported'],
+    ['pending', (rollup: ReturnType<typeof passingStatusCheckRollup>) => rollup.map((entry) => (entry.name ?? entry.context) === 'plugin'
+      ? { context: 'plugin', state: 'PENDING', targetUrl: 'https://github.test/status/plugin' }
+      : entry), 'required_ci_check_passed'],
+    ['failing', (rollup: ReturnType<typeof passingStatusCheckRollup>) => rollup.map((entry) => (entry.name ?? entry.context) === 'plugin'
+      ? { context: 'plugin', state: 'FAILURE', targetUrl: 'https://github.test/status/plugin' }
+      : entry), 'required_ci_check_passed'],
+  ])('fails closed when a required statusCheckRollup check is %s', async (_state, makeRollup, failedCheck) => {
+    const dir = tempDir()
+    await writeBundle(dir, () => {
+      writeJson(join(dir, 'github-checks.json'), { statusCheckRollup: makeRollup(passingStatusCheckRollup()) })
+    })
+
+    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285', releaseSha: RELEASE_SHA })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: failedCheck,
+      check_name: 'plugin',
     }))
   })
 

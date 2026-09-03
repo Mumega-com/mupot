@@ -101,12 +101,19 @@ describe('Outbound Customer Webhooks & Multi-Channel Alert Router (Flight 10)', 
       TENANT_SLUG: 'gaf',
       PUBLIC_ORIGIN: 'https://gaf.mupot.mumega.com',
       DB: harness.db,
+      SESSIONS: {
+        get: async (key: string) => (key === 'sess:owner-session' ? JSON.stringify({ userId: 'owner-user', email: 'owner@gaf.com', role: 'owner', createdAt: '2026-09-01T00:00:00.000Z' }) : null),
+        put: async () => undefined,
+        delete: async () => undefined,
+      },
     } as unknown as Env
+    // Routes are org-admin gated (P0 2026-09-02): drive them as a dashboard owner.
+    const asOwner = { cookie: 'mupot_session=owner-session' }
 
     // 1. Create Webhook
     const createReq = new Request('http://localhost/webhooks', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...asOwner },
       body: JSON.stringify({
         url: 'https://webhook.site/test-endpoint',
         channel_type: 'slack',
@@ -121,7 +128,7 @@ describe('Outbound Customer Webhooks & Multi-Channel Alert Router (Flight 10)', 
     expect(createJson.webhook.channel_type).toBe('slack')
 
     // 2. List Webhooks
-    const listReq = new Request('http://localhost/webhooks')
+    const listReq = new Request('http://localhost/webhooks', { headers: asOwner })
     const listRes = await alertsApp.fetch(listReq, env)
     expect(listRes.status).toBe(200)
     const listJson = await listRes.json<{ ok: boolean; webhooks: unknown[] }>()

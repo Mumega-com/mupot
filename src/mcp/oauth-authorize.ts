@@ -25,6 +25,15 @@
 
 import type { Env, AuthContext, Capability, CapabilityGrant, CapabilityScopeType, ConnectionChannel } from '../types'
 import { resolveCapabilities, canOnSquad, hasCapability, capabilityRank } from '../auth/capability'
+import { bootstrapSelf, type BootstrapSelfFailure } from '../members/bootstrap-self'
+import {
+  carriesOrgAdmin,
+  highestCapability,
+  referencedScopeIds,
+  searchHaystack,
+  summarizeGrants,
+  type ScopeNames,
+} from './consent-view'
 import { sha256Hex, mintRawToken, resolveAgentMemberBinding, mintAgentBoundToken } from '../members/service'
 import { createAgent } from '../org/service'
 import { redactSecretPatterns } from '../lib/redact'
@@ -129,49 +138,10 @@ async function findOrCreateMember(
   env: Env,
   email: string,
   displayName: string,
+  loginIdentity?: { provider: string; subject: string },
 ): Promise<string> { // returns member_id
-  const existing = await env.DB.prepare(
-    'SELECT id FROM members WHERE email = ?1 LIMIT 1',
-  ).bind(email).first<{ id: string }>()
-  if (existing) return existing.id
-
-  const memberId = crypto.randomUUID()
-  await env.DB.prepare(
-    `INSERT INTO members (id, email, display_name, telegram_chat_id, status, created_at, tenant)
-     VALUES (?1, ?2, ?3, NULL, 'active', datetime('now'), ?4)`,
-  ).bind(memberId, email, displayName.trim().slice(0, 128) || email, env.TENANT_SLUG).run()
-
-  // ── THE HALF THAT WAS MISSING (mupot#1121, 2026-08-17) ──────────────────────────────
-  //
-  // Until now this function created an IDENTITY and no ACCESS. The comment further down
-  // this file records it as intentional — "C6 zero capabilities" — but the effect is that
-  // a verified Google user lands with a members row, zero capability grants, and a 403 on
-  // every capability-gated surface. Compare the INVITE path (src/members/index.ts:246),
-  // which writes member + capability + token in a single batch. The gates were never the
-  // problem; OAuth onboarding was half-implemented.
-  //
-  // grantSignupDefault reads the tenant's open onboarding door and applies the capability
-  // the OWNER configured there. It FAILS CLOSED twice: no open door grants nothing, and an
-  // open door with signup_capability NULL grants nothing. Both leave behaviour byte-for-byte
-  // as it is today, so merging this cannot open a pot — someone has to set the value.
-  //
-  // The grant is written with its receipt in one batch, so it reviews, reverses and expires
-  // through the same path as everything else that came through the door.
-  //
-  // Non-fatal by design: a login must not fail because the door lookup did. A user with no
-  // capability sees today's behaviour; a hard failure here would lock out every login.
-  try {
-    const { grantSignupDefault } = await import('../onboarding/doors')
-    await grantSignupDefault(env, memberId)
-  } catch (err) {
-    console.error('oauth: signup default grant failed (non-fatal, member still created)', {
-      tenant: env.TENANT_SLUG,
-      member_id: memberId,
-      error: err instanceof Error ? err.message : String(err),
-    })
-  }
-
-  return memberId
+  const { findOrCreateHumanMember } = await import('../members/human-identity')
+  return findOrCreateHumanMember(env, email, displayName, loginIdentity)
 }
 
 // ── Token mint for OAuth seat ─────────────────────────────────────────────────
@@ -539,13 +509,9 @@ function escapeHtml(value: string): string {
     .replace(/'/g, '&#39;')
 }
 
-function formatCapabilities(grants: CapabilityGrant[]): string {
-  if (grants.length === 0) return 'none'
-  return grants
-    .map((g) => `${g.scope_type}${g.scope_id ? `:${g.scope_id}` : ''} → ${g.capability}`)
-    .map(escapeHtml)
-    .join(', ')
-}
+// formatCapabilities was removed here. It rendered grants as
+// `squad:<uuid> → admin`, which is what made the consent screen unreadable.
+// summarizeGrants + scopeLabel in ./consent-view replace it; nothing else called it.
 
 /** Defensive numeric coercion before interpolation (P2, adversarial review
  *  2026-08-10): SQLite has dynamic column typing — `agents.budget_cap_cents` being
@@ -579,9 +545,88 @@ a home for it and gives <em>you</em> admin on it immediately, no operator needed
 to this screen afterward (reconnect / re-authorize) and your new agent will be listed
 here to choose.</p>`
 
-/** Renders the consent screen. The ONLY thing the user reads before a token is
- *  minted — every field a selectable agent would carry into the session is shown
- *  literally, not summarized (slug, name, squad, capabilities, autonomy, budget). */
+/**
+ * Loads display names for only the scopes the consent screen will actually show.
+ *
+ * Deliberately narrow: it resolves the ids referenced by the grants being
+ * rendered, rather than dumping every squad and department in the tenant. The
+ * reader is already entitled to see these scopes — they are printed as raw ids
+ * today — so naming them discloses nothing new, and enumerating the rest would.
+ *
+ * Fails soft on purpose. If either lookup throws, the maps stay empty and
+ * scopeLabel falls back to the raw identifier. A degraded consent screen that
+ * shows an ugly id is acceptable; one that hides a grant is not.
+ */
+async function loadScopeNames(env: Env, agents: ConsentableAgent[]): Promise<ScopeNames> {
+  const names: ScopeNames = { squads: new Map(), departments: new Map(), org: env.TENANT_SLUG }
+  const { squads, departments } = referencedScopeIds(agents.flatMap((a) => a.capabilities))
+
+  const fill = async (table: 'squads' | 'departments', ids: string[], into: Map<string, string>) => {
+    if (ids.length === 0) return
+    const placeholders = ids.map((_, i) => `?${i + 1}`).join(', ')
+    const rows = await env.DB.prepare(
+      `SELECT id, name FROM ${table} WHERE id IN (${placeholders})`,
+    ).bind(...ids).all<{ id: string; name: string }>()
+    for (const r of rows.results ?? []) into.set(r.id, r.name)
+  }
+
+  try {
+    await fill('squads', squads, names.squads)
+  } catch (err) {
+    console.error('[oauth-authorize] squad name lookup failed; falling back to ids:', err)
+  }
+  try {
+    await fill('departments', departments, names.departments)
+  } catch (err) {
+    console.error('[oauth-authorize] department name lookup failed; falling back to ids:', err)
+  }
+  return names
+}
+
+/**
+ * Renders the consent screen — the only thing a person reads before a token is
+ * minted, and therefore the surface where "what am I granting?" must be
+ * answerable at a glance.
+ *
+ * Three things changed from the original, and one thing deliberately did not.
+ *
+ * UNCHANGED: every grant is still shown. The original comment was right that an
+ * authorisation surface shows its fields literally rather than summarising them
+ * away. Grants are regrouped and renamed here, never filtered.
+ *
+ * 1. LEGIBILITY. Scopes render as names, and grants are grouped by tier with the
+ *    most powerful first. A session carrying organisation admin is badged. The
+ *    old rendering placed `org:mumega → admin` fifth in a run-on line of UUIDs,
+ *    in a box identical to the one offering zero capability.
+ *
+ * 2. TABS. Choosing an existing seat, minting a new one, and continuing unbound
+ *    are three different intentions; they were one undifferentiated radio list.
+ *    Implemented with CSS `:checked` sibling selectors so they work with
+ *    scripting unavailable.
+ *
+ * 3. FILTER. The list is unbounded — 48 options on this deployment already. The
+ *    filter matches a server-built haystack carried on a data attribute rather
+ *    than scraping rendered text, so it cannot accidentally match page chrome.
+ *
+ * A NAMING CONSTRAINT that looks arbitrary and is not: CSS class names here must
+ * not contain any agent slug as a substring. A test asserts that a slug the
+ * viewer is not entitled to see appears NOWHERE in this document, and a class
+ * called "agent-body" contains the fixture slug "agent-b" — as did the CSS
+ * comment first written to explain the rename, since comments ship too. Hence
+ * "opt-body". Keeping that assertion strict is worth more than a nicer name.
+ *
+ * TWO SAFETY PROPERTIES worth stating, because both are easy to lose:
+ *
+ *   - The radios carry no `required` attribute. A required radio inside a hidden
+ *     tab is an unfocusable invalid control, which browsers refuse to submit
+ *     while showing nothing to explain why. The server already rejects a missing
+ *     choice, and that check remains the authority; the client-side guard is a
+ *     courtesy on top of it.
+ *   - Filtering can hide a row that is already selected. A selection that cannot
+ *     be seen must never be submitted silently, so the footer always states the
+ *     current choice and its highest capability, whether or not its row is
+ *     visible.
+ */
 function renderConsentPage(
   consentNonce: string,
   email: string,
@@ -593,86 +638,342 @@ function renderConsentPage(
   // when we actually know it. Defaults true so existing callers are unchanged.
   agentsListed = true,
   squads: ConsentableSquad[] = [],
+  scopeNames: ScopeNames = { squads: new Map(), departments: new Map(), org: '' },
 ): Response {
-  const rows = agents.map((a) => `
-        <label class="agent-option">
-          <input type="radio" name="agent_id" value="${escapeHtml(a.id)}" required>
-          <div>
-            <div class="agent-title"><strong>${escapeHtml(a.name)}</strong> <code>${escapeHtml(a.slug)}</code></div>
-            <div class="agent-meta">squad: ${escapeHtml(a.squad_name)} &middot; autonomy: ${escapeHtml(a.autonomy)} &middot; budget: ${formatBudgetCap(a.budget_cap_cents)} / ${escapeHtml(a.budget_window)}</div>
-            <div class="agent-caps">capabilities this session would carry: ${formatCapabilities(a.capabilities)}</div>
-          </div>
-        </label>`).join('\n')
+  const rows = agents.map((a) => {
+    const groups = summarizeGrants(a.capabilities, scopeNames)
+    const orgAdmin = carriesOrgAdmin(a.capabilities)
+    const top = highestCapability(a.capabilities)
+    const haystack = searchHaystack({
+      name: a.name,
+      slug: a.slug,
+      squad_name: a.squad_name,
+      grants: a.capabilities,
+      names: scopeNames,
+    })
 
-  const mintNewOption = squads.length > 0 ? `
-        <label class="agent-option">
-          <input type="radio" name="agent_id" value="__mint_new__" required>
-          <div style="width: 100%;">
-            <div class="agent-title"><strong>Mint new agent seat</strong></div>
-            <div class="agent-meta">Create and bind a new agent seat on one of your squads.</div>
-            <div style="margin-top: 0.5rem; display: flex; flex-direction: column; gap: 0.5rem;">
-              <div>
-                <label style="font-size: 0.8rem; display: block; margin-bottom: 0.2rem;">Agent Name</label>
-                <input type="text" name="new_agent_name" placeholder="e.g. Cursor Kasra" style="width: 100%; padding: 0.35rem; box-sizing: border-box;">
-              </div>
-              <div>
-                <label style="font-size: 0.8rem; display: block; margin-bottom: 0.2rem;">Agent Slug (optional)</label>
-                <input type="text" name="new_agent_slug" placeholder="e.g. cursor-kasra" style="width: 100%; padding: 0.35rem; box-sizing: border-box;">
-              </div>
-              <div>
-                <label style="font-size: 0.8rem; display: block; margin-bottom: 0.2rem;">Home Squad</label>
-                <select name="new_agent_squad_id" style="width: 100%; padding: 0.35rem; box-sizing: border-box;">
-                  ${squads.map((s) => `<option value="${escapeHtml(s.id)}">${escapeHtml(s.name)} (${escapeHtml(s.slug)})</option>`).join('\n')}
-                </select>
-              </div>
-              <div>
-                <label style="font-size: 0.8rem; display: block; margin-bottom: 0.2rem;">Purpose / Notes (optional)</label>
-                <input type="text" name="new_agent_purpose" placeholder="e.g. Cursor Agent CLI seat on muvps" style="width: 100%; padding: 0.35rem; box-sizing: border-box;">
+    const grantRows = groups.length === 0
+      ? '<div class="grant none">no standing capability</div>'
+      : groups.map((g) => `
+              <div class="grant${g.elevated ? ' elevated' : ''}">
+                <span class="cap cap-${escapeHtml(g.capability)}">${escapeHtml(g.capability)}</span>
+                <span class="scopes">${g.scopes.map(escapeHtml).join(', ')}</span>
+              </div>`).join('')
+
+    return `
+        <label class="agent-option${orgAdmin ? ' is-org-admin' : ''}" data-haystack="${escapeHtml(haystack)}" data-top="${escapeHtml(top ?? 'none')}">
+          <input type="radio" name="agent_id" value="${escapeHtml(a.id)}" required
+                 data-label="${escapeHtml(a.name)}" data-top="${escapeHtml(top ?? 'no standing capability')}">
+          <div class="opt-body">
+            <div class="agent-title">
+              <strong>${escapeHtml(a.name)}</strong>
+              <code>${escapeHtml(a.slug)}</code>
+              ${orgAdmin ? '<span class="badge-org">organisation admin</span>' : ''}
+            </div>
+            <div class="agent-meta">Home squad ${escapeHtml(a.squad_name)} &middot; autonomy ${escapeHtml(a.autonomy)} &middot; budget ${formatBudgetCap(a.budget_cap_cents)} / ${escapeHtml(a.budget_window)}</div>
+            <div class="grants">${grantRows}
+            </div>
+          </div>
+        </label>`
+  }).join('\n')
+
+  // The zero state. When a person has no agent to choose AND no squad they may
+  // mint on, every other option on this screen is unavailable to them, and the
+  // screen collapses to "continue unbound" — which is mute. Never render an
+  // empty picker: offer the creating act in place of the emptiness.
+  const canOfferFirstAgent = agentsListed && agents.length === 0 && squads.length === 0
+
+  const firstAgentPanel = canOfferFirstAgent ? `
+        <label class="agent-option first-run">
+          <input type="radio" name="agent_id" value="__bootstrap__" required data-label="your first agent" data-top="member on its own squad">
+          <div class="opt-body">
+            <div class="agent-title"><strong>Name your first agent</strong></div>
+            <div class="agent-meta">This creates your workspace and an agent you own. It becomes a member of its own squad, and you administer that squad.</div>
+            <div class="fields">
+              <div class="field">
+                <span class="flabel">What should it be called?</span>
+                <input type="text" name="first_agent_name" placeholder="Ada" autocomplete="off" maxlength="128">
               </div>
             </div>
           </div>
         </label>` : ''
 
+  const mintPanel = squads.length > 0 ? `
+        <label class="agent-option mint">
+          <input type="radio" name="agent_id" value="__mint_new__" required data-label="a new agent seat" data-top="member on its home squad">
+          <div class="opt-body">
+            <div class="agent-title"><strong>Create a new agent seat</strong></div>
+            <div class="agent-meta">It starts with member capability on the squad you choose.</div>
+            <div class="fields">
+              <div class="field">
+                <span class="flabel">Name</span>
+                <input type="text" name="new_agent_name" placeholder="Cursor on muvps" autocomplete="off">
+              </div>
+              <div class="field">
+                <span class="flabel">Slug <em>optional</em></span>
+                <input type="text" name="new_agent_slug" placeholder="muvps-cursor" autocomplete="off">
+              </div>
+              <div class="field">
+                <span class="flabel">Home squad</span>
+                <select name="new_agent_squad_id">
+                  ${squads.map((sq) => `<option value="${escapeHtml(sq.id)}">${escapeHtml(sq.name)}</option>`).join('\n')}
+                </select>
+              </div>
+              <div class="field">
+                <span class="flabel">Purpose <em>optional</em></span>
+                <input type="text" name="new_agent_purpose" placeholder="Branch-only builder under gate" autocomplete="off">
+              </div>
+            </div>
+          </div>
+        </label>` : `
+        <p class="empty-hint">You do not hold admin on any squad, so you cannot create a new seat here. Ask someone who administers the squad to create it, then reconnect.</p>`
+
   const html = `<!doctype html>
-<html>
+<html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Connect to mupot</title>
 <style>
-  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; color: #111; }
-  h1 { font-size: 1.25rem; }
-  .agent-option { display: flex; gap: 0.75rem; align-items: flex-start; border: 1px solid #ccc; border-radius: 8px; padding: 0.75rem; margin: 0.5rem 0; }
-  .agent-meta, .agent-caps { font-size: 0.85rem; color: #444; }
-  .agent-caps { font-family: monospace; }
-  .empty-hint { font-size: 0.85rem; color: #444; background: #f5f5f5; border-radius: 8px; padding: 0.75rem; }
-  .empty-hint code { font-family: monospace; }
-  fieldset { border: none; padding: 0; }
-  .actions { margin-top: 1.5rem; display: flex; gap: 0.75rem; }
-  button { padding: 0.5rem 1rem; font-size: 1rem; }
+  :root {
+    --paper:#F7F8F6; --raised:#FFFFFF; --ink:#14181D; --ink-2:#3D474E; --ink-3:#6B7680;
+    --rule:#DCE0DD; --rule-2:#C3C9C5; --accent:#2F6F6A; --accent-soft:#E4EEEC;
+    --obs:#6B7A80; --mem:#3C7EA6; --lead:#B4761F; --admin:#A33A2A; --owner:#7B2D3B;
+    --danger-bg:#FBECE9;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper:#101418; --raised:#171C21; --ink:#E8ECE9; --ink-2:#AEB8BC; --ink-3:#7C878D;
+      --rule:#262D33; --rule-2:#333C43; --accent:#5FB3AA; --accent-soft:#16302E;
+      --obs:#8A979D; --mem:#6BA8CE; --lead:#D69B45; --admin:#D2705E; --owner:#C4788A;
+      --danger-bg:#2E1B18;
+    }
+  }
+  *,*::before,*::after { box-sizing:border-box }
+  body { background:var(--paper); color:var(--ink); margin:0;
+         font-family:system-ui,-apple-system,"Segoe UI",sans-serif; line-height:1.55; }
+  .wrap { max-width:44rem; margin:0 auto; padding:2.5rem 1.25rem 4rem; }
+  h1 { font-size:1.4rem; margin:0 0 .35rem; letter-spacing:-.01em }
+  .who { color:var(--ink-2); font-size:.92rem; margin:0 0 1.5rem }
+  .who strong { color:var(--ink) }
+
+  /* tabs — CSS only, so they work without scripting */
+  /* The tab bar is hidden until scripting confirms it can drive it. With no
+     scripting every panel stays visible, which is exactly the behaviour this
+     screen had before tabs existed — degraded, never broken. */
+  .tabbar { display:none; gap:.25rem; border-bottom:1px solid var(--rule-2); margin-bottom:1rem }
+  .tabs-on .tabbar { display:flex }
+  .tab { padding:.5rem .85rem; font-size:.9rem; cursor:pointer; color:var(--ink-3);
+         background:none; border:none; border-bottom:2px solid transparent; margin-bottom:-1px }
+  .tab:hover { color:var(--ink) }
+  .tab[aria-selected="true"] { color:var(--ink); border-bottom-color:var(--accent); font-weight:600 }
+  .tabs-on .panel { display:none }
+  .tabs-on .panel.active { display:block }
+  .panel-title { font-size:.82rem; color:var(--ink-3); margin:1.25rem 0 .5rem; font-weight:600 }
+  .tabs-on .panel-title { display:none }
+
+  .filter { width:100%; padding:.55rem .7rem; font-size:.92rem; margin-bottom:.75rem;
+            border:1px solid var(--rule-2); border-radius:6px; background:var(--raised); color:var(--ink) }
+  .filter::placeholder { color:var(--ink-3) }
+  .count-line { font-size:.8rem; color:var(--ink-3); margin:0 0 .6rem }
+
+  .agent-option { display:flex; gap:.7rem; align-items:flex-start; background:var(--raised);
+                  border:1px solid var(--rule-2); border-radius:7px; padding:.75rem .85rem;
+                  margin:0 0 .5rem; cursor:pointer }
+  .agent-option:hover { border-color:var(--ink-3) }
+  .agent-option:has(input:checked) { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) }
+  .agent-option.is-org-admin { border-left:3px solid var(--admin) }
+  .agent-option.first-run { border-left:3px solid var(--accent) }
+  .agent-option input { margin-top:.3rem; flex:none; accent-color:var(--accent) }
+    .opt-body { min-width:0; flex:1 }
+  .agent-title { display:flex; flex-wrap:wrap; gap:.4rem; align-items:baseline }
+  .agent-title code { font-family:ui-monospace,Menlo,monospace; font-size:.8rem; color:var(--ink-3) }
+  .badge-org { font-size:.68rem; font-weight:700; letter-spacing:.04em; text-transform:uppercase;
+               background:var(--admin); color:#fff; padding:.12rem .4rem; border-radius:3px }
+  .agent-meta { font-size:.82rem; color:var(--ink-3); margin-top:.1rem }
+  .grants { display:flex; flex-direction:column; gap:.15rem; margin-top:.4rem }
+  .grant { display:flex; gap:.5rem; align-items:baseline; font-size:.84rem; color:var(--ink-2) }
+  .grant.none { color:var(--ink-3); font-style:italic }
+  .cap { font-family:ui-monospace,Menlo,monospace; font-size:.72rem; font-weight:700;
+         min-width:4.4rem; text-transform:uppercase; letter-spacing:.03em }
+  .cap-observer{color:var(--obs)} .cap-member{color:var(--mem)} .cap-lead{color:var(--lead)}
+  .cap-admin{color:var(--admin)} .cap-owner{color:var(--owner)}
+  .scopes { min-width:0; word-break:break-word }
+
+  .fields { display:flex; flex-direction:column; gap:.5rem; margin-top:.6rem }
+  .field { display:flex; flex-direction:column; gap:.2rem }
+  .flabel { font-size:.78rem; color:var(--ink-3) }
+  .flabel em { font-style:normal; opacity:.75 }
+  .field input, .field select { width:100%; padding:.45rem .55rem; font-size:.9rem;
+      border:1px solid var(--rule-2); border-radius:5px; background:var(--paper); color:var(--ink) }
+
+  .empty-hint { font-size:.88rem; color:var(--ink-2); background:var(--accent-soft);
+                border-radius:7px; padding:.8rem .9rem; margin:0 0 .75rem }
+  .empty-hint code { font-family:ui-monospace,Menlo,monospace }
+  .no-match { font-size:.88rem; color:var(--ink-3); padding:1rem 0; display:none }
+
+  .summary { position:sticky; bottom:0; background:var(--raised); border:1px solid var(--rule-2);
+             border-radius:8px; padding:.8rem .9rem; margin-top:1.25rem;
+             display:flex; flex-wrap:wrap; gap:.6rem .9rem; align-items:center }
+  .summary.danger { border-color:var(--admin); background:var(--danger-bg) }
+  .summary-text { font-size:.9rem; color:var(--ink-2); flex:1; min-width:12rem }
+  .summary-text b { color:var(--ink) }
+  .actions { display:flex; gap:.5rem }
+  button { padding:.5rem 1rem; font-size:.94rem; border-radius:6px; cursor:pointer;
+           border:1px solid var(--rule-2); background:var(--raised); color:var(--ink) }
+  button[value="continue"] { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600 }
+  button:focus-visible, .filter:focus-visible, .agent-option input:focus-visible {
+      outline:2px solid var(--accent); outline-offset:2px }
+  @media (prefers-reduced-motion:reduce) { * { transition:none !important } }
 </style>
 </head>
 <body>
+<div class="wrap">
 <h1>Connect to mupot</h1>
-<p>Signed in as <strong>${escapeHtml(email)}</strong>. Choose what this connection can act as.</p>
-${agentsListed && agents.length === 0 ? EMPTY_STATE_HINT : ''}
-<form method="POST" action="/oauth/consent">
+<p class="who">Signed in as <strong>${escapeHtml(email)}</strong>. Choose what this connection can act as.</p>
+
+<form method="POST" action="/oauth/consent" id="consent-form">
   <input type="hidden" name="consent_nonce" value="${escapeHtml(consentNonce)}">
-  <fieldset>
+
+  <div class="tabbar" role="tablist">
+    <button type="button" class="tab" role="tab" data-panel="p-existing" aria-selected="true">Existing agent${agents.length > 0 ? ` (${agents.length})` : ''}</button>
+    <button type="button" class="tab" role="tab" data-panel="p-new" aria-selected="false">New agent</button>
+    <button type="button" class="tab" role="tab" data-panel="p-none" aria-selected="false">No agent</button>
+  </div>
+
+  <div class="panels" id="panels">
+    <div class="panel" id="p-existing">
+      ${agentsListed && agents.length === 0 && !canOfferFirstAgent ? EMPTY_STATE_HINT : ''}
+      ${canOfferFirstAgent ? '<p class="empty-hint">You do not have an agent yet. Open <strong>New agent</strong> to name your first one and continue in one step.</p>' : ''}
+      ${agents.length > 0 ? `<input class="filter" type="search" id="agent-filter" placeholder="Filter by name, squad, or capability — try &quot;admin&quot;" autocomplete="off">
+      <p class="count-line" id="filter-count"></p>` : ''}
 ${rows}
-${mintNewOption}
-    <label class="agent-option">
-      <input type="radio" name="agent_id" value="" required>
-      <div>
-        <div class="agent-title"><strong>No agent — continue unbound</strong></div>
-        <div class="agent-meta">Zero standing capabilities (read-only directory queries).</div>
-      </div>
-    </label>
-  </fieldset>
-  <div class="actions">
-    <button type="submit" name="action" value="continue">Continue</button>
-    <button type="submit" name="action" value="decline">Decline</button>
+      <p class="no-match" id="no-match">No agent matches that filter.</p>
+    </div>
+
+    <p class="panel-title">Create a new agent seat</p>
+    <div class="panel" id="p-new">
+${firstAgentPanel}
+${mintPanel}
+    </div>
+
+    <p class="panel-title">Or continue without an agent</p>
+    <div class="panel" id="p-none">
+      <label class="agent-option">
+        <input type="radio" name="agent_id" value="" required data-label="no agent" data-top="no standing capability">
+        <div class="opt-body">
+          <div class="agent-title"><strong>Continue unbound</strong></div>
+          <div class="agent-meta">Zero standing capabilities. Read-only directory queries.</div>
+        </div>
+      </label>
+    </div>
+  </div>
+
+  <div class="summary" id="summary">
+    <div class="summary-text" id="summary-text">Nothing selected yet.</div>
+    <div class="actions">
+      <button type="submit" name="action" value="continue">Continue</button>
+      <button type="submit" name="action" value="decline">Decline</button>
+    </div>
   </div>
 </form>
+</div>
+
+<script>
+(function () {
+  var form = document.getElementById('consent-form')
+  var filter = document.getElementById('agent-filter')
+  var countLine = document.getElementById('filter-count')
+  var noMatch = document.getElementById('no-match')
+  var summary = document.getElementById('summary')
+  var summaryText = document.getElementById('summary-text')
+  var options = Array.prototype.slice.call(document.querySelectorAll('#p-existing .agent-option'))
+
+  function applyFilter() {
+    var q = (filter.value || '').trim().toLowerCase()
+    var shown = 0
+    options.forEach(function (el) {
+      var hit = q === '' || (el.getAttribute('data-haystack') || '').indexOf(q) !== -1
+      el.style.display = hit ? '' : 'none'
+      if (hit) shown++
+    })
+    noMatch.style.display = shown === 0 ? 'block' : 'none'
+    countLine.textContent = q === ''
+      ? options.length + ' agents'
+      : shown + ' of ' + options.length + ' agents'
+  }
+
+  // The selection footer is a safety property, not decoration: filtering can
+  // hide an already-selected row, and a choice that cannot be seen must never
+  // be submitted without being stated.
+  function updateSummary() {
+    var picked = form.querySelector('input[name="agent_id"]:checked')
+    if (!picked) {
+      summary.classList.remove('danger')
+      summaryText.textContent = 'Nothing selected yet.'
+      return
+    }
+    var label = picked.getAttribute('data-label') || 'this option'
+    var top = picked.getAttribute('data-top') || 'no standing capability'
+    var row = picked.closest('.agent-option')
+    var orgAdmin = row && row.classList.contains('is-org-admin')
+    summary.classList.toggle('danger', !!orgAdmin)
+    summaryText.innerHTML = orgAdmin
+      ? 'This connection will act as <b>' + label + '</b> and carry <b>administrator control of the whole organisation</b>.'
+      : 'This connection will act as <b>' + label + '</b>, carrying <b>' + top + '</b>.'
+  }
+
+  // Tabs are enabled only now, once scripting is known to work. Until this runs
+  // every panel is visible, so a scriptless browser sees the full flat list.
+  var panels = document.getElementById('panels')
+  var tabs = Array.prototype.slice.call(document.querySelectorAll('.tab'))
+
+  function selectTab(id) {
+    tabs.forEach(function (t) { t.setAttribute('aria-selected', String(t.getAttribute('data-panel') === id)) })
+    Array.prototype.forEach.call(panels.children, function (el) {
+      if (el.classList.contains('panel')) el.classList.toggle('active', el.id === id)
+    })
+  }
+
+  document.body.classList.add('tabs-on')
+  tabs.forEach(function (t) {
+    t.addEventListener('click', function () { selectTab(t.getAttribute('data-panel')) })
+  })
+  // Land on the tab that actually has something in it. A newcomer whose only
+  // option is to create their first agent should not have to find that tab.
+  selectTab(document.querySelector('#p-new .first-run') && !document.querySelector('#p-existing .agent-option')
+    ? 'p-new'
+    : 'p-existing')
+
+  // The required attribute is correct in the markup: with no scripting every panel is
+  // visible, so the browser can enforce it and focus whatever is invalid. Once
+  // tabs hide panels that stops being true — a required radio inside a hidden
+  // panel is an unfocusable invalid control, and browsers respond by refusing
+  // to submit while displaying nothing at all. So scripting takes the attribute
+  // off and takes responsibility for the message instead.
+  Array.prototype.forEach.call(form.querySelectorAll('input[name="agent_id"][required]'), function (r) {
+    r.removeAttribute('required')
+  })
+
+  if (filter) { filter.addEventListener('input', applyFilter); applyFilter() }
+  form.addEventListener('change', updateSummary)
+  updateSummary()
+
+  // Courtesy guard only. The server rejects a missing choice regardless — it
+  // checks that the field was submitted at all, which is why "continue unbound"
+  // with an empty value is still an explicit choice — and that check, not this
+  // one, is what enforces explicit consent.
+  form.addEventListener('submit', function (e) {
+    var action = (e.submitter && e.submitter.value) || 'continue'
+    if (action === 'decline') return
+    if (!form.querySelector('input[name="agent_id"]:checked')) {
+      e.preventDefault()
+      summary.classList.remove('danger')
+      summaryText.textContent = 'Choose an option before continuing.'
+    }
+  })
+})()
+</script>
 </body>
 </html>`
 
@@ -1098,7 +1399,10 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     // Find-or-create the mupot member row for this verified email.
     let memberId: string
     try {
-      memberId = await findOrCreateMember(env, googleUser.email, googleUser.name)
+      memberId = await findOrCreateMember(env, googleUser.email, googleUser.name, {
+        provider: 'google',
+        subject: googleUser.id,
+      })
     } catch (err) {
       console.error('[oauth-authorize] member find-or-create failed:', redactSecretPatterns(err instanceof Error ? err.message : String(err)))
       return new Response('Member provisioning failed', { status: 500 })
@@ -1143,7 +1447,11 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       squads = []
     }
 
-    const page = renderConsentPage(consentNonce, googleUser.email, agents, agentsListed, squads)
+    // Names for the scopes about to be shown. Fails soft to raw ids inside the
+    // loader, so a naming outage degrades the wording and never the disclosure.
+    const scopeNames = await loadScopeNames(env, agents)
+
+    const page = renderConsentPage(consentNonce, googleUser.email, agents, agentsListed, squads, scopeNames)
     // B3-style: bind the consent nonce to this browser. Clears the earlier
     // google-callback CSRF cookie (its job is done) and sets the consent one,
     // scoped to the /oauth/consent path only.
@@ -1234,7 +1542,78 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     // authoritative, live source of truth rather than trusting the stored row.
     let boundAgentId: string | null = null
     let mintMemberId = pending.memberId
-    if (agentIdRaw === '__mint_new__') {
+    if (agentIdRaw === '__bootstrap__') {
+      // First-run door. A brand-new customer holds no capabilities, so they have
+      // no consentable agent AND no squad they may mint on — the screen offered
+      // them exactly one thing, "continue unbound", and an unbound session is
+      // mute on the directory channel. bootstrapSelf is the exit ramp that
+      // already exists for precisely this principal; until now it was reachable
+      // only as a tool call, which asked a customer to know a tool name.
+      //
+      // This widens NOTHING. Same operation, same gate (unbound directory
+      // session), same clamp (the new agent is a member on its own home squad,
+      // never lead or above), same idempotent-once-per-member guarantee enforced
+      // by a unique index rather than a check. The only change is that the door
+      // is visible.
+      const firstName = String(form.get('first_agent_name') ?? '').trim()
+
+      const rejectSoftly = (message: string, status: 400 | 403 | 429 | 500) => {
+        // Deliberately NOT clearing the consent cookie. This is a recoverable
+        // condition on the signup funnel; destroying the session here is what
+        // turns "you mistyped a name" into "sign in again and hit the identical
+        // wall", which is the loop this flow was reported for.
+        return new Response(message, { status, headers: { 'Content-Type': 'text/plain' } })
+      }
+
+      // No local name check. bootstrapSelf already owns that rule (naming is its
+      // condition 1) and returns agent_name_required, which is mapped below. A
+      // second copy of the same predicate here was redundant and untested — a
+      // mutation deleting it changed nothing, which is exactly how two copies of
+      // one rule drift apart later.
+
+      const bootstrapped = await bootstrapSelf(
+        env,
+        { channel: 'directory', boundAgentId: null, memberId: pending.memberId },
+        firstName,
+      )
+
+      if (!bootstrapped.ok) {
+        const explain: Record<BootstrapSelfFailure, { message: string; status: 400 | 403 | 429 | 500 }> = {
+          agent_name_required: { message: 'Give your agent a name, then continue. Nothing was created.', status: 400 },
+          not_unbound_directory_session: {
+            message: 'This connection already has an identity, so a first agent cannot be created from it. Choose an existing agent instead.',
+            status: 403,
+          },
+          rate_limited: { message: 'Too many attempts. Wait a minute and try again. Nothing was created.', status: 429 },
+          already_bootstrapped: {
+            message: 'You have already created your first agent. Go back and choose it from the list. If it is not listed, reconnect and it will be.',
+            status: 400,
+          },
+          provisioning_failed: { message: 'Creating the agent did not complete, and nothing was left behind. Try again.', status: 500 },
+        }
+        const { message, status } = explain[bootstrapped.error]
+        console.error('[oauth-authorize] first-agent bootstrap refused:', bootstrapped.error)
+        return rejectSoftly(message, status)
+      }
+
+      // Re-validate through the SAME gate the ordinary path uses. bootstrapSelf
+      // grants the founding human admin on the new home squad, which is what
+      // makes the agent consentable — but that is asserted by reading it here,
+      // never assumed from the fact that we just created it.
+      const eligible = await memberMayConsentToAgent(env, pending.memberId, bootstrapped.agent.id)
+      const binding = eligible ? await resolveAgentMemberBinding(env, bootstrapped.agent.id) : null
+      if (!eligible || !binding || binding.kind !== 'bound') {
+        // The agent EXISTS and is theirs; only this session could not be bound to
+        // it. Say exactly that, because "sign in again" would read as failure.
+        return rejectSoftly(
+          `Your agent "${bootstrapped.agent.name}" was created. This connection could not be bound to it automatically — reconnect and choose it from the list.`,
+          403,
+        )
+      }
+
+      boundAgentId = bootstrapped.agent.id
+      mintMemberId = binding.memberId
+    } else if (agentIdRaw === '__mint_new__') {
       const newName = String(form.get('new_agent_name') ?? '').trim()
       const newSlugRaw = String(form.get('new_agent_slug') ?? '').trim()
       const squadId = String(form.get('new_agent_squad_id') ?? '').trim()

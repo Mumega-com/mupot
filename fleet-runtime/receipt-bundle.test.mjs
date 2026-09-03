@@ -6,7 +6,7 @@ import { spawnSync } from 'node:child_process'
 import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
-import { buildBundle, checkBundleManifest, exportBundle, formatHostGoPlan, formatStatusSummary, inspectBundleStatus, parseArgs, safeName } from './receipt-bundle.mjs'
+import { buildBundle, checkBundleManifest, exportBundle, formatHostGoPlan, formatStatusSummary, inspectBundleStatus, normalizeStarterEvidence, parseArgs, safeName } from './receipt-bundle.mjs'
 import { buildReceipt as buildHostReceipt } from './host-receipt.mjs'
 import { createServiceContext } from './service-context.mjs'
 import { renderLaunchd } from './launchd-service-manager.mjs'
@@ -16,6 +16,7 @@ import { verifyStarterBundle } from './starter-manifest.mjs'
 
 const POT_URL = 'https://pot.example.org'
 const POT_TENANT = 'tenant-a'
+const RELEASE_SHA = 'a'.repeat(40)
 const HEARTBEAT_DEFINITION = '[Service]\nExecStart=heartbeat\n'
 const CONTROL_DEFINITION = '[Service]\nExecStart=control\n'
 const STARTER_MANIFEST_VALUE = {
@@ -34,8 +35,10 @@ const digest = (value) => createHash('sha256').update(value).digest('hex')
 const HEARTBEAT_SHA = digest(HEARTBEAT_DEFINITION)
 const CONTROL_SHA = digest(CONTROL_DEFINITION)
 const STARTER_SHA = digest(STARTER_MANIFEST)
-const NEXT_STEP_ATTACH = 'attach manifest.json and cutover-gate.json to the cutover record; SOS removal is permitted only for the proven agent(s)'
-const NEXT_STEP_HOLD = 'do not remove SOS wiring yet; rerun until manifest.json and cutover-gate.json are status pass'
+const NEUTRAL_ATTACH = 'attach manifest.json and cutover-gate.json to the Host-Go handoff record; handoff is permitted only for the proven agent(s)'
+const NEUTRAL_HOLD = 'do not complete the Host-Go handoff yet; rerun until manifest.json and cutover-gate.json are status pass'
+const LEGACY_ATTACH = 'attach manifest.json and cutover-gate.json to the cutover record; SOS removal is permitted only for the proven agent(s)'
+const LEGACY_HOLD = 'do not remove SOS wiring yet; rerun until manifest.json and cutover-gate.json are status pass'
 const HOST_PANEL_PUBLIC_KEY_CHECK = {
   ok: true,
   component: 'fleet-control-daemon',
@@ -156,6 +159,24 @@ function probeReceipt(status = 'pass', verb = 'start') {
     ],
     checks,
   }
+}
+
+function boundProbeReceipt(status = 'pass', verb = 'start', releaseSha = RELEASE_SHA) {
+  const receipt = probeReceipt(status, verb)
+  const healthOk = status === 'pass'
+  receipt.inputs.release_sha = releaseSha
+  receipt.health = {
+    ok: healthOk,
+    service: 'mupot',
+    commit: releaseSha,
+    clean: healthOk,
+  }
+  receipt.checks.splice(3, 0,
+    { ok: true, component: 'cutover-probe', check: 'release_sha_valid' },
+    { ok: healthOk, component: 'cutover-probe', check: 'release_health_matches', status: 200 },
+  )
+  receipt.summary = summarizeFixture(receipt.checks)
+  return receipt
 }
 
 function hostReceipt(status = 'pass', opts = {}) {
@@ -413,8 +434,10 @@ function serviceAwareHostReceipt(sourceService = serviceReceipt()) {
   return receipt
 }
 
-function priorBundleManifest(status = 'pass', artifactDigests = {}) {
+function priorBundleManifest(status = 'pass', artifactDigests = {}, options = {}) {
   const ok = status === 'pass'
+  const cutoverReceiptType = options.cutoverReceiptType ?? 'mupot-sos-cutover-gate/v1'
+  const cutoverNextSteps = options.cutoverNextSteps ?? [LEGACY_ATTACH]
   const meta = (path, receiptType, sha256 = digest(`prior:${path}`)) => ({ path, receipt_type: receiptType, status, sha256 })
   const checks = [
     { ok, component: 'receipt-bundle', check: 'selected_agents_present', agents: ['agent-one'] },
@@ -451,10 +474,10 @@ function priorBundleManifest(status = 'pass', artifactDigests = {}) {
         meta('control-start.json', 'mupot-fleet-control-receipt/v1', artifactDigests.lifecycle_control_start),
         meta('control-stop.json', 'mupot-fleet-control-receipt/v1', artifactDigests.lifecycle_control_stop),
       ],
-      cutover_gate: meta('cutover-gate.json', 'mupot-sos-cutover-gate/v1'),
+      cutover_gate: meta('cutover-gate.json', cutoverReceiptType, artifactDigests.cutover_gate),
       manifest: 'manifest.json',
     },
-    next_steps: ['attach manifest.json and cutover-gate.json to the cutover record; SOS removal is permitted only for the proven agent(s)'],
+    next_steps: cutoverNextSteps,
     checks,
   }
 }
@@ -465,6 +488,190 @@ function seedCutoverEvidence(outDir, host = hostReceipt()) {
   writeJson(join(outDir, 'runtime-agent-one.json'), runtimeReceipt('agent-one'))
   writeJson(join(outDir, 'control-start.json'), controlReceipt('agent-one', 'start'))
   writeJson(join(outDir, 'control-stop.json'), controlReceipt('agent-one', 'stop'))
+}
+
+async function buildBoundBundle(releaseSha = RELEASE_SHA) {
+  const outDir = tmpDir()
+  seedCutoverEvidence(outDir)
+  writeJson(join(outDir, 'probe-start.json'), boundProbeReceipt('pass', 'start', releaseSha))
+  const bundle = await buildBundle({
+    outDir,
+    agents: ['agent-one'],
+    releaseSha,
+    verifyOnly: true,
+  })
+  return { outDir, bundle }
+}
+
+async function buildHiddenHistoricalProbeBundle() {
+  const outDir = tmpDir()
+  const hiddenStartPath = writeJson(join(outDir, 'probe-hidden-start.json'), probeReceipt('pass', 'start'))
+  const boundStopPath = writeJson(join(tmpDir(), 'bound-stop.json'), boundProbeReceipt('pass', 'stop'))
+  const service = serviceReceipt()
+  writeJson(join(outDir, 'host.json'), serviceAwareHostReceipt(service))
+  writeJson(join(outDir, 'runtime-agent-one.json'), runtimeReceipt('agent-one'))
+  writeJson(join(outDir, 'control-start.json'), stateControlReceipt('agent-one', 'start', 102, { probePath: hiddenStartPath }))
+  writeJson(join(outDir, 'control-stop.json'), stateControlReceipt('agent-one', 'stop', 102, { probePath: boundStopPath }))
+  const bundle = await buildBundle({
+    outDir,
+    agents: ['agent-one'],
+    releaseSha: RELEASE_SHA,
+    probeReceiptPaths: [boundStopPath],
+    verifyOnly: true,
+  })
+  return { outDir, bundle }
+}
+
+function copyDeclaredBundle(outDir) {
+  const copiedDir = tmpDir()
+  const manifest = JSON.parse(readFileSync(join(outDir, 'manifest.json'), 'utf8'))
+  const metas = [
+    manifest.artifacts.install,
+    ...manifest.artifacts.probes,
+    manifest.artifacts.host,
+    ...manifest.artifacts.runtimes,
+    ...manifest.artifacts.controls,
+    manifest.artifacts.cutover_gate,
+  ].filter(Boolean)
+  for (const meta of metas) copyFileSync(meta.path, join(copiedDir, basename(meta.path)))
+  copyFileSync(join(outDir, 'manifest.json'), join(copiedDir, 'manifest.json'))
+  chmodSync(copiedDir, 0o700)
+  for (const name of readdirSync(copiedDir)) chmodSync(join(copiedDir, name), 0o600)
+  return copiedDir
+}
+
+function legacyCutoverReceipt({ agentId = 'agent-one', hostPath, runtimePath, startPath, stopPath }) {
+  const checks = [
+    { ok: true, component: 'cutover-receipt', check: 'host_receipt_read', path: hostPath },
+    { ok: true, component: 'cutover-receipt', check: 'host_receipt_type', path: hostPath, expected: 'mupot-fleet-host-receipt/v1', actual: 'mupot-fleet-host-receipt/v1' },
+    { ok: true, component: 'cutover-receipt', check: 'host_receipt_status_pass', path: hostPath, actual: 'pass' },
+    { ok: true, component: 'cutover-receipt', check: 'runtime_receipt_read', path: runtimePath },
+    { ok: true, component: 'cutover-receipt', check: 'runtime_receipt_type', path: runtimePath, expected: 'mupot-fleet-runtime-receipt/v1', actual: 'mupot-fleet-runtime-receipt/v1' },
+    { ok: true, component: 'cutover-receipt', check: 'runtime_receipt_status_pass', path: runtimePath, actual: 'pass' },
+    { ok: true, component: 'cutover-receipt', check: 'control_receipt_read', path: startPath },
+    { ok: true, component: 'cutover-receipt', check: 'control_receipt_type', path: startPath, expected: 'mupot-fleet-control-receipt/v1', actual: 'mupot-fleet-control-receipt/v1' },
+    { ok: true, component: 'cutover-receipt', check: 'control_receipt_status_pass', path: startPath, actual: 'pass' },
+    { ok: true, component: 'cutover-receipt', check: 'control_receipt_read', path: stopPath },
+    { ok: true, component: 'cutover-receipt', check: 'control_receipt_type', path: stopPath, expected: 'mupot-fleet-control-receipt/v1', actual: 'mupot-fleet-control-receipt/v1' },
+    { ok: true, component: 'cutover-receipt', check: 'control_receipt_status_pass', path: stopPath, actual: 'pass' },
+    { ok: true, component: 'cutover-receipt', check: 'runtime_receipt_for_agent', agent_id: agentId, path: runtimePath },
+    { ok: true, component: 'cutover-receipt', check: 'runtime_signed_attach_for_agent', agent_id: agentId, path: runtimePath },
+    { ok: true, component: 'cutover-receipt', check: 'runtime_inbox_handoff_for_agent', agent_id: agentId, path: runtimePath },
+    { ok: true, component: 'cutover-receipt', check: 'control_verb_for_agent', agent_id: agentId, required_verb: 'start', matched_verb: 'start', matched_action: 'open' },
+    { ok: true, component: 'cutover-receipt', check: 'control_verb_for_agent', agent_id: agentId, required_verb: 'stop', matched_verb: 'stop', matched_action: 'close' },
+  ]
+  return {
+    receipt_type: 'mupot-sos-cutover-gate/v1',
+    generated_at: '2026-07-08T00:03:00.000Z',
+    status: 'pass',
+    summary: summarizeFixture(checks),
+    inputs: {
+      agents: [agentId],
+      host_receipt: hostPath,
+      runtime_receipts: [runtimePath],
+      control_receipts: [startPath, stopPath],
+      required_control_verbs: ['start', 'stop'],
+    },
+    checks,
+  }
+}
+
+function neutralCutoverReceipt(paths) {
+  const legacy = legacyCutoverReceipt(paths)
+  const checks = [
+    ...legacy.checks,
+    {
+      ok: true,
+      component: 'host-go-cutover',
+      check: 'no_live_sos_wiring',
+      substrate: 'mupot-herdr',
+      finding_count: 0,
+      findings: [],
+    },
+  ]
+  return {
+    ...legacy,
+    receipt_type: 'mupot-host-go-cutover/v1',
+    summary: summarizeFixture(checks),
+    inputs: {
+      substrate: 'mupot-herdr',
+      live_sos_wiring: false,
+      ...legacy.inputs,
+    },
+    checks,
+  }
+}
+
+function seedBundleForMode(gateType, outDir = tmpDir()) {
+  const paths = {
+    hostPath: writeJson(join(outDir, 'host.json'), hostReceipt()),
+    runtimePath: writeJson(join(outDir, 'runtime-agent-one.json'), runtimeReceipt('agent-one')),
+    startPath: writeJson(join(outDir, 'control-start.json'), controlReceipt('agent-one', 'start')),
+    stopPath: writeJson(join(outDir, 'control-stop.json'), controlReceipt('agent-one', 'stop')),
+  }
+  writeJson(join(outDir, 'install.json'), installReceipt('pass'))
+  writeJson(join(outDir, 'probe-start.json'), probeReceipt('pass', 'start'))
+  writeJson(join(outDir, 'probe-stop.json'), probeReceipt('pass', 'stop'))
+  const gate = gateType === 'mupot-host-go-cutover/v1'
+    ? neutralCutoverReceipt(paths)
+    : legacyCutoverReceipt(paths)
+  const gatePath = writeJson(join(outDir, 'cutover-gate.json'), gate)
+  const artifactDigests = {
+    install: sha256(join(outDir, 'install.json')),
+    probe_start: sha256(join(outDir, 'probe-start.json')),
+    probe_stop: sha256(join(outDir, 'probe-stop.json')),
+    host: sha256(paths.hostPath),
+    runtime_inbox: sha256(paths.runtimePath),
+    lifecycle_control_start: sha256(paths.startPath),
+    lifecycle_control_stop: sha256(paths.stopPath),
+    cutover_gate: sha256(gatePath),
+  }
+  const manifest = priorBundleManifest('pass', artifactDigests, {
+    cutoverReceiptType: gateType,
+    cutoverNextSteps: [gateType === 'mupot-host-go-cutover/v1' ? NEUTRAL_ATTACH : LEGACY_ATTACH],
+  })
+  manifest.inputs.out_dir = outDir
+  manifest.artifacts.out_dir = outDir
+  writeJson(join(outDir, 'manifest.json'), manifest)
+  chmodSync(outDir, 0o700)
+  for (const name of readdirSync(outDir).filter((entry) => entry.endsWith('.json'))) chmodSync(join(outDir, name), 0o600)
+  return outDir
+}
+
+function seedLegacyCutoverEvidence(outDir) {
+  return seedBundleForMode('mupot-sos-cutover-gate/v1', outDir)
+}
+
+function injectLiveSosHostEvidence(outDir) {
+  const hostPath = join(outDir, 'host.json')
+  const host = JSON.parse(readFileSync(hostPath, 'utf8'))
+  host.inputs.daemon_config = '/home/operator/.sos/daemon.json'
+  writeJson(hostPath, host)
+  const manifestPath = join(outDir, 'manifest.json')
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+  manifest.artifacts.host.sha256 = sha256(hostPath)
+  writeJson(manifestPath, manifest)
+}
+
+function rewriteCutoverMode(outDir, gateType) {
+  const paths = {
+    hostPath: join(outDir, 'host.json'),
+    runtimePath: join(outDir, 'runtime-agent-one.json'),
+    startPath: join(outDir, 'control-start.json'),
+    stopPath: join(outDir, 'control-stop.json'),
+  }
+  const gate = gateType === 'mupot-host-go-cutover/v1'
+    ? neutralCutoverReceipt(paths)
+    : legacyCutoverReceipt(paths)
+  const gatePath = writeJson(join(outDir, 'cutover-gate.json'), gate)
+  const manifestPath = join(outDir, 'manifest.json')
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+  manifest.artifacts.cutover_gate.receipt_type = gateType
+  manifest.artifacts.cutover_gate.status = 'pass'
+  manifest.artifacts.cutover_gate.sha256 = sha256(gatePath)
+  manifest.next_steps = [gateType === 'mupot-host-go-cutover/v1' ? NEUTRAL_ATTACH : LEGACY_ATTACH]
+  writeJson(manifestPath, manifest)
+  return manifest
 }
 
 function starterPaths(overrides = {}) {
@@ -674,6 +881,21 @@ function seedStarterEvidence(outDir, sources) {
   writeJson(join(outDir, 'control-stop.json'), evidence.controlStop)
 }
 
+async function exportPortableBundleForMode(gateType) {
+  const outDir = tmpDir()
+  const sources = starterPaths()
+  seedStarterEvidence(outDir, sources)
+  const bundle = await buildBundle({ outDir, agents: ['agent-one'], verifyOnly: true, ...sources })
+  assert.equal(bundle.status, 'pass', JSON.stringify(bundle.checks.filter((entry) => entry.ok !== true), null, 2))
+  rewriteCutoverMode(outDir, gateType)
+  const sourceCheck = checkBundleManifest({ outDir })
+  assert.equal(sourceCheck.status, 'pass', JSON.stringify(sourceCheck.checks.filter((entry) => entry.ok !== true), null, 2))
+  const exportDir = tmpDir()
+  const exportReceipt = exportBundle({ outDir, exportDir })
+  assert.equal(exportReceipt.status, 'pass', JSON.stringify(exportReceipt.checks.filter((entry) => entry.ok !== true), null, 2))
+  return { outDir, sources, exportDir, exportReceipt }
+}
+
 const STARTER_ROLE_FILES = Object.freeze({
   install: 'install.json',
   service: 'service.json',
@@ -706,6 +928,29 @@ function rewriteStarterEvidence(sources, role) {
   writeJson(path, value)
   sources.evidence.starter.artifacts.find((artifact) => artifact.role === role).sha256 = sha256(path)
   rewriteStarterReceipt(sources)
+}
+
+function bindPriorManifestRelease(sources, releaseSha) {
+  sources.evidence.priorManifest.inputs.release_sha = releaseSha
+  sources.evidence.priorManifest.checks.push(
+    { ok: true, component: 'receipt-bundle', check: 'release_sha_valid' },
+    { ok: true, component: 'receipt-bundle', check: 'probe_release_sha_matches_bundle', path: 'probe-start.json' },
+    { ok: true, component: 'receipt-bundle', check: 'probe_release_sha_matches_bundle', path: 'probe-stop.json' },
+  )
+  sources.evidence.priorManifest.summary = summarizeFixture(sources.evidence.priorManifest.checks)
+  rewriteStarterEvidence(sources, 'receipt_bundle_manifest')
+}
+
+function normalizeStarterSources(sources, expectedReleaseSha = null) {
+  return normalizeStarterEvidence({
+    serviceReceipt: sources.evidence.service,
+    continuousReceipt: sources.evidence.continuous,
+    starterReceipt: sources.evidence.starter,
+    hostReceipt: sources.evidence.host,
+    agents: ['agent-one'],
+    starterPath: sources.starterReceiptPath,
+    expectedReleaseSha,
+  })
 }
 
 function nestStarterSources(sources) {
@@ -767,7 +1012,8 @@ test('receipt bundle writes host, runtime, control, cutover gate, and manifest',
   assert.equal(bundle.artifacts.probes.length, 1)
   assert.equal(bundle.artifacts.probes[0].receipt_type, 'mupot-fleet-cutover-probe/v1')
   assert.equal(bundle.artifacts.cutover_gate.status, 'pass')
-  assert.ok(bundle.next_steps.some((s) => s.includes('SOS removal is permitted only for the proven agent')))
+  assert.equal(bundle.artifacts.cutover_gate.receipt_type, 'mupot-host-go-cutover/v1')
+  assert.deepEqual(bundle.next_steps, [NEUTRAL_ATTACH])
   assert.ok(existsSync(join(outDir, 'install.json')))
   assert.ok(existsSync(join(outDir, 'probe-start-probe.json')))
   assert.ok(existsSync(join(outDir, 'host.json')))
@@ -793,6 +1039,334 @@ test('receipt bundle writes host, runtime, control, cutover gate, and manifest',
   assert.ok(manifest.checks.some((c) => c.check === 'probe_receipt_status_pass' && c.ok === true))
   assert.ok(manifest.checks.some((c) => c.check === 'cutover_gate_status_pass' && c.ok === true))
   assert.ok(manifest.checks.some((c) => c.check === 'manifest_written' && c.ok === true))
+})
+
+test('release-bound bundle rejects a required probe with missing or mismatched release SHA', async (t) => {
+  for (const [name, probe] of [
+    ['missing', probeReceipt('pass', 'start')],
+    ['mismatched', boundProbeReceipt('pass', 'start', 'b'.repeat(40))],
+  ]) {
+    await t.test(name, async () => {
+      const outDir = tmpDir()
+      seedCutoverEvidence(outDir)
+      writeJson(join(outDir, 'probe-start.json'), probe)
+      const bundle = await buildBundle({
+        outDir,
+        agents: ['agent-one'],
+        releaseSha: RELEASE_SHA,
+        verifyOnly: true,
+      })
+
+      assert.equal(bundle.status, 'fail')
+      assert.ok(bundle.checks.some((check) =>
+        check.check === 'probe_release_sha_matches_bundle' && check.ok === false
+      ))
+    })
+  }
+})
+
+test('release-bound bundle emits the SHA, exports cleanly, and rechecks copied probes', async () => {
+  const { outDir, bundle } = await buildBoundBundle()
+  assert.equal(bundle.status, 'pass', JSON.stringify(bundle.checks.filter((check) => check.ok !== true), null, 2))
+  assert.equal(bundle.inputs.release_sha, RELEASE_SHA)
+
+  const manifest = JSON.parse(readFileSync(join(outDir, 'manifest.json'), 'utf8'))
+  assert.equal(manifest.inputs.release_sha, RELEASE_SHA)
+  assert.equal(checkBundleManifest({ outDir }).status, 'pass')
+
+  const exportDir = tmpDir()
+  const exported = exportBundle({ outDir, exportDir })
+  assert.equal(exported.status, 'pass', JSON.stringify(exported.checks.filter((check) => check.ok !== true), null, 2))
+  assert.equal(checkBundleManifest({ outDir: exportDir }).status, 'pass')
+  assert.equal(JSON.parse(readFileSync(join(exportDir, 'manifest.json'), 'utf8')).inputs.release_sha, RELEASE_SHA)
+  assert.equal(readFileSync(join(exportDir, 'export-receipt.json'), 'utf8').includes(RELEASE_SHA), false)
+  assert.equal(readFileSync(join(exportDir, 'manifest-check.json'), 'utf8').includes(RELEASE_SHA), false)
+})
+
+test('export and manifest check enforce the caller expected release SHA', async (t) => {
+  await t.test('expected A over bound B fails with named checks', async () => {
+    const { outDir } = await buildBoundBundle('b'.repeat(40))
+    const checked = checkBundleManifest({ outDir, releaseSha: RELEASE_SHA })
+    assert.equal(checked.status, 'fail')
+    assert.ok(checked.checks.some((check) =>
+      check.check === 'manifest_release_sha_matches_expected' && check.ok === false
+    ))
+
+    const exported = exportBundle({ outDir, exportDir: tmpDir(), releaseSha: RELEASE_SHA })
+    assert.equal(exported.status, 'fail')
+    assert.ok(exported.checks.some((check) =>
+      check.check === 'source_manifest_release_sha_matches_expected' && check.ok === false
+    ))
+  })
+
+  await t.test('expected A over bound A passes', async () => {
+    const { outDir } = await buildBoundBundle(RELEASE_SHA)
+    assert.equal(checkBundleManifest({ outDir, releaseSha: RELEASE_SHA }).status, 'pass')
+    assert.equal(exportBundle({ outDir, exportDir: tmpDir(), releaseSha: RELEASE_SHA }).status, 'pass')
+  })
+
+  await t.test('expected A over an unbound historical manifest fails', async () => {
+    const outDir = tmpDir()
+    seedCutoverEvidence(outDir)
+    assert.equal((await buildBundle({ outDir, agents: ['agent-one'], verifyOnly: true })).status, 'pass')
+    assert.equal(checkBundleManifest({ outDir, releaseSha: RELEASE_SHA }).status, 'fail')
+    assert.equal(exportBundle({ outDir, exportDir: tmpDir(), releaseSha: RELEASE_SHA }).status, 'fail')
+  })
+})
+
+test('manifest recheck derives the release SHA from the manifest and fails closed on missing, malformed, or mismatched binding', async (t) => {
+  for (const [name, mutate] of [
+    ['missing', (manifest) => { delete manifest.inputs.release_sha }],
+    ['uppercase', (manifest) => { manifest.inputs.release_sha = RELEASE_SHA.toUpperCase() }],
+    ['mismatched', (manifest) => { manifest.inputs.release_sha = 'b'.repeat(40) }],
+  ]) {
+    await t.test(name, async () => {
+      const { outDir, bundle } = await buildBoundBundle()
+      assert.equal(bundle.status, 'pass')
+      const manifestPath = join(outDir, 'manifest.json')
+      const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+      mutate(manifest)
+      writeJson(manifestPath, manifest)
+      chmodSync(manifestPath, 0o600)
+
+      const checked = checkBundleManifest({ outDir })
+      assert.equal(checked.status, 'fail')
+      assert.ok(checked.checks.some((check) =>
+        check.check === 'probe_release_sha_matches_manifest' && check.ok === false
+      ))
+    })
+  }
+})
+
+test('tampering an exported bound probe fails semantic recheck even after its manifest digest is updated', async () => {
+  const { outDir, bundle } = await buildBoundBundle()
+  assert.equal(bundle.status, 'pass')
+  const exportDir = tmpDir()
+  assert.equal(exportBundle({ outDir, exportDir }).status, 'pass')
+
+  const manifestPath = join(exportDir, 'manifest.json')
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+  const probePath = join(exportDir, basename(manifest.artifacts.probes[0].path))
+  const probe = JSON.parse(readFileSync(probePath, 'utf8'))
+  probe.health.commit = 'b'.repeat(40)
+  writeJson(probePath, probe)
+  chmodSync(probePath, 0o600)
+  manifest.artifacts.probes[0].sha256 = sha256(probePath)
+  writeJson(manifestPath, manifest)
+  chmodSync(manifestPath, 0o600)
+
+  const checked = checkBundleManifest({ outDir: exportDir })
+  assert.equal(checked.status, 'fail')
+  assert.ok(checked.checks.some((check) =>
+    check.check === 'probe_release_sha_matches_manifest' && check.ok === false
+  ))
+})
+
+test('historical unbound bundle remains valid without release fields', async () => {
+  const outDir = tmpDir()
+  seedCutoverEvidence(outDir)
+  const bundle = await buildBundle({ outDir, agents: ['agent-one'], verifyOnly: true })
+  assert.equal(bundle.status, 'pass')
+  assert.equal(Object.hasOwn(bundle.inputs, 'release_sha'), false)
+  assert.equal(checkBundleManifest({ outDir }).status, 'pass')
+})
+
+test('construction without release SHA rejects bound probe evidence', async (t) => {
+  for (const [name, seedProbes] of [
+    ['bound-only set', (outDir) => {
+      writeJson(join(outDir, 'probe-start.json'), boundProbeReceipt('pass', 'start'))
+    }],
+    ['mixed set', (outDir) => {
+      writeJson(join(outDir, 'probe-stop.json'), boundProbeReceipt('pass', 'stop'))
+    }],
+  ]) {
+    await t.test(name, async () => {
+      const outDir = tmpDir()
+      seedCutoverEvidence(outDir)
+      seedProbes(outDir)
+      const bundle = await buildBundle({ outDir, agents: ['agent-one'], verifyOnly: true })
+
+      assert.equal(bundle.status, 'fail')
+      assert.ok(bundle.checks.some((check) =>
+        check.check === 'probe_release_sha_matches_bundle' && check.ok === false
+      ))
+    })
+  }
+})
+
+test('release-bound build refuses lifecycle control evidence bound only to a hidden historical probe', async () => {
+  const { bundle } = await buildHiddenHistoricalProbeBundle()
+
+  assert.equal(bundle.status, 'fail')
+  assert.ok(bundle.checks.some((check) =>
+    check.check === 'control_probe_binding_valid' &&
+    check.verb === 'start' &&
+    check.ok === false
+  ))
+})
+
+test('manifest recheck recomputes lifecycle control bindings from declared probes', async () => {
+  const { outDir } = await buildHiddenHistoricalProbeBundle()
+  const copiedDir = copyDeclaredBundle(outDir)
+
+  const checked = checkBundleManifest({ outDir: copiedDir })
+  assert.equal(checked.status, 'fail')
+  assert.ok(checked.checks.some((check) =>
+    check.component === 'receipt-bundle-check' &&
+    check.check === 'control_probe_binding_valid' &&
+    check.verb === 'start' &&
+    check.ok === false
+  ))
+})
+
+test('starter prior manifest rejects probes bound to a different release SHA', async () => {
+  const priorReleaseSha = 'b'.repeat(40)
+  const sources = starterPaths({
+    probeStart: boundProbeReceipt('pass', 'start', RELEASE_SHA),
+    probeStop: boundProbeReceipt('pass', 'stop', RELEASE_SHA),
+  })
+  bindPriorManifestRelease(sources, priorReleaseSha)
+
+  const outDir = tmpDir()
+  seedStarterEvidence(outDir, sources)
+  const bundle = await buildBundle({
+    outDir,
+    agents: ['agent-one'],
+    releaseSha: RELEASE_SHA,
+    verifyOnly: true,
+    ...sources,
+  })
+
+  assert.equal(bundle.status, 'fail')
+  assert.ok(bundle.checks.some((check) =>
+    check.check === 'starter_evidence_contracts_valid' && check.ok === false
+  ))
+})
+
+test('starter prior release binding follows the outer bundle SHA without downgrade', async (t) => {
+  await t.test('outer A rejects internally consistent prior and nested probes B', async () => {
+    const priorReleaseSha = 'b'.repeat(40)
+    const sources = starterPaths({
+      probeStart: boundProbeReceipt('pass', 'start', priorReleaseSha),
+      probeStop: boundProbeReceipt('pass', 'stop', priorReleaseSha),
+    })
+    bindPriorManifestRelease(sources, priorReleaseSha)
+    assert.equal(normalizeStarterSources(sources, RELEASE_SHA), null)
+    const outDir = tmpDir()
+    seedStarterEvidence(outDir, sources)
+    writeJson(join(outDir, 'probe-start.json'), boundProbeReceipt('pass', 'start', RELEASE_SHA))
+    writeJson(join(outDir, 'probe-stop.json'), boundProbeReceipt('pass', 'stop', RELEASE_SHA))
+
+    const bundle = await buildBundle({
+      outDir,
+      agents: ['agent-one'],
+      releaseSha: RELEASE_SHA,
+      verifyOnly: true,
+      ...sources,
+    })
+
+    assert.equal(bundle.status, 'fail')
+    assert.ok(bundle.checks.some((check) =>
+      check.check === 'starter_evidence_contracts_valid' && check.ok === false
+    ))
+  })
+
+  await t.test('outer A accepts prior and nested probes A', async () => {
+    const sources = starterPaths({
+      probeStart: boundProbeReceipt('pass', 'start', RELEASE_SHA),
+      probeStop: boundProbeReceipt('pass', 'stop', RELEASE_SHA),
+    })
+    bindPriorManifestRelease(sources, RELEASE_SHA)
+    assert.ok(normalizeStarterSources(sources, RELEASE_SHA))
+    const outDir = tmpDir()
+    seedStarterEvidence(outDir, sources)
+
+    const bundle = await buildBundle({
+      outDir,
+      agents: ['agent-one'],
+      releaseSha: RELEASE_SHA,
+      verifyOnly: true,
+      ...sources,
+    })
+
+    assert.equal(bundle.status, 'pass', JSON.stringify(bundle.checks.filter((check) => check.ok !== true), null, 2))
+  })
+
+  await t.test('unbound outer rejects a bound prior bundle', async () => {
+    const priorReleaseSha = 'b'.repeat(40)
+    const sources = starterPaths({
+      probeStart: boundProbeReceipt('pass', 'start', priorReleaseSha),
+      probeStop: boundProbeReceipt('pass', 'stop', priorReleaseSha),
+    })
+    bindPriorManifestRelease(sources, priorReleaseSha)
+    assert.equal(normalizeStarterSources(sources), null)
+    const outDir = tmpDir()
+    seedStarterEvidence(outDir, sources)
+    writeJson(join(outDir, 'probe-start.json'), probeReceipt('pass', 'start'))
+    writeJson(join(outDir, 'probe-stop.json'), probeReceipt('pass', 'stop'))
+
+    const bundle = await buildBundle({ outDir, agents: ['agent-one'], verifyOnly: true, ...sources })
+
+    assert.equal(bundle.status, 'fail')
+    assert.ok(bundle.checks.some((check) =>
+      check.check === 'starter_evidence_contracts_valid' && check.ok === false
+    ))
+  })
+
+  await t.test('fully unbound outer and prior history remains valid', async () => {
+    const sources = starterPaths()
+    assert.ok(normalizeStarterSources(sources))
+    const outDir = tmpDir()
+    seedStarterEvidence(outDir, sources)
+
+    const bundle = await buildBundle({ outDir, agents: ['agent-one'], verifyOnly: true, ...sources })
+    assert.equal(bundle.status, 'pass', JSON.stringify(bundle.checks.filter((check) => check.ok !== true), null, 2))
+  })
+})
+
+test('new bundle rejects an injected legacy cutover gate', async () => {
+  const outDir = tmpDir()
+  seedCutoverEvidence(outDir)
+  const bundle = await buildBundle({
+    outDir,
+    agents: ['agent-one'],
+    verifyOnly: true,
+    cutoverBuilder: async ({ agents, hostPath, runtimePaths, controlPaths }) => legacyCutoverReceipt({
+      agentId: agents[0],
+      hostPath,
+      runtimePath: runtimePaths[0],
+      startPath: controlPaths.find((path) => path.endsWith('control-start.json')),
+      stopPath: controlPaths.find((path) => path.endsWith('control-stop.json')),
+    }),
+  })
+
+  assert.equal(bundle.status, 'fail')
+  assert.equal(bundle.artifacts.cutover_gate.receipt_type, 'mupot-sos-cutover-gate/v1')
+  assert.ok(bundle.checks.some((entry) => entry.check === 'cutover_gate_status_pass' && entry.ok === false))
+  assert.deepEqual(bundle.next_steps, [NEUTRAL_HOLD])
+})
+
+test('new bundle fails closed when an injected cutover builder returns null', async () => {
+  const outDir = tmpDir()
+  seedCutoverEvidence(outDir)
+  let bundle
+
+  await assert.doesNotReject(async () => {
+    bundle = await buildBundle({
+      outDir,
+      agents: ['agent-one'],
+      verifyOnly: true,
+      cutoverBuilder: async () => null,
+    })
+  })
+
+  assert.equal(bundle.status, 'fail')
+  assert.ok(bundle.checks.some((entry) =>
+    entry.check === 'cutover_gate_status_pass' &&
+    entry.ok === false &&
+    entry.actual === null
+  ))
+  assert.deepEqual(bundle.next_steps, [NEUTRAL_HOLD])
 })
 
 test('starter-ready bundle requires, exports, and summarizes service continuity evidence', async () => {
@@ -917,6 +1491,56 @@ test('starter-ready bundle requires, exports, and summarizes service continuity 
   }
   assert.deepEqual(absoluteStrings(copiedCheck), [])
   assert.deepEqual(absoluteStrings(inspectBundleStatus({ outDir: exportDir })), [])
+})
+
+for (const [name, gateType, attachPolicy] of [
+  ['neutral', 'mupot-host-go-cutover/v1', NEUTRAL_ATTACH],
+  ['historical legacy', 'mupot-sos-cutover-gate/v1', LEGACY_ATTACH],
+]) {
+  test(`portable export preserves ${name} cutover type, provenance, and status`, async () => {
+    const { exportDir, exportReceipt } = await exportPortableBundleForMode(gateType)
+    assert.deepEqual(exportReceipt.next_steps, [attachPolicy])
+
+    const manifest = JSON.parse(readFileSync(join(exportDir, 'manifest.json'), 'utf8'))
+    assert.equal(manifest.artifacts.cutover_gate.receipt_type, gateType)
+    const mapping = manifest.provenance.projections.find((entry) => entry.role === 'cutover_gate')
+    assert.equal(mapping.source_receipt_type, gateType)
+    const projection = JSON.parse(readFileSync(join(exportDir, mapping.path), 'utf8'))
+    assert.equal(projection.source_receipt_type, gateType)
+    assert.equal(projection.content.receipt_type, gateType)
+    assert.equal(JSON.parse(readFileSync(join(exportDir, mapping.source_path), 'utf8')).receipt_type, gateType)
+
+    const check = checkBundleManifest({ outDir: exportDir })
+    assert.equal(check.status, 'pass', JSON.stringify(check.checks.filter((entry) => entry.ok !== true), null, 2))
+    assert.ok(check.checks.some((entry) =>
+      entry.check === 'artifact_receipt_type_expected' &&
+      entry.artifact === 'cutover_gate' &&
+      entry.expected === gateType &&
+      entry.ok === true
+    ))
+    const status = inspectBundleStatus({ outDir: exportDir })
+    assert.equal(status.status, 'pass', JSON.stringify(status.checks.filter((entry) => entry.ok !== true), null, 2))
+    assert.deepEqual(status.next_steps, [attachPolicy])
+  })
+}
+
+test('portable provenance rejects a mapping that changes only the cutover receipt type', async () => {
+  const { exportDir } = await exportPortableBundleForMode('mupot-host-go-cutover/v1')
+  const manifestPath = join(exportDir, 'manifest.json')
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+  const mapping = manifest.provenance.projections.find((entry) => entry.role === 'cutover_gate')
+  mapping.source_receipt_type = 'mupot-sos-cutover-gate/v1'
+  writeJson(manifestPath, manifest)
+
+  const check = checkBundleManifest({ outDir: exportDir })
+  assert.equal(check.status, 'fail')
+  assert.ok(check.checks.some((entry) =>
+    entry.check === 'provenance_source_type_match' &&
+    entry.artifact === 'cutover_gate' &&
+    entry.expected === 'mupot-host-go-cutover/v1' &&
+    entry.actual === 'mupot-sos-cutover-gate/v1' &&
+    entry.ok === false
+  ))
 })
 
 test('starter-ready accepts daemon-state lifecycle receipts and binds them to the running control service', async () => {
@@ -1505,11 +2129,11 @@ test('receipt bundle fails when an included probe receipt did not queue inputs',
 
   assert.equal(bundle.status, 'fail')
   assert.ok(bundle.checks.some((c) => c.check === 'probe_receipt_status_pass' && c.ok === false && c.actual === 'fail'))
-  assert.deepEqual(bundle.next_steps, [NEXT_STEP_HOLD])
+  assert.deepEqual(bundle.next_steps, [NEUTRAL_HOLD])
   assert.ok(inspectBundleStatus({ outDir, agents: ['agent-one'] }).next_steps.some((s) => s.includes('queue inbox and lifecycle inputs')))
   const manifest = JSON.parse(readFileSync(join(outDir, 'manifest.json'), 'utf8'))
   assert.equal(manifest.artifacts.probes[0].status, 'fail')
-  assert.ok(manifest.next_steps.some((s) => s.includes('do not remove SOS wiring yet')))
+  assert.deepEqual(manifest.next_steps, [NEUTRAL_HOLD])
 })
 
 test('receipt bundle can reuse existing host, runtime, and control receipts', async () => {
@@ -1613,7 +2237,7 @@ test('receipt bundle fails when reused host receipt lacks public-only panel key 
     c.check === 'host_candidate_ignored' &&
     c.required_checks_pass === false
   ))
-  assert.deepEqual(bundle.next_steps, [NEXT_STEP_HOLD])
+  assert.deepEqual(bundle.next_steps, [NEUTRAL_HOLD])
   assert.ok(inspectBundleStatus({ outDir, agents: ['agent-one'] }).next_steps.some((s) => s.includes('panel_public_key_public_only')))
 })
 
@@ -1661,6 +2285,224 @@ test('verify-only rechecks an existing bundle without live receipt builders', as
   assert.ok(manifest.next_steps.some((s) => s.includes('attach manifest.json and cutover-gate.json')))
 })
 
+test('manifest checker preserves a strict historical SOS cutover bundle', () => {
+  const outDir = seedLegacyCutoverEvidence(tmpDir())
+  const check = checkBundleManifest({ outDir })
+  assert.equal(check.status, 'pass', JSON.stringify(check.checks.filter((entry) => entry.ok !== true), null, 2))
+})
+
+for (const [name, gateType, attachPolicy] of [
+  ['neutral', 'mupot-host-go-cutover/v1', NEUTRAL_ATTACH],
+  ['historical legacy', 'mupot-sos-cutover-gate/v1', LEGACY_ATTACH],
+]) {
+  test(`copied ${name} bundle preserves exact cutover mode through manifest, export, and status`, () => {
+    const outDir = seedBundleForMode(gateType)
+    const copiedDir = tmpDir()
+    for (const file of readdirSync(outDir)) copyFileSync(join(outDir, file), join(copiedDir, file))
+    chmodSync(copiedDir, 0o700)
+    for (const file of readdirSync(copiedDir)) chmodSync(join(copiedDir, file), 0o600)
+
+    const check = checkBundleManifest({ outDir: copiedDir })
+    assert.equal(check.status, 'pass', JSON.stringify(check.checks.filter((entry) => entry.ok !== true), null, 2))
+    assert.ok(check.checks.some((entry) =>
+      entry.check === 'artifact_receipt_type_expected' &&
+      entry.artifact === 'cutover_gate' &&
+      entry.expected === gateType &&
+      entry.ok === true
+    ))
+
+    const exportDir = tmpDir()
+    const exportReceipt = exportBundle({ outDir: copiedDir, exportDir })
+    assert.equal(exportReceipt.status, 'pass', JSON.stringify(exportReceipt.checks.filter((entry) => entry.ok !== true), null, 2))
+    assert.deepEqual(exportReceipt.next_steps, [attachPolicy])
+    const exportedManifest = JSON.parse(readFileSync(join(exportDir, 'manifest.json'), 'utf8'))
+    assert.equal(exportedManifest.artifacts.cutover_gate.receipt_type, gateType)
+    assert.equal(exportReceipt.artifacts.copied.find((entry) => entry.label === 'cutover_gate').receipt_type, gateType)
+    assert.equal(checkBundleManifest({ outDir: exportDir }).status, 'pass')
+
+    const status = inspectBundleStatus({ outDir: exportDir })
+    assert.equal(status.status, 'pass', JSON.stringify(status.checks.filter((entry) => entry.ok !== true), null, 2))
+    assert.deepEqual(status.next_steps, [attachPolicy])
+    assert.equal(checklistById(status, 'cutover_gate_passed').status, 'pass')
+  })
+}
+
+test('manifest rejects cutover metadata and gate-file type disagreement without a fallback mode', () => {
+  const outDir = seedBundleForMode('mupot-host-go-cutover/v1')
+  const manifestPath = join(outDir, 'manifest.json')
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+  manifest.artifacts.cutover_gate.receipt_type = 'mupot-sos-cutover-gate/v1'
+  manifest.next_steps = [LEGACY_ATTACH]
+  writeJson(manifestPath, manifest)
+
+  const check = checkBundleManifest({ outDir })
+  assert.equal(check.status, 'fail')
+  assert.ok(check.checks.some((entry) => entry.check === 'cutover_gate_mode_valid' && entry.ok === false))
+  assert.ok(check.checks.some((entry) =>
+    entry.check === 'artifact_receipt_type_expected' &&
+    entry.artifact === 'cutover_gate' &&
+    entry.expected === 'mupot-sos-cutover-gate/v1' &&
+    entry.actual === 'mupot-host-go-cutover/v1' &&
+    entry.ok === false
+  ))
+})
+
+for (const [gateType, wrongPolicy] of [
+  ['mupot-host-go-cutover/v1', LEGACY_ATTACH],
+  ['mupot-sos-cutover-gate/v1', NEUTRAL_ATTACH],
+]) {
+  test(`export checker rejects ${gateType} policy disagreement`, () => {
+    const outDir = seedBundleForMode(gateType)
+    const exportDir = tmpDir()
+    assert.equal(exportBundle({ outDir, exportDir }).status, 'pass')
+    const sidecarPath = join(exportDir, 'export-receipt.json')
+    const sidecar = JSON.parse(readFileSync(sidecarPath, 'utf8'))
+    sidecar.next_steps = [wrongPolicy]
+    writeJson(sidecarPath, sidecar)
+
+    const check = checkBundleManifest({ outDir: exportDir })
+    assert.equal(check.status, 'fail')
+    assert.ok(check.checks.some((entry) =>
+      entry.check === 'export_sidecar_semantics_complete' &&
+      entry.sidecar === 'export-receipt.json' &&
+      entry.ok === false
+    ))
+  })
+}
+
+test('copied neutral bundle rejects a forged no-live-SOS pass', () => {
+  const outDir = seedBundleForMode('mupot-host-go-cutover/v1')
+  const gatePath = join(outDir, 'cutover-gate.json')
+  const gate = JSON.parse(readFileSync(gatePath, 'utf8'))
+  gate.checks.at(-1).finding_count = 1
+  gate.checks.at(-1).findings = [{ location: 'host.checks[0].path', marker: 'sos_path' }]
+  gate.summary = summarizeFixture(gate.checks)
+  writeJson(gatePath, gate)
+  const manifestPath = join(outDir, 'manifest.json')
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+  manifest.artifacts.cutover_gate.sha256 = sha256(gatePath)
+  writeJson(manifestPath, manifest)
+
+  const check = checkBundleManifest({ outDir })
+  assert.equal(check.status, 'fail')
+  assert.ok(check.checks.some((entry) => entry.check === 'cutover_gate_mode_valid' && entry.ok === false))
+})
+
+test('copied neutral bundle recomputes no-live-SOS from hashed source receipts', () => {
+  const outDir = seedBundleForMode('mupot-host-go-cutover/v1')
+  injectLiveSosHostEvidence(outDir)
+
+  const check = checkBundleManifest({ outDir })
+
+  assert.equal(check.status, 'fail')
+  const recomputed = check.checks.find((entry) => entry.check === 'neutral_source_receipts_no_live_sos')
+  assert.deepEqual(recomputed?.findings, [
+    { location: 'host.inputs.daemon_config', marker: 'sos_path' },
+  ])
+  assert.equal(recomputed?.finding_count, 1)
+  assert.doesNotMatch(JSON.stringify(recomputed), /home|operator|daemon\.json/)
+})
+
+test('exported neutral bundle recomputes no-live-SOS before emitting attach policy', () => {
+  const outDir = seedBundleForMode('mupot-host-go-cutover/v1')
+  injectLiveSosHostEvidence(outDir)
+  const exportDir = tmpDir()
+
+  const exportReceipt = exportBundle({ outDir, exportDir })
+  const check = checkBundleManifest({ outDir: exportDir })
+
+  assert.equal(exportReceipt.status, 'fail')
+  assert.equal(exportReceipt.next_steps.includes(NEUTRAL_ATTACH), false)
+  assert.equal(check.status, 'fail')
+  assert.ok(check.checks.some((entry) =>
+    entry.check === 'neutral_source_receipts_no_live_sos' &&
+    entry.ok === false &&
+    entry.finding_count === 1 &&
+    entry.findings[0]?.location === 'host.inputs.daemon_config' &&
+    entry.findings[0]?.marker === 'sos_path'
+  ))
+})
+
+test('legacy bundle does not recompute neutral no-live-SOS evidence', () => {
+  const outDir = seedBundleForMode('mupot-sos-cutover-gate/v1')
+  injectLiveSosHostEvidence(outDir)
+
+  const check = checkBundleManifest({ outDir })
+
+  assert.equal(check.status, 'pass', JSON.stringify(check.checks.filter((entry) => entry.ok !== true), null, 2))
+  assert.equal(check.checks.some((entry) => entry.check === 'neutral_source_receipts_no_live_sos'), false)
+})
+
+test('copied legacy gate cannot be interpreted with the neutral schema', () => {
+  const outDir = seedBundleForMode('mupot-sos-cutover-gate/v1')
+  const gatePath = join(outDir, 'cutover-gate.json')
+  const gate = JSON.parse(readFileSync(gatePath, 'utf8'))
+  gate.receipt_type = 'mupot-host-go-cutover/v1'
+  writeJson(gatePath, gate)
+  const manifestPath = join(outDir, 'manifest.json')
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+  manifest.artifacts.cutover_gate.receipt_type = 'mupot-host-go-cutover/v1'
+  manifest.artifacts.cutover_gate.sha256 = sha256(gatePath)
+  manifest.next_steps = [NEUTRAL_ATTACH]
+  writeJson(manifestPath, manifest)
+
+  const check = checkBundleManifest({ outDir })
+  assert.equal(check.status, 'fail')
+  assert.ok(check.checks.some((entry) => entry.check === 'cutover_gate_mode_valid' && entry.ok === false))
+})
+
+for (const [gateType, nextSteps] of [
+  ['mupot-host-go-cutover/v1', [LEGACY_ATTACH]],
+  ['mupot-sos-cutover-gate/v1', [NEUTRAL_ATTACH]],
+]) {
+  test(`manifest rejects mixed cutover mode ${gateType}`, () => {
+    const outDir = seedBundleForMode(gateType)
+    const manifestPath = join(outDir, 'manifest.json')
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+    manifest.next_steps = nextSteps
+    writeJson(manifestPath, manifest)
+    assert.equal(checkBundleManifest({ outDir }).status, 'fail')
+  })
+}
+
+for (const [name, mutate] of [
+  ['missing substrate input', (gate) => { delete gate.inputs.substrate }],
+  ['wrong substrate input', (gate) => { gate.inputs.substrate = 'other-substrate' }],
+  ['non-boolean live SOS input', (gate) => { gate.inputs.live_sos_wiring = 'false' }],
+  ['live SOS input set true', (gate) => { gate.inputs.live_sos_wiring = true }],
+  ['missing no-live-SOS check', (gate) => { gate.checks.pop() }],
+  ['nonzero finding count', (gate) => { gate.checks.at(-1).finding_count = 1 }],
+  ['nonempty findings', (gate) => { gate.checks.at(-1).findings = [{ location: 'host.checks[0].path', marker: 'sos_path' }] }],
+  ['wrong no-live-SOS component', (gate) => { gate.checks.at(-1).component = 'cutover-receipt' }],
+  ['wrong no-live-SOS check name', (gate) => { gate.checks.at(-1).check = 'no_sos' }],
+  ['unknown top-level field', (gate) => { gate.extra = true }],
+  ['unknown input field', (gate) => { gate.inputs.extra = true }],
+  ['unknown check field', (gate) => { gate.checks.at(-1).extra = true }],
+]) {
+  test(`manifest rejects forged neutral pass with ${name}`, () => {
+    const outDir = seedBundleForMode('mupot-host-go-cutover/v1')
+    const gatePath = join(outDir, 'cutover-gate.json')
+    const gate = JSON.parse(readFileSync(gatePath, 'utf8'))
+    mutate(gate)
+    gate.summary = summarizeFixture(gate.checks)
+    writeJson(gatePath, gate)
+
+    const manifestPath = join(outDir, 'manifest.json')
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+    manifest.artifacts.cutover_gate.sha256 = sha256(gatePath)
+    writeJson(manifestPath, manifest)
+
+    let check
+    assert.doesNotThrow(() => { check = checkBundleManifest({ outDir }) })
+    assert.equal(check.status, 'fail')
+    assert.ok(check.checks.some((entry) =>
+      entry.check === 'artifact_receipt_json_read' &&
+      entry.artifact === 'cutover_gate' &&
+      entry.ok === false
+    ))
+  })
+}
+
 test('manifest check verifies copied bundle hashes without rewriting files', async () => {
   const outDir = tmpDir()
   writeJson(join(outDir, 'probe-start.json'), probeReceipt())
@@ -1704,7 +2546,7 @@ test('manifest check verifies copied bundle hashes without rewriting files', asy
   assert.ok(check.checks.some((c) =>
     c.check === 'artifact_receipt_type_expected' &&
     c.artifact === 'cutover_gate' &&
-    c.expected === 'mupot-sos-cutover-gate/v1' &&
+    c.expected === 'mupot-host-go-cutover/v1' &&
     c.ok === true
   ))
   assert.ok(check.checks.some((c) =>
@@ -1879,6 +2721,34 @@ test('export writes a clean self-contained attachable bundle', async () => {
   assert.equal(tamperedSidecar.status, 'fail')
   assert.ok(tamperedSidecar.checks.some((check) => check.check === 'export_sidecar_receipt_json_read' && check.sidecar === 'export-receipt.json' && check.ok === false))
   assert.equal(checkBundleManifest({ outDir }).status, 'fail')
+})
+
+test('export preserves the strict historical legacy cutover policy', () => {
+  const outDir = seedLegacyCutoverEvidence(tmpDir())
+  const exportDir = tmpDir()
+
+  const receipt = exportBundle({ outDir, exportDir })
+
+  assert.equal(receipt.status, 'pass', JSON.stringify(receipt.checks.filter((entry) => entry.ok === false), null, 2))
+  assert.deepEqual(receipt.next_steps, [LEGACY_ATTACH])
+  const persisted = JSON.parse(readFileSync(join(exportDir, 'export-receipt.json'), 'utf8'))
+  assert.deepEqual(persisted.next_steps, [LEGACY_ATTACH])
+  assert.equal(checkBundleManifest({ outDir: exportDir }).status, 'pass')
+})
+
+test('export checker accepts the exact legacy attach policy', () => {
+  const outDir = seedLegacyCutoverEvidence(tmpDir())
+  const exportDir = tmpDir()
+  const receipt = exportBundle({ outDir, exportDir })
+  assert.equal(receipt.status, 'pass')
+
+  const exportReceiptPath = join(exportDir, 'export-receipt.json')
+  const persisted = JSON.parse(readFileSync(exportReceiptPath, 'utf8'))
+  persisted.next_steps = [LEGACY_ATTACH]
+  writeJson(exportReceiptPath, persisted)
+
+  const check = checkBundleManifest({ outDir: exportDir })
+  assert.equal(check.status, 'pass', JSON.stringify(check.checks.filter((entry) => entry.ok === false), null, 2))
 })
 
 test('manifest check fails when exported bundle sidecar receipts are missing', async () => {
@@ -2121,7 +2991,37 @@ test('status reports a complete host-go bundle as pass', async () => {
   assert.ok(status.checks.some((c) => c.check === 'manifest_check_pass' && c.ok === true))
   assert.ok(status.checks.some((c) => c.check === 'copied_bundle_no_secret_material' && c.ok === true))
   assert.ok(status.checks.some((c) => c.check === 'copied_bundle_only_manifest_artifacts' && c.ok === true))
-  assert.ok(status.next_steps.some((s) => s.includes('SOS removal is permitted only for the proven agent')))
+  assert.ok(status.next_steps.includes(NEUTRAL_ATTACH))
+})
+
+test('status rejects manifest cutover metadata and gate content disagreement without selecting a policy', () => {
+  const outDir = seedBundleForMode('mupot-host-go-cutover/v1')
+  const manifestPath = join(outDir, 'manifest.json')
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+  manifest.artifacts.cutover_gate.receipt_type = 'mupot-sos-cutover-gate/v1'
+  manifest.next_steps = [LEGACY_ATTACH]
+  writeJson(manifestPath, manifest)
+
+  const status = inspectBundleStatus({ outDir })
+
+  assert.equal(status.status, 'fail')
+  assert.equal(status.manifest_check.status, 'fail')
+  assert.ok(status.checks.some((entry) =>
+    entry.check === 'cutover_gate_mode_valid' &&
+    entry.expected === 'mupot-sos-cutover-gate/v1' &&
+    entry.actual === 'mupot-host-go-cutover/v1' &&
+    entry.ok === false
+  ))
+  assert.equal(status.next_steps.some((step) => [NEUTRAL_ATTACH, NEUTRAL_HOLD, LEGACY_ATTACH, LEGACY_HOLD].includes(step)), false)
+})
+
+test('status selects no cutover policy when the gate is missing', () => {
+  const outDir = tmpDir()
+  const status = inspectBundleStatus({ outDir, agents: ['agent-one'] })
+
+  assert.equal(status.status, 'fail')
+  assert.ok(status.checks.some((entry) => entry.check === 'cutover_gate_mode_valid' && entry.ok === false))
+  assert.equal(status.next_steps.some((step) => [NEUTRAL_ATTACH, NEUTRAL_HOLD, LEGACY_ATTACH, LEGACY_HOLD].includes(step)), false)
 })
 
 test('status reports missing host-go evidence and next steps for a partial bundle', () => {
@@ -2157,7 +3057,7 @@ test('status reports missing host-go evidence and next steps for a partial bundl
   assert.ok(status.next_steps.some((s) => s.includes('save installer output')))
   assert.ok(status.next_steps.some((s) => s.includes('queue inbox and lifecycle inputs')))
   assert.ok(status.next_steps.some((s) => s.includes('runtime-agent-one.json')))
-  assert.ok(status.next_steps.some((s) => s.includes('do not remove SOS wiring yet')))
+  assert.equal(status.next_steps.some((step) => [NEUTRAL_ATTACH, NEUTRAL_HOLD, LEGACY_ATTACH, LEGACY_HOLD].includes(step)), false)
 })
 
 test('status reports stale host receipt missing public-only panel key evidence', () => {
@@ -2251,7 +3151,7 @@ test('manifest check fails when next_steps contradict readiness', async () => {
 
   const manifestPath = join(outDir, 'manifest.json')
   const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
-  manifest.next_steps = ['do not remove SOS wiring yet; rerun until manifest.json and cutover-gate.json are status pass']
+  manifest.next_steps = [NEUTRAL_HOLD]
   writeJson(manifestPath, manifest)
 
   const check = checkBundleManifest({ manifestPath })
@@ -2275,7 +3175,7 @@ test('manifest check enforces a closed ordered next_steps policy', async () => {
   await buildBundle({ outDir, agents: ['agent-one'], verifyOnly: true })
   const manifestPath = join(outDir, 'manifest.json')
   const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
-  manifest.next_steps.push('leave SOS wiring installed forever')
+  manifest.next_steps.push('complete the handoff without the exact policy')
   writeJson(manifestPath, manifest)
 
   const check = checkBundleManifest({ outDir })
@@ -2292,7 +3192,7 @@ test('manifest check rejects instructions before the sole non-ready hold step', 
   await buildBundle({ outDir, agents: ['agent-one'], verifyOnly: true })
   const manifestPath = join(outDir, 'manifest.json')
   const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
-  manifest.next_steps = ['remove SOS wiring now despite the failed gate', NEXT_STEP_HOLD]
+  manifest.next_steps = ['complete the handoff now despite the failed gate', NEUTRAL_HOLD]
   writeJson(manifestPath, manifest)
 
   const check = checkBundleManifest({ outDir })
@@ -2300,7 +3200,7 @@ test('manifest check rejects instructions before the sole non-ready hold step', 
   assert.ok(check.checks.some((entry) => entry.check === 'next_steps_exact_policy' && entry.ok === false))
 })
 
-test('legacy SOS-only manifest check preserves the pre-Task-7 check surface', async () => {
+test('generic Host-Go manifest check preserves the pre-Task-7 check surface', async () => {
   const outDir = tmpDir()
   seedCutoverEvidence(outDir)
   const bundle = await buildBundle({ outDir, agents: ['agent-one'], verifyOnly: true })
@@ -3033,7 +3933,7 @@ test('receipt bundle fails when the final cutover gate lacks stop evidence', asy
 
   assert.equal(bundle.status, 'fail')
   assert.ok(bundle.checks.some((c) => c.check === 'cutover_gate_status_pass' && c.ok === false && c.actual === 'fail'))
-  assert.deepEqual(bundle.next_steps, [NEXT_STEP_HOLD])
+  assert.deepEqual(bundle.next_steps, [NEUTRAL_HOLD])
   assert.ok(inspectBundleStatus({ outDir, agents: ['agent-one'] }).next_steps.some((s) => s.includes('agent-one:stop')))
   const gate = JSON.parse(readFileSync(join(outDir, 'cutover-gate.json'), 'utf8'))
   assert.ok(gate.checks.some((c) => c.check === 'control_verb_for_agent' && c.required_verb === 'stop' && c.ok === false))
@@ -3137,16 +4037,52 @@ test('parseArgs accepts read-only host-go status', () => {
 })
 
 test('parseArgs accepts host-go plan options', () => {
-  const opts = parseArgs(['--agent', 'agent-one', '--out-dir', './receipts/agent-one', '--export-dir', './receipts/agent-one-attach', '--base-url', 'https://pot.example.org', '--host-go-plan'])
+  const opts = parseArgs(['--agent', 'agent-one', '--out-dir', './receipts/agent-one', '--export-dir', './receipts/agent-one-attach', '--base-url', 'https://pot.example.org', '--release-sha', RELEASE_SHA, '--host-go-plan'])
 
   assert.equal(opts.hostGoPlan, true)
   assert.equal(opts.baseUrl, 'https://pot.example.org')
+  assert.equal(opts.releaseSha, RELEASE_SHA)
   assert.ok(opts.outDir.endsWith('/receipts/agent-one'))
   assert.ok(opts.exportDir.endsWith('/receipts/agent-one-attach'))
   assert.deepEqual(opts.agents, ['agent-one'])
 })
 
-test('formatHostGoPlan prints the full #274 live-host command sequence without token values', () => {
+test('parseArgs rejects malformed or uppercase release SHA', () => {
+  assert.throws(() => parseArgs(['--release-sha', 'abc']), /release sha/i)
+  assert.throws(() => parseArgs(['--release-sha', RELEASE_SHA.toUpperCase()]), /release sha/i)
+})
+
+test('release-bound Host-Go plan passes the SHA to every probe, build, export, and check command', () => {
+  const plan = formatHostGoPlan({
+    agents: ['agent-one'],
+    outDir: '~/.fleet/receipts/agent-one',
+    exportDir: '~/.fleet/receipts/agent-one-attach',
+    installReceiptPath: '~/.fleet/receipts/install.json',
+    baseUrl: POT_URL,
+    releaseSha: RELEASE_SHA,
+    requiredControlVerbs: ['start', 'stop'],
+  })
+
+  const probeCommands = plan.split('\n').filter((line) => line.includes('/cutover-probe.mjs'))
+  const releaseSensitiveBundleCommands = plan.split('\n').filter((line) =>
+    line.includes('/receipt-bundle.mjs') &&
+    !line.includes('--status')
+  )
+  const exportCommands = releaseSensitiveBundleCommands.filter((line) => line.includes('--export'))
+  const checkCommands = releaseSensitiveBundleCommands.filter((line) => line.includes('--check-manifest'))
+  const bundleBuildCommands = releaseSensitiveBundleCommands.filter((line) => !line.includes('--export') && !line.includes('--check-manifest'))
+  assert.equal(probeCommands.length, 2)
+  assert.ok(probeCommands.every((line) => line.includes(`--release-sha ${RELEASE_SHA}`)))
+  assert.ok(bundleBuildCommands.length > 0)
+  assert.ok(bundleBuildCommands.every((line) => line.includes(`--release-sha ${RELEASE_SHA}`)))
+  assert.equal(exportCommands.length, 1)
+  assert.ok(exportCommands.every((line) => line.includes(`--release-sha ${RELEASE_SHA}`)))
+  assert.equal(checkCommands.length, 1)
+  assert.ok(checkCommands.every((line) => line.includes(`--release-sha ${RELEASE_SHA}`)))
+  assert.ok(releaseSensitiveBundleCommands.every((line) => line.includes(`--release-sha ${RELEASE_SHA}`)))
+})
+
+test('formatHostGoPlan prints a release-neutral live-host command sequence without token values', () => {
   const plan = formatHostGoPlan({
     agents: ['agent-one'],
     outDir: '~/.fleet/receipts/agent-one',
@@ -3156,7 +4092,8 @@ test('formatHostGoPlan prints the full #274 live-host command sequence without t
     requiredControlVerbs: ['start', 'stop'],
   })
 
-  assert.ok(plan.includes('Mupot host-go plan (#274)'))
+  assert.ok(plan.includes('Mupot/Herdr Host-Go handoff plan'))
+  assert.doesNotMatch(plan, /#274/)
   assert.ok(plan.includes('node fleet-runtime/install.mjs > ~/.fleet/receipts/install.json'))
   assert.ok(plan.includes('node ~/.fleet/runtime/receipt-bundle.mjs --agent agent-one --out-dir ~/.fleet/receipts/agent-one --require-control-verb start,stop --install-receipt ~/.fleet/receipts/install.json --skip-runtime --skip-control'))
   assert.ok(plan.includes('# Requires MUPOT_AGENT_TOKEN and MUPOT_OWNER_TOKEN in the environment.'))
@@ -3171,6 +4108,10 @@ test('formatHostGoPlan prints the full #274 live-host command sequence without t
   assert.ok(plan.includes('--export-dir ~/.fleet/receipts/agent-one-attach --export'))
   assert.ok(plan.includes('--out-dir ~/.fleet/receipts/agent-one-attach --check-manifest'))
   assert.ok(plan.includes('export-receipt.json, and manifest-check.json all report status "pass"'))
+  assert.doesNotMatch(plan, /SOS removal/)
+  assert.doesNotMatch(plan, /SOS wiring/)
+  assert.doesNotMatch(plan, /mupot-sos-cutover-gate\/v1/)
+  assert.match(plan, /Host-Go handoff/)
   assert.doesNotMatch(plan, /mupot_[A-Za-z0-9]/)
   assert.doesNotMatch(plan, /Bearer\s+[A-Za-z0-9]/)
 })

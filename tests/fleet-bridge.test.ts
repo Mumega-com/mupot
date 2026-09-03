@@ -88,6 +88,7 @@ function envWith(db: ReturnType<typeof makeDb>, tenant = 't'): Env {
 
 const baseInput = {
   agentId: 'hermes-mac',
+  runtimeAddress: 'hermes-mac',
   squadId: 'squad-1',
   taskId: 'task-1',
   receiptId: 'receipt-1',
@@ -115,10 +116,12 @@ describe('deliverDispatchToInbox', () => {
     expect(row.request_id).toBe('dispatch-inbox:receipt-1')
     const body = JSON.parse(row.body) as Record<string, unknown>
     expect(body).toEqual({
+      version: 'runtime.dispatch/v1',
       type: 'task_dispatch',
       task_id: 'task-1',
       dispatch_receipt_id: 'receipt-1',
       squad_id: 'squad-1',
+      runtime_address: 'hermes-mac',
     })
   })
 

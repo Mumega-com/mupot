@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Mupot v0.23 real work-lifecycle evidence checker.
+// Mupot real work-lifecycle evidence checker.
 //
 // This validates one actual product task cycle: task creation, real-agent
 // execution, approval, completion, and audit visibility.
@@ -51,6 +51,8 @@ const SECRET_VALUE_PATTERNS = [
 
 const SECRET_FIELD_RE = /(?:^|[_-])(authorization|bearer|token|access[_-]?token|refresh[_-]?token|secret|password|passwd|api[_-]?key|private[_-]?key|client[_-]?secret|cookie)(?:$|[_-])/i
 const SAFE_REFERENCE_FIELD_RE = /(?:^|[_-])(env|name|names|ref|path|file|id|ids|label|labels)$/i
+const SOURCE_HEALTH_STEP = 'agent_execution'
+const SOURCE_HEALTH_KEYS = ['ok', 'service', 'commit', 'clean']
 
 export function parseArgs(argv) {
   const opts = {
@@ -59,6 +61,7 @@ export function parseArgs(argv) {
     baseUrl: '',
     agent: '',
     taskId: '',
+    releaseSha: '',
     plan: false,
     check: false,
     summary: false,
@@ -78,6 +81,11 @@ export function parseArgs(argv) {
     else if (arg === '--base-url') opts.baseUrl = stripTrailingSlash(next())
     else if (arg === '--agent') opts.agent = next()
     else if (arg === '--task-id') opts.taskId = next()
+    else if (arg === '--release-sha') {
+      const releaseSha = next()
+      if (!isCanonicalReleaseSha(releaseSha)) throw new Error('invalid release SHA: expected 40 lowercase hexadecimal characters')
+      opts.releaseSha = releaseSha
+    }
     else if (arg === '--plan') opts.plan = true
     else if (arg === '--check') opts.check = true
     else if (arg === '--summary') opts.summary = true
@@ -101,6 +109,7 @@ export function usage() {
     '  --base-url <url>       expected pot URL',
     '  --agent <id-or-slug>   expected real agent identity',
     '  --task-id <id>         expected task id',
+    '  --release-sha <sha>    expected 40-character lowercase release SHA',
     '  -h, --help             show this help',
   ].join('\n')
 }
@@ -128,10 +137,11 @@ export function formatPlan(opts = {}) {
   const baseUrl = opts.baseUrl || 'https://<pot-host>'
   const agent = opts.agent || '<agent-id-or-slug>'
   const taskId = opts.taskId || '<task-id>'
+  const releaseSha = opts.releaseSha || ''
   const outDir = defaultOutDir(opts)
   const lines = []
 
-  lines.push('Mupot v0.23 real work-lifecycle evidence plan')
+  lines.push('Mupot real work-lifecycle evidence plan')
   lines.push('')
   lines.push('Goal: prove one actual product task moves from creation to real-agent execution, approval, completion, and audit visibility.')
   lines.push('')
@@ -159,6 +169,7 @@ export function formatPlan(opts = {}) {
       base_url: baseUrl,
       agent,
       task_id: taskId,
+      ...(releaseSha ? { release_sha: releaseSha } : {}),
     },
     evidence: {
       '<required_key>': true,
@@ -167,6 +178,21 @@ export function formatPlan(opts = {}) {
       { label: '<screenshot, API response, audit row, or receipt label>', path: '<redacted attachable artifact path>' },
     ],
   }, null, 2))
+  if (releaseSha) {
+    lines.push('')
+    lines.push(`${SOURCE_HEALTH_STEP}: record the authorized collector's redacted source health observation:`)
+    lines.push(JSON.stringify({
+      step: SOURCE_HEALTH_STEP,
+      evidence: {
+        source_health: {
+          ok: true,
+          service: 'mupot',
+          commit: releaseSha,
+          clean: true,
+        },
+      },
+    }, null, 2))
+  }
   lines.push('')
   lines.push('Check the completed bundle:')
   lines.push(commandLine([
@@ -183,6 +209,7 @@ export function formatPlan(opts = {}) {
     agent,
     '--task-id',
     taskId,
+    ...(releaseSha ? ['--release-sha', releaseSha] : []),
   ], ` > ${shellQuote(join(outDir, 'work-lifecycle-check.json'))}`))
   lines.push(commandLine([
     'node',
@@ -199,6 +226,7 @@ export function formatPlan(opts = {}) {
     agent,
     '--task-id',
     taskId,
+    ...(releaseSha ? ['--release-sha', releaseSha] : []),
   ]))
   return `${lines.join('\n')}\n`
 }
@@ -280,6 +308,31 @@ function targetValue(receipt, field) {
   const target = receipt?.target && typeof receipt.target === 'object' ? receipt.target : {}
   const value = target[field] ?? receipt?.evidence?.[field]
   return typeof value === 'string' ? stripTrailingSlash(value.trim()) : ''
+}
+
+function releaseShaValue(receipt) {
+  const target = receipt?.target && typeof receipt.target === 'object' ? receipt.target : {}
+  return target.release_sha
+}
+
+function isCanonicalReleaseSha(value) {
+  return typeof value === 'string' && /^[0-9a-f]{40}$/.test(value)
+}
+
+function validateSourceHealth(receipt, expectedReleaseSha) {
+  const health = receipt?.evidence?.source_health
+  const object = health !== null && typeof health === 'object' && !Array.isArray(health)
+  const exact = object && Object.keys(health).length === SOURCE_HEALTH_KEYS.length && SOURCE_HEALTH_KEYS.every((key) => Object.hasOwn(health, key))
+  const observed = object ? {
+    ok: typeof health.ok === 'boolean' ? health.ok : null,
+    service: health.service === 'mupot' ? 'mupot' : null,
+    commit: isCanonicalReleaseSha(health.commit) ? health.commit : null,
+    clean: typeof health.clean === 'boolean' ? health.clean : null,
+  } : null
+  return {
+    valid: Boolean(exact && health.ok === true && health.service === 'mupot' && health.commit === expectedReleaseSha && health.clean === true),
+    observed,
+  }
 }
 
 function checkReceiptBasics(checks, receipt, path, step) {
@@ -370,6 +423,43 @@ export function checkBundle(opts = {}) {
     target[field] = values.length === 1 ? values[0] : null
   }
 
+  const releaseShaValues = receipts.map(({ receipt }) => releaseShaValue(receipt))
+  const releaseShaPresent = releaseShaValues.some((value) => value !== undefined)
+  const releaseShaConsistent = receipts.length === REQUIRED_STEPS.length
+    && releaseShaValues.every(isCanonicalReleaseSha)
+    && new Set(releaseShaValues).size === 1
+  if (releaseShaPresent || opts.releaseSha) {
+    for (const { spec, path, receipt } of receipts) {
+      pushCheck(checks, isCanonicalReleaseSha(releaseShaValue(receipt)), 'target_release_sha_valid', {
+        path,
+        step: spec.step,
+        value: releaseShaValue(receipt) ?? null,
+      })
+    }
+    pushCheck(checks, releaseShaConsistent, 'target_release_sha_consistent_across_receipts', {
+      values: [...new Set(releaseShaValues.filter(isCanonicalReleaseSha))],
+    })
+  }
+  target.release_sha = releaseShaConsistent ? releaseShaValues[0] : null
+  const effectiveReleaseSha = opts.releaseSha || target.release_sha
+  if (opts.releaseSha) {
+    pushCheck(checks, isCanonicalReleaseSha(opts.releaseSha), 'expected_release_sha_valid', { expected: opts.releaseSha })
+    pushCheck(checks, target.release_sha === opts.releaseSha, 'target_release_sha_matches_expected', {
+      expected: opts.releaseSha,
+      actual: target.release_sha,
+    })
+  }
+  if (releaseShaPresent || opts.releaseSha) {
+    const sourceReceipt = receipts.find(({ spec }) => spec.step === SOURCE_HEALTH_STEP)
+    const sourceHealth = validateSourceHealth(sourceReceipt?.receipt, effectiveReleaseSha)
+    pushCheck(checks, sourceHealth.valid, 'source_health_matches_expected_release_sha', {
+      step: SOURCE_HEALTH_STEP,
+      path: sourceReceipt?.path ?? join(outDir, 'agent-execution.json'),
+      artifact_sha256: artifacts[SOURCE_HEALTH_STEP]?.sha256 ?? null,
+      source_health: sourceHealth.observed,
+    })
+  }
+
   if (opts.pot) pushCheck(checks, target.pot === opts.pot, 'target_pot_matches_expected', { expected: opts.pot, actual: target.pot })
   if (opts.baseUrl) pushCheck(checks, target.base_url === stripTrailingSlash(opts.baseUrl), 'target_base_url_matches_expected', { expected: stripTrailingSlash(opts.baseUrl), actual: target.base_url })
   if (opts.agent) pushCheck(checks, target.agent === opts.agent, 'target_agent_matches_expected', { expected: opts.agent, actual: target.agent })
@@ -396,7 +486,7 @@ export function checkBundle(opts = {}) {
     artifacts,
     checks,
     next_steps: failed.length === 0
-      ? ['attach the work-lifecycle evidence directory and this check receipt to the v0.23 release issue']
+      ? ['attach the work-lifecycle evidence directory and this check receipt to the active release tracker']
       : ['fix failing work-lifecycle evidence, rerun the product task cycle if needed, then rerun work-lifecycle-receipt --check'],
   }
 }

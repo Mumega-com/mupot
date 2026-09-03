@@ -214,10 +214,40 @@ export interface PreparedAgentTokenMint extends AgentMintResult {
   expiresAt: string | null
 }
 
+/**
+ * The doors a plain agent-bound key can come out of. They do not share an
+ * authorization bar — 'enroll' and 'mcp_mint_agent_token' gate on admin over the
+ * target agent's squad, 'admin_agent_token' on org admin — so the trail records
+ * which one was used rather than flattening them into "an admin did it".
+ */
+export type TokenIssuanceSurface =
+  | 'enroll'
+  | 'admin_agent_token'
+  | 'mcp_mint_agent_token'
+  | 'provision'
+  | 'bootstrap_self'
+
+export interface TokenIssuanceActor {
+  /** The operator principal's member id — the human, not the agent envelope. */
+  memberId: string
+  /** Their email/handle as of issuance; stored verbatim so the trail stays
+   *  readable after the member row is renamed or deactivated. */
+  principal: string
+  surface: TokenIssuanceSurface
+}
+
 export interface PrepareAgentTokenMintOptions {
   grantCapability?: AgentTokenCapability
   expiresAt?: string | null
   revokePriorTokenId?: string | null
+  /**
+   * When present, an agent_token_issuance_audit row is appended to the SAME
+   * batch as the token insert, so a credential cannot exist without the record
+   * of who issued it — the two land together or neither does. Optional because
+   * the older mint paths predate the trail; omitting it is the previous
+   * behaviour exactly (no extra statement, no extra row).
+   */
+  issuedBy?: TokenIssuanceActor
 }
 
 export interface AgentTokenReplacementClaim {
@@ -326,7 +356,7 @@ export async function prepareAgentBoundTokenMint(
   }
 
   const binding = await resolveAgentMemberBinding(env, agent.id)
-  return prepareAgentBoundTokenMintForBinding(env, agent, label, grantCapability, binding, opts.expiresAt, opts.revokePriorTokenId)
+  return prepareAgentBoundTokenMintForBinding(env, agent, label, grantCapability, binding, opts.expiresAt, opts.revokePriorTokenId, opts.issuedBy)
 }
 
 export async function prepareAgentBoundTokenMintForBinding(
@@ -337,6 +367,7 @@ export async function prepareAgentBoundTokenMintForBinding(
   binding: AgentMemberBinding,
   expiresAt: string | null = calculateExpiryTimestamp(DEFAULT_TOKEN_EXPIRY_DAYS),
   revokePriorTokenId: string | null = null,
+  issuedBy?: TokenIssuanceActor,
 ): Promise<PreparedAgentTokenMint> {
   const creating = binding.kind === 'unminted'
   const memberId = creating ? crypto.randomUUID() : binding.memberId
@@ -481,6 +512,39 @@ export async function prepareAgentBoundTokenMintForBinding(
     )
   }
 
+  // WHO coined this key (0139). In the same batch as the token insert above, so
+  // a live credential can never exist without its issuance record — they land
+  // together or neither does. That ordering is the whole point: an audit write
+  // that happens after the commit is one crashed isolate away from a key nobody
+  // can attribute.
+  //
+  // Skipped on the rotation path, and nothing is lost by that: a replacement
+  // already records its actor as agent_token_rotation_handoffs.minted_by_member_id
+  // (0134). Passing issuedBy alongside revokePriorTokenId is therefore redundant,
+  // not dropped — the trail for that ceremony lives in the handoff row.
+  if (!revokePriorTokenId && issuedBy) {
+    statements.push(
+      env.DB.prepare(
+        `INSERT INTO agent_token_issuance_audit
+           (id, tenant, token_id, agent_id, member_id, actor_member_id, actor_principal,
+            surface, seat_label, grant_capability, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).bind(
+        crypto.randomUUID(),
+        env.TENANT_SLUG,
+        tokenId,
+        agent.id,
+        memberId,
+        issuedBy.memberId,
+        issuedBy.principal,
+        issuedBy.surface,
+        safeLabel,
+        grantCapability,
+        createdAt,
+      ),
+    )
+  }
+
   return {
     raw: rawToken,
     tokenId,
@@ -578,6 +642,7 @@ export async function mintAgentBoundToken(
       winner,
       opts.expiresAt,
       opts.revokePriorTokenId,
+      opts.issuedBy,
     )
     return commitPreparedAgentTokenMint(env, retry)
   }

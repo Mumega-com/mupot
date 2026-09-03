@@ -140,6 +140,20 @@ service-definition renderer"*; it has no `--seat`, no token, and no hook. It is
 installer-shaped and takes `--dry-run`, which makes it easy to mistake for a renamed
 version of the above. It is not.
 
+### Task dispatch receipts are not inbox acknowledgements
+
+An externally assigned task arrives as `runtime.dispatch/v1`. Leasing that row
+does not prove the runtime consumed it, and `task_dispatch_receipts.consumed_at`
+only proves Mupot completed the selected transport side effect. After the exact
+harness consumes the task, call `task_dispatch_runtime_receipt` with stage
+`runtime_consumed`; after work, call `completed` or `failed`. Completion stops at
+task `review` until an independent gate decides it.
+
+The receipt call uses the same agent-bound workspace credential and exact leased
+message/attempt. Do not reply to the synthetic `mupot-dispatch` sender, and do not
+put a raw harness thread ID in the message. Full contract and recovery steps:
+[`operations/runtime-dispatch-v1.md`](./operations/runtime-dispatch-v1.md).
+
 ### Why a shell script and not an extension
 
 Claude Code has no API for injecting a message into a running session. `pi` and

@@ -45,11 +45,13 @@ Version ownership, activation state, exclusions, and release gates live only in
 [`ROADMAP.md`](../ROADMAP.md). This document defines enduring product requirements and
 workstreams; it does not independently assign features to versions.
 
-The current stable release is `v0.23.0 Trusted Runtime`. The current development target is
-`v0.24.0 Project Operations`: make Project the coherent place where operators and agents
-see the goal, team, work, runtime activity, blockers, evidence, and next action.
+The latest tagged stable release is `v0.25.0 Project Routines and Needs You`. Source
+currently reports `0.30.0`; the next stable candidate is `v0.30.0 Stabilized Control
+Plane`, and `v0.31.0` development remains held until that release closes. The active
+release contract is [`docs/releases/v0.30.0.md`](releases/v0.30.0.md), and the ordered
+execution runway is [`docs/releases/next-flights.md`](releases/next-flights.md).
 
-The completed `v0.23.0` release gate remains at
+The completed historical `v0.23.0 Trusted Runtime` gate remains at
 [`docs/releases/v0.23.0-trusted-runtime.md`](releases/v0.23.0-trusted-runtime.md).
 
 ## Product workstreams

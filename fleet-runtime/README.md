@@ -40,7 +40,7 @@ Fork the pot → you get this. No tenant is hardcoded: `base_url` + `tenant` com
 | `host-receipt.mjs` | non-destructive local verifier that emits a redacted host-install receipt |
 | `runtime-receipt.mjs` | one-shot live daemon-cycle receipt for signed attach + inbox drain |
 | `control-receipt.mjs` | direct-poll or daemon-state lifecycle receipt |
-| `cutover-receipt.mjs` | verifies host/runtime/control receipts before SOS removal |
+| `cutover-receipt.mjs` | verifies host/runtime/control receipts before the Mupot/Herdr Host-Go handoff |
 | `cutover-probe.mjs` | queues inbox and lifecycle probes that live receipts must observe |
 | `receipt-bundle.mjs` | saves host/runtime/control receipts, final gate, starter evidence, and manifest |
 
@@ -377,10 +377,10 @@ and drain Mupot inbox work. `status:"warn"` with `inbox_no_messages_to_handoff`
 means the signed inbox route worked, but no queued message was available to prove
 handler delivery; send a cutover probe message and rerun it.
 
-## SOS cutover gate
+## Mupot/Herdr Host-Go handoff gate
 
-Do not remove an agent's SOS bus/wake path from the runtime config until the
-host, runtime, and control receipts have all passed and the combined gate passes:
+Complete the Mupot/Herdr Host-Go handoff only after the host, runtime, and
+control receipts have all passed and the combined gate passes:
 
 ```bash
 node ~/.fleet/runtime/cutover-receipt.mjs \
@@ -402,12 +402,18 @@ npm run receipt:cutover -- \
   --control ./receipts/control-stop-my-agent.json
 ```
 
-It prints JSON with `receipt_type: "mupot-sos-cutover-gate/v1"`. A
+It prints JSON with `receipt_type: "mupot-host-go-cutover/v1"`. A
 `status:"pass"` receipt proves that:
 
 - the host pre-flight receipt passed
 - the selected agent's runtime receipt passed signed attach and inbox handoff
 - lifecycle control has start and stop evidence for that same agent
+- the selected evidence chain has `no_live_sos_wiring`
+
+### Historical compatibility
+
+Legacy `mupot-sos-cutover-gate/v1` receipts remain verifiable as historical
+evidence, but cannot satisfy the v0.30 Host-Go handoff requirement.
 
 By default the gate requires both `start` and `stop` lifecycle evidence. A
 single `restart` control receipt can satisfy both because the control daemon
@@ -639,8 +645,8 @@ npm run receipt:bundle:check -- --out-dir ./receipts/my-agent
 
 When `manifest.json` and `cutover-gate.json` both report
 `receipt_type: "mupot-fleet-receipt-bundle/v1"` /
-`"mupot-sos-cutover-gate/v1"` with `status: "pass"`, the saved evidence is ready
-to attach to the cutover record for that agent. Use `--force` only to replace a
+`"mupot-host-go-cutover/v1"` with `status: "pass"`, the saved evidence is ready
+to attach to the Mupot/Herdr Host-Go handoff record for that agent. Use `--force` only to replace a
 same-name failed attempt after fixing the underlying host issue.
 
 The manifest includes SHA-256 hashes for the saved receipt artifacts
@@ -655,9 +661,8 @@ agent, and rejects stale host receipts that do not include the
 The check receipt includes the SHA-256 of the `manifest.json` file it inspected
 and compares `cutover-gate.json.inputs` back to the manifest evidence. It
 rejects copied evidence that mixes receipts from different pot base URLs or
-tenants. It also rejects advisory `next_steps` guidance that says to attach the
-bundle before the hard gate passes, or says to keep SOS wiring after the hard
-gate passes. Secret-scan findings include only the JSON path and reason; they do
+tenants. It also rejects advisory `next_steps` guidance that contradicts the
+hard gate. Secret-scan findings include only the JSON path and reason; they do
 not echo the suspected secret value.
 Directory-scope failures mean the attachable bundle is not self-contained or
 contains files outside the allowed evidence set; rebuild a clean copy with only

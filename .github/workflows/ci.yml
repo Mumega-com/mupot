@@ -274,3 +274,20 @@ jobs:
           node-version: 22
       - name: Guard — design status only in design-only contracts
         run: node scripts/design-status-contract-policy.mjs
+
+  release-truth:
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 is load-bearing, not tidiness. The policy compares the
+      # documented "latest tagged stable release" against the repository's real
+      # tags, and it FAILS CLOSED when no tags are visible rather than skipping
+      # that rule. A shallow checkout would therefore turn this job red, which is
+      # the correct behaviour and the reason the depth is pinned here.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Guard — release docs must not make self-falsifying claims
+        run: node scripts/release-truth-policy.mjs
