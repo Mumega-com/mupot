@@ -170,6 +170,7 @@ import { MUPOT_MCP_INITIALIZE_INSTRUCTIONS } from './instructions'
 // The SAME predicate the meter enforces with. Imported rather than restated —
 // these were two copies and they drifted (#1179 gate R6).
 import { getAuthorizedMeterStatus, isEnforceableCap } from '../agents/meter'
+import { authLookupOrNull } from '../auth/fail-closed'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
@@ -362,6 +363,14 @@ function bearerToken(header: string | undefined): string | null {
 // a generic message (never distinguish "no token" from "bad token" to a caller —
 // no oracle). The tenant is forced to env.TENANT_SLUG.
 export async function authenticateMember(c: {
+  req: { header: (name: string) => string | undefined }
+  env: Env
+}): Promise<AuthContext | null> {
+  // mupot#1281 — the third independent copy of the unguarded lookup (#41 dedupe debt).
+  return authLookupOrNull('authenticateMember', () => authenticateMemberInner(c))
+}
+
+async function authenticateMemberInner(c: {
   req: { header: (name: string) => string | undefined }
   env: Env
 }): Promise<AuthContext | null> {
