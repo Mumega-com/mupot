@@ -80,6 +80,15 @@ import { findPreset, isValidPresetId } from '../auth/role-presets'
 // Agent-bound token mint UI.
 import { loadAgentTokenView, agentTokenPageBody, agentTokenMintedBody } from './agent-token'
 import {
+  loadFlightPanel,
+  loadWorkPanel,
+  panelByKey,
+  formatCost,
+  type PanelResult,
+  type FlightSummary,
+  type WorkSummary,
+} from './agent-profile'
+import {
   authorizeEnrollMint,
   enrollClientSnippet,
   enrollForbiddenBody,
@@ -1714,8 +1723,15 @@ dashboardApp.get('/agents/:id', async (c) => {
   // Mirror the wake API's real gate (lead+ on the agent's squad) so squad leads
   // see a working button — the API re-checks server-side either way.
   const canWake = await canOnSquad(c.env, auth, agent.squad_id)
+  // Panels resolve independently and in parallel: one failing read must degrade
+  // its own section and nothing else. Each returns a typed state, so "we could
+  // not read this" never renders as "this agent has done nothing".
+  const [flights, work] = await Promise.all([
+    loadFlightPanel(c.env, agent.id),
+    loadWorkPanel(c.env, agent.id),
+  ])
   return c.html(
-    shell(c.env, `Agent · ${agent.name}`, agentConsoleBody(agent, squad, canWake)),
+    shell(c.env, `Agent · ${agent.name}`, agentConsoleBody(agent, squad, canWake, flights, work)),
   )
 })
 
@@ -5213,7 +5229,35 @@ function taskCard(t: Task) {
   </div>`
 }
 
-function agentConsoleBody(agent: Agent, squad: Squad | null, canWake: boolean) {
+
+/**
+ * Renders one profile panel. The three states are kept visually distinct on
+ * purpose: a panel we could not READ must never look like an agent that has
+ * done nothing. Conflating them is how a dashboard reports a zero that is
+ * really an unknown, and a zero that is really an unknown reads as a measurement.
+ */
+function renderPanel<T>(
+  key: string,
+  result: PanelResult<T>,
+  body: (data: T) => ReturnType<typeof html>,
+) {
+  const spec = panelByKey(key)
+  if (result.state === 'unavailable') {
+    return html`<div class="card"><p class="dim">${result.reason ?? 'This could not be read.'}</p></div>`
+  }
+  if (result.state === 'empty' || !result.data) {
+    return html`<div class="card"><p class="dim">${spec?.emptyLabel ?? 'Nothing here yet.'}</p></div>`
+  }
+  return body(result.data)
+}
+
+function agentConsoleBody(
+  agent: Agent,
+  squad: Squad | null,
+  canWake: boolean,
+  flights: PanelResult<FlightSummary>,
+  work: PanelResult<WorkSummary>,
+) {
   // The wake button calls the RBAC-gated agents endpoint. The fetch is same-origin
   // and credentialed (HttpOnly session cookie rides along automatically).
   const wakeScript = raw(`
@@ -5266,6 +5310,42 @@ function agentConsoleBody(agent: Agent, squad: Squad | null, canWake: boolean) {
         <dt>Created</dt><dd>${agent.created_at}</dd>
       </dl>
     </div>
+    <h2>Flights</h2>
+    ${renderPanel('flights', flights, (d) => html`
+      <div class="card">
+        <dl class="kv">
+          <dt>Flown</dt><dd>${d.total}</dd>
+          <dt>Landed</dt><dd>${d.landed}</dd>
+          <dt>Failed</dt><dd>${d.failed}</dd>
+          <dt>Held</dt><dd>${d.held}</dd>
+          <dt>Running</dt><dd>${d.running}</dd>
+          <dt>Spend</dt><dd>${formatCost(d.costMicroUsd)}</dd>
+        </dl>
+        <ul>
+          ${d.recent.map((f) => html`<li>
+            <a href="/flights/${f.id}">${f.goal.slice(0, 90)}</a> — ${f.status} · ${f.created_at}
+          </li>`)}
+        </ul>
+      </div>`)}
+
+    <h2>Work</h2>
+    ${renderPanel('work', work, (d) => html`
+      <div class="card">
+        <dl class="kv">
+          <dt>Assigned</dt><dd>${d.total}</dd>
+          <dt>Open</dt><dd>${d.open}</dd>
+          <dt>Done</dt><dd>${d.done}</dd>
+          <dt>Tracked in GitHub</dt><dd>${d.tracked}</dd>
+        </dl>
+        <ul>
+          ${d.recent.map((t) => html`<li>
+            ${t.github_issue_url
+              ? html`<a href="${t.github_issue_url}">${t.title.slice(0, 90)}</a>`
+              : html`${t.title.slice(0, 90)}`} — ${t.status}
+          </li>`)}
+        </ul>
+      </div>`)}
+
     <h2>Console</h2>
     <div class="card">
       <button id="wake-btn" class="btn" ${canWake ? raw('') : raw('disabled title="Requires admin or owner"')}>
