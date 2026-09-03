@@ -180,3 +180,27 @@ describe('lease reads answer the same question', () => {
     f.close()
   })
 })
+
+
+describe('pagination — the cursor must be reflected in what is left over', () => {
+  it('page two of two reports complete, not a phantom remainder', async () => {
+    const f = fixture()
+    f.seed(150)
+    const p1 = await readAgentInbox(f.env, { agent: 'agent-a', peek: true, limit: 100, sinceSeq: 0 })
+    expect(p1.ok).toBe(true)
+    if (!p1.ok) return
+    expect(p1.messages).toHaveLength(100)
+    expect(p1.complete).toBe(false)
+    expect(p1.remaining).toBe(50)
+
+    const cursor = p1.messages[p1.messages.length - 1].seq
+    const p2 = await readAgentInbox(f.env, { agent: 'agent-a', peek: true, limit: 100, sinceSeq: cursor })
+    expect(p2.ok).toBe(true)
+    if (!p2.ok) return
+    expect(p2.messages).toHaveLength(50)
+    // The whole point of the cursor: nothing is left ABOVE it once drained.
+    expect(p2.remaining).toBe(0)
+    expect(p2.complete).toBe(true)
+    f.close()
+  })
+})

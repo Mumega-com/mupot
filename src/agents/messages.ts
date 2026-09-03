@@ -680,13 +680,24 @@ async function readAgentInboxForReader(
     let remaining = 0
     if (reader === 'signed') {
       const seatSql = targetSeat ? 'AND (target_seat = ?4 OR target_seat IS NULL)' : 'AND target_seat IS NULL'
-      const binds = targetSeat
+      const binds: (string | number | null | undefined)[] = targetSeat
         ? [tenant, input.agent, signedKeyFingerprint, targetSeat]
         : [tenant, input.agent, signedKeyFingerprint]
+      // The cursor MUST be in the COUNT, not only in the page. Without it a
+      // paginating caller is told rows exist below a cursor it has already
+      // passed, so page two of two reports a phantom remainder and the loop
+      // never terminates. Found by test, not by reading.
+      const sinceSql = sinceSeq > 0 ? `AND seq > ?${binds.length + 1}` : ''
+      if (sinceSeq > 0) binds.push(sinceSeq)
+      // The cursor MUST be in the count, not only in the page. Without it a
+      // paginating caller is told rows exist below its cursor that it has
+      // already passed, so page two of two reports a phantom remainder and the
+      // loop never terminates. Caught by test, not by reading.
       const remainingRow = await env.DB.prepare(
         `SELECT COUNT(*) AS n FROM agent_messages
           WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL
             ${seatSql}
+            ${sinceSql}
             AND EXISTS (SELECT 1 FROM agent_inbox_fences
                          WHERE tenant = ?1 AND agent_id = ?2
                            AND mode = 'signed_only' AND key_fingerprint = ?3)`,
@@ -694,13 +705,16 @@ async function readAgentInboxForReader(
       remaining = Number(remainingRow?.n ?? 0)
     } else {
       const seatSql = targetSeat ? 'AND (target_seat = ?3 OR target_seat IS NULL)' : 'AND target_seat IS NULL'
-      const binds = targetSeat
+      const binds: (string | number | null)[] = targetSeat
         ? [tenant, input.agent, targetSeat]
         : [tenant, input.agent]
+      const sinceSql = sinceSeq > 0 ? `AND seq > ?${binds.length + 1}` : ''
+      if (sinceSeq > 0) binds.push(sinceSeq)
       const remainingRow = await env.DB.prepare(
         `SELECT COUNT(*) AS n FROM agent_messages
           WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL
             ${seatSql}
+            ${sinceSql}
             AND COALESCE((SELECT mode FROM agent_inbox_fences
                            WHERE tenant = ?1 AND agent_id = ?2), 'bearer_only') = 'bearer_only'`,
       ).bind(...binds).first<{ n: number }>()
