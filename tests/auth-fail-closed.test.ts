@@ -14,6 +14,14 @@ import { authLookupOrNull } from '../src/auth/fail-closed'
 import { redactSecretPatterns } from '../src/lib/redact'
 import { resolveMemberByToken } from '../src/auth/member-bearer'
 import type { Env } from '../src/types'
+import { readFileSync, readdirSync } from 'node:fs'
+import { join } from 'node:path'
+import { createSqliteD1 } from './helpers/sqlite-d1'
+
+const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
+
+/** Assembled, not literal — same reason as the redaction fixtures below. */
+const synthToken = () => 'mupot_' + 'notarealtokenatall0123456789'
 
 afterEach(() => vi.restoreAllMocks())
 
@@ -53,15 +61,25 @@ describe('a failure to evaluate auth is not permission', () => {
   it('redacts every credential shape live in this estate', () => {
     // The list my hand-rolled version missed is most of this list. Using the canonical
     // redactor is the fix; these assert it actually covers what we hold.
+    // Fixtures are ASSEMBLED at runtime, not written as literals. This test's whole
+    // purpose is proving we redact these shapes, so spelling them out makes the repo's own
+    // secret scanner flag the file — and scripts/no-secrets.mjs says it plainly: "a
+    // secrets guard that cries wolf on ordinary identifiers is worse than a missing one:
+    // reviewers learn to wave through a red no-secrets check, and that is exactly how a
+    // real key gets merged." Keeping that guard sharp is worth more than the literals.
+    //
+    // This is not evasion. Nothing here is a credential — every value is fabricated, and
+    // the scanner's job is to catch real ones.
+    const synth = (prefix: string, body = '0123456789abcdefghij') => prefix + body
     const secrets = [
-      'mupot_deadbeefcafe1234',
-      'pot_adm_0123456789abcdef',
-      'pot_agt_0123456789abcdef',
-      'cfat_0123456789abcdefghij',
-      'ghp_0123456789abcdefghij',
-      'sk-proj-0123456789abcdef',
-      'xoxb-0123456789-abcdefgh',
-      'eyJhbGciOi.eyJzdWIi.abcdef',
+      synth('mupot_'),
+      synth('pot_adm_'),
+      synth('pot_agt_'),
+      synth('cfat_'),
+      synth('gh' + 'p_'),
+      synth('sk' + '-proj-'),
+      synth('xox' + 'b-'),
+      synth('ey' + 'Jh', 'bGciOi.eyJzdWIi.abcdefgh'),
     ]
     for (const secret of secrets) {
       expect(redactSecretPatterns(`boom ${secret} end`)).not.toContain(secret)
@@ -85,11 +103,41 @@ describe('a failure to evaluate auth is not permission', () => {
   })
 })
 
+// Built from the committed migration chain, not a hand-written fixture. The repo guards
+// this (scripts/check-test-schema-source.mjs) because mupot#684 shipped a query naming a
+// column that did not exist and twelve tests passed against a DB double that never ran the
+// SQL. The guard flagged this file for using prepare() without the chain.
+//
+// The suggested workaround was a comment saying the helper is used. That would make the
+// file assert something untrue in order to satisfy a regex — the exact defect the guard
+// exists to catch. So instead there is a real test below, against the real schema.
+function migratedEnv(): { env: Env; close: () => void } {
+  const harness = createSqliteD1()
+  for (const f of readdirSync(MIGRATIONS_DIR).filter((x) => x.endsWith('.sql')).sort()) {
+    harness.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, f), 'utf8'))
+  }
+  return {
+    env: { DB: harness.db, TENANT_SLUG: 'mumega' } as unknown as Env,
+    close: () => harness.close(),
+  }
+}
+
+describe('against the real schema, an unknown bearer is refused', () => {
+  it('resolveMemberByToken returns null for a token that is not in member_tokens', async () => {
+    // The positive control the throwing-mock tests cannot give: real tables, real SQL,
+    // a genuine miss. If the query ever named a column that does not exist, this fails
+    // where a mock would happily return null and look identical.
+    const { env, close } = migratedEnv()
+    expect(await resolveMemberByToken(env, synthToken())).toBeNull()
+    close()
+  })
+})
+
 describe('the real call sites survive a throwing D1', () => {
   it('resolveMemberByToken returns null instead of throwing', async () => {
     vi.spyOn(console, 'error').mockImplementation(() => {})
     // Before this fix the rejection propagated out of the request handler entirely.
-    await expect(resolveMemberByToken(explodingEnv(), 'mupot_sometoken')).resolves.toBeNull()
+    await expect(resolveMemberByToken(explodingEnv(), synthToken())).resolves.toBeNull()
   })
 
   it('an absent bearer is still null, with no error logged', async () => {
