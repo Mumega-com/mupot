@@ -237,7 +237,10 @@ inboxApp.get('/', async (c) => {
     if (res.reason === 'consumer_fenced') return c.json({ error: res.reason }, 409)
     return c.json({ error: res.reason, detail: res.detail }, 400)
   }
-  return c.json({ ok: true, messages: res.messages, remaining: res.remaining, consumed: !peek })
+  // `complete` rides the HTTP surface too — the Herdr seatlink bridge reads THIS
+  // route, not the MCP tool, and it is the consumer that was silently dropping
+  // genuinely-unread mail by treating a capped page as the whole inbox.
+  return c.json({ ok: true, messages: res.messages, remaining: res.remaining, complete: res.complete, consumed: !peek })
 })
 
 // POST /api/inbox/signed — read the signed agent's own inbox without a bearer token.
@@ -256,6 +259,7 @@ inboxApp.post('/signed', async (c) => {
     agent: res.agent_id,
     messages: res.messages,
     remaining: res.remaining,
+    complete: res.complete,
     consumed: res.consumed,
   })
 })
