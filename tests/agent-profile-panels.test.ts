@@ -57,6 +57,22 @@ describe('flight summary', () => {
     expect(summariseFlights(rows).costMicroUsd).toBe(2_000_000)
   })
 
+  // A null row does NOT exercise the finite-check: Number(null) is 0, not NaN.
+  // A surviving mutation proved that. SQLite has dynamic column typing, so a
+  // declared-INTEGER column can genuinely hold a string; that is the case the
+  // guard exists for, and this is the case that kills the mutation.
+  it('ignores a non-numeric cost instead of poisoning the whole sum with NaN', () => {
+    const poisoned = [
+      { id: 'f1', goal: 'a', status: 'landed', cost_micro_usd: 1_000_000, created_at: 'd1' },
+      { id: 'f2', goal: 'b', status: 'landed', cost_micro_usd: 'not-a-number' as unknown as number, created_at: 'd2' },
+      { id: 'f3', goal: 'c', status: 'landed', cost_micro_usd: 500_000, created_at: 'd3' },
+    ]
+    const s = summariseFlights(poisoned)
+    expect(s.costMicroUsd).toBe(1_500_000)
+    expect(Number.isNaN(s.costMicroUsd)).toBe(false)
+    expect(s.total).toBe(3)
+  })
+
   // A flight reaped by the watchdog really did cost zero. Rounding that away
   // would hide the most common failure on this deployment.
   it('keeps a zero-cost failed flight in the counts rather than discarding it', () => {
