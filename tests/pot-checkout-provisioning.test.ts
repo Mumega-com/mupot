@@ -108,9 +108,22 @@ describe('Public Pricing & Self-Serve Sovereign Pot Provisioning Portal (Flight 
     }
 
     const outcome = await handlePotCreationCompleted(env, sessionPayload)
-    expect(outcome.ok).toBe(true)
+
+    // WAS: expect(outcome.ok).toBe(true). This is the MONEY PATH — it runs after a customer
+    // completes Stripe checkout. Asserting ok:true certified that a paying customer is told
+    // their pot is live when provisioning created an empty D1, an empty KV, no schema, no
+    // worker and no credentials (mupot#1285). The test made the defect look verified.
+    expect(outcome.ok).toBe(false)
     expect(outcome.slug).toBe('acmecorp')
+    expect(outcome.error).toBeTruthy()
+
+    // The event still fires — silence would be worse — but under a type that says what
+    // actually happened, so no subscriber treats a half-run as a delivered product.
     expect(mockBusSend).toHaveBeenCalledTimes(1)
+    const emitted = mockBusSend.mock.calls[0][0] as { type: string; payload: Record<string, unknown> }
+    expect(emitted.type).toBe('pot.self_serve_provisioning_incomplete')
+    expect(emitted.payload.not_completed).toBeTruthy()
+    expect(emitted.payload.orphaned_resources).toBeTruthy()
 
     vi.unstubAllGlobals()
   })

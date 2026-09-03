@@ -482,6 +482,25 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
           throw new Error(`message.created delivery failed: ${outcome.kind}`)
       }
     }
+    case 'pot.self_serve_provisioning_incomplete': {
+      // Deliberately NOT grouped with the committed-effect observations below. That branch
+      // documents "the producer has already committed its durable effect" — the whole point
+      // of this event is that it did NOT. It ran after a customer paid, created billable
+      // Cloudflare resources, and stopped without producing a usable pot. Log it as
+      // something that needs a human, and carry the orphan ids so they can be reclaimed
+      // rather than discovered on an invoice (mupot#1285).
+      const payload = (event.payload ?? {}) as Record<string, unknown>
+      console.error('bus: pot.self_serve_provisioning_incomplete NEEDS ATTENTION', {
+        tenant: event.tenant,
+        slug: payload.slug,
+        not_completed: payload.not_completed,
+        orphaned_resources: payload.orphaned_resources,
+        reason: payload.incomplete_reason,
+      })
+      // Acked, not retried: retrying cannot finish a provisioning run that was never
+      // implemented, and a poisoned queue would bury the alert we just logged.
+      return true
+    }
     case 'member.auto_enrolled':
     case 'billing.subscription.created':
     case 'billing.subscription.deleted':
