@@ -39,6 +39,7 @@ import { TOKEN_LIVE_PREDICATE, nowSqlUtc, touchTokenLastUsed } from '../auth/tok
 import { callerHoldsGateCapability, verdictPrincipal } from '../tasks/index'
 import { resolveSoleGateOwnerAgent } from '../gates/grants'
 import { isChannel } from '../members/service'
+import { findExistingBootstrap } from '../members/bootstrap-self'
 import { resolveConsentedAgentCapabilities } from './oauth-authorize'
 import { createBus } from '../bus'
 import { createMemory } from '../memory'
@@ -4111,6 +4112,7 @@ const toolFleetAgentGet: ToolSpec = {
   },
 }
 
+<<<<<<< HEAD
 // Boot-time self-report, wrapped so it can NEVER take boot down with it. boot_context is
 // the one response documented as always succeeding on the directory channel (#712) and is
 // the only reachable call for a zero-capability seat. A registry write is strictly less
@@ -4125,6 +4127,92 @@ async function reportSelfAtBoot(
     return await selfReportAtBoot(env, agentId, claim)
   } catch {
     return { outcome: 'unavailable', belief: null, detail: 'registry unreachable at boot; identity below is unaffected' }
+=======
+// ── first-run onboarding: state + doors (mupot#1283) ─────────────────────────────
+//
+// Structured, so a harness can ACT on it without parsing English. `next_step` remains
+// a human-readable summary of doors[0].
+
+export type OnboardingState =
+  /** Token is welded to an agent. Nothing to do. */
+  | 'bound'
+  /** Directory channel, unbound, this member has never bootstrapped → self-serve. */
+  | 'unbound_no_agent'
+  /** Directory channel, unbound, but this member already bootstrapped once. */
+  | 'unbound_agent_exists'
+  /** Any non-directory channel without a weld. bootstrap_self refuses this caller. */
+  | 'unbound_workspace'
+
+export interface OnboardingDoor {
+  /** MCP tool to call, or null when the door is a URL rather than a tool. */
+  tool: string | null
+  /** What walking through it actually accomplishes. */
+  does: string
+  /** What the caller must already have. 'nothing' means genuinely self-serve. */
+  requires: string
+}
+
+/** Has this member ever completed bootstrap_self? Delegates to the CANONICAL predicate
+ *  in src/members/bootstrap-self.ts — the same call that makes a second attempt return
+ *  `already_bootstrapped` — so the door we advertise cannot drift from what the tool
+ *  accepts. It held its own copy of that query first; one predicate, two definitions is
+ *  how an advertised door quietly starts lying.
+ *
+ *  NEVER allowed to throw. boot_context is documented as "the one response that always
+ *  succeeds on this channel" (#712) and is the only reachable call for a zero-capability
+ *  seat; a first-run caller losing its whole map because an advisory lookup failed would
+ *  reproduce the exact dead end this field exists to remove. On any error we fall back to
+ *  the state that offers MORE doors, never fewer — a caller shown bootstrap_self when it
+ *  has already bootstrapped gets a clear 409 naming the consent flow, whereas a caller
+ *  denied the door gets nothing.
+ */
+async function hasBootstrappedBefore(env: Env, memberId: string | null | undefined): Promise<boolean> {
+  if (!memberId) return false
+  try {
+    // The SAME function bootstrapSelf uses to decide `already_bootstrapped`. Not a
+    // reimplementation of it — the door has to move when the tool moves.
+    const row = await findExistingBootstrap(env, memberId)
+    return row !== null && row !== undefined
+  } catch {
+    return false
+  }
+}
+
+function buildAvailableDoors(state: OnboardingState): OnboardingDoor[] {
+  const alwaysOpen: OnboardingDoor[] = [
+    { tool: 'status', does: 'echo who this token is', requires: 'nothing' },
+    { tool: 'boot_context', does: 'this map', requires: 'nothing' },
+  ]
+
+  switch (state) {
+    case 'bound':
+      return [
+        { tool: 'orient', does: 'your full basin-drop packet — squad, scope, tasks, field state', requires: 'nothing (your token is agent-bound)' },
+        ...alwaysOpen,
+      ]
+    case 'unbound_no_agent':
+      return [
+        {
+          tool: 'bootstrap_self',
+          does: 'create your department, squad and agent, mint its credential, and grant you admin on its squad — one atomic act',
+          requires: 'nothing — this is the self-serve door, no second human',
+        },
+        { tool: 'connect', does: 'claim an EXISTING agent for this session only (no durable weld)', requires: 'the agent slug, and capability on its squad' },
+        ...alwaysOpen,
+      ]
+    case 'unbound_agent_exists':
+      return [
+        { tool: null, does: 'bind this session to the agent you already bootstrapped, at /oauth/consent', requires: 'admin on that agent\'s squad — the founder grant from your bootstrap already gives you this' },
+        { tool: 'connect', does: 'claim that agent for this session only (no durable weld)', requires: 'the agent slug' },
+        ...alwaysOpen,
+      ]
+    case 'unbound_workspace':
+      return [
+        { tool: 'connect', does: 'claim an existing agent for this session only (no durable weld)', requires: 'the agent slug, and capability on its squad' },
+        { tool: 'mint_agent_token', does: 'weld a credential to an agent permanently', requires: 'admin on the agent\'s squad — ask an org-admin if you lack it' },
+        ...alwaysOpen,
+      ]
+>>>>>>> origin/main
   }
 }
 
@@ -4199,6 +4287,35 @@ const toolBootContext: ToolSpec = {
       ? await reportSelfAtBoot(env, auth.boundAgentId as string, { runtime: args.runtime, model: args.model })
       : null
     const identityStatus: 'minted' | 'unminted' = isMinted ? 'minted' : 'unminted'
+
+    // ── mupot#1283: the self-serve door has to be NAMED at the door ──────────────
+    //
+    // `bootstrap_self` (mupot#925) exists for exactly one caller: an unbound, verified
+    // DIRECTORY session with no agent yet. It creates the department, squad and agent,
+    // mints the agent's credential, and grants the calling human founder admin on the
+    // new squad — one atomic act, no second human required.
+    //
+    // Until now nothing in this response mentioned it. `next_step` and
+    // `channel_limits.to_get_write_access` both said "ask an org-admin", which for a
+    // BRAND-NEW tenant names someone who does not exist yet. The consent screen cannot
+    // help either: consent only offers agents that already hold an
+    // `agent_member_bindings` row, and that row is written by the mint (see
+    // src/mcp/oauth-authorize.ts, selection rule 2). So an org whose first agent was
+    // never minted had no reachable door at all, and the tool built to break precisely
+    // that deadlock was named in one line of the static instructions blob — competing
+    // with ~119 tool descriptions for a reader's attention.
+    //
+    // The fix is not more prose. `available_doors` and `onboarding_state` were already
+    // declared the durable contract in the comment above `nextStep`; they were never
+    // implemented, so callers had only a sentence to parse. They are real fields now,
+    // and prose is the summary of them rather than the source of truth.
+    const onboardingState: OnboardingState = isMinted
+      ? 'bound'
+      : auth.channel === 'directory'
+        ? (await hasBootstrappedBefore(env, auth.memberId) ? 'unbound_agent_exists' : 'unbound_no_agent')
+        : 'unbound_workspace'
+
+    const availableDoors = buildAvailableDoors(onboardingState)
     const enrollHref = enrollUrl(
       canonicalOrigin(env, ctx.origin),
       (str(args.seat) || str(args.label) || ctx?.seat || '').trim() || null,
@@ -4216,9 +4333,17 @@ const toolBootContext: ToolSpec = {
     // the durable contract is onboarding_state + available_doors[], with prose
     // as at most a summary. Two PRs racing to own one sentence is how the
     // sentence ends up describing neither state correctly.
+    // Prose is now a SUMMARY of available_doors[0], never a second source of truth.
+    // The workspace-channel wording is unchanged: bootstrap_self is gated to the
+    // directory channel inside bootstrapSelf, so advertising it here would be a door
+    // that refuses the caller it was offered to.
     const nextStep = isMinted
       ? 'call orient (no args — your token is agent-bound) to receive your full basin-drop packet'
-      : 'if you know your agent slug/id: call connect { agent_name: "<slug>" } to claim your identity now (session-local). For a permanent weld: ask an org-admin to call mint_agent_token for your agent, then reconnect with the minted token.'
+      : onboardingState === 'unbound_no_agent'
+        ? 'you have no agent yet — call bootstrap_self { agent_name: "<the name you are giving it>" } to create it, mint its credential and grant yourself admin on its squad in one act. No other human is required. See available_doors for every door open to you.'
+        : onboardingState === 'unbound_agent_exists'
+          ? 'you already bootstrapped an agent — bind this session to it at /oauth/consent, or call connect { agent_name: "<slug>" } to claim it session-locally now. See available_doors.'
+          : 'if you know your agent slug/id: call connect { agent_name: "<slug>" } to claim your identity now (session-local). For a permanent weld: ask an org-admin to call mint_agent_token for your agent, then reconnect with the minted token.'
 
     // THE DOOR MUST SAY WHAT IT IS (#712).
     //
@@ -4257,7 +4382,9 @@ const toolBootContext: ToolSpec = {
               'anything requiring a standing capability, regardless of what you hold elsewhere',
             ],
             to_get_write_access:
-              'ask an org-admin for a WORKSPACE-channel token (mint_agent_token), and connect with that bearer. Requesting a squad grant will NOT help — this door discards grants by construction.',
+              'if you have no agent yet, call bootstrap_self { agent_name } — it creates your agent, mints its credential and makes you admin of its squad in one atomic act, with no other human involved. '
+              + 'If your agent already exists, ask an org-admin for a WORKSPACE-channel token (mint_agent_token), and connect with that bearer. '
+              + 'Requesting a squad grant will NOT help — this door discards grants by construction.',
           }
         : undefined
 
@@ -4273,6 +4400,8 @@ const toolBootContext: ToolSpec = {
       identity_status: identityStatus,
       bound_agent_id: auth.boundAgentId ?? null,
       ...(selfReport ? { registry: selfReport } : {}),
+      onboarding_state: onboardingState,
+      available_doors: availableDoors,
       next_step: nextStep,
       ...(isMinted ? {} : { enroll_url: enrollHref }),
       // Present ONLY on the directory channel — its absence is itself information.
