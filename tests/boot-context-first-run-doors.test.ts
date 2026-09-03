@@ -19,6 +19,7 @@ import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { invokeTool } from '../src/mcp/index'
+import { bootstrapSelf } from '../src/members/bootstrap-self'
 import type { AuthContext, Env } from '../src/types'
 
 const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
@@ -150,5 +151,46 @@ describe('the advisory lookup can never cost the caller its map', () => {
     // Fail toward MORE doors, never fewer: a caller wrongly shown bootstrap_self gets a
     // clear 409 that names the consent flow. A caller wrongly denied it gets nothing.
     expect(r.available_doors?.[0]?.tool).toBe('bootstrap_self')
+  })
+})
+
+// THE COUPLING. boot_context advertises bootstrap_self; bootstrapSelf decides whether to
+// accept the caller. Those are two readers of one fact. The first version of this change
+// carried its own copy of the audit query, which is how an advertised door quietly starts
+// lying: the tool tightens its predicate, the door keeps promising, and nothing fails
+// until a real newcomer is told to walk through a wall. They share one function now, and
+// this test pins the AGREEMENT rather than either implementation — so it still holds if
+// the predicate itself changes.
+describe('the door and the tool cannot disagree', () => {
+  it('when the tool would refuse with already_bootstrapped, the door has stopped offering it', async () => {
+    markBootstrapped('mem-newcomer')
+
+    const auth = seat('directory')
+    const toolResult = await bootstrapSelf(env, auth, 'Second Attempt')
+    const r = await boot('directory')
+
+    // The tool refuses...
+    expect(toolResult.ok).toBe(false)
+    if (!toolResult.ok) expect(toolResult.error).toBe('already_bootstrapped')
+    // ...and the door already knew.
+    expect(r.onboarding_state).toBe('unbound_agent_exists')
+    expect(r.available_doors?.map((d) => d.tool)).not.toContain('bootstrap_self')
+  })
+
+  it('with no prior bootstrap the tool does NOT refuse, and the door offers it', async () => {
+    // The positive control. Without this, the test above passes for a door that never
+    // offers bootstrap_self to anyone.
+    const auth = seat('directory')
+    const toolResult = await bootstrapSelf(env, auth, 'First Agent')
+    const refusedAsAlreadyDone = !toolResult.ok && toolResult.error === 'already_bootstrapped'
+    expect(refusedAsAlreadyDone).toBe(false)
+
+    const fresh = createSqliteD1()
+    applyAllMigrations(fresh.sqlite)
+    const freshEnv = { DB: fresh.db, TENANT_SLUG: 'mumega', BUS: { send: async () => {} } } as unknown as Env
+    const out = await invokeTool(seat('directory'), freshEnv, 'boot_context', {}, ORIGIN)
+    const r = ((out as { result?: BootResult }).result ?? {}) as BootResult
+    expect(r.available_doors?.[0]?.tool).toBe('bootstrap_self')
+    fresh.close()
   })
 })

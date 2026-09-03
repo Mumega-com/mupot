@@ -39,6 +39,7 @@ import { TOKEN_LIVE_PREDICATE, nowSqlUtc, touchTokenLastUsed } from '../auth/tok
 import { callerHoldsGateCapability, verdictPrincipal } from '../tasks/index'
 import { resolveSoleGateOwnerAgent } from '../gates/grants'
 import { isChannel } from '../members/service'
+import { findExistingBootstrap } from '../members/bootstrap-self'
 import { resolveConsentedAgentCapabilities } from './oauth-authorize'
 import { createBus } from '../bus'
 import { createMemory } from '../memory'
@@ -4134,9 +4135,11 @@ export interface OnboardingDoor {
   requires: string
 }
 
-/** Has this member ever completed bootstrap_self? Mirrors findExistingBootstrap in
- *  src/members/bootstrap-self.ts — the same audit row that makes a second attempt
- *  return `already_bootstrapped`, so the door we advertise matches what the tool does.
+/** Has this member ever completed bootstrap_self? Delegates to the CANONICAL predicate
+ *  in src/members/bootstrap-self.ts — the same call that makes a second attempt return
+ *  `already_bootstrapped` — so the door we advertise cannot drift from what the tool
+ *  accepts. It held its own copy of that query first; one predicate, two definitions is
+ *  how an advertised door quietly starts lying.
  *
  *  NEVER allowed to throw. boot_context is documented as "the one response that always
  *  succeeds on this channel" (#712) and is the only reachable call for a zero-capability
@@ -4149,9 +4152,9 @@ export interface OnboardingDoor {
 async function hasBootstrappedBefore(env: Env, memberId: string | null | undefined): Promise<boolean> {
   if (!memberId) return false
   try {
-    const row = await env.DB.prepare(
-      `SELECT agent_id FROM agent_audit WHERE actor_id = ?1 AND action = 'bootstrap_self' LIMIT 1`,
-    ).bind(memberId).first<{ agent_id: string }>()
+    // The SAME function bootstrapSelf uses to decide `already_bootstrapped`. Not a
+    // reimplementation of it — the door has to move when the tool moves.
+    const row = await findExistingBootstrap(env, memberId)
     return row !== null && row !== undefined
   } catch {
     return false
