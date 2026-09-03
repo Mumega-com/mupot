@@ -64,11 +64,12 @@ describe('MUPOT_MCP_INITIALIZE_INSTRUCTIONS', () => {
     // mumega-com#1179, 2026-09-02/03: ACK chains had no stop condition, so an ACK of an ACK
     // triggered a further ACK indefinitely. The instruction that produced the loop said "if it
     // carries request_id, ACK it" — no terminal case. The stop condition is now a server-computed
-    // field an automated receive path can read, plus a marker any kind can set.
+    // field an automated receive path can read, closed structurally by kind:"ack". A body marker
+    // was tried and removed: anything readable out of a body can be reproduced by quoting it.
     const text = MUPOT_MCP_INITIALIZE_INSTRUCTIONS
     expect(text).toContain('expects_reply')
     expect(text).toContain('reply_basis')
-    expect(text).toContain('[no_reply]')
+    expect(text).toContain('kind:"ack"')
     // an ack must be named as terminal, and the reason the field survives on it must be stated
     expect(text).toMatch(/ack is terminal/i)
     expect(text).toMatch(/idempotency/i)

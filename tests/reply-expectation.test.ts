@@ -18,7 +18,7 @@
 // prose token, surfaced on every inbox read as expects_reply + reply_basis. Nothing is refused.
 
 import { describe, expect, it } from 'vitest'
-import { evaluateReplyExpectation, NO_REPLY_MARKER } from '../src/agents/reply-expectation'
+import { evaluateReplyExpectation } from '../src/agents/reply-expectation'
 import { sendAgentMessage, readAgentInbox, leaseAgentInbox, type SendAuthzDecision } from '../src/agents/messages'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
@@ -50,9 +50,10 @@ describe('the predicate — one decision, from every input that can express it',
     expect(got).toEqual({ expected: true, basis: 'request_id_field' })
   })
 
-  it('the [no_reply] marker closes a chain that has no field to clear', () => {
-    const got = evaluateReplyExpectation({ kind: 'message', body: `chain closed. ${NO_REPLY_MARKER}` })
-    expect(got).toEqual({ expected: false, basis: 'explicit_no_reply' })
+  it('a chain is closed by kind:"ack", which is structured and cannot be quoted', () => {
+    // The ONLY close. A body cannot carry this authority — see the quoted-marker regressions.
+    expect(evaluateReplyExpectation({ kind: 'ack', body: 'chain closed, nothing further owed' }))
+      .toEqual({ expected: false, basis: 'ack_is_terminal' })
   })
 
   it('a [request_id:...] token in PROSE counts, because that is what agents actually key on', () => {
@@ -72,9 +73,9 @@ describe('the predicate — one decision, from every input that can express it',
     expect(quoting.basis).not.toBe('request_id_field')
   })
 
-  it('the field beats the marker when a sender contradicts itself', () => {
+  it('the structured field decides regardless of what the prose says', () => {
     // A spurious ack is noise; a missing ack is a stall. Fail toward answering.
-    const got = evaluateReplyExpectation({ kind: 'message', requestId: 'req-1', body: `answer me ${NO_REPLY_MARKER}` })
+    const got = evaluateReplyExpectation({ kind: 'message', requestId: 'req-1', body: 'answer me [no_reply]' })
     expect(got).toEqual({ expected: true, basis: 'request_id_field' })
   })
 
@@ -83,10 +84,45 @@ describe('the predicate — one decision, from every input that can express it',
       .toEqual({ expected: false, basis: 'no_signal' })
   })
 
-  it('the marker survives spacing and hyphenation, since bodies are hand-written', () => {
+  // REGRESSION — Athena's BLOCK on d117565e. A first draft honoured a `[no_reply]` body marker.
+  // A body QUOTING that marker suppressed a reply the same body was genuinely asking for: a
+  // required ACK cancelled by quotation. The lesson generalises past the one token — ANY
+  // authority read out of a body is forgeable by repeating it — so the marker is gone rather
+  // than reordered, and these pin that it stays gone.
+  it('a body marker no longer suppresses anything — it is inert text', () => {
     for (const body of ['[no_reply]', '[ no_reply ]', '[no-reply]', 'done. [NO_REPLY]']) {
-      expect(evaluateReplyExpectation({ kind: 'message', body }).expected).toBe(false)
+      const got = evaluateReplyExpectation({ kind: 'message', body })
+      expect(got.expected).toBe(false)
+      // false because NOTHING asked, not because the marker was honoured
+      expect(got.basis).toBe('no_signal')
     }
+  })
+
+  it("Athena's exact probe body is inert, not a honoured close", () => {
+    // Verbatim from the gate verdict on d117565e. Previously this returned
+    // basis:'explicit_no_reply' — a quoted marker treated as authoritative.
+    const got = evaluateReplyExpectation({ kind: 'message', body: 'Quoting "[no_reply]" but please answer' })
+    expect(got.expected).toBe(false)
+    expect(got.basis).toBe('no_signal')
+  })
+
+  it('QUOTING a no-reply marker cannot cancel a genuine request in the same body', () => {
+    // Athena's exact probe shape, plus the real request the probe was protecting.
+    const got = evaluateReplyExpectation({
+      kind: 'message',
+      body: 'Quoting "[no_reply]" but please answer: [request_id:550e8400-e29b-41d4-a716-446655440000]',
+    })
+    expect(got.expected).toBe(true)
+    expect(got.basis).toBe('body_token')
+  })
+
+  it('QUOTING a no-reply marker cannot cancel a structured request either', () => {
+    const got = evaluateReplyExpectation({
+      kind: 'message',
+      requestId: 'req-must-be-answered',
+      body: 'They wrote "[no_reply]" — ignore that, I still need an answer.',
+    })
+    expect(got).toEqual({ expected: true, basis: 'request_id_field' })
   })
 
   it('KNOWN RESIDUAL: an acknowledgement sent WITHOUT kind:"ack" still reads as a request', () => {
@@ -95,9 +131,8 @@ describe('the predicate — one decision, from every input that can express it',
     // That is the correct reading of what it sent — it labelled itself a message and asked for a
     // reply. The escape is available to every kind and costs one token: [no_reply].
     expect(evaluateReplyExpectation({ kind: 'message', requestId: 'req-9', body: 'ack: got it' }).expected).toBe(true)
-    expect(evaluateReplyExpectation({ kind: 'message', requestId: 'req-9', body: `ack: got it ${NO_REPLY_MARKER}` }).expected).toBe(true)
-    // ...but with no field set, the marker does close it:
-    expect(evaluateReplyExpectation({ kind: 'message', body: `ack: got it ${NO_REPLY_MARKER}` }).expected).toBe(false)
+    // ...and the fix is to send it as what it is:
+    expect(evaluateReplyExpectation({ kind: 'ack', requestId: 'req-9', body: 'ack: got it' }).expected).toBe(false)
   })
 })
 
@@ -186,7 +221,7 @@ describe('every inbox surface carries the answer', () => {
     }, SYSTEM_AUTHZ)
     await sendAgentMessage(env, {
       fromAgent: FROM, fromMember: FROM_MEMBER, toAgent: TO,
-      body: `chain closed. ${NO_REPLY_MARKER}`, kind: 'message',
+      body: 'chain closed', kind: 'ack', inReplyTo: 'req-wants-answer',
     }, SYSTEM_AUTHZ)
 
     const read = await readAgentInbox(env, { agent: TO, peek: true })
@@ -195,8 +230,8 @@ describe('every inbox surface carries the answer', () => {
     const byBody = Object.fromEntries(read.messages.map((m) => [m.body, m]))
     expect(byBody['build G64b'].expects_reply).toBe(true)
     expect(byBody['build G64b'].reply_basis).toBe('request_id_field')
-    expect(byBody[`chain closed. ${NO_REPLY_MARKER}`].expects_reply).toBe(false)
-    expect(byBody[`chain closed. ${NO_REPLY_MARKER}`].reply_basis).toBe('explicit_no_reply')
+    expect(byBody['chain closed'].expects_reply).toBe(false)
+    expect(byBody['chain closed'].reply_basis).toBe('ack_is_terminal')
 
     harness.close()
   })
