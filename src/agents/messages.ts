@@ -687,6 +687,12 @@ async function readAgentInboxForReader(
       // paginating caller is told rows exist below a cursor it has already
       // passed, so page two of two reports a phantom remainder and the loop
       // never terminates. Found by test, not by reading.
+      // NOTE: unreachable today and deliberately kept. readVerifiedSignedAgentInbox's
+      // input type has no sinceSeq, so no caller can reach the signed path with a
+      // cursor — a mutation removing this survives, and that is expected rather than
+      // an untested branch. It stays so that adding sinceSeq to the signed reader
+      // later cannot silently reintroduce the phantom-remainder bug the bearer path
+      // had. Reported as a surviving mutation rather than buried.
       const sinceSql = sinceSeq > 0 ? `AND seq > ?${binds.length + 1}` : ''
       if (sinceSeq > 0) binds.push(sinceSeq)
       // The cursor MUST be in the count, not only in the page. Without it a
