@@ -333,9 +333,18 @@ function reportUnmatchedCron(scheduledAt: Date): void {
 export default {
   fetch: async (req: Request, env: Env, ctx: ExecutionContext) => {
     // ── Cloudflare Workers for Platforms (WFP) Sovereign Tenant Routing ──
-    // Hostname: `<tenant>.mupot.mumega.com`
-    // Apex path: `mupot.mumega.com/t/{tenant}/{interface}` e.g. `/t/gaf/mcp`
-    const url = new URL(req.url)
+    //
+    // PATH IS THE TENANT ADDRESS: `mupot.mumega.com/t/{tenant}/{interface}`, e.g. `/t/gaf/mcp`.
+    //
+    // The subdomain form `<tenant>.mupot.mumega.com` is NOT usable and must not be
+    // reintroduced. Cloudflare Universal SSL covers `mumega.com` and `*.mumega.com`, but
+    // not a second-level wildcard like `*.mupot.mumega.com` — that needs Advanced
+    // Certificate Manager. Measured 2026-09-03: `gaf.mupot.mumega.com` fails the TLS
+    // handshake outright (alert 552) while `mupot.mumega.com` answers 200, so a
+    // per-tenant subdomain dies before HTTP begins. `provisionSovereignPot` still
+    // computes that shape and hands it back as a login URL; see mupot#1285.
+    //
+    // Path-based routing needs no DNS record, no ACM, and no certificate per tenant.
     const rootHost = env.PUBLIC_ORIGIN ? new URL(env.PUBLIC_ORIGIN).hostname : 'mupot.mumega.com'
     const homeSlug = (env.TENANT_SLUG || 'mumega').toLowerCase()
     const { extractTenantSlug, resolveApexPathTenant } = await import('./dispatcher')
