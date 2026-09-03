@@ -4112,7 +4112,6 @@ const toolFleetAgentGet: ToolSpec = {
   },
 }
 
-<<<<<<< HEAD
 // Boot-time self-report, wrapped so it can NEVER take boot down with it. boot_context is
 // the one response documented as always succeeding on the directory channel (#712) and is
 // the only reachable call for a zero-capability seat. A registry write is strictly less
@@ -4127,7 +4126,9 @@ async function reportSelfAtBoot(
     return await selfReportAtBoot(env, agentId, claim)
   } catch {
     return { outcome: 'unavailable', belief: null, detail: 'registry unreachable at boot; identity below is unaffected' }
-=======
+  }
+}
+
 // ── first-run onboarding: state + doors (mupot#1283) ─────────────────────────────
 //
 // Structured, so a harness can ACT on it without parsing English. `next_step` remains
@@ -4212,7 +4213,6 @@ function buildAvailableDoors(state: OnboardingState): OnboardingDoor[] {
         { tool: 'mint_agent_token', does: 'weld a credential to an agent permanently', requires: 'admin on the agent\'s squad — ask an org-admin if you lack it' },
         ...alwaysOpen,
       ]
->>>>>>> origin/main
   }
 }
 
