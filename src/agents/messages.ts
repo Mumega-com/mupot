@@ -20,6 +20,7 @@ import { resolveAgentRef } from '../org/resolve'
 import { canOnSquad } from '../auth/capability'
 import { sha256Hex } from '../lib/canonical-json'
 import { TOKEN_LIVE_PREDICATE } from '../auth/token-lifecycle'
+import { evaluateReplyExpectation, type ReplyBasis } from './reply-expectation'
 
 // ── tunables ────────────────────────────────────────────────────────────────────────────
 const MAX_BODY_CHARS = 8000
@@ -70,9 +71,15 @@ export interface InboxMessage {
   body_length: number | null
   checksum_sha256: string | null
   is_intact: boolean | null
+  /** Does this message ask its recipient for a reply? Server-computed, never client-supplied.
+   *  See ./reply-expectation — one predicate over kind, request_id and the body prose token. */
+  expects_reply?: boolean
+  /** Which input decided expects_reply. 'body_token' is the weak, quotable one — a consumer
+   *  that acts only on structured intent should require 'request_id_field'. */
+  reply_basis?: ReplyBasis
 }
 
-async function annotateMessageIntegrity(messages: InboxMessage[]): Promise<void> {
+async function annotateMessages(messages: InboxMessage[]): Promise<void> {
   for (const message of messages) {
     const storedLength = typeof message.body_length === 'number'
       && Number.isInteger(message.body_length)
@@ -90,6 +97,17 @@ async function annotateMessageIntegrity(messages: InboxMessage[]): Promise<void>
       ? null
       : message.body.length === storedLength
         && await sha256Hex(message.body) === storedChecksum
+
+    // Reply expectation rides in the SAME pass as integrity, deliberately. Both are read-time
+    // annotations that every inbox surface needs, and three call sites already exist (read,
+    // lease, dead-letters). A second, separate pass would be three more places to forget one.
+    const expectation = evaluateReplyExpectation({
+      kind: message.kind,
+      requestId: message.request_id,
+      body: message.body,
+    })
+    message.expects_reply = expectation.expected
+    message.reply_basis = expectation.basis
   }
 }
 
@@ -731,7 +749,7 @@ async function readAgentInboxForReader(
     for (const m of messages) m.seq = Number(m.seq)
     for (const m of messages) m.project_id = m.project_id ?? null
     for (const m of messages) m.target_seat = m.target_seat ?? null
-    await annotateMessageIntegrity(messages)
+    await annotateMessages(messages)
     // On the CONSUMING path the returned rows were already marked read above, so
     // this count already excludes them. On the PEEK path nothing was marked, so
     // the count still includes them and has to be reduced by what we are handing
@@ -958,7 +976,7 @@ export async function leaseAgentInbox(
       m.project_id = m.project_id ?? null
       m.target_seat = m.target_seat ?? null
     }
-    await annotateMessageIntegrity(messages)
+    await annotateMessages(messages)
 
     // Post-check, mirroring readAgentInboxForReader. The pre-check above is NOT the fence —
     // it cannot be, because a fence flip between it and the UPDATE would slip through. The
@@ -1116,7 +1134,7 @@ export async function listDeadLetteredMessages(
       m.project_id = m.project_id ?? null
       m.target_seat = m.target_seat ?? null
     }
-    await annotateMessageIntegrity(messages)
+    await annotateMessages(messages)
 
     if (messages.length === 0 && await bearerFenceBlocks(env, tenant, input.agent)) {
       return { ok: false, reason: 'consumer_fenced' }
