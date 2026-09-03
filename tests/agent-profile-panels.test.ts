@@ -3,6 +3,7 @@ import {
   PANELS,
   formatCost,
   panelByKey,
+  summariseCollaboration,
   summariseFlights,
   summariseWork,
   empty,
@@ -138,7 +139,7 @@ describe('work summary', () => {
 
 describe('registry — a new signal is a registration, not a rewrite', () => {
   it('is ordered and addressable by key', () => {
-    expect(PANELS.map((p) => p.key)).toEqual(['flights', 'work'])
+    expect(PANELS.map((p) => p.key)).toEqual(['flights', 'work', 'collaboration'])
     expect(panelByKey('flights')?.title).toBe('Flights')
   })
 
@@ -151,7 +152,6 @@ describe('registry — a new signal is a registration, not a rewrite', () => {
   it('does not register panels that cannot yet resolve', () => {
     const keys = PANELS.map((p) => p.key)
     expect(keys).not.toContain('reliability')
-    expect(keys).not.toContain('collaboration')
   })
 
   it('every panel states what its empty case means', () => {
@@ -174,5 +174,61 @@ describe('cost formatting', () => {
   it('shows an em dash for a value that is not a number, never $0.00', () => {
     expect(formatCost(Number.NaN)).toBe('—')
     expect(formatCost(-1)).toBe('—')
+  })
+})
+
+describe('collaboration — who this agent actually works with', () => {
+  const ME = 'me'
+  const names = new Map([['a1', 'Athena'], ['l1', 'Loom']])
+  const rows = [
+    { from_agent: ME, to_agent: 'a1', created_at: '2026-09-03T05:00:00Z' },
+    { from_agent: ME, to_agent: 'a1', created_at: '2026-09-03T04:00:00Z' },
+    { from_agent: 'a1', to_agent: ME, created_at: '2026-09-03T03:00:00Z' },
+    { from_agent: 'l1', to_agent: ME, created_at: '2026-09-03T02:00:00Z' },
+  ]
+
+  it('keeps direction — sent and received are separate facts', () => {
+    const s = summariseCollaboration(ME, rows, names)
+    const athena = s.collaborators.find((c) => c.agentId === 'a1')
+    expect(athena?.sent).toBe(2)
+    expect(athena?.received).toBe(1)
+  })
+
+  it('names peers, falling back to the id rather than hiding an unnamed one', () => {
+    const s = summariseCollaboration(ME, rows, new Map([['a1', 'Athena']]))
+    expect(s.collaborators.find((c) => c.agentId === 'a1')?.name).toBe('Athena')
+    expect(s.collaborators.find((c) => c.agentId === 'l1')?.name).toBe('l1')
+  })
+
+  it('orders by total exchange volume, busiest first', () => {
+    expect(summariseCollaboration(ME, rows, names).collaborators[0].agentId).toBe('a1')
+  })
+
+  it('records the most recent exchange in EITHER direction', () => {
+    const s = summariseCollaboration(ME, rows, names)
+    expect(s.collaborators.find((c) => c.agentId === 'a1')?.lastAt).toBe('2026-09-03T05:00:00Z')
+  })
+
+  // Self-messages appear in real data and are not collaboration.
+  it('excludes self-messages entirely', () => {
+    const s = summariseCollaboration(ME, [{ from_agent: ME, to_agent: ME, created_at: 'd' }], names)
+    expect(s.collaborators).toEqual([])
+    expect(s.totalMessages).toBe(0)
+  })
+
+  // A row naming neither side is not this agent's edge.
+  it('ignores a row that involves neither side of this agent', () => {
+    const s = summariseCollaboration(ME, [{ from_agent: 'a1', to_agent: 'l1', created_at: 'd' }], names)
+    expect(s.collaborators).toEqual([])
+  })
+
+  it('counts every message it attributes, and no others', () => {
+    const s = summariseCollaboration(ME, rows, names)
+    expect(s.totalMessages).toBe(4)
+    expect(s.collaborators.reduce((n, c) => n + c.sent + c.received, 0)).toBe(4)
+  })
+
+  it('returns nothing for an agent that has exchanged nothing', () => {
+    expect(summariseCollaboration(ME, [], names)).toMatchObject({ collaborators: [], totalMessages: 0 })
   })
 })

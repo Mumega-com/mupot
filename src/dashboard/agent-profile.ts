@@ -176,6 +176,107 @@ export async function loadWorkPanel(env: Env, agentId: string): Promise<PanelRes
   }
 }
 
+
+// ── collaboration ────────────────────────────────────────────────────────────
+
+export interface Collaborator {
+  agentId: string
+  name: string
+  /** Messages this agent SENT to them. */
+  sent: number
+  /** Messages they sent to THIS agent. */
+  received: number
+  /** Most recent exchange in either direction. */
+  lastAt: string
+}
+
+export interface CollaborationSummary {
+  collaborators: Collaborator[]
+  totalMessages: number
+}
+
+/**
+ * Who this agent actually works with, built from real messages rather than from
+ * org structure.
+ *
+ * DIRECTION IS KEPT, deliberately. Who initiates and who answers are different
+ * facts, and collapsing them into one number hides the difference between a
+ * peer and a reporting line. A pair where one side sends 40 and receives 1 is
+ * not the same relationship as 20 each way.
+ *
+ * SHARED SQUAD MEMBERSHIP IS NOT AN EDGE. That is co-location, not
+ * collaboration — two agents can sit in one squad for months and never exchange
+ * a message. Drawing it as the same kind of line would let the org chart
+ * masquerade as evidence, which is exactly backwards: the messages are the
+ * evidence and the chart is the claim.
+ */
+export function summariseCollaboration(
+  agentId: string,
+  rows: { from_agent: string; to_agent: string; created_at: string }[],
+  names: Map<string, string>,
+): CollaborationSummary {
+  const byPeer = new Map<string, Collaborator>()
+  let counted = 0
+
+  for (const r of rows) {
+    // Self-messages are not collaboration. They also appear in real data.
+    if (r.from_agent === r.to_agent) continue
+    const isSender = r.from_agent === agentId
+    const peerId = isSender ? r.to_agent : r.from_agent
+    // A row naming neither side is not ours to count.
+    if (!isSender && r.to_agent !== agentId) continue
+    if (!peerId) continue
+
+    let peer = byPeer.get(peerId)
+    if (!peer) {
+      peer = { agentId: peerId, name: names.get(peerId) ?? peerId, sent: 0, received: 0, lastAt: r.created_at }
+      byPeer.set(peerId, peer)
+    }
+    if (isSender) peer.sent += 1
+    else peer.received += 1
+    if (r.created_at > peer.lastAt) peer.lastAt = r.created_at
+    counted += 1
+  }
+
+  const collaborators = [...byPeer.values()].sort(
+    (a, b) => (b.sent + b.received) - (a.sent + a.received),
+  )
+  return { collaborators, totalMessages: counted }
+}
+
+export async function loadCollaborationPanel(
+  env: Env,
+  agentId: string,
+): Promise<PanelResult<CollaborationSummary>> {
+  try {
+    const res = await env.DB.prepare(
+      `SELECT from_agent, to_agent, created_at
+         FROM agent_messages
+        WHERE tenant = ?1 AND (from_agent = ?2 OR to_agent = ?2)
+        ORDER BY created_at DESC
+        LIMIT 500`,
+    ).bind(env.TENANT_SLUG, agentId).all<{ from_agent: string; to_agent: string; created_at: string }>()
+    const rows = res.results ?? []
+    if (rows.length === 0) return empty()
+
+    // Name ONLY the peers that actually appear. Resolving the whole roster here
+    // would disclose agents this reader has no reason to see.
+    const peerIds = [...new Set(rows.flatMap((r) => [r.from_agent, r.to_agent]).filter((id) => id && id !== agentId))]
+    const names = new Map<string, string>()
+    if (peerIds.length > 0) {
+      const placeholders = peerIds.map((_, i) => `?${i + 1}`).join(', ')
+      const nameRows = await env.DB.prepare(
+        `SELECT id, name FROM agents WHERE id IN (${placeholders})`,
+      ).bind(...peerIds).all<{ id: string; name: string }>()
+      for (const n of nameRows.results ?? []) names.set(n.id, n.name)
+    }
+    return ready(summariseCollaboration(agentId, rows, names))
+  } catch (err) {
+    console.error('[agent-profile] collaboration panel read failed:', err)
+    return unavailable('Collaboration history could not be read.')
+  }
+}
+
 // ── registry ─────────────────────────────────────────────────────────────────
 
 export interface PanelSpec {
@@ -193,6 +294,7 @@ export interface PanelSpec {
 export const PANELS: readonly PanelSpec[] = [
   { key: 'flights', title: 'Flights', emptyLabel: 'This agent has not flown.' },
   { key: 'work', title: 'Work', emptyLabel: 'No tasks are assigned to this agent.' },
+  { key: 'collaboration', title: 'Works with', emptyLabel: 'This agent has exchanged no messages.' },
 ]
 
 export function panelByKey(key: string): PanelSpec | undefined {
