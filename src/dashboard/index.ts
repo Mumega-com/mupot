@@ -80,6 +80,7 @@ import { findPreset, isValidPresetId } from '../auth/role-presets'
 // Agent-bound token mint UI.
 import { loadAgentTokenView, agentTokenPageBody, agentTokenMintedBody } from './agent-token'
 import {
+  loadCollaborationPanel,
   loadFlightPanel,
   loadWorkPanel,
   panelByKey,
@@ -87,6 +88,7 @@ import {
   type PanelResult,
   type FlightSummary,
   type WorkSummary,
+  type CollaborationSummary,
 } from './agent-profile'
 import {
   authorizeEnrollMint,
@@ -1726,12 +1728,13 @@ dashboardApp.get('/agents/:id', async (c) => {
   // Panels resolve independently and in parallel: one failing read must degrade
   // its own section and nothing else. Each returns a typed state, so "we could
   // not read this" never renders as "this agent has done nothing".
-  const [flights, work] = await Promise.all([
+  const [flights, work, collaboration] = await Promise.all([
     loadFlightPanel(c.env, agent.id),
     loadWorkPanel(c.env, agent.id),
+    loadCollaborationPanel(c.env, agent.id),
   ])
   return c.html(
-    shell(c.env, `Agent · ${agent.name}`, agentConsoleBody(agent, squad, canWake, flights, work)),
+    shell(c.env, `Agent · ${agent.name}`, agentConsoleBody(agent, squad, canWake, flights, work, collaboration)),
   )
 })
 
@@ -5257,6 +5260,7 @@ function agentConsoleBody(
   canWake: boolean,
   flights: PanelResult<FlightSummary>,
   work: PanelResult<WorkSummary>,
+  collaboration: PanelResult<CollaborationSummary>,
 ) {
   // The wake button calls the RBAC-gated agents endpoint. The fetch is same-origin
   // and credentialed (HttpOnly session cookie rides along automatically).
@@ -5342,6 +5346,17 @@ function agentConsoleBody(
             ${t.github_issue_url
               ? html`<a href="${t.github_issue_url}">${t.title.slice(0, 90)}</a>`
               : html`${t.title.slice(0, 90)}`} — ${t.status}
+          </li>`)}
+        </ul>
+      </div>`)}
+
+    <h2>Works with</h2>
+    ${renderPanel('collaboration', collaboration, (d) => html`
+      <div class="card">
+        <p class="dim">${d.totalMessages} messages exchanged. Edges are real messages — shared squad membership is not shown here, because co-location is not collaboration.</p>
+        <ul>
+          ${d.collaborators.slice(0, 10).map((p) => html`<li>
+            <a href="/agents/${p.agentId}">${p.name}</a> — sent ${p.sent}, received ${p.received} · last ${p.lastAt}
           </li>`)}
         </ul>
       </div>`)}

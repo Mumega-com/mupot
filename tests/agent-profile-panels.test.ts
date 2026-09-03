@@ -209,6 +209,20 @@ describe('collaboration — who this agent actually works with', () => {
     expect(s.collaborators.find((c) => c.agentId === 'a1')?.lastAt).toBe('2026-09-03T05:00:00Z')
   })
 
+  // The fixture above arrives newest-first, matching the query's ORDER BY — so
+  // lastAt is already correct from initialisation and the advance-check never
+  // runs. A surviving mutation proved that assertion was vacuous. The summariser
+  // must not depend on input order, so this feeds rows OLDEST-first.
+  it('advances lastAt when rows arrive oldest-first, not just when pre-sorted', () => {
+    const ascending = [
+      { from_agent: ME, to_agent: 'a1', created_at: '2026-09-01T00:00:00Z' },
+      { from_agent: 'a1', to_agent: ME, created_at: '2026-09-02T00:00:00Z' },
+      { from_agent: ME, to_agent: 'a1', created_at: '2026-09-03T00:00:00Z' },
+    ]
+    const s = summariseCollaboration(ME, ascending, names)
+    expect(s.collaborators.find((c) => c.agentId === 'a1')?.lastAt).toBe('2026-09-03T00:00:00Z')
+  })
+
   // Self-messages appear in real data and are not collaboration.
   it('excludes self-messages entirely', () => {
     const s = summariseCollaboration(ME, [{ from_agent: ME, to_agent: ME, created_at: 'd' }], names)
