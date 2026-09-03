@@ -47,7 +47,10 @@ potsApp.post('/provision', async (c) => {
 
   try {
     const result = await provisionSovereignPot(c.env, body)
-    return c.json({ ok: true, pot: result }, 201)
+    // 201 Created is a claim that the thing now exists. It does not, unless every step ran
+    // and it was verified reachable. 202 Accepted is the honest code for "we started, and
+    // here is exactly how far we got".
+    return c.json({ ok: result.ok, pot: result }, result.ok ? 201 : 202)
   } catch (err) {
     return c.json(
       {
