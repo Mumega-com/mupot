@@ -968,6 +968,21 @@ describe('provision tools — operator-principal invariant is exhaustive', () =>
     // Kasra-core to re-examine now that 0087 makes it reachable by more
     // callers than before, but not silently changed here.
     'deactivate_agent',
+    // mupot#1288: update_agent grew a SELF LANE — an agent-bound caller
+    // correcting its OWN row (auth.boundAgentId === the resolved agent's id)
+    // acts on its own authority, no admin required. Deciding self-vs-other
+    // needs `agent` resolved first, so the operator-principal refusal can no
+    // longer be the literal first statement in run() (this loop calls every
+    // tool with EMPTY args, which the self lane can't classify without an
+    // `agent` to resolve). The guard itself is NOT gone: an agent-bound
+    // caller targeting a DIFFERENT agent's row still gets
+    // operator_principal_required, and the self lane has its own admin-field
+    // gate (SELF_FORBIDDEN_FIELDS) rejecting slug/owner/qnft_ref/capabilities/
+    // budget_cap_cents/budget_window even on the caller's own row. Exhaustive
+    // coverage of both axes — self-allowed, self-forbidden-fields, other-agent
+    // still refused, admin path unchanged — lives in
+    // tests/agent-self-update.test.ts, not here.
+    'update_agent',
   ])
 
   const boundAgentAuth: AuthContext = {
