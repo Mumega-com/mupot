@@ -118,9 +118,10 @@ export type SignedAttachResult = SignedAttachOk | SignedAttachErr
 export async function verifySignedAttach(
   env: Env,
   body: Record<string, unknown>,
-  validTypes: Set<string>,
-  validRuntimes: Set<string>,
-  validLifecycles: Set<string>,
+  // ReadonlySet: a verifier validates against the vocabulary, it never edits it.
+  validTypes: ReadonlySet<string>,
+  validRuntimes: ReadonlySet<string>,
+  validLifecycles: ReadonlySet<string>,
 ): Promise<SignedAttachResult> {
   // 1. Shape + field validation (all from the UNTRUSTED body).
   if (typeof body.agent_id !== 'string' || !AGENT_ID_RE.test(body.agent_id)) {
