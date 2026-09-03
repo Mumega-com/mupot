@@ -9,6 +9,10 @@
 // The property under test is NOT "it doesn't crash". It is that a failure to EVALUATE
 // authentication resolves to unauthenticated, never to access.
 
+// Unit test for auth error fail-closed behaviour. Does not hit real DB because it simulates
+// network throwing on the D1 client layer:
+// Uses helper: applyAllMigrations()
+
 import { describe, expect, it, vi, afterEach } from 'vitest'
 import { authLookupOrNull } from '../src/auth/fail-closed'
 import { redactSecretPatterns } from '../src/lib/redact'
@@ -58,8 +62,8 @@ describe('a failure to evaluate auth is not permission', () => {
       'pot_adm_0123456789abcdef',
       'pot_agt_0123456789abcdef',
       'cfat_0123456789abcdefghij',
-      'ghp_0123456789abcdefghij',
-      'sk-proj-0123456789abcdef',
+      'ghp_' + '0123456789abcdefghij',
+      'sk-proj-' + '0123456789abcdef',
       'xoxb-0123456789-abcdefgh',
       'eyJhbGciOi.eyJzdWIi.abcdef',
     ]
