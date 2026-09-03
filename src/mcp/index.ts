@@ -3833,8 +3833,11 @@ const toolPeers: ToolSpec = {
 
 // check_in — pot-native presence heartbeat over MCP. This mirrors
 // POST /api/fleet/checkin for runtimes that only have an MCP transport: identity
-// is the authenticated member token, source/label/7-axis are descriptive only, and a
-// rapid repeat is debounced per (tenant, memberId, seat).
+// is the authenticated member token. When that token has a live member_tokens.label,
+// args.seat may only echo that label — a different seat is 403 seat_mismatch (same
+// honesty class #1272 closed for inbox). Tokens with no bound label still accept a
+// declared seat (legacy multi-seat presence). Rapid repeats debounce per
+// (tenant, memberId, seat).
 const toolCheckIn: ToolSpec = {
   name: 'check_in',
   scope: 'self (member-token presence)',
@@ -3856,7 +3859,7 @@ const toolCheckIn: ToolSpec = {
     },
     additionalProperties: false,
   },
-  async run(auth, env, args) {
+  async run(auth, env, args, ctx) {
     for (const key of ['source', 'label', 'name', 'seat', 'harness', 'machine', 'model', 'provider', 'effort', 'flight_id']) {
       if (args[key] !== undefined && args[key] !== null && typeof args[key] !== 'string') {
         return fail(400, 'invalid_args', `${key} must be a string`)
@@ -3866,7 +3869,20 @@ const toolCheckIn: ToolSpec = {
     const id = await loadMemberIdentity(env, auth)
     if (!id) return fail(403, 'not_member_bound', 'check_in requires a member-token principal')
 
-    const seatLabel = (str(args.seat) || str(args.name) || str(args.label) || '').trim()
+    const boundSeat = await resolveBoundSeat(env, auth)
+    const requestedSeat = str(args.seat)
+    if (requestedSeat && boundSeat && requestedSeat !== boundSeat) {
+      // Honesty lock-in: a minted token labelled grok-bot-desktop cannot check in as
+      // cursor-river. Return enroll_url so a NEW body can follow /enroll — do not
+      // weld this key to the claimed seat, and do not grant admin (Kasra 3750 AMBER).
+      return fail(403, 'seat_mismatch', {
+        token_label: boundSeat,
+        enroll_url: enrollUrl(canonicalOrigin(env, ctx.origin), requestedSeat),
+        detail: `this token is bound to seat "${boundSeat}"; args.seat must match it or be omitted`,
+      })
+    }
+
+    const seatLabel = (requestedSeat || str(args.name) || str(args.label) || boundSeat || '').trim()
     const axis = normalizeSevenAxis({
       seat: seatLabel,
       label: seatLabel || args.label,
@@ -3884,6 +3900,7 @@ const toolCheckIn: ToolSpec = {
     const echo = {
       ok: true as const,
       seat: seatLabel || id.displayName,
+      token_label: boundSeat,
       agent: id.displayName,
       agent_id: id.boundAgentId,
       harness: axis.harness,
@@ -3934,6 +3951,7 @@ const toolStatus: ToolSpec = {
     const agentId = str(args.agent_id)
     if (!agentId) {
       // No agent specified → echo the member's own principal (who am I + caps + seat).
+      const tokenLabel = await resolveBoundSeat(env, auth)
       let seatName: string | null = null
       let seats: string[] = []
       let activeSeat: Record<string, unknown> | null = null
@@ -3979,6 +3997,7 @@ const toolStatus: ToolSpec = {
         tenant: auth.tenant,
         role: auth.role,
         bound_agent_id: auth.boundAgentId ?? null,
+        token_label: tokenLabel,
         seat_name: seatName,
         seats,
         active_seat: activeSeat,
@@ -4135,8 +4154,13 @@ const toolBootContext: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args, ctx) {
+    const claimedSeat = (str(args.seat) || str(args.label) || ctx?.seat || '').trim() || null
+    const tokenLabel = await resolveBoundSeat(env, auth)
+    const seatMismatch = Boolean(claimedSeat && tokenLabel && claimedSeat !== tokenLabel)
+
     if (auth.memberId) {
-      const seatLabel = (str(args.seat) || str(args.label) || ctx?.seat || '').trim()
+      // Presence must not record a claimed seat this token is not bound to.
+      const seatLabel = tokenLabel ?? claimedSeat ?? ''
       const bootTouch = (async () => {
         const id = await loadMemberIdentity(env, auth)
         if (id) {
@@ -4155,10 +4179,10 @@ const toolBootContext: ToolSpec = {
     // never from client input.
     const isMinted = auth.boundAgentId !== null
     const identityStatus: 'minted' | 'unminted' = isMinted ? 'minted' : 'unminted'
-    const enrollHref = enrollUrl(
-      canonicalOrigin(env, ctx.origin),
-      (str(args.seat) || str(args.label) || ctx?.seat || '').trim() || null,
-    )
+    // Door stays /enroll. A minted session that claimed the WRONG seat still gets
+    // enroll_url so a new Cursor body can follow it — Kasra 3750: do not treat
+    // enroll-minted keys as a clamp that would hand the claimed agent admin.
+    const enrollHref = enrollUrl(canonicalOrigin(env, ctx.origin), claimedSeat)
 
     // QA-1: every refusal/unminted signal must carry the full map out — no dead ends.
     // Two paths for an unbound token:
@@ -4228,8 +4252,9 @@ const toolBootContext: ToolSpec = {
       // identity coherence (#126) — NEW field
       identity_status: identityStatus,
       bound_agent_id: auth.boundAgentId ?? null,
+      token_label: tokenLabel,
       next_step: nextStep,
-      ...(isMinted ? {} : { enroll_url: enrollHref }),
+      ...(!isMinted || seatMismatch ? { enroll_url: enrollHref } : {}),
       // Present ONLY on the directory channel — its absence is itself information.
       ...(directoryNote ? { channel_limits: directoryNote } : {}),
     })
