@@ -40,6 +40,12 @@ export function redactSecretPatterns(text: string): string {
     .replace(/Bearer\s+[^\s"']+/gi, 'Bearer [redacted]')
     .replace(/\bxox[baprs]-[A-Za-z0-9-]{8,}\b/gi, '[redacted]')
     .replace(/\bmupot_[A-Za-z0-9_-]+\b/g, '[redacted]')
+    // Cloudflare API tokens — live on this host as ~/.fleet/agents/*.token and passed to
+    // the CF API. Added 2026-09-03 after an adversarial pass found them absent while a
+    // hand-rolled copy of this function was being written elsewhere (mupot#1287).
+    .replace(/\bcfat_[A-Za-z0-9_-]{16,}\b/g, '[redacted]')
+    // Pot admin / lead-agent credentials minted by provisionSovereignPot.
+    .replace(/\bpot_(?:adm|agt)_[A-Za-z0-9_-]{8,}\b/g, '[redacted]')
     .replace(/\bgh[pousr]_[A-Za-z0-9_]{12,}\b/g, '[redacted]')
     .replace(/\bsk-(?:proj-)?[A-Za-z0-9_-]{12,}\b/g, '[redacted]')
     .replace(/\bAKIA[A-Z0-9]{16}\b/g, '[redacted]')

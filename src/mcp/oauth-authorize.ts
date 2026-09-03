@@ -37,6 +37,7 @@ import {
 import { sha256Hex, mintRawToken, resolveAgentMemberBinding, mintAgentBoundToken } from '../members/service'
 import { createAgent } from '../org/service'
 import { redactSecretPatterns } from '../lib/redact'
+import { authLookupOrNull } from '../auth/fail-closed'
 
 // ── OAuth props stored via completeAuthorization ─────────────────────────────
 // Encrypted by the library; read back via resolveExternalToken.
@@ -993,6 +994,14 @@ export async function resolveExternalToken(
   env: Env,
   token: string,
 ): Promise<{ props: OAuthMemberProps } | null> {
+  // mupot#1281 — a D1 throw here used to escape uncaught to the platform as a 1101.
+  return authLookupOrNull('resolveExternalToken', () => resolveExternalTokenInner(env, token))
+}
+
+async function resolveExternalTokenInner(
+  env: Env,
+  token: string,
+): Promise<{ props: OAuthMemberProps } | null> {
   // Namespace non-overlap assertion (C4): OAuth tokens are issued as
   // "userId:grantId:secret" format (3 colon-separated segments). mupot member
   // keys always start with "mupot_" (64 hex chars after the prefix). These two
@@ -1080,6 +1089,15 @@ export async function resolveExternalToken(
 // deactivating the agent (or narrowing its squad access) takes effect immediately —
 // same C2 guarantee as every other channel.
 export async function buildAuthContextFromProps(
+  env: Env,
+  props: OAuthMemberProps,
+): Promise<AuthContext | null> {
+  // mupot#1281 — three unguarded D1 reads live below (token liveness, resolveCapabilities,
+  // resolveConsentedAgentCapabilities). Any of them throwing became a 1101.
+  return authLookupOrNull('buildAuthContextFromProps', () => buildAuthContextFromPropsInner(env, props))
+}
+
+async function buildAuthContextFromPropsInner(
   env: Env,
   props: OAuthMemberProps,
 ): Promise<AuthContext | null> {
