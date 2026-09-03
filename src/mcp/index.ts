@@ -170,6 +170,7 @@ import { MUPOT_MCP_INITIALIZE_INSTRUCTIONS } from './instructions'
 // The SAME predicate the meter enforces with. Imported rather than restated —
 // these were two copies and they drifted (#1179 gate R6).
 import { getAuthorizedMeterStatus, isEnforceableCap } from '../agents/meter'
+import { selfReportAtBoot } from '../fleet/boot-self-report'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
@@ -4110,6 +4111,23 @@ const toolFleetAgentGet: ToolSpec = {
   },
 }
 
+// Boot-time self-report, wrapped so it can NEVER take boot down with it. boot_context is
+// the one response documented as always succeeding on the directory channel (#712) and is
+// the only reachable call for a zero-capability seat. A registry write is strictly less
+// important than the caller learning who it is: on any error we report the failure as data
+// and hand back the rest of the packet.
+async function reportSelfAtBoot(
+  env: Env,
+  agentId: string,
+  claim: { runtime?: unknown; model?: unknown },
+): Promise<unknown> {
+  try {
+    return await selfReportAtBoot(env, agentId, claim)
+  } catch {
+    return { outcome: 'unavailable', belief: null, detail: 'registry unreachable at boot; identity below is unaffected' }
+  }
+}
+
 // boot_context — first-call coherence signal for any connecting principal.
 //
 // Problem (#126): boot_context must tell a first-run agent whether it has a claimed
@@ -4132,13 +4150,15 @@ const toolBootContext: ToolSpec = {
   name: 'boot_context',
   scope: 'self (read-only — no args required)',
   min: 'authenticated',
-  args: '{ source?: string, seat?: string, label?: string }',
+  args: '{ source?: string, seat?: string, label?: string, runtime?: string, model?: string }  // runtime/model: what you are ACTUALLY running on — reported at boot',
   inputSchema: {
     type: 'object',
     properties: {
       source: STRING_SCHEMA,
       seat: STRING_SCHEMA,
       label: STRING_SCHEMA,
+      runtime: STRING_SCHEMA,
+      model: STRING_SCHEMA,
     },
     additionalProperties: false,
   },
@@ -4162,6 +4182,22 @@ const toolBootContext: ToolSpec = {
     // auth.boundAgentId mirrors that field — it is resolved server-side from the token,
     // never from client input.
     const isMinted = auth.boundAgentId !== null
+
+    // ── mupot#1284: boot is where an agent says what it IS ──────────────────────
+    //
+    // fleet_agents.runtime/.model previously moved ONLY via POST /api/fleet/attach —
+    // a call a host daemon makes. An agent booting over MCP never touched it, so a
+    // harness change went unrecorded while presence kept last_reported_at fresh. The
+    // timestamp then vouched for a field nothing had rechecked, and the registry could
+    // not say which model was gating a review.
+    //
+    // Reported even when the caller claims nothing: `registry` carries what mupot
+    // currently believes, so a booting agent SEES the drift instead of having to think
+    // to ask. Same reasoning as available_doors — the response that always succeeds is
+    // where a fact has to be said, or it is not said at all.
+    const selfReport = isMinted
+      ? await reportSelfAtBoot(env, auth.boundAgentId as string, { runtime: args.runtime, model: args.model })
+      : null
     const identityStatus: 'minted' | 'unminted' = isMinted ? 'minted' : 'unminted'
     const enrollHref = enrollUrl(
       canonicalOrigin(env, ctx.origin),
@@ -4236,6 +4272,7 @@ const toolBootContext: ToolSpec = {
       // identity coherence (#126) — NEW field
       identity_status: identityStatus,
       bound_agent_id: auth.boundAgentId ?? null,
+      ...(selfReport ? { registry: selfReport } : {}),
       next_step: nextStep,
       ...(isMinted ? {} : { enroll_url: enrollHref }),
       // Present ONLY on the directory channel — its absence is itself information.

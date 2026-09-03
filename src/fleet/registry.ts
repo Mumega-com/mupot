@@ -7,10 +7,13 @@
 
 import type { Env } from '../types'
 import { resolveCapabilities } from '../auth/capability'
+import { isValidRuntimeOrUnset } from './runtimes'
 
 const AGENT_ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/
 const STATUSES = new Set(['running', 'stopped', 'unknown'])
-const RUNTIMES = new Set(['codex', 'claude-code', 'nous', 'hermes', 'hermes-cron', 'systemd-user', 'tmux', 'python', 'pi', 'prime-agent', 'herdr', ''])
+// Runtime vocabulary lives in ./runtimes — ONE list. This path also accepts '',
+// which is why it uses isValidRuntimeOrUnset: declining to claim a runtime is not the
+// same as claiming a wrong one.
 const LIFECYCLES = new Set(['on_demand', 'always_on', ''])
 // Valid agent type values — what KIND of agent, not the runtime it runs on.
 const AGENT_TYPES = new Set(['builder', 'reviewer', 'weaver', 'brain', 'comms', 'generic'])
@@ -146,7 +149,7 @@ function validReport(a: unknown): FleetAgentReport | null {
   const r = a as Record<string, unknown>
   if (typeof r.agent_id !== 'string' || !AGENT_ID_RE.test(r.agent_id)) return null
   if (typeof r.status !== 'string' || !STATUSES.has(r.status)) return null
-  const runtime = typeof r.runtime === 'string' && RUNTIMES.has(r.runtime) ? r.runtime : ''
+  const runtime = isValidRuntimeOrUnset(r.runtime) ? r.runtime : ''
   const lifecycle = typeof r.lifecycle === 'string' && LIFECYCLES.has(r.lifecycle) ? r.lifecycle : ''
   const squads = Array.isArray(r.squads)
     ? r.squads.filter((s): s is string => typeof s === 'string' && AGENT_ID_RE.test(s)).slice(0, MAX_SQUADS)
