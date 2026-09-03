@@ -970,18 +970,38 @@ describe('provision tools — operator-principal invariant is exhaustive', () =>
     'deactivate_agent',
     // mupot#1288: update_agent grew a SELF LANE — an agent-bound caller
     // correcting its OWN row (auth.boundAgentId === the resolved agent's id)
-    // acts on its own authority, no admin required. Deciding self-vs-other
-    // needs `agent` resolved first, so the operator-principal refusal can no
-    // longer be the literal first statement in run() (this loop calls every
-    // tool with EMPTY args, which the self lane can't classify without an
-    // `agent` to resolve). The guard itself is NOT gone: an agent-bound
-    // caller targeting a DIFFERENT agent's row still gets
-    // operator_principal_required, and the self lane has its own admin-field
-    // gate (SELF_FORBIDDEN_FIELDS) rejecting slug/owner/qnft_ref/capabilities/
-    // budget_cap_cents/budget_window even on the caller's own row. Exhaustive
-    // coverage of both axes — self-allowed, self-forbidden-fields, other-agent
-    // still refused, admin path unchanged — lives in
-    // tests/agent-self-update.test.ts, not here.
+    // acts on its own authority, no admin required, on 4 fields only (model,
+    // model_fallback, purpose, skills — see SELF_PATCHABLE_FIELDS in
+    // provision.ts; name/role were REMOVED from the lane by Kasra's
+    // adversarial gate on PR #1289, F2/F5 — they are interpolated raw into
+    // the agent's own system prompt and stay admin-only even on the caller's
+    // own row). Deciding self-vs-other needs `agent` resolved first, so the
+    // operator-principal refusal can no longer be the literal first statement
+    // in run() (this loop calls every tool with EMPTY args, which the self
+    // lane can't classify without an `agent` to resolve). The guard itself is
+    // NOT gone: an agent-bound caller targeting a DIFFERENT agent's row still
+    // gets operator_principal_required, and the self lane has its own
+    // admin-field gate (SELF_FORBIDDEN_FIELDS) rejecting slug/name/role/owner/
+    // qnft_ref/capabilities/budget_cap_cents/budget_window even on the
+    // caller's own row.
+    //
+    // update_agent's `min` also moved from 'admin' to 'authenticated' in the
+    // same gate rework — the AAGATE floor this loop exercises (line ~4863 of
+    // src/mcp/index.ts) is scope-agnostic and would otherwise have required
+    // the caller to already hold admin on SOME scope before run() is ever
+    // reached, making the self lane unreachable for the population it exists
+    // for. That does not weaken THIS loop's exemption or its reasoning above
+    // (isGuarded below calls tool.run() directly, bypassing the floor
+    // entirely either way) — it does mean update_agent's non-self branch now
+    // carries the FULL admin check itself (hasWorkspaceAdmin OR
+    // memberCanOnSquad admin) instead of leaning on the floor for it, tested
+    // in tests/agent-self-update.test.ts.
+    //
+    // Exhaustive coverage of every axis — self-allowed, self-forbidden-fields
+    // (including name/role), other-agent still refused, admin path unchanged,
+    // shape caps, null handling, the partition invariant, and the F1 A/B
+    // (member-grant self-caller reaching the lane through invokeTool) — lives
+    // in tests/agent-self-update.test.ts, not here.
     'update_agent',
   ])
 

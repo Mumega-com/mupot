@@ -88,6 +88,7 @@ import {
   done,
   str,
   memberCanOnSquad,
+  hasWorkspaceAdmin,
 } from './index'
 
 const STRING_SCHEMA = { type: 'string' }
@@ -1287,37 +1288,89 @@ async function readAuditDiff(
 // an org admin could repair it, making the admin a bottleneck for every
 // model/purpose drift after a re-harness. An agent-bound caller whose resolved
 // target IS its own row (auth.boundAgentId === agent.id) may now patch the
-// non-authority fields in SELF_PATCHABLE_FIELDS without admin. Authority /
-// identity-reference fields (SELF_FORBIDDEN_FIELDS) stay admin-gated even on
-// the caller's own row — an agent must not rename its own slug, reassign its
-// owner, forge its qnft_ref, grant itself capabilities, or move its own budget
-// — and are rejected BEFORE any write, naming the first offending field.
+// four fields in SELF_PATCHABLE_FIELDS without admin.
+//
+// SELF_PATCHABLE_FIELDS is deliberately narrow — model, model_fallback,
+// purpose, skills — NOT name/role. Kasra's adversarial gate (PR #1289, F2/F5)
+// found that the first version of this lane also let an agent self-write
+// name/role, and both are operator-authored identity interpolated RAW into
+// the agent's own system turn, above the charter and the untrusted-content
+// fence (src/agents/execute.ts, src/agents/loop.ts, src/agents/agent-do.ts —
+// see the buildSystemPrompt call sites in each). A one-shot prompt injection
+// that reaches an agent's own update_agent call could otherwise persist
+// itself into that agent's identity line — a durable self-poisoning path, not
+// a one-turn compromise. `name` also squats the human-facing display surface
+// `resolve_agent` returns. Closing this by construction (name/role simply
+// never reach the self lane) is the fix, NOT filtering the prompt builders —
+// see SELF_FORBIDDEN_FIELDS below, which folds both into the same
+// before-any-write per-field block the authority fields already got.
+//
+// Authority / identity-reference fields (SELF_FORBIDDEN_FIELDS: slug, name,
+// role, owner, qnft_ref, capabilities, budget_cap_cents, budget_window) stay
+// admin-gated even on the caller's own row — an agent must not rename its own
+// slug, rewrite its own name/role, reassign its owner, forge its qnft_ref,
+// grant itself capabilities, or move its own budget — and are rejected BEFORE
+// any write, naming the first offending field in this list's fixed order.
+// SELF_PATCHABLE_FIELDS and SELF_FORBIDDEN_FIELDS partition ADMIN_PATCHABLE_
+// FIELDS exactly (tested in tests/agent-self-update.test.ts) — a field can
+// never land in neither and get silently dropped.
+//
 // An agent-bound caller targeting a DIFFERENT agent's row is unchanged:
-// operator_principal_required. See SELF_PATCHABLE_FIELDS / SELF_FORBIDDEN_FIELDS
-// below and the exemption comment on 'update_agent' in
+// operator_principal_required. See the exemption comment on 'update_agent' in
 // tests/provision-tools.test.ts's operator-principal-invariant sweep — this
 // tool can no longer put that guard as the literal first statement in run()
 // because deciding self-vs-other requires resolving `agent` first; the self
-// lane's own admin-field gate takes over that job, and is covered exhaustively
-// in tests/agent-self-update.test.ts.
-const SELF_PATCHABLE_FIELDS = ['name', 'role', 'purpose', 'model', 'model_fallback', 'skills'] as const
-const SELF_FORBIDDEN_FIELDS = [
+// lane's own admin-field gate takes over that job.
+//
+// `min` is 'authenticated', not 'admin' (Kasra's gate, F1): the AAGATE floor
+// in src/mcp/index.ts's invokeTool is scope-AGNOSTIC — `min: 'admin'` would
+// have required the CALLER to already hold admin on some scope before run()
+// is ever entered, which makes the self lane unreachable for exactly the
+// population it exists for (an agent holding only 'member' on its own squad).
+// Lowering the floor means the non-self branch below must carry the FULL
+// admin check itself (hasWorkspaceAdmin(auth) OR memberCanOnSquad admin on
+// the target's squad) — the floor no longer vouches for anything.
+export const SELF_PATCHABLE_FIELDS = ['model', 'model_fallback', 'purpose', 'skills'] as const
+export const SELF_FORBIDDEN_FIELDS = [
   'slug',
+  'name',
+  'role',
   'owner',
   'qnft_ref',
   'capabilities',
   'budget_cap_cents',
   'budget_window',
 ] as const
+// The admin-path patch surface. Hoisted out of run() (it used to be an inline
+// literal) so tests can assert the partition invariant: every field here is
+// in exactly one of SELF_PATCHABLE_FIELDS / SELF_FORBIDDEN_FIELDS, never both,
+// never neither.
+export const ADMIN_PATCHABLE_FIELDS = [
+  'slug',
+  'name',
+  'role',
+  'model',
+  'model_fallback',
+  'purpose',
+  'owner',
+  'qnft_ref',
+  'capabilities',
+  'skills',
+  'budget_cap_cents',
+  'budget_window',
+] as const
 const toolUpdateAgent: ToolSpec = {
   name: 'update_agent',
-  scope: "agent's squad, or an agent's own row (self lane — see args)",
-  min: 'admin',
+  scope: "agent's squad or org admin; or an agent's own row for 4 non-identity fields (self lane — see args)",
+  min: 'authenticated',
   args:
     '{ agent: string (id|slug), slug?, name?, role?, model?, model_fallback?, purpose?, owner?, qnft_ref?, capabilities?: string[], skills?: string[], budget_cap_cents?: number|null, budget_window?: "day"|"week", reason?: string }' +
-    ' — SELF LANE: an agent-bound caller correcting its OWN row (agent === its own id/slug) needs no admin,' +
-    ' but may only patch name/role/purpose/model/model_fallback/skills;' +
-    ' slug/owner/qnft_ref/capabilities/budget_cap_cents/budget_window still require admin, even on your own row.',
+    ' -- SELF LANE: an agent-bound caller correcting its OWN row (agent === its own id/slug) needs no admin,' +
+    ' but may only patch model/model_fallback/purpose/skills.' +
+    ' name/role/slug/owner/qnft_ref/capabilities/budget_cap_cents/budget_window still require admin,' +
+    ' even on your own row -- name/role are interpolated into your own system prompt and are' +
+    ' deliberately excluded from the self lane. Every non-self call (a different agent-bound' +
+    ' target, or a non-bound member) needs admin on the target agent squad or org.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -1367,7 +1420,8 @@ const toolUpdateAgent: ToolSpec = {
     }
 
     if (isSelf) {
-      // Authority / identity-reference fields stay admin-gated even on the
+      // Authority / identity-reference fields (including name/role — see the
+      // block comment above toolUpdateAgent) stay admin-gated even on the
       // caller's own row. Checked BEFORE any write (patch isn't even built
       // yet), and in SELF_FORBIDDEN_FIELDS's fixed order so "first offending
       // field" is deterministic regardless of the order args arrived in.
@@ -1375,31 +1429,21 @@ const toolUpdateAgent: ToolSpec = {
         if (field in args) return fail(403, 'forbidden', { need: 'admin', field })
       }
     } else {
-      // Gate: admin on the agent's squad, same rank as create/deactivate. A
-      // profile row is identity — who an agent claims to be is what every
-      // downstream router, gate, and dispatcher reads.
+      // `min` is 'authenticated' (see the block comment above), so this
+      // branch is now the ONLY thing standing between an unprivileged caller
+      // and every field on this tool — the AAGATE floor in invokeTool no
+      // longer vouches for admin. Same rank as create/deactivate (org admin
+      // OR admin on the agent's squad, the exact pair the floor used to cover
+      // via hasWorkspaceAdmin-or-holdsCapabilityFloor before this tool moved
+      // off it). A profile row is identity — who an agent claims to be is
+      // what every downstream router, gate, and dispatcher reads.
       const grants = auth.capabilities ?? []
-      if (!(await memberCanOnSquad(env, grants, agent.squad_id, 'admin'))) {
+      if (!hasWorkspaceAdmin(auth) && !(await memberCanOnSquad(env, grants, agent.squad_id, 'admin'))) {
         return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
       }
     }
 
-    const PATCHABLE = isSelf
-      ? SELF_PATCHABLE_FIELDS
-      : ([
-          'slug',
-          'name',
-          'role',
-          'model',
-          'model_fallback',
-          'purpose',
-          'owner',
-          'qnft_ref',
-          'capabilities',
-          'skills',
-          'budget_cap_cents',
-          'budget_window',
-        ] as const)
+    const PATCHABLE = isSelf ? SELF_PATCHABLE_FIELDS : ADMIN_PATCHABLE_FIELDS
 
     const patch: AgentProfilePatch = {}
     for (const key of PATCHABLE) {
@@ -1412,6 +1456,16 @@ const toolUpdateAgent: ToolSpec = {
     // Audit actor: a self-correction is attributed to the agent itself (0086's
     // CHECK already permits actor_type 'agent'), not to the human whose bearer
     // token happens to be bound to it — the agent made this call, not them.
+    //
+    // F6 (Kasra's gate, PR #1289): agent_audit has NO column for the member
+    // behind an agent-bound token — actor_id is either the agent's id (self)
+    // or the member's id (operator), and that is the only durable signal.
+    // A consumer must tell a self-correction apart from an operator one by
+    // reading actor_type on THIS row, never by trusting the emitted event's
+    // self_report field below — the event is best-effort (see the comment on
+    // emitProvisioned below) and can be lost on a bus failure while the audit
+    // row still commits. self_report is a same-request convenience for a live
+    // listener, not the record of truth. No schema change in this PR.
     const actor: AuditActor = isSelf
       ? { id: auth.boundAgentId as string, type: 'agent' }
       : { id: auth.memberId as string, type: 'user' }

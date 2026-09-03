@@ -45,7 +45,7 @@ export type BootSelfReport =
   /** Claimed a runtime outside the vocabulary — told which words exist. */
   | { outcome: 'refused_unknown_runtime'; belief: FleetBelief | null; detail: string }
 
-const MODEL_RE = /^[A-Za-z0-9_./@-]{1,128}$/
+export const MODEL_RE = /^[A-Za-z0-9_./@-]{1,128}$/
 
 export async function readFleetBelief(env: Env, agentId: string): Promise<FleetBelief | null> {
   return env.DB.prepare(
