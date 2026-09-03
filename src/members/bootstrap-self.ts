@@ -419,7 +419,13 @@ function isBootstrapAuditConflict(err: unknown): boolean {
     && err.message.includes('agent_audit')
 }
 
-async function findExistingBootstrap(
+/** The canonical "has this member already bootstrapped?" predicate.
+ *  EXPORTED because boot_context must advertise bootstrap_self only to callers the
+ *  tool will actually accept. It previously carried its own copy of this query; two
+ *  copies of one predicate drift, and the drift is silent — the door keeps promising
+ *  a tool that has started refusing. One definition, both readers.
+ */
+export async function findExistingBootstrap(
   env: Env,
   consentingMemberId: string,
 ): Promise<{ agent_id: string } | null> {

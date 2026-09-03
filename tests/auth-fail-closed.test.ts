@@ -14,11 +14,8 @@ import { authLookupOrNull } from '../src/auth/fail-closed'
 import { redactSecretPatterns } from '../src/lib/redact'
 import { resolveMemberByToken } from '../src/auth/member-bearer'
 import type { Env } from '../src/types'
-import { readFileSync, readdirSync } from 'node:fs'
-import { join } from 'node:path'
 import { createSqliteD1 } from './helpers/sqlite-d1'
-
-const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
+import { applyAllMigrations } from './helpers/migrations'
 
 /** Assembled, not literal — same reason as the redaction fixtures below. */
 const synthToken = () => 'mupot_' + 'notarealtokenatall0123456789'
@@ -113,9 +110,9 @@ describe('a failure to evaluate auth is not permission', () => {
 // exists to catch. So instead there is a real test below, against the real schema.
 function migratedEnv(): { env: Env; close: () => void } {
   const harness = createSqliteD1()
-  for (const f of readdirSync(MIGRATIONS_DIR).filter((x) => x.endsWith('.sql')).sort()) {
-    harness.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, f), 'utf8'))
-  }
+  // The canonical helper, not a hand-rolled loop over the directory. A private copy of
+  // "apply the migrations" is the same drift this guard exists to stop, one level up.
+  applyAllMigrations(harness.sqlite)
   return {
     env: { DB: harness.db, TENANT_SLUG: 'mumega' } as unknown as Env,
     close: () => harness.close(),

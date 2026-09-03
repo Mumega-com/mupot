@@ -146,9 +146,14 @@ export async function handlePotCreationCompleted(
       admin_email: ownerEmail,
     })
 
+    // MONEY PATH. This runs after Stripe checkout completes. Emitting
+    // `pot.self_serve_provisioned` for an empty D1 with no worker told a PAYING CUSTOMER
+    // their pot was live, at a URL that could not even complete a TLS handshake. The event
+    // type now follows what actually happened, so nothing downstream treats a half-run as
+    // a delivered product.
     const bus = createBus(env)
     await bus.emit({
-      type: 'pot.self_serve_provisioned',
+      type: result.ok ? 'pot.self_serve_provisioned' : 'pot.self_serve_provisioning_incomplete',
       actor: { kind: 'stripe', id: session.customer || 'checkout' },
       tenant: env.TENANT_SLUG,
       ts: new Date().toISOString(),
@@ -158,10 +163,16 @@ export async function handlePotCreationCompleted(
         tier,
         owner_email: ownerEmail,
         public_url: result.public_origin,
+        status: result.status,
+        not_completed: result.not_completed,
+        orphaned_resources: result.orphaned_resources,
+        incomplete_reason: result.incomplete_reason,
       },
     })
 
-    return { ok: true, slug }
+    return result.ok
+      ? { ok: true, slug }
+      : { ok: false, slug, error: result.incomplete_reason ?? 'provisioning incomplete' }
   } catch (error) {
     return { ok: false, slug, error: error instanceof Error ? error.message : String(error) }
   }
