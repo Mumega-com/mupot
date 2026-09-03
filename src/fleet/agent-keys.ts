@@ -138,3 +138,26 @@ export async function registerAgentPublicKey(
     ? { ok: true, status: 'already_registered', memberId }
     : { ok: false, reason: 'key_conflict' }
 }
+
+/** True if a signed-attach public key is registered for (tenant, agent_id). Such agents
+ *  may only move their fleet row BY SIGNATURE.
+ *
+ *  Lives here, once, because two paths now depend on it and they must agree.
+ *  src/fleet/attach-routes.ts closes the bearer /attach path for a keyed agent
+ *  explicitly ("no auth downgrade"). Boot-time self-report over MCP is also
+ *  bearer-authenticated, so it honours the SAME predicate — otherwise the new door is a
+ *  way around the signature requirement that the attach route already bolted shut, and
+ *  the weaker door wins by being newer.
+ *
+ *  Deliberately distinct from loadActiveAgentKey above: this asks whether ANY key is
+ *  registered (including a revoked one), because the question is "is this agent required
+ *  to use the signed path", not "can this signature be verified right now". An agent
+ *  whose key was revoked must fix its key, not fall back to bearer. */
+export async function hasRegisteredKey(env: Env, agentId: string): Promise<boolean> {
+  const row = await env.DB.prepare(
+    `SELECT 1 AS x FROM agent_keys WHERE tenant = ?1 AND agent_id = ?2`,
+  )
+    .bind(env.TENANT_SLUG, agentId)
+    .first<{ x: number }>()
+  return !!row
+}
