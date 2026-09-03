@@ -96,7 +96,41 @@ async function annotateMessageIntegrity(messages: InboxMessage[]): Promise<void>
 export interface InboxResult {
   ok: true
   messages: InboxMessage[]
+  /**
+   * Unread rows NOT in `messages`.
+   *
+   * WAS POLYSEMOUS AND IS NOT ANY MORE. This field used to be counted after the
+   * consuming path had already marked the returned rows read (see the UPDATEs
+   * above the count), so on `peek` it INCLUDED the returned rows and on a
+   * consume it EXCLUDED them — one field, two meanings, selected by a different
+   * argument. A caller that learned the rule on one path and applied it on the
+   * other was silently wrong, and nothing in the response said which reading
+   * applied.
+   *
+   * It now means the same thing on both paths: what is left over, never
+   * including what you were just handed. Prefer `complete` over doing arithmetic
+   * on this.
+   */
   remaining: number
+  /**
+   * TRUE when `messages` is everything there was. FALSE when the read was capped
+   * and more exists.
+   *
+   * This exists because deriving truncation from a length and a count is the
+   * single most reliable way to manufacture a false measurement in this system.
+   * On 2026-09-03 that same mistake was made FOUR times in one night by three
+   * different agents across two substrates — the seatlink bridge dropped
+   * genuinely-unread mail; a gate consumed rows it never read, unrecoverably; an
+   * agent-profile page rendered a capped count as a total in the very commit
+   * arguing that an unknown must never be presented as a measurement; and a CI
+   * watcher read a half-populated result as settled. Every one was committed by
+   * someone actively hunting the same bug elsewhere.
+   *
+   * That is not a diligence problem. A capped response is successful,
+   * well-formed, and indistinguishable from a complete one at the call site, so
+   * the correct behaviour has to be the one that requires no work.
+   */
+  complete: boolean
 }
 
 export type SendFailure = {
@@ -646,13 +680,30 @@ async function readAgentInboxForReader(
     let remaining = 0
     if (reader === 'signed') {
       const seatSql = targetSeat ? 'AND (target_seat = ?4 OR target_seat IS NULL)' : 'AND target_seat IS NULL'
-      const binds = targetSeat
+      const binds: (string | number | null | undefined)[] = targetSeat
         ? [tenant, input.agent, signedKeyFingerprint, targetSeat]
         : [tenant, input.agent, signedKeyFingerprint]
+      // The cursor MUST be in the COUNT, not only in the page. Without it a
+      // paginating caller is told rows exist below a cursor it has already
+      // passed, so page two of two reports a phantom remainder and the loop
+      // never terminates. Found by test, not by reading.
+      // NOTE: unreachable today and deliberately kept. readVerifiedSignedAgentInbox's
+      // input type has no sinceSeq, so no caller can reach the signed path with a
+      // cursor — a mutation removing this survives, and that is expected rather than
+      // an untested branch. It stays so that adding sinceSeq to the signed reader
+      // later cannot silently reintroduce the phantom-remainder bug the bearer path
+      // had. Reported as a surviving mutation rather than buried.
+      const sinceSql = sinceSeq > 0 ? `AND seq > ?${binds.length + 1}` : ''
+      if (sinceSeq > 0) binds.push(sinceSeq)
+      // The cursor MUST be in the count, not only in the page. Without it a
+      // paginating caller is told rows exist below its cursor that it has
+      // already passed, so page two of two reports a phantom remainder and the
+      // loop never terminates. Caught by test, not by reading.
       const remainingRow = await env.DB.prepare(
         `SELECT COUNT(*) AS n FROM agent_messages
           WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL
             ${seatSql}
+            ${sinceSql}
             AND EXISTS (SELECT 1 FROM agent_inbox_fences
                          WHERE tenant = ?1 AND agent_id = ?2
                            AND mode = 'signed_only' AND key_fingerprint = ?3)`,
@@ -660,13 +711,16 @@ async function readAgentInboxForReader(
       remaining = Number(remainingRow?.n ?? 0)
     } else {
       const seatSql = targetSeat ? 'AND (target_seat = ?3 OR target_seat IS NULL)' : 'AND target_seat IS NULL'
-      const binds = targetSeat
+      const binds: (string | number | null)[] = targetSeat
         ? [tenant, input.agent, targetSeat]
         : [tenant, input.agent]
+      const sinceSql = sinceSeq > 0 ? `AND seq > ?${binds.length + 1}` : ''
+      if (sinceSeq > 0) binds.push(sinceSeq)
       const remainingRow = await env.DB.prepare(
         `SELECT COUNT(*) AS n FROM agent_messages
           WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL
             ${seatSql}
+            ${sinceSql}
             AND COALESCE((SELECT mode FROM agent_inbox_fences
                            WHERE tenant = ?1 AND agent_id = ?2), 'bearer_only') = 'bearer_only'`,
       ).bind(...binds).first<{ n: number }>()
@@ -678,7 +732,12 @@ async function readAgentInboxForReader(
     for (const m of messages) m.project_id = m.project_id ?? null
     for (const m of messages) m.target_seat = m.target_seat ?? null
     await annotateMessageIntegrity(messages)
-    return { ok: true, messages, remaining }
+    // On the CONSUMING path the returned rows were already marked read above, so
+    // this count already excludes them. On the PEEK path nothing was marked, so
+    // the count still includes them and has to be reduced by what we are handing
+    // back. Same meaning either way afterwards: what is LEFT OVER.
+    const leftOver = peek ? Math.max(0, remaining - messages.length) : remaining
+    return { ok: true, messages, remaining: leftOver, complete: leftOver === 0 }
   } catch (err) {
     return { ok: false, reason: 'db_error', detail: err instanceof Error ? err.message : String(err) }
   }
@@ -750,6 +809,15 @@ export interface LeaseResult {
   messages: LeasedMessage[]
   /** Unread, not dead-lettered, not currently leased — i.e. how many MORE could be leased now. */
   remaining: number
+  /**
+   * TRUE when this lease took everything currently leasable. Same contract as
+   * InboxResult.complete, and present for the same reason: every read surface
+   * should answer "did I get it all?" without the caller doing arithmetic.
+   * Dead-lettered rows are NOT leasable, so they do not make a lease incomplete —
+   * `dead_lettered` reports those separately and a non-zero value means a seat is
+   * stuck, which is a different problem from a capped read.
+   */
+  complete: boolean
   /** Unread rows parked by the dead-letter rule. Non-zero means a seat is stuck. */
   dead_lettered: number
   lease_seconds: number
@@ -913,10 +981,12 @@ export async function leaseAgentInbox(
          AND (CASE WHEN ?4 IS NULL THEN target_seat IS NULL ELSE (target_seat = ?4 OR target_seat IS NULL) END)`,
     ).bind(tenant, input.agent, nowIso, targetSeat).first<{ leasable: number | null; dead: number | null }>()
 
+    const leasableLeft = Number(counts?.leasable ?? 0)
     return {
       ok: true,
       messages,
-      remaining: Number(counts?.leasable ?? 0),
+      remaining: leasableLeft,
+      complete: leasableLeft === 0,
       dead_lettered: Number(counts?.dead ?? 0),
       lease_seconds: leaseSeconds,
     }

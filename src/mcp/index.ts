@@ -3453,7 +3453,14 @@ const toolInbox: ToolSpec = {
       if (res.reason === 'consumer_fenced') return fail(409, res.reason)
       return fail(400, res.reason, res.detail)
     }
-    return done({ messages: res.messages, remaining: res.remaining, consumed: args.peek !== true })
+    // `complete` is surfaced deliberately: a caller must be able to know it was
+    // handed everything WITHOUT comparing a length against a cap it has to know.
+    return done({
+      messages: res.messages,
+      remaining: res.remaining,
+      complete: res.complete,
+      consumed: args.peek !== true,
+    })
   },
 }
 
@@ -3527,6 +3534,7 @@ const toolInboxLease: ToolSpec = {
     return done({
       messages: res.messages,
       remaining: res.remaining,
+      complete: res.complete,
       dead_lettered: res.dead_lettered,
       lease_seconds: res.lease_seconds,
       max_lease_seconds: MAX_LEASE_SECONDS,
