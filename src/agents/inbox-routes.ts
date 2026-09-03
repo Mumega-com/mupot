@@ -230,14 +230,38 @@ inboxApp.get('/', async (c) => {
     limit = n
   }
 
-  const res = await readAgentInbox(c.env, { agent: id.boundAgentId, peek, limit })
+  // since_seq — the cursor that makes bounded pagination possible from the bridge.
+  //
+  // Requested by Loom for the consumer side: with `complete` alone a caller can
+  // TELL it was handed a partial page but cannot ask for the next one, so any
+  // inbox above the cap forces fail-open and stale replays during exactly the
+  // backlogs this work exists to remove. With both, pagination is deterministic.
+  //
+  // PEEK-ONLY, mirroring the MCP tool's rule rather than inventing a second one.
+  // A cursor on a CONSUMING read is a footgun: rows are marked read as they are
+  // returned, so a caller paging with a cursor would consume the inbox while
+  // believing it was browsing, and anything it failed to process is unrecoverable.
+  // Reliable consumption is inbox_lease plus inbox_ack.
+  let sinceSeq: number | undefined
+  const sinceQ = c.req.query('since_seq')
+  if (sinceQ !== undefined) {
+    const n = Number(sinceQ)
+    if (!Number.isSafeInteger(n) || n < 0) return c.json({ error: 'invalid_since_seq' }, 400)
+    if (!peek) return c.json({ error: 'since_seq_requires_peek' }, 400)
+    sinceSeq = n
+  }
+
+  const res = await readAgentInbox(c.env, { agent: id.boundAgentId, peek, limit, sinceSeq })
   if (!res.ok) {
     // Never forward a raw DB error string to the client (leak-guard, matches the MCP path).
     if (res.reason === 'db_error') return c.json({ error: res.reason }, 500)
     if (res.reason === 'consumer_fenced') return c.json({ error: res.reason }, 409)
     return c.json({ error: res.reason, detail: res.detail }, 400)
   }
-  return c.json({ ok: true, messages: res.messages, remaining: res.remaining, consumed: !peek })
+  // `complete` rides the HTTP surface too — the Herdr seatlink bridge reads THIS
+  // route, not the MCP tool, and it is the consumer that was silently dropping
+  // genuinely-unread mail by treating a capped page as the whole inbox.
+  return c.json({ ok: true, messages: res.messages, remaining: res.remaining, complete: res.complete, consumed: !peek })
 })
 
 // POST /api/inbox/signed — read the signed agent's own inbox without a bearer token.
@@ -256,6 +280,7 @@ inboxApp.post('/signed', async (c) => {
     agent: res.agent_id,
     messages: res.messages,
     remaining: res.remaining,
+    complete: res.complete,
     consumed: res.consumed,
   })
 })
