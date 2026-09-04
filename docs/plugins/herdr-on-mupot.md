@@ -88,9 +88,13 @@ SOS is retired for fleet mail. Do not revive `sos-inbox-check` / SOS MCP as if i
 | Grok Build | `grok` | [grok-herdr-mupot](grok-herdr-mupot.md) | `~/.grok/skills/grok-herdr-mupot` |
 | Codex CLI | `codex` | [codex-herdr-mupot](codex-herdr-mupot.md) | `~/.codex/skills/codex-herdr-mupot` |
 | Hermes | `hermes` | [hermes-herdr-mupot](hermes-herdr-mupot.md) | `~/.hermes/skills/hermes-herdr-mupot` |
+| Cursor CLI | `cursor` | [cursor-herdr-mupot](cursor-herdr-mupot.md) | `~/.cursor/skills/cursor-herdr-mupot` |
+| OpenCode | `opencode` | [opencode-herdr-mupot](opencode-herdr-mupot.md) | `hadi-opencode/skills/opencode-herdr-mupot` |
+| Pi | `pi` | [pi-herdr-mupot](pi-herdr-mupot.md) | `hadi-pi/skills/pi-herdr-mupot` |
+| River (Agy) | `agy` | [river-herdr-mupot](river-herdr-mupot.md) | `hadi-river/skills/river-herdr-mupot` |
 | Cursor Cloud pager | — | [cursor-mupot-pager](cursor-mupot-pager.md) | `dara/.grok/skills/cursor-mupot-pager` |
 
-Cursor / OpenCode / Pi on this Mac are often **unnamed** Herdr panes. Name them before writing a weld page; until then seatlink will not inject.
+Names drop on restart. Rename after every `agent start`. `wZ` Claude at Stemminds is not a fleet seat — do not steal a hadi-* name for it.
 
 ## Receive on hadi-mac
 

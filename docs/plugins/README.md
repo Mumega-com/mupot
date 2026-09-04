@@ -21,6 +21,10 @@ Read like a wiki: start here, open one page. Do not print tokens. Token **paths*
 | [grok-herdr-mupot](grok-herdr-mupot.md) | Grok Build skill + MCP weld | **live** on hadi-mac | `~/.grok/skills/grok-herdr-mupot` (this catalog mirrors the wiki page) |
 | [codex-herdr-mupot](codex-herdr-mupot.md) | Codex CLI skill + MCP weld | **live** on hadi-mac | `~/.codex/skills/codex-herdr-mupot` (this catalog mirrors the wiki page) |
 | [hermes-herdr-mupot](hermes-herdr-mupot.md) | Hermes skill + MCP weld | **live** on hadi-mac · weld **split** (see page) | `~/.hermes/skills/hermes-herdr-mupot` |
+| [cursor-herdr-mupot](cursor-herdr-mupot.md) | Cursor CLI on Herdr | **live** on hadi-mac · baked bearer in mcp.json | `~/.cursor/skills/cursor-herdr-mupot` |
+| [opencode-herdr-mupot](opencode-herdr-mupot.md) | OpenCode on Herdr | **live** · second consumer (inbox-watch.sh) | `hadi-opencode/skills/opencode-herdr-mupot` |
+| [pi-herdr-mupot](pi-herdr-mupot.md) | Pi CLI on Herdr | **live** · token-from-file | `hadi-pi/skills/pi-herdr-mupot` |
+| [river-herdr-mupot](river-herdr-mupot.md) | River Agy on Herdr | **live** Mac body · SOS leftover in .mcp.json | `hadi-river/skills/river-herdr-mupot` |
 | [cursor-mupot-pager](cursor-mupot-pager.md) | Slack broker for Cursor Cloud | **live** (hadi-grok-desktop) | `dara/.grok/skills/cursor-mupot-pager` |
 | [prime-mupot-experience](prime-mupot-experience.md) | Prime-agent skill + bridges | **published** | [Mumega-com/prime-mupot-experience](https://github.com/Mumega-com/prime-mupot-experience) |
 
