@@ -75,6 +75,44 @@
 //        the cleanup `DROP TRIGGER`/`DROP TABLE` calls threw, hiding the diagnostic that
 //        matters most exactly when a connection is already dropping (the common production
 //        failure). Fixed: cleanup failures are now swallowed in favor of the original error.
+//
+// GATE HISTORY, ROUND 4 (2026-09-04): both of round 3's remaining P1s were caused by
+// machinery round 3 itself added — a clever mechanism that created the hole it was meant to
+// close. Round 4's instruction was to DELETE that machinery, not patch it further, and both
+// fixes below are net removals:
+//   K1 SUPERSEDED — round 3's `selectGroundTruthProbes` sampled 5 files (`fractions = [0,
+//        0.25, 0.5, 0.75, 1]`) out of 115 object-creating files. The gate proved a selective
+//        wipe — keep only the 5 probed objects, drop the other ~600 real objects — passed
+//        clean, and so did dropping every object of any one of the 129 unprobed files. Fixed
+//        by DELETING `fractions` and the fraction-walking code: `selectGroundTruthProbes` now
+//        probes EVERY object-creating file's first surviving object, not a sample — one
+//        `CREATE TRIGGER` with one `RAISE(ABORT)`/`WHERE NOT EXISTS` clause per probed file,
+//        still a single round trip. `objectSurvivesRestOfChain` (below) was already sound —
+//        kept as-is. See `selectGroundTruthProbes` and its test for the non-empty-probe-list
+//        assertion this closes.
+//   K2 SUPERSEDED — round 3's `fileHasTraceInDatabase` tried to tell "nothing ran" from "the
+//        file's created objects are absent from sqlite_master," to let a `started` row be
+//        retried instead of hard-failed when nothing of the file's DDL survived. The gate
+//        proved that unsafe: 29 of the 134 committed migrations run an `ALTER`, `UPDATE`, or
+//        `INSERT` BEFORE their first `CREATE`, so a crash in that window leaves the database
+//        dirty (non-idempotent DML already ran) with NO object trace at all —
+//        `fileHasTraceInDatabase` read that as "safe to retry," reproducing the original F1
+//        brick one door over (the exact "table already exists" / "duplicate column name"
+//        signature). `sqlite_master` cannot witness "did anything run"; only the reached
+//        statement index could, and this module deliberately does not record one (see the F1
+//        note below on why a true resume engine is not worth building here). Fixed by DELETING
+//        `fileHasTraceInDatabase` entirely and reverting to: a `started` row is unconditionally
+//        a hard fail-closed, full stop, with exactly one exception that needs no database
+//        query at all — a file with ZERO statements cannot have run anything. See the
+//        `'started'` branch in `applySchemaChain` below.
+//   Also this round: `recordedEntryFor`'s throw (C5, round 3) was unwrapped inside the file
+//   loop, so a malformed bookkeeping entry lost `applied`/`skipped` for every file that
+//   succeeded before it — the F4 class, one door over. Now wrapped and returned as a typed
+//   `'malformed-bookkeeping'` failure like every other path in this module. And the
+//   transaction-control classifier's `skipWhitespace` (scripts/gen-schema-chain.mjs) now skips
+//   comments too, and the splitter-version/source hash region (same file) now covers
+//   `isBlankStatement`, which `splitSqlStatements` calls but which sat outside the hashed
+//   region — see that file for both.
 
 import {
   SCHEMA_CHAIN,
@@ -224,6 +262,7 @@ export type ApplySchemaChainFailureKind =
   | 'partial-application' // a file is recorded 'started' but never 'applied' — unknown partial state
   | 'statement-error' // a specific chain statement (or a bookkeeping statement) threw
   | 'ground-truth-mismatch' // post-run verification against the real database failed
+  | 'malformed-bookkeeping' // an `alreadyApplied` entry for this file does not parse (round 4 gate fix)
 
 export interface ApplySchemaChainFailure {
   readonly file: string
@@ -273,7 +312,15 @@ interface RecordedEntry {
  *  `Number.isInteger(0)` is `true` — so a truncated key (e.g. two consecutive separators from
  *  a corrupted write) with an EMPTY splitter-version field used to parse as "splitter version
  *  0" instead of failing, misattributing a corrupt entry to a real-looking version number.
- *  `/^\d+$/.test(...)` rejects an empty string outright, closing that specific trap. */
+ *  `/^\d+$/.test(...)` rejects an empty string outright, closing that specific trap.
+ *
+ *  Round 4 gate fix: this function itself still throws (the fail-closed signal stays a plain
+ *  exception here, unchanged) — but its ONE call site, inside `applySchemaChain`'s file loop,
+ *  now wraps that call in try/catch and returns a typed `'malformed-bookkeeping'` failure
+ *  instead of letting the throw escape the loop. Before this, the throw was unwrapped and
+ *  propagated straight out of `applySchemaChain`, discarding `applied`/`skipped` for every file
+ *  that had already succeeded earlier in the same run — the F4 class (exec calls outside
+ *  try/catch losing `applied`/`skipped`) one door over, on a non-exec code path. */
 function recordedEntryFor(file: string, alreadyApplied: ReadonlySet<string>): RecordedEntry | undefined {
   const prefix = `${file}${RECORDED_KEY_SEP}`
   for (const entry of alreadyApplied) {
@@ -324,15 +371,18 @@ export interface ApplySchemaChainOptions {
    * that actually ran) fails closed rather than silently reapplying or silently skipping a
    * change nobody can see. One whose name appears `started` is a HARD fail-closed — see
    * `partial-application` below — regardless of its sha256 or splitter version, because a
-   * `started` row means the true state of the database for that file is unknown — UNLESS
-   * fileHasTraceInDatabase (K2 gate fix, below) finds no real trace of that file's own
-   * created objects, in which case it is retried, not condemned.
+   * `started` row means the true state of the database for that file is unknown, with exactly
+   * one exception that needs no database query: a file with ZERO statements cannot have run
+   * anything (round 4 gate fix — see the file header's K2 SUPERSEDED note for why the
+   * database-probing alternative that used to live here was removed).
    *
    * An entry whose file prefix matches but does not parse (wrong field count, empty sha256,
-   * an unrecognized status, or a non-digit splitter-version field) throws synchronously out
-   * of `applySchemaChain` (C5 gate fix) rather than being silently treated as "not recorded"
-   * — the same fail-closed posture as the empty-chain check below, since both represent an
-   * upstream caller handing this module data it cannot safely act on.
+   * an unrecognized status, or a non-digit splitter-version field) is a hard, typed
+   * `'malformed-bookkeeping'` failure (C5 gate fix; wrapping fixed round 4 — see the file
+   * header) rather than being silently treated as "not recorded" and replayed. It is returned
+   * from `applySchemaChain`, not thrown, so `applied`/`skipped` for files that succeeded
+   * before it in the loop are not lost — the empty-chain check below is the one remaining
+   * case that still throws, since it fires before any file-level bookkeeping exists to lose.
    */
   alreadyApplied?: ReadonlySet<string>
   onFile?: (file: string, index: number, total: number) => void
@@ -354,16 +404,6 @@ interface GroundTruthProbe {
   readonly name: string
 }
 
-/**
- * Picks a handful of real objects to probe, spread across the EARLY, MIDDLE, and LATE parts
- * of the chain — not just one, and not just the first — so the check cannot be satisfied by a
- * splitter or apply bug isolated to one part of the corpus (K1 gate fix: the exact F2 scenario
- * — an older splitter mis-splitting ONE file deep in the chain — must be visible here). Only
- * files with at least one created object (see extractCreatedObjects) are candidates; a chain
- * built entirely of ALTER/DML-only files (no real migration in this repo is, but a synthetic
- * test `chain` override could be) yields no probes, which the caller must treat as "cannot be
- * verified this way" rather than a false pass — see the call site below.
- */
 /** Escapes a name for embedding inside a RegExp built from it (not SQL — see escapeSqlLiteral
  *  for that). */
 function escapeRegExp(text: string): string {
@@ -397,36 +437,61 @@ function objectSurvivesRestOfChain(type: string, name: string, laterStatements: 
   return true
 }
 
-function selectGroundTruthProbes(chain: readonly SchemaChainFile[]): GroundTruthProbe[] {
-  const withObjects = chain
-    .map((entry, index) => ({ entry, index }))
-    .filter(({ entry }) => entry.objects.length > 0)
-  if (withObjects.length === 0) return []
+function statementsFrom(chain: readonly SchemaChainFile[], index: number): string[] {
+  const statements: string[] = []
+  for (let i = index; i < chain.length; i += 1) statements.push(...chain[i].statements)
+  return statements
+}
 
-  function statementsFrom(index: number): string[] {
-    const statements: string[] = []
-    for (let i = index; i < chain.length; i += 1) statements.push(...chain[i].statements)
-    return statements
-  }
-
-  function firstSurvivingObject(
-    entry: SchemaChainFile,
-    index: number,
-  ): { type: string; name: string } | undefined {
-    const rest = statementsFrom(index)
-    return entry.objects.find((obj) => objectSurvivesRestOfChain(obj.type, obj.name, rest))
-  }
-
-  const fractions = [0, 0.25, 0.5, 0.75, 1]
-  const byFile = new Map<string, GroundTruthProbe>()
-  for (const frac of fractions) {
-    const pos = Math.min(withObjects.length - 1, Math.floor(frac * (withObjects.length - 1)))
-    const { entry, index } = withObjects[pos]
-    const object = firstSurvivingObject(entry, index)
+/**
+ * Picks one real object to probe from EVERY object-creating file in the chain — not a sample.
+ *
+ * ROUND 4 GATE FIX: the pre-fix version sampled 5 files (`fractions = [0, 0.25, 0.5, 0.75,
+ * 1]`) out of 115 that create objects, on the theory that spreading across early/middle/late
+ * chain position was enough. The gate proved it was not: a selective wipe keeping only the 5
+ * probed objects (and dropping the other ~600 real objects) passed clean, and so did dropping
+ * every object of any ONE of the 129 unprobed files. A sample cannot see a defect isolated to
+ * a file it didn't pick. Fixed by deleting the sample: every file with at least one created
+ * object (see extractCreatedObjects in scripts/gen-schema-chain.mjs) contributes one probe —
+ * its first object that survives to the end of the chain (`objectSurvivesRestOfChain`, kept
+ * unchanged from round 3 — the gate verified it sound: 589 claimed survivors, 0 absent after a
+ * clean apply). At today's corpus size (115 object-creating files) this is still one
+ * `CREATE TRIGGER` with ~115 `RAISE(ABORT)`/`WHERE NOT EXISTS` clauses — a few tens of KB,
+ * comfortably under SCHEMA_CHAIN_BATCH_MAX_BYTES (64KB) — and one round trip, same as before.
+ * If the corpus grows enough that a single trigger statement becomes too large, split
+ * `raiseClauses` (in `verifyGroundTruth`, below) into multiple sequential
+ * create-trigger/insert/cleanup rounds, mechanically (e.g. every N clauses), and keep the
+ * failure naming the FIRST missing object and its file — not implemented here because it is
+ * not needed at today's size, and building it unused would be the same mistake this round is
+ * fixing in the other direction.
+ *
+ * Only files with at least one created object are candidates; a chain built entirely of
+ * ALTER/DML-only files (no real migration in this repo is, but a synthetic test `chain`
+ * override could be) yields no probes, which the caller must treat as "cannot be verified this
+ * way" rather than a false pass — see the call site below. `selectGroundTruthProbes` is
+ * exported (mirrors escapeSqlLiteral / assertSafeInteger's export rationale) so a dedicated
+ * test can assert the REAL `SCHEMA_CHAIN` always yields a non-empty probe list — the one
+ * runtime fact that must never silently go back to zero, since an empty list is exactly what
+ * would restore the original K1 tautology.
+ *
+ * NOTE ON WHAT THIS DOES NOT CHECK: each probe compares `type` and `name` against
+ * `sqlite_master` only — never the object's actual DDL/shape (`sqlite_master.sql`). A probed
+ * table replaced by a same-named one-column stub still passes this check. That is a real,
+ * documented limitation, not fixed this round (it would require comparing `sql` text, which
+ * is brittle against harmless formatting differences the generator itself introduces) — stated
+ * here plainly so this comment never claims more than the code does.
+ */
+export function selectGroundTruthProbes(chain: readonly SchemaChainFile[]): GroundTruthProbe[] {
+  const probes: GroundTruthProbe[] = []
+  for (let index = 0; index < chain.length; index += 1) {
+    const entry = chain[index]
+    if (entry.objects.length === 0) continue
+    const rest = statementsFrom(chain, index)
+    const object = entry.objects.find((obj) => objectSurvivesRestOfChain(obj.type, obj.name, rest))
     if (!object) continue // every object this file creates is later dropped/renamed — skip it
-    byFile.set(entry.file, { file: entry.file, type: object.type, name: object.name })
+    probes.push({ file: entry.file, type: object.type, name: object.name })
   }
-  return [...byFile.values()]
+  return probes
 }
 
 /**
@@ -447,16 +512,16 @@ function selectGroundTruthProbes(chain: readonly SchemaChainFile[]): GroundTruth
  *     CHAIN'S FILE SET, for every file in that set (C6: the pre-fix count was UNSCOPED — any
  *     stale row for a file since renamed or squashed out of the chain inflated it forever,
  *     permanently failing a healthy pot's count). This alone is still bookkeeping-only.
- *  2. A SELECTION of real schema objects (`selectGroundTruthProbes`, above) — tables,
- *     indexes, triggers, views the chain's OWN statements create — actually exist in
- *     `sqlite_master`, spread across early/middle/late chain position. THIS is the fix for
- *     the tautology: an `alreadyApplied` claiming files are applied against a virgin (or
- *     partially-applied, or wrong-splitter-applied) database now fails HERE, on the real
- *     schema, not on bookkeeping this module wrote itself moments earlier. When the chain has
- *     no probeable objects at all (every file is ALTER/DML-only — never true for the real
- *     SCHEMA_CHAIN, possible only for a synthetic test override), this check is skipped and
- *     only the scoped count above applies — documented here rather than silently claimed as
- *     exhaustive.
+ *  2. EVERY real schema object `selectGroundTruthProbes` (above) picks — one per
+ *     object-creating file in the chain, not a sample (round 4 gate fix; round 3 sampled 5 of
+ *     115 and the gate proved a selective wipe of the other ~600 objects passed clean) —
+ *     actually exists in `sqlite_master`. THIS is the fix for the tautology: an
+ *     `alreadyApplied` claiming files are applied against a virgin (or partially-applied, or
+ *     wrong-splitter-applied) database now fails HERE, on the real schema, not on bookkeeping
+ *     this module wrote itself moments earlier. When the chain has no probeable objects at all
+ *     (every file is ALTER/DML-only — never true for the real SCHEMA_CHAIN, possible only for
+ *     a synthetic test override), this check is skipped and only the scoped count above
+ *     applies — documented here rather than silently claimed as exhaustive.
  *  3. `pot_schema_chain_meta`'s digest row reads back exactly what THIS RUN just wrote (C6:
  *     corrected comment — this catches an `exec` that silently no-ops instead of persisting
  *     within this call; it cannot detect anything "across runs," because the digest is
@@ -526,64 +591,6 @@ async function verifyGroundTruth(
   }
   await exec('DROP TRIGGER IF EXISTS __pot_schema_chain_ground_truth_trg;')
   await exec('DROP TABLE IF EXISTS __pot_schema_chain_ground_truth;')
-}
-
-/**
- * K2 gate fix (round 3): used only when a file is recorded 'started' and has at least one
- * created object (see extractCreatedObjects) — checks whether the REAL database shows ANY
- * trace of that file's own objects, so a transient failure on the file's very first statement
- * (nothing ran, database objectively clean) can be retried instead of permanently condemning
- * the pot. Same RAISE(ABORT)-in-trigger technique as verifyGroundTruth, because `exec` cannot
- * return rows (see the file header).
- *
- * Returns `true` ("has a trace, do not retry — genuine partial state") if ANY of the file's
- * objects exist; `false` ("no trace, safe to retry from scratch") only if NONE do. A file with
- * SOME but not all of its objects present is still `true` (has SOME trace) — the safe,
- * conservative reading, since "some of this file's DDL ran" is exactly the state a resume
- * would be unsafe over (see this module's file-header note on why this is not a resume
- * engine).
- */
-async function fileHasTraceInDatabase(
-  exec: (sql: string) => Promise<void>,
-  entry: SchemaChainFile,
-): Promise<boolean> {
-  if (entry.objects.length === 0) {
-    // Unverifiable: this file creates no schema object extractCreatedObjects can see (e.g.
-    // pure DML/ALTER). Assume it has a trace — the old, always-hard-fail behavior — rather
-    // than guess. Only the zero-STATEMENT case (a comment-only migration) is unconditionally
-    // safe without this check at all — see the caller.
-    return true
-  }
-  const existsClauses = entry.objects
-    .map(
-      (obj) =>
-        `(SELECT COUNT(*) FROM sqlite_master WHERE type = '${escapeSqlLiteral(obj.type)}' AND name = '${escapeSqlLiteral(obj.name)}')`,
-    )
-    .join(' + ')
-
-  await exec('DROP TRIGGER IF EXISTS __pot_schema_chain_trace_trg;')
-  await exec('DROP TABLE IF EXISTS __pot_schema_chain_trace;')
-  await exec('CREATE TABLE __pot_schema_chain_trace (ok INTEGER NOT NULL);')
-  await exec(
-    `CREATE TRIGGER __pot_schema_chain_trace_trg BEFORE INSERT ON __pot_schema_chain_trace BEGIN\n` +
-      `  SELECT RAISE(ABORT, 'no trace') WHERE (${existsClauses}) = 0;\n` +
-      `END;`,
-  )
-  let hasTrace = true
-  try {
-    await exec('INSERT INTO __pot_schema_chain_trace (ok) VALUES (1);')
-  } catch {
-    hasTrace = false
-  } finally {
-    try {
-      await exec('DROP TRIGGER IF EXISTS __pot_schema_chain_trace_trg;')
-      await exec('DROP TABLE IF EXISTS __pot_schema_chain_trace;')
-    } catch {
-      // Best-effort cleanup only — do not let a cleanup failure override the trace result
-      // this function already determined (mirrors verifyGroundTruth's C7 fix).
-    }
-  }
-  return hasTrace
 }
 
 /**
@@ -657,59 +664,59 @@ export async function applySchemaChain(
     const entry = chain[index]
     opts.onFile?.(entry.file, index, chain.length)
 
-    const recorded = recordedEntryFor(entry.file, alreadyApplied)
+    let recorded: RecordedEntry | undefined
+    try {
+      recorded = recordedEntryFor(entry.file, alreadyApplied)
+    } catch (error) {
+      // Round 4 gate fix: this used to be an unwrapped call — a throw here propagated straight
+      // out of applySchemaChain and discarded applied/skipped for every file that had already
+      // succeeded earlier in this same run. See recordedEntryFor's doc comment.
+      return {
+        applied,
+        skipped,
+        failed: { file: entry.file, statementIndex: -1, kind: 'malformed-bookkeeping', error: errorMessage(error) },
+      }
+    }
 
     if (recorded?.status === 'started') {
-      // F1's hard fail-closed outcome, refined by the K2 gate fix (round 3): a 'started' row
-      // means we do not know how far this file got — UNLESS we can prove nothing of it ran.
+      // F1's hard fail-closed outcome. Round 4 gate fix: reverted to the pre-K2 posture — a
+      // `started` row is unconditionally a hard fail-closed, full stop, with exactly ONE
+      // exception that needs no database query: a file with ZERO statements (a comment-only
+      // migration, e.g. 0085_identity_cleanup.sql) cannot possibly have run anything, so a
+      // `started` row for it can only be the marker write itself landing before a crash with
+      // nothing after it to run — always safe to fall through and (re)apply.
       //
-      //  - Zero-statement file (a comment-only migration, e.g. 0085_identity_cleanup.sql):
-      //    there is definitionally nothing that could have run, so a 'started' row here can
-      //    only mean the marker write itself landed and nothing after it got the chance to
-      //    run before a crash. Always safe to fall through and (re)apply — condemning a
-      //    database over a literal no-op was the exact gate finding this closes.
-      //  - A file WITH created objects: check the real database for any trace of them
-      //    (fileHasTraceInDatabase). No trace at all means nothing of this file's DDL
-      //    survived — safe to fall through and retry from scratch, because there is nothing
-      //    to have run non-idempotently against. ANY trace means genuine partial state —
-      //    hard fail-closed, unchanged from before.
-      //  - A file with statements but NO created objects extractCreatedObjects can see (pure
-      //    DML/ALTER): unverifiable either way — stays hard fail-closed always, the
-      //    conservative default this module shipped with.
-      if (entry.statements.length > 0) {
-        let hasTrace: boolean
-        try {
-          hasTrace = await fileHasTraceInDatabase(exec, entry)
-        } catch (error) {
-          return {
-            applied,
-            skipped,
-            failed: { file: entry.file, statementIndex: -1, kind: 'statement-error', error: errorMessage(error) },
-          }
+      // Round 3's K2 fix tried to go further: probe the real database (fileHasTraceInDatabase,
+      // since deleted) for any trace of a non-zero-statement file's own created objects, and
+      // retry when none were found. The gate proved that unsafe — 29 of the 134 committed
+      // migrations run an ALTER, UPDATE, or INSERT BEFORE their first CREATE, so a crash in
+      // that window leaves the database dirty (non-idempotent DML already ran) with NO object
+      // trace at all, which the K2 check read as "safe to retry," reproducing the original F1
+      // brick ("table already exists" / "duplicate column name" on replay) one door over.
+      // `sqlite_master` cannot witness "did anything run" for a file that creates no lasting
+      // object trace before it fails — only the reached statement index could, and this module
+      // deliberately does not record one (see this function's doc comment on why a true resume
+      // engine is not worth building here). So: any statement, any content, always hard-fails.
+      if (entry.statements.length === 0) {
+        // Nothing could have run — fall through to "apply fresh" below, which for a
+        // zero-statement file is just rewriting 'started' then immediately 'applied'.
+      } else {
+        return {
+          applied,
+          skipped,
+          failed: {
+            file: entry.file,
+            statementIndex: -1,
+            kind: 'partial-application',
+            error:
+              `pot_schema_applied recorded '${entry.file}' as 'started' but never 'applied' — a ` +
+              'prior run crashed or was interrupted partway through this file, leaving the ' +
+              'database in an unknown partial state. This module does not resume partial ' +
+              'application (blindly replaying non-idempotent DDL is not safe — see this ' +
+              "function's doc comment). The database must be recreated, not repaired.",
+          },
         }
-        if (hasTrace) {
-          return {
-            applied,
-            skipped,
-            failed: {
-              file: entry.file,
-              statementIndex: -1,
-              kind: 'partial-application',
-              error:
-                `pot_schema_applied recorded '${entry.file}' as 'started' but never 'applied', and ` +
-                'the real database shows a trace of at least one object this file creates — a ' +
-                'prior run crashed or was interrupted partway through this file, leaving the ' +
-                'database in an unknown partial state. This module does not resume partial ' +
-                'application (blindly replaying non-idempotent DDL is not safe — see this ' +
-                "function's doc comment). The database must be recreated, not repaired.",
-            },
-          }
-        }
-        // No trace of this file's own objects: nothing of it survived. Fall through to
-        // "apply fresh" below instead of returning — deliberately NOT a `continue`/skip.
       }
-      // else: zero-statement file — always falls through to "apply fresh" (which for zero
-      // statements is just re-writing 'started' then immediately 'applied', no real work).
     }
 
     if (recorded?.status === 'applied') {

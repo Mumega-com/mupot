@@ -2716,6 +2716,6 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
-export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 2
+export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "bf41e6b45d8d323a16b4189efe084bcfd35b94fbf9596c1bbce9ca2ff4be59a7"
+export const SCHEMA_CHAIN_DIGEST: string = "68381f2aedc200d9af0e33de9cd494491d6b39eca4f404dacf0bc0619b5e88d9"

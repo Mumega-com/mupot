@@ -7,6 +7,7 @@
 
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -289,6 +290,23 @@ test('C4 — BEGIN; ... END; (END as a SQLite synonym for COMMIT) hard-fails ins
 test('C4 — BEGIN TRANSACTION; ... END TRANSACTION; also hard-fails instead of swallowing the file (gate verdict\'s exact second example)', () => {
   const sql = 'BEGIN TRANSACTION;\nCREATE TABLE a (id TEXT);\nEND TRANSACTION;\nCREATE TABLE b (id TEXT);'
   assert.throws(() => splitSqlStatements(sql, 'begin_end_txn2.sql'), /transaction-control BEGIN/)
+})
+
+test('P2 (round 4) — BEGIN /* comment */; ... END; is STILL classified as transaction-control BEGIN, not silently swallowed', () => {
+  // Round 3's C4 fix classified the word immediately after BEGIN by skipping WHITESPACE only
+  // (skipWhitespace) to find it. The gate proved that gap: a comment wedged between BEGIN and
+  // its next real token defeated the classifier — it read into the comment's own text rather
+  // than past it, missed the `;` that should have triggered "bare BEGIN;" classification, fell
+  // through to the safe default (treat as trigger-opening), and the whole file collapsed into
+  // one statement exactly like the pre-C4 defect. Fixed: skipWhitespace now skips `--` and
+  // `/* */` comments too. This is the direct reproduction — before the fix this did NOT throw.
+  const sql = 'BEGIN /* c */;\nCREATE TABLE a (id TEXT);\nEND;\nCREATE TABLE b (id TEXT);'
+  assert.throws(() => splitSqlStatements(sql, 'begin_comment_txn.sql'), /transaction-control BEGIN/)
+})
+
+test('P2 (round 4) — BEGIN -- line comment\\n TRANSACTION; ... END; is also classified as transaction-control BEGIN', () => {
+  const sql = 'BEGIN -- starts a transaction\nTRANSACTION;\nCREATE TABLE a (id TEXT);\nEND;'
+  assert.throws(() => splitSqlStatements(sql, 'begin_linecomment_txn.sql'), /transaction-control BEGIN/)
 })
 
 test('C4 — a trigger-opening BEGIN (immediately followed by a non-transaction word) is UNAFFECTED — still tracked and closed by its own END', () => {
@@ -615,6 +633,59 @@ test('splitterSourceText: is stable across calls and non-empty', () => {
   assert.equal(a, b)
   assert.ok(a.length > 100)
   assert.match(a, /function splitSqlStatements/)
+})
+
+test('P2 (round 4) — the splitter-version/source hash covers the FULL CALL GRAPH: mutating a helper splitSqlStatements calls (isBlankStatement), not just its own body, invalidates the pinned hash', () => {
+  // The gate's finding, reproduced directly and mechanically rather than just documented:
+  // round 3's SPLITTER SOURCE HASH REGION wrapped splitSqlStatements' own text, but
+  // isBlankStatement — called from splitSqlStatements' final line — was defined just OUTSIDE
+  // the region. Editing isBlankStatement's BEHAVIOR (not splitSqlStatements' own body) changed
+  // the real corpus' total statement count (955 -> 958 in the gate's report) while
+  // SCHEMA_CHAIN_SPLITTER_VERSION, SCHEMA_CHAIN_DIGEST, and every per-file sha256 stayed
+  // identical — the exact silent-skip shape SPLITTER_SOURCE_SHA256_BY_VERSION exists to catch,
+  // for a function one line outside the fence meant to catch it.
+  //
+  // This builds a REAL, RUNNABLE copy of the generator with isBlankStatement's body mutated,
+  // and confirms assertSplitterVersionMatchesSource (called from generateSchemaChainModule,
+  // which both `npm run gen:schema-chain` and the CI freshness guard invoke) now refuses to
+  // run against it — proving the hashed region covers the call graph, not just one function's
+  // own text. Before the round-4 fix (moving the END marker past isBlankStatement's
+  // definition), this test's mutated copy did NOT throw.
+  const realPath = new URL('../scripts/gen-schema-chain.mjs', import.meta.url)
+  const realSource = readFileSync(realPath, 'utf8')
+  const needle = 'return stripped.length === 0\n}'
+  assert.ok(
+    realSource.includes(needle),
+    'fixture assumption violated: isBlankStatement\'s body text not found to mutate — did its source change shape?',
+  )
+  const mutated = realSource.replace(needle, 'return stripped.length === 0 && stripped !== "MUTATED_BY_TEST"\n}')
+  assert.notEqual(mutated, realSource)
+
+  const dir = mkdtempSync(join(tmpdir(), 'splitter-call-graph-test-'))
+  try {
+    const mutatedGeneratorPath = join(dir, 'gen-schema-chain.mjs')
+    writeFileSync(mutatedGeneratorPath, mutated, 'utf8')
+    const runnerPath = join(dir, 'runner.mjs')
+    const runnerSrc =
+      `import { assertSplitterVersionMatchesSource } from ${JSON.stringify(mutatedGeneratorPath)}\n` +
+      `try {\n` +
+      `  assertSplitterVersionMatchesSource()\n` +
+      `  console.log('NO_THROW')\n` +
+      `} catch (e) {\n` +
+      `  console.log('THREW: ' + e.message)\n` +
+      `}\n`
+    writeFileSync(runnerPath, runnerSrc, 'utf8')
+    const output = execFileSync(process.execPath, [runnerPath], { encoding: 'utf8' })
+    assert.match(
+      output,
+      /THREW:/,
+      'mutating isBlankStatement (a helper splitSqlStatements calls) must invalidate the pinned ' +
+        'splitter source hash — it did not, meaning the hashed region misses part of the call graph',
+    )
+    assert.match(output, /source changed/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 test('generateSchemaChainModule: throws (refuses to generate) when the splitter version/source tie is broken', () => {

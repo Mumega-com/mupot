@@ -31,6 +31,7 @@ import {
   batchStatements,
   escapeSqlLiteral,
   recordedKey,
+  selectGroundTruthProbes,
   POT_SCHEMA_APPLIED_TABLE_SQL,
   POT_SCHEMA_CHAIN_META_TABLE_SQL,
   SCHEMA_CHAIN_BATCH_MAX_BYTES,
@@ -449,16 +450,7 @@ describe('applySchemaChain — F1: partial-application (crash-then-replay) fails
   it('a `started` row WITH a genuine trace in the database blocks that file even when its recorded sha256 and splitter_version both still match', async () => {
     // Guards against a narrower, "helpful-looking" bug: only checking 'started' when the
     // sha/version DON'T match. Matching sha/version says nothing about whether the file's
-    // statements actually finished — that is exactly why fileHasTraceInDatabase (K2 gate fix,
-    // round 3) checks the REAL schema rather than trusting sha/version comparison either way.
-    //
-    // NOTE (round 3): this test's ORIGINAL version asserted a 'started' row hard-blocks
-    // UNCONDITIONALLY, on a virgin database with nothing of the file's DDL ever run — that is
-    // now WRONG on purpose (see the K2 test right below this one): a comment-only migration,
-    // or any file where nothing ran, must be retried, not condemned. This version instead
-    // manufactures a GENUINE trace (runs the file's first real statement directly) so the
-    // 'started' row corresponds to an actual partial application, and confirms the block
-    // still fires even though sha256/splitter_version both match.
+    // statements actually finished.
     const db = createSqliteD1()
     const entry = SCHEMA_CHAIN[0]
     await execViaSqlite(db)(entry.statements[0])
@@ -471,24 +463,33 @@ describe('applySchemaChain — F1: partial-application (crash-then-replay) fails
     db.close()
   })
 
-  it('K2 gate fix (round 3) — a `started` row with NO trace of the file in the database is retried, not hard-blocked', async () => {
-    // Direct fix for the gate finding: "the 'started' row is written BEFORE statement 0, so a
-    // failure at statement 0 — where nothing ran and the database is objectively clean —
-    // permanently condemns it." A virgin database with a 'started' row for a file that has
-    // real created objects (SCHEMA_CHAIN[0] creates several tables) must now succeed on
-    // retry, because fileHasTraceInDatabase finds none of those objects present.
+  it('ROUND 4 gate fix — a `started` row for a file WITH statements is unconditionally hard-blocked, even on a VIRGIN database where nothing of the file ran', async () => {
+    // Round 3's K2 fix tried to distinguish "nothing ran" from "genuine partial state" by
+    // probing the real database for a trace of the file's own created objects
+    // (fileHasTraceInDatabase, since deleted) — a virgin database with a 'started' row used to
+    // be RETRIED here, not blocked. The gate proved that unsafe: 29 of the 134 committed
+    // migrations run an ALTER/UPDATE/INSERT before their first CREATE, so a crash in that
+    // window leaves the database dirty (non-idempotent DML already ran) with NO object trace
+    // — exactly what the K2 check read as "safe to retry," reproducing the original F1 brick
+    // one door over. This test is the direct regression guard for that: a virgin database
+    // (nothing has run, no manufactured trace) with a 'started' row for a file that HAS
+    // statements must be hard-blocked, full stop — proving fileHasTraceInDatabase-style
+    // database-probing is gone, not just renamed.
     const db = createSqliteD1()
     const entry = SCHEMA_CHAIN[0]
     const alreadyApplied = new Set<string>([
       recordedKey(entry.file, entry.sha256, SCHEMA_CHAIN_SPLITTER_VERSION, 'started'),
     ])
     const result = await applySchemaChain(execViaSqlite(db), { chain: [entry], alreadyApplied })
-    expect(result.failed).toBeUndefined()
-    expect(result.applied).toEqual([entry.file])
+    expect(result.failed?.kind).toBe('partial-application')
+    expect(result.applied).toEqual([])
     db.close()
   })
 
-  it('K2 gate fix — the reviewer\'s LITERAL example: a comment-only, zero-statement migration marked \'started\' must not be condemned over a no-op', async () => {
+  it('the reviewer\'s LITERAL example: a comment-only, zero-statement migration marked \'started\' must not be condemned over a no-op', async () => {
+    // The ONE exception that survives round 4: a file with ZERO statements cannot possibly
+    // have run anything, so this needs no database query at all — see the 'started' branch in
+    // applySchemaChain.
     const db = createSqliteD1()
     const commentOnly = SCHEMA_CHAIN.find((e) => e.file === '0085_identity_cleanup.sql')
     expect(commentOnly).toBeDefined()
@@ -503,7 +504,7 @@ describe('applySchemaChain — F1: partial-application (crash-then-replay) fails
     db.close()
   })
 
-  it('K2 — a `started` row for a file with statements but NO detectable created objects (pure DML/ALTER) stays hard-blocked unconditionally (documented limitation)', async () => {
+  it('a `started` row for a file with statements but NO detectable created objects (pure DML/ALTER) is hard-blocked too — same rule, no special case any more', async () => {
     const db = createSqliteD1()
     const dmlOnlyEntry: SchemaChainFile = {
       file: 'synthetic_dml_only.sql',
@@ -676,6 +677,75 @@ describe('applySchemaChain — K1 (round 3): verifyGroundTruth is not a tautolog
   })
 })
 
+// ── ROUND 4 — the K1 fix itself was a 5-of-115 sample; probing must cover EVERY file ────
+
+describe('applySchemaChain — ROUND 4: selectGroundTruthProbes probes every object-creating file, not a sample', () => {
+  it('the real SCHEMA_CHAIN yields a non-empty probe list, and one probe per object-creating, surviving-object file — never a fixed-size sample', () => {
+    // Direct assertion for the gate note: "assert that the real SCHEMA_CHAIN yields a
+    // non-empty probe list, so an empty list can never silently restore the tautology." Also
+    // proves the count scales with the CORPUS, not a constant like the old `fractions.length`
+    // (5) — if a future regression reintroduced any fixed-size sample, this would go red the
+    // moment the corpus has more than that many probeable files, which it already does.
+    const probes = selectGroundTruthProbes(SCHEMA_CHAIN)
+    expect(probes.length).toBeGreaterThan(5)
+
+    const withSurvivingObject = SCHEMA_CHAIN.filter((entry) => entry.objects.length > 0).length
+    // Not every object-creating file necessarily contributes a probe (all of its objects could
+    // be dropped/renamed away later — see objectSurvivesRestOfChain) so this is an upper bound,
+    // not exact equality, but it must be in the same ballpark as "every file," not "5".
+    expect(probes.length).toBeGreaterThan(withSurvivingObject * 0.9)
+    expect(probes.length).toBeLessThanOrEqual(withSurvivingObject)
+
+    // Every probed file must be distinct (one probe per file, not per object).
+    expect(new Set(probes.map((p) => p.file)).size).toBe(probes.length)
+  })
+
+  it('wiping an arbitrary mid-chain file — deliberately one the OLD 5-point 0/25/50/75/100% sample would never have picked — is caught', async () => {
+    // Round 3's sample walked `fractions = [0, 0.25, 0.5, 0.75, 1]` over the object-creating
+    // files, by POSITION in that sub-list. The gate proved dropping any of the other ~110
+    // files' objects passed clean. This test picks one such file (a real one, not a synthetic
+    // fixture) by computing what the OLD algorithm would have selected and choosing a
+    // different index, applies the REAL full chain, wipes only that file's surviving object,
+    // and confirms ground truth now fails and names it — the direct proof that probing covers
+    // every file, not five.
+    const withObjects = SCHEMA_CHAIN.map((entry, index) => ({ entry, index })).filter(
+      ({ entry }) => entry.objects.length > 0,
+    )
+    expect(withObjects.length).toBeGreaterThan(20) // sanity: corpus is large enough for this to mean something
+
+    const legacyFractions = [0, 0.25, 0.5, 0.75, 1]
+    const legacyIndices = new Set(
+      legacyFractions.map((f) => Math.min(withObjects.length - 1, Math.floor(f * (withObjects.length - 1)))),
+    )
+    const targetPos = withObjects.findIndex((_, i) => !legacyIndices.has(i))
+    expect(targetPos).toBeGreaterThanOrEqual(0) // sanity: such a position exists
+    const target = withObjects[targetPos]
+
+    const db = createSqliteD1()
+    const exec = execViaSqlite(db)
+    const first = await applySchemaChain(exec, { chain: SCHEMA_CHAIN })
+    expect(first.failed).toBeUndefined()
+
+    // Find one real object this file created that survived to the end of the chain (i.e. it
+    // is actually present in the final schema) and drop it directly — simulating a
+    // splitter/apply bug that silently lost exactly this one migration deep in the corpus.
+    const survivingObject = target.entry.objects.find((obj) =>
+      db.sqlite.prepare(`SELECT 1 FROM sqlite_master WHERE type = ? AND name = ?`).get(obj.type, obj.name),
+    )
+    expect(survivingObject).toBeDefined()
+    if (!survivingObject) throw new Error('unreachable')
+    db.sqlite.exec(`DROP ${survivingObject.type.toUpperCase()} ${survivingObject.name};`)
+
+    const alreadyApplied = recordedSetFromDb(db)
+    const second = await applySchemaChain(exec, { chain: SCHEMA_CHAIN, alreadyApplied })
+    expect(second.failed).toBeDefined()
+    expect(second.failed?.kind).toBe('ground-truth-mismatch')
+    expect(second.failed?.error).toContain(target.entry.file)
+
+    db.close()
+  })
+})
+
 // ── C7 — verifyGroundTruth's cleanup must not replace the original diagnostic ──────────
 
 describe('applySchemaChain — C7 (round 3): a cleanup failure inside verifyGroundTruth does not clobber the real error', () => {
@@ -717,58 +787,81 @@ describe('applySchemaChain — C5 (round 3): a malformed alreadyApplied entry is
   // src/pots/schema-chain.ts) — a plain space would not even match the file's prefix check
   // and would just look like "not recorded" without ever reaching the malformed-entry logic
   // these tests exist to exercise. Every fixture below builds on that real separator.
+  //
+  // ROUND 4 gate fix: these used to assert applySchemaChain REJECTS (throws) on a malformed
+  // entry — that was itself a bug this round closes (recordedEntryFor's throw was unwrapped
+  // inside the file loop, discarding applied/skipped for files that already succeeded). It now
+  // resolves with a typed `failed.kind === 'malformed-bookkeeping'` result instead, like every
+  // other failure path in this module. See the 'preserves applied/skipped' test below.
   const SEP = '\u0000'
 
-  it('an entry with the wrong number of fields after the file prefix throws, rather than being treated as unrecorded and replayed', async () => {
+  it('an entry with the wrong number of fields after the file prefix is a malformed-bookkeeping failure, rather than being treated as unrecorded and replayed', async () => {
     const db = createSqliteD1()
     const entry = SCHEMA_CHAIN[0]
     const malformed = new Set<string>([`${entry.file}${SEP}onlyonefield`])
-    await expect(applySchemaChain(execViaSqlite(db), { chain: [entry], alreadyApplied: malformed })).rejects.toThrow(
-      /malformed bookkeeping entry/,
-    )
+    const result = await applySchemaChain(execViaSqlite(db), { chain: [entry], alreadyApplied: malformed })
+    expect(result.failed?.kind).toBe('malformed-bookkeeping')
+    expect(result.failed?.error).toMatch(/malformed bookkeeping entry/)
     db.close()
   })
 
-  it('an entry with an unknown status throws, rather than being silently skipped', async () => {
+  it('an entry with an unknown status is a malformed-bookkeeping failure, rather than being silently skipped', async () => {
     const db = createSqliteD1()
     const entry = SCHEMA_CHAIN[0]
     const malformed = new Set<string>([`${entry.file}${SEP}${entry.sha256}${SEP}${SCHEMA_CHAIN_SPLITTER_VERSION}${SEP}bogus_status`])
-    await expect(applySchemaChain(execViaSqlite(db), { chain: [entry], alreadyApplied: malformed })).rejects.toThrow(
-      /unknown status/,
-    )
+    const result = await applySchemaChain(execViaSqlite(db), { chain: [entry], alreadyApplied: malformed })
+    expect(result.failed?.kind).toBe('malformed-bookkeeping')
+    expect(result.failed?.error).toMatch(/unknown status/)
     db.close()
   })
 
-  it('the empty-string-is-zero trap: an entry with an EMPTY splitter-version field throws instead of silently parsing as version 0', async () => {
+  it('the empty-string-is-zero trap: an entry with an EMPTY splitter-version field is a malformed-bookkeeping failure, not a silent parse as version 0', async () => {
     // Number('') === 0, and Number.isInteger(0) === true — a truncated/corrupted key (e.g.
     // from a double separator) with an empty splitter-version field used to misparse as "a
     // real version 0" rather than being caught as malformed. This is the gate's named trap.
     const db = createSqliteD1()
     const entry = SCHEMA_CHAIN[0]
     const malformed = new Set<string>([`${entry.file}${SEP}${entry.sha256}${SEP}${SEP}applied`])
-    await expect(applySchemaChain(execViaSqlite(db), { chain: [entry], alreadyApplied: malformed })).rejects.toThrow(
-      /not a non-negative integer literal/,
-    )
+    const result = await applySchemaChain(execViaSqlite(db), { chain: [entry], alreadyApplied: malformed })
+    expect(result.failed?.kind).toBe('malformed-bookkeeping')
+    expect(result.failed?.error).toMatch(/not a non-negative integer literal/)
     db.close()
   })
 
-  it('an entry with a non-digit (e.g. negative or decimal) splitter-version field throws', async () => {
+  it('an entry with a non-digit (e.g. negative or decimal) splitter-version field is a malformed-bookkeeping failure', async () => {
     const db = createSqliteD1()
     const entry = SCHEMA_CHAIN[0]
     const malformed = new Set<string>([`${entry.file}${SEP}${entry.sha256}${SEP}-1${SEP}applied`])
-    await expect(applySchemaChain(execViaSqlite(db), { chain: [entry], alreadyApplied: malformed })).rejects.toThrow(
-      /not a non-negative integer literal/,
-    )
+    const result = await applySchemaChain(execViaSqlite(db), { chain: [entry], alreadyApplied: malformed })
+    expect(result.failed?.kind).toBe('malformed-bookkeeping')
+    expect(result.failed?.error).toMatch(/not a non-negative integer literal/)
     db.close()
   })
 
-  it('an entry with an empty sha256 field throws', async () => {
+  it('an entry with an empty sha256 field is a malformed-bookkeeping failure', async () => {
     const db = createSqliteD1()
     const entry = SCHEMA_CHAIN[0]
     const malformed = new Set<string>([`${entry.file}${SEP}${SEP}1${SEP}applied`])
-    await expect(applySchemaChain(execViaSqlite(db), { chain: [entry], alreadyApplied: malformed })).rejects.toThrow(
-      /empty sha256/,
-    )
+    const result = await applySchemaChain(execViaSqlite(db), { chain: [entry], alreadyApplied: malformed })
+    expect(result.failed?.kind).toBe('malformed-bookkeeping')
+    expect(result.failed?.error).toMatch(/empty sha256/)
+    db.close()
+  })
+
+  it('ROUND 4 regression: preserves applied/skipped — a malformed entry hit partway through a multi-file chain does not lose the files that already succeeded (the F4 class, one door over)', async () => {
+    // Before this round, recordedEntryFor's throw was unwrapped inside the file loop and
+    // propagated straight out of applySchemaChain as a rejected promise — discarding
+    // `applied`/`skipped` even though earlier files in the SAME run had genuinely succeeded.
+    const db = createSqliteD1()
+    const exec = execViaSqlite(db)
+    const chain = SCHEMA_CHAIN.slice(0, 3)
+    const malformed = new Set<string>([`${chain[2].file}${SEP}onlyonefield`])
+    const result = await applySchemaChain(exec, { chain, alreadyApplied: malformed })
+    expect(result.failed?.kind).toBe('malformed-bookkeeping')
+    expect(result.failed?.file).toBe(chain[2].file)
+    // The first two files genuinely ran (nothing claims them as already applied) and must be
+    // visible in `applied`, not silently discarded by the third file's malformed entry.
+    expect(result.applied).toEqual([chain[0].file, chain[1].file])
     db.close()
   })
 

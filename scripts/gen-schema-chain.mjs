@@ -141,14 +141,35 @@ export function splitSqlStatements(sql, fileLabel) {
     return { word: sql.slice(pos, j).toUpperCase(), end: j }
   }
 
-  // Looks past pure whitespace from `pos` — used only to classify what follows a BEGIN
-  // keyword. Deliberately does NOT also skip comments: a comment wedged between BEGIN and
-  // its next token is not a shape this repo's migrations use, and treating "comment then
-  // something" as "nothing significant yet" just falls through to the safe default (treat as
-  // a trigger-opening BEGIN), not a wrong hard-pass.
+  // Looks past whitespace AND comments from `pos` — used only to classify what follows a
+  // BEGIN keyword. P2 gate fix (round 4, 2026-09-04): the original version skipped only
+  // whitespace, on the theory that "comment then something" falls through to the safe default
+  // (treat as a trigger-opening BEGIN) and so could never be a wrong hard-pass. That was
+  // false: `BEGIN /* c */;` has a `;` sitting right after the comment, which the
+  // whitespace-only version never saw — it looked past the comment's TEXT (landing inside the
+  // comment, not past it) and read whatever character came next in the raw source, not the
+  // real next token. The practical effect: a comment wedged between BEGIN and the token that
+  // would have classified it as transaction control could suppress that classification, and
+  // `BEGIN /* c */; … END;` swallowed the whole rest of the file into one statement — the
+  // exact class C4 (round 3) was supposed to close, one spelling over. Fixed to loop over
+  // whitespace and `--`/`/* */` comments the same way the main state machine does, so the
+  // classifier sees the real next token regardless of what separates it from BEGIN.
   function skipWhitespace(pos) {
     let j = pos
-    while (j < n && /\s/.test(sql[j])) j += 1
+    for (;;) {
+      while (j < n && /\s/.test(sql[j])) j += 1
+      if (sql[j] === '-' && sql[j + 1] === '-') {
+        const nl = sql.indexOf('\n', j)
+        j = nl === -1 ? n : nl + 1
+        continue
+      }
+      if (sql[j] === '/' && sql[j + 1] === '*') {
+        const close = sql.indexOf('*/', j + 2)
+        j = close === -1 ? n : close + 2
+        continue
+      }
+      break
+    }
     return j
   }
 
@@ -298,8 +319,18 @@ export function splitSqlStatements(sql, fileLabel) {
   // an empty-after-comment-stripped chunk being sent as its own "statement".
   return statements.filter((stmt) => !isBlankStatement(stmt))
 }
-// === SPLITTER SOURCE HASH REGION END ===
 
+// isBlankStatement is called by splitSqlStatements above (its final line) but was, until the
+// round 4 gate fix, defined AFTER the SPLITTER SOURCE HASH REGION END marker — outside the
+// text SPLITTER_SOURCE_SHA256_BY_VERSION hashes. The gate proved that gap live: editing
+// isBlankStatement's BEHAVIOR (not splitSqlStatements' own body) changed the real corpus'
+// total statement count 955 -> 958 while SCHEMA_CHAIN_SPLITTER_VERSION, SCHEMA_CHAIN_DIGEST,
+// and every per-file sha256 stayed identical — the exact silent-skip shape this hash exists to
+// prevent, for a function one line outside the fence meant to catch it. A hash that only
+// covers a function's own text, not the functions it calls, is not a hash of its behavior.
+// Fixed by moving the END marker past isBlankStatement's definition so the hashed region
+// covers the splitter's full call graph, not just splitSqlStatements' own body. (wordAt and
+// skipWhitespace are nested INSIDE splitSqlStatements and were already covered.)
 function isBlankStatement(stmt) {
   const stripped = stmt
     .replace(/--[^\n]*/g, '')
@@ -307,6 +338,7 @@ function isBlankStatement(stmt) {
     .trim()
   return stripped.length === 0
 }
+// === SPLITTER SOURCE HASH REGION END ===
 
 // ---------------------------------------------------------------------------------------
 // Created-object extraction (K1 gate fix, 2026-09-04)
@@ -420,7 +452,20 @@ export function extractCreatedObjects(statements) {
 //       every statement this produces for the migrations committed as of this bump is
 //       byte-identical to version 1's output — this bump is for RULES the gate found unsafe
 //       for input the splitter had not yet been asked to handle, not for today's corpus.
-export const SCHEMA_CHAIN_SPLITTER_VERSION = 2
+//   3 (2026-09-04, gate round 4 on PR #1300, P2): skipWhitespace (used only to classify what
+//       follows a BEGIN keyword) now also skips `--`/`/* */` comments, not just whitespace —
+//       `BEGIN /* c */;` previously fell through the comment-only skip and never got
+//       classified as transaction-control, so it swallowed the whole rest of the file into one
+//       statement, the exact class version 2 was supposed to close. Also: the SPLITTER SOURCE
+//       HASH REGION now extends past isBlankStatement's definition (splitSqlStatements' own
+//       final line calls it, but its body previously sat outside the hashed region — the gate
+//       proved that gap live, changing isBlankStatement's behavior altered the real corpus'
+//       statement count with the hash, version, and every per-file sha256 unchanged). Verified:
+//       every statement this produces for the migrations committed as of this bump is
+//       byte-identical to version 2's output — no real migration uses a comment between BEGIN
+//       and its next token, or an isBlankStatement edge case this splitter did not already
+//       handle; this bump is for the RULE and the HASH COVERAGE, not today's corpus.
+export const SCHEMA_CHAIN_SPLITTER_VERSION = 3
 
 const SPLITTER_HASH_REGION_START = '// === SPLITTER SOURCE HASH REGION START'
 const SPLITTER_HASH_REGION_END = '// === SPLITTER SOURCE HASH REGION END ==='
@@ -463,6 +508,7 @@ export function splitterSourceText() {
  */
 export const SPLITTER_SOURCE_SHA256_BY_VERSION = {
   2: 'a4279142c00604c48c0343942008e3c2cc81cb050eae061f7313a2f7ef6840e9',
+  3: '248025a0102a2364b7bfebcf28059c8b8f000c085de0a20027721af8a31be400',
 }
 
 export function assertSplitterVersionMatchesSource() {
