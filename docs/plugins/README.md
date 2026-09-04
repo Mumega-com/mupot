@@ -16,6 +16,7 @@ Read like a wiki: start here, open one page. Do not print tokens. Token **paths*
 | [mupot-plugin](mupot-hermes-plugin.md) | Hermes plugin | **published** v0.3 | [Mumega-com/mupot-plugin](https://github.com/Mumega-com/mupot-plugin) |
 | [mupot-claude-plugin](mupot-claude-plugin.md) | Claude Code plugin | **published** | [Mumega-com/mupot-claude-plugin](https://github.com/Mumega-com/mupot-claude-plugin) |
 | [grok-herdr-mupot](grok-herdr-mupot.md) | Grok Build skill + MCP weld | **live** on hadi-mac | `~/.grok/skills/grok-herdr-mupot` (this catalog mirrors the wiki page) |
+| [codex-herdr-mupot](codex-herdr-mupot.md) | Codex CLI skill + MCP weld | **live** on hadi-mac | `~/.codex/skills/codex-herdr-mupot` (this catalog mirrors the wiki page) |
 | [cursor-mupot-pager](cursor-mupot-pager.md) | Slack broker for Cursor Cloud | **live** (hadi-grok-desktop) | `dara/.grok/skills/cursor-mupot-pager` |
 | [prime-mupot-experience](prime-mupot-experience.md) | Prime-agent skill + bridges | **published** | [Mumega-com/prime-mupot-experience](https://github.com/Mumega-com/prime-mupot-experience) |
 
@@ -24,7 +25,7 @@ Read like a wiki: start here, open one page. Do not print tokens. Token **paths*
 ```
 Herdr          hands — panes, names, agent prompt
 Mupot          papers — UUID, seq, capability, inbox/send
-Harness weld   how that body authenticates (Grok / Claude / Hermes / Prime / Cursor)
+Harness weld   how that body authenticates (Grok / Codex / Claude / Hermes / Prime / Cursor)
 ```
 
 Herdr is local dispatch. Mupot is cross-machine mail. A plugin that polls every 5s and a plugin that subscribes to Herdr events are **different** — both talk to the pot.
