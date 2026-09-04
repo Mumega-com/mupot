@@ -80,6 +80,20 @@ function rewriteRequest(request: Request, hostname: string, pathname: string): R
   return new Request(url, request)
 }
 
+// Headers a client must never use to retarget a resolved path tenant.
+const TENANT_OVERRIDE_HEADERS = ['x-mupot-tenant-slug', 'x-pot-tenant']
+// Colony credentials that must never ride into a foreign tenant isolate.
+// The path door is same-origin (`mupot.mumega.com`), so unlike subdomain
+// routing the browser/operator credentials arrive with the request — strip
+// them before dispatch. Tenant Workers authenticate through their own door.
+const CREDENTIAL_HEADERS = ['cookie', 'authorization', 'proxy-authorization']
+
+function stripHeaders(request: Request, names: string[]): Request {
+  const headers = new Headers(request.headers)
+  for (const name of names) headers.delete(name)
+  return new Request(request, { headers })
+}
+
 /**
  * On the colony apex, `/t/{slug}/{interface}` is the tenant URL.
  * Home slug stays on this Worker with the prefix stripped.
@@ -95,12 +109,25 @@ export function resolveApexPathTenant(
   if (!parsed) return null
   const home = homeSlug.toLowerCase()
   if (parsed.slug === home) {
-    return { kind: 'home', slug: parsed.slug, request: rewriteRequest(request, url.hostname, parsed.remainder) }
+    // Home stays on this Worker (same isolate, colony credentials valid),
+    // but the tenant-override headers must die here so the downstream
+    // header dispatch in index.ts cannot retarget a resolved path.
+    const homeRequest = stripHeaders(
+      rewriteRequest(request, url.hostname, parsed.remainder),
+      TENANT_OVERRIDE_HEADERS,
+    )
+    return { kind: 'home', slug: parsed.slug, request: homeRequest }
   }
+  // Foreign tenant: the rewritten request carries no client tenant-override
+  // and no colony credentials into the isolate (Athena gate 2026-09-04).
+  const dispatchRequest = stripHeaders(
+    rewriteRequest(request, `${parsed.slug}.${rootDomain}`, parsed.remainder),
+    [...TENANT_OVERRIDE_HEADERS, ...CREDENTIAL_HEADERS],
+  )
   return {
     kind: 'dispatch',
     slug: parsed.slug,
-    request: rewriteRequest(request, `${parsed.slug}.${rootDomain}`, parsed.remainder),
+    request: dispatchRequest,
   }
 }
 

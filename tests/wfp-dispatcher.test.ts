@@ -141,3 +141,55 @@ describe('WFP Dispatcher fetch handler', () => {
     expect(body.message).toContain("'unprovisioned-tenant'")
   })
 })
+
+describe('apex path tenant gate fix: header strip (Athena 2026-09-04)', () => {
+  it('a client tenant header cannot retarget the dispatch isolate', () => {
+    const req = new Request('https://mupot.mumega.com/t/gaf/mcp', {
+      method: 'POST',
+      headers: { 'x-mupot-tenant-slug': 'other', 'x-pot-tenant': 'other' },
+    })
+    const resolved = resolveApexPathTenant(req, 'mumega', 'mupot.mumega.com')
+    expect(resolved?.kind).toBe('dispatch')
+    if (resolved?.kind !== 'dispatch') throw new Error('expected dispatch')
+    expect(resolved.slug).toBe('gaf')
+    expect(new URL(resolved.request.url).hostname).toBe('gaf.mupot.mumega.com')
+    expect(resolved.request.headers.get('x-mupot-tenant-slug')).toBeNull()
+    expect(resolved.request.headers.get('x-pot-tenant')).toBeNull()
+  })
+
+  it('colony credentials do not ride into the foreign isolate', async () => {
+    const req = new Request('https://mupot.mumega.com/t/gaf/mcp', {
+      method: 'POST',
+      headers: {
+        cookie: 'session=colony',
+        authorization: 'Bearer colony-token',
+        'x-test': '1',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ hello: 'world' }),
+    })
+    const resolved = resolveApexPathTenant(req, 'mumega', 'mupot.mumega.com')
+    expect(resolved?.kind).toBe('dispatch')
+    if (resolved?.kind !== 'dispatch') throw new Error('expected dispatch')
+    expect(resolved.request.headers.get('cookie')).toBeNull()
+    expect(resolved.request.headers.get('authorization')).toBeNull()
+    expect(resolved.request.headers.get('x-test')).toBe('1')
+    expect(await resolved.request.text()).toBe(JSON.stringify({ hello: 'world' }))
+  })
+
+  it('home keeps colony credentials but drops tenant-override headers', () => {
+    const req = new Request('https://mupot.mumega.com/t/mumega/mcp', {
+      headers: {
+        cookie: 'session=colony',
+        authorization: 'Bearer colony-token',
+        'x-mupot-tenant-slug': 'other',
+      },
+    })
+    const resolved = resolveApexPathTenant(req, 'mumega', 'mupot.mumega.com')
+    expect(resolved?.kind).toBe('home')
+    if (resolved?.kind !== 'home') throw new Error('expected home')
+    expect(resolved.request.headers.get('cookie')).toBe('session=colony')
+    expect(resolved.request.headers.get('authorization')).toBe('Bearer colony-token')
+    expect(resolved.request.headers.get('x-mupot-tenant-slug')).toBeNull()
+  })
+})
