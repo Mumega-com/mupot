@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import dispatcher, { extractTenantSlug, DEFAULT_ROOT_DOMAIN, DEFAULT_FALLBACK_POT } from '../src/dispatcher'
+import dispatcher, { extractTenantSlug, renderUnprovisionedPotHtml, DEFAULT_ROOT_DOMAIN, DEFAULT_FALLBACK_POT } from '../src/dispatcher'
 
 describe('WFP Dynamic Dispatcher', () => {
   describe('extractTenantSlug', () => {
@@ -76,19 +76,18 @@ describe('WFP Dynamic Dispatcher', () => {
   // mupot#1301 review, F7 — the render half. Sanitization and escaping are two guards;
   // testing only the slug leaves the interpolation unproven.
   describe('unprovisioned-pot page', () => {
-    it('escapes the tenant it echoes back', async () => {
-      const mockGet = vi.fn().mockImplementation(() => {
-        throw new Error('No user worker found for tenant')
-      })
-      const res = await dispatcher.fetch(
-        new Request('https://x.mupot.mumega.com/', { headers: { Accept: 'text/html' } }),
-        { DISPATCHER: { get: mockGet } },
-      )
-      const html = await res.text()
-      expect(res.status).toBe(404)
-      // Whatever the slug is, it must never arrive as live markup.
+    // Calls the renderer DIRECTLY with hostile input. Routing the same string through
+    // dispatcher.fetch does not test this: sanitizeSlug strips `<` first, so removing the
+    // escaping entirely leaves such a test green — confirmed by mutation. Sanitization and
+    // escaping are two independent guards and each needs its own proof.
+    it('escapes hostile input regardless of what the sanitizer would have done', () => {
+      const html = renderUnprovisionedPotHtml('</span><script>alert(1)</script>')
       expect(html).not.toMatch(/<script\b/i)
-      expect(html).toContain('<span class="code">')
+      expect(html).toContain('&lt;script&gt;')
+    })
+
+    it('still renders an ordinary slug readably', () => {
+      expect(renderUnprovisionedPotHtml('gaf')).toContain('<span class="code">gaf</span>')
     })
   })
 

@@ -114,7 +114,12 @@ function escapeHtml(value: string): string {
     .replace(/'/g, '&#39;')
 }
 
-function renderUnprovisionedPotHtml(tenantSlug: string): string {
+// Exported for test. It must be safe for ANY input, not merely for what sanitizeSlug
+// happens to emit today — otherwise the render's safety is a property of its caller, and
+// a future change to the sanitizer silently un-fixes it. Verified by mutation: with the
+// escaping removed, a test that only routes hostile input THROUGH the sanitizer stays
+// green, because sanitization strips `<` first. The two guards must be proven separately.
+export function renderUnprovisionedPotHtml(tenantSlug: string): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
