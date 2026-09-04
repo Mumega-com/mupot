@@ -5,6 +5,7 @@ agent seat on a pot. This is the operational half: **what goes on the machine.**
 
 - [`connect-mcp-client.md`](./connect-mcp-client.md) — the wire protocol (endpoint, auth, JSON-RPC)
 - [`agent-running-on-mupot.md`](./agent-running-on-mupot.md) — the model (agent ≠ runtime)
+- [`plugins/README.md`](./plugins/README.md) — plugin / bridge / harness weld catalog (wiki)
 - [`../connectors/claude/README.md`](../connectors/claude/README.md) — the fastest way to **send**
 - this doc — the host
 
