@@ -87,7 +87,8 @@ SOS is retired for fleet mail. Do not revive `sos-inbox-check` / SOS MCP as if i
 |---|---|---|---|
 | Grok Build | `grok` | [grok-herdr-mupot](grok-herdr-mupot.md) | `~/.grok/skills/grok-herdr-mupot` |
 | Codex CLI | `codex` | [codex-herdr-mupot](codex-herdr-mupot.md) | `~/.codex/skills/codex-herdr-mupot` |
-| Hermes | `hermes` | [hermes-herdr-mupot](hermes-herdr-mupot.md) | `~/.hermes/skills/hermes-herdr-mupot` |
+| Hermes (Mac) | `hermes` | [hermes-herdr-mupot](hermes-herdr-mupot.md) | `~/.hermes/skills/hermes-herdr-mupot` |
+| Hermes (VPS) | VPS Herdr `muvps_hermes` | [muvps-hermes-mupot](muvps-hermes-mupot.md) | `~/.hermes/skills/muvps-hermes-mupot` |
 | Cursor CLI | `cursor` | [cursor-herdr-mupot](cursor-herdr-mupot.md) | `~/.cursor/skills/cursor-herdr-mupot` |
 | OpenCode | `opencode` | [opencode-herdr-mupot](opencode-herdr-mupot.md) | `hadi-opencode/skills/opencode-herdr-mupot` |
 | Pi | `pi` | [pi-herdr-mupot](pi-herdr-mupot.md) | `hadi-pi/skills/pi-herdr-mupot` |

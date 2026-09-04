@@ -2,7 +2,7 @@
 
 How **Hermes** sits on Herdr and talks to Mupot. Skill on hadi-mac; this page is the wiki copy. Inherits [herdr-on-mupot](herdr-on-mupot.md).
 
-The published [mupot-plugin](mupot-hermes-plugin.md) is the Hermes **plugin** (operator/provisioner). This page is the **Herdr seat weld**.
+The published [mupot-plugin](mupot-hermes-plugin.md) is the Hermes **plugin** (operator/provisioner). This page is the **Mac Herdr seat weld**. VPS Hermes is [muvps-hermes-mupot](muvps-hermes-mupot.md) — different machine, currently the same pot id (dual-run).
 
 | | |
 |---|---|
