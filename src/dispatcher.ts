@@ -8,6 +8,8 @@
 //   2. Caches are disabled inside dispatch namespaces; zero `caches.default` / `caches.open`.
 //   3. Single billed request across the chain: Dispatch Worker -> User Worker.
 
+import { RESERVED_TENANT_SLUGS } from './pots/service'
+
 export interface DispatcherEnv {
   DISPATCHER: {
     get(
@@ -72,6 +74,7 @@ export function extractPathTenant(pathname: string): { slug: string; remainder: 
 export type ApexPathTenant =
   | { kind: 'home'; request: Request; slug: string }
   | { kind: 'dispatch'; request: Request; slug: string }
+  | { kind: 'reserved'; slug: string }
 
 function rewriteRequest(request: Request, hostname: string, pathname: string): Request {
   const url = new URL(request.url)
@@ -118,6 +121,11 @@ export function resolveApexPathTenant(
     )
     return { kind: 'home', slug: parsed.slug, request: homeRequest }
   }
+  // Reserved infrastructure names can never own a tenant worker (see
+  // RESERVED_TENANT_SLUGS in src/pots/service.ts) — refuse before dispatch.
+  if (RESERVED_TENANT_SLUGS.has(parsed.slug)) {
+    return { kind: 'reserved', slug: parsed.slug }
+  }
   // Foreign tenant: the rewritten request carries no client tenant-override
   // and no colony credentials into the isolate (Athena gate 2026-09-04).
   const dispatchRequest = stripHeaders(
@@ -129,6 +137,64 @@ export function resolveApexPathTenant(
     slug: parsed.slug,
     request: dispatchRequest,
   }
+}
+
+export interface ApexPathEnv {
+  PUBLIC_ORIGIN?: string
+  TENANT_SLUG?: string
+  DISPATCHER?: DispatcherEnv['DISPATCHER']
+}
+
+export type ApexPathRoute =
+  | { kind: 'passthrough' }
+  | { kind: 'home'; request: Request }
+  | { kind: 'respond'; response: Response }
+
+/**
+ * Route one apex `/t/{tenant}/{interface}` request. Returns `passthrough` when
+ * the path is not a tenant address, the rewritten home request for this
+ * Worker's own slug, or a terminal response (reserved slug, unbound
+ * dispatcher, dispatched tenant response). Extracted so the routing contract
+ * is unit-testable without booting the full Worker entry.
+ */
+export async function routeApexPathTenant(req: Request, env: ApexPathEnv): Promise<ApexPathRoute> {
+  const rootHost = env.PUBLIC_ORIGIN ? new URL(env.PUBLIC_ORIGIN).hostname : DEFAULT_ROOT_DOMAIN
+  const homeSlug = (env.TENANT_SLUG || 'mumega').toLowerCase()
+  const pathTenant = resolveApexPathTenant(req, homeSlug, rootHost)
+  if (!pathTenant) return { kind: 'passthrough' }
+  if (pathTenant.kind === 'home') return { kind: 'home', request: pathTenant.request }
+  if (pathTenant.kind === 'reserved') {
+    return {
+      kind: 'respond',
+      response: new Response(
+        JSON.stringify({
+          error: 'reserved_slug',
+          tenant: pathTenant.slug,
+          message: `Slug '${pathTenant.slug}' is reserved infrastructure and cannot name a tenant.`,
+        }),
+        { status: 404, headers: { 'content-type': 'application/json' } },
+      ),
+    }
+  }
+  if (!env.DISPATCHER) {
+    return {
+      kind: 'respond',
+      response: new Response(
+        JSON.stringify({
+          error: 'unconfigured',
+          tenant: pathTenant.slug,
+          message: 'Cloudflare dispatch namespace is not bound; cannot route /t/{tenant}.',
+        }),
+        { status: 503, headers: { 'content-type': 'application/json' } },
+      ),
+    }
+  }
+  const response = await dispatcher.fetch(pathTenant.request, {
+    DISPATCHER: env.DISPATCHER,
+    FALLBACK_POT: env.TENANT_SLUG,
+    ROOT_DOMAIN: rootHost,
+  })
+  return { kind: 'respond', response }
 }
 
 function renderUnprovisionedPotHtml(tenantSlug: string): string {
@@ -160,7 +226,7 @@ function renderUnprovisionedPotHtml(tenantSlug: string): string {
 </html>`
 }
 
-export default {
+const dispatcher = {
   async fetch(request: Request, env: DispatcherEnv): Promise<Response> {
     const url = new URL(request.url)
     const rootDomain = env.ROOT_DOMAIN || DEFAULT_ROOT_DOMAIN
@@ -207,4 +273,6 @@ export default {
     }
   },
 }
+
+export default dispatcher
 

@@ -5,6 +5,7 @@ import dispatcher, {
   extractTenantSlug,
   extractPathTenant,
   resolveApexPathTenant,
+  routeApexPathTenant,
   type DispatcherEnv,
 } from '../src/dispatcher'
 
@@ -191,5 +192,58 @@ describe('apex path tenant gate fix: header strip (Athena 2026-09-04)', () => {
     expect(resolved.request.headers.get('cookie')).toBe('session=colony')
     expect(resolved.request.headers.get('authorization')).toBe('Bearer colony-token')
     expect(resolved.request.headers.get('x-mupot-tenant-slug')).toBeNull()
+  })
+})
+
+describe('apex path tenant follow-up: reserved + unconfigured + preservation', () => {
+  it('refuses reserved infrastructure slugs before dispatch', () => {
+    const req = new Request('https://mupot.mumega.com/t/mupot/mcp')
+    expect(resolveApexPathTenant(req, 'mumega', 'mupot.mumega.com')).toEqual({
+      kind: 'reserved',
+      slug: 'mupot',
+    })
+  })
+
+  it('prefers home over reserved when the slug is this worker', () => {
+    const req = new Request('https://mupot.mumega.com/t/mumega/mcp')
+    expect(resolveApexPathTenant(req, 'mumega', 'mupot.mumega.com')?.kind).toBe('home')
+  })
+
+  it('returns 503 JSON when the dispatch namespace is not bound', async () => {
+    const routed = await routeApexPathTenant(new Request('https://mupot.mumega.com/t/gaf/mcp'), {
+      TENANT_SLUG: 'mumega',
+    })
+    expect(routed.kind).toBe('respond')
+    if (routed.kind !== 'respond') throw new Error('expected respond')
+    expect(routed.response.status).toBe(503)
+    expect(await routed.response.json()).toMatchObject({ error: 'unconfigured', tenant: 'gaf' })
+  })
+
+  it('returns 404 reserved_slug JSON without touching the dispatcher', async () => {
+    const get = vi.fn()
+    const routed = await routeApexPathTenant(new Request('https://mupot.mumega.com/t/mupot/mcp'), {
+      TENANT_SLUG: 'mumega',
+      DISPATCHER: { get },
+    })
+    expect(routed.kind).toBe('respond')
+    if (routed.kind !== 'respond') throw new Error('expected respond')
+    expect(routed.response.status).toBe(404)
+    expect(await routed.response.json()).toMatchObject({ error: 'reserved_slug', tenant: 'mupot' })
+    expect(get).not.toHaveBeenCalled()
+  })
+
+  it('preserves method, headers, query, and body across the rewrite', async () => {
+    const req = new Request('https://mupot.mumega.com/t/gaf/mcp?token=abc', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-test': '1' },
+      body: JSON.stringify({ hello: 'world' }),
+    })
+    const resolved = resolveApexPathTenant(req, 'mumega', 'mupot.mumega.com')
+    expect(resolved?.kind).toBe('dispatch')
+    if (resolved?.kind !== 'dispatch') throw new Error('expected dispatch')
+    expect(resolved.request.method).toBe('POST')
+    expect(resolved.request.headers.get('x-test')).toBe('1')
+    expect(new URL(resolved.request.url).search).toBe('?token=abc')
+    expect(await resolved.request.text()).toBe(JSON.stringify({ hello: 'world' }))
   })
 })
