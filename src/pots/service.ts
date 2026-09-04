@@ -216,8 +216,17 @@ export async function provisionSovereignPot(
   // which is also why nobody noticed the login URL below was useless — you cannot reach
   // far enough to receive the 404.
   //
-  // The apex path form is served by the dispatcher (src/dispatcher.ts, mupot#1248) and
-  // needs no DNS record, no ACM, and no per-tenant certificate.
+  // WARNING (mupot#1301 review, 2026-09-04): THIS URL IS NOT SERVED BY ANYTHING TODAY.
+  // The previous version of this comment claimed "the apex path form is served by the
+  // dispatcher (src/dispatcher.ts, mupot#1248)". It is not: there is no `/t/` route
+  // anywhere in src/, and mupot#1248 — which would add it — is open and BLOCKED. Live
+  // check: GET https://mupot.mumega.com/t/gaf/health returns 302 to the dashboard
+  // catch-all, not a dispatch.
+  //
+  // The path form is still the right destination (no DNS record, no ACM, no per-tenant
+  // certificate), which is why the value is left as-is rather than reverted to the
+  // subdomain form that provably cannot serve either. But until #1248 or a replacement
+  // lands, every origin this function returns is unreachable. Tracked in mupot#1306.
   const publicOrigin = `https://${rootDomain}/t/${slug}`
   const tier = input.plan_tier || 'enterprise'
 
