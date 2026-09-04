@@ -108,3 +108,55 @@ describe('a client-supplied tenant header cannot choose the serving Worker (#129
     expect(dispatched).toEqual(['gaf'])
   })
 })
+
+// ── mupot#1307 (gate F4) ───────────────────────────────────────────────────────────────
+//
+// The /preview gate proven through the DEPLOYED composition, not the sub-app. Every other
+// test for it calls platformApp.fetch, which cannot see whether the middleware survives the
+// mount at `app.route('/', platformApp)` in src/index.ts, or the OAuthProvider wrapper
+// around it. That is the same blind spot this file was created for.
+//
+// There is NO DB binding on this env, deliberately. If the refusal is ordered correctly the
+// database is never reached, so a missing binding is harmless — and if the gate is removed,
+// the handler dereferences `env.DB` and cannot produce a clean 401. That proves refusal
+// precedes any database work without hand-writing a D1 stand-in, which
+// scripts/check-test-schema-source.mjs correctly rejects: an invented query builder is a
+// SQL engine that string-matches instead of executing, so it can never contradict a query
+// naming a column that does not exist. It caught my first attempt at this test — and then
+// caught the COMMENT explaining the fix, because that guard scans raw text and its pattern
+// matches the method name in prose as readily as in code. Named in prose deliberately.
+describe('/preview refuses anonymous callers through the real worker (#1307)', () => {
+  function envWithoutDb() {
+    const dispatched: string[] = []
+    const env = {
+      TENANT_SLUG: 'mumega',
+      BRAND: 'mupot',
+      IDP_PROVIDER: 'google',
+      OAUTH_CLIENT_ID: 'test-client.apps.googleusercontent.com',
+      OAUTH_CLIENT_SECRET: 'test-secret',
+      PUBLIC_ORIGIN: 'https://mupot.mumega.com',
+      SESSIONS: kv(),
+      OAUTH_KV: kv(),
+      DISPATCHER: {
+        get: (name: string) => {
+          dispatched.push(name)
+          return { fetch: async () => new Response('tenant') }
+        },
+      },
+    }
+    return { env: env as never, dispatched }
+  }
+
+  it.each([
+    ['/preview/proj-1'],
+    ['/preview/proj-1/'],
+    ['/preview/proj-1/deep/path?q=1'],
+  ])('%s is refused 401 without touching the database or the namespace', async (path) => {
+    const { env, dispatched } = envWithoutDb()
+    const res = await worker.fetch(new Request(`https://mupot.mumega.com${path}`), env, ctx)
+
+    expect(res.status).toBe(401)
+    expect(await res.json()).toEqual({ error: 'unauthenticated' })
+    expect(dispatched).toEqual([])
+  })
+})
