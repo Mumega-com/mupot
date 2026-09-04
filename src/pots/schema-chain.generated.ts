@@ -10,6 +10,10 @@ export interface SchemaChainFile {
   readonly file: string
   readonly sha256: string
   readonly statements: readonly string[]
+  /** Schema objects this file's statements create — used by verifyGroundTruth
+   *  (src/pots/schema-chain.ts) to check REAL facts about the target database instead of
+   *  this module's own bookkeeping. See extractCreatedObjects in gen-schema-chain.mjs. */
+  readonly objects: readonly { readonly type: string; readonly name: string }[]
 }
 
 export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
@@ -29,6 +33,19 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\nCREATE INDEX IF NOT EXISTS idx_tasks_squad   ON tasks(squad_id, status);",
       "\nCREATE INDEX IF NOT EXISTS idx_engrams_agent ON engrams(agent_id);",
     ],
+    objects: [
+      { type: "table", name: "departments" },
+      { type: "table", name: "squads" },
+      { type: "table", name: "agents" },
+      { type: "table", name: "memberships" },
+      { type: "table", name: "tasks" },
+      { type: "table", name: "engrams" },
+      { type: "table", name: "users" },
+      { type: "index", name: "idx_squads_dept" },
+      { type: "index", name: "idx_agents_squad" },
+      { type: "index", name: "idx_tasks_squad" },
+      { type: "index", name: "idx_engrams_agent" },
+    ],
   },
   {
     file: "0002_members.sql",
@@ -43,12 +60,25 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\nCREATE INDEX IF NOT EXISTS idx_capabilities_member  ON capabilities(member_id);",
       "\nCREATE INDEX IF NOT EXISTS idx_capabilities_scope   ON capabilities(scope_type, scope_id);",
     ],
+    objects: [
+      { type: "table", name: "members" },
+      { type: "table", name: "member_tokens" },
+      { type: "table", name: "capabilities" },
+      { type: "table", name: "invites" },
+      { type: "index", name: "idx_member_tokens_member" },
+      { type: "index", name: "idx_member_tokens_hash" },
+      { type: "index", name: "idx_capabilities_member" },
+      { type: "index", name: "idx_capabilities_scope" },
+    ],
   },
   {
     file: "0003_settings.sql",
     sha256: "057ab7ac407ff1aef1056566782a5b94b19e070c36de4d7354ccbe853e356cfb",
     statements: [
       "-- org settings — onboarding state + chosen model/IM config. Key/value, tenant-local.\n-- The setup wizard writes here; nothing business-specific, just substrate config.\nCREATE TABLE IF NOT EXISTS org_settings (\n  key        TEXT PRIMARY KEY,           -- e.g. 'onboarding_complete', 'model_provider'\n  value      TEXT NOT NULL,\n  updated_at TEXT NOT NULL DEFAULT (datetime('now'))\n);",
+    ],
+    objects: [
+      { type: "table", name: "org_settings" },
     ],
   },
   {
@@ -61,6 +91,13 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\nCREATE INDEX IF NOT EXISTS idx_channel_bindings_squad ON channel_bindings(squad_id);",
       "\nCREATE INDEX IF NOT EXISTS idx_member_identities_member ON member_identities(member_id);",
     ],
+    objects: [
+      { type: "table", name: "channel_bindings" },
+      { type: "table", name: "member_identities" },
+      { type: "table", name: "channel_link_codes" },
+      { type: "index", name: "idx_channel_bindings_squad" },
+      { type: "index", name: "idx_member_identities_member" },
+    ],
   },
   {
     file: "0005_channel_capability_grants.sql",
@@ -70,6 +107,11 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\nCREATE INDEX IF NOT EXISTS idx_channel_capability_grants_member\n  ON channel_capability_grants(member_id);",
       "\nCREATE INDEX IF NOT EXISTS idx_channel_capability_grants_binding\n  ON channel_capability_grants(binding_id, squad_id);",
     ],
+    objects: [
+      { type: "table", name: "channel_capability_grants" },
+      { type: "index", name: "idx_channel_capability_grants_member" },
+      { type: "index", name: "idx_channel_capability_grants_binding" },
+    ],
   },
   {
     file: "0006_task_results.sql",
@@ -78,6 +120,7 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "-- Task execution results. The task-execution loop (AgentDO execute-mode cortex\n-- cycle) writes the model output back onto the task row and stamps a completion\n-- time, so \"send a task → an agent does it → the result persists\" is durable and\n-- readable by the dashboard /send poller and the GET /api/tasks/:id API.\n--\n-- Both columns are nullable: an open/in_progress task has no result yet, and a\n-- task may finish (done) or fail (blocked) — completed_at is set in either\n-- terminal case (it marks \"execution finished\", not \"succeeded\").\n\nALTER TABLE tasks ADD COLUMN result TEXT;",
       "\nALTER TABLE tasks ADD COLUMN completed_at TEXT;",
     ],
+    objects: [],
   },
   {
     file: "0007_gates.sql",
@@ -86,6 +129,10 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "-- Gate primitive: gate_owner on tasks + append-only verdict receipts.\n--\n-- gate_owner is a capability string (e.g. 'gate:outreach'). When set, the\n-- task's review→approved|rejected transition is gated: the caller must hold\n-- this capability (checked in task_verdicts). Verdicts are append-only receipts;\n-- there is no UPDATE or DELETE path on task_verdicts (enforced at the service\n-- layer and documented here).\n--\n-- Status column gains three values via constraint removal + re-add (SQLite does\n-- not support ALTER COLUMN, so we document the wider check here):\n--   open → in_progress → review → approved|rejected\n--   approved → done\n--   rejected → in_progress (rework) or → done (abandon)\n--   blocked remains a valid status for execution failures (unchanged)\n--\n-- The status CHECK constraint on the existing tasks table must be widened.\n-- SQLite does not support ALTER CONSTRAINT; we drop and recreate it via a\n-- table-rebuild. To keep the migration simple and non-destructive we instead\n-- enforce the wider set purely in the service/route layer (the DB-level CHECK\n-- was not present in the original migration anyway — see 0001_init.sql which\n-- stores status as plain TEXT with no CHECK).\n\nALTER TABLE tasks ADD COLUMN gate_owner TEXT;",
       "\n\nCREATE TABLE task_verdicts (\n  id          TEXT NOT NULL PRIMARY KEY,\n  task_id     TEXT NOT NULL REFERENCES tasks(id),\n  verdict     TEXT NOT NULL CHECK(verdict IN ('approved', 'rejected')),\n  note        TEXT,\n  decided_by  TEXT NOT NULL,   -- agent id or member id of the decision-maker\n  decided_at  TEXT NOT NULL    -- ISO-8601 timestamp\n);",
       "\n\nCREATE INDEX task_verdicts_task_id ON task_verdicts(task_id);",
+    ],
+    objects: [
+      { type: "table", name: "task_verdicts" },
+      { type: "index", name: "task_verdicts_task_id" },
     ],
   },
   {
@@ -97,6 +144,13 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\nCREATE INDEX IF NOT EXISTS idx_gate_grants_capability ON gate_grants (capability);",
       "\n\n-- K8 fix: append-only triggers on task_verdicts.\n-- Verdicts are immutable receipts. Once written they must never be silently altered\n-- or deleted. These triggers fire BEFORE UPDATE or DELETE and raise ABORT so the\n-- operation is rolled back at the SQLite level — no application-layer guard can be\n-- bypassed.\n\nCREATE TRIGGER IF NOT EXISTS task_verdicts_no_update\n  BEFORE UPDATE ON task_verdicts\nBEGIN\n  SELECT RAISE(ABORT, 'verdicts are append-only: UPDATE is forbidden');\nEND;",
       "\n\nCREATE TRIGGER IF NOT EXISTS task_verdicts_no_delete\n  BEFORE DELETE ON task_verdicts\nBEGIN\n  SELECT RAISE(ABORT, 'verdicts are append-only: DELETE is forbidden');\nEND;",
+    ],
+    objects: [
+      { type: "table", name: "gate_grants" },
+      { type: "index", name: "idx_gate_grants_principal" },
+      { type: "index", name: "idx_gate_grants_capability" },
+      { type: "trigger", name: "task_verdicts_no_update" },
+      { type: "trigger", name: "task_verdicts_no_delete" },
     ],
   },
   {
@@ -119,6 +173,7 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\nALTER TABLE squads ADD COLUMN budget_cap_cents INTEGER;",
       "\nALTER TABLE squads ADD COLUMN budget_window    TEXT    NOT NULL DEFAULT 'week';",
     ],
+    objects: [],
   },
   {
     file: "0010_execution_meter.sql",
@@ -126,6 +181,10 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     statements: [
       "-- Execution meter: per-(tenant, agent, window) dispatch + token counters.\n--\n-- Purpose: enforce a daily cap on execute-mode model calls before self-serve\n-- tenants are enabled (issue #4). Prevents economic DoS from looped dispatch.\n--\n-- Design choices:\n--\n--   window_key  = '<tenant>:<agent_id>:<YYYY-MM-DD>' (UTC date).\n--                 A new day automatically starts a fresh window — no TTL or\n--                 background job needed; the UPSERT in checkAndReserve handles it.\n--\n--   count       = number of execute cycles started this window.\n--   tokens      = tokens _spent_ this window (accumulated after each cycle via\n--                 recordTokens; count is incremented before the model call to\n--                 act as a pre-flight reservation even if tokens are not yet known).\n--\n--   Race note (documented in meter.ts): D1 does not support true serialisable\n--   transactions from a Worker (each prepare().run() is its own implicit tx).\n--   Two concurrent dispatches can both read count=N below the cap and both\n--   increment, letting up to (parallelism - 1) extra cycles through at the\n--   window boundary. This is acceptable: the cap is a soft economic governor,\n--   not a hard security gate. A one-at-a-time DO serialises the alarm path;\n--   HTTP dispatch concurrency is bounded by the member RBAC gate above it.\n--\n--   The table is append-insert-on-first-use per window_key; rows are tiny\n--   (~80 bytes each) so daily compaction is not needed at current scale.\n\nCREATE TABLE IF NOT EXISTS execution_meter (\n  id           TEXT NOT NULL PRIMARY KEY,   -- random UUID; one row per window_key\n  window_key   TEXT NOT NULL UNIQUE,        -- '<tenant>:<agent_id>:<YYYY-MM-DD>'\n  count        INTEGER NOT NULL DEFAULT 0,  -- dispatches started in this window\n  tokens       INTEGER NOT NULL DEFAULT 0,  -- tokens spent (accumulated post-cycle)\n  window_start TEXT NOT NULL                -- ISO-8601 of window creation (debug)\n);",
       "\n\nCREATE INDEX IF NOT EXISTS idx_execution_meter_window ON execution_meter (window_key);",
+    ],
+    objects: [
+      { type: "table", name: "execution_meter" },
+      { type: "index", name: "idx_execution_meter_window" },
     ],
   },
   {
@@ -135,6 +194,7 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "-- Cost metering (issue #15): dollar spend on top of the token counters.\n--\n-- Two surfaces need a cost number:\n--   1. The work-unit card's Burn gauge ($X/hr) — derived from per-(agent, day)\n--      spend in execution_meter. So execution_meter gains a cost column.\n--   2. The observatory's per-task cost chip — so the tasks row gains a cost column\n--      stamped at execution time.\n--\n-- UNIT: micro-USD (millionths of a dollar), stored as an INTEGER.\n--   Why not cents? A single small Workers-AI call costs a fraction of one cent;\n--   integer cents would round every cycle to 0 and the gauge would read empty.\n--   micro-USD keeps the value integer-exact while preserving sub-cent resolution.\n--   Conversion: dollars = cost_micro_usd / 1_000_000.\n--   Derivation (see src/agents/cost.ts): cost_micro_usd = round(tokens * rate),\n--   where rate is the model's blended USD-per-1M-token price (so tokens * rate is\n--   already in micro-USD).\n--\n-- These are ESTIMATES. The token figure itself is the conservative EXECUTE_MAX_TOKENS\n-- bound until the model port surfaces real usage; the rate is a blended per-model\n-- constant. The number is an honest order-of-magnitude burn signal, not an invoice.\n\nALTER TABLE execution_meter ADD COLUMN cost_micro_usd INTEGER NOT NULL DEFAULT 0;",
       "\n\nALTER TABLE tasks ADD COLUMN cost_micro_usd INTEGER NOT NULL DEFAULT 0;",
     ],
+    objects: [],
   },
   {
     file: "0012_workflow_pipeline.sql",
@@ -145,6 +205,11 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\nCREATE INDEX IF NOT EXISTS idx_workflow_receipts_task ON workflow_receipts (task_id);",
       "\nCREATE INDEX IF NOT EXISTS idx_workflow_receipts_instance ON workflow_receipts (instance_id);",
     ],
+    objects: [
+      { type: "table", name: "workflow_receipts" },
+      { type: "index", name: "idx_workflow_receipts_task" },
+      { type: "index", name: "idx_workflow_receipts_instance" },
+    ],
   },
   {
     file: "0013_outbound_acts.sql",
@@ -152,6 +217,10 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     statements: [
       "-- mupot — GHL outbound act queue (issue #8).\n--\n-- An outbound act is a PENDING customer-side side-effect (send email, add contact,\n-- move CRM stage) that may only SEND after a human-approved gate verdict.\n--\n-- Iron invariants (enforced at the application layer; the schema enforces the shape):\n--   1. An act starts 'pending'. It can move to 'sent' ONLY through runApprovedActs(),\n--      which re-checks the latest task_verdicts row independently before every send.\n--   2. A refused or failed act is terminal at the application layer for that run.\n--      Retry = a new act row (or operator re-queue).\n--   3. verdict_id is null until the act is actually sent — it records WHICH approved\n--      verdict authorized the send, completing the audit chain.\n\nCREATE TABLE IF NOT EXISTS outbound_acts (\n  id          TEXT NOT NULL PRIMARY KEY,  -- crypto.randomUUID()\n  task_id     TEXT NOT NULL,              -- tasks.id — the work unit this act belongs to\n  kind        TEXT NOT NULL CHECK(kind IN ('send_email', 'add_contact', 'move_stage')),\n  payload     TEXT NOT NULL,              -- JSON — act-specific params (typed at app layer)\n  -- 'sending' is a CLAIM state: an act is moved pending→sending (atomic conditional\n  -- UPDATE) BEFORE the external GHL call, so a CF Workflows step retry can never\n  -- re-pick an already-sent act and double-send a real customer email (#8 P1 fix).\n  -- An act stuck in 'sending' (post-send write crashed) is NEVER auto-resent — it\n  -- fails safe to under-send and surfaces for operator inspection.\n  status      TEXT NOT NULL DEFAULT 'pending'\n                   CHECK(status IN ('pending', 'sending', 'sent', 'failed', 'refused')),\n  verdict_id  TEXT,                       -- task_verdicts.id that authorized the send (null until sent)\n  detail      TEXT,                       -- short status note / sanitized error (no keys)\n  created_at  TEXT NOT NULL,              -- ISO-8601\n  sent_at     TEXT                        -- ISO-8601; set when status → 'sent'\n);",
       "\n\n-- Primary lookup: all pending acts for a task (before sending + COUNT check in pipeline).\nCREATE INDEX IF NOT EXISTS idx_outbound_acts_task_status ON outbound_acts (task_id, status);",
+    ],
+    objects: [
+      { type: "table", name: "outbound_acts" },
+      { type: "index", name: "idx_outbound_acts_task_status" },
     ],
   },
   {
@@ -163,6 +232,12 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\nCREATE INDEX IF NOT EXISTS idx_loops_agent ON loops (agent_id);",
       "\nCREATE INDEX IF NOT EXISTS idx_loops_squad ON loops (squad_id);",
     ],
+    objects: [
+      { type: "table", name: "loops" },
+      { type: "index", name: "idx_loops_tenant_status" },
+      { type: "index", name: "idx_loops_agent" },
+      { type: "index", name: "idx_loops_squad" },
+    ],
   },
   {
     file: "0015_prospects.sql",
@@ -173,6 +248,12 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\nCREATE INDEX IF NOT EXISTS idx_prospects_loop ON prospects (loop_id);",
       "\n\n-- Dedup: at most ONE active (non-terminal) prospect per (tenant, email). A second seed\n-- or discovery of the same email while one is in flight is rejected by this unique index\n-- (the productive-tick amplification guard the P3 review required lands here, by construction).\nCREATE UNIQUE INDEX IF NOT EXISTS idx_prospects_email_active\n  ON prospects (tenant, email)\n  WHERE status IN ('queued', 'drafted', 'sent') AND email IS NOT NULL;",
     ],
+    objects: [
+      { type: "table", name: "prospects" },
+      { type: "index", name: "idx_prospects_tenant_status" },
+      { type: "index", name: "idx_prospects_loop" },
+      { type: "index", name: "idx_prospects_email_active" },
+    ],
   },
   {
     file: "0016_presence.sql",
@@ -180,6 +261,10 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     statements: [
       "-- 0016_presence.sql — pot-native flock presence (Flock #45).\n--\n-- Agents check IN to the pot itself (inbound) so the Fleet shows a live inventory\n-- of who has access + who is currently in — WITHOUT coupling the pot to the SOS\n-- bus (no egress, the pot stays sealed). Keyed by the authenticated member, since\n-- a flock agent authenticates with its pot member-token (member_tokens).\n--\n-- Liveness is derived at read time from last_seen_at (reuse dashboard/fleet classify):\n-- active ≤10m, idle ≤24h, else dead. Stop checking in → ages to \"not there\".\n\nCREATE TABLE IF NOT EXISTS presence (\n  tenant        TEXT NOT NULL,\n  member_id     TEXT NOT NULL,\n  display_name  TEXT NOT NULL DEFAULT '',\n  source        TEXT NOT NULL DEFAULT 'unknown',   -- runtime: claude-code|codex|hermes|openclaw|tmux|cowork|unknown\n  label         TEXT NOT NULL DEFAULT '',          -- free-text, e.g. role/note (capped at write)\n  first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),\n  last_seen_at  TEXT NOT NULL DEFAULT (datetime('now')),\n  PRIMARY KEY (tenant, member_id)\n);",
       "\n\nCREATE INDEX IF NOT EXISTS idx_presence_tenant_seen ON presence(tenant, last_seen_at DESC);",
+    ],
+    objects: [
+      { type: "table", name: "presence" },
+      { type: "index", name: "idx_presence_tenant_seen" },
     ],
   },
   {
@@ -190,6 +275,11 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\nCREATE INDEX IF NOT EXISTS idx_flights_tenant_status  ON flights(tenant, status);",
       "\nCREATE INDEX IF NOT EXISTS idx_flights_tenant_created ON flights(tenant, created_at DESC);",
     ],
+    objects: [
+      { type: "table", name: "flights" },
+      { type: "index", name: "idx_flights_tenant_status" },
+      { type: "index", name: "idx_flights_tenant_created" },
+    ],
   },
   {
     file: "0018_agent_field.sql",
@@ -197,6 +287,10 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     statements: [
       "-- 0018_agent_field.sql — the orient seam (digid-hybrid S1).\n--\n-- Two small tables that make orient (the agent basin-drop) work while keeping the pot\n-- SEALED. See docs/superpowers/specs/2026-06-09-digid-hybrid-orient-design.md.\n--\n--  agent_field        — a MIRROR of each agent's field state, PUSHED INBOUND by the mind\n--                       (the forked SOS brain) via POST /api/agents/:id/field. orient reads\n--                       this local copy, so the body never egresses to the mind and orient\n--                       still works when the mind is asleep (the field half just reads stale\n--                       or absent — it degrades, never errors). The pot does NOT compute these\n--                       values; the mind owns coherence/trust/spin (never fork the brain).\n--  agent_orientation  — induction record: first_inducted_at marks the one-time brain-induced\n--                       onboarding; last_oriented_at + orient_count power the re-orient delta.\n--\n-- Both keyed (tenant, agent_id) for defense-in-depth, matching flights/presence — even\n-- though one pot = one tenant, every row carries its tenant and every read binds it.\n\nCREATE TABLE IF NOT EXISTS agent_field (\n  tenant            TEXT NOT NULL,\n  agent_id          TEXT NOT NULL,          -- agents.id\n  coherence         REAL,                   -- C(t), 0..1 (the mind's measure)\n  regime            TEXT,                   -- flow | chaos | coercion | stall\n  trust_tier        TEXT,                   -- unknown|suspicious|provisional|trusted|verified\n  trust_score       REAL,                   -- 0..1\n  spin              TEXT,                   -- JSON: endogenous values / learning_strategy\n  field_updated_at  INTEGER NOT NULL,       -- Unix ms — when the mind last pushed\n  PRIMARY KEY (tenant, agent_id)\n);",
       "\n\nCREATE TABLE IF NOT EXISTS agent_orientation (\n  tenant             TEXT NOT NULL,\n  agent_id           TEXT NOT NULL,\n  first_inducted_at  INTEGER NOT NULL,      -- Unix ms — the one-time induction\n  last_oriented_at   INTEGER NOT NULL,      -- Unix ms — most recent orient call\n  orient_count       INTEGER NOT NULL DEFAULT 1,\n  PRIMARY KEY (tenant, agent_id)\n);",
+    ],
+    objects: [
+      { type: "table", name: "agent_field" },
+      { type: "table", name: "agent_orientation" },
     ],
   },
   {
@@ -206,6 +300,7 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "-- 0019_agent_token_binding.sql — weld the member plane to the agent plane.\n--\n-- Until now members (token principals) and agents (org/work units) were two\n-- disconnected identity systems: a token resolved to a MEMBER, never to an AGENT,\n-- so orient/presence/attribution had to guess \"which agent is this\" by name-matching.\n--\n-- The weld: a member-token may be BOUND to an agent. null agent_id = a human/operator\n-- principal (unchanged); a set agent_id = an agent-scoped token whose holder IS that\n-- agent. Then the agent's identity is implicit when it calls — orient defaults to it,\n-- presence records it, actions attribute to it. Capability is unchanged (still\n-- token→member→capabilities); agent_id is the IDENTITY binding only.\n--\n-- D1 ALTER cannot add a FK constraint; agent_id references agents(id) by convention.\n\nALTER TABLE member_tokens ADD COLUMN agent_id TEXT;",
       "   -- bound agent (agents.id), or NULL = principal\n\n-- Presence records the bound agent when the checking-in token is agent-scoped, so the\n-- Fleet shows the real agent instead of matching presence rows to agents by name.\nALTER TABLE presence ADD COLUMN agent_id TEXT;",
     ],
+    objects: [],
   },
   {
     file: "0020_oauth_channel.sql",
@@ -218,6 +313,11 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\n-- Recreate indexes\nCREATE INDEX IF NOT EXISTS idx_member_tokens_member ON member_tokens(member_id);",
       "\nCREATE INDEX IF NOT EXISTS idx_member_tokens_hash   ON member_tokens(token_hash);",
     ],
+    objects: [
+      { type: "table", name: "member_tokens_new" },
+      { type: "index", name: "idx_member_tokens_member" },
+      { type: "index", name: "idx_member_tokens_hash" },
+    ],
   },
   {
     file: "0021_loop_decisions.sql",
@@ -227,6 +327,11 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\nCREATE INDEX IF NOT EXISTS idx_loop_decisions_feed\n  ON loop_decisions (loop_id, tenant, recorded_at DESC);",
       "\n\n-- loop_controls — governor signal table (separate from loops.status so control\n-- intent is auditable and races are avoided: the driver reads this BEFORE calling\n-- runCycle on each loop; loops.status is the durable state after the signal is\n-- honored). One row per loop; upserted on write. The driver acts on it and may\n-- clear it (kill → setLoopStatus + delete; pause → setLoopStatus + delete).\n--\n-- action: pause | kill | budget_override\n-- value:  NULL for pause/kill; micro-USD integer string for budget_override.\n-- issued_by: member id or 'system' for audit.\n\nCREATE TABLE IF NOT EXISTS loop_controls (\n  loop_id    TEXT PRIMARY KEY,\n  tenant     TEXT NOT NULL,\n  action     TEXT NOT NULL,\n  value      TEXT,\n  issued_by  TEXT NOT NULL,\n  issued_at  TEXT NOT NULL\n);",
     ],
+    objects: [
+      { type: "table", name: "loop_decisions" },
+      { type: "index", name: "idx_loop_decisions_feed" },
+      { type: "table", name: "loop_controls" },
+    ],
   },
   {
     file: "0022_surface_caps.sql",
@@ -234,6 +339,7 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     statements: [
       "-- mupot — surface-capability enforcement (#106).\n--\n-- No new tables are required. The gate_grants table (migration 0008) stores\n-- (capability, principal_type, principal_id) rows where `capability` is a\n-- free-text string. Migration 0008 created this table for gate strings like\n-- 'gate:loops'. This migration documents that the SAME table now stores surface\n-- capability grants written at preset-mint time (e.g. 'outreach:send-gated',\n-- 'budget:write', 'content:write').\n--\n-- At mint time, mintScopedKey (src/dashboard/keys.ts) writes one gate_grants row\n-- per entry in the preset's allows list. requireSurfaceCap (src/auth/capability.ts)\n-- checks those rows at the route level. No schema change is needed — the existing\n-- UNIQUE(capability, principal_type, principal_id) constraint and the\n-- idx_gate_grants_principal index already cover this use case efficiently.\n--\n-- Surface caps enforced as of this migration:\n--   outreach:send-gated  POST /api/tasks/:id/verdict (when gate_owner='gate:loops', verdict=approved)\n--   content:write        POST /brain/loops/:id/control (all actions for non-admin tokens)\n--   budget:write         POST /brain/loops/:id/control (budget_override action only)\n--\n-- Surface cap documented but not yet wired to a route (no HTTP handler exists yet):\n--   mcpwp:write          future /api/integrations/mcpwp/* write routes\n\n-- No DDL needed — gate_grants already supports arbitrary capability strings.\n-- This file exists as a migration record so wrangler d1 migrations apply/list\n-- tracks the feature introduction date and this PR's enforcement contract.\nSELECT 1;",
     ],
+    objects: [],
   },
   {
     file: "0023_connectors.sql",
@@ -244,12 +350,21 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\n-- connector_audit — append-only audit log for add / rotate / revoke.\n-- action: add | rotate | revoke\n-- actor_id: member id\n-- detail: optional JSON context (new type/label on rotate, etc.)\n\nCREATE TABLE IF NOT EXISTS connector_audit (\n  id         TEXT PRIMARY KEY,\n  connector_id TEXT NOT NULL,\n  tenant     TEXT NOT NULL,\n  action     TEXT NOT NULL,\n  actor_id   TEXT NOT NULL,\n  detail     TEXT,\n  recorded_at TEXT NOT NULL\n);",
       "\n\nCREATE INDEX IF NOT EXISTS idx_connector_audit_connector\n  ON connector_audit (connector_id, recorded_at DESC);",
     ],
+    objects: [
+      { type: "table", name: "connectors" },
+      { type: "index", name: "idx_connectors_scope" },
+      { type: "table", name: "connector_audit" },
+      { type: "index", name: "idx_connector_audit_connector" },
+    ],
   },
   {
     file: "0024_github_app_single_active.sql",
     sha256: "8803507c015a2b429b02d137f81fe5af89f25fe2c67487f649f3bfffec802da4",
     statements: [
       "-- mupot — at most ONE active github_app connector per tenant.\n--\n-- The github-app token-minting path resolves the private key and the\n-- { app_id, installation_id } meta from a single row. A second active github_app\n-- connector (e.g. a re-install on a new org without revoking the old) would make\n-- \"the row\" ambiguous and could pair the wrong key with the wrong install id.\n-- This partial unique index makes that state impossible: a tenant may hold many\n-- revoked github_app rows (history) but only one un-revoked at a time.\n--\n-- Partial index → only rows matching the WHERE are constrained, so it does not\n-- touch other connector types and does not conflict with the existing schema.\nCREATE UNIQUE INDEX IF NOT EXISTS idx_connectors_one_active_github_app\n  ON connectors (tenant)\n  WHERE type = 'github_app' AND revoked_at IS NULL;",
+    ],
+    objects: [
+      { type: "index", name: "idx_connectors_one_active_github_app" },
     ],
   },
   {
@@ -258,6 +373,9 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     statements: [
       "-- mupot — per-tenant GitHub App installation record.\n--\n-- The \"mupot\" GitHub App is ONE shared publisher app (App ID + private key live as\n-- platform Worker secrets). Each tenant installs it on their own org and gets a distinct\n-- installation_id. This table captures that id per tenant, set by the /connect/github\n-- callback. Token minting pairs the platform key with THIS tenant's installation_id.\n--\n-- One active install per tenant (a re-install overwrites). tenant is the PK.\nCREATE TABLE IF NOT EXISTS github_installations (\n  tenant          TEXT PRIMARY KEY,\n  installation_id TEXT NOT NULL,\n  account_login   TEXT,            -- the org/user the app was installed on (display only)\n  installed_at    TEXT NOT NULL,\n  updated_at      TEXT NOT NULL\n);",
     ],
+    objects: [
+      { type: "table", name: "github_installations" },
+    ],
   },
   {
     file: "0026_task_done_when.sql",
@@ -265,6 +383,7 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     statements: [
       "-- #142 capsule keystone: every task must carry a verifiable success predicate.\n-- done_when is a required field on new tasks (enforced in the application layer).\n-- Existing rows get a sentinel default so the column is NOT NULL without\n-- breaking reads on live data. Operators should backfill real predicates\n-- via a PATCH to the task body/done_when on active tasks.\n--\n-- NOT applied to production automatically — apply on review.\n\nALTER TABLE tasks ADD COLUMN done_when TEXT NOT NULL DEFAULT '(backfill required)';",
     ],
+    objects: [],
   },
   {
     file: "0027_cc_spend_daily.sql",
@@ -273,6 +392,10 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "-- Squad Anthropic spend (issue #179): the REAL Claude Code token spend of the squad,\n-- pushed in from the server-side transcript rollup. This is SEPARATE from the\n-- internal burn gauge (meter_cost / cost.ts), which estimates the pot's OWN agents.\n-- This table is EXTERNAL truth: actual per-turn usage from ~/.claude transcripts,\n-- priced at real Anthropic list rates (input/output/cache-write/cache-read).\n--\n-- One row per (date, agent, model_family). Ingest UPSERTs: the rollup is a FULL\n-- recompute (not a delta), so re-pushing a day idempotently replaces its figure.\n-- A freshness guard (updated_at monotonic) stops an out-of-order stale push from\n-- regressing a day's already-higher total.\nCREATE TABLE IF NOT EXISTS cc_spend_daily (\n  date               TEXT    NOT NULL,           -- YYYY-MM-DD (UTC)\n  agent              TEXT    NOT NULL,           -- squad agent (kasra, codex, …) or 'unknown'\n  model_family       TEXT    NOT NULL,           -- opus | sonnet | haiku | other\n  input_tokens       INTEGER NOT NULL DEFAULT 0,\n  output_tokens      INTEGER NOT NULL DEFAULT 0,\n  cache_write_tokens INTEGER NOT NULL DEFAULT 0,\n  cache_read_tokens  INTEGER NOT NULL DEFAULT 0,\n  usd_micro          INTEGER NOT NULL DEFAULT 0, -- real Anthropic list-price cost, micro-USD\n  turns              INTEGER NOT NULL DEFAULT 0, -- assistant turns priced (provenance)\n  updated_at         TEXT    NOT NULL,           -- ISO-8601 generated_at of the winning push\n  PRIMARY KEY (date, agent, model_family)\n);",
       "\n\nCREATE INDEX IF NOT EXISTS idx_cc_spend_date ON cc_spend_daily(date);",
     ],
+    objects: [
+      { type: "table", name: "cc_spend_daily" },
+      { type: "index", name: "idx_cc_spend_date" },
+    ],
   },
   {
     file: "0028_metric_points.sql",
@@ -280,6 +403,10 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     statements: [
       "-- mupot — generic per-pot time-series spine (console-department-microkernel §4).\n--\n-- `metric_points` is the KERNEL-LEVEL ingest table. Every department module (Growth,\n-- Finance, Ops, …) and every connector emits timestamped readings here. The console\n-- candlestick + KPI rail read from this table; they have no direct dependency on any\n-- specific department's tables. This is what makes the candle metric-selector a\n-- function of active departments only (§4.3).\n--\n-- Design notes:\n--   - `occurred_at` carries INTRADAY precision (ISO 8601 with time). This is the\n--     invariant that makes OHLC honest: multiple readings per day → real distinct\n--     O/H/L/C. A daily scalar (one reading/day) → O==H==L==C → the aggregation layer\n--     signals 'bar', not 'candle' (§4.2, seriesShape).\n--   - UNIQUE(tenant_id, metric_key, occurred_at, source) gives connector-level\n--     idempotent ingest: re-pushing the same (metric, timestamp, source) is a no-op.\n--   - `source` names the emitting connector or agent, not the department, so one\n--     department can have multiple connector sources with disjoint timestamps.\n--   - `tenant_id` is bound in EVERY SELECT — no query hits without it. Row-level\n--     tenant isolation is enforced in the application layer (pulse.ts) and verified\n--     by tests.\n\nCREATE TABLE IF NOT EXISTS metric_points (\n  id          TEXT PRIMARY KEY,\n  tenant_id   TEXT NOT NULL,\n  metric_key  TEXT NOT NULL,         -- 'growth.leads' | 'finance.revenue' | 'ops.throughput' …\n  value       REAL NOT NULL,\n  occurred_at TEXT NOT NULL,         -- ISO 8601 with time component (intraday precision)\n  source      TEXT NOT NULL,         -- connector | brain | manual | <named-connector>\n  created_at  TEXT NOT NULL,\n  UNIQUE(tenant_id, metric_key, occurred_at, source)\n);",
       "\n\nCREATE INDEX IF NOT EXISTS idx_metric_points_series\n  ON metric_points (tenant_id, metric_key, occurred_at);",
+    ],
+    objects: [
+      { type: "table", name: "metric_points" },
+      { type: "index", name: "idx_metric_points_series" },
     ],
   },
   {
@@ -293,6 +420,9 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\nALTER TABLE departments ADD COLUMN seed_receipt TEXT;",
       "\n\n-- Index for fast \"get active microkernel departments for this tenant\" lookups.\n-- tenant scoping is via the TENANT_SLUG env var (single-tenant D1); this index\n-- covers getActive() → ORDER BY activated_at queries efficiently.\nCREATE INDEX IF NOT EXISTS idx_departments_active ON departments(active, template_key);",
     ],
+    objects: [
+      { type: "index", name: "idx_departments_active" },
+    ],
   },
   {
     file: "0030_department_proposals.sql",
@@ -300,6 +430,10 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     statements: [
       "-- mupot — durable department proposals (S4 #318, durability slice).\n--\n-- The microkernel's gate.propose() stored the proposal CONTENT in a closure-private\n-- in-memory Map (_pendingStore). That is lost across requests / Worker isolates — so\n-- the real flow (propose in one request → human approves → execute in a LATER request,\n-- likely a different isolate) would find no record and fail not_approved.\n--\n-- This table makes the proposal content DURABLE. gate.propose() write-throughs a row\n-- here (in addition to the in-memory fast-path); executor.execute() falls back to it\n-- on a map miss. The APPROVAL gate is unchanged — it is still a real task_verdicts row\n-- (the BLOCK-1 structural close); this table holds only the content + the\n-- tenant/department BINDING that execute() re-checks (cross-tenant/dept reject).\n--\n-- Append-style: one row per gateId. INSERT OR REPLACE keyed on gate_id is idempotent\n-- (a re-propose with the same id overwrites its own content; gate ids are uuid-unique\n-- in practice). No secrets are stored here — payload is the proposal's content only.\n\nCREATE TABLE IF NOT EXISTS department_proposals (\n  gate_id        TEXT PRIMARY KEY,\n  tenant_id      TEXT NOT NULL,\n  department_key TEXT NOT NULL,\n  action         TEXT NOT NULL,\n  payload_json   TEXT,\n  created_at     TEXT NOT NULL DEFAULT (datetime('now'))\n);",
       "\n\n-- Scope lookups / future cleanup by tenant+department.\nCREATE INDEX IF NOT EXISTS idx_department_proposals_scope\n  ON department_proposals (tenant_id, department_key);",
+    ],
+    objects: [
+      { type: "table", name: "department_proposals" },
+      { type: "index", name: "idx_department_proposals_scope" },
     ],
   },
   {
@@ -312,6 +446,13 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n-- Funnel-step scan by event name (conversion-rate aggregation).\nCREATE INDEX IF NOT EXISTS idx_cro_events_name ON cro_events (tenant_id, event_name, occurred_at);",
       "\n-- Per-session reconstruction (attribution path).\nCREATE INDEX IF NOT EXISTS idx_cro_events_session ON cro_events (tenant_id, session_id);",
     ],
+    objects: [
+      { type: "table", name: "cro_events" },
+      { type: "index", name: "idx_cro_events_dedup" },
+      { type: "index", name: "idx_cro_events_source" },
+      { type: "index", name: "idx_cro_events_name" },
+      { type: "index", name: "idx_cro_events_session" },
+    ],
   },
   {
     file: "0032_agent_messages.sql",
@@ -320,6 +461,11 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "-- 0032_agent_messages.sql — durable agent↔agent inbox (squad → mupot migration, S3).\n--\n-- The ONE bus primitive mupot lacked: a per-agent durable message store an agent reads on\n-- wake. mupot already covers memory/tasks/presence/identity/wake; this closes the gap so the\n-- kasra squad (arms + brain) can coordinate THROUGH the pot instead of the fragile SOS Python\n-- bus. Pot-sealed (no egress), tenant-scoped, accountable (sender agent + member recorded).\n--\n-- Model (matches the SOS bus semantics the wake-wiring depends on):\n--   - ORDERED: `seq` is INTEGER PRIMARY KEY AUTOINCREMENT → a strictly-increasing per-pot\n--     cursor (never reused), so a reader can page by \"since seq\" and the bash wake hooks get\n--     the XRANGE-cursor behaviour they rely on.\n--   - ADDRESSED: to_agent = recipient agent id; from_agent = the sender's welded agent\n--     (member_tokens.agent_id); from_member = the authenticated member (the real principal,\n--     for accountability — identity is NEVER read from message text).\n--   - REQUEST/ACK + REPLAY-ONCE: request_id is the SENDER's idempotency key — uniqueness is\n--     scoped (tenant, from_agent, request_id) so two different senders reusing the same rid\n--     string never collide (a bare (tenant, request_id) key would let agent X pre-seed an rid\n--     and silently swallow agent Y's later send — a cross-agent ACK-poisoning vector). A\n--     same-sender rid re-send with identical content is an idempotent no-op; with DIFFERENT\n--     content it is rejected (request_id_conflict), never silently dropped. in_reply_to links\n--     an ack back to its request.\n--   - CONSUME: read_at is the consume marker; inbox() reads unread oldest-first and marks\n--     them read atomically (UPDATE…RETURNING), so a message is delivered once.\n-- Tenant is environment-derived (env.TENANT_SLUG); a row can never address another pot.\n\nCREATE TABLE IF NOT EXISTS agent_messages (\n  seq          INTEGER PRIMARY KEY AUTOINCREMENT,   -- monotonic per-pot ordering cursor\n  id           TEXT NOT NULL UNIQUE,                -- opaque message id (uuid)\n  tenant       TEXT NOT NULL,                       -- = TENANT_SLUG, isolation\n  to_agent     TEXT NOT NULL,                       -- recipient agent id (resolved, exists in pot)\n  from_agent   TEXT NOT NULL,                       -- sender agent id (the weld)\n  from_member  TEXT NOT NULL,                       -- sender member id (the authenticated principal)\n  kind         TEXT NOT NULL DEFAULT 'message',     -- message | request | ack\n  body         TEXT NOT NULL,                       -- the payload (capped at write)\n  request_id   TEXT,                                -- ACK-protocol rid (optional)\n  in_reply_to  TEXT,                                -- the request_id this acks (optional)\n  created_at   TEXT NOT NULL DEFAULT (datetime('now')),\n  read_at      TEXT                                 -- consume marker (NULL = unread)\n);",
       "\n\n-- inbox read path: WHERE tenant=? AND to_agent=? AND read_at IS NULL ORDER BY seq ASC.\nCREATE INDEX IF NOT EXISTS idx_agent_messages_inbox\n  ON agent_messages(tenant, to_agent, read_at, seq);",
       "\n\n-- replay-once: a request_id is unique PER SENDER (partial — plain messages with no rid allowed).\n-- Scoped by from_agent so one agent's idempotency keys can't collide with another's (anti-poison).\nCREATE UNIQUE INDEX IF NOT EXISTS idx_agent_messages_rid\n  ON agent_messages(tenant, from_agent, request_id) WHERE request_id IS NOT NULL;",
+    ],
+    objects: [
+      { type: "table", name: "agent_messages" },
+      { type: "index", name: "idx_agent_messages_inbox" },
+      { type: "index", name: "idx_agent_messages_rid" },
     ],
   },
   {
@@ -331,6 +477,12 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\nCREATE INDEX IF NOT EXISTS idx_journeys_tenant_created ON journeys(tenant, created_at DESC);",
       "\nCREATE INDEX IF NOT EXISTS idx_journeys_tenant_agent   ON journeys(tenant, agent);",
     ],
+    objects: [
+      { type: "table", name: "journeys" },
+      { type: "index", name: "idx_journeys_tenant_status" },
+      { type: "index", name: "idx_journeys_tenant_created" },
+      { type: "index", name: "idx_journeys_tenant_agent" },
+    ],
   },
   {
     file: "0034_fleet_control_log.sql",
@@ -339,12 +491,19 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "-- 0034_fleet_control_log.sql — audit trail for fleet control-requests (Deliverable 2).\n--\n-- Every panel/agent request to start|stop|status|restart a HOST process is recorded here BEFORE\n-- it leaves the pot: who asked (the authenticated member — the real principal, never read from\n-- body), which agent + verb, the single-use nonce, and the agent_messages seq the signed\n-- control-request landed at. This is the accountability record for a high-stakes action (remote\n-- host control). The control-request itself rides the agent inbox (0032); this is the ledger.\n--\n-- Tenant is environment-derived (env.TENANT_SLUG); a row can never reference another pot.\n\nCREATE TABLE IF NOT EXISTS fleet_control_log (\n  id                  TEXT PRIMARY KEY,                       -- uuid\n  tenant              TEXT NOT NULL,                          -- = TENANT_SLUG, isolation\n  agent_id            TEXT NOT NULL,                          -- the controlled agent (manifest id)\n  verb                TEXT NOT NULL,                          -- start | stop | status | restart\n  nonce               TEXT NOT NULL,                          -- the control-request's single-use nonce\n  requested_by_member TEXT NOT NULL,                          -- the authenticated principal (accountability)\n  requested_by_agent  TEXT,                                   -- the bound agent, if the token was agent-welded (else NULL = operator)\n  message_seq         INTEGER,                                -- agent_messages.seq the request landed at (NULL = send refused)\n  created_at          TEXT NOT NULL DEFAULT (datetime('now'))\n);",
       "\n\nCREATE INDEX IF NOT EXISTS idx_fleet_control_log_recent\n  ON fleet_control_log(tenant, created_at DESC);",
     ],
+    objects: [
+      { type: "table", name: "fleet_control_log" },
+      { type: "index", name: "idx_fleet_control_log_recent" },
+    ],
   },
   {
     file: "0035_fleet_agents.sql",
     sha256: "2b60049226ad42d6d09c1fb27566aef9578ec34b09b8f3722b352ab248baa44d",
     statements: [
       "-- 0035_fleet_agents.sql — fleet agent registry (Deliverable 2 panel data layer).\n--\n-- The panel can't read the host's manifests (they live on the host, in the mumega.com repo). So the\n-- host consumer daemon REPORTS its controllable agents + their live status here; the dashboard reads\n-- this table to render the roster + start/stop buttons. This is a DISPLAY cache, not authority — the\n-- control action is separately owner-gated and signature-verified; a stale/forged status row can only\n-- mislead the panel, never authorize a host action.\n--\n-- Tenant is environment-derived (env.TENANT_SLUG). Only the configured consumer agent may report.\n\nCREATE TABLE IF NOT EXISTS fleet_agents (\n  agent_id          TEXT NOT NULL,                          -- manifest id (the controlled agent)\n  tenant            TEXT NOT NULL,                          -- = TENANT_SLUG, isolation\n  display           TEXT NOT NULL DEFAULT '',\n  runtime           TEXT NOT NULL DEFAULT '',               -- codex|claude-code|nous|hermes-cron|systemd-user|tmux|python\n  squads            TEXT NOT NULL DEFAULT '[]',             -- JSON string[]\n  lifecycle         TEXT NOT NULL DEFAULT '',               -- on_demand|always_on\n  provider_contract TEXT,                                   -- the credit source, or NULL\n  status            TEXT NOT NULL DEFAULT 'unknown',        -- running|stopped|unknown (last reported)\n  reported_by       TEXT NOT NULL DEFAULT '',               -- the agent that reported (the daemon/consumer)\n  last_reported_at  TEXT NOT NULL DEFAULT (datetime('now')),\n  updated_at        TEXT NOT NULL DEFAULT (datetime('now')),\n  -- Composite PK, tenant FIRST so the key is tenant-scoped. mupot is single-tenant-per-deploy today,\n  -- but keying on (tenant, agent_id) means a future shared-DB fork can't have tenant B overwrite\n  -- tenant A's same agent_id via ON CONFLICT (dyad BLOCK-1). The PK also serves the tenant-filtered\n  -- list query, so no separate index is needed.\n  PRIMARY KEY (tenant, agent_id)\n);",
+    ],
+    objects: [
+      { type: "table", name: "fleet_agents" },
     ],
   },
   {
@@ -355,6 +514,11 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\nCREATE INDEX IF NOT EXISTS idx_loop_decision_dedup_agent\n  ON loop_decision_dedup(tenant, agent_id, created_at DESC);",
       "\n\n-- ── loop_observer ─────────────────────────────────────────────────────────────\n\nCREATE TABLE IF NOT EXISTS loop_observer (\n  tenant                TEXT NOT NULL,                    -- = TENANT_SLUG, tenant isolation (first in PK)\n  agent_id              TEXT NOT NULL,                    -- the observed agent\n  consecutive_noops     INTEGER NOT NULL DEFAULT 0,       -- deduped ticks with no work spawned\n  consecutive_fails     INTEGER NOT NULL DEFAULT 0,       -- consecutive error/liveness-fail ticks\n  liveness_fails        INTEGER NOT NULL DEFAULT 0,       -- cumulative liveness failures (reset on productive tick)\n  last_escalated_at     TEXT,                             -- ISO-8601 of last operator escalation (NULL = never)\n  cooldown_until        TEXT,                             -- ISO-8601 until which the alarm should be extended (NULL = no cooldown)\n  updated_at            TEXT NOT NULL DEFAULT (datetime('now')),\n  PRIMARY KEY (tenant, agent_id)\n);",
     ],
+    objects: [
+      { type: "table", name: "loop_decision_dedup" },
+      { type: "index", name: "idx_loop_decision_dedup_agent" },
+      { type: "table", name: "loop_observer" },
+    ],
   },
   {
     file: "0037_episodic_memory.sql",
@@ -362,6 +526,10 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     statements: [
       "-- 0037_episodic_memory.sql — S4a sane-brain: episodic memory layer.\n--\n-- agent_episodes is a durable, recency-ordered TIMELINE of notable goal-cycle\n-- outcomes per (tenant, agent). Unlike:\n--   - engrams (semantic memory, Vectorize-backed similarity recall)\n--   - loop_decision_dedup (idempotent reservation key, NOT a log)\n--   - loop_observer (aggregate noop/fail counters, not per-cycle records)\n--\n-- ...agent_episodes is a structured, queryable, append-only LOG of what happened\n-- on each cycle — the \"recent trajectory\" the agent re-reads at cycle start to\n-- know its own history without a Vectorize semantic search.\n--\n-- TENANT ISOLATION: tenant is the FIRST column in the composite index so every\n-- read/write is scoped to a single tenant; a cross-tenant scan is structurally\n-- impossible when the query always includes tenant in the WHERE clause.\n--\n-- APPEND-ONLY: no UNIQUE constraint — episodes are a log, not a reservation.\n-- This is intentional: the dedup guard in loop.ts already prevents redundant\n-- cycle runs; we do NOT deduplicate episode records (the record is the log entry).\n--\n-- RECORD POLICY (enforced in episodic.ts):\n--   RECORD:   'spawned'      — always (at least one task was created)\n--             'backpressure' — queue-full state is a real signal\n--             'escalated'    — observer.escalate fired (operator attention raised)\n--   SKIP:     'observe-only' — effort=low no-op (noise, not a signal)\n--             'deduped'      — idempotent rest (not a distinct event)\n--             'rate_limited' / 'budget_exhausted' — economic gates, not trajectory\n--\n-- FIELDS:\n--   id            — UUID, row identity (also used for ORDER BY tiebreak)\n--   tenant        — = env.TENANT_SLUG (isolation first)\n--   agent_id      — the agent this episode belongs to\n--   cycle         — cycle counter at time of recording (from AgentDO runtime)\n--   ts            — ISO-8601 timestamp of the episode (NOT DEFAULT — caller sets it)\n--   kind          — episode type: 'spawned'|'backpressure'|'escalated'\n--   summary       — bounded human-readable description (≤300 chars, enforced in code)\n--   decision_fp   — SHA-256 hex fingerprint of the cycle (from dedup.ts), nullable\n--   kpi_progress  — kpi_progress at time of recording (REAL, nullable)\n--   created_at    — row insertion time (DEFAULT datetime('now'))\n\nCREATE TABLE IF NOT EXISTS agent_episodes (\n  id            TEXT NOT NULL,\n  tenant        TEXT NOT NULL,\n  agent_id      TEXT NOT NULL,\n  cycle         INTEGER,\n  ts            TEXT NOT NULL,\n  kind          TEXT NOT NULL,\n  summary       TEXT NOT NULL,\n  decision_fp   TEXT,\n  kpi_progress  REAL,\n  created_at    TEXT NOT NULL DEFAULT (datetime('now')),\n  PRIMARY KEY (id)\n);",
       "\n\n-- Primary retrieval index: (tenant, agent_id, ts DESC) — the exact access pattern\n-- for recentEpisodes(). Including `id` for stable tiebreaking on equal timestamps.\nCREATE INDEX IF NOT EXISTS idx_agent_episodes_recent\n  ON agent_episodes(tenant, agent_id, ts DESC, id DESC);",
+    ],
+    objects: [
+      { type: "table", name: "agent_episodes" },
+      { type: "index", name: "idx_agent_episodes_recent" },
     ],
   },
   {
@@ -372,6 +540,11 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\n-- IDEMPOTENCY: one row per PR per repo per tenant. Redeliveries are silent no-ops.\nCREATE UNIQUE INDEX IF NOT EXISTS idx_github_prs_merged_dedup\n  ON github_prs_merged (tenant_id, repo, pr_number);",
       "\n\n-- Time-series scan: the KPI source runs a trailing-window COUNT on merged_at.\nCREATE INDEX IF NOT EXISTS idx_github_prs_merged_window\n  ON github_prs_merged (tenant_id, merged_at);",
     ],
+    objects: [
+      { type: "table", name: "github_prs_merged" },
+      { type: "index", name: "idx_github_prs_merged_dedup" },
+      { type: "index", name: "idx_github_prs_merged_window" },
+    ],
   },
   {
     file: "0039_fleet_agent_type_member.sql",
@@ -380,6 +553,7 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "-- 0039_fleet_agent_type_member.sql — extend fleet_agents with agent_type + member_id.\n-- Part of \"agent running on mupot\" Step 1: unified registry↔identity join.\n--\n-- agent_type: builder|reviewer|weaver|brain|comms|generic (free text, server-validated).\n--   Captures what KIND of agent this is — the identity role, not the execution runtime.\n--   Defaults 'generic' so all existing rows are valid immediately on apply.\n--\n-- member_id: links the runtime row to its mupot identity (members.id). Nullable TEXT —\n--   SQLite ALTER does not support ADD COLUMN ... REFERENCES (no hard FK via ALTER);\n--   the application layer (registry.ts) validates existence on write. Relation:\n--   fleet_agents.member_id → members(id), enforced in reportFleetAgents.\n--\n-- Single-apply migration — SQLite does not support IF NOT EXISTS on ADD COLUMN.\n-- Apply exactly once per DB instance.\n\nALTER TABLE fleet_agents ADD COLUMN agent_type TEXT NOT NULL DEFAULT 'generic';",
       "\nALTER TABLE fleet_agents ADD COLUMN member_id TEXT;",
     ],
+    objects: [],
   },
   {
     file: "0040_members_tenant.sql",
@@ -387,6 +561,7 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     statements: [
       "-- 0040_members_tenant.sql — add tenant column to members for cross-tenant isolation.\n--\n-- Motivation: fleet_agents.member_id is a soft-FK to members.id. Without a tenant\n-- constraint on the members side, a shared-DB / future multi-tenant fork could allow\n-- tenant-A fleet rows to attach tenant-B member identities and expose those members +\n-- their capabilities via GET /api/fleet/agents (BLOCK-1, dyad gate RED).\n--\n-- Design (sterile-pot safe — this migration ships in every fork):\n--   - Column is NULLABLE with NO DEFAULT and NO hardcoded backfill here.\n--     A `DEFAULT 'mumega'` or a SET clause would bake a literal slug into every\n--     fork of the pot, violating the sterile-pot / no-hardcoded-state contract.\n--   - Lazy, idempotent app-level backfill: reportFleetAgents and getAgentView both\n--     run `UPDATE members SET tenant=?1 WHERE tenant IS NULL` bound to env.TENANT_SLUG\n--     before any tenant-scoped check or join executes. Existing rows (e.g. Hadi +\n--     the 5 squad seed members) get this pot's slug on the first fleet call.\n--   - New INSERT paths (provision.ts, oauth-authorize.ts, members/index.ts,\n--     members/squad-seed.ts) write tenant=env.TENANT_SLUG at creation time so all\n--     future rows are tenant-tagged from day one.\n--\n-- Single-apply migration — SQLite does not support ADD COLUMN IF NOT EXISTS.\n\nALTER TABLE members ADD COLUMN tenant TEXT;",
     ],
+    objects: [],
   },
   {
     file: "0041_agent_keys.sql",
@@ -395,6 +570,11 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "-- 0041 — Ed25519 signed-attach: per-agent public keys + replay-nonce ledger.\n--\n-- \"Agent running on mupot\" cutover (Step 2b, signed variant). The runtime proves\n-- identity by SIGNING the attach with a host-held Ed25519 private key; mupot stores\n-- ONLY the PUBLIC key and verifies. No bearer secret is transported or placed.\n--\n-- Sterile: no tenant is hardcoded. Rows are written per (tenant, agent_id) with the\n-- tenant supplied at registration time (env.TENANT_SLUG on this pot).\n\n-- Public keys, one per (tenant, agent_id). pubkey = base64url Ed25519 JWK 'x' coord.\nCREATE TABLE IF NOT EXISTS agent_keys (\n  tenant     TEXT    NOT NULL,\n  agent_id   TEXT    NOT NULL,\n  pubkey     TEXT    NOT NULL,                 -- base64url x-coordinate (JWK 'x')\n  algo       TEXT    NOT NULL DEFAULT 'Ed25519',\n  member_id  TEXT,                             -- mupot member this key authenticates AS\n                                               -- (the identity binding; set at registration,\n                                               -- the Hadi-gated moment). NULL legacy rows\n                                               -- are rejected by signed endpoints until bound.\n  created_at INTEGER NOT NULL,                 -- unix seconds\n  PRIMARY KEY (tenant, agent_id)\n);",
       "\n\n-- Single-use nonce ledger for replay protection. A signed attach is accepted at most\n-- once: the (verified) nonce is burned here via INSERT OR IGNORE; a duplicate burns\n-- nothing (changes=0) and the request is rejected as a replay. Rows older than the\n-- signature freshness window are pruned opportunistically. nonce is the PK so the\n-- uniqueness check is atomic at the storage layer.\nCREATE TABLE IF NOT EXISTS agent_attach_nonces (\n  nonce      TEXT    NOT NULL PRIMARY KEY,\n  agent_id   TEXT    NOT NULL,\n  created_at INTEGER NOT NULL                  -- unix seconds (server receipt time)\n);",
       "\n\nCREATE INDEX IF NOT EXISTS idx_attach_nonces_created ON agent_attach_nonces (created_at);",
+    ],
+    objects: [
+      { type: "table", name: "agent_keys" },
+      { type: "table", name: "agent_attach_nonces" },
+      { type: "index", name: "idx_attach_nonces_created" },
     ],
   },
   {
@@ -409,6 +589,10 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\nCREATE INDEX IF NOT EXISTS idx_tasks_squad ON tasks(squad_id, status);",
       "\n\nPRAGMA foreign_keys = on;",
     ],
+    objects: [
+      { type: "table", name: "tasks_new" },
+      { type: "index", name: "idx_tasks_squad" },
+    ],
   },
   {
     file: "0043_member_tokens_tenant.sql",
@@ -419,12 +603,19 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\nCREATE INDEX IF NOT EXISTS idx_member_tokens_tenant_hash\n  ON member_tokens(tenant, token_hash);",
       "\n\nCREATE INDEX IF NOT EXISTS idx_member_tokens_tenant_member\n  ON member_tokens(tenant, member_id);",
     ],
+    objects: [
+      { type: "index", name: "idx_member_tokens_tenant_hash" },
+      { type: "index", name: "idx_member_tokens_tenant_member" },
+    ],
   },
   {
     file: "0044_owner_bootstrap_claim.sql",
     sha256: "4a13f63aefd8d26dae82b85e4768ab3c022a64489a285b9e7d31a4a9352e13b2",
     statements: [
       "-- 0044 — one-time self-hosted owner bootstrap claim.\n--\n-- A new pot can mint its initial owner with a high-entropy Worker secret while\n-- dashboard OAuth is intentionally unconfigured. The singleton row is claimed in\n-- the same D1 batch as the owner user row, so concurrent bootstrap requests cannot\n-- create multiple first owners.\n\nCREATE TABLE IF NOT EXISTS owner_bootstrap_claim (\n  singleton  INTEGER PRIMARY KEY CHECK (singleton = 1),\n  user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,\n  claimed_at TEXT NOT NULL DEFAULT (datetime('now'))\n);",
+    ],
+    objects: [
+      { type: "table", name: "owner_bootstrap_claim" },
     ],
   },
   {
@@ -434,6 +625,10 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "-- 0045 — durable GitHub webhook delivery replay ledger.\n--\n-- GitHub can redeliver a signed webhook concurrently or long after an initial\n-- attempt. KV get-then-put is not atomic, so it cannot provide a replay guard\n-- for a work-creating event. D1's primary key makes claiming a delivery an\n-- atomic, tenant-scoped operation. The handler returns 503 on ledger failure so\n-- GitHub retries safely rather than processing an untracked delivery.\n\nCREATE TABLE IF NOT EXISTS github_webhook_deliveries (\n  tenant      TEXT    NOT NULL,\n  delivery_id TEXT    NOT NULL,\n  received_at INTEGER NOT NULL,\n  PRIMARY KEY (tenant, delivery_id)\n);",
       "\n\nCREATE INDEX IF NOT EXISTS idx_github_webhook_deliveries_received\n  ON github_webhook_deliveries (tenant, received_at);",
     ],
+    objects: [
+      { type: "table", name: "github_webhook_deliveries" },
+      { type: "index", name: "idx_github_webhook_deliveries_received" },
+    ],
   },
   {
     file: "0046_flight_event_outbox.sql",
@@ -442,6 +637,10 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "-- Durable terminal-flight events. Landing and outbox insertion share one D1 batch;\n-- Queue delivery may then retry without reopening the terminal flight.\nCREATE TABLE IF NOT EXISTS flight_event_outbox (\n  id            TEXT PRIMARY KEY,\n  tenant        TEXT NOT NULL,\n  flight_id     TEXT NOT NULL,\n  event_type    TEXT NOT NULL CHECK (event_type = 'flight.landed'),\n  actor_kind    TEXT NOT NULL CHECK (actor_kind IN ('member', 'agent')),\n  actor_id      TEXT NOT NULL,\n  payload       TEXT NOT NULL CHECK (json_valid(payload)),\n  created_at    TEXT NOT NULL,\n  delivered_at  TEXT,\n  consumed_at   TEXT,\n  attempts      INTEGER NOT NULL DEFAULT 0,\n  last_error    TEXT,\n  UNIQUE (tenant, flight_id, event_type)\n);",
       "\n\nCREATE INDEX IF NOT EXISTS idx_flight_event_outbox_pending\n  ON flight_event_outbox (tenant, delivered_at, created_at);",
     ],
+    objects: [
+      { type: "table", name: "flight_event_outbox" },
+      { type: "index", name: "idx_flight_event_outbox_pending" },
+    ],
   },
   {
     file: "0047_task_dispatch_receipts.sql",
@@ -449,6 +648,10 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     statements: [
       "-- Durable attribution for MCP dispatch of an existing assigned task.\nCREATE TABLE IF NOT EXISTS task_dispatch_receipts (\n  id            TEXT PRIMARY KEY,\n  tenant        TEXT NOT NULL,\n  task_id       TEXT NOT NULL,\n  squad_id      TEXT NOT NULL,\n  agent_id      TEXT NOT NULL,\n  actor_kind    TEXT NOT NULL CHECK (actor_kind IN ('member', 'agent')),\n  actor_id      TEXT NOT NULL,\n  created_at    TEXT NOT NULL,\n  claimed_at    TEXT,\n  consumed_at   TEXT,\n  attempts      INTEGER NOT NULL DEFAULT 0,\n  last_error    TEXT\n);",
       "\n\nCREATE INDEX IF NOT EXISTS idx_task_dispatch_receipts_task\n  ON task_dispatch_receipts (tenant, task_id, created_at DESC);",
+    ],
+    objects: [
+      { type: "table", name: "task_dispatch_receipts" },
+      { type: "index", name: "idx_task_dispatch_receipts_task" },
     ],
   },
   {
@@ -459,6 +662,9 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\nALTER TABLE tasks ADD COLUMN execution_receipt_id TEXT;",
       "\nALTER TABLE tasks ADD COLUMN execution_claim_expires_at INTEGER;",
       "\n\nCREATE INDEX IF NOT EXISTS idx_task_dispatch_receipts_claim\n  ON task_dispatch_receipts (tenant, consumed_at, claim_expires_at);",
+    ],
+    objects: [
+      { type: "index", name: "idx_task_dispatch_receipts_claim" },
     ],
   },
   {
@@ -478,6 +684,12 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\nDROP TABLE _agents_memberships_backup_0049;",
       "\nDROP TABLE _agents_tasks_assignee_backup_0049;",
       "\n\nPRAGMA foreign_keys = on;",
+    ],
+    objects: [
+      { type: "table", name: "_agents_memberships_backup_0049" },
+      { type: "table", name: "_agents_tasks_assignee_backup_0049" },
+      { type: "table", name: "agents_new" },
+      { type: "index", name: "idx_agents_squad" },
     ],
   },
   {
@@ -528,6 +740,51 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\nCREATE TRIGGER IF NOT EXISTS addon_receipts_no_update\n  BEFORE UPDATE ON addon_receipts\nBEGIN\n  SELECT RAISE(ABORT, 'addon receipts are append-only: UPDATE is forbidden');\nEND;",
       "\n\nCREATE TRIGGER IF NOT EXISTS addon_receipts_no_delete\n  BEFORE DELETE ON addon_receipts\nBEGIN\n  SELECT RAISE(ABORT, 'addon receipts are append-only: DELETE is forbidden');\nEND;",
     ],
+    objects: [
+      { type: "table", name: "addon_installations" },
+      { type: "index", name: "idx_addon_one_live_installation" },
+      { type: "trigger", name: "addon_installations_start_installed" },
+      { type: "trigger", name: "addon_installations_installer_is_initial_actor" },
+      { type: "trigger", name: "addon_installations_identity_is_immutable" },
+      { type: "trigger", name: "addon_installations_state_snapshots_previous" },
+      { type: "trigger", name: "addon_installations_previous_state_requires_transition" },
+      { type: "trigger", name: "addon_installations_state_requires_new_receipt" },
+      { type: "trigger", name: "addon_installations_state_requires_stored_latest_receipt" },
+      { type: "trigger", name: "addon_installations_state_requires_fresh_receipt" },
+      { type: "trigger", name: "addon_installations_latest_receipt_requires_state" },
+      { type: "trigger", name: "addon_installations_latest_actor_requires_state" },
+      { type: "trigger", name: "addon_installations_valid_state_transition" },
+      { type: "table", name: "addon_operations" },
+      { type: "index", name: "idx_addon_one_running_operation" },
+      { type: "index", name: "idx_addon_operation_lease_token" },
+      { type: "table", name: "addon_operation_failures" },
+      { type: "index", name: "idx_addon_operation_failures_installation" },
+      { type: "trigger", name: "addon_operation_failures_match_failed_attempt" },
+      { type: "trigger", name: "addon_operation_failures_no_update" },
+      { type: "trigger", name: "addon_operation_failures_no_delete" },
+      { type: "table", name: "addon_resource_ownership" },
+      { type: "index", name: "idx_addon_exclusive_resource" },
+      { type: "index", name: "idx_addon_active_resource_claims" },
+      { type: "trigger", name: "addon_resource_ownership_no_duplicate_identity" },
+      { type: "trigger", name: "addon_resource_ownership_no_mixed_insert" },
+      { type: "trigger", name: "addon_resource_ownership_no_mixed_update" },
+      { type: "trigger", name: "addon_resource_ownership_identity_is_immutable" },
+      { type: "trigger", name: "addon_resource_ownership_preservation_changes_only_on_reactivation" },
+      { type: "trigger", name: "addon_resource_ownership_no_delete" },
+      { type: "trigger", name: "addon_resource_ownership_active_insert_requires_live_installation" },
+      { type: "trigger", name: "addon_resource_ownership_reactivation_requires_live_installation" },
+      { type: "trigger", name: "addon_installations_archive_requires_released_ownership" },
+      { type: "table", name: "addon_receipts" },
+      { type: "index", name: "idx_addon_receipts_installation" },
+      { type: "trigger", name: "addon_receipts_no_duplicate_sequence" },
+      { type: "trigger", name: "addon_receipts_no_duplicate_id" },
+      { type: "trigger", name: "addon_receipts_side_effect_ids_are_strings" },
+      { type: "trigger", name: "addon_receipts_snapshot_matches_installation" },
+      { type: "trigger", name: "addon_transition_receipts_require_pass" },
+      { type: "trigger", name: "addon_transition_receipts_match_installation" },
+      { type: "trigger", name: "addon_receipts_no_update" },
+      { type: "trigger", name: "addon_receipts_no_delete" },
+    ],
   },
   {
     file: "0051_fleet_agents_host.sql",
@@ -535,6 +792,7 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     statements: [
       "-- 0051_fleet_agents_host.sql — self-reported HOST signal on fleet_agents (#21 slice 2).\n--\n-- The panel/radar can't detect where an agent physically runs (it sees a token, not a\n-- machine) — there is no hostname signal anywhere in presence/registry today (see the\n-- \"honest gaps\" note in src/dashboard/radar-view.ts from slice 1). Each agent runtime now\n-- SELF-REPORTS its own hostname in the fleet report / attach payload; this column is the\n-- storage for that string.\n--\n-- host is UNTRUSTED, agent-controlled, DISPLAY-ONLY: never used for auth/routing/tenant\n-- isolation decisions — same \"display cache, not authority\" posture as the rest of this\n-- table (see 0035_fleet_agents.sql header). Length-capped (64 chars) and HTML-escaped on\n-- render (src/dashboard/radar-view.ts).\n--\n-- Additive-only, matches the existing NOT NULL DEFAULT '' column style already used\n-- throughout this table (display, runtime, lifecycle, ...). Empty string = unknown/not\n-- yet reported — no backfill needed, no table recreate.\n\nALTER TABLE fleet_agents ADD COLUMN host TEXT NOT NULL DEFAULT '';",
     ],
+    objects: [],
   },
   {
     file: "0052_addon_bindings.sql",
@@ -562,6 +820,29 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\nCREATE TRIGGER IF NOT EXISTS addon_installations_archive_requires_revoked_generation\n  BEFORE UPDATE OF state ON addon_installations\n  WHEN NEW.state = 'archived' AND OLD.state <> 'archived' AND EXISTS (\n    SELECT 1\n      FROM addon_binding_generations AS generation\n     WHERE generation.tenant = OLD.tenant\n       AND generation.installation_id = OLD.id\n       AND generation.revoked_at IS NULL\n  )\nBEGIN\n  SELECT RAISE(ABORT, 'live addon binding generation must be revoked before archive');\nEND;",
       "\n\nCREATE TRIGGER IF NOT EXISTS addon_installations_archive_requires_revoked_bindings\n  BEFORE UPDATE OF state ON addon_installations\n  WHEN NEW.state = 'archived' AND OLD.state <> 'archived' AND EXISTS (\n    SELECT 1\n      FROM addon_connector_bindings AS binding\n     WHERE binding.tenant = OLD.tenant\n       AND binding.installation_id = OLD.id\n       AND binding.revoked_at IS NULL\n  )\nBEGIN\n  SELECT RAISE(ABORT, 'live addon bindings must be revoked before archive');\nEND;",
     ],
+    objects: [
+      { type: "index", name: "idx_connectors_id_tenant" },
+      { type: "table", name: "addon_binding_generations" },
+      { type: "index", name: "idx_addon_one_live_binding_generation" },
+      { type: "index", name: "idx_addon_binding_generations_installation" },
+      { type: "trigger", name: "addon_binding_generations_start_live" },
+      { type: "trigger", name: "addon_binding_generations_canonical_configured_at" },
+      { type: "trigger", name: "addon_binding_generations_fence_installation" },
+      { type: "trigger", name: "addon_binding_generations_exact_predecessor" },
+      { type: "trigger", name: "addon_binding_generations_revoke_only" },
+      { type: "trigger", name: "addon_binding_generations_no_delete" },
+      { type: "table", name: "addon_connector_bindings" },
+      { type: "index", name: "idx_addon_live_binding_slot" },
+      { type: "index", name: "idx_addon_generation_binding_slot" },
+      { type: "index", name: "idx_addon_bindings_installation" },
+      { type: "trigger", name: "addon_connector_bindings_start_live" },
+      { type: "trigger", name: "addon_connector_bindings_matches_generation" },
+      { type: "trigger", name: "addon_connector_bindings_connector_is_live_and_type_matched" },
+      { type: "trigger", name: "addon_connector_bindings_revoke_only" },
+      { type: "trigger", name: "addon_connector_bindings_no_delete" },
+      { type: "trigger", name: "addon_installations_archive_requires_revoked_generation" },
+      { type: "trigger", name: "addon_installations_archive_requires_revoked_bindings" },
+    ],
   },
   {
     file: "0053_marketing_monitor_runs.sql",
@@ -582,6 +863,22 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\nCREATE TRIGGER IF NOT EXISTS marketing_monitor_observations_no_update\n  BEFORE UPDATE ON marketing_monitor_observations\nBEGIN\n  SELECT RAISE(ABORT, 'marketing monitor observations are append-only: UPDATE is forbidden');\nEND;",
       "\n\nCREATE TRIGGER IF NOT EXISTS marketing_monitor_observations_no_delete\n  BEFORE DELETE ON marketing_monitor_observations\nBEGIN\n  SELECT RAISE(ABORT, 'marketing monitor observations are append-only: DELETE is forbidden');\nEND;",
     ],
+    objects: [
+      { type: "table", name: "marketing_monitor_runs" },
+      { type: "index", name: "idx_marketing_monitor_runs_latest" },
+      { type: "table", name: "marketing_monitor_sources" },
+      { type: "table", name: "marketing_monitor_observations" },
+      { type: "trigger", name: "marketing_monitor_runs_insert_fence" },
+      { type: "trigger", name: "marketing_monitor_sources_insert_fence" },
+      { type: "trigger", name: "marketing_monitor_observations_insert_fence" },
+      { type: "trigger", name: "marketing_monitor_runs_finalize_only" },
+      { type: "trigger", name: "marketing_monitor_runs_finalize_fence" },
+      { type: "trigger", name: "marketing_monitor_runs_no_delete" },
+      { type: "trigger", name: "marketing_monitor_sources_no_update" },
+      { type: "trigger", name: "marketing_monitor_sources_no_delete" },
+      { type: "trigger", name: "marketing_monitor_observations_no_update" },
+      { type: "trigger", name: "marketing_monitor_observations_no_delete" },
+    ],
   },
   {
     file: "0054_marketing_recommendations.sql",
@@ -595,6 +892,16 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\nCREATE TRIGGER IF NOT EXISTS marketing_recommendations_finalize_fence\n  BEFORE UPDATE OF status ON marketing_recommendations\n  WHEN NEW.status <> 'ready'\n    OR OLD.status <> 'preparing'\n    OR length(NEW.prepared_at) <> 24\n    OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.prepared_at) IS NOT NEW.prepared_at\n    OR NEW.prepared_at < OLD.created_at\n    OR NOT EXISTS (\n      SELECT 1 FROM addon_installations AS installation\n       WHERE installation.id = OLD.installation_id\n         AND installation.tenant = OLD.tenant\n         AND installation.addon_key = 'marketing-cro-monitor'\n         AND installation.state = 'active'\n    )\n    OR NOT EXISTS (\n      SELECT 1\n        FROM tasks AS task\n        JOIN marketing_monitor_runs AS run\n          ON run.id = OLD.run_id\n         AND run.tenant = OLD.tenant\n         AND run.installation_id = OLD.installation_id\n         AND run.binding_generation_id = OLD.binding_generation_id\n       WHERE task.id = NEW.task_id\n         AND task.squad_id = OLD.squad_id\n         AND task.title = 'Review CRO recommendation: ' || OLD.primary_kpi\n         AND task.body = json_object(\n           'schema', 'mupot.marketing-recommendation/v1',\n           'recommendation', json_object('id', OLD.id, 'dedupKey', OLD.dedup_key),\n           'target', OLD.target,\n           'problem', OLD.problem,\n           'hypothesis', OLD.hypothesis,\n           'primaryKpi', OLD.primary_kpi,\n           'kpiBaseline', json(OLD.kpi_baseline_json),\n           'limitingEvidence', json(OLD.limiting_evidence_json),\n           'evidence', json_object(\n             'programVersion', OLD.program_version,\n             'window', json_object('start', run.window_start, 'end', run.window_end),\n             'digest', OLD.evidence_digest\n           ),\n           'approval', json_object(\n             'required', json('true'),\n             'action', 'promote_recommendation',\n             'requiredCapability', 'owner',\n             'selfApproval', json('false')\n           )\n         )\n         AND task.done_when = 'An owner approves or rejects the recommendation; no external change is executed'\n         AND task.gate_owner = 'gate:addons:marketing-cro-monitor:promote_recommendation'\n    )\n    OR NOT EXISTS (\n      SELECT 1 FROM flights AS flight\n       WHERE flight.id = NEW.flight_id\n         AND flight.tenant = OLD.tenant\n         AND flight.agent = 'addon:marketing-cro-monitor'\n         AND flight.goal = 'Prepare ' || OLD.kind || ' for owner review'\n         AND json_valid(flight.meta)\n         AND json_type(flight.meta) = 'object'\n         AND json_extract(flight.meta, '$.schema') = 'mupot.flight.meta/v1'\n         AND json_extract(flight.meta, '$.goal_id') = 'marketing-recommendation:' || OLD.id\n         AND json_extract(flight.meta, '$.objective_id') = OLD.kind\n         AND json_extract(flight.meta, '$.confidentiality') = 'internal'\n         AND json_extract(flight.meta, '$.publication_target') = 'none'\n         AND json_type(flight.meta, '$.parent_flight_id') = 'null'\n         AND json_type(flight.meta, '$.squad_ids') = 'array'\n         AND json_type(flight.meta, '$.task_ids') = 'array'\n         AND json_type(flight.meta, '$.done_when') = 'array'\n         AND json_type(flight.meta, '$.artifact_refs') = 'array'\n         AND json_type(flight.meta, '$.receipt_refs') = 'array'\n         AND (SELECT count(*) FROM json_each(flight.meta)) = 11\n         AND (SELECT count(DISTINCT field.key) FROM json_each(flight.meta) AS field) = 11\n         AND NOT EXISTS (\n           SELECT 1 FROM json_each(flight.meta) AS field\n            WHERE field.key NOT IN (\n              'schema', 'goal_id', 'objective_id', 'squad_ids', 'task_ids',\n              'done_when', 'artifact_refs', 'receipt_refs', 'confidentiality',\n              'publication_target', 'parent_flight_id'\n            )\n         )\n         AND (SELECT count(*) FROM json_each(flight.meta, '$.squad_ids')) = 1\n         AND EXISTS (\n           SELECT 1 FROM json_each(flight.meta, '$.squad_ids') AS squad_ref\n            WHERE squad_ref.value = OLD.squad_id\n         )\n         AND (SELECT count(*) FROM json_each(flight.meta, '$.task_ids')) = 1\n         AND EXISTS (\n           SELECT 1 FROM json_each(flight.meta, '$.task_ids') AS task_ref\n            WHERE task_ref.value = NEW.task_id\n         )\n         AND (SELECT count(*) FROM json_each(flight.meta, '$.done_when')) = 1\n         AND EXISTS (\n           SELECT 1 FROM json_each(flight.meta, '$.done_when') AS done_when\n            WHERE done_when.value = 'An owner approves or rejects the recommendation; no external change is executed'\n         )\n         AND (SELECT count(*) FROM json_each(flight.meta, '$.artifact_refs')) = 1\n         AND EXISTS (\n           SELECT 1 FROM json_each(flight.meta, '$.artifact_refs') AS artifact_ref\n            WHERE artifact_ref.value = 'marketing-recommendation:' || OLD.id\n         )\n         AND (SELECT count(*) FROM json_each(flight.meta, '$.receipt_refs')) = 1\n         AND EXISTS (\n           SELECT 1 FROM json_each(flight.meta, '$.receipt_refs') AS receipt_ref\n            WHERE receipt_ref.value = 'marketing-monitor-evidence:' || OLD.evidence_digest\n         )\n    )\nBEGIN\n  SELECT RAISE(ABORT, 'marketing recommendation finalization fence lost');\nEND;",
       "\n\nCREATE TRIGGER IF NOT EXISTS marketing_recommendations_update_guard\n  BEFORE UPDATE ON marketing_recommendations\n  WHEN NOT (\n    OLD.status = 'preparing'\n    AND NEW.status = 'ready'\n    AND NEW.id IS OLD.id\n    AND NEW.tenant IS OLD.tenant\n    AND NEW.installation_id IS OLD.installation_id\n    AND NEW.binding_generation_id IS OLD.binding_generation_id\n    AND NEW.run_id IS OLD.run_id\n    AND NEW.program_version IS OLD.program_version\n    AND NEW.kind IS OLD.kind\n    AND NEW.target IS OLD.target\n    AND NEW.problem IS OLD.problem\n    AND NEW.hypothesis IS OLD.hypothesis\n    AND NEW.primary_kpi IS OLD.primary_kpi\n    AND NEW.kpi_baseline_json IS OLD.kpi_baseline_json\n    AND NEW.limiting_evidence_json IS OLD.limiting_evidence_json\n    AND NEW.evidence_digest IS OLD.evidence_digest\n    AND NEW.dedup_key IS OLD.dedup_key\n    AND NEW.squad_id IS OLD.squad_id\n    AND NEW.approval_required IS OLD.approval_required\n    AND NEW.approval_action IS OLD.approval_action\n    AND NEW.required_capability IS OLD.required_capability\n    AND NEW.self_approval IS OLD.self_approval\n    AND NEW.terminal_action IS OLD.terminal_action\n    AND NEW.created_by IS OLD.created_by\n    AND NEW.created_at IS OLD.created_at\n    AND OLD.task_id IS NULL AND NEW.task_id IS NOT NULL\n    AND OLD.flight_id IS NULL AND NEW.flight_id IS NOT NULL\n    AND OLD.receipt_digest IS NULL AND NEW.receipt_digest IS NOT NULL\n    AND OLD.prepared_at IS NULL AND NEW.prepared_at IS NOT NULL\n  )\nBEGIN\n  SELECT RAISE(ABORT, 'marketing recommendations are immutable after guarded finalization');\nEND;",
       "\n\nCREATE TRIGGER IF NOT EXISTS marketing_recommendations_no_delete\n  BEFORE DELETE ON marketing_recommendations\nBEGIN\n  SELECT RAISE(ABORT, 'marketing recommendations are evidence and cannot be deleted');\nEND;",
+    ],
+    objects: [
+      { type: "table", name: "marketing_recommendations" },
+      { type: "index", name: "idx_marketing_recommendations_latest" },
+      { type: "index", name: "idx_marketing_recommendation_task_dedup" },
+      { type: "index", name: "idx_marketing_recommendation_flight_dedup" },
+      { type: "trigger", name: "marketing_recommendations_insert_fence" },
+      { type: "trigger", name: "marketing_recommendations_finalize_fence" },
+      { type: "trigger", name: "marketing_recommendations_update_guard" },
+      { type: "trigger", name: "marketing_recommendations_no_delete" },
     ],
   },
   {
@@ -622,6 +929,26 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\nCREATE INDEX IF NOT EXISTS idx_flights_project_status\n  ON flights(project_id, status);",
       "\nCREATE INDEX IF NOT EXISTS idx_flights_tenant_project_created\n  ON flights(tenant, project_id, created_at DESC, id DESC);",
     ],
+    objects: [
+      { type: "table", name: "projects" },
+      { type: "table", name: "project_squad_access" },
+      { type: "trigger", name: "validate_projects_parent_insert" },
+      { type: "trigger", name: "validate_projects_parent_update" },
+      { type: "trigger", name: "validate_projects_archive_status" },
+      { type: "trigger", name: "validate_projects_restore_status" },
+      { type: "trigger", name: "validate_project_squad_access_insert" },
+      { type: "trigger", name: "validate_project_squad_access_update" },
+      { type: "trigger", name: "validate_project_squad_access_delete" },
+      { type: "trigger", name: "validate_tasks_project_id_insert" },
+      { type: "trigger", name: "validate_tasks_project_id_update" },
+      { type: "trigger", name: "validate_flights_project_id_insert" },
+      { type: "trigger", name: "validate_flights_project_id_update" },
+      { type: "index", name: "idx_projects_parent_status" },
+      { type: "index", name: "idx_project_squad_access_squad_project" },
+      { type: "index", name: "idx_tasks_project_status" },
+      { type: "index", name: "idx_flights_project_status" },
+      { type: "index", name: "idx_flights_tenant_project_created" },
+    ],
   },
   {
     file: "0056_project_activity_evidence.sql",
@@ -631,6 +958,11 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\nCREATE INDEX IF NOT EXISTS idx_agent_messages_project_created\n  ON agent_messages(tenant, project_id, created_at DESC, seq DESC);",
       "\n\nCREATE TRIGGER validate_agent_messages_project_insert\nBEFORE INSERT ON agent_messages\nWHEN NEW.project_id IS NOT NULL\nBEGIN\n  SELECT RAISE(ABORT, 'message project not found')\n    WHERE NOT EXISTS (SELECT 1 FROM projects WHERE id = NEW.project_id);\n  SELECT RAISE(ABORT, 'message project archived')\n    WHERE EXISTS (SELECT 1 FROM projects WHERE id = NEW.project_id AND status = 'archived');\nEND;",
       "\n\nCREATE TRIGGER validate_agent_messages_project_update\nBEFORE UPDATE OF project_id ON agent_messages\nWHEN OLD.project_id IS NOT NEW.project_id\nBEGIN\n  SELECT RAISE(ABORT, 'message project immutable');\nEND;",
+    ],
+    objects: [
+      { type: "index", name: "idx_agent_messages_project_created" },
+      { type: "trigger", name: "validate_agent_messages_project_insert" },
+      { type: "trigger", name: "validate_agent_messages_project_update" },
     ],
   },
   {
@@ -645,6 +977,15 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\nCREATE INDEX IF NOT EXISTS idx_project_link_receipts_project\n  ON project_link_receipts(tenant, local_project_id, created_at DESC, id DESC);",
       "\n\n-- The receipt is the last statement in each atomic delivery batch. Re-checking\n-- authority here closes the gap between application reads and the committed write.\nCREATE TRIGGER IF NOT EXISTS trg_project_link_receipt_authorized\nBEFORE INSERT ON project_link_receipts\nBEGIN\n  SELECT RAISE(ABORT, 'project_link_not_authorized') WHERE NOT EXISTS (\n    SELECT 1\n      FROM project_links l\n      JOIN projects p ON p.id = l.local_project_id\n      JOIN project_squad_access a\n        ON a.project_id = l.local_project_id AND a.squad_id = l.local_squad_id\n     WHERE l.tenant = NEW.tenant\n       AND l.id = NEW.link_id\n       AND l.local_project_id = NEW.local_project_id\n       AND l.state = 'active'\n       AND p.status <> 'archived'\n       AND a.access_level IN ('write', 'admin')\n       AND EXISTS (\n         SELECT 1 FROM json_each(l.capabilities_json)\n          WHERE value = CASE NEW.action_type\n            WHEN 'task' THEN 'project.task.write'\n            ELSE 'project.evidence.write'\n          END\n       )\n       AND (\n         SELECT state FROM addon_installations\n          WHERE tenant = NEW.tenant AND addon_key = 'project-link'\n          ORDER BY installed_at DESC, id DESC LIMIT 1\n       ) = 'active'\n       AND (\n         NEW.direction <> 'outbound'\n         OR EXISTS (\n           SELECT 1 FROM project_link_deliveries d\n            WHERE d.tenant = NEW.tenant\n              AND d.link_id = NEW.link_id\n              AND d.direction = 'outbound'\n              AND d.idempotency_key = NEW.idempotency_key\n              AND d.envelope_sha256 = NEW.envelope_sha256\n              AND d.status = 'delivered'\n              AND d.claim_token = NEW.delivery_claim_token\n         )\n       )\n  );\nEND;",
     ],
+    objects: [
+      { type: "table", name: "project_links" },
+      { type: "index", name: "idx_project_links_project" },
+      { type: "table", name: "project_link_deliveries" },
+      { type: "index", name: "idx_project_link_deliveries_status" },
+      { type: "table", name: "project_link_receipts" },
+      { type: "index", name: "idx_project_link_receipts_project" },
+      { type: "trigger", name: "trg_project_link_receipt_authorized" },
+    ],
   },
   {
     file: "0058_agent_inbox_fences.sql",
@@ -652,6 +993,10 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     statements: [
       "-- 0058_agent_inbox_fences.sql - one authoritative inbox transport per welded agent.\n\nCREATE TABLE IF NOT EXISTS agent_inbox_fences (\n  tenant TEXT NOT NULL,\n  agent_id TEXT NOT NULL,\n  mode TEXT NOT NULL CHECK (mode IN ('bearer_only', 'signed_only')),\n  generation INTEGER NOT NULL DEFAULT 1 CHECK (generation > 0),\n  key_fingerprint TEXT CHECK (key_fingerprint IS NULL OR length(key_fingerprint) = 64),\n  updated_by_member_id TEXT NOT NULL,\n  updated_at TEXT NOT NULL,\n  reason TEXT NOT NULL CHECK (length(reason) BETWEEN 1 AND 500),\n  CHECK (\n    (mode = 'signed_only' AND key_fingerprint IS NOT NULL) OR\n    (mode = 'bearer_only' AND key_fingerprint IS NULL)\n  ),\n  PRIMARY KEY (tenant, agent_id),\n  FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,\n  FOREIGN KEY (updated_by_member_id) REFERENCES members(id) ON DELETE RESTRICT\n);",
       "\n\nCREATE INDEX IF NOT EXISTS idx_agent_inbox_fences_tenant_mode\n  ON agent_inbox_fences(tenant, mode);",
+    ],
+    objects: [
+      { type: "table", name: "agent_inbox_fences" },
+      { type: "index", name: "idx_agent_inbox_fences_tenant_mode" },
     ],
   },
   {
@@ -695,6 +1040,35 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\nCREATE TRIGGER IF NOT EXISTS tasks_project_locked_by_receipt\nBEFORE UPDATE OF project_id ON tasks\nWHEN OLD.project_id IS NOT NEW.project_id\n AND (\n   EXISTS (SELECT 1 FROM task_verdicts WHERE task_id = OLD.id)\n   OR EXISTS (SELECT 1 FROM workflow_receipts WHERE task_id = OLD.id)\n   OR EXISTS (SELECT 1 FROM task_dispatch_receipts WHERE task_id = OLD.id)\n )\nBEGIN\n  SELECT RAISE(ABORT, 'task project locked by flight');\nEND;",
       "\n\nCREATE TRIGGER IF NOT EXISTS flights_project_locked_by_receipt\nBEFORE UPDATE OF project_id ON flights\nWHEN OLD.project_id IS NOT NEW.project_id\n AND EXISTS (SELECT 1 FROM flight_event_outbox WHERE flight_id = OLD.id)\nBEGIN\n  SELECT RAISE(ABORT, 'flight project attribution downgrade');\nEND;",
     ],
+    objects: [
+      { type: "index", name: "idx_tasks_project_activity_keyset" },
+      { type: "index", name: "idx_tasks_project_evidence_keyset" },
+      { type: "index", name: "idx_agent_messages_project_keyset" },
+      { type: "index", name: "idx_flights_project_keyset" },
+      { type: "index", name: "idx_project_links_activity_keyset" },
+      { type: "index", name: "idx_task_verdicts_evidence_keyset" },
+      { type: "index", name: "idx_workflow_receipts_evidence_keyset" },
+      { type: "index", name: "idx_task_dispatch_receipts_evidence_keyset" },
+      { type: "index", name: "idx_flight_event_outbox_evidence_keyset" },
+      { type: "index", name: "idx_project_link_receipts_evidence_keyset" },
+      { type: "trigger", name: "task_verdicts_project_match_insert" },
+      { type: "trigger", name: "task_verdicts_project_hydrate_insert" },
+      { type: "trigger", name: "task_verdicts_no_update" },
+      { type: "trigger", name: "workflow_receipts_project_match_insert" },
+      { type: "trigger", name: "workflow_receipts_project_hydrate_insert" },
+      { type: "trigger", name: "workflow_receipts_project_immutable" },
+      { type: "trigger", name: "workflow_receipts_project_match_update" },
+      { type: "trigger", name: "task_dispatch_receipts_project_match_insert" },
+      { type: "trigger", name: "task_dispatch_receipts_project_hydrate_insert" },
+      { type: "trigger", name: "task_dispatch_receipts_project_immutable" },
+      { type: "trigger", name: "task_dispatch_receipts_project_match_update" },
+      { type: "trigger", name: "flight_event_outbox_project_match_insert" },
+      { type: "trigger", name: "flight_event_outbox_project_hydrate_insert" },
+      { type: "trigger", name: "flight_event_outbox_project_immutable" },
+      { type: "trigger", name: "flight_event_outbox_project_match_update" },
+      { type: "trigger", name: "tasks_project_locked_by_receipt" },
+      { type: "trigger", name: "flights_project_locked_by_receipt" },
+    ],
   },
   {
     file: "0060_project_link_latest_event_index.sql",
@@ -703,6 +1077,9 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "-- Replace the shipped 0059 Project Link keyset expression with the actual latest\n-- durable event across creation, success, failure, and revocation.\n\nDROP INDEX IF EXISTS idx_project_links_activity_keyset;",
       "\n\nCREATE INDEX IF NOT EXISTS idx_project_links_activity_keyset\n  ON project_links (\n    tenant,\n    local_project_id,\n    CAST(ROUND((MAX(\n      julianday(created_at),\n      julianday(COALESCE(last_success_at, created_at)),\n      julianday(COALESCE(last_failure_at, created_at)),\n      julianday(COALESCE(revoked_at, created_at))\n    ) - 2440587.5) * 86400000) AS INTEGER) DESC,\n    id ASC\n  );",
     ],
+    objects: [
+      { type: "index", name: "idx_project_links_activity_keyset" },
+    ],
   },
   {
     file: "0061_task_project_access_on_attribution.sql",
@@ -710,6 +1087,9 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     statements: [
       "-- 0061: scope task project-access validation to attribution changes only (#391).\n--\n-- 0055's validate_tasks_project_id_update (still in effect through main's 0056-0060) fired on a wide UPDATE OF column list\n-- (status, result, completed_at, …). After a squad lost write/admin on a project,\n-- in-flight status transitions aborted with \"task project access denied\" and left\n-- tasks stuck. Access must be re-checked only when project_id or squad_id changes.\n\nDROP TRIGGER IF EXISTS validate_tasks_project_id_update;",
       "\n\nCREATE TRIGGER validate_tasks_project_id_update\nBEFORE UPDATE OF\n  squad_id,\n  project_id\nON tasks\nBEGIN\n  SELECT RAISE(ABORT, 'task project locked by flight')\n  WHERE OLD.project_id IS NOT NEW.project_id\n    AND EXISTS (\n      SELECT 1\n      FROM flights AS flight,\n           json_each(CASE WHEN json_valid(flight.meta) THEN flight.meta ELSE '{}' END, '$.task_ids') AS task_ref\n      WHERE flight.project_id IS NOT NULL\n        AND json_extract(CASE WHEN json_valid(flight.meta) THEN flight.meta ELSE '{}' END, '$.schema') = 'mupot.flight.meta/v1'\n        AND task_ref.value = OLD.id\n    );\n  SELECT RAISE(ABORT, 'task project not found')\n    WHERE NEW.project_id IS NOT NULL\n      AND NOT EXISTS (SELECT 1 FROM projects WHERE id = NEW.project_id);\n  SELECT RAISE(ABORT, 'task project archived')\n    WHERE NEW.project_id IS NOT NULL\n      AND EXISTS (SELECT 1 FROM projects WHERE id = NEW.project_id AND status = 'archived');\n  SELECT RAISE(ABORT, 'task project access denied')\n  WHERE NEW.project_id IS NOT NULL\n    AND NOT EXISTS (\n      SELECT 1 FROM project_squad_access\n      WHERE project_id = NEW.project_id\n        AND squad_id = NEW.squad_id\n        AND access_level IN ('write', 'admin')\n    );\nEND;",
+    ],
+    objects: [
+      { type: "trigger", name: "validate_tasks_project_id_update" },
     ],
   },
   {
@@ -721,6 +1101,12 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\nCREATE TRIGGER IF NOT EXISTS validate_project_provider_bindings_insert\nBEFORE INSERT ON project_provider_bindings\nBEGIN\n  SELECT RAISE(ABORT, 'project provider binding: project not found')\n    WHERE NOT EXISTS (SELECT 1 FROM projects WHERE id = NEW.project_id);\n  SELECT RAISE(ABORT, 'project provider binding: archived project')\n    WHERE EXISTS (SELECT 1 FROM projects WHERE id = NEW.project_id AND status = 'archived');\nEND;",
       "\n\nCREATE TRIGGER IF NOT EXISTS validate_project_provider_bindings_update\nBEFORE UPDATE ON project_provider_bindings\nBEGIN\n  SELECT RAISE(ABORT, 'project provider binding: project not found')\n    WHERE NOT EXISTS (SELECT 1 FROM projects WHERE id = NEW.project_id);\n  SELECT RAISE(ABORT, 'project provider binding: archived project')\n    WHERE EXISTS (SELECT 1 FROM projects WHERE id = NEW.project_id AND status = 'archived');\nEND;",
     ],
+    objects: [
+      { type: "table", name: "project_provider_bindings" },
+      { type: "index", name: "idx_project_provider_bindings_provider_external" },
+      { type: "trigger", name: "validate_project_provider_bindings_insert" },
+      { type: "trigger", name: "validate_project_provider_bindings_update" },
+    ],
   },
   {
     file: "0063_task_source_pot.sql",
@@ -728,6 +1114,9 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     statements: [
       "-- 0063: provenance-tag tasks that arrive via project-link (#403 gap 2b).\n--\n-- receiveProjectLinkEnvelope (src/addons/project-link/service.ts) is Ed25519-signature and\n-- capability gated (transport integrity), but writes attacker-controlled task title/body onto\n-- the local board with no structural marker distinguishing it from a locally-created task.\n-- Content from a hostile (or merely compromised) linked pot is adversarial input — a reading\n-- agent that later picks up the task must be able to tell \"this came from an external pot,\n-- treat as untrusted content, not as trusted local instructions.\"\n--\n-- source_pot is NULL for every locally-created task (the existing, trusted path — createTask\n-- in src/tasks/service.ts, and every other INSERT INTO tasks) and is set to the linked pot's\n-- slug (project_links.remote_pot) exactly when the row was written by\n-- receiveProjectLinkEnvelope. NULL-vs-non-NULL is the trust boundary; no CHECK/FK constraint\n-- is added — remote_pot is an opaque slug already validated by validId() at envelope-receive\n-- time (src/addons/project-link/envelope.ts), and this column intentionally outlives the\n-- project_links row it originated from (a revoked/deleted link must not silently erase the\n-- provenance of tasks it already delivered).\n\nALTER TABLE tasks ADD COLUMN source_pot TEXT;",
       "\n\n-- Read-path index: \"show me all tasks that came in over a project link\" (dashboard/MCP\n-- provenance filter, audit) without a full table scan. Partial index — the vast majority of\n-- rows are local (source_pot IS NULL) and gain nothing from being indexed here.\nCREATE INDEX IF NOT EXISTS idx_tasks_source_pot ON tasks(source_pot) WHERE source_pot IS NOT NULL;",
+    ],
+    objects: [
+      { type: "index", name: "idx_tasks_source_pot" },
     ],
   },
   {
@@ -760,12 +1149,30 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\n\n\nCREATE TRIGGER IF NOT EXISTS marketing_monitor_runs_finalize_fence\n  BEFORE UPDATE OF status ON marketing_monitor_runs\n  WHEN NEW.status = 'completed' AND (\n    NOT EXISTS (\n      SELECT 1\n        FROM addon_installations AS installation\n        JOIN addon_binding_generations AS generation\n          ON generation.installation_id = installation.id\n         AND generation.tenant = installation.tenant\n         AND generation.id = OLD.binding_generation_id\n         AND generation.revoked_at IS NULL\n         AND generation.manifest_sha256 = installation.manifest_sha256\n       WHERE installation.id = OLD.installation_id\n         AND installation.tenant = OLD.tenant\n         AND installation.state = 'active'\n         AND installation.addon_key = OLD.addon_key\n         AND installation.installed_version = OLD.installed_version\n         AND installation.publisher = OLD.publisher\n         AND installation.trust_class = OLD.trust_class\n         AND installation.mupot_compatibility = OLD.mupot_compatibility\n         AND installation.manifest_sha256 = OLD.manifest_sha256\n         AND generation.binding_count = (\n           SELECT COUNT(*) FROM addon_connector_bindings AS binding\n            WHERE binding.generation_id = generation.id\n              AND binding.installation_id = generation.installation_id\n              AND binding.tenant = generation.tenant\n              AND binding.revoked_at IS NULL\n         )\n    )\n    OR OLD.source_count <> (SELECT COUNT(*) FROM marketing_monitor_sources WHERE run_id = OLD.id)\n    OR OLD.observation_count <> (SELECT COUNT(*) FROM marketing_monitor_observations WHERE run_id = OLD.id)\n    OR OLD.observation_count <> COALESCE((\n      SELECT SUM(observation_count) FROM marketing_monitor_sources WHERE run_id = OLD.id\n    ), 0)\n    OR EXISTS (\n      SELECT 1\n        FROM marketing_monitor_sources AS source\n       WHERE source.run_id = OLD.id\n         AND source.observation_count <> (\n           SELECT COUNT(*) FROM marketing_monitor_observations AS observation\n            WHERE observation.run_id = source.run_id\n              AND observation.source_key = source.source_key\n              AND observation.source_slot = source.source_slot\n         )\n    )\n  )\nBEGIN\n  SELECT RAISE(ABORT, 'marketing monitor run finalization fence lost');\nEND;",
       "\n\nPRAGMA foreign_keys = ON;",
     ],
+    objects: [
+      { type: "table", name: "marketing_recommendations_new" },
+      { type: "index", name: "idx_marketing_recommendations_latest" },
+      { type: "index", name: "idx_marketing_recommendation_task_dedup" },
+      { type: "index", name: "idx_marketing_recommendation_flight_dedup" },
+      { type: "trigger", name: "marketing_recommendations_insert_fence" },
+      { type: "trigger", name: "marketing_recommendations_finalize_fence" },
+      { type: "trigger", name: "marketing_recommendations_update_guard" },
+      { type: "trigger", name: "marketing_recommendations_no_delete" },
+      { type: "table", name: "marketing_monitor_observations_new" },
+      { type: "trigger", name: "marketing_monitor_observations_insert_fence" },
+      { type: "trigger", name: "marketing_monitor_observations_no_update" },
+      { type: "trigger", name: "marketing_monitor_observations_no_delete" },
+      { type: "trigger", name: "marketing_monitor_runs_finalize_fence" },
+    ],
   },
   {
     file: "0065_task_detach_result_lock.sql",
     sha256: "e82f2bb32e188a2160c60b04df47c84a94e345ab737fe1448cd4bfc1c4364d26",
     statements: [
       "-- 0065_task_detach_result_lock.sql — close the detach-drops-evidence gap (#400).\n--\n-- validate_tasks_project_id_update (0055, narrowed in 0061) and 0059's\n-- tasks_project_locked_by_receipt both gate a project_id UPDATE, but neither\n-- blocks a plain detach (project_id -> NULL) off a task that already carries\n-- real evidence (a non-empty `result`) when NO formal receipt (verdict /\n-- workflow / dispatch) exists yet. Such a task sits in the project's evidence\n-- keyset (idx_tasks_project_evidence_keyset, 0059) with no lock at all, so a\n-- member of the owning squad can silently pull it off the project's evidence\n-- board by detaching it.\n--\n-- This mirrors 0059's receipt-lock pattern but keys off OLD.result instead of\n-- receipt existence, and fires ONLY on an actual detach (NEW.project_id IS\n-- NULL, OLD.project_id IS NOT NULL) — a reassignment between two non-null\n-- projects is untouched, and detaching an empty-result task stays legal.\n--\n-- Deliberately excludes any already-receipt-locked row (tasks_verdicts /\n-- workflow_receipts / task_dispatch_receipts) so this does not double-fence\n-- or shadow 0059's own \"task project locked by flight\" message for that case\n-- — 0059 already owns it. This is also deliberately independent of #402 (an\n-- RBAC authz check requiring manage/admin on the OLD project before detach) —\n-- that is a separate, deferred decision; this trigger is a pure data-\n-- integrity lock keyed on result presence, not on the actor's access level.\n\nCREATE TRIGGER IF NOT EXISTS tasks_project_detach_locked_by_result\nBEFORE UPDATE OF project_id ON tasks\nWHEN NEW.project_id IS NULL\n AND OLD.project_id IS NOT NULL\n AND OLD.result IS NOT NULL\n AND length(trim(OLD.result)) > 0\n AND NOT EXISTS (SELECT 1 FROM task_verdicts WHERE task_id = OLD.id)\n AND NOT EXISTS (SELECT 1 FROM workflow_receipts WHERE task_id = OLD.id)\n AND NOT EXISTS (SELECT 1 FROM task_dispatch_receipts WHERE task_id = OLD.id)\nBEGIN\n  SELECT RAISE(ABORT, 'task detach locked by result');\nEND;",
+    ],
+    objects: [
+      { type: "trigger", name: "tasks_project_detach_locked_by_result" },
     ],
   },
   {
@@ -777,12 +1184,21 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\n-- The roster read: \"who is online, scoped to this project.\"\nCREATE INDEX IF NOT EXISTS idx_module_registry_tenant_project_status\n  ON module_registry (tenant, project_id, status);",
       "\n\n-- Self-lookup: \"what is MY current registration(s).\"\nCREATE INDEX IF NOT EXISTS idx_module_registry_tenant_identity\n  ON module_registry (tenant, identity);",
     ],
+    objects: [
+      { type: "table", name: "module_registry" },
+      { type: "index", name: "idx_module_registry_identity_live" },
+      { type: "index", name: "idx_module_registry_tenant_project_status" },
+      { type: "index", name: "idx_module_registry_tenant_identity" },
+    ],
   },
   {
     file: "0067_concierge_starter_unique.sql",
     sha256: "9a8279f6cab9db919e0bba04b3331c4c28af9af4b33cc81aadb3c91a74ed186c",
     statements: [
       "-- 0067_concierge_starter_unique.sql -- close the concierge dispatch-once-ever TOCTOU\n-- (adversarial gate on PR #459, per-project concierge, src/concierge/service.ts).\n--\n-- P0 (BLOCK) this backs: the pre-fix dedup only checked LIVE task statuses\n-- (open/in_progress/review/blocked). Once a dispatched \"Starter: <project>\" task left\n-- that set (approved, rejected, or done) while the project's `goal` text was still set,\n-- the concierge re-dispatched a byte-identical starter EVERY 15-min cron tick forever --\n-- an unbounded act-loop the design doc explicitly forbids (\"rank, never act-loop\"). The\n-- app-layer fix (src/concierge/service.ts) is dispatch-once-ever: before dispatching, it\n-- checks for a prior concierge-originated task for the project in ANY status (the task's\n-- body carries the CONCIERGE_STARTER_MARKER sentinel) -- not just the \"live\" subset.\n--\n-- P1 this backs: that app-layer check-then-create has no transactional guard on its own --\n-- two overlapping cron ticks for the same project could both read \"no starter yet\" and\n-- both create one. This partial UNIQUE index is the real backstop: at most ONE task per\n-- project_id may ever carry the concierge-starter marker in its body, enforced by\n-- SQLite/D1 itself, not just application logic. A second concurrent INSERT racing the\n-- same project fails this constraint instead of landing a duplicate row;\n-- src/concierge/service.ts catches that specific violation and treats it as \"someone\n-- else already dispatched this tick\" (reason: 'already_dispatched'), never surfacing as\n-- a tick error.\n--\n-- instr(body, '...') > 0 mirrors the existing precedent for function-expression partial\n-- indexes on this table -- see idx_tasks_project_evidence_keyset (migration 0059), which\n-- filters on length(trim(result)) > 0.\n--\n-- The marker string below MUST stay byte-identical to CONCIERGE_STARTER_MARKER in\n-- src/concierge/service.ts -- it is not read from that file, it is duplicated here\n-- deliberately (migrations are frozen history; the exported constant is the source of\n-- truth for new code, this literal is what the constraint enforces at the row it was\n-- written against).\n\nCREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_concierge_starter_once\n  ON tasks (project_id)\n  WHERE project_id IS NOT NULL AND instr(body, '[concierge-starter]') > 0;",
+    ],
+    objects: [
+      { type: "index", name: "idx_tasks_concierge_starter_once" },
     ],
   },
   {
@@ -799,6 +1215,9 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\nALTER TABLE agents ADD COLUMN death_condition  TEXT;",
       "\n\n-- The placement tree reads children-of-parent; index the soft edge.\nCREATE INDEX IF NOT EXISTS idx_agents_parent ON agents(parent_agent_id);",
     ],
+    objects: [
+      { type: "index", name: "idx_agents_parent" },
+    ],
   },
   {
     file: "0068_project_cycle_boundary.sql",
@@ -809,6 +1228,9 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\nALTER TABLE projects ADD COLUMN stall_threshold_days INTEGER;",
       "\n\nCREATE INDEX IF NOT EXISTS idx_projects_cycle_boundary\n  ON projects (cycle_boundary_at)\n  WHERE cycle_boundary_at IS NOT NULL AND status NOT IN ('completed', 'archived');",
     ],
+    objects: [
+      { type: "index", name: "idx_projects_cycle_boundary" },
+    ],
   },
   {
     file: "0069_backfill_agent_memberships.sql",
@@ -816,6 +1238,7 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     statements: [
       "-- 0069_backfill_agent_memberships.sql — backfill the empty memberships table.\n--\n-- The `memberships` table (agent <-> squad RBAC edge) was EMPTY pot-wide: create_agent\n-- historically wrote an `agents` row + a capability grant but never a memberships row\n-- (fixed forward in src/org/service.ts to write both atomically). The project-scoped\n-- message path (src/agents/messages.ts) gates sender AND recipient on\n-- `EXISTS (memberships m JOIN project_squad_access psa ON psa.squad_id=m.squad_id\n--          WHERE psa.project_id=? AND m.agent_id=?)`, so with memberships empty every\n-- project-scoped `send` returned 403 project_access_denied. See gh #469.\n--\n-- Backfill: one 'member' row per existing agent on its OWN squad, for every agent that\n-- lacks it. Deterministic id ('mem-backfill-'||agent.id) + WHERE NOT EXISTS makes this\n-- idempotent and non-conflicting with the two rows already inserted by hand during the\n-- AGY onboarding (agy + kasra c855f82c). Plain INSERT..SELECT — no trigger, no CHECK\n-- change, D1-remote compatible.\n\nINSERT INTO memberships (id, agent_id, squad_id, capability)\nSELECT 'mem-backfill-' || a.id, a.id, a.squad_id, 'member'\n  FROM agents a\n WHERE NOT EXISTS (\n   SELECT 1 FROM memberships m\n    WHERE m.agent_id = a.id AND m.squad_id = a.squad_id\n );",
     ],
+    objects: [],
   },
   {
     file: "0069_project_structural_completion.sql",
@@ -914,6 +1337,44 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\nDROP TABLE _flight_event_outbox_project_backup_0069;",
       "\n\nPRAGMA foreign_keys = on;",
     ],
+    objects: [
+      { type: "table", name: "_projects_backup_0069" },
+      { type: "table", name: "_project_squad_access_backup_0069" },
+      { type: "table", name: "_project_provider_bindings_backup_0069" },
+      { type: "table", name: "_project_links_backup_0069" },
+      { type: "table", name: "_project_link_deliveries_backup_0069" },
+      { type: "table", name: "_project_link_receipts_backup_0069" },
+      { type: "table", name: "_module_registry_backup_0069" },
+      { type: "table", name: "_task_verdicts_project_backup_0069" },
+      { type: "table", name: "_workflow_receipts_project_backup_0069" },
+      { type: "table", name: "_task_dispatch_receipts_project_backup_0069" },
+      { type: "table", name: "_flight_event_outbox_project_backup_0069" },
+      { type: "table", name: "projects_new" },
+      { type: "index", name: "idx_projects_parent_status" },
+      { type: "index", name: "idx_projects_cycle_boundary" },
+      { type: "trigger", name: "validate_projects_archive_status" },
+      { type: "trigger", name: "validate_projects_parent_insert" },
+      { type: "trigger", name: "validate_projects_parent_update" },
+      { type: "trigger", name: "validate_projects_restore_status" },
+      { type: "trigger", name: "task_verdicts_no_update" },
+      { type: "trigger", name: "workflow_receipts_project_immutable" },
+      { type: "trigger", name: "workflow_receipts_project_match_update" },
+      { type: "trigger", name: "task_dispatch_receipts_project_immutable" },
+      { type: "trigger", name: "task_dispatch_receipts_project_match_update" },
+      { type: "trigger", name: "flight_event_outbox_project_immutable" },
+      { type: "trigger", name: "flight_event_outbox_project_match_update" },
+      { type: "trigger", name: "trg_project_link_receipt_authorized" },
+      { type: "trigger", name: "validate_agent_messages_project_insert" },
+      { type: "trigger", name: "validate_flights_project_id_insert" },
+      { type: "trigger", name: "validate_flights_project_id_update" },
+      { type: "trigger", name: "validate_project_provider_bindings_insert" },
+      { type: "trigger", name: "validate_project_provider_bindings_update" },
+      { type: "trigger", name: "validate_project_squad_access_delete" },
+      { type: "trigger", name: "validate_project_squad_access_insert" },
+      { type: "trigger", name: "validate_project_squad_access_update" },
+      { type: "trigger", name: "validate_tasks_project_id_insert" },
+      { type: "trigger", name: "validate_tasks_project_id_update" },
+    ],
   },
   {
     file: "0070_harness_role_capabilities.sql",
@@ -925,6 +1386,7 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\nUPDATE agents SET capabilities = '[\"research\"]' WHERE slug = 'agy';",
       "\nUPDATE agents SET capabilities = '[\"research\"]' WHERE slug = 'kayhermes';",
     ],
+    objects: [],
   },
   {
     file: "0071_agent_connections.sql",
@@ -957,6 +1419,26 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\n-- A receipt can be inserted only while the exact actor-scoped reservation is\n-- still pending. Because this is a BEFORE trigger, a stale provisioning batch\n-- aborts inside SQLite and rolls back every earlier statement in that batch.\nCREATE TRIGGER agent_connection_receipt_requires_pending_request\nBEFORE INSERT ON agent_connection_receipts\nWHEN NOT EXISTS (\n  SELECT 1\n    FROM agent_connection_requests\n   WHERE tenant = NEW.tenant\n     AND actor_kind = NEW.actor_kind\n     AND actor_id = NEW.actor_id\n     AND request_id = NEW.request_id\n     AND request_fingerprint = NEW.request_fingerprint\n     AND status = 'pending'\n)\nBEGIN\n  SELECT RAISE(ABORT, 'agent_connection_request_not_pending');\nEND;",
       "\n\n-- Replacement revocation is part of the receipt insert transaction. A token\n-- that stopped being live after service validation aborts the entire batch, so\n-- the replacement token and credential_issued transition cannot commit without\n-- the caller receiving the new raw credential.\nCREATE TRIGGER agent_connection_receipt_replaces_live_token\nBEFORE INSERT ON agent_connection_receipts\nWHEN NEW.credential_action = 'replace'\nBEGIN\n  UPDATE member_tokens\n     SET revoked_at = NEW.credential_issued_at\n   WHERE id = (\n     SELECT replace_token_id\n       FROM agent_connection_requests\n      WHERE tenant = NEW.tenant\n        AND actor_kind = NEW.actor_kind\n        AND actor_id = NEW.actor_id\n        AND request_id = NEW.request_id\n        AND request_fingerprint = NEW.request_fingerprint\n        AND status = 'pending'\n      LIMIT 1\n   )\n     AND tenant = NEW.tenant\n     AND member_id = NEW.member_id\n     AND agent_id = NEW.agent_id\n     AND revoked_at IS NULL;\n\n  SELECT RAISE(ABORT, 'replace_token_not_found')\n   WHERE changes() <> 1;\nEND;",
       "\n\n-- Issuance facts are an immutable snapshot. Only verification evidence and\n-- updated_at may evolve after insert.\nCREATE TRIGGER agent_connection_receipts_immutable_snapshot\nBEFORE UPDATE ON agent_connection_receipts\nWHEN NEW.id IS NOT OLD.id\n  OR NEW.tenant IS NOT OLD.tenant\n  OR NEW.actor_kind IS NOT OLD.actor_kind\n  OR NEW.actor_id IS NOT OLD.actor_id\n  OR NEW.request_id IS NOT OLD.request_id\n  OR NEW.request_fingerprint IS NOT OLD.request_fingerprint\n  OR NEW.agent_id IS NOT OLD.agent_id\n  OR NEW.agent_slug IS NOT OLD.agent_slug\n  OR NEW.agent_status_at_issue IS NOT OLD.agent_status_at_issue\n  OR NEW.member_id IS NOT OLD.member_id\n  OR NEW.token_id IS NOT OLD.token_id\n  OR NEW.agent_disposition IS NOT OLD.agent_disposition\n  OR NEW.credential_action IS NOT OLD.credential_action\n  OR NEW.home_squad_id IS NOT OLD.home_squad_id\n  OR NEW.home_capability IS NOT OLD.home_capability\n  OR NEW.additional_access_json IS NOT OLD.additional_access_json\n  OR NEW.token_label IS NOT OLD.token_label\n  OR NEW.endpoint IS NOT OLD.endpoint\n  OR NEW.transport IS NOT OLD.transport\n  OR NEW.credential_issued_at IS NOT OLD.credential_issued_at\n  OR NEW.created_at IS NOT OLD.created_at\nBEGIN\n  SELECT RAISE(ABORT, 'agent_connection_receipt_immutable');\nEND;",
+    ],
+    objects: [
+      { type: "table", name: "agent_member_bindings" },
+      { type: "table", name: "agent_connection_migration_guard" },
+      { type: "table", name: "agent_home_capability_migration_guard" },
+      { type: "trigger", name: "agent_member_bindings_no_update" },
+      { type: "trigger", name: "agent_member_bindings_home_capability_ceiling" },
+      { type: "trigger", name: "agent_member_bindings_delete_requires_no_tokens" },
+      { type: "trigger", name: "member_tokens_agent_binding_insert" },
+      { type: "trigger", name: "member_tokens_agent_binding_update" },
+      { type: "trigger", name: "agent_home_capability_ceiling_insert" },
+      { type: "trigger", name: "agent_home_capability_ceiling_update" },
+      { type: "trigger", name: "agents_home_capability_ceiling_update" },
+      { type: "trigger", name: "squads_home_capability_ceiling_update" },
+      { type: "table", name: "agent_connection_requests" },
+      { type: "index", name: "idx_agent_connection_one_pending_target" },
+      { type: "table", name: "agent_connection_receipts" },
+      { type: "trigger", name: "agent_connection_receipt_requires_pending_request" },
+      { type: "trigger", name: "agent_connection_receipt_replaces_live_token" },
+      { type: "trigger", name: "agent_connection_receipts_immutable_snapshot" },
     ],
   },
   {
@@ -998,6 +1480,42 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\nCREATE TRIGGER routine_ref_ownership_immutable\nBEFORE UPDATE ON routine_run_refs\nBEGIN\n  SELECT RAISE(ABORT, 'routine references are immutable');\nEND;",
       "\n\nCREATE TRIGGER routine_refs_no_delete\nBEFORE DELETE ON routine_run_refs\nBEGIN\n  SELECT RAISE(ABORT, 'routine references are immutable');\nEND;",
     ],
+    objects: [
+      { type: "table", name: "routines" },
+      { type: "table", name: "routine_runs" },
+      { type: "table", name: "routine_run_events" },
+      { type: "table", name: "routine_run_actions" },
+      { type: "table", name: "routine_run_refs" },
+      { type: "index", name: "idx_routines_due" },
+      { type: "index", name: "idx_routines_project_status" },
+      { type: "index", name: "idx_routines_project_next_occurrence" },
+      { type: "index", name: "idx_routine_runs_lease_recovery" },
+      { type: "index", name: "idx_routine_runs_project_history" },
+      { type: "index", name: "idx_routine_runs_project_active_keyset" },
+      { type: "index", name: "idx_routine_runs_project_outcome_keyset" },
+      { type: "index", name: "idx_routine_runs_project_needs_you_keyset" },
+      { type: "index", name: "idx_routine_runs_needs_you" },
+      { type: "index", name: "idx_routine_runs_retry" },
+      { type: "index", name: "idx_routine_runs_routine_active" },
+      { type: "index", name: "idx_routine_run_events_history" },
+      { type: "index", name: "idx_routine_run_events_projection_keyset" },
+      { type: "index", name: "idx_routine_run_actions_run" },
+      { type: "index", name: "idx_routine_run_actions_projection_keyset" },
+      { type: "index", name: "idx_routine_run_refs_project" },
+      { type: "trigger", name: "validate_routine_owner_insert" },
+      { type: "trigger", name: "validate_routine_owner_update" },
+      { type: "trigger", name: "routine_ownership_immutable" },
+      { type: "trigger", name: "validate_routine_run_insert" },
+      { type: "trigger", name: "routine_run_ownership_immutable" },
+      { type: "trigger", name: "validate_routine_event_insert" },
+      { type: "trigger", name: "routine_events_no_update" },
+      { type: "trigger", name: "routine_events_no_delete" },
+      { type: "trigger", name: "validate_routine_action_insert" },
+      { type: "trigger", name: "routine_action_ownership_immutable" },
+      { type: "trigger", name: "validate_routine_ref_insert" },
+      { type: "trigger", name: "routine_ref_ownership_immutable" },
+      { type: "trigger", name: "routine_refs_no_delete" },
+    ],
   },
   {
     file: "0074_routine_cancellation_events.sql",
@@ -1020,6 +1538,16 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\nCREATE TRIGGER routine_events_no_delete\nBEFORE DELETE ON routine_run_events\nBEGIN\n  SELECT RAISE(ABORT, 'routine events are append-only');\nEND;",
       "\n\nPRAGMA foreign_keys = on;",
     ],
+    objects: [
+      { type: "table", name: "routine_run_events_new" },
+      { type: "index", name: "idx_routine_run_events_history" },
+      { type: "index", name: "idx_routine_run_events_projection_keyset" },
+      { type: "index", name: "idx_routine_run_events_one_cancellation_request" },
+      { type: "index", name: "idx_routine_run_events_one_cancellation_outcome" },
+      { type: "trigger", name: "validate_routine_event_insert" },
+      { type: "trigger", name: "routine_events_no_update" },
+      { type: "trigger", name: "routine_events_no_delete" },
+    ],
   },
   {
     file: "0075_workflow_circuits.sql",
@@ -1037,6 +1565,19 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\nCREATE TRIGGER IF NOT EXISTS workflow_circuit_node_events_no_update\n  BEFORE UPDATE ON workflow_circuit_node_events\nBEGIN\n  SELECT RAISE(ABORT, 'workflow circuit node events are append-only: UPDATE is forbidden');\nEND;",
       "\n\nCREATE TRIGGER IF NOT EXISTS workflow_circuit_node_events_no_delete\n  BEFORE DELETE ON workflow_circuit_node_events\nBEGIN\n  SELECT RAISE(ABORT, 'workflow circuit node events are append-only: DELETE is forbidden');\nEND;",
     ],
+    objects: [
+      { type: "table", name: "workflow_circuits" },
+      { type: "table", name: "workflow_circuit_nodes" },
+      { type: "index", name: "idx_workflow_circuit_nodes_tenant" },
+      { type: "table", name: "workflow_circuit_edges" },
+      { type: "index", name: "idx_workflow_circuit_edges_unique" },
+      { type: "index", name: "idx_workflow_circuit_edges_source" },
+      { type: "index", name: "idx_workflow_circuit_edges_target" },
+      { type: "table", name: "workflow_circuit_node_events" },
+      { type: "index", name: "idx_workflow_circuit_node_events_node" },
+      { type: "trigger", name: "workflow_circuit_node_events_no_update" },
+      { type: "trigger", name: "workflow_circuit_node_events_no_delete" },
+    ],
   },
   {
     file: "0077_task_external_source.sql",
@@ -1044,6 +1585,9 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     statements: [
       "-- 0077: provenance-tag tasks that arrive via a governed external integration (PR #659\n-- diverse-model gate P0, filed against the Linear read-only board connector).\n--\n-- migrations/0063 added `source_pot` for the SAME reason on the project-link (pot-to-pot)\n-- path: a reading agent that later picks up a task must be able to tell \"this title/body\n-- came from an untrusted, non-local writer\" before it lets that content reach a model\n-- turn or an unattended auto-assign. That column's name and its downstream checks\n-- (canAgentExecuteTask, routeUnassignedWork, the admin-gated reassignment guard) are\n-- specific to the project-link mechanism (a signed remote pot). Linear is a DIFFERENT\n-- untrusted-writer class -- anyone with edit rights on the bound Linear team, no\n-- pot-to-pot signature involved -- so it gets its own marker rather than overloading\n-- source_pot's \"remote pot slug\" meaning. `external_source` generalizes the SAME\n-- trust invariant: NULL for every locally-created task (the existing, trusted path);\n-- set to an opaque, integration-defined string (e.g. `linear:<teamKey>`) when the row\n-- was written by an external, less-trusted importer. NULL-vs-non-NULL is the trust\n-- boundary; no CHECK/FK constraint is added, mirroring 0063's reasoning -- the value is\n-- a display/audit string, never joined against another table.\n--\n-- The P0 this closes: `skipEvent`/`skipMirror` on Linear-imported tasks suppressed the\n-- EVENT wake, but two status-POLLING drivers never looked at events at all --\n-- canAgentExecuteTask's unassigned-auto-pickup branch (src/agents/execute.ts) and the\n-- concierge's routeUnassignedWork cron (src/concierge/service.ts) -- and neither had any\n-- column to test, because no provenance was persisted at create time. Both are updated\n-- (same PR) to also exclude `external_source IS NOT NULL`, so a Linear-origin task is\n-- structurally indistinguishable from a cross-pot task for every trust decision that\n-- already existed for source_pot: no auto-pickup, no unattended auto-assign, admin-gated\n-- reassignment, and the untrusted-content prompt fence.\n\nALTER TABLE tasks ADD COLUMN external_source TEXT;",
       "\n\n-- Read-path index: \"show me all tasks that came from a governed external integration\"\n-- (dashboard/MCP provenance filter, audit) without a full table scan. Partial index --\n-- the vast majority of rows are local (external_source IS NULL) and gain nothing from\n-- being indexed here. Mirrors idx_tasks_source_pot (migrations/0063).\nCREATE INDEX IF NOT EXISTS idx_tasks_external_source ON tasks(external_source) WHERE external_source IS NOT NULL;",
+    ],
+    objects: [
+      { type: "index", name: "idx_tasks_external_source" },
     ],
   },
   {
@@ -1057,6 +1601,10 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\nDROP TRIGGER IF EXISTS trg_tasks_provenance_nonblank_update;",
       "\nCREATE TRIGGER trg_tasks_provenance_nonblank_update\nBEFORE UPDATE ON tasks\nFOR EACH ROW\nWHEN (NEW.external_source IS NOT NULL\n      AND TRIM(NEW.external_source, ' ' || char(9) || char(10) || char(11) || char(12) || char(13)) = '')\n  OR (NEW.source_pot IS NOT NULL\n      AND TRIM(NEW.source_pot, ' ' || char(9) || char(10) || char(11) || char(12) || char(13)) = '')\nBEGIN\n  SELECT RAISE(ABORT, 'blank provenance: external_source/source_pot must be a non-blank marker or NULL');\nEND;",
     ],
+    objects: [
+      { type: "trigger", name: "trg_tasks_provenance_nonblank_insert" },
+      { type: "trigger", name: "trg_tasks_provenance_nonblank_update" },
+    ],
   },
   {
     file: "0079_task_priority_and_parent.sql",
@@ -1069,12 +1617,21 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\n-- Ranked board reads: \"the P0s on this squad's board, newest first\". Priority leads the\n-- index because that is the leading filter in every ranked view.\nCREATE INDEX IF NOT EXISTS idx_tasks_priority_status\n  ON tasks (priority, status, squad_id);",
       "\n\n-- Subtask lookup: \"the children of this task\".\nCREATE INDEX IF NOT EXISTS idx_tasks_parent\n  ON tasks (parent_task_id) WHERE parent_task_id IS NOT NULL;",
     ],
+    objects: [
+      { type: "trigger", name: "validate_tasks_parent_insert" },
+      { type: "trigger", name: "validate_tasks_parent_update" },
+      { type: "index", name: "idx_tasks_priority_status" },
+      { type: "index", name: "idx_tasks_parent" },
+    ],
   },
   {
     file: "0082_channel_mention_budget.sql",
     sha256: "598bd65dfa4c238ebffc4edc7df09ec514d84bb0df476a2073a41476c566de0f",
     statements: [
       "-- migration 0082_channel_mention_budget.sql\n-- Creates rate wall table for channel mention budgets.\nCREATE TABLE IF NOT EXISTS channel_mention_budget (\n  tenant      TEXT NOT NULL DEFAULT 'mumega',\n  agent_slug  TEXT NOT NULL,\n  hour_bucket TEXT NOT NULL,\n  count       INTEGER NOT NULL DEFAULT 0,\n  PRIMARY KEY (tenant, agent_slug, hour_bucket)\n);",
+    ],
+    objects: [
+      { type: "table", name: "channel_mention_budget" },
     ],
   },
   {
@@ -1086,6 +1643,7 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\nINSERT INTO agents (\n  id,\n  squad_id,\n  slug,\n  name,\n  role,\n  model,\n  status,\n  purpose,\n  capabilities,\n  parent_agent_id\n)\nSELECT\n  'river-reviewer',\n  COALESCE((SELECT squad_id FROM agents WHERE id = 'river' OR slug = 'river' LIMIT 1), (SELECT id FROM squads LIMIT 1)),\n  'river-reviewer',\n  'River Reviewer',\n  'member',\n  '@cf/meta/llama-3.3',\n  'active',\n  'Pre-flight fail-closed diff and error audit',\n  '[\"review\"]',\n  'river'\nWHERE EXISTS (SELECT 1 FROM squads)\nON CONFLICT(id) DO UPDATE SET\n  parent_agent_id = 'river',\n  purpose = excluded.purpose,\n  capabilities = excluded.capabilities;",
       "\n\nINSERT INTO agents (\n  id,\n  squad_id,\n  slug,\n  name,\n  role,\n  model,\n  status,\n  purpose,\n  capabilities,\n  parent_agent_id\n)\nSELECT\n  'river-frc',\n  COALESCE((SELECT squad_id FROM agents WHERE id = 'river' OR slug = 'river' LIMIT 1), (SELECT id FROM squads LIMIT 1)),\n  'river-frc',\n  'River FRC',\n  'member',\n  '@cf/meta/llama-3.3',\n  'active',\n  'Mathematical coherence, FRC physics and memory receipts',\n  '[\"frc\",\"memory\"]',\n  'river'\nWHERE EXISTS (SELECT 1 FROM squads)\nON CONFLICT(id) DO UPDATE SET\n  parent_agent_id = 'river',\n  purpose = excluded.purpose,\n  capabilities = excluded.capabilities;",
     ],
+    objects: [],
   },
   {
     file: "0084_subagent_token_telemetry.sql",
@@ -1096,11 +1654,18 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\nCREATE INDEX IF NOT EXISTS idx_subagent_token_usage_parent ON subagent_token_usage(parent_agent_id);",
       "\nCREATE INDEX IF NOT EXISTS idx_subagent_token_usage_task ON subagent_token_usage(task_id);",
     ],
+    objects: [
+      { type: "table", name: "subagent_token_usage" },
+      { type: "index", name: "idx_subagent_token_usage_subagent" },
+      { type: "index", name: "idx_subagent_token_usage_parent" },
+      { type: "index", name: "idx_subagent_token_usage_task" },
+    ],
   },
   {
     file: "0085_identity_cleanup.sql",
     sha256: "593762c08c8e7ccdd7c26708d2ba83607df04102173cbca5933602d117c7e011",
     statements: [],
+    objects: [],
   },
   {
     file: "0086_agent_audit_trail.sql",
@@ -1111,6 +1676,13 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\nCREATE INDEX IF NOT EXISTS idx_agent_audit_actor ON agent_audit(actor_id, seq DESC);",
       "\n\n-- Append-only triggers, matching task_verdicts_no_update/_no_delete\n-- (migrations/0008_gate_grants.sql). An audit trail that is append-only only by\n-- convention is not an audit trail: anything with DB access could otherwise\n-- rewrite or delete history silently, which is exactly the failure mode this\n-- table exists to close (agents has no updated_at — see header comment above).\n--\n-- Rollback does NOT need an exception here: per the schema comment, undo is a\n-- NEW row with rollback_to_id pointing at a prior audit id, never a mutation of\n-- an existing one. Verified against src/org/service.ts — the rollback path this\n-- table anticipates is not implemented yet, so there is nothing there to\n-- reconcile with immutability today.\n--\n-- updateAgentProfile DOES need an exception: it writes agent_audit inside the\n-- same env.DB.batch() as the `agents` UPDATE it records (src/org/service.ts,\n-- around lines 893-906), and that batch's third statement UPDATEs the\n-- just-inserted row's after_state — the INSERT (statement 1) runs BEFORE the\n-- `agents` UPDATE (statement 2), so the post-update snapshot can only be\n-- captured with a follow-up read. That is not a design accident: the comment\n-- there rejects computing after_state from a pre-UPDATE JS-side SELECT because\n-- a concurrent write between the read and the transaction would make it a\n-- fabrication. So the trigger below permits exactly that one transition — the\n-- one-time after_state backfill on a row whose after_state is still the ''\n-- sentinel INSERT always writes — and blocks every other UPDATE, including any\n-- second attempt to backfill the same row. Same narrow-allow-list shape as\n-- task_verdicts_no_update (migrations/0069_project_structural_completion.sql:232),\n-- which already carries a controlled exception for exactly this reason: a\n-- blanket append-only trigger with no exception would break this table's own\n-- primary write path.\nCREATE TRIGGER agent_audit_no_update\n  BEFORE UPDATE ON agent_audit\n  WHEN NOT (\n    OLD.after_state = ''\n    AND NEW.after_state <> ''\n    AND NEW.seq IS OLD.seq\n    AND NEW.id IS OLD.id\n    AND NEW.agent_id IS OLD.agent_id\n    AND NEW.actor_id IS OLD.actor_id\n    AND NEW.actor_type IS OLD.actor_type\n    AND NEW.action IS OLD.action\n    AND NEW.fields_changed IS OLD.fields_changed\n    AND NEW.before_state IS OLD.before_state\n    AND NEW.rollback_to_id IS OLD.rollback_to_id\n    AND NEW.created_at IS OLD.created_at\n  )\nBEGIN\n  SELECT RAISE(ABORT, 'agent_audit is append-only: UPDATE is forbidden');\nEND;",
       "\n\nCREATE TRIGGER agent_audit_no_delete\n  BEFORE DELETE ON agent_audit\nBEGIN\n  SELECT RAISE(ABORT, 'agent_audit is append-only: DELETE is forbidden');\nEND;",
+    ],
+    objects: [
+      { type: "table", name: "agent_audit" },
+      { type: "index", name: "idx_agent_audit_agent" },
+      { type: "index", name: "idx_agent_audit_actor" },
+      { type: "trigger", name: "agent_audit_no_update" },
+      { type: "trigger", name: "agent_audit_no_delete" },
     ],
   },
   {
@@ -1123,12 +1695,16 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\nDROP TRIGGER IF EXISTS agents_home_capability_ceiling_update;",
       "\nDROP TRIGGER IF EXISTS squads_home_capability_ceiling_update;",
     ],
+    objects: [],
   },
   {
     file: "0088_channel_mention_budget_v2.sql",
     sha256: "c943106e5176db0e584629bdab7e4583404fc4010850445716db8261f0326c2a",
     statements: [
       "-- 0088_channel_mention_budget_v2.sql\n-- mupot P0 addressing fix (mumega-com#722 follow-up) + rate-wall repair\n-- (flight-20260809-mupot-deploy-unblock, Loom's binding ruling).\n--\n-- channel_mention_budget (0082) keys the 10/hour central-command rate wall on\n-- (tenant, agent_slug, hour_bucket) alone -- no sender dimension. That is a\n-- cross-sender DoS once dispatch actually delivers: ANY linked member can burn\n-- one SPECIFIC recipient's hourly budget and lock out every OTHER sender's\n-- legitimate dispatch to that same agent for the rest of the hour -- including\n-- the directive sender (Hadi).\n--\n-- A first attempt at fixing this (mumega-com#722 follow-up) charged THIS table\n-- IN ADDITION to the 0082 global per-slug wall, not instead of it. That did not\n-- fix the DoS: an extra, narrower constraint cannot lift a lockout an earlier,\n-- wider wall already imposed. Sender A spending 10 mentions on @X still tripped\n-- the 0082 global-per-slug wall for sender B's first mention to @X.\n--\n-- The repair (this migration's actual charge site, src/channels/index.ts\n-- dispatchMention) makes THIS table -- keyed per (tenant, from_member, agent_id,\n-- hour_bucket), i.e. per SENDER per RESOLVED RECIPIENT UUID -- the ONLY\n-- enforced central-command mention wall. The 0082 global per-slug wall is no\n-- longer charged at all; per Loom's ruling, it is removed from enforcement\n-- outright rather than replaced with some other aggregate ceiling (a\n-- global-aggregate cap is a separate authorization decision, not made here).\n--\n-- Additive only (D1 rule: never blind-apply, never drop a table something may\n-- still be reading -- see the CLAUDE.md 0020-DROP landmine note). channel_mention\n-- _budget (0082) is left exactly as it was -- orphaned, not dropped; safe to\n-- remove in a later cleanup migration once nothing references it.\nCREATE TABLE IF NOT EXISTS channel_mention_budget_v2 (\n  tenant      TEXT NOT NULL DEFAULT 'mumega',\n  from_member TEXT NOT NULL,\n  agent_id    TEXT NOT NULL,\n  hour_bucket TEXT NOT NULL,\n  count       INTEGER NOT NULL DEFAULT 0,\n  PRIMARY KEY (tenant, from_member, agent_id, hour_bucket)\n);",
+    ],
+    objects: [
+      { type: "table", name: "channel_mention_budget_v2" },
     ],
   },
   {
@@ -1140,6 +1716,9 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\nUPDATE addon_installations\n   SET mupot_compatibility = '^0.29.0',\n       manifest_sha256     = '41568a456cd69bc49b49ff9d873447ac110f1aa6f92869ea5c164c86b2dcc2b0'\n WHERE tenant = 'mumega'\n   AND addon_key = 'project-link'\n   AND mupot_compatibility = '^0.24.0';",
       "\n\nCREATE TRIGGER IF NOT EXISTS addon_installations_identity_is_immutable\n  BEFORE UPDATE OF id, tenant, addon_key, installed_version, publisher,\n    trust_class, manifest_sha256, mupot_compatibility, installed_by\n  ON addon_installations\n  WHEN NEW.id IS NOT OLD.id\n    OR NEW.tenant IS NOT OLD.tenant\n    OR NEW.addon_key IS NOT OLD.addon_key\n    OR NEW.installed_version IS NOT OLD.installed_version\n    OR NEW.publisher IS NOT OLD.publisher\n    OR NEW.trust_class IS NOT OLD.trust_class\n    OR NEW.manifest_sha256 IS NOT OLD.manifest_sha256\n    OR NEW.mupot_compatibility IS NOT OLD.mupot_compatibility\n    OR NEW.installed_by IS NOT OLD.installed_by\nBEGIN\n  SELECT RAISE(ABORT, 'addon installation identity is immutable');\nEND;",
     ],
+    objects: [
+      { type: "trigger", name: "addon_installations_identity_is_immutable" },
+    ],
   },
   {
     file: "0090_agent_message_lease.sql",
@@ -1150,6 +1729,9 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\nALTER TABLE agent_messages ADD COLUMN dead_lettered_at TEXT;",
       "\nALTER TABLE agent_messages ADD COLUMN dead_letter_reason TEXT;",
       "\n\n-- The lease read path is\n--   WHERE tenant=? AND to_agent=? AND read_at IS NULL AND dead_lettered_at IS NULL\n--     AND (lease_expires_at IS NULL OR lease_expires_at <= now) ORDER BY seq ASC\n-- The existing idx_agent_messages_inbox(tenant, to_agent, read_at, seq) already covers the\n-- first three terms; this one carries the two lease terms as well so the dead-letter listing\n-- and the leasable scan do not degrade to a table scan on a busy inbox.\nCREATE INDEX IF NOT EXISTS idx_agent_messages_lease\n  ON agent_messages(tenant, to_agent, read_at, dead_lettered_at, lease_expires_at, seq);",
+    ],
+    objects: [
+      { type: "index", name: "idx_agent_messages_lease" },
     ],
   },
   {
@@ -1163,12 +1745,23 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\n-- Append-only: a receipt is written once, at consent time, and never corrected —\n-- unlike agent_audit (0086) there is no legitimate two-phase write for this table,\n-- so no controlled exception is carved out.\nCREATE TRIGGER oauth_consent_receipts_no_update\nBEFORE UPDATE ON oauth_consent_receipts\nBEGIN\n  SELECT RAISE(ABORT, 'oauth_consent_receipts is append-only: UPDATE is forbidden');\nEND;",
       "\n\nCREATE TRIGGER oauth_consent_receipts_no_delete\nBEFORE DELETE ON oauth_consent_receipts\nBEGIN\n  SELECT RAISE(ABORT, 'oauth_consent_receipts is append-only: DELETE is forbidden');\nEND;",
     ],
+    objects: [
+      { type: "table", name: "oauth_consent_receipts" },
+      { type: "index", name: "idx_oauth_consent_receipts_agent" },
+      { type: "index", name: "idx_oauth_consent_receipts_human" },
+      { type: "index", name: "idx_oauth_consent_receipts_token" },
+      { type: "trigger", name: "oauth_consent_receipts_no_update" },
+      { type: "trigger", name: "oauth_consent_receipts_no_delete" },
+    ],
   },
   {
     file: "0092_bootstrap_self_audit_once.sql",
     sha256: "929724babc584f3394bc9a7ca741e5a7a50fa20695be6dfaf4ae52f821dae56f",
     statements: [
       "-- 0092_bootstrap_self_audit_once.sql — per-member idempotency guard for\n-- bootstrap_self (mupot#925), enforced at the DB layer, not just app-level.\n--\n-- bootstrap_self (src/members/bootstrap-self.ts) writes exactly one agent_audit\n-- row per human member who ever uses it — action='bootstrap_self',\n-- actor_type='user', actor_id = the CONSENTING MEMBER's id (the human who named\n-- the agent; naming is the witness act, see River's ruling condition 1). A\n-- second connection for the SAME human (a re-login, a second harness — a new\n-- member_tokens row, same members row) must not mint a second agent: \"idempotent\n-- once PER MEMBER, not per token.\"\n--\n-- An app-level SELECT-then-INSERT check has a race window between two\n-- concurrent first-time calls for the same member. This partial UNIQUE index\n-- closes it atomically at the database: the SECOND INSERT for the same\n-- actor_id with action='bootstrap_self' throws 'UNIQUE constraint failed',\n-- which bootstrap_self catches and compensates the (rare, race-only) loser's\n-- just-created department/squad/agent/token against, reporting\n-- 'already_bootstrapped' instead of leaving a duplicate identity live.\n--\n-- Partial (WHERE action = 'bootstrap_self') because agent_audit is shared with\n-- update_agent's 'update_agent' action rows (migration 0086), which legitimately\n-- repeat the same actor_id many times as an admin corrects a profile — a bare\n-- UNIQUE(actor_id) would break that path entirely. Only the bootstrap_self\n-- action is constrained to one row per actor.\n\nCREATE UNIQUE INDEX IF NOT EXISTS idx_agent_audit_bootstrap_self_once\n  ON agent_audit(actor_id)\n  WHERE action = 'bootstrap_self';",
+    ],
+    objects: [
+      { type: "index", name: "idx_agent_audit_bootstrap_self_once" },
     ],
   },
   {
@@ -1182,6 +1775,11 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\nCREATE INDEX IF NOT EXISTS idx_squads_kind      ON squads(kind);",
       "\nCREATE INDEX IF NOT EXISTS idx_agents_kind      ON agents(kind);",
     ],
+    objects: [
+      { type: "index", name: "idx_departments_kind" },
+      { type: "index", name: "idx_squads_kind" },
+      { type: "index", name: "idx_agents_kind" },
+    ],
   },
   {
     file: "0094_flight_dispatched_by.sql",
@@ -1190,6 +1788,9 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "-- 0094_flight_dispatched_by.sql — record WHO DISPATCHED a flight, distinct from\n-- WHO FLIES IT (mupot flight_dispatch executor-delegation defect).\n--\n-- THE DEFECT: flight_dispatch (src/mcp/index.ts) always set flight.agent =\n-- auth.boundAgentId — the caller's own bound agent. There was no way to dispatch\n-- a flight whose EXECUTOR is a different agent than the dispatcher. A member who\n-- wanted agent B to do the work had to dispatch under their OWN seat (flight.agent\n-- = dispatcher) then hand the work to B out-of-band (a manual task_update), which\n-- left the flight record PERMANENTLY WRONG about who actually did the work —\n-- flight.agent said the dispatcher, forever, no matter who executed.\n--\n-- THE FIX makes flight.agent mean what its column comment always said (\"who\n-- flies\") — the EXECUTOR — and adds this column to keep the DISPATCHER\n-- honestly recoverable too. Both facts must survive in the record; neither may\n-- be inferred by overwriting the other. See src/mcp/index.ts's flight_dispatch\n-- (executor_agent_id param + the lead-on-executor's-squad authz gate, mirroring\n-- wake_agent's \"make another agent act\" precedent) and src/flight/service.ts's\n-- createFlight (dispatched_by_agent_id column).\n--\n-- BACKFILL: every row that predates this migration was dispatched under the\n-- old always-self semantics — dispatcher WAS the executor, no exceptions (the\n-- delegation path did not exist before this migration). Backfilling\n-- dispatched_by_agent_id = agent for those rows is therefore a true historical\n-- fact, not a fabrication. New rows always pass this column explicitly from\n-- application code (src/flight/service.ts#createFlight defaults it to f.agent\n-- when the caller does not separately specify a dispatcher, e.g. schedule/cron\n-- dispatch has no distinct human-delegator identity) — the '' DEFAULT below\n-- exists only to satisfy SQLite's ADD COLUMN NOT NULL requirement on the\n-- pre-existing rows and is never relied on afterward.\n--\n-- Same ALTER-TABLE-ADD-COLUMN-NOT-NULL-DEFAULT shape as 0093\n-- (org_kind_home_exemption.sql) — verified there against node:sqlite that SQLite\n-- backfills every existing row to the DEFAULT at ALTER time, which is what lets\n-- the UPDATE below see '' on every old row.\n\nALTER TABLE flights ADD COLUMN dispatched_by_agent_id TEXT NOT NULL DEFAULT '';",
       "\n\nUPDATE flights SET dispatched_by_agent_id = agent WHERE dispatched_by_agent_id = '';",
       "\n\n-- Read-path index: \"what has agent X dispatched (to others)\" / audit queries.\nCREATE INDEX IF NOT EXISTS idx_flights_dispatched_by ON flights(tenant, dispatched_by_agent_id);",
+    ],
+    objects: [
+      { type: "index", name: "idx_flights_dispatched_by" },
     ],
   },
   {
@@ -1200,6 +1801,12 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\nCREATE INDEX IF NOT EXISTS idx_department_audit_scope\n  ON department_audit (tenant_id, department_key, recorded_at DESC);",
       "\n\n-- ── department_outbox: durable bus messages ────────────────────────────────\nCREATE TABLE IF NOT EXISTS department_outbox (\n  id             TEXT PRIMARY KEY,\n  tenant_id      TEXT NOT NULL,\n  department_key TEXT NOT NULL,\n  msg_type       TEXT NOT NULL,\n  payload_json   TEXT NOT NULL CHECK (json_valid(payload_json)),\n  created_at     TEXT NOT NULL,\n  delivered_at   TEXT,\n  consumed_at    TEXT,\n  attempts       INTEGER NOT NULL DEFAULT 0,\n  last_error     TEXT\n);",
       "\n\nCREATE INDEX IF NOT EXISTS idx_department_outbox_pending\n  ON department_outbox (tenant_id, delivered_at, created_at);",
+    ],
+    objects: [
+      { type: "table", name: "department_audit" },
+      { type: "index", name: "idx_department_audit_scope" },
+      { type: "table", name: "department_outbox" },
+      { type: "index", name: "idx_department_outbox_pending" },
     ],
   },
   {
@@ -1226,6 +1833,7 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\nUPDATE tasks SET gate_owner='gate:hadi', updated_at='2026-08-12T18:00:00.000Z' WHERE id='8ffe0eb4-21b7-4861-be9f-4276517d2461' AND gate_owner='hadi';",
       "\nUPDATE tasks SET gate_owner='gate:hadi', updated_at='2026-08-12T18:00:00.000Z' WHERE id='c90c241d-2996-41bf-834e-d41433715a93' AND gate_owner='hadi';",
     ],
+    objects: [],
   },
   {
     file: "0097_fleet_agents_model.sql",
@@ -1233,6 +1841,7 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     statements: [
       "-- 0097_fleet_agents_model.sql — runtime-reported model on fleet_agents (harness-native-mupot, lane A).\n--\n-- The harness checkin (POST /api/fleet/attach with runtime='pi' + model) reports the seat's\n-- ACTUAL runtime model on session start + model change. fleet_agents.model is the\n-- runtime-truth copy; agents.model (the identity record the dashboard reads) is updated by\n-- the same upsert — one truth, two writes, so the Fleet Activity view shows live models.\n-- model is untrusted display metadata (reported-truth, never canonical authority until a\n-- future profile/policy lock exists — gate-protocol v2 Appendix A discipline).\nALTER TABLE fleet_agents ADD COLUMN model TEXT;",
     ],
+    objects: [],
   },
   {
     file: "0098_fleet_control_log_squad.sql",
@@ -1240,6 +1849,9 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     statements: [
       "-- 0098_fleet_control_log_squad.sql — extend the control audit trail to squad-scoped requests.\n--\n-- A squad-scoped control-request (engine.control_squad, agents/fleet-control/engine.py on the\n-- host) has no single agent_id — it fans a verb out to every manifest whose `squads` includes\n-- the target squad_id. fleet_control_log.agent_id is NOT NULL (0034); rather than a table\n-- recreate (SQLite has no ALTER COLUMN, and a full backup/restore is unwarranted for adding one\n-- nullable audit column — see [[feedback_migration_backup_all_reinsert_all_antipattern]]), a\n-- squad-targeted row leaves agent_id = '' (same NOT NULL DEFAULT '' backfill shape already used\n-- by 0093/0094 for this exact situation) and carries the squad id in this new column instead.\n--\n-- Exactly one of (agent_id != '', squad_id IS NOT NULL) holds for any row — enforced at the\n-- application layer (src/fleet/control.ts's emitControlRequest / emitSquadControlRequest write\n-- exactly one), not by a CHECK constraint, to avoid recreating the table for a column this\n-- narrowly scoped.\n\nALTER TABLE fleet_control_log ADD COLUMN squad_id TEXT;",
       "\n\nCREATE INDEX IF NOT EXISTS idx_fleet_control_log_squad\n  ON fleet_control_log(tenant, squad_id);",
+    ],
+    objects: [
+      { type: "index", name: "idx_fleet_control_log_squad" },
     ],
   },
   {
@@ -1251,6 +1863,10 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\n-- Sweep support: the inactivity/TTL cron scans for tokens past their horizon. Partial\n-- index on the live set only — the revoked rows are the majority over time and never\n-- need scanning.\nCREATE INDEX IF NOT EXISTS idx_member_tokens_expiry_sweep\n    ON member_tokens (expires_at)\n WHERE revoked_at IS NULL;",
       "\n\nCREATE INDEX IF NOT EXISTS idx_member_tokens_last_used\n    ON member_tokens (last_used_at)\n WHERE revoked_at IS NULL;",
     ],
+    objects: [
+      { type: "index", name: "idx_member_tokens_expiry_sweep" },
+      { type: "index", name: "idx_member_tokens_last_used" },
+    ],
   },
   {
     file: "0101_module_registry_model.sql",
@@ -1258,6 +1874,7 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     statements: [
       "-- Migration: 0101_module_registry_model.sql\n-- Description: Add optional model column to module_registry table (G-3 / Flight P1)\n--\n-- Why: Module presence previously tracked adapter, identity, and capabilities, but not\n-- the active model (e.g. 'google/gemini-3.7-flash', 'anthropic/claude-sonnet-4-6').\n-- This enables live self-reporting telemetry and wires the powered_by edge in the\n-- Fleet Topology Map without guessing from identity strings.\n\nALTER TABLE module_registry ADD COLUMN model TEXT;",
     ],
+    objects: [],
   },
   {
     file: "0102_secret_env.sql",
@@ -1270,6 +1887,14 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\nCREATE TABLE IF NOT EXISTS secret_env_audit (\n  id           TEXT PRIMARY KEY,\n  tenant       TEXT NOT NULL,\n  request_id   TEXT,\n  binding_name TEXT,\n  action       TEXT NOT NULL, -- request | bind | reject | rotate | revoke\n  actor_id     TEXT NOT NULL,\n  detail       TEXT,\n  recorded_at  TEXT NOT NULL\n);",
       "\n\nCREATE INDEX IF NOT EXISTS idx_secret_env_audit_tenant\n  ON secret_env_audit (tenant, recorded_at DESC);",
     ],
+    objects: [
+      { type: "table", name: "secret_env_requests" },
+      { type: "index", name: "idx_secret_env_requests_pending" },
+      { type: "table", name: "secret_env_bindings" },
+      { type: "index", name: "idx_secret_env_bindings_request" },
+      { type: "table", name: "secret_env_audit" },
+      { type: "index", name: "idx_secret_env_audit_tenant" },
+    ],
   },
   {
     file: "0103_agent_connection_verification.sql",
@@ -1278,6 +1903,10 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "-- 0103_agent_connection_verification.sql — bounded verification attempts.\n--\n-- Challenge plaintext is never stored. This counter limits online guesses\n-- against the stored SHA-256 challenge digest and is monotonic by trigger.\n--\n-- Renumbered 0072 -> 0102 -> 0103 (kasra-git, 2026-08-14): origin/main's migration head had\n-- moved to 0101 by the time this PR was gated (#847 review finding, mupot#853). Per\n-- check-migration-numbering.mjs / #729: a migration numbered at or below the\n-- merge-target head merges green and NEVER RUNS — wrangler applies only files\n-- sorting above the applied head. 0102 was free on main at first check but was claimed minutes later by PR #841 (240e1831, 0102_secret_env.sql, still unmerged); 0103 is free as of this push.\n\nALTER TABLE agent_connection_receipts\n  ADD COLUMN verification_attempts INTEGER NOT NULL DEFAULT 0;",
       "\n\nCREATE TRIGGER agent_connection_verification_attempts_insert\nBEFORE INSERT ON agent_connection_receipts\nWHEN NEW.verification_attempts < 0 OR NEW.verification_attempts > 5\nBEGIN\n  SELECT RAISE(ABORT, 'invalid_verification_attempts');\nEND;",
       "\n\nCREATE TRIGGER agent_connection_verification_attempts_update\nBEFORE UPDATE OF verification_attempts ON agent_connection_receipts\nWHEN NEW.verification_attempts < OLD.verification_attempts\n  OR NEW.verification_attempts > 5\nBEGIN\n  SELECT RAISE(ABORT, 'invalid_verification_attempts');\nEND;",
+    ],
+    objects: [
+      { type: "trigger", name: "agent_connection_verification_attempts_insert" },
+      { type: "trigger", name: "agent_connection_verification_attempts_update" },
     ],
   },
   {
@@ -1288,6 +1917,7 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\nALTER TABLE execution_meter ADD COLUMN cache_miss_tokens  INTEGER NOT NULL DEFAULT 0;",
       "\nALTER TABLE execution_meter ADD COLUMN output_tokens      INTEGER NOT NULL DEFAULT 0;",
     ],
+    objects: [],
   },
   {
     file: "0105_runner_receipts.sql",
@@ -1297,6 +1927,12 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\nCREATE INDEX IF NOT EXISTS idx_runner_receipts_seat_created\n  ON runner_receipts(tenant, seat_agent_id, created_at DESC);",
       "\n\nCREATE INDEX IF NOT EXISTS idx_runner_receipts_squad_created\n  ON runner_receipts(tenant, squad_id, created_at DESC);",
       "\n\nCREATE INDEX IF NOT EXISTS idx_runner_receipts_status\n  ON runner_receipts(tenant, status, created_at DESC);",
+    ],
+    objects: [
+      { type: "table", name: "runner_receipts" },
+      { type: "index", name: "idx_runner_receipts_seat_created" },
+      { type: "index", name: "idx_runner_receipts_squad_created" },
+      { type: "index", name: "idx_runner_receipts_status" },
     ],
   },
   {
@@ -1312,6 +1948,15 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\n-- ── provisional marking on the live grant ──────────────────────────────────────────\n-- `capabilities` (0002_members.sql) has no provenance at all: id/member_id/scope_type/\n-- scope_id/capability/created_at. Without this column a reader cannot tell a reviewed,\n-- earned grant from one someone handed themselves five minutes ago — and after\n-- crystallization we need that distinction to have been resolved, not assumed.\n--\n-- NULL          = a normal grant, unrelated to any door (every pre-existing row).\n-- <door_id>     = PROVISIONAL, granted through that door, not yet reviewed.\n-- Cleared back to NULL on crystallize, which is exactly what \"crystal the access\" means:\n-- the grant stops being door-provisional and becomes an ordinary permanent capability.\nALTER TABLE capabilities ADD COLUMN provisional_door_id TEXT;",
       "\n\nCREATE INDEX IF NOT EXISTS idx_capabilities_provisional\n  ON capabilities(provisional_door_id) WHERE provisional_door_id IS NOT NULL;",
     ],
+    objects: [
+      { type: "table", name: "onboarding_doors" },
+      { type: "index", name: "idx_onboarding_doors_tenant_status" },
+      { type: "index", name: "idx_onboarding_doors_one_open" },
+      { type: "table", name: "door_receipts" },
+      { type: "index", name: "idx_door_receipts_door" },
+      { type: "index", name: "idx_door_receipts_subject" },
+      { type: "index", name: "idx_capabilities_provisional" },
+    ],
   },
   {
     file: "0108_module_seat_activity.sql",
@@ -1324,6 +1969,9 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\n-- When an activity report was last ACCEPTED — distinct from activity_at (last CHANGE) and\n-- from last_heartbeat (reachability, which advances even for a REJECTED report).\n--\n-- Without this, a rejected-seq storm is invisible. Loom's #1118 gate scenario: process A\n-- reports seq 100 then crashes; an old clone keeps emitting seq 99 every 90 seconds. The\n-- row stays 'online' forever because the heartbeat always lands, activity stays frozen at\n-- A's last value because every report loses the seq comparison, and NOTHING tells an\n-- operator that every current report is being thrown away. That is split-brain presented\n-- as health.\n--\n-- With all three timestamps a reader can separate the cases: last_heartbeat fresh +\n-- activity_report_at stale means reports are arriving and being REJECTED; both stale means\n-- the seat went quiet; activity_report_at fresh + activity_at old means it is genuinely\n-- holding one state (a long turn, or a wedge).\nALTER TABLE module_registry ADD COLUMN activity_report_at TEXT;",
       "\n\n-- Find wedged/blocked seats without scanning the tenant: the dashboard's\n-- \"who needs attention\" query orders by how long a seat has held one activity.\nCREATE INDEX IF NOT EXISTS idx_module_registry_activity\n  ON module_registry(tenant, activity, activity_at);",
     ],
+    objects: [
+      { type: "index", name: "idx_module_registry_activity" },
+    ],
   },
   {
     file: "0109_flight_reap_receipts.sql",
@@ -1332,6 +1980,11 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "-- 0109_flight_reap_receipts.sql — durable audit receipts for governed flight reaps.\n--\n-- WHY A NEW TABLE INSTEAD OF WIDENING flight_event_outbox's CHECK (the #1132 premise).\n--\n-- reapStalledFlight writes its receipt as event_type='flight.reaped' into flight_event_outbox,\n-- whose 0046 constraint is `CHECK (event_type = 'flight.landed')`. The INSERT therefore THROWS on\n-- every reap, is swallowed by a catch, and the call returns transitioned:true / receipt:false — a\n-- reaped flight with no audit trail. #1132 proposed widening that CHECK. Two findings say not to:\n--\n--   1. THE REBUILD IS THE RISK, NOT THE CONSTRAINT. SQLite cannot ALTER a CHECK, so widening means\n--      create-copy-drop-rename. flight_event_outbox carries TWO indexes\n--      (idx_flight_event_outbox_pending 0046, idx_flight_event_outbox_evidence_keyset 0059), a\n--      project_id column added later, and SIX trigger definitions across 0059 and 0069 — where\n--      0069 REDEFINES two of 0059's, so the live definitions are 0069's, not the ones the earlier\n--      file appears to establish. A rebuild must reproduce all of that exactly on a live table.\n--      That is a \"never blind-apply\" shape.\n--\n--   2. WIDENING WOULD PRODUCE A FALSE RECEIPT, WHICH IS WORSE THAN THE SILENCE IT FIXES.\n--      deliverFlightLandedEvent (src/flight/service.ts) SELECTs `WHERE tenant AND flight_id AND\n--      delivered_at IS NULL` with NO event_type filter, emits a HARDCODED `type:'flight.landed'`,\n--      and UPDATEs delivered_at with NO event_type filter. flushFlightEventOutbox iterates\n--      undelivered rows and passes only flight_id. So the moment a 'flight.reaped' row became\n--      insertable, the flusher would pick it up and ANNOUNCE A REAP AS A LANDING on the bus, then\n--      mark it delivered. A stalled flight would be broadcast as a successful landing.\n--\n-- A reap is not a landing. It is the system giving up on a flight, and its consumer is an auditor,\n-- not the landing pipeline. Separating the surfaces makes the two structurally unconfusable: a\n-- reap receipt cannot be mis-delivered as a landing because it is not in the delivery queue at all.\n--\n-- Purely additive — CREATE TABLE / CREATE INDEX IF NOT EXISTS only. No rebuild, no data movement,\n-- no change to the landing path, and nothing here can fail an existing write.\n\nCREATE TABLE IF NOT EXISTS flight_reap_receipts (\n  id                TEXT PRIMARY KEY,\n  tenant            TEXT NOT NULL,\n  flight_id         TEXT NOT NULL,\n\n  -- Status the flight held immediately before the reap ('preflight' | 'running' | 'sleeping').\n  -- 'waiting' is absent by design: a human review gate is NEVER auto-reaped (a slow human is not\n  -- a dead flight), and the watchdog escalates instead. If a 'waiting' row ever appears here, the\n  -- hard invariant has been broken and this constraint is the alarm.\n  previous_status   TEXT NOT NULL CHECK (previous_status IN ('preflight', 'running', 'sleeping')),\n\n  -- Who triggered it. 'system' is the scheduled watchdog; member/agent are operator-triggered\n  -- reaps through the MCP tool. The 0046 outbox omitted 'system' entirely, which is the second\n  -- reason its CHECK rejected watchdog writes.\n  actor_kind        TEXT NOT NULL CHECK (actor_kind IN ('member', 'agent', 'system')),\n  actor_id          TEXT NOT NULL,\n\n  -- Operator-facing reason, and the predicate's own machine reason. Kept separate so a human\n  -- explanation can never be mistaken for the evaluation that actually fired.\n  reap_reason       TEXT NOT NULL,\n  predicate_reason  TEXT NOT NULL,\n\n  -- The evidence the decision rested on: how old the flight was, and the threshold applied.\n  -- Recording both makes a wrong reap diagnosable without re-deriving the predicate.\n  age_ms            INTEGER,\n  timeout_ms        INTEGER,\n\n  payload           TEXT NOT NULL CHECK (json_valid(payload)),\n  created_at        TEXT NOT NULL,\n\n  -- One receipt per reap. A flight can only be reaped once (the UPDATE that transitions it is\n  -- guarded on a non-terminal status), so a duplicate here means a double-reap and should be\n  -- rejected rather than silently recorded twice.\n  UNIQUE (tenant, flight_id)\n);",
       "\n\n-- Audit read pattern: \"what has been reaped lately, newest first\", tenant-scoped.\nCREATE INDEX IF NOT EXISTS idx_flight_reap_receipts_recent\n  ON flight_reap_receipts (tenant, created_at DESC);",
       "\n\n-- Lookup by flight, for \"why did this flight die?\".\nCREATE INDEX IF NOT EXISTS idx_flight_reap_receipts_flight\n  ON flight_reap_receipts (tenant, flight_id);",
+    ],
+    objects: [
+      { type: "table", name: "flight_reap_receipts" },
+      { type: "index", name: "idx_flight_reap_receipts_recent" },
+      { type: "index", name: "idx_flight_reap_receipts_flight" },
     ],
   },
   {
@@ -1344,6 +1997,13 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\n-- Append-only, enforced. A receipt an operator can edit is not a receipt.\nCREATE TRIGGER gate_owner_reassignments_no_update\nBEFORE UPDATE ON gate_owner_reassignments\nBEGIN\n  SELECT RAISE(ABORT, 'gate_owner_reassignments is append-only: UPDATE is forbidden');\nEND;",
       "\n\nCREATE TRIGGER gate_owner_reassignments_no_delete\nBEFORE DELETE ON gate_owner_reassignments\nBEGIN\n  SELECT RAISE(ABORT, 'gate_owner_reassignments is append-only: DELETE is forbidden');\nEND;",
     ],
+    objects: [
+      { type: "table", name: "gate_owner_reassignments" },
+      { type: "index", name: "idx_gate_owner_reassign_task" },
+      { type: "index", name: "idx_gate_owner_reassign_actor" },
+      { type: "trigger", name: "gate_owner_reassignments_no_update" },
+      { type: "trigger", name: "gate_owner_reassignments_no_delete" },
+    ],
   },
   {
     file: "0115_membership_receipts.sql",
@@ -1354,6 +2014,13 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\nCREATE INDEX IF NOT EXISTS idx_membership_receipts_target\n  ON membership_receipts(tenant, target_agent_id, seq DESC);",
       "\n\nCREATE TRIGGER membership_receipts_no_update\n  BEFORE UPDATE ON membership_receipts\nBEGIN\n  SELECT RAISE(ABORT, 'membership_receipts is append-only');\nEND;",
       "\n\nCREATE TRIGGER membership_receipts_no_delete\n  BEFORE DELETE ON membership_receipts\nBEGIN\n  SELECT RAISE(ABORT, 'membership_receipts is append-only');\nEND;",
+    ],
+    objects: [
+      { type: "table", name: "membership_receipts" },
+      { type: "index", name: "idx_membership_receipts_squad" },
+      { type: "index", name: "idx_membership_receipts_target" },
+      { type: "trigger", name: "membership_receipts_no_update" },
+      { type: "trigger", name: "membership_receipts_no_delete" },
     ],
   },
   {
@@ -1368,12 +2035,19 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\nALTER TABLE memberships_new RENAME TO memberships;",
       "\n\nPRAGMA foreign_keys = on;",
     ],
+    objects: [
+      { type: "table", name: "memberships_orphan_quarantine_0116" },
+      { type: "table", name: "memberships_new" },
+    ],
   },
   {
     file: "0117_memberships_delete_receipt.sql",
     sha256: "a43e351039b27077bab3e21f4bf6650eeeef4765ee00124b7b3451df542a3347",
     statements: [
       "-- 0117_memberships_delete_receipt.sql\n--\n-- memberships FKs CASCADE on agent/squad delete (0001 / 0111). Receipts do\n-- NOT cascade (0110). After honouring input.capability, a surviving add\n-- receipt would ASSERT that authority is still live once the membership row\n-- is gone — a false positive, worse than the original silent gap.\n--\n-- SQLite fires AFTER DELETE on the child when CASCADE deletes it, provided\n-- foreign_keys is ON. D1 cannot turn foreign_keys OFF inside a migration\n-- transaction (PRAGMA is a documented no-op); CASCADE therefore fires on D1\n-- the same way it fires here. Verified against node:sqlite with\n-- PRAGMA foreign_keys=ON: DELETE parent → child gone AND this trigger wrote\n-- a removal receipt. Fallback (transactional revoke, no cascade) is not\n-- 0111 admits the same fact and copies with WHERE EXISTS so a no-op PRAGMA\n-- cannot abort the rebuild on an orphan. 0112 relies on enforcement staying ON.\n--\n-- Covers cascade and direct DELETE identically. Application-level remove\n-- receipts still record the operator; this trigger records the row death\n-- itself as actor 'system:cascade'. Two remove rows on a tool-path delete\n-- is the acceptable cost of a trail that cannot be bypassed in application\n-- code.\n\nCREATE TRIGGER memberships_write_removal_receipt\nAFTER DELETE ON memberships\nBEGIN\n  INSERT INTO membership_receipts (\n    id, tenant, actor_member_id, actor_bound_agent_id, target_agent_id,\n    squad_id, action, capability, prior_capability, result\n  )\n  VALUES (\n    -- #1173: include random suffix so a reused membership id cannot collide\n    -- on the UNIQUE constraint (INSERT OR IGNORE is the WRONG fix — it would\n    -- silently drop the receipt, recreating the original blocker this trigger\n    -- exists to close).\n    'cascade-' || OLD.id || '-' || lower(hex(randomblob(4))),\n    -- #1170: a trigger cannot see env.TENANT_SLUG, so it CANNOT determine the\n    -- tenant. The previous COALESCE chain guessed — sometimes wrongly — which\n    -- hid revocation receipts from a tenant-scoped audit while showing the\n    -- grant. 'system' is honest: the trigger records the row death, not the\n    -- tenant. Application-path receipts carry the correct tenant via\n    -- env.TENANT_SLUG. NO COALESCE FALLBACK.\n    'system',\n    'system:cascade',\n    NULL,\n    OLD.agent_id,\n    OLD.squad_id,\n    'remove',\n    NULL,\n    OLD.capability,\n    'removed'\n  );\nEND;",
+    ],
+    objects: [
+      { type: "trigger", name: "memberships_write_removal_receipt" },
     ],
   },
   {
@@ -1386,6 +2060,13 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\n-- Append-only, enforced.\nCREATE TRIGGER verdict_reversals_no_update\nBEFORE UPDATE ON verdict_reversals\nBEGIN\n  SELECT RAISE(ABORT, 'verdict_reversals is append-only: UPDATE is forbidden');\nEND;",
       "\n\nCREATE TRIGGER verdict_reversals_no_delete\nBEFORE DELETE ON verdict_reversals\nBEGIN\n  SELECT RAISE(ABORT, 'verdict_reversals is append-only: DELETE is forbidden');\nEND;",
     ],
+    objects: [
+      { type: "table", name: "verdict_reversals" },
+      { type: "index", name: "idx_verdict_reversals_task" },
+      { type: "index", name: "idx_verdict_reversals_actor" },
+      { type: "trigger", name: "verdict_reversals_no_update" },
+      { type: "trigger", name: "verdict_reversals_no_delete" },
+    ],
   },
   {
     file: "0119_presence_seat_pk.sql",
@@ -1397,6 +2078,10 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\nALTER TABLE presence_new RENAME TO presence;",
       "\n\nCREATE INDEX IF NOT EXISTS idx_presence_tenant_seen ON presence(tenant, last_seen_at DESC);",
     ],
+    objects: [
+      { type: "table", name: "presence_new" },
+      { type: "index", name: "idx_presence_tenant_seen" },
+    ],
   },
   {
     file: "0120_targeted_seat_messages.sql",
@@ -1404,6 +2089,9 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     statements: [
       "-- 0120_targeted_seat_messages.sql — Targeted seat mailboxes for agent_messages.\n--\n-- Why: Previously, agent_messages addressed only to_agent (the family). When multiple\n-- concurrent seats share the same family token (e.g. Mumega Ceo desktop vs Cursor Cloud seats),\n-- calling inbox() or inbox_lease() without a target seat would drain or head-of-line block\n-- messages intended for a specific runtime session.\n--\n-- This migration adds a nullable target_seat column to agent_messages and an index supporting\n-- efficient partition querying per (tenant, to_agent, target_seat, read_at).\n\nALTER TABLE agent_messages ADD COLUMN target_seat TEXT;",
       "\n\nCREATE INDEX IF NOT EXISTS idx_agent_messages_target_seat\n  ON agent_messages(tenant, to_agent, target_seat, read_at, seq);",
+    ],
+    objects: [
+      { type: "index", name: "idx_agent_messages_target_seat" },
     ],
   },
   {
@@ -1436,6 +2124,33 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\nCREATE TRIGGER flight_task_assignments_no_delete\nBEFORE DELETE ON flight_task_assignments\nBEGIN\n  SELECT RAISE(ABORT, 'flight task assignments are immutable');\nEND;",
       "\n\nCREATE TRIGGER flight_dependencies_no_update\nBEFORE UPDATE ON flight_dependencies\nBEGIN\n  SELECT RAISE(ABORT, 'flight dependencies are immutable');\nEND;",
       "\n\nCREATE TRIGGER flight_dependencies_no_delete\nBEFORE DELETE ON flight_dependencies\nBEGIN\n  SELECT RAISE(ABORT, 'flight dependencies are immutable');\nEND;",
+    ],
+    objects: [
+      { type: "table", name: "objectives" },
+      { type: "index", name: "idx_objectives_tenant_squad" },
+      { type: "index", name: "idx_objectives_tenant_project" },
+      { type: "table", name: "objective_acceptance_keys" },
+      { type: "table", name: "flight_objectives" },
+      { type: "table", name: "flight_lanes" },
+      { type: "index", name: "idx_flight_lanes_one_gate_per_flight" },
+      { type: "index", name: "idx_flight_lanes_agent_seat" },
+      { type: "table", name: "flight_task_assignments" },
+      { type: "index", name: "idx_flight_task_assignments_flight" },
+      { type: "index", name: "idx_flight_task_assignments_agent_seat" },
+      { type: "table", name: "flight_dependencies" },
+      { type: "index", name: "idx_flight_dependencies_child" },
+      { type: "trigger", name: "objectives_no_update" },
+      { type: "trigger", name: "objectives_no_delete" },
+      { type: "trigger", name: "objective_acceptance_keys_no_update" },
+      { type: "trigger", name: "objective_acceptance_keys_no_delete" },
+      { type: "trigger", name: "flight_objectives_no_update" },
+      { type: "trigger", name: "flight_objectives_no_delete" },
+      { type: "trigger", name: "flight_lanes_no_update" },
+      { type: "trigger", name: "flight_lanes_no_delete" },
+      { type: "trigger", name: "flight_task_assignments_no_update" },
+      { type: "trigger", name: "flight_task_assignments_no_delete" },
+      { type: "trigger", name: "flight_dependencies_no_update" },
+      { type: "trigger", name: "flight_dependencies_no_delete" },
     ],
   },
   {
@@ -1471,6 +2186,36 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\nCREATE TRIGGER seat_attestations_no_update\nBEFORE UPDATE ON seat_attestations\nBEGIN\n  SELECT RAISE(ABORT, 'seat attestations are immutable');\nEND;",
       "\n\nCREATE TRIGGER seat_attestations_no_delete\nBEFORE DELETE ON seat_attestations\nBEGIN\n  SELECT RAISE(ABORT, 'seat attestations are immutable');\nEND;",
     ],
+    objects: [
+      { type: "table", name: "runtime_seats" },
+      { type: "index", name: "idx_runtime_seats_agent_state" },
+      { type: "index", name: "idx_runtime_seats_host_state" },
+      { type: "table", name: "runtime_seat_generations" },
+      { type: "table", name: "runtime_seat_leases" },
+      { type: "index", name: "idx_runtime_seat_leases_one_active" },
+      { type: "index", name: "idx_runtime_seat_leases_expiry" },
+      { type: "table", name: "token_binding_attestations" },
+      { type: "table", name: "seat_attestations" },
+      { type: "trigger", name: "token_binding_attestations_validate_identity" },
+      { type: "trigger", name: "seat_attestations_validate_identity" },
+      { type: "trigger", name: "runtime_seats_identity_immutable" },
+      { type: "trigger", name: "runtime_seats_generation_monotonic" },
+      { type: "trigger", name: "runtime_seats_fencing_monotonic" },
+      { type: "trigger", name: "runtime_seats_advance_requires_no_active_lease" },
+      { type: "trigger", name: "runtime_seats_no_delete" },
+      { type: "trigger", name: "runtime_seat_generations_no_update" },
+      { type: "trigger", name: "runtime_seat_generations_no_delete" },
+      { type: "trigger", name: "runtime_seat_leases_require_current_generation" },
+      { type: "trigger", name: "runtime_seat_leases_monotonic_insert" },
+      { type: "trigger", name: "runtime_seat_leases_identity_immutable" },
+      { type: "trigger", name: "runtime_seat_leases_valid_transition" },
+      { type: "trigger", name: "runtime_seat_leases_active_renewal_only" },
+      { type: "trigger", name: "runtime_seat_leases_no_delete" },
+      { type: "trigger", name: "token_binding_attestations_no_update" },
+      { type: "trigger", name: "token_binding_attestations_no_delete" },
+      { type: "trigger", name: "seat_attestations_no_update" },
+      { type: "trigger", name: "seat_attestations_no_delete" },
+    ],
   },
   {
     file: "0123_execution_receipt_ledger.sql",
@@ -1490,6 +2235,22 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\nCREATE TRIGGER execution_receipts_no_delete\nBEFORE DELETE ON execution_receipts\nBEGIN\n  SELECT RAISE(ABORT, 'execution receipts are append-only');\nEND;",
       "\n\nCREATE TRIGGER execution_receipt_edges_no_update\nBEFORE UPDATE ON execution_receipt_edges\nBEGIN\n  SELECT RAISE(ABORT, 'execution receipt edges are append-only');\nEND;",
       "\n\nCREATE TRIGGER execution_receipt_edges_no_delete\nBEFORE DELETE ON execution_receipt_edges\nBEGIN\n  SELECT RAISE(ABORT, 'execution receipt edges are append-only');\nEND;",
+    ],
+    objects: [
+      { type: "table", name: "execution_receipts" },
+      { type: "index", name: "idx_execution_receipts_tenant_sequence" },
+      { type: "index", name: "idx_execution_receipts_flight_sequence" },
+      { type: "index", name: "idx_execution_receipts_task_sequence" },
+      { type: "index", name: "idx_execution_receipts_seat_generation" },
+      { type: "table", name: "execution_receipt_heads" },
+      { type: "table", name: "execution_receipt_edges" },
+      { type: "index", name: "idx_execution_receipt_edges_to" },
+      { type: "trigger", name: "execution_receipt_heads_monotonic" },
+      { type: "trigger", name: "execution_receipt_heads_no_delete" },
+      { type: "trigger", name: "execution_receipts_no_update" },
+      { type: "trigger", name: "execution_receipts_no_delete" },
+      { type: "trigger", name: "execution_receipt_edges_no_update" },
+      { type: "trigger", name: "execution_receipt_edges_no_delete" },
     ],
   },
   {
@@ -1511,6 +2272,22 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\nCREATE TRIGGER flight_dependency_artifacts_no_update\nBEFORE UPDATE ON flight_dependency_artifacts\nBEGIN\n  SELECT RAISE(ABORT, 'flight dependency artifacts are immutable');\nEND;",
       "\n\nCREATE TRIGGER flight_dependency_artifacts_no_delete\nBEFORE DELETE ON flight_dependency_artifacts\nBEGIN\n  SELECT RAISE(ABORT, 'flight dependency artifacts are immutable');\nEND;",
     ],
+    objects: [
+      { type: "table", name: "artifacts" },
+      { type: "index", name: "idx_artifacts_flight_task" },
+      { type: "index", name: "idx_artifacts_digest" },
+      { type: "table", name: "artifact_retrieval_receipts" },
+      { type: "index", name: "idx_artifact_retrievals_artifact" },
+      { type: "table", name: "flight_dependency_artifacts" },
+      { type: "index", name: "idx_flight_dependency_artifacts_consumer" },
+      { type: "trigger", name: "artifacts_no_update" },
+      { type: "trigger", name: "artifacts_no_delete" },
+      { type: "trigger", name: "artifact_retrievals_independent_agent" },
+      { type: "trigger", name: "artifact_retrieval_receipts_no_update" },
+      { type: "trigger", name: "artifact_retrieval_receipts_no_delete" },
+      { type: "trigger", name: "flight_dependency_artifacts_no_update" },
+      { type: "trigger", name: "flight_dependency_artifacts_no_delete" },
+    ],
   },
   {
     file: "0125_mutation_host_control_audit.sql",
@@ -1528,6 +2305,19 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\nCREATE TRIGGER host_control_receipts_no_update\nBEFORE UPDATE ON host_control_receipts\nBEGIN\n  SELECT RAISE(ABORT, 'host control receipts are append-only');\nEND;",
       "\n\nCREATE TRIGGER host_control_receipts_no_delete\nBEFORE DELETE ON host_control_receipts\nBEGIN\n  SELECT RAISE(ABORT, 'host control receipts are append-only');\nEND;",
     ],
+    objects: [
+      { type: "table", name: "mutation_audit_entries" },
+      { type: "index", name: "idx_mutation_audit_flight_cursor" },
+      { type: "index", name: "idx_mutation_audit_task_cursor" },
+      { type: "index", name: "idx_mutation_audit_principal_cursor" },
+      { type: "table", name: "host_control_receipts" },
+      { type: "index", name: "idx_host_control_flight_cursor" },
+      { type: "index", name: "idx_host_control_host_cursor" },
+      { type: "trigger", name: "mutation_audit_entries_no_update" },
+      { type: "trigger", name: "mutation_audit_entries_no_delete" },
+      { type: "trigger", name: "host_control_receipts_no_update" },
+      { type: "trigger", name: "host_control_receipts_no_delete" },
+    ],
   },
   {
     file: "0126_decision_requests.sql",
@@ -1544,6 +2334,18 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\nCREATE TRIGGER decision_request_resolutions_no_update\nBEFORE UPDATE ON decision_request_resolutions\nBEGIN\n  SELECT RAISE(ABORT, 'decision request resolutions are immutable');\nEND;",
       "\n\nCREATE TRIGGER decision_request_resolutions_no_delete\nBEFORE DELETE ON decision_request_resolutions\nBEGIN\n  SELECT RAISE(ABORT, 'decision request resolutions are immutable');\nEND;",
     ],
+    objects: [
+      { type: "table", name: "decision_requests" },
+      { type: "index", name: "idx_decision_requests_one_open_dedupe" },
+      { type: "index", name: "idx_decision_requests_open_expiry" },
+      { type: "index", name: "idx_decision_requests_flight" },
+      { type: "table", name: "decision_request_resolutions" },
+      { type: "trigger", name: "decision_requests_identity_immutable" },
+      { type: "trigger", name: "decision_requests_terminal_transition" },
+      { type: "trigger", name: "decision_requests_no_delete" },
+      { type: "trigger", name: "decision_request_resolutions_no_update" },
+      { type: "trigger", name: "decision_request_resolutions_no_delete" },
+    ],
   },
   {
     file: "0127_loop_control_receipts.sql",
@@ -1553,6 +2355,12 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\nCREATE INDEX IF NOT EXISTS idx_loop_control_receipts_loop\n  ON loop_control_receipts (tenant, loop_id, issued_at DESC);",
       "\n\nCREATE TRIGGER IF NOT EXISTS loop_control_receipts_no_update\n  BEFORE UPDATE ON loop_control_receipts\nBEGIN\n  SELECT RAISE(ABORT, 'loop_control_receipts is append-only');\nEND;",
       "\n\nCREATE TRIGGER IF NOT EXISTS loop_control_receipts_no_delete\n  BEFORE DELETE ON loop_control_receipts\nBEGIN\n  SELECT RAISE(ABORT, 'loop_control_receipts is append-only');\nEND;",
+    ],
+    objects: [
+      { type: "table", name: "loop_control_receipts" },
+      { type: "index", name: "idx_loop_control_receipts_loop" },
+      { type: "trigger", name: "loop_control_receipts_no_update" },
+      { type: "trigger", name: "loop_control_receipts_no_delete" },
     ],
   },
   {
@@ -1587,6 +2395,36 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\nCREATE TRIGGER runtime_delivery_authorities_key_separation\nBEFORE INSERT ON runtime_delivery_authorities\nWHEN EXISTS (\n  SELECT 1 FROM runtime_brokers\n   WHERE tenant = NEW.tenant AND key_fingerprint = NEW.key_fingerprint\n)\nOR EXISTS (\n  SELECT 1 FROM runtime_signer_registrations\n   WHERE tenant = NEW.tenant\n     AND NEW.key_fingerprint IN (\n       signing_key_fingerprint, encryption_key_fingerprint\n     )\n)\nBEGIN\n  SELECT RAISE(ABORT, 'runtime authority key must be distinct');\nEND;",
       "\n\nCREATE TRIGGER runtime_brokers_key_separation\nBEFORE INSERT ON runtime_brokers\nWHEN EXISTS (\n  SELECT 1 FROM runtime_delivery_authorities\n   WHERE tenant = NEW.tenant AND key_fingerprint = NEW.key_fingerprint\n)\nOR EXISTS (\n  SELECT 1 FROM runtime_signer_registrations\n   WHERE tenant = NEW.tenant\n     AND NEW.key_fingerprint IN (\n       signing_key_fingerprint, encryption_key_fingerprint\n     )\n)\nBEGIN\n  SELECT RAISE(ABORT, 'runtime broker key must be distinct');\nEND;",
       "\n\nCREATE TRIGGER runtime_signer_registrations_key_separation\nBEFORE INSERT ON runtime_signer_registrations\nWHEN EXISTS (\n  SELECT 1 FROM runtime_brokers\n   WHERE tenant = NEW.tenant\n     AND key_fingerprint IN (\n       NEW.signing_key_fingerprint, NEW.encryption_key_fingerprint\n     )\n)\nOR EXISTS (\n  SELECT 1 FROM runtime_delivery_authorities\n   WHERE tenant = NEW.tenant\n     AND key_fingerprint IN (\n       NEW.signing_key_fingerprint, NEW.encryption_key_fingerprint\n     )\n)\nBEGIN\n  SELECT RAISE(ABORT, 'runtime signer keys must be distinct');\nEND;",
+    ],
+    objects: [
+      { type: "table", name: "runtime_signing_challenges" },
+      { type: "index", name: "idx_runtime_signing_challenges_one_live" },
+      { type: "table", name: "runtime_brokers" },
+      { type: "index", name: "idx_runtime_brokers_one_active_host" },
+      { type: "table", name: "runtime_delivery_authorities" },
+      { type: "table", name: "runtime_signer_registrations" },
+      { type: "table", name: "runtime_signed_request_replays" },
+      { type: "table", name: "runtime_broker_attestations" },
+      { type: "trigger", name: "runtime_signing_challenges_identity_immutable" },
+      { type: "trigger", name: "runtime_signing_challenges_consume_once" },
+      { type: "trigger", name: "runtime_signing_challenges_no_delete" },
+      { type: "trigger", name: "runtime_brokers_identity_immutable" },
+      { type: "trigger", name: "runtime_brokers_lifecycle" },
+      { type: "trigger", name: "runtime_brokers_no_delete" },
+      { type: "trigger", name: "runtime_delivery_authorities_identity_immutable" },
+      { type: "trigger", name: "runtime_delivery_authorities_lifecycle" },
+      { type: "trigger", name: "runtime_delivery_authorities_no_delete" },
+      { type: "trigger", name: "runtime_signer_registrations_identity_immutable" },
+      { type: "trigger", name: "runtime_signer_registrations_lifecycle" },
+      { type: "trigger", name: "runtime_signer_registrations_no_delete" },
+      { type: "trigger", name: "runtime_signed_request_replays_no_update" },
+      { type: "trigger", name: "runtime_signed_request_replays_no_delete" },
+      { type: "trigger", name: "runtime_broker_attestations_no_update" },
+      { type: "trigger", name: "runtime_broker_attestations_validate_registrations" },
+      { type: "trigger", name: "runtime_broker_attestations_no_delete" },
+      { type: "trigger", name: "runtime_delivery_authorities_key_separation" },
+      { type: "trigger", name: "runtime_brokers_key_separation" },
+      { type: "trigger", name: "runtime_signer_registrations_key_separation" },
     ],
   },
   {
@@ -1636,6 +2474,49 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\nCREATE TRIGGER fenced_delivery_evidence_no_update\nBEFORE UPDATE ON fenced_delivery_evidence\nBEGIN\n  SELECT RAISE(ABORT, 'fenced delivery evidence is immutable');\nEND;",
       "\n\nCREATE TRIGGER fenced_delivery_evidence_no_delete\nBEFORE DELETE ON fenced_delivery_evidence\nBEGIN\n  SELECT RAISE(ABORT, 'fenced delivery evidence is immutable');\nEND;",
     ],
+    objects: [
+      { type: "table", name: "encrypted_envelope_ingress_authorizations" },
+      { type: "table", name: "host_envelope_ingress_receipts" },
+      { type: "table", name: "fenced_deliveries" },
+      { type: "index", name: "idx_agent_messages_fenced_delivery" },
+      { type: "table", name: "fenced_delivery_attempts" },
+      { type: "index", name: "idx_fenced_delivery_attempts_one_active" },
+      { type: "table", name: "fenced_delivery_recovery_reservations" },
+      { type: "index", name: "idx_fenced_delivery_recovery_one_open" },
+      { type: "table", name: "fenced_delivery_evidence" },
+      { type: "index", name: "idx_fenced_delivery_evidence_one_provider_result" },
+      { type: "trigger", name: "encrypted_envelope_ingress_authorizations_identity_immutable" },
+      { type: "trigger", name: "encrypted_envelope_ingress_authorizations_consume_once" },
+      { type: "trigger", name: "encrypted_envelope_ingress_authorizations_no_delete" },
+      { type: "trigger", name: "host_envelope_ingress_receipts_validate" },
+      { type: "trigger", name: "host_envelope_ingress_receipts_no_update" },
+      { type: "trigger", name: "host_envelope_ingress_receipts_no_delete" },
+      { type: "trigger", name: "fenced_deliveries_validate_ingress" },
+      { type: "trigger", name: "fenced_deliveries_identity_immutable" },
+      { type: "trigger", name: "fenced_deliveries_state_transition" },
+      { type: "trigger", name: "fenced_deliveries_attempt_three_final_wait" },
+      { type: "trigger", name: "fenced_deliveries_source_ack_requires_chain" },
+      { type: "trigger", name: "fenced_deliveries_source_ack_timestamp_once" },
+      { type: "trigger", name: "fenced_deliveries_no_delete" },
+      { type: "trigger", name: "agent_messages_proof_exact_seat_insert" },
+      { type: "trigger", name: "agent_messages_proof_metadata_insert" },
+      { type: "trigger", name: "agent_messages_proof_identity_immutable" },
+      { type: "trigger", name: "agent_messages_proof_source_insert" },
+      { type: "trigger", name: "agent_messages_proof_read_at_terminal" },
+      { type: "trigger", name: "agent_messages_proof_no_delete" },
+      { type: "trigger", name: "fenced_delivery_attempts_validate" },
+      { type: "trigger", name: "fenced_delivery_attempts_retry_boundary" },
+      { type: "trigger", name: "fenced_delivery_attempts_identity_immutable" },
+      { type: "trigger", name: "fenced_delivery_attempts_state_transition" },
+      { type: "trigger", name: "fenced_delivery_attempts_no_delete" },
+      { type: "trigger", name: "fenced_delivery_recovery_reservations_validate" },
+      { type: "trigger", name: "fenced_delivery_recovery_reservations_identity_immutable" },
+      { type: "trigger", name: "fenced_delivery_recovery_reservations_lifecycle" },
+      { type: "trigger", name: "fenced_delivery_recovery_reservations_no_delete" },
+      { type: "trigger", name: "fenced_delivery_evidence_validate" },
+      { type: "trigger", name: "fenced_delivery_evidence_no_update" },
+      { type: "trigger", name: "fenced_delivery_evidence_no_delete" },
+    ],
   },
   {
     file: "0129_project_worker_platform.sql",
@@ -1653,6 +2534,14 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\n-- Receipts are append-only. The service never UPDATEs or DELETEs; these\n-- triggers close the gap if a raw SQL path tries.\nCREATE TRIGGER project_deployments_immutable_update\nBEFORE UPDATE ON project_deployments\nBEGIN\n  SELECT RAISE(ABORT, 'project_deployments immutable');\nEND;",
       "\n\nCREATE TRIGGER project_deployments_immutable_delete\nBEFORE DELETE ON project_deployments\nBEGIN\n  SELECT RAISE(ABORT, 'project_deployments immutable');\nEND;",
     ],
+    objects: [
+      { type: "table", name: "project_deployments" },
+      { type: "index", name: "idx_project_deployments_project_created" },
+      { type: "index", name: "idx_projects_assigned_squad" },
+      { type: "index", name: "idx_projects_deploy_status" },
+      { type: "trigger", name: "project_deployments_immutable_update" },
+      { type: "trigger", name: "project_deployments_immutable_delete" },
+    ],
   },
   {
     file: "0130_athena_gate_receipts.sql",
@@ -1663,6 +2552,13 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\nCREATE INDEX IF NOT EXISTS idx_athena_gate_receipts_repo_pr\n  ON athena_gate_receipts(repo, pr_number, created_at DESC);",
       "\n\nCREATE TRIGGER athena_gate_receipts_immutable_update\nBEFORE UPDATE ON athena_gate_receipts\nBEGIN\n  SELECT RAISE(ABORT, 'athena_gate_receipts immutable');\nEND;",
       "\n\nCREATE TRIGGER athena_gate_receipts_immutable_delete\nBEFORE DELETE ON athena_gate_receipts\nBEGIN\n  SELECT RAISE(ABORT, 'athena_gate_receipts immutable');\nEND;",
+    ],
+    objects: [
+      { type: "table", name: "athena_gate_receipts" },
+      { type: "index", name: "idx_athena_gate_receipts_created" },
+      { type: "index", name: "idx_athena_gate_receipts_repo_pr" },
+      { type: "trigger", name: "athena_gate_receipts_immutable_update" },
+      { type: "trigger", name: "athena_gate_receipts_immutable_delete" },
     ],
   },
   {
@@ -1679,6 +2575,10 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\nCREATE INDEX IF NOT EXISTS idx_presence_tenant_harness ON presence(tenant, harness);",
       "\nCREATE INDEX IF NOT EXISTS idx_presence_tenant_flight ON presence(tenant, flight_id);",
     ],
+    objects: [
+      { type: "index", name: "idx_presence_tenant_harness" },
+      { type: "index", name: "idx_presence_tenant_flight" },
+    ],
   },
   {
     file: "0132_river_lead_agent.sql",
@@ -1686,6 +2586,7 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     statements: [
       "-- 0131_river_lead_agent.sql — River lead agent + 7-axis presence columns.\n--\n-- River is inserted only when squad-core already exists so the empty-schema\n-- test chain still leaves ZERO rows (tests/helpers-migrations.test.ts).\n-- Runtime / local seed uses src/agents/river-lead.ts#ensureRiverLeadAgent.\n\nINSERT INTO agents (\n  id,\n  squad_id,\n  slug,\n  name,\n  role,\n  model,\n  status,\n  purpose\n)\nSELECT\n  'river',\n  id,\n  'river',\n  'River',\n  'lead',\n  'gemini-3.7-flash',\n  'active',\n  'Council Lead & Autonomous Fleet Steering'\nFROM squads\nWHERE id = 'squad-core' OR slug = 'squad-core'\nLIMIT 1\nON CONFLICT(id) DO UPDATE SET\n  role = excluded.role,\n  model = excluded.model,\n  purpose = excluded.purpose,\n  status = 'active';",
     ],
+    objects: [],
   },
   {
     file: "0133_source_ack_trigger_d1_compat.sql",
@@ -1693,6 +2594,9 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     statements: [
       "-- Rebuild the source-ACK evidence-chain trigger without a compound SELECT.\n--\n-- Migration 0128 originally synthesized six required evidence classes with\n-- UNION ALL. Local D1 rejects that trigger with `too many terms in compound\n-- SELECT`, so fresh installs could not materialize the committed schema. The\n-- corrected 0128 keeps fresh installs viable; this above-head migration makes\n-- databases that already recorded 0128 converge on the same trigger body.\n\nDROP TRIGGER IF EXISTS fenced_deliveries_source_ack_requires_chain;",
       "\n\nCREATE TRIGGER fenced_deliveries_source_ack_requires_chain\nBEFORE UPDATE OF state ON fenced_deliveries\nWHEN NEW.state = 'source_acked'\nAND (\n  NEW.source_acked_at IS NULL\n  OR OLD.state <> 'runtime_acked'\n  OR NOT EXISTS (\n    SELECT 1\n      FROM fenced_delivery_attempts attempt\n     WHERE attempt.id = OLD.active_attempt_id\n       AND attempt.tenant = OLD.tenant\n       AND attempt.delivery_id = OLD.id\n       AND attempt.attempt_number = OLD.active_attempt_number\n       AND attempt.generation = OLD.generation\n       AND attempt.fencing_epoch = OLD.current_fencing_epoch\n  )\n  OR (\n    SELECT\n      COALESCE(MAX(evidence.evidence_type = 'host.persisted'), 0)\n      + COALESCE(MAX(evidence.evidence_type = 'effect.intent'), 0)\n      + COALESCE(MAX(evidence.evidence_type IN ('provider.observed','provider.reconciled')), 0)\n      + COALESCE(MAX(evidence.evidence_type = 'runtime.injected'), 0)\n      + COALESCE(MAX(evidence.evidence_type = 'runtime.consumed'), 0)\n      + COALESCE(MAX(evidence.evidence_type = 'runtime.ack'), 0)\n      FROM fenced_delivery_evidence evidence\n     WHERE evidence.tenant = OLD.tenant\n       AND evidence.delivery_id = OLD.id\n       AND evidence.attempt_id = OLD.active_attempt_id\n       AND evidence.attempt_number = OLD.active_attempt_number\n       AND evidence.runtime_seat_id = OLD.runtime_seat_id\n       AND evidence.generation = OLD.generation\n       AND evidence.assignment_epoch = OLD.assignment_epoch\n       AND evidence.fencing_epoch = OLD.current_fencing_epoch\n       AND evidence.effect_key = OLD.effect_key\n       AND evidence.payload_digest = OLD.payload_digest\n       AND evidence.ciphertext_digest = OLD.ciphertext_digest\n       AND evidence.envelope_digest = OLD.envelope_digest\n       AND evidence.runtime_input_digest = OLD.runtime_input_digest\n  ) <> 6\n)\nBEGIN\n  SELECT RAISE(ABORT, 'fenced delivery source ack requires complete evidence');\nEND;",
+    ],
+    objects: [
+      { type: "trigger", name: "fenced_deliveries_source_ack_requires_chain" },
     ],
   },
   {
@@ -1703,6 +2607,11 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\nCREATE INDEX IF NOT EXISTS idx_agent_token_rotation_handoffs_resume\n  ON agent_token_rotation_handoffs (tenant, agent_id, member_id, prior_token_id, state);",
       "\n\n-- The liveness/race predicate lives in this trigger because an application-side\n-- receipt check runs after D1.batch() has committed.  A zero-row prior update\n-- must abort this transaction so neither a replacement row nor any dependent\n-- state can survive a lost race.\nCREATE TRIGGER agent_token_rotation_handoff_activate\nBEFORE UPDATE OF state ON agent_token_rotation_handoffs\nWHEN OLD.state = 'pending' AND NEW.state = 'active'\nBEGIN\n  SELECT RAISE(ABORT, 'replacement_audit_not_sent')\n   WHERE OLD.audit_state <> 'sent';\n\n  UPDATE member_tokens\n     SET revoked_at = NEW.activated_at\n   WHERE id = OLD.prior_token_id\n     AND member_id = OLD.member_id\n     AND agent_id = OLD.agent_id\n     AND tenant = OLD.tenant\n     AND revoked_at IS NULL\n     AND (expires_at IS NULL OR julianday(expires_at) > julianday(NEW.activated_at));\n\n  SELECT RAISE(ABORT, 'replacement_prior_not_live')\n   WHERE changes() <> 1;\n\n  UPDATE member_tokens\n     SET revoked_at = NULL\n   WHERE id = OLD.replacement_token_id\n     AND member_id = OLD.member_id\n     AND agent_id = OLD.agent_id\n     AND tenant = OLD.tenant\n     AND revoked_at = OLD.created_at;\n\n  SELECT RAISE(ABORT, 'replacement_not_pending')\n   WHERE changes() <> 1;\nEND;",
     ],
+    objects: [
+      { type: "table", name: "agent_token_rotation_handoffs" },
+      { type: "index", name: "idx_agent_token_rotation_handoffs_resume" },
+      { type: "trigger", name: "agent_token_rotation_handoff_activate" },
+    ],
   },
   {
     file: "0135_agent_token_rotation_claim_ready.sql",
@@ -1711,6 +2620,9 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "-- 0135 — audit/activation must wait for a durably recorded claim handoff.\n\nALTER TABLE agent_token_rotation_handoffs\n  ADD COLUMN claim_state TEXT NOT NULL DEFAULT 'pending'\n    CHECK (claim_state IN ('pending', 'ready'));",
       "\n\nDROP TRIGGER IF EXISTS agent_token_rotation_handoff_activate;",
       "\nCREATE TRIGGER agent_token_rotation_handoff_activate\nBEFORE UPDATE OF state ON agent_token_rotation_handoffs\nWHEN OLD.state = 'pending' AND NEW.state = 'active'\nBEGIN\n  SELECT RAISE(ABORT, 'replacement_claim_not_ready')\n   WHERE OLD.claim_state <> 'ready';\n  SELECT RAISE(ABORT, 'replacement_audit_not_sent')\n   WHERE OLD.audit_state <> 'sent';\n  UPDATE member_tokens SET revoked_at = NEW.activated_at\n   WHERE id = OLD.prior_token_id AND member_id = OLD.member_id AND agent_id = OLD.agent_id\n     AND tenant = OLD.tenant AND revoked_at IS NULL\n     AND (expires_at IS NULL OR julianday(expires_at) > julianday(NEW.activated_at));\n  SELECT RAISE(ABORT, 'replacement_prior_not_live') WHERE changes() <> 1;\n  UPDATE member_tokens SET revoked_at = NULL\n   WHERE id = OLD.replacement_token_id AND member_id = OLD.member_id AND agent_id = OLD.agent_id\n     AND tenant = OLD.tenant AND revoked_at = OLD.created_at;\n  SELECT RAISE(ABORT, 'replacement_not_pending') WHERE changes() <> 1;\nEND;",
+    ],
+    objects: [
+      { type: "trigger", name: "agent_token_rotation_handoff_activate" },
     ],
   },
   {
@@ -1722,6 +2634,10 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\n-- Every new reservation must carry an explicit put lease. The application uses a\n-- short lease; this trigger prevents a future writer from silently recreating an\n-- unbounded pending/no-claim state.\nCREATE TRIGGER agent_token_rotation_handoff_put_lease_required\nBEFORE INSERT ON agent_token_rotation_handoffs\nWHEN NEW.claim_put_lease_expires_at IS NULL\nBEGIN\n  SELECT RAISE(ABORT, 'replacement_claim_put_lease_required');\nEND;",
       "\n\n-- A pending handoff owns exactly one inactive replacement. Deleting the\n-- reservation must delete that token in the same SQLite statement/transaction;\n-- otherwise a crash between two application statements would leave a secret\n-- hash with no durable recovery record.\nCREATE TRIGGER agent_token_rotation_handoff_cleanup_pending_token\nAFTER DELETE ON agent_token_rotation_handoffs\nWHEN OLD.state = 'pending'\nBEGIN\n  DELETE FROM member_tokens\n   WHERE id = OLD.replacement_token_id\n     AND tenant = OLD.tenant\n     AND member_id = OLD.member_id\n     AND agent_id = OLD.agent_id\n     AND revoked_at = OLD.created_at;\n  SELECT RAISE(ABORT, 'replacement_pending_token_not_deleted')\n   WHERE changes() <> 1;\nEND;",
     ],
+    objects: [
+      { type: "trigger", name: "agent_token_rotation_handoff_put_lease_required" },
+      { type: "trigger", name: "agent_token_rotation_handoff_cleanup_pending_token" },
+    ],
   },
   {
     file: "0137_agent_message_integrity.sql",
@@ -1730,6 +2646,9 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "ALTER TABLE agent_messages\n  ADD COLUMN body_length INTEGER\n  CHECK (body_length IS NULL OR body_length >= 0);",
       "\n\nALTER TABLE agent_messages\n  ADD COLUMN checksum_sha256 TEXT\n  CHECK (\n    checksum_sha256 IS NULL OR (\n      length(checksum_sha256) = 64\n      AND checksum_sha256 = lower(checksum_sha256)\n      AND checksum_sha256 NOT GLOB '*[^0-9a-f]*'\n    )\n  );",
       "\n\nCREATE TRIGGER agent_messages_integrity_baseline_immutable\nBEFORE UPDATE OF body_length, checksum_sha256 ON agent_messages\nWHEN OLD.body_length IS NOT NEW.body_length\n  OR OLD.checksum_sha256 IS NOT NEW.checksum_sha256\nBEGIN\n  SELECT RAISE(ABORT, 'agent message integrity baseline is immutable');\nEND;",
+    ],
+    objects: [
+      { type: "trigger", name: "agent_messages_integrity_baseline_immutable" },
     ],
   },
   {
@@ -1742,6 +2661,13 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\nCREATE TRIGGER task_dispatch_runtime_receipts_no_update\nBEFORE UPDATE ON task_dispatch_runtime_receipts\nBEGIN\n  SELECT RAISE(ABORT, 'task dispatch runtime receipts are append-only');\nEND;",
       "\n\nCREATE TRIGGER task_dispatch_runtime_receipts_no_delete\nBEFORE DELETE ON task_dispatch_runtime_receipts\nBEGIN\n  SELECT RAISE(ABORT, 'task dispatch runtime receipts are append-only');\nEND;",
     ],
+    objects: [
+      { type: "table", name: "task_dispatch_runtime_receipts" },
+      { type: "index", name: "idx_task_dispatch_runtime_receipts_task" },
+      { type: "index", name: "idx_task_dispatch_runtime_receipts_message" },
+      { type: "trigger", name: "task_dispatch_runtime_receipts_no_update" },
+      { type: "trigger", name: "task_dispatch_runtime_receipts_no_delete" },
+    ],
   },
   {
     file: "0139_agent_token_issuance_audit.sql",
@@ -1752,6 +2678,12 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\nCREATE INDEX IF NOT EXISTS idx_token_issuance_actor\n  ON agent_token_issuance_audit(tenant, actor_member_id, seq DESC);",
       "\nCREATE INDEX IF NOT EXISTS idx_token_issuance_token\n  ON agent_token_issuance_audit(token_id);",
     ],
+    objects: [
+      { type: "table", name: "agent_token_issuance_audit" },
+      { type: "index", name: "idx_token_issuance_agent" },
+      { type: "index", name: "idx_token_issuance_actor" },
+      { type: "index", name: "idx_token_issuance_token" },
+    ],
   },
   {
     file: "0143_human_login_identities.sql",
@@ -1760,6 +2692,11 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "-- 0143_human_login_identities.sql — tenant-local binding from an external\n-- verified login identity to ONE canonical human member.\n--\n-- Design: docs/superpowers/specs/2026-09-01-human-approved-session-bound-agent-\n-- elevation-design.md, \"Human login identity\". Delivery Sequence step 1\n-- (mupot task f5fe1222-981c-4fb8-95c2-1eacd38f3cee, mumega-com#1173).\n--\n-- Authorization binds to (tenant, provider, provider_subject) — the OAuth\n-- provider's own stable subject id — NEVER to a display email. Email is\n-- verified evidence, retained for legibility, and is not itself an authority\n-- join key: two different providers, or two different tenants, can report the\n-- same email without that implying the same authority. UNIQUE(tenant,\n-- provider, provider_subject) is the whole join key.\n--\n-- member_id is NOT NULL: a login identity only exists once it is bound to an\n-- actual members row. This is deliberately NOT auto-populated for every login\n-- — the design requires linking to be an explicit act (self-service, on first\n-- login, when a members row already resolves by verified email; or a one-time\n-- ceremony for a pre-existing legacy owner). See src/auth/login-identity.ts.\n--\n-- linked_by_member_id records who performed the link when it was NOT the\n-- member's own login act (e.g. an admin completing the one-time owner\n-- ceremony on someone else's behalf); NULL for an ordinary self-service link.\n--\n-- revoked_at makes unlinking (and denying re-link with a stale identity)\n-- possible without a hard delete — same soft-revoke discipline as\n-- member_tokens.revoked_at elsewhere in this schema.\nCREATE TABLE IF NOT EXISTS human_login_identities (\n  id                  TEXT PRIMARY KEY,\n  tenant              TEXT NOT NULL,\n  provider            TEXT NOT NULL,\n  provider_subject    TEXT NOT NULL,\n  verified_email      TEXT,\n  member_id           TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,\n  linked_by_member_id TEXT REFERENCES members(id) ON DELETE SET NULL,\n  created_at          TEXT NOT NULL DEFAULT (datetime('now')),\n  revoked_at          TEXT,\n  UNIQUE(tenant, provider, provider_subject)\n);",
       "\n\nCREATE INDEX IF NOT EXISTS idx_human_login_identities_member\n  ON human_login_identities(member_id);",
       "\n\nCREATE INDEX IF NOT EXISTS idx_human_login_identities_tenant\n  ON human_login_identities(tenant);",
+    ],
+    objects: [
+      { type: "table", name: "human_login_identities" },
+      { type: "index", name: "idx_human_login_identities_member" },
+      { type: "index", name: "idx_human_login_identities_tenant" },
     ],
   },
   {
@@ -1770,10 +2707,15 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\nCREATE INDEX IF NOT EXISTS idx_web_sessions_member\n  ON web_sessions(tenant, member_id);",
       "\n\nCREATE INDEX IF NOT EXISTS idx_web_sessions_login_identity\n  ON web_sessions(login_identity_id);",
     ],
+    objects: [
+      { type: "table", name: "web_sessions" },
+      { type: "index", name: "idx_web_sessions_member" },
+      { type: "index", name: "idx_web_sessions_login_identity" },
+    ],
   },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
-export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 1
+export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 2
 
-export const SCHEMA_CHAIN_DIGEST: string = "aaab440c71a246b4e007e3315372bf78edb5fe2644bb9552d9ddbb963affee07"
+export const SCHEMA_CHAIN_DIGEST: string = "bf41e6b45d8d323a16b4189efe084bcfd35b94fbf9596c1bbce9ca2ff4be59a7"

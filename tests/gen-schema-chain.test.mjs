@@ -17,6 +17,10 @@ import {
   buildSchemaChainEntries,
   computeChainDigest,
   generateSchemaChainModule,
+  extractCreatedObjects,
+  splitterSourceText,
+  assertSplitterVersionMatchesSource,
+  SPLITTER_SOURCE_SHA256_BY_VERSION,
   SCHEMA_CHAIN_SPLITTER_VERSION,
   DEFAULT_MIGRATIONS_DIR,
 } from '../scripts/gen-schema-chain.mjs'
@@ -177,9 +181,23 @@ test('splitSqlStatements: [bracket-quoted] identifier does not open a false BEGI
   assert.match(statements[0], /\[begin\]/)
 })
 
-test('splitSqlStatements: `backtick-quoted` identifier does not open a false BEGIN/CASE block', () => {
-  const sql = 'CREATE TABLE t (`begin` TEXT, `end` TEXT);\nCREATE TABLE y (id TEXT);'
-  const statements = splitSqlStatements(sql)
+test('splitSqlStatements: `backtick-quoted` identifier does not open a false BEGIN/CASE block (UNBALANCED fixture — pins the branch itself, gate M14)', () => {
+  // Gate finding on PR #1300, round 3: the ORIGINAL version of this test paired `begin` with
+  // `end` in the same statement. Deleting the entire backtick branch left 29/29 vitest and
+  // 30/30 node green anyway, because with the branch gone, the bare words BEGIN and END
+  // inside the backticks are scanned as the real keywords — blockDepth goes 0 -> 1 (BEGIN) ->
+  // 0 (END) -> back to zero by COINCIDENCE, and the file still "looks" correctly split. A
+  // fixture that can pass whether or not the branch exists proves nothing about the branch.
+  //
+  // This fixture uses `begin` ALONE, with NO matching `end` anywhere in the file. With the
+  // backtick branch present, `` `begin` `` is consumed whole as an opaque identifier and never
+  // reaches the keyword scan — blockDepth stays 0, the file splits into 2 statements cleanly.
+  // With the branch removed, the bare word BEGIN inside the backticks IS scanned as the
+  // keyword, opens a block nothing in the file ever closes, and generation now hard-fails
+  // with "unterminated BEGIN/CASE block" instead of returning 2 statements — an assertion
+  // that can actually tell the branch was removed.
+  const sql = 'CREATE TABLE t (`begin` TEXT);\nCREATE TABLE y (id TEXT);'
+  const statements = splitSqlStatements(sql, 'unbalanced_backtick.sql')
   assert.equal(statements.length, 2, `expected 2 statements, got ${statements.length}: ${JSON.stringify(statements)}`)
   assert.match(statements[0], /`begin`/)
 })
@@ -191,11 +209,26 @@ test('splitSqlStatements: doubled `` inside a backtick identifier is an escaped 
   assert.match(statements[0], /`a``b`/)
 })
 
-test('splitSqlStatements: [ ] with no closing bracket runs to end of string, not an infinite loop', () => {
+test('splitSqlStatements: [ ] with no closing bracket hard-fails at end of file (C4 gate fix) — was a vacuous assertion, gate note on gen-schema-chain.test.mjs:194', () => {
+  // The ORIGINAL version of this test only asserted `Array.isArray(statements)` — true for
+  // ANY return value the function could produce, so it could not fail for the reason it
+  // existed (an infinite loop would hang the test runner, not fail this assertion; a wrong
+  // split would still be an array). Before the C4 fix, an unterminated bracket silently
+  // consumed to end of string as one "statement" and returned normally — also `Array.isArray`
+  // true, so the vacuous assertion passed on BOTH the wrong-but-terminating behavior and any
+  // future correct behavior equally, telling a reader nothing. Now it must hard-fail, and this
+  // pins the exact error and that the fileLabel is named in it.
   const sql = 'CREATE TABLE t ([unterminated TEXT);'
-  // Must terminate at all (the point of this test) and must not throw for an unrelated reason.
-  const statements = splitSqlStatements(sql)
-  assert.ok(Array.isArray(statements))
+  assert.throws(
+    () => splitSqlStatements(sql, 'unterminated_bracket.sql'),
+    /unterminated \[bracket identifier\]/,
+  )
+  try {
+    splitSqlStatements(sql, 'unterminated_bracket.sql')
+    assert.fail('expected a throw')
+  } catch (error) {
+    assert.match(error.message, /unterminated_bracket\.sql/)
+  }
 })
 
 // ── splitter: hard fail on an unterminated block (F2 gate fix) — permanent regressions ──
@@ -204,12 +237,19 @@ test('splitSqlStatements: [ ] with no closing bracket runs to end of string, not
 // PR #1300: constructs that swallowed a whole file into one "statement" and survived every
 // check that existed before this fix.
 
-test('M12 — BEGIN TRANSACTION; ... COMMIT; never closes the block counter: hard fail, not a silent 1-statement swallow', () => {
+test('M12 — BEGIN TRANSACTION; ... COMMIT; is classified and hard-failed as transaction-control BEGIN (C4 gate fix, round 3)', () => {
+  // Round 2 caught this by letting the generic "unterminated BEGIN/CASE block" check fire at
+  // EOF (COMMIT never decrements the counter BEGIN incremented). Round 3's gate finding was
+  // that the SAME construct closed by END instead of COMMIT — `BEGIN; ... END;` — swallows the
+  // whole file SILENTLY, because END decrements the counter back to zero by coincidence (see
+  // the two tests below). The fix classifies transaction-control BEGIN immediately, at the
+  // BEGIN itself, before it ever reaches the block-depth counter — so this fixture now throws
+  // a different, more specific message than round 2's, not the generic end-of-file one.
   const sql = 'BEGIN TRANSACTION;\nCREATE TABLE a (id TEXT);\nCOMMIT;\nCREATE TABLE b (id TEXT);'
   assert.throws(
     () => splitSqlStatements(sql, 'M12_fixture.sql'),
-    /unterminated BEGIN\/CASE block/,
-    'BEGIN TRANSACTION (closed by COMMIT, not END) must hard-fail rather than swallow the rest of the file',
+    /transaction-control BEGIN/,
+    'BEGIN TRANSACTION must hard-fail as transaction-control BEGIN, not swallow or silently mis-split',
   )
   // The file label must be named in the error, not just "some file somewhere failed".
   try {
@@ -218,6 +258,80 @@ test('M12 — BEGIN TRANSACTION; ... COMMIT; never closes the block counter: har
   } catch (error) {
     assert.match(error.message, /M12_fixture\.sql/)
   }
+})
+
+test('C4 — bare BEGIN; ... COMMIT; (no TRANSACTION keyword) is also classified as transaction-control BEGIN', () => {
+  const sql = 'BEGIN;\nCREATE TABLE a (id TEXT);\nCOMMIT;\nCREATE TABLE b (id TEXT);'
+  assert.throws(() => splitSqlStatements(sql, 'bare_begin.sql'), /transaction-control BEGIN/)
+})
+
+test('C4 — BEGIN DEFERRED / IMMEDIATE / EXCLUSIVE (with or without TRANSACTION) are all classified as transaction-control BEGIN', () => {
+  for (const variant of ['BEGIN DEFERRED;', 'BEGIN IMMEDIATE;', 'BEGIN EXCLUSIVE;', 'BEGIN DEFERRED TRANSACTION;']) {
+    const sql = `${variant}\nCREATE TABLE a (id TEXT);\nCOMMIT;`
+    assert.throws(
+      () => splitSqlStatements(sql, 'variant.sql'),
+      /transaction-control BEGIN/,
+      `expected ${JSON.stringify(variant)} to hard-fail as transaction-control BEGIN`,
+    )
+  }
+})
+
+test('C4 — BEGIN; ... END; (END as a SQLite synonym for COMMIT) hard-fails instead of SILENTLY swallowing the whole file', () => {
+  // THE gap round 3's gate found: a naive fix for M12 (hard-fail whenever the BEGIN/CASE
+  // counter never returns to zero) does NOT catch this shape, because END decrements the
+  // counter back to zero — coincidentally, since SQLite treats END as a synonym for COMMIT
+  // for transaction control, not because this is a trigger body. Before this fix, the whole
+  // file between BEGIN and END collapsed into ONE "statement" and no check anywhere caught it.
+  const sql = 'BEGIN;\nCREATE TABLE a (id TEXT);\nEND;\nCREATE TABLE b (id TEXT);'
+  assert.throws(() => splitSqlStatements(sql, 'begin_end_txn.sql'), /transaction-control BEGIN/)
+})
+
+test('C4 — BEGIN TRANSACTION; ... END TRANSACTION; also hard-fails instead of swallowing the file (gate verdict\'s exact second example)', () => {
+  const sql = 'BEGIN TRANSACTION;\nCREATE TABLE a (id TEXT);\nEND TRANSACTION;\nCREATE TABLE b (id TEXT);'
+  assert.throws(() => splitSqlStatements(sql, 'begin_end_txn2.sql'), /transaction-control BEGIN/)
+})
+
+test('C4 — a trigger-opening BEGIN (immediately followed by a non-transaction word) is UNAFFECTED — still tracked and closed by its own END', () => {
+  const sql = [
+    'CREATE TRIGGER t BEFORE UPDATE ON x BEGIN',
+    "  SELECT RAISE(ABORT, 'nope');",
+    'END;',
+    'CREATE TABLE y (id TEXT);',
+  ].join('\n')
+  const statements = splitSqlStatements(sql, 'trigger_unaffected.sql')
+  assert.equal(statements.length, 2)
+  assert.match(statements[0], /CREATE TRIGGER t/)
+})
+
+// ── splitter: every literal zone must close before EOF (C4 gate fix) ───────────────────
+
+test('C4 — unterminated /* block comment */ at end of file hard-fails, naming the file', () => {
+  const sql = 'CREATE TABLE a (id TEXT);\n/* this comment never closes'
+  assert.throws(
+    () => splitSqlStatements(sql, 'unterminated_comment.sql'),
+    /unterminated \/\* block comment \*\//,
+  )
+  try {
+    splitSqlStatements(sql, 'unterminated_comment.sql')
+    assert.fail('expected a throw')
+  } catch (error) {
+    assert.match(error.message, /unterminated_comment\.sql/)
+  }
+})
+
+test('C4 — unterminated \'string literal\' at end of file hard-fails instead of swallowing the rest of the file', () => {
+  const sql = "CREATE TABLE a (id TEXT);\nINSERT INTO a VALUES ('never closed"
+  assert.throws(() => splitSqlStatements(sql, 'unterminated_string.sql'), /unterminated 'string literal'/)
+})
+
+test('C4 — unterminated "double-quoted identifier" at end of file hard-fails', () => {
+  const sql = 'CREATE TABLE a (id TEXT);\nSELECT "never closed FROM a;'
+  assert.throws(() => splitSqlStatements(sql, 'unterminated_dquote.sql'), /unterminated "double-quoted identifier"/)
+})
+
+test('C4 — unterminated `backtick identifier` at end of file hard-fails', () => {
+  const sql = 'CREATE TABLE a (id TEXT);\nSELECT `never closed FROM a;'
+  assert.throws(() => splitSqlStatements(sql, 'unterminated_backtick.sql'), /unterminated `backtick-quoted identifier`/)
 })
 
 test('M13 — CREATE TABLE t([begin] TEXT); is NOT mistaken for a BEGIN keyword (regression, not just the unit test above)', () => {
@@ -388,4 +502,127 @@ test('generateSchemaChainModule: reacts to a migrations directory change (no sta
     assert.notEqual(before, after)
     assert.match(after, /0002_b\.sql/)
   })
+})
+
+// ── extractCreatedObjects (K1 gate fix) ─────────────────────────────────────────────
+
+test('extractCreatedObjects: CREATE TABLE / INDEX / UNIQUE INDEX / TRIGGER / VIEW are all detected', () => {
+  const statements = [
+    'CREATE TABLE foo (id TEXT);',
+    'CREATE TABLE IF NOT EXISTS bar (id TEXT);',
+    'CREATE INDEX idx_foo ON foo(id);',
+    'CREATE UNIQUE INDEX uidx_foo ON foo(id);',
+    'CREATE TRIGGER trg_foo BEFORE UPDATE ON foo BEGIN SELECT 1; END;',
+    'CREATE VIEW v_foo AS SELECT * FROM foo;',
+    'CREATE VIRTUAL TABLE vt_foo USING fts5(id);',
+  ]
+  const objects = extractCreatedObjects(statements)
+  assert.deepEqual(objects, [
+    { type: 'table', name: 'foo' },
+    { type: 'table', name: 'bar' },
+    { type: 'index', name: 'idx_foo' },
+    { type: 'index', name: 'uidx_foo' },
+    { type: 'trigger', name: 'trg_foo' },
+    { type: 'view', name: 'v_foo' },
+    { type: 'table', name: 'vt_foo' },
+  ])
+})
+
+test('extractCreatedObjects: a statement whose text is LED by a comment (very common in this repo) is still detected — regression for a bug caught during this fix, not shipped', () => {
+  // The first version of this extractor matched `^\s*CREATE` directly and silently missed
+  // every statement that opens with a descriptive header comment before the keyword — which
+  // is migrations/0001_init.sql's FIRST statement (the `departments` table) and dozens of
+  // others across the real corpus. Caught by cross-checking against the real migrations
+  // directory before this diff shipped, not by any assertion that was ever red in CI.
+  const statements = ["-- a header comment about this table\n-- spanning two lines\nCREATE TABLE t (id TEXT);"]
+  const objects = extractCreatedObjects(statements)
+  assert.deepEqual(objects, [{ type: 'table', name: 't' }])
+})
+
+test('extractCreatedObjects: a statement led by a /* block comment */ before the keyword is also detected', () => {
+  const statements = ['/* block comment */\nCREATE TABLE t (id TEXT);']
+  assert.deepEqual(extractCreatedObjects(statements), [{ type: 'table', name: 't' }])
+})
+
+test('extractCreatedObjects: quoted object names ("...", `...`, [...]) are unwrapped to the bare name', () => {
+  const statements = [
+    'CREATE TABLE "t1" (id TEXT);',
+    'CREATE TABLE `t2` (id TEXT);',
+    'CREATE TABLE [t3] (id TEXT);',
+  ]
+  assert.deepEqual(extractCreatedObjects(statements), [
+    { type: 'table', name: 't1' },
+    { type: 'table', name: 't2' },
+    { type: 'table', name: 't3' },
+  ])
+})
+
+test('extractCreatedObjects: ALTER TABLE / DROP / plain DML create nothing and are skipped', () => {
+  const statements = [
+    'ALTER TABLE t ADD COLUMN x TEXT;',
+    'DROP TABLE IF EXISTS t;',
+    "INSERT INTO t (id) VALUES ('a');",
+    "UPDATE t SET id = 'b';",
+  ]
+  assert.deepEqual(extractCreatedObjects(statements), [])
+})
+
+test('extractCreatedObjects: case-insensitive CREATE keyword (real migrations use both cases)', () => {
+  assert.deepEqual(extractCreatedObjects(['create table t (id text);']), [{ type: 'table', name: 't' }])
+})
+
+test('buildSchemaChainEntries: every real migration file with a CREATE statement has a non-empty objects list (spot-check against a known comment-led file)', () => {
+  // 0001_init.sql's FIRST statement is comment-led (see the regression test above) — this
+  // pins that the real corpus, not just a synthetic fixture, is covered.
+  const entries = buildSchemaChainEntries()
+  const init = entries.find((e) => e.file === '0001_init.sql')
+  assert.ok(init, 'expected 0001_init.sql to be present')
+  const names = init.objects.map((o) => o.name)
+  assert.ok(names.includes('departments'), `expected 'departments' among ${JSON.stringify(names)}`)
+})
+
+// ── splitter version <-> source hash tie (C6 gate fix — CI enforcement of the bump rule) ──
+
+test('assertSplitterVersionMatchesSource: passes against the committed splitSqlStatements source', () => {
+  assert.doesNotThrow(() => assertSplitterVersionMatchesSource())
+})
+
+test('assertSplitterVersionMatchesSource: throws when the recorded hash for the current version does not match the current source (simulates an edit with no bump)', () => {
+  const original = SPLITTER_SOURCE_SHA256_BY_VERSION[SCHEMA_CHAIN_SPLITTER_VERSION]
+  try {
+    SPLITTER_SOURCE_SHA256_BY_VERSION[SCHEMA_CHAIN_SPLITTER_VERSION] = 'deadbeef'.repeat(8)
+    assert.throws(() => assertSplitterVersionMatchesSource(), /was not bumped/)
+  } finally {
+    SPLITTER_SOURCE_SHA256_BY_VERSION[SCHEMA_CHAIN_SPLITTER_VERSION] = original
+  }
+  // Restored — must pass again.
+  assert.doesNotThrow(() => assertSplitterVersionMatchesSource())
+})
+
+test('assertSplitterVersionMatchesSource: throws when the current version has no recorded hash entry at all', () => {
+  const original = SPLITTER_SOURCE_SHA256_BY_VERSION[SCHEMA_CHAIN_SPLITTER_VERSION]
+  try {
+    delete SPLITTER_SOURCE_SHA256_BY_VERSION[SCHEMA_CHAIN_SPLITTER_VERSION]
+    assert.throws(() => assertSplitterVersionMatchesSource(), /has no entry/)
+  } finally {
+    SPLITTER_SOURCE_SHA256_BY_VERSION[SCHEMA_CHAIN_SPLITTER_VERSION] = original
+  }
+})
+
+test('splitterSourceText: is stable across calls and non-empty', () => {
+  const a = splitterSourceText()
+  const b = splitterSourceText()
+  assert.equal(a, b)
+  assert.ok(a.length > 100)
+  assert.match(a, /function splitSqlStatements/)
+})
+
+test('generateSchemaChainModule: throws (refuses to generate) when the splitter version/source tie is broken', () => {
+  const original = SPLITTER_SOURCE_SHA256_BY_VERSION[SCHEMA_CHAIN_SPLITTER_VERSION]
+  try {
+    SPLITTER_SOURCE_SHA256_BY_VERSION[SCHEMA_CHAIN_SPLITTER_VERSION] = 'deadbeef'.repeat(8)
+    assert.throws(() => generateSchemaChainModule(), /was not|has no entry/)
+  } finally {
+    SPLITTER_SOURCE_SHA256_BY_VERSION[SCHEMA_CHAIN_SPLITTER_VERSION] = original
+  }
 })

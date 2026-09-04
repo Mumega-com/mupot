@@ -27,9 +27,12 @@ import {
 } from '../src/pots/schema-chain.generated'
 import {
   applySchemaChain,
+  assertSafeInteger,
   batchStatements,
   escapeSqlLiteral,
   recordedKey,
+  POT_SCHEMA_APPLIED_TABLE_SQL,
+  POT_SCHEMA_CHAIN_META_TABLE_SQL,
   SCHEMA_CHAIN_BATCH_MAX_BYTES,
   SCHEMA_CHAIN_BATCH_MAX_STATEMENTS,
 } from '../src/pots/schema-chain'
@@ -443,18 +446,76 @@ describe('applySchemaChain — F1: partial-application (crash-then-replay) fails
     db.close()
   })
 
-  it('a `started` row blocks that file even when its recorded sha256 and splitter_version both still match', async () => {
+  it('a `started` row WITH a genuine trace in the database blocks that file even when its recorded sha256 and splitter_version both still match', async () => {
     // Guards against a narrower, "helpful-looking" bug: only checking 'started' when the
-    // sha/version DON'T match. A `started` row must be a hard stop unconditionally, because
-    // matching sha/version says nothing about whether the file's statements actually finished.
+    // sha/version DON'T match. Matching sha/version says nothing about whether the file's
+    // statements actually finished — that is exactly why fileHasTraceInDatabase (K2 gate fix,
+    // round 3) checks the REAL schema rather than trusting sha/version comparison either way.
+    //
+    // NOTE (round 3): this test's ORIGINAL version asserted a 'started' row hard-blocks
+    // UNCONDITIONALLY, on a virgin database with nothing of the file's DDL ever run — that is
+    // now WRONG on purpose (see the K2 test right below this one): a comment-only migration,
+    // or any file where nothing ran, must be retried, not condemned. This version instead
+    // manufactures a GENUINE trace (runs the file's first real statement directly) so the
+    // 'started' row corresponds to an actual partial application, and confirms the block
+    // still fires even though sha256/splitter_version both match.
     const db = createSqliteD1()
     const entry = SCHEMA_CHAIN[0]
+    await execViaSqlite(db)(entry.statements[0])
     const alreadyApplied = new Set<string>([
       recordedKey(entry.file, entry.sha256, SCHEMA_CHAIN_SPLITTER_VERSION, 'started'),
     ])
     const result = await applySchemaChain(execViaSqlite(db), { chain: [entry], alreadyApplied })
     expect(result.failed?.kind).toBe('partial-application')
     expect(result.applied).toEqual([])
+    db.close()
+  })
+
+  it('K2 gate fix (round 3) — a `started` row with NO trace of the file in the database is retried, not hard-blocked', async () => {
+    // Direct fix for the gate finding: "the 'started' row is written BEFORE statement 0, so a
+    // failure at statement 0 — where nothing ran and the database is objectively clean —
+    // permanently condemns it." A virgin database with a 'started' row for a file that has
+    // real created objects (SCHEMA_CHAIN[0] creates several tables) must now succeed on
+    // retry, because fileHasTraceInDatabase finds none of those objects present.
+    const db = createSqliteD1()
+    const entry = SCHEMA_CHAIN[0]
+    const alreadyApplied = new Set<string>([
+      recordedKey(entry.file, entry.sha256, SCHEMA_CHAIN_SPLITTER_VERSION, 'started'),
+    ])
+    const result = await applySchemaChain(execViaSqlite(db), { chain: [entry], alreadyApplied })
+    expect(result.failed).toBeUndefined()
+    expect(result.applied).toEqual([entry.file])
+    db.close()
+  })
+
+  it('K2 gate fix — the reviewer\'s LITERAL example: a comment-only, zero-statement migration marked \'started\' must not be condemned over a no-op', async () => {
+    const db = createSqliteD1()
+    const commentOnly = SCHEMA_CHAIN.find((e) => e.file === '0085_identity_cleanup.sql')
+    expect(commentOnly).toBeDefined()
+    if (!commentOnly) throw new Error('unreachable')
+    expect(commentOnly.statements).toEqual([]) // sanity: this really is the zero-statement file
+    const alreadyApplied = new Set<string>([
+      recordedKey(commentOnly.file, commentOnly.sha256, SCHEMA_CHAIN_SPLITTER_VERSION, 'started'),
+    ])
+    const result = await applySchemaChain(execViaSqlite(db), { chain: [commentOnly], alreadyApplied })
+    expect(result.failed).toBeUndefined()
+    expect(result.applied).toEqual([commentOnly.file])
+    db.close()
+  })
+
+  it('K2 — a `started` row for a file with statements but NO detectable created objects (pure DML/ALTER) stays hard-blocked unconditionally (documented limitation)', async () => {
+    const db = createSqliteD1()
+    const dmlOnlyEntry: SchemaChainFile = {
+      file: 'synthetic_dml_only.sql',
+      sha256: 'b'.repeat(64),
+      statements: ["INSERT INTO nonexistent (id) VALUES ('x');"],
+      objects: [],
+    }
+    const alreadyApplied = new Set<string>([
+      recordedKey(dmlOnlyEntry.file, dmlOnlyEntry.sha256, SCHEMA_CHAIN_SPLITTER_VERSION, 'started'),
+    ])
+    const result = await applySchemaChain(execViaSqlite(db), { chain: [dmlOnlyEntry], alreadyApplied })
+    expect(result.failed?.kind).toBe('partial-application')
     db.close()
   })
 })
@@ -524,6 +585,242 @@ describe('applySchemaChain — F3: ground-truth verification against the real da
   })
 })
 
+// ── K1 — ground truth must check REAL schema objects, not just this module's own bookkeeping ──
+
+describe('applySchemaChain — K1 (round 3): verifyGroundTruth is not a tautology over pot_schema_applied/pot_schema_chain_meta', () => {
+  it('reproduces the exact gate scenario: HONESTLY-populated pot_schema_applied (real rows, correct sha256s, matching digest) but ZERO real schema objects exist — must fail, not report success', async () => {
+    // The F3 fix (round 2) only checked pot_schema_applied's ROW COUNT and pot_schema_chain_
+    // meta's digest — both tables THIS MODULE owns. The gate proved that is a tautology: seed
+    // those two tables "honestly" (real rows, not just a caller's in-memory claim) with
+    // correct counts and a correct digest, and the check passes even though not one real
+    // CREATE TABLE from the actual migrations ever ran. This test does exactly that — writes
+    // directly to pot_schema_applied/pot_schema_chain_meta via `exec`, bypassing
+    // applySchemaChain's own statement loop entirely — then calls applySchemaChain with an
+    // `alreadyApplied` that matches those honest rows, so every file is skipped and the ONLY
+    // thing under test is whether ground truth can be fooled by consistent-but-fake
+    // bookkeeping.
+    const db = createSqliteD1()
+    const exec = execViaSqlite(db)
+    const chain = SCHEMA_CHAIN.slice(0, 4)
+
+    await exec(POT_SCHEMA_APPLIED_TABLE_SQL)
+    await exec(POT_SCHEMA_CHAIN_META_TABLE_SQL)
+    const alreadyApplied = new Set<string>()
+    for (const entry of chain) {
+      await exec(
+        `INSERT INTO pot_schema_applied (file, sha256, splitter_version, status, started_at, applied_at) ` +
+          `VALUES ('${entry.file}', '${entry.sha256}', ${SCHEMA_CHAIN_SPLITTER_VERSION}, 'applied', ` +
+          `'2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');`,
+      )
+      alreadyApplied.add(recordedKey(entry.file, entry.sha256, SCHEMA_CHAIN_SPLITTER_VERSION, 'applied'))
+    }
+    const expectedDigest = sha256Hex(
+      [String(SCHEMA_CHAIN_SPLITTER_VERSION), ...chain.map((e) => e.sha256)].join('\n'),
+    )
+    await exec(`INSERT INTO pot_schema_chain_meta (key, value) VALUES ('digest', '${expectedDigest}');`)
+
+    // Sanity: the OLD bookkeeping-only facts genuinely do match here — this is not a case the
+    // count/digest checks alone would have caught either way.
+    const countRow = db.sqlite
+      .prepare(`SELECT COUNT(*) AS n FROM pot_schema_applied WHERE status = 'applied'`)
+      .get() as { n: number }
+    expect(countRow.n).toBe(chain.length)
+
+    const result = await applySchemaChain(exec, { chain, alreadyApplied })
+
+    expect(result.failed).toBeDefined()
+    expect(result.failed?.kind).toBe('ground-truth-mismatch')
+    expect(result.failed?.error).toMatch(/no (table|index|trigger|view) named/)
+
+    db.close()
+  })
+
+  it('C6: a stale `applied` row for a file no longer in the current chain (a renamed/squashed migration) does not permanently fail ground truth for an otherwise healthy pot', async () => {
+    // Gate note: "an applied row for a migration since renamed or squashed permanently fails
+    // the count, which is unscoped to the chain." Before the C6 fix, the count query counted
+    // EVERY 'applied' row in pot_schema_applied regardless of whether its file is still part
+    // of the chain being verified — so a stray leftover row from a rename/squash inflated the
+    // count above chain.length forever, failing ground truth on an otherwise perfectly
+    // healthy, fully up-to-date pot.
+    const db = createSqliteD1()
+    const exec = execViaSqlite(db)
+    const chain = SCHEMA_CHAIN.slice(0, 4)
+
+    const first = await applySchemaChain(exec, { chain })
+    expect(first.failed).toBeUndefined()
+
+    await exec(
+      `INSERT INTO pot_schema_applied (file, sha256, splitter_version, status, started_at, applied_at) ` +
+        `VALUES ('old_removed_migration.sql', '${'a'.repeat(64)}', ${SCHEMA_CHAIN_SPLITTER_VERSION}, ` +
+        `'applied', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z');`,
+    )
+
+    const alreadyApplied = recordedSetFromDb(db)
+    const second = await applySchemaChain(exec, { chain, alreadyApplied })
+    expect(second.failed).toBeUndefined()
+
+    db.close()
+  })
+
+  it('the real SCHEMA_CHAIN chosen probes survive to the end of the full chain (0042\'s tasks_new rename-away is correctly skipped as a probe candidate)', async () => {
+    // Regression for a real bug caught while building this fix: the FIRST version of
+    // selectGroundTruthProbes picked entry.objects[0] blindly. migrations/0042_task_status_
+    // gate_values.sql creates `tasks_new`, then (same file) DROPs `tasks` and RENAMEs
+    // `tasks_new` TO `tasks` — so `tasks_new` never exists under that name once the chain
+    // finishes, and probing for it after a full, genuinely correct apply would fail on a
+    // HEALTHY database. This runs the full real chain and confirms ground truth passes.
+    const db = createSqliteD1()
+    const result = await applySchemaChain(execViaSqlite(db), { chain: SCHEMA_CHAIN })
+    expect(result.failed).toBeUndefined()
+    db.close()
+  })
+})
+
+// ── C7 — verifyGroundTruth's cleanup must not replace the original diagnostic ──────────
+
+describe('applySchemaChain — C7 (round 3): a cleanup failure inside verifyGroundTruth does not clobber the real error', () => {
+  it('when the ground-truth INSERT fails AND the cleanup DROP calls also fail, the reported error is the ORIGINAL ground-truth failure, not the cleanup failure', async () => {
+    const db = createSqliteD1()
+    const realExec = execViaSqlite(db)
+    const chain = SCHEMA_CHAIN.slice(0, 4)
+    let sawGroundTruthInsert = false
+    const exec = async (sql: string) => {
+      if (sql.includes('INSERT INTO __pot_schema_chain_ground_truth')) {
+        sawGroundTruthInsert = true
+        throw new Error('ORIGINAL: real ground-truth mismatch')
+      }
+      if (sawGroundTruthInsert && sql.startsWith('DROP')) {
+        // Simulate the cleanup calls ALSO failing (e.g. the same dropped connection that
+        // caused the ground-truth check to fail in the first place).
+        throw new Error('SECONDARY: cleanup DROP failed too')
+      }
+      await realExec(sql)
+    }
+
+    const result = await applySchemaChain(exec, { chain })
+
+    expect(sawGroundTruthInsert).toBe(true)
+    expect(result.failed).toBeDefined()
+    expect(result.failed?.kind).toBe('ground-truth-mismatch')
+    // The C7 fix: the ORIGINAL error must be what's reported, not the cleanup's.
+    expect(result.failed?.error).toMatch(/ORIGINAL: real ground-truth mismatch/)
+    expect(result.failed?.error).not.toMatch(/SECONDARY/)
+
+    db.close()
+  })
+})
+
+// ── C5 — recordedEntryFor fails CLOSED on a malformed bookkeeping entry, not open ──────
+
+describe('applySchemaChain — C5 (round 3): a malformed alreadyApplied entry is a hard failure, never silently "not recorded"', () => {
+  // NUL (\u0000) is the REAL field separator recordedKey uses (see RECORDED_KEY_SEP in
+  // src/pots/schema-chain.ts) — a plain space would not even match the file's prefix check
+  // and would just look like "not recorded" without ever reaching the malformed-entry logic
+  // these tests exist to exercise. Every fixture below builds on that real separator.
+  const SEP = '\u0000'
+
+  it('an entry with the wrong number of fields after the file prefix throws, rather than being treated as unrecorded and replayed', async () => {
+    const db = createSqliteD1()
+    const entry = SCHEMA_CHAIN[0]
+    const malformed = new Set<string>([`${entry.file}${SEP}onlyonefield`])
+    await expect(applySchemaChain(execViaSqlite(db), { chain: [entry], alreadyApplied: malformed })).rejects.toThrow(
+      /malformed bookkeeping entry/,
+    )
+    db.close()
+  })
+
+  it('an entry with an unknown status throws, rather than being silently skipped', async () => {
+    const db = createSqliteD1()
+    const entry = SCHEMA_CHAIN[0]
+    const malformed = new Set<string>([`${entry.file}${SEP}${entry.sha256}${SEP}${SCHEMA_CHAIN_SPLITTER_VERSION}${SEP}bogus_status`])
+    await expect(applySchemaChain(execViaSqlite(db), { chain: [entry], alreadyApplied: malformed })).rejects.toThrow(
+      /unknown status/,
+    )
+    db.close()
+  })
+
+  it('the empty-string-is-zero trap: an entry with an EMPTY splitter-version field throws instead of silently parsing as version 0', async () => {
+    // Number('') === 0, and Number.isInteger(0) === true — a truncated/corrupted key (e.g.
+    // from a double separator) with an empty splitter-version field used to misparse as "a
+    // real version 0" rather than being caught as malformed. This is the gate's named trap.
+    const db = createSqliteD1()
+    const entry = SCHEMA_CHAIN[0]
+    const malformed = new Set<string>([`${entry.file}${SEP}${entry.sha256}${SEP}${SEP}applied`])
+    await expect(applySchemaChain(execViaSqlite(db), { chain: [entry], alreadyApplied: malformed })).rejects.toThrow(
+      /not a non-negative integer literal/,
+    )
+    db.close()
+  })
+
+  it('an entry with a non-digit (e.g. negative or decimal) splitter-version field throws', async () => {
+    const db = createSqliteD1()
+    const entry = SCHEMA_CHAIN[0]
+    const malformed = new Set<string>([`${entry.file}${SEP}${entry.sha256}${SEP}-1${SEP}applied`])
+    await expect(applySchemaChain(execViaSqlite(db), { chain: [entry], alreadyApplied: malformed })).rejects.toThrow(
+      /not a non-negative integer literal/,
+    )
+    db.close()
+  })
+
+  it('an entry with an empty sha256 field throws', async () => {
+    const db = createSqliteD1()
+    const entry = SCHEMA_CHAIN[0]
+    const malformed = new Set<string>([`${entry.file}${SEP}${SEP}1${SEP}applied`])
+    await expect(applySchemaChain(execViaSqlite(db), { chain: [entry], alreadyApplied: malformed })).rejects.toThrow(
+      /empty sha256/,
+    )
+    db.close()
+  })
+
+  it('a malformed entry for a DIFFERENT (unrelated) file does not affect lookup or application of the real chain files', async () => {
+    // The malformed-entry check only inspects entries whose prefix matches the file being
+    // looked up — a garbage entry for some OTHER file must not affect this one. Both real
+    // chain files apply FRESH here (nothing claims them as already applied), so a clean
+    // success (including ground truth, which now checks real objects) proves the garbage
+    // entry for an unrelated file was ignored rather than tripping anything.
+    const db = createSqliteD1()
+    const chain = SCHEMA_CHAIN.slice(0, 2)
+    const garbageForAnotherFile = `totally_unrelated_file.sql${SEP}garbage`
+    const alreadyApplied = new Set<string>([garbageForAnotherFile])
+    const result = await applySchemaChain(execViaSqlite(db), { chain, alreadyApplied })
+    expect(result.failed).toBeUndefined()
+    expect(result.skipped).toEqual([])
+    expect(result.applied).toEqual([chain[0].file, chain[1].file])
+    db.close()
+  })
+})
+
+
+// ── M15 — assertSafeInteger's guard must be directly, not just incidentally, verified ──
+
+describe('assertSafeInteger', () => {
+  it('accepts a non-negative integer and returns it unchanged', () => {
+    expect(assertSafeInteger(0, 'x')).toBe(0)
+    expect(assertSafeInteger(42, 'x')).toBe(42)
+  })
+
+  it('rejects a negative number', () => {
+    expect(() => assertSafeInteger(-1, 'x')).toThrow(/non-negative integer/)
+  })
+
+  it('rejects a non-integer (float)', () => {
+    expect(() => assertSafeInteger(1.5, 'x')).toThrow(/non-negative integer/)
+  })
+
+  it('rejects NaN and Infinity', () => {
+    expect(() => assertSafeInteger(Number.NaN, 'x')).toThrow(/non-negative integer/)
+    expect(() => assertSafeInteger(Number.POSITIVE_INFINITY, 'x')).toThrow(/non-negative integer/)
+  })
+
+  it('live on the path that matters: an invalid splitterVersion override is rejected through the public applySchemaChain API, not just in isolation', async () => {
+    const db = createSqliteD1()
+    const result = await applySchemaChain(execViaSqlite(db), { chain: [SCHEMA_CHAIN[0]], splitterVersion: -1 })
+    expect(result.failed).toBeDefined()
+    expect(result.failed?.error).toMatch(/non-negative integer/)
+    db.close()
+  })
+})
+
 // ── F4/F5 — unguarded exec() calls, and a plain (non-upsert) bookkeeping INSERT ────────
 
 describe('applySchemaChain — F4/F5: exec() failures around bookkeeping are caught, not thrown raw', () => {
@@ -576,6 +873,7 @@ describe('applySchemaChain — F4/F5: exec() failures around bookkeeping are cau
       file: 'synthetic_idempotent_for_f5.sql',
       sha256: 'a'.repeat(64),
       statements: ['CREATE TABLE IF NOT EXISTS synth_f5_table (id TEXT);'],
+      objects: [{ type: 'table', name: 'synth_f5_table' }],
     }
 
     const run1 = await applySchemaChain(exec, { chain: [idempotentEntry] })

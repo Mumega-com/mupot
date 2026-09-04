@@ -11,9 +11,9 @@
 // mupot#1285 Tier C slice 1. Nothing wires this into provisionSovereignPot yet — that is a
 // later slice's job.
 //
-// GATE HISTORY (2026-09-04, PR #1300): the first version of this file shipped three P1s that
-// an adversarial pass reproduced directly. Each is fixed below; the fix is referenced at its
-// own site as F1/F2/F3/F4/F5 to match the gate verdict's numbering:
+// GATE HISTORY (2026-09-04, PR #1300, round 2): the first version of this file shipped three
+// P1s that an adversarial pass reproduced directly. Each is fixed below; the fix is
+// referenced at its own site as F1/F2/F3/F4/F5 to match the gate verdict's numbering:
 //   F1 — a mid-file crash left the bookkeeping table unrecorded, so the NEXT run replayed the
 //        file from statement 0 against non-idempotent DDL and died forever ("bricks silently
 //        after the first fail"). Fixed with a two-phase `status` marker (`started` written
@@ -28,6 +28,53 @@
 //   F4/F5 — two `exec` calls sat outside any try/catch (losing `applied`/`skipped` on throw),
 //        and the bookkeeping write was a plain INSERT (throwing UNIQUE on a stale
 //        `alreadyApplied`). Both are upserts now, both wrapped.
+//
+// GATE HISTORY, ROUND 3 (2026-09-04): round 2's fixes each closed the EXACT reproduction
+// handed to the builder and left the class open one spelling over. Round 3 fixes the class,
+// referenced at its own site as K1/K2/C3/C4/C5/C6/C7:
+//   K1 — verifyGroundTruth's F3 fix was a TAUTOLOGY: it checked `pot_schema_applied`'s count
+//        and `pot_schema_chain_meta`'s digest, both written by THIS module in the SAME call.
+//        134 honest bookkeeping rows and a self-written digest, with zero real tables in the
+//        database, passed. Fixed by checking real objects (`sqlite_master`) that only a
+//        genuinely-applied chain could have created — see `verifyGroundTruth` and
+//        `selectGroundTruthProbes` below, and `extractCreatedObjects` in
+//        scripts/gen-schema-chain.mjs, which derives the object list so it cannot drift.
+//   K2 — the F1 'started' marker is written BEFORE a file's statements run, so a failure on
+//        literally the first statement (nothing ran, database objectively clean) permanently
+//        condemned the database exactly like a genuine partial run would — a comment-only,
+//        zero-statement migration could condemn a database over a no-op. Fixed: a
+//        zero-statement file is always safe to retry (nothing could possibly have run), and a
+//        file with created objects is retried when NONE of its own objects have any trace in
+//        the real database — see `fileHasTraceInDatabase` and the 'started' branch below.
+//   C3 — deleting the backtick branch entirely left the OLD test suite green because every
+//        backtick fixture used a BALANCED `` `begin` ``/`` `end` `` pair, so removing the
+//        branch made BEGIN/END track each other by coincidence. Fixed in
+//        scripts/gen-schema-chain.mjs's tests with an UNBALANCED fixture; irrelevant to this
+//        file's own code but the corresponding vacuous-assertion audit here is `assert.ok`
+//        near-misses in tests/schema-chain.test.ts, addressed alongside these fixes.
+//   C4 — `BEGIN; … END;` / `BEGIN TRANSACTION; … END TRANSACTION;` still swallowed a whole
+//        file, because END decrements whatever BEGIN incremented — fixed in
+//        scripts/gen-schema-chain.mjs (splitSqlStatements now classifies transaction-control
+//        BEGIN and refuses it immediately, plus every quoted/commented/bracketed zone left
+//        open at EOF is now a hard failure), not this file.
+//   C5 — `recordedEntryFor` had three `continue` paths that silently fell through to "not
+//        recorded, apply fresh" on a malformed bookkeeping entry — including the classic
+//        empty-string-is-zero trap (`Number('') === 0` passes `Number.isInteger`). Fixed: any
+//        entry whose prefix matches this file but fails to parse is now a hard throw, not a
+//        silent replay. See `recordedEntryFor` below.
+//   C6 — the ground-truth applied-count was unscoped to the chain (a renamed/squashed
+//        migration's stale row inflated it forever); the digest was written then verified
+//        against itself in the same call (detects an `exec` that no-ops, nothing else —
+//        comment corrected, not the mechanism); nothing tied a `splitSqlStatements` edit to a
+//        `SCHEMA_CHAIN_SPLITTER_VERSION` bump. Fixed: the count query is now scoped to the
+//        current chain's file set (see `verifyGroundTruth`), and
+//        scripts/gen-schema-chain.mjs's `assertSplitterVersionMatchesSource` — called from
+//        `generateSchemaChainModule`, so both the CLI and CI's freshness guard enforce it for
+//        free — ties an edit of the splitter's source to its version.
+//   C7 — `verifyGroundTruth`'s `finally` replaced a real ground-truth failure with whatever
+//        the cleanup `DROP TRIGGER`/`DROP TABLE` calls threw, hiding the diagnostic that
+//        matters most exactly when a connection is already dropping (the common production
+//        failure). Fixed: cleanup failures are now swallowed in favor of the original error.
 
 import {
   SCHEMA_CHAIN,
@@ -128,8 +175,14 @@ function errorMessage(error: unknown): string {
 
 /** A non-negative integer, or throws — guards the numeric values this module interpolates
  *  directly into SQL text (splitter version, row counts) against ever carrying anything but
- *  a small internally-computed integer. */
-function assertSafeInteger(value: number, label: string): number {
+ *  a small internally-computed integer. Exported so its guard behavior can be asserted
+ *  directly (mirrors escapeSqlLiteral's export rationale — gate note, PR #1300 round 3: this
+ *  function is not reachable through any test that fails if it is removed or reduced to the
+ *  identity, because every number it guards today happens to still be a syntactically valid
+ *  SQL literal even when wrong, e.g. `-1` or `1.5` as an INTEGER column value under SQLite's
+ *  loose type affinity — the guard exists for values this module does not yet pass it, not
+ *  ones SQLite itself would reject). */
+export function assertSafeInteger(value: number, label: string): number {
   if (!Number.isInteger(value) || value < 0) {
     throw new Error(`schema-chain: ${label} must be a non-negative integer, got ${String(value)}`)
   }
@@ -208,16 +261,50 @@ interface RecordedEntry {
   readonly status: 'started' | 'applied'
 }
 
+/** C5 gate fix (2026-09-04, round 3): the pre-fix version had three `continue` paths that
+ *  silently fell through to "not recorded for this file" on a malformed bookkeeping entry —
+ *  which the applySchemaChain loop treats identically to "never applied," i.e. it REPLAYS the
+ *  file's statements against a database that may already have run them. In a module whose
+ *  whole thesis is fail-closed, a stringly-typed parse seam that fails OPEN on a parse error
+ *  is a design defect: it silently reapplies non-idempotent DDL and reports success. Every one
+ *  of those three paths is now a hard throw instead.
+ *
+ *  One of the three was also the classic empty-string-is-zero trap: `Number('')` is `0`, and
+ *  `Number.isInteger(0)` is `true` — so a truncated key (e.g. two consecutive separators from
+ *  a corrupted write) with an EMPTY splitter-version field used to parse as "splitter version
+ *  0" instead of failing, misattributing a corrupt entry to a real-looking version number.
+ *  `/^\d+$/.test(...)` rejects an empty string outright, closing that specific trap. */
 function recordedEntryFor(file: string, alreadyApplied: ReadonlySet<string>): RecordedEntry | undefined {
   const prefix = `${file}${RECORDED_KEY_SEP}`
   for (const entry of alreadyApplied) {
     if (!entry.startsWith(prefix)) continue
-    const [sha256, splitterVersionRaw, status] = entry.slice(prefix.length).split(RECORDED_KEY_SEP)
-    if (sha256 === undefined || splitterVersionRaw === undefined) continue
-    if (status !== 'started' && status !== 'applied') continue
-    const splitterVersion = Number(splitterVersionRaw)
-    if (!Number.isInteger(splitterVersion)) continue
-    return { sha256, splitterVersion, status }
+    const parts = entry.slice(prefix.length).split(RECORDED_KEY_SEP)
+    if (parts.length !== 3) {
+      throw new Error(
+        `schema-chain: malformed bookkeeping entry for '${file}': expected exactly 3 fields ` +
+          `(sha256, splitterVersion, status) after the file prefix, got ${parts.length}. Refusing ` +
+          'to guess — a fail-closed module must not silently treat an unparseable entry as ' +
+          '"not recorded" and replay the file.',
+      )
+    }
+    const [sha256, splitterVersionRaw, status] = parts
+    if (sha256.length === 0) {
+      throw new Error(`schema-chain: malformed bookkeeping entry for '${file}': empty sha256 field.`)
+    }
+    if (status !== 'started' && status !== 'applied') {
+      throw new Error(
+        `schema-chain: malformed bookkeeping entry for '${file}': unknown status '${status}' ` +
+          "(expected 'started' or 'applied').",
+      )
+    }
+    if (!/^\d+$/.test(splitterVersionRaw)) {
+      throw new Error(
+        `schema-chain: malformed bookkeeping entry for '${file}': splitter version ` +
+          `'${splitterVersionRaw}' is not a non-negative integer literal (an empty string here ` +
+          'would silently misparse as version 0 via Number(""), which this check rejects).',
+      )
+    }
+    return { sha256, splitterVersion: Number(splitterVersionRaw), status }
   }
   return undefined
 }
@@ -237,7 +324,15 @@ export interface ApplySchemaChainOptions {
    * that actually ran) fails closed rather than silently reapplying or silently skipping a
    * change nobody can see. One whose name appears `started` is a HARD fail-closed — see
    * `partial-application` below — regardless of its sha256 or splitter version, because a
-   * `started` row means the true state of the database for that file is unknown.
+   * `started` row means the true state of the database for that file is unknown — UNLESS
+   * fileHasTraceInDatabase (K2 gate fix, below) finds no real trace of that file's own
+   * created objects, in which case it is retried, not condemned.
+   *
+   * An entry whose file prefix matches but does not parse (wrong field count, empty sha256,
+   * an unrecognized status, or a non-digit splitter-version field) throws synchronously out
+   * of `applySchemaChain` (C5 gate fix) rather than being silently treated as "not recorded"
+   * — the same fail-closed posture as the empty-chain check below, since both represent an
+   * upstream caller handing this module data it cannot safely act on.
    */
   alreadyApplied?: ReadonlySet<string>
   onFile?: (file: string, index: number, total: number) => void
@@ -251,49 +346,244 @@ export interface ApplySchemaChainOptions {
   digest?: string
 }
 
+/** One schema object, picked from a chain file's own `objects` (see extractCreatedObjects in
+ *  scripts/gen-schema-chain.mjs), that `verifyGroundTruth` checks for real in `sqlite_master`. */
+interface GroundTruthProbe {
+  readonly file: string
+  readonly type: string
+  readonly name: string
+}
+
 /**
- * Verifies one fact about the REAL database that this run's in-memory bookkeeping cannot
- * fake — F3. `exec`'s contract is write-only (`Promise<void>`, no rows back — see the file
- * header on why), so there is no `SELECT ... ` this function can just read the answer from.
- * Instead it writes a scratch table guarded by a BEFORE INSERT trigger that RAISE(ABORT)s
- * when the fact does not hold, then tries to insert into it — the insert either succeeds
- * (fact true) or throws (fact false), and the throw is a REAL SQL failure that came from the
+ * Picks a handful of real objects to probe, spread across the EARLY, MIDDLE, and LATE parts
+ * of the chain — not just one, and not just the first — so the check cannot be satisfied by a
+ * splitter or apply bug isolated to one part of the corpus (K1 gate fix: the exact F2 scenario
+ * — an older splitter mis-splitting ONE file deep in the chain — must be visible here). Only
+ * files with at least one created object (see extractCreatedObjects) are candidates; a chain
+ * built entirely of ALTER/DML-only files (no real migration in this repo is, but a synthetic
+ * test `chain` override could be) yields no probes, which the caller must treat as "cannot be
+ * verified this way" rather than a false pass — see the call site below.
+ */
+/** Escapes a name for embedding inside a RegExp built from it (not SQL — see escapeSqlLiteral
+ *  for that). */
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+/**
+ * A real migration (e.g. migrations/0042_task_status_gate_values.sql) can CREATE an object
+ * and then DROP or RENAME it away later in the SAME file, or a LATER file in the chain can
+ * drop/rename it (the create-new / copy-data / drop-old / rename-new-to-old pattern SQLite's
+ * lack of most ALTER TABLE forms forces). An object created but not surviving to the end of
+ * the chain is a USELESS ground-truth probe — checking for it after the full chain runs would
+ * find it correctly absent even on a perfectly healthy pot, a false positive this function
+ * exists to avoid. `laterStatements` should be every statement from (and including) the
+ * object's own creating file's statements through the end of the chain being verified —
+ * intentionally starting at the creating file rather than strictly after the CREATE statement
+ * itself, which is a conservative choice (it can never wrongly call something "surviving," it
+ * can only wrongly skip a valid probe in favor of a different one).
+ */
+function objectSurvivesRestOfChain(type: string, name: string, laterStatements: readonly string[]): boolean {
+  const escapedName = escapeRegExp(name)
+  const dropRe = new RegExp(`\\bDROP\\s+${type}\\s+(?:IF\\s+EXISTS\\s+)?["'\`\\[]?${escapedName}["'\`\\]]?\\b`, 'i')
+  const renamedAwayRe =
+    type === 'table'
+      ? new RegExp(`\\bALTER\\s+TABLE\\s+["'\`\\[]?${escapedName}["'\`\\]]?\\s+RENAME\\s+TO\\b`, 'i')
+      : null
+  for (const stmt of laterStatements) {
+    if (dropRe.test(stmt)) return false
+    if (renamedAwayRe?.test(stmt)) return false
+  }
+  return true
+}
+
+function selectGroundTruthProbes(chain: readonly SchemaChainFile[]): GroundTruthProbe[] {
+  const withObjects = chain
+    .map((entry, index) => ({ entry, index }))
+    .filter(({ entry }) => entry.objects.length > 0)
+  if (withObjects.length === 0) return []
+
+  function statementsFrom(index: number): string[] {
+    const statements: string[] = []
+    for (let i = index; i < chain.length; i += 1) statements.push(...chain[i].statements)
+    return statements
+  }
+
+  function firstSurvivingObject(
+    entry: SchemaChainFile,
+    index: number,
+  ): { type: string; name: string } | undefined {
+    const rest = statementsFrom(index)
+    return entry.objects.find((obj) => objectSurvivesRestOfChain(obj.type, obj.name, rest))
+  }
+
+  const fractions = [0, 0.25, 0.5, 0.75, 1]
+  const byFile = new Map<string, GroundTruthProbe>()
+  for (const frac of fractions) {
+    const pos = Math.min(withObjects.length - 1, Math.floor(frac * (withObjects.length - 1)))
+    const { entry, index } = withObjects[pos]
+    const object = firstSurvivingObject(entry, index)
+    if (!object) continue // every object this file creates is later dropped/renamed — skip it
+    byFile.set(entry.file, { file: entry.file, type: object.type, name: object.name })
+  }
+  return [...byFile.values()]
+}
+
+/**
+ * Verifies real facts about the REAL database that this run's in-memory bookkeeping cannot
+ * fake. `exec`'s contract is write-only (`Promise<void>`, no rows back — see the file header
+ * on why), so there is no `SELECT ...` this function can just read the answer from. Instead it
+ * writes a scratch table guarded by a BEFORE INSERT trigger that RAISE(ABORT)s when a fact
+ * does not hold, then tries to insert into it — the insert either succeeds (every fact true)
+ * or throws (some fact false), and the throw is a REAL SQL failure that came from the
  * database, not from anything this module already believed.
  *
- * The two facts checked: (1) `pot_schema_applied` has exactly one 'applied' row per chain
- * file — this is what catches the F3 repro directly: a caller-supplied `alreadyApplied`
- * claiming files are applied against a virgin database now fails HERE, because the real row
- * count is 0, not `chain.length`. (2) `pot_schema_chain_meta`'s digest row reads back exactly
- * what this run just wrote — catches an `exec` that silently no-ops instead of persisting.
+ * K1 GATE FIX (round 3): the pre-fix version checked exactly two things, and BOTH were
+ * written by this module in the SAME call — a tautology the gate proved with 134 honest
+ * `pot_schema_applied` rows and a self-written digest against a database holding zero real
+ * tables. What this function now checks:
  *
- * Both checks run inside one BEFORE INSERT trigger (one round trip) rather than two, and the
- * scratch objects are dropped in a `finally` so a successful run leaves nothing behind.
+ *  1. `pot_schema_applied` has exactly one 'applied' row, per chain file IN THE CURRENT
+ *     CHAIN'S FILE SET, for every file in that set (C6: the pre-fix count was UNSCOPED — any
+ *     stale row for a file since renamed or squashed out of the chain inflated it forever,
+ *     permanently failing a healthy pot's count). This alone is still bookkeeping-only.
+ *  2. A SELECTION of real schema objects (`selectGroundTruthProbes`, above) — tables,
+ *     indexes, triggers, views the chain's OWN statements create — actually exist in
+ *     `sqlite_master`, spread across early/middle/late chain position. THIS is the fix for
+ *     the tautology: an `alreadyApplied` claiming files are applied against a virgin (or
+ *     partially-applied, or wrong-splitter-applied) database now fails HERE, on the real
+ *     schema, not on bookkeeping this module wrote itself moments earlier. When the chain has
+ *     no probeable objects at all (every file is ALTER/DML-only — never true for the real
+ *     SCHEMA_CHAIN, possible only for a synthetic test override), this check is skipped and
+ *     only the scoped count above applies — documented here rather than silently claimed as
+ *     exhaustive.
+ *  3. `pot_schema_chain_meta`'s digest row reads back exactly what THIS RUN just wrote (C6:
+ *     corrected comment — this catches an `exec` that silently no-ops instead of persisting
+ *     within this call; it cannot detect anything "across runs," because the digest is
+ *     unconditionally overwritten to the current expected value immediately before this
+ *     check runs every time — see `recordDigestSql` at the call site).
+ *
+ * All checks run inside one BEFORE INSERT trigger (one round trip) rather than several, and
+ * the scratch objects are dropped afterward so a successful run leaves nothing behind.
+ *
+ * C7 GATE FIX: the pre-fix version dropped the scratch trigger/table in a bare `finally`,
+ * which meant a THROWING cleanup call replaced the real ground-truth error with whatever the
+ * cleanup itself threw — hiding the diagnostic that matters most exactly when a connection is
+ * already failing (the common production shape: the ground-truth INSERT fails because the
+ * connection just dropped, and the cleanup DROP calls right after it fail for the same
+ * reason). Cleanup failures after a real failure are now swallowed in favor of the original
+ * error; cleanup failures after a SUCCESSFUL check still propagate normally, since nothing
+ * else failed to prioritize over them.
  */
 async function verifyGroundTruth(
   exec: (sql: string) => Promise<void>,
-  expectedAppliedCount: number,
+  chain: readonly SchemaChainFile[],
   expectedDigest: string,
 ): Promise<void> {
-  const count = assertSafeInteger(expectedAppliedCount, 'expectedAppliedCount')
+  const count = assertSafeInteger(chain.length, 'chain.length')
   const digest = escapeSqlLiteral(expectedDigest)
+  const fileList = chain.map((entry) => `'${escapeSqlLiteral(entry.file)}'`).join(', ')
+  const probes = selectGroundTruthProbes(chain)
+
+  const raiseClauses: string[] = [
+    `  SELECT RAISE(ABORT, 'schema-chain ground truth: pot_schema_applied has ' || ` +
+      `(SELECT COUNT(*) FROM pot_schema_applied WHERE status = 'applied' AND file IN (${fileList})) || ` +
+      `' applied row(s) among this chain''s files, expected ${count}')\n` +
+      `    WHERE (SELECT COUNT(*) FROM pot_schema_applied WHERE status = 'applied' AND file IN (${fileList})) != ${count};`,
+    `  SELECT RAISE(ABORT, 'schema-chain ground truth: pot_schema_chain_meta digest does not match the expected SCHEMA_CHAIN_DIGEST')\n` +
+      `    WHERE (SELECT value FROM pot_schema_chain_meta WHERE key = 'digest') != '${digest}';`,
+  ]
+  for (const probe of probes) {
+    const type = escapeSqlLiteral(probe.type)
+    const name = escapeSqlLiteral(probe.name)
+    const file = escapeSqlLiteral(probe.file)
+    raiseClauses.push(
+      `  SELECT RAISE(ABORT, 'schema-chain ground truth: no ${type} named ${name} in sqlite_master ` +
+        `(expected from ${file}) — the real schema does not match what this run believes it applied')\n` +
+        `    WHERE NOT EXISTS (SELECT 1 FROM sqlite_master WHERE type = '${type}' AND name = '${name}');`,
+    )
+  }
 
   await exec('DROP TRIGGER IF EXISTS __pot_schema_chain_ground_truth_trg;')
   await exec('DROP TABLE IF EXISTS __pot_schema_chain_ground_truth;')
   await exec('CREATE TABLE __pot_schema_chain_ground_truth (ok INTEGER NOT NULL);')
   await exec(
     `CREATE TRIGGER __pot_schema_chain_ground_truth_trg BEFORE INSERT ON __pot_schema_chain_ground_truth BEGIN\n` +
-      `  SELECT RAISE(ABORT, 'schema-chain ground truth: pot_schema_applied has ' || (SELECT COUNT(*) FROM pot_schema_applied WHERE status = 'applied') || ' applied row(s), expected ${count}')\n` +
-      `    WHERE (SELECT COUNT(*) FROM pot_schema_applied WHERE status = 'applied') != ${count};\n` +
-      `  SELECT RAISE(ABORT, 'schema-chain ground truth: pot_schema_chain_meta digest does not match the expected SCHEMA_CHAIN_DIGEST')\n` +
-      `    WHERE (SELECT value FROM pot_schema_chain_meta WHERE key = 'digest') != '${digest}';\n` +
-      `END;`,
+      raiseClauses.join('\n') +
+      `\nEND;`,
   )
   try {
     await exec('INSERT INTO __pot_schema_chain_ground_truth (ok) VALUES (1);')
-  } finally {
-    await exec('DROP TRIGGER IF EXISTS __pot_schema_chain_ground_truth_trg;')
-    await exec('DROP TABLE IF EXISTS __pot_schema_chain_ground_truth;')
+  } catch (primaryError) {
+    try {
+      await exec('DROP TRIGGER IF EXISTS __pot_schema_chain_ground_truth_trg;')
+      await exec('DROP TABLE IF EXISTS __pot_schema_chain_ground_truth;')
+    } catch {
+      // C7: a cleanup failure here is secondary — the ground-truth failure above is what the
+      // caller needs to see, especially when both are the same underlying connection drop.
+    }
+    throw primaryError
   }
+  await exec('DROP TRIGGER IF EXISTS __pot_schema_chain_ground_truth_trg;')
+  await exec('DROP TABLE IF EXISTS __pot_schema_chain_ground_truth;')
+}
+
+/**
+ * K2 gate fix (round 3): used only when a file is recorded 'started' and has at least one
+ * created object (see extractCreatedObjects) — checks whether the REAL database shows ANY
+ * trace of that file's own objects, so a transient failure on the file's very first statement
+ * (nothing ran, database objectively clean) can be retried instead of permanently condemning
+ * the pot. Same RAISE(ABORT)-in-trigger technique as verifyGroundTruth, because `exec` cannot
+ * return rows (see the file header).
+ *
+ * Returns `true` ("has a trace, do not retry — genuine partial state") if ANY of the file's
+ * objects exist; `false` ("no trace, safe to retry from scratch") only if NONE do. A file with
+ * SOME but not all of its objects present is still `true` (has SOME trace) — the safe,
+ * conservative reading, since "some of this file's DDL ran" is exactly the state a resume
+ * would be unsafe over (see this module's file-header note on why this is not a resume
+ * engine).
+ */
+async function fileHasTraceInDatabase(
+  exec: (sql: string) => Promise<void>,
+  entry: SchemaChainFile,
+): Promise<boolean> {
+  if (entry.objects.length === 0) {
+    // Unverifiable: this file creates no schema object extractCreatedObjects can see (e.g.
+    // pure DML/ALTER). Assume it has a trace — the old, always-hard-fail behavior — rather
+    // than guess. Only the zero-STATEMENT case (a comment-only migration) is unconditionally
+    // safe without this check at all — see the caller.
+    return true
+  }
+  const existsClauses = entry.objects
+    .map(
+      (obj) =>
+        `(SELECT COUNT(*) FROM sqlite_master WHERE type = '${escapeSqlLiteral(obj.type)}' AND name = '${escapeSqlLiteral(obj.name)}')`,
+    )
+    .join(' + ')
+
+  await exec('DROP TRIGGER IF EXISTS __pot_schema_chain_trace_trg;')
+  await exec('DROP TABLE IF EXISTS __pot_schema_chain_trace;')
+  await exec('CREATE TABLE __pot_schema_chain_trace (ok INTEGER NOT NULL);')
+  await exec(
+    `CREATE TRIGGER __pot_schema_chain_trace_trg BEFORE INSERT ON __pot_schema_chain_trace BEGIN\n` +
+      `  SELECT RAISE(ABORT, 'no trace') WHERE (${existsClauses}) = 0;\n` +
+      `END;`,
+  )
+  let hasTrace = true
+  try {
+    await exec('INSERT INTO __pot_schema_chain_trace (ok) VALUES (1);')
+  } catch {
+    hasTrace = false
+  } finally {
+    try {
+      await exec('DROP TRIGGER IF EXISTS __pot_schema_chain_trace_trg;')
+      await exec('DROP TABLE IF EXISTS __pot_schema_chain_trace;')
+    } catch {
+      // Best-effort cleanup only — do not let a cleanup failure override the trace result
+      // this function already determined (mirrors verifyGroundTruth's C7 fix).
+    }
+  }
+  return hasTrace
 }
 
 /**
@@ -370,24 +660,56 @@ export async function applySchemaChain(
     const recorded = recordedEntryFor(entry.file, alreadyApplied)
 
     if (recorded?.status === 'started') {
-      // F1's hard fail-closed outcome. Deliberately does not compare sha256/splitterVersion
-      // here — a 'started' row means we do not know how far this file got, so nothing about
-      // it can be trusted regardless of whether the recorded sha256 still matches.
-      return {
-        applied,
-        skipped,
-        failed: {
-          file: entry.file,
-          statementIndex: -1,
-          kind: 'partial-application',
-          error:
-            `pot_schema_applied recorded '${entry.file}' as 'started' but never 'applied' — a ` +
-            'prior run crashed or was interrupted partway through this file, leaving the ' +
-            'database in an unknown partial state. This module does not resume partial ' +
-            'application (blindly replaying non-idempotent DDL is not safe — see this ' +
-            "function's doc comment). The database must be recreated, not repaired.",
-        },
+      // F1's hard fail-closed outcome, refined by the K2 gate fix (round 3): a 'started' row
+      // means we do not know how far this file got — UNLESS we can prove nothing of it ran.
+      //
+      //  - Zero-statement file (a comment-only migration, e.g. 0085_identity_cleanup.sql):
+      //    there is definitionally nothing that could have run, so a 'started' row here can
+      //    only mean the marker write itself landed and nothing after it got the chance to
+      //    run before a crash. Always safe to fall through and (re)apply — condemning a
+      //    database over a literal no-op was the exact gate finding this closes.
+      //  - A file WITH created objects: check the real database for any trace of them
+      //    (fileHasTraceInDatabase). No trace at all means nothing of this file's DDL
+      //    survived — safe to fall through and retry from scratch, because there is nothing
+      //    to have run non-idempotently against. ANY trace means genuine partial state —
+      //    hard fail-closed, unchanged from before.
+      //  - A file with statements but NO created objects extractCreatedObjects can see (pure
+      //    DML/ALTER): unverifiable either way — stays hard fail-closed always, the
+      //    conservative default this module shipped with.
+      if (entry.statements.length > 0) {
+        let hasTrace: boolean
+        try {
+          hasTrace = await fileHasTraceInDatabase(exec, entry)
+        } catch (error) {
+          return {
+            applied,
+            skipped,
+            failed: { file: entry.file, statementIndex: -1, kind: 'statement-error', error: errorMessage(error) },
+          }
+        }
+        if (hasTrace) {
+          return {
+            applied,
+            skipped,
+            failed: {
+              file: entry.file,
+              statementIndex: -1,
+              kind: 'partial-application',
+              error:
+                `pot_schema_applied recorded '${entry.file}' as 'started' but never 'applied', and ` +
+                'the real database shows a trace of at least one object this file creates — a ' +
+                'prior run crashed or was interrupted partway through this file, leaving the ' +
+                'database in an unknown partial state. This module does not resume partial ' +
+                'application (blindly replaying non-idempotent DDL is not safe — see this ' +
+                "function's doc comment). The database must be recreated, not repaired.",
+            },
+          }
+        }
+        // No trace of this file's own objects: nothing of it survived. Fall through to
+        // "apply fresh" below instead of returning — deliberately NOT a `continue`/skip.
       }
+      // else: zero-statement file — always falls through to "apply fresh" (which for zero
+      // statements is just re-writing 'started' then immediately 'applied', no real work).
     }
 
     if (recorded?.status === 'applied') {
@@ -457,13 +779,14 @@ export async function applySchemaChain(
     applied.push(entry.file)
   }
 
-  // F3: verify against the real database before certifying success — see verifyGroundTruth's
-  // doc comment for exactly what this catches and why it has to be a real database round
+  // F3/K1: verify against the real database before certifying success — see
+  // verifyGroundTruth's doc comment for exactly what this catches (real schema objects, not
+  // just bookkeeping this module wrote itself) and why it has to be a real database round
   // trip rather than trusting applied/skipped, which are themselves partly built from the
   // caller's own (possibly wrong) `alreadyApplied` claim.
   try {
     await exec(recordDigestSql(digest))
-    await verifyGroundTruth(exec, chain.length, digest)
+    await verifyGroundTruth(exec, chain, digest)
   } catch (error) {
     return {
       applied,
