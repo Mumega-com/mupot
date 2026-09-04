@@ -7,7 +7,7 @@
 
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -17,7 +17,10 @@ import {
   buildSchemaChainEntries,
   computeChainDigest,
   generateSchemaChainModule,
+  SCHEMA_CHAIN_SPLITTER_VERSION,
+  DEFAULT_MIGRATIONS_DIR,
 } from '../scripts/gen-schema-chain.mjs'
+import { DatabaseSync } from 'node:sqlite'
 
 function withMigrationsDir(files, fn) {
   const dir = mkdtempSync(join(tmpdir(), 'gen-schema-chain-test-'))
@@ -165,6 +168,72 @@ test('splitSqlStatements: multiple triggers back to back are each their own stat
   assert.match(statements[1], /t2/)
 })
 
+// ── splitter: bracket / backtick identifiers (F2 gate fix) ─────────────────────────
+
+test('splitSqlStatements: [bracket-quoted] identifier does not open a false BEGIN/CASE block', () => {
+  const sql = "CREATE TABLE t ([begin] TEXT, [end] TEXT, [case] TEXT);\nCREATE TABLE y (id TEXT);"
+  const statements = splitSqlStatements(sql)
+  assert.equal(statements.length, 2, `expected 2 statements, got ${statements.length}: ${JSON.stringify(statements)}`)
+  assert.match(statements[0], /\[begin\]/)
+})
+
+test('splitSqlStatements: `backtick-quoted` identifier does not open a false BEGIN/CASE block', () => {
+  const sql = 'CREATE TABLE t (`begin` TEXT, `end` TEXT);\nCREATE TABLE y (id TEXT);'
+  const statements = splitSqlStatements(sql)
+  assert.equal(statements.length, 2, `expected 2 statements, got ${statements.length}: ${JSON.stringify(statements)}`)
+  assert.match(statements[0], /`begin`/)
+})
+
+test('splitSqlStatements: doubled `` inside a backtick identifier is an escaped backtick, not a close', () => {
+  const sql = 'CREATE TABLE t (`a``b` TEXT);\nCREATE TABLE y (id TEXT);'
+  const statements = splitSqlStatements(sql)
+  assert.equal(statements.length, 2)
+  assert.match(statements[0], /`a``b`/)
+})
+
+test('splitSqlStatements: [ ] with no closing bracket runs to end of string, not an infinite loop', () => {
+  const sql = 'CREATE TABLE t ([unterminated TEXT);'
+  // Must terminate at all (the point of this test) and must not throw for an unrelated reason.
+  const statements = splitSqlStatements(sql)
+  assert.ok(Array.isArray(statements))
+})
+
+// ── splitter: hard fail on an unterminated block (F2 gate fix) — permanent regressions ──
+//
+// M12 and M13 are the two mutation-style fixture regressions named in the gate verdict on
+// PR #1300: constructs that swallowed a whole file into one "statement" and survived every
+// check that existed before this fix.
+
+test('M12 — BEGIN TRANSACTION; ... COMMIT; never closes the block counter: hard fail, not a silent 1-statement swallow', () => {
+  const sql = 'BEGIN TRANSACTION;\nCREATE TABLE a (id TEXT);\nCOMMIT;\nCREATE TABLE b (id TEXT);'
+  assert.throws(
+    () => splitSqlStatements(sql, 'M12_fixture.sql'),
+    /unterminated BEGIN\/CASE block/,
+    'BEGIN TRANSACTION (closed by COMMIT, not END) must hard-fail rather than swallow the rest of the file',
+  )
+  // The file label must be named in the error, not just "some file somewhere failed".
+  try {
+    splitSqlStatements(sql, 'M12_fixture.sql')
+    assert.fail('expected a throw')
+  } catch (error) {
+    assert.match(error.message, /M12_fixture\.sql/)
+  }
+})
+
+test('M13 — CREATE TABLE t([begin] TEXT); is NOT mistaken for a BEGIN keyword (regression, not just the unit test above)', () => {
+  const sql = 'CREATE TABLE t([begin] TEXT);\nCREATE TABLE y (id TEXT);'
+  // Before the bracket branch existed, "begin" inside the brackets matched the keyword scan,
+  // opened a block nothing ever closes, and the file was silently swallowed into one
+  // statement — which this splitter now instead treats correctly, needing no END at all.
+  const statements = splitSqlStatements(sql, 'M13_fixture.sql')
+  assert.equal(statements.length, 2, `expected 2 statements (bracket identifier is not a keyword), got: ${JSON.stringify(statements)}`)
+})
+
+test('splitSqlStatements: an unterminated trigger BEGIN with no END hard-fails, naming the file', () => {
+  const sql = 'CREATE TRIGGER t BEFORE UPDATE ON x BEGIN\n  SELECT 1;\n'
+  assert.throws(() => splitSqlStatements(sql, 'unterminated_trigger.sql'), /unterminated BEGIN\/CASE block/)
+})
+
 // ── real migrations directory: end-to-end sanity ────────────────────────────────────
 
 test('buildSchemaChainEntries: every real migration file has a well-formed entry', () => {
@@ -200,6 +269,70 @@ test('buildSchemaChainEntries: every real CREATE TRIGGER file keeps its trigger 
   }
 })
 
+// ── CORPUS INVARIANT (F2c gate fix): every emitted statement is exactly ONE statement ──
+
+test('CORPUS INVARIANT: every statement emitted for every real migration file is exactly ONE SQL statement, per node:sqlite as an independent oracle', () => {
+  // Oracle choice, and why this one: node:sqlite's DatabaseSync.prepare(sql) does NOT throw
+  // or reject when handed more than one statement — verified empirically against this Node
+  // version — it silently prepares only the FIRST statement and ignores the rest. That
+  // silent truncation is exactly what makes `.sourceSQL` usable here: it is the exact
+  // substring SQLite's OWN tokenizer consumed as one statement (always trimmed of trailing
+  // whitespace — verified separately). If what this splitter emitted as "one statement"
+  // actually glues a second real statement onto the first, sourceSQL comes back SHORTER than
+  // the text we handed it — a signal that comes from SQLite's tokenizer, not from re-running
+  // our own splitter against itself (which would just relocate the blind spot, not close it —
+  // see the PR #1300 gate verdict, which named this exact trap).
+  //
+  // Every statement is also exec()'d in real chain order as it's checked, not merely
+  // prepared, so later CREATE TRIGGER / INSERT statements see the schema and data their own
+  // dependencies need — the same order applySchemaChain itself runs them in.
+  const db = new DatabaseSync(':memory:')
+  db.exec('PRAGMA foreign_keys = ON')
+  const entries = buildSchemaChainEntries()
+  let checked = 0
+  for (const entry of entries) {
+    for (const stmt of entry.statements) {
+      const prepared = db.prepare(stmt)
+      const expected = stmt.trim()
+      const actual = prepared.sourceSQL.trim()
+      assert.equal(
+        actual,
+        expected,
+        `${entry.file}: emitted "statement" is not exactly one SQL statement per node:sqlite's ` +
+          `own tokenizer — sourceSQL covers only ${actual.length} of ${expected.length} chars. ` +
+          `First 200 chars emitted: ${JSON.stringify(expected.slice(0, 200))}`,
+      )
+      prepared.run()
+      checked += 1
+    }
+  }
+  // Not just "every file produced a well-formed shape" (buildSchemaChainEntries' own test
+  // above already covers that) — this pins that a meaningful number of REAL statements were
+  // actually walked through the oracle, so the assertion above cannot pass vacuously on an
+  // empty or near-empty corpus.
+  assert.ok(checked > 900, `expected roughly 955 real statements checked across the corpus, got ${checked}`)
+  db.close()
+})
+
+test('CORPUS INVARIANT sanity check: a deliberately-broken splitter (return [sql]) IS caught by the oracle above', () => {
+  // Proves the invariant test is not vacuous — the exact mutation named in the gate verdict
+  // (`return [sql]`, i.e. no splitting at all) must fail this oracle for at least one real
+  // migration file that contains more than one statement.
+  const entries = buildSchemaChainEntries()
+  const multiStatementFile = entries.find((e) => e.statements.length > 1)
+  assert.ok(multiStatementFile, 'expected at least one real migration with more than one statement')
+  const wholeFileText = readFileSync(join(DEFAULT_MIGRATIONS_DIR, multiStatementFile.file), 'utf8')
+  const db = new DatabaseSync(':memory:')
+  const prepared = db.prepare(wholeFileText)
+  assert.notEqual(
+    prepared.sourceSQL.trim(),
+    wholeFileText.trim(),
+    `return [sql] mutation: ${multiStatementFile.file} has ${multiStatementFile.statements.length} real ` +
+      'statements, so treating the whole file as one statement must be caught by the oracle',
+  )
+  db.close()
+})
+
 // ── digest and module generation ────────────────────────────────────────────────────
 
 test('sha256Hex: stable, 64 hex chars, sensitive to content', () => {
@@ -215,6 +348,30 @@ test('computeChainDigest: changes when any file sha256 changes', () => {
   const entriesA = [{ file: 'a', sha256: sha256Hex('1') }, { file: 'b', sha256: sha256Hex('2') }]
   const entriesB = [{ file: 'a', sha256: sha256Hex('1') }, { file: 'b', sha256: sha256Hex('3') }]
   assert.notEqual(computeChainDigest(entriesA), computeChainDigest(entriesB))
+})
+
+// ── splitter version (gate fix: sha256 seals migration TEXT, never the splitter) ───────
+
+test('SCHEMA_CHAIN_SPLITTER_VERSION: is a positive integer', () => {
+  assert.ok(Number.isInteger(SCHEMA_CHAIN_SPLITTER_VERSION))
+  assert.ok(SCHEMA_CHAIN_SPLITTER_VERSION > 0)
+})
+
+test('computeChainDigest: changes when ONLY the splitter version changes, file sha256s held fixed', () => {
+  // This is the exact gate finding: "the sha256 seals the migration text but not the
+  // splitter that produced the statements — fixing the splitter would make every
+  // already-provisioned pot skip every file". Mixing the splitter version into the digest
+  // formula means a splitter-only change is visible at the aggregate level too, not just in
+  // the per-file bookkeeping key (src/pots/schema-chain.ts recordedKey).
+  const entries = [{ file: 'a', sha256: sha256Hex('1') }, { file: 'b', sha256: sha256Hex('2') }]
+  const digestV1 = computeChainDigest(entries, 1)
+  const digestV2 = computeChainDigest(entries, 2)
+  assert.notEqual(digestV1, digestV2, 'digest must change when only the splitter version differs')
+})
+
+test('generateSchemaChainModule: emits SCHEMA_CHAIN_SPLITTER_VERSION as a real export', () => {
+  const source = generateSchemaChainModule()
+  assert.match(source, /export const SCHEMA_CHAIN_SPLITTER_VERSION: number = \d+/)
 })
 
 test('generateSchemaChainModule: deterministic — two runs produce byte-identical output', () => {

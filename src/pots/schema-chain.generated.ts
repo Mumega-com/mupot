@@ -1773,4 +1773,7 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
   },
 ]
 
-export const SCHEMA_CHAIN_DIGEST: string = "de7e3f26134a6c6b1f19c00c6c4a94073ec4c4708910319b952ea3f470d5cd17"
+// Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
+export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 1
+
+export const SCHEMA_CHAIN_DIGEST: string = "aaab440c71a246b4e007e3315372bf78edb5fe2644bb9552d9ddbb963affee07"

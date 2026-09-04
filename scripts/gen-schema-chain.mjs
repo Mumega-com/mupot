@@ -21,6 +21,23 @@
 // `migrationFiles` from tests/helpers/migrations.ts and this file's `listMigrationFiles`),
 // so any future drift between the two copies of the rule goes red immediately instead of
 // silently producing two different answers to "what order is the schema."
+//
+// DUPLICATE NUMERIC PREFIXES ARE SAFE HERE, DELIBERATELY NOT RE-CHECKED
+//
+// migrations/ has three numeric prefixes that each name two files today (0068, 0069, 0127 —
+// verified via `ls migrations/*.sql | sed -E 's/^([0-9]+)_.*/\1/' | sort | uniq -c`).
+// scripts/check-migration-numbering.mjs already documents this exact fact and deliberately
+// does not fail on it ("Existing duplicates on main ... pre-existing debt is not this PR's to
+// fix") — its only two accepted deviations. `.sort()` above sorts the FULL FILENAME string,
+// not the parsed numeric prefix, so "0068_agent_profile.sql" < "0068_project_cycle_boundary.sql"
+// is a stable, total, lexicographic order regardless of the duplicate prefix — every reader
+// of this rule (this script, tests/helpers/migrations.ts, D1's own `wrangler d1 migrations
+// apply`, which also applies alphabetically) computes the identical order from the identical
+// input, so position is well-defined even though the number alone is not unique. Adding a
+// SEPARATE duplicate-prefix guard here would just re-litigate a question
+// check-migration-numbering.mjs already answered for the one thing that actually matters
+// (newly ADDED files clearing the target head) — see that file's `duplicate_number_within_pr`
+// check for the case that's real.
 
 import { createHash } from 'node:crypto'
 import { readFileSync, readdirSync, writeFileSync } from 'node:fs'
@@ -74,7 +91,29 @@ export function sha256Hex(text) {
 // the same keyword and SQL never interleaves them incorrectly (a CASE always closes with its
 // own END before the enclosing BEGIN's END can), a single LIFO stack over both is correct:
 // push on BEGIN or CASE, pop on END, and a `;` at depth 0 is a real statement boundary.
-export function splitSqlStatements(sql) {
+//
+// TWO MORE LITERAL ZONES, ADDED AFTER A GATE FINDING (2026-09-04): `[bracket]` identifiers
+// and `` `backtick` `` identifiers are both SQLite-legal quoting for identifiers, borrowed
+// from MS SQL Server and MySQL respectively. Before this fix, neither had a branch here, so
+// `CREATE TABLE t([begin] TEXT);` fed straight into the keyword-scanning branch below, which
+// matched the word "begin" inside the brackets as the keyword BEGIN and opened a block that
+// nothing in the file ever closes — silently swallowing the rest of the file into one
+// "statement". Both branches below run BEFORE the keyword-scanning branch, so their contents
+// (including any word that looks like BEGIN/CASE/END) are consumed as an opaque literal and
+// never reach the keyword scan, the same way the string-literal and comment branches already
+// protect their own contents.
+//
+// WHAT THIS SPLITTER DOES NOT HANDLE, ON PURPOSE: standalone `BEGIN;` / `BEGIN TRANSACTION;`
+// (SQLite's transaction-control statement, unrelated to a trigger body) is not distinguished
+// from a trigger-opening BEGIN — both increment blockDepth here, and only a trigger's BEGIN is
+// ever closed by a matching END. A file that uses transaction-control BEGIN therefore leaves
+// blockDepth stuck above zero at end of file, which the check below turns into a hard
+// generator failure rather than a silently wrong split. No migration in this repo uses
+// transaction-control BEGIN today (`wrangler d1 migrations apply` already wraps each file in
+// its own transaction — see migrations/0049_agent_status_inactive.sql's header — so a
+// migration author has no reason to write one), and the hard failure is the correct outcome
+// if one ever is: fail loud at generation time, not silently mis-split at runtime.
+export function splitSqlStatements(sql, fileLabel) {
   const statements = []
   let current = ''
   let i = 0
@@ -133,6 +172,30 @@ export function splitSqlStatements(sql) {
       i = j
       continue
     }
+    // `backtick-quoted identifier` (MySQL-style, SQLite accepts it too)
+    if (ch === '`') {
+      let j = i + 1
+      while (j < n) {
+        if (sql[j] === '`' && sql[j + 1] === '`') { j += 2; continue }
+        if (sql[j] === '`') { j += 1; break }
+        j += 1
+      }
+      current += sql.slice(i, j)
+      i = j
+      continue
+    }
+    // [bracket-quoted identifier] (MS SQL Server-style, SQLite accepts it too). SQLite's own
+    // tokenizer does not support an escaped `]` inside a bracket identifier — the first `]`
+    // always closes it — so this branch matches that exactly rather than inventing an escape
+    // convention SQLite itself does not honor.
+    if (ch === '[') {
+      let j = i + 1
+      while (j < n && sql[j] !== ']') j += 1
+      if (j < n) j += 1 // include the closing bracket
+      current += sql.slice(i, j)
+      i = j
+      continue
+    }
     // keyword-based block tracking (BEGIN / CASE open, END closes whichever is innermost)
     if (/[A-Za-z]/.test(ch)) {
       const w = wordAt(i)
@@ -157,6 +220,27 @@ export function splitSqlStatements(sql) {
   }
   if (current.trim().length > 0) statements.push(current)
 
+  // HARD FAIL, not a warning — a gate finding on this PR (2026-09-04) proved that swallowing
+  // the rest of a file into one "statement" because a block never closed is invisible to
+  // every other check in this repo: the equality test builds both schemas through
+  // node:sqlite's exec(), which runs multi-statement text happily, so split granularity was
+  // never actually observed. `blockDepth !== 0` here means the file contained more BEGIN/CASE
+  // opens than END closes as far as this splitter's rules understand them (see the
+  // WHAT-THIS-SPLITTER-DOES-NOT-HANDLE note above for the one known unsupported construct,
+  // transaction-control BEGIN). Refusing to generate is the correct outcome: a migration this
+  // splitter cannot account for must be looked at by a person, not silently mis-split into
+  // one giant statement that then gets exec()'d as if it were one CREATE TABLE.
+  if (blockDepth !== 0) {
+    throw new Error(
+      `splitSqlStatements: unterminated BEGIN/CASE block (depth=${blockDepth}) at end of file` +
+        (fileLabel ? ` in ${fileLabel}` : '') +
+        ' — this splitter only understands BEGIN as a CREATE TRIGGER body opener, closed by a' +
+        ' matching END; transaction-control BEGIN (bare `BEGIN;` / `BEGIN TRANSACTION;`, closed' +
+        ' by COMMIT rather than END) and any other unmatched BEGIN/CASE are not supported and' +
+        ' must be rewritten, or this splitter must be extended to recognize the construct.',
+    )
+  }
+
   // Drop fragments that are pure whitespace/comments (e.g. a trailing comment block after
   // the file's last `;`) — they are not statements and node:sqlite's exec() would choke on
   // an empty-after-comment-stripped chunk being sent as its own "statement".
@@ -175,20 +259,34 @@ function isBlankStatement(stmt) {
 // Module generation
 // ---------------------------------------------------------------------------------------
 
+// Bumped whenever splitSqlStatements' SPLITTING RULES change (not when migrations/*.sql
+// changes — that's what each entry's own sha256 already covers). Gate finding (2026-09-04):
+// the per-file sha256 seals the migration TEXT, never the splitter that turned that text
+// into statements. Fix a splitter bug — say, the bracket/backtick branches added alongside
+// this constant — and every already-provisioned pot's bookkeeping still shows the old sha256
+// for unchanged files, so a naive "sha256 matches, skip" would silently go on believing the
+// OLD (buggy) split was what actually ran, forever. src/pots/schema-chain.ts folds this into
+// each bookkeeping row's key precisely so a splitter-version bump becomes a visible,
+// fail-closed content-mismatch on next apply against an already-provisioned pot, never a
+// silent skip.
+export const SCHEMA_CHAIN_SPLITTER_VERSION = 1
+
 export function buildSchemaChainEntries(migrationsDir = DEFAULT_MIGRATIONS_DIR) {
   return listMigrationFiles(migrationsDir).map((file) => {
     const text = readFileSync(join(migrationsDir, file), 'utf8')
     return {
       file,
       sha256: sha256Hex(text),
-      statements: splitSqlStatements(text),
+      statements: splitSqlStatements(text, file),
     }
   })
 }
 
-/** sha256 over the concatenation of every file's own sha256 (newline-joined), in chain order. */
-export function computeChainDigest(entries) {
-  return sha256Hex(entries.map((entry) => entry.sha256).join('\n'))
+/** sha256 over the splitter version plus the concatenation of every file's own sha256
+ *  (newline-joined), in chain order — mixing in the splitter version means a splitter fix
+ *  changes the digest even when not one migration file's text changed. */
+export function computeChainDigest(entries, splitterVersion = SCHEMA_CHAIN_SPLITTER_VERSION) {
+  return sha256Hex([String(splitterVersion), ...entries.map((entry) => entry.sha256)].join('\n'))
 }
 
 function renderStatementsArray(statements) {
@@ -232,6 +330,9 @@ export function generateSchemaChainModule(migrationsDir = DEFAULT_MIGRATIONS_DIR
     lines.push('  },')
   }
   lines.push(']')
+  lines.push('')
+  lines.push('// Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.')
+  lines.push(`export const SCHEMA_CHAIN_SPLITTER_VERSION: number = ${JSON.stringify(SCHEMA_CHAIN_SPLITTER_VERSION)}`)
   lines.push('')
   lines.push(`export const SCHEMA_CHAIN_DIGEST: string = ${JSON.stringify(digest)}`)
   lines.push('')
