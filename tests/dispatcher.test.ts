@@ -24,8 +24,13 @@ describe('WFP Dynamic Dispatcher', () => {
       // Sanity: these are the two hostnames the old override test smuggled a tenant into.
       expect(extractTenantSlug('mupot.mumega.com', DEFAULT_ROOT_DOMAIN)).toBe(DEFAULT_FALLBACK_POT)
       expect(extractTenantSlug('anything.com', DEFAULT_ROOT_DOMAIN)).toBe('anything-com')
-      // The function takes exactly two parameters; a third has nowhere to go.
-      expect(extractTenantSlug.length).toBe(1)
+      // NOTE: do not try to pin this with `extractTenantSlug.length`. Function.length
+      // counts parameters before the first DEFAULTED one, and `rootDomain` has a default,
+      // so it reads 1 whether the signature is (hostname, rootDomain) or
+      // (hostname, rootDomain, headerSlug) — verified, and it silently survived the
+      // mutation that restored the third parameter. The real guards are the behavioural
+      // case below at the dispatcher.fetch seam, the composition test at worker.fetch,
+      // and tsc rejecting a third argument at every call site.
     })
 
     it('sanitizes custom CNAME domains', () => {
