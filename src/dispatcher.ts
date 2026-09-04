@@ -8,6 +8,8 @@
 //   2. Caches are disabled inside dispatch namespaces; zero `caches.default` / `caches.open`.
 //   3. Single billed request across the chain: Dispatch Worker -> User Worker.
 
+import { RESERVED_TENANT_SLUGS } from './pots/service'
+
 export interface DispatcherEnv {
   DISPATCHER: {
     get(
@@ -99,6 +101,147 @@ export function extractTenantSlug(
   return sanitizeSlug(cleanHost)
 }
 
+const PATH_TENANT_RE = /^\/t\/([a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?)(\/.*)?$/i
+
+/** Apex path ` /t/{tenant}/{interface} ` e.g. `/t/gaf/mcp`. */
+export function extractPathTenant(pathname: string): { slug: string; remainder: string } | null {
+  const match = pathname.match(PATH_TENANT_RE)
+  if (!match) return null
+  const slug = match[1].toLowerCase()
+  const rest = match[2]
+  const remainder = rest && rest.length > 0 ? rest : '/'
+  return { slug, remainder }
+}
+
+export type ApexPathTenant =
+  | { kind: 'home'; request: Request; slug: string }
+  | { kind: 'dispatch'; request: Request; slug: string }
+  | { kind: 'reserved'; slug: string }
+
+function rewriteRequest(request: Request, hostname: string, pathname: string): Request {
+  const url = new URL(request.url)
+  url.hostname = hostname
+  url.pathname = pathname
+  return new Request(url, request)
+}
+
+// Headers a client must never use to retarget a resolved path tenant.
+const TENANT_OVERRIDE_HEADERS = ['x-mupot-tenant-slug', 'x-pot-tenant']
+// Colony credentials that must never ride into a foreign tenant isolate.
+// The path door is same-origin (`mupot.mumega.com`), so unlike subdomain
+// routing the browser/operator credentials arrive with the request — strip
+// them before dispatch. Tenant Workers authenticate through their own door.
+const CREDENTIAL_HEADERS = ['cookie', 'authorization', 'proxy-authorization']
+
+function stripHeaders(request: Request, names: string[]): Request {
+  const headers = new Headers(request.headers)
+  for (const name of names) headers.delete(name)
+  return new Request(request, { headers })
+}
+
+/**
+ * On the colony apex, `/t/{slug}/{interface}` is the tenant URL.
+ * Home slug stays on this Worker with the prefix stripped.
+ * Any other slug is rewritten to `{slug}.{rootDomain}{interface}` for WFP dispatch.
+ */
+export function resolveApexPathTenant(
+  request: Request,
+  homeSlug: string,
+  rootDomain: string = DEFAULT_ROOT_DOMAIN,
+): ApexPathTenant | null {
+  const url = new URL(request.url)
+  const parsed = extractPathTenant(url.pathname)
+  if (!parsed) return null
+  const home = homeSlug.toLowerCase()
+  if (parsed.slug === home) {
+    // Home stays on this Worker (same isolate, colony credentials valid),
+    // but the tenant-override headers must die here so the downstream
+    // header dispatch in index.ts cannot retarget a resolved path.
+    const homeRequest = stripHeaders(
+      rewriteRequest(request, url.hostname, parsed.remainder),
+      TENANT_OVERRIDE_HEADERS,
+    )
+    return { kind: 'home', slug: parsed.slug, request: homeRequest }
+  }
+  // Reserved infrastructure names can never own a tenant worker (see
+  // RESERVED_TENANT_SLUGS in src/pots/service.ts) — refuse before dispatch.
+  if (RESERVED_TENANT_SLUGS.has(parsed.slug)) {
+    return { kind: 'reserved', slug: parsed.slug }
+  }
+  // Foreign tenant: the rewritten request carries no client tenant-override
+  // and no colony credentials into the isolate (Athena gate 2026-09-04).
+  const dispatchRequest = stripHeaders(
+    rewriteRequest(request, `${parsed.slug}.${rootDomain}`, parsed.remainder),
+    [...TENANT_OVERRIDE_HEADERS, ...CREDENTIAL_HEADERS],
+  )
+  return {
+    kind: 'dispatch',
+    slug: parsed.slug,
+    request: dispatchRequest,
+  }
+}
+
+export interface ApexPathEnv {
+  PUBLIC_ORIGIN?: string
+  TENANT_SLUG?: string
+  DISPATCHER?: DispatcherEnv['DISPATCHER']
+}
+
+export type ApexPathRoute =
+  | { kind: 'passthrough' }
+  | { kind: 'home'; request: Request }
+  | { kind: 'respond'; response: Response }
+
+/**
+ * Route one apex `/t/{tenant}/{interface}` request. Returns `passthrough` when
+ * the path is not a tenant address, the rewritten home request for this
+ * Worker's own slug, or a terminal response (reserved slug, unbound
+ * dispatcher, dispatched tenant response). Extracted so the routing contract
+ * is unit-testable without booting the full Worker entry.
+ */
+export async function routeApexPathTenant(req: Request, env: ApexPathEnv): Promise<ApexPathRoute> {
+  const rootHost = env.PUBLIC_ORIGIN ? new URL(env.PUBLIC_ORIGIN).hostname : DEFAULT_ROOT_DOMAIN
+  const homeSlug = (env.TENANT_SLUG || 'mumega').toLowerCase()
+  const pathTenant = resolveApexPathTenant(req, homeSlug, rootHost)
+  if (!pathTenant) return { kind: 'passthrough' }
+  if (pathTenant.kind === 'home') return { kind: 'home', request: pathTenant.request }
+  if (pathTenant.kind === 'reserved') {
+    return {
+      kind: 'respond',
+      response: new Response(
+        JSON.stringify({
+          error: 'reserved_slug',
+          tenant: pathTenant.slug,
+          message: `Slug '${pathTenant.slug}' is reserved infrastructure and cannot name a tenant.`,
+        }),
+        { status: 404, headers: { 'content-type': 'application/json' } },
+      ),
+    }
+  }
+  if (!env.DISPATCHER) {
+    return {
+      kind: 'respond',
+      response: new Response(
+        JSON.stringify({
+          error: 'unconfigured',
+          tenant: pathTenant.slug,
+          message: 'Cloudflare dispatch namespace is not bound; cannot route /t/{tenant}.',
+        }),
+        { status: 503, headers: { 'content-type': 'application/json' } },
+      ),
+    }
+  }
+  // No FALLBACK_POT: that field was removed from DispatcherEnv in mupot#1301 because
+  // nothing ever read it — extractTenantSlug returns the module constant. Passing it here
+  // would re-add a knob that does nothing.
+  const response = await dispatcher.fetch(pathTenant.request, {
+    DISPATCHER: env.DISPATCHER,
+    ROOT_DOMAIN: rootHost,
+  })
+  return { kind: 'respond', response }
+}
+
+
 /** The one normalization both hostname branches emit. Substitutes, never shortens. */
 function sanitizeSlug(label: string): string {
   return label.replace(/[^a-z0-9-]/g, '-')
@@ -148,7 +291,7 @@ export function renderUnprovisionedPotHtml(tenantSlug: string): string {
 </html>`
 }
 
-export default {
+const dispatcher = {
   async fetch(request: Request, env: DispatcherEnv): Promise<Response> {
     const url = new URL(request.url)
     const rootDomain = env.ROOT_DOMAIN || DEFAULT_ROOT_DOMAIN
@@ -195,4 +338,6 @@ export default {
     }
   },
 }
+
+export default dispatcher
 

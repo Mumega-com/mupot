@@ -8,6 +8,21 @@ import type {
 export const DISPATCH_NAMESPACE = 'mupot-pots'
 export const DEFAULT_ROOT_DOMAIN = 'mupot.mumega.com'
 
+// Slugs that can never name a tenant worker. Mirrored by the apex path router
+// (src/dispatcher.ts) so reserved names fail fast instead of dispatching.
+export const RESERVED_TENANT_SLUGS = new Set([
+  'mumega',
+  'mupot',
+  'api',
+  'admin',
+  'dashboard',
+  'auth',
+  'oauth',
+  'app',
+  'studio',
+  'copilot',
+])
+
 export function sanitizeSlug(input: string): string {
   return input
     .toLowerCase()
@@ -23,8 +38,7 @@ export function validateSlug(slug: string): { ok: true } | { ok: false; error: s
   if (!/^[a-z0-9][a-z0-9-]*[a-z0-9]$/.test(slug)) {
     return { ok: false, error: 'Slug must start and end with alphanumeric characters and contain only letters, numbers, and dashes.' }
   }
-  const reserved = new Set(['mumega', 'mupot', 'api', 'admin', 'dashboard', 'auth', 'oauth', 'app', 'studio', 'copilot'])
-  if (reserved.has(slug)) {
+  if (RESERVED_TENANT_SLUGS.has(slug)) {
     return { ok: false, error: `Slug '${slug}' is a reserved system domain.` }
   }
   return { ok: true }
