@@ -569,6 +569,30 @@ describe('applySchemaChain — F3: ground-truth verification against the real da
     db.close()
   })
 
+  it('the digest RAISE clause is load-bearing: an exec() that silently no-ops the pot_schema_chain_meta write (reports success without persisting it) is caught, not treated as success', async () => {
+    // Direct mutation-guard for the digest clause in verifyGroundTruth's raiseClauses: deleting
+    // that clause entirely survives every other test in this file (nothing else in the suite
+    // observes it, since recordDigestSql unconditionally overwrites the digest to the correct
+    // value immediately before verifyGroundTruth runs on every normal path — see the C6 doc
+    // note on what this clause can and cannot detect). The one thing it CAN catch is an exec()
+    // that reports success on the digest INSERT without actually persisting it — simulated
+    // here directly, rather than asserted only in prose.
+    const db = createSqliteD1()
+    const realExec = execViaSqlite(db)
+    const chain = SCHEMA_CHAIN.slice(0, 4)
+    const exec = async (sql: string) => {
+      if (sql.startsWith('INSERT INTO pot_schema_chain_meta')) {
+        return // silently no-op — the exact failure mode the digest clause exists to catch
+      }
+      await realExec(sql)
+    }
+    const result = await applySchemaChain(exec, { chain })
+    expect(result.failed).toBeDefined()
+    expect(result.failed?.kind).toBe('ground-truth-mismatch')
+    expect(result.failed?.error).toMatch(/digest does not match/)
+    db.close()
+  })
+
   it('a correctly-recorded skip-everything run still passes ground truth (not a false positive)', async () => {
     const db = createSqliteD1()
     const exec = execViaSqlite(db)

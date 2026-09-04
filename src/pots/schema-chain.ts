@@ -555,8 +555,15 @@ async function verifyGroundTruth(
       `(SELECT COUNT(*) FROM pot_schema_applied WHERE status = 'applied' AND file IN (${fileList})) || ` +
       `' applied row(s) among this chain''s files, expected ${count}')\n` +
       `    WHERE (SELECT COUNT(*) FROM pot_schema_applied WHERE status = 'applied' AND file IN (${fileList})) != ${count};`,
+    // `IS NOT`, not `!=`: if the digest row is MISSING entirely (the meta INSERT silently
+    // no-op'd — the one thing this clause exists to catch, per the C6 doc note above) the
+    // subselect returns SQL NULL, and `NULL != '<digest>'` evaluates to NULL — which WHERE
+    // treats as false, so the RAISE never fired and the missing-row case slipped through as a
+    // pass. Found while re-verifying this clause is load-bearing (round 4). `IS NOT` is
+    // NULL-aware (`NULL IS NOT '<digest>'` is true), closing that gap with no new machinery —
+    // one operator, not a mechanism.
     `  SELECT RAISE(ABORT, 'schema-chain ground truth: pot_schema_chain_meta digest does not match the expected SCHEMA_CHAIN_DIGEST')\n` +
-      `    WHERE (SELECT value FROM pot_schema_chain_meta WHERE key = 'digest') != '${digest}';`,
+      `    WHERE (SELECT value FROM pot_schema_chain_meta WHERE key = 'digest') IS NOT '${digest}';`,
   ]
   for (const probe of probes) {
     const type = escapeSqlLiteral(probe.type)
