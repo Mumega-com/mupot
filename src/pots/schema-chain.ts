@@ -85,7 +85,9 @@
 //        wipe — keep only the 5 probed objects, drop the other ~600 real objects — passed
 //        clean, and so did dropping every object of any one of the 129 unprobed files. Fixed
 //        by DELETING `fractions` and the fraction-walking code: `selectGroundTruthProbes` now
-//        probes EVERY object-creating file's first surviving object, not a sample — one
+//        probes every object-creating file whose object still exists at the end of the
+//        chain — 114 of 115 today, not a sample; the one exclusion is a trigger a later
+//        migration replaces, and that later migration is itself probed. One
 //        `CREATE TRIGGER` with one `RAISE(ABORT)`/`WHERE NOT EXISTS` clause per probed file,
 //        still a single round trip. `objectSurvivesRestOfChain` (below) was already sound —
 //        kept as-is. See `selectGroundTruthProbes` and its test for the non-empty-probe-list
@@ -437,6 +439,32 @@ function objectSurvivesRestOfChain(type: string, name: string, laterStatements: 
   return true
 }
 
+/** Statements of `fileStatements` that come AFTER the one creating `type`/`name`.
+ *
+ *  ROUND 5 GATE FIX. The survival scan used to start at the file's OWN first statement, so the
+ *  ordinary rebuild idiom — `DROP TRIGGER IF EXISTS x; CREATE TRIGGER x ...` in one migration —
+ *  read the file's own DROP as "dropped later" and removed the file from probe coverage
+ *  entirely. Six real migrations did exactly that, and all seven of their objects were
+ *  droppable afterwards without ground truth noticing. Only statements after the CREATE can
+ *  undo it, so that is the window. If no creating statement is found the whole file is scanned,
+ *  which is the conservative direction: it can drop a probe, never invent one.
+ */
+function statementsAfterCreationOf(
+  fileStatements: readonly string[],
+  type: string,
+  name: string,
+): string[] {
+  const escapedName = escapeRegExp(name)
+  const createRe = new RegExp(
+    `\\bCREATE\\s+(?:UNIQUE\\s+)?(?:TEMP(?:ORARY)?\\s+)?${type}\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?["'\`\\[]?${escapedName}["'\`\\]]?\\b`,
+    'i',
+  )
+  for (let i = fileStatements.length - 1; i >= 0; i -= 1) {
+    if (createRe.test(fileStatements[i])) return fileStatements.slice(i + 1)
+  }
+  return [...fileStatements]
+}
+
 function statementsFrom(chain: readonly SchemaChainFile[], index: number): string[] {
   const statements: string[] = []
   for (let i = index; i < chain.length; i += 1) statements.push(...chain[i].statements)
@@ -444,7 +472,10 @@ function statementsFrom(chain: readonly SchemaChainFile[], index: number): strin
 }
 
 /**
- * Picks one real object to probe from EVERY object-creating file in the chain — not a sample.
+ * Picks one real object to probe from every object-creating file whose object survives to the
+ * end of the chain — 114 of the 115 object-creating files today, not a sample. The single
+ * exclusion is a trigger that a later migration drops and recreates; that later file is probed
+ * instead, so the object is still covered.
  *
  * ROUND 4 GATE FIX: the pre-fix version sampled 5 files (`fractions = [0, 0.25, 0.5, 0.75,
  * 1]`) out of 115 that create objects, on the theory that spreading across early/middle/late
@@ -457,7 +488,12 @@ function statementsFrom(chain: readonly SchemaChainFile[], index: number): strin
  * unchanged from round 3 — the gate verified it sound: 589 claimed survivors, 0 absent after a
  * clean apply). At today's corpus size (115 object-creating files) this is still one
  * `CREATE TRIGGER` with ~115 `RAISE(ABORT)`/`WHERE NOT EXISTS` clauses — a few tens of KB,
- * comfortably under SCHEMA_CHAIN_BATCH_MAX_BYTES (64KB) — and one round trip, same as before.
+ * The limit that actually applies is D1's 100KB per-statement cap, NOT SCHEMA_CHAIN_BATCH_MAX_BYTES
+ * (batchStatements has no callers on this path, so that constant enforces nothing here). Measured
+ * against real local D1: 45KB today, ~381 bytes per added migration, and SQLITE_TOOBIG at ~100KB,
+ * so roughly 145 migrations of headroom. It fails loudly and never truncates. Note that node:sqlite
+ * accepts >2MB and so cannot detect this ceiling — see migrations/0133 for a prior case where D1
+ * was stricter than node. Chunk the trigger before that runs out.
  * If the corpus grows enough that a single trigger statement becomes too large, split
  * `raiseClauses` (in `verifyGroundTruth`, below) into multiple sequential
  * create-trigger/insert/cleanup rounds, mechanically (e.g. every N clauses), and keep the
@@ -486,9 +522,15 @@ export function selectGroundTruthProbes(chain: readonly SchemaChainFile[]): Grou
   for (let index = 0; index < chain.length; index += 1) {
     const entry = chain[index]
     if (entry.objects.length === 0) continue
-    const rest = statementsFrom(chain, index)
-    const object = entry.objects.find((obj) => objectSurvivesRestOfChain(obj.type, obj.name, rest))
-    if (!object) continue // every object this file creates is later dropped/renamed — skip it
+    const later = statementsFrom(chain, index + 1)
+    const object = entry.objects.find((obj) =>
+      objectSurvivesRestOfChain(obj.type, obj.name, [
+        ...statementsAfterCreationOf(entry.statements, obj.type, obj.name),
+        ...later,
+      ]),
+    )
+    // Genuinely dropped or renamed away before the chain ends — nothing to probe here.
+    if (!object) continue
     probes.push({ file: entry.file, type: object.type, name: object.name })
   }
   return probes

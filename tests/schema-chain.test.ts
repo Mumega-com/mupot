@@ -714,11 +714,17 @@ describe('applySchemaChain — ROUND 4: selectGroundTruthProbes probes every obj
     expect(probes.length).toBeGreaterThan(5)
 
     const withSurvivingObject = SCHEMA_CHAIN.filter((entry) => entry.objects.length > 0).length
-    // Not every object-creating file necessarily contributes a probe (all of its objects could
-    // be dropped/renamed away later — see objectSurvivesRestOfChain) so this is an upper bound,
-    // not exact equality, but it must be in the same ballpark as "every file," not "5".
-    expect(probes.length).toBeGreaterThan(withSurvivingObject * 0.9)
-    expect(probes.length).toBeLessThanOrEqual(withSurvivingObject)
+    // ROUND 5: this used to allow a 10% shortfall (`* 0.9`), and that slack is exactly what hid
+    // six files falling out of coverage — 109 > 103.5 passed while 7 real objects were droppable
+    // without ground truth noticing. A file may legitimately contribute no probe only when a LATER
+    // migration drops or renames every object it creates, and that later file is probed instead.
+    // Today that is exactly one file, so the shortfall is pinned at 1 rather than a percentage:
+    // any new exclusion has to be justified here deliberately, not absorbed by a slack window.
+    const unprobed = SCHEMA_CHAIN.filter(
+      (entry) => entry.objects.length > 0 && !new Set(probes.map((p) => p.file)).has(entry.file),
+    ).map((entry) => entry.file)
+    expect(unprobed).toEqual(['0061_task_project_access_on_attribution.sql'])
+    expect(probes.length).toBe(withSurvivingObject - 1)
 
     // Every probed file must be distinct (one probe per file, not per object).
     expect(new Set(probes.map((p) => p.file)).size).toBe(probes.length)
