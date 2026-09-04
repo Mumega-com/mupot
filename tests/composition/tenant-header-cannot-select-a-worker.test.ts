@@ -108,3 +108,54 @@ describe('a client-supplied tenant header cannot choose the serving Worker (#129
     expect(dispatched).toEqual(['gaf'])
   })
 })
+
+// ── mupot#1307 (gate F4) ───────────────────────────────────────────────────────────────
+//
+// The /preview gate proven through the DEPLOYED composition, not the sub-app. Every other
+// test for it calls platformApp.fetch, which cannot see whether the middleware survives the
+// mount at `app.route('/', platformApp)` in src/index.ts, or the OAuthProvider wrapper
+// around it. That is the same blind spot this file was created for.
+//
+// The DB binding throws on any prepare(): if the refusal is ordered correctly it is never
+// reached, so the test also proves refusal precedes any database work — an anonymous caller
+// learns nothing, not even that a lookup happened.
+describe('/preview refuses anonymous callers through the real worker (#1307)', () => {
+  function envWithThrowingDb() {
+    const dispatched: string[] = []
+    const env = {
+      TENANT_SLUG: 'mumega',
+      BRAND: 'mupot',
+      IDP_PROVIDER: 'google',
+      OAUTH_CLIENT_ID: 'test-client.apps.googleusercontent.com',
+      OAUTH_CLIENT_SECRET: 'test-secret',
+      PUBLIC_ORIGIN: 'https://mupot.mumega.com',
+      SESSIONS: kv(),
+      OAUTH_KV: kv(),
+      DB: {
+        prepare: () => {
+          throw new Error('DB_TOUCHED_BY_ANONYMOUS_CALLER')
+        },
+      },
+      DISPATCHER: {
+        get: (name: string) => {
+          dispatched.push(name)
+          return { fetch: async () => new Response('tenant') }
+        },
+      },
+    }
+    return { env: env as never, dispatched }
+  }
+
+  it.each([
+    ['/preview/proj-1'],
+    ['/preview/proj-1/'],
+    ['/preview/proj-1/deep/path?q=1'],
+  ])('%s is refused 401 without touching the database or the namespace', async (path) => {
+    const { env, dispatched } = envWithThrowingDb()
+    const res = await worker.fetch(new Request(`https://mupot.mumega.com${path}`), env, ctx)
+
+    expect(res.status).toBe(401)
+    expect(await res.json()).toEqual({ error: 'unauthenticated' })
+    expect(dispatched).toEqual([])
+  })
+})

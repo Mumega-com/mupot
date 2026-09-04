@@ -5,10 +5,12 @@
 // the same path in a split-view iframe (live preview | code/logs).
 
 import { Hono } from 'hono'
+import type { Context } from 'hono'
 import { html, raw } from 'hono/html'
 import type { HtmlEscapedString } from 'hono/utils/html'
 import type { AuthContext, Env, Project, ProjectDeployment } from '../types'
 import { requireAuth } from '../auth'
+import { readableProjectForAuth } from '../projects'
 import {
   handlePlatformDispatch,
   previewIframePath,
@@ -21,7 +23,31 @@ type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
 export const platformApp = new Hono<AppEnv>()
 
-async function previewHandler(c: { req: { raw: Request }; env: Env }): Promise<Response> {
+async function previewHandler(c: Context<AppEnv>): Promise<Response> {
+  // AUTHENTICATED IS NOT AUTHORIZED (mupot#1305, gate round 1).
+  //
+  // requireAuth above proves a valid session in this pot. It does NOT prove this principal
+  // may see THIS project — and new identities self-enrol as `member` with zero grants
+  // (src/auth/index.ts: role = isFirst && allowBootstrapOwner ? 'owner' : 'member'), so
+  // "authenticated" is a much larger set than it looks.
+  //
+  // Before this check, `/preview/:id` resolved the project with the UNSCOPED getProject
+  // via findProjectForDispatch, which meant a principal who gets 404 from
+  // GET /api/projects/:id and 404 from the /projects/:id page could still dispatch into
+  // that project's Worker and read its response. The preview was more permissive than the
+  // page embedding it, using the same project id.
+  //
+  // Same authority as those two surfaces, and the same 404 rather than a 403, so this does
+  // not become an existence oracle for projects the caller cannot see.
+  const projectId = c.req.param('project_id') ?? ''
+  const visible = projectId ? await readableProjectForAuth(c.env, projectId, c.get('auth')) : null
+  if (!visible) {
+    return new Response(JSON.stringify({ error: 'project_not_found', project_id: projectId }), {
+      status: 404,
+      headers: { 'content-type': 'application/json' },
+    })
+  }
+
   const response = await handlePlatformDispatch(c.req.raw, c.env)
   return response ?? new Response(JSON.stringify({ error: 'preview_unroutable' }), {
     status: 404,

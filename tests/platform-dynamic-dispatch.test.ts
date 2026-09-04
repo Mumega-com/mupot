@@ -189,8 +189,12 @@ describe('platform dispatch fetch', () => {
     expect(created.ok).toBe(true)
     if (!created.ok) return
 
+    // NO cookie here, deliberately: this calls handlePlatformDispatch DIRECTLY, below the
+    // route middleware, so a cookie would be inert decoration that reads to a maintainer
+    // as gate coverage (mupot#1307 gate, F5). The gate itself is proven in
+    // tests/platform-preview-auth.test.ts, which goes through platformApp.fetch.
     const response = await handlePlatformDispatch(
-      new Request(`https://mupot.mumega.com/preview/${created.value.id}/`, { headers: AUTHED }),
+      new Request(`https://mupot.mumega.com/preview/${created.value.id}/`),
       envFor(harness),
     )
     expect(response).not.toBeNull()

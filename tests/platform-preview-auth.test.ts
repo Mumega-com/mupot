@@ -47,6 +47,19 @@ const SESSION_RECORD = JSON.stringify({
   createdAt: '2026-09-04T00:00:00.000Z',
 })
 
+/**
+ * A self-enrolled principal: valid session, role `member`, no grants. This is what
+ * src/auth/index.ts mints for every identity after the first
+ * (`role = isFirst && allowBootstrapOwner ? 'owner' : 'member'`), so it is the realistic
+ * attacker for this route — not an org-admin.
+ */
+const MEMBER_RECORD = JSON.stringify({
+  userId: 'stranger',
+  email: 'stranger@example.com',
+  role: 'member',
+  createdAt: '2026-09-04T00:00:00.000Z',
+})
+
 /** Records every script name the dispatch namespace was asked for. */
 function spyDispatcher() {
   const asked: string[] = []
@@ -152,6 +165,66 @@ describe('/preview/:project_id requires authentication (#1305)', () => {
     )
     expect(res.status).toBe(401)
     expect(await res.text()).not.toContain('project_not_found')
+  })
+
+  // ── gate round 1, F1: authenticated is not authorized ──────────────────────────
+  //
+  // The first version of this fix stopped at requireAuth. That left `/preview/:id`
+  // resolving the project with the UNSCOPED getProject, so any authenticated principal
+  // could dispatch into any project's Worker — including one for whom GET /api/projects/:id
+  // and the /projects/:id page both answer 404. The preview was more permissive than the
+  // page that embeds it.
+  it('refuses a member who cannot SEE the project, though their session is valid', async () => {
+    harness = makeHarness()
+    const d = spyDispatcher()
+    const ownerEnv = envFor(harness, d.binding, true)
+    const id = await healthyProject(harness, ownerEnv, 'gaf')
+
+    // Same request, same cookie, but the session resolves to a grantless member.
+    const memberEnv = {
+      ...ownerEnv,
+      SESSIONS: { get: vi.fn(async () => MEMBER_RECORD) },
+    } as unknown as Env
+
+    const res = await platformApp.fetch(
+      new Request(`https://mupot.mumega.com/preview/${id}/secret`, {
+        method: 'POST',
+        headers: { cookie: 'mupot_session=live-session-id' },
+      }),
+      memberEnv,
+    )
+
+    expect(res.status).toBe(404)
+    // 404, not 403 — a 403 would confirm the project exists to someone who may not see it.
+    expect(d.asked, `dispatched to ${d.asked.join(',')} for a principal who cannot see the project`).toEqual([])
+  })
+
+  // ── gate round 1, F3: a cookie is not a session ────────────────────────────────
+  //
+  // Every negative test above sends NO cookie, so they exercise only
+  // `getCookie() === undefined`. The gate proved a middleware that 401s on a MISSING
+  // cookie and trusts any present one passed the entire suite. This is the missing case:
+  // a cookie IS presented and the session store does not know it.
+  it('refuses a forged cookie whose session does not resolve', async () => {
+    harness = makeHarness()
+    const d = spyDispatcher()
+    const ownerEnv = envFor(harness, d.binding, true)
+    const id = await healthyProject(harness, ownerEnv, 'gaf')
+
+    const forgedEnv = {
+      ...ownerEnv,
+      SESSIONS: { get: vi.fn(async () => null) },
+    } as unknown as Env
+
+    const res = await platformApp.fetch(
+      new Request(`https://mupot.mumega.com/preview/${id}/`, {
+        headers: { cookie: 'mupot_session=forged-does-not-exist' },
+      }),
+      forgedEnv,
+    )
+
+    expect(res.status).toBe(401)
+    expect(d.asked).toEqual([])
   })
 
   // PAIRED POSITIVE CONTROL. Without this, a change that broke /preview entirely would
