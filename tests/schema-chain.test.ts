@@ -590,6 +590,34 @@ describe('applySchemaChain — F4/F5: exec() failures around bookkeeping are cau
 
     db.close()
   })
+
+  it('a file never lands in `applied` when the write that marks it applied itself fails (guards the applied.push ordering)', async () => {
+    // Gate note: "moving `applied.push` above the record write survives 15/15 — nothing ties
+    // `applied` to the rows actually written." This test forces exactly that write to fail
+    // and asserts `applied` reflects reality — it can only pass if `applied.push` runs AFTER
+    // the write that marks the file 'applied' succeeds, not before.
+    const db = createSqliteD1()
+    const realExec = execViaSqlite(db)
+    const chain = SCHEMA_CHAIN.slice(0, 2)
+    const targetFile = chain[1].file
+    const exec = async (sql: string) => {
+      if (sql.startsWith('UPDATE pot_schema_applied SET status') && sql.includes(`WHERE file = '${targetFile}'`)) {
+        throw new Error('simulated failure writing the applied marker')
+      }
+      await realExec(sql)
+    }
+
+    const result = await applySchemaChain(exec, { chain })
+
+    expect(result.failed).toBeDefined()
+    expect(result.failed?.file).toBe(targetFile)
+    // The file whose applied-write failed must NOT be in `applied` — its statements ran, but
+    // the bookkeeping never confirmed it, so callers must not be told it is done.
+    expect(result.applied).not.toContain(targetFile)
+    expect(result.applied).toEqual([chain[0].file])
+
+    db.close()
+  })
 })
 
 // ── escapeSqlLiteral — direct + injection-shaped integration proof ─────────────────────
