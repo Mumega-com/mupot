@@ -20,7 +20,14 @@ describe('WFP Dynamic Dispatcher', () => {
     // written down as an expectation: it made tenant selection an unauthenticated choice
     // at an entry point that runs before any auth. The capability is now gone from the
     // signature, so the assertion is that the hostname is the only input.
-    it('ignores any client-supplied slug — the hostname is the only input', () => {
+    // NAME CHANGED (mupot#1301 review): this was called "ignores any client-supplied slug",
+    // which overclaimed — both assertions below pass IDENTICALLY under the old
+    // three-parameter signature, because neither passes a third argument. The cheapest
+    // implementation that satisfies this test is the pre-fix code. The real guards are the
+    // behavioural case at the dispatcher.fetch seam below and the composition test at
+    // worker.fetch; both were confirmed by mutation, this one was not. It is named for
+    // what it actually pins so nobody counts it as the security guard.
+    it('resolves root, www and custom domains from the hostname', () => {
       // Sanity: these are the two hostnames the old override test smuggled a tenant into.
       expect(extractTenantSlug('mupot.mumega.com', DEFAULT_ROOT_DOMAIN)).toBe(DEFAULT_FALLBACK_POT)
       expect(extractTenantSlug('anything.com', DEFAULT_ROOT_DOMAIN)).toBe('anything-com')
@@ -33,8 +40,55 @@ describe('WFP Dynamic Dispatcher', () => {
       // and tsc rejecting a third argument at every call site.
     })
 
+    // mupot#1301 review, F2. Reproduced LIVE on production before the fix:
+    //   curl --resolve 'mupot.mumega.com.:443:<ip>' https://mupot.mumega.com./health
+    //   -> {"error":"pot_not_found","tenant":"mupot-mumega-com-"}
+    // A trailing dot is a legal FQDN, survives the Cloudflare edge, and is preserved in
+    // req.url. It defeated both the apex equality test and the suffix test, fell through
+    // to the custom-domain branch, and delivered an attacker-shaped string to
+    // DISPATCHER.get() unauthenticated, ahead of all auth. It failed closed only because
+    // no Worker happens to be named `mupot-mumega-com-`.
+    it('normalizes a trailing dot — an FQDN apex is the apex, not a custom domain', () => {
+      expect(extractTenantSlug('mupot.mumega.com.', DEFAULT_ROOT_DOMAIN)).toBe(DEFAULT_FALLBACK_POT)
+      expect(extractTenantSlug('mupot.mumega.com..', DEFAULT_ROOT_DOMAIN)).toBe(DEFAULT_FALLBACK_POT)
+      expect(extractTenantSlug('www.mupot.mumega.com.', DEFAULT_ROOT_DOMAIN)).toBe(DEFAULT_FALLBACK_POT)
+      // and a real tenant subdomain still resolves to itself, not to a mangled slug
+      expect(extractTenantSlug('gaf.mupot.mumega.com.', DEFAULT_ROOT_DOMAIN)).toBe('gaf')
+      // the specific string that reached DISPATCHER.get() on prod must be unreachable
+      expect(extractTenantSlug('mupot.mumega.com.', DEFAULT_ROOT_DOMAIN)).not.toBe('mupot-mumega-com-')
+    })
+
+    // mupot#1301 review, F7. The subdomain branch used to return its label RAW while the
+    // custom-domain branch sanitized, and that value is interpolated into HTML by
+    // renderUnprovisionedPotHtml. The only thing preventing reflected XSS was WHATWG
+    // `new URL()` rejecting forbidden host code points before `url.hostname` exists — an
+    // implicit dependency, never stated, on a surface that runs before all auth.
+    it('sanitizes the subdomain label on the same terms as a custom domain', () => {
+      expect(extractTenantSlug('a_b.mupot.mumega.com', DEFAULT_ROOT_DOMAIN)).toBe('a-b')
+      expect(extractTenantSlug('a b.mupot.mumega.com', DEFAULT_ROOT_DOMAIN)).toBe('a-b')
+    })
+
     it('sanitizes custom CNAME domains', () => {
       expect(extractTenantSlug('ai.gafmaterials.com')).toBe('ai-gafmaterials-com')
+    })
+  })
+
+  // mupot#1301 review, F7 — the render half. Sanitization and escaping are two guards;
+  // testing only the slug leaves the interpolation unproven.
+  describe('unprovisioned-pot page', () => {
+    it('escapes the tenant it echoes back', async () => {
+      const mockGet = vi.fn().mockImplementation(() => {
+        throw new Error('No user worker found for tenant')
+      })
+      const res = await dispatcher.fetch(
+        new Request('https://x.mupot.mumega.com/', { headers: { Accept: 'text/html' } }),
+        { DISPATCHER: { get: mockGet } },
+      )
+      const html = await res.text()
+      expect(res.status).toBe(404)
+      // Whatever the slug is, it must never arrive as live markup.
+      expect(html).not.toMatch(/<script\b/i)
+      expect(html).toContain('<span class="code">')
     })
   })
 

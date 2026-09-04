@@ -347,7 +347,6 @@ export default {
         const dispatcher = (await import('./dispatcher')).default
         return dispatcher.fetch(req, {
           DISPATCHER: env.DISPATCHER,
-          FALLBACK_POT: env.TENANT_SLUG,
           ROOT_DOMAIN: rootHost,
         })
       }
