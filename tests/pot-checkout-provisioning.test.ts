@@ -38,6 +38,68 @@ describe('Public Pricing & Self-Serve Sovereign Pot Provisioning Portal (Flight 
     expect(resInvalid.available).toBe(false)
   })
 
+  // mupot#1303. The old implementation swallowed a failed lookup and returned
+  // `available: true`, with a comment calling that "fail-safe". These tests pin the
+  // opposite, and every one of them PASSES under the old code except by design:
+  // the seeded-pot and throwing-DB cases are the two that could not have passed.
+  describe('availability fails closed (#1303)', () => {
+    it('reports a slug with a live pot as TAKEN', async () => {
+      // The row is seeded HERE, not by the migration. Migration 0145 creates the table
+      // only: tests/helpers/migrations.ts caches the finished chain as DDL, which is sound
+      // only while no migration seeds data, and its guard goes red if one ever does. `gaf`
+      // is the real content of the mupot-pots dispatch namespace read from the Cloudflare
+      // API on 2026-09-04; on production before this fix it reported available while
+      // serving traffic.
+      harness.sqlite.exec(`
+        INSERT INTO pots (id, slug, worker_script, status, source)
+        VALUES ('pot-gaf', 'gaf', 'gaf', 'active', 'namespace-audit');
+      `)
+      const env = { DB: harness.db } as unknown as Env
+      const res = await checkSlugAvailability(env, 'gaf')
+      expect(res.available).toBe(false)
+      expect(res.reason).toContain('already taken')
+    })
+
+    it('reports a slug taken by a PROJECT worker as taken — same dispatch namespace', async () => {
+      harness.sqlite.exec(`
+        INSERT INTO departments (id, slug, name) VALUES ('d1', 'd1', 'D1');
+        INSERT INTO squads (id, department_id, slug, name) VALUES ('s1', 'd1', 's1', 'S1');
+        INSERT INTO projects (id, slug, name, description, goal, status, assigned_squad_id, worker_name)
+        VALUES ('p1', 'someproject', 'P', '', '', 'active', 's1', 'claimed-worker');
+      `)
+      const env = { DB: harness.db } as unknown as Env
+      expect((await checkSlugAvailability(env, 'claimed-worker')).available).toBe(false)
+      expect((await checkSlugAvailability(env, 'someproject')).available).toBe(false)
+    })
+
+    it('an unanswerable check is NOT available', async () => {
+      // The exact shape of the original defect: the lookup throws. Old code returned
+      // available:true. "I could not determine whether this is taken" must never be
+      // answered as "this is not taken".
+      const env = {
+        DB: {
+          prepare: () => ({
+            bind: () => ({
+              first: async () => { throw new Error('D1_ERROR: no such table: pots') },
+            }),
+          }),
+        },
+      } as unknown as Env
+      const res = await checkSlugAvailability(env, 'anything-at-all')
+      expect(res.available).toBe(false)
+      expect(res.reason).toContain('could not be verified')
+    })
+
+    it('still accepts a genuinely free slug — the check is not simply refusing everything', async () => {
+      // Paired positive control. Without it, `return { available: false }` unconditionally
+      // would satisfy every assertion above.
+      const env = { DB: harness.db } as unknown as Env
+      const res = await checkSlugAvailability(env, 'genuinely-unused-slug')
+      expect(res.available).toBe(true)
+      expect(res.reason).toBeUndefined()
+    })
+  })
+
   it('creates Stripe checkout session with embedded pot metadata', async () => {
     const mockFetch = vi.fn().mockResolvedValue({
       ok: true,

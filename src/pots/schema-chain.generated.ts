@@ -2713,9 +2713,21 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_web_sessions_login_identity" },
     ],
   },
+  {
+    file: "0145_pots_registry.sql",
+    sha256: "8f83cc9c189f1f31e43432e3e88e9cfa1fce4acd3c161d900bdb84313ee8ec3c",
+    statements: [
+      "-- 0145_pots_registry.sql — the `pots` table, which src/pots/checkout.ts has been\n-- querying since it was written and which has never existed (mupot#1303).\n--\n-- checkSlugAvailability runs:\n--     SELECT id FROM pots WHERE slug = ?1 LIMIT 1\n-- wrapped in `try { ... } catch { /* proceed fail-safe */ }`. With no such table the\n-- query throws on EVERY call, the catch swallows it, and the function returns\n-- `available: true` for every well-formed non-reserved slug. The \"already taken\" branch\n-- has never executed in production. Measured 2026-09-04:\n--\n--     GET /api/pots/slug-available?slug=gaf -> {\"available\":true}\n--\n-- while `gaf` is a live Worker serving traffic in the mupot-pots dispatch namespace.\n--\n-- NO SEED HERE, DELIBERATELY. The first version of this migration inserted the one live\n-- pot. tests/helpers-migrations.test.ts went red and named it:\n--\n--     migrations now seed rows: [{\"table\":\"pots\",\"count\":1}]\n--\n-- tests/helpers/migrations.ts caches the finished chain as DDL captured from sqlite_master,\n-- which is only sound because no migration seeds data — a property that file documents and\n-- guards rather than assumes. A seeding migration would hand every cached test a\n-- schema-only database while the first (cache-cold) caller saw the row, so the same code\n-- would pass or fail depending on test ordering. The guard caught exactly that.\n--\n-- The live namespace content is therefore applied as a DATA operation against production\n-- D1 at deploy time, not baked into the chain. Read from the Cloudflare API 2026-09-04,\n-- the mupot-pots namespace contained exactly one script: gaf, created 2026-08-26T18:40:18Z.\n-- Tests seed their own rows.\n--\n-- This table is also the first brick of the hostname->tenant LOOKUP proposed in mupot#1302.\n-- Routing today DERIVES a slug from the hostname by string transform and validates it\n-- against nothing; the intended end state is that a request resolves through a record like\n-- this one, so an unknown host fails closed instead of being transformed into a guess.\nCREATE TABLE IF NOT EXISTS pots (\n  id            TEXT PRIMARY KEY,\n  slug          TEXT NOT NULL UNIQUE,\n  worker_script TEXT NOT NULL,\n  status        TEXT NOT NULL DEFAULT 'active',\n  -- Provenance of the row, so a future reader can tell a seeded observation from a row\n  -- written by provisioning. 'namespace-audit' = read from the live dispatch namespace.\n  source        TEXT NOT NULL DEFAULT 'provision',\n  created_at    TEXT NOT NULL DEFAULT (datetime('now'))\n);",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_pots_slug ON pots(slug);",
+    ],
+    objects: [
+      { type: "table", name: "pots" },
+      { type: "index", name: "idx_pots_slug" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "68381f2aedc200d9af0e33de9cd494491d6b39eca4f404dacf0bc0619b5e88d9"
+export const SCHEMA_CHAIN_DIGEST: string = "30da0847e8d1567d961c3d689cc40c4ee516adbe5b383c6006c2dae67ef580e7"
