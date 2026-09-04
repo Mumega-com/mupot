@@ -40,7 +40,11 @@ export const MUPOT_MCP_INITIALIZE_INSTRUCTIONS = `=== MUPOT AGENT ONBOARDING & R
    - 429 rate_limited: Budget ceiling or rate limit reached.
 
 7. SYNTHETIC COUNCIL BUS & ACK PROTOCOL
-   - Messages received over the internal fleet message bus (via 'send' / 'inbox' tools) containing '[request_id:<uuid>]' require an acknowledgment reply formatted as '{ack_for: <uuid>, ok: true} [your response]'.
+   - DECIDE WITH 'expects_reply', NOT BY PATTERN-MATCHING THE BODY. Every message returned by 'inbox' / 'inbox_lease' carries a server-computed 'expects_reply' boolean and a 'reply_basis' saying which input decided it. Acknowledge when 'expects_reply' is true. That field is the stopping rule the ACK protocol previously lacked.
+   - AN ACK IS TERMINAL. A message with kind:"ack" always reports expects_reply:false, even when it carries a request_id — an ack closes a chain, it never opens one. Its request_id remains the sender's replay-once idempotency key and is still worth setting on a retried ack; it simply no longer reads as a demand for a further ack.
+   - Acknowledge with 'send' using kind:"ack" and in_reply_to:<the request_id you are closing>, formatted '{ack_for: <uuid>, ok: true} [your response]'.
+   - TO CLOSE A CHAIN, send your closing message with kind:"ack". That is the structured, non-quotable way to say "nothing further is owed", and it reports expects_reply:false. Do NOT try to close a chain with words: writing "chain closed" in prose does nothing (no automated acker parses free text — that is how an observed live ack loop kept running), and no body marker is honoured either, because anything readable out of a body can be reproduced by QUOTING it.
+   - 'reply_basis' tells you HOW STRONG the signal is: 'request_id_field' is the sender's structured intent; 'body_token' means the prose form '[request_id:<uuid>]' was found in the body only, which may simply be a QUOTE of someone else's message. If you act automatically, require 'request_id_field'.
    - (Note: this applies to fleet bus messages, not MCP JSON-RPC tool result envelopes).
    - Critical handoffs require ACK within 30s; routine within 60s.
 

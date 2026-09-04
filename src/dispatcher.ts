@@ -19,29 +19,65 @@ export interface DispatcherEnv {
     }
   }
   ROOT_DOMAIN?: string // default 'mupot.mumega.com'
-  FALLBACK_POT?: string // default 'mumega'
   DEFAULT_CPU_MS?: number // default 50ms
   DEFAULT_SUBREQUESTS?: number // default 50
 }
 
 export const DEFAULT_ROOT_DOMAIN = 'mupot.mumega.com'
+// The apex's own pot. NOTE (mupot#1301 review): this constant is the ONLY thing that
+// resolves the apex, and src/index.ts separately hardcodes `tenantSlug !== 'mumega'` in
+// its dispatch guard — two copies of one predicate, in a repo documented as designed to
+// be forked. A colony deployed with TENANT_SLUG !== 'mumega' is protected from
+// dispatching its own apex into the namespace only by that duplicated literal. The dead
+// `FALLBACK_POT` env field that used to imply this was configurable has been removed
+// rather than left to read as a knob that does nothing; making it genuinely configurable
+// is tracked separately.
 export const DEFAULT_FALLBACK_POT = 'mumega'
 export const DEFAULT_DISPATCH_LIMITS = {
   cpuMs: 50,
   subRequests: 50,
 } as const
 
+// TENANT SELECTION IS A FUNCTION OF THE HOSTNAME ALONE (mupot#1299).
+//
+// This used to accept a third `headerSlug` argument, read from a client-supplied
+// `x-mupot-tenant-slug` / `x-pot-tenant` request header, and it took PRIORITY over the
+// hostname. That made "which tenant Worker serves this request" an unauthenticated
+// choice made by the caller: measured live on prod at 8ff9b8e2, an anonymous
+// `GET https://mupot.mumega.com/health` carrying that header was answered by the named
+// tenant's Worker instead of the colony's.
+//
+// The parameter is GONE rather than gated, because a gated version has to be correct at
+// every call site forever, and there were already two independent readers of the header
+// (this file and src/index.ts) that had to agree. A signature that cannot express the
+// unsafe call cannot be called unsafely.
+//
+// The credential half of the hazard closes with it: hostname routing means a browser only
+// ever sends cookies the browser itself scoped to that hostname. mupot's session cookie is
+// set with no `Domain=` attribute (src/auth/index.ts setSessionCookie), so it is host-only
+// and never reaches a tenant subdomain. Forwarding headers to the User Worker is therefore
+// correct here — stripping Cookie/Authorization would break a tenant's own logged-in users.
+// That reasoning depends on the cookie staying host-only, so it is pinned by an assertion
+// in tests/auth-dev-login.test.ts (next to setSessionCookie, the code that would break it).
+// NOTE: only the SESSION cookie is pinned. The OAuth CSRF and consent cookies in
+// src/mcp/oauth-authorize.ts also omit Domain= today, but nothing asserts that.
 export function extractTenantSlug(
   hostname: string,
   rootDomain: string = DEFAULT_ROOT_DOMAIN,
-  headerSlug?: string | null,
 ): string {
-  if (headerSlug && /^[a-z0-9-_]+$/i.test(headerSlug.trim())) {
-    return headerSlug.trim().toLowerCase()
-  }
-
-  const cleanHost = hostname.toLowerCase().split(':')[0]
-  const cleanRoot = rootDomain.toLowerCase().split(':')[0]
+  // A TRAILING DOT IS A LEGAL, FULLY-QUALIFIED HOSTNAME, and it reached production.
+  // `Host: mupot.mumega.com.` survives the Cloudflare edge (Host and SNI still match) and
+  // is preserved in req.url, so before this normalization the apex failed BOTH the
+  // `=== cleanRoot` and the `.endsWith('.' + cleanRoot)` tests, fell through to the
+  // custom-domain branch, and produced the slug `mupot-mumega-com-` — which was then
+  // handed verbatim to DISPATCHER.get() as a script name, unauthenticated, ahead of all
+  // auth. It failed closed only because no Worker happens to carry that name. Measured
+  // live on 2026-09-04 (mupot#1301 review):
+  //   curl --resolve 'mupot.mumega.com.:443:<ip>' https://mupot.mumega.com./health
+  //   -> {"error":"pot_not_found","tenant":"mupot-mumega-com-"}
+  // It also knocked the colony off its own app for any request that appended a dot.
+  const cleanHost = hostname.toLowerCase().split(':')[0].replace(/\.+$/, '')
+  const cleanRoot = rootDomain.toLowerCase().split(':')[0].replace(/\.+$/, '')
 
   if (cleanHost === cleanRoot || cleanHost === `www.${cleanRoot}`) {
     return DEFAULT_FALLBACK_POT
@@ -50,14 +86,40 @@ export function extractTenantSlug(
   if (cleanHost.endsWith(`.${cleanRoot}`)) {
     const sub = cleanHost.slice(0, -(cleanRoot.length + 1))
     const parts = sub.split('.')
-    return parts[parts.length - 1] || DEFAULT_FALLBACK_POT
+    // Sanitized on the SAME terms as the custom-domain branch below. This label used to be
+    // returned raw (lowercased only) and is interpolated into HTML by
+    // renderUnprovisionedPotHtml; the only thing standing between that and reflected XSS
+    // was WHATWG `new URL()` rejecting forbidden host code points before `url.hostname`
+    // exists — an implicit dependency, on a surface that runs before all auth. Both
+    // branches now emit the same shape, so the render has one contract instead of two.
+    return sanitizeSlug(parts[parts.length - 1]) || DEFAULT_FALLBACK_POT
   }
 
   // Custom domains (Cloudflare for SaaS CNAMEs) default to sanitized host slug
-  return cleanHost.replace(/[^a-z0-9-]/g, '-')
+  return sanitizeSlug(cleanHost)
 }
 
-function renderUnprovisionedPotHtml(tenantSlug: string): string {
+/** The one normalization both hostname branches emit. Substitutes, never shortens. */
+function sanitizeSlug(label: string): string {
+  return label.replace(/[^a-z0-9-]/g, '-')
+}
+
+/** Escapes text interpolated into the unprovisioned-pot page. */
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
+// Exported for test. It must be safe for ANY input, not merely for what sanitizeSlug
+// happens to emit today — otherwise the render's safety is a property of its caller, and
+// a future change to the sanitizer silently un-fixes it. Verified by mutation: with the
+// escaping removed, a test that only routes hostile input THROUGH the sanitizer stays
+// green, because sanitization strips `<` first. The two guards must be proven separately.
+export function renderUnprovisionedPotHtml(tenantSlug: string): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -79,7 +141,7 @@ function renderUnprovisionedPotHtml(tenantSlug: string): string {
   <div class="card">
     <div class="badge">Sovereign Cloudflare Isolation</div>
     <h1>Pot Not Provisioned</h1>
-    <p>No active sovereign mupot instance found for <span class="code">${tenantSlug}</span>. Each organization runs in an isolated V8 container with dedicated D1 storage.</p>
+    <p>No active sovereign mupot instance found for <span class="code">${escapeHtml(tenantSlug)}</span>. Each organization runs in an isolated V8 container with dedicated D1 storage.</p>
     <a href="https://mupot.mumega.com/signup" class="btn">Provision Sovereign Pot</a>
   </div>
 </body>
@@ -90,8 +152,8 @@ export default {
   async fetch(request: Request, env: DispatcherEnv): Promise<Response> {
     const url = new URL(request.url)
     const rootDomain = env.ROOT_DOMAIN || DEFAULT_ROOT_DOMAIN
-    const headerSlug = request.headers.get('x-mupot-tenant-slug') || request.headers.get('x-pot-tenant')
-    const tenantSlug = extractTenantSlug(url.hostname, rootDomain, headerSlug)
+    // No header is consulted: see extractTenantSlug (mupot#1299).
+    const tenantSlug = extractTenantSlug(url.hostname, rootDomain)
 
     const limits = {
       cpuMs: env.DEFAULT_CPU_MS ?? DEFAULT_DISPATCH_LIMITS.cpuMs,

@@ -177,7 +177,10 @@ export type VerifiedSignedInboxRead =
       ok: true
       agent_id: string
       messages: InboxMessage[]
+      /** Unread rows NOT in `messages` — same contract as InboxResult.remaining. */
       remaining: number
+      /** TRUE when `messages` is everything there was. See InboxResult.complete. */
+      complete: boolean
       consumed: boolean
     }
   | SignedInboxErr
@@ -204,6 +207,7 @@ export async function verifyAndReadSignedInbox(
     agent_id: verified.agent_id,
     messages: inbox.messages,
     remaining: inbox.remaining,
+    complete: inbox.complete,
     consumed: !verified.peek,
   }
 }

@@ -16,8 +16,21 @@ const CONTRACT = join(process.cwd(), CONTRACT_RELATIVE)
 
 describe('v0.30.0 repository release contract', () => {
   const contract = JSON.parse(readFileSync(CONTRACT, 'utf8')) as {
-    receipts: Array<{ file: string; receipt_type: string }>
+    receipts: Array<{ file: string; receipt_type: string; release_sha_path?: string }>
   }
+
+  it.each([
+    ['fresh-install-check.json', 'target.release_sha'],
+    ['host-go/manifest.json', 'inputs.release_sha'],
+    ['work-lifecycle-check.json', 'target.release_sha'],
+    ['external-pr-cycle-check.json', 'target.release_sha'],
+    ['staging-recovery-check.json', 'target.git_sha'],
+  ])('declares the exact release SHA binding for %s', (file, releaseShaPath) => {
+    expect(contract.receipts).toContainEqual(expect.objectContaining({
+      file,
+      release_sha_path: releaseShaPath,
+    }))
+  })
 
   it('requires the neutral Host-Go cutover receipt', () => {
     expect(contract.receipts).toContainEqual(expect.objectContaining({

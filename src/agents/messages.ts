@@ -19,6 +19,8 @@ import { createBus } from '../bus'
 import { resolveAgentRef } from '../org/resolve'
 import { canOnSquad } from '../auth/capability'
 import { sha256Hex } from '../lib/canonical-json'
+import { TOKEN_LIVE_PREDICATE } from '../auth/token-lifecycle'
+import { evaluateReplyExpectation, type ReplyBasis } from './reply-expectation'
 
 // ── tunables ────────────────────────────────────────────────────────────────────────────
 const MAX_BODY_CHARS = 8000
@@ -69,9 +71,15 @@ export interface InboxMessage {
   body_length: number | null
   checksum_sha256: string | null
   is_intact: boolean | null
+  /** Does this message ask its recipient for a reply? Server-computed, never client-supplied.
+   *  See ./reply-expectation — one predicate over kind, request_id and the body prose token. */
+  expects_reply?: boolean
+  /** Which input decided expects_reply. 'body_token' is the weak, quotable one — a consumer
+   *  that acts only on structured intent should require 'request_id_field'. */
+  reply_basis?: ReplyBasis
 }
 
-async function annotateMessageIntegrity(messages: InboxMessage[]): Promise<void> {
+async function annotateMessages(messages: InboxMessage[]): Promise<void> {
   for (const message of messages) {
     const storedLength = typeof message.body_length === 'number'
       && Number.isInteger(message.body_length)
@@ -89,13 +97,58 @@ async function annotateMessageIntegrity(messages: InboxMessage[]): Promise<void>
       ? null
       : message.body.length === storedLength
         && await sha256Hex(message.body) === storedChecksum
+
+    // Reply expectation rides in the SAME pass as integrity, deliberately. Both are read-time
+    // annotations that every inbox surface needs, and three call sites already exist (read,
+    // lease, dead-letters). A second, separate pass would be three more places to forget one.
+    const expectation = evaluateReplyExpectation({
+      kind: message.kind,
+      requestId: message.request_id,
+      body: message.body,
+    })
+    message.expects_reply = expectation.expected
+    message.reply_basis = expectation.basis
   }
 }
 
 export interface InboxResult {
   ok: true
   messages: InboxMessage[]
+  /**
+   * Unread rows NOT in `messages`.
+   *
+   * WAS POLYSEMOUS AND IS NOT ANY MORE. This field used to be counted after the
+   * consuming path had already marked the returned rows read (see the UPDATEs
+   * above the count), so on `peek` it INCLUDED the returned rows and on a
+   * consume it EXCLUDED them — one field, two meanings, selected by a different
+   * argument. A caller that learned the rule on one path and applied it on the
+   * other was silently wrong, and nothing in the response said which reading
+   * applied.
+   *
+   * It now means the same thing on both paths: what is left over, never
+   * including what you were just handed. Prefer `complete` over doing arithmetic
+   * on this.
+   */
   remaining: number
+  /**
+   * TRUE when `messages` is everything there was. FALSE when the read was capped
+   * and more exists.
+   *
+   * This exists because deriving truncation from a length and a count is the
+   * single most reliable way to manufacture a false measurement in this system.
+   * On 2026-09-03 that same mistake was made FOUR times in one night by three
+   * different agents across two substrates — the seatlink bridge dropped
+   * genuinely-unread mail; a gate consumed rows it never read, unrecoverably; an
+   * agent-profile page rendered a capped count as a total in the very commit
+   * arguing that an unknown must never be presented as a measurement; and a CI
+   * watcher read a half-populated result as settled. Every one was committed by
+   * someone actively hunting the same bug elsewhere.
+   *
+   * That is not a diligence problem. A capped response is successful,
+   * well-formed, and indistinguishable from a complete one at the call site, so
+   * the correct behaviour has to be the one that requires no work.
+   */
+  complete: boolean
 }
 
 export type SendFailure = {
@@ -236,10 +289,50 @@ export async function sendAgentMessage(
     if (access !== null) return { ok: false, reason: access }
   }
 
-  if (input.targetSeat !== undefined && !isRef(input.targetSeat))
-    return { ok: false, reason: 'invalid_body', detail: 'target_seat must be a valid reference string' }
-
   const now = opts.now ?? (() => new Date().toISOString())
+
+  // mupot#1272 adversarial-gate P1 (kasra-code, flight-20260902-seat-bind, round 2): the
+  // seat-bind fix earlier in this PR made `inbox`/`inbox_lease` read-side STRICT — a caller can
+  // only ever read the ONE seat its own live token is labelled with (resolveBoundSeat,
+  // src/mcp/index.ts). Left alone, `send`'s write side only checked isRef(targetSeat) — any
+  // syntactically valid string, typo or case-mismatch included. A `target_seat` that matches no
+  // LIVE token label for the recipient creates an ORPHAN row: no `inbox`/`inbox_lease` caller can
+  // ever be bound to that seat (there is no such token), `inbox_ack` needs an id nobody can
+  // obtain, and `inbox_dead_letters` needs `dead_lettered_at`, which only the LEASE path sets —
+  // and lease can never see the row either, so `delivery_attempts` stays 0 forever. Worse,
+  // MAX_UNREAD_PER_RECIPIENT is per `to_agent` and seat-BLIND: enough orphans pin the whole
+  // agent's inbox at `inbox_full`, for every seat, with no drain path — a permanent DoS any
+  // peer with send rights could trigger with nothing more than a typo. Proven A/B against base
+  // by kasra-review on this same PR. Validating at the WRITE side, once, here — rather than in
+  // the MCP `send` tool handler — is deliberate: this primitive is also the REST send path
+  // (`POST /api/inbox/send`, src/agents/inbox-routes.ts), and both must refuse the same orphan
+  // shape, not just the MCP one.
+  //
+  // mupot#1272 adversarial-gate round 3 (kasra-review): the FIRST version of this guard refused
+  // with a distinct `seat_unknown` reason + a confirming detail string — which is itself a new
+  // enumeration oracle. Proven live: any caller who can send to agent X can distinguish
+  // "seat exists but is not X's live label" from "no such seat at all" by the refusal alone,
+  // side-effect-free, and seat labels are NOT opaque (`oauth:<email-localpart>`,
+  // `[preset:<id>:<scope>]`, machine names — see the label-corpus finding on this PR's earlier
+  // review round). Collapsed onto the SAME `send_target_not_visible` string this function
+  // already uses for its OTHER internal existence/visibility refusals a few lines below (and
+  // that `sendToRef` collapses non-admin/invisible-target failures onto, #401) — no detail, no
+  // distinguishing shape. A sender cannot tell "bad seat" from "bad recipient" from any other
+  // reason this string already covers.
+  if (input.targetSeat !== undefined) {
+    if (!isRef(input.targetSeat))
+      return { ok: false, reason: 'invalid_body', detail: 'target_seat must be a valid reference string' }
+    const liveSeatToken = await env.DB.prepare(
+      `SELECT 1 FROM member_tokens t
+        WHERE t.tenant = ?1 AND t.agent_id = ?2 AND t.label = ?3
+          AND ${TOKEN_LIVE_PREDICATE('?4')}
+        LIMIT 1`,
+    ).bind(tenant, input.toAgent, input.targetSeat, now()).first()
+    if (!liveSeatToken) {
+      return { ok: false, reason: 'send_target_not_visible' }
+    }
+  }
+
   const idGen = opts.idGen ?? (() => crypto.randomUUID())
   const routineFence = opts.routineRunFence
   if (routineFence && input.projectId !== routineFence.projectId) {
@@ -605,13 +698,30 @@ async function readAgentInboxForReader(
     let remaining = 0
     if (reader === 'signed') {
       const seatSql = targetSeat ? 'AND (target_seat = ?4 OR target_seat IS NULL)' : 'AND target_seat IS NULL'
-      const binds = targetSeat
+      const binds: (string | number | null | undefined)[] = targetSeat
         ? [tenant, input.agent, signedKeyFingerprint, targetSeat]
         : [tenant, input.agent, signedKeyFingerprint]
+      // The cursor MUST be in the COUNT, not only in the page. Without it a
+      // paginating caller is told rows exist below a cursor it has already
+      // passed, so page two of two reports a phantom remainder and the loop
+      // never terminates. Found by test, not by reading.
+      // NOTE: unreachable today and deliberately kept. readVerifiedSignedAgentInbox's
+      // input type has no sinceSeq, so no caller can reach the signed path with a
+      // cursor — a mutation removing this survives, and that is expected rather than
+      // an untested branch. It stays so that adding sinceSeq to the signed reader
+      // later cannot silently reintroduce the phantom-remainder bug the bearer path
+      // had. Reported as a surviving mutation rather than buried.
+      const sinceSql = sinceSeq > 0 ? `AND seq > ?${binds.length + 1}` : ''
+      if (sinceSeq > 0) binds.push(sinceSeq)
+      // The cursor MUST be in the count, not only in the page. Without it a
+      // paginating caller is told rows exist below its cursor that it has
+      // already passed, so page two of two reports a phantom remainder and the
+      // loop never terminates. Caught by test, not by reading.
       const remainingRow = await env.DB.prepare(
         `SELECT COUNT(*) AS n FROM agent_messages
           WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL
             ${seatSql}
+            ${sinceSql}
             AND EXISTS (SELECT 1 FROM agent_inbox_fences
                          WHERE tenant = ?1 AND agent_id = ?2
                            AND mode = 'signed_only' AND key_fingerprint = ?3)`,
@@ -619,13 +729,16 @@ async function readAgentInboxForReader(
       remaining = Number(remainingRow?.n ?? 0)
     } else {
       const seatSql = targetSeat ? 'AND (target_seat = ?3 OR target_seat IS NULL)' : 'AND target_seat IS NULL'
-      const binds = targetSeat
+      const binds: (string | number | null)[] = targetSeat
         ? [tenant, input.agent, targetSeat]
         : [tenant, input.agent]
+      const sinceSql = sinceSeq > 0 ? `AND seq > ?${binds.length + 1}` : ''
+      if (sinceSeq > 0) binds.push(sinceSeq)
       const remainingRow = await env.DB.prepare(
         `SELECT COUNT(*) AS n FROM agent_messages
           WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL
             ${seatSql}
+            ${sinceSql}
             AND COALESCE((SELECT mode FROM agent_inbox_fences
                            WHERE tenant = ?1 AND agent_id = ?2), 'bearer_only') = 'bearer_only'`,
       ).bind(...binds).first<{ n: number }>()
@@ -636,8 +749,13 @@ async function readAgentInboxForReader(
     for (const m of messages) m.seq = Number(m.seq)
     for (const m of messages) m.project_id = m.project_id ?? null
     for (const m of messages) m.target_seat = m.target_seat ?? null
-    await annotateMessageIntegrity(messages)
-    return { ok: true, messages, remaining }
+    await annotateMessages(messages)
+    // On the CONSUMING path the returned rows were already marked read above, so
+    // this count already excludes them. On the PEEK path nothing was marked, so
+    // the count still includes them and has to be reduced by what we are handing
+    // back. Same meaning either way afterwards: what is LEFT OVER.
+    const leftOver = peek ? Math.max(0, remaining - messages.length) : remaining
+    return { ok: true, messages, remaining: leftOver, complete: leftOver === 0 }
   } catch (err) {
     return { ok: false, reason: 'db_error', detail: err instanceof Error ? err.message : String(err) }
   }
@@ -709,6 +827,15 @@ export interface LeaseResult {
   messages: LeasedMessage[]
   /** Unread, not dead-lettered, not currently leased — i.e. how many MORE could be leased now. */
   remaining: number
+  /**
+   * TRUE when this lease took everything currently leasable. Same contract as
+   * InboxResult.complete, and present for the same reason: every read surface
+   * should answer "did I get it all?" without the caller doing arithmetic.
+   * Dead-lettered rows are NOT leasable, so they do not make a lease incomplete —
+   * `dead_lettered` reports those separately and a non-zero value means a seat is
+   * stuck, which is a different problem from a capped read.
+   */
+  complete: boolean
   /** Unread rows parked by the dead-letter rule. Non-zero means a seat is stuck. */
   dead_lettered: number
   lease_seconds: number
@@ -849,7 +976,7 @@ export async function leaseAgentInbox(
       m.project_id = m.project_id ?? null
       m.target_seat = m.target_seat ?? null
     }
-    await annotateMessageIntegrity(messages)
+    await annotateMessages(messages)
 
     // Post-check, mirroring readAgentInboxForReader. The pre-check above is NOT the fence —
     // it cannot be, because a fence flip between it and the UPDATE would slip through. The
@@ -872,10 +999,12 @@ export async function leaseAgentInbox(
          AND (CASE WHEN ?4 IS NULL THEN target_seat IS NULL ELSE (target_seat = ?4 OR target_seat IS NULL) END)`,
     ).bind(tenant, input.agent, nowIso, targetSeat).first<{ leasable: number | null; dead: number | null }>()
 
+    const leasableLeft = Number(counts?.leasable ?? 0)
     return {
       ok: true,
       messages,
-      remaining: Number(counts?.leasable ?? 0),
+      remaining: leasableLeft,
+      complete: leasableLeft === 0,
       dead_lettered: Number(counts?.dead ?? 0),
       lease_seconds: leaseSeconds,
     }
@@ -1005,7 +1134,7 @@ export async function listDeadLetteredMessages(
       m.project_id = m.project_id ?? null
       m.target_seat = m.target_seat ?? null
     }
-    await annotateMessageIntegrity(messages)
+    await annotateMessages(messages)
 
     if (messages.length === 0 && await bearerFenceBlocks(env, tenant, input.agent)) {
       return { ok: false, reason: 'consumer_fenced' }

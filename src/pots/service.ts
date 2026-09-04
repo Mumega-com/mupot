@@ -1,7 +1,9 @@
 // src/pots/service.ts — Cloudflare Workers for Platforms (WFP) Sovereign Pot Provisioner.
 
 import type { Env } from '../types'
-import type { SovereignPotProvisionInput, SovereignPotProvisionResult, SovereignPotSummary } from './types'
+import type {
+  ProvisionStep,
+  OrphanedResources, SovereignPotProvisionInput, SovereignPotProvisionResult, SovereignPotSummary } from './types'
 
 export const DISPATCH_NAMESPACE = 'mupot-pots'
 export const DEFAULT_ROOT_DOMAIN = 'mupot.mumega.com'
@@ -197,17 +199,50 @@ export async function provisionSovereignPot(
   }
 
   const cf: CloudflareApiConfig = { accountId, apiToken }
+
+  // Steps are RECORDED as they happen, never assumed. The previous version generated a
+  // full result object describing six steps after performing two.
+  const completed: ProvisionStep[] = []
+  const orphans: OrphanedResources = {
+    d1_database_id: null, d1_database_name: null, kv_namespace_id: null, kv_namespace_title: null,
+  }
   const rootDomain = env.PUBLIC_ORIGIN ? new URL(env.PUBLIC_ORIGIN).hostname : DEFAULT_ROOT_DOMAIN
-  const publicOrigin = `https://${slug}.${rootDomain}`
+  // PATH, NOT SUBDOMAIN. This used to be `https://${slug}.${rootDomain}`, i.e.
+  // `<slug>.mupot.mumega.com` — an address that can never serve. Cloudflare Universal SSL
+  // covers `mumega.com` and `*.mumega.com`, but NOT a second-level wildcard like
+  // `*.mupot.mumega.com` without Advanced Certificate Manager. Measured 2026-09-03:
+  // gaf.mupot.mumega.com fails the TLS handshake (alert 552) while mupot.mumega.com
+  // answers 200. Every origin this function has ever returned died before HTTP began,
+  // which is also why nobody noticed the login URL below was useless — you cannot reach
+  // far enough to receive the 404.
+  //
+  // WARNING (mupot#1301 review, 2026-09-04): THIS URL IS NOT SERVED BY ANYTHING TODAY.
+  // The previous version of this comment claimed "the apex path form is served by the
+  // dispatcher (src/dispatcher.ts, mupot#1248)". It is not: there is no `/t/` route
+  // anywhere in src/, and mupot#1248 — which would add it — is open and BLOCKED. Live
+  // check: GET https://mupot.mumega.com/t/gaf/health returns 302 to the dashboard
+  // catch-all, not a dispatch.
+  //
+  // The path form is still the right destination (no DNS record, no ACM, no per-tenant
+  // certificate), which is why the value is left as-is rather than reverted to the
+  // subdomain form that provably cannot serve either. But until #1248 or a replacement
+  // lands, every origin this function returns is unreachable. Tracked in mupot#1306.
+  const publicOrigin = `https://${rootDomain}/t/${slug}`
   const tier = input.plan_tier || 'enterprise'
 
   // 1. Create Isolated D1 Database
   const dbName = `mupot-pot-${slug}`
   const d1 = await createD1Database(cf, dbName)
+  completed.push('create_d1')
+  orphans.d1_database_id = d1.uuid
+  orphans.d1_database_name = d1.name
 
   // 2. Create Isolated KV Namespace
   const kvTitle = `mupot-pot-${slug}-kv`
   const kv = await createKVNamespace(cf, kvTitle)
+  completed.push('create_kv')
+  orphans.kv_namespace_id = kv.id
+  orphans.kv_namespace_title = kv.title
 
   // 3. Generate initial IDs & Tokens
   const adminMemberId = crypto.randomUUID()
@@ -217,6 +252,7 @@ export async function provisionSovereignPot(
 
   // 4. If workerJsCode provided, upload to Dispatch Namespace
   if (workerJsCode) {
+    completed.push('deploy_worker')
     await uploadUserWorkerToDispatch(cf, slug, workerJsCode, {
       d1DatabaseId: d1.uuid,
       kvNamespaceId: kv.id,
@@ -226,8 +262,25 @@ export async function provisionSovereignPot(
     })
   }
 
+  // NOT YET IMPLEMENTED ANYWHERE: schema, seeding, reachability. Until those exist this
+  // function cannot produce a usable pot, and must say so rather than return a result
+  // shaped exactly like success. Empty D1 + empty KV + no worker is not a tenant.
+  const ALL_STEPS: ProvisionStep[] =
+    ['create_d1', 'create_kv', 'apply_schema', 'deploy_worker', 'seed_identities', 'verify_reachable']
+  const notCompleted = ALL_STEPS.filter((step) => !completed.includes(step))
+  const isComplete = notCompleted.length === 0
+
   return {
-    ok: true,
+    ok: isComplete,
+    status: isComplete ? 'provisioned' : 'incomplete',
+    completed,
+    not_completed: notCompleted,
+    orphaned_resources: isComplete ? null : orphans,
+    incomplete_reason: isComplete
+      ? null
+      : `pot is NOT usable: ${notCompleted.join(', ')} did not run. `
+        + `A D1 database and KV namespace were created and are billable — see orphaned_resources. `
+        + `Schema application, identity seeding and reachability verification are not implemented (mupot#1285).`,
     slug,
     brand_name: input.brand_name,
     plan_tier: tier,
@@ -240,11 +293,14 @@ export async function provisionSovereignPot(
     public_origin: publicOrigin,
     admin_email: input.admin_email,
     admin_member_id: adminMemberId,
-    admin_token: adminToken,
-    admin_login_url: `${publicOrigin}/?token=${adminToken}`,
+    // NULL on purpose. These were generated in memory and never written to the pot's
+    // database, so they authenticate nothing. Handing them back as usable credentials is
+    // what turns a provisioning bug into an hour of somebody debugging a login.
+    admin_token: isComplete ? adminToken : null,
+    admin_login_url: isComplete ? `${publicOrigin}/?token=${adminToken}` : null,
     lead_agent_id: leadAgentId,
     lead_agent_name: `${input.brand_name} Lead Agent`,
-    lead_agent_token: leadAgentToken,
+    lead_agent_token: isComplete ? leadAgentToken : null,
     provisioned_at: new Date().toISOString(),
   }
 }

@@ -26,7 +26,18 @@ export const PREPUBLICATION_CHECK_RECEIPT_TYPE = 'mupot-v023-prepublication-read
 const DEFAULT_VERSION = `v${JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version}`
 const DEFAULT_REPO = 'Mumega-com/mupot'
 const LEGACY_VERSION = 'v0.23.0'
+const CANONICAL_V030_VERSION = 'v0.30.0'
+const CANONICAL_V030_CONTRACT_PATH = fileURLToPath(new URL('../docs/releases/v0.30.0-contract.json', import.meta.url))
+const CANONICAL_V030_CONTRACT_RAW = JSON.parse(readFileSync(CANONICAL_V030_CONTRACT_PATH, 'utf8'))
 const RELEASE_PHASES = new Set(['prepublication', 'final'])
+const RELEASE_SHA_PATH_BY_RECEIPT = new Map([
+  ['fresh-install-check.json', 'target.release_sha'],
+  ['host-go/manifest.json', 'inputs.release_sha'],
+  ['work-lifecycle-check.json', 'target.release_sha'],
+  ['external-pr-cycle-check.json', 'target.release_sha'],
+  ['staging-recovery-check.json', 'target.git_sha'],
+])
+const RELEASE_SHA_PATHS = new Set(RELEASE_SHA_PATH_BY_RECEIPT.values())
 
 export const REQUIRED_RECEIPTS = [
   { objective: 1, issue: 282, file: 'fresh-install-check.json', receipt_type: 'mupot-fresh-install/v1' },
@@ -248,7 +259,7 @@ function validateContract(raw, expectedVersion, source = 'inline') {
     }
     rejectUnknownContractFields(
       receipt,
-      new Set(['objective', 'file', 'receipt_type', 'phases', 'issue']),
+      new Set(['objective', 'file', 'receipt_type', 'release_sha_path', 'phases', 'issue']),
       source,
       `receipts[${index}]`,
     )
@@ -258,6 +269,15 @@ function validateContract(raw, expectedVersion, source = 'inline') {
     }
     if (seenFiles.has(file)) throw new Error(`invalid release contract ${source}: duplicate receipt file ${file}`)
     seenFiles.add(file)
+    const releaseShaPathDeclared = Object.hasOwn(receipt, 'release_sha_path')
+    const releaseShaPath = receipt.release_sha_path
+    if (releaseShaPathDeclared
+      && (typeof releaseShaPath !== 'string' || !RELEASE_SHA_PATHS.has(releaseShaPath))) {
+      throw new Error(`invalid release contract ${source}: receipts[${index}].release_sha_path invalid`)
+    }
+    if (releaseShaPathDeclared && RELEASE_SHA_PATH_BY_RECEIPT.get(file) !== releaseShaPath) {
+      throw new Error(`invalid release contract ${source}: receipts[${index}].release_sha_path incompatible with ${file}`)
+    }
     const objective = receipt.objective
     if (!((Number.isInteger(objective) && objective > 0)
       || (typeof objective === 'string' && objective.trim().length > 0))) {
@@ -279,6 +299,7 @@ function validateContract(raw, expectedVersion, source = 'inline') {
       file,
       receipt_type: receiptType,
       phases: [...new Set(receipt.phases)],
+      ...(releaseShaPathDeclared ? { release_sha_path: releaseShaPath } : {}),
       ...(Number.isInteger(receipt.issue) && receipt.issue > 0 ? { issue: receipt.issue } : {}),
     }
   })
@@ -320,8 +341,48 @@ function validateContract(raw, expectedVersion, source = 'inline') {
   }
 }
 
+function deterministicContractContent(contract) {
+  const phases = (values) => [...values].sort((a, b) => a.localeCompare(b))
+  const receipts = contract.receipts.map((receipt) => ({
+    objective: receipt.objective,
+    file: receipt.file,
+    receipt_type: receipt.receipt_type,
+    ...(Object.hasOwn(receipt, 'release_sha_path') ? { release_sha_path: receipt.release_sha_path } : {}),
+    phases: phases(receipt.phases),
+    ...(Object.hasOwn(receipt, 'issue') ? { issue: receipt.issue } : {}),
+  })).sort((a, b) => a.file.localeCompare(b.file))
+  const issues = contract.issues.map((issue) => ({
+    number: issue.number,
+    phases: phases(issue.phases),
+  })).sort((a, b) => a.number - b.number)
+  return JSON.stringify({
+    schema_version: contract.schema_version,
+    version: contract.version,
+    name: contract.name,
+    receipt_types: contract.receipt_types,
+    receipts,
+    issues,
+  })
+}
+
+function requireCanonicalV030Contract(contract, source) {
+  if (contract.version !== CANONICAL_V030_VERSION) return contract
+  const canonical = validateContract(
+    CANONICAL_V030_CONTRACT_RAW,
+    CANONICAL_V030_VERSION,
+    CANONICAL_V030_CONTRACT_PATH,
+  )
+  if (deterministicContractContent(contract) !== deterministicContractContent(canonical)) {
+    throw new Error(`invalid release contract ${source}: does not match canonical v0.30.0 contract`)
+  }
+  return contract
+}
+
 function resolveContract(opts, version) {
-  if (opts.contract !== undefined) return validateContract(opts.contract, version)
+  if (opts.contract !== undefined) {
+    const contract = validateContract(opts.contract, version)
+    return requireCanonicalV030Contract(contract, 'inline')
+  }
   const defaultArg = `docs/releases/${version}-contract.json`
   const defaultPath = resolve(process.cwd(), defaultArg)
   const pathArg = opts.contractPath || (existsSync(defaultPath) ? defaultArg : '')
@@ -335,13 +396,14 @@ function resolveContract(opts, version) {
     } catch (err) {
       throw new Error(`invalid release contract ${path}: ${err instanceof Error ? err.message : String(err)}`)
     }
-    return {
+    const contract = {
       ...validateContract(parsed, version, path),
       source: path,
       source_path: path,
       source_arg: pathArg,
       source_sha256: createHash('sha256').update(text).digest('hex'),
     }
+    return requireCanonicalV030Contract(contract, path)
   }
   if (version === LEGACY_VERSION) return legacyContract(version)
   throw new Error(`release contract required for ${version}; pass --contract docs/releases/${version}-contract.json`)
@@ -601,6 +663,23 @@ function canonicalReleaseSha(value) {
   return typeof value === 'string' && /^[0-9a-f]{40}$/.test(value) ? value : null
 }
 
+function declaredReceiptReleaseSha(receipt, file, releaseShaPath) {
+  switch (`${file}:${releaseShaPath}`) {
+    case 'fresh-install-check.json:target.release_sha':
+      return receipt?.target?.release_sha
+    case 'host-go/manifest.json:inputs.release_sha':
+      return receipt?.inputs?.release_sha
+    case 'work-lifecycle-check.json:target.release_sha':
+      return receipt?.target?.release_sha
+    case 'external-pr-cycle-check.json:target.release_sha':
+      return receipt?.target?.release_sha
+    case 'staging-recovery-check.json:target.git_sha':
+      return receipt?.target?.git_sha
+    default:
+      return undefined
+  }
+}
+
 function checkSucceeded(entry) {
   const conclusion = String(entry?.conclusion ?? '').toUpperCase()
   const state = String(entry?.state ?? entry?.status ?? '').toUpperCase()
@@ -683,6 +762,16 @@ export function checkBundle(opts = {}) {
       objective: required.objective,
       issue: required.issue,
     })
+    if (required.release_sha_path) {
+      const releaseShaValue = declaredReceiptReleaseSha(receipt, required.file, required.release_sha_path)
+      const receiptReleaseSha = canonicalReleaseSha(releaseShaValue)
+      pushCheck(checks, Boolean(releaseSha && receiptReleaseSha === releaseSha), 'receipt_release_sha_matches_release_sha', {
+        file: required.file,
+        release_sha_path: required.release_sha_path,
+        expected: releaseSha,
+        actual: releaseShaValue ?? null,
+      })
+    }
   }
 
   if (requiredReceipts.some((receipt) => receipt.file === 'release-candidate-check.json')) {

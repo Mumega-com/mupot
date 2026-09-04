@@ -8,8 +8,8 @@ numbers.
 
 | State | Version | Meaning |
 |---|---|---|
-| Current source version | `0.30.0` | Present on `main` at `55c1c3ef` as of 2026-09-01; preview until the stabilization gate passes and `v0.30.0` is tagged. |
-| Current production version | `0.30.0` | Deployed at `16390d1e`; behind current `main` and not a stable-release claim. |
+| Current source version | `0.30.0` | Present on `main`; the commit is deliberately not pinned here, because any SHA in a versioned file is false once that file merges — read `git rev-parse origin/main`. Preview until the stabilization gate passes and `v0.30.0` is tagged. |
+| Current production version | `0.30.0` | Last recorded deploy `7d58d36b`, `clean:true`, 2026-09-02 (authoritative: live `/health`). The gap to `main` is not asserted here; compare the two sources. Still not a stable-release claim, which requires a tag. |
 | Last tagged release | `v0.25.0` | Project Routines and Needs You. |
 | Next stable candidate | `v0.30.0` | Stabilization-only: security train, messaging reliability, release proof, and backlog closure. |
 | Future development target | `v0.31.0` | Canonical receiver, Agent Computers, and Recovery; held until `v0.30.0` is stable. |
@@ -63,7 +63,7 @@ Three consequences this document now carries:
 | 4a | PR #1249 — external runtime dispatch receipts | Exact external dispatch, gate, replay, cancellation, and public receipt paths | **LANDED OUTSIDE THE ORDERED TRAIN** as `16390d1e`; present in main as preview | Restack the release head on it, retain exact combined gates, and do not promote new stable claims without a separate scope decision |
 | 5 | PR #1250 — versioned release contract | Version-aware release receipts, exact RC/stable identity, and metadata truth | **LANDED 2026-08-31** as `ccfdb4b3`; CI, CodeQL, independent review, and Athena green | Use its contract and checkers for the frozen release SHA |
 | 6 | PR #1251 — neutral Host-Go evidence | Mupot/Herdr-neutral host cutover receipt with `no_live_sos_wiring` | **LANDED 2026-08-31** as `c6ef9876`; historical receipt parsing preserved | Produce fresh neutral host evidence for the release bundle |
-| 7 | PR #1252 — exact Codex CLI harness | Accept exact `codex-cli` declarations across persistence, parser, schema, and instructions | **LANDED 2026-09-01** as `55c1c3ef`; post-main CI and CodeQL green; not deployed | Keep as preview in v0.30, freeze `main`, and require a fresh seat check-in after any later deployment |
+| 7 | PR #1252 — exact Codex CLI harness | Accept exact `codex-cli` declarations across persistence, parser, schema, and instructions | **LANDED 2026-09-01** as `55c1c3ef`; post-main CI and CodeQL green; deployed since 2026-09-02 as an ancestor of prod `7d58d36b` | Keep as preview in v0.30, freeze `main`, and require a fresh seat check-in after any later deployment |
 | 8 | `v0.30.0` release candidate | One exact main SHA, upgrade/fresh migration proof, browser/runtime/MCP smoke, release receipt | **READY TO FREEZE** — [release contract](docs/releases/v0.30.0.md) and [flight runway](docs/releases/next-flights.md) defined; evidence remains pending | Freeze one SHA, collect contract receipts, then request separate RC publication/deployment approvals |
 
 The ordered release flights and post-stable receiver convergence are maintained in

@@ -39,6 +39,7 @@ import { TOKEN_LIVE_PREDICATE, nowSqlUtc, touchTokenLastUsed } from '../auth/tok
 import { callerHoldsGateCapability, verdictPrincipal } from '../tasks/index'
 import { resolveSoleGateOwnerAgent } from '../gates/grants'
 import { isChannel } from '../members/service'
+import { findExistingBootstrap } from '../members/bootstrap-self'
 import { resolveConsentedAgentCapabilities } from './oauth-authorize'
 import { createBus } from '../bus'
 import { createMemory } from '../memory'
@@ -92,6 +93,7 @@ import {
 import { loadAgentRuntimeStates, type AgentRuntimeState } from '../dashboard/observatory'
 import { buildOrient, renderBrief } from '../orient/service'
 import { mcpEndpoint, canonicalOrigin, requiredCanonicalOrigin } from '../dashboard/connect'
+import { enrollUrl } from '../dashboard/enroll'
 import { classify, humanAge } from '../dashboard/fleet'
 import { resolveAgentRef } from '../org/resolve'
 import {
@@ -169,6 +171,8 @@ import { MUPOT_MCP_INITIALIZE_INSTRUCTIONS } from './instructions'
 // The SAME predicate the meter enforces with. Imported rather than restated —
 // these were two copies and they drifted (#1179 gate R6).
 import { getAuthorizedMeterStatus, isEnforceableCap } from '../agents/meter'
+import { selfReportAtBoot } from '../fleet/boot-self-report'
+import { authLookupOrNull } from '../auth/fail-closed'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
@@ -361,6 +365,14 @@ function bearerToken(header: string | undefined): string | null {
 // a generic message (never distinguish "no token" from "bad token" to a caller —
 // no oracle). The tenant is forced to env.TENANT_SLUG.
 export async function authenticateMember(c: {
+  req: { header: (name: string) => string | undefined }
+  env: Env
+}): Promise<AuthContext | null> {
+  // mupot#1281 — the third independent copy of the unguarded lookup (#41 dedupe debt).
+  return authLookupOrNull('authenticateMember', () => authenticateMemberInner(c))
+}
+
+async function authenticateMemberInner(c: {
   req: { header: (name: string) => string | undefined }
   env: Env
 }): Promise<AuthContext | null> {
@@ -3118,9 +3130,14 @@ const toolSend: ToolSpec = {
     required: ['to', 'body'],
     additionalProperties: false,
   },
-  async run(auth, env, args) {
+  async run(auth, env, args, ctx) {
     const fromAgent = auth.boundAgentId
-    if (!fromAgent) return fail(403, 'not_agent_bound', 'send requires an agent-bound token (member_tokens.agent_id)')
+    if (!fromAgent) {
+      return fail(403, 'not_agent_bound', {
+        detail: 'send requires an agent-bound token (member_tokens.agent_id)',
+        enroll_url: enrollUrl(canonicalOrigin(env, ctx.origin), ctx.seat),
+      })
+    }
     const to = str(args.to)
     const body = str(args.body)
     if (!to) return fail(400, 'invalid_args', 'to required')
@@ -3292,9 +3309,98 @@ const toolBroadcast: ToolSpec = {
   },
 }
 
+// ── seat binding (mupot#1254 C1 — caller-controlled inbox seat partition) ──────
+//
+// origin/main (pre-fix) read the seat partition straight off `args.seat` — a caller bound
+// to ANY of an agent's tokens could pass ANY other seat's label and read/lease its mail.
+// The fix binds the partition to the ONE seat identity a caller cannot forge: the live
+// `member_tokens.label` row for `auth.tokenId` (re-derived server-side from the live
+// tenant/member-scoped token every request — see resolveAuth/authenticateMember above,
+// `AuthContext.tokenId`'s own doc comment: "server-derived only"). That label IS the seat
+// name — migration 0139 spells it out verbatim ("member_tokens.label, i.e. the seat
+// name"), and it is set once at mint time: explicitly by the /enroll form (src/dashboard/
+// enroll.ts, POST /enroll/mint) or mint_agent_token's own `label` arg, or implicitly
+// (mint_agent_token defaults an unlabelled mint to the agent's own slug — src/mcp/
+// provision.ts:563). A token minted before this feature, or never given an explicit seat,
+// simply has label = '' (the column default) or = the agent's slug — either way a single,
+// stable, server-controlled value, never a per-request claim.
+//
+// Two things this is explicitly NOT:
+//   - `ctx.seat` (used a few lines below for enroll_url) is the `x-mupot-seat` REQUEST
+//     HEADER (see handleJsonRpc's ToolCtx construction) — a plain client-supplied value,
+//     exactly as forgeable as args.seat. It is fine as a cosmetic hint for the enrollment
+//     door; it must never be treated as an authenticated seat.
+//   - `runtime_seats` (migrations 0121+, src/flight-spine/seats.ts) is a DIFFERENT "seat"
+//     concept — host/process assignment for the flight-spine scheduler — unrelated to
+//     inbox mailbox partitioning. Do not conflate the two when reading migration history.
+//
+// A null return means "this token has no seat label bound," not "lookup failed open":
+// on a DB error we return null too, which — same as an empty label — refuses any
+// caller-supplied args.seat (seat_not_bound) rather than silently trusting it. The scoping
+// feature fails closed; the unscoped (broadcast-only) read/lease untouched by this fix
+// still works, exactly as it did before.
+async function resolveBoundSeat(env: Env, auth: AuthContext): Promise<string | null> {
+  if (!auth.tokenId || !env.DB) return null
+  try {
+    const row = await env.DB.prepare(
+      `SELECT label FROM member_tokens WHERE id = ?1 AND tenant = ?2`,
+    ).bind(auth.tokenId, env.TENANT_SLUG).first<{ label: string | null }>()
+    const label = row?.label?.trim()
+    return label && label.length > 0 ? label : null
+  } catch {
+    return null
+  }
+}
+
+// A bound token's seat is now authoritative: it applies EVEN WHEN args.seat is omitted
+// (this is what lets a seat-labelled token receive mail addressed to its own seat without
+// every caller having to echo its own identity back at it — the same class of bug #889
+// closed for the "wrong token file" case; here it was "right token, seat mail simply never
+// matched because nothing derived the seat from the token"). An explicit args.seat is
+// accepted ONLY as a same-value compat echo; anything else is refused, never silently
+// downgraded to the token's real seat or to unscoped.
+function resolveInboxSeatArg(
+  requestedSeatRaw: string | undefined,
+  boundSeat: string | null,
+): { ok: true; seat: string | undefined } | { ok: false; outcome: ToolOutcome } {
+  // mupot#1272 adversarial-gate P1, item 3: an empty/whitespace-only `args.seat` ('' or ' ')
+  // is "no seat requested," matching the PRE-FIX normalization that lived in
+  // readAgentInboxForReader/leaseAgentInbox (`input.seat.trim().length > 0 ? ... : null`,
+  // src/agents/messages.ts). Without this, a caller passing `seat: ''` fell into the mismatch
+  // branch below (boundSeat, if any, is never '') and got a spurious seat_mismatch instead of
+  // the unscoped read it got before this PR.
+  const requestedSeat = requestedSeatRaw !== undefined && requestedSeatRaw.trim().length === 0
+    ? undefined
+    : requestedSeatRaw
+  if (requestedSeat !== undefined) {
+    if (boundSeat === null) {
+      return {
+        ok: false,
+        outcome: fail(
+          403,
+          'seat_not_bound',
+          'this token has no seat label bound; args.seat cannot be used until the token is minted with a seat label (see /enroll or mint_agent_token { label })',
+        ),
+      }
+    }
+    if (requestedSeat !== boundSeat) {
+      return {
+        ok: false,
+        outcome: fail(
+          403,
+          'seat_mismatch',
+          `this token is bound to seat "${boundSeat}"; args.seat must match it or be omitted`,
+        ),
+      }
+    }
+  }
+  return { ok: true, seat: boundSeat ?? undefined }
+}
+
 // inbox — read (and by default CONSUME) the CALLER's own inbox. cap: agent-bound member.
 // Self-scoped: an agent only ever reads to_agent = its own welded id; it cannot read another
-// agent's inbox. peek=true reads without consuming.
+// agent's inbox. peek=true reads without consuming. The seat partition within that inbox is
+// bound to the caller's own token (resolveBoundSeat above) — args.seat can only confirm it.
 const toolInbox: ToolSpec = {
   name: 'inbox',
   scope: 'self (the caller agent reads its own inbox)',
@@ -3311,9 +3417,14 @@ const toolInbox: ToolSpec = {
     required: [],
     additionalProperties: false,
   },
-  async run(auth, env, args) {
+  async run(auth, env, args, ctx) {
     const agent = auth.boundAgentId
-    if (!agent) return fail(403, 'not_agent_bound', 'inbox requires an agent-bound token (member_tokens.agent_id)')
+    if (!agent) {
+      return fail(403, 'not_agent_bound', {
+        detail: 'inbox requires an agent-bound token (member_tokens.agent_id)',
+        enroll_url: enrollUrl(canonicalOrigin(env, ctx.origin), ctx.seat),
+      })
+    }
     let limit: number | undefined
     if (args.limit !== undefined) {
       if (typeof args.limit !== 'number' || !Number.isFinite(args.limit))
@@ -3334,19 +3445,33 @@ const toolInbox: ToolSpec = {
       sinceSeq = rawSinceSeq
     }
 
+    const boundSeat = await resolveBoundSeat(env, auth)
+    const seatArg = resolveInboxSeatArg(
+      typeof args.seat === 'string' ? args.seat.trim() : undefined,
+      boundSeat,
+    )
+    if (!seatArg.ok) return seatArg.outcome
+
     const res = await readAgentInbox(env, {
       agent,
       limit,
       peek: args.peek === true,
       sinceSeq,
-      seat: typeof args.seat === 'string' ? args.seat.trim() : undefined,
+      seat: seatArg.seat,
     })
     if (!res.ok) {
       if (res.reason === 'db_error') return fail(500, res.reason) // no raw DB string to caller
       if (res.reason === 'consumer_fenced') return fail(409, res.reason)
       return fail(400, res.reason, res.detail)
     }
-    return done({ messages: res.messages, remaining: res.remaining, consumed: args.peek !== true })
+    // `complete` is surfaced deliberately: a caller must be able to know it was
+    // handed everything WITHOUT comparing a length against a cap it has to know.
+    return done({
+      messages: res.messages,
+      remaining: res.remaining,
+      complete: res.complete,
+      consumed: args.peek !== true,
+    })
   },
 }
 
@@ -3376,9 +3501,14 @@ const toolInboxLease: ToolSpec = {
     required: [],
     additionalProperties: false,
   },
-  async run(auth, env, args) {
+  async run(auth, env, args, ctx) {
     const agent = auth.boundAgentId
-    if (!agent) return fail(403, 'not_agent_bound', 'inbox_lease requires an agent-bound token (member_tokens.agent_id)')
+    if (!agent) {
+      return fail(403, 'not_agent_bound', {
+        detail: 'inbox_lease requires an agent-bound token (member_tokens.agent_id)',
+        enroll_url: enrollUrl(canonicalOrigin(env, ctx.origin), ctx.seat),
+      })
+    }
     let limit: number | undefined
     if (args.limit !== undefined) {
       if (typeof args.limit !== 'number' || !Number.isFinite(args.limit))
@@ -3394,11 +3524,18 @@ const toolInboxLease: ToolSpec = {
     if (args.seat !== undefined && typeof args.seat !== 'string')
       return fail(400, 'invalid_args', 'seat must be a string')
 
+    const boundSeat = await resolveBoundSeat(env, auth)
+    const seatArg = resolveInboxSeatArg(
+      typeof args.seat === 'string' ? args.seat.trim() : undefined,
+      boundSeat,
+    )
+    if (!seatArg.ok) return seatArg.outcome
+
     const res = await leaseAgentInbox(env, {
       agent,
       limit,
       leaseSeconds,
-      seat: typeof args.seat === 'string' ? args.seat.trim() : undefined,
+      seat: seatArg.seat,
     })
     if (!res.ok) {
       if (res.reason === 'db_error') return fail(500, res.reason) // no raw DB string to caller
@@ -3408,6 +3545,7 @@ const toolInboxLease: ToolSpec = {
     return done({
       messages: res.messages,
       remaining: res.remaining,
+      complete: res.complete,
       dead_lettered: res.dead_lettered,
       lease_seconds: res.lease_seconds,
       max_lease_seconds: MAX_LEASE_SECONDS,
@@ -3424,6 +3562,29 @@ const toolInboxLease: ToolSpec = {
 // behind it. Idempotent: re-acking an already-read id is success, not an error, because the
 // alternative is every caller re-implementing the retry bookkeeping this tool exists to
 // remove. Ids that are not this agent's are refused without saying whether they exist.
+//
+// mupot#1254 C1 seat-bind (kasra-code, flight-20260902-seat-bind): deliberately UNCHANGED.
+// inbox_ack has no `seat` argument at all — it is scoped by `to_agent = agent` only
+// (ackAgentMessages, src/agents/messages.ts:922-929 — filters tenant/to_agent/fence, never
+// target_seat), same as before this fix, and that is by the ORIGINAL design of this tool
+// ("Only the bound recipient may ack, and only rows addressed to them" — see
+// ackAgentMessages' own docstring). `ids` are opaque `crypto.randomUUID()`s
+// (src/agents/messages.ts:265ish), not derivable from a seat name — knowing an id is already
+// a real capability, the same "id as bearer capability" shape `send_target_not_visible`
+// deliberately collapses onto.
+//
+// CORRECTED on kasra-review's round-2 gate of this PR (3ac8eb18): an earlier version of this
+// comment claimed "the one place a seat-B caller could learn a seat-A id was a mismatched
+// args.seat on inbox/inbox_lease — exactly the hole this PR closes," implying the id-leak
+// surface was fully closed. That was false, refuted with a live PoC: `inbox_dead_letters`
+// (self scope, a few tools below, src/agents/messages.ts:~990 `listDeadLetteredMessages`)
+// returns id+body for EVERY seat of `to_agent` with NO seat filter at all, and
+// `project_context`'s message projections (src/projects/projections.ts ~337-346, ~563-570,
+// gated only by `messageReadableSql` — squad readability, no seat concept) do the same. A
+// seat-B caller who can reach either surface can still learn a seat-A id today and hand it
+// straight to inbox_ack. Neither channel is caused or worsened by args.seat, and NEITHER IS
+// FIXED IN THIS PR — scope stays the 3 tools named in the flight brief
+// (index.ts inbox/inbox_lease/inbox_ack). Tracked as mumega-com#1176.
 const toolInboxAck: ToolSpec = {
   name: 'inbox_ack',
   scope: 'self (the caller agent acks messages addressed to itself)',
@@ -3960,6 +4121,110 @@ const toolFleetAgentGet: ToolSpec = {
   },
 }
 
+// Boot-time self-report, wrapped so it can NEVER take boot down with it. boot_context is
+// the one response documented as always succeeding on the directory channel (#712) and is
+// the only reachable call for a zero-capability seat. A registry write is strictly less
+// important than the caller learning who it is: on any error we report the failure as data
+// and hand back the rest of the packet.
+async function reportSelfAtBoot(
+  env: Env,
+  agentId: string,
+  claim: { runtime?: unknown; model?: unknown },
+): Promise<unknown> {
+  try {
+    return await selfReportAtBoot(env, agentId, claim)
+  } catch {
+    return { outcome: 'unavailable', belief: null, detail: 'registry unreachable at boot; identity below is unaffected' }
+  }
+}
+
+// ── first-run onboarding: state + doors (mupot#1283) ─────────────────────────────
+//
+// Structured, so a harness can ACT on it without parsing English. `next_step` remains
+// a human-readable summary of doors[0].
+
+export type OnboardingState =
+  /** Token is welded to an agent. Nothing to do. */
+  | 'bound'
+  /** Directory channel, unbound, this member has never bootstrapped → self-serve. */
+  | 'unbound_no_agent'
+  /** Directory channel, unbound, but this member already bootstrapped once. */
+  | 'unbound_agent_exists'
+  /** Any non-directory channel without a weld. bootstrap_self refuses this caller. */
+  | 'unbound_workspace'
+
+export interface OnboardingDoor {
+  /** MCP tool to call, or null when the door is a URL rather than a tool. */
+  tool: string | null
+  /** What walking through it actually accomplishes. */
+  does: string
+  /** What the caller must already have. 'nothing' means genuinely self-serve. */
+  requires: string
+}
+
+/** Has this member ever completed bootstrap_self? Delegates to the CANONICAL predicate
+ *  in src/members/bootstrap-self.ts — the same call that makes a second attempt return
+ *  `already_bootstrapped` — so the door we advertise cannot drift from what the tool
+ *  accepts. It held its own copy of that query first; one predicate, two definitions is
+ *  how an advertised door quietly starts lying.
+ *
+ *  NEVER allowed to throw. boot_context is documented as "the one response that always
+ *  succeeds on this channel" (#712) and is the only reachable call for a zero-capability
+ *  seat; a first-run caller losing its whole map because an advisory lookup failed would
+ *  reproduce the exact dead end this field exists to remove. On any error we fall back to
+ *  the state that offers MORE doors, never fewer — a caller shown bootstrap_self when it
+ *  has already bootstrapped gets a clear 409 naming the consent flow, whereas a caller
+ *  denied the door gets nothing.
+ */
+async function hasBootstrappedBefore(env: Env, memberId: string | null | undefined): Promise<boolean> {
+  if (!memberId) return false
+  try {
+    // The SAME function bootstrapSelf uses to decide `already_bootstrapped`. Not a
+    // reimplementation of it — the door has to move when the tool moves.
+    const row = await findExistingBootstrap(env, memberId)
+    return row !== null && row !== undefined
+  } catch {
+    return false
+  }
+}
+
+function buildAvailableDoors(state: OnboardingState): OnboardingDoor[] {
+  const alwaysOpen: OnboardingDoor[] = [
+    { tool: 'status', does: 'echo who this token is', requires: 'nothing' },
+    { tool: 'boot_context', does: 'this map', requires: 'nothing' },
+  ]
+
+  switch (state) {
+    case 'bound':
+      return [
+        { tool: 'orient', does: 'your full basin-drop packet — squad, scope, tasks, field state', requires: 'nothing (your token is agent-bound)' },
+        ...alwaysOpen,
+      ]
+    case 'unbound_no_agent':
+      return [
+        {
+          tool: 'bootstrap_self',
+          does: 'create your department, squad and agent, mint its credential, and grant you admin on its squad — one atomic act',
+          requires: 'nothing — this is the self-serve door, no second human',
+        },
+        { tool: 'connect', does: 'claim an EXISTING agent for this session only (no durable weld)', requires: 'the agent slug, and capability on its squad' },
+        ...alwaysOpen,
+      ]
+    case 'unbound_agent_exists':
+      return [
+        { tool: null, does: 'bind this session to the agent you already bootstrapped, at /oauth/consent', requires: 'admin on that agent\'s squad — the founder grant from your bootstrap already gives you this' },
+        { tool: 'connect', does: 'claim that agent for this session only (no durable weld)', requires: 'the agent slug' },
+        ...alwaysOpen,
+      ]
+    case 'unbound_workspace':
+      return [
+        { tool: 'connect', does: 'claim an existing agent for this session only (no durable weld)', requires: 'the agent slug, and capability on its squad' },
+        { tool: 'mint_agent_token', does: 'weld a credential to an agent permanently', requires: 'admin on the agent\'s squad — ask an org-admin if you lack it' },
+        ...alwaysOpen,
+      ]
+  }
+}
+
 // boot_context — first-call coherence signal for any connecting principal.
 //
 // Problem (#126): boot_context must tell a first-run agent whether it has a claimed
@@ -3982,13 +4247,15 @@ const toolBootContext: ToolSpec = {
   name: 'boot_context',
   scope: 'self (read-only — no args required)',
   min: 'authenticated',
-  args: '{ source?: string, seat?: string, label?: string }',
+  args: '{ source?: string, seat?: string, label?: string, runtime?: string, model?: string }  // runtime/model: what you are ACTUALLY running on — reported at boot',
   inputSchema: {
     type: 'object',
     properties: {
       source: STRING_SCHEMA,
       seat: STRING_SCHEMA,
       label: STRING_SCHEMA,
+      runtime: STRING_SCHEMA,
+      model: STRING_SCHEMA,
     },
     additionalProperties: false,
   },
@@ -4012,15 +4279,80 @@ const toolBootContext: ToolSpec = {
     // auth.boundAgentId mirrors that field — it is resolved server-side from the token,
     // never from client input.
     const isMinted = auth.boundAgentId !== null
+
+    // ── mupot#1284: boot is where an agent says what it IS ──────────────────────
+    //
+    // fleet_agents.runtime/.model previously moved ONLY via POST /api/fleet/attach —
+    // a call a host daemon makes. An agent booting over MCP never touched it, so a
+    // harness change went unrecorded while presence kept last_reported_at fresh. The
+    // timestamp then vouched for a field nothing had rechecked, and the registry could
+    // not say which model was gating a review.
+    //
+    // Reported even when the caller claims nothing: `registry` carries what mupot
+    // currently believes, so a booting agent SEES the drift instead of having to think
+    // to ask. Same reasoning as available_doors — the response that always succeeds is
+    // where a fact has to be said, or it is not said at all.
+    const selfReport = isMinted
+      ? await reportSelfAtBoot(env, auth.boundAgentId as string, { runtime: args.runtime, model: args.model })
+      : null
     const identityStatus: 'minted' | 'unminted' = isMinted ? 'minted' : 'unminted'
+
+    // ── mupot#1283: the self-serve door has to be NAMED at the door ──────────────
+    //
+    // `bootstrap_self` (mupot#925) exists for exactly one caller: an unbound, verified
+    // DIRECTORY session with no agent yet. It creates the department, squad and agent,
+    // mints the agent's credential, and grants the calling human founder admin on the
+    // new squad — one atomic act, no second human required.
+    //
+    // Until now nothing in this response mentioned it. `next_step` and
+    // `channel_limits.to_get_write_access` both said "ask an org-admin", which for a
+    // BRAND-NEW tenant names someone who does not exist yet. The consent screen cannot
+    // help either: consent only offers agents that already hold an
+    // `agent_member_bindings` row, and that row is written by the mint (see
+    // src/mcp/oauth-authorize.ts, selection rule 2). So an org whose first agent was
+    // never minted had no reachable door at all, and the tool built to break precisely
+    // that deadlock was named in one line of the static instructions blob — competing
+    // with ~119 tool descriptions for a reader's attention.
+    //
+    // The fix is not more prose. `available_doors` and `onboarding_state` were already
+    // declared the durable contract in the comment above `nextStep`; they were never
+    // implemented, so callers had only a sentence to parse. They are real fields now,
+    // and prose is the summary of them rather than the source of truth.
+    const onboardingState: OnboardingState = isMinted
+      ? 'bound'
+      : auth.channel === 'directory'
+        ? (await hasBootstrappedBefore(env, auth.memberId) ? 'unbound_agent_exists' : 'unbound_no_agent')
+        : 'unbound_workspace'
+
+    const availableDoors = buildAvailableDoors(onboardingState)
+    const enrollHref = enrollUrl(
+      canonicalOrigin(env, ctx.origin),
+      (str(args.seat) || str(args.label) || ctx?.seat || '').trim() || null,
+    )
 
     // QA-1: every refusal/unminted signal must carry the full map out — no dead ends.
     // Two paths for an unbound token:
     //   A) Shared apikey + know your name → call connect { agent_name } (session-local, works now).
     //   B) Want a permanent weld → ask an admin to call mint_agent_token, then reconnect.
+    //
+    // The enrollment door is deliberately NOT in this string. It ships as the
+    // structured `enroll_url` field below instead. Kasra's collision ruling
+    // (2026-09-01): #1253 and this branch both rewrite next_step for the same
+    // unbound state with contradictory tests, and no PR owns the whole truth —
+    // the durable contract is onboarding_state + available_doors[], with prose
+    // as at most a summary. Two PRs racing to own one sentence is how the
+    // sentence ends up describing neither state correctly.
+    // Prose is now a SUMMARY of available_doors[0], never a second source of truth.
+    // The workspace-channel wording is unchanged: bootstrap_self is gated to the
+    // directory channel inside bootstrapSelf, so advertising it here would be a door
+    // that refuses the caller it was offered to.
     const nextStep = isMinted
       ? 'call orient (no args — your token is agent-bound) to receive your full basin-drop packet'
-      : 'if you know your agent slug/id: call connect { agent_name: "<slug>" } to claim your identity now (session-local). For a permanent weld: ask an org-admin to call mint_agent_token for your agent, then reconnect with the minted token.'
+      : onboardingState === 'unbound_no_agent'
+        ? 'you have no agent yet — call bootstrap_self { agent_name: "<the name you are giving it>" } to create it, mint its credential and grant yourself admin on its squad in one act. No other human is required. See available_doors for every door open to you.'
+        : onboardingState === 'unbound_agent_exists'
+          ? 'you already bootstrapped an agent — bind this session to it at /oauth/consent, or call connect { agent_name: "<slug>" } to claim it session-locally now. See available_doors.'
+          : 'if you know your agent slug/id: call connect { agent_name: "<slug>" } to claim your identity now (session-local). For a permanent weld: ask an org-admin to call mint_agent_token for your agent, then reconnect with the minted token.'
 
     // THE DOOR MUST SAY WHAT IT IS (#712).
     //
@@ -4059,7 +4391,9 @@ const toolBootContext: ToolSpec = {
               'anything requiring a standing capability, regardless of what you hold elsewhere',
             ],
             to_get_write_access:
-              'ask an org-admin for a WORKSPACE-channel token (mint_agent_token), and connect with that bearer. Requesting a squad grant will NOT help — this door discards grants by construction.',
+              'if you have no agent yet, call bootstrap_self { agent_name } — it creates your agent, mints its credential and makes you admin of its squad in one atomic act, with no other human involved. '
+              + 'If your agent already exists, ask an org-admin for a WORKSPACE-channel token (mint_agent_token), and connect with that bearer. '
+              + 'Requesting a squad grant will NOT help — this door discards grants by construction.',
           }
         : undefined
 
@@ -4074,7 +4408,11 @@ const toolBootContext: ToolSpec = {
       // identity coherence (#126) — NEW field
       identity_status: identityStatus,
       bound_agent_id: auth.boundAgentId ?? null,
+      ...(selfReport ? { registry: selfReport } : {}),
+      onboarding_state: onboardingState,
+      available_doors: availableDoors,
       next_step: nextStep,
+      ...(isMinted ? {} : { enroll_url: enrollHref }),
       // Present ONLY on the directory channel — its absence is itself information.
       ...(directoryNote ? { channel_limits: directoryNote } : {}),
     })
@@ -4271,6 +4609,7 @@ const toolConnect: ToolSpec = {
       // member who already held org:owner — the grant would have changed nothing, because
       // the directory door discards grants by construction. Name the real cause and the
       // door that works (mupot#678).
+      const enrollHref = enrollUrl(canonicalOrigin(env, ctx.origin), ctx.seat)
       if (auth.channel === 'directory') {
         return fail(403, 'forbidden', {
           reason: 'directory_channel_zero_capability',
@@ -4286,9 +4625,11 @@ const toolConnect: ToolSpec = {
             // the exact failure this refusal exists to remove. Not hypothetical: six
             // hadi/codex agent records share slugs today. (codex gate, #681.)
             `squad to run mint_agent_token { agent: "${agentRef.id}" }, then connect with that bearer.`,
+            `Open ${enrollHref} to choose or coin a seat key.`,
           ].join(' '),
           need: 'workspace-channel token',
           scope: 'channel',
+          enroll_url: enrollHref,
         })
       }
       return fail(403, 'forbidden', {
@@ -4296,9 +4637,11 @@ const toolConnect: ToolSpec = {
         detail: [
           `Your token does not have member-or-higher capability on the squad for agent "${agentRef.slug}".`,
           'Ask an org-admin to grant you squad membership, or verify you are using the right token.',
+          `Open ${enrollHref} to choose or coin a seat key.`,
         ].join(' '),
         need: 'member',
         scope: 'squad',
+        enroll_url: enrollHref,
       })
     }
 

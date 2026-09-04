@@ -71,6 +71,8 @@ const SAFE_REFERENCE_FIELD_RE = /(?:^|[_-])(env|name|names|ref|path|file|id|ids|
 
 const MANUAL_DB_COMMAND_RE = /\b(wrangler\s+d1\s+execute|sqlite3\b|INSERT\s+INTO|UPDATE\s+\w+|DELETE\s+FROM|DROP\s+TABLE|ALTER\s+TABLE)\b/i
 const SAFE_DB_COMMAND_RE = /\bwrangler\s+d1\s+migrations\s+apply\b/i
+const SOURCE_HEALTH_STEP = 'post_setup_validation'
+const SOURCE_HEALTH_KEYS = ['ok', 'service', 'commit', 'clean']
 
 export function parseArgs(argv) {
   const opts = {
@@ -78,6 +80,7 @@ export function parseArgs(argv) {
     pot: '',
     baseUrl: '',
     operator: '',
+    releaseSha: '',
     plan: false,
     check: false,
     summary: false,
@@ -96,6 +99,11 @@ export function parseArgs(argv) {
     else if (arg === '--pot') opts.pot = next()
     else if (arg === '--base-url') opts.baseUrl = stripTrailingSlash(next())
     else if (arg === '--operator') opts.operator = next()
+    else if (arg === '--release-sha') {
+      const releaseSha = next()
+      if (!isCanonicalReleaseSha(releaseSha)) throw new Error('invalid release SHA: expected 40 lowercase hexadecimal characters')
+      opts.releaseSha = releaseSha
+    }
     else if (arg === '--plan') opts.plan = true
     else if (arg === '--check') opts.check = true
     else if (arg === '--summary') opts.summary = true
@@ -118,6 +126,7 @@ export function usage() {
     '  --pot <slug>           expected pot slug',
     '  --base-url <url>       expected deployed pot URL',
     '  --operator <id-email>  expected fresh operator identity',
+    '  --release-sha <sha>    expected 40-character lowercase release SHA',
     '  -h, --help             show this help',
   ].join('\n')
 }
@@ -144,6 +153,7 @@ export function formatPlan(opts = {}) {
   const pot = opts.pot || '<pot>'
   const baseUrl = opts.baseUrl || 'https://<pot-host>'
   const operator = opts.operator || '<operator-email-or-id>'
+  const releaseSha = opts.releaseSha || ''
   const outDir = defaultOutDir(opts)
   const lines = []
 
@@ -184,6 +194,7 @@ export function formatPlan(opts = {}) {
       worker: `mupot-${pot}`,
       db: `mupot-${pot}`,
       config: `wrangler.${pot}.toml`,
+      ...(releaseSha ? { release_sha: releaseSha } : {}),
     },
     commands: [
       { command: '<redacted command or command id>', ok: true, exit_code: 0 },
@@ -197,6 +208,21 @@ export function formatPlan(opts = {}) {
       { label: '<artifact label>', path: '<redacted path or attachable artifact name>' },
     ],
   }, null, 2))
+  if (releaseSha) {
+    lines.push('')
+    lines.push(`${SOURCE_HEALTH_STEP}: record the authorized collector's redacted source health observation:`)
+    lines.push(JSON.stringify({
+      step: SOURCE_HEALTH_STEP,
+      evidence: {
+        source_health: {
+          ok: true,
+          service: 'mupot',
+          commit: releaseSha,
+          clean: true,
+        },
+      },
+    }, null, 2))
+  }
   lines.push('')
   lines.push('After all files are present:')
   lines.push(commandLine([
@@ -211,6 +237,7 @@ export function formatPlan(opts = {}) {
     baseUrl,
     '--operator',
     operator,
+    ...(releaseSha ? ['--release-sha', releaseSha] : []),
   ], ` > ${shellQuote(join(outDir, 'fresh-install-check.json'))}`))
   lines.push(commandLine([
     'node',
@@ -225,6 +252,7 @@ export function formatPlan(opts = {}) {
     baseUrl,
     '--operator',
     operator,
+    ...(releaseSha ? ['--release-sha', releaseSha] : []),
   ]))
   return `${lines.join('\n')}\n`
 }
@@ -307,6 +335,31 @@ function receiptTargetValue(receipt, field) {
   const target = receipt?.target && typeof receipt.target === 'object' ? receipt.target : {}
   const value = target[field]
   return typeof value === 'string' ? stripTrailingSlash(value.trim()) : ''
+}
+
+function releaseShaValue(receipt) {
+  const target = receipt?.target && typeof receipt.target === 'object' ? receipt.target : {}
+  return target.release_sha
+}
+
+function isCanonicalReleaseSha(value) {
+  return typeof value === 'string' && /^[0-9a-f]{40}$/.test(value)
+}
+
+function validateSourceHealth(receipt, expectedReleaseSha) {
+  const health = receipt?.evidence?.source_health
+  const object = health !== null && typeof health === 'object' && !Array.isArray(health)
+  const exact = object && Object.keys(health).length === SOURCE_HEALTH_KEYS.length && SOURCE_HEALTH_KEYS.every((key) => Object.hasOwn(health, key))
+  const observed = object ? {
+    ok: typeof health.ok === 'boolean' ? health.ok : null,
+    service: health.service === 'mupot' ? 'mupot' : null,
+    commit: isCanonicalReleaseSha(health.commit) ? health.commit : null,
+    clean: typeof health.clean === 'boolean' ? health.clean : null,
+  } : null
+  return {
+    valid: Boolean(exact && health.ok === true && health.service === 'mupot' && health.commit === expectedReleaseSha && health.clean === true),
+    observed,
+  }
 }
 
 function receiptTargetValuePass(value) {
@@ -481,6 +534,43 @@ export function checkBundle(opts = {}) {
       values,
     })
     target[field] = values.length === 1 ? values[0] : null
+  }
+
+  const releaseShaValues = receipts.map(({ receipt }) => releaseShaValue(receipt))
+  const releaseShaPresent = releaseShaValues.some((value) => value !== undefined)
+  const releaseShaConsistent = receipts.length === REQUIRED_STEPS.length
+    && releaseShaValues.every(isCanonicalReleaseSha)
+    && new Set(releaseShaValues).size === 1
+  if (releaseShaPresent || opts.releaseSha) {
+    for (const { spec, path, receipt } of receipts) {
+      pushCheck(checks, isCanonicalReleaseSha(releaseShaValue(receipt)), 'target_release_sha_valid', {
+        path,
+        step: spec.step,
+        value: releaseShaValue(receipt) ?? null,
+      })
+    }
+    pushCheck(checks, releaseShaConsistent, 'target_release_sha_consistent_across_receipts', {
+      values: [...new Set(releaseShaValues.filter(isCanonicalReleaseSha))],
+    })
+  }
+  target.release_sha = releaseShaConsistent ? releaseShaValues[0] : null
+  const effectiveReleaseSha = opts.releaseSha || target.release_sha
+  if (opts.releaseSha) {
+    pushCheck(checks, isCanonicalReleaseSha(opts.releaseSha), 'expected_release_sha_valid', { expected: opts.releaseSha })
+    pushCheck(checks, target.release_sha === opts.releaseSha, 'target_release_sha_matches_expected', {
+      expected: opts.releaseSha,
+      actual: target.release_sha,
+    })
+  }
+  if (releaseShaPresent || opts.releaseSha) {
+    const sourceReceipt = receipts.find(({ spec }) => spec.step === SOURCE_HEALTH_STEP)
+    const sourceHealth = validateSourceHealth(sourceReceipt?.receipt, effectiveReleaseSha)
+    pushCheck(checks, sourceHealth.valid, 'source_health_matches_expected_release_sha', {
+      step: SOURCE_HEALTH_STEP,
+      path: sourceReceipt?.path ?? join(outDir, 'post-setup-validation.json'),
+      artifact_sha256: artifacts[SOURCE_HEALTH_STEP]?.sha256 ?? null,
+      source_health: sourceHealth.observed,
+    })
   }
 
   for (const { spec, path, receipt } of receipts) {

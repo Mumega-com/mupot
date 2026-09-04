@@ -79,6 +79,30 @@ import { findPreset, isValidPresetId } from '../auth/role-presets'
 
 // Agent-bound token mint UI.
 import { loadAgentTokenView, agentTokenPageBody, agentTokenMintedBody } from './agent-token'
+import {
+  withDeadline,
+  loadCollaborationPanel,
+  loadFlightPanel,
+  loadWorkPanel,
+  panelByKey,
+  formatCost,
+  type PanelResult,
+  type FlightSummary,
+  type WorkSummary,
+  type CollaborationSummary,
+} from './agent-profile'
+import {
+  authorizeEnrollMint,
+  enrollClientSnippet,
+  enrollForbiddenBody,
+  enrollMintedBody,
+  enrollPageBody,
+  enrollThrottledBody,
+  enrollUnavailableBody,
+  checkEnrollMintRateLimit,
+  loadEnrollView,
+  normalizeEnrollSeat,
+} from './enroll'
 import { loadControlCenterView, controlCenterPageBody } from './control-center'
 import { loadJoinPreview, confirmJoin, joinPreviewPageBody, joinConfirmedBody } from './join-agent'
 import { mintAgentBoundToken, isAgentTokenCapability } from '../members/service'
@@ -1702,8 +1726,22 @@ dashboardApp.get('/agents/:id', async (c) => {
   // Mirror the wake API's real gate (lead+ on the agent's squad) so squad leads
   // see a working button — the API re-checks server-side either way.
   const canWake = await canOnSquad(c.env, auth, agent.squad_id)
+  // Panels resolve independently: one failing read degrades its own section and
+  // nothing else, and each returns a typed state so "we could not read this"
+  // never renders as "this agent has done nothing".
+  //
+  // Each read carries its OWN deadline. Athena's gate on 0df79b09 caught that
+  // Promise.all alone does not deliver the independence this comment claims — a
+  // read that never RETURNS still stalls the whole page, so independence held
+  // only for reads that failed, not for reads that hung. allSettled would not
+  // fix it either; the missing piece is a deadline, not error handling.
+  const [flights, work, collaboration] = await Promise.all([
+    withDeadline(loadFlightPanel(c.env, agent.id), undefined, 'Flight history took too long to read.'),
+    withDeadline(loadWorkPanel(c.env, agent.id), undefined, 'Assigned work took too long to read.'),
+    withDeadline(loadCollaborationPanel(c.env, agent.id), undefined, 'Collaboration history took too long to read.'),
+  ])
   return c.html(
-    shell(c.env, `Agent · ${agent.name}`, agentConsoleBody(agent, squad, canWake)),
+    shell(c.env, `Agent · ${agent.name}`, agentConsoleBody(agent, squad, canWake, flights, work, collaboration)),
   )
 })
 
@@ -2040,6 +2078,132 @@ dashboardApp.post('/admin/agent-token/mint', async (c) => {
         minted.raw,
         minted.tokenId,
         minted.grantCapability,
+      ),
+    ),
+  )
+})
+
+// ── seat enrollment (GET /enroll, POST /enroll/mint) ─────────────────────────
+//
+// Seat-aware sibling of /admin/agent-token. A signed-in human picks an agent
+// they may act as (OAuth consent eligibility) and coins a workspace-channel
+// key labelled with this seat. Minting reuses mintAgentBoundToken; the gate
+// is mint_agent_token's (admin on the agent's squad), never a wider one.
+
+dashboardApp.get('/enroll', async (c) => {
+  const auth = c.get('auth')
+  const view = await loadEnrollView(c.env, auth, {
+    seat: c.req.query('seat'),
+    agent: c.req.query('agent'),
+  })
+  return c.html(shell(c.env, 'Enroll seat', enrollPageBody(view)))
+})
+
+dashboardApp.post('/enroll/mint', async (c) => {
+  const auth = c.get('auth')
+  const form = await c.req.parseBody()
+  const agentIdRaw = typeof form.agent_id === 'string' ? form.agent_id.trim() : ''
+  const seat = normalizeEnrollSeat(typeof form.seat === 'string' ? form.seat : '')
+
+  if (auth.boundAgentId) {
+    return c.html(
+      shell(c.env, 'Enroll seat', errorBody('An operator principal is required.')),
+      403,
+    )
+  }
+
+  // Throttle before anything is resolved or minted. A refused attempt burns
+  // budget on purpose — a loop hammering this form with a bad agent id is the
+  // shape worth braking, and it would otherwise cost nothing.
+  const actorMemberId = auth.memberId
+  if (!actorMemberId) {
+    return c.html(
+      shell(c.env, 'Enroll seat', errorBody('No member identity resolved for this session.')),
+      403,
+    )
+  }
+  const throttle = await checkEnrollMintRateLimit(c.env, actorMemberId)
+  if (!throttle.allowed) {
+    const body = throttle.reason === 'unavailable'
+      ? enrollUnavailableBody(throttle.retryAfter)
+      : enrollThrottledBody(throttle.retryAfter)
+    return c.html(shell(c.env, 'Enroll seat', body), 429, {
+      'Retry-After': String(throttle.retryAfter),
+    })
+  }
+
+  const canonical = requiredCanonicalOrigin(c.env)
+  if (!canonical.ok) {
+    return c.html(
+      shell(
+        c.env,
+        'Enroll seat',
+        errorBody('A secure public origin must be configured before provisioning a token.'),
+      ),
+      503,
+    )
+  }
+
+  if (!agentIdRaw) {
+    const view = await loadEnrollView(c.env, auth, { seat, agent: agentIdRaw })
+    return c.html(shell(c.env, 'Enroll seat', enrollPageBody(view, 'Pick an agent.')), 400)
+  }
+
+  const agentResult = await resolveAgentRef(c.env, agentIdRaw)
+  if (!agentResult.ok) {
+    const view = await loadEnrollView(c.env, auth, { seat, agent: agentIdRaw })
+    const msg = agentResult.reason === 'ambiguous'
+      ? 'Agent slug is ambiguous — use the agent id instead.'
+      : 'Agent not found in this pot.'
+    const status = agentResult.reason === 'ambiguous' ? 409 : 404
+    return c.html(shell(c.env, 'Enroll seat', enrollPageBody(view, msg)), status)
+  }
+  const agent = agentResult.value
+
+  const authorized = await authorizeEnrollMint(c.env, auth, agent.squad_id)
+  if (!authorized.ok) {
+    if (authorized.reason === 'operator_principal_required') {
+      return c.html(
+        shell(c.env, 'Enroll seat', errorBody('An operator principal is required.')),
+        403,
+      )
+    }
+    const squadRow = await c.env.DB.prepare('SELECT name FROM squads WHERE id = ?1 LIMIT 1')
+      .bind(agent.squad_id)
+      .first<{ name: string }>()
+    return c.html(
+      shell(c.env, 'Enroll seat', enrollForbiddenBody(auth, agent.name, squadRow?.name ?? null)),
+      403,
+    )
+  }
+
+  // issuedBy puts the issuance row in the same batch as the token (0139), so
+  // this page cannot hand out a credential nobody can attribute.
+  const minted = await mintAgentBoundToken(c.env, agent, seat, {
+    issuedBy: {
+      memberId: actorMemberId,
+      principal: (auth.email && auth.email.trim().length > 0) ? auth.email.trim() : actorMemberId,
+      surface: 'enroll',
+    },
+  })
+  const squadRow = await c.env.DB.prepare('SELECT name FROM squads WHERE id = ?1 LIMIT 1')
+    .bind(agent.squad_id)
+    .first<{ name: string }>()
+  const snippet = enrollClientSnippet(agent.slug, canonical.origin, seat)
+
+  return c.html(
+    shell(
+      c.env,
+      'Seat key coined',
+      enrollMintedBody(
+        agent.name,
+        agent.slug,
+        squadRow?.name ?? null,
+        minted.raw,
+        minted.tokenId,
+        minted.grantCapability,
+        seat,
+        snippet,
       ),
     ),
   )
@@ -4144,6 +4308,11 @@ export function shell(
             <span class="nav-label">Access tokens</span>
           </a>
 
+          <a class="nav-link" href="/enroll">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><rect x="4" y="7" width="12" height="9" rx="1.5"/><path d="M7.5 7V5.8a2.5 2.5 0 0 1 5 0V7"/><path d="M10 11.2v2"/></svg>
+            <span class="nav-label">Enroll seat</span>
+          </a>
+
           <!-- People & roles (grants roster) -->
           <a class="nav-link" href="/admin/members">
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><circle cx="10" cy="6.5" r="2.6"/><path d="M4.5 16c0-2.6 2.5-4.3 5.5-4.3s5.5 1.7 5.5 4.3"/></svg>
@@ -5070,7 +5239,36 @@ function taskCard(t: Task) {
   </div>`
 }
 
-function agentConsoleBody(agent: Agent, squad: Squad | null, canWake: boolean) {
+
+/**
+ * Renders one profile panel. The three states are kept visually distinct on
+ * purpose: a panel we could not READ must never look like an agent that has
+ * done nothing. Conflating them is how a dashboard reports a zero that is
+ * really an unknown, and a zero that is really an unknown reads as a measurement.
+ */
+function renderPanel<T>(
+  key: string,
+  result: PanelResult<T>,
+  body: (data: T) => ReturnType<typeof html>,
+) {
+  const spec = panelByKey(key)
+  if (result.state === 'unavailable') {
+    return html`<div class="card"><p class="dim">${result.reason ?? 'This could not be read.'}</p></div>`
+  }
+  if (result.state === 'empty' || !result.data) {
+    return html`<div class="card"><p class="dim">${spec?.emptyLabel ?? 'Nothing here yet.'}</p></div>`
+  }
+  return body(result.data)
+}
+
+function agentConsoleBody(
+  agent: Agent,
+  squad: Squad | null,
+  canWake: boolean,
+  flights: PanelResult<FlightSummary>,
+  work: PanelResult<WorkSummary>,
+  collaboration: PanelResult<CollaborationSummary>,
+) {
   // The wake button calls the RBAC-gated agents endpoint. The fetch is same-origin
   // and credentialed (HttpOnly session cookie rides along automatically).
   const wakeScript = raw(`
@@ -5123,6 +5321,55 @@ function agentConsoleBody(agent: Agent, squad: Squad | null, canWake: boolean) {
         <dt>Created</dt><dd>${agent.created_at}</dd>
       </dl>
     </div>
+    <h2>Flights</h2>
+    ${renderPanel('flights', flights, (d) => html`
+      <div class="card">
+        <dl class="kv">
+          <dt>Flown</dt><dd>${d.truncated ? html`at least ${d.total}` : html`${d.total}`}</dd>
+          <dt>Landed</dt><dd>${d.landed}</dd>
+          <dt>Failed</dt><dd>${d.failed}</dd>
+          <dt>Held</dt><dd>${d.held}</dd>
+          <dt>Running</dt><dd>${d.running}</dd>
+          <dt>Spend</dt><dd>${formatCost(d.costMicroUsd)}</dd>
+        </dl>
+        ${d.truncated ? html`<p class="dim">Read capped — counts above are a floor, not a total.</p>` : ''}
+        <ul>
+          ${d.recent.map((f) => html`<li>
+            <a href="/flights/${f.id}">${f.goal.slice(0, 90)}</a> — ${f.status} · ${f.created_at}
+          </li>`)}
+        </ul>
+      </div>`)}
+
+    <h2>Work</h2>
+    ${renderPanel('work', work, (d) => html`
+      <div class="card">
+        <dl class="kv">
+          <dt>Assigned</dt><dd>${d.truncated ? html`at least ${d.total}` : html`${d.total}`}</dd>
+          <dt>Open</dt><dd>${d.open}</dd>
+          <dt>Done</dt><dd>${d.done}</dd>
+          <dt>Tracked in GitHub</dt><dd>${d.tracked}</dd>
+        </dl>
+        ${d.truncated ? html`<p class="dim">Read capped — counts above are a floor, not a total.</p>` : ''}
+        <ul>
+          ${d.recent.map((t) => html`<li>
+            ${t.github_issue_url
+              ? html`<a href="${t.github_issue_url}">${t.title.slice(0, 90)}</a>`
+              : html`${t.title.slice(0, 90)}`} — ${t.status}
+          </li>`)}
+        </ul>
+      </div>`)}
+
+    <h2>Works with</h2>
+    ${renderPanel('collaboration', collaboration, (d) => html`
+      <div class="card">
+        <p class="dim">${d.truncated ? html`At least ${d.totalMessages}` : html`${d.totalMessages}`} messages exchanged. Edges are real messages — shared squad membership is not shown here, because co-location is not collaboration.</p>
+        <ul>
+          ${d.collaborators.slice(0, 10).map((p) => html`<li>
+            <a href="/agents/${p.agentId}">${p.name}</a> — sent ${p.sent}, received ${p.received} · last ${p.lastAt}
+          </li>`)}
+        </ul>
+      </div>`)}
+
     <h2>Console</h2>
     <div class="card">
       <button id="wake-btn" class="btn" ${canWake ? raw('') : raw('disabled title="Requires admin or owner"')}>

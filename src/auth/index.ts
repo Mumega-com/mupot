@@ -19,6 +19,27 @@ import type { Context, MiddlewareHandler } from 'hono'
 import type { Env, AuthContext } from '../types'
 import { verifyHandoffClaim } from './handoff-verify'
 import { resolveCapabilities } from './capability'
+import {
+  linkLoginIdentity,
+  listLoginIdentities,
+  resolveLoginIdentity,
+  revokeLoginIdentity,
+} from './login-identity'
+import { resolveHumanMemberId } from '../members/resolve-human-member'
+import {
+  createWebSession,
+  evaluateWebSession,
+  hashWebSessionId,
+  listWebSessions,
+  loadLiveReauthIdentity,
+  loadWebSession,
+  markRecentReauth,
+  revokeAllWebSessions,
+  revokeWebSession,
+  revokeWebSessionByHash,
+  revokeWebSessionsForLoginIdentity,
+  touchWebSession,
+} from './web-sessions'
 
 // ── tunables ──
 const COOKIE_NAME = 'mupot_session'
@@ -37,6 +58,18 @@ interface SessionRecord {
   email: string | null
   role: OrgRole
   createdAt: string
+  /**
+   * True only when mintSession's registerWebSession call actually created a
+   * D1 web_sessions row for this login (Delivery Sequence step 1). Gates
+   * whether loadAuthFromCookie performs the D1 cross-check at all: a session
+   * minted before this field existed, or one whose login never resolved to a
+   * members row, carries no flag, so requireAuth/peekSessionAuth never issue
+   * the extra D1 query for it and today's KV-only behaviour is UNCHANGED.
+   * Server-set only, at mint time, from mintSession's own write — never
+   * settable by a caller, and absence is always treated as false (fail
+   * closed toward "no D1 registry entry", never toward "trust it anyway").
+   */
+  webSessionRegistered?: boolean
 }
 
 // Role precedence for the minimum-role gate: owner > admin > member.
@@ -188,19 +221,121 @@ function isBootstrapEmail(value: string): boolean {
   return value.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)
 }
 
+/**
+ * registerWebSession — Delivery Sequence step 1: give this login a listable,
+ * revocable, expiring D1 record IF it resolves to a real members row.
+ *
+ * This is deliberately NOT a requirement for login to succeed. A login whose
+ * email matches no `members` row (e.g. a legacy dashboard owner/admin who has
+ * never been provisioned as a network member) still gets its existing
+ * KV+cookie session exactly as before — it just has no D1 registry entry, so
+ * it cannot be listed/remotely-revoked yet. That gap is intentional and
+ * documented (design doc "Human login identity": linking is an explicit act,
+ * not something a login silently invents by matching two email strings) —
+ * closing it for every principal is the "Authorization convergence" step
+ * later in the Delivery Sequence, not this one.
+ *
+ * Best-effort by design: a failure here must never fail the login itself —
+ * the caller writes the KV+cookie session (today's actual source of truth
+ * for role/access) regardless of what this function returns.
+ *
+ * Returns true only on an actual new D1 row — the caller stamps that (and
+ * ONLY that) onto the KV record's webSessionRegistered flag, which is what
+ * gates whether loadAuthFromCookie ever issues the follow-up D1 read on
+ * later requests for this session.
+ */
+async function registerWebSession(
+  env: Env,
+  sessionId: string,
+  email: string | null,
+  loginIdentity: { provider: string; subject: string } | undefined,
+): Promise<boolean> {
+  if (!loginIdentity || !email || !env.DB) return false
+  try {
+    const tenant = env.TENANT_SLUG
+    // Join key first: (tenant, provider, provider_subject) is the authority
+    // binding, not display email. An explicit prior link (the one-time owner
+    // ceremony, or any previous successful bind) MUST win over "whichever
+    // members.email happens to equal this login email" — that email match is
+    // the #1162 dual-member defect (hadi@digid.ca is a member row that holds
+    // admin on nothing; mem-hadi is the owner). Email is only the bootstrap
+    // when no live identity exists yet.
+    const existingIdentity = await resolveLoginIdentity(
+      env,
+      tenant,
+      loginIdentity.provider,
+      loginIdentity.subject,
+    )
+    let memberId: string
+    let loginIdentityId: string
+    if (existingIdentity) {
+      memberId = existingIdentity.member_id
+      loginIdentityId = existingIdentity.id
+      // verified_email is evidence, not the join key — refresh it on a
+      // step-1 hit so an IdP email change does not leave the primary
+      // address resolving to null (write-once P0-2).
+      const nextEmail = email.trim().toLowerCase()
+      const prev = existingIdentity.verified_email?.trim().toLowerCase() ?? ''
+      if (nextEmail && nextEmail !== prev) {
+        await env.DB.prepare(
+          `UPDATE human_login_identities SET verified_email = ?1
+            WHERE id = ?2 AND tenant = ?3 AND revoked_at IS NULL`,
+        ).bind(email, existingIdentity.id, tenant).run()
+      }
+    } else {
+      const resolved = await resolveHumanMemberId(env, {
+        tenant,
+        provider: loginIdentity.provider,
+        providerSubject: loginIdentity.subject,
+        email,
+      })
+      if (!resolved) return false
+
+      const linked = await linkLoginIdentity(env, {
+        tenant,
+        provider: loginIdentity.provider,
+        providerSubject: loginIdentity.subject,
+        verifiedEmail: email,
+        memberId: resolved,
+      })
+      if (!linked.ok) return false
+      memberId = resolved
+      loginIdentityId = linked.identity.id
+    }
+
+    await createWebSession(env, sessionId, {
+      tenant,
+      memberId,
+      loginIdentityId,
+    })
+    return true
+  } catch (err) {
+    // Best-effort: the D1 registry write failed, but the KV+cookie session
+    // is unaffected. Surface for operability; never rethrow. Includes the
+    // not-yet-migrated case (migrations 0139/0140 are shipped on this branch
+    // but deliberately NOT applied — see this task's boundary) — a pot
+    // running without those tables simply mints ordinary KV-only sessions
+    // until the migration lands, exactly like before this change.
+    console.error('registerWebSession failed (login still succeeded via KV session)', err)
+    return false
+  }
+}
+
 async function mintSession(
   c: Context<AppEnv>,
   userId: string,
   email: string | null,
   role: OrgRole,
-  opts: { secure?: boolean } = {},
+  opts: { secure?: boolean; loginIdentity?: { provider: string; subject: string } } = {},
 ): Promise<void> {
   const sessionId = randomId(32)
+  const webSessionRegistered = await registerWebSession(c.env, sessionId, email, opts.loginIdentity)
   const record: SessionRecord = {
     userId,
     email,
     role,
     createdAt: new Date().toISOString(),
+    ...(webSessionRegistered ? { webSessionRegistered: true } : {}),
   }
   await c.env.SESSIONS.put(sessionKey(sessionId), JSON.stringify(record), {
     expirationTtl: SESSION_TTL_SECONDS,
@@ -309,7 +444,9 @@ authApp.post('/bootstrap', async (c) => {
   const owner = await claimBootstrapOwner(c.env, form.email)
   if (!owner) return c.json({ error: 'bootstrap_already_claimed' }, 409)
 
-  await mintSession(c, owner.id, form.email, owner.role)
+  await mintSession(c, owner.id, form.email, owner.role, {
+    loginIdentity: { provider: 'bootstrap', subject: form.email },
+  })
   return c.redirect('/')
 })
 
@@ -364,7 +501,10 @@ authApp.get('/dev-login', async (c) => {
   const preferredId = await deriveUserId('local-test', email)
   const { id: userId, role } = await upsertUserByEmail(env, preferredId, email, true)
 
-  await mintSession(c, userId, email, role, { secure: false })
+  await mintSession(c, userId, email, role, {
+    secure: false,
+    loginIdentity: { provider: 'local-test', subject: email },
+  })
   return c.redirect('/')
 })
 
@@ -390,6 +530,24 @@ authApp.get('/callback', async (c) => {
     return c.json({ error: 'invalid_state' }, 400)
   }
   await env.SESSIONS.delete(stateKey(state))
+
+  // GET /auth/reauth (below) encodes a reauth marker into the SAME state
+  // value this route already validates above — no new CSRF mechanism, just a
+  // richer payload for the one that exists. A plain login's state is the
+  // literal string '1' (unchanged), so this parse only ever activates for a
+  // request that actually went through /auth/reauth.
+  let reauthTarget: { webSessionIdHash: string } | null = null
+  if (seen !== '1') {
+    try {
+      const parsed = JSON.parse(seen) as { reauth?: boolean; webSessionIdHash?: string }
+      if (parsed.reauth === true && typeof parsed.webSessionIdHash === 'string') {
+        reauthTarget = { webSessionIdHash: parsed.webSessionIdHash }
+      }
+    } catch {
+      // Not a reauth marker — an ordinary (if unrecognised) state value.
+      // Falls through to the normal mint path below, same as today.
+    }
+  }
 
   // Exchange the authorization code for an access token.
   const tokenRes = await fetch(GOOGLE_TOKEN, {
@@ -427,6 +585,24 @@ authApp.get('/callback', async (c) => {
     return c.json({ error: 'email_unverified' }, 403)
   }
 
+  // Reauth branch (GET /auth/reauth's round trip): this callback is proving
+  // freshness for an EXISTING session, not minting a new one. The returned
+  // provider identity must be the EXACT identity that session is already
+  // bound to — a reauth can only refresh recency for the human already
+  // signed in, never silently move recency onto a different human who
+  // happens to complete the OAuth dance on the same browser. A missing,
+  // revoked, or mismatched target is refused outright — never falls back to
+  // an ordinary login for a request that explicitly asked to step up.
+  if (reauthTarget) {
+    const identity = await loadLiveReauthIdentity(env, env.TENANT_SLUG, reauthTarget.webSessionIdHash)
+
+    if (!identity || identity.provider !== 'google' || identity.provider_subject !== info.sub) {
+      return c.json({ error: 'reauth_identity_mismatch' }, 403)
+    }
+    await markRecentReauth(env, reauthTarget.webSessionIdHash)
+    return c.redirect('/')
+  }
+
   const derivedId = await deriveUserId('google', info.sub)
   const email = info.email ?? null
 
@@ -437,8 +613,51 @@ authApp.get('/callback', async (c) => {
   const { id: userId, role } = await upsertUserByEmail(env, derivedId, email, true)
 
   // Mint the session: random opaque id → server-side record in KV.
-  await mintSession(c, userId, email, role)
+  await mintSession(c, userId, email, role, {
+    loginIdentity: { provider: 'google', subject: info.sub },
+  })
   return c.redirect('/')
+})
+
+// GET /auth/reauth → step-up: prove a FRESH round-trip through the identity
+// provider for the CURRENT session, without minting a new one. This is the
+// primitive the elevation approval flow (Delivery Sequence step 3) will read
+// before admitting a sensitive-action approval ("recent reauthentication
+// within five minutes" — design doc, Approval Flow step 5). Requires an
+// already-authenticated, D1-registered session: there is nothing to step up
+// for a session that was never bridged to a members row.
+authApp.get('/reauth', requireAuthMw(), async (c) => {
+  const env = c.env
+  if (provider(env) !== 'google') {
+    return c.json({ error: 'unsupported_provider', provider: provider(env) }, 400)
+  }
+  if (!env.OAUTH_CLIENT_ID) {
+    return c.json({ error: 'oauth_not_configured' }, 500)
+  }
+  const auth = c.get('auth')
+  if (!auth.webSessionIdHash) {
+    return c.json({ error: 'session_not_registered' }, 409)
+  }
+
+  const state = randomId(24)
+  await env.SESSIONS.put(
+    stateKey(state),
+    JSON.stringify({ reauth: true, webSessionIdHash: auth.webSessionIdHash }),
+    { expirationTtl: STATE_TTL_SECONDS },
+  )
+
+  const params = new URLSearchParams({
+    client_id: env.OAUTH_CLIENT_ID,
+    redirect_uri: callbackUrl(c.req.url),
+    response_type: 'code',
+    scope: 'openid email',
+    state,
+    access_type: 'online',
+    // Force a fresh credential prompt — "recent reauth" must reflect a
+    // genuine just-now round-trip, not a silently reused provider cookie.
+    prompt: 'select_account consent',
+  })
+  return c.redirect(`${GOOGLE_AUTH}?${params.toString()}`)
 })
 
 // GET /auth/handoff?token= → accept a mumega-signed verified-email claim (#262).
@@ -490,7 +709,9 @@ authApp.get('/handoff', async (c) => {
 
   // Mint the pot's OWN session (mirror /callback). We never trust mumega's session —
   // we issue our own opaque server-side session.
-  await mintSession(c, userId, res.claim.email, role)
+  await mintSession(c, userId, res.claim.email, role, {
+    loginIdentity: { provider: 'mumega', subject: res.claim.email },
+  })
   return c.redirect('/')
 })
 
@@ -506,6 +727,23 @@ authApp.get('/logout', async (c) => {
         await clearPresence(c.env, (JSON.parse(raw) as SessionRecord).email)
       } catch {
         /* malformed record — presence marker lapses at TTL */
+      }
+    }
+    // Also revoke the D1-registered web session, if this login ever resolved
+    // to a members row. Logout must kill listable/revocable authority
+    // immediately — deleting only the KV blob would leave a D1 row that
+    // still reads as live to loadWebSession until its own expiry. Design
+    // invariant #10: "Human logout/revocation immediately ends grants
+    // approved by that web session." Best-effort: a session that was never
+    // registered (no D1 row) revokes 0 rows, which is the correct outcome,
+    // not a fault — the KV delete above is already this login's source of
+    // truth in that case.
+    if (c.env.DB) {
+      try {
+        const idHash = await hashWebSessionId(sessionId)
+        await revokeWebSessionByHash(c.env, c.env.TENANT_SLUG, idHash, 'logout')
+      } catch (err) {
+        console.error('web_sessions revoke-on-logout failed (KV session already cleared)', err)
       }
     }
   }
@@ -552,6 +790,128 @@ authApp.get('/presence', async (c) => {
 // GET /auth/me → echo the current AuthContext (debug / dashboard bootstrap).
 authApp.get('/me', requireAuthMw(), (c) => {
   return c.json(c.get('auth'))
+})
+
+// ── web-session inventory (Delivery Sequence step 1) ────────────────────────
+// "The web-session page has current-session logout and sign-out-all-devices
+// controls" + "The owner has an Active Elevations page... The web-session
+// page has current-session logout and sign-out-all-devices controls." (design
+// doc, User Experience). Elevations themselves are a LATER step; this is the
+// session inventory + revoke primitives they will sit alongside.
+
+// GET /auth/sessions → list every web session for the caller's OWN member.
+//
+// Deliberately scoped by webSessionMemberId, NOT memberId: memberId (and
+// capabilities) are gated to role === 'member' ONLY by the email→member
+// bridge above (never set for a legacy owner/admin login, to avoid ever
+// DEFINING auth.capabilities for them). registerWebSession has no such
+// restriction — an owner/admin login that resolves to a members row by email
+// IS registered — so this route (and the two below) must key off
+// webSessionMemberId or an owner's own sessions would be unlistable through
+// it, contradicting the design's "the owner has an Active Elevations page...
+// current-session logout and sign-out-all-devices controls".
+//
+// Empty (not an error) for a session that was never registered (documented
+// step-1 gap, see registerWebSession) — nothing to list yet.
+authApp.get('/sessions', requireAuthMw(), async (c) => {
+  const auth = c.get('auth')
+  if (!auth.webSessionMemberId) return c.json({ sessions: [] })
+  const rows = await listWebSessions(c.env, c.env.TENANT_SLUG, auth.webSessionMemberId)
+  return c.json({
+    sessions: rows.map((row) => ({
+      id: row.id_hash,
+      created_at: row.created_at,
+      last_seen_at: row.last_seen_at,
+      idle_expires_at: row.idle_expires_at,
+      absolute_expires_at: row.absolute_expires_at,
+      revoked_at: row.revoked_at,
+      revoke_reason: row.revoke_reason,
+      is_current: row.id_hash === auth.webSessionIdHash,
+      live: evaluateWebSession(row).ok,
+    })),
+  })
+})
+
+// POST /auth/sessions/:id/revoke → revoke exactly one of the caller's OWN
+// sessions. Ownership-scoped in revokeWebSession itself (tenant +
+// webSessionMemberId + id_hash, all server-derived except the target
+// id_hash) — a caller can never revoke a session that resolves to a
+// different member's rows, regardless of what id it names.
+authApp.post('/sessions/:id/revoke', requireAuthMw(), async (c) => {
+  const auth = c.get('auth')
+  if (!auth.webSessionMemberId) return c.json({ error: 'forbidden' }, 403)
+  const idHash = c.req.param('id')
+  const { revoked } = await revokeWebSession(c.env, c.env.TENANT_SLUG, auth.webSessionMemberId, idHash, 'human_revoke')
+  return c.json({ revoked })
+})
+
+// POST /auth/sessions/revoke-all → "sign out all devices". Keeps the CURRENT
+// session alive by default (the common "sign out other devices" case); pass
+// ?include_current=1 for a full sign-out (the caller's own cookie stays set
+// client-side, but its D1 row — and therefore its listable/checkable
+// liveness — is dead the instant this returns).
+authApp.post('/sessions/revoke-all', requireAuthMw(), async (c) => {
+  const auth = c.get('auth')
+  if (!auth.webSessionMemberId) return c.json({ error: 'forbidden' }, 403)
+  const includeCurrent = new URL(c.req.url).searchParams.get('include_current') === '1'
+  const exceptIdHash = includeCurrent ? undefined : auth.webSessionIdHash ?? undefined
+  const { revokedCount } = await revokeAllWebSessions(
+    c.env,
+    c.env.TENANT_SLUG,
+    auth.webSessionMemberId,
+    'human_revoke_all',
+    exceptIdHash,
+  )
+  return c.json({ revoked_count: revokedCount })
+})
+
+// GET /auth/identities → every login identity for the caller's OWN member.
+// Same ownership scope as /auth/sessions: webSessionMemberId, never
+// cross-member. Empty (not an error) when the session never registered.
+authApp.get('/identities', requireAuthMw(), async (c) => {
+  const auth = c.get('auth')
+  if (!auth.webSessionMemberId) return c.json({ identities: [] })
+  const rows = await listLoginIdentities(c.env, c.env.TENANT_SLUG, auth.webSessionMemberId)
+  return c.json({
+    identities: rows.map((row) => ({
+      id: row.id,
+      provider: row.provider,
+      provider_subject: row.provider_subject,
+      verified_email: row.verified_email,
+      created_at: row.created_at,
+      revoked_at: row.revoked_at,
+      live: row.revoked_at === null,
+    })),
+  })
+})
+
+// POST /auth/identities/:id/revoke → revoke exactly one of the caller's OWN
+// identities. Ownership-scoped in revokeLoginIdentity (tenant +
+// webSessionMemberId + id). Also kills every live web_session bound to that
+// identity — otherwise the attacker keeps a cookie minted under the stolen
+// binding, and reauth would still succeed until hli.revoked_at is checked.
+authApp.post('/identities/:id/revoke', requireAuthMw(), async (c) => {
+  const auth = c.get('auth')
+  if (!auth.webSessionMemberId) return c.json({ error: 'forbidden' }, 403)
+  const identityId = c.req.param('id')
+  const { revoked, identity } = await revokeLoginIdentity(
+    c.env,
+    c.env.TENANT_SLUG,
+    auth.webSessionMemberId,
+    identityId,
+  )
+  let sessions_revoked = 0
+  if (revoked && identity) {
+    const killed = await revokeWebSessionsForLoginIdentity(
+      c.env,
+      c.env.TENANT_SLUG,
+      auth.webSessionMemberId,
+      identity.id,
+      'identity_revoked',
+    )
+    sessions_revoked = killed.revokedCount
+  }
+  return c.json({ revoked, sessions_revoked })
 })
 
 // ── user upsert (AuthZ side) ─────────────────────────────────────────────────
@@ -698,20 +1058,28 @@ async function loadAuthFromCookie(c: Context<AppEnv>): Promise<AuthContext | nul
   //  - fail-closed — no (or non-unique) match leaves memberId unset: identical to
   //    today's behaviour, never an over-grant. members.email is UNIQUE so LIMIT 1 is
   //    deterministic; the bridge is purely ADDITIVE (only grants scope, never removes).
-  if (auth.role === 'member' && auth.email && c.env.DB) {
-    // Case-insensitive email match (lower() both sides): email is case-insensitive
-    // in practice, but the session email (/callback stores it raw) and members.email
-    // (inserted as-provided, BINARY-collated UNIQUE) can differ in case — an operator
-    // invited as `Gavin@x` whom Google returns as `gavin@x` would otherwise silently
-    // resolve to no member. Still fail-closed (only ever under-grants).
-    const member = await c.env.DB.prepare(
-      "SELECT id FROM members WHERE lower(email) = lower(?1) AND tenant = ?2 AND status = 'active' LIMIT 1",
-    )
-      .bind(auth.email, c.env.TENANT_SLUG)
-      .first<{ id: string }>()
-    if (member) {
-      auth.memberId = member.id
-      auth.capabilities = await resolveCapabilities(c.env, member.id)
+  if (record.webSessionRegistered && c.env.DB) {
+    const webSession = await loadWebSession(c.env, c.env.TENANT_SLUG, sessionId)
+    if (webSession.ok) {
+      auth.webSessionIdHash = webSession.session.id_hash
+      auth.webSessionMemberId = webSession.session.member_id
+      await touchWebSession(c.env, webSession.session.id_hash)
+    } else if (webSession.reason !== 'not_found') {
+      await c.env.SESSIONS.delete(sessionKey(sessionId))
+      return null
+    }
+  }
+
+  if (auth.role === 'member' && c.env.DB) {
+    const memberId =
+      auth.webSessionMemberId ??
+      (await resolveHumanMemberId(c.env, {
+        tenant: c.env.TENANT_SLUG,
+        email: auth.email,
+      }))
+    if (memberId) {
+      auth.memberId = memberId
+      auth.capabilities = await resolveCapabilities(c.env, memberId)
       auth.channel = 'dashboard'
     }
   }

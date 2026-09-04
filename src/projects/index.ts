@@ -174,6 +174,23 @@ function edgePredicate(access: ProjectReadAccess): { sql: string; binds: string[
   }
 }
 
+/**
+ * The visibility-scoped read, for callers outside this module (mupot#1305).
+ *
+ * `/preview/:project_id` used the UNSCOPED `getProject` and so dispatched into a project
+ * Worker for any authenticated principal, including one for whom `GET /api/projects/:id`
+ * answers 404. Authentication is not authorization, and the authority already existed
+ * here — this is the same read the project's own API route and dashboard page use, so a
+ * preview can no longer be more permissive than the page that embeds it.
+ */
+export async function readableProjectForAuth(
+  env: Env,
+  id: string,
+  auth: AuthContext,
+): Promise<Project | null> {
+  return readableProject(env, id, await projectReadAccess(env, auth))
+}
+
 async function readableProject(
   env: Env,
   id: string,

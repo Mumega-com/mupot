@@ -26,14 +26,29 @@ function makeHarness(): SqliteD1Harness {
   return harness
 }
 
+// /preview/:project_id requires an authenticated session as of mupot#1305, so these
+// dispatch-behaviour tests must carry one. They exercise what happens AFTER the gate;
+// the gate itself is covered by tests/platform-preview-auth.test.ts, including the
+// unauthenticated-refusal cases this helper deliberately does not produce.
+const TEST_SESSION = JSON.stringify({
+  userId: 'u1',
+  email: 'owner@pot.test',
+  role: 'owner',
+  createdAt: '2026-09-04T00:00:00.000Z',
+})
+
+/** Requests to a gated route need the cookie as well as a resolving SESSIONS store. */
+const AUTHED = { cookie: 'mupot_session=test-session-id' }
+
 function envFor(harness: SqliteD1Harness, extra: Partial<Env> = {}): Env {
   return {
     DB: harness.db,
     TENANT_SLUG: 'mumega',
     BRAND: 'Mupot',
     RELEASE_SHA: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    SESSIONS: { get: async () => TEST_SESSION },
     ...extra,
-  } as Env
+  } as unknown as Env
 }
 
 function mockDispatcher(fetchImpl?: (request: Request) => Promise<Response> | Response) {
@@ -109,7 +124,7 @@ describe('platform dispatch fetch', () => {
     const env = envFor(harness, { DISPATCHER: dispatcher })
 
     const response = await platformApp.fetch(
-      new Request(`https://mupot.mumega.com/preview/${created.value.id}/dashboard`),
+      new Request(`https://mupot.mumega.com/preview/${created.value.id}/dashboard`, { headers: AUTHED }),
       env,
     )
     expect(response.status).toBe(200)
@@ -154,7 +169,7 @@ describe('platform dispatch fetch', () => {
     const dispatcher = mockDispatcher()
     const env = envFor(harness, { DISPATCHER: dispatcher })
     const response = await platformApp.fetch(
-      new Request(`https://mupot.mumega.com/preview/${created.value.id}/`),
+      new Request(`https://mupot.mumega.com/preview/${created.value.id}/`, { headers: AUTHED }),
       env,
     )
     expect(response.status).toBe(200)
@@ -174,6 +189,10 @@ describe('platform dispatch fetch', () => {
     expect(created.ok).toBe(true)
     if (!created.ok) return
 
+    // NO cookie here, deliberately: this calls handlePlatformDispatch DIRECTLY, below the
+    // route middleware, so a cookie would be inert decoration that reads to a maintainer
+    // as gate coverage (mupot#1307 gate, F5). The gate itself is proven in
+    // tests/platform-preview-auth.test.ts, which goes through platformApp.fetch.
     const response = await handlePlatformDispatch(
       new Request(`https://mupot.mumega.com/preview/${created.value.id}/`),
       envFor(harness),
@@ -202,7 +221,7 @@ describe('platform dispatch fetch', () => {
       },
     })
     const response = await platformApp.fetch(
-      new Request(`https://mupot.mumega.com/preview/${created.value.id}/`),
+      new Request(`https://mupot.mumega.com/preview/${created.value.id}/`, { headers: AUTHED }),
       env,
     )
     expect(response.status).toBe(200)
@@ -213,7 +232,7 @@ describe('platform dispatch fetch', () => {
   it('returns 404 JSON for an unknown /preview/:project_id', async () => {
     harness = makeHarness()
     const response = await platformApp.fetch(
-      new Request('https://mupot.mumega.com/preview/missing/'),
+      new Request('https://mupot.mumega.com/preview/missing/', { headers: AUTHED }),
       envFor(harness),
     )
     expect(response.status).toBe(404)

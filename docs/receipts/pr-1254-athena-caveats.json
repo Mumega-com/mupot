@@ -1,0 +1,116 @@
+{
+  "schema": "PR-1254-ATHENA-CAVEATS-BUILD",
+  "version": 1,
+  "verdict": "BUILT-NOT-GATED",
+  "built_at": "2026-09-01T02:25:00Z",
+  "supersedes_residual_in": "docs/receipts/pr-1254-enroll-seat-key.json",
+  "author": {
+    "slug": "hadi-grok-desktop",
+    "uuid": "fb18400b-4908-42f4-90dd-a3f5ad7d0654",
+    "squad_id": "3674d955-067f-4821-86a0-c2fa03e30ff9",
+    "seat": "cursor-cloud-river",
+    "harness": "cursor-cloud",
+    "machine": "cursor-cloud-vm",
+    "model": "claude-opus-5-thinking",
+    "provider": "anthropic"
+  },
+  "durable_state": {
+    "pull_request": "https://github.com/Mumega-com/mupot/pull/1254",
+    "athena_adversarial_pass": "inbox seq 3302 (relayed by Loom); cross-system ruling seq 3307",
+    "kasra_ack": "inbox seq 3292",
+    "receipts_reported_to_athena": "seq 3315",
+    "receipts_reported_to_kasra": "seq 3316"
+  },
+  "bindings": {
+    "branch": "cursor/flight-river-lead-agent-onboarding-warm-cache-35a3",
+    "head": "a178c40",
+    "prior_head": "d7c9e66",
+    "commits_this_tick": [
+      "47a75b0 feat(enroll): record who coined each seat key, and throttle the mint",
+      "a178c40 fix(tests): revive the routine scheduler tests, dead since they were written"
+    ],
+    "migrations_added": ["0139_agent_token_issuance_audit.sql"],
+    "migration_number_check": "chain head was 0138; 0139 is above the 0079 production applied head, per the house rule in AGENTS.md"
+  },
+  "athena_caveats": {
+    "audit": {
+      "status": "done",
+      "how": "migration 0139 agent_token_issuance_audit; optional issuedBy threaded through the SHARED mintAgentBoundToken helper, never a second write path",
+      "atomicity": "the audit INSERT joins the SAME D1 batch as the token INSERT, so a live credential cannot exist without its attribution",
+      "rotation_excluded": "agent_token_rotation_handoffs.minted_by_member_id (0134) already carries the actor for that ceremony, so nothing is lost — passing issuedBy on a rotation is redundant, not dropped",
+      "no_secret_material": "token_hash and raw are never written; asserted by test",
+      "no_foreign_keys": "deliberate, same reasoning agent_audit gives in #857 — a cascade erases the record exactly during revocation or an incident"
+    },
+    "rate_limit": {
+      "status": "done",
+      "how": "per-member KV counter, same shape as checkBootstrapSelfRateLimit, keyed on member because an IP-keyed limiter is bypassed by rotating IPs",
+      "ceiling": "10/hour, not bootstrap's 5, because this page exists to enrol several seats in one sitting and 5 would refuse a legitimate first setup",
+      "refused_attempts_burn_budget": true,
+      "fails_open_on_kv_error": true,
+      "framing": "a brake on a runaway loop, NOT an authorization boundary; CSRF and squad-admin authz are what stop an attacker and neither fails open"
+    },
+    "csrf": {
+      "status": "believed already covered, independent falsification in flight",
+      "basis": "dashboardApp.use('*', csrf()) registered before the route; hono/csrf is an Origin check needing no hidden token field",
+      "why_no_second_mechanism": "a redundant second gate on a surface already covered, against Athena's own 'never a second write path' principle",
+      "verification_method": "an independent worker was tasked with FALSIFYING the claim, including asserting that a cross-origin POST mints nothing as a side effect — a 403 after minting would be worthless"
+    },
+    "squad_vs_org_admin_delta": {
+      "status": "documented as a decision on authorizeEnrollMint",
+      "content": "three doors mint the same artifact and disagree: mint_agent_token and /enroll gate on squad admin, /admin/agent-token on org admin. This route matches the MCP primitive deliberately, because the squad admin who reaches it can already mint via the tool — raising this route alone closes no hole and only teaches people to use the surface you cannot see. Recorded that if org admin IS the policy, the fix is to raise the primitive."
+    }
+  },
+  "independently_verified_this_tick": {
+    "typecheck": true,
+    "full_suite": "6918 passed / 6 failed (452 files, 190.39s)",
+    "baseline_method": "detached origin/main worktree with node_modules symlinked; every failing file re-run there",
+    "all_six_failures_reproduce_on_clean_main": true,
+    "regressions_introduced": 0,
+    "net_versus_main": "+2 green (the two scheduler tests this branch revives)",
+    "audit_row_actor_surface_seat_token_id_asserted": true,
+    "audit_absent_when_mint_refused_asserted": true,
+    "audit_absent_when_issuer_not_declared_asserted": true,
+    "throttle_429_with_retry_after_and_no_further_mint_asserted": true,
+    "throttle_is_per_member_asserted": "second human still mints 200, not merely 'not 429'",
+    "throttle_burns_budget_on_refused_attempt_asserted": true,
+    "throttle_fails_open_on_kv_error_asserted": true
+  },
+  "defect_found_and_fixed_pre_existing": {
+    "what": "both tests in tests/agent-routines-scheduler.test.ts threw in beforeEach and had NEVER reached the scheduler",
+    "root_cause": "the fixtures are prepared against node:sqlite directly (harness.sqlite), not the D1 shim, and node:sqlite's positional run() rejects NUMBERED placeholders — '?1' throws 'column index out of range' where '?' binds",
+    "why_it_matters": "the file was RED, not skipped, so nothing lied in the summary — but red-because-the-fixture-throws is indistinguishable at a glance from red-because-the-code-is-broken. The autonomous routine loop had zero live coverage while appearing to merely have a failing test.",
+    "outcome": "fixtures fixed; both tests pass UNMODIFIED, so the scheduler's atomic task/run creation and occurrence-key skip are correct. No production change.",
+    "blast_radius_scanned": "four other test files match the same shape and all pass, so this was the only dead fixture of this kind",
+    "closes_residual": "the prior receipt listed these two failures as 'untouched and unexplained'"
+  },
+  "loop_reachability_finding": {
+    "claim": "Athena can likely reach River directly by passing project_id eaf4fb0e-b4f6-4f28-aae6-c06c67ae7afa on send, with no code change and no new grant",
+    "mechanism": "sendToRef #392 confinement case (b): when projectId is present it defers to validateMessageProjectAccess, which requires only that both parties sit on a squad with project_squad_access to that project",
+    "live_data_checked": [
+      "project eaf4fb0e status active (archived would refuse)",
+      "project_squad_access grants squad-core WRITE and 3674d955 READ; the predicate has no access_level filter, so read suffices for the recipient",
+      "memberships: athena in squad-core, hadi-grok-desktop in 3674d955 — the predicate joins memberships, not the agent home squad_id column"
+    ],
+    "corroboration": "Kasra reaches River with no relay (ack seq 3292 arrived direct) because he IS a member of 3674d955 and satisfies case (a). Athena is not, so she falls to case (b), which the gate flow never supplied a project_id for. The asymmetry is predicted by the model.",
+    "NOT_PROVEN": "this is a read of code plus live rows, not an executed test. River cannot send as Athena. Athena must run the experiment; sent as seq 3320.",
+    "why_it_matters": "a gate that cannot reach the builder it is gating cannot close a cycle without a human in the path — a cut edge in the orchestration graph, and a direct cause of the stagnation Hadi reports. The reachability graph already exists in project_squad_access; the gate flow was not traversing it."
+  },
+  "judgement_calls_needing_a_second_lens": [
+    "Put the audit INSERT inside the SHARED prepare rather than the route. Better atomicity and one write path, but it touches a helper used by bootstrap_self, provision_agent_connection and mint_agent_token. It is a no-op unless issuedBy is passed and only /enroll passes it today — but widening that helper is a gate-level call, not mine.",
+    "The throttle FAILS OPEN on KV unavailability, following the sibling limiters. On a credential-minting surface that deserves a second opinion; asked both Kasra and Athena explicitly.",
+    "Did NOT add a second CSRF mechanism, on the judgement that the existing Origin check already covers the route. If the independent falsification disproves me, this is wrong and the caveat is unmet — that result will be reported before asking Kasra to close the gate.",
+    "Left the scheduler fix in #1254 rather than opening a separate branch, because standing instruction is not to leave this branch without being told. It is unrelated to enroll and arguably muddies a single-purpose PR; offered both gates the option to split it."
+  ],
+  "residuals_not_this_block": [
+    "No deploy. No live-pot exercise of GET /enroll or POST /enroll/mint. Route-level vitest coverage only.",
+    "No browser walkthrough of the rendered page; HTML asserted by string, not by a real render.",
+    "The CSRF caveat is not closed until the independent falsification reports.",
+    "Athena's direct-reach experiment is unrun; the loop-reachability finding is a prediction, not a receipt.",
+    "Athena's cross-system safe subset (mark unattested shadows non-canonical, refuse mint on them, add the attestation schema) is NOT started, per her sequencing ruling."
+  ],
+  "merge_authorized": false,
+  "migration_authorized": false,
+  "deploy_authorized": false,
+  "autonomy_claim": false,
+  "gate_required": "Kasra gates the exact head a178c40; Athena's adversarial pass cleared the bar with the four caveats above. CI green is not product green."
+}
