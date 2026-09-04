@@ -177,9 +177,26 @@ export async function resolveSoleGateOwnerAgent(env: Env, gateOwner: string): Pr
 // (mupot#1080/#1081 post-mortem: "read/write predicate drift is the root
 // cause, not either implementation").
 //
-// agents.status CHECK is ('active','paused'); members.status CHECK is
+// agents.status CHECK is ('active','paused','inactive') — CORRECTED
+// (mupot#1319 gate WARN-1: this previously said ('active','paused'),
+// stale since migrations/0049_agent_status_inactive.sql widened the enum to
+// add 'inactive' for a dead/retired identity, distinct from 'paused' — a
+// temporary rest. The CODE was always correct regardless: `a.status =
+// 'active'` fails closed on ANY non-active value, 'paused' and 'inactive'
+// alike; only this comment's enumeration was wrong). members.status CHECK is
 // ('active','suspended') — two different vocabularies, so this cannot be one
 // shared column name across a UNION; principalType selects the join target.
+//
+// OPERATOR-VISIBLE BEHAVIOUR CHANGE (this IS #1080's intended fix, not a
+// side effect, but nothing warns at the toggle site that revokes it):
+// PAUSING an agent — a trivially reversible dashboard toggle, and 0049
+// documents 'paused' as temporary rest, not retirement — now SILENTLY
+// revokes that agent's gate-verdict authority for as long as it stays
+// paused, even though its gate_grants row is untouched. Before this fix a
+// paused agent's stale grant still worked; that was #1080's whole finding.
+// An operator pausing an agent for an unrelated reason (cost, a bug, a
+// vacation) may not expect that click to ALSO strip its verdict authority —
+// it does, immediately and reversibly (resume by un-pausing).
 export async function hasActiveGateGrant(
   env: Env,
   capability: string,

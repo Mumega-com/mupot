@@ -160,6 +160,7 @@ import {
 } from './ui'
 import type { Html } from './ui'
 import type { ApprovalItem, PublishableItem } from './approvals'
+import { APPROVALS_QUEUE_LIMIT } from './approvals'
 import { loadObservatory, agentGradient } from './observatory'
 import { kanbanApp, loadKanbanData, kanbanBoardBody } from './kanban-routes'
 // Flight-008 Slice 3 (#1062): the /send dispatch-now picker's reachability signal.
@@ -5817,6 +5818,14 @@ function approvalsBody(
   // scope its querySelectorAll without touching #obs-queue on the home page.
   const cards = items.map((t) => approvalCardHtml(t)).join('')
   const n = items.length
+  // mupot#1319 gate BLOCK-1: loadApprovals is now bounded at
+  // APPROVALS_QUEUE_LIMIT rows (src/dashboard/approvals.ts) to cap the D1
+  // fan-out decorateApprovals does per row. Hitting the limit exactly is the
+  // signal there may be more waiting past it (oldest-first, so the ones
+  // shown are the longest-waiting) — say so rather than show a bare count
+  // that reads as complete when it is not.
+  const truncated = n === APPROVALS_QUEUE_LIMIT
+  const badgeText = truncated ? `${String(n)}+ awaiting your gate (showing the oldest ${String(n)})` : `${String(n)} awaiting your gate`
 
   // "Ready to publish" (flight-1 gap fix): tasks already past the gate
   // (status='approved', gate:content) with no operator control to fire the real
@@ -5843,7 +5852,7 @@ function approvalsBody(
       crumbs: 'Overview / The Gate',
       title: 'The Gate',
       sub: 'Agents propose work; you authorize it. This is the only place human authority enters the loop — untrusted input can wake an agent, never steer it.',
-      badge: n ? `${String(n)} awaiting your gate` : 'Gate clear',
+      badge: n ? badgeText : 'Gate clear',
       badgeTone: n ? 'warn' : 'ok',
     })}
     ${n ? raw(`<div id="approvals-list">${cards}</div>`) : html`<div class="card"><p class="empty">Nothing waiting at your gates. Gated work lands here when an agent finishes it.</p></div>`}

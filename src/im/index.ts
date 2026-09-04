@@ -565,17 +565,48 @@ async function verdictReply(
   // through a member-type grant instead of the original agent-type one.
   // Routing through evaluateVerdictGates closes it: a member principal's id
   // can never equal an agent assignee_agent_id, so gate:agent-self-completion
-  // is only ever passable here via the legacyOwnerAdmin escape — matching
-  // the HTTP/MCP behaviour exactly, and correct by construction (a human via
-  // IM can never BE "the completing agent").
+  // is only ever passable here via the legacyOwnerAdmin escape (correct by
+  // construction — a human via IM can never BE "the completing agent").
+  //
+  // CORRECTED (mupot#1319 gate BLOCK-2, River's adversarial pass — the
+  // previous wording here claimed this "matches the HTTP/MCP behaviour
+  // exactly." That is FALSE on precisely the gate BLOCK-1 was written to
+  // close, and a load-bearing security comment must not assert a parity
+  // that does not hold):
   //
   // The synthetic AuthContext below maps IM's own authority model onto the
-  // shape evaluateVerdictGates expects: `role` is derived from the SAME
+  // shape evaluateVerdictGates expects. `role` is derived from the SAME
   // hasCapability(grants,'org',null,'admin') check canBypassApprovalGate
-  // already used (so legacyOwnerAdmin — role-only — still recognizes a
-  // capability-based org admin, exactly as canBypassApprovalGate did);
-  // `boundAgentId` is always null (IM never authenticates as an agent
-  // principal, only as the human member behind the chat).
+  // already used — so legacyOwnerAdmin (role-only, tasks/index.ts) DOES
+  // recognize a capability-based org admin HERE, on IM, when it does NOT on
+  // the other two write surfaces:
+  //   - MCP: authenticateMember (src/mcp/index.ts) hardcodes role:'member'
+  //     unconditionally — a capability-based org admin's AuthContext never
+  //     carries role:'owner'/'admin' at all.
+  //   - HTTP: the cookie bridge (loadAuthFromCookie, src/auth/index.ts)
+  //     only attaches memberId+capabilities when role==='member' already —
+  //     a session that resolved role:'owner'/'admin' never synthesizes a
+  //     capability-derived role either; it already HAD the legacy role.
+  // So a member holding ONLY an org-scope admin CAPABILITY row (no legacy
+  // role, no gate_grants row at all) passes gate:agent-self-completion for
+  // an agent they do not own via IM, and is refused (no_gate_capability) via
+  // MCP and HTTP for the identical principal and task — verified directly
+  // against the gate, not inferred. This is a genuine, IM-ONLY authority
+  // divergence, not a bug this PR introduces (IM never modeled
+  // gate:agent-self-completion's owner/admin escape at all before this fix,
+  // so there was no parity to break) — but this refactor is what makes it
+  // reachable in the first place, and asserting false parity in the comment
+  // that explains it is a defect in its own right: a future reader reasoning
+  // from "matches HTTP/MCP exactly" would trust a guarantee that is not
+  // there. DO NOT change IM's authority model to close this gap in this PR —
+  // making the synthesized role carry the capability plane (or dropping the
+  // synthesis) is itself a behaviour change to IM's admin authority and
+  // needs its own gate; it is filed as a follow-up to #1080/#1081, not
+  // fixed here. `boundAgentId` is always null (IM never authenticates as an
+  // agent principal, only as the human member behind the chat).
+  //
+  // See tests/im-verdict-gates.test.ts "IM-only escape (not parity)" for the
+  // receipt this comment describes.
   const auth: AuthContext = {
     userId: member.id,
     email: member.email,

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { loadApprovals, loadPublishable, resultPreview } from '../src/dashboard/approvals'
+import { loadApprovals, loadPublishable, resultPreview, APPROVALS_QUEUE_LIMIT } from '../src/dashboard/approvals'
 import { CONTENT_GATE_OWNER } from '../src/agents/execute'
 import type { Env, AuthContext } from '../src/types'
 
@@ -72,13 +72,15 @@ describe('loadApprovals', () => {
     expect(out).toHaveLength(1)
     expect(calls[0].sql).toContain('gate_grants')
     expect(calls[0].sql).toContain('t.gate_owner IS NOT NULL')
-    expect(calls[0].binds).toEqual(['member', 'm-9'])
+    // mupot#1319 gate BLOCK-1: BASE_SELECT is now bounded (LIMIT ?3 ->
+    // APPROVALS_QUEUE_LIMIT) — the 3rd bind is the cap, not a principal.
+    expect(calls[0].binds).toEqual(['member', 'm-9', APPROVALS_QUEUE_LIMIT])
   })
 
   it('agent token (no memberId) checks agent principal via userId', async () => {
     const { env, calls } = makeEnv([])
     await loadApprovals(env, auth({ role: 'member', memberId: undefined, userId: 'agent-7' }))
-    expect(calls[0].binds).toEqual(['agent', 'agent-7'])
+    expect(calls[0].binds).toEqual(['agent', 'agent-7', APPROVALS_QUEUE_LIMIT])
   })
 
   it('no principal id → empty list, no query', async () => {

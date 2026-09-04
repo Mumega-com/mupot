@@ -27,7 +27,7 @@
 
 import type { Env, Task, AuthContext } from '../types'
 import { CONTENT_GATE_OWNER } from '../agents/execute'
-import { canActOnSquad, evaluateVerdictGates } from '../tasks/index'
+import { canActOnSquad, evaluateVerdictGates, createVerdictGateCache } from '../tasks/index'
 
 export interface ApprovalItem {
   id: string
@@ -95,6 +95,23 @@ function isOwnerAdmin(auth: AuthContext): boolean {
 // the state machine forbids review→open/in_progress — so surfacing it with an
 // Approve button just hands the operator a 409. Filter it out at the source
 // (both the owner/admin path and the gate-grant path inherit this).
+//
+// mupot#1319 gate BLOCK-1: BOUNDED at APPROVALS_QUEUE_LIMIT rows. Before this
+// fix there was no LIMIT at all, and decorateApprovals fans out up to 4 D1
+// calls per row (measured 4.00/row on a gate:loops-heavy fixture) through an
+// unbounded Promise.all — an operator with ~250 pending rows was issuing
+// ~1000 D1 calls rendering ONE page load. The queue is oldest-first
+// (ORDER BY t.created_at ASC below), so a truncated result is the OLDEST
+// APPROVALS_QUEUE_LIMIT waiting rows — the ones that have waited longest,
+// not an arbitrary slice. Past the limit: loadApprovals silently returns
+// only the first APPROVALS_QUEUE_LIMIT rows; the dashboard (approvalsBody,
+// src/dashboard/index.ts) detects the exact-limit case and renders a
+// "showing the oldest N" note rather than a bare, misleadingly-precise count
+// — a truncated queue that says so beats a queue that falls over. There is
+// no pagination past this cap yet; the newest rows past the limit will
+// simply not render until older ones clear.
+export const APPROVALS_QUEUE_LIMIT = 200
+
 const BASE_SELECT = `
   SELECT t.id, t.squad_id, s.name AS squad_name, t.title, t.body, t.gate_owner,
          t.assignee_agent_id, a.name AS agent_name, t.result, t.completed_at,
@@ -128,17 +145,25 @@ const PUBLISHABLE_SELECT = `
 // grant for a squad they are no longer a member of). Every row here already
 // has a non-null gate_owner (BASE_SELECT's WHERE clause), so the narrowing
 // is safe without a runtime guard.
+// mupot#1319 gate BLOCK-1: deptCache and gateCache are created ONCE per
+// loadApprovals() call and threaded through every row (and, for gateCache,
+// both verdicts of every row) — see canActOnSquad's and evaluateVerdictGates'
+// own doc comments for exactly what each memoizes and why it is safe (both
+// are scoped to this one function call, discarded after, never shared across
+// requests or callers).
 async function decorateApprovals(env: Env, auth: AuthContext, rows: ApprovalRow[]): Promise<ApprovalItem[]> {
+  const deptCache = new Map<string, Promise<string | null>>()
+  const gateCache = createVerdictGateCache()
   return Promise.all(
     rows.map(async (row) => {
       const gateOwner = row.gate_owner
-      if (!gateOwner || !(await canActOnSquad(env, auth, row.squad_id))) {
+      if (!gateOwner || !(await canActOnSquad(env, auth, row.squad_id, 'member', deptCache))) {
         return { ...row, can_verdict: false, can_approve: false, can_reject: false }
       }
       const task = { squad_id: row.squad_id, gate_owner: gateOwner, assignee_agent_id: row.assignee_agent_id }
       const [approveResult, rejectResult] = await Promise.all([
-        evaluateVerdictGates(env, auth, task, 'approved'),
-        evaluateVerdictGates(env, auth, task, 'rejected'),
+        evaluateVerdictGates(env, auth, task, 'approved', gateCache),
+        evaluateVerdictGates(env, auth, task, 'rejected', gateCache),
       ])
       const can_approve = approveResult.allowed
       const can_reject = rejectResult.allowed
@@ -149,7 +174,9 @@ async function decorateApprovals(env: Env, auth: AuthContext, rows: ApprovalRow[
 
 export async function loadApprovals(env: Env, auth: AuthContext): Promise<ApprovalItem[]> {
   if (isOwnerAdmin(auth)) {
-    const rs = await env.DB.prepare(`${BASE_SELECT} ORDER BY t.created_at ASC`).all<ApprovalRow>()
+    const rs = await env.DB.prepare(`${BASE_SELECT} ORDER BY t.created_at ASC LIMIT ?1`)
+      .bind(APPROVALS_QUEUE_LIMIT)
+      .all<ApprovalRow>()
     return decorateApprovals(env, auth, rs.results ?? [])
   }
 
@@ -184,9 +211,9 @@ export async function loadApprovals(env: Env, auth: AuthContext): Promise<Approv
             AND g.principal_type = ?1
             AND g.principal_id   = ?2
        )
-     ORDER BY t.created_at ASC`,
+     ORDER BY t.created_at ASC LIMIT ?3`,
   )
-    .bind(principalType, principalId)
+    .bind(principalType, principalId, APPROVALS_QUEUE_LIMIT)
     .all<ApprovalRow>()
   return decorateApprovals(env, auth, rs.results ?? [])
 }

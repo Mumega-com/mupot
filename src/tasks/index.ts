@@ -117,16 +117,45 @@ async function squadDepartment(env: Env, squadId: string): Promise<string | null
 // real 'member'-vs-'admin' distinction requires) cannot currently be driven
 // through tasksApp.fetch in a test harness; testing the primitive itself keeps
 // the #406 admin-floor coverage real rather than skipped.
+// mupot#1319 gate BLOCK-1: `deptCache` is an OPTIONAL, caller-supplied memo
+// for squadDepartment's `SELECT department_id FROM squads` — squad_id ->
+// department_id never changes within one request, but decorateApprovals
+// (src/dashboard/approvals.ts) calls this once per queue row, and a gate
+// queue is typically a handful of squads holding many rows each, so an
+// unmemoized lookup re-queries the SAME squad N times. Omitted (undefined)
+// by every other existing call site, so behavior and cost there is
+// unchanged — caching only activates when a caller opts in.
 export async function canActOnSquad(
   env: Env,
   auth: AuthContext,
   squadId: string,
   min: Capability = 'member',
+  deptCache?: Map<string, Promise<string | null>>,
 ): Promise<boolean> {
   if (legacyOwnerAdmin(auth)) return true
   if (!auth.memberId) return false
   const grants = auth.capabilities ?? (await resolveCapabilities(env, auth.memberId))
-  const deptId = await squadDepartment(env, squadId)
+  // The cache stores the PROMISE, not the resolved value. decorateApprovals
+  // (src/dashboard/approvals.ts) drives every row through Promise.all
+  // CONCURRENTLY, so all rows for the same squad reach this line in the same
+  // synchronous tick, before any of them has awaited far enough to write a
+  // resolved value back — caching only the value would have every one of
+  // them race past an empty cache and issue its own query (a cache
+  // stampede; caught by tests/dashboard-approvals-query-cost.test.ts, which
+  // failed against exactly that version of this fix). Caching the promise
+  // itself means the FIRST row to reach a given squadId synchronously claims
+  // the map slot before its own `await`, so every concurrent sibling for
+  // that squadId finds the in-flight promise already there and awaits the
+  // SAME one — one real query serves the whole concurrent batch.
+  let deptPromise: Promise<string | null>
+  const cached = deptCache?.get(squadId)
+  if (cached) {
+    deptPromise = cached
+  } else {
+    deptPromise = squadDepartment(env, squadId)
+    if (deptCache) deptCache.set(squadId, deptPromise)
+  }
+  const deptId = await deptPromise
   return hasCapability(grants, 'squad', squadId, min, deptId)
 }
 
@@ -1280,11 +1309,62 @@ export type VerdictGateResult =
   | { allowed: true; principal: ReturnType<typeof verdictPrincipal> }
   | { allowed: false; code: VerdictGateDenialCode; principal: ReturnType<typeof verdictPrincipal> }
 
+// mupot#1319 gate BLOCK-1 (River, adversarial pass): decorateApprovals
+// (src/dashboard/approvals.ts) calls evaluateVerdictGates TWICE per row — once
+// per verdict, because a boolean cannot express the gate:loops surface cap
+// (approve is gated, reject is not) — so a caller must ask the predicate
+// "would approve succeed" and "would reject succeed" separately. That
+// approve/reject split is correct and stays. What is NOT correct is that the
+// gate-ownership check (callerHoldsGateCapability -> hasActiveGateGrant, a
+// real D1 join) is verdict-INDEPENDENT by construction — it does not read
+// `verdict` at all — so calling it twice per row for a byte-identical answer
+// is pure waste, and BASE_SELECT has no LIMIT: measured, 40 rows produced 161
+// D1 calls (4.00/row) with an unbounded Promise.all fan-out. An operator with
+// ~250 pending gate:loops rows was issuing ~1000 D1 calls rendering ONE page.
+//
+// VerdictGateCache is the fix: an OPTIONAL, caller-supplied memo, scoped to
+// one request (decorateApprovals creates exactly one via
+// createVerdictGateCache() and reuses it across every row + both verdicts).
+// Every existing single-call caller (the HTTP route, MCP task_verdict, IM
+// verdictReply) omits it — cache is undefined there, so behavior and cost for
+// those call sites is BYTE-IDENTICAL to before this fix; caching only ever
+// activates when a caller explicitly opts in by passing one.
+//
+// Keys are the identity actually being checked, NOT anything from `task`
+// beyond gate_owner: callerHoldsGateCapability's squadId parameter is already
+// unused (`_squadId`) — the gate-ownership answer only depends on
+// (principal, gate_owner) — so the cache also amortizes across DIFFERENT rows
+// that share a gate_owner + caller, not just the approve/reject pair of one
+// row. hasSurfaceCap resolves ITS OWN principal internally (auth.memberId ??
+// auth.userId, member-first — the KNOWN DIVERGENCE from verdictPrincipal
+// documented above) — the surface-cap cache key mirrors that SAME expression
+// so the memo never claims an answer for a principal hasSurfaceCap would not
+// actually have checked; it does not resolve or touch the divergence itself.
+export interface VerdictGateCache {
+  // Values are the PROMISE, not the resolved boolean — decorateApprovals
+  // drives concurrent rows through Promise.all, so a value-only cache races:
+  // every row for the same key would reach an empty cache in the same
+  // synchronous tick before any of them awaits far enough to populate it,
+  // and each would fire its own D1 query anyway (a cache stampede — caught
+  // live by tests/dashboard-approvals-query-cost.test.ts, which failed
+  // against exactly that version of this cache). Caching the in-flight
+  // promise means the first caller for a key claims the slot synchronously,
+  // before its own `await`, so every concurrent sibling finds it already
+  // there and awaits the SAME promise.
+  readonly gateCapability: Map<string, Promise<boolean>>
+  readonly surfaceCapability: Map<string, Promise<boolean>>
+}
+
+export function createVerdictGateCache(): VerdictGateCache {
+  return { gateCapability: new Map(), surfaceCapability: new Map() }
+}
+
 export async function evaluateVerdictGates(
   env: Env,
   auth: AuthContext,
   task: VerdictGateTask,
   verdict: 'approved' | 'rejected',
+  cache?: VerdictGateCache,
 ): Promise<VerdictGateResult> {
   const principal = verdictPrincipal(auth)
   const isSelfCompletionGate = task.gate_owner === 'gate:agent-self-completion'
@@ -1297,8 +1377,19 @@ export async function evaluateVerdictGates(
     if (principal.id !== task.assignee_agent_id && !legacyOwnerAdmin(auth)) {
       return { allowed: false, code: 'no_gate_capability', principal }
     }
-  } else if (!(await callerHoldsGateCapability(env, auth, task.squad_id, task.gate_owner))) {
-    return { allowed: false, code: 'no_gate_capability', principal }
+  } else {
+    const gateCacheKey = cache ? `${principal.type}:${principal.id}:${task.gate_owner}` : null
+    let hasGatePromise: Promise<boolean>
+    const cachedGate = gateCacheKey !== null ? cache?.gateCapability.get(gateCacheKey) : undefined
+    if (cachedGate) {
+      hasGatePromise = cachedGate
+    } else {
+      hasGatePromise = callerHoldsGateCapability(env, auth, task.squad_id, task.gate_owner)
+      if (cache && gateCacheKey !== null) cache.gateCapability.set(gateCacheKey, hasGatePromise)
+    }
+    if (!(await hasGatePromise)) {
+      return { allowed: false, code: 'no_gate_capability', principal }
+    }
   }
 
   // Surface-cap gate (#106): approving a gate:loops task (outreach queue) requires
@@ -1317,7 +1408,16 @@ export async function evaluateVerdictGates(
   // separately, wide blast radius — hasSurfaceCap is called from far beyond
   // this route).
   if (task.gate_owner === 'gate:loops' && verdict === 'approved') {
-    if (!(await hasSurfaceCap(env, auth, 'outreach:send-gated'))) {
+    const surfaceCacheKey = cache ? `${auth.memberId ?? auth.userId ?? ''}:outreach:send-gated` : null
+    let hasSendPromise: Promise<boolean>
+    const cachedSend = surfaceCacheKey !== null ? cache?.surfaceCapability.get(surfaceCacheKey) : undefined
+    if (cachedSend) {
+      hasSendPromise = cachedSend
+    } else {
+      hasSendPromise = hasSurfaceCap(env, auth, 'outreach:send-gated')
+      if (cache && surfaceCacheKey !== null) cache.surfaceCapability.set(surfaceCacheKey, hasSendPromise)
+    }
+    if (!(await hasSendPromise)) {
       return { allowed: false, code: 'missing_surface_cap', principal }
     }
   }

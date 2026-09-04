@@ -111,7 +111,24 @@ describe('IM verdictReply — gate:agent-self-completion closed on the third wri
     expect(taskVerdictCount(harness.sqlite, 'task-1')).toBe(0)
   })
 
-  it('positive control: org admin (capability-based) STILL overrides gate:agent-self-completion via IM — the legacy escape is preserved', async () => {
+  // mupot#1319 gate BLOCK-2 (River's adversarial pass): this documents an
+  // IM-ONLY authority divergence, NOT intended parity with HTTP/MCP — do
+  // NOT read this test as "the escape is correct and preserved across
+  // surfaces." It is not. See the CORRECTED comment at verdictReply's
+  // AuthContext construction (src/im/index.ts) for the full receipt: the
+  // synthesized `role: canBypassApprovalGate(grants) ? 'admin' : 'member'`
+  // makes legacyOwnerAdmin (role-only) recognize a capability-based org
+  // admin ONLY on IM — MCP's authenticateMember hardcodes role:'member'
+  // unconditionally, and the HTTP cookie bridge never synthesizes a role
+  // from capabilities either. The SAME principal (one org-scope admin
+  // capability row, zero gate_grants rows) is refused with
+  // no_gate_capability via MCP and HTTP for the identical task — this test
+  // only proves IM's own behaviour, and a future PR that aligns the three
+  // surfaces is expected to change this test's expectation, not defend it.
+  // Fixing the divergence itself is explicitly OUT of scope here (changing
+  // IM's authority model is its own gated change) — filed as a follow-up to
+  // #1080/#1081.
+  it('IM-only escape (NOT parity with HTTP/MCP): a capability-based org admin overrides gate:agent-self-completion via IM, where the identical principal is refused on the other two write paths', async () => {
     seedMember(harness.sqlite, 'admin-1', 'chat-2')
     seedOrgAdminCapability(harness.sqlite, 'admin-1')
     seedAgent(harness.sqlite, 'agent-other-2')
