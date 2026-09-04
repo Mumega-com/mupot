@@ -16,7 +16,16 @@ import {
   type DeviceGrantPublic,
 } from './device-grant'
 
-type AppEnv = { Bindings: Env }
+// Must match the AppEnv that peekSessionAuth (./index) is typed against — that one
+// declares Variables.auth, and this file previously declared only Bindings. Two different
+// types sharing the name AppEnv across two files is why `peekSessionAuth(c)` failed to
+// typecheck at every call site here: Context<AppEnv, "/", BlankInput> is not assignable to
+// Context<AppEnv, any, {}> when the two AppEnvs are structurally different.
+//
+// peekSessionAuth sets `auth` on the context, so declaring the variable is also the honest
+// shape rather than a cast that hides the mismatch. (Same defect and same fix as
+// src/platform/routes.ts in mupot#1307.)
+type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
 export const deviceApp = new Hono<AppEnv>()
 
