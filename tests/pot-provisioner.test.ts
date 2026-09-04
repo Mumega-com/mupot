@@ -10,7 +10,15 @@ import {
   DISPATCH_NAMESPACE,
 } from '../src/pots/service'
 import { toolPotProvision, toolPotList } from '../src/mcp/pots'
+import { invokeTool } from '../src/mcp/index'
 import type { Env, AuthContext } from '../src/types'
+
+const orgAdmin: AuthContext = {
+  memberId: 'admin-mem-id',
+  role: 'admin',
+  tenant: 'mumega',
+  capabilities: [{ scope_type: 'org', scope_id: 'mumega', capability: 'admin' }],
+}
 
 describe('Sovereign Pot Provisioner (Flight 2)', () => {
   beforeEach(() => {
@@ -291,6 +299,30 @@ describe('Sovereign Pot Provisioner (Flight 2)', () => {
       const data = outcome.result as { pot: { slug: string; d1_database_id: string } }
       expect(data.pot.slug).toBe('viamar')
       expect(data.pot.d1_database_id).toBe('d1-111')
+    })
+
+    it('pot_list through invokeTool returns 503 unconfigured with top-level error when CF token is missing', async () => {
+      const env = { PUBLIC_ORIGIN: 'https://mupot.mumega.com' } as unknown as Env
+      const outcome = await invokeTool(orgAdmin, env, 'pot_list', {})
+      expect(outcome.ok).toBe(false)
+      if (outcome.ok) throw new Error('expected failure')
+      expect(outcome.status).toBe(503)
+      expect(outcome.error).toBe('unconfigured')
+      expect(String(outcome.detail)).toMatch(/Cloudflare API Token not configured/i)
+    })
+
+    it('pot_provision through invokeTool returns 503 unconfigured, not a detail-less 500, when CF token is missing', async () => {
+      const env = { PUBLIC_ORIGIN: 'https://mupot.mumega.com' } as unknown as Env
+      const outcome = await invokeTool(orgAdmin, env, 'pot_provision', {
+        slug: 'gaf',
+        brand_name: 'GAF',
+        admin_email: 'admin@example.com',
+      })
+      expect(outcome.ok).toBe(false)
+      if (outcome.ok) throw new Error('expected failure')
+      expect(outcome.status).toBe(503)
+      expect(outcome.error).toBe('unconfigured')
+      expect(String(outcome.detail)).toMatch(/Cloudflare API Token not configured/i)
     })
   })
 })
