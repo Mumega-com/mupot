@@ -336,10 +336,12 @@ export default {
     // Routes `<tenant>.mupot.mumega.com` to the isolated User Worker in `mupot-pots`.
     if (env.DISPATCHER) {
       const url = new URL(req.url)
-      const headerSlug = req.headers.get('x-mupot-tenant-slug') || req.headers.get('x-pot-tenant')
       const rootHost = env.PUBLIC_ORIGIN ? new URL(env.PUBLIC_ORIGIN).hostname : undefined
       const { extractTenantSlug } = await import('./dispatcher')
-      const tenantSlug = extractTenantSlug(url.hostname, rootHost, headerSlug)
+      // Hostname only. A request header must never choose which tenant Worker answers —
+      // this branch runs BEFORE the OAuth provider and before any auth middleware, so a
+      // header consulted here is a selector handed to anonymous callers (mupot#1299).
+      const tenantSlug = extractTenantSlug(url.hostname, rootHost)
 
       if (tenantSlug && tenantSlug !== (env.TENANT_SLUG || 'mumega') && tenantSlug !== 'mupot' && tenantSlug !== 'mumega') {
         const dispatcher = (await import('./dispatcher')).default

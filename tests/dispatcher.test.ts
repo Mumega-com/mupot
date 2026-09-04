@@ -15,9 +15,17 @@ describe('WFP Dynamic Dispatcher', () => {
       expect(extractTenantSlug('dme-corp.mupot.mumega.com')).toBe('dme-corp')
     })
 
-    it('honors x-mupot-tenant-slug header override', () => {
-      expect(extractTenantSlug('mupot.mumega.com', DEFAULT_ROOT_DOMAIN, 'gaf')).toBe('gaf')
-      expect(extractTenantSlug('anything.com', DEFAULT_ROOT_DOMAIN, 'viamar_custom')).toBe('viamar_custom')
+    // mupot#1299. This test used to be `honors x-mupot-tenant-slug header override`, and
+    // it asserted that a client-supplied header BEAT the hostname. That was the defect
+    // written down as an expectation: it made tenant selection an unauthenticated choice
+    // at an entry point that runs before any auth. The capability is now gone from the
+    // signature, so the assertion is that the hostname is the only input.
+    it('ignores any client-supplied slug — the hostname is the only input', () => {
+      // Sanity: these are the two hostnames the old override test smuggled a tenant into.
+      expect(extractTenantSlug('mupot.mumega.com', DEFAULT_ROOT_DOMAIN)).toBe(DEFAULT_FALLBACK_POT)
+      expect(extractTenantSlug('anything.com', DEFAULT_ROOT_DOMAIN)).toBe('anything-com')
+      // The function takes exactly two parameters; a third has nowhere to go.
+      expect(extractTenantSlug.length).toBe(1)
     })
 
     it('sanitizes custom CNAME domains', () => {
@@ -26,6 +34,28 @@ describe('WFP Dynamic Dispatcher', () => {
   })
 
   describe('fetch routing', () => {
+    // mupot#1299 — the behavioural half. Arity proves the parameter is gone; this proves
+    // dispatcher.fetch does not re-derive the same capability from the raw request, which
+    // it did independently of src/index.ts (two readers, one predicate).
+    it('does not let a request header redirect the request to another tenant', async () => {
+      const mockGet = vi.fn().mockReturnValue({
+        fetch: vi.fn().mockResolvedValue(new Response('ok')),
+      })
+      const env = { DISPATCHER: { get: mockGet } }
+
+      // Addressed to gaf by hostname; asks for `victim` by header, both spellings.
+      const req = new Request('https://gaf.mupot.mumega.com/health', {
+        headers: {
+          'x-mupot-tenant-slug': 'victim',
+          'x-pot-tenant': 'victim',
+        },
+      })
+
+      await dispatcher.fetch(req, env)
+      expect(mockGet).toHaveBeenCalledTimes(1)
+      expect(mockGet.mock.calls[0][0]).toBe('gaf')
+    })
+
     it('dispatches request to target User Worker with limits', async () => {
       const mockFetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({ pot: 'gaf', ok: true }), {
         status: 200,

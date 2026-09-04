@@ -31,15 +31,30 @@ export const DEFAULT_DISPATCH_LIMITS = {
   subRequests: 50,
 } as const
 
+// TENANT SELECTION IS A FUNCTION OF THE HOSTNAME ALONE (mupot#1299).
+//
+// This used to accept a third `headerSlug` argument, read from a client-supplied
+// `x-mupot-tenant-slug` / `x-pot-tenant` request header, and it took PRIORITY over the
+// hostname. That made "which tenant Worker serves this request" an unauthenticated
+// choice made by the caller: measured live on prod at 8ff9b8e2, an anonymous
+// `GET https://mupot.mumega.com/health` carrying that header was answered by the named
+// tenant's Worker instead of the colony's.
+//
+// The parameter is GONE rather than gated, because a gated version has to be correct at
+// every call site forever, and there were already two independent readers of the header
+// (this file and src/index.ts) that had to agree. A signature that cannot express the
+// unsafe call cannot be called unsafely.
+//
+// The credential half of the hazard closes with it: hostname routing means a browser only
+// ever sends cookies the browser itself scoped to that hostname. mupot's session cookie is
+// set with no `Domain=` attribute (src/auth/index.ts setSessionCookie), so it is host-only
+// and never reaches a tenant subdomain. Forwarding headers to the User Worker is therefore
+// correct here — stripping Cookie/Authorization would break a tenant's own logged-in users.
+// That reasoning depends on the cookie staying host-only; tests/dispatcher.test.ts pins it.
 export function extractTenantSlug(
   hostname: string,
   rootDomain: string = DEFAULT_ROOT_DOMAIN,
-  headerSlug?: string | null,
 ): string {
-  if (headerSlug && /^[a-z0-9-_]+$/i.test(headerSlug.trim())) {
-    return headerSlug.trim().toLowerCase()
-  }
-
   const cleanHost = hostname.toLowerCase().split(':')[0]
   const cleanRoot = rootDomain.toLowerCase().split(':')[0]
 
@@ -90,8 +105,8 @@ export default {
   async fetch(request: Request, env: DispatcherEnv): Promise<Response> {
     const url = new URL(request.url)
     const rootDomain = env.ROOT_DOMAIN || DEFAULT_ROOT_DOMAIN
-    const headerSlug = request.headers.get('x-mupot-tenant-slug') || request.headers.get('x-pot-tenant')
-    const tenantSlug = extractTenantSlug(url.hostname, rootDomain, headerSlug)
+    // No header is consulted: see extractTenantSlug (mupot#1299).
+    const tenantSlug = extractTenantSlug(url.hostname, rootDomain)
 
     const limits = {
       cpuMs: env.DEFAULT_CPU_MS ?? DEFAULT_DISPATCH_LIMITS.cpuMs,
