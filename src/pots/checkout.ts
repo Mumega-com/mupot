@@ -44,17 +44,48 @@ export async function checkSlugAvailability(env: Env, rawSlug: string): Promise<
     return { available: false, slug, reason: 'This pot subdomain is reserved.' }
   }
 
-  // Check if pot already exists in pots table
+  // FAIL CLOSED (mupot#1303). The previous version wrapped this lookup in
+  // `catch { /* proceed fail-safe */ }` and then returned `available: true`. That comment
+  // was wrong in the load-bearing word: returning "available" when the check could not run
+  // is fail-OPEN. "I could not determine whether this is taken" was being answered as
+  // "this is not taken".
+  //
+  // It was not a rare error path either. The `pots` table did not exist in the migration
+  // chain at all, so the query threw on every call and the "already taken" branch had never
+  // once executed in production. Measured 2026-09-04, while `gaf` was a live Worker serving
+  // traffic in the mupot-pots dispatch namespace:
+  //
+  //     GET /api/pots/slug-available?slug=gaf -> {"available":true}
+  //
+  // Migration 0145 creates the table and seeds it from a real read of that namespace.
+  //
+  // Two sources are consulted because BOTH occupy the same dispatch namespace: tenant pots
+  // and project sub-workers (src/platform/dispatcher.ts dispatches `worker_name || slug`
+  // into it). A name taken by either is not available to a new pot.
   try {
-    const existing = await env.DB.prepare('SELECT id FROM pots WHERE slug = ?1 LIMIT 1')
+    const takenByPot = await env.DB.prepare('SELECT id FROM pots WHERE slug = ?1 LIMIT 1')
       .bind(slug)
       .first<{ id: string }>()
+    if (takenByPot) {
+      return { available: false, slug, reason: 'This pot subdomain is already taken.' }
+    }
 
-    if (existing) {
+    const takenByProject = await env.DB.prepare(
+      'SELECT id FROM projects WHERE slug = ?1 OR worker_name = ?1 LIMIT 1',
+    )
+      .bind(slug)
+      .first<{ id: string }>()
+    if (takenByProject) {
       return { available: false, slug, reason: 'This pot subdomain is already taken.' }
     }
   } catch {
-    // If pots table not queryable, proceed fail-safe
+    // An unanswerable check is NOT an available slug. Refusing a legitimate signup is
+    // recoverable by retrying; selling a slug that already has a Worker behind it is not.
+    return {
+      available: false,
+      slug,
+      reason: 'Availability could not be verified right now. Please try again.',
+    }
   }
 
   return { available: true, slug }
