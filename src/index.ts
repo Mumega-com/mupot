@@ -347,28 +347,17 @@ export default {
     // Path-based routing needs no DNS record, no ACM, and no certificate per tenant.
     const rootHost = env.PUBLIC_ORIGIN ? new URL(env.PUBLIC_ORIGIN).hostname : 'mupot.mumega.com'
     const homeSlug = (env.TENANT_SLUG || 'mumega').toLowerCase()
-    const { extractTenantSlug, resolveApexPathTenant } = await import('./dispatcher')
+    const { extractTenantSlug, routeApexPathTenant } = await import('./dispatcher')
 
-    const pathTenant = resolveApexPathTenant(req, homeSlug, rootHost)
-    if (pathTenant?.kind === 'home') {
-      req = pathTenant.request
-    } else if (pathTenant?.kind === 'dispatch') {
-      if (!env.DISPATCHER) {
-        return new Response(
-          JSON.stringify({
-            error: 'unconfigured',
-            tenant: pathTenant.slug,
-            message: 'Cloudflare dispatch namespace is not bound; cannot route /t/{tenant}.',
-          }),
-          { status: 503, headers: { 'content-type': 'application/json' } },
-        )
-      }
-      const dispatcher = (await import('./dispatcher')).default
-      return dispatcher.fetch(pathTenant.request, {
-        DISPATCHER: env.DISPATCHER,
-        FALLBACK_POT: env.TENANT_SLUG,
-        ROOT_DOMAIN: rootHost,
-      })
+    const apexRoute = await routeApexPathTenant(req, {
+      PUBLIC_ORIGIN: env.PUBLIC_ORIGIN,
+      TENANT_SLUG: env.TENANT_SLUG,
+      DISPATCHER: env.DISPATCHER,
+    })
+    if (apexRoute.kind === 'home') {
+      req = apexRoute.request
+    } else if (apexRoute.kind === 'respond') {
+      return apexRoute.response
     }
 
     if (env.DISPATCHER) {
