@@ -226,7 +226,7 @@ export async function provisionSovereignPot(
   // The path form is still the right destination (no DNS record, no ACM, no per-tenant
   // certificate), which is why the value is left as-is rather than reverted to the
   // subdomain form that provably cannot serve either. But until #1248 or a replacement
-  // lands, every origin this function returns is unreachable. Tracked in mupot#1305.
+  // lands, every origin this function returns is unreachable. Tracked in mupot#1306.
   const publicOrigin = `https://${rootDomain}/t/${slug}`
   const tier = input.plan_tier || 'enterprise'
 
