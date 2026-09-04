@@ -143,13 +143,25 @@ describe('decorateApprovals — bounded, memoized D1 cost (mupot#1319 gate BLOCK
     expect(count()).toBeLessThanOrEqual(6)
   })
 
-  it('BASE_SELECT is bounded: seeding well past APPROVALS_QUEUE_LIMIT still returns at most the limit, oldest first', async () => {
+  it('BASE_SELECT is bounded (non-admin path): seeding well past APPROVALS_QUEUE_LIMIT still returns at most the limit, oldest first', async () => {
     const EXTRA = 5
     for (let i = 0; i < APPROVALS_QUEUE_LIMIT + EXTRA; i += 1) {
       seedReviewTask(harness.sqlite, `task-${String(i).padStart(5, '0')}`, 'squad-1', 'gate:loops')
     }
     const { env } = countingEnv(harness)
     const out = await loadApprovals(env, memberAuth('member-1'))
+    expect(out.length).toBeLessThanOrEqual(APPROVALS_QUEUE_LIMIT)
+    expect(out).toHaveLength(APPROVALS_QUEUE_LIMIT)
+  })
+
+  it('BASE_SELECT is bounded (owner/admin path — a SEPARATE query branch, no gate_grants EXISTS clause): the admin bypass query has its own LIMIT too', async () => {
+    const EXTRA = 5
+    for (let i = 0; i < APPROVALS_QUEUE_LIMIT + EXTRA; i += 1) {
+      seedReviewTask(harness.sqlite, `task-admin-${String(i).padStart(5, '0')}`, 'squad-1', 'gate:loops')
+    }
+    const { env } = countingEnv(harness)
+    const ownerAuth: AuthContext = { userId: 'owner-1', email: null, role: 'owner', tenant: TENANT, memberId: 'owner-1' }
+    const out = await loadApprovals(env, ownerAuth)
     expect(out.length).toBeLessThanOrEqual(APPROVALS_QUEUE_LIMIT)
     expect(out).toHaveLength(APPROVALS_QUEUE_LIMIT)
   })
