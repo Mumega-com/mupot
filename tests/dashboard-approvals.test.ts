@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { loadApprovals, loadPublishable, resultPreview, APPROVALS_QUEUE_LIMIT } from '../src/dashboard/approvals'
+import { loadApprovals, loadPublishable, resultPreview, APPROVALS_FETCH_CEILING } from '../src/dashboard/approvals'
 import { CONTENT_GATE_OWNER } from '../src/agents/execute'
 import type { Env, AuthContext } from '../src/types'
 
@@ -51,7 +51,11 @@ describe('loadApprovals', () => {
     const rows = [{ id: 't1' }, { id: 't2' }]
     const { env, calls } = makeEnv(rows)
     const out = await loadApprovals(env, auth({ role: 'owner' }))
-    expect(out).toHaveLength(2)
+    // These fixture rows carry no gate_owner, so decorateApprovals marks them
+    // informational (can_verdict:false) — they still render (items), but
+    // contribute nothing to actionableCount.
+    expect(out.items).toHaveLength(2)
+    expect(out.actionableCount).toBe(0)
     expect(calls[0].sql).toContain("t.status = 'review'")
     expect(calls[0].sql).not.toContain('gate_grants')
     // ungated review tasks are unverdictable zombies — the queue must not offer
@@ -69,24 +73,26 @@ describe('loadApprovals', () => {
   it('member is filtered through gate_grants with member principal', async () => {
     const { env, calls } = makeEnv([{ id: 't1' }])
     const out = await loadApprovals(env, auth({ role: 'member', memberId: 'm-9', userId: 'u-9' }))
-    expect(out).toHaveLength(1)
+    expect(out.items).toHaveLength(1)
     expect(calls[0].sql).toContain('gate_grants')
     expect(calls[0].sql).toContain('t.gate_owner IS NOT NULL')
-    // mupot#1319 gate BLOCK-1: BASE_SELECT is now bounded (LIMIT ?3 ->
-    // APPROVALS_QUEUE_LIMIT) — the 3rd bind is the cap, not a principal.
-    expect(calls[0].binds).toEqual(['member', 'm-9', APPROVALS_QUEUE_LIMIT])
+    // mupot#1319 round 2, Codex FINDING 3: the candidate fetch is bounded at
+    // APPROVALS_FETCH_CEILING, not the smaller display cap — see
+    // selectQueueWindow (src/dashboard/approvals.ts) for why the display cap
+    // is now applied AFTER eligibility, not in this SQL LIMIT.
+    expect(calls[0].binds).toEqual(['member', 'm-9', APPROVALS_FETCH_CEILING])
   })
 
   it('agent token (no memberId) checks agent principal via userId', async () => {
     const { env, calls } = makeEnv([])
     await loadApprovals(env, auth({ role: 'member', memberId: undefined, userId: 'agent-7' }))
-    expect(calls[0].binds).toEqual(['agent', 'agent-7', APPROVALS_QUEUE_LIMIT])
+    expect(calls[0].binds).toEqual(['agent', 'agent-7', APPROVALS_FETCH_CEILING])
   })
 
-  it('no principal id → empty list, no query', async () => {
+  it('no principal id → empty queue, no query', async () => {
     const { env, calls } = makeEnv([{ id: 'should-not-appear' }])
     const out = await loadApprovals(env, auth({ role: 'member', memberId: undefined, userId: undefined }))
-    expect(out).toEqual([])
+    expect(out).toEqual({ items: [], actionableCount: 0, actionableCountIsLowerBound: false })
     expect(calls).toHaveLength(0)
   })
 })

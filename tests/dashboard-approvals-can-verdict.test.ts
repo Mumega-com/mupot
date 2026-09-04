@@ -88,8 +88,8 @@ describe('loadApprovals — can_verdict/can_approve/can_reject decoration (mupot
     // Deliberately NO capabilities row on squad-1 for member-1 — they hold the
     // gate grant (org-global) but not squad membership (squad-scoped).
     const out = await loadApprovals(envFor(harness), memberAuth('member-1'))
-    expect(out).toHaveLength(1)
-    expect(out[0]).toMatchObject({ can_verdict: false, can_approve: false, can_reject: false })
+    expect(out.items).toHaveLength(1)
+    expect(out.items[0]).toMatchObject({ can_verdict: false, can_approve: false, can_reject: false })
   })
 
   it('positive control: same caller, WITH squad membership — can_verdict true', async () => {
@@ -98,8 +98,8 @@ describe('loadApprovals — can_verdict/can_approve/can_reject decoration (mupot
     seedReviewTask(harness.sqlite, 'task-2', 'squad-1', 'gate:outreach')
     seedGrant(harness.sqlite, 'gate:outreach', 'member', 'member-2')
     const out = await loadApprovals(envFor(harness), memberAuth('member-2'))
-    expect(out).toHaveLength(1)
-    expect(out[0]).toMatchObject({ can_verdict: true, can_approve: true, can_reject: true })
+    expect(out.items).toHaveLength(1)
+    expect(out.items[0]).toMatchObject({ can_verdict: true, can_approve: true, can_reject: true })
   })
 
   it('REACHABLE false branch: gate:loops held without outreach:send-gated — can_approve false, can_reject true, can_verdict true', async () => {
@@ -108,8 +108,8 @@ describe('loadApprovals — can_verdict/can_approve/can_reject decoration (mupot
     seedReviewTask(harness.sqlite, 'task-3', 'squad-1', 'gate:loops')
     seedGrant(harness.sqlite, 'gate:loops', 'member', 'member-3')
     const out = await loadApprovals(envFor(harness), memberAuth('member-3'))
-    expect(out).toHaveLength(1)
-    expect(out[0]).toMatchObject({ can_verdict: true, can_approve: false, can_reject: true })
+    expect(out.items).toHaveLength(1)
+    expect(out.items[0]).toMatchObject({ can_verdict: true, can_approve: false, can_reject: true })
   })
 
   // INVARIANT WITNESS, not a fabricated fixture (per this flight's own gate
@@ -147,7 +147,7 @@ describe('loadApprovals — can_verdict/can_approve/can_reject decoration (mupot
     // cannot see a row whose only grant is agent-typed — regardless of
     // self-verdict, the row is not even in the returned set.
     const out = await loadApprovals(envFor(harness), memberAuth('member-4'))
-    expect(out).toHaveLength(0)
+    expect(out.items).toHaveLength(0)
   })
 
   it('org owner: can_verdict true for a gate:agent-self-completion row assigned to someone else (legacy escape modeled correctly)', async () => {
@@ -155,8 +155,8 @@ describe('loadApprovals — can_verdict/can_approve/can_reject decoration (mupot
     seedReviewTask(harness.sqlite, 'task-5', 'squad-1', 'gate:agent-self-completion', 'agent-other')
     const ownerAuth: AuthContext = { userId: 'owner-1', email: null, role: 'owner', tenant: TENANT, memberId: 'owner-1' }
     const out = await loadApprovals(envFor(harness), ownerAuth)
-    expect(out).toHaveLength(1)
-    expect(out[0]).toMatchObject({ can_verdict: true, can_approve: true, can_reject: true })
+    expect(out.items).toHaveLength(1)
+    expect(out.items[0]).toMatchObject({ can_verdict: true, can_approve: true, can_reject: true })
   })
 })
 

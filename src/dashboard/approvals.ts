@@ -96,21 +96,43 @@ function isOwnerAdmin(auth: AuthContext): boolean {
 // Approve button just hands the operator a 409. Filter it out at the source
 // (both the owner/admin path and the gate-grant path inherit this).
 //
-// mupot#1319 gate BLOCK-1: BOUNDED at APPROVALS_QUEUE_LIMIT rows. Before this
-// fix there was no LIMIT at all, and decorateApprovals fans out up to 4 D1
-// calls per row (measured 4.00/row on a gate:loops-heavy fixture) through an
-// unbounded Promise.all — an operator with ~250 pending rows was issuing
-// ~1000 D1 calls rendering ONE page load. The queue is oldest-first
-// (ORDER BY t.created_at ASC below), so a truncated result is the OLDEST
-// APPROVALS_QUEUE_LIMIT waiting rows — the ones that have waited longest,
-// not an arbitrary slice. Past the limit: loadApprovals silently returns
-// only the first APPROVALS_QUEUE_LIMIT rows; the dashboard (approvalsBody,
-// src/dashboard/index.ts) detects the exact-limit case and renders a
-// "showing the oldest N" note rather than a bare, misleadingly-precise count
-// — a truncated queue that says so beats a queue that falls over. There is
-// no pagination past this cap yet; the newest rows past the limit will
-// simply not render until older ones clear.
+// mupot#1319 gate BLOCK-1 (round 1): BOUNDED at APPROVALS_QUEUE_LIMIT display
+// rows. Before this fix there was no LIMIT at all, and decorateApprovals
+// fans out up to 4 D1 calls per row (measured 4.00/row on a gate:loops-heavy
+// fixture) through an unbounded Promise.all — an operator with ~250 pending
+// rows was issuing ~1000 D1 calls rendering ONE page load.
+//
+// mupot#1319 round 2, Codex FINDING 3 (CORRECTED — round 1 applied the LIMIT
+// in SQL, oldest-first, BEFORE eligibility ever ran): that was starvation,
+// and silently wrong, which is worse than the fan-out it replaced. A
+// non-admin caller with APPROVALS_QUEUE_LIMIT+ OLD review rows they can no
+// longer action (lost squad access; a stale gate grant the EXISTS clause
+// below cannot see is inactive) had those unactionable rows consume the
+// ENTIRE returned window — newer rows they COULD actually verdict never
+// appeared in the queue at all, and nothing told the operator this was
+// happening.
+//
+// Fix: fetch a larger CANDIDATE window (APPROVALS_FETCH_CEILING, itself a
+// hard bound so this cannot degrade back to unbounded), decorate ALL of it,
+// then select ACTIONABLE rows first regardless of their position in that
+// candidate window — see selectQueueWindow below. Decorating up to 5x more
+// candidate rows is now cheap: BLOCK-1's cache fix (deptCache / gateCache)
+// makes decoration cost O(distinct squad/gate), not O(rows), so widening the
+// candidate window barely changes D1 call count — it only does more
+// (already-cheap) JS-side filtering.
+//
+// Residual, DOCUMENTED limit, not a full fix: if more than
+// APPROVALS_FETCH_CEILING consecutive OLDEST rows are ALL unactionable, an
+// actionable row beyond the ceiling still will not appear. Closing that
+// completely would require re-implementing evaluateVerdictGates' full RBAC
+// (squad-scope + department inheritance, gate ownership including the
+// self-completion special case, the gate:loops surface cap, self-verdict) as
+// SQL — duplicating, in a second language, the exact predicate this whole
+// flight exists to keep singular. The ceiling is deliberately generous (5x
+// the display limit) specifically because decoration is now cheap; widening
+// it further narrows the residual window at near-zero added D1 cost.
 export const APPROVALS_QUEUE_LIMIT = 200
+export const APPROVALS_FETCH_CEILING = APPROVALS_QUEUE_LIMIT * 5
 
 const BASE_SELECT = `
   SELECT t.id, t.squad_id, s.name AS squad_name, t.title, t.body, t.gate_owner,
@@ -172,12 +194,56 @@ async function decorateApprovals(env: Env, auth: AuthContext, rows: ApprovalRow[
   )
 }
 
-export async function loadApprovals(env: Env, auth: AuthContext): Promise<ApprovalItem[]> {
+// mupot#1319 round 2, Codex FINDING 3 + FINDING 4/2: the caller-facing result
+// of loadApprovals. `items` is what renders (actionable rows ALWAYS placed
+// ahead of informational ones — see selectQueueWindow), `actionableCount` is
+// the number this module's OWN documented contract promises ("needs your
+// decision — the only tasks a verdict endpoint will actually accept"), and
+// `actionableCountIsLowerBound` is the honesty signal every KPI surface must
+// render instead of a bare, possibly-wrong exact number.
+export interface ApprovalsQueue {
+  items: ApprovalItem[]
+  /** Count of can_verdict:true rows actually present in `items` — NOT
+   *  items.length, which also counts informational (unactionable) rows. */
+  actionableCount: number
+  /** True when actionableCount is a LOWER BOUND, not the exact total:
+   *  either actionable rows alone filled the APPROVALS_QUEUE_LIMIT display
+   *  window (more may exist beyond it), or the underlying candidate fetch
+   *  hit APPROVALS_FETCH_CEILING before exhausting the table (more
+   *  actionable rows, of any age, may exist beyond the fetched window
+   *  entirely — see APPROVALS_FETCH_CEILING's doc comment). A surface that
+   *  cannot express "at least N" must say so rather than print this count
+   *  as if it were exact. */
+  actionableCountIsLowerBound: boolean
+}
+
+// Select the displayed window from a fully-decorated CANDIDATE set (already
+// bounded at APPROVALS_FETCH_CEILING by the SQL LIMIT below). Actionable rows
+// are placed first, in their original (oldest-first) relative order, so an
+// actionable row is NEVER crowded out of the display window by an
+// unactionable one merely because the unactionable one is older — that
+// crowding-out was Codex FINDING 3. Informational rows fill any remaining
+// space, oldest first, for context only (no action renders on them).
+export function selectQueueWindow(decorated: ApprovalItem[]): ApprovalsQueue {
+  const actionable = decorated.filter((t) => t.can_verdict)
+  const informational = decorated.filter((t) => !t.can_verdict)
+  const items = [...actionable, ...informational].slice(0, APPROVALS_QUEUE_LIMIT)
+  const actionableCountIsLowerBound =
+    actionable.length > APPROVALS_QUEUE_LIMIT || decorated.length >= APPROVALS_FETCH_CEILING
+  return {
+    items,
+    actionableCount: Math.min(actionable.length, APPROVALS_QUEUE_LIMIT),
+    actionableCountIsLowerBound,
+  }
+}
+
+export async function loadApprovals(env: Env, auth: AuthContext): Promise<ApprovalsQueue> {
   if (isOwnerAdmin(auth)) {
     const rs = await env.DB.prepare(`${BASE_SELECT} ORDER BY t.created_at ASC LIMIT ?1`)
-      .bind(APPROVALS_QUEUE_LIMIT)
+      .bind(APPROVALS_FETCH_CEILING)
       .all<ApprovalRow>()
-    return decorateApprovals(env, auth, rs.results ?? [])
+    const decorated = await decorateApprovals(env, auth, rs.results ?? [])
+    return selectQueueWindow(decorated)
   }
 
   // Non-admin: visibility == verdict authority. Same principal resolution as
@@ -201,7 +267,7 @@ export async function loadApprovals(env: Env, auth: AuthContext): Promise<Approv
   // into a new call site; use verdictPrincipal instead.
   const principalId = auth.memberId ?? auth.userId
   const principalType: 'member' | 'agent' = auth.memberId ? 'member' : 'agent'
-  if (!principalId) return []
+  if (!principalId) return { items: [], actionableCount: 0, actionableCountIsLowerBound: false }
 
   const rs = await env.DB.prepare(
     `${BASE_SELECT}
@@ -213,9 +279,10 @@ export async function loadApprovals(env: Env, auth: AuthContext): Promise<Approv
        )
      ORDER BY t.created_at ASC LIMIT ?3`,
   )
-    .bind(principalType, principalId, APPROVALS_QUEUE_LIMIT)
+    .bind(principalType, principalId, APPROVALS_FETCH_CEILING)
     .all<ApprovalRow>()
-  return decorateApprovals(env, auth, rs.results ?? [])
+  const decorated = await decorateApprovals(env, auth, rs.results ?? [])
+  return selectQueueWindow(decorated)
 }
 
 // Approved content-publish tasks awaiting the admin's separate Publish click.

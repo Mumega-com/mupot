@@ -159,8 +159,7 @@ import {
   statusDot as uiStatusDot,
 } from './ui'
 import type { Html } from './ui'
-import type { ApprovalItem, PublishableItem } from './approvals'
-import { APPROVALS_QUEUE_LIMIT } from './approvals'
+import type { ApprovalItem, PublishableItem, ApprovalsQueue } from './approvals'
 import { loadObservatory, agentGradient } from './observatory'
 import { kanbanApp, loadKanbanData, kanbanBoardBody } from './kanban-routes'
 // Flight-008 Slice 3 (#1062): the /send dispatch-now picker's reachability signal.
@@ -456,7 +455,7 @@ dashboardApp.get('/', async (c) => {
   //   - loadTodaySpendScalar: ONE D1 round trip (today's sum + an EXISTS check),
   //     vs loadEconomy's 5 parallel queries — see economy.ts for why "configured"
   //     is defined identically so the two never disagree.
-  const [obsData, approvals, physics, spend, taskStatusCounts] = await Promise.all([
+  const [obsData, approvalsQueue, physics, spend, taskStatusCounts] = await Promise.all([
     loadObservatory(c.env),
     loadApprovals(c.env, auth),
     loadBrainPhysics(c.env),
@@ -473,11 +472,11 @@ dashboardApp.get('/', async (c) => {
     agents: obsData.agents,
     stats: obsData.stats,
     runtimeStates: obsData.runtimeStates,
-    approvals,
+    approvals: approvalsQueue,
     taskStatusCounts,
   })
   return c.html(
-    shell(c.env, 'Overview', observatoryBody(c.env.BRAND, obsData, approvals, auth, counts), {
+    shell(c.env, 'Overview', observatoryBody(c.env.BRAND, obsData, approvalsQueue.items, auth, counts), {
       physics,
       costToday: { configured: spend.configured, todayUsdMicro: spend.today_usd_micro },
     }),
@@ -857,12 +856,12 @@ dashboardApp.get('/approvals', async (c) => {
   const auth = c.get('auth')
   // Secret-env pending requests: admin-only, like loadPublishable above — a
   // non-admin caller never even queries the table, not just doesn't see a button.
-  const [items, publishable, secretEnvRequests] = await Promise.all([
+  const [approvalsQueue, publishable, secretEnvRequests] = await Promise.all([
     loadApprovals(c.env, auth),
     loadPublishable(c.env, auth),
     isOrgAdmin(auth) ? listPendingSecretEnvRequests(c.env) : Promise.resolve([]),
   ])
-  return c.html(shell(c.env, 'Approvals', approvalsBody(items, publishable, secretEnvRequests)))
+  return c.html(shell(c.env, 'Approvals', approvalsBody(approvalsQueue, publishable, secretEnvRequests)))
 })
 
 // POST /admin/secret-env/:requestId/bind — admin pastes values for a pending
@@ -4757,7 +4756,7 @@ function observatoryBody(
     statCard({ label: 'Configured agents', value: String(counts.agentsTotal) }),
     statCard({ label: 'Live runtimes', value: String(counts.liveRuntimeCount), subTone: counts.liveRuntimeCount > 0 ? 'primary' : 'warn' }),
     statCard({ label: 'In flight', value: String(counts.inFlightTotal), subTone: counts.inFlightTotal > 0 ? 'primary' : 'dim' }),
-    statCard({ label: 'Needs decision', value: String(counts.needsDecisionCount), subTone: counts.needsDecisionCount > 0 ? 'warn' : 'dim' }),
+    statCard({ label: 'Needs decision', value: `${String(counts.needsDecisionCount)}${counts.needsDecisionCountIsLowerBound ? '+' : ''}`, subTone: counts.needsDecisionCount > 0 ? 'warn' : 'dim' }),
     statCard({ label: 'Spend · 24h', value: formatUsd(counts.spendMicroUsdTotal) }),
   ])
 
@@ -5810,22 +5809,29 @@ function sendScript(projectId?: string) {
 // duplication across pages.
 
 function approvalsBody(
-  items: ApprovalItem[],
+  approvalsQueue: ApprovalsQueue,
   publishable: PublishableItem[] = [],
   secretEnvRequests: PublicSecretEnvRequest[] = [],
 ) {
+  const { items, actionableCount, actionableCountIsLowerBound } = approvalsQueue
   // Re-use the shared card renderer. Wrap in a named container so the script can
   // scope its querySelectorAll without touching #obs-queue on the home page.
+  // `items` mixes actionable rows (buttons render) and informational ones (no
+  // buttons; see approvalCardHtml) — actionable rows always come first, see
+  // selectQueueWindow (src/dashboard/approvals.ts).
   const cards = items.map((t) => approvalCardHtml(t)).join('')
   const n = items.length
-  // mupot#1319 gate BLOCK-1: loadApprovals is now bounded at
-  // APPROVALS_QUEUE_LIMIT rows (src/dashboard/approvals.ts) to cap the D1
-  // fan-out decorateApprovals does per row. Hitting the limit exactly is the
-  // signal there may be more waiting past it (oldest-first, so the ones
-  // shown are the longest-waiting) — say so rather than show a bare count
-  // that reads as complete when it is not.
-  const truncated = n === APPROVALS_QUEUE_LIMIT
-  const badgeText = truncated ? `${String(n)}+ awaiting your gate (showing the oldest ${String(n)})` : `${String(n)} awaiting your gate`
+  // mupot#1319 round 2, Codex FINDING 4/2 (CORRECTED from round 1, which used
+  // items.length — that counted informational/unactionable rows as "awaiting
+  // your gate," which they are not by this page's own definition, AND
+  // understated the true total once truncated since it never distinguished
+  // "hit the cap" from "this is everything"). The badge now reflects
+  // actionableCount specifically, with an explicit "+" whenever that count is
+  // a LOWER BOUND (actionableCountIsLowerBound) — see ApprovalsQueue's own
+  // doc comment for exactly what can make it one.
+  const badgeText = actionableCountIsLowerBound
+    ? `${String(actionableCount)}+ awaiting your gate`
+    : `${String(actionableCount)} awaiting your gate`
 
   // "Ready to publish" (flight-1 gap fix): tasks already past the gate
   // (status='approved', gate:content) with no operator control to fire the real
@@ -5847,13 +5853,19 @@ function approvalsBody(
         ${publishScript()}`
     : html``
 
+  // "Gate clear" means nothing NEEDS the caller's decision — that is
+  // actionableCount, not n (items.length also counts informational rows
+  // with no verdict action at all; a queue full of those is still clear).
+  const sub = actionableCountIsLowerBound
+    ? 'Agents propose work; you authorize it. This is the only place human authority enters the loop — untrusted input can wake an agent, never steer it. The queue is deep enough that this count is a floor, not a total — some waiting work may not be listed below yet.'
+    : 'Agents propose work; you authorize it. This is the only place human authority enters the loop — untrusted input can wake an agent, never steer it.'
   return html`
     ${pageHeader({
       crumbs: 'Overview / The Gate',
       title: 'The Gate',
-      sub: 'Agents propose work; you authorize it. This is the only place human authority enters the loop — untrusted input can wake an agent, never steer it.',
-      badge: n ? badgeText : 'Gate clear',
-      badgeTone: n ? 'warn' : 'ok',
+      sub,
+      badge: actionableCount ? badgeText : 'Gate clear',
+      badgeTone: actionableCount ? 'warn' : 'ok',
     })}
     ${n ? raw(`<div id="approvals-list">${cards}</div>`) : html`<div class="card"><p class="empty">Nothing waiting at your gates. Gated work lands here when an agent finishes it.</p></div>`}
     ${n ? approvalsScript() : html``}

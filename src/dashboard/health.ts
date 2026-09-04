@@ -6,7 +6,7 @@
 
 import type { Agent, AuthContext, Env } from '../types'
 import { loadAgentStats, loadAgentRuntimeStates, type AgentStat, type AgentRuntimeState } from './observatory'
-import { loadApprovals, type ApprovalItem } from './approvals'
+import { loadApprovals, type ApprovalsQueue } from './approvals'
 import { computeOperatorCounts, loadTaskStatusCounts, type OperatorCounts } from './operator-counts'
 
 export type HealthTone = 'ok' | 'warn' | 'danger' | 'dim'
@@ -59,6 +59,11 @@ export interface OpsHealthData {
     runtimeOnline: number
     activePresence: number
     needsDecision: number
+    /** mupot#1319 round 2 FINDING 4/2: true when needsDecision is a LOWER
+     *  BOUND (see OperatorCounts.needsDecisionCountIsLowerBound) — an API
+     *  consumer of this field must not treat needsDecision as exact when
+     *  this is true. */
+    needsDecisionIsLowerBound: boolean
     blockedOrRejected: number
     recentAudit: number
   }
@@ -398,7 +403,7 @@ export async function loadOpsHealth(env: Env, auth: AuthContext, nowMs = Date.no
     // failure here becomes a queryErrors entry + safe fallback, not a 500.
     safeCall(() => loadAgentStats(env), new Map<string, AgentStat>()),
     safeCall(() => loadAgentRuntimeStates(env, nowMs), new Map<string, AgentRuntimeState>()),
-    safeCall(() => loadApprovals(env, auth), [] as ApprovalItem[]),
+    safeCall(() => loadApprovals(env, auth), { items: [], actionableCount: 0, actionableCountIsLowerBound: false } as ApprovalsQueue),
     safeCall(() => loadTaskStatusCounts(env), new Map<string, number>()),
   ])
 
@@ -598,7 +603,12 @@ export async function loadOpsHealth(env: Env, auth: AuthContext, nowMs = Date.no
       id: 'approvals',
       label: 'Approval gates',
       tone: counts.needsDecisionCount > 0 ? 'warn' : 'ok',
-      state: counts.needsDecisionCount > 0 ? `${counts.needsDecisionCount} waiting` : 'clear',
+      // mupot#1319 round 2 FINDING 4/2: append '+' when the count is a lower
+      // bound (APPROVALS_QUEUE_LIMIT/FETCH_CEILING truncation) rather than
+      // print a number that reads as exact when it may not be.
+      state: counts.needsDecisionCount > 0
+        ? `${counts.needsDecisionCount}${counts.needsDecisionCountIsLowerBound ? '+' : ''} waiting`
+        : 'clear',
       detail: counts.needsDecisionCount > 0 ? 'Gated work is waiting for an accountable verdict.' : 'No tasks are waiting in review.',
       nextAction: counts.needsDecisionCount > 0 ? 'Approve, reject, or request changes.' : 'No action needed.',
       href: '/approvals',
@@ -703,6 +713,7 @@ export async function loadOpsHealth(env: Env, auth: AuthContext, nowMs = Date.no
       runtimeOnline: counts.liveRuntimeCount,
       activePresence,
       needsDecision: counts.needsDecisionCount,
+      needsDecisionIsLowerBound: counts.needsDecisionCountIsLowerBound,
       blockedOrRejected,
       recentAudit: auditSignals.length,
     },
