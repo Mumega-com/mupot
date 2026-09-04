@@ -45,9 +45,22 @@ potsApp.post('/provision', async (c) => {
     )
   }
 
+  if (!c.env.SECRET_ENV_CF_API_TOKEN) {
+    return c.json(
+      {
+        error: 'unconfigured',
+        message: 'Cloudflare API Token not configured for pot provisioning.',
+      },
+      503,
+    )
+  }
+
   try {
     const result = await provisionSovereignPot(c.env, body)
-    return c.json({ ok: true, pot: result }, 201)
+    // 201 Created is a claim that the thing now exists. It does not, unless every step ran
+    // and it was verified reachable. 202 Accepted is the honest code for "we started, and
+    // here is exactly how far we got".
+    return c.json({ ok: result.ok, pot: result }, result.ok ? 201 : 202)
   } catch (err) {
     return c.json(
       {
@@ -67,10 +80,10 @@ potsApp.get('/', async (c) => {
   }
 
   try {
-    const accountId = c.env.SECRET_ENV_CF_ACCOUNT_ID
+    const accountId = c.env.SECRET_ENV_CF_ACCOUNT_ID || 'e39eaf94f33092c4efd029d94ae1e9dd'
     const apiToken = c.env.SECRET_ENV_CF_API_TOKEN
-    if (!accountId || !apiToken) {
-      return c.json({ error: 'unconfigured', message: 'Cloudflare API credentials are not configured.' }, 503)
+    if (!apiToken) {
+      return c.json({ error: 'unconfigured', message: 'Cloudflare API Token not configured for pot listing.' }, 503)
     }
     const list = await listSovereignPots({ accountId, apiToken })
     return c.json({ ok: true, pots: list })

@@ -608,6 +608,10 @@ export type BusEventType =
   | 'billing.subscription.created'
   | 'billing.subscription.deleted'
   | 'pot.self_serve_provisioned'
+  // Emitted when a self-serve (Stripe) provisioning run created resources but did NOT
+  // produce a usable pot. A distinct type on purpose: a subscriber that treats a partial
+  // run as a delivered product is exactly the failure this separates out (mupot#1285).
+  | 'pot.self_serve_provisioning_incomplete'
   | 'routine.run.started'
   | 'supabase.record.insert'
   | 'supabase.record.update'

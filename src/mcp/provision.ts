@@ -26,7 +26,7 @@
 //   register_agent_key — admin on the agent's squad → public-only signed-runtime identity
 
 import type { Capability, CapabilityGrant, ConnectionChannel, Env, BusEvent, Squad } from '../types'
-import { hasCapability, isOrgAdmin } from '../auth/capability'
+import { hasCapability, isOrgAdmin, holdsCapabilityFloor } from '../auth/capability'
 import {
   createDepartment,
   createSquad,
@@ -36,7 +36,7 @@ import {
   updateAgentProfile,
   updateUnitConfig,
 } from '../org/service'
-import type { AgentProfilePatch, UnitConfigPatch } from '../org/service'
+import type { AgentProfilePatch, AuditActor, UnitConfigPatch } from '../org/service'
 import {
   mintAgentBoundToken,
   isAgentTokenCapability,
@@ -88,6 +88,7 @@ import {
   done,
   str,
   memberCanOnSquad,
+  hasWorkspaceAdmin,
 } from './index'
 
 const STRING_SCHEMA = { type: 'string' }
@@ -141,6 +142,11 @@ async function emitProvisioned(
     // updated_at), so the field-level before/after must ride on the event or
     // the change is unreversible from the trail.
     changed?: Record<string, { from: unknown; to: unknown }>
+    // mupot#1288: set when an 'agent_updated' correction came through
+    // update_agent's self lane (the agent corrected its own row), so a
+    // consumer can tell that apart from an operator-initiated correction
+    // without re-deriving it from actor_type on the audit row.
+    self_report?: boolean
   } = {},
   strict = false,
 ): Promise<void> {
@@ -153,6 +159,7 @@ async function emitProvisioned(
     receipt_id?: string
     reason?: string
     changed?: Record<string, { from: unknown; to: unknown }>
+    self_report?: boolean
   }> = {
     type: 'org.provisioned',
     tenant: env.TENANT_SLUG,
@@ -168,6 +175,7 @@ async function emitProvisioned(
       ...(extra.receipt_id ? { receipt_id: extra.receipt_id } : {}),
       ...(extra.reason ? { reason: extra.reason } : {}),
       ...(extra.changed ? { changed: extra.changed } : {}),
+      ...(extra.self_report ? { self_report: extra.self_report } : {}),
     },
     ts: new Date().toISOString(),
   }
@@ -1273,12 +1281,136 @@ async function readAuditDiff(
 // here (deactivate_agent owns retirement, with its token/presence/key teardown)
 // and neither is squad_id (moving squads changes capability scope — that is a
 // re-provision, not an edit).
+//
+// SELF LANE (mupot#1288). Athena ruled (2026-08) that a self-row registry write
+// is inside an agent's own authority — the profile row is what every router,
+// gate and dispatcher reads to know what an agent IS, and before this fix only
+// an org admin could repair it, making the admin a bottleneck for every
+// model/purpose drift after a re-harness. An agent-bound caller whose resolved
+// target IS its own row (auth.boundAgentId === agent.id) may now patch the
+// four fields in SELF_PATCHABLE_FIELDS without admin.
+//
+// SELF_PATCHABLE_FIELDS is deliberately narrow — model, model_fallback,
+// purpose, skills — NOT name/role. Kasra's adversarial gate (PR #1289, F2/F5)
+// found that the first version of this lane also let an agent self-write
+// name/role, and both are operator-authored identity interpolated RAW into
+// the agent's own system turn, above the charter and the untrusted-content
+// fence (src/agents/execute.ts, src/agents/loop.ts, src/agents/agent-do.ts —
+// see the buildSystemPrompt call sites in each). A one-shot prompt injection
+// that reaches an agent's own update_agent call could otherwise persist
+// itself into that agent's identity line — a durable self-poisoning path, not
+// a one-turn compromise. `name` also squats the human-facing display surface
+// `resolve_agent` returns. Closing this by construction (name/role simply
+// never reach the self lane) is the fix, NOT filtering the prompt builders —
+// see SELF_FORBIDDEN_FIELDS below, which folds both into the same
+// before-any-write per-field block the authority fields already got.
+//
+// Authority / identity-reference fields (SELF_FORBIDDEN_FIELDS: slug, name,
+// role, owner, qnft_ref, capabilities, budget_cap_cents, budget_window) stay
+// admin-gated even on the caller's own row — an agent must not rename its own
+// slug, rewrite its own name/role, reassign its owner, forge its qnft_ref,
+// grant itself capabilities, or move its own budget — and are rejected BEFORE
+// any write, naming the first offending field in this list's fixed order.
+// SELF_PATCHABLE_FIELDS and SELF_FORBIDDEN_FIELDS partition ADMIN_PATCHABLE_
+// FIELDS exactly (tested in tests/agent-self-update.test.ts) — a field can
+// never land in neither and get silently dropped.
+//
+// An agent-bound caller targeting a DIFFERENT agent's row is unchanged:
+// operator_principal_required. See the exemption comment on 'update_agent' in
+// tests/provision-tools.test.ts's operator-principal-invariant sweep — this
+// tool can no longer put that guard as the literal first statement in run()
+// because deciding self-vs-other requires resolving `agent` first; the self
+// lane's own admin-field gate takes over that job.
+//
+// `min` is 'authenticated', not 'admin' (Kasra's gate round 2, F1): the
+// AAGATE floor in src/mcp/index.ts's invokeTool is scope-AGNOSTIC —
+// `min: 'admin'` would have required the CALLER to already hold admin on
+// some scope before run() is ever entered, which makes the self lane
+// unreachable for exactly the population it exists for (an agent holding
+// only 'member' on its own squad). Lowering the floor means run() below
+// must carry the FULL admin check itself for a non-bound caller.
+//
+// R1 (Kasra's gate round 3): invokeTool's own comment states the invariant
+// this tool must now preserve on its own — "Check authz FIRST so
+// unauthorized callers get 403 regardless of body validity" (src/mcp/index.ts,
+// ~line 4862). With the floor skipped for 'authenticated' tools, that
+// ordering became this handler's job: a non-bound, zero-cap caller (e.g. a
+// B1 directory session) used to get a UNIFORM 403 from the floor no matter
+// what it sent. After lowering `min`, the SAME caller instead reached
+// resolveAgentRef first and got 400 invalid_args / 404 agent_not_found / 403
+// forbidden depending on whether an `agent` was supplied and whether it
+// existed — an agent-EXISTENCE ORACLE it has through no other tool
+// (resolve_agent and get_agent_profile both refuse it at 403 need=observer).
+// Fixed by re-deriving, for a non-bound caller ONLY, exactly what the old
+// central floor checked (`!hasWorkspaceAdmin(auth) && !holdsCapabilityFloor
+// (auth, 'admin')`) and running it BEFORE any argument is read. A bound
+// caller skips this — its authorization depends on whether the target is its
+// OWN row, which requires resolving `agent` first; that path (self lane vs.
+// operator_principal_required) is untouched by this check.
+//
+// R2 (Kasra's gate round 3): the fine-grained memberCanOnSquad(..., 'admin')
+// check below is no longer backed by a declarative `min` — the RANK is
+// asserted only by the read of this code and, now, by dedicated negative
+// tests (lead / observer / admin-on-a-different-squad all refused) in
+// tests/agent-self-update.test.ts. A framework-level floor sweep no longer
+// exercises this tool's rank once the check moved into run(); the tests
+// carry that weight explicitly instead.
+//
+// R3 (Kasra's gate round 3): the fine-grained check below does NOT repeat
+// `hasWorkspaceAdmin(auth) ||` — that disjunct was proven DEAD there. An
+// org-wide grant already satisfies memberCanOnSquad/hasCapability's own
+// org-scope branch (src/auth/capability.ts's hasCapability: "An org-wide
+// grant covers every scope"), so for the array-shaped `capabilities` every
+// real MCP caller carries, hasWorkspaceAdmin(auth) is a strict SUBSET of
+// memberCanOnSquad(..., 'admin') — proven by mutation (deleting the
+// disjunct left the suite green). The EARLY floor check above still writes
+// `!hasWorkspaceAdmin(auth) && !holdsCapabilityFloor(auth, 'admin')` with
+// both conjuncts, deliberately: it exists to replicate src/mcp/index.ts's
+// central AAGATE floor byte-for-byte (see R1), and that floor itself pairs
+// the same two checks — whether hasWorkspaceAdmin is ALSO redundant there is
+// a question about the shared floor, not about this tool, and simplifying
+// the shared floor is out of scope here. Match it, don't improve on it.
+export const SELF_PATCHABLE_FIELDS = ['model', 'model_fallback', 'purpose', 'skills'] as const
+export const SELF_FORBIDDEN_FIELDS = [
+  'slug',
+  'name',
+  'role',
+  'owner',
+  'qnft_ref',
+  'capabilities',
+  'budget_cap_cents',
+  'budget_window',
+] as const
+// The admin-path patch surface. Hoisted out of run() (it used to be an inline
+// literal) so tests can assert the partition invariant: every field here is
+// in exactly one of SELF_PATCHABLE_FIELDS / SELF_FORBIDDEN_FIELDS, never both,
+// never neither.
+export const ADMIN_PATCHABLE_FIELDS = [
+  'slug',
+  'name',
+  'role',
+  'model',
+  'model_fallback',
+  'purpose',
+  'owner',
+  'qnft_ref',
+  'capabilities',
+  'skills',
+  'budget_cap_cents',
+  'budget_window',
+] as const
 const toolUpdateAgent: ToolSpec = {
   name: 'update_agent',
-  scope: "agent's squad",
-  min: 'admin',
+  scope: "agent's squad or org admin; or an agent's own row for 4 non-identity fields (self lane — see args)",
+  min: 'authenticated',
   args:
-    '{ agent: string (id|slug), slug?, name?, role?, model?, model_fallback?, purpose?, owner?, qnft_ref?, capabilities?: string[], skills?: string[], budget_cap_cents?: number|null, budget_window?: "day"|"week", reason?: string }',
+    '{ agent: string (id|slug), slug?, name?, role?, model?, model_fallback?, purpose?, owner?, qnft_ref?, capabilities?: string[], skills?: string[], budget_cap_cents?: number|null, budget_window?: "day"|"week", reason?: string }' +
+    ' -- SELF LANE: an agent-bound caller correcting its OWN row (agent === its own id/slug) needs no admin,' +
+    ' but may only patch model/model_fallback/purpose/skills.' +
+    ' name/role/slug/owner/qnft_ref/capabilities/budget_cap_cents/budget_window still require admin,' +
+    ' even on your own row -- name/role are interpolated into your own system prompt and are' +
+    ' deliberately excluded from the self lane. Every non-self call (a different agent-bound' +
+    ' target, or a non-bound member) needs admin on the target agent squad or org.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -1306,11 +1438,28 @@ const toolUpdateAgent: ToolSpec = {
       budget_window: STRING_SCHEMA,
       reason: STRING_SCHEMA,
     },
-    required: ['agent'],
+    // `agent` is deliberately NOT in `required` here (R1, gate round 3).
+    // invokeTool runs validateArgs's `required` check UNCONDITIONALLY before
+    // run() — including for a tool whose `min` is 'authenticated', which
+    // skips only the AAGATE floor, not schema validation. A `required`
+    // entry would therefore reject a missing `agent` with 400 BEFORE the R1
+    // floor check below ever runs, reopening the exact "authz FIRST" gap R1
+    // exists to close. run() enforces "agent required" itself, AFTER the
+    // floor, via the `if (!agentRef) return fail(400, ...)` a few lines down
+    // — same outcome for an authorized caller, correct order for one who
+    // isn't.
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
+    // R1 (mupot#1288 gate round 3): for a NON-bound caller, replicate the old
+    // central AAGATE floor BEFORE reading or resolving `agent` — see the
+    // block comment above. A bound caller skips this: whether it is
+    // authorized depends on whether the target IS its own row, which needs
+    // `agent` resolved first (handled below, unaffected by this check).
+    if (!auth.boundAgentId && !hasWorkspaceAdmin(auth) && !holdsCapabilityFloor(auth, 'admin')) {
+      return fail(403, 'forbidden', { need: 'admin' })
+    }
+
     const agentRef = str(args.agent)
     if (!agentRef) return fail(400, 'invalid_args', 'agent required')
 
@@ -1318,28 +1467,41 @@ const toolUpdateAgent: ToolSpec = {
     if (!agentResult.ok) return resolveFail(agentResult.reason, 'agent_not_found')
     const agent = agentResult.value
 
-    // Gate: admin on the agent's squad, same rank as create/deactivate. A
-    // profile row is identity — who an agent claims to be is what every
-    // downstream router, gate, and dispatcher reads.
-    const grants = auth.capabilities ?? []
-    if (!(await memberCanOnSquad(env, grants, agent.squad_id, 'admin'))) {
-      return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
+    // Self lane (mupot#1288): an agent-bound caller whose resolved target IS its
+    // own row acts on its own authority, no admin required. Any other
+    // agent-bound caller — targeting a DIFFERENT agent's row — hits the same
+    // operator-principal refusal every sibling credential/capability tool
+    // carries, unchanged from before this fix.
+    const isSelf = auth.boundAgentId != null && auth.boundAgentId === agent.id
+    if (auth.boundAgentId && !isSelf) {
+      return fail(403, 'operator_principal_required')
     }
 
-    const PATCHABLE = [
-      'slug',
-      'name',
-      'role',
-      'model',
-      'model_fallback',
-      'purpose',
-      'owner',
-      'qnft_ref',
-      'capabilities',
-      'skills',
-      'budget_cap_cents',
-      'budget_window',
-    ] as const
+    if (isSelf) {
+      // Authority / identity-reference fields (including name/role — see the
+      // block comment above toolUpdateAgent) stay admin-gated even on the
+      // caller's own row. Checked BEFORE any write (patch isn't even built
+      // yet), and in SELF_FORBIDDEN_FIELDS's fixed order so "first offending
+      // field" is deterministic regardless of the order args arrived in.
+      for (const field of SELF_FORBIDDEN_FIELDS) {
+        if (field in args) return fail(403, 'forbidden', { need: 'admin', field })
+      }
+    } else {
+      // Precise scope check — the R1 floor above already proved this caller
+      // holds admin on SOME scope; this proves it holds admin on THIS
+      // squad specifically (or org-wide — hasCapability's org branch covers
+      // that inside memberCanOnSquad itself, see R3 in the block comment
+      // above, which is why there is no separate hasWorkspaceAdmin(auth)
+      // disjunct here). Admin on squad X does not imply admin on squad Y.
+      // A profile row is identity — who an agent claims to be is what every
+      // downstream router, gate, and dispatcher reads.
+      const grants = auth.capabilities ?? []
+      if (!(await memberCanOnSquad(env, grants, agent.squad_id, 'admin'))) {
+        return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
+      }
+    }
+
+    const PATCHABLE = isSelf ? SELF_PATCHABLE_FIELDS : ADMIN_PATCHABLE_FIELDS
 
     const patch: AgentProfilePatch = {}
     for (const key of PATCHABLE) {
@@ -1349,10 +1511,24 @@ const toolUpdateAgent: ToolSpec = {
       return fail(400, 'invalid_args', 'at least one field to update is required')
     }
 
-    const result = await updateAgentProfile(env, agent.id, patch, {
-      id: auth.memberId as string,
-      type: 'user',
-    })
+    // Audit actor: a self-correction is attributed to the agent itself (0086's
+    // CHECK already permits actor_type 'agent'), not to the human whose bearer
+    // token happens to be bound to it — the agent made this call, not them.
+    //
+    // F6 (Kasra's gate, PR #1289): agent_audit has NO column for the member
+    // behind an agent-bound token — actor_id is either the agent's id (self)
+    // or the member's id (operator), and that is the only durable signal.
+    // A consumer must tell a self-correction apart from an operator one by
+    // reading actor_type on THIS row, never by trusting the emitted event's
+    // self_report field below — the event is best-effort (see the comment on
+    // emitProvisioned below) and can be lost on a bus failure while the audit
+    // row still commits. self_report is a same-request convenience for a live
+    // listener, not the record of truth. No schema change in this PR.
+    const actor: AuditActor = isSelf
+      ? { id: auth.boundAgentId as string, type: 'agent' }
+      : { id: auth.memberId as string, type: 'user' }
+
+    const result = await updateAgentProfile(env, agent.id, patch, actor)
     if (!result.ok) {
       if (result.error === 'slug_taken') return fail(409, 'slug_taken', { slug: str(args.slug) })
       if (result.error === 'not_found') return fail(404, 'agent_not_found', { agent: agentRef })
@@ -1367,12 +1543,17 @@ const toolUpdateAgent: ToolSpec = {
     const changed = await readAuditDiff(env, result.auditId, Object.keys(patch))
 
     // Best-effort by design, and now safe to be: a bus failure loses a
-    // notification, not the audit trail. It used to lose both.
+    // notification, not the audit trail. It used to lose both. The event's
+    // `by`/actor stays the underlying member id (member_tokens always carries
+    // one, even for an agent-bound token) — self_report:true is what tells a
+    // consumer this correction came from the agent's own authority, not an
+    // operator's.
     await emitProvisioned(env, auth.memberId as string, 'agent_updated', agent.id, {
       agent_id: agent.id,
       squad_id: agent.squad_id,
       changed,
       reason: str(args.reason) || undefined,
+      ...(isSelf ? { self_report: true } : {}),
     })
 
     return done({ agent: result.value, changed, audit_id: result.auditId })

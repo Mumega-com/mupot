@@ -1,0 +1,4 @@
+import { TOOLS } from '../src/mcp/index'
+for (const t of TOOLS) {
+  expect(VALID_MIN.has(t.min)).toBe(true)
+}

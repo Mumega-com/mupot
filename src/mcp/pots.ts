@@ -54,6 +54,10 @@ export const toolPotProvision: ToolSpec = {
       return fail(400, 'invalid_args', 'Missing required fields: slug, brand_name, admin_email.')
     }
 
+    if (!env.SECRET_ENV_CF_API_TOKEN) {
+      return fail(503, 'unconfigured', 'Cloudflare API Token not configured for pot provisioning.')
+    }
+
     try {
       const input: SovereignPotProvisionInput = {
         slug,
@@ -64,7 +68,14 @@ export const toolPotProvision: ToolSpec = {
         custom_domain: str(args.custom_domain) || undefined,
       }
       const result = await provisionSovereignPot(env, input)
-      return done({ pot: result })
+      // `done()` reads as success to every caller. When provisioning did not finish, say so
+      // in the payload rather than letting the envelope speak for the outcome.
+      return done({
+        pot: result,
+        ok: result.ok,
+        status: result.status,
+        ...(result.ok ? {} : { warning: result.incomplete_reason }),
+      })
     } catch (err) {
       return fail(500, 'provisioning_failed', err instanceof Error ? err.message : String(err))
     }

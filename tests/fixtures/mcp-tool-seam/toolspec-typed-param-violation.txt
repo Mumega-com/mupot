@@ -1,0 +1,5 @@
+import type { ToolSpec } from '../src/mcp'
+async function isGuarded(tool: ToolSpec, env) {
+  const outcome = await tool.run(auth, env, {}, ctx)
+  return outcome.ok === false
+}

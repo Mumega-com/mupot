@@ -27,6 +27,8 @@ import { bearerToken, resolveMemberByToken } from '../auth/member-bearer'
 import { getAgentView } from './registry'
 import { verifySignedAttach } from './signed-attach'
 import { verifySignedDetach } from './signed-detach'
+import { isValidRuntime, runtimeVocabulary, RUNTIME_SET } from './runtimes'
+import { hasRegisteredKey } from './agent-keys'
 
 // ── shared upsert ───────────────────────────────────────────────────────────────────
 
@@ -113,14 +115,8 @@ async function markStopped(env: Env, agentId: string, memberId: string | null): 
 
 /** True if a signed-attach public key is registered for (tenant, agent_id). Such agents
  *  MUST use /attach-signed — the bearer path refuses them (no auth downgrade). */
-async function hasRegisteredKey(env: Env, agentId: string): Promise<boolean> {
-  const row = await env.DB.prepare(
-    `SELECT 1 AS x FROM agent_keys WHERE tenant = ?1 AND agent_id = ?2`,
-  )
-    .bind(env.TENANT_SLUG, agentId)
-    .first<{ x: number }>()
-  return !!row
-}
+// Definition moved to ./agent-keys so the MCP boot-time self-report validates against
+// the SAME predicate. Two copies of this one would let one path admit what the other refuses.
 
 // ── constants ─────────────────────────────────────────────────────────────────────
 
@@ -134,10 +130,7 @@ const VALID_TYPES = new Set(['builder', 'reviewer', 'weaver', 'brain', 'comms', 
 // daemon-report set which uses 'hermes-cron' for cron-only Hermes).
 // Goose / goosed are deliberately excluded — see docs/fleet/goose-non-adoption-2026-07-22.md.
 // Added 'prime-agent' and 'herdr' per F-09 / mupot#881 / mupot#893.
-const VALID_RUNTIMES = new Set([
-  'codex', 'claude-code', 'nous', 'hermes', 'hermes-cron',
-  'systemd-user', 'tmux', 'python', 'pi', 'prime-agent', 'herdr',
-])
+// Runtime vocabulary lives in src/fleet/runtimes.ts — ONE list, see the note there.
 
 const VALID_LIFECYCLES = new Set(['on_demand', 'always_on'])
 
@@ -201,8 +194,8 @@ fleetAttachApp.post('/attach', async (c) => {
   }
   const agentType = b.type
 
-  if (typeof b.runtime !== 'string' || !VALID_RUNTIMES.has(b.runtime)) {
-    return c.json({ error: 'bad_request', detail: `runtime: must be one of ${[...VALID_RUNTIMES].join('|')}` }, 400)
+  if (!isValidRuntime(b.runtime)) {
+    return c.json({ error: 'bad_request', detail: `runtime: must be one of ${runtimeVocabulary()}` }, 400)
   }
   // Runtime-reported model (harness-native-mupot lane A): optional display metadata, never
   // an authority. Reported-truth discipline (gate-protocol v2, Appendix A): the runtime
@@ -288,7 +281,7 @@ fleetAttachApp.post('/attach-signed', async (c) => {
 
   // 2. Verify the signature. Does ALL field validation (incl. lifecycle, which is SIGNED),
   //    freshness, key lookup, and the single-use nonce burn.
-  const v = await verifySignedAttach(c.env, b, VALID_TYPES, VALID_RUNTIMES, VALID_LIFECYCLES)
+  const v = await verifySignedAttach(c.env, b, VALID_TYPES, RUNTIME_SET, VALID_LIFECYCLES)
   if (!v.ok) return c.json({ error: v.error, detail: v.detail }, v.status as 400 | 401 | 409)
 
   // host: UNTRUSTED, agent-controlled, optional, display-only (#21 slice 2). Deliberately

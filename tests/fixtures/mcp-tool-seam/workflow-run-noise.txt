@@ -1,0 +1,3 @@
+import { TOOLS } from '../src/mcp/index'
+const instance = await env.MY_WORKFLOW.create()
+await workflow.run(payload)

@@ -336,13 +336,12 @@ export default {
     //
     // PATH IS THE TENANT ADDRESS: `mupot.mumega.com/t/{tenant}/{interface}`, e.g. `/t/gaf/mcp`.
     //
-    // The subdomain form `<tenant>.mupot.mumega.com` is NOT usable and must not be
-    // reintroduced. Cloudflare Universal SSL covers `mumega.com` and `*.mumega.com`, but
-    // not a second-level wildcard like `*.mupot.mumega.com` — that needs Advanced
-    // Certificate Manager. Measured 2026-09-03: `gaf.mupot.mumega.com` fails the TLS
-    // handshake outright (alert 552) while `mupot.mumega.com` answers 200, so a
-    // per-tenant subdomain dies before HTTP begins. `provisionSovereignPot` still
-    // computes that shape and hands it back as a login URL; see mupot#1285.
+    // The subdomain form `<tenant>.mupot.mumega.com` cannot serve: Cloudflare Universal SSL
+    // covers `mumega.com` and `*.mumega.com`, but not a second-level wildcard like
+    // `*.mupot.mumega.com` without Advanced Certificate Manager. Measured 2026-09-03 and
+    // again 2026-09-04: `gaf.mupot.mumega.com` fails the TLS handshake (alert 552) while
+    // `mupot.mumega.com` answers 200. Hostname dispatch below is kept because it is correct
+    // code, but it is unreachable in production today — see mupot#1306.
     //
     // Path-based routing needs no DNS record, no ACM, and no certificate per tenant.
     const rootHost = env.PUBLIC_ORIGIN ? new URL(env.PUBLIC_ORIGIN).hostname : 'mupot.mumega.com'
@@ -361,14 +360,16 @@ export default {
     }
 
     if (env.DISPATCHER) {
-      const headerSlug = req.headers.get('x-mupot-tenant-slug') || req.headers.get('x-pot-tenant')
-      const tenantSlug = extractTenantSlug(new URL(req.url).hostname, rootHost, headerSlug)
+      // HOSTNAME ONLY. This branch runs before the OAuth provider and every auth
+      // middleware, so a request header consulted here is an unauthenticated tenant
+      // selector (mupot#1299 — measured exploitable on production, fixed and deployed
+      // 2026-09-04). extractTenantSlug no longer accepts a header argument at all.
+      const tenantSlug = extractTenantSlug(new URL(req.url).hostname, rootHost)
 
       if (tenantSlug && tenantSlug !== homeSlug && tenantSlug !== 'mupot' && tenantSlug !== 'mumega') {
         const dispatcher = (await import('./dispatcher')).default
         return dispatcher.fetch(req, {
           DISPATCHER: env.DISPATCHER,
-          FALLBACK_POT: env.TENANT_SLUG,
           ROOT_DOMAIN: rootHost,
         })
       }
