@@ -11,6 +11,11 @@ import type { D1PreparedStatement } from '@cloudflare/workers-types'
 import type { Env, Department, Squad, Agent, Effort, Autonomy, BudgetWindow, OrgKind } from '../types'
 import { isEffort, isAutonomy, isBudgetWindow } from '../types'
 import { checkCreateLimit } from '../billing/entitlement'
+// Reused, not duplicated (mupot#1288, Kasra's gate) — src/fleet/boot-self-report.ts's
+// bearer-authenticated boot self-report already validates a claimed model against
+// this exact shape; update_agent's model/model_fallback fields must accept exactly
+// the same values or the two self-report paths silently diverge.
+import { MODEL_RE } from '../fleet/boot-self-report'
 
 // ── kind (migration 0093, mupot#925 P0-N1; UNSETTABLE-BY-BODY fix, mupot#925
 // P0-N3 / PR #928) ──────────────────────────────────────────────────────────
@@ -885,6 +890,45 @@ const UPDATABLE_TEXT_COLUMNS = [
 
 const UPDATABLE_ARRAY_COLUMNS = ['capabilities', 'skills'] as const
 
+// Shape caps for update_agent's self-lane fields (mupot#1288, Kasra's gate F3) —
+// enforced HERE, not just at the MCP tool layer, so the admin path gets them too
+// (an admin fat-fingering a 100k-char purpose is the same corrupted row as an
+// agent doing it). MODEL_RE is imported, not redefined, so this and boot-time
+// self-report (src/fleet/boot-self-report.ts) can never silently diverge on what
+// a "valid model string" is.
+//
+// PURPOSE_MAX_LEN / PURPOSE_CONTROL_CHAR_RE: purpose is free text (unlike model,
+// which is a slug-shaped identifier), so it only gets a length ceiling and a
+// control-character ban — NUL and friends have no legitimate reason to appear in
+// a one-line self-description, and letting them through risks corrupting log
+// lines / CSV exports / terminal renders downstream. \n is allowed (a purpose can
+// be a short paragraph); every other C0 control code and DEL are not.
+const PURPOSE_MAX_LEN = 2000
+// eslint-disable-next-line no-control-regex -- deliberately matching control chars to REJECT them
+const PURPOSE_CONTROL_CHAR_RE = /[\x00-\x09\x0B-\x1F\x7F]/
+
+// skills: capped at 32 entries, each a short lowercase tag — same shape family as
+// a capability/permission string elsewhere in this codebase, not free text.
+const SKILLS_MAX_COUNT = 32
+const SKILL_RE = /^[a-z0-9][a-z0-9_.:-]{0,63}$/
+
+// NAME_MAX_LEN / ROLE_MAX_LEN / IDENTITY_CONTROL_CHAR_RE (mupot#1288 gate round 3,
+// R4): name and role had NO shape cap on the admin path even after F3 capped
+// model/model_fallback/purpose/skills — and they are the two fields
+// interpolated RAW into an agent's own system turn (src/agents/execute.ts,
+// src/agents/loop.ts, src/agents/agent-do.ts), a stricter authority surface
+// than purpose (which reaches no prompt builder). Unlike purpose,
+// \n is NOT allowed here — a newline in role/name forges a standalone
+// prompt LINE, not just an oversized one, so the ban is every C0 control
+// code AND \n, not "every control code except \n". Bounds are generous for
+// a one-line identity string, not a paragraph: name tracks a short display
+// name (80 chars), role a short descriptor (200 chars — mirrors purpose's
+// intent but at a fraction of its length, since role is a title, not a brief).
+const NAME_MAX_LEN = 80
+const ROLE_MAX_LEN = 200
+// eslint-disable-next-line no-control-regex -- deliberately matching control chars to REJECT them
+const IDENTITY_CONTROL_CHAR_RE = /[\x00-\x1F\x7F]/
+
 // budget_cap_cents/budget_window (mupot#611 item 1): before this, budget_cap_cents
 // was settable ONLY at creation (prepareSquadCreate/prepareAgentCreate above). An
 // agent or squad created without a cap — or one whose spend profile changed — could
@@ -970,6 +1014,15 @@ export async function updateAgentProfile(
       if (!Array.isArray(raw) || !raw.every((x) => typeof x === 'string')) {
         return { ok: false, error: 'invalid_field' }
       }
+      // mupot#1288 F3 — skills is the one array column reachable from
+      // update_agent's self lane, so it gets the same shape discipline as a
+      // capability/permission tag: capped count, short lowercase-tag shape.
+      // `capabilities` (the other UPDATABLE_ARRAY_COLUMNS member) is
+      // admin-only on every path and keeps its existing string[] check only.
+      if (key === 'skills') {
+        if (raw.length > SKILLS_MAX_COUNT) return { ok: false, error: 'invalid_field' }
+        if (!raw.every((s) => SKILL_RE.test(s))) return { ok: false, error: 'invalid_field' }
+      }
       sets.push(`${key} = ?`)
       binds.push(JSON.stringify(raw))
       continue
@@ -980,9 +1033,16 @@ export async function updateAgentProfile(
     }
 
     if (raw === null) {
-      // slug and name are NOT NULL in the schema; clearing them would corrupt
-      // every join that resolves an agent by slug.
-      if (key === 'slug' || key === 'name') return { ok: false, error: 'invalid_field' }
+      // slug, name, role and model are NOT NULL in the schema (migration 0049
+      // — role/model carry schema DEFAULTs, but D1 still rejects an explicit
+      // NULL). Before mupot#1288 F4, role/model were missing from this list:
+      // a { role: null } or { model: null } patch sailed through this
+      // function's own validation, then threw a raw SQLite NOT NULL
+      // constraint violation out of the D1 batch — an admin-path patch that
+      // 500'd instead of failing closed with a named field.
+      if (key === 'slug' || key === 'name' || key === 'role' || key === 'model') {
+        return { ok: false, error: 'invalid_field' }
+      }
       sets.push(`${key} = ?`)
       binds.push(null)
       continue
@@ -992,6 +1052,31 @@ export async function updateAgentProfile(
     const trimmed = raw.trim()
     if ((key === 'slug' || key === 'name' || key === 'role' || key === 'model') && !trimmed) {
       return { ok: false, error: 'invalid_field' }
+    }
+    // mupot#1288 F3 — model/model_fallback are the two update_agent self-lane
+    // fields shaped like an identifier rather than free text; model_fallback
+    // is nullable (handled above) but once it IS a string it must be shaped
+    // the same as model, or a fallback nobody validated becomes the live
+    // model the moment the primary fails.
+    if ((key === 'model' || key === 'model_fallback') && !MODEL_RE.test(trimmed)) {
+      return { ok: false, error: 'invalid_field' }
+    }
+    if (key === 'purpose') {
+      if (trimmed.length > PURPOSE_MAX_LEN) return { ok: false, error: 'invalid_field' }
+      if (PURPOSE_CONTROL_CHAR_RE.test(trimmed)) return { ok: false, error: 'invalid_field' }
+    }
+    // mupot#1288 gate round 3, R4 — name/role reach the system prompt raw
+    // (see the block comment above IDENTITY_CONTROL_CHAR_RE); the non-empty
+    // check above already enforces the 1-char floor, this adds the ceiling
+    // and bans EVERY control character including \n (a newline here forges
+    // a standalone prompt line, unlike purpose where \n is legitimate).
+    if (key === 'name') {
+      if (trimmed.length > NAME_MAX_LEN) return { ok: false, error: 'invalid_field' }
+      if (IDENTITY_CONTROL_CHAR_RE.test(trimmed)) return { ok: false, error: 'invalid_field' }
+    }
+    if (key === 'role') {
+      if (trimmed.length > ROLE_MAX_LEN) return { ok: false, error: 'invalid_field' }
+      if (IDENTITY_CONTROL_CHAR_RE.test(trimmed)) return { ok: false, error: 'invalid_field' }
     }
     sets.push(`${key} = ?`)
     binds.push(trimmed)

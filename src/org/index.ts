@@ -29,6 +29,7 @@ import type {
 
 // requireAuth is owned by the auth component; it sets c.get('auth').
 import { requireAuth } from '../auth'
+import { csrf } from 'hono/csrf'
 // Fine-grained RBAC. Org mutations target a SPECIFIC scope: creating a department
 // is org admin; creating a squad in a department is admin+ on THAT department;
 // creating an agent / attaching a membership in a squad is lead+ on THAT squad.
@@ -110,6 +111,12 @@ export const orgApp = new Hono<{ Bindings: Env; Variables: { auth: AuthContext }
 orgApp.get('/health', (c) => c.json({ ok: true, component: 'org', tenant: c.env.TENANT_SLUG }))
 
 // Every route is authenticated and scoped to this pot's tenant.
+// CSRF (2026-09-02, adversarial class finding): cookie-authenticated mutations on a
+// top-level mount do not inherit dashboardApp's csrf(); SameSite=Lax is site-scoped
+// (mumega.com) and does not stop a sibling *.mupot.mumega.com origin, and text/plain
+// skips CORS preflight. hono/csrf guards the three CORS-simple content types only —
+// its coverage depends on this Worker having NO cors() anywhere. Same convention as tasksApp.
+orgApp.use('*', csrf())
 orgApp.use('*', requireAuth)
 orgApp.use('*', async (c, next) => {
   const auth = c.get('auth')

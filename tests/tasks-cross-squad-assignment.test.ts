@@ -9,6 +9,8 @@ const TARGET_SQUAD_ID = 'squad-target'
 const HOME_SQUAD_ID = 'squad-home'
 const CROSS_AGENT_ID = 'agent-cross'
 const MEMBER_ID = 'member-cross'
+const GATE_AGENT_ID = 'agent-gate'
+const GATE_MEMBER_ID = 'member-gate'
 
 const CROSS_AGENT: Agent = {
   id: CROSS_AGENT_ID,
@@ -38,7 +40,9 @@ function createSchema(sqlite: SqliteD1Harness['sqlite']): void {
       member_id TEXT NOT NULL,
       agent_id TEXT NOT NULL,
       tenant TEXT NOT NULL,
-      revoked_at TEXT
+      channel TEXT NOT NULL DEFAULT 'workspace',
+      revoked_at TEXT,
+      expires_at TEXT
     );
     CREATE TABLE agent_member_bindings (
       tenant TEXT NOT NULL,
@@ -60,6 +64,14 @@ function createSchema(sqlite: SqliteD1Harness['sqlite']): void {
       member_id TEXT NOT NULL,
       squad_id TEXT NOT NULL,
       capability TEXT NOT NULL
+    );
+    CREATE TABLE gate_grants (
+      id TEXT PRIMARY KEY,
+      capability TEXT NOT NULL,
+      principal_type TEXT NOT NULL,
+      principal_id TEXT NOT NULL,
+      granted_by TEXT NOT NULL,
+      created_at TEXT NOT NULL
     );
     -- priority + parent_task_id (migrations/0079) added by hand: this fixture hand-writes
     -- tasks rather than applying the committed chain, so a purely-additive column breaks it
@@ -97,12 +109,23 @@ function addCrossSquadIdentity(sqlite: SqliteD1Harness['sqlite'], capability: 'm
     VALUES ('${HOME_SQUAD_ID}', 'department-home', 'Home squad charter.');
     INSERT INTO squads (id, department_id, charter)
     VALUES ('${TARGET_SQUAD_ID}', 'department-target', 'Target squad charter.');
-    INSERT INTO agents (id, squad_id, status) VALUES ('${CROSS_AGENT_ID}', '${HOME_SQUAD_ID}', 'active');
-    INSERT INTO members (id, tenant, status) VALUES ('${MEMBER_ID}', '${TENANT}', 'active');
+    INSERT INTO agents (id, squad_id, status) VALUES
+      ('${CROSS_AGENT_ID}', '${HOME_SQUAD_ID}', 'active'),
+      ('${GATE_AGENT_ID}', '${TARGET_SQUAD_ID}', 'active');
+    INSERT INTO members (id, tenant, status) VALUES
+      ('${MEMBER_ID}', '${TENANT}', 'active'),
+      ('${GATE_MEMBER_ID}', '${TENANT}', 'active');
     INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
-    VALUES ('${TENANT}', '${CROSS_AGENT_ID}', '${MEMBER_ID}', '2026-07-24T00:00:00.000Z');
-    INSERT INTO member_tokens (id, member_id, agent_id, tenant, revoked_at)
-    VALUES ('token-cross', '${MEMBER_ID}', '${CROSS_AGENT_ID}', '${TENANT}', NULL);
+    VALUES
+      ('${TENANT}', '${CROSS_AGENT_ID}', '${MEMBER_ID}', '2026-07-24T00:00:00.000Z'),
+      ('${TENANT}', '${GATE_AGENT_ID}', '${GATE_MEMBER_ID}', '2026-07-24T00:00:00.000Z');
+    INSERT INTO member_tokens (id, member_id, agent_id, tenant, channel, revoked_at, expires_at) VALUES
+      ('token-cross', '${MEMBER_ID}', '${CROSS_AGENT_ID}', '${TENANT}', 'workspace', NULL, '2099-01-01T00:00:00.000Z'),
+      ('token-gate', '${GATE_MEMBER_ID}', '${GATE_AGENT_ID}', '${TENANT}', 'workspace', NULL, '2099-01-01T00:00:00.000Z');
+    INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+      VALUES ('grant-gate', '${GATE_MEMBER_ID}', 'squad', '${TARGET_SQUAD_ID}', 'member');
+    INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
+      VALUES ('gate-grant', 'gate:cross-review', 'agent', '${GATE_AGENT_ID}', '${MEMBER_ID}', '2026-07-24T00:00:00.000Z');
   `)
   sqlite.prepare(
     'INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES (?, ?, ?, ?, ?)',
@@ -233,6 +256,7 @@ describe('cross-squad task assignment over HTTP', () => {
       title: 'Execute cross-squad assignment',
       done_when: 'The execution result is persisted.',
       assignee_agent_id: CROSS_AGENT_ID,
+      gate_owner: 'gate:cross-review',
       dispatch: true,
     }), env)
     expect(created.status).toBe(201)

@@ -14,6 +14,8 @@ const runtimeContract = 'runtime-adapter/v1'
 const hermesLifecycle = 'Hermes IM lifecycle: Telegram update -> IM webhook -> chat_id member mapping -> capability gate -> fleet/approval/task effect -> reply'
 const smokeRunId = new Date().toISOString().replace(/[:.]/g, '-')
 const sendTaskTitle = `Browser workflow smoke ${smokeRunId}`
+const sendTaskDoneWhen = 'The browser-created task preserves this exact completion predicate and renders its result.'
+const sendTaskGateOwner = 'gate:local'
 const approvalTaskTitle = `Approval workflow smoke ${smokeRunId}`
 const hermesApprovalTaskTitle = `Hermes approval smoke ${smokeRunId}`
 const hermesTaskTitle = `Hermes dashboard refresh ${smokeRunId}`
@@ -605,6 +607,8 @@ async function runSendTaskWorkflow() {
     '',
     'Verify the browser harness can create a task, preserve done_when, and render a visible result.',
   ].join('\n'))
+  await page.locator('#send-done').fill(sendTaskDoneWhen)
+  await page.locator('#send-gate').fill(sendTaskGateOwner)
   // Flight-008 Slice 3 (mupot#1062): the /send dispatch-now picker is a radio-card
   // group (name="send-agent"), not a <select> — the browser can no longer supply
   // an implicit "first option" default, so the smoke workflow must explicitly
@@ -629,7 +633,13 @@ async function runSendTaskWorkflow() {
   if (submittedTask.project_id !== 'project-mupot') {
     fail('send smoke task lost project context', { submittedTask })
   }
-  if (typeof created?.task?.done_when !== 'string' || created.task.done_when.length === 0) {
+  if (submittedTask.done_when !== sendTaskDoneWhen) {
+    fail('send smoke request changed the exact done_when', { submittedTask })
+  }
+  if (submittedTask.gate_owner !== sendTaskGateOwner) {
+    fail('send smoke request changed the independent gate owner', { submittedTask })
+  }
+  if (created?.task?.done_when !== sendTaskDoneWhen) {
     fail('send task create did not preserve done_when', { created })
   }
 

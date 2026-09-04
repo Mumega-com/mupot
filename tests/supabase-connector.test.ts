@@ -190,11 +190,12 @@ describe('1-Click Supabase Data Connector & Engine (Flight 6)', () => {
         send: mockBusSend,
       },
       DB: harness.db,
+      SUPABASE_WEBHOOK_SECRET: 'test-webhook-secret',
     } as unknown as Env
 
     const req = new Request('http://localhost/supabase', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'x-supabase-webhook-secret': 'test-webhook-secret' },
       body: JSON.stringify(payload),
     })
 
@@ -225,10 +226,11 @@ describe('1-Click Supabase Data Connector & Engine (Flight 6)', () => {
       TENANT_SLUG: 'gaf',
       BUS: { send: mockBusSend },
       DB: harness.db,
+      SUPABASE_WEBHOOK_SECRET: 'test-webhook-secret',
     } as unknown as Env
     const req = new Request('http://localhost/supabase', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'x-supabase-webhook-secret': 'test-webhook-secret' },
       body: JSON.stringify(payload),
     })
 

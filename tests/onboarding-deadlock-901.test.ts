@@ -129,14 +129,30 @@ async function reachConsentScreen(
 let harness: SqliteD1Harness
 
 describe('#901 residual gap — the empty-agent consent screen names the escape hatch', () => {
-  it('when zero agents are consentable, the screen tells the caller bootstrap_self exists (not just silent "continue unbound")', async () => {
+  // WAS: asserted the screen names the `bootstrap_self` TOOL. The intent — that a
+  // caller with zero agents is not left in silence — is kept and strengthened.
+  // Naming a tool was the best available answer while the only exit was a tool
+  // call; it asked a customer to know an internal identifier. The screen now
+  // carries the operation itself, so it is asserted here instead.
+  it('when zero agents are consentable, the screen offers the way out rather than naming a tool', async () => {
     harness = createSqliteD1()
     applyAllMigrations(harness.sqlite)
     const oauthProvider = stubOAuthProvider()
     const { env } = httpEnv(harness, oauthProvider)
 
     const { html } = await reachConsentScreen(env, FRESH_EMAIL)
-    expect(html).toContain('bootstrap_self')
+
+    // The way out is on the page, and it is an action rather than an instruction.
+    expect(html).toContain('value="__bootstrap__"')
+    expect(html).toContain('name="first_agent_name"')
+    expect(html).toContain('Name your first agent')
+
+    // Not silent: the caller is told what state they are in.
+    expect(html).toContain('You do not have an agent yet')
+
+    // The tool still exists and still works — the seam test below exercises it —
+    // but a customer is no longer asked to know its name to get started.
+    expect(html).not.toContain('bootstrap_self')
 
     harness.close()
   })
@@ -173,7 +189,12 @@ describe('#901 residual gap — the empty-agent consent screen names the escape 
 })
 
 describe('#901 — the first-run deadlock, reproduced and then closed end-to-end', () => {
-  it('step 1: a genuinely fresh Google sign-in is offered NOTHING but unbound (no members/agents/squads rows exist before this test runs)', async () => {
+  // WAS: 'step 1: a genuinely fresh Google sign-in is offered NOTHING but unbound'.
+  // That assertion documented the deadlock this file was filed for, and it is now
+  // false ON PURPOSE — the consent screen offers the first-agent door in that
+  // state. The reproduction is kept rather than deleted, inverted to hold the fix
+  // in place: the same conditions, asserting the way out is present.
+  it('step 1: a genuinely fresh Google sign-in is offered a way out, not only unbound', async () => {
     harness = createSqliteD1()
     applyAllMigrations(harness.sqlite)
     const oauthProvider = stubOAuthProvider()
@@ -187,11 +208,22 @@ describe('#901 — the first-run deadlock, reproduced and then closed end-to-end
     expect(res.status).toBe(200)
     expect(html.toLowerCase()).toContain('unbound')
 
-    // THE DEADLOCK, literally: there is exactly one radio input on this page
-    // (the "no agent" default) — no selectable agent was ever offered, and
-    // nothing on this screen lets the human create one.
-    const radioCount = (html.match(/<input type="radio" name="agent_id"/g) ?? []).length
-    expect(radioCount).toBe(1)
+    // THE DEADLOCK WAS: exactly one radio on the page (the "no agent" default) —
+    // no agent offered, and nothing on the screen able to create one. The human's
+    // only exit was to know the name of an MCP tool.
+    //
+    // NOW: a second option exists, and it is the creating act itself. Assert both
+    // halves — that the door is there, and that it is genuinely reachable from a
+    // pot with no rows in it at all.
+    const radios = html.match(/<input type="radio" name="agent_id" value="([^"]*)"/g) ?? []
+    expect(radios.length).toBe(2)
+    expect(html).toContain('value="__bootstrap__"')
+    expect(html).toContain('Name your first agent')
+
+    // Still true, and still important: no AGENT is offered, because none exists.
+    // The fix is a way to create one, never a pre-existing identity appearing
+    // from nowhere.
+    expect(html).not.toMatch(/<input type="radio" name="agent_id" value="[0-9a-f-]{36}"/)
 
     harness.close()
   })

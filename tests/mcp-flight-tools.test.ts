@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import { mcpApp, TOOLS, invokeTool } from '../src/mcp'
 import type { AuthContext, Env } from '../src/types'
@@ -1321,6 +1322,7 @@ SHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
            NULL, NULL,
            '2026-07-12T00:00:00.000Z', '2026-07-12T00:00:00.000Z');
       `)
+      harness.sqlite.exec(readFileSync(new URL('../migrations/0137_agent_message_integrity.sql', import.meta.url), 'utf8'))
       const env = {
         TENANT_SLUG: TENANT,
         DB: harness.db,

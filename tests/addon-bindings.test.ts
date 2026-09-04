@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs'
 import type { D1PreparedStatement, D1Result } from '@cloudflare/workers-types'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   listAddonBindings,
   preflightAddonBindings,
@@ -127,7 +127,11 @@ describe('addon connector bindings', () => {
     env = { DB: harness.db, TENANT_SLUG: 'tenant-a' } as Env
   })
 
-  afterEach(() => harness.close())
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+    harness.close()
+  })
 
   it('configures the required first-party slot without storing a credential', async () => {
     const installation = await installMarketing(env)
@@ -326,6 +330,13 @@ describe('addon connector bindings', () => {
   })
 
   it('treats the same normalized configuration as idempotent and records changed generations as preflight', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-30T12:43:38.619Z'))
+    let nextUuid = 0xffff
+    vi.spyOn(crypto, 'randomUUID').mockImplementation(() => (
+      `00000000-0000-4000-8000-${(nextUuid--).toString(16).padStart(12, '0')}`
+    ))
+
     const installation = await installMarketing(env)
     const connectorId = insertConnector(harness)
     const first = await configureAddon(env, owner, 'marketing-cro-monitor', { bindings: [firstPartyBinding] })
@@ -350,7 +361,7 @@ describe('addon connector bindings', () => {
     expect(receipts[0]).toMatchObject({ previousState: null, nextState: null, actorId: owner.id })
     expect(harness.sqlite.prepare(`
       SELECT adapter, revoked_at FROM addon_connector_bindings
-       WHERE installation_id = ? ORDER BY configured_at, id
+       WHERE installation_id = ? ORDER BY (revoked_at IS NULL), configured_at, id
     `).all(installation.id)).toEqual([
       { adapter: 'first_party', revoked_at: expect.any(String) },
       { adapter: 'posthog', revoked_at: null },
@@ -384,6 +395,13 @@ describe('addon connector bindings', () => {
   })
 
   it('makes one concurrent identical reconfiguration generation and receipt authoritative', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-30T12:43:38.619Z'))
+    let nextUuid = 0xffff
+    vi.spyOn(crypto, 'randomUUID').mockImplementation(() => (
+      `00000000-0000-4000-8000-${(nextUuid--).toString(16).padStart(12, '0')}`
+    ))
+
     const installation = await installMarketing(env)
     const connectorId = insertConnector(harness)
     await configureAddon(env, owner, 'marketing-cro-monitor', { bindings: [firstPartyBinding] })
@@ -405,14 +423,14 @@ describe('addon connector bindings', () => {
     expect((await getAddonReceipts(env, installation.id)).filter(({ action }) => action === 'preflight')).toHaveLength(1)
     expect(harness.sqlite.prepare(`
       SELECT configuration_sha256, revoked_at FROM addon_binding_generations
-       WHERE installation_id = ? ORDER BY configured_at, id
+       WHERE installation_id = ? ORDER BY (revoked_at IS NULL), configured_at, id
     `).all(installation.id)).toEqual([
       { configuration_sha256: expect.any(String), revoked_at: expect.any(String) },
       { configuration_sha256: expect.any(String), revoked_at: null },
     ])
     expect(harness.sqlite.prepare(`
       SELECT adapter, revoked_at FROM addon_connector_bindings
-       WHERE installation_id = ? ORDER BY configured_at, id
+       WHERE installation_id = ? ORDER BY (revoked_at IS NULL), configured_at, id
     `).all(installation.id)).toEqual([
       { adapter: 'first_party', revoked_at: expect.any(String) },
       { adapter: 'posthog', revoked_at: null },

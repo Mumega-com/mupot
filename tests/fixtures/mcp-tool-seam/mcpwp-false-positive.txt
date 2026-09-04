@@ -1,0 +1,2 @@
+import { toolThing } from '../src/mcpwp/tools'
+await toolThing.run(auth, env, {}, ctx)

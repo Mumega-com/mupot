@@ -1,0 +1,2 @@
+const stmt = harness.sqlite.prepare('UPDATE tasks SET status = ? WHERE id = ?')
+stmt.run('done', id)

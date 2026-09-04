@@ -1,26 +1,87 @@
 # Changelog
 
-## Release status — 2026-08-30
+## Release status — 2026-09-02
 
-- **Current source version:** `0.30.0` in `package.json` and the public version constants.
+- **Current source version:** `0.30.0` on `main`. **This document does not pin the `main`
+  commit.** Any SHA written here is false the moment the commit writing it is merged, so
+  read it with `git rev-parse origin/main`.
+- **Current production deployment:** `0.30.0`. Read the exact commit and `clean` flag from
+  the live `/health` endpoint. A SHA is recorded here only when a deployment happens, and a
+  deployment is a gated event, so this line does not rot on every merge the way a `main` SHA
+  does. Most recent recorded deployment: `7d58d36be5a67a6e859f4513bc9fc65523aab1a8`,
+  `clean:true`, 2026-09-02T20:01:42Z (#1272 seat binding).
+- **Relationship between the two:** deliberately not asserted here. `main` advances on every
+  merge and production only on a deploy, so any "level with" or "behind" claim is stale
+  almost immediately. Compare `git rev-parse origin/main` against live `/health` to see the
+  real gap. Neither is a stable-release claim, because a stable release requires a tag, not
+  a deployment.
 - **Latest tagged stable release:** `v0.25.0`. Neither `v0.29.0` nor `v0.30.0`
   currently has a release tag or GitHub release, so source-version headings below are
   preview history, not a supported stable contract.
 - **v0.30.0 stabilization candidate:** PR #1239 landed as merge commit
   `f3389d65172b9660efaa82999675739046a987e9`, restoring a green main migration,
   typecheck, full-suite, schema-source, no-secrets, and local-evidence baseline.
-- **Athena-GREEN, not yet landed:** PR #1243 (credential-rotation recovery) and
-  PR #1242 (router/loop/meter authorization). Each must be refreshed against the
-  preceding merged main before it can enter the stable release candidate.
-- **Still required for the stable candidate:** revalidate/reconstruct the message
-  reliability work in #1235, #1237, and #1241; close or explicitly defer obsolete
-  PRs; run the exact release gate recorded in [ROADMAP.md](ROADMAP.md).
+- **Landed stabilization train:** PR #1243 (`8be1cac7`, credential rotation),
+  PR #1242 (`fb10d79b`, router/loop/meter authorization), PR #1237
+  (`b980f565`, immutable message integrity), PR #1245 (`31644899`, addon binding
+  ordering), PR #1235 (`4d41d9bd`, guest-squad send visibility), and PR #1241
+  (`a3d46acb`, strictly validated peek-only inbox cursor) are on main with
+  post-merge CI and CodeQL evidence.
+- **Release-surface hygiene complete:** obsolete/conflicting #1211, #1217,
+  #1236, and #1238 were closed with replacement or deferral evidence; branches
+  were preserved.
+- **Post-freeze main drift recorded:** PR #1249 landed externally as merge
+  commit `16390d1e` after #1241, adding exact external-runtime dispatch receipt
+  paths. Its code is present in the candidate base but remains preview rather
+  than a newly promoted stable-release claim.
+- **Release preparation landed:** #1250 (`ccfdb4b3`, versioned v0.30 contract),
+  #1251 (`c6ef9876`, evidence-chain-neutral Host-Go receipt), and #1252
+  (`55c1c3ef`, exact `codex-cli` harness vocabulary) are now on `main`. All were
+  exact-head gated with terminal-successful CI and CodeQL. #1252 is present in the
+  current production deployment as of the 2026-09-02 `7d58d36b` deploy (`55c1c3ef` is
+  an ancestor of it) and does not backfill old presence rows.
+- **Still required for the stable candidate:** freeze one exact `main` SHA,
+  collect the fresh receipts in [the v0.30.0 release contract](docs/releases/v0.30.0.md),
+  execute the [next release flights](docs/releases/next-flights.md), and pass the
+  exact release gate recorded in [ROADMAP.md](ROADMAP.md).
 - **Release-excluded:** the #1236 omnibus, project-worker/sandbox expansion, device
-  fleet, new onboarding journeys, and other unbounded feature work. Useful donor
-  material must return through separate reviewed PRs after `v0.30.0`.
+  fleet, new onboarding journeys, open #1246–#1248 and #1253–#1254, and other
+  unbounded feature work. Useful donor material must return through separate
+  reviewed PRs after `v0.30.0`.
 
-No entry in this section claims a deployment. Tagging, publishing, and deploying
-`v0.30.0` each require separate receipts and approval.
+The production line above is a measured health snapshot, not a claim that #1250–#1252
+are deployed or stable. Tagging, publishing, and deploying a release candidate or
+stable `v0.30.0` each require separate receipts and approval.
+
+## Preview on main — 2026-09-01 (not fully deployed or tagged)
+
+- **Versioned v0.30 release contract and fail-closed evidence tooling** (#1250,
+  merge `ccfdb4b3`).
+  - Adds human-readable and machine-readable `v0.30.0` release contracts.
+  - Separates RC identity (`v0.30.0-rc.1`) from the already-cut package/API source
+    version (`0.30.0`) and binds tag, remote tag, live health, receipts, and the
+    release SHA to one exact commit.
+  - Rejects dirty, unpublished, malformed, cross-version, cross-commit, and
+    remote-tag-divergent evidence rather than reconstructing a green result.
+
+- **Evidence-chain-neutral Host-Go receipt** (#1251, merge `c6ef9876`).
+  - Replaces the v0.30 Host-Go contract with `mupot-host-go-cutover/v1` and a
+    redacted `no_live_sos_wiring` assertion.
+  - Preserves strict historical receipt parsing and v0.23 evidence compatibility;
+    no historical receipt is silently reclassified as v0.30 readiness.
+
+- **Exact Codex CLI harness recognition** (#1252, merge `55c1c3ef`).
+  - Accepts exact `codex-cli` declarations across presence persistence, runtime
+    parsing, MCP schemas, catalog text, and initialize instructions.
+  - Bare `codex`, case variants, whitespace-padded values, and arbitrary strings
+    remain unknown. Harness text is descriptive runtime metadata, not agent identity
+    or cryptographic provenance.
+  - Existing presence rows are not backfilled; a deployed runtime must check in
+    again before its seat reports `codex-cli`.
+
+These changes prepare and describe a release candidate. They do not prove the fresh
+install, recovery, RC publication, stable deployment, tag, or GitHub Release required
+for `v0.30.0` stability.
 
 ## Preview on main — 2026-08-26 (not a tagged release)
 
@@ -29,7 +90,7 @@ No entry in this section claims a deployment. Tagging, publishing, and deploying
   - Model prompts use a frozen static prefix (charter, architecture, tool schemas, River governance) with dynamic turns at the bottom, plus a keep-alive heartbeat.
   - D1 registers River on `squad-core` (`gemini-3.7-flash`) when that squad exists; `check_in` records 7-axis presence for `seat: river-cursor`.
 
-## 0.30.0 source cut — 2026-08-21 (preview; not tagged)
+## [0.30.0] — source cut 2026-08-21 (release candidate; not tagged)
 
 This heading records when the source version advanced to `0.30.0`. It is not a
 stable-release date. Features listed here remain preview until the stabilization
@@ -98,27 +159,7 @@ scope and release gate in [ROADMAP.md](ROADMAP.md) pass at one exact main commit
 
 - **Session transcript** (`docs/session-transcripts/2026-08-15-primeagent-deepseek-v4-flash-0730.md`) — truncated transcription of the Athena gate seat session on prime-agent (deepseek-v4-flash): gate verdict confirmation (Flight 640f6b4d, #1040), correctness lenses #1052/#1053, CF token TTL fix, fleet responder retirement, mupot visibility review (Hadi-directed).
 
-
-
 ## 0.29.0 source cut — 2026-08-08 (untagged)
-
-- **Build-Time Release Identity & Version Truth** (`src/health.ts`, `scripts/generate-build-info.mjs`; #443, #571).
-  - `/health` and deployment consoles now stamp exact commit identity (`commit`), branch (`ref`), build timestamp (`built_at`), and working-tree cleanliness (`clean`) by construction via `src/build-info.ts` fallback when runtime environment variables are omitted.
-  - Eliminated decorative `clean: false` state; `clean` strictly reflects working-tree status (`git status --porcelain`). Branch identity is tracked separately via `ref`.
-  - Supersedes the env-only stamping direction of `aac13ed` (#443, #571): `RELEASE_SHA` still takes precedence when present, and the generated build-info module is the floor for deploys that do not run the wrapper. Adopted deliberately — four production deploys on 2026-08-07 used bare `wrangler deploy` and every one reported `commit: null`.
-
-- **Sovereign Addons & Memory Engine (v0.28.0)** (`src/addons/`, `src/telemetry/`, `src/dashboard/motherboard.ts`; #780, #796, #797, #798).
-  - Four modular Hono addon sub-apps (`sos`, `mirror`, `inkwell`, `torivers`) with fail-closed HTTP 503 `unconfigured_secret` and 401 authentication handlers.
-  - D1 token usage telemetry logging (`subagent_token_usage` table) integrated directly into `dispatchRun`.
-  - Fractal Motherboard visual map (`/dashboard/motherboard`) with RBAC squad scoping (`resolveGrantedSquadIds`).
-  - D1 Migrations `0083_subagent_tentacles_registration.sql`, `0084_subagent_token_telemetry.sql`, and `0085_identity_cleanup.sql`.
-
-- **Telegram Central Command Ingress & Native Webhook** (`src/channels/`, `src/telegram-bridge/`; #789, #769, #760, #767, #779).
-  - Fail-closed native Telegram webhook handler (`/channels/telegram/webhook`) gated by immutable sender authority (Hadi ID `765204057`), rate walls, and Bot API delivery.
-  - Cleaned up duplicate legacy webhook ingress.
-
-- **Master Constitution `MU.100.001` v6 Ratification** (`docs/constitution/`; #788).
-  - Ratified governance contract signed by River, Kasra, and Athena, establishing Asha identity, UNPROVEN sharpening, and council workflow state machines.
 
 - **Build-Time Release Identity & Version Truth** (`src/health.ts`, `scripts/generate-build-info.mjs`; #443, #571).
   - `/health` and deployment consoles now stamp exact commit identity (`commit`), branch (`ref`), build timestamp (`built_at`), and working-tree cleanliness (`clean`) by construction via `src/build-info.ts` fallback when runtime environment variables are omitted.

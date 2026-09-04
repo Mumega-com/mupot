@@ -35,6 +35,7 @@ import type {
 } from '../types'
 import { resolveCapabilities, hasCapability } from '../auth/capability'
 import { createBus } from '../bus'
+import { sha256Hex } from '../lib/canonical-json'
 import { getAdapter } from './registry'
 import { sendToRef, resolveVisibleSendTarget } from '../agents/messages'
 import { createTask } from '../tasks/service'
@@ -619,10 +620,13 @@ async function sosBusSend(
 ): Promise<string> {
   const id = crypto.randomUUID()
   const tenant = env.TENANT_SLUG ?? 'mumega'
+  const auditBody = `[sos-bus] ${body}`
+  const auditChecksum = await sha256Hex(auditBody)
   await env.DB.prepare(
-    `INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, created_at)
-     VALUES (?1, ?2, ?3, ?4, 'system', 'message', ?5, datetime('now'))`
-  ).bind(id, tenant, target, 'central-command', `[sos-bus] ${body}`).run()
+    `INSERT INTO agent_messages
+       (id, tenant, to_agent, from_agent, from_member, kind, body, created_at, body_length, checksum_sha256)
+     VALUES (?1, ?2, ?3, ?4, 'system', 'message', ?5, datetime('now'), ?6, ?7)`
+  ).bind(id, tenant, target, 'central-command', auditBody, auditBody.length, auditChecksum).run()
 
   return `@${target} is SOS-native and NOT REACHED: no SOS bridge exists, so this message was only recorded for audit (id: ${id.slice(0, 8)}). Nobody received it — deliver it another way.`
 }

@@ -21,8 +21,37 @@ export interface SovereignPotProvisionInput {
   account_id?: string
 }
 
+/** The steps a pot needs before it exists. Named so a partial run can say which ones
+ *  actually happened instead of implying all of them. */
+export type ProvisionStep =
+  | 'create_d1'
+  | 'create_kv'
+  | 'apply_schema'
+  | 'deploy_worker'
+  | 'seed_identities'
+  | 'verify_reachable'
+
+/** Resources that were created before provisioning stopped. Real, billable, and nobody's
+ *  job to clean up unless the caller is TOLD about them. */
+export interface OrphanedResources {
+  d1_database_id: string | null
+  d1_database_name: string | null
+  kv_namespace_id: string | null
+  kv_namespace_title: string | null
+}
+
 export interface SovereignPotProvisionResult {
+  /** TRUE only when every step completed and the pot was verified reachable.
+   *  It previously meant "the function returned", which is not the same thing. */
   ok: boolean
+  status: 'provisioned' | 'incomplete'
+  completed: ProvisionStep[]
+  /** What did NOT happen. Empty only when status is 'provisioned'. */
+  not_completed: ProvisionStep[]
+  /** Populated whenever status is 'incomplete' — these exist and cost money. */
+  orphaned_resources: OrphanedResources | null
+  /** Why it stopped, in words an operator can act on. */
+  incomplete_reason: string | null
   slug: string
   brand_name: string
   plan_tier: SovereignPotTier
@@ -35,11 +64,14 @@ export interface SovereignPotProvisionResult {
   public_origin: string
   admin_email: string
   admin_member_id: string
-  admin_token: string
-  admin_login_url: string
+  /** NULL until seeding exists. A credential that was generated in memory and never
+   *  written to the pot's database authenticates nothing; returning it as if it worked is
+   *  how an operator ends up debugging a login that was never possible. */
+  admin_token: string | null
+  admin_login_url: string | null
   lead_agent_id: string
   lead_agent_name: string
-  lead_agent_token: string
+  lead_agent_token: string | null
   provisioned_at: string
 }
 

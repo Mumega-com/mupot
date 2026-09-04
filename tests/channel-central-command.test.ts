@@ -25,6 +25,8 @@ import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import type { Env } from '../src/types'
+import { readAgentInbox } from '../src/agents/messages'
+import { sha256Hex } from '../src/lib/canonical-json'
 
 const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
 
@@ -175,6 +177,15 @@ describe('central-command ingress (mumega-com#722)', () => {
     expect(msg?.body).toContain('[sos-bus]')
     // The audit row is the ONLY effect. It is not evidence of delivery.
     expect(msg?.body).toContain('review spec')
+
+    const inbox = await readAgentInbox(env, { agent: 'river', peek: true })
+    expect(inbox.ok).toBe(true)
+    if (!inbox.ok) return
+    expect(inbox.messages[0]).toMatchObject({
+      body_length: msg?.body.length,
+      checksum_sha256: await sha256Hex(msg?.body ?? ''),
+      is_intact: true,
+    })
   })
 
   // B1b UPDATED (flight-20260809-mupot-deploy-unblock): PR #866 reverted the
