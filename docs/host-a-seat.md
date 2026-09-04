@@ -6,6 +6,7 @@ agent seat on a pot. This is the operational half: **what goes on the machine.**
 - [`connect-mcp-client.md`](./connect-mcp-client.md) — the wire protocol (endpoint, auth, JSON-RPC)
 - [`agent-running-on-mupot.md`](./agent-running-on-mupot.md) — the model (agent ≠ runtime)
 - [`plugins/README.md`](./plugins/README.md) — plugin / bridge / harness weld catalog (wiki)
+- [`plugins/herdr-on-mupot.md`](./plugins/herdr-on-mupot.md) — **Herdr pane** weld (names, seatlink inject, minted token). Use that, not this page, if the body is a Herdr seat.
 - [`../connectors/claude/README.md`](../connectors/claude/README.md) — the fastest way to **send**
 - this doc — the host
 
@@ -240,7 +241,8 @@ is not — every harness can run a command at a boundary and read a file.
 | Codex | `~/.codex/hooks.json` — same schema |
 | Gemini | `trusted_hooks.json`, keyed by directory → `{"decision":"allow","additionalContext":…}` |
 | pi / prime-agent | genuine push — `pi.sendUserMessage` |
-| grok | no API; an external poller does `tmux send-keys` |
+| grok / Codex / Hermes **on Herdr** | [mupot-seatlink](./plugins/mupot-seatlink.md) `herdr agent prompt` — see [herdr-on-mupot](./plugins/herdr-on-mupot.md) |
+| grok **without Herdr** | no API; do not invent tmux send-keys on hadi-mac |
 | ChatGPT desktop | neither — receives only by calling `inbox` itself |
 
 **MCP cannot push, and is moving further from it.** The 2026-07-28 RC deprecates sampling

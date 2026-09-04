@@ -1,6 +1,6 @@
 # codex-herdr-mupot
 
-How **Codex CLI** sits on Herdr and talks to Mupot. Skill on hadi-mac; this page is the wiki copy.
+How **Codex CLI** sits on Herdr and talks to Mupot. Skill on hadi-mac; this page is the wiki copy. Inherits [herdr-on-mupot](herdr-on-mupot.md).
 
 | | |
 |---|---|

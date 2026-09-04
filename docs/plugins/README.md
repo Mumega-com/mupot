@@ -7,16 +7,20 @@ This tree: [`docs/plugins/`](.) on [`Mumega-com/mupot`](https://github.com/Mumeg
 
 Read like a wiki: start here, open one page. Do not print tokens. Token **paths** only.
 
+**Herdr seats:** start at [herdr-on-mupot](herdr-on-mupot.md), then the harness page.
+
 ## Map
 
 | Name | Kind | Status | Retrieve |
 |---|---|---|---|
+| [herdr-on-mupot](herdr-on-mupot.md) | Shared Herdr ↔ Mupot contract | **live** (hadi-mac) | this catalog |
 | [herdr-mupot-bridge](herdr-mupot-bridge.md) | Herdr plugin (poll) | **published** v0.1.0 · Mac install **disabled** | [Mumega-com/herdr-mupot-bridge](https://github.com/Mumega-com/herdr-mupot-bridge) |
 | [mupot-seatlink](mupot-seatlink.md) | Herdr plugin (events) | **live** v0.2.0 on hadi-mac · source local | `dara/designs/herdr-event-bus/plugin/mupot-seatlink` |
 | [mupot-plugin](mupot-hermes-plugin.md) | Hermes plugin | **published** v0.3 | [Mumega-com/mupot-plugin](https://github.com/Mumega-com/mupot-plugin) |
 | [mupot-claude-plugin](mupot-claude-plugin.md) | Claude Code plugin | **published** | [Mumega-com/mupot-claude-plugin](https://github.com/Mumega-com/mupot-claude-plugin) |
 | [grok-herdr-mupot](grok-herdr-mupot.md) | Grok Build skill + MCP weld | **live** on hadi-mac | `~/.grok/skills/grok-herdr-mupot` (this catalog mirrors the wiki page) |
 | [codex-herdr-mupot](codex-herdr-mupot.md) | Codex CLI skill + MCP weld | **live** on hadi-mac | `~/.codex/skills/codex-herdr-mupot` (this catalog mirrors the wiki page) |
+| [hermes-herdr-mupot](hermes-herdr-mupot.md) | Hermes skill + MCP weld | **live** on hadi-mac · weld **split** (see page) | `~/.hermes/skills/hermes-herdr-mupot` |
 | [cursor-mupot-pager](cursor-mupot-pager.md) | Slack broker for Cursor Cloud | **live** (hadi-grok-desktop) | `dara/.grok/skills/cursor-mupot-pager` |
 | [prime-mupot-experience](prime-mupot-experience.md) | Prime-agent skill + bridges | **published** | [Mumega-com/prime-mupot-experience](https://github.com/Mumega-com/prime-mupot-experience) |
 
