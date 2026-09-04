@@ -1,0 +1,2 @@
+import { invokeTool } from '../src/mcp/index'
+await invokeTool(auth, env, 'send', {}, ctx)

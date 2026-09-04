@@ -1,0 +1,3 @@
+import { toolPotProvision } from '../src/mcp/pots'
+// seam-exempt: migration-behaviour test, no auth context available
+const outcome = await toolPotProvision.run(auth, env, {}, ctx)

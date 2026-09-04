@@ -1,0 +1,2 @@
+import { toolPotProvision } from '../src/mcp/pots'
+const outcome = await toolPotProvision.run(auth, env, {}, ctx)

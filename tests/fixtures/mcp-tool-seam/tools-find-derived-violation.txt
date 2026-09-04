@@ -1,0 +1,3 @@
+import { TOOLS } from '../src/mcp/index'
+const toolSend = TOOLS.find((t) => t.name === 'send')!
+const r = await toolSend.run(auth, env, {}, ctx)
