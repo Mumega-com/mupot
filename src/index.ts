@@ -50,6 +50,7 @@ import { studioApp } from './dashboard/studio'
 import { studioDataApp } from './dashboard/studio-data-api'
 import { orientApp } from './orient/routes'
 import { handleOAuthAuthorize, resolveExternalToken as memberKeyResolver } from './mcp/oauth-authorize'
+import { deviceApp } from './auth/device-routes'
 import { McpOAuthApiHandler } from './mcp/oauth-api-handler'
 import { brainPhysicsIngestApp } from './dashboard/brain-ingest'
 import { billingAdminApp } from './billing/admin'
@@ -224,6 +225,7 @@ app.route('/api/presence', presenceApp)
 app.all('/authorize', async (c) => handleOAuthAuthorize(c.req.raw, c.env))
 app.all('/oauth/google-callback', async (c) => handleOAuthAuthorize(c.req.raw, c.env))
 app.all('/oauth/consent', async (c) => handleOAuthAuthorize(c.req.raw, c.env))
+app.route('/device', deviceApp)
 
 // Project sub-worker preview (`/preview/:project_id/*`) must precede the
 // dashboard '/' catch-all so the iframe is not redirected through login HTML.
