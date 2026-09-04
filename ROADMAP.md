@@ -1,8 +1,14 @@
 # Mupot version roadmap
 
 This is the canonical forward-looking product roadmap. [CHANGELOG.md](CHANGELOG.md)
-is the canonical record of what has shipped. GitHub milestones use the same version
-numbers.
+is the canonical record of what has shipped.
+
+**GitHub milestones do NOT currently match these version numbers** (verified 2026-09-04).
+No `v0.30.0` milestone exists — the newest is `v0.29.0 - Distribution and Commercial
+Operations` — and existing milestone titles still use the PRE-renumbering scheme this
+document describes moving away from (`v0.26.0 - Governed Tools`, `v0.27.0 - Agent
+Computers`). The v0.30.0 release contract's integrity gate requires a milestone that agrees
+with the release, so that gate is currently unsatisfiable as written.
 
 ## Current version
 

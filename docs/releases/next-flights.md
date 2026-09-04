@@ -37,6 +37,22 @@ Any merge after Flight A invalidates Flights B and C. Land the correction throug
 normal exact-head gate, freeze the new `main`, and restart from Flight A. No prior RC
 receipt rolls forward to a different commit.
 
+## Evidence hygiene — read before building the aggregate bundle
+
+`/home/mumega/.fleet/receipts/mumega-vps-codex-attach/` contains two receipts dated
+2026-08-30, **both `status: "fail"` with `release_sha: null`**. It is the only Host-Go-shaped
+bundle on the host, and it has neither `manifest.json` nor `cutover-gate.json`.
+
+A glob such as `*-check.json` when assembling the aggregate evidence directory **will sweep
+these in**. Exclude the path explicitly, or move it aside first. The contract's own rule —
+an unbound historical outer bundle cannot admit a bound prior bundle — means including it
+does not merely add noise, it invalidates the bundle.
+
+Verified state of the prepublication receipts as of 2026-09-04: **1 of 11 exists**
+(`mupot-github-app-permissions/v1`, passing 35/35, and notably the only one carrying no
+`release_sha` binding — so it is the only receipt that survives a re-freeze). The other ten
+must be produced fresh from whatever SHA is frozen.
+
 ## Supersession — 2026-09-04
 
 `v0.30.0-rc.1` was tagged at `0bb9c256` on 2026-09-03. `main` is now 13 commits ahead of it.
