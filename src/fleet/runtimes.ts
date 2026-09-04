@@ -23,6 +23,7 @@ export const RUNTIME_VALUES = [
   'codex',
   'claude-code',
   'grok',        // added 2026-09-03: Athena's harness moved to grok and could not say so
+  'antigravity-cli', // added 2026-09-04: Loom runs Google Antigravity; heartbeat row said 'tmux'
   'nous',
   'hermes',
   'hermes-cron',
