@@ -1,0 +1,2 @@
+import { invokeTool } from '../src/mcp/index'
+const out = await invokeTool(auth, env, 'send', { to: 'x', body: 'hi' }, ctx)

@@ -1,0 +1,5 @@
+import { PROVISION_TOOLS } from '../src/mcp/provision'
+const registryWithRegression = [...PROVISION_TOOLS, forgotTheGuard]
+for (const tool of registryWithRegression) {
+  await tool.run(auth, env, {}, ctx)
+}

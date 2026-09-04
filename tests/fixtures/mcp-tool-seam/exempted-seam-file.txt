@@ -1,0 +1,2 @@
+import { toolPotProvision } from '../src/mcp/pots'
+await toolPotProvision.run(auth, env, {}, ctx) // seam-exempt: sanctioned probe

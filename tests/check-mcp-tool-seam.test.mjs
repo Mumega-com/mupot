@@ -5,19 +5,32 @@
 // dead in production while the tests exercising it stay green.
 //
 // Two halves, like the model:
-//   1. `scanSource` unit tests — the detector itself, driven with synthetic source. Proves
-//      the taint-propagation shapes (direct import, `.find()`-derived variable, for-of loop
-//      variable, type-annotated parameter) are all caught, and that D1/Workflow/vitest
-//      `.run()` calls are NOT false-positived.
+//   1. `scanSource` unit tests — the detector itself, driven with synthetic source read from
+//      tests/fixtures/mcp-tool-seam/*.txt. Proves the taint-propagation shapes (direct
+//      import, `.find()`-derived variable, for-of loop variable, type-annotated parameter)
+//      are all caught, and that D1/Workflow/vitest `.run()` calls are NOT false-positived.
 //   2. The git-backed ratchet pins — a throwaway repo with a committed `main`, so the
 //      non-growth / smuggled-file / stale-baseline mechanics have a real merge target to be
 //      tested against, exactly like test-schema-source.test.mjs's scaffold()/run().
+//
+// WHY THE FIXTURES LIVE IN .txt FILES, NOT INLINE TEMPLATE LITERALS: this file's own job is
+// to synthesize source that LOOKS LIKE a test importing '../src/mcp/...' and calling
+// prepare()/.run() — which is exactly the textual shape scripts/check-test-schema-source.mjs
+// scans for. That guard classifies by regex over a file's raw text, not by AST, so an inline
+// fixture like `import { TOOLS } from '../src/mcp/index'` sitting in THIS file's own source
+// trips its mockDb detector even though it's test data, not a real import (found in CI on
+// this very file, PR #1291). The fix is not a token trick (splitting strings, a decoy
+// `applyAllMigrations(` to short-circuit its classify()) — that is exactly the false-signal
+// class both ratchets exist to reject. Externalizing the fixture bodies to .txt is the real
+// fix: check-test-schema-source.mjs's own walk() only scans .ts/.tsx/.mjs/.cjs/.js
+// (scripts/check-test-schema-source.mjs:161), so a .txt fixture is invisible to it by
+// construction, not by incidental token luck.
 //
 // Run: node --test tests/check-mcp-tool-seam.test.mjs
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, cpSync, symlinkSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, cpSync, symlinkSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
@@ -26,13 +39,18 @@ import { scanSource } from '../scripts/check-mcp-tool-seam.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const SCRIPT = join(HERE, '..', 'scripts', 'check-mcp-tool-seam.mjs')
+const FIXTURES_DIR = join(HERE, 'fixtures', 'mcp-tool-seam')
+
+/** Read a fixture source body by filename. Kept as one helper so every fixture read goes
+ * through the same, obviously-inert path (no string concatenation, no partial reads). */
+function fixture(name) {
+  return readFileSync(join(FIXTURES_DIR, name), 'utf8')
+}
 
 // ── the detector ───────────────────────────────────────────────────────────────────────
 
 test('a directly-imported tool identifier calling .run() is a violation', () => {
-  const src = `import { toolPotProvision } from '../src/mcp/pots'\n` +
-    `const outcome = await toolPotProvision.run(auth, env, {}, ctx)\n`
-  const { violations } = scanSource('x.test.ts', src)
+  const { violations } = scanSource('x.test.ts', fixture('direct-import-violation.txt'))
   assert.equal(violations.length, 1)
   assert.equal(violations[0].line, 2)
 })
@@ -40,21 +58,14 @@ test('a directly-imported tool identifier calling .run() is a violation', () => 
 test('a variable derived via TOOLS.find() is tainted and its .run() is a violation', () => {
   // The exact shape of mupot#1289's original defect and tests/agent-messages.test.ts today:
   // the tool object is never itself imported, only looked up from an imported registry.
-  const src = `import { TOOLS } from '../src/mcp/index'\n` +
-    `const toolSend = TOOLS.find((t) => t.name === 'send')!\n` +
-    `const r = await toolSend.run(auth, env, {}, ctx)\n`
-  const { violations } = scanSource('x.test.ts', src)
+  const { violations } = scanSource('x.test.ts', fixture('tools-find-derived-violation.txt'))
   assert.equal(violations.length, 1)
   assert.equal(violations[0].line, 3)
 })
 
 test('a for-of loop variable over an imported registry is tainted', () => {
   // tests/provision-tools.test.ts's actual shape: `for (const tool of PROVISION_TOOLS)`.
-  const src = `import { PROVISION_TOOLS } from '../src/mcp/provision'\n` +
-    `for (const tool of PROVISION_TOOLS) {\n` +
-    `  await tool.run(auth, env, {}, ctx)\n` +
-    `}\n`
-  const { violations } = scanSource('x.test.ts', src)
+  const { violations } = scanSource('x.test.ts', fixture('provision-tools-loop-violation.txt'))
   assert.equal(violations.length, 1)
   assert.equal(violations[0].line, 3)
 })
@@ -62,12 +73,7 @@ test('a for-of loop variable over an imported registry is tainted', () => {
 test('an array literal spreading an imported registry is tainted', () => {
   // provision-tools.test.ts's regression-simulation shape: a local array that spreads a
   // seam-imported registry plus a locally-defined extra tool.
-  const src = `import { PROVISION_TOOLS } from '../src/mcp/provision'\n` +
-    `const registryWithRegression = [...PROVISION_TOOLS, forgotTheGuard]\n` +
-    `for (const tool of registryWithRegression) {\n` +
-    `  await tool.run(auth, env, {}, ctx)\n` +
-    `}\n`
-  const { violations } = scanSource('x.test.ts', src)
+  const { violations } = scanSource('x.test.ts', fixture('array-spread-loop-violation.txt'))
   assert.equal(violations.length, 1)
   assert.equal(violations[0].line, 4)
 })
@@ -75,66 +81,45 @@ test('an array literal spreading an imported registry is tainted', () => {
 test('a parameter typed with an imported ToolSpec is tainted even though never imported by name', () => {
   // provision-tools.test.ts's isGuarded(tool: ToolSpec, env: Env) — `tool` is a bare
   // parameter, caught only because its TYPE annotation names an import from src/mcp.
-  const src = `import type { ToolSpec } from '../src/mcp'\n` +
-    `async function isGuarded(tool: ToolSpec, env) {\n` +
-    `  const outcome = await tool.run(auth, env, {}, ctx)\n` +
-    `  return outcome.ok === false\n` +
-    `}\n`
-  const { violations } = scanSource('x.test.ts', src)
+  const { violations } = scanSource('x.test.ts', fixture('toolspec-typed-param-violation.txt'))
   assert.equal(violations.length, 1)
   assert.equal(violations[0].line, 3)
 })
 
 test('going through invokeTool is the sanctioned path and is not a violation', () => {
-  const src = `import { invokeTool } from '../src/mcp/index'\n` +
-    `const out = await invokeTool(auth, env, 'send', { to: 'x', body: 'hi' }, ctx)\n`
-  const { violations } = scanSource('x.test.ts', src)
+  const { violations } = scanSource('x.test.ts', fixture('invoke-tool-sanctioned.txt'))
   assert.equal(violations.length, 0)
 })
 
 test('inspecting TOOLS metadata without calling .run() is not a violation', () => {
   // The common, legitimate shape: dozens of test files do `TOOLS.find(...).min` /
   // `.inputSchema` / `.name` and never touch `.run()` at all.
-  const src = `import { TOOLS } from '../src/mcp/index'\n` +
-    `for (const t of TOOLS) {\n` +
-    `  expect(VALID_MIN.has(t.min)).toBe(true)\n` +
-    `}\n`
-  const { violations } = scanSource('x.test.ts', src)
+  const { violations } = scanSource('x.test.ts', fixture('tools-metadata-inspection-only.txt'))
   assert.equal(violations.length, 0)
 })
 
 test('db.prepare(...).run() is NOT flagged', () => {
-  const src = `import { TOOLS } from '../src/mcp/index'\n` +
-    `await env.DB.prepare('DELETE FROM agents WHERE id = ?').bind(id).run()\n`
-  const { violations } = scanSource('x.test.ts', src)
+  const { violations } = scanSource('x.test.ts', fixture('d1-prepare-run-noise.txt'))
   assert.equal(violations.length, 0)
 })
 
 test('a plain statement variable calling .run() is NOT flagged (no seam import in scope)', () => {
-  const src = `const stmt = harness.sqlite.prepare('UPDATE tasks SET status = ? WHERE id = ?')\n` +
-    `stmt.run('done', id)\n`
-  const { violations } = scanSource('x.test.ts', src)
+  const { violations } = scanSource('x.test.ts', fixture('plain-statement-run-noise.txt'))
   assert.equal(violations.length, 0)
 })
 
 test('a Workflow-shaped .run() is NOT flagged even in a file that also imports the seam', () => {
-  const src = `import { TOOLS } from '../src/mcp/index'\n` +
-    `const instance = await env.MY_WORKFLOW.create()\n` +
-    `await workflow.run(payload)\n`
-  const { violations } = scanSource('x.test.ts', src)
+  const { violations } = scanSource('x.test.ts', fixture('workflow-run-noise.txt'))
   assert.equal(violations.length, 0)
 })
 
 test('a file with no src/mcp import is out of scope entirely', () => {
-  const src = `const db = { prepare: () => ({ run: () => ({}) }) }\n` + `db.prepare().run()\n`
-  const { violations } = scanSource('x.test.ts', src)
+  const { violations } = scanSource('x.test.ts', fixture('object-mock-prepare-run-noise.txt'))
   assert.equal(violations.length, 0)
 })
 
 test('a same-line seam-exempt comment exempts the call and is reported, not silently dropped', () => {
-  const src = `import { toolPotProvision } from '../src/mcp/pots'\n` +
-    `const outcome = await toolPotProvision.run(auth, env, {}, ctx) // seam-exempt: harness has no invokeTool shim yet\n`
-  const { violations, exemptions } = scanSource('x.test.ts', src)
+  const { violations, exemptions } = scanSource('x.test.ts', fixture('seam-exempt-same-line.txt'))
   assert.equal(violations.length, 0)
   assert.equal(exemptions.length, 1)
   assert.equal(exemptions[0].line, 2)
@@ -142,10 +127,7 @@ test('a same-line seam-exempt comment exempts the call and is reported, not sile
 })
 
 test('a line-above seam-exempt comment also exempts the call and is reported', () => {
-  const src = `import { toolPotProvision } from '../src/mcp/pots'\n` +
-    `// seam-exempt: migration-behaviour test, no auth context available\n` +
-    `const outcome = await toolPotProvision.run(auth, env, {}, ctx)\n`
-  const { violations, exemptions } = scanSource('x.test.ts', src)
+  const { violations, exemptions } = scanSource('x.test.ts', fixture('seam-exempt-line-above.txt'))
   assert.equal(violations.length, 0)
   assert.equal(exemptions.length, 1)
   assert.equal(exemptions[0].line, 3)
@@ -153,9 +135,7 @@ test('a line-above seam-exempt comment also exempts the call and is reported', (
 })
 
 test('a module path containing "mcpwp" is not mistaken for the src/mcp seam', () => {
-  const src = `import { toolThing } from '../src/mcpwp/tools'\n` +
-    `await toolThing.run(auth, env, {}, ctx)\n`
-  const { violations } = scanSource('x.test.ts', src)
+  const { violations } = scanSource('x.test.ts', fixture('mcpwp-false-positive.txt'))
   assert.equal(violations.length, 0)
 })
 
@@ -175,10 +155,7 @@ function scaffold({ baseline, targetBaseline, extraTest }) {
   git('config', 'user.email', 't@t.test')
   git('config', 'user.name', 't')
 
-  const VIOLATING_BODY =
-    `import { TOOLS } from '../src/mcp/index'\n` +
-    `const t = TOOLS.find((x) => x.name === 'send')!\n` +
-    `t.run(auth, env, {}, ctx)\n`
+  const VIOLATING_BODY = fixture('violating-body-scaffold.txt')
 
   // TWO pre-existing violators, both present on the target — legitimate baseline material.
   // Two, so the non-growth pin can be isolated from the smuggled-new-file pin (see
@@ -304,11 +281,7 @@ test('a baselined file that stopped violating (rewritten to use invokeTool) is r
   // is "the file rots" as check-test-schema-source.mjs's classify()-evaluated-per-file
   // comment describes: a baselined file that stopped matching must not sit in the list
   // forever.
-  writeFileSync(
-    join(dir, 'tests', 'legacy2.test.ts'),
-    `import { invokeTool } from '../src/mcp/index'\n` +
-      `await invokeTool(auth, env, 'send', {}, ctx)\n`,
-  )
+  writeFileSync(join(dir, 'tests', 'legacy2.test.ts'), fixture('fixed-invoketool-body.txt'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const r = run(dir)
   assert.equal(r.code, 1)
@@ -318,11 +291,7 @@ test('a baselined file that stopped violating (rewritten to use invokeTool) is r
 
 test('a seam-exempt call in a baselined file is printed as an exemption, not silently absorbed', (t) => {
   const dir = scaffold({ targetBaseline: { files: BOTH }, baseline: { files: BOTH } })
-  writeFileSync(
-    join(dir, 'tests', 'exempted.test.ts'),
-    `import { toolPotProvision } from '../src/mcp/pots'\n` +
-      `await toolPotProvision.run(auth, env, {}, ctx) // seam-exempt: sanctioned probe\n`,
-  )
+  writeFileSync(join(dir, 'tests', 'exempted.test.ts'), fixture('exempted-seam-file.txt'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const r = run(dir)
   assert.equal(r.code, 0)
