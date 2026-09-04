@@ -97,14 +97,27 @@ describe('Enterprise Google & SAML SSO & Domain Auto-Enrollment (Flight 11)', ()
       `INSERT INTO org_settings (key, value, updated_at)
        VALUES ('sso_config', ?1, CURRENT_TIMESTAMP)`,
     ).bind(JSON.stringify({ enabled: true, allowed_domains: ['gaf.com'] })).run()
+    // Routes are org-admin gated (P0 2026-09-02): drive them as a dashboard owner.
+    const ownerSession = JSON.stringify({
+      userId: 'owner-user',
+      email: 'owner@gaf.com',
+      role: 'owner',
+      createdAt: '2026-09-01T00:00:00.000Z',
+    })
     const env = {
       TENANT_SLUG: 'gaf',
       BUS: { send: vi.fn().mockResolvedValue(undefined) },
       DB: harness.db,
+      SESSIONS: {
+        get: async (key: string) => (key === 'sess:owner-session' ? ownerSession : null),
+        put: async () => undefined,
+        delete: async () => undefined,
+      },
     } as unknown as Env
+    const asOwner = { cookie: 'mupot_session=owner-session' }
 
     // 1. GET /config
-    const getReq = new Request('http://localhost/config')
+    const getReq = new Request('http://localhost/config', { headers: asOwner })
     const getRes = await ssoApp.fetch(getReq, env)
     expect(getRes.status).toBe(200)
     const getJson = await getRes.json<{ ok: boolean; config: SsoConfig }>()
@@ -114,7 +127,7 @@ describe('Enterprise Google & SAML SSO & Domain Auto-Enrollment (Flight 11)', ()
     // 2. POST /validate
     const valReq = new Request('http://localhost/validate', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...asOwner },
       body: JSON.stringify({ email: 'user@gaf.com' }),
     })
     const valRes = await ssoApp.fetch(valReq, env)

@@ -1,0 +1,2 @@
+import { TOOLS } from '../src/mcp/index'
+await env.DB.prepare('DELETE FROM agents WHERE id = ?').bind(id).run()

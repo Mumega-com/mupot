@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Mupot external board -> task -> agent -> GitHub PR evidence checker.
 //
-// This is the #150 release proof gate. The real cycle runs against GitHub and a
+// This is the external PR-cycle release proof gate. The real cycle runs against GitHub and a
 // live pot; this script validates the redacted evidence bundle afterward.
 
 import { createHash } from 'node:crypto'
@@ -68,6 +68,8 @@ const SECRET_VALUE_PATTERNS = [
 
 const SECRET_FIELD_RE = /(?:^|[_-])(authorization|bearer|token|access[_-]?token|refresh[_-]?token|secret|password|passwd|api[_-]?key|private[_-]?key|client[_-]?secret|cookie)(?:$|[_-])/i
 const SAFE_REFERENCE_FIELD_RE = /(?:^|[_-])(env|name|names|ref|path|file|id)$/i
+const SOURCE_HEALTH_STEP = 'final_verification'
+const SOURCE_HEALTH_KEYS = ['ok', 'service', 'commit', 'clean']
 
 export function parseArgs(argv) {
   const opts = {
@@ -79,6 +81,7 @@ export function parseArgs(argv) {
     issueUrl: '',
     prUrl: '',
     baseUrl: '',
+    releaseSha: '',
     plan: false,
     check: false,
     summary: false,
@@ -101,6 +104,11 @@ export function parseArgs(argv) {
     else if (arg === '--issue-url') opts.issueUrl = stripTrailingSlash(next())
     else if (arg === '--pr-url') opts.prUrl = stripTrailingSlash(next())
     else if (arg === '--base-url') opts.baseUrl = stripTrailingSlash(next())
+    else if (arg === '--release-sha') {
+      const releaseSha = next()
+      if (!isCanonicalReleaseSha(releaseSha)) throw new Error('invalid release SHA: expected 40 lowercase hexadecimal characters')
+      opts.releaseSha = releaseSha
+    }
     else if (arg === '--plan') opts.plan = true
     else if (arg === '--check') opts.check = true
     else if (arg === '--summary') opts.summary = true
@@ -116,7 +124,7 @@ export function usage() {
     'Usage: node scripts/external-pr-cycle-receipt.mjs --plan|--check [options]',
     '',
     'Options:',
-    '  --plan                 print the #150 evidence plan',
+    '  --plan                 print the external PR-cycle evidence plan',
     '  --check                check a completed evidence directory',
     '  --summary              with --check, print a compact text summary',
     '  --out-dir <path>       evidence directory',
@@ -127,6 +135,7 @@ export function usage() {
     '  --issue-url <url>      expected GitHub board issue URL',
     '  --pr-url <url>         expected GitHub PR URL',
     '  --base-url <url>       expected Mupot base URL',
+    '  --release-sha <sha>    expected 40-character lowercase release SHA',
     '  -h, --help             show this help',
   ].join('\n')
 }
@@ -160,9 +169,10 @@ export function formatPlan(opts = {}) {
   const issueUrl = opts.issueUrl || 'https://github.com/<owner>/<repo>/issues/<number>'
   const prUrl = opts.prUrl || 'https://github.com/<owner>/<repo>/pull/<number>'
   const baseUrl = opts.baseUrl || 'https://<pot-host>'
+  const releaseSha = opts.releaseSha || ''
   const lines = []
 
-  lines.push('Mupot #150 external PR-cycle evidence plan')
+  lines.push('Mupot external PR-cycle evidence plan')
   lines.push('')
   lines.push('Goal: prove one real GitHub board item became a Mupot task, reached a named runtime agent, produced a GitHub PR, linked back to the task, and surfaced CI/status feedback.')
   lines.push('')
@@ -195,6 +205,7 @@ export function formatPlan(opts = {}) {
       task_id: taskId,
       issue_url: issueUrl,
       pr_url: prUrl,
+      ...(releaseSha ? { release_sha: releaseSha } : {}),
     },
     evidence: {
       '<required_key>': true,
@@ -208,6 +219,21 @@ export function formatPlan(opts = {}) {
       { label: '<screenshot, gh output, task JSON, or check run>', path: '<redacted path or durable URL>' },
     ],
   }, null, 2))
+  if (releaseSha) {
+    lines.push('')
+    lines.push(`${SOURCE_HEALTH_STEP}: record the authorized collector's redacted source health observation:`)
+    lines.push(JSON.stringify({
+      step: SOURCE_HEALTH_STEP,
+      evidence: {
+        source_health: {
+          ok: true,
+          service: 'mupot',
+          commit: releaseSha,
+          clean: true,
+        },
+      },
+    }, null, 2))
+  }
   lines.push('')
   lines.push('After all files are present:')
   lines.push(commandLine([
@@ -230,6 +256,7 @@ export function formatPlan(opts = {}) {
     prUrl,
     '--base-url',
     baseUrl,
+    ...(releaseSha ? ['--release-sha', releaseSha] : []),
   ], ` > ${shellQuote(join(outDir, 'external-pr-cycle-check.json'))}`))
   lines.push(commandLine([
     'node',
@@ -252,9 +279,10 @@ export function formatPlan(opts = {}) {
     prUrl,
     '--base-url',
     baseUrl,
+    ...(releaseSha ? ['--release-sha', releaseSha] : []),
   ]))
   lines.push('')
-  lines.push('Attach the evidence directory plus external-pr-cycle-check.json to #150 only when the aggregate receipt reports status "pass".')
+  lines.push('Attach the evidence directory plus external-pr-cycle-check.json to the active release tracker only when the aggregate receipt reports status "pass".')
 
   return `${lines.join('\n')}\n`
 }
@@ -344,6 +372,31 @@ function evidenceValuePass(value) {
 function targetValue(receipt, key) {
   const value = receipt?.target?.[key]
   return typeof value === 'string' ? stripTrailingSlash(value) : ''
+}
+
+function releaseShaValue(receipt) {
+  const target = receipt?.target && typeof receipt.target === 'object' ? receipt.target : {}
+  return target.release_sha
+}
+
+function isCanonicalReleaseSha(value) {
+  return typeof value === 'string' && /^[0-9a-f]{40}$/.test(value)
+}
+
+function validateSourceHealth(receipt, expectedReleaseSha) {
+  const health = receipt?.evidence?.source_health
+  const object = health !== null && typeof health === 'object' && !Array.isArray(health)
+  const exact = object && Object.keys(health).length === SOURCE_HEALTH_KEYS.length && SOURCE_HEALTH_KEYS.every((key) => Object.hasOwn(health, key))
+  const observed = object ? {
+    ok: typeof health.ok === 'boolean' ? health.ok : null,
+    service: health.service === 'mupot' ? 'mupot' : null,
+    commit: isCanonicalReleaseSha(health.commit) ? health.commit : null,
+    clean: typeof health.clean === 'boolean' ? health.clean : null,
+  } : null
+  return {
+    valid: Boolean(exact && health.ok === true && health.service === 'mupot' && health.commit === expectedReleaseSha && health.clean === true),
+    observed,
+  }
 }
 
 function linkValue(receipt, key) {
@@ -496,6 +549,43 @@ export function checkBundle(opts = {}) {
     target[field] = values.length === 1 ? values[0] : null
   }
 
+  const releaseShaValues = receipts.map(({ receipt }) => releaseShaValue(receipt))
+  const releaseShaPresent = releaseShaValues.some((value) => value !== undefined)
+  const releaseShaConsistent = receipts.length === REQUIRED_STEPS.length
+    && releaseShaValues.every(isCanonicalReleaseSha)
+    && new Set(releaseShaValues).size === 1
+  if (releaseShaPresent || opts.releaseSha) {
+    for (const { step, path, receipt } of receipts) {
+      pushCheck(checks, isCanonicalReleaseSha(releaseShaValue(receipt)), 'target_release_sha_valid', {
+        step,
+        path,
+        value: releaseShaValue(receipt) ?? null,
+      })
+    }
+    pushCheck(checks, releaseShaConsistent, 'target_release_sha_consistent_across_steps', {
+      values: [...new Set(releaseShaValues.filter(isCanonicalReleaseSha))],
+    })
+  }
+  target.release_sha = releaseShaConsistent ? releaseShaValues[0] : null
+  const effectiveReleaseSha = opts.releaseSha || target.release_sha
+  if (opts.releaseSha) {
+    pushCheck(checks, isCanonicalReleaseSha(opts.releaseSha), 'expected_release_sha_valid', { expected: opts.releaseSha })
+    pushCheck(checks, target.release_sha === opts.releaseSha, 'target_release_sha_matches_expected', {
+      expected: opts.releaseSha,
+      actual: target.release_sha,
+    })
+  }
+  if (releaseShaPresent || opts.releaseSha) {
+    const sourceReceipt = receipts.find(({ step }) => step === SOURCE_HEALTH_STEP)
+    const sourceHealth = validateSourceHealth(sourceReceipt?.receipt, effectiveReleaseSha)
+    pushCheck(checks, sourceHealth.valid, 'source_health_matches_expected_release_sha', {
+      step: SOURCE_HEALTH_STEP,
+      path: sourceReceipt?.path ?? join(outDir, 'final-verification.json'),
+      artifact_sha256: artifacts[SOURCE_HEALTH_STEP]?.sha256 ?? null,
+      source_health: sourceHealth.observed,
+    })
+  }
+
   const repoFromIssue = githubIssueOrPrRepo(target.issue_url)
   const repoFromPr = githubIssueOrPrRepo(target.pr_url)
   const taskImportReceipt = receipts.find(({ step }) => step === 'task_import')?.receipt
@@ -547,7 +637,7 @@ export function checkBundle(opts = {}) {
     },
     checks,
     next_steps: failed.length === 0
-      ? ['attach the external PR-cycle evidence directory and this check receipt to #150']
+      ? ['attach the external PR-cycle evidence directory and this check receipt to the active release tracker']
       : ['fix failing external PR-cycle evidence, rerun the real step if needed, then rerun external-pr-cycle-receipt --check'],
   }
 }

@@ -87,4 +87,25 @@ describe('/auth/dev-login', () => {
       role: 'owner',
     })
   })
+
+  // mupot#1299 pins this here, next to the code that sets the cookie.
+  //
+  // The WFP dispatch branch forwards the incoming request to a tenant's User Worker with
+  // its headers intact, INCLUDING Cookie. That is only safe because this cookie is
+  // host-only: with no `Domain=` attribute a browser sends it to mupot.mumega.com and
+  // nowhere else, so it never reaches `<tenant>.mupot.mumega.com`. Adding `Domain=` here
+  // to "share the session across subdomains" would hand every tenant Worker in the
+  // dispatch namespace a valid colony session cookie, and the dispatcher comment claiming
+  // stripping is unnecessary would silently become false.
+  //
+  // If this test fails, do NOT relax it — go re-read src/dispatcher.ts and strip
+  // credentials on the dispatch branch first.
+  it('scopes the session cookie to the host — no Domain= (guards the dispatch branch)', async () => {
+    const { env } = makeEnv()
+    const res = await authApp.request('/dev-login', {}, env)
+    const setCookie = res.headers.get('set-cookie') ?? ''
+
+    expect(setCookie).toContain('mupot_session=')
+    expect(setCookie.toLowerCase()).not.toContain('domain=')
+  })
 })

@@ -7,6 +7,8 @@ import type { BusEvent, Env } from '../src/types'
 const TENANT = 'tenant-a'
 const SQUAD_ID = 'squad-a'
 const AGENT_ID = 'agent-a'
+const GATE_AGENT_ID = 'agent-gate-a'
+const GATE_MEMBER_ID = 'member-gate-a'
 
 function seed(harness: SqliteD1Harness): void {
   const sql = harness.sqlite
@@ -14,7 +16,24 @@ function seed(harness: SqliteD1Harness): void {
     INSERT INTO departments (id, slug, name) VALUES ('dept-a', 'dept-a', 'Department A');
     INSERT INTO squads (id, department_id, slug, name) VALUES ('${SQUAD_ID}', 'dept-a', 'squad-a', 'Squad A');
     INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES
-      ('${AGENT_ID}', '${SQUAD_ID}', 'agent-a', 'Agent A', 'operator', 'test', 'active');
+      ('${AGENT_ID}', '${SQUAD_ID}', 'agent-a', 'Agent A', 'operator', 'test', 'active'),
+      ('${GATE_AGENT_ID}', '${SQUAD_ID}', 'agent-gate-a', 'Gate Agent A', 'reviewer', 'test', 'active');
+    INSERT INTO members (id, display_name, status, tenant)
+      VALUES ('${GATE_MEMBER_ID}', 'Gate Member A', 'active', '${TENANT}');
+    INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+      VALUES ('cap-gate-a', '${GATE_MEMBER_ID}', 'squad', '${SQUAD_ID}', 'member');
+    INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+      VALUES ('${TENANT}', '${GATE_AGENT_ID}', '${GATE_MEMBER_ID}', '2026-07-12T00:00:00.000Z');
+    INSERT INTO member_tokens (
+      id, member_id, token_hash, label, channel, created_at, revoked_at,
+      agent_id, tenant, expires_at
+    ) VALUES (
+      'token-gate-a', '${GATE_MEMBER_ID}', 'hash-gate-a', 'gate', 'workspace',
+      '2026-07-12T00:00:00.000Z', NULL, '${GATE_AGENT_ID}', '${TENANT}',
+      '2099-01-01T00:00:00.000Z'
+    );
+    INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
+      VALUES ('gate-grant-a', 'gate:test-review', 'agent', '${GATE_AGENT_ID}', 'owner-1', '2026-07-12T00:00:00.000Z');
   `)
 }
 
@@ -128,6 +147,7 @@ describe('Flight-006 Slice 1 — backlog creation vs dispatch', () => {
       title: 'Dispatch me',
       done_when: 'The agent does the thing.',
       assignee_agent_id: AGENT_ID,
+      gate_owner: 'gate:test-review',
       dispatch: true,
     }), env)
 

@@ -12,6 +12,7 @@
 import type { Env } from '../types'
 import { resolveCapabilities, hasCapability } from './capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc, touchTokenLastUsed } from './token-lifecycle'
+import { authLookupOrNull } from './fail-closed'
 
 export interface AgentIdentity {
   // Exact live member_tokens row that authenticated this request. Never supplied
@@ -46,6 +47,12 @@ export function bearerToken(header: string | undefined | null): string | null {
 // Resolve a raw bearer token to an identity, or null on any failure (no oracle —
 // a missing token and a bad token are indistinguishable to the caller).
 export async function resolveMemberByToken(env: Env, raw: string | null): Promise<AgentIdentity | null> {
+  // mupot#1281 — this copy sits under Hono's error handler, so its throw surfaced as a
+  // clean 500 rather than a 1101. Same fault, different surface; guarded the same way.
+  return authLookupOrNull('resolveMemberByToken', () => resolveMemberByTokenInner(env, raw))
+}
+
+async function resolveMemberByTokenInner(env: Env, raw: string | null): Promise<AgentIdentity | null> {
   if (!raw) return null
   const tokenHash = await hashMemberToken(raw)
   const row = await env.DB.prepare(

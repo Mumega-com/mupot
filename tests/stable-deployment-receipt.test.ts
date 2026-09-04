@@ -30,7 +30,7 @@ function fixture(mutate?: (dir: string, outDir: string, commit: string) => void)
     receipt_type: 'mupot-stable-deployment/v1',
     observed_at: '2026-07-13T16:00:00.000Z',
     target: { base_url: 'https://mupot.example.com', version: TAG, tag: TAG, commit },
-    health: { ok: true, service: 'mupot', tenant: 'example', version: VERSION, commit },
+    health: { ok: true, clean: true, service: 'mupot', tenant: 'example', version: VERSION, commit },
   }))
   mutate?.(dir, outDir, commit)
   return { dir, outDir, commit }
@@ -114,6 +114,42 @@ describe('stable deployment receipt checker', { timeout: 15_000 }, () => {
       head_commit: commit,
     }))
     expect(receipt.summary.failed).toBe(0)
+  })
+
+  it('fails when live health reports a non-clean deployment', () => {
+    const receiptModule = stableReceipt as Record<string, any>
+    const { dir, outDir, commit } = fixture((_, evidenceDir) => {
+      const path = join(evidenceDir, 'deployment.json')
+      const deployment = JSON.parse(readFileSync(path, 'utf8'))
+      deployment.health.clean = false
+      writeFileSync(path, JSON.stringify(deployment))
+    })
+    const receipt = receiptModule.checkBundle({ repoRoot: dir, outDir, version: TAG, releaseSha: commit })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      check: 'deployment_health_clean',
+      ok: false,
+      actual: false,
+    }))
+  })
+
+  it('fails when live health does not report clean status', () => {
+    const receiptModule = stableReceipt as Record<string, any>
+    const { dir, outDir, commit } = fixture((_, evidenceDir) => {
+      const path = join(evidenceDir, 'deployment.json')
+      const deployment = JSON.parse(readFileSync(path, 'utf8'))
+      delete deployment.health.clean
+      writeFileSync(path, JSON.stringify(deployment))
+    })
+    const receipt = receiptModule.checkBundle({ repoRoot: dir, outDir, version: TAG, releaseSha: commit })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      check: 'deployment_health_clean',
+      ok: false,
+      actual: null,
+    }))
   })
 
   it('fails when package and public API versions are not the final version', () => {

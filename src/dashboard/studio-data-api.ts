@@ -9,8 +9,20 @@ import {
   type SupabaseConfig,
 } from '../connectors/supabase'
 import { resolveConnector } from '../connectors/service'
+// requireAuth is owned by the auth component; it sets c.get('auth').
+import { requireAuth } from '../auth'
+import { requireOrgCapability } from '../auth/capability'
+import { csrf } from 'hono/csrf'
 
-export const studioDataApp = new Hono<{ Bindings: Env; Variables: { auth?: AuthContext } }>()
+export const studioDataApp = new Hono<{ Bindings: Env; Variables: { auth: AuthContext } }>()
+
+// P0 (2026-09-02): this app was mounted at /api/studio/database with no middleware
+// and no inline check — anonymous arbitrary Supabase read/write/delete on any pot
+// with a connector bound. connectors/service.ts states isAdmin is enforced at the
+// ROUTE layer; this is that layer. Raw database access is org-admin only.
+// CSRF: see alerts/routes.ts — cookie-authenticated mutate on a top-level mount.
+studioDataApp.use('*', csrf())
+studioDataApp.use('*', requireAuth)
 
 async function resolveActiveSupabaseConfig(env: Env): Promise<SupabaseConfig | null> {
   const raw = await resolveConnector(env, 'pot', 'supabase')
@@ -28,7 +40,7 @@ async function resolveActiveSupabaseConfig(env: Env): Promise<SupabaseConfig | n
 /**
  * GET /api/studio/database/tables — Returns introspected tables and column lists.
  */
-studioDataApp.get('/tables', async (c) => {
+studioDataApp.get('/tables', requireOrgCapability('admin'), async (c) => {
   const creds = await resolveActiveSupabaseConfig(c.env)
   if (!creds) {
     return c.json({ ok: false, error: 'no_active_supabase_connector' }, 404)
@@ -52,7 +64,7 @@ studioDataApp.get('/tables', async (c) => {
 /**
  * GET /api/studio/database/query — Executes live query for a given table.
  */
-studioDataApp.get('/query', async (c) => {
+studioDataApp.get('/query', requireOrgCapability('admin'), async (c) => {
   const creds = await resolveActiveSupabaseConfig(c.env)
   if (!creds) {
     return c.json({ ok: false, error: 'no_active_supabase_connector' }, 404)
@@ -92,7 +104,7 @@ studioDataApp.get('/query', async (c) => {
 /**
  * POST /api/studio/database/mutate — Executes a mutation on a given table.
  */
-studioDataApp.post('/mutate', async (c) => {
+studioDataApp.post('/mutate', requireOrgCapability('admin'), async (c) => {
   const creds = await resolveActiveSupabaseConfig(c.env)
   if (!creds) {
     return c.json({ ok: false, error: 'no_active_supabase_connector' }, 404)

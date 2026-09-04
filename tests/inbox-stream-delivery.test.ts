@@ -142,10 +142,23 @@ describe('inbox SSE delivery against the real migration schema (#706 gate eviden
     // Nothing at or below the flushed window is ever re-emitted.
     expect(delivered.every((seq) => seq > WINDOW)).toBe(true)
 
-    // The stream notifies; it never consumes — a subsequent peek still counts all 151 unread.
+    // The stream notifies; it never consumes — every row is still unread afterwards.
+    //
+    // This assertion USED TO read `expect(peek.remaining).toBe(BACKLOG + 1)`, i.e. all
+    // 151. That encoded the old polysemous contract, where `remaining` was counted
+    // before the peek path had accounted for what it was handing back, so it INCLUDED
+    // the returned rows on peek and EXCLUDED them on a consume — one field, two
+    // meanings, chosen by a different argument. A caller that paged on it looped
+    // forever. `remaining` now means the same thing on both paths: what is LEFT OVER.
+    //
+    // The property this test actually cares about is unchanged and is asserted
+    // directly below: the stream consumed NOTHING, so returned + left-over is still
+    // the whole backlog.
     const peek = await readAgentInbox(env, { agent: AGENT, peek: true, limit: WINDOW, sinceSeq: 0 })
     if (!peek.ok) throw new Error(`peek failed: ${peek.reason}`)
-    expect(peek.remaining).toBe(BACKLOG + 1)
+    expect(peek.messages.length + peek.remaining).toBe(BACKLOG + 1)
+    expect(peek.remaining).toBe(BACKLOG + 1 - WINDOW)
+    expect(peek.complete).toBe(false)
 
     await gen.return(undefined)
   })

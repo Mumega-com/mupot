@@ -1,9 +1,9 @@
 #!/usr/bin/env node
-// Mupot v0.23 GitHub App least-privilege evidence checker.
+// Mupot GitHub App least-privilege evidence checker.
 //
 // This checker turns #151 into a falsifiable release receipt: after the live
 // GitHub App definition is remediated and the installation is re-accepted, a
-// redacted GET /app export must show only the permissions v0.23 needs.
+// redacted GET /app export must show only the release contract's permissions.
 
 import { createHash, createSign } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
@@ -120,9 +120,9 @@ export function formatPlan(opts = {}) {
   const outDir = defaultOutDir(opts)
   const lines = []
 
-  lines.push('Mupot v0.23 GitHub App least-privilege evidence plan')
+  lines.push('Mupot GitHub App least-privilege evidence plan')
   lines.push('')
-  lines.push('Goal: prove #151 is fixed by checking the live GitHub App definition after permissions are reduced and the installation is re-accepted.')
+  lines.push('Goal: prove the live GitHub App definition is least-privilege and the installation has accepted the same permission set.')
   lines.push('')
   lines.push('Required live App permissions:')
   for (const [permission, level] of Object.entries(REQUIRED_APP_PERMISSIONS)) {
@@ -295,14 +295,33 @@ function ghApiJson(args, ghExec, errorMessage) {
   }
 }
 
+function ghApiNdjson(args, ghExec, errorMessage) {
+  let raw
+  try {
+    raw = ghExec('gh', ['api', ...args], { encoding: 'utf8' })
+  } catch {
+    throw new Error(errorMessage)
+  }
+
+  const values = []
+  for (const line of String(raw).split(/\r?\n/)) {
+    const trimmed = line.trim()
+    if (!trimmed) continue
+    try {
+      values.push(JSON.parse(trimmed))
+    } catch {
+      throw new Error('gh api returned invalid JSON')
+    }
+  }
+  return values
+}
+
 function installationFromGh(organization, installationId, ghExec) {
-  const pages = ghApiJson(
-    ['--paginate', '--slurp', `orgs/${encodeURIComponent(organization)}/installations`],
+  const installations = ghApiNdjson(
+    ['--paginate', `orgs/${encodeURIComponent(organization)}/installations`, '--jq', '.installations[] | @json'],
     ghExec,
     'gh api could not read the organization installations; authenticate gh as an organization owner or App manager',
   )
-  const installations = (Array.isArray(pages) ? pages : [pages])
-    .flatMap((page) => Array.isArray(page?.installations) ? page.installations : [])
   const matches = installations.filter((installation) => String(installation?.id ?? '') === String(installationId))
   if (matches.length !== 1) {
     throw new Error(`organization installation ${installationId} was not found exactly once under ${organization}`)
@@ -583,7 +602,7 @@ export function checkBundle(opts = {}) {
     },
     checks,
     next_steps: failed.length === 0
-      ? [`attach github-app-permissions-check.json, ${APP_FILE}, and ${INSTALLATION_FILE} to #151, then close #151`]
+      ? [`attach github-app-permissions-check.json, ${APP_FILE}, and ${INSTALLATION_FILE} to the active release tracker`]
       : ['fix the live GitHub App permissions, re-accept the installation, export GET /app again, then rerun this check'],
   }
 }

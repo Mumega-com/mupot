@@ -1,0 +1,4 @@
+import { PROVISION_TOOLS } from '../src/mcp/provision'
+for (const tool of PROVISION_TOOLS) {
+  await tool.run(auth, env, {}, ctx)
+}

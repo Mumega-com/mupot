@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import { MUPOT_PUBLIC_API_VERSION } from '../src/version'
+import { REQUIRED_RECEIPTS } from '../scripts/release-readiness-receipt.mjs'
 
 const read = (path: string) => readFileSync(new URL(path, import.meta.url), 'utf8')
 
@@ -15,6 +16,13 @@ const workflow = read('../.github/workflows/ci.yml')
 const runbook = read('../docs/production-runbook.md')
 
 describe('v0.23.0 Trusted Runtime release gate', () => {
+  it('keeps the historical SOS cutover receipt as the v0.23 default', () => {
+    expect(REQUIRED_RECEIPTS).toContainEqual(expect.objectContaining({
+      file: 'host-go/cutover-gate.json',
+      receipt_type: 'mupot-sos-cutover-gate/v1',
+    }))
+  })
+
   it('is the named current release target across top-level docs', () => {
     for (const doc of [releaseDoc, roadmap, controlRoadmap, readme]) {
       expect(doc).toContain('v0.23.0')

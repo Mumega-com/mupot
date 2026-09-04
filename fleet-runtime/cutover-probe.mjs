@@ -14,6 +14,7 @@ const MESSAGE_KINDS = new Set(['message', 'request', 'ack'])
 const DEFAULT_AGENT_TOKEN_ENV = 'MUPOT_AGENT_TOKEN'
 const DEFAULT_OWNER_TOKEN_ENV = 'MUPOT_OWNER_TOKEN'
 const HTTP_TIMEOUT_MS = 8000
+const RELEASE_SHA_RE = /^[a-f0-9]{40}$/
 
 function splitValues(v) {
   return String(v).split(',').map((s) => s.trim()).filter(Boolean)
@@ -28,6 +29,7 @@ function parseArgs(argv) {
     body: '',
     kind: 'request',
     requestId: '',
+    releaseSha: '',
     agentTokenEnv: DEFAULT_AGENT_TOKEN_ENV,
     ownerTokenEnv: DEFAULT_OWNER_TOKEN_ENV,
   }
@@ -53,6 +55,11 @@ function parseArgs(argv) {
       if (!MESSAGE_KINDS.has(kind)) throw new Error(`unsupported message kind: ${kind}`)
       opts.kind = kind
     } else if (arg === '--request-id') opts.requestId = next()
+    else if (arg === '--release-sha') {
+      const releaseSha = next()
+      if (!RELEASE_SHA_RE.test(releaseSha)) throw new Error('release sha must be 40 lowercase hexadecimal characters')
+      opts.releaseSha = releaseSha
+    }
     else if (arg === '--agent-token-env') opts.agentTokenEnv = next()
     else if (arg === '--owner-token-env') opts.ownerTokenEnv = next()
     else if (arg === '--help' || arg === '-h') opts.help = true
@@ -71,6 +78,7 @@ function usage() {
     '  --body <text>                 inbox probe body (default: generated cutover probe text)',
     '  --kind <kind>                 inbox message kind; message, request, or ack (default: request)',
     '  --request-id <id>             idempotency id prefix; defaults to a generated cutover-probe id',
+    '  --release-sha <sha>            bind mutations to matching clean /health at a 40-character lowercase Git SHA',
     `  --agent-token-env <name>      env var holding welded sender token (default: ${DEFAULT_AGENT_TOKEN_ENV})`,
     `  --owner-token-env <name>      env var holding owner token for /api/fleet/control (default: ${DEFAULT_OWNER_TOKEN_ENV})`,
     '  -h, --help                    show this help',
@@ -127,6 +135,35 @@ async function postJson(fetchImpl, url, token, body) {
   return { ok: res.ok, status: res.status, json }
 }
 
+function redactedHealth(value) {
+  return {
+    ok: typeof value?.ok === 'boolean' ? value.ok : null,
+    service: typeof value?.service === 'string' ? value.service : null,
+    commit: typeof value?.commit === 'string' ? value.commit : null,
+    clean: typeof value?.clean === 'boolean' ? value.clean : null,
+  }
+}
+
+async function observeReleaseHealth(fetchImpl, url, releaseSha) {
+  const res = await fetchImpl(url, {
+    method: 'GET',
+    signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+  })
+  const text = await res.text()
+  let json = null
+  try {
+    json = JSON.parse(text)
+  } catch {
+    // Invalid JSON fails the release binding below without retaining raw bytes.
+  }
+  const health = redactedHealth(json)
+  return {
+    status: res.status,
+    health,
+    ok: res.ok && health.ok === true && health.service === 'mupot' && health.commit === releaseSha && health.clean === true,
+  }
+}
+
 function generatedRequestId(prefix, suffix) {
   return `${prefix}-${suffix}`
 }
@@ -143,6 +180,10 @@ export async function buildReceipt(opts) {
   const generatedAt = now()
   const requestIdBase = opts.requestId || `cutover-probe-${randomUUID()}`
   const normalized = normalizeBaseUrl(opts.baseUrl)
+  const releaseBound = typeof opts.releaseSha === 'string' && opts.releaseSha.length > 0
+  const releaseShaValid = !releaseBound || RELEASE_SHA_RE.test(opts.releaseSha)
+  let health = releaseBound ? redactedHealth(null) : null
+  let releaseHealthOk = !releaseBound
 
   checks.push({
     ok: normalized.ok,
@@ -162,9 +203,34 @@ export async function buildReceipt(opts) {
     check: 'probe_action_selected',
   })
 
+  if (releaseBound) {
+    checks.push({
+      ok: releaseShaValid,
+      component: 'cutover-probe',
+      check: 'release_sha_valid',
+    })
+    let status = null
+    if (releaseShaValid && normalized.ok && opts.agent && (opts.queueInbox || (opts.controls ?? []).length > 0)) {
+      try {
+        const observed = await observeReleaseHealth(fetchImpl, `${normalized.value}/health`, opts.releaseSha)
+        status = observed.status
+        health = observed.health
+        releaseHealthOk = observed.ok
+      } catch {
+        releaseHealthOk = false
+      }
+    }
+    checks.push({
+      ok: releaseHealthOk,
+      component: 'cutover-probe',
+      check: 'release_health_matches',
+      status,
+    })
+  }
+
   const actions = []
 
-  if (normalized.ok && opts.agent && opts.queueInbox) {
+  if (normalized.ok && opts.agent && opts.queueInbox && releaseHealthOk) {
     const token = env[opts.agentTokenEnv || DEFAULT_AGENT_TOKEN_ENV]
     checks.push({
       ok: typeof token === 'string' && token.length > 0,
@@ -212,7 +278,7 @@ export async function buildReceipt(opts) {
   }
 
   const controls = [...new Set(opts.controls ?? [])]
-  if (normalized.ok && opts.agent && controls.length > 0) {
+  if (normalized.ok && opts.agent && controls.length > 0 && releaseHealthOk) {
     const token = env[opts.ownerTokenEnv || DEFAULT_OWNER_TOKEN_ENV]
     checks.push({
       ok: typeof token === 'string' && token.length > 0,
@@ -271,12 +337,14 @@ export async function buildReceipt(opts) {
     inputs: {
       base_url: normalized.ok ? normalized.value : opts.baseUrl || null,
       agent: opts.agent || null,
+      ...(releaseBound ? { release_sha: opts.releaseSha } : {}),
       queue_inbox: Boolean(opts.queueInbox),
       control_verbs: controls,
       inbox_kind: opts.kind || 'request',
       agent_token_env: opts.agentTokenEnv || DEFAULT_AGENT_TOKEN_ENV,
       owner_token_env: opts.ownerTokenEnv || DEFAULT_OWNER_TOKEN_ENV,
     },
+    ...(releaseBound ? { health } : {}),
     actions,
     checks,
   }

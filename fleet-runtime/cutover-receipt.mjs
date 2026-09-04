@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// fleet-runtime cutover receipt — final local gate before removing SOS for an agent.
+// fleet-runtime cutover receipt — final local Host-Go handoff gate for an agent.
 //
 // This command does not touch Mupot. It verifies the JSON receipts produced by
 // host-receipt.mjs, runtime-receipt.mjs, and control-receipt.mjs and emits one
@@ -14,6 +14,28 @@ const EXPECTED = {
   runtime: 'mupot-fleet-runtime-receipt/v1',
   control: 'mupot-fleet-control-receipt/v1',
 }
+
+export const HOST_GO_CUTOVER_RECEIPT_TYPE = 'mupot-host-go-cutover/v1'
+export const LEGACY_SOS_CUTOVER_RECEIPT_TYPE = 'mupot-sos-cutover-gate/v1'
+
+const SCANNED_FIELD_RE = /(?:^|_)(?:path|config|file|dir|probe|commands?|argv|script|service|name|unit|label|binding|env|endpoint|adapter|runtime|base_url)(?:$|_)/i
+const SOS_MARKERS = Object.freeze([
+  ['sos_binding', /(?:^|[^A-Za-z0-9])SOS(?:_[A-Z0-9_]+)?(?:$|[^A-Za-z0-9])/i],
+  ['sos_path', /(?:^|[/\\])\.sos(?:[/\\]|$)|(?:^|[/\\])sos(?:[/\\]|$)/i],
+  ['sos_service', /(?:^|[./_-])sos(?:[./_-].*)?(?:\.service|\.plist)?$/i],
+  ['sos_command', /(?:^|[/\\._-])sos(?:[/\\._-]|$)/i],
+  ['sos_endpoint', /^https?:\/\/[^/]*\bsos\b|^https?:\/\/[^/]+\/sos(?:\/|$)/i],
+])
+
+const FIELD_MARKERS = Object.freeze([
+  ['sos_binding', /(?:^|_)(?:binding|env)(?:$|_)/i],
+  ['sos_path', /(?:^|_)(?:path|config|file|dir)(?:$|_)/i],
+  ['sos_service', /(?:^|_)(?:service|name|unit|label)(?:$|_)/i],
+  ['sos_command', /(?:^|_)(?:probe|commands?|argv|script|adapter|runtime)(?:$|_)/i],
+  ['sos_endpoint', /(?:^|_)(?:endpoint|base_url)(?:$|_)/i],
+])
+const INHERITED_VALUE_FIELD_RE = /^(?:value|url|executable)$/i
+const FIELD_STATE_FLAG_RE = /_configured$/i
 
 const CONTROL_VERBS = new Set(['start', 'stop', 'restart'])
 
@@ -163,6 +185,47 @@ function verbSatisfied(run, requiredVerb) {
   return run.verb === requiredVerb
 }
 
+export function collectLiveSosFindings({ host, runtimes = [], controls = [] } = {}) {
+  const findings = []
+  const seen = new Set()
+  const add = (location, marker) => {
+    const key = `${location}\0${marker}`
+    if (!seen.has(key)) {
+      seen.add(key)
+      findings.push({ location, marker })
+    }
+  }
+  const visit = (value, location, field = '', inheritedMarker = null) => {
+    const marker = SCANNED_FIELD_RE.test(field) && !FIELD_STATE_FLAG_RE.test(field)
+      ? FIELD_MARKERS.find(([, fieldPattern]) => fieldPattern.test(field))?.[0] ?? inheritedMarker
+      : inheritedMarker
+    if (Array.isArray(value)) {
+      value.forEach((entry, index) => visit(entry, `${location}[${index}]`, '', marker))
+      return
+    }
+    if (value && typeof value === 'object') {
+      for (const [key, entry] of Object.entries(value)) {
+        const childLocation = location ? `${location}.${key}` : key
+        if (/^sos(?:_|$)/i.test(key)) add(childLocation, 'sos_binding')
+        const childInheritsMarker = Array.isArray(entry) || (entry && typeof entry === 'object') || INHERITED_VALUE_FIELD_RE.test(key)
+        visit(entry, childLocation, key, childInheritsMarker ? marker : null)
+      }
+      return
+    }
+    if (!marker || value == null) return
+    if (typeof value !== 'string') {
+      add(location, marker)
+      return
+    }
+    const [, markerPattern] = SOS_MARKERS.find(([name]) => name === marker)
+    if (markerPattern.test(value)) add(location, marker)
+  }
+  visit(host, 'host')
+  runtimes.forEach((receipt, index) => visit(receipt, `runtimes[${index}]`))
+  controls.forEach((receipt, index) => visit(receipt, `controls[${index}]`))
+  return findings.sort((a, b) => a.location.localeCompare(b.location) || a.marker.localeCompare(b.marker))
+}
+
 export async function buildReceipt(opts) {
   const checks = []
   const requestedAgents = [...new Set(opts.agents ?? [])]
@@ -234,13 +297,28 @@ export async function buildReceipt(opts) {
     }
   }
 
+  const sosFindings = collectLiveSosFindings({
+    host,
+    runtimes: runtimeReceipts.map(({ receipt }) => receipt),
+    controls: controlReceipts.map(({ receipt }) => receipt),
+  })
+  checks.push({
+    ok: sosFindings.length === 0,
+    component: 'host-go-cutover',
+    check: 'no_live_sos_wiring',
+    substrate: 'mupot-herdr',
+    finding_count: sosFindings.length,
+    findings: sosFindings,
+  })
   const summary = summarize(checks)
   return {
-    receipt_type: 'mupot-sos-cutover-gate/v1',
+    receipt_type: HOST_GO_CUTOVER_RECEIPT_TYPE,
     generated_at: new Date().toISOString(),
     status: summary.status,
     summary,
     inputs: {
+      substrate: 'mupot-herdr',
+      live_sos_wiring: sosFindings.length > 0,
       agents: requestedAgents,
       host_receipt: opts.hostPath || null,
       runtime_receipts: opts.runtimePaths ?? [],

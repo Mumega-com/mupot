@@ -1,0 +1,10 @@
+{
+  "_why": "Files under tests/ that call an MCP tool's .run() directly instead of going through invokeTool (src/mcp/index.ts). RATCHET: this list may only shrink. scripts/check-mcp-tool-seam.mjs fails on any file not listed, and ALSO fails if a listed file no longer violates (a fixed file must leave the list, or the ratchet becomes an exemption).",
+  "_measured": "2026-09-04, against origin/main, issue mupot#1290",
+  "files": [
+    "tests/agent-messages.test.ts",
+    "tests/pot-provisioner.test.ts",
+    "tests/provision-tools.test.ts",
+    "tests/update-squad-tool.test.ts"
+  ]
+}

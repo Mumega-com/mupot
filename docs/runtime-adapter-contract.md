@@ -452,6 +452,40 @@ consumer stamps `consumed_at` only after the assigned AgentDO accepts
 the task-scoped wake. Emission or wake failure leaves an attempt count and bounded
 error for operator diagnosis.
 
+For a live external runtime, the durable inbox body is `runtime.dispatch/v1` and
+includes only task, dispatch, squad, and the public route address selected by
+Mupot. The authenticated outer inbox row remains authoritative for sender,
+recipient, project, message sequence, lease, and delivery attempt. Queue delivery
+is transport evidence only.
+
+The assigned runtime records later stages with
+`task_dispatch_runtime_receipt` (or the generated REST Action of the same name).
+The operation requires an agent-bound workspace credential and revalidates the
+current token, assignment, squad/project authority, exact dispatch/message body,
+outer sender, public route, lease, and attempt. The unique key is dispatch receipt
++ stage + attempt: an identical retry returns the original receipt; changed
+content is rejected. `runtime_consumed` claims the task `in_progress`,
+`completed` moves it to `review`, and `failed` moves it to `blocked`. None of
+those stages writes `done`; the independent verdict surface remains mandatory.
+A failed dispatch is terminally fenced and cannot later be revived as
+`runtime_consumed` by any later attempt for that dispatch/message. Completion
+also requires an explicit `gate:<owner>` with a currently active, credentialed
+different-agent grant. The member identity bound to that credential must also
+hold effective `member+` authority on the task squad through canonical org,
+department, exact-squad, or channel-derived inheritance. Nonexistent, revoked,
+inactive, cross-squad-without-authority, observer-only, assignee-only, and
+self-completion gates cannot enter review. Completion repeats this scope check in
+the atomic mutation fence, so authority revoked after precheck cannot create an
+unverdictable review task.
+
+Task readback and runtime write responses expose allowlisted DTOs. Credential/audit
+IDs and exact message/dispatch/private receipt correlation IDs remain only in a
+privileged audit surface. Public timeline principals use safe display labels, not
+raw UUIDs. The shared write service also records the
+framework-derived `mcp` versus `rest` origin in its mutation audit row.
+
+See [`operations/runtime-dispatch-v1.md`](./operations/runtime-dispatch-v1.md).
+
 Statuses:
 
 - `open`

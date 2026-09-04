@@ -1625,19 +1625,22 @@ describe('G. consent screen escaping — slug, squad name, budget window (not ju
   // survived its escapeHtml call being deleted, undetected, exactly like slug/
   // squad_name/budget_window above before this file covered them.
 
-  it('formatCapabilities escapes a malicious scope_id inside the capability PREVIEW itself — capabilities.scope_id has no FK, nothing stops a stray value from reaching here', async () => {
+  it('the grant list escapes a malicious scope_id — capabilities.scope_id has no FK, nothing stops a stray value from reaching the render', async () => {
     // capabilities.scope_id (migrations/0002_members.sql) is free TEXT, no FK — the
-    // capability PREVIEW line (formatCapabilities) interpolates scope_type:scope_id
-    // for every grant the session would carry, escaped as a whole.
+    // grant list renders a scope for every grant the session would carry. Since the
+    // consent screen now NAMES scopes (summarizeGrants + scopeLabel in
+    // src/mcp/consent-view.ts), an id with no matching squad row falls back to the
+    // raw id — so a hostile scope_id still reaches the markup and still has to be
+    // escaped there. The rendering changed; this hazard did not.
     //
     // The P0-1 clamp drops any grant on a scope the human holds nothing on — a
     // first version of this test gave agent-a's dedicated member a grant on a
     // nonsense scope_id and nothing else, which the clamp silently dropped before
-    // formatCapabilities ever saw it (100% green even with .map(escapeHtml)
+    // the render ever saw it (100% green even with .map(escapeHtml)
     // deleted — the exact "different mechanism, same visible result" trap noted
     // elsewhere in this suite). Fixed by ALSO granting the human an exact-match
     // capability on that same literal scope_id string, so the clamp lets the
-    // grant through and formatCapabilities is the thing actually under test.
+    // grant through and the escaping is the thing actually under test.
     const hostileScopeId = '"><script>alert(6)</script>'
     harness.sqlite.exec(`
       INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
@@ -1649,10 +1652,13 @@ describe('G. consent screen escaping — slug, squad name, budget window (not ju
     const { env } = httpEnv(harness, oauthProvider)
     const { html } = await reachConsentScreen(env, oauthProvider, 'human@example.test')
     expect(html).not.toContain('<script>alert(6)</script>')
-    // Positive check: the grant actually reached the preview (unescaped form would
-    // show scope_id verbatim) — proves this test exercises formatCapabilities, not
-    // a dropped-by-the-clamp no-op.
-    expect(html).toContain('capabilities this session would carry:')
+    // Positive control, and deliberately stronger than the anchor string it
+    // replaces: assert the hostile scope_id is present in ESCAPED form. That
+    // proves both halves at once — the grant survived the clamp and reached the
+    // render, and what reached it was escaped. An anchor that merely checked for
+    // a fixed label would pass even if this particular grant had been dropped,
+    // which is the vacuous-green trap this test was written to avoid.
+    expect(html).toContain('&quot;&gt;&lt;script&gt;alert(6)&lt;/script&gt;')
   })
 
   it('escapes a.autonomy', async () => {
@@ -1738,5 +1744,197 @@ describe('fixture sanity', () => {
   it('the migrations dir this suite applies is non-empty (guards against a silently-empty glob)', () => {
     const files = readFileSync(new URL('../migrations/0001_init.sql', import.meta.url), 'utf8')
     expect(files).toContain('CREATE TABLE')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// C10. The newcomer. This is the customer-onboarding funnel, not a corner case.
+//
+// findOrCreateMember auto-creates a members row for any verified Google email,
+// and unless an onboarding door is configured that member holds NOTHING. With no
+// capabilities they have no consentable agent, and no squad they may mint on, so
+// the create-a-seat option does not render either. The screen used to collapse to
+// a single choice — continue unbound — and an unbound session is mute on the
+// directory channel: send/inbox/inbox_lease/inbox_ack all refuse it.
+//
+// The exit ramp (bootstrapSelf) already existed and was already gated to exactly
+// this principal. It was reachable only as a tool call, which asked a customer to
+// know a tool name. These tests hold the door open on the screen itself.
+// ─────────────────────────────────────────────────────────────────────────────
+describe('C10. a brand-new customer with no capabilities', () => {
+  const NEWCOMER = 'newcomer@example.test'
+
+  it('is never shown an empty picker — the first-agent door is offered instead', async () => {
+    const oauthProvider = stubOAuthProvider()
+    const { env } = httpEnv(harness, oauthProvider)
+    const { html } = await reachConsentScreen(env, oauthProvider, NEWCOMER)
+
+    expect(html).toContain('__bootstrap__')
+    expect(html).toContain('Name your first agent')
+    // And not the old dead end that told them to go invoke a tool by name.
+    expect(html).not.toContain('bootstrap_self')
+  })
+
+  it('does not offer the door to someone who already has an agent to choose', async () => {
+    const oauthProvider = stubOAuthProvider()
+    const { env } = httpEnv(harness, oauthProvider)
+    const { html } = await reachConsentScreen(env, oauthProvider, 'human@example.test')
+    expect(html).not.toContain('__bootstrap__')
+  })
+
+  it('creates the agent and binds THIS session to it, in one pass', async () => {
+    const oauthProvider = stubOAuthProvider()
+    const { env } = httpEnv(harness, oauthProvider)
+    const { consentCookie } = await reachConsentScreen(env, oauthProvider, NEWCOMER)
+
+    const form = new URLSearchParams({
+      consent_nonce: consentCookie,
+      action: 'continue',
+      agent_id: '__bootstrap__',
+      first_agent_name: 'Ada',
+    })
+    const res = await handleOAuthAuthorize(new Request('https://pot.test/oauth/consent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${consentCookie}` },
+      body: form.toString(),
+    }), env)
+
+    expect(res.status).toBe(302)
+    expect(oauthProvider.completeAuthorization).toHaveBeenCalledTimes(1)
+
+    // The session is BOUND — the whole point. An unbound session would be mute.
+    const call = oauthProvider.completeAuthorization.mock.calls[0][0]
+    expect(call.props.boundAgentId).toBeTruthy()
+
+    const agent = harness.sqlite.prepare(
+      `SELECT id, name, squad_id FROM agents WHERE id = '${call.props.boundAgentId}'`,
+    ).all()[0]
+    expect(agent).toBeTruthy()
+    expect(agent.name).toBe('Ada')
+  })
+
+  it('clamps the new agent to member on its own squad — never lead or above', async () => {
+    const oauthProvider = stubOAuthProvider()
+    const { env } = httpEnv(harness, oauthProvider)
+    const { consentCookie } = await reachConsentScreen(env, oauthProvider, NEWCOMER)
+
+    await handleOAuthAuthorize(new Request('https://pot.test/oauth/consent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${consentCookie}` },
+      body: new URLSearchParams({
+        consent_nonce: consentCookie, action: 'continue', agent_id: '__bootstrap__', first_agent_name: 'Ada',
+      }).toString(),
+    }), env)
+
+    const call = oauthProvider.completeAuthorization.mock.calls[0][0]
+    const caps = harness.sqlite.prepare(
+      `SELECT capability, scope_type FROM capabilities WHERE member_id = '${call.props.memberId}'`,
+    ).all() as Array<{ capability: string; scope_type: string }>
+    expect(caps.length).toBeGreaterThan(0)
+    for (const c of caps) {
+      expect(['observer', 'member']).toContain(c.capability)
+      expect(c.scope_type).toBe('squad')
+    }
+  })
+
+  it('refuses an unnamed agent without destroying the session, so retrying works', async () => {
+    const oauthProvider = stubOAuthProvider()
+    const { env } = httpEnv(harness, oauthProvider)
+    const { consentCookie } = await reachConsentScreen(env, oauthProvider, NEWCOMER)
+
+    const before = harness.sqlite.prepare('SELECT COUNT(*) AS n FROM agents').all()[0].n
+
+    const res = await handleOAuthAuthorize(new Request('https://pot.test/oauth/consent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${consentCookie}` },
+      body: new URLSearchParams({
+        consent_nonce: consentCookie, action: 'continue', agent_id: '__bootstrap__', first_agent_name: '   ',
+      }).toString(),
+    }), env)
+
+    expect(res.status).toBe(400)
+    // The consent session must SURVIVE a recoverable mistake. Clearing it here is
+    // what turned a typo into "sign in again and hit the identical wall".
+    expect(res.headers.get('Set-Cookie') ?? '').not.toContain('Max-Age=0')
+    expect(await res.text()).not.toContain('sign in again')
+    // Nothing was created.
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM agents').all()[0].n).toBe(before)
+    expect(oauthProvider.completeAuthorization).not.toHaveBeenCalled()
+  })
+
+  it('is idempotent once per member — a second attempt creates no second agent', async () => {
+    const oauthProvider = stubOAuthProvider()
+    const { env } = httpEnv(harness, oauthProvider)
+
+    const first = await reachConsentScreen(env, oauthProvider, NEWCOMER)
+    await handleOAuthAuthorize(new Request('https://pot.test/oauth/consent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${first.consentCookie}` },
+      body: new URLSearchParams({
+        consent_nonce: first.consentCookie, action: 'continue', agent_id: '__bootstrap__', first_agent_name: 'Ada',
+      }).toString(),
+    }), env)
+    const afterFirst = harness.sqlite.prepare('SELECT COUNT(*) AS n FROM agents').all()[0].n
+
+    const second = await reachConsentScreen(env, oauthProvider, NEWCOMER)
+    const res = await handleOAuthAuthorize(new Request('https://pot.test/oauth/consent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${second.consentCookie}` },
+      body: new URLSearchParams({
+        consent_nonce: second.consentCookie, action: 'continue', agent_id: '__bootstrap__', first_agent_name: 'Bob',
+      }).toString(),
+    }), env)
+
+    expect(res.status).toBe(400)
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM agents').all()[0].n).toBe(afterFirst)
+    // The message must tell them what to do, not just what failed.
+    expect((await res.text()).toLowerCase()).toContain('already created your first agent')
+  })
+})
+
+// The fail-closed branch: bootstrapSelf SUCCEEDS but this session still cannot be
+// bound. Reachable through the documented adopted-home-squad case — when a home
+// squad already exists for this member and they hold a NON-admin capability on it,
+// the founder grant is adopted rather than written (never widened), so the human
+// does not clear the consent screen's admin floor. The agent is real and theirs;
+// only the automatic binding fails. Without this test that whole branch is
+// uncovered: deleting its condition changed no result.
+describe('C11. the agent was created but this session could not be bound', () => {
+  const ADOPTED = 'adopted@example.test'
+  const ADOPTED_MEMBER = 'member-adopted-home'
+
+  beforeEach(() => {
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status, created_at, tenant)
+        VALUES ('${ADOPTED_MEMBER}', '${ADOPTED}', 'Adopted', 'active', '2026-09-01T00:00:00.000Z', 'mumega');
+      INSERT INTO departments (id, slug, name, kind)
+        VALUES ('dept-adopted', 'dept-home-${ADOPTED_MEMBER}', 'Home', 'home');
+      INSERT INTO squads (id, department_id, slug, name, kind)
+        VALUES ('squad-adopted', 'dept-adopted', 'home-${ADOPTED_MEMBER}', 'Home', 'home');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES ('cap-adopted-not-admin', '${ADOPTED_MEMBER}', 'squad', 'squad-adopted', 'member');
+    `)
+  })
+
+  it('says the agent was created and how to reach it, instead of reporting failure', async () => {
+    const oauthProvider = stubOAuthProvider()
+    const { env } = httpEnv(harness, oauthProvider)
+    const { consentCookie } = await reachConsentScreen(env, oauthProvider, ADOPTED)
+
+    const res = await handleOAuthAuthorize(new Request('https://pot.test/oauth/consent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${consentCookie}` },
+      body: new URLSearchParams({
+        consent_nonce: consentCookie, action: 'continue', agent_id: '__bootstrap__', first_agent_name: 'Ada',
+      }).toString(),
+    }), env)
+
+    expect(res.status).toBe(403)
+    const body = await res.text()
+    // The agent EXISTS and is theirs. Saying "failed" here would be false.
+    expect(body).toContain('was created')
+    expect(body).toContain('reconnect')
+    // No token is issued for a session that could not be bound.
+    expect(oauthProvider.completeAuthorization).not.toHaveBeenCalled()
   })
 })

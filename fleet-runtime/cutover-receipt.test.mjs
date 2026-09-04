@@ -1,10 +1,17 @@
 // node --test cutover-receipt.test.mjs
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { buildReceipt, controlRuns, parseArgs } from './cutover-receipt.mjs'
+import {
+  HOST_GO_CUTOVER_RECEIPT_TYPE,
+  LEGACY_SOS_CUTOVER_RECEIPT_TYPE,
+  buildReceipt,
+  collectLiveSosFindings,
+  controlRuns,
+  parseArgs,
+} from './cutover-receipt.mjs'
 
 function tmpDir() {
   return mkdtempSync(join(tmpdir(), 'mupot-cutover-receipt-'))
@@ -53,26 +60,137 @@ function controlReceipt(agentId, verb) {
   }
 }
 
-test('cutover receipt passes when host, runtime, start, and stop receipts pass for an agent', async () => {
+function passingCutoverFiles(agentId) {
   const dir = tmpDir()
   const host = writeJson(dir, 'host.json', hostReceipt())
-  const runtime = writeJson(dir, 'runtime.json', runtimeReceipt('agent-one'))
-  const start = writeJson(dir, 'control-start.json', controlReceipt('agent-one', 'start'))
-  const stop = writeJson(dir, 'control-stop.json', controlReceipt('agent-one', 'stop'))
+  const runtime = writeJson(dir, 'runtime.json', runtimeReceipt(agentId))
+  const start = writeJson(dir, 'control-start.json', controlReceipt(agentId, 'start'))
+  const stop = writeJson(dir, 'control-stop.json', controlReceipt(agentId, 'stop'))
+  return {
+    host,
+    runtime,
+    control: start,
+    opts: {
+      agents: [agentId],
+      hostPath: host,
+      runtimePaths: [runtime],
+      controlPaths: [start, stop],
+      requiredControlVerbs: ['start', 'stop'],
+    },
+  }
+}
 
-  const receipt = await buildReceipt({
-    agents: ['agent-one'],
-    hostPath: host,
-    runtimePaths: [runtime],
-    controlPaths: [start, stop],
-    requiredControlVerbs: ['start', 'stop'],
-  })
+test('cutover receipt passes when host, runtime, start, and stop receipts pass for an agent', async () => {
+  const fixture = passingCutoverFiles('agent-one')
+  const receipt = await buildReceipt(fixture.opts)
 
-  assert.equal(receipt.receipt_type, 'mupot-sos-cutover-gate/v1')
+  assert.equal(HOST_GO_CUTOVER_RECEIPT_TYPE, 'mupot-host-go-cutover/v1')
+  assert.equal(LEGACY_SOS_CUTOVER_RECEIPT_TYPE, 'mupot-sos-cutover-gate/v1')
+  assert.equal(receipt.receipt_type, HOST_GO_CUTOVER_RECEIPT_TYPE)
   assert.equal(receipt.status, 'pass')
   assert.equal(receipt.summary.failed, 0)
+  assert.equal(receipt.inputs.substrate, 'mupot-herdr')
+  assert.equal(receipt.inputs.live_sos_wiring, false)
   assert.ok(receipt.checks.some((c) => c.check === 'runtime_inbox_handoff_for_agent' && c.ok === true))
   assert.equal(receipt.checks.filter((c) => c.check === 'control_verb_for_agent' && c.ok === true).length, 2)
+  assert.deepEqual(receipt.checks.at(-1), {
+    ok: true,
+    component: 'host-go-cutover',
+    check: 'no_live_sos_wiring',
+    substrate: 'mupot-herdr',
+    finding_count: 0,
+    findings: [],
+  })
+})
+
+const SOS_MARKER_CASES = [
+  ['sos_binding', 'host', (receipt) => { receipt.inputs = { token_binding: 'SOS_TOKEN_FILE' } }],
+  ['sos_path', 'host', (receipt) => { receipt.inputs = { daemon_config: '/home/operator/.sos/daemon.json' } }],
+  ['sos_service', 'host', (receipt) => { receipt.checks.push({ ok: true, component: 'host-services', check: 'service_observed', service: 'sos-agent.service' }) }],
+  ['sos_command', 'runtime', (receipt) => { receipt.checks.push({ ok: true, component: 'fleet-daemon', check: 'probe_configured', probe: '/opt/sos/bin/agent-probe' }) }],
+  ['sos_endpoint', 'control', (receipt) => { receipt.target = { sos_endpoint: 'https://sos.internal.example' } }],
+]
+
+for (const [marker, target, mutate] of SOS_MARKER_CASES) {
+  test(`cutover receipt fails closed for ${marker}`, async () => {
+    const fixture = passingCutoverFiles('agent-one')
+    const value = JSON.parse(readFileSync(fixture[target], 'utf8'))
+    mutate(value)
+    writeFileSync(fixture[target], JSON.stringify(value, null, 2))
+
+    const receipt = await buildReceipt(fixture.opts)
+
+    assert.equal(receipt.status, 'fail')
+    assert.equal(receipt.inputs.live_sos_wiring, true)
+    assert.ok(receipt.checks.some((check) =>
+      check.check === 'no_live_sos_wiring' &&
+      check.ok === false &&
+      check.findings.some((finding) => finding.marker === marker)
+    ))
+    assert.doesNotMatch(JSON.stringify(receipt), /SOS_TOKEN_FILE|\.sos\/daemon|sos-agent|\/opt\/sos|sos\.internal/)
+  })
+}
+
+test('collectLiveSosFindings classifies lowercase binding values case-insensitively', () => {
+  assert.deepEqual(collectLiveSosFindings({
+    host: { inputs: { token_binding: 'sos_token_file' } },
+  }), [{ location: 'host.inputs.token_binding', marker: 'sos_binding' }])
+})
+
+test('collectLiveSosFindings preserves nested field categories for every closed SOS marker', () => {
+  const findings = collectLiveSosFindings({
+    host: {
+      inputs: {
+        token_binding: { env: { value: 'SOS_TOKEN_FILE' } },
+        daemon_config: { value: '/home/operator/.sos/daemon.json' },
+        unrelated: { executable: '/opt/sos/bin/ignored', url: 'https://sos.ignored.example' },
+      },
+      checks: [{ service: { value: 'sos-agent.service', pid: 1234 } }],
+      commands: [{ executable: '/opt/sos/bin/agent-probe', code: 0 }],
+    },
+    runtimes: [{ command: { executable: '/opt/sos/bin/runtime-probe' } }],
+    controls: [{ endpoint: { url: 'https://sos.internal.example/v1' } }],
+  })
+
+  assert.deepEqual(findings, [
+    { location: 'controls[0].endpoint.url', marker: 'sos_endpoint' },
+    { location: 'host.checks[0].service.value', marker: 'sos_service' },
+    { location: 'host.commands[0].executable', marker: 'sos_command' },
+    { location: 'host.inputs.daemon_config.value', marker: 'sos_path' },
+    { location: 'host.inputs.token_binding.env.value', marker: 'sos_binding' },
+    { location: 'runtimes[0].command.executable', marker: 'sos_command' },
+  ])
+})
+
+test('collectLiveSosFindings fails closed and redacts malformed nested scanned values', () => {
+  const findings = collectLiveSosFindings({
+    host: {
+      inputs: {
+        daemon_config: 42,
+        sos_env: 'SOS_TOKEN_FILE',
+        token_binding: true,
+      },
+      command: Symbol('do-not-expose'),
+    },
+  })
+
+  assert.deepEqual(findings, [
+    { location: 'host.command', marker: 'sos_command' },
+    { location: 'host.inputs.daemon_config', marker: 'sos_path' },
+    { location: 'host.inputs.sos_env', marker: 'sos_binding' },
+    { location: 'host.inputs.token_binding', marker: 'sos_binding' },
+  ])
+  assert.doesNotMatch(JSON.stringify(findings), /42|true|do-not-expose|SOS_TOKEN_FILE/)
+  assert.deepEqual(collectLiveSosFindings({
+    host: {
+      inputs: {
+        token_binding: true,
+        sos_env: 'SOS_TOKEN_FILE',
+        daemon_config: 42,
+      },
+      command: Symbol('do-not-expose'),
+    },
+  }), findings)
 })
 
 test('cutover receipt fails when runtime receipt did not prove inbox handoff', async () => {

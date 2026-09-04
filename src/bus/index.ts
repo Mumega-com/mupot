@@ -55,6 +55,7 @@ export function createBus(env: Env): BusPort {
 
 // requireAuth is owned by the auth component; it sets c.get('auth').
 import { requireAuth } from '../auth'
+import { csrf } from 'hono/csrf'
 // requireCapability is the fine-grained RBAC gate (capability.ts). Publishing to
 // the bus is an org-wide effect → admin on org scope. A pure web-login owner/admin
 // satisfies the org-scope check via the legacy-role escape inside requireCapability.
@@ -76,7 +77,7 @@ export const busApp = new Hono<{ Bindings: Env; Variables: { auth: AuthContext }
 
 busApp.get('/health', (c) => c.json({ ok: true, component: 'bus', tenant: c.env.TENANT_SLUG }))
 
-busApp.post('/emit', requireAuth, requireCapability(orgScope, 'admin'), async (c) => {
+busApp.post('/emit', csrf(), requireAuth, requireCapability(orgScope, 'admin'), async (c) => {
   const auth = c.get('auth')
 
   let body: EmitBody

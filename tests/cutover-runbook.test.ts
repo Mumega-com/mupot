@@ -14,7 +14,12 @@ describe('squad mupot cutover runbook', () => {
     expect(runbook).not.toContain('once the HTTP inbox route exists')
   })
 
-  it('keeps SOS wake-hook removal gated by the complete host evidence bundle', () => {
+  it('keeps Mupot Herdr handoff gated by the complete Host-Go bundle', () => {
+    expect(runbook).toContain('mupot-host-go-cutover/v1')
+    expect(runbook).toContain('Mupot/Herdr')
+    expect(runbook).toContain('no_live_sos_wiring')
+    expect(runbook).not.toContain('do not remove SOS wiring yet')
+    expect(runbook).not.toContain('SOS removal is permitted')
     expect(runbook).toContain('until the target host has a passing receipt bundle')
     expect(runbook).toContain('install.json')
     expect(runbook).toContain('probe-*.json')

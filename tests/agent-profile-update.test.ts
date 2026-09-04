@@ -209,6 +209,29 @@ describe('updateAgentProfile — registry drift repair', () => {
     expect((await getAgentProfile(env, agentId))?.slug).toBe('prime')
   })
 
+  // mupot#1288 F4 (Kasra's adversarial gate, PR #1289): role and model are
+  // ALSO NOT NULL (migration 0049 — DEFAULTs exist but D1 still rejects an
+  // explicit NULL). Before this fix, { role: null } / { model: null } sailed
+  // past this function's own validation and threw a raw SQLite NOT NULL
+  // constraint violation out of the D1 batch — an admin-path patch that
+  // crashed with a 500 instead of failing closed with a named field. This is
+  // the service-layer proof; tests/agent-self-update.test.ts proves the same
+  // thing through the MCP tool (invokeTool), where the 500 would otherwise
+  // have surfaced to a real caller.
+  it('refuses to null role or model — also NOT NULL, and used to throw instead of failing closed (F4)', async () => {
+    expect(await updateAgentProfile(env, agentId, { role: null })).toEqual({
+      ok: false,
+      error: 'invalid_field',
+    })
+    expect(await updateAgentProfile(env, agentId, { model: null })).toEqual({
+      ok: false,
+      error: 'invalid_field',
+    })
+    const profile = await getAgentProfile(env, agentId)
+    expect(profile?.role).toBe('member')
+    expect(profile?.model).toBe('@cf/meta/llama-3.3-70b-instruct-fp8-fast')
+  })
+
   it('refuses a whitespace-only required field', async () => {
     expect(await updateAgentProfile(env, agentId, { model: '   ' })).toEqual({
       ok: false,

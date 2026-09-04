@@ -24,6 +24,23 @@ const TARGET = {
 const START = Date.parse('2026-07-09T20:00:00.000Z')
 const STEP_WINDOW_MS = 5 * 60 * 1000
 const STEP_DURATION_MS = 2 * 60 * 1000
+const RELEASE_SHA = '8a2bd44c5f0efcc23791e3b08d9f5472d1a6c4be'
+const OTHER_RELEASE_SHA = '7b2bd44c5f0efcc23791e3b08d9f5472d1a6c4be'
+const MISSING = Symbol('missing')
+
+function sourceHealth(commit = RELEASE_SHA) {
+  return { ok: true, service: 'mupot', commit, clean: true }
+}
+
+function bindReleaseReceipt(receipt: Record<string, unknown>, file: string, releaseSha = RELEASE_SHA) {
+  receipt.target = { ...(receipt.target as Record<string, unknown>), release_sha: releaseSha }
+  if (file === 'post-setup-validation.json') {
+    receipt.evidence = {
+      ...(receipt.evidence as Record<string, unknown>),
+      source_health: sourceHealth(releaseSha),
+    }
+  }
+}
 
 function iso(ms: number) {
   return new Date(ms).toISOString()
@@ -42,7 +59,7 @@ function baseReceipt(step: string, evidence: Record<string, unknown>) {
     status: 'pass',
     started_at: iso(startedAt),
     completed_at: iso(startedAt + STEP_DURATION_MS),
-    target: TARGET,
+    target: { ...TARGET },
     commands: [
       { command: `run ${step}`, ok: true, exit_code: 0 },
     ],
@@ -87,7 +104,8 @@ describe('fresh install receipt checker', () => {
       operator: TARGET.operator,
     })
 
-    expect(plan).toContain('Mupot v0.23 fresh self-host install evidence plan')
+    expect(plan).toContain('Mupot fresh self-host install evidence plan')
+    expect(plan).not.toContain('v0.23')
     expect(plan).toContain(STEP_RECEIPT_TYPE)
     expect(plan).toContain('provision-resources.json')
     expect(plan).toContain('fresh-install-check.json')
@@ -109,6 +127,7 @@ describe('fresh install receipt checker', () => {
     expect(receipt.summary.step_receipts).toBe(REQUIRED_STEPS.length)
     expect(receipt.target.pot).toBe(TARGET.pot)
     expect(receipt.timeline.map((step) => step.step)).toEqual(REQUIRED_STEPS.map((step) => step.step))
+    expect(receipt.next_steps.join(' ')).not.toContain('v0.23 release issue')
   })
 
   it('fails when install steps overlap or run out of order', () => {
@@ -319,6 +338,165 @@ describe('fresh install receipt checker', () => {
     expect(receipt.checks).toContainEqual(expect.objectContaining({
       ok: false,
       check: 'receipt_has_no_secret_material',
+    }))
+  })
+
+  it('binds every fresh-install receipt to the requested release SHA', () => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt, file) => {
+      bindReleaseReceipt(receipt, file)
+    })
+
+    const parsed = parseArgs(['--check', '--out-dir', dir, '--release-sha', RELEASE_SHA])
+    const plan = formatPlan({ outDir: dir, releaseSha: RELEASE_SHA })
+    const receipt = checkBundle(parsed)
+
+    expect(parsed.releaseSha).toBe(RELEASE_SHA)
+    expect(plan).toContain('"release_sha": "8a2bd44c5f0efcc23791e3b08d9f5472d1a6c4be"')
+    expect(plan).toContain('"source_health": {')
+    expect(plan).toContain('"service": "mupot"')
+    expect(plan).toContain('"commit": "8a2bd44c5f0efcc23791e3b08d9f5472d1a6c4be"')
+    expect(plan).toContain('"clean": true')
+    expect(plan).toContain('--release-sha 8a2bd44c5f0efcc23791e3b08d9f5472d1a6c4be')
+    expect(receipt.status).toBe('pass')
+    expect(receipt.target.release_sha).toBe(RELEASE_SHA)
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: true,
+      check: 'source_health_matches_expected_release_sha',
+      step: 'post_setup_validation',
+    }))
+  })
+
+  it('rejects a bound fresh-install bundle without CLI SHA or designated source health', () => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt) => {
+      receipt.target = { ...(receipt.target as Record<string, unknown>), release_sha: RELEASE_SHA }
+    })
+
+    const result = checkBundle({ outDir: dir })
+    expect(result.status).toBe('fail')
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'source_health_matches_expected_release_sha',
+      step: 'post_setup_validation',
+    }))
+  })
+
+  it('accepts a bound fresh-install bundle without CLI SHA when source health matches', () => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt, file) => bindReleaseReceipt(receipt, file))
+
+    const result = checkBundle({ outDir: dir })
+    expect(result.status).toBe('pass')
+    expect(result.target.release_sha).toBe(RELEASE_SHA)
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      ok: true,
+      check: 'source_health_matches_expected_release_sha',
+      step: 'post_setup_validation',
+    }))
+  })
+
+  it.each([
+    ['missing', MISSING],
+    ['null', null],
+    ['array', [sourceHealth()]],
+    ['unknown field', { ...sourceHealth(), note: 'unexpected' }],
+    ['secret-bearing field', { ...sourceHealth(), api_key: 'plain credential value' }],
+    ['malformed commit', { ...sourceHealth(), commit: 'not-a-sha' }],
+    ['uppercase commit', { ...sourceHealth(), commit: RELEASE_SHA.toUpperCase() }],
+    ['non-clean source', { ...sourceHealth(), clean: false }],
+    ['wrong service', { ...sourceHealth(), service: 'other' }],
+    ['non-ok source', { ...sourceHealth(), ok: false }],
+  ])('rejects %s designated fresh-install source health', (_label, value) => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt, file) => {
+      bindReleaseReceipt(receipt, file)
+      if (file !== 'post-setup-validation.json') return
+      const evidence = receipt.evidence as Record<string, unknown>
+      if (value === MISSING) delete evidence.source_health
+      else evidence.source_health = value
+    })
+
+    const result = checkBundle({ outDir: dir, releaseSha: RELEASE_SHA })
+    expect(result.status).toBe('fail')
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'source_health_matches_expected_release_sha',
+      step: 'post_setup_validation',
+    }))
+  })
+
+  it('rejects relabeling every fresh-install target from source SHA B to requested SHA A', () => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt, file) => {
+      bindReleaseReceipt(receipt, file)
+      if (file === 'post-setup-validation.json') {
+        const evidence = receipt.evidence as Record<string, unknown>
+        evidence.source_health = sourceHealth(OTHER_RELEASE_SHA)
+      }
+    })
+
+    const result = checkBundle({ outDir: dir, releaseSha: RELEASE_SHA })
+    expect(result.status).toBe('fail')
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'source_health_matches_expected_release_sha',
+      step: 'post_setup_validation',
+    }))
+  })
+
+  it('rejects a fresh-install bundle when a bound step omits the release SHA', () => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt, file) => {
+      receipt.target = { ...(receipt.target as Record<string, unknown>), release_sha: RELEASE_SHA }
+      if (file === 'migrations-applied.json') delete (receipt.target as Record<string, unknown>).release_sha
+    })
+
+    expect(checkBundle({ outDir: dir, releaseSha: RELEASE_SHA }).status).toBe('fail')
+  })
+
+  it('rejects a fresh-install bundle with different valid release SHAs', () => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt, file) => {
+      receipt.target = {
+        ...(receipt.target as Record<string, unknown>),
+        release_sha: file === 'worker-deployed.json' ? '7b2bd44c5f0efcc23791e3b08d9f5472d1a6c4be' : RELEASE_SHA,
+      }
+    })
+
+    expect(checkBundle({ outDir: dir }).status).toBe('fail')
+  })
+
+  it.each([
+    ['malformed', 'not-a-sha'],
+    ['uppercase', RELEASE_SHA.toUpperCase()],
+    ['array', [RELEASE_SHA]],
+    ['object', { sha: RELEASE_SHA }],
+  ])('rejects %s fresh-install release SHA values without coercion', (_kind, releaseSha) => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt) => {
+      receipt.target = { ...(receipt.target as Record<string, unknown>), release_sha: releaseSha }
+    })
+
+    expect(checkBundle({ outDir: dir }).status).toBe('fail')
+  })
+
+  it('rejects malformed or uppercase fresh-install CLI release SHAs', () => {
+    expect(() => parseArgs(['--check', '--release-sha', 'not-a-sha'])).toThrow('invalid release SHA')
+    expect(() => parseArgs(['--check', '--release-sha', RELEASE_SHA.toUpperCase()])).toThrow('invalid release SHA')
+    expect(checkBundle({ outDir: tempDir(), releaseSha: '7b2bd44c5f0efcc23791e3b08d9f5472d1a6c4be' }).status).toBe('fail')
+  })
+
+  it('keeps a historical fresh-install bundle without release SHAs valid', () => {
+    const dir = tempDir()
+    writeBundle(dir)
+
+    const receipt = checkBundle({ outDir: dir })
+
+    expect(receipt.status).toBe('pass')
+    expect(receipt.target.release_sha).toBeNull()
+    expect(receipt.checks).not.toContainEqual(expect.objectContaining({
+      check: 'source_health_matches_expected_release_sha',
     }))
   })
 })
