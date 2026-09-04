@@ -49,6 +49,10 @@ async function previewHandler(c: { req: { raw: Request }; env: Env }): Promise<R
 // requireAuth answers 401 JSON rather than redirecting, so the dashboard's preview iframe
 // fails cleanly instead of rendering login HTML into itself. That was the stated reason
 // this route sits ahead of the dashboard catch-all, and it is preserved.
+// The WILDCARD registration is the one that enforces this — verified by mutation: with it
+// removed, all forms are reachable unauthenticated; with only the bare one removed, both
+// forms are still refused. The bare registration is redundant today and kept as
+// belt-and-braces against Hono's matching semantics changing.
 platformApp.use('/preview/:project_id', requireAuth)
 platformApp.use('/preview/:project_id/*', requireAuth)
 platformApp.all('/preview/:project_id', previewHandler)

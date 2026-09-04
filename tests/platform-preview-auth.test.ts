@@ -103,6 +103,29 @@ describe('/preview/:project_id requires authentication (#1305)', () => {
     expect(d.asked, `dispatch namespace was consulted: ${d.asked.join(',')}`).toEqual([])
   })
 
+  // Covers the no-trailing-slash form, which nothing else here exercises.
+  //
+  // MEASURED, because the first version of this comment guessed wrong: removing
+  // `use('/preview/:project_id')` and keeping only the wildcard still refuses BOTH forms,
+  // so the wildcard registration alone is what enforces the gate and the bare one is
+  // redundant. It is kept as belt-and-braces against Hono's matching semantics changing,
+  // NOT because it is currently load-bearing. Removing the WILDCARD, by contrast, opens
+  // every form — that mutation kills three tests.
+  it('refuses the bare path with no trailing slash', async () => {
+    harness = makeHarness()
+    const d = spyDispatcher()
+    const env = envFor(harness, d.binding, false)
+    const id = await healthyProject(harness, envFor(harness, d.binding, true), 'gaf')
+
+    const res = await platformApp.fetch(
+      new Request(`https://mupot.mumega.com/preview/${id}`),
+      env,
+    )
+
+    expect(res.status).toBe(401)
+    expect(d.asked).toEqual([])
+  })
+
   it('refuses without a session on the wildcard sub-path too', async () => {
     harness = makeHarness()
     const d = spyDispatcher()
