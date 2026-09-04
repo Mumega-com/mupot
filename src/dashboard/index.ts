@@ -159,7 +159,7 @@ import {
   statusDot as uiStatusDot,
 } from './ui'
 import type { Html } from './ui'
-import type { ApprovalItem } from './approvals'
+import type { ApprovalItem, PublishableItem } from './approvals'
 import { loadObservatory, agentGradient } from './observatory'
 import { kanbanApp, loadKanbanData, kanbanBoardBody } from './kanban-routes'
 // Flight-008 Slice 3 (#1062): the /send dispatch-now picker's reachability signal.
@@ -4986,6 +4986,17 @@ function opsHealthBody(data: OpsHealthData) {
  * The verdict buttons call the existing RBAC-gated POST /api/tasks/:id/verdict endpoint.
  * NO new write path is introduced here (adversarial review point from #12).
  */
+// mupot#1081: Approve/Reject render ONLY when t.can_approve/t.can_reject are
+// true — server-computed by evaluateVerdictGates (src/tasks/index.ts), the
+// SAME predicate POST /:id/verdict itself evaluates. When a row's can_verdict
+// is false, NO <button> markup is emitted at all for that row's actions:
+// the control is structurally absent, not disabled/hidden, so no client-side
+// script can re-enable it. When can_approve and can_reject differ (e.g. a
+// gate:loops row where the caller holds gate:loops but not
+// outreach:send-gated — approve blocked, reject still allowed), only the
+// permitted button renders; a plain note field with no buttons would leave a
+// dead control, so the note input itself only renders when at least one
+// action does.
 function approvalCardHtml(t: ApprovalItem): string {
   const preview = resultPreview(t)
   const agentLabel = escHtml(t.agent_name ?? t.assignee_agent_id ?? 'unassigned')
@@ -4997,8 +5008,14 @@ function approvalCardHtml(t: ApprovalItem): string {
   const previewHtml = preview
     ? `<div class="appr-result"><div class="lbl">Result</div>${escHtml(preview)}</div>`
     : ''
+  const actionsHtml = t.can_verdict
+    ? `<input type="text" class="appr-note" placeholder="note (optional; required to reject)" />
+        ${t.can_approve ? '<button class="btn appr-approve">Approve</button>' : ''}
+        ${t.can_reject ? '<button class="btn btn-reject appr-reject">Reject</button>' : ''}
+        <span class="appr-status"></span>`
+    : `<span class="appr-no-action">No verdict action available for you on this task.</span>`
   return `
-    <div class="card approval" data-task="${escAttr(t.id)}" style="border-left:3px solid var(--accent)">
+    <div class="card approval" data-task="${escAttr(t.id)}" data-can-approve="${t.can_approve ? '1' : '0'}" data-can-reject="${t.can_reject ? '1' : '0'}" style="border-left:3px solid var(--accent)">
       <div class="appr-head">
         <div>
           <div class="appr-title">${escHtml(t.title)}</div>
@@ -5008,12 +5025,7 @@ function approvalCardHtml(t: ApprovalItem): string {
       </div>
       <div class="appr-body">${escHtml(t.body)}</div>
       ${previewHtml}
-      <div class="appr-actions">
-        <input type="text" class="appr-note" placeholder="note (optional; required to reject)" />
-        <button class="btn appr-approve">Approve</button>
-        <button class="btn btn-reject appr-reject">Reject</button>
-        <span class="appr-status"></span>
-      </div>
+      <div class="appr-actions">${actionsHtml}</div>
     </div>`
 }
 
@@ -5025,6 +5037,11 @@ function obsQueueScript(): string {
     <script>
       (function () {
         document.querySelectorAll('#obs-queue .approval').forEach(function (card) {
+          // mupot#1081: a row with no can_approve/can_reject renders NO
+          // buttons at all (see approvalCardHtml) — nothing to wire here.
+          var approveBtn = card.querySelector('.appr-approve');
+          var rejectBtn = card.querySelector('.appr-reject');
+          if (!approveBtn && !rejectBtn) return;
           var id = card.getAttribute('data-task');
           var note = card.querySelector('.appr-note');
           var status = card.querySelector('.appr-status');
@@ -5055,8 +5072,8 @@ function obsQueueScript(): string {
               card.querySelectorAll('button').forEach(function (b) { b.disabled = false; });
             });
           }
-          card.querySelector('.appr-approve').addEventListener('click', function () { decide('approved'); });
-          card.querySelector('.appr-reject').addEventListener('click', function () { decide('rejected'); });
+          if (approveBtn) approveBtn.addEventListener('click', function () { decide('approved'); });
+          if (rejectBtn) rejectBtn.addEventListener('click', function () { decide('rejected'); });
         });
 
         // Jump-to-now: scroll the swimlane grid all the way right.
@@ -5793,7 +5810,7 @@ function sendScript(projectId?: string) {
 
 function approvalsBody(
   items: ApprovalItem[],
-  publishable: ApprovalItem[] = [],
+  publishable: PublishableItem[] = [],
   secretEnvRequests: PublicSecretEnvRequest[] = [],
 ) {
   // Re-use the shared card renderer. Wrap in a named container so the script can
@@ -5839,8 +5856,14 @@ function approvalsBody(
  * Render one approved content-publish task as a Publish card. Only ever
  * populated by loadPublishable (admin/owner + status='approved' + gate:content),
  * so no client-side role check is needed here — the data itself is the gate.
+ *
+ * mupot#1081: t is PublishableItem, not ApprovalItem — it structurally has no
+ * can_verdict/can_approve/can_reject field to (mis)read. The prior shape
+ * carried can_verdict:false here unread by this function; mutation M8
+ * (false -> true) survived the whole suite because nothing checked it. That
+ * is fixed by construction now, not by a runtime check nothing calls.
  */
-function publishCardHtml(t: ApprovalItem): string {
+function publishCardHtml(t: PublishableItem): string {
   const agentLabel = escHtml(t.agent_name ?? t.assignee_agent_id ?? 'unassigned')
   const squadLabel = escHtml(t.squad_name ?? t.squad_id)
   const when = escHtml((t.completed_at ?? t.created_at).slice(0, 16).replace('T', ' '))
@@ -5913,6 +5936,11 @@ function approvalsScript() {
         var list = document.getElementById('approvals-list');
         if (!list) return;
         list.querySelectorAll('.approval').forEach(function (card) {
+          // mupot#1081: a row with no can_approve/can_reject renders NO
+          // buttons at all (see approvalCardHtml) — nothing to wire here.
+          var approveBtn = card.querySelector('.appr-approve');
+          var rejectBtn = card.querySelector('.appr-reject');
+          if (!approveBtn && !rejectBtn) return;
           var id = card.getAttribute('data-task');
           var note = card.querySelector('.appr-note');
           var status = card.querySelector('.appr-status');
@@ -5943,8 +5971,8 @@ function approvalsScript() {
               card.querySelectorAll('button').forEach(function (b) { b.disabled = false; });
             });
           }
-          card.querySelector('.appr-approve').addEventListener('click', function () { decide('approved'); });
-          card.querySelector('.appr-reject').addEventListener('click', function () { decide('rejected'); });
+          if (approveBtn) approveBtn.addEventListener('click', function () { decide('approved'); });
+          if (rejectBtn) rejectBtn.addEventListener('click', function () { decide('rejected'); });
         });
       })();
     </script>`)

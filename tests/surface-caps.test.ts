@@ -288,58 +288,33 @@ describe('POST /brain/loops/:id/control — surface gates', () => {
 // not have a member-token auth path. HTTP-level surface cap testing requires
 // session auth + a memberId in gate_grants, which is not what requireAuth sets.
 //
-// Instead we test the gate logic directly through hasSurfaceCap (already covered
-// in section 1) plus a structural assertion: verify the gate code exists in
-// tasks/index.ts at the correct position (after callerHoldsGateCapability, before
-// self-verdict check). This confirms the guard is wired, not just defined.
+// REPLACED 2026-09-04 (mupot#1080/#1081 flight). This describe block used to
+// be a STRUCTURAL assertion — it read tasks/index.ts's raw source text and
+// grepped for literal substrings ("task.gate_owner === 'gate:loops' &&
+// body.verdict === 'approved'", "callerHoldsGateCapability(", "K4:
+// self-verdict prevention") to "confirm the guard is wired." That is
+// vacuous-by-construction: it can only ever confirm the author's belief that
+// certain strings exist in a certain order, never that the gate actually
+// fires. When this flight moved the surface-cap check into the shared
+// evaluateVerdictGates predicate (src/tasks/index.ts) and renamed
+// `body.verdict` to a `verdict` parameter, every one of these string matches
+// broke — not because the gate stopped working (it did not; see the real
+// behavioural coverage below), but because the literal text moved. A test
+// that breaks on a refactor that preserves behaviour, yet would stay GREEN
+// through a refactor that silently dropped the gate (so long as the
+// characters '403' and 'outreach:send-gated' still appeared somewhere in the
+// file), was never testing the gate.
 //
-// For HTTP-level confirmation, the surface gate fires AFTER canActOnSquad. A
-// session-based admin (whose hasSurfaceCap returns true via bypass) can reach
-// past both gates — this confirms the path is reachable.
-
-import * as fs from 'node:fs'
-import * as path from 'node:path'
-
-describe('outreach:send-gated gate wired in tasks/index.ts (structural)', () => {
-  const tasksSource = fs.readFileSync(
-    path.resolve(__dirname, '../src/tasks/index.ts'),
-    'utf8',
-  )
-
-  it('surface gate code present: hasSurfaceCap imported', () => {
-    expect(tasksSource).toMatch(
-      /import\s*\{[^}]*\bhasSurfaceCap\b[^}]*\}\s*from\s*'\.\.\/auth\/capability'/,
-    )
-  })
-
-  it('surface gate fires when gate_owner=gate:loops and verdict=approved', () => {
-    expect(tasksSource).toContain("task.gate_owner === 'gate:loops' && body.verdict === 'approved'")
-    expect(tasksSource).toContain("hasSurfaceCap(c.env, auth, 'outreach:send-gated')")
-  })
-
-  it('surface gate is between callerHoldsGateCapability and self-verdict check', () => {
-    const gateIdx = tasksSource.indexOf("task.gate_owner === 'gate:loops' && body.verdict === 'approved'")
-    const callerHoldsIdx = tasksSource.indexOf('callerHoldsGateCapability(')
-    const selfVerdictIdx = tasksSource.indexOf('K4: self-verdict prevention')
-    // gate is after callerHolds check, before self-verdict check
-    expect(gateIdx).toBeGreaterThan(callerHoldsIdx)
-    expect(gateIdx).toBeLessThan(selfVerdictIdx)
-  })
-
-  it('surface gate returns 403 with need:outreach:send-gated when check fails', () => {
-    expect(tasksSource).toContain("{ error: 'forbidden', need: 'outreach:send-gated' }, 403")
-  })
-
-  it('gate only applied on approved verdict, not rejected', () => {
-    // The condition checks body.verdict === 'approved' — rejected skips the block
-    const blockStart = tasksSource.indexOf("task.gate_owner === 'gate:loops' && body.verdict === 'approved'")
-    const blockEnd = tasksSource.indexOf("K4: self-verdict prevention")
-    const gateBlock = tasksSource.slice(blockStart, blockEnd)
-    // The block contains 'approved' condition but not a parallel 'rejected' check
-    expect(gateBlock).toContain("body.verdict === 'approved'")
-    expect(gateBlock).not.toContain("body.verdict === 'rejected'")
-  })
-})
+// Real behavioural coverage (real SQLite via applyAllMigrations, not a
+// hand-rolled `prepare()`, per scripts/check-test-schema-source.mjs):
+//   - tests/tasks-verdict-gates.test.ts — evaluateVerdictGates unit-level,
+//     including the REACHABLE false branch (gate:loops held, outreach:
+//     send-gated not) and a positive control (reject is not gated; both
+//     grants held → approve honored).
+//   - tests/tasks-verdict-route-e2e.test.ts — the same case through the REAL
+//     HTTP route (tasksApp.fetch, real D1), proving the wire response is
+//     exactly 403 {error:'forbidden', need:'outreach:send-gated'}, not just
+//     that the predicate function returns false.
 
 // HTTP-level confirmation: an admin session can reach the verdict route
 // (confirms the path is reachable at all — the surface cap would pass for admin).

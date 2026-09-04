@@ -34,9 +34,9 @@ import type {
   Squad,
   Task,
 } from '../types'
-import { resolveCapabilities, hasCapability, holdsCapabilityFloor, canOnSquad, hasSurfaceCap } from '../auth/capability'
+import { resolveCapabilities, hasCapability, holdsCapabilityFloor, canOnSquad } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc, touchTokenLastUsed } from '../auth/token-lifecycle'
-import { callerHoldsGateCapability, verdictPrincipal } from '../tasks/index'
+import { evaluateVerdictGates } from '../tasks/index'
 import { resolveSoleGateOwnerAgent } from '../gates/grants'
 import { isChannel } from '../members/service'
 import { findExistingBootstrap } from '../members/bootstrap-self'
@@ -1666,11 +1666,13 @@ async function wakeGateOwnerOnReview(
 }
 
 // task_verdict — approve or reject a task in 'review'. The MCP twin of
-// POST /api/tasks/:id/verdict, reusing the SAME helpers (callerHoldsGateCapability,
-// verdictPrincipal, writeVerdict) so the gate logic never forks. This is the wire
-// that lets an operator/gate CLOSE a gated task programmatically over MCP — without
-// it a review task can only be verdicted from the browser dashboard. cap: member+
-// on the task's squad AND the gate capability named by task.gate_owner.
+// POST /api/tasks/:id/verdict, reusing the SAME shared predicate
+// (evaluateVerdictGates, src/tasks/index.ts — mupot#1080/#1081) plus
+// writeVerdict, so the gate logic never forks between the two write surfaces.
+// This is the wire that lets an operator/gate CLOSE a gated task
+// programmatically over MCP — without it a review task can only be verdicted
+// from the browser dashboard. cap: member+ on the task's squad AND the gate
+// capability named by task.gate_owner.
 const toolTaskVerdict: ToolSpec = {
   name: 'task_verdict',
   scope: 'squad (of the task)',
@@ -1708,43 +1710,37 @@ const toolTaskVerdict: ToolSpec = {
     if (!task.gate_owner) return fail(409, 'no_gate')
     if (task.status !== 'review') return fail(409, 'not_in_review', { status: task.status })
 
-    // RBAC: caller must hold the gate capability named by task.gate_owner.
-    // BLOCK-1 fix (kasra-review 2026-08-13, proof-of-exploit): gate:agent-self-completion
-    // is closeable ONLY by the completing agent (the assignee) or an org owner/admin.
-    // The grant is NOT authority for this gate — the D2 universal mint grant would
-    // let any agent approve any other agent's task (proven live). Every other gate
-    // keeps the capability-based check.
-    const principal = verdictPrincipal(auth)
-    if (task.gate_owner === 'gate:agent-self-completion') {
-      const isOwnerAdmin = auth.role === 'owner' || auth.role === 'admin'
-      if (principal.id !== task.assignee_agent_id && !isOwnerAdmin) {
-        return fail(403, 'forbidden', { need: 'assignee_or_org_admin' })
-      }
-    } else if (!(await callerHoldsGateCapability(env, auth, task.squad_id, task.gate_owner))) {
-      return fail(403, 'forbidden', { need: task.gate_owner })
-    }
+    // RBAC: gate ownership, the gate:loops surface cap, and self-verdict — the
+    // ONE shared predicate (mupot#1080/#1081, src/tasks/index.ts) also used by
+    // the HTTP twin (POST /:id/verdict) and the dashboard's read-side
+    // can_verdict/can_approve/can_reject. A sixth gate cannot drift the two
+    // write surfaces apart because there is only one place it can be added.
+    const gateOwner = task.gate_owner
+    const gateResult = await evaluateVerdictGates(
+      env,
+      auth,
+      { squad_id: task.squad_id, gate_owner: gateOwner, assignee_agent_id: task.assignee_agent_id },
+      verdict,
+    )
+    const principal = gateResult.principal
 
-    // Surface-cap (#106): approving a gate:loops task fires a real send — requires
-    // outreach:send-gated. Rejections send nothing and are not surface-gated.
-    if (task.gate_owner === 'gate:loops' && verdict === 'approved') {
-      if (!(await hasSurfaceCap(env, auth, 'outreach:send-gated'))) {
-        return fail(403, 'forbidden', { need: 'outreach:send-gated' })
-      }
-    }
-
-    // Self-verdict prevention (no grading your own homework). Agent-bound tokens
-    // resolve to the bound agent id, so an assignee cannot hide behind its member
-    // envelope. Org owner may override with override_self_verdict:true (audited).
-    // D1 (2026-08-13): gate:agent-self-completion is the executor's fallback gate
-    // for an agent's OWN completion of ungated work (BLOCK-2, PR #417) — the
-    // different-principal rule is waived for exactly this capability (the caller
-    // still had to pass callerHoldsGateCapability above; every other gate keeps
-    // the self_verdict 409). Mirrors the HTTP twin in src/tasks/index.ts.
     let note: string | null = typeof args.note === 'string'
       ? args.note
       : (typeof args.reason === 'string' ? args.reason : null)
-    const isSelfCompletionGate = task.gate_owner === 'gate:agent-self-completion'
-    if (principal.id === task.assignee_agent_id && !isSelfCompletionGate) {
+
+    if (!gateResult.allowed) {
+      if (gateResult.code === 'no_gate_capability') {
+        const need = gateOwner === 'gate:agent-self-completion' ? 'assignee_or_org_admin' : gateOwner
+        return fail(403, 'forbidden', { need })
+      }
+      if (gateResult.code === 'missing_surface_cap') {
+        return fail(403, 'forbidden', { need: 'outreach:send-gated' })
+      }
+      // 'self_verdict' — org owner may override with override_self_verdict:true
+      // (audited in the note). evaluateVerdictGates never grants this itself — a
+      // default caller never sends the flag — so it is applied here, at the one
+      // write-time call site that owns request-arg-shaped exceptions. Mirrors
+      // the HTTP twin in src/tasks/index.ts.
       const isOrgOwner = auth.role === 'owner'
       const overrideRequested = args.override_self_verdict === true
       if (!isOrgOwner || !overrideRequested) {

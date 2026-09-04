@@ -30,6 +30,7 @@ import type { TaskStatus } from './service'
 import { resolveTaskAssignee } from './assignee'
 import { verifyTaskArtifactShape } from './artifact-verification'
 import { hasIndependentRuntimeGate, listTaskDispatchReceiptTimeline } from './runtime-receipts'
+import { hasActiveGateGrant } from '../gates/grants'
 export { resolveTaskAssignee as resolveAssignee } from './assignee'
 import { createBus } from '../bus'
 import type { BusEvent } from '../types'
@@ -206,6 +207,26 @@ function taskProjectErrorResponse(error: TaskProjectError): { body: { error: str
   return { body: { error: error.code }, status: 400 }
 }
 
+// KNOWN DIVERGENCE (flagged 2026-09-04, mupot#1080/#1081 flight — filed as a
+// separate ticket, deliberately NOT fixed here; wide blast radius, own gate):
+// verdictPrincipal is AGENT-BOUND-FIRST — for an agent-bound token it resolves
+// to the bound agent (auth.boundAgentId), falling back to auth.memberId, then
+// auth.userId. THREE OTHER principal resolvers in this codebase are
+// MEMBER-FIRST instead — `auth.memberId ?? auth.userId`, never reading
+// auth.boundAgentId at all: hasSurfaceCap (src/auth/capability.ts:353-354),
+// loadApprovals (src/dashboard/approvals.ts:157, its non-admin branch),
+// and loadVerifications (src/dashboard/verifications.ts:101-102). For a
+// single agent-bound token these two resolvers name TWO DIFFERENT
+// principals — concretely, for a gate:loops + approved verdict,
+// callerHoldsGateCapability (which uses verdictPrincipal, below) checks the
+// AGENT's gate_grants row while hasSurfaceCap checks the MEMBER's
+// outreach:send-gated row in the SAME request: send authority is assembled
+// from two different principals' grants. Do not resolve this by quietly
+// picking one resolver inside evaluateVerdictGates (below) — its surface-cap
+// check calls hasSurfaceCap as-is, member-first, exactly as today, so the
+// disagreement stays visible (see the comment at that call site) rather than
+// being papered over. Fixing it means auditing every hasSurfaceCap/
+// memberId-first call site's blast radius, not a local patch here.
 export function verdictPrincipal(auth: AuthContext): { id: string; type: 'member' | 'agent'; actor?: TaskActor } {
   if (auth.boundAgentId) {
     return { id: auth.boundAgentId, type: 'agent', actor: { kind: 'agent', id: auth.boundAgentId } }
@@ -223,10 +244,21 @@ export const tasksApp = new Hono<{ Bindings: Env; Variables: { auth: AuthContext
 tasksApp.get('/health', (c) => c.json({ ok: true, component: 'tasks', tenant: c.env.TENANT_SLUG }))
 
 // CSRF: the dashboard /send page drives these mutations with the SameSite=Lax
-// session cookie (requireAuth is cookie-only). SameSite=Lax must NOT be the single
-// line of defense on a state-changing route, so add an explicit Origin/Host check
-// (hono/csrf guards only unsafe methods — GET reads are unaffected). Adversarial
-// finding 2026-06-06.
+// session cookie (requireAuth is cookie-only).
+//
+// CORRECTED (mupot#1081 "stale comments to correct" — the previous wording here
+// implied hono's csrf() is a real second line of defense on every unsafe method).
+// It is NOT, for this app: hono/csrf's Origin/Sec-Fetch-Site check only fires
+// when the request Content-Type matches the form-submission set
+// (application/x-www-form-urlencoded, multipart/form-data, text/plain — or is
+// ABSENT, which defaults to text/plain and so also matches). Every mutation on
+// this router (including POST /:id/verdict) is driven with
+// 'content-type: application/json', which csrf() does not test at all — so
+// csrf() is a no-op for every real caller of this router today. It is kept
+// (harmless, and it WOULD catch a future form-encoded route added here by
+// mistake) but SameSite=Lax is, in fact, the only line of defense a JSON
+// mutation on this router currently has against a cross-site POST. Adversarial
+// finding 2026-06-06; comment corrected 2026-09-04.
 tasksApp.use('*', csrf())
 
 // Every route is authenticated and hard-scoped to this pot's tenant.
@@ -1166,13 +1198,28 @@ interface VerdictBody {
 // un-insertable and this gate structurally inert.
 //
 // Fix: gate capability grants live in `gate_grants` (migration 0008). A grant row
-// for (capability=<gateOwner>, principal_type='member', principal_id=<memberId>)
+// for (capability=<gateOwner>, principal_type='member'|'agent', principal_id=...)
 // authorises verdicting. The legacy owner/admin bypass is retained so pre-existing
 // org owners never lose the ability to gate-override.
 //
-// Agent principals: if the caller is an agent token rather than a member, we check
-// principal_type='agent' using auth.userId as the principal_id (agent tokens carry
-// the agent id as userId).
+// Agent principals: verdictPrincipal (below) resolves the checked principal —
+// an agent-bound token's principal is its BOUND agent (auth.boundAgentId), not
+// auth.userId; auth.userId is only the fallback for a legacy agent token that
+// carries no member envelope at all. (Corrected 2026-09-04, mupot#1081 — this
+// comment previously said "agent tokens carry the agent id as userId", which
+// verdictPrincipal never actually does when boundAgentId is set; a stale
+// comment stating the inverse of the real precedence is exactly what #1081
+// found and asked to be corrected.)
+//
+// mupot#1080: the existence check below is JOINed to the principal's own
+// liveness (hasActiveGateGrant, src/gates/grants.ts) — a grant row surviving
+// is not enough; the member/agent behind it must still be active. Before this
+// fix, this was a bare `SELECT 1 FROM gate_grants` with no such join, so
+// suspending a member or pausing an agent left their gate-verdict authority
+// intact as long as the grant row itself was never explicitly revoked. This
+// mirrors the read-side liveness requirement (a resolveGateOwner-shaped
+// resolver's LEFT JOIN + status='active'), which is what surfaced the drift:
+// the write path — the actual security boundary — was the WEAKER of the two.
 export async function callerHoldsGateCapability(
   env: Env,
   auth: AuthContext,
@@ -1191,17 +1238,100 @@ export async function callerHoldsGateCapability(
 
   if (!principalId) return false
 
-  // Query gate_grants for an explicit grant.
-  const row = await env.DB.prepare(
-    `SELECT 1 FROM gate_grants
-      WHERE capability     = ?1
-        AND principal_type = ?2
-        AND principal_id   = ?3
-      LIMIT 1`,
-  )
-    .bind(gateOwner, principalType, principalId)
-    .first<{ 1: number }>()
-  return row !== null
+  return hasActiveGateGrant(env, gateOwner, principalType, principalId)
+}
+
+// ── mupot#1081 — the shared read/write verdict-authority predicate ────────────
+//
+// The write path (POST /:id/verdict below, and its MCP twin task_verdict in
+// src/mcp/index.ts) and a read-side "can this caller verdict this row" flag
+// (src/dashboard/approvals.ts, for the /approvals queue) both need to answer
+// exactly the same question. #1081 found a prior version of that read-side
+// flag (`can_verdict = isOwnerAdmin(auth) || resolution.resolvable`) that was
+// TRUE ON EVERY REACHABLE PATH — its FALSE branch was entailed away by the
+// query that produced the row in the first place, so the "structurally absent
+// verdict control" safety property was dead code carried by nobody.
+//
+// Fix: evaluateVerdictGates is the ONE function both sides call for the
+// RBAC-shaped part of the decision (gate ownership, the gate:loops surface
+// cap, and the self-verdict rule — the three checks that were actually
+// duplicated, by hand, between the HTTP route and the MCP tool, and entirely
+// UNMODELED on the read side). Squad-scope (canActOnSquad) and the "does this
+// task even have a gate_owner" state check stay as separate calls at each
+// call site — they are each already a single canonical function/field check,
+// so calling them from two call sites does not reintroduce the drift risk
+// this function exists to close; only compound, multi-step RBAC logic does.
+//
+// This answers "would a caller's DEFAULT click succeed" — the self-verdict
+// org-owner override (override_self_verdict:true) is a write-time-only,
+// explicit opt-in a default Approve/Reject click never sends, so a
+// self-verdict row is modeled as NOT verdictable here even for an org owner;
+// the write path layers the override check on top of this function's
+// 'self_verdict' denial, exactly as it did before this refactor.
+export interface VerdictGateTask {
+  squad_id: string
+  gate_owner: string
+  assignee_agent_id: string | null
+}
+
+export type VerdictGateDenialCode = 'no_gate_capability' | 'missing_surface_cap' | 'self_verdict'
+
+export type VerdictGateResult =
+  | { allowed: true; principal: ReturnType<typeof verdictPrincipal> }
+  | { allowed: false; code: VerdictGateDenialCode; principal: ReturnType<typeof verdictPrincipal> }
+
+export async function evaluateVerdictGates(
+  env: Env,
+  auth: AuthContext,
+  task: VerdictGateTask,
+  verdict: 'approved' | 'rejected',
+): Promise<VerdictGateResult> {
+  const principal = verdictPrincipal(auth)
+  const isSelfCompletionGate = task.gate_owner === 'gate:agent-self-completion'
+
+  // BLOCK-1 fix (kasra-review 2026-08-13, proof-of-exploit): gate:agent-self-completion
+  // is closeable ONLY by the completing agent (the assignee) or an org owner/admin —
+  // the gate grant is explicitly NOT authority for this one gate (the D2 universal
+  // mint grant would otherwise let any agent approve any other agent's task).
+  if (isSelfCompletionGate) {
+    if (principal.id !== task.assignee_agent_id && !legacyOwnerAdmin(auth)) {
+      return { allowed: false, code: 'no_gate_capability', principal }
+    }
+  } else if (!(await callerHoldsGateCapability(env, auth, task.squad_id, task.gate_owner))) {
+    return { allowed: false, code: 'no_gate_capability', principal }
+  }
+
+  // Surface-cap gate (#106): approving a gate:loops task (outreach queue) requires
+  // outreach:send-gated — a member token without this surface grant cannot fire a
+  // GHL send even if they hold gate:loops. Reject is not gated: rejecting sends nothing.
+  //
+  // PRINCIPAL DISAGREEMENT (deliberately not resolved here — see the KNOWN
+  // DIVERGENCE comment at verdictPrincipal, above): hasSurfaceCap resolves its
+  // own principal as auth.memberId ?? auth.userId, member-first — it does NOT
+  // use the `principal` value this function computed via verdictPrincipal
+  // (agent-bound-first). For an agent-bound token these can be two different
+  // principals, so `callerHoldsGateCapability` just above and `hasSurfaceCap`
+  // here check TWO DIFFERENT grant holders for the same verdict. Left as-is
+  // on purpose: silently swapping in `principal` here would fix the symptom
+  // and hide the bug rather than the underlying resolver being fixed (filed
+  // separately, wide blast radius — hasSurfaceCap is called from far beyond
+  // this route).
+  if (task.gate_owner === 'gate:loops' && verdict === 'approved') {
+    if (!(await hasSurfaceCap(env, auth, 'outreach:send-gated'))) {
+      return { allowed: false, code: 'missing_surface_cap', principal }
+    }
+  }
+
+  // K4: self-verdict prevention. "Own work" = the principal IS the task assignee.
+  // gate:agent-self-completion deliberately WAIVES this (its entire purpose is that
+  // the completing agent closes it — see the isSelfCompletionGate branch above,
+  // which already required the caller to BE that assignee to reach this point).
+  const isSelfVerdict = principal.id === task.assignee_agent_id
+  if (isSelfVerdict && !isSelfCompletionGate) {
+    return { allowed: false, code: 'self_verdict', principal }
+  }
+
+  return { allowed: true, principal }
 }
 
 tasksApp.post('/:id/verdict', async (c) => {
@@ -1243,65 +1373,46 @@ tasksApp.post('/:id/verdict', async (c) => {
         ? body.note
         : null
 
-  // RBAC: caller must hold the gate capability.
+  // RBAC: gate ownership, the gate:loops surface cap, and self-verdict — the
+  // ONE shared predicate (mupot#1080/#1081) also used by the MCP twin
+  // (task_verdict, src/mcp/index.ts) and by the dashboard's read-side
+  // can_verdict/can_approve/can_reject (src/dashboard/approvals.ts). A sixth
+  // gate cannot drift the two sides apart because there is only one place it
+  // can be added — see evaluateVerdictGates' own doc comment above.
   const auth = c.get('auth')
-  const principal = verdictPrincipal(auth)
-  // BLOCK-1 fix (kasra-review 2026-08-13, proof-of-exploit): gate:agent-self-completion
-  // is closeable ONLY by the completing agent (the assignee) or an org owner/admin.
-  // The gate grant is NOT authority for this gate — the D2 universal mint grant
-  // would let any agent approve any other agent's completed task (proven live).
-  // Every other gate keeps the capability-based check.
-  if (task.gate_owner === 'gate:agent-self-completion') {
-    if (principal.id !== task.assignee_agent_id && !legacyOwnerAdmin(auth)) {
-      return c.json({ error: 'forbidden', need: 'assignee_or_org_admin' }, 403)
-    }
-  } else {
-    const hasGate = await callerHoldsGateCapability(c.env, auth, task.squad_id, task.gate_owner)
-    if (!hasGate) {
-      return c.json({ error: 'forbidden', need: task.gate_owner }, 403)
-    }
-  }
+  // task.gate_owner is narrowed to non-null by the 'no_gate' guard above, but that
+  // narrowing does not survive passing the whole `task` object to a function whose
+  // parameter type declares gate_owner: string — bind it to a local first so the
+  // narrowing is captured directly, no cast needed.
+  const gateOwner = task.gate_owner
+  const gateResult = await evaluateVerdictGates(
+    c.env,
+    auth,
+    { squad_id: task.squad_id, gate_owner: gateOwner, assignee_agent_id: task.assignee_agent_id },
+    body.verdict,
+  )
+  const principal = gateResult.principal
 
-  // Surface-cap gate (#106): approving a gate:loops task (outreach queue) requires
-  // outreach:send-gated. A member token without this surface grant cannot fire a
-  // GHL send even if they hold gate:loops. Reject path is not gated — rejections
-  // do not send anything.
-  if (task.gate_owner === 'gate:loops' && body.verdict === 'approved') {
-    const hasSend = await hasSurfaceCap(c.env, auth, 'outreach:send-gated')
-    if (!hasSend) {
+  if (!gateResult.allowed) {
+    if (gateResult.code === 'no_gate_capability') {
+      const need = task.gate_owner === 'gate:agent-self-completion' ? 'assignee_or_org_admin' : task.gate_owner
+      return c.json({ error: 'forbidden', need }, 403)
+    }
+    if (gateResult.code === 'missing_surface_cap') {
       return c.json({ error: 'forbidden', need: 'outreach:send-gated' }, 403)
     }
-  }
-
-  // K4: self-verdict prevention.
-  //
-  // Policy: a principal may not approve or reject their own work.
-  // "Own work" = the principal IS the task assignee. Agent-bound tokens use
-  // auth.boundAgentId, not the member envelope id, so they cannot approve their
-  // own assigned tasks by hiding behind member_tokens.member_id.
-  //
-  // Comparison logic:
-  //  - agent-bound token: decider = auth.boundAgentId = agent id.
-  //  - legacy agent token without member envelope: decider = auth.userId.
-  //  - human member token/session: decider = auth.memberId.
-  // Future: when tasks carry a created_by member_id column, also compare memberId
-  // against the creator.
-  //
-  // Override: org owner may self-verdict by passing { override_self_verdict: true }
-  // in the body. The override is logged in the verdict note for auditability.
-  const deciderPrincipalId = principal.id
-  const isSelfVerdict = deciderPrincipalId === task.assignee_agent_id
-  // D1 (2026-08-13, athena gate cluster map on 247858f1): gate:agent-self-completion
-  // is the executor's fallback gate for an agent's OWN completion of previously
-  // UNGATED work (src/agents/execute.ts AGENT_SELF_COMPLETION_GATE_OWNER, BLOCK-2
-  // PR #417). Its entire purpose is that the completing agent closes it — so the
-  // different-principal self_verdict rule is DELIBERATELY WAIVED for exactly this
-  // capability. The waiver is not blanket: reaching this point already required
-  // callerHoldsGateCapability to pass above (a gate_grants row for the caller, or
-  // the org owner/admin legacy bypass), so a caller without the grant still gets
-  // 403, and every other gate keeps the self_verdict 409.
-  const isSelfCompletionGate = task.gate_owner === 'gate:agent-self-completion'
-  if (isSelfVerdict && !isSelfCompletionGate) {
+    // 'self_verdict' — the ONE gate with a deliberate, explicit opt-in override.
+    //
+    // Policy: a principal may not approve or reject their own work. "Own work" =
+    // the principal IS the task assignee. Agent-bound tokens use auth.boundAgentId,
+    // not the member envelope id, so they cannot approve their own assigned tasks
+    // by hiding behind member_tokens.member_id.
+    //
+    // Override: org owner may self-verdict by passing { override_self_verdict: true }
+    // in the body. The override is logged in the verdict note for auditability.
+    // evaluateVerdictGates never grants this override itself (a default
+    // Approve/Reject click never sends the flag) — it is applied here, at the
+    // one write-time call site that owns request-body-shaped exceptions.
     const isOrgOwner = auth.role === 'owner'
     const overrideRequested = body.override_self_verdict === true
     if (!isOrgOwner || !overrideRequested) {
@@ -1312,7 +1423,7 @@ tasksApp.post('/:id/verdict', async (c) => {
       }, 409)
     }
     // Org owner explicit override: audit note is prepended to any caller-provided note.
-    const overrideNote = `[self_verdict_override by org owner ${deciderPrincipalId}]`
+    const overrideNote = `[self_verdict_override by org owner ${principal.id}]`
     note = note ? `${overrideNote} ${note}` : overrideNote
   }
 
