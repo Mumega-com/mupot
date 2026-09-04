@@ -211,6 +211,28 @@ jobs:
       - name: Guard — MCP tool tests must enter through invokeTool
         run: node scripts/check-mcp-tool-seam.mjs
 
+  schema-chain-fresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      # mupot#1285 Tier C slice 1: src/pots/schema-chain.generated.ts is the schema chain
+      # baked into the deployed bundle at build time (a Worker cannot read migrations/*.sql
+      # off disk at request time). A migration added without regenerating this file would
+      # ship a Tier C pot provisioner silently missing that migration's schema — the same
+      # "correct on the day it's written, rots on the next commit" shape
+      # check-test-schema-source.mjs and check-migration-numbering.mjs exist to close for
+      # their own surfaces. Hard gate, no baseline: the file did not exist before this
+      # change, so there is no pre-existing-offender population to grandfather.
+      # Self-tests FIRST, same discipline as the sibling guards.
+      - name: Guard self-tests
+        run: node --test tests/gen-schema-chain.test.mjs tests/check-schema-chain-fresh.test.mjs
+      - name: Guard — schema-chain.generated.ts must match migrations/*.sql
+        run: node scripts/check-schema-chain-fresh.mjs
+
   operator-counts-source:
     runs-on: ubuntu-latest
     steps:

@@ -11,6 +11,7 @@
     "deploy": "node scripts/deploy.mjs",
     "pretypecheck": "node scripts/generate-build-info.mjs",
     "typecheck": "tsc --noEmit",
+  "gen:schema-chain": "node scripts/gen-schema-chain.mjs",
     "pretest": "node scripts/generate-build-info.mjs",
     "test": "vitest run",
     "migrate:local": "wrangler d1 migrations apply mupot --local",
