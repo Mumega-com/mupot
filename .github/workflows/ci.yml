@@ -185,6 +185,32 @@ jobs:
       - name: Guard — tests must build schema from the migration chain
         run: node scripts/check-test-schema-source.mjs
 
+  mcp-tool-seam:
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 is REQUIRED — same reason as test-schema-source above: the ratchet
+      # compares the baseline against the merge target, and a shallow clone cannot read it.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # The guard uses the TypeScript compiler API (already a devDependency) to resolve
+      # imports and simple data flow rather than grepping for `.run(` — needs node_modules.
+      - run: npm ci
+      # Ratchet (mupot#1290): a test that calls a tool's .run() directly instead of going
+      # through invokeTool (src/mcp/index.ts) skips the central spec.min enforcement — a lane
+      # can be dead behind spec.min in production while every test calling .run() stays
+      # green (mupot#1289 round 1: 72/72 green, feature unreachable). The baseline may
+      # shrink, never grow.
+      # Self-tests FIRST — same discipline as test-schema-source: a gate with no tests of its
+      # own is the shape this gate exists to reject.
+      - name: Ratchet self-tests
+        run: node --test tests/check-mcp-tool-seam.test.mjs
+      - name: Guard — MCP tool tests must enter through invokeTool
+        run: node scripts/check-mcp-tool-seam.mjs
+
   operator-counts-source:
     runs-on: ubuntu-latest
     steps:
