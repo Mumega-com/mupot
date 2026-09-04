@@ -7,7 +7,8 @@
 import { Hono } from 'hono'
 import { html, raw } from 'hono/html'
 import type { HtmlEscapedString } from 'hono/utils/html'
-import type { Env, Project, ProjectDeployment } from '../types'
+import type { AuthContext, Env, Project, ProjectDeployment } from '../types'
+import { requireAuth } from '../auth'
 import {
   handlePlatformDispatch,
   previewIframePath,
@@ -16,7 +17,7 @@ import { githubRepoSlug } from '../projects/urls'
 import { PROJECT_SANDBOX_QUICK_PROMPTS } from '../projects/provisioner'
 import { copilotDeepChatMarkup, copilotRecipientSelectHtml } from '../dashboard/copilot'
 
-type AppEnv = { Bindings: Env }
+type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
 export const platformApp = new Hono<AppEnv>()
 
@@ -28,6 +29,28 @@ async function previewHandler(c: { req: { raw: Request }; env: Env }): Promise<R
   })
 }
 
+// AUTHENTICATION IS REQUIRED HERE (mupot#1305). This route dispatches into the
+// `mupot-pots` dispatch namespace — the SAME namespace that holds sovereign tenant pots —
+// using a script name that is member-supplied (`worker_name || slug`). Until this gate it
+// was mounted with no auth middleware at all, and was confirmed reachable unauthenticated
+// on production 2026-09-04:
+//
+//   GET https://mupot.mumega.com/preview/<uuid>/  ->  {"error":"project_not_found",...}
+//
+// i.e. a database lookup ran for an anonymous stranger, and for a project in `healthy`
+// state the request would have been dispatched into that project's Worker.
+//
+// It also forwards credentials, and unlike the WFP hostname branch it cannot rely on the
+// browser's own scoping to prevent that: `/preview/*` is SAME-ORIGIN on the colony, so the
+// browser attaches the colony's host-only `mupot_session` cookie, and dispatchProjectRequest
+// hands the request on with headers intact. The cookie being host-only is precisely why it
+// IS sent here — the host is the colony.
+//
+// requireAuth answers 401 JSON rather than redirecting, so the dashboard's preview iframe
+// fails cleanly instead of rendering login HTML into itself. That was the stated reason
+// this route sits ahead of the dashboard catch-all, and it is preserved.
+platformApp.use('/preview/:project_id', requireAuth)
+platformApp.use('/preview/:project_id/*', requireAuth)
 platformApp.all('/preview/:project_id', previewHandler)
 platformApp.all('/preview/:project_id/*', previewHandler)
 
