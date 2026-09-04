@@ -26,7 +26,7 @@
 //   register_agent_key — admin on the agent's squad → public-only signed-runtime identity
 
 import type { Capability, CapabilityGrant, ConnectionChannel, Env, BusEvent, Squad } from '../types'
-import { hasCapability, isOrgAdmin } from '../auth/capability'
+import { hasCapability, isOrgAdmin, holdsCapabilityFloor } from '../auth/capability'
 import {
   createDepartment,
   createSquad,
@@ -1322,14 +1322,54 @@ async function readAuditDiff(
 // because deciding self-vs-other requires resolving `agent` first; the self
 // lane's own admin-field gate takes over that job.
 //
-// `min` is 'authenticated', not 'admin' (Kasra's gate, F1): the AAGATE floor
-// in src/mcp/index.ts's invokeTool is scope-AGNOSTIC — `min: 'admin'` would
-// have required the CALLER to already hold admin on some scope before run()
-// is ever entered, which makes the self lane unreachable for exactly the
-// population it exists for (an agent holding only 'member' on its own squad).
-// Lowering the floor means the non-self branch below must carry the FULL
-// admin check itself (hasWorkspaceAdmin(auth) OR memberCanOnSquad admin on
-// the target's squad) — the floor no longer vouches for anything.
+// `min` is 'authenticated', not 'admin' (Kasra's gate round 2, F1): the
+// AAGATE floor in src/mcp/index.ts's invokeTool is scope-AGNOSTIC —
+// `min: 'admin'` would have required the CALLER to already hold admin on
+// some scope before run() is ever entered, which makes the self lane
+// unreachable for exactly the population it exists for (an agent holding
+// only 'member' on its own squad). Lowering the floor means run() below
+// must carry the FULL admin check itself for a non-bound caller.
+//
+// R1 (Kasra's gate round 3): invokeTool's own comment states the invariant
+// this tool must now preserve on its own — "Check authz FIRST so
+// unauthorized callers get 403 regardless of body validity" (src/mcp/index.ts,
+// ~line 4862). With the floor skipped for 'authenticated' tools, that
+// ordering became this handler's job: a non-bound, zero-cap caller (e.g. a
+// B1 directory session) used to get a UNIFORM 403 from the floor no matter
+// what it sent. After lowering `min`, the SAME caller instead reached
+// resolveAgentRef first and got 400 invalid_args / 404 agent_not_found / 403
+// forbidden depending on whether an `agent` was supplied and whether it
+// existed — an agent-EXISTENCE ORACLE it has through no other tool
+// (resolve_agent and get_agent_profile both refuse it at 403 need=observer).
+// Fixed by re-deriving, for a non-bound caller ONLY, exactly what the old
+// central floor checked (`!hasWorkspaceAdmin(auth) && !holdsCapabilityFloor
+// (auth, 'admin')`) and running it BEFORE any argument is read. A bound
+// caller skips this — its authorization depends on whether the target is its
+// OWN row, which requires resolving `agent` first; that path (self lane vs.
+// operator_principal_required) is untouched by this check.
+//
+// R2 (Kasra's gate round 3): the fine-grained memberCanOnSquad(..., 'admin')
+// check below is no longer backed by a declarative `min` — the RANK is
+// asserted only by the read of this code and, now, by dedicated negative
+// tests (lead / observer / admin-on-a-different-squad all refused) in
+// tests/agent-self-update.test.ts. A framework-level floor sweep no longer
+// exercises this tool's rank once the check moved into run(); the tests
+// carry that weight explicitly instead.
+//
+// R3 (Kasra's gate round 3): the fine-grained check below does NOT repeat
+// `hasWorkspaceAdmin(auth) ||` — that disjunct was proven DEAD there. An
+// org-wide grant already satisfies memberCanOnSquad/hasCapability's own
+// org-scope branch (src/auth/capability.ts's hasCapability: "An org-wide
+// grant covers every scope"), so for the array-shaped `capabilities` every
+// real MCP caller carries, hasWorkspaceAdmin(auth) is a strict SUBSET of
+// memberCanOnSquad(..., 'admin') — proven by mutation (deleting the
+// disjunct left the suite green). The EARLY floor check above still writes
+// `!hasWorkspaceAdmin(auth) && !holdsCapabilityFloor(auth, 'admin')` with
+// both conjuncts, deliberately: it exists to replicate src/mcp/index.ts's
+// central AAGATE floor byte-for-byte (see R1), and that floor itself pairs
+// the same two checks — whether hasWorkspaceAdmin is ALSO redundant there is
+// a question about the shared floor, not about this tool, and simplifying
+// the shared floor is out of scope here. Match it, don't improve on it.
 export const SELF_PATCHABLE_FIELDS = ['model', 'model_fallback', 'purpose', 'skills'] as const
 export const SELF_FORBIDDEN_FIELDS = [
   'slug',
@@ -1398,10 +1438,28 @@ const toolUpdateAgent: ToolSpec = {
       budget_window: STRING_SCHEMA,
       reason: STRING_SCHEMA,
     },
-    required: ['agent'],
+    // `agent` is deliberately NOT in `required` here (R1, gate round 3).
+    // invokeTool runs validateArgs's `required` check UNCONDITIONALLY before
+    // run() — including for a tool whose `min` is 'authenticated', which
+    // skips only the AAGATE floor, not schema validation. A `required`
+    // entry would therefore reject a missing `agent` with 400 BEFORE the R1
+    // floor check below ever runs, reopening the exact "authz FIRST" gap R1
+    // exists to close. run() enforces "agent required" itself, AFTER the
+    // floor, via the `if (!agentRef) return fail(400, ...)` a few lines down
+    // — same outcome for an authorized caller, correct order for one who
+    // isn't.
     additionalProperties: false,
   },
   async run(auth, env, args) {
+    // R1 (mupot#1288 gate round 3): for a NON-bound caller, replicate the old
+    // central AAGATE floor BEFORE reading or resolving `agent` — see the
+    // block comment above. A bound caller skips this: whether it is
+    // authorized depends on whether the target IS its own row, which needs
+    // `agent` resolved first (handled below, unaffected by this check).
+    if (!auth.boundAgentId && !hasWorkspaceAdmin(auth) && !holdsCapabilityFloor(auth, 'admin')) {
+      return fail(403, 'forbidden', { need: 'admin' })
+    }
+
     const agentRef = str(args.agent)
     if (!agentRef) return fail(400, 'invalid_args', 'agent required')
 
@@ -1429,16 +1487,16 @@ const toolUpdateAgent: ToolSpec = {
         if (field in args) return fail(403, 'forbidden', { need: 'admin', field })
       }
     } else {
-      // `min` is 'authenticated' (see the block comment above), so this
-      // branch is now the ONLY thing standing between an unprivileged caller
-      // and every field on this tool — the AAGATE floor in invokeTool no
-      // longer vouches for admin. Same rank as create/deactivate (org admin
-      // OR admin on the agent's squad, the exact pair the floor used to cover
-      // via hasWorkspaceAdmin-or-holdsCapabilityFloor before this tool moved
-      // off it). A profile row is identity — who an agent claims to be is
-      // what every downstream router, gate, and dispatcher reads.
+      // Precise scope check — the R1 floor above already proved this caller
+      // holds admin on SOME scope; this proves it holds admin on THIS
+      // squad specifically (or org-wide — hasCapability's org branch covers
+      // that inside memberCanOnSquad itself, see R3 in the block comment
+      // above, which is why there is no separate hasWorkspaceAdmin(auth)
+      // disjunct here). Admin on squad X does not imply admin on squad Y.
+      // A profile row is identity — who an agent claims to be is what every
+      // downstream router, gate, and dispatcher reads.
       const grants = auth.capabilities ?? []
-      if (!hasWorkspaceAdmin(auth) && !(await memberCanOnSquad(env, grants, agent.squad_id, 'admin'))) {
+      if (!(await memberCanOnSquad(env, grants, agent.squad_id, 'admin'))) {
         return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
       }
     }

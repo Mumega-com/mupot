@@ -912,6 +912,23 @@ const PURPOSE_CONTROL_CHAR_RE = /[\x00-\x09\x0B-\x1F\x7F]/
 const SKILLS_MAX_COUNT = 32
 const SKILL_RE = /^[a-z0-9][a-z0-9_.:-]{0,63}$/
 
+// NAME_MAX_LEN / ROLE_MAX_LEN / IDENTITY_CONTROL_CHAR_RE (mupot#1288 gate round 3,
+// R4): name and role had NO shape cap on the admin path even after F3 capped
+// model/model_fallback/purpose/skills — and they are the two fields
+// interpolated RAW into an agent's own system turn (src/agents/execute.ts,
+// src/agents/loop.ts, src/agents/agent-do.ts), a stricter authority surface
+// than purpose (which reaches no prompt builder). Unlike purpose,
+// \n is NOT allowed here — a newline in role/name forges a standalone
+// prompt LINE, not just an oversized one, so the ban is every C0 control
+// code AND \n, not "every control code except \n". Bounds are generous for
+// a one-line identity string, not a paragraph: name tracks a short display
+// name (80 chars), role a short descriptor (200 chars — mirrors purpose's
+// intent but at a fraction of its length, since role is a title, not a brief).
+const NAME_MAX_LEN = 80
+const ROLE_MAX_LEN = 200
+// eslint-disable-next-line no-control-regex -- deliberately matching control chars to REJECT them
+const IDENTITY_CONTROL_CHAR_RE = /[\x00-\x1F\x7F]/
+
 // budget_cap_cents/budget_window (mupot#611 item 1): before this, budget_cap_cents
 // was settable ONLY at creation (prepareSquadCreate/prepareAgentCreate above). An
 // agent or squad created without a cap — or one whose spend profile changed — could
@@ -1047,6 +1064,19 @@ export async function updateAgentProfile(
     if (key === 'purpose') {
       if (trimmed.length > PURPOSE_MAX_LEN) return { ok: false, error: 'invalid_field' }
       if (PURPOSE_CONTROL_CHAR_RE.test(trimmed)) return { ok: false, error: 'invalid_field' }
+    }
+    // mupot#1288 gate round 3, R4 — name/role reach the system prompt raw
+    // (see the block comment above IDENTITY_CONTROL_CHAR_RE); the non-empty
+    // check above already enforces the 1-char floor, this adds the ceiling
+    // and bans EVERY control character including \n (a newline here forges
+    // a standalone prompt line, unlike purpose where \n is legitimate).
+    if (key === 'name') {
+      if (trimmed.length > NAME_MAX_LEN) return { ok: false, error: 'invalid_field' }
+      if (IDENTITY_CONTROL_CHAR_RE.test(trimmed)) return { ok: false, error: 'invalid_field' }
+    }
+    if (key === 'role') {
+      if (trimmed.length > ROLE_MAX_LEN) return { ok: false, error: 'invalid_field' }
+      if (IDENTITY_CONTROL_CHAR_RE.test(trimmed)) return { ok: false, error: 'invalid_field' }
     }
     sets.push(`${key} = ?`)
     binds.push(trimmed)
