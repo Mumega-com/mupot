@@ -1,8 +1,50 @@
 # Changelog
 
+## 0.30.1 — landing sweep (2026-09-04)
+
+Six pull requests landed, closing three live production defects and clearing the open-PR
+backlog to two drafts. Verified on the merged tree: 7487/7487 vitest, 15/15 composition
+(workerd), `tsc --noEmit` exit 0, and the schema-source, mcp-tool-seam and audit gates all
+exit 0 with zero dependency vulnerabilities.
+
+**Security — measured exploitable on production and fixed:**
+
+- **#1301 / #1299** — a client-supplied `x-mupot-tenant-slug` header selected which tenant
+  Worker served a request, ahead of all authentication. Both readers closed, the parameter
+  deleted from `extractTenantSlug` rather than gated. Also closed a second live bypass found
+  in review: a trailing-dot host (`mupot.mumega.com.`) is a legal FQDN that survived the edge
+  and reached the dispatch namespace as `mupot-mumega-com-`.
+- **#1307 / #1305** — `/preview/:project_id` was mounted with no auth middleware and
+  dispatched into the same namespace that holds tenant pots, by a member-supplied script
+  name. Now requires a session *and* a project the caller may actually see, using the same
+  visibility-scoped read the project's own API and page use.
+- **#1312 / #1303** — slug availability returned `available: true` for every well-formed
+  slug, because the `pots` table it queried had never existed and the catch reported the
+  failure as availability. Table added, check fails closed, and it now consults both pots
+  and project worker names since they share one dispatch namespace.
+
+**Features:**
+
+- **#1248** — `/t/{tenant}/{interface}` apex path routing, with colony credentials and
+  tenant-override headers stripped before dispatch. The path door is same-origin, so unlike
+  subdomain routing the browser's credentials arrive with the request.
+- **#1246** — type-then-click device grant for agent access.
+- **#1247** — a missing Cloudflare token now returns `503 unconfigured` rather than failing
+  opaquely.
+
+**Documentation:** #1262 plugins catalog, #1313 muvps-loom VPS bridge skill.
+
+Held deliberately: #1277 fails two `living-presence` tests on its own head (sibling seats
+collapse onto one presence label), and #1253 needs a design decision on onboarding surface
+conflicts. Neither is a merge problem; both are recorded on the PRs.
+
+Known open and not fixed here: #1306 (no HTTP route reached a provisioned pot before #1248),
+#1311 (dispatched responses execute on the colony origin — no CSP anywhere in `src/`), #1302
+(tenant addressing), #1304 (drifted tenants never receive security fixes).
+
 ## Release status — 2026-09-02
 
-- **Current source version:** `0.30.0` on `main`. **This document does not pin the `main`
+- **Current source version:** `0.30.1` on `main`. **This document does not pin the `main`
   commit.** Any SHA written here is false the moment the commit writing it is merged, so
   read it with `git rev-parse origin/main`.
 - **Current production deployment:** `0.30.0`. Read the exact commit and `clean` flag from
