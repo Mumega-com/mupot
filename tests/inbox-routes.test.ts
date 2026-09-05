@@ -6,6 +6,12 @@ import { describe, it, expect, vi } from 'vitest'
 import { createHash } from 'node:crypto'
 import type { Env, CapabilityGrant } from '../src/types'
 
+// SQLite's lower() is ASCII-only — it does not fold Unicode case. Use this, never
+// String.prototype.toLowerCase(), when mocking a `lower(...)` SQL predicate.
+function asciiLower(s: string): string {
+  return s.replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32))
+}
+
 // Mock the member-token auth so we drive the caller's weld directly.
 vi.mock('../src/auth/member-bearer', () => ({
   bearerToken: (h?: string) => (h && h.startsWith('Bearer ') ? h.slice(7) : null),
@@ -135,8 +141,10 @@ function makeDb(
       return agents.filter((a) => a.slug === ref)
     }
     if (sql.includes('WHERE lower(name) = lower(?1)')) {
+      // F4, 2026-09: SQLite's lower() is ASCII-only (does not fold Unicode case) — mirror
+      // that here with an ASCII-only fold instead of JS's Unicode-folding toLowerCase().
       const [ref] = b as [string]
-      return agents.filter((a) => a.name.toLowerCase() === String(ref).toLowerCase())
+      return agents.filter((a) => asciiLower(a.name) === asciiLower(String(ref)))
     }
     if (sql.includes('SELECT squad_id FROM memberships WHERE agent_id = ?1')) {
       return []

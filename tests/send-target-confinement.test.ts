@@ -1046,3 +1046,139 @@ describe('sendToRef — PR #1321 follow-up mutation gaps (2026-09-05 third gate)
     }
   })
 })
+
+describe('sendToRef — 4th-gate fixes (Codex re-review, 2026-09-05)', () => {
+  it('F1: admin ambiguous slug never launders into a name send, even with exactly one name match', async () => {
+    const { db, close, sqlite } = migratedDb()
+    try {
+      sqlite.exec(`
+        INSERT INTO departments (id, slug, name) VALUES ('dept-f1', 'dept-f1', 'Dept F1');
+        INSERT INTO squads (id, department_id, slug, name) VALUES
+          ('squad-f1-a', 'dept-f1', 'f1-a', 'F1 A'),
+          ('squad-f1-b', 'dept-f1', 'f1-b', 'F1 B'),
+          ('squad-f1-c', 'dept-f1', 'f1-c', 'F1 C');
+        INSERT INTO agents (id, squad_id, slug, name) VALUES
+          ('agent-f1-slug-1', 'squad-f1-a', 'kasra', 'Not Named Kasra One'),
+          ('agent-f1-slug-2', 'squad-f1-b', 'kasra', 'Not Named Kasra Two'),
+          ('agent-f1-named', 'squad-f1-c', 'ops-bot', 'kasra');
+      `)
+      const res = await sendToRef(envWith(db), { ...baseInput, toRef: 'kasra' }, ADMIN)
+      expect(res).toEqual({ ok: false, reason: 'recipient_ambiguous' })
+      expect(sqlite.prepare('SELECT COUNT(*) AS n FROM agent_messages').get()).toEqual({ n: 0 })
+      expect(sqlite.prepare(
+        "SELECT COUNT(*) AS n FROM agent_messages WHERE to_agent = 'agent-f1-named'",
+      ).get()).toEqual({ n: 0 })
+    } finally {
+      close()
+    }
+  })
+
+  it('F2: send.to strips exactly one leading @ so a roster-copied "@slug" handle resolves', async () => {
+    const { db, close } = migratedDb()
+    try {
+      const res = await sendToRef(envWith(db), { ...baseInput, toRef: '@target' }, NON_ADMIN(grant('squad-target')))
+      expect(res.ok).toBe(true)
+      if (res.ok) expect(res.toAgent).toBe('agent-target')
+    } finally {
+      close()
+    }
+  })
+
+  it('F2: a literal leading-@ slug is still reachable by its raw value (no double-strip, no false fallback)', async () => {
+    const { db, close, sqlite } = migratedDb()
+    try {
+      sqlite.exec(`
+        INSERT INTO agents (id, squad_id, slug, name) VALUES ('agent-at-literal', 'squad-target', '@literal', 'At Literal');
+        INSERT INTO memberships (id, agent_id, squad_id, capability) VALUES
+          ('membership-at-literal', 'agent-at-literal', 'squad-target', 'member');
+      `)
+      const res = await sendToRef(envWith(db), { ...baseInput, toRef: '@literal' }, NON_ADMIN(grant('squad-target')))
+      expect(res.ok).toBe(true)
+      if (res.ok) expect(res.toAgent).toBe('agent-at-literal')
+    } finally {
+      close()
+    }
+  })
+
+  it('F3: a visible slug and a DIFFERENT visible agent\'s display name sharing the same ref refuse rather than pick by precedence', async () => {
+    const { db, close, sqlite } = migratedDb()
+    try {
+      sqlite.exec(`
+        INSERT INTO departments (id, slug, name) VALUES ('dept-f3', 'dept-f3', 'Dept F3');
+        INSERT INTO squads (id, department_id, slug, name) VALUES
+          ('squad-f3-a', 'dept-f3', 'f3-a', 'F3 A'),
+          ('squad-f3-b', 'dept-f3', 'f3-b', 'F3 B');
+        INSERT INTO agents (id, squad_id, slug, name) VALUES
+          ('agent-f3-atlas-slug', 'squad-f3-a', 'atlas', 'Slug Holder'),
+          ('agent-f3-atlas-name', 'squad-f3-b', 'atlas-bot', 'Atlas');
+        INSERT INTO memberships (id, agent_id, squad_id, capability) VALUES
+          ('membership-f3-slug', 'agent-f3-atlas-slug', 'squad-f3-a', 'member'),
+          ('membership-f3-name', 'agent-f3-atlas-name', 'squad-f3-b', 'member');
+      `)
+      const grants: CapabilityGrant[] = [
+        { member_id: 'member-sender', scope_type: 'squad', scope_id: 'squad-f3-a', capability: 'observer' },
+        { member_id: 'member-sender', scope_type: 'squad', scope_id: 'squad-f3-b', capability: 'observer' },
+      ]
+      const res = await sendToRef(envWith(db), { ...baseInput, toRef: 'atlas' }, NON_ADMIN(grants))
+      expect(res).toEqual({ ok: false, reason: 'send_target_not_visible' })
+      expect(sqlite.prepare(
+        "SELECT COUNT(*) AS n FROM agent_messages WHERE to_agent IN ('agent-f3-atlas-slug', 'agent-f3-atlas-name')",
+      ).get()).toEqual({ n: 0 })
+    } finally {
+      close()
+    }
+  })
+
+  it('F3: an agent whose own slug and name both match itself still resolves (same-agent collision is not ambiguity)', async () => {
+    const { db, close, sqlite } = migratedDb()
+    try {
+      sqlite.exec(`
+        INSERT INTO departments (id, slug, name) VALUES ('dept-f3s', 'dept-f3s', 'Dept F3 Self');
+        INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-f3s', 'dept-f3s', 'f3s', 'F3 Self');
+        INSERT INTO agents (id, squad_id, slug, name) VALUES ('agent-f3-self', 'squad-f3s', 'atlas', 'atlas');
+        INSERT INTO memberships (id, agent_id, squad_id, capability) VALUES
+          ('membership-f3-self', 'agent-f3-self', 'squad-f3s', 'member');
+      `)
+      const grants: CapabilityGrant[] = [
+        { member_id: 'member-sender', scope_type: 'squad', scope_id: 'squad-f3s', capability: 'observer' },
+      ]
+      const res = await sendToRef(envWith(db), { ...baseInput, toRef: 'atlas' }, NON_ADMIN(grants))
+      expect(res.ok).toBe(true)
+      if (res.ok) expect(res.toAgent).toBe('agent-f3-self')
+    } finally {
+      close()
+    }
+  })
+
+  it('F4: real migrated D1 lower(name)=lower(?1) is ASCII-only — a non-ASCII-case-folded name does NOT match', async () => {
+    const { db, close, sqlite } = migratedDb()
+    try {
+      sqlite.exec(`
+        INSERT INTO departments (id, slug, name) VALUES ('dept-f4', 'dept-f4', 'Dept F4');
+        INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-f4', 'dept-f4', 'f4', 'F4');
+        INSERT INTO agents (id, squad_id, slug, name) VALUES ('agent-f4-elodie', 'squad-f4', 'elodie-bot', 'Élodie');
+      `)
+      // Pin actual production D1 behaviour, not a wished-for one: SQLite's lower() leaves
+      // non-ASCII code points untouched instead of case-folding them the way JS
+      // .toLowerCase() does. Name is stored as 'Élodie' (accented E uppercase). Querying
+      // with the accented E in LOWERCASE ('élodie') does NOT match in real D1, even though
+      // every ASCII letter in the rest of the name is a case-insensitive match and JS's
+      // .toLowerCase()-based mock (the bug this fix closes) would have matched it.
+      const lowerAccentMisses = sqlite.prepare(
+        "SELECT id FROM agents WHERE lower(name) = lower(?1) AND status != 'inactive'",
+      ).all('élodie') as Array<{ id: string }>
+      expect(lowerAccentMisses).toEqual([])
+
+      // The exact stored case (including the accented letter) still matches, as does an
+      // all-uppercase query — ASCII-only lower() happens to fold 'ÉLODIE' back down to
+      // 'Élodie' because it leaves the leading É exactly as typed and lowers only the
+      // trailing ASCII letters, which coincides with the stored value here.
+      const exactCaseMatches = sqlite.prepare(
+        "SELECT id FROM agents WHERE lower(name) = lower(?1) AND status != 'inactive'",
+      ).all('Élodie') as Array<{ id: string }>
+      expect(exactCaseMatches).toEqual([{ id: 'agent-f4-elodie' }])
+    } finally {
+      close()
+    }
+  })
+})

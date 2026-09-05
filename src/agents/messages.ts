@@ -1736,21 +1736,33 @@ async function resolveNonAdminSendTarget(
     const visibility = await recipientVisibilityOnSenderSquads(env, memberId, authz.grants, candidate)
     if (visibility.visible) idSlugSquadVisible.push({ ...candidate, guestFence: visibility.guestFence })
   }
-  if (idSlugSquadVisible.length === 1) {
-    return { ok: true, value: idSlugSquadVisible[0], guestFence: idSlugSquadVisible[0].guestFence }
-  }
   if (idSlugSquadVisible.length >= 2) {
     return { ok: false, reason: 'send_target_not_visible' }
   }
 
   // Stage 2: display name, squad/guest visibility only — unconditionally ahead of project,
-  // regardless of how many (if any) invisible id/slug candidates stage 1 saw.
+  // regardless of how many (if any) invisible id/slug candidates stage 1 saw. Computed
+  // BEFORE stage 1 is allowed to return, because a visible slug and a DIFFERENT visible
+  // agent's display name can both match `toRef` — silently preferring stage 1's precedence
+  // in that case is a squat vector (rename your own agent's slug to a colleague's display
+  // name and capture their name-addressed mail). F3, 2026-09.
   const nameSquadVisible = await visibleNamedAgents(env, toRef, authz, memberId)
-  if (nameSquadVisible.length === 1) {
-    return { ok: true, value: nameSquadVisible[0], guestFence: nameSquadVisible[0].guestFence }
-  }
   if (nameSquadVisible.length >= 2) {
     return { ok: false, reason: 'send_target_not_visible' }
+  }
+
+  if (idSlugSquadVisible.length === 1) {
+    if (nameSquadVisible.length === 1 && nameSquadVisible[0].id !== idSlugSquadVisible[0].id) {
+      // Same ref matches two DIFFERENT visible agents — one by slug, one by name. The
+      // overwhelmingly common case (an agent's own slug and name both match itself) is
+      // excluded by the id comparison above, not by count, so it still resolves cleanly.
+      return { ok: false, reason: 'send_target_not_visible' }
+    }
+    return { ok: true, value: idSlugSquadVisible[0], guestFence: idSlugSquadVisible[0].guestFence }
+  }
+
+  if (nameSquadVisible.length === 1) {
+    return { ok: true, value: nameSquadVisible[0], guestFence: nameSquadVisible[0].guestFence }
   }
 
   // Stage 3: last resort — project-scoped authorization over the id/slug candidate set,
@@ -1778,7 +1790,36 @@ function nonAdminGrantsSingleMember(grants: CapabilityGrant[], memberId: string)
 }
 
 
+// F2, 2026-09: src/orient/service.ts's rosterLabel renders `Name (@slug)` so an agent can
+// copy the `@slug` portion straight into send.to — but no resolver here ever stripped the
+// leading `@`, so the advertised handle failed to resolve. Strip at most ONE leading `@`
+// before resolution. The raw ref is always tried FIRST and the stripped retry only runs
+// when the raw ref resolves to nothing, so an agent whose slug or name legitimately begins
+// with `@` remains reachable by its literal value.
+function stripOneLeadingAt(ref: string): string | null {
+  return ref.length > 1 && ref[0] === '@' ? ref.slice(1) : null
+}
+
 export async function resolveVisibleSendTarget(
+  env: Env,
+  toRef: string,
+  authz: SendTargetAuthz,
+  memberId?: string,
+): Promise<
+  | { ok: true; value: { id: string; squad_id: string; slug: string; name: string } }
+  | { ok: false; reason: 'recipient_not_found' | 'recipient_ambiguous' | 'send_target_not_visible' }
+> {
+  const result = await resolveVisibleSendTargetOnce(env, toRef, authz, memberId)
+  if (result.ok) return result
+  const stripped = stripOneLeadingAt(toRef)
+  if (stripped !== null) {
+    const retried = await resolveVisibleSendTargetOnce(env, stripped, authz, memberId)
+    if (retried.ok) return retried
+  }
+  return result
+}
+
+async function resolveVisibleSendTargetOnce(
   env: Env,
   toRef: string,
   authz: SendTargetAuthz,
@@ -1842,28 +1883,37 @@ export async function sendToRef(
   let squadViaProjectOnly = false
   let guestVisibilityFence: GuestVisibilityFence | undefined
 
-  if (authz.isAdmin) {
-    // Admin behaviour is unchanged: existence-only resolve, falling back to a name lookup on
-    // EITHER not_found or ambiguous (an admin operator picking a genuinely ambiguous name is
-    // expected to disambiguate by id; there is no visibility gate to protect here).
-    const r = await resolveAgentRef(env, input.toRef)
-    if (r.ok) {
-      resolved = r
-    } else {
-      const visible = await visibleNamedAgents(env, input.toRef, authz, input.fromMember)
-      if (visible.length !== 1) {
-        // If the id/slug resolve itself was ambiguous (2+ non-tombstoned agents sharing the
-        // ref as a slug), that reason must survive an empty name-fallback — downgrading it
-        // to recipient_not_found here would silently swallow the exact signal potSend's
-        // disambiguation hint (src/channels/index.ts) depends on to tell an admin operator
-        // "pick by id" instead of "no such agent". Only report recipient_not_found when the
-        // id/slug lookup itself found nothing.
-        if (visible.length > 1) return { ok: false, reason: 'recipient_ambiguous' }
-        return { ok: false, reason: r.reason === 'ambiguous' ? 'recipient_ambiguous' : 'recipient_not_found' }
+  // F2, 2026-09: see stripOneLeadingAt's doc comment above resolveVisibleSendTarget. Try the
+  // raw ref first; only retry with the `@` stripped if the raw ref resolved to nothing, so a
+  // legitimately `@`-prefixed slug/name is still reachable by its literal value.
+  type Resolution =
+    | { ok: true; resolved: { value: SendAgentRow }; squadViaProjectOnly: boolean; guestVisibilityFence?: GuestVisibilityFence }
+    | { ok: false; reason: 'recipient_not_found' | 'recipient_ambiguous' | 'send_target_not_visible' }
+
+  const attemptResolve = async (toRef: string): Promise<Resolution> => {
+    if (authz.isAdmin) {
+      // Admin behaviour is unchanged: existence-only resolve, falling back to a name lookup on
+      // EITHER not_found or ambiguous (an admin operator picking a genuinely ambiguous name is
+      // expected to disambiguate by id; there is no visibility gate to protect here).
+      const r = await resolveAgentRef(env, toRef)
+      if (r.ok) {
+        return { ok: true, resolved: r, squadViaProjectOnly: false }
       }
-      resolved = { value: visible[0] }
+      if (r.reason === 'ambiguous') {
+        // An ambiguous slug means "I found 2+ rows and refuse to guess" — that refusal must
+        // never be laundered into a name lookup on ANY path. Falling through here would let an
+        // admin's ambiguous slug send silently deliver to a DIFFERENT agent that merely shares
+        // a display name with one of the slug matches (the P1 defect blocked on the non-admin
+        // path, F1 2026-09). Refuse outright, regardless of how many name candidates exist.
+        return { ok: false, reason: 'recipient_ambiguous' }
+      }
+      const visible = await visibleNamedAgents(env, toRef, authz, input.fromMember)
+      if (visible.length !== 1) {
+        if (visible.length > 1) return { ok: false, reason: 'recipient_ambiguous' }
+        return { ok: false, reason: 'recipient_not_found' }
+      }
+      return { ok: true, resolved: { value: visible[0] }, squadViaProjectOnly: false }
     }
-  } else {
     if (!nonAdminGrantsSingleMember(authz.grants, input.fromMember)) {
       return { ok: false, reason: 'send_target_not_visible' }
     }
@@ -1873,18 +1923,33 @@ export async function sendToRef(
     // predicate found) BEFORE sendAgentMessage is ever called — there is no deferred,
     // post-hoc authorization left to run. sendAgentMessage's own validateMessageProjectAccess
     // still runs below as the authoritative, race-safe write-time check on that same target.
-    const result = await resolveNonAdminSendTarget(env, input.toRef, authz, input.fromMember, {
+    const result = await resolveNonAdminSendTarget(env, toRef, authz, input.fromMember, {
       fromAgent: input.fromAgent,
       projectId: input.projectId,
     })
     if (result.ok) {
-      resolved = { value: result.value }
-      guestVisibilityFence = result.guestFence
-      squadViaProjectOnly = result.viaProjectOnly === true
-    } else {
-      return { ok: false, reason: 'send_target_not_visible' }
+      return {
+        ok: true,
+        resolved: { value: result.value },
+        guestVisibilityFence: result.guestFence,
+        squadViaProjectOnly: result.viaProjectOnly === true,
+      }
+    }
+    return { ok: false, reason: 'send_target_not_visible' }
+  }
+
+  let attempt = await attemptResolve(input.toRef)
+  if (!attempt.ok) {
+    const stripped = stripOneLeadingAt(input.toRef)
+    if (stripped !== null) {
+      const retried = await attemptResolve(stripped)
+      if (retried.ok) attempt = retried
     }
   }
+  if (!attempt.ok) return { ok: false, reason: attempt.reason }
+  resolved = attempt.resolved
+  guestVisibilityFence = attempt.guestVisibilityFence
+  squadViaProjectOnly = attempt.squadViaProjectOnly
 
   const res = await sendAgentMessage(
     env,
