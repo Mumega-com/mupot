@@ -30,8 +30,9 @@ import type { TaskStatus } from './service'
 import { resolveTaskAssignee } from './assignee'
 import { verifyTaskArtifactShape } from './artifact-verification'
 import { hasIndependentRuntimeGate, listTaskDispatchReceiptTimeline } from './runtime-receipts'
+import { dispatchAssignedTask, TaskDispatchFailure } from './dispatch'
+import { resolveHumanMemberId } from '../members/resolve-human-member'
 export { resolveTaskAssignee as resolveAssignee } from './assignee'
-import { createBus } from '../bus'
 import type { BusEvent } from '../types'
 import { startTaskPipeline } from '../workflows/pipeline'
 // #22 v1 ATC ranking: pure scorer (no I/O) + the existing radar's agent
@@ -90,6 +91,33 @@ function inTenantScope(auth: AuthContext, env: Env): boolean {
 // Mirrors the legacy-role escape in requireCapability, applied at squad scope here.
 function legacyOwnerAdmin(auth: AuthContext): boolean {
   return auth.role === 'owner' || auth.role === 'admin'
+}
+
+/**
+ * A receipt-bearing dispatch needs a current, active tenant Member for
+ * attribution. An explicit workspace or web-session member binding is never
+ * allowed to fall back to email if it is stale: that would replace the
+ * authenticated identity with a different principal. Only an unbound legacy
+ * dashboard session may use the identity-first email resolver.
+ */
+async function resolveActiveDispatchActorMemberId(
+  env: Env,
+  auth: AuthContext,
+): Promise<string | null> {
+  const boundMemberId = auth.memberId ?? auth.webSessionMemberId
+  if (boundMemberId) {
+    const row = await env.DB.prepare(
+      `SELECT id
+         FROM members
+        WHERE id = ?1 AND tenant = ?2 AND status = 'active'
+        LIMIT 1`,
+    ).bind(boundMemberId, env.TENANT_SLUG).first<{ id: string }>()
+    return row?.id ?? null
+  }
+  return resolveHumanMemberId(env, {
+    tenant: env.TENANT_SLUG,
+    email: auth.email,
+  })
 }
 
 // Resolve a squad's department for department→squad capability inheritance.
@@ -518,6 +546,8 @@ tasksApp.post('/', async (c) => {
     return c.json({ error: 'forbidden', need: 'member' }, 403)
   }
 
+  const auth = c.get('auth')
+
   const taskBody =
     body.body === undefined || body.body === null
       ? ''
@@ -555,6 +585,20 @@ tasksApp.post('/', async (c) => {
   ) {
     return c.json({ error: 'invalid_gate_owner' }, 400)
   }
+
+  // An external dispatch is durable attributed work. A legacy dashboard owner
+  // may pass the coarse role check without a memberId, but must still resolve to
+  // one active tenant member before this route creates a receipt-bearing task.
+  // Never write a member-attributed receipt using the unrelated web user ID.
+  const dispatchActorMemberId = body.dispatch === true
+    ? await resolveActiveDispatchActorMemberId(c.env, auth)
+    : null
+  if (body.dispatch === true && !dispatchActorMemberId) {
+    return c.json({ error: 'dispatch_actor_member_required' }, 409)
+  }
+  if (body.dispatch === true && !assigneeAgentId) {
+    return c.json({ error: 'dispatch_requires_assignee' }, 400)
+  }
   // Reject a bare-slug gate_owner at write time — it is unverdictable (247858f1).
   if (gateOwner !== null && gateOwner !== undefined && !isValidGateOwnerForm(gateOwner)) {
     return c.json(
@@ -583,7 +627,6 @@ tasksApp.post('/', async (c) => {
     priority = body.priority
   }
 
-  const auth = c.get('auth')
   const projectId = body.project_id === undefined || body.project_id === null
     ? null
     : isNonEmptyString(body.project_id)
@@ -603,12 +646,16 @@ tasksApp.post('/', async (c) => {
       gate_owner: gateOwner,
       priority,
     }, {
-      actor: auth.memberId ? { kind: 'member', id: auth.memberId } : undefined,
-      // HARD-EXCLUSION (Flight-006 Slice 1): a backlog-only create (dispatch:false)
-      // must NOT emit task.created, so the task.created → dispatchSquad →
-      // SquadCoordinatorDO /dispatch → wake-all-agents loop never fires for
-      // planning work. dispatch:true keeps the event + the direct agent.wake.
-      skipEvent: body.dispatch === false,
+      actor: dispatchActorMemberId
+        ? { kind: 'member', id: dispatchActorMemberId }
+        : auth.memberId
+          ? { kind: 'member', id: auth.memberId }
+          : undefined,
+      // A direct dispatch owns the only execution stimulus: its one durable
+      // receipt-bearing agent.wake. Suppress task.created for both explicit
+      // dispatch modes so the generic task.created → dispatchSquad path cannot
+      // fan the same task out to every active squad agent.
+      skipEvent: body.dispatch === false || body.dispatch === true,
     })
   } catch (error) {
     if (error instanceof TaskIntakeContractError) {
@@ -625,19 +672,17 @@ tasksApp.post('/', async (c) => {
   // assignee_not_in_squad), so this fails closed without an authorized assignee.
   let dispatched = false
   if (body.dispatch === true) {
-    if (!assigneeAgentId) {
-      return c.json({ error: 'dispatch_requires_assignee' }, 400)
+    try {
+      await dispatchAssignedTask(c.env, task, dispatchActorMemberId as string)
+    } catch (error) {
+      if (error instanceof TaskDispatchFailure) {
+        if (error.code === 'dispatch_failed') {
+          return c.json({ error: error.code, receipt_id: error.receiptId }, 500)
+        }
+        return c.json({ error: error.code }, 409)
+      }
+      throw error
     }
-    const wake: BusEvent<{ task_id: string; by: string }> = {
-      type: 'agent.wake',
-      tenant: c.env.TENANT_SLUG,
-      squad_id: squad.id,
-      agent_id: assigneeAgentId,
-      actor: auth.memberId ? { kind: 'member', id: auth.memberId } : undefined,
-      payload: { task_id: task.id, by: auth.userId },
-      ts: new Date().toISOString(),
-    }
-    await createBus(c.env).emit(wake)
     dispatched = true
   }
 

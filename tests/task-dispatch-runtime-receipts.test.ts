@@ -23,6 +23,7 @@ const RUNTIME_HASH = 'a'.repeat(64)
 
 function runtimeFixture() {
   const harness = createSqliteD1()
+  const events: BusEvent[] = []
   applyAllMigrations(harness.sqlite)
   harness.sqlite.exec(`
     INSERT INTO departments (id, slug, name)
@@ -107,7 +108,17 @@ function runtimeFixture() {
       capability: 'member',
     }],
   }
-  return { harness, env: { TENANT_SLUG: TENANT, DB: harness.db } as Env, auth, gateAuth }
+  return {
+    harness,
+    env: {
+      TENANT_SLUG: TENANT,
+      DB: harness.db,
+      BUS: { send: async (event: BusEvent) => { events.push(event) } },
+    } as unknown as Env,
+    auth,
+    gateAuth,
+    events,
+  }
 }
 
 describe('task dispatch runtime receipt schema', () => {
@@ -321,6 +332,176 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
     }
   })
 
+  it('emits the task update and wakes the sole independent gate after runtime completion', async () => {
+    const fixture = runtimeFixture()
+    try {
+      await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+        taskId: TASK_ID,
+        dispatchReceiptId: DISPATCH_ID,
+        messageId: MESSAGE_ID,
+        stage: 'runtime_consumed',
+        runtimeReceiptHash: RUNTIME_HASH,
+        attempt: 1,
+      })
+      await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+        taskId: TASK_ID,
+        dispatchReceiptId: DISPATCH_ID,
+        messageId: MESSAGE_ID,
+        stage: 'completed',
+        runtimeReceiptHash: 'd'.repeat(64),
+        attempt: 1,
+        result: 'Ready for the independent gate.',
+      })
+
+      expect(fixture.events).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          type: 'task.updated',
+          agent_id: AGENT_ID,
+          actor: { kind: 'agent', id: AGENT_ID },
+          payload: expect.objectContaining({ task_id: TASK_ID, status: 'review' }),
+        }),
+        expect.objectContaining({
+          type: 'agent.wake',
+          agent_id: GATE_AGENT_ID,
+          actor: { kind: 'agent', id: AGENT_ID },
+          payload: expect.objectContaining({ task_id: TASK_ID, gate_owner: 'gate:independent' }),
+        }),
+        expect.objectContaining({
+          type: 'message.created',
+          agent_id: GATE_AGENT_ID,
+          payload: expect.objectContaining({
+            to_agent: GATE_AGENT_ID,
+            from_agent: 'mupot-review-gate',
+            kind: 'request',
+          }),
+        }),
+      ]))
+      expect(fixture.harness.sqlite.prepare(
+        "SELECT COUNT(*) AS count FROM agent_messages WHERE from_agent = 'mupot-review-gate' AND to_agent = ?",
+      ).get(GATE_AGENT_ID)).toEqual({ count: 1 })
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
+  it('rejects a late failure after the dispatch has already completed', async () => {
+    const fixture = runtimeFixture()
+    try {
+      await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+        taskId: TASK_ID, dispatchReceiptId: DISPATCH_ID, messageId: MESSAGE_ID,
+        stage: 'runtime_consumed', runtimeReceiptHash: RUNTIME_HASH, attempt: 1,
+      })
+      await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+        taskId: TASK_ID, dispatchReceiptId: DISPATCH_ID, messageId: MESSAGE_ID,
+        stage: 'completed', runtimeReceiptHash: 'd'.repeat(64), attempt: 1,
+        result: 'Completed before the late failure arrived.',
+      })
+
+      await expect(recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+        taskId: TASK_ID, dispatchReceiptId: DISPATCH_ID, messageId: MESSAGE_ID,
+        stage: 'failed', runtimeReceiptHash: 'e'.repeat(64), attempt: 1,
+        reason: 'A late failure must not follow completion.',
+      })).rejects.toMatchObject({ code: 'runtime_receipt_transition_conflict' })
+      expect(fixture.harness.sqlite.prepare(
+        "SELECT stage FROM task_dispatch_runtime_receipts ORDER BY CASE stage WHEN 'runtime_consumed' THEN 0 WHEN 'completed' THEN 1 ELSE 2 END, created_at, id",
+      ).all()).toEqual([
+        { stage: 'runtime_consumed' },
+        { stage: 'completed' },
+      ])
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
+  it('returns the completed receipt for an identical completion retry', async () => {
+    const fixture = runtimeFixture()
+    try {
+      await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+        taskId: TASK_ID, dispatchReceiptId: DISPATCH_ID, messageId: MESSAGE_ID,
+        stage: 'runtime_consumed', runtimeReceiptHash: RUNTIME_HASH, attempt: 1,
+      })
+      const input = {
+        taskId: TASK_ID, dispatchReceiptId: DISPATCH_ID, messageId: MESSAGE_ID,
+        stage: 'completed' as const, runtimeReceiptHash: 'f'.repeat(64), attempt: 1,
+        result: 'The completed receipt is replayable.',
+      }
+      const first = await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, input)
+      const replay = await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, input)
+      expect(replay).toEqual(first)
+      expect(fixture.harness.sqlite.prepare(
+        'SELECT COUNT(*) AS count FROM task_dispatch_runtime_receipts WHERE stage = \'completed\'',
+      ).get()).toEqual({ count: 1 })
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
+  it('returns the failed receipt for an identical failure retry', async () => {
+    const fixture = runtimeFixture()
+    try {
+      const input = {
+        taskId: TASK_ID, dispatchReceiptId: DISPATCH_ID, messageId: MESSAGE_ID,
+        stage: 'failed' as const, runtimeReceiptHash: '1'.repeat(64), attempt: 1,
+        reason: 'The failed receipt is replayable.',
+      }
+      const first = await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, input)
+      const replay = await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, input)
+      expect(replay).toEqual(first)
+      expect(fixture.harness.sqlite.prepare(
+        'SELECT COUNT(*) AS count FROM task_dispatch_runtime_receipts WHERE stage = \'failed\'',
+      ).get()).toEqual({ count: 1 })
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
+  it('allows a fresh dispatch identity after an earlier dispatch completed', async () => {
+    const fixture = runtimeFixture()
+    try {
+      await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+        taskId: TASK_ID, dispatchReceiptId: DISPATCH_ID, messageId: MESSAGE_ID,
+        stage: 'runtime_consumed', runtimeReceiptHash: RUNTIME_HASH, attempt: 1,
+      })
+      await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+        taskId: TASK_ID, dispatchReceiptId: DISPATCH_ID, messageId: MESSAGE_ID,
+        stage: 'completed', runtimeReceiptHash: '2'.repeat(64), attempt: 1,
+        result: 'The first dispatch completed.',
+      })
+      fixture.harness.sqlite.prepare(
+        'UPDATE tasks SET status = \'open\', execution_receipt_id = NULL WHERE id = ?',
+      ).run(TASK_ID)
+      fixture.harness.sqlite.exec(`
+        INSERT INTO task_dispatch_receipts (
+          id, tenant, task_id, squad_id, agent_id, actor_kind, actor_id,
+          created_at, claimed_at, consumed_at, attempts, last_error
+        ) VALUES (
+          'dispatch-runtime-2', '${TENANT}', '${TASK_ID}', '${SQUAD_ID}', '${AGENT_ID}',
+          'member', '${MEMBER_ID}', '${T0}', '${T0}', '${T0}', 1, NULL
+        );
+        INSERT INTO agent_messages (
+          id, tenant, to_agent, from_agent, from_member, kind, body, request_id,
+          created_at, delivery_attempts, lease_expires_at
+        ) VALUES (
+          'message-runtime-2', '${TENANT}', '${RUNTIME_ADDRESS}', 'mupot-dispatch', '${MEMBER_ID}',
+          'request',
+          '{"version":"runtime.dispatch/v1","type":"task_dispatch","task_id":"${TASK_ID}","dispatch_receipt_id":"dispatch-runtime-2","squad_id":"${SQUAD_ID}","runtime_address":"${RUNTIME_ADDRESS}"}',
+          'dispatch-inbox:dispatch-runtime-2', '${T0}', 1, '2099-01-01T00:00:00.000Z'
+        );
+      `)
+
+      const consumed = await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+        taskId: TASK_ID, dispatchReceiptId: 'dispatch-runtime-2', messageId: 'message-runtime-2',
+        stage: 'runtime_consumed', runtimeReceiptHash: '3'.repeat(64), attempt: 1,
+      })
+      expect(consumed).toMatchObject({ task_status: 'in_progress' })
+      expect(fixture.harness.sqlite.prepare(
+        'SELECT dispatch_receipt_id, stage FROM task_dispatch_runtime_receipts WHERE dispatch_receipt_id = ?',
+      ).all('dispatch-runtime-2')).toEqual([{ dispatch_receipt_id: 'dispatch-runtime-2', stage: 'runtime_consumed' }])
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
   it('refuses runtime completion when the task has no independent gate owner', async () => {
     const fixture = runtimeFixture()
     try {
@@ -453,6 +634,46 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
     }
   })
 
+  it('fails atomically when the exact leased delivery is acknowledged after precheck', async () => {
+    const fixture = runtimeFixture()
+    try {
+      let invalidated = false
+      const racedDb = {
+        ...fixture.env.DB,
+        prepare: fixture.env.DB.prepare.bind(fixture.env.DB),
+        batch: async (statements: Parameters<Env['DB']['batch']>[0]) => {
+          if (!invalidated) {
+            invalidated = true
+            fixture.harness.sqlite.prepare(
+              'UPDATE agent_messages SET read_at = ?, lease_expires_at = NULL WHERE id = ?',
+            ).run('2026-08-30T18:05:00.000Z', MESSAGE_ID)
+          }
+          return fixture.env.DB.batch(statements)
+        },
+      } as Env['DB']
+
+      await expect(recordTaskDispatchRuntimeReceipt(
+        { ...fixture.env, DB: racedDb },
+        fixture.auth,
+        {
+          taskId: TASK_ID,
+          dispatchReceiptId: DISPATCH_ID,
+          messageId: MESSAGE_ID,
+          stage: 'runtime_consumed',
+          runtimeReceiptHash: RUNTIME_HASH,
+          attempt: 1,
+        },
+      )).rejects.toMatchObject({ code: 'runtime_receipt_transition_conflict' })
+      expect(fixture.harness.sqlite.prepare('SELECT status FROM tasks WHERE id = ?').get(TASK_ID))
+        .toEqual({ status: 'open' })
+      expect(fixture.harness.sqlite.prepare(
+        'SELECT COUNT(*) AS count FROM task_dispatch_runtime_receipts',
+      ).get()).toEqual({ count: 0 })
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
   it('moves runtime completion through review to a different granted gate agent verdict', async () => {
     const fixture = runtimeFixture()
     try {
@@ -529,6 +750,49 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
       expect(fixture.harness.sqlite.prepare(
         'SELECT stage FROM task_dispatch_runtime_receipts ORDER BY created_at, id',
       ).all()).toEqual([{ stage: 'failed' }])
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
+  it('terminally fences failed then completed after an operator reopens the task', async () => {
+    const fixture = runtimeFixture()
+    try {
+      await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+        taskId: TASK_ID,
+        dispatchReceiptId: DISPATCH_ID,
+        messageId: MESSAGE_ID,
+        stage: 'runtime_consumed',
+        runtimeReceiptHash: RUNTIME_HASH,
+        attempt: 1,
+      })
+      await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+        taskId: TASK_ID,
+        dispatchReceiptId: DISPATCH_ID,
+        messageId: MESSAGE_ID,
+        stage: 'failed',
+        runtimeReceiptHash: '4'.repeat(64),
+        attempt: 1,
+        reason: 'The exact runtime failed after consuming the delivery.',
+      })
+      fixture.harness.sqlite.prepare(
+        "UPDATE tasks SET status = 'in_progress' WHERE id = ?",
+      ).run(TASK_ID)
+
+      await expect(recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+        taskId: TASK_ID,
+        dispatchReceiptId: DISPATCH_ID,
+        messageId: MESSAGE_ID,
+        stage: 'completed',
+        runtimeReceiptHash: '5'.repeat(64),
+        attempt: 1,
+        result: 'A failed dispatch must not later claim completion.',
+      })).rejects.toMatchObject({ code: 'runtime_receipt_transition_conflict' })
+      expect(fixture.harness.sqlite.prepare('SELECT status FROM tasks WHERE id = ?').get(TASK_ID))
+        .toEqual({ status: 'in_progress' })
+      expect(fixture.harness.sqlite.prepare(
+        "SELECT COUNT(*) AS count FROM task_dispatch_runtime_receipts WHERE stage = 'completed'",
+      ).get()).toEqual({ count: 0 })
     } finally {
       fixture.harness.close()
     }

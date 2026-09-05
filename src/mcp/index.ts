@@ -37,7 +37,6 @@ import type {
 import { resolveCapabilities, hasCapability, holdsCapabilityFloor, canOnSquad, hasSurfaceCap } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc, touchTokenLastUsed } from '../auth/token-lifecycle'
 import { callerHoldsGateCapability, verdictPrincipal } from '../tasks/index'
-import { resolveSoleGateOwnerAgent } from '../gates/grants'
 import { isChannel } from '../members/service'
 import { findExistingBootstrap } from '../members/bootstrap-self'
 import { resolveConsentedAgentCapabilities } from './oauth-authorize'
@@ -73,6 +72,8 @@ import type { TaskStatus } from '../tasks/service'
 import { isTaskPriority, TASK_PRIORITIES } from '../types'
 import type { TaskPriority } from '../types'
 import { resolveTaskAssignee } from '../tasks/assignee'
+import { dispatchAssignedTask, TaskDispatchFailure } from '../tasks/dispatch'
+import { wakeGateOwnerOnReview } from '../tasks/review-wake'
 import {
   recordTaskDispatchRuntimeReceipt,
   TaskDispatchRuntimeReceiptError,
@@ -1577,94 +1578,6 @@ const toolTaskUpdate: ToolSpec = {
   },
 }
 
-// Non-spoofable system-sender literal for a review-wake's durable inbox delegation —
-// mirrors DISPATCH_BRIDGE_SENDER's convention (src/bus/fleet-bridge.ts): task_update is
-// invoked by a human/agent MEMBER token, not by the gate-owner agent itself, so there is
-// no honest agent principal to name as the sender of "you have a review waiting."
-const REVIEW_WAKE_SENDER = 'mupot-review-gate'
-
-// sendAgentMessage's request_id must match RID_RE ([A-Za-z0-9_.:-]{1,128}, src/agents/
-// messages.ts) — task.id (a uuid) + an ISO timestamp both fit that charset comfortably
-// inside the length cap, so no encoding/hashing is needed.
-function reviewWakeRequestId(taskId: string, ts: string): string {
-  return `review-wake:${taskId}:${ts}`
-}
-
-// wakeGateOwnerOnReview — fires when a task ENTERS 'review' with a gate_owner set.
-// Two independent, best-effort side channels (neither may ever fail the review
-// transition itself, which has already committed by the time this runs):
-//
-//   1. An `agent.wake` BusEvent, built EXACTLY like toolTaskDispatch's own event
-//      (same envelope shape) — this drives the in-Worker AgentDO cortex cycle via
-//      src/bus/consumer.ts's 'agent.wake' case. Deliberately NO dispatch_receipt_id
-//      in the payload: that field is what taskDispatchIdentity() (consumer.ts) keys
-//      on to route into the task_dispatch execute/receipt state machine, which this
-//      is not — a review-wake with no dispatch_receipt_id falls through to the
-//      plain wakeAgent() path, the same generic "poke this agent's DO" primitive
-//      member_wake uses. (AgentDO.wake() will still see payload.task_id and take
-//      its EXECUTE MODE branch — but 'review' is in execute.ts's K6 no-op set, so
-//      that branch safely no-ops rather than mis-driving execution of a task that
-//      is already gated for review.)
-//   2. A durable `agent_messages` row (via the SAME sendAgentMessage primitive
-//      fleet-bridge.ts uses for task_dispatch's external-runtime delivery), so a
-//      non-DO runtime polling GET /api/inbox — the bash wake-hooks — also picks up
-//      the review delegation without needing a hand relay.
-async function wakeGateOwnerOnReview(
-  env: Env,
-  task: Task,
-  actor: { kind: 'member' | 'agent'; id: string },
-  byId: string,
-): Promise<void> {
-  const gateOwner = task.gate_owner
-  if (!gateOwner) return
-
-  let agentId: string | null
-  try {
-    agentId = await resolveSoleGateOwnerAgent(env, gateOwner)
-  } catch {
-    return // resolution failure — never break the already-committed review transition
-  }
-  if (!agentId) return // zero or multiple holders: no unambiguous wake target
-
-  const ts = new Date().toISOString()
-
-  try {
-    const event: BusEvent<{ task_id: string; gate_owner: string; by: string }> = {
-      type: 'agent.wake',
-      tenant: env.TENANT_SLUG,
-      squad_id: task.squad_id,
-      agent_id: agentId,
-      actor,
-      payload: { task_id: task.id, gate_owner: gateOwner, by: byId },
-      ts,
-    }
-    await createBus(env).emit(event)
-  } catch {
-    // best-effort, mirrors toolTaskDispatch's own createBus(env).emit() try/catch
-  }
-
-  try {
-    await sendAgentMessage(
-      env,
-      {
-        fromAgent: REVIEW_WAKE_SENDER,
-        fromMember: byId,
-        toAgent: agentId,
-        kind: 'request',
-        body: JSON.stringify({ type: 'task_review', task_id: task.id, gate_owner: gateOwner, squad_id: task.squad_id }),
-        requestId: reviewWakeRequestId(task.id, ts),
-      },
-      {
-        system: true,
-        reason: 'target is the sole gate_grants holder resolved server-side, not attacker input',
-      },
-    )
-  } catch {
-    // best-effort — durable inbox delivery is additive to the bus wake, never
-    // allowed to fail the already-committed review transition.
-  }
-}
-
 // task_verdict — approve or reject a task in 'review'. The MCP twin of
 // POST /api/tasks/:id/verdict, reusing the SAME helpers (callerHoldsGateCapability,
 // verdictPrincipal, writeVerdict) so the gate logic never forks. This is the wire
@@ -1844,52 +1757,16 @@ const toolTaskDispatch: ToolSpec = {
     if (!(await memberCanOnSquad(env, grants, task.squad_id, 'member'))) {
       return fail(404, 'task_not_found')
     }
-    if (task.status !== 'open' && task.status !== 'blocked' && task.status !== 'rejected') {
-      return fail(409, 'task_not_runnable')
-    }
-    if (!task.assignee_agent_id) return fail(409, 'task_not_dispatchable')
-
-    const assignee = await resolveTaskAssignee(env, task.assignee_agent_id, task.squad_id)
-    if (assignee.error || assignee.value !== task.assignee_agent_id) {
-      return fail(409, 'task_not_dispatchable')
-    }
-
     const memberId = auth.memberId as string
-    const receiptId = crypto.randomUUID()
-    const dispatchedAt = new Date().toISOString()
-    await env.DB.prepare(
-      `INSERT INTO task_dispatch_receipts
-         (id, tenant, task_id, squad_id, agent_id, actor_kind, actor_id, created_at, attempts)
-       VALUES (?, ?, ?, ?, ?, 'member', ?, ?, 1)`,
-    ).bind(
-      receiptId,
-      env.TENANT_SLUG,
-      task.id,
-      task.squad_id,
-      task.assignee_agent_id,
-      memberId,
-      dispatchedAt,
-    ).run()
-
-    const event: BusEvent<{ task_id: string; by: string; dispatch_receipt_id: string }> = {
-      type: 'agent.wake',
-      tenant: env.TENANT_SLUG,
-      squad_id: task.squad_id,
-      agent_id: task.assignee_agent_id,
-      actor: memberActor(memberId),
-      payload: { task_id: task.id, by: memberId, dispatch_receipt_id: receiptId },
-      ts: dispatchedAt,
-    }
+    let dispatch
     try {
-      await createBus(env).emit(event)
+      dispatch = await dispatchAssignedTask(env, task, memberId)
     } catch (error) {
-      const message = error instanceof Error ? error.message.slice(0, 500) : 'dispatch_failed'
-      await env.DB.prepare(
-        `UPDATE task_dispatch_receipts
-            SET last_error = ?
-          WHERE tenant = ? AND id = ?`,
-      ).bind(message, env.TENANT_SLUG, receiptId).run()
-      return fail(500, 'dispatch_failed', { receipt_id: receiptId })
+      if (error instanceof TaskDispatchFailure) {
+        return fail(error.code === 'dispatch_failed' ? 500 : 409, error.code,
+          error.receiptId ? { receipt_id: error.receiptId } : undefined)
+      }
+      throw error
     }
 
     // NOTE (mupot#76e25fc2 / FLIGHT-07B, reverted after gate BLOCK): this handler
@@ -1905,14 +1782,10 @@ const toolTaskDispatch: ToolSpec = {
 
     return done({
       dispatched: true,
-      task_id: task.id,
-      agent_id: task.assignee_agent_id,
-      squad_id: task.squad_id,
-      receipt: {
-        id: receiptId,
-        dispatched_by: memberActor(memberId),
-        dispatched_at: dispatchedAt,
-      },
+      task_id: dispatch.task.id,
+      agent_id: dispatch.task.assignee_agent_id,
+      squad_id: dispatch.task.squad_id,
+      receipt: dispatch.receipt,
     })
   },
 }
