@@ -433,8 +433,11 @@ membersApp.get('/members/:id', requireCapability(orgScope, 'member'), async (c) 
   const id = c.req.param('id')
   // #1330 F2: tenant-scoped — was `WHERE id = ?` alone, letting an admin of
   // tenant A read a tenant-B member's row by id.
+  // #1330 gate-followup: match legacy `tenant IS NULL` rows too, matching
+  // GET /members just above — a legacy row was listed there but 404'd here,
+  // which was incoherent (fail-closed is fine, but the two surfaces must agree).
   const member = await c.env.DB.prepare(
-    'SELECT id, email, display_name, telegram_chat_id, status, created_at FROM members WHERE id = ?1 AND tenant = ?2 LIMIT 1',
+    'SELECT id, email, display_name, telegram_chat_id, status, created_at FROM members WHERE id = ?1 AND (tenant = ?2 OR tenant IS NULL) LIMIT 1',
   )
     .bind(id, c.env.TENANT_SLUG)
     .first<Member>()

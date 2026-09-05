@@ -184,3 +184,67 @@ describe('PATCH /members/:id catch-fallback tenant scoping (#1330 F-C)', () => {
     expect(row?.status).toBe('active')
   })
 })
+
+// #1330 gate-followup (kasra-code, 2026-09-05) — the catch-fallback rung
+// (src/members/index.ts:497, degraded-schema / missing web_sessions branch)
+// was pinned above only for the NEGATIVE cross-tenant case. No test proved
+// the POSITIVE side: a legacy `tenant IS NULL` row actually gets adopted and
+// suspended via this exact fallback rung. Fixture forces the branch the same
+// way as the test above it (DROP TABLE web_sessions).
+describe('PATCH /members/:id catch-fallback legacy tenant IS NULL adoption (#1330 F-C positive)', () => {
+  let harness: SqliteD1Harness
+
+  afterEach(() => harness.close())
+
+  it('adopts and suspends a legacy tenant-IS-NULL row via the degraded-schema fallback', async () => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    harness.sqlite.exec('DROP TABLE web_sessions')
+    const now = '2026-09-05T00:00:00.000Z'
+    await harness.db.prepare(
+      `INSERT INTO members (id, tenant, email, display_name, status, created_at)
+       VALUES ('legacy-member', NULL, 'legacy@example.test', 'Legacy', 'active', ?1)`,
+    ).bind(now).run()
+
+    const env = {
+      TENANT_SLUG: 'tenant-a',
+      DB: harness.db,
+      SESSIONS: {
+        get: async (key: string) => (
+          key === 'sess:owner-session'
+            ? JSON.stringify({
+                userId: 'owner-user',
+                email: 'owner@example.test',
+                role: 'owner',
+                createdAt: now,
+              })
+            : null
+        ),
+        put: async () => undefined,
+        delete: async () => undefined,
+      },
+    } as unknown as Env
+
+    const res = await membersApp.request(
+      '/members/legacy-member',
+      {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json', cookie: 'mupot_session=owner-session' },
+        body: JSON.stringify({ status: 'suspended' }),
+      },
+      env,
+    )
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toEqual({
+      member_id: 'legacy-member',
+      status: 'suspended',
+      sessions_revoked: 0,
+    })
+    const row = await harness.db.prepare(
+      'SELECT status, tenant FROM members WHERE id = ?1',
+    ).bind('legacy-member').first<{ status: string; tenant: string | null }>()
+    expect(row?.status).toBe('suspended')
+    expect(row?.tenant).toBe('tenant-a')
+  })
+})

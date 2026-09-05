@@ -128,4 +128,47 @@ describe('PATCH /members/:id — legacy tenant IS NULL rows (#1330 F-A)', () => 
     expect(row?.status).toBe('active')
     expect(row?.tenant).toBe('tenant-b')
   })
+
+  // #1330 gate-followup (kasra-code, 2026-09-05) — GET /members/:id was strict
+  // `tenant = ?2` while GET /members (list) and PATCH both match
+  // `(tenant = ?N OR tenant IS NULL)`. A legacy row was listed but 404'd on
+  // direct read: incoherent. Fixed to match the OR-NULL form too.
+  it('GET /members/:id matches a legacy tenant=NULL row, consistent with the list endpoint', async () => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    const now = '2026-09-05T00:00:00.000Z'
+    await harness.db.prepare(
+      `INSERT INTO members (id, tenant, email, display_name, status, created_at)
+       VALUES ('legacy-read', NULL, 'legacy-read@example.test', 'Legacy Read', 'active', ?1)`,
+    ).bind(now).run()
+
+    const env = ownerEnv('tenant-a', harness.db)
+    const res = await membersApp.request(
+      '/members/legacy-read',
+      { method: 'GET', headers: { cookie: 'mupot_session=owner-session' } },
+      env,
+    )
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toEqual({
+      member: expect.objectContaining({ id: 'legacy-read' }),
+    })
+  })
+
+  it('GET /members/:id still refuses a different tenant\'s row', async () => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    const now = '2026-09-05T00:00:00.000Z'
+    await harness.db.prepare(
+      `INSERT INTO members (id, tenant, email, display_name, status, created_at)
+       VALUES ('victim-read', 'tenant-b', 'victim-read@example.test', 'Victim Read', 'active', ?1)`,
+    ).bind(now).run()
+
+    const env = ownerEnv('tenant-a', harness.db)
+    const res = await membersApp.request(
+      '/members/victim-read',
+      { method: 'GET', headers: { cookie: 'mupot_session=owner-session' } },
+      env,
+    )
+    expect(res.status).toBe(404)
+  })
 })

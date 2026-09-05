@@ -2,7 +2,8 @@
 --
 -- #1330 F-D: src/auth/index.ts's unconditional status check (added to close the
 -- registered-session fail-open, see 0145-era commit) queries
--- `WHERE lower(email) = ?1 AND tenant = ?2` on every cookie-authenticated
+-- `WHERE lower(email) = ?1 AND (tenant = ?2 OR tenant IS NULL)` on every
+-- cookie-authenticated
 -- request. The only existing index on members.email is the UNIQUE constraint
 -- on the raw column, which `lower()` makes unusable — SQLite/D1 cannot use an
 -- index on `email` to satisfy a predicate on `lower(email)`. Without this,
