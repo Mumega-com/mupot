@@ -259,7 +259,7 @@ describe('enroll admission: revoked standing and the null-member listing guard',
   it('a SUSPENDED org admin is refused — the org grant does not outrank revoked standing', async () => {
     const env = seedOrgAdmin('suspended')
     const res = await authorizeEnrollMint(env, orgAuth(), SQUAD_A)
-    expect(res).toEqual({ ok: false, reason: 'squad_admin_required' })
+    expect(res).toEqual({ ok: false, reason: 'principal_revoked' })
   })
 
   it('an ACTIVE org admin holding NO capability rows is still admitted (legacy owner role)', async () => {
@@ -342,7 +342,7 @@ describe('enroll: a revoked human cannot reach the bootstrap-owner branch', () =
   it('a SUSPENDED org admin is refused even though the resolver answers null', async () => {
     const env = seed('suspended', 'org')
     const res = await authorizeEnrollMint(env, sessionAuth(orgCaps), SQUAD_A)
-    expect(res).toEqual({ ok: false, reason: 'squad_admin_required' })
+    expect(res).toEqual({ ok: false, reason: 'principal_revoked' })
   })
 
   it('an ACTIVE org admin resolving through the same path is admitted', async () => {
@@ -359,7 +359,7 @@ describe('enroll: a revoked human cannot reach the bootstrap-owner branch', () =
     const auth = {
       userId: 'user-sus', email: 'sus@pot.test', role: 'owner', tenant: TENANT, capabilities: [],
     } as unknown as AuthContext
-    expect(await authorizeEnrollMint(env, auth, SQUAD_A)).toEqual({ ok: false, reason: 'squad_admin_required' })
+    expect(await authorizeEnrollMint(env, auth, SQUAD_A)).toEqual({ ok: false, reason: 'principal_revoked' })
   })
 
   it('the true bootstrap owner — no members row for the email at all — is still admitted', async () => {
@@ -423,7 +423,7 @@ describe('enroll standing follows the authority, not the email', () => {
       memberId: 'mem-real', webSessionMemberId: 'mem-real',
       capabilities: [{ scope_type: 'org', scope_id: null, capability: 'admin' }],
     } as unknown as AuthContext
-    expect(await authorizeEnrollMint(env, auth, SQUAD_A)).toEqual({ ok: false, reason: 'squad_admin_required' })
+    expect(await authorizeEnrollMint(env, auth, SQUAD_A)).toEqual({ ok: false, reason: 'principal_revoked' })
   })
 
   it('a suspended org admin on a legacy tenant=NULL row is refused', async () => {
@@ -441,7 +441,7 @@ describe('enroll standing follows the authority, not the email', () => {
       memberId: 'mem-legacy',
       capabilities: [{ scope_type: 'org', scope_id: null, capability: 'admin' }],
     } as unknown as AuthContext
-    expect(await authorizeEnrollMint(env, auth, SQUAD_A)).toEqual({ ok: false, reason: 'squad_admin_required' })
+    expect(await authorizeEnrollMint(env, auth, SQUAD_A)).toEqual({ ok: false, reason: 'principal_revoked' })
   })
 
   it('a suspended owner is refused when the stored email carries whitespace', async () => {
@@ -455,7 +455,7 @@ describe('enroll standing follows the authority, not the email', () => {
     const auth = {
       userId: 'u3', email: 'ws@pot.test', role: 'owner', tenant: TENANT, capabilities: [],
     } as unknown as AuthContext
-    expect(await authorizeEnrollMint(env, auth, SQUAD_A)).toEqual({ ok: false, reason: 'squad_admin_required' })
+    expect(await authorizeEnrollMint(env, auth, SQUAD_A)).toEqual({ ok: false, reason: 'principal_revoked' })
   })
 
   it('a suspended owner arriving through an owner_login_emails ALIAS is refused', async () => {
@@ -473,7 +473,7 @@ describe('enroll standing follows the authority, not the email', () => {
     const auth = {
       userId: 'u4', email: 'alias@pot.test', role: 'owner', tenant: TENANT, capabilities: [],
     } as unknown as AuthContext
-    expect(await authorizeEnrollMint(env, auth, SQUAD_A)).toEqual({ ok: false, reason: 'squad_admin_required' })
+    expect(await authorizeEnrollMint(env, auth, SQUAD_A)).toEqual({ ok: false, reason: 'principal_revoked' })
   })
 
   it('an owner whose provider returned NO email is still admitted — absent is not revoked', async () => {
@@ -641,7 +641,7 @@ describe('enroll: the alias rung selects like the authority does, and revoked ga
       memberId: 'm-revoked',
       capabilities: [{ scope_type: 'squad', scope_id: SQUAD_A, capability: 'admin' }],
     } as unknown as AuthContext
-    expect(await authorizeEnrollMint(env, auth, SQUAD_A)).toEqual({ ok: false, reason: 'squad_admin_required' })
+    expect(await authorizeEnrollMint(env, auth, SQUAD_A)).toEqual({ ok: false, reason: 'principal_revoked' })
   })
 
   it('a revoked verdict beats grants the ALIAS resolver would otherwise hand over', async () => {
@@ -672,7 +672,7 @@ describe('enroll: the alias rung selects like the authority does, and revoked ga
     } as unknown as AuthContext
 
     expect(await humanStandingForSession(env, auth)).toBe('revoked')
-    expect(await authorizeEnrollMint(env, auth, SQUAD_A)).toEqual({ ok: false, reason: 'squad_admin_required' })
+    expect(await authorizeEnrollMint(env, auth, SQUAD_A)).toEqual({ ok: false, reason: 'principal_revoked' })
   })
 
   it('the mint and the picker agree for the same session', async () => {
@@ -695,5 +695,91 @@ describe('enroll: the alias rung selects like the authority does, and revoked ga
     const view = await loadEnrollView(env, auth, {})
     expect(mint.ok).toBe(false)
     expect(view.agents).toEqual([])
+  })
+})
+
+// ── sixth gate: zero is not ambiguous, and two survivors ─────────────────────
+describe('enroll: the alias rung distinguishes absent from ambiguous', () => {
+  let harness: SqliteD1Harness
+  afterEach(() => harness?.close())
+
+  const aliasAuth = () => ({
+    userId: 'u-a', email: 'alias@pot.test', role: 'owner', tenant: TENANT, capabilities: [],
+  } as unknown as AuthContext)
+
+  const withAlias = (seed: string) => {
+    harness = makeHarness()
+    harness.sqlite.exec(`${seed}
+      INSERT INTO org_settings (key, value) VALUES ('owner_login_emails', '["alias@pot.test"]');`)
+    return envFor(harness)
+  }
+
+  it('ZERO owners behind the alias is the bootstrap shape, and is admitted', async () => {
+    // The previous version returned 'revoked' for any non-unique count, which refused the
+    // exact principal this PR exists to admit: capability.ts documents the bootstrap owner
+    // as having no grant rows at all. Zero means "the thing being gated does not exist
+    // yet"; only 2+ means "cannot tell".
+    const env = withAlias('')
+    expect(await humanStandingForSession(env, aliasAuth())).toBe('none')
+    await expect(authorizeEnrollMint(env, aliasAuth(), SQUAD_A)).resolves.toEqual({ ok: true })
+  })
+
+  it('a sole ACTIVE owner whose members.tenant is NULL is still admitted', async () => {
+    // The seventh shape. Importing `m.tenant = ?1` inverted its polarity: in a resolver a
+    // missed row means "resolve nobody" (safe); in a gate that denies on the count, a missed
+    // row drops 1 to 0 and refuses the live owner. 0040 ships that column nullable with no
+    // backfill, so this row is ordinary, not exotic.
+    const env = withAlias(`
+      INSERT INTO members (id, email, display_name, status, tenant) VALUES
+        ('owner-null', 'own@pot.test', 'Owner', 'active', NULL);
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES
+        ('cap-null', 'owner-null', 'org', NULL, 'owner');`)
+    expect(await humanStandingForSession(env, aliasAuth())).toBe('active')
+  })
+
+  it('a scope_id-bearing owner grant does not vouch as the ORG owner', async () => {
+    // Survivor M3: dropping `AND c.scope_id IS NULL` left 33/33 green, so a squad- or
+    // dept-scoped 'owner' row could stand in for the org owner.
+    const env = withAlias(`
+      INSERT INTO members (id, email, display_name, status, tenant) VALUES
+        ('owner-scoped', 'sc@pot.test', 'Scoped', 'active', '${TENANT}');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES
+        ('cap-scoped', 'owner-scoped', 'org', '${SQUAD_A}', 'owner');`)
+    // Only a scoped row exists, so the org-owner set is EMPTY -> bootstrap, not a vouch.
+    expect(await humanStandingForSession(env, aliasAuth())).toBe('none')
+  })
+
+  it('a SUSPENDED scoped owner cannot be masked by treating scoped rows as org rows', async () => {
+    // The direction that matters: with the scope filter dropped, this suspended scoped row
+    // would be the single "org owner" and would answer 'revoked' — right answer, wrong
+    // reason. Pair it with a real org owner so the filter's presence is observable.
+    const env = withAlias(`
+      INSERT INTO members (id, email, display_name, status, tenant) VALUES
+        ('owner-org', 'org@pot.test', 'Org Owner', 'active', '${TENANT}'),
+        ('owner-sq',  'sq@pot.test',  'Squad Owner', 'suspended', '${TENANT}');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES
+        ('cap-org', 'owner-org', 'org', NULL, 'owner'),
+        ('cap-sq',  'owner-sq',  'org', '${SQUAD_A}', 'owner');`)
+    // With the filter: exactly one org-scoped owner, active -> 'active'.
+    // Without it: two rows -> ambiguous -> 'revoked'. Observable either way.
+    expect(await humanStandingForSession(env, aliasAuth())).toBe('active')
+  })
+
+  it('standing keys on memberId, matching resolveEnrollMemberId precedence', async () => {
+    // Survivor M5: swapping the precedence back left 33/33 green, even though gate 5 proved
+    // the divergence exploitable. Pin the order explicitly.
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status, tenant) VALUES
+        ('m-primary', 'p@pot.test', 'Primary', 'suspended', '${TENANT}'),
+        ('m-session', 's@pot.test', 'Session', 'active',    '${TENANT}');
+    `)
+    const env = envFor(harness)
+    const auth = {
+      userId: 'u-p', email: 'p@pot.test', role: 'member', tenant: TENANT,
+      memberId: 'm-primary', webSessionMemberId: 'm-session', capabilities: [],
+    } as unknown as AuthContext
+    // memberId wins, so the suspended primary is what standing reports.
+    expect(await humanStandingForSession(env, auth)).toBe('revoked')
   })
 })

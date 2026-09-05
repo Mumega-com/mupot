@@ -228,9 +228,17 @@ async function ownerAliasStanding(env: Env, email: string): Promise<HumanStandin
       .filter((item): item is string => typeof item === 'string')
       .map((item) => item.trim().toLowerCase())
     if (!aliases.includes(email)) return null
-    // Mirror uniqueOrgOwnerId (src/members/resolve-human-member.ts:25-39) EXACTLY, minus
-    // only the status filter — which is the one predicate this function must not inherit,
-    // because it needs to SEE a suspended owner rather than resolve past them.
+    // Mirror uniqueOrgOwnerId (src/members/resolve-human-member.ts:25-39), minus TWO
+    // predicates, each for its own reason.
+    //
+    // status: this function must SEE a suspended owner rather than resolve past them.
+    //
+    // tenant: 0040 ships members.tenant NULLABLE with no backfill, and the predicate's
+    // POLARITY INVERTS on the way from a resolver into a gate. In uniqueOrgOwnerId a
+    // missed row means "resolve nobody", which is safe. Here a missed row drops the count
+    // from 1 to 0, and a gate that denies on the count then REFUSES the live owner. Same
+    // reasoning as the member-id plane above, which is why that one carries no tenant
+    // predicate either.
     //
     // The previous version dropped three others as well: tenant, `scope_id IS NULL`, and
     // the uniqueness check. That left the authority resolver answering "the unique active
@@ -245,14 +253,23 @@ async function ownerAliasStanding(env: Env, email: string): Promise<HumanStandin
     const owners = await env.DB.prepare(
       `SELECT m.status AS status FROM members m
          JOIN capabilities c ON c.member_id = m.id
-        WHERE m.tenant = ?1
-          AND c.scope_type = 'org'
+        WHERE c.scope_type = 'org'
           AND c.scope_id IS NULL
           AND c.capability = 'owner'
         LIMIT 2`,
-    ).bind(env.TENANT_SLUG).all<{ status: string }>()
+    ).all<{ status: string }>()
     const found = owners.results ?? []
-    if (found.length !== 1) return 'revoked'
+    // TWO different decisions, and the previous version collapsed them into one refusal:
+    //
+    //   2+ owners -> ambiguous. This rung cannot say whose standing the alias inherits,
+    //                so it must not vouch. Fail CLOSED.
+    //   0 owners  -> the thing being gated does not exist yet. That is the bootstrap
+    //                shape, not a revocation, and refusing it locks out exactly the
+    //                principal this PR exists to admit (capability.ts:53-55: "the
+    //                bootstrap owner has no grant rows at all"). Return null so the
+    //                caller's 'none' stands.
+    if (found.length >= 2) return 'revoked'
+    if (found.length === 0) return null
     return standingOf(found[0])
   } catch {
     // A lagging pot may not have org_settings. Absence of the alias table is not evidence
@@ -265,7 +282,7 @@ export async function authorizeEnrollMint(
   env: Env,
   auth: AuthContext,
   squadId: string,
-): Promise<{ ok: true } | { ok: false; reason: 'operator_principal_required' | 'squad_admin_required' }> {
+): Promise<{ ok: true } | { ok: false; reason: 'operator_principal_required' | 'principal_revoked' | 'squad_admin_required' }> {
   if (auth.boundAgentId) return { ok: false, reason: 'operator_principal_required' }
   // BOOTSTRAP-OWNER ADMISSION (mupot#1324 adversarial follow-up). An explicit OR
   // alongside the squad-admin bar below, not a replacement for it. `canOnSquad`
@@ -305,7 +322,13 @@ export async function authorizeEnrollMint(
   // picker showed zero agents to the very session the mint admitted — the two halves
   // disagreeing, with the privileged half permissive.
   const standing = await humanStandingForSession(env, auth)
-  if (standing === 'revoked') return { ok: false, reason: 'squad_admin_required' }
+  // A DISTINCT reason, not squad_admin_required. The standing gate fires before grants are
+  // resolved, so the squad-admin message ("ask an owner to grant you admin there") describes
+  // a cause that was never read — and acting on it hands squad admin to a SUSPENDED account,
+  // after which the reload still 403s and the operator escalates further. A revoked human
+  // and an under-privileged one are different refusals and must not share a reason code on
+  // an authz surface.
+  if (standing === 'revoked') return { ok: false, reason: 'principal_revoked' }
   if (isOrgAdmin(auth)) return { ok: true }
   // resolveHumanStandingGrants, not raw resolveCapabilities: a member whose
   // members.status has moved to suspended gets [] here even when

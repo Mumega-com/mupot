@@ -2175,6 +2175,19 @@ dashboardApp.post('/enroll/mint', async (c) => {
         403,
       )
     }
+    if (authorized.reason === 'principal_revoked') {
+      // Say what is actually true. The squad-admin page below would send the operator to
+      // grant admin to a suspended account, which cannot help and escalates the account's
+      // privileges while it stays locked out.
+      return c.html(
+        shell(
+          c.env,
+          'Enroll seat',
+          errorBody('This login is not active on this pot. A suspended member cannot mint a seat key, and granting more capability will not change that — ask an owner to reactivate the account first.'),
+        ),
+        403,
+      )
+    }
     const squadRow = await c.env.DB.prepare('SELECT name FROM squads WHERE id = ?1 LIMIT 1')
       .bind(agent.squad_id)
       .first<{ name: string }>()
