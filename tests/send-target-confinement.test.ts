@@ -764,3 +764,194 @@ describe('sendToRef — gate 1 send-target confinement (#392)', () => {
     }
   })
 })
+
+// ── PR #1321 re-gate: resolution must be a pure function of the visible set ──────────────
+// The old design decided a resolution PATH (id/slug vs. name) before deciding hidden/visible,
+// and exempted the projectId branch via a caller-supplied flag — so a hidden agent's id/slug
+// could capture or refuse a project-scoped send addressed by a visible agent's display name,
+// and whether it did so depended on hidden-row COUNT. Every cell below must produce the
+// IDENTICAL response (ok, reason, toAgent, and the resulting agent_messages row) to the
+// 0-hidden cell for the same projectId — hidden-row count and projectId together must never
+// change the outcome of a send addressed to a genuinely visible target.
+describe('sendToRef — #1321 re-gate: response is a pure function of the visible agent set', () => {
+  function envoyFixture() {
+    const fixture = migratedDb()
+    fixture.sqlite.exec(`
+      INSERT INTO agents (id, squad_id, slug, name) VALUES ('agent-envoy', 'squad-target', 'envoy', 'Envoy');
+      INSERT INTO memberships (id, agent_id, squad_id, capability)
+      VALUES ('membership-envoy', 'agent-envoy', 'squad-target', 'member');
+      INSERT INTO squads (id, department_id, slug, name) VALUES
+        ('squad-hidden-a', 'dept', 'hidden-a', 'Hidden Squad A'),
+        ('squad-hidden-b', 'dept', 'hidden-b', 'Hidden Squad B'),
+        ('squad-hidden-shared', 'dept', 'hidden-shared', 'Hidden Squad Shared');
+      INSERT INTO projects (id, slug, name, status) VALUES
+        ('project-accessible', 'project-accessible', 'Accessible Project', 'active'),
+        ('project-inaccessible', 'project-inaccessible', 'Inaccessible Project', 'active');
+      INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES
+        ('project-accessible', 'squad-sender', 'write'),
+        ('project-accessible', 'squad-target', 'write');
+    `)
+    return fixture
+  }
+
+  const PROJECT_STATES: Array<{ label: string; projectId: string | undefined }> = [
+    { label: 'unset', projectId: undefined },
+    { label: 'accessible', projectId: 'project-accessible' },
+    { label: 'inaccessible', projectId: 'project-inaccessible' },
+  ]
+
+  const HIDDEN_STATES: Array<{ label: string; setup: (sqlite: ReturnType<typeof migratedDb>['sqlite']) => void }> = [
+    { label: '0 hidden', setup: () => {} },
+    {
+      label: '1 hidden (no project access)',
+      setup: (sqlite) => {
+        sqlite.exec(`
+          INSERT INTO agents (id, squad_id, slug, name) VALUES ('agent-hidden-envoy-1', 'squad-hidden-a', 'Envoy', 'Hidden Envoy One');
+          INSERT INTO memberships (id, agent_id, squad_id, capability)
+          VALUES ('membership-hidden-envoy-1', 'agent-hidden-envoy-1', 'squad-hidden-a', 'member');
+        `)
+      },
+    },
+    {
+      label: '2 hidden (no project access, different squads)',
+      setup: (sqlite) => {
+        sqlite.exec(`
+          INSERT INTO agents (id, squad_id, slug, name) VALUES
+            ('agent-hidden-envoy-1', 'squad-hidden-a', 'Envoy', 'Hidden Envoy One'),
+            ('agent-hidden-envoy-2', 'squad-hidden-b', 'Envoy', 'Hidden Envoy Two');
+          INSERT INTO memberships (id, agent_id, squad_id, capability) VALUES
+            ('membership-hidden-envoy-1', 'agent-hidden-envoy-1', 'squad-hidden-a', 'member'),
+            ('membership-hidden-envoy-2', 'agent-hidden-envoy-2', 'squad-hidden-b', 'member');
+        `)
+      },
+    },
+    {
+      label: '1 hidden whose squad shares the (accessible) project',
+      setup: (sqlite) => {
+        sqlite.exec(`
+          INSERT INTO agents (id, squad_id, slug, name) VALUES ('agent-hidden-envoy-shared', 'squad-hidden-shared', 'Envoy', 'Hidden Envoy Shared');
+          INSERT INTO memberships (id, agent_id, squad_id, capability)
+          VALUES ('membership-hidden-envoy-shared', 'agent-hidden-envoy-shared', 'squad-hidden-shared', 'member');
+          INSERT INTO project_squad_access (project_id, squad_id, access_level)
+          VALUES ('project-accessible', 'squad-hidden-shared', 'write');
+        `)
+      },
+    },
+  ]
+
+  const HIDDEN_AGENT_IDS = ['agent-hidden-envoy-1', 'agent-hidden-envoy-2', 'agent-hidden-envoy-shared']
+
+  for (const { projectId, label: projectLabel } of PROJECT_STATES) {
+    it(`display-name send to a visible target is identical across hidden-slug-holder counts — projectId ${projectLabel}`, async () => {
+      const results: Array<{ label: string; res: unknown; envoyRows: number; hiddenRows: number }> = []
+      for (const { label, setup } of HIDDEN_STATES) {
+        const { db, close, sqlite } = envoyFixture()
+        try {
+          setup(sqlite)
+          const res = await sendToRef(
+            envWith(db),
+            { ...baseInput, toRef: 'Envoy', projectId },
+            NON_ADMIN(grant('squad-target')),
+          )
+          const envoyRows = (
+            sqlite.prepare("SELECT COUNT(*) AS n FROM agent_messages WHERE to_agent = 'agent-envoy'").get() as {
+              n: number
+            }
+          ).n
+          const hiddenRows = (
+            sqlite
+              .prepare(
+                `SELECT COUNT(*) AS n FROM agent_messages WHERE to_agent IN (${HIDDEN_AGENT_IDS.map((id) => `'${id}'`).join(',')})`,
+              )
+              .get() as { n: number }
+          ).n
+          // Strip the message row's own generated uuid — nondeterministic per insert, not
+          // part of the decision under test. Everything else (ok, reason, toAgent, seq,
+          // duplicate) must be byte-identical across hidden-row counts.
+          const normalized =
+            res && typeof res === 'object' && 'id' in res ? { ...(res as Record<string, unknown>), id: '<uuid>' } : res
+          results.push({ label, res: normalized, envoyRows, hiddenRows })
+        } finally {
+          close()
+        }
+      }
+
+      const baseline = results[0]
+      expect(baseline.label).toBe('0 hidden')
+      for (const cell of results) {
+        expect(cell.res, `${cell.label} vs 0-hidden, projectId ${projectLabel}`).toEqual(baseline.res)
+        expect(cell.hiddenRows, `${cell.label}: no hidden agent ever received the message`).toBe(0)
+        // Whatever the visible target's own message outcome was (delivered, or refused for
+        // an orthogonal reason such as an inaccessible projectId), it is IDENTICAL across
+        // every hidden-row count — the hidden agent never siphons off, and never blocks, a
+        // message addressed to the genuinely visible target.
+        expect(cell.envoyRows, cell.label).toBe(baseline.envoyRows)
+      }
+    })
+  }
+
+  // ── addressing a hidden agent DIRECTLY by its own id or slug — no display-name collision.
+  // Must collapse to the SAME shape a genuinely nonexistent ref gets when no authorization
+  // surface applies, and may only succeed when project-scoped access (case b) genuinely
+  // covers that exact agent — never merely because OTHER hidden rows exist elsewhere.
+  for (const { projectId, label: projectLabel } of PROJECT_STATES) {
+    it(`addressing a hidden agent by its own ID collapses to not_found-shape unless project-authorized — projectId ${projectLabel}`, async () => {
+      const { db, close, sqlite } = envoyFixture()
+      try {
+        sqlite.exec(`
+          INSERT INTO agents (id, squad_id, slug, name) VALUES ('agent-lone-hidden', 'squad-hidden-a', 'lone-hidden', 'Lone Hidden');
+          INSERT INTO memberships (id, agent_id, squad_id, capability)
+          VALUES ('membership-lone-hidden', 'agent-lone-hidden', 'squad-hidden-a', 'member');
+        `)
+        const byId = await sendToRef(
+          envWith(db),
+          { ...baseInput, toRef: 'agent-lone-hidden', projectId },
+          NON_ADMIN(grant('squad-target')),
+        )
+        const missing = await sendToRef(
+          envWith(db),
+          { ...baseInput, toRef: 'agent-does-not-exist-either', projectId },
+          NON_ADMIN(grant('squad-target')),
+        )
+        if (projectId === 'project-accessible') {
+          // squad-hidden-a has no project_squad_access row in this fixture — project does
+          // NOT cover it, so it must refuse exactly like the nonexistent ref.
+          expect(byId).toEqual(missing)
+          expect(byId).toEqual({ ok: false, reason: 'send_target_not_visible' })
+        } else {
+          expect(byId).toEqual(missing)
+          expect(byId).toEqual({ ok: false, reason: 'send_target_not_visible' })
+        }
+      } finally {
+        close()
+      }
+    })
+
+    it(`addressing a hidden agent by its own SLUG collapses the same way, and project-authorized access reaches it explicitly (not via display-name leakage) — projectId ${projectLabel}`, async () => {
+      const { db, close, sqlite } = envoyFixture()
+      try {
+        sqlite.exec(`
+          INSERT INTO agents (id, squad_id, slug, name) VALUES ('agent-project-hidden', 'squad-hidden-shared', 'project-hidden-slug', 'Project Hidden');
+          INSERT INTO memberships (id, agent_id, squad_id, capability)
+          VALUES ('membership-project-hidden', 'agent-project-hidden', 'squad-hidden-shared', 'member');
+          INSERT INTO project_squad_access (project_id, squad_id, access_level)
+          VALUES ('project-accessible', 'squad-hidden-shared', 'write');
+        `)
+        const bySlug = await sendToRef(
+          envWith(db),
+          { ...baseInput, toRef: 'project-hidden-slug', projectId },
+          NON_ADMIN(grant('squad-target')),
+        )
+        if (projectId === 'project-accessible') {
+          // Explicitly addressed by its OWN slug, and its squad genuinely shares the
+          // project — case (b) legitimately authorizes this exact, explicitly-named agent.
+          expect(bySlug).toMatchObject({ ok: true, toAgent: 'agent-project-hidden' })
+        } else {
+          expect(bySlug).toEqual({ ok: false, reason: 'send_target_not_visible' })
+        }
+      } finally {
+        close()
+      }
+    })
+  }
+})
