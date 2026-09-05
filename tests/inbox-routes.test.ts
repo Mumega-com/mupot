@@ -71,6 +71,21 @@ function makeDb(
     }
     throw new Error('unhandled run: ' + sql)
   }
+
+  // Faithfully reflects the seatSql fragment shape (src/agents/messages.ts) rather than
+  // hardcoding "unscoped means broadcast-only" — a fake that always applied the correct
+  // filter regardless of the SQL text would never notice a dropped/fail-open predicate.
+  // Three shapes: "target_seat = ?N OR target_seat IS NULL" (scoped — seat is the last
+  // bind), "target_seat IS NULL" alone (broadcast-only default), or NEITHER present
+  // (mutated/fail-open — every unread row for the recipient matches, seat or not).
+  function seatMatches(sql: string, b: unknown[], m: MsgRow): boolean {
+    if (sql.includes('OR target_seat IS NULL')) {
+      const seat = b[b.length - 1] as string
+      return m.target_seat === seat || (m.target_seat ?? null) === null
+    }
+    if (sql.includes('target_seat IS NULL')) return (m.target_seat ?? null) === null
+    return true // no seat predicate in the SQL at all — matches everything (fail-open)
+  }
   function runFirst(sql: string, b: unknown[]) {
     if (/^\s*SELECT mode, generation, key_fingerprint FROM agent_inbox_fences/.test(sql)) {
       const [tenant, agentId] = b as [string, string]
@@ -92,9 +107,9 @@ function makeDb(
       const [tenant, agentId, label] = b as [string, string, string]
       return tenant === 't' && agentId === 'ag-review' && label === 'hadi-codex-cli' ? { 1: 1 } : null
     }
-    // resolveBoundSeat's lookup (src/mcp/index.ts) — the same query, reused unmodified by
-    // the HTTP route (mupot#1325): resolve the CALLER's bound seat label from its own token
-    // id, never from anything the caller supplies.
+    // resolveBoundSeat's lookup (src/agents/inbox-seat.ts) — the same query the MCP inbox
+    // tools use, reused unmodified by the HTTP route (mupot#1325): resolve the CALLER's
+    // bound seat label from its own token id, never from anything the caller supplies.
     if (sql.includes('SELECT label FROM member_tokens WHERE id = ?1 AND tenant = ?2')) {
       const [tokenId, tenant] = b as [string, string]
       if (tenant !== 't') return null
@@ -109,8 +124,7 @@ function makeDb(
       if (signed) {
         if (effectiveMode !== 'signed_only' || suppliedFingerprint !== keyFingerprint(tenant, to_agent)) return { n: 0 }
       } else if (effectiveMode !== 'bearer_only') return { n: 0 }
-      const seat = sql.includes('OR target_seat IS NULL') ? b[b.length - 1] as string : null
-      return { n: messages.filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null && (seat ? (m.target_seat === seat || (m.target_seat ?? null) === null) : (m.target_seat ?? null) === null)).length }
+      return { n: messages.filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null && seatMatches(sql, b, m)).length }
     }
     if (sql.includes('FROM agents WHERE id = ?1 LIMIT 1')) {
       const [ref] = b as [string]
@@ -139,8 +153,7 @@ function makeDb(
       if (signed) {
         if (effectiveMode !== 'signed_only' || b[4] !== keyFingerprint(tenant, to_agent)) return []
       } else if (effectiveMode !== 'bearer_only') return []
-      const seat = sql.includes('OR target_seat IS NULL') ? b[b.length - 1] as string : null
-      const claimed = messages.filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null && (seat ? (m.target_seat === seat || (m.target_seat ?? null) === null) : (m.target_seat ?? null) === null)).sort((x, y) => x.seq - y.seq).slice(0, limit)
+      const claimed = messages.filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null && seatMatches(sql, b, m)).sort((x, y) => x.seq - y.seq).slice(0, limit)
       for (const m of claimed) m.read_at = readAt
       return claimed.map((m) => ({ ...m }))
     }
@@ -154,8 +167,7 @@ function makeDb(
       const hasCursor = sql.includes('seq >')
       const sinceSeq = hasCursor ? (sinceSeqOrLimit ?? 0) : 0
       const limit = hasCursor ? (maybeLimit as number) : sinceSeqOrLimit
-      const seat = sql.includes('OR target_seat IS NULL') ? b[b.length - 1] as string : null
-      return messages.filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null && m.seq > sinceSeq && (seat ? (m.target_seat === seat || (m.target_seat ?? null) === null) : (m.target_seat ?? null) === null)).sort((x, y) => x.seq - y.seq).slice(0, limit).map((m) => ({ ...m }))
+      return messages.filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null && m.seq > sinceSeq && seatMatches(sql, b, m)).sort((x, y) => x.seq - y.seq).slice(0, limit).map((m) => ({ ...m }))
     }
     if (sql.includes('FROM agents WHERE slug = ?1')) {
       const [ref] = b as [string]
@@ -293,6 +305,33 @@ describe('GET /api/inbox', () => {
     const res2 = await inboxApp.fetch(getReq('tok-code'), e)
     const j2 = (await res2.json()) as { messages: unknown[] }
     expect(j2.messages.length).toBe(0)
+  })
+  it('consuming (no peek) read on a seat-bound token only consumes its own seat + broadcast rows, leaving other-seat mail untouched', async () => {
+    // Probes the DB-level seat predicate on the CONSUMING path directly (not just the
+    // route-level seat_mismatch refusal above) — the shape mupot#1325's own-seat default
+    // now exercises: no ?seat, own bound seat mail present alongside another seat's mail.
+    const { env: e, db } = env(AGENTS)
+    db._messages.push({ seq: 1, id: 'a', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm', kind: 'request', body: 'for cli', request_id: null, in_reply_to: null, created_at: 't0', read_at: null, target_seat: 'hadi-codex-cli' })
+    db._messages.push({ seq: 2, id: 'b', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm', kind: 'request', body: 'for mac', request_id: null, in_reply_to: null, created_at: 't0', read_at: null, target_seat: 'hadi-codex-mac' })
+    const res = await inboxApp.fetch(getReq('tok-code-cli'), e)
+    expect(res.status).toBe(200)
+    const j = (await res.json()) as { messages: Array<{ body: string }> }
+    expect(j.messages.map((m) => m.body)).toEqual(['for cli'])
+    // the OTHER seat's row must remain unread — the consuming UPDATE must not have touched it.
+    expect(db._messages.find((m) => m.id === 'b')?.read_at).toBeNull()
+  })
+  it('consuming (no peek) read on an UNSCOPED token (no seat label) stays broadcast-only — seat-tagged mail is never consumed by it', async () => {
+    // The "fail open" mutation: dropping the default branch's `AND target_seat IS NULL`
+    // would let a token with no seat binding at all silently consume every seat's mail on
+    // its next unscoped poll. tok-code carries no seat label (see the member_tokens fake).
+    const { env: e, db } = env(AGENTS)
+    db._messages.push({ seq: 1, id: 'a', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm', kind: 'request', body: 'broadcast', request_id: null, in_reply_to: null, created_at: 't0', read_at: null, target_seat: null })
+    db._messages.push({ seq: 2, id: 'b', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm', kind: 'request', body: 'for mac', request_id: null, in_reply_to: null, created_at: 't0', read_at: null, target_seat: 'hadi-codex-mac' })
+    const res = await inboxApp.fetch(getReq('tok-code'), e)
+    expect(res.status).toBe(200)
+    const j = (await res.json()) as { messages: Array<{ body: string }> }
+    expect(j.messages.map((m) => m.body)).toEqual(['broadcast'])
+    expect(db._messages.find((m) => m.id === 'b')?.read_at).toBeNull()
   })
   it('peek=1 does not consume', async () => {
     const { env: e, db } = env(AGENTS)
