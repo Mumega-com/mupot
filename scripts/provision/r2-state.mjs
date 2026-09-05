@@ -62,6 +62,23 @@ export function guardWorkerDeploy(entitlementState) {
   };
 }
 
+// Classify a FAILED worker-deploy response into the state machine (TEST-ORD-2).
+// 10136 ⇒ binding entitlement off despite reachable data-plane: same park as
+// entitlement_required (dashboard deep link, exit 3). Anything else passes
+// through untouched — the caller owns non-entitlement deploy failures.
+export function classifyDeployError(res) {
+  const code = String(res?.json?.code ?? extractErrorCode(res?.raw ?? '') ?? '');
+  if (code === ERR_BINDING_ENTITLEMENT) {
+    return {
+      state: 'entitlement_required',
+      exit: 3,
+      evidence: 'POST worker versions code:10136 (r2 binding entitlement off)',
+      message: `Worker deploy refused the R2 binding (code 10136): entitlement lapsed after probe. Open ${R2_DASHBOARD_DEEP_LINK}, then re-run — provisioning resumes automatically.`,
+    };
+  }
+  return { state: null, exit: null, evidence: null, message: null, passthrough: res ?? null };
+}
+
 // Tolerant code extraction from non-JSON error bodies (wrangler/CF text errors).
 function extractErrorCode(text) {
   const m = /\bcode[:\s]+(\d{4,5})\b/.exec(String(text ?? ''));
