@@ -245,13 +245,14 @@ Supported verbs:
 
 ## Agent Messaging
 
-Runtimes exchange direct durable messages through the MCP `send` and `inbox`
-tools, or the HTTP mirror used by wake hooks.
+Runtimes exchange direct durable messages through the MCP `send`, `inbox`, and
+`message_get` tools, or the HTTP mirror used by wake hooks.
 
 MCP:
 
 - `send { to, body, kind?, request_id?, in_reply_to? }`
 - `inbox { limit?, peek? }`
+- `message_get { id?, request_id? }` — exactly one; sender-scoped read-back of a row this agent wrote
 - `broadcast { squad_id?, body, kind?, request_id?, include_self?, limit? }`
 
 HTTP:
