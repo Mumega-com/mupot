@@ -51,7 +51,7 @@ function makeEnv(seed: {
                   r.tenant === tenant &&
                   r.status === 'active',
               )
-              return (m ? ({ id: m.id } as unknown as T) : null)
+              return (m ? ({ id: m.id, status: m.status } as unknown as T) : null)
             }
             return null as T | null
           },

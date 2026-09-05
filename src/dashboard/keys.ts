@@ -70,9 +70,13 @@ export interface KeysView {
 
 export async function loadKeysView(env: Env): Promise<KeysView> {
   const [members, squads, departments, tokens] = await Promise.all([
+    // #1330 F-B: tenant-scoped — was unscoped, listing every tenant's active
+    // members into the keys view.
     env.DB.prepare(
-      `SELECT id, display_name, email FROM members WHERE status = 'active' ORDER BY display_name ASC`,
-    ).all<ScopedKeyMember>(),
+      `SELECT id, display_name, email FROM members WHERE status = 'active' AND (tenant = ?1 OR tenant IS NULL) ORDER BY display_name ASC`,
+    )
+      .bind(env.TENANT_SLUG)
+      .all<ScopedKeyMember>(),
 
     env.DB.prepare(
       `SELECT s.id, s.name, d.name AS dept_name
@@ -159,12 +163,16 @@ export async function mintScopedKey(env: Env, params: MintParams): Promise<MintR
     return { ok: false, error: 'rank_ceiling' }
   }
 
-  // 2. Validate member belongs to this pot (D1 is per-tenant — no extra tenant column
-  //    needed, but we check existence to give a clean error vs a FK violation).
+  // 2. Validate member belongs to this pot. Wrangler binds exactly one D1 per
+  //    deployed pot today, so TENANT_SLUG is effectively a constant and this DB
+  //    IS the tenant boundary in practice — but members.tenant (0040) is
+  //    defence-in-depth for a future shared-DB fork, so scope by it here too
+  //    (matching legacy NULL-tenant rows) rather than relying only on the D1
+  //    boundary, and check existence to give a clean error vs a FK violation.
   const member = await env.DB.prepare(
-    `SELECT id FROM members WHERE id = ?1 AND status = 'active' LIMIT 1`,
+    `SELECT id FROM members WHERE id = ?1 AND status = 'active' AND (tenant = ?2 OR tenant IS NULL) LIMIT 1`,
   )
-    .bind(memberId)
+    .bind(memberId, env.TENANT_SLUG)
     .first<{ id: string }>()
   if (!member) return { ok: false, error: 'member_not_found' }
 
