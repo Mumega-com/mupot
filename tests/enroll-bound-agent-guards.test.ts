@@ -527,6 +527,16 @@ describe('humanStandingForSession returns the three states distinctly', () => {
     expect(await humanStandingForSession(envFor(harness), auth('nobody@pot.test'))).toBe('none')
   })
 
+  it("'none' when the authority names a member id whose row is GONE", async () => {
+    // Reaches standingOf's own !row branch, which the email-plane test does not: that one
+    // returns through a different literal further down. Mutating this branch survived
+    // until this case existed — the branch a test executes is not always the branch that
+    // shares its name.
+    harness = makeHarness()
+    const a = auth('ghost@pot.test', { role: 'member', memberId: 'm-deleted', webSessionMemberId: 'm-deleted' })
+    expect(await humanStandingForSession(envFor(harness), a)).toBe('none')
+  })
+
   it("'active' when the row exists and is active", async () => {
     harness = makeHarness()
     harness.sqlite.exec(`INSERT INTO members (id, email, display_name, status, tenant) VALUES ('m-a', 'a@pot.test', 'A', 'active', '${TENANT}');`)
