@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { hasSurfaceCap } from '../src/auth/capability'
+import { createVerdictGateCache, evaluateVerdictGates } from '../src/tasks/index'
 import type { AuthContext, Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
@@ -92,4 +93,60 @@ describe('hasSurfaceCap principal liveness and agent-bound resolution', () => {
       'outreach:send-gated',
     )).resolves.toBe(false)
   })
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // Added by the merge gate. Two of this PR's claimed properties survived
+  // mutation — correct, but unpinned. A property nothing can fail for is a hole
+  // waiting to be reopened.
+  //   deleting the principal_type match in hasActiveGateGrant -> 0 tests red
+  //   removing principal type+id from the verdict cache keys  -> 0 tests red
+  describe('gate-added pins for the mutation survivors', () => {
+    it('a grant of the OTHER principal type never satisfies the check', async () => {
+      // Same id, wrong type. Member and agent ids are distinct UUID namespaces in
+      // production, so this is unreachable today — which is exactly why deleting
+      // the discriminator turned nothing red. It is load-bearing; pin it rather
+      // than trust the namespaces to stay disjoint forever.
+      grant('budget:write', 'member', 'agent-active')
+
+      await expect(hasSurfaceCap(
+        env,
+        auth({ userId: 'agent-active', memberId: null, boundAgentId: 'agent-active' }),
+        'budget:write',
+      )).resolves.toBe(false)
+    })
+
+    it('one cache serving two principals does not hand the second the first answer', async () => {
+      // The verdict cache is request-scoped, so in production one cache serves one
+      // AuthContext and the principal never varies — meaning the key could be a
+      // constant and no test would notice. Nothing in the type or the API enforces
+      // that one-cache-one-auth invariant, so assert the key discriminates. With
+      // principal type+id dropped, the paused agent reads the active agent's `true`.
+      grant('gate:loops', 'agent', 'agent-active')
+
+      const cache = createVerdictGateCache()
+      const task = {
+        id: 'task-1',
+        squad_id: 'squad-1',
+        gate_owner: 'gate:loops',
+        // A THIRD agent: neither principal may verdict its own task, and
+        // self_verdict would short-circuit before the cache is ever consulted.
+        assignee_agent_id: 'agent-someone-else',
+      } as unknown as Parameters<typeof evaluateVerdictGates>[2]
+
+      const first = await evaluateVerdictGates(
+        env,
+        auth({ userId: 'member-active', memberId: 'member-active', boundAgentId: 'agent-active' }),
+        task, 'rejected', cache,
+      )
+      const second = await evaluateVerdictGates(
+        env,
+        auth({ userId: 'member-active', memberId: 'member-active', boundAgentId: 'agent-paused' }),
+        task, 'rejected', cache,
+      )
+
+      expect(first.allowed).toBe(true)
+      expect(second.allowed).toBe(false)
+    })
+  })
+
 })
