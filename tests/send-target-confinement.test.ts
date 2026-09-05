@@ -556,6 +556,77 @@ describe('sendToRef — gate 1 send-target confinement (#392)', () => {
     }
   })
 
+  it('a hidden-namespace slug can never flip a visible display-name send (#1321)', async () => {
+    const { db, close, sqlite } = migratedDb()
+    try {
+      sqlite.exec(`
+        INSERT INTO agents (id, squad_id, slug, name) VALUES ('agent-atlas', 'squad-target', 'atlas', 'Atlas');
+        INSERT INTO memberships (id, agent_id, squad_id, capability) VALUES
+          ('membership-atlas', 'agent-atlas', 'squad-target', 'member');
+      `)
+      const expected = { ok: true, toAgent: 'agent-atlas' }
+      const baseline = await sendToRef(envWith(db), { ...baseInput, toRef: 'Atlas' }, NON_ADMIN(grant('squad-target')))
+      expect(baseline).toMatchObject(expected)
+
+      // Insert a HIDDEN agent (different, invisible squad) whose SLUG is the visible name.
+      // Being not visible AND not matched by name, it must not change the result at all.
+      sqlite.exec(`
+        INSERT INTO agents (id, squad_id, slug, name) VALUES ('agent-hidden-1', 'squad-other', 'Atlas', 'Hidden One');
+        INSERT INTO memberships (id, agent_id, squad_id, capability) VALUES
+          ('membership-hidden-1', 'agent-hidden-1', 'squad-other', 'member');
+      `)
+      const withOneHidden = await sendToRef(envWith(db), { ...baseInput, toRef: 'Atlas' }, NON_ADMIN(grant('squad-target')))
+      expect(withOneHidden).toMatchObject(expected)
+
+      // A second hidden agent (a different squad, a different slug so id/slug resolution
+      // for 'Atlas' still hits exactly the first hidden row, not an ambiguous pair — the
+      // ambiguous-slug case is covered on its own below) must not change it either: general
+      // hidden-namespace noise must never leak through a visible name send.
+      sqlite.exec(`
+        INSERT INTO agents (id, squad_id, slug, name) VALUES ('agent-hidden-2', 'squad-sender', 'hidden-two', 'Hidden Two');
+        INSERT INTO memberships (id, agent_id, squad_id, capability) VALUES
+          ('membership-hidden-2', 'agent-hidden-2', 'squad-sender', 'member');
+      `)
+      const withTwoHidden = await sendToRef(envWith(db), { ...baseInput, toRef: 'Atlas' }, NON_ADMIN(grant('squad-target')))
+      expect(withTwoHidden).toMatchObject(expected)
+
+      const rowCount = sqlite
+        .prepare("SELECT COUNT(*) AS n FROM agent_messages WHERE to_agent = 'agent-atlas'")
+        .get() as { n: number }
+      expect(rowCount.n).toBe(3)
+    } finally {
+      close()
+    }
+  })
+
+  it('two hidden agents sharing an ambiguous slug refuse the send and never fall back to a same-named visible decoy (#1321)', async () => {
+    const { db, close, sqlite } = migratedDb()
+    try {
+      // Two DIFFERENT squads (both invisible to a sender whose only grant is squad-target)
+      // so both rows can legitimately share slug 'kasra' — agents.slug is
+      // UNIQUE(squad_id, slug), not globally unique.
+      sqlite.exec(`
+        INSERT INTO agents (id, squad_id, slug, name) VALUES
+          ('agent-hidden-kasra-1', 'squad-other', 'kasra', 'Hidden Kasra One'),
+          ('agent-hidden-kasra-2', 'squad-sender', 'kasra', 'Hidden Kasra Two'),
+          ('agent-decoy-kasra', 'squad-target', 'decoy-kasra', 'kasra');
+        INSERT INTO memberships (id, agent_id, squad_id, capability) VALUES
+          ('membership-hidden-kasra-1', 'agent-hidden-kasra-1', 'squad-other', 'member'),
+          ('membership-hidden-kasra-2', 'agent-hidden-kasra-2', 'squad-sender', 'member'),
+          ('membership-decoy-kasra', 'agent-decoy-kasra', 'squad-target', 'member');
+      `)
+      const res = await sendToRef(envWith(db), { ...baseInput, toRef: 'kasra' }, NON_ADMIN(grant('squad-target')))
+      expect(res).toEqual({ ok: false, reason: 'send_target_not_visible' })
+
+      const decoyRows = sqlite
+        .prepare("SELECT COUNT(*) AS n FROM agent_messages WHERE to_agent = 'agent-decoy-kasra'")
+        .get() as { n: number }
+      expect(decoyRows.n).toBe(0)
+    } finally {
+      close()
+    }
+  })
+
   it('a real capabilities-table row (not a hand-built grant array) is honored end-to-end', async () => {
     const { db, sqlite, close } = migratedDb()
     try {
