@@ -644,6 +644,37 @@ describe('enroll: the alias rung selects like the authority does, and revoked ga
     expect(await authorizeEnrollMint(env, auth, SQUAD_A)).toEqual({ ok: false, reason: 'squad_admin_required' })
   })
 
+  it('a revoked verdict beats grants the ALIAS resolver would otherwise hand over', async () => {
+    // The case that actually kills the org-branch-only check. My first attempt at this test
+    // used a suspended member holding a squad grant, which is refused anyway because
+    // resolveHumanStandingGrants filters status — so it passed for the wrong reason.
+    //
+    // The real shape: TWO org owners, one suspended and one active. The standing rung is
+    // status-blind and sees two, so it fails closed with 'revoked'. But resolveHumanMemberId's
+    // uniqueOrgOwnerId filters status='active', sees exactly ONE, and resolves the alias to
+    // the LIVE owner — handing this session a different member's grants, which are then
+    // approved honestly. isOrgAdmin is false here (role member, no capabilities), so the
+    // org branch is skipped entirely and only a verdict that gates every path can refuse.
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status, tenant) VALUES
+        ('owner-susp', 'susp@pot.test', 'Suspended Owner', 'suspended', '${TENANT}'),
+        ('owner-live', 'live@pot.test', 'Live Owner',      'active',    '${TENANT}');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES
+        ('cap-susp', 'owner-susp', 'org', NULL, 'owner'),
+        ('cap-live', 'owner-live', 'org', NULL, 'owner'),
+        ('cap-live-squad', 'owner-live', 'squad', '${SQUAD_A}', 'admin');
+      INSERT INTO org_settings (key, value) VALUES ('owner_login_emails', '["alias@pot.test"]');
+    `)
+    const env = envFor(harness)
+    const auth = {
+      userId: 'u-alias2', email: 'alias@pot.test', role: 'member', tenant: TENANT, capabilities: [],
+    } as unknown as AuthContext
+
+    expect(await humanStandingForSession(env, auth)).toBe('revoked')
+    expect(await authorizeEnrollMint(env, auth, SQUAD_A)).toEqual({ ok: false, reason: 'squad_admin_required' })
+  })
+
   it('the mint and the picker agree for the same session', async () => {
     // They disagreed: the picker honoured the revoked verdict and returned zero agents
     // while the mint admitted. The permissive half was the privileged one.
