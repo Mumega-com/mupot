@@ -955,3 +955,94 @@ describe('sendToRef — #1321 re-gate: response is a pure function of the visibl
     })
   }
 })
+
+describe('sendToRef — PR #1321 follow-up mutation gaps (2026-09-05 third gate)', () => {
+  it('two hidden agents sharing one slug, both project-authorized, no visible name match -> refuses (mutant projectVisible.length >= 1 take-first must go red)', async () => {
+    const { db, close, sqlite } = migratedDb()
+    try {
+      sqlite.exec(`
+        INSERT INTO departments (id, slug, name) VALUES ('dept-hidden', 'dept-hidden', 'Dept Hidden');
+        INSERT INTO squads (id, department_id, slug, name) VALUES
+          ('squad-hidden-a', 'dept-hidden', 'hidden-a', 'Hidden A'),
+          ('squad-hidden-b', 'dept-hidden', 'hidden-b', 'Hidden B');
+        INSERT INTO agents (id, squad_id, slug, name) VALUES
+          ('agent-hidden-analyst-a', 'squad-hidden-a', 'analyst', 'Not Named Analyst A'),
+          ('agent-hidden-analyst-b', 'squad-hidden-b', 'analyst', 'Not Named Analyst B');
+        INSERT INTO memberships (id, agent_id, squad_id, capability) VALUES
+          ('membership-hidden-analyst-a', 'agent-hidden-analyst-a', 'squad-hidden-a', 'member'),
+          ('membership-hidden-analyst-b', 'agent-hidden-analyst-b', 'squad-hidden-b', 'member');
+        INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES
+          ('project-shared', 'squad-hidden-a', 'write'),
+          ('project-shared', 'squad-hidden-b', 'write');
+      `)
+      // Sender has NO grant on squad-hidden-a/b, so neither candidate is squad/guest
+      // visible (stage 1), and neither agent's display NAME is 'analyst' (stage 2), so
+      // resolution falls to stage 3: both candidates are project-authorized via
+      // project-shared. That is genuine ambiguity at stage 3 and must refuse — the
+      // mutant `>= 1` would instead take projectVisible[0] and dispatch silently to
+      // whichever row the query happened to return first.
+      const res = await sendToRef(
+        envWith(db),
+        { ...baseInput, toRef: 'analyst', projectId: 'project-shared' },
+        NO_GRANTS,
+      )
+      expect(res).toEqual({ ok: false, reason: 'send_target_not_visible' })
+      expect(sqlite.prepare(
+        "SELECT COUNT(*) AS n FROM agent_messages WHERE to_agent IN ('agent-hidden-analyst-a', 'agent-hidden-analyst-b')",
+      ).get()).toEqual({ n: 0 })
+    } finally {
+      close()
+    }
+  })
+
+  it('project-only-visible target: a sendAgentMessage failure after the visibility check collapses to send_target_not_visible, never the underlying reason (mutant `if (false)` must go red)', async () => {
+    const { db, close, sqlite } = migratedDb()
+    try {
+      // Sender has NO squad/guest grant reaching agent-target — the ONLY route in is
+      // stage 3's project_squad_access authorization via 'project-shared' (both
+      // squad-sender and squad-target sit on it per migratedDb's fixture). Force
+      // sendAgentMessage itself to fail post-visibility-check (archive the project
+      // between the visibility check and the write) so squadViaProjectOnly is true and
+      // the collapse branch actually fires.
+      const raced = withDbHooks(envWith(db), {
+        beforeMessageInsert: () => {
+          sqlite.prepare("UPDATE projects SET status = 'archived' WHERE id = 'project-shared'").run()
+        },
+      })
+
+      const res = await sendToRef(
+        raced,
+        { ...baseInput, toRef: 'agent-target', projectId: 'project-shared' },
+        NO_GRANTS,
+      )
+      expect(res).toEqual({ ok: false, reason: 'send_target_not_visible' })
+      expect(sqlite.prepare(
+        "SELECT COUNT(*) AS n FROM agent_messages WHERE to_agent = 'agent-target'",
+      ).get()).toEqual({ n: 0 })
+    } finally {
+      close()
+    }
+  })
+
+  it('admin: two active agents sharing slug "kasra", no agent named kasra -> recipient_ambiguous survives an empty name fallback', async () => {
+    const { db, close, sqlite } = migratedDb()
+    try {
+      sqlite.exec(`
+        INSERT INTO departments (id, slug, name) VALUES ('dept-kasra', 'dept-kasra', 'Dept Kasra');
+        INSERT INTO squads (id, department_id, slug, name) VALUES
+          ('squad-kasra-a', 'dept-kasra', 'kasra-a', 'Kasra A'),
+          ('squad-kasra-b', 'dept-kasra', 'kasra-b', 'Kasra B');
+        INSERT INTO agents (id, squad_id, slug, name) VALUES
+          ('agent-kasra-1', 'squad-kasra-a', 'kasra', 'Not Named Kasra One'),
+          ('agent-kasra-2', 'squad-kasra-b', 'kasra', 'Not Named Kasra Two');
+      `)
+      const res = await sendToRef(envWith(db), { ...baseInput, toRef: 'kasra' }, ADMIN)
+      expect(res).toEqual({ ok: false, reason: 'recipient_ambiguous' })
+      expect(sqlite.prepare(
+        "SELECT COUNT(*) AS n FROM agent_messages WHERE to_agent IN ('agent-kasra-1', 'agent-kasra-2')",
+      ).get()).toEqual({ n: 0 })
+    } finally {
+      close()
+    }
+  })
+})

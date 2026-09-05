@@ -1782,6 +1782,7 @@ export async function resolveVisibleSendTarget(
   env: Env,
   toRef: string,
   authz: SendTargetAuthz,
+  memberId?: string,
 ): Promise<
   | { ok: true; value: { id: string; squad_id: string; slug: string; name: string } }
   | { ok: false; reason: 'recipient_not_found' | 'recipient_ambiguous' | 'send_target_not_visible' }
@@ -1793,14 +1794,24 @@ export async function resolveVisibleSendTarget(
     if (named.length === 1) return { ok: true, value: named[0] }
     return { ok: false, reason: named.length > 1 ? 'recipient_ambiguous' : 'recipient_not_found' }
   }
-  const memberIds = [...new Set(authz.grants.map((grant) => grant.member_id).filter(Boolean))]
-  if (memberIds.length !== 1 || !nonAdminGrantsSingleMember(authz.grants, memberIds[0])) {
+  // Prefer the caller's own identity when it hands one in (e.g. src/channels/index.ts,
+  // which already has the resolved member id in scope) so both callers apply the EXACT
+  // SAME predicate to the EXACT SAME identity, rather than each independently
+  // reconstructing "the" member id from the grants array. Reconstructing from grants
+  // remains the fallback for callers that only have an authz bag.
+  const distinctMemberIds = [...new Set(authz.grants.map((grant) => grant.member_id).filter(Boolean))]
+  const resolvedMemberId = memberId ?? distinctMemberIds[0]
+  if (
+    resolvedMemberId === undefined ||
+    distinctMemberIds.length !== 1 ||
+    !nonAdminGrantsSingleMember(authz.grants, resolvedMemberId)
+  ) {
     return { ok: false, reason: 'send_target_not_visible' }
   }
   // No projectId here by design — this primitive is for pre-send visibility gating only
   // (e.g. rate-limit charge keys); a caller with a projectId must go through sendToRef
   // itself, which passes one through to the same resolveNonAdminSendTarget call.
-  const result = await resolveNonAdminSendTarget(env, toRef, authz, memberIds[0])
+  const result = await resolveNonAdminSendTarget(env, toRef, authz, resolvedMemberId)
   if (result.ok) return { ok: true, value: result.value }
   return { ok: false, reason: 'send_target_not_visible' }
 }
@@ -1841,7 +1852,14 @@ export async function sendToRef(
     } else {
       const visible = await visibleNamedAgents(env, input.toRef, authz, input.fromMember)
       if (visible.length !== 1) {
-        return { ok: false, reason: visible.length > 1 ? 'recipient_ambiguous' : 'recipient_not_found' }
+        // If the id/slug resolve itself was ambiguous (2+ non-tombstoned agents sharing the
+        // ref as a slug), that reason must survive an empty name-fallback — downgrading it
+        // to recipient_not_found here would silently swallow the exact signal potSend's
+        // disambiguation hint (src/channels/index.ts) depends on to tell an admin operator
+        // "pick by id" instead of "no such agent". Only report recipient_not_found when the
+        // id/slug lookup itself found nothing.
+        if (visible.length > 1) return { ok: false, reason: 'recipient_ambiguous' }
+        return { ok: false, reason: r.reason === 'ambiguous' ? 'recipient_ambiguous' : 'recipient_not_found' }
       }
       resolved = { value: visible[0] }
     }
