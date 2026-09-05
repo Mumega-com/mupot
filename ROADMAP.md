@@ -15,7 +15,7 @@ with the release, so that gate is currently unsatisfiable as written.
 | State | Version | Meaning |
 |---|---|---|
 | Current source version | `0.30.0` | Present on `main`; the commit is deliberately not pinned here, because any SHA in a versioned file is false once that file merges — read `git rev-parse origin/main`. Preview until the stabilization gate passes and `v0.30.0` is tagged. |
-| Current production version | `0.30.0` | Last recorded deploy `4fd452eb`, `clean:true`, 2026-09-04 (authoritative: live `/health`). Six PRs merged after that deploy, so production trails `main`; the size of the gap is not asserted here, compare the two sources. Still not a stable-release claim, which requires a tag. |
+| Current production version | `0.30.0` | Last recorded deploy `4fd452eb`, `clean:true`, 2026-09-04 (authoritative: live `/health`). Further PRs merged after that deploy, so production trails `main`; the size of the gap is deliberately not counted here (a count rots on the next merge), compare the two sources. Still not a stable-release claim, which requires a tag. |
 | Last tagged release | `v0.25.0` | Project Routines and Needs You. |
 | Next stable candidate | `v0.30.0` | Stabilization-only: security train, messaging reliability, release proof, and backlog closure. **Scope is unsettled as of 2026-09-04** — #1246, #1247 and #1248 were excluded by the scope boundary and have since landed on `main`; see `docs/releases/next-flights.md`. |
 | Future development target | `v0.31.0` | Canonical receiver, Agent Computers, and Recovery; held until `v0.30.0` is stable. |

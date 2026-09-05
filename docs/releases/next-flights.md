@@ -10,7 +10,7 @@ ownership remains in [ROADMAP.md](../../ROADMAP.md); the shipped record remains 
 | Surface | Exact state |
 |---|---|
 | Current `main` | `0.30.0` — not pinned here; read `git rev-parse origin/main` |
-| Current production | `0.30.0` — read live `/health`; last recorded deploy `4fd452eb0b6a618d1db2a18206eee8616d44f276`, `clean:true`, 2026-09-04 (#1312). Six PRs merged after it, so production trails `main`. |
+| Current production | `0.30.0` — read live `/health`; last recorded deploy `4fd452eb0b6a618d1db2a18206eee8616d44f276`, `clean:true`, 2026-09-04 (#1312). Further PRs merged after it, so production trails `main`; the gap is not counted here. |
 | Latest tagged stable release | `v0.25.0` |
 | Next stable candidate | `v0.30.0` |
 | Next development release | `v0.31.0` |
