@@ -627,6 +627,72 @@ describe('sendToRef — gate 1 send-target confinement (#392)', () => {
     }
   })
 
+  it('a projectId must not let a hidden slug steal a unique visible display-name send (#1321)', async () => {
+    const { db, close, sqlite } = migratedDb()
+    try {
+      sqlite.exec(`
+        INSERT INTO agents (id, squad_id, slug, name) VALUES
+          ('agent-atlas', 'squad-target', 'atlas', 'Atlas'),
+          ('agent-hidden-atlas', 'squad-other', 'Atlas', 'Hidden Atlas');
+        INSERT INTO memberships (id, agent_id, squad_id, capability) VALUES
+          ('membership-atlas', 'agent-atlas', 'squad-target', 'member'),
+          ('membership-hidden-atlas', 'agent-hidden-atlas', 'squad-other', 'member');
+        INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES
+          ('project-shared', 'squad-other', 'write');
+      `)
+      const covered = await sendToRef(
+        envWith(db),
+        { ...baseInput, toRef: 'Atlas', projectId: 'project-shared' },
+        NON_ADMIN(grant('squad-target')),
+      )
+      expect(covered).toMatchObject({ ok: true, toAgent: 'agent-atlas' })
+      expect(sqlite.prepare(
+        "SELECT COUNT(*) AS n FROM agent_messages WHERE to_agent = 'agent-hidden-atlas'",
+      ).get()).toEqual({ n: 0 })
+    } finally {
+      close()
+    }
+  })
+
+  it('a projectId that does not cover the hidden slug still delivers the unique visible name (#1321)', async () => {
+    const { db, close, sqlite } = migratedDb()
+    try {
+      sqlite.exec(`
+        INSERT INTO agents (id, squad_id, slug, name) VALUES
+          ('agent-atlas', 'squad-target', 'atlas', 'Atlas'),
+          ('agent-hidden-atlas', 'squad-other', 'Atlas', 'Hidden Atlas');
+        INSERT INTO memberships (id, agent_id, squad_id, capability) VALUES
+          ('membership-atlas', 'agent-atlas', 'squad-target', 'member'),
+          ('membership-hidden-atlas', 'agent-hidden-atlas', 'squad-other', 'member');
+      `)
+      const uncovered = await sendToRef(
+        envWith(db),
+        { ...baseInput, toRef: 'Atlas', projectId: 'project-shared' },
+        NON_ADMIN(grant('squad-target')),
+      )
+      expect(uncovered).toMatchObject({ ok: true, toAgent: 'agent-atlas' })
+      expect(sqlite.prepare(
+        "SELECT COUNT(*) AS n FROM agent_messages WHERE to_agent = 'agent-hidden-atlas'",
+      ).get()).toEqual({ n: 0 })
+    } finally {
+      close()
+    }
+  })
+
+  it('a projectId still authorizes an invisible slug when no unique visible name matches', async () => {
+    const { db, close } = migratedDb()
+    try {
+      const res = await sendToRef(
+        envWith(db),
+        { ...baseInput, toRef: 'target', projectId: 'project-shared' },
+        NO_GRANTS,
+      )
+      expect(res).toMatchObject({ ok: true, toAgent: 'agent-target' })
+    } finally {
+      close()
+    }
+  })
+
   it('a real capabilities-table row (not a hand-built grant array) is honored end-to-end', async () => {
     const { db, sqlite, close } = migratedDb()
     try {

@@ -1567,8 +1567,10 @@ async function visibleNamedAgents(
 //
 // The correct rule, applied uniformly:
 //   - id/slug resolves to a VISIBLE agent            -> use it, no fallback.
-//   - id/slug resolves to a NOT-VISIBLE agent, or
-//     does not resolve at all ('not_found')          -> fall back to a visible-name match
+//   - id/slug resolves to a NOT-VISIBLE agent        -> unique visible name first; only
+//                                                        if there is none may the caller
+//                                                        defer that row to project auth.
+//   - id/slug does not resolve at all ('not_found')  -> fall back to a visible-name match
 //                                                        (so a hidden slug can never flip a
 //                                                        visible name's destination).
 //   - id/slug is 'ambiguous'                          -> refuse. Never fall back to names;
@@ -1577,10 +1579,11 @@ async function visibleNamedAgents(
 type NonAdminResolution =
   | { ok: true; value: SendAgentRow; guestFence?: GuestVisibilityFence }
   | { ok: false; reason: 'send_target_not_visible' }
-  // Only returned when `deferInvisibleFallback` is set: id/slug resolved to a REAL agent
-  // the sender cannot see on their squads, but the caller has another authorization surface
-  // (sendToRef's projectId / case (b)) it wants to try before giving up on this ref as a
-  // name candidate. The caller decides; this primitive never guesses on its own.
+  // Only returned when `deferInvisibleFallback` is set AND there is no unique visible
+  // display-name match: id/slug resolved to a REAL agent the sender cannot see on their
+  // squads, and the caller has another authorization surface (sendToRef's projectId /
+  // case (b)) it wants to try. A unique visible name always wins first so a hidden slug
+  // cannot steal or refuse that send just because a projectId is attached.
   | { ok: false; reason: 'invisible_resolved'; value: SendAgentRow }
 
 async function resolveNonAdminSendTarget(
@@ -1596,13 +1599,23 @@ async function resolveNonAdminSendTarget(
     if (visibility.visible) {
       return { ok: true, value: resolved.value, guestFence: visibility.guestFence }
     }
-    // Resolved to a real agent, but not one this sender can see.
+    // Resolved to a real agent this sender cannot see. A unique visible display name
+    // still wins — same as the no-projectId path — so a hidden slug never flips who
+    // a visible name reaches. Only when there is no unique visible name may the
+    // caller defer this row to project authorization.
+    const visible = await visibleNamedAgents(env, toRef, authz, memberId)
+    if (visible.length === 1) {
+      return { ok: true, value: visible[0], guestFence: visible[0].guestFence }
+    }
+    if (visible.length > 1) {
+      return { ok: false, reason: 'send_target_not_visible' }
+    }
     if (opts.deferInvisibleFallback) {
       return { ok: false, reason: 'invisible_resolved', value: resolved.value }
     }
-    // No other authorization surface available to the caller — fall through to the
-    // visible-name fallback below, same as a genuine not_found.
-  } else if (resolved.reason === 'ambiguous') {
+    return { ok: false, reason: 'send_target_not_visible' }
+  }
+  if (resolved.reason === 'ambiguous') {
     // Fail-closed by design in resolve.ts — never laundered into a name-based guess.
     return { ok: false, reason: 'send_target_not_visible' }
   }
@@ -1679,9 +1692,10 @@ export async function sendToRef(
     }
     // The EXACT SAME non-admin decision resolveVisibleSendTarget applies — see
     // resolveNonAdminSendTarget's doc comment for the full rule. `deferInvisibleFallback`
-    // is set only when a projectId is attached, so that case (a) failing on a REAL,
-    // resolved-but-invisible agent can still be rescued by case (b) (sendAgentMessage's
-    // own validateMessageProjectAccess) instead of being downgraded to a name guess.
+    // is set only when a projectId is attached, and only after a unique visible name
+    // has already been ruled out, so case (b) can still rescue a REAL resolved-but-
+    // invisible id/slug via sendAgentMessage's validateMessageProjectAccess without
+    // letting that hidden row steal a visible-name send.
     const result = await resolveNonAdminSendTarget(env, input.toRef, authz, input.fromMember, {
       deferInvisibleFallback: input.projectId !== undefined,
     })
