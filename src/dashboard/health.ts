@@ -288,6 +288,48 @@ function makeCheck(input: HealthCheck): HealthCheck {
   return input
 }
 
+/**
+ * How the Approval gates check presents a count that may be a LOWER BOUND.
+ *
+ * Exported and pure so the test asserts THIS function rather than a copy of its
+ * logic — a projection that mirrors production proves nothing once production
+ * drifts.
+ *
+ * The case that matters: a count of 0 whose candidate fetch hit
+ * APPROVALS_FETCH_CEILING. Rows past the ceiling were never loaded, so an
+ * actionable task can exist that the count cannot see. Reporting 'clear' there
+ * is the truncated-read-as-complete defect this PR exists to remove, so an
+ * unknown presents as an unknown instead of an all-clear.
+ */
+export function approvalsCheckPresentation(
+  needsDecisionCount: number,
+  isLowerBound: boolean,
+): { tone: HealthTone; state: string; detail: string; nextAction: string } {
+  if (needsDecisionCount > 0) {
+    return {
+      tone: 'warn',
+      state: `${needsDecisionCount}${isLowerBound ? '+' : ''} waiting`,
+      detail: 'Gated work is waiting for an accountable verdict.',
+      nextAction: 'Approve, reject, or request changes.',
+    }
+  }
+  if (isLowerBound) {
+    return {
+      tone: 'warn',
+      state: '0+ waiting',
+      detail:
+        'The approval queue read was truncated, so this is a lower bound — an actionable task may exist beyond it.',
+      nextAction: 'Open the approvals queue directly — the count cannot prove it is empty.',
+    }
+  }
+  return {
+    tone: 'ok',
+    state: 'clear',
+    detail: 'No tasks are waiting in review.',
+    nextAction: 'No action needed.',
+  }
+}
+
 export async function loadOpsHealth(env: Env, auth: AuthContext, nowMs = Date.now()): Promise<OpsHealthData> {
   const tenant = env.TENANT_SLUG
   const [
@@ -602,15 +644,7 @@ export async function loadOpsHealth(env: Env, auth: AuthContext, nowMs = Date.no
     makeCheck({
       id: 'approvals',
       label: 'Approval gates',
-      tone: counts.needsDecisionCount > 0 ? 'warn' : 'ok',
-      // mupot#1319 round 2 FINDING 4/2: append '+' when the count is a lower
-      // bound (APPROVALS_QUEUE_LIMIT/FETCH_CEILING truncation) rather than
-      // print a number that reads as exact when it may not be.
-      state: counts.needsDecisionCount > 0
-        ? `${counts.needsDecisionCount}${counts.needsDecisionCountIsLowerBound ? '+' : ''} waiting`
-        : 'clear',
-      detail: counts.needsDecisionCount > 0 ? 'Gated work is waiting for an accountable verdict.' : 'No tasks are waiting in review.',
-      nextAction: counts.needsDecisionCount > 0 ? 'Approve, reject, or request changes.' : 'No action needed.',
+      ...approvalsCheckPresentation(counts.needsDecisionCount, counts.needsDecisionCountIsLowerBound),
       href: '/approvals',
     }),
     makeCheck({

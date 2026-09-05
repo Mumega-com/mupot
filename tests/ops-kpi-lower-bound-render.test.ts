@@ -13,7 +13,7 @@
 
 import { describe, expect, it } from 'vitest'
 import { opsHealthBody } from '../src/dashboard/index'
-import type { OpsHealthData } from '../src/dashboard/health'
+import { approvalsCheckPresentation, type OpsHealthData } from '../src/dashboard/health'
 
 function data(needsDecision: number, isLowerBound: boolean): OpsHealthData {
   return {
@@ -62,5 +62,39 @@ describe('/ops "Needs decision" KPI tells the truth about a capped queue', () =>
     // not read "nothing waiting" off a truncated read.
     const window = renderedNeedsDecision(data(0, true))
     expect(window).toContain('>0+<')
+  })
+})
+
+// The KPI card is one of TWO surfaces that report the same number. The health
+// check line reported 'clear' / 'No tasks are waiting in review' whenever the
+// count was 0, without consulting the lower-bound flag — so a queue whose
+// candidate fetch hit APPROVALS_FETCH_CEILING and filtered every row out read as
+// an all-clear while an actionable task could sit past the ceiling, unloaded.
+// Codex found the symptom; the repair is that an unknown must present as unknown,
+// not that the loader should fetch more.
+describe('the Approval gates check does not call a TRUNCATED zero "clear"', () => {
+  it('an exact zero is clear', () => {
+    const r = approvalsCheckPresentation(0, false)
+    expect(r.tone).toBe('ok')
+    expect(r.state).toBe('clear')
+    expect(r.detail).toBe('No tasks are waiting in review.')
+  })
+
+  it('a truncated zero is NOT clear — it warns and says the count cannot prove empty', () => {
+    const r = approvalsCheckPresentation(0, true)
+    expect(r.tone).toBe('warn')
+    expect(r.state).toBe('0+ waiting')
+    expect(r.detail).toContain('lower bound')
+    expect(r.nextAction).toContain('cannot prove it is empty')
+  })
+
+  it('a truncated positive count keeps its marker', () => {
+    const r = approvalsCheckPresentation(3, true)
+    expect(r.tone).toBe('warn')
+    expect(r.state).toBe('3+ waiting')
+  })
+
+  it('an exact positive count carries no marker', () => {
+    expect(approvalsCheckPresentation(3, false).state).toBe('3 waiting')
   })
 })
