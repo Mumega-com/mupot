@@ -599,12 +599,17 @@ describe('sendToRef — gate 1 send-target confinement (#392)', () => {
     }
   })
 
-  it('two hidden agents sharing an ambiguous slug refuse the send and never fall back to a same-named visible decoy (#1321)', async () => {
+  it('two INVISIBLE agents sharing an ambiguous slug do not block a visible same-named decoy — an ambiguity purely among hidden rows is worth no more than zero matches (#1321 Pattern 8 closure)', async () => {
     const { db, close, sqlite } = migratedDb()
     try {
       // Two DIFFERENT squads (both invisible to a sender whose only grant is squad-target)
       // so both rows can legitimately share slug 'kasra' — agents.slug is
-      // UNIQUE(squad_id, slug), not globally unique.
+      // UNIQUE(squad_id, slug), not globally unique. Before the Pattern 8 fix,
+      // resolveAgentRef collapsed these two into an opaque 'ambiguous' BEFORE visibility
+      // was ever consulted, so this send refused even though neither ambiguous match is
+      // reachable by this sender and a uniquely-named, squad-visible decoy exists. That
+      // made "does a display-name send survive" depend on hidden-row COUNT (>=1 vs >=2),
+      // an oracle over a namespace the sender cannot see. It must not.
       sqlite.exec(`
         INSERT INTO agents (id, squad_id, slug, name) VALUES
           ('agent-hidden-kasra-1', 'squad-other', 'kasra', 'Hidden Kasra One'),
@@ -616,12 +621,51 @@ describe('sendToRef — gate 1 send-target confinement (#392)', () => {
           ('membership-decoy-kasra', 'agent-decoy-kasra', 'squad-target', 'member');
       `)
       const res = await sendToRef(envWith(db), { ...baseInput, toRef: 'kasra' }, NON_ADMIN(grant('squad-target')))
-      expect(res).toEqual({ ok: false, reason: 'send_target_not_visible' })
+      expect(res).toMatchObject({ ok: true, toAgent: 'agent-decoy-kasra' })
 
       const decoyRows = sqlite
         .prepare("SELECT COUNT(*) AS n FROM agent_messages WHERE to_agent = 'agent-decoy-kasra'")
         .get() as { n: number }
-      expect(decoyRows.n).toBe(0)
+      expect(decoyRows.n).toBe(1)
+      const hiddenRows = sqlite
+        .prepare(
+          "SELECT COUNT(*) AS n FROM agent_messages WHERE to_agent IN ('agent-hidden-kasra-1', 'agent-hidden-kasra-2')",
+        )
+        .get() as { n: number }
+      expect(hiddenRows.n).toBe(0)
+    } finally {
+      close()
+    }
+  })
+
+  it('an ambiguous slug with TWO squad-visible matches still refuses — ambiguity to the sender is real, unlike ambiguity among hidden rows (#1321 Pattern 8, positive control)', async () => {
+    const { db, close, sqlite } = migratedDb()
+    try {
+      // Both slug-holders sit in squads the sender CAN see (squad-target, granted below,
+      // and squad-sender, the sender's own squad — no observer grant is needed there since
+      // recipientVisibilityOnSenderSquads treats squad_id === sender's own squad_id, via
+      // membership, the same as an explicit grant would for a squadmate... to keep this a
+      // clean positive control, grant BOTH squads explicitly.
+      sqlite.exec(`
+        INSERT INTO agents (id, squad_id, slug, name) VALUES
+          ('agent-visible-kasra-1', 'squad-target', 'kasra', 'Visible Kasra One'),
+          ('agent-visible-kasra-2', 'squad-other', 'kasra', 'Visible Kasra Two');
+        INSERT INTO memberships (id, agent_id, squad_id, capability) VALUES
+          ('membership-visible-kasra-1', 'agent-visible-kasra-1', 'squad-target', 'member'),
+          ('membership-visible-kasra-2', 'agent-visible-kasra-2', 'squad-other', 'member');
+      `)
+      const res = await sendToRef(
+        envWith(db),
+        { ...baseInput, toRef: 'kasra' },
+        NON_ADMIN([...grant('squad-target'), ...grant('squad-other')]),
+      )
+      expect(res).toEqual({ ok: false, reason: 'send_target_not_visible' })
+      const rows = sqlite
+        .prepare(
+          "SELECT COUNT(*) AS n FROM agent_messages WHERE to_agent IN ('agent-visible-kasra-1', 'agent-visible-kasra-2')",
+        )
+        .get() as { n: number }
+      expect(rows.n).toBe(0)
     } finally {
       close()
     }

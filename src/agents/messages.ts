@@ -1620,13 +1620,28 @@ async function visibleNamedAgents(
   return visible
 }
 
+// ── nonAdminRefCandidates — id/slug candidate collection, ALL matches, no ambiguity guess ──
+// Mirrors resolveByIdThenSlug's own SQL (id exact match first; else every non-inactive slug
+// match) but returns the full candidate list instead of collapsing 2+ slug matches into an
+// opaque 'ambiguous' — resolveNonAdminSendTarget needs to know the full set before it can
+// decide whether "ambiguous" even matters to THIS sender.
+async function nonAdminRefCandidates(env: Env, ref: string): Promise<SendAgentRow[]> {
+  const byId = await env.DB.prepare(
+    `SELECT id, squad_id, slug, name FROM agents WHERE id = ?1 LIMIT 1`,
+  ).bind(ref).first<SendAgentRow>()
+  if (byId) return [byId]
+  const bySlug = await env.DB.prepare(
+    `SELECT id, squad_id, slug, name FROM agents WHERE slug = ?1 AND status != 'inactive'`,
+  ).bind(ref).all<SendAgentRow>()
+  return bySlug.results ?? []
+}
+
 // ── projectScopedRecipientVisible — the project-scoping half of "visible to this sender" ──
 // Case (b): a projectId is a legitimate, DISTINCT authorization channel from squad/guest
 // visibility, mirroring the exists checks validateMessageProjectAccess runs at write time
 // (both squads reach the project, project not archived) so this pre-check and the eventual
-// write-time authority agree. Deliberately kept as its own predicate, never folded into
-// squad/guest visibility for CANDIDATE SELECTION — see resolveNonAdminSendTarget's doc
-// comment for why order matters here.
+// write-time authority agree. Deliberately its own predicate, consulted only as the LAST
+// resort in resolveNonAdminSendTarget (see its doc comment for why order matters).
 async function projectScopedRecipientVisible(
   env: Env,
   projectId: string,
@@ -1661,42 +1676,43 @@ async function projectScopedRecipientVisible(
 // so the comment above ("the EXACT SAME check") is literally true rather than aspirational.
 //
 // INVARIANT (PR #1321 re-gate — kills the deferred-fallback DESIGN, not just its cells):
-// for a non-admin sender, every field of the response must be a pure function of the set
-// of agents the sender can see. The old design chose a resolution PATH first (id/slug vs.
+// for a non-admin sender, every field of the response must be a pure function of the set of
+// agents the sender can see. The old design chose a resolution PATH first (id/slug vs.
 // name) and decided hidden/visible only afterward, then exempted the projectId branch from
 // the name-fallback via a caller-supplied `deferInvisibleFallback` flag / an
-// `invisible_resolved` result that only sendToRef ever set — so (a) a hidden agent whose
-// slug happened to equal a visible agent's display name could capture (or refuse) every
-// project-scoped send addressed by that name, and (b) resolveVisibleSendTarget and
-// sendToRef could provably diverge on destination, not merely on yes/no, because one of
-// them always passed `deferInvisibleFallback: false` and the other keyed it off
-// `projectId !== undefined`. Both the flag and the `invisible_resolved` result are deleted:
-// project-scoped authorization (case b) is now unconditionally available to this function
-// whenever a projectId is supplied — never gated behind an opt-in the two callers could set
-// differently — and it NEVER pre-empts the visible-name lookup that has always run first.
+// `invisible_resolved` result that only sendToRef ever set. Both are deleted. Two distinct
+// leaks are closed here, not just one:
 //
-// The rule, applied uniformly:
-//   1. id/slug resolves to a squad/guest-VISIBLE agent   -> use it, no fallback.
-//   2. id/slug resolves to a NOT-VISIBLE agent            -> a unique visible display name
-//                                                             ALWAYS wins next, regardless of
-//                                                             whether a projectId is attached
-//                                                             — a hidden slug can never flip
-//                                                             or refuse a visible name's
-//                                                             destination.
-//      -> no unique visible name (zero or 2+) AND a projectId is attached -> the id/slug
-//         candidate may still be authorized via projectScopedRecipientVisible (case b), the
-//         LAST resort, never the first. If that check refuses, fall through to the safe
-//         'send_target_not_visible' path rather than returning early — closing the "escape
-//         hatch that doesn't fall back on refusal" hole (round-2 re-gate).
-//   3. id/slug does not resolve at all ('not_found')      -> fall back to a visible-name
-//                                                             match (so a hidden slug can
-//                                                             never flip a visible name's
-//                                                             destination) — no id/slug
-//                                                             candidate exists, so case (b)
-//                                                             has nothing to authorize here.
-//   4. id/slug is 'ambiguous'                             -> refuse. Fail-closed by design in
-//                                                             resolve.ts; never laundered into
-//                                                             a name-based guess.
+//   (Pattern 6 — escape hatch pre-empts the safe path) A hidden agent whose id/slug matched
+//   the ref could steal or refuse a project-scoped send addressed by a visible agent's
+//   display name, because the old code checked project authorization on the id/slug
+//   candidate BEFORE ever trying the name. Fix: project authorization is the LAST resort,
+//   tried only after BOTH the id/slug and the name lookup have been exhausted via
+//   squad/guest visibility alone.
+//
+//   (Pattern 8 — ambiguity narrows the oracle, it does not delete it) resolveAgentRef
+//   collapses 2+ slug matches into a single opaque 'ambiguous' BEFORE visibility is ever
+//   consulted, so whether a display-name send survives used to depend on "are there >=2
+//   hidden holders of this slug", not just ">=1". Fix: collect every id/slug candidate
+//   (nonAdminRefCandidates) and filter ALL of them by squad/guest visibility before asking
+//   "is this ambiguous" — an ambiguity purely among rows this sender cannot see is worth
+//   nothing more than a single not_found, in either direction.
+//
+// The rule, staged and applied uniformly, independent of hidden-row COUNT at every stage:
+//   1. Collect every id/slug candidate, filter through squad/guest visibility
+//      (recipientVisibilityOnSenderSquads) only.
+//        - exactly one visible -> that is the target. Done (case a, no fallback).
+//        - two or more visible -> refuse (genuinely ambiguous to THIS sender).
+//        - zero visible (0, 1, or many INVISIBLE holders — doesn't matter) -> stage 2.
+//   2. Collect display-name candidates, filtered through the SAME squad/guest visibility.
+//        - exactly one visible -> that is the target.
+//        - two or more visible -> refuse.
+//        - zero visible -> stage 3.
+//   3. Only now, and only if a projectId was supplied, may project-scoped authorization
+//      (case b) rescue an id/slug candidate — filtering the SAME id/slug candidate set from
+//      stage 1 through projectScopedRecipientVisible, with the SAME one/many/zero rule.
+//        - exactly one project-visible -> that is the target.
+//        - otherwise (zero, or two+) -> refuse.
 // Only once a visible target has been chosen does the caller (sendToRef) let
 // sendAgentMessage's own validateMessageProjectAccess run — as the authoritative,
 // race-safe, write-time check — on THAT target.
@@ -1712,43 +1728,43 @@ async function resolveNonAdminSendTarget(
   opts: { fromAgent?: string; projectId?: string } = {},
 ): Promise<NonAdminResolution> {
   const fromAgent = opts.fromAgent ?? ''
-  const resolved = await resolveAgentRef(env, toRef)
-  if (resolved.ok) {
-    const visibility = await recipientVisibilityOnSenderSquads(env, memberId, authz.grants, resolved.value)
-    if (visibility.visible) {
-      return { ok: true, value: resolved.value, guestFence: visibility.guestFence }
-    }
-    // Resolved to a real agent this sender cannot see on their squads. A unique visible
-    // display name still wins — unconditionally, independent of projectId — so a hidden
-    // slug never flips who a visible name reaches.
-    const visible = await visibleNamedAgents(env, toRef, authz, memberId)
-    if (visible.length === 1) {
-      return { ok: true, value: visible[0], guestFence: visible[0].guestFence }
-    }
-    if (visible.length > 1) {
-      return { ok: false, reason: 'send_target_not_visible' }
-    }
-    // No unique visible name either. This is the ONLY place project-scoped authorization
-    // may still rescue the id/slug candidate — unconditionally available whenever a
-    // projectId is attached (not behind a caller-supplied flag), and only as the LAST
-    // resort after the name lookup has already come back empty.
-    if (opts.projectId !== undefined) {
-      const viaProject = await projectScopedRecipientVisible(env, opts.projectId, fromAgent, resolved.value.id)
-      if (viaProject) {
-        return { ok: true, value: resolved.value, viaProjectOnly: true }
+
+  // Stage 1: id/slug, squad/guest visibility only.
+  const idSlugCandidates = await nonAdminRefCandidates(env, toRef)
+  const idSlugSquadVisible: Array<SendAgentRow & { guestFence?: GuestVisibilityFence }> = []
+  for (const candidate of idSlugCandidates) {
+    const visibility = await recipientVisibilityOnSenderSquads(env, memberId, authz.grants, candidate)
+    if (visibility.visible) idSlugSquadVisible.push({ ...candidate, guestFence: visibility.guestFence })
+  }
+  if (idSlugSquadVisible.length === 1) {
+    return { ok: true, value: idSlugSquadVisible[0], guestFence: idSlugSquadVisible[0].guestFence }
+  }
+  if (idSlugSquadVisible.length >= 2) {
+    return { ok: false, reason: 'send_target_not_visible' }
+  }
+
+  // Stage 2: display name, squad/guest visibility only — unconditionally ahead of project,
+  // regardless of how many (if any) invisible id/slug candidates stage 1 saw.
+  const nameSquadVisible = await visibleNamedAgents(env, toRef, authz, memberId)
+  if (nameSquadVisible.length === 1) {
+    return { ok: true, value: nameSquadVisible[0], guestFence: nameSquadVisible[0].guestFence }
+  }
+  if (nameSquadVisible.length >= 2) {
+    return { ok: false, reason: 'send_target_not_visible' }
+  }
+
+  // Stage 3: last resort — project-scoped authorization over the id/slug candidate set,
+  // only if a projectId was supplied and stage 1 actually found candidates to authorize.
+  if (opts.projectId !== undefined && idSlugCandidates.length > 0) {
+    const projectVisible: SendAgentRow[] = []
+    for (const candidate of idSlugCandidates) {
+      if (await projectScopedRecipientVisible(env, opts.projectId, fromAgent, candidate.id)) {
+        projectVisible.push(candidate)
       }
     }
-    return { ok: false, reason: 'send_target_not_visible' }
-  }
-  if (resolved.reason === 'ambiguous') {
-    // Fail-closed by design in resolve.ts — never laundered into a name-based guess.
-    return { ok: false, reason: 'send_target_not_visible' }
-  }
-  // Genuine not_found: no id/slug candidate exists, so there is nothing for case (b) to
-  // authorize — a pure name lookup, exactly as before.
-  const visible = await visibleNamedAgents(env, toRef, authz, memberId)
-  if (visible.length === 1) {
-    return { ok: true, value: visible[0], guestFence: visible[0].guestFence }
+    if (projectVisible.length === 1) {
+      return { ok: true, value: projectVisible[0], viaProjectOnly: true }
+    }
   }
   return { ok: false, reason: 'send_target_not_visible' }
 }
