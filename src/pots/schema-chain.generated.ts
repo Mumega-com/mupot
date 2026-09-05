@@ -2725,9 +2725,23 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_pots_slug" },
     ],
   },
+  {
+    file: "0146_task_dispatch_runtime_consumption_lease_fence.sql",
+    sha256: "21ca23fdc0d18152f04f415af01ac323415ff37678d2273ef914be217bf2c735",
+    statements: [
+      "-- A runtime-consumed receipt is valid only while the exact source delivery is\n-- still unread and held by the same live lease attempt. The application also\n-- guards the task UPDATE; this trigger is the transaction-local backstop that\n-- aborts the whole D1 batch if the delivery changes between preflight and\n-- receipt insertion.\n\nCREATE TRIGGER task_dispatch_runtime_consumed_requires_live_delivery\nBEFORE INSERT ON task_dispatch_runtime_receipts\nWHEN NEW.stage = 'runtime_consumed'\nBEGIN\n  SELECT RAISE(ABORT, 'task_dispatch_runtime_delivery_stale')\n   WHERE NOT EXISTS (\n     SELECT 1\n       FROM agent_messages message\n       JOIN tasks task ON task.id = NEW.task_id\n      WHERE message.id = NEW.message_id\n        AND message.tenant = NEW.tenant\n        AND message.to_agent = NEW.runtime_address\n        AND message.from_agent = 'mupot-dispatch'\n        AND message.request_id = 'dispatch-inbox:' || NEW.dispatch_receipt_id\n        AND message.read_at IS NULL\n        AND message.delivery_attempts = NEW.attempt\n        AND message.lease_expires_at IS NOT NULL\n        AND julianday(message.lease_expires_at) > julianday(NEW.created_at)\n        AND message.dead_lettered_at IS NULL\n        AND task.status = 'in_progress'\n        AND task.execution_receipt_id = NEW.dispatch_receipt_id\n        AND task.assignee_agent_id = NEW.agent_id\n   );\nEND;",
+      "\n\n-- A failed dispatch is terminal for its receipt identity. The application\n-- guards the task transition; this trigger is the transaction-local backstop\n-- that prevents a zero-row task update from being followed by a completed\n-- receipt insert after an operator reopens the task.\n\nCREATE TRIGGER task_dispatch_runtime_completed_requires_no_failed\nBEFORE INSERT ON task_dispatch_runtime_receipts\nWHEN NEW.stage = 'completed'\nBEGIN\n  SELECT RAISE(ABORT, 'task_dispatch_runtime_failed_terminal')\n   WHERE EXISTS (\n     SELECT 1\n       FROM task_dispatch_runtime_receipts failed\n      WHERE failed.tenant = NEW.tenant\n        AND failed.dispatch_receipt_id = NEW.dispatch_receipt_id\n        AND failed.stage = 'failed'\n   );\nEND;",
+      "\n\n-- A completed dispatch is terminal in the opposite direction as well. This\n-- protects the append-only receipt table if a future D1 batch implementation\n-- accepts a zero-row task update and continues to later statements.\n\nCREATE TRIGGER task_dispatch_runtime_failed_requires_no_completed\nBEFORE INSERT ON task_dispatch_runtime_receipts\nWHEN NEW.stage = 'failed'\nBEGIN\n  SELECT RAISE(ABORT, 'task_dispatch_runtime_completed_terminal')\n   WHERE EXISTS (\n     SELECT 1\n       FROM task_dispatch_runtime_receipts completed\n      WHERE completed.tenant = NEW.tenant\n        AND completed.dispatch_receipt_id = NEW.dispatch_receipt_id\n        AND completed.stage = 'completed'\n   );\nEND;",
+    ],
+    objects: [
+      { type: "trigger", name: "task_dispatch_runtime_consumed_requires_live_delivery" },
+      { type: "trigger", name: "task_dispatch_runtime_completed_requires_no_failed" },
+      { type: "trigger", name: "task_dispatch_runtime_failed_requires_no_completed" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "30da0847e8d1567d961c3d689cc40c4ee516adbe5b383c6006c2dae67ef580e7"
+export const SCHEMA_CHAIN_DIGEST: string = "b791b5ffd088a396f8adc4268720fbe72716982c3f77f11d1b0bd0e9792dca34"

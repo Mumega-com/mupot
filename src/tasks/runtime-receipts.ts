@@ -1,10 +1,11 @@
 import { canOnSquad, resolveCapabilities } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { canonicalJson, sha256Hex } from '../lib/canonical-json'
-import type { AuthContext, Env } from '../types'
+import type { AuthContext, Env, Task } from '../types'
 import { resolveTaskAssignee } from './assignee'
 import { verifyTaskArtifactShape } from './artifact-verification'
-import { isValidGateOwnerForm } from './service'
+import { emitTaskEvent, isValidGateOwnerForm, mirrorTaskUpdate } from './service'
+import { wakeGateOwnerOnReview } from './review-wake'
 
 export type TaskDispatchRuntimeStage = 'runtime_consumed' | 'completed' | 'failed'
 
@@ -401,6 +402,20 @@ export async function recordTaskDispatchRuntimeReceipt(
            WHERE id = ?3 AND assignee_agent_id = ?4
              AND status IN ('open', 'blocked', 'rejected')
              AND (execution_receipt_id IS NULL OR execution_receipt_id = ?1)
+             AND EXISTS (
+               SELECT 1
+                 FROM agent_messages message
+                WHERE message.id = ?6
+                  AND message.tenant = ?5
+                  AND message.to_agent = ?7
+                  AND message.from_agent = 'mupot-dispatch'
+                  AND message.request_id = 'dispatch-inbox:' || ?1
+                  AND message.read_at IS NULL
+                  AND message.delivery_attempts = ?8
+                  AND message.lease_expires_at IS NOT NULL
+                  AND message.lease_expires_at > ?9
+                  AND message.dead_lettered_at IS NULL
+             )
              AND NOT EXISTS (
                SELECT 1 FROM task_dispatch_runtime_receipts failed
                 WHERE failed.tenant = ?5
@@ -408,7 +423,17 @@ export async function recordTaskDispatchRuntimeReceipt(
                   AND failed.stage = 'failed'
              )
           RETURNING status
-        `).bind(input.dispatchReceiptId, now, input.taskId, agentId, env.TENANT_SLUG)
+        `).bind(
+          input.dispatchReceiptId,
+          now,
+          input.taskId,
+          agentId,
+          env.TENANT_SLUG,
+          input.messageId,
+          runtimeAddress,
+          input.attempt,
+          now,
+        )
       : input.stage === 'completed'
         ? env.DB.prepare(`
             UPDATE tasks SET status = 'review', result = ?1, updated_at = ?2
@@ -472,6 +497,12 @@ export async function recordTaskDispatchRuntimeReceipt(
                     AND consumed.stage = 'runtime_consumed'
                     AND consumed.attempt = ?7
                )
+               AND NOT EXISTS (
+                 SELECT 1 FROM task_dispatch_runtime_receipts failed
+                  WHERE failed.tenant = ?6
+                    AND failed.dispatch_receipt_id = ?5
+                    AND failed.stage = 'failed'
+               )
             RETURNING status
           `).bind(result, now, input.taskId, agentId, input.dispatchReceiptId,
             env.TENANT_SLUG, input.attempt, nowSqlUtc())
@@ -480,8 +511,14 @@ export async function recordTaskDispatchRuntimeReceipt(
              WHERE id = ?3 AND assignee_agent_id = ?4
                AND status IN ('open', 'in_progress', 'blocked', 'rejected')
                AND (execution_receipt_id IS NULL OR execution_receipt_id = ?5)
+               AND NOT EXISTS (
+                 SELECT 1 FROM task_dispatch_runtime_receipts completed
+                  WHERE completed.tenant = ?6
+                    AND completed.dispatch_receipt_id = ?5
+                    AND completed.stage = 'completed'
+               )
             RETURNING status
-          `).bind(reason, now, input.taskId, agentId, input.dispatchReceiptId)
+          `).bind(reason, now, input.taskId, agentId, input.dispatchReceiptId, env.TENANT_SLUG)
     await env.DB.batch([
       mutation,
       env.DB.prepare(`
@@ -515,9 +552,16 @@ export async function recordTaskDispatchRuntimeReceipt(
 
   const persisted = await env.DB.prepare('SELECT * FROM task_dispatch_runtime_receipts WHERE id = ?1')
     .bind(receiptId).first<ReceiptRow>()
-  const task = await env.DB.prepare('SELECT status FROM tasks WHERE id = ?1')
-    .bind(input.taskId).first<{ status: string }>()
+  const task = await env.DB.prepare('SELECT * FROM tasks WHERE id = ?1')
+    .bind(input.taskId).first<Task>()
   if (!persisted || !task) throw new TaskDispatchRuntimeReceiptError('runtime_receipt_persistence_conflict')
+
+  if (input.stage === 'completed') {
+    task.github_issue_url = await mirrorTaskUpdate(env, task, { statusChanged: true })
+    const actor = { kind: 'agent' as const, id: agentId }
+    await emitTaskEvent(env, 'task.updated', task, actor)
+    await wakeGateOwnerOnReview(env, task, actor, memberId)
+  }
   return { receipt: publicTimelineReceipt(persisted), task_status: task.status }
 }
 
