@@ -9,6 +9,7 @@ Mupot is the control plane for portable agent identity, authority, project memor
 - [Capability discovery](./capability-discovery.md): proposed shared catalog and progressive discovery architecture for human UI and MCP clients.
 - [Journey validation](./journey-validation.md): evidence grades, tested journeys, UX findings and validation backlog.
 - [Backlog and gate hygiene](./backlog-and-gate-hygiene.md): safe treatment of open requests, task records, external reconciliation and the proposed master executable-action queue.
+- [Operational records and Kanban](./operational-records-and-kanban.md): record-family boundaries, scoped visibility and why the current board is not the executable queue.
 
 ## Truth vocabulary
 
