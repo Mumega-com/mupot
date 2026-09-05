@@ -88,7 +88,7 @@
     "debounce": "tenant-member-30s"
   },
   "messaging": {
-    "mcpTools": ["send", "inbox", "broadcast"],
+    "mcpTools": ["send", "inbox", "message_get", "broadcast"],
     "http": {
       "read": "GET /api/inbox?peek=1&limit=N",
       "signedRead": {

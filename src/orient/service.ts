@@ -80,9 +80,14 @@ export function fieldHalf(row: AgentFieldRow | null, nowMs: number, staleMs = ST
 
 export interface SquadMember {
   agent_id: string
+  slug?: string
   name: string
   role: string
   capability: string // owner | lead | member | observer
+}
+
+function rosterLabel(member: Pick<SquadMember, 'name' | 'slug'>): string {
+  return member.slug ? `${member.name} (@${member.slug})` : member.name
 }
 
 const CAP_RANK: Record<string, number> = { owner: 4, lead: 3, member: 2, observer: 1 }
@@ -162,7 +167,7 @@ const RAILS = [
 /** Render the DIRECTIVE brief (the basin-drop). Pure — exported for tests. */
 export function renderBrief(d: OrientData): string {
   const supervisor = d.supervisor
-    ? `${d.supervisor.name} (${d.supervisor.capability})`
+    ? `${rosterLabel(d.supervisor)} (${d.supervisor.capability})`
     : 'your operator/owner (you are the top of this squad — escalate above the squad)'
   const tasks = d.tasks.length
     ? d.tasks.map((t) => `  - [${t.status}] ${t.title}`).join('\n')
@@ -190,7 +195,7 @@ export function renderBrief(d: OrientData): string {
     ``,
     `## Chain of command`,
     `Your supervisor is **${supervisor}**. Escalate there when blocked — do not improvise around a blocker.`,
-    d.squadmates.length ? `Squad-mates: ${d.squadmates.map((m) => `${m.name} (${m.role})`).join(', ')}.` : ``,
+    d.squadmates.length ? `Squad-mates: ${d.squadmates.map((m) => `${rosterLabel(m)} (${m.role})`).join(', ')}.` : ``,
     ``,
     `## Your exact scope — do not exceed it, do not start from scratch`,
     `- Autonomy: **${d.agent.autonomy}** — ${autonomyDirective(d.agent.autonomy)}`,
@@ -256,9 +261,9 @@ export async function buildOrient(
     : null
 
   const matesRes = await env.DB.prepare(
-    `SELECT a.id AS agent_id, a.name AS name, a.role AS role, m.capability AS capability
+    `SELECT a.id AS agent_id, a.slug AS slug, a.name AS name, a.role AS role, m.capability AS capability
        FROM memberships m JOIN agents a ON a.id = m.agent_id
-      WHERE m.squad_id = ?1`,
+      WHERE m.squad_id = ?1 AND a.status != 'inactive'`,
   )
     .bind(agent.squad_id)
     .all<SquadMember>()

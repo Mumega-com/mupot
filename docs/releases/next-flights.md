@@ -5,12 +5,12 @@ tagged stable release, followed by the first `v0.31.0` runtime flight. Version
 ownership remains in [ROADMAP.md](../../ROADMAP.md); the shipped record remains in
 [CHANGELOG.md](../../CHANGELOG.md).
 
-## Release truth at 2026-09-02
+## Release truth at 2026-09-04
 
 | Surface | Exact state |
 |---|---|
 | Current `main` | `0.30.0` — not pinned here; read `git rev-parse origin/main` |
-| Current production | `0.30.0` — read live `/health`; last recorded deploy `7d58d36be5a67a6e859f4513bc9fc65523aab1a8`, `clean:true`, 2026-09-02T20:01:42Z (#1272) |
+| Current production | `0.30.0` — read live `/health`; last recorded deploy `4fd452eb0b6a618d1db2a18206eee8616d44f276`, `clean:true`, 2026-09-04 (#1312). Further PRs merged after it, so production trails `main`; the gap is not counted here. |
 | Latest tagged stable release | `v0.25.0` |
 | Next stable candidate | `v0.30.0` |
 | Next development release | `v0.31.0` |
@@ -27,9 +27,9 @@ the order and acceptance boundary; they are not reusable historical flight IDs.
 
 | Order | Flight | Deliverable | Gate | State |
 |---|---|---|---|---|
-| A | Freeze the v0.30 candidate | One immutable `main` SHA after #1250, #1251, and #1252; no later merge contaminates its evidence | Push CI and CodeQL green at the frozen SHA; Athena exact-head release gate | **NEXT** |
+| A | Freeze the v0.30 candidate | One immutable `main` SHA with no later merge contaminating its evidence | Push CI and CodeQL green at the frozen SHA; Athena exact-head release gate | **RESTART REQUIRED** — see supersession below |
 | B | Build the v0.30 evidence bundle | Fresh install, upgrade, host, permission, lifecycle, external-PR, recovery, browser, runtime, MCP, and ACK receipts from the frozen SHA | `mupot-v030-prepublication-readiness/v1` prerequisites pass without reconstructed evidence | Pending A |
-| C | Publish and soak `v0.30.0-rc.1` | RC tag, prerelease, exact deployment, smoke, soak, and release-candidate receipt | Separate Hadi approval for tag and deployment; no merge after the RC receipt | Pending B |
+| C | Publish and soak the RC | RC tag, prerelease, exact deployment, smoke, soak, and release-candidate receipt | Separate Hadi approval for tag and deployment; no merge after the RC receipt | Pending B — `v0.30.0-rc.1` exists but is superseded; a new RC is required |
 | D | Publish `v0.30.0` stable | Stable deployment, tag, GitHub Release, release-integrity receipt, and final readiness receipt at one SHA | Separate Hadi approvals for stable deployment and publication; Athena verifies the final bundle | Pending C |
 | E | Converge the v0.31 receiver | One default-disabled Mupot-to-Codex receiver and host runner, built from the Hadi-admin operational implementation plus the Hadi-dev contract and policy lane | Required CI, identity/seat adversarial gate, replay proof, and one separately approved synthetic live canary | Post-v0.30 |
 
@@ -37,15 +37,55 @@ Any merge after Flight A invalidates Flights B and C. Land the correction throug
 normal exact-head gate, freeze the new `main`, and restart from Flight A. No prior RC
 receipt rolls forward to a different commit.
 
+## Evidence hygiene — read before building the aggregate bundle
+
+`/home/mumega/.fleet/receipts/mumega-vps-codex-attach/` contains two receipts dated
+2026-08-30, **both `status: "fail"` with `release_sha: null`**. It is the only Host-Go-shaped
+bundle on the host, and it has neither `manifest.json` nor `cutover-gate.json`.
+
+A glob such as `*-check.json` when assembling the aggregate evidence directory **will sweep
+these in**. Exclude the path explicitly, or move it aside first. The contract's own rule —
+an unbound historical outer bundle cannot admit a bound prior bundle — means including it
+does not merely add noise, it invalidates the bundle.
+
+Verified state of the prepublication receipts as of 2026-09-04: **1 of 11 exists**
+(`mupot-github-app-permissions/v1`, passing 35/35, and notably the only one carrying no
+`release_sha` binding — so it is the only receipt that survives a re-freeze). The other ten
+must be produced fresh from whatever SHA is frozen.
+
+## Supersession — 2026-09-04
+
+`v0.30.0-rc.1` was tagged at `0bb9c256` on 2026-09-03. `main` is now 13 commits ahead of it.
+By this document's own rule below, and release order step 7 in the contract, **no prior RC
+receipt rolls forward** — the RC is superseded and Flights A and B must be re-run from a
+newly frozen `main`.
+
+Three PRs that this document's scope boundary routed OUT of `v0.30.0` have since landed on
+`main` — #1246 (routed to v0.31.0), #1247 (routed to post-v0.30.0) and #1248 (routed to
+v0.33.0). They were merged on 2026-09-04 at Hadi's direction as part of clearing the open-PR
+backlog. The consequence is factual and unresolved: **the contents of `main` no longer match
+the written scope of the v0.30.0 stable candidate.**
+
+Two ways forward, and the choice is the owner's:
+
+1. **Re-cut v0.30.0 to include them.** The scope boundary table below is then rewritten
+   rather than merely annotated, and the security train section gains the three defects
+   closed on 2026-09-04.
+2. **Take the stable candidate from a commit that predates them.** This preserves the
+   written scope but excludes three closed production vulnerabilities from the stable
+   release, which is the harder position to defend.
+
+Until that is decided, the rows below describe the plan as written, not the state of `main`.
+
 ## v0.30 scope boundary
 
 The following work is useful but excluded from the `v0.30.0` stable contract:
 
 | Work | Routing |
 |---|---|
-| #1246 device grant | `v0.31.0` identity/onboarding; restack and re-gate |
-| #1247 missing-token 503 | Post-`v0.30.0` patch candidate; rebase and exact-head gate |
-| #1248 tenant path dispatcher | `v0.33.0` distribution/self-hosting surface |
+| #1246 device grant | `v0.31.0` identity/onboarding; restack and re-gate. **LANDED ON `main` 2026-09-04** — routing above is the plan as written, not the current state. |
+| #1247 missing-token 503 | Post-`v0.30.0` patch candidate; rebase and exact-head gate. **LANDED ON `main` 2026-09-04** — routing above is the plan as written, not the current state. |
+| #1248 tenant path dispatcher | `v0.33.0` distribution/self-hosting surface. **LANDED ON `main` 2026-09-04** — routing above is the plan as written, not the current state. |
 | #1253 MCP self-registration | `v0.31.0` identity/onboarding; remains draft |
 | #1254 enrollment chooser and seat key | `v0.31.0` identity/access; requires an independent exact-head security gate |
 | `servathadi/cc#1` receiver engineering record | Evidence source for Flight E, not a Mupot product merge |

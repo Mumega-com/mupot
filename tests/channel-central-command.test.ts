@@ -274,24 +274,76 @@ describe('central-command ingress (mumega-com#722)', () => {
     expect(row?.count).toBe(1)
   })
 
-  it('ambiguous slug: two active agents sharing a slug fail closed, no write, no crash', async () => {
+  it('hidden squad sharing a slug does not change a visible dispatch', async () => {
+    // INVARIANT (this PR): a slug collision in a squad the sender CANNOT see must
+    // be invisible to dispatch resolution entirely — it must neither block nor
+    // otherwise alter the outcome of a dispatch to the one visible holder of that
+    // slug. The old "ambiguous slug" framing treated the mere existence of a
+    // same-slug row in a hidden squad as an existence oracle this PR closes: with
+    // exactly one VISIBLE holder, resolution must behave identically to the
+    // zero-hidden-rows case — i.e. dispatch to that one visible agent.
     // Mirrors prod's kasra shape structurally (agents.slug is UNIQUE(squad_id, slug),
     // not globally unique, so the same slug can legitimately exist in two squads) —
     // using a NON-fenced slug ('analyst') so the SOS-native fence doesn't shadow the
     // dynamic path this test is actually exercising.
-    // Downgraded from the original brief: since these test members are non-admins
-    // (no org:admin grant), sendToRef's non-admin path collapses BOTH ambiguous and
-    // not-found into the same `send_target_not_visible` (see messages.ts's
-    // existence-oracle-closure doc) — so the assertion here is "fails closed
-    // cleanly", not the specific `recipient_ambiguous` reason.
+    harness.sqlite.exec(`
+      INSERT OR IGNORE INTO agents (id, squad_id, slug, name, status)
+      VALUES ('ag-analyst-a', 'squad-core', 'analyst', 'Analyst A', 'active');
+    `)
+
+    const { runInbound } = await import('../src/channels/index')
+    const baseline = await runInbound(env, 'telegram', '-5317747241', '765204057', '@analyst build the fix')
+    const stripId = (s: string) => s.replace(/\(id: [^)]*\)/, '(id: <redacted>)')
+
+    expect(baseline).toContain('Dispatched @analyst')
+
+    const baselineMsg = await env.DB.prepare(
+      `SELECT to_agent, body FROM agent_messages WHERE body LIKE '%build the fix%'`
+    ).first<{ to_agent: string; body: string }>()
+    expect(baselineMsg).not.toBeNull()
+    expect(baselineMsg?.to_agent).toBe('ag-analyst-a')
+
+    // Now add the hidden same-slug row in a squad the sender cannot see, and
+    // re-run the exact same inbound. The outcome must be deep-equal (ignoring
+    // any embedded message id) to the baseline above.
     harness.sqlite.exec(`
       INSERT OR IGNORE INTO departments (id, slug, name)
       VALUES ('dept-other', 'other', 'Dept Other');
       INSERT OR IGNORE INTO squads (id, department_id, slug, name)
       VALUES ('squad-other', 'dept-other', 'other', 'Squad Other');
       INSERT OR IGNORE INTO agents (id, squad_id, slug, name, status)
+      VALUES ('ag-analyst-b', 'squad-other', 'analyst', 'Analyst B', 'active');
+    `)
+
+    const res = await runInbound(env, 'telegram', '-5317747241', '765204057', '@analyst build the fix')
+    expect(stripId(res)).toBe(stripId(baseline))
+    expect(res).toContain('Dispatched @analyst')
+
+    const rows = await env.DB.prepare(
+      `SELECT to_agent, body FROM agent_messages WHERE body LIKE '%build the fix%'`
+    ).all<{ to_agent: string; body: string }>()
+    expect(rows.results).toHaveLength(2)
+    for (const row of rows.results ?? []) {
+      expect(row.to_agent).toBe('ag-analyst-a')
+    }
+  })
+
+  it('two agents sharing a slug BOTH visible to the sender fail closed, no write, no crash', async () => {
+    // Positive control for the invariant above: when there are TWO visible
+    // holders of the same slug, resolution must refuse — this is real ambiguity,
+    // not a hidden-squad false alarm. Grant the sender visibility into a second
+    // squad (mirroring the real cap grant shape from beforeEach) so both
+    // same-slug agents are squad-visible to m-hadi.
+    harness.sqlite.exec(`
+      INSERT OR IGNORE INTO departments (id, slug, name)
+      VALUES ('dept-second', 'second', 'Dept Second');
+      INSERT OR IGNORE INTO squads (id, department_id, slug, name)
+      VALUES ('squad-second', 'dept-second', 'second', 'Squad Second');
+      INSERT OR IGNORE INTO capabilities (id, member_id, scope_type, scope_id, capability)
+      VALUES ('cap-hadi-squad-second', 'm-hadi', 'squad', 'squad-second', 'member');
+      INSERT OR IGNORE INTO agents (id, squad_id, slug, name, status)
       VALUES ('ag-analyst-a', 'squad-core', 'analyst', 'Analyst A', 'active'),
-             ('ag-analyst-b', 'squad-other', 'analyst', 'Analyst B', 'active');
+             ('ag-analyst-c', 'squad-second', 'analyst', 'Analyst C', 'active');
     `)
 
     const { runInbound } = await import('../src/channels/index')

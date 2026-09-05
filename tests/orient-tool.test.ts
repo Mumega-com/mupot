@@ -76,7 +76,7 @@ function makeEnv(opts: Opts = {}): Env {
           if (sql.includes('FROM memberships')) {
             return {
               results: [
-                { agent_id: AGENT.id, name: AGENT.name, role: AGENT.role, capability: 'lead' },
+                { agent_id: AGENT.id, slug: AGENT.slug, name: AGENT.name, role: AGENT.role, capability: 'lead' },
               ],
             }
           }

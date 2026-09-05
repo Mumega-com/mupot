@@ -1,6 +1,74 @@
 # Changelog
 
-## Release status — 2026-09-02
+## Release status — 2026-09-04
+
+- **Current source version:** `0.30.0` on `main`. **This document does not pin the `main`
+  commit.** Any SHA written here is false the moment the commit writing it is merged, so
+  read it with `git rev-parse origin/main`.
+- **Current production deployment:** `0.30.0`. Most recent recorded deployment:
+  `4fd452eb0b6a618d1db2a18206eee8616d44f276`, `clean:true`, 2026-09-04 (slug availability
+  fail-closed + pots registry). Production is BEHIND `main` as of that record — six further
+  PRs merged after it. Read the live `/health` endpoint for the authoritative answer.
+- **Latest tagged stable release:** `v0.25.0`. Unchanged. `v0.29.0` and `v0.30.0` have never
+  been tagged, so their headings below remain preview history rather than a supported
+  stable contract. A `v0.30.0-rc.1` prerelease tag exists at `0bb9c256` (2026-09-03) — see
+  the supersession note under the 2026-09-04 sweep.
+- **Relationship between the three:** deliberately not asserted as a single claim. `main`
+  advances on every merge, production only on a deploy, and a stable release only on a tag.
+
+## Preview on main — 2026-09-04 landing sweep (not deployed, not tagged)
+
+Nine PRs landed across the day. Verified on the merged tree at the end of the sweep:
+7487/7487 vitest, 15/15 composition (workerd), `tsc --noEmit` exit 0, and the
+schema-source, mcp-tool-seam and audit gates all exit 0 with zero dependency
+vulnerabilities.
+
+**Three live production defects, each measured exploitable before the fix rather than
+inferred from reading the code:**
+
+- **#1301 / #1299** — a client-supplied `x-mupot-tenant-slug` header chose which tenant
+  Worker served a request, ahead of all authentication. Both readers closed and the
+  parameter deleted from `extractTenantSlug` rather than gated. Review found a second live
+  bypass on the same surface: a trailing-dot host (`mupot.mumega.com.`) is a legal FQDN
+  that survived the edge and reached the dispatch namespace as `mupot-mumega-com-`.
+  Deployed 2026-09-04; prod verified rejecting both header spellings and the trailing dot.
+- **#1307 / #1305** — `/preview/:project_id` was mounted with no auth middleware and
+  dispatched into the same namespace that holds tenant pots, using a member-supplied
+  script name. Now requires a session AND a project the caller may actually see, via the
+  same visibility-scoped read the project's own API route and dashboard page use.
+- **#1312 / #1303** — slug availability answered `available: true` for every well-formed
+  slug, including a live tenant. The `pots` table it queried had never existed in the
+  migration chain, so the lookup threw on every call and the catch reported that failure
+  as availability. The "already taken" branch had never once executed in production.
+
+**Also landed:** #1248 `/t/{tenant}/{interface}` apex path routing with colony credentials
+and tenant-override headers stripped before dispatch (the path door is same-origin, so
+unlike subdomain routing the browser's credentials arrive with the request); #1246
+type-then-click device grant; #1247 missing Cloudflare token returns `503 unconfigured`;
+#1262 plugins catalog; #1313 muvps-loom VPS bridge skill.
+
+**Consequences for the v0.30.0 release contract, recorded rather than glossed:**
+
+- `v0.30.0-rc.1` (`0bb9c256`, 2026-09-03) is **superseded**. `main` is 13 commits ahead of
+  it. `docs/releases/v0.30.0.md` release order step 7 states that a post-RC merge
+  invalidates prior RC evidence, so no rc.1 receipt rolls forward.
+- **#1246, #1247 and #1248 were explicitly excluded** from the v0.30.0 stable contract by
+  the scope boundary in `docs/releases/next-flights.md`, which routed them to v0.31.0,
+  post-v0.30.0 and v0.33.0 respectively. They are now on `main`. Either the v0.30.0 scope
+  is re-cut to include them, or the stable candidate is taken from a different commit —
+  that is an owner decision and is not resolved by this document.
+
+**Held deliberately, with reasons recorded on the PRs:** #1277 fails two `living-presence`
+tests on its own head (recording presence under the bound seat collapses sibling seats onto
+one label, against `UNIQUE(tenant, member_id, label)`); #1253 conflicts with #1283's
+`available_doors`/`onboarding_state` onboarding surface.
+
+**Known open, not fixed here:** #1306 (no HTTP route reached a provisioned pot before
+#1248), #1311 (a dispatched Worker's response executes on the colony origin — no CSP,
+`frame-ancestors` or `X-Frame-Options` anywhere in `src/`), #1302 (tenant addressing),
+#1304 (drifted tenants never receive security fixes).
+
+## Release status — 2026-09-02 (superseded by the entry above)
 
 - **Current source version:** `0.30.0` on `main`. **This document does not pin the `main`
   commit.** Any SHA written here is false the moment the commit writing it is merged, so

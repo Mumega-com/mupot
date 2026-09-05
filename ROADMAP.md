@@ -1,18 +1,40 @@
 # Mupot version roadmap
 
 This is the canonical forward-looking product roadmap. [CHANGELOG.md](CHANGELOG.md)
-is the canonical record of what has shipped. GitHub milestones use the same version
-numbers.
+is the canonical record of what has shipped.
+
+**GitHub milestones do NOT currently match these version numbers** (verified 2026-09-04).
+No `v0.30.0` milestone exists — the newest is `v0.29.0 - Distribution and Commercial
+Operations` — and existing milestone titles still use the PRE-renumbering scheme this
+document describes moving away from (`v0.26.0 - Governed Tools`, `v0.27.0 - Agent
+Computers`). The v0.30.0 release contract's integrity gate requires a milestone that agrees
+with the release, so that gate is currently unsatisfiable as written.
 
 ## Current version
 
 | State | Version | Meaning |
 |---|---|---|
 | Current source version | `0.30.0` | Present on `main`; the commit is deliberately not pinned here, because any SHA in a versioned file is false once that file merges — read `git rev-parse origin/main`. Preview until the stabilization gate passes and `v0.30.0` is tagged. |
-| Current production version | `0.30.0` | Last recorded deploy `7d58d36b`, `clean:true`, 2026-09-02 (authoritative: live `/health`). The gap to `main` is not asserted here; compare the two sources. Still not a stable-release claim, which requires a tag. |
+| Current production version | `0.30.0` | Last recorded deploy `4fd452eb`, `clean:true`, 2026-09-04 (authoritative: live `/health`). Further PRs merged after that deploy, so production trails `main`; the size of the gap is deliberately not counted here (a count rots on the next merge), compare the two sources. Still not a stable-release claim, which requires a tag. |
 | Last tagged release | `v0.25.0` | Project Routines and Needs You. |
-| Next stable candidate | `v0.30.0` | Stabilization-only: security train, messaging reliability, release proof, and backlog closure. |
+| Next stable candidate | `v0.30.0` | Stabilization-only: security train, messaging reliability, release proof, and backlog closure. **Scope is unsettled as of 2026-09-04** — #1246, #1247 and #1248 were excluded by the scope boundary and have since landed on `main`; see `docs/releases/next-flights.md`. |
 | Future development target | `v0.31.0` | Canonical receiver, Agent Computers, and Recovery; held until `v0.30.0` is stable. |
+
+### Release state as of 2026-09-04
+
+A `v0.30.0-rc.1` prerelease tag exists at `0bb9c256` (2026-09-03). It is **superseded**:
+`main` is 13 commits ahead of it, and release order step 7 in
+[the v0.30.0 contract](./docs/releases/v0.30.0.md) states that a post-RC merge invalidates
+prior RC evidence. No rc.1 receipt rolls forward to a different commit.
+
+The 2026-09-04 landing sweep closed three live production defects (#1301/#1299 header-selected
+tenant, #1307/#1305 unauthenticated preview dispatch, #1312/#1303 fail-open slug
+availability) and cleared the open-PR backlog to two drafts. It also landed three PRs the
+v0.30 scope boundary had routed to later releases, so the stable candidate's contents no
+longer match its written scope. Resolving that is an owner decision: either re-cut v0.30.0
+to include them, or take the candidate from a different commit.
+
+Nothing here is a stable-release claim. `git tag` still tops out at `v0.25.0`.
 
 `0.30.0` is the version the source currently reports. It is **not** yet a stable
 release: no `v0.30.0` tag or GitHub release exists. Code on `main` remains preview

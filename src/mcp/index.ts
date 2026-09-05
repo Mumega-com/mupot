@@ -97,7 +97,7 @@ import { enrollUrl } from '../dashboard/enroll'
 import { classify, humanAge } from '../dashboard/fleet'
 import { resolveAgentRef } from '../org/resolve'
 import {
-  sendToRef, readAgentInbox, sendAgentMessage,
+  sendToRef, readAgentInbox, sendAgentMessage, getSenderMessage,
 } from '../agents/messages'
 import { routeAgentWake } from '../agents/wake-routing'
 import { authorizeExecutionScope } from '../auth/execution-scope'
@@ -3111,7 +3111,7 @@ const toolSend: ToolSpec = {
   name: 'send',
   scope: 'agent→agent (this pot); sender must be agent-bound',
   min: 'authenticated',
-  args: '{ to: string (agent id or unique slug), body: string, kind?: "message"|"request"|"ack", request_id?: string, in_reply_to?: string, project_id?: string, seat?: string }',
+  args: '{ to: string (agent id, unique slug, or display name unique among agents you can already see — not a harness seat label), body: string, kind?: "message"|"request"|"ack", request_id?: string, in_reply_to?: string, project_id?: string, seat?: string }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -3468,6 +3468,51 @@ const toolInbox: ToolSpec = {
       complete: res.complete,
       consumed: args.peek !== true,
     })
+  },
+}
+
+// message_get — sender-scoped read-back of a row THIS agent wrote (#1323).
+// Inbox is recipient-only (`to_agent = caller`). After consume the recipient peek is empty,
+// and there is no outbox. This looks up by id OR request_id, scoped to
+// from_agent = auth.boundAgentId. No admin bypass, no from_agent argument, no list.
+const toolMessageGet: ToolSpec = {
+  name: 'message_get',
+  scope: 'self (the caller agent re-reads a message it sent)',
+  min: 'authenticated',
+  args: '{ id?: string, request_id?: string }  // exactly one; sender is the bound agent — not a to_agent inbox read',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      id: STRING_SCHEMA,
+      request_id: STRING_SCHEMA,
+    },
+    required: [],
+    additionalProperties: false,
+  },
+  async run(auth, env, args, ctx) {
+    const fromAgent = auth.boundAgentId
+    if (!fromAgent) {
+      return fail(403, 'not_agent_bound', {
+        detail: 'message_get requires an agent-bound token (member_tokens.agent_id)',
+        enroll_url: enrollUrl(canonicalOrigin(env, ctx.origin), ctx.seat),
+      })
+    }
+    if (args.id !== undefined && typeof args.id !== 'string')
+      return fail(400, 'invalid_args', 'id must be a string')
+    if (args.request_id !== undefined && typeof args.request_id !== 'string')
+      return fail(400, 'invalid_args', 'request_id must be a string')
+
+    const res = await getSenderMessage(env, {
+      fromAgent,
+      id: typeof args.id === 'string' ? args.id : undefined,
+      requestId: typeof args.request_id === 'string' ? args.request_id : undefined,
+    })
+    if (!res.ok) {
+      if (res.reason === 'db_error') return fail(500, res.reason)
+      if (res.reason === 'message_not_found') return fail(404, res.reason)
+      return fail(400, res.reason, res.detail)
+    }
+    return done(res.message)
   },
 }
 
@@ -4731,6 +4776,7 @@ export const TOOLS: ToolSpec[] = [
   toolSend,
   toolBroadcast,
   toolInbox,
+  toolMessageGet,
   toolInboxLease,
   toolInboxAck,
   toolInboxDeadLetters,
@@ -4783,6 +4829,14 @@ function rpcResult(id: unknown, result: unknown): Response {
   return new Response(JSON.stringify({ jsonrpc: '2.0', id: id ?? null, result }), {
     headers: { 'content-type': 'application/json' },
   })
+}
+
+/** JSON-RPC code for a finished tool failure. -32602 is Invalid params — never use it
+ *  for application refusals such as send_target_not_visible (HTTP 404). Harnesses treat
+ *  -32602 as a schema error and retry the call shape instead of resolving the target. */
+export function jsonRpcCodeForToolFailure(status: number, error: string): number {
+  if (error === 'send_target_not_visible') return -32000
+  return status === 404 ? -32602 : -32000
 }
 
 function rpcError(id: unknown, code: number, message: string, data?: unknown, status = 200): Response {
@@ -4993,7 +5047,7 @@ async function handleJsonRpc(c: import('hono').Context<AppEnv>, body: JsonRpcReq
 
     return rpcError(
       id,
-      outcome.status === 404 ? -32602 : -32000,
+      jsonRpcCodeForToolFailure(outcome.status, outcome.error),
       outcome.error,
       outcome.detail,
       outcome.status,
