@@ -217,28 +217,46 @@ export async function humanStandingForSession(env: Env, auth: AuthContext): Prom
  *  address is not an alias. Mirrors ownerAliasMemberId in src/members/resolve-human-member.ts,
  *  which cannot be reused directly because it resolves an id through status-filtered rungs. */
 async function ownerAliasStanding(env: Env, email: string): Promise<HumanStanding | null> {
+  let aliases: string[]
   try {
+    // Narrow on purpose: this catch documents ONE failure — a lagging pot without
+    // org_settings — so it must not also swallow a D1 error from the owner COUNT below.
+    // A wide try there returned null on any query failure, which the caller reads as
+    // 'none' and admits.
     const setting = await env.DB.prepare(
       `SELECT value FROM org_settings WHERE key = 'owner_login_emails' LIMIT 1`,
     ).first<{ value: string }>()
     if (!setting?.value) return null
     const parsed: unknown = JSON.parse(setting.value)
     if (!Array.isArray(parsed)) return null
-    const aliases = parsed
+    aliases = parsed
       .filter((item): item is string => typeof item === 'string')
       .map((item) => item.trim().toLowerCase())
-    if (!aliases.includes(email)) return null
+  } catch {
+    return null
+  }
+  if (!aliases.includes(email)) return null
+  {
     // Mirror uniqueOrgOwnerId (src/members/resolve-human-member.ts:25-39), minus TWO
     // predicates, each for its own reason.
     //
     // status: this function must SEE a suspended owner rather than resolve past them.
     //
-    // tenant: 0040 ships members.tenant NULLABLE with no backfill, and the predicate's
-    // POLARITY INVERTS on the way from a resolver into a gate. In uniqueOrgOwnerId a
-    // missed row means "resolve nobody", which is safe. Here a missed row drops the count
-    // from 1 to 0, and a gate that denies on the count then REFUSES the live owner. Same
-    // reasoning as the member-id plane above, which is why that one carries no tenant
-    // predicate either.
+    // tenant: WIDENED, not dropped. The predicate has THREE states, not two — match,
+    // NULL, and a different value — and deleting it collapses all three. NULL means "this
+    // pot's legacy row under 0040's no-backfill design" and must be counted; a different
+    // value means "definitely another pot's owner" and must not be, because in a
+    // count-gate a foreign row pushes the count to 2 and DENIES this pot's sole live
+    // owner. That is a cross-tenant lockout no action inside this pot can clear.
+    //
+    // The polarity argument that made me delete it was right about the danger and wrong
+    // about the remedy: when a gate's polarity makes a predicate dangerous, widen it to
+    // the states it wrongly excluded rather than removing it.
+    //
+    // DISTINCT m.id counts OWNERS, not rows. capabilities' UNIQUE(member_id, scope_type,
+    // scope_id) does not constrain org grants, because scope_id is NULL there and NULLs
+    // are distinct in a SQLite unique index — so one member can hold two org/owner rows
+    // and be miscounted as ambiguous, locking out the single live owner.
     //
     // The previous version dropped three others as well: tenant, `scope_id IS NULL`, and
     // the uniqueness check. That left the authority resolver answering "the unique active
@@ -251,13 +269,14 @@ async function ownerAliasStanding(env: Env, email: string): Promise<HumanStandin
     // cannot be resolved to exactly one owner must not grant. Ambiguity fails CLOSED here
     // rather than falling through to the caller's 'none', which admits.
     const owners = await env.DB.prepare(
-      `SELECT m.status AS status FROM members m
+      `SELECT DISTINCT m.id AS id, m.status AS status FROM members m
          JOIN capabilities c ON c.member_id = m.id
-        WHERE c.scope_type = 'org'
+        WHERE (m.tenant = ?1 OR m.tenant IS NULL)
+          AND c.scope_type = 'org'
           AND c.scope_id IS NULL
           AND c.capability = 'owner'
         LIMIT 2`,
-    ).all<{ status: string }>()
+    ).bind(env.TENANT_SLUG).all<{ id: string; status: string }>()
     const found = owners.results ?? []
     // TWO different decisions, and the previous version collapsed them into one refusal:
     //
@@ -271,10 +290,6 @@ async function ownerAliasStanding(env: Env, email: string): Promise<HumanStandin
     if (found.length >= 2) return 'revoked'
     if (found.length === 0) return null
     return standingOf(found[0])
-  } catch {
-    // A lagging pot may not have org_settings. Absence of the alias table is not evidence
-    // of standing either way, so say "not an alias" and let the caller's 'none' stand.
-    return null
   }
 }
 

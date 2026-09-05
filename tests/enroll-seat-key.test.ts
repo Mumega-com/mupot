@@ -858,3 +858,50 @@ describe('authorizeEnrollMint — suspended-member grants source (mupot#1335, en
     expect(result).toEqual({ ok: true })
   })
 })
+
+// ── the refusal an operator actually READS ───────────────────────────────────
+//
+// Deleting the `principal_revoked` branch from the route left 142/142 green: the whole
+// operator-facing point of the new reason had no route-level coverage. Not a hole — the
+// fall-through still 403s — but it would silently regress to the squad-admin page, which
+// tells the operator to grant admin to a suspended account. That action cannot help, the
+// reload still 403s, and the account ends up MORE privileged while still locked out.
+//
+// A new refusal reason is only delivered if a test exercises the route, not the predicate.
+describe('POST /enroll/mint — a revoked principal is told the truth', () => {
+  let harness: SqliteD1Harness | undefined
+  afterEach(() => { harness?.close(); harness = undefined })
+
+  // An ORG ADMIN deliberately: a suspended PLAIN member never reaches this branch, because
+  // the throttle-key check at index.ts:2119 refuses first with "No member identity resolved
+  // for this session." Only a principal whose isOrgAdmin holds gets a throttle key and
+  // arrives at the standing gate. (That earlier message is itself imprecise for a suspended
+  // member — the identity resolved fine, it is revoked — but changing it means touching the
+  // throttle path, which is out of scope here. Noted on the PR.)
+  it('says the login is not active, and does NOT tell the operator to grant squad admin', async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status, tenant)
+        VALUES ('m-revoked-route', 'revoked@pot.test', 'Revoked', 'suspended', '${TENANT}');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES ('cap-revoked-route', 'm-revoked-route', 'org', NULL, 'admin');
+    `)
+    const env = envFor(harness, { 'sess:s-revoked': sessionRecord('revoked@pot.test', 'admin') })
+    const before = harness.sqlite.prepare(`SELECT COUNT(*) AS n FROM member_tokens`).get() as { n: number }
+
+    const res = await dashboardApp.fetch(
+      dashboardPost('/enroll/mint', 's-revoked', { agent_id: AGENT_A, seat: 'revoked-seat' }),
+      env,
+    )
+
+    const body = await res.text()
+    expect(res.status).toBe(403)
+    expect(body).toContain('not active on this pot')
+    // The misleading instruction must be absent, not merely accompanied.
+    expect(body).not.toContain('grant you')
+    expect(body).not.toMatch(/mupot_[0-9a-f]{64}/)
+
+    const after = harness.sqlite.prepare(`SELECT COUNT(*) AS n FROM member_tokens`).get() as { n: number }
+    expect(after.n).toBe(before.n)
+  })
+})

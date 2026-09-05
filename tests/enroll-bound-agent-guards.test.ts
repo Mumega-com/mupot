@@ -783,3 +783,71 @@ describe('enroll: the alias rung distinguishes absent from ambiguous', () => {
     expect(await humanStandingForSession(env, auth)).toBe('revoked')
   })
 })
+
+// ── seventh gate ─────────────────────────────────────────────────────────────
+describe('enroll: the owner pick counts owners of THIS pot, and counts them once', () => {
+  let harness: SqliteD1Harness
+  afterEach(() => harness?.close())
+
+  const aliasAuth = () => ({
+    userId: 'u-7', email: 'alias@pot.test', role: 'owner', tenant: TENANT, capabilities: [],
+  } as unknown as AuthContext)
+
+  const withAlias = (seed: string) => {
+    harness = makeHarness()
+    harness.sqlite.exec(`${seed}
+      INSERT INTO org_settings (key, value) VALUES ('owner_login_emails', '["alias@pot.test"]');`)
+    return envFor(harness)
+  }
+
+  it("a FOREIGN tenant's owner cannot deny this pot's live owner", async () => {
+    // Deleting the tenant predicate traded gate 6's NULL lockout for this one: a foreign
+    // active owner pushed the count to 2, the alias read 'revoked', and the operator was
+    // told to reactivate an account that was never suspended — an action that cannot help,
+    // for a row belonging to a tenant invisible from here.
+    const env = withAlias(`
+      INSERT INTO members (id, email, display_name, status, tenant) VALUES
+        ('owner-live',    'live@pot.test',    'Live',    'active', '${TENANT}'),
+        ('owner-foreign', 'foreign@pot.test', 'Foreign', 'active', 'other-tenant');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES
+        ('cap-live',    'owner-live',    'org', NULL, 'owner'),
+        ('cap-foreign', 'owner-foreign', 'org', NULL, 'owner');`)
+    expect(await humanStandingForSession(env, aliasAuth())).toBe('active')
+  })
+
+  it('a legacy NULL-tenant owner is still counted as this pot\'s', async () => {
+    // The state the widened predicate must keep: 0040 ships members.tenant nullable with
+    // no backfill, so NULL means "this pot's legacy row", not "another pot's".
+    const env = withAlias(`
+      INSERT INTO members (id, email, display_name, status, tenant) VALUES
+        ('owner-null', 'nul@pot.test', 'Legacy', 'active', NULL);
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES
+        ('cap-null', 'owner-null', 'org', NULL, 'owner');`)
+    expect(await humanStandingForSession(env, aliasAuth())).toBe('active')
+  })
+
+  it('ONE owner holding TWO org grant rows is not ambiguous', async () => {
+    // capabilities' UNIQUE(member_id, scope_type, scope_id) does not constrain org grants:
+    // scope_id is NULL there and NULLs are distinct in a SQLite unique index, so duplicate
+    // rows insert cleanly. Counting rows instead of owners locked out the single live owner.
+    const env = withAlias(`
+      INSERT INTO members (id, email, display_name, status, tenant) VALUES
+        ('owner-dup', 'dup@pot.test', 'Dup', 'active', '${TENANT}');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES
+        ('cap-dup-1', 'owner-dup', 'org', NULL, 'owner'),
+        ('cap-dup-2', 'owner-dup', 'org', NULL, 'owner');`)
+    expect(await humanStandingForSession(env, aliasAuth())).toBe('active')
+  })
+
+  it('two DISTINCT owners are still ambiguous and refuse', async () => {
+    // The positive control for the DISTINCT change: it must not swallow real ambiguity.
+    const env = withAlias(`
+      INSERT INTO members (id, email, display_name, status, tenant) VALUES
+        ('own-a', 'a@pot.test', 'A', 'active',    '${TENANT}'),
+        ('own-b', 'b@pot.test', 'B', 'suspended', '${TENANT}');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES
+        ('cap-a', 'own-a', 'org', NULL, 'owner'),
+        ('cap-b', 'own-b', 'org', NULL, 'owner');`)
+    expect(await humanStandingForSession(env, aliasAuth())).toBe('revoked')
+  })
+})
