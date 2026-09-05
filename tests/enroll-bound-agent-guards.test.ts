@@ -565,3 +565,104 @@ describe('humanStandingForSession returns the three states distinctly', () => {
     expect(await humanStandingForSession(envFor(harness), a)).toBe('revoked')
   })
 })
+
+// ── fifth gate: selection, and a verdict computed then discarded ─────────────
+describe('enroll: the alias rung selects like the authority does, and revoked gates every path', () => {
+  let harness: SqliteD1Harness
+  afterEach(() => harness?.close())
+
+  function seedOwners(rows: Array<{ id: string; status: string; tenant: string }>): Env {
+    harness = makeHarness()
+    for (const r of rows) {
+      harness.sqlite.exec(`
+        INSERT INTO members (id, email, display_name, status, tenant) VALUES
+          ('${r.id}', '${r.id}@pot.test', '${r.id}', '${r.status}', ${r.tenant === 'NULL' ? 'NULL' : `'${r.tenant}'`});
+        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES
+          ('cap-${r.id}', '${r.id}', 'org', NULL, 'owner');
+      `)
+    }
+    harness.sqlite.exec(`INSERT INTO org_settings (key, value) VALUES ('owner_login_emails', '["alias@pot.test"]');`)
+    return envFor(harness)
+  }
+
+  const aliasAuth = () => ({
+    userId: 'u-alias', email: 'alias@pot.test', role: 'owner', tenant: TENANT, capabilities: [],
+  } as unknown as AuthContext)
+
+  it('a suspended owner is not rescued by an ACTIVE owner sorting first', async () => {
+    // The previous LIMIT 1 with no ORDER BY picked by rowid, so the same fixture gave
+    // opposite verdicts depending on insertion order. Seed the active one FIRST, which is
+    // the order that used to admit.
+    const env = seedOwners([
+      { id: 'owner-live', status: 'active', tenant: TENANT },
+      { id: 'owner-susp', status: 'suspended', tenant: TENANT },
+    ])
+    expect(await humanStandingForSession(env, aliasAuth())).toBe('revoked')
+  })
+
+  it('and not by the reverse insertion order either', async () => {
+    const env = seedOwners([
+      { id: 'owner-susp', status: 'suspended', tenant: TENANT },
+      { id: 'owner-live', status: 'active', tenant: TENANT },
+    ])
+    expect(await humanStandingForSession(env, aliasAuth())).toBe('revoked')
+  })
+
+  it('an owner of ANOTHER tenant cannot vouch for this pot', async () => {
+    // The shared-DB shape migration 0040 defends. The previous query had no tenant
+    // predicate, so a suspended owner here was admitted on a foreign active owner.
+    const env = seedOwners([
+      { id: 'owner-susp', status: 'suspended', tenant: TENANT },
+      { id: 'owner-foreign', status: 'active', tenant: 'other-tenant' },
+    ])
+    expect(await humanStandingForSession(env, aliasAuth())).toBe('revoked')
+  })
+
+  it('a single ACTIVE owner behind the alias still resolves active', async () => {
+    const env = seedOwners([{ id: 'owner-only', status: 'active', tenant: TENANT }])
+    expect(await humanStandingForSession(env, aliasAuth())).toBe('active')
+  })
+
+  it('a revoked human is refused on the squad-grant path too, not just the org branch', async () => {
+    // The verdict used to be computed and then consulted only inside the isOrgAdmin
+    // branch, so the fall-through path discarded it: the alias resolver handed the session
+    // a DIFFERENT member's grants, those were approved honestly, and the mint returned
+    // ok:true for a principal this function had just judged revoked.
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status, tenant) VALUES
+        ('m-revoked', 'revoked@pot.test', 'Revoked', 'suspended', '${TENANT}');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES
+        ('cap-revoked', 'm-revoked', 'squad', '${SQUAD_A}', 'admin');
+    `)
+    const env = envFor(harness)
+    const auth = {
+      userId: 'u-r', email: 'revoked@pot.test', role: 'member', tenant: TENANT,
+      memberId: 'm-revoked',
+      capabilities: [{ scope_type: 'squad', scope_id: SQUAD_A, capability: 'admin' }],
+    } as unknown as AuthContext
+    expect(await authorizeEnrollMint(env, auth, SQUAD_A)).toEqual({ ok: false, reason: 'squad_admin_required' })
+  })
+
+  it('the mint and the picker agree for the same session', async () => {
+    // They disagreed: the picker honoured the revoked verdict and returned zero agents
+    // while the mint admitted. The permissive half was the privileged one.
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status, tenant) VALUES
+        ('m-both', 'both@pot.test', 'Both', 'suspended', '${TENANT}');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES
+        ('cap-both', 'm-both', 'squad', '${SQUAD_A}', 'admin');
+    `)
+    const env = envFor(harness)
+    const auth = {
+      userId: 'u-b', email: 'both@pot.test', role: 'member', tenant: TENANT,
+      memberId: 'm-both',
+      capabilities: [{ scope_type: 'squad', scope_id: SQUAD_A, capability: 'admin' }],
+    } as unknown as AuthContext
+    const mint = await authorizeEnrollMint(env, auth, SQUAD_A)
+    const view = await loadEnrollView(env, auth, {})
+    expect(mint.ok).toBe(false)
+    expect(view.agents).toEqual([])
+  })
+})

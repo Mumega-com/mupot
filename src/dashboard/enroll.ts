@@ -179,7 +179,11 @@ export async function humanStandingForSession(env: Env, auth: AuthContext): Prom
   // No tenant predicate: `members.tenant` ships NULLABLE with a deliberate no-backfill
   // design (migrations/0040), so scoping by tenant here silently misses legacy rows and
   // returns 'none' for a suspended principal — the mupot#1330 shape.
-  const authorityMemberId = auth.webSessionMemberId ?? auth.memberId
+  // Same precedence as resolveEnrollMemberId (enroll.ts:60) — `memberId ?? webSessionMemberId`.
+  // They are equal today only because loadAuthFromCookie sets memberId FROM
+  // webSessionMemberId when present; one line of drift in either producer and a gate reading
+  // the opposite order judges a different member than the one whose grants are used.
+  const authorityMemberId = auth.memberId ?? auth.webSessionMemberId
   if (authorityMemberId) {
     const row = await env.DB.prepare(
       `SELECT status FROM members WHERE id = ?1 LIMIT 1`,
@@ -224,13 +228,32 @@ async function ownerAliasStanding(env: Env, email: string): Promise<HumanStandin
       .filter((item): item is string => typeof item === 'string')
       .map((item) => item.trim().toLowerCase())
     if (!aliases.includes(email)) return null
-    const owner = await env.DB.prepare(
+    // Mirror uniqueOrgOwnerId (src/members/resolve-human-member.ts:25-39) EXACTLY, minus
+    // only the status filter — which is the one predicate this function must not inherit,
+    // because it needs to SEE a suspended owner rather than resolve past them.
+    //
+    // The previous version dropped three others as well: tenant, `scope_id IS NULL`, and
+    // the uniqueness check. That left the authority resolver answering "the unique active
+    // org-scoped owner OF THIS TENANT" while this gate answered "an arbitrary row from a
+    // superset", decided by rowid. Same fixture, opposite verdict depending on insertion
+    // order — and in the shared-DB shape 0040 defends, a suspended owner of this pot was
+    // admitted because an active owner of another tenant sorted first.
+    //
+    // LIMIT 2 + reject non-unique is deliberate and matches the original: an alias that
+    // cannot be resolved to exactly one owner must not grant. Ambiguity fails CLOSED here
+    // rather than falling through to the caller's 'none', which admits.
+    const owners = await env.DB.prepare(
       `SELECT m.status AS status FROM members m
          JOIN capabilities c ON c.member_id = m.id
-        WHERE c.scope_type = 'org' AND c.capability = 'owner'
-        LIMIT 1`,
-    ).first<{ status: string }>()
-    return standingOf(owner)
+        WHERE m.tenant = ?1
+          AND c.scope_type = 'org'
+          AND c.scope_id IS NULL
+          AND c.capability = 'owner'
+        LIMIT 2`,
+    ).bind(env.TENANT_SLUG).all<{ status: string }>()
+    const found = owners.results ?? []
+    if (found.length !== 1) return 'revoked'
+    return standingOf(found[0])
   } catch {
     // A lagging pot may not have org_settings. Absence of the alias table is not evidence
     // of standing either way, so say "not an alias" and let the caller's 'none' stand.
@@ -273,8 +296,17 @@ export async function authorizeEnrollMint(
   // NO status column — so members.status has no authority over a users-role owner in any
   // code path. The gate therefore asks about the HUMAN behind the session, status-blind,
   // rather than about a member id the resolver already filtered.
+  // A revoked human does not mint, on ANY authority plane. The previous version computed
+  // `standing` and then consulted it only inside the isOrgAdmin branch, so the fall-through
+  // squad-grant path discarded a 'revoked' verdict it had already calculated: the alias
+  // resolver handed the session a DIFFERENT member's grants, resolveHumanStandingGrants
+  // approved that member honestly, and the mint returned ok:true for a principal this
+  // function had just judged revoked. loadEnrollView honoured the same verdict, so the
+  // picker showed zero agents to the very session the mint admitted — the two halves
+  // disagreeing, with the privileged half permissive.
   const standing = await humanStandingForSession(env, auth)
-  if (isOrgAdmin(auth) && standing !== 'revoked') return { ok: true }
+  if (standing === 'revoked') return { ok: false, reason: 'squad_admin_required' }
+  if (isOrgAdmin(auth)) return { ok: true }
   // resolveHumanStandingGrants, not raw resolveCapabilities: a member whose
   // members.status has moved to suspended gets [] here even when
   // resolveEnrollMemberId still resolves an id for them, because step 2 of
