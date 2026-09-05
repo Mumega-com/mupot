@@ -26,7 +26,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
 import type { Env, AuthContext } from '../src/types'
-import { resolveEnrollMemberId, authorizeEnrollMint } from '../src/dashboard/enroll'
+import { resolveEnrollMemberId, authorizeEnrollMint, loadEnrollView } from '../src/dashboard/enroll'
 
 const TENANT = 'pot-a'
 const ORIGIN = 'https://pot.test'
@@ -295,5 +295,96 @@ describe('enroll admission: revoked standing and the null-member listing guard',
       capabilities: [],
     } as unknown as AuthContext
     await expect(authorizeEnrollMint(env, auth, SQUAD_A)).resolves.toEqual({ ok: true })
+  })
+})
+
+// ── BLOCK-C: suspension itself produced the null the fix admitted on ─────────
+//
+// Every rung of resolveHumanMemberId filters status='active' or revoked_at IS NULL, so it
+// answers null for BOTH "no such human" and "that human is suspended". An earlier version
+// of authorizeEnrollMint read null as the bootstrap-owner shape and admitted it — which made
+// REVOKING a member the way to reach the unguarded branch. Doing more revocation made the
+// principal more admissible.
+//
+// These tests deliberately pass NO memberId, so resolveEnrollMemberId actually runs. The
+// prior round's tests hard-coded memberId to the value the resolver would compute, which is
+// precisely why they could not see a resolver-produced attack shape: a test that hand-sets
+// what the resolver returns has stubbed out the thing under attack.
+describe('enroll: a revoked human cannot reach the bootstrap-owner branch', () => {
+  let harness: SqliteD1Harness
+
+  afterEach(() => harness?.close())
+
+  function seed(status: 'active' | 'suspended', scope: 'org' | 'squad'): Env {
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status, tenant) VALUES
+        ('m-sus', 'sus@pot.test', 'Suspendable', '${status}', '${TENANT}');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES
+        ('cap-sus', 'm-sus', '${scope}', ${scope === 'org' ? 'NULL' : `'${SQUAD_A}'`}, 'admin');
+      INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES
+        ('${TENANT}', '${AGENT_A}', 'm-sus', '2026-09-05T00:00:00.000Z');
+    `)
+    return envFor(harness)
+  }
+
+  // No memberId: the resolver must run, and for a suspended row it returns null.
+  const sessionAuth = (caps: Array<Record<string, unknown>>): AuthContext => ({
+    userId: 'user-sus',
+    email: 'sus@pot.test',
+    role: 'member',
+    tenant: TENANT,
+    capabilities: caps,
+  } as unknown as AuthContext)
+
+  const orgCaps = [{ scope_type: 'org', scope_id: null, capability: 'admin' }]
+
+  it('a SUSPENDED org admin is refused even though the resolver answers null', async () => {
+    const env = seed('suspended', 'org')
+    const res = await authorizeEnrollMint(env, sessionAuth(orgCaps), SQUAD_A)
+    expect(res).toEqual({ ok: false, reason: 'squad_admin_required' })
+  })
+
+  it('an ACTIVE org admin resolving through the same path is admitted', async () => {
+    // The positive control. Without it the test above passes for the wrong reason.
+    const env = seed('active', 'org')
+    await expect(authorizeEnrollMint(env, sessionAuth(orgCaps), SQUAD_A)).resolves.toEqual({ ok: true })
+  })
+
+  it('a users-role owner with a SUSPENDED member row is refused', async () => {
+    // isOrgAdmin's first branch reads auth.role from `users`, a table with NO status column,
+    // so members.status has no authority over this principal through any id-based check.
+    // The gate has to ask about the human, status-blind, or this shape walks through.
+    const env = seed('suspended', 'org')
+    const auth = {
+      userId: 'user-sus', email: 'sus@pot.test', role: 'owner', tenant: TENANT, capabilities: [],
+    } as unknown as AuthContext
+    expect(await authorizeEnrollMint(env, auth, SQUAD_A)).toEqual({ ok: false, reason: 'squad_admin_required' })
+  })
+
+  it('the true bootstrap owner — no members row for the email at all — is still admitted', async () => {
+    // 'none' and 'revoked' must stay distinguishable. This is the case the whole fix exists
+    // for, and it is the one a naive "refuse on null" would break.
+    harness = makeHarness()
+    const env = envFor(harness)
+    const auth = {
+      userId: 'user-boot', email: 'nobody@pot.test', role: 'owner', tenant: TENANT, capabilities: [],
+    } as unknown as AuthContext
+    await expect(authorizeEnrollMint(env, auth, SQUAD_A)).resolves.toEqual({ ok: true })
+  })
+
+  it('a suspended ORG admin cannot enumerate the agent inventory through the picker', async () => {
+    // BLOCK-E: the mint was hardened and the picker was not, so revocation ended minting
+    // while leaving the inventory plus each live key's label, channel and created_at
+    // readable.
+    //
+    // It has to be an ORG admin, not a squad admin. A suspended squad admin resolves to a
+    // null memberId and is already turned away by the pre-existing `!memberId` branch, so
+    // that test passes whether or not the standing gate exists — it proves nothing. Only an
+    // org admin reaches `orgAdminWithoutMember`, walks past that branch, and would be handed
+    // listConsentableAgents(null), which skips the per-squad filter entirely.
+    const env = seed('suspended', 'org')
+    const view = await loadEnrollView(env, sessionAuth(orgCaps), {})
+    expect(view.agents).toEqual([])
   })
 })

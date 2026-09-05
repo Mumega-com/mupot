@@ -148,14 +148,30 @@ export function enrollClientSnippet(slug: string, origin: string, seat: string):
  * beyond mint_agent_token's bar ... that bar is an over-restriction of one
  * surface; enroll matches the MCP primitive."
  */
-/** Is this member row live? A MISSING row is deliberately not this function's business —
- *  callers distinguish "no identity to check" from "identity revoked", because conflating
- *  them either locks out the bootstrap owner or admits a suspended one. */
-async function memberIsActive(env: Env, memberId: string): Promise<boolean> {
+/** The standing of the human behind this session, resolved STATUS-BLIND on purpose.
+ *
+ *  Why this cannot use resolveHumanMemberId: every rung of that resolver filters
+ *  `status = 'active'` (resolve-human-member.ts:31,133,144,152) or `revoked_at IS NULL`
+ *  (:105,111). So it answers null for BOTH "no such human" and "that human is suspended",
+ *  and an earlier version of this file treated null as the bootstrap-owner shape and
+ *  admitted it. That made SUSPENSION ITSELF the way to reach the unguarded branch: revoke
+ *  a member and their next session resolves null, which was the unconditional admit.
+ *
+ *  'none' and 'revoked' must therefore be distinguishable, which requires a query that
+ *  does not filter on status. members.email is globally UNIQUE (0002), so at most one row. */
+type HumanStanding = 'none' | 'active' | 'revoked'
+
+async function humanStandingForSession(env: Env, auth: AuthContext): Promise<HumanStanding> {
+  const email = auth.email?.trim().toLowerCase()
+  // No email means no way to ask the question. Refuse rather than guess: every session
+  // that reaches this route carries a provider-verified email, so an absent one is an
+  // unexpected shape, and unexpected shapes do not get to mint operator credentials.
+  if (!email) return 'revoked'
   const row = await env.DB.prepare(
-    `SELECT status FROM members WHERE id = ?1 AND tenant = ?2`,
-  ).bind(memberId, env.TENANT_SLUG).first<{ status: string }>()
-  return row?.status === 'active'
+    `SELECT status FROM members WHERE lower(email) = ?1 AND tenant = ?2 LIMIT 1`,
+  ).bind(email, env.TENANT_SLUG).first<{ status: string }>()
+  if (!row) return 'none'
+  return row.status === 'active' ? 'active' : 'revoked'
 }
 
 export async function authorizeEnrollMint(
@@ -189,8 +205,12 @@ export async function authorizeEnrollMint(
   //     as "grants.length > 0" would refuse a legacy role='owner' who holds no grant rows,
   //     which is precisely the principal isOrgAdmin exists to protect.
   // So read the status itself rather than any consequence of it.
-  const memberIsRevoked = memberId ? !(await memberIsActive(env, memberId)) : false
-  if (isOrgAdmin(auth) && !memberIsRevoked) return { ok: true }
+  // isOrgAdmin's first branch reads auth.role, which comes from `users.role` — a table with
+  // NO status column — so members.status has no authority over a users-role owner in any
+  // code path. The gate therefore asks about the HUMAN behind the session, status-blind,
+  // rather than about a member id the resolver already filtered.
+  const standing = await humanStandingForSession(env, auth)
+  if (isOrgAdmin(auth) && standing !== 'revoked') return { ok: true }
   // resolveHumanStandingGrants, not raw resolveCapabilities: a member whose
   // members.status has moved to suspended gets [] here even when
   // resolveEnrollMemberId still resolves an id for them, because step 2 of
@@ -330,6 +350,14 @@ export async function loadEnrollView(
   // principal who outranks every squad — the visible half of the same defect that
   // made the mint 403. An org admin sees the full active inventory; everyone else
   // still needs a resolved member.
+  // The picker gets the SAME standing gate as the mint. Hardening only the mint left a
+  // suspended squad admin able to enumerate the full agent inventory plus each live key's
+  // label, channel and created_at through loadLiveKeysForAgents — a smaller hole than
+  // minting, but the same principal and the same revocation that was supposed to end it.
+  const standing = await humanStandingForSession(env, auth)
+  if (standing === 'revoked') {
+    return { principal, memberId, seat, preselectedAgent: null, agents: [] }
+  }
   const orgAdminWithoutMember = !memberId && !auth.boundAgentId && isOrgAdmin(auth)
   if (!memberId && !orgAdminWithoutMember) {
     return { principal, memberId, seat, preselectedAgent: null, agents: [] }
