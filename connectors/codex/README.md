@@ -6,6 +6,12 @@ as Claude — `POST /mcp` with a member token — and gets the same tool surface
 gated by the same capability RBAC. Identity is derived by the pot from the token,
 never from anything Codex says about itself.
 
+> **Connection is not delivery.** This generic connector describes how a running
+> Codex turn reaches Mupot. It does not create an idle receiver, wake a Codex
+> task, prove runtime consumption, or authorize a background service. For the
+> separate exact-delivery boundary, evidence requirements, and current status,
+> see [Codex Exact Delivery](../../docs/operations/codex-exact-delivery-status.md).
+
 ## Connect
 
 Codex reads MCP servers from its config (`~/.codex/config.toml`, or the JSON form
@@ -33,9 +39,10 @@ See [`mcp.json`](./mcp.json) — identical structure to the Claude connector's
 ## Fill in
 
 1. Replace `YOUR-POT.example.workers.dev` with **your** pot's host.
-2. Replace `<MUPOT_MEMBER_TOKEN>` with the raw member token your pot minted
-   (`channel: workspace`). See the top-level [connectors README](../README.md) for
-   how to mint one. **Never commit the filled-in file.**
+2. Supply the workspace token through protected environment or secret storage;
+   do not paste a bearer into a repository config, prompt, issue, receipt, or
+   screenshot. See the top-level [connectors README](../README.md) for token
+   provisioning. **Never commit a filled-in file.**
 
 Verify the tool surface (no token needed):
 
