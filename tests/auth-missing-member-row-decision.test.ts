@@ -89,4 +89,30 @@ describe('missing members row does not lock out a session (#1330 F3, explicit de
     )
     expect(res.status).toBe(401)
   })
+
+  it('a REAL suspended members row with tenant IS NULL (legacy, unbackfilled) still denies (#1330 F-A)', async () => {
+    // F3's "missing row allows" absorbed this shape silently: the status
+    // check bound `AND tenant = ?2`, which never matches a NULL column, so a
+    // suspended legacy row with tenant IS NULL looked exactly like "no row at
+    // all" and was allowed through — a fail-open on the very defect #1318
+    // exists to close. This pins that a tenant=NULL row is treated as a REAL
+    // row (denied), not as absence (allowed).
+    const env = makeEnv('suspended-legacy@x.test')
+    env.DB = harness.db
+    await env.DB.prepare(
+      `INSERT INTO members (id, tenant, email, display_name, status, created_at)
+       VALUES ('m-suspended-legacy', NULL, ?1, ?1, 'suspended', datetime('now'))`,
+    ).bind('suspended-legacy@x.test').run()
+
+    const loginRes = await authApp.request('/dev-login', {}, env)
+    expect(loginRes.status).toBe(302)
+    const cookie = cookieFrom(loginRes)
+
+    const res = await authApp.request(
+      '/me',
+      { headers: { cookie: `mupot_session=${cookie}` } },
+      env,
+    )
+    expect(res.status).toBe(401)
+  })
 })

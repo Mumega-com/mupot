@@ -128,3 +128,59 @@ describe('PATCH /members/:id web-session liveness', () => {
     expect(member?.status).toBe('suspended')
   })
 })
+
+// #1330 F-C — the catch-fallback rung (degraded-schema branch, web_sessions
+// missing) had its own `UPDATE members ... AND tenant = ?3` bound copy of the
+// F2 fix, silently reverted independent of the batch path. 11/11 tests stayed
+// green with it reverted because no existing test drove a CROSS-TENANT
+// suspend down the degraded-schema branch specifically. This pins that rung.
+describe('PATCH /members/:id catch-fallback tenant scoping (#1330 F-C)', () => {
+  let harness: SqliteD1Harness
+
+  afterEach(() => harness.close())
+
+  it('cannot cross-tenant-suspend via the degraded-schema (missing web_sessions) fallback', async () => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    harness.sqlite.exec('DROP TABLE web_sessions')
+    const now = '2026-09-05T00:00:00.000Z'
+    await harness.db.prepare(
+      `INSERT INTO members (id, tenant, email, display_name, status, created_at)
+       VALUES ('victim-degraded', 'tenant-b', 'victim@example.test', 'Victim', 'active', ?1)`,
+    ).bind(now).run()
+
+    const env = {
+      TENANT_SLUG: 'tenant-a',
+      DB: harness.db,
+      SESSIONS: {
+        get: async (key: string) => (
+          key === 'sess:owner-session'
+            ? JSON.stringify({
+                userId: 'owner-user',
+                email: 'owner@example.test',
+                role: 'owner',
+                createdAt: now,
+              })
+            : null
+        ),
+        put: async () => undefined,
+        delete: async () => undefined,
+      },
+    } as unknown as Env
+
+    const res = await membersApp.request(
+      '/members/victim-degraded',
+      {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json', cookie: 'mupot_session=owner-session' },
+        body: JSON.stringify({ status: 'suspended' }),
+      },
+      env,
+    )
+    expect(res.status).toBe(404)
+    const row = await harness.db.prepare(
+      'SELECT status FROM members WHERE id = ?1',
+    ).bind('victim-degraded').first<{ status: string }>()
+    expect(row?.status).toBe('active')
+  })
+})

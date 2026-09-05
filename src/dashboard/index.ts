@@ -2989,9 +2989,12 @@ async function canOnSquadRead(env: Env, grants: CapabilityGrant[], squadId: stri
 }
 
 async function loadMembers(env: Env): Promise<Member[]> {
+  // #1330 F-B: tenant-scoped, same rationale as src/members/index.ts GET /members.
   const rows = await env.DB.prepare(
-    'SELECT id, email, display_name, telegram_chat_id, status, created_at FROM members ORDER BY created_at ASC, display_name ASC',
-  ).all<Member>()
+    'SELECT id, email, display_name, telegram_chat_id, status, created_at FROM members WHERE tenant = ?1 OR tenant IS NULL ORDER BY created_at ASC, display_name ASC',
+  )
+    .bind(env.TENANT_SLUG)
+    .all<Member>()
   return rows.results ?? []
 }
 

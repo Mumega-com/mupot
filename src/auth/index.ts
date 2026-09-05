@@ -1058,9 +1058,13 @@ async function loadAuthFromCookie(c: Context<AppEnv>): Promise<AuthContext | nul
   // row, never on absence (see F3 below for the missing-member decision).
   if (record.email && c.env.DB) {
     try {
+      // #1330 F-A: match legacy tenant IS NULL rows too (0040 adds the column
+      // with no backfill) — `AND tenant = ?2` alone made a suspended legacy
+      // member's row invisible to this check, so it fell through to the
+      // missing-row "allow" path below (F3) instead of being denied.
       const member = await c.env.DB.prepare(
         `SELECT status FROM members
-          WHERE lower(email) = ?1 AND tenant = ?2
+          WHERE lower(email) = ?1 AND (tenant = ?2 OR tenant IS NULL)
           LIMIT 1`,
       ).bind(record.email.trim().toLowerCase(), c.env.TENANT_SLUG).first<{ status: string }>()
       if (typeof member?.status === 'string' && member.status !== 'active') {
