@@ -416,7 +416,7 @@ export async function resolveConsentedAgentCapabilities(
  *  explicit-named-act escape hatch (`connect`) — it must reflect the HUMAN's own
  *  grants, never the agent's raw unclamped set (that would reopen P0-1 through a
  *  second door: `connect`'s claimGrants falls back to latentCapabilities). */
-async function resolveHumanStandingGrants(env: Env, memberId: string): Promise<CapabilityGrant[]> {
+export async function resolveHumanStandingGrants(env: Env, memberId: string): Promise<CapabilityGrant[]> {
   const human = await env.DB.prepare(
     `SELECT status FROM members WHERE id = ?1 AND tenant = ?2`,
   ).bind(memberId, env.TENANT_SLUG).first<{ status: string }>()
@@ -452,8 +452,17 @@ export async function memberMayConsentToAgent(env: Env, memberId: string, agentI
 /** The full selectable list for the consent screen, each with its capability preview
  *  — "a parameter that grants capability without showing it is a phishing surface".
  *  Floor is 'admin' (P0-3) — see memberMayConsentToAgent. */
-export async function listConsentableAgents(env: Env, memberId: string): Promise<ConsentableAgent[]> {
-  const humanGrants = await resolveCapabilities(env, memberId)
+/** `memberId: null` is the BOOTSTRAP-OWNER shape (mupot#1324): an org owner/admin
+ *  web session that has no `members` row at all, so there is no id to resolve
+ *  grants from. Only `src/dashboard/enroll.ts` passes null, and only after
+ *  `isOrgAdmin(auth)` — an org admin outranks every squad grant, which is the
+ *  same reasoning `canOnSquad` already applies, so the per-squad filter is
+ *  skipped rather than evaluated against an empty grant set. The capability
+ *  preview is omitted in that case instead of faked: with no human member there
+ *  is no clamp to preview, and inventing one would misreport what the session
+ *  would actually carry (P0-1). */
+export async function listConsentableAgents(env: Env, memberId: string | null): Promise<ConsentableAgent[]> {
+  const humanGrants = memberId ? await resolveCapabilities(env, memberId) : []
   const rows = await env.DB.prepare(
     `SELECT a.id AS id, a.slug AS slug, a.name AS name, a.squad_id AS squad_id,
             sq.name AS squad_name, a.autonomy AS autonomy,
@@ -467,11 +476,13 @@ export async function listConsentableAgents(env: Env, memberId: string): Promise
 
   const out: ConsentableAgent[] = []
   for (const row of rows.results ?? []) {
-    if (!(await canOnSquad(env, humanGrants, row.squad_id, 'admin'))) continue
+    if (memberId && !(await canOnSquad(env, humanGrants, row.squad_id, 'admin'))) continue
     // The preview shows the TRUE clamped result (P0-1) — `memberId` here IS the
     // viewing/consenting human, so this is honest about exactly what the session
     // would carry, never the agent's raw (possibly higher) grant.
-    const capabilities = await resolveConsentedAgentCapabilities(env, row.id, memberId)
+    const capabilities = memberId
+      ? await resolveConsentedAgentCapabilities(env, row.id, memberId)
+      : []
     out.push({ ...row, capabilities })
   }
   return out

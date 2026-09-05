@@ -25,11 +25,15 @@
 
 import { html, raw as honoRaw } from 'hono/html'
 import type { AuthContext, Env } from '../types'
-import { canOnSquad, resolveCapabilities } from '../auth/capability'
+import { canOnSquad, isOrgAdmin } from '../auth/capability'
 import { describeOrgStanding } from '../auth/refusal'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { resolveHumanMemberId } from '../members/resolve-human-member'
-import { listConsentableAgents, type ConsentableAgent } from '../mcp/oauth-authorize'
+import {
+  listConsentableAgents,
+  resolveHumanStandingGrants,
+  type ConsentableAgent,
+} from '../mcp/oauth-authorize'
 import { mcpEndpoint, mcpServerKey } from './connect'
 
 export const DEFAULT_ENROLL_SEAT = 'unnamed-seat'
@@ -150,8 +154,24 @@ export async function authorizeEnrollMint(
   squadId: string,
 ): Promise<{ ok: true } | { ok: false; reason: 'operator_principal_required' | 'squad_admin_required' }> {
   if (auth.boundAgentId) return { ok: false, reason: 'operator_principal_required' }
+  // BOOTSTRAP-OWNER ADMISSION (mupot#1324 adversarial follow-up). An explicit OR
+  // alongside the squad-admin bar below, not a replacement for it. `canOnSquad`
+  // needs a memberId to load grant rows from, and the bootstrap owner — the case
+  // capability.ts:50-52 documents as "no grant rows at all" — usually has no
+  // `members` row either, so resolveEnrollMemberId returns null and canOnSquad is
+  // evaluated against []. Before this, that principal got 403 squad_admin_required
+  // from THIS route while POST /admin/agent-token/mint on the same app admitted
+  // them via isOrgAdmin. Two mint surfaces disagreeing about who the owner is was
+  // the defect the owner actually hit as "you don't have access" after enroll. A
+  // squad admin still does not need an org role; that bar is unchanged below.
+  if (isOrgAdmin(auth)) return { ok: true }
   const memberId = await resolveEnrollMemberId(env, auth)
-  const grants = auth.capabilities ?? (memberId ? await resolveCapabilities(env, memberId) : [])
+  // resolveHumanStandingGrants, not raw resolveCapabilities: a member whose
+  // members.status has moved to suspended gets [] here even when
+  // resolveEnrollMemberId still resolves an id for them, because step 2 of
+  // resolveHumanMemberId carries no status filter (mupot#1335). Closes the mint
+  // side of that hole without touching the resolver, which is #1335's own fix.
+  const grants = memberId ? await resolveHumanStandingGrants(env, memberId) : []
   if (!(await canOnSquad(env, grants, squadId, 'admin'))) {
     return { ok: false, reason: 'squad_admin_required' }
   }
@@ -279,7 +299,14 @@ export async function loadEnrollView(
     : (auth.memberId ?? auth.userId)
   const memberId = await resolveEnrollMemberId(env, auth)
 
-  if (!memberId) {
+  // Bootstrap owner (mupot#1324): isOrgAdmin can hold with no `members` row, so a
+  // null memberId here is not "unauthorized", it is "no member identity to resolve
+  // grants from". Returning [] made the picker render zero agents for the very
+  // principal who outranks every squad — the visible half of the same defect that
+  // made the mint 403. An org admin sees the full active inventory; everyone else
+  // still needs a resolved member.
+  const orgAdminWithoutMember = !memberId && !auth.boundAgentId && isOrgAdmin(auth)
+  if (!memberId && !orgAdminWithoutMember) {
     return { principal, memberId, seat, preselectedAgent: null, agents: [] }
   }
 

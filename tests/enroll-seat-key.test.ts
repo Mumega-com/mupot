@@ -13,6 +13,7 @@ import { applyAllMigrations } from './helpers/migrations'
 import { dashboardApp } from '../src/dashboard/index'
 import { mcpApp } from '../src/mcp'
 import {
+  authorizeEnrollMint,
   enrollUrl,
   ENROLL_MINT_RL_MAX,
   ENROLL_MINT_RL_TTL,
@@ -668,5 +669,188 @@ describe('MCP unbound session surfaces enroll_url', () => {
     expect(body.error.data?.enroll_url).toBeDefined()
     expect(body.error.data?.enroll_url).toContain('/enroll')
     expect(body.error.data?.detail).toContain('inbox requires an agent-bound token')
+  })
+})
+
+// ── mupot#1324 BLOCK-1: bootstrap owner with NO members row ──────────────────
+//
+// Kasra's adversarial finding: every prior positive test in this file reuses
+// HUMAN_ADMIN — a subject that has BOTH a members row AND a squad-admin grant.
+// That is exactly why the bootstrap-owner shape was never exercised: a legacy
+// owner/admin session (role from the ORG login, capability.ts:50-52's
+// documented "the bootstrap owner has no grant rows at all") often has no
+// `members` row either. Pre-fix, that principal got 403
+// "No member identity resolved for this session" from POST /enroll/mint and
+// saw zero consentable agents on GET /enroll, while the sibling
+// POST /admin/agent-token/mint admitted the identical principal via
+// isOrgAdmin. This block proves BOTH surfaces now agree.
+describe('bootstrap owner with NO members row (mupot#1324 BLOCK-1)', () => {
+  let harness: SqliteD1Harness | undefined
+  afterEach(() => {
+    harness?.close()
+    harness = undefined
+  })
+
+  const BOOTSTRAP_OWNER_EMAIL = 'boss@pot.test'
+
+  it('GET /enroll shows every active agent across every squad, not zero', async () => {
+    harness = makeHarness()
+    // Deliberately NO members row, NO capabilities row, for this email —
+    // the exact shape the block report reproduced.
+    const env = envFor(harness, { 'sess:s-boss': sessionRecord(BOOTSTRAP_OWNER_EMAIL, 'owner') })
+    const res = await dashboardApp.fetch(dashboardReq('/enroll?seat=owner-laptop', 's-boss'), env)
+    expect(res.status).toBe(200)
+    const body = await res.text()
+    expect(body).toContain(BOOTSTRAP_OWNER_EMAIL)
+    // Pre-fix this was the empty-state copy ("You may not act as any agent
+    // yet") because listConsentableAgents(env, null) never even ran.
+    expect(body).not.toContain('You may not act as any agent yet')
+    // Sees BOTH squads' agents — org-admin listing, not one squad's.
+    expect(body).toContain('Cursor River')
+    expect(body).toContain(AGENT_A)
+    expect(body).toContain('Ghost Agent')
+    expect(body).toContain(AGENT_B)
+  })
+
+  it('POST /enroll/mint succeeds for an agent OUTSIDE any squad this principal has a grant row on', async () => {
+    harness = makeHarness()
+    const sessions = statefulSessions({ 'sess:s-boss': sessionRecord(BOOTSTRAP_OWNER_EMAIL, 'owner') })
+    const env = envFor(harness, {}, sessions.kv)
+    const before = harness.sqlite
+      .prepare(`SELECT COUNT(*) AS n FROM member_tokens WHERE agent_id = ?`)
+      .get(AGENT_B) as { n: number }
+
+    const res = await dashboardApp.fetch(
+      dashboardPost('/enroll/mint', 's-boss', { agent_id: AGENT_B, seat: 'owner-seat' }),
+      env,
+    )
+    expect(res.status).toBe(200)
+    const body = await res.text()
+    expect(body).toContain('x-mupot-seat')
+    expect(body).toContain('owner-seat')
+    expect(body).toMatch(/mupot_[0-9a-f]{64}/)
+
+    const after = harness.sqlite
+      .prepare(`SELECT COUNT(*) AS n FROM member_tokens WHERE agent_id = ?`)
+      .get(AGENT_B) as { n: number }
+    expect(after.n).toBe(before.n + 1)
+
+    // No members row for this principal → mintAgentBoundToken is called
+    // WITHOUT issuedBy (matching the sibling /admin/agent-token/mint route,
+    // which never attaches it either) — an empty trail, not a fabricated one.
+    const auditRows = harness.sqlite
+      .prepare(`SELECT COUNT(*) AS n FROM agent_token_issuance_audit`)
+      .get() as { n: number }
+    expect(auditRows.n).toBe(0)
+  })
+
+  it('does NOT admit a plain member with no org role and no grants — the widen is isOrgAdmin-only', async () => {
+    harness = makeHarness()
+    // A brand-new Google login: role 'member', no members row, no grants at all.
+    const env = envFor(harness, { 'sess:s-nobody': sessionRecord('nobody@pot.test') })
+    const res = await dashboardApp.fetch(
+      dashboardPost('/enroll/mint', 's-nobody', { agent_id: AGENT_A, seat: 'nobody-seat' }),
+      env,
+    )
+    expect(res.status).toBe(403)
+    const body = await res.text()
+    expect(body).toMatch(/Not allowed|requires owner or admin|forbidden|operator principal|No member identity resolved/i)
+    expect(body).not.toMatch(/mupot_[0-9a-f]{64}/)
+    const minted = harness.sqlite
+      .prepare(`SELECT id FROM member_tokens WHERE label = ?`)
+      .get('nobody-seat')
+    expect(minted).toBeUndefined()
+  })
+
+  it('cross-tenant: the same owner email session scoped to a DIFFERENT tenant sees nothing from pot-a', async () => {
+    harness = makeHarness()
+    const env = {
+      ...envFor(harness, { 'sess:s-boss': sessionRecord(BOOTSTRAP_OWNER_EMAIL, 'owner') }),
+      TENANT_SLUG: 'other-pot',
+    } as Env
+    const res = await dashboardApp.fetch(dashboardReq('/enroll?seat=owner-laptop', 's-boss'), env)
+    expect(res.status).toBe(200)
+    const body = await res.text()
+    expect(body).not.toContain('Cursor River')
+    expect(body).not.toContain(AGENT_A)
+    expect(body).not.toContain('Ghost Agent')
+    expect(body).not.toContain(AGENT_B)
+  })
+})
+
+// ── mupot#1335 (surfaced by #1324's adversarial gate) — authorizeEnrollMint's
+// grants source, enroll.ts:154 ───────────────────────────────────────────────
+//
+// The instructed fix is narrow: point authorizeEnrollMint's FALLBACK grants
+// lookup at resolveHumanStandingGrants (status-gated) instead of the raw
+// resolveCapabilities — WITHOUT touching resolveHumanMemberId's own step-2 gap
+// (that gap is #1335's separate fix, tracked there).
+//
+// IMPORTANT, and worth being honest about in the PR rather than papering over
+// with a lenient assertion: this closes the gap only on the branch where
+// `auth.capabilities` is undefined (memberId set directly, no ambient
+// capabilities already attached). On the LIVE dashboard cookie path, a
+// role==='member' session gets `auth.capabilities` populated by
+// loadAuthFromCookie's OWN email→member bridge (src/auth/index.ts) BEFORE
+// authorizeEnrollMint ever runs — and that bridge calls the raw
+// resolveCapabilities with no status check of its own. Since
+// `auth.capabilities ?? (...)` short-circuits on a defined (even empty) array,
+// a suspended member logging in fresh through that bridge is NOT closed by
+// this PR's change; closing THAT would mean editing loadAuthFromCookie, which
+// is its own surface change outside enroll.ts. Flagged for Kasra-core: if the
+// intent was to close the live cookie path too, this PR does not fully do it,
+// and that decision needs a human call, not a silent narrower test.
+describe('authorizeEnrollMint — suspended-member grants source (mupot#1335, enroll.ts:154)', () => {
+  let harness: SqliteD1Harness | undefined
+  afterEach(() => {
+    harness?.close()
+    harness = undefined
+  })
+
+  const SUSPENDED_MEMBER = 'member-suspended'
+
+  it('refuses (squad_admin_required) when the resolved memberId points at a suspended members row', async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status, tenant)
+        VALUES ('${SUSPENDED_MEMBER}', 'susp@pot.test', 'Suspended', 'suspended', '${TENANT}');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES ('cap-susp-a', '${SUSPENDED_MEMBER}', 'squad', '${SQUAD_A}', 'admin');
+    `)
+    const env = envFor(harness)
+    // auth.memberId set directly (bearer/memberId-resolved shape) and
+    // auth.capabilities left undefined, so authorizeEnrollMint's fallback
+    // (enroll.ts:154) is the branch actually exercised — the raw
+    // resolveCapabilities would see the live capability row and admit this;
+    // resolveHumanStandingGrants must not.
+    const auth = {
+      userId: 'u-susp',
+      email: 'susp@pot.test',
+      role: 'member' as const,
+      tenant: TENANT,
+      memberId: SUSPENDED_MEMBER,
+    }
+    const result = await authorizeEnrollMint(env, auth, SQUAD_A)
+    expect(result).toEqual({ ok: false, reason: 'squad_admin_required' })
+  })
+
+  it('control: the SAME memberId + grant, status active, is admitted', async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status, tenant)
+        VALUES ('${SUSPENDED_MEMBER}', 'susp@pot.test', 'Formerly suspended', 'active', '${TENANT}');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES ('cap-susp-a', '${SUSPENDED_MEMBER}', 'squad', '${SQUAD_A}', 'admin');
+    `)
+    const env = envFor(harness)
+    const auth = {
+      userId: 'u-susp',
+      email: 'susp@pot.test',
+      role: 'member' as const,
+      tenant: TENANT,
+      memberId: SUSPENDED_MEMBER,
+    }
+    const result = await authorizeEnrollMint(env, auth, SQUAD_A)
+    expect(result).toEqual({ ok: true })
   })
 })

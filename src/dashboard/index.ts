@@ -2117,13 +2117,19 @@ dashboardApp.post('/enroll/mint', async (c) => {
   // budget on purpose — a loop hammering this form with a bad agent id is the
   // shape worth braking, and it would otherwise cost nothing.
   const actorMemberId = await resolveEnrollMemberId(c.env, auth)
-  if (!actorMemberId) {
+  // Bootstrap-owner shape (mupot#1324): isOrgAdmin can be true with no
+  // `members` row at all, so actorMemberId is legitimately null here. The
+  // throttle still needs SOME per-principal key — auth.userId (the web
+  // login's own id, always present) stands in, namespaced so it can never
+  // collide with a real member id.
+  const throttleKey = actorMemberId ?? (!auth.boundAgentId && isOrgAdmin(auth) ? `org-admin:${auth.userId}` : null)
+  if (!throttleKey) {
     return c.html(
       shell(c.env, 'Enroll seat', errorBody('No member identity resolved for this session.')),
       403,
     )
   }
-  const throttle = await checkEnrollMintRateLimit(c.env, actorMemberId)
+  const throttle = await checkEnrollMintRateLimit(c.env, throttleKey)
   if (!throttle.allowed) {
     const body = throttle.reason === 'unavailable'
       ? enrollUnavailableBody(throttle.retryAfter)
@@ -2179,14 +2185,21 @@ dashboardApp.post('/enroll/mint', async (c) => {
   }
 
   // issuedBy puts the issuance row in the same batch as the token (0139), so
-  // this page cannot hand out a credential nobody can attribute.
-  const minted = await mintAgentBoundToken(c.env, agent, seat, {
-    issuedBy: {
-      memberId: actorMemberId,
-      principal: (auth.email && auth.email.trim().length > 0) ? auth.email.trim() : actorMemberId,
-      surface: 'enroll',
-    },
-  })
+  // this page cannot hand out a credential nobody can attribute. Omitted (not
+  // faked) when actorMemberId is null — the bootstrap-owner-without-a-
+  // members-row shape — matching the sibling /admin/agent-token/mint route,
+  // which never attaches issuedBy at all. agent_token_issuance_audit.member_id
+  // has no NULL-safe value to put here; leaving the trail empty is the
+  // pre-0139 behaviour verbatim, not a hidden mint.
+  const minted = await mintAgentBoundToken(c.env, agent, seat, actorMemberId
+    ? {
+        issuedBy: {
+          memberId: actorMemberId,
+          principal: (auth.email && auth.email.trim().length > 0) ? auth.email.trim() : actorMemberId,
+          surface: 'enroll',
+        },
+      }
+    : {})
   const squadRow = await c.env.DB.prepare('SELECT name FROM squads WHERE id = ?1 LIMIT 1')
     .bind(agent.squad_id)
     .first<{ name: string }>()
