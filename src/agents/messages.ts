@@ -1524,6 +1524,32 @@ async function guestVisibilityFenceIsCurrent(
 // visibility gating (e.g. rate-limit charge keys) only, never a substitute for the real send.
 // sendToRef consumes this decision and carries any matched guest grant into the atomic message
 // INSERT, so a membership/grant removed after preflight cannot authorize the write.
+type SendAgentRow = { id: string; squad_id: string; slug: string; name: string }
+
+async function agentsNamed(env: Env, name: string): Promise<SendAgentRow[]> {
+  const rows = await env.DB.prepare(
+    `SELECT id, squad_id, slug, name FROM agents
+      WHERE lower(name) = lower(?1) AND status != 'inactive'`,
+  ).bind(name).all<SendAgentRow>()
+  return rows.results ?? []
+}
+
+async function visibleNamedAgents(
+  env: Env,
+  name: string,
+  authz: SendTargetAuthz,
+  memberId: string,
+): Promise<Array<SendAgentRow & { guestFence?: GuestVisibilityFence }>> {
+  const named = await agentsNamed(env, name)
+  if (authz.isAdmin) return named
+  const visible: Array<SendAgentRow & { guestFence?: GuestVisibilityFence }> = []
+  for (const candidate of named) {
+    const visibility = await recipientVisibilityOnSenderSquads(env, memberId, authz.grants, candidate)
+    if (visibility.visible) visible.push({ ...candidate, guestFence: visibility.guestFence })
+  }
+  return visible
+}
+
 export async function resolveVisibleSendTarget(
   env: Env,
   toRef: string,
@@ -1534,8 +1560,16 @@ export async function resolveVisibleSendTarget(
 > {
   const resolved = await resolveAgentRef(env, toRef)
   if (!resolved.ok) {
-    if (!authz.isAdmin) return { ok: false, reason: 'send_target_not_visible' }
-    return { ok: false, reason: resolved.reason === 'ambiguous' ? 'recipient_ambiguous' : 'recipient_not_found' }
+    const memberIds = [...new Set(authz.grants.map((grant) => grant.member_id).filter(Boolean))]
+    if (!authz.isAdmin) {
+      if (memberIds.length !== 1) return { ok: false, reason: 'send_target_not_visible' }
+      const visible = await visibleNamedAgents(env, toRef, authz, memberIds[0])
+      if (visible.length === 1) return { ok: true, value: visible[0] }
+      return { ok: false, reason: 'send_target_not_visible' }
+    }
+    const named = await agentsNamed(env, toRef)
+    if (named.length === 1) return { ok: true, value: named[0] }
+    return { ok: false, reason: named.length > 1 ? 'recipient_ambiguous' : 'recipient_not_found' }
   }
   if (authz.isAdmin) return { ok: true, value: resolved.value }
   const memberIds = [...new Set(authz.grants.map((grant) => grant.member_id).filter(Boolean))]
@@ -1566,10 +1600,19 @@ export async function sendToRef(
   authz: SendTargetAuthz,
   opts: Opts = {},
 ): Promise<SendToRefResult> {
-  const resolved = await resolveAgentRef(env, input.toRef)
+  let resolved = await resolveAgentRef(env, input.toRef)
   if (!resolved.ok) {
-    if (!authz.isAdmin) return { ok: false, reason: 'send_target_not_visible' }
-    return { ok: false, reason: resolved.reason === 'ambiguous' ? 'recipient_ambiguous' : 'recipient_not_found' }
+    if (!authz.isAdmin && authz.grants.some((grant) => grant.member_id !== input.fromMember)) {
+      return { ok: false, reason: 'send_target_not_visible' }
+    }
+    const visible = await visibleNamedAgents(env, input.toRef, authz, input.fromMember)
+    if (visible.length === 1) {
+      resolved = { ok: true, value: visible[0] }
+    } else if (authz.isAdmin) {
+      return { ok: false, reason: visible.length > 1 ? 'recipient_ambiguous' : 'recipient_not_found' }
+    } else {
+      return { ok: false, reason: 'send_target_not_visible' }
+    }
   }
 
   // squadVisible stays `true` for admins (case (a) is never consulted, so it must never gate

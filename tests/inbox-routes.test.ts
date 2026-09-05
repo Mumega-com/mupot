@@ -134,6 +134,10 @@ function makeDb(
       const [ref] = b as [string]
       return agents.filter((a) => a.slug === ref)
     }
+    if (sql.includes('WHERE lower(name) = lower(?1)')) {
+      const [ref] = b as [string]
+      return agents.filter((a) => a.name.toLowerCase() === String(ref).toLowerCase())
+    }
     if (sql.includes('SELECT squad_id FROM memberships WHERE agent_id = ?1')) {
       return []
     }

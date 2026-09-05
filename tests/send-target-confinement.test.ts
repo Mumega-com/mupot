@@ -480,6 +480,82 @@ describe('sendToRef — gate 1 send-target confinement (#392)', () => {
     }
   })
 
+  it('display name unique among the sender\'s visible agents resolves the same as id or slug', async () => {
+    const { db, close } = migratedDb()
+    try {
+      const byId = await sendToRef(envWith(db), { ...baseInput, toRef: 'agent-target' }, NON_ADMIN(grant('squad-target')))
+      const bySlug = await sendToRef(envWith(db), { ...baseInput, toRef: 'target' }, NON_ADMIN(grant('squad-target')))
+      const byName = await sendToRef(envWith(db), { ...baseInput, toRef: 'Target' }, NON_ADMIN(grant('squad-target')))
+      const byNameCase = await sendToRef(envWith(db), { ...baseInput, toRef: 'target' }, NON_ADMIN(grant('squad-target')))
+      expect(byId).toMatchObject({ ok: true, toAgent: 'agent-target' })
+      expect(bySlug).toMatchObject({ ok: true, toAgent: 'agent-target' })
+      expect(byName).toMatchObject({ ok: true, toAgent: 'agent-target' })
+      // slug 'target' already works; mixed-case display name is the agent copy-paste case
+      expect(byNameCase).toMatchObject({ ok: true, toAgent: 'agent-target' })
+    } finally {
+      close()
+    }
+  })
+
+  it('mixed-case display name of a visible agent is addressable (Kasra / Athena copy-paste)', async () => {
+    const { db, close } = migratedDb()
+    try {
+      const res = await sendToRef(envWith(db), { ...baseInput, toRef: 'TARGET' }, NON_ADMIN(grant('squad-target')))
+      expect(res).toMatchObject({ ok: true, toAgent: 'agent-target' })
+    } finally {
+      close()
+    }
+  })
+
+  it('a visible-name send and a missing-name send are distinguishable ONLY by success — failures collapse', async () => {
+    const { db, close } = migratedDb()
+    try {
+      const missing = await sendToRef(envWith(db), { ...baseInput, toRef: 'No Such Person' }, NON_ADMIN(grant('squad-target')))
+      const invisible = await sendToRef(envWith(db), { ...baseInput, toRef: 'Outside' }, NON_ADMIN(grant('squad-target')))
+      expect(missing).toEqual({ ok: false, reason: 'send_target_not_visible' })
+      expect(invisible).toEqual({ ok: false, reason: 'send_target_not_visible' })
+      expect(missing).toEqual(invisible)
+    } finally {
+      close()
+    }
+  })
+
+  it('two visible agents sharing a display name collapse to send_target_not_visible (no arbitrary pick)', async () => {
+    const { db, close, sqlite } = migratedDb()
+    try {
+      sqlite.exec(`
+        INSERT INTO agents (id, squad_id, slug, name) VALUES
+          ('agent-twin-a', 'squad-target', 'twin-a', 'Twin'),
+          ('agent-twin-b', 'squad-target', 'twin-b', 'Twin');
+        INSERT INTO memberships (id, agent_id, squad_id, capability) VALUES
+          ('membership-twin-a', 'agent-twin-a', 'squad-target', 'member'),
+          ('membership-twin-b', 'agent-twin-b', 'squad-target', 'member');
+      `)
+      const res = await sendToRef(envWith(db), { ...baseInput, toRef: 'Twin' }, NON_ADMIN(grant('squad-target')))
+      expect(res).toEqual({ ok: false, reason: 'send_target_not_visible' })
+    } finally {
+      close()
+    }
+  })
+
+  it('one visible and one invisible agent sharing a display name addresses the visible one only', async () => {
+    const { db, close, sqlite } = migratedDb()
+    try {
+      sqlite.exec(`
+        INSERT INTO agents (id, squad_id, slug, name) VALUES
+          ('agent-twin-visible', 'squad-target', 'twin-visible', 'Twin'),
+          ('agent-twin-hidden', 'squad-other', 'twin-hidden', 'Twin');
+        INSERT INTO memberships (id, agent_id, squad_id, capability) VALUES
+          ('membership-twin-visible', 'agent-twin-visible', 'squad-target', 'member'),
+          ('membership-twin-hidden', 'agent-twin-hidden', 'squad-other', 'member');
+      `)
+      const res = await sendToRef(envWith(db), { ...baseInput, toRef: 'Twin' }, NON_ADMIN(grant('squad-target')))
+      expect(res).toMatchObject({ ok: true, toAgent: 'agent-twin-visible' })
+    } finally {
+      close()
+    }
+  })
+
   it('a real capabilities-table row (not a hand-built grant array) is honored end-to-end', async () => {
     const { db, sqlite, close } = migratedDb()
     try {

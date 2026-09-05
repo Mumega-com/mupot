@@ -175,6 +175,10 @@ function makeDb(
       const [ref] = b as [string]
       return agents.filter((a) => a.slug === ref)
     }
+    if (sql.includes('WHERE lower(name) = lower(?1)')) {
+      const [ref] = b as [string]
+      return agents.filter((a) => a.name.toLowerCase() === String(ref).toLowerCase())
+    }
     throw new Error('unhandled all sql: ' + sql)
   }
 

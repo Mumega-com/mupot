@@ -3115,7 +3115,7 @@ const toolSend: ToolSpec = {
   name: 'send',
   scope: 'agent→agent (this pot); sender must be agent-bound',
   min: 'authenticated',
-  args: '{ to: string (agent id or unique slug), body: string, kind?: "message"|"request"|"ack", request_id?: string, in_reply_to?: string, project_id?: string, seat?: string }',
+  args: '{ to: string (agent id, unique slug, or display name unique among agents you can already see — not a harness seat label), body: string, kind?: "message"|"request"|"ack", request_id?: string, in_reply_to?: string, project_id?: string, seat?: string }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -4789,6 +4789,14 @@ function rpcResult(id: unknown, result: unknown): Response {
   })
 }
 
+/** JSON-RPC code for a finished tool failure. -32602 is Invalid params — never use it
+ *  for application refusals such as send_target_not_visible (HTTP 404). Harnesses treat
+ *  -32602 as a schema error and retry the call shape instead of resolving the target. */
+export function jsonRpcCodeForToolFailure(status: number, error: string): number {
+  if (error === 'send_target_not_visible') return -32000
+  return status === 404 ? -32602 : -32000
+}
+
 function rpcError(id: unknown, code: number, message: string, data?: unknown, status = 200): Response {
   return new Response(JSON.stringify({ jsonrpc: '2.0', id: id ?? null, error: { code, message, data } }), {
     status,
@@ -4997,7 +5005,7 @@ async function handleJsonRpc(c: import('hono').Context<AppEnv>, body: JsonRpcReq
 
     return rpcError(
       id,
-      outcome.status === 404 ? -32602 : -32000,
+      jsonRpcCodeForToolFailure(outcome.status, outcome.error),
       outcome.error,
       outcome.detail,
       outcome.status,

@@ -123,8 +123,8 @@ describe('renderBrief', () => {
     agent: { id: 'a1', slug: 'writer', name: 'Scribe', role: 'writer', status: 'active', okr: 'Publish weekly', kpi_target: '4 posts/mo', kpi_progress: 50, effort: 'standard', autonomy: 'draft', budget_cap_cents: 500, budget_window: 'week' },
     department: { id: 'd1', name: 'Marketing' },
     squad: { id: 's1', name: 'Content', charter: 'Own the blog', okr: null },
-    supervisor: { agent_id: 'lead1', name: 'Editor', role: 'lead', capability: 'lead' },
-    squadmates: [{ agent_id: 'a2', name: 'Illustrator', role: 'design', capability: 'member' }],
+    supervisor: { agent_id: 'lead1', slug: 'editor', name: 'Editor', role: 'lead', capability: 'lead' },
+    squadmates: [{ agent_id: 'a2', slug: 'illustrator', name: 'Illustrator', role: 'design', capability: 'member' }],
     tasks: [{ id: 't1', title: 'Draft launch post', status: 'open' }],
     capability: 'observer+',
     mcpEndpoint: 'https://agents.digid.ca/mcp',
@@ -135,12 +135,14 @@ describe('renderBrief', () => {
   it('is directive: names supervisor, exact scope, exact tasks, autonomy bound', () => {
     const b = renderBrief(base)
     expect(b).toMatch(/first induction/i)
-    expect(b).toContain('Editor (lead)')
+    expect(b).toContain('Editor (@editor) (lead)')
     expect(b).toContain('Draft launch post')
     expect(b).toMatch(/may NOT ship/) // draft autonomy directive
     expect(b).toContain('Coherence: 82%')
     expect(b).toContain('regime flow')
     expect(b).toContain('agents.digid.ca/mcp')
+    expect(b).toContain('Editor (@editor)')
+    expect(b).toContain('Illustrator (@illustrator)')
   })
 
   it('top-of-squad agent → escalate-above-squad line', () => {
