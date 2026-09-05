@@ -809,7 +809,11 @@ describe('authorizeEnrollMint — suspended-member grants source (mupot#1335, en
 
   const SUSPENDED_MEMBER = 'member-suspended'
 
-  it('refuses (squad_admin_required) when the resolved memberId points at a suspended members row', async () => {
+  // Reason changed from squad_admin_required to principal_revoked (gate 6). The old code
+  // sent a revoked principal to a page telling the operator to grant squad admin — which
+  // hands admin to a suspended account, still 403s on reload, and escalates. A revoked
+  // human and an under-privileged one are different refusals.
+  it('refuses (principal_revoked) when the resolved memberId points at a suspended members row', async () => {
     harness = makeHarness()
     harness.sqlite.exec(`
       INSERT INTO members (id, email, display_name, status, tenant)
@@ -831,7 +835,7 @@ describe('authorizeEnrollMint — suspended-member grants source (mupot#1335, en
       memberId: SUSPENDED_MEMBER,
     }
     const result = await authorizeEnrollMint(env, auth, SQUAD_A)
-    expect(result).toEqual({ ok: false, reason: 'squad_admin_required' })
+    expect(result).toEqual({ ok: false, reason: 'principal_revoked' })
   })
 
   it('control: the SAME memberId + grant, status active, is admitted', async () => {
