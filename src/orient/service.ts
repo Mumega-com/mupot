@@ -263,7 +263,7 @@ export async function buildOrient(
   const matesRes = await env.DB.prepare(
     `SELECT a.id AS agent_id, a.slug AS slug, a.name AS name, a.role AS role, m.capability AS capability
        FROM memberships m JOIN agents a ON a.id = m.agent_id
-      WHERE m.squad_id = ?1`,
+      WHERE m.squad_id = ?1 AND a.status != 'inactive'`,
   )
     .bind(agent.squad_id)
     .all<SquadMember>()
