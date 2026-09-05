@@ -670,6 +670,28 @@ describe('GET /api/inbox/stream', () => {
     expect(res.status).toBe(403)
     expect(await res.json()).toMatchObject({ error: 'seat_mismatch' })
   })
+  it('no ?seat on the stream route still emits its own seat mail plus broadcasts', async () => {
+    // mupot#1325 P1: streamInboxEvents(...) is called with `seat` from resolveInboxSeatArg —
+    // the GET / route was proven to default an omitted ?seat to the token's OWN bound seat
+    // (see 'no ?seat on a seat-bound token still returns its own seat mail plus broadcasts'
+    // above); the mutation `seat,` -> `seat: c.req.query('seat'),` at the streamInboxEvents(...)
+    // call site here leaves the 403/seat_mismatch refusal above untouched (both branches still
+    // read the query string in that path) and only breaks this no-?seat case, where a
+    // seat-bound token's own mail would silently vanish from the initial flush.
+    const { env: e, db } = env(AGENTS)
+    db._messages.push({ seq: 1, id: 'a', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm-rev', kind: 'request', body: 'broadcast', request_id: null, in_reply_to: null, created_at: 't0', read_at: null, target_seat: null })
+    db._messages.push({ seq: 2, id: 'b', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm-rev', kind: 'request', body: 'for cli', request_id: null, in_reply_to: null, created_at: 't0', read_at: null, target_seat: 'hadi-codex-cli' })
+    db._messages.push({ seq: 3, id: 'c', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm-rev', kind: 'request', body: 'for mac', request_id: null, in_reply_to: null, created_at: 't0', read_at: null, target_seat: 'hadi-codex-mac' })
+    const res = await inboxApp.fetch(getReq('tok-code-cli', 'stream'), e)
+    expect(res.status).toBe(200)
+    const reader = res.body!.getReader()
+    const { value } = await reader.read()
+    const text = new TextDecoder().decode(value)
+    await reader.cancel()
+    const event = JSON.parse(text.slice(5))
+    expect(event.type).toBe('initial')
+    expect(event.messages.map((m: { body: string }) => m.body).sort()).toEqual(['broadcast', 'for cli'])
+  })
   it('since=N skips already-seen messages in the initial flush', async () => {
     const { env: e, db } = env(AGENTS)
     db._messages.push({ seq: 1, id: 'a', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm-rev', kind: 'message', body: 'old', request_id: null, in_reply_to: null, created_at: 't0', read_at: null })
