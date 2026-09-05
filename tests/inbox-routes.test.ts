@@ -329,8 +329,33 @@ describe('GET /api/inbox', () => {
     db._messages.push({ seq: 2, id: 'b', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm', kind: 'request', body: 'for mac', request_id: null, in_reply_to: null, created_at: 't0', read_at: null, target_seat: 'hadi-codex-mac' })
     const res = await inboxApp.fetch(getReq('tok-code'), e)
     expect(res.status).toBe(200)
-    const j = (await res.json()) as { messages: Array<{ body: string }> }
+    const j = (await res.json()) as { messages: Array<{ body: string }>; remaining: number; complete: boolean }
     expect(j.messages.map((m) => m.body)).toEqual(['broadcast'])
+    expect(db._messages.find((m) => m.id === 'b')?.read_at).toBeNull()
+    // remaining/complete are computed by the SAME default-branch seatSql (messages.ts:801) —
+    // if it fails open, the seat-tagged row leaks into the caller's own "how much is left"
+    // count as if it were the caller's, not just into the returned page.
+    expect(j.remaining).toBe(0)
+    expect(j.complete).toBe(true)
+  })
+  it('PEEK (mupot#1325 P2) on an UNSCOPED token (no seat label) stays broadcast-only — seat-tagged mail is invisible on the peek path too', async () => {
+    // messages.ts:696 — the bearer PEEK default branch. This is the branch the SSE stream
+    // actually rides (streamInboxEvents always peeks). Proven live on real D1 in the PR
+    // brief: mutating this branch's `AND target_seat IS NULL` to `''` let an unlabelled
+    // token's `GET /api/inbox?peek=1` see another seat's SECRET mail. The existing consuming
+    // (no-peek) unscoped test above exercises messages.ts:734, a SEPARATE branch — it does
+    // NOT exercise this one.
+    const { env: e, db } = env(AGENTS)
+    db._messages.push({ seq: 1, id: 'a', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm', kind: 'request', body: 'broadcast', request_id: null, in_reply_to: null, created_at: 't0', read_at: null, target_seat: null })
+    db._messages.push({ seq: 2, id: 'b', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm', kind: 'request', body: 'SECRET for cli', request_id: null, in_reply_to: null, created_at: 't0', read_at: null, target_seat: 'hadi-codex-cli' })
+    const res = await inboxApp.fetch(getReq('tok-code', '?peek=1'), e)
+    expect(res.status).toBe(200)
+    const j = (await res.json()) as { messages: Array<{ body: string }>; consumed: boolean; remaining: number; complete: boolean }
+    expect(j.messages.map((m) => m.body)).toEqual(['broadcast'])
+    expect(j.consumed).toBe(false)
+    expect(j.remaining).toBe(0)
+    expect(j.complete).toBe(true)
+    // nothing was consumed by the peek, either way — confirm the seat-tagged row is untouched.
     expect(db._messages.find((m) => m.id === 'b')?.read_at).toBeNull()
   })
   it('peek=1 does not consume', async () => {
@@ -591,6 +616,40 @@ describe('POST /api/inbox/signed', () => {
     const { kp } = await genKey()
     const { env: e } = env(AGENTS)
     expect((await postSigned(await signedInboxBody(kp.privateKey, 'ag-code'), e)).status).toBe(401)
+  })
+
+  it('mupot#1325 P2: signed reads never carry a seat — the default branch (messages.ts:681/715/770) is the ONLY live branch for every signed keyed agent, and it must stay broadcast-only', async () => {
+    // readVerifiedSignedAgentInbox's input type has no `seat` field and its only caller
+    // (fleet/signed-inbox.ts) never supplies one — so targetSeat is unconditionally null on
+    // every signed read, meaning the default `AND target_seat IS NULL` branch is not a rare
+    // corner here, it is the entire live surface. A fail-open mutation on it would let any
+    // signed keyed agent read every seat-tagged row addressed to it.
+    const { kp, pubX } = await genKey()
+    const { env: e, db } = env(
+      AGENTS,
+      { 't:ag-code': { pubkey: pubX, algo: 'Ed25519', member_id: 'm-code' } },
+      {},
+      new Set(['ag-code']),
+    )
+    db._messages.push({ seq: 1, id: 'x', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm', kind: 'message', body: 'broadcast', request_id: null, in_reply_to: null, created_at: 't0', read_at: null, target_seat: null })
+    db._messages.push({ seq: 2, id: 'y', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm', kind: 'message', body: 'SECRET for cli', request_id: null, in_reply_to: null, created_at: 't0', read_at: null, target_seat: 'hadi-codex-cli' })
+
+    const peekRes = await postSigned(await signedInboxBody(kp.privateKey, 'ag-code', { peek: true, limit: 10 }), e)
+    expect(peekRes.status).toBe(200)
+    const peek = (await peekRes.json()) as { messages: Array<{ body: string }>; remaining: number; complete: boolean }
+    expect(peek.messages.map((m) => m.body)).toEqual(['broadcast'])
+    expect(peek.remaining).toBe(0)
+    expect(peek.complete).toBe(true)
+    expect(db._messages.find((m) => m.id === 'y')?.read_at).toBeNull()
+
+    const consumeRes = await postSigned(await signedInboxBody(kp.privateKey, 'ag-code', { peek: false, limit: 10 }), e)
+    expect(consumeRes.status).toBe(200)
+    const consumed = (await consumeRes.json()) as { messages: Array<{ body: string }>; remaining: number; complete: boolean }
+    expect(consumed.messages.map((m) => m.body)).toEqual(['broadcast'])
+    expect(consumed.remaining).toBe(0)
+    expect(consumed.complete).toBe(true)
+    // the seat-tagged row must remain untouched by the consuming UPDATE.
+    expect(db._messages.find((m) => m.id === 'y')?.read_at).toBeNull()
   })
 
   it('unbound or disabled keys cannot read a signed inbox', async () => {
