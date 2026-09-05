@@ -156,3 +156,72 @@ export async function resolveSoleGateOwnerAgent(env: Env, gateOwner: string): Pr
   const results = rows.results ?? []
   return results.length === 1 ? results[0].principal_id : null
 }
+
+// ── mupot#1080 — the write path's own liveness check ──────────────────────────
+//
+// callerHoldsGateCapability (src/tasks/index.ts) previously ran a bare
+// `SELECT 1 FROM gate_grants WHERE capability=... AND principal_type=... AND
+// principal_id=...` existence check — it never asked whether the principal
+// BEHIND the grant row was still active. Consequence: suspending a member or
+// pausing an agent did not revoke their gate-verdict authority as long as the
+// gate_grants row itself survived (grants are revoked by a separate, explicit
+// admin action — src/gates/grants.ts revokeGateCapability — not by member/agent
+// status changes).
+//
+// hasActiveGateGrant is that missing join, and it is now the ONE place either
+// side of the read/write seam evaluates "does this grant currently authorize
+// its holder" — the write path (callerHoldsGateCapability) and any future
+// read-side accounting both call this rather than re-deriving their own
+// existence query, which is exactly how the read side (a resolveGateOwner-
+// shaped resolver) and the write side drifted apart in the first place
+// (mupot#1080/#1081 post-mortem: "read/write predicate drift is the root
+// cause, not either implementation").
+//
+// agents.status CHECK is ('active','paused','inactive') — CORRECTED
+// (mupot#1319 gate WARN-1: this previously said ('active','paused'),
+// stale since migrations/0049_agent_status_inactive.sql widened the enum to
+// add 'inactive' for a dead/retired identity, distinct from 'paused' — a
+// temporary rest. The CODE was always correct regardless: `a.status =
+// 'active'` fails closed on ANY non-active value, 'paused' and 'inactive'
+// alike; only this comment's enumeration was wrong). members.status CHECK is
+// ('active','suspended') — two different vocabularies, so this cannot be one
+// shared column name across a UNION; principalType selects the join target.
+//
+// OPERATOR-VISIBLE BEHAVIOUR CHANGE (this IS #1080's intended fix, not a
+// side effect, but nothing warns at the toggle site that revokes it):
+// PAUSING an agent — a trivially reversible dashboard toggle, and 0049
+// documents 'paused' as temporary rest, not retirement — now SILENTLY
+// revokes that agent's gate-verdict authority for as long as it stays
+// paused, even though its gate_grants row is untouched. Before this fix a
+// paused agent's stale grant still worked; that was #1080's whole finding.
+// An operator pausing an agent for an unrelated reason (cost, a bug, a
+// vacation) may not expect that click to ALSO strip its verdict authority —
+// it does, immediately and reversibly (resume by un-pausing).
+export async function hasActiveGateGrant(
+  env: Env,
+  capability: string,
+  principalType: GatePrincipalType,
+  principalId: string,
+): Promise<boolean> {
+  const row =
+    principalType === 'agent'
+      ? await env.DB.prepare(
+          `SELECT 1 FROM gate_grants g
+             JOIN agents a ON a.id = g.principal_id
+            WHERE g.capability = ?1 AND g.principal_type = 'agent' AND g.principal_id = ?2
+              AND a.status = 'active'
+            LIMIT 1`,
+        )
+          .bind(capability, principalId)
+          .first<{ 1: number }>()
+      : await env.DB.prepare(
+          `SELECT 1 FROM gate_grants g
+             JOIN members m ON m.id = g.principal_id
+            WHERE g.capability = ?1 AND g.principal_type = 'member' AND g.principal_id = ?2
+              AND m.status = 'active'
+            LIMIT 1`,
+        )
+          .bind(capability, principalId)
+          .first<{ 1: number }>()
+  return row !== null
+}

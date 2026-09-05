@@ -34,10 +34,12 @@ import type {
   Agent,
   Squad,
   Task,
+  AuthContext,
 } from '../types'
 import { resolveCapabilities, hasCapability } from '../auth/capability'
 import { createBus } from '../bus'
 import { createTask, writeVerdict, VerdictRaceError, TaskEvidenceFenceError } from '../tasks/service'
+import { evaluateVerdictGates } from '../tasks/index'
 import { emitControlRequest } from '../fleet/control'
 import { CONTROL_VERBS, type ControlVerb } from '../fleet/control-request'
 import { listFleetAgentRuntimeView, type FleetAgentRuntimeView } from '../fleet/registry'
@@ -471,26 +473,14 @@ function canBypassApprovalGate(grants: CapabilityGrant[]): boolean {
   return hasCapability(grants, 'org', null, 'admin')
 }
 
-async function memberHasGateGrant(env: Env, memberId: string, capability: string): Promise<boolean> {
-  const row = await env.DB.prepare(
-    `SELECT 1 FROM gate_grants
-      WHERE capability = ?1 AND principal_type = 'member' AND principal_id = ?2
-      LIMIT 1`,
-  )
-    .bind(capability, memberId)
-    .first<{ 1: number }>()
-  return row !== null
-}
-
-async function memberHasSurfaceGrant(
-  env: Env,
-  member: Member,
-  grants: CapabilityGrant[],
-  surface: string,
-): Promise<boolean> {
-  if (canBypassApprovalGate(grants)) return true
-  return memberHasGateGrant(env, member.id, surface)
-}
+// mupot#1080/#1081 (2026-09-04): memberHasGateGrant and memberHasSurfaceGrant
+// used to live here as verdictReply's own hand-rolled gate-ownership +
+// surface-cap checks (bare gate_grants existence, no liveness join, no
+// gate:agent-self-completion special case). Removed — verdictReply now calls
+// the shared evaluateVerdictGates (src/tasks/index.ts), which covers both
+// (via callerHoldsGateCapability, now liveness-joined, and hasSurfaceCap)
+// plus the special case these two never had. See verdictReply's own comment
+// for the exploit this closed.
 
 async function memberOwnsAssigneeAgent(
   env: Env,
@@ -557,20 +547,104 @@ async function verdictReply(
   if (!task.gate_owner) return `"${task.title}" has no approval gate.`
   if (task.status !== 'review') return `"${task.title}" is ${task.status}, not waiting for approval.`
 
-  const hasGate =
-    canBypassApprovalGate(grants) || (await memberHasGateGrant(env, member.id, task.gate_owner))
-  if (!hasGate) {
-    return `You don't have permission to decide "${task.title}" (need ${task.gate_owner}).`
+  // mupot#1080/#1081 (2026-09-04): verdictReply is the THIRD write path onto
+  // writeVerdict (HTTP POST /:id/verdict, MCP task_verdict, this one), and
+  // until this fix it was the only one NOT routed through the shared
+  // evaluateVerdictGates predicate. It hand-rolled its own gate-ownership +
+  // surface-cap logic, which — unlike the HTTP/MCP routes — had NO special
+  // case at all for gate:agent-self-completion (BLOCK-1, kasra-review
+  // 2026-08-13: closeable ONLY by the completing agent or org owner/admin,
+  // the grant is NOT authority). gate:agent-self-completion is never
+  // auto-granted (src/members/service.ts:502, deliberate), but nothing on
+  // the grant-management route (POST /api/gates/grants, GATE_CAPABILITY_RE
+  // has no exclusion for this capability string) stops an org admin from
+  // granting it to a plain MEMBER — and the old `memberHasGateGrant` bare
+  // existence check would then treat that member as fully authorized on
+  // ANY gate:agent-self-completion task, including one assigned to an agent
+  // they do not own. That is the BLOCK-1 exploit shape again, reproduced
+  // through a member-type grant instead of the original agent-type one.
+  // Routing through evaluateVerdictGates closes it: a member principal's id
+  // can never equal an agent assignee_agent_id, so gate:agent-self-completion
+  // is only ever passable here via the legacyOwnerAdmin escape (correct by
+  // construction — a human via IM can never BE "the completing agent").
+  //
+  // CORRECTED (mupot#1319 gate BLOCK-2, River's adversarial pass — the
+  // previous wording here claimed this "matches the HTTP/MCP behaviour
+  // exactly." That is FALSE on precisely the gate BLOCK-1 was written to
+  // close, and a load-bearing security comment must not assert a parity
+  // that does not hold):
+  //
+  // The synthetic AuthContext below maps IM's own authority model onto the
+  // shape evaluateVerdictGates expects. `role` is derived from the SAME
+  // hasCapability(grants,'org',null,'admin') check canBypassApprovalGate
+  // already used — so legacyOwnerAdmin (role-only, tasks/index.ts) DOES
+  // recognize a capability-based org admin HERE, on IM, when it does NOT on
+  // the other two write surfaces:
+  //   - MCP: authenticateMember (src/mcp/index.ts) hardcodes role:'member'
+  //     unconditionally — a capability-based org admin's AuthContext never
+  //     carries role:'owner'/'admin' at all.
+  //   - HTTP: the cookie bridge (loadAuthFromCookie, src/auth/index.ts)
+  //     only attaches memberId+capabilities when role==='member' already —
+  //     a session that resolved role:'owner'/'admin' never synthesizes a
+  //     capability-derived role either; it already HAD the legacy role.
+  // So a member holding ONLY an org-scope admin CAPABILITY row (no legacy
+  // role, no gate_grants row at all) passes gate:agent-self-completion for
+  // an agent they do not own via IM, and is refused (no_gate_capability) via
+  // MCP and HTTP for the identical principal and task — verified directly
+  // against the gate, not inferred. This is a genuine, IM-ONLY authority
+  // divergence, not a bug this PR introduces (IM never modeled
+  // gate:agent-self-completion's owner/admin escape at all before this fix,
+  // so there was no parity to break) — but this refactor is what makes it
+  // reachable in the first place, and asserting false parity in the comment
+  // that explains it is a defect in its own right: a future reader reasoning
+  // from "matches HTTP/MCP exactly" would trust a guarantee that is not
+  // there. DO NOT change IM's authority model to close this gap in this PR —
+  // making the synthesized role carry the capability plane (or dropping the
+  // synthesis) is itself a behaviour change to IM's admin authority and
+  // needs its own gate; it is filed as a follow-up to #1080/#1081, not
+  // fixed here. `boundAgentId` is always null (IM never authenticates as an
+  // agent principal, only as the human member behind the chat).
+  //
+  // See tests/im-verdict-gates.test.ts "IM-only escape (not parity)" for the
+  // receipt this comment describes.
+  const auth: AuthContext = {
+    userId: member.id,
+    email: member.email,
+    role: canBypassApprovalGate(grants) ? 'admin' : 'member',
+    tenant: env.TENANT_SLUG,
+    memberId: member.id,
+    channel: 'im',
+    capabilities: grants,
+    boundAgentId: null,
+  }
+  const gateOwner = task.gate_owner
+  const gateResult = await evaluateVerdictGates(
+    env,
+    auth,
+    { squad_id: task.squad_id, gate_owner: gateOwner, assignee_agent_id: task.assignee_agent_id },
+    verdict,
+  )
+  if (!gateResult.allowed) {
+    if (gateResult.code === 'missing_surface_cap') {
+      return `You don't have permission to approve "${task.title}" (need outreach:send-gated).`
+    }
+    if (gateResult.code === 'self_verdict') {
+      // Unreachable in practice today: this function's principal is always a
+      // member id, which can never equal an agent assignee_agent_id. Kept as
+      // a defensive, sensible message rather than an unhandled branch.
+      return `You can't decide "${task.title}" because you are the assignee.`
+    }
+    const need = gateOwner === 'gate:agent-self-completion' ? 'assignee_or_org_admin' : gateOwner
+    return `You don't have permission to decide "${task.title}" (need ${need}).`
   }
 
-  if (
-    task.gate_owner === 'gate:loops' &&
-    verdict === 'approved' &&
-    !(await memberHasSurfaceGrant(env, member, grants, 'outreach:send-gated'))
-  ) {
-    return `You don't have permission to approve "${task.title}" (need outreach:send-gated).`
-  }
-
+  // IM-SPECIFIC conflict-of-interest rule, layered ON TOP of the shared
+  // predicate above (not replaced by it): a human who owns/minted the
+  // assignee agent's token may not verdict that agent's own task. This is
+  // orthogonal to evaluateVerdictGates' self-verdict rule (which compares
+  // the DECIDING principal to the assignee — for IM the deciding principal
+  // is always a member, never the agent itself, so that rule can never fire
+  // here) — memberOwnsAssigneeAgent is IM's own, additional guard.
   if (await memberOwnsAssigneeAgent(env, member.id, task.assignee_agent_id)) {
     return `You can't decide "${task.title}" because you are the assignee.`
   }

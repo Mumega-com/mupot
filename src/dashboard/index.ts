@@ -159,7 +159,7 @@ import {
   statusDot as uiStatusDot,
 } from './ui'
 import type { Html } from './ui'
-import type { ApprovalItem } from './approvals'
+import type { ApprovalItem, PublishableItem, ApprovalsQueue } from './approvals'
 import { loadObservatory, agentGradient } from './observatory'
 import { kanbanApp, loadKanbanData, kanbanBoardBody } from './kanban-routes'
 // Flight-008 Slice 3 (#1062): the /send dispatch-now picker's reachability signal.
@@ -455,7 +455,7 @@ dashboardApp.get('/', async (c) => {
   //   - loadTodaySpendScalar: ONE D1 round trip (today's sum + an EXISTS check),
   //     vs loadEconomy's 5 parallel queries — see economy.ts for why "configured"
   //     is defined identically so the two never disagree.
-  const [obsData, approvals, physics, spend, taskStatusCounts] = await Promise.all([
+  const [obsData, approvalsQueue, physics, spend, taskStatusCounts] = await Promise.all([
     loadObservatory(c.env),
     loadApprovals(c.env, auth),
     loadBrainPhysics(c.env),
@@ -472,11 +472,11 @@ dashboardApp.get('/', async (c) => {
     agents: obsData.agents,
     stats: obsData.stats,
     runtimeStates: obsData.runtimeStates,
-    approvals,
+    approvals: approvalsQueue,
     taskStatusCounts,
   })
   return c.html(
-    shell(c.env, 'Overview', observatoryBody(c.env.BRAND, obsData, approvals, auth, counts), {
+    shell(c.env, 'Overview', observatoryBody(c.env.BRAND, obsData, approvalsQueue.items, auth, counts), {
       physics,
       costToday: { configured: spend.configured, todayUsdMicro: spend.today_usd_micro },
     }),
@@ -856,12 +856,12 @@ dashboardApp.get('/approvals', async (c) => {
   const auth = c.get('auth')
   // Secret-env pending requests: admin-only, like loadPublishable above — a
   // non-admin caller never even queries the table, not just doesn't see a button.
-  const [items, publishable, secretEnvRequests] = await Promise.all([
+  const [approvalsQueue, publishable, secretEnvRequests] = await Promise.all([
     loadApprovals(c.env, auth),
     loadPublishable(c.env, auth),
     isOrgAdmin(auth) ? listPendingSecretEnvRequests(c.env) : Promise.resolve([]),
   ])
-  return c.html(shell(c.env, 'Approvals', approvalsBody(items, publishable, secretEnvRequests)))
+  return c.html(shell(c.env, 'Approvals', approvalsBody(approvalsQueue, publishable, secretEnvRequests)))
 })
 
 // POST /admin/secret-env/:requestId/bind — admin pastes values for a pending
@@ -4756,7 +4756,7 @@ function observatoryBody(
     statCard({ label: 'Configured agents', value: String(counts.agentsTotal) }),
     statCard({ label: 'Live runtimes', value: String(counts.liveRuntimeCount), subTone: counts.liveRuntimeCount > 0 ? 'primary' : 'warn' }),
     statCard({ label: 'In flight', value: String(counts.inFlightTotal), subTone: counts.inFlightTotal > 0 ? 'primary' : 'dim' }),
-    statCard({ label: 'Needs decision', value: String(counts.needsDecisionCount), subTone: counts.needsDecisionCount > 0 ? 'warn' : 'dim' }),
+    statCard({ label: 'Needs decision', value: `${String(counts.needsDecisionCount)}${counts.needsDecisionCountIsLowerBound ? '+' : ''}`, subTone: counts.needsDecisionCount > 0 ? 'warn' : 'dim' }),
     statCard({ label: 'Spend · 24h', value: formatUsd(counts.spendMicroUsdTotal) }),
   ])
 
@@ -4876,7 +4876,7 @@ function uiToneFromHealth(tone: HealthTone): 'ok' | 'warn' | 'danger' | 'dim' {
   return 'dim'
 }
 
-function opsHealthBody(data: OpsHealthData) {
+export function opsHealthBody(data: OpsHealthData) {
   const checkRows: Html[][] = data.checks.map((c) => [
     html`<a class="ui-link" href="${c.href}">${c.label}</a>`,
     uiStatusDot(uiToneFromHealth(c.tone), c.state),
@@ -4918,7 +4918,7 @@ function opsHealthBody(data: OpsHealthData) {
     ${kpiRow([
       statCard({ label: 'Active agents', value: String(data.kpis.activeAgents), subTone: data.kpis.activeAgents > 0 ? 'ok' : 'warn' }),
       statCard({ label: 'Runtime online', value: String(data.kpis.runtimeOnline), subTone: data.kpis.runtimeOnline > 0 ? 'ok' : 'warn' }),
-      statCard({ label: 'Needs decision', value: String(data.kpis.needsDecision), subTone: data.kpis.needsDecision > 0 ? 'warn' : 'dim' }),
+      statCard({ label: 'Needs decision', value: `${String(data.kpis.needsDecision)}${data.kpis.needsDecisionIsLowerBound ? '+' : ''}`, subTone: data.kpis.needsDecision > 0 ? 'warn' : 'dim' }),
       statCard({ label: 'Failures', value: String(data.kpis.blockedOrRejected), subTone: data.kpis.blockedOrRejected > 0 ? 'danger' : 'dim' }),
     ])}
     ${sectionPanel({
@@ -4986,6 +4986,17 @@ function opsHealthBody(data: OpsHealthData) {
  * The verdict buttons call the existing RBAC-gated POST /api/tasks/:id/verdict endpoint.
  * NO new write path is introduced here (adversarial review point from #12).
  */
+// mupot#1081: Approve/Reject render ONLY when t.can_approve/t.can_reject are
+// true — server-computed by evaluateVerdictGates (src/tasks/index.ts), the
+// SAME predicate POST /:id/verdict itself evaluates. When a row's can_verdict
+// is false, NO <button> markup is emitted at all for that row's actions:
+// the control is structurally absent, not disabled/hidden, so no client-side
+// script can re-enable it. When can_approve and can_reject differ (e.g. a
+// gate:loops row where the caller holds gate:loops but not
+// outreach:send-gated — approve blocked, reject still allowed), only the
+// permitted button renders; a plain note field with no buttons would leave a
+// dead control, so the note input itself only renders when at least one
+// action does.
 function approvalCardHtml(t: ApprovalItem): string {
   const preview = resultPreview(t)
   const agentLabel = escHtml(t.agent_name ?? t.assignee_agent_id ?? 'unassigned')
@@ -4997,8 +5008,14 @@ function approvalCardHtml(t: ApprovalItem): string {
   const previewHtml = preview
     ? `<div class="appr-result"><div class="lbl">Result</div>${escHtml(preview)}</div>`
     : ''
+  const actionsHtml = t.can_verdict
+    ? `<input type="text" class="appr-note" placeholder="note (optional; required to reject)" />
+        ${t.can_approve ? '<button class="btn appr-approve">Approve</button>' : ''}
+        ${t.can_reject ? '<button class="btn btn-reject appr-reject">Reject</button>' : ''}
+        <span class="appr-status"></span>`
+    : `<span class="appr-no-action">No verdict action available for you on this task.</span>`
   return `
-    <div class="card approval" data-task="${escAttr(t.id)}" style="border-left:3px solid var(--accent)">
+    <div class="card approval" data-task="${escAttr(t.id)}" data-can-approve="${t.can_approve ? '1' : '0'}" data-can-reject="${t.can_reject ? '1' : '0'}" style="border-left:3px solid var(--accent)">
       <div class="appr-head">
         <div>
           <div class="appr-title">${escHtml(t.title)}</div>
@@ -5008,12 +5025,7 @@ function approvalCardHtml(t: ApprovalItem): string {
       </div>
       <div class="appr-body">${escHtml(t.body)}</div>
       ${previewHtml}
-      <div class="appr-actions">
-        <input type="text" class="appr-note" placeholder="note (optional; required to reject)" />
-        <button class="btn appr-approve">Approve</button>
-        <button class="btn btn-reject appr-reject">Reject</button>
-        <span class="appr-status"></span>
-      </div>
+      <div class="appr-actions">${actionsHtml}</div>
     </div>`
 }
 
@@ -5025,6 +5037,11 @@ function obsQueueScript(): string {
     <script>
       (function () {
         document.querySelectorAll('#obs-queue .approval').forEach(function (card) {
+          // mupot#1081: a row with no can_approve/can_reject renders NO
+          // buttons at all (see approvalCardHtml) — nothing to wire here.
+          var approveBtn = card.querySelector('.appr-approve');
+          var rejectBtn = card.querySelector('.appr-reject');
+          if (!approveBtn && !rejectBtn) return;
           var id = card.getAttribute('data-task');
           var note = card.querySelector('.appr-note');
           var status = card.querySelector('.appr-status');
@@ -5055,8 +5072,8 @@ function obsQueueScript(): string {
               card.querySelectorAll('button').forEach(function (b) { b.disabled = false; });
             });
           }
-          card.querySelector('.appr-approve').addEventListener('click', function () { decide('approved'); });
-          card.querySelector('.appr-reject').addEventListener('click', function () { decide('rejected'); });
+          if (approveBtn) approveBtn.addEventListener('click', function () { decide('approved'); });
+          if (rejectBtn) rejectBtn.addEventListener('click', function () { decide('rejected'); });
         });
 
         // Jump-to-now: scroll the swimlane grid all the way right.
@@ -5792,14 +5809,29 @@ function sendScript(projectId?: string) {
 // duplication across pages.
 
 function approvalsBody(
-  items: ApprovalItem[],
-  publishable: ApprovalItem[] = [],
+  approvalsQueue: ApprovalsQueue,
+  publishable: PublishableItem[] = [],
   secretEnvRequests: PublicSecretEnvRequest[] = [],
 ) {
+  const { items, actionableCount, actionableCountIsLowerBound } = approvalsQueue
   // Re-use the shared card renderer. Wrap in a named container so the script can
   // scope its querySelectorAll without touching #obs-queue on the home page.
+  // `items` mixes actionable rows (buttons render) and informational ones (no
+  // buttons; see approvalCardHtml) — actionable rows always come first, see
+  // selectQueueWindow (src/dashboard/approvals.ts).
   const cards = items.map((t) => approvalCardHtml(t)).join('')
   const n = items.length
+  // mupot#1319 round 2, Codex FINDING 4/2 (CORRECTED from round 1, which used
+  // items.length — that counted informational/unactionable rows as "awaiting
+  // your gate," which they are not by this page's own definition, AND
+  // understated the true total once truncated since it never distinguished
+  // "hit the cap" from "this is everything"). The badge now reflects
+  // actionableCount specifically, with an explicit "+" whenever that count is
+  // a LOWER BOUND (actionableCountIsLowerBound) — see ApprovalsQueue's own
+  // doc comment for exactly what can make it one.
+  const badgeText = actionableCountIsLowerBound
+    ? `${String(actionableCount)}+ awaiting your gate`
+    : `${String(actionableCount)} awaiting your gate`
 
   // "Ready to publish" (flight-1 gap fix): tasks already past the gate
   // (status='approved', gate:content) with no operator control to fire the real
@@ -5821,13 +5853,19 @@ function approvalsBody(
         ${publishScript()}`
     : html``
 
+  // "Gate clear" means nothing NEEDS the caller's decision — that is
+  // actionableCount, not n (items.length also counts informational rows
+  // with no verdict action at all; a queue full of those is still clear).
+  const sub = actionableCountIsLowerBound
+    ? 'Agents propose work; you authorize it. This is the only place human authority enters the loop — untrusted input can wake an agent, never steer it. The queue is deep enough that this count is a floor, not a total — some waiting work may not be listed below yet.'
+    : 'Agents propose work; you authorize it. This is the only place human authority enters the loop — untrusted input can wake an agent, never steer it.'
   return html`
     ${pageHeader({
       crumbs: 'Overview / The Gate',
       title: 'The Gate',
-      sub: 'Agents propose work; you authorize it. This is the only place human authority enters the loop — untrusted input can wake an agent, never steer it.',
-      badge: n ? `${String(n)} awaiting your gate` : 'Gate clear',
-      badgeTone: n ? 'warn' : 'ok',
+      sub,
+      badge: actionableCount ? badgeText : 'Gate clear',
+      badgeTone: actionableCount ? 'warn' : 'ok',
     })}
     ${n ? raw(`<div id="approvals-list">${cards}</div>`) : html`<div class="card"><p class="empty">Nothing waiting at your gates. Gated work lands here when an agent finishes it.</p></div>`}
     ${n ? approvalsScript() : html``}
@@ -5839,8 +5877,14 @@ function approvalsBody(
  * Render one approved content-publish task as a Publish card. Only ever
  * populated by loadPublishable (admin/owner + status='approved' + gate:content),
  * so no client-side role check is needed here — the data itself is the gate.
+ *
+ * mupot#1081: t is PublishableItem, not ApprovalItem — it structurally has no
+ * can_verdict/can_approve/can_reject field to (mis)read. The prior shape
+ * carried can_verdict:false here unread by this function; mutation M8
+ * (false -> true) survived the whole suite because nothing checked it. That
+ * is fixed by construction now, not by a runtime check nothing calls.
  */
-function publishCardHtml(t: ApprovalItem): string {
+function publishCardHtml(t: PublishableItem): string {
   const agentLabel = escHtml(t.agent_name ?? t.assignee_agent_id ?? 'unassigned')
   const squadLabel = escHtml(t.squad_name ?? t.squad_id)
   const when = escHtml((t.completed_at ?? t.created_at).slice(0, 16).replace('T', ' '))
@@ -5913,6 +5957,11 @@ function approvalsScript() {
         var list = document.getElementById('approvals-list');
         if (!list) return;
         list.querySelectorAll('.approval').forEach(function (card) {
+          // mupot#1081: a row with no can_approve/can_reject renders NO
+          // buttons at all (see approvalCardHtml) — nothing to wire here.
+          var approveBtn = card.querySelector('.appr-approve');
+          var rejectBtn = card.querySelector('.appr-reject');
+          if (!approveBtn && !rejectBtn) return;
           var id = card.getAttribute('data-task');
           var note = card.querySelector('.appr-note');
           var status = card.querySelector('.appr-status');
@@ -5943,8 +5992,8 @@ function approvalsScript() {
               card.querySelectorAll('button').forEach(function (b) { b.disabled = false; });
             });
           }
-          card.querySelector('.appr-approve').addEventListener('click', function () { decide('approved'); });
-          card.querySelector('.appr-reject').addEventListener('click', function () { decide('rejected'); });
+          if (approveBtn) approveBtn.addEventListener('click', function () { decide('approved'); });
+          if (rejectBtn) rejectBtn.addEventListener('click', function () { decide('rejected'); });
         });
       })();
     </script>`)
