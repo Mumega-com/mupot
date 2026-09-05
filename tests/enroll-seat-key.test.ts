@@ -115,8 +115,8 @@ function envFor(
   } as unknown as Env
 }
 
-function sessionRecord(email: string): string {
-  return JSON.stringify({ userId: `u-${email}`, email, role: 'member', createdAt: '2026-01-01T00:00:00Z' })
+function sessionRecord(email: string, role: 'owner' | 'admin' | 'member' = 'member'): string {
+  return JSON.stringify({ userId: `u-${email}`, email, role, createdAt: '2026-01-01T00:00:00Z' })
 }
 
 function dashboardReq(path: string, sessionId: string, init: RequestInit = {}): Request {
@@ -194,6 +194,39 @@ describe('GET /enroll — seat enrollment page (real schema)', () => {
     expect(body).toContain(AGENT_A)
   })
 
+  it('renders consentable agents for a signed-in owner whose member row holds eligibility', async () => {
+    harness = makeHarness()
+    const env = envFor(harness, { 'sess:s-owner': sessionRecord('admin@pot.test', 'owner') })
+    const res = await dashboardApp.fetch(dashboardReq('/enroll?seat=hadi-assistant', 's-owner'), env)
+    expect(res.status).toBe(200)
+    const body = await res.text()
+    expect(body).toContain('admin@pot.test')
+    expect(body).toContain(`member <code class="inline">${HUMAN_ADMIN}</code>`)
+    expect(body).toContain('hadi-assistant')
+    expect(body).toContain('Cursor River')
+    expect(body).toContain(AGENT_A)
+  })
+
+  it('redirects unauthenticated enrollment visitors to login', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+    const res = await dashboardApp.fetch(new Request(`${ORIGIN}/enroll?seat=hadi-assistant`), env)
+    expect(res.status).toBe(302)
+    expect(res.headers.get('location')).toBe('/auth/login')
+  })
+
+  it('does not resolve an owner email to an agent through another tenant', async () => {
+    harness = makeHarness()
+    const env = { ...envFor(harness, { 'sess:s-owner': sessionRecord('admin@pot.test', 'owner') }), TENANT_SLUG: 'other-pot' } as Env
+    const res = await dashboardApp.fetch(dashboardReq('/enroll?seat=hadi-assistant', 's-owner'), env)
+    expect(res.status).toBe(200)
+    const body = await res.text()
+    expect(body).toContain('admin@pot.test')
+    expect(body).not.toContain(`member <code class="inline">${HUMAN_ADMIN}</code>`)
+    expect(body).not.toContain('Cursor River')
+    expect(body).not.toContain(AGENT_A)
+  })
+
   it('omits an agent the human may not act as', async () => {
     harness = makeHarness()
     const env = envFor(harness, { 'sess:s-admin': sessionRecord('admin@pot.test') })
@@ -261,6 +294,33 @@ describe('POST /enroll/mint — coin a seat key (real schema)', () => {
     expect(body).toContain('cursor-river')
     expect(body).not.toContain('token_hash')
     expect(body).not.toContain(sha256(rawMatches[0]))
+  })
+
+  it('as a signed-in owner with a matching member row can coin a seat key through enrol', async () => {
+    harness = makeHarness()
+    const env = envFor(harness, { 'sess:s-owner': sessionRecord('admin@pot.test', 'owner') })
+    const before = harness.sqlite
+      .prepare(`SELECT COUNT(*) AS n FROM member_tokens WHERE agent_id = ?`)
+      .get(AGENT_A) as { n: number }
+
+    const res = await dashboardApp.fetch(
+      dashboardPost('/enroll/mint', 's-owner', { agent_id: AGENT_A, seat: 'hadi-assistant' }),
+      env,
+    )
+    expect(res.status).toBe(200)
+    const body = await res.text()
+
+    const tokens = harness.sqlite
+      .prepare(`SELECT id, agent_id, label, channel FROM member_tokens WHERE agent_id = ?`)
+      .all(AGENT_A) as Array<{ id: string; agent_id: string; label: string; channel: string }>
+    expect(tokens.length).toBe(before.n + 1)
+    const minted = tokens[tokens.length - 1]
+    expect(minted.agent_id).toBe(AGENT_A)
+    expect(minted.label).toBe('hadi-assistant')
+    expect(minted.channel).toBe('workspace')
+    expect(body).toContain('x-mupot-seat')
+    expect(body).toContain('hadi-assistant')
+    expect(body).not.toContain('token_hash')
   })
 
   it('WITHOUT admin on the target agent squad is refused and writes no member_tokens row', async () => {

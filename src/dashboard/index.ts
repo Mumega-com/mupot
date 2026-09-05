@@ -102,6 +102,7 @@ import {
   checkEnrollMintRateLimit,
   loadEnrollView,
   normalizeEnrollSeat,
+  resolveEnrollMemberId,
 } from './enroll'
 import { loadControlCenterView, controlCenterPageBody } from './control-center'
 import { loadJoinPreview, confirmJoin, joinPreviewPageBody, joinConfirmedBody } from './join-agent'
@@ -2115,7 +2116,7 @@ dashboardApp.post('/enroll/mint', async (c) => {
   // Throttle before anything is resolved or minted. A refused attempt burns
   // budget on purpose — a loop hammering this form with a bad agent id is the
   // shape worth braking, and it would otherwise cost nothing.
-  const actorMemberId = auth.memberId
+  const actorMemberId = await resolveEnrollMemberId(c.env, auth)
   if (!actorMemberId) {
     return c.html(
       shell(c.env, 'Enroll seat', errorBody('No member identity resolved for this session.')),

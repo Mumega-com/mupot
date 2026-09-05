@@ -25,9 +25,10 @@
 
 import { html, raw as honoRaw } from 'hono/html'
 import type { AuthContext, Env } from '../types'
-import { canOnSquad } from '../auth/capability'
+import { canOnSquad, resolveCapabilities } from '../auth/capability'
 import { describeOrgStanding } from '../auth/refusal'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
+import { resolveHumanMemberId } from '../members/resolve-human-member'
 import { listConsentableAgents, type ConsentableAgent } from '../mcp/oauth-authorize'
 import { mcpEndpoint, mcpServerKey } from './connect'
 
@@ -49,6 +50,15 @@ export interface EnrollView {
   seat: string
   preselectedAgent: string | null
   agents: EnrollAgent[]
+}
+
+export async function resolveEnrollMemberId(env: Env, auth: AuthContext): Promise<string | null> {
+  if (auth.boundAgentId) return null
+  return auth.memberId ??
+    auth.webSessionMemberId ??
+    (auth.email
+      ? await resolveHumanMemberId(env, { tenant: env.TENANT_SLUG, email: auth.email })
+      : null)
 }
 
 /** Absolute enrollment URL, built in exactly one place. Optional seat is
@@ -140,7 +150,8 @@ export async function authorizeEnrollMint(
   squadId: string,
 ): Promise<{ ok: true } | { ok: false; reason: 'operator_principal_required' | 'squad_admin_required' }> {
   if (auth.boundAgentId) return { ok: false, reason: 'operator_principal_required' }
-  const grants = auth.capabilities ?? []
+  const memberId = await resolveEnrollMemberId(env, auth)
+  const grants = auth.capabilities ?? (memberId ? await resolveCapabilities(env, memberId) : [])
   if (!(await canOnSquad(env, grants, squadId, 'admin'))) {
     return { ok: false, reason: 'squad_admin_required' }
   }
@@ -266,7 +277,7 @@ export async function loadEnrollView(
   const principal = (auth.email && auth.email.trim().length > 0)
     ? auth.email.trim()
     : (auth.memberId ?? auth.userId)
-  const memberId = auth.memberId ?? null
+  const memberId = await resolveEnrollMemberId(env, auth)
 
   if (!memberId) {
     return { principal, memberId, seat, preselectedAgent: null, agents: [] }
