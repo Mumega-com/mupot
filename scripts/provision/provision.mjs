@@ -12,6 +12,7 @@
 
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import {
   newJournal, saveJournal, loadJournal, beginStep, completeStep, failStep,
@@ -29,7 +30,7 @@ const TENANT_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
 function parseArgs(argv) {
   const args = {
     'account-id': null, 'token-file': null, 'tenant': null,
-    'journal-path': null, 'sha': null, 'dry-run': false,
+    'journal-path': null, 'sha': null, 'config': null, 'dry-run': false,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -38,6 +39,7 @@ function parseArgs(argv) {
     else if (a === '--tenant') args.tenant = argv[++i];
     else if (a === '--journal-path') args['journal-path'] = argv[++i];
     else if (a === '--sha') args.sha = argv[++i];
+    else if (a === '--config') args.config = argv[++i];
     else if (a === '--dry-run') args['dry-run'] = true;
     else if (a === '--help' || a === '-h') return { ...args, help: true };
     else throw new Error(`unknown arg: ${a}`);
@@ -144,35 +146,63 @@ async function main() {
 
   // ── Steps 2..n: buckets → deploy → health gate (implemented in P0 lanes) ───
   // Loom lane: bucket create + deploy guard (R2 refusal wiring + TEST-ORD-2).
-  // Mubot lane: health gate below.
+  // Mubot lane: client wiring + health gate below.
   const { provisionBuckets, deployWorker } = await import('./steps.mjs');
-  const { cfClient } = await import('./cf-client.mjs');
-  const client = cfClient ?? null; // steps.mjs owns its own client; kept for symmetry
+  const { makeCfClient } = await import('./cf-client.mjs');
+  const client = makeCfClient({ accountId: args['account-id'], tokenPath: args['token-file'] });
 
-  await provisionBuckets({ journal, journalPath, args });
-  const guard = guardWorkerDeploy('entitlement_active'); // journal already proves entitlement (T5 read-back recorded)
-  if (!guard.allowed) {
-    console.error(guard.message);
-    process.exit(guard.exit);
+  const buckets = await provisionBuckets({ journal, journalPath, args, cfClient: client });
+  if (!buckets.ok) {
+    console.error(buckets.message ?? `bucket step failed (exit ${buckets.exit}) — see journal evidence`);
+    process.exit(buckets.exit);
   }
-  await deployWorker({ journal, journalPath, args });
+  const deploy = await deployWorker({ journal, journalPath, args, entitlementState: 'entitlement_active', deploy: makeDeployExecutor(args) });
+  if (!deploy.ok) {
+    console.error(deploy.message ?? `deploy step failed (exit ${deploy.exit}) — see journal evidence`);
+    process.exit(deploy.exit);
+  }
 
   // ── Health gate (poll-5s / timeout-600s / elapsed reported — §2 verified shape) ──
   const health = await import('./health-gate.mjs');
-  const result = await health.gate({
-    tenant: args.tenant, expectedSha: sha,
-    onProgress: (s) => process.stdout.write(s),
-  });
-  if (!result.ok) {
-    park(journal, 'manual_intervention_required', `health gate timeout after ${result.elapsed}s`);
+  const hg = beginStep(journal, 'health_gate');
+  if (hg.ok !== true) {
+    const result = await health.gate({
+      tenant: args.tenant, expectedSha: sha,
+      onProgress: (s) => process.stdout.write(s),
+    });
+    if (!result.ok) {
+      failStep(journal, 'health_gate', `gate timeout after ${result.elapsed}s — last body ${JSON.stringify(result.lastBody ?? null)}`);
+      park(journal, 'manual_intervention_required', `health gate timeout after ${result.elapsed}s`);
+      await saveJournal(journalPath, journal);
+      console.error(`health-gate-timeout after ${result.elapsed}s — journal parked, re-run to resume`);
+      process.exit(4);
+    }
+    completeStep(journal, 'health_gate', `GET /health 200 commit=${sha} clean=true in ${result.elapsed}s`);
     await saveJournal(journalPath, journal);
-    console.error(`health-gate-timeout after ${result.elapsed}s — journal parked, re-run to resume`);
-    process.exit(4);
   }
-  completeStep(journal, 'health_gate', `GET /health 200 commit=${sha} clean=true in ${result.elapsed}s`);
-  await saveJournal(journalPath, journal);
-  console.log(`provisioned: tenant=${args.tenant} sha=${sha} elapsed=${result.elapsed}s`);
+  console.log(`provisioned: tenant=${args.tenant} sha=${sha}`);
   process.exit(0);
+}
+
+// Deploy executor: wrangler deploy with the provisioner's own token (file → env,
+// never echoed), tenant config path from --config. Honest default: P0 has no
+// tenant worker config to deploy yet (HQ-2 documented-risk, no virgin account) —
+// so the default throws with a plan reference instead of inventing deploy
+// mechanics. Tests inject their own deploy (steps.mjs deploy param).
+function makeDeployExecutor(args) {
+  return async () => {
+    const cfg = args.config;
+    if (!cfg) {
+      throw new Error('no tenant worker config (--config) wired in P0 — deploy executor is injectable; see plan §5 P0 / HQ-2 documented-risk');
+    }
+    const { execFileSync } = await import('node:child_process');
+    const token = readFileSync(args['token-file'], 'utf8').trim();
+    const out = execFileSync('npx', ['wrangler', 'deploy', '--config', cfg], {
+      env: { ...process.env, CLOUDFLARE_API_TOKEN: token },
+      stdio: 'pipe',
+    });
+    return `wrangler deploy --config ${cfg}: ${String(out).slice(0, 300)}`;
+  };
 }
 
 main().catch((err) => {
