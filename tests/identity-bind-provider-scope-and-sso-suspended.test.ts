@@ -55,6 +55,32 @@ describe('identity: step-2 provider scoping + SSO enroll never INSERTs a collidi
     expect(viaSaml).not.toBe('mem-a')
   })
 
+  it('A2: verified_email fallback does not resolve a suspended identity owner', async () => {
+    await env.DB.prepare(
+      `INSERT INTO members (id, tenant, email, display_name, status, created_at)
+       VALUES ('mem-suspended-ident', ?1, 'suspended-ident@mumega.test', 'Suspended Ident', 'suspended', datetime('now'))`,
+    ).bind(TENANT).run()
+    const linked = await linkLoginIdentity(env, {
+      tenant: TENANT,
+      provider: 'google',
+      providerSubject: 'sub-suspended',
+      verifiedEmail: 'suspended-ident@corp.test',
+      memberId: 'mem-suspended-ident',
+    })
+    expect(linked.ok).toBe(true)
+
+    const direct = await resolveHumanMemberId(env, {
+      tenant: TENANT,
+      provider: 'google',
+      providerSubject: 'sub-suspended',
+      email: 'suspended-ident@corp.test',
+    })
+    const byVerifiedEmail = await resolveHumanMemberId(env, { tenant: TENANT, email: 'suspended-ident@corp.test' })
+
+    expect(direct).toBeNull()
+    expect(byVerifiedEmail).toBeNull()
+  })
+
   it('B: SSO enroll for a suspended member reports member_suspended, never UNIQUE 500', async () => {
     let result: Awaited<ReturnType<typeof autoEnrollSsoMember>> | undefined
     let err: unknown

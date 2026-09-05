@@ -57,6 +57,15 @@ async function ownerAliasMemberId(env: Env, email: string): Promise<string | nul
   return uniqueOrgOwnerId(env)
 }
 
+async function activeMemberId(env: Env, tenant: string, memberId: string): Promise<string | null> {
+  const row = await env.DB.prepare(
+    `SELECT id FROM members
+      WHERE id = ?1 AND tenant = ?2 AND status = 'active'
+      LIMIT 1`,
+  ).bind(memberId, tenant).first<{ id: string }>()
+  return row?.id ?? null
+}
+
 /**
  * Resolve a human to one active member.
  * 1. Live (tenant, provider, provider_subject) identity.
@@ -92,7 +101,7 @@ export async function resolveHumanMemberId(
   try {
     if (input.provider && input.providerSubject) {
       const ident = await resolveLoginIdentity(env, tenant, input.provider, input.providerSubject)
-      if (ident) return ident.member_id
+      if (ident) return activeMemberId(env, tenant, ident.member_id)
     }
 
     const email = input.email ? normalizeEmail(input.email) : ''
@@ -101,14 +110,20 @@ export async function resolveHumanMemberId(
     if (email && !joinKeyPresent) {
       const identByEmail = input.provider
         ? await env.DB.prepare(
-            `SELECT member_id FROM human_login_identities
-              WHERE tenant = ?1 AND lower(verified_email) = ?2 AND revoked_at IS NULL
-                AND provider = ?3
+            `SELECT h.member_id AS member_id
+               FROM human_login_identities h
+               JOIN members m ON m.id = h.member_id AND m.tenant = h.tenant
+              WHERE h.tenant = ?1 AND lower(h.verified_email) = ?2 AND h.revoked_at IS NULL
+                AND h.provider = ?3
+                AND m.status = 'active'
               LIMIT 2`,
           ).bind(tenant, email, input.provider).all<{ member_id: string }>()
         : await env.DB.prepare(
-            `SELECT member_id FROM human_login_identities
-              WHERE tenant = ?1 AND lower(verified_email) = ?2 AND revoked_at IS NULL
+            `SELECT h.member_id AS member_id
+               FROM human_login_identities h
+               JOIN members m ON m.id = h.member_id AND m.tenant = h.tenant
+              WHERE h.tenant = ?1 AND lower(h.verified_email) = ?2 AND h.revoked_at IS NULL
+                AND m.status = 'active'
               LIMIT 2`,
           ).bind(tenant, email).all<{ member_id: string }>()
       const rows = identByEmail.results ?? []

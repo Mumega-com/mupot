@@ -132,7 +132,7 @@ export async function createWebSession(
 
 export type WebSessionLoadResult =
   | { ok: true; session: WebSessionRecord }
-  | { ok: false; reason: 'not_found' | 'revoked' | 'expired_idle' | 'expired_absolute' }
+  | { ok: false; reason: 'not_found' | 'member_inactive' | 'revoked' | 'expired_idle' | 'expired_absolute' }
 
 /**
  * evaluateWebSession — pure fail-closed check against a loaded row. Revocation
@@ -167,23 +167,33 @@ export async function loadWebSession(
   nowMs: number = Date.now(),
 ): Promise<WebSessionLoadResult> {
   const idHash = await hashWebSessionId(rawSessionId)
-  let row: WebSessionRecord | null
+  let row: (WebSessionRecord & { member_status: string | null }) | null
   try {
     row = await env.DB.prepare(
-      `SELECT id_hash, tenant, member_id, login_identity_id, created_at, last_seen_at,
-              idle_expires_at, absolute_expires_at, recent_reauth_at, revoked_at, revoke_reason
-         FROM web_sessions
-        WHERE id_hash = ?1 AND tenant = ?2
+      `SELECT ws.id_hash AS id_hash, ws.tenant AS tenant, ws.member_id AS member_id,
+              ws.login_identity_id AS login_identity_id, ws.created_at AS created_at,
+              ws.last_seen_at AS last_seen_at, ws.idle_expires_at AS idle_expires_at,
+              ws.absolute_expires_at AS absolute_expires_at,
+              ws.recent_reauth_at AS recent_reauth_at, ws.revoked_at AS revoked_at,
+              ws.revoke_reason AS revoke_reason,
+              m.status AS member_status
+         FROM web_sessions ws
+         LEFT JOIN members m ON m.id = ws.member_id AND m.tenant = ws.tenant
+        WHERE ws.id_hash = ?1 AND ws.tenant = ?2
         LIMIT 1`,
     )
       .bind(idHash, tenant)
-      .first<WebSessionRecord>()
+      .first<WebSessionRecord & { member_status: string | null }>()
   } catch (err) {
     if (isMissingTableError(err)) return { ok: false, reason: 'not_found' }
     throw err
   }
   if (!row) return { ok: false, reason: 'not_found' }
-  return evaluateWebSession(row, nowMs)
+  const { member_status: _memberStatus, ...session } = row
+  const evaluated = evaluateWebSession(session, nowMs)
+  if (!evaluated.ok) return evaluated
+  if (_memberStatus !== 'active') return { ok: false, reason: 'member_inactive' }
+  return evaluated
 }
 
 /**
@@ -337,9 +347,11 @@ export async function loadLiveReauthIdentity(
     `SELECT hli.provider AS provider, hli.provider_subject AS provider_subject
        FROM web_sessions ws
        JOIN human_login_identities hli ON hli.id = ws.login_identity_id
+       JOIN members m ON m.id = ws.member_id AND m.tenant = ws.tenant
       WHERE ws.id_hash = ?1 AND ws.tenant = ?2
         AND ws.revoked_at IS NULL
         AND hli.revoked_at IS NULL
+        AND m.status = 'active'
       LIMIT 1`,
   )
     .bind(webSessionIdHash, tenant)

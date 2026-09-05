@@ -455,12 +455,26 @@ membersApp.patch('/members/:id', requireCapability(orgScope, 'admin'), async (c)
     return c.json({ error: 'invalid_status', allowed: ['active', 'suspended'] }, 400)
   }
 
-  const res = await c.env.DB.prepare('UPDATE members SET status = ? WHERE id = ?')
-    .bind(status, id)
-    .run()
+  let sessionsRevoked = 0
+  const res = status === 'suspended'
+    ? await (async () => {
+        const nowIso = new Date().toISOString()
+        const [memberUpdate, sessionRevoke] = await c.env.DB.batch([
+          c.env.DB.prepare('UPDATE members SET status = ? WHERE id = ?').bind(status, id),
+          c.env.DB.prepare(
+            `UPDATE web_sessions SET revoked_at = ?1, revoke_reason = ?2
+              WHERE tenant = ?3 AND member_id = ?4 AND revoked_at IS NULL`,
+          ).bind(nowIso, 'member_suspended', c.env.TENANT_SLUG, id),
+        ])
+        sessionsRevoked = Number(sessionRevoke.meta?.changes ?? 0)
+        return memberUpdate
+      })()
+    : await c.env.DB.prepare('UPDATE members SET status = ? WHERE id = ?')
+        .bind(status, id)
+        .run()
   if (!res.meta || res.meta.changes === 0) return c.json({ error: 'member_not_found' }, 404)
 
-  return c.json({ member_id: id, status })
+  return c.json({ member_id: id, status, sessions_revoked: sessionsRevoked })
 })
 
 // ── tokens (mint / revoke) ────────────────────────────────────────────────────
