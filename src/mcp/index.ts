@@ -3846,7 +3846,7 @@ const toolCheckIn: ToolSpec = {
     const id = await loadMemberIdentity(env, auth)
     if (!id) return fail(403, 'not_member_bound', 'check_in requires a member-token principal')
 
-    const boundSeat = await resolveBoundSeat(env, auth)
+    const boundSeat = await resolveBoundSeat(env, auth.tokenId)
     const requestedSeat = str(args.seat)
     if (requestedSeat && boundSeat && requestedSeat !== boundSeat) {
       // Honesty lock-in: a minted token labelled grok-bot-desktop cannot check in as
@@ -3928,7 +3928,7 @@ const toolStatus: ToolSpec = {
     const agentId = str(args.agent_id)
     if (!agentId) {
       // No agent specified → echo the member's own principal (who am I + caps + seat).
-      const tokenLabel = await resolveBoundSeat(env, auth)
+      const tokenLabel = await resolveBoundSeat(env, auth.tokenId)
       let seatName: string | null = null
       let seats: string[] = []
       let activeSeat: Record<string, unknown> | null = null
@@ -4238,7 +4238,7 @@ const toolBootContext: ToolSpec = {
   },
   async run(auth, env, args, ctx) {
     const claimedSeat = (str(args.seat) || str(args.label) || ctx?.seat || '').trim() || null
-    const tokenLabel = await resolveBoundSeat(env, auth)
+    const tokenLabel = await resolveBoundSeat(env, auth.tokenId)
     const seatMismatch = Boolean(claimedSeat && tokenLabel && claimedSeat !== tokenLabel)
 
     if (auth.memberId) {
