@@ -5,12 +5,14 @@
 // a thin HTTP mirror to poll the pot for new delegations. These routes are that mirror, over the
 // SAME pure service (sendToRef / readAgentInbox), so the HTTP and MCP surfaces can never diverge.
 //
-//   GET  /api/inbox?peek=1&limit=N  — read the CALLER's own inbox (consume by default; peek=1
+//   GET  /api/inbox?peek=1&limit=N&seat=<name>
+//                                   — read the CALLER's own inbox (consume by default; peek=1
 //                                     reads without consuming, for a poll that doesn't drain).
 //   GET  /api/inbox/stream          — SSE stream of NEW messages (server-side poll over the
 //                                     same readAgentInbox service; initial flush + subsequent
 //                                     message events; ?since=<seq> to skip already-seen rows;
-//                                     ?poll_ms=<N> to tune the poll cadence).
+//                                     ?poll_ms=<N> to tune the poll cadence; ?seat=<name> narrows
+//                                     to rows for that exact seat plus broadcast rows).
 //   POST /api/inbox/send            — send to another agent (e.g. a hook ACKing a delegation).
 //
 // Auth: the agent's pot member-token (bearer), resolved server-side. Identity (from/to-scope)
@@ -46,6 +48,7 @@ export interface StreamMessage {
   request_id: string | null
   in_reply_to: string | null
   created_at: string
+  target_seat?: string | null
 }
 
 export type InboxStreamEvent =
@@ -64,7 +67,7 @@ interface StreamOpts {
  *  Pure + injectable: the Hono route owns auth and the SSE wire format only. */
 export async function* streamInboxEvents(
   env: Env,
-  input: { agent: string; since?: number; pollMs?: number; revalidate?: () => Promise<boolean> },
+  input: { agent: string; since?: number; pollMs?: number; seat?: string; revalidate?: () => Promise<boolean> },
   opts: StreamOpts = {},
 ): AsyncGenerator<InboxStreamEvent> {
   const tenant = env.TENANT_SLUG
@@ -79,7 +82,7 @@ export async function* streamInboxEvents(
   const isNew = (m: StreamMessage) => m.seq > lastSeq
 
   // Initial flush: anything unread above the client's cursor, oldest-first.
-  const initial = await readAgentInbox(env, { agent, peek: true, limit: 100, sinceSeq: lastSeq })
+  const initial = await readAgentInbox(env, { agent, peek: true, limit: 100, sinceSeq: lastSeq, seat: input.seat })
   if (initial.ok) {
     const fresh = initial.messages.filter(isNew)
     if (fresh.length > 0) {
@@ -99,7 +102,7 @@ export async function* streamInboxEvents(
     }
     await sleep(pollMs)
     if (aborted()) return
-    const res = await readAgentInbox(env, { agent, peek: true, limit: 100, sinceSeq: lastSeq })
+    const res = await readAgentInbox(env, { agent, peek: true, limit: 100, sinceSeq: lastSeq, seat: input.seat })
     if (!res.ok) {
       // Transient DB failure — keep the stream alive; the client re-reads on reconnect.
       yield { type: 'heartbeat' }
@@ -139,6 +142,7 @@ inboxApp.get('/stream', async (c) => {
     if (!Number.isFinite(n) || n <= 0) return c.json({ error: 'invalid_poll_ms' }, 400)
     pollMs = n
   }
+  const seat = c.req.query('seat')?.trim() || undefined
 
   const events = streamInboxEvents(
     c.env,
@@ -146,6 +150,7 @@ inboxApp.get('/stream', async (c) => {
       agent: id.boundAgentId,
       since,
       pollMs,
+      seat,
       // P0-2: re-validate the bearer credential on every poll so a revoked token or
       // deactivated agent ends the stream instead of leaking the full inbox forever.
       revalidate: async () => {
@@ -229,6 +234,7 @@ inboxApp.get('/', async (c) => {
     if (!Number.isFinite(n)) return c.json({ error: 'invalid_limit' }, 400)
     limit = n
   }
+  const seat = c.req.query('seat')?.trim() || undefined
 
   // since_seq — the cursor that makes bounded pagination possible from the bridge.
   //
@@ -251,7 +257,7 @@ inboxApp.get('/', async (c) => {
     sinceSeq = n
   }
 
-  const res = await readAgentInbox(c.env, { agent: id.boundAgentId, peek, limit, sinceSeq })
+  const res = await readAgentInbox(c.env, { agent: id.boundAgentId, peek, limit, sinceSeq, seat })
   if (!res.ok) {
     // Never forward a raw DB error string to the client (leak-guard, matches the MCP path).
     if (res.reason === 'db_error') return c.json({ error: res.reason }, 500)
@@ -293,7 +299,7 @@ inboxApp.post('/send', async (c) => {
 
   const parsed = await readJsonObjectCapped(c)
   if (!parsed.ok) return c.json({ error: parsed.error }, parsed.status)
-  const body = parsed.value as { to?: unknown; body?: unknown; kind?: unknown; request_id?: unknown; in_reply_to?: unknown; project_id?: unknown }
+  const body = parsed.value as { to?: unknown; body?: unknown; kind?: unknown; request_id?: unknown; in_reply_to?: unknown; project_id?: unknown; seat?: unknown }
 
   const to = typeof body.to === 'string' ? body.to : ''
   const text = typeof body.body === 'string' ? body.body : ''
@@ -303,6 +309,8 @@ inboxApp.post('/send', async (c) => {
   if (body.request_id !== undefined && typeof body.request_id !== 'string') return c.json({ error: 'invalid_args', detail: 'request_id must be a string' }, 400)
   if (body.in_reply_to !== undefined && typeof body.in_reply_to !== 'string') return c.json({ error: 'invalid_args', detail: 'in_reply_to must be a string' }, 400)
   if (body.project_id !== undefined && typeof body.project_id !== 'string') return c.json({ error: 'invalid_args', detail: 'project_id must be a string' }, 400)
+  if (body.seat !== undefined && typeof body.seat !== 'string') return c.json({ error: 'invalid_args', detail: 'seat must be a string' }, 400)
+  const targetSeat = typeof body.seat === 'string' && body.seat.trim().length > 0 ? body.seat.trim() : undefined
 
   // Gate 1 (#392): confine the send target for non-admin welded tokens — the SAME rule the MCP
   // `send` tool enforces (see the docstring on sendToRef in ./messages.ts). This bearer surface
@@ -322,6 +330,7 @@ inboxApp.post('/send', async (c) => {
       requestId: typeof body.request_id === 'string' ? body.request_id : undefined,
       inReplyTo: typeof body.in_reply_to === 'string' ? body.in_reply_to : undefined,
       projectId: typeof body.project_id === 'string' ? body.project_id : undefined,
+      targetSeat,
     },
     { isAdmin, grants },
   )
@@ -338,5 +347,13 @@ inboxApp.post('/send', async (c) => {
           : 400
     return c.json({ error: res.reason, detail: res.detail }, status)
   }
-  return c.json({ ok: true, id: res.id, seq: res.seq, duplicate: res.duplicate, to: res.toAgent, project_id: typeof body.project_id === 'string' ? body.project_id : null })
+  return c.json({
+    ok: true,
+    id: res.id,
+    seq: res.seq,
+    duplicate: res.duplicate,
+    to: res.toAgent,
+    project_id: typeof body.project_id === 'string' ? body.project_id : null,
+    target_seat: targetSeat ?? null,
+  })
 })

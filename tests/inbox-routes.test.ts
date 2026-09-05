@@ -29,6 +29,7 @@ const { inboxApp } = await import('../src/agents/inbox-routes')
 interface MsgRow {
   seq: number; id: string; tenant: string; to_agent: string; from_agent: string; from_member: string
   kind: string; body: string; request_id: string | null; in_reply_to: string | null; created_at: string; read_at: string | null
+  target_seat?: string | null
 }
 
 interface KeyRow { pubkey: string; algo: string; member_id: string | null }
@@ -52,15 +53,15 @@ function makeDb(
 
   function runRun(sql: string, b: unknown[]) {
     if (sql.includes('INSERT INTO agent_messages')) {
-      const [id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, maxUnread] =
-        b as [string, string, string, string, string, string, string, string | null, string | null, string, number]
+      const [id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, maxUnread, _projectId, targetSeat] =
+        b as [string, string, string, string, string, string, string, string | null, string | null, string, number, string | null, string | null]
       const unread = messages.filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null).length
       if (typeof maxUnread === 'number' && unread >= maxUnread) return { meta: { changes: 0 } }
       if (request_id != null && messages.some((m) => m.tenant === tenant && m.from_agent === from_agent && m.request_id === request_id)) {
         throw new Error('UNIQUE constraint failed')
       }
       const seq = ++seqCounter
-      messages.push({ seq, id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, read_at: null })
+      messages.push({ seq, id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, read_at: null, target_seat: targetSeat ?? null })
       return { meta: { last_row_id: seq, changes: 1 } }
     }
     throw new Error('unhandled run: ' + sql)
@@ -82,6 +83,10 @@ function makeDb(
       const m = messages.find((x) => x.tenant === tenant && x.from_agent === from_agent && x.request_id === request_id)
       return m ? { id: m.id, seq: m.seq, to_agent: m.to_agent, kind: m.kind, body: m.body, in_reply_to: m.in_reply_to } : null
     }
+    if (sql.includes('FROM member_tokens t') && sql.includes('t.agent_id = ?2') && sql.includes('t.label = ?3')) {
+      const [tenant, agentId, label] = b as [string, string, string]
+      return tenant === 't' && agentId === 'ag-review' && label === 'hadi-codex-cli' ? { 1: 1 } : null
+    }
     if (sql.includes('COUNT(*) AS n FROM agent_messages')) {
       const [tenant, to_agent] = b as [string, string]
       const effectiveMode = signedOnlyAgents.has(to_agent) ? 'signed_only' : 'bearer_only'
@@ -90,7 +95,8 @@ function makeDb(
       if (signed) {
         if (effectiveMode !== 'signed_only' || suppliedFingerprint !== keyFingerprint(tenant, to_agent)) return { n: 0 }
       } else if (effectiveMode !== 'bearer_only') return { n: 0 }
-      return { n: messages.filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null).length }
+      const seat = sql.includes('OR target_seat IS NULL') ? b[b.length - 1] as string : null
+      return { n: messages.filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null && (seat ? (m.target_seat === seat || (m.target_seat ?? null) === null) : (m.target_seat ?? null) === null)).length }
     }
     if (sql.includes('FROM agents WHERE id = ?1 LIMIT 1')) {
       const [ref] = b as [string]
@@ -119,7 +125,8 @@ function makeDb(
       if (signed) {
         if (effectiveMode !== 'signed_only' || b[4] !== keyFingerprint(tenant, to_agent)) return []
       } else if (effectiveMode !== 'bearer_only') return []
-      const claimed = messages.filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null).sort((x, y) => x.seq - y.seq).slice(0, limit)
+      const seat = sql.includes('OR target_seat IS NULL') ? b[b.length - 1] as string : null
+      const claimed = messages.filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null && (seat ? (m.target_seat === seat || (m.target_seat ?? null) === null) : (m.target_seat ?? null) === null)).sort((x, y) => x.seq - y.seq).slice(0, limit)
       for (const m of claimed) m.read_at = readAt
       return claimed.map((m) => ({ ...m }))
     }
@@ -130,11 +137,11 @@ function makeDb(
       if (signed) {
         if (effectiveMode !== 'signed_only' || b[4] !== keyFingerprint(tenant, to_agent)) return []
       } else if (effectiveMode !== 'bearer_only') return []
-      // 5 binds = signed with cursor; 4 binds = bearer with cursor; 3 binds = plain peek (no cursor).
-      const hasCursor = signed ? b.length === 5 : b.length === 4
+      const hasCursor = sql.includes('seq >')
       const sinceSeq = hasCursor ? (sinceSeqOrLimit ?? 0) : 0
       const limit = hasCursor ? (maybeLimit as number) : sinceSeqOrLimit
-      return messages.filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null && m.seq > sinceSeq).sort((x, y) => x.seq - y.seq).slice(0, limit).map((m) => ({ ...m }))
+      const seat = sql.includes('OR target_seat IS NULL') ? b[b.length - 1] as string : null
+      return messages.filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null && m.seq > sinceSeq && (seat ? (m.target_seat === seat || (m.target_seat ?? null) === null) : (m.target_seat ?? null) === null)).sort((x, y) => x.seq - y.seq).slice(0, limit).map((m) => ({ ...m }))
     }
     if (sql.includes('FROM agents WHERE slug = ?1')) {
       const [ref] = b as [string]
@@ -283,6 +290,19 @@ describe('GET /api/inbox', () => {
     const res2 = await inboxApp.fetch(getReq('tok-code', '?peek=1'), e)
     expect(((await res2.json()) as { messages: unknown[] }).messages.length).toBe(1) // still there
   })
+  it('seat query reads matching exact-seat and broadcast rows only', async () => {
+    const { env: e, db } = env(AGENTS)
+    db._messages.push({ seq: 1, id: 'a', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm', kind: 'request', body: 'broadcast', request_id: null, in_reply_to: null, created_at: 't0', read_at: null, target_seat: null })
+    db._messages.push({ seq: 2, id: 'b', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm', kind: 'request', body: 'for cli', request_id: null, in_reply_to: null, created_at: 't0', read_at: null, target_seat: 'hadi-codex-cli' })
+    db._messages.push({ seq: 3, id: 'c', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm', kind: 'request', body: 'for mac', request_id: null, in_reply_to: null, created_at: 't0', read_at: null, target_seat: 'hadi-codex-mac' })
+
+    const res = await inboxApp.fetch(getReq('tok-code', '?peek=1&seat=hadi-codex-cli'), e)
+    expect(res.status).toBe(200)
+    const j = (await res.json()) as { messages: Array<{ body: string; target_seat: string | null }>; remaining: number }
+    expect(j.messages.map((m) => m.body)).toEqual(['broadcast', 'for cli'])
+    expect(j.messages.map((m) => m.target_seat)).toEqual([null, 'hadi-codex-cli'])
+    expect(j.remaining).toBe(0)
+  })
   it('invalid limit → 400', async () => {
     const { env: e } = env(AGENTS)
     expect((await inboxApp.fetch(getReq('tok-code', '?limit=abc'), e)).status).toBe(400)
@@ -318,6 +338,20 @@ describe('POST /api/inbox/send', () => {
     expect(j.to).toBe('ag-review')
     expect(db._messages[0].from_agent).toBe('ag-code')
     expect(db._messages[0].to_agent).toBe('ag-review')
+  })
+  it('accepts an exact target seat for the recipient inbox', async () => {
+    const { env: e, db } = env(AGENTS, {}, {}, new Set(), M_CODE_OBSERVES_S1)
+    const res = await inboxApp.fetch(postReq('tok-code', { to: 'review', body: 'build it', seat: 'hadi-codex-cli' }), e)
+    expect(res.status).toBe(200)
+    const j = (await res.json()) as { ok: boolean; target_seat: string | null }
+    expect(j.target_seat).toBe('hadi-codex-cli')
+    expect(db._messages[0].target_seat).toBe('hadi-codex-cli')
+  })
+  it('rejects a non-string exact target seat', async () => {
+    const { env: e } = env(AGENTS, {}, {}, new Set(), M_CODE_OBSERVES_S1)
+    const res = await inboxApp.fetch(postReq('tok-code', { to: 'review', body: 'build it', seat: 123 }), e)
+    expect(res.status).toBe(400)
+    expect(await res.json()).toMatchObject({ error: 'invalid_args', detail: 'seat must be a string' })
   })
   it('unknown recipient → 404', async () => {
     const { env: e } = env(AGENTS, {}, {}, new Set(), M_CODE_OBSERVES_S1)
@@ -529,6 +563,22 @@ describe('GET /api/inbox/stream', () => {
     const again = await inboxApp.fetch(getReq('tok-code', '?peek=1'), e)
     const j = (await again.json()) as { messages: unknown[] }
     expect(j.messages.length).toBe(1)
+  })
+  it('seat query emits matching exact-seat and broadcast rows only', async () => {
+    const { env: e, db } = env(AGENTS)
+    db._messages.push({ seq: 1, id: 'a', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm-rev', kind: 'request', body: 'broadcast', request_id: null, in_reply_to: null, created_at: 't0', read_at: null, target_seat: null })
+    db._messages.push({ seq: 2, id: 'b', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm-rev', kind: 'request', body: 'for cli', request_id: null, in_reply_to: null, created_at: 't0', read_at: null, target_seat: 'hadi-codex-cli' })
+    db._messages.push({ seq: 3, id: 'c', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm-rev', kind: 'request', body: 'for mac', request_id: null, in_reply_to: null, created_at: 't0', read_at: null, target_seat: 'hadi-codex-mac' })
+    const res = await inboxApp.fetch(getReq('tok-code', 'stream?seat=hadi-codex-cli'), e)
+    expect(res.status).toBe(200)
+    const reader = res.body!.getReader()
+    const { value } = await reader.read()
+    const text = new TextDecoder().decode(value)
+    await reader.cancel()
+    const event = JSON.parse(text.slice(5))
+    expect(event.type).toBe('initial')
+    expect(event.messages.map((m: { body: string }) => m.body)).toEqual(['broadcast', 'for cli'])
+    expect(event.since).toBe(2)
   })
   it('since=N skips already-seen messages in the initial flush', async () => {
     const { env: e, db } = env(AGENTS)
