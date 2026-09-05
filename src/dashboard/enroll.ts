@@ -148,30 +148,94 @@ export function enrollClientSnippet(slug: string, origin: string, seat: string):
  * beyond mint_agent_token's bar ... that bar is an over-restriction of one
  * surface; enroll matches the MCP primitive."
  */
-/** The standing of the human behind this session, resolved STATUS-BLIND on purpose.
+/** The standing of the principal whose AUTHORITY is being honoured.
  *
- *  Why this cannot use resolveHumanMemberId: every rung of that resolver filters
- *  `status = 'active'` (resolve-human-member.ts:31,133,144,152) or `revoked_at IS NULL`
- *  (:105,111). So it answers null for BOTH "no such human" and "that human is suspended",
- *  and an earlier version of this file treated null as the bootstrap-owner shape and
- *  admitted it. That made SUSPENSION ITSELF the way to reach the unguarded branch: revoke
- *  a member and their next session resolves null, which was the unconditional admit.
+ *  The fourth gate's one-line diagnosis of the previous version: it moved the gate's join
+ *  key to email without moving the authority's join key with it. `auth.capabilities` is
+ *  loaded by `resolveCapabilities(memberId)` where memberId is
+ *  `webSessionMemberId ?? resolveHumanMemberId(email)` (src/auth/index.ts:1072-1084), and
+ *  `webSessionMemberId` comes from `human_login_identities` — deliberately NOT the display
+ *  email. When those resolve different rows, an email-keyed status check reads a member who
+ *  never granted anything, and the suspended one who did walks through.
  *
- *  'none' and 'revoked' must therefore be distinguishable, which requires a query that
- *  does not filter on status. members.email is globally UNIQUE (0002), so at most one row. */
+ *  So ask on whichever plane the authority actually arrived:
+ *    - grants (auth.memberId present) -> that member's status, keyed on id;
+ *    - users.role alone (no member id) -> email is the only join to members, so use it,
+ *      including the owner-alias indirection that exists precisely to map an operator's
+ *      login address onto the org owner.
+ *
+ *  Distinguishing 'none' from 'revoked' remains the point: every rung of
+ *  resolveHumanMemberId filters on active status, so it collapses them, and treating that
+ *  collapsed null as the bootstrap-owner shape is what made SUSPENSION the way in. */
 type HumanStanding = 'none' | 'active' | 'revoked'
 
-async function humanStandingForSession(env: Env, auth: AuthContext): Promise<HumanStanding> {
-  const email = auth.email?.trim().toLowerCase()
-  // No email means no way to ask the question. Refuse rather than guess: every session
-  // that reaches this route carries a provider-verified email, so an absent one is an
-  // unexpected shape, and unexpected shapes do not get to mint operator credentials.
-  if (!email) return 'revoked'
-  const row = await env.DB.prepare(
-    `SELECT status FROM members WHERE lower(email) = ?1 AND tenant = ?2 LIMIT 1`,
-  ).bind(email, env.TENANT_SLUG).first<{ status: string }>()
+function standingOf(row: { status: string } | null): HumanStanding {
   if (!row) return 'none'
   return row.status === 'active' ? 'active' : 'revoked'
+}
+
+async function humanStandingForSession(env: Env, auth: AuthContext): Promise<HumanStanding> {
+  // Plane 1: authority came from this member's grant rows. Key on the same id.
+  // No tenant predicate: `members.tenant` ships NULLABLE with a deliberate no-backfill
+  // design (migrations/0040), so scoping by tenant here silently misses legacy rows and
+  // returns 'none' for a suspended principal — the mupot#1330 shape.
+  const authorityMemberId = auth.webSessionMemberId ?? auth.memberId
+  if (authorityMemberId) {
+    const row = await env.DB.prepare(
+      `SELECT status FROM members WHERE id = ?1 LIMIT 1`,
+    ).bind(authorityMemberId).first<{ status: string }>()
+    return standingOf(row)
+  }
+
+  // Plane 2: authority is `users.role`, a table with no status column and no member id.
+  // Email is the only join. An absent email means no member identity exists to revoke —
+  // and refusing there locks out the bootstrap owner this branch exists to serve, on the
+  // one shape where they have no other door (a provider that returns no email at all;
+  // src/auth/index.ts mints such sessions with email: null).
+  const email = auth.email?.trim().toLowerCase()
+  if (!email) return 'none'
+
+  // trim() on BOTH sides: lowering only the column while trimming only the input let a
+  // stored 'ws@pot.test ' miss and read as 'none'.
+  const direct = await env.DB.prepare(
+    `SELECT status FROM members WHERE lower(trim(email)) = ?1 LIMIT 1`,
+  ).bind(email).first<{ status: string }>()
+  if (direct) return standingOf(direct)
+
+  // The owner alias (org_settings.owner_login_emails) maps an operator's login address to
+  // the unique org owner and has no members row of its own, so a direct lookup answers
+  // 'none' for a suspended owner arriving that way.
+  const aliasOwner = await ownerAliasStanding(env, email)
+  return aliasOwner ?? 'none'
+}
+
+/** Resolve the owner-alias indirection to the org owner's standing, or null when the
+ *  address is not an alias. Mirrors ownerAliasMemberId in src/members/resolve-human-member.ts,
+ *  which cannot be reused directly because it resolves an id through status-filtered rungs. */
+async function ownerAliasStanding(env: Env, email: string): Promise<HumanStanding | null> {
+  try {
+    const setting = await env.DB.prepare(
+      `SELECT value FROM org_settings WHERE key = 'owner_login_emails' LIMIT 1`,
+    ).first<{ value: string }>()
+    if (!setting?.value) return null
+    const parsed: unknown = JSON.parse(setting.value)
+    if (!Array.isArray(parsed)) return null
+    const aliases = parsed
+      .filter((item): item is string => typeof item === 'string')
+      .map((item) => item.trim().toLowerCase())
+    if (!aliases.includes(email)) return null
+    const owner = await env.DB.prepare(
+      `SELECT m.status AS status FROM members m
+         JOIN capabilities c ON c.member_id = m.id
+        WHERE c.scope_type = 'org' AND c.capability = 'owner'
+        LIMIT 1`,
+    ).first<{ status: string }>()
+    return standingOf(owner)
+  } catch {
+    // A lagging pot may not have org_settings. Absence of the alias table is not evidence
+    // of standing either way, so say "not an alias" and let the caller's 'none' stand.
+    return null
+  }
 }
 
 export async function authorizeEnrollMint(

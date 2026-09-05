@@ -388,3 +388,119 @@ describe('enroll: a revoked human cannot reach the bootstrap-owner branch', () =
     expect(view.agents).toEqual([])
   })
 })
+
+// ── fourth gate: the join-key divergence ─────────────────────────────────────
+//
+// The previous version keyed the status check on EMAIL while the authority arrives keyed on
+// MEMBER ID: auth.capabilities is loaded by resolveCapabilities(memberId) where memberId is
+// webSessionMemberId ?? resolveHumanMemberId(email), and webSessionMemberId comes from
+// human_login_identities — deliberately not the display email. When those resolve different
+// rows, the gate read a member who granted nothing and the suspended one who did walked in.
+//
+// Every seed here deliberately BREAKS the fixture convention that made these unreachable:
+// the previous tests all set members.email === auth.email and tenant = the pot's tenant, so
+// no amount of added cases could vary the axis that actually matters.
+describe('enroll standing follows the authority, not the email', () => {
+  let harness: SqliteD1Harness
+  afterEach(() => harness?.close())
+
+  const orgCap = (id: string, member: string) =>
+    `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('${id}', '${member}', 'org', NULL, 'admin');`
+
+  it('a suspended org admin is refused when the session email resolves a DIFFERENT member', async () => {
+    // The P1-1 shape, and the one this deployment actually has: a login address whose
+    // members row holds nothing, alongside the real owner row that holds everything.
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status, tenant) VALUES
+        ('mem-real',  'owner@pot.test', 'Real Owner', 'suspended', '${TENANT}'),
+        ('mem-decoy', 'login@pot.test', 'Login Row',  'active',    '${TENANT}');
+      ${orgCap('cap-real', 'mem-real')}
+    `)
+    const env = envFor(harness)
+    const auth = {
+      userId: 'u1', email: 'login@pot.test', role: 'member', tenant: TENANT,
+      memberId: 'mem-real', webSessionMemberId: 'mem-real',
+      capabilities: [{ scope_type: 'org', scope_id: null, capability: 'admin' }],
+    } as unknown as AuthContext
+    expect(await authorizeEnrollMint(env, auth, SQUAD_A)).toEqual({ ok: false, reason: 'squad_admin_required' })
+  })
+
+  it('a suspended org admin on a legacy tenant=NULL row is refused', async () => {
+    // migrations/0040 ships members.tenant NULLABLE with an explicit no-backfill design, so
+    // any tenant predicate in the standing lookup answers 'none' for these rows.
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status, tenant) VALUES
+        ('mem-legacy', 'legacy@pot.test', 'Legacy', 'suspended', NULL);
+      ${orgCap('cap-legacy', 'mem-legacy')}
+    `)
+    const env = envFor(harness)
+    const auth = {
+      userId: 'u2', email: 'legacy@pot.test', role: 'member', tenant: TENANT,
+      memberId: 'mem-legacy',
+      capabilities: [{ scope_type: 'org', scope_id: null, capability: 'admin' }],
+    } as unknown as AuthContext
+    expect(await authorizeEnrollMint(env, auth, SQUAD_A)).toEqual({ ok: false, reason: 'squad_admin_required' })
+  })
+
+  it('a suspended owner is refused when the stored email carries whitespace', async () => {
+    // Lowering both sides while trimming only the input let a stored ' ws@pot.test ' miss.
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status, tenant) VALUES
+        ('mem-ws', 'ws@pot.test ', 'Whitespace', 'suspended', '${TENANT}');
+    `)
+    const env = envFor(harness)
+    const auth = {
+      userId: 'u3', email: 'ws@pot.test', role: 'owner', tenant: TENANT, capabilities: [],
+    } as unknown as AuthContext
+    expect(await authorizeEnrollMint(env, auth, SQUAD_A)).toEqual({ ok: false, reason: 'squad_admin_required' })
+  })
+
+  it('a suspended owner arriving through an owner_login_emails ALIAS is refused', async () => {
+    // The alias has no members row of its own, so a direct lookup answers 'none'.
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status, tenant) VALUES
+        ('mem-owner', 'real-owner@pot.test', 'Owner', 'suspended', '${TENANT}');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES
+        ('cap-owner', 'mem-owner', 'org', NULL, 'owner');
+      INSERT INTO org_settings (key, value) VALUES
+        ('owner_login_emails', '["alias@pot.test"]');
+    `)
+    const env = envFor(harness)
+    const auth = {
+      userId: 'u4', email: 'alias@pot.test', role: 'owner', tenant: TENANT, capabilities: [],
+    } as unknown as AuthContext
+    expect(await authorizeEnrollMint(env, auth, SQUAD_A)).toEqual({ ok: false, reason: 'squad_admin_required' })
+  })
+
+  it('an owner whose provider returned NO email is still admitted — absent is not revoked', async () => {
+    // src/auth/index.ts mints sessions with email: null when userinfo omits it. Refusing
+    // there locks out the bootstrap owner on the one shape with no other door.
+    harness = makeHarness()
+    const env = envFor(harness)
+    const auth = {
+      userId: 'u5', email: null, role: 'owner', tenant: TENANT, capabilities: [],
+    } as unknown as AuthContext
+    await expect(authorizeEnrollMint(env, auth, SQUAD_A)).resolves.toEqual({ ok: true })
+  })
+
+  it('an ACTIVE org admin with a divergent login email is still admitted', async () => {
+    // Positive control for the first test: without it, that one passes for the wrong reason.
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status, tenant) VALUES
+        ('mem-live', 'owner2@pot.test', 'Live Owner', 'active', '${TENANT}');
+      ${orgCap('cap-live', 'mem-live')}
+    `)
+    const env = envFor(harness)
+    const auth = {
+      userId: 'u6', email: 'different@pot.test', role: 'member', tenant: TENANT,
+      memberId: 'mem-live', webSessionMemberId: 'mem-live',
+      capabilities: [{ scope_type: 'org', scope_id: null, capability: 'admin' }],
+    } as unknown as AuthContext
+    await expect(authorizeEnrollMint(env, auth, SQUAD_A)).resolves.toEqual({ ok: true })
+  })
+})
