@@ -26,6 +26,7 @@ import { bearerToken, resolveMemberByToken } from '../auth/member-bearer'
 import { resolveCapabilities, hasCapability } from '../auth/capability'
 import { sendToRef, readAgentInbox } from './messages'
 import { verifyAndReadSignedInbox } from '../fleet/signed-inbox'
+import { resolveBoundSeat, resolveInboxSeatArg } from './inbox-seat'
 
 const MAX_BODY_BYTES = 8192
 
@@ -142,7 +143,15 @@ inboxApp.get('/stream', async (c) => {
     if (!Number.isFinite(n) || n <= 0) return c.json({ error: 'invalid_poll_ms' }, 400)
     pollMs = n
   }
-  const seat = c.req.query('seat')?.trim() || undefined
+  // Seat is resolved from the AUTHENTICATED token's binding, never trusted from the
+  // query string — reuses the exact rule the MCP inbox tool applies (resolveBoundSeat +
+  // resolveInboxSeatArg), so the HTTP and MCP surfaces cannot diverge on this again.
+  // An omitted ?seat gets the token's own bound seat (plus broadcasts); an explicit
+  // ?seat is accepted only as a same-value echo, anything else refuses seat_mismatch.
+  const boundSeat = await resolveBoundSeat(c.env, id.tokenId)
+  const seatArg = resolveInboxSeatArg(c.req.query('seat')?.trim(), boundSeat)
+  if (!seatArg.ok) return c.json({ error: seatArg.error, detail: seatArg.detail }, seatArg.status)
+  const seat = seatArg.seat
 
   const events = streamInboxEvents(
     c.env,
@@ -234,7 +243,16 @@ inboxApp.get('/', async (c) => {
     if (!Number.isFinite(n)) return c.json({ error: 'invalid_limit' }, 400)
     limit = n
   }
-  const seat = c.req.query('seat')?.trim() || undefined
+  // Seat is resolved from the AUTHENTICATED token's binding, never trusted from the
+  // query string — reuses the exact rule the MCP inbox tool applies (resolveBoundSeat +
+  // resolveInboxSeatArg), so the HTTP and MCP surfaces cannot diverge on this again.
+  // An omitted ?seat gets the token's own bound seat (plus broadcasts) — this is the
+  // consuming read/lease path, so getting this wrong either leaks+destroys another
+  // seat's mail or silently drops the caller's own seat-addressed mail as broadcast-only.
+  const boundSeat = await resolveBoundSeat(c.env, id.tokenId)
+  const seatArg = resolveInboxSeatArg(c.req.query('seat')?.trim(), boundSeat)
+  if (!seatArg.ok) return c.json({ error: seatArg.error, detail: seatArg.detail }, seatArg.status)
+  const seat = seatArg.seat
 
   // since_seq — the cursor that makes bounded pagination possible from the bridge.
   //
