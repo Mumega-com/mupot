@@ -22,6 +22,8 @@
 
 import type { Context, MiddlewareHandler } from 'hono'
 import type { Env, AuthContext, Capability, CapabilityGrant, CapabilityScopeType } from '../types'
+import { hasActiveGateGrant } from '../gates/grants'
+import { resolveGatePrincipal } from '../gates/principal'
 
 // ── ladder ────────────────────────────────────────────────────────────────────
 
@@ -350,19 +352,9 @@ export async function actorMaxRankOnScope(
  */
 export async function hasSurfaceCap(env: Env, auth: AuthContext, surface: string): Promise<boolean> {
   if (isOrgAdmin(auth)) return true
-  const principalId = auth.memberId ?? auth.userId
-  const principalType: 'member' | 'agent' = auth.memberId ? 'member' : 'agent'
-  if (!principalId) return false
-  const row = await env.DB.prepare(
-    `SELECT 1 FROM gate_grants
-      WHERE capability     = ?1
-        AND principal_type = ?2
-        AND principal_id   = ?3
-      LIMIT 1`,
-  )
-    .bind(surface, principalType, principalId)
-    .first<{ 1: number }>()
-  return row !== null
+  const principal = resolveGatePrincipal(auth)
+  if (!principal) return false
+  return hasActiveGateGrant(env, surface, principal.type, principal.id)
 }
 
 /**

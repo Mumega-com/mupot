@@ -31,6 +31,7 @@ import { resolveTaskAssignee } from './assignee'
 import { verifyTaskArtifactShape } from './artifact-verification'
 import { hasIndependentRuntimeGate, listTaskDispatchReceiptTimeline } from './runtime-receipts'
 import { hasActiveGateGrant } from '../gates/grants'
+import { resolveGatePrincipal } from '../gates/principal'
 export { resolveTaskAssignee as resolveAssignee } from './assignee'
 import { createBus } from '../bus'
 import type { BusEvent } from '../types'
@@ -236,34 +237,10 @@ function taskProjectErrorResponse(error: TaskProjectError): { body: { error: str
   return { body: { error: error.code }, status: 400 }
 }
 
-// KNOWN DIVERGENCE (flagged 2026-09-04, mupot#1080/#1081 flight — filed as a
-// separate ticket, deliberately NOT fixed here; wide blast radius, own gate):
-// verdictPrincipal is AGENT-BOUND-FIRST — for an agent-bound token it resolves
-// to the bound agent (auth.boundAgentId), falling back to auth.memberId, then
-// auth.userId. THREE OTHER principal resolvers in this codebase are
-// MEMBER-FIRST instead — `auth.memberId ?? auth.userId`, never reading
-// auth.boundAgentId at all: hasSurfaceCap (src/auth/capability.ts:353-354),
-// loadApprovals (src/dashboard/approvals.ts:157, its non-admin branch),
-// and loadVerifications (src/dashboard/verifications.ts:101-102). For a
-// single agent-bound token these two resolvers name TWO DIFFERENT
-// principals — concretely, for a gate:loops + approved verdict,
-// callerHoldsGateCapability (which uses verdictPrincipal, below) checks the
-// AGENT's gate_grants row while hasSurfaceCap checks the MEMBER's
-// outreach:send-gated row in the SAME request: send authority is assembled
-// from two different principals' grants. Do not resolve this by quietly
-// picking one resolver inside evaluateVerdictGates (below) — its surface-cap
-// check calls hasSurfaceCap as-is, member-first, exactly as today, so the
-// disagreement stays visible (see the comment at that call site) rather than
-// being papered over. Fixing it means auditing every hasSurfaceCap/
-// memberId-first call site's blast radius, not a local patch here.
 export function verdictPrincipal(auth: AuthContext): { id: string; type: 'member' | 'agent'; actor?: TaskActor } {
-  if (auth.boundAgentId) {
-    return { id: auth.boundAgentId, type: 'agent', actor: { kind: 'agent', id: auth.boundAgentId } }
-  }
-  if (auth.memberId) {
-    return { id: auth.memberId, type: 'member', actor: { kind: 'member', id: auth.memberId } }
-  }
-  return { id: auth.userId, type: 'agent', actor: auth.userId ? { kind: 'agent', id: auth.userId } : undefined }
+  const principal = resolveGatePrincipal(auth)
+  if (!principal) return { id: auth.userId, type: 'agent' }
+  return { ...principal, actor: { kind: principal.type, id: principal.id } }
 }
 
 // ── app ──────────────────────────────────────────────────────────────────────
@@ -1335,11 +1312,8 @@ export type VerdictGateResult =
 // unused (`_squadId`) — the gate-ownership answer only depends on
 // (principal, gate_owner) — so the cache also amortizes across DIFFERENT rows
 // that share a gate_owner + caller, not just the approve/reject pair of one
-// row. hasSurfaceCap resolves ITS OWN principal internally (auth.memberId ??
-// auth.userId, member-first — the KNOWN DIVERGENCE from verdictPrincipal
-// documented above) — the surface-cap cache key mirrors that SAME expression
-// so the memo never claims an answer for a principal hasSurfaceCap would not
-// actually have checked; it does not resolve or touch the divergence itself.
+// row. Gate and surface checks share resolveGatePrincipal, so both cache keys
+// name the same principal for an agent-bound request.
 export interface VerdictGateCache {
   // Values are the PROMISE, not the resolved boolean — decorateApprovals
   // drives concurrent rows through Promise.all, so a value-only cache races:
@@ -1395,20 +1369,10 @@ export async function evaluateVerdictGates(
   // Surface-cap gate (#106): approving a gate:loops task (outreach queue) requires
   // outreach:send-gated — a member token without this surface grant cannot fire a
   // GHL send even if they hold gate:loops. Reject is not gated: rejecting sends nothing.
-  //
-  // PRINCIPAL DISAGREEMENT (deliberately not resolved here — see the KNOWN
-  // DIVERGENCE comment at verdictPrincipal, above): hasSurfaceCap resolves its
-  // own principal as auth.memberId ?? auth.userId, member-first — it does NOT
-  // use the `principal` value this function computed via verdictPrincipal
-  // (agent-bound-first). For an agent-bound token these can be two different
-  // principals, so `callerHoldsGateCapability` just above and `hasSurfaceCap`
-  // here check TWO DIFFERENT grant holders for the same verdict. Left as-is
-  // on purpose: silently swapping in `principal` here would fix the symptom
-  // and hide the bug rather than the underlying resolver being fixed (filed
-  // separately, wide blast radius — hasSurfaceCap is called from far beyond
-  // this route).
   if (task.gate_owner === 'gate:loops' && verdict === 'approved') {
-    const surfaceCacheKey = cache ? `${auth.memberId ?? auth.userId ?? ''}:outreach:send-gated` : null
+    const surfaceCacheKey = cache
+      ? `${principal.type}:${principal.id}:outreach:send-gated`
+      : null
     let hasSendPromise: Promise<boolean>
     const cachedSend = surfaceCacheKey !== null ? cache?.surfaceCapability.get(surfaceCacheKey) : undefined
     if (cachedSend) {

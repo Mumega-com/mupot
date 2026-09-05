@@ -15,6 +15,7 @@
 
 import type { Env, AuthContext } from '../types'
 import type { AthenaGateReceipt } from '../athena/webhook'
+import { resolveGatePrincipal } from '../gates/principal'
 import {
   pageHeader,
   dataTable,
@@ -96,11 +97,8 @@ export async function loadVerifications(
     return rs.results ?? []
   }
 
-  // Non-admin: visibility mirrors approvals.ts gate_grants scoping.
-  // The principal may be a member OR an agent-bound token.
-  const principalId = auth.memberId ?? auth.userId
-  const principalType: 'member' | 'agent' = auth.memberId ? 'member' : 'agent'
-  if (!principalId) return []
+  const principal = resolveGatePrincipal(auth)
+  if (!principal) return []
 
   const rs = await env.DB.prepare(
     `${BASE_SELECT}
@@ -118,7 +116,7 @@ export async function loadVerifications(
      )
      ORDER BY v.decided_at DESC`,
   )
-    .bind(principalId, principalType)
+    .bind(principal.id, principal.type)
     .all<VerificationItem>()
   return rs.results ?? []
 }

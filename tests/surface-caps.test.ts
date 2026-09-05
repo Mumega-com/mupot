@@ -51,7 +51,7 @@ function makeEnv(grantedSurfaces: string[] = [], principalId = 'member-1'): Env 
           async first() {
             if (sql.includes('FROM gate_grants')) {
               const surface = args[0] as string
-              const pid = args[2] as string
+              const pid = args[1] as string
               if (pid === principalId && grantedSurfaces.includes(surface)) {
                 return { 1: 1 }
               }
@@ -183,15 +183,15 @@ function makeSessionEnv(opts: {
           ) {
             return { id: userId }
           }
-          // gate_grants lookup: hasSurfaceCap binds (surface, principalType, principalId)
-          // 3 args, second arg is 'member' or 'agent'.
+          // Active gate-grant lookup binds (surface, principalId); the SQL join
+          // selects the member or agent table from the resolved principal type.
           if (
-            captured.length === 3 &&
+            captured.length === 2 &&
             typeof captured[0] === 'string' &&
-            (captured[1] === 'member' || captured[1] === 'agent')
+            captured[1] === userId
           ) {
             const surface = captured[0] as string
-            const pid = captured[2] as string
+            const pid = captured[1] as string
             if (pid === userId && grantedSurfaces.includes(surface)) return { 1: 1 }
             return null
           }
