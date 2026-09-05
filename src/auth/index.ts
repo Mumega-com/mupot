@@ -1040,7 +1040,23 @@ async function loadAuthFromCookie(c: Context<AppEnv>): Promise<AuthContext | nul
     tenant: c.env.TENANT_SLUG, // tenant is environment-derived, not client-supplied
   }
 
-  if (!record.webSessionRegistered && record.email && c.env.DB) {
+  // #1330 F1: this check MUST run unconditionally whenever an email is present —
+  // it used to be gated on `!record.webSessionRegistered`, on the assumption a
+  // registered session is always covered by the status join inside
+  // loadWebSession below. That assumption is false: loadWebSession collapses
+  // "web_sessions (or human_login_identities) table missing" to the SAME
+  // `reason: 'not_found'` as an ordinary unregistered session, and the
+  // webSessionRegistered branch below treats 'not_found' as benign fall-through.
+  // A registered session whose backing table degrades therefore hit NEITHER
+  // guard — fail-open on a suspended member. Running this members lookup
+  // unconditionally, independent of loadWebSession/web_sessions entirely,
+  // closes that hole regardless of which table is unreadable, and costs
+  // nothing extra for the registered+healthy case (loadWebSession's own
+  // member_status join still runs and agrees). A missing member row (owner/
+  // admin logins with no members row, #1324) is unaffected — the `typeof
+  // member?.status === 'string'` check still only fires on a REAL suspended
+  // row, never on absence (see F3 below for the missing-member decision).
+  if (record.email && c.env.DB) {
     try {
       const member = await c.env.DB.prepare(
         `SELECT status FROM members
