@@ -26,7 +26,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
 import type { Env, AuthContext } from '../src/types'
-import { resolveEnrollMemberId, authorizeEnrollMint, loadEnrollView } from '../src/dashboard/enroll'
+import { resolveEnrollMemberId, authorizeEnrollMint, loadEnrollView, humanStandingForSession } from '../src/dashboard/enroll'
 
 const TENANT = 'pot-a'
 const ORIGIN = 'https://pot.test'
@@ -502,5 +502,56 @@ describe('enroll standing follows the authority, not the email', () => {
       capabilities: [{ scope_type: 'org', scope_id: null, capability: 'admin' }],
     } as unknown as AuthContext
     await expect(authorizeEnrollMint(env, auth, SQUAD_A)).resolves.toEqual({ ok: true })
+  })
+})
+
+// The three-valued contract, asserted directly.
+//
+// Through the mint alone, 'none' and 'active' are indistinguishable — both admit, since the
+// decision is `standing !== 'revoked'`. So mutating the no-row case from 'none' to 'active'
+// left the whole suite green: an equivalent mutant at every call site. That is precisely
+// why the distinction has to be pinned on the FUNCTION rather than on its consequence.
+// It is load-bearing documentation of three genuinely different states, and the moment a
+// caller does treat 'none' differently — an audit trail, a first-run door, a metric — a
+// collapsed value would be wrong everywhere at once with nothing red.
+describe('humanStandingForSession returns the three states distinctly', () => {
+  let harness: SqliteD1Harness
+  afterEach(() => harness?.close())
+
+  const auth = (email: string | null, extra: Record<string, unknown> = {}) => ({
+    userId: 'u', email, role: 'owner', tenant: TENANT, capabilities: [], ...extra,
+  } as unknown as AuthContext)
+
+  it("'none' when no member row exists for the session", async () => {
+    harness = makeHarness()
+    expect(await humanStandingForSession(envFor(harness), auth('nobody@pot.test'))).toBe('none')
+  })
+
+  it("'active' when the row exists and is active", async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(`INSERT INTO members (id, email, display_name, status, tenant) VALUES ('m-a', 'a@pot.test', 'A', 'active', '${TENANT}');`)
+    expect(await humanStandingForSession(envFor(harness), auth('a@pot.test'))).toBe('active')
+  })
+
+  it("'revoked' when the row exists and is suspended", async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(`INSERT INTO members (id, email, display_name, status, tenant) VALUES ('m-s', 's@pot.test', 'S', 'suspended', '${TENANT}');`)
+    expect(await humanStandingForSession(envFor(harness), auth('s@pot.test'))).toBe('revoked')
+  })
+
+  it("'none' — not 'revoked' — when there is no email to join on", async () => {
+    harness = makeHarness()
+    expect(await humanStandingForSession(envFor(harness), auth(null))).toBe('none')
+  })
+
+  it('keys on the member id when the authority arrived that way, ignoring the email', async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status, tenant) VALUES
+        ('m-auth', 'auth@pot.test', 'Authority', 'suspended', '${TENANT}'),
+        ('m-mail', 'mail@pot.test', 'Mail Row',  'active',    '${TENANT}');
+    `)
+    const a = auth('mail@pot.test', { role: 'member', memberId: 'm-auth', webSessionMemberId: 'm-auth' })
+    expect(await humanStandingForSession(envFor(harness), a)).toBe('revoked')
   })
 })

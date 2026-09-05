@@ -167,14 +167,14 @@ export function enrollClientSnippet(slug: string, origin: string, seat: string):
  *  Distinguishing 'none' from 'revoked' remains the point: every rung of
  *  resolveHumanMemberId filters on active status, so it collapses them, and treating that
  *  collapsed null as the bootstrap-owner shape is what made SUSPENSION the way in. */
-type HumanStanding = 'none' | 'active' | 'revoked'
+export type HumanStanding = 'none' | 'active' | 'revoked'
 
 function standingOf(row: { status: string } | null): HumanStanding {
   if (!row) return 'none'
   return row.status === 'active' ? 'active' : 'revoked'
 }
 
-async function humanStandingForSession(env: Env, auth: AuthContext): Promise<HumanStanding> {
+export async function humanStandingForSession(env: Env, auth: AuthContext): Promise<HumanStanding> {
   // Plane 1: authority came from this member's grant rows. Key on the same id.
   // No tenant predicate: `members.tenant` ships NULLABLE with a deliberate no-backfill
   // design (migrations/0040), so scoping by tenant here silently misses legacy rows and
