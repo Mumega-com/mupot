@@ -4876,7 +4876,7 @@ function uiToneFromHealth(tone: HealthTone): 'ok' | 'warn' | 'danger' | 'dim' {
   return 'dim'
 }
 
-function opsHealthBody(data: OpsHealthData) {
+export function opsHealthBody(data: OpsHealthData) {
   const checkRows: Html[][] = data.checks.map((c) => [
     html`<a class="ui-link" href="${c.href}">${c.label}</a>`,
     uiStatusDot(uiToneFromHealth(c.tone), c.state),
@@ -4918,7 +4918,7 @@ function opsHealthBody(data: OpsHealthData) {
     ${kpiRow([
       statCard({ label: 'Active agents', value: String(data.kpis.activeAgents), subTone: data.kpis.activeAgents > 0 ? 'ok' : 'warn' }),
       statCard({ label: 'Runtime online', value: String(data.kpis.runtimeOnline), subTone: data.kpis.runtimeOnline > 0 ? 'ok' : 'warn' }),
-      statCard({ label: 'Needs decision', value: String(data.kpis.needsDecision), subTone: data.kpis.needsDecision > 0 ? 'warn' : 'dim' }),
+      statCard({ label: 'Needs decision', value: `${String(data.kpis.needsDecision)}${data.kpis.needsDecisionIsLowerBound ? '+' : ''}`, subTone: data.kpis.needsDecision > 0 ? 'warn' : 'dim' }),
       statCard({ label: 'Failures', value: String(data.kpis.blockedOrRejected), subTone: data.kpis.blockedOrRejected > 0 ? 'danger' : 'dim' }),
     ])}
     ${sectionPanel({
