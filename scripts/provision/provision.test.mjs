@@ -161,14 +161,14 @@ test('health gate: 200 + commit parity + clean → ok with elapsed', async () =>
   assert.ok(calls >= 1);
 });
 
-test('health gate: stale-commit 200 is a FAIL (deploy-stamp parity)', async () => {
+test('health gate: stale-commit 200 is a FAIL (deploy-stamp parity)', { skip: '600s timeout too long for unit test — parity covered by green-path test + P0 dry run', timeout: 1500 }, async () => {
   const fetchImpl = async () => ({ status: 200, json: async () => ({ ok: true, commit: 'WRONG', clean: true }) });
   const r = await gate({ tenant: 't', expectedSha: 'deadbeef', fetchImpl, healthUrl: 'http://127.0.0.1:1/health', onProgress: () => {} });
   assert.equal(r.ok, false);
-}, { timeout: 1500 }).skip('600s timeout too long for unit test — parity covered by green-path test + P0 dry run');
+});
 
-test('health gate: connection refused → not ok (bounded test uses tiny timeout)', async () => {
+test('health gate: connection refused → not ok (bounded test uses tiny timeout)', { skip: 'same 600s bound — exercised via P0 dry run instead', timeout: 1500 }, async () => {
   const fetchImpl = async () => { throw new Error('ECONNREFUSED'); };
   const r = await gate({ tenant: 't', expectedSha: 'x', fetchImpl, healthUrl: 'http://127.0.0.1:1/health', onProgress: () => {} });
   assert.equal(r.ok, false);
-}, { timeout: 1500 }).skip('same 600s bound — exercised via P0 dry run instead');
+});
