@@ -76,6 +76,18 @@ describe('loadVerifications — visibility + latest-verdict', () => {
     expect(calls[0].args).toEqual(['a1', 'agent'])
   })
 
+  it('agent-bound principal binds the bound agent instead of its member envelope', async () => {
+    const { db, calls } = makeDb({ allRows: [] })
+    await loadVerifications(env(db), {
+      role: 'member',
+      tenant: 'test-pot',
+      userId: 'member-envelope',
+      memberId: 'member-envelope',
+      boundAgentId: 'agent-bound',
+    } as unknown as AuthContext)
+    expect(calls[0].args).toEqual(['agent-bound', 'agent'])
+  })
+
   it('no principal id → returns [] without querying', async () => {
     const { db, calls } = makeDb({ allRows: [{ verdict_id: 'x' }] })
     const rows = await loadVerifications(env(db), noPrincipal)

@@ -89,6 +89,17 @@ describe('loadApprovals', () => {
     expect(calls[0].binds).toEqual(['agent', 'agent-7', APPROVALS_FETCH_CEILING])
   })
 
+  it('agent-bound token checks the bound agent instead of its member envelope', async () => {
+    const { env, calls } = makeEnv([])
+    await loadApprovals(env, auth({
+      role: 'member',
+      memberId: 'member-envelope',
+      userId: 'member-envelope',
+      boundAgentId: 'agent-bound',
+    }))
+    expect(calls[0].binds).toEqual(['agent', 'agent-bound', APPROVALS_FETCH_CEILING])
+  })
+
   it('no principal id → empty queue, no query', async () => {
     const { env, calls } = makeEnv([{ id: 'should-not-appear' }])
     const out = await loadApprovals(env, auth({ role: 'member', memberId: undefined, userId: undefined }))

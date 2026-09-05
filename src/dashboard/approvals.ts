@@ -28,6 +28,7 @@
 import type { Env, Task, AuthContext } from '../types'
 import { CONTENT_GATE_OWNER } from '../agents/execute'
 import { canActOnSquad, evaluateVerdictGates, createVerdictGateCache } from '../tasks/index'
+import { resolveGatePrincipal } from '../gates/principal'
 
 export interface ApprovalItem {
   id: string
@@ -246,28 +247,8 @@ export async function loadApprovals(env: Env, auth: AuthContext): Promise<Approv
     return selectQueueWindow(decorated)
   }
 
-  // Non-admin: visibility == verdict authority. Same principal resolution as
-  // callerHoldsGateCapability (member tokens carry memberId; agent tokens carry
-  // the agent id in userId).
-  //
-  // KNOWN DRIFT (mupot#1081 "stale comments to correct" — flagged, not fixed
-  // this flight; see tasks/index.ts verdictPrincipal for the canonical
-  // resolution): this is NOT actually the same principal resolution as
-  // callerHoldsGateCapability. verdictPrincipal prefers auth.boundAgentId
-  // (an agent-bound token's principal is the bound AGENT); this prefers
-  // auth.memberId first and never reads auth.boundAgentId at all. Today this
-  // is a LATENT gap, not a live one: this module is only ever called from
-  // dashboard cookie-session routes (dashboard/index.ts, operator-counts.ts,
-  // health.ts), and the cookie session path never populates auth.boundAgentId
-  // — so principalId always resolves the same way either resolver would pick
-  // for every REACHABLE caller today. It would stop being latent the moment
-  // any future caller of loadApprovals carries a bound-agent AuthContext
-  // (e.g. an MCP-driven approvals listing), which is exactly the shape of bug
-  // this predicate-parity flight exists to close — do not copy this pattern
-  // into a new call site; use verdictPrincipal instead.
-  const principalId = auth.memberId ?? auth.userId
-  const principalType: 'member' | 'agent' = auth.memberId ? 'member' : 'agent'
-  if (!principalId) return { items: [], actionableCount: 0, actionableCountIsLowerBound: false }
+  const principal = resolveGatePrincipal(auth)
+  if (!principal) return { items: [], actionableCount: 0, actionableCountIsLowerBound: false }
 
   const rs = await env.DB.prepare(
     `${BASE_SELECT}
@@ -279,7 +260,7 @@ export async function loadApprovals(env: Env, auth: AuthContext): Promise<Approv
        )
      ORDER BY t.created_at ASC LIMIT ?3`,
   )
-    .bind(principalType, principalId, APPROVALS_FETCH_CEILING)
+    .bind(principal.type, principal.id, APPROVALS_FETCH_CEILING)
     .all<ApprovalRow>()
   const decorated = await decorateApprovals(env, auth, rs.results ?? [])
   return selectQueueWindow(decorated)
