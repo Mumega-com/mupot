@@ -21,6 +21,11 @@ import { probeEntitlement, guardWorkerDeploy, R2_DASHBOARD_DEEP_LINK } from './r
 
 const PROTECTED_TENANTS = new Set(['mumega', 'mupot', 'mumega-com']);
 
+// DNS-safe slugs only: the tenant lands in journal paths and CF resource names.
+// Loom 2026-09-04 (tenant-clamp lane — Mubot review): trim + charset gate so
+// ' MUMEGA ' or '../x' cannot slip the clamp or the journal path.
+const TENANT_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
+
 function parseArgs(argv) {
   const args = {
     'account-id': null, 'token-file': null, 'tenant': null,
@@ -55,10 +60,15 @@ Exit codes: 0 ok · 1 internal · 2 preflight-fail · 3 activation-required ·
 }
 
 function preflight(args) {
+  if (typeof args.tenant === 'string') args.tenant = args.tenant.trim();
   const missing = ['account-id', 'token-file', 'tenant', 'sha'].filter((k) => !args[k]);
   if (missing.length) {
     console.error(`preflight-fail: missing required args: ${missing.map((m) => `--${m}`).join(', ')}`);
     console.error(usage());
+    process.exit(2);
+  }
+  if (!TENANT_RE.test(args.tenant)) {
+    console.error(`preflight-fail: tenant '${args.tenant}' is not a DNS-safe slug [a-z0-9-] — refusing`);
     process.exit(2);
   }
   if (PROTECTED_TENANTS.has(String(args.tenant).toLowerCase())) {
