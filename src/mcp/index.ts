@@ -97,7 +97,7 @@ import { enrollUrl } from '../dashboard/enroll'
 import { classify, humanAge } from '../dashboard/fleet'
 import { resolveAgentRef } from '../org/resolve'
 import {
-  sendToRef, readAgentInbox, sendAgentMessage,
+  sendToRef, readAgentInbox, sendAgentMessage, getSenderMessage,
 } from '../agents/messages'
 import { routeAgentWake } from '../agents/wake-routing'
 import { authorizeExecutionScope } from '../auth/execution-scope'
@@ -3475,6 +3475,51 @@ const toolInbox: ToolSpec = {
   },
 }
 
+// message_get — sender-scoped read-back of a row THIS agent wrote (#1323).
+// Inbox is recipient-only (`to_agent = caller`). After consume the recipient peek is empty,
+// and there is no outbox. This looks up by id OR request_id, scoped to
+// from_agent = auth.boundAgentId. No admin bypass, no from_agent argument, no list.
+const toolMessageGet: ToolSpec = {
+  name: 'message_get',
+  scope: 'self (the caller agent re-reads a message it sent)',
+  min: 'authenticated',
+  args: '{ id?: string, request_id?: string }  // exactly one; sender is the bound agent — not a to_agent inbox read',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      id: STRING_SCHEMA,
+      request_id: STRING_SCHEMA,
+    },
+    required: [],
+    additionalProperties: false,
+  },
+  async run(auth, env, args, ctx) {
+    const fromAgent = auth.boundAgentId
+    if (!fromAgent) {
+      return fail(403, 'not_agent_bound', {
+        detail: 'message_get requires an agent-bound token (member_tokens.agent_id)',
+        enroll_url: enrollUrl(canonicalOrigin(env, ctx.origin), ctx.seat),
+      })
+    }
+    if (args.id !== undefined && typeof args.id !== 'string')
+      return fail(400, 'invalid_args', 'id must be a string')
+    if (args.request_id !== undefined && typeof args.request_id !== 'string')
+      return fail(400, 'invalid_args', 'request_id must be a string')
+
+    const res = await getSenderMessage(env, {
+      fromAgent,
+      id: typeof args.id === 'string' ? args.id : undefined,
+      requestId: typeof args.request_id === 'string' ? args.request_id : undefined,
+    })
+    if (!res.ok) {
+      if (res.reason === 'db_error') return fail(500, res.reason)
+      if (res.reason === 'message_not_found') return fail(404, res.reason)
+      return fail(400, res.reason, res.detail)
+    }
+    return done(res.message)
+  },
+}
+
 // inbox_lease — read the caller's own inbox WITHOUT marking it read (#899).
 //
 // `inbox` can only say "delivered the whole batch" or "delivered nothing", which is why every
@@ -4735,6 +4780,7 @@ export const TOOLS: ToolSpec[] = [
   toolSend,
   toolBroadcast,
   toolInbox,
+  toolMessageGet,
   toolInboxLease,
   toolInboxAck,
   toolInboxDeadLetters,

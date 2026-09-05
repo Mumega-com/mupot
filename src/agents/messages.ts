@@ -1,8 +1,9 @@
 // mupot — agent↔agent durable messaging (squad → mupot migration, S3).
 //
-// The pure service behind the `send` / `inbox` MCP tools: persist a message to another
-// agent's inbox, and read (consume) one's own inbox. This is the bus primitive mupot lacked
-// — a durable, ordered, addressed, consume-once message store (see migrations/0032).
+// The pure service behind the `send` / `inbox` / `message_get` MCP tools: persist a
+// message to another agent's inbox, read (consume) one's own inbox, and let the sender
+// re-read a row it wrote. This is the bus primitive mupot lacked — a durable, ordered,
+// addressed, consume-once message store (see migrations/0032) plus sender read-back (#1323).
 //
 // Discipline (identical to the rest of the sovereign core):
 //   - Tenant is env.TENANT_SLUG, NEVER client-supplied. Fail-closed if absent.
@@ -555,6 +556,75 @@ async function findBySenderRequestId(
     .bind(tenant, fromAgent, requestId)
     .first<ExistingMessage>()
   return row ? { ...row, seq: Number(row.seq) } : null
+}
+
+// ── sender read-back (#1323) ─────────────────────────────────────────────────────────────
+// Inbox reads are recipient-scoped (`to_agent = caller`). After send, the writer has no
+// later fetch: consume hides the row from the recipient peek, and there is no outbox.
+// This is the sender-scoped counterpart — id or request_id, never another agent's inbox.
+// No admin bypass: from_agent is the authenticated caller, not an argument that can be
+// widened. Missing / wrong-sender / other-tenant collapse to the same refusal.
+
+export interface SenderMessage {
+  id: string
+  seq: number
+  to_agent: string
+  kind: string
+  body: string
+  request_id: string | null
+  read_at: string | null
+}
+
+export type GetSenderMessageFailure = {
+  ok: false
+  reason: 'no_tenant' | 'invalid_from' | 'invalid_args' | 'message_not_found' | 'db_error'
+  detail?: string
+}
+
+export async function getSenderMessage(
+  env: Env,
+  input: { fromAgent: string; id?: string; requestId?: string },
+): Promise<{ ok: true; message: SenderMessage } | GetSenderMessageFailure> {
+  const tenant = env.TENANT_SLUG
+  if (!tenant) return { ok: false, reason: 'no_tenant' }
+  if (typeof input.fromAgent !== 'string' || !isRef(input.fromAgent))
+    return { ok: false, reason: 'invalid_from' }
+
+  const hasId = typeof input.id === 'string' && input.id.trim().length > 0
+  const hasRid = typeof input.requestId === 'string' && input.requestId.trim().length > 0
+  if (hasId === hasRid) return { ok: false, reason: 'invalid_args' }
+
+  const id = hasId ? input.id!.trim() : undefined
+  const requestId = hasRid ? input.requestId!.trim() : undefined
+  if (id !== undefined && !isRef(id)) return { ok: false, reason: 'invalid_args' }
+  if (requestId !== undefined && !RID_RE.test(requestId)) return { ok: false, reason: 'invalid_args' }
+
+  try {
+    const row = id !== undefined
+      ? await env.DB.prepare(
+          `SELECT id, seq, to_agent, kind, body, request_id, read_at FROM agent_messages
+            WHERE tenant = ?1 AND from_agent = ?2 AND id = ?3 LIMIT 1`,
+        ).bind(tenant, input.fromAgent, id).first<SenderMessage>()
+      : await env.DB.prepare(
+          `SELECT id, seq, to_agent, kind, body, request_id, read_at FROM agent_messages
+            WHERE tenant = ?1 AND from_agent = ?2 AND request_id = ?3 LIMIT 1`,
+        ).bind(tenant, input.fromAgent, requestId).first<SenderMessage>()
+    if (!row) return { ok: false, reason: 'message_not_found' }
+    return {
+      ok: true,
+      message: {
+        id: row.id,
+        seq: Number(row.seq),
+        to_agent: row.to_agent,
+        kind: row.kind,
+        body: row.body,
+        request_id: row.request_id ?? null,
+        read_at: row.read_at ?? null,
+      },
+    }
+  } catch (err) {
+    return { ok: false, reason: 'db_error', detail: err instanceof Error ? err.message : String(err) }
+  }
 }
 
 // ── inbox ───────────────────────────────────────────────────────────────────────────────
