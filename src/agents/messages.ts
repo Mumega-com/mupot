@@ -1574,24 +1574,36 @@ async function visibleNamedAgents(
 //   - id/slug is 'ambiguous'                          -> refuse. Never fall back to names;
 //                                                        resolve.ts's fail-closed refusal
 //                                                        must not be laundered into a guess.
+type NonAdminResolution =
+  | { ok: true; value: SendAgentRow; guestFence?: GuestVisibilityFence }
+  | { ok: false; reason: 'send_target_not_visible' }
+  // Only returned when `deferInvisibleFallback` is set: id/slug resolved to a REAL agent
+  // the sender cannot see on their squads, but the caller has another authorization surface
+  // (sendToRef's projectId / case (b)) it wants to try before giving up on this ref as a
+  // name candidate. The caller decides; this primitive never guesses on its own.
+  | { ok: false; reason: 'invisible_resolved'; value: SendAgentRow }
+
 async function resolveNonAdminSendTarget(
   env: Env,
   toRef: string,
   authz: SendTargetAuthz,
   memberId: string,
-): Promise<
-  | { ok: true; value: SendAgentRow; guestFence?: GuestVisibilityFence }
-  | { ok: false; reason: 'send_target_not_visible' }
-> {
+  opts: { deferInvisibleFallback?: boolean } = {},
+): Promise<NonAdminResolution> {
   const resolved = await resolveAgentRef(env, toRef)
   if (resolved.ok) {
     const visibility = await recipientVisibilityOnSenderSquads(env, memberId, authz.grants, resolved.value)
     if (visibility.visible) {
       return { ok: true, value: resolved.value, guestFence: visibility.guestFence }
     }
-    // Resolved to a real agent, but not one this sender can see — fall through to the
+    // Resolved to a real agent, but not one this sender can see.
+    if (opts.deferInvisibleFallback) {
+      return { ok: false, reason: 'invisible_resolved', value: resolved.value }
+    }
+    // No other authorization surface available to the caller — fall through to the
     // visible-name fallback below, same as a genuine not_found.
   } else if (resolved.reason === 'ambiguous') {
+    // Fail-closed by design in resolve.ts — never laundered into a name-based guess.
     return { ok: false, reason: 'send_target_not_visible' }
   }
   const visible = await visibleNamedAgents(env, toRef, authz, memberId)
@@ -1618,9 +1630,10 @@ export async function resolveVisibleSendTarget(
   }
   const memberIds = [...new Set(authz.grants.map((grant) => grant.member_id).filter(Boolean))]
   if (memberIds.length !== 1) return { ok: false, reason: 'send_target_not_visible' }
+  // deferInvisibleFallback defaults to false, so 'invisible_resolved' can never come back here.
   const result = await resolveNonAdminSendTarget(env, toRef, authz, memberIds[0])
-  if (!result.ok) return result
-  return { ok: true, value: result.value }
+  if (result.ok) return { ok: true, value: result.value }
+  return { ok: false, reason: 'send_target_not_visible' }
 }
 
 export async function sendToRef(
@@ -1664,35 +1677,22 @@ export async function sendToRef(
     if (authz.grants.some((grant) => grant.member_id !== input.fromMember)) {
       return { ok: false, reason: 'send_target_not_visible' }
     }
-    const r = await resolveAgentRef(env, input.toRef)
-    if (r.ok) {
-      const visibility = await recipientVisibilityOnSenderSquads(env, input.fromMember, authz.grants, r.value)
-      if (visibility.visible) {
-        resolved = { value: r.value }
-        guestVisibilityFence = visibility.guestFence
-      } else if (input.projectId !== undefined) {
-        // Case (a) failed but a projectId is attached: let sendAgentMessage's own
-        // validateMessageProjectAccess (case b) make the authoritative call rather than
-        // downgrading an explicit, resolved id/slug target to a name-based guess.
-        resolved = { value: r.value }
-        squadVisible = false
-      } else {
-        // Resolved to a real agent the sender cannot see, with no project to fall back on —
-        // this is the SAME situation as not_found from the sender's point of view, so it gets
-        // the SAME visible-name fallback (never a silent "resolved -> refuse").
-        const visible = await visibleNamedAgents(env, input.toRef, authz, input.fromMember)
-        if (visible.length !== 1) return { ok: false, reason: 'send_target_not_visible' }
-        resolved = { value: visible[0] }
-        guestVisibilityFence = visible[0].guestFence
-      }
-    } else if (r.reason === 'ambiguous') {
-      // Fail-closed by design in resolve.ts — never laundered into a name-based guess.
-      return { ok: false, reason: 'send_target_not_visible' }
+    // The EXACT SAME non-admin decision resolveVisibleSendTarget applies — see
+    // resolveNonAdminSendTarget's doc comment for the full rule. `deferInvisibleFallback`
+    // is set only when a projectId is attached, so that case (a) failing on a REAL,
+    // resolved-but-invisible agent can still be rescued by case (b) (sendAgentMessage's
+    // own validateMessageProjectAccess) instead of being downgraded to a name guess.
+    const result = await resolveNonAdminSendTarget(env, input.toRef, authz, input.fromMember, {
+      deferInvisibleFallback: input.projectId !== undefined,
+    })
+    if (result.ok) {
+      resolved = { value: result.value }
+      guestVisibilityFence = result.guestFence
+    } else if (result.reason === 'invisible_resolved') {
+      resolved = { value: result.value }
+      squadVisible = false
     } else {
-      const visible = await visibleNamedAgents(env, input.toRef, authz, input.fromMember)
-      if (visible.length !== 1) return { ok: false, reason: 'send_target_not_visible' }
-      resolved = { value: visible[0] }
-      guestVisibilityFence = visible[0].guestFence
+      return { ok: false, reason: 'send_target_not_visible' }
     }
   }
 
