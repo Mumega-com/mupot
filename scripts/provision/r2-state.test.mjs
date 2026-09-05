@@ -60,7 +60,7 @@ test('TEST-ORD-1: required probe → guard refuses, zero mutating calls', async 
   assert.equal(guard.allowed, false);
   assert.equal(guard.exit, 3);
   assert.match(guard.message, /R2 is not enabled/);
-  assert.match(guard.message, new RegExp(R2_DASHBOARD_DEEP_LINK.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.ok(guard.message.includes(R2_DASHBOARD_DEEP_LINK), 'deep link present (string match, not regex — CodeQL js/incomplete-hostname-regexp)');
   assert.equal(calls.length, 1, 'only the GET probe ran');
   assert.equal(calls[0].method, 'GET', 'no POST/PUT/DELETE attempted');
 });

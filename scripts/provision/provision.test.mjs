@@ -138,7 +138,7 @@ test('guard: deploy refused while entitlement_required (R2 invariant, exit 3)', 
   assert.equal(g.allowed, false);
   assert.equal(g.exit, 3);
   assert.match(g.message, /R2 is not enabled/);
-  assert.match(g.message, new RegExp(R2_DASHBOARD_DEEP_LINK.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.ok(g.message.includes(R2_DASHBOARD_DEEP_LINK), 'deep link present (string match, not regex — CodeQL js/incomplete-hostname-regexp)');
 });
 
 test('guard: deploy allowed only after entitlement_active', () => {
