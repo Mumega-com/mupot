@@ -12,13 +12,18 @@ function asciiLower(s: string): string {
   return s.replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32))
 }
 
-// Mock the member-token auth so we drive the caller's weld directly.
+// Mock the member-token auth so we drive the caller's weld directly. tokenId is included
+// (the real resolveMemberByToken always returns it — mupot#1325 P1: the earlier mock omitted
+// it, so no test in this file COULD fail for a missing token->seat binding check) and feeds
+// resolveBoundSeat's `SELECT label FROM member_tokens WHERE id = ?1` lookup in the DB fake below.
 vi.mock('../src/auth/member-bearer', () => ({
   bearerToken: (h?: string) => (h && h.startsWith('Bearer ') ? h.slice(7) : null),
   resolveMemberByToken: async (_env: unknown, token: string | null) => {
-    if (token === 'tok-code') return { memberId: 'm-code', displayName: 'code', email: null, boundAgentId: 'ag-code' }
-    if (token === 'tok-review') return { memberId: 'm-rev', displayName: 'review', email: null, boundAgentId: 'ag-review' }
-    if (token === 'tok-unbound') return { memberId: 'm-h', displayName: 'h', email: null, boundAgentId: null }
+    if (token === 'tok-code') return { tokenId: 'tid-code', memberId: 'm-code', displayName: 'code', email: null, boundAgentId: 'ag-code' }
+    // seat-bound variant of the same agent's token — label 'hadi-codex-cli' in member_tokens.
+    if (token === 'tok-code-cli') return { tokenId: 'tid-code-cli', memberId: 'm-code', displayName: 'code', email: null, boundAgentId: 'ag-code' }
+    if (token === 'tok-review') return { tokenId: 'tid-review', memberId: 'm-rev', displayName: 'review', email: null, boundAgentId: 'ag-review' }
+    if (token === 'tok-unbound') return { tokenId: 'tid-unbound', memberId: 'm-h', displayName: 'h', email: null, boundAgentId: null }
     return null
   },
 }))
@@ -29,6 +34,7 @@ const { inboxApp } = await import('../src/agents/inbox-routes')
 interface MsgRow {
   seq: number; id: string; tenant: string; to_agent: string; from_agent: string; from_member: string
   kind: string; body: string; request_id: string | null; in_reply_to: string | null; created_at: string; read_at: string | null
+  target_seat?: string | null
 }
 
 interface KeyRow { pubkey: string; algo: string; member_id: string | null }
@@ -52,18 +58,33 @@ function makeDb(
 
   function runRun(sql: string, b: unknown[]) {
     if (sql.includes('INSERT INTO agent_messages')) {
-      const [id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, maxUnread] =
-        b as [string, string, string, string, string, string, string, string | null, string | null, string, number]
+      const [id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, maxUnread, _projectId, targetSeat] =
+        b as [string, string, string, string, string, string, string, string | null, string | null, string, number, string | null, string | null]
       const unread = messages.filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null).length
       if (typeof maxUnread === 'number' && unread >= maxUnread) return { meta: { changes: 0 } }
       if (request_id != null && messages.some((m) => m.tenant === tenant && m.from_agent === from_agent && m.request_id === request_id)) {
         throw new Error('UNIQUE constraint failed')
       }
       const seq = ++seqCounter
-      messages.push({ seq, id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, read_at: null })
+      messages.push({ seq, id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, read_at: null, target_seat: targetSeat ?? null })
       return { meta: { last_row_id: seq, changes: 1 } }
     }
     throw new Error('unhandled run: ' + sql)
+  }
+
+  // Faithfully reflects the seatSql fragment shape (src/agents/messages.ts) rather than
+  // hardcoding "unscoped means broadcast-only" — a fake that always applied the correct
+  // filter regardless of the SQL text would never notice a dropped/fail-open predicate.
+  // Three shapes: "target_seat = ?N OR target_seat IS NULL" (scoped — seat is the last
+  // bind), "target_seat IS NULL" alone (broadcast-only default), or NEITHER present
+  // (mutated/fail-open — every unread row for the recipient matches, seat or not).
+  function seatMatches(sql: string, b: unknown[], m: MsgRow): boolean {
+    if (sql.includes('OR target_seat IS NULL')) {
+      const seat = b[b.length - 1] as string
+      return m.target_seat === seat || (m.target_seat ?? null) === null
+    }
+    if (sql.includes('target_seat IS NULL')) return (m.target_seat ?? null) === null
+    return true // no seat predicate in the SQL at all — matches everything (fail-open)
   }
   function runFirst(sql: string, b: unknown[]) {
     if (/^\s*SELECT mode, generation, key_fingerprint FROM agent_inbox_fences/.test(sql)) {
@@ -82,6 +103,19 @@ function makeDb(
       const m = messages.find((x) => x.tenant === tenant && x.from_agent === from_agent && x.request_id === request_id)
       return m ? { id: m.id, seq: m.seq, to_agent: m.to_agent, kind: m.kind, body: m.body, in_reply_to: m.in_reply_to } : null
     }
+    if (sql.includes('FROM member_tokens t') && sql.includes('t.agent_id = ?2') && sql.includes('t.label = ?3')) {
+      const [tenant, agentId, label] = b as [string, string, string]
+      return tenant === 't' && agentId === 'ag-review' && label === 'hadi-codex-cli' ? { 1: 1 } : null
+    }
+    // resolveBoundSeat's lookup (src/agents/inbox-seat.ts) — the same query the MCP inbox
+    // tools use, reused unmodified by the HTTP route (mupot#1325): resolve the CALLER's
+    // bound seat label from its own token id, never from anything the caller supplies.
+    if (sql.includes('SELECT label FROM member_tokens WHERE id = ?1 AND tenant = ?2')) {
+      const [tokenId, tenant] = b as [string, string]
+      if (tenant !== 't') return null
+      if (tokenId === 'tid-code-cli') return { label: 'hadi-codex-cli' }
+      return null // tok-code / tok-review / tok-unbound carry no seat label
+    }
     if (sql.includes('COUNT(*) AS n FROM agent_messages')) {
       const [tenant, to_agent] = b as [string, string]
       const effectiveMode = signedOnlyAgents.has(to_agent) ? 'signed_only' : 'bearer_only'
@@ -90,7 +124,7 @@ function makeDb(
       if (signed) {
         if (effectiveMode !== 'signed_only' || suppliedFingerprint !== keyFingerprint(tenant, to_agent)) return { n: 0 }
       } else if (effectiveMode !== 'bearer_only') return { n: 0 }
-      return { n: messages.filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null).length }
+      return { n: messages.filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null && seatMatches(sql, b, m)).length }
     }
     if (sql.includes('FROM agents WHERE id = ?1 LIMIT 1')) {
       const [ref] = b as [string]
@@ -119,7 +153,7 @@ function makeDb(
       if (signed) {
         if (effectiveMode !== 'signed_only' || b[4] !== keyFingerprint(tenant, to_agent)) return []
       } else if (effectiveMode !== 'bearer_only') return []
-      const claimed = messages.filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null).sort((x, y) => x.seq - y.seq).slice(0, limit)
+      const claimed = messages.filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null && seatMatches(sql, b, m)).sort((x, y) => x.seq - y.seq).slice(0, limit)
       for (const m of claimed) m.read_at = readAt
       return claimed.map((m) => ({ ...m }))
     }
@@ -130,11 +164,10 @@ function makeDb(
       if (signed) {
         if (effectiveMode !== 'signed_only' || b[4] !== keyFingerprint(tenant, to_agent)) return []
       } else if (effectiveMode !== 'bearer_only') return []
-      // 5 binds = signed with cursor; 4 binds = bearer with cursor; 3 binds = plain peek (no cursor).
-      const hasCursor = signed ? b.length === 5 : b.length === 4
+      const hasCursor = sql.includes('seq >')
       const sinceSeq = hasCursor ? (sinceSeqOrLimit ?? 0) : 0
       const limit = hasCursor ? (maybeLimit as number) : sinceSeqOrLimit
-      return messages.filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null && m.seq > sinceSeq).sort((x, y) => x.seq - y.seq).slice(0, limit).map((m) => ({ ...m }))
+      return messages.filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null && m.seq > sinceSeq && seatMatches(sql, b, m)).sort((x, y) => x.seq - y.seq).slice(0, limit).map((m) => ({ ...m }))
     }
     if (sql.includes('FROM agents WHERE slug = ?1')) {
       const [ref] = b as [string]
@@ -273,6 +306,58 @@ describe('GET /api/inbox', () => {
     const j2 = (await res2.json()) as { messages: unknown[] }
     expect(j2.messages.length).toBe(0)
   })
+  it('consuming (no peek) read on a seat-bound token only consumes its own seat + broadcast rows, leaving other-seat mail untouched', async () => {
+    // Probes the DB-level seat predicate on the CONSUMING path directly (not just the
+    // route-level seat_mismatch refusal above) — the shape mupot#1325's own-seat default
+    // now exercises: no ?seat, own bound seat mail present alongside another seat's mail.
+    const { env: e, db } = env(AGENTS)
+    db._messages.push({ seq: 1, id: 'a', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm', kind: 'request', body: 'for cli', request_id: null, in_reply_to: null, created_at: 't0', read_at: null, target_seat: 'hadi-codex-cli' })
+    db._messages.push({ seq: 2, id: 'b', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm', kind: 'request', body: 'for mac', request_id: null, in_reply_to: null, created_at: 't0', read_at: null, target_seat: 'hadi-codex-mac' })
+    const res = await inboxApp.fetch(getReq('tok-code-cli'), e)
+    expect(res.status).toBe(200)
+    const j = (await res.json()) as { messages: Array<{ body: string }> }
+    expect(j.messages.map((m) => m.body)).toEqual(['for cli'])
+    // the OTHER seat's row must remain unread — the consuming UPDATE must not have touched it.
+    expect(db._messages.find((m) => m.id === 'b')?.read_at).toBeNull()
+  })
+  it('consuming (no peek) read on an UNSCOPED token (no seat label) stays broadcast-only — seat-tagged mail is never consumed by it', async () => {
+    // The "fail open" mutation: dropping the default branch's `AND target_seat IS NULL`
+    // would let a token with no seat binding at all silently consume every seat's mail on
+    // its next unscoped poll. tok-code carries no seat label (see the member_tokens fake).
+    const { env: e, db } = env(AGENTS)
+    db._messages.push({ seq: 1, id: 'a', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm', kind: 'request', body: 'broadcast', request_id: null, in_reply_to: null, created_at: 't0', read_at: null, target_seat: null })
+    db._messages.push({ seq: 2, id: 'b', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm', kind: 'request', body: 'for mac', request_id: null, in_reply_to: null, created_at: 't0', read_at: null, target_seat: 'hadi-codex-mac' })
+    const res = await inboxApp.fetch(getReq('tok-code'), e)
+    expect(res.status).toBe(200)
+    const j = (await res.json()) as { messages: Array<{ body: string }>; remaining: number; complete: boolean }
+    expect(j.messages.map((m) => m.body)).toEqual(['broadcast'])
+    expect(db._messages.find((m) => m.id === 'b')?.read_at).toBeNull()
+    // remaining/complete are computed by the SAME default-branch seatSql (messages.ts:801) —
+    // if it fails open, the seat-tagged row leaks into the caller's own "how much is left"
+    // count as if it were the caller's, not just into the returned page.
+    expect(j.remaining).toBe(0)
+    expect(j.complete).toBe(true)
+  })
+  it('PEEK (mupot#1325 P2) on an UNSCOPED token (no seat label) stays broadcast-only — seat-tagged mail is invisible on the peek path too', async () => {
+    // messages.ts:696 — the bearer PEEK default branch. This is the branch the SSE stream
+    // actually rides (streamInboxEvents always peeks). Proven live on real D1 in the PR
+    // brief: mutating this branch's `AND target_seat IS NULL` to `''` let an unlabelled
+    // token's `GET /api/inbox?peek=1` see another seat's SECRET mail. The existing consuming
+    // (no-peek) unscoped test above exercises messages.ts:734, a SEPARATE branch — it does
+    // NOT exercise this one.
+    const { env: e, db } = env(AGENTS)
+    db._messages.push({ seq: 1, id: 'a', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm', kind: 'request', body: 'broadcast', request_id: null, in_reply_to: null, created_at: 't0', read_at: null, target_seat: null })
+    db._messages.push({ seq: 2, id: 'b', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm', kind: 'request', body: 'SECRET for cli', request_id: null, in_reply_to: null, created_at: 't0', read_at: null, target_seat: 'hadi-codex-cli' })
+    const res = await inboxApp.fetch(getReq('tok-code', '?peek=1'), e)
+    expect(res.status).toBe(200)
+    const j = (await res.json()) as { messages: Array<{ body: string }>; consumed: boolean; remaining: number; complete: boolean }
+    expect(j.messages.map((m) => m.body)).toEqual(['broadcast'])
+    expect(j.consumed).toBe(false)
+    expect(j.remaining).toBe(0)
+    expect(j.complete).toBe(true)
+    // nothing was consumed by the peek, either way — confirm the seat-tagged row is untouched.
+    expect(db._messages.find((m) => m.id === 'b')?.read_at).toBeNull()
+  })
   it('peek=1 does not consume', async () => {
     const { env: e, db } = env(AGENTS)
     db._messages.push({ seq: 1, id: 'x', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm', kind: 'message', body: 'hi', request_id: null, in_reply_to: null, created_at: 't0', read_at: null })
@@ -282,6 +367,50 @@ describe('GET /api/inbox', () => {
     expect(j.consumed).toBe(false)
     const res2 = await inboxApp.fetch(getReq('tok-code', '?peek=1'), e)
     expect(((await res2.json()) as { messages: unknown[] }).messages.length).toBe(1) // still there
+  })
+  it('seat query (same-value echo on a seat-bound token) reads matching exact-seat and broadcast rows only', async () => {
+    const { env: e, db } = env(AGENTS)
+    db._messages.push({ seq: 1, id: 'a', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm', kind: 'request', body: 'broadcast', request_id: null, in_reply_to: null, created_at: 't0', read_at: null, target_seat: null })
+    db._messages.push({ seq: 2, id: 'b', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm', kind: 'request', body: 'for cli', request_id: null, in_reply_to: null, created_at: 't0', read_at: null, target_seat: 'hadi-codex-cli' })
+    db._messages.push({ seq: 3, id: 'c', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm', kind: 'request', body: 'for mac', request_id: null, in_reply_to: null, created_at: 't0', read_at: null, target_seat: 'hadi-codex-mac' })
+
+    const res = await inboxApp.fetch(getReq('tok-code-cli', '?peek=1&seat=hadi-codex-cli'), e)
+    expect(res.status).toBe(200)
+    const j = (await res.json()) as { messages: Array<{ body: string; target_seat: string | null }>; remaining: number }
+    expect(j.messages.map((m) => m.body)).toEqual(['broadcast', 'for cli'])
+    expect(j.messages.map((m) => m.target_seat)).toEqual([null, 'hadi-codex-cli'])
+    expect(j.remaining).toBe(0)
+  })
+  it('no ?seat on a seat-bound token still returns its own seat mail plus broadcasts', async () => {
+    // mupot#1325 P0-2: before the fix, omitting ?seat fell to `target_seat IS NULL`
+    // (broadcast-only) even for a token whose OWN seat mail is waiting — reported as
+    // messages:[] / complete:true, indistinguishable from "nothing to deliver".
+    const { env: e, db } = env(AGENTS)
+    db._messages.push({ seq: 1, id: 'a', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm', kind: 'request', body: 'broadcast', request_id: null, in_reply_to: null, created_at: 't0', read_at: null, target_seat: null })
+    db._messages.push({ seq: 2, id: 'b', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm', kind: 'request', body: 'for cli', request_id: null, in_reply_to: null, created_at: 't0', read_at: null, target_seat: 'hadi-codex-cli' })
+    db._messages.push({ seq: 3, id: 'c', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm', kind: 'request', body: 'for mac', request_id: null, in_reply_to: null, created_at: 't0', read_at: null, target_seat: 'hadi-codex-mac' })
+
+    const res = await inboxApp.fetch(getReq('tok-code-cli', '?peek=1'), e)
+    expect(res.status).toBe(200)
+    const j = (await res.json()) as { messages: Array<{ body: string }> }
+    expect(j.messages.map((m) => m.body).sort()).toEqual(['broadcast', 'for cli'])
+  })
+  it('?seat=<other seat> on a seat-bound token refuses seat_mismatch and touches no rows', async () => {
+    // mupot#1325 P0-1: this is the LEAK + DESTROY path — a token bound to one seat asking
+    // for another's mail via the query string, on the default CONSUMING path (no peek).
+    const { env: e, db } = env(AGENTS)
+    db._messages.push({ seq: 1, id: 'v', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm', kind: 'request', body: 'for mac only', request_id: null, in_reply_to: null, created_at: 't0', read_at: null, target_seat: 'hadi-codex-mac' })
+    const res = await inboxApp.fetch(getReq('tok-code-cli', '?seat=hadi-codex-mac'), e)
+    expect(res.status).toBe(403)
+    expect(await res.json()).toMatchObject({ error: 'seat_mismatch' })
+    // the victim's row must still be unread — nothing consumed, nothing leaked.
+    expect(db._messages.find((m) => m.id === 'v')?.read_at).toBeNull()
+  })
+  it('?seat=<anything> on a token with NO seat label refuses seat_not_bound', async () => {
+    const { env: e } = env(AGENTS)
+    const res = await inboxApp.fetch(getReq('tok-code', '?seat=hadi-codex-cli'), e)
+    expect(res.status).toBe(403)
+    expect(await res.json()).toMatchObject({ error: 'seat_not_bound' })
   })
   it('invalid limit → 400', async () => {
     const { env: e } = env(AGENTS)
@@ -318,6 +447,20 @@ describe('POST /api/inbox/send', () => {
     expect(j.to).toBe('ag-review')
     expect(db._messages[0].from_agent).toBe('ag-code')
     expect(db._messages[0].to_agent).toBe('ag-review')
+  })
+  it('accepts an exact target seat for the recipient inbox', async () => {
+    const { env: e, db } = env(AGENTS, {}, {}, new Set(), M_CODE_OBSERVES_S1)
+    const res = await inboxApp.fetch(postReq('tok-code', { to: 'review', body: 'build it', seat: 'hadi-codex-cli' }), e)
+    expect(res.status).toBe(200)
+    const j = (await res.json()) as { ok: boolean; target_seat: string | null }
+    expect(j.target_seat).toBe('hadi-codex-cli')
+    expect(db._messages[0].target_seat).toBe('hadi-codex-cli')
+  })
+  it('rejects a non-string exact target seat', async () => {
+    const { env: e } = env(AGENTS, {}, {}, new Set(), M_CODE_OBSERVES_S1)
+    const res = await inboxApp.fetch(postReq('tok-code', { to: 'review', body: 'build it', seat: 123 }), e)
+    expect(res.status).toBe(400)
+    expect(await res.json()).toMatchObject({ error: 'invalid_args', detail: 'seat must be a string' })
   })
   it('unknown recipient → 404', async () => {
     const { env: e } = env(AGENTS, {}, {}, new Set(), M_CODE_OBSERVES_S1)
@@ -475,6 +618,40 @@ describe('POST /api/inbox/signed', () => {
     expect((await postSigned(await signedInboxBody(kp.privateKey, 'ag-code'), e)).status).toBe(401)
   })
 
+  it('mupot#1325 P2: signed reads never carry a seat — the default branch (messages.ts:681/715/770) is the ONLY live branch for every signed keyed agent, and it must stay broadcast-only', async () => {
+    // readVerifiedSignedAgentInbox's input type has no `seat` field and its only caller
+    // (fleet/signed-inbox.ts) never supplies one — so targetSeat is unconditionally null on
+    // every signed read, meaning the default `AND target_seat IS NULL` branch is not a rare
+    // corner here, it is the entire live surface. A fail-open mutation on it would let any
+    // signed keyed agent read every seat-tagged row addressed to it.
+    const { kp, pubX } = await genKey()
+    const { env: e, db } = env(
+      AGENTS,
+      { 't:ag-code': { pubkey: pubX, algo: 'Ed25519', member_id: 'm-code' } },
+      {},
+      new Set(['ag-code']),
+    )
+    db._messages.push({ seq: 1, id: 'x', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm', kind: 'message', body: 'broadcast', request_id: null, in_reply_to: null, created_at: 't0', read_at: null, target_seat: null })
+    db._messages.push({ seq: 2, id: 'y', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm', kind: 'message', body: 'SECRET for cli', request_id: null, in_reply_to: null, created_at: 't0', read_at: null, target_seat: 'hadi-codex-cli' })
+
+    const peekRes = await postSigned(await signedInboxBody(kp.privateKey, 'ag-code', { peek: true, limit: 10 }), e)
+    expect(peekRes.status).toBe(200)
+    const peek = (await peekRes.json()) as { messages: Array<{ body: string }>; remaining: number; complete: boolean }
+    expect(peek.messages.map((m) => m.body)).toEqual(['broadcast'])
+    expect(peek.remaining).toBe(0)
+    expect(peek.complete).toBe(true)
+    expect(db._messages.find((m) => m.id === 'y')?.read_at).toBeNull()
+
+    const consumeRes = await postSigned(await signedInboxBody(kp.privateKey, 'ag-code', { peek: false, limit: 10 }), e)
+    expect(consumeRes.status).toBe(200)
+    const consumed = (await consumeRes.json()) as { messages: Array<{ body: string }>; remaining: number; complete: boolean }
+    expect(consumed.messages.map((m) => m.body)).toEqual(['broadcast'])
+    expect(consumed.remaining).toBe(0)
+    expect(consumed.complete).toBe(true)
+    // the seat-tagged row must remain untouched by the consuming UPDATE.
+    expect(db._messages.find((m) => m.id === 'y')?.read_at).toBeNull()
+  })
+
   it('unbound or disabled keys cannot read a signed inbox', async () => {
     const { kp, pubX } = await genKey()
     const unbound = env(AGENTS, { 't:ag-code': { pubkey: pubX, algo: 'Ed25519', member_id: null } })
@@ -529,6 +706,50 @@ describe('GET /api/inbox/stream', () => {
     const again = await inboxApp.fetch(getReq('tok-code', '?peek=1'), e)
     const j = (await again.json()) as { messages: unknown[] }
     expect(j.messages.length).toBe(1)
+  })
+  it('seat query (same-value echo on a seat-bound token) emits matching exact-seat and broadcast rows only', async () => {
+    const { env: e, db } = env(AGENTS)
+    db._messages.push({ seq: 1, id: 'a', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm-rev', kind: 'request', body: 'broadcast', request_id: null, in_reply_to: null, created_at: 't0', read_at: null, target_seat: null })
+    db._messages.push({ seq: 2, id: 'b', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm-rev', kind: 'request', body: 'for cli', request_id: null, in_reply_to: null, created_at: 't0', read_at: null, target_seat: 'hadi-codex-cli' })
+    db._messages.push({ seq: 3, id: 'c', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm-rev', kind: 'request', body: 'for mac', request_id: null, in_reply_to: null, created_at: 't0', read_at: null, target_seat: 'hadi-codex-mac' })
+    const res = await inboxApp.fetch(getReq('tok-code-cli', 'stream?seat=hadi-codex-cli'), e)
+    expect(res.status).toBe(200)
+    const reader = res.body!.getReader()
+    const { value } = await reader.read()
+    const text = new TextDecoder().decode(value)
+    await reader.cancel()
+    const event = JSON.parse(text.slice(5))
+    expect(event.type).toBe('initial')
+    expect(event.messages.map((m: { body: string }) => m.body)).toEqual(['broadcast', 'for cli'])
+    expect(event.since).toBe(2)
+  })
+  it('?seat=<other seat> on the stream route refuses seat_mismatch (JSON, not a stream)', async () => {
+    const { env: e } = env(AGENTS)
+    const res = await inboxApp.fetch(getReq('tok-code-cli', 'stream?seat=hadi-codex-mac'), e)
+    expect(res.status).toBe(403)
+    expect(await res.json()).toMatchObject({ error: 'seat_mismatch' })
+  })
+  it('no ?seat on the stream route still emits its own seat mail plus broadcasts', async () => {
+    // mupot#1325 P1: streamInboxEvents(...) is called with `seat` from resolveInboxSeatArg —
+    // the GET / route was proven to default an omitted ?seat to the token's OWN bound seat
+    // (see 'no ?seat on a seat-bound token still returns its own seat mail plus broadcasts'
+    // above); the mutation `seat,` -> `seat: c.req.query('seat'),` at the streamInboxEvents(...)
+    // call site here leaves the 403/seat_mismatch refusal above untouched (both branches still
+    // read the query string in that path) and only breaks this no-?seat case, where a
+    // seat-bound token's own mail would silently vanish from the initial flush.
+    const { env: e, db } = env(AGENTS)
+    db._messages.push({ seq: 1, id: 'a', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm-rev', kind: 'request', body: 'broadcast', request_id: null, in_reply_to: null, created_at: 't0', read_at: null, target_seat: null })
+    db._messages.push({ seq: 2, id: 'b', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm-rev', kind: 'request', body: 'for cli', request_id: null, in_reply_to: null, created_at: 't0', read_at: null, target_seat: 'hadi-codex-cli' })
+    db._messages.push({ seq: 3, id: 'c', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm-rev', kind: 'request', body: 'for mac', request_id: null, in_reply_to: null, created_at: 't0', read_at: null, target_seat: 'hadi-codex-mac' })
+    const res = await inboxApp.fetch(getReq('tok-code-cli', 'stream'), e)
+    expect(res.status).toBe(200)
+    const reader = res.body!.getReader()
+    const { value } = await reader.read()
+    const text = new TextDecoder().decode(value)
+    await reader.cancel()
+    const event = JSON.parse(text.slice(5))
+    expect(event.type).toBe('initial')
+    expect(event.messages.map((m: { body: string }) => m.body).sort()).toEqual(['broadcast', 'for cli'])
   })
   it('since=N skips already-seen messages in the initial flush', async () => {
     const { env: e, db } = env(AGENTS)
