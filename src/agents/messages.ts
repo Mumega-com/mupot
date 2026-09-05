@@ -1594,30 +1594,267 @@ async function guestVisibilityFenceIsCurrent(
 // visibility gating (e.g. rate-limit charge keys) only, never a substitute for the real send.
 // sendToRef consumes this decision and carries any matched guest grant into the atomic message
 // INSERT, so a membership/grant removed after preflight cannot authorize the write.
+type SendAgentRow = { id: string; squad_id: string; slug: string; name: string }
+
+async function agentsNamed(env: Env, name: string): Promise<SendAgentRow[]> {
+  const rows = await env.DB.prepare(
+    `SELECT id, squad_id, slug, name FROM agents
+      WHERE lower(name) = lower(?1) AND status != 'inactive'`,
+  ).bind(name).all<SendAgentRow>()
+  return rows.results ?? []
+}
+
+async function visibleNamedAgents(
+  env: Env,
+  name: string,
+  authz: SendTargetAuthz,
+  memberId: string,
+): Promise<Array<SendAgentRow & { guestFence?: GuestVisibilityFence }>> {
+  const named = await agentsNamed(env, name)
+  if (authz.isAdmin) return named
+  const visible: Array<SendAgentRow & { guestFence?: GuestVisibilityFence }> = []
+  for (const candidate of named) {
+    const visibility = await recipientVisibilityOnSenderSquads(env, memberId, authz.grants, candidate)
+    if (visibility.visible) visible.push({ ...candidate, guestFence: visibility.guestFence })
+  }
+  return visible
+}
+
+// ── nonAdminRefCandidates — id/slug candidate collection, ALL matches, no ambiguity guess ──
+// Mirrors resolveByIdThenSlug's own SQL (id exact match first; else every non-inactive slug
+// match) but returns the full candidate list instead of collapsing 2+ slug matches into an
+// opaque 'ambiguous' — resolveNonAdminSendTarget needs to know the full set before it can
+// decide whether "ambiguous" even matters to THIS sender.
+async function nonAdminRefCandidates(env: Env, ref: string): Promise<SendAgentRow[]> {
+  const byId = await env.DB.prepare(
+    `SELECT id, squad_id, slug, name FROM agents WHERE id = ?1 LIMIT 1`,
+  ).bind(ref).first<SendAgentRow>()
+  if (byId) return [byId]
+  const bySlug = await env.DB.prepare(
+    `SELECT id, squad_id, slug, name FROM agents WHERE slug = ?1 AND status != 'inactive'`,
+  ).bind(ref).all<SendAgentRow>()
+  return bySlug.results ?? []
+}
+
+// ── projectScopedRecipientVisible — the project-scoping half of "visible to this sender" ──
+// Case (b): a projectId is a legitimate, DISTINCT authorization channel from squad/guest
+// visibility, mirroring the exists checks validateMessageProjectAccess runs at write time
+// (both squads reach the project, project not archived) so this pre-check and the eventual
+// write-time authority agree. Deliberately its own predicate, consulted only as the LAST
+// resort in resolveNonAdminSendTarget (see its doc comment for why order matters).
+async function projectScopedRecipientVisible(
+  env: Env,
+  projectId: string,
+  fromAgent: string,
+  toAgentId: string,
+): Promise<boolean> {
+  const row = await env.DB.prepare(
+    `SELECT 1 FROM projects p
+      WHERE p.id = ?1
+        AND p.status <> 'archived'
+        AND EXISTS (
+          SELECT 1 FROM memberships sender_membership
+          JOIN project_squad_access sender_access
+            ON sender_access.squad_id = sender_membership.squad_id
+           AND sender_access.project_id = p.id
+           WHERE sender_membership.agent_id = ?2
+        )
+        AND EXISTS (
+          SELECT 1 FROM memberships recipient_membership
+          JOIN project_squad_access recipient_access
+            ON recipient_access.squad_id = recipient_membership.squad_id
+           AND recipient_access.project_id = p.id
+           WHERE recipient_membership.agent_id = ?3
+        )
+      LIMIT 1`,
+  ).bind(projectId, fromAgent, toAgentId).first()
+  return row !== null
+}
+
+// ── resolveNonAdminSendTarget — THE ONE non-admin resolution gate ─────────────────────
+// Both resolveVisibleSendTarget and sendToRef delegate here for their non-admin decision,
+// so the comment above ("the EXACT SAME check") is literally true rather than aspirational.
+//
+// INVARIANT (PR #1321 re-gate — kills the deferred-fallback DESIGN, not just its cells):
+// for a non-admin sender, every field of the response must be a pure function of the set of
+// agents the sender can see. The old design chose a resolution PATH first (id/slug vs.
+// name) and decided hidden/visible only afterward, then exempted the projectId branch from
+// the name-fallback via a caller-supplied `deferInvisibleFallback` flag / an
+// `invisible_resolved` result that only sendToRef ever set. Both are deleted. Two distinct
+// leaks are closed here, not just one:
+//
+//   (Pattern 6 — escape hatch pre-empts the safe path) A hidden agent whose id/slug matched
+//   the ref could steal or refuse a project-scoped send addressed by a visible agent's
+//   display name, because the old code checked project authorization on the id/slug
+//   candidate BEFORE ever trying the name. Fix: project authorization is the LAST resort,
+//   tried only after BOTH the id/slug and the name lookup have been exhausted via
+//   squad/guest visibility alone.
+//
+//   (Pattern 8 — ambiguity narrows the oracle, it does not delete it) resolveAgentRef
+//   collapses 2+ slug matches into a single opaque 'ambiguous' BEFORE visibility is ever
+//   consulted, so whether a display-name send survives used to depend on "are there >=2
+//   hidden holders of this slug", not just ">=1". Fix: collect every id/slug candidate
+//   (nonAdminRefCandidates) and filter ALL of them by squad/guest visibility before asking
+//   "is this ambiguous" — an ambiguity purely among rows this sender cannot see is worth
+//   nothing more than a single not_found, in either direction.
+//
+// The rule, staged and applied uniformly, independent of hidden-row COUNT at every stage:
+//   1. Collect every id/slug candidate, filter through squad/guest visibility
+//      (recipientVisibilityOnSenderSquads) only.
+//        - exactly one visible -> that is the target. Done (case a, no fallback).
+//        - two or more visible -> refuse (genuinely ambiguous to THIS sender).
+//        - zero visible (0, 1, or many INVISIBLE holders — doesn't matter) -> stage 2.
+//   2. Collect display-name candidates, filtered through the SAME squad/guest visibility.
+//        - exactly one visible -> that is the target.
+//        - two or more visible -> refuse.
+//        - zero visible -> stage 3.
+//   3. Only now, and only if a projectId was supplied, may project-scoped authorization
+//      (case b) rescue an id/slug candidate — filtering the SAME id/slug candidate set from
+//      stage 1 through projectScopedRecipientVisible, with the SAME one/many/zero rule.
+//        - exactly one project-visible -> that is the target.
+//        - otherwise (zero, or two+) -> refuse.
+// Only once a visible target has been chosen does the caller (sendToRef) let
+// sendAgentMessage's own validateMessageProjectAccess run — as the authoritative,
+// race-safe, write-time check — on THAT target.
+type NonAdminResolution =
+  | { ok: true; value: SendAgentRow; guestFence?: GuestVisibilityFence; viaProjectOnly?: boolean }
+  | { ok: false; reason: 'send_target_not_visible' }
+
+async function resolveNonAdminSendTarget(
+  env: Env,
+  toRef: string,
+  authz: SendTargetAuthz,
+  memberId: string,
+  opts: { fromAgent?: string; projectId?: string } = {},
+): Promise<NonAdminResolution> {
+  const fromAgent = opts.fromAgent ?? ''
+
+  // Stage 1: id/slug, squad/guest visibility only.
+  const idSlugCandidates = await nonAdminRefCandidates(env, toRef)
+  const idSlugSquadVisible: Array<SendAgentRow & { guestFence?: GuestVisibilityFence }> = []
+  for (const candidate of idSlugCandidates) {
+    const visibility = await recipientVisibilityOnSenderSquads(env, memberId, authz.grants, candidate)
+    if (visibility.visible) idSlugSquadVisible.push({ ...candidate, guestFence: visibility.guestFence })
+  }
+  if (idSlugSquadVisible.length >= 2) {
+    return { ok: false, reason: 'send_target_not_visible' }
+  }
+
+  // Stage 2: display name, squad/guest visibility only — unconditionally ahead of project,
+  // regardless of how many (if any) invisible id/slug candidates stage 1 saw. Computed
+  // BEFORE stage 1 is allowed to return, because a visible slug and a DIFFERENT visible
+  // agent's display name can both match `toRef` — silently preferring stage 1's precedence
+  // in that case is a squat vector (rename your own agent's slug to a colleague's display
+  // name and capture their name-addressed mail). F3, 2026-09.
+  const nameSquadVisible = await visibleNamedAgents(env, toRef, authz, memberId)
+  if (nameSquadVisible.length >= 2) {
+    return { ok: false, reason: 'send_target_not_visible' }
+  }
+
+  if (idSlugSquadVisible.length === 1) {
+    if (nameSquadVisible.length === 1 && nameSquadVisible[0].id !== idSlugSquadVisible[0].id) {
+      // Same ref matches two DIFFERENT visible agents — one by slug, one by name. The
+      // overwhelmingly common case (an agent's own slug and name both match itself) is
+      // excluded by the id comparison above, not by count, so it still resolves cleanly.
+      return { ok: false, reason: 'send_target_not_visible' }
+    }
+    return { ok: true, value: idSlugSquadVisible[0], guestFence: idSlugSquadVisible[0].guestFence }
+  }
+
+  if (nameSquadVisible.length === 1) {
+    return { ok: true, value: nameSquadVisible[0], guestFence: nameSquadVisible[0].guestFence }
+  }
+
+  // Stage 3: last resort — project-scoped authorization over the id/slug candidate set,
+  // only if a projectId was supplied and stage 1 actually found candidates to authorize.
+  if (opts.projectId !== undefined && idSlugCandidates.length > 0) {
+    const projectVisible: SendAgentRow[] = []
+    for (const candidate of idSlugCandidates) {
+      if (await projectScopedRecipientVisible(env, opts.projectId, fromAgent, candidate.id)) {
+        projectVisible.push(candidate)
+      }
+    }
+    if (projectVisible.length === 1) {
+      return { ok: true, value: projectVisible[0], viaProjectOnly: true }
+    }
+  }
+  return { ok: false, reason: 'send_target_not_visible' }
+}
+
+// The exact same "is this non-admin authz a single, coherent member" predicate, used by
+// both resolveVisibleSendTarget (which must derive the member id from the grants it was
+// handed) and sendToRef (which is handed the member id directly) — one function so the
+// "EXACT SAME check" claim above is literally true.
+function nonAdminGrantsSingleMember(grants: CapabilityGrant[], memberId: string): boolean {
+  return !grants.some((grant) => grant.member_id !== memberId)
+}
+
+
+// F2, 2026-09: src/orient/service.ts's rosterLabel renders `Name (@slug)` so an agent can
+// copy the `@slug` portion straight into send.to — but no resolver here ever stripped the
+// leading `@`, so the advertised handle failed to resolve. Strip at most ONE leading `@`
+// before resolution. The raw ref is always tried FIRST and the stripped retry only runs
+// when the raw ref resolves to nothing, so an agent whose slug or name legitimately begins
+// with `@` remains reachable by its literal value.
+function stripOneLeadingAt(ref: string): string | null {
+  return ref.length > 1 && ref[0] === '@' ? ref.slice(1) : null
+}
+
 export async function resolveVisibleSendTarget(
   env: Env,
   toRef: string,
   authz: SendTargetAuthz,
+  memberId?: string,
 ): Promise<
   | { ok: true; value: { id: string; squad_id: string; slug: string; name: string } }
   | { ok: false; reason: 'recipient_not_found' | 'recipient_ambiguous' | 'send_target_not_visible' }
 > {
-  const resolved = await resolveAgentRef(env, toRef)
-  if (!resolved.ok) {
-    if (!authz.isAdmin) return { ok: false, reason: 'send_target_not_visible' }
-    return { ok: false, reason: resolved.reason === 'ambiguous' ? 'recipient_ambiguous' : 'recipient_not_found' }
+  const result = await resolveVisibleSendTargetOnce(env, toRef, authz, memberId)
+  if (result.ok) return result
+  const stripped = stripOneLeadingAt(toRef)
+  if (stripped !== null) {
+    const retried = await resolveVisibleSendTargetOnce(env, stripped, authz, memberId)
+    if (retried.ok) return retried
   }
-  if (authz.isAdmin) return { ok: true, value: resolved.value }
-  const memberIds = [...new Set(authz.grants.map((grant) => grant.member_id).filter(Boolean))]
-  if (memberIds.length !== 1) return { ok: false, reason: 'send_target_not_visible' }
-  const visibility = await recipientVisibilityOnSenderSquads(
-    env,
-    memberIds[0],
-    authz.grants,
-    resolved.value,
-  )
-  if (!visibility.visible) return { ok: false, reason: 'send_target_not_visible' }
-  return { ok: true, value: resolved.value }
+  return result
+}
+
+async function resolveVisibleSendTargetOnce(
+  env: Env,
+  toRef: string,
+  authz: SendTargetAuthz,
+  memberId?: string,
+): Promise<
+  | { ok: true; value: { id: string; squad_id: string; slug: string; name: string } }
+  | { ok: false; reason: 'recipient_not_found' | 'recipient_ambiguous' | 'send_target_not_visible' }
+> {
+  if (authz.isAdmin) {
+    const resolved = await resolveAgentRef(env, toRef)
+    if (resolved.ok) return { ok: true, value: resolved.value }
+    const named = await agentsNamed(env, toRef)
+    if (named.length === 1) return { ok: true, value: named[0] }
+    return { ok: false, reason: named.length > 1 ? 'recipient_ambiguous' : 'recipient_not_found' }
+  }
+  // Prefer the caller's own identity when it hands one in (e.g. src/channels/index.ts,
+  // which already has the resolved member id in scope) so both callers apply the EXACT
+  // SAME predicate to the EXACT SAME identity, rather than each independently
+  // reconstructing "the" member id from the grants array. Reconstructing from grants
+  // remains the fallback for callers that only have an authz bag.
+  const distinctMemberIds = [...new Set(authz.grants.map((grant) => grant.member_id).filter(Boolean))]
+  const resolvedMemberId = memberId ?? distinctMemberIds[0]
+  if (
+    resolvedMemberId === undefined ||
+    distinctMemberIds.length !== 1 ||
+    !nonAdminGrantsSingleMember(authz.grants, resolvedMemberId)
+  ) {
+    return { ok: false, reason: 'send_target_not_visible' }
+  }
+  // No projectId here by design — this primitive is for pre-send visibility gating only
+  // (e.g. rate-limit charge keys); a caller with a projectId must go through sendToRef
+  // itself, which passes one through to the same resolveNonAdminSendTarget call.
+  const result = await resolveNonAdminSendTarget(env, toRef, authz, resolvedMemberId)
+  if (result.ok) return { ok: true, value: result.value }
+  return { ok: false, reason: 'send_target_not_visible' }
 }
 
 export async function sendToRef(
@@ -1636,36 +1873,83 @@ export async function sendToRef(
   authz: SendTargetAuthz,
   opts: Opts = {},
 ): Promise<SendToRefResult> {
-  const resolved = await resolveAgentRef(env, input.toRef)
-  if (!resolved.ok) {
-    if (!authz.isAdmin) return { ok: false, reason: 'send_target_not_visible' }
-    return { ok: false, reason: resolved.reason === 'ambiguous' ? 'recipient_ambiguous' : 'recipient_not_found' }
+  // squadViaProjectOnly tracks whether the chosen target was visible ONLY through the
+  // folded-in projectId channel (never through squad/guest visibility). Revealing
+  // sendAgentMessage's specific failure reason in that case would leak the same
+  // existence-oracle bit the old `invisible_resolved` defer used to leak; when the target
+  // was already squad/guest-visible, the specific reason is legitimate feedback the sender
+  // already had every right to (they could already see this recipient).
+  let resolved: { value: SendAgentRow }
+  let squadViaProjectOnly = false
+  let guestVisibilityFence: GuestVisibilityFence | undefined
+
+  // F2, 2026-09: see stripOneLeadingAt's doc comment above resolveVisibleSendTarget. Try the
+  // raw ref first; only retry with the `@` stripped if the raw ref resolved to nothing, so a
+  // legitimately `@`-prefixed slug/name is still reachable by its literal value.
+  type Resolution =
+    | { ok: true; resolved: { value: SendAgentRow }; squadViaProjectOnly: boolean; guestVisibilityFence?: GuestVisibilityFence }
+    | { ok: false; reason: 'recipient_not_found' | 'recipient_ambiguous' | 'send_target_not_visible' }
+
+  const attemptResolve = async (toRef: string): Promise<Resolution> => {
+    if (authz.isAdmin) {
+      // Admin behaviour is unchanged: existence-only resolve, falling back to a name lookup on
+      // EITHER not_found or ambiguous (an admin operator picking a genuinely ambiguous name is
+      // expected to disambiguate by id; there is no visibility gate to protect here).
+      const r = await resolveAgentRef(env, toRef)
+      if (r.ok) {
+        return { ok: true, resolved: r, squadViaProjectOnly: false }
+      }
+      if (r.reason === 'ambiguous') {
+        // An ambiguous slug means "I found 2+ rows and refuse to guess" — that refusal must
+        // never be laundered into a name lookup on ANY path. Falling through here would let an
+        // admin's ambiguous slug send silently deliver to a DIFFERENT agent that merely shares
+        // a display name with one of the slug matches (the P1 defect blocked on the non-admin
+        // path, F1 2026-09). Refuse outright, regardless of how many name candidates exist.
+        return { ok: false, reason: 'recipient_ambiguous' }
+      }
+      const visible = await visibleNamedAgents(env, toRef, authz, input.fromMember)
+      if (visible.length !== 1) {
+        if (visible.length > 1) return { ok: false, reason: 'recipient_ambiguous' }
+        return { ok: false, reason: 'recipient_not_found' }
+      }
+      return { ok: true, resolved: { value: visible[0] }, squadViaProjectOnly: false }
+    }
+    if (!nonAdminGrantsSingleMember(authz.grants, input.fromMember)) {
+      return { ok: false, reason: 'send_target_not_visible' }
+    }
+    // The EXACT SAME non-admin decision resolveVisibleSendTarget applies — see
+    // resolveNonAdminSendTarget's doc comment for the full rule. The chosen target is
+    // already visible to the sender (squad/guest OR project-scoped, whichever the unified
+    // predicate found) BEFORE sendAgentMessage is ever called — there is no deferred,
+    // post-hoc authorization left to run. sendAgentMessage's own validateMessageProjectAccess
+    // still runs below as the authoritative, race-safe write-time check on that same target.
+    const result = await resolveNonAdminSendTarget(env, toRef, authz, input.fromMember, {
+      fromAgent: input.fromAgent,
+      projectId: input.projectId,
+    })
+    if (result.ok) {
+      return {
+        ok: true,
+        resolved: { value: result.value },
+        guestVisibilityFence: result.guestFence,
+        squadViaProjectOnly: result.viaProjectOnly === true,
+      }
+    }
+    return { ok: false, reason: 'send_target_not_visible' }
   }
 
-  // squadVisible stays `true` for admins (case (a) is never consulted, so it must never gate
-  // the fallback-collapse below either) and is only computed — and only matters — once we know
-  // we're in the non-admin path.
-  let squadVisible = true
-  let guestVisibilityFence: GuestVisibilityFence | undefined
-  if (!authz.isAdmin) {
-    if (authz.grants.some((grant) => grant.member_id !== input.fromMember)) {
-      return { ok: false, reason: 'send_target_not_visible' }
-    }
-    const visibility = await recipientVisibilityOnSenderSquads(
-      env,
-      input.fromMember,
-      authz.grants,
-      resolved.value,
-    )
-    squadVisible = visibility.visible
-    guestVisibilityFence = visibility.guestFence
-    // Case (a) failed. Case (b) can only save it if a projectId is attached — otherwise there
-    // is no other authorization surface to consult, so refuse now, before ever calling
-    // sendAgentMessage (no DB write attempted, no existence oracle for the target).
-    if (!squadVisible && input.projectId === undefined) {
-      return { ok: false, reason: 'send_target_not_visible' }
+  let attempt = await attemptResolve(input.toRef)
+  if (!attempt.ok) {
+    const stripped = stripOneLeadingAt(input.toRef)
+    if (stripped !== null) {
+      const retried = await attemptResolve(stripped)
+      if (retried.ok) attempt = retried
     }
   }
+  if (!attempt.ok) return { ok: false, reason: attempt.reason }
+  resolved = attempt.resolved
+  guestVisibilityFence = attempt.guestVisibilityFence
+  squadViaProjectOnly = attempt.squadViaProjectOnly
 
   const res = await sendAgentMessage(
     env,
@@ -1684,17 +1968,19 @@ export async function sendToRef(
     guestVisibilityFence ? { ...opts, guestVisibilityFence } : opts,
   )
   if (!res.ok) {
-    // Existence-oracle closure (re-gate fix, #401): once squad-visibility (case a) has failed,
-    // reaching sendAgentMessage AT ALL already proves resolveAgentRef found a real agent — the
-    // early `!resolved.ok` branch above is the ONLY path that returns before validation for a
-    // ref that doesn't exist. So for a non-admin whose squad check failed, ANY failure reason
-    // sendAgentMessage can produce here — project_not_found / project_archived /
-    // project_access_denied, but just as much invalid_body / request_id_conflict / inbox_full /
-    // db_error — is itself a distinguisher (a nonexistent ref can never surface those). Collapse
-    // every one of them to the SAME send_target_not_visible a nonexistent ref gets. This does
-    // not touch the admin path or the case-(a)-succeeded path, where the specific reason is
-    // legitimate operational feedback, not a leak.
-    if (!authz.isAdmin && !squadVisible) {
+    // Existence-oracle closure (re-gate fix, #401): resolveNonAdminSendTarget above already
+    // proved the chosen target is visible to this sender (case a or the folded-in project
+    // case). Reaching sendAgentMessage at all means the ref resolved to a real, now-visible
+    // agent — so ANY failure reason sendAgentMessage can produce here — project_not_found /
+    // project_archived / project_access_denied, but just as much invalid_body /
+    // request_id_conflict / inbox_full / db_error — is itself a distinguisher a nonexistent
+    // ref could never surface. Collapse every one of them to the SAME send_target_not_visible
+    // a nonexistent ref gets — but only when the target was visible ONLY through the folded-in
+    // project channel; once a target is squad/guest-visible the sender already has the right
+    // to the specific reason (project_access_denied, invalid_body, etc.), same as the
+    // pre-#1321 case-(a)-succeeded path. This does not touch the admin path either, where the
+    // specific reason is legitimate operational feedback, not a leak.
+    if (!authz.isAdmin && squadViaProjectOnly) {
       return { ok: false, reason: 'send_target_not_visible' }
     }
     return res

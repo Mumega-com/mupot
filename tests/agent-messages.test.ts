@@ -7,6 +7,12 @@ import { sendAgentMessage, readAgentInbox } from '../src/agents/messages'
 import { TOOLS } from '../src/mcp/index'
 import type { Env, AuthContext, CapabilityGrant } from '../src/types'
 
+// SQLite's lower() is ASCII-only — it does not fold Unicode case. Use this, never
+// String.prototype.toLowerCase(), when mocking a `lower(...)` SQL predicate.
+function asciiLower(s: string): string {
+  return s.replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32))
+}
+
 // ── faithful in-memory D1 ─────────────────────────────────────────────────────────────────
 interface MsgRow {
   seq: number
@@ -174,6 +180,13 @@ function makeDb(
     if (sql.includes('FROM agents WHERE slug = ?1')) {
       const [ref] = b as [string]
       return agents.filter((a) => a.slug === ref)
+    }
+    if (sql.includes('WHERE lower(name) = lower(?1)')) {
+      // F4, 2026-09: SQLite's lower() is ASCII-only — it does NOT fold Unicode case (e.g.
+      // Élodie/ÉLODIE never match in real D1). JS .toLowerCase() folds Unicode, so a naive
+      // mock here would pass a test that fails in production. Mirror D1 with an ASCII-only fold.
+      const [ref] = b as [string]
+      return agents.filter((a) => asciiLower(a.name) === asciiLower(String(ref)))
     }
     throw new Error('unhandled all sql: ' + sql)
   }

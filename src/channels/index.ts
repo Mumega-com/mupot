@@ -523,7 +523,7 @@ async function dispatchMention(
   const bucket = new Date().toISOString().slice(0, 13) + ':00:00Z'
   const tenant = env.TENANT_SLUG ?? 'mumega'
   const isAdmin = hasCapability(grants, 'org', null, 'admin')
-  const visible = await resolveVisibleSendTarget(env, target, { isAdmin, grants })
+  const visible = await resolveVisibleSendTarget(env, target, { isAdmin, grants }, memberId)
   if (visible.ok) {
     const perRecipientInc = await env.DB.prepare(
       `INSERT INTO channel_mention_budget_v2 (tenant, from_member, agent_id, hour_bucket, count)
