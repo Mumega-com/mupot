@@ -148,6 +148,16 @@ export function enrollClientSnippet(slug: string, origin: string, seat: string):
  * beyond mint_agent_token's bar ... that bar is an over-restriction of one
  * surface; enroll matches the MCP primitive."
  */
+/** Is this member row live? A MISSING row is deliberately not this function's business —
+ *  callers distinguish "no identity to check" from "identity revoked", because conflating
+ *  them either locks out the bootstrap owner or admits a suspended one. */
+async function memberIsActive(env: Env, memberId: string): Promise<boolean> {
+  const row = await env.DB.prepare(
+    `SELECT status FROM members WHERE id = ?1 AND tenant = ?2`,
+  ).bind(memberId, env.TENANT_SLUG).first<{ status: string }>()
+  return row?.status === 'active'
+}
+
 export async function authorizeEnrollMint(
   env: Env,
   auth: AuthContext,
@@ -164,8 +174,23 @@ export async function authorizeEnrollMint(
   // them via isOrgAdmin. Two mint surfaces disagreeing about who the owner is was
   // the defect the owner actually hit as "you don't have access" after enroll. A
   // squad admin still does not need an org role; that bar is unchanged below.
-  if (isOrgAdmin(auth)) return { ok: true }
   const memberId = await resolveEnrollMemberId(env, auth)
+  // ORDER MATTERS, and getting it wrong is how the first pass at this fix shipped a worse
+  // hole than the one it closed. `isOrgAdmin` reads auth.capabilities, which the login
+  // bridge fills via resolveCapabilities — a bare SELECT on `capabilities` with NO
+  // members.status filter (mupot#1335). Admitting on it BEFORE the status gate let a
+  // SUSPENDED org admin mint: it closed the suspended squad-admin class and opened the
+  // higher-privilege one.
+  //
+  // Two distinctions this has to keep straight, and a grants-length proxy gets both wrong:
+  //   - a MISSING members row is not a suspended one. memberId === null is the documented
+  //     bootstrap-owner shape (capability.ts:50-52) — there is no identity to revoke, admit.
+  //   - an ACTIVE member with NO capability rows is not suspended either. Reading standing
+  //     as "grants.length > 0" would refuse a legacy role='owner' who holds no grant rows,
+  //     which is precisely the principal isOrgAdmin exists to protect.
+  // So read the status itself rather than any consequence of it.
+  const memberIsRevoked = memberId ? !(await memberIsActive(env, memberId)) : false
+  if (isOrgAdmin(auth) && !memberIsRevoked) return { ok: true }
   // resolveHumanStandingGrants, not raw resolveCapabilities: a member whose
   // members.status has moved to suspended gets [] here even when
   // resolveEnrollMemberId still resolves an id for them, because step 2 of

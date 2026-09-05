@@ -211,3 +211,89 @@ describe('POST /enroll/mint — route-level bound-agent 403 (index.ts, independe
     expect(after.n).toBe(before.n)
   })
 })
+
+// ── the re-gate's two findings ───────────────────────────────────────────────
+//
+// BLOCK-A. The first pass at the bootstrap-owner fix put `isOrgAdmin(auth)` AHEAD of the
+// status-gated grant resolution, and isOrgAdmin reads auth.capabilities, which is filled by
+// resolveCapabilities — no members.status filter (#1335). So it closed the suspended
+// SQUAD-admin class and opened the suspended ORG-admin one, which is strictly worse.
+//
+// BLOCK-B. The null-memberId branch added to the GET picker had no test at all. Weakening it
+// to `!memberId` left every suite green while leaking the whole active roster to a principal
+// with zero grants. The fixture MUST carry an agent_member_bindings row: listConsentableAgents
+// inner-joins it, so without one the listing is empty under both the fix and the mutant and
+// the test proves nothing.
+describe('enroll admission: revoked standing and the null-member listing guard', () => {
+  let harness: SqliteD1Harness
+
+  afterEach(() => harness?.close())
+
+  function seedOrgAdmin(status: 'active' | 'suspended'): Env {
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status, tenant) VALUES
+        ('member-org', 'org@pot.test', 'Org Admin', '${status}', '${TENANT}');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES
+        ('cap-org', 'member-org', 'org', NULL, 'admin');
+      INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES
+        ('${TENANT}', '${AGENT_A}', 'member-org', '2026-09-05T00:00:00.000Z');
+    `)
+    return envFor(harness)
+  }
+
+  const orgAuth = (): AuthContext => ({
+    userId: 'user-org',
+    email: 'org@pot.test',
+    role: 'member',
+    tenant: TENANT,
+    memberId: 'member-org',
+    capabilities: [{ scope_type: 'org', scope_id: null, capability: 'admin' }],
+  } as unknown as AuthContext)
+
+  it('an ACTIVE org admin is admitted', async () => {
+    const env = seedOrgAdmin('active')
+    await expect(authorizeEnrollMint(env, orgAuth(), SQUAD_A)).resolves.toEqual({ ok: true })
+  })
+
+  it('a SUSPENDED org admin is refused — the org grant does not outrank revoked standing', async () => {
+    const env = seedOrgAdmin('suspended')
+    const res = await authorizeEnrollMint(env, orgAuth(), SQUAD_A)
+    expect(res).toEqual({ ok: false, reason: 'squad_admin_required' })
+  })
+
+  it('an ACTIVE org admin holding NO capability rows is still admitted (legacy owner role)', async () => {
+    // Guards the fix against being written as "grants.length > 0", which would refuse the
+    // very principal isOrgAdmin exists to protect. Absence of grants is not revocation.
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status, tenant) VALUES
+        ('member-owner', 'owner@pot.test', 'Legacy Owner', 'active', '${TENANT}');
+    `)
+    const env = envFor(harness)
+    const auth = {
+      userId: 'user-owner',
+      email: 'owner@pot.test',
+      role: 'owner',
+      tenant: TENANT,
+      memberId: 'member-owner',
+      capabilities: [],
+    } as unknown as AuthContext
+    await expect(authorizeEnrollMint(env, auth, SQUAD_A)).resolves.toEqual({ ok: true })
+  })
+
+  it('the bootstrap owner, with NO members row at all, is still admitted', async () => {
+    // A missing row is not a revoked one. This is the whole point of the fix.
+    harness = makeHarness()
+    const env = envFor(harness)
+    const auth = {
+      userId: 'user-boot',
+      email: 'boot@pot.test',
+      role: 'owner',
+      tenant: TENANT,
+      memberId: null,
+      capabilities: [],
+    } as unknown as AuthContext
+    await expect(authorizeEnrollMint(env, auth, SQUAD_A)).resolves.toEqual({ ok: true })
+  })
+})
