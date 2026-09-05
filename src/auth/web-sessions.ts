@@ -78,6 +78,11 @@ function isMissingTableError(err: unknown): boolean {
   return /no such table:\s*(web_sessions|human_login_identities)\b/i.test(message)
 }
 
+export function isMissingWebSessionsTableError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err)
+  return /no such table:\s*web_sessions\b/i.test(message)
+}
+
 // ── create ────────────────────────────────────────────────────────────────────
 
 export interface CreateWebSessionInput {

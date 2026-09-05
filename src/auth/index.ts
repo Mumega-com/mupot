@@ -1040,6 +1040,23 @@ async function loadAuthFromCookie(c: Context<AppEnv>): Promise<AuthContext | nul
     tenant: c.env.TENANT_SLUG, // tenant is environment-derived, not client-supplied
   }
 
+  if (!record.webSessionRegistered && record.email && c.env.DB) {
+    try {
+      const member = await c.env.DB.prepare(
+        `SELECT status FROM members
+          WHERE lower(email) = ?1 AND tenant = ?2
+          LIMIT 1`,
+      ).bind(record.email.trim().toLowerCase(), c.env.TENANT_SLUG).first<{ status: string }>()
+      if (typeof member?.status === 'string' && member.status !== 'active') {
+        await c.env.SESSIONS.delete(sessionKey(sessionId))
+        return null
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      if (!/no such (?:table:\s*members|column:\s*email)\b/i.test(message)) throw err
+    }
+  }
+
   // Email→member bridge (the DASHBOARD member-resolution the members schema always
   // specified — "workspace, IM, or the dashboard, all resolving to member_id +
   // capabilities" — but which the web-session path never implemented). A plain

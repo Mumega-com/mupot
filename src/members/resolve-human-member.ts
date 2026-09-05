@@ -18,6 +18,11 @@ export interface ResolveHumanMemberInput {
   email?: string | null
 }
 
+export interface ResolvedHumanMember {
+  id: string
+  status: string
+}
+
 function normalizeEmail(email: string): string {
   return email.trim().toLowerCase()
 }
@@ -57,13 +62,17 @@ async function ownerAliasMemberId(env: Env, email: string): Promise<string | nul
   return uniqueOrgOwnerId(env)
 }
 
-async function activeMemberId(env: Env, tenant: string, memberId: string): Promise<string | null> {
-  const row = await env.DB.prepare(
-    `SELECT id FROM members
-      WHERE id = ?1 AND tenant = ?2 AND status = 'active'
+async function memberById(
+  env: Env,
+  tenant: string,
+  memberId: string,
+  activeOnly: boolean,
+): Promise<ResolvedHumanMember | null> {
+  return env.DB.prepare(
+    `SELECT id, status FROM members
+      WHERE id = ?1 AND tenant = ?2${activeOnly ? " AND status = 'active'" : ''}
       LIMIT 1`,
-  ).bind(memberId, tenant).first<{ id: string }>()
-  return row?.id ?? null
+  ).bind(memberId, tenant).first<ResolvedHumanMember>()
 }
 
 /**
@@ -92,16 +101,17 @@ export function isMissingHumanLoginIdentitiesTable(err: unknown): boolean {
   return /no such table:\s*human_login_identities/i.test(msg)
 }
 
-export async function resolveHumanMemberId(
+async function resolveHumanMemberRecord(
   env: Env,
   input: ResolveHumanMemberInput,
-): Promise<string | null> {
+  activeOnly: boolean,
+): Promise<ResolvedHumanMember | null> {
   const tenant = input.tenant
   const joinKeyPresent = !!(input.provider && input.providerSubject)
   try {
     if (input.provider && input.providerSubject) {
       const ident = await resolveLoginIdentity(env, tenant, input.provider, input.providerSubject)
-      if (ident) return activeMemberId(env, tenant, ident.member_id)
+      if (ident) return memberById(env, tenant, ident.member_id, activeOnly)
     }
 
     const email = input.email ? normalizeEmail(input.email) : ''
@@ -110,24 +120,24 @@ export async function resolveHumanMemberId(
     if (email && !joinKeyPresent) {
       const identByEmail = input.provider
         ? await env.DB.prepare(
-            `SELECT h.member_id AS member_id
+            `SELECT h.member_id AS id, m.status AS status
                FROM human_login_identities h
                JOIN members m ON m.id = h.member_id AND m.tenant = h.tenant
               WHERE h.tenant = ?1 AND lower(h.verified_email) = ?2 AND h.revoked_at IS NULL
                 AND h.provider = ?3
-                AND m.status = 'active'
+                ${activeOnly ? "AND m.status = 'active'" : ''}
               LIMIT 2`,
-          ).bind(tenant, email, input.provider).all<{ member_id: string }>()
+          ).bind(tenant, email, input.provider).all<ResolvedHumanMember>()
         : await env.DB.prepare(
-            `SELECT h.member_id AS member_id
+            `SELECT h.member_id AS id, m.status AS status
                FROM human_login_identities h
                JOIN members m ON m.id = h.member_id AND m.tenant = h.tenant
               WHERE h.tenant = ?1 AND lower(h.verified_email) = ?2 AND h.revoked_at IS NULL
-                AND m.status = 'active'
+                ${activeOnly ? "AND m.status = 'active'" : ''}
               LIMIT 2`,
-          ).bind(tenant, email).all<{ member_id: string }>()
+          ).bind(tenant, email).all<ResolvedHumanMember>()
       const rows = identByEmail.results ?? []
-      if (rows.length === 1) return rows[0].member_id
+      if (rows.length === 1) return rows[0]
       if (rows.length > 1) return null
     }
   } catch (err) {
@@ -144,8 +154,8 @@ export async function resolveHumanMemberId(
   try {
     const byEmail = joinKeyPresent
       ? await env.DB.prepare(
-          `SELECT id FROM members
-            WHERE lower(email) = ?1 AND tenant = ?2 AND status = 'active'
+          `SELECT id, status FROM members
+            WHERE lower(email) = ?1 AND tenant = ?2 ${activeOnly ? "AND status = 'active'" : ''}
               AND NOT EXISTS (
                 SELECT 1 FROM human_login_identities h
                  WHERE h.tenant = members.tenant
@@ -153,25 +163,41 @@ export async function resolveHumanMemberId(
                    AND h.revoked_at IS NULL
               )
             LIMIT 1`,
-        ).bind(email, tenant).first<{ id: string }>()
+        ).bind(email, tenant).first<ResolvedHumanMember>()
       : await env.DB.prepare(
-          `SELECT id FROM members
-            WHERE lower(email) = ?1 AND tenant = ?2 AND status = 'active'
+          `SELECT id, status FROM members
+            WHERE lower(email) = ?1 AND tenant = ?2 ${activeOnly ? "AND status = 'active'" : ''}
             LIMIT 1`,
-        ).bind(email, tenant).first<{ id: string }>()
-    if (byEmail) return byEmail.id
+        ).bind(email, tenant).first<ResolvedHumanMember>()
+    if (byEmail) return byEmail
   } catch (err) {
     if (!isMissingHumanLoginIdentitiesTable(err)) throw err
     const byEmail = await env.DB.prepare(
-      `SELECT id FROM members
-        WHERE lower(email) = ?1 AND tenant = ?2 AND status = 'active'
+      `SELECT id, status FROM members
+        WHERE lower(email) = ?1 AND tenant = ?2 ${activeOnly ? "AND status = 'active'" : ''}
         LIMIT 1`,
-    ).bind(email, tenant).first<{ id: string }>()
-    if (byEmail) return byEmail.id
+    ).bind(email, tenant).first<ResolvedHumanMember>()
+    if (byEmail) return byEmail
   }
 
   // Step 4: same join-key gate as step 2. A missed subject must not
   // inherit the org owner via an operator alias.
   if (joinKeyPresent) return null
-  return ownerAliasMemberId(env, email)
+  const ownerId = await ownerAliasMemberId(env, email)
+  return ownerId ? { id: ownerId, status: 'active' } : null
+}
+
+export function resolveHumanMember(
+  env: Env,
+  input: ResolveHumanMemberInput,
+): Promise<ResolvedHumanMember | null> {
+  return resolveHumanMemberRecord(env, input, false)
+}
+
+export async function resolveHumanMemberId(
+  env: Env,
+  input: ResolveHumanMemberInput,
+): Promise<string | null> {
+  const member = await resolveHumanMemberRecord(env, input, true)
+  return member?.id ?? null
 }

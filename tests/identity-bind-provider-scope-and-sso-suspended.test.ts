@@ -12,6 +12,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { linkLoginIdentity } from '../src/auth/login-identity'
 import { resolveHumanMemberId } from '../src/members/resolve-human-member'
+import { findOrCreateHumanMember } from '../src/members/human-identity'
 import { autoEnrollSsoMember } from '../src/auth/sso'
 import type { Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
@@ -93,6 +94,28 @@ describe('identity: step-2 provider scoping + SSO enroll never INSERTs a collidi
     expect(result?.ok).toBe(false)
     expect(result?.error).toBe('member_suspended')
     const n = await env.DB.prepare(`SELECT count(*) AS n FROM members WHERE lower(email) = 'gone@mumega.test'`).first<{ n: number }>()
+    expect(n?.n).toBe(1)
+  })
+
+  it('B2: OAuth find-or-create returns an existing suspended identity owner', async () => {
+    const linked = await linkLoginIdentity(env, {
+      tenant: TENANT,
+      provider: 'google',
+      providerSubject: 'sub-gone',
+      verifiedEmail: 'gone@mumega.test',
+      memberId: 'mem-suspended',
+    })
+    expect(linked.ok).toBe(true)
+
+    await expect(findOrCreateHumanMember(
+      env,
+      'gone@mumega.test',
+      'Gone',
+      { provider: 'google', subject: 'sub-gone' },
+    )).resolves.toBe('mem-suspended')
+    const n = await env.DB.prepare(
+      `SELECT count(*) AS n FROM members WHERE lower(email) = 'gone@mumega.test'`,
+    ).first<{ n: number }>()
     expect(n?.n).toBe(1)
   })
 })

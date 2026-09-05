@@ -38,6 +38,7 @@ import type {
 
 // requireAuth is owned by the auth component; it sets c.get('auth').
 import { requireAuth } from '../auth'
+import { isMissingWebSessionsTableError } from '../auth/web-sessions'
 import { csrf } from 'hono/csrf'
 import { assertBatchWritten } from '../lib/receipt'
 // The FROZEN capability API — everyone codes against these exact signatures.
@@ -459,15 +460,22 @@ membersApp.patch('/members/:id', requireCapability(orgScope, 'admin'), async (c)
   const res = status === 'suspended'
     ? await (async () => {
         const nowIso = new Date().toISOString()
-        const [memberUpdate, sessionRevoke] = await c.env.DB.batch([
-          c.env.DB.prepare('UPDATE members SET status = ? WHERE id = ?').bind(status, id),
-          c.env.DB.prepare(
-            `UPDATE web_sessions SET revoked_at = ?1, revoke_reason = ?2
-              WHERE tenant = ?3 AND member_id = ?4 AND revoked_at IS NULL`,
-          ).bind(nowIso, 'member_suspended', c.env.TENANT_SLUG, id),
-        ])
-        sessionsRevoked = Number(sessionRevoke.meta?.changes ?? 0)
-        return memberUpdate
+        try {
+          const [memberUpdate, sessionRevoke] = await c.env.DB.batch([
+            c.env.DB.prepare('UPDATE members SET status = ? WHERE id = ?').bind(status, id),
+            c.env.DB.prepare(
+              `UPDATE web_sessions SET revoked_at = ?1, revoke_reason = ?2
+                WHERE tenant = ?3 AND member_id = ?4 AND revoked_at IS NULL`,
+            ).bind(nowIso, 'member_suspended', c.env.TENANT_SLUG, id),
+          ])
+          sessionsRevoked = Number(sessionRevoke.meta?.changes ?? 0)
+          return memberUpdate
+        } catch (err) {
+          if (!isMissingWebSessionsTableError(err)) throw err
+          return c.env.DB.prepare('UPDATE members SET status = ? WHERE id = ?')
+            .bind(status, id)
+            .run()
+        }
       })()
     : await c.env.DB.prepare('UPDATE members SET status = ? WHERE id = ?')
         .bind(status, id)

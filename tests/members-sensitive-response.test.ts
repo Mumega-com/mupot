@@ -21,6 +21,9 @@ function makeEnv(options: {
           return statement
         },
         async first<T>() {
+          if (sql.includes('SELECT status FROM members') && sql.includes('lower(email)')) {
+            return { status: 'active' } as T
+          }
           if (sql.includes('FROM invites')) {
             return {
               id: 'invite-1',
