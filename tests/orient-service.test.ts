@@ -155,9 +155,33 @@ describe('renderBrief', () => {
     expect(b).toMatch(/no field state yet/)
   })
 
-  it('no tasks → explicit do-not-invent-work line', () => {
-    const b = renderBrief({ ...base, tasks: [] })
-    expect(b).toMatch(/do not invent work/)
+  it('induction + empty tasks points at supervisor/board and does not say rest', () => {
+    const b = renderBrief({ ...base, induction: true, tasks: [] })
+    expect(b).toMatch(/ask your supervisor/i)
+    expect(b).toMatch(/project board/i)
+    expect(b).not.toMatch(/or rest/)
+    expect(b).not.toMatch(/Rest when there is no defect/)
+  })
+
+  it('onboarded + empty tasks keeps the rest instruction', () => {
+    const b = renderBrief({ ...base, induction: false, tasks: [] })
+    expect(b).toMatch(/rest/i)
+  })
+
+  it('rails ship line is rendered from autonomy and differs for each value', () => {
+    const levels = ['suggest', 'draft', 'execute', 'execute_with_approval'] as const
+    const shipLines = levels.map((autonomy) => {
+      const brief = renderBrief({ ...base, agent: { ...base.agent, autonomy } })
+      const rails = brief.split('## The rails')[1] ?? ''
+      const ship = rails.split('\n').find((line) => /ship|execute|read-only|gate approval/i.test(line))
+      return ship ?? ''
+    })
+    expect(shipLines.every((line) => line.length > 0)).toBe(true)
+    expect(new Set(shipLines).size).toBe(4)
+    expect(shipLines[levels.indexOf('execute')]).not.toMatch(/never ship/)
+    expect(shipLines[levels.indexOf('draft')]).toMatch(/never ship/)
+    expect(shipLines[levels.indexOf('suggest')]).toMatch(/read-only/i)
+    expect(shipLines[levels.indexOf('execute_with_approval')]).toMatch(/gate approval/)
   })
 
   it('field_restricted → shows the restricted line, never the peer field values (#88)', () => {
