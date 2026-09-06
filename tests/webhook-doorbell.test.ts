@@ -317,6 +317,28 @@ describe('Grok Bot webhook doorbell', () => {
     expect(calls).toBe(1)
   })
 
+  it('does not POST when CONNECTOR_MASTER_KEY is missing on send', async () => {
+    await setAgentWebhookDoorbell(env, {
+      agentId: AGENT_A,
+      webhookUrl: 'https://webhook.example/ceo',
+      bearer: DOORBELL_BEARER,
+      createdByMemberId: MEMBER_ID,
+    })
+    const noKey = { ...env, CONNECTOR_MASTER_KEY: undefined } as unknown as Env
+    let calls = 0
+    const res = await sendAgentMessage(noKey, {
+      fromAgent: AGENT_B, fromMember: MEMBER_ID, toAgent: AGENT_A,
+      body: 'no crypto', kind: 'message', requestId: 'rid-nokey',
+    }, AUTHZ, {
+      fetch: (async () => {
+        calls += 1
+        return new Response('ok')
+      }) as typeof fetch,
+    })
+    expect(res.ok).toBe(true)
+    expect(calls).toBe(0)
+  })
+
   it('send still succeeds when fetch throws; no doorbell row means no POST', async () => {
     const pending: Promise<unknown>[] = []
     let calls = 0

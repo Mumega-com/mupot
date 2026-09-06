@@ -271,6 +271,10 @@ export function scheduleWebhookDoorbell(
   opts: DoorbellFireOpts = {},
 ): void {
   try {
+    // No master key → cannot decrypt; skip the D1 lookup entirely.
+    if (typeof env.CONNECTOR_MASTER_KEY !== 'string' || env.CONNECTOR_MASTER_KEY.length === 0) {
+      return
+    }
     const run = fireWebhookDoorbell(env, wake, opts).catch(() => {
       logReceipt('failed', { ...wake, reason: 'unhandled' })
     })
