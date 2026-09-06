@@ -31,6 +31,15 @@ import { activeSeatEventGrant, authorizeSeatDelivery, isSeatEventsEnabled } from
 
 const MAX_BODY_BYTES = 8192
 
+function waitUntilFrom(c: Context<{ Bindings: Env }>): ((p: Promise<unknown>) => void) | undefined {
+  try {
+    const ctx = c.executionCtx
+    return ctx ? (p: Promise<unknown>) => ctx.waitUntil(p) : undefined
+  } catch {
+    return undefined
+  }
+}
+
 // ── inbox stream (SSE) ────────────────────────────────────────────────────────────────────
 // The durable inbox is pull-only; this endpoint is the push side of #706. It is a thin SSE
 // wrapper over the SAME readAgentInbox service (peek=true), so the stream can never diverge
@@ -388,6 +397,7 @@ inboxApp.post('/send', async (c) => {
       targetSeat,
     },
     { isAdmin, grants },
+    { waitUntil: waitUntilFrom(c) },
   )
   if (!res.ok) {
     // Never forward a raw DB error string to the client (leak-guard, matches the MCP path).
