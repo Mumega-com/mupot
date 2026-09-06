@@ -2735,9 +2735,19 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_members_email_lower" },
     ],
   },
+  {
+    file: "0147_agent_webhook_doorbells.sql",
+    sha256: "9196e23a4c48a05fc70192a79e195daab0a6911ad92656cc5db94cdb755233c4",
+    statements: [
+      "-- 0147_agent_webhook_doorbells.sql — per-agent Grok Bot webhook doorbell.\n--\n-- Chair (Hadi): when agent A `send`s to agent B, if B has a registered doorbell,\n-- the pot POSTs B's webhook so B's Grok Bot routine wakes and peeks pot. The\n-- inbox row stays the letter / source of truth. The POST is a hint only.\n--\n-- WHY A NEW TABLE, NOT wake_contract.emit_url\n--\n-- mint_agent_token's wake_contract.emit_url is INBOUND: POST <origin>/bus/emit\n-- with type agent.wake and an operator bearer, to wake AgentDO inside the pot.\n-- A Grok Bot doorbell is OUTBOUND: the pot POSTs an external https URL that\n-- belongs to the recipient's Bot. Reusing emit_url would point the Bot at the\n-- pot and invert the direction.\n--\n-- WHY NOT the Hermes message.created consumer\n--\n-- src/bus/hermes-delivery.ts is pot-wide, HMAC-signed, and THROWS on 5xx so\n-- the Queue retries / DLQ. A Bot 500 on that path would retry Hermes too.\n-- The doorbell fires fail-open from sendAgentMessage after the INSERT, with\n-- its own short timeout, and never fails the send.\n--\n-- SECRET PATTERN (house vault, not D1 plaintext)\n--\n-- The doorbell bearer is AES-GCM-256 under CONNECTOR_MASTER_KEY (Worker\n-- secret), HKDF info `mupot_doorbell_v1`, salt = agent_id. Same primitive as\n-- connectors (src/connectors/crypto.ts encryptDomainSecret). D1 stores only\n-- ciphertext + last4. Get/list/logs never see the bearer. Fail-closed on set\n-- if the master key is missing. This is not a new Worker secret name — one\n-- pot-level key, domain-separated info string.\n--\n-- Production applied head at the time of this file is ≥0146. Do not renumber\n-- ≤0079 (mupot#729).\n\nCREATE TABLE IF NOT EXISTS agent_webhook_doorbells (\n  tenant                TEXT NOT NULL,\n  agent_id              TEXT NOT NULL,\n  webhook_url           TEXT NOT NULL,\n  auth_ciphertext       TEXT NOT NULL,\n  auth_last4            TEXT NOT NULL,\n  created_by_member_id  TEXT NOT NULL,\n  updated_at            TEXT NOT NULL,\n  PRIMARY KEY (tenant, agent_id),\n  FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE\n);",
+    ],
+    objects: [
+      { type: "table", name: "agent_webhook_doorbells" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "aab5e051a941c2d032924b2178533de80ca7a6311f048b843ab1a1cf70fa9d00"
+export const SCHEMA_CHAIN_DIGEST: string = "1ca879d798c0e02243c0fc58488adc904cf82713f6272599cb9aa6cf311240d7"

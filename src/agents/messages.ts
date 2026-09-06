@@ -22,6 +22,7 @@ import { canOnSquad } from '../auth/capability'
 import { sha256Hex } from '../lib/canonical-json'
 import { TOKEN_LIVE_PREDICATE } from '../auth/token-lifecycle'
 import { evaluateReplyExpectation, type ReplyBasis } from './reply-expectation'
+import { scheduleWebhookDoorbell } from './webhook-doorbell'
 
 // ── tunables ────────────────────────────────────────────────────────────────────────────
 const MAX_BODY_CHARS = 8000
@@ -197,6 +198,10 @@ interface Opts {
   routineRunFence?: { runId: string; projectId: string }
   /** Current durable guest-membership authority must still exist in the message INSERT. */
   guestVisibilityFence?: GuestVisibilityFence
+  /** Test-injected fetch for the outbound Grok Bot doorbell POST. */
+  fetch?: typeof fetch
+  /** Worker waitUntil so the doorbell POST can outlive the send response. */
+  waitUntil?: (promise: Promise<unknown>) => void
 }
 
 function isRef(v: string): boolean {
@@ -496,6 +501,16 @@ export async function sendAgentMessage(
         emitErr instanceof Error ? emitErr.message : String(emitErr),
       )
     }
+
+    // Grok Bot doorbell: outbound POST to the recipient's registered webhook.
+    // Same "row landed" point as message.created — not on an idempotent duplicate,
+    // not on the Hermes Queue consumer (a Bot 500 must not retry Hermes).
+    // Fail-open: a 5xx / timeout / missing mapping never fails this send.
+    scheduleWebhookDoorbell(
+      env,
+      { agent_id: input.toAgent, seq, message_id: id, kind },
+      { fetch: opts.fetch, waitUntil: opts.waitUntil },
+    )
 
     return { ok: true, id, seq, duplicate: false }
   } catch (err) {
