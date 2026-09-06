@@ -506,11 +506,19 @@ export async function sendAgentMessage(
     // Same "row landed" point as message.created — not on an idempotent duplicate,
     // not on the Hermes Queue consumer (a Bot 500 must not retry Hermes).
     // Fail-open: a 5xx / timeout / missing mapping never fails this send.
-    scheduleWebhookDoorbell(
-      env,
-      { agent_id: input.toAgent, seq, message_id: id, kind },
-      { fetch: opts.fetch, waitUntil: opts.waitUntil },
-    )
+    //
+    // Skip routine-fenced envelopes: the cron invocation already runs
+    // runRoutineScheduler + dispatchRoutineRun under the D1 free-tier 50-statement
+    // cap (MAX_SCHEDULER_DB_STATEMENTS + dispatch). A doorbell SELECT here is the
+    // 33rd dispatch statement and overflows that shared budget. Routine dispatch
+    // has its own wake; this doorbell is for agent/human send.
+    if (!opts.routineRunFence) {
+      scheduleWebhookDoorbell(
+        env,
+        { agent_id: input.toAgent, seq, message_id: id, kind },
+        { fetch: opts.fetch, waitUntil: opts.waitUntil },
+      )
+    }
 
     return { ok: true, id, seq, duplicate: false }
   } catch (err) {

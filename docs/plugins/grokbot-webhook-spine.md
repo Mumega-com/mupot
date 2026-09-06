@@ -42,6 +42,8 @@ Set fails closed if `CONNECTOR_MASTER_KEY` is missing (`503 doorbell_crypto_unav
 
 Header: `Authorization: Bearer <doorbell key>`. Timeout ~3s. Fire-and-forget via `waitUntil` after a **landed** INSERT. Idempotent duplicate sends do not POST. A webhook 5xx / timeout / throw does **not** fail `send`.
 
+Routine-fenced dispatch envelopes (`routineRunFence` on `sendAgentMessage`) do **not** ring the doorbell. The project-routines cron already runs scheduler + dispatch in one invocation under the D1 50-statement cap; an extra SELECT there overflows the budget. Routine dispatch has its own wake. This doorbell is for agent/human `send`.
+
 ## Operator — register ceo / staff (mumega)
 
 1. In Grok Bot, create a webhook / routine that **peeks** pot (`inbox({ peek: true })`). Copy the https URL and the webhook secret.
