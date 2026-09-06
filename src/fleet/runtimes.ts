@@ -24,6 +24,8 @@ export const RUNTIME_VALUES = [
   'claude-code',
   'grok',        // added 2026-09-03: Athena's harness moved to grok and could not say so
   'antigravity-cli', // added 2026-09-04: Loom runs Google Antigravity; heartbeat row said 'tmux'
+  'cursor-agent', // added 2026-09-06: muvps-cursor / Cursor CLI seats
+  'cursor-ide',   // added 2026-09-06: muvps-cursor / Cursor CLI seats
   'nous',
   'hermes',
   'hermes-cron',
