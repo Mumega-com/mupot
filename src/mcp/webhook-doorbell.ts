@@ -15,28 +15,29 @@ import {
 import { type ToolSpec, fail, done, str, hasWorkspaceAdmin } from './index'
 
 const STRING_SCHEMA = { type: 'string' }
+type ToolFailure = Extract<ReturnType<typeof fail>, { ok: false }>
 
 async function resolveDoorbellTarget(
   auth: AuthContext,
   env: Env,
   agentArg: unknown,
-): Promise<{ ok: true; agentId: string } | ReturnType<typeof fail>> {
+): Promise<{ ok: true; agentId: string } | ToolFailure> {
   const requested = str(agentArg)
   const targetRef = requested ?? auth.boundAgentId
   if (!targetRef) {
-    return fail(400, 'invalid_args', 'agent required when caller is not agent-bound')
+    return fail(400, 'invalid_args', 'agent required when caller is not agent-bound') as ToolFailure
   }
 
   const resolved = await resolveAgentRef(env, targetRef)
   if (!resolved.ok) {
-    return resolved.reason === 'ambiguous'
+    return (resolved.reason === 'ambiguous'
       ? fail(409, 'ambiguous_slug', 'slug matches multiple agents — use the id instead')
-      : fail(404, 'agent_not_found')
+      : fail(404, 'agent_not_found')) as ToolFailure
   }
 
   const self = auth.boundAgentId === resolved.value.id
   if (!self && !hasWorkspaceAdmin(auth)) {
-    return fail(403, 'forbidden', { need: 'self_or_org_admin' })
+    return fail(403, 'forbidden', { need: 'self_or_org_admin' }) as ToolFailure
   }
   return { ok: true, agentId: resolved.value.id }
 }
