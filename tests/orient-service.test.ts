@@ -155,17 +155,18 @@ describe('renderBrief', () => {
     expect(b).toMatch(/no field state yet/)
   })
 
-  it('induction + empty tasks points at supervisor/board and does not say rest', () => {
-    const b = renderBrief({ ...base, induction: true, tasks: [] })
-    expect(b).toMatch(/ask your supervisor/i)
-    expect(b).toMatch(/project board/i)
-    expect(b).not.toMatch(/or rest/)
-    expect(b).not.toMatch(/Rest when there is no defect/)
-  })
-
-  it('onboarded + empty tasks keeps the rest instruction', () => {
-    const b = renderBrief({ ...base, induction: false, tasks: [] })
-    expect(b).toMatch(/rest/i)
+  it('no tasks → explicit do-not-invent-work line', () => {
+    // REWRITTEN (was: expect /do not invent work/ on an empty list).
+    // renderBrief is not handed terminal-state history, so it cannot tell
+    // never-onboarded from queue-clear. Cheap error: never say rest.
+    // induction is not a discriminator — prove both values of it.
+    for (const induction of [true, false]) {
+      const b = renderBrief({ ...base, induction, tasks: [] })
+      expect(b).toMatch(/ask your supervisor/i)
+      expect(b).toMatch(/project board/i)
+      expect(b).not.toMatch(/or rest/)
+      expect(b).not.toMatch(/Rest when there is no defect/)
+    }
   })
 
   it('rails ship line is rendered from autonomy and differs for each value', () => {

@@ -134,10 +134,12 @@ export function railsShipLine(autonomy: string | null | undefined): string {
   return RAILS_SHIP[autonomy ?? ''] ?? RAILS_SHIP.draft
 }
 
-function emptyWorkLine(induction: boolean): string {
-  return induction
-    ? '  (none assigned yet — ask your supervisor or check the project board)'
-    : '  (none assigned right now — do not invent work; ask your supervisor or rest)'
+// Packet has no terminal-task history (buildOrient only selects
+// open/in_progress/blocked). Never-onboarded and queue-clear are
+// indistinguishable here. Cheap error: never tell an empty-open-list
+// agent to rest.
+function emptyWorkLine(): string {
+  return '  (none assigned yet — ask your supervisor or check the project board)'
 }
 
 // ── the packet ───────────────────────────────────────────────────────────────────
@@ -176,10 +178,10 @@ export interface OrientData {
   induction: boolean // first time this agent has been oriented
 }
 
-function renderRails(autonomy: string, induction: boolean, hasTasks: boolean): string[] {
-  const rest = induction && !hasTasks
-    ? null
-    : 'Rest when there is no defect. Do not invent work to look busy.'
+function renderRails(autonomy: string, hasTasks: boolean): string[] {
+  const rest = hasTasks
+    ? 'Rest when there is no defect. Do not invent work to look busy.'
+    : null
   return [
     'Read state before you act — the pot + GitHub backlog, not your assumptions.',
     'Write work to GitHub (issues), never a private list.',
@@ -196,7 +198,7 @@ export function renderBrief(d: OrientData): string {
     : 'your operator/owner (you are the top of this squad — escalate above the squad)'
   const tasks = d.tasks.length
     ? d.tasks.map((t) => `  - [${t.status}] ${t.title}`).join('\n')
-    : emptyWorkLine(d.induction)
+    : emptyWorkLine()
   const kpi = d.agent.kpi_target ? `${d.agent.kpi_target} (now at ${Math.round(d.agent.kpi_progress)}%)` : 'no KPI set'
 
   const fieldLines: string[] = []
@@ -239,7 +241,7 @@ export function renderBrief(d: OrientData): string {
     ...fieldLines,
     ``,
     `## The rails — how we work here`,
-    ...renderRails(d.agent.autonomy, d.induction, d.tasks.length > 0).map((r) => `- ${r}`),
+    ...renderRails(d.agent.autonomy, d.tasks.length > 0).map((r) => `- ${r}`),
   ]
     .filter((line) => line !== ``)
     .join('\n')
