@@ -5,12 +5,12 @@ tagged stable release, followed by the first `v0.31.0` runtime flight. Version
 ownership remains in [ROADMAP.md](../../ROADMAP.md); the shipped record remains in
 [CHANGELOG.md](../../CHANGELOG.md).
 
-## Release truth at 2026-09-04
+## Release truth at 2026-09-06
 
 | Surface | Exact state |
 |---|---|
 | Current `main` | `0.30.0` — not pinned here; read `git rev-parse origin/main` |
-| Current production | `0.30.0` — read live `/health`; last recorded deploy `4fd452eb0b6a618d1db2a18206eee8616d44f276`, `clean:true`, 2026-09-04 (#1312). Further PRs merged after it, so production trails `main`; the gap is not counted here. |
+| Current production | `0.30.0` — read live `/health`; last recorded deploy `1303648c141eb5f5e9fa5efe76ef1776c6711011`, `clean:true`, 2026-09-05 (eleven-PR security and identity sweep). Equal to `main` at the time of writing; both move independently and this line ages on the next merge or deploy. |
 | Latest tagged stable release | `v0.25.0` |
 | Next stable candidate | `v0.30.0` |
 | Next development release | `v0.31.0` |
@@ -27,7 +27,7 @@ the order and acceptance boundary; they are not reusable historical flight IDs.
 
 | Order | Flight | Deliverable | Gate | State |
 |---|---|---|---|---|
-| A | Freeze the v0.30 candidate | One immutable `main` SHA with no later merge contaminating its evidence | Push CI and CodeQL green at the frozen SHA; Athena exact-head release gate | **RESTART REQUIRED** — see supersession below |
+| A | Freeze the v0.30 candidate | One immutable `main` SHA with no later merge contaminating its evidence | Push CI and CodeQL green at the frozen SHA; Athena exact-head release gate | **BLOCKED ON A FREEZE MECHANISM.** Two attempts invalidated: `55c1c3ef` (46 commits landed after it) and `v0.30.0-rc.1` at `0bb9c256` (15 after). Both were invalidated by correct merges closing measured-exploitable defects. A third attempt on the same terms will be invalidated the same way. See [ROADMAP.md](../../ROADMAP.md) § "Why no version has been tagged since v0.25.0" for the three options |
 | B | Build the v0.30 evidence bundle | Fresh install, upgrade, host, permission, lifecycle, external-PR, recovery, browser, runtime, MCP, and ACK receipts from the frozen SHA | `mupot-v030-prepublication-readiness/v1` prerequisites pass without reconstructed evidence | Pending A |
 | C | Publish and soak the RC | RC tag, prerelease, exact deployment, smoke, soak, and release-candidate receipt | Separate Hadi approval for tag and deployment; no merge after the RC receipt | Pending B — `v0.30.0-rc.1` exists but is superseded; a new RC is required |
 | D | Publish `v0.30.0` stable | Stable deployment, tag, GitHub Release, release-integrity receipt, and final readiness receipt at one SHA | Separate Hadi approvals for stable deployment and publication; Athena verifies the final bundle | Pending C |
