@@ -1380,6 +1380,12 @@ export const SELF_FORBIDDEN_FIELDS = [
   'capabilities',
   'budget_cap_cents',
   'budget_window',
+  // autonomy (mupot#1337): governs whether an agent may ship/send/publish/
+  // merge. Admin-only even on the caller's own row, for the same reason as
+  // capabilities — a self-patchable ceiling is a self-grantable ceiling. This
+  // is the load-bearing entry: it must land here, in SELF_FORBIDDEN_FIELDS,
+  // so the per-field self-lane block above refuses it BEFORE any write.
+  'autonomy',
 ] as const
 // The admin-path patch surface. Hoisted out of run() (it used to be an inline
 // literal) so tests can assert the partition invariant: every field here is
@@ -1398,17 +1404,19 @@ export const ADMIN_PATCHABLE_FIELDS = [
   'skills',
   'budget_cap_cents',
   'budget_window',
+  'autonomy',
 ] as const
 const toolUpdateAgent: ToolSpec = {
   name: 'update_agent',
   scope: "agent's squad or org admin; or an agent's own row for 4 non-identity fields (self lane — see args)",
   min: 'authenticated',
   args:
-    '{ agent: string (id|slug), slug?, name?, role?, model?, model_fallback?, purpose?, owner?, qnft_ref?, capabilities?: string[], skills?: string[], budget_cap_cents?: number|null, budget_window?: "day"|"week", reason?: string }' +
+    '{ agent: string (id|slug), slug?, name?, role?, model?, model_fallback?, purpose?, owner?, qnft_ref?, capabilities?: string[], skills?: string[], budget_cap_cents?: number|null, budget_window?: "day"|"week", autonomy?: "suggest"|"draft"|"execute"|"execute_with_approval", reason?: string }' +
     ' -- SELF LANE: an agent-bound caller correcting its OWN row (agent === its own id/slug) needs no admin,' +
     ' but may only patch model/model_fallback/purpose/skills.' +
-    ' name/role/slug/owner/qnft_ref/capabilities/budget_cap_cents/budget_window still require admin,' +
-    ' even on your own row -- name/role are interpolated into your own system prompt and are' +
+    ' name/role/slug/owner/qnft_ref/capabilities/budget_cap_cents/budget_window/autonomy still require admin,' +
+    ' even on your own row -- name/role are interpolated into your own system prompt, and autonomy' +
+    ' governs whether an agent may ship/send/publish/merge, so both are' +
     ' deliberately excluded from the self lane. Every non-self call (a different agent-bound' +
     ' target, or a non-bound member) needs admin on the target agent squad or org.',
   inputSchema: {
@@ -1436,6 +1444,11 @@ const toolUpdateAgent: ToolSpec = {
       // or null (clears the cap); budget_window ∈ 'day'|'week'.
       budget_cap_cents: OPTIONAL_NUMBER_SCHEMA,
       budget_window: STRING_SCHEMA,
+      // autonomy (mupot#1337): admin-only, see SELF_FORBIDDEN_FIELDS above.
+      // Validated at the service layer (isAutonomy, src/org/service.ts)
+      // against the exact four enum values — suggest | draft | execute |
+      // execute_with_approval.
+      autonomy: STRING_SCHEMA,
       reason: STRING_SCHEMA,
     },
     // `agent` is deliberately NOT in `required` here (R1, gate round 3).
