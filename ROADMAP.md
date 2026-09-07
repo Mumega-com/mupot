@@ -10,7 +10,7 @@ numbers.
 |---|---|---|
 | Current source version | `0.30.0` | On `main`; preview. Read the commit with `git rev-parse origin/main` — this table does not pin it. |
 | Current production version | `0.30.0` | Last recorded deploy `1303648c` (2026-09-05); live `/health` is authoritative. Equal to `main` at the time of writing; both move independently. |
-| Last tagged stable release | `v0.25.0` | Project Routines and Needs You. Unchanged since. |
+| Last tagged release | `v0.25.0` | Project Routines and Needs You. The last STABLE tag; unchanged since. |
 | Superseded prerelease | `v0.30.0-rc.1` | Cut at `0bb9c256` (2026-09-03). 15 commits have landed since, including four security and three identity fixes. Not a candidate. |
 | Next stable candidate | `v0.30.0` | Stabilization-only. See the freeze problem below before planning against it. |
 | Future development target | `v0.31.0` | Canonical receiver, Agent Computers, and Recovery; held until `v0.30.0` is stable. |
