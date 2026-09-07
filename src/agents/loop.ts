@@ -66,22 +66,34 @@ import { safeRecordEpisode, safeRecentEpisodes, renderEpisodes } from './episodi
 import type { EpisodeInput, Episode } from './episodic'
 import { computeKpiSignal } from './kpi-sources'
 import type { KpiSignalResult } from './kpi-sources'
+import { GATE_LOOPS } from '../gates/lanes'
 
 // The gate stamped on tasks an agent's own loop creates under
 // execute_with_approval.
 //
-// MUST be a canonical 'gate:<owner>' (GATE_CAPABILITY_RE) — a bare capability
-// like the previous 'lead' can never be inserted into gate_grants, so the
-// approvals EXISTS clause and hasActiveGateGrant both miss it forever.
+// This is GATE_LOOPS from the lane registry, not a lane invented here. Three
+// reasons, in order of weight:
 //
-// SHAPE IS NECESSARY, NOT SUFFICIENT. A canonical string with no live
-// gate_grants row is still unverdictable by every agent/MCP principal:
-// migrations/0096 states the discipline plainly — "never the reverse — a flip
-// ahead of its grant swaps one unverdictable string for another". The grant
-// must be minted BEFORE this value is relied on, to a SINGLE active agent that
-// is not the loop agent (resolveSoleGateOwnerAgent returns null on zero OR
-// multiple holders, which silently disables the wake).
-export const LOOP_AUTONOMY_GATE_OWNER = 'gate:lead'
+//  1. src/loops/gate.ts ALREADY stamps gate:loops on loop-created work. Two
+//     loop paths stamping two different gates is the same one-rule-two-copies
+//     split that produced the seat and verdict defects. One lane, one place.
+//  2. src/gates/lanes.ts exists so "a gate lane is a compile-time reference,
+//     not a string typed from memory at each call site". A lane invented at a
+//     single call site is precisely what that file prevents.
+//  3. The previous value here was a bare 'lead' — un-insertable into
+//     gate_grants, so unverdictable by every agent/MCP principal. Its first
+//     replacement, 'gate:lead', was canonical in SHAPE but named a RANK. Ranks
+//     are granted to several holders, and resolveSoleGateOwnerAgent returns
+//     null on multiple holders, which silently disables the wake.
+//
+// PREREQUISITE, NOT OPTIONAL: gate:loops must have a live gate_grants row held
+// by exactly ONE active agent that is not the loop agent. Measured 2026-09-07:
+// zero grants. migrations/0096 states the discipline — "never the reverse — a
+// flip ahead of its grant swaps one unverdictable string for another". Until
+// that grant exists, a task stamped here is verdictable only by a cookie-session
+// owner/admin, and on the external-runtime path (src/tasks/runtime-receipts.ts)
+// cannot be closed at all.
+export const LOOP_AUTONOMY_GATE_OWNER = GATE_LOOPS
 
 // ── Effort → max tasks spawned per tick ──────────────────────────────────────
 
