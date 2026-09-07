@@ -50,6 +50,13 @@
 import type { Env, Agent, Effort, Autonomy, ModelMessage, ModelPort } from '../types'
 import { isEffort, isAutonomy } from '../types'
 import { autonomyImpliesGate } from '../org/service'
+
+// The gate stamped on tasks an agent's own loop creates under
+// execute_with_approval. Canonical 'gate:<owner>' so a gate_grants row CAN be
+// inserted for a delegated reviewer, and so org owner/admin see it through the
+// normal approvals path. Mirrors LOOP_GATE_OWNER = 'gate:loops' in
+// src/loops/gate.ts.
+export const LOOP_AUTONOMY_GATE_OWNER = 'gate:lead'
 import { createTask } from '../tasks/service'
 import { createModel } from '../model'
 import { createMemory } from '../memory'
@@ -415,7 +422,16 @@ export async function runGoalCycle(
 
     let spawned = 0
     for (const proposal of proposals) {
-      const gateOwner = autonomyImpliesGate(autonomy) ? 'lead' : null
+      // gate_owner MUST be canonical 'gate:<owner>'. A bare 'lead' can never
+      // match a gate_grants row (grants live in the gate:<owner> namespace),
+      // and the owner/admin bypass in dashboard/approvals.ts reads auth.role,
+      // which is always 'member' over MCP. A task stamped 'lead' therefore
+      // lands in review visible to NOBODY and has no legal exit — the verdict
+      // endpoint 409s and the approvals queue filters it out. Silent stranding,
+      // indistinguishable from an agent that simply stopped working.
+      // src/mcp/index.ts:1449 already refuses non-canonical gate_owner on the
+      // MCP path; this loop calls createTask directly and bypassed that check.
+      const gateOwner = autonomyImpliesGate(autonomy) ? LOOP_AUTONOMY_GATE_OWNER : null
 
       // 'execute' and 'execute_with_approval' self-assign to the agent.
       const assignee =

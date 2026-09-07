@@ -17,6 +17,7 @@ import {
   updateKpiProgress,
   parseLeadingInt,
   EFFORT_TASK_BUDGET,
+  LOOP_AUTONOMY_GATE_OWNER,
 } from '../src/agents/loop'
 import type { Env, Agent } from '../src/types'
 import type { LoopDeps } from '../src/agents/loop'
@@ -385,7 +386,34 @@ describe('runGoalCycle — autonomy disposition table', () => {
     expect(dispatch).toHaveBeenCalledTimes(1)
   })
 
-  // execute_with_approval: gated task (gate_owner='lead'), self-assigned, dispatch called
+  // The property, not the literal. A future change may pick a different owner
+  // segment; what must never change is the canonical shape, because that is
+  // what makes a gate_grants row insertable and the task reachable at all.
+  it('execute_with_approval gate_owner is canonical gate:<owner>, never a bare capability', async () => {
+    const agent = makeAgent({ autonomy: 'execute_with_approval', effort: 'standard' })
+    const { env } = makeEnv()
+    const ct = makeCreateTask()
+
+    await runGoalCycle(env, agent, {
+      meterCheck: makeMeterOk(),
+      model: makeModel([{ title: 'Gated Task', body: 'needs approval' }]),
+      recall: makeRecall(),
+      createTask: ct,
+      dispatch: makeDispatch(),
+      writeProgress: makeWriteProgress(),
+    })
+
+    const input = (ct as ReturnType<typeof vi.fn>).mock.calls[0][1] as { gate_owner: string | null }
+    expect(input.gate_owner).toMatch(/^gate:[^:\s][^\s]*$/)
+    expect(input.gate_owner).not.toBe('lead')
+  })
+
+  // execute_with_approval: gated task, self-assigned, dispatch called.
+  // gate_owner must be CANONICAL 'gate:<owner>'. This test previously asserted
+  // the bare literal 'lead', which pinned the defect in place: a bare value can
+  // never match a gate_grants row and the owner/admin bypass reads auth.role,
+  // which is always 'member' over MCP — so the task stranded in review, visible
+  // to nobody, with no legal exit.
   it('execute_with_approval → gated task, gate_owner set, self-assigned, dispatch called', async () => {
     const agent = makeAgent({ autonomy: 'execute_with_approval', effort: 'standard' })
     const { env } = makeEnv()
@@ -403,7 +431,7 @@ describe('runGoalCycle — autonomy disposition table', () => {
 
     expect(result.spawned).toBe(1)
     const input = (ct as ReturnType<typeof vi.fn>).mock.calls[0][1] as { gate_owner: string | null; assignee_agent_id: string | null }
-    expect(input.gate_owner).toBe('lead') // gate auto-set
+    expect(input.gate_owner).toBe(LOOP_AUTONOMY_GATE_OWNER) // gate auto-set
     expect(input.assignee_agent_id).toBe('agent-1') // self-assigned
     expect(dispatch).toHaveBeenCalledTimes(1)
   })
