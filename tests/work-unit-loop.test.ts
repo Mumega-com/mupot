@@ -19,6 +19,7 @@ import {
   EFFORT_TASK_BUDGET,
   LOOP_AUTONOMY_GATE_OWNER,
 } from '../src/agents/loop'
+import { isValidGateOwnerForm } from '../src/tasks/service'
 import type { Env, Agent } from '../src/types'
 import type { LoopDeps } from '../src/agents/loop'
 import type { Task } from '../src/types'
@@ -389,7 +390,7 @@ describe('runGoalCycle — autonomy disposition table', () => {
   // The property, not the literal. A future change may pick a different owner
   // segment; what must never change is the canonical shape, because that is
   // what makes a gate_grants row insertable and the task reachable at all.
-  it('execute_with_approval gate_owner is canonical gate:<owner>, never a bare capability', async () => {
+  it('execute_with_approval gate_owner satisfies the production isValidGateOwnerForm predicate', async () => {
     const agent = makeAgent({ autonomy: 'execute_with_approval', effort: 'standard' })
     const { env } = makeEnv()
     const ct = makeCreateTask()
@@ -404,7 +405,11 @@ describe('runGoalCycle — autonomy disposition table', () => {
     })
 
     const input = (ct as ReturnType<typeof vi.fn>).mock.calls[0][1] as { gate_owner: string | null }
-    expect(input.gate_owner).toMatch(/^gate:[^:\s][^\s]*$/)
+    // Assert the PRODUCTION predicate, not a second hand-spelled regex. A
+    // looser local copy let 'gate:-foo', 'gate:LEAD!' and 'gate:_x' pass while
+    // all three are un-grantable — read/write drift of exactly the kind
+    // #1080/#1081 exist to close.
+    expect(isValidGateOwnerForm(String(input.gate_owner))).toBe(true)
     expect(input.gate_owner).not.toBe('lead')
   })
 
