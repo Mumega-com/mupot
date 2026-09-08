@@ -16,6 +16,50 @@ import type { RuntimeDeps } from '../src/loops/runtime'
 import type { LoopManifest } from '../src/loops/manifest'
 import type { Env } from '../src/types'
 
+// ── identity-resolution shim (mumega-com#1218) ────────────────────────────────
+//
+// The D1 stubs below are INDEX-SEQUENCED — "we need two prepare() calls: first for
+// getLoop, second for listLoopDecisions" — so they answer by call ORDER, not by SQL.
+//
+// requireAuth now resolves member IDENTITY for owner/admin sessions too (previously
+// `role === 'member'` only — the bug that left the org owner with no memberId and an
+// empty /enroll picker). That adds a `human_login_identities` lookup AHEAD of the
+// queries these tests count, so every queued response shifted by one and six tests
+// failed on data that was never wrong.
+//
+// Scoped DELIBERATELY NARROW. An earlier version of this shim also matched
+// `FROM members`, which swallowed the PRE-EXISTING suspended-member check (#1330)
+// that these fixtures legitimately answer with firstResponses[0] = {status:'active'}
+// — fixing one shift by introducing another. Only the queries this change actually
+// introduces are intercepted.
+const AUTH_PRELUDE_SQL = /FROM\s+(members|capabilities|human_login_identities|org_settings|web_sessions)/i
+
+function skipIdentityQueries<T>(stmt: T) {
+  return (sql: string): T => {
+    const text = String(sql)
+    if (AUTH_PRELUDE_SQL.test(text)) {
+      // The whole auth prelude is served here, not from the sequenced queue, so the
+      // queue holds ONLY the queries each test actually reasons about. Piecemeal
+      // interception does not work: answering human_login_identities with null makes
+      // the resolver fall through to its email fallback, which issues ANOTHER members
+      // query that was invisible in the original trace — whack-a-mole.
+      //
+      // 'active' for the suspended-member check (#1330) so these admin sessions stay
+      // live; null everywhere else so identity simply does not resolve, which is the
+      // production behaviour for a session whose email matches no members row.
+      const isSuspensionCheck = /SELECT\s+status\s+FROM\s+members/i.test(text)
+      const inert: Record<string, unknown> = {
+        bind: () => inert,
+        first: async () => (isSuspensionCheck ? { status: 'active' } : null),
+        all: async () => ({ results: [] }),
+        run: async () => ({ meta: { changes: 0 } }),
+      }
+      return inert as unknown as T
+    }
+    return stmt
+  }
+}
+
 const ENV = {
   TENANT_SLUG: 't',
   DB: {
@@ -124,7 +168,7 @@ function mockD1(rows: unknown[], extraFirst: unknown = null) {
     run: vi.fn(async () => ({ meta: { changes: 1 } })),
   }
   return {
-    prepare: vi.fn(() => stmt),
+    prepare: vi.fn(skipIdentityQueries(stmt)),
     _stmt: stmt,
   }
 }
@@ -159,7 +203,7 @@ describe('(b) GET /api/loops/:id/decisions — returns the persisted feed', () =
     }
     // We need two prepare() calls: first for getLoop, second for listLoopDecisions.
     // Build a DB mock where first() returns loopRow and all() returns decisions.
-    const firstResponses: unknown[] = [{ status: 'active' }, loopRow]
+    const firstResponses: unknown[] = [loopRow]
     const allResponses: unknown[][] = [[decRow]]
     let firstIdx = 0
     let allIdx = 0
@@ -169,7 +213,7 @@ describe('(b) GET /api/loops/:id/decisions — returns the persisted feed', () =
       all: vi.fn(async () => ({ results: allResponses[allIdx++] ?? [] })),
       run: vi.fn(async () => ({ meta: { changes: 1 } })),
     }
-    const db = { prepare: vi.fn(() => stmt) }
+    const db = { prepare: vi.fn(skipIdentityQueries(stmt)) }
     const env = {
       TENANT_SLUG: 't',
       DB: db,
@@ -195,7 +239,7 @@ describe('(b) GET /api/loops/:id/decisions — returns the persisted feed', () =
       all: vi.fn(async () => ({ results: [] })),
       run: vi.fn(async () => ({ meta: { changes: 1 } })),
     }
-    const db = { prepare: vi.fn(() => stmt) }
+    const db = { prepare: vi.fn(skipIdentityQueries(stmt)) }
     const env = {
       TENANT_SLUG: 't',
       DB: db,
@@ -283,7 +327,7 @@ describe('(c) loop_control pause stops the loop at the next cycle', () => {
     }
     const envWithDb = {
       ...ENV,
-      DB: { prepare: vi.fn(() => stmt) },
+      DB: { prepare: vi.fn(skipIdentityQueries(stmt)) },
     } as unknown as Env
 
     const deps: DriverDeps = {
@@ -340,7 +384,7 @@ describe('(d) non-admin governor write 403s', () => {
     return {
       TENANT_SLUG: tenant,
       BRAND: 'Test',
-      DB: { prepare: vi.fn(() => stmt) },
+      DB: { prepare: vi.fn(skipIdentityQueries(stmt)) },
       SESSIONS: {
         get: vi.fn(async () => JSON.stringify({
           userId: 'u1', email: 'a@b.com', role, createdAt: '2026-01-01T00:00:00Z',
@@ -380,7 +424,7 @@ describe('(d) non-admin governor write 403s', () => {
       }),
       dry_rounds: 0, created_at: 'x', updated_at: 'x',
     }
-    const firstResponses = [{ status: 'active' }, loopRow]
+    const firstResponses = [loopRow]
     let firstIdx = 0
     const stmt = {
       bind: (..._args: unknown[]) => stmt,
@@ -391,7 +435,7 @@ describe('(d) non-admin governor write 403s', () => {
     const env = {
       TENANT_SLUG: 't',
       BRAND: 'Test',
-      DB: { prepare: vi.fn(() => stmt) },
+      DB: { prepare: vi.fn(skipIdentityQueries(stmt)) },
       SESSIONS: {
         get: vi.fn(async () => JSON.stringify({
           userId: 'u1', email: 'admin@test.com', role: 'admin', createdAt: '2026-01-01T00:00:00Z',
@@ -434,7 +478,7 @@ describe('(e) budget_override <= 0 → 400', () => {
       }),
       dry_rounds: 0, created_at: 'x', updated_at: 'x',
     }
-    const firstResponses = [{ status: 'active' }, loopRow]
+    const firstResponses = [loopRow]
     let firstIdx = 0
     const stmt = {
       bind: (..._args: unknown[]) => stmt,
@@ -445,7 +489,7 @@ describe('(e) budget_override <= 0 → 400', () => {
     return {
       TENANT_SLUG: 't',
       BRAND: 'Test',
-      DB: { prepare: vi.fn(() => stmt) },
+      DB: { prepare: vi.fn(skipIdentityQueries(stmt)) },
       SESSIONS: {
         get: vi.fn(async () => JSON.stringify({
           userId: 'u1', email: 'admin@test.com', role: 'admin', createdAt: '2026-01-01T00:00:00Z',
