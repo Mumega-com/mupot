@@ -25,7 +25,7 @@
 
 import { html, raw as honoRaw } from 'hono/html'
 import type { AuthContext, Env } from '../types'
-import { canOnSquad } from '../auth/capability'
+import { canOnSquad, isOrgAdmin } from '../auth/capability'
 import { describeOrgStanding } from '../auth/refusal'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { listConsentableAgents, type ConsentableAgent } from '../mcp/oauth-authorize'
@@ -272,7 +272,10 @@ export async function loadEnrollView(
     return { principal, memberId, seat, preselectedAgent: null, agents: [] }
   }
 
-  const consentable = await listConsentableAgents(env, memberId)
+  // #1218: pass the legacy-role plane through. isOrgAdmin reads auth.role OR an
+  // org-scope grant, so a role-only owner is admitted here exactly as they are on
+  // every other admin surface — without it the picker stays empty for them.
+  const consentable = await listConsentableAgents(env, memberId, isOrgAdmin(auth))
   const liveByAgent = await loadLiveKeysForAgents(env, consentable.map((a) => a.id))
   const want = (opts.agent ?? '').trim()
   const preselectedAgent = want && consentable.some((a) => a.id === want || a.slug === want)

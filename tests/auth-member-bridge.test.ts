@@ -6,7 +6,8 @@
 // status-active, and fail-closed on no match.
 import { describe, expect, it } from 'vitest'
 import { authApp } from '../src/auth'
-import type { Env } from '../src/types'
+import { holdsCapabilityFloor, isOrgAdmin } from '../src/auth/capability'
+import type { AuthContext, Env } from '../src/types'
 
 type Role = 'owner' | 'admin' | 'member'
 interface MemberRow {
@@ -106,14 +107,52 @@ describe('email→member bridge (requireAuth)', () => {
     expect(body.capabilities).toEqual([grant])
   })
 
-  it('does NOT bind an owner (no downgrade) even with a matching lesser member row', async () => {
+  // mumega-com#1218. This test previously asserted BOTH `memberId` and `capabilities`
+  // were undefined for an owner — conflating IDENTITY with AUTHORITY exactly as the code
+  // did, and thereby pinning the defect: an owner with no memberId reaches
+  // loadEnrollView, which returns `agents: []`, and the seat picker is empty. Owners
+  // could not enrol any agent seat.
+  //
+  // The memberId half was the bug. The capabilities half is the real invariant and is
+  // asserted harder below, including the consequence rather than only the input.
+  it('binds an owner IDENTITY (memberId) but never its AUTHORITY (capabilities)', async () => {
     const { env, login } = makeEnv({ members: [gavin], grants: [grant] })
     const { body } = await me(env, login('u1', 'gavin@x.test', 'owner'))
-    // Owner keeps the pure legacy-role path — capabilities stays undefined so the
-    // requireCapability owner-escape is not disabled.
-    expect(body.memberId).toBeUndefined()
-    expect(body.capabilities).toBeUndefined()
+
+    // identity — this is what unblocks /enroll
+    expect(body.memberId).toBe('m-gavin')
     expect(body.role).toBe('owner')
+
+    // authority — MUST stay undefined. resolveCapabilities would return the lesser
+    // squad-observer grant above; assigning it defines auth.capabilities and disables
+    // the legacy-role escape in holdsCapabilityFloor (src/auth/capability.ts:181),
+    // downgrading the owner.
+    expect(body.capabilities).toBeUndefined()
+  })
+
+  // The CONSEQUENCE, not just the input. Asserting `capabilities === undefined` only
+  // pins the shape; this pins what that shape is FOR. If a future change assigns
+  // capabilities to an owner, the line above goes red — and so does this, which says
+  // why it matters.
+  it('an owner still clears an admin floor after the identity bind', async () => {
+    const { env, login } = makeEnv({ members: [gavin], grants: [grant] })
+    const { body } = await me(env, login('u1', 'gavin@x.test', 'owner'))
+
+    const auth = {
+      role: body.role,
+      memberId: body.memberId,
+      capabilities: body.capabilities,
+    } as unknown as AuthContext
+
+    expect(holdsCapabilityFloor(auth, 'admin')).toBe(true)
+    expect(isOrgAdmin(auth)).toBe(true)
+  })
+
+  it('an ADMIN is bound the same way — identity yes, authority no', async () => {
+    const { env, login } = makeEnv({ members: [gavin], grants: [grant] })
+    const { body } = await me(env, login('u1', 'gavin@x.test', 'admin'))
+    expect(body.memberId).toBe('m-gavin')
+    expect(body.capabilities).toBeUndefined()
   })
 
   it('does NOT bind across tenants (no cross-tenant leak)', async () => {

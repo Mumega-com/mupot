@@ -1107,17 +1107,62 @@ async function loadAuthFromCookie(c: Context<AppEnv>): Promise<AuthContext | nul
     }
   }
 
-  if (auth.role === 'member' && c.env.DB) {
-    const memberId =
-      auth.webSessionMemberId ??
-      (await resolveHumanMemberId(c.env, {
-        tenant: c.env.TENANT_SLUG,
-        email: auth.email,
-      }))
-    if (memberId) {
-      auth.memberId = memberId
-      auth.capabilities = await resolveCapabilities(c.env, memberId)
-      auth.channel = 'dashboard'
+  // mumega-com#1218: IDENTITY is resolved for every role; AUTHORITY still is not.
+  //
+  // This used to be gated `auth.role === 'member'` in its entirety, which excluded the
+  // org OWNER from identity resolution by the very field that marks them as owner —
+  // auth.role is written once at account creation (first account ever -> 'owner',
+  // everyone later -> 'member') and no supported interface changes it afterwards. The
+  // owner therefore reached loadEnrollView with memberId null, and enroll.ts returns
+  // `agents: []` on that branch: the empty seat picker. Owners could not enrol ANY
+  // agent seat, which is why harnesses ended up welded to the wrong seats by hand.
+  //
+  // The invariant recorded above is REAL and is preserved — verified, not assumed, at
+  // src/auth/capability.ts:181 (holdsCapabilityFloor): when auth.capabilities is
+  // undefined it falls back to legacyRoleSatisfies(auth.role, min). A role-only owner
+  // has NO grant rows, so resolveCapabilities returns []; assigning [] flips that
+  // branch to [].some(...) === false and DOWNGRADES the owner. isOrgAdmin happens to
+  // survive it (capability.ts:85 checks role first) so the regression would be PARTIAL
+  // and surface later on a different surface — worse than a clean break.
+  //
+  // So the two concerns are separated, because only one of them was ever the problem:
+  //   memberId     = identity  -> attached for EVERY role (unblocks the picker)
+  //   capabilities = authority -> assigned ONLY for role === 'member' (invariant held,
+  //                               stays undefined for owner/admin so the legacy escape
+  //                               keeps firing)
+  //
+  // FAIL-SAFE, and this is load-bearing. Widening the bridge to every role means
+  // owner/admin sessions now execute this lookup on EVERY authenticated request,
+  // where before they skipped it entirely. Without the guard below, any throw in
+  // identity resolution — a degraded table, a D1 hiccup, a schema drift — would
+  // turn every owner request into a 500 on a path that used to be inert for them.
+  // Caught in test: a fixture whose D1 stub implements first()/run() but not all()
+  // (the owner-alias rung uses .all()) took three task-route tests from green to
+  // 500, and the same shape is reachable in production.
+  //
+  // Degrading to "no memberId" is EXACTLY the pre-existing behaviour for these
+  // roles, so this is strictly no worse than main: the picker stays empty, which
+  // is the old bug, rather than the request dying, which would be a new one.
+  // Identity resolution is an enhancement; it must never be able to take down auth.
+  if (c.env.DB) {
+    try {
+      const memberId =
+        auth.webSessionMemberId ??
+        (await resolveHumanMemberId(c.env, {
+          tenant: c.env.TENANT_SLUG,
+          email: auth.email,
+        }))
+      if (memberId) {
+        auth.memberId = memberId
+        auth.channel = 'dashboard'
+        if (auth.role === 'member') {
+          auth.capabilities = await resolveCapabilities(c.env, memberId)
+        }
+      }
+    } catch {
+      // Identity unresolved. auth.memberId stays undefined and auth.capabilities
+      // is untouched, so the legacy-role plane still decides authority — no
+      // principal is elevated by this failing, and none is downgraded.
     }
   }
 

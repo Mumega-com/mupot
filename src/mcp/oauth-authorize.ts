@@ -452,7 +452,27 @@ export async function memberMayConsentToAgent(env: Env, memberId: string, agentI
 /** The full selectable list for the consent screen, each with its capability preview
  *  — "a parameter that grants capability without showing it is a phishing surface".
  *  Floor is 'admin' (P0-3) — see memberMayConsentToAgent. */
-export async function listConsentableAgents(env: Env, memberId: string): Promise<ConsentableAgent[]> {
+export async function listConsentableAgents(
+  env: Env,
+  memberId: string,
+  /**
+   * mumega-com#1218. The per-squad filter below is GRANTS-ONLY — canOnSquad takes a
+   * grant array, never an AuthContext, so it cannot see the legacy `auth.role` plane
+   * that isOrgAdmin (src/auth/capability.ts:85) honours everywhere else.
+   *
+   * An org owner whose ownership lives as a ROLE rather than a capability row
+   * therefore resolves to humanGrants = [], every agent is filtered out, and the
+   * caller receives []. That is the #1218 empty seat picker, and attaching
+   * auth.memberId alone does not fix it — it only moves the null one layer down.
+   * Proven: tests/enroll-owner-outcome.test.ts asserts the OUTCOME (does the picker
+   * populate) rather than the intermediate (is memberId set), which is the check the
+   * first cut of that fix was missing.
+   *
+   * OPTIONAL and defaulting false so the OAuth consent caller is byte-for-byte
+   * unchanged: that flow has no AuthContext and must not silently widen.
+   */
+  orgWideAdmin = false,
+): Promise<ConsentableAgent[]> {
   const humanGrants = await resolveCapabilities(env, memberId)
   const rows = await env.DB.prepare(
     `SELECT a.id AS id, a.slug AS slug, a.name AS name, a.squad_id AS squad_id,
@@ -467,7 +487,10 @@ export async function listConsentableAgents(env: Env, memberId: string): Promise
 
   const out: ConsentableAgent[] = []
   for (const row of rows.results ?? []) {
-    if (!(await canOnSquad(env, humanGrants, row.squad_id, 'admin'))) continue
+    // An org-wide admin/owner covers every scope by definition — the same rule
+    // canOnSquad already applies to an org-scope GRANT. This adds only the legacy
+    // role plane, so it can never admit a principal that isOrgAdmin would refuse.
+    if (!orgWideAdmin && !(await canOnSquad(env, humanGrants, row.squad_id, 'admin'))) continue
     // The preview shows the TRUE clamped result (P0-1) — `memberId` here IS the
     // viewing/consenting human, so this is honest about exactly what the session
     // would carry, never the agent's raw (possibly higher) grant.
