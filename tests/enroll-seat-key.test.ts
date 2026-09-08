@@ -880,13 +880,28 @@ describe('POST /enroll/mint — a revoked principal is told the truth', () => {
   // throttle path, which is out of scope here. Noted on the PR.)
   it('says the login is not active, and does NOT tell the operator to grant squad admin', async () => {
     harness = makeHarness()
+    // FIXTURE REBUILT after #1330 landed. The original seeded a SUSPENDED member and
+    // asserted 403. That path no longer reaches this route: #1330 revokes the web session
+    // of a suspended member, so loadAuthFromCookie now answers 302 to /auth/login before
+    // the enroll handler runs. Editing the assertion to 302 would have gone green and
+    // deleted the property this test exists for — that a revoked operator is told the
+    // truth instead of the misleading "grant you squad admin".
+    //
+    // So the fixture moves to a revoked standing that still ARRIVES: the owner-alias rung
+    // returns 'revoked' when the alias resolves to MORE THAN ONE org owner (ambiguous —
+    // the gate cannot tell which principal is being admitted). Both owners are ACTIVE and
+    // the caller has no members row of its own, so nothing suspends the session and the
+    // request reaches the standing gate exactly as a real ambiguous-alias operator would.
     harness.sqlite.exec(`
-      INSERT INTO members (id, email, display_name, status, tenant)
-        VALUES ('m-revoked-route', 'revoked@pot.test', 'Revoked', 'suspended', '${TENANT}');
-      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
-        VALUES ('cap-revoked-route', 'm-revoked-route', 'org', NULL, 'admin');
+      INSERT INTO members (id, email, display_name, status, tenant) VALUES
+        ('m-owner-one', 'owner1@pot.test', 'Owner One', 'active', '${TENANT}'),
+        ('m-owner-two', 'owner2@pot.test', 'Owner Two', 'active', '${TENANT}');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES
+        ('cap-owner-one', 'm-owner-one', 'org', NULL, 'owner'),
+        ('cap-owner-two', 'm-owner-two', 'org', NULL, 'owner');
+      INSERT INTO org_settings (key, value) VALUES ('owner_login_emails', '["alias@pot.test"]');
     `)
-    const env = envFor(harness, { 'sess:s-revoked': sessionRecord('revoked@pot.test', 'admin') })
+    const env = envFor(harness, { 'sess:s-revoked': sessionRecord('alias@pot.test', 'admin') })
     const before = harness.sqlite.prepare(`SELECT COUNT(*) AS n FROM member_tokens`).get() as { n: number }
 
     const res = await dashboardApp.fetch(
