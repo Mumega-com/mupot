@@ -161,3 +161,160 @@ describe('POST /members/:id/capabilities bound-agent delegation', () => {
     })
   })
 })
+
+// ── #1337: TARGET-rank ceiling on POST /members/:id/capabilities ──────────────
+//
+// The pre-existing ceiling guards the capability being GRANTED. It never looked
+// at what the target ALREADY HOLDS, so an org admin could remove or demote the
+// org OWNER. Both reachable paths are covered here because both DELETE the
+// target's existing row:
+//
+//   revoke  — DELETEs by (member_id, scope_type, scope_id), not by capability
+//   grant   — upsertCapabilityGrant is DELETE-then-INSERT on the same key, so
+//             granting a LOWER capability deletes the higher one. The grant
+//             ceiling cannot catch that: rank('member') is BELOW the actor's.
+//
+// Fixtures use the REAL migration chain (createHarness above), and every
+// assertion re-reads the row rather than trusting the response body.
+describe('POST /members/:id/capabilities — target-rank ceiling (#1337)', () => {
+  let harness: SqliteD1Harness
+  let env: Env
+
+  const OWNER_MEMBER = 'member-owner'
+  const ADMIN_MEMBER = 'member-admin'
+  const PEER_ADMIN = 'member-peer-admin'
+
+  function ownerCapabilityRequest(target: string, body: Record<string, unknown>): Request {
+    return new Request(`https://pot.example/members/${target}/capabilities`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+  }
+
+  function orgCapabilityOf(memberId: string): { capability: string } | undefined {
+    return harness.sqlite.prepare(
+      `SELECT capability FROM capabilities
+        WHERE member_id = ? AND scope_type = 'org' AND scope_id IS NULL`,
+    ).get(memberId) as { capability: string } | undefined
+  }
+
+  beforeEach(() => {
+    harness = createHarness()
+    env = { TENANT_SLUG: TENANT, DB: harness.db } as Env
+    harness.sqlite.exec(`
+      INSERT INTO members (id, display_name, status, tenant) VALUES
+        ('${OWNER_MEMBER}', 'The Owner', 'active', '${TENANT}'),
+        ('${ADMIN_MEMBER}', 'An Admin', 'active', '${TENANT}'),
+        ('${PEER_ADMIN}', 'Peer Admin', 'active', '${TENANT}');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES
+        ('cap-owner', '${OWNER_MEMBER}', 'org', NULL, 'owner'),
+        ('cap-admin', '${ADMIN_MEMBER}', 'org', NULL, 'admin'),
+        ('cap-peer',  '${PEER_ADMIN}',  'org', NULL, 'admin');
+    `)
+    // The ACTOR is an org admin, not an owner. role is deliberately 'member' so
+    // standing comes from the capability grant, which is the plane that matters.
+    authState.current = {
+      userId: 'admin-user',
+      email: 'admin@example.test',
+      role: 'member',
+      tenant: TENANT,
+      memberId: ADMIN_MEMBER,
+      capabilities: [
+        { member_id: ADMIN_MEMBER, scope_type: 'org', scope_id: null, capability: 'admin' },
+      ],
+    } as AuthContext
+  })
+
+  afterEach(() => {
+    authState.current = null
+    harness.close()
+  })
+
+  it('refuses an admin REVOKING the org owner, and the owner row survives', async () => {
+    const res = await membersApp.fetch(ownerCapabilityRequest(OWNER_MEMBER, {
+      action: 'revoke',
+      scope_type: 'org',
+    }), env)
+
+    expect(res.status).toBe(403)
+    await expect(res.json()).resolves.toMatchObject({ reason: 'cannot_affect_higher_rank' })
+    // The row is what matters, not the status code.
+    expect(orgCapabilityOf(OWNER_MEMBER)).toEqual({ capability: 'owner' })
+  })
+
+  it('refuses an admin DEMOTING the org owner via a lower grant — the path the grant ceiling cannot see', async () => {
+    const res = await membersApp.fetch(ownerCapabilityRequest(OWNER_MEMBER, {
+      scope_type: 'org',
+      capability: 'member',
+    }), env)
+
+    expect(res.status).toBe(403)
+    await expect(res.json()).resolves.toMatchObject({ reason: 'cannot_affect_higher_rank' })
+    expect(orgCapabilityOf(OWNER_MEMBER)).toEqual({ capability: 'owner' })
+  })
+
+  it('still allows an admin to affect a PEER admin — the guard is about rank inversion, not peers', async () => {
+    const res = await membersApp.fetch(ownerCapabilityRequest(PEER_ADMIN, {
+      action: 'revoke',
+      scope_type: 'org',
+    }), env)
+
+    expect(res.status).toBe(200)
+    expect(orgCapabilityOf(PEER_ADMIN)).toBeUndefined()
+  })
+
+  it('refuses an admin SUSPENDING the org owner — #1330 made that lockout immediate', async () => {
+    const res = await membersApp.fetch(new Request(`https://pot.example/members/${OWNER_MEMBER}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ status: 'suspended' }),
+    }), env)
+
+    expect(res.status).toBe(403)
+    await expect(res.json()).resolves.toMatchObject({ reason: 'cannot_affect_higher_rank' })
+    // Re-read the row: the response body is not the evidence.
+    expect(harness.sqlite.prepare('SELECT status FROM members WHERE id = ?').get(OWNER_MEMBER))
+      .toEqual({ status: 'active' })
+  })
+
+  it('still allows an admin to suspend a PEER admin', async () => {
+    const res = await membersApp.fetch(new Request(`https://pot.example/members/${PEER_ADMIN}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ status: 'suspended' }),
+    }), env)
+
+    expect(res.status).toBe(200)
+    expect(harness.sqlite.prepare('SELECT status FROM members WHERE id = ?').get(PEER_ADMIN))
+      .toEqual({ status: 'suspended' })
+  })
+
+  it('refuses an admin MINTING A TOKEN for the org owner — a token authenticates AS that member, so this is rank ESCALATION', async () => {
+    const res = await membersApp.fetch(new Request(`https://pot.example/members/${OWNER_MEMBER}/tokens`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ label: 'escalation attempt' }),
+    }), env)
+
+    expect(res.status).toBe(403)
+    await expect(res.json()).resolves.toMatchObject({ reason: 'cannot_affect_higher_rank' })
+    // No credential row may exist for the owner.
+    expect(harness.sqlite.prepare(
+      'SELECT COUNT(*) AS n FROM member_tokens WHERE member_id = ?',
+    ).get(OWNER_MEMBER)).toEqual({ n: 0 })
+  })
+
+  it('still allows an admin to mint a token for a PEER admin', async () => {
+    const res = await membersApp.fetch(new Request(`https://pot.example/members/${PEER_ADMIN}/tokens`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ label: 'ordinary' }),
+    }), env)
+
+    expect(res.status).toBe(201)
+    expect(harness.sqlite.prepare(
+      'SELECT COUNT(*) AS n FROM member_tokens WHERE member_id = ?',
+    ).get(PEER_ADMIN)).toEqual({ n: 1 })
+  })
+})

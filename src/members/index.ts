@@ -451,6 +451,60 @@ interface PatchMemberBody {
   status?: unknown
 }
 
+
+// ── TARGET-rank ceiling (#1337), shared by every route that mutates a member ──
+//
+// The ceilings already in this file guard the capability being GRANTED or
+// INVITED AT. None of them looked at what the TARGET already holds, which is the
+// #1164/#1169 class: "a rank ceiling guards the grant, not the target."
+//
+// Three reachable paths, all of which act on a higher-ranked principal:
+//   1. POST /members/:id/capabilities action='revoke' — DELETEs by
+//      (member_id, scope_type, scope_id) and does NOT filter on capability, so
+//      revoking org scope removes an OWNER row wholesale.
+//   2. POST /members/:id/capabilities action='grant' with a LOWER capability —
+//      upsertCapabilityGrant (src/members/service.ts) is DELETE-then-INSERT on
+//      the same key, so granting 'member' to an owner deletes the owner row. The
+//      grant ceiling cannot catch this: rank('member') is BELOW the actor's own,
+//      so it passes. Demotion slips through the check meant to stop escalation.
+//   3. PATCH /members/:id — an org admin could suspend the org OWNER. Since
+//      #1330 revokes web sessions on suspend, that lockout is immediate.
+//
+// ONE helper rather than three copies: a rule that exists in more than one place
+// is a rule whose copies eventually disagree, which is the defect class this
+// codebase keeps paying for (seat resolution had an HTTP copy and an MCP copy;
+// gate eligibility had three).
+//
+// Rank comparison rather than hasCapability(grants, ...) — deliberately.
+// actorMaxRankOnScope combines the fine-grained grants with the coarse auth.role
+// plane; a grants-only check would miss an actor whose standing comes from the
+// legacy role column.
+//
+// STRICTLY ABOVE, not at-or-above: an admin removing another admin is ordinary
+// administration, and refusing it would break a live path to close a hole that
+// is about rank INVERSION, not peers.
+async function targetRankCeiling(
+  c: Context<AppEnv>,
+  targetMemberId: string,
+  scopeType: CapabilityScopeType,
+  scopeId: string | null,
+): Promise<Response | null> {
+  const existing = scopeId === null
+    ? await c.env.DB.prepare(
+        'SELECT capability FROM capabilities WHERE member_id = ? AND scope_type = ? AND scope_id IS NULL LIMIT 1',
+      ).bind(targetMemberId, scopeType).first<{ capability: Capability }>()
+    : await c.env.DB.prepare(
+        'SELECT capability FROM capabilities WHERE member_id = ? AND scope_type = ? AND scope_id = ? LIMIT 1',
+      ).bind(targetMemberId, scopeType, scopeId).first<{ capability: Capability }>()
+
+  if (!existing) return null
+  const actorRank = await actorMaxRankOnScope(c, scopeType, scopeId)
+  if (capabilityRank(existing.capability) > actorRank) {
+    return c.json({ error: 'forbidden', reason: 'cannot_affect_higher_rank' }, 403)
+  }
+  return null
+}
+
 membersApp.patch('/members/:id', requireCapability(orgScope, 'admin'), async (c) => {
   const id = c.req.param('id')
 
@@ -465,6 +519,13 @@ membersApp.patch('/members/:id', requireCapability(orgScope, 'admin'), async (c)
   if (status !== 'active' && status !== 'suspended') {
     return c.json({ error: 'invalid_status', allowed: ['active', 'suspended'] }, 400)
   }
+
+  // #1337: an org admin must not suspend (or reactivate) a higher-ranked
+  // principal. Since #1330 revokes web sessions on suspend, an unguarded
+  // suspend of the org OWNER is an immediate, total lockout of the one
+  // principal who could undo it.
+  const ceiling = await targetRankCeiling(c, id, 'org', null)
+  if (ceiling) return ceiling
 
   let sessionsRevoked = 0
   const res = status === 'suspended'
@@ -528,6 +589,13 @@ membersApp.post('/members/:id/tokens', requireCapability(orgScope, 'admin'), asy
     .bind(memberId)
     .first<{ id: string; status: Member['status'] }>()
   if (!member) return c.json({ error: 'member_not_found' }, 404)
+
+  // #1337: the most severe of the three. Minting a token FOR a member yields a
+  // credential that authenticates AS that member, so an unguarded mint lets an
+  // org admin (rank 4) obtain owner rank (5). That is vertical privilege
+  // escalation, not merely acting on a higher-ranked target.
+  const mintCeiling = await targetRankCeiling(c, memberId, 'org', null)
+  if (mintCeiling) return mintCeiling
 
   let body: MintTokenBody
   try {
@@ -617,6 +685,9 @@ membersApp.post('/members/:id/capabilities', requireCapability(orgScope, 'admin'
       .first<{ id: string }>()
     if (!exists) return c.json({ error: `${scopeType}_not_found` }, 404)
   }
+
+  const ceiling = await targetRankCeiling(c, memberId, scopeType, scopeId)
+  if (ceiling) return ceiling
 
   const boundAgent = await resolveBoundAgentForMember(c.env, memberId)
   if (boundAgent && scopeType !== 'squad') {

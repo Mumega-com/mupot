@@ -39,6 +39,18 @@ function makeEnv(options: {
           if (sql.includes('SELECT id, display_name FROM members')) {
             return { id: 'member-1', display_name: 'Operator' } as T
           }
+          // #1337: the mint route now consults the TARGET's existing capability
+          // before minting (targetRankCeiling — an org admin must not mint a
+          // token that authenticates AS a higher-ranked member). This stub is an
+          // exact-sequence allowlist, so the new lookup has to be declared here
+          // or every mint 500s.
+          //
+          // Returning null = "target holds no grant at org scope", which is the
+          // right fixture for THIS test: its subject is caching/referrer headers
+          // on a successful mint, not authorization. The ceiling itself is
+          // covered against the real migration chain in
+          // tests/members-agent-capability-route.test.ts.
+          if (sql.includes('SELECT capability FROM capabilities')) return null as T
           throw new Error(`unexpected first query: ${sql}`)
         },
         async run() {
