@@ -85,6 +85,10 @@ jobs:
       # the guard fired on the person who wrote it, which is the point of a guard.
       - name: Router routing-rule tests
         run: node --test tests/router.test.mjs
+      # P0 provisioner tests. Same #745 rule as above: **/*.test.mjs is excluded
+      # from vitest as a class, so scripts/provision/*.test.mjs runs ONLY here.
+      - name: P0 provisioner tests (journal, R2 ordering, clamp)
+        run: node --test 'scripts/provision/*.test.mjs'
       - name: Wrangler dry-run bundle check
         run: npx wrangler deploy --dry-run --config wrangler.example.toml
       - name: D1 migration chain check

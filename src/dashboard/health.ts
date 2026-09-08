@@ -6,7 +6,7 @@
 
 import type { Agent, AuthContext, Env } from '../types'
 import { loadAgentStats, loadAgentRuntimeStates, type AgentStat, type AgentRuntimeState } from './observatory'
-import { loadApprovals, type ApprovalItem } from './approvals'
+import { loadApprovals, type ApprovalsQueue } from './approvals'
 import { computeOperatorCounts, loadTaskStatusCounts, type OperatorCounts } from './operator-counts'
 
 export type HealthTone = 'ok' | 'warn' | 'danger' | 'dim'
@@ -59,6 +59,11 @@ export interface OpsHealthData {
     runtimeOnline: number
     activePresence: number
     needsDecision: number
+    /** mupot#1319 round 2 FINDING 4/2: true when needsDecision is a LOWER
+     *  BOUND (see OperatorCounts.needsDecisionCountIsLowerBound) — an API
+     *  consumer of this field must not treat needsDecision as exact when
+     *  this is true. */
+    needsDecisionIsLowerBound: boolean
     blockedOrRejected: number
     recentAudit: number
   }
@@ -283,6 +288,48 @@ function makeCheck(input: HealthCheck): HealthCheck {
   return input
 }
 
+/**
+ * How the Approval gates check presents a count that may be a LOWER BOUND.
+ *
+ * Exported and pure so the test asserts THIS function rather than a copy of its
+ * logic — a projection that mirrors production proves nothing once production
+ * drifts.
+ *
+ * The case that matters: a count of 0 whose candidate fetch hit
+ * APPROVALS_FETCH_CEILING. Rows past the ceiling were never loaded, so an
+ * actionable task can exist that the count cannot see. Reporting 'clear' there
+ * is the truncated-read-as-complete defect this PR exists to remove, so an
+ * unknown presents as an unknown instead of an all-clear.
+ */
+export function approvalsCheckPresentation(
+  needsDecisionCount: number,
+  isLowerBound: boolean,
+): { tone: HealthTone; state: string; detail: string; nextAction: string } {
+  if (needsDecisionCount > 0) {
+    return {
+      tone: 'warn',
+      state: `${needsDecisionCount}${isLowerBound ? '+' : ''} waiting`,
+      detail: 'Gated work is waiting for an accountable verdict.',
+      nextAction: 'Approve, reject, or request changes.',
+    }
+  }
+  if (isLowerBound) {
+    return {
+      tone: 'warn',
+      state: '0+ waiting',
+      detail:
+        'The approval queue read was truncated, so this is a lower bound — an actionable task may exist beyond it.',
+      nextAction: 'Open the approvals queue directly — the count cannot prove it is empty.',
+    }
+  }
+  return {
+    tone: 'ok',
+    state: 'clear',
+    detail: 'No tasks are waiting in review.',
+    nextAction: 'No action needed.',
+  }
+}
+
 export async function loadOpsHealth(env: Env, auth: AuthContext, nowMs = Date.now()): Promise<OpsHealthData> {
   const tenant = env.TENANT_SLUG
   const [
@@ -398,7 +445,7 @@ export async function loadOpsHealth(env: Env, auth: AuthContext, nowMs = Date.no
     // failure here becomes a queryErrors entry + safe fallback, not a 500.
     safeCall(() => loadAgentStats(env), new Map<string, AgentStat>()),
     safeCall(() => loadAgentRuntimeStates(env, nowMs), new Map<string, AgentRuntimeState>()),
-    safeCall(() => loadApprovals(env, auth), [] as ApprovalItem[]),
+    safeCall(() => loadApprovals(env, auth), { items: [], actionableCount: 0, actionableCountIsLowerBound: false } as ApprovalsQueue),
     safeCall(() => loadTaskStatusCounts(env), new Map<string, number>()),
   ])
 
@@ -597,10 +644,7 @@ export async function loadOpsHealth(env: Env, auth: AuthContext, nowMs = Date.no
     makeCheck({
       id: 'approvals',
       label: 'Approval gates',
-      tone: counts.needsDecisionCount > 0 ? 'warn' : 'ok',
-      state: counts.needsDecisionCount > 0 ? `${counts.needsDecisionCount} waiting` : 'clear',
-      detail: counts.needsDecisionCount > 0 ? 'Gated work is waiting for an accountable verdict.' : 'No tasks are waiting in review.',
-      nextAction: counts.needsDecisionCount > 0 ? 'Approve, reject, or request changes.' : 'No action needed.',
+      ...approvalsCheckPresentation(counts.needsDecisionCount, counts.needsDecisionCountIsLowerBound),
       href: '/approvals',
     }),
     makeCheck({
@@ -703,6 +747,7 @@ export async function loadOpsHealth(env: Env, auth: AuthContext, nowMs = Date.no
       runtimeOnline: counts.liveRuntimeCount,
       activePresence,
       needsDecision: counts.needsDecisionCount,
+      needsDecisionIsLowerBound: counts.needsDecisionCountIsLowerBound,
       blockedOrRejected,
       recentAudit: auditSignals.length,
     },

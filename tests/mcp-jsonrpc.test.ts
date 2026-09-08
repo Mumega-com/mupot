@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { mcpActionsApp, mcpApp } from '../src/mcp'
+import { jsonRpcCodeForToolFailure, mcpActionsApp, mcpApp } from '../src/mcp'
 import { MUPOT_PUBLIC_API_VERSION } from '../src/version'
 import type { CapabilityGrant, Env } from '../src/types'
 
@@ -146,6 +146,15 @@ describe('mcp JSON-RPC compatibility', () => {
     const body = await res.json() as { ok: boolean; result: { tenant: string } }
     expect(body.ok).toBe(true)
     expect(body.result.tenant).toBe('digid')
+  })
+})
+
+describe('JSON-RPC error codes for tool failures', () => {
+  it('does not map send_target_not_visible (HTTP 404) to -32602 Invalid params', () => {
+    // Harnesses print -32602 as a schema/argument error and retry the call shape.
+    // send_target_not_visible is an application refusal, not invalid params.
+    expect(jsonRpcCodeForToolFailure(404, 'send_target_not_visible')).toBe(-32000)
+    expect(jsonRpcCodeForToolFailure(404, 'send_target_not_visible')).not.toBe(-32602)
   })
 })
 

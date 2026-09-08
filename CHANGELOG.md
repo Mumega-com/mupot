@@ -1,6 +1,166 @@
 # Changelog
 
-## Release status — 2026-09-02
+## Release status — 2026-09-06
+
+- **Current source version:** `0.30.0` on `main`. **This document does not pin the `main`
+  commit.** Any SHA written here is false the moment the commit writing it is merged, so
+  read it with `git rev-parse origin/main`.
+- **Current production deployment:** `0.30.0` at
+  `1303648c141eb5f5e9fa5efe76ef1776c6711011`, `clean:true`, built 2026-09-05T11:08:03Z.
+  Production and `main` are at the same commit at the time of writing — the first time
+  they have agreed since the 2026-09-01 freeze attempt. Read the live `/health` endpoint
+  for the authoritative answer; this line ages the moment anything merges.
+- **Latest tagged stable release:** `v0.25.0`. Unchanged for the eighth consecutive
+  status block. `v0.29.0` and `v0.30.0` have never been tagged. `v0.30.0-rc.1` exists at
+  `0bb9c256` (2026-09-03) and is superseded — 15 commits have landed on `main` since it
+  was cut, including four security fixes and three identity fixes.
+- **The version number is not tracking the work.** `package.json` and `src/version.ts`
+  both read `0.30.0` and agree with each other. They also read `0.30.0` before the 46
+  commits recorded below. Containment is currently established by
+  `git merge-base --is-ancestor <sha> <prod-sha>`, not by the version string, and every
+  deployment verification in this period used ancestry rather than `/health`'s version
+  field. See [ROADMAP.md](ROADMAP.md) § "Why no version has been tagged since v0.25.0".
+
+## Preview on main — 2026-09-05 landing sweep (deployed, not tagged)
+
+Eleven PRs landed and were deployed as `1303648c`. Containment of all eleven verified by
+`git merge-base --is-ancestor` against the deployed SHA, not by the reported version.
+Verified on the merged tree: 7540/7540 vitest, `tsc --noEmit` exit 0.
+
+**Every identity PR in this sweep was blocked on its first gate.** That is the sweep's
+main finding and is recorded here because the merge count alone misrepresents it. Seven
+defects were caught before merge, five of them in fixes that had themselves been written
+to close an earlier finding on the same PR.
+
+**Seat and inbox isolation — the same defect class on two surfaces:**
+
+- **#1325** — `GET /api/inbox` and `/api/inbox/stream` took the filtering seat from a
+  `?seat=` query parameter rather than from the bound token, so a token bound to seat A
+  could pass `?seat=B` and both read *and consume* seat B's mail. Consumption is the part
+  that matters: the mail is gone, and the rightful reader has no record that it existed.
+  Fixed by extracting `src/agents/inbox-seat.ts`, now the single seat rule shared by the
+  HTTP and MCP paths, so the two surfaces cannot drift again.
+
+**Gate predicate unification — three copies of one rule:**
+
+- **#1319** (`bda81e4c`) — `task_verdict`, `verdictReply` and the dashboard approvals page
+  each carried an independently written gate-eligibility predicate. Unified into
+  `hasActiveGateGrant` / `evaluateVerdictGates`. Also closed an unbounded D1 fan-out (161
+  `prepare()` calls per 40 rows) and a starvation bug where unactionable rows crowded
+  actionable ones out of a capped queue.
+- **#1334** (`84b51970`) — the divergence #1319 documented and deliberately left open:
+  `verdictPrincipal` resolved agent-bound first while `hasSurfaceCap` resolved member
+  first, so a single request could draw authority from two different principals. One
+  predicate now in `src/gates/principal.ts`.
+
+**Session lifecycle — suspension that did not suspend:**
+
+- **#1330** (`1303648c`) — `loadAuthFromCookie`'s suspended-member check was gated behind
+  `!webSessionRegistered`. A degraded `web_sessions` table collapses to the same
+  `'not_found'` as an unregistered session, so a suspended member holding a registered
+  session bypassed both guards. Reproduced end to end: suspend the member,
+  `DROP TABLE web_sessions`, `GET /me` still returns 200 as owner. The same PR closed a
+  second defect found during its gate — `PATCH /members/:id` and its status UPDATEs
+  carried no `tenant` predicate at all, so a cross-tenant org admin could suspend,
+  reactivate or read another tenant's member by id.
+
+**Addressing without an existence oracle:**
+
+- **#1321** (`e93f5257`) — `send` by display name entered its visibility fallback on *any*
+  resolution failure, including "resolved, but this sender may not see it". A hidden
+  slug could therefore redirect or block a visible display-name send, and the difference
+  in response leaked the hidden name's existence. Rewritten through one
+  `resolveNonAdminSendTarget`.
+
+**Also landed:** #1322 provisioner core (journal, R2 state machine, CLI, health gate);
+#1328 sender re-reads its own outbound message; #1316, #1326, #1331, #1332 documentation.
+
+**Held, with reasons, rather than merged:**
+
+- **#1324** — enrollment eligibility. Eight gate rounds; still open. Round seven found
+  three further defects in the round-six fix: a tenant predicate deleted rather than
+  widened (a predicate has three states — match, NULL, and a different value — and
+  deleting it let a foreign tenant's owner row lock out this pot's live owner), an owner
+  count that counted grant rows rather than owners (SQLite treats NULLs as distinct in a
+  unique index, so one owner with two org grant rows read as ambiguous), and a `try` wider
+  than the failure its `catch` documented, so a D1 error on the owner count returned "no
+  answer", which admits.
+- **#1277** — needs redesign, not repair. Its refusal would take live agents dark: the
+  shape is "reject the mismatch" where the correct shape is "record the bound seat and
+  report the correction".
+- **#1327** — one failing test (`tests/tasks-cross-squad-assignment.test.ts:269`, expected
+  201 got 500), diagnosed and left to the PR's author.
+- **#1253** — routed to v0.31.0; 50 commits behind `main`, the only open PR past the
+  rebase threshold.
+- **#1317** — draft docs describing a fleet with nothing on `main` to verify against.
+
+**Defects filed rather than fixed in place, because each is a different class than the PR
+that surfaced it:**
+
+- **#1337** (P1) — no rank ceiling on `POST /members/:id/capabilities`. An org admin can
+  strip or demote the org owner's own capability row; the actor is gated, the target is
+  not. This is what makes #1324's zero-owner branch attacker-reachable rather than
+  first-run-only.
+- **#1335** (P1) — step 2 of `resolve-human-member.ts` (login identity → member id) has no
+  `status = 'active'` filter, unlike steps 3 and 4, so a suspended member can still mint a
+  seat token. Reproduced end to end with a real mint.
+- **#1336** — the enroll mint path writes no issuance record when there is no member row,
+  breaking migration 0139's own stated invariant that no live credential exists without
+  one.
+
+## Preview on main — 2026-09-04 landing sweep (not deployed, not tagged)
+
+Nine PRs landed across the day. Verified on the merged tree at the end of the sweep:
+7487/7487 vitest, 15/15 composition (workerd), `tsc --noEmit` exit 0, and the
+schema-source, mcp-tool-seam and audit gates all exit 0 with zero dependency
+vulnerabilities.
+
+**Three live production defects, each measured exploitable before the fix rather than
+inferred from reading the code:**
+
+- **#1301 / #1299** — a client-supplied `x-mupot-tenant-slug` header chose which tenant
+  Worker served a request, ahead of all authentication. Both readers closed and the
+  parameter deleted from `extractTenantSlug` rather than gated. Review found a second live
+  bypass on the same surface: a trailing-dot host (`mupot.mumega.com.`) is a legal FQDN
+  that survived the edge and reached the dispatch namespace as `mupot-mumega-com-`.
+  Deployed 2026-09-04; prod verified rejecting both header spellings and the trailing dot.
+- **#1307 / #1305** — `/preview/:project_id` was mounted with no auth middleware and
+  dispatched into the same namespace that holds tenant pots, using a member-supplied
+  script name. Now requires a session AND a project the caller may actually see, via the
+  same visibility-scoped read the project's own API route and dashboard page use.
+- **#1312 / #1303** — slug availability answered `available: true` for every well-formed
+  slug, including a live tenant. The `pots` table it queried had never existed in the
+  migration chain, so the lookup threw on every call and the catch reported that failure
+  as availability. The "already taken" branch had never once executed in production.
+
+**Also landed:** #1248 `/t/{tenant}/{interface}` apex path routing with colony credentials
+and tenant-override headers stripped before dispatch (the path door is same-origin, so
+unlike subdomain routing the browser's credentials arrive with the request); #1246
+type-then-click device grant; #1247 missing Cloudflare token returns `503 unconfigured`;
+#1262 plugins catalog; #1313 muvps-loom VPS bridge skill.
+
+**Consequences for the v0.30.0 release contract, recorded rather than glossed:**
+
+- `v0.30.0-rc.1` (`0bb9c256`, 2026-09-03) is **superseded**. `main` is 13 commits ahead of
+  it. `docs/releases/v0.30.0.md` release order step 7 states that a post-RC merge
+  invalidates prior RC evidence, so no rc.1 receipt rolls forward.
+- **#1246, #1247 and #1248 were explicitly excluded** from the v0.30.0 stable contract by
+  the scope boundary in `docs/releases/next-flights.md`, which routed them to v0.31.0,
+  post-v0.30.0 and v0.33.0 respectively. They are now on `main`. Either the v0.30.0 scope
+  is re-cut to include them, or the stable candidate is taken from a different commit —
+  that is an owner decision and is not resolved by this document.
+
+**Held deliberately, with reasons recorded on the PRs:** #1277 fails two `living-presence`
+tests on its own head (recording presence under the bound seat collapses sibling seats onto
+one label, against `UNIQUE(tenant, member_id, label)`); #1253 conflicts with #1283's
+`available_doors`/`onboarding_state` onboarding surface.
+
+**Known open, not fixed here:** #1306 (no HTTP route reached a provisioned pot before
+#1248), #1311 (a dispatched Worker's response executes on the colony origin — no CSP,
+`frame-ancestors` or `X-Frame-Options` anywhere in `src/`), #1302 (tenant addressing),
+#1304 (drifted tenants never receive security fixes).
+
+## Release status — 2026-09-02 (superseded by the entry above)
 
 - **Current source version:** `0.30.0` on `main`. **This document does not pin the `main`
   commit.** Any SHA written here is false the moment the commit writing it is merged, so

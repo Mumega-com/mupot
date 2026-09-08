@@ -426,4 +426,26 @@ describe('web-session registry — integration through authApp (real D1)', () =>
     expect(body?.webSessionMemberId).toBeUndefined()
     bareHarness.close()
   })
+
+  it('a KV-only session is rejected after its member is suspended', async () => {
+    const env = makeEnv('member@x.test')
+    env.DB = harness.db
+    await seedMember(env, 'm1', 'member@x.test')
+    const cookie = await devLogin(env)
+    const key = `sess:${cookie}`
+    const raw = await env.SESSIONS.get(key)
+    expect(raw).not.toBeNull()
+    const record = JSON.parse(raw!) as Record<string, unknown>
+    delete record.webSessionRegistered
+    await env.SESSIONS.put(key, JSON.stringify(record))
+    await env.DB.prepare('DELETE FROM web_sessions WHERE tenant = ?1 AND member_id = ?2')
+      .bind(TENANT, 'm1')
+      .run()
+    await env.DB.prepare("UPDATE members SET status = 'suspended' WHERE id = ?1")
+      .bind('m1')
+      .run()
+
+    expect((await me(env, cookie)).status).toBe(401)
+    await expect(env.SESSIONS.get(key)).resolves.toBeNull()
+  })
 })

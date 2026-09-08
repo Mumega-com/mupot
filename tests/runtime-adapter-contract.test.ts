@@ -131,7 +131,7 @@ describe('runtime-adapter/v1 contract artifact', () => {
       domain: 'fleet-detach:v1',
     })
     expect(contract.attach.detach.signed.required).toEqual(['agent_id', 'ts', 'nonce', 'sig'])
-    expect(contract.messaging.mcpTools).toEqual(['send', 'inbox', 'broadcast'])
+    expect(contract.messaging.mcpTools).toEqual(['send', 'inbox', 'message_get', 'broadcast'])
     expect(contract.messaging.http.signedRead).toMatchObject({
       path: '/api/inbox/signed',
       domain: 'agent-inbox:v1',

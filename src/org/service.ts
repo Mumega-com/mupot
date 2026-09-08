@@ -941,11 +941,23 @@ const IDENTITY_CONTROL_CHAR_RE = /[\x00-\x1F\x7F]/
 const UPDATABLE_NUMERIC_COLUMNS = ['budget_cap_cents'] as const
 const UPDATABLE_ENUM_COLUMNS = ['budget_window'] as const
 
+// autonomy (mupot#1337): the ONLY MCP write path for this column was
+// POST /dashboard/agents/:id/config (src/dashboard/index.ts), which
+// authenticates by cookie session only — a bearer-token caller gets 302 to
+// /auth/login, so no MCP-bound agent, at any capability level, could ever
+// change autonomy through the MCP surface. It gets its own category (not
+// folded into UPDATABLE_ENUM_COLUMNS) because its validator is isAutonomy,
+// not isBudgetWindow — the two enums are not interchangeable and a shared
+// branch would either need a lookup table or risk validating one enum's
+// value against the other's predicate.
+const UPDATABLE_AUTONOMY_COLUMNS = ['autonomy'] as const
+
 export type UpdatableAgentField =
   | (typeof UPDATABLE_TEXT_COLUMNS)[number]
   | (typeof UPDATABLE_ARRAY_COLUMNS)[number]
   | (typeof UPDATABLE_NUMERIC_COLUMNS)[number]
   | (typeof UPDATABLE_ENUM_COLUMNS)[number]
+  | (typeof UPDATABLE_AUTONOMY_COLUMNS)[number]
 
 export type AgentProfilePatch = Partial<Record<UpdatableAgentField, unknown>>
 
@@ -1000,6 +1012,16 @@ export async function updateAgentProfile(
       // row (prepareAgentCreate defaults it to 'week' when omitted) — unlike
       // budget_cap_cents, null is not accepted here.
       if (!isBudgetWindow(raw)) return { ok: false, error: 'invalid_field' }
+      sets.push(`${key} = ?`)
+      binds.push(raw)
+      continue
+    }
+
+    if ((UPDATABLE_AUTONOMY_COLUMNS as readonly string[]).includes(key)) {
+      // autonomy has a schema DEFAULT and is never null-valued on a live row
+      // (mirrors budget_window above) — null is not accepted, only one of
+      // the four isAutonomy enum values.
+      if (!isAutonomy(raw)) return { ok: false, error: 'invalid_field' }
       sets.push(`${key} = ?`)
       binds.push(raw)
       continue

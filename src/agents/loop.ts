@@ -53,6 +53,7 @@ import { autonomyImpliesGate } from '../org/service'
 import { createTask } from '../tasks/service'
 import { createModel } from '../model'
 import { createMemory } from '../memory'
+
 import { buildAuthorizedExecution, checkAndReserve, recordTokens } from './meter'
 import { costMicroUsd, costUsageMicroUsd } from './cost'
 import { buildSensorium, renderSensorium } from './sensorium'
@@ -65,6 +66,34 @@ import { safeRecordEpisode, safeRecentEpisodes, renderEpisodes } from './episodi
 import type { EpisodeInput, Episode } from './episodic'
 import { computeKpiSignal } from './kpi-sources'
 import type { KpiSignalResult } from './kpi-sources'
+import { GATE_LOOPS } from '../gates/lanes'
+
+// The gate stamped on tasks an agent's own loop creates under
+// execute_with_approval.
+//
+// This is GATE_LOOPS from the lane registry, not a lane invented here. Three
+// reasons, in order of weight:
+//
+//  1. src/loops/gate.ts ALREADY stamps gate:loops on loop-created work. Two
+//     loop paths stamping two different gates is the same one-rule-two-copies
+//     split that produced the seat and verdict defects. One lane, one place.
+//  2. src/gates/lanes.ts exists so "a gate lane is a compile-time reference,
+//     not a string typed from memory at each call site". A lane invented at a
+//     single call site is precisely what that file prevents.
+//  3. The previous value here was a bare 'lead' — un-insertable into
+//     gate_grants, so unverdictable by every agent/MCP principal. Its first
+//     replacement, 'gate:lead', was canonical in SHAPE but named a RANK. Ranks
+//     are granted to several holders, and resolveSoleGateOwnerAgent returns
+//     null on multiple holders, which silently disables the wake.
+//
+// PREREQUISITE, NOT OPTIONAL: gate:loops must have a live gate_grants row held
+// by exactly ONE active agent that is not the loop agent. Measured 2026-09-07:
+// zero grants. migrations/0096 states the discipline — "never the reverse — a
+// flip ahead of its grant swaps one unverdictable string for another". Until
+// that grant exists, a task stamped here is verdictable only by a cookie-session
+// owner/admin, and on the external-runtime path (src/tasks/runtime-receipts.ts)
+// cannot be closed at all.
+export const LOOP_AUTONOMY_GATE_OWNER = GATE_LOOPS
 
 // ── Effort → max tasks spawned per tick ──────────────────────────────────────
 
@@ -415,7 +444,26 @@ export async function runGoalCycle(
 
     let spawned = 0
     for (const proposal of proposals) {
-      const gateOwner = autonomyImpliesGate(autonomy) ? 'lead' : null
+      // gate_owner MUST be canonical 'gate:<owner>'. A bare 'lead' can never
+      // match a gate_grants row (grants live in the gate:<owner> namespace), so
+      // the approvals EXISTS clause and hasActiveGateGrant both miss it.
+      //
+      // EXACT SCOPE of the old defect, corrected after review — the earlier
+      // wording here overstated it and an overstated comment mis-sizes the next
+      // fix. A non-null gate_owner is NOT invisible to everyone: BASE_SELECT +
+      // isOwnerAdmin in dashboard/approvals.ts still surfaces it to a
+      // cookie-session owner/admin, who can verdict it via legacyOwnerAdmin.
+      // What was stranded is every AGENT/MCP principal and every non-admin,
+      // because auth.role is always 'member' over MCP. And the refusal is a
+      // 403 with need:<gate_owner> (src/tasks/index.ts:1458), not a 409 — the
+      // 409 no_gate fires only when gate_owner is NULL.
+      //
+      // src/mcp/index.ts:1449 already refuses non-canonical gate_owner on the
+      // MCP path; this loop calls createTask directly and bypassed that check.
+      // The class fix is to hoist isValidGateOwnerForm into createTask itself,
+      // as src/tasks/service.ts already did for external-source provenance;
+      // that is deliberately out of scope here.
+      const gateOwner = autonomyImpliesGate(autonomy) ? LOOP_AUTONOMY_GATE_OWNER : null
 
       // 'execute' and 'execute_with_approval' self-assign to the agent.
       const assignee =

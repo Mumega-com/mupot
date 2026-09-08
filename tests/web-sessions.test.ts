@@ -115,6 +115,18 @@ describe('web-session registry (D1, real migration chain)', () => {
     expect(result.ok).toBe(true)
   })
 
+  it('loadWebSession: fails closed when the owning member is suspended', async () => {
+    const identityId = await seedMemberAndIdentity('m1', 'a@x.test')
+    const raw = 'raw-suspended-member'
+    const nowMs = Date.parse('2026-09-01T00:00:00.000Z')
+    await createWebSession(env, raw, { tenant: TENANT, memberId: 'm1', loginIdentityId: identityId }, nowMs)
+    await env.DB.prepare(`UPDATE members SET status = 'suspended' WHERE id = 'm1'`).run()
+
+    const result = await loadWebSession(env, TENANT, raw, nowMs + 1000)
+
+    expect(result).toEqual({ ok: false, reason: 'member_inactive' })
+  })
+
   it('evaluateWebSession: revoked wins even if neither expiry has passed yet', () => {
     const nowMs = Date.parse('2026-09-01T00:00:00.000Z')
     const session = {
@@ -313,6 +325,18 @@ describe('web-session registry (D1, real migration chain)', () => {
       .run()
     // Session row is still live — that is the hole the reauth join had.
     expect((await loadWebSession(env, TENANT, 'raw-reauth-ident')).ok).toBe(true)
+    expect(await loadLiveReauthIdentity(env, TENANT, created.id_hash)).toBeNull()
+  })
+
+  it('loadLiveReauthIdentity fails closed when the owning member is suspended', async () => {
+    const id1 = await seedMemberAndIdentity('m1', 'a@x.test', 'google', 'sub-m1')
+    const created = await createWebSession(env, 'raw-reauth-suspended-member', {
+      tenant: TENANT,
+      memberId: 'm1',
+      loginIdentityId: id1,
+    })
+    await env.DB.prepare(`UPDATE members SET status = 'suspended' WHERE id = 'm1'`).run()
+
     expect(await loadLiveReauthIdentity(env, TENANT, created.id_hash)).toBeNull()
   })
 

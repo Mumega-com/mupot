@@ -4,7 +4,7 @@
 // contained the bug it was written to fix.
 
 import type { Env } from '../types'
-import { OWNER_LOGIN_EMAILS_KEY, resolveHumanMemberId } from './resolve-human-member'
+import { OWNER_LOGIN_EMAILS_KEY, resolveHumanMember, resolveHumanMemberId } from './resolve-human-member'
 
 export { OWNER_LOGIN_EMAILS_KEY }
 
@@ -27,8 +27,13 @@ export async function findOrCreateHumanMember(
   displayName: string,
   loginIdentity?: { provider: string; subject: string },
 ): Promise<string> {
-  const resolved = await resolveVerifiedHumanMemberId(env, email, loginIdentity)
-  if (resolved) return resolved
+  const resolved = await resolveHumanMember(env, {
+    tenant: env.TENANT_SLUG,
+    provider: loginIdentity?.provider,
+    providerSubject: loginIdentity?.subject,
+    email,
+  })
+  if (resolved) return resolved.id
 
   const memberId = crypto.randomUUID()
   await env.DB.prepare(

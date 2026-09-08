@@ -8,16 +8,69 @@ numbers.
 
 | State | Version | Meaning |
 |---|---|---|
-| Current source version | `0.30.0` | Present on `main`; the commit is deliberately not pinned here, because any SHA in a versioned file is false once that file merges — read `git rev-parse origin/main`. Preview until the stabilization gate passes and `v0.30.0` is tagged. |
-| Current production version | `0.30.0` | Last recorded deploy `7d58d36b`, `clean:true`, 2026-09-02 (authoritative: live `/health`). The gap to `main` is not asserted here; compare the two sources. Still not a stable-release claim, which requires a tag. |
-| Last tagged release | `v0.25.0` | Project Routines and Needs You. |
-| Next stable candidate | `v0.30.0` | Stabilization-only: security train, messaging reliability, release proof, and backlog closure. |
+| Current source version | `0.30.0` | On `main`; preview. Read the commit with `git rev-parse origin/main` — this table does not pin it. |
+| Current production version | `0.30.0` | Last recorded deploy `1303648c` (2026-09-05); live `/health` is authoritative. Equal to `main` at the time of writing; both move independently. |
+| Last tagged release | `v0.25.0` | Project Routines and Needs You. The last STABLE tag; unchanged since. |
+| Superseded prerelease | `v0.30.0-rc.1` | Cut at `0bb9c256` (2026-09-03). 15 commits have landed since, including four security and three identity fixes. Not a candidate. |
+| Next stable candidate | `v0.30.0` | Stabilization-only. See the freeze problem below before planning against it. |
 | Future development target | `v0.31.0` | Canonical receiver, Agent Computers, and Recovery; held until `v0.30.0` is stable. |
 
-`0.30.0` is the version the source currently reports. It is **not** yet a stable
-release: no `v0.30.0` tag or GitHub release exists. Code on `main` remains preview
-until one exact commit passes the release gate below and is tagged. Deployment alone
-does not make a capability stable.
+`0.30.0` is the version the source reports. It is **not** a stable release: no `v0.30.0`
+tag or GitHub release exists. Deployment alone does not make a capability stable.
+
+## Why no version has been tagged since v0.25.0
+
+This section exists because the answer is structural, not a matter of remaining effort.
+
+The release contract in [docs/releases/next-flights.md](docs/releases/next-flights.md)
+states, correctly, that **"any merge after Flight A invalidates Flights B and C"** — the
+evidence bundle and the RC are bound to one exact SHA and no receipt rolls forward to a
+different commit. That rule is right. Evidence gathered at one commit genuinely says
+nothing about another.
+
+The rule assumes a `main` that can be held still long enough to collect the bundle.
+Measured, `main` has not been still:
+
+| Freeze attempt | Frozen at | Commits landed before the bundle completed |
+|---|---|---|
+| 2026-09-01 (Flight A, first) | `55c1c3ef` | 46, through 2026-09-05 |
+| 2026-09-03 (`v0.30.0-rc.1`) | `0bb9c256` | 15, through 2026-09-05 |
+
+Both attempts were invalidated by merges that were themselves correct and, in seven
+cases, closed live production defects that had been measured exploitable. Nothing here
+was a mistake. The freeze and the defect flow are simply competing for the same `main`,
+and the defect flow wins every time — as it should, while defects of that severity keep
+arriving.
+
+**So the tag is not blocked on work remaining. It is blocked on a quiet window that the
+current arrival rate does not offer.** Three ways out, and the choice is Hadi's:
+
+1. **Declare a freeze window.** No merges except a P0-with-live-exploit for a bounded
+   period; collect the bundle; tag; reopen. Costs whatever lands in that window.
+2. **Cut the release from a release branch.** Freeze `release/v0.30.0` at one SHA and let
+   `main` keep moving; cherry-pick only P0s onto the branch. Standard, and it removes the
+   competition entirely. Costs the cherry-pick discipline.
+3. **Change the contract to a rolling head.** Accept that the tag names the head at
+   collection time and re-collect cheaply on each merge. Only honest if the bundle is
+   fully automated; today it is not.
+
+Until one is chosen, expect this table to keep reading `v0.25.0`, and expect containment
+questions to keep being answered by ancestry rather than by a version number.
+
+## Versioning truth — the version string does not track the work
+
+`package.json` and `src/version.ts` both read `0.30.0` and agree with each other. They
+also read `0.30.0` across the 46 commits recorded in the 2026-09-05 CHANGELOG sweep,
+which included eleven merges, seven closed production defects, and three identity fixes.
+
+The consequence is operational, not cosmetic. `/health` reports
+`{"version":"0.30.0","commit":"<sha>"}`; only the second field distinguishes one
+deployment from another. **Every deployment verification in this period established
+containment with `git merge-base --is-ancestor`, because the version field could not.**
+
+Cheapest correction, when the release path is next touched: bump on merge to `main` so
+the reported version becomes a receipt rather than a label. Deliberately not done
+mid-flight — it touches the release path, which is the thing currently under repair.
 
 ## Versioning truth — source cuts exist, release tags are still owed
 
@@ -64,7 +117,44 @@ Three consequences this document now carries:
 | 5 | PR #1250 — versioned release contract | Version-aware release receipts, exact RC/stable identity, and metadata truth | **LANDED 2026-08-31** as `ccfdb4b3`; CI, CodeQL, independent review, and Athena green | Use its contract and checkers for the frozen release SHA |
 | 6 | PR #1251 — neutral Host-Go evidence | Mupot/Herdr-neutral host cutover receipt with `no_live_sos_wiring` | **LANDED 2026-08-31** as `c6ef9876`; historical receipt parsing preserved | Produce fresh neutral host evidence for the release bundle |
 | 7 | PR #1252 — exact Codex CLI harness | Accept exact `codex-cli` declarations across persistence, parser, schema, and instructions | **LANDED 2026-09-01** as `55c1c3ef`; post-main CI and CodeQL green; deployed since 2026-09-02 as an ancestor of prod `7d58d36b` | Keep as preview in v0.30, freeze `main`, and require a fresh seat check-in after any later deployment |
-| 8 | `v0.30.0` release candidate | One exact main SHA, upgrade/fresh migration proof, browser/runtime/MCP smoke, release receipt | **READY TO FREEZE** — [release contract](docs/releases/v0.30.0.md) and [flight runway](docs/releases/next-flights.md) defined; evidence remains pending | Freeze one SHA, collect contract receipts, then request separate RC publication/deployment approvals |
+| 8 | Security and identity train — 2026-09-02 to 09-05 | Close measured-exploitable production defects on auth, tenancy, seat isolation, and session lifecycle | **LANDED AND DEPLOYED** as `1303648c`; 46 commits since the first freeze. Full record in [CHANGELOG.md](CHANGELOG.md) | None — this work is done. It is listed because it is what invalidated freezes 1 and 2 |
+| 9 | `v0.30.0` release candidate | One exact main SHA, upgrade/fresh migration proof, browser/runtime/MCP smoke, release receipt | **BLOCKED ON A FREEZE DECISION**, not on work. Two freeze attempts invalidated by correct merges; see "Why no version has been tagged since v0.25.0" above | Hadi picks freeze window, release branch, or rolling head. Then freeze one SHA and collect receipts |
+
+
+## Open defect backlog — carried into the freeze decision
+
+Verified open on 2026-09-06 by direct query (203 open issues, 5 open PRs in the repo
+overall; these are the ones that bear on the release).
+
+| # | Severity | Defect | Bearing on v0.30.0 |
+|---|---|---|---|
+| [#1337](https://github.com/Mumega-com/mupot/issues/1337) | P1 | `POST /members/:id/capabilities` gates the actor but not the target, so an org admin can strip or demote the org owner's grant | Should land before a stable tag. It is the reachability path that makes #1324's zero-owner branch attacker-reachable |
+| [#1335](https://github.com/Mumega-com/mupot/issues/1335) | P1 | Step 2 of `resolve-human-member.ts` lacks the `status = 'active'` filter that steps 3 and 4 carry, so a suspended member can still mint a seat token | Should land before a stable tag; reproduced end to end with a real mint |
+| [#1336](https://github.com/Mumega-com/mupot/issues/1336) | — | The enroll mint path writes no issuance record when there is no member row, breaking migration 0139's own invariant | Audit-integrity gap; a live credential with no issuance row cannot be traced |
+| [#1234](https://github.com/Mumega-com/mupot/issues/1234) | — | No single reviewable artifact connects the task/gate/evidence system to Codex execution without treating a bus message or thread id as authority | Feature gap, post-v0.30 |
+
+**Pattern across all four, and across the seven defects caught during the 09-05 gates:**
+a rule exists in more than one place, and the copies disagree. Seat resolution had an
+HTTP copy and an MCP copy. Gate eligibility had three copies. The active-status filter
+exists at steps 3 and 4 of the member resolver and not at step 2. Authority is read from
+`auth.capabilities` (keyed on `member_id`) in one place and from `auth.role` on the
+`users` table — which has no status column — in another.
+
+Each individual fix has been to unify the copies. The backlog above is what remains
+un-unified, and it is the reason to expect further findings of the same shape on any
+identity surface touched next. This is a known structural property of the codebase, not
+a run of bad luck, and it should be stated as such in any estimate.
+
+## Open pull requests — state at 2026-09-06
+
+| PR | State | Behind `main` | Blocking condition |
+|---|---|---|---|
+| #1324 | Open, blocked | 11 | Eighth adversarial gate at exact head `1fb73058`. Identity/authz surface: requires the adversarial arm plus a second independent lens at the same head |
+| #1327 | Open, held | 11 | One failing test (`tests/tasks-cross-squad-assignment.test.ts:269`, expected 201 got 500); diagnosed, fix belongs to the PR's author |
+| #1277 | Draft, blocked | 1 | Redesign required — the refusal as written would take live agents dark. Record the bound seat and report the correction instead of refusing |
+| #1253 | Draft, held | **50** | Routed to v0.31.0. The only open PR past the 20-commit rebase threshold; rebase before it is gated |
+| #1317 | Draft, held | 11 | Describes a fleet with nothing on `main` to verify the description against |
+
 
 The ordered release flights and post-stable receiver convergence are maintained in
 [docs/releases/next-flights.md](docs/releases/next-flights.md). Open #1246–#1248 and

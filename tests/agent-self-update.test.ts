@@ -735,4 +735,92 @@ describe('update_agent — self lane (mupot#1288, reworked post-gate PR #1289)',
       expect(result.ok).toBe(true)
     })
   })
+
+  // ── mupot#1337: autonomy exposed on update_agent, admin-only ─────────────
+  //
+  // Before this, the ONLY write path for `autonomy` was
+  // POST /dashboard/agents/:id/config (src/dashboard/index.ts), which
+  // authenticates by cookie session only — a bearer-token caller gets a 302
+  // to /auth/login, so no agent, at any capability level, could ever change
+  // autonomy through the MCP surface. `autonomy` governs whether an agent
+  // may ship/send/publish/merge, so this is admin-only, and — the
+  // load-bearing part — it is in SELF_FORBIDDEN_FIELDS, not
+  // SELF_PATCHABLE_FIELDS: an agent-bound caller must never be able to raise
+  // its own ceiling (the escalation class tracked in mupot#1337).
+  describe('mupot#1337 — autonomy: admin-settable, self-forbidden', () => {
+    const squadAdmin: CapabilityGrant[] = [
+      { member_id: 'member-operator', scope_type: 'squad', scope_id: squadId, capability: 'admin' },
+    ]
+
+    it.each(['suggest', 'draft', 'execute', 'execute_with_approval'] as const)(
+      'admin sets autonomy to %s and the row actually changes (re-read, not just the return value)',
+      async (value) => {
+        const result = await invoke(auth({ capabilities: squadAdmin }), { agent: selfAgentId, autonomy: value })
+        expect(result.ok).toBe(true)
+
+        const row = await env.DB.prepare('SELECT autonomy FROM agents WHERE id = ?').bind(selfAgentId)
+          .first<{ autonomy: string }>()
+        expect(row?.autonomy).toBe(value)
+      },
+    )
+
+    it.each(['god', '', 'EXECUTE', 'executewithapproval', 'Suggest'])(
+      'admin sends invalid autonomy %j — rejected, row UNCHANGED',
+      async (value) => {
+        // Establish a known-good baseline first so "unchanged" is a real assertion.
+        await invoke(auth({ capabilities: squadAdmin }), { agent: selfAgentId, autonomy: 'suggest' })
+
+        const result = await invoke(auth({ capabilities: squadAdmin }), { agent: selfAgentId, autonomy: value })
+        expect(result.ok).toBe(false)
+        if (result.ok) return
+        expect(result.status).toBe(400)
+        expect(result.error).toBe('invalid_args')
+        expect(result.detail).toEqual({ reason: 'invalid_field' })
+
+        const row = await env.DB.prepare('SELECT autonomy FROM agents WHERE id = ?').bind(selfAgentId)
+          .first<{ autonomy: string }>()
+        expect(row?.autonomy).toBe('suggest') // untouched by the rejected write
+      },
+    )
+
+    // ── THE escalation test — matters most ────────────────────────────────
+    it('an agent-bound caller patching autonomy on its OWN row is refused by the self-lane block (privilege-escalation guard)', async () => {
+      const before = await env.DB.prepare('SELECT autonomy FROM agents WHERE id = ?').bind(selfAgentId)
+        .first<{ autonomy: string }>()
+
+      const result = await invoke(auth({ boundAgentId: selfAgentId }), {
+        agent: selfAgentId,
+        autonomy: 'execute',
+      })
+      expect(result.ok).toBe(false)
+      if (result.ok) return
+      expect(result.status).toBe(403)
+      expect(result.detail).toEqual({ need: 'admin', field: 'autonomy' })
+
+      const after = await env.DB.prepare('SELECT autonomy FROM agents WHERE id = ?').bind(selfAgentId)
+        .first<{ autonomy: string }>()
+      expect(after?.autonomy).toBe(before?.autonomy) // untouched — no ceiling raise
+    })
+
+    it('autonomy mixed with self-patchable fields still refuses the WHOLE call and writes nothing (same discipline as the name-mixed-with-model case above)', async () => {
+      const result = await invoke(auth({ boundAgentId: selfAgentId }), {
+        agent: selfAgentId,
+        model: 'claude-fable-5-1',
+        autonomy: 'execute',
+      })
+      expect(result.ok).toBe(false)
+      if (result.ok) return
+      expect(result.detail).toEqual({ need: 'admin', field: 'autonomy' })
+
+      const row = await env.DB.prepare('SELECT model FROM agents WHERE id = ?').bind(selfAgentId)
+        .first<{ model: string }>()
+      expect(row?.model).toBe('gpt-5.6-terra') // untouched
+    })
+
+    it('partition invariant covers autonomy specifically: forbidden, never patchable', () => {
+      expect(new Set<string>(SELF_FORBIDDEN_FIELDS).has('autonomy')).toBe(true)
+      expect(new Set<string>(SELF_PATCHABLE_FIELDS).has('autonomy')).toBe(false)
+      expect(new Set<string>(ADMIN_PATCHABLE_FIELDS).has('autonomy')).toBe(true)
+    })
+  })
 })

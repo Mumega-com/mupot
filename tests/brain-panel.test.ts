@@ -159,7 +159,7 @@ describe('(b) GET /api/loops/:id/decisions — returns the persisted feed', () =
     }
     // We need two prepare() calls: first for getLoop, second for listLoopDecisions.
     // Build a DB mock where first() returns loopRow and all() returns decisions.
-    const firstResponses: unknown[] = [loopRow]
+    const firstResponses: unknown[] = [{ status: 'active' }, loopRow]
     const allResponses: unknown[][] = [[decRow]]
     let firstIdx = 0
     let allIdx = 0
@@ -380,7 +380,7 @@ describe('(d) non-admin governor write 403s', () => {
       }),
       dry_rounds: 0, created_at: 'x', updated_at: 'x',
     }
-    const firstResponses = [loopRow]
+    const firstResponses = [{ status: 'active' }, loopRow]
     let firstIdx = 0
     const stmt = {
       bind: (..._args: unknown[]) => stmt,
@@ -434,7 +434,7 @@ describe('(e) budget_override <= 0 → 400', () => {
       }),
       dry_rounds: 0, created_at: 'x', updated_at: 'x',
     }
-    const firstResponses = [loopRow]
+    const firstResponses = [{ status: 'active' }, loopRow]
     let firstIdx = 0
     const stmt = {
       bind: (..._args: unknown[]) => stmt,

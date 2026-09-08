@@ -12,6 +12,12 @@ The matching machine-readable artifact is
 [`docs/runtime-adapter-v1.json`](./runtime-adapter-v1.json). Tests validate the
 artifact and the local smoke harness references this same contract name.
 
+For the current distinction between generic runtime attachment, active-turn
+Codex MCP access, and the separately gated exact-delivery receiver, see
+[Codex Exact Delivery: Status and Activation Boundary](./operations/codex-exact-delivery-status.md).
+That operational document records evidence states; it does not widen this
+contract or authorize receiver activation.
+
 ## Version
 
 - Contract id: `runtime-adapter/v1`
@@ -245,13 +251,14 @@ Supported verbs:
 
 ## Agent Messaging
 
-Runtimes exchange direct durable messages through the MCP `send` and `inbox`
-tools, or the HTTP mirror used by wake hooks.
+Runtimes exchange direct durable messages through the MCP `send`, `inbox`, and
+`message_get` tools, or the HTTP mirror used by wake hooks.
 
 MCP:
 
 - `send { to, body, kind?, request_id?, in_reply_to? }`
 - `inbox { limit?, peek? }`
+- `message_get { id?, request_id? }` — exactly one; sender-scoped read-back of a row this agent wrote
 - `broadcast { squad_id?, body, kind?, request_id?, include_self?, limit? }`
 
 HTTP:

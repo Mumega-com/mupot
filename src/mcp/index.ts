@@ -34,9 +34,9 @@ import type {
   Squad,
   Task,
 } from '../types'
-import { resolveCapabilities, hasCapability, holdsCapabilityFloor, canOnSquad, hasSurfaceCap } from '../auth/capability'
+import { resolveCapabilities, hasCapability, holdsCapabilityFloor, canOnSquad } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc, touchTokenLastUsed } from '../auth/token-lifecycle'
-import { callerHoldsGateCapability, verdictPrincipal } from '../tasks/index'
+import { evaluateVerdictGates } from '../tasks/index'
 import { resolveSoleGateOwnerAgent } from '../gates/grants'
 import { isChannel } from '../members/service'
 import { findExistingBootstrap } from '../members/bootstrap-self'
@@ -97,7 +97,7 @@ import { enrollUrl } from '../dashboard/enroll'
 import { classify, humanAge } from '../dashboard/fleet'
 import { resolveAgentRef } from '../org/resolve'
 import {
-  sendToRef, readAgentInbox, sendAgentMessage,
+  sendToRef, readAgentInbox, sendAgentMessage, getSenderMessage,
 } from '../agents/messages'
 import { routeAgentWake } from '../agents/wake-routing'
 import { authorizeExecutionScope } from '../auth/execution-scope'
@@ -107,6 +107,7 @@ import {
   leaseAgentInbox, ackAgentMessages, listDeadLetteredMessages, summarizeDeadLetters,
   MAX_DELIVERY_ATTEMPTS, DEFAULT_LEASE_SECONDS, MAX_LEASE_SECONDS,
 } from '../agents/messages'
+import { resolveBoundSeat, resolveInboxSeatArg } from '../agents/inbox-seat'
 import {
   recordCheckin,
   touchPresence,
@@ -1666,11 +1667,13 @@ async function wakeGateOwnerOnReview(
 }
 
 // task_verdict — approve or reject a task in 'review'. The MCP twin of
-// POST /api/tasks/:id/verdict, reusing the SAME helpers (callerHoldsGateCapability,
-// verdictPrincipal, writeVerdict) so the gate logic never forks. This is the wire
-// that lets an operator/gate CLOSE a gated task programmatically over MCP — without
-// it a review task can only be verdicted from the browser dashboard. cap: member+
-// on the task's squad AND the gate capability named by task.gate_owner.
+// POST /api/tasks/:id/verdict, reusing the SAME shared predicate
+// (evaluateVerdictGates, src/tasks/index.ts — mupot#1080/#1081) plus
+// writeVerdict, so the gate logic never forks between the two write surfaces.
+// This is the wire that lets an operator/gate CLOSE a gated task
+// programmatically over MCP — without it a review task can only be verdicted
+// from the browser dashboard. cap: member+ on the task's squad AND the gate
+// capability named by task.gate_owner.
 const toolTaskVerdict: ToolSpec = {
   name: 'task_verdict',
   scope: 'squad (of the task)',
@@ -1708,43 +1711,37 @@ const toolTaskVerdict: ToolSpec = {
     if (!task.gate_owner) return fail(409, 'no_gate')
     if (task.status !== 'review') return fail(409, 'not_in_review', { status: task.status })
 
-    // RBAC: caller must hold the gate capability named by task.gate_owner.
-    // BLOCK-1 fix (kasra-review 2026-08-13, proof-of-exploit): gate:agent-self-completion
-    // is closeable ONLY by the completing agent (the assignee) or an org owner/admin.
-    // The grant is NOT authority for this gate — the D2 universal mint grant would
-    // let any agent approve any other agent's task (proven live). Every other gate
-    // keeps the capability-based check.
-    const principal = verdictPrincipal(auth)
-    if (task.gate_owner === 'gate:agent-self-completion') {
-      const isOwnerAdmin = auth.role === 'owner' || auth.role === 'admin'
-      if (principal.id !== task.assignee_agent_id && !isOwnerAdmin) {
-        return fail(403, 'forbidden', { need: 'assignee_or_org_admin' })
-      }
-    } else if (!(await callerHoldsGateCapability(env, auth, task.squad_id, task.gate_owner))) {
-      return fail(403, 'forbidden', { need: task.gate_owner })
-    }
+    // RBAC: gate ownership, the gate:loops surface cap, and self-verdict — the
+    // ONE shared predicate (mupot#1080/#1081, src/tasks/index.ts) also used by
+    // the HTTP twin (POST /:id/verdict) and the dashboard's read-side
+    // can_verdict/can_approve/can_reject. A sixth gate cannot drift the two
+    // write surfaces apart because there is only one place it can be added.
+    const gateOwner = task.gate_owner
+    const gateResult = await evaluateVerdictGates(
+      env,
+      auth,
+      { squad_id: task.squad_id, gate_owner: gateOwner, assignee_agent_id: task.assignee_agent_id },
+      verdict,
+    )
+    const principal = gateResult.principal
 
-    // Surface-cap (#106): approving a gate:loops task fires a real send — requires
-    // outreach:send-gated. Rejections send nothing and are not surface-gated.
-    if (task.gate_owner === 'gate:loops' && verdict === 'approved') {
-      if (!(await hasSurfaceCap(env, auth, 'outreach:send-gated'))) {
-        return fail(403, 'forbidden', { need: 'outreach:send-gated' })
-      }
-    }
-
-    // Self-verdict prevention (no grading your own homework). Agent-bound tokens
-    // resolve to the bound agent id, so an assignee cannot hide behind its member
-    // envelope. Org owner may override with override_self_verdict:true (audited).
-    // D1 (2026-08-13): gate:agent-self-completion is the executor's fallback gate
-    // for an agent's OWN completion of ungated work (BLOCK-2, PR #417) — the
-    // different-principal rule is waived for exactly this capability (the caller
-    // still had to pass callerHoldsGateCapability above; every other gate keeps
-    // the self_verdict 409). Mirrors the HTTP twin in src/tasks/index.ts.
     let note: string | null = typeof args.note === 'string'
       ? args.note
       : (typeof args.reason === 'string' ? args.reason : null)
-    const isSelfCompletionGate = task.gate_owner === 'gate:agent-self-completion'
-    if (principal.id === task.assignee_agent_id && !isSelfCompletionGate) {
+
+    if (!gateResult.allowed) {
+      if (gateResult.code === 'no_gate_capability') {
+        const need = gateOwner === 'gate:agent-self-completion' ? 'assignee_or_org_admin' : gateOwner
+        return fail(403, 'forbidden', { need })
+      }
+      if (gateResult.code === 'missing_surface_cap') {
+        return fail(403, 'forbidden', { need: 'outreach:send-gated' })
+      }
+      // 'self_verdict' — org owner may override with override_self_verdict:true
+      // (audited in the note). evaluateVerdictGates never grants this itself — a
+      // default caller never sends the flag — so it is applied here, at the one
+      // write-time call site that owns request-arg-shaped exceptions. Mirrors
+      // the HTTP twin in src/tasks/index.ts.
       const isOrgOwner = auth.role === 'owner'
       const overrideRequested = args.override_self_verdict === true
       if (!isOrgOwner || !overrideRequested) {
@@ -3115,7 +3112,7 @@ const toolSend: ToolSpec = {
   name: 'send',
   scope: 'agent→agent (this pot); sender must be agent-bound',
   min: 'authenticated',
-  args: '{ to: string (agent id or unique slug), body: string, kind?: "message"|"request"|"ack", request_id?: string, in_reply_to?: string, project_id?: string, seat?: string }',
+  args: '{ to: string (agent id, unique slug, or display name unique among agents you can already see — not a harness seat label), body: string, kind?: "message"|"request"|"ack", request_id?: string, in_reply_to?: string, project_id?: string, seat?: string }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -3309,93 +3306,9 @@ const toolBroadcast: ToolSpec = {
   },
 }
 
-// ── seat binding (mupot#1254 C1 — caller-controlled inbox seat partition) ──────
-//
-// origin/main (pre-fix) read the seat partition straight off `args.seat` — a caller bound
-// to ANY of an agent's tokens could pass ANY other seat's label and read/lease its mail.
-// The fix binds the partition to the ONE seat identity a caller cannot forge: the live
-// `member_tokens.label` row for `auth.tokenId` (re-derived server-side from the live
-// tenant/member-scoped token every request — see resolveAuth/authenticateMember above,
-// `AuthContext.tokenId`'s own doc comment: "server-derived only"). That label IS the seat
-// name — migration 0139 spells it out verbatim ("member_tokens.label, i.e. the seat
-// name"), and it is set once at mint time: explicitly by the /enroll form (src/dashboard/
-// enroll.ts, POST /enroll/mint) or mint_agent_token's own `label` arg, or implicitly
-// (mint_agent_token defaults an unlabelled mint to the agent's own slug — src/mcp/
-// provision.ts:563). A token minted before this feature, or never given an explicit seat,
-// simply has label = '' (the column default) or = the agent's slug — either way a single,
-// stable, server-controlled value, never a per-request claim.
-//
-// Two things this is explicitly NOT:
-//   - `ctx.seat` (used a few lines below for enroll_url) is the `x-mupot-seat` REQUEST
-//     HEADER (see handleJsonRpc's ToolCtx construction) — a plain client-supplied value,
-//     exactly as forgeable as args.seat. It is fine as a cosmetic hint for the enrollment
-//     door; it must never be treated as an authenticated seat.
-//   - `runtime_seats` (migrations 0121+, src/flight-spine/seats.ts) is a DIFFERENT "seat"
-//     concept — host/process assignment for the flight-spine scheduler — unrelated to
-//     inbox mailbox partitioning. Do not conflate the two when reading migration history.
-//
-// A null return means "this token has no seat label bound," not "lookup failed open":
-// on a DB error we return null too, which — same as an empty label — refuses any
-// caller-supplied args.seat (seat_not_bound) rather than silently trusting it. The scoping
-// feature fails closed; the unscoped (broadcast-only) read/lease untouched by this fix
-// still works, exactly as it did before.
-async function resolveBoundSeat(env: Env, auth: AuthContext): Promise<string | null> {
-  if (!auth.tokenId || !env.DB) return null
-  try {
-    const row = await env.DB.prepare(
-      `SELECT label FROM member_tokens WHERE id = ?1 AND tenant = ?2`,
-    ).bind(auth.tokenId, env.TENANT_SLUG).first<{ label: string | null }>()
-    const label = row?.label?.trim()
-    return label && label.length > 0 ? label : null
-  } catch {
-    return null
-  }
-}
-
-// A bound token's seat is now authoritative: it applies EVEN WHEN args.seat is omitted
-// (this is what lets a seat-labelled token receive mail addressed to its own seat without
-// every caller having to echo its own identity back at it — the same class of bug #889
-// closed for the "wrong token file" case; here it was "right token, seat mail simply never
-// matched because nothing derived the seat from the token"). An explicit args.seat is
-// accepted ONLY as a same-value compat echo; anything else is refused, never silently
-// downgraded to the token's real seat or to unscoped.
-function resolveInboxSeatArg(
-  requestedSeatRaw: string | undefined,
-  boundSeat: string | null,
-): { ok: true; seat: string | undefined } | { ok: false; outcome: ToolOutcome } {
-  // mupot#1272 adversarial-gate P1, item 3: an empty/whitespace-only `args.seat` ('' or ' ')
-  // is "no seat requested," matching the PRE-FIX normalization that lived in
-  // readAgentInboxForReader/leaseAgentInbox (`input.seat.trim().length > 0 ? ... : null`,
-  // src/agents/messages.ts). Without this, a caller passing `seat: ''` fell into the mismatch
-  // branch below (boundSeat, if any, is never '') and got a spurious seat_mismatch instead of
-  // the unscoped read it got before this PR.
-  const requestedSeat = requestedSeatRaw !== undefined && requestedSeatRaw.trim().length === 0
-    ? undefined
-    : requestedSeatRaw
-  if (requestedSeat !== undefined) {
-    if (boundSeat === null) {
-      return {
-        ok: false,
-        outcome: fail(
-          403,
-          'seat_not_bound',
-          'this token has no seat label bound; args.seat cannot be used until the token is minted with a seat label (see /enroll or mint_agent_token { label })',
-        ),
-      }
-    }
-    if (requestedSeat !== boundSeat) {
-      return {
-        ok: false,
-        outcome: fail(
-          403,
-          'seat_mismatch',
-          `this token is bound to seat "${boundSeat}"; args.seat must match it or be omitted`,
-        ),
-      }
-    }
-  }
-  return { ok: true, seat: boundSeat ?? undefined }
-}
+// ── seat binding (mupot#1254/#1272/#1325) ── resolveBoundSeat / resolveInboxSeatArg now
+// live in ../agents/inbox-seat.ts so the MCP tools below and the HTTP mirror
+// (src/agents/inbox-routes.ts) share one rule instead of two copies that can diverge.
 
 // inbox — read (and by default CONSUME) the CALLER's own inbox. cap: agent-bound member.
 // Self-scoped: an agent only ever reads to_agent = its own welded id; it cannot read another
@@ -3445,12 +3358,12 @@ const toolInbox: ToolSpec = {
       sinceSeq = rawSinceSeq
     }
 
-    const boundSeat = await resolveBoundSeat(env, auth)
+    const boundSeat = await resolveBoundSeat(env, auth.tokenId ?? null)
     const seatArg = resolveInboxSeatArg(
       typeof args.seat === 'string' ? args.seat.trim() : undefined,
       boundSeat,
     )
-    if (!seatArg.ok) return seatArg.outcome
+    if (!seatArg.ok) return fail(seatArg.status, seatArg.error, seatArg.detail)
 
     const res = await readAgentInbox(env, {
       agent,
@@ -3472,6 +3385,51 @@ const toolInbox: ToolSpec = {
       complete: res.complete,
       consumed: args.peek !== true,
     })
+  },
+}
+
+// message_get — sender-scoped read-back of a row THIS agent wrote (#1323).
+// Inbox is recipient-only (`to_agent = caller`). After consume the recipient peek is empty,
+// and there is no outbox. This looks up by id OR request_id, scoped to
+// from_agent = auth.boundAgentId. No admin bypass, no from_agent argument, no list.
+const toolMessageGet: ToolSpec = {
+  name: 'message_get',
+  scope: 'self (the caller agent re-reads a message it sent)',
+  min: 'authenticated',
+  args: '{ id?: string, request_id?: string }  // exactly one; sender is the bound agent — not a to_agent inbox read',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      id: STRING_SCHEMA,
+      request_id: STRING_SCHEMA,
+    },
+    required: [],
+    additionalProperties: false,
+  },
+  async run(auth, env, args, ctx) {
+    const fromAgent = auth.boundAgentId
+    if (!fromAgent) {
+      return fail(403, 'not_agent_bound', {
+        detail: 'message_get requires an agent-bound token (member_tokens.agent_id)',
+        enroll_url: enrollUrl(canonicalOrigin(env, ctx.origin), ctx.seat),
+      })
+    }
+    if (args.id !== undefined && typeof args.id !== 'string')
+      return fail(400, 'invalid_args', 'id must be a string')
+    if (args.request_id !== undefined && typeof args.request_id !== 'string')
+      return fail(400, 'invalid_args', 'request_id must be a string')
+
+    const res = await getSenderMessage(env, {
+      fromAgent,
+      id: typeof args.id === 'string' ? args.id : undefined,
+      requestId: typeof args.request_id === 'string' ? args.request_id : undefined,
+    })
+    if (!res.ok) {
+      if (res.reason === 'db_error') return fail(500, res.reason)
+      if (res.reason === 'message_not_found') return fail(404, res.reason)
+      return fail(400, res.reason, res.detail)
+    }
+    return done(res.message)
   },
 }
 
@@ -3524,12 +3482,12 @@ const toolInboxLease: ToolSpec = {
     if (args.seat !== undefined && typeof args.seat !== 'string')
       return fail(400, 'invalid_args', 'seat must be a string')
 
-    const boundSeat = await resolveBoundSeat(env, auth)
+    const boundSeat = await resolveBoundSeat(env, auth.tokenId ?? null)
     const seatArg = resolveInboxSeatArg(
       typeof args.seat === 'string' ? args.seat.trim() : undefined,
       boundSeat,
     )
-    if (!seatArg.ok) return seatArg.outcome
+    if (!seatArg.ok) return fail(seatArg.status, seatArg.error, seatArg.detail)
 
     const res = await leaseAgentInbox(env, {
       agent,
@@ -4735,6 +4693,7 @@ export const TOOLS: ToolSpec[] = [
   toolSend,
   toolBroadcast,
   toolInbox,
+  toolMessageGet,
   toolInboxLease,
   toolInboxAck,
   toolInboxDeadLetters,
@@ -4787,6 +4746,14 @@ function rpcResult(id: unknown, result: unknown): Response {
   return new Response(JSON.stringify({ jsonrpc: '2.0', id: id ?? null, result }), {
     headers: { 'content-type': 'application/json' },
   })
+}
+
+/** JSON-RPC code for a finished tool failure. -32602 is Invalid params — never use it
+ *  for application refusals such as send_target_not_visible (HTTP 404). Harnesses treat
+ *  -32602 as a schema error and retry the call shape instead of resolving the target. */
+export function jsonRpcCodeForToolFailure(status: number, error: string): number {
+  if (error === 'send_target_not_visible') return -32000
+  return status === 404 ? -32602 : -32000
 }
 
 function rpcError(id: unknown, code: number, message: string, data?: unknown, status = 200): Response {
@@ -4997,7 +4964,7 @@ async function handleJsonRpc(c: import('hono').Context<AppEnv>, body: JsonRpcReq
 
     return rpcError(
       id,
-      outcome.status === 404 ? -32602 : -32000,
+      jsonRpcCodeForToolFailure(outcome.status, outcome.error),
       outcome.error,
       outcome.detail,
       outcome.status,

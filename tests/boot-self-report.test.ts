@@ -71,6 +71,25 @@ describe('boot records what the agent actually is', () => {
     expect(RUNTIME_VALUES).toContain('grok')
   })
 
+  it('cursor-agent and cursor-ide are sayable — muvps-cursor / Cursor CLI seats', () => {
+    // Live 2026-09-05: muvps-cursor (c51d08bc) boot_context refused both words.
+    // Same class as grok: without these, a Cursor seat must lie or stay silent.
+    expect(RUNTIME_VALUES).toContain('cursor-agent')
+    expect(RUNTIME_VALUES).toContain('cursor-ide')
+  })
+
+  it('a cursor-agent report is recorded, not refused', async () => {
+    const r = await boot({ runtime: 'cursor-agent' })
+    expect(r.registry?.outcome).toBe('recorded')
+    expect(storedRuntime().runtime).toBe('cursor-agent')
+  })
+
+  it('a cursor-ide report is recorded, not refused', async () => {
+    const r = await boot({ runtime: 'cursor-ide' })
+    expect(r.registry?.outcome).toBe('recorded')
+    expect(storedRuntime().runtime).toBe('cursor-ide')
+  })
+
   it('the report is attributed to the agent itself, not left as the old reporter', async () => {
     await boot({ runtime: 'grok' })
     expect(storedRuntime().reported_by).toBe(AGENT)
@@ -113,6 +132,8 @@ describe('refusals teach instead of silencing', () => {
     expect(r.registry?.outcome).toBe('refused_unknown_runtime')
     // Withholding the valid values is what made the agent give up and stay stale.
     expect(r.registry?.detail).toContain('grok')
+    expect(r.registry?.detail).toContain('cursor-agent')
+    expect(r.registry?.detail).toContain('cursor-ide')
     expect(storedRuntime().runtime).toBe('pi')
   })
 })

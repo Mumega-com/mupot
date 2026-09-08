@@ -90,6 +90,9 @@ function makeGrantRouteEnv(existingCapabilities: Capability[]): Env {
           return statement
         },
         async first<T>() {
+          if (sql.includes('SELECT status FROM members') && sql.includes('lower(email)')) {
+            return { status: 'active' } as T
+          }
           if (sql.includes('SELECT id FROM members')) return { id: 'member-1' } as T
           if (sql.includes('SELECT b.agent_id') && sql.includes('b.member_id')) {
             return null

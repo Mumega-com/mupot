@@ -43,7 +43,7 @@
 
 import type { Agent, AuthContext, Env } from '../types'
 import { loadAgentStats, loadAgentRuntimeStates, type AgentStat, type AgentRuntimeState } from './observatory'
-import { loadApprovals, type ApprovalItem } from './approvals'
+import { loadApprovals, type ApprovalsQueue } from './approvals'
 
 export interface OperatorCounts {
   generatedAtMs: number
@@ -59,9 +59,19 @@ export interface OperatorCounts {
   inFlightTotal: number
   /** Sum of AgentStat.spend_micro_usd over the 24h stats window. */
   spendMicroUsdTotal: number
-  /** loadApprovals(env, auth).length — the RBAC+gate_owner-scoped gate queue. This IS
-   *  "needs your decision": the only tasks a verdict endpoint will actually accept. */
+  /** loadApprovals(env, auth).actionableCount — the RBAC+gate_owner-scoped gate
+   *  queue's actionable rows. This IS "needs your decision": the only tasks a
+   *  verdict endpoint will actually accept (mupot#1319 round 2 FINDING 4/2:
+   *  this used to be approvals.length, which counted informational/
+   *  unactionable rows too — a caller who lost squad access but still holds
+   *  a stale gate grant is NOT "needing a decision" by this comment's own
+   *  definition). */
   needsDecisionCount: number
+  /** True when needsDecisionCount is a LOWER BOUND, not the exact total — see
+   *  ApprovalsQueue.actionableCountIsLowerBound (src/dashboard/approvals.ts).
+   *  A surface rendering this MUST show it as "N+" or otherwise signal
+   *  incompleteness when true, never a bare exact-looking number. */
+  needsDecisionCountIsLowerBound: boolean
   /** tasks.status IN ('blocked', 'rejected'), from the shared grouped count. */
   blockedOrRejectedCount: number
 }
@@ -71,7 +81,11 @@ export interface OperatorCountsInputs {
   agents: Array<Pick<Agent, 'id' | 'status'>>
   stats: Map<string, AgentStat>
   runtimeStates: Map<string, AgentRuntimeState>
-  approvals: ApprovalItem[]
+  // The full ApprovalsQueue (loadApprovals' return value) is accepted here —
+  // only actionableCount/actionableCountIsLowerBound are read; `items` is
+  // ignored (callers that also RENDER the queue, e.g. dashboard/index.ts's
+  // two routes, pass approvals.items separately to their own card renderer).
+  approvals: Pick<ApprovalsQueue, 'actionableCount' | 'actionableCountIsLowerBound'>
   /** status -> count, e.g. from loadTaskStatusCounts. Only 'blocked'/'rejected' are read. */
   taskStatusCounts: Map<string, number>
 }
@@ -111,7 +125,8 @@ export function computeOperatorCounts(inputs: OperatorCountsInputs): OperatorCou
     liveRuntimeCount,
     inFlightTotal,
     spendMicroUsdTotal,
-    needsDecisionCount: approvals.length,
+    needsDecisionCount: approvals.actionableCount,
+    needsDecisionCountIsLowerBound: approvals.actionableCountIsLowerBound,
     blockedOrRejectedCount,
   }
 }

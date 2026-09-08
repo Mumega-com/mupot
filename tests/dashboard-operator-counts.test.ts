@@ -22,7 +22,7 @@ import {
   type OperatorCountsInputs,
 } from '../src/dashboard/operator-counts'
 import type { AgentStat, AgentRuntimeState } from '../src/dashboard/observatory'
-import type { ApprovalItem } from '../src/dashboard/approvals'
+import type { ApprovalsQueue } from '../src/dashboard/approvals'
 import type { Agent, AuthContext, Env } from '../src/types'
 
 function agent(id: string, status: Agent['status'] = 'active'): Pick<Agent, 'id' | 'status'> {
@@ -33,20 +33,12 @@ function stat(over: Partial<AgentStat> = {}): AgentStat {
   return { agent_id: 'a', task_count: 0, done_count: 0, success_pct: 0, in_flight: 0, spend_micro_usd: 0, ...over }
 }
 
-function approval(id: string): ApprovalItem {
-  return {
-    id,
-    squad_id: 'sq-1',
-    squad_name: 'Squad',
-    title: `Task ${id}`,
-    body: '',
-    gate_owner: 'gate:content',
-    assignee_agent_id: null,
-    agent_name: null,
-    result: null,
-    completed_at: null,
-    created_at: '2026-08-01T00:00:00.000Z',
-  }
+// mupot#1319 round 2 FINDING 4/2: computeOperatorCounts reads ONLY
+// actionableCount/actionableCountIsLowerBound off the approvals queue now —
+// never the raw items — so the fixture is that summary shape directly, not
+// a list of ApprovalItem rows a count would have to re-derive from.
+function approvalsQueue(actionableCount: number, isLowerBound = false): Pick<ApprovalsQueue, 'actionableCount' | 'actionableCountIsLowerBound'> {
+  return { actionableCount, actionableCountIsLowerBound: isLowerBound }
 }
 
 function baseInputs(over: Partial<OperatorCountsInputs> = {}): OperatorCountsInputs {
@@ -55,7 +47,7 @@ function baseInputs(over: Partial<OperatorCountsInputs> = {}): OperatorCountsInp
     agents: [],
     stats: new Map(),
     runtimeStates: new Map(),
-    approvals: [],
+    approvals: approvalsQueue(0),
     taskStatusCounts: new Map(),
     ...over,
   }
@@ -84,9 +76,16 @@ describe('computeOperatorCounts — arithmetic', () => {
     expect(out.spendMicroUsdTotal).toBe(600)
   })
 
-  it('needsDecisionCount is exactly approvals.length — never a second predicate', () => {
-    const out = computeOperatorCounts(baseInputs({ approvals: [approval('t1'), approval('t2')] }))
+  it('needsDecisionCount is exactly approvals.actionableCount — never re-derived from raw items', () => {
+    const out = computeOperatorCounts(baseInputs({ approvals: approvalsQueue(2) }))
     expect(out.needsDecisionCount).toBe(2)
+    expect(out.needsDecisionCountIsLowerBound).toBe(false)
+  })
+
+  it('needsDecisionCountIsLowerBound passes through actionableCountIsLowerBound unchanged', () => {
+    const out = computeOperatorCounts(baseInputs({ approvals: approvalsQueue(200, true) }))
+    expect(out.needsDecisionCount).toBe(200)
+    expect(out.needsDecisionCountIsLowerBound).toBe(true)
   })
 
   it('blockedOrRejectedCount sums the blocked and rejected buckets of the shared map', () => {

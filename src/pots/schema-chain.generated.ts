@@ -2725,9 +2725,19 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_pots_slug" },
     ],
   },
+  {
+    file: "0146_members_email_lower_index.sql",
+    sha256: "ebbe611454984cb54b123abaecec45f053904166e31c1c3ad8c5ad60c27300a2",
+    statements: [
+      "-- 0146_members_email_lower_index.sql — index members on lower(email).\n--\n-- #1330 F-D: src/auth/index.ts's unconditional status check (added to close the\n-- registered-session fail-open, see 0145-era commit) queries\n-- `WHERE lower(email) = ?1 AND (tenant = ?2 OR tenant IS NULL)` on every\n-- cookie-authenticated\n-- request. The only existing index on members.email is the UNIQUE constraint\n-- on the raw column, which `lower()` makes unusable — SQLite/D1 cannot use an\n-- index on `email` to satisfy a predicate on `lower(email)`. Without this,\n-- every such request does a full table scan of members.\n--\n-- A functional index on the expression lets the query planner use it directly.\n\nCREATE INDEX IF NOT EXISTS idx_members_email_lower ON members (lower(email));",
+    ],
+    objects: [
+      { type: "index", name: "idx_members_email_lower" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "30da0847e8d1567d961c3d689cc40c4ee516adbe5b383c6006c2dae67ef580e7"
+export const SCHEMA_CHAIN_DIGEST: string = "aab5e051a941c2d032924b2178533de80ca7a6311f048b843ab1a1cf70fa9d00"

@@ -38,6 +38,7 @@ import type {
 
 // requireAuth is owned by the auth component; it sets c.get('auth').
 import { requireAuth } from '../auth'
+import { isMissingWebSessionsTableError } from '../auth/web-sessions'
 import { csrf } from 'hono/csrf'
 import { assertBatchWritten } from '../lib/receipt'
 // The FROZEN capability API — everyone codes against these exact signatures.
@@ -417,18 +418,28 @@ membersApp.post(
 // ── members (list / read) ─────────────────────────────────────────────────────
 
 membersApp.get('/members', requireCapability(orgScope, 'member'), async (c) => {
+  // #1330 F-B: tenant-scoped — this listed every tenant's members alongside the
+  // by-id GET beside it (already scoped by F2). Match legacy NULL-tenant rows
+  // too so they still show up, consistent with the F-A adoption-on-write fix.
   const rows = await c.env.DB.prepare(
-    'SELECT id, email, display_name, telegram_chat_id, status, created_at FROM members ORDER BY created_at ASC, display_name ASC',
-  ).all<Member>()
+    'SELECT id, email, display_name, telegram_chat_id, status, created_at FROM members WHERE tenant = ?1 OR tenant IS NULL ORDER BY created_at ASC, display_name ASC',
+  )
+    .bind(c.env.TENANT_SLUG)
+    .all<Member>()
   return c.json({ members: rows.results ?? [] })
 })
 
 membersApp.get('/members/:id', requireCapability(orgScope, 'member'), async (c) => {
   const id = c.req.param('id')
+  // #1330 F2: tenant-scoped — was `WHERE id = ?` alone, letting an admin of
+  // tenant A read a tenant-B member's row by id.
+  // #1330 gate-followup: match legacy `tenant IS NULL` rows too, matching
+  // GET /members just above — a legacy row was listed there but 404'd here,
+  // which was incoherent (fail-closed is fine, but the two surfaces must agree).
   const member = await c.env.DB.prepare(
-    'SELECT id, email, display_name, telegram_chat_id, status, created_at FROM members WHERE id = ? LIMIT 1',
+    'SELECT id, email, display_name, telegram_chat_id, status, created_at FROM members WHERE id = ?1 AND (tenant = ?2 OR tenant IS NULL) LIMIT 1',
   )
-    .bind(id)
+    .bind(id, c.env.TENANT_SLUG)
     .first<Member>()
   if (!member) return c.json({ error: 'member_not_found' }, 404)
   return c.json({ member })
@@ -455,12 +466,52 @@ membersApp.patch('/members/:id', requireCapability(orgScope, 'admin'), async (c)
     return c.json({ error: 'invalid_status', allowed: ['active', 'suspended'] }, 400)
   }
 
-  const res = await c.env.DB.prepare('UPDATE members SET status = ? WHERE id = ?')
-    .bind(status, id)
-    .run()
+  let sessionsRevoked = 0
+  const res = status === 'suspended'
+    ? await (async () => {
+        const nowIso = new Date().toISOString()
+        try {
+          const [memberUpdate, sessionRevoke] = await c.env.DB.batch([
+            // #1330 F2: tenant-scoped, matching the web_sessions UPDATE
+            // one line below — was `WHERE id = ?` alone, letting an admin
+            // of tenant A suspend/reactivate a tenant-B member by id.
+            // #1330 F-A: legacy rows may have tenant IS NULL (0040 adds the
+            // column with no backfill). Match NULL rows too and adopt them
+            // into this tenant in the same statement — the same lazy
+            // backfill reportFleetAgents/getAgentView already perform —
+            // so a legacy row is repaired on first touch instead of being
+            // invisible to every tenant-scoped write forever.
+            c.env.DB.prepare(
+              'UPDATE members SET status = ?1, tenant = ?3 WHERE id = ?2 AND (tenant = ?3 OR tenant IS NULL)',
+            ).bind(status, id, c.env.TENANT_SLUG),
+            c.env.DB.prepare(
+              `UPDATE web_sessions SET revoked_at = ?1, revoke_reason = ?2
+                WHERE tenant = ?3 AND member_id = ?4 AND revoked_at IS NULL`,
+            ).bind(nowIso, 'member_suspended', c.env.TENANT_SLUG, id),
+          ])
+          sessionsRevoked = Number(sessionRevoke.meta?.changes ?? 0)
+          return memberUpdate
+        } catch (err) {
+          if (!isMissingWebSessionsTableError(err)) throw err
+          // #1330 F-A / F-C: same NULL-tenant adoption as the batch path
+          // above, pinned for the degraded-schema (missing web_sessions)
+          // fallback rung.
+          return c.env.DB.prepare(
+            'UPDATE members SET status = ?1, tenant = ?3 WHERE id = ?2 AND (tenant = ?3 OR tenant IS NULL)',
+          )
+            .bind(status, id, c.env.TENANT_SLUG)
+            .run()
+        }
+      })()
+    : // #1330 F-A: reactivate path — same NULL-tenant adoption.
+      await c.env.DB.prepare(
+        'UPDATE members SET status = ?1, tenant = ?3 WHERE id = ?2 AND (tenant = ?3 OR tenant IS NULL)',
+      )
+        .bind(status, id, c.env.TENANT_SLUG)
+        .run()
   if (!res.meta || res.meta.changes === 0) return c.json({ error: 'member_not_found' }, 404)
 
-  return c.json({ member_id: id, status })
+  return c.json({ member_id: id, status, sessions_revoked: sessionsRevoked })
 })
 
 // ── tokens (mint / revoke) ────────────────────────────────────────────────────
