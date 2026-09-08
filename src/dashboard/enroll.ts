@@ -25,10 +25,15 @@
 
 import { html, raw as honoRaw } from 'hono/html'
 import type { AuthContext, Env } from '../types'
-import { canOnSquad } from '../auth/capability'
+import { canOnSquad, isOrgAdmin } from '../auth/capability'
 import { describeOrgStanding } from '../auth/refusal'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
-import { listConsentableAgents, type ConsentableAgent } from '../mcp/oauth-authorize'
+import { resolveHumanMemberId } from '../members/resolve-human-member'
+import {
+  listConsentableAgents,
+  resolveHumanStandingGrants,
+  type ConsentableAgent,
+} from '../mcp/oauth-authorize'
 import { mcpEndpoint, mcpServerKey } from './connect'
 
 export const DEFAULT_ENROLL_SEAT = 'unnamed-seat'
@@ -49,6 +54,15 @@ export interface EnrollView {
   seat: string
   preselectedAgent: string | null
   agents: EnrollAgent[]
+}
+
+export async function resolveEnrollMemberId(env: Env, auth: AuthContext): Promise<string | null> {
+  if (auth.boundAgentId) return null
+  return auth.memberId ??
+    auth.webSessionMemberId ??
+    (auth.email
+      ? await resolveHumanMemberId(env, { tenant: env.TENANT_SLUG, email: auth.email })
+      : null)
 }
 
 /** Absolute enrollment URL, built in exactly one place. Optional seat is
@@ -134,13 +148,209 @@ export function enrollClientSnippet(slug: string, origin: string, seat: string):
  * beyond mint_agent_token's bar ... that bar is an over-restriction of one
  * surface; enroll matches the MCP primitive."
  */
+/** The standing of the principal whose AUTHORITY is being honoured.
+ *
+ *  The fourth gate's one-line diagnosis of the previous version: it moved the gate's join
+ *  key to email without moving the authority's join key with it. `auth.capabilities` is
+ *  loaded by `resolveCapabilities(memberId)` where memberId is
+ *  `webSessionMemberId ?? resolveHumanMemberId(email)` (src/auth/index.ts:1072-1084), and
+ *  `webSessionMemberId` comes from `human_login_identities` — deliberately NOT the display
+ *  email. When those resolve different rows, an email-keyed status check reads a member who
+ *  never granted anything, and the suspended one who did walks through.
+ *
+ *  So ask on whichever plane the authority actually arrived:
+ *    - grants (auth.memberId present) -> that member's status, keyed on id;
+ *    - users.role alone (no member id) -> email is the only join to members, so use it,
+ *      including the owner-alias indirection that exists precisely to map an operator's
+ *      login address onto the org owner.
+ *
+ *  Distinguishing 'none' from 'revoked' remains the point: every rung of
+ *  resolveHumanMemberId filters on active status, so it collapses them, and treating that
+ *  collapsed null as the bootstrap-owner shape is what made SUSPENSION the way in. */
+export type HumanStanding = 'none' | 'active' | 'revoked'
+
+function standingOf(row: { status: string } | null): HumanStanding {
+  if (!row) return 'none'
+  return row.status === 'active' ? 'active' : 'revoked'
+}
+
+export async function humanStandingForSession(env: Env, auth: AuthContext): Promise<HumanStanding> {
+  // Plane 1: authority came from this member's grant rows. Key on the same id.
+  // No tenant predicate: `members.tenant` ships NULLABLE with a deliberate no-backfill
+  // design (migrations/0040), so scoping by tenant here silently misses legacy rows and
+  // returns 'none' for a suspended principal — the mupot#1330 shape.
+  // Same precedence as resolveEnrollMemberId (enroll.ts:60) — `memberId ?? webSessionMemberId`.
+  // They are equal today only because loadAuthFromCookie sets memberId FROM
+  // webSessionMemberId when present; one line of drift in either producer and a gate reading
+  // the opposite order judges a different member than the one whose grants are used.
+  const authorityMemberId = auth.memberId ?? auth.webSessionMemberId
+  if (authorityMemberId) {
+    const row = await env.DB.prepare(
+      `SELECT status FROM members WHERE id = ?1 LIMIT 1`,
+    ).bind(authorityMemberId).first<{ status: string }>()
+    return standingOf(row)
+  }
+
+  // Plane 2: authority is `users.role`, a table with no status column and no member id.
+  // Email is the only join. An absent email means no member identity exists to revoke —
+  // and refusing there locks out the bootstrap owner this branch exists to serve, on the
+  // one shape where they have no other door (a provider that returns no email at all;
+  // src/auth/index.ts mints such sessions with email: null).
+  const email = auth.email?.trim().toLowerCase()
+  if (!email) return 'none'
+
+  // trim() on BOTH sides: lowering only the column while trimming only the input let a
+  // stored 'ws@pot.test ' miss and read as 'none'.
+  const direct = await env.DB.prepare(
+    `SELECT status FROM members WHERE lower(trim(email)) = ?1 LIMIT 1`,
+  ).bind(email).first<{ status: string }>()
+  if (direct) return standingOf(direct)
+
+  // The owner alias (org_settings.owner_login_emails) maps an operator's login address to
+  // the unique org owner and has no members row of its own, so a direct lookup answers
+  // 'none' for a suspended owner arriving that way.
+  const aliasOwner = await ownerAliasStanding(env, email)
+  return aliasOwner ?? 'none'
+}
+
+/** Resolve the owner-alias indirection to the org owner's standing, or null when the
+ *  address is not an alias. Mirrors ownerAliasMemberId in src/members/resolve-human-member.ts,
+ *  which cannot be reused directly because it resolves an id through status-filtered rungs. */
+async function ownerAliasStanding(env: Env, email: string): Promise<HumanStanding | null> {
+  let aliases: string[]
+  try {
+    // Narrow on purpose: this catch documents ONE failure — a lagging pot without
+    // org_settings — so it must not also swallow a D1 error from the owner COUNT below.
+    // A wide try there returned null on any query failure, which the caller reads as
+    // 'none' and admits.
+    const setting = await env.DB.prepare(
+      `SELECT value FROM org_settings WHERE key = 'owner_login_emails' LIMIT 1`,
+    ).first<{ value: string }>()
+    if (!setting?.value) return null
+    const parsed: unknown = JSON.parse(setting.value)
+    if (!Array.isArray(parsed)) return null
+    aliases = parsed
+      .filter((item): item is string => typeof item === 'string')
+      .map((item) => item.trim().toLowerCase())
+  } catch {
+    return null
+  }
+  if (!aliases.includes(email)) return null
+  {
+    // Mirror uniqueOrgOwnerId (src/members/resolve-human-member.ts:25-39), minus TWO
+    // predicates, each for its own reason.
+    //
+    // status: this function must SEE a suspended owner rather than resolve past them.
+    //
+    // tenant: WIDENED, not dropped. The predicate has THREE states, not two — match,
+    // NULL, and a different value — and deleting it collapses all three. NULL means "this
+    // pot's legacy row under 0040's no-backfill design" and must be counted; a different
+    // value means "definitely another pot's owner" and must not be, because in a
+    // count-gate a foreign row pushes the count to 2 and DENIES this pot's sole live
+    // owner. That is a cross-tenant lockout no action inside this pot can clear.
+    //
+    // The polarity argument that made me delete it was right about the danger and wrong
+    // about the remedy: when a gate's polarity makes a predicate dangerous, widen it to
+    // the states it wrongly excluded rather than removing it.
+    //
+    // DISTINCT m.id counts OWNERS, not rows. capabilities' UNIQUE(member_id, scope_type,
+    // scope_id) does not constrain org grants, because scope_id is NULL there and NULLs
+    // are distinct in a SQLite unique index — so one member can hold two org/owner rows
+    // and be miscounted as ambiguous, locking out the single live owner.
+    //
+    // The previous version dropped three others as well: tenant, `scope_id IS NULL`, and
+    // the uniqueness check. That left the authority resolver answering "the unique active
+    // org-scoped owner OF THIS TENANT" while this gate answered "an arbitrary row from a
+    // superset", decided by rowid. Same fixture, opposite verdict depending on insertion
+    // order — and in the shared-DB shape 0040 defends, a suspended owner of this pot was
+    // admitted because an active owner of another tenant sorted first.
+    //
+    // LIMIT 2 + reject non-unique is deliberate and matches the original: an alias that
+    // cannot be resolved to exactly one owner must not grant. Ambiguity fails CLOSED here
+    // rather than falling through to the caller's 'none', which admits.
+    const owners = await env.DB.prepare(
+      `SELECT DISTINCT m.id AS id, m.status AS status FROM members m
+         JOIN capabilities c ON c.member_id = m.id
+        WHERE (m.tenant = ?1 OR m.tenant IS NULL)
+          AND c.scope_type = 'org'
+          AND c.scope_id IS NULL
+          AND c.capability = 'owner'
+        LIMIT 2`,
+    ).bind(env.TENANT_SLUG).all<{ id: string; status: string }>()
+    const found = owners.results ?? []
+    // TWO different decisions, and the previous version collapsed them into one refusal:
+    //
+    //   2+ owners -> ambiguous. This rung cannot say whose standing the alias inherits,
+    //                so it must not vouch. Fail CLOSED.
+    //   0 owners  -> the thing being gated does not exist yet. That is the bootstrap
+    //                shape, not a revocation, and refusing it locks out exactly the
+    //                principal this PR exists to admit (capability.ts:53-55: "the
+    //                bootstrap owner has no grant rows at all"). Return null so the
+    //                caller's 'none' stands.
+    if (found.length >= 2) return 'revoked'
+    if (found.length === 0) return null
+    return standingOf(found[0])
+  }
+}
+
 export async function authorizeEnrollMint(
   env: Env,
   auth: AuthContext,
   squadId: string,
-): Promise<{ ok: true } | { ok: false; reason: 'operator_principal_required' | 'squad_admin_required' }> {
+): Promise<{ ok: true } | { ok: false; reason: 'operator_principal_required' | 'principal_revoked' | 'squad_admin_required' }> {
   if (auth.boundAgentId) return { ok: false, reason: 'operator_principal_required' }
-  const grants = auth.capabilities ?? []
+  // BOOTSTRAP-OWNER ADMISSION (mupot#1324 adversarial follow-up). An explicit OR
+  // alongside the squad-admin bar below, not a replacement for it. `canOnSquad`
+  // needs a memberId to load grant rows from, and the bootstrap owner — the case
+  // capability.ts:50-52 documents as "no grant rows at all" — usually has no
+  // `members` row either, so resolveEnrollMemberId returns null and canOnSquad is
+  // evaluated against []. Before this, that principal got 403 squad_admin_required
+  // from THIS route while POST /admin/agent-token/mint on the same app admitted
+  // them via isOrgAdmin. Two mint surfaces disagreeing about who the owner is was
+  // the defect the owner actually hit as "you don't have access" after enroll. A
+  // squad admin still does not need an org role; that bar is unchanged below.
+  const memberId = await resolveEnrollMemberId(env, auth)
+  // ORDER MATTERS, and getting it wrong is how the first pass at this fix shipped a worse
+  // hole than the one it closed. `isOrgAdmin` reads auth.capabilities, which the login
+  // bridge fills via resolveCapabilities — a bare SELECT on `capabilities` with NO
+  // members.status filter (mupot#1335). Admitting on it BEFORE the status gate let a
+  // SUSPENDED org admin mint: it closed the suspended squad-admin class and opened the
+  // higher-privilege one.
+  //
+  // Two distinctions this has to keep straight, and a grants-length proxy gets both wrong:
+  //   - a MISSING members row is not a suspended one. memberId === null is the documented
+  //     bootstrap-owner shape (capability.ts:50-52) — there is no identity to revoke, admit.
+  //   - an ACTIVE member with NO capability rows is not suspended either. Reading standing
+  //     as "grants.length > 0" would refuse a legacy role='owner' who holds no grant rows,
+  //     which is precisely the principal isOrgAdmin exists to protect.
+  // So read the status itself rather than any consequence of it.
+  // isOrgAdmin's first branch reads auth.role, which comes from `users.role` — a table with
+  // NO status column — so members.status has no authority over a users-role owner in any
+  // code path. The gate therefore asks about the HUMAN behind the session, status-blind,
+  // rather than about a member id the resolver already filtered.
+  // A revoked human does not mint, on ANY authority plane. The previous version computed
+  // `standing` and then consulted it only inside the isOrgAdmin branch, so the fall-through
+  // squad-grant path discarded a 'revoked' verdict it had already calculated: the alias
+  // resolver handed the session a DIFFERENT member's grants, resolveHumanStandingGrants
+  // approved that member honestly, and the mint returned ok:true for a principal this
+  // function had just judged revoked. loadEnrollView honoured the same verdict, so the
+  // picker showed zero agents to the very session the mint admitted — the two halves
+  // disagreeing, with the privileged half permissive.
+  const standing = await humanStandingForSession(env, auth)
+  // A DISTINCT reason, not squad_admin_required. The standing gate fires before grants are
+  // resolved, so the squad-admin message ("ask an owner to grant you admin there") describes
+  // a cause that was never read — and acting on it hands squad admin to a SUSPENDED account,
+  // after which the reload still 403s and the operator escalates further. A revoked human
+  // and an under-privileged one are different refusals and must not share a reason code on
+  // an authz surface.
+  if (standing === 'revoked') return { ok: false, reason: 'principal_revoked' }
+  if (isOrgAdmin(auth)) return { ok: true }
+  // resolveHumanStandingGrants, not raw resolveCapabilities: a member whose
+  // members.status has moved to suspended gets [] here even when
+  // resolveEnrollMemberId still resolves an id for them, because step 2 of
+  // resolveHumanMemberId carries no status filter (mupot#1335). Closes the mint
+  // side of that hole without touching the resolver, which is #1335's own fix.
+  const grants = memberId ? await resolveHumanStandingGrants(env, memberId) : []
   if (!(await canOnSquad(env, grants, squadId, 'admin'))) {
     return { ok: false, reason: 'squad_admin_required' }
   }
@@ -266,9 +476,24 @@ export async function loadEnrollView(
   const principal = (auth.email && auth.email.trim().length > 0)
     ? auth.email.trim()
     : (auth.memberId ?? auth.userId)
-  const memberId = auth.memberId ?? null
+  const memberId = await resolveEnrollMemberId(env, auth)
 
-  if (!memberId) {
+  // Bootstrap owner (mupot#1324): isOrgAdmin can hold with no `members` row, so a
+  // null memberId here is not "unauthorized", it is "no member identity to resolve
+  // grants from". Returning [] made the picker render zero agents for the very
+  // principal who outranks every squad — the visible half of the same defect that
+  // made the mint 403. An org admin sees the full active inventory; everyone else
+  // still needs a resolved member.
+  // The picker gets the SAME standing gate as the mint. Hardening only the mint left a
+  // suspended squad admin able to enumerate the full agent inventory plus each live key's
+  // label, channel and created_at through loadLiveKeysForAgents — a smaller hole than
+  // minting, but the same principal and the same revocation that was supposed to end it.
+  const standing = await humanStandingForSession(env, auth)
+  if (standing === 'revoked') {
+    return { principal, memberId, seat, preselectedAgent: null, agents: [] }
+  }
+  const orgAdminWithoutMember = !memberId && !auth.boundAgentId && isOrgAdmin(auth)
+  if (!memberId && !orgAdminWithoutMember) {
     return { principal, memberId, seat, preselectedAgent: null, agents: [] }
   }
 
