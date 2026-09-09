@@ -230,8 +230,7 @@ describe('shared execution authorization', () => {
           member_id TEXT NOT NULL,
           scope_type TEXT NOT NULL,
           scope_id TEXT,
-          capability TEXT NOT NULL,
-      expires_at TEXT   -- 0149: NULL = non-expiring
+          capability TEXT NOT NULL
         );
         CREATE TABLE channel_capability_grants (
           id TEXT PRIMARY KEY,
