@@ -133,6 +133,7 @@ import { ADDON_TOOLS } from './addons'
 import { GATE_GRANT_TOOLS } from './gates'
 import { LOOP_TOOLS } from './loops'
 import { SECRET_ENV_TOOLS } from './secret-env'
+import { WEBHOOK_DOORBELL_TOOLS } from './webhook-doorbell'
 import { PRESENCE_TOOLS } from './presence'
 import { WORKFLOW_CIRCUIT_TOOLS } from './workflow-circuits'
 import { ROUTINE_TOOLS } from './routines'
@@ -3168,6 +3169,7 @@ const toolSend: ToolSpec = {
         targetSeat: typeof args.seat === 'string' && args.seat.trim().length > 0 ? args.seat.trim() : undefined,
       },
       { isAdmin: hasWorkspaceAdmin(auth), grants: auth.capabilities ?? [] },
+      { waitUntil: ctx.waitUntil },
     )
     if (!res.ok) {
       if (res.reason === 'db_error') return fail(500, res.reason) // no raw DB string to caller
@@ -4715,6 +4717,7 @@ export const TOOLS: ToolSpec[] = [
   ...GATE_GRANT_TOOLS,
   ...LOOP_TOOLS,
   ...SECRET_ENV_TOOLS,
+  ...WEBHOOK_DOORBELL_TOOLS,
   ...PRESENCE_TOOLS,
   ...WORKFLOW_CIRCUIT_TOOLS,
   ...ROUTINE_TOOLS,

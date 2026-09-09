@@ -5,14 +5,15 @@
 //
 // Algorithm:
 //   CONNECTOR_MASTER_KEY (256-bit hex Worker secret)
-//   → HKDF-SHA256(master, salt=connector_id, info='mupot_connector_<type>_v1')
-//   → per-connector AES-GCM-256 key
+//   → HKDF-SHA256(master, salt=<row id>, info=<domain string>)
+//   → per-row AES-GCM-256 key
 //   → encrypt(key, IV=random 96-bit, plaintext) → base64(iv || ciphertext || tag)
 //
-// Domain separation: each connector type uses a distinct `info` string so that
-// even if two connectors share the same id (impossible by UUID, but defensive),
-// the derived keys differ. The connector_id (UUID) is the HKDF salt — unique
-// per connector row, never reused.
+// Domain separation: each caller uses a distinct `info` string so that
+// even if two rows share the same salt (impossible by UUID, but defensive),
+// the derived keys differ. Connectors use info `mupot_connector_<type>_v1`
+// and salt=connector_id. Agent webhook doorbells reuse the same Worker secret
+// with info `mupot_doorbell_v1` and salt=agent_id (see encryptDomainSecret).
 //
 // Fail-closed (ADV-C-13 from intake-crypto): decrypt throws on ANY failure.
 // Callers must translate to 500 and NEVER fall through to using a bad plaintext.
@@ -120,24 +121,23 @@ async function importMasterKey(masterKeyHex: string): Promise<CryptoKey> {
 }
 
 /**
- * Derive a per-connector AES-GCM-256 key.
+ * Derive a per-row AES-GCM-256 key from CONNECTOR_MASTER_KEY.
  *
  * @param masterKeyHex 64-char hex (32 bytes). From CONNECTOR_MASTER_KEY secret.
- * @param connectorId  The connector UUID — used as HKDF salt (unique per row).
- * @param type         ConnectorType — used in the info string for domain separation.
+ * @param salt         Unique per row (connector id, agent id, …) — HKDF salt.
+ * @param info         Domain-separation string (must be distinct per caller).
  */
-async function deriveConnectorKey(
+async function deriveDomainKey(
   masterKeyHex: string,
-  connectorId: string,
-  type: ConnectorType,
+  salt: string,
+  info: string,
 ): Promise<CryptoKey> {
   const master = await importMasterKey(masterKeyHex)
-  const info = `mupot_connector_${type}_v1`
   return crypto.subtle.deriveKey(
     {
       name: 'HKDF',
       hash: 'SHA-256',
-      salt: asBuf(utf8(connectorId)),
+      salt: asBuf(utf8(salt)),
       info: asBuf(utf8(info)),
     },
     master,
@@ -147,7 +147,60 @@ async function deriveConnectorKey(
   )
 }
 
+function connectorInfo(type: ConnectorType): string {
+  return `mupot_connector_${type}_v1`
+}
+
 // ── public API ───────────────────────────────────────────────────────────────
+
+/**
+ * Encrypt a domain-separated secret for D1 storage.
+ * Returns base64(iv || ciphertext || tag).
+ * The plaintext MUST be discarded after this call.
+ */
+export async function encryptDomainSecret(
+  masterKeyHex: string,
+  salt: string,
+  info: string,
+  plaintext: string,
+): Promise<string> {
+  if (!plaintext) throw new Error('connector-crypto: plaintext must be non-empty')
+  if (!salt) throw new Error('connector-crypto: salt must be non-empty')
+  if (!info) throw new Error('connector-crypto: info must be non-empty')
+  const key = await deriveDomainKey(masterKeyHex, salt, info)
+  const iv = crypto.getRandomValues(new Uint8Array(IV_BYTES))
+  const ct = new Uint8Array(
+    await crypto.subtle.encrypt({ name: 'AES-GCM', iv: asBuf(iv) }, key, asBuf(utf8(plaintext))),
+  )
+  const out = new Uint8Array(iv.length + ct.length)
+  out.set(iv, 0)
+  out.set(ct, iv.length)
+  return bytesToBase64(out)
+}
+
+/**
+ * Decrypt a domain-separated secret. Throws on ANY failure (fail-closed).
+ * Callers must use the result immediately and never return it in API responses.
+ */
+export async function decryptDomainSecret(
+  masterKeyHex: string,
+  salt: string,
+  info: string,
+  encryptedBase64: string,
+): Promise<string> {
+  if (!encryptedBase64) {
+    throw new Error('connector-crypto: ciphertext is empty (decrypt fail-closed)')
+  }
+  const blob = base64ToBytes(encryptedBase64)
+  if (blob.length <= IV_BYTES + 16) {
+    throw new Error('connector-crypto: ciphertext too short (decrypt fail-closed)')
+  }
+  const iv = blob.slice(0, IV_BYTES)
+  const ct = blob.slice(IV_BYTES)
+  const key = await deriveDomainKey(masterKeyHex, salt, info)
+  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: asBuf(iv) }, key, asBuf(ct))
+  return new TextDecoder().decode(pt)
+}
 
 /**
  * Encrypt a connector secret for storage.
@@ -160,16 +213,7 @@ export async function encryptConnectorSecret(
   type: ConnectorType,
   plaintext: string,
 ): Promise<string> {
-  if (!plaintext) throw new Error('connector-crypto: plaintext must be non-empty')
-  const key = await deriveConnectorKey(masterKeyHex, connectorId, type)
-  const iv = crypto.getRandomValues(new Uint8Array(IV_BYTES))
-  const ct = new Uint8Array(
-    await crypto.subtle.encrypt({ name: 'AES-GCM', iv: asBuf(iv) }, key, asBuf(utf8(plaintext))),
-  )
-  const out = new Uint8Array(iv.length + ct.length)
-  out.set(iv, 0)
-  out.set(ct, iv.length)
-  return bytesToBase64(out)
+  return encryptDomainSecret(masterKeyHex, connectorId, connectorInfo(type), plaintext)
 }
 
 /**
@@ -182,18 +226,7 @@ export async function decryptConnectorSecret(
   type: ConnectorType,
   encryptedBase64: string,
 ): Promise<string> {
-  if (!encryptedBase64) {
-    throw new Error('connector-crypto: ciphertext is empty (decrypt fail-closed)')
-  }
-  const blob = base64ToBytes(encryptedBase64)
-  if (blob.length <= IV_BYTES + 16) {
-    throw new Error('connector-crypto: ciphertext too short (decrypt fail-closed)')
-  }
-  const iv = blob.slice(0, IV_BYTES)
-  const ct = blob.slice(IV_BYTES)
-  const key = await deriveConnectorKey(masterKeyHex, connectorId, type)
-  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: asBuf(iv) }, key, asBuf(ct))
-  return new TextDecoder().decode(pt)
+  return decryptDomainSecret(masterKeyHex, connectorId, connectorInfo(type), encryptedBase64)
 }
 
 /**
