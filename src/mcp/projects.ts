@@ -166,7 +166,7 @@ const toolProjectCreate: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    // Workspace admin, OR a live action:project_lifecycle elevation at ORG scope.
+    // Workspace admin, OR a live action:workspace_project elevation at ORG scope.
     //
     // Projects in mupot are WORKSPACE objects, not squad objects (the gate is
     // requireWorkspaceAdmin, not a squad check), so the elevation that
@@ -176,7 +176,16 @@ const toolProjectCreate: ToolSpec = {
     // strictly narrower than the standing workspace admin it replaces.
     const denied = requireWorkspaceAdmin(auth)
     if (denied) {
-      const elevated = await hasElevatedAction(env, auth, 'action:project_lifecycle', 'org', null, {
+      // action:workspace_project, NOT action:project_lifecycle.
+      //
+      // project_create is workspace-gated, so its elevation must be granted at
+      // ORG scope — and hasElevatedAction treats an org-scoped grant as covering
+      // every scope. While both tools read one action key, the single grant that
+      // let a squad lead make its own project ALSO created squads in departments
+      // it had nothing to do with (measured). Splitting the key is what keeps an
+      // org-scoped PROJECT grant from being a squad-structure grant: create_squad
+      // asks for a different action, so this one cannot answer for it.
+      const elevated = await hasElevatedAction(env, auth, 'action:workspace_project', 'org', null, {
         toolName: 'project_create',
         detail: { slug: args.slug },
       })

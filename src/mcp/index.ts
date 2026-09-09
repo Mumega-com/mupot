@@ -5090,7 +5090,6 @@ const ELEVATION_FLOOR_BYPASS_TOOLS: ReadonlySet<string> = new Set([
   'mint_agent_token',
   'grant_agent_capability',
   'create_squad',
-  'create_department',
   'project_create',
 ])
 

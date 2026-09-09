@@ -36,6 +36,7 @@ const ORIGIN = 'https://pot.test'
 const DEPT_ID = 'dept-eng'
 const LEAD_SQUAD_ID = 'squad-mcpwp'      // the lead's OWN squad
 const OTHER_SQUAD_ID = 'squad-core'      // somebody else's squad — must stay shut
+const OTHER_DEPT_ID = 'dept-finance'     // somebody else's department — must stay shut
 
 const LEAD_AGENT_ID = 'agent-lead'
 const LEAD_MEMBER_ID = 'member-lead'
@@ -49,7 +50,16 @@ let env: Env
 
 function seed(sqlite: SqliteD1Harness['sqlite']): void {
   sqlite.exec(`
-    INSERT INTO departments (id, slug, name) VALUES ('${DEPT_ID}', 'eng', 'Engineering');
+    INSERT INTO departments (id, slug, name) VALUES
+      ('${DEPT_ID}', 'eng', 'Engineering'),
+      ('${OTHER_DEPT_ID}', 'finance', 'Finance');
+
+    -- LIFT THE PLAN QUOTA. On the free tier maxDepartments/maxSquads are 1, so
+    -- create_department and create_squad return a 400 quota refusal that reads
+    -- EXACTLY like an authorization gate holding. Every "cannot" below has to
+    -- fail for the right reason, so the quota is taken out of the picture first.
+    INSERT INTO org_settings (key, value) VALUES ('billing_state', '{"tier":"scale"}')
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value;
 
     INSERT INTO squads (id, department_id, slug, name) VALUES
       ('${LEAD_SQUAD_ID}', '${DEPT_ID}', 'mcpwp', 'MCPWP'),
@@ -232,11 +242,16 @@ describe('a squad lead stands up its own squad, with no admin anywhere', () => {
 
     // ── the human, twice, deliberately ──────────────────────────────────────
     // mint_token is squad-scoped: the credential belongs to an agent in THIS
-    // squad. project_lifecycle is org-scoped because projects are workspace
+    // squad. workspace_project is org-scoped because projects are workspace
     // objects (project_create gates on requireWorkspaceAdmin) — the approver
     // chooses that scope knowingly, and it still lapses on its own clock.
+    //
+    // It is a SEPARATE action key from action:project_lifecycle (squads) on
+    // purpose: an org-scoped grant covers every scope, so one shared key would
+    // make "may create its own project" silently mean "may create squads
+    // anywhere in the org".
     await approve(sessionId, ['action:mint_token'], 'squad', LEAD_SQUAD_ID, 60, t0)
-    await approve(sessionId, ['action:project_lifecycle'], 'org', '', 60, t0)
+    await approve(sessionId, ['action:workspace_project'], 'org', '', 60, t0)
 
     // ── 1. its own agent ────────────────────────────────────────────────────
     const agentRes = await invokeTool(
@@ -276,6 +291,33 @@ describe('a squad lead stands up its own squad, with no admin anywhere', () => {
       { agent: newAgentId, squad: LEAD_SQUAD_ID, capability: 'member' }, ORIGIN,
     )
     expect(notApproved.ok, 'action:manage_access was never approved').toBe(false)
+
+    // ── the ORG-SCOPED grant's OWN boundary ─────────────────────────────────
+    //
+    // This is the half the first version of this test never probed, and an
+    // adversarial pass measured the consequence: project_create is
+    // workspace-gated, so action:project_lifecycle has to be granted at ORG
+    // scope to authorize a project at all — and hasElevatedAction treats an
+    // org-scoped grant as covering EVERY scope. The same grant that let the
+    // lead make its own project also created departments org-wide and squads
+    // inside departments it had nothing to do with. Against "nothing outside of
+    // it", org structure is outside of it.
+    //
+    // create_department no longer has an elevation path at all.
+    const deptAttempt = await invokeTool(
+      leadAuth(), env, 'create_department', { slug: 'ops', name: 'Ops' }, ORIGIN,
+    )
+    expect(deptAttempt.ok, 'an org-scoped project grant must not create org structure').toBe(false)
+    expect(JSON.stringify(deptAttempt)).not.toContain('limit_reached') // authz, not quota
+
+    // …and squad creation is DEPARTMENT-scoped, so it cannot reach a department
+    // the approver never named. (No project_lifecycle grant on dept-finance.)
+    const foreignSquad = await invokeTool(
+      leadAuth(), env, 'create_squad',
+      { department: OTHER_DEPT_ID, slug: 'blackops', name: 'Blackops' }, ORIGIN,
+    )
+    expect(foreignSquad.ok, 'a department-scoped grant must not reach another department').toBe(false)
+    expect(JSON.stringify(foreignSquad)).not.toContain('limit_reached')
 
     // ── 5. it gained NO standing authority doing any of this ────────────────
     const after = await resolveCapabilities(env, LEAD_MEMBER_ID)

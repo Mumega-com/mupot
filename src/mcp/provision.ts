@@ -303,23 +303,23 @@ const toolCreateDepartment: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    // Gate: org admin (a department is org-structure; only org-admin creates one),
-    // OR a live action:project_lifecycle elevation at ORG scope — which an
-    // approver grants deliberately and which still lapses on its own clock.
+    // Gate: org admin. NO elevation path, deliberately.
+    //
+    // An earlier revision wired action:project_lifecycle here. It was wrong, and
+    // an adversarial pass measured why: project_create is workspace-gated, so
+    // that action must be granted at ORG scope to authorize a project at all —
+    // and hasElevatedAction treats an org-scoped grant as covering every scope.
+    // So the one grant that let a squad lead make its own project ALSO let it
+    // create departments org-wide, and squads inside departments it has nothing
+    // to do with. Against "make their own agents and project, nothing outside of
+    // it", creating org structure is outside of it.
+    //
+    // A department is org-structure and stays an org-admin act. Squad creation
+    // keeps its elevation path, because that one is DEPARTMENT-scoped and so is
+    // actually bounded to the department the approver named.
     const grants = auth.capabilities ?? []
     if (!hasCapability(grants, 'org', null, 'admin')) {
-      const elevated = await hasElevatedAction(env, auth, 'action:project_lifecycle', 'org', null, {
-        toolName: 'create_department',
-        detail: { slug: args.slug },
-      })
-      if (!elevated.granted) {
-        return fail(403, 'forbidden', {
-          need: 'admin',
-          scope: 'org',
-          elevation_denied: elevated.reason,
-          remedy: elevationRemedyMessage(elevated.reason),
-        })
-      }
+      return fail(403, 'forbidden', { need: 'admin', scope: 'org' })
     }
 
     const result = await createDepartment(env, { slug: args.slug, name: args.name })
@@ -1419,6 +1419,42 @@ const toolGrantAgentCapability: ToolSpec = {
     const binding = await resolveAgentMemberBinding(env, agent.id)
     if (binding.kind === 'unminted') {
       return fail(409, 'agent_identity_unminted', 'call mint_agent_token before granting capabilities')
+    }
+
+    // The THIRD axis of the elevation ceiling, checked here because it needs the
+    // target's member id, which only exists once the binding is resolved.
+    //
+    // The ceiling above is a ONE-WAY VALVE, and the first version of this fix
+    // shipped only that half. setAgentSquadAccess is an upsert — ON CONFLICT DO
+    // UPDATE SET capability = excluded.capability — so "grant at most member"
+    // also reads as "SET to member", and nothing looked at what the target
+    // already held. Measured: a 60-minute action:manage_access elevation called
+    // grant_agent_capability with capability 'observer' against an agent holding
+    // standing squad 'admin'. It returned ok:true result:"updated", and after
+    // the elevation expired the victim was still 'observer'.
+    //
+    // A time-boxed grant that permanently DEMOTES a standing admin breaks the
+    // same invariant as one that permanently promotes — the effect outlives the
+    // window either way. Losing rank is not the safe direction; it is the
+    // destructive one, and it is how an elevated session would disarm the
+    // operators who could revoke it.
+    //
+    // Guard the GRANT, guard the ACTOR, and guard the TARGET's existing standing.
+    if (elevatedGrant) {
+      const existing = await env.DB.prepare(
+        `SELECT capability FROM capabilities
+          WHERE member_id = ?1 AND scope_type = 'squad' AND scope_id = ?2
+          LIMIT 1`,
+      )
+        .bind(binding.memberId, squad.id)
+        .first<{ capability: Capability }>()
+      if (existing && capabilityRank(existing.capability) > capabilityRank(capability as Capability)) {
+        return fail(
+          403,
+          'elevation_cannot_demote',
+          `target already holds '${existing.capability}' on this squad; an elevated session may not lower standing authority it could not restore`,
+        )
+      }
     }
 
     const outcome = await setAgentSquadAccess(env, {

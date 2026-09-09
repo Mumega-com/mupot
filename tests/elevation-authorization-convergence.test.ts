@@ -415,6 +415,49 @@ describe('grant_agent_capability — elevation substitutes for operator_principa
     expect(row?.capability).toBe('member')
   })
 
+  // THE MIRROR AXIS. The 'member' ceiling above is a ONE-WAY VALVE, and the first
+  // version of that fix shipped only the upward half. setAgentSquadAccess is an
+  // upsert, so "grant at most member" also reads as "SET to member" — and nothing
+  // looked at what the target already held. Measured on that revision: a
+  // 60-minute action:manage_access elevation set an agent holding standing squad
+  // 'admin' down to 'observer', ok:true result:"updated", and the demotion
+  // survived the elevation's expiry.
+  //
+  // A time-boxed grant that permanently DESTROYS standing authority breaks the
+  // same invariant as one that permanently confers it. It is also how an elevated
+  // session would disarm the operators able to revoke it.
+  it('an elevated agent may not DEMOTE a target that already outranks the grant', async () => {
+    const sessionId = await checkInActingAgent()
+    await approveElevation(sessionId, 'action:manage_access', 60, Date.now())
+
+    // Give the target standing admin on the squad — the thing worth destroying.
+    harness.sqlite
+      .prepare(
+        `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+         VALUES ('cap-victim', ?, 'squad', ?, 'admin')
+         ON CONFLICT(member_id, scope_type, scope_id) DO UPDATE SET capability = 'admin'`,
+      )
+      .run(TARGET_MEMBER_ID, TARGET_SQUAD_ID)
+
+    for (const capability of ['observer', 'member'] as const) {
+      const res = await invokeTool(
+        actingAgentAuth(),
+        env,
+        'grant_agent_capability',
+        { agent: TARGET_AGENT_ID, squad: TARGET_SQUAD_ID, capability },
+        ORIGIN,
+      )
+      expect(res.ok, `demotion to ${capability} must be refused`).toBe(false)
+      expect(JSON.stringify(res)).toContain('elevation_cannot_demote')
+    }
+
+    // The victim keeps what it had — the refusals are not merely cosmetic.
+    const row = harness.sqlite.prepare(
+      `SELECT capability FROM capabilities WHERE member_id = ? AND scope_type = 'squad' AND scope_id = ?`,
+    ).get(TARGET_MEMBER_ID, TARGET_SQUAD_ID) as { capability: string } | undefined
+    expect(row?.capability).toBe('admin')
+  })
+
   // THE MISSING AXIS. Every other test in this file passes agent: TARGET_AGENT_ID,
   // so "elevation never widens standing capability" was asserted only against a
   // member that was never the actor. target == actor was never in the matrix.

@@ -83,8 +83,16 @@ export const ELEVATION_ACTIONS: Readonly<Record<string, ElevationActionDef>> = O
   'action:project_lifecycle': {
     key: 'action:project_lifecycle',
     enforced: true,
-    label: 'Create/update projects & squads',
-    description: 'Create or update departments, squads, and projects.',
+    label: 'Create/update squads',
+    description: 'Create a squad inside a department you have been granted.',
+    effect: 'reversible',
+    effectNote: 'Created/updated records can be edited or removed by standing authority after expiry.',
+  },
+  'action:workspace_project': {
+    key: 'action:workspace_project',
+    enforced: true,
+    label: 'Create/update workspace projects',
+    description: 'Create or update a workspace project.',
     effect: 'reversible',
     effectNote: 'Created/updated records can be edited or removed by standing authority after expiry.',
   },
