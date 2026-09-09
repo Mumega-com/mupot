@@ -415,6 +415,55 @@ describe('grant_agent_capability — elevation substitutes for operator_principa
     expect(row?.capability).toBe('member')
   })
 
+  // THE ATTACK THE FIRST DEMOTE GUARD WAVED THROUGH.
+  //
+  // setAgentSquadAccess upserts TWO tables — capabilities AND memberships — and
+  // they are independent authorization planes. memberships is AND-gated by
+  // requireFlightSpineSquadAuthority and read by agents/messages.ts. The first
+  // guard read `capabilities` only, so for the DEFAULT shape written by
+  // createAgent (memberships='member', NO capabilities row) the SELECT returned
+  // undefined and the demotion went through. Measured with that guard in place:
+  // memberships lead -> observer, permanently, from a 60-minute grant.
+  //
+  // This fixture is that exact shape: a membership row, and NO capabilities row.
+  it('an elevated agent may not demote a target whose rank lives only in memberships', async () => {
+    const sessionId = await checkInActingAgent()
+    await approveElevation(sessionId, 'action:manage_access', 60, Date.now())
+
+    // The create_agent shape: membership only, no capabilities row anywhere.
+    harness.sqlite
+      .prepare(`DELETE FROM capabilities WHERE member_id = ? AND scope_type = 'squad' AND scope_id = ?`)
+      .run(TARGET_MEMBER_ID, TARGET_SQUAD_ID)
+    harness.sqlite
+      .prepare(
+        `INSERT INTO memberships (id, agent_id, squad_id, capability)
+         VALUES ('mem-victim', ?, ?, 'lead')
+         ON CONFLICT(agent_id, squad_id) DO UPDATE SET capability = 'lead'`,
+      )
+      .run(TARGET_AGENT_ID, TARGET_SQUAD_ID)
+
+    const capRow = harness.sqlite.prepare(
+      `SELECT capability FROM capabilities WHERE member_id = ? AND scope_type = 'squad' AND scope_id = ?`,
+    ).get(TARGET_MEMBER_ID, TARGET_SQUAD_ID)
+    expect(capRow, 'fixture must have NO capabilities row — that is the attack').toBeUndefined()
+
+    const res = await invokeTool(
+      actingAgentAuth(),
+      env,
+      'grant_agent_capability',
+      { agent: TARGET_AGENT_ID, squad: TARGET_SQUAD_ID, capability: 'observer' },
+      ORIGIN,
+    )
+    expect(res.ok, 'demotion via the memberships plane must be refused').toBe(false)
+    expect(JSON.stringify(res)).toContain('elevation_cannot_demote')
+
+    // And the membership is untouched — the refusal is not cosmetic.
+    const after = harness.sqlite.prepare(
+      `SELECT capability FROM memberships WHERE agent_id = ? AND squad_id = ?`,
+    ).get(TARGET_AGENT_ID, TARGET_SQUAD_ID) as { capability: string } | undefined
+    expect(after?.capability).toBe('lead')
+  })
+
   // THE MIRROR AXIS. The 'member' ceiling above is a ONE-WAY VALVE, and the first
   // version of that fix shipped only the upward half. setAgentSquadAccess is an
   // upsert, so "grant at most member" also reads as "SET to member" — and nothing

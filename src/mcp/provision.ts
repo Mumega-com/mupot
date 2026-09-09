@@ -1424,35 +1424,54 @@ const toolGrantAgentCapability: ToolSpec = {
     // The THIRD axis of the elevation ceiling, checked here because it needs the
     // target's member id, which only exists once the binding is resolved.
     //
-    // The ceiling above is a ONE-WAY VALVE, and the first version of this fix
-    // shipped only that half. setAgentSquadAccess is an upsert — ON CONFLICT DO
-    // UPDATE SET capability = excluded.capability — so "grant at most member"
-    // also reads as "SET to member", and nothing looked at what the target
-    // already held. Measured: a 60-minute action:manage_access elevation called
-    // grant_agent_capability with capability 'observer' against an agent holding
-    // standing squad 'admin'. It returned ok:true result:"updated", and after
-    // the elevation expired the victim was still 'observer'.
+    // READ BOTH PLANES. setAgentSquadAccess upserts TWO tables — `capabilities`
+    // AND `memberships` — and they are independent authorization planes, not
+    // mirrors of each other. memberships is AND-gated by
+    // requireFlightSpineSquadAuthority (src/flight-spine/objectives.ts:250) and
+    // read by src/agents/messages.ts for send/visibility.
     //
-    // A time-boxed grant that permanently DEMOTES a standing admin breaks the
-    // same invariant as one that permanently promotes — the effect outlives the
-    // window either way. Losing rank is not the safe direction; it is the
-    // destructive one, and it is how an elevated session would disarm the
-    // operators who could revoke it.
+    // The first version of this guard read `capabilities` only, and an
+    // adversarial pass reproduced the attack straight through it: createAgent
+    // (src/org/service.ts:526) writes memberships='member' with NO capabilities
+    // row, so for the DEFAULT shape of every agent in the pot the SELECT
+    // returned undefined and the guard waved the call through. Measured with the
+    // guard fully in place: a 60-minute action:manage_access elevation moved a
+    // target from memberships 'lead' to 'observer', permanently.
     //
-    // Guard the GRANT, guard the ACTOR, and guard the TARGET's existing standing.
+    // The repo already had the right answer and I read the wrong table anyway:
+    // src/members/squad-membership.ts:77 reads `memberships` for exactly this
+    // check, and its comment at :243 says "#1171: read prior from memberships,
+    // not capabilities" — because `capabilities` cannot represent 'owner' and,
+    // as here, is frequently absent. Take the MAX of the two planes so neither
+    // an absent row nor a lower one in one table can hide standing rank in the
+    // other.
     if (elevatedGrant) {
-      const existing = await env.DB.prepare(
-        `SELECT capability FROM capabilities
-          WHERE member_id = ?1 AND scope_type = 'squad' AND scope_id = ?2
-          LIMIT 1`,
+      const [existingCap, existingMembership] = await Promise.all([
+        env.DB.prepare(
+          `SELECT capability FROM capabilities
+            WHERE member_id = ?1 AND scope_type = 'squad' AND scope_id = ?2
+            LIMIT 1`,
+        )
+          .bind(binding.memberId, squad.id)
+          .first<{ capability: Capability }>(),
+        env.DB.prepare(
+          `SELECT capability FROM memberships WHERE agent_id = ?1 AND squad_id = ?2 LIMIT 1`,
+        )
+          .bind(agent.id, squad.id)
+          .first<{ capability: Capability }>(),
+      ])
+      const currentRank = Math.max(
+        existingCap ? capabilityRank(existingCap.capability) : -1,
+        existingMembership ? capabilityRank(existingMembership.capability) : -1,
       )
-        .bind(binding.memberId, squad.id)
-        .first<{ capability: Capability }>()
-      if (existing && capabilityRank(existing.capability) > capabilityRank(capability as Capability)) {
+      if (currentRank > capabilityRank(capability as Capability)) {
+        const held = existingMembership && capabilityRank(existingMembership.capability) === currentRank
+          ? existingMembership.capability
+          : existingCap?.capability
         return fail(
           403,
           'elevation_cannot_demote',
-          `target already holds '${existing.capability}' on this squad; an elevated session may not lower standing authority it could not restore`,
+          `target already holds '${held}' on this squad; an elevated session may not lower standing authority it could not restore`,
         )
       }
     }
