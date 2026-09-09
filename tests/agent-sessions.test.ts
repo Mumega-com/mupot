@@ -219,7 +219,16 @@ describe('agent-session registry (D1, real migration chain)', () => {
     }, t0)
     await revokeAgentSessionById(env, TENANT, AGENT_A, a!.session.id, 'test')
     const bAfter = await loadAgentSessionById(env, TENANT, b!.session.id)
-    expect(evaluateAgentSession(bAfter!).ok).toBe(true)
+    // The property under test is ISOLATION, and revoked_at is the only field the
+    // revoke could have touched — so assert that directly. It is also the only
+    // assertion here that does not depend on what day it is.
+    expect(bAfter?.revoked_at).toBeNull()
+    // Liveness is evaluated AT t0. evaluateAgentSession defaults nowMs to Date.now(),
+    // and these fixtures pin creation to a fixed 2026-09-01 — so the unpinned form
+    // asserted "a session created 2026-09-01 is live TODAY", which stopped being true
+    // 24h later when the idle window closed. It passed on the day it was written and
+    // has failed every day since: a fixture pinned at one end and read at the other.
+    expect(evaluateAgentSession(bAfter!, t0).ok).toBe(true)
   })
 
   it('ADVERSARIAL: absolute expiry (7d) fails closed even if the credential is continuously used — the SAME credential rotates to a NEW session id, the old one ends up revoked', async () => {
