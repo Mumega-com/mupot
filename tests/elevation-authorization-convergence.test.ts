@@ -464,6 +464,55 @@ describe('grant_agent_capability — elevation substitutes for operator_principa
     expect(after?.capability).toBe('lead')
   })
 
+  // THE COMBINATOR, not just the terms.
+  //
+  // A gate pass mutated Math.max into "capabilities-preferred" and all 30 tests
+  // stayed GREEN while a memberships lead -> observer demotion went through. The
+  // shipped code is correct; the DIRECTION was simply not pinned by anything.
+  //
+  // This is the state that makes it reachable: the two planes are NOT guaranteed
+  // in lockstep. setAgentSquadAccess keeps them together, but squad-scoped
+  // `capabilities` rows are also written outside it — src/onboarding/doors.ts,
+  // src/auth/sso.ts, src/members/service.ts — so a LOWER capabilities row
+  // alongside a HIGHER membership is a real shape, not a contrived one.
+  it('takes the MAX of the two planes — a lower capabilities row must not mask a higher membership', async () => {
+    const sessionId = await checkInActingAgent()
+    await approveElevation(sessionId, 'action:manage_access', 60, Date.now())
+
+    // capabilities says observer; memberships says lead. MAX must see 'lead'.
+    harness.sqlite
+      .prepare(
+        `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+         VALUES ('cap-low', ?, 'squad', ?, 'observer')
+         ON CONFLICT(member_id, scope_type, scope_id) DO UPDATE SET capability = 'observer'`,
+      )
+      .run(TARGET_MEMBER_ID, TARGET_SQUAD_ID)
+    harness.sqlite
+      .prepare(
+        `INSERT INTO memberships (id, agent_id, squad_id, capability)
+         VALUES ('mem-high', ?, ?, 'lead')
+         ON CONFLICT(agent_id, squad_id) DO UPDATE SET capability = 'lead'`,
+      )
+      .run(TARGET_AGENT_ID, TARGET_SQUAD_ID)
+
+    const res = await invokeTool(
+      actingAgentAuth(),
+      env,
+      'grant_agent_capability',
+      { agent: TARGET_AGENT_ID, squad: TARGET_SQUAD_ID, capability: 'observer' },
+      ORIGIN,
+    )
+    // Under capabilities-preferred this reads 'observer' vs 'observer' and is
+    // allowed; under MAX it reads 'lead' and is refused.
+    expect(res.ok, 'the higher membership must decide').toBe(false)
+    expect(JSON.stringify(res)).toContain('elevation_cannot_demote')
+
+    const after = harness.sqlite.prepare(
+      `SELECT capability FROM memberships WHERE agent_id = ? AND squad_id = ?`,
+    ).get(TARGET_AGENT_ID, TARGET_SQUAD_ID) as { capability: string } | undefined
+    expect(after?.capability).toBe('lead')
+  })
+
   // THE MIRROR AXIS. The 'member' ceiling above is a ONE-WAY VALVE, and the first
   // version of that fix shipped only the upward half. setAgentSquadAccess is an
   // upsert, so "grant at most member" also reads as "SET to member" — and nothing
