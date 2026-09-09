@@ -35,6 +35,10 @@ import {
 
 const SRC_DIR = join(__dirname, '..', 'src')
 const DEFINITION_FILE = join('auth', 'elevation-actions.ts')
+/** hasElevatedAction is DECLARED here, so its own parameter list (`action:
+ *  string`) matches the call-site pattern. Excluded as a caller; it is the
+ *  callee. */
+const ELEVATION_IMPL_FILE = join('auth', 'elevation.ts')
 
 function tsFiles(dir: string): string[] {
   const out: string[] = []
@@ -46,17 +50,40 @@ function tsFiles(dir: string): string[] {
   return out
 }
 
-/** Files that reference this action key OUTSIDE its own definition file. The
- *  dashboard renders every key generically via ELEVATION_ACTIONS[...] and so
- *  never names one literally — a literal occurrence elsewhere is a consumer. */
-function consumersOf(action: string): string[] {
-  const hits: string[] = []
+/** Source with comments removed. A first version of this file searched raw text,
+ *  and an adversarial pass drove a mutation straight through it: flip an action to
+ *  enforced:true, add `// TODO: someday wire 'action:deploy' here` anywhere in
+ *  src/, and the action became requestable and approvable while authorizing
+ *  nothing — the exact false-authority bug this file exists to prevent, waved
+ *  through by a comment. Enforcement is code; comments are not evidence of it. */
+function codeOf(file: string): string {
+  return readFileSync(file, 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/(^|[^:])\/\/[^\n]*/g, '$1 ')
+}
+
+/** Every `hasElevatedAction(...)` call site in src/, with the action argument as
+ *  written. mupot passes it positionally: (env, auth, action, scopeType, scopeId). */
+function elevationCallSites(): Array<{ file: string; actionArg: string }> {
+  const out: Array<{ file: string; actionArg: string }> = []
   for (const file of tsFiles(SRC_DIR)) {
     const rel = file.slice(file.indexOf('src/') + 4)
-    if (rel === DEFINITION_FILE) continue
-    if (readFileSync(file, 'utf8').includes(`'${action}'`)) hits.push(rel)
+    if (rel === DEFINITION_FILE || rel === ELEVATION_IMPL_FILE) continue
+    const code = codeOf(file)
+    const re = /hasElevatedAction\s*\(\s*[^,]+,\s*[^,]+,\s*([^,]+),/g
+    let m: RegExpExecArray | null
+    while ((m = re.exec(code)) !== null) out.push({ file: rel, actionArg: m[1].trim() })
   }
-  return hits
+  return out
+}
+
+/** Files that ENFORCE this action — i.e. pass it to hasElevatedAction. Not files
+ *  that merely mention it. The dashboard renders keys generically via
+ *  ELEVATION_ACTIONS[...] and never names one, so it correctly never counts. */
+function consumersOf(action: string): string[] {
+  return elevationCallSites()
+    .filter((c) => c.actionArg === `'${action}'` || c.actionArg === `"${action}"`)
+    .map((c) => c.file)
 }
 
 describe('every elevation action is enforced exactly as it is declared', () => {
@@ -81,6 +108,20 @@ describe('every elevation action is enforced exactly as it is declared', () => {
         `${action} has consumers ${JSON.stringify(consumers)} but is declared unenforced, so it cannot be requested — that enforcement branch is dead code`,
       ).toEqual([])
     }
+  })
+
+  it('every hasElevatedAction call site names its action as a STRING LITERAL', () => {
+    // The scan above is only complete if the action argument is always readable
+    // statically. A call site passing a constant, a variable, or a template
+    // would enforce an action while contributing no literal — so the action
+    // could stay declared unenforced (and unrequestable) with live enforcement
+    // behind it, which is dead code, or be silently enforced under a key nobody
+    // audited. Rather than try to resolve such an expression, refuse it: this is
+    // a small, closed set of call sites and keeping them literal costs nothing.
+    const sites = elevationCallSites()
+    expect(sites.length, 'no call sites found — the scan is blind').toBeGreaterThan(0)
+    const nonLiteral = sites.filter((c) => !/^'[^']+'$|^"[^"]+"$/.test(c.actionArg))
+    expect(nonLiteral, 'non-literal action argument defeats the enforcement scan').toEqual([])
   })
 
   it('only enforced actions are requestable', () => {
