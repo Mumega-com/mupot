@@ -333,12 +333,20 @@ export async function recordTaskDispatchRuntimeReceipt(
      WHERE tenant = ?1 AND dispatch_receipt_id = ?2 AND stage = ?3 AND attempt = ?4
   `).bind(env.TENANT_SLUG, input.dispatchReceiptId, input.stage, input.attempt).first<ReceiptRow>()
 
-  const now = new Date().toISOString()
+  // 0099: this is a credential gate on a WRITE path, so it consumes the one shared
+  // liveness export rather than a hand-written copy. The copy this replaces compared
+  // `expires_at > ?5` as TEXT against an ISO-shaped `now`, while member_tokens holds
+  // BOTH 'YYYY-MM-DD HH:MM:SS' and ISO rows. 'T' (0x54) sorts above ' ' (0x20), so a
+  // space-format token expiring later today compared as already dead — fail-closed,
+  // but only by accident: harmonizing `now` to nowSqlUtc() (the obvious tidy-up)
+  // would have flipped the same expression to fail-OPEN. TOKEN_LIVE_PREDICATE uses
+  // julianday() on both sides and has no such orientation.
+  const now = nowSqlUtc()
   const token = await env.DB.prepare(`
-    SELECT id FROM member_tokens
-     WHERE id = ?1 AND member_id = ?2 AND agent_id = ?3 AND tenant = ?4
-       AND channel = 'workspace' AND revoked_at IS NULL
-       AND (expires_at IS NULL OR expires_at > ?5)
+    SELECT t.id FROM member_tokens t
+     WHERE t.id = ?1 AND t.member_id = ?2 AND t.agent_id = ?3 AND t.tenant = ?4
+       AND t.channel = 'workspace'
+       AND ${TOKEN_LIVE_PREDICATE('?5')}
   `).bind(credentialId, memberId, agentId, env.TENANT_SLUG, now).first<{ id: string }>()
   if (!token) throw new TaskDispatchRuntimeReceiptError('agent_bound_workspace_credential_required')
 
