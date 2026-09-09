@@ -2777,9 +2777,20 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_elevation_usage_log_grant" },
     ],
   },
+  {
+    file: "0149_capability_expiry.sql",
+    sha256: "91cecc4d54c280639290b9de7cb2f30203cb83834e8cc081358168c877aa1554",
+    statements: [
+      "-- 0149_capability_expiry.sql — a standing capability grant may now END on its own.\n--\n-- WHY\n--\n-- Until now `capabilities` had no expiry at all: every grant was forever, and\n-- the only way to narrow one was for a human to remember to revoke it. That is\n-- why \"give this agent access to stand up its own squad\" kept collapsing into\n-- \"make it an admin\" — there was no shape in the schema for a grant that is\n-- both REAL (the agent acts on its own, with no approval per action) and\n-- BOUNDED (it stops without anyone doing anything).\n--\n-- Session-bound elevation (0148) solves a different problem: a human approves\n-- each request, and the grant dies with the agent session. That is the right\n-- tool for a one-off privileged act. It is the wrong tool for \"this agent leads\n-- this squad until the end of the quarter\", because it puts a human in the loop\n-- every single time.\n--\n-- MECHANISM ONLY. Exactly like 0099 did for member_tokens: add the column,\n-- change nothing about existing rows. `expires_at IS NULL` means NON-EXPIRING,\n-- which is what every current grant is, so applying this migration expires\n-- nothing and alters no behaviour on its own.\n--\n-- The NULL arm is load-bearing for the same reason it is in\n-- src/auth/token-lifecycle.ts: SQL three-valued logic drops NULL rows from any\n-- comparison, so a predicate without an explicit `IS NULL` branch would\n-- silently stop resolving every grant in the table — an instant, total,\n-- self-inflicted authorization outage. See CAPABILITY_LIVE_PREDICATE.\nALTER TABLE capabilities ADD COLUMN expires_at TEXT;",
+      "\n\n-- Sweep support: find grants past their horizon without scanning the whole\n-- table. Partial index on the expiring subset only — the overwhelming majority\n-- of rows are non-expiring and never need visiting.\nCREATE INDEX IF NOT EXISTS idx_capabilities_expiry\n    ON capabilities (expires_at)\n WHERE expires_at IS NOT NULL;",
+    ],
+    objects: [
+      { type: "index", name: "idx_capabilities_expiry" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "dd9bbe95b8907f0fa0e8968c090d964c4110c87349956e5397d35842cc9c8c02"
+export const SCHEMA_CHAIN_DIGEST: string = "fe2be531d62d114e143238aa0afa36436a8980f57b39faec296559aa4c508c18"

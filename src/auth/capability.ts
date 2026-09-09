@@ -94,17 +94,46 @@ export function isOrgAdmin(auth: AuthContext | null | undefined): boolean {
  * Load every capability grant for a member from D1. Returns [] (fail-closed) for
  * an unknown or grantless member — absence of grants is never a grant.
  */
+/** SQL fragment gating a `capabilities` row on liveness (migration 0149).
+ *
+ *  Two things are load-bearing, and they are the same two that
+ *  src/auth/token-lifecycle.ts spells out for member_tokens — the reasoning
+ *  transfers exactly, because the failure modes do:
+ *
+ *  1. `expires_at IS NULL` means NON-EXPIRING. Every grant written before 0149
+ *     is NULL, and SQL three-valued logic drops NULL rows from any comparison,
+ *     so a predicate without this arm would stop resolving EVERY existing grant
+ *     at once — a total authorization outage, self-inflicted, on the whole pot.
+ *
+ *  2. `julianday()` on BOTH sides, never a string compare. mupot's timestamp
+ *     columns already hold two shapes ('2026-06-06 16:11:58' and
+ *     '2026-06-09T02:51:30.844Z'), and 'T' (0x54) sorts ABOVE ' ' (0x20), so a
+ *     textual `>` gives the wrong answer for the same instant — and fails OPEN
+ *     or CLOSED depending purely on which shape the row happens to carry.
+ *
+ *  Bind: the `now` parameter index. Alias-free so it composes into either arm
+ *  of the UNION below. */
+export const CAPABILITY_LIVE_PREDICATE = (nowParam: string): string =>
+  `(expires_at IS NULL OR julianday(expires_at) > julianday(${nowParam}))`
+
+/** Canonical `now` for the predicate above — SQLite's own datetime('now') shape,
+ *  so application writes and migration writes are never a mixed pair. */
+export function nowCapabilitySql(): string {
+  return new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, '')
+}
+
 export async function resolveCapabilities(env: Env, memberId: string): Promise<CapabilityGrant[]> {
   const rows = await env.DB.prepare(
     `SELECT member_id, scope_type, scope_id, capability
        FROM capabilities
       WHERE member_id = ?1
+        AND ${CAPABILITY_LIVE_PREDICATE('?2')}
      UNION ALL
      SELECT member_id, 'squad' AS scope_type, squad_id AS scope_id, capability
        FROM channel_capability_grants
       WHERE member_id = ?1`,
   )
-    .bind(memberId)
+    .bind(memberId, nowCapabilitySql())
     .all<CapabilityGrant>()
   return rows.results ?? []
 }

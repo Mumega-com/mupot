@@ -1233,7 +1233,9 @@ describe('MCP granted multi-squad flight lifecycle', () => {
         CREATE TABLE capabilities (
           id TEXT PRIMARY KEY, member_id TEXT NOT NULL, scope_type TEXT NOT NULL, scope_id TEXT,
           capability TEXT NOT NULL CHECK (capability IN ('owner','admin','lead','member','observer')),
-          created_at TEXT NOT NULL DEFAULT (datetime('now')), UNIQUE (member_id, scope_type, scope_id)
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          expires_at TEXT,  -- 0149: NULL = non-expiring
+          UNIQUE (member_id, scope_type, scope_id)
         );
         CREATE TABLE channel_capability_grants (
           id TEXT PRIMARY KEY, member_id TEXT NOT NULL, squad_id TEXT NOT NULL, capability TEXT NOT NULL

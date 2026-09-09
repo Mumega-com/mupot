@@ -40,6 +40,10 @@ const migrations = [
   // reference a column this fixture never created, so every authenticated request in
   // this file 401s. A curated migration list is a second schema that silently drifts.
   '../migrations/0099_member_token_lifecycle.sql',
+  // 0149 adds capabilities.expires_at, which resolveCapabilities now references.
+  // Same story as 0099 immediately above, and the second time this curated list
+  // has had to be told about a column — which is the drift the comment warns of.
+  '../migrations/0149_capability_expiry.sql',
 ].map((path) => readFileSync(new URL(path, import.meta.url), 'utf8'))
 
 function envForRole(harness: SqliteD1Harness, role: 'owner' | 'admin' | 'member', tenant = 'tenant-a'): Env {
