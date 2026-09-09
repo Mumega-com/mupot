@@ -18,6 +18,7 @@ import type { Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { createAgentSession } from '../src/auth/agent-sessions'
+import { isRequestableElevationAction } from '../src/auth/elevation-actions'
 import { createElevationRequest } from '../src/auth/elevation'
 
 const TENANT = 'local'
@@ -133,7 +134,36 @@ describe('elevation dashboard screens — integration through dashboardApp (real
       durationMinutes: opts.durationMinutes ?? 60,
       reason: 'need it for the task',
     })
-    if (!result.ok) throw new Error('setup: could not create elevation request')
+    if (!result.ok) {
+      // createElevationRequest refuses actions that no tool enforces yet, so a
+      // request naming one cannot be built through the API. These are RENDERING
+      // tests over a stored row: the approval screen must classify and warn
+      // correctly for every action in the registry, including the ones not yet
+      // requestable — otherwise the warning is discovered to be broken on the
+      // day someone wires that action, which is the worst possible day.
+      // So seed the row directly, and only for that case.
+      const unenforced = (opts.actions ?? []).filter((a) => !isRequestableElevationAction(a))
+      if (unenforced.length === 0) throw new Error(`setup: could not create elevation request: ${result.reason}`)
+      const id = `req-direct-${Math.random().toString(16).slice(2, 10)}`
+      const now = Date.now()
+      await env.DB.prepare(
+        `INSERT INTO elevation_requests
+           (id, tenant, agent_session_id, agent_id, member_id, requested_actions_json,
+            requested_scope_type, requested_scope_id, requested_duration_minutes, reason,
+            status, created_at, decision_expires_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'squad', ?7, ?8, 'need it for the task', 'pending', ?9, ?10)`,
+      )
+        .bind(
+          id, TENANT, agentSessionId, AGENT_ID, AGENT_MEMBER,
+          JSON.stringify(opts.actions ?? []), opts.scopeId ?? SQUAD_A,
+          opts.durationMinutes ?? 60,
+          new Date(now).toISOString(),
+          new Date(now + 10 * 60 * 1000).toISOString(),
+        )
+        .run()
+      const row = await env.DB.prepare(`SELECT * FROM elevation_requests WHERE id = ?1`).bind(id).first()
+      return row as unknown as typeof result.request
+    }
     return result.request
   }
 

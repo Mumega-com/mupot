@@ -54,7 +54,7 @@ import {
   evaluateElevationGrant,
   boundAgentHasAnyLiveElevationGrant,
 } from '../auth/elevation'
-import { ALL_ELEVATION_ACTION_KEYS, ELEVATION_ACTIONS, ELEVATION_DURATION_PRESETS_MINUTES } from '../auth/elevation-actions'
+import { ELEVATION_ACTIONS, ELEVATION_DURATION_PRESETS_MINUTES, REQUESTABLE_ELEVATION_ACTION_KEYS } from '../auth/elevation-actions'
 import { createBus } from '../bus'
 import { createMemory } from '../memory'
 import {
@@ -4014,7 +4014,7 @@ const toolRequestElevation: ToolSpec = {
   inputSchema: {
     type: 'object',
     properties: {
-      actions: { type: 'array', items: { type: 'string', enum: [...ALL_ELEVATION_ACTION_KEYS] }, minItems: 1 },
+      actions: { type: 'array', items: { type: 'string', enum: [...REQUESTABLE_ELEVATION_ACTION_KEYS] }, minItems: 1 },
       scope_type: { type: 'string', enum: ['org', 'department', 'squad'] },
       scope_id: STRING_SCHEMA,
       duration_minutes: { type: 'number', enum: [...ELEVATION_DURATION_PRESETS_MINUTES] },
@@ -5083,7 +5083,16 @@ function validateArgs(schema: JsonSchema, args: Record<string, unknown>): string
 // handler wired for elevation with no name here can never be reached by an
 // elevated bound agent (dead code, caught in review by mumega-com#1173's
 // own adversarial pass on this exact branch).
-const ELEVATION_FLOOR_BYPASS_TOOLS: ReadonlySet<string> = new Set(['mint_agent_token', 'grant_agent_capability'])
+// Tools whose ToolSpec.min floor an elevated session may reach past. The floor
+// is enforced BEFORE run(), so a tool that consults elevation inside run() is
+// unreachable without membership here — its elevation branch would be dead code.
+const ELEVATION_FLOOR_BYPASS_TOOLS: ReadonlySet<string> = new Set([
+  'mint_agent_token',
+  'grant_agent_capability',
+  'create_squad',
+  'create_department',
+  'project_create',
+])
 
 export async function invokeTool(
   auth: AuthContext,

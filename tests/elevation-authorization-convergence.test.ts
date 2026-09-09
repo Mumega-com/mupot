@@ -353,17 +353,17 @@ describe('grant_agent_capability — elevation substitutes for operator_principa
       actingAgentAuth(),
       env,
       'grant_agent_capability',
-      { agent: TARGET_AGENT_ID, squad: TARGET_SQUAD_ID, capability: 'admin' },
+      { agent: TARGET_AGENT_ID, squad: TARGET_SQUAD_ID, capability: 'member' },
       ORIGIN,
     )
     expect(res.ok).toBe(true)
     const out = res.result as { grant: { capability: string; scope_id: string } }
-    expect(out.grant).toMatchObject({ capability: 'admin', scope_id: TARGET_SQUAD_ID })
+    expect(out.grant).toMatchObject({ capability: 'member', scope_id: TARGET_SQUAD_ID })
 
     const row = harness.sqlite.prepare(
       `SELECT capability FROM capabilities WHERE member_id = ? AND scope_type = 'squad' AND scope_id = ?`,
     ).get(TARGET_MEMBER_ID, TARGET_SQUAD_ID) as { capability: string } | undefined
-    expect(row?.capability).toBe('admin')
+    expect(row?.capability).toBe('member')
 
     const usage = await listElevationUsage(env, TENANT, grant.id)
     expect(usage.length).toBeGreaterThanOrEqual(1)
@@ -372,17 +372,72 @@ describe('grant_agent_capability — elevation substitutes for operator_principa
     expect(usage[0].action).toBe('action:manage_access')
   })
 
-  it('an elevated agent may grant UP TO admin (never above — admin is already GRANTABLE_AGENT_CAPABILITIES\' ceiling and the approver was re-verified admin on this exact scope)', async () => {
+  // This test previously asserted the OPPOSITE — that an elevated agent may grant
+  // UP TO admin — reasoning that admin is GRANTABLE_AGENT_CAPABILITIES' ceiling
+  // and the approver was re-verified admin on this exact scope. Both halves are
+  // true and both are beside the point: grant_agent_capability writes the
+  // STANDING capabilities table, so a 15-minute elevation was minting permanent
+  // squad admin. Measured on the old code, with the elevation revoked AND
+  // expired first, the acting agent kept a standing admin row and create_agent
+  // went from 403 forbidden to 400 agent_limit_reached — authorization passed,
+  // only a quota stopped it. Duration was a voluntary property.
+  it('an elevated agent may grant at most member — lead/admin outlive the elevation and are refused', async () => {
     const sessionId = await checkInActingAgent()
     await approveElevation(sessionId, 'action:manage_access', 60, Date.now())
-    const res = await invokeTool(
+
+    for (const capability of ['lead', 'admin'] as const) {
+      const res = await invokeTool(
+        actingAgentAuth(),
+        env,
+        'grant_agent_capability',
+        { agent: TARGET_AGENT_ID, squad: TARGET_SQUAD_ID, capability },
+        ORIGIN,
+      )
+      expect(res.ok, `${capability} must be refused to an elevated caller`).toBe(false)
+      expect(JSON.stringify(res)).toContain('elevation_capability_ceiling')
+    }
+
+    // POSITIVE CONTROL: the same call at 'member' still succeeds, so the two
+    // refusals above are the ceiling and not a broken elevation.
+    const ok = await invokeTool(
       actingAgentAuth(),
       env,
       'grant_agent_capability',
-      { agent: TARGET_AGENT_ID, squad: TARGET_SQUAD_ID, capability: 'admin' },
+      { agent: TARGET_AGENT_ID, squad: TARGET_SQUAD_ID, capability: 'member' },
       ORIGIN,
     )
-    expect(res.ok).toBe(true)
+    expect(ok.ok).toBe(true)
+
+    // And nothing standing was written for the TARGET above 'member'.
+    const row = harness.sqlite.prepare(
+      `SELECT capability FROM capabilities WHERE member_id = ? AND scope_type = 'squad' AND scope_id = ?`,
+    ).get(TARGET_MEMBER_ID, TARGET_SQUAD_ID) as { capability: string } | undefined
+    expect(row?.capability).toBe('member')
+  })
+
+  // THE MISSING AXIS. Every other test in this file passes agent: TARGET_AGENT_ID,
+  // so "elevation never widens standing capability" was asserted only against a
+  // member that was never the actor. target == actor was never in the matrix.
+  it('an elevated agent may not grant capabilities to ITSELF at any rank', async () => {
+    const sessionId = await checkInActingAgent()
+    await approveElevation(sessionId, 'action:manage_access', 60, Date.now())
+
+    for (const capability of ['member', 'lead', 'admin'] as const) {
+      const res = await invokeTool(
+        actingAgentAuth(),
+        env,
+        'grant_agent_capability',
+        { agent: ACTING_AGENT_ID, squad: TARGET_SQUAD_ID, capability },
+        ORIGIN,
+      )
+      expect(res.ok, `self-grant of ${capability} must be refused`).toBe(false)
+      expect(JSON.stringify(res)).toContain('cannot_grant_to_self')
+    }
+
+    const rows = harness.sqlite.prepare(
+      `SELECT COUNT(*) AS n FROM capabilities WHERE member_id = ?`,
+    ).get(ACTING_MEMBER_ID) as { n: number }
+    expect(rows.n).toBe(0)
   })
 
   it('an agent whose elevation has EXPIRED is refused', async () => {

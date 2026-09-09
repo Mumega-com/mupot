@@ -111,12 +111,12 @@ describe('token rotation revokes the OLD agent_sessions row (Athena\'s step-2 ga
 
       const created = await createElevationRequest(harness.env, {
         tenant: TENANT, agentSessionId: priorSession.id, agentId: AGENT.id, memberId: prior.memberId,
-        actions: ['action:dispatch'], scopeType: 'squad', scopeId: AGENT.squad_id, durationMinutes: 1440, reason: 'long task',
+        actions: ['action:project_lifecycle'], scopeType: 'squad', scopeId: AGENT.squad_id, durationMinutes: 1440, reason: 'long task',
       })
       if (!created.ok) throw new Error('setup failed')
       const decision = await decideElevationRequest(harness.env, {
         tenant: TENANT, requestId: created.request.id, decision: 'approve',
-        selectedActions: ['action:dispatch'],
+        selectedActions: ['action:project_lifecycle'],
         decidedByMemberId: 'admin-1',
         decidedByCapabilities: [{ member_id: 'admin-1', scope_type: 'squad', scope_id: AGENT.squad_id, capability: 'admin' }],
         decidedByWebSessionHash: approverSession.id_hash, recentReauthOk: true,
@@ -128,7 +128,7 @@ describe('token rotation revokes the OLD agent_sessions row (Athena\'s step-2 ga
         channel: 'workspace', boundAgentId: AGENT.id, tokenId: prior.tokenId,
       }
       // Confirmed live BEFORE rotation.
-      const before = await hasElevatedAction(harness.env, priorAuth, 'action:dispatch', 'squad', AGENT.squad_id, { recordUsage: false })
+      const before = await hasElevatedAction(harness.env, priorAuth, 'action:project_lifecycle', 'squad', AGENT.squad_id, { recordUsage: false })
       expect(before.granted).toBe(true)
 
       // Rotate the credential (a routine, legitimate key-rotation event — NOT a
@@ -141,7 +141,7 @@ describe('token rotation revokes the OLD agent_sessions row (Athena\'s step-2 ga
       // session it is bound to is dead. This is the ambiguity Athena's gate
       // exists to prevent: a rotated-away session must never be able to
       // authenticate an elevation, ever.
-      const after = await hasElevatedAction(harness.env, priorAuth, 'action:dispatch', 'squad', AGENT.squad_id)
+      const after = await hasElevatedAction(harness.env, priorAuth, 'action:project_lifecycle', 'squad', AGENT.squad_id)
       expect(after.granted).toBe(false)
       if (!after.granted) {
         expect(['no_live_session', 'session_revoked']).toContain(after.reason)

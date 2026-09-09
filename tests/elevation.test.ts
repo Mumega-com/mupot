@@ -215,6 +215,108 @@ describe('elevation ledger (D1, real migration chain)', () => {
     expect(grants).toHaveLength(0)
   })
 
+  it('DENY is gated by the same authority as approve — an outsider cannot kill a request', async () => {
+    // Deny and approve are two writes to ONE authority ledger. The authority
+    // check used to sit BELOW the deny branch, so deny was reachable by any
+    // member with a login who learned a request id — and the requesting agent
+    // knows its own. They could terminally kill any pending request, and the
+    // ledger recorded them as the decider: an unauthorized write to an audit
+    // surface. Measured on the old code: a zero-capability outsider's deny
+    // returned ok:true with decided_by = that outsider.
+    const nowMs = Date.now()
+    const session = await seedAgentSession(nowMs)
+    const created = await createElevationRequest(
+      env,
+      {
+        tenant: TENANT, agentSessionId: session.id, agentId: AGENT_ID, memberId: AGENT_MEMBER,
+        actions: ['action:manage_access'], scopeType: 'squad', scopeId: SQUAD, durationMinutes: 60, reason: 'x',
+      },
+      nowMs,
+    )
+    if (!created.ok) throw new Error('setup failed')
+    const approverSession = await seedApproverWebSession(nowMs)
+
+    const outsider = await decideElevationRequest(
+      env,
+      {
+        tenant: TENANT,
+        requestId: created.request.id,
+        decision: 'deny',
+        decidedByMemberId: 'member-outsider',
+        decidedByCapabilities: [], // no authority anywhere
+        decidedByWebSessionHash: approverSession.id_hash,
+        recentReauthOk: false,
+      },
+      nowMs,
+    )
+    expect(outsider.ok).toBe(false)
+    if (!outsider.ok) expect(outsider.reason).toBe('forbidden')
+
+    // The request must still be pending — a refused deny that nonetheless
+    // flipped the row would be the same audit corruption by another route.
+    const still = await env.DB.prepare(`SELECT status, decided_by_member_id FROM elevation_requests WHERE id = ?1`)
+      .bind(created.request.id)
+      .first<{ status: string; decided_by_member_id: string | null }>()
+    expect(still?.status).toBe('pending')
+    expect(still?.decided_by_member_id).toBeNull()
+
+    // POSITIVE CONTROL: the SAME deny, by a principal that does hold admin on
+    // the scope, succeeds. Without this the refusal above could equally be a
+    // broken deny path.
+    const admin = await decideElevationRequest(
+      env,
+      {
+        tenant: TENANT,
+        requestId: created.request.id,
+        decision: 'deny',
+        decidedByMemberId: ADMIN_MEMBER,
+        decidedByCapabilities: capabilities,
+        decidedByWebSessionHash: approverSession.id_hash,
+        recentReauthOk: false,
+      },
+      nowMs,
+    )
+    expect(admin.ok).toBe(true)
+    if (admin.ok) expect(admin.request.status).toBe('denied')
+  })
+
+  it('a request is never its own approval — the requesting member cannot decide it', async () => {
+    const nowMs = Date.now()
+    const session = await seedAgentSession(nowMs)
+    const created = await createElevationRequest(
+      env,
+      {
+        tenant: TENANT, agentSessionId: session.id, agentId: AGENT_ID, memberId: AGENT_MEMBER,
+        actions: ['action:manage_access'], scopeType: 'squad', scopeId: SQUAD, durationMinutes: 60, reason: 'x',
+      },
+      nowMs,
+    )
+    if (!created.ok) throw new Error('setup failed')
+    const approverSession = await seedApproverWebSession(nowMs)
+
+    // AGENT_MEMBER is the requester. Give it full admin capabilities so the
+    // refusal can only be the self-approval rule and never a missing grant.
+    const selfApprove = await decideElevationRequest(
+      env,
+      {
+        tenant: TENANT,
+        requestId: created.request.id,
+        decision: 'approve',
+        selectedActions: ['action:manage_access'],
+        decidedByMemberId: AGENT_MEMBER,
+        decidedByCapabilities: capabilities.map((c) => ({ ...c, member_id: AGENT_MEMBER })),
+        decidedByWebSessionHash: approverSession.id_hash,
+        recentReauthOk: true,
+      },
+      nowMs,
+    )
+    expect(selfApprove.ok).toBe(false)
+    if (!selfApprove.ok) expect(selfApprove.reason).toBe('forbidden')
+
+    const grants = await loadLiveElevationGrantsForSession(env, TENANT, session.id, nowMs)
+    expect(grants).toHaveLength(0)
+  })
+
   it('approve rejects an action not in the original request (cannot ADD permissions)', async () => {
     const nowMs = Date.now()
     const session = await seedAgentSession(nowMs)
@@ -235,7 +337,7 @@ describe('elevation ledger (D1, real migration chain)', () => {
         tenant: TENANT,
         requestId: created.request.id,
         decision: 'approve',
-        selectedActions: ['action:manage_access', 'action:deploy'], // deploy was never requested
+        selectedActions: ['action:manage_access', 'action:mint_token'], // mint_token was never requested
         decidedByMemberId: ADMIN_MEMBER,
         decidedByCapabilities: capabilities,
         decidedByWebSessionHash: approverSession.id_hash,
@@ -321,7 +423,7 @@ describe('elevation ledger (D1, real migration chain)', () => {
       env,
       {
         tenant: TENANT, agentSessionId: session.id, agentId: AGENT_ID, memberId: AGENT_MEMBER,
-        actions: ['action:register_key'], scopeType: 'squad', scopeId: SQUAD, durationMinutes: 15, reason: 'x',
+        actions: ['action:mint_token'], scopeType: 'squad', scopeId: SQUAD, durationMinutes: 15, reason: 'x',
       },
       nowMs,
     )
@@ -332,7 +434,7 @@ describe('elevation ledger (D1, real migration chain)', () => {
       env,
       {
         tenant: TENANT, requestId: created.request.id, decision: 'approve',
-        selectedActions: ['action:register_key'],
+        selectedActions: ['action:mint_token'],
         decidedByMemberId: ADMIN_MEMBER, decidedByCapabilities: capabilities,
         decidedByWebSessionHash: approverSession.id_hash, recentReauthOk: false,
       },
@@ -345,7 +447,7 @@ describe('elevation ledger (D1, real migration chain)', () => {
       env,
       {
         tenant: TENANT, requestId: created.request.id, decision: 'approve',
-        selectedActions: ['action:register_key'],
+        selectedActions: ['action:mint_token'],
         decidedByMemberId: ADMIN_MEMBER, decidedByCapabilities: capabilities,
         decidedByWebSessionHash: approverSession.id_hash, recentReauthOk: true,
       },
@@ -354,14 +456,14 @@ describe('elevation ledger (D1, real migration chain)', () => {
     expect(withReauth.ok).toBe(true)
   })
 
-  it('approve writes a grant with the effect FROZEN from the action registry (register_key = irreversible)', async () => {
+  it('approve writes a grant with the effect FROZEN from the action registry (mint_token = revocable_if_recorded)', async () => {
     const nowMs = Date.now()
     const session = await seedAgentSession(nowMs)
     const created = await createElevationRequest(
       env,
       {
         tenant: TENANT, agentSessionId: session.id, agentId: AGENT_ID, memberId: AGENT_MEMBER,
-        actions: ['action:register_key'], scopeType: 'squad', scopeId: SQUAD, durationMinutes: 15, reason: 'x',
+        actions: ['action:mint_token'], scopeType: 'squad', scopeId: SQUAD, durationMinutes: 15, reason: 'x',
       },
       nowMs,
     )
@@ -371,7 +473,7 @@ describe('elevation ledger (D1, real migration chain)', () => {
       env,
       {
         tenant: TENANT, requestId: created.request.id, decision: 'approve',
-        selectedActions: ['action:register_key'],
+        selectedActions: ['action:mint_token'],
         decidedByMemberId: ADMIN_MEMBER, decidedByCapabilities: capabilities,
         decidedByWebSessionHash: approverSession.id_hash, recentReauthOk: true,
       },
@@ -379,7 +481,13 @@ describe('elevation ledger (D1, real migration chain)', () => {
     )
     expect(decision.ok).toBe(true)
     if (decision.ok) {
-      expect(decision.grants[0].effect).toBe('irreversible')
+      // The property under test is that the grant carries the effect the
+      // REGISTRY held at grant time, not that any particular action is
+      // irreversible. This used action:register_key — which is classified
+      // irreversible but is not enforced by any tool, and so can no longer be
+      // requested. action:mint_token is enforced and carries a distinct,
+      // non-default classification, which is what makes the freeze observable.
+      expect(decision.grants[0].effect).toBe('revocable_if_recorded')
     }
   })
 
@@ -477,7 +585,7 @@ describe('elevation ledger (D1, real migration chain)', () => {
     const ok = await hasElevatedAction(env, agentAuth(), 'action:manage_access', 'squad', SQUAD, { nowMs })
     expect(ok.granted).toBe(true)
 
-    const wrongAction = await hasElevatedAction(env, agentAuth(), 'action:deploy', 'squad', SQUAD, { nowMs })
+    const wrongAction = await hasElevatedAction(env, agentAuth(), 'action:mint_token', 'squad', SQUAD, { nowMs })
     expect(wrongAction.granted).toBe(false)
 
     const wrongScope = await hasElevatedAction(env, agentAuth(), 'action:manage_access', 'squad', 'some-other-squad', { nowMs })
@@ -563,7 +671,7 @@ describe('elevation ledger (D1, real migration chain)', () => {
       env,
       {
         tenant: TENANT, agentSessionId: session.id, agentId: AGENT_ID, memberId: AGENT_MEMBER,
-        actions: ['action:dispatch'], scopeType: 'org', scopeId: '', durationMinutes: 60, reason: 'x',
+        actions: ['action:project_lifecycle'], scopeType: 'org', scopeId: '', durationMinutes: 60, reason: 'x',
       },
       nowMs,
     )
@@ -583,7 +691,7 @@ describe('elevation ledger (D1, real migration chain)', () => {
       env,
       {
         tenant: TENANT, requestId: created.request.id, decision: 'approve',
-        selectedActions: ['action:dispatch'],
+        selectedActions: ['action:project_lifecycle'],
         decidedByMemberId: ADMIN_MEMBER, decidedByCapabilities: orgCapabilities,
         decidedByWebSessionHash: approverSession.id_hash, recentReauthOk: true,
       },
@@ -591,7 +699,7 @@ describe('elevation ledger (D1, real migration chain)', () => {
     )
     expect(decision.ok).toBe(true)
 
-    const result = await hasElevatedAction(env, agentAuth(), 'action:dispatch', 'squad', SQUAD, { nowMs })
+    const result = await hasElevatedAction(env, agentAuth(), 'action:project_lifecycle', 'squad', SQUAD, { nowMs })
     expect(result.granted).toBe(true)
   })
 

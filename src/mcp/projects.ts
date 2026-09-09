@@ -1,5 +1,6 @@
 import type { AuthContext, BusEvent, Env, Project, ProjectSquadAccess, ProjectStatus } from '../types'
 import { hasCapability } from '../auth/capability'
+import { elevationRemedyMessage, hasElevatedAction } from '../auth/elevation'
 import { createBus } from '../bus'
 import {
   createProject,
@@ -165,8 +166,29 @@ const toolProjectCreate: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
+    // Workspace admin, OR a live action:project_lifecycle elevation at ORG scope.
+    //
+    // Projects in mupot are WORKSPACE objects, not squad objects (the gate is
+    // requireWorkspaceAdmin, not a squad check), so the elevation that
+    // authorizes creating one is necessarily org-scoped. That is broader than
+    // a squad-scoped grant and deliberately so: the approver is choosing the
+    // scope, and an org-scoped grant that expires on its own clock is still
+    // strictly narrower than the standing workspace admin it replaces.
     const denied = requireWorkspaceAdmin(auth)
-    if (denied) return denied
+    if (denied) {
+      const elevated = await hasElevatedAction(env, auth, 'action:project_lifecycle', 'org', null, {
+        toolName: 'project_create',
+        detail: { slug: args.slug },
+      })
+      if (!elevated.granted) {
+        return fail(403, 'forbidden', {
+          need: 'admin',
+          scope: 'org',
+          elevation_denied: elevated.reason,
+          remedy: elevationRemedyMessage(elevated.reason),
+        })
+      }
+    }
     const result = await createProject(env, args)
     if (!result.ok) return mutationFailure(result.error)
     await emitProjectMutation(env, auth.memberId as string, 'created', result.value.id)

@@ -53,6 +53,32 @@ describe('elevation approval — integration through authApp (real D1)', () => {
 
   async function seedFixture(env: Env) {
     env.DB = harness.db
+    // CLAIM THE BOOTSTRAP OWNER SEAT FIRST — with an email no test logs in as.
+    //
+    // upsertUserByEmail makes the FIRST user in an empty `users` table the org
+    // owner (`isFirst && allowBootstrapOwner`), and every test here builds a
+    // fresh D1 and then dev-logs-in. So without this row, the principal each
+    // test calls "the outsider" or "an operator without authority" WAS the org
+    // owner, holding the highest authority in the pot.
+    //
+    // Those tests passed only because the routes ignored the legacy role plane
+    // entirely and read `auth.capabilities ?? []` — i.e. they passed BECAUSE of
+    // the owner-lockout defect, and would have kept passing after it was fixed
+    // only by asserting the owner still sees nothing. The fixture was encoding
+    // the bug it should have caught.
+    await env.DB.prepare(
+      "INSERT INTO users (id, email, role) VALUES ('bootstrap-owner', 'bootstrap-owner@x.test', 'owner')",
+    ).run()
+    // …with a matching members row, because that is what production looks like:
+    // the owner is a users row (authority, role plane) AND a members row
+    // (identity, what the dashboard bridge resolves and what the ledger records
+    // as the decider). Without the members row the routes return before ever
+    // reaching an authority check, which would hide the fix under an unrelated
+    // early return.
+    await env.DB.prepare(
+      `INSERT INTO members (id, tenant, email, display_name, status, created_at)
+       VALUES ('bootstrap-owner', ?1, 'bootstrap-owner@x.test', 'Bootstrap Owner', 'active', datetime('now'))`,
+    ).bind(TENANT).run()
     await env.DB.prepare(`INSERT INTO departments (id, slug, name) VALUES (?1, 'dept', 'Dept')`).bind(DEPT).run()
     await env.DB.prepare(`INSERT INTO squads (id, department_id, slug, name) VALUES (?1, ?2, 'squad', 'Squad')`)
       .bind(SQUAD, DEPT)
@@ -136,6 +162,47 @@ describe('elevation approval — integration through authApp (real D1)', () => {
     expect(body.requests[0].actions[0]).toMatchObject({ key: 'action:manage_access', effect: 'reversible' })
   })
 
+  it('the ORG OWNER — whose authority is the legacy role plane, with ZERO capability rows — sees and can approve', async () => {
+    // The owner is the principal with the most authority in the pot and
+    // characteristically holds NO rows in `capabilities`: their authority lives
+    // on auth.role, and the auth bridge deliberately leaves auth.capabilities
+    // UNDEFINED for them (assigning [] is what downgrades them).
+    //
+    // The routes read `auth.capabilities ?? await resolveCapabilities(...)`,
+    // and resolveCapabilities is pure SQL over `capabilities` with no role
+    // plane — so that `??` materialized [] for exactly this principal. Measured
+    // on the pre-fix code: GET /elevation/requests returned 200 {"requests":[]}
+    // and POST .../decide returned 403. Not a visible refusal — a permanent,
+    // silent "nothing is pending" for the only person who can approve anything.
+    const env = makeEnv('bootstrap-owner@x.test')
+    const { session } = await seedFixture(env)
+    const request = await seedPendingRequest(env, session.id)
+    const cookie = await devLogin(env)
+
+    const ownerRows = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM capabilities WHERE member_id = 'bootstrap-owner'",
+    ).first<{ n: number }>()
+    expect(ownerRows?.n ?? 0).toBe(0) // the whole point: authority without grants
+
+    const listRes = await authApp.request('/elevation/requests', { headers: { cookie: `mupot_session=${cookie}` } }, env)
+    expect(listRes.status).toBe(200)
+    const listBody = (await listRes.json()) as { requests: Array<{ id: string }> }
+    expect(listBody.requests).toHaveLength(1)
+    expect(listBody.requests[0].id).toBe(request.id)
+
+    const decideRes = await authApp.request(
+      `/elevation/requests/${request.id}/decide`,
+      {
+        method: 'POST',
+        headers: { cookie: `mupot_session=${cookie}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ decision: 'deny' }),
+      },
+      env,
+    )
+    const decideBody = (await decideRes.json()) as { ok: boolean; reason?: string }
+    expect(decideBody.ok, `owner decide refused: ${decideBody.reason}`).toBe(true)
+  })
+
   it('an operator WITHOUT admin authority on the scope sees NOTHING — visibility follows authorization, never shown-then-403', async () => {
     const env = makeEnv('outsider@x.test')
     const { session } = await seedFixture(env)
@@ -150,7 +217,7 @@ describe('elevation approval — integration through authApp (real D1)', () => {
   it('POST /elevation/requests/:id/decide approve creates the grant and it is queryable via GET /elevation/active', async () => {
     const env = makeEnv('admin@x.test')
     const { session } = await seedFixture(env)
-    const request = await seedPendingRequest(env, session.id, ['action:dispatch'])
+    const request = await seedPendingRequest(env, session.id, ['action:project_lifecycle'])
     const cookie = await devLogin(env)
 
     const decideRes = await authApp.request(
@@ -158,7 +225,7 @@ describe('elevation approval — integration through authApp (real D1)', () => {
       {
         method: 'POST',
         headers: { cookie: `mupot_session=${cookie}`, 'content-type': 'application/json' },
-        body: JSON.stringify({ decision: 'approve', actions: ['action:dispatch'] }),
+        body: JSON.stringify({ decision: 'approve', actions: ['action:project_lifecycle'] }),
       },
       env,
     )
@@ -195,7 +262,10 @@ describe('elevation approval — integration through authApp (real D1)', () => {
   it('a sensitive action requires a fresh reauth on the deciding web session — a plain dev-login (no reauth) is refused', async () => {
     const env = makeEnv('admin@x.test')
     const { session } = await seedFixture(env)
-    const request = await seedPendingRequest(env, session.id, ['action:register_key'])
+    // action:mint_token, not action:register_key: both are in
+    // SENSITIVE_STEP_UP_ACTIONS (which is what this test is about), but
+    // register_key is not enforced by any tool yet and so cannot be requested.
+    const request = await seedPendingRequest(env, session.id, ['action:mint_token'])
     const cookie = await devLogin(env)
 
     const res = await authApp.request(
@@ -203,7 +273,7 @@ describe('elevation approval — integration through authApp (real D1)', () => {
       {
         method: 'POST',
         headers: { cookie: `mupot_session=${cookie}`, 'content-type': 'application/json' },
-        body: JSON.stringify({ decision: 'approve', actions: ['action:register_key'] }),
+        body: JSON.stringify({ decision: 'approve', actions: ['action:mint_token'] }),
       },
       env,
     )
@@ -233,7 +303,7 @@ describe('elevation approval — integration through authApp (real D1)', () => {
   it('POST /elevation/:id/revoke ends a grant, scoped to the caller\'s own admin authority', async () => {
     const env = makeEnv('admin@x.test')
     const { session } = await seedFixture(env)
-    const request = await seedPendingRequest(env, session.id, ['action:dispatch'])
+    const request = await seedPendingRequest(env, session.id, ['action:project_lifecycle'])
     const cookie = await devLogin(env)
 
     const decideRes = await authApp.request(
@@ -241,7 +311,7 @@ describe('elevation approval — integration through authApp (real D1)', () => {
       {
         method: 'POST',
         headers: { cookie: `mupot_session=${cookie}`, 'content-type': 'application/json' },
-        body: JSON.stringify({ decision: 'approve', actions: ['action:dispatch'] }),
+        body: JSON.stringify({ decision: 'approve', actions: ['action:project_lifecycle'] }),
       },
       env,
     )
@@ -262,14 +332,14 @@ describe('elevation approval — integration through authApp (real D1)', () => {
   it('an outsider (no admin authority on the scope) cannot revoke someone else\'s grant', async () => {
     const adminEnv = makeEnv('admin@x.test')
     const { session } = await seedFixture(adminEnv)
-    const request = await seedPendingRequest(adminEnv, session.id, ['action:dispatch'])
+    const request = await seedPendingRequest(adminEnv, session.id, ['action:project_lifecycle'])
     const adminCookie = await devLogin(adminEnv)
     const decideRes = await authApp.request(
       `/elevation/requests/${request.id}/decide`,
       {
         method: 'POST',
         headers: { cookie: `mupot_session=${adminCookie}`, 'content-type': 'application/json' },
-        body: JSON.stringify({ decision: 'approve', actions: ['action:dispatch'] }),
+        body: JSON.stringify({ decision: 'approve', actions: ['action:project_lifecycle'] }),
       },
       adminEnv,
     )

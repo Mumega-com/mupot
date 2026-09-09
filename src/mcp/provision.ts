@@ -26,7 +26,7 @@
 //   register_agent_key — admin on the agent's squad → public-only signed-runtime identity
 
 import type { Capability, CapabilityGrant, ConnectionChannel, Env, BusEvent, Squad } from '../types'
-import { hasCapability, isOrgAdmin, holdsCapabilityFloor } from '../auth/capability'
+import { capabilityRank, hasCapability, isOrgAdmin, holdsCapabilityFloor } from '../auth/capability'
 import {
   createDepartment,
   createSquad,
@@ -303,10 +303,23 @@ const toolCreateDepartment: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    // Gate: org admin (a department is org-structure; only org-admin creates one).
+    // Gate: org admin (a department is org-structure; only org-admin creates one),
+    // OR a live action:project_lifecycle elevation at ORG scope — which an
+    // approver grants deliberately and which still lapses on its own clock.
     const grants = auth.capabilities ?? []
     if (!hasCapability(grants, 'org', null, 'admin')) {
-      return fail(403, 'forbidden', { need: 'admin', scope: 'org' })
+      const elevated = await hasElevatedAction(env, auth, 'action:project_lifecycle', 'org', null, {
+        toolName: 'create_department',
+        detail: { slug: args.slug },
+      })
+      if (!elevated.granted) {
+        return fail(403, 'forbidden', {
+          need: 'admin',
+          scope: 'org',
+          elevation_denied: elevated.reason,
+          remedy: elevationRemedyMessage(elevated.reason),
+        })
+      }
     }
 
     const result = await createDepartment(env, { slug: args.slug, name: args.name })
@@ -349,10 +362,25 @@ const toolCreateSquad: ToolSpec = {
     if (!deptResult.ok) return resolveFail(deptResult.reason, 'department_not_found')
     const dept = deptResult.value
 
-    // Gate: admin on the department (an org-admin grant inherits to every scope).
+    // Gate: admin on the department (an org-admin grant inherits to every scope),
+    // OR a live action:project_lifecycle elevation on that department. This is
+    // the "stand up your own squad" path: a squad lead who has been approved for
+    // project_lifecycle on its department may create a squad there for a bounded
+    // window, without being handed standing department admin.
     const grants = auth.capabilities ?? []
     if (!hasCapability(grants, 'department', dept.id, 'admin')) {
-      return fail(403, 'forbidden', { need: 'admin', scope: 'department' })
+      const elevated = await hasElevatedAction(env, auth, 'action:project_lifecycle', 'department', dept.id, {
+        toolName: 'create_squad',
+        detail: { department_id: dept.id, slug: args.slug },
+      })
+      if (!elevated.granted) {
+        return fail(403, 'forbidden', {
+          need: 'admin',
+          scope: 'department',
+          elevation_denied: elevated.reason,
+          remedy: elevationRemedyMessage(elevated.reason),
+        })
+      }
     }
 
     const result = await createSquad(env, dept.id, {
@@ -1349,7 +1377,42 @@ const toolGrantAgentCapability: ToolSpec = {
     // already the maximum value GRANTABLE_AGENT_CAPABILITIES allows (never
     // 'owner') — so the ceiling the standing check exists to enforce is
     // structurally already satisfied whenever elevatedGrant is set.
-    if (!elevatedGrant && !callerCanGrantAgentCapability(grants, squad, capability)) {
+    if (elevatedGrant) {
+      // ── the two things elevation does NOT buy ────────────────────────────
+      //
+      // 1. GRANTING YOURSELF. Nothing else here compares the target to the
+      //    caller, so an agent elevated for action:manage_access could name
+      //    ITSELF as the target. Measured before this guard: a 15-minute grant
+      //    produced a standing 'admin' row for the acting agent that survived
+      //    both revocation and expiry of the elevation.
+      if (auth.boundAgentId && agent.id === auth.boundAgentId) {
+        return fail(403, 'cannot_grant_to_self', 'an elevated session may not grant capabilities to its own agent')
+      }
+      // 2. CONFERRING AUTHORITY THAT OUTLIVES THE GRANT. This tool writes the
+      //    STANDING capabilities table, which resolveCapabilities reads
+      //    forever. A time-boxed action that writes permanent authority
+      //    converts duration into a voluntary property: approve 15 minutes of
+      //    manage_access, keep squad admin. The previous code skipped the
+      //    ceiling here entirely, reasoning — correctly but insufficiently —
+      //    that hasElevatedAction has already re-derived the APPROVER's live
+      //    'admin' on this scope, so the grant is never above what the approver
+      //    holds. That argues the grant is not too HIGH. It never argues it is
+      //    not too LONG, which is the whole point of the feature.
+      //
+      //    So an elevated caller may confer at most 'member': enough to add an
+      //    agent to a squad it is standing up, never enough to hand out the
+      //    rank that mints more authority. An approver who genuinely wants a
+      //    standing lead/admin still has their own standing authority to do it
+      //    with, deliberately and permanently, which is the honest way to
+      //    express a permanent decision.
+      if (capabilityRank(capability as Capability) > capabilityRank('member')) {
+        return fail(
+          403,
+          'elevation_capability_ceiling',
+          "an elevated session may grant at most 'member' — a standing lead/admin outlives the elevation and must be granted by standing authority",
+        )
+      }
+    } else if (!callerCanGrantAgentCapability(grants, squad, capability)) {
       return fail(403, 'cannot_grant_above_own_rank')
     }
 

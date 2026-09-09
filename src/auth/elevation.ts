@@ -41,6 +41,7 @@ import {
   SENSITIVE_STEP_UP_ACTIONS,
   elevationActionEffect,
   isKnownElevationAction,
+  isRequestableElevationAction,
   isValidElevationDuration,
 } from './elevation-actions'
 import { assertBatchWritten } from '../lib/receipt'
@@ -138,6 +139,17 @@ export async function createElevationRequest(
   for (const action of uniqueActions) {
     if (!isKnownElevationAction(action)) {
       return { ok: false, reason: 'invalid_elevation_request', detail: `unknown action "${action}"` }
+    }
+    // Refuse at REQUEST time, not silently at use time. An action nothing
+    // consults would otherwise be approved by a human, rendered as a live grant
+    // with a countdown, and authorize nothing — a promise the system cannot
+    // keep. Server-side because the tool's enum is only the client's copy.
+    if (!isRequestableElevationAction(action)) {
+      return {
+        ok: false,
+        reason: 'invalid_elevation_request',
+        detail: `"${action}" is defined but not yet enforced by any tool — it cannot be requested`,
+      }
     }
   }
   if (!['org', 'department', 'squad'].includes(input.scopeType)) {
@@ -297,6 +309,16 @@ export interface DecideElevationInput {
   /** Must be <= request.requested_duration_minutes and one of the presets. */
   durationMinutes?: number
   decidedByMemberId: string
+  /** TRUE when the approver holds org authority on the LEGACY ROLE plane
+   *  (auth.role 'owner'/'admin'). That plane is invisible to
+   *  resolveCapabilities, which is pure SQL over `capabilities` — so the org
+   *  owner, who characteristically has ZERO capability rows, resolves to []
+   *  and is refused by the grant check below. The caller passes isOrgAdmin(auth)
+   *  here so both authority planes reach this decision. Do NOT collapse this
+   *  into decidedByCapabilities by synthesizing a grant row: assigning
+   *  capabilities to a role-only owner is what DOWNGRADES them (see the
+   *  bridge in src/auth/index.ts). */
+  decidedByIsOrgAdmin?: boolean
   /** The approver's OWN live capability grants — caller resolves these
    *  fresh (resolveCapabilities) immediately before calling; never accept a
    *  cached/stale set here. */
@@ -382,6 +404,48 @@ export async function decideElevationRequest(
 
   const nowIso = new Date(nowMs).toISOString()
 
+  // ── authority, checked BEFORE either terminal decision ────────────────
+  //
+  // Approve and deny are two writes to the SAME authority ledger, and this
+  // check used to sit below the deny branch — so deny was reachable by any
+  // member with a login who learned a request id (the requesting agent knows
+  // its own). They could terminally kill any pending request and the ledger
+  // recorded them as the decider: an unauthorized write to an audit surface.
+  //
+  // Authority is evaluated against the REQUEST's own scope. Approve may narrow
+  // the action set, never the scope (enforced below), so the request's scope is
+  // the scope of both decisions.
+  const requestScopeDepartmentId = await resolveScopeDepartmentId(
+    env,
+    request.requested_scope_type as CapabilityScopeType,
+    request.requested_scope_id,
+  )
+  const decidedByHasAuthority =
+    input.decidedByIsOrgAdmin === true ||
+    hasCapability(
+      input.decidedByCapabilities,
+      request.requested_scope_type as CapabilityScopeType,
+      request.requested_scope_id || null,
+      'admin',
+      requestScopeDepartmentId,
+    )
+  if (!decidedByHasAuthority) {
+    return {
+      ok: false,
+      reason: 'forbidden',
+      need: 'admin',
+      scope: { type: request.requested_scope_type as CapabilityScopeType, id: request.requested_scope_id },
+    }
+  }
+
+  // A request is never its own approval. The requesting principal and the
+  // deciding principal are the same KIND of row here — an agent's identity is a
+  // members row, so "a human approved this" would otherwise degrade to "the
+  // principal that asked, approved" wherever those coincide.
+  if (input.decidedByMemberId === request.member_id) {
+    return { ok: false, reason: 'forbidden', need: 'admin', scope: { type: request.requested_scope_type as CapabilityScopeType, id: request.requested_scope_id } }
+  }
+
   if (input.decision === 'deny') {
     const result = await env.DB.prepare(
       `UPDATE elevation_requests
@@ -419,8 +483,15 @@ export async function decideElevationRequest(
     return { ok: false, reason: 'invalid_elevation_request', detail: 'invalid or widened duration_minutes' }
   }
 
+  // scopeType/scopeId are already proven identical to the request's own scope
+  // above, so this re-check is over the same scope the hoisted gate cleared. It
+  // stays as defence in depth and must honour the SAME two planes, or an owner
+  // clears the first gate and is refused by the second.
   const squadDepartmentId = await resolveScopeDepartmentId(env, scopeType, scopeId)
-  if (!hasCapability(input.decidedByCapabilities, scopeType, scopeId || null, 'admin', squadDepartmentId)) {
+  if (
+    input.decidedByIsOrgAdmin !== true &&
+    !hasCapability(input.decidedByCapabilities, scopeType, scopeId || null, 'admin', squadDepartmentId)
+  ) {
     return { ok: false, reason: 'forbidden', need: 'admin', scope: { type: scopeType, id: scopeId } }
   }
 

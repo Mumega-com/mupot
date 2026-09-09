@@ -52,6 +52,19 @@ export interface ElevationActionDef {
    *  next to the effect badge so "irreversible" is never just an unglossed
    *  word on a click-through screen. */
   effectNote: string
+  /** TRUE when at least one tool actually CONSULTS this action.
+   *
+   *  Six of these eight shipped as vocabulary with no consumer: a human could
+   *  approve action:deploy, watch it render on the dashboard with a live
+   *  countdown and an effect badge, and it authorized nothing. A defined
+   *  action with no enforcement branch is a FALSE-AUTHORITY surface — worse
+   *  than a missing feature, because the approval screen makes a promise the
+   *  system never keeps, and the operator believes a decision was made.
+   *
+   *  Only enforced actions are requestable (REQUESTABLE_ELEVATION_ACTION_KEYS).
+   *  Flip this to true in the same commit that wires the consumer, never
+   *  before; tests/elevation-actions-enforced.test.ts fails either way round. */
+  enforced: boolean
 }
 
 // Design doc "Authorization Semantics" names the first five presets
@@ -61,6 +74,7 @@ export interface ElevationActionDef {
 export const ELEVATION_ACTIONS: Readonly<Record<string, ElevationActionDef>> = Object.freeze({
   'action:manage_access': {
     key: 'action:manage_access',
+    enforced: true,
     label: 'Manage access',
     description: 'Grant/revoke capabilities, add/remove squad members, edit project↔squad access.',
     effect: 'reversible',
@@ -68,6 +82,7 @@ export const ELEVATION_ACTIONS: Readonly<Record<string, ElevationActionDef>> = O
   },
   'action:project_lifecycle': {
     key: 'action:project_lifecycle',
+    enforced: true,
     label: 'Create/update projects & squads',
     description: 'Create or update departments, squads, and projects.',
     effect: 'reversible',
@@ -75,6 +90,7 @@ export const ELEVATION_ACTIONS: Readonly<Record<string, ElevationActionDef>> = O
   },
   'action:mint_token': {
     key: 'action:mint_token',
+    enforced: true,
     label: 'Mint agent token',
     description: 'Issue a new bound bearer credential for an agent.',
     effect: 'revocable_if_recorded',
@@ -83,6 +99,7 @@ export const ELEVATION_ACTIONS: Readonly<Record<string, ElevationActionDef>> = O
   },
   'action:register_key': {
     key: 'action:register_key',
+    enforced: false,
     label: 'Register agent signing key',
     description: 'Register a public Ed25519 key for an agent\'s signed runtime identity.',
     effect: 'irreversible',
@@ -91,6 +108,7 @@ export const ELEVATION_ACTIONS: Readonly<Record<string, ElevationActionDef>> = O
   },
   'action:deploy': {
     key: 'action:deploy',
+    enforced: false,
     label: 'Deploy',
     description: 'Trigger a project deploy.',
     effect: 'reversible',
@@ -98,6 +116,7 @@ export const ELEVATION_ACTIONS: Readonly<Record<string, ElevationActionDef>> = O
   },
   'action:migrate': {
     key: 'action:migrate',
+    enforced: false,
     label: 'Apply migration',
     description: 'Apply a D1 schema migration.',
     effect: 'irreversible',
@@ -105,6 +124,7 @@ export const ELEVATION_ACTIONS: Readonly<Record<string, ElevationActionDef>> = O
   },
   'action:secrets': {
     key: 'action:secrets',
+    enforced: false,
     label: 'Manage secrets',
     description: 'Set or rotate a secret value.',
     effect: 'revocable_if_recorded',
@@ -112,6 +132,7 @@ export const ELEVATION_ACTIONS: Readonly<Record<string, ElevationActionDef>> = O
   },
   'action:dispatch': {
     key: 'action:dispatch',
+    enforced: false,
     label: 'Dispatch work',
     description: 'Dispatch a task/flight to a squad or agent.',
     effect: 'reversible',
@@ -130,6 +151,17 @@ export function elevationActionEffect(key: string): ElevationActionEffect | null
 }
 
 export const ALL_ELEVATION_ACTION_KEYS: readonly string[] = Object.freeze(Object.keys(ELEVATION_ACTIONS))
+
+/** The actions a request may actually name. An unenforced action is refused at
+ *  REQUEST time rather than granted and silently ignored at use time, so nobody
+ *  approves something decorative. */
+export const REQUESTABLE_ELEVATION_ACTION_KEYS: readonly string[] = Object.freeze(
+  Object.keys(ELEVATION_ACTIONS).filter((k) => ELEVATION_ACTIONS[k].enforced),
+)
+
+export function isRequestableElevationAction(key: string): boolean {
+  return isKnownElevationAction(key) && ELEVATION_ACTIONS[key].enforced
+}
 
 // 1446 minutes (~24.1 hours) is Hadi's own explicit duration — asked for
 // twice, verbatim "time limited 1446" (mupot task f5fe1222). It is not a
