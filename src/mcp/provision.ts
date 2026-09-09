@@ -974,7 +974,7 @@ const toolRevokeAgentToken: ToolSpec = {
     // must also retire the agent_sessions row keyed to THIS SAME credential,
     // or a live-looking session survives the death of the token that backed
     // it. Best-effort/self-guarding (revokeAgentSessionByCredentialSafe): this
-    // tool must keep working unmodified against a tenant where migration 0141
+    // tool must keep working unmodified against a tenant where migration 0147
     // has not been applied yet.
     const sessionAuthKind = deriveAgentAuthKind(row.channel)
     if (sessionAuthKind) {
@@ -2013,7 +2013,7 @@ const toolDeactivateAgent: ToolSpec = {
     // an active runtime identity even after the credential backing it is
     // dead. Deliberately OUTSIDE the batch above (not statement [6]): the
     // four existing writes must keep succeeding byte-for-byte unmodified in a
-    // tenant where migration 0141 has not been applied yet — a table-missing
+    // tenant where migration 0147 has not been applied yet — a table-missing
     // error inside env.DB.batch would fail the WHOLE batch atomically and
     // break a currently-shipped tool. revokeAllAgentSessionsForAgent
     // self-guards that exact case (see src/auth/agent-sessions.ts).

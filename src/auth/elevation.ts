@@ -5,7 +5,7 @@
 // Design: docs/superpowers/specs/2026-09-01-human-approved-session-bound-agent-
 // elevation-design.md, "Elevation Data Model" / "Approval Flow" /
 // "Authorization Semantics". Deviations from that doc are recorded at the
-// top of migrations/0142_elevation_ledger.sql (no rank grants — action-only;
+// top of migrations/0148_elevation_ledger.sql (no rank grants — action-only;
 // scope_type matches the real CapabilityScopeType enum; effect + usage log
 // added).
 //
@@ -23,7 +23,7 @@
 // that "expiry forgot to touch."
 //
 // EVERY function that reads "now" takes it as an explicit parameter (default
-// Date.now()) — the same house rule migrations 0140/0141's modules follow.
+// Date.now()) — the same house rule migrations 0144/0147's modules follow.
 
 import type { AuthContext, CapabilityGrant, CapabilityScopeType, Env } from '../types'
 import { hasCapability, resolveCapabilities } from './capability'

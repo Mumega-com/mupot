@@ -13,7 +13,7 @@
 // effect outlives the grant." This is the canonical map. It is a static,
 // reviewed registry — NOT computed from a live table — because the whole
 // point is that a human sees a value that cannot silently drift out from
-// under an already-issued grant (see migrations/0142_elevation_ledger.sql's
+// under an already-issued grant (see migrations/0148_elevation_ledger.sql's
 // `effect` column, which freezes a COPY of this classification at grant
 // time).
 //

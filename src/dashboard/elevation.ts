@@ -60,7 +60,7 @@
 // THE FROZEN EFFECT (the single most important rendering rule in this
 // module): elevation_grants.effect is a COPY of the action's
 // reversible/revocable_if_recorded/irreversible classification taken at
-// GRANT time (migration 0142's header comment, decideElevationRequest in
+// GRANT time (migration 0148's header comment, decideElevationRequest in
 // ../auth/elevation.ts). The live-grants view renders `grant.effect` — the
 // frozen column — and NEVER calls elevationActionEffect()/reads
 // ELEVATION_ACTIONS[action].effect for an already-granted row. A future edit

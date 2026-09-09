@@ -1035,7 +1035,7 @@ export async function markAgentTokenReplacementAuditSent(
  * analogue in this codebase (an OAuth session's continuity is instead
  * proven-or-not by refresh, per the design doc's "Agent runtime session").
  * Best-effort/self-guarding (revokeAgentSessionByCredentialSafe): this
- * function must keep working unmodified in a tenant where migration 0141
+ * function must keep working unmodified in a tenant where migration 0147
  * (agent_sessions) has not been applied yet, exactly like every other
  * agent_sessions call site added in step 2.
  */

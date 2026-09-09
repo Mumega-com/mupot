@@ -1,10 +1,10 @@
--- 0142_elevation_ledger.sql — the elevation ledger: request, grant, and usage
+-- 0148_elevation_ledger.sql — the elevation ledger: request, grant, and usage
 -- log tables for Delivery Sequence step 3 (session-bound agent elevation).
 --
 -- Design: docs/superpowers/specs/2026-09-01-human-approved-session-bound-agent-
 -- elevation-design.md, "Elevation Data Model". mupot task f5fe1222, GitHub
 -- mumega-com#1173. NOT applied by this build — branch/schema only, exactly
--- like migrations 0139-0141 before it; a human applies it separately.
+-- like migrations 0143/0144/0147 before it; a human applies it separately.
 --
 -- DEVIATION FROM THE DESIGN DOC'S SCHEMA (recorded here, not silently):
 --   1. grant_type is DROPPED. The design's agent_session_grants table allowed
@@ -41,7 +41,7 @@
 --
 -- Every clock read in src/auth/elevation.ts is an explicit injectable
 -- parameter (never Date.now() read internally by a loader) — the same house
--- rule migrations 0140/0141's modules follow, and the one a controlled-clock
+-- rule migrations 0144/0147's modules follow, and the one a controlled-clock
 -- adversarial expiry test depends on.
 
 CREATE TABLE IF NOT EXISTS elevation_requests (
@@ -83,7 +83,7 @@ CREATE INDEX IF NOT EXISTS idx_elevation_requests_session
 -- FOREIGN KEY itself still cascades (a deleted session cannot leave an
 -- orphaned live grant), but the ordinary lifecycle path is REVOCATION
 -- (revoked_at), never a DELETE; nothing in this codebase deletes
--- agent_sessions rows today (see migration 0141's comment: retire, never
+-- agent_sessions rows today (see migration 0147's comment: retire, never
 -- delete). expires_at is fixed at grant time and NEVER extended by anything
 -- that touches agent_sessions (no idle ceiling here) — see the constraint-2
 -- adversarial test in tests/elevation.test.ts.

@@ -3882,7 +3882,7 @@ const toolCheckIn: ToolSpec = {
     // (getOrCreateAgentSession self-coalesces its own writes to 5 minutes —
     // see src/auth/agent-sessions.ts touchAgentSession). A pure human/
     // operator principal (auth.boundAgentId unset) or a not-yet-applied
-    // migration 0141 both resolve to `null` here — never a thrown error, so
+    // migration 0147 both resolve to `null` here — never a thrown error, so
     // check_in keeps working unmodified in either case (see
     // resolveAgentSessionContext's 'not_agent_session' and
     // getOrCreateAgentSession's missing-table guard).

@@ -375,9 +375,9 @@ describe('agent-session registry (D1, real migration chain)', () => {
     })
   })
 
-  // ── missing-table graceful degradation (migration 0141 not applied yet) ──
+  // ── missing-table graceful degradation (migration 0147 not applied yet) ──
 
-  describe('when migration 0141 has not been applied yet', () => {
+  describe('when migration 0147 has not been applied yet', () => {
     let preMigrationHarness: SqliteD1Harness
     let preMigrationEnv: Env
 
@@ -388,7 +388,7 @@ describe('agent-session registry (D1, real migration chain)', () => {
       // is exactly the "branch merged, migration not yet applied" scenario
       // this task's boundary describes. Never a hand-written schema.
       for (const file of migrationFiles()) {
-        if (file === '0141_agent_sessions.sql') continue
+        if (file === '0147_agent_sessions.sql') continue
         preMigrationHarness.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
       }
       preMigrationEnv = { TENANT_SLUG: TENANT, DB: preMigrationHarness.db } as unknown as Env

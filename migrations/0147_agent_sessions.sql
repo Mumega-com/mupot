@@ -1,4 +1,4 @@
--- 0141_agent_sessions.sql — the queryable, listable, revocable runtime-session
+-- 0147_agent_sessions.sql — the queryable, listable, revocable runtime-session
 -- registry for an AGENT's authenticated connection, mirroring migration
 -- 0140_web_sessions.sql's registry for a HUMAN's.
 --

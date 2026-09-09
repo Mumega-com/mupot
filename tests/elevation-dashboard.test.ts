@@ -432,7 +432,7 @@ describe('elevation dashboard screens — integration through dashboardApp (real
     // the ledger write path already covered by step 3/4's own tests).
     const cookie = await devLogin(adminEnv)
     // decided_by_web_session_hash / approved_by_web_session_hash both carry a
-    // REFERENCES web_sessions(id_hash) FK (migration 0142) — use the REAL row
+    // REFERENCES web_sessions(id_hash) FK (migration 0148) — use the REAL row
     // dev-login just created rather than a fabricated hash.
     const webSessionRow = await adminEnv.DB.prepare(`SELECT id_hash FROM web_sessions WHERE tenant = ?1 AND member_id = ?2 LIMIT 1`)
       .bind(TENANT, ADMIN_MEMBER)

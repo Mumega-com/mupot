@@ -15,7 +15,7 @@
 // revocable row — the same shape web_sessions already gave a human login.
 //
 // credential_id is NOT a raw secret and is deliberately NOT hashed the way
-// web_sessions.id_hash is. See migrations/0141_agent_sessions.sql's comment
+// web_sessions.id_hash is. See migrations/0147_agent_sessions.sql's comment
 // for the full reasoning: it is auth.tokenId, the live member_tokens.id this
 // codebase already re-validates on every request (src/mcp/index.ts
 // authenticateMember, src/mcp/oauth-authorize.ts buildAuthContext) — never a
@@ -55,7 +55,7 @@ export interface AgentSessionRecord {
 
 /**
  * isMissingTableError — true iff `err` is exactly "agent_sessions does not
- * exist yet". Migration 0141 (this module's table) is deliberately NOT
+ * exist yet". Migration 0147 (this module's table) is deliberately NOT
  * applied by this build — see the task's boundary: schema and code ship on a
  * branch, a human applies the migration separately. Every function on the hot
  * request path (check_in, and anything reusing getOrCreateAgentSession)
@@ -446,7 +446,7 @@ export async function revokeAgentSessionByCredential(
  *  must actually reach this table too, not just agents.status/member_tokens/
  *  fleet_agents/agent_keys). Self-guarding: deactivate_agent is a live,
  *  currently-shipped tool and must keep working unmodified in an environment
- *  where migration 0141 has not been applied yet. */
+ *  where migration 0147 has not been applied yet. */
 export async function revokeAllAgentSessionsForAgent(
   env: Env,
   tenant: string,
