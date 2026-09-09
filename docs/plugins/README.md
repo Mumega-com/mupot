@@ -7,15 +7,25 @@ This tree: [`docs/plugins/`](.) on [`Mumega-com/mupot`](https://github.com/Mumeg
 
 Read like a wiki: start here, open one page. Do not print tokens. Token **paths** only.
 
+**Herdr seats:** start at [herdr-on-mupot](herdr-on-mupot.md), then the harness page.
+
 ## Map
 
 | Name | Kind | Status | Retrieve |
 |---|---|---|---|
+| [herdr-on-mupot](herdr-on-mupot.md) | Shared Herdr ↔ Mupot contract | **live** (hadi-mac) | this catalog |
 | [herdr-mupot-bridge](herdr-mupot-bridge.md) | Herdr plugin (poll) | **published** v0.1.0 · Mac install **disabled** | [Mumega-com/herdr-mupot-bridge](https://github.com/Mumega-com/herdr-mupot-bridge) |
 | [mupot-seatlink](mupot-seatlink.md) | Herdr plugin (events) | **live** v0.2.0 on hadi-mac · source local | `dara/designs/herdr-event-bus/plugin/mupot-seatlink` |
 | [mupot-plugin](mupot-hermes-plugin.md) | Hermes plugin | **published** v0.3 | [Mumega-com/mupot-plugin](https://github.com/Mumega-com/mupot-plugin) |
 | [mupot-claude-plugin](mupot-claude-plugin.md) | Claude Code plugin | **published** | [Mumega-com/mupot-claude-plugin](https://github.com/Mumega-com/mupot-claude-plugin) |
 | [grok-herdr-mupot](grok-herdr-mupot.md) | Grok Build skill + MCP weld | **live** on hadi-mac | `~/.grok/skills/grok-herdr-mupot` (this catalog mirrors the wiki page) |
+| [codex-herdr-mupot](codex-herdr-mupot.md) | Codex CLI skill + MCP weld | **live** on hadi-mac | `~/.codex/skills/codex-herdr-mupot` (this catalog mirrors the wiki page) |
+| [hermes-herdr-mupot](hermes-herdr-mupot.md) | Hermes skill + MCP weld | **live** on hadi-mac · weld **split** (see page) | `~/.hermes/skills/hermes-herdr-mupot` |
+| [muvps-hermes-mupot](muvps-hermes-mupot.md) | VPS Hermes → Mupot | **live** on Hetzner Herdr `muvps_hermes` · not Mac Herdr · SOS-only MCP · dual-run `870a5024` | `~/.hermes/skills/muvps-hermes-mupot` |
+| [cursor-herdr-mupot](cursor-herdr-mupot.md) | Cursor CLI on Herdr | **live** on hadi-mac · baked bearer in mcp.json | `~/.cursor/skills/cursor-herdr-mupot` |
+| [opencode-herdr-mupot](opencode-herdr-mupot.md) | OpenCode on Herdr | **live** · second consumer (inbox-watch.sh) | `hadi-opencode/skills/opencode-herdr-mupot` |
+| [pi-herdr-mupot](pi-herdr-mupot.md) | Pi CLI on Herdr | **live** · token-from-file | `hadi-pi/skills/pi-herdr-mupot` |
+| [river-herdr-mupot](river-herdr-mupot.md) | River Agy on Herdr | **live** Mac body · SOS leftover in .mcp.json | `hadi-river/skills/river-herdr-mupot` |
 | [cursor-mupot-pager](cursor-mupot-pager.md) | Slack broker for Cursor Cloud | **live** (hadi-grok-desktop) | `dara/.grok/skills/cursor-mupot-pager` |
 | [prime-mupot-experience](prime-mupot-experience.md) | Prime-agent skill + bridges | **published** | [Mumega-com/prime-mupot-experience](https://github.com/Mumega-com/prime-mupot-experience) |
 
@@ -24,7 +34,7 @@ Read like a wiki: start here, open one page. Do not print tokens. Token **paths*
 ```
 Herdr          hands — panes, names, agent prompt
 Mupot          papers — UUID, seq, capability, inbox/send
-Harness weld   how that body authenticates (Grok / Claude / Hermes / Prime / Cursor)
+Harness weld   how that body authenticates (Grok / Codex / Claude / Hermes / Prime / Cursor)
 ```
 
 Herdr is local dispatch. Mupot is cross-machine mail. A plugin that polls every 5s and a plugin that subscribes to Herdr events are **different** — both talk to the pot.
