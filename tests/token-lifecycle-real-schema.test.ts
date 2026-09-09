@@ -314,7 +314,7 @@ describe('every bearer door consumes the shared predicate', () => {
     { fingerprint: '87a0ace21487', why: 'keys page: lists a tenant preset-labelled keys. Display only.' },
     { fingerprint: '021f1001e123', why: 'label read for seat naming (agents/inbox-seat.ts and mcp/index.ts share this query). Runs on an ALREADY authenticated session and only narrows it; it cannot grant.' },
     { fingerprint: '5531526a4ea7', why: 'list_agent_tokens — inventory. Must show expired rows or they become unlistable.' },
-    { fingerprint: '19c7bbd261b4', why: 'revoke_agent_token ownership lookup — SELECTs revoked_at for the caller to judge. Revoking an already-expired token must stay possible.' },
+    { fingerprint: 'bc19cd43e6b7', why: 'revoke_agent_token ownership lookup — SELECTs revoked_at for the caller to judge. Revoking an already-expired token must stay possible. Also selects channel, so the revoke can retire the agent_sessions row keyed to the same credential; still grants nothing.' },
     { fingerprint: '55c5b8ae2ab0', why: 'agent-connection status read — returns revoked_at for display. Grants nothing.' },
     { fingerprint: 'c5f8c11a05f4', why: 'credential REPLACE target. Reached only after authorize() has required admin on the home squad; the new credential a grants come from the request and are ceilinged against the ACTOR, never inherited from this row. Replacing an expired token is legitimate recovery.' },
     { fingerprint: '768c3883fe85', why: 'members service: token inventory listing. Display only.' },
