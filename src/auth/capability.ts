@@ -217,6 +217,58 @@ export async function canOnSquad(
   return hasCapability(grants, 'squad', squadId, min, deptId)
 }
 
+/**
+ * canOnSquadAuth — the squad check that sees BOTH authority planes.
+ *
+ * canOnSquad above takes `grants` and never `auth`, so it is blind to the
+ * LEGACY ROLE plane. Org-owner authority lives on that plane, and the auth
+ * bridge deliberately leaves `auth.capabilities` UNDEFINED for an owner/admin
+ * (assigning [] is what downgrades them, see src/auth/index.ts). Every caller
+ * written as `canOnSquad(env, auth.capabilities ?? [], ...)` therefore
+ * materialises an EMPTY grant list for precisely the principal with the most
+ * authority in the pot, and refuses them.
+ *
+ * Measured 2026-09-09 on prod 04586ef8: the org owner opens /enroll, the picker
+ * lists his agents (that path passes isOrgAdmin(auth) — mupot#1351), and the
+ * mint on the same page returns squad_admin_required. Visible seat, refused
+ * mint, and no amount of additional authority fixes it because none of it is
+ * visible to the check.
+ *
+ * BOTH doors that mint an agent credential had this, identically:
+ *   src/mcp/provision.ts   mint_agent_token   memberCanOnSquad -> canOnSquad
+ *   src/dashboard/enroll.ts authorizeEnrollMint                 canOnSquad
+ *
+ * That is why the fix is HERE and both call sites consume it, rather than a
+ * patch to the dashboard route. src/dashboard/enroll.ts:128-136 records
+ * Athena's ruling on PR #1254 verbatim: enroll matches the MCP primitive, and
+ * "if the intended policy is in fact org admin everywhere, the fix is to raise
+ * mint_agent_token — the primitive — and let both dashboard routes inherit it.
+ * Do not raise this route alone." Fixing enroll alone would have re-created the
+ * divergence in the other direction and left the tool as the soft path.
+ *
+ * This is NOT a widening of the bar. The bar is unchanged — admin on the squad,
+ * with org and department scopes inheriting exactly as hasCapability already
+ * allows. It only stops the check from being blind to one of the two places
+ * that authority is recorded.
+ */
+export async function canOnSquadAuth(
+  env: Env,
+  auth: AuthContext | null | undefined,
+  squadId: string,
+  min: Capability,
+): Promise<boolean> {
+  // The legacy ROLE plane, asked at the caller's OWN `min` — not at isOrgAdmin's
+  // fixed admin-rank question. isOrgAdmin answers "is this an org admin?"; that is
+  // the right question for the two call sites here (both pass 'admin'), but it
+  // ignores `min`, so a future caller asking for 'owner' would have been satisfied
+  // by a rank-4 admin. A rank ceiling has to guard the TARGET, not just the grant.
+  if (auth && legacyRoleSatisfies(auth.role, min)) return true
+  // The modern ORG-GRANT plane needs no separate limb: hasCapability's org branch
+  // already matches an org-scope grant at `min` for a squad question, so canOnSquad
+  // covers it — at the caller's min, with department inheritance intact.
+  return canOnSquad(env, auth?.capabilities ?? [], squadId, min)
+}
+
 // ── middleware ──────────────────────────────────────────────────────────────────
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }

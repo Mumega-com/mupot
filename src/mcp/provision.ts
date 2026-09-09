@@ -96,6 +96,7 @@ import {
   done,
   str,
   memberCanOnSquad,
+  memberCanOnSquadAuth,
   hasWorkspaceAdmin,
 } from './index'
 import {
@@ -626,7 +627,14 @@ const toolMintAgentToken: ToolSpec = {
     // credential that IS an agent is an org-trust act → admin, never lead/member.
     const grants = auth.capabilities ?? []
     let elevatedGrant: ElevationGrantRecord | null = null
-    if (!(await memberCanOnSquad(env, grants, agent.squad_id, 'admin'))) {
+    // memberCanOnSquadAuth: the SAME bar, seeing both authority planes. The
+    // grants-only form refused an org owner outright — owner authority lives
+    // on auth.role, and `auth.capabilities ?? []` erases it. Raised here at the
+    // PRIMITIVE so the dashboard enroll route inherits the repair, per the
+    // ruling recorded in src/dashboard/enroll.ts:128-136. It is the STANDING
+    // authority question only: a principal who fails it still falls through to
+    // the elevation limb below, unchanged.
+    if (!(await memberCanOnSquadAuth(env, auth, agent.squad_id, 'admin'))) {
       if (!mayBeElevated) return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
       const squadDepartmentId = await resolveElevationSquadDepartmentId(env, 'squad', agent.squad_id)
       const elevated = await hasElevatedAction(env, auth, 'action:mint_token', 'squad', agent.squad_id, {
