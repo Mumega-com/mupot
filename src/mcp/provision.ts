@@ -26,7 +26,7 @@
 //   register_agent_key — admin on the agent's squad → public-only signed-runtime identity
 
 import type { Capability, CapabilityGrant, ConnectionChannel, Env, BusEvent, Squad } from '../types'
-import { hasCapability, isOrgAdmin, holdsCapabilityFloor } from '../auth/capability'
+import { capabilityRank, hasCapability, isOrgAdmin, holdsCapabilityFloor } from '../auth/capability'
 import {
   createDepartment,
   createSquad,
@@ -81,6 +81,14 @@ import { createBus } from '../bus'
 import { resolveDepartmentRef, resolveSquadRef, resolveAgentRef } from '../org/resolve'
 import { listAgentTokensQuery, revokeTokenOwnershipQuery } from './token-queries'
 import { isValidEd25519PublicX, registerAgentPublicKey } from '../fleet/agent-keys'
+import {
+  deriveAgentAuthKind,
+  evaluateAgentSession,
+  listAgentSessions,
+  revokeAgentSessionByCredentialSafe,
+  revokeAgentSessionById,
+  revokeAllAgentSessionsForAgent,
+} from '../auth/agent-sessions'
 import { assertWritten, rowsWritten } from '../lib/receipt'
 import {
   type ToolSpec,
@@ -90,6 +98,14 @@ import {
   memberCanOnSquad,
   hasWorkspaceAdmin,
 } from './index'
+import {
+  hasElevatedAction,
+  boundAgentHasAnyLiveGrantForAction,
+  resolveScopeDepartmentId as resolveElevationSquadDepartmentId,
+  elevationRemedyMessage,
+  recordElevationUsage,
+  type ElevationGrantRecord,
+} from '../auth/elevation'
 
 const STRING_SCHEMA = { type: 'string' }
 const OPTIONAL_NUMBER_SCHEMA = { type: 'number' }
@@ -129,7 +145,8 @@ async function emitProvisioned(
     | 'agent_updated'
     | 'squad_updated'
     | 'membership'
-    | 'membership_removed',
+    | 'membership_removed'
+    | 'agent_session_revoked',
   id: string,
   extra: {
     squad_id?: string
@@ -286,7 +303,20 @@ const toolCreateDepartment: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    // Gate: org admin (a department is org-structure; only org-admin creates one).
+    // Gate: org admin. NO elevation path, deliberately.
+    //
+    // An earlier revision wired action:project_lifecycle here. It was wrong, and
+    // an adversarial pass measured why: project_create is workspace-gated, so
+    // that action must be granted at ORG scope to authorize a project at all —
+    // and hasElevatedAction treats an org-scoped grant as covering every scope.
+    // So the one grant that let a squad lead make its own project ALSO let it
+    // create departments org-wide, and squads inside departments it has nothing
+    // to do with. Against "make their own agents and project, nothing outside of
+    // it", creating org structure is outside of it.
+    //
+    // A department is org-structure and stays an org-admin act. Squad creation
+    // keeps its elevation path, because that one is DEPARTMENT-scoped and so is
+    // actually bounded to the department the approver named.
     const grants = auth.capabilities ?? []
     if (!hasCapability(grants, 'org', null, 'admin')) {
       return fail(403, 'forbidden', { need: 'admin', scope: 'org' })
@@ -332,10 +362,25 @@ const toolCreateSquad: ToolSpec = {
     if (!deptResult.ok) return resolveFail(deptResult.reason, 'department_not_found')
     const dept = deptResult.value
 
-    // Gate: admin on the department (an org-admin grant inherits to every scope).
+    // Gate: admin on the department (an org-admin grant inherits to every scope),
+    // OR a live action:project_lifecycle elevation on that department. This is
+    // the "stand up your own squad" path: a squad lead who has been approved for
+    // project_lifecycle on its department may create a squad there for a bounded
+    // window, without being handed standing department admin.
     const grants = auth.capabilities ?? []
     if (!hasCapability(grants, 'department', dept.id, 'admin')) {
-      return fail(403, 'forbidden', { need: 'admin', scope: 'department' })
+      const elevated = await hasElevatedAction(env, auth, 'action:project_lifecycle', 'department', dept.id, {
+        toolName: 'create_squad',
+        detail: { department_id: dept.id, slug: args.slug },
+      })
+      if (!elevated.granted) {
+        return fail(403, 'forbidden', {
+          need: 'admin',
+          scope: 'department',
+          elevation_denied: elevated.reason,
+          remedy: elevationRemedyMessage(elevated.reason),
+        })
+      }
     }
 
     const result = await createSquad(env, dept.id, {
@@ -538,7 +583,23 @@ const toolMintAgentToken: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args, _ctx) {
-    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
+    // Elevation collapse gate (step 4, mumega-com#1173 "authorization
+    // convergence"): a bound-agent session holding ZERO live elevation
+    // grants for action:mint_token gets the EXACT SAME unconditional
+    // operator_principal_required refusal as before this step, at the exact
+    // same point — before `agent` or any other arg is even read. That is the
+    // collapse that stops a stranger from using this tool's error shape to
+    // probe agent existence (Security Invariant: "wrong tenant: not found,
+    // never a cross-tenant existence oracle" — same asymmetry). A session
+    // that DOES hold some live grant for this action is no longer a
+    // stranger to it — a human already vetted this exact session for this
+    // exact action — so it proceeds to a scope-specific check below, once
+    // the target agent (and therefore its squad) is known.
+    let mayBeElevated = false
+    if (auth.boundAgentId) {
+      mayBeElevated = await boundAgentHasAnyLiveGrantForAction(env, auth, 'action:mint_token')
+      if (!mayBeElevated) return fail(403, 'operator_principal_required')
+    }
     const agentRef = str(args.agent)
     if (!agentRef) return fail(400, 'invalid_args', 'agent required')
 
@@ -547,7 +608,9 @@ const toolMintAgentToken: ToolSpec = {
     // Rotation is an org credential-authority act. This server-derived gate is
     // deliberately before agent resolution and every token/handoff lookup so a
     // scoped admin receives one uniform denial for existing, missing, and
-    // ambiguous targets.
+    // ambiguous targets. Elevation does NOT substitute here — action:mint_token
+    // authorizes ordinary minting only; revoking the prior credential mid-batch
+    // is a heavier org-trust act this step deliberately leaves standing-admin-only.
     if (replacementSupplied && !isOrgAdmin(auth)) {
       return fail(403, 'forbidden', { need: 'admin', scope: 'org' })
     }
@@ -562,8 +625,24 @@ const toolMintAgentToken: ToolSpec = {
     // Gate: admin on the agent's squad (org/department admin inherit). Minting a
     // credential that IS an agent is an org-trust act → admin, never lead/member.
     const grants = auth.capabilities ?? []
+    let elevatedGrant: ElevationGrantRecord | null = null
     if (!(await memberCanOnSquad(env, grants, agent.squad_id, 'admin'))) {
-      return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
+      if (!mayBeElevated) return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
+      const squadDepartmentId = await resolveElevationSquadDepartmentId(env, 'squad', agent.squad_id)
+      const elevated = await hasElevatedAction(env, auth, 'action:mint_token', 'squad', agent.squad_id, {
+        squadDepartmentId,
+        toolName: 'mint_agent_token',
+        detail: { agent_id: agent.id, squad_id: agent.squad_id, rotation: Boolean(rotatePriorTokenId) },
+      })
+      if (!elevated.granted) {
+        return fail(403, 'forbidden', {
+          need: 'admin',
+          scope: 'squad',
+          elevation_denied: elevated.reason,
+          remedy: elevationRemedyMessage(elevated.reason),
+        })
+      }
+      elevatedGrant = elevated.grant
     }
 
     // Cap the label length (parity with the HTTP mint path, members/index.ts) — a
@@ -758,6 +837,28 @@ const toolMintAgentToken: ToolSpec = {
       reason: expiresAt ? `expires_at:${expiresAt}` : 'non_expiring:immortal',
     })
 
+    // action:mint_token's effect is classified 'revocable_if_recorded'
+    // (elevation-actions.ts): the minted token is revocable via
+    // revoke_agent_token ONLY if the usage log names its id — the
+    // authorization-time log entry written inside hasElevatedAction above
+    // could not yet contain it (the token did not exist then). This SECOND,
+    // itemized entry closes that gap. It is deliberately NOT wrapped in
+    // try/catch: a failure here must fail the tool call even though the
+    // mint already committed, rather than report success with an elevation
+    // usage trail that cannot name what was minted.
+    if (elevatedGrant) {
+      await recordElevationUsage(
+        env,
+        auth.tenant,
+        elevatedGrant.id,
+        elevatedGrant.agent_session_id,
+        'action:mint_token',
+        'mint_agent_token',
+        { minted_token_id: minted.tokenId, agent_id: agent.id, squad_id: agent.squad_id },
+        Date.now(),
+      )
+    }
+
     // SECURITY (mupot#987): the raw token NEVER appears in this tool result. Every
     // MCP client that persists a conversation (all of them) writes the tool result
     // verbatim to a transcript file — a `raw` field here, however it was named or
@@ -886,7 +987,7 @@ const toolRevokeAgentToken: ToolSpec = {
       revokeTokenOwnershipQuery(),
     )
       .bind(tokenId, env.TENANT_SLUG)
-      .first<{ id: string; member_id: string; agent_id: string | null; label: string; revoked_at: string | null }>()
+      .first<{ id: string; member_id: string; agent_id: string | null; label: string; channel: ConnectionChannel; revoked_at: string | null }>()
 
     if (!row || row.agent_id !== agent.id) {
       // Same 404 whether the token is absent or belongs elsewhere — do not turn this
@@ -896,6 +997,17 @@ const toolRevokeAgentToken: ToolSpec = {
 
     // Idempotent: revoking an already-revoked token succeeds and reports revoked:false.
     const revoked = await revokeMemberToken(env, row.member_id, tokenId)
+
+    // Delivery Sequence step 2 (mumega-com#1173) — fact 3: a credential revoke
+    // must also retire the agent_sessions row keyed to THIS SAME credential,
+    // or a live-looking session survives the death of the token that backed
+    // it. Best-effort/self-guarding (revokeAgentSessionByCredentialSafe): this
+    // tool must keep working unmodified against a tenant where migration 0147
+    // has not been applied yet.
+    const sessionAuthKind = deriveAgentAuthKind(row.channel)
+    if (sessionAuthKind) {
+      await revokeAgentSessionByCredentialSafe(env, env.TENANT_SLUG, sessionAuthKind, tokenId, 'token_revoked')
+    }
 
     await emitProvisioned(env, auth.memberId as string, 'token_revoked', tokenId, {
       squad_id: agent.squad_id,
@@ -910,6 +1022,109 @@ const toolRevokeAgentToken: ToolSpec = {
       note: revoked
         ? 'Token revoked. It fails authentication immediately — grants are re-resolved per request.'
         : 'Token was already revoked; no change.',
+    })
+  },
+}
+
+// mupot task f5fe1222 / mumega-com#1173, Delivery Sequence step 2 — the
+// human-facing half of "listable, independently expirable, revocable by the
+// human and by the agent itself" for agent_sessions. Gated IDENTICALLY to
+// list_agent_tokens/revoke_agent_token above (admin on the agent's squad,
+// operator-principal only) — an agent session is a runtime-identity record
+// about a credential, same trust tier as the credential-listing tools it
+// sits beside. See end_agent_session (src/mcp/index.ts) for the AGENT's own
+// self-service half — that tool is gated the OPPOSITE way (bound-agent only,
+// and can only ever target its own exact current session, never one it
+// names), so the two surfaces never overlap in what they can reach.
+
+const toolListAgentSessions: ToolSpec = {
+  name: 'list_agent_sessions',
+  scope: "agent's squad",
+  min: 'admin',
+  args: '{ agent: string (id|slug) }',
+  inputSchema: {
+    type: 'object',
+    properties: { agent: STRING_SCHEMA },
+    required: ['agent'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args, _ctx) {
+    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
+    const agentRef = str(args.agent)
+    if (!agentRef) return fail(400, 'invalid_args', 'agent required')
+
+    const agentResult = await resolveAgentRef(env, agentRef)
+    if (!agentResult.ok) return resolveFail(agentResult.reason, 'agent_not_found')
+    const agent = agentResult.value
+
+    const grants = auth.capabilities ?? []
+    if (!(await memberCanOnSquad(env, grants, agent.squad_id, 'admin'))) {
+      return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
+    }
+
+    const rows = await listAgentSessions(env, env.TENANT_SLUG, agent.id)
+    const sessions = rows.map((row) => ({
+      id: row.id,
+      auth_kind: row.auth_kind,
+      seat: row.seat,
+      created_at: row.created_at,
+      last_seen_at: row.last_seen_at,
+      idle_expires_at: row.idle_expires_at,
+      absolute_expires_at: row.absolute_expires_at,
+      revoked_at: row.revoked_at,
+      revoke_reason: row.revoke_reason,
+      live: evaluateAgentSession(row).ok,
+    }))
+    return done({
+      agent: { id: agent.id, slug: agent.slug, name: agent.name },
+      sessions,
+      live_count: sessions.filter((s) => s.live).length,
+    })
+  },
+}
+
+const toolRevokeAgentSession: ToolSpec = {
+  name: 'revoke_agent_session',
+  scope: "agent's squad",
+  min: 'admin',
+  args: '{ agent: string (id|slug), session_id: string }',
+  inputSchema: {
+    type: 'object',
+    properties: { agent: STRING_SCHEMA, session_id: STRING_SCHEMA },
+    required: ['agent', 'session_id'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args, _ctx) {
+    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
+    const agentRef = str(args.agent)
+    const sessionId = str(args.session_id)
+    if (!agentRef) return fail(400, 'invalid_args', 'agent required')
+    if (!sessionId) return fail(400, 'invalid_args', 'session_id required')
+
+    const agentResult = await resolveAgentRef(env, agentRef)
+    if (!agentResult.ok) return resolveFail(agentResult.reason, 'agent_not_found')
+    const agent = agentResult.value
+
+    const grants = auth.capabilities ?? []
+    if (!(await memberCanOnSquad(env, grants, agent.squad_id, 'admin'))) {
+      return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
+    }
+
+    // Ownership-scoped inside revokeAgentSessionById itself (tenant + agent_id
+    // + id) — a caller can never revoke a session that resolves to a
+    // different agent's row, regardless of what id it names. Idempotent:
+    // revoking an already-dead session succeeds and reports revoked:false.
+    const { revoked } = await revokeAgentSessionById(env, env.TENANT_SLUG, agent.id, sessionId, 'human_revoke')
+
+    await emitProvisioned(env, auth.memberId as string, 'agent_session_revoked', sessionId, {
+      squad_id: agent.squad_id,
+      agent_id: agent.id,
+    })
+
+    return done({
+      session: { id: sessionId, agent_id: agent.id },
+      revoked,
+      already_revoked: !revoked,
     })
   },
 }
@@ -1107,7 +1322,15 @@ const toolGrantAgentCapability: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
+    // Elevation collapse gate — see the identical pattern + rationale on
+    // mint_agent_token above (step 4, mumega-com#1173). A bound-agent
+    // session with ZERO live grants for action:manage_access gets the exact
+    // same unconditional refusal, before any arg is resolved.
+    let mayBeElevated = false
+    if (auth.boundAgentId) {
+      mayBeElevated = await boundAgentHasAnyLiveGrantForAction(env, auth, 'action:manage_access')
+      if (!mayBeElevated) return fail(403, 'operator_principal_required')
+    }
     const agentRef = str(args.agent)
     if (!agentRef) return fail(400, 'invalid_args', 'agent required')
     const squadRef = str(args.squad)
@@ -1127,16 +1350,130 @@ const toolGrantAgentCapability: ToolSpec = {
     const squad = squadResult.value
 
     const grants = auth.capabilities ?? []
+    let elevatedGrant: ElevationGrantRecord | null = null
     if (!(await memberCanOnSquad(env, grants, squad.id, 'admin'))) {
-      return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
+      if (!mayBeElevated) return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
+      const squadDepartmentId = await resolveElevationSquadDepartmentId(env, 'squad', squad.id)
+      const elevated = await hasElevatedAction(env, auth, 'action:manage_access', 'squad', squad.id, {
+        squadDepartmentId,
+        toolName: 'grant_agent_capability',
+        detail: { agent_id: agent.id, squad_id: squad.id, capability },
+      })
+      if (!elevated.granted) {
+        return fail(403, 'forbidden', {
+          need: 'admin',
+          scope: 'squad',
+          elevation_denied: elevated.reason,
+          remedy: elevationRemedyMessage(elevated.reason),
+        })
+      }
+      elevatedGrant = elevated.grant
     }
-    if (!callerCanGrantAgentCapability(grants, squad, capability)) {
+    // callerCanGrantAgentCapability enforces a rank ceiling against the
+    // caller's STANDING grants — meaningless for an elevated caller, whose
+    // `grants` may be empty. It is not skipped arbitrarily: hasElevatedAction
+    // above already re-derived that the APPROVING human currently holds
+    // 'admin' on this exact squad (or its department/org), and 'admin' is
+    // already the maximum value GRANTABLE_AGENT_CAPABILITIES allows (never
+    // 'owner') — so the ceiling the standing check exists to enforce is
+    // structurally already satisfied whenever elevatedGrant is set.
+    if (elevatedGrant) {
+      // ── the two things elevation does NOT buy ────────────────────────────
+      //
+      // 1. GRANTING YOURSELF. Nothing else here compares the target to the
+      //    caller, so an agent elevated for action:manage_access could name
+      //    ITSELF as the target. Measured before this guard: a 15-minute grant
+      //    produced a standing 'admin' row for the acting agent that survived
+      //    both revocation and expiry of the elevation.
+      if (auth.boundAgentId && agent.id === auth.boundAgentId) {
+        return fail(403, 'cannot_grant_to_self', 'an elevated session may not grant capabilities to its own agent')
+      }
+      // 2. CONFERRING AUTHORITY THAT OUTLIVES THE GRANT. This tool writes the
+      //    STANDING capabilities table, which resolveCapabilities reads
+      //    forever. A time-boxed action that writes permanent authority
+      //    converts duration into a voluntary property: approve 15 minutes of
+      //    manage_access, keep squad admin. The previous code skipped the
+      //    ceiling here entirely, reasoning — correctly but insufficiently —
+      //    that hasElevatedAction has already re-derived the APPROVER's live
+      //    'admin' on this scope, so the grant is never above what the approver
+      //    holds. That argues the grant is not too HIGH. It never argues it is
+      //    not too LONG, which is the whole point of the feature.
+      //
+      //    So an elevated caller may confer at most 'member': enough to add an
+      //    agent to a squad it is standing up, never enough to hand out the
+      //    rank that mints more authority. An approver who genuinely wants a
+      //    standing lead/admin still has their own standing authority to do it
+      //    with, deliberately and permanently, which is the honest way to
+      //    express a permanent decision.
+      if (capabilityRank(capability as Capability) > capabilityRank('member')) {
+        return fail(
+          403,
+          'elevation_capability_ceiling',
+          "an elevated session may grant at most 'member' — a standing lead/admin outlives the elevation and must be granted by standing authority",
+        )
+      }
+    } else if (!callerCanGrantAgentCapability(grants, squad, capability)) {
       return fail(403, 'cannot_grant_above_own_rank')
     }
 
     const binding = await resolveAgentMemberBinding(env, agent.id)
     if (binding.kind === 'unminted') {
       return fail(409, 'agent_identity_unminted', 'call mint_agent_token before granting capabilities')
+    }
+
+    // The THIRD axis of the elevation ceiling, checked here because it needs the
+    // target's member id, which only exists once the binding is resolved.
+    //
+    // READ BOTH PLANES. setAgentSquadAccess upserts TWO tables — `capabilities`
+    // AND `memberships` — and they are independent authorization planes, not
+    // mirrors of each other. memberships is AND-gated by
+    // requireFlightSpineSquadAuthority (src/flight-spine/objectives.ts:250) and
+    // read by src/agents/messages.ts for send/visibility.
+    //
+    // The first version of this guard read `capabilities` only, and an
+    // adversarial pass reproduced the attack straight through it: createAgent
+    // (src/org/service.ts:526) writes memberships='member' with NO capabilities
+    // row, so for the DEFAULT shape of every agent in the pot the SELECT
+    // returned undefined and the guard waved the call through. Measured with the
+    // guard fully in place: a 60-minute action:manage_access elevation moved a
+    // target from memberships 'lead' to 'observer', permanently.
+    //
+    // The repo already had the right answer and I read the wrong table anyway:
+    // src/members/squad-membership.ts:77 reads `memberships` for exactly this
+    // check, and its comment at :243 says "#1171: read prior from memberships,
+    // not capabilities" — because `capabilities` cannot represent 'owner' and,
+    // as here, is frequently absent. Take the MAX of the two planes so neither
+    // an absent row nor a lower one in one table can hide standing rank in the
+    // other.
+    if (elevatedGrant) {
+      const [existingCap, existingMembership] = await Promise.all([
+        env.DB.prepare(
+          `SELECT capability FROM capabilities
+            WHERE member_id = ?1 AND scope_type = 'squad' AND scope_id = ?2
+            LIMIT 1`,
+        )
+          .bind(binding.memberId, squad.id)
+          .first<{ capability: Capability }>(),
+        env.DB.prepare(
+          `SELECT capability FROM memberships WHERE agent_id = ?1 AND squad_id = ?2 LIMIT 1`,
+        )
+          .bind(agent.id, squad.id)
+          .first<{ capability: Capability }>(),
+      ])
+      const currentRank = Math.max(
+        existingCap ? capabilityRank(existingCap.capability) : -1,
+        existingMembership ? capabilityRank(existingMembership.capability) : -1,
+      )
+      if (currentRank > capabilityRank(capability as Capability)) {
+        const held = existingMembership && capabilityRank(existingMembership.capability) === currentRank
+          ? existingMembership.capability
+          : existingCap?.capability
+        return fail(
+          403,
+          'elevation_cannot_demote',
+          `target already holds '${held}' on this squad; an elevated session may not lower standing authority it could not restore`,
+        )
+      }
     }
 
     const outcome = await setAgentSquadAccess(env, {
@@ -1788,6 +2125,23 @@ const toolDeactivateAgent: ToolSpec = {
     const detached = rowsWritten(results[2]) + (safeSlug ? rowsWritten(results[4]) : 0)
     const keysRemoved = rowsWritten(results[3]) + (safeSlug ? rowsWritten(results[5]) : 0)
 
+    // Delivery Sequence step 2 (mumega-com#1173) — fact 3: deactivate_agent
+    // revoked agents.status, member_tokens, fleet_agents, and agent_keys, but
+    // NOTHING revoked a live agent_sessions row, which would keep reading as
+    // an active runtime identity even after the credential backing it is
+    // dead. Deliberately OUTSIDE the batch above (not statement [6]): the
+    // four existing writes must keep succeeding byte-for-byte unmodified in a
+    // tenant where migration 0147 has not been applied yet — a table-missing
+    // error inside env.DB.batch would fail the WHOLE batch atomically and
+    // break a currently-shipped tool. revokeAllAgentSessionsForAgent
+    // self-guards that exact case (see src/auth/agent-sessions.ts).
+    const { revokedCount: agentSessionsRevoked } = await revokeAllAgentSessionsForAgent(
+      env,
+      env.TENANT_SLUG,
+      agent.id,
+      'agent_deactivated',
+    )
+
     await emitProvisioned(env, auth.memberId as string, 'agent_deactivated', agent.id, {
       squad_id: agent.squad_id,
       agent_id: agent.id,
@@ -1800,6 +2154,7 @@ const toolDeactivateAgent: ToolSpec = {
       detached,
       tokens_revoked: tokensRevoked,
       keys_removed: keysRemoved,
+      agent_sessions_revoked: agentSessionsRevoked,
       // Ambiguous slug (shared with an agent in another squad) → the
       // slug-keyed fleet_agents/agent_keys sweep above was skipped on
       // purpose (never sweep another agent's row). That means a signed
@@ -1982,6 +2337,8 @@ export const PROVISION_TOOLS: ToolSpec[] = [
   toolMintAgentToken,
   toolListAgentTokens,
   toolRevokeAgentToken,
+  toolListAgentSessions,
+  toolRevokeAgentSession,
   toolProvisionAgentConnection,
   toolGrantAgentCapability,
   toolSquadMemberAdd,

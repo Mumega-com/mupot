@@ -41,6 +41,20 @@ import { resolveSoleGateOwnerAgent } from '../gates/grants'
 import { isChannel } from '../members/service'
 import { findExistingBootstrap } from '../members/bootstrap-self'
 import { resolveConsentedAgentCapabilities } from './oauth-authorize'
+import {
+  getOrCreateAgentSession,
+  resolveAgentSessionContext,
+  revokeAgentSessionByCredential,
+  loadLiveAgentSessionByCredential,
+} from '../auth/agent-sessions'
+import {
+  createElevationRequest,
+  loadElevationRequestById,
+  loadLiveElevationGrantsForSession,
+  evaluateElevationGrant,
+  boundAgentHasAnyLiveElevationGrant,
+} from '../auth/elevation'
+import { ELEVATION_ACTIONS, ELEVATION_DURATION_PRESETS_MINUTES, REQUESTABLE_ELEVATION_ACTION_KEYS } from '../auth/elevation-actions'
 import { createBus } from '../bus'
 import { createMemory } from '../memory'
 import {
@@ -3858,6 +3872,33 @@ const toolCheckIn: ToolSpec = {
       ? `checkin:${env.TENANT_SLUG}:${id.memberId}:${seatLabel}`
       : `checkin:${env.TENANT_SLUG}:${id.memberId}`
 
+    // Delivery Sequence step 2 (mupot task f5fe1222, mumega-com#1173):
+    // check_in is the agent-authentication touchpoint — the closest thing an
+    // already-authenticated agent credential has to a human "login" event.
+    // Ensure the exact runtime session (this credential, this tenant) has a
+    // first-class, listable, independently-expirable, revocable row, same as
+    // a human dashboard login gets one via registerWebSession. Runs for every
+    // bound-agent principal, unconditional on the KV presence debounce below
+    // (getOrCreateAgentSession self-coalesces its own writes to 5 minutes —
+    // see src/auth/agent-sessions.ts touchAgentSession). A pure human/
+    // operator principal (auth.boundAgentId unset) or a not-yet-applied
+    // migration 0147 both resolve to `null` here — never a thrown error, so
+    // check_in keeps working unmodified in either case (see
+    // resolveAgentSessionContext's 'not_agent_session' and
+    // getOrCreateAgentSession's missing-table guard).
+    let agentSessionResult: Awaited<ReturnType<typeof getOrCreateAgentSession>> = null
+    const sessionContext = resolveAgentSessionContext(auth, seatLabel)
+    if (sessionContext.ok) {
+      agentSessionResult = await getOrCreateAgentSession(env, {
+        tenant: env.TENANT_SLUG,
+        agentId: sessionContext.context.agentId,
+        memberId: sessionContext.context.memberId,
+        authKind: sessionContext.context.authKind,
+        credentialId: sessionContext.context.credentialId,
+        seat: sessionContext.context.seat,
+      })
+    }
+
     const echo = {
       ok: true as const,
       seat: seatLabel || id.displayName,
@@ -3869,6 +3910,17 @@ const toolCheckIn: ToolSpec = {
       provider: axis.provider,
       effort: axis.effort,
       flight_id: axis.flight_id,
+      ...(agentSessionResult
+        ? {
+            agent_session: {
+              id: agentSessionResult.session.id,
+              created: agentSessionResult.created,
+              last_seen_at: agentSessionResult.session.last_seen_at,
+              idle_expires_at: agentSessionResult.session.idle_expires_at,
+              absolute_expires_at: agentSessionResult.session.absolute_expires_at,
+            },
+          }
+        : {}),
     }
 
     try {
@@ -3892,6 +3944,198 @@ const toolCheckIn: ToolSpec = {
       flight_id: args.flight_id,
     })
     return done({ ...echo, debounced: false })
+  },
+}
+
+// end_agent_session — Delivery Sequence step 2 (mupot task f5fe1222,
+// mumega-com#1173): the AGENT's own self-service half of "revocable by the
+// human and by the agent itself". Deliberately takes NO id argument — the
+// target is always the caller's own EXACT current session, derived entirely
+// from its own authenticated credential via resolveAgentSessionContext
+// (Security Invariant 1: session identity is derived from authentication,
+// never request text). An agent can therefore never end another agent's
+// session, another session of its OWN agent identity, or guess an id to
+// reach one — there is no id parameter for it to name one with. This is the
+// mirror image of list_agent_sessions/revoke_agent_session in
+// src/mcp/provision.ts, which are gated the OPPOSITE way (operator-principal
+// only, never a bound-agent caller) and DO take an explicit session_id,
+// because a human admin legitimately manages sessions other than "the one
+// making this exact call".
+const toolEndAgentSession: ToolSpec = {
+  name: 'end_agent_session',
+  scope: 'self (exact current agent session)',
+  min: 'authenticated',
+  args: '{}',
+  inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  shouldTouchPresence: () => false,
+  async run(auth, env, _args) {
+    const sessionContext = resolveAgentSessionContext(auth)
+    if (!sessionContext.ok) return fail(403, sessionContext.reason)
+
+    const { revoked, sessionId } = await revokeAgentSessionByCredential(
+      env,
+      env.TENANT_SLUG,
+      sessionContext.context.authKind,
+      sessionContext.context.credentialId,
+      'agent_self_revoke',
+    )
+    return done({
+      revoked,
+      session_id: sessionId,
+      note: revoked
+        ? 'This exact runtime session ended. Ordinary standing access is unaffected; any elevation granted to this session (Delivery Sequence step 3) ends with it.'
+        : sessionId
+          ? 'Session was already ended; no change.'
+          : 'No tracked session found for this credential (not yet migrated, or none was ever created).',
+    })
+  },
+}
+
+// request_elevation / elevation_status — Delivery Sequence step 3 (mupot
+// task f5fe1222, mumega-com#1173): the AGENT-facing half of "Fix the ability
+// that I can make agents admin by a safe way and time limited." An agent
+// asks for named actions on a scope for its EXACT current session; a human
+// decides separately (POST /elevation/requests/:id/decide in src/auth —
+// operator-principal-only, mirrors the /auth/sessions* dashboard routes).
+//
+// Security Invariant 1 (identity is derived from authentication, never
+// request text): agentSessionId/agentId/memberId below all come from
+// resolveAgentSessionContext(auth), exactly like end_agent_session — there
+// is no argument an agent could pass to name a DIFFERENT session or a
+// different agent's request. request_elevation therefore cannot be used by
+// one agent to elevate another, by construction (constraint 5), and never
+// by a pure human/operator principal either (resolveAgentSessionContext
+// fails closed with 'not_agent_session' for those).
+const toolRequestElevation: ToolSpec = {
+  name: 'request_elevation',
+  scope: 'self (exact current agent session)',
+  min: 'authenticated',
+  args: '{ actions: string[], scope_type: "org"|"department"|"squad", scope_id?: string, duration_minutes: number, reason: string }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      actions: { type: 'array', items: { type: 'string', enum: [...REQUESTABLE_ELEVATION_ACTION_KEYS] }, minItems: 1 },
+      scope_type: { type: 'string', enum: ['org', 'department', 'squad'] },
+      scope_id: STRING_SCHEMA,
+      duration_minutes: { type: 'number', enum: [...ELEVATION_DURATION_PRESETS_MINUTES] },
+      reason: STRING_SCHEMA,
+    },
+    required: ['actions', 'scope_type', 'duration_minutes', 'reason'],
+    additionalProperties: false,
+  },
+  shouldTouchPresence: () => false,
+  async run(auth, env, args) {
+    const sessionContext = resolveAgentSessionContext(auth)
+    if (!sessionContext.ok) return fail(403, sessionContext.reason)
+
+    const liveSession = await loadLiveAgentSessionByCredential(
+      env,
+      env.TENANT_SLUG,
+      sessionContext.context.authKind,
+      sessionContext.context.credentialId,
+    )
+    if (!liveSession) {
+      return fail(409, 'not_agent_session', 'No tracked runtime session for this credential (migration not applied yet, or none created — call check_in first).')
+    }
+
+    const actions = Array.isArray(args.actions) ? args.actions.filter((a): a is string => typeof a === 'string') : []
+    const scopeType = str(args.scope_type)
+    const scopeId = str(args.scope_id) ?? ''
+    const durationMinutes = typeof args.duration_minutes === 'number' ? args.duration_minutes : NaN
+    const reason = str(args.reason)
+
+    if (!scopeType || (scopeType !== 'org' && scopeType !== 'department' && scopeType !== 'squad')) {
+      return fail(400, 'invalid_args', 'scope_type must be org|department|squad')
+    }
+    if (!reason) return fail(400, 'invalid_args', 'reason required')
+
+    const result = await createElevationRequest(env, {
+      tenant: env.TENANT_SLUG,
+      agentSessionId: liveSession.id,
+      agentId: sessionContext.context.agentId,
+      memberId: sessionContext.context.memberId,
+      actions,
+      scopeType: scopeType as 'org' | 'department' | 'squad',
+      scopeId,
+      durationMinutes,
+      reason,
+    })
+    if (!result.ok) return fail(400, result.reason, result.detail)
+
+    return done({
+      request: {
+        id: result.request.id,
+        status: result.request.status,
+        actions: JSON.parse(result.request.requested_actions_json),
+        scope_type: result.request.requested_scope_type,
+        scope_id: result.request.requested_scope_id,
+        duration_minutes: result.request.requested_duration_minutes,
+        reason: result.request.reason,
+        created_at: result.request.created_at,
+        decision_expires_at: result.request.decision_expires_at,
+      },
+      note: 'Pending human approval. No authority is granted yet — poll elevation_status or wait for it to be reflected on your next call.',
+    })
+  },
+}
+
+const toolElevationStatus: ToolSpec = {
+  name: 'elevation_status',
+  scope: 'self (exact current agent session)',
+  min: 'authenticated',
+  args: '{ request_id?: string }',
+  inputSchema: {
+    type: 'object',
+    properties: { request_id: STRING_SCHEMA },
+    additionalProperties: false,
+  },
+  shouldTouchPresence: () => false,
+  async run(auth, env, args) {
+    const sessionContext = resolveAgentSessionContext(auth)
+    if (!sessionContext.ok) return fail(403, sessionContext.reason)
+
+    const liveSession = await loadLiveAgentSessionByCredential(
+      env,
+      env.TENANT_SLUG,
+      sessionContext.context.authKind,
+      sessionContext.context.credentialId,
+    )
+    if (!liveSession) return fail(409, 'not_agent_session', 'No tracked runtime session for this credential.')
+
+    const requestId = str(args.request_id)
+    let requestView: Record<string, unknown> | null = null
+    if (requestId) {
+      const request = await loadElevationRequestById(env, env.TENANT_SLUG, requestId)
+      // Never a cross-session existence oracle: a request for a DIFFERENT
+      // session reads identically to "not found".
+      if (request && request.agent_session_id === liveSession.id) {
+        requestView = {
+          id: request.id,
+          status: request.status,
+          actions: JSON.parse(request.requested_actions_json),
+          scope_type: request.requested_scope_type,
+          scope_id: request.requested_scope_id,
+          decision_expires_at: request.decision_expires_at,
+          decided_at: request.decided_at,
+        }
+      }
+    }
+
+    const liveGrants = await loadLiveElevationGrantsForSession(env, env.TENANT_SLUG, liveSession.id)
+    return done({
+      session_id: liveSession.id,
+      request: requestView,
+      active_elevations: liveGrants.map((g) => ({
+        id: g.id,
+        action: g.action,
+        label: ELEVATION_ACTIONS[g.action]?.label ?? g.action,
+        scope_type: g.scope_type,
+        scope_id: g.scope_id,
+        effect: g.effect,
+        expires_at: g.expires_at,
+        live: evaluateElevationGrant(g).ok,
+      })),
+    })
   },
 }
 
@@ -4701,6 +4945,9 @@ export const TOOLS: ToolSpec[] = [
   toolInboxFenceSet,
   toolPeers,
   toolCheckIn,
+  toolEndAgentSession,
+  toolRequestElevation,
+  toolElevationStatus,
   toolStatus,
   toolFleetAgentGet,
   toolBootContext,
@@ -4825,6 +5072,27 @@ function validateArgs(schema: JsonSchema, args: Record<string, unknown>): string
   return null
 }
 
+// Step 4 (mumega-com#1173, "authorization convergence") — the EXPLICIT,
+// reviewed set of tools whose AAGATE floor rejection a live session-bound
+// elevation grant may bypass. Adding a tool here does NOT authorize
+// anything by itself; the tool's own handler still performs the real,
+// scope-precise hasElevatedAction check (and every other tool not listed
+// here is completely unaffected — see invokeTool's AAGATE block). Keep this
+// list and the tool's in-handler wiring in sync: a name here with no
+// matching elevation branch in the handler is a silent floor hole; a
+// handler wired for elevation with no name here can never be reached by an
+// elevated bound agent (dead code, caught in review by mumega-com#1173's
+// own adversarial pass on this exact branch).
+// Tools whose ToolSpec.min floor an elevated session may reach past. The floor
+// is enforced BEFORE run(), so a tool that consults elevation inside run() is
+// unreachable without membership here — its elevation branch would be dead code.
+const ELEVATION_FLOOR_BYPASS_TOOLS: ReadonlySet<string> = new Set([
+  'mint_agent_token',
+  'grant_agent_capability',
+  'create_squad',
+  'project_create',
+])
+
 export async function invokeTool(
   auth: AuthContext,
   env: Env,
@@ -4865,7 +5133,30 @@ export async function invokeTool(
   // its precise per-scope check (the floor is scope-agnostic — see capability.ts).
   // Check authz FIRST so unauthorized callers get 403 regardless of body validity.
   if (spec.min !== 'authenticated' && !hasWorkspaceAdmin(auth) && !holdsCapabilityFloor(auth, spec.min)) {
-    return { ...fail(403, 'forbidden', { need: spec.min }), tool: spec.name }
+    // Elevation-floor bypass (step 4, mumega-com#1173 "authorization
+    // convergence") — a small, EXPLICIT, tool-NAMED allowlist. For every
+    // tool not in this set, and for every caller that is not a bound agent,
+    // this branch is skipped entirely and the floor behaves byte-for-byte as
+    // it did before this step: same rejection, same message, no added D1
+    // read. Only a bound-agent session holding at least one LIVE elevation
+    // grant (for ANY action — this probe is exactly as scope/action-agnostic
+    // as holdsCapabilityFloor itself, which also only checks "min on ANY
+    // scope") gets ONE chance past the floor. It does not grant anything:
+    // each listed tool's own handler re-derives the PRECISE action+scope
+    // match via hasElevatedAction and refuses on its own, with a named
+    // remedy, if the live grant does not actually cover what it asked for.
+    // A caller with zero live elevation grants at all gets the exact same
+    // `forbidden {need: spec.min}` the floor has always returned — the
+    // pre-elevation collapse that stops a stranger from learning anything
+    // about a sensitive tool's target is therefore preserved AT THE FLOOR,
+    // before schema validation even runs.
+    const mayBeElevated =
+      auth.boundAgentId != null &&
+      ELEVATION_FLOOR_BYPASS_TOOLS.has(spec.name) &&
+      (await boundAgentHasAnyLiveElevationGrant(env, auth))
+    if (!mayBeElevated) {
+      return { ...fail(403, 'forbidden', { need: spec.min }), tool: spec.name }
+    }
   }
 
   const schemaError = validateArgs(spec.inputSchema, args)
