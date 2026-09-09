@@ -27,6 +27,7 @@
 
 import { describe, expect, it, beforeEach, afterEach } from 'vitest'
 import { readFileSync, readdirSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../src/auth/token-lifecycle'
@@ -204,11 +205,21 @@ describe('migration 0099 — member_tokens lifecycle', () => {
   })
 })
 
-describe('both bearer doors consume the shared predicate', () => {
-  // Asserts the SOURCE, not the behaviour — behaviour is covered above. The failure
-  // this catches is someone adding a third lookup, or reverting one door to an inline
-  // `revoked_at IS NULL`, which would restore the bypass while every behavioural test
-  // above still passed against the door that was left correct.
+describe('every bearer door consumes the shared predicate', () => {
+  // Asserts the SOURCE, not the behaviour — behaviour is covered above (and, for the
+  // oauth-authorize doors, in tests/mcp-bearer-expiry-outcome.test.ts).
+  //
+  // THIS SECTION FAILED AT ITS OWN JOB ONCE. It was written to catch "someone adding a
+  // third lookup", but the check below iterated a HARDCODED two-element file list, so a
+  // third and fourth lookup — resolveExternalToken and buildAuthContextFromProps, both
+  // in src/mcp/oauth-authorize.ts, both on the POST /mcp path — were added with a bare
+  // revoked_at check and could never have failed it. Expired credentials authenticated
+  // in production for the whole time this file was green.
+  //
+  // So the enumeration is now DERIVED FROM THE SOURCE TREE rather than typed out: every
+  // single-row member_tokens lookup that exists must consume the shared predicate. A
+  // fifth door added tomorrow is in scope automatically, which is the only version of
+  // this guard that actually holds.
   const read = (p: string) => readFileSync(join(__dirname, '..', p), 'utf8')
 
   it('mcp/index.ts authenticateMember uses TOKEN_LIVE_PREDICATE', () => {
@@ -231,12 +242,127 @@ describe('both bearer doors consume the shared predicate', () => {
     expect(fn).not.toContain('AND t.revoked_at IS NULL')
   })
 
-  it('no bearer lookup still hardcodes a bare revoked_at-only liveness check', () => {
-    for (const p of ['src/mcp/index.ts', 'src/auth/member-bearer.ts']) {
-      const src = read(p)
-      // The old predicate, as it appeared before 0099. Its return would mean expiry is
-      // no longer enforced at that door.
-      expect(src).not.toContain('AND t.revoked_at IS NULL\n      LIMIT 1')
+  it('mcp/oauth-authorize.ts resolveExternalToken uses TOKEN_LIVE_PREDICATE', () => {
+    const src = read('src/mcp/oauth-authorize.ts')
+    expect(src).toContain("from '../auth/token-lifecycle'")
+    const fn = src.slice(src.indexOf('async function resolveExternalTokenInner'))
+    expect(fn.slice(0, 2000)).toContain('TOKEN_LIVE_PREDICATE(')
+  })
+
+  it('mcp/oauth-authorize.ts buildAuthContextFromProps uses TOKEN_LIVE_PREDICATE', () => {
+    const src = read('src/mcp/oauth-authorize.ts')
+    const fn = src.slice(src.indexOf('async function buildAuthContextFromPropsInner'))
+    expect(fn.slice(0, 2000)).toContain('TOKEN_LIVE_PREDICATE(')
+  })
+
+  // ── the derived enumeration ───────────────────────────────────────────────────
+  //
+  // Walks src/ and extracts EVERY string containing a SELECT over member_tokens --
+  // template literals and quoted strings alike, since mupot writes SQL in both. Each
+  // must consume the shared predicate, or be exempted BY QUERY FINGERPRINT below.
+  //
+  // TWO EARLIER VERSIONS OF THIS GUARD FAILED, AND BOTH FAILURES SHAPE IT:
+  //
+  //  1. It iterated a hardcoded two-file list, so the two oauth-authorize doors could
+  //     never fail it. That is what let expired credentials authenticate.
+  //
+  //  2. Its replacement derived the file list but matched only backtick literals
+  //     containing the exact text `LIMIT 1`, and exempted whole FILES. An adversarial
+  //     pass drove three real shapes straight through it: a single-row lookup with no
+  //     LIMIT clause at all (D1's .first() needs none -- and one exists, at
+  //     src/tasks/runtime-receipts.ts), `LIMIT  1` with two spaces, and SQL written as
+  //     a quoted string. It then appended a genuine revoked_at-only bearer lookup to an
+  //     exempt FILE and the suite stayed green. A file is not the unit of authority; a
+  //     query is. Exempting by filename re-created, one level up, exactly the defect
+  //     this file exists to prevent.
+  //
+  // Hence: no LIMIT heuristic, all quote forms, and exemptions pinned to the
+  // normalized text of one specific query. Change that query by a character and its
+  // fingerprint changes and it must be re-justified.
+  const SRC_DIR = join(__dirname, '..', 'src')
+
+  function tsFiles(dir: string): string[] {
+    const out: string[] = []
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name)
+      if (entry.isDirectory()) out.push(...tsFiles(full))
+      else if (entry.name.endsWith('.ts') && !entry.name.includes('schema-chain')) out.push(full)
     }
+    return out
+  }
+
+  /** Every string literal in a source file, in any of TypeScript's three quote forms. */
+  function stringLiterals(src: string): string[] {
+    const re = /`([^`\\]*(?:\\[\s\S][^`\\]*)*)`|'([^'\\\n]*(?:\\.[^'\\\n]*)*)'|"([^"\\\n]*(?:\\.[^"\\\n]*)*)"/g
+    const out: string[] = []
+    let m: RegExpExecArray | null
+    while ((m = re.exec(src)) !== null) out.push(m[1] ?? m[2] ?? m[3] ?? '')
+    return out
+  }
+
+  /** Whitespace-normalized SHA-256 prefix — stable across reindentation, not across
+   *  a change to the query's actual columns, table, or predicate. */
+  function fingerprint(sql: string): string {
+    return createHash('sha256').update(sql.split(/\s+/).filter(Boolean).join(' ')).digest('hex').slice(0, 12)
+  }
+
+  // Queries that read member_tokens WITHOUT granting anything, and must therefore be
+  // able to see a non-live row. Pinned to the query, not the file.
+  const NON_AUTH_QUERIES: ReadonlyArray<{ fingerprint: string; why: string }> = [
+    { fingerprint: 'dd4c5c20f09a', why: 'control-center: aggregate of member/channel pairs for an operator view. Grants nothing.' },
+    { fingerprint: '426f3c16d874', why: 'dashboard: DISTINCT member/channel listing. Grants nothing.' },
+    { fingerprint: '87a0ace21487', why: 'keys page: lists a tenant preset-labelled keys. Display only.' },
+    { fingerprint: '021f1001e123', why: 'label read for seat naming (agents/inbox-seat.ts and mcp/index.ts share this query). Runs on an ALREADY authenticated session and only narrows it; it cannot grant.' },
+    { fingerprint: '5531526a4ea7', why: 'list_agent_tokens — inventory. Must show expired rows or they become unlistable.' },
+    { fingerprint: '19c7bbd261b4', why: 'revoke_agent_token ownership lookup — SELECTs revoked_at for the caller to judge. Revoking an already-expired token must stay possible.' },
+    { fingerprint: '55c5b8ae2ab0', why: 'agent-connection status read — returns revoked_at for display. Grants nothing.' },
+    { fingerprint: 'c5f8c11a05f4', why: 'credential REPLACE target. Reached only after authorize() has required admin on the home squad; the new credential a grants come from the request and are ceilinged against the ACTOR, never inherited from this row. Replacing an expired token is legitimate recovery.' },
+    { fingerprint: '768c3883fe85', why: 'members service: token inventory listing. Display only.' },
+    { fingerprint: '213bb53402c3', why: 'the expiry SWEEP itself (token-lifecycle.ts) — it exists to find tokens BY their expiry, so the live-only predicate would make it return nothing.' },
+  ]
+
+  it('EVERY SELECT over member_tokens in src/ consumes the shared predicate or is fingerprint-exempt', () => {
+    const offenders: string[] = []
+    const exempt = new Map(NON_AUTH_QUERIES.map((e) => [e.fingerprint, e.why]))
+    const seen = new Set<string>()
+    let inspected = 0
+    for (const file of tsFiles(SRC_DIR)) {
+      const src = readFileSync(file, 'utf8')
+      if (!src.includes('member_tokens')) continue
+      for (const literal of stringLiterals(src)) {
+        if (!/FROM\s+member_tokens/i.test(literal)) continue
+        if (!/^\s*SELECT/i.test(literal.trim())) continue
+        inspected += 1
+        const usesShared =
+          literal.includes('TOKEN_LIVE_PREDICATE(') || /\$\{\w*[lL]ivePredicate\(/.test(literal)
+        if (usesShared) continue
+        const fp = fingerprint(literal)
+        seen.add(fp)
+        if (!exempt.has(fp)) {
+          offenders.push(`${file.slice(file.indexOf('src/'))} [${fp}]: ${literal.trim().slice(0, 90)}…`)
+        }
+      }
+    }
+    // Anti-vacuity: a walker that matched nothing would be green for the worst reason.
+    expect(inspected).toBeGreaterThanOrEqual(20)
+    expect(offenders).toEqual([])
+  })
+
+  it('the exemption list has no dead entries — a stale fingerprint hides a real regression', () => {
+    // If a query is edited, its fingerprint changes: the new text correctly becomes an
+    // offender, but the OLD entry lingers and would silently re-exempt that exact text
+    // if it ever came back. Fail on the leftover so exemptions stay a live inventory.
+    const present = new Set<string>()
+    for (const file of tsFiles(SRC_DIR)) {
+      const src = readFileSync(file, 'utf8')
+      if (!src.includes('member_tokens')) continue
+      for (const literal of stringLiterals(src)) {
+        if (!/FROM\s+member_tokens/i.test(literal)) continue
+        if (!/^\s*SELECT/i.test(literal.trim())) continue
+        present.add(fingerprint(literal))
+      }
+    }
+    const dead = NON_AUTH_QUERIES.filter((e) => !present.has(e.fingerprint)).map((e) => e.fingerprint)
+    expect(dead).toEqual([])
   })
 })

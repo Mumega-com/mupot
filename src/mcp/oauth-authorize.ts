@@ -38,6 +38,7 @@ import { sha256Hex, mintRawToken, resolveAgentMemberBinding, mintAgentBoundToken
 import { createAgent } from '../org/service'
 import { redactSecretPatterns } from '../lib/redact'
 import { authLookupOrNull } from '../auth/fail-closed'
+import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 
 // ── OAuth props stored via completeAuthorization ─────────────────────────────
 // Encrypted by the library; read back via resolveExternalToken.
@@ -1039,9 +1040,15 @@ async function resolveExternalTokenInner(
       WHERE t.token_hash = ?1
         AND t.tenant = ?2
         AND m.tenant = ?2
-        AND t.revoked_at IS NULL
+        -- 0099: the SAME shared liveness predicate authenticateMember (src/mcp/index.ts)
+        -- and resolveMemberByToken (src/auth/member-bearer.ts) execute. This is the
+        -- POST /mcp member-API-key door; a hand-written revoked_at-only check here was
+        -- a live expiry bypass — the credential simply arrived at this entrance
+        -- instead. See src/auth/token-lifecycle.ts's header: if the fragment is being
+        -- pasted into another place, the paste is the bug.
+        AND ${TOKEN_LIVE_PREDICATE('?3')}
       LIMIT 1`,
-  ).bind(tokenHash, env.TENANT_SLUG).first<{
+  ).bind(tokenHash, env.TENANT_SLUG, nowSqlUtc()).first<{
     member_id: string
     email: string | null
     status: string
@@ -1124,7 +1131,9 @@ async function buildAuthContextFromPropsInner(
   env: Env,
   props: OAuthMemberProps,
 ): Promise<AuthContext | null> {
-  // Verify the referenced token is still live (not revoked since authorization).
+  // Verify the referenced token is still live — neither revoked nor expired since
+  // authorization. Both arms matter: this runs per-request, so it is also the only
+  // thing that ends a session whose credential expires while it is open.
   const tokenRow = await env.DB.prepare(
     `SELECT m.status AS status, m.email AS email, t.channel AS channel, t.agent_id AS bound_agent_id
        FROM member_tokens t
@@ -1133,9 +1142,12 @@ async function buildAuthContextFromPropsInner(
         AND t.member_id = ?2
         AND t.tenant = ?3
         AND m.tenant = ?3
-        AND t.revoked_at IS NULL
+        -- 0099: liveness is revoked_at AND expiry, via the one shared export. This
+        -- lookup runs on EVERY MCP request, so an expiry omission here kept an
+        -- expired credential working for its whole session, not just at handshake.
+        AND ${TOKEN_LIVE_PREDICATE('?4')}
       LIMIT 1`,
-  ).bind(props.tokenId, props.memberId, env.TENANT_SLUG).first<{
+  ).bind(props.tokenId, props.memberId, env.TENANT_SLUG, nowSqlUtc()).first<{
     status: string
     email: string | null
     channel?: ConnectionChannel | null
