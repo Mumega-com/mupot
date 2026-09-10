@@ -3,10 +3,21 @@ use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OperationId(u64);
+/// Frozen device context cannot be serialized, including through its container.
+/// ```compile_fail
+/// fn encode(request: &mumachine::PollRequest) {
+///     let _ = serde_json::to_string(request);
+/// }
+/// ```
 #[derive(Debug)]
 pub struct PollRequest {
     pub operation: OperationId,
-    pub code: Secret,
+    pub(crate) code: Secret,
+    pub(crate) origin: PotOrigin,
+    pub(crate) desired_agent: String,
+    pub(crate) started: Instant,
+    pub(crate) started_unix: u64,
+    pub(crate) deadline: Instant,
 }
 struct Pending {
     challenge: DeviceChallenge,
@@ -89,6 +100,11 @@ impl DeviceFlow {
         Ok(Some(PollRequest {
             operation: OperationId(self.generation),
             code: p.challenge.device_code.clone(),
+            origin: p.challenge.origin.clone(),
+            desired_agent: p.challenge.desired_agent.clone(),
+            started: p.challenge.started,
+            started_unix: p.challenge.started_unix,
+            deadline: p.challenge.deadline,
         }))
     }
     pub fn complete_poll(

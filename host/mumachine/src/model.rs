@@ -15,6 +15,7 @@ pub enum Error {
     Expired,
     StaleOperation,
     Storage,
+    StorageBusy,
     Unsupported,
 }
 impl fmt::Display for Error {
@@ -114,6 +115,10 @@ pub struct DeviceChallenge {
     pub interval: Duration,
     pub(crate) device_code: Secret,
     pub(crate) deadline: Instant,
+    pub(crate) origin: PotOrigin,
+    pub(crate) desired_agent: String,
+    pub(crate) started: Instant,
+    pub(crate) started_unix: u64,
 }
 #[derive(Debug)]
 pub struct VerifiedConnection {

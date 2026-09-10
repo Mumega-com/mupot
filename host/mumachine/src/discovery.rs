@@ -40,25 +40,7 @@ pub fn discover_local() -> DiscoverySnapshot {
     if let Some(home) = &home {
         roots.push(home.join("Applications"));
     }
-    for (name, bundle) in [
-        ("Codex", "Codex.app"),
-        ("Claude", "Claude.app"),
-        ("Cursor", "Cursor.app"),
-        ("Termius", "Termius.app"),
-        ("Herdr", "Herdr.app"),
-        ("ChatGPT", "ChatGPT.app"),
-    ] {
-        for root in &roots {
-            let path = root.join(bundle);
-            if path.is_dir() {
-                snapshot.apps.push(InstalledApp {
-                    name: name.into(),
-                    path,
-                });
-                break;
-            }
-        }
-    }
+    snapshot.apps = installed_apps(&roots);
     let mut candidates: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|p| {
             std::env::split_paths(&p)
@@ -99,6 +81,31 @@ pub fn discover_local() -> DiscoverySnapshot {
         }
     }
     snapshot
+}
+pub(crate) fn installed_apps(roots: &[PathBuf]) -> Vec<InstalledApp> {
+    let mut apps = Vec::new();
+    for (name, bundle) in [
+        ("Codex", "Codex.app"),
+        ("Claude", "Claude.app"),
+        ("Cursor", "Cursor.app"),
+        ("Termius", "Termius.app"),
+        ("Herdr", "Herdr.app"),
+        ("ChatGPT", "ChatGPT.app"),
+        ("Antigravity", "Antigravity.app"),
+        ("Grok Bot", "Grok Bot.app"),
+    ] {
+        for root in roots {
+            let path = root.join(bundle);
+            if path.is_dir() {
+                apps.push(InstalledApp {
+                    name: name.into(),
+                    path,
+                });
+                break;
+            }
+        }
+    }
+    apps
 }
 pub(crate) fn parse_runtimes(data: &[u8]) -> crate::Result<Vec<LocalRuntime>> {
     let value: serde_json::Value =

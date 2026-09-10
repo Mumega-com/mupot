@@ -9,10 +9,7 @@ use std::{
     fs::{File, OpenOptions},
     io::{Read, Write},
     path::PathBuf,
-    sync::{
-        Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicU64, Ordering},
 };
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -30,7 +27,16 @@ impl Profile {
 }
 pub struct ProfileRepository {
     directory: File,
-    lock: Mutex<()>,
+}
+struct TransactionGuard(File);
+impl Drop for TransactionGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        // SAFETY: guard owns the open lock file until after unlocking.
+        unsafe {
+            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
 }
 pub fn default_directory() -> Result<PathBuf> {
     let home = std::env::var_os("HOME").ok_or(Error::Storage)?;
@@ -69,10 +75,7 @@ impl ProfileRepository {
                 .open(path)
                 .map_err(|_| Error::Storage)?;
             private(&directory, true)?;
-            Ok(Self {
-                directory,
-                lock: Mutex::new(()),
-            })
+            Ok(Self { directory })
         }
         #[cfg(not(unix))]
         {
@@ -81,7 +84,7 @@ impl ProfileRepository {
         }
     }
     pub fn list(&self) -> Result<Vec<Profile>> {
-        let _guard = self.lock.lock().map_err(|_| Error::Storage)?;
+        let _guard = self.transaction()?;
         self.read_profiles()
     }
     pub fn save(
@@ -89,7 +92,7 @@ impl ProfileRepository {
         connection: &VerifiedConnection,
         vault: &dyn CredentialVault,
     ) -> Result<Profile> {
-        let _guard = self.lock.lock().map_err(|_| Error::Storage)?;
+        let _guard = self.transaction()?;
         if connection.is_expired() {
             return Err(Error::Expired);
         }
@@ -117,25 +120,75 @@ impl ProfileRepository {
         Ok(profile)
     }
     pub fn load(&self, profile: &Profile, vault: &dyn CredentialVault) -> Result<Secret> {
+        let _guard = self.transaction()?;
         validate(profile)?;
         if profile.expires_unix <= crate::client::unix_now()? {
             return Err(Error::Expired);
         }
-        if !self.list()?.contains(profile) {
+        if !self.read_profiles()?.contains(profile) {
             return Err(Error::Storage);
         }
         vault.retrieve(&profile.account())?.ok_or(Error::Storage)
     }
     pub fn forget(&self, profile: &Profile, vault: &dyn CredentialVault) -> Result<()> {
-        let _guard = self.lock.lock().map_err(|_| Error::Storage)?;
+        let _guard = self.transaction()?;
         validate(profile)?;
         let mut profiles = self.read_profiles()?;
         if !profiles.contains(profile) {
             return Err(Error::Storage);
         }
+        let previous = vault.retrieve(&profile.account())?;
         vault.remove(&profile.account())?;
         profiles.retain(|p| p.account() != profile.account());
-        self.write_profiles(&profiles)
+        if self.write_profiles(&profiles).is_err() {
+            if let Some(secret) = previous {
+                vault.store(&profile.account(), &secret)?;
+            }
+            return Err(Error::Storage);
+        }
+        Ok(())
+    }
+    fn transaction(&self) -> Result<TransactionGuard> {
+        #[cfg(unix)]
+        {
+            private(&self.directory, true)?;
+            // SAFETY: fixed relative basename and a directory descriptor held for
+            // this repository's lifetime. The lock file is never renamed/deleted.
+            let fd = unsafe {
+                libc::openat(
+                    self.directory.as_raw_fd(),
+                    c".profiles.lock".as_ptr(),
+                    libc::O_RDWR
+                        | libc::O_CREAT
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC
+                        | libc::O_NONBLOCK,
+                    0o600,
+                )
+            };
+            if fd < 0 {
+                return Err(Error::Storage);
+            }
+            // SAFETY: owns the newly opened descriptor returned by openat.
+            let file = unsafe { File::from_raw_fd(fd) };
+            private(&file, false)?;
+            // Separate open file descriptions coordinate independent repositories,
+            // threads and processes. Never wait behind an OS Keychain prompt.
+            // SAFETY: file descriptor remains open for this guard's full lifetime.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } < 0 {
+                let error = std::io::Error::last_os_error();
+                return Err(if error.kind() == std::io::ErrorKind::WouldBlock {
+                    Error::StorageBusy
+                } else {
+                    Error::Storage
+                });
+            }
+            Ok(TransactionGuard(file))
+        }
+        #[cfg(not(unix))]
+        {
+            Err(Error::Unsupported)
+        }
     }
     fn read_profiles(&self) -> Result<Vec<Profile>> {
         #[cfg(unix)]
@@ -249,7 +302,7 @@ fn validate(profile: &Profile) -> Result<()> {
     if PotOrigin::parse(&profile.origin)?.as_str() != profile.origin {
         return Err(Error::Storage);
     }
-    crate::client::identifier(&profile.agent_id)?;
+    crate::client::agent_uuid(&profile.agent_id)?;
     crate::client::identifier(&profile.agent_slug)?;
     crate::client::identifier(&profile.tenant)?;
     Ok(())
