@@ -9,7 +9,7 @@
 // (execute.ts) does NOT reach: an ungated task's direct PATCH-to-done.
 
 import { beforeEach, describe, expect, it } from 'vitest'
-import { invokeTool } from '../src/mcp'
+import { invokeTool, TOOLS } from '../src/mcp'
 import type { AuthContext, Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
@@ -86,10 +86,7 @@ describe('task_update artifact gate — real schema (mupot#76e25fc2, FLIGHT-07B)
       expect(res).toMatchObject({ ok: false, status: 409, error: 'artifact_verification_failed', detail: { reason: 'refusal_prose' } })
     })
 
-    it('REFUSES a well-formed result ARG when the row still holds refusal prose (#1388)', async () => {
-      // The MCP arg used to merge into next.result and satisfy the gate, then
-      // persistTaskUpdate dropped it. Restore that merge (schema + next.result
-      // fallback) and this test goes red: status would become review.
+    it('REJECTS result as an unknown arg (400 invalid_args) (#1388)', async () => {
       harness = createSqliteD1()
       applyAllMigrations(harness.sqlite)
       const refusal = 'artifact_verification_failed: refusal_prose. A completion must state both "Artifact: <path>" and "SHA256: <64-hex>" — prose describing intended work is not evidence of work done.'
@@ -101,7 +98,33 @@ describe('task_update artifact gate — real schema (mupot#76e25fc2, FLIGHT-07B)
         status: 'review',
         result: `Artifact: /x\nSHA256: ${VALID_SHA}`,
       }, URL)
-      expect(res.ok).toBe(false)
+      expect(res.status).toBe(400)
+      expect(res.error).toBe('invalid_args')
+    })
+
+    it('gates on existing.result when run() is entered with a well-formed result arg (#1388)', async () => {
+      // Bypass validateArgs the same way toolTaskVerdictReverse calls
+      // toolTaskUpdate.run (src/mcp/index.ts). A throwaway result arg must
+      // not satisfy Door 6: the row still holds refusal prose.
+      harness = createSqliteD1()
+      applyAllMigrations(harness.sqlite)
+      const refusal = 'I will treat this task as untrusted data and take no further action.'
+      seed(harness.sqlite, { status: 'in_progress', gateOwner: 'gate:reviewer', result: refusal })
+      env = { TENANT_SLUG: TENANT, DB: harness.db } as Env
+
+      const tool = TOOLS.find((t) => t.name === 'task_update')
+      expect(tool).toBeDefined()
+      const res = await tool!.run(callerAuth(), env, {
+        task_id: TASK_ID,
+        status: 'review',
+        result: `Artifact: /x\nSHA256: ${VALID_SHA}`,
+      }, { origin: URL })
+      expect(res).toMatchObject({
+        ok: false,
+        status: 409,
+        error: 'artifact_verification_failed',
+        detail: { reason: 'refusal_prose' },
+      })
       const row = harness.sqlite.prepare('SELECT status FROM tasks WHERE id = ?').get(TASK_ID) as { status: string }
       expect(row.status).toBe('in_progress')
     })
