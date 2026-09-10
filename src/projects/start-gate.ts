@@ -11,6 +11,7 @@
 // attempt escalates to org owners (ghost-start alarm).
 
 import type { Env, Project, ProjectAccessLevel, Task } from '../types'
+import { CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
 import {
   mintAgentBoundToken,
   resolveActiveAgentMember,
@@ -434,11 +435,12 @@ export async function listOrgOwnerMemberIds(env: Env): Promise<string[]> {
       WHERE c.scope_type = 'org'
         AND c.scope_id IS NULL
         AND c.capability = 'owner'
+        AND ${CAPABILITY_LIVE_PREDICATE('c', '?2')}
         AND m.tenant = ?1
         AND m.status = 'active'
       ORDER BY c.member_id ASC`,
   )
-    .bind(env.TENANT_SLUG)
+    .bind(env.TENANT_SLUG, nowCapabilitySql())
     .all<{ member_id: string }>()
   return (result.results ?? []).map((row) => row.member_id)
 }

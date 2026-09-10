@@ -1,4 +1,4 @@
-import { canOnSquad, hasCapability } from '../auth/capability'
+import { canOnSquad, hasCapability, CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
 import type { AuthContext, Capability, CapabilityGrant, Env, Squad } from '../types'
 import {
   commitAgentSquadAccess,
@@ -316,10 +316,11 @@ export async function listSquadMembers(input: {
          ON c.member_id = b.member_id
         AND c.scope_type = 'squad'
         AND c.scope_id = m.squad_id
+        AND ${CAPABILITY_LIVE_PREDICATE('c', '?3')}
       WHERE m.squad_id = ?2
       ORDER BY a.slug ASC`,
   )
-    .bind(input.env.TENANT_SLUG, input.squadId)
+    .bind(input.env.TENANT_SLUG, input.squadId, nowCapabilitySql())
     .all<SquadMembershipListRow>()
   return { ok: true, members: rows.results ?? [] }
 }

@@ -31,7 +31,8 @@ function createSchema(sqlite: SqliteD1Harness['sqlite']): void {
     CREATE TABLE squads (id TEXT PRIMARY KEY, department_id TEXT NOT NULL);
     CREATE TABLE capabilities (
       id TEXT PRIMARY KEY, member_id TEXT NOT NULL, scope_type TEXT NOT NULL,
-      scope_id TEXT, capability TEXT NOT NULL
+      scope_id TEXT, capability TEXT NOT NULL,
+          expires_at TEXT
     );
     CREATE TABLE channel_capability_grants (
       id TEXT PRIMARY KEY, member_id TEXT NOT NULL, squad_id TEXT NOT NULL, capability TEXT NOT NULL

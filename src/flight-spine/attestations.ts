@@ -1,4 +1,5 @@
 import type { AuthContext } from '../types'
+import { CAPABILITY_LIVE_PREDICATE } from '../auth/capability'
 import { hasCapability, resolveCapabilities } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import {
@@ -227,6 +228,7 @@ async function readExistingWithCurrentAuthority(
                     EXISTS (
                       SELECT 1 FROM capabilities capability
                        WHERE capability.member_id = member.id
+                         AND ${CAPABILITY_LIVE_PREDICATE('capability', "datetime('now')")}
                          AND (
                            capability.scope_type = 'org'
                            OR (capability.scope_type = 'department'
@@ -342,6 +344,7 @@ export async function issueTokenBindingAttestation(
            EXISTS (
              SELECT 1 FROM capabilities capability
               WHERE capability.member_id = member.id
+                AND ${CAPABILITY_LIVE_PREDICATE('capability', "datetime('now')")}
                 AND (
                   capability.scope_type = 'org'
                   OR (capability.scope_type = 'department'

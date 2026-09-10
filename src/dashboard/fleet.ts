@@ -10,6 +10,7 @@
 // routes must not call it.
 
 import type { AuthContext, Env } from '../types'
+import { CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
 import { createBus } from '../bus'
 import { sendAgentMessage } from '../agents/messages'
 import { resolveAgentRef } from '../org/resolve'
@@ -185,10 +186,11 @@ export async function loadFleet(env: Env, nowMs: number, auth: AuthContext): Pro
         ))
         OR member_id IN (
           SELECT member_id FROM capabilities
-          WHERE (scope_type = 'squad' AND scope_id IN (SELECT CAST(value AS TEXT) FROM json_each(?2)))
+          WHERE ${CAPABILITY_LIVE_PREDICATE('', '?3')}
+            AND ((scope_type = 'squad' AND scope_id IN (SELECT CAST(value AS TEXT) FROM json_each(?2)))
              OR (scope_type = 'department' AND scope_id IN (
                   SELECT department_id FROM squads WHERE id IN (SELECT CAST(value AS TEXT) FROM json_each(?2))
-                ))
+                )))
         )
       )`
   }
@@ -197,7 +199,7 @@ export async function loadFleet(env: Env, nowMs: number, auth: AuthContext): Pro
             harness, machine, model, provider, effort, flight_id
        FROM presence WHERE tenant = ?1${scopeClause} ORDER BY last_seen_at DESC LIMIT 200`,
   )
-  const bound = idsJson === null ? statement.bind(env.TENANT_SLUG) : statement.bind(env.TENANT_SLUG, idsJson)
+  const bound = idsJson === null ? statement.bind(env.TENANT_SLUG) : statement.bind(env.TENANT_SLUG, idsJson, nowCapabilitySql())
   const res = await bound.all<{
     member_id: string
     display_name: string

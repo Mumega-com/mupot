@@ -1,5 +1,6 @@
 import type { D1PreparedStatement } from '@cloudflare/workers-types'
 import { assertBatchWritten } from '../lib/receipt'
+import { CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
 import type { CapabilityGrant, Env, Membership } from '../types'
 import type { AgentBindingProof } from './service'
 
@@ -17,6 +18,19 @@ export interface SetAgentSquadAccessInput {
   memberId: string
   squadId: string
   capability: AgentAccessCapability
+  /** ISO/SQL timestamp after which this grant stops resolving, or null/undefined
+   *  for a permanent one (migration 0149).
+   *
+   *  THIS IS THE POINT OF 0149. grant_agent_capability writes here, and before
+   *  the column existed the write was necessarily PERMANENT — which is why an
+   *  elevated session was capped at 'member': a time-boxed approval could not be
+   *  allowed to confer standing lead/admin that outlived its own window.
+   *
+   *  With an expiry the constraint inverts. An elevated caller passes the
+   *  ELEVATION GRANT'S OWN expires_at, so the conferred capability cannot outlive
+   *  the approval that authorized it, and conferring 'lead' becomes safe because
+   *  it lapses on the same clock. See mupot#1360. */
+  expiresAt?: string | null
 }
 
 export interface RemoveAgentSquadAccessInput {
@@ -143,8 +157,9 @@ async function priorAccess(
         WHERE member_id = ?
           AND scope_type = 'squad'
           AND scope_id = ?
+          AND ${CAPABILITY_LIVE_PREDICATE('', '?')}
         LIMIT 1`,
-    ).bind(input.memberId, input.squadId).first<{ capability: AgentAccessCapability }>(),
+    ).bind(input.memberId, input.squadId, nowCapabilitySql()).first<{ capability: AgentAccessCapability }>(),
   ])
   return {
     membership,
@@ -258,8 +273,8 @@ export async function prepareAgentSquadAccess(
   const grantId = crypto.randomUUID()
   const capabilityStatement = bindingGuard
     ? env.DB.prepare(
-        `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
-         SELECT ?, ?, 'squad', ?, ?
+        `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, expires_at)
+         SELECT ?, ?, 'squad', ?, ?, ?
           WHERE EXISTS (
             SELECT 1
               FROM agent_member_bindings
@@ -268,22 +283,71 @@ export async function prepareAgentSquadAccess(
                AND member_id = ?
           )
          ON CONFLICT(member_id, scope_type, scope_id)
-         DO UPDATE SET capability = excluded.capability`,
+         DO UPDATE SET capability = excluded.capability,
+                       -- THE HORIZON IS MONOTONIC. It can be extended, never cut.
+                       --
+                       -- NULL means permanent, i.e. the longest horizon there is,
+                       -- so either side being NULL wins. Otherwise the LATER of the
+                       -- two survives, compared with julianday() because these
+                       -- columns hold two timestamp shapes and a text compare is
+                       -- wrong for the same instant.
+                       --
+                       -- This closes two findings at the write instead of with a
+                       -- refusal, which is why there is no guard above it:
+                       --  * a caller supplying NO expiry (standing operator, or the
+                       --    HTTP route) cannot ERASE a horizon a human set — that
+                       --    would turn a deliberately time-limited grant permanent
+                       --    with no receipt distinguishing it from a real grant.
+                       --  * an ELEVATED caller cannot SHORTEN a longer or permanent
+                       --    grant to its own 60-minute horizon. An equal-rank
+                       --    re-grant is still a demotion when it cuts the duration,
+                       --    and a rank-only guard is blind to it.
+                       expires_at = CASE
+                         WHEN excluded.expires_at IS NULL OR capabilities.expires_at IS NULL THEN NULL
+                         WHEN julianday(excluded.expires_at) > julianday(capabilities.expires_at)
+                           THEN excluded.expires_at
+                         ELSE capabilities.expires_at
+                       END`,
       ).bind(
         grantId,
         input.memberId,
         input.squadId,
         input.capability,
+        input.expiresAt ?? null,
         env.TENANT_SLUG,
         input.agentId,
         input.memberId,
       )
     : env.DB.prepare(
-        `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
-         VALUES (?, ?, 'squad', ?, ?)
+        `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, expires_at)
+         VALUES (?, ?, 'squad', ?, ?, ?)
          ON CONFLICT(member_id, scope_type, scope_id)
-         DO UPDATE SET capability = excluded.capability`,
-      ).bind(grantId, input.memberId, input.squadId, input.capability)
+         DO UPDATE SET capability = excluded.capability,
+                       -- THE HORIZON IS MONOTONIC. It can be extended, never cut.
+                       --
+                       -- NULL means permanent, i.e. the longest horizon there is,
+                       -- so either side being NULL wins. Otherwise the LATER of the
+                       -- two survives, compared with julianday() because these
+                       -- columns hold two timestamp shapes and a text compare is
+                       -- wrong for the same instant.
+                       --
+                       -- This closes two findings at the write instead of with a
+                       -- refusal, which is why there is no guard above it:
+                       --  * a caller supplying NO expiry (standing operator, or the
+                       --    HTTP route) cannot ERASE a horizon a human set — that
+                       --    would turn a deliberately time-limited grant permanent
+                       --    with no receipt distinguishing it from a real grant.
+                       --  * an ELEVATED caller cannot SHORTEN a longer or permanent
+                       --    grant to its own 60-minute horizon. An equal-rank
+                       --    re-grant is still a demotion when it cuts the duration,
+                       --    and a rank-only guard is blind to it.
+                       expires_at = CASE
+                         WHEN excluded.expires_at IS NULL OR capabilities.expires_at IS NULL THEN NULL
+                         WHEN julianday(excluded.expires_at) > julianday(capabilities.expires_at)
+                           THEN excluded.expires_at
+                         ELSE capabilities.expires_at
+                       END`,
+      ).bind(grantId, input.memberId, input.squadId, input.capability, input.expiresAt ?? null)
 
   return {
     ok: true,
@@ -324,8 +388,9 @@ async function readCommittedAccess(
         WHERE member_id = ?
           AND scope_type = 'squad'
           AND scope_id = ?
+          AND ${CAPABILITY_LIVE_PREDICATE('', '?')}
         LIMIT 1`,
-    ).bind(input.memberId, input.squadId).first<CapabilityGrant>(),
+    ).bind(input.memberId, input.squadId, nowCapabilitySql()).first<CapabilityGrant>(),
   ])
   if (
     !membership

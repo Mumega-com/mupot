@@ -99,12 +99,13 @@ export async function resolveCapabilities(env: Env, memberId: string): Promise<C
     `SELECT member_id, scope_type, scope_id, capability
        FROM capabilities
       WHERE member_id = ?1
+        AND ${CAPABILITY_LIVE_PREDICATE('', '?2')}
      UNION ALL
      SELECT member_id, 'squad' AS scope_type, squad_id AS scope_id, capability
        FROM channel_capability_grants
       WHERE member_id = ?1`,
   )
-    .bind(memberId)
+    .bind(memberId, nowCapabilitySql())
     .all<CapabilityGrant>()
   return rows.results ?? []
 }
@@ -215,6 +216,106 @@ export async function canOnSquad(
 ): Promise<boolean> {
   const deptId = await resolveSquadDepartment(env, squadId)
   return hasCapability(grants, 'squad', squadId, min, deptId)
+}
+
+/** SQL fragment gating a `capabilities` row on liveness (migration 0149).
+ *
+ *  Two things are load-bearing, and they are the same two src/auth/token-lifecycle.ts
+ *  spells out for member_tokens — the reasoning transfers because the failure modes do:
+ *
+ *  1. `expires_at IS NULL` means NON-EXPIRING. Every grant written before 0149 is
+ *     NULL, and SQL three-valued logic drops NULL from any comparison, so a
+ *     predicate without this arm would stop resolving EVERY grant in the pot at
+ *     once — a total authorization outage, self-inflicted.
+ *
+ *  2. julianday() on BOTH sides, never a text compare. mupot's timestamp columns
+ *     already hold two shapes ('2026-06-06 16:11:58' and ISO), and 'T' (0x54)
+ *     sorts above ' ' (0x20), so a textual `>` is wrong for the same instant and
+ *     fails open or closed depending purely on which shape the row carries.
+ *
+ *  THE PREDICATE IS NOT THE HARD PART. `capabilities` has 43 readers across 25
+ *  files. A first cut of 0149 applied this to ONE of them (resolveCapabilities)
+ *  and an adversarial pass blocked it: an expired grant would have been dead in
+ *  one reader and alive in forty-two, so the surface that DISPLAYS "expired"
+ *  would disagree with every surface that ENFORCES. Worse than no expiry at all.
+ *
+ *  tests/capability-readers-enforced.test.ts is what keeps that from recurring:
+ *  it enumerates every read from the source tree and requires each to consume
+ *  this export or be exempted by query fingerprint with a stated reason.
+ *
+ *  @param alias table alias used in the query ('' for an unaliased FROM).
+ *  @param nowParam the bound `now` parameter, e.g. '?2'.
+ */
+export const CAPABILITY_LIVE_PREDICATE = (alias: string, nowParam: string): string => {
+  const col = alias ? `${alias}.expires_at` : 'expires_at'
+  return `(${col} IS NULL OR julianday(${col}) > julianday(${nowParam}))`
+}
+
+/** Canonical `now` for the predicate above — SQLite's own datetime('now') shape,
+ *  so an application write and a migration write are never a mixed pair. */
+export function nowCapabilitySql(): string {
+  return new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, '')
+}
+
+export interface ExpiredCapabilitySweepResult {
+  /** Grants whose horizon has passed. They already resolve to nothing — this
+   *  reports them so a lapse is VISIBLE rather than merely silent. */
+  expired: Array<{ member_id: string; scope_type: string; scope_id: string | null; capability: string; expires_at: string }>
+}
+
+/**
+ * Sweep `capabilities` for grants that have lapsed (migration 0149).
+ *
+ * DELIBERATELY REPORT-ONLY. It does not DELETE, and that is the design:
+ *
+ *  - The predicate already makes an expired grant inert everywhere it is read,
+ *    so deleting adds no security and removes the only record that the grant
+ *    ever existed. "What was this agent allowed to do in September" has to stay
+ *    answerable after the fact — an expiry that erases its own evidence is worse
+ *    than one that leaves a lapsed row behind.
+ *  - A sweep that deletes is also a sweep that can delete the WRONG row after a
+ *    clock skew or a bad backfill, with no undo. Reporting is reversible;
+ *    deleting is not.
+ *
+ * The partial index idx_capabilities_expiry (0149) exists so this only visits
+ * rows that can actually lapse, which is a small minority of the table.
+ */
+export async function sweepExpiredCapabilities(env: Env): Promise<ExpiredCapabilitySweepResult> {
+  try {
+    const rows = await env.DB.prepare(
+      `SELECT member_id, scope_type, scope_id, capability, expires_at
+         FROM capabilities
+        WHERE expires_at IS NOT NULL
+          AND julianday(expires_at) <= julianday(?1)
+        ORDER BY expires_at ASC
+        LIMIT 500`,
+    )
+      .bind(nowCapabilitySql())
+      .all<{ member_id: string; scope_type: string; scope_id: string | null; capability: string; expires_at: string }>()
+    const expired = rows.results ?? []
+
+    if (expired.length > 0 && env.BUS?.send) {
+      for (const grant of expired) {
+        await env.BUS.send({
+          type: 'org.provisioned',
+          tenant: env.TENANT_SLUG,
+          ts: new Date().toISOString(),
+          payload: {
+            kind: 'capability_expired',
+            member_id: grant.member_id,
+            scope_type: grant.scope_type,
+            scope_id: grant.scope_id,
+            capability: grant.capability,
+            expires_at: grant.expires_at,
+          },
+        })
+      }
+    }
+    return { expired }
+  } catch {
+    // A sweep is telemetry. It must never take down the request or the cron.
+    return { expired: [] }
+  }
 }
 
 // ── middleware ──────────────────────────────────────────────────────────────────

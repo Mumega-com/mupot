@@ -3,6 +3,7 @@ import {
   readAgentInbox,
   sendAgentMessage,
 } from '../agents/messages'
+import { CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
 import { mcpEndpoint, requiredCanonicalOrigin } from '../dashboard/connect'
 import { rowsWritten } from '../lib/receipt'
 import { buildOrient } from '../orient/service'
@@ -481,9 +482,10 @@ export async function verifyAgentConnection(
           AND scope_type = 'squad'
           AND scope_id = ?
           AND capability IN ('observer', 'member')
+          AND ${CAPABILITY_LIVE_PREDICATE('', '?')}
         LIMIT 1`,
     )
-      .bind(receipt.member_id, receipt.home_squad_id)
+      .bind(receipt.member_id, receipt.home_squad_id, nowCapabilitySql())
       .first<{ capability: string }>()
     currentCapability = memberCapability?.capability ?? null
   } catch {

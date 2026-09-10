@@ -26,7 +26,7 @@
 //   register_agent_key — admin on the agent's squad → public-only signed-runtime identity
 
 import type { Capability, CapabilityGrant, ConnectionChannel, Env, BusEvent, Squad } from '../types'
-import { capabilityRank, hasCapability, isOrgAdmin, holdsCapabilityFloor } from '../auth/capability'
+import { capabilityRank, hasCapability, isOrgAdmin, holdsCapabilityFloor, CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
 import {
   createDepartment,
   createSquad,
@@ -1448,12 +1448,17 @@ const toolGrantAgentCapability: ToolSpec = {
     if (elevatedGrant) {
       const [existingCap, existingMembership] = await Promise.all([
         env.DB.prepare(
-          `SELECT capability FROM capabilities
+          // 0149: an EXPIRED grant is not authority, so it must not block a
+          // demotion either. Filtering here keeps "what the target currently
+          // holds" meaning the same thing in the guard as it does in every
+          // authorization check.
+          `SELECT capability, expires_at FROM capabilities
             WHERE member_id = ?1 AND scope_type = 'squad' AND scope_id = ?2
+              AND ${CAPABILITY_LIVE_PREDICATE('', '?3')}
             LIMIT 1`,
         )
-          .bind(binding.memberId, squad.id)
-          .first<{ capability: Capability }>(),
+          .bind(binding.memberId, squad.id, nowCapabilitySql())
+          .first<{ capability: Capability; expires_at: string | null }>(),
         env.DB.prepare(
           `SELECT capability FROM memberships WHERE agent_id = ?1 AND squad_id = ?2 LIMIT 1`,
         )
@@ -1476,11 +1481,25 @@ const toolGrantAgentCapability: ToolSpec = {
       }
     }
 
+    // 0149 — THE CONFERRED CAPABILITY CANNOT OUTLIVE THE APPROVAL THAT AUTHORIZED IT.
+    //
+    // An elevated caller writes the grant with the ELEVATION's own expires_at, so
+    // the standing row lapses on exactly the clock the human approved. A standing
+    // caller writes null, which is a permanent grant — unchanged behaviour.
+    //
+    // This is what makes the 'member' ceiling above unnecessary in principle: that
+    // cap exists because a time-boxed approval must not confer authority that
+    // outlives it, and the reason it HAD to be a rank cap is that `capabilities`
+    // had no expiry to bound the effect with. It does now. Lifting the cap is a
+    // deliberate follow-up (mupot#1360), not something to do in the same commit
+    // that introduces the mechanism — the ceiling stays until the expiry is
+    // proven in production.
     const outcome = await setAgentSquadAccess(env, {
       agentId: agent.id,
       memberId: binding.memberId,
       squadId: squad.id,
       capability: capability as AgentAccessCapability,
+      expiresAt: elevatedGrant ? elevatedGrant.expires_at : null,
     })
     if (!outcome.ok) {
       if (outcome.error === 'agent_not_found') return fail(404, outcome.error)

@@ -1,6 +1,7 @@
 // src/auth/sso.ts — Enterprise SSO & Domain Auto-Enrollment Engine.
 
 import type { Env } from '../types'
+import { CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from './capability'
 import { getJSON, setJSON } from '../dashboard/settings'
 import { createBus } from '../bus'
 import { resolveHumanMemberId } from '../members/resolve-human-member'
@@ -126,12 +127,13 @@ export async function autoEnrollSsoMember(
                    AND c.scope_type = 'org'
                    AND c.scope_id IS NULL
                    AND c.capability IN ('owner', 'admin')
+                   AND ${CAPABILITY_LIVE_PREDICATE('c', '?3')}
               ) AS is_admin
          FROM members m
         WHERE m.id = ?1 AND m.tenant = ?2
         LIMIT 1`,
     )
-      .bind(existingId, env.TENANT_SLUG)
+      .bind(existingId, env.TENANT_SLUG, nowCapabilitySql())
       .first<{ id: string; status: string; is_admin: number }>()
     if (existing) {
       const role = existing.is_admin === 1 ? 'admin' : 'member'

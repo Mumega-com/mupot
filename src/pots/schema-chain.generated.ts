@@ -2777,9 +2777,20 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_elevation_usage_log_grant" },
     ],
   },
+  {
+    file: "0149_capability_expiry.sql",
+    sha256: "4f893ecee6d163ccda7dd73a854720dc5cf76324047fc7200e6e171838cc60f6",
+    statements: [
+      "-- 0149_capability_expiry.sql — a standing capability grant may now END on its own.\n--\n-- WHY\n--\n-- Until now `capabilities` had no expiry. Every grant was permanent, and the\n-- only way to narrow one was for a human to remember to revoke it. That single\n-- fact is why \"let this agent stand up its own squad\" kept collapsing into\n-- \"make it an admin\": there was no shape in the schema for a grant that is both\n-- REAL (the agent acts alone, no approval per action) and BOUNDED (it stops\n-- without anyone doing anything).\n--\n-- It is also why operator_principal_required pushes people toward browser\n-- sessions (mupot#1360): with no way to hand an agent bounded authority, the\n-- only available authority is unbounded and belongs to a human.\n--\n-- MECHANISM ONLY. Exactly as 0099 was for member_tokens: add the column, change\n-- nothing about existing rows. Every current grant is NULL, which the predicate\n-- reads as non-expiring, so applying this expires nothing and alters no\n-- behaviour by itself.\n--\n-- The NULL arm is load-bearing for the same reason it is in\n-- src/auth/token-lifecycle.ts: SQL three-valued logic drops NULL rows from any\n-- comparison, so a predicate without an explicit `IS NULL` branch would stop\n-- resolving EVERY grant in the table at once — a total, instant, self-inflicted\n-- authorization outage. See CAPABILITY_LIVE_PREDICATE.\nALTER TABLE capabilities ADD COLUMN expires_at TEXT;",
+      "\n\n-- Sweep support: find grants past their horizon without scanning the table.\n-- Partial index on the expiring subset only — the overwhelming majority of rows\n-- are non-expiring and never need visiting.\nCREATE INDEX IF NOT EXISTS idx_capabilities_expiry\n    ON capabilities (expires_at)\n WHERE expires_at IS NOT NULL;",
+    ],
+    objects: [
+      { type: "index", name: "idx_capabilities_expiry" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "dd9bbe95b8907f0fa0e8968c090d964c4110c87349956e5397d35842cc9c8c02"
+export const SCHEMA_CHAIN_DIGEST: string = "14e6a4ccd3b0e073ffc14d13a85f2a4cb0e95d7374e3127a10cf7bafae188814"
