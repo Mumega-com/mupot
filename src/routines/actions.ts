@@ -20,6 +20,7 @@ import { projectVisibilityClause } from '../projects/access'
 import { principalCanReadProject, principalCanRunForSquad, type RoutinePrincipal } from './access'
 import {
   parseRoutineProposal,
+  routineProposalReceiptRef,
   type RoutineProposal,
   type RoutineProposalAction,
   type RoutineProposalReference,
@@ -435,6 +436,31 @@ async function validateActionScope(
   return null
 }
 
+function stampRoutineProposalReceipt(env: Env, run: RunContext) {
+  if (!run.flight_id) return null
+  const ref = routineProposalReceiptRef(run.id)
+  return env.DB.prepare(
+    `UPDATE flights
+        SET meta = json_set(
+              meta,
+              '$.receipt_refs',
+              CASE
+                WHEN EXISTS (
+                  SELECT 1 FROM json_each(meta, '$.receipt_refs') WHERE value = ?1
+                ) THEN json_extract(meta, '$.receipt_refs')
+                ELSE json_insert(
+                  COALESCE(json_extract(meta, '$.receipt_refs'), json_array()),
+                  '$[#]',
+                  ?1
+                )
+              END
+            )
+      WHERE id = ?2
+        AND tenant = ?3
+        AND json_extract(meta, '$.routine_run_id') = ?4`,
+  ).bind(ref, run.flight_id, run.tenant, run.id)
+}
+
 async function reserveAction(
   env: Env,
   run: RunContext,
@@ -449,6 +475,7 @@ async function reserveAction(
     if (keyed.status === 'cancelled' || keyed.status === 'failed') {
       const now = new Date().toISOString()
       const proposalJson = canonicalJson(proposal)
+      const stamp = stampRoutineProposalReceipt(env, run)
       const outcomes = await env.DB.batch([
         env.DB.prepare(
           `UPDATE routine_runs SET proposal_json = ?, result_summary = NULL, retry_at = NULL,
@@ -489,8 +516,9 @@ async function reserveAction(
           crypto.randomUUID(), run.assigned_agent_id, now, proposal.action.key,
           proposal.action.kind, run.id, run.tenant, proposalJson, keyed.id, run.tenant, now,
         ),
+        ...(stamp ? [stamp] : []),
       ])
-      if (!wrote(outcomes[0]) || !wrote(outcomes[1]) || !wrote(outcomes[2])) {
+      if (!wrote(outcomes[0]) || !wrote(outcomes[1]) || !wrote(outcomes[2]) || (stamp && !wrote(outcomes[3]))) {
         const raced = await loadAction(env, run.id, proposal.action.key)
         if (raced && raced.status !== 'cancelled' && raced.status !== 'failed') {
           return { action: raced, duplicate: true }
@@ -515,6 +543,7 @@ async function reserveAction(
   const id = crypto.randomUUID()
   const now = new Date().toISOString()
   const proposalJson = canonicalJson(proposal)
+  const stamp = stampRoutineProposalReceipt(env, run)
   let outcomes: D1Result<unknown>[]
   try {
     outcomes = await env.DB.batch([
@@ -548,6 +577,7 @@ async function reserveAction(
         crypto.randomUUID(), run.assigned_agent_id, now, proposal.action.key,
         proposal.action.kind, run.id, run.tenant, proposalJson,
       ),
+      ...(stamp ? [stamp] : []),
     ])
   } catch {
     const raced = await loadAction(env, run.id, proposal.action.key)
@@ -556,7 +586,7 @@ async function reserveAction(
     }
     return { error: 'receipt_failed' }
   }
-  if (!wrote(outcomes[0]) || !wrote(outcomes[1]) || !wrote(outcomes[2])) {
+  if (!wrote(outcomes[0]) || !wrote(outcomes[1]) || !wrote(outcomes[2]) || (stamp && !wrote(outcomes[3]))) {
     const raced = await loadAction(env, run.id, proposal.action.key)
     if (raced && raced.kind === proposal.action.kind && canonicalJson(JSON.parse(raced.input_json)) === inputJson) {
       return { action: raced, duplicate: true }

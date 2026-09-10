@@ -32,6 +32,7 @@ import {
   listFlights,
   listFlightProjectMismatchTaskIds,
   listIncompleteFlightTaskIds,
+  routineControlLandLacksWitness,
   FlightProjectError,
   type FlightStatus,
   type TriggerSource,
@@ -362,6 +363,9 @@ flightsApp.post('/:id/land', async (c) => {
       const incompleteTaskIds = await listIncompleteFlightTaskIds(c.env, governedMeta.task_ids)
       if (incompleteTaskIds.length > 0) {
         return c.json({ error: 'flight_tasks_incomplete', task_ids: incompleteTaskIds }, 409)
+      }
+      if (governedMeta.routine_run_id && await routineControlLandLacksWitness(c.env, id)) {
+        return c.json({ error: 'routine_proposal_receipt_missing' }, 409)
       }
       return c.json({ error: 'flight_transition_conflict' }, 409)
     }
