@@ -24,12 +24,12 @@ artifact. Neither system independently reads the work today.
 
 ## The core, four things
 
-| Thing | What it means | Tools that stay | Receipt on 2026-09-10 |
+| Thing | What it means | Surfaces that stay (MCP tool unless marked HTTP or internal) | Receipt on 2026-09-10 |
 |---|---|---|---|
-| **Identity** | which *seat* did this, not which human's token; a runtime proves it is the agent | `register_agent_key`, `token_binding_attest`, signed fleet attach (`POST /api/fleet/attach-signed`), `mint_agent_token`, `revoke_agent_token`, `runtime_seat_register_pending`, `verify_agent_connection`, `provision_agent_connection`, `bootstrap_self` | boot-time bearer self-report refused for a keyed agent (`refused_signed_attach_required`); `runner_record` refused a spoofed `seat_agent_id` |
-| **Door** | one remote MCP over HTTPS with OAuth consent; the same tools whether the agent arrives from Claude Desktop, ChatGPT, a CLI, or a daemon | `boot_context`, `orient`, `status`, the OAuth consent flow, `connect` | Hadi Dev on Codex Desktop delivered a four-part document through the Hadi ChatGPT connector and received correlated ACKs; no other product in the 2026-09-10 map offers a hosted-agent door (Paperclip's MCP is stdio only) |
-| **Gate** | a verdict by someone who is not the author, enforced by a grant, refused in code | `grant_gate_capability`, `revoke_gate_capability`, `grant_list_gate_capabilities`, `grant_agent_capability`, `task_verdict`, `task_verdict_reverse`, `request_elevation`, `elevation_status`, `reveal_credential_claim` | `task_verdict` refused a non-holder of `gate:athena`; `blocked→review` refused as an invalid transition; the seam ratchet refused a test bypassing `invokeTool` |
-| **Receipt** | one row tying seat, artifact hash, and verdict to the issue, thread, and PR that live elsewhere | `runner_record`, `runner_list`, `task_dispatch_runtime_receipt`, `execution_receipt_get`, the artifact-shape verifier, the verdict ledger | receipts `a01b1960`, `762f1a1d`, `2285378f`; verdict `2324d6b9` |
+| **Identity** | which *seat* did this, not which human's token; a runtime proves it is the agent | `register_agent_key`, `token_binding_attest`, `mint_agent_token`, `revoke_agent_token`, `runtime_seat_register_pending`, `verify_agent_connection`, `provision_agent_connection`, `bootstrap_self`; HTTP: `POST /api/fleet/attach-signed` | `boot_context` at 13:54Z for agent `c855f82c` returned `registry.outcome: refused_signed_attach_required` ("this agent has a registered signing key, so its fleet row moves by signature only"); `runner_record` with `seat_agent_id` = cursor's id from Kasra's session returned `forbidden_seat_spoofing: seat_agent_id must match authenticated bound agent` (task `ac175612`, ~14:38Z) |
+| **Door** | one remote MCP over HTTPS with OAuth consent; the same tools whether the agent arrives from Claude Desktop, ChatGPT, a CLI, or a daemon | `boot_context`, `orient`, `status`, `connect`; HTTP: the OAuth consent flow (`src/mcp/oauth-authorize.ts`) | Hadi Dev on Codex Desktop delivered a four-part document through the Hadi ChatGPT connector (agent `76f81c84`): inbox seqs 4307, 4309, 4311, 4313 (message ids `ff96857b`, `22f3107f`, `4605539c`, `2115fab2`), each `is_intact: true`; Kasra's ACKs seqs 4320-4323. No other product in the 2026-09-10 map offers a hosted-agent door: Paperclip's `packages/mcp-server/src/index.ts` constructs only `StdioServerTransport` |
+| **Gate** | a verdict by someone who is not the author, enforced by a grant, refused in code | `grant_gate_capability`, `revoke_gate_capability`, `grant_list_gate_capabilities`, `grant_agent_capability`, `task_verdict`, `task_verdict_reverse`, `request_elevation`, `elevation_status`, `reveal_credential_claim`; internal: `src/gates/grants.ts` | `task_verdict` on task `ac175612` from Kasra (holder of `gate:kasra-core`, not `gate:athena`) returned `forbidden {need: "gate:athena"}` (~15:05Z); `task_update {status: review}` on the same task while `blocked` returned `invalid_transition {from: blocked, to: review}` (~14:38Z); CI job `mcp-tool-seam` (run 34502121740, job 102955206703) failed PR #1393 head `4ca5b2da` for a test calling `.run()` directly, baseline 4 |
+| **Receipt** | one row tying seat, artifact hash, and verdict to the issue, thread, and PR that live elsewhere | `runner_record`, `runner_list`, `task_dispatch_runtime_receipt`, `execution_receipt_get`; internal: `src/tasks/artifact-verification.ts` (shape verifier), `src/tasks/runtime-receipts.ts` (the only legitimate `result` writer), the `task_verdicts` table | runner receipts `a01b1960`, `762f1a1d` (task `ac175612`), `2285378f` (task `f1ca34cf`); verdict `2324d6b9`; the shape verifier refused the in-Worker executor's prose on `ac175612` at 14:21:17Z with `artifact_verification_failed: refusal_prose` |
 
 Plus a thin mailbox for wakes: `inbox`, `inbox_lease`, `inbox_ack`,
 `inbox_consumer_status`. Keep it thin, or replace with Cloudflare Queues; either way
@@ -44,7 +44,8 @@ test on the exact ref, checks freshness against the dispatch, and refuses to let
 anyone say done otherwise. Today `verifyTaskArtifactShape` checks that a path and a
 64-hex hash are present and that the text is not refusal prose. The independent
 verification on 2026-09-10 was performed by Athena and the kasra-review arm, by hand,
-on a live ref. That practice is the product; it is not yet code. It is the one piece
+on a live ref (mutation tables in the comments on PRs #1387 and #1393). That practice
+is the product; it is not yet code. It is the one piece
 worth owning that no tool in the map has.
 
 ## Invariants the core must hold
@@ -69,7 +70,9 @@ the property is broken.
    Carrying a verdict on someone's behalf is a documented exception, not a path.
 7. **Every spend meters, every completion stamps only completion.** mupot#1389,
    mupot#1392.
-8. **A refusal is a receipt.** Every refusal above is logged with actor and reason.
+8. **A refusal is a receipt.** Every refusal above returned a structured error to the
+   caller; whether each is also persisted with actor and reason is not verified here
+   and is part of the verifier work.
 
 ## Not core — addons or removed
 
