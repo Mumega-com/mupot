@@ -16,6 +16,31 @@ export const MAX_SCHEDULER_DB_STATEMENTS = 3
 const LEASE_SECONDS = 300
 const ACTIVE_RUN_STATUSES = "'leased','observing','waiting','running'"
 const NON_TERMINAL_RUN_STATUSES = "'queued','leased','observing','waiting','running'"
+const LIVE_FLIGHT_STATUSES = "'preflight','running','sleeping','waiting'"
+
+/** A flight-less non-terminal run older than this must not pin overlap (mupot#1369). */
+export const OVERLAP_PIN_MAX_AGE_MS = 24 * 60 * 60 * 1000
+
+/**
+ * A run still blocks skip/claim only if it is in `statuses` AND either its
+ * flight is still live, or it has no flight yet and is younger than the pin
+ * window. A run whose flight is already terminal is not a pin.
+ */
+function runStillPinsSql(alias: string, statuses: string): string {
+  return `${alias}.status IN (${statuses})
+    AND (
+      EXISTS (
+        SELECT 1 FROM flights f
+         WHERE f.id = ${alias}.flight_id
+           AND f.tenant = ${alias}.tenant
+           AND f.status IN (${LIVE_FLIGHT_STATUSES})
+      )
+      OR (
+        ${alias}.flight_id IS NULL
+        AND ${alias}.created_at > ?
+      )
+    )`
+}
 
 interface DueRoutine extends Routine {
   occurrence_count: number
@@ -115,6 +140,8 @@ async function createDueOccurrence(
   const policyJson = JSON.stringify(policySnapshot(routine))
   const createdEventId = crypto.randomUUID()
   const skippedEventId = crypto.randomUUID()
+  const pinCutoff = new Date(now.getTime() - OVERLAP_PIN_MAX_AGE_MS).toISOString()
+  const skipPins = runStillPinsSql('r', NON_TERMINAL_RUN_STATUSES)
 
   const outcomes = await env.DB.batch([
     env.DB.prepare(
@@ -126,8 +153,8 @@ async function createDueOccurrence(
         CASE
           WHEN NOT EXISTS (SELECT 1 FROM projects WHERE id = ? AND status = 'active') THEN 'skipped'
           WHEN ? = 'skip' AND EXISTS (
-            SELECT 1 FROM routine_runs
-             WHERE tenant = ? AND routine_id = ? AND status IN (${NON_TERMINAL_RUN_STATUSES})
+            SELECT 1 FROM routine_runs r
+             WHERE r.tenant = ? AND r.routine_id = ? AND ${skipPins}
           ) THEN 'skipped'
           WHEN ? = 'queue' AND (
             SELECT COUNT(*) FROM routine_runs
@@ -138,8 +165,8 @@ async function createDueOccurrence(
         CASE
           WHEN NOT EXISTS (SELECT 1 FROM projects WHERE id = ? AND status = 'active') THEN 'project_not_active'
           WHEN ? = 'skip' AND EXISTS (
-            SELECT 1 FROM routine_runs
-             WHERE tenant = ? AND routine_id = ? AND status IN (${NON_TERMINAL_RUN_STATUSES})
+            SELECT 1 FROM routine_runs r
+             WHERE r.tenant = ? AND r.routine_id = ? AND ${skipPins}
           ) THEN 'overlap'
           WHEN ? = 'queue' AND (
             SELECT COUNT(*) FROM routine_runs
@@ -150,8 +177,8 @@ async function createDueOccurrence(
         CASE
           WHEN NOT EXISTS (SELECT 1 FROM projects WHERE id = ? AND status = 'active') THEN ?
           WHEN ? = 'skip' AND EXISTS (
-            SELECT 1 FROM routine_runs
-             WHERE tenant = ? AND routine_id = ? AND status IN (${NON_TERMINAL_RUN_STATUSES})
+            SELECT 1 FROM routine_runs r
+             WHERE r.tenant = ? AND r.routine_id = ? AND ${skipPins}
           ) THEN ?
           WHEN ? = 'queue' AND (
             SELECT COUNT(*) FROM routine_runs
@@ -171,11 +198,11 @@ async function createDueOccurrence(
     ).bind(
       runId, routine.tenant, routine.project_id, routine.id, routine.revision, policyJson,
       occurrenceKey, routine.trigger_kind, routine.next_run_at,
-      routine.project_id, routine.overlap_policy, routine.tenant, routine.id,
+      routine.project_id, routine.overlap_policy, routine.tenant, routine.id, pinCutoff,
       routine.overlap_policy, routine.tenant, routine.id,
-      routine.project_id, routine.overlap_policy, routine.tenant, routine.id,
+      routine.project_id, routine.overlap_policy, routine.tenant, routine.id, pinCutoff,
       routine.overlap_policy, routine.tenant, routine.id,
-      routine.project_id, nowIso, routine.overlap_policy, routine.tenant, routine.id, nowIso,
+      routine.project_id, nowIso, routine.overlap_policy, routine.tenant, routine.id, pinCutoff, nowIso,
       routine.overlap_policy, routine.tenant, routine.id, nowIso,
       nowIso, nowIso,
       routine.id, routine.tenant, routine.project_id, routine.revision, routine.next_run_at,
@@ -300,6 +327,7 @@ export async function claimRoutineRun(
   if (await skipStaleRun(env, runId, owner, nowIso)) return false
   if (await failExhaustedQueuedRun(env, runId, owner, nowIso)) return false
   const leaseExpiresAt = new Date(now.getTime() + LEASE_SECONDS * 1000).toISOString()
+  const pinCutoff = new Date(now.getTime() - OVERLAP_PIN_MAX_AGE_MS).toISOString()
   const eventId = crypto.randomUUID()
   const outcomes = await env.DB.batch([
     env.DB.prepare(
@@ -323,7 +351,7 @@ export async function claimRoutineRun(
              WHERE active.tenant = routine_runs.tenant
                AND active.routine_id = routine_runs.routine_id
                AND active.id <> routine_runs.id
-               AND active.status IN (${ACTIVE_RUN_STATUSES})
+               AND ${runStillPinsSql('active', ACTIVE_RUN_STATUSES)}
           )
           AND NOT EXISTS (
             SELECT 1 FROM routine_runs earlier
@@ -335,7 +363,7 @@ export async function claimRoutineRun(
                  OR (earlier.created_at = routine_runs.created_at AND earlier.id < routine_runs.id))
           )
           AND ${sqlNotCancellationPending('routine_runs')}`,
-    ).bind(owner, leaseExpiresAt, nowIso, runId, env.TENANT_SLUG, nowIso),
+    ).bind(owner, leaseExpiresAt, nowIso, runId, env.TENANT_SLUG, nowIso, pinCutoff),
     env.DB.prepare(
       `INSERT INTO routine_run_events (
         id, tenant, project_id, run_id, kind, actor_type, actor_id,
@@ -431,6 +459,7 @@ export async function runRoutineScheduler(
 ): Promise<RoutineSchedulerSummary> {
   const recovered = await recoverExpiredRoutineLeases(env, now)
   const nowIso = now.toISOString()
+  const pinCutoff = new Date(now.getTime() - OVERLAP_PIN_MAX_AGE_MS).toISOString()
   const due = await env.DB.prepare(
     `SELECT r.*,
             (SELECT COUNT(*) FROM routine_runs rr
@@ -475,11 +504,11 @@ export async function runRoutineScheduler(
             OR NOT EXISTS (
               SELECT 1 FROM routine_runs active
                WHERE active.tenant = rr.tenant AND active.routine_id = rr.routine_id
-                 AND active.id <> rr.id AND active.status IN (${ACTIVE_RUN_STATUSES})
+                 AND active.id <> rr.id AND ${runStillPinsSql('active', ACTIVE_RUN_STATUSES)}
             )
           )
         ORDER BY rr.created_at ASC, rr.id ASC LIMIT ?`,
-    ).bind(env.TENANT_SLUG, nowIso, MAX_CLAIMS_PER_TICK).all<{ id: string }>()
+    ).bind(env.TENANT_SLUG, nowIso, pinCutoff, MAX_CLAIMS_PER_TICK).all<{ id: string }>()
     : { results: [] as { id: string }[] }
   let claimed = 0
   let dispatchErrors = 0

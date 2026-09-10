@@ -336,22 +336,45 @@ export async function reapStalledFlight(
 
   const gateReason = `watchdog_reap: ${reason.slice(0, 400)}`
   const previousStatus = flight.status
+  const nowIso = new Date(nowMs).toISOString()
+  const runReason = `watchdog_reap: ${reason.slice(0, 200)}`
 
-  // 1. Atomic D1 state transition
-  const transition = await env.DB.prepare(
-    `UPDATE flights
-        SET status = 'failed',
-            gate_reason = ?3,
-            ended_at = ?4
-      WHERE id = ?1
-        AND tenant = ?2
-        AND status IN ('preflight', 'running', 'sleeping')
-      RETURNING id, status`,
-  )
-    .bind(flightId, env.TENANT_SLUG, gateReason, nowMs)
-    .all<{ id: string; status: string }>()
+  // Flight and its spawning routine_run must move together. The overlap
+  // predicate treats a non-terminal run as a permanent pin; leaving the run
+  // behind after this UPDATE is how cron died on 2026-08-22 (mupot#1369).
+  // Statement 2 is guarded on the flight already being failed in this
+  // transaction, so a raced no-op on the flight cannot fail the run alone.
+  const transition = await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE flights
+          SET status = 'failed',
+              gate_reason = ?3,
+              ended_at = ?4
+        WHERE id = ?1
+          AND tenant = ?2
+          AND status IN ('preflight', 'running', 'sleeping')
+        RETURNING id, status`,
+    ).bind(flightId, env.TENANT_SLUG, gateReason, nowMs),
+    env.DB.prepare(
+      `UPDATE routine_runs
+          SET status = 'failed',
+              waiting_reason = NULL,
+              lease_owner = NULL,
+              lease_expires_at = NULL,
+              result_summary = ?1,
+              finished_at = ?2,
+              updated_at = ?2
+        WHERE tenant = ?3
+          AND flight_id = ?4
+          AND status IN ('queued','leased','observing','waiting','running')
+          AND EXISTS (
+            SELECT 1 FROM flights
+             WHERE id = ?4 AND tenant = ?3 AND status = 'failed' AND ended_at = ?5
+          )`,
+    ).bind(runReason, nowIso, env.TENANT_SLUG, flightId, nowMs),
+  ])
 
-  const rows = transition.results ?? []
+  const rows = transition[0]?.results ?? []
   if (rows.length === 0) {
     return {
       transitioned: false,
