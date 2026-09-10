@@ -20,9 +20,10 @@
 import { describe, expect, it } from 'vitest'
 import { resolveTaskAssignee, resolveTaskAssigneeMember } from '../src/tasks/assignee'
 import { createTask } from '../src/tasks/service'
+import { invokeTool } from '../src/mcp'
 import { runTaskExecution } from '../src/agents/execute'
 import { TASK_SELECT_COLUMNS } from '../src/tasks/ranking'
-import type { Env } from '../src/types'
+import type { AuthContext, Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
 
@@ -385,6 +386,151 @@ describe('every reader knows the member axis exists — gate BLOCK on PR #1373',
       expect(chatCalls, 'the agent could not pick up ordinary unowned work either').toBeGreaterThan(0)
     } finally {
       h.sqlite.close()
+    }
+  })
+})
+
+// ── task_list must be able to FIND the human's work ───────────────────────────
+//
+// Task 676ae5db's done_when has three clauses, and the third is the one that was
+// missing: "a task can be created/updated with a human assignee AND SHOWS UP IN
+// THAT PERSON'S QUEUE."
+//
+// Measured 2026-09-10 on 65758b44: task_create and task_update both accept
+// assignee_member_id, the single-assignee triggers enforce it, ranking selects
+// it — and NOTHING read BY it. Zero references in src/attention/service.ts
+// (needs_you_list), zero in src/dashboard/*, and task_list exposed only
+// assignee_agent_id. The column was WRITE-ONLY: a person could be given work
+// they had no way to query.
+//
+// That is the same shape as the escalation gate_owner defect found the same
+// night (mupot#1381): the write path lands, every layer reports success, and the
+// read path does not exist.
+//
+// These tests enter through invokeTool, never a ToolSpec's run() — the min
+// capability floor is enforced BEFORE run(), so calling run() directly would
+// test a path production never takes (and scripts/check-mcp-tool-seam.mjs
+// enforces the same rule).
+
+describe('task_list — the human axis is readable, not just writable', () => {
+  function memberAuth(): AuthContext {
+    return {
+      userId: HUMAN,
+      memberId: HUMAN,
+      email: 'hadi@mumega.com',
+      role: 'member',
+      tenant: 'mumega',
+      channel: 'dashboard',
+      boundAgentId: null,
+      capabilities: [
+        { member_id: HUMAN, scope_type: 'squad', scope_id: SQUAD, capability: 'admin' },
+      ],
+    } as unknown as AuthContext
+  }
+
+  async function seedTwoTasks(env: Env): Promise<void> {
+    await createTask(env, {
+      squad_id: SQUAD,
+      title: 'Human-owned: editorial gate',
+      body: 'Hadi retains editorial authority',
+      done_when: 'Hadi approves the draft',
+      assignee_member_id: HUMAN,
+    }, { actor: { kind: 'agent', id: AGENT } })
+
+    await createTask(env, {
+      squad_id: SQUAD,
+      title: 'Agent-owned: ship the fix',
+      body: 'routine agent work',
+      done_when: 'PR merged',
+      assignee_agent_id: AGENT,
+    }, { actor: { kind: 'agent', id: AGENT } })
+  }
+
+  it('returns the human-owned task and EXCLUDES the agent-owned one', async () => {
+    const { h, env } = harness()
+    try {
+      await seedTwoTasks(env)
+
+      const res = await invokeTool(
+        memberAuth(),
+        env,
+        'task_list',
+        { squad_id: SQUAD, assignee_member_id: HUMAN },
+        'https://pot.example',
+      )
+
+      expect(res.ok, `task_list failed: ${JSON.stringify(res)}`).toBe(true)
+      const tasks = (res.result as { tasks: { title: string; assignee_member_id: string | null }[] }).tasks
+
+      // Both halves matter. Returning the human's task proves the filter reads
+      // the column; excluding the agent's proves it is a FILTER and not a
+      // squad-wide list that happens to contain the row.
+      expect(tasks.map((t) => t.title)).toEqual(['Human-owned: editorial gate'])
+      expect(tasks[0].assignee_member_id).toBe(HUMAN)
+    } finally {
+      h.close()
+    }
+  })
+
+  it('a DIFFERENT member id returns nothing — the filter is not decorative', async () => {
+    const { h, env } = harness()
+    try {
+      await seedTwoTasks(env)
+
+      const res = await invokeTool(
+        memberAuth(),
+        env,
+        'task_list',
+        { squad_id: SQUAD, assignee_member_id: OUTSIDER },
+        'https://pot.example',
+      )
+
+      expect(res.ok).toBe(true)
+      expect((res.result as { tasks: unknown[] }).tasks).toEqual([])
+    } finally {
+      h.close()
+    }
+  })
+
+  it('POSITIVE CONTROL — the agent axis still filters, so the above is not a dead harness', async () => {
+    const { h, env } = harness()
+    try {
+      await seedTwoTasks(env)
+
+      const res = await invokeTool(
+        memberAuth(),
+        env,
+        'task_list',
+        { squad_id: SQUAD, assignee_agent_id: AGENT },
+        'https://pot.example',
+      )
+
+      expect(res.ok).toBe(true)
+      const tasks = (res.result as { tasks: { title: string }[] }).tasks
+      expect(tasks.map((t) => t.title)).toEqual(['Agent-owned: ship the fix'])
+    } finally {
+      h.close()
+    }
+  })
+
+  // Rejected rather than silently empty. A task has exactly one owner, so this
+  // combination can never match — and a zero-row success reads as "no such work"
+  // rather than "impossible query", which is the success-shaped no-op again.
+  it('REFUSES both axes at once instead of returning an empty list', async () => {
+    const { h, env } = harness()
+    try {
+      const res = await invokeTool(
+        memberAuth(),
+        env,
+        'task_list',
+        { squad_id: SQUAD, assignee_member_id: HUMAN, assignee_agent_id: AGENT },
+        'https://pot.example',
+      )
+
+      expect(res.ok).toBe(false)
+      expect(JSON.stringify(res)).toContain('task_single_assignee')
+    } finally {
+      h.close()
     }
   })
 })
