@@ -286,11 +286,12 @@ describe('Project Routines dashboard', () => {
       ) VALUES (
         'answer-control-flight', 'tenant-a', 'project-a', 'agent-a', 'Ask a human', 'running', 'schedule',
         200000, 0, 1752940800000, 1752940800000,
-        '{"schema":"mupot.flight.meta/v1","goal_id":"routine:run-waiting","objective_id":"routine:routine-enabled:2","squad_ids":["squad-a"],"task_ids":["answer-control-task"],"done_when":["A correlated Routine proposal is accepted."],"artifact_refs":[],"receipt_refs":[],"confidentiality":"internal","publication_target":"none","parent_flight_id":null,"routine_run_id":"run-waiting","routine_revision":2}'
+        '{"schema":"mupot.flight.meta/v1","goal_id":"routine:run-waiting","objective_id":"routine:routine-enabled:2","squad_ids":["squad-a"],"task_ids":["answer-control-task"],"done_when":["A correlated Routine proposal is accepted."],"artifact_refs":[],"receipt_refs":["routine.proposal:run-waiting"],"confidentiality":"internal","publication_target":"none","parent_flight_id":null,"routine_run_id":"run-waiting","routine_revision":2}'
       );
       UPDATE routine_runs
          SET waiting_reason = 'answer', task_id = 'answer-control-task',
-             flight_id = 'answer-control-flight', assigned_agent_id = 'agent-a'
+             flight_id = 'answer-control-flight', assigned_agent_id = 'agent-a',
+             proposal_json = '{"version":"routine.proposal/v1","run_id":"run-waiting","project_id":"project-a","situation_digest":"${'ab'.repeat(32)}","summary":"Ask which event is authoritative.","action":{"key":"question-1","kind":"ask_human","input":{"question":"Which event is authoritative?","choices":["Booked","Paid"],"references":[]}}}'
        WHERE id = 'run-waiting';
       INSERT INTO routine_run_actions (
         id, tenant, project_id, run_id, action_key, kind, input_json,
