@@ -42,7 +42,7 @@ import { isMissingWebSessionsTableError } from '../auth/web-sessions'
 import { csrf } from 'hono/csrf'
 import { assertBatchWritten } from '../lib/receipt'
 // The FROZEN capability API — everyone codes against these exact signatures.
-import { requireCapability, capabilityRank, actorMaxRankOnScope } from '../auth/capability'
+import { requireCapability, capabilityRank, actorMaxRankOnScope, CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
 // Shared token lifecycle — the single mint/revoke path (also used by the dashboard).
 // sha256Hex/mintRawToken are imported ONLY for the invite-accept atomic batch.
 import {
@@ -491,11 +491,13 @@ async function targetRankCeiling(
 ): Promise<Response | null> {
   const existing = scopeId === null
     ? await c.env.DB.prepare(
-        'SELECT capability FROM capabilities WHERE member_id = ? AND scope_type = ? AND scope_id IS NULL LIMIT 1',
-      ).bind(targetMemberId, scopeType).first<{ capability: Capability }>()
+        `SELECT capability FROM capabilities WHERE member_id = ? AND scope_type = ? AND scope_id IS NULL
+           AND ${CAPABILITY_LIVE_PREDICATE('', '?')} LIMIT 1`,
+      ).bind(targetMemberId, scopeType, nowCapabilitySql()).first<{ capability: Capability }>()
     : await c.env.DB.prepare(
-        'SELECT capability FROM capabilities WHERE member_id = ? AND scope_type = ? AND scope_id = ? LIMIT 1',
-      ).bind(targetMemberId, scopeType, scopeId).first<{ capability: Capability }>()
+        `SELECT capability FROM capabilities WHERE member_id = ? AND scope_type = ? AND scope_id = ?
+           AND ${CAPABILITY_LIVE_PREDICATE('', '?')} LIMIT 1`,
+      ).bind(targetMemberId, scopeType, scopeId, nowCapabilitySql()).first<{ capability: Capability }>()
 
   if (!existing) return null
   const actorRank = await actorMaxRankOnScope(c, scopeType, scopeId)

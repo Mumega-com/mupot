@@ -6,6 +6,7 @@
 // Distinct seats persist independently on (tenant, member_id, label).
 
 import type { Env } from '../types'
+import { CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
 import { classify, humanAge, type FleetLiveness } from '../dashboard/fleet'
 import type { AgentIdentity } from '../auth/member-bearer'
 import { listFlights } from '../flight/service'
@@ -330,15 +331,16 @@ export async function listPresence(env: Env, nowMs: number, squadIds?: string[] 
         ))
         OR member_id IN (
           SELECT member_id FROM capabilities
-          WHERE (scope_type = 'squad' AND scope_id IN (SELECT CAST(value AS TEXT) FROM json_each(?2)))
+          WHERE ${CAPABILITY_LIVE_PREDICATE('', '?3')}
+            AND ((scope_type = 'squad' AND scope_id IN (SELECT CAST(value AS TEXT) FROM json_each(?2)))
              OR (scope_type = 'department' AND scope_id IN (
                   SELECT department_id FROM squads WHERE id IN (SELECT CAST(value AS TEXT) FROM json_each(?2))
-                ))
+                )))
         )
       )`
   }
   const statement = env.DB.prepare(`${PRESENCE_SELECT}${scopeClause} ORDER BY last_seen_at DESC LIMIT 200`)
-  const bound = idsJson === null ? statement.bind(env.TENANT_SLUG) : statement.bind(env.TENANT_SLUG, idsJson)
+  const bound = idsJson === null ? statement.bind(env.TENANT_SLUG) : statement.bind(env.TENANT_SLUG, idsJson, nowCapabilitySql())
   const res = await bound.all<PresenceRow>()
   const rows = (res.results ?? []).map((r) => {
     const ms = sqliteUtcToMs(r.last_seen_at)
