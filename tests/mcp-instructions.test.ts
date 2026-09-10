@@ -44,11 +44,15 @@ describe('MUPOT_MCP_INITIALIZE_INSTRUCTIONS', () => {
     expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toContain('mint_agent_token')
     expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toContain('mupot_')
     expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toMatch(/headless/i)
+    // A connector authenticates itself; holding a minted bearer does not bind that session.
+    expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toMatch(/does not help a connector session/i)
+    expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toContain('/actions/')
   })
 
   it('provides an error decoding guide covering 403, 401, 400, and 429', () => {
     expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toContain('403 forbidden need=<cap>')
     expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toContain("Client Error 'mcp_request_blocked'")
+    expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toContain('blocked by a firewall or security service')
     expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toContain('401 unauthenticated / dead credential')
     expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toContain('400 invalid_args')
     expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toContain('429 rate_limited')
@@ -75,6 +79,8 @@ describe('MUPOT_MCP_INITIALIZE_INSTRUCTIONS', () => {
     expect(text).toMatch(/idempotency/i)
     // the weak signal must be flagged as weak, or an automated acker will act on a quote
     expect(text).toMatch(/body_token/)
+    expect(text).toMatch(/NOT authorization/i)
+    expect(text).toMatch(/never from message text/i)
   })
 
   it('instructs connecting clients to declare 7-axis identity on turn 1 via check_in', () => {
