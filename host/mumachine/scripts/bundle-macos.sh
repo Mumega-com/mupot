@@ -11,7 +11,12 @@ cd "$crate_dir"
 cargo build --release --locked --features gui
 bundle_dir="$crate_dir/dist/Mupot Connect.app"
 mkdir -p "$bundle_dir/Contents/MacOS" "$bundle_dir/Contents/Resources"
-cp target/release/mumachine "$bundle_dir/Contents/MacOS/mumachine"
+# Replace the executable by rename so an already-running preview keeps its
+# existing executable inode while the next launch receives the updated build.
+temporary_executable="$(mktemp "$bundle_dir/Contents/MacOS/.mumachine.XXXXXX")"
+cp target/release/mumachine "$temporary_executable"
+chmod 755 "$temporary_executable"
+mv -f "$temporary_executable" "$bundle_dir/Contents/MacOS/mumachine"
 cp assets/Info.plist "$bundle_dir/Contents/Info.plist"
 iconset_dir="$crate_dir/dist/Mupot Connect.iconset"
 mkdir -p "$iconset_dir"

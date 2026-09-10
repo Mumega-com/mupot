@@ -252,11 +252,12 @@ impl ConnectApp {
     fn report_error(&mut self, error: Error) {
         let message = match error {
             Error::InvalidOrigin => "Enter your Mupot address starting with https://, such as https://your-pot.example, without a page path or extra URL parameters.",
-            Error::InvalidInput => "Enter your organization ID and an existing agent name or ID.",
+            Error::InvalidInput => "Enter your organization ID and the existing agent’s exact UUID. Copy the full agent ID from Mupot; no new agent is required.",
             Error::IdentityMismatch => "The returned identity or tenant did not match. Nothing was saved. Check the agent and tenant, then reconnect.",
             Error::Expired => "This approval or credential has expired. Start a new connection when ready.",
             Error::Refused => "Mupot refused this request. Check your browser approval and agent access before trying again.",
             Error::Storage => "The app could not access its local profile or Keychain item. The connection was not saved successfully.",
+            Error::StorageBusy => "Another Mupot Connect window is updating saved connections. Try again after it finishes.",
             Error::Unsupported => "Secure credential storage is unavailable on this platform. Credentials cannot be saved here.",
             Error::Transport => "Mupot could not be reached securely. Check the origin and your connection, then try again.",
             Error::ResponseTooLarge | Error::InvalidResponse => "Mupot returned an unsupported response. No new credential was saved. Check the server and retry explicitly.",
@@ -407,13 +408,9 @@ impl ConnectApp {
             match self.flow.poll_request(Instant::now()) {
                 Ok(Some(request)) => {
                     if let Some(client) = self.client.clone() {
-                        let desired = self.desired.clone();
                         let tenant = self.tenant.clone();
                         self.spawn(ctx, move || {
-                            Event::Poll(
-                                request.operation,
-                                client.poll_device(&request.code, &desired, &tenant),
-                            )
+                            Event::Poll(request.operation, client.poll_device(&request, &tenant))
                         });
                     }
                 }
@@ -450,7 +447,7 @@ impl ConnectApp {
         self.snapshot = None;
         self.origin = profile.origin.clone();
         self.tenant = profile.tenant.clone();
-        self.desired = profile.agent_slug.clone();
+        self.desired = profile.agent_id.clone();
         let client = match PotOrigin::parse(&profile.origin).and_then(MupotClient::new) {
             Ok(client) => client,
             Err(error) => {
@@ -469,6 +466,20 @@ impl ConnectApp {
                     .and_then(|token| client.restore(&profile, token)),
             )
         });
+    }
+
+    fn switch_agent(&mut self) {
+        self.invalidate();
+        self.connection = None;
+        self.snapshot = None;
+        self.storage.clear();
+        self.client = None;
+        self.desired.clear();
+        self.confirm_forget = false;
+        self.page = Page::Connect;
+        // Switching changes this UI session only. Do not call the repository or
+        // vault: saved profiles and their credentials must remain intact.
+        self.log("Choose another agent. Your saved app profiles and Keychain items were kept.");
     }
 
     fn forget(&mut self) {
@@ -777,6 +788,14 @@ impl ConnectApp {
             ui.add_space(12.0);
             receive_card(ui);
             ui.add_space(12.0);
+            if ui.button("Switch agent").clicked() {
+                self.switch_agent();
+                return;
+            }
+            muted(
+                ui,
+                "Switching keeps your saved profiles and credentials for later.",
+            );
             if ui.button("Forget this app’s connection…").clicked() {
                 self.confirm_forget = true;
             }
@@ -807,7 +826,7 @@ impl ConnectApp {
         card(ui, |ui| {
             let mut changed = false;
             ui.add_enabled_ui(!self.pending, |ui| {
-                ui.label("Mupot address");
+                let address_label = ui.label("Mupot address");
                 changed |= ui
                     .add(
                         egui::TextEdit::singleline(&mut self.origin)
@@ -815,8 +834,9 @@ impl ConnectApp {
                             .margin(egui::Margin::symmetric(12, 10))
                             .desired_width(f32::INFINITY),
                     )
+                    .labelled_by(address_label.id)
                     .changed();
-                ui.label("Organization ID");
+                let organization_label = ui.label("Organization ID");
                 changed |= ui
                     .add(
                         egui::TextEdit::singleline(&mut self.tenant)
@@ -824,16 +844,19 @@ impl ConnectApp {
                             .margin(egui::Margin::symmetric(12, 10))
                             .desired_width(f32::INFINITY),
                     )
+                    .labelled_by(organization_label.id)
                     .changed();
-                ui.label("Agent name or ID");
+                let agent_label = ui.label("Exact Agent ID (UUID)");
                 changed |= ui
                     .add(
                         egui::TextEdit::singleline(&mut self.desired)
-                            .hint_text("Existing agent name or ID from Mupot")
+                            .hint_text("xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")
                             .margin(egui::Margin::symmetric(12, 10))
                             .desired_width(f32::INFINITY),
                     )
+                    .labelled_by(agent_label.id)
                     .changed();
+                ui.small("Copy the full ID of your existing agent from Mupot. No new agent is required. Names can be shared by agents in different squads.");
             });
             if changed {
                 self.invalidate();
@@ -1267,5 +1290,105 @@ mod tests {
         assert!(!app.pending);
         assert!(app.error.is_none());
         assert!(app.note.contains("forgotten"));
+    }
+
+    #[test]
+    fn switch_agent_preserves_saved_profiles_and_rejects_old_worker_results() {
+        let ctx = egui::Context::default();
+        let mut app = ConnectApp::with_context(&ctx, true, "connect", false);
+        let profile = Profile {
+            origin: "https://example.invalid".into(),
+            agent_id: "11111111-1111-4111-8111-111111111111".into(),
+            agent_slug: "sample-agent".into(),
+            tenant: "sample-organization".into(),
+            expires_unix: u64::MAX,
+        };
+        app.profiles.push(profile.clone());
+        app.origin = profile.origin.clone();
+        app.tenant = profile.tenant.clone();
+        app.desired = profile.agent_id.clone();
+        app.snapshot = Some(BootSnapshot {
+            agent: Agent {
+                id: profile.agent_id.clone(),
+                slug: profile.agent_slug.clone(),
+                name: "Sample Agent".into(),
+                role: "sample role".into(),
+                status: "registry sample".into(),
+            },
+            squad: Squad {
+                id: "sample-squad".into(),
+                name: "Sample Squad".into(),
+            },
+            tenant: profile.tenant.clone(),
+            channel: "directory".into(),
+            brief: "Old sample context".into(),
+            roster: vec![],
+            verification: Verification::BoundIdentityVerified,
+        });
+        let generation = app.fence.advance();
+        app.pending = true;
+        app.confirm_forget = true;
+        app.storage = "Old saved status".into();
+        app.switch_agent();
+        app.tx
+            .send(WorkerResult {
+                generation,
+                event: Event::Restored(Err(Error::IdentityMismatch)),
+            })
+            .unwrap();
+        app.receive(&ctx);
+        assert_eq!(app.profiles, vec![profile.clone()]);
+        assert_eq!(app.origin, profile.origin);
+        assert_eq!(app.tenant, profile.tenant);
+        assert!(app.repository.is_none()); // No storage or vault was initialized.
+        assert!(app.connection.is_none());
+        assert!(app.snapshot.is_none());
+        assert!(app.client.is_none());
+        assert!(app.storage.is_empty());
+        assert!(app.desired.is_empty());
+        assert!(!app.pending);
+        assert!(!app.confirm_forget);
+        assert!(app.error.is_none());
+        assert!(app.note.contains("were kept"));
+    }
+
+    #[test]
+    fn onboarding_fields_have_explicit_accessibility_labels() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut app = ConnectApp::with_context(&ctx, true, "connect", false);
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1160.0, 780.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| app.connect(ui));
+            },
+        );
+        // This is a headless accessibility test, so no graphics backend consumes
+        // the font/brand texture uploads generated by the real form layout.
+        output.textures_delta.clear();
+        let tree = output
+            .platform_output
+            .accesskit_update
+            .expect("accessibility tree");
+        for expected in ["Mupot address", "Organization ID", "Exact Agent ID (UUID)"] {
+            assert!(
+                tree.nodes.iter().any(|(_, node)| {
+                    node.role() == egui::accesskit::Role::TextInput
+                        && node.labelled_by().iter().any(|label_id| {
+                            tree.nodes.iter().any(|(id, label)| {
+                                id == label_id
+                                    && label.value().or_else(|| label.label()) == Some(expected)
+                            })
+                        })
+                }),
+                "missing input label: {expected}"
+            );
+        }
     }
 }

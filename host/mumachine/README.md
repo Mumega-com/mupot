@@ -17,7 +17,7 @@ The bundle is local and ad-hoc signed, not Developer ID signed or notarized. The
 
 ## Connect
 
-1. Enter your **Mupot address** (a plain HTTPS origin), **Organization ID** (the expected tenant) and **Agent name or ID** (an existing slug or UUID).
+1. Enter your **Mupot address** (a plain HTTPS origin), **Organization ID** (the expected tenant) and **Exact Agent ID (UUID)**. Copy the full ID of your existing agent from Mupot; no new agent is required. Names can be shared across squads and cannot be used for enrollment in this version.
 2. Select **Get approval code**, then **Open Mupot approval page**. Approve the displayed short user code in the browser.
 3. The app polls at the server’s interval, verifies the returned tenant and bound identity using `boot_context` and `orient`, and only then saves its separate, short-lived credential to its own macOS Keychain item. Any storage failure is shown explicitly.
 
@@ -26,6 +26,8 @@ Cancel stops the operation locally and discards late results; a new attempt requ
 macOS may display a Keychain permission prompt when saving, loading or forgetting this app’s credential. The app waits for that native prompt to finish; access refusal is reported rather than falling back to plaintext storage.
 
 **Load and verify** reconnects using only this app’s saved credential and checks identity again. Expired saved credentials cannot be used. **Forget** deletes only the selected app profile and its exact Keychain item, clears the current connection, and discards outstanding results. Forget does not revoke a server credential.
+
+**Switch agent** clears the current connection and pending UI operations, while preserving saved profiles and Keychain items so they can be loaded again later. It does not revoke or delete credentials.
 
 Local runtime discovery uses read-only Herdr output. Installed applications and local runtimes are separate from Mupot registry identities. A registry state or successful check-in never means an AI model has started or can receive work.
 
