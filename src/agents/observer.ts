@@ -18,6 +18,7 @@
 //   'rate_limited'   — meter blocked; counted as noop (not a failure).
 //   'budget_exhausted' — dollar cap hit; counted as noop.
 //   'observe-only'   — effort=low; counted as noop.
+//   'backpressure'   — open-task queue full; noop until tasks drain.
 //   'no-goal'        — agent has no OKR; observer is a no-op (nothing to observe).
 //   'kpi-met'        — goal reached; observer is a no-op.
 //   'error'          — unhandled exception in the cycle; counted as failure.

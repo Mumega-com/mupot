@@ -546,7 +546,7 @@ export async function loadOpsHealth(env: Env, auth: AuthContext, nowMs = Date.no
   const missingCoreTables = CORE_TABLES.filter((name) => !schemaTables.rows.some((r) => r.name === name))
 
   const observerTrouble = loopObserver.rows.filter(
-    (r) => toNumber(r.consecutive_fails) > 0 || toNumber(r.liveness_fails) > 0,
+    (r) => toNumber(r.consecutive_fails) > 0,
   )
   const failedWorkflowReceipts = workflowReceipts.rows.filter(
     (r) => !['ok', 'waiting', 'gate-resolved'].includes(r.status),

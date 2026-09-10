@@ -791,8 +791,8 @@ async function safeObserve(
 /**
  * observeStep — observe the cycle outcome AND record an 'escalated' episode if the
  * observer fires an escalation. Centralized so escalation is captured on EVERY exit
- * path: escalations build on failure/liveness/noop ticks (consecutive_fails /
- * liveness_fails), NOT the 'spawned' path which resets those counters. Wiring the
+ * path: escalations build on failure/noop ticks (consecutive_fails),
+ * NOT the 'spawned' path which resets those counters. Wiring the
  * escalated-episode record only after 'spawned' (the pre-fix bug) meant it never ran.
  * Both the observe and the record are best-effort and never abort the cycle.
  */
