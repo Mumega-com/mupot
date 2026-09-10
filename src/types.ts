@@ -42,6 +42,9 @@ export interface WorkflowBinding<PARAMS = unknown> {
 // ── Cloudflare bindings (must match wrangler.toml) ──
 export interface Env {
   DB: D1Database
+  /** Protected operator JSON config for expiring agent_context read delegations.
+   * Absent/malformed denies peer reads. Never supplied by a request or committed with live values. */
+  AGENT_CONTEXT_READ_BINDINGS?: string
   VEC: VectorizeIndex
   BUS: Queue<BusEvent>
   SESSIONS: KVNamespace

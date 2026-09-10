@@ -141,6 +141,7 @@ import { PROVISION_TOOLS } from './provision'
 import { BOOTSTRAP_TOOLS } from './bootstrap'
 import { CREDENTIAL_CLAIM_TOOLS } from './credential-claim'
 import { AGENT_CONNECTION_TOOLS } from './agent-connection'
+import { AGENT_CONTEXT_TOOLS } from './agent-context'
 import { PROJECT_TOOLS, readAccess, readableProject } from './projects'
 import { hasProjectWriteForSquads, anySquadHasProjectWrite } from '../projects/access'
 import { ADDON_TOOLS } from './addons'
@@ -4954,6 +4955,7 @@ export const TOOLS: ToolSpec[] = [
   toolOrient,
   toolConnect,
   ...AGENT_CONNECTION_TOOLS,
+  ...AGENT_CONTEXT_TOOLS,
   ...PROJECT_TOOLS,
   ...PROVISION_TOOLS,
   ...BOOTSTRAP_TOOLS,
