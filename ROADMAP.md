@@ -165,6 +165,136 @@ input (asha first-pass, Athena architecture, River build feasibility) is request
 flight when SCOPE is unclear, and is advisory. Ratification voting (MU.100.001 §1.3)
 applies to constitution amendments only — never to sequencing work.
 
+## 2026-09-10 — first proven swarm loop, plumbing defects, and the surface-reduction direction
+
+> Recorded by Kasra from receipts, not from plans. Every claim below names the task,
+> PR, issue, or file that carries it. Direction items are proposals until Hadi
+> decides; decisions owed are listed at the end. Updates by PR only.
+
+### What was proven
+
+The herdr + mupot swarm loop ran end to end twice on real work, with mupot as board,
+inbox, receipts, and verdict, and herdr as the wake transport:
+
+| Run | Work | Builder | Gates | Landed |
+|---|---|---|---|---|
+| 1 | [#1383](https://github.com/Mumega-com/mupot/issues/1383) dead `liveness_fail` outcome | muvps-cursor (grok-4.6), task `ac175612` | kasra-review adversarial GREEN; Athena (codex) GREEN at exact head | merged as `76b5b95c` (PR [#1387](https://github.com/Mumega-com/mupot/pull/1387)) |
+| 2 | [#1388](https://github.com/Mumega-com/mupot/issues/1388) `task_update` transient-value gate | muvps-cursor, task `f1ca34cf` | adversarial GREEN with test hardened after review; Athena GREEN per head | PR [#1393](https://github.com/Mumega-com/mupot/pull/1393); state on the PR |
+
+Both runs produced seat-bound `runner_record` receipts on the task (run 1: `a01b1960`,
+`762f1a1d`, verdict `2324d6b9`; run 2: `2285378f`) — the first such receipts in the records
+Kasra holds; earlier flights carried `receipt_refs=[]`. Both mutation-proved every new
+test (mutation tables are in the PR comments). Wall time from dispatch to merge was on the
+order of an hour each, from message timestamps, not a measured figure.
+
+**The honest shape:** every wake was typed by hand into a herdr pane. Seatlink did not
+wake cursor (seat has no token file; herdr name `muvps-cursor` vs seats.json
+`muvps_cursor`). Athena's codex connector could not record its own verdict (403,
+`need: member`) and reads a different inbox than the one the pot delivered to. Remove
+the human conductor and the loop stops at dispatch. The controls that refused correctly,
+each observed once or more with the error text on the task or PR: signed-attach refusing a
+bearer self-report; `runner_record` refusing a spoofed seat; `task_verdict` refusing a
+non-holder of `gate:athena`; the artifact verifier refusing prose; `blocked→review` as an
+invalid transition; the seam ratchet refusing a test that bypasses `invokeTool`. The plumbing
+between them is what is missing.
+
+### Defects found by receipt (all filed 2026-09-10)
+
+| # | Sev | Class | Mechanism |
+|---|---|---|---|
+| [#1388](https://github.com/Mumega-com/mupot/issues/1388) | P0 | transient-value gate | MCP `task_update` gated Door 6 on a `result` argument `persistTaskUpdate` never wrote; four evidence writes echoed and a task reached `approved` over refusal prose. REST was already fail-closed. Fix in #1393 |
+| [#1394](https://github.com/Mumega-com/mupot/issues/1394) | P1 | pre-state check | gate predicate reads the pre-state assignee; `{status:'review', assignee_agent_id}` in one call bypasses Door 6 on MCP and REST |
+| [#1390](https://github.com/Mumega-com/mupot/issues/1390) | P1 | fail-open dispatch | `src/bus/consumer.ts` runs a task in-Worker under the assignee's identity when the seat heartbeat is older than 180 s; identity checks pass because the impersonation is structural |
+| [#1389](https://github.com/Mumega-com/mupot/issues/1389) | P1 | unmetered spend | the artifact-fail and `done_when_placeholder` branches of `execute.ts` stamp cost on the row but never record the meter |
+| [#1391](https://github.com/Mumega-com/mupot/issues/1391) | P2 | silent clamp | `task_create` nulls `assignee_agent_id` when `external_source` is set, no signal |
+| [#1392](https://github.com/Mumega-com/mupot/issues/1392) | P2 | mislabelled state | `completed_at` stamped for `blocked`; observatory and approvals read it as completion |
+| [#1395](https://github.com/Mumega-com/mupot/issues/1395) | P2 | conditional gate | runtime-receipt artifact gate applies only when `done_when` mentions `Artifact:`/`SHA256:` |
+| [#1396](https://github.com/Mumega-com/mupot/issues/1396) | P3 | flaky test | `send-target-confinement` pair red under parallel suite, green solo at base and head |
+
+Also confirmed with mechanism, not yet re-filed: [#1369](https://github.com/Mumega-com/mupot/issues/1369)
+orphaned runs are structural (`dispatch.ts` sets `running` and clears the lease;
+`recoverExpiredRoutineLeases` reaps only `leased`/`observing`), and two schedulers coexist
+(`cron-scheduler.ts` ignores `overlap_policy`; `scheduler.ts` is the sound one).
+
+Same pattern as the 09-06 backlog note: one rule, several copies, the copies disagree.
+The copies now include the gate reading an argument instead of the row, and the
+executor reasoning about a heartbeat instead of a binding.
+
+### Direction: reduce the surface, derive the seat, fail closed
+
+Proposed sequence. Nothing below is started; it is the order Kasra would run if told go.
+
+1. **Name the kernel by receipts.** The controls that refused correctly on 09-10 are the
+   kernel: signed attach, seat-bound runner_record, `gate:<owner>` verdict, artifact-shape
+   verifier, task state machine, consume-once inbox, capability floor. Write each as an
+   invariant with the test that proves it.
+2. **Freeze the tool surface for one cycle.** No new MCP tools. Every new path is where
+   the next copy of a rule comes from.
+3. **One truth per fact.** Seat derived at boot from one signed proof (today it is data in
+   four places: seats.json, token file, OAuth consent pick, `fleet_agents.runtime`). One
+   gate function on `next` state, both surfaces. `result` written by the runtime-receipt
+   path only. One presence writer.
+4. **Fail closed where the pot improvises.** Stale seat parks the work, never runs it
+   in-Worker under that name. Failed model calls meter. `completed_at` means completed.
+   The pot never does work nobody assigned to it.
+5. **Cut the board to what is true.** Close dead flights, dedupe, label unowned.
+6. **Prove the loop with zero hands.** Same task shape as run 1, nobody typing wakes.
+   Ship nothing new until the hand count is zero for one task.
+
+**Linchpin decision (proposal):** the always-on centre is a deterministic daemon, not an
+LLM agent. Seatlink is three quarters of it. mubot and Hermes become operator seats woken
+when there is work, gated like everyone else. The earlier plan to make mubot/Asha on
+Hermes the hub never ran because nothing reliably reached them; an LLM at the centre
+also brings the three properties the centre must not have: steerable by message text,
+paid per tick, forgetful.
+
+### Adoption survey — use what we already pay for (research 2026-09-10)
+
+| Hand-rolled today | Adopt | Removes |
+|---|---|---|
+| flights, `runner_record`, flight receipts (never fired) | Cloudflare Workflows (`waitForEvent`, instances API) | flight engine, receipt bookkeeping; greenfield since the current engine does not work |
+| approvals waiting on a human | Workflows `waitForEvent` | gate-wake polling; audit from instances API |
+| routine engine, overlap, watchdog | Agents SDK `Agent` + `schedule()`/`scheduleEvery()` | cron loop, orphan watchdog, overlap logic |
+| dispatch consumer, retries, DLQ | Cloudflare Queues pull consumers + DLQ | the fail-open consumer path |
+| daemon / Worker-to-Worker identity | mTLS client certs or Access service tokens | bearer files for seatlink and fleet daemons; not for human OAuth seats |
+
+Do not adopt: SPIFFE (assumes a persistent node agent), Temporal/Inngest/Restate/Trigger.dev
+(external orchestration), Oso/Cerbos (policy decision, not approval workflow),
+WebAuthn-for-agents (no spec). MCP SEP-1933 workload identity is our seat problem but is
+an unmerged PR; watch it. Workflows pricing was not confirmed at survey time; check first.
+
+What stays ours: consume-once inbox, presence, seat derivation for OAuth connector seats.
+
+### Paperclip (paperclipai/paperclip, MIT) — mapped, not adopted
+
+Four-arm map at its commit `0d8bbf7`. Verdict: do not migrate, do not vendor its
+identity/authz/secrets code; lift patterns. mupot is ahead on topology (it spawns and
+owns every agent as a child; no inbox, no remote seats), on tenant isolation (per-query
+convention, no RLS, vs physical pots), and on gates (no `gate:<owner>`; review defaults
+to "anyone"; no artifact gate at transition; no time-boxed elevation). Six P0/P1 holes
+found in its authz on adversarial read.
+
+Patterns to lift: validate and persist in one transaction with a content-hash decision
+ledger (rules out the #1388 class by construction); re-validate ownership and presence
+immediately before dispatch (the #1390 window); cancel in-flight work when a scope
+crosses a hard budget stop; a tenant-scoped resource helper that collapses missing and
+cross-tenant into one 404, with a ratchet test and a second test that fails on stale
+allowlist entries; agent authority intersected with an accountable human; runtime holds
+no credential, server mints per call; structured `waiting_on`; per-seat session resume.
+
+Positioning: Paperclip is the org chart; mupot is the wall the org chart's work passes
+through. Be compatible at the adapter contract, not adjacent.
+
+### Decisions owed to Hadi
+
+- Freeze choice for `v0.30.0` (unchanged from above).
+- Whether to run the direction sequence and the adoption sequence, and in which order
+  relative to the stabilization train.
+- Re-bind Athena's codex seat and wire cursor/hermes seats (identity-class; Kasra holds).
+- Destination repo for the "Mupot desktop operator host" review document, if any.
+- One-day Paperclip proof: hire the six herdr seats through its adapters, run one task,
+  count the hands.
+
 ## Historical operating-loop snapshot — 2026-08-03
 
 > Cross-cutting runtime plan; version-scoped features above own their releases.
@@ -190,11 +320,11 @@ predicate), review (cross-vendor gate), steward (self-repair). One codex: 1eb0e7
 baselines + DME operational flight (e1a02d39; code already in main). W2 caged
 lanes — implement codex's acceptance predicate (#645), then Spark unpause + Hermes/
 V4-Flash lane via iron-proxy. W3 self-perpetuation — steward round 2 (dead-man
-pings with evidence), server-side requeue + task markers + max-rounds (#635),
+pings with evidence), server-side requeue + task markers (mupot#635; max-rounds was the plan, not in #635's scope),
 codified gate delegation. W4 federation — Phase 1 registry (mumega-com#573) on the
 merged Phase 0 ADR (452f11db); separate-ownership pilot + mints stay Hadi-direct.
-W5 debt — 22-BLOCK backlog (#636), organisms redesign (#595), Mirror 501 (#596),
-board hygiene, athena-inbox-watch (#594), mubot token rotation.
+W5 debt — 22-BLOCK backlog (#636), organisms redesign (mumega-com#595), Mirror 501 (mumega-com#596),
+board hygiene, athena-inbox-watch (mumega-com#594), mubot token rotation.
 
 **Noticing (landed 2026-08-07):** the loop now has a read-only sensing pass —
 `scripts/gatherer.py` runs inside `operator-loop.sh`, ranks anomalies into one digest
@@ -621,6 +751,9 @@ Must ship:
   operational implementation with the Hadi-dev contract and policy lane;
 - bearer-derived agent identity plus a server-authorized seat/session context shared by
   `check_in`, inbox lease/ACK, send, and runtime receipts;
+- the seat derived at boot from one signed proof, and dispatch that fails closed when the
+  bound seat is stale (#1390) — preconditions for "identity-bound receiver"; see the
+  2026-09-10 section;
 - a standardized cross-platform runner CLI/service with polling fallback and a governed
   push subscription path; push becomes default only after soak and replay gates pass;
 - an exact receipt chain from dispatch through runtime consumption, correlated ACK,
