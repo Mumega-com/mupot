@@ -2777,9 +2777,24 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_elevation_usage_log_grant" },
     ],
   },
+  {
+    file: "0150_task_assignee_member.sql",
+    sha256: "ab41abfa352dcd1dc44a935380034a565651a800a80a46110002fbfb3f8773e6",
+    statements: [
+      "-- 0150_task_assignee_member.sql — a task can be owned by a HUMAN, not only an agent.\n--\n-- squad-core task 676ae5db, P0: \"Tasks can only be assigned to AGENTS, not humans\n-- — no assignee_member_id (Hadi can't own a task).\"\n--\n-- `tasks.assignee_agent_id REFERENCES agents(id)` is the only ownership column the\n-- table has ever had. Every consequence of that is structural, not cosmetic:\n--\n--   - The operator cannot be given work on the board he is looking at. Anything\n--     that genuinely needs a human — a browser click, a credential decision, an\n--     approval — has to live in prose inside some agent's task body, where no\n--     query can find it and no lane surfaces it.\n--   - Agents cannot hand work to each other either: an agent may not change the\n--     assignee on its own in_progress task (assignee_cannot_mutate_own_assignment,\n--     src/tasks/index.ts) and, on the MCP plane, may not grant capability at all\n--     (mupot#1357). Every redistribution therefore terminates at a human — who\n--     until now could not be named as the owner of the thing he was redistributing.\n--\n-- WHY A COLUMN AND NOT AN AGENT ROW FOR THE HUMAN. The cheap fix is to mint Hadi\n-- an `agents` row and assign to that. It is the wrong fix. It puts one identity in\n-- two homes, which is the disease squad-core task 2c6273a6 (\"One home per\n-- predicate — collapse the N-homes disease: presence 4, model 3, role 2, roster 2,\n-- transport 2\") already exists to cure. An agent row also carries a runtime, a\n-- seat, a dispatch target and a wake path, none of which mean anything for a\n-- person, and dispatch would then try to wake him.\n--\n-- WHY A TRIGGER AND NOT A TABLE-LEVEL CHECK. SQLite cannot add a table-level CHECK\n-- via ALTER TABLE; expressing \"exactly one of the two is set\" as a constraint would\n-- require rebuilding `tasks`. That rebuild is the backup-ALL / reinsert-ALL pattern\n-- this repo has been bitten by before, and `tasks` is the hottest table in the pot\n-- with fourteen migrations' worth of accumulated columns — a rebuild that forgets\n-- one silently drops data. The trigger pair below enforces the same invariant at\n-- the same layer (a write cannot get past it) without touching the existing rows.\n-- This mirrors the DB-level backstop-trigger approach already used for rank checks.\n\nALTER TABLE tasks ADD COLUMN assignee_member_id TEXT REFERENCES members(id) ON DELETE SET NULL;",
+      "\n\n-- The invariant: AT MOST ONE owner. Both NULL is the normal unassigned state and\n-- must stay legal — 25 of 40 open tasks were unassigned when this was written, and\n-- a migration that made that illegal would fail on the existing table.\n-- Both non-null is the state that must never exist: two owners means every reader\n-- has to pick one, and different readers will pick differently.\n\nCREATE TRIGGER IF NOT EXISTS trg_tasks_single_assignee_insert\nBEFORE INSERT ON tasks\nFOR EACH ROW\nWHEN NEW.assignee_agent_id IS NOT NULL AND NEW.assignee_member_id IS NOT NULL\nBEGIN\n  SELECT RAISE(ABORT, 'task_single_assignee: assignee_agent_id and assignee_member_id are mutually exclusive');\nEND;",
+      "\n\nCREATE TRIGGER IF NOT EXISTS trg_tasks_single_assignee_update\nBEFORE UPDATE ON tasks\nFOR EACH ROW\nWHEN NEW.assignee_agent_id IS NOT NULL AND NEW.assignee_member_id IS NOT NULL\nBEGIN\n  SELECT RAISE(ABORT, 'task_single_assignee: assignee_agent_id and assignee_member_id are mutually exclusive');\nEND;",
+      "\n\n-- \"What is on my plate\" is the query this column exists to make answerable, so it\n-- gets the same index treatment the agent side has. Partial — the overwhelming\n-- majority of rows have no member assignee and should not enter the index.\nCREATE INDEX IF NOT EXISTS idx_tasks_assignee_member\n  ON tasks(assignee_member_id, status)\n  WHERE assignee_member_id IS NOT NULL;",
+    ],
+    objects: [
+      { type: "trigger", name: "trg_tasks_single_assignee_insert" },
+      { type: "trigger", name: "trg_tasks_single_assignee_update" },
+      { type: "index", name: "idx_tasks_assignee_member" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "dd9bbe95b8907f0fa0e8968c090d964c4110c87349956e5397d35842cc9c8c02"
+export const SCHEMA_CHAIN_DIGEST: string = "3b0f8d41f1505842208e7ff8f2ec1d2c5df356e9e3a7439b115539cc5b720f71"

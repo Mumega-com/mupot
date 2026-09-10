@@ -457,6 +457,17 @@ async function canAgentExecuteTask(env: Env, agent: Agent, task: Task): Promise<
     // cross-pot tasks. Require the same explicit-assignee step for any externally-
     // sourced task, regardless of which integration wrote it.
     if (isExternallySourced(task)) return false
+    // migrations/0150: agent-null is NOT the same question as unassigned any more.
+    // A task owned by a HUMAN has assignee_agent_id null and assignee_member_id set,
+    // so without this an agent reads a human-owned task as free work and returns
+    // true — then claimTaskProgress writes assignee_agent_id and the one-owner
+    // trigger ABORTS it as a throw rather than a refusal. Pickup saying yes while
+    // claim explodes is the two-layers-disagree class this repo keeps closing.
+    // Null-tolerant `== null` deliberately: not every Task reaching here comes from
+    // TASK_SELECT_COLUMNS, so the field may be undefined rather than null on a
+    // hand-built or legacy-projection row, and undefined must read as "no member
+    // owner", not as "owned".
+    if (task.assignee_member_id != null) return false
     return task.squad_id === agent.squad_id
   }
   if (task.assignee_agent_id !== agent.id) return false
@@ -488,6 +499,7 @@ async function claimTaskProgress(
           SET status = 'in_progress', assignee_agent_id = ?, updated_at = ?,
               execution_receipt_id = ?, execution_claim_expires_at = ?
         WHERE id = ? AND squad_id = ? AND status = ? AND assignee_agent_id IS NULL
+          AND assignee_member_id IS NULL
           ${executionCondition}
           AND EXISTS (SELECT 1 FROM agents WHERE id = ? AND status = 'active')`,
     ).bind(

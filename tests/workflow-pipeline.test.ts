@@ -251,7 +251,11 @@ describe('shared execution authorization', () => {
           -- whenever a column joins the shared projection. Third time in one day (#703).
           priority           TEXT,
           parent_task_id     TEXT,
+          -- assignee_member_id (migrations/0150) hand-added: hand-written DDL, so a
+          -- purely-additive column breaks it. One of FOUR fixtures patched for this single
+          -- column in this change; the count is the cost of the pattern. See #703.
           assignee_agent_id TEXT,
+          assignee_member_id TEXT,
           github_issue_url TEXT,
           result TEXT,
           completed_at TEXT,

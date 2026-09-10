@@ -1245,10 +1245,16 @@ describe('MCP granted multi-squad flight lifecycle', () => {
         -- 13 hand-written-schema tests tracked in #703, and this is the second time its
         -- fixture has blocked a feature rather than caught a bug. Fixed properly by #703;
         -- patched minimally here so a task-management change is not gated on that conversion.
+        -- assignee_member_id (migrations/0150) is the next instance. Worth recording what it
+        -- cost, because the cost is never paid where the shortcut was taken: this fixture and
+        -- the one in tests/tasks-cross-squad-assignment.test.ts both 500'd on a purely-additive
+        -- column, in a change that has nothing to do with flights or cross-squad assignment,
+        -- and neither failure appeared until a FULL suite ran — which on a contended host is
+        -- the run most likely to be skipped.
         CREATE TABLE tasks (
           id TEXT PRIMARY KEY, squad_id TEXT NOT NULL, project_id TEXT, title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '',
           done_when TEXT NOT NULL, status TEXT NOT NULL, priority TEXT, parent_task_id TEXT,
-          assignee_agent_id TEXT, github_issue_url TEXT,
+          assignee_agent_id TEXT, assignee_member_id TEXT, github_issue_url TEXT,
           result TEXT, completed_at TEXT, gate_owner TEXT, source_pot TEXT, external_source TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
         );
         CREATE TABLE task_verdicts (

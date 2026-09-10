@@ -333,8 +333,17 @@ async function routeUnassignedWork(
   // very next tick with zero human step. external_source IS NULL closes it the same way
   // source_pot IS NULL already does for cross-pot tasks.
   const rows = await env.DB.prepare(
+    // migrations/0150: assignee_member_id IS NULL is load-bearing here, and its
+    // absence was a HEAD-OF-LINE STALL, not a missed row. Without it the first
+    // human-owned open task is selected as unassigned on every tick; the UPDATE
+    // below then tries to set assignee_agent_id on a row that already has a member
+    // owner, the one-owner trigger ABORTS, and the throw escapes into the caller's
+    // empty catch as routed=[]. ORDER BY created_at ASC keeps that task at the head
+    // forever, so ONE human-owned task silently freezes routing for its entire
+    // project — reported as a quiet noop, not as an error.
     `SELECT id, squad_id, title, body FROM tasks
       WHERE project_id = ?1 AND status = 'open' AND assignee_agent_id IS NULL
+        AND assignee_member_id IS NULL
         AND source_pot IS NULL
         AND external_source IS NULL
       ORDER BY created_at ASC
@@ -374,8 +383,14 @@ async function routeUnassignedWork(
     // concurrency task-update path (WHERE updated_at=…). The WHERE guard is
     // unchanged, so idempotency/TOCTOU safety is preserved.
     const upd = await env.DB.prepare(
+      // The member clause is repeated here, not merely in the SELECT above, because
+      // this is the TOCTOU re-guard: a human may be given the task between the read
+      // and this write. With the clause, that race degrades to changes=0 and the row
+      // is skipped; without it, the write reaches the one-owner trigger and the tick
+      // dies. A guard that turns a race into an exception is not a guard.
       `UPDATE tasks SET assignee_agent_id = ?1, updated_at = ?3
-        WHERE id = ?2 AND status = 'open' AND assignee_agent_id IS NULL`,
+        WHERE id = ?2 AND status = 'open' AND assignee_agent_id IS NULL
+          AND assignee_member_id IS NULL`,
     )
       .bind(picked.agent.id, task.id, new Date().toISOString())
       .run()

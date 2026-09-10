@@ -77,6 +77,16 @@ function createSchema(sqlite: SqliteD1Harness['sqlite']): void {
     -- tasks rather than applying the committed chain, so a purely-additive column breaks it
     -- (persistTaskUpdate writes every column it owns). The fixture did not catch a bug; it
     -- lied about the schema and blocked a feature. One of the 13 tracked in #703.
+    --
+    -- assignee_member_id (migrations/0150) added by hand for the SAME reason, which is now the
+    -- third time this fixture has had to be patched to keep up with a purely-additive column.
+    -- Recording that count deliberately: the cost of a hand-written schema is not that it fails,
+    -- it is that it fails LATER, in someone else's feature, for a reason that has nothing to do
+    -- with the test's subject. This one costs the mutual-exclusion trigger too — the fixture
+    -- cannot carry it, so the one-owner invariant is unenforced here and is proven instead in
+    -- tests/task-assignee-member.test.ts against the real chain. Converting this file to
+    -- applyAllMigrations would SHRINK the check-test-schema-source baseline, which the ratchet
+    -- explicitly permits; it is the right fix and it is not this PR's scope.
     CREATE TABLE tasks (
       id TEXT PRIMARY KEY,
       squad_id TEXT NOT NULL,
@@ -88,6 +98,7 @@ function createSchema(sqlite: SqliteD1Harness['sqlite']): void {
       parent_task_id TEXT,
       status TEXT NOT NULL,
       assignee_agent_id TEXT,
+      assignee_member_id TEXT,
       github_issue_url TEXT,
       result TEXT,
       completed_at TEXT,
