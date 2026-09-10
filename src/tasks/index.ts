@@ -30,7 +30,7 @@ import type { TaskStatus } from './service'
 import { resolveTaskAssignee, resolveTaskAssigneeMember } from './assignee'
 import { verifyTaskArtifactShape } from './artifact-verification'
 import { hasIndependentRuntimeGate, listTaskDispatchReceiptTimeline } from './runtime-receipts'
-import { hasActiveGateGrant } from '../gates/grants'
+import { hasActiveGateGrant, loadGateWakeNotices } from '../gates/grants'
 import { resolveGatePrincipal } from '../gates/principal'
 export { resolveTaskAssignee as resolveAssignee } from './assignee'
 import { createBus } from '../bus'
@@ -511,8 +511,9 @@ tasksApp.get('/:id', async (c) => {
     return c.json({ error: 'forbidden', need: 'member' }, 403)
   }
 
+  const [visibleTask] = await loadGateWakeNotices(c.env, [task])
   const dispatchTimeline = await listTaskDispatchReceiptTimeline(c.env, task.id)
-  return c.json({ task, dispatch_timeline: dispatchTimeline })
+  return c.json({ task: visibleTask ?? task, dispatch_timeline: dispatchTimeline })
 })
 
 // ── POST / — create a task (optionally dispatch it for execution) ─────────────
