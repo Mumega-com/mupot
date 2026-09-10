@@ -5,7 +5,7 @@
 // 3. High-frequency tool loops debounce with KV to protect D1.
 // 4. waitUntil is called to protect background touches in Cloudflare Workers.
 
-import { describe, it, expect, beforeAll, afterAll } from 'vitest'
+import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
 import { invokeTool } from '../src/mcp/index'
@@ -67,6 +67,16 @@ describe('FLIGHT-LIVING-PRESENCE: zero-touch auto-liveness (real SQLite D1)', ()
     harness.close()
   })
 
+  // The harness is built once in beforeAll, so a presence row written by one test leaks
+  // into the next. That is what turned a single wrong assertion into two failures: test 1
+  // wrote its row under the BOUND seat, and test 2's seed then collided with it on
+  // PRIMARY KEY (tenant, member_id, label). Clear the table between tests so each one
+  // states its own preconditions.
+  beforeEach(() => {
+    harness.sqlite.exec('DELETE FROM presence')
+    sessionsStore.clear()
+  })
+
   it('boot_context auto-registers presence on startup with waitUntil', async () => {
     const auth: AuthContext = {
       memberId,
@@ -92,12 +102,22 @@ describe('FLIGHT-LIVING-PRESENCE: zero-touch auto-liveness (real SQLite D1)', ()
     expect(waitedPromises.length).toBeGreaterThan(0)
     await Promise.all(waitedPromises)
 
+    // This assertion USED to look for label 'OpenCode Mac Pane' — the seat the caller
+    // CLAIMED through ctx. That is the behaviour this PR removes: presence must record the
+    // seat the token is actually BOUND to (member_tokens.label = 'Seat Alpha' for
+    // tok-alpha-id), never a name the caller supplied. A presence row under a claimed seat
+    // is the same lying receipt #1272 closed for the inbox.
+    const claimed = harness.sqlite.prepare(
+      `SELECT label FROM presence WHERE member_id = ? AND tenant = ? AND label = 'OpenCode Mac Pane'`,
+    ).get(memberId, tenant)
+    expect(claimed).toBeUndefined()
+
     const presence = harness.sqlite.prepare(
-      `SELECT label, source, agent_id FROM presence WHERE member_id = ? AND tenant = ? AND label = 'OpenCode Mac Pane'`,
+      `SELECT label, source, agent_id FROM presence WHERE member_id = ? AND tenant = ? AND label = 'Seat Alpha'`,
     ).get(memberId, tenant) as { label: string; source: string; agent_id: string }
 
     expect(presence).toBeDefined()
-    expect(presence.label).toBe('OpenCode Mac Pane')
+    expect(presence.label).toBe('Seat Alpha')
     expect(presence.source).toBe('tmux')
     expect(presence.agent_id).toBe(familyAgentId)
   })
