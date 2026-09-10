@@ -18,7 +18,7 @@
 import type { Env, CapabilityGrant, MessageCreatedPayload } from '../types'
 import { createBus } from '../bus'
 import { resolveAgentRef } from '../org/resolve'
-import { canOnSquad } from '../auth/capability'
+import { canOnSquad, CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
 import { sha256Hex } from '../lib/canonical-json'
 import { TOKEN_LIVE_PREDICATE } from '../auth/token-lifecycle'
 import { evaluateReplyExpectation, type ReplyBasis } from './reply-expectation'
@@ -407,6 +407,7 @@ export async function sendAgentMessage(
         guestVisibilityFence.scopeType,
         guestVisibilityFence.scopeId,
         guestVisibilityFence.capability,
+        nowCapabilitySql(),
       )
     }
     const activeRecipientProjectAccessSql = opts.requireActiveRecipientProjectAccess
@@ -2007,6 +2008,7 @@ async function recipientVisibilityOnSenderSquads(
                AND a.scope_id IS c.scope_id
                AND ${capabilityRankSql('c.capability')} >= ${capabilityRankSql('a.capability')}
              WHERE c.member_id = ?1
+               AND ${CAPABILITY_LIVE_PREDICATE('c', '?5')}
             UNION ALL
             SELECT 'squad', cg.squad_id, a.capability
               FROM channel_capability_grants cg
@@ -2026,7 +2028,7 @@ async function recipientVisibilityOnSenderSquads(
       WHERE m.agent_id = ?2
         AND m.squad_id <> ?3
       LIMIT 1`,
-  ).bind(memberId, recipient.id, recipient.squad_id, ambientJson).first<{
+  ).bind(memberId, recipient.id, recipient.squad_id, ambientJson, nowCapabilitySql()).first<{
     squad_id: string
     scope_type: CapabilityGrant['scope_type']
     scope_id: string | null
@@ -2049,6 +2051,9 @@ function guestVisibilityWriteFenceSql(first: number): string {
   const scopeType = `?${first + 1}`
   const scopeId = `?${first + 2}`
   const capability = `?${first + 3}`
+  // 0149: the durable capability plane must be LIVE, not merely present. The
+  // caller pushes nowCapabilitySql() as the fifth value of this block.
+  const now = `?${first + 4}`
   return `AND (
     EXISTS (
       SELECT 1
@@ -2067,6 +2072,7 @@ function guestVisibilityWriteFenceSql(first: number): string {
               WHERE c.member_id = ?5
                 AND c.scope_type = ${scopeType}
                 AND c.scope_id IS ${scopeId}
+                AND ${CAPABILITY_LIVE_PREDICATE('c', now)}
                 AND ${capabilityRankSql('c.capability')} >= ${capabilityRankSql(capability)}
            )
            OR (
@@ -2126,6 +2132,7 @@ async function guestVisibilityFenceIsCurrent(
           EXISTS (
             SELECT 1 FROM capabilities c
              WHERE c.member_id = ?3
+               AND ${CAPABILITY_LIVE_PREDICATE('c', '?7')}
                AND c.scope_type = ?4
                AND c.scope_id IS ?5
                AND ${capabilityRankSql('c.capability')} >= ${capabilityRankSql('?6')}
@@ -2148,6 +2155,7 @@ async function guestVisibilityFenceIsCurrent(
     fence.scopeType,
     fence.scopeId,
     fence.capability,
+    nowCapabilitySql(),
   ).first()
   return row !== null
 }

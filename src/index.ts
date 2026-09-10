@@ -450,6 +450,7 @@ export default {
     // 11. Token expiry warning (Flight-002) — sweep active tokens expiring within 7 days
     //     and emit proactive warning bus events (pages seat/operator before silent stall).
     const { sweepExpiringTokensWarning } = await import('./auth/token-lifecycle')
+    const { sweepExpiredCapabilities } = await import('./auth/capability')
     // 12. Flight watchdog (mupot#1138) — reap flights that blew their execution or
     //     wake deadline. Reaps as the system actor 'mupot-watchdog'; 'escalate'
     //     (human review gate open >24h) is counted, never reaped. Requires the
@@ -469,6 +470,13 @@ export default {
       ['agent-connection-retention', () => sweepAgentConnectionRetention(env)],
       ['token-expiry-warning', () => sweepExpiringTokensWarning(env)],
       ['flight-watchdog', () => sweepStalledFlights(env)],
+      // APPEND, never insert. maintenanceSlot is (window * 10 + offset) % count
+      // (src/scheduled/slots.ts:42), so a route's minute is a function of its
+      // INDEX and the list length. Inserting anywhere but the end renumbers every
+      // route after it and silently moves work to different minutes — which is
+      // exactly what happened on the first cut of this, displacing
+      // flight-watchdog from minute 16.
+      ['capability-expiry-sweep', () => sweepExpiredCapabilities(env)],
     ]
     const heartbeat = maintenance[maintenanceSlot(scheduledAt.getUTCMinutes(), maintenance.length)]
     if (heartbeat) waitFor(heartbeat[0], heartbeat[1]())

@@ -7,6 +7,7 @@
 // how site four went unfixed while site one got attention.
 
 import type { Env } from '../types'
+import { CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
 import { resolveLoginIdentity } from '../auth/login-identity'
 
 export const OWNER_LOGIN_EMAILS_KEY = 'owner_login_emails'
@@ -37,8 +38,9 @@ async function uniqueOrgOwnerId(env: Env): Promise<string | null> {
         AND c.scope_type = 'org'
         AND c.scope_id IS NULL
         AND c.capability = 'owner'
+        AND ${CAPABILITY_LIVE_PREDICATE('c', '?2')}
       LIMIT 2`,
-  ).bind(env.TENANT_SLUG).all<{ id: string }>()
+  ).bind(env.TENANT_SLUG, nowCapabilitySql()).all<{ id: string }>()
   const found = rows.results ?? []
   if (found.length !== 1) return null
   return found[0].id

@@ -774,6 +774,18 @@ export async function bootstrapSelf(
   // now sees the row, and succeeds — unlike the P0-N2/WARN-2 shapes, nothing
   // here is deterministically doomed.
   const existingFounderGrant = await env.DB.prepare(
+    // DELIBERATELY UNFILTERED — this asks about ROW EXISTENCE, not authority.
+    //
+    // Same class as the two doors.ts prior-row reads, and I got this one wrong
+    // first: filtering it made an EXPIRED row invisible, so founderAdminStatement
+    // was included, and its INSERT (no ON CONFLICT, see the comment above) hit
+    // UNIQUE(member_id, scope_type, scope_id) inside the atomic batch. Worse, the
+    // comment's own escape — "a plain retry re-runs this pre-check, now sees the
+    // row, and succeeds" — became FALSE, because the retry filters the same
+    // lapsed row out again. A permanent, deterministic bootstrap lockout.
+    //
+    // Reachable, not theoretical: grant_agent_capability under elevation now
+    // writes a bounded grant on exactly this (member, 'squad', squadId) tuple.
     `SELECT capability FROM capabilities
       WHERE member_id = ?1 AND scope_type = 'squad' AND scope_id = ?2
       LIMIT 1`,

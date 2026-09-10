@@ -415,6 +415,112 @@ describe('grant_agent_capability — elevation substitutes for operator_principa
     expect(row?.capability).toBe('member')
   })
 
+  // THE KEYSTONE (migration 0149).
+  //
+  // grant_agent_capability writes the STANDING capabilities table, so before an
+  // expiry column existed the write was necessarily PERMANENT. That is the only
+  // reason an elevated caller is capped at 'member': a time-boxed approval must
+  // not confer authority that outlives it, and with no expiry the only way to
+  // bound the damage was to bound the RANK.
+  //
+  // With 0149 the conferred grant carries the ELEVATION's own expires_at, so it
+  // lapses on exactly the clock the human approved. That is what makes lifting
+  // the rank cap safe (mupot#1360) — tracked separately; the cap stays until the
+  // expiry is proven in production.
+  it('a capability conferred under elevation inherits the ELEVATION grant expiry', async () => {
+    const sessionId = await checkInActingAgent()
+    const grant = await approveElevation(sessionId, 'action:manage_access', 60, Date.now())
+
+    // The fixture seeds a PERMANENT grant on this squad, and the horizon is
+    // monotonic — so with that row present the elevated write correctly keeps
+    // permanence. Conferring NEW authority is the case under test here, so
+    // remove it; the monotonic behaviour has its own test below.
+    harness.sqlite
+      .prepare(`DELETE FROM capabilities WHERE member_id = ? AND scope_type = 'squad' AND scope_id = ?`)
+      .run(TARGET_MEMBER_ID, TARGET_SQUAD_ID)
+
+    const res = await invokeTool(
+      actingAgentAuth(),
+      env,
+      'grant_agent_capability',
+      { agent: TARGET_AGENT_ID, squad: TARGET_SQUAD_ID, capability: 'member' },
+      ORIGIN,
+    )
+    expect(res.ok, JSON.stringify(res)).toBe(true)
+
+    const row = harness.sqlite.prepare(
+      `SELECT capability, expires_at FROM capabilities
+        WHERE member_id = ? AND scope_type = 'squad' AND scope_id = ?`,
+    ).get(TARGET_MEMBER_ID, TARGET_SQUAD_ID) as { capability: string; expires_at: string | null } | undefined
+
+    expect(row?.capability).toBe('member')
+    // The whole point: not permanent, and not an arbitrary lifetime — exactly the
+    // approval's own horizon.
+    expect(row?.expires_at, 'an elevated grant must not be permanent').not.toBeNull()
+    expect(row?.expires_at).toBe(grant.expires_at)
+  })
+
+  it('THE HORIZON IS MONOTONIC — an elevated grant cannot shorten a longer or permanent one', async () => {
+    // A gate found this: rank 'member' re-granted as 'member' passes a rank-only
+    // demote guard (2 > 2 is false), and the upsert then wrote the elevation's
+    // 60-minute horizon over a PERMANENT grant. Standing authority that was
+    // permanent died in an hour — a demotion on the DURATION axis, performed by
+    // a session whose own error string forbids exactly that.
+    //
+    // Fixed at the WRITE rather than with a refusal, so there is no path around
+    // it and no legitimate flow is blocked.
+    const sessionId = await checkInActingAgent()
+    await approveElevation(sessionId, 'action:manage_access', 60, Date.now())
+
+    // The fixture's own seed is the permanent grant.
+    const before = harness.sqlite.prepare(
+      `SELECT expires_at FROM capabilities WHERE member_id = ? AND scope_type = 'squad' AND scope_id = ?`,
+    ).get(TARGET_MEMBER_ID, TARGET_SQUAD_ID) as { expires_at: string | null } | undefined
+    expect(before?.expires_at, 'fixture must start permanent for this to mean anything').toBeNull()
+
+    const res = await invokeTool(
+      actingAgentAuth(),
+      env,
+      'grant_agent_capability',
+      { agent: TARGET_AGENT_ID, squad: TARGET_SQUAD_ID, capability: 'member' },
+      ORIGIN,
+    )
+    expect(res.ok, JSON.stringify(res)).toBe(true)
+
+    const after = harness.sqlite.prepare(
+      `SELECT expires_at FROM capabilities WHERE member_id = ? AND scope_type = 'squad' AND scope_id = ?`,
+    ).get(TARGET_MEMBER_ID, TARGET_SQUAD_ID) as { expires_at: string | null } | undefined
+    expect(after?.expires_at, 'a permanent grant must survive an elevated re-grant').toBeNull()
+  })
+
+  it('a STANDING caller still writes a permanent grant — unchanged behaviour', async () => {
+    // The expiry rides on the ELEVATION, not on the tool. An operator granting
+    // from their own standing authority is making a permanent decision and must
+    // keep being able to.
+    const standingAuth = {
+      ...actingAgentAuth(),
+      boundAgentId: null,
+      capabilities: [
+        { member_id: ACTING_MEMBER_ID, scope_type: 'squad', scope_id: TARGET_SQUAD_ID, capability: 'admin' },
+      ],
+    } as unknown as ReturnType<typeof actingAgentAuth>
+
+    const res = await invokeTool(
+      standingAuth,
+      env,
+      'grant_agent_capability',
+      { agent: TARGET_AGENT_ID, squad: TARGET_SQUAD_ID, capability: 'member' },
+      ORIGIN,
+    )
+    expect(res.ok, JSON.stringify(res)).toBe(true)
+
+    const row = harness.sqlite.prepare(
+      `SELECT expires_at FROM capabilities
+        WHERE member_id = ? AND scope_type = 'squad' AND scope_id = ?`,
+    ).get(TARGET_MEMBER_ID, TARGET_SQUAD_ID) as { expires_at: string | null } | undefined
+    expect(row?.expires_at).toBeNull()
+  })
+
   // THE ATTACK THE FIRST DEMOTE GUARD WAVED THROUGH.
   //
   // setAgentSquadAccess upserts TWO tables — capabilities AND memberships — and

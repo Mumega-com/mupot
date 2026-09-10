@@ -1,4 +1,4 @@
-import { canOnSquad, resolveCapabilities } from '../auth/capability'
+import { canOnSquad, resolveCapabilities, CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { canonicalJson, sha256Hex } from '../lib/canonical-json'
 import type { AuthContext, Env } from '../types'
@@ -139,6 +139,7 @@ export async function hasIndependentRuntimeGate(
                 SELECT 1
                   FROM capabilities capability
                  WHERE capability.member_id = t.member_id
+                   AND ${CAPABILITY_LIVE_PREDICATE('capability', '?6')}
                    AND capability.capability IN ('member', 'lead', 'admin', 'owner')
                    AND (
                      capability.scope_type = 'org'
@@ -159,7 +160,7 @@ export async function hasIndependentRuntimeGate(
             )
        )
      LIMIT 1
-  `).bind(gateOwner, assigneeAgentId, env.TENANT_SLUG, taskSquadId, nowSqlUtc())
+  `).bind(gateOwner, assigneeAgentId, env.TENANT_SLUG, taskSquadId, nowSqlUtc(), nowCapabilitySql())
     .first<{ allowed: number }>()
   return row !== null
 }
@@ -446,6 +447,7 @@ export async function recordTaskDispatchRuntimeReceipt(
                              SELECT 1
                                FROM capabilities capability
                               WHERE capability.member_id = t.member_id
+                                AND ${CAPABILITY_LIVE_PREDICATE('capability', '?9')}
                                 AND capability.capability IN ('member', 'lead', 'admin', 'owner')
                                 AND (
                                   capability.scope_type = 'org'
@@ -482,7 +484,7 @@ export async function recordTaskDispatchRuntimeReceipt(
                )
             RETURNING status
           `).bind(result, now, input.taskId, agentId, input.dispatchReceiptId,
-            env.TENANT_SLUG, input.attempt, nowSqlUtc())
+            env.TENANT_SLUG, input.attempt, nowSqlUtc(), nowCapabilitySql())
         : env.DB.prepare(`
             UPDATE tasks SET status = 'blocked', result = ?1, updated_at = ?2
              WHERE id = ?3 AND assignee_agent_id = ?4

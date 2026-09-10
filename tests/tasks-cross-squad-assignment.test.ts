@@ -57,7 +57,8 @@ function createSchema(sqlite: SqliteD1Harness['sqlite']): void {
       member_id TEXT NOT NULL,
       scope_type TEXT NOT NULL,
       scope_id TEXT,
-      capability TEXT NOT NULL
+      capability TEXT NOT NULL,
+          expires_at TEXT
     );
     CREATE TABLE channel_capability_grants (
       id TEXT PRIMARY KEY,
