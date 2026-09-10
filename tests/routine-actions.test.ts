@@ -568,6 +568,12 @@ describe('Routine proposal submission and governed actions', () => {
     fixture.harness.sqlite.prepare(
       "UPDATE routine_runs SET proposal_json = ? WHERE id = 'run-1'",
     ).run(JSON.stringify(proposal))
+    const stamped = JSON.parse(
+      (row(fixture, "SELECT meta FROM flights WHERE id = 'control-flight'") as { meta: string }).meta,
+    ) as { receipt_refs: string[] }
+    stamped.receipt_refs = ['routine.proposal:run-1']
+    fixture.harness.sqlite.prepare("UPDATE flights SET meta = ? WHERE id = 'control-flight'")
+      .run(JSON.stringify(stamped))
     fixture.harness.sqlite.prepare(
       `INSERT INTO routine_run_actions (
         id, tenant, project_id, run_id, action_key, kind, input_json,

@@ -173,6 +173,7 @@ import {
   failFlight,
   getFlight,
   landGovernedFlight,
+  routineControlLandLacksWitness,
   listFlightProjectMismatchTaskIds,
   listFlightsForSquad,
   listIncompleteFlightTaskIds,
@@ -2747,6 +2748,9 @@ const toolFlightLand: ToolSpec = {
       const incompleteTaskIds = await listIncompleteFlightTaskIds(env, meta.task_ids)
       if (incompleteTaskIds.length > 0) {
         return fail(409, 'flight_tasks_incomplete', { task_ids: incompleteTaskIds })
+      }
+      if (meta.routine_run_id && await routineControlLandLacksWitness(env, flight.id)) {
+        return fail(409, 'routine_proposal_receipt_missing')
       }
       return fail(409, 'flight_transition_conflict')
     }

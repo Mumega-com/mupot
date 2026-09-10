@@ -2,6 +2,13 @@ import type { RoutineActionKind } from './types'
 
 export const ROUTINE_PROPOSAL_VERSION = 'routine.proposal/v1' as const
 
+/** Typed witness copied from marketing-monitor-evidence:<digest>. The id is the run. */
+export const ROUTINE_PROPOSAL_RECEIPT_PREFIX = 'routine.proposal:' as const
+
+export function routineProposalReceiptRef(runId: string): string {
+  return `${ROUTINE_PROPOSAL_RECEIPT_PREFIX}${runId}`
+}
+
 export interface RoutineProposalReference {
   type: 'task' | 'flight' | 'artifact'
   id: string

@@ -9,6 +9,7 @@ import type { Env } from '../types'
 import { createBus } from '../bus'
 import type { PreflightResult } from './preflight'
 import type { FlightMetaV1 } from './meta'
+import { ROUTINE_PROPOSAL_RECEIPT_PREFIX } from '../routines/proposal'
 
 const D1_TASK_ID_QUERY_CHUNK_SIZE = 90
 
@@ -309,6 +310,33 @@ export async function landGovernedFlight(
     cost_micro_usd: opts.cost_micro_usd,
     score: opts.score ?? null,
   })
+  // Witness SQL is only attached when this flight claims a routine_run_id.
+  // API/studio lands do not, and some callers (and tests) have no routine_runs
+  // table in scope — referencing it there throws and 500s a live land.
+  // Child flights carry routine_run_id but are not the control row
+  // (routine_runs.flight_id ≠ child id), so NOT EXISTS stays true and they land.
+  const routineWitnessSql = opts.meta.routine_run_id
+    ? ` AND (
+         NOT EXISTS (
+           SELECT 1 FROM routine_runs rr
+            WHERE rr.flight_id = flights.id
+              AND rr.tenant = flights.tenant
+              AND rr.id = json_extract(flights.meta, '$.routine_run_id')
+         )
+         OR EXISTS (
+           SELECT 1
+             FROM json_each(flights.meta, '$.receipt_refs') AS receipt_ref
+             JOIN routine_runs rr
+               ON rr.tenant = flights.tenant
+              AND rr.flight_id = flights.id
+              AND rr.id = json_extract(flights.meta, '$.routine_run_id')
+            WHERE rr.proposal_json IS NOT NULL
+              AND json_valid(rr.proposal_json)
+              AND json_extract(rr.proposal_json, '$.version') = 'routine.proposal/v1'
+              AND receipt_ref.value = '${ROUTINE_PROPOSAL_RECEIPT_PREFIX}' || rr.id
+         )
+       )`
+    : ''
   const transition = env.DB.prepare(
     `UPDATE flights SET status='landed', cost_micro_usd=?4, score=COALESCE(?5, score), ended_at=?6
      WHERE id=?1 AND tenant=?2
@@ -334,7 +362,7 @@ export async function landGovernedFlight(
                   LIMIT 1
                ), '') <> 'approved'
              )
-       )
+       )${routineWitnessSql}
      RETURNING score, cost_micro_usd`,
   )
     .bind(
@@ -481,6 +509,33 @@ export async function landGovernedFlight(
   }
 
   return { transitioned: true, receipt }
+}
+
+/** True when this flight is a routine control flight and its proposal witness does not resolve. */
+export async function routineControlLandLacksWitness(env: Env, flightId: string): Promise<boolean> {
+  const row = await env.DB.prepare(
+    `SELECT 1 AS missing FROM flights
+      WHERE id = ?1 AND tenant = ?2
+        AND EXISTS (
+          SELECT 1 FROM routine_runs rr
+           WHERE rr.flight_id = flights.id
+             AND rr.tenant = flights.tenant
+             AND rr.id = json_extract(flights.meta, '$.routine_run_id')
+        )
+        AND NOT EXISTS (
+          SELECT 1
+            FROM json_each(flights.meta, '$.receipt_refs') AS ref
+            JOIN routine_runs rr
+              ON rr.tenant = flights.tenant
+             AND rr.flight_id = flights.id
+             AND rr.id = json_extract(flights.meta, '$.routine_run_id')
+           WHERE rr.proposal_json IS NOT NULL
+             AND json_valid(rr.proposal_json)
+             AND json_extract(rr.proposal_json, '$.version') = 'routine.proposal/v1'
+             AND ref.value = ?3 || rr.id
+        )`,
+  ).bind(flightId, env.TENANT_SLUG, ROUTINE_PROPOSAL_RECEIPT_PREFIX).first()
+  return row !== null
 }
 
 /** True when this flight already carries its landed receipt. */
