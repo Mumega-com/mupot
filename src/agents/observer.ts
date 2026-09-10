@@ -33,7 +33,26 @@ export const NOOP_COOLDOWN_THRESHOLD = 6
 /** Consecutive error/exception ticks before triggering an escalation. */
 export const FAIL_ESCALATION_THRESHOLD = 3
 
-/** Cumulative liveness failures before triggering an escalation. */
+/**
+ * Cumulative liveness failures before triggering an escalation.
+ *
+ * ⚠ CURRENTLY UNREACHABLE. Measured 2026-09-10 (mupot#1383): the `'liveness_fail'`
+ * outcome that increments `liveness_fails` is declared here — in the union, in the
+ * doc block above, and in the switch below — and is **produced nowhere in src/**.
+ * Every `observeStep` call site in src/agents/loop.ts passes 'backpressure',
+ * 'observe-only', 'deduped', 'spawned', 'error', or a cast `decided as
+ * ObserverOutcome`. A paused agent returns from AgentDO BEFORE the goal cycle, so
+ * it never observes at all.
+ *
+ * So `liveness_fails` is permanently 0 and the disjunct using this constant can
+ * never contribute — escalation reaches `shouldEscalate` only via
+ * FAIL_ESCALATION_THRESHOLD. **Tuning this number changes nothing today.**
+ *
+ * Left in place rather than deleted because whether to produce the outcome or
+ * remove the concept is a decision, not a cleanup — see mupot#1383. The one path
+ * worth checking first is loop.ts's `decided as ObserverOutcome` cast, the only
+ * non-literal producer and the only way a value outside the union could arrive.
+ */
 export const LIVENESS_ESCALATION_THRESHOLD = 3
 
 /** How long (ms) to extend the alarm when cooling down. */
@@ -172,6 +191,9 @@ export async function observe(
 
   const cooldown = consecutive_noops >= NOOP_COOLDOWN_THRESHOLD
 
+  // The second disjunct is dead today: nothing produces 'liveness_fail', so
+  // liveness_fails is always 0 (mupot#1383). Escalation is reached only via
+  // consecutive_fails. Kept so the intent survives the decision in #1383.
   const shouldEscalate =
     consecutive_fails >= FAIL_ESCALATION_THRESHOLD ||
     liveness_fails >= LIVENESS_ESCALATION_THRESHOLD
