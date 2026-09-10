@@ -42,6 +42,58 @@ export interface EscalationEmitResult {
   error?: string
 }
 
+/** The exact task payload an escalation creates, and the options it creates it under. */
+export interface EscalationTaskPlan {
+  input: {
+    squad_id: string
+    title: string
+    body: string
+    done_when: string
+    gate_owner: string
+  }
+  options: {
+    actor: { kind: 'agent'; id: string }
+    allowDeferredPredicate: true
+  }
+}
+
+/**
+ * Build the escalation payload without writing anything.
+ *
+ * Split out from the emit so a test can assert the payload FIELD BY FIELD
+ * rather than by round-tripping it through D1 and checking the columns it
+ * happens to SELECT. An adversarial gate on PR #1381 mutated the emitted
+ * done_when off ESCALATION_DONE_WHEN and all six tests stayed green, because
+ * they pinned properties of the CONSTANT while the row was free to stop using
+ * it. Asserting the built plan closes that class: every field the emit depends
+ * on is named in one place that a test can read.
+ *
+ * Note what is deliberately ABSENT from options: `skipMirror`. createTask
+ * mirrors a task to a GitHub issue unless that flag is set, and for an
+ * escalation the issue is the delivery path that actually reaches a person
+ * (see the emit's doc below). Adding skipMirror here would silence escalations
+ * on any tenant with GITHUB_REPO configured.
+ */
+export function buildEscalationTaskPlan(
+  agent: Agent,
+  reason: string | null,
+  cycle: number,
+): EscalationTaskPlan {
+  return {
+    input: {
+      squad_id: agent.squad_id,
+      title: `ESCALATION: agent ${agent.slug} stuck`,
+      body: `Agent ${agent.slug} (${agent.id}) crossed the stuck threshold.\nReason: ${reason ?? 'unknown'}\nCycle: ${cycle}`,
+      done_when: ESCALATION_DONE_WHEN,
+      gate_owner: GATE_ESCALATION,
+    },
+    options: {
+      actor: { kind: 'agent', id: agent.id },
+      allowDeferredPredicate: true,
+    },
+  }
+}
+
 /**
  * Emit one operator-facing task for a stuck agent.
  *
@@ -52,9 +104,13 @@ export interface EscalationEmitResult {
  * wake fires only on a transition INTO status 'review' and createTask never calls
  * it, so a task created 'open' never attempts one — independently of the fact that
  * GATE_ESCALATION currently has zero grant holders. needs_you_list and the approvals
- * queue also both filter to 'review'. What DOES reach a human is the GitHub issue
- * mirror (createTask mirrors unless skipMirror is set, and it is not set here) and
- * the squad task list. See mupot#1382 for the re-fire amplification that follows.
+ * queue also both filter to 'review'.
+ *
+ * What reaches a person is the GitHub issue mirror — and that is CONDITIONAL:
+ * mirrorTaskCreate is inert unless GITHUB_REPO and an outbound token are
+ * configured. On a tenant without them the only surface left is the squad task
+ * list, which is a pull surface nobody is obliged to open. See mupot#1382 for the
+ * re-fire amplification that rides on the mirror when it IS configured.
  */
 export async function emitEscalation(
   env: Env,
@@ -62,18 +118,9 @@ export async function emitEscalation(
   reason: string | null,
   cycle: number,
 ): Promise<EscalationEmitResult> {
+  const plan = buildEscalationTaskPlan(agent, reason, cycle)
   try {
-    await createTask(
-      env,
-      {
-        squad_id: agent.squad_id,
-        title: `ESCALATION: agent ${agent.slug} stuck`,
-        body: `Agent ${agent.slug} (${agent.id}) crossed the stuck threshold.\nReason: ${reason ?? 'unknown'}\nCycle: ${cycle}`,
-        done_when: ESCALATION_DONE_WHEN,
-        gate_owner: GATE_ESCALATION,
-      },
-      { actor: { kind: 'agent', id: agent.id }, allowDeferredPredicate: true },
-    )
+    await createTask(env, plan.input, plan.options)
     return { emitted: true }
   } catch (emitErr) {
     return { emitted: false, error: emitErr instanceof Error ? emitErr.message : 'err' }
