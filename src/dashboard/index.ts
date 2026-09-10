@@ -2103,6 +2103,7 @@ dashboardApp.get('/enroll', async (c) => {
   const view = await loadEnrollView(c.env, auth, {
     seat: c.req.query('seat'),
     agent: c.req.query('agent'),
+    code: c.req.query('code'),
   })
   return c.html(shell(c.env, 'Enroll seat', enrollPageBody(view)))
 })
