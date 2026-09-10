@@ -200,9 +200,8 @@ export class AgentDO extends DurableObject<Env> {
         // S2: consume observer signals from the goal cycle.
         // cooldown=true → extend the next alarm so the agent backs off instead of
         //   busy-looping on an identical situation every 15 min.
-        // escalate=true → emit ONE operator-facing task via createTask (the
-        //   obs?.escalate block below). Wired. Delivery is a separate concern:
-        //   it reaches a person only if 'gate:escalation' has a live holder.
+        // escalate=true → emit an operator-facing task via createTask (the
+        //   obs?.escalate block below). Wired — see the delivery note there.
         const obs = goalResult.observer
         if (obs?.cooldown) {
           // Extend alarm by COOLDOWN_EXTENSION_MS on top of the standard interval.
@@ -211,10 +210,19 @@ export class AgentDO extends DurableObject<Env> {
         } else {
           await this.ensureAlarm()
         }
-        // obs?.escalate → emit ONE operator-facing task via the existing createTask
-        // seam (same path the cortex propose-cycle uses). The observer dedupes on
-        // ESCALATION_COOLDOWN_MS, so this fires at most once per stuck state —
-        // not once per tick. gate_owner marks it for operator attention.
+        // obs?.escalate → emit an operator-facing task via the existing createTask
+        // seam (same path the cortex propose-cycle uses). The observer rate-limits
+        // on ESCALATION_COOLDOWN_MS, so this fires at most once per HOUR, not once
+        // per 15-min tick — but it re-fires every hour while the agent stays stuck,
+        // and each emit also mirrors a GitHub issue (createTask does that unless
+        // skipMirror is set, which it is not here).
+        //
+        // DELIVERY, measured 2026-09-10: the gate_owner tag drives no wake. The
+        // gate-owner wake fires only on a transition INTO status 'review' and this
+        // task is created 'open', so it never runs — independently of the fact that
+        // 'gate:escalation' currently has zero grant holders. needs_you_list and the
+        // approvals queue also both filter to 'review'. What DOES reach a human is
+        // the GitHub issue mirror and the squad task list.
         if (obs?.escalate) {
           try {
             await createTask(
