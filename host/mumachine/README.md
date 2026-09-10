@@ -2,6 +2,12 @@
 
 A native Rust desktop app for local agent discovery and browser-approved connection to an existing Mupot identity. This v0.1 loads a verified boot brief and accessible registry squadmates. It can explicitly check in **this app** after revalidating the identity. It does not start an AI runtime, receive inbox work, dispatch tasks, create agents or edit another tool’s configuration.
 
+## Full software documentation
+
+Start with the [master documentation](docs/MASTER.md). It links the complete current and planned feature catalog, architecture, integration contracts, user guide, operations, security/privacy, testing and delivery process. The [application roadmap](ROADMAP.md) and [changelog](CHANGELOG.md) are separate from the Mupot server release track.
+
+The documentation describes the current **0.1.0 local developer preview** and clearly labels future desktop-operator capabilities. It does not imply those capabilities are implemented or approved for live activation.
+
 ## Run and bundle
 
 Requires a current stable Rust toolchain and macOS build tools. The delivered app has no Node or Python runtime dependency.
