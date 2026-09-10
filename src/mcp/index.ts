@@ -34,7 +34,7 @@ import type {
   Squad,
   Task,
 } from '../types'
-import { resolveCapabilities, hasCapability, holdsCapabilityFloor, canOnSquad } from '../auth/capability'
+import { resolveCapabilities, hasCapability, holdsCapabilityFloor, canOnSquad, canOnSquadAuth } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc, touchTokenLastUsed } from '../auth/token-lifecycle'
 import { evaluateVerdictGates } from '../tasks/index'
 import { resolveSoleGateOwnerAgent } from '../gates/grants'
@@ -472,6 +472,19 @@ export async function memberCanOnSquad(
   min: Capability,
 ): Promise<boolean> {
   return canOnSquad(env, grants, squadId, min)
+}
+
+/** The same check, seeing BOTH authority planes — see canOnSquadAuth's header.
+ *  Tools that gate a privileged act on squad admin must use THIS, or they are
+ *  blind to an org owner whose authority lives on auth.role rather than in a
+ *  capabilities row. */
+export async function memberCanOnSquadAuth(
+  env: Env,
+  auth: AuthContext,
+  squadId: string,
+  min: Capability,
+): Promise<boolean> {
+  return canOnSquadAuth(env, auth, squadId, min)
 }
 
 // ── d1 helpers (read-only lookups; allow-listed table names) ──────────────────

@@ -25,7 +25,7 @@
 
 import { html, raw as honoRaw } from 'hono/html'
 import type { AuthContext, Env } from '../types'
-import { canOnSquad, isOrgAdmin } from '../auth/capability'
+import { canOnSquadAuth, isOrgAdmin } from '../auth/capability'
 import { describeOrgStanding } from '../auth/refusal'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { listConsentableAgents, type ConsentableAgent } from '../mcp/oauth-authorize'
@@ -140,8 +140,15 @@ export async function authorizeEnrollMint(
   squadId: string,
 ): Promise<{ ok: true } | { ok: false; reason: 'operator_principal_required' | 'squad_admin_required' }> {
   if (auth.boundAgentId) return { ok: false, reason: 'operator_principal_required' }
-  const grants = auth.capabilities ?? []
-  if (!(await canOnSquad(env, grants, squadId, 'admin'))) {
+  // canOnSquadAuth, not canOnSquad: the bar is unchanged (admin on the squad,
+  // org/department inheriting as before) but the check now sees BOTH authority
+  // planes. `auth.capabilities ?? []` materialised an empty grant list for the
+  // org owner — whose capabilities are deliberately undefined — so the owner was
+  // refused by his own pot while the picker two hundred lines below happily
+  // listed his agents. Raised at the shared seam so mint_agent_token inherits
+  // the same repair; see the ruling recorded above about not raising this route
+  // alone.
+  if (!(await canOnSquadAuth(env, auth, squadId, 'admin'))) {
     return { ok: false, reason: 'squad_admin_required' }
   }
   return { ok: true }
