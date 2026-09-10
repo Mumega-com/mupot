@@ -2792,9 +2792,17 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_tasks_assignee_member" },
     ],
   },
+  {
+    file: "0151_task_gate_wake_notice.sql",
+    sha256: "fbaefbaefb7406bc631cacea39f8fd0fdc0e7597593c4b32a21ce3ed8a4f6ab4",
+    statements: [
+      "-- 0149_task_gate_wake_notice.sql — operator-visible review wake outcomes.\n--\n-- A review transition is committed before its best-effort gate wake runs. The\n-- wake therefore needs a durable, task-visible outcome: null used to make\n-- absent, stale, and ambiguous gate holders indistinguishable from a wake that\n-- was never attempted. This is metadata about the wake, not task execution\n-- evidence and not a verdict.\n\nALTER TABLE tasks ADD COLUMN gate_wake_notice TEXT;",
+    ],
+    objects: [],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "3b0f8d41f1505842208e7ff8f2ec1d2c5df356e9e3a7439b115539cc5b720f71"
+export const SCHEMA_CHAIN_DIGEST: string = "5aecbf779ee83722eca1914df9b44b964bb0773c2ececa1041cb462cb708b41f"

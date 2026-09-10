@@ -408,6 +408,10 @@ export interface Task {
   result: string | null // execution output (model answer) or a short failure note
   completed_at: string | null // ISO; set when execution finishes (done OR blocked)
   gate_owner: string | null // capability string gating the review→approved|rejected transition
+  // Durable, human-readable outcome of the most recent automatic gate wake.
+  // This is surfaced by task, board, and list reads; it is not execution output
+  // and never authorizes a verdict.
+  gate_wake_notice?: string | null
   // #142 capsule keystone: a checkable success predicate (e.g. "test X passes",
   // "GET /url returns 200", "migration applied"). Required on creation; the DB
   // column carries a sentinel default for rows pre-dating this migration.

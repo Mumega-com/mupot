@@ -37,7 +37,13 @@ import type {
 import { resolveCapabilities, hasCapability, holdsCapabilityFloor, canOnSquad, canOnSquadAuth } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc, touchTokenLastUsed } from '../auth/token-lifecycle'
 import { evaluateVerdictGates } from '../tasks/index'
-import { resolveSoleGateOwnerAgent } from '../gates/grants'
+import {
+  persistGateWakeNotice,
+  loadGateWakeNotices,
+  resolveSoleGateOwnerAgent,
+  type GateOwnerResolution,
+  type GatePrincipalRef,
+} from '../gates/grants'
 import { isChannel } from '../members/service'
 import { findExistingBootstrap } from '../members/bootstrap-self'
 import { resolveConsentedAgentCapabilities } from './oauth-authorize'
@@ -1027,10 +1033,11 @@ const toolTaskList: ToolSpec = {
       }
     }
 
+    const visibleTaskRows = await loadGateWakeNotices(env, taskRows)
     const agentStates: ReadonlyMap<string, AgentRuntimeState> =
-      taskRows.length > 0 ? await loadAgentRuntimeStates(env) : new Map()
+      visibleTaskRows.length > 0 ? await loadAgentRuntimeStates(env) : new Map()
 
-    return done({ squad_id: squadRes.squad.id, tasks: rankTasks(taskRows, agentStates) })
+    return done({ squad_id: squadRes.squad.id, tasks: rankTasks(visibleTaskRows, agentStates) })
   },
 }
 
@@ -1075,7 +1082,8 @@ const toolTaskBoard: ToolSpec = {
       rejected: [],
       done: [],
     }
-    for (const task of rows.results ?? []) {
+    const visibleTaskRows = await loadGateWakeNotices(env, rows.results ?? [])
+    for (const task of visibleTaskRows) {
       if (columns[task.status]) columns[task.status].push(task)
     }
     const counts = Object.fromEntries(
@@ -1573,6 +1581,7 @@ const toolTaskUpdate: ToolSpec = {
 
     const actor = memberActor(auth.memberId as string)
     await emitTaskEvent(env, 'task.updated', next, actor)
+    let gateWake: GateWakeOutcome | undefined
 
     // Review-wake (S### — wake the gate owner instead of waiting for a hand
     // relay): only on the ENTERING transition (existing status was not already
@@ -1580,7 +1589,8 @@ const toolTaskUpdate: ToolSpec = {
     // re-fires it. gate_required_for_review above already guarantees
     // next.gate_owner is set whenever next.status === 'review'.
     if (existing.status !== 'review' && next.status === 'review' && next.gate_owner) {
-      await wakeGateOwnerOnReview(env, next, actor, auth.memberId as string)
+      gateWake = await wakeGateOwnerOnReview(env, next, actor, auth.memberId as string)
+      next.gate_wake_notice = gateWake.notice
     }
 
     // GATE REASSIGNMENT RECEIPT + WAKE.
@@ -1620,7 +1630,8 @@ const toolTaskUpdate: ToolSpec = {
       // on a task that is ALREADY in review — so without this the new gate owner
       // is never told the gate is now theirs, and the task sits exactly as stuck
       // as it was before, just under a different name.
-      await wakeGateOwnerOnReview(env, next, actor, auth.memberId as string)
+      gateWake = await wakeGateOwnerOnReview(env, next, actor, auth.memberId as string)
+      next.gate_wake_notice = gateWake.notice
     }
 
     // VERDICT REVERSAL RECEIPT.
@@ -1647,7 +1658,7 @@ const toolTaskUpdate: ToolSpec = {
         .run()
     }
 
-    return done({ task: next })
+    return done({ task: next, ...(gateWake ? { gate_wake: gateWake } : {}) })
   },
 }
 
@@ -1666,7 +1677,9 @@ function reviewWakeRequestId(taskId: string, ts: string): string {
 
 // wakeGateOwnerOnReview — fires when a task ENTERS 'review' with a gate_owner set.
 // Two independent, best-effort side channels (neither may ever fail the review
-// transition itself, which has already committed by the time this runs):
+// transition itself, which has already committed by the time this runs). Every
+// outcome is also persisted on the task row so a swallowed wake cannot look like
+// a successful transition to an operator.
 //
 //   1. An `agent.wake` BusEvent, built EXACTLY like toolTaskDispatch's own event
 //      (same envelope shape) — this drives the in-Worker AgentDO cortex cycle via
@@ -1683,25 +1696,98 @@ function reviewWakeRequestId(taskId: string, ts: string): string {
 //      fleet-bridge.ts uses for task_dispatch's external-runtime delivery), so a
 //      non-DO runtime polling GET /api/inbox — the bash wake-hooks — also picks up
 //      the review delegation without needing a hand relay.
-async function wakeGateOwnerOnReview(
+export type GateWakeOutcome = {
+  status: 'delivered' | 'partial' | 'delivery_failed' | 'ambiguous' | 'no_live_holder' | 'requires_human' | 'resolution_failed'
+  capability: string
+  principal?: GatePrincipalRef
+  active_holders: readonly GatePrincipalRef[]
+  inactive_holders: readonly GatePrincipalRef[]
+  grant_count: number
+  notice: string
+  notice_persisted: boolean
+}
+
+async function surfaceGateWakeOutcome(
+  env: Env,
+  taskId: string,
+  outcome: Omit<GateWakeOutcome, 'notice_persisted'>,
+): Promise<GateWakeOutcome> {
+  let noticePersisted = true
+  try {
+    await persistGateWakeNotice(env, taskId, outcome.notice)
+  } catch {
+    noticePersisted = false
+  }
+  return { ...outcome, notice_persisted: noticePersisted }
+}
+
+export async function wakeGateOwnerOnReview(
   env: Env,
   task: Task,
   actor: { kind: 'member' | 'agent'; id: string },
   byId: string,
-): Promise<void> {
+): Promise<GateWakeOutcome> {
   const gateOwner = task.gate_owner
-  if (!gateOwner) return
-
-  let agentId: string | null
-  try {
-    agentId = await resolveSoleGateOwnerAgent(env, gateOwner)
-  } catch {
-    return // resolution failure — never break the already-committed review transition
+  if (!gateOwner) {
+    return surfaceGateWakeOutcome(env, task.id, {
+      status: 'no_live_holder',
+      capability: '',
+      active_holders: [],
+      inactive_holders: [],
+      grant_count: 0,
+      notice: 'Gate wake not attempted: task has no gate capability.',
+    })
   }
-  if (!agentId) return // zero or multiple holders: no unambiguous wake target
+
+  let resolution: GateOwnerResolution
+  try {
+    resolution = await resolveSoleGateOwnerAgent(env, gateOwner)
+  } catch {
+    return surfaceGateWakeOutcome(env, task.id, {
+      status: 'resolution_failed',
+      capability: gateOwner,
+      active_holders: [],
+      inactive_holders: [],
+      grant_count: 0,
+      notice: `Gate wake resolution failed for ${gateOwner}; no wake was attempted.`,
+    })
+  }
+
+  const baseOutcome = {
+    capability: resolution.capability,
+    active_holders: resolution.active_holders,
+    inactive_holders: resolution.inactive_holders,
+    grant_count: resolution.grant_count,
+  }
+  if (resolution.status === 'ambiguous') {
+    return surfaceGateWakeOutcome(env, task.id, {
+      ...baseOutcome,
+      status: 'ambiguous',
+      notice: `Gate wake refused: ${gateOwner} has multiple live holders (${resolution.active_holders.map((holder) => `${holder.type}:${holder.id}`).join(', ')}); operator decision required.`,
+    })
+  }
+  if (resolution.status === 'no_live_holder') {
+    return surfaceGateWakeOutcome(env, task.id, {
+      ...baseOutcome,
+      status: 'no_live_holder',
+      notice: `Gate wake not delivered: ${gateOwner} has no live holder (${resolution.inactive_holders.length} stale or missing grant${resolution.inactive_holders.length === 1 ? '' : 's'}).`,
+    })
+  }
+
+  if (resolution.principal.type === 'member') {
+    return surfaceGateWakeOutcome(env, task.id, {
+      ...baseOutcome,
+      status: 'requires_human',
+      principal: resolution.principal,
+      notice: `Gate wake requires human: ${gateOwner} is held by active member ${resolution.principal.id}; no agent-addressed delivery was created.`,
+    })
+  }
+
+  const agentId = resolution.principal.id
 
   const ts = new Date().toISOString()
 
+  let busDelivered = false
   try {
     const event: BusEvent<{ task_id: string; gate_owner: string; by: string }> = {
       type: 'agent.wake',
@@ -1713,12 +1799,14 @@ async function wakeGateOwnerOnReview(
       ts,
     }
     await createBus(env).emit(event)
+    busDelivered = true
   } catch {
-    // best-effort, mirrors toolTaskDispatch's own createBus(env).emit() try/catch
+    // best-effort, but retained in the visible outcome below
   }
 
+  let inboxDelivered = false
   try {
-    await sendAgentMessage(
+    const delivery = await sendAgentMessage(
       env,
       {
         fromAgent: REVIEW_WAKE_SENDER,
@@ -1733,10 +1821,22 @@ async function wakeGateOwnerOnReview(
         reason: 'target is the sole gate_grants holder resolved server-side, not attacker input',
       },
     )
+    inboxDelivered = delivery.ok
   } catch {
-    // best-effort — durable inbox delivery is additive to the bus wake, never
-    // allowed to fail the already-committed review transition.
+    // best-effort — the visible task notice records this failure.
   }
+
+  const status: GateWakeOutcome['status'] = busDelivered && inboxDelivered
+    ? 'delivered'
+    : busDelivered || inboxDelivered
+      ? 'partial'
+      : 'delivery_failed'
+  return surfaceGateWakeOutcome(env, task.id, {
+    ...baseOutcome,
+    status,
+    principal: resolution.principal,
+    notice: `Gate wake ${status}: ${gateOwner} -> agent ${agentId} (bus=${busDelivered ? 'sent' : 'failed'}, inbox=${inboxDelivered ? 'sent' : 'failed'}).`,
+  })
 }
 
 // task_verdict — approve or reject a task in 'review'. The MCP twin of

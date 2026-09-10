@@ -58,8 +58,8 @@ type CrossSquadAssignee = {
 }
 
 interface MakeEnvOpts {
-  /** capability → agent principal ids holding it, for gate_grants lookups
-   *  (wakeGateOwnerOnReview's resolveSoleGateOwnerAgent, src/mcp/index.ts). */
+  /** capability → active agent principal ids holding it, for gate_grants lookups
+   *  (wakeGateOwnerOnReview's liveness-aware resolver, src/mcp/index.ts). */
   gateGrants?: Record<string, string[]>
   /** Make env.BUS.send throw on every emit, to prove a bus failure never fails
    *  the review transition (wakeGateOwnerOnReview's try/catch). */
@@ -136,7 +136,12 @@ function makeEnv(
                 if (sql.includes('FROM gate_grants')) {
                   const capability = args[0] as string
                   return {
-                    results: (gateGrants.get(capability) ?? []).map((principal_id) => ({ principal_id })),
+                    results: (gateGrants.get(capability) ?? []).map((principal_id) => ({
+                      principal_type: 'agent',
+                      principal_id,
+                      agent_status: 'active',
+                      member_status: null,
+                    })),
                   }
                 }
                 if (sql.includes('FROM capabilities') && sql.includes('UNION ALL')) {

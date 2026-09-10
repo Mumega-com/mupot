@@ -4,7 +4,7 @@
 // INSERT OR IGNORE keeps grant idempotent; revoke is a hard DELETE (verdict receipts
 // remain the audit trail).
 
-import type { Env } from '../types'
+import type { Env, Task } from '../types'
 
 export type GatePrincipalType = 'member' | 'agent'
 
@@ -138,23 +138,138 @@ export async function revokeGateCapability(
 }
 
 
+export interface GatePrincipalRef {
+  readonly type: GatePrincipalType
+  readonly id: string
+}
+
+export type GateOwnerResolution =
+  | {
+      readonly status: 'resolved'
+      readonly capability: string
+      readonly principal: GatePrincipalRef
+      readonly active_holders: readonly GatePrincipalRef[]
+      readonly inactive_holders: readonly GatePrincipalRef[]
+      readonly grant_count: number
+    }
+  | {
+      readonly status: 'ambiguous'
+      readonly capability: string
+      readonly active_holders: readonly GatePrincipalRef[]
+      readonly inactive_holders: readonly GatePrincipalRef[]
+      readonly grant_count: number
+    }
+  | {
+      readonly status: 'no_live_holder'
+      readonly capability: string
+      readonly active_holders: readonly GatePrincipalRef[]
+      readonly inactive_holders: readonly GatePrincipalRef[]
+      readonly grant_count: number
+    }
+
+interface GateOwnerPrincipalRow {
+  principal_type: GatePrincipalType
+  principal_id: string
+  agent_status: string | null
+  member_status: string | null
+}
+
 /**
- * Resolve a gate_owner CAPABILITY NAME (e.g. 'gate:athena') to the single AGENT
- * principal that holds it, from the gate_grants table (migration 0008:
- * capability, principal_type, principal_id — no tenant column, mirroring every
- * other gate_grants query in this codebase). Zero or more than one agent holder
- * has no unambiguous wake target, so the caller treats it as "skip silently" —
- * the same posture task_verdict takes when a capability isn't resolvable to a
- * sole actor.
+ * Resolve a gate_owner capability to its live principal(s).
+ *
+ * Gate ownership liveness is principal authority, not presence telemetry. The
+ * existing write-side predicate `hasActiveGateGrant` uses agents.status and
+ * members.status, so this read path deliberately uses those same rows and
+ * status values. `peers`, `module_registry`, and `fleet_agents` may describe
+ * runtime or attach presence and may contradict one another; none is
+ * authoritative for gate ownership, and no third liveness predicate belongs
+ * here.
+ *
+ * The function name is retained because this is the existing wake seam, but a
+ * nullable agent id is no longer an honest result: member principals are valid,
+ * multiple live holders are a visible ambiguity, and zero live holders names
+ * the capability whose wake cannot proceed.
  */
-export async function resolveSoleGateOwnerAgent(env: Env, gateOwner: string): Promise<string | null> {
+export async function resolveSoleGateOwnerAgent(env: Env, gateOwner: string): Promise<GateOwnerResolution> {
   const rows = await env.DB.prepare(
-    `SELECT principal_id FROM gate_grants WHERE capability = ?1 AND principal_type = 'agent'`,
+    `SELECT g.principal_type, g.principal_id,
+            a.status AS agent_status,
+            m.status AS member_status
+       FROM gate_grants g
+       LEFT JOIN agents a
+         ON g.principal_type = 'agent' AND a.id = g.principal_id
+       LEFT JOIN members m
+         ON g.principal_type = 'member' AND m.id = g.principal_id
+      WHERE g.capability = ?1
+      ORDER BY g.principal_type ASC, g.principal_id ASC`,
   )
     .bind(gateOwner)
-    .all<{ principal_id: string }>()
-  const results = rows.results ?? []
-  return results.length === 1 ? results[0].principal_id : null
+    .all<GateOwnerPrincipalRow>()
+
+  const activeHolders: GatePrincipalRef[] = []
+  const inactiveHolders: GatePrincipalRef[] = []
+  for (const row of rows.results ?? []) {
+    const principal: GatePrincipalRef = { type: row.principal_type, id: row.principal_id }
+    const status = row.principal_type === 'agent' ? row.agent_status : row.member_status
+    if (status === 'active') activeHolders.push(principal)
+    else inactiveHolders.push(principal)
+  }
+
+  const common = {
+    capability: gateOwner,
+    active_holders: activeHolders,
+    inactive_holders: inactiveHolders,
+    grant_count: (rows.results ?? []).length,
+  }
+  if (activeHolders.length === 1) {
+    return { ...common, status: 'resolved', principal: activeHolders[0] }
+  }
+  if (activeHolders.length > 1) return { ...common, status: 'ambiguous' }
+  return { ...common, status: 'no_live_holder' }
+}
+
+const MAX_GATE_WAKE_NOTICE_CHARS = 2000
+
+/**
+ * Keep the latest wake outcome on the task row so task, board, and list reads
+ * show why a review was not delivered. This is operational metadata only: it
+ * never changes task status or verdict authority.
+ */
+export async function persistGateWakeNotice(env: Env, taskId: string, notice: string): Promise<void> {
+  await env.DB.prepare(
+    `UPDATE tasks SET gate_wake_notice = ?1 WHERE id = ?2`,
+  )
+    .bind(notice.slice(0, MAX_GATE_WAKE_NOTICE_CHARS), taskId)
+    .run()
+}
+
+/**
+ * Hydrate the optional wake notice only for operator-facing task surfaces.
+ * Execution projections intentionally do not select this post-0148 column:
+ * several compatibility fixtures and legacy consumers build an older task
+ * shape. A missing column is therefore an explicit legacy-schema fallback,
+ * while every other read error remains visible to the caller.
+ */
+export async function loadGateWakeNotices(env: Env, tasks: readonly Task[]): Promise<Task[]> {
+  if (tasks.length === 0) return [...tasks]
+  const ids = tasks.map((task) => task.id)
+  const placeholders = ids.map(() => '?').join(', ')
+  try {
+    const rows = await env.DB.prepare(
+      `SELECT id, gate_wake_notice FROM tasks WHERE id IN (${placeholders})`,
+    )
+      .bind(...ids)
+      .all<{ id: string; gate_wake_notice: string | null }>()
+    const notices = new Map((rows.results ?? []).map((row) => [row.id, row.gate_wake_notice]))
+    return tasks.map((task) => ({
+      ...task,
+      gate_wake_notice: notices.get(task.id) ?? null,
+    }))
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error)
+    if (/no such column:\s*gate_wake_notice/i.test(detail)) return [...tasks]
+    throw error
+  }
 }
 
 // ── mupot#1080 — the write path's own liveness check ──────────────────────────
