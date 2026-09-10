@@ -642,7 +642,7 @@ describe('escalated episode — recorded on every path the observer can escalate
     const env = makeLoopEnv(makeLoopD1({ backlogCount: MAX_OPEN_TASKS }))
     const recordEpisode = vi.fn().mockResolvedValue(undefined)
     const result = await runGoalCycle(env, agent, baseDeps({
-      observe: vi.fn().mockResolvedValue({ cooldown: true, escalate: true, reason: 'liveness_fails=3' }),
+      observe: vi.fn().mockResolvedValue({ cooldown: true, escalate: true, reason: 'consecutive_fails=3' }),
       recordEpisode,
     }))
     expect(result.decided).toBe('backpressure')

@@ -327,10 +327,15 @@ export async function runGoalCycle(
     buildAuthorizedExecution(env, agent, null, estimateMicroUsd),
   )
   if (!meterResult.ok) {
-    const decided: GoalCycleDecided =
-      meterResult.reason === 'budget_cap_exceeded' ? 'budget_exhausted' : 'rate_limited'
+    const observerOutcome = meterResult.reason === 'budget_cap_exceeded'
+      ? 'budget_exhausted' as const
+      : 'rate_limited' as const
+    const decided: GoalCycleDecided = observerOutcome
     // S2: observe the meter-block as a noop (not a failure — it is a governed state).
-    const observerResult = await observeStep(doObserve, doRecord, env, agent, decided as ObserverOutcome, deps.sensoriumRuntime?.cycles ?? null)
+    // Both values are ObserverOutcome members; no cast. The previous
+    // `decided as ObserverOutcome` was the only non-literal producer and could
+    // only ever hold these two strings — never 'liveness_fail' (#1383).
+    const observerResult = await observeStep(doObserve, doRecord, env, agent, observerOutcome, deps.sensoriumRuntime?.cycles ?? null)
     return {
       ok: false,
       decided,
@@ -786,8 +791,8 @@ async function safeObserve(
 /**
  * observeStep — observe the cycle outcome AND record an 'escalated' episode if the
  * observer fires an escalation. Centralized so escalation is captured on EVERY exit
- * path: escalations build on failure/liveness/noop ticks (consecutive_fails /
- * liveness_fails), NOT the 'spawned' path which resets those counters. Wiring the
+ * path: escalations build on failure/noop ticks (consecutive_fails),
+ * NOT the 'spawned' path which resets those counters. Wiring the
  * escalated-episode record only after 'spawned' (the pre-fix bug) meant it never ran.
  * Both the observe and the record are best-effort and never abort the cycle.
  */
