@@ -27,18 +27,17 @@
 //     hand-written CREATE TABLE (CI #711), never a string-matching DB mock (#721)
 //   - the org owner as the bridge builds him: role 'owner' on the legacy plane,
 //     capabilities UNDEFINED (never []), zero rows in `capabilities`
+//   - every tool enters through invokeTool (scripts/check-mcp-tool-seam.mjs,
+//     mupot#1289): spec.min is enforced centrally BEFORE run(), so a proof
+//     that bypasses it proves nothing about the production path
 //   - every negative is PAIRED with a positive: a refusal test that passes
 //     because the harness returned null for everything proves nothing
 
 import { describe, expect, it } from 'vitest'
 import { randomBytes } from 'node:crypto'
 import { createAgent, getAgentProfile } from '../src/org/service'
-// Side-effect first: src/mcp/provision ↔ src/mcp/index form a cycle, and
-// importing provision first leaves PROVISION_TOOLS undefined inside index's
-// spread (see tests/provision-tools.test.ts import order for the same reason).
-import '../src/mcp'
-import { PROVISION_TOOLS } from '../src/mcp/provision'
-import type { ToolCtx, ToolSpec } from '../src/mcp'
+import { invokeTool } from '../src/mcp'
+import type { ToolCtx } from '../src/mcp'
 import type { AuthContext, CapabilityGrant, Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
@@ -51,10 +50,12 @@ const OWNER_MEMBER = 'mem-owner'
 const WELD_MEMBER = 'mem-weld'
 const CTX: ToolCtx = { origin: 'test', transport: 'mcp' }
 
-function runTool(name: string): ToolSpec {
-  const tool = PROVISION_TOOLS.find((t) => t.name === name)
-  if (!tool) throw new Error(`tool not registered: ${name}`)
-  return tool
+// Every tool enters through invokeTool — never a ToolSpec's run() directly
+// (scripts/check-mcp-tool-seam.mjs, mupot#1289). spec.min is enforced
+// centrally in invokeTool BEFORE run() is entered, so a proof that bypasses
+// it proves nothing about the path production callers take.
+function callTool(name: string, auth: AuthContext, env: Env, args: Record<string, unknown>) {
+  return invokeTool(auth, env, name, args, CTX)
 }
 
 interface Fixture {
@@ -148,7 +149,7 @@ describe('credential lifecycle sees the role-plane owner (mupot#1366)', () => {
   it('owner LISTS the seat key he minted', async () => {
     const { h, env, agentId } = await fixture()
     try {
-      const out = await runTool('list_agent_tokens').run(ownerAuth(), env, { agent: agentId }, CTX)
+      const out = await callTool('list_agent_tokens', ownerAuth(), env, { agent: agentId })
       expect(out.ok, JSON.stringify(out)).toBe(true)
       if (!out.ok) return
       const result = out.result as { tokens: Array<Record<string, unknown>> }
@@ -164,7 +165,7 @@ describe('credential lifecycle sees the role-plane owner (mupot#1366)', () => {
   it('squad admin on THIS squad still lists, as before', async () => {
     const { h, env, agentId } = await fixture()
     try {
-      const out = await runTool('list_agent_tokens').run(squadAdmin(), env, { agent: agentId }, CTX)
+      const out = await callTool('list_agent_tokens', squadAdmin(), env, { agent: agentId })
       expect(out.ok, JSON.stringify(out)).toBe(true)
     } finally {
       h.sqlite.close()
@@ -174,7 +175,7 @@ describe('credential lifecycle sees the role-plane owner (mupot#1366)', () => {
   it('squad LEAD is still refused list', async () => {
     const { h, env, agentId } = await fixture()
     try {
-      const out = await runTool('list_agent_tokens').run(squadLead(), env, { agent: agentId }, CTX)
+      const out = await callTool('list_agent_tokens', squadLead(), env, { agent: agentId })
       expect(out.ok).toBe(false)
     } finally {
       h.sqlite.close()
@@ -184,7 +185,7 @@ describe('credential lifecycle sees the role-plane owner (mupot#1366)', () => {
   it('other-squad admin is still refused list', async () => {
     const { h, env, agentId } = await fixture()
     try {
-      const out = await runTool('list_agent_tokens').run(otherSquadAdmin(), env, { agent: agentId }, CTX)
+      const out = await callTool('list_agent_tokens', otherSquadAdmin(), env, { agent: agentId })
       expect(out.ok).toBe(false)
     } finally {
       h.sqlite.close()
@@ -194,7 +195,7 @@ describe('credential lifecycle sees the role-plane owner (mupot#1366)', () => {
   it('grantless member is still refused list', async () => {
     const { h, env, agentId } = await fixture()
     try {
-      const out = await runTool('list_agent_tokens').run(grantless(), env, { agent: agentId }, CTX)
+      const out = await callTool('list_agent_tokens', grantless(), env, { agent: agentId })
       expect(out.ok).toBe(false)
     } finally {
       h.sqlite.close()
@@ -205,8 +206,12 @@ describe('credential lifecycle sees the role-plane owner (mupot#1366)', () => {
     const { h, env, agentId } = await fixture()
     try {
       const agentOwner = { ...ownerAuth(), boundAgentId: 'agent-other' } as unknown as AuthContext
-      const out = await runTool('list_agent_tokens').run(agentOwner, env, { agent: agentId }, CTX)
+      const out = await callTool('list_agent_tokens', agentOwner, env, { agent: agentId })
       expect(out.ok).toBe(false)
+      // Through invokeTool the floor runs first — but hasWorkspaceAdmin sees the
+      // OWNER ROLE, not the binding, so a role-plane owner who is agent-bound
+      // sails through the floor and is refused by run()'s operator-principal
+      // gate. This test now proves that ordering on the production path.
       if (!out.ok) expect(out.error).toBe('operator_principal_required')
     } finally {
       h.sqlite.close()
@@ -217,8 +222,7 @@ describe('credential lifecycle sees the role-plane owner (mupot#1366)', () => {
   it('owner REVOKES the seat key he minted, idempotently', async () => {
     const { h, env, agentId } = await fixture()
     try {
-      const tool = runTool('revoke_agent_token')
-      const first = await tool.run(ownerAuth(), env, { agent: agentId, token_id: 'tok-live' }, CTX)
+      const first = await callTool('revoke_agent_token', ownerAuth(), env, { agent: agentId, token_id: 'tok-live' })
       expect(first.ok, JSON.stringify(first)).toBe(true)
       if (!first.ok) return
       expect((first.result as { revoked: boolean }).revoked).toBe(true)
@@ -226,7 +230,7 @@ describe('credential lifecycle sees the role-plane owner (mupot#1366)', () => {
         .prepare('SELECT revoked_at FROM member_tokens WHERE id = ?')
         .get('tok-live') as { revoked_at: string | null }
       expect(row.revoked_at).not.toBeNull()
-      const second = await tool.run(ownerAuth(), env, { agent: agentId, token_id: 'tok-live' }, CTX)
+      const second = await callTool('revoke_agent_token', ownerAuth(), env, { agent: agentId, token_id: 'tok-live' })
       expect(second.ok).toBe(true)
       if (second.ok) expect((second.result as { already_revoked: boolean }).already_revoked).toBe(true)
     } finally {
@@ -237,7 +241,7 @@ describe('credential lifecycle sees the role-plane owner (mupot#1366)', () => {
   it('squad LEAD is still refused revoke', async () => {
     const { h, env, agentId } = await fixture()
     try {
-      const out = await runTool('revoke_agent_token').run(squadLead(), env, { agent: agentId, token_id: 'tok-live' }, CTX)
+      const out = await callTool('revoke_agent_token', squadLead(), env, { agent: agentId, token_id: 'tok-live' })
       expect(out.ok).toBe(false)
       const row = h.sqlite
         .prepare('SELECT revoked_at FROM member_tokens WHERE id = ?')
@@ -251,10 +255,10 @@ describe('credential lifecycle sees the role-plane owner (mupot#1366)', () => {
   it('other-squad admin is still refused revoke', async () => {
     const { h, env, agentId } = await fixture()
     try {
-      const out = await runTool('revoke_agent_token').run(otherSquadAdmin(), env, {
+      const out = await callTool('revoke_agent_token', otherSquadAdmin(), env, {
         agent: agentId,
         token_id: 'tok-live',
-      }, CTX)
+      })
       expect(out.ok).toBe(false)
     } finally {
       h.sqlite.close()
@@ -264,7 +268,7 @@ describe('credential lifecycle sees the role-plane owner (mupot#1366)', () => {
   it('grantless member is still refused revoke', async () => {
     const { h, env, agentId } = await fixture()
     try {
-      const out = await runTool('revoke_agent_token').run(grantless(), env, { agent: agentId, token_id: 'tok-live' }, CTX)
+      const out = await callTool('revoke_agent_token', grantless(), env, { agent: agentId, token_id: 'tok-live' })
       expect(out.ok).toBe(false)
     } finally {
       h.sqlite.close()
@@ -275,8 +279,10 @@ describe('credential lifecycle sees the role-plane owner (mupot#1366)', () => {
     const { h, env, agentId } = await fixture()
     try {
       const agentOwner = { ...ownerAuth(), boundAgentId: 'agent-other' } as unknown as AuthContext
-      const out = await runTool('revoke_agent_token').run(agentOwner, env, { agent: agentId, token_id: 'tok-live' }, CTX)
+      const out = await callTool('revoke_agent_token', agentOwner, env, { agent: agentId, token_id: 'tok-live' })
       expect(out.ok).toBe(false)
+      // Same ordering as the list case: floor passes the owner role, run()
+      // refuses the binding.
       if (!out.ok) expect(out.error).toBe('operator_principal_required')
     } finally {
       h.sqlite.close()
@@ -287,11 +293,10 @@ describe('credential lifecycle sees the role-plane owner (mupot#1366)', () => {
   it('owner REGISTERS the seat key', async () => {
     const { h, env, agentId } = await fixture()
     try {
-      const out = await runTool('register_agent_key').run(
+      const out = await callTool('register_agent_key', 
         ownerAuth(),
         env,
         { agent: agentId, public_key: await freshPublicX(), key_id: agentId },
-        CTX,
       )
       expect(out.ok, JSON.stringify(out)).toBe(true)
     } finally {
@@ -302,11 +307,10 @@ describe('credential lifecycle sees the role-plane owner (mupot#1366)', () => {
   it('squad LEAD is still refused register', async () => {
     const { h, env, agentId } = await fixture()
     try {
-      const out = await runTool('register_agent_key').run(
+      const out = await callTool('register_agent_key', 
         squadLead(),
         env,
         { agent: agentId, public_key: noiseKey(), key_id: agentId },
-        CTX,
       )
       expect(out.ok).toBe(false)
     } finally {
@@ -317,11 +321,10 @@ describe('credential lifecycle sees the role-plane owner (mupot#1366)', () => {
   it('other-squad admin is still refused register', async () => {
     const { h, env, agentId } = await fixture()
     try {
-      const out = await runTool('register_agent_key').run(
+      const out = await callTool('register_agent_key', 
         otherSquadAdmin(),
         env,
         { agent: agentId, public_key: noiseKey(), key_id: agentId },
-        CTX,
       )
       expect(out.ok).toBe(false)
     } finally {
@@ -332,11 +335,10 @@ describe('credential lifecycle sees the role-plane owner (mupot#1366)', () => {
   it('grantless member is still refused register', async () => {
     const { h, env, agentId } = await fixture()
     try {
-      const out = await runTool('register_agent_key').run(
+      const out = await callTool('register_agent_key', 
         grantless(),
         env,
         { agent: agentId, public_key: noiseKey(), key_id: agentId },
-        CTX,
       )
       expect(out.ok).toBe(false)
     } finally {
@@ -348,13 +350,14 @@ describe('credential lifecycle sees the role-plane owner (mupot#1366)', () => {
     const { h, env, agentId } = await fixture()
     try {
       const agentOwner = { ...ownerAuth(), boundAgentId: 'agent-other' } as unknown as AuthContext
-      const out = await runTool('register_agent_key').run(
+      const out = await callTool('register_agent_key', 
         agentOwner,
         env,
         { agent: agentId, public_key: noiseKey(), key_id: agentId },
-        CTX,
       )
       expect(out.ok).toBe(false)
+      // Same ordering as the list case: floor passes the owner role, run()
+      // refuses the binding.
       if (!out.ok) expect(out.error).toBe('operator_principal_required')
     } finally {
       h.sqlite.close()
@@ -365,7 +368,7 @@ describe('credential lifecycle sees the role-plane owner (mupot#1366)', () => {
   it('owner UPDATES the seat row', async () => {
     const { h, env, agentId } = await fixture()
     try {
-      const out = await runTool('update_agent').run(ownerAuth(), env, { agent: agentId, purpose: 'night watch' }, CTX)
+      const out = await callTool('update_agent', ownerAuth(), env, { agent: agentId, purpose: 'night watch' })
       expect(out.ok, JSON.stringify(out)).toBe(true)
       const reread = await getAgentProfile(env, agentId)
       expect(reread?.purpose).toBe('night watch')
@@ -377,7 +380,7 @@ describe('credential lifecycle sees the role-plane owner (mupot#1366)', () => {
   it('squad LEAD is still refused update', async () => {
     const { h, env, agentId } = await fixture()
     try {
-      const out = await runTool('update_agent').run(squadLead(), env, { agent: agentId, purpose: 'x' }, CTX)
+      const out = await callTool('update_agent', squadLead(), env, { agent: agentId, purpose: 'x' })
       expect(out.ok).toBe(false)
     } finally {
       h.sqlite.close()
@@ -387,7 +390,7 @@ describe('credential lifecycle sees the role-plane owner (mupot#1366)', () => {
   it('other-squad admin is still refused update', async () => {
     const { h, env, agentId } = await fixture()
     try {
-      const out = await runTool('update_agent').run(otherSquadAdmin(), env, { agent: agentId, purpose: 'x' }, CTX)
+      const out = await callTool('update_agent', otherSquadAdmin(), env, { agent: agentId, purpose: 'x' })
       expect(out.ok).toBe(false)
     } finally {
       h.sqlite.close()
@@ -397,7 +400,7 @@ describe('credential lifecycle sees the role-plane owner (mupot#1366)', () => {
   it('grantless member is still refused update', async () => {
     const { h, env, agentId } = await fixture()
     try {
-      const out = await runTool('update_agent').run(grantless(), env, { agent: agentId, purpose: 'x' }, CTX)
+      const out = await callTool('update_agent', grantless(), env, { agent: agentId, purpose: 'x' })
       expect(out.ok).toBe(false)
     } finally {
       h.sqlite.close()
@@ -412,7 +415,7 @@ describe('credential lifecycle sees the role-plane owner (mupot#1366)', () => {
         memberId: WELD_MEMBER,
         boundAgentId: 'agent-other',
       } as unknown as AuthContext
-      const out = await runTool('update_agent').run(agentCaller, env, { agent: agentId, purpose: 'x' }, CTX)
+      const out = await callTool('update_agent', agentCaller, env, { agent: agentId, purpose: 'x' })
       expect(out.ok).toBe(false)
       if (!out.ok) expect(out.error).toBe('operator_principal_required')
     } finally {
@@ -424,7 +427,7 @@ describe('credential lifecycle sees the role-plane owner (mupot#1366)', () => {
   it('owner DEACTIVATES the seat and its live token dies with it', async () => {
     const { h, env, agentId } = await fixture()
     try {
-      const out = await runTool('deactivate_agent').run(ownerAuth(), env, { agent: agentId }, CTX)
+      const out = await callTool('deactivate_agent', ownerAuth(), env, { agent: agentId })
       expect(out.ok, JSON.stringify(out)).toBe(true)
       const agent = h.sqlite.prepare('SELECT status FROM agents WHERE id = ?').get(agentId) as { status: string }
       expect(agent.status).toBe('inactive')
@@ -440,7 +443,7 @@ describe('credential lifecycle sees the role-plane owner (mupot#1366)', () => {
   it('squad LEAD is still refused deactivate', async () => {
     const { h, env, agentId } = await fixture()
     try {
-      const out = await runTool('deactivate_agent').run(squadLead(), env, { agent: agentId }, CTX)
+      const out = await callTool('deactivate_agent', squadLead(), env, { agent: agentId })
       expect(out.ok).toBe(false)
       const agent = h.sqlite.prepare('SELECT status FROM agents WHERE id = ?').get(agentId) as { status: string }
       expect(agent.status).not.toBe('inactive')
@@ -452,7 +455,7 @@ describe('credential lifecycle sees the role-plane owner (mupot#1366)', () => {
   it('other-squad admin is still refused deactivate', async () => {
     const { h, env, agentId } = await fixture()
     try {
-      const out = await runTool('deactivate_agent').run(otherSquadAdmin(), env, { agent: agentId }, CTX)
+      const out = await callTool('deactivate_agent', otherSquadAdmin(), env, { agent: agentId })
       expect(out.ok).toBe(false)
     } finally {
       h.sqlite.close()
@@ -462,7 +465,7 @@ describe('credential lifecycle sees the role-plane owner (mupot#1366)', () => {
   it('grantless member is still refused deactivate', async () => {
     const { h, env, agentId } = await fixture()
     try {
-      const out = await runTool('deactivate_agent').run(grantless(), env, { agent: agentId }, CTX)
+      const out = await callTool('deactivate_agent', grantless(), env, { agent: agentId })
       expect(out.ok).toBe(false)
     } finally {
       h.sqlite.close()
@@ -477,7 +480,7 @@ describe('credential lifecycle sees the role-plane owner (mupot#1366)', () => {
         memberId: WELD_MEMBER,
         boundAgentId: 'agent-other',
       } as unknown as AuthContext
-      const out = await runTool('deactivate_agent').run(agentCaller, env, { agent: agentId }, CTX)
+      const out = await callTool('deactivate_agent', agentCaller, env, { agent: agentId })
       expect(out.ok).toBe(false)
     } finally {
       h.sqlite.close()
