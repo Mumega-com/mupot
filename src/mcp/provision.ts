@@ -1363,11 +1363,9 @@ const toolGrantAgentCapability: ToolSpec = {
     if (!squadResult.ok) return resolveFail(squadResult.reason, 'squad_not_found')
     const squad = squadResult.value
 
+    const grants = auth.capabilities ?? []
     let elevatedGrant: ElevationGrantRecord | null = null
-    // memberCanOnSquadAuth (mupot#1366): the STANDING authority question only,
-    // both planes. A principal who fails it still falls through to the
-    // elevation limb below, unchanged — the two-limb structure is preserved.
-    if (!(await memberCanOnSquadAuth(env, auth, squad.id, 'admin'))) {
+    if (!(await memberCanOnSquad(env, grants, squad.id, 'admin'))) {
       if (!mayBeElevated) return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
       const squadDepartmentId = await resolveElevationSquadDepartmentId(env, 'squad', squad.id)
       const elevated = await hasElevatedAction(env, auth, 'action:manage_access', 'squad', squad.id, {
@@ -1428,13 +1426,7 @@ const toolGrantAgentCapability: ToolSpec = {
           "an elevated session may grant at most 'member' — a standing lead/admin outlives the elevation and must be granted by standing authority",
         )
       }
-    // NOTE (mupot#1366): the ceiling asks the same standing-authority question
-    // as the gate above — "does this caller hold `capability` on this squad" —
-    // so it carries the same blindness when written grants-only. Raised to the
-    // same seam at the caller's own requested rank: the bar (rank X to grant
-    // rank X) is unchanged, it now sees both planes. Without this, the site
-    // fix above opens the door and this line shuts it again for the owner.
-    } else if (!(await memberCanOnSquadAuth(env, auth, squad.id, capability))) {
+    } else if (!callerCanGrantAgentCapability(grants, squad, capability)) {
       return fail(403, 'cannot_grant_above_own_rank')
     }
 

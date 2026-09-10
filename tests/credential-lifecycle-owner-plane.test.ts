@@ -1,24 +1,26 @@
 // tests/credential-lifecycle-owner-plane.test.ts — mupot#1366.
 //
 // PR #1359 raised mint_agent_token to see BOTH authority planes
-// (memberCanOnSquadAuth), but the other six doors on the same credential
-// surface still read `auth.capabilities ?? []` + memberCanOnSquad — blind to
-// the legacy role plane where the org owner's authority actually lives.
-// After #1359 merges without this, the org owner can mint a seat key and then
-// cannot list it, cannot revoke it, cannot register the agent's key, cannot
-// grant capabilities on its squad, cannot update its row, cannot deactivate it.
+// (memberCanOnSquadAuth), but five other doors on the same credential surface
+// still read `auth.capabilities ?? []` + memberCanOnSquad — blind to the
+// legacy role plane where the org owner's authority actually lives.
+// After #1359 merged, the org owner can mint a seat key and then cannot list
+// it, cannot revoke it, cannot register the agent's key, cannot update its
+// row, cannot deactivate it. Withdrawing a credential must never be HARDER
+// than issuing one.
 //
-// The six doors, all in src/mcp/provision.ts:
-//   list_agent_tokens / revoke_agent_token / grant_agent_capability /
+// The five doors, all in src/mcp/provision.ts:
+//   list_agent_tokens / revoke_agent_token /
 //   register_agent_key / update_agent / deactivate_agent
 //
+// Out of scope by gate ruling (Kasra, scope change on #1366):
+// grant_agent_capability is UPSERT-shaped — raising a new principal into an
+// upsert is not the same act as raising them into a read or a revoke, and the
+// rank ceiling has an unanswered third axis (what the target ALREADY HOLDS).
+// It stays grants-only in this PR.
+//
 // Fix shape (same seam, same bar, no new primitive): memberCanOnSquadAuth at
-// each site. One place needed a second touch the issue's line-list did not
-// name: grant_agent_capability's rank ceiling (callerCanGrantAgentCapability)
-// asks the same standing-authority question grants-only, so the site fix opens
-// the door and the ceiling shuts it again for the owner. It is raised to the
-// same seam at the caller's own requested rank — the bar (rank X to grant rank
-// X) is unchanged. Kasra gates; revert that hunk alone if the ruling differs.
+// each site.
 //
 // Discipline, copied from tests/enroll-mint-owner-plane.test.ts:
 //   - real sqlite, ALL migrations in order (tests/helpers/migrations) — never a
@@ -274,88 +276,6 @@ describe('credential lifecycle sees the role-plane owner (mupot#1366)', () => {
     try {
       const agentOwner = { ...ownerAuth(), boundAgentId: 'agent-other' } as unknown as AuthContext
       const out = await runTool('revoke_agent_token').run(agentOwner, env, { agent: agentId, token_id: 'tok-live' }, CTX)
-      expect(out.ok).toBe(false)
-      if (!out.ok) expect(out.error).toBe('operator_principal_required')
-    } finally {
-      h.sqlite.close()
-    }
-  })
-
-  // ── grant_agent_capability ─────────────────────────────────────────────
-  it('owner GRANTS member on the seat squad', async () => {
-    const { h, env, agentId } = await fixture()
-    try {
-      const out = await runTool('grant_agent_capability').run(
-        ownerAuth(),
-        env,
-        { agent: agentId, squad: SQUAD, capability: 'member' },
-        CTX,
-      )
-      expect(out.ok, JSON.stringify(out)).toBe(true)
-    } finally {
-      h.sqlite.close()
-    }
-  })
-
-  it('squad LEAD is still refused grant', async () => {
-    const { h, env, agentId } = await fixture()
-    try {
-      const out = await runTool('grant_agent_capability').run(
-        squadLead(),
-        env,
-        { agent: agentId, squad: SQUAD, capability: 'member' },
-        CTX,
-      )
-      expect(out.ok).toBe(false)
-    } finally {
-      h.sqlite.close()
-    }
-  })
-
-  it('other-squad admin is still refused grant on this squad', async () => {
-    const { h, env, agentId } = await fixture()
-    try {
-      const out = await runTool('grant_agent_capability').run(
-        otherSquadAdmin(),
-        env,
-        { agent: agentId, squad: SQUAD, capability: 'member' },
-        CTX,
-      )
-      expect(out.ok).toBe(false)
-    } finally {
-      h.sqlite.close()
-    }
-  })
-
-  it('grantless member is still refused grant', async () => {
-    const { h, env, agentId } = await fixture()
-    try {
-      const out = await runTool('grant_agent_capability').run(
-        grantless(),
-        env,
-        { agent: agentId, squad: SQUAD, capability: 'member' },
-        CTX,
-      )
-      expect(out.ok).toBe(false)
-    } finally {
-      h.sqlite.close()
-    }
-  })
-
-  it('agent-bound caller without a live grant is refused grant first', async () => {
-    const { h, env, agentId } = await fixture()
-    try {
-      const agentCaller = {
-        ...grantless(),
-        memberId: WELD_MEMBER,
-        boundAgentId: 'agent-other',
-      } as unknown as AuthContext
-      const out = await runTool('grant_agent_capability').run(
-        agentCaller,
-        env,
-        { agent: agentId, squad: SQUAD, capability: 'member' },
-        CTX,
-      )
       expect(out.ok).toBe(false)
       if (!out.ok) expect(out.error).toBe('operator_principal_required')
     } finally {
