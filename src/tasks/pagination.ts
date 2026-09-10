@@ -54,8 +54,9 @@ export interface TaskPageContext {
   readonly status?: string
 }
 
-export function filterFingerprint(parts: { status?: string | null; projectId?: string | null; assignee?: string | null }): string {
-  return [parts.status ?? '', parts.projectId ?? '', parts.assignee ?? ''].join('|')
+export function filterFingerprint(parts: { status?: string | null; projectId?: string | null; assignee?: string | null; assigneeMember?: string | null }): string {
+  // The member axis is appended only when set, so every existing cursor (no member filter) keeps its exact fingerprint.
+  return [parts.status ?? '', parts.projectId ?? '', parts.assignee ?? '', ...(parts.assigneeMember ? [`m:${parts.assigneeMember}`] : [])].join('|')
 }
 
 function toBase64Url(s: string): string {
