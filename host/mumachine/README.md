@@ -29,6 +29,8 @@ macOS may display a Keychain permission prompt when saving, loading or forgettin
 
 **Switch agent** clears the current connection and pending UI operations, while preserving saved profiles and Keychain items so they can be loaded again later. It does not revoke or delete credentials.
 
+If another Mupot Connect window is updating saved connections when this app starts, saved profiles may be temporarily unavailable. Wait for the other window to finish, then restart Mupot Connect to reload them. The app reports this condition instead of waiting indefinitely during startup.
+
 Local runtime discovery uses read-only Herdr output. Installed applications and local runtimes are separate from Mupot registry identities. A registry state or successful check-in never means an AI model has started or can receive work.
 
 ## Offline demo and visual QA
