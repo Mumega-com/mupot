@@ -74,6 +74,10 @@ describe('mcp JSON-RPC compatibility', () => {
     expect(body.result.instructions).toContain('B1 security ceiling')
     expect(body.result.instructions).toContain('bootstrap_self')
     expect(body.result.instructions).toContain("Client Error 'mcp_request_blocked'")
+    expect(body.result.instructions).toContain('blocked by a firewall or security service')
+    expect(body.result.instructions).toContain('does not help a connector session')
+    expect(body.result.instructions).toContain('/actions/')
+    expect(body.result.instructions).toContain('NOT authorization')
     expect(body.result.instructions).toContain('ack_for')
   })
 
