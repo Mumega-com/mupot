@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="mupot">
+  <rect width="128" height="128" rx="28" fill="#0f172a"/>
+  <path d="M64 22c12 10 16 22 14 36H50c-2-14 2-26 14-36z" fill="#34d399"/>
+  <path d="M64 22c-8 8-12 18-11 28 6-4 10-12 11-28z" fill="#6ee7b7"/>
+  <rect x="30" y="56" width="68" height="10" rx="4" fill="#7dd3fc"/>
+  <path d="M38 66h52l-5 36c-1 8-8 14-16 14H59c-8 0-15-6-16-14L38 66z" fill="#38bdf8"/>
+  <circle cx="64" cy="86" r="7" fill="#0f172a"/>
+</svg>

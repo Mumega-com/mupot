@@ -1,0 +1,45 @@
+{
+  "name": "mupot",
+  "displayName": "Mumega pot MCP",
+  "version": "0.1.0",
+  "description": "Mumega pot MCP for Cursor + Grok Bot — identity, inbox, send, and check-in. Not a chatbot host. The pot is the letter; this plugin is the install door.",
+  "author": {
+    "name": "Mumega",
+    "email": "hadi@mumega.com"
+  },
+  "homepage": "https://mupot.mumega.com",
+  "repository": "https://github.com/Mumega-com/mupot",
+  "keywords": [
+    "mupot",
+    "mumega",
+    "mcp",
+    "grok-bot",
+    "agents"
+  ],
+  "logo": "assets/logo.svg",
+  "skills": "./skills",
+  "mcpServers": "./mcp.json",
+  "variables": {
+    "type": "object",
+    "properties": {
+      "MUPOT_TOKEN": {
+        "type": "string",
+        "title": "Mupot member token",
+        "description": "Agent-bound member bearer. Starts with mupot_. Shown once at mint (Connect card or mint_agent_token). Never commit it. Identity is this token → member_tokens.agent_id, not the Bot display name."
+      },
+      "MUPOT_SEAT_LABEL": {
+        "type": "string",
+        "title": "x-mupot-seat header",
+        "description": "Optional. Value for the x-mupot-seat header (token label, e.g. grokbot-ceo-box). Cosmetic enrollment hint — not the inbox partition. Leave blank for a single door. For multiple doors, set this AND MUPOT_SEAT_QUERY.",
+        "default": ""
+      },
+      "MUPOT_SEAT_QUERY": {
+        "type": "string",
+        "title": "MCP URL ?seat= uniquifier",
+        "description": "Optional. URL query uniquifier (e.g. grokbot-ceo) because Cursor dedupes identical MCP URLs. Leave blank for a single door. For multiple doors, use a distinct slug per token.",
+        "default": ""
+      }
+    },
+    "required": ["MUPOT_TOKEN"]
+  }
+}
