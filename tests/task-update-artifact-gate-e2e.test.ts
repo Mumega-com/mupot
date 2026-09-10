@@ -86,6 +86,22 @@ describe('task_update artifact gate — real schema (mupot#76e25fc2, FLIGHT-07B)
       expect(res).toMatchObject({ ok: false, status: 409, error: 'artifact_verification_failed', detail: { reason: 'refusal_prose' } })
     })
 
+    it('REJECTS result as an unknown arg (400 invalid_args) (#1388)', async () => {
+      harness = createSqliteD1()
+      applyAllMigrations(harness.sqlite)
+      const refusal = 'artifact_verification_failed: refusal_prose. A completion must state both "Artifact: <path>" and "SHA256: <64-hex>" — prose describing intended work is not evidence of work done.'
+      seed(harness.sqlite, { status: 'in_progress', gateOwner: 'gate:reviewer', result: refusal })
+      env = { TENANT_SLUG: TENANT, DB: harness.db } as Env
+
+      const res = await invokeTool(callerAuth(), env, 'task_update', {
+        task_id: TASK_ID,
+        status: 'review',
+        result: `Artifact: /x\nSHA256: ${VALID_SHA}`,
+      }, URL)
+      expect(res.status).toBe(400)
+      expect(res.error).toBe('invalid_args')
+    })
+
     it('SUCCEEDS entering review when result carries valid Artifact:/SHA256: evidence', async () => {
       harness = createSqliteD1()
       applyAllMigrations(harness.sqlite)
