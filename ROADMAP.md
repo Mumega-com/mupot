@@ -181,15 +181,22 @@ inbox, receipts, and verdict, and herdr as the wake transport:
 | 1 | [#1383](https://github.com/Mumega-com/mupot/issues/1383) dead `liveness_fail` outcome | muvps-cursor (grok-4.6), task `ac175612` | kasra-review adversarial GREEN; Athena (codex) GREEN at exact head | merged as `76b5b95c` (PR [#1387](https://github.com/Mumega-com/mupot/pull/1387)) |
 | 2 | [#1388](https://github.com/Mumega-com/mupot/issues/1388) `task_update` transient-value gate | muvps-cursor, task `f1ca34cf` | adversarial GREEN with test hardened after review; Athena GREEN per head | PR [#1393](https://github.com/Mumega-com/mupot/pull/1393); state on the PR |
 
-Both runs produced seat-bound `runner_record` receipts, the first ever on a task. Both
-mutation-proved every new test. Roughly fifty minutes wall each.
+Both runs produced seat-bound `runner_record` receipts on the task (run 1: `a01b1960`,
+`762f1a1d`, verdict `2324d6b9`; run 2: `2285378f`) — the first such receipts in the records
+Kasra holds; earlier flights carried `receipt_refs=[]`. Both mutation-proved every new
+test (mutation tables are in the PR comments). Wall time from dispatch to merge was on the
+order of an hour each, from message timestamps, not a measured figure.
 
 **The honest shape:** every wake was typed by hand into a herdr pane. Seatlink did not
 wake cursor (seat has no token file; herdr name `muvps-cursor` vs seats.json
 `muvps_cursor`). Athena's codex connector could not record its own verdict (403,
 `need: member`) and reads a different inbox than the one the pot delivered to. Remove
-the human conductor and the loop stops at dispatch. The controls held eleven times; the
-plumbing between them is what is missing.
+the human conductor and the loop stops at dispatch. The controls that refused correctly,
+each observed once or more with the error text on the task or PR: signed-attach refusing a
+bearer self-report; `runner_record` refusing a spoofed seat; `task_verdict` refusing a
+non-holder of `gate:athena`; the artifact verifier refusing prose; `blocked→review` as an
+invalid transition; the seam ratchet refusing a test that bypasses `invokeTool`. The plumbing
+between them is what is missing.
 
 ### Defects found by receipt (all filed 2026-09-10)
 
@@ -313,11 +320,11 @@ predicate), review (cross-vendor gate), steward (self-repair). One codex: 1eb0e7
 baselines + DME operational flight (e1a02d39; code already in main). W2 caged
 lanes — implement codex's acceptance predicate (#645), then Spark unpause + Hermes/
 V4-Flash lane via iron-proxy. W3 self-perpetuation — steward round 2 (dead-man
-pings with evidence), server-side requeue + task markers + max-rounds (#635),
+pings with evidence), server-side requeue + task markers (mupot#635; max-rounds was the plan, not in #635's scope),
 codified gate delegation. W4 federation — Phase 1 registry (mumega-com#573) on the
 merged Phase 0 ADR (452f11db); separate-ownership pilot + mints stay Hadi-direct.
-W5 debt — 22-BLOCK backlog (#636), organisms redesign (#595), Mirror 501 (#596),
-board hygiene, athena-inbox-watch (#594), mubot token rotation.
+W5 debt — 22-BLOCK backlog (#636), organisms redesign (mumega-com#595), Mirror 501 (mumega-com#596),
+board hygiene, athena-inbox-watch (mumega-com#594), mubot token rotation.
 
 **Noticing (landed 2026-08-07):** the loop now has a read-only sensing pass —
 `scripts/gatherer.py` runs inside `operator-loop.sh`, ranks anomalies into one digest
