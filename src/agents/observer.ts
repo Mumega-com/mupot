@@ -90,8 +90,9 @@ interface ObserverRow {
  *
  * AgentDO consumes:
  *   cooldown  → extend the next alarm (back off; don't busy-loop)
- *   escalate  → emit a single operator notification via existing approval/notification
- *               seam. TODO: wire the actual emit in AgentDO (see agent-do.ts).
+ *   escalate  → AgentDO emits ONE operator-facing task via createTask, tagged
+ *               gate_owner 'gate:escalation' (see agent-do.ts). Whether an operator
+ *               is woken depends on that capability having a live holder.
  *
  * The `now` parameter is injectable for determinism in tests.
  */
