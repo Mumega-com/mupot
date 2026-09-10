@@ -232,6 +232,49 @@ describe('runProjectConcierge — stalled project dispatches exactly one starter
     expect(row.assignee_agent_id).toBeNull() // untrusted Linear-origin task NOT auto-assigned
   })
 
+  // migrations/0150 (gate BLOCK B1 on PR #1373, found by the hermes seat). Adding a
+  // HUMAN ownership axis made `assignee_agent_id IS NULL` stop meaning "unassigned".
+  // Without the member clause this is not a missed row, it is a HEAD-OF-LINE STALL:
+  // the human-owned task is selected as unassigned every tick, the UPDATE hits the
+  // one-owner trigger, the throw escapes into the caller's empty catch as routed=[],
+  // and ORDER BY created_at ASC keeps that task at the head forever. One human-owned
+  // task silently freezes routing for the whole project, reported as a quiet noop.
+  //
+  // The second task is the control that makes this a stall test rather than a skip
+  // test: it is younger, ordinary, and routable. If the human-owned row at the head
+  // blocks the tick, this one never gets routed either — which is the actual damage.
+  it('a human-owned task does not stall routing for everything behind it', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    const p = project()
+    insertProject(harness, p)
+    grantSquadAccess(harness, p.id, 'squad-a', 'write')
+    harness.sqlite.exec(
+      `INSERT INTO members (id, email, display_name, status)
+       VALUES ('mem-human', 'human@x.test', 'A Human', 'active');
+       INSERT INTO tasks (id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, assignee_member_id, created_at)
+       VALUES ('task-human', 'squad-a', '${p.id}', 'Needs a browser session', '', 'done', 'open', NULL, 'mem-human', '2026-01-01T00:00:00.000Z');
+       INSERT INTO tasks (id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, created_at)
+       VALUES ('task-behind', 'squad-a', '${p.id}', 'Ordinary routable work', '', 'done', 'open', NULL, '2026-01-02T00:00:00.000Z')`,
+    )
+    await registerBuilderShared(env)
+
+    await runProjectConcierge(env, p)
+
+    const human = harness.sqlite
+      .prepare('SELECT assignee_agent_id, assignee_member_id FROM tasks WHERE id = ?')
+      .get('task-human') as { assignee_agent_id: string | null; assignee_member_id: string | null }
+    // The human keeps the task. An agent must never take work owned by a person.
+    expect(human.assignee_agent_id).toBeNull()
+    expect(human.assignee_member_id).toBe('mem-human')
+
+    // THE POINT OF THE TEST: the task behind it still got routed.
+    const behind = harness.sqlite
+      .prepare('SELECT assignee_agent_id FROM tasks WHERE id = ?')
+      .get('task-behind') as { assignee_agent_id: string | null }
+    expect(behind.assignee_agent_id, 'human-owned head-of-line row stalled the router').not.toBeNull()
+  })
+
   it('does NOT reassign an already-assigned task; busy project with no sitting work -> noop', async () => {
     const harness = makeHarness()
     const env = envFor(harness)

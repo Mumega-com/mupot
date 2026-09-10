@@ -150,9 +150,17 @@ export const PRIORITY_RANK: Record<string, number> = { P0: 0, P1: 1, P2: 2, P3: 
  *
  * A projection duplicated across surfaces is a divergence waiting for its next column.
  */
+// migrations/0150: assignee_member_id belongs here for two reasons, and the second
+// is the one that bites. (1) Every projection reader — dashboard board, MCP
+// task_list, IM reads, routines — receives Tasks built from this list, so omitting
+// it renders a human-owned task as UNASSIGNED, which is exactly the invisibility
+// the column exists to end. (2) routines/actions.ts spread-loads a Task and
+// persists it back; a column missing from the projection is silently written NULL
+// on the way out, stripping a human owner on control-task completion. The 0150
+// trigger cannot catch that, because NULL is legal — it is loss, not a violation.
 export const TASK_SELECT_COLUMNS =
   'id, squad_id, project_id, title, body, done_when, status, priority, parent_task_id, ' +
-  'assignee_agent_id, github_issue_url, result, completed_at, gate_owner, source_pot, ' +
+  'assignee_agent_id, assignee_member_id, github_issue_url, result, completed_at, gate_owner, source_pot, ' +
   'external_source, created_at, updated_at'
 
 export function priorityOrderSql(column = 'priority'): string {

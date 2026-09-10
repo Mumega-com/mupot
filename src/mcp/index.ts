@@ -86,7 +86,7 @@ import { loadKanbanData } from '../dashboard/kanban-routes'
 import type { TaskStatus } from '../tasks/service'
 import { isTaskPriority, TASK_PRIORITIES } from '../types'
 import type { TaskPriority } from '../types'
-import { resolveTaskAssignee } from '../tasks/assignee'
+import { resolveTaskAssignee, resolveTaskAssigneeMember } from '../tasks/assignee'
 import {
   recordTaskDispatchRuntimeReceipt,
   TaskDispatchRuntimeReceiptError,
@@ -777,7 +777,7 @@ const toolTaskCreate: ToolSpec = {
   name: 'task_create',
   scope: 'squad',
   min: 'member',
-  args: '{ squad_id: string, project_id?: string|null, title: string, done_when: string, body?: string, assignee_agent_id?: string, priority?: "P0"|"P1"|"P2"|"P3", parent_task_id?: string, external_source?: string }',
+  args: '{ squad_id: string, project_id?: string|null, title: string, done_when: string, body?: string, assignee_agent_id?: string, assignee_member_id?: string, priority?: "P0"|"P1"|"P2"|"P3", parent_task_id?: string, external_source?: string }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -787,6 +787,11 @@ const toolTaskCreate: ToolSpec = {
       done_when: { ...STRING_SCHEMA, description: 'Verifiable success predicate — a checkable condition that proves the task is complete.' },
       body: STRING_SCHEMA,
       assignee_agent_id: STRING_SCHEMA,
+      // migrations/0150. The point of this field is that work needing a PERSON —
+      // a browser click, a credential decision, an approval — can be owned on the
+      // board instead of buried in prose inside some agent's task body, where no
+      // query finds it. Mutually exclusive with assignee_agent_id.
+      assignee_member_id: { ...STRING_SCHEMA, description: 'Human owner (member id). Use when the work genuinely requires a person. Mutually exclusive with assignee_agent_id; a task owned by a human cannot be dispatched, because there is no runtime to wake.' },
       priority: { type: 'string', enum: ['P0', 'P1', 'P2', 'P3'], description: 'Rank. Omit to leave UNTRIAGED — a real state, deliberately sorted last so unranked work has a cost.' },
       parent_task_id: { ...STRING_SCHEMA, description: 'Parent task id, making this a subtask. Must be an existing task in the same squad.' },
       // PR #659 P0 fix (migrations/0077): carries provenance forward when a task with an
@@ -837,6 +842,16 @@ const toolTaskCreate: ToolSpec = {
 
     const assignee = await resolveTaskAssignee(env, args.assignee_agent_id, squad.id)
     if (assignee.error) return fail(400, assignee.error)
+    // migrations/0150 — one owner, two possible kinds. Refused by name here; the
+    // DB trigger is the backstop for writers that never reach this tool.
+    if (
+      args.assignee_agent_id !== undefined && args.assignee_agent_id !== null &&
+      args.assignee_member_id !== undefined && args.assignee_member_id !== null
+    ) {
+      return fail(400, 'task_single_assignee', 'a task has one owner: pass assignee_agent_id or assignee_member_id, never both')
+    }
+    const assigneeMember = await resolveTaskAssigneeMember(env, args.assignee_member_id, squad.id)
+    if (assigneeMember.error) return fail(400, assigneeMember.error)
 
     // PR #659 P0 fix: bounded, optional provenance carry-forward (see inputSchema comment
     // above). Absent/null/blank -> undefined -> createTask defaults external_source to null,
@@ -884,6 +899,7 @@ const toolTaskCreate: ToolSpec = {
           done_when: doneWhen,
           body,
           assignee_agent_id: assignee.value,
+          assignee_member_id: assigneeMember.value,
           priority,
           parent_task_id: parentTaskId,
         },
@@ -1109,7 +1125,7 @@ const toolTaskUpdate: ToolSpec = {
   name: 'task_update',
   scope: 'squad (of the task)',
   min: 'member',
-  args: '{ task_id: string, project_id?: string|null, title?: string, body?: string, done_when?: string, status?: "open"|"in_progress"|"blocked"|"done"|"review", priority?: "P0"|"P1"|"P2"|"P3"|null, parent_task_id?: string|null, assignee_agent_id?: string|null, gate_owner?: string|null, gate_owner_reason?: string, reversal_reason?: string }',
+  args: '{ task_id: string, project_id?: string|null, title?: string, body?: string, done_when?: string, status?: "open"|"in_progress"|"blocked"|"done"|"review", priority?: "P0"|"P1"|"P2"|"P3"|null, parent_task_id?: string|null, assignee_agent_id?: string|null, assignee_member_id?: string|null, gate_owner?: string|null, gate_owner_reason?: string, reversal_reason?: string }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -1126,6 +1142,9 @@ const toolTaskUpdate: ToolSpec = {
       priority: { type: ['string', 'null'], description: 'Rank, or null to return the task to UNTRIAGED.' },
       parent_task_id: { type: ['string', 'null'], description: 'Parent task id, or null to promote this task to top level.' },
       assignee_agent_id: STRING_SCHEMA,
+      // migrations/0150 — hand work to a PERSON. Mutually exclusive with
+      // assignee_agent_id; null on either field unassigns that axis.
+      assignee_member_id: { ...STRING_SCHEMA, description: 'Human owner (member id). Mutually exclusive with assignee_agent_id. Setting one clears the other. null unassigns.' },
       gate_owner: STRING_SCHEMA,
       gate_owner_reason: STRING_SCHEMA,
       result: { type: ['string', 'null'], description: 'Task execution completion result (must include Artifact: <path> and SHA256: <64-hex> when entering review or completing)' },
@@ -1346,7 +1365,20 @@ const toolTaskUpdate: ToolSpec = {
       next.status = args.status
       changed = true
     }
-    if (args.assignee_agent_id !== undefined) {
+    // migrations/0150: ownership has TWO axes. ONE block, deliberately — every
+    // guard inside it (the self-mutation chokepoint, the external-source admin
+    // bar) was written for the agent axis, and a second block for the human axis
+    // would inherit none of them. In particular the laundering path the
+    // chokepoint closes works identically through the new field: an agent that
+    // could not unassign itself could otherwise assign the task to a HUMAN and
+    // then close it, and the self-match check would see nothing.
+    if (args.assignee_agent_id !== undefined || args.assignee_member_id !== undefined) {
+      if (
+        args.assignee_agent_id !== undefined && args.assignee_agent_id !== null &&
+        args.assignee_member_id !== undefined && args.assignee_member_id !== null
+      ) {
+        return fail(400, 'task_single_assignee', 'a task has one owner: pass assignee_agent_id or assignee_member_id, never both')
+      }
       // BLOCK-1 close (fake-green guard, 2026-07-20 re-gate on PR #417): the
       // no-self-close predicate only fires on in_progress→done. An agent could
       // launder around it by first stripping/reassigning itself off the task
@@ -1381,10 +1413,24 @@ const toolTaskUpdate: ToolSpec = {
           return fail(403, 'forbidden', { need: 'admin', scope: 'squad', detail: 'source_pot/external_source task assignment requires admin+' })
         }
       }
-      const check = await resolveTaskAssignee(env, args.assignee_agent_id, existing.squad_id)
-      if (check.error) return fail(400, check.error)
-      next.assignee_agent_id = check.value
-      changed = true
+      if (args.assignee_agent_id !== undefined) {
+        const check = await resolveTaskAssignee(env, args.assignee_agent_id, existing.squad_id)
+        if (check.error) return fail(400, check.error)
+        next.assignee_agent_id = check.value
+        // Naming one owner clears the other. The alternative — making the caller
+        // null the previous field first — turns an ordinary handoff into a
+        // two-call dance whose failure mode is a DB trigger abort naming a
+        // constraint the caller never mentioned.
+        if (check.value !== null) next.assignee_member_id = null
+        changed = true
+      }
+      if (args.assignee_member_id !== undefined) {
+        const check = await resolveTaskAssigneeMember(env, args.assignee_member_id, existing.squad_id)
+        if (check.error) return fail(400, check.error)
+        next.assignee_member_id = check.value
+        if (check.value !== null) next.assignee_agent_id = null
+        changed = true
+      }
     }
     // Hoisted: the receipt write after the update commits needs both, and the
     // gate_owner block below is where they are decided.

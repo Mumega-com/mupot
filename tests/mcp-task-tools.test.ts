@@ -317,7 +317,13 @@ describe('MCP task cutover tools', () => {
     // which the tested behaviour does not involve at all. Kept and updated rather than
     // loosened: a positional assertion is brittle, but it is also the only thing that would
     // catch a bind/column misalignment, which is silent corruption rather than a crash.
-    // The two nulls below are priority and parent_task_id, both unset on this task.
+    // The two nulls before AGENT_ID are priority and parent_task_id, both unset on this task.
+    // The null immediately AFTER AGENT_ID is assignee_member_id (migrations/0150) — the human
+    // ownership axis, necessarily unset here because this task is agent-owned and the two are
+    // mutually exclusive. Its position matters as much as its value: it sits between
+    // assignee_agent_id and github_issue_url in persistTaskUpdate's SET list, and putting it
+    // anywhere else in this array would still be 16 elements and would still fail loudly,
+    // which is the whole point of keeping this assertion positional.
     expect(updates[0].args).toEqual([
       'Ship the adapter',
       'updated',
@@ -326,6 +332,7 @@ describe('MCP task cutover tools', () => {
       null,
       null,
       AGENT_ID,
+      null,
       null,
       null,
       null,

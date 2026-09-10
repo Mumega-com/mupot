@@ -59,7 +59,15 @@ function createSchema(sqlite: SqliteD1Harness['sqlite']): void {
       -- whenever a column joins the shared projection. Third time in one day (#703).
       priority           TEXT,
       parent_task_id     TEXT,
+      -- assignee_member_id (migrations/0150) hand-added: this fixture writes its own
+      -- own tasks DDL instead of applying the committed chain, so any purely-additive column
+      -- breaks it. FOURTH fixture patched for this one column in this single change —
+      -- alongside tasks-cross-squad-assignment, mcp-flight-tools and workflow-pipeline.
+      -- That count IS the cost of the pattern: none of these four failures had anything to
+      -- do with the test's own subject, and none surfaced until a FULL suite ran. Tracked
+      -- for conversion in #703, where the check-test-schema-source ratchet permits the shrink.
       assignee_agent_id  TEXT,
+      assignee_member_id TEXT,
       github_issue_url   TEXT,
       created_at         TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at         TEXT NOT NULL DEFAULT (datetime('now')),

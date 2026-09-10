@@ -27,7 +27,7 @@ import { resolveCapabilities, hasCapability, hasSurfaceCap, isOrgAdmin } from '.
 import { orgAdminForbiddenPayload, ORG_ADMIN_REFUSAL_LINKS } from '../auth/refusal'
 import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, TaskEvidenceFenceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution, assigneeSelfClose, assigneeCannotMutateOwnAssignment, TaskIntakeContractError, assertValidIntakeContract, evaluateTaskIntakeContract, isTaskStatus, ALL_TASK_STATUSES } from './service'
 import type { TaskStatus } from './service'
-import { resolveTaskAssignee } from './assignee'
+import { resolveTaskAssignee, resolveTaskAssigneeMember } from './assignee'
 import { verifyTaskArtifactShape } from './artifact-verification'
 import { hasIndependentRuntimeGate, listTaskDispatchReceiptTimeline } from './runtime-receipts'
 import { hasActiveGateGrant } from '../gates/grants'
@@ -526,6 +526,8 @@ interface CreateTaskBody {
   body?: unknown
   status?: unknown
   assignee_agent_id?: unknown
+  /** HUMAN owner (migrations/0150). Mutually exclusive with assignee_agent_id. */
+  assignee_member_id?: unknown
   gate_owner?: unknown
   priority?: unknown
   // when dispatch === true AND an assignee resolves, wake that agent in execute
@@ -577,6 +579,24 @@ tasksApp.post('/', async (c) => {
   const assigneeCheck = await resolveTaskAssignee(c.env, body.assignee_agent_id, squad.id)
   if (assigneeCheck.error) return c.json({ error: assigneeCheck.error }, 400)
   const assigneeAgentId = assigneeCheck.value
+  // migrations/0150: the human axis, same bar. One owner only — refused by name
+  // here so the caller learns what it did wrong; the DB trigger is the backstop
+  // that makes it true for writers who never come through this route.
+  if (
+    body.assignee_agent_id !== undefined && body.assignee_agent_id !== null &&
+    body.assignee_member_id !== undefined && body.assignee_member_id !== null
+  ) {
+    return c.json(
+      {
+        error: 'task_single_assignee',
+        detail: 'a task has one owner: pass assignee_agent_id or assignee_member_id, never both',
+      },
+      400,
+    )
+  }
+  const assigneeMemberCheck = await resolveTaskAssigneeMember(c.env, body.assignee_member_id, squad.id)
+  if (assigneeMemberCheck.error) return c.json({ error: assigneeMemberCheck.error }, 400)
+  const assigneeMemberId = assigneeMemberCheck.value
 
   // gate_owner: optional capability string (e.g. 'gate:outreach'). Must be a
   // non-empty string or absent/null. Validated here; stored on the task row.
@@ -638,6 +658,7 @@ tasksApp.post('/', async (c) => {
       body: taskBody,
       status,
       assignee_agent_id: assigneeAgentId,
+      assignee_member_id: assigneeMemberId,
       gate_owner: gateOwner,
       priority,
     }, {
@@ -664,6 +685,21 @@ tasksApp.post('/', async (c) => {
   let dispatched = false
   if (body.dispatch === true) {
     if (!assigneeAgentId) {
+      // A human owner is a real assignee but not a dispatch target — there is no
+      // runtime to wake, and silently succeeding here would report `dispatched`
+      // for an envelope nothing can ever consume. That is the same shape as the
+      // wake_agent delivered:true black hole (squad-core b50a78d9): a truthful
+      // refusal beats a success-shaped no-op. Name the two cases apart so the
+      // caller knows whether to pick an assignee or to stop asking for dispatch.
+      if (assigneeMemberId) {
+        return c.json(
+          {
+            error: 'dispatch_requires_agent_assignee',
+            detail: 'this task is owned by a human member; there is no runtime to wake. Create it without dispatch, or assign an agent.',
+          },
+          400,
+        )
+      }
       return c.json({ error: 'dispatch_requires_assignee' }, 400)
     }
     const wake: BusEvent<{ task_id: string; by: string }> = {
@@ -693,6 +729,8 @@ interface UpdateTaskBody {
   status?: unknown
   priority?: unknown
   assignee_agent_id?: unknown
+  /** HUMAN owner (migrations/0150). Mutually exclusive with assignee_agent_id. */
+  assignee_member_id?: unknown
   gate_owner?: unknown
   project_id?: unknown
   reversal_reason?: unknown
@@ -881,7 +919,31 @@ tasksApp.patch('/:id', async (c) => {
       next.priority = body.priority
     }
   }
-  if (body.assignee_agent_id !== undefined) {
+  // migrations/0150: ownership now has TWO axes — an agent or a human member.
+  // This block fires for EITHER, deliberately as one block rather than two. Every
+  // guard below (the source_pot/external_source admin bar, the
+  // assignee-cannot-mutate-own-assignment chokepoint) was written for the agent
+  // axis; adding a second axis in a second block is how you end up with a
+  // half-gated ladder where the new rung has none of them. Reassigning work to a
+  // human is exactly as much an ownership change as reassigning it to an agent.
+  if (body.assignee_agent_id !== undefined || body.assignee_member_id !== undefined) {
+    // Mutual exclusion, refused here by name rather than left to the DB trigger.
+    // The trigger (migrations/0150) is the backstop that makes the invariant true
+    // for every writer including a direct D1 write; this is the one that tells a
+    // caller what it did wrong. Note both-null is NOT this error — explicitly
+    // clearing both is a legitimate way to unassign.
+    if (
+      body.assignee_agent_id !== undefined && body.assignee_agent_id !== null &&
+      body.assignee_member_id !== undefined && body.assignee_member_id !== null
+    ) {
+      return c.json(
+        {
+          error: 'task_single_assignee',
+          detail: 'a task has one owner: pass assignee_agent_id or assignee_member_id, never both',
+        },
+        400,
+      )
+    }
     // #406 fast-follow (Opus re-gate WARN-1 on #404): #404 closed AUTO-pickup of
     // an unassigned source_pot task (canAgentExecuteTask, src/agents/execute.ts)
     // — a remote adversary pot delivers tasks unassigned and cannot assign, so
@@ -936,12 +998,30 @@ tasksApp.patch('/:id', async (c) => {
       )
     }
     // null explicitly unassigns.
-    if (body.assignee_agent_id === null) {
-      next.assignee_agent_id = null
-    } else {
-      const check = await resolveTaskAssignee(c.env, body.assignee_agent_id, existing.squad_id)
-      if (check.error) return c.json({ error: check.error }, 400)
-      next.assignee_agent_id = check.value
+    if (body.assignee_agent_id !== undefined) {
+      if (body.assignee_agent_id === null) {
+        next.assignee_agent_id = null
+      } else {
+        const check = await resolveTaskAssignee(c.env, body.assignee_agent_id, existing.squad_id)
+        if (check.error) return c.json({ error: check.error }, 400)
+        next.assignee_agent_id = check.value
+        // Naming an agent owner clears any human owner. Without this, setting the
+        // agent axis on a task a human already owned would leave BOTH populated and
+        // the DB trigger would abort the write with a message about a constraint
+        // the caller never mentioned. Handing off is the ordinary case; it must not
+        // require the caller to null the other field first.
+        next.assignee_member_id = null
+      }
+    }
+    if (body.assignee_member_id !== undefined) {
+      if (body.assignee_member_id === null) {
+        next.assignee_member_id = null
+      } else {
+        const check = await resolveTaskAssigneeMember(c.env, body.assignee_member_id, existing.squad_id)
+        if (check.error) return c.json({ error: check.error }, 400)
+        next.assignee_member_id = check.value
+        next.assignee_agent_id = null
+      }
     }
   }
   // gate_owner may only be set/changed while status is open or in_progress.

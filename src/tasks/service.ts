@@ -234,6 +234,12 @@ export interface CreateTaskInput {
   body?: string
   status?: TaskStatus
   assignee_agent_id?: string | null
+  /**
+   * HUMAN owner (migrations/0150). Mutually exclusive with assignee_agent_id at the
+   * DB layer — a trigger aborts a write that sets both — and rejected earlier, with
+   * a named error, by the callers so the abort is a backstop rather than the UX.
+   */
+  assignee_member_id?: string | null
   gate_owner?: string | null
   /** Rank (migrations/0079). Omitted/null = untriaged, which is a real state, not a default. */
   priority?: TaskPriority | null
@@ -468,7 +474,7 @@ export async function persistTaskUpdate(
   try {
     result = await env.DB.prepare(
       `UPDATE tasks
-          SET title = ?, body = ?, done_when = ?, status = ?, priority = ?, parent_task_id = ?, assignee_agent_id = ?, github_issue_url = ?, gate_owner = ?, project_id = ?, completed_at = ?, updated_at = ?
+          SET title = ?, body = ?, done_when = ?, status = ?, priority = ?, parent_task_id = ?, assignee_agent_id = ?, assignee_member_id = ?, github_issue_url = ?, gate_owner = ?, project_id = ?, completed_at = ?, updated_at = ?
         WHERE id = ? AND updated_at = ? AND project_id IS ?`,
     )
       .bind(
@@ -479,6 +485,7 @@ export async function persistTaskUpdate(
         next.priority ?? null,
         next.parent_task_id ?? null,
         next.assignee_agent_id,
+        next.assignee_member_id ?? null,
         next.github_issue_url,
         next.gate_owner,
         next.project_id,
@@ -1017,6 +1024,16 @@ export async function prepareGuardedTaskInsert(
   // but that reached here another way (a legacy row, a future caller, a direct write).
   // Fail closed on anything that is not literally absent.
   const assigneeAgentId = externalSource !== null ? null : (input.assignee_agent_id ?? null)
+  // The same clamp, on the human axis (migrations/0150). This is not defensive
+  // duplication: the guard above exists because an external-origin task that
+  // arrives PRE-ASSIGNED skips every gate — the unassigned-auto-pickup check does
+  // not apply once an assignee is set, and the admin-gated reassignment check only
+  // fires on a LATER update, never on the original create. Adding a second
+  // ownership column without extending the clamp would reopen exactly that hole on
+  // the new axis, and it would be worse there: an attacker-editable external field
+  // could put fabricated work under a NAMED HUMAN's ownership, which is what a
+  // reviewer reads as provenance. Fail closed on anything not literally absent.
+  const assigneeMemberId = externalSource !== null ? null : (input.assignee_member_id ?? null)
   const task: Task = {
     id: options.id ?? crypto.randomUUID(),
     squad_id: input.squad_id,
@@ -1028,6 +1045,7 @@ export async function prepareGuardedTaskInsert(
     done_when: input.done_when.trim(),
     status: input.status ?? 'open',
     assignee_agent_id: assigneeAgentId,
+    assignee_member_id: assigneeMemberId,
     github_issue_url: null,
     result: null,
     completed_at: null,
@@ -1062,6 +1080,7 @@ export async function prepareGuardedTaskInsert(
   if (externalSource !== null) { extraColumns.push('external_source'); extraValues.push(externalSource) }
   if (input.priority != null) { extraColumns.push('priority'); extraValues.push(input.priority) }
   if (input.parent_task_id != null) { extraColumns.push('parent_task_id'); extraValues.push(input.parent_task_id) }
+  if (assigneeMemberId != null) { extraColumns.push('assignee_member_id'); extraValues.push(assigneeMemberId) }
 
   const columns = extraColumns.length > 0 ? `${baseColumns}, ${extraColumns.join(', ')}` : baseColumns
   const values = [...baseValues, ...extraValues]

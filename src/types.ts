@@ -391,6 +391,19 @@ export interface Task {
   body: string
   status: 'open' | 'in_progress' | 'blocked' | 'done' | 'review' | 'approved' | 'rejected'
   assignee_agent_id: string | null
+  /**
+   * HUMAN owner (migrations/0150). Mutually exclusive with assignee_agent_id — a
+   * DB trigger aborts any write that sets both, because two owners means every
+   * reader picks one and different readers pick differently.
+   *
+   * This exists because the operator could not be given work on the board he was
+   * looking at: anything needing a person (a browser click, a credential
+   * decision, an approval) had to hide in prose inside some agent's task body,
+   * where no query finds it and no lane surfaces it. It is a `members` reference,
+   * NOT an agents row for the human — see the migration for why that shortcut is
+   * the N-homes disease (squad-core 2c6273a6) rather than a fix for it.
+   */
+  assignee_member_id: string | null
   github_issue_url: string | null // tasks are mirrored to GitHub (source of truth)
   result: string | null // execution output (model answer) or a short failure note
   completed_at: string | null // ISO; set when execution finishes (done OR blocked)
