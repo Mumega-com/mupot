@@ -7,10 +7,10 @@
 //               The agent rests until there is something new to do, rather than
 //               burning a model call on the same empty situation every 15 min.
 //
-//   escalate  — consecutive failures OR liveness failures crossed a threshold →
-//               operator attention needed. Escalation is ONE-SHOT (deduped via
-//               last_escalated_at + ESCALATION_COOLDOWN_MS): the same stuck state
-//               does not flood the operator on every tick.
+//   escalate  — consecutive failures crossed a threshold → operator attention
+//               needed. Escalation is ONE-SHOT (deduped via last_escalated_at
+//               + ESCALATION_COOLDOWN_MS): the same stuck state does not flood
+//               the operator on every tick.
 //
 // Outcome shape follows the natural cycle lifecycle:
 //   'spawned'        — at least one task was created; productive tick; reset counters.
@@ -20,8 +20,12 @@
 //   'observe-only'   — effort=low; counted as noop.
 //   'no-goal'        — agent has no OKR; observer is a no-op (nothing to observe).
 //   'kpi-met'        — goal reached; observer is a no-op.
-//   'liveness_fail'  — agent row not found or paused; counted as liveness failure.
 //   'error'          — unhandled exception in the cycle; counted as failure.
+//
+// There is no 'liveness_fail' outcome. A paused or missing agent row returns
+// from AgentDO before the goal cycle runs, so the observer never sees it.
+// loop_observer.liveness_fails remains a persisted column (reset on 'spawned')
+// but nothing increments it. Do not re-add a union member with no producer.
 
 import type { Env, Agent } from '../types'
 
@@ -33,9 +37,6 @@ export const NOOP_COOLDOWN_THRESHOLD = 6
 /** Consecutive error/exception ticks before triggering an escalation. */
 export const FAIL_ESCALATION_THRESHOLD = 3
 
-/** Cumulative liveness failures before triggering an escalation. */
-export const LIVENESS_ESCALATION_THRESHOLD = 3
-
 /** How long (ms) to extend the alarm when cooling down. */
 export const COOLDOWN_EXTENSION_MS = 30 * 60 * 1000 // 30 minutes
 
@@ -44,17 +45,19 @@ export const ESCALATION_COOLDOWN_MS = 60 * 60 * 1000 // 1 hour — dedup window
 
 // ── Outcome type ──────────────────────────────────────────────────────────────
 
-export type ObserverOutcome =
-  | 'spawned'
-  | 'deduped'
-  | 'rate_limited'
-  | 'budget_exhausted'
-  | 'observe-only'
-  | 'backpressure'      // S3: open-task queue full; noop until tasks drain
-  | 'no-goal'
-  | 'kpi-met'
-  | 'liveness_fail'
-  | 'error'
+export const OBSERVER_OUTCOMES = [
+  'spawned',
+  'deduped',
+  'rate_limited',
+  'budget_exhausted',
+  'observe-only',
+  'backpressure',
+  'no-goal',
+  'kpi-met',
+  'error',
+] as const
+
+export type ObserverOutcome = (typeof OBSERVER_OUTCOMES)[number]
 
 // ── Observer result ───────────────────────────────────────────────────────────
 
@@ -159,22 +162,13 @@ export async function observe(
       consecutive_fails += 1
       consecutive_noops += 1 // also a noop (no work spawned)
       break
-
-    case 'liveness_fail':
-      // Agent row missing or paused — the worst signal.
-      liveness_fails += 1
-      consecutive_fails += 1
-      consecutive_noops += 1
-      break
   }
 
   // ── Determine signals ────────────────────────────────────────────────────────
 
   const cooldown = consecutive_noops >= NOOP_COOLDOWN_THRESHOLD
 
-  const shouldEscalate =
-    consecutive_fails >= FAIL_ESCALATION_THRESHOLD ||
-    liveness_fails >= LIVENESS_ESCALATION_THRESHOLD
+  const shouldEscalate = consecutive_fails >= FAIL_ESCALATION_THRESHOLD
 
   // Dedup: only escalate if we haven't escalated recently.
   const lastEscalated = prev.last_escalated_at ? new Date(prev.last_escalated_at).getTime() : 0
@@ -224,9 +218,6 @@ export async function observe(
     const parts: string[] = []
     if (consecutive_fails >= FAIL_ESCALATION_THRESHOLD) {
       parts.push(`consecutive_fails=${consecutive_fails}`)
-    }
-    if (liveness_fails >= LIVENESS_ESCALATION_THRESHOLD) {
-      parts.push(`liveness_fails=${liveness_fails}`)
     }
     reason = `escalate: ${parts.join(', ')}`
   } else if (cooldown) {

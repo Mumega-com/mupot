@@ -10,7 +10,13 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { computeDecisionFp, reserveDecision } from '../src/agents/dedup'
-import { observe, NOOP_COOLDOWN_THRESHOLD, FAIL_ESCALATION_THRESHOLD } from '../src/agents/observer'
+import {
+  observe,
+  OBSERVER_OUTCOMES,
+  NOOP_COOLDOWN_THRESHOLD,
+  FAIL_ESCALATION_THRESHOLD,
+} from '../src/agents/observer'
+import * as observerModule from '../src/agents/observer'
 import { runGoalCycle } from '../src/agents/loop'
 import { SENSORIUM_VERSION } from '../src/agents/sensorium'
 import type { Sensorium } from '../src/agents/sensorium'
@@ -417,6 +423,28 @@ describe('observe — escalation dedup', () => {
 
     expect(result.escalate).toBe(true)
     expect(result.reason).toMatch(/escalate/)
+    expect(result.reason).not.toMatch(/liveness_fails/)
+  })
+
+  it('does not declare liveness_fail — nothing in src/ produces it (#1383)', () => {
+    expect(OBSERVER_OUTCOMES).not.toContain('liveness_fail')
+    expect(observerModule).not.toHaveProperty('LIVENESS_ESCALATION_THRESHOLD')
+  })
+
+  it('no produced outcome increments liveness_fails', async () => {
+    const observerRows = new Map()
+    const db = makeD1({ observerRows })
+    const env = makeEnv(db)
+    const agent = makeAgent()
+    const now = '2026-06-22T10:00:00Z'
+    const key = 'tenant-a:agent-1'
+
+    for (const outcome of OBSERVER_OUTCOMES) {
+      await observe(env, agent, outcome, now)
+      const row = observerRows.get(key)
+      if (outcome === 'no-goal' || outcome === 'kpi-met') continue
+      expect(row?.liveness_fails, outcome).toBe(0)
+    }
   })
 
   it('does NOT escalate again within ESCALATION_COOLDOWN_MS after first escalation', async () => {

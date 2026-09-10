@@ -327,10 +327,15 @@ export async function runGoalCycle(
     buildAuthorizedExecution(env, agent, null, estimateMicroUsd),
   )
   if (!meterResult.ok) {
-    const decided: GoalCycleDecided =
-      meterResult.reason === 'budget_cap_exceeded' ? 'budget_exhausted' : 'rate_limited'
+    const observerOutcome = meterResult.reason === 'budget_cap_exceeded'
+      ? 'budget_exhausted' as const
+      : 'rate_limited' as const
+    const decided: GoalCycleDecided = observerOutcome
     // S2: observe the meter-block as a noop (not a failure — it is a governed state).
-    const observerResult = await observeStep(doObserve, doRecord, env, agent, decided as ObserverOutcome, deps.sensoriumRuntime?.cycles ?? null)
+    // Both values are ObserverOutcome members; no cast. The previous
+    // `decided as ObserverOutcome` was the only non-literal producer and could
+    // only ever hold these two strings — never 'liveness_fail' (#1383).
+    const observerResult = await observeStep(doObserve, doRecord, env, agent, observerOutcome, deps.sensoriumRuntime?.cycles ?? null)
     return {
       ok: false,
       decided,
