@@ -925,8 +925,12 @@ const toolListAgentTokens: ToolSpec = {
     if (!agentResult.ok) return resolveFail(agentResult.reason, 'agent_not_found')
     const agent = agentResult.value
 
-    const grants = auth.capabilities ?? []
-    if (!(await memberCanOnSquad(env, grants, agent.squad_id, 'admin'))) {
+    // memberCanOnSquadAuth (mupot#1366): the SAME bar — admin on the agent's
+    // squad — seeing BOTH authority planes. `auth.capabilities ?? []`
+    // materialised an empty grant list for the role-plane org owner, so the
+    // owner was refused his own credential surface. No elevation limb here;
+    // this is the whole gate.
+    if (!(await memberCanOnSquadAuth(env, auth, agent.squad_id, 'admin'))) {
       return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
     }
 
@@ -982,8 +986,10 @@ const toolRevokeAgentToken: ToolSpec = {
     if (!agentResult.ok) return resolveFail(agentResult.reason, 'agent_not_found')
     const agent = agentResult.value
 
-    const grants = auth.capabilities ?? []
-    if (!(await memberCanOnSquad(env, grants, agent.squad_id, 'admin'))) {
+    // memberCanOnSquadAuth (mupot#1366): same bar, both planes — withdrawing a
+    // credential must never be HARDER than issuing one (see the file comment
+    // above list_agent_tokens). No elevation limb here; this is the whole gate.
+    if (!(await memberCanOnSquadAuth(env, auth, agent.squad_id, 'admin'))) {
       return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
     }
 
@@ -1357,9 +1363,11 @@ const toolGrantAgentCapability: ToolSpec = {
     if (!squadResult.ok) return resolveFail(squadResult.reason, 'squad_not_found')
     const squad = squadResult.value
 
-    const grants = auth.capabilities ?? []
     let elevatedGrant: ElevationGrantRecord | null = null
-    if (!(await memberCanOnSquad(env, grants, squad.id, 'admin'))) {
+    // memberCanOnSquadAuth (mupot#1366): the STANDING authority question only,
+    // both planes. A principal who fails it still falls through to the
+    // elevation limb below, unchanged — the two-limb structure is preserved.
+    if (!(await memberCanOnSquadAuth(env, auth, squad.id, 'admin'))) {
       if (!mayBeElevated) return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
       const squadDepartmentId = await resolveElevationSquadDepartmentId(env, 'squad', squad.id)
       const elevated = await hasElevatedAction(env, auth, 'action:manage_access', 'squad', squad.id, {
@@ -1420,7 +1428,13 @@ const toolGrantAgentCapability: ToolSpec = {
           "an elevated session may grant at most 'member' — a standing lead/admin outlives the elevation and must be granted by standing authority",
         )
       }
-    } else if (!callerCanGrantAgentCapability(grants, squad, capability)) {
+    // NOTE (mupot#1366): the ceiling asks the same standing-authority question
+    // as the gate above — "does this caller hold `capability` on this squad" —
+    // so it carries the same blindness when written grants-only. Raised to the
+    // same seam at the caller's own requested rank: the bar (rank X to grant
+    // rank X) is unchanged, it now sees both planes. Without this, the site
+    // fix above opens the door and this line shuts it again for the owner.
+    } else if (!(await memberCanOnSquadAuth(env, auth, squad.id, capability))) {
       return fail(403, 'cannot_grant_above_own_rank')
     }
 
@@ -1536,8 +1550,10 @@ const toolRegisterAgentKey: ToolSpec = {
     if (!agentResult.ok) return resolveFail(agentResult.reason, 'agent_not_found')
     const agent = agentResult.value
 
-    const grants = auth.capabilities ?? []
-    if (!(await memberCanOnSquad(env, grants, agent.squad_id, 'admin'))) {
+    // memberCanOnSquadAuth (mupot#1366): same bar, both planes. Registering the
+    // agent's key is part of issue → see → withdraw; a minted-but-unkeyed seat
+    // the owner cannot key is the same wall one step later. No elevation limb.
+    if (!(await memberCanOnSquadAuth(env, auth, agent.squad_id, 'admin'))) {
       return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
     }
 
@@ -1853,8 +1869,11 @@ const toolUpdateAgent: ToolSpec = {
       // disjunct here). Admin on squad X does not imply admin on squad Y.
       // A profile row is identity — who an agent claims to be is what every
       // downstream router, gate, and dispatcher reads.
-      const grants = auth.capabilities ?? []
-      if (!(await memberCanOnSquad(env, grants, agent.squad_id, 'admin'))) {
+      // memberCanOnSquadAuth (mupot#1366): same bar, both planes. This is the
+      // non-self operator path only — the self lane above and the R1 floor are
+      // untouched. A profile row is identity — who an agent claims to be is what every
+      // downstream router, gate, and dispatcher reads.
+      if (!(await memberCanOnSquadAuth(env, auth, agent.squad_id, 'admin'))) {
         return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
       }
     }
@@ -2061,9 +2080,9 @@ const toolDeactivateAgent: ToolSpec = {
 
     // Gate: admin on the agent's squad (org/department admin inherit) — same
     // rank as mint/register; retiring a credentialed identity is an org-trust
-    // act, not a routine edit.
-    const grants = auth.capabilities ?? []
-    if (!(await memberCanOnSquad(env, grants, agent.squad_id, 'admin'))) {
+    // act, not a routine edit. memberCanOnSquadAuth (mupot#1366): same bar,
+    // both planes — the owner who minted the seat must be able to retire it.
+    if (!(await memberCanOnSquadAuth(env, auth, agent.squad_id, 'admin'))) {
       return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
     }
 
