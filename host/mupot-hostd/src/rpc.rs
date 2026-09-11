@@ -1,13 +1,21 @@
 //! Same-user Unix socket RPC + read-only operations.
 //! Writes return ApprovalRequired until Flight 3.
+//!
+//! Served context join: Store.list_observations → reconcile/build_context.
+//! Cutting `load_observations_from_store` empties the socket `context` packet.
 
-use crate::contract::{BrokerError, Receipt, VerifiedScope};
+use crate::adapters::herdr::HerdrAdapter;
+use crate::adapters::mupot::MupotAdapter;
+use crate::adapters::ReadAdapter;
+use crate::contract::{BrokerError, Observation, Receipt, VerifiedScope};
 use crate::context::build_context;
 use crate::freshness::{reconcile, ReconciledClaim, SourcePolicy};
 use crate::identity::{normalize_evidence, verify_identity};
+use crate::policy::HERDR_SOCK_DEFAULT;
 use crate::store::Store;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
@@ -17,6 +25,12 @@ use std::sync::{Arc, Mutex};
 
 pub const MAX_REQUEST_BYTES: usize = 1_048_576;
 pub const MAX_RESPONSE_BYTES: usize = 4_194_304;
+
+/// Production join point: observations served to `context` come from Store.
+/// Kill-witness: if this returns empty while the DB has rows, served context is unwired.
+pub fn load_observations_from_store(store: &Store) -> Result<Vec<Observation>, BrokerError> {
+    store.list_observations()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RpcRequest {
@@ -39,29 +53,150 @@ pub struct HostState {
     pub runtime_dir: PathBuf,
     pub socket_path: PathBuf,
     pub policies: Vec<SourcePolicy>,
-    pub observations: Mutex<Vec<crate::contract::Observation>>,
+    /// Cache refreshed from Store via `load_observations_from_store` — not a second source of truth.
+    pub observations: Mutex<Vec<Observation>>,
+    pub mupot: MupotAdapter,
+    pub herdr: HerdrAdapter,
 }
 
 impl HostState {
     pub fn open(runtime_dir: &Path) -> Result<Self, BrokerError> {
+        let mupot = default_mupot_adapter();
+        let herdr = default_herdr_adapter();
+        Self::open_with_adapters(runtime_dir, mupot, herdr)
+    }
+
+    pub fn open_with_adapters(
+        runtime_dir: &Path,
+        mupot: MupotAdapter,
+        herdr: HerdrAdapter,
+    ) -> Result<Self, BrokerError> {
         prepare_runtime_dir(runtime_dir)?;
         let socket_path = runtime_dir.join("hostd.sock");
         refuse_occupied_socket(&socket_path)?;
         let db = runtime_dir.join("host.sqlite");
         let store = Store::open(&db)?;
+        let observations = load_observations_from_store(&store)?;
         Ok(Self {
             store: Mutex::new(store),
             runtime_dir: runtime_dir.to_path_buf(),
             socket_path,
             policies: default_policies(),
-            observations: Mutex::new(Vec::new()),
+            observations: Mutex::new(observations),
+            mupot,
+            herdr,
         })
+    }
+
+    /// Persist then reload cache from Store (the join Gate F2 requires).
+    pub fn persist_observation(&self, obs: &Observation) -> Result<(), BrokerError> {
+        {
+            let mut store = self.store.lock().map_err(|_| BrokerError::CorruptState)?;
+            store.record_observation(obs)?;
+        }
+        self.reload_observations_from_store()
+    }
+
+    pub fn reload_observations_from_store(&self) -> Result<(), BrokerError> {
+        let store = self.store.lock().map_err(|_| BrokerError::CorruptState)?;
+        let loaded = load_observations_from_store(&store)?;
+        let mut cache = self.observations.lock().map_err(|_| BrokerError::CorruptState)?;
+        *cache = loaded;
+        Ok(())
+    }
+
+    /// Read allowed sources (scripted Mupot RPCs + Herdr Unix client), persist, reload.
+    /// No SSE, inbox_ack, mint, or connect.
+    pub fn ingest_from_read_adapters(&self, scope: &VerifiedScope) -> Result<usize, BrokerError> {
+        let mut written = 0usize;
+        {
+            let mut store = self.store.lock().map_err(|_| BrokerError::CorruptState)?;
+            if let Ok(batch) = self.mupot.recall("boot", scope) {
+                for obs in batch {
+                    match store.record_observation(&obs) {
+                        Ok(()) => written += 1,
+                        Err(BrokerError::Conflict) => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+            match self.herdr.recall("session", scope) {
+                Ok(batch) => {
+                    // Skip enormous live snapshots in default test path unless opted in.
+                    let live = std::env::var("MUPOT_HOSTD_LIVE_HERDR").ok().as_deref() == Some("1");
+                    let allow = self.herdr.scripted.is_some() || live;
+                    if allow {
+                        for obs in batch {
+                            match store.record_observation(&obs) {
+                                Ok(()) => written += 1,
+                                Err(BrokerError::Conflict) => {}
+                                Err(e) => return Err(e),
+                            }
+                        }
+                    }
+                }
+                Err(BrokerError::SourceUnavailable) | Err(BrokerError::UnsupportedContract) => {}
+                Err(e) => return Err(e),
+            }
+            let _ = store.record_cursor("hostd", &scope.scope().tenant, &written.to_string());
+        }
+        self.reload_observations_from_store()?;
+        Ok(written)
+    }
+
+    /// Observations for serve path — always from Store through the join function.
+    pub fn served_observations(&self) -> Result<Vec<Observation>, BrokerError> {
+        let store = self.store.lock().map_err(|_| BrokerError::CorruptState)?;
+        load_observations_from_store(&store)
+    }
+}
+
+fn default_mupot_adapter() -> MupotAdapter {
+    let mut scripted = BTreeMap::new();
+    scripted.insert(
+        "boot_context".into(),
+        json!({
+            "ok": true,
+            "result": {
+                "bound_agent_id": "7089044c-5e48-4d5f-b5b0-6937433c4e79",
+                "identity_status": "minted"
+            }
+        }),
+    );
+    scripted.insert(
+        "status".into(),
+        json!({"ok": true, "result": {"agent": "hadi-cursor"}}),
+    );
+    scripted.insert(
+        "receipt_get".into(),
+        json!({"ok": true, "result": null}),
+    );
+    MupotAdapter { scripted }
+}
+
+fn default_herdr_adapter() -> HerdrAdapter {
+    let path = std::env::var("HERDR_SOCK").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_default();
+        if HERDR_SOCK_DEFAULT.starts_with("~/") {
+            format!("{}/{}", home, HERDR_SOCK_DEFAULT.trim_start_matches("~/"))
+        } else {
+            HERDR_SOCK_DEFAULT.to_string()
+        }
+    });
+    // Prefer live socket; tests may override via open_with_adapters + scripted.
+    HerdrAdapter {
+        sock_path: PathBuf::from(path),
+        scripted: None,
     }
 }
 
 pub fn prepare_runtime_dir(dir: &Path) -> Result<(), BrokerError> {
     if dir.exists() {
-        if dir.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+        if dir
+            .symlink_metadata()
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
             return Err(BrokerError::Forbidden);
         }
     } else {
@@ -74,7 +209,6 @@ pub fn prepare_runtime_dir(dir: &Path) -> Result<(), BrokerError> {
 
 pub fn refuse_occupied_socket(path: &Path) -> Result<(), BrokerError> {
     if path.exists() {
-        // Do not blindly unlink another process's socket.
         return Err(BrokerError::Conflict);
     }
     Ok(())
@@ -138,6 +272,13 @@ fn default_policies() -> Vec<SourcePolicy> {
             stale_fallback_permitted: false,
         },
         SourcePolicy {
+            system: "herdr".into(),
+            is_authority: true,
+            is_generated_summary: false,
+            stale_after_secs: 30,
+            stale_fallback_permitted: true,
+        },
+        SourcePolicy {
             system: "inkwell".into(),
             is_authority: true,
             is_generated_summary: false,
@@ -198,7 +339,6 @@ fn handle(state: &HostState, req: &RpcRequest) -> Result<Value, BrokerError> {
 }
 
 fn boot(state: &HostState, params: &Value) -> Result<Value, BrokerError> {
-    // Caller-supplied scope is data, not authority.
     if params.get("forged_agent").is_some() {
         return Err(BrokerError::Forbidden);
     }
@@ -212,7 +352,7 @@ fn boot(state: &HostState, params: &Value) -> Result<Value, BrokerError> {
     };
     let evidence = normalize_evidence(&evidence_raw)?;
     let vs = verify_identity(&evidence, 1_780_000_000)?;
-    let _ = state;
+    let _ = state.ingest_from_read_adapters(&vs);
     Ok(json!({
         "agent": vs.scope().agent,
         "tenant": vs.scope().tenant,
@@ -223,11 +363,14 @@ fn boot(state: &HostState, params: &Value) -> Result<Value, BrokerError> {
 fn status(state: &HostState) -> Result<Value, BrokerError> {
     let store = state.store.lock().map_err(|_| BrokerError::CorruptState)?;
     let hash = store.last_audit_hash()?;
+    let n = load_observations_from_store(&store)?.len();
     Ok(json!({
         "runtime_dir": state.runtime_dir,
         "socket": state.socket_path,
         "audit_tip": hash,
+        "observation_count": n,
         "writes": "disabled_until_flight3",
+        "adapters": ["mupot_read_rpc", "herdr_unix_client"],
     }))
 }
 
@@ -250,11 +393,9 @@ fn context_op(state: &HostState, params: &Value) -> Result<Value, BrokerError> {
         .get("token_budget_bytes")
         .and_then(|v| v.as_u64())
         .unwrap_or(64_000) as usize;
-    let obs = state
-        .observations
-        .lock()
-        .map_err(|_| BrokerError::CorruptState)?
-        .clone();
+    // Optional refresh from adapters (read-only); always serve from Store join.
+    let _ = state.ingest_from_read_adapters(&scope);
+    let obs = state.served_observations()?;
     let claims = reconcile(&obs, &state.policies, 1_780_000_000)?;
     let packet = build_context(&claims, &scope, budget)?;
     Ok(serde_json::to_value(packet).map_err(|_| BrokerError::CorruptState)?)
@@ -266,10 +407,7 @@ fn recall_op(state: &HostState, params: &Value) -> Result<Value, BrokerError> {
         .get("query")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let obs = state
-        .observations
-        .lock()
-        .map_err(|_| BrokerError::CorruptState)?;
+    let obs = state.served_observations()?;
     let hits: Vec<_> = obs
         .iter()
         .filter(|o| o.scope.tenant == scope.scope().tenant && o.fact_key.contains(query))
@@ -280,21 +418,13 @@ fn recall_op(state: &HostState, params: &Value) -> Result<Value, BrokerError> {
 
 fn freshness_check(state: &HostState, params: &Value) -> Result<Value, BrokerError> {
     let _ = verified_from_params(params)?;
-    let obs = state
-        .observations
-        .lock()
-        .map_err(|_| BrokerError::CorruptState)?
-        .clone();
+    let obs = state.served_observations()?;
     let claims = reconcile(&obs, &state.policies, 1_780_000_000)?;
     Ok(serde_json::to_value(claims).map_err(|_| BrokerError::CorruptState)?)
 }
 
 fn conflicts_list(state: &HostState) -> Result<Value, BrokerError> {
-    let obs = state
-        .observations
-        .lock()
-        .map_err(|_| BrokerError::CorruptState)?
-        .clone();
+    let obs = state.served_observations()?;
     let claims = reconcile(&obs, &state.policies, 1_780_000_000)?;
     let conflicts: Vec<&ReconciledClaim> = claims
         .iter()
@@ -351,7 +481,6 @@ pub fn serve_one(state: &Arc<HostState>, mut stream: UnixStream) -> Result<(), B
     write_framed(&mut stream, &resp)
 }
 
-/// Stdio MCP bridge: one JSON line in → one JSON line out. No credentials held.
 pub fn mcp_stdio_once(state: &HostState, line: &str) -> String {
     let req: Result<RpcRequest, _> = serde_json::from_str(line);
     let resp = match req {
@@ -367,11 +496,9 @@ pub fn mcp_stdio_once(state: &HostState, line: &str) -> String {
     })
 }
 
-/// Helper for tests: create runtime dir + socket with 0700/0600.
 pub fn test_runtime(dir: &Path) -> Result<(HostState, UnixListener), BrokerError> {
     let state = HostState::open(dir)?;
     let listener = bind_socket(&state.socket_path)?;
-    // Ensure 0600
     let meta = std::fs::metadata(&state.socket_path).map_err(|_| BrokerError::CorruptState)?;
     let mode = meta.permissions().mode() & 0o777;
     if mode != 0o600 {

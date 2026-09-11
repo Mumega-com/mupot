@@ -119,6 +119,27 @@ impl Store {
         Ok(())
     }
 
+    /// Load every persisted observation. Required join for served `context`.
+    pub fn list_observations(&self) -> Result<Vec<Observation>, BrokerError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT payload_json FROM observations ORDER BY id ASC",
+            )
+            .map_err(|_| BrokerError::CorruptState)?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|_| BrokerError::CorruptState)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let payload = row.map_err(|_| BrokerError::CorruptState)?;
+            let obs: Observation =
+                serde_json::from_str(&payload).map_err(|_| BrokerError::CorruptState)?;
+            out.push(obs);
+        }
+        Ok(out)
+    }
+
     pub fn record_receipt(&mut self, receipt: &Receipt) -> Result<(), BrokerError> {
         let tenant = receipt
             .target

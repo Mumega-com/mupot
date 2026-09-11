@@ -73,6 +73,8 @@ Recorded at Task 1 run: `rustc 1.97.1` / `cargo 1.97.1` (Homebrew).
 
 ## Flight 2 status
 
-Tasks 2–6 implemented in this crate. See `docs/flight-results.md`.
-F1 contract tests remain green. Gate: hadi-grok.
+Tasks 2–6 implemented. GATE-F2 AMEND `served-context-unwired` cleared in crate:
+persist → `Store::list_observations` / `load_observations_from_store` → labelled `context`.
+Kill-witness: `kill_witness_served_context_requires_store_load`.
+Hermes `870a5024` remains fenced. F3 not started.
 

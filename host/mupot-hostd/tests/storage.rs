@@ -47,6 +47,11 @@ fn restart_preserves_cursor_and_observation() {
         store.cursor("mirror", "test-tenant").unwrap(),
         Some("42".into())
     );
+    let loaded = store.list_observations().unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].fact_key, "k1");
+    assert_eq!(loaded[0].source_system, "mirror");
+    assert_eq!(loaded[0].source_id.as_deref(), Some("obj1"));
     store.verify_audit_chain().unwrap();
 }
 
