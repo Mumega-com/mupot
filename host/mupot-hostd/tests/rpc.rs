@@ -55,18 +55,42 @@ fn socket_permissions_and_roundtrip() {
 }
 
 #[test]
-fn mcp_stdio_bridge_and_writes_disabled() {
+fn mcp_stdio_bridge_and_writes_gated() {
     let dir = tempfile::tempdir().unwrap();
     let state = HostState::open(dir.path()).unwrap();
     let line = r#"{"op":"status","params":{}}"#;
     let out = mcp_stdio_once(&state, line);
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["ok"], true);
+    assert!(v["result"]["writes"]
+        .as_str()
+        .unwrap()
+        .contains("approval"));
 
-    let write = mcp_stdio_once(&state, r#"{"op":"commit","params":{}}"#);
+    // Bare write remains unsupported.
+    let write = mcp_stdio_once(&state, r#"{"op":"write","params":{}}"#);
     let w: serde_json::Value = serde_json::from_str(&write).unwrap();
     assert_eq!(w["ok"], false);
-    assert!(w["error"].as_str().unwrap().contains("approval"));
+    assert!(w["error"].as_str().unwrap().contains("unsupported"));
+
+    // Commit without approval → ApprovalRequired (not UnsupportedContract).
+    let commit = mcp_stdio_once(
+        &state,
+        r#"{"op":"commit","params":{"principal":"hadi","tenant":"mumega","proposal":{"target":{"system":"inkwell","id":"x","revision":"1"},"expected_revision":"1","payload_hash":"p","classification":"private","expires_at":"2099-01-01T00:00:00Z"}}}"#,
+    );
+    let c: serde_json::Value = serde_json::from_str(&commit).unwrap();
+    assert_eq!(c["ok"], false);
+    assert!(
+        c["error"].as_str().unwrap().contains("approval"),
+        "expected ApprovalRequired, got {:?}",
+        c["error"]
+    );
+
+    // Propose with empty params → InvalidInput.
+    let propose = mcp_stdio_once(&state, r#"{"op":"propose","params":{}}"#);
+    let p: serde_json::Value = serde_json::from_str(&propose).unwrap();
+    assert_eq!(p["ok"], false);
+    assert!(p["error"].as_str().unwrap().contains("invalid"));
 }
 
 #[test]

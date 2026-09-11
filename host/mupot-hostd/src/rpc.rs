@@ -1,16 +1,22 @@
-//! Same-user Unix socket RPC + read-only operations.
-//! Writes return ApprovalRequired until Flight 3.
+//! Same-user Unix socket RPC + approved write path (F3).
 //!
 //! Served context join: Store.list_observations → reconcile/build_context.
-//! Cutting `load_observations_from_store` empties the socket `context` packet.
+//! `propose` stores a proposal; `commit` requires a matching exact-action Approval.
+//! Missing/expired approval → `ApprovalRequired` / `ApprovalExpired` only.
+//! Bare `write` remains `UnsupportedContract` (use propose/commit).
 
 use crate::adapters::herdr::HerdrAdapter;
+use crate::adapters::inkwell::InkwellWriteAdapter;
+use crate::adapters::mirror::MirrorWriteAdapter;
 use crate::adapters::mupot::MupotAdapter;
 use crate::adapters::ReadAdapter;
-use crate::contract::{BrokerError, Observation, Receipt, VerifiedScope};
+use crate::approval::ExactAction;
+use crate::commit::{CommitEngine, CommitRequest};
+use crate::contract::{BrokerError, Observation, Proposal, Receipt, VerifiedScope};
 use crate::context::build_context;
 use crate::freshness::{reconcile, ReconciledClaim, SourcePolicy};
 use crate::identity::{normalize_evidence, verify_identity};
+use crate::outbox::Outbox;
 use crate::policy::HERDR_SOCK_DEFAULT;
 use crate::store::Store;
 use serde::{Deserialize, Serialize};
@@ -57,6 +63,8 @@ pub struct HostState {
     pub observations: Mutex<Vec<Observation>>,
     pub mupot: MupotAdapter,
     pub herdr: HerdrAdapter,
+    pub proposals: Mutex<BTreeMap<String, Proposal>>,
+    pub commit: CommitEngine,
 }
 
 impl HostState {
@@ -77,6 +85,7 @@ impl HostState {
         let db = runtime_dir.join("host.sqlite");
         let store = Store::open(&db)?;
         let observations = load_observations_from_store(&store)?;
+        let outbox = Outbox::open(&runtime_dir.join("outbox.json"))?;
         Ok(Self {
             store: Mutex::new(store),
             runtime_dir: runtime_dir.to_path_buf(),
@@ -85,6 +94,12 @@ impl HostState {
             observations: Mutex::new(observations),
             mupot,
             herdr,
+            proposals: Mutex::new(BTreeMap::new()),
+            commit: CommitEngine {
+                outbox,
+                inkwell: InkwellWriteAdapter::new(),
+                mirror: MirrorWriteAdapter::new(),
+            },
         })
     }
 
@@ -333,9 +348,82 @@ fn handle(state: &HostState, req: &RpcRequest) -> Result<Value, BrokerError> {
         "freshness_check" => freshness_check(state, &req.params),
         "conflicts_list" => conflicts_list(state),
         "receipt_get" => receipt_get(state, &req.params),
-        "propose" | "commit" | "write" => Err(BrokerError::ApprovalRequired),
+        "propose" => propose_op(state, &req.params),
+        "commit" => commit_op(state, &req.params),
+        "write" => Err(BrokerError::UnsupportedContract),
         _ => Err(BrokerError::UnsupportedContract),
     }
+}
+
+fn propose_op(state: &HostState, params: &Value) -> Result<Value, BrokerError> {
+    let principal = params
+        .get("principal")
+        .and_then(|v| v.as_str())
+        .ok_or(BrokerError::InvalidInput)?;
+    let tenant = params
+        .get("tenant")
+        .and_then(|v| v.as_str())
+        .ok_or(BrokerError::InvalidInput)?;
+    let proposal: Proposal = serde_json::from_value(
+        params
+            .get("proposal")
+            .cloned()
+            .ok_or(BrokerError::InvalidInput)?,
+    )
+    .map_err(|_| BrokerError::InvalidInput)?;
+    let action = ExactAction::from_proposal(principal, tenant, &proposal, "source_write");
+    let hash = action.action_hash();
+    {
+        let mut map = state.proposals.lock().map_err(|_| BrokerError::CorruptState)?;
+        map.insert(hash.clone(), proposal.clone());
+    }
+    Ok(json!({
+        "action_hash": hash,
+        "proposal": proposal,
+        "principal": principal,
+        "tenant": tenant,
+    }))
+}
+
+fn commit_op(state: &HostState, params: &Value) -> Result<Value, BrokerError> {
+    let principal = params
+        .get("principal")
+        .and_then(|v| v.as_str())
+        .ok_or(BrokerError::InvalidInput)?;
+    let tenant = params
+        .get("tenant")
+        .and_then(|v| v.as_str())
+        .ok_or(BrokerError::InvalidInput)?;
+    let proposal: Proposal = if let Some(p) = params.get("proposal") {
+        serde_json::from_value(p.clone()).map_err(|_| BrokerError::InvalidInput)?
+    } else if let Some(h) = params.get("action_hash").and_then(|v| v.as_str()) {
+        let map = state.proposals.lock().map_err(|_| BrokerError::CorruptState)?;
+        map.get(h).cloned().ok_or(BrokerError::InvalidInput)?
+    } else {
+        return Err(BrokerError::InvalidInput);
+    };
+    let approval_json = params
+        .get("approval")
+        .map(|v| {
+            if let Some(s) = v.as_str() {
+                s.to_string()
+            } else {
+                v.to_string()
+            }
+        });
+    let now_unix = params
+        .get("now_unix")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(1_780_000_000);
+    let req = CommitRequest {
+        principal: principal.into(),
+        tenant: tenant.into(),
+        proposal,
+        approval_json,
+        now_unix,
+    };
+    let result = state.commit.execute(&req)?;
+    serde_json::to_value(result).map_err(|_| BrokerError::CorruptState)
 }
 
 fn boot(state: &HostState, params: &Value) -> Result<Value, BrokerError> {
@@ -369,8 +457,8 @@ fn status(state: &HostState) -> Result<Value, BrokerError> {
         "socket": state.socket_path,
         "audit_tip": hash,
         "observation_count": n,
-        "writes": "disabled_until_flight3",
-        "adapters": ["mupot_read_rpc", "herdr_unix_client"],
+        "writes": "gated_by_exact_action_approval",
+        "adapters": ["mupot_read_rpc", "herdr_unix_client", "inkwell_write_fixture", "mirror_write_fixture"],
     }))
 }
 

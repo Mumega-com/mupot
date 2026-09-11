@@ -284,6 +284,204 @@ pub fn run_case(adapter: &str, case: &str) {
             }
             other => panic!("unknown rpc case {other}"),
         },
+        "approval" => match case {
+            "payload_changed_denied" => {
+                use mupot_hostd::approval::{mint_approval_for_action, validate_approval, ExactAction};
+                use mupot_hostd::contract::{Classification, Proposal, SourceRef};
+                let proposal = Proposal {
+                    target: SourceRef {
+                        system: "inkwell".into(),
+                        id: "x".into(),
+                        revision: "1".into(),
+                    },
+                    expected_revision: "1".into(),
+                    payload_hash: "a".into(),
+                    classification: Classification::Private,
+                    intended_projection: None,
+                    expires_at: "2099-01-01T00:00:00Z".into(),
+                };
+                let action = ExactAction::from_proposal("hadi", "mumega", &proposal, "source_write");
+                let approval = mint_approval_for_action(&action, 5);
+                let mut drifted = proposal;
+                drifted.payload_hash = "b".into();
+                let drifted_action =
+                    ExactAction::from_proposal("hadi", "mumega", &drifted, "source_write");
+                assert_eq!(
+                    validate_approval(&approval, &drifted_action, 1_780_000_000),
+                    Err(BrokerError::Conflict)
+                );
+                assert_eq!(expect, "conflict");
+            }
+            "revision_changed_denied" => {
+                use mupot_hostd::approval::{mint_approval_for_action, validate_approval, ExactAction};
+                use mupot_hostd::contract::{Classification, Proposal, SourceRef};
+                let proposal = Proposal {
+                    target: SourceRef {
+                        system: "inkwell".into(),
+                        id: "x".into(),
+                        revision: "1".into(),
+                    },
+                    expected_revision: "1".into(),
+                    payload_hash: "a".into(),
+                    classification: Classification::Private,
+                    intended_projection: None,
+                    expires_at: "2099-01-01T00:00:00Z".into(),
+                };
+                let action = ExactAction::from_proposal("hadi", "mumega", &proposal, "source_write");
+                let approval = mint_approval_for_action(&action, 5);
+                let mut drifted = proposal;
+                drifted.expected_revision = "2".into();
+                drifted.target.revision = "2".into();
+                let drifted_action =
+                    ExactAction::from_proposal("hadi", "mumega", &drifted, "source_write");
+                assert_eq!(
+                    validate_approval(&approval, &drifted_action, 1_780_000_000),
+                    Err(BrokerError::RevisionChanged)
+                );
+                assert_eq!(expect, "revision_changed");
+            }
+            other => panic!("unknown approval case {other}"),
+        },
+        "outbox" => {
+            assert_eq!(case, "restart_after_claim");
+            use mupot_hostd::approval::ExactAction;
+            use mupot_hostd::contract::{Classification, Proposal, SourceRef};
+            use mupot_hostd::outbox::{Outbox, OutboxState};
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("outbox.json");
+            let proposal = Proposal {
+                target: SourceRef {
+                    system: "inkwell".into(),
+                    id: "o".into(),
+                    revision: "1".into(),
+                },
+                expected_revision: "1".into(),
+                payload_hash: "p".into(),
+                classification: Classification::Private,
+                intended_projection: None,
+                expires_at: "2099-01-01T00:00:00Z".into(),
+            };
+            let a = ExactAction::from_proposal("hadi", "mumega", &proposal, "source_write");
+            {
+                let b = Outbox::open(&path).unwrap();
+                let job = b.enqueue(&a, "source_write", "{}").unwrap();
+                b.claim(&job.idempotency_key, 1).unwrap();
+            }
+            let b2 = Outbox::open(&path).unwrap();
+            let recovered = b2.recover_claimed_on_restart().unwrap();
+            assert_eq!(recovered.len(), 1);
+            assert_eq!(recovered[0].state, OutboxState::Claimed);
+            assert_eq!(expect, "ok");
+        }
+        "commit" => {
+            use mupot_hostd::adapters::inkwell::InkwellWriteAdapter;
+            use mupot_hostd::adapters::mirror::MirrorWriteAdapter;
+            use mupot_hostd::commit::{approval_json_for, CommitEngine, CommitRequest};
+            use mupot_hostd::contract::{Classification, Proposal, SourceRef};
+            use mupot_hostd::outbox::Outbox;
+            let dir = tempfile::tempdir().unwrap();
+            let eng = CommitEngine {
+                outbox: Outbox::open(&dir.path().join("outbox.json")).unwrap(),
+                inkwell: InkwellWriteAdapter::new(),
+                mirror: MirrorWriteAdapter::new(),
+            };
+            let mk = |id: &str| Proposal {
+                target: SourceRef {
+                    system: "inkwell".into(),
+                    id: id.into(),
+                    revision: "1".into(),
+                },
+                expected_revision: "1".into(),
+                payload_hash: "ph".into(),
+                classification: Classification::Private,
+                intended_projection: Some(SourceRef {
+                    system: "mirror".into(),
+                    id: format!("proj:{id}"),
+                    revision: "1".into(),
+                }),
+                expires_at: "2099-01-01T00:00:00Z".into(),
+            };
+            match case {
+                "source_readback_mismatch_no_projection" => {
+                    eng.inkwell.seed(
+                        "m1",
+                        json!({"auth": true, "tenant": "mumega", "revision": "1"}),
+                    );
+                    eng.inkwell.set_mode("m1", "mismatch_readback");
+                    let prop = mk("m1");
+                    let approval = approval_json_for("hadi", "mumega", &prop);
+                    assert_eq!(
+                        eng.execute(&CommitRequest {
+                            principal: "hadi".into(),
+                            tenant: "mumega".into(),
+                            proposal: prop,
+                            approval_json: Some(approval),
+                            now_unix: 1_780_000_000,
+                        })
+                        .err(),
+                        Some(BrokerError::Conflict)
+                    );
+                    assert_eq!(eng.mirror.project_count("proj:m1"), 0);
+                    assert_eq!(expect, "conflict");
+                }
+                "source_success_projection_failure" => {
+                    eng.inkwell.seed(
+                        "m2",
+                        json!({"auth": true, "tenant": "mumega", "revision": "1"}),
+                    );
+                    eng.mirror.set_mode("proj:m2", "projection_fail");
+                    let prop = mk("m2");
+                    let approval = approval_json_for("hadi", "mumega", &prop);
+                    assert_eq!(
+                        eng.execute(&CommitRequest {
+                            principal: "hadi".into(),
+                            tenant: "mumega".into(),
+                            proposal: prop,
+                            approval_json: Some(approval),
+                            now_unix: 1_780_000_000,
+                        })
+                        .err(),
+                        Some(BrokerError::SourceUnavailable)
+                    );
+                    assert_eq!(expect, "source_unavailable");
+                }
+                "timeout_after_remote_write_no_duplicate" => {
+                    eng.inkwell.seed(
+                        "m3",
+                        json!({"auth": true, "tenant": "mumega", "revision": "1"}),
+                    );
+                    eng.inkwell.set_mode("m3", "timeout_uncertain");
+                    let prop = mk("m3");
+                    let approval = approval_json_for("hadi", "mumega", &prop);
+                    assert_eq!(
+                        eng.execute(&CommitRequest {
+                            principal: "hadi".into(),
+                            tenant: "mumega".into(),
+                            proposal: prop.clone(),
+                            approval_json: Some(approval.clone()),
+                            now_unix: 1_780_000_000,
+                        })
+                        .err(),
+                        Some(BrokerError::UncertainWrite)
+                    );
+                    assert_eq!(eng.inkwell.write_count("m3"), 1);
+                    assert_eq!(
+                        eng.execute(&CommitRequest {
+                            principal: "hadi".into(),
+                            tenant: "mumega".into(),
+                            proposal: prop,
+                            approval_json: Some(approval),
+                            now_unix: 1_780_000_000,
+                        })
+                        .err(),
+                        Some(BrokerError::UncertainWrite)
+                    );
+                    assert_eq!(eng.inkwell.write_count("m3"), 1);
+                    assert_eq!(expect, "uncertain_write");
+                }
+                other => panic!("unknown commit case {other}"),
+            }
+        }
         other => panic!("unknown adapter {other}"),
     }
 }

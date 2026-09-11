@@ -77,5 +77,29 @@
     "oversized_request_denied": {
       "expect": "forbidden"
     }
+  },
+  "approval": {
+    "payload_changed_denied": {
+      "expect": "conflict"
+    },
+    "revision_changed_denied": {
+      "expect": "revision_changed"
+    }
+  },
+  "outbox": {
+    "restart_after_claim": {
+      "expect": "ok"
+    }
+  },
+  "commit": {
+    "source_readback_mismatch_no_projection": {
+      "expect": "conflict"
+    },
+    "source_success_projection_failure": {
+      "expect": "source_unavailable"
+    },
+    "timeout_after_remote_write_no_duplicate": {
+      "expect": "uncertain_write"
+    }
   }
 }
