@@ -1,0 +1,8 @@
+{
+  "fact_key": "identity.rava",
+  "source_system": "task_title",
+  "subject_id": "Rava",
+  "scope": { "tenant": "test" },
+  "expected_authority": "mupot",
+  "required_receipt": "boot"
+}

@@ -1,0 +1,111 @@
+{
+  "cases": [
+    {
+      "name": "identity_mismatch_display_vs_bearer",
+      "fixture": {
+        "fact_key": "identity.rava",
+        "source_system": "display_name",
+        "subject_id": "Rava",
+        "scope": { "tenant": "test" },
+        "expected_authority": "mupot",
+        "required_receipt": "boot"
+      },
+      "expect": "conflict"
+    },
+    {
+      "name": "tenant_separation_ok",
+      "fixture": {
+        "fact_key": "squad.roster",
+        "source_system": "mupot",
+        "subject_id": "7089044c-5e48-4d5f-b5b0-6937433c4e79",
+        "scope": { "tenant": "mumega", "squad": "hadi-mac" },
+        "expected_authority": "mupot",
+        "required_receipt": "orient",
+        "classification": "squad",
+        "observed_at": "2026-09-10T00:00:00Z",
+        "now_unix": 1789000000
+      },
+      "expect": "ok"
+    },
+    {
+      "name": "stale_fallback_requires_freshness_label",
+      "fixture": {
+        "fact_key": "doc.memory_contract",
+        "source_system": "inkwell",
+        "subject_id": "MEMORY-CONTRACT",
+        "scope": { "tenant": "mumega" },
+        "expected_authority": "inkwell",
+        "required_receipt": "readback",
+        "source_revision": null,
+        "freshness": "fresh"
+      },
+      "expect": "invalid_input"
+    },
+    {
+      "name": "absent_revision_unverified_ok",
+      "fixture": {
+        "fact_key": "doc.memory_contract",
+        "source_system": "inkwell",
+        "subject_id": "MEMORY-CONTRACT",
+        "scope": { "tenant": "mumega" },
+        "expected_authority": "inkwell",
+        "required_receipt": "readback",
+        "source_revision": null,
+        "freshness": "unverified"
+      },
+      "expect": "ok"
+    },
+    {
+      "name": "deletion_unsupported_source",
+      "fixture": {
+        "fact_key": "x.delete",
+        "source_system": "unknown_store",
+        "subject_id": "x",
+        "scope": { "tenant": "test" },
+        "expected_authority": "unknown_store",
+        "required_receipt": "delete"
+      },
+      "expect": "unsupported_contract"
+    },
+    {
+      "name": "supersession_vector_ok",
+      "fixture": {
+        "fact_key": "mirror.engram",
+        "source_system": "mirror",
+        "subject_id": "engram-1",
+        "scope": { "tenant": "mumega" },
+        "expected_authority": "mirror",
+        "required_receipt": "store",
+        "source_revision": "2",
+        "supersedes": "1",
+        "classification": "project"
+      },
+      "expect": "ok"
+    },
+    {
+      "name": "partial_delivery_missing_receipt",
+      "fixture": {
+        "fact_key": "delivery.stage",
+        "source_system": "mupot",
+        "subject_id": "msg-1",
+        "scope": { "tenant": "test" },
+        "expected_authority": "mupot"
+      },
+      "expect": "invalid_input"
+    },
+    {
+      "name": "future_observed_at_rejected",
+      "fixture": {
+        "fact_key": "time.skew",
+        "source_system": "herdr",
+        "subject_id": "pane-1",
+        "scope": { "tenant": "test" },
+        "expected_authority": "herdr",
+        "required_receipt": "snapshot",
+        "observed_at": "2099-01-01T00:00:00Z",
+        "now_unix": 1789000000
+      },
+      "expect": "invalid_input"
+    }
+  ]
+}

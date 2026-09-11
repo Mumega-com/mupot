@@ -1,0 +1,45 @@
+{
+  "live_seat_uuids": [
+    "870a5024-afd2-407e-86b3-fe2596e89bd1",
+    "7089044c-5e48-4d5f-b5b0-6937433c4e79",
+    "f23a6c2c-7377-492f-8d69-96c3946a7148",
+    "bec1bb7a-b37e-4594-b018-1f608ae38d47",
+    "087a816b-ab9f-400f-8d53-f6f97b94a725",
+    "95b5ba06-72a7-4c17-ab4b-c95ed8ff2dd3",
+    "cb14cb85-f7c6-447b-a6dd-52db44872d2e",
+    "7b3cbfcd-51ac-4d16-bcf0-d6e1a069dbed",
+    "a065e61c-6a93-42fc-b070-b541631202f1",
+    "5498e2bb-c67f-40dc-87cb-1c7f7be360f2",
+    "454bcf06-b337-4dfe-96f3-3f7fe9e97796"
+  ],
+  "forbidden_actions": ["sse", "poll_cursor", "consume", "inbox_ack"],
+  "allowed_mupot_rpcs": ["boot_context", "status", "receipt_get"],
+  "allowed_herdr_methods": [
+    "ping",
+    "session.snapshot",
+    "agent.list",
+    "agent.get",
+    "pane.get",
+    "pane.list",
+    "pane.process_info",
+    "workspace.list",
+    "workspace.get"
+  ],
+  "forbidden_herdr_methods": [
+    "agent.prompt",
+    "pane.send_text",
+    "pane.send_input",
+    "pane.send_keys",
+    "server.stop",
+    "server.live_handoff",
+    "server.reload_config",
+    "server.reload_agent_manifests",
+    "events.subscribe",
+    "snapshot"
+  ],
+  "bindings": {
+    "inbox_fence_doc": "INBOX-FENCE.md",
+    "herdr_adapter_doc": "HERDR-ADAPTER.md",
+    "source": "hostd-canonical-host-20260910 Hermes INBOX-FENCE + River HERDR-ADAPTER"
+  }
+}
