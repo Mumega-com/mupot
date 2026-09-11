@@ -1,0 +1,10 @@
+{
+  "bearer_agent_id": "7089044c-5e48-4d5f-b5b0-6937433c4e79",
+  "requested_principal": "Rava",
+  "documentary_principal": "Rava-qnft",
+  "seat_live": true,
+  "seat_agent_id": "7089044c-5e48-4d5f-b5b0-6937433c4e79",
+  "tenant": "mumega",
+  "credential_fingerprint": "fp-test",
+  "mupot_available": true
+}

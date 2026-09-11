@@ -1,0 +1,81 @@
+{
+  "mirror": {
+    "tenant_denied": {
+      "tenant": "other",
+      "revision": "1",
+      "memory_kind": "experienced",
+      "text": "nope",
+      "expect": "forbidden"
+    },
+    "bm25_tier_denied": {
+      "tenant": "mumega",
+      "revision": "1",
+      "tier_denied": true,
+      "memory_kind": "experienced",
+      "text": "secret",
+      "expect": "forbidden"
+    },
+    "synthesized_not_experienced": {
+      "tenant": "mumega",
+      "revision": "2",
+      "memory_kind": "synthesized",
+      "text": "summary only",
+      "expect": "ok",
+      "expect_kind": "synthesized"
+    }
+  },
+  "inkwell": {
+    "auth_required": {
+      "auth": false,
+      "tenant": "mumega",
+      "revision": "1",
+      "expect": "forbidden"
+    },
+    "ok_object": {
+      "auth": true,
+      "tenant": "mumega",
+      "revision": "9",
+      "expect": "ok"
+    }
+  },
+  "github": {
+    "exact_sha": {
+      "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expect": "ok"
+    },
+    "timeout": {
+      "error": "timeout",
+      "expect": "source_unavailable"
+    }
+  },
+  "codex_memory": {
+    "disabled": {
+      "enabled": false,
+      "expect": "source_unavailable"
+    }
+  },
+  "reconciler": {
+    "newer_summary_not_authority": {
+      "expect": "owner_wins"
+    },
+    "equal_authority_conflict": {
+      "expect": "conflicted"
+    }
+  },
+  "context": {
+    "stale_hint_separate_section": {
+      "expect": "hint_section"
+    }
+  },
+  "rpc": {
+    "same_user_forged_scope_denied": {
+      "expect": "forbidden"
+    },
+    "different_user_denied": {
+      "expect": "forbidden"
+    },
+    "oversized_request_denied": {
+      "expect": "forbidden"
+    }
+  }
+}

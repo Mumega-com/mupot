@@ -1,0 +1,8 @@
+{
+  "now_unix": 1780000000,
+  "policies": [
+    {"system":"mupot","is_authority":true,"is_generated_summary":false,"stale_after_secs":30,"stale_fallback_permitted":false},
+    {"system":"codex_memory","is_authority":false,"is_generated_summary":true,"stale_after_secs":0,"stale_fallback_permitted":true},
+    {"system":"inkwell","is_authority":true,"is_generated_summary":false,"stale_after_secs":300,"stale_fallback_permitted":true}
+  ]
+}

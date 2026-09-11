@@ -2,17 +2,35 @@
 name = "mupot-hostd"
 version = "0.1.0"
 edition = "2024"
-description = "Local Mupot host memory freshness broker (contracts only in Flight 1)"
+description = "Local Mupot host memory freshness broker"
 license = "UNLICENSED"
 publish = false
 
 [lib]
 path = "src/lib.rs"
 
+[[bin]]
+name = "mupot-hostd"
+path = "src/main.rs"
+
+[[bin]]
+name = "mupot-host-mcp"
+path = "src/bin/mupot-host-mcp.rs"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+rusqlite = { version = "0.37", features = ["bundled", "backup"] }
+sha2 = "0.10"
+hex = "0.4"
+zeroize = { version = "1", features = ["derive"] }
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
 
 [dev-dependencies]
+tempfile = "3"
 serde_json = "1"
+rusqlite = { version = "0.37", features = ["bundled", "backup"] }

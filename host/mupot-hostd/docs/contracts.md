@@ -71,6 +71,8 @@ See `declared_capabilities()` in `src/contract.rs`. Missing live operations map 
 
 Recorded at Task 1 run: `rustc 1.97.1` / `cargo 1.97.1` (Homebrew).
 
-## Out of scope this task
+## Flight 2 status
 
-No daemon listen, no Unix socket server, no Flight 3 write path, no Documents/`mupot-hostd` scaffold, no second Connect GUI, no Herdr I/O in contract tests.
+Tasks 2–6 implemented in this crate. See `docs/flight-results.md`.
+F1 contract tests remain green. Gate: hadi-grok.
+
