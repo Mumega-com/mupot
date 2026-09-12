@@ -929,7 +929,7 @@ const toolTaskList: ToolSpec = {
   name: 'task_list',
   scope: 'squad',
   min: 'member',
-  args: '{ squad_id?: string, project_id?: string|null, status?: "open"|"in_progress"|"blocked"|"done"|"review"|"approved"|"rejected", assignee_agent_id?: string, limit?: number }',
+  args: '{ squad_id?: string, project_id?: string|null, status?: "open"|"in_progress"|"blocked"|"done"|"review"|"approved"|"rejected", assignee_agent_id?: string, assignee_member_id?: string, limit?: number }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -937,6 +937,7 @@ const toolTaskList: ToolSpec = {
       project_id: NULLABLE_STRING_SCHEMA,
       status: STRING_SCHEMA,
       assignee_agent_id: STRING_SCHEMA,
+      assignee_member_id: { ...STRING_SCHEMA, description: 'Filter to tasks owned by this human (member id). Mutually exclusive with assignee_agent_id — a task has one owner, so passing both can only ever match nothing.' },
       limit: OPTIONAL_NUMBER_SCHEMA,
     },
     additionalProperties: false,
@@ -951,6 +952,25 @@ const toolTaskList: ToolSpec = {
     const assignee = args.assignee_agent_id
     if (assignee !== undefined && assignee !== null && typeof assignee !== 'string') {
       return fail(400, 'invalid_args', 'assignee_agent_id must be a string')
+    }
+    // The human axis (migrations/0150). Without this filter assignee_member_id is
+    // WRITE-ONLY: task_create and task_update both accept it, the single-assignee
+    // triggers enforce it, and no read surface anywhere selects BY it — so a person
+    // could be given work they had no way to query. That is the same shape as the
+    // escalation gate_owner defect (mupot#1381): the write path lands, the read
+    // path is absent, and every layer reports success.
+    const assigneeMember = args.assignee_member_id
+    if (assigneeMember !== undefined && assigneeMember !== null && typeof assigneeMember !== 'string') {
+      return fail(400, 'invalid_args', 'assignee_member_id must be a string')
+    }
+    // Rejected rather than silently returning zero rows: a task has exactly one
+    // owner, so this filter combination can never match, and an empty result would
+    // read as "no such work" instead of "impossible query".
+    if (
+      typeof assignee === 'string' && assignee.trim()
+      && typeof assigneeMember === 'string' && assigneeMember.trim()
+    ) {
+      return fail(400, 'task_single_assignee', 'a task has one owner: filter by assignee_agent_id or assignee_member_id, never both')
     }
     const limit = readLimit(args.limit, 25, 100)
     if (typeof limit !== 'number') return limit
@@ -970,6 +990,10 @@ const toolTaskList: ToolSpec = {
     if (typeof assignee === 'string' && assignee.trim()) {
       baseClauses.push(`assignee_agent_id = ?${baseBinds.length + 1}`)
       baseBinds.push(assignee.trim())
+    }
+    if (typeof assigneeMember === 'string' && assigneeMember.trim()) {
+      baseClauses.push(`assignee_member_id = ?${baseBinds.length + 1}`)
+      baseBinds.push(assigneeMember.trim())
     }
 
     // #22 v1 ATC ranking (src/tasks/ranking.ts). Fetch is SPLIT and BOUNDED
