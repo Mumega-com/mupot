@@ -50,6 +50,7 @@ export interface CreateDeviceGrantResult {
   device_code: string
   user_code: string
   verification_uri: string
+  verification_uri_complete?: string
   expires_in: number
   interval: number
 }
@@ -202,6 +203,7 @@ export async function createDeviceGrant(
       device_code: deviceCode,
       user_code: userCode,
       verification_uri: `${input.origin.replace(/\/$/, '')}/device`,
+      verification_uri_complete: `${input.origin.replace(/\/$/, '')}/enroll?code=${encodeURIComponent(userCode)}&agent=${encodeURIComponent(agent.slug)}`,
       expires_in: DEVICE_GRANT_TTL_SECONDS,
       interval: DEVICE_POLL_INTERVAL_SECONDS,
     },

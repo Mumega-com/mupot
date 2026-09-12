@@ -48,16 +48,20 @@ export interface EnrollView {
   memberId: string | null
   seat: string
   preselectedAgent: string | null
+  deviceCode?: string | null
   agents: EnrollAgent[]
 }
 
-/** Absolute enrollment URL, built in exactly one place. Optional seat is
- *  query-encoded; omit or blank → `/enroll` with no guess. */
-export function enrollUrl(origin: string, seat?: string | null): string {
+/** Absolute enrollment URL, built in exactly one place. Optional seat or device code
+ *  is query-encoded; omit or blank → `/enroll` with no guess. */
+export function enrollUrl(origin: string, seat?: string | null, code?: string | null): string {
   const base = origin.replace(/\/+$/, '')
-  const trimmed = (seat ?? '').trim()
-  if (!trimmed) return `${base}/enroll`
-  return `${base}/enroll?seat=${encodeURIComponent(trimmed)}`
+  const parts: string[] = []
+  const trimmedSeat = (seat ?? '').trim()
+  const trimmedCode = (code ?? '').trim()
+  if (trimmedSeat) parts.push(`seat=${encodeURIComponent(trimmedSeat)}`)
+  if (trimmedCode) parts.push(`code=${encodeURIComponent(trimmedCode)}`)
+  return parts.length > 0 ? `${base}/enroll?${parts.join('&')}` : `${base}/enroll`
 }
 
 /** Seat label for the form: honour `?seat=` when present, otherwise an honest
@@ -267,16 +271,17 @@ export function enrollUnavailableBody(retryAfterSeconds: number) {
 export async function loadEnrollView(
   env: Env,
   auth: AuthContext,
-  opts: { seat?: string | null; agent?: string | null } = {},
+  opts: { seat?: string | null; agent?: string | null; code?: string | null } = {},
 ): Promise<EnrollView> {
   const seat = normalizeEnrollSeat(opts.seat)
+  const code = (opts.code ?? '').trim() || null
   const principal = (auth.email && auth.email.trim().length > 0)
     ? auth.email.trim()
     : (auth.memberId ?? auth.userId)
   const memberId = auth.memberId ?? null
 
   if (!memberId) {
-    return { principal, memberId, seat, preselectedAgent: null, agents: [] }
+    return { principal, memberId, seat, preselectedAgent: null, deviceCode: code, agents: [] }
   }
 
   // #1218: pass the legacy-role plane through. isOrgAdmin reads auth.role OR an
@@ -294,6 +299,7 @@ export async function loadEnrollView(
     memberId,
     seat,
     preselectedAgent,
+    deviceCode: code,
     agents: consentable.map((a) => ({ ...a, liveKeys: liveByAgent.get(a.id) ?? [] })),
   }
 }
@@ -404,6 +410,18 @@ ${honoRaw(errorHtml)}
       <code class="inline">${esc(DEFAULT_ENROLL_SEAT)}</code> — correct it if
       this harness has a real name.
     </p>
+
+    <div style="margin-top:16px;padding:12px;background:var(--card-bg, #f8f9fa);border:1px dashed var(--border, #ccc);border-radius:6px">
+      <label style="font-weight:bold">
+        Device Pairing Code (Optional)
+        <br/>
+        <input name="device_code" value="${esc(view.deviceCode ?? '')}" maxlength="12" placeholder="XXXX-XXXX"
+          style="font-family:ui-monospace,monospace;letter-spacing:0.1rem;text-transform:uppercase;margin-top:4px;width:140px" />
+      </label>
+      <p style="font-size:12px;color:var(--muted);margin:4px 0 0">
+        Pairing a CLI or headless terminal? Enter the code shown on the screen, or open <a href="/device">/device</a>.
+      </p>
+    </div>
 
     <h2 style="margin-top:24px">Choose an agent</h2>
     ${view.agents.length === 0
