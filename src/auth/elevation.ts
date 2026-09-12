@@ -45,12 +45,21 @@ import {
   isValidElevationDuration,
 } from './elevation-actions'
 import { assertBatchWritten } from '../lib/receipt'
+import { type ExactAction, exactActionHash, validateExactActionInput } from './exact-action'
+
+/** The one action requiring an exact-action binding (migrations/0152). Kept
+ *  as a single literal constant here (not re-exported for use as a
+ *  hasElevatedAction call argument elsewhere — see
+ *  tests/elevation-actions-enforced.test.ts's requirement that every
+ *  hasElevatedAction call site name its action as a STRING LITERAL, never a
+ *  constant reference). */
+const KNOWLEDGE_WRITE_ACTION = 'action:knowledge_write'
 
 export const REQUEST_DECISION_WINDOW_MS = 10 * 60 * 1000 // 10 minutes — design v1 "user code" window
 
 function isMissingTableError(err: unknown): boolean {
   const message = err instanceof Error ? err.message : String(err)
-  return /no such table:\s*(elevation_requests|elevation_grants|elevation_usage_log)\b/i.test(message)
+  return /no such table:\s*(elevation_requests|elevation_grants|elevation_usage_log|elevation_action_bindings)\b/i.test(message)
 }
 
 // ── shapes ───────────────────────────────────────────────────────────────
@@ -101,7 +110,72 @@ const REQUEST_COLUMNS = `id, tenant, agent_session_id, agent_id, member_id, requ
 const GRANT_COLUMNS = `id, tenant, elevation_request_id, agent_session_id, action, scope_type, scope_id,
   effect, approved_by_member_id, approved_by_web_session_hash, created_at, expires_at, revoked_at, revoke_reason`
 
+/**
+ * ElevationActionBindingRecord — one row of migrations/0152's
+ * elevation_action_bindings: the immutable, byte-exact action a human
+ * approved alongside an elevation_requests row for 'action:knowledge_write'.
+ * See that migration's header for the full design rationale. Never updated
+ * after insert — no function in this module issues an UPDATE against this
+ * table.
+ */
+export interface ElevationActionBindingRecord {
+  id: string
+  tenant: string
+  elevation_request_id: string
+  action: string
+  principal: string
+  target_system: string
+  target_id: string
+  target_revision: string
+  expected_revision: string
+  payload_hash: string
+  destination: string
+  operation: string
+  expires_at: string
+  action_hash: string
+  created_at: string
+}
+
+const BINDING_COLUMNS = `id, tenant, elevation_request_id, action, principal, target_system, target_id, target_revision,
+  expected_revision, payload_hash, destination, operation, expires_at, action_hash, created_at`
+
+/** loadElevationActionBinding — the exact-action binding for one
+ *  (request, action) pair, or null. Self-guarding like every other reader in
+ *  this module: a not-yet-migrated tenant reads as "no binding", never a 500. */
+export async function loadElevationActionBinding(
+  env: Env,
+  tenant: string,
+  requestId: string,
+  action: string,
+): Promise<ElevationActionBindingRecord | null> {
+  try {
+    const row = await env.DB.prepare(
+      `SELECT ${BINDING_COLUMNS} FROM elevation_action_bindings
+        WHERE tenant = ?1 AND elevation_request_id = ?2 AND action = ?3 LIMIT 1`,
+    )
+      .bind(tenant, requestId, action)
+      .first<ElevationActionBindingRecord>()
+    return row ?? null
+  } catch (err) {
+    if (isMissingTableError(err)) return null
+    throw err
+  }
+}
+
 // ── create request (agent-initiated) ────────────────────────────────────────
+
+/** The exact-action fields a REQUESTER (hostd, via request_elevation) may
+ *  supply — deliberately missing `principal`/`tenant`: both are ALWAYS
+ *  server-derived from the authenticated caller, never accepted from an
+ *  argument. See ExactAction's own doc comment (src/auth/exact-action.ts). */
+export interface ExactActionRequestFields {
+  target: { system: string; id: string; revision: string }
+  expected_revision: string
+  payload_hash: string
+  destination: string
+  operation: string
+  expires_at: string
+}
 
 export interface CreateElevationRequestInput {
   tenant: string
@@ -113,10 +187,13 @@ export interface CreateElevationRequestInput {
   scopeId: string
   durationMinutes: number
   reason: string
+  /** REQUIRED iff `actions` includes 'action:knowledge_write'; refused as
+   *  invalid if present for any other action set. See createElevationRequest. */
+  exactAction?: ExactActionRequestFields
 }
 
 export type CreateElevationRequestResult =
-  | { ok: true; request: ElevationRequestRecord }
+  | { ok: true; request: ElevationRequestRecord; binding: ElevationActionBindingRecord | null }
   | { ok: false; reason: 'invalid_elevation_request'; detail: string }
 
 /**
@@ -126,6 +203,19 @@ export type CreateElevationRequestResult =
  * — this function does not re-derive identity, it only validates and
  * persists the ask. `actions` must be a non-empty set of KNOWN 'action:*'
  * keys (see elevation-actions.ts) — never 'admin', never free text.
+ *
+ * EXACT-ACTION BINDING (migrations/0152): a request naming
+ * 'action:knowledge_write' MUST carry `exactAction` — a reason-only body for
+ * that action is refused as invalid_elevation_request, never silently
+ * accepted as "the human will approve anything named knowledge_write" (the
+ * defect this whole contract exists to close). Conversely, `exactAction` on
+ * any OTHER action set is also refused — it would be dead data nothing ever
+ * checks. When present, `exactAction` is validated and hashed SERVER-SIDE
+ * (principal = input.agentId, tenant = input.tenant — never read from the
+ * exactAction argument itself) and the elevation_requests INSERT plus the
+ * elevation_action_bindings INSERT happen in ONE env.DB.batch() — a request
+ * for action:knowledge_write can never exist without its exact-action
+ * binding landing atomically alongside it.
  */
 export async function createElevationRequest(
   env: Env,
@@ -162,33 +252,107 @@ export async function createElevationRequest(
     return { ok: false, reason: 'invalid_elevation_request', detail: 'reason required' }
   }
 
+  const wantsKnowledgeWrite = uniqueActions.includes(KNOWLEDGE_WRITE_ACTION)
+  if (wantsKnowledgeWrite && !input.exactAction) {
+    return { ok: false, reason: 'invalid_elevation_request', detail: 'exact_action required for action:knowledge_write' }
+  }
+  if (!wantsKnowledgeWrite && input.exactAction) {
+    return { ok: false, reason: 'invalid_elevation_request', detail: 'exact_action is only valid alongside action:knowledge_write' }
+  }
+
+  let boundAction: ExactAction | null = null
+  let boundActionHash: string | null = null
+  if (input.exactAction) {
+    const validated = validateExactActionInput({
+      principal: input.agentId,
+      tenant: input.tenant,
+      target: input.exactAction.target,
+      expected_revision: input.exactAction.expected_revision,
+      payload_hash: input.exactAction.payload_hash,
+      destination: input.exactAction.destination,
+      operation: input.exactAction.operation,
+      expires_at: input.exactAction.expires_at,
+    })
+    if (!validated.ok) {
+      return { ok: false, reason: 'invalid_elevation_request', detail: `exact_action: ${validated.reason}` }
+    }
+    boundAction = validated.action
+    boundActionHash = await exactActionHash(validated.action)
+  }
+
   const id = crypto.randomUUID()
   const nowIso = new Date(nowMs).toISOString()
   const decisionExpiresAt = new Date(nowMs + REQUEST_DECISION_WINDOW_MS).toISOString()
   const scopeId = input.scopeId ?? ''
 
-  await env.DB.prepare(
+  const requestStmt = env.DB.prepare(
     `INSERT INTO elevation_requests
        (id, tenant, agent_session_id, agent_id, member_id, requested_actions_json,
         requested_scope_type, requested_scope_id, requested_duration_minutes, reason,
         status, created_at, decision_expires_at)
      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?12)`,
+  ).bind(
+    id,
+    input.tenant,
+    input.agentSessionId,
+    input.agentId,
+    input.memberId,
+    JSON.stringify(uniqueActions),
+    input.scopeType,
+    scopeId,
+    input.durationMinutes,
+    input.reason.trim(),
+    nowIso,
+    decisionExpiresAt,
   )
-    .bind(
-      id,
-      input.tenant,
-      input.agentSessionId,
-      input.agentId,
-      input.memberId,
-      JSON.stringify(uniqueActions),
-      input.scopeType,
-      scopeId,
-      input.durationMinutes,
-      input.reason.trim(),
-      nowIso,
-      decisionExpiresAt,
+
+  let binding: ElevationActionBindingRecord | null = null
+  if (boundAction && boundActionHash) {
+    const bindingId = crypto.randomUUID()
+    binding = {
+      id: bindingId,
+      tenant: input.tenant,
+      elevation_request_id: id,
+      action: KNOWLEDGE_WRITE_ACTION,
+      principal: input.agentId,
+      target_system: boundAction.target.system,
+      target_id: boundAction.target.id,
+      target_revision: boundAction.target.revision,
+      expected_revision: boundAction.expected_revision,
+      payload_hash: boundAction.payload_hash,
+      destination: boundAction.destination,
+      operation: boundAction.operation,
+      expires_at: boundAction.expires_at,
+      action_hash: boundActionHash,
+      created_at: nowIso,
+    }
+    const bindingStmt = env.DB.prepare(
+      `INSERT INTO elevation_action_bindings
+         (id, tenant, elevation_request_id, action, principal, target_system, target_id, target_revision,
+          expected_revision, payload_hash, destination, operation, expires_at, action_hash, created_at)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)`,
+    ).bind(
+      binding.id,
+      binding.tenant,
+      binding.elevation_request_id,
+      binding.action,
+      binding.principal,
+      binding.target_system,
+      binding.target_id,
+      binding.target_revision,
+      binding.expected_revision,
+      binding.payload_hash,
+      binding.destination,
+      binding.operation,
+      binding.expires_at,
+      binding.action_hash,
+      binding.created_at,
     )
-    .run()
+    const batchResults = await env.DB.batch([requestStmt, bindingStmt])
+    assertBatchWritten(batchResults, 'elevation_requests+elevation_action_bindings.insert', 1)
+  } else {
+    await requestStmt.run()
+  }
 
   return {
     ok: true,
@@ -211,6 +375,7 @@ export async function createElevationRequest(
       decided_by_web_session_hash: null,
       decision_note: null,
     },
+    binding,
   }
 }
 
