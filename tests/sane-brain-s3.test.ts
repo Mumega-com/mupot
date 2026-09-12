@@ -200,6 +200,49 @@ describe('runGoalCycle — backpressure guard (dedicated backlog count)', () => 
   })
 })
 
+// ── 1b. The loop → AgentDO observer seam (mupot#1381) ─────────────────────────
+//
+// runGoalCycle computes observer signals and returns them; AgentDO consumes
+// result.observer to extend its alarm (cooldown) and to emit an escalation.
+// NOTHING crossed that seam in a test. An adversarial gate proved it: changing
+// every `observer: observerResult ?? undefined` in loop.ts to `observer: undefined`
+// left the FULL suite green — 510 files, 7890 tests — while silently disabling
+// both the backoff and the brain's only path for reporting a stuck agent.
+//
+// The observer's own computation is covered (sane-brain-s2), and the emit itself
+// is covered (agent-escalation-emit). This is the wire between them.
+
+describe('S3 — the goal cycle actually returns its observer signals', () => {
+  it('returns a defined observer on a productive cycle', async () => {
+    const agent = makeAgent()
+    const env = makeEnv(makeD1({ backlogCount: 0 }))
+    const observe = vi.fn().mockResolvedValue({ cooldown: false, escalate: true, reason: 'escalate: x' })
+
+    const result = await runGoalCycle(env, agent, baseDeps({ observe }))
+
+    expect(observe, 'the loop never called observe()').toHaveBeenCalled()
+    expect(
+      result.observer,
+      'runGoalCycle dropped the observer signals — AgentDO can no longer back off ' +
+        'or escalate, and no other test would notice',
+    ).toBeDefined()
+    expect(result.observer?.escalate).toBe(true)
+    expect(result.observer?.reason).toBe('escalate: x')
+  })
+
+  it('returns a defined observer on the backpressure path too', async () => {
+    const agent = makeAgent()
+    const env = makeEnv(makeD1({ backlogCount: MAX_OPEN_TASKS }))
+    const observe = vi.fn().mockResolvedValue({ cooldown: true, escalate: false })
+
+    const result = await runGoalCycle(env, agent, baseDeps({ observe }))
+
+    expect(result.decided).toBe('backpressure')
+    expect(result.observer, 'backpressure cycle dropped its observer signals').toBeDefined()
+    expect(result.observer?.cooldown).toBe(true)
+  })
+})
+
 // ── 2. Empty proposals (spawned=0) → observe-only no-op, NO memory ────────────
 
 describe('runGoalCycle — empty proposals are a no-op (gate-RED fix)', () => {
