@@ -47,3 +47,12 @@ Tasks 7–9 implemented in crate. Gate: hadi-grok. Hermes lane dropped.
 - Live F3 remains blocked: PR #1229 is not deployed, no Rava bearer is installed
   on this Mac, and the current commit engine still uses fixture Inkwell/Mirror
   writers. A successful Hadi Codex read is not a Rava write authorization.
+- Mupot profile read confirms Rava is active at
+  `e9597210-edc5-4de5-80cd-b9cbea8ff422`, but her git-canonical qNFT remains
+  `NEEDS_CEREMONY`; cause and descriptor are pending self-statement. No Rava
+  token handle was found on the Mac or VPS, and Herdr has no Rava seat. Grokbot
+  CEO was asked to coordinate the authentic self-statement/witness path under
+  Mupot message receipt `ce10398d-053f-4ebf-8e0b-693c4a1d90d0`.
+- Read-only D1 discovery selected existing admin KB object ID `18`, slug
+  `substrate-mirror-v1`, revision `2026-04-28 03:29:04`, as the proposed private
+  canary target. Selection did not mutate the object and is not write approval.
