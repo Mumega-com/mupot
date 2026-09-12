@@ -474,7 +474,21 @@ describe('exact-action approval contract', () => {
     expect(resB.ok, JSON.stringify(resB)).toBe(true)
   })
 
-  it('batch atomicity: a hard DB failure on the grant INSERT (FK violation) rolls back the status flip too — status stays pending, re-decidable', async () => {
+  it('batch atomicity: a hard DB failure on JUST the grant INSERT rolls back the status flip too — status stays pending, re-decidable', async () => {
+    // NOTE on fault-injection choice: elevation_requests ITSELF has
+    // `decided_by_member_id REFERENCES members(id)` and
+    // `decided_by_web_session_hash REFERENCES web_sessions(id_hash)` — the
+    // SAME two FK-constrained columns the grant row's approved_by_* columns
+    // get their values from (decideElevationRequest passes the caller's
+    // decidedByMemberId/decidedByWebSessionHash into BOTH the flip UPDATE
+    // and every grant INSERT). So a bogus member id or web-session hash
+    // breaks the FLIP STATEMENT ITSELF, not just the grant insert — that
+    // fault-injection would prove nothing about atomicity (a failing flip
+    // trivially never commits, batched or not; verified directly against
+    // this exact scenario before choosing the trigger approach below). A
+    // temporary trigger that fires ONLY on elevation_grants inserts isolates
+    // the fault to exactly the statement under test, leaving the flip's own
+    // write perfectly valid.
     const t0 = Date.parse('2026-09-12T00:00:00.000Z')
     vi.useFakeTimers()
     vi.setSystemTime(t0)
@@ -490,29 +504,41 @@ describe('exact-action approval contract', () => {
     const requestId = (reqRes.result as { request: { id: string } }).request.id
     const hash = await serverHashFor(fields)
 
+    const approverSession = await createWebSession(env, 'raw-approver-atomicity', { tenant: TENANT, memberId: APPROVER_MEMBER_ID, loginIdentityId: APPROVER_IDENTITY_ID }, t0)
+
+    // Fires on every INSERT into elevation_grants and aborts it — a real,
+    // hard DB failure that has nothing to do with FK values, so it cannot
+    // accidentally also break the flip.
+    await env.DB.prepare(
+      `CREATE TRIGGER zzz_simulated_grant_insert_failure
+         BEFORE INSERT ON elevation_grants
+       BEGIN
+         SELECT RAISE(ABORT, 'simulated grant insert failure');
+       END`,
+    ).run()
+
     await expect(
       decideElevationRequest(
         env,
         {
           tenant: TENANT, requestId, decision: 'approve', selectedActions: ['action:knowledge_write'],
           decidedByMemberId: APPROVER_MEMBER_ID, decidedByCapabilities: ORG_ADMIN_CAPABILITIES,
-          // Bogus — no such row in web_sessions. The grant INSERT's
-          // `approved_by_web_session_hash REFERENCES web_sessions(id_hash)`
-          // fails with a FOREIGN KEY constraint error, inside the SAME
-          // env.DB.batch() transaction as the status flip.
-          decidedByWebSessionHash: 'does-not-exist-in-web-sessions',
+          decidedByWebSessionHash: approverSession.id_hash,
           recentReauthOk: true, boundActionHash: hash,
         },
         t0,
       ),
-    ).rejects.toThrow()
+    ).rejects.toThrow(/simulated grant insert failure/)
 
     const row = await env.DB.prepare(`SELECT status FROM elevation_requests WHERE id = ?1`).bind(requestId).first<{ status: string }>()
     expect(row?.status).toBe('pending')
+    const grantsAfterFailure = await env.DB.prepare(`SELECT COUNT(*) AS n FROM elevation_grants WHERE elevation_request_id = ?1`).bind(requestId).first<{ n: number }>()
+    expect(Number(grantsAfterFailure?.n ?? -1)).toBe(0)
 
-    // Genuinely re-decidable afterward with a REAL approver session — the
-    // failed attempt left no partial state behind.
-    const approverSession = await createWebSession(env, 'raw-approver-retry', { tenant: TENANT, memberId: APPROVER_MEMBER_ID, loginIdentityId: APPROVER_IDENTITY_ID }, t0)
+    await env.DB.prepare(`DROP TRIGGER zzz_simulated_grant_insert_failure`).run()
+
+    // Genuinely re-decidable afterward — the failed attempt left no partial
+    // state behind.
     const retry = await decideElevationRequest(
       env,
       {
@@ -896,6 +922,22 @@ describe('exact-action approval contract', () => {
     expect(Number.isNaN(Date.parse(CAFE_DATE))).toBe(false)
 
     const result = validateExactActionInput(withField('expires_at', CAFE_DATE))
+    expect(result.ok, JSON.stringify(result)).toBe(false)
+  })
+
+  it('expires_at: a fully-ASCII, Date.parse-accepted value that is NOT strict RFC3339 is rejected (proves the regex itself does work, not just isAsciiPrintable)', () => {
+    // "2026-09-12" is pure ASCII and Date.parse happily accepts it — so this
+    // case can ONLY be caught by the strict RFC3339 shape check, never by
+    // isAsciiPrintable alone. Every other case in this file (café, 5000
+    // chars) happens to also be non-ASCII or oversized, which is already
+    // caught upstream of the regex — this is the one case that isolates the
+    // regex's own contribution, and it is exactly what mutation-testing this
+    // module (removing EXPIRES_AT_RE while keeping isAsciiPrintable) found
+    // missing on the first pass.
+    const DATE_ONLY = '2026-09-12'
+    expect(Number.isNaN(Date.parse(DATE_ONLY))).toBe(false)
+
+    const result = validateExactActionInput(withField('expires_at', DATE_ONLY))
     expect(result.ok, JSON.stringify(result)).toBe(false)
   })
 })
