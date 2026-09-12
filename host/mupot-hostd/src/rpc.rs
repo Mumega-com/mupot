@@ -5,22 +5,22 @@
 //! Missing/expired approval → `ApprovalRequired` / `ApprovalExpired` only.
 //! Bare `write` remains `UnsupportedContract` (use propose/commit).
 
+use crate::adapters::ReadAdapter;
 use crate::adapters::herdr::HerdrAdapter;
 use crate::adapters::inkwell::InkwellWriteAdapter;
 use crate::adapters::mirror::MirrorWriteAdapter;
 use crate::adapters::mupot::MupotAdapter;
-use crate::adapters::ReadAdapter;
 use crate::approval::ExactAction;
 use crate::commit::{CommitEngine, CommitRequest};
-use crate::contract::{BrokerError, Observation, Proposal, Receipt, VerifiedScope};
 use crate::context::build_context;
-use crate::freshness::{reconcile, ReconciledClaim, SourcePolicy};
-use crate::identity::{normalize_evidence, verify_identity};
+use crate::contract::{BrokerError, Observation, Proposal, Receipt, VerifiedScope};
+use crate::freshness::{ReconciledClaim, SourcePolicy, reconcile};
+use crate::identity::normalize_evidence;
 use crate::outbox::Outbox;
 use crate::policy::HERDR_SOCK_DEFAULT;
 use crate::store::Store;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -115,7 +115,10 @@ impl HostState {
     pub fn reload_observations_from_store(&self) -> Result<(), BrokerError> {
         let store = self.store.lock().map_err(|_| BrokerError::CorruptState)?;
         let loaded = load_observations_from_store(&store)?;
-        let mut cache = self.observations.lock().map_err(|_| BrokerError::CorruptState)?;
+        let mut cache = self
+            .observations
+            .lock()
+            .map_err(|_| BrokerError::CorruptState)?;
         *cache = loaded;
         Ok(())
     }
@@ -182,11 +185,8 @@ fn default_mupot_adapter() -> MupotAdapter {
         "status".into(),
         json!({"ok": true, "result": {"agent": "hadi-cursor"}}),
     );
-    scripted.insert(
-        "receipt_get".into(),
-        json!({"ok": true, "result": null}),
-    );
-    MupotAdapter { scripted }
+    scripted.insert("receipt_get".into(), json!({"ok": true, "result": null}));
+    MupotAdapter::scripted(scripted)
 }
 
 fn default_herdr_adapter() -> HerdrAdapter {
@@ -374,7 +374,10 @@ fn propose_op(state: &HostState, params: &Value) -> Result<Value, BrokerError> {
     let action = ExactAction::from_proposal(principal, tenant, &proposal, "source_write");
     let hash = action.action_hash();
     {
-        let mut map = state.proposals.lock().map_err(|_| BrokerError::CorruptState)?;
+        let mut map = state
+            .proposals
+            .lock()
+            .map_err(|_| BrokerError::CorruptState)?;
         map.insert(hash.clone(), proposal.clone());
     }
     Ok(json!({
@@ -397,20 +400,21 @@ fn commit_op(state: &HostState, params: &Value) -> Result<Value, BrokerError> {
     let proposal: Proposal = if let Some(p) = params.get("proposal") {
         serde_json::from_value(p.clone()).map_err(|_| BrokerError::InvalidInput)?
     } else if let Some(h) = params.get("action_hash").and_then(|v| v.as_str()) {
-        let map = state.proposals.lock().map_err(|_| BrokerError::CorruptState)?;
+        let map = state
+            .proposals
+            .lock()
+            .map_err(|_| BrokerError::CorruptState)?;
         map.get(h).cloned().ok_or(BrokerError::InvalidInput)?
     } else {
         return Err(BrokerError::InvalidInput);
     };
-    let approval_json = params
-        .get("approval")
-        .map(|v| {
-            if let Some(s) = v.as_str() {
-                s.to_string()
-            } else {
-                v.to_string()
-            }
-        });
+    let approval_json = params.get("approval").map(|v| {
+        if let Some(s) = v.as_str() {
+            s.to_string()
+        } else {
+            v.to_string()
+        }
+    });
     let now_unix = params
         .get("now_unix")
         .and_then(|v| v.as_i64())
@@ -439,8 +443,12 @@ fn boot(state: &HostState, params: &Value) -> Result<Value, BrokerError> {
         evidence_val.to_string()
     };
     let evidence = normalize_evidence(&evidence_raw)?;
-    let vs = verify_identity(&evidence, 1_780_000_000)?;
-    let _ = state.ingest_from_read_adapters(&vs);
+    let vs = state.mupot.verified_scope(
+        &evidence.requested_principal,
+        &evidence.tenant,
+        1_780_000_000,
+    )?;
+    state.ingest_from_read_adapters(&vs)?;
     Ok(json!({
         "agent": vs.scope().agent,
         "tenant": vs.scope().tenant,
@@ -462,7 +470,7 @@ fn status(state: &HostState) -> Result<Value, BrokerError> {
     }))
 }
 
-fn verified_from_params(params: &Value) -> Result<VerifiedScope, BrokerError> {
+fn verified_from_params(state: &HostState, params: &Value) -> Result<VerifiedScope, BrokerError> {
     if let Some(ev) = params.get("evidence") {
         let raw = if let Some(s) = ev.as_str() {
             s.to_string()
@@ -470,13 +478,17 @@ fn verified_from_params(params: &Value) -> Result<VerifiedScope, BrokerError> {
             ev.to_string()
         };
         let evidence = normalize_evidence(&raw)?;
-        return verify_identity(&evidence, 1_780_000_000);
+        return state.mupot.verified_scope(
+            &evidence.requested_principal,
+            &evidence.tenant,
+            1_780_000_000,
+        );
     }
     Err(BrokerError::UnverifiedIdentity)
 }
 
 fn context_op(state: &HostState, params: &Value) -> Result<Value, BrokerError> {
-    let scope = verified_from_params(params)?;
+    let scope = verified_from_params(state, params)?;
     let budget = params
         .get("token_budget_bytes")
         .and_then(|v| v.as_u64())
@@ -490,11 +502,8 @@ fn context_op(state: &HostState, params: &Value) -> Result<Value, BrokerError> {
 }
 
 fn recall_op(state: &HostState, params: &Value) -> Result<Value, BrokerError> {
-    let scope = verified_from_params(params)?;
-    let query = params
-        .get("query")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let scope = verified_from_params(state, params)?;
+    let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
     let obs = state.served_observations()?;
     let hits: Vec<_> = obs
         .iter()
@@ -505,7 +514,7 @@ fn recall_op(state: &HostState, params: &Value) -> Result<Value, BrokerError> {
 }
 
 fn freshness_check(state: &HostState, params: &Value) -> Result<Value, BrokerError> {
-    let _ = verified_from_params(params)?;
+    let _ = verified_from_params(state, params)?;
     let obs = state.served_observations()?;
     let claims = reconcile(&obs, &state.policies, 1_780_000_000)?;
     Ok(serde_json::to_value(claims).map_err(|_| BrokerError::CorruptState)?)
@@ -579,9 +588,8 @@ pub fn mcp_stdio_once(state: &HostState, line: &str) -> String {
             error: Some(BrokerError::InvalidInput.to_string()),
         },
     };
-    serde_json::to_string(&resp).unwrap_or_else(|_| {
-        r#"{"ok":false,"error":"corrupt state"}"#.into()
-    })
+    serde_json::to_string(&resp)
+        .unwrap_or_else(|_| r#"{"ok":false,"error":"corrupt state"}"#.into())
 }
 
 pub fn test_runtime(dir: &Path) -> Result<(HostState, UnixListener), BrokerError> {

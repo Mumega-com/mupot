@@ -26,6 +26,7 @@ sha2 = "0.10"
 hex = "0.4"
 zeroize = { version = "1", features = ["derive"] }
 libc = "0.2"
+ureq = { version = "2.12", default-features = false, features = ["json", "tls"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3"

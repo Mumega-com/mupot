@@ -1,8 +1,8 @@
 mod support;
 
 use mupot_hostd::rpc::{
-    bind_socket, dispatch, mcp_stdio_once, read_framed, require_same_user, write_framed, HostState,
-    RpcRequest, RpcResponse,
+    HostState, RpcRequest, RpcResponse, bind_socket, dispatch, mcp_stdio_once, read_framed,
+    require_same_user, write_framed,
 };
 use serde_json::json;
 use std::os::unix::net::UnixStream;
@@ -62,10 +62,7 @@ fn mcp_stdio_bridge_and_writes_gated() {
     let out = mcp_stdio_once(&state, line);
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["ok"], true);
-    assert!(v["result"]["writes"]
-        .as_str()
-        .unwrap()
-        .contains("approval"));
+    assert!(v["result"]["writes"].as_str().unwrap().contains("approval"));
 
     // Bare write remains unsupported.
     let write = mcp_stdio_once(&state, r#"{"op":"write","params":{}}"#);
@@ -94,6 +91,29 @@ fn mcp_stdio_bridge_and_writes_gated() {
 }
 
 #[test]
+fn boot_rejects_self_asserted_bearer_that_disagrees_with_mupot() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = HostState::open(dir.path()).unwrap();
+    let claimed = "e9597210-edc5-4de5-80cd-b9cbea8ff422";
+    let resp = dispatch(
+        &state,
+        &RpcRequest {
+            op: "boot".into(),
+            params: json!({
+                "evidence": {
+                    "bearer_agent_id": claimed,
+                    "requested_principal": claimed,
+                    "tenant": "mumega",
+                    "credential_fingerprint": "self-asserted"
+                }
+            }),
+        },
+    );
+    assert!(!resp.ok, "self-asserted bearer must not grant identity");
+    assert_eq!(resp.error.as_deref(), Some("conflict"));
+}
+
+#[test]
 fn refuse_occupied_socket_without_unlink() {
     let dir = tempfile::tempdir().unwrap();
     let state = HostState::open(dir.path()).unwrap();
@@ -105,8 +125,8 @@ fn refuse_occupied_socket_without_unlink() {
 /// Goes RED if Store→load→labelled `context` join is cut (empty in-memory only).
 #[test]
 fn kill_witness_served_context_requires_store_load() {
-    use mupot_hostd::contract::{Classification, Observation, Scope};
     use mupot_hostd::context::build_context;
+    use mupot_hostd::contract::{Classification, Observation, Scope};
     use mupot_hostd::freshness::reconcile;
     use mupot_hostd::policy::FENCED_LIVE_SEAT_UUIDS;
     use mupot_hostd::rpc::load_observations_from_store;
@@ -184,7 +204,11 @@ fn kill_witness_served_context_requires_store_load() {
         let store = state.store.lock().unwrap();
         load_observations_from_store(&store).unwrap()
     };
-    assert_eq!(loaded.len(), 1, "HostState::open must load observations from Store");
+    assert_eq!(
+        loaded.len(),
+        1,
+        "HostState::open must load observations from Store"
+    );
     assert_eq!(loaded[0].source_system, "mupot");
 
     let evidence = json!({
@@ -203,8 +227,14 @@ fn kill_witness_served_context_requires_store_load() {
     );
     assert!(resp.ok, "context failed: {:?}", resp.error);
     let result = resp.result.unwrap();
-    let current = result["current_facts"].as_array().cloned().unwrap_or_default();
-    let hints = result["historical_hints"].as_array().cloned().unwrap_or_default();
+    let current = result["current_facts"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let hints = result["historical_hints"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     let conflicts = result["conflicts"].as_array().cloned().unwrap_or_default();
     assert!(
         !current.is_empty() || !hints.is_empty() || !conflicts.is_empty(),
@@ -220,5 +250,8 @@ fn kill_witness_served_context_requires_store_load() {
                 Some("mupot" | "herdr" | "mirror" | "inkwell" | "github")
             )
         });
-    assert!(labelled, "packet must carry source_system label; got {result}");
+    assert!(
+        labelled,
+        "packet must carry source_system label; got {result}"
+    );
 }

@@ -3,23 +3,31 @@
 
 use mupot_hostd::adapters::herdr::HerdrAdapter;
 use mupot_hostd::adapters::mupot::MupotAdapter;
-use mupot_hostd::rpc::{bind_socket, serve_one, HostState};
-use serde_json::json;
-use std::collections::BTreeMap;
+use mupot_hostd::contract::BrokerError;
+use mupot_hostd::rpc::{HostState, bind_socket, serve_one};
+use mupot_hostd::secrets::SecretHandle;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 fn main() {
     let runtime = match std::env::var("MUPOT_HOSTD_RUNTIME") {
         Ok(p) => PathBuf::from(p),
-        Err(_) => dirs_runtime().unwrap_or_else(|| PathBuf::from("/tmp/mupot-hostd-should-not-use")),
+        Err(_) => {
+            dirs_runtime().unwrap_or_else(|| PathBuf::from("/tmp/mupot-hostd-should-not-use"))
+        }
     };
     if runtime.starts_with("/tmp") && std::env::var("MUPOT_HOSTD_ALLOW_TMP").is_err() {
         eprintln!("set MUPOT_HOSTD_RUNTIME to a private directory (0700)");
         std::process::exit(2);
     }
 
-    let mupot = production_mupot_adapter();
+    let mupot = match production_mupot_adapter() {
+        Ok(adapter) => adapter,
+        Err(e) => {
+            eprintln!("mupot adapter configuration failed: {e}");
+            std::process::exit(1);
+        }
+    };
     let herdr = production_herdr_adapter();
     let state = match HostState::open_with_adapters(&runtime, mupot, herdr) {
         Ok(s) => Arc::new(s),
@@ -50,16 +58,18 @@ fn main() {
     }
 }
 
-fn production_mupot_adapter() -> MupotAdapter {
-    // Scripted/read-RPC only — never inbox/SSE/connect/mint.
-    let mut scripted = BTreeMap::new();
-    scripted.insert(
-        "boot_context".into(),
-        json!({"ok":true,"result":{"bound_agent_id":"7089044c-5e48-4d5f-b5b0-6937433c4e79","identity_status":"minted"}}),
-    );
-    scripted.insert("status".into(), json!({"ok":true,"result":{}}));
-    scripted.insert("receipt_get".into(), json!({"ok":true,"result":null}));
-    MupotAdapter { scripted }
+fn production_mupot_adapter() -> Result<MupotAdapter, BrokerError> {
+    let home = std::env::var("HOME").map_err(|_| BrokerError::UnverifiedIdentity)?;
+    let token_path = std::env::var("MUPOT_HOSTD_TOKEN_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(home).join(".fleet/agents/hadi-codex.token"));
+    let token = SecretHandle::from_private_file("mupot", "hostd", &token_path)?;
+    let base_url =
+        std::env::var("MUPOT_HOSTD_URL").unwrap_or_else(|_| "https://mupot.mumega.com".into());
+    let expected_agent_id = std::env::var("MUPOT_HOSTD_EXPECTED_AGENT_ID")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    MupotAdapter::http(base_url, token, expected_agent_id)
 }
 
 fn production_herdr_adapter() -> HerdrAdapter {

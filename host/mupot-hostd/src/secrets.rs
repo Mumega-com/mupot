@@ -24,7 +24,11 @@ impl std::fmt::Debug for SecretHandle {
 }
 
 impl SecretHandle {
-    pub fn from_bytes(service: impl Into<String>, account: impl Into<String>, bytes: Vec<u8>) -> Self {
+    pub fn from_bytes(
+        service: impl Into<String>,
+        account: impl Into<String>,
+        bytes: Vec<u8>,
+    ) -> Self {
         Self {
             service: service.into(),
             account: account.into(),
@@ -41,6 +45,38 @@ impl SecretHandle {
 
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    #[cfg(unix)]
+    pub fn from_private_file(
+        service: impl Into<String>,
+        account: impl Into<String>,
+        path: &std::path::Path,
+    ) -> Result<Self, BrokerError> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let meta = path
+            .symlink_metadata()
+            .map_err(|_| BrokerError::UnverifiedIdentity)?;
+        if !meta.file_type().is_file()
+            || meta.file_type().is_symlink()
+            || meta.uid() != unsafe { libc::geteuid() }
+            || meta.permissions().mode() & 0o077 != 0
+            || meta.len() == 0
+            || meta.len() > 16 * 1024
+        {
+            return Err(BrokerError::Forbidden);
+        }
+        let bytes = std::fs::read(path).map_err(|_| BrokerError::UnverifiedIdentity)?;
+        let trimmed = String::from_utf8(bytes)
+            .map_err(|_| BrokerError::UnverifiedIdentity)?
+            .trim()
+            .as_bytes()
+            .to_vec();
+        if trimmed.is_empty() {
+            return Err(BrokerError::UnverifiedIdentity);
+        }
+        Ok(Self::from_bytes(service, account, trimmed))
     }
 }
 
