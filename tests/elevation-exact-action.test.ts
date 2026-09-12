@@ -176,6 +176,11 @@ async function setupApprovedKnowledgeWrite(
     { tenant: TENANT, memberId: APPROVER_MEMBER_ID, loginIdentityId: APPROVER_IDENTITY_ID },
     nowMs,
   )
+  // The approver's client must echo back the EXACT binding hash it rendered
+  // (P0-2 fix) — in a real dashboard flow this comes from the approval
+  // panel's own render of the binding; here it's the same server-computed
+  // hash createElevationRequest itself would have stored.
+  const hash = await serverHashFor(fields)
   const decision = await decideElevationRequest(
     env,
     {
@@ -187,12 +192,11 @@ async function setupApprovedKnowledgeWrite(
       decidedByCapabilities: ORG_ADMIN_CAPABILITIES,
       decidedByWebSessionHash: approverSession.id_hash,
       recentReauthOk: true,
+      boundActionHash: hash,
     },
     nowMs,
   )
   if (!decision.ok) throw new Error(`setup: decision failed: ${JSON.stringify(decision)}`)
-
-  const hash = await serverHashFor(fields)
   return {
     sessionId,
     requestId,
@@ -286,7 +290,14 @@ describe('exact-action approval contract', () => {
     expect(await usageRowCount(grantId)).toBe(0)
   })
 
-  it('bound mismatch: approved for payload A, verify presents payload B with a correct self-computed hash for B → deny, no usage row', async () => {
+  it('never-approved payload: a correct self-computed hash for something nobody approved → deny (no_matching_grant), no usage row', async () => {
+    // Post P0-1 matcher fix, hasElevatedAction itself already searches every
+    // live candidate grant for one whose OWN binding matches the presented
+    // hash (see the "two concurrent live bindings" test below) — so
+    // presenting a hash for a payload that was NEVER approved under ANY live
+    // grant is refused at that search (no_matching_grant), not at the later
+    // redundant per-grant binding re-check (bound_action_mismatch), because
+    // no candidate is ever returned to re-check in the first place.
     const t0 = Date.parse('2026-09-12T00:00:00.000Z')
     vi.useFakeTimers()
     vi.setSystemTime(t0)
@@ -297,11 +308,221 @@ describe('exact-action approval contract', () => {
 
     const res = await verify(otherHash, otherFields)
     expect(res.ok).toBe(false)
-    if (!res.ok) expect(res.error).toBe('bound_action_mismatch')
+    if (!res.ok) expect(res.error).toBe('no_matching_grant')
     expect(await usageRowCount(grantId)).toBe(0)
     // Original, actually-approved action is untouched and still verifies.
     const original = await verify(await serverHashFor(fields), fields)
     expect(original.ok).toBe(true)
+  })
+
+  it('two concurrent live bindings for the SAME session/action/scope: each verifies only its own payload, cross-presentation denied (P0-1 matcher fix)', async () => {
+    // migrations/0153's whole point: a session may hold MULTIPLE live
+    // action:knowledge_write grants at once (one per still-live exact
+    // action). Before the P0-1 matcher fix, hasElevatedAction picked only
+    // the MOST RECENTLY approved live grant for (action, scope) — so
+    // approving B (page-B) after A (page-A) is still live would have made A
+    // unverifiable (silently shadowed) even though A's own grant was never
+    // revoked or expired. check_in reuses the SAME agent_sessions row for
+    // this credential across both requests (production's own behavior), so
+    // this reproduces the exact shape of the bug report.
+    const t0 = Date.parse('2026-09-12T00:00:00.000Z')
+    vi.useFakeTimers()
+    vi.setSystemTime(t0)
+
+    const a = await setupApprovedKnowledgeWrite(t0, {
+      target: { system: 'wiki', id: 'page-A', revision: 'rev-A' },
+      expected_revision: 'rev-A',
+      payload_hash: 'a'.repeat(64),
+      destination: 'content/en/notes/page-A.mdx',
+    })
+    // Approved AFTER A, while A is still live — the exact "newer binding
+    // shadows an older live one" scenario the matcher fix targets.
+    const b = await setupApprovedKnowledgeWrite(t0, {
+      target: { system: 'wiki', id: 'page-B', revision: 'rev-B' },
+      expected_revision: 'rev-B',
+      payload_hash: 'b'.repeat(64),
+      destination: 'content/en/notes/page-B.mdx',
+    })
+    expect(a.sessionId).toBe(b.sessionId) // same reused agent session
+    expect(a.requestId).not.toBe(b.requestId)
+    expect(a.grantId).not.toBe(b.grantId)
+
+    // A, approved FIRST and now the OLDER live grant, must still verify —
+    // this is the case the pre-fix "first live scope-matching grant" logic
+    // would have silently denied once B existed.
+    const resA = await verify(a.hash, a.fields)
+    expect(resA.ok, JSON.stringify(resA)).toBe(true)
+    if (resA.ok) expect((resA.result as { grant_id: string }).grant_id).toBe(a.grantId)
+
+    // B, the newer grant, verifies independently.
+    const resB = await verify(b.hash, b.fields)
+    expect(resB.ok, JSON.stringify(resB)).toBe(true)
+    if (resB.ok) expect((resB.result as { grant_id: string }).grant_id).toBe(b.grantId)
+
+    // Cross-presentation: claiming A's hash for B's fields (or the reverse)
+    // is a hash mismatch, never a success laundered through the other grant.
+    const crossAB = await verify(a.hash, b.fields)
+    expect(crossAB.ok).toBe(false)
+    const crossBA = await verify(b.hash, a.fields)
+    expect(crossBA.ok).toBe(false)
+
+    expect(await usageRowCount(a.grantId)).toBe(1)
+    expect(await usageRowCount(b.grantId)).toBe(1)
+  })
+
+  it('A expired, then B approves and verifies for the SAME session/action/scope tuple (migrations/0153 regression)', async () => {
+    // THE P0-1 bug, reproduced directly: migrations/0148's original
+    // elevation_grants had a table-level UNIQUE(agent_session_id, action,
+    // scope_type, scope_id) with NO revoked_at/expiry qualifier — so once A's
+    // row existed for this exact tuple, EXPIRED or not, a second approval for
+    // the same tuple threw a raw D1 UNIQUE-constraint error from the grant
+    // INSERT, AFTER the status-flip UPDATE had already committed 'approved'
+    // with zero grants — unrecoverable. migrations/0153 removes that
+    // constraint; this proves the regression is closed end to end.
+    const t0 = Date.parse('2026-09-12T00:00:00.000Z')
+    vi.useFakeTimers()
+    vi.setSystemTime(t0)
+
+    await checkIn()
+    // A's own exact-action expires far in the future — only its GRANT (15
+    // minutes) expires, isolating which ceiling is under test.
+    const aFields = fixtureExactAction({ payload_hash: 'a'.repeat(64), expires_at: new Date(t0 + 24 * 60 * 60 * 1000).toISOString() }, t0)
+    const reqA = await invokeTool(
+      agentAuth(), env, 'request_elevation',
+      { actions: ['action:knowledge_write'], scope_type: 'org', scope_id: '', duration_minutes: 15, reason: 'a', exact_action: aFields },
+      ORIGIN,
+    )
+    if (!reqA.ok) throw new Error(JSON.stringify(reqA))
+    const requestIdA = (reqA.result as { request: { id: string } }).request.id
+    const hashA = await serverHashFor(aFields)
+    const approverSessionA = await createWebSession(env, 'raw-approver-expired-a', { tenant: TENANT, memberId: APPROVER_MEMBER_ID, loginIdentityId: APPROVER_IDENTITY_ID }, t0)
+    const decisionA = await decideElevationRequest(
+      env,
+      {
+        tenant: TENANT, requestId: requestIdA, decision: 'approve', selectedActions: ['action:knowledge_write'],
+        decidedByMemberId: APPROVER_MEMBER_ID, decidedByCapabilities: ORG_ADMIN_CAPABILITIES,
+        decidedByWebSessionHash: approverSessionA.id_hash, recentReauthOk: true, boundActionHash: hashA,
+      },
+      t0,
+    )
+    if (!decisionA.ok) throw new Error(JSON.stringify(decisionA))
+
+    // Past A's 15-minute grant — A is now a DEAD row for this tuple, never revoked.
+    const t1 = t0 + 16 * 60 * 1000
+    vi.setSystemTime(t1)
+    expect((await verify(hashA, aFields)).ok).toBe(false) // sanity: A really is dead now
+
+    const bFields = fixtureExactAction({ payload_hash: 'b'.repeat(64) }, t1)
+    const reqB = await invokeTool(
+      agentAuth(), env, 'request_elevation',
+      { actions: ['action:knowledge_write'], scope_type: 'org', scope_id: '', duration_minutes: 60, reason: 'b', exact_action: bFields },
+      ORIGIN,
+    )
+    expect(reqB.ok, JSON.stringify(reqB)).toBe(true)
+    const requestIdB = (reqB.result as { request: { id: string } }).request.id
+    const hashB = await serverHashFor(bFields)
+    const approverSessionB = await createWebSession(env, 'raw-approver-expired-b', { tenant: TENANT, memberId: APPROVER_MEMBER_ID, loginIdentityId: APPROVER_IDENTITY_ID }, t1)
+    const decisionB = await decideElevationRequest(
+      env,
+      {
+        tenant: TENANT, requestId: requestIdB, decision: 'approve', selectedActions: ['action:knowledge_write'],
+        decidedByMemberId: APPROVER_MEMBER_ID, decidedByCapabilities: ORG_ADMIN_CAPABILITIES,
+        decidedByWebSessionHash: approverSessionB.id_hash, recentReauthOk: true, boundActionHash: hashB,
+      },
+      t1,
+    )
+    // THE regression assertion: pre-0153 this threw a raw UNIQUE-constraint
+    // error and left request B's own row stuck at status='approved' with
+    // zero grants (a SEPARATE bug from request A, which was already terminal).
+    expect(decisionB.ok, JSON.stringify(decisionB)).toBe(true)
+
+    const resB = await verify(hashB, bFields)
+    expect(resB.ok, JSON.stringify(resB)).toBe(true)
+  })
+
+  it('A revoked, then B approves and verifies for the SAME session/action/scope tuple', async () => {
+    const t0 = Date.parse('2026-09-12T00:00:00.000Z')
+    vi.useFakeTimers()
+    vi.setSystemTime(t0)
+
+    const a = await setupApprovedKnowledgeWrite(t0, { payload_hash: 'a'.repeat(64) })
+    await revokeElevationGrant(env, TENANT, a.grantId, 'test-revoke', t0)
+    expect((await verify(a.hash, a.fields)).ok).toBe(false) // sanity: A really is dead now
+
+    const bFields = fixtureExactAction({ payload_hash: 'b'.repeat(64) }, t0)
+    const reqB = await invokeTool(
+      agentAuth(), env, 'request_elevation',
+      { actions: ['action:knowledge_write'], scope_type: 'org', scope_id: '', duration_minutes: 60, reason: 'b', exact_action: bFields },
+      ORIGIN,
+    )
+    expect(reqB.ok, JSON.stringify(reqB)).toBe(true)
+    const requestIdB = (reqB.result as { request: { id: string } }).request.id
+    const hashB = await serverHashFor(bFields)
+    const approverSessionB = await createWebSession(env, 'raw-approver-revoked-b', { tenant: TENANT, memberId: APPROVER_MEMBER_ID, loginIdentityId: APPROVER_IDENTITY_ID }, t0)
+    const decisionB = await decideElevationRequest(
+      env,
+      {
+        tenant: TENANT, requestId: requestIdB, decision: 'approve', selectedActions: ['action:knowledge_write'],
+        decidedByMemberId: APPROVER_MEMBER_ID, decidedByCapabilities: ORG_ADMIN_CAPABILITIES,
+        decidedByWebSessionHash: approverSessionB.id_hash, recentReauthOk: true, boundActionHash: hashB,
+      },
+      t0,
+    )
+    expect(decisionB.ok, JSON.stringify(decisionB)).toBe(true)
+
+    const resB = await verify(hashB, bFields)
+    expect(resB.ok, JSON.stringify(resB)).toBe(true)
+  })
+
+  it('batch atomicity: a hard DB failure on the grant INSERT (FK violation) rolls back the status flip too — status stays pending, re-decidable', async () => {
+    const t0 = Date.parse('2026-09-12T00:00:00.000Z')
+    vi.useFakeTimers()
+    vi.setSystemTime(t0)
+
+    await checkIn()
+    const fields = fixtureExactAction({}, t0)
+    const reqRes = await invokeTool(
+      agentAuth(), env, 'request_elevation',
+      { actions: ['action:knowledge_write'], scope_type: 'org', scope_id: '', duration_minutes: 60, reason: 'x', exact_action: fields },
+      ORIGIN,
+    )
+    if (!reqRes.ok) throw new Error(JSON.stringify(reqRes))
+    const requestId = (reqRes.result as { request: { id: string } }).request.id
+    const hash = await serverHashFor(fields)
+
+    await expect(
+      decideElevationRequest(
+        env,
+        {
+          tenant: TENANT, requestId, decision: 'approve', selectedActions: ['action:knowledge_write'],
+          decidedByMemberId: APPROVER_MEMBER_ID, decidedByCapabilities: ORG_ADMIN_CAPABILITIES,
+          // Bogus — no such row in web_sessions. The grant INSERT's
+          // `approved_by_web_session_hash REFERENCES web_sessions(id_hash)`
+          // fails with a FOREIGN KEY constraint error, inside the SAME
+          // env.DB.batch() transaction as the status flip.
+          decidedByWebSessionHash: 'does-not-exist-in-web-sessions',
+          recentReauthOk: true, boundActionHash: hash,
+        },
+        t0,
+      ),
+    ).rejects.toThrow()
+
+    const row = await env.DB.prepare(`SELECT status FROM elevation_requests WHERE id = ?1`).bind(requestId).first<{ status: string }>()
+    expect(row?.status).toBe('pending')
+
+    // Genuinely re-decidable afterward with a REAL approver session — the
+    // failed attempt left no partial state behind.
+    const approverSession = await createWebSession(env, 'raw-approver-retry', { tenant: TENANT, memberId: APPROVER_MEMBER_ID, loginIdentityId: APPROVER_IDENTITY_ID }, t0)
+    const retry = await decideElevationRequest(
+      env,
+      {
+        tenant: TENANT, requestId, decision: 'approve', selectedActions: ['action:knowledge_write'],
+        decidedByMemberId: APPROVER_MEMBER_ID, decidedByCapabilities: ORG_ADMIN_CAPABILITIES,
+        decidedByWebSessionHash: approverSession.id_hash, recentReauthOk: true, boundActionHash: hash,
+      },
+      t0,
+    )
+    expect(retry.ok, JSON.stringify(retry)).toBe(true)
   })
 
   it('expiry is exclusive: nowMs === binding.expires_at denies, nowMs === expires_at - 1ms admits', async () => {
@@ -432,6 +653,45 @@ describe('exact-action approval contract', () => {
     )
     expect(res.ok).toBe(false)
     if (!res.ok) expect(res.error).toBe('invalid_elevation_request')
+  })
+
+  it('adversarial gate P2-a: a past-dated exact_action.expires_at is refused at request time (would burn the (request_id, action) slot for nothing)', async () => {
+    const t0 = Date.parse('2026-09-12T00:00:00.000Z')
+    vi.useFakeTimers()
+    vi.setSystemTime(t0)
+
+    await checkIn()
+    // Exactly at nowMs — verifyProtectedAction's own expiry check is
+    // exclusive (nowMs >= expires_at denies), so this could never be used
+    // even the instant it was approved.
+    const pastFields = fixtureExactAction({ expires_at: new Date(t0).toISOString() }, t0)
+    const res = await invokeTool(
+      agentAuth(),
+      env,
+      'request_elevation',
+      {
+        actions: ['action:knowledge_write'], scope_type: 'org', scope_id: '', duration_minutes: 60,
+        reason: 'x', exact_action: pastFields,
+      },
+      ORIGIN,
+    )
+    expect(res.ok).toBe(false)
+    if (!res.ok) expect(res.error).toBe('invalid_elevation_request')
+
+    // Genuinely in the past (not just at the boundary) is refused the same way.
+    const wayPastFields = fixtureExactAction({ expires_at: new Date(t0 - 60 * 60 * 1000).toISOString() }, t0)
+    const res2 = await invokeTool(
+      agentAuth(),
+      env,
+      'request_elevation',
+      {
+        actions: ['action:knowledge_write'], scope_type: 'org', scope_id: '', duration_minutes: 60,
+        reason: 'x', exact_action: wayPastFields,
+      },
+      ORIGIN,
+    )
+    expect(res2.ok).toBe(false)
+    if (!res2.ok) expect(res2.error).toBe('invalid_elevation_request')
   })
 
   it('approver == requester → forbidden, even with a bound exact action already inserted', async () => {
@@ -570,5 +830,72 @@ describe('exact-action approval contract', () => {
       expires_at: '2026-09-12T00:10:00.000Z',
     })
     expect(result.ok).toBe(false)
+  })
+
+  // ── adversarial gate P1: expires_at skipped the shared ASCII/length gate ──
+  //
+  // Before the fix, expires_at went straight to Date.parse with no
+  // isAsciiPrintable/length check of its own — the ONE field among the nine
+  // ASCII-validated ones with that gap. `Date.parse("Jan 1 2099 (café)")`
+  // parses successfully in V8 (it treats the parenthesised suffix as
+  // ignorable trailing content), so that string passed validation despite
+  // containing a non-ASCII 'é' — and JS's non-ASCII-preserving JSON.stringify
+  // vs. Python's ensure_ascii-escaping json.dumps would then compute
+  // DIFFERENT hashes for the "same" canonical action (see exact-action.ts's
+  // module header on the non-ASCII caveat). This table test iterates EVERY
+  // ASCII-validated field (not just expires_at, so a regression on any OTHER
+  // field is caught the same way) rather than special-casing one.
+  const ASCII_VALIDATED_FIELD_PATHS = [
+    'principal', 'tenant', 'target.system', 'target.id', 'target.revision',
+    'expected_revision', 'destination', 'operation', 'expires_at',
+  ] as const
+
+  function baseValidAction(): Record<string, unknown> {
+    return {
+      principal: 'agent-a',
+      tenant: 'mumega',
+      target: { system: 'wiki', id: 'page-42', revision: 'rev-7' },
+      expected_revision: 'rev-7',
+      payload_hash: 'a'.repeat(64),
+      destination: 'content/en/notes/page-42.mdx',
+      operation: 'upsert',
+      expires_at: '2026-09-12T00:10:00.000Z',
+    }
+  }
+
+  function withField(path: (typeof ASCII_VALIDATED_FIELD_PATHS)[number], value: string): Record<string, unknown> {
+    const a = baseValidAction()
+    if (path.startsWith('target.')) {
+      const key = path.slice('target.'.length)
+      a.target = { ...(a.target as Record<string, unknown>), [key]: value }
+    } else {
+      a[path] = value
+    }
+    return a
+  }
+
+  it('anti-vacuity: the base fixture used by the table tests below actually validates', () => {
+    const result = validateExactActionInput(baseValidAction())
+    expect(result.ok, JSON.stringify(result)).toBe(true)
+  })
+
+  it.each(ASCII_VALIDATED_FIELD_PATHS)('%s rejects a non-ASCII value', (path) => {
+    const result = validateExactActionInput(withField(path, 'pagé-42'))
+    expect(result.ok, `${path} should have been rejected as non-ASCII`).toBe(false)
+  })
+
+  it.each(ASCII_VALIDATED_FIELD_PATHS)('%s rejects a 5000-character value (exceeds the field length bound)', (path) => {
+    const result = validateExactActionInput(withField(path, 'a'.repeat(5000)))
+    expect(result.ok, `${path} should have been rejected as oversized`).toBe(false)
+  })
+
+  it('expires_at: "Jan 1 2099 (café)" is rejected — Date.parse alone would have accepted this', () => {
+    const CAFE_DATE = 'Jan 1 2099 (café)'
+    // Sanity: prove Date.parse really would let this through un-gated — this
+    // is the exact regression the P1 fix exists to close, not a strawman.
+    expect(Number.isNaN(Date.parse(CAFE_DATE))).toBe(false)
+
+    const result = validateExactActionInput(withField('expires_at', CAFE_DATE))
+    expect(result.ok, JSON.stringify(result)).toBe(false)
   })
 })

@@ -276,6 +276,16 @@ export async function createElevationRequest(
     if (!validated.ok) {
       return { ok: false, reason: 'invalid_elevation_request', detail: `exact_action: ${validated.reason}` }
     }
+    // Adversarial gate P2-a: a past-dated exact action burns the slot for
+    // nothing — createElevationRequest would insert a binding that
+    // verifyProtectedAction can NEVER admit (its own expiry check is
+    // exclusive: nowMs >= expires_at denies), while the UNIQUE(elevation_
+    // request_id, action) index (migrations/0153) still occupies that pair
+    // for this request. Refuse it at ask time instead of silently accepting
+    // a request nobody could ever use.
+    if (Date.parse(validated.action.expires_at) <= nowMs) {
+      return { ok: false, reason: 'invalid_elevation_request', detail: 'exact_action.expires_at must be in the future' }
+    }
     boundAction = validated.action
     boundActionHash = await exactActionHash(validated.action)
   }
@@ -493,6 +503,17 @@ export interface DecideElevationInput {
    *  round-trip — required when any selected action is in
    *  SENSITIVE_STEP_UP_ACTIONS (design Approval Flow step 5). */
   recentReauthOk: boolean
+  /** REQUIRED iff `selectedActions` includes 'action:knowledge_write': the
+   *  approving human's client must echo back the EXACT
+   *  elevation_action_bindings.action_hash it rendered on the approval
+   *  screen (migrations/0152; see src/dashboard/elevation.ts's approval
+   *  panel and src/auth/index.ts's decide route). This is what makes
+   *  "the human saw and approved THIS exact payload/target/destination" a
+   *  checked fact rather than an assumption — a client that never rendered
+   *  the binding (a stale page, a hand-crafted request) cannot supply the
+   *  right value and is refused (adversarial gate P0-2). Ignored, never
+   *  required, for every other action. */
+  boundActionHash?: string
   note?: string
 }
 
@@ -528,14 +549,39 @@ export async function resolveScopeDepartmentId(
  * decideElevationRequest — THE single-decision transaction. Security
  * Invariant 6 ("Approval is single-decision and atomic. Concurrent
  * Allow/Deny or double-Allow yields one terminal decision and one grant
- * set."): the status flip is one guarded UPDATE (`WHERE status = 'pending'`)
- * — SQLite serializes it, so at most one concurrent caller ever observes
- * `changes === 1`; every other concurrent/later caller sees 0 and returns
- * 'already_decided' WITHOUT inserting any grant. The grant-row insert is
- * one `.batch()` call, which is all-or-nothing (assertBatchWritten) — a
- * mid-batch D1 failure leaves the request 'approved' with zero grants
- * rather than a PARTIAL grant set (a detectable data-integrity gap, never a
- * silent extra authority).
+ * set.").
+ *
+ * ADVERSARIAL GATE FIX (P0-1 class): the status-flip UPDATE and every grant
+ * INSERT are now ONE `env.DB.batch()` call — i.e. ONE atomic transaction.
+ * Previously the flip was a separate, already-committed `.run()` before a
+ * SECOND, independent grant-insert batch; a hard failure on the inserts
+ * (the concrete case: migrations/0148's original elevation_grants had a
+ * table-level UNIQUE with no revoked_at/expiry qualifier, so a second
+ * knowledge_write approval for a session that had ANY prior row for the
+ * same tuple threw a raw UNIQUE-constraint error) left the request stuck at
+ * status='approved' with a decider recorded and ZERO grants — unrecoverable
+ * (decide requires status='pending') and, with no try/catch in the
+ * dashboard/API route, surfaced as a bare 500. migrations/0153 removes that
+ * broad UNIQUE; this function's own atomicity is the second, independent
+ * half of the fix — even a genuinely different hard DB error (an FK
+ * violation, a disk error) now rolls back the flip too, so the request is
+ * always found EXACTLY as it was before the call: still 'pending' and
+ * re-decidable, never a lying partial 'approved'.
+ *
+ * CONCURRENCY WITHIN THAT ONE TRANSACTION: at most one concurrent caller's
+ * flip UPDATE (`WHERE status = 'pending'`) can ever affect a row — SQLite
+ * serializes writers, so a losing caller's transaction runs strictly after
+ * the winner's commit and its own flip matches 0 rows. Each grant INSERT is
+ * additionally guarded by `WHERE EXISTS (... decision_attempt_id = <this
+ * call's own crypto.randomUUID() nonce>)` — NOT by matching decided_at/
+ * decided_by_member_id VALUES, which two concurrent calls sharing an
+ * identical nowMs/approver (a real scenario, exercised directly by
+ * tests/elevation.test.ts's "concurrent double-approve" test) could
+ * coincidentally share, letting a losing call's guard match the winner's
+ * already-committed row by coincidence and insert a duplicate grant set. A
+ * fresh per-call random nonce cannot coincide across calls, so the guard can
+ * only ever pass for the transaction that actually wrote it. See
+ * migrations/0153's header for the full reasoning.
  */
 export async function decideElevationRequest(
   env: Env,
@@ -665,15 +711,50 @@ export async function decideElevationRequest(
     return { ok: false, reason: 'reauth_required' }
   }
 
-  const flip = await env.DB.prepare(
+  // ── exact-action binding gate (adversarial gate P0-2 / P2-b) ────────────
+  // A human approving action:knowledge_write must be approving the EXACT
+  // action a request bound at ask-time (migrations/0152) — never the bare
+  // action key. Two distinct failure modes, both refused the SAME way
+  // (invalid_elevation_request), because both mean "the approval screen and
+  // this decision are not provably about the same thing":
+  //   (1) no binding row exists at all — a pre-0152 request, or one whose
+  //       binding insert never landed (should be structurally impossible
+  //       post-0152 given createElevationRequest's one-batch insert, but a
+  //       human approving action:knowledge_write with nothing to compare
+  //       against is refused rather than trusted);
+  //   (2) the approver's client did not supply the CURRENT binding's own
+  //       hash (a stale rendered page, or a hand-crafted request that never
+  //       actually looked at the binding).
+  if (selected.includes(KNOWLEDGE_WRITE_ACTION)) {
+    const boundAction = await loadElevationActionBinding(env, input.tenant, request.id, KNOWLEDGE_WRITE_ACTION)
+    if (!boundAction) {
+      return {
+        ok: false,
+        reason: 'invalid_elevation_request',
+        detail: 'no exact-action binding exists for action:knowledge_write on this request — refusing to approve a bare action key',
+      }
+    }
+    if (!input.boundActionHash || input.boundActionHash !== boundAction.action_hash) {
+      return {
+        ok: false,
+        reason: 'invalid_elevation_request',
+        detail: 'bound_action_hash is required for action:knowledge_write and must match the exact action bound to this request',
+      }
+    }
+  }
+
+  // A fresh per-call nonce — never a value derived from caller input (which
+  // two genuinely concurrent calls may share, see this function's own doc
+  // comment) — correlates the flip with ITS OWN grant inserts inside the one
+  // atomic batch below.
+  const attemptId = crypto.randomUUID()
+
+  const flipStmt = env.DB.prepare(
     `UPDATE elevation_requests
         SET status = 'approved', decided_at = ?1, decided_by_member_id = ?2,
-            decided_by_web_session_hash = ?3, decision_note = ?4
+            decided_by_web_session_hash = ?3, decision_note = ?4, decision_attempt_id = ?7
       WHERE id = ?5 AND tenant = ?6 AND status = 'pending'`,
-  )
-    .bind(nowIso, input.decidedByMemberId, input.decidedByWebSessionHash, input.note ?? null, request.id, input.tenant)
-    .run()
-  if (Number(flip.meta?.changes ?? 0) === 0) return { ok: false, reason: 'already_decided', status: 'approved' }
+  ).bind(nowIso, input.decidedByMemberId, input.decidedByWebSessionHash, input.note ?? null, request.id, input.tenant, attemptId)
 
   const expiresAt = new Date(nowMs + durationMinutes * 60 * 1000).toISOString()
   const grants: ElevationGrantRecord[] = selected.map((action) => ({
@@ -693,30 +774,39 @@ export async function decideElevationRequest(
     revoke_reason: null,
   }))
 
-  const batchResults = await env.DB.batch(
-    grants.map((g) =>
-      env.DB.prepare(
-        `INSERT INTO elevation_grants
-           (id, tenant, elevation_request_id, agent_session_id, action, scope_type, scope_id, effect,
-            approved_by_member_id, approved_by_web_session_hash, created_at, expires_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)`,
-      ).bind(
-        g.id,
-        g.tenant,
-        g.elevation_request_id,
-        g.agent_session_id,
-        g.action,
-        g.scope_type,
-        g.scope_id,
-        g.effect,
-        g.approved_by_member_id,
-        g.approved_by_web_session_hash,
-        g.created_at,
-        g.expires_at,
-      ),
+  const grantInsertStmts = grants.map((g) =>
+    env.DB.prepare(
+      `INSERT INTO elevation_grants
+         (id, tenant, elevation_request_id, agent_session_id, action, scope_type, scope_id, effect,
+          approved_by_member_id, approved_by_web_session_hash, created_at, expires_at)
+       SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
+        WHERE EXISTS (
+          SELECT 1 FROM elevation_requests WHERE id = ?3 AND tenant = ?2 AND decision_attempt_id = ?13
+        )`,
+    ).bind(
+      g.id,
+      g.tenant,
+      g.elevation_request_id,
+      g.agent_session_id,
+      g.action,
+      g.scope_type,
+      g.scope_id,
+      g.effect,
+      g.approved_by_member_id,
+      g.approved_by_web_session_hash,
+      g.created_at,
+      g.expires_at,
+      attemptId,
     ),
   )
-  assertBatchWritten(batchResults, 'elevation_grants.insert', 1)
+
+  // ONE atomic transaction: a hard failure on ANY statement here rolls back
+  // the flip too, so the request is found exactly as it was before this
+  // call — never a partial 'approved' with missing grants.
+  const batchResults = await env.DB.batch([flipStmt, ...grantInsertStmts])
+  const flipChanges = Number(batchResults[0]?.meta?.changes ?? 0)
+  if (flipChanges === 0) return { ok: false, reason: 'already_decided', status: 'approved' }
+  assertBatchWritten(batchResults.slice(1), 'elevation_grants.insert', 1)
 
   const updatedRequest = await loadElevationRequestById(env, input.tenant, request.id)
   return { ok: true, request: updatedRequest ?? { ...request, status: 'approved' }, grants }
@@ -913,6 +1003,26 @@ export interface HasElevatedActionOptions {
   recordUsage?: boolean
   toolName?: string
   detail?: unknown
+  /** When supplied, the matcher does NOT stop at the first live,
+   *  scope-matching grant for `action` (grants are ordered created_at
+   *  DESC — "most recently approved") — it considers EVERY live,
+   *  scope-matching grant for `action` held by this session and selects the
+   *  one whose OWN elevation_action_bindings row (migrations/0152, keyed by
+   *  that grant's elevation_request_id) has action_hash === this value.
+   *
+   *  Required for the exact-action approval contract
+   *  (src/auth/protected-action.ts): a session can legitimately hold TWO OR
+   *  MORE live action:knowledge_write grants at once, each bound to a
+   *  DIFFERENT exact action (migrations/0153's header explains why that
+   *  must be possible). Without this, "first live scope-matching grant"
+   *  picks whichever was approved most recently — a caller presenting an
+   *  OLDER, still-live, still-approved action would be matched against the
+   *  wrong grant's binding and wrongly denied `bound_action_mismatch`, and
+   *  a newer unrelated approval would silently shadow an older one
+   *  (adversarial gate finding, P0-1 class). Ignored by every OTHER caller
+   *  (mint_agent_token, grant_agent_capability, ...) — their behavior
+   *  (first live scope-matching grant) is byte-for-byte unchanged. */
+  matchBindingHash?: string
 }
 
 /**
@@ -978,7 +1088,7 @@ export async function hasElevatedAction(
 
   const normalizedScopeId = scopeId ?? ''
   const grants = await loadLiveElevationGrantsForSession(env, tenant, liveSession.id, nowMs)
-  const match = grants.find((g) => {
+  const candidates = grants.filter((g) => {
     if (g.action !== action) return false
     if (g.scope_type === 'org') return true
     if (g.scope_type === scopeType && g.scope_id === normalizedScopeId) return true
@@ -992,6 +1102,22 @@ export async function hasElevatedAction(
     }
     return false
   })
+
+  let match: ElevationGrantRecord | undefined
+  if (opts.matchBindingHash !== undefined) {
+    // Iterate ALL live, scope-matching candidates (not just the first) and
+    // pick the one whose OWN binding matches — see HasElevatedActionOptions'
+    // doc comment for why "most recently approved" is the wrong question here.
+    for (const candidate of candidates) {
+      const binding = await loadElevationActionBinding(env, tenant, candidate.elevation_request_id, action)
+      if (binding && binding.action_hash === opts.matchBindingHash) {
+        match = candidate
+        break
+      }
+    }
+  } else {
+    match = candidates[0]
+  }
   if (!match) return { granted: false, reason: 'no_matching_grant' }
 
   // Re-derive the APPROVER's authority live — never trust that they still

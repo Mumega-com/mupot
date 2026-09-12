@@ -114,6 +114,24 @@ const MAX_FIELD_LEN = 512
 // Deliberately excludes every non-ASCII codepoint — see module header.
 const ASCII_PRINTABLE_RE = /^[\x20-\x7E]+$/
 const PAYLOAD_HASH_RE = /^[0-9a-f]{64}$/
+// Strict RFC3339 UTC, no offset forms, 0-3 fractional digits. Deliberately
+// narrower than `isAsciiPrintable` + `Date.parse` alone (adversarial gate
+// P1 finding): `Date.parse` accepts a wide, loosely-specified grab-bag of
+// formats — including `"Jan 1 2099 (café)"`, which V8 parses as a valid
+// date (treating the parenthesised suffix as an ignorable comment) despite
+// containing a non-ASCII character. Validating expires_at through
+// `isAsciiPrintable` ALONE (as this module did before this fix) let that
+// string through: it is ASCII-printable-looking to a naive human reading
+// the source (the visible characters are all printable), but "café"
+// contains a non-ASCII 'é' — Date.parse's tolerance for trailing junk means
+// the ASCII check that runs BEFORE this line already rejects it correctly,
+// but expires_at was the ONE field in this validator that skipped straight
+// to Date.parse with no isAsciiPrintable/length gate of its own, so a
+// non-ASCII expires_at value reached hashing (where JS and Python's
+// canonical JSON would then disagree — see the module header's non-ASCII
+// caveat). Requiring this exact shape closes that gap structurally: nothing
+// matching it can contain a non-ASCII byte or a parenthesised comment.
+const EXPIRES_AT_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z$/
 
 function isAsciiPrintable(v: unknown, maxLen = MAX_FIELD_LEN): v is string {
   return typeof v === 'string' && v.length > 0 && v.length <= maxLen && ASCII_PRINTABLE_RE.test(v)
@@ -154,8 +172,13 @@ export function validateExactActionInput(raw: unknown): ValidateExactActionResul
   }
   if (!isAsciiPrintable(r.destination)) return { ok: false, reason: 'invalid destination' }
   if (!isAsciiPrintable(r.operation)) return { ok: false, reason: 'invalid operation' }
-  if (typeof r.expires_at !== 'string' || r.expires_at.length === 0 || Number.isNaN(Date.parse(r.expires_at))) {
-    return { ok: false, reason: 'expires_at must be a parseable ISO timestamp' }
+  if (
+    typeof r.expires_at !== 'string' ||
+    !isAsciiPrintable(r.expires_at) ||
+    !EXPIRES_AT_RE.test(r.expires_at) ||
+    Number.isNaN(Date.parse(r.expires_at))
+  ) {
+    return { ok: false, reason: 'expires_at must be a strict RFC3339 UTC timestamp (YYYY-MM-DDTHH:MM:SS[.sss]Z), ASCII-printable, within the field length bound' }
   }
 
   return {

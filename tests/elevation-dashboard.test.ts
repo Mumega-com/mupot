@@ -167,6 +167,33 @@ describe('elevation dashboard screens — integration through dashboardApp (real
     return result.request
   }
 
+  // Adversarial gate P0-2: a pending action:knowledge_write request with a
+  // real exact-action binding (migrations/0152), for testing that the
+  // pending-list card and the approval panel both render its detail.
+  async function seedPendingKnowledgeWriteRequest(env: Env, agentSessionId: string) {
+    const result = await createElevationRequest(env, {
+      tenant: TENANT,
+      agentSessionId,
+      agentId: AGENT_ID,
+      memberId: AGENT_MEMBER,
+      actions: ['action:knowledge_write'],
+      scopeType: 'squad',
+      scopeId: SQUAD_A,
+      durationMinutes: 60,
+      reason: 'write the approved page',
+      exactAction: {
+        target: { system: 'wiki', id: 'gate-p0-2-page', revision: 'rev-gate-1' },
+        expected_revision: 'rev-gate-1',
+        payload_hash: 'c'.repeat(64),
+        destination: 'content/en/notes/gate-p0-2-page.mdx',
+        operation: 'upsert',
+        expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+      },
+    })
+    if (!result.ok || !result.binding) throw new Error(`setup: could not create knowledge_write elevation request: ${JSON.stringify(result)}`)
+    return { request: result.request, binding: result.binding }
+  }
+
   function cookieFrom(res: Response): string {
     const setCookie = res.headers.get('set-cookie') ?? ''
     const match = /mupot_session=([^;]+)/.exec(setCookie)
@@ -239,6 +266,31 @@ describe('elevation dashboard screens — integration through dashboardApp (real
     expect(bodyText).toContain('Agent Alpha')
     expect(bodyText).toContain('Reversible after expiry')
     expect(bodyText).toContain('Review this request')
+  })
+
+  it('adversarial gate P0-2: a pending action:knowledge_write request renders the bound target and payload hash on BOTH the pending-list card and the approval panel', async () => {
+    const env = makeEnv('admin@x.test')
+    const { session } = await seedFixture(env)
+    const { request, binding } = await seedPendingKnowledgeWriteRequest(env, session.id)
+    const cookie = await devLogin(env)
+
+    const listRes = await dashboardApp.request('/elevation', { headers: { cookie: `mupot_session=${cookie}` } }, env)
+    const listHtml = await listRes.text()
+    expect(listHtml).toContain(binding.payload_hash)
+    expect(listHtml).toContain(binding.target_id)
+    expect(listHtml).toContain(binding.destination)
+    expect(listHtml).toContain(binding.action_hash)
+
+    const approvalRes = await dashboardApp.request(`/elevation/${request.id}`, { headers: { cookie: `mupot_session=${cookie}` } }, env)
+    const approvalHtml = await approvalRes.text()
+    expect(approvalHtml).toContain(binding.payload_hash)
+    expect(approvalHtml).toContain(binding.target_id)
+    expect(approvalHtml).toContain(binding.destination)
+    expect(approvalHtml).toContain(binding.action_hash)
+    // The approve form's client-side script must carry the hash forward on
+    // its POST — a page that only DISPLAYS the hash but never sends it back
+    // would still let a human approve blind.
+    expect(approvalHtml).toContain(`var boundActionHash = "${binding.action_hash}"`)
   })
 
   it('a pending request outside the operator\'s administered scope is never silently absent — it is named by scope with a remedy, not just missing', async () => {

@@ -82,10 +82,12 @@ import { hasCapability, resolveCapabilities } from '../auth/capability'
 import {
   listPendingElevationRequests,
   loadElevationRequestById,
+  loadElevationActionBinding,
   listActiveElevationGrants,
   resolveScopeDepartmentId,
   type ElevationRequestRecord,
   type ElevationGrantRecord,
+  type ElevationActionBindingRecord,
 } from '../auth/elevation'
 import {
   ELEVATION_ACTIONS,
@@ -286,6 +288,31 @@ async function splitByOperatorScope<T>(
   return { visible, outOfScope }
 }
 
+// ── exact-action binding detail (adversarial gate P0-2) ─────────────────────
+//
+// existence ≠ enforcement on the HUMAN side: an approval screen that shows
+// only the bare action key ("Write knowledge") makes the SAME promise the
+// action-registry itself makes (tests/elevation-actions-enforced.test.ts) —
+// that approving it does something specific — without showing WHAT. Render
+// every field migrations/0152 froze (target, expected revision, payload
+// hash, destination, operation, its own expiry) and the binding's own
+// action_hash, on BOTH the pending-list card and the approval panel, so a
+// human can compare "what I am about to approve" against out-of-band
+// knowledge of the actual write (e.g. hostd's own request) before clicking.
+function boundActionDetail(binding: ElevationActionBindingRecord): Html {
+  return html`
+    <div style="border:1px solid var(--border);border-radius:10px;padding:10px 12px;margin:8px 0;font-size:12.5px;">
+      <div style="color:var(--dim);margin-bottom:4px;">Exact action bound to this request (migrations/0152) — approving action:knowledge_write approves ONLY this:</div>
+      <div><strong>Target:</strong> ${binding.target_system} / ${binding.target_id} @ ${binding.target_revision}</div>
+      <div><strong>Expected revision:</strong> ${binding.expected_revision}</div>
+      <div><strong>Payload hash:</strong> <code>${binding.payload_hash}</code></div>
+      <div><strong>Destination:</strong> ${binding.destination}</div>
+      <div><strong>Operation:</strong> ${binding.operation}</div>
+      <div><strong>Action expires:</strong> ${formatWhen(binding.expires_at)}</div>
+      <div style="color:var(--dim);margin-top:4px;"><strong>Action hash:</strong> <code>${binding.action_hash}</code></div>
+    </div>`
+}
+
 // ── Screen 1: GET /elevation — pending requests ─────────────────────────────
 
 async function renderPendingRequestCard(env: Env, r: ElevationRequestRecord): Promise<Html> {
@@ -297,6 +324,9 @@ async function renderPendingRequestCard(env: Env, r: ElevationRequestRecord): Pr
   const sessionLive = session ? evaluateAgentSession(session).ok : false
   const actions: string[] = JSON.parse(r.requested_actions_json)
   const hasIrreversible = actions.some((a) => ELEVATION_ACTIONS[a]?.effect === 'irreversible')
+  const boundAction = actions.includes('action:knowledge_write')
+    ? await loadElevationActionBinding(env, env.TENANT_SLUG, r.id, 'action:knowledge_write')
+    : null
 
   return sectionPanel({
     title: `${agent?.name ?? r.agent_id} — ${formatMinutes(r.requested_duration_minutes)} requested`,
@@ -315,6 +345,7 @@ async function renderPendingRequestCard(env: Env, r: ElevationRequestRecord): Pr
           return html`<div style="margin:4px 0;">${def ? effectBadge(def.effect) : ''} <strong>${def?.label ?? a}</strong></div>`
         })}
       </div>
+      ${boundAction ? boundActionDetail(boundAction) : ''}
       <a class="btn" href="/elevation/${r.id}">Review this request</a>
     `,
   })
@@ -388,13 +419,24 @@ function actionChecklist(actions: string[]): Html {
     </fieldset>`
 }
 
-function decideScript(requestId: string): Html {
+function decideScript(requestId: string, boundActionHash: string | null): Html {
+  // Adversarial gate P0-2: the approve POST must carry the EXACT
+  // action_hash this page rendered (JSON.stringify — this value is a
+  // server-computed 64-hex sha256 or null, never free text, but stringified
+  // for safety regardless of that). decideElevationRequest refuses to
+  // approve action:knowledge_write without a matching value, so a stale
+  // page (rendered before a since-changed binding — which cannot happen
+  // today, bindings are immutable, but the check is defence in depth) or a
+  // hand-crafted request cannot silently approve a DIFFERENT exact action
+  // than the one a human actually saw here.
+  const boundActionHashJs = JSON.stringify(boundActionHash)
   return raw(`
     <script>
       (function () {
         var form = document.getElementById('decide-form');
         if (!form) return;
         var status = document.getElementById('decide-status');
+        var boundActionHash = ${boundActionHashJs};
         function setBusy(busy) {
           form.querySelectorAll('button').forEach(function (b) { b.disabled = busy; });
         }
@@ -407,6 +449,13 @@ function decideScript(requestId: string): Html {
             if (!body.actions.length) {
               status.textContent = 'Select at least one action, or use Deny.';
               return;
+            }
+            if (body.actions.indexOf('action:knowledge_write') !== -1) {
+              if (!boundActionHash) {
+                status.textContent = 'This request has no exact-action binding to approve against — cannot approve action:knowledge_write.';
+                return;
+              }
+              body.bound_action_hash = boundActionHash;
             }
           }
           var note = String(fd.get('note') || '').trim();
@@ -495,6 +544,13 @@ export async function approvalBody(env: Env, auth: AuthContext, requestId: strin
   const hasIrreversible = actions.some((a) => ELEVATION_ACTIONS[a]?.effect === 'irreversible')
   const needsStepUp = actions.some((a) => SENSITIVE_STEP_UP_ACTIONS.has(a))
   const durationOptions = ELEVATION_DURATION_PRESETS_MINUTES.filter((m) => m <= request.requested_duration_minutes)
+  // Adversarial gate P0-2: load the frozen exact-action binding (migrations/
+  // 0152) so this panel can show what approving action:knowledge_write
+  // ACTUALLY authorizes, and so its hash can be echoed back on the approve
+  // POST (decideElevationRequest refuses to approve without it).
+  const boundAction = actions.includes('action:knowledge_write')
+    ? await loadElevationActionBinding(env, env.TENANT_SLUG, request.id, 'action:knowledge_write')
+    : null
 
   let reauthOk = false
   if (auth.webSessionIdHash) {
@@ -524,6 +580,7 @@ export async function approvalBody(env: Env, auth: AuthContext, requestId: strin
       body: html`
         <p style="margin:4px 0;"><strong>Reason given:</strong> ${request.reason}</p>
         ${actionChecklist(actions)}
+        ${boundAction ? boundActionDetail(boundAction) : ''}
       `,
     })}
 
@@ -571,7 +628,7 @@ export async function approvalBody(env: Env, auth: AuthContext, requestId: strin
       </div>
       <div id="decide-status" class="status-line" style="margin-top:8px;"></div>
     </form>
-    ${decideScript(request.id)}
+    ${decideScript(request.id, boundAction?.action_hash ?? null)}
     <p><a href="/elevation">← Back to pending requests</a></p>
   `
 }

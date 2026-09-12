@@ -13,6 +13,7 @@ import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { createAgentSession } from '../src/auth/agent-sessions'
 import { createElevationRequest, loadElevationGrantById } from '../src/auth/elevation'
+import { hashWebSessionId, markRecentReauth } from '../src/auth/web-sessions'
 
 const TENANT = 'local'
 const DEPT = 'dept-1'
@@ -133,6 +134,35 @@ describe('elevation approval — integration through authApp (real D1)', () => {
     })
     if (!result.ok) throw new Error('setup: could not create elevation request')
     return result.request
+  }
+
+  // Adversarial gate P0-2: a pending action:knowledge_write request with a
+  // real exact-action binding (migrations/0152), for testing the decide
+  // route's bound_action_hash enforcement.
+  async function seedPendingKnowledgeWriteRequest(env: Env, agentSessionId: string) {
+    const result = await createElevationRequest(env, {
+      tenant: TENANT, agentSessionId, agentId: AGENT_ID, memberId: AGENT_MEMBER,
+      actions: ['action:knowledge_write'], scopeType: 'squad', scopeId: SQUAD, durationMinutes: 60,
+      reason: 'write the approved page',
+      exactAction: {
+        target: { system: 'wiki', id: 'page-1', revision: 'rev-1' },
+        expected_revision: 'rev-1',
+        payload_hash: 'a'.repeat(64),
+        destination: 'content/en/notes/page-1.mdx',
+        operation: 'upsert',
+        expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+      },
+    })
+    if (!result.ok || !result.binding) throw new Error(`setup: could not create knowledge_write elevation request: ${JSON.stringify(result)}`)
+    return { request: result.request, binding: result.binding }
+  }
+
+  /** Mark the web session behind `cookie` as recently reauthenticated —
+   *  action:knowledge_write is in SENSITIVE_STEP_UP_ACTIONS, so every decide
+   *  test for it needs this or it is refused at the (unrelated) reauth gate
+   *  before ever reaching the bound_action_hash check under test. */
+  async function markReauth(env: Env, cookie: string): Promise<void> {
+    await markRecentReauth(env, await hashWebSessionId(cookie), Date.now())
   }
 
   function cookieFrom(res: Response): string {
@@ -359,5 +389,108 @@ describe('elevation approval — integration through authApp (real D1)', () => {
 
     const grant = await loadElevationGrantById(adminEnv, TENANT, grantId)
     expect(grant?.revoked_at).toBeNull()
+  })
+
+  // ── adversarial gate P0-2: bound_action_hash enforcement through the HTTP route ──
+
+  it('approving action:knowledge_write WITHOUT bound_action_hash is refused (invalid_elevation_request)', async () => {
+    const env = makeEnv('admin@x.test')
+    const { session } = await seedFixture(env)
+    const { request } = await seedPendingKnowledgeWriteRequest(env, session.id)
+    const cookie = await devLogin(env)
+    await markReauth(env, cookie)
+
+    const res = await authApp.request(
+      `/elevation/requests/${request.id}/decide`,
+      {
+        method: 'POST',
+        headers: { cookie: `mupot_session=${cookie}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ decision: 'approve', actions: ['action:knowledge_write'] }),
+      },
+      env,
+    )
+    const body = (await res.json()) as { ok: boolean; reason?: string }
+    expect(body.ok).toBe(false)
+    expect(body.reason).toBe('invalid_elevation_request')
+    expect(res.status).toBe(409)
+  })
+
+  it('approving action:knowledge_write with the WRONG bound_action_hash is refused', async () => {
+    const env = makeEnv('admin@x.test')
+    const { session } = await seedFixture(env)
+    const { request } = await seedPendingKnowledgeWriteRequest(env, session.id)
+    const cookie = await devLogin(env)
+    await markReauth(env, cookie)
+
+    const res = await authApp.request(
+      `/elevation/requests/${request.id}/decide`,
+      {
+        method: 'POST',
+        headers: { cookie: `mupot_session=${cookie}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ decision: 'approve', actions: ['action:knowledge_write'], bound_action_hash: 'f'.repeat(64) }),
+      },
+      env,
+    )
+    const body = (await res.json()) as { ok: boolean; reason?: string }
+    expect(body.ok).toBe(false)
+    expect(body.reason).toBe('invalid_elevation_request')
+  })
+
+  it('approving action:knowledge_write with the CORRECT bound_action_hash succeeds', async () => {
+    const env = makeEnv('admin@x.test')
+    const { session } = await seedFixture(env)
+    const { request, binding } = await seedPendingKnowledgeWriteRequest(env, session.id)
+    const cookie = await devLogin(env)
+    await markReauth(env, cookie)
+
+    const res = await authApp.request(
+      `/elevation/requests/${request.id}/decide`,
+      {
+        method: 'POST',
+        headers: { cookie: `mupot_session=${cookie}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ decision: 'approve', actions: ['action:knowledge_write'], bound_action_hash: binding.action_hash }),
+      },
+      env,
+    )
+    const body = (await res.json()) as { ok: boolean; grants: Array<{ action: string }> }
+    expect(body.ok, JSON.stringify(body)).toBe(true)
+    expect(body.grants[0].action).toBe('action:knowledge_write')
+  })
+
+  it('approving action:knowledge_write with NO binding row at all (pre-0152 or side-inserted request) is refused', async () => {
+    const env = makeEnv('admin@x.test')
+    const { session } = await seedFixture(env)
+    // Bypasses createElevationRequest entirely — simulates a request row
+    // that predates migrations/0152, or whose binding insert never landed.
+    // Real JS ISO timestamps, not SQLite's datetime('now') — see
+    // reference_config elsewhere in this repo: datetime('now') produces a
+    // SPACE-separated string that sorts/parses incorrectly against the
+    // real .toISOString() values every production writer uses.
+    const nowIso = new Date().toISOString()
+    const decisionExpiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString()
+    await env.DB.prepare(
+      `INSERT INTO elevation_requests
+         (id, tenant, agent_session_id, agent_id, member_id, requested_actions_json,
+          requested_scope_type, requested_scope_id, requested_duration_minutes, reason,
+          status, created_at, decision_expires_at)
+       VALUES ('req-no-binding', ?1, ?2, ?3, ?4, ?5, 'squad', ?6, 60, 'x', 'pending', ?7, ?8)`,
+    )
+      .bind(TENANT, session.id, AGENT_ID, AGENT_MEMBER, JSON.stringify(['action:knowledge_write']), SQUAD, nowIso, decisionExpiresAt)
+      .run()
+    const cookie = await devLogin(env)
+    await markReauth(env, cookie)
+
+    const res = await authApp.request(
+      `/elevation/requests/req-no-binding/decide`,
+      {
+        method: 'POST',
+        headers: { cookie: `mupot_session=${cookie}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ decision: 'approve', actions: ['action:knowledge_write'], bound_action_hash: 'a'.repeat(64) }),
+      },
+      env,
+    )
+    const body = (await res.json()) as { ok: boolean; reason?: string }
+    expect(body.ok).toBe(false)
+    expect(body.reason).toBe('invalid_elevation_request')
   })
 })

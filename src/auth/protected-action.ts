@@ -162,15 +162,30 @@ export async function verifyProtectedAction(
     return { ok: false, reason: 'action_hash_mismatch' }
   }
 
-  // (e)
+  // (e) — matchBindingHash: a session can hold MULTIPLE live
+  // action:knowledge_write grants at once (one per concurrently-live exact
+  // action, migrations/0153's header explains why that's legitimate).
+  // "First live scope-matching grant" (this function's default matcher when
+  // matchBindingHash is omitted) would pick whichever was approved most
+  // recently, regardless of whether IT is the one bound to computedHash —
+  // adversarial gate finding, P0-1 class. Passing computedHash here makes
+  // hasElevatedAction iterate every live candidate and select the one whose
+  // OWN binding matches, so an older still-live approval is reachable even
+  // when a newer, unrelated one exists.
   const elevated = await hasElevatedAction(env, auth, 'action:knowledge_write', scopeType, scopeId, {
     nowMs,
     squadDepartmentId: opts.squadDepartmentId ?? undefined,
     recordUsage: false,
+    matchBindingHash: computedHash,
   })
   if (!elevated.granted) return { ok: false, reason: elevated.reason }
 
-  // (f)
+  // (f) — redundant with (e)'s own binding lookup by construction (the
+  // grant hasElevatedAction just returned was selected BECAUSE its binding's
+  // action_hash already equals computedHash) — kept as defence in depth
+  // rather than trusted-by-construction, so a future refactor of either
+  // function's internals cannot silently reopen the shadowing bug without a
+  // visible, testable check failing here too.
   const binding = await loadElevationActionBinding(env, auth.tenant, elevated.grant.elevation_request_id, 'action:knowledge_write')
   if (!binding) return { ok: false, reason: 'no_bound_action' }
 
