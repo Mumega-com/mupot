@@ -72,6 +72,16 @@ export interface Env {
   // without this, a non-owner tenant with an internal_adapter posthog binding would read the
   // operator's own PostHog project and emit it under its own tenant's observations.
   OWNER_TENANT_SLUG?: string
+  // Memory/brain backend. Absent or "native" = D1+Vectorize (today's default).
+  // "mirror" = real Mirror HTTP (MIRROR_URL + MIRROR_TOKEN). Hits are ops_experience.
+  // "verbs" = hosted MEMORY_VERBS v1 HTTP MCP (not Mac GBrain).
+  // Unknown values fail closed at createMemory. Mem0 is not a live backend.
+  MEMORY_BACKEND?: string
+  // Comma list of memory layers, e.g. "native,mirror". When set, Mirror is one
+  // layer beside native — not a replacement. Mirror still needs MIRROR_URL+TOKEN.
+  MEMORY_LAYERS?: string
+  MEMORY_VERBS_URL?: string
+  MEMORY_VERBS_TOKEN?: string
   BRAND: string
   // Which IdP the human web-login door uses. NAMED `IDP_PROVIDER`, NOT `OAUTH_PROVIDER` —
   // @cloudflare/workers-oauth-provider RESERVES the binding name `OAUTH_PROVIDER` and
@@ -711,7 +721,12 @@ export interface WakeContract {
 }
 
 // ── Ports (the swappable seams; CF profile implements these) ──
+export type MemoryBackendKind = 'native' | 'mirror' | 'verbs'
+export type MemoryHitClass = 'ops_experience' | 'pot_engram' | 'seat_hint'
+
 export interface MemoryPort {
+  readonly backend?: MemoryBackendKind
+  readonly layers?: MemoryBackendKind[]
   remember(agentId: string, text: string, concepts?: string[]): Promise<string> // returns engram id
   recall(agentId: string, query: string, limit?: number): Promise<MemoryHit[]>
 }
@@ -720,6 +735,8 @@ export interface MemoryHit {
   id: string
   text: string
   score: number
+  class?: MemoryHitClass
+  cite?: string
 }
 
 export interface BusPort {

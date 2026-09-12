@@ -1,98 +1,71 @@
-// memory — the CF-profile MemoryPort impl.
-// remember: write engram row (D1) + embed (Workers AI) + upsert vector (Vectorize).
-// recall:   embed query + ANN query (Vectorize, filtered to agentId) + join back to D1.
+// Memory factory — pot owner picks layers; agents keep remember/recall.
 //
-// Every engram is scoped to an agentId. recall filters the Vectorize query by
-// agentId metadata so an agent never recalls another agent's memory — isolation
-// is enforced at the vector query, not just at the join.
+//   native (default) — D1 + Vectorize (pot_engram)
+//   mirror           — real Mirror HTTP at MIRROR_URL (ops_experience)
+//   verbs            — hosted MEMORY_VERBS v1 (not Mac GBrain)
+//
+// MEMORY_BACKEND picks a single store (legacy).
+// MEMORY_LAYERS=native,mirror puts Mirror beside native.
+// Unknown names fail closed. A sole down Mirror fails closed.
+// A down extra Mirror layer does not invent hits and does not take native down.
 
-import type { Env, MemoryPort, MemoryHit } from '../types'
+import type { Env, MemoryBackendKind, MemoryPort } from '../types'
+import { createLayeredMemory } from './layers'
+import { createMirrorMemory } from './mirror'
+import { createNativeMemory } from './native'
+import { createVerbsMemory, MemoryBackendError, type FetchLike } from './verbs'
 
-// 768-dim to match the `mupot-memory` Vectorize index (see wrangler.toml / README:
-// `wrangler vectorize create mupot-memory --dimensions=768 --metric=cosine`).
-// bge-base-en-v1.5 emits 768-dim sentence embeddings.
-const EMBED_MODEL = '@cf/baai/bge-base-en-v1.5'
+export { EMBED_MODEL } from './native'
+export { createNativeMemory } from './native'
+export { createVerbsMemory, MemoryBackendError, attributedProvenance, scopedEntity } from './verbs'
+export { createMirrorMemory, mirrorCite } from './mirror'
+export { createLayeredMemory, isOpsScope } from './layers'
 
-interface EmbeddingResponse {
-  data: number[][]
+const KINDS = new Set<MemoryBackendKind>(['native', 'mirror', 'verbs'])
+
+export function resolveMemoryBackend(env: Env): MemoryBackendKind {
+  const raw = (env.MEMORY_BACKEND ?? 'native').trim().toLowerCase()
+  if (raw === '' || raw === 'native' || raw === 'vectorize' || raw === 'd1') return 'native'
+  if (!KINDS.has(raw as MemoryBackendKind)) {
+    throw new MemoryBackendError(
+      `unknown MEMORY_BACKEND=${raw} (accepted: native, mirror, verbs)`,
+      'memory_backend_unknown',
+    )
+  }
+  return raw as MemoryBackendKind
 }
 
-async function embed(env: Env, text: string): Promise<number[]> {
-  // env.AI.run is typed loosely across model families; the bge embedding model
-  // returns { data: number[][] }. Narrow via the local EmbeddingResponse shape.
-  const res = (await env.AI.run(EMBED_MODEL, { text: [text] })) as EmbeddingResponse
-  const vector = res.data?.[0]
-  if (!vector || vector.length === 0) {
-    throw new Error('memory: embedding model returned no vector')
+export function resolveMemoryLayers(env: Env): MemoryBackendKind[] {
+  const listed = (env.MEMORY_LAYERS ?? '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean)
+  if (listed.length === 0) return [resolveMemoryBackend(env)]
+
+  const layers: MemoryBackendKind[] = []
+  for (const raw of listed) {
+    const kind = raw === 'vectorize' || raw === 'd1' ? 'native' : raw
+    if (!KINDS.has(kind as MemoryBackendKind)) {
+      throw new MemoryBackendError(
+        `unknown MEMORY_LAYERS entry=${raw} (accepted: native, mirror, verbs)`,
+        'memory_layers_unknown',
+      )
+    }
+    if (!layers.includes(kind as MemoryBackendKind)) layers.push(kind as MemoryBackendKind)
   }
-  return vector
+  if (layers.length === 0) {
+    throw new MemoryBackendError('MEMORY_LAYERS is empty', 'memory_layers_empty')
+  }
+  return layers
 }
 
-export function createMemory(env: Env): MemoryPort {
-  return {
-    async remember(agentId: string, text: string, concepts?: string[]): Promise<string> {
-      const id = crypto.randomUUID()
-      const conceptsJson = concepts && concepts.length > 0 ? JSON.stringify(concepts) : null
+function buildPort(kind: MemoryBackendKind, env: Env, deps: { fetch?: FetchLike }): MemoryPort {
+  if (kind === 'mirror') return createMirrorMemory(env, deps)
+  if (kind === 'verbs') return createVerbsMemory(env, deps)
+  return createNativeMemory(env)
+}
 
-      // Persist the relational engram first (source of truth for the text/metadata).
-      await env.DB.prepare(
-        'INSERT INTO engrams (id, agent_id, text, concepts) VALUES (?, ?, ?, ?)',
-      )
-        .bind(id, agentId, text, conceptsJson)
-        .run()
-
-      // Embed and upsert the vector. Metadata carries agentId for query-time
-      // filtering and engramId for the join back to D1.
-      const values = await embed(env, text)
-      await env.VEC.upsert([
-        {
-          id,
-          values,
-          // tenant scopes the vector even on a SHARED Vectorize index (the
-          // multi-tenant-operator model) — agentId alone is not a tenant boundary.
-          metadata: { agentId, engramId: id, tenant: env.TENANT_SLUG },
-        },
-      ])
-
-      return id
-    },
-
-    async recall(agentId: string, query: string, limit = 5): Promise<MemoryHit[]> {
-      const values = await embed(env, query)
-      const result = await env.VEC.query(values, {
-        topK: limit,
-        // Scope to this agent's engrams AND this tenant — cross-agent AND
-        // cross-tenant recall are both prevented at the vector query.
-        filter: { agentId, tenant: env.TENANT_SLUG },
-        returnMetadata: 'none',
-      })
-
-      const matches = result.matches ?? []
-      if (matches.length === 0) return []
-
-      // Join back to D1 for the canonical text. Preserve Vectorize's score order.
-      const ids = matches.map((m) => m.id)
-      const placeholders = ids.map(() => '?').join(', ')
-      const rows = await env.DB.prepare(
-        `SELECT id, text FROM engrams WHERE id IN (${placeholders}) AND agent_id = ?`,
-      )
-        .bind(...ids, agentId)
-        .all<{ id: string; text: string }>()
-
-      const textById = new Map<string, string>()
-      for (const row of rows.results ?? []) {
-        textById.set(row.id, row.text)
-      }
-
-      const hits: MemoryHit[] = []
-      for (const m of matches) {
-        const text = textById.get(m.id)
-        // Skip vectors whose D1 row is missing or scoped to a different agent
-        // (defense in depth against orphaned/cross-tenant vectors).
-        if (text === undefined) continue
-        hits.push({ id: m.id, text, score: m.score })
-      }
-      return hits
-    },
-  }
+export function createMemory(env: Env, deps: { fetch?: FetchLike } = {}): MemoryPort {
+  const layers = resolveMemoryLayers(env)
+  if (layers.length === 1) return buildPort(layers[0], env, deps)
+  const ports: Partial<Record<MemoryBackendKind, MemoryPort>> = {}
+  for (const kind of layers) ports[kind] = buildPort(kind, env, deps)
+  return createLayeredMemory(ports, layers)
 }

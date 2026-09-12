@@ -64,7 +64,7 @@ import { inboxApp } from './agents/inbox-routes'
 import { coordinationApp } from './coordination/routes'
 import { addonsApp } from './addons/routes'
 import { sosApp } from './addons/sos'
-import { mirrorApp } from './addons/mirror'
+import { mirrorApp } from './addons/pot-engram-rrf'
 import { inkwellApp } from './addons/inkwell'
 import { toriversAddonApp } from './addons/torivers'
 import { projectLinkApp } from './addons/project-link/routes'
@@ -192,7 +192,8 @@ app.route('/api/inbox', inboxApp)
 // dashboard /coordination. Before the '/' catch-all.
 app.route('/api/coordination', coordinationApp)
 
-// Modular sovereign addon sub-apps (SOS bridge, Mirror RRF search, Inkwell CMS, ToRivers automations).
+// Modular sovereign addon sub-apps (SOS bridge, pot-native engram RRF, Inkwell CMS, ToRivers automations).
+// /api/mirror is the in-Worker D1 RRF sub-app, not the colony Mirror MemoryPort.
 app.route('/api/sos', sosApp)
 app.route('/api/mirror', mirrorApp)
 app.route('/api/inkwell', inkwellApp)

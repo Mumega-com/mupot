@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach } from 'vitest'
-import { mirrorApp } from '../src/addons/mirror'
+import { mirrorApp } from '../src/addons/pot-engram-rrf'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
 import type { Env } from '../src/types'

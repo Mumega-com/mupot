@@ -1,3 +1,6 @@
+// Pot-native D1 + Vectorize RRF search. HTTP paths /api/mirror stay for compatibility.
+// This is NOT the colony Mirror store. MemoryPort backend `mirror` lives in src/memory/mirror.ts.
+
 import { Hono } from 'hono'
 import type { Env } from '../types'
 import { timingSafeEqual } from '../lib/crypto'

@@ -10,7 +10,7 @@ import {
   listSubagentTokenUsage,
 } from '../src/telemetry/subagent-usage'
 import { sosApp } from '../src/addons/sos'
-import { mirrorApp } from '../src/addons/mirror'
+import { mirrorApp } from '../src/addons/pot-engram-rrf'
 import { inkwellApp } from '../src/addons/inkwell'
 
 let harness: SqliteD1Harness
@@ -243,7 +243,7 @@ describe('SOS Event Bus Bridge Sub-App (src/addons/sos.ts)', () => {
 })
 
 // ── 3. Mirror 16D RRF Memory Search Sub-App Tests ──────────────────────────
-describe('Mirror 16D RRF Memory Search Sub-App (src/addons/mirror.ts)', () => {
+describe('Pot-native 16D RRF Memory Search Sub-App (src/addons/pot-engram-rrf.ts)', () => {
   it('GET /health returns status', async () => {
     const res = await mirrorApp.request('/health', {}, env)
     expect(res.status).toBe(200)

@@ -30,6 +30,11 @@ IDP_PROVIDER = "google"           # google | telegram
 # Required for Project Routine dispatch; scheduled work has no request Host to derive safely.
 # Set this to the canonical public origin of this pot before enabling a Routine.
 # PUBLIC_ORIGIN = "https://mupot.example.com"
+# Memory layers (src/memory). Agents still call remember/recall.
+#   MEMORY_BACKEND = "native"           # default single store — D1 + Vectorize
+#   MEMORY_LAYERS = "native,mirror"     # Mirror as one layer beside native
+#   MEMORY_BACKEND = "mirror"           # Mirror only — fails closed if down
+# Mirror layer needs MIRROR_URL + MIRROR_TOKEN. Do not use Mem0 or Mac GBrain.
 FLEET_PROJECT = "sos"             # pot fleet label (legacy name; CF-native messaging, not SOS Redis — ADR #473)
 FLEET_OPS_AGENT = "kasra"         # ops agent that receives control asks via agent_messages (explicit — resolvers fail closed, no code default)
 # REALTIME_PRESENCE = "1"         # opt-in live roster WebSocket fan-out (ADR #473). Off by default.
