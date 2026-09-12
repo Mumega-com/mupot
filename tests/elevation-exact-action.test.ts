@@ -35,6 +35,7 @@ import {
 import { createWebSession, revokeWebSession } from '../src/auth/web-sessions'
 import { revokeAgentSessionByCredential } from '../src/auth/agent-sessions'
 import { canonicalExactActionJson, exactActionHash, validateExactActionInput, type ExactAction } from '../src/auth/exact-action'
+import { verifyProtectedAction } from '../src/auth/protected-action'
 
 const TENANT = 'tenant-exact-action'
 const ORIGIN = 'https://pot.test'
@@ -478,6 +479,35 @@ describe('exact-action approval contract', () => {
     )
     expect(decision.ok).toBe(false)
     if (!decision.ok) expect(decision.reason).toBe('forbidden')
+  })
+
+  it('verifyProtectedAction ignores a spoofed `principal` on its own input object — auth is the ONLY source', async () => {
+    // The MCP tool's schema has no `principal` property at all (additionalProperties:false
+    // strips it before verifyProtectedAction is ever called through invokeTool), so every
+    // OTHER test in this file cannot exercise this function's own guarantee that principal
+    // is server-derived — only a DIRECT call to verifyProtectedAction can. Calling the
+    // function directly (not a ToolSpec) is not a mcp-tool-seam violation — see that
+    // script's own scope (".run()" on an MCP tool object, not a plain exported function).
+    const t0 = Date.parse('2026-09-12T00:00:00.000Z')
+    vi.useFakeTimers()
+    vi.setSystemTime(t0)
+
+    const { fields, hash } = await setupApprovedKnowledgeWrite(t0)
+    // A caller reaching this function some way other than the MCP tool (a spoofed/extra
+    // `principal` key that TypeScript's VerifyProtectedActionInput does not even declare)
+    // must not be able to change which principal the hash is computed against.
+    const spoofedInput = {
+      exact_action_hash: hash,
+      target: fields.target,
+      expected_revision: fields.expected_revision,
+      payload_hash: fields.payload_hash,
+      destination: fields.destination,
+      operation: fields.operation,
+      expires_at: fields.expires_at,
+      principal: 'someone-else', // not a declared field — only reachable via a raw call
+    }
+    const res = await verifyProtectedAction(env, agentAuth(), spoofedInput as never)
+    expect(res.ok, JSON.stringify(res)).toBe(true)
   })
 
   it('canonical hash vector matches a Python-computed sha256 (json.dumps(obj, sort_keys=True, separators=(",",":"))).hexdigest())', async () => {
