@@ -3,6 +3,7 @@ import type { D1Database, D1PreparedStatement } from '@cloudflare/workers-types'
 import { landGovernedFlight } from '../src/flight/service'
 import { parseFlightMetaV1 } from '../src/flight/meta'
 import { canonicalJsonDigest } from '../src/lib/canonical-json'
+import { leaseAgentInbox } from '../src/agents/messages'
 import { loadProjectSituation } from '../src/projects/situation'
 import { answerRoutineRun, cancelRoutineRun, executeRoutineAction, getRoutinePendingQuestion, submitRoutineProposal } from '../src/routines/actions'
 import type { RoutinePrincipal } from '../src/routines/access'
@@ -372,7 +373,7 @@ describe('Routine proposal submission and governed actions', () => {
     const message = row(fixture, "SELECT to_agent, from_agent, from_member, kind, request_id, project_id, body FROM agent_messages")
     expect(message).toMatchObject({
       to_agent: 'agent-1', from_agent: 'mupot-routines', from_member: 'system:routines',
-      kind: 'request', request_id: 'routine-human:run-1:task-1', project_id: 'project-1',
+      kind: 'ack', request_id: 'routine-human:run-1:task-1', project_id: 'project-1',
     })
     expect(JSON.parse(String(message?.body))).toEqual({
       version: 'routine.human-wait/v1',
@@ -382,6 +383,19 @@ describe('Routine proposal submission and governed actions', () => {
       action_key: 'task-1',
       reason: 'review',
       decision: { type: 'review', task_id: 'control-task' },
+    })
+    const lease = await leaseAgentInbox(fixture.env, {
+      agent: 'agent-1', limit: 1, leaseSeconds: 60,
+    })
+    expect(lease).toMatchObject({
+      ok: true,
+      messages: [{
+        kind: 'ack',
+        request_id: 'routine-human:run-1:task-1',
+        project_id: 'project-1',
+        expects_reply: false,
+        reply_basis: 'ack_is_terminal',
+      }],
     })
     await expect(submitRoutineProposal(notifyingEnv, fixture.principal, proposal)).resolves.toMatchObject({
       ok: true, status: 'waiting', reason: 'review', duplicate: true, notification_pending: false,
@@ -407,6 +421,41 @@ describe('Routine proposal submission and governed actions', () => {
       expect.objectContaining({ ok: true, status: 'waiting', reason: 'review', duplicate: true }),
     ]))
     expect(row(fixture, "SELECT COUNT(*) AS count FROM routine_run_events WHERE kind = 'approval_requested'")).toEqual({ count: 1 })
+  })
+
+  it('preserves a legacy request-kind human-wait envelope during reconciliation', async () => {
+    fixture = await makeReadyRoutineFixture('propose')
+    fixture.harness.sqlite.prepare(`
+      INSERT INTO agent_messages (
+        id, tenant, to_agent, from_agent, from_member, kind, body,
+        request_id, created_at, project_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      'legacy-human-wait', 'tenant-a', 'agent-1', 'mupot-routines', 'system:routines',
+      'request', JSON.stringify({
+        version: 'routine.human-wait/v1', type: 'routine_human_wait',
+        project_id: 'project-1', run_id: 'run-1', action_key: 'task-1', reason: 'review',
+        decision: { type: 'review', task_id: 'control-task' },
+      }),
+      'routine-human:run-1:task-1', '2026-09-12T00:00:00.000Z', 'project-1',
+    )
+    const proposal = fixture.proposal({
+      key: 'task-1', kind: 'create_task', input: { title: 'Task', description: 'Description' },
+    })
+
+    await expect(submitRoutineProposal(fixture.env, fixture.principal, proposal)).resolves.toMatchObject({
+      ok: true, status: 'waiting', reason: 'review', duplicate: false, notification_pending: true,
+    })
+    expect(row(fixture, `
+      SELECT id, kind, request_id FROM agent_messages
+      WHERE from_agent = 'mupot-routines' AND request_id = 'routine-human:run-1:task-1'
+    `)).toEqual({
+      id: 'legacy-human-wait', kind: 'request', request_id: 'routine-human:run-1:task-1',
+    })
+    expect(row(fixture, `
+      SELECT COUNT(*) AS count FROM agent_messages
+      WHERE from_agent = 'mupot-routines' AND request_id = 'routine-human:run-1:task-1'
+    `)).toEqual({ count: 1 })
   })
 
   it('fences notification when the assignee loses Project membership after the wait commits', async () => {

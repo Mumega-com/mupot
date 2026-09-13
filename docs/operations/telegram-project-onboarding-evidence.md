@@ -354,3 +354,77 @@ source/test files, indexed 206 changed nodes and 3,404 edges, and reported risk 
 no detected execution flows and could not associate the private serializer helpers with the
 integration-style regression, so the direct focused and expanded test evidence remains the
 verification authority.
+
+## Hostile repair Task 6: terminal human-wait delivery
+
+This local repair started from exact head
+`2bcfd7e6af6bf277b06bd9bf24ee4f7fa6e632ed`. It changes only new Routine human-wait
+notifications from `kind = 'request'` to `kind = 'ack'`; their sender identities, stable
+`routine-human:` request ID, project attribution, and `routine.human-wait/v1` body are
+unchanged. Ordinary `routine.run/v1` execution dispatch remains a request.
+
+### Red/green seam evidence
+
+The test was changed first to lease the real stored human-wait message through
+`leaseAgentInbox`. Before the source change, this command exited 1 because the persisted kind
+was `request` instead of `ack`:
+
+```text
+npx vitest run tests/routine-actions.test.ts
+  -t 'routes propose mode through the existing Task review gate' --reporter=verbose
+```
+
+After the one-line source change, the exact local seam gate exited 0 with 2/2 files and 3/3
+selected tests passing:
+
+```text
+npx vitest run tests/routine-actions.test.ts tests/routine-dispatch.test.ts
+  -t 'routes propose mode through the existing Task review gate|preserves a legacy request-kind human-wait envelope during reconciliation|attributes Task, Flight, references, digest, and inbox envelope to the exact Project'
+  --reporter=verbose
+```
+
+The leased human-wait envelope reported `kind: ack`, `expects_reply: false`, and
+`reply_basis: ack_is_terminal`. Its identical proposal replay retained one durable message.
+The real ordinary Routine dispatch lease reported `kind: request`, `expects_reply: true`, and
+`reply_basis: request_id_field`.
+
+Historical human-wait rows are not migrated or rewritten. The reconciliation regression
+pre-seeded a request-kind `routine-human:` row, replayed the proposal, and observed the same
+row and kind with a one-row count. Because the new ACK envelope differs from that historical
+envelope, notification remains pending and the operator must reconcile the persisted legacy
+record rather than manufacture a replacement.
+
+### Fresh local verification
+
+Focused full-file verification:
+
+```text
+npx vitest run tests/routine-actions.test.ts tests/routine-dispatch.test.ts --reporter=dot
+```
+
+Result: exit 0, 2/2 files and 65/65 tests passed.
+
+Adjacent lease, reply-expectation, integrity, and migration-chain onboarding verification:
+
+```text
+npx vitest run tests/reply-expectation.test.ts tests/agent-inbox-lease-sqlite.test.ts
+  tests/message-integrity-persistence.test.ts tests/telegram-project-onboarding.test.ts
+  --reporter=dot
+```
+
+Result: exit 0, 4/4 files and 81/81 tests passed.
+
+The following commands also exited 0:
+
+```text
+npm run typecheck
+node scripts/check-schema-chain-fresh.mjs
+git diff --check
+node scripts/no-secrets.mjs
+```
+
+TypeScript ran `tsc --noEmit`; the schema guard reported the generated chain fresh; the
+secret scan reported `no secrets found`. The build-info pre-step named exact base
+`2bcfd7e6af6bf277b06bd9bf24ee4f7fa6e632ed` with `clean: false`, accurately describing the
+uncommitted local repair at verification time. This is local evidence only: no push, PR
+mutation, merge, deployment, production state change, or live Telegram pilot is claimed.

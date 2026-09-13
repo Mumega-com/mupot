@@ -249,8 +249,15 @@ decision update, or claim the verdict completed. This onboarding slice does not 
 inherited gap.
 
 A Routine entering a human wait first commits its waiting/Needs You state, then attempts one
-project-attributed message to the run's assigned agent. Inspect the message by its
-stable request ID:
+project-attributed terminal acknowledgement (`kind = 'ack'`) to the run's assigned agent.
+The `routine.human-wait/v1` body tells the Hermes-side notifier what human action to surface;
+it does not ask the assigned agent to send another Mupot acknowledgement. The stable
+`request_id` remains the sender-scoped idempotency key. Through `inbox_lease`, this envelope
+must therefore read as `expects_reply: false` with `reply_basis: ack_is_terminal`. Ordinary
+`routine.run/v1` execution dispatch remains `kind = 'request'` and must read as
+`expects_reply: true` with `reply_basis: request_id_field`.
+
+Inspect the human-wait message by its stable request ID:
 
 ```sql
 SELECT id, to_agent, project_id, kind, request_id, created_at
@@ -264,6 +271,24 @@ is durable but notification was not proven. Correct recipient liveness/project a
 replay the same Routine proposal/action. The duplicate path retries with the same request ID;
 sender-scoped idempotency permits one durable message and no duplicate push event. Do not
 send an ad hoc replacement with a new request ID.
+
+Historical human-wait rows written as `kind = 'request'` are audit records and are not
+rewritten or backfilled. Replaying the same stable request ID against such a row conflicts
+with the new ACK envelope and reports notification pending while leaving the historical row
+unchanged. Reconcile it by exact message ID/request ID and persisted kind; suppress any
+automated acknowledgement loop at the consumer, and record the legacy envelope as the reason
+delivery could not be re-proven. Do not update the row in place or mint a replacement ID.
+
+Before release, run the exact local seam gate:
+
+```text
+npx vitest run tests/routine-actions.test.ts tests/routine-dispatch.test.ts \
+  -t 'routes propose mode through the existing Task review gate|preserves a legacy request-kind human-wait envelope during reconciliation|attributes Task, Flight, references, digest, and inbox envelope to the exact Project' \
+  --reporter=verbose
+```
+
+Require all three tests to pass. This local gate proves envelope interpretation and replay
+behavior only; it is not PR CI, deployment proof, or a live Telegram pilot receipt.
 
 ## Suspension, revocation, and exceptional updates
 

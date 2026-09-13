@@ -383,7 +383,7 @@ async function notifyHumanWait(
       fromAgent: ROUTINE_ACTOR,
       fromMember: ROUTINE_MEMBER,
       toAgent: run.assigned_agent_id,
-      kind: 'request',
+      kind: 'ack',
       requestId: await humanWaitRequestId(run.id, action.action_key),
       projectId: run.project_id,
       body: humanWaitBody(run, action, reason, decision),
