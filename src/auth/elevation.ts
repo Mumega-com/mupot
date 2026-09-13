@@ -45,12 +45,21 @@ import {
   isValidElevationDuration,
 } from './elevation-actions'
 import { assertBatchWritten } from '../lib/receipt'
+import { type ExactAction, exactActionHash, validateExactActionInput } from './exact-action'
+
+/** The one action requiring an exact-action binding (migrations/0152). Kept
+ *  as a single literal constant here (not re-exported for use as a
+ *  hasElevatedAction call argument elsewhere — see
+ *  tests/elevation-actions-enforced.test.ts's requirement that every
+ *  hasElevatedAction call site name its action as a STRING LITERAL, never a
+ *  constant reference). */
+const KNOWLEDGE_WRITE_ACTION = 'action:knowledge_write'
 
 export const REQUEST_DECISION_WINDOW_MS = 10 * 60 * 1000 // 10 minutes — design v1 "user code" window
 
 function isMissingTableError(err: unknown): boolean {
   const message = err instanceof Error ? err.message : String(err)
-  return /no such table:\s*(elevation_requests|elevation_grants|elevation_usage_log)\b/i.test(message)
+  return /no such table:\s*(elevation_requests|elevation_grants|elevation_usage_log|elevation_action_bindings)\b/i.test(message)
 }
 
 // ── shapes ───────────────────────────────────────────────────────────────
@@ -101,7 +110,72 @@ const REQUEST_COLUMNS = `id, tenant, agent_session_id, agent_id, member_id, requ
 const GRANT_COLUMNS = `id, tenant, elevation_request_id, agent_session_id, action, scope_type, scope_id,
   effect, approved_by_member_id, approved_by_web_session_hash, created_at, expires_at, revoked_at, revoke_reason`
 
+/**
+ * ElevationActionBindingRecord — one row of migrations/0152's
+ * elevation_action_bindings: the immutable, byte-exact action a human
+ * approved alongside an elevation_requests row for 'action:knowledge_write'.
+ * See that migration's header for the full design rationale. Never updated
+ * after insert — no function in this module issues an UPDATE against this
+ * table.
+ */
+export interface ElevationActionBindingRecord {
+  id: string
+  tenant: string
+  elevation_request_id: string
+  action: string
+  principal: string
+  target_system: string
+  target_id: string
+  target_revision: string
+  expected_revision: string
+  payload_hash: string
+  destination: string
+  operation: string
+  expires_at: string
+  action_hash: string
+  created_at: string
+}
+
+const BINDING_COLUMNS = `id, tenant, elevation_request_id, action, principal, target_system, target_id, target_revision,
+  expected_revision, payload_hash, destination, operation, expires_at, action_hash, created_at`
+
+/** loadElevationActionBinding — the exact-action binding for one
+ *  (request, action) pair, or null. Self-guarding like every other reader in
+ *  this module: a not-yet-migrated tenant reads as "no binding", never a 500. */
+export async function loadElevationActionBinding(
+  env: Env,
+  tenant: string,
+  requestId: string,
+  action: string,
+): Promise<ElevationActionBindingRecord | null> {
+  try {
+    const row = await env.DB.prepare(
+      `SELECT ${BINDING_COLUMNS} FROM elevation_action_bindings
+        WHERE tenant = ?1 AND elevation_request_id = ?2 AND action = ?3 LIMIT 1`,
+    )
+      .bind(tenant, requestId, action)
+      .first<ElevationActionBindingRecord>()
+    return row ?? null
+  } catch (err) {
+    if (isMissingTableError(err)) return null
+    throw err
+  }
+}
+
 // ── create request (agent-initiated) ────────────────────────────────────────
+
+/** The exact-action fields a REQUESTER (hostd, via request_elevation) may
+ *  supply — deliberately missing `principal`/`tenant`: both are ALWAYS
+ *  server-derived from the authenticated caller, never accepted from an
+ *  argument. See ExactAction's own doc comment (src/auth/exact-action.ts). */
+export interface ExactActionRequestFields {
+  target: { system: string; id: string; revision: string }
+  expected_revision: string
+  payload_hash: string
+  destination: string
+  operation: string
+  expires_at: string
+}
 
 export interface CreateElevationRequestInput {
   tenant: string
@@ -113,10 +187,13 @@ export interface CreateElevationRequestInput {
   scopeId: string
   durationMinutes: number
   reason: string
+  /** REQUIRED iff `actions` includes 'action:knowledge_write'; refused as
+   *  invalid if present for any other action set. See createElevationRequest. */
+  exactAction?: ExactActionRequestFields
 }
 
 export type CreateElevationRequestResult =
-  | { ok: true; request: ElevationRequestRecord }
+  | { ok: true; request: ElevationRequestRecord; binding: ElevationActionBindingRecord | null }
   | { ok: false; reason: 'invalid_elevation_request'; detail: string }
 
 /**
@@ -126,6 +203,19 @@ export type CreateElevationRequestResult =
  * — this function does not re-derive identity, it only validates and
  * persists the ask. `actions` must be a non-empty set of KNOWN 'action:*'
  * keys (see elevation-actions.ts) — never 'admin', never free text.
+ *
+ * EXACT-ACTION BINDING (migrations/0152): a request naming
+ * 'action:knowledge_write' MUST carry `exactAction` — a reason-only body for
+ * that action is refused as invalid_elevation_request, never silently
+ * accepted as "the human will approve anything named knowledge_write" (the
+ * defect this whole contract exists to close). Conversely, `exactAction` on
+ * any OTHER action set is also refused — it would be dead data nothing ever
+ * checks. When present, `exactAction` is validated and hashed SERVER-SIDE
+ * (principal = input.agentId, tenant = input.tenant — never read from the
+ * exactAction argument itself) and the elevation_requests INSERT plus the
+ * elevation_action_bindings INSERT happen in ONE env.DB.batch() — a request
+ * for action:knowledge_write can never exist without its exact-action
+ * binding landing atomically alongside it.
  */
 export async function createElevationRequest(
   env: Env,
@@ -162,33 +252,117 @@ export async function createElevationRequest(
     return { ok: false, reason: 'invalid_elevation_request', detail: 'reason required' }
   }
 
+  const wantsKnowledgeWrite = uniqueActions.includes(KNOWLEDGE_WRITE_ACTION)
+  if (wantsKnowledgeWrite && !input.exactAction) {
+    return { ok: false, reason: 'invalid_elevation_request', detail: 'exact_action required for action:knowledge_write' }
+  }
+  if (!wantsKnowledgeWrite && input.exactAction) {
+    return { ok: false, reason: 'invalid_elevation_request', detail: 'exact_action is only valid alongside action:knowledge_write' }
+  }
+
+  let boundAction: ExactAction | null = null
+  let boundActionHash: string | null = null
+  if (input.exactAction) {
+    const validated = validateExactActionInput({
+      principal: input.agentId,
+      tenant: input.tenant,
+      target: input.exactAction.target,
+      expected_revision: input.exactAction.expected_revision,
+      payload_hash: input.exactAction.payload_hash,
+      destination: input.exactAction.destination,
+      operation: input.exactAction.operation,
+      expires_at: input.exactAction.expires_at,
+    })
+    if (!validated.ok) {
+      return { ok: false, reason: 'invalid_elevation_request', detail: `exact_action: ${validated.reason}` }
+    }
+    // Adversarial gate P2-a: a past-dated exact action burns the slot for
+    // nothing — createElevationRequest would insert a binding that
+    // verifyProtectedAction can NEVER admit (its own expiry check is
+    // exclusive: nowMs >= expires_at denies), while the UNIQUE(elevation_
+    // request_id, action) index (migrations/0153) still occupies that pair
+    // for this request. Refuse it at ask time instead of silently accepting
+    // a request nobody could ever use.
+    if (Date.parse(validated.action.expires_at) <= nowMs) {
+      return { ok: false, reason: 'invalid_elevation_request', detail: 'exact_action.expires_at must be in the future' }
+    }
+    boundAction = validated.action
+    boundActionHash = await exactActionHash(validated.action)
+  }
+
   const id = crypto.randomUUID()
   const nowIso = new Date(nowMs).toISOString()
   const decisionExpiresAt = new Date(nowMs + REQUEST_DECISION_WINDOW_MS).toISOString()
   const scopeId = input.scopeId ?? ''
 
-  await env.DB.prepare(
+  const requestStmt = env.DB.prepare(
     `INSERT INTO elevation_requests
        (id, tenant, agent_session_id, agent_id, member_id, requested_actions_json,
         requested_scope_type, requested_scope_id, requested_duration_minutes, reason,
         status, created_at, decision_expires_at)
      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?12)`,
+  ).bind(
+    id,
+    input.tenant,
+    input.agentSessionId,
+    input.agentId,
+    input.memberId,
+    JSON.stringify(uniqueActions),
+    input.scopeType,
+    scopeId,
+    input.durationMinutes,
+    input.reason.trim(),
+    nowIso,
+    decisionExpiresAt,
   )
-    .bind(
-      id,
-      input.tenant,
-      input.agentSessionId,
-      input.agentId,
-      input.memberId,
-      JSON.stringify(uniqueActions),
-      input.scopeType,
-      scopeId,
-      input.durationMinutes,
-      input.reason.trim(),
-      nowIso,
-      decisionExpiresAt,
+
+  let binding: ElevationActionBindingRecord | null = null
+  if (boundAction && boundActionHash) {
+    const bindingId = crypto.randomUUID()
+    binding = {
+      id: bindingId,
+      tenant: input.tenant,
+      elevation_request_id: id,
+      action: KNOWLEDGE_WRITE_ACTION,
+      principal: input.agentId,
+      target_system: boundAction.target.system,
+      target_id: boundAction.target.id,
+      target_revision: boundAction.target.revision,
+      expected_revision: boundAction.expected_revision,
+      payload_hash: boundAction.payload_hash,
+      destination: boundAction.destination,
+      operation: boundAction.operation,
+      expires_at: boundAction.expires_at,
+      action_hash: boundActionHash,
+      created_at: nowIso,
+    }
+    const bindingStmt = env.DB.prepare(
+      `INSERT INTO elevation_action_bindings
+         (id, tenant, elevation_request_id, action, principal, target_system, target_id, target_revision,
+          expected_revision, payload_hash, destination, operation, expires_at, action_hash, created_at)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)`,
+    ).bind(
+      binding.id,
+      binding.tenant,
+      binding.elevation_request_id,
+      binding.action,
+      binding.principal,
+      binding.target_system,
+      binding.target_id,
+      binding.target_revision,
+      binding.expected_revision,
+      binding.payload_hash,
+      binding.destination,
+      binding.operation,
+      binding.expires_at,
+      binding.action_hash,
+      binding.created_at,
     )
-    .run()
+    const batchResults = await env.DB.batch([requestStmt, bindingStmt])
+    assertBatchWritten(batchResults, 'elevation_requests+elevation_action_bindings.insert', 1)
+  } else {
+    await requestStmt.run()
+  }
 
   return {
     ok: true,
@@ -211,6 +385,7 @@ export async function createElevationRequest(
       decided_by_web_session_hash: null,
       decision_note: null,
     },
+    binding,
   }
 }
 
@@ -328,6 +503,17 @@ export interface DecideElevationInput {
    *  round-trip — required when any selected action is in
    *  SENSITIVE_STEP_UP_ACTIONS (design Approval Flow step 5). */
   recentReauthOk: boolean
+  /** REQUIRED iff `selectedActions` includes 'action:knowledge_write': the
+   *  approving human's client must echo back the EXACT
+   *  elevation_action_bindings.action_hash it rendered on the approval
+   *  screen (migrations/0152; see src/dashboard/elevation.ts's approval
+   *  panel and src/auth/index.ts's decide route). This is what makes
+   *  "the human saw and approved THIS exact payload/target/destination" a
+   *  checked fact rather than an assumption — a client that never rendered
+   *  the binding (a stale page, a hand-crafted request) cannot supply the
+   *  right value and is refused (adversarial gate P0-2). Ignored, never
+   *  required, for every other action. */
+  boundActionHash?: string
   note?: string
 }
 
@@ -363,14 +549,39 @@ export async function resolveScopeDepartmentId(
  * decideElevationRequest — THE single-decision transaction. Security
  * Invariant 6 ("Approval is single-decision and atomic. Concurrent
  * Allow/Deny or double-Allow yields one terminal decision and one grant
- * set."): the status flip is one guarded UPDATE (`WHERE status = 'pending'`)
- * — SQLite serializes it, so at most one concurrent caller ever observes
- * `changes === 1`; every other concurrent/later caller sees 0 and returns
- * 'already_decided' WITHOUT inserting any grant. The grant-row insert is
- * one `.batch()` call, which is all-or-nothing (assertBatchWritten) — a
- * mid-batch D1 failure leaves the request 'approved' with zero grants
- * rather than a PARTIAL grant set (a detectable data-integrity gap, never a
- * silent extra authority).
+ * set.").
+ *
+ * ADVERSARIAL GATE FIX (P0-1 class): the status-flip UPDATE and every grant
+ * INSERT are now ONE `env.DB.batch()` call — i.e. ONE atomic transaction.
+ * Previously the flip was a separate, already-committed `.run()` before a
+ * SECOND, independent grant-insert batch; a hard failure on the inserts
+ * (the concrete case: migrations/0148's original elevation_grants had a
+ * table-level UNIQUE with no revoked_at/expiry qualifier, so a second
+ * knowledge_write approval for a session that had ANY prior row for the
+ * same tuple threw a raw UNIQUE-constraint error) left the request stuck at
+ * status='approved' with a decider recorded and ZERO grants — unrecoverable
+ * (decide requires status='pending') and, with no try/catch in the
+ * dashboard/API route, surfaced as a bare 500. migrations/0153 removes that
+ * broad UNIQUE; this function's own atomicity is the second, independent
+ * half of the fix — even a genuinely different hard DB error (an FK
+ * violation, a disk error) now rolls back the flip too, so the request is
+ * always found EXACTLY as it was before the call: still 'pending' and
+ * re-decidable, never a lying partial 'approved'.
+ *
+ * CONCURRENCY WITHIN THAT ONE TRANSACTION: at most one concurrent caller's
+ * flip UPDATE (`WHERE status = 'pending'`) can ever affect a row — SQLite
+ * serializes writers, so a losing caller's transaction runs strictly after
+ * the winner's commit and its own flip matches 0 rows. Each grant INSERT is
+ * additionally guarded by `WHERE EXISTS (... decision_attempt_id = <this
+ * call's own crypto.randomUUID() nonce>)` — NOT by matching decided_at/
+ * decided_by_member_id VALUES, which two concurrent calls sharing an
+ * identical nowMs/approver (a real scenario, exercised directly by
+ * tests/elevation.test.ts's "concurrent double-approve" test) could
+ * coincidentally share, letting a losing call's guard match the winner's
+ * already-committed row by coincidence and insert a duplicate grant set. A
+ * fresh per-call random nonce cannot coincide across calls, so the guard can
+ * only ever pass for the transaction that actually wrote it. See
+ * migrations/0153's header for the full reasoning.
  */
 export async function decideElevationRequest(
   env: Env,
@@ -500,15 +711,50 @@ export async function decideElevationRequest(
     return { ok: false, reason: 'reauth_required' }
   }
 
-  const flip = await env.DB.prepare(
+  // ── exact-action binding gate (adversarial gate P0-2 / P2-b) ────────────
+  // A human approving action:knowledge_write must be approving the EXACT
+  // action a request bound at ask-time (migrations/0152) — never the bare
+  // action key. Two distinct failure modes, both refused the SAME way
+  // (invalid_elevation_request), because both mean "the approval screen and
+  // this decision are not provably about the same thing":
+  //   (1) no binding row exists at all — a pre-0152 request, or one whose
+  //       binding insert never landed (should be structurally impossible
+  //       post-0152 given createElevationRequest's one-batch insert, but a
+  //       human approving action:knowledge_write with nothing to compare
+  //       against is refused rather than trusted);
+  //   (2) the approver's client did not supply the CURRENT binding's own
+  //       hash (a stale rendered page, or a hand-crafted request that never
+  //       actually looked at the binding).
+  if (selected.includes(KNOWLEDGE_WRITE_ACTION)) {
+    const boundAction = await loadElevationActionBinding(env, input.tenant, request.id, KNOWLEDGE_WRITE_ACTION)
+    if (!boundAction) {
+      return {
+        ok: false,
+        reason: 'invalid_elevation_request',
+        detail: 'no exact-action binding exists for action:knowledge_write on this request — refusing to approve a bare action key',
+      }
+    }
+    if (!input.boundActionHash || input.boundActionHash !== boundAction.action_hash) {
+      return {
+        ok: false,
+        reason: 'invalid_elevation_request',
+        detail: 'bound_action_hash is required for action:knowledge_write and must match the exact action bound to this request',
+      }
+    }
+  }
+
+  // A fresh per-call nonce — never a value derived from caller input (which
+  // two genuinely concurrent calls may share, see this function's own doc
+  // comment) — correlates the flip with ITS OWN grant inserts inside the one
+  // atomic batch below.
+  const attemptId = crypto.randomUUID()
+
+  const flipStmt = env.DB.prepare(
     `UPDATE elevation_requests
         SET status = 'approved', decided_at = ?1, decided_by_member_id = ?2,
-            decided_by_web_session_hash = ?3, decision_note = ?4
+            decided_by_web_session_hash = ?3, decision_note = ?4, decision_attempt_id = ?7
       WHERE id = ?5 AND tenant = ?6 AND status = 'pending'`,
-  )
-    .bind(nowIso, input.decidedByMemberId, input.decidedByWebSessionHash, input.note ?? null, request.id, input.tenant)
-    .run()
-  if (Number(flip.meta?.changes ?? 0) === 0) return { ok: false, reason: 'already_decided', status: 'approved' }
+  ).bind(nowIso, input.decidedByMemberId, input.decidedByWebSessionHash, input.note ?? null, request.id, input.tenant, attemptId)
 
   const expiresAt = new Date(nowMs + durationMinutes * 60 * 1000).toISOString()
   const grants: ElevationGrantRecord[] = selected.map((action) => ({
@@ -528,30 +774,39 @@ export async function decideElevationRequest(
     revoke_reason: null,
   }))
 
-  const batchResults = await env.DB.batch(
-    grants.map((g) =>
-      env.DB.prepare(
-        `INSERT INTO elevation_grants
-           (id, tenant, elevation_request_id, agent_session_id, action, scope_type, scope_id, effect,
-            approved_by_member_id, approved_by_web_session_hash, created_at, expires_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)`,
-      ).bind(
-        g.id,
-        g.tenant,
-        g.elevation_request_id,
-        g.agent_session_id,
-        g.action,
-        g.scope_type,
-        g.scope_id,
-        g.effect,
-        g.approved_by_member_id,
-        g.approved_by_web_session_hash,
-        g.created_at,
-        g.expires_at,
-      ),
+  const grantInsertStmts = grants.map((g) =>
+    env.DB.prepare(
+      `INSERT INTO elevation_grants
+         (id, tenant, elevation_request_id, agent_session_id, action, scope_type, scope_id, effect,
+          approved_by_member_id, approved_by_web_session_hash, created_at, expires_at)
+       SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
+        WHERE EXISTS (
+          SELECT 1 FROM elevation_requests WHERE id = ?3 AND tenant = ?2 AND decision_attempt_id = ?13
+        )`,
+    ).bind(
+      g.id,
+      g.tenant,
+      g.elevation_request_id,
+      g.agent_session_id,
+      g.action,
+      g.scope_type,
+      g.scope_id,
+      g.effect,
+      g.approved_by_member_id,
+      g.approved_by_web_session_hash,
+      g.created_at,
+      g.expires_at,
+      attemptId,
     ),
   )
-  assertBatchWritten(batchResults, 'elevation_grants.insert', 1)
+
+  // ONE atomic transaction: a hard failure on ANY statement here rolls back
+  // the flip too, so the request is found exactly as it was before this
+  // call — never a partial 'approved' with missing grants.
+  const batchResults = await env.DB.batch([flipStmt, ...grantInsertStmts])
+  const flipChanges = Number(batchResults[0]?.meta?.changes ?? 0)
+  if (flipChanges === 0) return { ok: false, reason: 'already_decided', status: 'approved' }
+  assertBatchWritten(batchResults.slice(1), 'elevation_grants.insert', 1)
 
   const updatedRequest = await loadElevationRequestById(env, input.tenant, request.id)
   return { ok: true, request: updatedRequest ?? { ...request, status: 'approved' }, grants }
@@ -748,6 +1003,26 @@ export interface HasElevatedActionOptions {
   recordUsage?: boolean
   toolName?: string
   detail?: unknown
+  /** When supplied, the matcher does NOT stop at the first live,
+   *  scope-matching grant for `action` (grants are ordered created_at
+   *  DESC — "most recently approved") — it considers EVERY live,
+   *  scope-matching grant for `action` held by this session and selects the
+   *  one whose OWN elevation_action_bindings row (migrations/0152, keyed by
+   *  that grant's elevation_request_id) has action_hash === this value.
+   *
+   *  Required for the exact-action approval contract
+   *  (src/auth/protected-action.ts): a session can legitimately hold TWO OR
+   *  MORE live action:knowledge_write grants at once, each bound to a
+   *  DIFFERENT exact action (migrations/0153's header explains why that
+   *  must be possible). Without this, "first live scope-matching grant"
+   *  picks whichever was approved most recently — a caller presenting an
+   *  OLDER, still-live, still-approved action would be matched against the
+   *  wrong grant's binding and wrongly denied `bound_action_mismatch`, and
+   *  a newer unrelated approval would silently shadow an older one
+   *  (adversarial gate finding, P0-1 class). Ignored by every OTHER caller
+   *  (mint_agent_token, grant_agent_capability, ...) — their behavior
+   *  (first live scope-matching grant) is byte-for-byte unchanged. */
+  matchBindingHash?: string
 }
 
 /**
@@ -813,7 +1088,7 @@ export async function hasElevatedAction(
 
   const normalizedScopeId = scopeId ?? ''
   const grants = await loadLiveElevationGrantsForSession(env, tenant, liveSession.id, nowMs)
-  const match = grants.find((g) => {
+  const candidates = grants.filter((g) => {
     if (g.action !== action) return false
     if (g.scope_type === 'org') return true
     if (g.scope_type === scopeType && g.scope_id === normalizedScopeId) return true
@@ -827,6 +1102,22 @@ export async function hasElevatedAction(
     }
     return false
   })
+
+  let match: ElevationGrantRecord | undefined
+  if (opts.matchBindingHash !== undefined) {
+    // Iterate ALL live, scope-matching candidates (not just the first) and
+    // pick the one whose OWN binding matches — see HasElevatedActionOptions'
+    // doc comment for why "most recently approved" is the wrong question here.
+    for (const candidate of candidates) {
+      const binding = await loadElevationActionBinding(env, tenant, candidate.elevation_request_id, action)
+      if (binding && binding.action_hash === opts.matchBindingHash) {
+        match = candidate
+        break
+      }
+    }
+  } else {
+    match = candidates[0]
+  }
   if (!match) return { granted: false, reason: 'no_matching_grant' }
 
   // Re-derive the APPROVER's authority live — never trust that they still

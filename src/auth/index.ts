@@ -47,6 +47,7 @@ import {
   listActiveElevationGrants,
   listElevationUsage,
   listPendingElevationRequests,
+  loadElevationActionBinding,
   loadElevationGrantById,
   revokeElevationGrant,
 } from './elevation'
@@ -953,11 +954,34 @@ authApp.get('/elevation/requests', requireAuthMw(), async (c) => {
   for (const r of all) {
     const deptId = await resolveSquadDepartmentId(c.env, r.requested_scope_type, r.requested_scope_id)
     if (!scopeAuthorityOk(auth, capabilities, r.requested_scope_type as CapabilityScopeType, r.requested_scope_id, deptId)) continue
+    const actionKeys: string[] = JSON.parse(r.requested_actions_json)
+    // Adversarial gate P0-2: an approval surface that does not show what is
+    // being approved is existence-without-enforcement on the HUMAN side —
+    // load and surface the frozen exact-action binding (migrations/0152)
+    // for every pending request naming action:knowledge_write, so the JSON
+    // consumer (and the dashboard panel below) can render the actual
+    // target/payload/destination BEFORE a decision, not just the bare
+    // action key.
+    let boundAction: Record<string, unknown> | null = null
+    if (actionKeys.includes('action:knowledge_write')) {
+      const binding = await loadElevationActionBinding(c.env, c.env.TENANT_SLUG, r.id, 'action:knowledge_write')
+      if (binding) {
+        boundAction = {
+          action_hash: binding.action_hash,
+          target: { system: binding.target_system, id: binding.target_id, revision: binding.target_revision },
+          expected_revision: binding.expected_revision,
+          payload_hash: binding.payload_hash,
+          destination: binding.destination,
+          operation: binding.operation,
+          expires_at: binding.expires_at,
+        }
+      }
+    }
     visible.push({
       id: r.id,
       agent_session_id: r.agent_session_id,
       agent_id: r.agent_id,
-      actions: JSON.parse(r.requested_actions_json).map((a: string) => ({
+      actions: actionKeys.map((a: string) => ({
         key: a,
         label: ELEVATION_ACTIONS[a]?.label ?? a,
         effect: ELEVATION_ACTIONS[a]?.effect ?? null,
@@ -969,18 +993,24 @@ authApp.get('/elevation/requests', requireAuthMw(), async (c) => {
       reason: r.reason,
       created_at: r.created_at,
       decision_expires_at: r.decision_expires_at,
+      bound_action: boundAction,
     })
   }
   return c.json({ requests: visible })
 })
 
 // POST /auth/elevation/requests/:id/decide → the single-decision transaction.
-// Body: { decision: 'approve'|'deny', actions?: string[], duration_minutes?: number, note?: string }.
+// Body: { decision: 'approve'|'deny', actions?: string[], duration_minutes?: number,
+//         bound_action_hash?: string, note?: string }.
 // `actions`/`duration_minutes` may only NARROW the request (decideElevationRequest
 // enforces this — the route never widens what it forwards). Sensitive
 // actions (SENSITIVE_STEP_UP_ACTIONS) require the caller's web session to
 // have proven a fresh reauth within the last 5 minutes — same primitive
-// GET /auth/reauth exists for.
+// GET /auth/reauth exists for. `bound_action_hash` is REQUIRED when
+// approving action:knowledge_write (adversarial gate P0-2) — the approving
+// client must echo back the exact elevation_action_bindings.action_hash it
+// rendered (GET /elevation/requests above, and the dashboard approval
+// panel), never a value this route invents on the approver's behalf.
 authApp.post('/elevation/requests/:id/decide', requireAuthMw(), async (c) => {
   const auth = c.get('auth')
   if (!auth.webSessionMemberId || !auth.webSessionIdHash) return c.json({ error: 'forbidden' }, 403)
@@ -998,21 +1028,46 @@ authApp.post('/elevation/requests/:id/decide', requireAuthMw(), async (c) => {
   const currentWebSession = await loadWebSessionByHash(c.env, c.env.TENANT_SLUG, auth.webSessionIdHash)
   const recentReauthOk = currentWebSession ? hasRecentReauth(currentWebSession) : false
 
-  const result = await decideElevationRequest(c.env, {
-    tenant: c.env.TENANT_SLUG,
-    requestId: c.req.param('id'),
-    decision,
-    selectedActions: Array.isArray(body.actions) ? body.actions.filter((a): a is string => typeof a === 'string') : undefined,
-    scopeType: typeof body.scope_type === 'string' ? (body.scope_type as CapabilityScopeType) : undefined,
-    scopeId: typeof body.scope_id === 'string' ? body.scope_id : undefined,
-    durationMinutes: typeof body.duration_minutes === 'number' ? body.duration_minutes : undefined,
-    decidedByMemberId: auth.webSessionMemberId,
-    decidedByCapabilities: capabilities,
-    decidedByIsOrgAdmin: isOrgAdmin(auth),
-    decidedByWebSessionHash: auth.webSessionIdHash,
-    recentReauthOk,
-    note: typeof body.note === 'string' ? body.note : undefined,
-  })
+  // ADVERSARIAL GATE FIX (P0-1 class): decideElevationRequest's approve path
+  // now runs the status flip and every grant INSERT as ONE atomic
+  // env.DB.batch() — a genuine hard DB failure (not the benign "someone
+  // else already decided this" race, which returns a clean {ok:false}
+  // result) throws rather than leaving a partial 'approved'-with-zero-
+  // grants state. Previously this route had no try/catch at all and such a
+  // failure surfaced as an unstructured, no-detail 500 — worse, it left the
+  // request PERMANENTLY stuck (status already flipped, unrecoverable)
+  // because the flip and the inserts were two separate, non-atomic writes.
+  // Now the underlying state is always consistent (still 'pending',
+  // re-decidable) even when this catch fires; the catch's only job is to
+  // give the caller a STRUCTURED response instead of an opaque crash.
+  let result: Awaited<ReturnType<typeof decideElevationRequest>>
+  try {
+    result = await decideElevationRequest(c.env, {
+      tenant: c.env.TENANT_SLUG,
+      requestId: c.req.param('id'),
+      decision,
+      selectedActions: Array.isArray(body.actions) ? body.actions.filter((a): a is string => typeof a === 'string') : undefined,
+      scopeType: typeof body.scope_type === 'string' ? (body.scope_type as CapabilityScopeType) : undefined,
+      scopeId: typeof body.scope_id === 'string' ? body.scope_id : undefined,
+      durationMinutes: typeof body.duration_minutes === 'number' ? body.duration_minutes : undefined,
+      decidedByMemberId: auth.webSessionMemberId,
+      decidedByCapabilities: capabilities,
+      decidedByIsOrgAdmin: isOrgAdmin(auth),
+      decidedByWebSessionHash: auth.webSessionIdHash,
+      recentReauthOk,
+      boundActionHash: typeof body.bound_action_hash === 'string' ? body.bound_action_hash : undefined,
+      note: typeof body.note === 'string' ? body.note : undefined,
+    })
+  } catch (err) {
+    return c.json(
+      {
+        ok: false,
+        reason: 'decision_failed',
+        detail: 'the decision could not be completed; nothing was committed and the request remains pending and re-decidable',
+      },
+      500,
+    )
+  }
 
   if (!result.ok) {
     const status = result.reason === 'not_found' ? 404 : result.reason === 'forbidden' ? 403 : 409

@@ -411,7 +411,9 @@ describe('web-session registry — integration through authApp (real D1)', () =>
     const dir = path.join(process.cwd(), 'migrations')
     const files = fs.readdirSync(dir).filter((f) => f.endsWith('.sql')).sort()
     for (const file of files) {
-      if (file.startsWith('0143_') || file.startsWith('0144_')) continue
+      // This is an ordered pre-feature schema, not a later rebuild with
+      // missing FK parents. Preserve the same legacy-degradation assertions.
+      if (file >= '0143_') break
       bareHarness.sqlite.exec(fs.readFileSync(path.join(dir, file), 'utf8'))
     }
     const env = makeEnv('owner@x.test')

@@ -146,6 +146,25 @@ export const ELEVATION_ACTIONS: Readonly<Record<string, ElevationActionDef>> = O
     effect: 'reversible',
     effectNote: 'Dispatching enqueues work; it does not itself grant standing authority beyond the dispatch record.',
   },
+  // Added for the exact-action approval contract (migrations/0152,
+  // src/auth/exact-action.ts, src/auth/protected-action.ts): a host daemon
+  // (hostd) asks verify_protected_action "is THIS exact knowledge write
+  // approved?" before performing it. Unlike every other action above, a
+  // grant for this action is NOT sufficient by itself — createElevationRequest
+  // additionally requires (and freezes, in elevation_action_bindings) the
+  // exact target/payload/destination/operation/expiry a human approved, and
+  // verifyProtectedAction demands a byte-exact match. enforced:true ships in
+  // the SAME commit as that consumer (src/auth/protected-action.ts), per the
+  // rule above.
+  'action:knowledge_write': {
+    key: 'action:knowledge_write',
+    enforced: true,
+    label: 'Write knowledge',
+    description: 'Write one exact, human-approved knowledge item to its destination.',
+    effect: 'revocable_if_recorded',
+    effectNote:
+      'The written item is only traceable to what was approved because this grant\'s usage log records the exact target, revision, and payload hash at the moment verify_protected_action admitted it.',
+  },
 })
 
 export type ElevationActionKey = keyof typeof ELEVATION_ACTIONS
@@ -193,4 +212,5 @@ export const SENSITIVE_STEP_UP_ACTIONS: ReadonlySet<string> = new Set([
   'action:secrets',
   'action:register_key',
   'action:mint_token',
+  'action:knowledge_write',
 ])

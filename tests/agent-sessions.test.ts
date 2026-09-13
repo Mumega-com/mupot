@@ -392,12 +392,12 @@ describe('agent-session registry (D1, real migration chain)', () => {
 
     beforeEach(() => {
       preMigrationHarness = createSqliteD1()
-      // Apply every REAL migration file EXCEPT this module's own — this is
-      // still the real migration chain, just stopped one file short, which
-      // is exactly the "branch merged, migration not yet applied" scenario
-      // this task's boundary describes. Never a hand-written schema.
+      // Model the real pre-feature boundary: the ordered chain stops before
+      // 0147. Later migrations depend on its table and cannot legitimately be
+      // applied while skipping their parent. Runtime degradation assertions
+      // below remain unchanged; no hand-written schema or discarded records.
       for (const file of migrationFiles()) {
-        if (file === '0147_agent_sessions.sql') continue
+        if (file >= '0147_agent_sessions.sql') break
         preMigrationHarness.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
       }
       preMigrationEnv = { TENANT_SLUG: TENANT, DB: preMigrationHarness.db } as unknown as Env

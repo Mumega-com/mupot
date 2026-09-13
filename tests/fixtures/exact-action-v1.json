@@ -1,0 +1,19 @@
+{
+  "schema": "hostd-exact-action-fixture/v1",
+  "action": {
+    "principal": "00000000-0000-4000-8000-000000000001",
+    "tenant": "fixture-tenant",
+    "target": {
+      "system": "inkwell",
+      "id": "fixture-article",
+      "revision": "2026-09-01 00:00:00"
+    },
+    "expected_revision": "2026-09-01 00:00:00",
+    "payload_hash": "6beaaf0f7043d43b156be32b40087a6db4b24f21580d958c19eb4b8fcd2fc3ae",
+    "destination": "mirror:fixture-article",
+    "operation": "source_write",
+    "expires_at": "2099-01-01T00:00:00Z"
+  },
+  "canonical_utf8": "{\"destination\":\"mirror:fixture-article\",\"expected_revision\":\"2026-09-01 00:00:00\",\"expires_at\":\"2099-01-01T00:00:00Z\",\"operation\":\"source_write\",\"payload_hash\":\"6beaaf0f7043d43b156be32b40087a6db4b24f21580d958c19eb4b8fcd2fc3ae\",\"principal\":\"00000000-0000-4000-8000-000000000001\",\"target\":{\"id\":\"fixture-article\",\"revision\":\"2026-09-01 00:00:00\",\"system\":\"inkwell\"},\"tenant\":\"fixture-tenant\"}",
+  "sha256": "3f2ccdf56f35e7f55d27fb6e93f9c461d4ba8a779514bf7bba6a04563c582c69"
+}

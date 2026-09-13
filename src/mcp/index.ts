@@ -56,11 +56,14 @@ import {
 import {
   createElevationRequest,
   loadElevationRequestById,
+  loadElevationActionBinding,
   loadLiveElevationGrantsForSession,
   evaluateElevationGrant,
   boundAgentHasAnyLiveElevationGrant,
 } from '../auth/elevation'
 import { ELEVATION_ACTIONS, ELEVATION_DURATION_PRESETS_MINUTES, REQUESTABLE_ELEVATION_ACTION_KEYS } from '../auth/elevation-actions'
+import { validateExactActionRequestShape, validateExactActionTargetShape } from '../auth/exact-action'
+import { verifyProtectedAction, protectedActionRemedyMessage } from '../auth/protected-action'
 import { createBus } from '../bus'
 import { createMemory } from '../memory'
 import {
@@ -4182,6 +4185,16 @@ const toolRequestElevation: ToolSpec = {
       scope_id: STRING_SCHEMA,
       duration_minutes: { type: 'number', enum: [...ELEVATION_DURATION_PRESETS_MINUTES] },
       reason: STRING_SCHEMA,
+      // Exact-action approval contract (migrations/0152). REQUIRED when
+      // `actions` includes 'action:knowledge_write' — enforced in
+      // createElevationRequest, not just here (server-side, never trust the
+      // client's enum copy). Deliberately carries NO principal/tenant keys
+      // (both are always server-derived) — validateExactActionRequestShape
+      // below rejects any key outside {target, expected_revision,
+      // payload_hash, destination, operation, expires_at}, since this
+      // nested object's own additionalProperties are NOT enforced by
+      // validateArgs (which only recurses one level).
+      exact_action: { type: 'object' },
     },
     required: ['actions', 'scope_type', 'duration_minutes', 'reason'],
     additionalProperties: false,
@@ -4212,6 +4225,28 @@ const toolRequestElevation: ToolSpec = {
     }
     if (!reason) return fail(400, 'invalid_args', 'reason required')
 
+    let exactAction: { target: { system: string; id: string; revision: string }; expected_revision: string; payload_hash: string; destination: string; operation: string; expires_at: string } | undefined
+    if (args.exact_action !== undefined && args.exact_action !== null) {
+      const shapeError = validateExactActionRequestShape(args.exact_action)
+      if (shapeError) return fail(400, 'invalid_args', shapeError)
+      const raw = args.exact_action as {
+        target: { system: string; id: string; revision: string }
+        expected_revision: string
+        payload_hash: string
+        destination: string
+        operation: string
+        expires_at: string
+      }
+      exactAction = {
+        target: { system: raw.target.system, id: raw.target.id, revision: raw.target.revision },
+        expected_revision: raw.expected_revision,
+        payload_hash: raw.payload_hash,
+        destination: raw.destination,
+        operation: raw.operation,
+        expires_at: raw.expires_at,
+      }
+    }
+
     const result = await createElevationRequest(env, {
       tenant: env.TENANT_SLUG,
       agentSessionId: liveSession.id,
@@ -4222,6 +4257,7 @@ const toolRequestElevation: ToolSpec = {
       scopeId,
       durationMinutes,
       reason,
+      exactAction,
     })
     if (!result.ok) return fail(400, result.reason, result.detail)
 
@@ -4237,6 +4273,7 @@ const toolRequestElevation: ToolSpec = {
         created_at: result.request.created_at,
         decision_expires_at: result.request.decision_expires_at,
       },
+      exact_action_bound: result.binding !== null,
       note: 'Pending human approval. No authority is granted yet — poll elevation_status or wait for it to be reflected on your next call.',
     })
   },
@@ -4267,19 +4304,39 @@ const toolElevationStatus: ToolSpec = {
 
     const requestId = str(args.request_id)
     let requestView: Record<string, unknown> | null = null
+    // The exact-action binding (migrations/0152) frozen for this request, if
+    // it named 'action:knowledge_write' — so a human/agent can see EXACTLY
+    // what a live grant on this request would (and would not) let
+    // verify_protected_action admit, before it is used.
+    let boundActionView: Record<string, unknown> | null = null
     if (requestId) {
       const request = await loadElevationRequestById(env, env.TENANT_SLUG, requestId)
       // Never a cross-session existence oracle: a request for a DIFFERENT
       // session reads identically to "not found".
       if (request && request.agent_session_id === liveSession.id) {
+        const requestActions: string[] = JSON.parse(request.requested_actions_json)
         requestView = {
           id: request.id,
           status: request.status,
-          actions: JSON.parse(request.requested_actions_json),
+          actions: requestActions,
           scope_type: request.requested_scope_type,
           scope_id: request.requested_scope_id,
           decision_expires_at: request.decision_expires_at,
           decided_at: request.decided_at,
+        }
+        if (requestActions.includes('action:knowledge_write')) {
+          const binding = await loadElevationActionBinding(env, env.TENANT_SLUG, request.id, 'action:knowledge_write')
+          if (binding) {
+            boundActionView = {
+              action: binding.action,
+              action_hash: binding.action_hash,
+              target: { system: binding.target_system, id: binding.target_id, revision: binding.target_revision },
+              expected_revision: binding.expected_revision,
+              destination: binding.destination,
+              operation: binding.operation,
+              expires_at: binding.expires_at,
+            }
+          }
         }
       }
     }
@@ -4288,6 +4345,7 @@ const toolElevationStatus: ToolSpec = {
     return done({
       session_id: liveSession.id,
       request: requestView,
+      bound_action: boundActionView,
       active_elevations: liveGrants.map((g) => ({
         id: g.id,
         action: g.action,
@@ -4299,6 +4357,85 @@ const toolElevationStatus: ToolSpec = {
         live: evaluateElevationGrant(g).ok,
       })),
     })
+  },
+}
+
+// verify_protected_action — the exact-action approval contract's enforcement
+// surface (migrations/0152, src/auth/exact-action.ts, src/auth/protected-
+// action.ts). A host daemon (hostd) calls this BEFORE performing a knowledge
+// write, asking "is THIS exact write approved?" — not "is knowledge_write
+// elevated at all", which a live grant alone would answer too generously
+// (see protected-action.ts's header for the full defect-class reasoning).
+//
+// min: 'authenticated' — deliberately NOT gated by a capability floor, and
+// therefore deliberately ABSENT from ELEVATION_FLOOR_BYPASS_TOOLS above: that
+// allowlist exists only to let a live elevation grant substitute for a
+// standing-CAPABILITY floor (AAGATE, enforced in invokeTool before run() for
+// any `spec.min !== 'authenticated'`) — this tool has no such floor to pass,
+// since invokeTool skips the AAGATE block entirely when min is
+// 'authenticated'. This tool's authorization is ENTIRELY the in-handler
+// verifyProtectedAction call below: a caller with zero elevation gets a
+// precise `no_matching_grant` (or `not_agent_session` for a non-bound
+// principal) 403, not a generic floor rejection.
+//
+// Args carry NO principal/tenant/scope fields — verifyProtectedAction derives
+// both from `auth` exclusively (see its own doc comment). `expires_at` MUST
+// be supplied even though it duplicates the bound action's own value,
+// because it is one of the hashed fields: a caller that omits it cannot
+// reconstruct the same hash the approval was computed against.
+const toolVerifyProtectedAction: ToolSpec = {
+  name: 'verify_protected_action',
+  scope: 'self (exact current agent session) — one exact protected action',
+  min: 'authenticated',
+  args: '{ exact_action_hash: string, target: {system,id,revision}, expected_revision: string, payload_hash: string, destination: string, operation: string, expires_at: string }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      exact_action_hash: STRING_SCHEMA,
+      target: { type: 'object' },
+      expected_revision: STRING_SCHEMA,
+      payload_hash: STRING_SCHEMA,
+      destination: STRING_SCHEMA,
+      operation: STRING_SCHEMA,
+      expires_at: STRING_SCHEMA,
+    },
+    required: ['exact_action_hash', 'target', 'expected_revision', 'payload_hash', 'destination', 'operation', 'expires_at'],
+    additionalProperties: false,
+  },
+  shouldTouchPresence: () => false,
+  async run(auth, env, args) {
+    const exactActionHashArg = str(args.exact_action_hash)
+    if (!exactActionHashArg) return fail(400, 'invalid_args', 'exact_action_hash required')
+
+    // `target` is a nested object — validateArgs's additionalProperties:false
+    // only applies at THIS schema's top level, so its own allowed keys are
+    // checked here (see validateExactActionTargetShape's own doc comment).
+    const targetShapeError = validateExactActionTargetShape(args.target)
+    if (targetShapeError) return fail(400, 'invalid_args', targetShapeError)
+    const target = args.target as { system: string; id: string; revision: string }
+
+    const expectedRevision = str(args.expected_revision)
+    const payloadHash = str(args.payload_hash)
+    const destination = str(args.destination)
+    const operation = str(args.operation)
+    const expiresAt = str(args.expires_at)
+    if (!expectedRevision || !payloadHash || !destination || !operation || !expiresAt) {
+      return fail(400, 'invalid_args', 'expected_revision, payload_hash, destination, operation, and expires_at are all required non-empty strings')
+    }
+
+    const result = await verifyProtectedAction(env, auth, {
+      exact_action_hash: exactActionHashArg,
+      target,
+      expected_revision: expectedRevision,
+      payload_hash: payloadHash,
+      destination,
+      operation,
+      expires_at: expiresAt,
+    })
+    if (!result.ok) {
+      return fail(403, result.reason, { detail: result.detail, remedy: protectedActionRemedyMessage(result.reason) })
+    }
+    return done(result.approval)
   },
 }
 
@@ -5111,6 +5248,7 @@ export const TOOLS: ToolSpec[] = [
   toolEndAgentSession,
   toolRequestElevation,
   toolElevationStatus,
+  toolVerifyProtectedAction,
   toolStatus,
   toolFleetAgentGet,
   toolBootContext,
