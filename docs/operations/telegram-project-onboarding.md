@@ -191,7 +191,7 @@ verdict, reconcile the task status and latest task verdict. Do not infer complet
 Telegram 200 alone.
 
 A Routine entering a human wait first commits its waiting/Needs You state, then attempts one
-project-attributed message to the run's assigned Hermes agent. Inspect the message by its
+project-attributed message to the run's assigned agent. Inspect the message by its
 stable request ID:
 
 ```sql
