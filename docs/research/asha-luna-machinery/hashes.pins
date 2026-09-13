@@ -1,0 +1,19 @@
+# Fingerprints pinned at candidate authoring — 2026-09-13 (task t_bc14f72c).
+#
+# The smoke script compares LIVE files against these pins to prove that nothing
+# was minted, modified, or rotated since the candidate was built ("no activation").
+# Refresh a pin ONLY on a legitimate rotation, and say so in the commit that
+# refreshes it — a silent pin update defeats the check.
+#
+# Format: <sha256>  <path relative to the fleet root (~/.fleet)>
+
+# asha agent-bound credential — mode 600, 70 bytes as of authoring
+9b9068fe45ec824b7ffb53b350e28c00643c2e76dbdbfb1bdb1aad8d9255521b  agents/asha-agent-bound.token
+
+# responder machinery — preserved by construction, never forked
+08b26b13c78d3f1d06742559750549badaf4e7d40a807f20b67ad85b925c5ef9  prime/prime-responder.py
+3d9ad076fd52c61005d3d6bb0218a8bfba0472df7fdabc39266b989d7d933ab3  prime/inbox-watch.py
+
+# retired unit base files (the drop-in template overrides these)
+17258f6b99df80589b4d6799a33893ac9e93af068472e81ddf0f8aa2942055ef  retired-units-20260815/asha-responder.service
+bf90c65d0b1c73a2089840050f81403efd634d474310132a374450f1e7683143  retired-units-20260815/asha-inbox-capture.service

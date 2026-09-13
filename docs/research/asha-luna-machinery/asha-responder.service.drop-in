@@ -1,0 +1,33 @@
+# asha-responder.service — CANDIDATE unit drop-in (not installed, nothing enabled).
+#
+# Install target at promotion-time (gated by River decision asha-luna-machinery-20260913):
+#   rename to:  /etc/systemd/system/asha-responder.service.d/override.conf
+# The BASE unit (retired since 2026-08-15) must first be restored to
+# /etc/systemd/system/asha-responder.service from
+# ~/.fleet/retired-units-20260815/asha-responder.service — restoring/enabling it
+# is an ACTIVATION step, out of scope for this candidate.
+#
+# CHANGES vs the retired base, all routing/guardrail:
+#   1. RESPONDER_BIN=hermes  ->  the asha alias (pins the profile; plain `hermes`
+#      launched the DEFAULT profile because prime-responder.py's hermes argv has
+#      no profile flag).
+#   2. RESPONDER_FLAVOR=hermes  (explicit, so the wrapper name != CLI name is fine).
+#   3. RESPONDER_EXECUTE_ROUTINES / RESPONDER_TASKS pinned OFF (fail-closed):
+#      routine/task envelopes keep parking in spool/routines|machine lanes —
+#      the kanban rail is the work rail, not the responder.
+# All other machinery (durable capture via inbox-watch.py, singleton flock,
+# staleness/rate gates, credential stripping) is PRESERVED BY CONSTRUCTION:
+# the candidate changes NO code in ~/.fleet/prime/.
+
+[Service]
+Environment=RESPONDER_BIN=/home/mumega/.local/bin/asha
+Environment=RESPONDER_FLAVOR=hermes
+Environment=RESPONDER_EXECUTE_ROUTINES=
+Environment=RESPONDER_TASKS=
+
+# Identity + credential source, mirroring the retired base (self-contained:
+# does not rely on the base unit's Environment lines).
+Environment=RESPONDER_AGENT=asha
+Environment=RESPONDER_AGENT_ID=e211b0fb-6ebf-4aab-bac5-6129ce6075e0
+Environment=RESPONDER_TOKEN_FILE=/home/mumega/.fleet/agents/asha-agent-bound.token
+Environment=RESPONDER_TOKEN_FILE_MODE_CHECK=600

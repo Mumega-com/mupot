@@ -1,0 +1,61 @@
+# asha — Hermes profile config TEMPLATE (CANDIDATE — not activated)
+
+# Install target at promotion-time (gated by River decision asha-luna-machinery-20260913):
+#   /home/mumega/.hermes/profiles/asha/config.yaml        (profile)
+#   /home/mumega/.hermes/profiles/asha/SOUL.md            (from SOUL.asha.md)
+# Creation is DEFERRED on purpose: this bundle must not create or start anything.
+
+# ---------------------------------------------------------------------------
+# MODEL ROUTE — Luna, configurable per fork (task requirement).
+# This block is a copy of the proven prime-opencode profile route
+# (~/.hermes/profiles/prime-opencode/config.yaml, model gpt-5.6-luna /
+# opencode-go). To fork this seat to a different model, change ONLY the two
+# marked keys below (and prove the fork with:
+#   ASHA_SMOKE_EXPECT_MODEL=<model> ASHA_SMOKE_EXPECT_PROVIDER=<provider>
+#   docs/research/asha-luna-machinery/smoke-asha-luna-candidate.sh
+# ). Do not hardcode the route into responder code — prime-responder.py is
+# shared machinery and must stay fork-agnostic.
+model:
+  # FORK KEY #1 — model route (Luna by default); change ONLY this to fork the seat
+  default: gpt-5.6-luna
+  # FORK KEY #2 — provider route (Luna by default); change ONLY this to fork the seat
+  provider: opencode-go
+  base_url: https://opencode.ai/zen/go/v1
+  api_mode: codex_responses
+fallback_providers: []
+
+# First-pass gate = near-mechanical verdicts; rank/read, never act.
+agent:
+  max_turns: 90
+  gateway_timeout: 1800
+  reasoning_effort: low
+  api_max_retries: 3
+
+# hermes-cli keeps the seat host-ops capable (read-only posture is enforced by
+# SOUL + command allowlist, not by a toolset). retention tools stay off.
+toolsets:
+  - hermes-cli
+
+# Kanban is the work rail (docs/research/2026-09-13-asha-brain-mupot-native-revival.md §3.3):
+# cards are the durable receiving surface replacing the dead inbox/wake path.
+kanban:
+  dispatch_in_gateway: true
+  dispatch_interval_seconds: 60
+  failure_limit: 2
+  dispatch_stale_timeout_seconds: 14400
+
+# Memory + session retention deliberately lean: stateless one-shot seat.
+memory:
+  memory_enabled: true
+  user_profile_enabled: false
+  memory_char_limit: 1200
+
+# No messaging platforms, no webhooks, no cron: the seat is woken by kanban
+# dispatch or a human operator, nothing else.
+platforms:
+  webhook:
+    enabled: false
+
+# Secrets live in ~/.hermes/profiles/asha/.env (never in config.yaml):
+#   HERMES_ASHA_FLEET_TOKEN_FILE=/home/mumega/.fleet/agents/asha-agent-bound.token
+# The responder, not the profile, holds the token at runtime (single source).
