@@ -2818,9 +2818,24 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "table", name: "telegram_webhook_receipts" },
     ],
   },
+  {
+    file: "0153_inbox_lease_attempt_reconciliation.sql",
+    sha256: "106920f8109500252318491be804dab6babe8dede7280b6019e652dda0f2c719",
+    statements: [
+      "-- 0153_inbox_lease_attempt_reconciliation.sql — server-authoritative recovery\n-- for ambiguous inbox_lease transport outcomes.\n\n-- This stores the server-derived scope-bound stamp, not the raw client attempt id.\nALTER TABLE agent_messages ADD COLUMN lease_attempt_id TEXT;",
+      "\n\nCREATE TABLE agent_inbox_lease_attempts (\n  tenant TEXT NOT NULL,\n  agent_id TEXT NOT NULL,\n  target_seat_key TEXT NOT NULL,\n  attempt_id TEXT NOT NULL,\n  request_digest TEXT NOT NULL\n                 CHECK (length(request_digest) = 64\n                        AND request_digest NOT GLOB '*[^0-9A-Fa-f]*'),\n  state TEXT NOT NULL\n        CHECK (state IN ('opening','leased','empty','cancelled','expired','acked')),\n  message_id TEXT REFERENCES agent_messages(id) ON DELETE RESTRICT,\n  message_seq INTEGER,\n  delivery_attempt INTEGER,\n  lease_expires_at TEXT,\n  created_at TEXT NOT NULL,\n  resolved_at TEXT,\n  PRIMARY KEY (tenant, agent_id, target_seat_key, attempt_id),\n  CHECK (\n    (state = 'leased'\n      AND message_id IS NOT NULL\n      AND message_seq IS NOT NULL\n      AND delivery_attempt IS NOT NULL\n      AND lease_expires_at IS NOT NULL)\n    OR\n    (state <> 'leased'\n      AND message_id IS NULL\n      AND message_seq IS NULL\n      AND delivery_attempt IS NULL\n      AND lease_expires_at IS NULL)\n  )\n);",
+      "\n\nCREATE INDEX idx_agent_inbox_lease_attempts_lookup\n  ON agent_inbox_lease_attempts(tenant, agent_id, target_seat_key, attempt_id);",
+      "\n\nCREATE INDEX idx_agent_messages_lease_attempt\n  ON agent_messages(tenant, to_agent, lease_attempt_id);",
+    ],
+    objects: [
+      { type: "table", name: "agent_inbox_lease_attempts" },
+      { type: "index", name: "idx_agent_inbox_lease_attempts_lookup" },
+      { type: "index", name: "idx_agent_messages_lease_attempt" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "302422c0dea7d8d12e07e285cb96000407aa550639675a9227b17aa431596aff"
+export const SCHEMA_CHAIN_DIGEST: string = "91bf8093abef362dc715eef6723f9e11d8b00539a5904ca324edaa5cf6cb4ec4"

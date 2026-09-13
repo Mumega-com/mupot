@@ -951,6 +951,17 @@ export interface LeaseResult {
   lease_seconds: number
 }
 
+export type LeaseAttemptState = 'leased' | 'empty' | 'cancelled' | 'expired' | 'acked'
+
+export interface LeaseAttemptResult {
+  ok: true
+  attempt_id: string
+  state: LeaseAttemptState
+  lease_expires_at: string | null
+  messages: LeasedMessage[]
+  consumed: false
+}
+
 export interface DeadLetteredMessage extends InboxMessage {
   delivery_attempts: number
   dead_lettered_at: string
@@ -971,7 +982,7 @@ export interface AckResult {
 
 export type LeaseFailure = {
   ok: false
-  reason: 'no_tenant' | 'invalid_agent' | 'invalid_limit' | 'invalid_lease' | 'consumer_fenced' | 'db_error'
+  reason: 'no_tenant' | 'invalid_agent' | 'invalid_limit' | 'invalid_lease' | 'invalid_attempt' | 'attempt_conflict' | 'consumer_fenced' | 'db_error'
   detail?: string
 }
 
@@ -983,6 +994,125 @@ export type AckFailure = {
 
 const LEASE_COLS =
   'seq, id, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id, delivery_attempts, lease_expires_at, target_seat, body_length, checksum_sha256'
+
+const LEASE_ATTEMPT_PROTOCOL_VERSION = 1
+const CANCELLED_ATTEMPT_DIGEST = '0'.repeat(64)
+const ATTEMPT_ID_RE = /^[A-Za-z0-9_-]{16,128}$/
+
+type StoredLeaseAttempt = {
+  attempt_id: string
+  request_digest: string
+  attempt_state: 'opening' | LeaseAttemptState
+  attempt_lease_expires_at: string | null
+  seq: number | null
+  id: string | null
+  from_agent: string | null
+  from_member: string | null
+  kind: string | null
+  body: string | null
+  request_id: string | null
+  in_reply_to: string | null
+  created_at: string | null
+  project_id: string | null
+  delivery_attempts: number | null
+  target_seat: string | null
+  body_length: number | null
+  checksum_sha256: string | null
+}
+
+const ATTEMPT_RESULT_SELECT = `
+  SELECT a.attempt_id, a.request_digest, a.state AS attempt_state,
+         a.lease_expires_at AS attempt_lease_expires_at,
+         m.seq, m.id, m.from_agent, m.from_member, m.kind, m.body, m.request_id,
+         m.in_reply_to, m.created_at, m.project_id, m.delivery_attempts,
+         m.target_seat, m.body_length, m.checksum_sha256
+    FROM agent_inbox_lease_attempts a
+    LEFT JOIN agent_messages m
+      ON a.state = 'leased'
+     AND m.id = a.message_id
+     AND m.tenant = a.tenant
+     AND m.to_agent = a.agent_id
+     AND m.seq = a.message_seq
+     AND m.delivery_attempts = a.delivery_attempt
+     AND m.lease_attempt_id = ?5
+     AND m.lease_expires_at = a.lease_expires_at
+     AND m.read_at IS NULL
+   WHERE a.tenant = ?1 AND a.agent_id = ?2
+     AND a.target_seat_key = ?3 AND a.attempt_id = ?4
+     AND ${bearerFencePredicate('?1', '?2')}
+   LIMIT 1`
+
+function validAttemptId(value: unknown): value is string {
+  return typeof value === 'string' && ATTEMPT_ID_RE.test(value)
+}
+
+async function attemptDigest(leaseSeconds: number, targetSeatKey: string): Promise<string> {
+  return sha256Hex(JSON.stringify({
+    lease_seconds: leaseSeconds,
+    effectiveSeat: targetSeatKey,
+    protocolVersion: LEASE_ATTEMPT_PROTOCOL_VERSION,
+  }))
+}
+
+async function attemptStamp(
+  tenant: string,
+  agent: string,
+  targetSeatKey: string,
+  attemptId: string,
+): Promise<string> {
+  // attempt_id is intentionally reusable in another tenant/agent/seat scope. The message
+  // row therefore carries a scope-bound opaque stamp rather than the raw client id; without
+  // this, simultaneous same-id attempts in two seats could both match one broadcast row.
+  return sha256Hex(JSON.stringify({
+    tenant,
+    agent,
+    effectiveSeat: targetSeatKey,
+    attemptId,
+    protocolVersion: LEASE_ATTEMPT_PROTOCOL_VERSION,
+  }))
+}
+
+async function materializeAttempt(row: StoredLeaseAttempt): Promise<LeaseAttemptResult | LeaseFailure> {
+  if (row.attempt_state === 'opening') {
+    return { ok: false, reason: 'db_error', detail: 'lease attempt remained opening' }
+  }
+  const messages: LeasedMessage[] = []
+  if (row.attempt_state === 'leased') {
+    if (row.id === null || row.seq === null || row.delivery_attempts === null
+      || row.attempt_lease_expires_at === null || row.body === null
+      || row.from_agent === null || row.from_member === null || row.kind === null
+      || row.created_at === null) {
+      return { ok: false, reason: 'db_error', detail: 'active lease attempt lost its exact message tuple' }
+    }
+    messages.push({
+      seq: Number(row.seq),
+      id: row.id,
+      from_agent: row.from_agent,
+      from_member: row.from_member,
+      kind: row.kind,
+      body: row.body,
+      request_id: row.request_id,
+      in_reply_to: row.in_reply_to,
+      created_at: row.created_at,
+      project_id: row.project_id ?? null,
+      delivery_attempts: Number(row.delivery_attempts),
+      lease_expires_at: row.attempt_lease_expires_at,
+      target_seat: row.target_seat ?? null,
+      body_length: row.body_length,
+      checksum_sha256: row.checksum_sha256,
+      is_intact: null,
+    })
+    await annotateMessages(messages)
+  }
+  return {
+    ok: true,
+    attempt_id: row.attempt_id,
+    state: row.attempt_state,
+    lease_expires_at: row.attempt_state === 'leased' ? row.attempt_lease_expires_at : null,
+    messages,
+    consumed: false,
+  }
+}
 
 /** The bearer half of the 0058 consumer fence, written once so lease/ack/dead-letter cannot
  *  drift from the predicate readAgentInboxForReader enforces. `?N` numbering is caller-chosen
@@ -999,6 +1129,218 @@ async function bearerFenceBlocks(env: Env, tenant: string, agent: string): Promi
   return (fence?.mode ?? 'bearer_only') !== 'bearer_only'
 }
 
+async function leaseAgentInboxWithAttempt(
+  env: Env,
+  input: { agent: string; leaseSeconds: number; seat?: string; attemptId: string },
+  nowIso: string,
+  expiresIso: string,
+): Promise<LeaseAttemptResult | LeaseFailure> {
+  const tenant = env.TENANT_SLUG
+  const targetSeatKey = input.seat?.trim() || ''
+  const digest = await attemptDigest(input.leaseSeconds, targetSeatKey)
+  const stamp = await attemptStamp(tenant, input.agent, targetSeatKey, input.attemptId)
+  const scope = [tenant, input.agent, targetSeatKey, input.attemptId] as const
+  const fence = bearerFencePredicate('?1', '?2')
+  const seat = `(CASE WHEN ?3 = '' THEN target_seat IS NULL ELSE (target_seat = ?3 OR target_seat IS NULL) END)`
+  const attemptOpening = `EXISTS (
+    SELECT 1 FROM agent_inbox_lease_attempts a
+     WHERE a.tenant = ?1 AND a.agent_id = ?2 AND a.target_seat_key = ?3
+       AND a.attempt_id = ?4 AND a.request_digest = ?5 AND a.state = 'opening'
+  )`
+
+  try {
+    const statements = [
+      env.DB.prepare(
+        `INSERT INTO agent_inbox_lease_attempts
+          (tenant, agent_id, target_seat_key, attempt_id, request_digest, state, created_at)
+         SELECT ?1, ?2, ?3, ?4, ?5, 'opening', ?6
+          WHERE ${fence}
+         ON CONFLICT(tenant, agent_id, target_seat_key, attempt_id) DO NOTHING`,
+      ).bind(...scope, digest, nowIso),
+      env.DB.prepare(
+        `UPDATE agent_messages
+            SET dead_lettered_at = ?6,
+                dead_letter_reason = 'max_delivery_attempts_exceeded:' || delivery_attempts,
+                lease_attempt_id = NULL
+          WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL
+            AND dead_lettered_at IS NULL
+            AND (lease_expires_at IS NULL OR lease_expires_at <= ?6)
+            AND delivery_attempts >= ?7 AND ${seat}
+            AND ${attemptOpening} AND ${fence}`,
+      ).bind(...scope, digest, nowIso, MAX_DELIVERY_ATTEMPTS),
+      env.DB.prepare(
+        `UPDATE agent_messages
+            SET delivery_attempts = delivery_attempts + 1,
+                lease_expires_at = ?7,
+                lease_attempt_id = ?9
+          WHERE seq = (
+            SELECT seq FROM agent_messages
+             WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL
+               AND dead_lettered_at IS NULL
+               AND (lease_expires_at IS NULL OR lease_expires_at <= ?6)
+               AND delivery_attempts < ?8 AND ${seat}
+               AND ${fence}
+             ORDER BY seq ASC LIMIT 1
+          )
+            AND ${attemptOpening} AND ${fence}`,
+      ).bind(...scope, digest, nowIso, expiresIso, MAX_DELIVERY_ATTEMPTS, stamp),
+      env.DB.prepare(
+        `UPDATE agent_inbox_lease_attempts AS a
+            SET state = 'leased',
+                message_id = (SELECT id FROM agent_messages
+                  WHERE tenant = ?1 AND to_agent = ?2 AND lease_attempt_id = ?9
+                    AND lease_expires_at = ?7 LIMIT 1),
+                message_seq = (SELECT seq FROM agent_messages
+                  WHERE tenant = ?1 AND to_agent = ?2 AND lease_attempt_id = ?9
+                    AND lease_expires_at = ?7 LIMIT 1),
+                delivery_attempt = (SELECT delivery_attempts FROM agent_messages
+                  WHERE tenant = ?1 AND to_agent = ?2 AND lease_attempt_id = ?9
+                    AND lease_expires_at = ?7 LIMIT 1),
+                lease_expires_at = ?7,
+                resolved_at = ?6
+          WHERE tenant = ?1 AND agent_id = ?2 AND target_seat_key = ?3
+            AND attempt_id = ?4 AND request_digest = ?5 AND state = 'opening'
+            AND EXISTS (SELECT 1 FROM agent_messages
+              WHERE tenant = ?1 AND to_agent = ?2 AND lease_attempt_id = ?9
+                AND lease_expires_at = ?7)
+            AND ${fence}`,
+      ).bind(...scope, digest, nowIso, expiresIso, MAX_DELIVERY_ATTEMPTS, stamp),
+      env.DB.prepare(
+        `UPDATE agent_inbox_lease_attempts AS a
+            SET state = 'empty', resolved_at = ?6
+          WHERE tenant = ?1 AND agent_id = ?2 AND target_seat_key = ?3
+            AND attempt_id = ?4 AND request_digest = ?5 AND state = 'opening'
+            AND NOT EXISTS (SELECT 1 FROM agent_messages
+              WHERE tenant = ?1 AND to_agent = ?2 AND lease_attempt_id = ?9
+                AND lease_expires_at = ?7)
+            AND ${fence}`,
+      ).bind(...scope, digest, nowIso, expiresIso, MAX_DELIVERY_ATTEMPTS, stamp),
+      // A fence transition cannot interleave a real D1 batch, but keeping the fence inside
+      // every write also protects against database-side triggers and future batch adapters.
+      // If it flips after the claim statement, roll the unreturned hand-out back before the
+      // opening receipt is tombstoned: no body escaped, so delivery_attempts must not advance.
+      env.DB.prepare(
+        `UPDATE agent_messages
+            SET delivery_attempts = CASE WHEN delivery_attempts > 0 THEN delivery_attempts - 1 ELSE 0 END,
+                lease_expires_at = NULL,
+                lease_attempt_id = NULL
+          WHERE tenant = ?1 AND to_agent = ?2 AND lease_attempt_id = ?9
+            AND lease_expires_at = ?7
+            AND ${attemptOpening}
+            AND NOT (${fence})`,
+      ).bind(...scope, digest, nowIso, expiresIso, MAX_DELIVERY_ATTEMPTS, stamp),
+      env.DB.prepare(
+        `UPDATE agent_inbox_lease_attempts
+            SET state = 'cancelled', resolved_at = ?6
+          WHERE tenant = ?1 AND agent_id = ?2 AND target_seat_key = ?3
+            AND attempt_id = ?4 AND request_digest = ?5 AND state = 'opening'`,
+      ).bind(...scope, digest, nowIso),
+      env.DB.prepare(
+        `UPDATE agent_inbox_lease_attempts AS a
+            SET state = 'acked', message_id = NULL, message_seq = NULL,
+                delivery_attempt = NULL, lease_expires_at = NULL, resolved_at = ?6
+          WHERE tenant = ?1 AND agent_id = ?2 AND target_seat_key = ?3
+            AND attempt_id = ?4 AND state = 'leased'
+            AND EXISTS (SELECT 1 FROM agent_messages m
+              WHERE m.id = a.message_id AND m.tenant = ?1 AND m.to_agent = ?2
+                AND m.read_at IS NOT NULL)
+            AND ${fence}`,
+      ).bind(...scope, digest, nowIso),
+      env.DB.prepare(
+        `UPDATE agent_inbox_lease_attempts AS a
+            SET state = 'expired', message_id = NULL, message_seq = NULL,
+                delivery_attempt = NULL, lease_expires_at = NULL, resolved_at = ?6
+          WHERE tenant = ?1 AND agent_id = ?2 AND target_seat_key = ?3
+            AND attempt_id = ?4 AND state = 'leased'
+            AND NOT EXISTS (SELECT 1 FROM agent_messages m
+              WHERE m.id = a.message_id AND m.tenant = ?1 AND m.to_agent = ?2
+                AND m.seq = a.message_seq AND m.delivery_attempts = a.delivery_attempt
+                AND m.lease_attempt_id = ?9 AND m.lease_expires_at = a.lease_expires_at
+                AND m.read_at IS NULL AND m.lease_expires_at > ?6)
+            AND ${fence}`,
+      ).bind(...scope, digest, nowIso, expiresIso, MAX_DELIVERY_ATTEMPTS, stamp),
+      env.DB.prepare(ATTEMPT_RESULT_SELECT).bind(...scope, stamp),
+    ]
+    const results = await env.DB.batch<StoredLeaseAttempt>(statements)
+    const row = results.at(-1)?.results?.[0]
+    if (!row) {
+      if (await bearerFenceBlocks(env, tenant, input.agent)) return { ok: false, reason: 'consumer_fenced' }
+      return { ok: false, reason: 'db_error', detail: 'lease attempt receipt missing' }
+    }
+    if (row.attempt_state !== 'cancelled' && row.request_digest !== digest) {
+      return { ok: false, reason: 'attempt_conflict' }
+    }
+    return materializeAttempt(row)
+  } catch (err) {
+    return { ok: false, reason: 'db_error', detail: err instanceof Error ? err.message : String(err) }
+  }
+}
+
+export async function reconcileAgentInboxLeaseAttempt(
+  env: Env,
+  input: { agent: string; attemptId: string; seat?: string },
+  opts: Pick<Opts, 'now'> = {},
+): Promise<LeaseAttemptResult | LeaseFailure> {
+  const tenant = env.TENANT_SLUG
+  if (!tenant) return { ok: false, reason: 'no_tenant' }
+  if (typeof input.agent !== 'string' || !isRef(input.agent))
+    return { ok: false, reason: 'invalid_agent', detail: 'agent required' }
+  if (!validAttemptId(input.attemptId))
+    return { ok: false, reason: 'invalid_attempt', detail: 'attempt_id must be 16-128 base64url characters' }
+
+  const nowIso = (opts.now ?? (() => new Date().toISOString()))()
+  if (!Number.isFinite(Date.parse(nowIso))) return { ok: false, reason: 'db_error', detail: 'clock' }
+  const targetSeatKey = input.seat?.trim() || ''
+  const stamp = await attemptStamp(tenant, input.agent, targetSeatKey, input.attemptId)
+  const scope = [tenant, input.agent, targetSeatKey, input.attemptId] as const
+  const fence = bearerFencePredicate('?1', '?2')
+
+  try {
+    const results = await env.DB.batch<StoredLeaseAttempt>([
+      env.DB.prepare(
+        `INSERT INTO agent_inbox_lease_attempts
+          (tenant, agent_id, target_seat_key, attempt_id, request_digest, state, created_at, resolved_at)
+         SELECT ?1, ?2, ?3, ?4, ?5, 'cancelled', ?6, ?6
+          WHERE ${fence}
+         ON CONFLICT(tenant, agent_id, target_seat_key, attempt_id) DO NOTHING`,
+      ).bind(...scope, CANCELLED_ATTEMPT_DIGEST, nowIso),
+      env.DB.prepare(
+        `UPDATE agent_inbox_lease_attempts AS a
+            SET state = 'acked', message_id = NULL, message_seq = NULL,
+                delivery_attempt = NULL, lease_expires_at = NULL, resolved_at = ?5
+          WHERE tenant = ?1 AND agent_id = ?2 AND target_seat_key = ?3
+            AND attempt_id = ?4 AND state = 'leased'
+            AND EXISTS (SELECT 1 FROM agent_messages m
+              WHERE m.id = a.message_id AND m.tenant = ?1 AND m.to_agent = ?2
+                AND m.read_at IS NOT NULL)
+            AND ${fence}`,
+      ).bind(...scope, nowIso),
+      env.DB.prepare(
+        `UPDATE agent_inbox_lease_attempts AS a
+            SET state = 'expired', message_id = NULL, message_seq = NULL,
+                delivery_attempt = NULL, lease_expires_at = NULL, resolved_at = ?5
+          WHERE tenant = ?1 AND agent_id = ?2 AND target_seat_key = ?3
+            AND attempt_id = ?4 AND state = 'leased'
+            AND NOT EXISTS (SELECT 1 FROM agent_messages m
+              WHERE m.id = a.message_id AND m.tenant = ?1 AND m.to_agent = ?2
+                AND m.seq = a.message_seq AND m.delivery_attempts = a.delivery_attempt
+                AND m.lease_attempt_id = ?6 AND m.lease_expires_at = a.lease_expires_at
+                AND m.read_at IS NULL AND m.lease_expires_at > ?5)
+            AND ${fence}`,
+      ).bind(...scope, nowIso, stamp),
+      env.DB.prepare(ATTEMPT_RESULT_SELECT).bind(...scope, stamp),
+    ])
+    const row = results.at(-1)?.results?.[0]
+    if (!row) {
+      if (await bearerFenceBlocks(env, tenant, input.agent)) return { ok: false, reason: 'consumer_fenced' }
+      return { ok: false, reason: 'db_error', detail: 'lease attempt receipt missing' }
+    }
+    return materializeAttempt(row)
+  } catch (err) {
+    return { ok: false, reason: 'db_error', detail: err instanceof Error ? err.message : String(err) }
+  }
+}
+
 /**
  * Lease the oldest unread, non-dead-lettered, non-leased messages for the caller's own inbox.
  *
@@ -1007,9 +1349,9 @@ async function bearerFenceBlocks(env: Env, tenant: string, agent: string): Promi
  */
 export async function leaseAgentInbox(
   env: Env,
-  input: { agent: string; limit?: number; leaseSeconds?: number; seat?: string },
+  input: { agent: string; limit?: number; leaseSeconds?: number; seat?: string; attemptId?: string },
   opts: Pick<Opts, 'now'> = {},
-): Promise<LeaseResult | LeaseFailure> {
+): Promise<LeaseResult | LeaseAttemptResult | LeaseFailure> {
   const tenant = env.TENANT_SLUG
   if (!tenant) return { ok: false, reason: 'no_tenant' }
   if (typeof input.agent !== 'string' || !isRef(input.agent))
@@ -1021,6 +1363,10 @@ export async function leaseAgentInbox(
       return { ok: false, reason: 'invalid_limit', detail: 'limit must be a number' }
     limit = Math.min(MAX_INBOX_LIMIT, Math.max(1, Math.floor(input.limit)))
   }
+  if (input.attemptId !== undefined && limit !== 1)
+    return { ok: false, reason: 'invalid_limit', detail: 'attempt_id mode requires limit=1' }
+  if (input.attemptId !== undefined && !validAttemptId(input.attemptId))
+    return { ok: false, reason: 'invalid_attempt', detail: 'attempt_id must be 16-128 base64url characters' }
 
   let leaseSeconds = DEFAULT_LEASE_SECONDS
   if (input.leaseSeconds !== undefined) {
@@ -1036,6 +1382,15 @@ export async function leaseAgentInbox(
   const expiresIso = new Date(nowMs + leaseSeconds * 1000).toISOString()
 
   const targetSeat = typeof input.seat === 'string' && input.seat.trim().length > 0 ? input.seat.trim() : null
+
+  if (input.attemptId !== undefined) {
+    return leaseAgentInboxWithAttempt(env, {
+      agent: input.agent,
+      leaseSeconds,
+      seat: targetSeat ?? undefined,
+      attemptId: input.attemptId,
+    }, nowIso, expiresIso)
+  }
 
   // "Not currently leased" — NULL means never leased; a lease at or before now has expired.
   // Both timestamps are ISO-8601 UTC with a fixed shape, so lexicographic <= IS chronological.
@@ -1055,7 +1410,8 @@ export async function leaseAgentInbox(
     await env.DB.prepare(
       `UPDATE agent_messages
           SET dead_lettered_at = ?4,
-              dead_letter_reason = 'max_delivery_attempts_exceeded:' || delivery_attempts
+              dead_letter_reason = 'max_delivery_attempts_exceeded:' || delivery_attempts,
+              lease_attempt_id = NULL
         WHERE ${leasable('?1', '?2', '?3', '?6')}
           AND delivery_attempts >= ?5
           AND ${bearerFencePredicate('?1', '?2')}`,
@@ -1069,7 +1425,8 @@ export async function leaseAgentInbox(
     const rows = await env.DB.prepare(
       `UPDATE agent_messages
           SET delivery_attempts = delivery_attempts + 1,
-              lease_expires_at = ?5
+              lease_expires_at = ?5,
+              lease_attempt_id = NULL
         WHERE seq IN (
           SELECT seq FROM agent_messages
            WHERE ${leasable('?1', '?2', '?3', '?6')}
@@ -1160,7 +1517,7 @@ export async function ackAgentMessages(
     // refusal is a property of the SQL, not of a check that could be skipped above it.
     const acked = await env.DB.prepare(
       `UPDATE agent_messages
-          SET read_at = ?3, lease_expires_at = NULL
+          SET read_at = ?3, lease_expires_at = NULL, lease_attempt_id = NULL
         WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL
           AND id IN (${placeholders})
           AND ${bearerFencePredicate('?1', '?2')}
