@@ -2800,9 +2800,27 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     ],
     objects: [],
   },
+  {
+    file: "0152_telegram_project_onboarding.sql",
+    sha256: "32f435e8d6e650e13335dc0ddd0c6e2c388aadd20e6f4beba9bb6822895a8b61",
+    statements: [
+      "-- 0152_telegram_project_onboarding.sql — durable Telegram project onboarding.\n--\n-- Project-scoped invites carry only a SHA-256 pairing digest; the raw pairing\n-- secret never enters D1. The four project fields form one atomic optional set\n-- so legacy email invites remain valid without allowing partial project binds.\n\nALTER TABLE invites ADD COLUMN project_id TEXT REFERENCES projects(id);",
+      "\nALTER TABLE invites ADD COLUMN squad_id TEXT REFERENCES squads(id);",
+      "\nALTER TABLE invites ADD COLUMN pairing_hash TEXT;",
+      "\nALTER TABLE invites ADD COLUMN pairing_expires_at TEXT;",
+      "\n\nCREATE TRIGGER validate_invites_project_pairing_insert\nBEFORE INSERT ON invites\nBEGIN\n  SELECT RAISE(ABORT, 'project invite fields must be jointly null or nonblank')\n  WHERE NOT (\n    (\n      NEW.project_id IS NULL\n      AND NEW.squad_id IS NULL\n      AND NEW.pairing_hash IS NULL\n      AND NEW.pairing_expires_at IS NULL\n    )\n    OR\n    (\n      NEW.project_id IS NOT NULL\n      AND NEW.squad_id IS NOT NULL\n      AND NEW.pairing_hash IS NOT NULL\n      AND NEW.pairing_expires_at IS NOT NULL\n      AND length(trim(NEW.project_id)) > 0\n      AND length(trim(NEW.squad_id)) > 0\n      AND length(trim(NEW.pairing_hash)) > 0\n      AND length(trim(NEW.pairing_expires_at)) > 0\n    )\n  );\n  SELECT RAISE(ABORT, 'project invite pairing hash must be 64 hex characters')\n  WHERE NEW.pairing_hash IS NOT NULL\n    AND (\n      length(NEW.pairing_hash) <> 64\n      OR NEW.pairing_hash GLOB '*[^0-9A-Fa-f]*'\n    );\nEND;",
+      "\n\nCREATE TRIGGER validate_invites_project_pairing_update\nBEFORE UPDATE OF project_id, squad_id, pairing_hash, pairing_expires_at ON invites\nBEGIN\n  SELECT RAISE(ABORT, 'project invite fields must be jointly null or nonblank')\n  WHERE NOT (\n    (\n      NEW.project_id IS NULL\n      AND NEW.squad_id IS NULL\n      AND NEW.pairing_hash IS NULL\n      AND NEW.pairing_expires_at IS NULL\n    )\n    OR\n    (\n      NEW.project_id IS NOT NULL\n      AND NEW.squad_id IS NOT NULL\n      AND NEW.pairing_hash IS NOT NULL\n      AND NEW.pairing_expires_at IS NOT NULL\n      AND length(trim(NEW.project_id)) > 0\n      AND length(trim(NEW.squad_id)) > 0\n      AND length(trim(NEW.pairing_hash)) > 0\n      AND length(trim(NEW.pairing_expires_at)) > 0\n    )\n  );\n  SELECT RAISE(ABORT, 'project invite pairing hash must be 64 hex characters')\n  WHERE NEW.pairing_hash IS NOT NULL\n    AND (\n      length(NEW.pairing_hash) <> 64\n      OR NEW.pairing_hash GLOB '*[^0-9A-Fa-f]*'\n    );\nEND;",
+      "\n\nCREATE TABLE telegram_webhook_receipts (\n  tenant         TEXT NOT NULL,\n  update_id      TEXT NOT NULL,\n  request_digest TEXT NOT NULL\n                 CHECK (\n                   length(request_digest) = 64\n                   AND request_digest NOT GLOB '*[^0-9A-Fa-f]*'\n                 ),\n  state          TEXT NOT NULL\n                 CHECK (state IN ('processing', 'completed', 'unknown')),\n  response_text  TEXT,\n  created_at     TEXT NOT NULL,\n  completed_at   TEXT,\n  PRIMARY KEY (tenant, update_id)\n);",
+    ],
+    objects: [
+      { type: "trigger", name: "validate_invites_project_pairing_insert" },
+      { type: "trigger", name: "validate_invites_project_pairing_update" },
+      { type: "table", name: "telegram_webhook_receipts" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "5aecbf779ee83722eca1914df9b44b964bb0773c2ececa1041cb462cb708b41f"
+export const SCHEMA_CHAIN_DIGEST: string = "a49ed186ea18e3aac306e09d056d96b60ff7a2595b47d1afc68ba631d12ff44e"
