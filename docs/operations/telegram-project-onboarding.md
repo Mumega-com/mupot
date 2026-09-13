@@ -102,6 +102,55 @@ The result must contain only the intended project. Stop if any other row exists.
 schema and service verify the named edge, but only this reverse check proves the squad does
 not reach additional projects.
 
+## Route intended decisions to the participant squad before inviting
+
+The project edge is visibility, not decision routing. Before creating or delivering an
+invitation, inventory every Routine answer and Task verdict the participant is intended to
+make, then route each one through the existing authorized Routine/Task administration
+surfaces to the exact `PARTICIPANT_SQUAD_ID`. Stop the onboarding if that routing is not
+approved and readable; do not compensate by granting the participant another operational
+squad.
+
+- `/answer` requires the Routine policy's `responsible_squad_id` to equal
+  `PARTICIPANT_SQUAD_ID`. A materialized run keeps that value in
+  `routine_runs.policy_json`; route the Routine before materializing the human wait. Do not
+  rewrite an in-flight policy snapshot to make a decision reachable.
+- `/approve` and `/reject` require the Task's `squad_id` to equal
+  `PARTICIPANT_SQUAD_ID`. The Task must remain attributed to the intended project, and the
+  participant squad must retain `write` or `admin` on that project.
+- A Task verdict also requires an independent gate policy and grant for its exact
+  `gate_owner` (plus any existing surface grant). The project invitation grants only the
+  selected squad capability. After redemption identifies the new member, issue and read
+  back the separately approved gate grant before advertising the verdict action.
+
+Read back the routing without selecting private decision bodies or credentials:
+
+```sql
+SELECT id, responsible_squad_id
+FROM routines
+WHERE id = '<routine-id>' AND project_id = '<project-id>';
+
+SELECT id, json_extract(policy_json, '$.responsible_squad_id') AS responsible_squad_id
+FROM routine_runs
+WHERE id = '<run-id>' AND project_id = '<project-id>';
+
+SELECT id, project_id, squad_id, status, gate_owner
+FROM tasks
+WHERE id = '<task-id>';
+
+SELECT capability, principal_type, principal_id
+FROM gate_grants
+WHERE capability = '<task-gate-owner>'
+  AND principal_type = 'member'
+  AND principal_id = '<joined-member-id>';
+```
+
+Every Routine and Task routing row must name the participant squad, and the gate-grant
+readback must be exact when a verdict is intended. `/needs` may still show view-only work
+from another squad in an accessible project; only its server-provided `allowed_actions` are
+authority. A missing `/answer`, `/approve`, or `/reject` action is a stop signal, not a reason
+to add a broader grant.
+
 ## Create and deliver the invitation
 
 Create the project invitation through the member surface. A project invite requires all of
@@ -189,6 +238,15 @@ Interpret it narrowly:
 For an answer, reconcile the Routine action/run and its durable answer receipt. For a task
 verdict, reconcile the task status and latest task verdict. Do not infer completion from a
 Telegram 200 alone.
+
+The pilot inherits a known non-atomic verdict caveat: `writeVerdict` changes the Task status
+to `approved` or `rejected` before inserting the append-only `task_verdicts` receipt. An
+interruption between those writes can leave a terminal-looking Task without its verdict
+receipt while the Telegram update remains fenced as `processing`. Reconcile both the Task
+status and the matching latest verdict row. If only one exists, record the mismatch as an
+incident and leave the update fenced; do not delete the webhook receipt, manufacture a new
+decision update, or claim the verdict completed. This onboarding slice does not repair that
+inherited gap.
 
 A Routine entering a human wait first commits its waiting/Needs You state, then attempts one
 project-attributed message to the run's assigned agent. Inspect the message by its
@@ -291,6 +349,10 @@ Rollback removes authority; it does not drop migration `0152` or erase receipts.
 - [ ] `/needs <project-id>` contains only authorized items and actions; a different project is
       absent or refused.
 - [ ] One authorized answer or verdict has its domain receipt and completed Telegram receipt.
+- [ ] Every intended Routine policy/run snapshot and Task names the participant squad; each
+      intended Task verdict has its separate exact gate policy/grant readback.
+- [ ] Task-verdict pilot reconciliation checks both Task status and the append-only verdict
+      row; a status/receipt mismatch remains fenced and is reported as the inherited caveat.
 - [ ] An invalid choice, unauthorized/wrong-project action, stale action, and conflicting
       update each have no new effect.
 - [ ] An identical update replay returns the stored response without a second domain effect.

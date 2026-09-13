@@ -252,3 +252,105 @@ The following remain explicitly unproven:
 
 Until those receipts exist, this work is locally verified repository work, not a deployed or
 live-pilot completion claim.
+
+## Final hostile-review fix round 1
+
+This section records the local fix tree based on
+`7ee6b18a8660f0faf4acd0db18e2fb03bf6c20af`. The prior PR #1407 report of 17 green checks
+applied to that base and is historical after this fix; it is not CI evidence for the commit
+containing this section. This round did not push, mutate the PR, merge, deploy, configure a
+credential or invitation, or execute a live pilot.
+
+The operator runbook now makes authorized decision routing a prerequisite: a Routine human
+answer must name the participant squad in `responsible_squad_id` (including the materialized
+run policy), while a Task verdict must name that squad in `task.squad_id` and retain its
+independently approved gate policy/grant. It also keeps the inherited `writeVerdict`
+status-before-receipt interruption gap explicit for pilot reconciliation; this fix does not
+claim to repair it.
+
+### Red/green and mutation evidence
+
+The hostile control-character regression used a valid 2,000-byte U+0001 question and five
+valid 500-byte choices. Before the source fix:
+
+```text
+npx vitest run tests/routine-actions.test.ts
+  -t 'bounds control-character human-wait notifications' --reporter=verbose
+```
+
+Result: exit 1. The Routine reached durable waiting state, but the first result reported
+`notification_pending: true` instead of `false`; the raw-slice fallback still serialized
+above 8,000 characters, so no agent message was accepted. After JSON-encoded budgeting and
+the final serialized re-check, the same command exited 0. The test proves project/run/action
+attribution, `truncated: true`, a nonempty distinct choice summary, a body at or below 8,000
+characters, successful initial delivery, duplicate replay, and exactly one stored message.
+
+The migration-chain join-to-decision integration was then run with:
+
+```text
+npx vitest run tests/telegram-project-onboarding.test.ts
+  -t 'joins through Telegram and decides only participant-squad' --reporter=verbose
+```
+
+Its first complete-path run exposed an incomplete test seed: governed control-Flight landing
+correctly refused a missing Routine proposal-witness receipt and `/answer` returned
+`receipt_failed`. Adding the real witness to the migration-backed fixture made the command
+exit 0. The test now creates the participant/other squad topology, routes the Routine and
+Task before invitation, redeems through the authenticated `/start` webhook, adds the
+independent gate grant, verifies `/needs` decision actions, records the authorized answer and
+verdict, and refuses both other-squad decisions.
+
+Two source mutations were introduced separately and restored immediately:
+
+1. Removing `answerRoutineRun`'s `policy.responsible_squad_id` authorization changed the
+   other-squad attempt from `forbidden` to `answer_not_found`; the integration exited 1.
+2. Removing IM verdict routing's `task.squad_id` capability check approved `other-review`;
+   the integration exited 1 instead of observing the permission refusal.
+
+After both restorations, the integration command exited 0 again. These are mutation REDs,
+not shipped source changes.
+
+### Focused and expanded verification
+
+Focused command:
+
+```text
+npx vitest run tests/telegram-project-onboarding.test.ts
+  tests/im-webhook-idempotency.test.ts tests/im-verdict-gates.test.ts
+  tests/routine-actions.test.ts tests/needs-you.test.ts --reporter=verbose
+```
+
+Result: exit 0, 5/5 files and 120/120 tests passed.
+
+Expanded adjacent command:
+
+```text
+npx vitest run tests/im-hermes.test.ts tests/telegram-direct.test.ts
+  tests/telegram-bridge.test.ts tests/telegram-adapter.test.ts
+  tests/routine-routes.test.ts tests/routine-dispatch.test.ts
+  tests/routine-proposal-receipt.test.ts tests/tasks-verdict-gates.test.ts
+  tests/tasks-verdict-route-e2e.test.ts --reporter=dot
+```
+
+Result: exit 0, 9/9 files and 90/90 tests passed. Existing negative Telegram tests emitted
+their expected delivery-refusal logs; they did not fail.
+
+The following commands also exited 0 on the local fix tree:
+
+```text
+npm run typecheck
+node scripts/check-schema-chain-fresh.mjs
+git diff --check
+node scripts/no-secrets.mjs
+```
+
+TypeScript ran `tsc --noEmit`; the schema guard reported the generated schema chain fresh;
+the secret scan reported `no secrets found`. The typecheck build-info pre-step identified
+base `7ee6b18a8660f0faf4acd0db18e2fb03bf6c20af` and `clean: false`, accurately reflecting
+that the fix was not committed yet. No full-suite or new PR-CI result is claimed here.
+
+The code-review graph was updated from the exact base after the changes. It parsed three
+source/test files, indexed 206 changed nodes and 3,404 edges, and reported risk 0.40; it found
+no detected execution flows and could not associate the private serializer helpers with the
+integration-style regression, so the direct focused and expanded test evidence remains the
+verification authority.

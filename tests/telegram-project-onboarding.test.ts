@@ -4,6 +4,7 @@ import {
   redeemTelegramProjectInvite,
 } from '../src/members/project-invites'
 import { membersApp } from '../src/members'
+import { imApp } from '../src/im'
 import type { AuthContext, Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
@@ -715,5 +716,199 @@ describe('Telegram project invitation service', () => {
     `).get()).toEqual({ count: 0 })
     expect(harness.sqlite.prepare(`SELECT COUNT(*) AS count FROM member_tokens`).get())
       .toEqual({ count: 0 })
+  })
+
+  it('joins through Telegram and decides only participant-squad Routine and Task work', async () => {
+    const participantPolicy = JSON.stringify({
+      execution_mode: 'execute_internal', overlap_policy: 'skip',
+      responsible_squad_id: 'squad-participants', preferred_agent_id: 'agent-participant',
+      budget_micro_usd: 1000, max_attempts: 3, retry_backoff_seconds: 300,
+    })
+    const otherPolicy = JSON.stringify({
+      execution_mode: 'execute_internal', overlap_policy: 'skip',
+      responsible_squad_id: 'squad-other', preferred_agent_id: null,
+      budget_micro_usd: 1000, max_attempts: 3, retry_backoff_seconds: 300,
+    })
+    const flightMeta = JSON.stringify({
+      schema: 'mupot.flight.meta/v1', goal_id: 'routine-participant',
+      objective_id: 'participant-run', squad_ids: ['squad-participants'],
+      task_ids: ['participant-control'], done_when: ['Participant decision is recorded.'],
+      artifact_refs: [], receipt_refs: ['routine.proposal:participant-run'], confidentiality: 'internal',
+      publication_target: 'none', parent_flight_id: null,
+      routine_run_id: 'participant-run', routine_revision: 1,
+    })
+    harness.sqlite.prepare(`
+      INSERT INTO squads (id, department_id, slug, name)
+      VALUES ('squad-other', 'department-delivery', 'other-decisions', 'Other Decisions')
+    `).run()
+    harness.sqlite.prepare(`
+      INSERT INTO project_squad_access (project_id, squad_id, access_level)
+      VALUES ('project-active', 'squad-other', 'write')
+    `).run()
+    harness.sqlite.prepare(`
+      INSERT INTO agents (id, squad_id, slug, name, status)
+      VALUES ('agent-participant', 'squad-participants', 'participant-agent', 'Participant Agent', 'active')
+    `).run()
+    harness.sqlite.prepare(`
+      INSERT INTO memberships (id, agent_id, squad_id, capability)
+      VALUES ('membership-participant-agent', 'agent-participant', 'squad-participants', 'member')
+    `).run()
+    harness.sqlite.prepare(`
+      INSERT INTO routines (
+        id, tenant, project_id, name, objective, status, trigger_kind, timezone,
+        overlap_policy, execution_mode, responsible_squad_id, preferred_agent_id,
+        budget_micro_usd, max_attempts, retry_backoff_seconds, revision,
+        enabled_by, enabled_at, created_by, created_at, updated_at
+      ) VALUES
+        ('routine-participant', ?, 'project-active', 'Participant decision', 'Choose safely',
+         'enabled', 'manual', 'UTC', 'skip', 'execute_internal', 'squad-participants',
+         'agent-participant', 1000, 3, 300, 1, 'member-inviter', ?, 'member-inviter', ?, ?),
+        ('routine-other', ?, 'project-active', 'Other decision', 'Remain fenced',
+         'enabled', 'manual', 'UTC', 'skip', 'execute_internal', 'squad-other',
+         NULL, 1000, 3, 300, 1, 'member-inviter', ?, 'member-inviter', ?, ?)
+    `).run(
+      TENANT, '2026-09-13T00:00:00.000Z', '2026-09-13T00:00:00.000Z', '2026-09-13T00:00:00.000Z',
+      TENANT, '2026-09-13T00:00:00.000Z', '2026-09-13T00:00:00.000Z', '2026-09-13T00:00:00.000Z',
+    )
+    harness.sqlite.prepare(`
+      INSERT INTO tasks (
+        id, squad_id, project_id, title, body, done_when, status,
+        assignee_agent_id, gate_owner, created_at, updated_at
+      ) VALUES
+        ('participant-control', 'squad-participants', 'project-active', 'Participant control', '',
+         'Participant decision is recorded.', 'in_progress', 'agent-participant', NULL, ?, ?),
+        ('participant-review', 'squad-participants', 'project-active', 'Participant review', '',
+         'Participant approves the evidence.', 'review', NULL, 'gate:participant-review', ?, ?),
+        ('other-review', 'squad-other', 'project-active', 'Other review', '',
+         'Other squad approves the evidence.', 'review', NULL, 'gate:participant-review', ?, ?)
+    `).run(
+      '2026-09-13T00:00:00.000Z', '2026-09-13T00:00:00.000Z',
+      '2026-09-13T00:00:01.000Z', '2026-09-13T00:00:01.000Z',
+      '2026-09-13T00:00:02.000Z', '2026-09-13T00:00:02.000Z',
+    )
+    harness.sqlite.prepare(`
+      INSERT INTO flights (
+        id, tenant, project_id, agent, goal, status, trigger_source, gate_verdict,
+        score, budget_micro_usd, cost_micro_usd, created_at, started_at, meta
+      ) VALUES (
+        'participant-flight', ?, 'project-active', 'agent-participant', 'Choose safely',
+        'running', 'manual', 'go', 1, 1000, 0, 1789257600000, 1789257600000, ?
+      )
+    `).run(TENANT, flightMeta)
+    harness.sqlite.prepare(`
+      INSERT INTO routine_runs (
+        id, tenant, project_id, routine_id, routine_revision, policy_json,
+        occurrence_key, trigger_kind, status, waiting_reason, attempt,
+        assigned_agent_id, task_id, flight_id, proposal_json, created_at, updated_at
+      ) VALUES
+        ('participant-run', ?, 'project-active', 'routine-participant', 1, ?,
+         'manual:participant-run', 'manual', 'waiting', 'answer', 1,
+         'agent-participant', 'participant-control', 'participant-flight', ?, ?, ?),
+        ('other-run', ?, 'project-active', 'routine-other', 1, ?,
+         'manual:other-run', 'manual', 'waiting', 'answer', 1,
+         NULL, NULL, NULL, NULL, ?, ?)
+    `).run(
+      TENANT, participantPolicy, JSON.stringify({ version: 'routine.proposal/v1' }),
+      '2026-09-13T00:00:00.000Z', '2026-09-13T00:00:00.000Z',
+      TENANT, otherPolicy, '2026-09-13T00:00:01.000Z', '2026-09-13T00:00:01.000Z',
+    )
+    harness.sqlite.prepare(`
+      INSERT INTO routine_run_actions (
+        id, tenant, project_id, run_id, action_key, kind, input_json,
+        validation_status, gate_status, status, source_type, source_id,
+        receipt_id, created_at, updated_at
+      ) VALUES (
+        'participant-question', ?, 'project-active', 'participant-run',
+        'participant-question', 'ask_human', ?, 'accepted', 'not_required',
+        'waiting', 'question', 'participant-question', 'participant-wait-receipt', ?, ?
+      )
+    `).run(
+      TENANT,
+      JSON.stringify({ question: 'Accept the participant decision?', choices: ['Accept', 'Decline'], references: [] }),
+      '2026-09-13T00:00:00.000Z', '2026-09-13T00:00:00.000Z',
+    )
+
+    expect(harness.sqlite.prepare(`
+      SELECT responsible_squad_id FROM routines WHERE id = 'routine-participant'
+    `).get()).toEqual({ responsible_squad_id: 'squad-participants' })
+    expect(JSON.parse(participantPolicy)).toMatchObject({ responsible_squad_id: 'squad-participants' })
+    expect(harness.sqlite.prepare(`
+      SELECT squad_id FROM tasks WHERE id = 'participant-review'
+    `).get()).toEqual({ squad_id: 'squad-participants' })
+
+    const created = await createInvite('integrated-participant@example.test')
+    expect(created.ok).toBe(true)
+    if (!created.ok) return
+    const telegramEnv = {
+      ...env,
+      IM_WEBHOOK_SECRET: 'integration-webhook-secret',
+      BUS: { send: async () => undefined },
+    } as Env
+    let updateId = 7000
+    const telegram = async (text: string) => {
+      const response = await imApp.fetch(new Request('https://pot.test/webhook', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Telegram-Bot-Api-Secret-Token': 'integration-webhook-secret',
+        },
+        body: JSON.stringify({
+          update_id: updateId++,
+          message: { from: { id: 9002001 }, chat: { id: 9002001, type: 'private' }, text },
+        }),
+      }), telegramEnv)
+      expect(response.status, await response.clone().text()).toBe(200)
+      return (await response.json() as { reply: string }).reply
+    }
+
+    await expect(telegram(`/start ${created.value.pairing_code}`))
+      .resolves.toContain('Joined project project-active')
+    const joined = harness.sqlite.prepare(`
+      SELECT id FROM members WHERE telegram_chat_id = '9002001' AND tenant = ?
+    `).get(TENANT) as { id: string }
+    expect(harness.sqlite.prepare(`
+      SELECT scope_type, scope_id, capability FROM capabilities WHERE member_id = ?
+    `).all(joined.id)).toEqual([{
+      scope_type: 'squad', scope_id: 'squad-participants', capability: 'member',
+    }])
+    harness.sqlite.prepare(`
+      INSERT INTO gate_grants (
+        id, capability, principal_type, principal_id, granted_by, created_at
+      ) VALUES (
+        'participant-review-grant', 'gate:participant-review', 'member', ?,
+        'member-inviter', '2026-09-13T00:00:03.000Z'
+      )
+    `).run(joined.id)
+    expect(harness.sqlite.prepare(`
+      SELECT capability, principal_type, principal_id FROM gate_grants WHERE id = 'participant-review-grant'
+    `).get()).toEqual({
+      capability: 'gate:participant-review', principal_type: 'member', principal_id: joined.id,
+    })
+
+    const needs = await telegram('/needs project-active')
+    expect(needs).toContain('/answer participant-run <choice>')
+    expect(needs).toContain('/approve participant-review')
+    expect(needs).toContain('/reject participant-review <reason>')
+    expect(needs).not.toContain('/answer other-run')
+    expect(needs).not.toContain('/approve other-review')
+    expect(needs).not.toContain('/reject other-review')
+
+    await expect(telegram('/answer participant-run Accept')).resolves.toContain('Answer recorded')
+    await expect(telegram('/approve participant-review')).resolves.toContain('Approved')
+    await expect(telegram('/answer other-run Accept')).resolves.toContain('forbidden')
+    await expect(telegram('/approve other-review')).resolves.toContain('permission')
+
+    expect(harness.sqlite.prepare(`
+      SELECT status FROM tasks WHERE id = 'participant-review'
+    `).get()).toEqual({ status: 'approved' })
+    expect(harness.sqlite.prepare(`
+      SELECT COUNT(*) AS count FROM task_verdicts WHERE task_id = 'participant-review'
+    `).get()).toEqual({ count: 1 })
+    expect(harness.sqlite.prepare(`
+      SELECT status FROM tasks WHERE id = 'other-review'
+    `).get()).toEqual({ status: 'review' })
+    expect(harness.sqlite.prepare(`
+      SELECT COUNT(*) AS count FROM task_verdicts WHERE task_id = 'other-review'
+    `).get()).toEqual({ count: 0 })
   })
 })

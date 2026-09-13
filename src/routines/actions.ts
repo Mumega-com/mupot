@@ -289,6 +289,27 @@ type HumanWaitDecision =
   | { type: 'review'; task_id: string; truncated?: true }
   | { type: 'answer'; question: string; choices: string[]; truncated?: true }
 
+function jsonStringContentLength(value: string): number {
+  return JSON.stringify(value).length - 2
+}
+
+function jsonBoundedSummary(value: string, budget: number): string {
+  if (budget <= 0) return ''
+  if (jsonStringContentLength(value) <= budget) return value
+  const points = [...value]
+  const candidate = (kept: number) => kept === 0
+    ? ''
+    : `${points.slice(0, Math.max(0, kept - 1)).join('')}…${points.at(-1)}`
+  let low = 0
+  let high = points.length
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2)
+    if (jsonStringContentLength(candidate(middle)) <= budget) low = middle
+    else high = middle - 1
+  }
+  return candidate(low)
+}
+
 function humanWaitBody(
   run: RunContext,
   action: ActionRow,
@@ -306,14 +327,38 @@ function humanWaitBody(
   })
   const body = envelope(decision)
   if (body.length <= HUMAN_WAIT_BODY_LIMIT) return body
-  return envelope(decision.type === 'review'
-    ? { type: 'review', task_id: decision.task_id.slice(0, 500), truncated: true }
-    : {
-        type: 'answer',
-        question: decision.question.slice(0, 1000),
-        choices: decision.choices.map(choice => choice.slice(0, 300)),
-        truncated: true,
-      })
+
+  if (decision.type === 'review') {
+    const review = envelope({ ...decision, truncated: true })
+    if (review.length <= HUMAN_WAIT_BODY_LIMIT) return review
+    throw new Error('human-wait review attribution exceeds message limit')
+  }
+
+  const emptyDecision: HumanWaitDecision = {
+    type: 'answer', question: '', choices: decision.choices.map(() => ''), truncated: true,
+  }
+  const emptyBody = envelope(emptyDecision)
+  const contentBudget = Math.max(0, HUMAN_WAIT_BODY_LIMIT - emptyBody.length)
+  const questionBudget = decision.choices.length > 0 ? Math.floor(contentBudget / 2) : contentBudget
+  const question = jsonBoundedSummary(decision.question, questionBudget)
+  let choicesBudget = contentBudget - jsonStringContentLength(question)
+  const choices = decision.choices.map((choice, index) => {
+    const share = Math.floor(choicesBudget / (decision.choices.length - index))
+    const bounded = jsonBoundedSummary(choice, share)
+    choicesBudget -= jsonStringContentLength(bounded)
+    return bounded
+  })
+  const truncated = envelope({ type: 'answer', question, choices, truncated: true })
+  if (truncated.length <= HUMAN_WAIT_BODY_LIMIT) return truncated
+
+  const omitted = envelope({
+    type: 'answer',
+    question: 'Decision summary omitted to fit the message limit.',
+    choices: [],
+    truncated: true,
+  })
+  if (omitted.length <= HUMAN_WAIT_BODY_LIMIT) return omitted
+  throw new Error('human-wait attribution exceeds message limit')
 }
 
 async function notifyHumanWait(

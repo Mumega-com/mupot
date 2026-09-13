@@ -458,27 +458,39 @@ describe('Routine proposal submission and governed actions', () => {
     expect(row(fixture, 'SELECT request_id FROM agent_messages')).toEqual(first)
   })
 
-  it('bounds the human-wait decision summary after JSON escaping', async () => {
+  it('bounds control-character human-wait notifications and replays one durable message', async () => {
     fixture = await makeReadyRoutineFixture('execute_internal')
-    const choices = Array.from({ length: 5 }, (_, index) => `${'"'.repeat(499)}${index}`)
-
-    await expect(submitRoutineProposal(fixture.env, fixture.principal, fixture.proposal({
+    const choices = Array.from({ length: 5 }, (_, index) => `${'\u0001'.repeat(499)}${index}`)
+    const proposal = fixture.proposal({
       key: 'escaped-summary', kind: 'ask_human',
-      input: { question: '"'.repeat(2000), choices, references: [] },
-    }))).resolves.toMatchObject({
+      input: { question: '\u0001'.repeat(2000), choices, references: [] },
+    })
+
+    await expect(submitRoutineProposal(fixture.env, fixture.principal, proposal)).resolves.toMatchObject({
       ok: true, status: 'waiting', notification_pending: false,
     })
 
     const message = row(fixture, 'SELECT body FROM agent_messages')
     expect(String(message?.body).length).toBeLessThanOrEqual(8000)
     const body = JSON.parse(String(message?.body)) as {
+      project_id: string
+      run_id: string
+      action_key: string
       decision: { type: string; question: string; choices: string[]; truncated?: boolean }
     }
-    expect(body.decision).toMatchObject({
-      type: 'answer', truncated: true,
-      question: '"'.repeat(1000),
-      choices: choices.map(choice => choice.slice(0, 300)),
+    expect(body).toMatchObject({
+      project_id: 'project-1', run_id: 'run-1', action_key: 'escaped-summary',
+      decision: { type: 'answer', truncated: true },
     })
+    expect(body.decision.question.length).toBeGreaterThan(0)
+    expect(body.decision.choices).toHaveLength(choices.length)
+    expect(body.decision.choices.every(choice => choice.length > 0)).toBe(true)
+    expect(new Set(body.decision.choices).size).toBe(choices.length)
+
+    await expect(submitRoutineProposal(fixture.env, fixture.principal, proposal)).resolves.toMatchObject({
+      ok: true, status: 'waiting', duplicate: true, notification_pending: false,
+    })
+    expect(row(fixture, 'SELECT COUNT(*) AS count FROM agent_messages')).toEqual({ count: 1 })
   })
 
   it('executes internal task creation once and returns the same result on replay', async () => {
