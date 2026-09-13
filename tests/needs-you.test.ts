@@ -209,10 +209,11 @@ describe('Needs You projection', () => {
       ).get()).toEqual({ status: 'waiting' })
     })
 
-    const result = await submitRoutineProposal(env, fixture.principal, fixture.proposal({
+    const proposal = fixture.proposal({
       key: 'notify-failure', kind: 'ask_human',
       input: { question: 'Which receipt is authoritative?', choices: ['A', 'B'], references: [] },
-    }))
+    })
+    const result = await submitRoutineProposal(env, fixture.principal, proposal)
 
     expect(result).toMatchObject({
       ok: true, status: 'waiting', reason: 'answer', duplicate: false, notification_pending: true,
@@ -231,6 +232,13 @@ describe('Needs You projection', () => {
         allowed_actions: ['view', 'answer'],
       }),
     ]))
+
+    await expect(submitRoutineProposal(fixture.env, fixture.principal, proposal)).resolves.toMatchObject({
+      ok: true, status: 'waiting', reason: 'answer', duplicate: true, notification_pending: false,
+    })
+    expect(harness.sqlite.prepare(
+      'SELECT COUNT(*) AS count FROM agent_messages WHERE request_id = ?',
+    ).get('routine-human:run-1:notify-failure')).toEqual({ count: 1 })
   })
 
   it('projects pending approvals once, keeps gate actions authority-scoped, and keeps result output on that source', async () => {

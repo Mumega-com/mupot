@@ -409,6 +409,33 @@ describe('Routine proposal submission and governed actions', () => {
     expect(row(fixture, "SELECT COUNT(*) AS count FROM routine_run_events WHERE kind = 'approval_requested'")).toEqual({ count: 1 })
   })
 
+  it('fences notification when the assignee loses Project membership after the wait commits', async () => {
+    fixture = await makeReadyRoutineFixture('execute_internal')
+    const proposal = fixture.proposal({
+      key: 'revoked-before-notify', kind: 'ask_human',
+      input: { question: 'Which receipt?', choices: ['A', 'B'], references: [] },
+    })
+    const env = observeHumanWaitMessage(fixture.env, () => {
+      expect(row(fixture!, "SELECT status, waiting_reason FROM routine_runs WHERE id = 'run-1'")).toEqual({
+        status: 'waiting', waiting_reason: 'answer',
+      })
+      fixture!.harness.sqlite.prepare(
+        "DELETE FROM memberships WHERE agent_id = 'agent-1' AND squad_id = 'squad-1'",
+      ).run()
+    })
+
+    await expect(submitRoutineProposal(env, fixture.principal, proposal)).resolves.toMatchObject({
+      ok: true, status: 'waiting', reason: 'answer', notification_pending: true,
+    })
+    expect(row(fixture, "SELECT status, waiting_reason FROM routine_runs WHERE id = 'run-1'")).toEqual({
+      status: 'waiting', waiting_reason: 'answer',
+    })
+    expect(row(fixture, "SELECT status FROM routine_run_actions WHERE action_key = 'revoked-before-notify'")).toEqual({
+      status: 'waiting',
+    })
+    expect(row(fixture, 'SELECT COUNT(*) AS count FROM agent_messages')).toEqual({ count: 0 })
+  })
+
   it('keeps the stable human-wait request ID valid for maximum-length action keys', async () => {
     fixture = await makeReadyRoutineFixture('execute_internal')
     const actionKey = 'a'.repeat(200)

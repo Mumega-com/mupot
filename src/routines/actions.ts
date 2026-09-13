@@ -347,6 +347,7 @@ async function notifyHumanWait(
       reason: 'human-wait target is the server-owned assigned agent on the committed Routine run',
     }, {
       systemProjectAttribution: true,
+      requireActiveRecipientProjectAccess: true,
     })
     return !delivery.ok
   } catch {
