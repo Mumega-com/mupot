@@ -53,7 +53,7 @@ CREATE TABLE telegram_webhook_receipts (
 ```
 
 - [ ] Add insert/update triggers requiring the four project-invite fields to be jointly NULL or non-NULL and nonblank.
-- [ ] Run `npm run schema:generate && npm run schema:check` and the focused test; expect exit 0.
+- [ ] Run `npm run gen:schema-chain && node scripts/check-schema-chain-fresh.mjs` and the focused test; expect exit 0.
 - [ ] Commit: `feat(onboarding): add Telegram project invite ledger`.
 
 ### Task 2: Create and atomically redeem project invitations
@@ -117,8 +117,7 @@ CREATE TABLE telegram_webhook_receipts (
 - Create: `docs/operations/telegram-project-onboarding.md`
 
 - [ ] Document participant-squad setup, project edge, invite creation, `/start`, `/needs`, answer/verdict, receipt inspection, suspension/revocation, rollback, and the fact that squad membership can expose every project linked to that squad.
-- [ ] Run `npm run typecheck`, `npm run schema:check`, the five focused test files, then `npm test`; record exact results.
+- [ ] Run `npm run typecheck`, `node scripts/check-schema-chain-fresh.mjs`, the five focused test files, then `npm test`; record exact results.
 - [ ] Mutation-check pairing expiry, chat/user equality, update digest conflict, member-active check, squad/project edge, answer choice validation, shared verdict predicate, and notification request ID.
 - [ ] Commit docs and open a draft PR from `kasra/telegram-project-onboarding-20260913` to `main`.
 - [ ] After independent review and direct deployment approval, deploy and execute the live pilot with the plugin plan.
-
