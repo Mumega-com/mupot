@@ -512,9 +512,12 @@ describe('Routine proposal submission and governed actions', () => {
 
     expect(left).toMatchObject({ ok: true, status: 'succeeded', result: { task_id: expect.any(String) } })
     expect(right).toMatchObject({
-      ok: true, status: 'succeeded', duplicate: true,
+      ok: true, status: 'succeeded',
       result: left.ok && left.status === 'succeeded' ? left.result : {},
     })
+    expect([left, right].map(result =>
+      result.ok && result.status === 'succeeded' ? result.duplicate : null,
+    ).sort()).toEqual([false, true])
     expect(row(fixture, "SELECT COUNT(*) AS count FROM tasks WHERE title = 'One concurrent task'")).toEqual({ count: 1 })
     expect(row(fixture, "SELECT COUNT(*) AS count FROM routine_run_actions WHERE action_key = 'task-concurrent'")).toEqual({ count: 1 })
   })
