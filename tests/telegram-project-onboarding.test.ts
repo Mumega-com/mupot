@@ -160,13 +160,14 @@ describe('Telegram project onboarding schema', () => {
   it('records webhook receipts once per tenant and update id', () => {
     const insert = harness.sqlite.prepare(`
       INSERT INTO telegram_webhook_receipts (
-        tenant, update_id, request_digest, state, response_text, created_at, completed_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        tenant, update_id, telegram_user_id, request_digest, state, response_text, created_at, completed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `)
 
     insert.run(
       'tenant-a',
       'update-1',
+      'telegram-user-a',
       VALID_REQUEST_DIGEST,
       'completed',
       'ok',
@@ -176,6 +177,7 @@ describe('Telegram project onboarding schema', () => {
     expect(() => insert.run(
       'tenant-a',
       'update-1',
+      'telegram-user-a',
       VALID_REQUEST_DIGEST,
       'processing',
       null,
@@ -185,6 +187,7 @@ describe('Telegram project onboarding schema', () => {
     expect(() => insert.run(
       'tenant-b',
       'update-1',
+      'telegram-user-b',
       VALID_REQUEST_DIGEST,
       'unknown',
       null,
@@ -193,29 +196,46 @@ describe('Telegram project onboarding schema', () => {
     )).not.toThrow()
 
     expect(harness.sqlite.prepare(`
-      SELECT tenant, update_id, response_text, completed_at
+      SELECT tenant, update_id, telegram_user_id, response_text, completed_at
       FROM telegram_webhook_receipts ORDER BY tenant
     `).all()).toEqual([
       {
         tenant: 'tenant-a',
         update_id: 'update-1',
+        telegram_user_id: 'telegram-user-a',
         response_text: 'ok',
         completed_at: '2026-09-13T00:00:01Z',
       },
       {
         tenant: 'tenant-b',
         update_id: 'update-1',
+        telegram_user_id: 'telegram-user-b',
         response_text: null,
         completed_at: null,
       },
     ])
   })
 
+  it('requires every webhook receipt to bind a nonblank authenticated Telegram user id', () => {
+    const columns = harness.sqlite
+      .prepare(`SELECT name, "notnull" FROM pragma_table_info('telegram_webhook_receipts')`)
+      .all()
+    expect(columns).toEqual(expect.arrayContaining([
+      { name: 'telegram_user_id', notnull: 1 },
+    ]))
+
+    expect(() => harness.sqlite.prepare(`
+      INSERT INTO telegram_webhook_receipts (
+        tenant, update_id, telegram_user_id, request_digest, state, created_at
+      ) VALUES ('tenant-a', 'blank-user', '   ', ?, 'processing', '2026-09-13T00:00:00Z')
+    `).run(VALID_REQUEST_DIGEST)).toThrow(/CHECK constraint failed/)
+  })
+
   it('requires webhook request digests to be 64 hex characters', () => {
     const insert = harness.sqlite.prepare(`
       INSERT INTO telegram_webhook_receipts (
-        tenant, update_id, request_digest, state, created_at
-      ) VALUES ('tenant-a', ?, ?, 'processing', '2026-09-13T00:00:00Z')
+        tenant, update_id, telegram_user_id, request_digest, state, created_at
+      ) VALUES ('tenant-a', ?, 'telegram-user-a', ?, 'processing', '2026-09-13T00:00:00Z')
     `)
 
     expect(() => insert.run('short', 'a'.repeat(63))).toThrow(/CHECK constraint failed/)
@@ -226,16 +246,16 @@ describe('Telegram project onboarding schema', () => {
   it.each(['processing', 'completed', 'unknown'])('accepts the %s webhook receipt state', (state) => {
     expect(() => harness.sqlite.prepare(`
       INSERT INTO telegram_webhook_receipts (
-        tenant, update_id, request_digest, state, created_at
-      ) VALUES ('tenant-a', ?, ?, ?, '2026-09-13T00:00:00Z')
+        tenant, update_id, telegram_user_id, request_digest, state, created_at
+      ) VALUES ('tenant-a', ?, 'telegram-user-a', ?, ?, '2026-09-13T00:00:00Z')
     `).run(`update-${state}`, VALID_REQUEST_DIGEST, state)).not.toThrow()
   })
 
   it('rejects webhook receipt states outside the durable state machine', () => {
     expect(() => harness.sqlite.prepare(`
       INSERT INTO telegram_webhook_receipts (
-        tenant, update_id, request_digest, state, created_at
-      ) VALUES ('tenant-a', 'update-invalid', ?, 'failed', '2026-09-13T00:00:00Z')
+        tenant, update_id, telegram_user_id, request_digest, state, created_at
+      ) VALUES ('tenant-a', 'update-invalid', 'telegram-user-a', ?, 'failed', '2026-09-13T00:00:00Z')
     `).run(VALID_REQUEST_DIGEST)).toThrow(/CHECK constraint failed/)
   })
 })
@@ -310,12 +330,16 @@ describe('Telegram project invitation service', () => {
     })
   }
 
-  function reserveUpdate(updateId: string, requestDigest = VALID_REQUEST_DIGEST): void {
+  function reserveUpdate(
+    updateId: string,
+    requestDigest = VALID_REQUEST_DIGEST,
+    telegramUserId = 'telegram-user-unbound',
+  ): void {
     harness.sqlite.prepare(`
       INSERT INTO telegram_webhook_receipts (
-        tenant, update_id, request_digest, state, created_at
-      ) VALUES (?, ?, ?, 'processing', ?)
-    `).run(TENANT, updateId, requestDigest, new Date().toISOString())
+        tenant, update_id, telegram_user_id, request_digest, state, created_at
+      ) VALUES (?, ?, ?, ?, 'processing', ?)
+    `).run(TENANT, updateId, telegramUserId, requestDigest, new Date().toISOString())
   }
 
   it('creates an active project invite for its exact linked squad and stores only the pairing hash', async () => {
@@ -406,7 +430,7 @@ describe('Telegram project invitation service', () => {
     const created = await createInvite()
     expect(created.ok).toBe(true)
     if (!created.ok) return
-    reserveUpdate('update-success')
+    reserveUpdate('update-success', VALID_REQUEST_DIGEST, '9001001')
 
     const result = await redeemTelegramProjectInvite(env, {
       pairing_code: created.value.pairing_code,
@@ -459,13 +483,77 @@ describe('Telegram project invitation service', () => {
     expect(receipt.completed_at).not.toBeNull()
   })
 
+  it('returns the stored non-secret result for an identical completed Telegram update', async () => {
+    const created = await createInvite('replayed-update@example.test')
+    expect(created.ok).toBe(true)
+    if (!created.ok) return
+    reserveUpdate('update-replay', VALID_REQUEST_DIGEST, '9001010')
+    const input = {
+      pairing_code: created.value.pairing_code,
+      telegram_user_id: '9001010',
+      display_name: 'Replay Participant',
+      update_id: 'update-replay',
+      request_digest: VALID_REQUEST_DIGEST,
+    }
+
+    const first = await redeemTelegramProjectInvite(env, input)
+    expect(first.ok).toBe(true)
+    const replay = await redeemTelegramProjectInvite(env, input)
+
+    expect(replay).toEqual(first)
+    await expect(redeemTelegramProjectInvite(env, {
+      ...input,
+      telegram_user_id: '9001011',
+    })).resolves.toEqual({ ok: false, error: 'update_receipt_invalid' })
+    expect(harness.sqlite.prepare(`
+      SELECT COUNT(*) AS count FROM members WHERE email = 'replayed-update@example.test'
+    `).get()).toEqual({ count: 1 })
+    expect(harness.sqlite.prepare(`
+      SELECT COUNT(*) AS count FROM capabilities
+      WHERE member_id IN (SELECT id FROM members WHERE email = 'replayed-update@example.test')
+    `).get()).toEqual({ count: 1 })
+    const stored = harness.sqlite.prepare(`
+      SELECT response_text FROM telegram_webhook_receipts
+      WHERE tenant = ? AND update_id = 'update-replay'
+    `).get(TENANT) as { response_text: string }
+    expect(stored.response_text.length).toBeLessThanOrEqual(1000)
+    expect(stored.response_text).not.toContain(created.value.pairing_code)
+    expect(stored.response_text).not.toContain('token')
+  })
+
+  it('refuses redemption when the authenticated Telegram user differs from the receipt binding', async () => {
+    const created = await createInvite('wrong-receipt-user@example.test')
+    expect(created.ok).toBe(true)
+    if (!created.ok) return
+    reserveUpdate('update-wrong-user', VALID_REQUEST_DIGEST, 'telegram-user-a')
+
+    const result = await redeemTelegramProjectInvite(env, {
+      pairing_code: created.value.pairing_code,
+      telegram_user_id: 'telegram-user-b',
+      display_name: 'Wrong User',
+      update_id: 'update-wrong-user',
+      request_digest: VALID_REQUEST_DIGEST,
+    })
+
+    expect(result).toEqual({ ok: false, error: 'update_receipt_invalid' })
+    expect(harness.sqlite.prepare('SELECT accepted_at FROM invites WHERE id = ?').get(created.value.invite.id))
+      .toEqual({ accepted_at: null })
+    expect(harness.sqlite.prepare(`
+      SELECT state, telegram_user_id FROM telegram_webhook_receipts
+      WHERE tenant = ? AND update_id = 'update-wrong-user'
+    `).get(TENANT)).toEqual({ state: 'processing', telegram_user_id: 'telegram-user-a' })
+    expect(harness.sqlite.prepare(`
+      SELECT COUNT(*) AS count FROM members WHERE email = 'wrong-receipt-user@example.test'
+    `).get()).toEqual({ count: 0 })
+  })
+
   it('refuses an expired pairing code without creating a member or completing its receipt', async () => {
     const created = await createInvite('expired@example.test')
     expect(created.ok).toBe(true)
     if (!created.ok) return
     harness.sqlite.prepare('UPDATE invites SET pairing_expires_at = ? WHERE id = ?')
       .run('2000-01-01T00:00:00.000Z', created.value.invite.id)
-    reserveUpdate('update-expired')
+    reserveUpdate('update-expired', VALID_REQUEST_DIGEST, '9001002')
 
     const result = await redeemTelegramProjectInvite(env, {
       pairing_code: created.value.pairing_code,
@@ -486,7 +574,7 @@ describe('Telegram project invitation service', () => {
     const created = await createInvite('single-use@example.test')
     expect(created.ok).toBe(true)
     if (!created.ok) return
-    reserveUpdate('update-first')
+    reserveUpdate('update-first', VALID_REQUEST_DIGEST, '9001003')
     const input = {
       pairing_code: created.value.pairing_code,
       telegram_user_id: '9001003',
@@ -495,7 +583,7 @@ describe('Telegram project invitation service', () => {
       request_digest: VALID_REQUEST_DIGEST,
     }
     expect((await redeemTelegramProjectInvite(env, input)).ok).toBe(true)
-    reserveUpdate('update-duplicate')
+    reserveUpdate('update-duplicate', VALID_REQUEST_DIGEST, '9001003')
 
     await expect(redeemTelegramProjectInvite(env, {
       ...input,
@@ -509,7 +597,7 @@ describe('Telegram project invitation service', () => {
     const created = await createInvite('different-chat@example.test')
     expect(created.ok).toBe(true)
     if (!created.ok) return
-    reserveUpdate('update-chat-owner')
+    reserveUpdate('update-chat-owner', VALID_REQUEST_DIGEST, '9001004')
     expect((await redeemTelegramProjectInvite(env, {
       pairing_code: created.value.pairing_code,
       telegram_user_id: '9001004',
@@ -517,7 +605,7 @@ describe('Telegram project invitation service', () => {
       update_id: 'update-chat-owner',
       request_digest: VALID_REQUEST_DIGEST,
     })).ok).toBe(true)
-    reserveUpdate('update-other-chat')
+    reserveUpdate('update-other-chat', VALID_REQUEST_DIGEST, '9001005')
 
     await expect(redeemTelegramProjectInvite(env, {
       pairing_code: created.value.pairing_code,
@@ -543,7 +631,7 @@ describe('Telegram project invitation service', () => {
                   'squad-participants', ?, ?)
       `).run(id, `${id}@example.test`, hash, expiresAt)
     }
-    reserveUpdate('update-ambiguous')
+    reserveUpdate('update-ambiguous', VALID_REQUEST_DIGEST, '9001006')
 
     await expect(redeemTelegramProjectInvite(env, {
       pairing_code: pairingCode,
@@ -564,7 +652,7 @@ describe('Telegram project invitation service', () => {
       INSERT INTO members (id, email, display_name, telegram_chat_id, status, tenant)
       VALUES ('member-conflict', 'conflict@example.test', 'Conflict', '9001007', 'active', '${TENANT}');
     `)
-    reserveUpdate('update-retryable')
+    reserveUpdate('update-retryable', VALID_REQUEST_DIGEST, '9001007')
 
     await expect(redeemTelegramProjectInvite(env, {
       pairing_code: created.value.pairing_code,
@@ -581,7 +669,7 @@ describe('Telegram project invitation service', () => {
     harness.sqlite.exec(`DELETE FROM members WHERE id = 'member-conflict'`)
     const retry = await redeemTelegramProjectInvite(env, {
       pairing_code: created.value.pairing_code,
-      telegram_user_id: '9001008',
+      telegram_user_id: '9001007',
       display_name: 'Retryable',
       update_id: 'update-retryable',
       request_digest: VALID_REQUEST_DIGEST,
@@ -605,5 +693,27 @@ describe('Telegram project invitation service', () => {
     await expect(response.json()).resolves.toEqual({ error: 'telegram_identity_requires_authenticated_webhook' })
     expect(harness.sqlite.prepare(`SELECT accepted_at FROM invites WHERE id = 'legacy-forged-chat'`).get())
       .toEqual({ accepted_at: null })
+  })
+
+  it('rejects a project invite on the legacy browser redemption route without minting a token', async () => {
+    const created = await createInvite('project-route-escape@example.test')
+    expect(created.ok).toBe(true)
+    if (!created.ok) return
+
+    const response = await membersApp.request(`/invites/${created.value.invite.id}/accept`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ display_name: 'Wrong Door' }),
+    }, env)
+
+    expect(response.status).toBe(409)
+    await expect(response.json()).resolves.toEqual({ error: 'project_invite_requires_telegram' })
+    expect(harness.sqlite.prepare('SELECT accepted_at FROM invites WHERE id = ?').get(created.value.invite.id))
+      .toEqual({ accepted_at: null })
+    expect(harness.sqlite.prepare(`
+      SELECT COUNT(*) AS count FROM members WHERE email = 'project-route-escape@example.test'
+    `).get()).toEqual({ count: 0 })
+    expect(harness.sqlite.prepare(`SELECT COUNT(*) AS count FROM member_tokens`).get())
+      .toEqual({ count: 0 })
   })
 })

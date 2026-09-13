@@ -90,6 +90,10 @@ END;
 CREATE TABLE telegram_webhook_receipts (
   tenant         TEXT NOT NULL,
   update_id      TEXT NOT NULL,
+  telegram_user_id TEXT NOT NULL
+                   CHECK (
+                     length(trim(telegram_user_id)) BETWEEN 1 AND 255
+                   ),
   request_digest TEXT NOT NULL
                  CHECK (
                    length(request_digest) = 64

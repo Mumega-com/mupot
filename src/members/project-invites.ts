@@ -114,6 +114,13 @@ interface RedeemableInviteRow {
   pairing_expires_at: string
 }
 
+interface TelegramReceiptRow {
+  telegram_user_id: string
+  request_digest: string
+  state: string
+  response_text: string | null
+}
+
 function isNonEmptyString(value: unknown, maxLength = 255): value is string {
   return typeof value === 'string' && value.trim().length > 0 && value.trim().length <= maxLength
 }
@@ -176,6 +183,28 @@ function claimTimestamp(): string {
   crypto.getRandomValues(random)
   const suffix = String(random[0] % 1_000_000).padStart(6, '0')
   return iso.replace('Z', `${suffix}Z`)
+}
+
+function parseStoredRedemption(text: string | null): RedeemedProjectInvite | null {
+  if (!text || text.length > 1000) return null
+  try {
+    const parsed = JSON.parse(text) as Record<string, unknown>
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
+    const keys = Object.keys(parsed).sort()
+    if (keys.join(',') !== 'capability,member_id,project_id,squad_id') return null
+    if (!isNonEmptyString(parsed.member_id)) return null
+    if (!isNonEmptyString(parsed.project_id)) return null
+    if (!isNonEmptyString(parsed.squad_id)) return null
+    if (!isCapability(parsed.capability)) return null
+    return {
+      member_id: parsed.member_id.trim(),
+      project_id: parsed.project_id.trim(),
+      squad_id: parsed.squad_id.trim(),
+      capability: parsed.capability,
+    }
+  } catch {
+    return null
+  }
 }
 
 /**
@@ -305,18 +334,23 @@ export async function redeemTelegramProjectInvite(
 
   const pairingHash = await sha256Hex(input.pairing_code.trim())
   const receipt = await env.DB.prepare(
-    `SELECT request_digest, state
+    `SELECT telegram_user_id, request_digest, state, response_text
        FROM telegram_webhook_receipts
       WHERE tenant = ?1 AND update_id = ?2
       LIMIT 1`,
-  ).bind(env.TENANT_SLUG, input.update_id.trim()).first<{
-    request_digest: string
-    state: string
-  }>()
+  ).bind(env.TENANT_SLUG, input.update_id.trim()).first<TelegramReceiptRow>()
   if (!receipt || receipt.request_digest.toLowerCase() !== input.request_digest.toLowerCase()) {
     return { ok: false, error: 'update_receipt_invalid' }
   }
-  if (receipt.state === 'completed') return { ok: false, error: 'update_already_completed' }
+  if (receipt.telegram_user_id !== input.telegram_user_id.trim()) {
+    return { ok: false, error: 'update_receipt_invalid' }
+  }
+  if (receipt.state === 'completed') {
+    const stored = parseStoredRedemption(receipt.response_text)
+    return stored
+      ? { ok: true, value: stored }
+      : { ok: false, error: 'update_receipt_invalid' }
+  }
   if (receipt.state !== 'processing') return { ok: false, error: 'update_receipt_invalid' }
 
   const matches = await env.DB.prepare(
@@ -373,6 +407,7 @@ export async function redeemTelegramProjectInvite(
                WHERE receipt.tenant = ?9
                  AND receipt.update_id = ?10
                  AND lower(receipt.request_digest) = lower(?11)
+                 AND receipt.telegram_user_id = ?12
                  AND receipt.state = 'processing'
             )`,
       ).bind(
@@ -387,6 +422,7 @@ export async function redeemTelegramProjectInvite(
         env.TENANT_SLUG,
         input.update_id.trim(),
         input.request_digest,
+        input.telegram_user_id.trim(),
       ),
       env.DB.prepare(
         `INSERT INTO members (
@@ -419,9 +455,10 @@ export async function redeemTelegramProjectInvite(
           WHERE tenant = ?3
             AND update_id = ?4
             AND lower(request_digest) = lower(?5)
+            AND telegram_user_id = ?6
             AND state = 'processing'
             AND EXISTS (
-              SELECT 1 FROM invites WHERE id = ?6 AND accepted_at = ?7
+              SELECT 1 FROM invites WHERE id = ?7 AND accepted_at = ?8
             )`,
       ).bind(
         responseText,
@@ -429,6 +466,7 @@ export async function redeemTelegramProjectInvite(
         env.TENANT_SLUG,
         input.update_id.trim(),
         input.request_digest,
+        input.telegram_user_id.trim(),
         invite.id,
         claimedAt,
       ),

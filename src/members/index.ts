@@ -137,6 +137,10 @@ interface InviteRow {
   id: string
   email: string
   department_id: string | null
+  project_id: string | null
+  squad_id: string | null
+  pairing_hash: string | null
+  pairing_expires_at: string | null
   capability: Capability
   invited_by: string | null
   accepted_at: string | null
@@ -191,12 +195,22 @@ membersApp.post('/invites/:id/accept', async (c) => {
   const displayName = body.display_name.trim()
 
   const invite = await c.env.DB.prepare(
-    'SELECT id, email, department_id, capability, invited_by, accepted_at, created_at FROM invites WHERE id = ? LIMIT 1',
+    `SELECT id, email, department_id, project_id, squad_id, pairing_hash,
+            pairing_expires_at, capability, invited_by, accepted_at, created_at
+       FROM invites WHERE id = ? LIMIT 1`,
   )
     .bind(inviteId)
     .first<InviteRow>()
 
   if (!invite) return c.json({ error: 'invite_not_found' }, 404)
+  if (
+    invite.project_id !== null
+    || invite.squad_id !== null
+    || invite.pairing_hash !== null
+    || invite.pairing_expires_at !== null
+  ) {
+    return c.json({ error: 'project_invite_requires_telegram' }, 409)
+  }
   if (invite.accepted_at) return c.json({ error: 'invite_already_accepted' }, 409)
 
   // Mint the member. The email comes from the INVITE (server-trusted), never the
