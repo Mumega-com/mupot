@@ -428,3 +428,51 @@ secret scan reported `no secrets found`. The build-info pre-step named exact bas
 `2bcfd7e6af6bf277b06bd9bf24ee4f7fa6e632ed` with `clean: false`, accurately describing the
 uncommitted local repair at verification time. This is local evidence only: no push, PR
 mutation, merge, deployment, production state change, or live Telegram pilot is claimed.
+
+## Final local release verification at `80001a11`
+
+Final verification was run on exact server head
+`80001a11c29d93a5dd83f09f87eeaff92514f851` with a clean tracked tree. The additive
+migration order is `0152_telegram_project_onboarding.sql` followed by
+`0153_inbox_lease_attempt_reconciliation.sql`; 0153 owns the strict-scope, attempt lease,
+reconciliation, and attempt-bound ACK receipts consumed by the Hermes attempt-v3 client.
+
+Fresh results:
+
+```text
+npm test
+Test Files  512 passed (512)
+Tests       7985 passed (7985)
+Duration    664.60s
+
+npm run typecheck                                      exit 0
+schema generator/freshness tests                       59/59 passed
+MCP seam ratchet tests                                 24/24 passed
+selected migration/schema integration                 105/105 passed (10 files)
+schema-chain freshness, full-base diff, no-secrets     exit 0
+```
+
+The cross-repository acceptance used the real server MCP application over loopback HTTP and
+the native Hermes client. With plugin head
+`457ac9816ec1b2532eb959b05a664cbccde2532c` and Hermes
+`233757037df1f03f9fe1cfddc097acd5ad7f7510`, both cases passed: the matched profile reached
+strict status, attempt lease, attempt ACK, consumed readback, and one activation acceptance;
+the mismatched profile stopped before custody or ACK.
+
+Two final server mutations were introduced separately in a disposable detached worktree and
+restored immediately:
+
+1. Removing the attempt stamp/delivery/expiry ownership checks let stale attempt A consume
+   newer lease B. The stale-attempt regression failed on the changed `read_at` and cleared
+   lease, killing the mutation.
+2. Removing `lease_expires_at IS NULL` from ACK compensation rolled back a same-timestamp
+   legacy consume. The legacy-race regression failed on the erased `read_at`, killing the
+   mutation.
+
+After restoration, the complete attempt-ACK file passed 9/9 and the disposable worktree was
+diff-clean. No server source or test changed during this final verification.
+
+The current exact head is not yet pushed. Therefore exact-head remote CI/security review,
+merge, deployment approval, remote application/readback of migrations 0152 and 0153,
+deployed `/health` SHA, protected profile/webhook configuration, invitation, and the real
+non-admin Telegram onboarding pilot remain unproven and separately gated.

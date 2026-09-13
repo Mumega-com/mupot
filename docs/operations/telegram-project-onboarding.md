@@ -52,7 +52,10 @@ export PARTICIPANT_SQUAD_ID='<filled-after-create>'
 Before mutation, record:
 
 1. `GET /health` and its exact clean release commit.
-2. Migration `0152_telegram_project_onboarding.sql` in the deployed migration ledger.
+2. Migrations `0152_telegram_project_onboarding.sql` and then
+   `0153_inbox_lease_attempt_reconciliation.sql` in the deployed migration ledger, in that
+   order. Migration 0152 creates the onboarding/webhook receipts; migration 0153 adds the
+   server-authoritative lease-attempt receipts used by the Hermes receiver.
 3. `IM_WEBHOOK_SECRET` configured at both ends, without reading or recording its value.
 4. The existing project is active and the intended department is correct.
 5. The planned capability (`observer`, `member`, `lead`, `admin`, or `owner`) is no greater
@@ -239,6 +242,16 @@ For an answer, reconcile the Routine action/run and its durable answer receipt. 
 verdict, reconcile the task status and latest task verdict. Do not infer completion from a
 Telegram 200 alone.
 
+The outbound Hermes receiver uses a separate attempt-v3 custody chain. Before one message is
+processed, the plugin reads strict server scope, durably records a random attempt ID together
+with tenant, agent, effective seat, consumer mode/generation, and the non-secret owning-profile
+fingerprint, then leases at most one message. An ambiguous restart reconciles that exact
+attempt; attempt-originated work can be consumed only by `inbox_lease_ack({attempt_id})` after
+the same profile owner and strict server scope are revalidated. A stale attempt cannot consume
+a newer lease, a same-timestamp legacy consume cannot be rolled back by fenced attempt ACK,
+and pre-v3 or owner-mismatched markers remain quarantined. Generic `inbox_ack` remains only for
+non-attempt legacy work.
+
 The pilot inherits a known non-atomic verdict caveat: `writeVerdict` changes the Task status
 to `approved` or `rejected` before inserting the append-only `task_verdicts` receipt. An
 interruption between those writes can leave a terminal-looking Task without its verdict
@@ -333,7 +346,8 @@ one, stop and investigate rather than widening the predicate.
 
 ## Rollback
 
-Rollback removes authority; it does not drop migration `0152` or erase receipts.
+Rollback removes authority; it does not drop additive migrations `0152` or `0153`, or erase
+receipts.
 
 1. Stop new ingress at the Telegram webhook/Hermes configuration if the transport boundary
    is suspect. Rotate `IM_WEBHOOK_SECRET` at both ends before reopening. Do not reveal the old
@@ -362,7 +376,8 @@ Rollback removes authority; it does not drop migration `0152` or erase receipts.
 - [ ] Direct deployment approval identifies the exact commit and tenant; no local test is
       represented as deploy authority.
 - [ ] `/health` reports the expected clean release commit after deployment.
-- [ ] The remote migration ledger includes `0152_telegram_project_onboarding.sql`.
+- [ ] The remote migration ledger includes `0152_telegram_project_onboarding.sql` followed by
+      `0153_inbox_lease_attempt_reconciliation.sql`.
 - [ ] `IM_WEBHOOK_SECRET` is configured at both ends; no credential value appears in evidence.
 - [ ] The participant-specific squad exists and the reverse edge query returns exactly the
       intended project.
