@@ -8,6 +8,7 @@ import { answerRoutineRun, cancelRoutineRun, executeRoutineAction, getRoutinePen
 import type { RoutinePrincipal } from '../src/routines/access'
 import type { Env, Project } from '../src/types'
 import { makeReadyRoutineFixture, type ReadyRoutineFixture } from './helpers/routine-actions'
+import { handleImMessage, imApp } from '../src/im'
 
 function row(fixture: ReadyRoutineFixture, sql: string, ...binds: unknown[]): Record<string, unknown> | undefined {
   return fixture.harness.sqlite.prepare(sql).get(...binds)
@@ -174,6 +175,80 @@ describe('Routine proposal submission and governed actions', () => {
   afterEach(() => {
     fixture?.harness.close()
     fixture = undefined
+  })
+
+  it('answers through IM as the mapped human with exact choices, attribution and duplicate/conflict fences', async () => {
+    fixture = await makeReadyRoutineFixture()
+    fixture.harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, telegram_chat_id, status, tenant)
+      VALUES ('human-1', 'human@test.com', 'Human', '123', 'active', 'tenant-a');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+      VALUES ('cap-human', 'human-1', 'squad', 'squad-1', 'member');
+    `)
+    await submitRoutineProposal(fixture.env, fixture.principal, fixture.proposal({
+      key: 'im-question', kind: 'ask_human',
+      input: { question: 'Which event?', choices: ['Booked', 'Paid'], references: [] },
+    }))
+    let updateId = 100
+    const message = async (text: string, forwarded = false, id = updateId++) => {
+      const response = await imApp.fetch(new Request('https://pot.test/webhook', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Telegram-Bot-Api-Secret-Token': 'routine-test-secret' },
+        body: JSON.stringify({ update_id: id, message: {
+          from: { id: 123 }, chat: { id: 123, type: 'private' }, text,
+          ...(forwarded ? { forward_origin: { type: 'user' } } : {}),
+        } }),
+      }), { ...fixture!.env, IM_WEBHOOK_SECRET: 'routine-test-secret' })
+      expect(response.status).toBe(200)
+      return (await response.json() as { reply: string }).reply
+    }
+    const state = () => ['routine_runs', 'routine_run_actions', 'routine_run_events', 'tasks', 'flights']
+      .map(table => fixture!.harness.sqlite.prepare(`SELECT * FROM ${table} ORDER BY id`).all())
+    const pending = state()
+    const needs = await message('/needs project-1')
+    expect(needs).toContain('Which event?')
+    expect(needs).toContain('Booked | Paid')
+    expect(needs).toContain('/answer run-1')
+    expect(await message('/answer run-1 paid')).toContain('invalid_answer')
+    expect(state()).toEqual(pending)
+    expect(await message('/answer run-1 Paid', true)).toMatch(/direct.*forward/i)
+    expect(state()).toEqual(pending)
+    const answerId = updateId
+    const recordedReply = await message('/answer run-1 Paid')
+    expect(recordedReply).toMatch(/recorded/i)
+    expect(row(fixture, "SELECT status, result_json FROM routine_run_actions WHERE action_key = 'im-question'"))
+      .toEqual({ status: 'succeeded', result_json: '{"answer":"Paid","answered_by":"human-1"}' })
+    const answered = state()
+    const receipts = fixture.harness.sqlite.prepare('SELECT * FROM telegram_webhook_receipts ORDER BY update_id').all()
+    expect(await message('/answer run-1 Paid', false, answerId)).toBe(recordedReply)
+    expect(fixture.harness.sqlite.prepare('SELECT * FROM telegram_webhook_receipts ORDER BY update_id').all()).toEqual(receipts)
+    expect(await message('/answer run-1 Paid')).toMatch(/already recorded/i)
+    expect(await message('/answer run-1 Booked')).toContain('answer_conflict')
+    expect(state()).toEqual(answered)
+  })
+
+  it.each(['suspended', 'revoked', 'observer', 'terminal', 'stale'])('refuses IM routine answers for %s decisions without domain effects', async scenario => {
+    fixture = await makeReadyRoutineFixture()
+    fixture.harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, telegram_chat_id, status, tenant)
+      VALUES ('human-1', 'human@test.com', 'Human', '123', 'active', 'tenant-a');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+      VALUES ('cap-human', 'human-1', 'squad', 'squad-1', 'member');
+    `)
+    await submitRoutineProposal(fixture.env, fixture.principal, fixture.proposal({
+      key: 'im-question', kind: 'ask_human', input: { question: 'Which?', choices: ['Paid'], references: [] },
+    }))
+    if (scenario === 'suspended') fixture.harness.sqlite.exec("UPDATE members SET status = 'suspended'")
+    if (scenario === 'revoked') fixture.harness.sqlite.exec('DELETE FROM capabilities')
+    if (scenario === 'observer') fixture.harness.sqlite.exec("UPDATE capabilities SET capability = 'observer'")
+    if (scenario === 'terminal') fixture.harness.sqlite.exec("UPDATE routine_runs SET status = 'cancelled'")
+    if (scenario === 'stale') fixture.harness.sqlite.exec("UPDATE routine_runs SET status = 'running', waiting_reason = NULL")
+    const state = () => ['routine_runs', 'routine_run_actions', 'routine_run_events', 'tasks', 'flights']
+      .map(table => fixture!.harness.sqlite.prepare(`SELECT * FROM ${table} ORDER BY id`).all())
+    const before = state()
+    const reply = await handleImMessage(fixture.env, '123', '/answer run-1 Paid')
+    expect(reply).toMatch(/not registered|run_not_found|forbidden|run_terminal|answer_not_found/)
+    expect(state()).toEqual(before)
   })
 
   it('rejects the wrong agent and mismatched run, Project, or Situation correlation', async () => {

@@ -10,15 +10,16 @@
 //   - AuthZ is OURS: every mutating intent is gated by the FROZEN capability API
 //     (resolveCapabilities / hasCapability) against the scope it targets. A
 //     'department' grant inherits down to its squads; an 'org' grant covers all.
-//   - Tenant is environment-derived (env.TENANT_SLUG), never client-supplied. A
-//     suspended member is inert. An unmapped chat_id is politely refused — we do
-//     NOT act and we do NOT leak which chat_ids are known.
-//   - Every effect emits an ATTRIBUTED BusEvent (actor {kind:'member', id}) so the
-//     activity feed/consumer knows a human caused it.
+//   - Tenant is environment-derived (env.TENANT_SLUG), never client-supplied.
+//     Suspended members are inert. Only an authenticated single-use invitation
+//     can establish a new member mapping.
+//   - Telegram reserves one principal-bound digest before handling an intent.
+//     Domain services own the attributed decision and membership receipts.
 //
 // Exports:
 //   - imApp            : Hono sub-app. POST /webhook accepts a Telegram-style
-//                        update {message:{chat:{id}, text}}, resolves the member,
+//                        update with update_id, message.from.id and private chat,
+//                        verifies matching sender/chat IDs, resolves the member,
 //                        runs the intent, and returns a short text reply.
 //   - handleImMessage  : (env, chatId, text) => Promise<string>. The pure entry
 //                        Hermes can call directly (or the webhook calls for it).
@@ -53,6 +54,12 @@ import {
 } from '../brain/directive'
 import { timingSafeEqual } from '../lib/crypto'
 import { routeAgentWake } from '../agents/wake-routing'
+import { canonicalJsonDigest } from '../lib/canonical-json'
+import { redeemTelegramProjectInvite } from '../members/project-invites'
+import { listNeedsYou } from '../attention/service'
+import { answerRoutineRun, getRoutinePendingQuestion } from '../routines/actions'
+import { routinePrincipal } from '../routines/access'
+import { completeTelegramUpdate, reserveTelegramUpdate, type TelegramUpdateIdentity } from './telegram-receipts'
 
 type AppEnv = { Bindings: Env }
 
@@ -87,10 +94,10 @@ async function memberForChat(env: Env, chatId: string): Promise<Member | null> {
   const row = await env.DB.prepare(
     `SELECT id, email, display_name, telegram_chat_id, status, created_at
        FROM members
-      WHERE telegram_chat_id = ?1
+      WHERE telegram_chat_id = ?1 AND tenant = ?2
       LIMIT 1`,
   )
-    .bind(chatId)
+    .bind(chatId, env.TENANT_SLUG)
     .first<Member>()
   if (!row) return null
   if (row.status !== 'active') return null
@@ -174,6 +181,9 @@ async function soleSquadGrant(grants: CapabilityGrant[]): Promise<string | null>
 // ── intent parsing (text → intent; identity is NEVER here) ────────────────────
 type Intent =
   | { kind: 'help' }
+  | { kind: 'join'; code: string }
+  | { kind: 'needs'; projectId: string | null }
+  | { kind: 'answer'; runId: string; choice: string }
   | { kind: 'status'; ref: string | null }
   | { kind: 'wake'; ref: string }
   | { kind: 'fleet'; verb: ControlVerb; ref: string }
@@ -206,6 +216,12 @@ function parseIntent(text: string): Intent {
   const lower = trimmed.toLowerCase()
 
   if (lower === 'help' || lower === '/help' || lower === '?') return { kind: 'help' }
+  const join = trimmed.match(/^\/start\s+(\S{1,512})$/i)
+  if (join) return { kind: 'join', code: join[1] }
+  const needs = trimmed.match(/^\/needs(?:\s+([A-Za-z0-9_-]{1,255}))?$/i)
+  if (needs) return { kind: 'needs', projectId: needs[1] ?? null }
+  const answer = trimmed.match(/^\/answer\s+([A-Za-z0-9_-]{1,255})\s+([\s\S]+)$/i)
+  if (answer) return { kind: 'answer', runId: answer[1], choice: answer[2] }
 
   // "status" or "status <agent>"
   if (lower === 'status' || lower === '/status') return { kind: 'status', ref: null }
@@ -266,7 +282,8 @@ function parseIntent(text: string): Intent {
 
 // ── reply copy (short, friendly, never leaks internals) ───────────────────────
 const HELP =
-  'I can: "task: <title>" (optionally "@squad"), "status" or "status <agent>", ' +
+  'I can: "/start <invite-code>", "/needs [project-id]", "/answer <run-id> <choice>", ' +
+  '"task: <title>" (optionally "@squad"), "status" or "status <agent>", ' +
   '"wake <agent>", "fleet start|stop|restart|status <agent>", "approve <task-id>", ' +
   '"reject <task-id> <reason>", "directive: <text>", or "directive clear". ' +
   'I act as you, with your permissions.'
@@ -277,6 +294,8 @@ const IM_TASK_DONE_WHEN =
 export interface HandleImMessageOptions {
   /** True only when the transport can prove Telegram forwarded-message metadata. */
   forwarded?: boolean
+  /** Set only by the authenticated webhook after reserving the envelope. */
+  telegram?: TelegramUpdateIdentity
 }
 
 // ── the entry point Hermes calls ──────────────────────────────────────────────
@@ -285,7 +304,9 @@ export interface HandleImMessageOptions {
 //
 // The 3-arg call is intentionally direct/trusted transport. Telegram webhook
 // calls must pass { forwarded:true } when update metadata shows a forwarded
-// message so owner-only effects can fail closed.
+// message so every forwarded command can fail closed. New invitations also
+// require the authenticated, reserved envelope; the trusted direct helper alone
+// cannot establish membership.
 export async function handleImMessage(
   env: Env,
   chatId: string | number,
@@ -293,6 +314,19 @@ export async function handleImMessage(
   options: HandleImMessageOptions = {},
 ): Promise<string> {
   const chat = String(chatId)
+  const intent = parseIntent(text ?? '')
+  if (options.forwarded) return 'Send commands directly from your private chat; forwarded commands are refused.'
+
+  // Invitations establish the mapping, so they must run before member lookup.
+  if (intent.kind === 'join') {
+    if (!options.telegram || options.telegram.telegram_user_id !== chat) {
+      return 'Open your invitation in a direct Telegram conversation to join.'
+    }
+    const result = await redeemTelegramProjectInvite(env, {
+      ...options.telegram, pairing_code: intent.code, display_name: 'Telegram member',
+    })
+    return result.ok ? joinedReply(result.value.project_id) : `Could not join: ${result.error}.`
+  }
 
   // 1) Identity: chat_id → member. No member → polite refusal, NO action taken.
   const member = await memberForChat(env, chat)
@@ -303,10 +337,16 @@ export async function handleImMessage(
   // 2) Capabilities for this member (the real RBAC).
   const grants = await resolveCapabilities(env, member.id)
 
-  // 3) Parse the intent from TEXT (never identity).
-  const intent = parseIntent(text ?? '')
-
   switch (intent.kind) {
+    case 'needs':
+      return needsReply(env, member, grants, intent.projectId)
+
+    case 'answer': {
+      const result = await answerRoutineRun(env, routinePrincipal(memberAuth(env, member, grants)), intent.runId, intent.choice)
+      return result.ok
+        ? (result.duplicate ? `Answer already recorded for ${intent.runId}.` : `Answer recorded for ${intent.runId}.`)
+        : `Could not answer: ${result.error}.`
+    }
     case 'help':
       return HELP
 
@@ -331,6 +371,50 @@ export async function handleImMessage(
     case 'task':
       return taskReply(env, member, grants, intent.title, intent.squadRef)
   }
+}
+
+function joinedReply(projectId: string): string {
+  return `Joined project ${projectId}. Use /needs to see what needs your attention.`
+}
+
+// IM resolves an ordinary human member, just like member HTTP/MCP auth. A
+// capability row never synthesizes a legacy owner/admin role or agent identity.
+function memberAuth(env: Env, member: Member, grants: CapabilityGrant[]): AuthContext {
+  return { userId: member.id, email: member.email, role: 'member', tenant: env.TENANT_SLUG,
+    memberId: member.id, channel: 'im', capabilities: grants, boundAgentId: null }
+}
+
+async function needsReply(env: Env, member: Member, grants: CapabilityGrant[], projectId: string | null): Promise<string> {
+  const principal = routinePrincipal(memberAuth(env, member, grants))
+  const page = await listNeedsYou(env, principal, { ...(projectId ? { project_id: projectId } : {}), limit: 10 })
+  if (!page.items.length) return 'Nothing needs your attention in your accessible projects.'
+  const lines: string[] = []
+  let omitted = Boolean(page.next_cursor || page.truncated)
+  for (const item of page.items) {
+    const actions = item.allowed_actions.map(action => {
+      if (action === 'approve') return `/approve ${item.source_id}`
+      if (action === 'reject') return `/reject ${item.source_id} <reason>`
+      if (action === 'answer') return `/answer ${item.source_id} <choice>`
+      if (action === 'view') return item.safe_url
+      return action
+    })
+    let questionText = ''
+    if (item.allowed_actions.includes('answer')) {
+      const question = await getRoutinePendingQuestion(env, principal, item.source_id)
+      if (question) questionText = `\n${question.question}${question.choices.length ? ` Choices: ${question.choices.join(' | ')}` : ''}`
+    }
+    let line = `${item.project_name}: ${item.title} (${item.source_id})${questionText}\n${actions.join(' · ')}`
+    if (line.length > 3900) {
+      line = `${item.project_name.slice(0, 100)}: ${item.title.slice(0, 200)} (${item.source_id})\n${actions.join(' · ')}\nOpen the item to read its full details.`
+    }
+    if ([...lines, line].join('\n\n').length > 3900) {
+      omitted = true
+      break
+    }
+    lines.push(line)
+  }
+  if (omitted) lines.push('More items are available in the project dashboard.')
+  return lines.join('\n\n')
 }
 
 // ── intent: status (read-only) ────────────────────────────────────────────────
@@ -466,13 +550,9 @@ async function fleetReply(
   return `Queued fleet ${verb} for ${fleetAgentLabel(agent)}. ${fleetRuntimeContext(agent)}`
 }
 
-// ── intent: approval verdict (cap: gate_owner or org admin/owner) ────────────
+// ── intent: approval verdict (shared member + gate grant policy) ────────────
 // Approval authority remains the same append-only gate store as the dashboard:
 // IM only resolves the member, checks access, then calls writeVerdict().
-function canBypassApprovalGate(grants: CapabilityGrant[]): boolean {
-  return hasCapability(grants, 'org', null, 'admin')
-}
-
 // mupot#1080/#1081 (2026-09-04): memberHasGateGrant and memberHasSurfaceGrant
 // used to live here as verdictReply's own hand-rolled gate-ownership +
 // surface-cap checks (bare gate_grants existence, no liveness join, no
@@ -547,76 +627,7 @@ async function verdictReply(
   if (!task.gate_owner) return `"${task.title}" has no approval gate.`
   if (task.status !== 'review') return `"${task.title}" is ${task.status}, not waiting for approval.`
 
-  // mupot#1080/#1081 (2026-09-04): verdictReply is the THIRD write path onto
-  // writeVerdict (HTTP POST /:id/verdict, MCP task_verdict, this one), and
-  // until this fix it was the only one NOT routed through the shared
-  // evaluateVerdictGates predicate. It hand-rolled its own gate-ownership +
-  // surface-cap logic, which — unlike the HTTP/MCP routes — had NO special
-  // case at all for gate:agent-self-completion (BLOCK-1, kasra-review
-  // 2026-08-13: closeable ONLY by the completing agent or org owner/admin,
-  // the grant is NOT authority). gate:agent-self-completion is never
-  // auto-granted (src/members/service.ts:502, deliberate), but nothing on
-  // the grant-management route (POST /api/gates/grants, GATE_CAPABILITY_RE
-  // has no exclusion for this capability string) stops an org admin from
-  // granting it to a plain MEMBER — and the old `memberHasGateGrant` bare
-  // existence check would then treat that member as fully authorized on
-  // ANY gate:agent-self-completion task, including one assigned to an agent
-  // they do not own. That is the BLOCK-1 exploit shape again, reproduced
-  // through a member-type grant instead of the original agent-type one.
-  // Routing through evaluateVerdictGates closes it: a member principal's id
-  // can never equal an agent assignee_agent_id, so gate:agent-self-completion
-  // is only ever passable here via the legacyOwnerAdmin escape (correct by
-  // construction — a human via IM can never BE "the completing agent").
-  //
-  // CORRECTED (mupot#1319 gate BLOCK-2, River's adversarial pass — the
-  // previous wording here claimed this "matches the HTTP/MCP behaviour
-  // exactly." That is FALSE on precisely the gate BLOCK-1 was written to
-  // close, and a load-bearing security comment must not assert a parity
-  // that does not hold):
-  //
-  // The synthetic AuthContext below maps IM's own authority model onto the
-  // shape evaluateVerdictGates expects. `role` is derived from the SAME
-  // hasCapability(grants,'org',null,'admin') check canBypassApprovalGate
-  // already used — so legacyOwnerAdmin (role-only, tasks/index.ts) DOES
-  // recognize a capability-based org admin HERE, on IM, when it does NOT on
-  // the other two write surfaces:
-  //   - MCP: authenticateMember (src/mcp/index.ts) hardcodes role:'member'
-  //     unconditionally — a capability-based org admin's AuthContext never
-  //     carries role:'owner'/'admin' at all.
-  //   - HTTP: the cookie bridge (loadAuthFromCookie, src/auth/index.ts)
-  //     only attaches memberId+capabilities when role==='member' already —
-  //     a session that resolved role:'owner'/'admin' never synthesizes a
-  //     capability-derived role either; it already HAD the legacy role.
-  // So a member holding ONLY an org-scope admin CAPABILITY row (no legacy
-  // role, no gate_grants row at all) passes gate:agent-self-completion for
-  // an agent they do not own via IM, and is refused (no_gate_capability) via
-  // MCP and HTTP for the identical principal and task — verified directly
-  // against the gate, not inferred. This is a genuine, IM-ONLY authority
-  // divergence, not a bug this PR introduces (IM never modeled
-  // gate:agent-self-completion's owner/admin escape at all before this fix,
-  // so there was no parity to break) — but this refactor is what makes it
-  // reachable in the first place, and asserting false parity in the comment
-  // that explains it is a defect in its own right: a future reader reasoning
-  // from "matches HTTP/MCP exactly" would trust a guarantee that is not
-  // there. DO NOT change IM's authority model to close this gap in this PR —
-  // making the synthesized role carry the capability plane (or dropping the
-  // synthesis) is itself a behaviour change to IM's admin authority and
-  // needs its own gate; it is filed as a follow-up to #1080/#1081, not
-  // fixed here. `boundAgentId` is always null (IM never authenticates as an
-  // agent principal, only as the human member behind the chat).
-  //
-  // See tests/im-verdict-gates.test.ts "IM-only escape (not parity)" for the
-  // receipt this comment describes.
-  const auth: AuthContext = {
-    userId: member.id,
-    email: member.email,
-    role: canBypassApprovalGate(grants) ? 'admin' : 'member',
-    tenant: env.TENANT_SLUG,
-    memberId: member.id,
-    channel: 'im',
-    capabilities: grants,
-    boundAgentId: null,
-  }
+  const auth = memberAuth(env, member, grants)
   const gateOwner = task.gate_owner
   const gateResult = await evaluateVerdictGates(
     env,
@@ -799,24 +810,44 @@ async function taskReply(
 }
 
 // ── HTTP surface ──────────────────────────────────────────────────────────────
-// Minimal + safe. Hermes can POST the raw Telegram update here, OR call
-// handleImMessage(env, chatId, text) directly. We ONLY trust chat.id for identity
-// and message.text for the intent — nothing else from the body.
+// The shared secret authenticates Telegram's envelope. Only a private message
+// whose immutable sender and chat IDs agree can establish a human principal.
 export const imApp = new Hono<AppEnv>()
 
 imApp.get('/health', (c) => c.json({ ok: true, component: 'im', tenant: c.env.TENANT_SLUG }))
 
-// The slice of a Telegram update we read. Everything else is ignored. We do NOT
-// read any "from"/username/identity field — identity is the chat.id mapping only.
+// Display names and usernames never identify a human or contribute authority.
 interface TelegramUpdate {
+  update_id?: unknown
   message?: {
-    chat?: { id?: unknown }
+    chat?: { id?: unknown; type?: unknown }
+    from?: { id?: unknown }
     text?: unknown
     forward_origin?: unknown
     forward_from?: unknown
     forward_from_chat?: unknown
     forward_date?: unknown
   }
+}
+
+function telegramId(raw: unknown, allowZero = false): string | null {
+  const value = typeof raw === 'string' && /^(0|[1-9][0-9]{0,15})$/.test(raw)
+    ? Number(raw) : typeof raw === 'number' ? raw : NaN
+  return Number.isSafeInteger(value) && value >= (allowZero ? 0 : 1) ? String(value) : null
+}
+
+function storedTelegramReply(responseText: string): { ok: true; reply: string } | null {
+  try {
+    const value = JSON.parse(responseText) as Record<string, unknown> | null
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+    if (value.ok === true && typeof value.reply === 'string') return { ok: true, reply: value.reply }
+    // Project redemption completes this receipt in its atomic membership batch.
+    if (typeof value.member_id === 'string' && typeof value.project_id === 'string'
+      && typeof value.squad_id === 'string' && typeof value.capability === 'string') {
+      return { ok: true, reply: joinedReply(value.project_id) }
+    }
+  } catch { /* An unreadable result is uncertain, never permission to retry. */ }
+  return null
 }
 
 // POST /webhook — accept a Telegram-style update, resolve + act, reply.
@@ -849,25 +880,42 @@ imApp.post('/webhook', async (c) => {
   } catch {
     return c.json({ error: 'invalid_json' }, 400)
   }
-
-  const rawId = update.message?.chat?.id
-  // chat id may arrive as number or string; anything else is unusable.
-  const chatId =
-    typeof rawId === 'number' && Number.isFinite(rawId)
-      ? String(rawId)
-      : typeof rawId === 'string' && rawId.trim().length > 0
-        ? rawId.trim()
-        : null
+  if (!update || typeof update !== 'object' || Array.isArray(update)) return c.json({ error: 'invalid_update' }, 400)
+  const chatId = telegramId(update.message?.chat?.id)
   if (!chatId) return c.json({ error: 'no_chat_id' }, 400)
-
+  const userId = telegramId(update.message?.from?.id)
+  if (!userId) return c.json({ error: 'no_user_id' }, 400)
+  const updateId = telegramId(update.update_id, true)
+  if (!updateId) return c.json({ error: 'no_update_id' }, 400)
+  if (update.message?.chat?.type !== 'private' || userId !== chatId) {
+    return c.json({ error: 'private_chat_required' }, 400)
+  }
   const text = typeof update.message?.text === 'string' ? update.message.text : ''
-
-  const forwarded =
-    update.message?.forward_origin !== undefined ||
-    update.message?.forward_from !== undefined ||
-    update.message?.forward_from_chat !== undefined ||
-    update.message?.forward_date !== undefined
-
-  const reply = await handleImMessage(c.env, chatId, text, { forwarded })
-  return c.json({ ok: true, reply })
+  if (text.length > 4096) return c.json({ error: 'message_too_long' }, 400)
+  const forwarding = {
+    forward_origin: update.message?.forward_origin !== undefined,
+    forward_from: update.message?.forward_from !== undefined,
+    forward_from_chat: update.message?.forward_from_chat !== undefined,
+    forward_date: update.message?.forward_date !== undefined,
+  }
+  let digest: string
+  try {
+    digest = await canonicalJsonDigest({ update_id: updateId, telegram_user_id: userId, chat_id: chatId, text, forwarding })
+  } catch {
+    return c.json({ error: 'invalid_update' }, 400)
+  }
+  const identity: TelegramUpdateIdentity = { update_id: updateId, telegram_user_id: userId, request_digest: digest }
+  const reservation = await reserveTelegramUpdate(c.env, identity)
+  if (!reservation.ok) return c.json({ error: reservation.error }, 409)
+  if (reservation.duplicate) {
+    const response = storedTelegramReply(reservation.response_text)
+    return response ? c.json(response) : c.json({ error: 'update_in_progress' }, 409)
+  }
+  // Never release or replace the reservation after an uncertain side effect.
+  const reply = await handleImMessage(c.env, chatId, text, {
+    forwarded: Object.values(forwarding).some(Boolean), telegram: identity,
+  })
+  const stored = await completeTelegramUpdate(c.env, identity, JSON.stringify({ ok: true, reply }))
+  const response = stored === null ? null : storedTelegramReply(stored)
+  return response ? c.json(response) : c.json({ error: 'update_in_progress' }, 409)
 })
