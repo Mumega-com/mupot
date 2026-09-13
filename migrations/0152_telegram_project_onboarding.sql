@@ -38,6 +38,14 @@ BEGIN
       length(NEW.pairing_hash) <> 64
       OR NEW.pairing_hash GLOB '*[^0-9A-Fa-f]*'
     );
+  SELECT RAISE(ABORT, 'project invite project-squad mismatch')
+  WHERE NEW.project_id IS NOT NULL
+    AND NOT EXISTS (
+      SELECT 1
+      FROM project_squad_access
+      WHERE project_id = NEW.project_id
+        AND squad_id = NEW.squad_id
+    );
 END;
 
 CREATE TRIGGER validate_invites_project_pairing_update
@@ -68,6 +76,14 @@ BEGIN
     AND (
       length(NEW.pairing_hash) <> 64
       OR NEW.pairing_hash GLOB '*[^0-9A-Fa-f]*'
+    );
+  SELECT RAISE(ABORT, 'project invite project-squad mismatch')
+  WHERE NEW.project_id IS NOT NULL
+    AND NOT EXISTS (
+      SELECT 1
+      FROM project_squad_access
+      WHERE project_id = NEW.project_id
+        AND squad_id = NEW.squad_id
     );
 END;
 

@@ -23,8 +23,11 @@ describe('Telegram project onboarding schema', () => {
       VALUES ('department-1', 'delivery', 'Delivery');
       INSERT INTO squads (id, department_id, slug, name)
       VALUES ('squad-1', 'department-1', 'telegram', 'Telegram');
-      INSERT INTO projects (id, slug, name, status)
-      VALUES ('project-1', 'telegram-onboarding', 'Telegram onboarding', 'active');
+      INSERT INTO projects (id, slug, name, status) VALUES
+        ('project-1', 'telegram-onboarding', 'Telegram onboarding', 'active'),
+        ('project-2', 'other-project', 'Other project', 'active');
+      INSERT INTO project_squad_access (project_id, squad_id, access_level)
+      VALUES ('project-1', 'squad-1', 'write');
     `)
   }
 
@@ -107,6 +110,33 @@ describe('Telegram project onboarding schema', () => {
     `).run(VALID_PAIRING_HASH)
     expect(harness.sqlite.prepare(`
       SELECT project_id, squad_id FROM invites WHERE id = 'invite-update'
+    `).get()).toEqual({ project_id: 'project-1', squad_id: 'squad-1' })
+  })
+
+  it('rejects an invite insert whose existing project and squad have no access edge', () => {
+    createProjectAndSquad()
+
+    expect(() => harness.sqlite.prepare(`
+      INSERT INTO invites (
+        id, email, project_id, squad_id, pairing_hash, pairing_expires_at
+      ) VALUES (
+        'mismatched-insert', 'mismatched-insert@example.com', 'project-2', 'squad-1',
+        ?, '2026-09-13T01:00:00Z'
+      )
+    `).run(VALID_PAIRING_HASH)).toThrow(/project invite project-squad mismatch/)
+  })
+
+  it('rejects an invite update to an existing project and squad with no access edge', () => {
+    createProjectAndSquad()
+    insertProjectInvite('mismatched-update')
+
+    expect(() => harness.sqlite.exec(`
+      UPDATE invites
+      SET project_id = 'project-2'
+      WHERE id = 'mismatched-update'
+    `)).toThrow(/project invite project-squad mismatch/)
+    expect(harness.sqlite.prepare(`
+      SELECT project_id, squad_id FROM invites WHERE id = 'mismatched-update'
     `).get()).toEqual({ project_id: 'project-1', squad_id: 'squad-1' })
   })
 
