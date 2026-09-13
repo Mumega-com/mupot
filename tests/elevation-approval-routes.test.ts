@@ -8,7 +8,11 @@
 // routing decide_elevation through authApp instead of a tool.
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { authApp } from '../src/auth'
-import type { Env } from '../src/types'
+import { invokeTool } from '../src/mcp'
+import type { AuthContext, Env } from '../src/types'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { exactActionHash, type ExactAction } from '../src/auth/exact-action'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { createAgentSession } from '../src/auth/agent-sessions'
@@ -51,6 +55,81 @@ describe('elevation approval — integration through authApp (real D1)', () => {
   })
 
   afterEach(() => harness.close())
+
+  it('human steering: deny A, approve changed B, then revoke B on the same worker session', async () => {
+    const env = makeEnv('admin@x.test')
+    const { session } = await seedFixture(env)
+    await env.DB.prepare(
+      "INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('steering-admin', ?1, 'org', NULL, 'admin')",
+    ).bind(ADMIN_MEMBER).run()
+    const cookie = await devLogin(env)
+    await markReauth(env, cookie)
+    const auth: AuthContext = {
+      userId: AGENT_MEMBER, memberId: AGENT_MEMBER, email: null, role: 'member',
+      tenant: TENANT, channel: 'workspace', boundAgentId: AGENT_ID, tokenId: TOKEN_ID, capabilities: [],
+    }
+    const fixture = JSON.parse(readFileSync(join(import.meta.dirname, 'fixtures/exact-action-v1.json'), 'utf8')) as { action: ExactAction }
+    const { principal: _fixturePrincipal, tenant: _fixtureTenant, ...fieldsA } = fixture.action
+    const fieldsB = { ...fieldsA, payload_hash: 'b'.repeat(64) }
+    const hashA = await exactActionHash({ principal: AGENT_ID, tenant: TENANT, ...fieldsA })
+    const hashB = await exactActionHash({ principal: AGENT_ID, tenant: TENANT, ...fieldsB })
+    expect(hashB).not.toBe(hashA)
+    const propose = async (fields: typeof fieldsA, reason: string) => {
+      const result = await invokeTool(auth, env, 'request_elevation', {
+        actions: ['action:knowledge_write'], scope_type: 'org', duration_minutes: 15,
+        reason, exact_action: fields,
+      }, 'https://pot.test')
+      expect(result.ok, JSON.stringify(result)).toBe(true)
+      return (result as { ok: true; result: { request: { id: string } } }).result.request.id
+    }
+    const decide = async (id: string, body: object) => {
+      const response = await authApp.request(`/elevation/requests/${id}/decide`, {
+        method: 'POST', headers: { cookie: `mupot_session=${cookie}`, 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      }, env)
+      expect(response.status).toBe(200)
+      return response.json() as Promise<{ ok: boolean; request: { status: string }; grants: Array<{ id: string }> }>
+    }
+    const verify = (hash: string, fields: typeof fieldsA) => invokeTool(auth, env, 'verify_protected_action', {
+      exact_action_hash: hash, ...fields,
+    }, 'https://pot.test')
+    const usageCount = async () => Number((await env.DB.prepare('SELECT COUNT(*) AS n FROM elevation_usage_log').first<{ n: number }>())?.n)
+
+    const requestA = await propose(fieldsA, 'original memory delta A')
+    const pendingA = await verify(hashA, fieldsA)
+    expect(pendingA.ok).toBe(false)
+    expect(await usageCount()).toBe(0)
+    const denial = await decide(requestA, { decision: 'deny', note: 'Change the memory delta to B; A is not permitted.' })
+    expect(denial.request.status).toBe('denied')
+    const requestB = await propose(fieldsB, 'changed memory delta B')
+    expect(requestB).not.toBe(requestA)
+    const approval = await decide(requestB, {
+      decision: 'approve', actions: ['action:knowledge_write'], duration_minutes: 15,
+      bound_action_hash: hashB,
+    })
+    expect(approval.ok).toBe(true)
+    expect(approval.grants).toHaveLength(1)
+    expect((await verify(hashA, fieldsA)).ok).toBe(false)
+    expect(await usageCount()).toBe(0)
+    const verifiedB = await verify(hashB, fieldsB)
+    expect(verifiedB.ok, JSON.stringify(verifiedB)).toBe(true)
+    if (verifiedB.ok) expect(verifiedB.result).toMatchObject({ grant_id: approval.grants[0].id, bound_action_hash: hashB })
+    expect(await usageCount()).toBe(1)
+
+    const revoked = await authApp.request(`/elevation/${approval.grants[0].id}/revoke`, {
+      method: 'POST', headers: { cookie: `mupot_session=${cookie}` },
+    }, env)
+    expect(revoked.status).toBe(200)
+    expect(await revoked.json()).toEqual({ revoked: true })
+    expect((await verify(hashB, fieldsB)).ok).toBe(false)
+    expect(await usageCount()).toBe(1)
+    const rows = await env.DB.prepare('SELECT id, agent_session_id, status FROM elevation_requests ORDER BY created_at, id')
+      .all<{ id: string; agent_session_id: string; status: string }>()
+    expect(rows.results).toEqual(expect.arrayContaining([
+      { id: requestA, agent_session_id: session.id, status: 'denied' },
+      { id: requestB, agent_session_id: session.id, status: 'approved' },
+    ]))
+  })
 
   async function seedFixture(env: Env) {
     env.DB = harness.db
