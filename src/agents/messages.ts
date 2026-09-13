@@ -1457,6 +1457,7 @@ export async function ackAgentInboxLeaseAttempt(
                      AND a.delivery_attempt = m.delivery_attempts
                 )
           WHERE m.tenant = ?1 AND m.to_agent = ?2 AND m.read_at = ?5
+            AND m.lease_expires_at IS NULL
             AND m.lease_attempt_id = ?6 AND ${seat}
             AND NOT (${fence})
             AND EXISTS (

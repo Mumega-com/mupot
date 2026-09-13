@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import {
   ackAgentInboxLeaseAttempt,
@@ -259,6 +259,46 @@ describe('authoritative attempt scope proof and ACK', () => {
         'SELECT state, message_id FROM agent_inbox_lease_attempts WHERE attempt_id=?',
       ).get(A)).toEqual({ state: 'leased', message_id: 'm1' })
     } finally { f.harness.close() }
+  })
+
+  it('never rolls back a same-time legacy inbox consume when attempt ACK is fenced', async () => {
+    const f = fixture()
+    vi.useFakeTimers()
+    try {
+      const token = f.installToken()
+      const actor = f.auth(token)
+      f.seed('m1')
+      vi.setSystemTime(new Date(at(0)))
+      expect(await invokeTool(actor, f.env, 'inbox_lease', {
+        attempt_id: A, limit: 1, lease_seconds: 30,
+      })).toMatchObject({ ok: true, result: { state: 'leased', messages: [{ id: 'm1' }] } })
+
+      vi.setSystemTime(new Date(at(1)))
+      expect(await invokeTool(actor, f.env, 'inbox', {})).toMatchObject({
+        ok: true, result: { consumed: true, messages: [{ id: 'm1' }] },
+      })
+      expect(f.harness.sqlite.prepare(
+        "SELECT read_at, lease_expires_at FROM agent_messages WHERE id='m1'",
+      ).get()).toEqual({ read_at: at(1), lease_expires_at: at(30) })
+
+      f.harness.sqlite.prepare(`
+        INSERT INTO agent_inbox_fences
+          (tenant, agent_id, mode, generation, key_fingerprint, updated_by_member_id, updated_at, reason)
+        VALUES ('tenant-a', 'agent-a', 'signed_only', 1, ?, ?, ?, 'test')
+      `).run('f'.repeat(64), token.member, at(1))
+      expect(await invokeTool(actor, f.env, 'inbox_lease_ack', { attempt_id: A }))
+        .toMatchObject({ ok: false, status: 409, error: 'consumer_fenced' })
+
+      expect(f.harness.sqlite.prepare(
+        "SELECT read_at, lease_expires_at FROM agent_messages WHERE id='m1'",
+      ).get()).toEqual({ read_at: at(1), lease_expires_at: at(30) })
+      expect(f.harness.sqlite.prepare(
+        'SELECT state, message_id FROM agent_inbox_lease_attempts WHERE attempt_id=?',
+      ).get(A)).toEqual({ state: 'leased', message_id: 'm1' })
+    } finally {
+      vi.useRealTimers()
+      f.harness.close()
+    }
   })
 
   it('does not read anything for unknown, empty, cancelled, or expired attempts', async () => {
