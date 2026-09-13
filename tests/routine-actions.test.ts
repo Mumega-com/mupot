@@ -33,6 +33,34 @@ function failFlightCreation(env: Env): Env {
   }
 }
 
+function observeHumanWaitMessage(
+  env: Env,
+  beforeInsert: () => void,
+): Env {
+  const db = env.DB
+  return {
+    ...env,
+    DB: {
+      prepare(sql: string) {
+        const statement = db.prepare(sql)
+        if (!/INSERT INTO agent_messages/.test(sql)) return statement
+        return {
+          bind(...values: unknown[]) {
+            const bound = statement.bind(...values)
+            return {
+              async run() {
+                beforeInsert()
+                return bound.run()
+              },
+            } as unknown as D1PreparedStatement
+          },
+        } as unknown as D1PreparedStatement
+      },
+      batch: db.batch.bind(db),
+    } as unknown as D1Database,
+  }
+}
+
 // #916: fail ONLY the receipt INSERT, so the landing transition itself still commits.
 // That is the half-landed state landControlFlight's re-check exists to adjudicate: the
 // flight really is 'landed', but no flight.landed receipt was ever written.
@@ -317,17 +345,49 @@ describe('Routine proposal submission and governed actions', () => {
 
   it('routes propose mode through the existing Task review gate', async () => {
     fixture = await makeReadyRoutineFixture('propose')
-    const result = await submitRoutineProposal(fixture.env, fixture.principal, fixture.proposal({
+    let insertAttempts = 0
+    const notifyingEnv = observeHumanWaitMessage(fixture.env, () => {
+      insertAttempts += 1
+      expect(row(fixture!, "SELECT status, waiting_reason FROM routine_runs WHERE id = 'run-1'")).toEqual({
+        status: 'waiting', waiting_reason: 'review',
+      })
+      expect(row(fixture!, "SELECT status, gate_status, source_type, source_id FROM routine_run_actions WHERE action_key = 'task-1'")).toEqual({
+        status: 'waiting', gate_status: 'pending', source_type: 'task', source_id: 'control-task',
+      })
+    })
+    const proposal = fixture.proposal({
       key: 'task-1', kind: 'create_task', input: { title: 'Task', description: 'Description' },
-    }))
+    })
+    const result = await submitRoutineProposal(notifyingEnv, fixture.principal, proposal)
 
-    expect(result).toMatchObject({ ok: true, status: 'waiting', reason: 'review', duplicate: false })
+    expect(result).toMatchObject({
+      ok: true, status: 'waiting', reason: 'review', duplicate: false, notification_pending: false,
+    })
     expect(row(fixture, "SELECT status, gate_owner FROM tasks WHERE id = 'control-task'")).toEqual({
       status: 'review', gate_owner: 'gate:routines',
     })
     expect(row(fixture, "SELECT status, waiting_reason FROM routine_runs WHERE id = 'run-1'")).toEqual({
       status: 'waiting', waiting_reason: 'review',
     })
+    const message = row(fixture, "SELECT to_agent, from_agent, from_member, kind, request_id, project_id, body FROM agent_messages")
+    expect(message).toMatchObject({
+      to_agent: 'agent-1', from_agent: 'mupot-routines', from_member: 'system:routines',
+      kind: 'request', request_id: 'routine-human:run-1:task-1', project_id: 'project-1',
+    })
+    expect(JSON.parse(String(message?.body))).toEqual({
+      version: 'routine.human-wait/v1',
+      type: 'routine_human_wait',
+      project_id: 'project-1',
+      run_id: 'run-1',
+      action_key: 'task-1',
+      reason: 'review',
+      decision: { type: 'review', task_id: 'control-task' },
+    })
+    await expect(submitRoutineProposal(notifyingEnv, fixture.principal, proposal)).resolves.toMatchObject({
+      ok: true, status: 'waiting', reason: 'review', duplicate: true, notification_pending: false,
+    })
+    expect(insertAttempts).toBe(1)
+    expect(row(fixture, 'SELECT COUNT(*) AS count FROM agent_messages')).toEqual({ count: 1 })
   })
 
   it('converges concurrent propose-mode replay on one review request', async () => {
@@ -347,6 +407,51 @@ describe('Routine proposal submission and governed actions', () => {
       expect.objectContaining({ ok: true, status: 'waiting', reason: 'review', duplicate: true }),
     ]))
     expect(row(fixture, "SELECT COUNT(*) AS count FROM routine_run_events WHERE kind = 'approval_requested'")).toEqual({ count: 1 })
+  })
+
+  it('keeps the stable human-wait request ID valid for maximum-length action keys', async () => {
+    fixture = await makeReadyRoutineFixture('execute_internal')
+    const actionKey = 'a'.repeat(200)
+    const proposal = fixture.proposal({
+      key: actionKey, kind: 'ask_human',
+      input: { question: 'Choose one.', choices: ['A', 'B'], references: [] },
+    })
+
+    await expect(submitRoutineProposal(fixture.env, fixture.principal, proposal)).resolves.toMatchObject({
+      ok: true, status: 'waiting', notification_pending: false,
+    })
+    const first = row(fixture, 'SELECT request_id FROM agent_messages')
+    expect(first?.request_id).toMatch(/^routine-human:[a-f0-9]{64}$/)
+    expect(String(first?.request_id)).toHaveLength(78)
+
+    await expect(submitRoutineProposal(fixture.env, fixture.principal, proposal)).resolves.toMatchObject({
+      ok: true, status: 'waiting', duplicate: true, notification_pending: false,
+    })
+    expect(row(fixture, 'SELECT COUNT(*) AS count FROM agent_messages')).toEqual({ count: 1 })
+    expect(row(fixture, 'SELECT request_id FROM agent_messages')).toEqual(first)
+  })
+
+  it('bounds the human-wait decision summary after JSON escaping', async () => {
+    fixture = await makeReadyRoutineFixture('execute_internal')
+    const choices = Array.from({ length: 5 }, (_, index) => `${'"'.repeat(499)}${index}`)
+
+    await expect(submitRoutineProposal(fixture.env, fixture.principal, fixture.proposal({
+      key: 'escaped-summary', kind: 'ask_human',
+      input: { question: '"'.repeat(2000), choices, references: [] },
+    }))).resolves.toMatchObject({
+      ok: true, status: 'waiting', notification_pending: false,
+    })
+
+    const message = row(fixture, 'SELECT body FROM agent_messages')
+    expect(String(message?.body).length).toBeLessThanOrEqual(8000)
+    const body = JSON.parse(String(message?.body)) as {
+      decision: { type: string; question: string; choices: string[]; truncated?: boolean }
+    }
+    expect(body.decision).toMatchObject({
+      type: 'answer', truncated: true,
+      question: '"'.repeat(1000),
+      choices: choices.map(choice => choice.slice(0, 300)),
+    })
   })
 
   it('executes internal task creation once and returns the same result on replay', async () => {
@@ -462,11 +567,44 @@ describe('Routine proposal submission and governed actions', () => {
 
     fixture.harness.close()
     fixture = await makeReadyRoutineFixture('execute_internal')
-    const question = await submitRoutineProposal(fixture.env, fixture.principal, fixture.proposal({
+    let insertAttempts = 0
+    const notifyingEnv = observeHumanWaitMessage(fixture.env, () => {
+      insertAttempts += 1
+      expect(row(fixture!, "SELECT status, waiting_reason FROM routine_runs WHERE id = 'run-1'")).toEqual({
+        status: 'waiting', waiting_reason: 'answer',
+      })
+      expect(row(fixture!, "SELECT status, source_type FROM routine_run_actions WHERE action_key = 'question-1'")).toEqual({
+        status: 'waiting', source_type: 'question',
+      })
+    })
+    const proposal = fixture.proposal({
       key: 'question-1', kind: 'ask_human',
       input: { question: 'Which event is authoritative?', choices: ['Booked', 'Paid'], references: [] },
-    }))
-    expect(question).toMatchObject({ ok: true, status: 'waiting', reason: 'answer' })
+    })
+    const question = await submitRoutineProposal(notifyingEnv, fixture.principal, proposal)
+    expect(question).toMatchObject({
+      ok: true, status: 'waiting', reason: 'answer', duplicate: false, notification_pending: false,
+    })
+    const message = row(fixture, "SELECT to_agent, request_id, project_id, body FROM agent_messages")
+    expect(message).toMatchObject({
+      to_agent: 'agent-1', request_id: 'routine-human:run-1:question-1', project_id: 'project-1',
+    })
+    expect(JSON.parse(String(message?.body))).toEqual({
+      version: 'routine.human-wait/v1',
+      type: 'routine_human_wait',
+      project_id: 'project-1',
+      run_id: 'run-1',
+      action_key: 'question-1',
+      reason: 'answer',
+      decision: {
+        type: 'answer', question: 'Which event is authoritative?', choices: ['Booked', 'Paid'],
+      },
+    })
+    await expect(submitRoutineProposal(notifyingEnv, fixture.principal, proposal)).resolves.toMatchObject({
+      ok: true, status: 'waiting', reason: 'answer', duplicate: true, notification_pending: false,
+    })
+    expect(insertAttempts).toBe(1)
+    expect(row(fixture, 'SELECT COUNT(*) AS count FROM agent_messages')).toEqual({ count: 1 })
 
     const responder: RoutinePrincipal = {
       ...fixture.principal,

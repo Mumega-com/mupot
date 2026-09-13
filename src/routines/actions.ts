@@ -1,4 +1,5 @@
 import type { D1Result } from '@cloudflare/workers-types'
+import { sendAgentMessage } from '../agents/messages'
 import { TASK_SELECT_COLUMNS } from '../tasks/ranking'
 import { canonicalJson, canonicalJsonDigest, sha256Hex } from '../lib/canonical-json'
 import { loadProjectSituation } from '../projects/situation'
@@ -31,6 +32,8 @@ import { routineControlId } from './identity'
 
 const ROUTINE_GATE = 'gate:routines'
 const ROUTINE_ACTOR = 'mupot-routines'
+const ROUTINE_MEMBER = 'system:routines'
+const HUMAN_WAIT_BODY_LIMIT = 8000
 
 type ProposalError =
   | 'invalid_proposal' | 'run_not_found' | 'run_not_accepting_proposal' | 'forbidden'
@@ -45,13 +48,13 @@ type ActionError =
   | 'project_not_active' | 'action_failed' | 'receipt_failed'
 
 export type RoutineProposalResult =
-  | { ok: true; status: 'waiting'; reason: 'review' | 'answer'; run_id: string; action_key: string; duplicate: boolean }
+  | { ok: true; status: 'waiting'; reason: 'review' | 'answer'; run_id: string; action_key: string; duplicate: boolean; notification_pending: boolean }
   | { ok: true; status: 'retry_scheduled'; reason: 'execution_failed'; run_id: string; action_key: string; duplicate: boolean }
   | { ok: true; status: 'succeeded'; run_id: string; action_key: string; result: Record<string, unknown>; duplicate: boolean }
   | { ok: false; error: ProposalError | ActionError }
 
 export type RoutineActionResult =
-  | { ok: true; status: 'waiting'; reason: 'review' | 'answer'; run_id: string; action_key: string; duplicate: boolean }
+  | { ok: true; status: 'waiting'; reason: 'review' | 'answer'; run_id: string; action_key: string; duplicate: boolean; notification_pending: boolean }
   | { ok: true; status: 'retry_scheduled'; reason: 'execution_failed'; run_id: string; action_key: string; duplicate: boolean }
   | { ok: true; status: 'succeeded'; run_id: string; action_key: string; result: Record<string, unknown>; duplicate: boolean }
   | { ok: false; error: ActionError }
@@ -272,6 +275,82 @@ function pendingQuestion(action: ActionRow): RoutinePendingQuestion | null {
     return choices ? { action_key: action.action_key, question: input.question, choices } : null
   } catch {
     return null
+  }
+}
+
+async function humanWaitRequestId(runId: string, actionKey: string): Promise<string> {
+  const requestId = `routine-human:${runId}:${actionKey}`
+  return requestId.length <= 128
+    ? requestId
+    : `routine-human:${await sha256Hex(`${runId}:${actionKey}`)}`
+}
+
+type HumanWaitDecision =
+  | { type: 'review'; task_id: string; truncated?: true }
+  | { type: 'answer'; question: string; choices: string[]; truncated?: true }
+
+function humanWaitBody(
+  run: RunContext,
+  action: ActionRow,
+  reason: 'review' | 'answer',
+  decision: HumanWaitDecision,
+): string {
+  const envelope = (boundedDecision: HumanWaitDecision) => JSON.stringify({
+    version: 'routine.human-wait/v1',
+    type: 'routine_human_wait',
+    project_id: run.project_id,
+    run_id: run.id,
+    action_key: action.action_key,
+    reason,
+    decision: boundedDecision,
+  })
+  const body = envelope(decision)
+  if (body.length <= HUMAN_WAIT_BODY_LIMIT) return body
+  return envelope(decision.type === 'review'
+    ? { type: 'review', task_id: decision.task_id.slice(0, 500), truncated: true }
+    : {
+        type: 'answer',
+        question: decision.question.slice(0, 1000),
+        choices: decision.choices.map(choice => choice.slice(0, 300)),
+        truncated: true,
+      })
+}
+
+async function notifyHumanWait(
+  env: Env,
+  run: RunContext,
+  action: ActionRow,
+  reason: 'review' | 'answer',
+): Promise<boolean> {
+  if (!run.assigned_agent_id) return true
+  const decision: HumanWaitDecision | null = reason === 'review'
+    ? run.task_id ? { type: 'review', task_id: run.task_id } : null
+    : (() => {
+        const question = pendingQuestion(action)
+        return question
+          ? { type: 'answer', question: question.question, choices: question.choices }
+          : null
+      })()
+  if (!decision) return true
+
+  try {
+    const delivery = await sendAgentMessage(env, {
+      fromAgent: ROUTINE_ACTOR,
+      fromMember: ROUTINE_MEMBER,
+      toAgent: run.assigned_agent_id,
+      kind: 'request',
+      requestId: await humanWaitRequestId(run.id, action.action_key),
+      projectId: run.project_id,
+      body: humanWaitBody(run, action, reason, decision),
+    }, {
+      system: true,
+      reason: 'human-wait target is the server-owned assigned agent on the committed Routine run',
+    }, {
+      systemProjectAttribution: true,
+    })
+    return !delivery.ok
+  } catch {
+    return true
   }
 }
 
@@ -671,11 +750,19 @@ async function waitForHuman(
   if (outcomes.some(outcome => !wrote(outcome))) {
     const raced = await loadAction(env, run.id, action.action_key)
     if (raced?.status === 'waiting') {
-      return { ok: true, status: 'waiting', reason, run_id: run.id, action_key: action.action_key, duplicate: true }
+      const notificationPending = await notifyHumanWait(env, run, raced, reason)
+      return {
+        ok: true, status: 'waiting', reason, run_id: run.id, action_key: action.action_key,
+        duplicate: true, notification_pending: notificationPending,
+      }
     }
     return { ok: false, error: 'receipt_failed' }
   }
-  return { ok: true, status: 'waiting', reason, run_id: run.id, action_key: action.action_key, duplicate: false }
+  const notificationPending = await notifyHumanWait(env, run, action, reason)
+  return {
+    ok: true, status: 'waiting', reason, run_id: run.id, action_key: action.action_key,
+    duplicate: false, notification_pending: notificationPending,
+  }
 }
 
 async function approvedGate(env: Env, action: ActionRow): Promise<'approved' | 'rejected' | null> {
@@ -694,13 +781,16 @@ async function replayWaitingAction(
   if (run.waiting_reason === 'review' && await approvedGate(env, action)) {
     return executeRoutineAction(env, run.id, action.action_key)
   }
+  const reason = run.waiting_reason === 'answer' ? 'answer' : 'review'
+  const notificationPending = await notifyHumanWait(env, run, action, reason)
   return {
     ok: true,
     status: 'waiting',
-    reason: run.waiting_reason === 'answer' ? 'answer' : 'review',
+    reason,
     run_id: run.id,
     action_key: action.action_key,
     duplicate: true,
+    notification_pending: notificationPending,
   }
 }
 
