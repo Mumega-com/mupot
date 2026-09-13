@@ -53,6 +53,7 @@ import {
   mintRawToken,
   upsertCapabilityGrant,
 } from './service'
+import { createProjectInvite, type CreateProjectInviteError } from './project-invites'
 import {
   isAgentAccessCapability,
   removeAgentSquadAccess,
@@ -65,9 +66,13 @@ import {
 // The validated invite payload, stashed by the parse middleware so the scope
 // extractor (which runs inside requireCapability) can read the target department.
 interface ParsedInvite {
+  kind: 'legacy' | 'project'
   email: string
   department_id: string | null
+  project_id: string | null
+  squad_id: string | null
   capability: Capability
+  expires_in_seconds: number | null
 }
 
 type AppEnv = {
@@ -173,17 +178,17 @@ membersApp.post('/invites/:id/accept', async (c) => {
     return c.json({ error: 'invalid_json' }, 400)
   }
 
+  if (!body || typeof body !== 'object') return c.json({ error: 'invalid_json' }, 400)
+
+  // Telegram identity is accepted only from the authenticated webhook envelope.
+  // The public/browser redemption body is never an identity authority, even when
+  // it carries a syntactically valid numeric chat id.
+  if (Object.prototype.hasOwnProperty.call(body, 'telegram_chat_id')) {
+    return c.json({ error: 'telegram_identity_requires_authenticated_webhook' }, 400)
+  }
+
   if (!isNonEmptyString(body.display_name)) return c.json({ error: 'invalid_display_name' }, 400)
   const displayName = body.display_name.trim()
-
-  // telegram_chat_id is optional — present for IM-first members.
-  let telegramChatId: string | null = null
-  if (body.telegram_chat_id !== undefined && body.telegram_chat_id !== null) {
-    if (!isNonEmptyString(body.telegram_chat_id)) {
-      return c.json({ error: 'invalid_telegram_chat_id' }, 400)
-    }
-    telegramChatId = body.telegram_chat_id.trim()
-  }
 
   const invite = await c.env.DB.prepare(
     'SELECT id, email, department_id, capability, invited_by, accepted_at, created_at FROM invites WHERE id = ? LIMIT 1',
@@ -200,7 +205,7 @@ membersApp.post('/invites/:id/accept', async (c) => {
     id: crypto.randomUUID(),
     email: invite.email,
     display_name: displayName,
-    telegram_chat_id: telegramChatId,
+    telegram_chat_id: null,
     status: 'active',
     created_at: new Date().toISOString(),
   }
@@ -316,7 +321,10 @@ const orgScope = (_c: Context): { type: CapabilityScopeType; id: string | null }
 interface CreateInviteBody {
   email?: unknown
   department_id?: unknown
+  project_id?: unknown
+  squad_id?: unknown
   capability?: unknown
+  expires_in_seconds?: unknown
 }
 
 // Creating an invite requires admin. When the invite targets a department, admin
@@ -326,6 +334,9 @@ const inviteScope = (c: Context): { type: CapabilityScopeType; id: string | null
   // The frozen requireCapability types its scope arg as (c: Context) => …, so we
   // read our stashed variable through the typed view of the same context.
   const parsed = (c as Context<AppEnv>).get('inviteBody')
+  if (parsed?.kind === 'project' && parsed.squad_id) {
+    return { type: 'squad', id: parsed.squad_id }
+  }
   const dept = parsed?.department_id ?? null
   return dept ? { type: 'department', id: dept } : { type: 'org', id: null }
 }
@@ -341,7 +352,43 @@ const parseInvite: MiddlewareHandler<AppEnv> = async (c, next) => {
     return c.json({ error: 'invalid_json' }, 400)
   }
 
+  if (!body || typeof body !== 'object') return c.json({ error: 'invalid_json' }, 400)
+
   if (!isEmail(body.email)) return c.json({ error: 'invalid_email' }, 400)
+
+  const hasProjectFields =
+    body.project_id !== undefined
+    || body.squad_id !== undefined
+    || body.expires_in_seconds !== undefined
+
+  const capability: Capability =
+    body.capability === undefined ? 'member' : (body.capability as Capability)
+  if (!isCapability(capability)) return c.json({ error: 'invalid_capability' }, 400)
+
+  if (hasProjectFields) {
+    if (body.department_id !== undefined && body.department_id !== null) {
+      return c.json({ error: 'invalid_invite_scope' }, 400)
+    }
+    if (!isNonEmptyString(body.project_id)) return c.json({ error: 'invalid_project_id' }, 400)
+    if (!isNonEmptyString(body.squad_id)) return c.json({ error: 'invalid_squad_id' }, 400)
+    if (
+      typeof body.expires_in_seconds !== 'number'
+      || !Number.isInteger(body.expires_in_seconds)
+    ) {
+      return c.json({ error: 'invalid_expiry' }, 400)
+    }
+    c.set('inviteBody', {
+      kind: 'project',
+      email: body.email,
+      department_id: null,
+      project_id: body.project_id.trim(),
+      squad_id: body.squad_id.trim(),
+      capability,
+      expires_in_seconds: body.expires_in_seconds,
+    })
+    await next()
+    return
+  }
 
   let departmentId: string | null = null
   if (body.department_id !== undefined && body.department_id !== null) {
@@ -355,23 +402,66 @@ const parseInvite: MiddlewareHandler<AppEnv> = async (c, next) => {
     if (!dept) return c.json({ error: 'department_not_found' }, 404)
   }
 
-  const capability: Capability =
-    body.capability === undefined ? 'member' : (body.capability as Capability)
-  if (!isCapability(capability)) return c.json({ error: 'invalid_capability' }, 400)
-
-  c.set('inviteBody', { email: body.email, department_id: departmentId, capability })
+  c.set('inviteBody', {
+    kind: 'legacy',
+    email: body.email,
+    department_id: departmentId,
+    project_id: null,
+    squad_id: null,
+    capability,
+    expires_in_seconds: null,
+  })
   await next()
+}
+
+const authorizeInvite: MiddlewareHandler<AppEnv> = async (c, next) => {
+  const body = c.get('inviteBody')
+  // Project invite authorization is enforced by createProjectInvite against both
+  // the legacy role plane and the caller's live/resolved squad grants. Keeping it
+  // in the service prevents a non-HTTP caller from bypassing the same ceiling.
+  if (body?.kind === 'project') {
+    await next()
+    return
+  }
+  await requireCapability(inviteScope, 'admin')(c, next)
+}
+
+function projectInviteErrorStatus(error: CreateProjectInviteError): 400 | 403 | 404 | 409 {
+  if (error === 'project_not_found' || error === 'project_squad_not_linked') return 404
+  if (
+    error === 'tenant_scope'
+    || error === 'forbidden'
+    || error === 'cannot_grant_above_own_rank'
+  ) return 403
+  if (error === 'pairing_code_collision') return 409
+  return 400
 }
 
 membersApp.post(
   '/invites',
   parseInvite,
-  requireCapability(inviteScope, 'admin'),
+  authorizeInvite,
   async (c) => {
     // Validated + scoped by parseInvite; reuse the stashed body.
     const body = c.get('inviteBody')
     if (!body) return c.json({ error: 'invalid_json' }, 400)
     const auth = c.get('auth')
+
+    if (body.kind === 'project') {
+      if (!body.project_id || !body.squad_id || body.expires_in_seconds === null) {
+        return c.json({ error: 'invalid_invite_scope' }, 400)
+      }
+      const result = await createProjectInvite(c.env, auth, {
+        email: body.email,
+        project_id: body.project_id,
+        squad_id: body.squad_id,
+        capability: body.capability,
+        expires_in_seconds: body.expires_in_seconds,
+      })
+      if (!result.ok) return c.json({ error: result.error }, projectInviteErrorStatus(result.error))
+      protectRawTokenResponse(c)
+      return c.json(result.value, 201)
+    }
 
     // CEILING: cannot invite at a capability above your own rank on this scope
     // (a dept-admin must not mint an 'owner' on their department). P0 fix.
