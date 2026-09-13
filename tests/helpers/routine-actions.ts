@@ -55,6 +55,9 @@ export async function makeReadyRoutineFixture(
     INSERT INTO agents (id, squad_id, slug, name, status) VALUES
       ('agent-1', 'squad-1', 'agent-1', 'Agent One', 'active'),
       ('agent-2', 'squad-1', 'agent-2', 'Agent Two', 'active');
+    INSERT INTO memberships (id, agent_id, squad_id, capability) VALUES
+      ('membership-agent-1', 'agent-1', 'squad-1', 'member'),
+      ('membership-agent-2', 'agent-2', 'squad-1', 'member');
     INSERT INTO projects (id, slug, name, goal, status)
       VALUES ('project-1', 'project-1', 'Project One', 'Reach a verified outcome', 'active');
     INSERT INTO project_squad_access (project_id, squad_id, access_level)

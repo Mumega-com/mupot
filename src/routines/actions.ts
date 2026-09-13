@@ -1,4 +1,5 @@
 import type { D1Result } from '@cloudflare/workers-types'
+import { sendAgentMessage } from '../agents/messages'
 import { TASK_SELECT_COLUMNS } from '../tasks/ranking'
 import { canonicalJson, canonicalJsonDigest, sha256Hex } from '../lib/canonical-json'
 import { loadProjectSituation } from '../projects/situation'
@@ -31,6 +32,8 @@ import { routineControlId } from './identity'
 
 const ROUTINE_GATE = 'gate:routines'
 const ROUTINE_ACTOR = 'mupot-routines'
+const ROUTINE_MEMBER = 'system:routines'
+const HUMAN_WAIT_BODY_LIMIT = 8000
 
 type ProposalError =
   | 'invalid_proposal' | 'run_not_found' | 'run_not_accepting_proposal' | 'forbidden'
@@ -45,13 +48,13 @@ type ActionError =
   | 'project_not_active' | 'action_failed' | 'receipt_failed'
 
 export type RoutineProposalResult =
-  | { ok: true; status: 'waiting'; reason: 'review' | 'answer'; run_id: string; action_key: string; duplicate: boolean }
+  | { ok: true; status: 'waiting'; reason: 'review' | 'answer'; run_id: string; action_key: string; duplicate: boolean; notification_pending: boolean }
   | { ok: true; status: 'retry_scheduled'; reason: 'execution_failed'; run_id: string; action_key: string; duplicate: boolean }
   | { ok: true; status: 'succeeded'; run_id: string; action_key: string; result: Record<string, unknown>; duplicate: boolean }
   | { ok: false; error: ProposalError | ActionError }
 
 export type RoutineActionResult =
-  | { ok: true; status: 'waiting'; reason: 'review' | 'answer'; run_id: string; action_key: string; duplicate: boolean }
+  | { ok: true; status: 'waiting'; reason: 'review' | 'answer'; run_id: string; action_key: string; duplicate: boolean; notification_pending: boolean }
   | { ok: true; status: 'retry_scheduled'; reason: 'execution_failed'; run_id: string; action_key: string; duplicate: boolean }
   | { ok: true; status: 'succeeded'; run_id: string; action_key: string; result: Record<string, unknown>; duplicate: boolean }
   | { ok: false; error: ActionError }
@@ -272,6 +275,128 @@ function pendingQuestion(action: ActionRow): RoutinePendingQuestion | null {
     return choices ? { action_key: action.action_key, question: input.question, choices } : null
   } catch {
     return null
+  }
+}
+
+async function humanWaitRequestId(runId: string, actionKey: string): Promise<string> {
+  const requestId = `routine-human:${runId}:${actionKey}`
+  return requestId.length <= 128
+    ? requestId
+    : `routine-human:${await sha256Hex(`${runId}:${actionKey}`)}`
+}
+
+type HumanWaitDecision =
+  | { type: 'review'; task_id: string; truncated?: true }
+  | { type: 'answer'; question: string; choices: string[]; truncated?: true }
+
+function jsonStringContentLength(value: string): number {
+  return JSON.stringify(value).length - 2
+}
+
+function jsonBoundedSummary(value: string, budget: number): string {
+  if (budget <= 0) return ''
+  if (jsonStringContentLength(value) <= budget) return value
+  const points = [...value]
+  const candidate = (kept: number) => kept === 0
+    ? ''
+    : `${points.slice(0, Math.max(0, kept - 1)).join('')}…${points.at(-1)}`
+  let low = 0
+  let high = points.length
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2)
+    if (jsonStringContentLength(candidate(middle)) <= budget) low = middle
+    else high = middle - 1
+  }
+  return candidate(low)
+}
+
+function humanWaitBody(
+  run: RunContext,
+  action: ActionRow,
+  reason: 'review' | 'answer',
+  decision: HumanWaitDecision,
+): string {
+  const envelope = (boundedDecision: HumanWaitDecision) => JSON.stringify({
+    version: 'routine.human-wait/v1',
+    type: 'routine_human_wait',
+    project_id: run.project_id,
+    run_id: run.id,
+    action_key: action.action_key,
+    reason,
+    decision: boundedDecision,
+  })
+  const body = envelope(decision)
+  if (body.length <= HUMAN_WAIT_BODY_LIMIT) return body
+
+  if (decision.type === 'review') {
+    const review = envelope({ ...decision, truncated: true })
+    if (review.length <= HUMAN_WAIT_BODY_LIMIT) return review
+    throw new Error('human-wait review attribution exceeds message limit')
+  }
+
+  const emptyDecision: HumanWaitDecision = {
+    type: 'answer', question: '', choices: decision.choices.map(() => ''), truncated: true,
+  }
+  const emptyBody = envelope(emptyDecision)
+  const contentBudget = Math.max(0, HUMAN_WAIT_BODY_LIMIT - emptyBody.length)
+  const questionBudget = decision.choices.length > 0 ? Math.floor(contentBudget / 2) : contentBudget
+  const question = jsonBoundedSummary(decision.question, questionBudget)
+  let choicesBudget = contentBudget - jsonStringContentLength(question)
+  const choices = decision.choices.map((choice, index) => {
+    const share = Math.floor(choicesBudget / (decision.choices.length - index))
+    const bounded = jsonBoundedSummary(choice, share)
+    choicesBudget -= jsonStringContentLength(bounded)
+    return bounded
+  })
+  const truncated = envelope({ type: 'answer', question, choices, truncated: true })
+  if (truncated.length <= HUMAN_WAIT_BODY_LIMIT) return truncated
+
+  const omitted = envelope({
+    type: 'answer',
+    question: 'Decision summary omitted to fit the message limit.',
+    choices: [],
+    truncated: true,
+  })
+  if (omitted.length <= HUMAN_WAIT_BODY_LIMIT) return omitted
+  throw new Error('human-wait attribution exceeds message limit')
+}
+
+async function notifyHumanWait(
+  env: Env,
+  run: RunContext,
+  action: ActionRow,
+  reason: 'review' | 'answer',
+): Promise<boolean> {
+  if (!run.assigned_agent_id) return true
+  const decision: HumanWaitDecision | null = reason === 'review'
+    ? run.task_id ? { type: 'review', task_id: run.task_id } : null
+    : (() => {
+        const question = pendingQuestion(action)
+        return question
+          ? { type: 'answer', question: question.question, choices: question.choices }
+          : null
+      })()
+  if (!decision) return true
+
+  try {
+    const delivery = await sendAgentMessage(env, {
+      fromAgent: ROUTINE_ACTOR,
+      fromMember: ROUTINE_MEMBER,
+      toAgent: run.assigned_agent_id,
+      kind: 'request',
+      requestId: await humanWaitRequestId(run.id, action.action_key),
+      projectId: run.project_id,
+      body: humanWaitBody(run, action, reason, decision),
+    }, {
+      system: true,
+      reason: 'human-wait target is the server-owned assigned agent on the committed Routine run',
+    }, {
+      systemProjectAttribution: true,
+      requireActiveRecipientProjectAccess: true,
+    })
+    return !delivery.ok
+  } catch {
+    return true
   }
 }
 
@@ -671,11 +796,19 @@ async function waitForHuman(
   if (outcomes.some(outcome => !wrote(outcome))) {
     const raced = await loadAction(env, run.id, action.action_key)
     if (raced?.status === 'waiting') {
-      return { ok: true, status: 'waiting', reason, run_id: run.id, action_key: action.action_key, duplicate: true }
+      const notificationPending = await notifyHumanWait(env, run, raced, reason)
+      return {
+        ok: true, status: 'waiting', reason, run_id: run.id, action_key: action.action_key,
+        duplicate: true, notification_pending: notificationPending,
+      }
     }
     return { ok: false, error: 'receipt_failed' }
   }
-  return { ok: true, status: 'waiting', reason, run_id: run.id, action_key: action.action_key, duplicate: false }
+  const notificationPending = await notifyHumanWait(env, run, action, reason)
+  return {
+    ok: true, status: 'waiting', reason, run_id: run.id, action_key: action.action_key,
+    duplicate: false, notification_pending: notificationPending,
+  }
 }
 
 async function approvedGate(env: Env, action: ActionRow): Promise<'approved' | 'rejected' | null> {
@@ -694,13 +827,16 @@ async function replayWaitingAction(
   if (run.waiting_reason === 'review' && await approvedGate(env, action)) {
     return executeRoutineAction(env, run.id, action.action_key)
   }
+  const reason = run.waiting_reason === 'answer' ? 'answer' : 'review'
+  const notificationPending = await notifyHumanWait(env, run, action, reason)
   return {
     ok: true,
     status: 'waiting',
-    reason: run.waiting_reason === 'answer' ? 'answer' : 'review',
+    reason,
     run_id: run.id,
     action_key: action.action_key,
     duplicate: true,
+    notification_pending: notificationPending,
   }
 }
 

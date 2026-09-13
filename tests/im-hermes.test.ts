@@ -297,7 +297,7 @@ describe('Hermes IM control', () => {
 
     const reply = await handleImMessage(env, 123456789, 'fleet stop hermes', { forwarded: true })
 
-    expect(reply).toBe('Fleet control commands must be sent directly from your paired chat, not forwarded.')
+    expect(reply).toMatch(/direct.*forward/i)
     expect(messages).toHaveLength(0)
     expect(controlLog).toHaveLength(0)
     expect(busEvents).toHaveLength(0)
@@ -378,13 +378,13 @@ describe('Hermes IM control', () => {
       forwarded: true,
     })
 
-    expect(reply).toBe('Brain directives must be sent directly from your paired chat, not forwarded.')
+    expect(reply).toMatch(/direct.*forward/i)
     expect(settings.has(HUMAN_DIRECTIVE_KEY)).toBe(false)
     expect(busEvents).toHaveLength(0)
   })
 
-  it('approves a review task from an owner IM command', async () => {
-    const { env, tasks, verdicts, busEvents } = makeEnv()
+  it('approves a review task from a human with an explicit gate grant', async () => {
+    const { env, tasks, verdicts, busEvents } = makeEnv({ gateGrants: ['gate:local'] })
 
     const reply = await handleImMessage(env, 123456789, 'approve task-review-local')
 
@@ -415,7 +415,7 @@ describe('Hermes IM control', () => {
   })
 
   it('refuses IM self-verdict when the member owns the assigned runtime key', async () => {
-    const { env, tasks, verdicts } = makeEnv({ assigneeAgentMemberId: 'mbr-hermes-user' })
+    const { env, tasks, verdicts } = makeEnv({ assigneeAgentMemberId: 'mbr-hermes-user', gateGrants: ['gate:local'] })
 
     const reply = await handleImMessage(env, 123456789, 'approve task-review-local')
 

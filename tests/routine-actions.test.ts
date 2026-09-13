@@ -8,6 +8,7 @@ import { answerRoutineRun, cancelRoutineRun, executeRoutineAction, getRoutinePen
 import type { RoutinePrincipal } from '../src/routines/access'
 import type { Env, Project } from '../src/types'
 import { makeReadyRoutineFixture, type ReadyRoutineFixture } from './helpers/routine-actions'
+import { handleImMessage, imApp } from '../src/im'
 
 function row(fixture: ReadyRoutineFixture, sql: string, ...binds: unknown[]): Record<string, unknown> | undefined {
   return fixture.harness.sqlite.prepare(sql).get(...binds)
@@ -26,6 +27,34 @@ function failFlightCreation(env: Env): Env {
           } as unknown as D1PreparedStatement
         }
         return db.prepare(sql)
+      },
+      batch: db.batch.bind(db),
+    } as unknown as D1Database,
+  }
+}
+
+function observeHumanWaitMessage(
+  env: Env,
+  beforeInsert: () => void,
+): Env {
+  const db = env.DB
+  return {
+    ...env,
+    DB: {
+      prepare(sql: string) {
+        const statement = db.prepare(sql)
+        if (!/INSERT INTO agent_messages/.test(sql)) return statement
+        return {
+          bind(...values: unknown[]) {
+            const bound = statement.bind(...values)
+            return {
+              async run() {
+                beforeInsert()
+                return bound.run()
+              },
+            } as unknown as D1PreparedStatement
+          },
+        } as unknown as D1PreparedStatement
       },
       batch: db.batch.bind(db),
     } as unknown as D1Database,
@@ -176,6 +205,80 @@ describe('Routine proposal submission and governed actions', () => {
     fixture = undefined
   })
 
+  it('answers through IM as the mapped human with exact choices, attribution and duplicate/conflict fences', async () => {
+    fixture = await makeReadyRoutineFixture()
+    fixture.harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, telegram_chat_id, status, tenant)
+      VALUES ('human-1', 'human@test.com', 'Human', '123', 'active', 'tenant-a');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+      VALUES ('cap-human', 'human-1', 'squad', 'squad-1', 'member');
+    `)
+    await submitRoutineProposal(fixture.env, fixture.principal, fixture.proposal({
+      key: 'im-question', kind: 'ask_human',
+      input: { question: 'Which event?', choices: ['Booked', 'Paid'], references: [] },
+    }))
+    let updateId = 100
+    const message = async (text: string, forwarded = false, id = updateId++) => {
+      const response = await imApp.fetch(new Request('https://pot.test/webhook', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Telegram-Bot-Api-Secret-Token': 'routine-test-secret' },
+        body: JSON.stringify({ update_id: id, message: {
+          from: { id: 123 }, chat: { id: 123, type: 'private' }, text,
+          ...(forwarded ? { forward_origin: { type: 'user' } } : {}),
+        } }),
+      }), { ...fixture!.env, IM_WEBHOOK_SECRET: 'routine-test-secret' })
+      expect(response.status).toBe(200)
+      return (await response.json() as { reply: string }).reply
+    }
+    const state = () => ['routine_runs', 'routine_run_actions', 'routine_run_events', 'tasks', 'flights']
+      .map(table => fixture!.harness.sqlite.prepare(`SELECT * FROM ${table} ORDER BY id`).all())
+    const pending = state()
+    const needs = await message('/needs project-1')
+    expect(needs).toContain('Which event?')
+    expect(needs).toContain('Booked | Paid')
+    expect(needs).toContain('/answer run-1')
+    expect(await message('/answer run-1 paid')).toContain('invalid_answer')
+    expect(state()).toEqual(pending)
+    expect(await message('/answer run-1 Paid', true)).toMatch(/direct.*forward/i)
+    expect(state()).toEqual(pending)
+    const answerId = updateId
+    const recordedReply = await message('/answer run-1 Paid')
+    expect(recordedReply).toMatch(/recorded/i)
+    expect(row(fixture, "SELECT status, result_json FROM routine_run_actions WHERE action_key = 'im-question'"))
+      .toEqual({ status: 'succeeded', result_json: '{"answer":"Paid","answered_by":"human-1"}' })
+    const answered = state()
+    const receipts = fixture.harness.sqlite.prepare('SELECT * FROM telegram_webhook_receipts ORDER BY update_id').all()
+    expect(await message('/answer run-1 Paid', false, answerId)).toBe(recordedReply)
+    expect(fixture.harness.sqlite.prepare('SELECT * FROM telegram_webhook_receipts ORDER BY update_id').all()).toEqual(receipts)
+    expect(await message('/answer run-1 Paid')).toMatch(/already recorded/i)
+    expect(await message('/answer run-1 Booked')).toContain('answer_conflict')
+    expect(state()).toEqual(answered)
+  })
+
+  it.each(['suspended', 'revoked', 'observer', 'terminal', 'stale'])('refuses IM routine answers for %s decisions without domain effects', async scenario => {
+    fixture = await makeReadyRoutineFixture()
+    fixture.harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, telegram_chat_id, status, tenant)
+      VALUES ('human-1', 'human@test.com', 'Human', '123', 'active', 'tenant-a');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+      VALUES ('cap-human', 'human-1', 'squad', 'squad-1', 'member');
+    `)
+    await submitRoutineProposal(fixture.env, fixture.principal, fixture.proposal({
+      key: 'im-question', kind: 'ask_human', input: { question: 'Which?', choices: ['Paid'], references: [] },
+    }))
+    if (scenario === 'suspended') fixture.harness.sqlite.exec("UPDATE members SET status = 'suspended'")
+    if (scenario === 'revoked') fixture.harness.sqlite.exec('DELETE FROM capabilities')
+    if (scenario === 'observer') fixture.harness.sqlite.exec("UPDATE capabilities SET capability = 'observer'")
+    if (scenario === 'terminal') fixture.harness.sqlite.exec("UPDATE routine_runs SET status = 'cancelled'")
+    if (scenario === 'stale') fixture.harness.sqlite.exec("UPDATE routine_runs SET status = 'running', waiting_reason = NULL")
+    const state = () => ['routine_runs', 'routine_run_actions', 'routine_run_events', 'tasks', 'flights']
+      .map(table => fixture!.harness.sqlite.prepare(`SELECT * FROM ${table} ORDER BY id`).all())
+    const before = state()
+    const reply = await handleImMessage(fixture.env, '123', '/answer run-1 Paid')
+    expect(reply).toMatch(/not registered|run_not_found|forbidden|run_terminal|answer_not_found/)
+    expect(state()).toEqual(before)
+  })
+
   it('rejects the wrong agent and mismatched run, Project, or Situation correlation', async () => {
     fixture = await makeReadyRoutineFixture()
     const action = { key: 'none-1', kind: 'no_action' as const, input: { reason: 'Nothing to do.' } }
@@ -242,17 +345,49 @@ describe('Routine proposal submission and governed actions', () => {
 
   it('routes propose mode through the existing Task review gate', async () => {
     fixture = await makeReadyRoutineFixture('propose')
-    const result = await submitRoutineProposal(fixture.env, fixture.principal, fixture.proposal({
+    let insertAttempts = 0
+    const notifyingEnv = observeHumanWaitMessage(fixture.env, () => {
+      insertAttempts += 1
+      expect(row(fixture!, "SELECT status, waiting_reason FROM routine_runs WHERE id = 'run-1'")).toEqual({
+        status: 'waiting', waiting_reason: 'review',
+      })
+      expect(row(fixture!, "SELECT status, gate_status, source_type, source_id FROM routine_run_actions WHERE action_key = 'task-1'")).toEqual({
+        status: 'waiting', gate_status: 'pending', source_type: 'task', source_id: 'control-task',
+      })
+    })
+    const proposal = fixture.proposal({
       key: 'task-1', kind: 'create_task', input: { title: 'Task', description: 'Description' },
-    }))
+    })
+    const result = await submitRoutineProposal(notifyingEnv, fixture.principal, proposal)
 
-    expect(result).toMatchObject({ ok: true, status: 'waiting', reason: 'review', duplicate: false })
+    expect(result).toMatchObject({
+      ok: true, status: 'waiting', reason: 'review', duplicate: false, notification_pending: false,
+    })
     expect(row(fixture, "SELECT status, gate_owner FROM tasks WHERE id = 'control-task'")).toEqual({
       status: 'review', gate_owner: 'gate:routines',
     })
     expect(row(fixture, "SELECT status, waiting_reason FROM routine_runs WHERE id = 'run-1'")).toEqual({
       status: 'waiting', waiting_reason: 'review',
     })
+    const message = row(fixture, "SELECT to_agent, from_agent, from_member, kind, request_id, project_id, body FROM agent_messages")
+    expect(message).toMatchObject({
+      to_agent: 'agent-1', from_agent: 'mupot-routines', from_member: 'system:routines',
+      kind: 'request', request_id: 'routine-human:run-1:task-1', project_id: 'project-1',
+    })
+    expect(JSON.parse(String(message?.body))).toEqual({
+      version: 'routine.human-wait/v1',
+      type: 'routine_human_wait',
+      project_id: 'project-1',
+      run_id: 'run-1',
+      action_key: 'task-1',
+      reason: 'review',
+      decision: { type: 'review', task_id: 'control-task' },
+    })
+    await expect(submitRoutineProposal(notifyingEnv, fixture.principal, proposal)).resolves.toMatchObject({
+      ok: true, status: 'waiting', reason: 'review', duplicate: true, notification_pending: false,
+    })
+    expect(insertAttempts).toBe(1)
+    expect(row(fixture, 'SELECT COUNT(*) AS count FROM agent_messages')).toEqual({ count: 1 })
   })
 
   it('converges concurrent propose-mode replay on one review request', async () => {
@@ -272,6 +407,90 @@ describe('Routine proposal submission and governed actions', () => {
       expect.objectContaining({ ok: true, status: 'waiting', reason: 'review', duplicate: true }),
     ]))
     expect(row(fixture, "SELECT COUNT(*) AS count FROM routine_run_events WHERE kind = 'approval_requested'")).toEqual({ count: 1 })
+  })
+
+  it('fences notification when the assignee loses Project membership after the wait commits', async () => {
+    fixture = await makeReadyRoutineFixture('execute_internal')
+    const proposal = fixture.proposal({
+      key: 'revoked-before-notify', kind: 'ask_human',
+      input: { question: 'Which receipt?', choices: ['A', 'B'], references: [] },
+    })
+    const env = observeHumanWaitMessage(fixture.env, () => {
+      expect(row(fixture!, "SELECT status, waiting_reason FROM routine_runs WHERE id = 'run-1'")).toEqual({
+        status: 'waiting', waiting_reason: 'answer',
+      })
+      fixture!.harness.sqlite.prepare(
+        "DELETE FROM memberships WHERE agent_id = 'agent-1' AND squad_id = 'squad-1'",
+      ).run()
+    })
+
+    await expect(submitRoutineProposal(env, fixture.principal, proposal)).resolves.toMatchObject({
+      ok: true, status: 'waiting', reason: 'answer', notification_pending: true,
+    })
+    expect(row(fixture, "SELECT status, waiting_reason FROM routine_runs WHERE id = 'run-1'")).toEqual({
+      status: 'waiting', waiting_reason: 'answer',
+    })
+    expect(row(fixture, "SELECT status FROM routine_run_actions WHERE action_key = 'revoked-before-notify'")).toEqual({
+      status: 'waiting',
+    })
+    expect(row(fixture, 'SELECT COUNT(*) AS count FROM agent_messages')).toEqual({ count: 0 })
+  })
+
+  it('keeps the stable human-wait request ID valid for maximum-length action keys', async () => {
+    fixture = await makeReadyRoutineFixture('execute_internal')
+    const actionKey = 'a'.repeat(200)
+    const proposal = fixture.proposal({
+      key: actionKey, kind: 'ask_human',
+      input: { question: 'Choose one.', choices: ['A', 'B'], references: [] },
+    })
+
+    await expect(submitRoutineProposal(fixture.env, fixture.principal, proposal)).resolves.toMatchObject({
+      ok: true, status: 'waiting', notification_pending: false,
+    })
+    const first = row(fixture, 'SELECT request_id FROM agent_messages')
+    expect(first?.request_id).toMatch(/^routine-human:[a-f0-9]{64}$/)
+    expect(String(first?.request_id)).toHaveLength(78)
+
+    await expect(submitRoutineProposal(fixture.env, fixture.principal, proposal)).resolves.toMatchObject({
+      ok: true, status: 'waiting', duplicate: true, notification_pending: false,
+    })
+    expect(row(fixture, 'SELECT COUNT(*) AS count FROM agent_messages')).toEqual({ count: 1 })
+    expect(row(fixture, 'SELECT request_id FROM agent_messages')).toEqual(first)
+  })
+
+  it('bounds control-character human-wait notifications and replays one durable message', async () => {
+    fixture = await makeReadyRoutineFixture('execute_internal')
+    const choices = Array.from({ length: 5 }, (_, index) => `${'\u0001'.repeat(499)}${index}`)
+    const proposal = fixture.proposal({
+      key: 'escaped-summary', kind: 'ask_human',
+      input: { question: '\u0001'.repeat(2000), choices, references: [] },
+    })
+
+    await expect(submitRoutineProposal(fixture.env, fixture.principal, proposal)).resolves.toMatchObject({
+      ok: true, status: 'waiting', notification_pending: false,
+    })
+
+    const message = row(fixture, 'SELECT body FROM agent_messages')
+    expect(String(message?.body).length).toBeLessThanOrEqual(8000)
+    const body = JSON.parse(String(message?.body)) as {
+      project_id: string
+      run_id: string
+      action_key: string
+      decision: { type: string; question: string; choices: string[]; truncated?: boolean }
+    }
+    expect(body).toMatchObject({
+      project_id: 'project-1', run_id: 'run-1', action_key: 'escaped-summary',
+      decision: { type: 'answer', truncated: true },
+    })
+    expect(body.decision.question.length).toBeGreaterThan(0)
+    expect(body.decision.choices).toHaveLength(choices.length)
+    expect(body.decision.choices.every(choice => choice.length > 0)).toBe(true)
+    expect(new Set(body.decision.choices).size).toBe(choices.length)
+
+    await expect(submitRoutineProposal(fixture.env, fixture.principal, proposal)).resolves.toMatchObject({
+      ok: true, status: 'waiting', duplicate: true, notification_pending: false,
+    })
+    expect(row(fixture, 'SELECT COUNT(*) AS count FROM agent_messages')).toEqual({ count: 1 })
   })
 
   it('executes internal task creation once and returns the same result on replay', async () => {
@@ -305,9 +524,12 @@ describe('Routine proposal submission and governed actions', () => {
 
     expect(left).toMatchObject({ ok: true, status: 'succeeded', result: { task_id: expect.any(String) } })
     expect(right).toMatchObject({
-      ok: true, status: 'succeeded', duplicate: true,
+      ok: true, status: 'succeeded',
       result: left.ok && left.status === 'succeeded' ? left.result : {},
     })
+    expect([left, right].map(result =>
+      result.ok && result.status === 'succeeded' ? result.duplicate : null,
+    ).sort()).toEqual([false, true])
     expect(row(fixture, "SELECT COUNT(*) AS count FROM tasks WHERE title = 'One concurrent task'")).toEqual({ count: 1 })
     expect(row(fixture, "SELECT COUNT(*) AS count FROM routine_run_actions WHERE action_key = 'task-concurrent'")).toEqual({ count: 1 })
   })
@@ -387,11 +609,44 @@ describe('Routine proposal submission and governed actions', () => {
 
     fixture.harness.close()
     fixture = await makeReadyRoutineFixture('execute_internal')
-    const question = await submitRoutineProposal(fixture.env, fixture.principal, fixture.proposal({
+    let insertAttempts = 0
+    const notifyingEnv = observeHumanWaitMessage(fixture.env, () => {
+      insertAttempts += 1
+      expect(row(fixture!, "SELECT status, waiting_reason FROM routine_runs WHERE id = 'run-1'")).toEqual({
+        status: 'waiting', waiting_reason: 'answer',
+      })
+      expect(row(fixture!, "SELECT status, source_type FROM routine_run_actions WHERE action_key = 'question-1'")).toEqual({
+        status: 'waiting', source_type: 'question',
+      })
+    })
+    const proposal = fixture.proposal({
       key: 'question-1', kind: 'ask_human',
       input: { question: 'Which event is authoritative?', choices: ['Booked', 'Paid'], references: [] },
-    }))
-    expect(question).toMatchObject({ ok: true, status: 'waiting', reason: 'answer' })
+    })
+    const question = await submitRoutineProposal(notifyingEnv, fixture.principal, proposal)
+    expect(question).toMatchObject({
+      ok: true, status: 'waiting', reason: 'answer', duplicate: false, notification_pending: false,
+    })
+    const message = row(fixture, "SELECT to_agent, request_id, project_id, body FROM agent_messages")
+    expect(message).toMatchObject({
+      to_agent: 'agent-1', request_id: 'routine-human:run-1:question-1', project_id: 'project-1',
+    })
+    expect(JSON.parse(String(message?.body))).toEqual({
+      version: 'routine.human-wait/v1',
+      type: 'routine_human_wait',
+      project_id: 'project-1',
+      run_id: 'run-1',
+      action_key: 'question-1',
+      reason: 'answer',
+      decision: {
+        type: 'answer', question: 'Which event is authoritative?', choices: ['Booked', 'Paid'],
+      },
+    })
+    await expect(submitRoutineProposal(notifyingEnv, fixture.principal, proposal)).resolves.toMatchObject({
+      ok: true, status: 'waiting', reason: 'answer', duplicate: true, notification_pending: false,
+    })
+    expect(insertAttempts).toBe(1)
+    expect(row(fixture, 'SELECT COUNT(*) AS count FROM agent_messages')).toEqual({ count: 1 })
 
     const responder: RoutinePrincipal = {
       ...fixture.principal,

@@ -20,6 +20,7 @@ const approvalTaskTitle = `Approval workflow smoke ${smokeRunId}`
 const hermesApprovalTaskTitle = `Hermes approval smoke ${smokeRunId}`
 const hermesTaskTitle = `Hermes dashboard refresh ${smokeRunId}`
 const hermesDirectiveText = `Hold all outbound automation until local browser smoke ${smokeRunId} is complete.`
+const hermesTelegramUserId = 123456789
 const ownerProjectName = `Browser Project ${smokeRunId}`
 const ownerProjectSlug = `browser-project-${Date.now()}`
 const ownerProjectInitialGoal = 'Create a governed nested project through the dashboard.'
@@ -70,6 +71,20 @@ const hermesMessages = [
   { lifecycle: 'Hermes IM fleet control lifecycle', text: 'fleet status agent-hermes', expect: 'Queued fleet status for Hermes Local Relay.' },
   { lifecycle: 'Hermes IM task lifecycle', text: `task: ${hermesTaskTitle} @growth`, expect: `Added to Growth Local: "${hermesTaskTitle}".` },
 ]
+
+export function createTelegramSmokeUpdateFactory() {
+  let updateId = 0
+  return (text) => ({
+    update_id: ++updateId,
+    message: {
+      chat: { id: hermesTelegramUserId, type: 'private' },
+      from: { id: hermesTelegramUserId },
+      text,
+    },
+  })
+}
+
+const nextHermesUpdate = createTelegramSmokeUpdateFactory()
 
 function fail(message, details) {
   const err = new Error(message)
@@ -742,7 +757,7 @@ async function postHermesMessage(hermes, msg) {
       'content-type': 'application/json',
       'X-Telegram-Bot-Api-Secret-Token': 'local-im-secret',
     },
-    data: { message: { chat: { id: 123456789 }, text: msg.text } },
+    data: nextHermesUpdate(msg.text),
     timeout: 20_000,
   })
   const json = await res.json().catch(() => null)

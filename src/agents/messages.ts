@@ -193,6 +193,8 @@ interface Opts {
   maxUnread?: number
   /** Internal task-dispatch attribution has a system sender and is authorized by the task. */
   systemProjectAttribution?: boolean
+  /** System sender is exempt, but the active recipient must still have Project-linked membership at INSERT. */
+  requireActiveRecipientProjectAccess?: boolean
   /** Internal atomic fence for a Routine dispatch envelope. */
   routineRunFence?: { runId: string; projectId: string }
   /** Current durable guest-membership authority must still exist in the message INSERT. */
@@ -218,6 +220,24 @@ async function routineDispatchAllowed(
         )
       LIMIT 1`,
   ).bind(fence.runId, tenant, fence.projectId).first()
+  return row !== null
+}
+
+async function activeRecipientProjectAccessAllowed(
+  env: Env,
+  projectId: string,
+  recipientAgentId: string,
+): Promise<boolean> {
+  const row = await env.DB.prepare(
+    `SELECT 1
+       FROM agents recipient
+       JOIN memberships membership ON membership.agent_id = recipient.id
+       JOIN project_squad_access access ON access.squad_id = membership.squad_id
+       JOIN projects project ON project.id = access.project_id
+      WHERE recipient.id = ? AND recipient.status = 'active'
+        AND project.id = ? AND project.status = 'active'
+      LIMIT 1`,
+  ).bind(recipientAgentId, projectId).first()
   return row !== null
 }
 
@@ -389,6 +409,17 @@ export async function sendAgentMessage(
         guestVisibilityFence.capability,
       )
     }
+    const activeRecipientProjectAccessSql = opts.requireActiveRecipientProjectAccess
+      ? `AND EXISTS (
+           SELECT 1
+             FROM agents recipient
+             JOIN memberships membership ON membership.agent_id = recipient.id
+             JOIN project_squad_access access ON access.squad_id = membership.squad_id
+             JOIN projects project ON project.id = access.project_id
+            WHERE recipient.id = ?3 AND recipient.status = 'active'
+              AND project.id = ?12 AND project.status = 'active'
+         )`
+      : ''
     const routineRunParam = values.length + 1
     const result = routineFence
       ? await env.DB.prepare(
@@ -397,6 +428,7 @@ export async function sendAgentMessage(
                WHERE (SELECT COUNT(*) FROM agent_messages
                        WHERE tenant = ?2 AND to_agent = ?3 AND read_at IS NULL) < ?11
                  ${guestVisibilitySql}
+                 ${activeRecipientProjectAccessSql}
                  AND EXISTS (
                    SELECT 1 FROM routine_runs rr
                     WHERE rr.id = ?${routineRunParam} AND rr.tenant = ?2 AND rr.project_id = ?12
@@ -413,7 +445,8 @@ export async function sendAgentMessage(
               SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?12, ?13, ?14, ?15
                WHERE (SELECT COUNT(*) FROM agent_messages
                        WHERE tenant = ?2 AND to_agent = ?3 AND read_at IS NULL) < ?11
-                 ${guestVisibilitySql}`,
+                 ${guestVisibilitySql}
+                 ${activeRecipientProjectAccessSql}`,
       ).bind(...values).run()
     if ((result.meta?.changes ?? 0) === 0) {
       if (routineFence && !await routineDispatchAllowed(env, tenant, routineFence)) {
@@ -428,6 +461,13 @@ export async function sendAgentMessage(
       if (input.requestId !== undefined) {
         const existing = await findBySenderRequestId(env, tenant, input.fromAgent, input.requestId)
         if (existing) return idempotentOrConflict(existing, input, kind)
+      }
+      if (
+        opts.requireActiveRecipientProjectAccess
+        && input.projectId !== undefined
+        && !await activeRecipientProjectAccessAllowed(env, input.projectId, input.toAgent)
+      ) {
+        return { ok: false, reason: 'project_access_denied' }
       }
       if (guestVisibilityFence) {
         const guestStillAllowed = await guestVisibilityFenceIsCurrent(
