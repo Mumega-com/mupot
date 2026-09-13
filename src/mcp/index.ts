@@ -124,7 +124,8 @@ import { authorizeExecutionScope } from '../auth/execution-scope'
 import { runRouterTick } from '../router/engine'
 import { verifyTaskArtifactShape } from '../tasks/artifact-verification'
 import {
-  leaseAgentInbox, reconcileAgentInboxLeaseAttempt, ackAgentMessages, listDeadLetteredMessages, summarizeDeadLetters,
+  leaseAgentInbox, reconcileAgentInboxLeaseAttempt, ackAgentInboxLeaseAttempt,
+  ackAgentMessages, listDeadLetteredMessages, summarizeDeadLetters,
   MAX_DELIVERY_ATTEMPTS, DEFAULT_LEASE_SECONDS, MAX_LEASE_SECONDS,
 } from '../agents/messages'
 import { resolveBoundSeat, resolveBoundSeatStrict, resolveInboxSeatArg } from '../agents/inbox-seat'
@@ -3665,7 +3666,7 @@ const toolInboxLease: ToolSpec = {
       return fail(400, 'invalid_args', 'attempt_id mode requires limit=1')
 
     const strictSeat = args.attempt_id !== undefined
-      ? await resolveBoundSeatStrict(env, auth.tokenId ?? null)
+      ? await resolveBoundSeatStrict(env, auth.tokenId ?? null, agent)
       : null
     if (strictSeat && !strictSeat.ok) return fail(500, strictSeat.error)
     const boundSeat = strictSeat?.ok
@@ -3690,6 +3691,9 @@ const toolInboxLease: ToolSpec = {
       return fail(400, res.reason, res.detail)
     }
     if ('state' in res) return done({
+      tenant: res.tenant,
+      agent_id: res.agent_id,
+      effective_inbox_seat: res.effective_inbox_seat,
       attempt_id: res.attempt_id,
       state: res.state,
       lease_expires_at: res.lease_expires_at,
@@ -3732,7 +3736,7 @@ const toolInboxLeaseReconcile: ToolSpec = {
     if (typeof args.attempt_id !== 'string')
       return fail(400, 'invalid_args', 'attempt_id must be a string')
 
-    const strictSeat = await resolveBoundSeatStrict(env, auth.tokenId ?? null)
+    const strictSeat = await resolveBoundSeatStrict(env, auth.tokenId ?? null, agent)
     if (!strictSeat.ok) return fail(500, strictSeat.error)
     const boundSeat = strictSeat.seat
     const res = await reconcileAgentInboxLeaseAttempt(env, {
@@ -3746,11 +3750,54 @@ const toolInboxLeaseReconcile: ToolSpec = {
       return fail(400, res.reason, res.detail)
     }
     return done({
+      tenant: res.tenant,
+      agent_id: res.agent_id,
+      effective_inbox_seat: res.effective_inbox_seat,
       attempt_id: res.attempt_id,
       state: res.state,
       lease_expires_at: res.lease_expires_at,
       messages: res.messages,
       consumed: false,
+    })
+  },
+}
+
+const toolInboxLeaseAck: ToolSpec = {
+  name: 'inbox_lease_ack',
+  scope: 'self (the caller agent ACKs the exact live message owned by one durable lease attempt)',
+  min: 'authenticated',
+  args: '{ attempt_id: string }',
+  inputSchema: {
+    type: 'object',
+    properties: { attempt_id: STRING_SCHEMA },
+    required: ['attempt_id'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const agent = auth.boundAgentId
+    if (!agent) return fail(403, 'not_agent_bound', 'inbox_lease_ack requires an agent-bound token')
+    if (typeof args.attempt_id !== 'string')
+      return fail(400, 'invalid_args', 'attempt_id must be a string')
+
+    const strictSeat = await resolveBoundSeatStrict(env, auth.tokenId ?? null, agent)
+    if (!strictSeat.ok) return fail(500, strictSeat.error)
+    const res = await ackAgentInboxLeaseAttempt(env, {
+      agent,
+      attemptId: args.attempt_id,
+      seat: strictSeat.seat ?? undefined,
+    })
+    if (!res.ok) {
+      if (res.reason === 'db_error') return fail(500, res.reason)
+      if (res.reason === 'consumer_fenced' || res.reason === 'attempt_conflict') return fail(409, res.reason)
+      return fail(400, res.reason, res.detail)
+    }
+    return done({
+      tenant: res.tenant,
+      agent_id: res.agent_id,
+      effective_inbox_seat: res.effective_inbox_seat,
+      attempt_id: res.attempt_id,
+      state: res.state,
+      consumed: res.consumed,
     })
   },
 }
@@ -3873,11 +3920,22 @@ const toolInboxFenceStatus: ToolSpec = {
   name: 'inbox_consumer_status',
   scope: 'self (the caller agent reads its own consumer-fence mode)',
   min: 'authenticated',
-  args: '{}',
-  inputSchema: { type: 'object', properties: {}, required: [], additionalProperties: false },
-  async run(auth, env) {
+  args: '{ strict_scope?: boolean }',
+  inputSchema: {
+    type: 'object',
+    properties: { strict_scope: OPTIONAL_BOOLEAN_SCHEMA },
+    required: [],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
     const agent = auth.boundAgentId
     if (!agent) return fail(403, 'not_agent_bound', 'inbox_fence_status requires an agent-bound token')
+    if (args.strict_scope !== undefined && typeof args.strict_scope !== 'boolean')
+      return fail(400, 'invalid_args', 'strict_scope must be a boolean')
+    const strictSeat = args.strict_scope === true
+      ? await resolveBoundSeatStrict(env, auth.tokenId ?? null, agent)
+      : null
+    if (strictSeat && !strictSeat.ok) return fail(500, strictSeat.error)
     const row = await env.DB.prepare(
       `SELECT mode, generation, key_fingerprint, updated_at FROM agent_inbox_fences
         WHERE tenant = ?1 AND agent_id = ?2 LIMIT 1`,
@@ -3886,7 +3944,7 @@ const toolInboxFenceStatus: ToolSpec = {
     }>()
     const key = await loadActiveAgentKey(env, agent)
     const activeKeyFingerprint = key ? await agentKeyFingerprint(key.pubkey) : null
-    return done({
+    const status = {
       agent_id: agent,
       mode: row?.mode === 'signed_only' ? 'signed_only' : 'bearer_only',
       generation: row?.mode === 'signed_only' || row?.mode === 'bearer_only' ? Number(row.generation) : 0,
@@ -3894,7 +3952,16 @@ const toolInboxFenceStatus: ToolSpec = {
       active_key_present: activeKeyFingerprint !== null,
       key_matches: row?.mode !== 'signed_only' || row.key_fingerprint === activeKeyFingerprint,
       updated_at: row?.mode === 'signed_only' || row?.mode === 'bearer_only' ? row.updated_at : null,
-    })
+    }
+    if (strictSeat?.ok) {
+      return done({
+        strict_scope: true,
+        tenant: env.TENANT_SLUG,
+        effective_inbox_seat: strictSeat.seat,
+        ...status,
+      })
+    }
+    return done(status)
   },
 }
 
@@ -5167,6 +5234,7 @@ export const TOOLS: ToolSpec[] = [
   toolMessageGet,
   toolInboxLease,
   toolInboxLeaseReconcile,
+  toolInboxLeaseAck,
   toolInboxAck,
   toolInboxDeadLetters,
   toolInboxFenceStatus,

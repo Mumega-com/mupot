@@ -28,6 +28,7 @@
 //     inbox mailbox partitioning. Do not conflate the two when reading migration history.
 
 import type { Env } from '../types'
+import { nowSqlUtc, TOKEN_LIVE_PREDICATE } from '../auth/token-lifecycle'
 
 export interface InboxSeatError {
   ok: false
@@ -69,13 +70,17 @@ export async function resolveBoundSeat(env: Env, tokenId: string | null | undefi
 export async function resolveBoundSeatStrict(
   env: Env,
   tokenId: string | null | undefined,
+  expectedAgentId: string | null | undefined,
 ): Promise<BoundSeatResolution> {
-  if (!tokenId) return { ok: true, seat: null }
-  if (!env.DB) return { ok: false, error: 'seat_resolution_failed' }
+  if (!tokenId || !expectedAgentId || !env.DB || !env.TENANT_SLUG) {
+    return { ok: false, error: 'seat_resolution_failed' }
+  }
   try {
     const row = await env.DB.prepare(
-      `SELECT label FROM member_tokens WHERE id = ?1 AND tenant = ?2`,
-    ).bind(tokenId, env.TENANT_SLUG).first<{ label: string | null }>()
+      `SELECT t.label FROM member_tokens t
+        WHERE t.id = ?1 AND t.tenant = ?2 AND t.agent_id = ?3
+          AND ${TOKEN_LIVE_PREDICATE('?4')}`,
+    ).bind(tokenId, env.TENANT_SLUG, expectedAgentId, nowSqlUtc()).first<{ label: string | null }>()
     if (!row) return { ok: false, error: 'seat_resolution_failed' }
     const label = row.label?.trim()
     return { ok: true, seat: label && label.length > 0 ? label : null }

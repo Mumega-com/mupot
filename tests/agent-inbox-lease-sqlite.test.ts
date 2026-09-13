@@ -843,7 +843,7 @@ describe('authoritative inbox lease attempt reconciliation', () => {
       const failingDb = {
         ...f.env.DB,
         prepare(sql: string) {
-          if (sql.includes('SELECT label FROM member_tokens')) {
+          if (sql.includes('SELECT t.label FROM member_tokens')) {
             const failed = {
               bind: () => failed,
               first: async () => { throw new Error('seat lookup unavailable') },
