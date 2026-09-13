@@ -835,4 +835,42 @@ describe('authoritative inbox lease attempt reconciliation', () => {
         .toMatchObject({ ok: false, status: 400, error: 'invalid_attempt' })
     } finally { f.harness.close() }
   })
+
+  it('fails attempt lease and reconcile before mutation when the bound-seat lookup errors', async () => {
+    const f = fixture()
+    try {
+      f.seed('m1')
+      const failingDb = {
+        ...f.env.DB,
+        prepare(sql: string) {
+          if (sql.includes('SELECT label FROM member_tokens')) {
+            const failed = {
+              bind: () => failed,
+              first: async () => { throw new Error('seat lookup unavailable') },
+            }
+            return failed
+          }
+          return f.env.DB.prepare(sql)
+        },
+      }
+      const env = { ...f.env, DB: failingDb } as unknown as Env
+      const auth: AuthContext = {
+        userId: 'agent-member', memberId: 'agent-member', email: null,
+        tenant: 'tenant-a', role: 'member', channel: 'workspace',
+        boundAgentId: 'agent-a', tokenId: 'tok-unavailable', capabilities: [],
+      }
+
+      expect(await invokeTool(auth, env, 'inbox_lease', {
+        attempt_id: ATTEMPT, limit: 1, lease_seconds: 30,
+      })).toMatchObject({ ok: false, status: 500, error: 'seat_resolution_failed' })
+      expect(await invokeTool(auth, env, 'inbox_lease_reconcile', { attempt_id: ATTEMPT }))
+        .toMatchObject({ ok: false, status: 500, error: 'seat_resolution_failed' })
+      expect(f.row('m1').delivery_attempts).toBe(0)
+      expect(f.harness.sqlite.prepare('SELECT COUNT(*) AS n FROM agent_inbox_lease_attempts').get())
+        .toEqual({ n: 0 })
+
+      const legacy = await invokeTool(auth, env, 'inbox_lease', { limit: 1, lease_seconds: 30 })
+      expect(legacy).toMatchObject({ ok: true, result: { messages: [{ id: 'm1' }] } })
+    } finally { f.harness.close() }
+  })
 })

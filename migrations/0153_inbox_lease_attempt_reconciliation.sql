@@ -14,7 +14,10 @@ CREATE TABLE agent_inbox_lease_attempts (
                         AND request_digest NOT GLOB '*[^0-9A-Fa-f]*'),
   state TEXT NOT NULL
         CHECK (state IN ('opening','leased','empty','cancelled','expired','acked')),
+  -- Live ownership is FK-protected. Terminal cleanup detaches the FK but keeps
+  -- the immutable tuple below plus this non-FK id tombstone for audit.
   message_id TEXT REFERENCES agent_messages(id) ON DELETE RESTRICT,
+  terminal_message_id TEXT,
   message_seq INTEGER,
   delivery_attempt INTEGER,
   lease_expires_at TEXT,
@@ -24,12 +27,21 @@ CREATE TABLE agent_inbox_lease_attempts (
   CHECK (
     (state = 'leased'
       AND message_id IS NOT NULL
+      AND terminal_message_id IS NULL
       AND message_seq IS NOT NULL
       AND delivery_attempt IS NOT NULL
       AND lease_expires_at IS NOT NULL)
     OR
-    (state <> 'leased'
+    (state IN ('acked','expired')
       AND message_id IS NULL
+      AND terminal_message_id IS NOT NULL
+      AND message_seq IS NOT NULL
+      AND delivery_attempt IS NOT NULL
+      AND lease_expires_at IS NOT NULL)
+    OR
+    (state IN ('opening','empty','cancelled')
+      AND message_id IS NULL
+      AND terminal_message_id IS NULL
       AND message_seq IS NULL
       AND delivery_attempt IS NULL
       AND lease_expires_at IS NULL)

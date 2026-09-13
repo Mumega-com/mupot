@@ -10,7 +10,13 @@ import {
   type AgentConnectionVerificationDeps,
   type AgentConnectionVerificationPrincipal,
 } from '../src/members/agent-connection-verification'
-import { deleteAgentConnectionMessage } from '../src/agents/messages'
+import {
+  ackAgentMessages,
+  deleteAgentConnectionMessage,
+  leaseAgentInbox,
+  readAgentInbox,
+  reconcileAgentInboxLeaseAttempt,
+} from '../src/agents/messages'
 import type { Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
@@ -157,6 +163,75 @@ describe('agent connection verification service', () => {
     expect(harness.sqlite.prepare(
       'SELECT COUNT(*) AS n FROM agent_messages WHERE request_id = ?',
     ).get(requestId)).toEqual({ n: 0 })
+  })
+
+  it('passes real verification cleanup after the loopback was leased and acked', async () => {
+    const issued = await issue('lease-cleanup')
+    const attemptId = '44444444-4444-4444-8444-444444444444'
+    const deps: Partial<AgentConnectionVerificationDeps> = {
+      readAgentInbox: async (...args) => {
+        const peeked = await readAgentInbox(...args)
+        if (!peeked.ok) return peeked
+        const requestId = `agent-connection:${issued.receipt.id}`
+        const target = peeked.messages.find((message) => message.request_id === requestId)
+        if (!target) return peeked
+        await leaseAgentInbox(env, {
+          agent: issued.receipt.agent_id, limit: 1, leaseSeconds: 30, attemptId,
+        }, { now: () => '2026-07-24T12:05:00.000Z' })
+        await ackAgentMessages(env, {
+          agent: issued.receipt.agent_id, ids: [target.id],
+        }, { now: () => '2026-07-24T12:05:01.000Z' })
+        return peeked
+      },
+    }
+    const outcome = await verifyAgentConnection(
+      env,
+      principal(issued),
+      { receiptId: issued.receipt.id, challenge: issued.verification.challenge },
+      new Date('2026-07-24T12:05:00.000Z'),
+      deps,
+    )
+    expect(outcome).toMatchObject({ status: 'messaging_verified', checks: { cleanup: { status: 'pass' } } })
+    expect(harness.sqlite.prepare(
+      'SELECT state, message_id FROM agent_inbox_lease_attempts WHERE attempt_id = ?',
+    ).get(attemptId)).toEqual({ state: 'acked', message_id: null })
+    await expect(reconcileAgentInboxLeaseAttempt(env, {
+      agent: issued.receipt.agent_id, attemptId,
+    })).resolves.toMatchObject({ ok: true, state: 'acked', messages: [] })
+  })
+
+  it('passes real verification cleanup after the loopback lease expired unacked', async () => {
+    const issued = await issue('expired-lease-cleanup')
+    const attemptId = '55555555-5555-4555-8555-555555555555'
+    const deps: Partial<AgentConnectionVerificationDeps> = {
+      readAgentInbox: async (...args) => {
+        const peeked = await readAgentInbox(...args)
+        if (!peeked.ok) return peeked
+        const target = peeked.messages.find(
+          (message) => message.request_id === `agent-connection:${issued.receipt.id}`,
+        )
+        if (target) {
+          await leaseAgentInbox(env, {
+            agent: issued.receipt.agent_id, limit: 1, leaseSeconds: 1, attemptId,
+          }, { now: () => '2026-07-24T12:04:00.000Z' })
+        }
+        return peeked
+      },
+    }
+    const outcome = await verifyAgentConnection(
+      env,
+      principal(issued),
+      { receiptId: issued.receipt.id, challenge: issued.verification.challenge },
+      new Date('2026-07-24T12:05:00.000Z'),
+      deps,
+    )
+    expect(outcome).toMatchObject({ status: 'messaging_verified', checks: { cleanup: { status: 'pass' } } })
+    expect(harness.sqlite.prepare(
+      'SELECT state, message_id FROM agent_inbox_lease_attempts WHERE attempt_id = ?',
+    ).get(attemptId)).toEqual({ state: 'expired', message_id: null })
+    await expect(reconcileAgentInboxLeaseAttempt(env, {
+      agent: issued.receipt.agent_id, attemptId,
+    })).resolves.toMatchObject({ ok: true, state: 'expired', messages: [] })
   })
 
   it('collapses wrong tenant, token, member, and agent without consuming attempts', async () => {

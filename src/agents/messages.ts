@@ -1237,8 +1237,8 @@ async function leaseAgentInboxWithAttempt(
       ).bind(...scope, digest, nowIso),
       env.DB.prepare(
         `UPDATE agent_inbox_lease_attempts AS a
-            SET state = 'acked', message_id = NULL, message_seq = NULL,
-                delivery_attempt = NULL, lease_expires_at = NULL, resolved_at = ?6
+            SET state = 'acked', terminal_message_id = message_id,
+                message_id = NULL, resolved_at = ?6
           WHERE tenant = ?1 AND agent_id = ?2 AND target_seat_key = ?3
             AND attempt_id = ?4 AND state = 'leased'
             AND EXISTS (SELECT 1 FROM agent_messages m
@@ -1248,8 +1248,8 @@ async function leaseAgentInboxWithAttempt(
       ).bind(...scope, digest, nowIso),
       env.DB.prepare(
         `UPDATE agent_inbox_lease_attempts AS a
-            SET state = 'expired', message_id = NULL, message_seq = NULL,
-                delivery_attempt = NULL, lease_expires_at = NULL, resolved_at = ?6
+            SET state = 'expired', terminal_message_id = message_id,
+                message_id = NULL, resolved_at = ?6
           WHERE tenant = ?1 AND agent_id = ?2 AND target_seat_key = ?3
             AND attempt_id = ?4 AND state = 'leased'
             AND NOT EXISTS (SELECT 1 FROM agent_messages m
@@ -1306,8 +1306,8 @@ export async function reconcileAgentInboxLeaseAttempt(
       ).bind(...scope, CANCELLED_ATTEMPT_DIGEST, nowIso),
       env.DB.prepare(
         `UPDATE agent_inbox_lease_attempts AS a
-            SET state = 'acked', message_id = NULL, message_seq = NULL,
-                delivery_attempt = NULL, lease_expires_at = NULL, resolved_at = ?5
+            SET state = 'acked', terminal_message_id = message_id,
+                message_id = NULL, resolved_at = ?5
           WHERE tenant = ?1 AND agent_id = ?2 AND target_seat_key = ?3
             AND attempt_id = ?4 AND state = 'leased'
             AND EXISTS (SELECT 1 FROM agent_messages m
@@ -1317,8 +1317,8 @@ export async function reconcileAgentInboxLeaseAttempt(
       ).bind(...scope, nowIso),
       env.DB.prepare(
         `UPDATE agent_inbox_lease_attempts AS a
-            SET state = 'expired', message_id = NULL, message_seq = NULL,
-                delivery_attempt = NULL, lease_expires_at = NULL, resolved_at = ?5
+            SET state = 'expired', terminal_message_id = message_id,
+                message_id = NULL, resolved_at = ?5
           WHERE tenant = ?1 AND agent_id = ?2 AND target_seat_key = ?3
             AND attempt_id = ?4 AND state = 'leased'
             AND NOT EXISTS (SELECT 1 FROM agent_messages m
@@ -1678,21 +1678,39 @@ export async function deleteAgentConnectionMessage(
   | { ok: false; reason: 'message_not_found' | 'db_error' }
 > {
   try {
-    const result = await env.DB.prepare(
-      `DELETE FROM agent_messages
-        WHERE tenant = ?
-          AND id = ?
-          AND to_agent = ?
-          AND from_agent = ?
-          AND request_id = ?`,
-    ).bind(
-      env.TENANT_SLUG,
-      input.messageId,
-      input.agentId,
-      input.agentId,
-      input.requestId,
-    ).run()
-    const changed = result.meta?.changes ?? result.meta?.rows_written ?? 0
+    const nowIso = new Date().toISOString()
+    const exactMessage = `EXISTS (
+      SELECT 1 FROM agent_messages m
+       WHERE m.tenant = ?1 AND m.id = ?2
+         AND m.to_agent = ?3 AND m.from_agent = ?3 AND m.request_id = ?4
+    )`
+    const results = await env.DB.batch([
+      // A lease-attempt receipt owns its message through an FK RESTRICT while live.
+      // Terminalize and detach only receipts for the exact authorized loopback tuple;
+      // the surrounding batch rolls this back if the delete is refused for any reason.
+      env.DB.prepare(
+        `UPDATE agent_inbox_lease_attempts
+            SET state = CASE
+                  WHEN EXISTS (SELECT 1 FROM agent_messages m
+                    WHERE m.tenant = ?1 AND m.id = ?2 AND m.read_at IS NOT NULL)
+                    THEN 'acked'
+                  ELSE 'expired'
+                END,
+                terminal_message_id = message_id,
+                message_id = NULL,
+                resolved_at = ?5
+          WHERE tenant = ?1 AND agent_id = ?3 AND message_id = ?2
+            AND state = 'leased' AND ${exactMessage}`,
+      ).bind(env.TENANT_SLUG, input.messageId, input.agentId, input.requestId, nowIso),
+      env.DB.prepare(
+        `DELETE FROM agent_messages
+          WHERE tenant = ?1 AND id = ?2
+            AND to_agent = ?3 AND from_agent = ?3 AND request_id = ?4
+          RETURNING id`,
+      ).bind(env.TENANT_SLUG, input.messageId, input.agentId, input.requestId),
+    ])
+    const deleted = results[1]?.results ?? []
+    const changed = deleted.length
     return changed === 1
       ? { ok: true }
       : { ok: false, reason: 'message_not_found' }

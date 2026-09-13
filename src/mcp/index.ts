@@ -127,7 +127,7 @@ import {
   leaseAgentInbox, reconcileAgentInboxLeaseAttempt, ackAgentMessages, listDeadLetteredMessages, summarizeDeadLetters,
   MAX_DELIVERY_ATTEMPTS, DEFAULT_LEASE_SECONDS, MAX_LEASE_SECONDS,
 } from '../agents/messages'
-import { resolveBoundSeat, resolveInboxSeatArg } from '../agents/inbox-seat'
+import { resolveBoundSeat, resolveBoundSeatStrict, resolveInboxSeatArg } from '../agents/inbox-seat'
 import {
   recordCheckin,
   touchPresence,
@@ -3664,7 +3664,13 @@ const toolInboxLease: ToolSpec = {
       && (limit === undefined || Math.min(100, Math.max(1, Math.floor(limit))) !== 1))
       return fail(400, 'invalid_args', 'attempt_id mode requires limit=1')
 
-    const boundSeat = await resolveBoundSeat(env, auth.tokenId ?? null)
+    const strictSeat = args.attempt_id !== undefined
+      ? await resolveBoundSeatStrict(env, auth.tokenId ?? null)
+      : null
+    if (strictSeat && !strictSeat.ok) return fail(500, strictSeat.error)
+    const boundSeat = strictSeat?.ok
+      ? strictSeat.seat
+      : await resolveBoundSeat(env, auth.tokenId ?? null)
     const seatArg = resolveInboxSeatArg(
       typeof args.seat === 'string' ? args.seat.trim() : undefined,
       boundSeat,
@@ -3726,7 +3732,9 @@ const toolInboxLeaseReconcile: ToolSpec = {
     if (typeof args.attempt_id !== 'string')
       return fail(400, 'invalid_args', 'attempt_id must be a string')
 
-    const boundSeat = await resolveBoundSeat(env, auth.tokenId ?? null)
+    const strictSeat = await resolveBoundSeatStrict(env, auth.tokenId ?? null)
+    if (!strictSeat.ok) return fail(500, strictSeat.error)
+    const boundSeat = strictSeat.seat
     const res = await reconcileAgentInboxLeaseAttempt(env, {
       agent,
       attemptId: args.attempt_id,

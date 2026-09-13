@@ -38,6 +38,10 @@ export interface InboxSeatError {
 
 export type InboxSeatResult = { ok: true; seat: string | undefined } | InboxSeatError
 
+export type BoundSeatResolution =
+  | { ok: true; seat: string | null }
+  | { ok: false; error: 'seat_resolution_failed' }
+
 // A null return means "this token has no seat label bound," not "lookup failed open": on
 // a DB error we return null too, which — same as an empty label — refuses any
 // caller-supplied seat (seat_not_bound) rather than silently trusting it. The scoping
@@ -53,6 +57,30 @@ export async function resolveBoundSeat(env: Env, tokenId: string | null | undefi
     return label && label.length > 0 ? label : null
   } catch {
     return null
+  }
+}
+
+/**
+ * Attempt reconciliation cannot collapse an unavailable token lookup into the
+ * broadcast partition: doing so could create a tombstone or claim under the
+ * wrong effective seat. Legacy inbox callers retain resolveBoundSeat's original
+ * compatibility behavior; durable attempt callers use this fail-closed form.
+ */
+export async function resolveBoundSeatStrict(
+  env: Env,
+  tokenId: string | null | undefined,
+): Promise<BoundSeatResolution> {
+  if (!tokenId) return { ok: true, seat: null }
+  if (!env.DB) return { ok: false, error: 'seat_resolution_failed' }
+  try {
+    const row = await env.DB.prepare(
+      `SELECT label FROM member_tokens WHERE id = ?1 AND tenant = ?2`,
+    ).bind(tokenId, env.TENANT_SLUG).first<{ label: string | null }>()
+    if (!row) return { ok: false, error: 'seat_resolution_failed' }
+    const label = row.label?.trim()
+    return { ok: true, seat: label && label.length > 0 ? label : null }
+  } catch {
+    return { ok: false, error: 'seat_resolution_failed' }
   }
 }
 
