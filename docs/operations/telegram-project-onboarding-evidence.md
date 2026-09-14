@@ -482,17 +482,51 @@ that names its own exact commit; look for that artifact rather than inferring it
 this file's test counts. See the Athena/Kasra gate history on the PR for the exact-head verdict
 and the commit it was measured against.
 
-## Kasra-core addendum (2026-09-14, commit 91e7df7c and after)
+## Kasra-core addendum (2026-09-14, commits 91e7df7c–608d622a)
 
-Kasra gate on head `22c778d8` returned AMBER; the fixes it required (P1-1 rank-widening on
-project invites, P1-2 claim-fence statement pinning, P1-3 admin-floor negative test, P1-4
-recipient/project/null-assignee fences, P2 enumeration-oracle reply) landed starting at commit
-`91e7df7c`, together with the Athena addendum items (A–H) tracked on the PR. `npm run
-typecheck` and the focused suite
+Kasra gate on head `22c778d8` returned **AMBER (fix before merge)**: P1-1 (CONFIRMED, executed
+— actor rank on a squad scope widened from the coarse legacy role, past an explicit narrower
+grant), P1-2 (CONFIRMED — the atomic claim fence unpinned because the synchronous test harness
+cannot race it), P1-3 (CONFIRMED — zero negative-actor coverage on the admin floor), P1-4
+(CONFIRMED — recipient/project authority content and the null-assignee branch of the notify
+fence unpinned). Fixed in commit `91e7df7c`. Athena's parallel addendum (items A–H: a masked
+mutant on the exact project↔squad edge lookup, a route-level P1-1 negative test plus
+reconciling the coarse-role rank helper to one predicate, IM verdict-authority behaviour-change
+disclosure, a net-new-humans-only `member_already_exists` test, threading Telegram's
+first_name/username through as a cosmetic display-name label, this evidence file's own stale
+"not yet pushed" language, the migration-0153-as-second-subsystem PR-body disclosure plus a
+numbering re-check against every other open PR, and splitting notifyHumanWait's collapsed
+boolean into a distinguishable outcome) landed in commit `ad441e69`. Mutation testing of the
+addendum's own new fences (below) surfaced two test-setup bugs in the M13 assertions
+themselves — an invalid `agents.status` value and a project status independently caught by an
+earlier, unrelated pre-check — both fixed in commit `608d622a` so the tests fail for the
+reason they claim to, not by accident.
+
+**Final head of this repository-local work: commit `608d622a` on
+`kasra/telegram-project-onboarding-20260913`.** `npm run typecheck` clean. Focused suite
 (`telegram-project-onboarding.test.ts`, `members-sensitive-response.test.ts`,
-`needs-you.test.ts`, `routine-actions.test.ts`, `im-webhook-idempotency.test.ts`) and the full
-`npm test` were run again against the actual final head of that work, not a parent commit; see
-the mutation table and counts below for the exact numbers and the exact SHA they were measured
-against. This addendum does not replace the exact-head remote CI / independent review /
-deployment gates named above — it is the same repository-local kind of evidence as the rest of
-this file, for the commits added after `22c778d8`.
+`needs-you.test.ts`, `routine-actions.test.ts`, `im-webhook-idempotency.test.ts`,
+`im-verdict-gates.test.ts`): 141/141. Full `npm test`: 512 files, 8,001 tests — see the exact
+run below; the same numbers are re-measured, not carried over from an earlier head.
+
+This addendum does not replace the exact-head remote CI / independent review / deployment
+gates named above — it is the same repository-local kind of evidence as the rest of this file,
+for the commits added after `22c778d8`.
+
+### Mutation table (measured against commit `608d622a`; each mutant applied, run, confirmed
+### red, then reverted — `git diff` clean between mutants)
+
+| ID | Location | Mutation | Test(s) driving the kill | Result |
+| --- | --- | --- | --- | --- |
+| A | `src/members/project-invites.ts:312-318` (exact project↔squad edge lookup) | `WHERE access.squad_id = ?2` only (dropped `access.project_id = ?1 AND`) | `refuses a unlinked squad` (`it.each`) — required first linking `squad-unlinked` to a *different* real project so a squad-only lookup and the exact-pair lookup diverge | RED — returned `forbidden` instead of `project_squad_not_linked` |
+| M5 | `project-invites.ts` `CLAIM_INVITE_SQL` | dropped `AND accepted_at IS NULL` | P1-2 "M5 — refuses to claim an invite that is already accepted" | RED — 1 row changed instead of 0 |
+| M6 | `project-invites.ts` `CLAIM_INVITE_SQL` | dropped `AND pairing_expires_at > ?8` | P1-2 "M6 — refuses to claim an invite past its pairing expiry" | RED — 1 row changed instead of 0 |
+| M7 | `project-invites.ts` `CLAIM_INVITE_SQL` | dropped the receipt `state = 'processing'` line inside the EXISTS | P1-2 "M7 — refuses to claim without a matching processing receipt" | RED — 1 row changed instead of 0 |
+| M10 | `project-invites.ts:319` | deleted `if (actorRank < capabilityRank('admin')) return {ok:false,error:'forbidden'}` | P1-3 "refuses invite creation from an observer holding a real, narrower squad grant" | RED — invite minted (`ok:true`) instead of `forbidden` |
+| M13 | `src/agents/messages.ts:419-420` (insert-time recipient fence) | dropped both `recipient.status = 'active'` and `project.status = 'active'` | routine-actions "fences notification when the assigned agent is deactivated…" and "…when the project is no longer active…" | RED (both) — `notification_pending:false, notification_reason:'delivered'` instead of refused |
+| M14 | `src/routines/actions.ts:397` (`notifyHumanWait`) | deleted `if (!run.assigned_agent_id) return {delivered:false, reason:'no_recipient'}` | routine-actions "reports no delivery honestly when the run has no assigned agent" | RED — outcome reason changed (fell through to an actual, differently-failing send attempt) |
+| P1-1 source | `project-invites.ts` `actorRankOnSquad` | restored the pre-fix `Math.max(legacyRoleRank(auth.role), grantRank)` widening | P1-1 "refuses an org admin with resolved-but-empty capabilities…" and "…org owner whose only resolved grant… is narrower than admin" | RED (both) — invite minted at `admin`/`owner` instead of refused |
+
+Every row above was applied as a single localized edit, confirmed red, then reverted with
+`git checkout -- <file>`; `git status --short` showed a clean tree between mutants (no
+uncommitted mutation ever coexisted with the next one).
