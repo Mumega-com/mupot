@@ -529,6 +529,35 @@ export async function recordTaskDispatchRuntimeReceipt(
   return { receipt: publicTimelineReceipt(persisted), task_status: task.status }
 }
 
+/** Cap applied to a rendered display name — matches the max length enforced
+ *  at redemption time (src/members/project-invites.ts's `isNonEmptyString`
+ *  call for `input.display_name`, 200), so this can never truncate a value
+ *  that was itself accepted as valid at mint time. */
+const DECIDED_BY_DISPLAY_MAX_LENGTH = 200
+
+/**
+ * P2: `decided_by_display` can resolve to `member.display_name`, and for a
+ * Telegram-onboarded member that value is cosmetic, user-supplied input
+ * (the sender's own Telegram first_name/username, threaded through with no
+ * server-side content validation — see redeemTelegramProjectInvite). It
+ * reaches this receipt via a plain SQL COALESCE with no escaping of its own.
+ * Strip control characters (newlines, tabs, and anything else in the C0/C1
+ * range) so a crafted display name cannot inject fake extra lines/fields
+ * into any plain-text or line-oriented rendering of this receipt downstream
+ * (a dashboard summary, a forwarded Telegram message, a log line), and cap
+ * length so a receipt can't be inflated by an oversized name. Applied here,
+ * at the render site, rather than at mint time, so it covers every existing
+ * row regardless of when it was written.
+ */
+function sanitizeDecidedByDisplay(value: string): string {
+  // eslint-disable-next-line no-control-regex -- deliberately stripping C0/C1 control chars, incl. newlines/tabs.
+  const stripped = value.replace(/[\x00-\x1F\x7F-\x9F]/g, ' ').trim()
+  const collapsed = stripped.replace(/\s+/g, ' ')
+  return collapsed.length > DECIDED_BY_DISPLAY_MAX_LENGTH
+    ? collapsed.slice(0, DECIDED_BY_DISPLAY_MAX_LENGTH)
+    : collapsed
+}
+
 export interface TaskDispatchReceiptTimeline {
   transport: Array<{
     agent_slug: string
@@ -598,7 +627,10 @@ export async function listTaskDispatchReceiptTimeline(
   return {
     transport: transport.results ?? [],
     runtime: (runtime.results ?? []).map(publicTimelineReceipt),
-    gate: gate.results ?? [],
+    gate: (gate.results ?? []).map((row) => ({
+      ...row,
+      decided_by_display: sanitizeDecidedByDisplay(row.decided_by_display),
+    })),
     task_status: task.status,
   }
 }

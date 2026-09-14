@@ -149,6 +149,16 @@ function isCapability(value: unknown): value is Capability {
  * as a bootstrap-owner floor when this principal's capabilities were NEVER
  * resolved at all (auth.capabilities === undefined) and no grant covers this
  * squad — never as an addition on top of a real, narrower grant.
+ *
+ * P1-1 parity fix: requireCapability's legacy-role escape is gated on
+ * `target.type === 'org'` (src/auth/capability.ts:302-310) — for a non-org
+ * scope with no memberId it returns 403 unconditionally, regardless of role
+ * or whether capabilities were ever resolved (src/auth/capability.ts:315-322).
+ * This function is squad-scope only, so that escape never applies here at
+ * all; the prior `!auth.memberId` branch granting a legacy-role floor was a
+ * second, looser copy of the same escape leaking into a scope it was never
+ * meant to reach. Removed rather than reimplemented — no memberId on a squad
+ * scope is simply zero standing, matching the canonical predicate exactly.
  */
 async function actorRankOnSquad(
   env: Env,
@@ -157,11 +167,10 @@ async function actorRankOnSquad(
   departmentId: string,
 ): Promise<number> {
   if (!auth.memberId) {
-    // No member identity: fine-grained RBAC does not apply. Fall back to the
-    // coarse role only for a principal that never had capabilities resolved
-    // at all (a pure legacy web login) — same condition requireCapability
-    // gates its own legacy-role escape on.
-    return auth.capabilities === undefined ? legacyRoleRank(auth.role) : 0
+    // Fine-grained RBAC is a member concept on a squad scope, and
+    // requireCapability's legacy-role escape does not reach non-org scopes —
+    // no floor here for any role, resolved or not.
+    return 0
   }
   const grants: CapabilityGrant[] = auth.capabilities ?? await resolveCapabilities(env, auth.memberId)
   for (const capability of CAPABILITIES) {

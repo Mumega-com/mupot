@@ -463,6 +463,31 @@ describe('Telegram project invitation service', () => {
       const res = await probe.fetch(new Request('https://pot.test/probe'), env)
       expect(res.status).toBe(200)
     })
+
+    it('P1-1 parity — refuses an org owner with no memberId on the squad scope, matching requireCapability\'s own refusal', async () => {
+      // requireCapability(squad, min) 403s a non-org scope whenever the
+      // principal has no memberId (src/auth/capability.ts:315-322) —
+      // regardless of role, and regardless of whether capabilities were ever
+      // resolved. Before the parity fix, actorRankOnSquad floored this exact
+      // shape (no memberId, capabilities undefined, role owner) to
+      // legacyRoleRank('owner') = 5 and minted the invite outright.
+      const ownerNoMember: AuthContext = {
+        userId: 'owner-no-member-user',
+        email: 'owner-no-member@example.test',
+        role: 'owner',
+        tenant: TENANT,
+        // memberId intentionally absent — the exact shape requireCapability
+        // refuses for any non-org scope.
+      }
+      const result = await createProjectInvite(env, ownerNoMember, {
+        email: 'owner-no-member-target@example.test',
+        project_id: 'project-active',
+        squad_id: 'squad-participants',
+        capability: 'member',
+        expires_in_seconds: 3600,
+      })
+      expect(result).toEqual({ ok: false, error: 'forbidden' })
+    })
   })
 
   // ── P1-3: the admin floor at project-invites.ts:254 is the SOLE gate for
@@ -597,6 +622,52 @@ describe('Telegram project invitation service', () => {
       insertFenceInvite()
       insertFenceReceipt('completed')
       expect(await runClaim()).toBe(0)
+    })
+
+    // ── P1-A: the project-status and project-squad-access EXISTS conjuncts
+    // (:226-229, :230-234) have no JS twin anywhere in the call chain — the
+    // JS pre-check in redeemTelegramProjectInvite only reads accepted_at and
+    // pairing_expires_at off the invites row itself, never re-checks the
+    // project or the edge. These two are the SOLE fence for a project
+    // archived, or a project<->squad edge revoked, between invite mint and
+    // claim. Proven load-bearing: deleting either conjunct lets the UPDATE
+    // succeed (accepted_at gets set) even against an archived project / a
+    // revoked edge, which is exactly the state that would then let the
+    // batch's remaining INSERTs (member + capabilities) go through too,
+    // since they all gate on `invites.accepted_at = <the value just set>`.
+    it('M8 — refuses to claim when the project has been archived between invite mint and claim', async () => {
+      insertFenceInvite()
+      insertFenceReceipt('processing')
+      fenceHarness.sqlite.exec(`UPDATE projects SET status = 'archived' WHERE id = 'project-fence'`)
+      expect(await runClaim()).toBe(0)
+      // Untouched: no partial claim, no capability row could ever be reached.
+      expect(fenceHarness.sqlite.prepare(
+        'SELECT accepted_at FROM invites WHERE id = ?',
+      ).get(FENCE_INVITE_ID)).toEqual({ accepted_at: null })
+      expect(fenceHarness.sqlite.prepare(
+        'SELECT COUNT(*) AS count FROM capabilities',
+      ).get()).toEqual({ count: 0 })
+      expect(fenceHarness.sqlite.prepare(
+        'SELECT state FROM telegram_webhook_receipts WHERE tenant = ? AND update_id = ?',
+      ).get(FENCE_TENANT, FENCE_UPDATE_ID)).toEqual({ state: 'processing' })
+    })
+
+    it('M9 — refuses to claim when the project_squad_access edge has been revoked between invite mint and claim', async () => {
+      insertFenceInvite()
+      insertFenceReceipt('processing')
+      fenceHarness.sqlite.exec(
+        `DELETE FROM project_squad_access WHERE project_id = 'project-fence' AND squad_id = 'squad-fence'`,
+      )
+      expect(await runClaim()).toBe(0)
+      expect(fenceHarness.sqlite.prepare(
+        'SELECT accepted_at FROM invites WHERE id = ?',
+      ).get(FENCE_INVITE_ID)).toEqual({ accepted_at: null })
+      expect(fenceHarness.sqlite.prepare(
+        'SELECT COUNT(*) AS count FROM capabilities',
+      ).get()).toEqual({ count: 0 })
+      expect(fenceHarness.sqlite.prepare(
+        'SELECT state FROM telegram_webhook_receipts WHERE tenant = ? AND update_id = ?',
+      ).get(FENCE_TENANT, FENCE_UPDATE_ID)).toEqual({ state: 'processing' })
     })
   })
 

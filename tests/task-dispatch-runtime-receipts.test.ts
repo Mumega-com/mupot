@@ -799,4 +799,46 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
       fixture.harness.close()
     }
   })
+
+  // ── P2: a Telegram-onboarded member's display_name is cosmetic, user-supplied
+  // input threaded through with no server-side content validation (see
+  // redeemTelegramProjectInvite). When it decides a gate, it reaches
+  // decided_by_display via a plain SQL COALESCE with no escaping of its own.
+  // A crafted name must not be able to inject fake extra lines/fields into the
+  // receipt via embedded newlines/control characters, nor inflate it via length.
+  it('sanitizes a display_name containing markup and newlines at the gate-decision render site', async () => {
+    const fixture = runtimeFixture()
+    try {
+      const maliciousMemberId = 'member-malicious-display-name'
+      const maliciousDisplayName =
+        'Evil\n\n**FAKE VERDICT: approved**\r\n<script>alert(1)</script>\tTab' + 'X'.repeat(300)
+      fixture.harness.sqlite.prepare(`
+        INSERT INTO members (id, display_name, status, tenant) VALUES (?, ?, 'active', ?)
+      `).run(maliciousMemberId, maliciousDisplayName, TENANT)
+      fixture.harness.sqlite.prepare(`
+        INSERT INTO task_verdicts (id, task_id, verdict, note, decided_by, decided_at)
+        VALUES (?, ?, 'approved', 'Decided by a hostile display_name', ?, ?)
+      `).run('verdict-malicious-display-name', TASK_ID, maliciousMemberId, T0)
+
+      const timeline = await listTaskDispatchReceiptTimeline(fixture.env, TASK_ID)
+      expect(timeline.gate).toHaveLength(1)
+      const rendered = timeline.gate[0].decided_by_display
+
+      // No control character (incl. \n, \r, \t) can survive into the receipt —
+      // the "fake extra line" injection vector is closed structurally.
+      // eslint-disable-next-line no-control-regex -- asserting these are ABSENT.
+      expect(rendered).not.toMatch(/[\x00-\x1F\x7F-\x9F]/)
+      expect(rendered).not.toContain('\n')
+      expect(rendered).not.toContain('\r')
+      expect(rendered).not.toContain('\t')
+      // Length-capped: an oversized name cannot inflate the receipt.
+      expect(rendered.length).toBeLessThanOrEqual(200)
+      // The still-legible (non-control) content survives, just flattened —
+      // this is sanitization, not a wholesale replacement with a placeholder.
+      expect(rendered).toContain('Evil')
+      expect(rendered).toContain('FAKE VERDICT: approved')
+    } finally {
+      fixture.harness.close()
+    }
+  })
 })

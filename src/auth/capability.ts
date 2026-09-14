@@ -379,7 +379,11 @@ export function capabilityRank(cap: Capability): number {
 }
 
 /** The acting principal's highest effective capability rank on a scope — their
- *  grants OR their coarse org role (owner=5, admin=4). 0 = no standing. */
+ *  grants OR their coarse org role (owner=5, admin=4). 0 = no standing.
+ *  KNOWN DRIFT from requireCapability's stricter memberId-gated escape (see
+ *  actorRankOnSquad's fix in src/members/project-invites.ts, P1-1 parity) —
+ *  this function still floors on the coarse role even with no memberId on a
+ *  non-org scope. Tracked separately, do not fix here: mupot#1408. */
 export async function actorMaxRankOnScope(
   c: Context<AppEnv>,
   scopeType: CapabilityScopeType,
