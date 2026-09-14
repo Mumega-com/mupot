@@ -820,12 +820,12 @@ id = ? AND telegram_chat_id = ?)` conjunct for the bind path, tying them to
   exit 0, 4 files, 111 passed (before the 3 tests the correctness fix added; see full-suite
   count below for the final total).
 - `npx vitest run tests/telegram-project-onboarding.test.ts`: exit 0, 76/76 (was 53 before this
-  task; +23 new: 1 schema-trigger test, 7 `createProjectInvite` member_id tests, 8
-  `redeemTelegramProjectInvite` member_id tests, 5 HTTP route tests, plus the suspend-retry and
-  tenant-reassignment tests added by the correctness fix).
-- `npm test` (full suite, committed tree at `aa66b330`): see the PR body for the exact final
-  count — measured after this addendum was drafted, so it is reported there rather than
-  risking a stale number here once more commits land on top.
+  task; +23 new: 1 schema-trigger test, 8 `createProjectInvite` member_id tests, 9
+  `redeemTelegramProjectInvite` member_id tests — including the suspend-retry and
+  tenant-reassignment tests the correctness fix added — and 5 HTTP route tests).
+- `npm test` (full suite, committed tree at `63069fb5`): exit 0, **512 files, 8041 tests, all
+  passed** (0 failed). Duration 584.11s. Up from 8018 on `origin/main` at `49a344aa` — the 23
+  new tests in this one file account for the difference exactly.
 
 ### Mutation table (every conjunct new to this task, all executed for real: mutate → run
 ### targeted test → confirm red → `git checkout --` → confirm `git diff --stat` empty → next)
