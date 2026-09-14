@@ -47,14 +47,20 @@ type ActionError =
   | 'invalid_policy' | 'budget_exceeded' | 'reference_out_of_scope' | 'stale_situation'
   | 'project_not_active' | 'action_failed' | 'receipt_failed'
 
+// Athena addendum H: notification_reason is ADDITIVE only — every existing
+// consumer of notification_pending (MCP tool results, HTTP route JSON) is
+// unaffected; it names WHY notification_pending is true (or that it was
+// actually delivered) instead of collapsing every non-delivery into one bit.
+export type NotifyHumanWaitReasonField = 'delivered' | NotifyHumanWaitRefusalReason
+
 export type RoutineProposalResult =
-  | { ok: true; status: 'waiting'; reason: 'review' | 'answer'; run_id: string; action_key: string; duplicate: boolean; notification_pending: boolean }
+  | { ok: true; status: 'waiting'; reason: 'review' | 'answer'; run_id: string; action_key: string; duplicate: boolean; notification_pending: boolean; notification_reason: NotifyHumanWaitReasonField }
   | { ok: true; status: 'retry_scheduled'; reason: 'execution_failed'; run_id: string; action_key: string; duplicate: boolean }
   | { ok: true; status: 'succeeded'; run_id: string; action_key: string; result: Record<string, unknown>; duplicate: boolean }
   | { ok: false; error: ProposalError | ActionError }
 
 export type RoutineActionResult =
-  | { ok: true; status: 'waiting'; reason: 'review' | 'answer'; run_id: string; action_key: string; duplicate: boolean; notification_pending: boolean }
+  | { ok: true; status: 'waiting'; reason: 'review' | 'answer'; run_id: string; action_key: string; duplicate: boolean; notification_pending: boolean; notification_reason: NotifyHumanWaitReasonField }
   | { ok: true; status: 'retry_scheduled'; reason: 'execution_failed'; run_id: string; action_key: string; duplicate: boolean }
   | { ok: true; status: 'succeeded'; run_id: string; action_key: string; result: Record<string, unknown>; duplicate: boolean }
   | { ok: false; error: ActionError }
@@ -367,13 +373,28 @@ function humanWaitBody(
   throw new Error('human-wait attribution exceeds message limit')
 }
 
+// Athena addendum H: notifyHumanWait used to collapse every "not delivered"
+// case (no assigned agent, no decision to deliver, and an actual send refusal
+// or exception) into the same `true`. A caller could not tell "there was
+// never anyone to notify" from "delivery was attempted and refused" — both
+// looked identical. NotifyHumanWaitOutcome keeps that distinction; the three
+// call sites below fold it back into the existing boolean
+// `notification_pending` field (so RoutineProposalResult/RoutineActionResult
+// and every MCP/route consumer of them are unchanged) and ALSO surface the
+// new `notification_reason` as a purely additive field.
+export type NotifyHumanWaitRefusalReason = 'no_recipient' | 'no_decision' | 'delivery_refused'
+
+export type NotifyHumanWaitOutcome =
+  | { delivered: true }
+  | { delivered: false; reason: NotifyHumanWaitRefusalReason }
+
 export async function notifyHumanWait(
   env: Env,
   run: RunContext,
   action: ActionRow,
   reason: 'review' | 'answer',
-): Promise<boolean> {
-  if (!run.assigned_agent_id) return true
+): Promise<NotifyHumanWaitOutcome> {
+  if (!run.assigned_agent_id) return { delivered: false, reason: 'no_recipient' }
   const decision: HumanWaitDecision | null = reason === 'review'
     ? run.task_id ? { type: 'review', task_id: run.task_id } : null
     : (() => {
@@ -382,7 +403,7 @@ export async function notifyHumanWait(
           ? { type: 'answer', question: question.question, choices: question.choices }
           : null
       })()
-  if (!decision) return true
+  if (!decision) return { delivered: false, reason: 'no_decision' }
 
   try {
     const delivery = await sendAgentMessage(env, {
@@ -400,10 +421,22 @@ export async function notifyHumanWait(
       systemProjectAttribution: true,
       requireActiveRecipientProjectAccess: true,
     })
-    return !delivery.ok
+    return delivery.ok ? { delivered: true } : { delivered: false, reason: 'delivery_refused' }
   } catch {
-    return true
+    return { delivered: false, reason: 'delivery_refused' }
   }
+}
+
+/** Folds a NotifyHumanWaitOutcome into the two result fields every waiting
+ *  RoutineProposalResult/RoutineActionResult carries: the existing boolean
+ *  `notification_pending` (unchanged shape) plus the additive
+ *  `notification_reason` a caller can use to distinguish WHY. */
+function notificationFields(
+  outcome: NotifyHumanWaitOutcome,
+): { notification_pending: boolean; notification_reason: 'delivered' | NotifyHumanWaitRefusalReason } {
+  return outcome.delivered
+    ? { notification_pending: false, notification_reason: 'delivered' }
+    : { notification_pending: true, notification_reason: outcome.reason }
 }
 
 async function deterministicUuid(namespace: string, value: string): Promise<string> {
@@ -802,18 +835,18 @@ async function waitForHuman(
   if (outcomes.some(outcome => !wrote(outcome))) {
     const raced = await loadAction(env, run.id, action.action_key)
     if (raced?.status === 'waiting') {
-      const notificationPending = await notifyHumanWait(env, run, raced, reason)
+      const outcome = await notifyHumanWait(env, run, raced, reason)
       return {
         ok: true, status: 'waiting', reason, run_id: run.id, action_key: action.action_key,
-        duplicate: true, notification_pending: notificationPending,
+        duplicate: true, ...notificationFields(outcome),
       }
     }
     return { ok: false, error: 'receipt_failed' }
   }
-  const notificationPending = await notifyHumanWait(env, run, action, reason)
+  const outcome = await notifyHumanWait(env, run, action, reason)
   return {
     ok: true, status: 'waiting', reason, run_id: run.id, action_key: action.action_key,
-    duplicate: false, notification_pending: notificationPending,
+    duplicate: false, ...notificationFields(outcome),
   }
 }
 
@@ -834,7 +867,7 @@ async function replayWaitingAction(
     return executeRoutineAction(env, run.id, action.action_key)
   }
   const reason = run.waiting_reason === 'answer' ? 'answer' : 'review'
-  const notificationPending = await notifyHumanWait(env, run, action, reason)
+  const outcome = await notifyHumanWait(env, run, action, reason)
   return {
     ok: true,
     status: 'waiting',
@@ -842,7 +875,7 @@ async function replayWaitingAction(
     run_id: run.id,
     action_key: action.action_key,
     duplicate: true,
-    notification_pending: notificationPending,
+    ...notificationFields(outcome),
   }
 }
 

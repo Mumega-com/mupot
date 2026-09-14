@@ -303,9 +303,11 @@ describe('Telegram project invitation service', () => {
         ('squad-unlinked', 'department-delivery', 'unlinked', 'Unlinked');
       INSERT INTO projects (id, slug, name, status) VALUES
         ('project-active', 'active-project', 'Active project', 'active'),
-        ('project-archived', 'archived-project', 'Archived project', 'archived');
-      INSERT INTO project_squad_access (project_id, squad_id, access_level)
-      VALUES ('project-active', 'squad-participants', 'write');
+        ('project-archived', 'archived-project', 'Archived project', 'archived'),
+        ('project-decoy', 'decoy-project', 'Decoy project', 'active');
+      INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES
+        ('project-active', 'squad-participants', 'write'),
+        ('project-decoy', 'squad-unlinked', 'write');
       INSERT INTO members (id, email, display_name, status, tenant)
       VALUES ('member-inviter', 'inviter@example.test', 'Inviter', 'active', '${TENANT}');
     `)
@@ -596,6 +598,53 @@ describe('Telegram project invitation service', () => {
       insertFenceReceipt('completed')
       expect(await runClaim()).toBe(0)
     })
+  })
+
+  // ── Athena addendum B: the SAME P1-1 fix, proven over the actual HTTP route
+  // (not just the service function) for a real, DB-resolved member grant —
+  // one predicate covering both call shapes.
+  it('P1-1/B — refuses a project invite over the HTTP route for a real member with only an observer squad grant', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status, tenant)
+      VALUES ('member-route-observer', 'route-observer@example.test', 'Route Observer', 'active', '${TENANT}');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+      VALUES ('cap-route-observer', 'member-route-observer', 'squad', 'squad-participants', 'observer');
+    `)
+    const session = JSON.stringify({
+      userId: 'route-observer-user',
+      email: 'route-observer@example.test',
+      role: 'member',
+      createdAt: new Date().toISOString(),
+    })
+    const routeEnv = {
+      ...env,
+      SESSIONS: {
+        get: async (key: string) => key === 'sess:route-observer' ? session : null,
+        put: async () => undefined,
+        delete: async () => undefined,
+      },
+    } as Env
+
+    const response = await membersApp.request('/invites', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        cookie: 'mupot_session=route-observer',
+      },
+      body: JSON.stringify({
+        email: 'route-target@example.test',
+        project_id: 'project-active',
+        squad_id: 'squad-participants',
+        capability: 'observer',
+        expires_in_seconds: 3600,
+      }),
+    }, routeEnv)
+
+    expect(response.status, await response.clone().text()).toBe(403)
+    await expect(response.json()).resolves.toEqual({ error: 'forbidden' })
+    expect(harness.sqlite.prepare(`
+      SELECT COUNT(*) AS count FROM invites WHERE email = 'route-target@example.test'
+    `).get()).toEqual({ count: 0 })
   })
 
   it('returns the project pairing code once through the authenticated invite route with no-store headers', async () => {
@@ -894,6 +943,41 @@ describe('Telegram project invitation service', () => {
     expect(retry.ok).toBe(true)
   })
 
+  // ── Athena addendum D: this onboarding slice is net-new humans only.
+  // Redeeming an invite whose email already belongs to an existing member
+  // (a different Telegram identity, so no telegram_chat_id conflict) must
+  // refuse with 'member_already_exists' and leave no partial writes.
+  it('refuses redemption when the invited email already belongs to an existing member', async () => {
+    const created = await createInvite('existing-member@example.test')
+    expect(created.ok).toBe(true)
+    if (!created.ok) return
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, telegram_chat_id, status, tenant)
+      VALUES ('member-already-exists', 'existing-member@example.test', 'Existing', '9002999', 'active', '${TENANT}');
+    `)
+    reserveUpdate('update-existing-member', VALID_REQUEST_DIGEST, '9002998')
+
+    const result = await redeemTelegramProjectInvite(env, {
+      pairing_code: created.value.pairing_code,
+      telegram_user_id: '9002998',
+      display_name: 'New Telegram Identity',
+      update_id: 'update-existing-member',
+      request_digest: VALID_REQUEST_DIGEST,
+    })
+
+    expect(result).toEqual({ ok: false, error: 'member_already_exists' })
+    expect(harness.sqlite.prepare('SELECT accepted_at FROM invites WHERE id = ?').get(created.value.invite.id))
+      .toEqual({ accepted_at: null })
+    expect(harness.sqlite.prepare(`
+      SELECT COUNT(*) AS count FROM members WHERE email = 'existing-member@example.test'
+    `).get()).toEqual({ count: 1 })
+    expect(harness.sqlite.prepare(`
+      SELECT COUNT(*) AS count FROM capabilities WHERE member_id = 'member-already-exists'
+    `).get()).toEqual({ count: 0 })
+    expect(harness.sqlite.prepare(`SELECT state FROM telegram_webhook_receipts WHERE update_id = 'update-existing-member'`).get())
+      .toEqual({ state: 'processing' })
+  })
+
   it('rejects a browser/API supplied Telegram identity without claiming a legacy invite', async () => {
     harness.sqlite.exec(`
       INSERT INTO invites (id, email, capability, invited_by)
@@ -1131,6 +1215,74 @@ describe('Telegram project invitation service', () => {
   // ── P2: a distinct chat reply per redemption failure is a weak enumeration
   // oracle over a secret pairing code. Two different underlying causes must
   // produce the IDENTICAL generic chat text.
+  // ── Athena addendum E: Telegram's self-reported first_name/username become
+  // the stored, COSMETIC-ONLY display_name — never a hardcoded 'Telegram
+  // member' when the update actually carries a name, and never authority.
+  it('E — threads the Telegram first_name/username through as the display_name label only', async () => {
+    const created = await createInvite('display-name-participant@example.test')
+    expect(created.ok).toBe(true)
+    if (!created.ok) return
+    const telegramEnv = {
+      ...env,
+      IM_WEBHOOK_SECRET: 'display-name-webhook-secret',
+      BUS: { send: async () => undefined },
+    } as Env
+
+    const response = await imApp.fetch(new Request('https://pot.test/webhook', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Telegram-Bot-Api-Secret-Token': 'display-name-webhook-secret',
+      },
+      body: JSON.stringify({
+        update_id: 8000,
+        message: {
+          from: { id: 9003001, first_name: 'Ada ', username: 'ada_lovelace' },
+          chat: { id: 9003001, type: 'private' },
+          text: `/start ${created.value.pairing_code}`,
+        },
+      }),
+    }), telegramEnv)
+    expect(response.status, await response.clone().text()).toBe(200)
+    await expect(response.json()).resolves.toMatchObject({ reply: expect.stringContaining('Joined project') })
+
+    expect(harness.sqlite.prepare(`
+      SELECT display_name FROM members WHERE telegram_chat_id = '9003001'
+    `).get()).toEqual({ display_name: 'Ada (@ada_lovelace)' })
+  })
+
+  it('E — falls back to the generic label when Telegram supplies no usable name', async () => {
+    const created = await createInvite('no-name-participant@example.test')
+    expect(created.ok).toBe(true)
+    if (!created.ok) return
+    const telegramEnv = {
+      ...env,
+      IM_WEBHOOK_SECRET: 'no-name-webhook-secret',
+      BUS: { send: async () => undefined },
+    } as Env
+
+    const response = await imApp.fetch(new Request('https://pot.test/webhook', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Telegram-Bot-Api-Secret-Token': 'no-name-webhook-secret',
+      },
+      body: JSON.stringify({
+        update_id: 8001,
+        message: {
+          from: { id: 9003002 },
+          chat: { id: 9003002, type: 'private' },
+          text: `/start ${created.value.pairing_code}`,
+        },
+      }),
+    }), telegramEnv)
+    expect(response.status, await response.clone().text()).toBe(200)
+
+    expect(harness.sqlite.prepare(`
+      SELECT display_name FROM members WHERE telegram_chat_id = '9003002'
+    `).get()).toEqual({ display_name: 'Telegram member' })
+  })
+
   it('P2 — never echoes the raw redemption error enum into the Telegram chat reply', async () => {
     const expired = await createInvite('join-error-expired@example.test')
     expect(expired.ok).toBe(true)

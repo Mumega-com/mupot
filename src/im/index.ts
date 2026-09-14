@@ -296,6 +296,17 @@ export interface HandleImMessageOptions {
   forwarded?: boolean
   /** Set only by the authenticated webhook after reserving the envelope. */
   telegram?: TelegramUpdateIdentity
+  /**
+   * COSMETIC ONLY — Telegram's self-reported `first_name`/`username`, used
+   * solely as the new member's stored `display_name` label. It carries NO
+   * authority and is never part of identity, authorization, or the request
+   * digest (computed upstream from update_id/telegram_user_id/chat_id/text/
+   * forwarding only): membership binding is exclusively the authenticated
+   * (tenant, update_id) receipt + Telegram user id. A caller cannot use this
+   * field to claim or spoof a different identity than the one that reserved
+   * the envelope.
+   */
+  displayName?: string
 }
 
 // ── the entry point Hermes calls ──────────────────────────────────────────────
@@ -323,7 +334,9 @@ export async function handleImMessage(
       return 'Open your invitation in a direct Telegram conversation to join.'
     }
     const result = await redeemTelegramProjectInvite(env, {
-      ...options.telegram, pairing_code: intent.code, display_name: 'Telegram member',
+      ...options.telegram,
+      pairing_code: intent.code,
+      display_name: sanitizeTelegramDisplayName(options.displayName),
     })
     // P2: never echo the raw error enum into the chat — `invalid_or_expired_pairing_code`
     // vs `ambiguous_pairing_code` vs `telegram_identity_conflict` vs `member_already_exists`
@@ -826,7 +839,7 @@ interface TelegramUpdate {
   update_id?: unknown
   message?: {
     chat?: { id?: unknown; type?: unknown }
-    from?: { id?: unknown }
+    from?: { id?: unknown; first_name?: unknown; username?: unknown }
     text?: unknown
     forward_origin?: unknown
     forward_from?: unknown
@@ -839,6 +852,30 @@ function telegramId(raw: unknown, allowZero = false): string | null {
   const value = typeof raw === 'string' && /^(0|[1-9][0-9]{0,15})$/.test(raw)
     ? Number(raw) : typeof raw === 'number' ? raw : NaN
   return Number.isSafeInteger(value) && value >= (allowZero ? 0 : 1) ? String(value) : null
+}
+
+/**
+ * COSMETIC ONLY — Telegram's self-reported `first_name`/`username` become the
+ * new member's `display_name` label and nothing else: not identity, not
+ * authority, not part of the request digest. Membership binding stays
+ * exclusively the authenticated (tenant, update_id) receipt + Telegram user
+ * id (see the header comment on TelegramUpdate above and on
+ * HandleImMessageOptions.displayName). Capped well under
+ * project-invites.ts's own 200-char display_name validation.
+ */
+function telegramDisplayName(from: { first_name?: unknown; username?: unknown } | undefined): string | undefined {
+  const firstName = typeof from?.first_name === 'string' ? from.first_name.trim() : ''
+  const username = typeof from?.username === 'string' ? from.username.trim() : ''
+  const label = username ? (firstName ? `${firstName} (@${username})` : `@${username}`) : firstName
+  const trimmed = label.slice(0, 100).trim()
+  return trimmed.length > 0 ? trimmed : undefined
+}
+
+/** Falls back to a generic label if Telegram supplied nothing usable — still
+ *  cosmetic only, see telegramDisplayName above. */
+function sanitizeTelegramDisplayName(candidate: string | undefined): string {
+  const trimmed = candidate?.trim()
+  return trimmed && trimmed.length > 0 ? trimmed.slice(0, 100) : 'Telegram member'
 }
 
 function storedTelegramReply(responseText: string): { ok: true; reply: string } | null {
@@ -918,7 +955,9 @@ imApp.post('/webhook', async (c) => {
   }
   // Never release or replace the reservation after an uncertain side effect.
   const reply = await handleImMessage(c.env, chatId, text, {
-    forwarded: Object.values(forwarding).some(Boolean), telegram: identity,
+    forwarded: Object.values(forwarding).some(Boolean),
+    telegram: identity,
+    displayName: telegramDisplayName(update.message?.from),
   })
   const stored = await completeTelegramUpdate(c.env, identity, JSON.stringify({ ok: true, reply }))
   const response = stored === null ? null : storedTelegramReply(stored)

@@ -483,7 +483,7 @@ describe('Routine proposal submission and governed actions', () => {
     })
 
     await expect(submitRoutineProposal(env, fixture.principal, proposal)).resolves.toMatchObject({
-      ok: true, status: 'waiting', reason: 'answer', notification_pending: true,
+      ok: true, status: 'waiting', reason: 'answer', notification_pending: true, notification_reason: 'delivery_refused',
     })
     expect(row(fixture, "SELECT status, waiting_reason FROM routine_runs WHERE id = 'run-1'")).toEqual({
       status: 'waiting', waiting_reason: 'answer',
@@ -511,7 +511,7 @@ describe('Routine proposal submission and governed actions', () => {
     })
 
     await expect(submitRoutineProposal(env, fixture.principal, proposal)).resolves.toMatchObject({
-      ok: true, status: 'waiting', reason: 'answer', notification_pending: true,
+      ok: true, status: 'waiting', reason: 'answer', notification_pending: true, notification_reason: 'delivery_refused',
     })
     expect(row(fixture, 'SELECT COUNT(*) AS count FROM agent_messages')).toEqual({ count: 0 })
   })
@@ -532,7 +532,7 @@ describe('Routine proposal submission and governed actions', () => {
     })
 
     await expect(submitRoutineProposal(env, fixture.principal, proposal)).resolves.toMatchObject({
-      ok: true, status: 'waiting', reason: 'answer', notification_pending: true,
+      ok: true, status: 'waiting', reason: 'answer', notification_pending: true, notification_reason: 'delivery_refused',
     })
     expect(row(fixture, 'SELECT COUNT(*) AS count FROM agent_messages')).toEqual({ count: 0 })
   })
@@ -565,9 +565,11 @@ describe('Routine proposal submission and governed actions', () => {
     expect(run?.assigned_agent_id).toBeNull()
     expect(action?.status).toBe('waiting')
 
-    const pending = await notifyHumanWait(fixture.env, run!, action!, 'answer')
+    const outcome = await notifyHumanWait(fixture.env, run!, action!, 'answer')
 
-    expect(pending).toBe(true)
+    // Athena addendum H: notifyHumanWait now distinguishes WHY it did not
+    // deliver — this is specifically 'no_recipient', not a collapsed boolean.
+    expect(outcome).toEqual({ delivered: false, reason: 'no_recipient' })
     // Still exactly the one message from the earlier, normally-assigned notify —
     // the null-assignee call above must not have attempted a second insert.
     expect(row(fixture, 'SELECT COUNT(*) AS count FROM agent_messages')).toEqual({ count: 1 })

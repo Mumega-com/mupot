@@ -13,6 +13,37 @@ Onboarding does not grant organization admin, an agent or workspace token, merge
 publish, spend, or independent gate authority. Approval and rejection still require the
 existing task gate grant, surface capability, conflict checks, and shared verdict predicate.
 
+This slice onboards **net-new humans only**. Redeeming a project invite whose email already
+belongs to an existing member refuses with `member_already_exists` and makes no partial
+writes (see the invite redemption tests). Binding a Telegram identity to an *existing* member
+account — for example, an operator who already has a web login and simply wants to add
+Telegram as a second channel — is not in scope of this PR. Do not work around that by
+inviting an existing member's own email; provision that binding through a separate, explicitly
+reviewed change instead.
+
+## Behaviour change: IM verdict authority
+
+`/approve` and `/reject` over Telegram now route through the SAME shared gate evaluator as the
+HTTP and MCP surfaces (`evaluateVerdictGates` in `src/tasks/index.ts`), via a flat `AuthContext`
+built with `role: 'member'` and the member's real, resolved capability grants
+(`src/im/index.ts`'s `memberAuth`). The IM surface's own earlier hand-rolled gate-ownership and
+surface-capability checks (`memberHasGateGrant`, `memberHasSurfaceGrant` — bare `gate_grants`
+existence, no liveness join, no `gate:agent-self-completion` special case) are removed.
+
+Net effect: **a human holding only a coarse org-scope admin *role* (not an actual org-scope
+admin *capability grant* row) can no longer approve `gate:agent-self-completion` over IM.**
+Only a real, resolved capability grant (an explicit `org`/`department`/`squad` row, evaluated
+the identical way HTTP and MCP evaluate it) satisfies the gate now. This closes the same class
+of divergence Kasra flagged in mupot#1319 BLOCK-2 and mupot#1080/#1081 — IM's verdict gate
+previously diverged from the canonical HTTP/MCP predicate, which is exactly the "two copies of
+one rule" defect class. That deferred item is closed here, for the IM surface, by deletion
+rather than a third copy.
+
+If an operator relies on Telegram approval today for `gate:agent-self-completion` on the
+strength of a coarse role alone (no capability row), grant them the real capability row before
+or as part of adopting this change — do not treat the coarse role as sufficient going forward,
+on IM or any other surface.
+
 ## Authority and credential boundaries
 
 - Only an authenticated operator with the required department, project, and squad authority

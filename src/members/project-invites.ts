@@ -2,6 +2,7 @@ import type { AuthContext, Capability, CapabilityGrant, Env } from '../types'
 import {
   capabilityRank,
   hasCapability,
+  legacyRoleRank,
   resolveCapabilities,
 } from '../auth/capability'
 import { sha256Hex } from './service'
@@ -129,27 +130,23 @@ function isCapability(value: unknown): value is Capability {
   return typeof value === 'string' && (CAPABILITIES as readonly string[]).includes(value)
 }
 
-function actorRoleRank(auth: AuthContext): number {
-  if (auth.role === 'owner') return capabilityRank('owner')
-  if (auth.role === 'admin') return capabilityRank('admin')
-  return 0
-}
-
 /**
  * The actor's effective capability rank on a squad scope — carrying exactly
  * requireCapability's restrictions (src/auth/capability.ts:295-338), NOT a
  * looser re-derivation of them.
  *
- * P1-1 fix: the prior version computed `actorRoleRank(auth)` unconditionally
- * and then `Math.max`ed it against any real grant, so a coarse org owner/admin
- * role always floored (and could WIDEN past) an explicit narrower squad grant.
- * requireCapability never does that for a non-org scope: its legacy-role
- * escape (capabilities === undefined) exists ONLY for org-scope checks, and
- * once a member's grants are resolved (even to []) the coarse role plays no
- * further part. So here: an explicit grant on this scope (via hasCapability —
- * the same predicate requireCapability calls, reused rather than
- * re-implemented) always wins outright; the coarse role is consulted ONLY as
- * a bootstrap-owner floor when this principal's capabilities were NEVER
+ * P1-1 fix: the prior version computed the coarse legacy role's rank
+ * unconditionally and then `Math.max`ed it against any real grant, so a
+ * coarse org owner/admin role always floored (and could WIDEN past) an
+ * explicit narrower squad grant. requireCapability never does that for a
+ * non-org scope: its legacy-role escape (capabilities === undefined) exists
+ * ONLY for org-scope checks, and once a member's grants are resolved (even to
+ * []) the coarse role plays no further part. So here: an explicit grant on
+ * this scope (via hasCapability — the same predicate requireCapability calls,
+ * reused rather than re-implemented) always wins outright; the coarse role
+ * (via legacyRoleRank — the SAME rank function requireCapability's own
+ * legacy-role escape is built on, not a second copy of it) is consulted ONLY
+ * as a bootstrap-owner floor when this principal's capabilities were NEVER
  * resolved at all (auth.capabilities === undefined) and no grant covers this
  * squad — never as an addition on top of a real, narrower grant.
  */
@@ -164,7 +161,7 @@ async function actorRankOnSquad(
     // coarse role only for a principal that never had capabilities resolved
     // at all (a pure legacy web login) — same condition requireCapability
     // gates its own legacy-role escape on.
-    return auth.capabilities === undefined ? actorRoleRank(auth) : 0
+    return auth.capabilities === undefined ? legacyRoleRank(auth.role) : 0
   }
   const grants: CapabilityGrant[] = auth.capabilities ?? await resolveCapabilities(env, auth.memberId)
   for (const capability of CAPABILITIES) {
@@ -176,7 +173,7 @@ async function actorRankOnSquad(
   // when capabilities were never resolved for this principal at all — never
   // when they were resolved (even to an empty array), which is itself the
   // real "no standing here" answer and must not be overridden upward.
-  return auth.capabilities === undefined ? actorRoleRank(auth) : 0
+  return auth.capabilities === undefined ? legacyRoleRank(auth.role) : 0
 }
 
 function base64Url(bytes: Uint8Array): string {

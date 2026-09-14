@@ -472,7 +472,27 @@ restored immediately:
 After restoration, the complete attempt-ACK file passed 9/9 and the disposable worktree was
 diff-clean. No server source or test changed during this final verification.
 
-The current exact head is not yet pushed. Therefore exact-head remote CI/security review,
-merge, deployment approval, remote application/readback of migrations 0152 and 0153,
-deployed `/health` SHA, protected profile/webhook configuration, invitation, and the real
-non-admin Telegram onboarding pilot remain unproven and separately gated.
+This file is repository-local verification only, permanently — that property does not change
+with a later push or a later green CI run, so no claim here should be read as, or restated as,
+proof of any of the following: exact-head remote CI, an independent security review, merge,
+deployment approval, remote application or readback of migrations `0152` and `0153`, a
+deployed `/health` SHA, protected profile/webhook configuration, a live invitation, or a real
+non-admin Telegram onboarding pilot. Each of those is a separate, separately gated artifact
+that names its own exact commit; look for that artifact rather than inferring its outcome from
+this file's test counts. See the Athena/Kasra gate history on the PR for the exact-head verdict
+and the commit it was measured against.
+
+## Kasra-core addendum (2026-09-14, commit 91e7df7c and after)
+
+Kasra gate on head `22c778d8` returned AMBER; the fixes it required (P1-1 rank-widening on
+project invites, P1-2 claim-fence statement pinning, P1-3 admin-floor negative test, P1-4
+recipient/project/null-assignee fences, P2 enumeration-oracle reply) landed starting at commit
+`91e7df7c`, together with the Athena addendum items (A–H) tracked on the PR. `npm run
+typecheck` and the focused suite
+(`telegram-project-onboarding.test.ts`, `members-sensitive-response.test.ts`,
+`needs-you.test.ts`, `routine-actions.test.ts`, `im-webhook-idempotency.test.ts`) and the full
+`npm test` were run again against the actual final head of that work, not a parent commit; see
+the mutation table and counts below for the exact numbers and the exact SHA they were measured
+against. This addendum does not replace the exact-head remote CI / independent review /
+deployment gates named above — it is the same repository-local kind of evidence as the rest of
+this file, for the commits added after `22c778d8`.
