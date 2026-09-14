@@ -2800,9 +2800,42 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     ],
     objects: [],
   },
+  {
+    file: "0152_telegram_project_onboarding.sql",
+    sha256: "0b3507c54a1f435d52ff721aba14c12893c3f044b166abd6604f150b01505bd0",
+    statements: [
+      "-- 0152_telegram_project_onboarding.sql — durable Telegram project onboarding.\n--\n-- Project-scoped invites carry only a SHA-256 pairing digest; the raw pairing\n-- secret never enters D1. The four project fields form one atomic optional set\n-- so legacy email invites remain valid without allowing partial project binds.\n\nALTER TABLE invites ADD COLUMN project_id TEXT REFERENCES projects(id);",
+      "\nALTER TABLE invites ADD COLUMN squad_id TEXT REFERENCES squads(id);",
+      "\nALTER TABLE invites ADD COLUMN pairing_hash TEXT;",
+      "\nALTER TABLE invites ADD COLUMN pairing_expires_at TEXT;",
+      "\n\nCREATE TRIGGER validate_invites_project_pairing_insert\nBEFORE INSERT ON invites\nBEGIN\n  SELECT RAISE(ABORT, 'project invite fields must be jointly null or nonblank')\n  WHERE NOT (\n    (\n      NEW.project_id IS NULL\n      AND NEW.squad_id IS NULL\n      AND NEW.pairing_hash IS NULL\n      AND NEW.pairing_expires_at IS NULL\n    )\n    OR\n    (\n      NEW.project_id IS NOT NULL\n      AND NEW.squad_id IS NOT NULL\n      AND NEW.pairing_hash IS NOT NULL\n      AND NEW.pairing_expires_at IS NOT NULL\n      AND length(trim(NEW.project_id)) > 0\n      AND length(trim(NEW.squad_id)) > 0\n      AND length(trim(NEW.pairing_hash)) > 0\n      AND length(trim(NEW.pairing_expires_at)) > 0\n    )\n  );\n  SELECT RAISE(ABORT, 'project invite pairing hash must be 64 hex characters')\n  WHERE NEW.pairing_hash IS NOT NULL\n    AND (\n      length(NEW.pairing_hash) <> 64\n      OR NEW.pairing_hash GLOB '*[^0-9A-Fa-f]*'\n    );\n  SELECT RAISE(ABORT, 'project invite project-squad mismatch')\n  WHERE NEW.project_id IS NOT NULL\n    AND NOT EXISTS (\n      SELECT 1\n      FROM project_squad_access\n      WHERE project_id = NEW.project_id\n        AND squad_id = NEW.squad_id\n    );\nEND;",
+      "\n\nCREATE TRIGGER validate_invites_project_pairing_update\nBEFORE UPDATE OF project_id, squad_id, pairing_hash, pairing_expires_at ON invites\nBEGIN\n  SELECT RAISE(ABORT, 'project invite fields must be jointly null or nonblank')\n  WHERE NOT (\n    (\n      NEW.project_id IS NULL\n      AND NEW.squad_id IS NULL\n      AND NEW.pairing_hash IS NULL\n      AND NEW.pairing_expires_at IS NULL\n    )\n    OR\n    (\n      NEW.project_id IS NOT NULL\n      AND NEW.squad_id IS NOT NULL\n      AND NEW.pairing_hash IS NOT NULL\n      AND NEW.pairing_expires_at IS NOT NULL\n      AND length(trim(NEW.project_id)) > 0\n      AND length(trim(NEW.squad_id)) > 0\n      AND length(trim(NEW.pairing_hash)) > 0\n      AND length(trim(NEW.pairing_expires_at)) > 0\n    )\n  );\n  SELECT RAISE(ABORT, 'project invite pairing hash must be 64 hex characters')\n  WHERE NEW.pairing_hash IS NOT NULL\n    AND (\n      length(NEW.pairing_hash) <> 64\n      OR NEW.pairing_hash GLOB '*[^0-9A-Fa-f]*'\n    );\n  SELECT RAISE(ABORT, 'project invite project-squad mismatch')\n  WHERE NEW.project_id IS NOT NULL\n    AND NOT EXISTS (\n      SELECT 1\n      FROM project_squad_access\n      WHERE project_id = NEW.project_id\n        AND squad_id = NEW.squad_id\n    );\nEND;",
+      "\n\nCREATE TABLE telegram_webhook_receipts (\n  tenant         TEXT NOT NULL,\n  update_id      TEXT NOT NULL,\n  telegram_user_id TEXT NOT NULL\n                   CHECK (\n                     length(trim(telegram_user_id)) BETWEEN 1 AND 255\n                   ),\n  request_digest TEXT NOT NULL\n                 CHECK (\n                   length(request_digest) = 64\n                   AND request_digest NOT GLOB '*[^0-9A-Fa-f]*'\n                 ),\n  state          TEXT NOT NULL\n                 CHECK (state IN ('processing', 'completed', 'unknown')),\n  response_text  TEXT,\n  created_at     TEXT NOT NULL,\n  completed_at   TEXT,\n  PRIMARY KEY (tenant, update_id)\n);",
+    ],
+    objects: [
+      { type: "trigger", name: "validate_invites_project_pairing_insert" },
+      { type: "trigger", name: "validate_invites_project_pairing_update" },
+      { type: "table", name: "telegram_webhook_receipts" },
+    ],
+  },
+  {
+    file: "0153_inbox_lease_attempt_reconciliation.sql",
+    sha256: "aee1cb0981130f3c82b409199849a374086460c5f2b114cfbddae98a372ad2d3",
+    statements: [
+      "-- 0153_inbox_lease_attempt_reconciliation.sql — server-authoritative recovery\n-- for ambiguous inbox_lease transport outcomes.\n\n-- This stores the server-derived scope-bound stamp, not the raw client attempt id.\nALTER TABLE agent_messages ADD COLUMN lease_attempt_id TEXT;",
+      "\n\nCREATE TABLE agent_inbox_lease_attempts (\n  tenant TEXT NOT NULL,\n  agent_id TEXT NOT NULL,\n  target_seat_key TEXT NOT NULL,\n  attempt_id TEXT NOT NULL,\n  request_digest TEXT NOT NULL\n                 CHECK (length(request_digest) = 64\n                        AND request_digest NOT GLOB '*[^0-9A-Fa-f]*'),\n  state TEXT NOT NULL\n        CHECK (state IN ('opening','leased','empty','cancelled','expired','acked')),\n  -- Live ownership is FK-protected. Terminal cleanup detaches the FK but keeps\n  -- the immutable tuple below plus this non-FK id tombstone for audit.\n  message_id TEXT REFERENCES agent_messages(id) ON DELETE RESTRICT,\n  terminal_message_id TEXT,\n  message_seq INTEGER,\n  delivery_attempt INTEGER,\n  lease_expires_at TEXT,\n  created_at TEXT NOT NULL,\n  resolved_at TEXT,\n  PRIMARY KEY (tenant, agent_id, target_seat_key, attempt_id),\n  CHECK (\n    (state = 'leased'\n      AND message_id IS NOT NULL\n      AND terminal_message_id IS NULL\n      AND message_seq IS NOT NULL\n      AND delivery_attempt IS NOT NULL\n      AND lease_expires_at IS NOT NULL)\n    OR\n    (state IN ('acked','expired')\n      AND message_id IS NULL\n      AND terminal_message_id IS NOT NULL\n      AND message_seq IS NOT NULL\n      AND delivery_attempt IS NOT NULL\n      AND lease_expires_at IS NOT NULL)\n    OR\n    (state IN ('opening','empty','cancelled')\n      AND message_id IS NULL\n      AND terminal_message_id IS NULL\n      AND message_seq IS NULL\n      AND delivery_attempt IS NULL\n      AND lease_expires_at IS NULL)\n  )\n);",
+      "\n\nCREATE INDEX idx_agent_inbox_lease_attempts_lookup\n  ON agent_inbox_lease_attempts(tenant, agent_id, target_seat_key, attempt_id);",
+      "\n\nCREATE INDEX idx_agent_messages_lease_attempt\n  ON agent_messages(tenant, to_agent, lease_attempt_id);",
+    ],
+    objects: [
+      { type: "table", name: "agent_inbox_lease_attempts" },
+      { type: "index", name: "idx_agent_inbox_lease_attempts_lookup" },
+      { type: "index", name: "idx_agent_messages_lease_attempt" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "5aecbf779ee83722eca1914df9b44b964bb0773c2ececa1041cb462cb708b41f"
+export const SCHEMA_CHAIN_DIGEST: string = "833b618a5d63d0fdacd3c7eaa0b9f583645dad67b8a6dfa31da5e6b93ca2cd49"

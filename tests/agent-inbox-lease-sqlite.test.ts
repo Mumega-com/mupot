@@ -19,6 +19,7 @@ import { describe, expect, it } from 'vitest'
 import {
   readAgentInbox,
   leaseAgentInbox,
+  reconcileAgentInboxLeaseAttempt,
   ackAgentMessages,
   listDeadLetteredMessages,
   summarizeDeadLetters,
@@ -26,7 +27,8 @@ import {
   DEFAULT_LEASE_SECONDS,
   MAX_LEASE_SECONDS,
 } from '../src/agents/messages'
-import type { Env } from '../src/types'
+import { invokeTool } from '../src/mcp/index'
+import type { AuthContext, Env } from '../src/types'
 import { createSqliteD1 } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
 
@@ -65,12 +67,13 @@ function fixture() {
       key_fingerprint=excluded.key_fingerprint, updated_at=excluded.updated_at, reason=excluded.reason;
   `)
   const row = (id: string) => harness.sqlite.prepare(
-    `SELECT read_at, delivery_attempts, lease_expires_at, dead_lettered_at, dead_letter_reason
+    `SELECT read_at, delivery_attempts, lease_expires_at, lease_attempt_id, dead_lettered_at, dead_letter_reason
        FROM agent_messages WHERE id = ?`,
   ).get(id) as {
     read_at: string | null
     delivery_attempts: number
     lease_expires_at: string | null
+    lease_attempt_id: string | null
     dead_lettered_at: string | null
     dead_letter_reason: string | null
   }
@@ -572,6 +575,302 @@ describe('tenant and recipient scoping', () => {
       const noTenant = { ...f.env, TENANT_SLUG: '' } as unknown as Env
       expect(await leaseAgentInbox(noTenant, { agent: 'agent-a' })).toMatchObject({ ok: false, reason: 'no_tenant' })
       expect(await ackAgentMessages(noTenant, { agent: 'agent-a', ids: ['m1'] })).toMatchObject({ ok: false, reason: 'no_tenant' })
+    } finally { f.harness.close() }
+  })
+})
+
+describe('authoritative inbox lease attempt reconciliation', () => {
+  const ATTEMPT = '11111111-1111-4111-8111-111111111111'
+  const NEXT_ATTEMPT = '22222222-2222-4222-8222-222222222222'
+
+  it('tombstones an unknown attempt so a delayed original lease cannot claim work', async () => {
+    const f = fixture()
+    try {
+      f.seed('m1')
+      const reconciled = await reconcileAgentInboxLeaseAttempt(
+        f.env, { agent: 'agent-a', attemptId: ATTEMPT }, clock(at(0)),
+      )
+      expect(reconciled).toMatchObject({ ok: true, attempt_id: ATTEMPT, state: 'cancelled', messages: [], consumed: false })
+
+      const delayed = await leaseAgentInbox(
+        f.env, { agent: 'agent-a', limit: 1, leaseSeconds: 30, attemptId: ATTEMPT }, clock(at(1)),
+      )
+      expect(delayed).toMatchObject({ ok: true, attempt_id: ATTEMPT, state: 'cancelled', messages: [], consumed: false })
+      expect(f.row('m1').delivery_attempts).toBe(0)
+    } finally { f.harness.close() }
+  })
+
+  it('replays a committed attempt without a second delivery and conflicts on changed normalized params', async () => {
+    const f = fixture()
+    try {
+      f.seed('m1')
+      const first = await leaseAgentInbox(
+        f.env, { agent: 'agent-a', limit: 1, leaseSeconds: 30, attemptId: ATTEMPT }, clock(at(0)),
+      )
+      expect(first).toMatchObject({ ok: true, attempt_id: ATTEMPT, state: 'leased', messages: [{ id: 'm1', delivery_attempts: 1 }], consumed: false })
+
+      const replay = await leaseAgentInbox(
+        f.env, { agent: 'agent-a', limit: 1, leaseSeconds: 30, attemptId: ATTEMPT }, clock(at(1)),
+      )
+      expect(replay).toMatchObject({ ok: true, attempt_id: ATTEMPT, state: 'leased', messages: [{ id: 'm1', delivery_attempts: 1 }] })
+      expect(f.row('m1').delivery_attempts).toBe(1)
+
+      const conflict = await leaseAgentInbox(
+        f.env, { agent: 'agent-a', limit: 1, leaseSeconds: 31, attemptId: ATTEMPT }, clock(at(1)),
+      )
+      expect(conflict).toMatchObject({ ok: false, reason: 'attempt_conflict' })
+      expect(f.row('m1').delivery_attempts).toBe(1)
+    } finally { f.harness.close() }
+  })
+
+  it('reconciles the exact active message, then terminalizes expiry until a fresh id leases again', async () => {
+    const f = fixture()
+    try {
+      f.seed('m1')
+      await leaseAgentInbox(
+        f.env, { agent: 'agent-a', limit: 1, leaseSeconds: 10, attemptId: ATTEMPT }, clock(at(0)),
+      )
+      expect(await reconcileAgentInboxLeaseAttempt(
+        f.env, { agent: 'agent-a', attemptId: ATTEMPT }, clock(at(5)),
+      )).toMatchObject({ ok: true, state: 'leased', messages: [{ id: 'm1', delivery_attempts: 1 }], lease_expires_at: at(10) })
+
+      expect(await reconcileAgentInboxLeaseAttempt(
+        f.env, { agent: 'agent-a', attemptId: ATTEMPT }, clock(at(10)),
+      )).toMatchObject({ ok: true, state: 'expired', messages: [], lease_expires_at: null })
+      expect(await leaseAgentInbox(
+        f.env, { agent: 'agent-a', limit: 1, leaseSeconds: 10, attemptId: ATTEMPT }, clock(at(11)),
+      )).toMatchObject({ ok: true, state: 'expired', messages: [] })
+
+      expect(await leaseAgentInbox(
+        f.env, { agent: 'agent-a', limit: 1, leaseSeconds: 10, attemptId: NEXT_ATTEMPT }, clock(at(11)),
+      )).toMatchObject({ ok: true, state: 'leased', messages: [{ id: 'm1', delivery_attempts: 2 }] })
+    } finally { f.harness.close() }
+  })
+
+  it('turns a leased attempt into acked without returning a body', async () => {
+    const f = fixture()
+    try {
+      f.seed('m1')
+      await leaseAgentInbox(
+        f.env, { agent: 'agent-a', limit: 1, leaseSeconds: 30, attemptId: ATTEMPT }, clock(at(0)),
+      )
+      expect(await ackAgentMessages(f.env, { agent: 'agent-a', ids: ['m1'] }, clock(at(1))))
+        .toMatchObject({ ok: true, acked: ['m1'] })
+      expect(f.row('m1').lease_attempt_id).toBeNull()
+      expect(await reconcileAgentInboxLeaseAttempt(
+        f.env, { agent: 'agent-a', attemptId: ATTEMPT }, clock(at(2)),
+      )).toMatchObject({ ok: true, state: 'acked', messages: [], lease_expires_at: null })
+    } finally { f.harness.close() }
+  })
+
+  it('clears the attempt stamp when a legacy caller re-leases an expired message', async () => {
+    const f = fixture()
+    try {
+      f.seed('m1')
+      await leaseAgentInbox(
+        f.env, { agent: 'agent-a', limit: 1, leaseSeconds: 10, attemptId: ATTEMPT }, clock(at(0)),
+      )
+      expect(f.row('m1').lease_attempt_id).toMatch(/^[0-9a-f]{64}$/)
+      expect(await leaseAgentInbox(
+        f.env, { agent: 'agent-a', limit: 1, leaseSeconds: 30 }, clock(at(11)),
+      )).toMatchObject({ ok: true, messages: [{ id: 'm1', delivery_attempts: 2 }] })
+      expect(f.row('m1').lease_attempt_id).toBeNull()
+      expect(await reconcileAgentInboxLeaseAttempt(
+        f.env, { agent: 'agent-a', attemptId: ATTEMPT }, clock(at(12)),
+      )).toMatchObject({ ok: true, state: 'expired', messages: [] })
+    } finally { f.harness.close() }
+  })
+
+  it('keeps an empty attempt terminal and never lets that id claim later work', async () => {
+    const f = fixture()
+    try {
+      expect(await leaseAgentInbox(
+        f.env, { agent: 'agent-a', limit: 1, leaseSeconds: 30, attemptId: ATTEMPT }, clock(at(0)),
+      )).toMatchObject({ ok: true, state: 'empty', messages: [], lease_expires_at: null })
+      f.seed('m1')
+      expect(await leaseAgentInbox(
+        f.env, { agent: 'agent-a', limit: 1, leaseSeconds: 30, attemptId: ATTEMPT }, clock(at(1)),
+      )).toMatchObject({ ok: true, state: 'empty', messages: [] })
+      expect(f.row('m1').delivery_attempts).toBe(0)
+    } finally { f.harness.close() }
+  })
+
+  it('expires an old attempt after a fresh id re-leases the same message', async () => {
+    const f = fixture()
+    try {
+      f.seed('m1')
+      await leaseAgentInbox(
+        f.env, { agent: 'agent-a', limit: 1, leaseSeconds: 10, attemptId: ATTEMPT }, clock(at(0)),
+      )
+      await leaseAgentInbox(
+        f.env, { agent: 'agent-a', limit: 1, leaseSeconds: 30, attemptId: NEXT_ATTEMPT }, clock(at(11)),
+      )
+      expect(await reconcileAgentInboxLeaseAttempt(
+        f.env, { agent: 'agent-a', attemptId: ATTEMPT }, clock(at(12)),
+      )).toMatchObject({ ok: true, state: 'expired', messages: [] })
+      expect(await reconcileAgentInboxLeaseAttempt(
+        f.env, { agent: 'agent-a', attemptId: NEXT_ATTEMPT }, clock(at(12)),
+      )).toMatchObject({ ok: true, state: 'leased', messages: [{ id: 'm1', delivery_attempts: 2 }] })
+    } finally { f.harness.close() }
+  })
+
+  it('isolates the same textual attempt id by tenant, agent, and effective seat', async () => {
+    const f = fixture()
+    try {
+      f.seed('mine')
+      const real = await leaseAgentInbox(
+        f.env, { agent: 'agent-a', limit: 1, leaseSeconds: 30, seat: 'seat-a', attemptId: ATTEMPT }, clock(at(0)),
+      )
+      expect(real).toMatchObject({ ok: true, state: 'leased', messages: [{ id: 'mine' }] })
+
+      const otherTenant = { ...f.env, TENANT_SLUG: 'tenant-b' } as Env
+      expect(await reconcileAgentInboxLeaseAttempt(
+        otherTenant, { agent: 'agent-a', seat: 'seat-a', attemptId: ATTEMPT }, clock(at(1)),
+      )).toMatchObject({ ok: true, state: 'cancelled' })
+      expect(await reconcileAgentInboxLeaseAttempt(
+        f.env, { agent: 'agent-b', seat: 'seat-a', attemptId: ATTEMPT }, clock(at(1)),
+      )).toMatchObject({ ok: true, state: 'cancelled' })
+      expect(await reconcileAgentInboxLeaseAttempt(
+        f.env, { agent: 'agent-a', seat: 'seat-b', attemptId: ATTEMPT }, clock(at(1)),
+      )).toMatchObject({ ok: true, state: 'cancelled' })
+      expect(await reconcileAgentInboxLeaseAttempt(
+        f.env, { agent: 'agent-a', seat: 'seat-a', attemptId: ATTEMPT }, clock(at(1)),
+      )).toMatchObject({ ok: true, state: 'leased', messages: [{ id: 'mine' }] })
+    } finally { f.harness.close() }
+  })
+
+  it('does not confuse simultaneous same-id leases in two seat partitions', async () => {
+    const f = fixture()
+    try {
+      f.seed('broadcast')
+      f.seed('seat-b-message')
+      f.harness.sqlite.exec("UPDATE agent_messages SET target_seat='seat-b' WHERE id='seat-b-message'")
+
+      expect(await leaseAgentInbox(
+        f.env, { agent: 'agent-a', limit: 1, leaseSeconds: 30, seat: 'seat-a', attemptId: ATTEMPT }, clock(at(0)),
+      )).toMatchObject({ ok: true, state: 'leased', messages: [{ id: 'broadcast' }] })
+      expect(await leaseAgentInbox(
+        f.env, { agent: 'agent-a', limit: 1, leaseSeconds: 30, seat: 'seat-b', attemptId: ATTEMPT }, clock(at(0)),
+      )).toMatchObject({ ok: true, state: 'leased', messages: [{ id: 'seat-b-message' }] })
+      expect(await reconcileAgentInboxLeaseAttempt(
+        f.env, { agent: 'agent-a', seat: 'seat-a', attemptId: ATTEMPT }, clock(at(1)),
+      )).toMatchObject({ ok: true, state: 'leased', messages: [{ id: 'broadcast' }] })
+      expect(await reconcileAgentInboxLeaseAttempt(
+        f.env, { agent: 'agent-a', seat: 'seat-b', attemptId: ATTEMPT }, clock(at(1)),
+      )).toMatchObject({ ok: true, state: 'leased', messages: [{ id: 'seat-b-message' }] })
+    } finally { f.harness.close() }
+  })
+
+  it('fails closed when the bearer fence flips inside the atomic batch', async () => {
+    const f = fixture()
+    try {
+      f.seed('m1')
+      f.setMode('bearer_only', 1)
+      f.harness.sqlite.exec(`
+        CREATE TRIGGER flip_fence_during_attempt
+        AFTER UPDATE OF lease_attempt_id ON agent_messages
+        WHEN NEW.lease_attempt_id IS NOT NULL
+        BEGIN
+          UPDATE agent_inbox_fences
+             SET mode = 'signed_only', generation = 2,
+                 key_fingerprint = '${'b'.repeat(64)}'
+           WHERE tenant = NEW.tenant AND agent_id = NEW.to_agent;
+        END;
+      `)
+      expect(await leaseAgentInbox(
+        f.env, { agent: 'agent-a', limit: 1, leaseSeconds: 30, attemptId: ATTEMPT }, clock(at(0)),
+      )).toMatchObject({ ok: false, reason: 'consumer_fenced' })
+      expect(f.row('m1').delivery_attempts).toBe(0)
+      expect(f.row('m1').lease_expires_at).toBeNull()
+      expect(f.harness.sqlite.prepare(
+        'SELECT state, message_id FROM agent_inbox_lease_attempts WHERE attempt_id = ?',
+      ).get(ATTEMPT)).toEqual({ state: 'cancelled', message_id: null })
+    } finally { f.harness.close() }
+  })
+
+  it('does not reveal or create attempt state through a fenced bearer reconcile', async () => {
+    const f = fixture()
+    try {
+      f.setMode('signed_only', 1)
+      expect(await reconcileAgentInboxLeaseAttempt(
+        f.env, { agent: 'agent-a', attemptId: ATTEMPT }, clock(at(0)),
+      )).toMatchObject({ ok: false, reason: 'consumer_fenced' })
+      expect(f.harness.sqlite.prepare('SELECT COUNT(*) AS n FROM agent_inbox_lease_attempts').get())
+        .toEqual({ n: 0 })
+    } finally { f.harness.close() }
+  })
+
+  it('exposes attempt lease and reconciliation only through the authenticated MCP self scope', async () => {
+    const f = fixture()
+    try {
+      f.seed('m1')
+      f.harness.sqlite.exec(`
+        INSERT INTO members (id, email, display_name, status, tenant)
+        VALUES ('agent-member', 'agent@pot.test', 'Agent Member', 'active', 'tenant-a');
+        INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+        VALUES ('tenant-a', 'agent-a', 'agent-member', '${T0}');
+        INSERT INTO member_tokens (id, member_id, tenant, token_hash, agent_id, label, channel, created_at)
+        VALUES ('tok-a', 'agent-member', 'tenant-a', '${'a'.repeat(64)}', 'agent-a', '', 'workspace', '${T0}');
+      `)
+      const auth: AuthContext = {
+        userId: 'agent-member', memberId: 'agent-member', email: null, tenant: 'tenant-a', role: 'member',
+        channel: 'workspace', boundAgentId: 'agent-a', tokenId: 'tok-a', capabilities: [],
+      }
+      const leased = await invokeTool(auth, f.env, 'inbox_lease', {
+        attempt_id: ATTEMPT, limit: 1, lease_seconds: 30,
+      })
+      expect(leased).toMatchObject({ ok: true, result: { attempt_id: ATTEMPT, state: 'leased', messages: [{ id: 'm1' }], consumed: false } })
+      expect(await invokeTool(auth, f.env, 'inbox_lease_reconcile', { attempt_id: ATTEMPT }))
+        .toMatchObject({ ok: true, result: { attempt_id: ATTEMPT, state: 'leased', messages: [{ id: 'm1' }], consumed: false } })
+
+      const human = { ...auth, boundAgentId: null, tokenId: null }
+      expect(await invokeTool(human, f.env, 'inbox_lease_reconcile', { attempt_id: ATTEMPT }))
+        .toMatchObject({ ok: false, status: 403, error: 'not_agent_bound' })
+      expect(await invokeTool(auth, f.env, 'inbox_lease', { attempt_id: NEXT_ATTEMPT, limit: 2 }))
+        .toMatchObject({ ok: false, status: 400, error: 'invalid_args' })
+      expect(await invokeTool(auth, f.env, 'inbox_lease', {
+        attempt_id: '33333333-3333-4333-8333-333333333333', limit: 1.9,
+      })).toMatchObject({ ok: true, result: { state: 'empty', messages: [] } })
+      expect(await invokeTool(auth, f.env, 'inbox_lease_reconcile', { attempt_id: '../bad' }))
+        .toMatchObject({ ok: false, status: 400, error: 'invalid_attempt' })
+    } finally { f.harness.close() }
+  })
+
+  it('fails attempt lease and reconcile before mutation when the bound-seat lookup errors', async () => {
+    const f = fixture()
+    try {
+      f.seed('m1')
+      const failingDb = {
+        ...f.env.DB,
+        prepare(sql: string) {
+          if (sql.includes('SELECT t.label FROM member_tokens')) {
+            const failed = {
+              bind: () => failed,
+              first: async () => { throw new Error('seat lookup unavailable') },
+            }
+            return failed
+          }
+          return f.env.DB.prepare(sql)
+        },
+      }
+      const env = { ...f.env, DB: failingDb } as unknown as Env
+      const auth: AuthContext = {
+        userId: 'agent-member', memberId: 'agent-member', email: null,
+        tenant: 'tenant-a', role: 'member', channel: 'workspace',
+        boundAgentId: 'agent-a', tokenId: 'tok-unavailable', capabilities: [],
+      }
+
+      expect(await invokeTool(auth, env, 'inbox_lease', {
+        attempt_id: ATTEMPT, limit: 1, lease_seconds: 30,
+      })).toMatchObject({ ok: false, status: 500, error: 'seat_resolution_failed' })
+      expect(await invokeTool(auth, env, 'inbox_lease_reconcile', { attempt_id: ATTEMPT }))
+        .toMatchObject({ ok: false, status: 500, error: 'seat_resolution_failed' })
+      expect(f.row('m1').delivery_attempts).toBe(0)
+      expect(f.harness.sqlite.prepare('SELECT COUNT(*) AS n FROM agent_inbox_lease_attempts').get())
+        .toEqual({ n: 0 })
+
+      const legacy = await invokeTool(auth, env, 'inbox_lease', { limit: 1, lease_seconds: 30 })
+      expect(legacy).toMatchObject({ ok: true, result: { messages: [{ id: 'm1' }] } })
     } finally { f.harness.close() }
   })
 })

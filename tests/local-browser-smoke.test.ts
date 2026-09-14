@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { validateRouteEvidence } from '../scripts/local-browser-smoke.mjs'
+import { createTelegramSmokeUpdateFactory, validateRouteEvidence } from '../scripts/local-browser-smoke.mjs'
 
 const browserSmokeSource = readFileSync(join(__dirname, '..', 'scripts', 'local-browser-smoke.mjs'), 'utf8')
 
@@ -41,6 +41,26 @@ describe('local browser route evidence', () => {
       })).toThrow(/meaningful content.*\/fleet/i)
     },
   )
+
+  it('builds complete private Telegram updates with one seeded human and unique update ids', () => {
+    const nextUpdate = createTelegramSmokeUpdateFactory()
+    expect(nextUpdate('approve task-1')).toEqual({
+      update_id: 1,
+      message: {
+        chat: { id: 123456789, type: 'private' },
+        from: { id: 123456789 },
+        text: 'approve task-1',
+      },
+    })
+    expect(nextUpdate('status')).toEqual({
+      update_id: 2,
+      message: {
+        chat: { id: 123456789, type: 'private' },
+        from: { id: 123456789 },
+        text: 'status',
+      },
+    })
+  })
 
   it('exercises project-context send and flight pages and verifies task attribution', () => {
     expect(browserSmokeSource).toContain("page.goto(`${baseUrl}/send?project_id=project-mupot`")

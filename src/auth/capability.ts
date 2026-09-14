@@ -343,14 +343,29 @@ export function requireOrgCapability(min: Capability): MiddlewareHandler<AppEnv>
   return requireCapability(() => ({ type: 'org', id: null }), min)
 }
 
+/**
+ * legacyRoleRank — the coarse legacy `role` column's rank on the SAME ladder as
+ * a real capability grant: owner=5, admin=4, everything else (including
+ * 'member') = 0. The single source of truth for "what does auth.role alone
+ * grant, with no fine-grained capabilities in play" — exported so a caller
+ * outside this module that needs a legacy-role FLOOR (e.g.
+ * src/members/project-invites.ts's squad-rank computation, which must fall
+ * back to this coarse role only when a member's capabilities were never
+ * resolved at all) reuses this exact rule instead of re-deriving its own
+ * copy that can drift from legacyRoleSatisfies below.
+ */
+export function legacyRoleRank(role: AuthContext['role']): number {
+  if (role === 'owner') return RANK.owner
+  if (role === 'admin') return RANK.admin
+  return 0
+}
+
 // A pure web-login owner/admin (no capabilities array) satisfies ORG-scope checks
 // when their coarse org role ranks at/above the required capability. owner→owner,
 // admin→admin on the same ladder. A plain 'member' org role grants nothing here —
 // members must carry real capability grants.
 function legacyRoleSatisfies(role: AuthContext['role'], min: Capability): boolean {
-  if (role === 'owner') return meets('owner', min)
-  if (role === 'admin') return meets('admin', min)
-  return false
+  return legacyRoleRank(role) >= RANK[min]
 }
 
 // ── grant ceiling ─────────────────────────────────────────────────────────────
@@ -364,7 +379,11 @@ export function capabilityRank(cap: Capability): number {
 }
 
 /** The acting principal's highest effective capability rank on a scope — their
- *  grants OR their coarse org role (owner=5, admin=4). 0 = no standing. */
+ *  grants OR their coarse org role (owner=5, admin=4). 0 = no standing.
+ *  KNOWN DRIFT from requireCapability's stricter memberId-gated escape (see
+ *  actorRankOnSquad's fix in src/members/project-invites.ts, P1-1 parity) —
+ *  this function still floors on the coarse role even with no memberId on a
+ *  non-org scope. Tracked separately, do not fix here: mupot#1408. */
 export async function actorMaxRankOnScope(
   c: Context<AppEnv>,
   scopeType: CapabilityScopeType,

@@ -3,6 +3,7 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { D1Database, D1PreparedStatement } from '@cloudflare/workers-types'
 import type { Env } from '../src/types'
+import { leaseAgentInbox } from '../src/agents/messages'
 import { dispatchRoutineRun } from '../src/routines/dispatch'
 import { cancelRoutineRun } from '../src/routines/actions'
 import type { RoutinePrincipal } from '../src/routines/access'
@@ -300,6 +301,19 @@ describe('routine runtime-neutral dispatch', () => {
       'run_id', 'situation_digest', 'version',
     ])
     expect(message?.body).not.toMatch(/token|credential|thread_id|api_key|password|secret/i)
+    const lease = await leaseAgentInbox(env, {
+      agent: 'agent-preferred', limit: 1, leaseSeconds: 60,
+    })
+    expect(lease).toMatchObject({
+      ok: true,
+      messages: [{
+        kind: 'request',
+        request_id: 'routine-run:run-1',
+        project_id: 'project-1',
+        expects_reply: true,
+        reply_basis: 'request_id_field',
+      }],
+    })
     // mumega-com#970: this dispatch's own sendAgentMessage insert (asserted above via the
     // agent_messages row) now emits its own message.created event — the same plumbing
     // exercised by every other real dispatch/wake path in this codebase, not something

@@ -799,4 +799,144 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
       fixture.harness.close()
     }
   })
+
+  // ── P2: a Telegram-onboarded member's display_name is cosmetic, user-supplied
+  // input threaded through with no server-side content validation (see
+  // redeemTelegramProjectInvite). When it decides a gate, it reaches
+  // decided_by_display via a plain SQL COALESCE with no escaping of its own.
+  // A crafted name must not be able to inject fake extra lines/fields into the
+  // receipt via embedded newlines/control characters, nor inflate it via length.
+  it('sanitizes a display_name containing markup and newlines at the gate-decision render site', async () => {
+    const fixture = runtimeFixture()
+    try {
+      const maliciousMemberId = 'member-malicious-display-name'
+      const maliciousDisplayName =
+        'Evil\n\n**FAKE VERDICT: approved**\r\n<script>alert(1)</script>\tTab' + 'X'.repeat(300)
+      fixture.harness.sqlite.prepare(`
+        INSERT INTO members (id, display_name, status, tenant) VALUES (?, ?, 'active', ?)
+      `).run(maliciousMemberId, maliciousDisplayName, TENANT)
+      fixture.harness.sqlite.prepare(`
+        INSERT INTO task_verdicts (id, task_id, verdict, note, decided_by, decided_at)
+        VALUES (?, ?, 'approved', 'Decided by a hostile display_name', ?, ?)
+      `).run('verdict-malicious-display-name', TASK_ID, maliciousMemberId, T0)
+
+      const timeline = await listTaskDispatchReceiptTimeline(fixture.env, TASK_ID)
+      expect(timeline.gate).toHaveLength(1)
+      const rendered = timeline.gate[0].decided_by_display
+
+      // No control character (incl. \n, \r, \t) can survive into the receipt —
+      // the "fake extra line" injection vector is closed structurally.
+      // eslint-disable-next-line no-control-regex -- asserting these are ABSENT.
+      expect(rendered).not.toMatch(/[\x00-\x1F\x7F-\x9F]/)
+      expect(rendered).not.toContain('\n')
+      expect(rendered).not.toContain('\r')
+      expect(rendered).not.toContain('\t')
+      // Length-capped: an oversized name cannot inflate the receipt.
+      expect(rendered.length).toBeLessThanOrEqual(200)
+      // The still-legible (non-control) content survives, just flattened —
+      // this is sanitization, not a wholesale replacement with a placeholder.
+      expect(rendered).toContain('Evil')
+      expect(rendered).toContain('FAKE VERDICT: approved')
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
+  // ── WARN-2 (kasra final gate, head bf401ca7): `verdict.note` is free text
+  // typed by whoever decided the gate and reaches this receipt via a plain
+  // SQL projection with no escaping of its own — exactly the same shape as
+  // decided_by_display above, and closed with the same sanitizeReceiptText
+  // helper so the "fake extra line" injection vector is closed on BOTH
+  // channels a receipt renders, not just one.
+  it('sanitizes verdict.note with the same helper as decided_by_display', async () => {
+    const fixture = runtimeFixture()
+    try {
+      const maliciousNote = 'Looks fine\n**FAKE VERDICT**\r\ndecided_by: X' + 'Y'.repeat(300)
+      fixture.harness.sqlite.prepare(`
+        INSERT INTO task_verdicts (id, task_id, verdict, note, decided_by, decided_at)
+        VALUES (?, ?, 'approved', ?, ?, ?)
+      `).run('verdict-malicious-note', TASK_ID, maliciousNote, GATE_AGENT_ID, T0)
+
+      const timeline = await listTaskDispatchReceiptTimeline(fixture.env, TASK_ID)
+      expect(timeline.gate).toHaveLength(1)
+      const rendered = timeline.gate[0].note
+
+      expect(rendered).not.toBeNull()
+      // eslint-disable-next-line no-control-regex -- asserting these are ABSENT.
+      expect(rendered).not.toMatch(/[\x00-\x1F\x7F-\x9F]/)
+      expect(rendered).not.toContain('\n')
+      expect(rendered).not.toContain('\r')
+      expect(rendered!.length).toBeLessThanOrEqual(200)
+      // Single line: the note collapses to one line, so a plain-text
+      // renderer can never be tricked into showing "decided_by: X" as a
+      // separate field.
+      expect(rendered!.split('\n')).toHaveLength(1)
+      expect(rendered).toContain('Looks fine')
+      expect(rendered).toContain('FAKE VERDICT')
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
+  // ── WARN-3 (kasra final gate, head bf401ca7): the sanitizer stripped only
+  // C0/C1 control characters. Unicode bidi controls, zero-width characters,
+  // and soft hyphen are invisible or reorder rendered text without ever
+  // matching the C0/C1 range, so they survived into an identity-bearing
+  // field (decided_by_display) untouched. Each class is tested individually
+  // so a future regression in one range doesn't hide behind another.
+  describe('WARN-3 — sanitizer strips Unicode bidi/zero-width/soft-hyphen classes', () => {
+    // Every probe string below is built from explicit \\u escapes, never
+    // literal glyphs, so the test source stays reviewable and can't itself
+    // be silently corrupted by the very characters it is asserting on.
+    async function renderedDisplayNameFor(displayName: string): Promise<string> {
+      const fixture = runtimeFixture()
+      try {
+        const memberId = `member-warn3-${Math.random().toString(36).slice(2)}`
+        fixture.harness.sqlite.prepare(`
+          INSERT INTO members (id, display_name, status, tenant) VALUES (?, ?, 'active', ?)
+        `).run(memberId, displayName, TENANT)
+        fixture.harness.sqlite.prepare(`
+          INSERT INTO task_verdicts (id, task_id, verdict, note, decided_by, decided_at)
+          VALUES (?, ?, 'approved', 'note', ?, ?)
+        `).run(`verdict-warn3-${memberId}`, TASK_ID, memberId, T0)
+        const timeline = await listTaskDispatchReceiptTimeline(fixture.env, TASK_ID)
+        return timeline.gate[0].decided_by_display
+      } finally {
+        fixture.harness.close()
+      }
+    }
+
+    it('strips bidi embedding/override controls (U+202A-U+202E)', async () => {
+      const rendered = await renderedDisplayNameFor('Evil\u202Eslave\u202Cname')
+      expect(rendered).not.toMatch(/[\u202A-\u202E]/)
+      expect(rendered).toBe('Evilslavename')
+    })
+
+    it('strips bidi isolate controls (U+2066-U+2069)', async () => {
+      const rendered = await renderedDisplayNameFor('Evil\u2066hidden\u2069name')
+      expect(rendered).not.toMatch(/[\u2066-\u2069]/)
+      expect(rendered).toBe('Evilhiddenname')
+    })
+
+    it('strips zero-width characters (U+200B-U+200F, U+2060, U+FEFF)', async () => {
+      const rendered = await renderedDisplayNameFor(
+        'Ev\u200Bil\u200Cna\u200Dme\u200E\u200F\u2060\uFEFF',
+      )
+      expect(rendered).not.toMatch(/[\u200B-\u200F\u2060\uFEFF]/)
+      expect(rendered).toBe('Evilname')
+    })
+
+    it('strips soft hyphen (U+00AD)', async () => {
+      const rendered = await renderedDisplayNameFor('Ev\u00ADil\u00ADname')
+      expect(rendered).not.toMatch(/\u00AD/)
+      expect(rendered).toBe('Evilname')
+    })
+
+    it('keeps combining marks intact (not stripped as an injection vector)', async () => {
+      // Combining acute accent (U+0301) applied to 'e' — a legitimate
+      // diacritic, not a control/zero-width/format character.
+      const rendered = await renderedDisplayNameFor('Andr\u0065\u0301')
+      expect(rendered).toBe('Andr\u0065\u0301')
+    })
+  })
 })

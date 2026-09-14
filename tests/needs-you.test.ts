@@ -1,10 +1,13 @@
 import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
+import type { D1Database, D1PreparedStatement } from '@cloudflare/workers-types'
 import type { CapabilityGrant, Env } from '../src/types'
 import { listNeedsYou } from '../src/attention/service'
 import type { RoutinePrincipal } from '../src/routines/access'
+import { submitRoutineProposal } from '../src/routines/actions'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { makeReadyRoutineFixture } from './helpers/routine-actions'
 
 const MIGRATIONS_DIR = join(import.meta.dirname, '..', 'migrations')
 
@@ -61,6 +64,30 @@ function envFor(
   sessionStore = sessions(),
 ): Env {
   return { DB: harness.db, SESSIONS: sessionStore, TENANT_SLUG: tenant } as unknown as Env
+}
+
+function failHumanWaitNotification(env: Env, beforeInsert: () => void): Env {
+  const db = env.DB
+  return {
+    ...env,
+    DB: {
+      prepare(sql: string) {
+        const statement = db.prepare(sql)
+        if (!/INSERT INTO agent_messages/.test(sql)) return statement
+        return {
+          bind() {
+            return {
+              async run() {
+                beforeInsert()
+                throw new Error('simulated human-wait notification failure')
+              },
+            } as unknown as D1PreparedStatement
+          },
+        } as unknown as D1PreparedStatement
+      },
+      batch: db.batch.bind(db),
+    } as unknown as D1Database,
+  }
 }
 
 const squadAGrant: CapabilityGrant = {
@@ -166,6 +193,52 @@ describe('Needs You projection', () => {
   afterEach(() => {
     harness?.close()
     harness = undefined
+  })
+
+  it('keeps a failed human-wait notification pending without rolling back Needs You state', async () => {
+    const fixture = await makeReadyRoutineFixture('execute_internal')
+    harness = fixture.harness
+    let insertAttempts = 0
+    const env = failHumanWaitNotification(fixture.env, () => {
+      insertAttempts += 1
+      expect(harness!.sqlite.prepare(
+        "SELECT status, waiting_reason FROM routine_runs WHERE id = 'run-1'",
+      ).get()).toEqual({ status: 'waiting', waiting_reason: 'answer' })
+      expect(harness!.sqlite.prepare(
+        "SELECT status FROM routine_run_actions WHERE action_key = 'notify-failure'",
+      ).get()).toEqual({ status: 'waiting' })
+    })
+
+    const proposal = fixture.proposal({
+      key: 'notify-failure', kind: 'ask_human',
+      input: { question: 'Which receipt is authoritative?', choices: ['A', 'B'], references: [] },
+    })
+    const result = await submitRoutineProposal(env, fixture.principal, proposal)
+
+    expect(result).toMatchObject({
+      ok: true, status: 'waiting', reason: 'answer', duplicate: false, notification_pending: true,
+    })
+    expect(insertAttempts).toBe(1)
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM agent_messages').get()).toEqual({ count: 0 })
+    const responder: RoutinePrincipal = {
+      ...fixture.principal,
+      actor_type: 'member',
+      actor_id: 'member-1',
+    }
+    const page = await listNeedsYou(env, responder, { project_id: 'project-1' })
+    expect(page.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'routine_answer', source_type: 'routine_run', source_id: 'run-1',
+        allowed_actions: ['view', 'answer'],
+      }),
+    ]))
+
+    await expect(submitRoutineProposal(fixture.env, fixture.principal, proposal)).resolves.toMatchObject({
+      ok: true, status: 'waiting', reason: 'answer', duplicate: true, notification_pending: false,
+    })
+    expect(harness.sqlite.prepare(
+      'SELECT COUNT(*) AS count FROM agent_messages WHERE request_id = ?',
+    ).get('routine-human:run-1:notify-failure')).toEqual({ count: 1 })
   })
 
   it('projects pending approvals once, keeps gate actions authority-scoped, and keeps result output on that source', async () => {

@@ -124,10 +124,11 @@ import { authorizeExecutionScope } from '../auth/execution-scope'
 import { runRouterTick } from '../router/engine'
 import { verifyTaskArtifactShape } from '../tasks/artifact-verification'
 import {
-  leaseAgentInbox, ackAgentMessages, listDeadLetteredMessages, summarizeDeadLetters,
+  leaseAgentInbox, reconcileAgentInboxLeaseAttempt, ackAgentInboxLeaseAttempt,
+  ackAgentMessages, listDeadLetteredMessages, summarizeDeadLetters,
   MAX_DELIVERY_ATTEMPTS, DEFAULT_LEASE_SECONDS, MAX_LEASE_SECONDS,
 } from '../agents/messages'
-import { resolveBoundSeat, resolveInboxSeatArg } from '../agents/inbox-seat'
+import { resolveBoundSeat, resolveBoundSeatStrict, resolveInboxSeatArg } from '../agents/inbox-seat'
 import {
   recordCheckin,
   touchPresence,
@@ -3624,10 +3625,15 @@ const toolInboxLease: ToolSpec = {
   name: 'inbox_lease',
   scope: 'self (the caller agent leases from its own inbox)',
   min: 'authenticated',
-  args: '{ limit?: number, lease_seconds?: number, seat?: string }',
+  args: '{ limit?: number, lease_seconds?: number, seat?: string, attempt_id?: string }',
   inputSchema: {
     type: 'object',
-    properties: { limit: OPTIONAL_NUMBER_SCHEMA, lease_seconds: OPTIONAL_NUMBER_SCHEMA, seat: STRING_SCHEMA },
+    properties: {
+      limit: OPTIONAL_NUMBER_SCHEMA,
+      lease_seconds: OPTIONAL_NUMBER_SCHEMA,
+      seat: STRING_SCHEMA,
+      attempt_id: STRING_SCHEMA,
+    },
     required: [],
     additionalProperties: false,
   },
@@ -3653,8 +3659,19 @@ const toolInboxLease: ToolSpec = {
     }
     if (args.seat !== undefined && typeof args.seat !== 'string')
       return fail(400, 'invalid_args', 'seat must be a string')
+    if (args.attempt_id !== undefined && typeof args.attempt_id !== 'string')
+      return fail(400, 'invalid_args', 'attempt_id must be a string')
+    if (args.attempt_id !== undefined
+      && (limit === undefined || Math.min(100, Math.max(1, Math.floor(limit))) !== 1))
+      return fail(400, 'invalid_args', 'attempt_id mode requires limit=1')
 
-    const boundSeat = await resolveBoundSeat(env, auth.tokenId ?? null)
+    const strictSeat = args.attempt_id !== undefined
+      ? await resolveBoundSeatStrict(env, auth.tokenId ?? null, agent)
+      : null
+    if (strictSeat && !strictSeat.ok) return fail(500, strictSeat.error)
+    const boundSeat = strictSeat?.ok
+      ? strictSeat.seat
+      : await resolveBoundSeat(env, auth.tokenId ?? null)
     const seatArg = resolveInboxSeatArg(
       typeof args.seat === 'string' ? args.seat.trim() : undefined,
       boundSeat,
@@ -3666,12 +3683,23 @@ const toolInboxLease: ToolSpec = {
       limit,
       leaseSeconds,
       seat: seatArg.seat,
+      attemptId: args.attempt_id as string | undefined,
     })
     if (!res.ok) {
       if (res.reason === 'db_error') return fail(500, res.reason) // no raw DB string to caller
-      if (res.reason === 'consumer_fenced') return fail(409, res.reason)
+      if (res.reason === 'consumer_fenced' || res.reason === 'attempt_conflict') return fail(409, res.reason)
       return fail(400, res.reason, res.detail)
     }
+    if ('state' in res) return done({
+      tenant: res.tenant,
+      agent_id: res.agent_id,
+      effective_inbox_seat: res.effective_inbox_seat,
+      attempt_id: res.attempt_id,
+      state: res.state,
+      lease_expires_at: res.lease_expires_at,
+      messages: res.messages,
+      consumed: false,
+    })
     return done({
       messages: res.messages,
       remaining: res.remaining,
@@ -3682,6 +3710,94 @@ const toolInboxLease: ToolSpec = {
       default_lease_seconds: DEFAULT_LEASE_SECONDS,
       max_delivery_attempts: MAX_DELIVERY_ATTEMPTS,
       consumed: false,
+    })
+  },
+}
+
+const toolInboxLeaseReconcile: ToolSpec = {
+  name: 'inbox_lease_reconcile',
+  scope: 'self (the caller agent reconciles one durable lease attempt in its own effective seat)',
+  min: 'authenticated',
+  args: '{ attempt_id: string }',
+  inputSchema: {
+    type: 'object',
+    properties: { attempt_id: STRING_SCHEMA },
+    required: ['attempt_id'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args, ctx) {
+    const agent = auth.boundAgentId
+    if (!agent) {
+      return fail(403, 'not_agent_bound', {
+        detail: 'inbox_lease_reconcile requires an agent-bound token (member_tokens.agent_id)',
+        enroll_url: enrollUrl(canonicalOrigin(env, ctx.origin), ctx.seat),
+      })
+    }
+    if (typeof args.attempt_id !== 'string')
+      return fail(400, 'invalid_args', 'attempt_id must be a string')
+
+    const strictSeat = await resolveBoundSeatStrict(env, auth.tokenId ?? null, agent)
+    if (!strictSeat.ok) return fail(500, strictSeat.error)
+    const boundSeat = strictSeat.seat
+    const res = await reconcileAgentInboxLeaseAttempt(env, {
+      agent,
+      attemptId: args.attempt_id,
+      seat: boundSeat ?? undefined,
+    })
+    if (!res.ok) {
+      if (res.reason === 'db_error') return fail(500, res.reason)
+      if (res.reason === 'consumer_fenced' || res.reason === 'attempt_conflict') return fail(409, res.reason)
+      return fail(400, res.reason, res.detail)
+    }
+    return done({
+      tenant: res.tenant,
+      agent_id: res.agent_id,
+      effective_inbox_seat: res.effective_inbox_seat,
+      attempt_id: res.attempt_id,
+      state: res.state,
+      lease_expires_at: res.lease_expires_at,
+      messages: res.messages,
+      consumed: false,
+    })
+  },
+}
+
+const toolInboxLeaseAck: ToolSpec = {
+  name: 'inbox_lease_ack',
+  scope: 'self (the caller agent ACKs the exact live message owned by one durable lease attempt)',
+  min: 'authenticated',
+  args: '{ attempt_id: string }',
+  inputSchema: {
+    type: 'object',
+    properties: { attempt_id: STRING_SCHEMA },
+    required: ['attempt_id'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const agent = auth.boundAgentId
+    if (!agent) return fail(403, 'not_agent_bound', 'inbox_lease_ack requires an agent-bound token')
+    if (typeof args.attempt_id !== 'string')
+      return fail(400, 'invalid_args', 'attempt_id must be a string')
+
+    const strictSeat = await resolveBoundSeatStrict(env, auth.tokenId ?? null, agent)
+    if (!strictSeat.ok) return fail(500, strictSeat.error)
+    const res = await ackAgentInboxLeaseAttempt(env, {
+      agent,
+      attemptId: args.attempt_id,
+      seat: strictSeat.seat ?? undefined,
+    })
+    if (!res.ok) {
+      if (res.reason === 'db_error') return fail(500, res.reason)
+      if (res.reason === 'consumer_fenced' || res.reason === 'attempt_conflict') return fail(409, res.reason)
+      return fail(400, res.reason, res.detail)
+    }
+    return done({
+      tenant: res.tenant,
+      agent_id: res.agent_id,
+      effective_inbox_seat: res.effective_inbox_seat,
+      attempt_id: res.attempt_id,
+      state: res.state,
+      consumed: res.consumed,
     })
   },
 }
@@ -3804,11 +3920,22 @@ const toolInboxFenceStatus: ToolSpec = {
   name: 'inbox_consumer_status',
   scope: 'self (the caller agent reads its own consumer-fence mode)',
   min: 'authenticated',
-  args: '{}',
-  inputSchema: { type: 'object', properties: {}, required: [], additionalProperties: false },
-  async run(auth, env) {
+  args: '{ strict_scope?: boolean }',
+  inputSchema: {
+    type: 'object',
+    properties: { strict_scope: OPTIONAL_BOOLEAN_SCHEMA },
+    required: [],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
     const agent = auth.boundAgentId
     if (!agent) return fail(403, 'not_agent_bound', 'inbox_fence_status requires an agent-bound token')
+    if (args.strict_scope !== undefined && typeof args.strict_scope !== 'boolean')
+      return fail(400, 'invalid_args', 'strict_scope must be a boolean')
+    const strictSeat = args.strict_scope === true
+      ? await resolveBoundSeatStrict(env, auth.tokenId ?? null, agent)
+      : null
+    if (strictSeat && !strictSeat.ok) return fail(500, strictSeat.error)
     const row = await env.DB.prepare(
       `SELECT mode, generation, key_fingerprint, updated_at FROM agent_inbox_fences
         WHERE tenant = ?1 AND agent_id = ?2 LIMIT 1`,
@@ -3817,7 +3944,7 @@ const toolInboxFenceStatus: ToolSpec = {
     }>()
     const key = await loadActiveAgentKey(env, agent)
     const activeKeyFingerprint = key ? await agentKeyFingerprint(key.pubkey) : null
-    return done({
+    const status = {
       agent_id: agent,
       mode: row?.mode === 'signed_only' ? 'signed_only' : 'bearer_only',
       generation: row?.mode === 'signed_only' || row?.mode === 'bearer_only' ? Number(row.generation) : 0,
@@ -3825,7 +3952,16 @@ const toolInboxFenceStatus: ToolSpec = {
       active_key_present: activeKeyFingerprint !== null,
       key_matches: row?.mode !== 'signed_only' || row.key_fingerprint === activeKeyFingerprint,
       updated_at: row?.mode === 'signed_only' || row?.mode === 'bearer_only' ? row.updated_at : null,
-    })
+    }
+    if (strictSeat?.ok) {
+      return done({
+        strict_scope: true,
+        tenant: env.TENANT_SLUG,
+        effective_inbox_seat: strictSeat.seat,
+        ...status,
+      })
+    }
+    return done(status)
   },
 }
 
@@ -5097,6 +5233,8 @@ export const TOOLS: ToolSpec[] = [
   toolInbox,
   toolMessageGet,
   toolInboxLease,
+  toolInboxLeaseReconcile,
+  toolInboxLeaseAck,
   toolInboxAck,
   toolInboxDeadLetters,
   toolInboxFenceStatus,
