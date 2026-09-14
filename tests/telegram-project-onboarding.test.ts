@@ -582,20 +582,37 @@ describe('Telegram project invitation service', () => {
       `).run(FENCE_TENANT, FENCE_UPDATE_ID, FENCE_TELEGRAM_USER, FENCE_REQUEST_DIGEST, state, new Date().toISOString())
     }
 
-    async function runClaim(now = new Date().toISOString()): Promise<number> {
+    // Every bind value defaults to the exact value that matches the fixture
+    // rows insertFenceInvite/insertFenceReceipt write, so a caller overriding
+    // ONE field is testing that field's own conjunct in isolation — the same
+    // shape as mutating the SQL, but proving the caller-supplied bind (not
+    // the statement text) is what a mismatch is caught against.
+    async function runClaim(overrides: Partial<{
+      now: string
+      inviteId: string
+      pairingHash: string
+      projectId: string
+      squadId: string
+      capability: string
+      email: string
+      tenant: string
+      updateId: string
+      requestDigest: string
+      telegramUserId: string
+    }> = {}): Promise<number> {
       const result = await fenceEnv.DB.prepare(CLAIM_INVITE_SQL).bind(
         new Date().toISOString(),
-        FENCE_INVITE_ID,
-        FENCE_PAIRING_HASH,
-        'project-fence',
-        'squad-fence',
-        FENCE_CAPABILITY,
-        FENCE_EMAIL,
-        now,
-        FENCE_TENANT,
-        FENCE_UPDATE_ID,
-        FENCE_REQUEST_DIGEST,
-        FENCE_TELEGRAM_USER,
+        overrides.inviteId ?? FENCE_INVITE_ID,
+        overrides.pairingHash ?? FENCE_PAIRING_HASH,
+        overrides.projectId ?? 'project-fence',
+        overrides.squadId ?? 'squad-fence',
+        overrides.capability ?? FENCE_CAPABILITY,
+        overrides.email ?? FENCE_EMAIL,
+        overrides.now ?? new Date().toISOString(),
+        overrides.tenant ?? FENCE_TENANT,
+        overrides.updateId ?? FENCE_UPDATE_ID,
+        overrides.requestDigest ?? FENCE_REQUEST_DIGEST,
+        overrides.telegramUserId ?? FENCE_TELEGRAM_USER,
       ).run()
       return result.meta?.changes ?? 0
     }
@@ -668,6 +685,71 @@ describe('Telegram project invitation service', () => {
       expect(fenceHarness.sqlite.prepare(
         'SELECT state FROM telegram_webhook_receipts WHERE tenant = ? AND update_id = ?',
       ).get(FENCE_TENANT, FENCE_UPDATE_ID)).toEqual({ state: 'processing' })
+    })
+
+    // ── Mutation-testing sweep of every remaining CLAIM_INVITE_SQL conjunct
+    // (kasra-review re-gate, 2026-09-14): mutating each one out and re-running
+    // this whole describe block showed 6 conjuncts SURVIVED green even with
+    // M5-M9 in place — id, pairing_hash, project_id, squad_id, capability,
+    // email, and the receipt's own tenant/update_id/digest/telegram_user_id
+    // sub-conjuncts (only receipt.state='processing' was independently
+    // pinned, by M7). None of these are reachable in production TODAY —
+    // redeemTelegramProjectInvite always binds every one of these straight
+    // off the SAME invite/receipt row it just read by pairing_hash/update_id,
+    // so a mismatch can't occur on the live call path. But the statement is
+    // exported specifically so it can be trusted independent of that one
+    // caller (P1-2's own stated purpose) — so the ones a future caller could
+    // plausibly get wrong on its own (tenant scoping, exact invite identity,
+    // project/squad pairing, capability level) are pinned below rather than
+    // left to "no test happens to catch it because there's only one caller".
+    it('pins the receipt tenant — refuses when the only matching receipt belongs to a different tenant', async () => {
+      insertFenceInvite()
+      // A receipt for the SAME update_id/digest/telegram_user, but a
+      // DIFFERENT tenant. If the tenant conjunct were dropped, this receipt
+      // alone would satisfy the EXISTS and the claim would succeed.
+      fenceHarness.sqlite.prepare(`
+        INSERT INTO telegram_webhook_receipts (
+          tenant, update_id, telegram_user_id, request_digest, state, created_at
+        ) VALUES (?, ?, ?, ?, 'processing', ?)
+      `).run('other-tenant', FENCE_UPDATE_ID, FENCE_TELEGRAM_USER, FENCE_REQUEST_DIGEST, new Date().toISOString())
+      expect(await runClaim({ tenant: FENCE_TENANT })).toBe(0)
+    })
+
+    it('pins the exact invite id — a second invite sharing the same pairing_hash/project/squad/capability/email is never touched', async () => {
+      insertFenceInvite()
+      const decoyId = 'fence-invite-decoy'
+      // Same pairing_hash, project, squad, capability, and email as the real
+      // invite — the ONLY difference is the id. Without the id conjunct, the
+      // UPDATE's WHERE would match BOTH rows.
+      fenceHarness.sqlite.prepare(`
+        INSERT INTO invites (
+          id, email, capability, invited_by, project_id, squad_id,
+          pairing_hash, pairing_expires_at, accepted_at
+        ) VALUES (?, ?, ?, 'fence-inviter', 'project-fence', 'squad-fence', ?, ?, NULL)
+      `).run(decoyId, FENCE_EMAIL, FENCE_CAPABILITY, FENCE_PAIRING_HASH, new Date(Date.now() + 3_600_000).toISOString())
+      insertFenceReceipt('processing')
+      expect(await runClaim({ inviteId: FENCE_INVITE_ID })).toBe(1)
+      expect(fenceHarness.sqlite.prepare(
+        'SELECT accepted_at FROM invites WHERE id = ?',
+      ).get(decoyId)).toEqual({ accepted_at: null })
+    })
+
+    it('pins the project_id binding — refuses when the caller\'s project_id mismatches the invite\'s own project', async () => {
+      insertFenceInvite()
+      insertFenceReceipt('processing')
+      expect(await runClaim({ projectId: 'some-other-project' })).toBe(0)
+    })
+
+    it('pins the squad_id binding — refuses when the caller\'s squad_id mismatches the invite\'s own squad', async () => {
+      insertFenceInvite()
+      insertFenceReceipt('processing')
+      expect(await runClaim({ squadId: 'some-other-squad' })).toBe(0)
+    })
+
+    it('pins the capability binding — refuses when the caller claims a different capability than the invite grants', async () => {
+      insertFenceInvite()
+      insertFenceReceipt('processing')
+      expect(await runClaim({ capability: 'admin' })).toBe(0)
     })
   })
 
