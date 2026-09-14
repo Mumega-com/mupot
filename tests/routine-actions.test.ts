@@ -506,7 +506,7 @@ describe('Routine proposal submission and governed actions', () => {
     })
     const env = observeHumanWaitMessage(fixture.env, () => {
       fixture!.harness.sqlite.prepare(
-        "UPDATE agents SET status = 'suspended' WHERE id = 'agent-1'",
+        "UPDATE agents SET status = 'paused' WHERE id = 'agent-1'",
       ).run()
     })
 
@@ -517,17 +517,21 @@ describe('Routine proposal submission and governed actions', () => {
   })
 
   // ── P1-4: the insert-time recipient fence also pins project.status='active'
-  // — an archived project must never be notified even while the agent stays
-  // active and its membership row is untouched.
-  it('fences notification when the project is archived after the wait commits', async () => {
+  // — a project that is no longer active must never be notified even while
+  // the agent stays active and its membership row is untouched. Deliberately
+  // 'paused', NOT 'archived': validateMessageProjectAccess (messages.ts:2576)
+  // already refuses 'archived' on its own, earlier, independent pre-check, so
+  // that status can never isolate THIS insert-time fence — only a non-active,
+  // non-archived status (still valid per the CHECK constraint) proves it.
+  it('fences notification when the project is no longer active after the wait commits', async () => {
     fixture = await makeReadyRoutineFixture('execute_internal')
     const proposal = fixture.proposal({
-      key: 'archived-before-notify', kind: 'ask_human',
+      key: 'paused-before-notify', kind: 'ask_human',
       input: { question: 'Which receipt?', choices: ['A', 'B'], references: [] },
     })
     const env = observeHumanWaitMessage(fixture.env, () => {
       fixture!.harness.sqlite.prepare(
-        "UPDATE projects SET status = 'archived' WHERE id = 'project-1'",
+        "UPDATE projects SET status = 'paused' WHERE id = 'project-1'",
       ).run()
     })
 
