@@ -161,6 +161,42 @@ describe('Telegram project onboarding schema', () => {
       .not.toThrow()
   })
 
+  it('requires a member-bind project invite to carry the full project field set', () => {
+    createProjectAndSquad()
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status)
+      VALUES ('member-bind-schema', 'bind-schema@example.com', 'Bind Schema', 'active');
+    `)
+
+    // member_id alone, no project fields at all — the pre-existing "jointly
+    // null or nonblank" clause already catches project_id, but member_id sat
+    // outside that check before this migration; assert this specific clause,
+    // not the pre-existing one, is what refuses it.
+    expect(() => harness.sqlite.exec(`
+      INSERT INTO invites (id, email, member_id)
+      VALUES ('member-bind-no-project', 'member-bind-no-project@example.com', 'member-bind-schema')
+    `)).toThrow(/project invite member bind requires the full project field set/)
+
+    // A fully-formed project invite plus member_id is accepted.
+    expect(() => harness.sqlite.prepare(`
+      INSERT INTO invites (
+        id, email, project_id, squad_id, pairing_hash, pairing_expires_at, member_id
+      ) VALUES (
+        'member-bind-complete', 'member-bind-complete@example.com', 'project-1', 'squad-1',
+        ?, '2026-09-13T01:00:00Z', 'member-bind-schema'
+      )
+    `).run(VALID_PAIRING_HASH)).not.toThrow()
+
+    // An UPDATE that attaches member_id to a row missing project fields is
+    // refused too (the UPDATE trigger lists member_id in its OF clause).
+    harness.sqlite.exec(`
+      INSERT INTO invites (id, email) VALUES ('member-bind-update-target', 'member-bind-update-target@example.com')
+    `)
+    expect(() => harness.sqlite.exec(`
+      UPDATE invites SET member_id = 'member-bind-schema' WHERE id = 'member-bind-update-target'
+    `)).toThrow(/project invite member bind requires the full project field set/)
+  })
+
   it('records webhook receipts once per tenant and update id', () => {
     const insert = harness.sqlite.prepare(`
       INSERT INTO telegram_webhook_receipts (
@@ -1530,5 +1566,590 @@ describe('Telegram project invitation service', () => {
         /invalid_or_expired_pairing_code|ambiguous_pairing_code|telegram_identity_conflict|member_already_exists|redemption_failed|update_receipt_invalid/,
       )
     }
+  })
+})
+
+// ── Bind-existing-member project invites (mupot#1407 follow-up) ────────────
+//
+// PR #1407 shipped project invites for net-new humans only: redemption always
+// INSERTs a fresh members row, so an existing member's own email collides
+// with members.email's UNIQUE constraint and returns member_already_exists.
+// This slice adds an optional member_id on invite creation: when set, the
+// invite binds an EXISTING active member's Telegram identity at redemption
+// (UPDATE, never INSERT) instead of minting a net-new one. One claim
+// statement (CLAIM_INVITE_SQL, unchanged), one new conditional bind
+// statement inside the SAME atomic batch, one capability ceiling path
+// (actorRankOnSquad, unchanged) — not a second copy of any of the three.
+
+describe('Telegram project invite — bind existing member', () => {
+  let harness: SqliteD1Harness
+  let env: Env
+
+  const ownerAuth: AuthContext = {
+    userId: 'bind-owner-user',
+    email: 'bind-owner@example.test',
+    role: 'member',
+    tenant: TENANT,
+    memberId: 'member-bind-owner',
+    capabilities: [{
+      member_id: 'member-bind-owner',
+      scope_type: 'squad',
+      scope_id: 'squad-bind',
+      capability: 'admin',
+    }],
+  }
+
+  beforeEach(() => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    env = { DB: harness.db, TENANT_SLUG: TENANT } as Env
+    harness.sqlite.exec(`
+      INSERT INTO departments (id, slug, name)
+      VALUES ('department-bind', 'delivery-bind', 'Delivery Bind');
+      INSERT INTO squads (id, department_id, slug, name)
+      VALUES ('squad-bind', 'department-bind', 'bind', 'Bind Squad');
+      INSERT INTO projects (id, slug, name, status)
+      VALUES ('project-bind', 'bind-project', 'Bind project', 'active');
+      INSERT INTO project_squad_access (project_id, squad_id, access_level)
+      VALUES ('project-bind', 'squad-bind', 'write');
+      INSERT INTO members (id, email, display_name, status, tenant)
+      VALUES ('member-bind-owner', 'bind-owner@example.test', 'Bind Owner', 'active', '${TENANT}');
+      INSERT INTO members (id, email, display_name, status, tenant)
+      VALUES ('member-existing', 'existing-human@example.test', 'Existing Human', 'active', '${TENANT}');
+    `)
+  })
+
+  afterEach(() => {
+    harness.close()
+  })
+
+  function reserveUpdate(
+    updateId: string,
+    requestDigest = VALID_REQUEST_DIGEST,
+    telegramUserId = 'telegram-user-bind',
+  ): void {
+    harness.sqlite.prepare(`
+      INSERT INTO telegram_webhook_receipts (
+        tenant, update_id, telegram_user_id, request_digest, state, created_at
+      ) VALUES (?, ?, ?, ?, 'processing', ?)
+    `).run(TENANT, updateId, telegramUserId, requestDigest, new Date().toISOString())
+  }
+
+  async function createMemberInvite(
+    overrides: Partial<{
+      member_id: string
+      project_id: string
+      squad_id: string
+      capability: 'owner' | 'admin' | 'lead' | 'member' | 'observer'
+      expires_in_seconds: number
+    }> = {},
+  ) {
+    return createProjectInvite(env, ownerAuth, {
+      member_id: 'member-existing',
+      project_id: 'project-bind',
+      squad_id: 'squad-bind',
+      capability: 'member',
+      expires_in_seconds: 3600,
+      ...overrides,
+    })
+  }
+
+  // ── createProjectInvite (creation side) ──────────────────────────────────
+
+  describe('createProjectInvite — member_id', () => {
+    it('creates a project invite bound to an existing member, deriving email server-side', async () => {
+      const result = await createMemberInvite()
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
+      expect(result.value.invite.email).toBe('existing-human@example.test')
+
+      const row = harness.sqlite.prepare(
+        'SELECT email, member_id FROM invites WHERE id = ?',
+      ).get(result.value.invite.id) as Record<string, unknown>
+      expect(row).toEqual({ email: 'existing-human@example.test', member_id: 'member-existing' })
+    })
+
+    it('rejects an empty member_id as invalid_member_id', async () => {
+      await expect(createMemberInvite({ member_id: '   ' })).resolves.toEqual({
+        ok: false,
+        error: 'invalid_member_id',
+      })
+    })
+
+    it('collapses a member from another tenant to member_not_found (no cross-tenant existence oracle)', async () => {
+      harness.sqlite.exec(`
+        INSERT INTO members (id, email, display_name, status, tenant)
+        VALUES ('member-other-tenant', 'other-tenant@example.test', 'Other Tenant', 'active', 'a-different-tenant');
+      `)
+      await expect(createMemberInvite({ member_id: 'member-other-tenant' })).resolves.toEqual({
+        ok: false,
+        error: 'member_not_found',
+      })
+    })
+
+    it('refuses a nonexistent member with member_not_found', async () => {
+      await expect(createMemberInvite({ member_id: 'member-does-not-exist' })).resolves.toEqual({
+        ok: false,
+        error: 'member_not_found',
+      })
+    })
+
+    it('refuses a suspended member with member_not_active', async () => {
+      harness.sqlite.exec(`
+        INSERT INTO members (id, email, display_name, status, tenant)
+        VALUES ('member-suspended', 'suspended@example.test', 'Suspended', 'suspended', '${TENANT}');
+      `)
+      await expect(createMemberInvite({ member_id: 'member-suspended' })).resolves.toEqual({
+        ok: false,
+        error: 'member_not_active',
+      })
+    })
+
+    it('refuses a member with no email on file with member_missing_email', async () => {
+      harness.sqlite.exec(`
+        INSERT INTO members (id, email, display_name, telegram_chat_id, status, tenant)
+        VALUES ('member-im-only', NULL, 'IM Only', '9200001', 'active', '${TENANT}');
+      `)
+      await expect(createMemberInvite({ member_id: 'member-im-only' })).resolves.toEqual({
+        ok: false,
+        error: 'member_missing_email',
+      })
+    })
+
+    it('still enforces the actor rank ceiling on a member-bind invite (no second predicate)', async () => {
+      await expect(createMemberInvite({ capability: 'owner' })).resolves.toEqual({
+        ok: false,
+        error: 'cannot_grant_above_own_rank',
+      })
+    })
+
+    it('does not create an invite row when member validation refuses', async () => {
+      await createMemberInvite({ member_id: 'member-does-not-exist' })
+      expect(harness.sqlite.prepare(
+        'SELECT COUNT(*) AS count FROM invites WHERE member_id = ?',
+      ).get('member-does-not-exist')).toEqual({ count: 0 })
+    })
+  })
+
+  // ── redeemTelegramProjectInvite (redemption side) ────────────────────────
+
+  describe('redeemTelegramProjectInvite — member_id', () => {
+    it('binds the Telegram identity to the existing member instead of inserting a new one', async () => {
+      const created = await createMemberInvite()
+      expect(created.ok).toBe(true)
+      if (!created.ok) return
+      reserveUpdate('update-bind-success', VALID_REQUEST_DIGEST, '9200100')
+
+      const before = harness.sqlite.prepare('SELECT COUNT(*) AS count FROM members').get()
+
+      const result = await redeemTelegramProjectInvite(env, {
+        pairing_code: created.value.pairing_code,
+        telegram_user_id: '9200100',
+        display_name: 'Ignored Cosmetic Name',
+        update_id: 'update-bind-success',
+        request_digest: VALID_REQUEST_DIGEST,
+      })
+
+      expect(result).toEqual({
+        ok: true,
+        value: {
+          member_id: 'member-existing',
+          project_id: 'project-bind',
+          squad_id: 'squad-bind',
+          capability: 'member',
+        },
+      })
+
+      const after = harness.sqlite.prepare('SELECT COUNT(*) AS count FROM members').get()
+      expect(after).toEqual(before) // no new member row minted
+
+      expect(harness.sqlite.prepare(`
+        SELECT email, display_name, telegram_chat_id, status
+        FROM members WHERE id = 'member-existing'
+      `).get()).toEqual({
+        email: 'existing-human@example.test',
+        display_name: 'Existing Human', // unchanged — display_name threading stays cosmetic-only
+        telegram_chat_id: '9200100',
+        status: 'active',
+      })
+
+      expect(harness.sqlite.prepare(`
+        SELECT scope_type, scope_id, capability FROM capabilities WHERE member_id = 'member-existing'
+      `).get()).toEqual({ scope_type: 'squad', scope_id: 'squad-bind', capability: 'member' })
+
+      const receipt = harness.sqlite.prepare(`
+        SELECT state, response_text FROM telegram_webhook_receipts
+        WHERE tenant = ? AND update_id = 'update-bind-success'
+      `).get(TENANT) as { state: string; response_text: string }
+      expect(receipt.state).toBe('completed')
+      expect(JSON.parse(receipt.response_text)).toEqual(result.value)
+    })
+
+    it('refuses when the member already has a DIFFERENT Telegram identity bound', async () => {
+      harness.sqlite.exec(`
+        UPDATE members SET telegram_chat_id = '9200200' WHERE id = 'member-existing'
+      `)
+      const created = await createMemberInvite()
+      expect(created.ok).toBe(true)
+      if (!created.ok) return
+      reserveUpdate('update-bind-self-conflict', VALID_REQUEST_DIGEST, '9200201')
+
+      const result = await redeemTelegramProjectInvite(env, {
+        pairing_code: created.value.pairing_code,
+        telegram_user_id: '9200201',
+        display_name: 'Wrong New Identity',
+        update_id: 'update-bind-self-conflict',
+        request_digest: VALID_REQUEST_DIGEST,
+      })
+
+      expect(result).toEqual({ ok: false, error: 'telegram_identity_conflict' })
+      expect(harness.sqlite.prepare('SELECT accepted_at FROM invites WHERE id = ?').get(created.value.invite.id))
+        .toEqual({ accepted_at: null })
+      expect(harness.sqlite.prepare(`
+        SELECT telegram_chat_id FROM members WHERE id = 'member-existing'
+      `).get()).toEqual({ telegram_chat_id: '9200200' }) // unchanged
+      expect(harness.sqlite.prepare(`
+        SELECT COUNT(*) AS count FROM capabilities WHERE member_id = 'member-existing'
+      `).get()).toEqual({ count: 0 })
+    })
+
+    it('refuses when the Telegram identity is already bound to a DIFFERENT member (reverse conflict)', async () => {
+      harness.sqlite.exec(`
+        INSERT INTO members (id, email, display_name, telegram_chat_id, status, tenant)
+        VALUES ('member-holds-telegram', 'holder@example.test', 'Holder', '9200300', 'active', '${TENANT}');
+      `)
+      const created = await createMemberInvite()
+      expect(created.ok).toBe(true)
+      if (!created.ok) return
+      reserveUpdate('update-bind-reverse-conflict', VALID_REQUEST_DIGEST, '9200300')
+
+      const result = await redeemTelegramProjectInvite(env, {
+        pairing_code: created.value.pairing_code,
+        telegram_user_id: '9200300',
+        display_name: 'Reverse Conflict',
+        update_id: 'update-bind-reverse-conflict',
+        request_digest: VALID_REQUEST_DIGEST,
+      })
+
+      expect(result).toEqual({ ok: false, error: 'telegram_identity_conflict' })
+      expect(harness.sqlite.prepare('SELECT accepted_at FROM invites WHERE id = ?').get(created.value.invite.id))
+        .toEqual({ accepted_at: null })
+      expect(harness.sqlite.prepare(`
+        SELECT telegram_chat_id FROM members WHERE id = 'member-existing'
+      `).get()).toEqual({ telegram_chat_id: null })
+      expect(harness.sqlite.prepare(`
+        SELECT COUNT(*) AS count FROM capabilities WHERE member_id = 'member-existing'
+      `).get()).toEqual({ count: 0 })
+    })
+
+    it('refuses redemption when the target member is suspended between invite creation and claim', async () => {
+      const created = await createMemberInvite()
+      expect(created.ok).toBe(true)
+      if (!created.ok) return
+      harness.sqlite.exec(`UPDATE members SET status = 'suspended' WHERE id = 'member-existing'`)
+      reserveUpdate('update-bind-suspended', VALID_REQUEST_DIGEST, '9200400')
+
+      const result = await redeemTelegramProjectInvite(env, {
+        pairing_code: created.value.pairing_code,
+        telegram_user_id: '9200400',
+        display_name: 'Suspended At Claim',
+        update_id: 'update-bind-suspended',
+        request_digest: VALID_REQUEST_DIGEST,
+      })
+
+      expect(result).toEqual({ ok: false, error: 'invalid_or_expired_pairing_code' })
+      expect(harness.sqlite.prepare('SELECT accepted_at FROM invites WHERE id = ?').get(created.value.invite.id))
+        .toEqual({ accepted_at: null })
+      expect(harness.sqlite.prepare(`
+        SELECT telegram_chat_id FROM members WHERE id = 'member-existing'
+      `).get()).toEqual({ telegram_chat_id: null })
+      expect(harness.sqlite.prepare(`
+        SELECT COUNT(*) AS count FROM capabilities WHERE member_id = 'member-existing'
+      `).get()).toEqual({ count: 0 })
+      expect(harness.sqlite.prepare(`SELECT state FROM telegram_webhook_receipts WHERE update_id = 'update-bind-suspended'`).get())
+        .toEqual({ state: 'processing' })
+    })
+
+    it('refuses a second redemption of the same member-bind invite (single-use fence still holds)', async () => {
+      const created = await createMemberInvite()
+      expect(created.ok).toBe(true)
+      if (!created.ok) return
+      reserveUpdate('update-bind-first', VALID_REQUEST_DIGEST, '9200500')
+      const first = await redeemTelegramProjectInvite(env, {
+        pairing_code: created.value.pairing_code,
+        telegram_user_id: '9200500',
+        display_name: 'First',
+        update_id: 'update-bind-first',
+        request_digest: VALID_REQUEST_DIGEST,
+      })
+      expect(first.ok).toBe(true)
+
+      reserveUpdate('update-bind-second', VALID_REQUEST_DIGEST, '9200500')
+      await expect(redeemTelegramProjectInvite(env, {
+        pairing_code: created.value.pairing_code,
+        telegram_user_id: '9200500',
+        display_name: 'Second',
+        update_id: 'update-bind-second',
+        request_digest: VALID_REQUEST_DIGEST,
+      })).resolves.toEqual({ ok: false, error: 'invalid_or_expired_pairing_code' })
+
+      expect(harness.sqlite.prepare(`
+        SELECT COUNT(*) AS count FROM capabilities WHERE member_id = 'member-existing'
+      `).get()).toEqual({ count: 1 })
+    })
+
+    it('returns the stored non-secret result for an identical completed Telegram update (replay-safe)', async () => {
+      const created = await createMemberInvite()
+      expect(created.ok).toBe(true)
+      if (!created.ok) return
+      reserveUpdate('update-bind-replay', VALID_REQUEST_DIGEST, '9200600')
+      const input = {
+        pairing_code: created.value.pairing_code,
+        telegram_user_id: '9200600',
+        display_name: 'Replay',
+        update_id: 'update-bind-replay',
+        request_digest: VALID_REQUEST_DIGEST,
+      }
+      const first = await redeemTelegramProjectInvite(env, input)
+      expect(first.ok).toBe(true)
+      const replay = await redeemTelegramProjectInvite(env, input)
+      expect(replay).toEqual(first)
+      expect(harness.sqlite.prepare(`
+        SELECT COUNT(*) AS count FROM capabilities WHERE member_id = 'member-existing'
+      `).get()).toEqual({ count: 1 })
+    })
+
+    it('joins through Telegram with the same generic reply text as the net-new path', async () => {
+      const created = await createMemberInvite()
+      expect(created.ok).toBe(true)
+      if (!created.ok) return
+      reserveUpdate('update-bind-im', VALID_REQUEST_DIGEST, '9200700')
+
+      const reply = await handleImMessage(env, '9200700', `/start ${created.value.pairing_code}`, {
+        telegram: { update_id: 'update-bind-im', telegram_user_id: '9200700', request_digest: VALID_REQUEST_DIGEST },
+      })
+
+      expect(reply).toBe('Joined project project-bind. Use /needs to see what needs your attention.')
+    })
+
+    it('does not burn the invite when the target member is suspended — it is retryable once reactivated', async () => {
+      const created = await createMemberInvite()
+      expect(created.ok).toBe(true)
+      if (!created.ok) return
+      harness.sqlite.exec(`UPDATE members SET status = 'suspended' WHERE id = 'member-existing'`)
+      reserveUpdate('update-bind-suspended-retry-1', VALID_REQUEST_DIGEST, '9200800')
+      await expect(redeemTelegramProjectInvite(env, {
+        pairing_code: created.value.pairing_code,
+        telegram_user_id: '9200800',
+        display_name: 'First Attempt',
+        update_id: 'update-bind-suspended-retry-1',
+        request_digest: VALID_REQUEST_DIGEST,
+      })).resolves.toEqual({ ok: false, error: 'invalid_or_expired_pairing_code' })
+      expect(harness.sqlite.prepare('SELECT accepted_at FROM invites WHERE id = ?').get(created.value.invite.id))
+        .toEqual({ accepted_at: null })
+
+      harness.sqlite.exec(`UPDATE members SET status = 'active' WHERE id = 'member-existing'`)
+      reserveUpdate('update-bind-suspended-retry-2', VALID_REQUEST_DIGEST, '9200800')
+      const retry = await redeemTelegramProjectInvite(env, {
+        pairing_code: created.value.pairing_code,
+        telegram_user_id: '9200800',
+        display_name: 'Retry After Reactivation',
+        update_id: 'update-bind-suspended-retry-2',
+        request_digest: VALID_REQUEST_DIGEST,
+      })
+      expect(retry.ok).toBe(true)
+      expect(harness.sqlite.prepare(`
+        SELECT telegram_chat_id FROM members WHERE id = 'member-existing'
+      `).get()).toEqual({ telegram_chat_id: '9200800' })
+    })
+
+    // Reproduces a residual, non-racing shape: CLAIM_INVITE_SQL's own
+    // member-status conjunct only checks `status = 'active'`, not tenant — so
+    // it cannot by itself detect a member reassigned to a different tenant
+    // between invite creation and claim. bindMemberStatement's OWN
+    // `(tenant = ? OR tenant IS NULL)` guard is what independently refuses
+    // this, and memberBindLandedGuard on the capability/receipt statements is
+    // what stops a capability from being granted anyway once bindMemberStatement
+    // silently affects 0 rows.
+    it('grants no capability when bindMemberStatement itself fails independently (member reassigned to another tenant)', async () => {
+      const created = await createMemberInvite()
+      expect(created.ok).toBe(true)
+      if (!created.ok) return
+      harness.sqlite.exec(`UPDATE members SET tenant = 'a-different-tenant' WHERE id = 'member-existing'`)
+      reserveUpdate('update-bind-tenant-reassigned', VALID_REQUEST_DIGEST, '9200900')
+
+      const result = await redeemTelegramProjectInvite(env, {
+        pairing_code: created.value.pairing_code,
+        telegram_user_id: '9200900',
+        display_name: 'Tenant Reassigned',
+        update_id: 'update-bind-tenant-reassigned',
+        request_digest: VALID_REQUEST_DIGEST,
+      })
+
+      expect(result).toEqual({ ok: false, error: 'invalid_or_expired_pairing_code' })
+      expect(harness.sqlite.prepare(`
+        SELECT telegram_chat_id FROM members WHERE id = 'member-existing'
+      `).get()).toEqual({ telegram_chat_id: null })
+      expect(harness.sqlite.prepare(`
+        SELECT COUNT(*) AS count FROM capabilities WHERE member_id = 'member-existing'
+      `).get()).toEqual({ count: 0 })
+      expect(harness.sqlite.prepare(`SELECT state FROM telegram_webhook_receipts WHERE update_id = 'update-bind-tenant-reassigned'`).get())
+        .toEqual({ state: 'processing' })
+      // CLAIM_INVITE_SQL's own conjunct only sees status='active' (still true
+      // here), so it commits — this invite IS consumed by this attempt,
+      // unlike the suspended-member case above where CLAIM_INVITE_SQL itself
+      // refuses. Documented, not silently accepted: an operator who
+      // reassigns a pending invitee's tenant mid-flight burns that invite.
+      expect(harness.sqlite.prepare('SELECT accepted_at FROM invites WHERE id = ?').get(created.value.invite.id))
+        .not.toEqual({ accepted_at: null })
+    })
+  })
+
+  // ── HTTP route (POST /invites, member_id) ────────────────────────────────
+
+  describe('POST /invites — member_id', () => {
+    function ownerSession(): Env {
+      const session = JSON.stringify({
+        userId: 'bind-owner-user',
+        email: 'bind-owner@example.test',
+        role: 'owner',
+        createdAt: new Date().toISOString(),
+      })
+      return {
+        ...env,
+        SESSIONS: {
+          get: async (key: string) => key === 'sess:bind-owner' ? session : null,
+          put: async () => undefined,
+          delete: async () => undefined,
+        },
+      } as Env
+    }
+
+    it('mints a project invite for an existing member as admin/owner (201)', async () => {
+      const response = await membersApp.request('/invites', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', cookie: 'mupot_session=bind-owner' },
+        body: JSON.stringify({
+          kind: 'project',
+          member_id: 'member-existing',
+          project_id: 'project-bind',
+          squad_id: 'squad-bind',
+          capability: 'member',
+          expires_in_seconds: 3600,
+        }),
+      }, ownerSession())
+
+      expect(response.status, await response.clone().text()).toBe(201)
+      const body = await response.json() as { invite: { email: string; id: string } }
+      expect(body.invite.email).toBe('existing-human@example.test')
+    })
+
+    it('refuses a non-admin caller (403 forbidden)', async () => {
+      harness.sqlite.exec(`
+        INSERT INTO members (id, email, display_name, status, tenant)
+        VALUES ('member-route-nonadmin', 'route-nonadmin@example.test', 'Route Nonadmin', 'active', '${TENANT}');
+        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES ('cap-route-nonadmin', 'member-route-nonadmin', 'squad', 'squad-bind', 'member');
+      `)
+      const session = JSON.stringify({
+        userId: 'route-nonadmin-user',
+        email: 'route-nonadmin@example.test',
+        role: 'member',
+        createdAt: new Date().toISOString(),
+      })
+      const routeEnv = {
+        ...env,
+        SESSIONS: {
+          get: async (key: string) => key === 'sess:route-nonadmin' ? session : null,
+          put: async () => undefined,
+          delete: async () => undefined,
+        },
+      } as Env
+
+      const response = await membersApp.request('/invites', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', cookie: 'mupot_session=route-nonadmin' },
+        body: JSON.stringify({
+          kind: 'project',
+          member_id: 'member-existing',
+          project_id: 'project-bind',
+          squad_id: 'squad-bind',
+          capability: 'member',
+          expires_in_seconds: 3600,
+        }),
+      }, routeEnv)
+
+      expect(response.status, await response.clone().text()).toBe(403)
+      await expect(response.json()).resolves.toEqual({ error: 'forbidden' })
+      expect(harness.sqlite.prepare(`
+        SELECT COUNT(*) AS count FROM invites WHERE member_id = 'member-existing'
+      `).get()).toEqual({ count: 0 })
+    })
+
+    it('refuses a member_id from another tenant (404)', async () => {
+      harness.sqlite.exec(`
+        INSERT INTO members (id, email, display_name, status, tenant)
+        VALUES ('member-route-other-tenant', 'route-other-tenant@example.test', 'Other Tenant', 'active', 'a-different-tenant');
+      `)
+      const response = await membersApp.request('/invites', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', cookie: 'mupot_session=bind-owner' },
+        body: JSON.stringify({
+          kind: 'project',
+          member_id: 'member-route-other-tenant',
+          project_id: 'project-bind',
+          squad_id: 'squad-bind',
+          capability: 'member',
+          expires_in_seconds: 3600,
+        }),
+      }, ownerSession())
+
+      expect(response.status, await response.clone().text()).toBe(404)
+      await expect(response.json()).resolves.toEqual({ error: 'member_not_found' })
+    })
+
+    it('refuses an inactive member (403)', async () => {
+      harness.sqlite.exec(`
+        INSERT INTO members (id, email, display_name, status, tenant)
+        VALUES ('member-route-suspended', 'route-suspended@example.test', 'Route Suspended', 'suspended', '${TENANT}');
+      `)
+      const response = await membersApp.request('/invites', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', cookie: 'mupot_session=bind-owner' },
+        body: JSON.stringify({
+          kind: 'project',
+          member_id: 'member-route-suspended',
+          project_id: 'project-bind',
+          squad_id: 'squad-bind',
+          capability: 'member',
+          expires_in_seconds: 3600,
+        }),
+      }, ownerSession())
+
+      expect(response.status, await response.clone().text()).toBe(403)
+      await expect(response.json()).resolves.toEqual({ error: 'member_not_active' })
+    })
+
+    it('rejects a body supplying both member_id and email as an ambiguous scope (400)', async () => {
+      const response = await membersApp.request('/invites', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', cookie: 'mupot_session=bind-owner' },
+        body: JSON.stringify({
+          kind: 'project',
+          member_id: 'member-existing',
+          email: 'someone-else@example.test',
+          project_id: 'project-bind',
+          squad_id: 'squad-bind',
+          capability: 'member',
+          expires_in_seconds: 3600,
+        }),
+      }, ownerSession())
+
+      expect(response.status, await response.clone().text()).toBe(400)
+      await expect(response.json()).resolves.toEqual({ error: 'invalid_invite_scope' })
+      expect(harness.sqlite.prepare(`
+        SELECT COUNT(*) AS count FROM invites WHERE member_id = 'member-existing'
+      `).get()).toEqual({ count: 0 })
+    })
   })
 })

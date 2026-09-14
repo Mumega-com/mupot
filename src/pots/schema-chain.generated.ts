@@ -2833,9 +2833,24 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_agent_messages_lease_attempt" },
     ],
   },
+  {
+    file: "0154_project_invite_member_bind.sql",
+    sha256: "a031ce4cd9a877d0b10767d295dd4d07ae4fb43360647b73c705da584f65a828",
+    statements: [
+      "-- 0154_project_invite_member_bind.sql — bind a Telegram identity to an EXISTING\n-- member via a project invite, instead of always minting a net-new member.\n--\n-- Additive, D1-safe: one nullable column plus an extension of 0152's own\n-- joint-null trigger set (dropped and recreated, not a second copy of it) so a\n-- member_id invite still requires the full project field group (project_id,\n-- squad_id, pairing_hash, pairing_expires_at) — this is a project invite\n-- concept, never a legacy email invite. No UNION ALL, no backfill of existing\n-- rows (member_id defaults NULL, matching every existing invite unchanged).\n\nALTER TABLE invites ADD COLUMN member_id TEXT REFERENCES members(id);",
+      "\n\nDROP TRIGGER validate_invites_project_pairing_insert;",
+      "\nDROP TRIGGER validate_invites_project_pairing_update;",
+      "\n\nCREATE TRIGGER validate_invites_project_pairing_insert\nBEFORE INSERT ON invites\nBEGIN\n  SELECT RAISE(ABORT, 'project invite fields must be jointly null or nonblank')\n  WHERE NOT (\n    (\n      NEW.project_id IS NULL\n      AND NEW.squad_id IS NULL\n      AND NEW.pairing_hash IS NULL\n      AND NEW.pairing_expires_at IS NULL\n    )\n    OR\n    (\n      NEW.project_id IS NOT NULL\n      AND NEW.squad_id IS NOT NULL\n      AND NEW.pairing_hash IS NOT NULL\n      AND NEW.pairing_expires_at IS NOT NULL\n      AND length(trim(NEW.project_id)) > 0\n      AND length(trim(NEW.squad_id)) > 0\n      AND length(trim(NEW.pairing_hash)) > 0\n      AND length(trim(NEW.pairing_expires_at)) > 0\n    )\n  );\n  SELECT RAISE(ABORT, 'project invite member bind requires the full project field set')\n  WHERE NEW.member_id IS NOT NULL\n    AND NOT (\n      NEW.project_id IS NOT NULL\n      AND NEW.squad_id IS NOT NULL\n      AND NEW.pairing_hash IS NOT NULL\n      AND NEW.pairing_expires_at IS NOT NULL\n      AND length(trim(NEW.project_id)) > 0\n      AND length(trim(NEW.squad_id)) > 0\n      AND length(trim(NEW.pairing_hash)) > 0\n      AND length(trim(NEW.pairing_expires_at)) > 0\n    );\n  SELECT RAISE(ABORT, 'project invite pairing hash must be 64 hex characters')\n  WHERE NEW.pairing_hash IS NOT NULL\n    AND (\n      length(NEW.pairing_hash) <> 64\n      OR NEW.pairing_hash GLOB '*[^0-9A-Fa-f]*'\n    );\n  SELECT RAISE(ABORT, 'project invite project-squad mismatch')\n  WHERE NEW.project_id IS NOT NULL\n    AND NOT EXISTS (\n      SELECT 1\n      FROM project_squad_access\n      WHERE project_id = NEW.project_id\n        AND squad_id = NEW.squad_id\n    );\nEND;",
+      "\n\nCREATE TRIGGER validate_invites_project_pairing_update\nBEFORE UPDATE OF project_id, squad_id, pairing_hash, pairing_expires_at, member_id ON invites\nBEGIN\n  SELECT RAISE(ABORT, 'project invite fields must be jointly null or nonblank')\n  WHERE NOT (\n    (\n      NEW.project_id IS NULL\n      AND NEW.squad_id IS NULL\n      AND NEW.pairing_hash IS NULL\n      AND NEW.pairing_expires_at IS NULL\n    )\n    OR\n    (\n      NEW.project_id IS NOT NULL\n      AND NEW.squad_id IS NOT NULL\n      AND NEW.pairing_hash IS NOT NULL\n      AND NEW.pairing_expires_at IS NOT NULL\n      AND length(trim(NEW.project_id)) > 0\n      AND length(trim(NEW.squad_id)) > 0\n      AND length(trim(NEW.pairing_hash)) > 0\n      AND length(trim(NEW.pairing_expires_at)) > 0\n    )\n  );\n  SELECT RAISE(ABORT, 'project invite member bind requires the full project field set')\n  WHERE NEW.member_id IS NOT NULL\n    AND NOT (\n      NEW.project_id IS NOT NULL\n      AND NEW.squad_id IS NOT NULL\n      AND NEW.pairing_hash IS NOT NULL\n      AND NEW.pairing_expires_at IS NOT NULL\n      AND length(trim(NEW.project_id)) > 0\n      AND length(trim(NEW.squad_id)) > 0\n      AND length(trim(NEW.pairing_hash)) > 0\n      AND length(trim(NEW.pairing_expires_at)) > 0\n    );\n  SELECT RAISE(ABORT, 'project invite pairing hash must be 64 hex characters')\n  WHERE NEW.pairing_hash IS NOT NULL\n    AND (\n      length(NEW.pairing_hash) <> 64\n      OR NEW.pairing_hash GLOB '*[^0-9A-Fa-f]*'\n    );\n  SELECT RAISE(ABORT, 'project invite project-squad mismatch')\n  WHERE NEW.project_id IS NOT NULL\n    AND NOT EXISTS (\n      SELECT 1\n      FROM project_squad_access\n      WHERE project_id = NEW.project_id\n        AND squad_id = NEW.squad_id\n    );\nEND;",
+    ],
+    objects: [
+      { type: "trigger", name: "validate_invites_project_pairing_insert" },
+      { type: "trigger", name: "validate_invites_project_pairing_update" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "833b618a5d63d0fdacd3c7eaa0b9f583645dad67b8a6dfa31da5e6b93ca2cd49"
+export const SCHEMA_CHAIN_DIGEST: string = "4aa55ed3be4d91c0e808165fd35dee5ba0f1c9ccad7775c992215f598eaadf5c"
