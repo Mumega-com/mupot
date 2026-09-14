@@ -534,3 +534,117 @@ for the commits added after `22c778d8`.
 Every row above was applied as a single localized edit, confirmed red, then reverted with
 `git checkout -- <file>`; `git status --short` showed a clean tree between mutants (no
 uncommitted mutation ever coexisted with the next one).
+
+## kasra-review re-gate follow-up (2026-09-14, commits 27f26deb–9cd9b182)
+
+kasra-review's adversarial re-gate at head `1fbc60b2` enumerated every conjunct of
+`CLAIM_INVITE_SQL` (not just the three the P1-2 fix's own tests named) and reported **8 of
+~11 survived** even with M5/M6/M7 in place, naming the project `status = 'active'` EXISTS and
+the `project_squad_access` EXISTS as the two that mattered (both singly-expressed, no JS
+twin, proven load-bearing by an A/B probe in that gate — deleting either lets a redemption
+into an archived project / a revoked squad↔project edge mint a `capabilities` row). This
+follow-up did not re-run that exact pre-fix baseline (the M8/M9 tests below were added before
+the first sweep in this session ran); instead it added tests for those two named conjuncts
+first, then ran its own full sweep at a finer 15-way split (separating the receipt `EXISTS`'s
+four sub-conjuncts individually, which the review's ~11 count did not) and found **10 of 15
+still unpinned** even with M5-M9 in place: `id`, `pairing_hash`, `project_id`, `squad_id`,
+`capability`, `email`, and all four receipt sub-conjuncts (`tenant`, `update_id`, digest,
+`telegram_user_id` — only `state = 'processing'` was independently pinned, by M7). Separately,
+the same re-gate re-confirmed a second finding first raised at
+head `22c778d8`: `createProjectInvite` still minted an invite for a legacy `role: 'admin'`
+principal with **no `memberId`**, a shape `requireCapability` itself refuses unconditionally
+for any non-org scope (`src/auth/capability.ts:315-322`) regardless of role. And a third,
+P2 finding: `decided_by_display` (`src/tasks/runtime-receipts.ts`) can resolve to a
+Telegram-onboarded member's cosmetic, user-supplied `display_name` with no escaping at that
+render site.
+
+Fixes, in commit order:
+
+- `27f26deb` — (1) added M8/M9 to the P1-2 fence describe block proving the project-active and
+  project-squad-access `EXISTS` conjuncts are load-bearing: each asserts 0 rows claimed,
+  `invites.accepted_at` still `NULL`, zero `capabilities` rows, and the Telegram receipt state
+  untouched at `'processing'`. (2) Closed the `memberId` parity gap: `actorRankOnSquad`'s
+  `!auth.memberId` branch no longer grants a legacy-role floor at all — it returns `0`
+  unconditionally, matching `requireCapability`'s own restriction (that escape only ever
+  applies to org-scope checks) instead of reimplementing a third, looser copy of it. Added a
+  test: org owner, no `memberId` → `forbidden`. Left `actorMaxRankOnScope`
+  (`src/auth/capability.ts`) untouched per brief — same class of drift, tracked separately as
+  `mupot#1408` — added a one-line pointer comment so the drift stays visible rather than
+  silently diverging further. (3) Added `sanitizeDecidedByDisplay`: strips C0/C1 control
+  characters (newlines, CR, tabs) and caps to 200 chars (the same bound
+  `redeemTelegramProjectInvite` enforces on `display_name` at mint time) at the
+  `decided_by_display` render site, plus a test proving a name with embedded markup/newlines
+  cannot inject a fake extra line into the receipt while its legible content still survives.
+- `209c2104` — full conjunct-by-conjunct mutation sweep of `CLAIM_INVITE_SQL` (script below)
+  re-run after the M8/M9 addition; 10 of 15 conjuncts were still green. Pinned the
+  four categories the re-gate brief named as mattering: receipt tenant (a receipt for the
+  right `update_id`/digest/`telegram_user_id` but the wrong tenant must not satisfy the
+  `EXISTS`), the exact invite `id` (a second invite row sharing the same
+  `pairing_hash`/`project_id`/`squad_id`/`capability`/`email` — only the named `id` is ever
+  touched), the `project_id`/`squad_id` binding, and the `capability` binding. Left
+  `pairing_hash`, `email`, and the receipt's `update_id`/digest/`telegram_user_id`
+  sub-conjuncts as reported (not pinned) survivors — see the table below for why.
+- `9cd9b182` — the full suite (not just the two focused files named in this task) surfaced 6
+  failures in `tests/im-webhook-idempotency.test.ts`: its `invite()` fixture used
+  `role: 'admin'` with no `memberId`, exactly the shape the `27f26deb` fix now correctly
+  refuses. Gave the fixture a real `memberId` + an explicit `admin` capability grant on
+  `squad-1`, the same shape any real inviter needs, instead of leaning on the coarse legacy
+  role alone. This is the fixture catching up to the corrected (secure) behavior, not a
+  regression in the fix.
+
+### Mutation sweep method
+
+Every conjunct of `CLAIM_INVITE_SQL` was mutated one at a time (anchor-uniqueness asserted
+before each write — `assert content.count(old) == 1`), `npx vitest run
+tests/telegram-project-onboarding.test.ts` run against each mutant, then the file restored
+and byte-identity verified against the original before the next mutant. No mutant ever
+coexisted with the next; the driver script itself asserts this at the end of the run.
+
+### Mutation table (measured at head `209c2104` — after both the P1-A fence tests and the
+### tenant/id/project/squad/capability pinning tests landed; each conjunct removed/replaced,
+### run against `tests/telegram-project-onboarding.test.ts`, then restored)
+
+| Conjunct | Mutation | Result | Killed by |
+| --- | --- | --- | --- |
+| `id = ?2` | replaced with `1=1` | RED | "pins the exact invite id — a second invite sharing the same pairing_hash/project/squad/capability/email is never touched" |
+| `pairing_hash = ?3` | dropped | **SURVIVED** | none (see note) |
+| `project_id = ?4` | dropped | RED | "pins the project_id binding — refuses when the caller's project_id mismatches the invite's own project" |
+| `squad_id = ?5` | dropped | RED | "pins the squad_id binding — refuses when the caller's squad_id mismatches the invite's own squad" |
+| `capability = ?6` | dropped | RED | "pins the capability binding — refuses when the caller claims a different capability than the invite grants" |
+| `email = ?7` | dropped | **SURVIVED** | none (see note) |
+| `accepted_at IS NULL` | dropped | RED | M5 |
+| `pairing_expires_at > ?8` | dropped | RED | M6 |
+| `EXISTS (projects … status = 'active')` | dropped | RED | M8 (new) |
+| `EXISTS (project_squad_access …)` | dropped | RED | M9 (new) |
+| receipt `tenant = ?9` | replaced with `1=1` | RED | "pins the receipt tenant — refuses when the only matching receipt belongs to a different tenant" |
+| receipt `AND update_id = ?10` | dropped | **SURVIVED** | none (see note) |
+| receipt `AND lower(request_digest) = lower(?11)` | dropped | **SURVIVED** | none (see note) |
+| receipt `AND telegram_user_id = ?12` | dropped | **SURVIVED** | none (see note) |
+| receipt `AND state = 'processing'` | dropped | RED | M7 |
+
+**Note on the 5 remaining survivors (`pairing_hash`, `email`, receipt `update_id`, receipt
+digest, receipt `telegram_user_id`):** none are reachable on the live call path today.
+`redeemTelegramProjectInvite` always binds every one of these straight off the *same* row it
+just read (by `pairing_hash` for the invite, by `tenant`+`update_id` for the receipt), so a
+mismatch cannot occur at the one real caller. The three receipt sub-conjuncts additionally
+already have a JS-level twin in `redeemTelegramProjectInvite`'s own pre-check — digest and
+`telegram_user_id` equality, and `update_id` as part of the lookup key itself — so their
+SQL-level exposure, if any, is TOCTOU-only (a receipt row changing between the JS pre-check
+and the atomic claim), the same class as the pre-existing M6 finding, not a new gap.
+`pairing_hash`/`email` are redundant with the now-pinned `id` in the current single-caller
+shape (the row is already uniquely identified by `id`). Reported per the "narrow truth, not
+the dramatic one" rule — these are honestly survived mutants, not silently dropped ones.
+
+### Focused and full-suite verification, measured at commit `9cd9b182` (the last code/test
+### commit in this follow-up; this documentation commit lands after it and does not itself
+### change any test or source file)
+
+- `npm run typecheck`: clean (`tsc --noEmit` exit 0).
+- `npx vitest run tests/telegram-project-onboarding.test.ts tests/members-sensitive-response.test.ts`:
+  exit 0, 2 files, 55/55 tests passed.
+- `npm test` (full suite): exit 0, **512 files, 8010 tests, all passed** (0 failed). Run
+  duration 592.53s. This is the real, freshly-measured count for this commit — not carried
+  over from the `608d622a` addendum above (which measured 512 files / 8,001 tests; the 9 new
+  tests added in this follow-up — 2 for the P1-A fence, 1 for the P1-1 parity gap, 5 for the
+  tenant/id/project/squad/capability pinning sweep, 1 for the display_name sanitizer — plus 0
+  net change elsewhere account for the difference).
