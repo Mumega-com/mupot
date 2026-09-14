@@ -648,3 +648,96 @@ the dramatic one" rule — these are honestly survived mutants, not silently dro
   tests added in this follow-up — 2 for the P1-A fence, 1 for the P1-1 parity gap, 5 for the
   tenant/id/project/squad/capability pinning sweep, 1 for the display_name sanitizer — plus 0
   net change elsewhere account for the difference).
+
+## Kasra final-gate repair (head `bf401ca7` → new commit), 2026-09-14
+
+Kasra's final gate on `bf401ca7` (AMBER → merge-defensible, 0 BLOCK / 3 WARN / 2 LOW) named
+three WARN findings and one LOW. All four addressed as classes, not repros:
+
+**WARN-1** (`src/members/project-invites.ts:242`, `access.squad_id = invites.squad_id`): M9
+deletes the invite's *only* `project_squad_access` row, so it cannot tell whether the
+`project_id` conjunct or the `squad_id` conjunct (or both) is what actually refuses the
+claim — with zero rows left, mutating out either one individually still yields zero matches
+and the test stays green regardless. Added two tests to the same `describe` block, each
+leaving a *different* row in place that satisfies exactly one of the two conjuncts:
+
+- **M9b** — a second squad (`squad-fence-b`) linked to the *same* project keeps its own
+  `project_squad_access` edge; only the invite's own squad's edge is revoked. If
+  `access.squad_id = invites.squad_id` were dropped, this leftover row would satisfy the
+  `EXISTS` via `project_id` alone.
+- **M9c** — the *same* squad keeps an edge on a *different* active project
+  (`project-fence-b`); only the invite's own project's edge is revoked. If
+  `access.project_id = invites.project_id` were dropped, this leftover row would satisfy the
+  `EXISTS` via `squad_id` alone.
+
+Mutation-proved individually (not inferred from the pair): dropping
+`access.squad_id = invites.squad_id` → M9b red (claimed 1 row instead of 0); dropping
+`access.project_id = invites.project_id` (replaced with `1=1` to avoid a SQL syntax error
+that would give a false red) → M9c red. Both restored via `git checkout --` after each probe;
+`git diff --stat` empty before the next probe and before final commit.
+
+**WARN-2** (`src/tasks/runtime-receipts.ts:611`): `verdict.note` was returned raw beside the
+sanitized `decided_by_display`, so the fake-extra-line injection threat this receipt guards
+against was closed on only one of its two free-text fields. Renamed `sanitizeDecidedByDisplay`
+to the generic `sanitizeReceiptText` (no other file referenced the old name — confirmed via
+`grep -rn sanitizeDecidedByDisplay src tests`) and applied it to both `note` (guarding the
+`null` case explicitly) and `decided_by_display`. New test: a note containing
+`\n**FAKE VERDICT**\r\ndecided_by: X` plus 300 padding characters renders as a single line
+(`split('\n')` length 1), with no `\n`/`\r`/C0-C1 control character, capped at 200 chars, and
+its legible content (`Looks fine`, `FAKE VERDICT`) intact. Mutation-proved: reverting the
+`gate.map` line to `note: row.note` (raw passthrough) turns this test red. Restored, diff
+empty.
+
+**WARN-3** (`runtime-receipts.ts:552`): the sanitizer stripped only C0/C1 control characters.
+Unicode bidi embedding/override (U+202A-U+202E) and isolate (U+2066-U+2069) controls can
+visually reorder or mask rendered text without changing the underlying characters; zero-width
+characters (U+200B-U+200F, U+2060 word joiner, U+FEFF BOM/ZWNBSP) and soft hyphen (U+00AD)
+render as nothing (or nothing until a line break) and can hide content or defeat exact-text
+matching — none of these fall in the C0/C1 range, so all survived into an identity-bearing
+field untouched. Extended `sanitizeReceiptText`'s regex to also strip
+`[\u200B-\u200F\u2060\uFEFF\u00AD\u202A-\u202E\u2066-\u2069]`, written as explicit `\u`
+escapes in the source (never literal invisible glyphs, so the diff itself stays reviewable
+and can't be corrupted by the very characters it strips). Five new tests, each probing exactly one
+class via a `renderedDisplayNameFor` helper (also built entirely from `\u` escapes): bidi
+embedding/override, bidi isolates, zero-width (all four codepoint classes in one probe),
+soft hyphen, and — the negative control — combining marks (U+0301 on `e`) are explicitly
+*not* stripped, since they are legitimate diacritics rather than an injection vector.
+Mutation-proved: removing the new strip clause (leaving only the C0/C1 clause) turns all four
+positive-class tests red simultaneously while the combining-marks test stays green, confirming
+the new clause — not some other part of the function — is what each test depends on. Restored,
+diff empty.
+
+**LOW** (comment at `runtime-receipts.ts:529-532`, now `:532-540`): the claim "so this can
+never truncate a value that was itself accepted as valid at mint time" is false — the 200-char
+cap is not universal across every mint-time path into these fields. `src/members/index.ts`'s
+own `isNonEmptyString` helper (~line 87, used at its `display_name` validation, ~line 194,
+the generic member-creation path) enforces no length cap at all, and a verdict `note` has no
+mint-time cap anywhere in the codebase. Rewrote the comment to state plainly that the cap
+bounds what a single receipt can render, not that it promises round-tripping of arbitrary
+mint-time input. Also asked to report the evidence-doc survivor table honestly at an
+asymmetric split: a symmetric two-edge split (M9b/M9c above) was done for *both* halves of the
+`project_squad_access` EXISTS conjunct, so there is no remaining asymmetry to report for that
+predicate specifically — the pre-existing 5-survivor table above (pairing_hash, email, and the
+three receipt sub-conjuncts) is unrelated to this WARN and is unchanged by this round.
+
+### Verification
+
+- `npm run typecheck`: clean (`tsc --noEmit` exit 0).
+- `npx vitest run tests/telegram-project-onboarding.test.ts tests/task-dispatch-runtime-receipts.test.ts`:
+  exit 0, 2 files, **84/84** tests passed (was 55/55 + 27 in the receipts file before this
+  round — this run's exact count for these two files together).
+- `npm test` (full suite), measured on the committed code/test tree (commit `5c2ea0bd`): exit
+  0, **512 files, 8018 tests, all passed** (0 failed). Duration 590.81s. Up from 8010 at
+  `bf401ca7` — the 8 new tests this round (2 for M9b/M9c, 1 for verdict.note, 5 for WARN-3's
+  bidi/zero-width/soft-hyphen classes) account for the difference exactly.
+
+### Mutation table (this round, all executed for real: mutate → run targeted test →
+### confirm red → `git checkout --` → confirm `git diff --stat` empty → next mutation)
+
+| Guard | Mutation | Result | Killed by |
+| --- | --- | --- | --- |
+| `access.squad_id = invites.squad_id` | dropped | RED (1 row claimed, expected 0) | M9b |
+| `access.project_id = invites.project_id` | replaced with `1=1` | RED (1 row claimed, expected 0) | M9c |
+| `note: sanitizeReceiptText(row.note)` | reverted to raw `row.note` passthrough | RED (control chars present, not single line) | "sanitizes verdict.note with the same helper as decided_by_display" |
+| bidi/zero-width/soft-hyphen strip clause | removed (C0/C1 clause kept) | RED × 4 (bidi embedding/override, bidi isolates, zero-width, soft hyphen) | the 4 named WARN-3 tests |
+| same mutation as above | — | GREEN (unaffected, as expected) | "keeps combining marks intact" (negative control, correctly unaffected) |
