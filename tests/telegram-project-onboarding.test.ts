@@ -1,10 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { Hono } from 'hono'
 import {
+  CLAIM_INVITE_SQL,
   createProjectInvite,
   redeemTelegramProjectInvite,
 } from '../src/members/project-invites'
 import { membersApp } from '../src/members'
-import { imApp } from '../src/im'
+import { handleImMessage, imApp } from '../src/im'
+import { requireCapability } from '../src/auth/capability'
 import type { AuthContext, Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
@@ -379,6 +382,219 @@ describe('Telegram project invitation service', () => {
     await expect(createInvite('owner@example.test', { capability: 'owner' })).resolves.toEqual({
       ok: false,
       error: 'cannot_grant_above_own_rank',
+    })
+  })
+
+  // ── P1-1: the coarse org role must never widen past (or substitute for) an
+  // explicit, resolved squad grant — mirroring requireCapability's own
+  // restriction. Each branch uses a DIFFERENT principal from the fixture
+  // inviter above, so none of these can pass by accidentally reusing its
+  // admin grant.
+  describe('P1-1 — squad rank never widens from the coarse role', () => {
+    it('refuses an org admin with resolved-but-empty capabilities and no squad grant', async () => {
+      const adminNoGrant: AuthContext = {
+        userId: 'admin-no-grant-user',
+        email: 'admin-no-grant@example.test',
+        role: 'admin',
+        tenant: TENANT,
+        memberId: 'member-admin-no-grant',
+        capabilities: [],
+      }
+      const result = await createProjectInvite(env, adminNoGrant, {
+        email: 'admin-no-grant-target@example.test',
+        project_id: 'project-active',
+        squad_id: 'squad-participants',
+        capability: 'member',
+        expires_in_seconds: 3600,
+      })
+      expect(result).toEqual({ ok: false, error: 'forbidden' })
+    })
+
+    it('refuses an org owner whose only resolved grant on the squad is narrower than admin', async () => {
+      const ownerNarrowGrant: AuthContext = {
+        userId: 'owner-narrow-user',
+        email: 'owner-narrow@example.test',
+        role: 'owner',
+        tenant: TENANT,
+        memberId: 'member-owner-narrow',
+        capabilities: [{
+          member_id: 'member-owner-narrow',
+          scope_type: 'squad',
+          scope_id: 'squad-participants',
+          capability: 'observer',
+        }],
+      }
+      const result = await createProjectInvite(env, ownerNarrowGrant, {
+        email: 'owner-narrow-target@example.test',
+        project_id: 'project-active',
+        squad_id: 'squad-participants',
+        capability: 'owner',
+        expires_in_seconds: 3600,
+      })
+      // Before the fix this minted an OWNER capability outright. After the fix
+      // the actor's real rank on this squad is 'observer' (1), so this must
+      // refuse — either at the admin floor or the grant ceiling, never ok:true.
+      expect(result.ok).toBe(false)
+      if (!result.ok) {
+        expect(['forbidden', 'cannot_grant_above_own_rank']).toContain(result.error)
+      }
+    })
+
+    it('requireCapability itself still admits a legacy admin role at ORG scope with unresolved capabilities (reference, unchanged by this fix)', async () => {
+      // This pins what requireCapability does TODAY at org scope so the squad-scope
+      // fix above is visibly narrower than, not a copy that drifted from, the rule
+      // it borrows from (src/auth/capability.ts:295-338). Unaffected by the
+      // project-invites.ts change: no squad scope, no memberId resolution.
+      const probe = new Hono<{ Bindings: Env; Variables: { auth: AuthContext } }>()
+      probe.use('*', async (c, next) => {
+        c.set('auth', {
+          userId: 'legacy-admin-user',
+          email: 'legacy-admin@example.test',
+          role: 'admin',
+          tenant: TENANT,
+          // capabilities intentionally left undefined — the pure web-login shape.
+        } as AuthContext)
+        await next()
+      })
+      probe.get('/probe', requireCapability(() => ({ type: 'org', id: null }), 'admin'), (c) => c.json({ ok: true }))
+
+      const res = await probe.fetch(new Request('https://pot.test/probe'), env)
+      expect(res.status).toBe(200)
+    })
+  })
+
+  // ── P1-3: the admin floor at project-invites.ts:254 is the SOLE gate for
+  // create — every prior test used the admin fixture inviter, so a deletion of
+  // that line was invisible. A real (narrower) squad grant must still refuse.
+  it('P1-3 — refuses invite creation from an observer holding a real, narrower squad grant', async () => {
+    const observerAuth: AuthContext = {
+      userId: 'observer-user',
+      email: 'observer@example.test',
+      role: 'member',
+      tenant: TENANT,
+      memberId: 'member-observer',
+      capabilities: [{
+        member_id: 'member-observer',
+        scope_type: 'squad',
+        scope_id: 'squad-participants',
+        capability: 'observer',
+      }],
+    }
+    // Request the SAME capability the actor already holds — with the admin
+    // floor removed, this would otherwise fall straight through the "cannot
+    // grant above own rank" ceiling too (observer <= observer) and succeed.
+    const result = await createProjectInvite(env, observerAuth, {
+      email: 'observer-target@example.test',
+      project_id: 'project-active',
+      squad_id: 'squad-participants',
+      capability: 'observer',
+      expires_in_seconds: 3600,
+    })
+    expect(result).toEqual({ ok: false, error: 'forbidden' })
+  })
+
+  // ── P1-2: the atomic single-use claim fence, driven directly through the
+  // exact exported statement. tests/helpers/sqlite-d1.ts is synchronous
+  // node:sqlite, so redeemTelegramProjectInvite's own JS pre-check always
+  // agrees with a same-process, non-racing caller — no test that goes through
+  // the whole function can ever see this WHERE clause refuse on its own. Only
+  // driving CLAIM_INVITE_SQL directly, with a row state the pre-check never
+  // saw, proves each guard independently.
+  describe('P1-2 — CLAIM_INVITE_SQL fences single-use, expiry, and receipt binding', () => {
+    const FENCE_TENANT = 'tenant-claim-fence'
+    const FENCE_INVITE_ID = 'fence-invite'
+    const FENCE_PAIRING_HASH = 'c'.repeat(64)
+    const FENCE_REQUEST_DIGEST = 'd'.repeat(64)
+    const FENCE_TELEGRAM_USER = 'fence-telegram-user'
+    const FENCE_UPDATE_ID = 'fence-update'
+    const FENCE_EMAIL = 'fence@example.test'
+    const FENCE_CAPABILITY = 'member'
+    let fenceHarness: SqliteD1Harness
+    let fenceEnv: Env
+
+    beforeEach(() => {
+      fenceHarness = createSqliteD1()
+      applyAllMigrations(fenceHarness.sqlite)
+      fenceEnv = { DB: fenceHarness.db, TENANT_SLUG: FENCE_TENANT } as Env
+      fenceHarness.sqlite.exec(`
+        INSERT INTO departments (id, slug, name) VALUES ('dept-fence', 'dept-fence', 'Dept Fence');
+        INSERT INTO squads (id, department_id, slug, name)
+        VALUES ('squad-fence', 'dept-fence', 'squad-fence', 'Squad Fence');
+        INSERT INTO projects (id, slug, name, status)
+        VALUES ('project-fence', 'project-fence', 'Project Fence', 'active');
+        INSERT INTO project_squad_access (project_id, squad_id, access_level)
+        VALUES ('project-fence', 'squad-fence', 'write');
+      `)
+    })
+
+    afterEach(() => {
+      fenceHarness.close()
+    })
+
+    function insertFenceInvite(overrides: Partial<{ acceptedAt: string | null; expiresAt: string }> = {}): void {
+      fenceHarness.sqlite.prepare(`
+        INSERT INTO invites (
+          id, email, capability, invited_by, project_id, squad_id,
+          pairing_hash, pairing_expires_at, accepted_at
+        ) VALUES (?, ?, ?, 'fence-inviter', 'project-fence', 'squad-fence', ?, ?, ?)
+      `).run(
+        FENCE_INVITE_ID,
+        FENCE_EMAIL,
+        FENCE_CAPABILITY,
+        FENCE_PAIRING_HASH,
+        overrides.expiresAt ?? new Date(Date.now() + 3_600_000).toISOString(),
+        overrides.acceptedAt ?? null,
+      )
+    }
+
+    function insertFenceReceipt(state = 'processing'): void {
+      fenceHarness.sqlite.prepare(`
+        INSERT INTO telegram_webhook_receipts (
+          tenant, update_id, telegram_user_id, request_digest, state, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+      `).run(FENCE_TENANT, FENCE_UPDATE_ID, FENCE_TELEGRAM_USER, FENCE_REQUEST_DIGEST, state, new Date().toISOString())
+    }
+
+    async function runClaim(now = new Date().toISOString()): Promise<number> {
+      const result = await fenceEnv.DB.prepare(CLAIM_INVITE_SQL).bind(
+        new Date().toISOString(),
+        FENCE_INVITE_ID,
+        FENCE_PAIRING_HASH,
+        'project-fence',
+        'squad-fence',
+        FENCE_CAPABILITY,
+        FENCE_EMAIL,
+        now,
+        FENCE_TENANT,
+        FENCE_UPDATE_ID,
+        FENCE_REQUEST_DIGEST,
+        FENCE_TELEGRAM_USER,
+      ).run()
+      return result.meta?.changes ?? 0
+    }
+
+    it('claims exactly one row when every fence condition holds (baseline)', async () => {
+      insertFenceInvite()
+      insertFenceReceipt('processing')
+      expect(await runClaim()).toBe(1)
+    })
+
+    it('M5 — refuses to claim an invite that is already accepted', async () => {
+      insertFenceInvite({ acceptedAt: '2020-01-01T00:00:00.000Z' })
+      insertFenceReceipt('processing')
+      expect(await runClaim()).toBe(0)
+    })
+
+    it('M6 — refuses to claim an invite past its pairing expiry', async () => {
+      insertFenceInvite({ expiresAt: new Date(Date.now() - 3_600_000).toISOString() })
+      insertFenceReceipt('processing')
+      expect(await runClaim()).toBe(0)
+    })
+
+    it('M7 — refuses to claim without a matching processing receipt', async () => {
+      insertFenceInvite()
+      insertFenceReceipt('completed')
+      expect(await runClaim()).toBe(0)
     })
   })
 
@@ -910,5 +1126,43 @@ describe('Telegram project invitation service', () => {
     expect(harness.sqlite.prepare(`
       SELECT COUNT(*) AS count FROM task_verdicts WHERE task_id = 'other-review'
     `).get()).toEqual({ count: 0 })
+  })
+
+  // ── P2: a distinct chat reply per redemption failure is a weak enumeration
+  // oracle over a secret pairing code. Two different underlying causes must
+  // produce the IDENTICAL generic chat text.
+  it('P2 — never echoes the raw redemption error enum into the Telegram chat reply', async () => {
+    const expired = await createInvite('join-error-expired@example.test')
+    expect(expired.ok).toBe(true)
+    if (!expired.ok) return
+    harness.sqlite.prepare('UPDATE invites SET pairing_expires_at = ? WHERE id = ?')
+      .run('2000-01-01T00:00:00.000Z', expired.value.invite.id)
+    reserveUpdate('update-join-expired', VALID_REQUEST_DIGEST, '9099001')
+
+    const expiredReply = await handleImMessage(env, '9099001', `/start ${expired.value.pairing_code}`, {
+      telegram: { update_id: 'update-join-expired', telegram_user_id: '9099001', request_digest: VALID_REQUEST_DIGEST },
+    })
+
+    const conflicted = await createInvite('join-error-conflict@example.test')
+    expect(conflicted.ok).toBe(true)
+    if (!conflicted.ok) return
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, telegram_chat_id, status, tenant)
+      VALUES ('member-join-conflict', 'join-conflict-existing@example.test', 'Existing', '9099002', 'active', '${TENANT}');
+    `)
+    reserveUpdate('update-join-conflict', VALID_REQUEST_DIGEST, '9099002')
+
+    const conflictReply = await handleImMessage(env, '9099002', `/start ${conflicted.value.pairing_code}`, {
+      telegram: { update_id: 'update-join-conflict', telegram_user_id: '9099002', request_digest: VALID_REQUEST_DIGEST },
+    })
+
+    const GENERIC = 'Could not join. Ask an admin for a new invitation.'
+    expect(expiredReply).toBe(GENERIC)
+    expect(conflictReply).toBe(GENERIC)
+    for (const reply of [expiredReply, conflictReply]) {
+      expect(reply).not.toMatch(
+        /invalid_or_expired_pairing_code|ambiguous_pairing_code|telegram_identity_conflict|member_already_exists|redemption_failed|update_receipt_invalid/,
+      )
+    }
   })
 })

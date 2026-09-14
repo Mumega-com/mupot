@@ -325,7 +325,12 @@ export async function handleImMessage(
     const result = await redeemTelegramProjectInvite(env, {
       ...options.telegram, pairing_code: intent.code, display_name: 'Telegram member',
     })
-    return result.ok ? joinedReply(result.value.project_id) : `Could not join: ${result.error}.`
+    // P2: never echo the raw error enum into the chat — `invalid_or_expired_pairing_code`
+    // vs `ambiguous_pairing_code` vs `telegram_identity_conflict` vs `member_already_exists`
+    // is a weak enumeration oracle over a secret pairing code. The distinguishing detail
+    // (`result.error`) stays in this function's return value / caller-side receipts and
+    // observability — never in the text that reaches the requester.
+    return result.ok ? joinedReply(result.value.project_id) : 'Could not join. Ask an admin for a new invitation.'
   }
 
   // 1) Identity: chat_id → member. No member → polite refusal, NO action taken.

@@ -5,7 +5,16 @@ import { parseFlightMetaV1 } from '../src/flight/meta'
 import { canonicalJsonDigest } from '../src/lib/canonical-json'
 import { leaseAgentInbox } from '../src/agents/messages'
 import { loadProjectSituation } from '../src/projects/situation'
-import { answerRoutineRun, cancelRoutineRun, executeRoutineAction, getRoutinePendingQuestion, submitRoutineProposal } from '../src/routines/actions'
+import {
+  answerRoutineRun,
+  cancelRoutineRun,
+  executeRoutineAction,
+  getRoutinePendingQuestion,
+  loadHumanAction,
+  loadRun,
+  notifyHumanWait,
+  submitRoutineProposal,
+} from '../src/routines/actions'
 import type { RoutinePrincipal } from '../src/routines/access'
 import type { Env, Project } from '../src/types'
 import { makeReadyRoutineFixture, type ReadyRoutineFixture } from './helpers/routine-actions'
@@ -483,6 +492,85 @@ describe('Routine proposal submission and governed actions', () => {
       status: 'waiting',
     })
     expect(row(fixture, 'SELECT COUNT(*) AS count FROM agent_messages')).toEqual({ count: 0 })
+  })
+
+  // ── P1-4: the insert-time recipient fence (src/agents/messages.ts:412-421)
+  // pins recipient.status='active' independent of the project-membership JOIN
+  // above — a deactivated agent must never be notified even while its
+  // membership row is untouched.
+  it('fences notification when the assigned agent is deactivated after the wait commits', async () => {
+    fixture = await makeReadyRoutineFixture('execute_internal')
+    const proposal = fixture.proposal({
+      key: 'deactivated-before-notify', kind: 'ask_human',
+      input: { question: 'Which receipt?', choices: ['A', 'B'], references: [] },
+    })
+    const env = observeHumanWaitMessage(fixture.env, () => {
+      fixture!.harness.sqlite.prepare(
+        "UPDATE agents SET status = 'suspended' WHERE id = 'agent-1'",
+      ).run()
+    })
+
+    await expect(submitRoutineProposal(env, fixture.principal, proposal)).resolves.toMatchObject({
+      ok: true, status: 'waiting', reason: 'answer', notification_pending: true,
+    })
+    expect(row(fixture, 'SELECT COUNT(*) AS count FROM agent_messages')).toEqual({ count: 0 })
+  })
+
+  // ── P1-4: the insert-time recipient fence also pins project.status='active'
+  // — an archived project must never be notified even while the agent stays
+  // active and its membership row is untouched.
+  it('fences notification when the project is archived after the wait commits', async () => {
+    fixture = await makeReadyRoutineFixture('execute_internal')
+    const proposal = fixture.proposal({
+      key: 'archived-before-notify', kind: 'ask_human',
+      input: { question: 'Which receipt?', choices: ['A', 'B'], references: [] },
+    })
+    const env = observeHumanWaitMessage(fixture.env, () => {
+      fixture!.harness.sqlite.prepare(
+        "UPDATE projects SET status = 'archived' WHERE id = 'project-1'",
+      ).run()
+    })
+
+    await expect(submitRoutineProposal(env, fixture.principal, proposal)).resolves.toMatchObject({
+      ok: true, status: 'waiting', reason: 'answer', notification_pending: true,
+    })
+    expect(row(fixture, 'SELECT COUNT(*) AS count FROM agent_messages')).toEqual({ count: 0 })
+  })
+
+  // ── P1-4: `if (!run.assigned_agent_id) return true` in notifyHumanWait
+  // (src/routines/actions.ts). Every reachable public entry point
+  // (submitRoutineProposal) requires the acting agent principal to equal
+  // run.assigned_agent_id BEFORE it ever reaches notifyHumanWait, so a null
+  // assignee can only be exercised by driving notifyHumanWait directly with a
+  // real RunContext/ActionRow (fetched via the exported loadRun/
+  // loadHumanAction — not a re-derived copy of their join). A run with no
+  // assigned agent must never attempt delivery, and must report the miss
+  // honestly rather than claiming a notification went out.
+  it('reports no delivery honestly when the run has no assigned agent', async () => {
+    fixture = await makeReadyRoutineFixture('execute_internal')
+    const proposal = fixture.proposal({
+      key: 'no-assignee-notify', kind: 'ask_human',
+      input: { question: 'Which receipt?', choices: ['A', 'B'], references: [] },
+    })
+    await expect(submitRoutineProposal(fixture.env, fixture.principal, proposal)).resolves.toMatchObject({
+      ok: true, status: 'waiting', reason: 'answer', notification_pending: false,
+    })
+    expect(row(fixture, 'SELECT COUNT(*) AS count FROM agent_messages')).toEqual({ count: 1 })
+
+    fixture.harness.sqlite.prepare(
+      "UPDATE routine_runs SET assigned_agent_id = NULL WHERE id = 'run-1'",
+    ).run()
+    const run = await loadRun(fixture.env, 'run-1')
+    const action = await loadHumanAction(fixture.env, 'run-1')
+    expect(run?.assigned_agent_id).toBeNull()
+    expect(action?.status).toBe('waiting')
+
+    const pending = await notifyHumanWait(fixture.env, run!, action!, 'answer')
+
+    expect(pending).toBe(true)
+    // Still exactly the one message from the earlier, normally-assigned notify —
+    // the null-assignee call above must not have attempted a second insert.
+    expect(row(fixture, 'SELECT COUNT(*) AS count FROM agent_messages')).toEqual({ count: 1 })
   })
 
   it('keeps the stable human-wait request ID valid for maximum-length action keys', async () => {

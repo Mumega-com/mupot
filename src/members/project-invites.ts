@@ -135,22 +135,48 @@ function actorRoleRank(auth: AuthContext): number {
   return 0
 }
 
+/**
+ * The actor's effective capability rank on a squad scope — carrying exactly
+ * requireCapability's restrictions (src/auth/capability.ts:295-338), NOT a
+ * looser re-derivation of them.
+ *
+ * P1-1 fix: the prior version computed `actorRoleRank(auth)` unconditionally
+ * and then `Math.max`ed it against any real grant, so a coarse org owner/admin
+ * role always floored (and could WIDEN past) an explicit narrower squad grant.
+ * requireCapability never does that for a non-org scope: its legacy-role
+ * escape (capabilities === undefined) exists ONLY for org-scope checks, and
+ * once a member's grants are resolved (even to []) the coarse role plays no
+ * further part. So here: an explicit grant on this scope (via hasCapability —
+ * the same predicate requireCapability calls, reused rather than
+ * re-implemented) always wins outright; the coarse role is consulted ONLY as
+ * a bootstrap-owner floor when this principal's capabilities were NEVER
+ * resolved at all (auth.capabilities === undefined) and no grant covers this
+ * squad — never as an addition on top of a real, narrower grant.
+ */
 async function actorRankOnSquad(
   env: Env,
   auth: AuthContext,
   squadId: string,
   departmentId: string,
 ): Promise<number> {
-  let max = actorRoleRank(auth)
-  if (!auth.memberId) return max
+  if (!auth.memberId) {
+    // No member identity: fine-grained RBAC does not apply. Fall back to the
+    // coarse role only for a principal that never had capabilities resolved
+    // at all (a pure legacy web login) — same condition requireCapability
+    // gates its own legacy-role escape on.
+    return auth.capabilities === undefined ? actorRoleRank(auth) : 0
+  }
   const grants: CapabilityGrant[] = auth.capabilities ?? await resolveCapabilities(env, auth.memberId)
   for (const capability of CAPABILITIES) {
     if (hasCapability(grants, 'squad', squadId, capability, departmentId)) {
-      max = Math.max(max, capabilityRank(capability))
-      break
+      return capabilityRank(capability)
     }
   }
-  return max
+  // No grant resolves on this exact scope. The coarse role is a floor ONLY
+  // when capabilities were never resolved for this principal at all — never
+  // when they were resolved (even to an empty array), which is itself the
+  // real "no standing here" answer and must not be overridden upward.
+  return auth.capabilities === undefined ? actorRoleRank(auth) : 0
 }
 
 function base64Url(bytes: Uint8Array): string {
@@ -176,6 +202,48 @@ function isUniqueViolation(error: unknown): boolean {
 function uniqueConstraintColumn(error: unknown, column: string): boolean {
   return error instanceof Error && new RegExp(`UNIQUE constraint failed: .*${column}`, 'i').test(error.message)
 }
+
+/**
+ * The atomic single-use claim fence, extracted to a named constant so a test
+ * can drive this EXACT statement directly (P1-2). tests/helpers/sqlite-d1.ts
+ * is synchronous `node:sqlite`, so no test that goes through
+ * redeemTelegramProjectInvite's own JS pre-check (line ~368, which answers
+ * first in every sequential run) can ever exercise this WHERE clause failing
+ * on its own — the pre-check always agrees with a same-process, non-racing
+ * caller. Pinning the statement itself, independent of that pre-check, is the
+ * only way to prove single-use (`accepted_at IS NULL`), expiry
+ * (`pairing_expires_at > ?8`), and the receipt-processing binding (the final
+ * EXISTS) each still hold under a real concurrent claim.
+ */
+export const CLAIM_INVITE_SQL = `
+  UPDATE invites
+     SET accepted_at = ?1
+   WHERE id = ?2
+     AND pairing_hash = ?3
+     AND project_id = ?4
+     AND squad_id = ?5
+     AND capability = ?6
+     AND email = ?7
+     AND accepted_at IS NULL
+     AND pairing_expires_at > ?8
+     AND EXISTS (
+       SELECT 1 FROM projects project
+        WHERE project.id = invites.project_id AND project.status = 'active'
+     )
+     AND EXISTS (
+       SELECT 1 FROM project_squad_access access
+        WHERE access.project_id = invites.project_id
+          AND access.squad_id = invites.squad_id
+     )
+     AND EXISTS (
+       SELECT 1 FROM telegram_webhook_receipts receipt
+        WHERE receipt.tenant = ?9
+          AND receipt.update_id = ?10
+          AND lower(receipt.request_digest) = lower(?11)
+          AND receipt.telegram_user_id = ?12
+          AND receipt.state = 'processing'
+     )
+`
 
 function claimTimestamp(): string {
   const iso = new Date().toISOString()
@@ -382,35 +450,7 @@ export async function redeemTelegramProjectInvite(
 
   try {
     const results = await env.DB.batch([
-      env.DB.prepare(
-        `UPDATE invites
-            SET accepted_at = ?1
-          WHERE id = ?2
-            AND pairing_hash = ?3
-            AND project_id = ?4
-            AND squad_id = ?5
-            AND capability = ?6
-            AND email = ?7
-            AND accepted_at IS NULL
-            AND pairing_expires_at > ?8
-            AND EXISTS (
-              SELECT 1 FROM projects project
-               WHERE project.id = invites.project_id AND project.status = 'active'
-            )
-            AND EXISTS (
-              SELECT 1 FROM project_squad_access access
-               WHERE access.project_id = invites.project_id
-                 AND access.squad_id = invites.squad_id
-            )
-            AND EXISTS (
-              SELECT 1 FROM telegram_webhook_receipts receipt
-               WHERE receipt.tenant = ?9
-                 AND receipt.update_id = ?10
-                 AND lower(receipt.request_digest) = lower(?11)
-                 AND receipt.telegram_user_id = ?12
-                 AND receipt.state = 'processing'
-            )`,
-      ).bind(
+      env.DB.prepare(CLAIM_INVITE_SQL).bind(
         claimedAt,
         invite.id,
         pairingHash,

@@ -224,7 +224,13 @@ function projectFrom(run: RunContext): Project {
   }
 }
 
-async function loadRun(env: Env, runId: string): Promise<RunContext | null> {
+// Exported for P1-4 unit-level pinning of notifyHumanWait's null-assignee
+// branch (`if (!run.assigned_agent_id) return true`): every reachable public
+// entry point (submitRoutineProposal) requires the acting agent principal to
+// equal run.assigned_agent_id before it ever gets this far, so a null
+// assignee can only be exercised by driving notifyHumanWait directly with a
+// real, correctly-shaped RunContext/ActionRow — not by re-deriving the join.
+export async function loadRun(env: Env, runId: string): Promise<RunContext | null> {
   return env.DB.prepare(
     `SELECT rr.id, rr.tenant, rr.project_id, rr.routine_id, rr.routine_revision,
             rr.policy_json, rr.status, rr.waiting_reason, rr.assigned_agent_id,
@@ -252,7 +258,7 @@ async function loadAction(env: Env, runId: string, actionKey: string): Promise<A
   ).bind(runId, actionKey, env.TENANT_SLUG).first<ActionRow>()
 }
 
-async function loadHumanAction(env: Env, runId: string): Promise<ActionRow | null> {
+export async function loadHumanAction(env: Env, runId: string): Promise<ActionRow | null> {
   return env.DB.prepare(
     `SELECT id, tenant, project_id, run_id, action_key, kind, input_json,
             validation_status, gate_status, status, source_type, source_id,
@@ -361,7 +367,7 @@ function humanWaitBody(
   throw new Error('human-wait attribution exceeds message limit')
 }
 
-async function notifyHumanWait(
+export async function notifyHumanWait(
   env: Env,
   run: RunContext,
   action: ActionRow,
