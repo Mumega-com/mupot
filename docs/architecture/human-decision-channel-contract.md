@@ -56,18 +56,36 @@ row. A conjunct with no test proving it is load-bearing is not a fence, it is de
 
 ### (b) Ingress authority
 
-The transport boundary is a **shared secret, verified before any parsing of the body**:
+The transport boundary is a **shared secret, verified before the body is JSON-parsed**
+— not before the raw bytes are read at all. The actual order (`src/im/index.ts:899-918`)
+is: (1) size-cap the declared and actual byte length, (2) UTF-8-decode with
+`fatal: true`, (3) *then* compare the secret, (4) `JSON.parse` only after the secret
+passes. Rejecting an oversized or malformed-encoding body cheaply, before spending a
+secret comparison on it, is deliberate — but "verified before any parsing" overstated
+it: the size cap and UTF-8 decode are themselves a form of parsing the body, and both
+run before the secret check, not after.
 
 - `IM_WEBHOOK_SECRET` compared with `timingSafeEqual`
-  (`src/im/index.ts:911-916`, `src/lib/crypto.ts`), never a plain `===`.
+  (`src/im/index.ts:914-916`, `src/lib/crypto.ts`), never a plain `===`.
 - Unconfigured secret seals the endpoint closed with `503 webhook_not_configured`
   (`src/im/index.ts:911-913`) — an absent secret must never default to "accept
   everything," it must default to "accept nothing."
 - Mismatched or missing secret returns `401` (`src/im/index.ts:914-917`) before the body
-  is even parsed as JSON.
+  is parsed as JSON, but after the size cap and UTF-8 decode above.
 - Body size is capped before decode (`IM_WEBHOOK_MAX_BODY_BYTES = 64 * 1024`,
   `src/im/index.ts:66,900-905`) and UTF-8-validated with `fatal: true`
   (`readCappedBody`, `src/im/index.ts:72-82`).
+- **Duplicate predicate, not yet unified:** `src/channels/adapters/telegram.ts`'s
+  `ChannelAdapter.verify` (`:44-49`) implements the identical
+  secret-header-comparison logic against the same
+  `X-Telegram-Bot-Api-Secret-Token` header name (`src/im/index.ts:914`,
+  `src/channels/adapters/telegram.ts:49`), and is live in production via
+  `/channels/telegram/...` (`src/channels/index.ts:776`, mounted alongside
+  `/im/webhook` in `src/index.ts:110,113`) — this is not a dead duplicate, both
+  paths are reachable today. Each copy has its own test suite
+  (`tests/im-webhook.test.ts` vs `tests/telegram-adapter.test.ts`), so a fix to one
+  does not provably fix the other. Filed as a one-line issue on mupot
+  (two-copies-of-one-predicate class) rather than folded silently into this doc.
 
 ### (c) Replay
 
@@ -112,11 +130,24 @@ time**, never a service or agent principal:
 Known behavior change, not a bug: because `memberAuth` hardcodes `role: 'member'`, **no
 principal can approve `gate:agent-self-completion` over this channel**, on any basis —
 role or capability grant row — because `evaluateVerdictGates`'s check for that one gate
-(`legacyOwnerAdmin(auth)`, `src/tasks/index.ts:93`) tests only the coarse role, which is
-frozen at `'member'` here. This was verified by execution: probes with an org-scope owner
-grant row and, separately, an org-scope admin grant row were both refused. This makes the
-channel strictly narrower than an authenticated web/HTTP session for that one gate, and
-brings it to parity with MCP (`auth.role` is likewise always `'member'` there).
+(`legacyOwnerAdmin(auth)`, `src/tasks/index.ts:93,1425-1433`) tests only the coarse role
+(`role === 'owner' || role === 'admin'`), which is frozen at `'member'` here and never
+reads `AuthContext.capabilities` for this one gate at all. Committed, not manual,
+evidence: `tests/im-verdict-gates.test.ts:98` grants a **member**-type
+`gate:agent-self-completion` capability row directly (the exact grant the check is
+supposed to skip for this gate) and the approve is still refused
+(`expect(reply).toMatch(/permission/i)`); `tests/im-verdict-gates.test.ts:114` grants an
+**org-scope `admin`** capability row and is likewise refused
+(`expect(reply).toMatch(/permission/)`). Correction to an earlier draft of this
+document: there is no committed test exercising an org-scope **`owner`** capability row
+specifically for this gate over IM — only `admin` (capability) and a direct `member`-type
+gate grant are covered; "owner and admin were both refused" was an overstatement not
+backed by a citation. The two committed cases above are sufficient to prove the clause
+(the check reads only `auth.role`, so a capability row's *value* — member, admin, or
+owner — cannot matter), but a dedicated owner-capability test would close the gap
+precisely rather than by inference. This makes the channel strictly narrower than an
+authenticated web/HTTP session for that one gate, and brings it to parity with MCP
+(`auth.role` is likewise always `'member'` there).
 
 ### (e) Fences
 
@@ -185,8 +216,16 @@ What is **adapter-thin** — replace, do not redesign:
   whatever fields the new transport supplies as its own "this exact event" identity
   (Slack: `event_id`; email: `Message-Id` + a content hash; SMS: provider message SID).
 - The gate evaluator (`evaluateVerdictGates`) and verdict writer (`writeVerdict`) are
-  already channel-agnostic — a second channel calls the SAME functions `src/im/index.ts`
-  calls, building its own `AuthContext` the same way. Do not fork a second gate check.
+  already channel-agnostic — a second channel must call the SAME functions
+  `src/im/index.ts` calls, building its own `AuthContext` **via the same helper
+  path** (`memberAuth`/`memberForChat`, `src/im/index.ts:93-105,356,400-403`), not a
+  channel-local re-derivation. Do not fork a second gate check. Building it "the same
+  way" also means **inheriting the same coarse-role limitation**: `memberAuth` hardcodes
+  `role: 'member'`, so any channel that reuses this helper unmodified reproduces the
+  identical `gate:agent-self-completion` gap documented in (d) above and (g) below —
+  that gap is not something a second channel can "avoid" by construction; it is fixed,
+  if at all, by changing the shared helper (or the gate check), not by each channel
+  papering over it separately.
 - The fence discipline (e) generalizes directly: "private conversation," "sender is the
   channel-native immutable id," "no forwarded/relayed content" all have direct Slack
   (DM-only, `user.id`, no forwarded-message block), WhatsApp, and SMS (no equivalent of
@@ -196,13 +235,41 @@ What **must change**, not merely adapt:
 
 - **Schema shape.** `members.telegram_chat_id` and `telegram_webhook_receipts` are
   Telegram-specific column/table names carrying Telegram-specific semantics (immutable
-  numeric chat id). A second channel needs either its own `members.<channel>_id` column
+  numeric chat id). This is not a stylistic nit — it is load-bearing in the invite path
+  itself: `CLAIM_INVITE_SQL` (`src/members/project-invites.ts:224-252`) **hardcodes** an
+  `EXISTS (SELECT 1 FROM telegram_webhook_receipts receipt WHERE ... receipt.telegram_user_id
+  = ?12 ...)` conjunct (`:245-250`) as one of the atomic claim's fence conditions — a
+  second channel cannot claim an invite through this exact statement without either its
+  own copy of this table+conjunct or a rewrite of the statement itself. The whole module
+  is Telegram-typed end to end, not just at the edges: the redemption input type names
+  the field `telegram_user_id` (`src/members/project-invites.ts:67`), the error code is
+  `invalid_telegram_user_id` (`:82`), and the runtime check re-asserts the same field
+  name (`:119`). A second channel needs either its own `members.<channel>_id` column
   and its own receipts table (fast, but repeats the `telegram_` prefix pattern per
   channel and needs a repeated migration + repeated fence logic per channel), or a
   refactor to a generic `member_channel_identities (member_id, channel, external_id)` +
-  `channel_webhook_receipts (tenant, channel, update_id, ...)` shape before a second
-  channel ships. Prefer the generic shape once a second channel is real — the
-  `telegram_` prefix was the right call for a first instance, not a pattern to repeat.
+  `channel_webhook_receipts (tenant, channel, update_id, ...)` shape — including a
+  rewrite of `CLAIM_INVITE_SQL`'s receipt conjunct — before a second channel ships.
+  Prefer the generic shape once a second channel is real — the `telegram_` prefix was
+  the right call for a first instance, not a pattern to repeat.
+- **Further Telegram-typed surfaces not yet listed above** (found while re-auditing for
+  this revision; likely incomplete, not a closed inventory): the dashboard renders IM
+  reachability by testing `m.telegram_chat_id` directly in two places
+  (`src/dashboard/index.ts:6115,6324`, `if (m.telegram_chat_id) chSet.add('im')`);
+  `src/dashboard/health.ts:537` names `IM_WEBHOOK_SECRET` specifically in the
+  operational health check's missing-secrets list; `src/mcp/index.ts:414` selects
+  `m.telegram_chat_id AS telegram_chat_id` in a member-lookup query; the generated
+  migration chain embeds the `telegram_webhook_receipts` table's Telegram-typed DDL
+  verbatim (`src/pots/schema-chain.generated.ts:2813`); and the secret header name
+  `X-Telegram-Bot-Api-Secret-Token` is hardcoded at both live verify sites
+  (`src/im/index.ts:914`, `src/channels/adapters/telegram.ts:49` — see the duplicate-
+  predicate note under (b) above). None of these block a second channel from being
+  built alongside Telegram, but each is a place a second channel's own identity will
+  need its own equivalent, not a shared read of the Telegram-named field. The
+  `ConnectionChannel` union itself is already channel-generic
+  (`'workspace' | 'im' | 'dashboard' | 'directory'`, `src/types.ts:577`, consumed at
+  `AuthContext.channel?: ConnectionChannel`, `:524`) — `'im'` is the channel-agnostic
+  tag; it is the *fields feeding it* above that are Telegram-specific.
 - **Identity extraction.** Telegram's `message.from.id === message.chat.id` private-DM
   check is Telegram's specific proof of "this is the account holder in their own private
   conversation." Each channel needs its own equivalent proof, not a generic transplant of
@@ -220,11 +287,42 @@ What **must change**, not merely adapt:
   own honest answer to "can I prove this wasn't relayed by someone else," which may be
   weaker than Telegram's and must be documented as such, not silently assumed equivalent.
 
+## Evidence discipline
+
+Every behavioural claim in this document, `agent-harness-contract.md`, and
+`decision-channel-conformance.md` carries either a **committed test path:line** or a
+**receipt id** (a durable, independently checkable record — a migration hash, an
+execution receipt, a PR head SHA someone else can check out and re-run) — never a bare
+"this was verified by execution" with no artifact attached. A manual probe, run once by
+hand and not committed as a test, is not evidence for this document: nobody reading it
+later can tell which ref it ran against, and nothing re-runs it when the code
+underneath changes. Round 2 of this PR (Athena gate, 2026-09-14) found exactly this
+shape of defect in the (d) Principal section above — a citation-free "probes ... were
+both refused" sentence that, on inspection, both overstated what was actually tested
+(an "owner" case that has no test) and pointed to nothing a reader could check.
+
+The property this enforces: **a claim in a contract or evidence doc must not be
+falsifiable by anything except editing the document itself.** State the property, then
+the exact test (or receipt id) and the ref/SHA it was read at. A later push, merge, or
+deploy can then only do one of two things to that claim — leave the cited test passing
+(the claim still holds) or break it (CI says so, not this document silently going
+stale). A claim with no citation, or a citation to something that turns out not to test
+what the prose says, is falsifiable by nothing at all except someone re-reading the
+document and doubting it — which is what round 2 was.
+
 ## Sources read
 
 - `docs/architecture/mupot-core.md` (mupot `main` @ `49a344aa`)
 - `docs/operations/telegram-project-onboarding.md` (same ref)
 - `src/im/index.ts`, `src/members/project-invites.ts`, `src/routines/actions.ts` (same ref)
-- `src/tasks/index.ts:93,1417` (`legacyOwnerAdmin`, `evaluateVerdictGates`; same ref)
+- `src/tasks/index.ts:85-93,1417-1433` (`legacyOwnerAdmin`, `evaluateVerdictGates`; same ref)
+- `tests/im-verdict-gates.test.ts:89-143` (round 2, re-read line by line against the
+  claim it backs); `src/channels/index.ts:776`, `src/channels/adapters/telegram.ts:44-49`,
+  `src/index.ts:110,113` (round 2, duplicate-predicate finding)
+- `src/dashboard/index.ts:6110-6120,6320-6330`, `src/dashboard/health.ts:530-542`,
+  `src/mcp/index.ts:408-420`, `src/pots/schema-chain.generated.ts:2813`,
+  `src/types.ts:520-524,577` (round 2, second-channel checklist omissions)
 - mupot PR #1407 gate history (Kasra AMBER fix, Athena addendum A-H, two adversarial
   re-gates) — read via `mcp__mupot__recall`, not re-fetched from GitHub for this doc
+- mupot PR #1410 round 1 gate comment (Athena, head `aa6e0a99`, 2026-09-14) — the
+  findings this revision fixes

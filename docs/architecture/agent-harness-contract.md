@@ -10,9 +10,22 @@ work, delivers text to a human, and sends to peers. Mupot's own `docs/runtime-ad
 (mupot `main` @ `49a344aa`) defines the identity/attach/messaging surface every runtime must
 use; this document names the properties a harness must hold **on top of** that surface to
 be safe to run unattended. The Hermes/mupot-plugin integration
-(`Mumega-com/mupot-plugin` @ `6c86c2b0`, PR #6 `kasra/native-receive-telegram-20260913`,
-open and unmerged as of that commit) is the first harness this was proven against, across five adversarial
-gate rounds. Per Hadi (2026-09-14): the method generalizes past this one harness.
+(`Mumega-com/mupot-plugin` @ `6c86c2b0`, PR #6 `kasra/native-receive-telegram-20260913`)
+is the first harness this was proven against, across five adversarial gate rounds. "Open
+and unmerged" is a PR-review state, not a property of the commit `6c86c2b0` itself — this
+document cites that commit's tree directly and does not depend on the PR's merge status.
+Per Hadi (2026-09-14): the method generalizes past this one harness — see the
+Second-harness checklist below.
+
+Every reference to **Hermes** (the host agent runtime the plugin runs inside, a separate
+repository this doc does not have access to and has not independently verified) is cited
+by **symbol**, not by line number, and pinned to one revision named once: the plugin's
+own CI-pinned Hermes ref, `233757037df1f03f9fe1cfddc097acd5ad7f7510`
+(`Mumega-com/mupot-plugin@6c86c2b0`, `.github/workflows/test.yml:34`). A Hermes line
+number is a release-truth violation the moment Hermes's own history moves; a Hermes
+symbol at a pinned rev is not. Where the plugin's own comments do not name a Hermes
+symbol precisely (e.g. the file-level behavior of `gateway/run_inbound.py`), this
+document says so rather than inventing one.
 
 ## The properties
 
@@ -24,7 +37,7 @@ gate rounds. Per Hadi (2026-09-14): the method generalizes past this one harness
   "must not trust local config as proof of identity."
 - A harness must never let a human's own web/MCP session credential leak into the same
   process that also carries the agent's bearer — see the harness/human separation property
-  (f) below; they are the same underlying rule applied to two different failure directions.
+  (g) below; they are the same underlying rule applied to two different failure directions.
 
 ### (b) Lease/ack: attempt-bound, consume-once, no ACK without delivery custody
 
@@ -40,18 +53,19 @@ gate rounds. Per Hadi (2026-09-14): the method generalizes past this one harness
   (`docs/operations/telegram-project-onboarding.md`, "attempt-v3 custody chain").
 - Consequence for the harness side: **never ACK before the work is durably committed.** The
   runtime-adapter contract states this directly for the fleet daemon path
-  (`runtime-adapter-contract.md` "Agent Messaging"): "persist each message durably before
-  exit 0; invoke a per-agent runtime command only after persistence; exit non-zero when the
-  runtime did not accept the batch, leaving messages unread for the next tick." A harness
-  that ACKs on receipt and processes afterward can lose work on a crash between the two.
+  (`runtime-adapter-contract.md` "Agent Messaging" (`:252`), `:292-295`), verbatim: "persists each
+  message durably before exit 0", "invokes a per-agent runtime command only after
+  persistence", "exits non-zero when the runtime did not accept the batch, leaving
+  messages unread for the next daemon tick." A harness that ACKs on receipt and processes
+  afterward can lose work on a crash between the two.
 
 ### (c) Fence: untrusted bodies wrapped once at construction, escape by character, mirrored as data
 
 - Every body that originates from a remote Mupot session and reaches a human's live
   terminal/chat/mirror is wrapped in a fence **once, at the point the notice is
   constructed**, not at each egress sink separately re-deriving it
-  (`_fenced_untrusted_block` + `_UNTRUSTED_CAVEAT`,
-  `mupot_gateway/notifications.py:143-147,155-180`, plugin `@6c86c2b0`).
+  (`_UNTRUSTED_CAVEAT`, `mupot_gateway/notifications.py:143-147`; `_fenced_untrusted_block`,
+  `:155-179`, plugin `@6c86c2b0`).
 - The escape must operate on **every character of the delimiter**, not on runs of the full
   delimiter string. The plugin's own history is the proof: the first fix used
   `text.replace("```", ...)` — a left-to-right, non-overlapping replace that regenerated the
@@ -67,13 +81,16 @@ gate rounds. Per Hadi (2026-09-14): the method generalizes past this one harness
 - When the body is mirrored into a session transcript, it must be recorded at a role that
   reads as **data relayed to** the agent, never as the agent's own outgoing turn and never
   as the human's own words. The plugin's `mirror_text` calls `mirror_to_session(...,
-  role="user")` explicitly, documenting that the library's own default role
-  (`"assistant"`) would let a relayed remote notice "replay as a genuine, completed agent
-  statement in the transcript instead of a quoted, attributable inbound message"
-  (`mupot_gateway/notifications.py:104-130`). Any non-`"user"` role Hermes accepts is
-  cosmetic prefix text only, not a transport-enforced distinction
-  (`hermes_cli/plugins.py:596`, referenced in `notifications.py:148-152`) — the fence in
-  the *content* is the real control; the role label is a bonus signal, not a substitute.
+  role="user")` explicitly (`mupot_gateway/notifications.py:104-130`), whose own
+  comment states, verbatim, that a non-agent text mirrored at the library's default
+  role "replays as a genuine assistant turn, letting an attacker's body impersonate a
+  completed agent statement in the transcript instead of a quoted, attributable inbound
+  message." Any non-`"user"` role Hermes accepts is
+  cosmetic prefix text only, not a transport-enforced distinction (Hermes symbol
+  `hermes_cli/plugins.py` turn-formatting path, referenced by the plugin at
+  `notifications.py:148-152`; the specific Hermes line is not independently verified by
+  this doc — see the Hermes-citation note above) — the fence in the *content* is the
+  real control; the role label is a bonus signal, not a substitute.
 
 ### (d) Authorization: harness-side allowlist that fails CLOSED on empty
 
@@ -86,15 +103,21 @@ gate rounds. Per Hadi (2026-09-14): the method generalizes past this one harness
 - **Never rely on a host-runtime flag that skips the host's own authorization as the
   harness's authorization.** The concrete defect this generalizes from: the plugin sets
   `event.internal=True` on every Mupot-originated turn so it queues as its own turn rather
-  than interrupting the human's (correct, needed behavior) — but at the pinned Hermes rev,
-  `gateway/run_inbound.py:174` returns for any internal event **before** it ever reaches
-  Hermes's own per-source auth check or its global e-stop gate
-  (`mupot_gateway/adapter.py:695-717`, `_estop_engaged` docstring). `internal=True` is a
-  routing signal, not an authorization decision, and a harness that treats "the host
-  skipped its own check for this class of event" as "therefore this event needs no check"
-  inherits a silent bypass. The fix kept `internal=True` (dropping it would misroute
-  synthetic Mupot sources through end-user auth never designed for them) and added an
-  **explicit, harness-owned** check at the same point instead of assuming the host covers it.
+  than interrupting the human's (correct, needed behavior) — but at the pinned Hermes rev
+  (`233757037df1f03f9fe1cfddc097acd5ad7f7510`), the internal-event short-circuit in
+  Hermes's `gateway/run_inbound.py` returns **before** the event ever reaches Hermes's own
+  per-source auth check (Hermes symbol `_is_user_authorized_for_source`) or its global
+  e-stop gate (Hermes symbol `agent/estop.py::check_paused`). The plugin's own precise
+  statement of this two-gate claim — naming both skipped checks in one place — is the
+  `allowed_agents` constructor comment (`mupot_gateway/adapter.py:1103-1106`); the
+  `_estop_engaged` docstring (`:694-716`) restates the e-stop half only, with less
+  precision, and should not be cited as the source of the two-gate claim.
+  `internal=True` is a routing signal, not an authorization decision, and a harness that
+  treats "the host skipped its own check for this class of event" as "therefore this
+  event needs no check" inherits a silent bypass. The fix kept `internal=True` (dropping
+  it would misroute synthetic Mupot sources through end-user auth never designed for
+  them) and added an **explicit, harness-owned** check at the same point instead of
+  assuming the host covers it.
 - Gate on the **smallest importable dependency that carries the authority**, not a
   convenience re-export. Concrete defect: a legacy delivery path imported a whole gateway
   module (pulling in HTTP client deps) just to reach the estop check; when that import
@@ -103,6 +126,15 @@ gate rounds. Per Hadi (2026-09-14): the method generalizes past this one harness
   below).
 
 ### (e) Pause/e-stop: a temporal condition, never a state transition
+
+**Scope note (Kasra decision, 2026-09-14, resolving an open question from round 1):**
+this property is **REQUIRED for conformance by any harness**, not a Hermes-local
+convenience. Any runtime that carries an agent into Mupot unattended must honour an
+operator-issued stop as a total work gate on that runtime's own consume/dispatch/egress
+surface — the specific mechanism (`_EstopDeferred`, `_poll_loop`, Hermes's `hermes
+pause`) is Hermes/mupot-plugin's implementation of it, not the property itself. A second
+harness with no equivalent operator stop, or one that only pauses some of its own
+choke points, does not conform to this document regardless of what it is called.
 
 - A pause must be representable as "try again later," never folded into "this is
   permanently broken." The plugin's own `_EstopDeferred` exception class exists
@@ -119,7 +151,7 @@ gate rounds. Per Hadi (2026-09-14): the method generalizes past this one harness
   with "gate the poll loop's first statement, and gate the primitive itself (ack, send,
   each notification sink) so every future caller of that primitive inherits the gate for
   free" (`_EstopDeferred` docstring's enumerated choke-point list,
-  `mupot_gateway/adapter.py:159-192`).
+  `mupot_gateway/adapter.py:162-181`).
 - **Deferral, never quarantine, and no persisted state while paused.** A choke point raises
   and returns the lease to expire for natural redelivery; it does not write a partial
   result, does not advance a cursor, and does not mark anything processed.
@@ -158,6 +190,102 @@ gate rounds. Per Hadi (2026-09-14): the method generalizes past this one harness
   that document's principal property (d): a harness that let its own bearer stand in for
   "the human decided" would collapse the exact distinction the decision-channel contract
   exists to hold.
+
+## Mapping to `mupot-core.md` invariants
+
+The eight properties above are this document's own restatement of harness-specific
+consequences of three core invariants (`docs/architecture/mupot-core.md`, mupot
+`main` @ `49a344aa`) — restated because a harness author should not have to derive them
+from the core doc, but the core doc is the authority, not this list:
+
+| Core invariant | Harness properties that restate it |
+|---|---|
+| 1. Authority never rides on message text | (a) Identity (bearer, not local config, proves who); (g) Human decisions authenticated by identity, never by a bearer standing in for a decision |
+| 6. A verdict is by a non-author, from a credential that is the holder's own | (g) Human decisions never ride the agent bearer — the harness-side mirror of the decision-channel contract's principal property |
+| 8. A refusal is a receipt | (f) Observability — a refusal (an ack refused, a send deferred) that logs once per window is a receipt of the refusal; core invariant 8 itself notes whether such refusals are *persisted* with actor and reason is not verified, which is exactly (f)'s "stranded states need their own inspector, not just a log line" |
+
+Properties (b), (c), (d), and (e) do not restate a single numbered core invariant —
+they are harness-specific safety properties (consume-once delivery, untrusted-content
+handling, fail-closed authorization, pause semantics) the core doc does not itself
+enumerate, because the core doc is about the pot's own authority surface, not about
+what a harness carrying an agent through that surface must additionally hold.
+
+## Second-harness checklist (Claude Code, Codex, Cursor, a cron worker, or any
+non-Hermes runtime)
+
+Every property above was proven against exactly one harness (Hermes/mupot-plugin).
+Per Hadi (2026-09-14), the method generalizes — but "the method generalizes" does not
+mean "the code generalizes." This checklist separates what a second harness gets for
+free from what it must build itself, because MAJOR-3 of the round-1 gate found every
+row up to this revision probed Hermes-plugin internals (`_poll_loop`, `_EstopDeferred`)
+that a second runtime cannot call, import, or test against.
+
+**Reusable as-is — call Mupot's own surface, no harness-specific code needed:**
+
+- `inbox_lease` / `inbox_lease_ack` (attempt-bound, consume-once — property (b)). Any
+  harness calls the same mupot MCP tools / HTTP routes Hermes/mupot-plugin calls; the
+  attempt-scoped state machine lives in mupot (`src/agents/messages.ts`), not in the
+  harness.
+- `send` (peer messaging) — same tool, same identity rules (property (a)), regardless
+  of harness.
+- **The fence *algorithm***, not the Python implementation: escape every individual
+  delimiter character (not runs of the full delimiter) before wrapping untrusted text,
+  caveat after the close. This is language-independent; a harness in TypeScript, Go, or
+  a shell script re-implements the same algorithm, it does not import
+  `_fenced_untrusted_block`.
+- **The allowlist rule**, not the config format: an explicitly empty allow-list must
+  deny everyone; only a genuinely absent config key may fall back to a default. The
+  *shape* of `allowed_agents` is Hermes/mupot-plugin's own config surface — a second
+  harness has its own config mechanism and applies the same rule to it.
+
+**The runtime must implement itself — no shared code exists for these today:**
+
+- **A work-loop gate.** Whatever this harness's own poll/dispatch/cron loop is, it needs
+  its own top-of-loop check against an operator-issued stop (property (e), REQUIRED —
+  see the scope note above). `_poll_loop`'s `_estop_engaged()` check is Hermes/mupot-
+  plugin's mechanism for ITS loop; a second harness has a different loop and a
+  (possibly different) way an operator signals "stop," and must gate that loop itself.
+- **Choke points on its own primitives.** Whatever this harness calls to consume a
+  lease, ack it, and send/inject to a human needs its own explicit gate at each of
+  those call sites — chosen from the *shape* of round-4's fix (one gate at loop entry,
+  plus one choke point per primitive so a future branch inherits the gate for free),
+  not by importing `_refuse_ack_if_estop_engaged` or `_transmit_final_reply`, which are
+  private to this plugin.
+- **A mirror-as-data equivalent.** Property (c)'s role-tagging requirement
+  (`role="user"`, never the transcript library's default "assistant" role) is specific
+  to how Hermes's session store tags messages. A harness with a different transcript/
+  log mechanism — a tool-result block, a system-reminder-shaped injection, a clearly
+  delimited context note — must find or build ITS OWN equivalent of "this reads as data
+  relayed to the agent, never as the agent's own completed turn," and prove by test
+  that a relayed body cannot be mistaken for the harness's own output in that
+  mechanism. There is no portable code for this; each harness's transcript format is
+  different.
+- **Once-per-window logging.** `_ESTOP_PAUSE_LOG_SITES` is a module-level dict specific
+  to this plugin's process lifetime. A second harness needs its own dedup state, keyed
+  however it tracks "one pause window" locally, so a long pause logs once per site
+  rather than flooding, and a new pause after a lift logs again (property (f), hf1/hf2).
+
+**Not yet reusable, and not yet built for a second harness at all:** a stranded-state
+inspector (property (f)'s `stranded_notifications()` equivalent) and the negative
+e-stop boundary (a pause must not gate a human's own live in-session tool call,
+property (e)) are both properties, not code, that a second harness must satisfy on its
+own terms — no shared library exists for either, and neither has a black-box conformance
+test outside the reference implementation yet (see `decision-channel-conformance.md`,
+he8/hd5).
+
+## Relationship to `docs/runtime-adapter-contract.md`'s conformance section
+
+`runtime-adapter-contract.md` already has a "Planned Conformance Tests" section
+(`:603-626`) naming `npm run conformance:runtime:local` as the local conformance smoke
+and listing the broader adapter-conformance surface (attach, detach, heartbeat, inbox,
+task verdicts). That is **one conformance surface**, covering the identity/attach/
+messaging layer this document builds on top of. This document's own
+`decision-channel-conformance.md` is a **second, narrower** surface — the harness-safety
+properties (b)-(g) above, which `runtime-adapter-contract.md`'s list does not cover
+(no e-stop, fence, or allowlist row exists there). The two should stay linked, not
+duplicated: a harness-conformance suite belongs alongside
+`npm run conformance:runtime:local`, extending it, not re-deriving the attach/inbox
+cases `decision-channel-conformance.md` already treats as out of its own scope.
 
 ## Defect classes found in PR #6 rounds 1–5 — what a non-conforming harness looks like
 
@@ -202,12 +330,21 @@ Each line: the defect class, one line, the round it was found (all dates 2026-09
 
 ## Sources read
 
-- `docs/runtime-adapter-contract.md` (mupot `main` @ `49a344aa`)
+- `docs/runtime-adapter-contract.md` (mupot `main` @ `49a344aa`), including its
+  "Planned Conformance Tests" section (`:603-626`)
+- `docs/architecture/mupot-core.md` (mupot `main` @ `49a344aa`), invariants 1, 6, 8
+- Hermes: not fetched directly (separate, inaccessible repo); cited only via the
+  plugin's own comments, at the plugin's CI-pinned rev
+  `233757037df1f03f9fe1cfddc097acd5ad7f7510` (`.github/workflows/test.yml:34`), by
+  symbol where the plugin names one
 - `Mumega-com/mupot-plugin` @ `6c86c2b0` (`master`, PR #6 head): `mupot_gateway/adapter.py`
-  (`_EstopDeferred` class + docstring lines 132-208, `_estop_engaged` lines 695-720,
-  `normalize_agent`/`should_accept_message` lines 630-648, allowlist init lines 1069-1121),
-  `mupot_gateway/notifications.py` (`_fenced_untrusted_block` lines 126-165, `mirror_text`
-  lines 104-121)
+  (`_EstopDeferred` class + docstring lines 132-208, choke-point list `:162-181`,
+  `_estop_engaged` lines 695-716, `normalize_agent`/`should_accept_message` lines
+  630-648, allowlist init lines 1069-1102, `allow_from`-scoping comment / two-gate claim
+  `:1103-1121`), `mupot_gateway/notifications.py` (`_UNTRUSTED_CAVEAT` lines 143-147,
+  `_fenced_untrusted_block` lines 155-179, `mirror_text` lines 104-130)
 - `docs/telegram-onboarding-runbook.md` (same plugin ref)
 - kasra-review re-gate history on PR #6 rounds 1-5 — read via `mcp__mupot__recall`, not
   re-fetched from GitHub for this doc
+- mupot PR #1410 round 1 gate comment (Athena, head `aa6e0a99`, 2026-09-14) — the
+  findings this revision fixes (MAJOR-3, MAJOR-4, MAJOR-7, MINOR-9..17, in part)
