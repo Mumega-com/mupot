@@ -687,6 +687,67 @@ describe('Telegram project invitation service', () => {
       ).get(FENCE_TENANT, FENCE_UPDATE_ID)).toEqual({ state: 'processing' })
     })
 
+    // M9's single project_squad_access row means deleting it removes the
+    // ONLY row that could ever satisfy the EXISTS — so M9 cannot tell
+    // whether `access.project_id = invites.project_id` or
+    // `access.squad_id = invites.squad_id` (or both) is doing the work.
+    // These two tests each leave a DIFFERENT edge in place that satisfies
+    // exactly one of the two conjuncts, so removing either one individually
+    // (mutating the SQL) turns the corresponding test red on its own.
+    it('M9b — refuses to claim when a DIFFERENT squad on the same project keeps its own edge (squad_id conjunct)', async () => {
+      insertFenceInvite()
+      insertFenceReceipt('processing')
+      // A second squad linked to the SAME project as the invite. If
+      // `access.squad_id = invites.squad_id` were dropped, this row alone
+      // would satisfy the EXISTS via project_id matching, independent of
+      // which squad the invite is actually for.
+      fenceHarness.sqlite.exec(`
+        INSERT INTO squads (id, department_id, slug, name)
+        VALUES ('squad-fence-b', 'dept-fence', 'squad-fence-b', 'Squad Fence B');
+        INSERT INTO project_squad_access (project_id, squad_id, access_level)
+        VALUES ('project-fence', 'squad-fence-b', 'write');
+        DELETE FROM project_squad_access
+         WHERE project_id = 'project-fence' AND squad_id = 'squad-fence';
+      `)
+      expect(await runClaim()).toBe(0)
+      expect(fenceHarness.sqlite.prepare(
+        'SELECT accepted_at FROM invites WHERE id = ?',
+      ).get(FENCE_INVITE_ID)).toEqual({ accepted_at: null })
+      expect(fenceHarness.sqlite.prepare(
+        'SELECT COUNT(*) AS count FROM capabilities',
+      ).get()).toEqual({ count: 0 })
+      expect(fenceHarness.sqlite.prepare(
+        'SELECT state FROM telegram_webhook_receipts WHERE tenant = ? AND update_id = ?',
+      ).get(FENCE_TENANT, FENCE_UPDATE_ID)).toEqual({ state: 'processing' })
+    })
+
+    it('M9c — refuses to claim when the SAME squad keeps an edge on a DIFFERENT project (project_id conjunct)', async () => {
+      insertFenceInvite()
+      insertFenceReceipt('processing')
+      // The invite's own squad, linked to a DIFFERENT active project. If
+      // `access.project_id = invites.project_id` were dropped, this row
+      // alone would satisfy the EXISTS via squad_id matching, independent
+      // of which project the invite is actually for.
+      fenceHarness.sqlite.exec(`
+        INSERT INTO projects (id, slug, name, status)
+        VALUES ('project-fence-b', 'project-fence-b', 'Project Fence B', 'active');
+        INSERT INTO project_squad_access (project_id, squad_id, access_level)
+        VALUES ('project-fence-b', 'squad-fence', 'write');
+        DELETE FROM project_squad_access
+         WHERE project_id = 'project-fence' AND squad_id = 'squad-fence';
+      `)
+      expect(await runClaim()).toBe(0)
+      expect(fenceHarness.sqlite.prepare(
+        'SELECT accepted_at FROM invites WHERE id = ?',
+      ).get(FENCE_INVITE_ID)).toEqual({ accepted_at: null })
+      expect(fenceHarness.sqlite.prepare(
+        'SELECT COUNT(*) AS count FROM capabilities',
+      ).get()).toEqual({ count: 0 })
+      expect(fenceHarness.sqlite.prepare(
+        'SELECT state FROM telegram_webhook_receipts WHERE tenant = ? AND update_id = ?',
+      ).get(FENCE_TENANT, FENCE_UPDATE_ID)).toEqual({ state: 'processing' })
+    })
+
     // ── Mutation-testing sweep of every remaining CLAIM_INVITE_SQL conjunct
     // (kasra-review re-gate, 2026-09-14): mutating each one out and re-running
     // this whole describe block showed 6 conjuncts SURVIVED green even with

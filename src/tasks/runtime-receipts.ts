@@ -529,32 +529,57 @@ export async function recordTaskDispatchRuntimeReceipt(
   return { receipt: publicTimelineReceipt(persisted), task_status: task.status }
 }
 
-/** Cap applied to a rendered display name — matches the max length enforced
- *  at redemption time (src/members/project-invites.ts's `isNonEmptyString`
- *  call for `input.display_name`, 200), so this can never truncate a value
- *  that was itself accepted as valid at mint time. */
-const DECIDED_BY_DISPLAY_MAX_LENGTH = 200
+/** Cap applied to a rendered receipt text field. Matches the max length
+ *  enforced at redemption time for a Telegram-onboarded display name
+ *  (src/members/project-invites.ts's `isNonEmptyString` call for
+ *  `input.display_name`), but that is not the only mint-time path into a
+ *  field this function sanitizes — `members/index.ts`'s own
+ *  `isNonEmptyString` helper (~line 87, used at its display_name check
+ *  ~line 194) enforces no length cap at all, and a verdict `note` has no
+ *  mint-time cap anywhere. This cap CAN and does truncate a value that was
+ *  accepted as valid at mint time; it exists to bound what a single receipt
+ *  can render, not to promise round-tripping of arbitrary mint-time input. */
+const RECEIPT_TEXT_MAX_LENGTH = 200
 
 /**
- * P2: `decided_by_display` can resolve to `member.display_name`, and for a
- * Telegram-onboarded member that value is cosmetic, user-supplied input
- * (the sender's own Telegram first_name/username, threaded through with no
- * server-side content validation — see redeemTelegramProjectInvite). It
- * reaches this receipt via a plain SQL COALESCE with no escaping of its own.
- * Strip control characters (newlines, tabs, and anything else in the C0/C1
- * range) so a crafted display name cannot inject fake extra lines/fields
- * into any plain-text or line-oriented rendering of this receipt downstream
- * (a dashboard summary, a forwarded Telegram message, a log line), and cap
- * length so a receipt can't be inflated by an oversized name. Applied here,
- * at the render site, rather than at mint time, so it covers every existing
- * row regardless of when it was written.
+ * P2/WARN-2/WARN-3: `decided_by_display` (which can resolve to
+ * `member.display_name`) and `verdict.note` can both be cosmetic,
+ * user-supplied text with no server-side content validation — a
+ * Telegram-onboarded member's own first_name/username threaded through by
+ * redeemTelegramProjectInvite, or free-text typed by whoever decided a gate.
+ * Both reach this receipt via a plain SQL projection with no escaping of
+ * their own. Strip:
+ *  - C0/C1 control characters (newlines, tabs, etc.) so a crafted value
+ *    cannot inject fake extra lines/fields into any plain-text or
+ *    line-oriented rendering of this receipt downstream (a dashboard
+ *    summary, a forwarded Telegram message, a log line).
+ *  - Unicode bidi control characters (U+202A-U+202E embedding/override,
+ *    U+2066-U+2069 isolates), which can visually reorder or mask rendered
+ *    text without changing its underlying characters.
+ *  - Zero-width characters (U+200B-U+200F, U+2060 word joiner, U+FEFF
+ *    BOM/ZWNBSP) and soft hyphen (U+00AD), which render as nothing (or as
+ *    nothing until a line break) and can hide content or defeat exact-text
+ *    matching between visible characters.
+ * Combining marks are deliberately left untouched — they render as intended
+ * accents/diacritics on the preceding character, not as an injection
+ * vector. Applied here, at the render site, rather than at mint time, so it
+ * covers every existing row regardless of when it was written.
  */
-function sanitizeDecidedByDisplay(value: string): string {
-  // eslint-disable-next-line no-control-regex -- deliberately stripping C0/C1 control chars, incl. newlines/tabs.
-  const stripped = value.replace(/[\x00-\x1F\x7F-\x9F]/g, ' ').trim()
+function sanitizeReceiptText(value: string): string {
+  const stripped = value
+    // eslint-disable-next-line no-control-regex -- deliberately stripping C0/C1 control chars, incl. newlines/tabs.
+    .replace(/[\x00-\x1F\x7F-\x9F]/g, ' ')
+    // Bidi embedding/override (U+202A-U+202E) and isolate (U+2066-U+2069)
+    // controls, plus zero-width characters (U+200B-U+200F, U+2060 word
+    // joiner, U+FEFF BOM/ZWNBSP) and soft hyphen (U+00AD). Written as
+    // explicit \u escapes, never as literal glyphs, so the source stays
+    // reviewable and can't itself be corrupted by the very characters it
+    // strips.
+    .replace(/[\u200B-\u200F\u2060\uFEFF\u00AD\u202A-\u202E\u2066-\u2069]/g, '')
+    .trim()
   const collapsed = stripped.replace(/\s+/g, ' ')
-  return collapsed.length > DECIDED_BY_DISPLAY_MAX_LENGTH
-    ? collapsed.slice(0, DECIDED_BY_DISPLAY_MAX_LENGTH)
+  return collapsed.length > RECEIPT_TEXT_MAX_LENGTH
+    ? collapsed.slice(0, RECEIPT_TEXT_MAX_LENGTH)
     : collapsed
 }
 
@@ -629,7 +654,8 @@ export async function listTaskDispatchReceiptTimeline(
     runtime: (runtime.results ?? []).map(publicTimelineReceipt),
     gate: (gate.results ?? []).map((row) => ({
       ...row,
-      decided_by_display: sanitizeDecidedByDisplay(row.decided_by_display),
+      note: row.note === null ? null : sanitizeReceiptText(row.note),
+      decided_by_display: sanitizeReceiptText(row.decided_by_display),
     })),
     task_status: task.status,
   }
