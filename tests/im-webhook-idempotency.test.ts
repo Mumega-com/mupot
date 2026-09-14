@@ -52,7 +52,18 @@ describe('authenticated Telegram receipts and human controls', () => {
       harness.sqlite.prepare(`SELECT * FROM ${table} ORDER BY id`).all())
   }
   async function invite() {
-    const auth: AuthContext = { userId: 'admin', email: 'admin@test.com', role: 'admin', tenant: env.TENANT_SLUG }
+    // P1-1 parity (mupot#1407): a squad scope with no memberId always
+    // refuses, regardless of role — mirrors requireCapability's own
+    // restriction (src/auth/capability.ts:315-322). This fixture must carry
+    // a memberId + a real admin grant on squad-1, the same shape any real
+    // inviter needs, rather than relying on the coarse legacy role alone.
+    const auth: AuthContext = {
+      userId: 'admin', email: 'admin@test.com', role: 'admin', tenant: env.TENANT_SLUG,
+      memberId: 'inviter-member',
+      capabilities: [{
+        member_id: 'inviter-member', scope_type: 'squad', scope_id: 'squad-1', capability: 'admin',
+      }],
+    }
     const result = await createProjectInvite(env, auth, {
       email: 'invited@example.com', project_id: 'project-1', squad_id: 'squad-1',
       capability: 'member', expires_in_seconds: 3600,
