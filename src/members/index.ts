@@ -68,6 +68,8 @@ import {
 interface ParsedInvite {
   kind: 'legacy' | 'project'
   email: string
+  /** Bind path only — an existing member to attach a Telegram identity to. */
+  member_id: string | null
   department_id: string | null
   project_id: string | null
   squad_id: string | null
@@ -334,6 +336,7 @@ const orgScope = (_c: Context): { type: CapabilityScopeType; id: string | null }
 
 interface CreateInviteBody {
   email?: unknown
+  member_id?: unknown
   department_id?: unknown
   project_id?: unknown
   squad_id?: unknown
@@ -368,10 +371,23 @@ const parseInvite: MiddlewareHandler<AppEnv> = async (c, next) => {
 
   if (!body || typeof body !== 'object') return c.json({ error: 'invalid_json' }, 400)
 
-  if (!isEmail(body.email)) return c.json({ error: 'invalid_email' }, 400)
+  // member_id (bind-existing-member path) and a caller-supplied email are
+  // mutually exclusive — the target member's own email is derived server-side
+  // by createProjectInvite, so a body carrying both is an ambiguous request,
+  // not a hint about which one wins.
+  const hasMemberId = body.member_id !== undefined && body.member_id !== null
+  if (hasMemberId) {
+    if (!isNonEmptyString(body.member_id)) return c.json({ error: 'invalid_member_id' }, 400)
+    if (body.email !== undefined && body.email !== null) {
+      return c.json({ error: 'invalid_invite_scope' }, 400)
+    }
+  } else {
+    if (!isEmail(body.email)) return c.json({ error: 'invalid_email' }, 400)
+  }
 
   const hasProjectFields =
-    body.project_id !== undefined
+    hasMemberId
+    || body.project_id !== undefined
     || body.squad_id !== undefined
     || body.expires_in_seconds !== undefined
 
@@ -393,7 +409,12 @@ const parseInvite: MiddlewareHandler<AppEnv> = async (c, next) => {
     }
     c.set('inviteBody', {
       kind: 'project',
-      email: body.email,
+      // Both casts are guarded above (isEmail / isNonEmptyString) in the
+      // branch that reaches them; the ternary's other arm never touches the
+      // unchecked value, so this mirrors the existing `capability as
+      // Capability` cast just above, guarded by isCapability.
+      email: hasMemberId ? '' : (body.email as string),
+      member_id: hasMemberId ? (body.member_id as string).trim() : null,
       department_id: null,
       project_id: body.project_id.trim(),
       squad_id: body.squad_id.trim(),
@@ -418,7 +439,11 @@ const parseInvite: MiddlewareHandler<AppEnv> = async (c, next) => {
 
   c.set('inviteBody', {
     kind: 'legacy',
-    email: body.email,
+    // Reaching this branch means hasMemberId was false above, so the isEmail
+    // guard in that branch already ran and returned on failure — narrowing
+    // just doesn't survive the intervening if/else for TS's flow analysis.
+    email: body.email as string,
+    member_id: null,
     department_id: departmentId,
     project_id: null,
     squad_id: null,
@@ -441,11 +466,16 @@ const authorizeInvite: MiddlewareHandler<AppEnv> = async (c, next) => {
 }
 
 function projectInviteErrorStatus(error: CreateProjectInviteError): 400 | 403 | 404 | 409 {
-  if (error === 'project_not_found' || error === 'project_squad_not_linked') return 404
+  if (
+    error === 'project_not_found'
+    || error === 'project_squad_not_linked'
+    || error === 'member_not_found'
+  ) return 404
   if (
     error === 'tenant_scope'
     || error === 'forbidden'
     || error === 'cannot_grant_above_own_rank'
+    || error === 'member_not_active'
   ) return 403
   if (error === 'pairing_code_collision') return 409
   return 400
@@ -466,7 +496,8 @@ membersApp.post(
         return c.json({ error: 'invalid_invite_scope' }, 400)
       }
       const result = await createProjectInvite(c.env, auth, {
-        email: body.email,
+        email: body.member_id ? undefined : body.email,
+        member_id: body.member_id ?? undefined,
         project_id: body.project_id,
         squad_id: body.squad_id,
         capability: body.capability,

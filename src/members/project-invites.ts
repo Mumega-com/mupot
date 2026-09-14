@@ -13,7 +13,15 @@ const REQUEST_DIGEST_RE = /^[0-9a-fA-F]{64}$/
 const MAX_INVITE_LIFETIME_SECONDS = 7 * 24 * 60 * 60
 
 export interface CreateProjectInviteInput {
-  email: string
+  /** Required unless `member_id` is set — then the member's own email is used. */
+  email?: string
+  /**
+   * Bind this EXISTING, active, same-tenant member instead of minting a
+   * net-new one at redemption. Mutually exclusive with a caller-supplied
+   * `email` (the member's own email is read server-side so the UNIQUE fence
+   * and the receipt shape stay identical to the net-new path).
+   */
+  member_id?: string
   project_id: string
   squad_id: string
   capability: Capability
@@ -46,6 +54,7 @@ export interface CreatedProjectInvite {
 export type CreateProjectInviteError =
   | 'tenant_scope'
   | 'invalid_email'
+  | 'invalid_member_id'
   | 'invalid_project_id'
   | 'invalid_squad_id'
   | 'invalid_capability'
@@ -54,6 +63,9 @@ export type CreateProjectInviteError =
   | 'archived_project'
   | 'project_not_active'
   | 'project_squad_not_linked'
+  | 'member_not_found'
+  | 'member_not_active'
+  | 'member_missing_email'
   | 'forbidden'
   | 'cannot_grant_above_own_rank'
   | 'pairing_code_collision'
@@ -113,6 +125,13 @@ interface RedeemableInviteRow {
   capability: Capability
   accepted_at: string | null
   pairing_expires_at: string
+  member_id: string | null
+}
+
+interface BindableMemberRow {
+  id: string
+  status: string
+  telegram_chat_id: string | null
 }
 
 interface TelegramReceiptRow {
@@ -293,8 +312,20 @@ export async function createProjectInvite(
 ): Promise<CreateProjectInviteResult> {
   if (auth.tenant !== env.TENANT_SLUG) return { ok: false, error: 'tenant_scope' }
 
-  const email = typeof input.email === 'string' ? input.email.trim() : ''
-  if (email.length > 254 || !EMAIL_RE.test(email)) return { ok: false, error: 'invalid_email' }
+  // member_id and a caller-supplied email are mutually exclusive: the bind
+  // path derives email from the member row so the UNIQUE fence and the
+  // receipt shape stay identical to the net-new path — the caller never gets
+  // to choose an email that diverges from the member it is binding to.
+  const hasMemberId = input.member_id !== undefined && input.member_id !== null
+  let memberId: string | null = null
+  let email = ''
+  if (hasMemberId) {
+    if (!isNonEmptyString(input.member_id)) return { ok: false, error: 'invalid_member_id' }
+    memberId = input.member_id.trim()
+  } else {
+    email = typeof input.email === 'string' ? input.email.trim() : ''
+    if (email.length > 254 || !EMAIL_RE.test(email)) return { ok: false, error: 'invalid_email' }
+  }
   if (!isNonEmptyString(input.project_id)) return { ok: false, error: 'invalid_project_id' }
   if (!isNonEmptyString(input.squad_id)) return { ok: false, error: 'invalid_squad_id' }
   if (!isCapability(input.capability)) return { ok: false, error: 'invalid_capability' }
@@ -324,6 +355,19 @@ export async function createProjectInvite(
   ).bind(projectId, squadId).first<ProjectSquadRow>()
   if (!edge) return { ok: false, error: 'project_squad_not_linked' }
 
+  if (hasMemberId) {
+    // Same tenant-collapse shape as GET /members/:id (src/members/index.ts) —
+    // a member in another tenant reads as not-found, not forbidden, so this
+    // never becomes a cross-tenant existence oracle.
+    const member = await env.DB.prepare(
+      'SELECT id, email, status FROM members WHERE id = ?1 AND (tenant = ?2 OR tenant IS NULL) LIMIT 1',
+    ).bind(memberId, env.TENANT_SLUG).first<{ id: string; email: string | null; status: string }>()
+    if (!member) return { ok: false, error: 'member_not_found' }
+    if (member.status !== 'active') return { ok: false, error: 'member_not_active' }
+    if (!isNonEmptyString(member.email)) return { ok: false, error: 'member_missing_email' }
+    email = member.email.trim()
+  }
+
   const actorRank = await actorRankOnSquad(env, auth, squadId, edge.department_id)
   if (actorRank < capabilityRank('admin')) return { ok: false, error: 'forbidden' }
   if (capabilityRank(input.capability) > actorRank) {
@@ -352,8 +396,8 @@ export async function createProjectInvite(
   await env.DB.prepare(
     `INSERT INTO invites (
        id, email, department_id, capability, invited_by, accepted_at, created_at,
-       project_id, squad_id, pairing_hash, pairing_expires_at
-     ) VALUES (?1, ?2, NULL, ?3, ?4, NULL, ?5, ?6, ?7, ?8, ?9)`,
+       project_id, squad_id, pairing_hash, pairing_expires_at, member_id
+     ) VALUES (?1, ?2, NULL, ?3, ?4, NULL, ?5, ?6, ?7, ?8, ?9, ?10)`,
   ).bind(
     id,
     email,
@@ -364,6 +408,7 @@ export async function createProjectInvite(
     squadId,
     pairingHash,
     expiresAt,
+    memberId,
   ).run()
 
   return {
@@ -428,7 +473,7 @@ export async function redeemTelegramProjectInvite(
   if (receipt.state !== 'processing') return { ok: false, error: 'update_receipt_invalid' }
 
   const matches = await env.DB.prepare(
-    `SELECT id, email, project_id, squad_id, capability, accepted_at, pairing_expires_at
+    `SELECT id, email, project_id, squad_id, capability, accepted_at, pairing_expires_at, member_id
        FROM invites
       WHERE pairing_hash = ?1
       LIMIT 2`,
@@ -443,7 +488,26 @@ export async function redeemTelegramProjectInvite(
     return { ok: false, error: 'invalid_or_expired_pairing_code' }
   }
 
-  const memberId = crypto.randomUUID()
+  // Bind-existing-member path (invite.member_id set at creation): re-check the
+  // member is still active AT CLAIM TIME (its status can change between
+  // invite creation and redemption) and pre-empt the "already bound to a
+  // DIFFERENT Telegram identity" conflict with a named error — the reverse
+  // conflict ("this Telegram id already belongs to a different member") is
+  // left to the existing UNIQUE(members.telegram_chat_id) catch below, the
+  // SAME mechanism the net-new path already relies on, not a second copy.
+  if (invite.member_id !== null) {
+    const member = await env.DB.prepare(
+      'SELECT id, status, telegram_chat_id FROM members WHERE id = ?1 AND (tenant = ?2 OR tenant IS NULL) LIMIT 1',
+    ).bind(invite.member_id, env.TENANT_SLUG).first<BindableMemberRow>()
+    if (!member || member.status !== 'active') {
+      return { ok: false, error: 'invalid_or_expired_pairing_code' }
+    }
+    if (member.telegram_chat_id !== null && member.telegram_chat_id !== input.telegram_user_id.trim()) {
+      return { ok: false, error: 'telegram_identity_conflict' }
+    }
+  }
+
+  const memberId = invite.member_id ?? crypto.randomUUID()
   const grantId = crypto.randomUUID()
   const claimedAt = claimTimestamp()
   const value: RedeemedProjectInvite = {
@@ -453,6 +517,43 @@ export async function redeemTelegramProjectInvite(
     capability: invite.capability,
   }
   const responseText = JSON.stringify(value)
+
+  const bindMemberStatement = invite.member_id !== null
+    ? env.DB.prepare(
+      `UPDATE members
+          SET telegram_chat_id = ?1
+        WHERE id = ?2
+          AND status = 'active'
+          AND (tenant = ?3 OR tenant IS NULL)
+          AND (telegram_chat_id IS NULL OR telegram_chat_id = ?1)
+          AND EXISTS (
+            SELECT 1 FROM invites WHERE id = ?4 AND accepted_at = ?5
+          )`,
+    ).bind(
+      input.telegram_user_id.trim(),
+      memberId,
+      env.TENANT_SLUG,
+      invite.id,
+      claimedAt,
+    )
+    : env.DB.prepare(
+      `INSERT INTO members (
+         id, email, display_name, telegram_chat_id, status, created_at, tenant
+       )
+       SELECT ?1, ?2, ?3, ?4, 'active', ?5, ?6
+        WHERE EXISTS (
+          SELECT 1 FROM invites WHERE id = ?7 AND accepted_at = ?8
+        )`,
+    ).bind(
+      memberId,
+      invite.email,
+      input.display_name.trim(),
+      input.telegram_user_id.trim(),
+      now,
+      env.TENANT_SLUG,
+      invite.id,
+      claimedAt,
+    )
 
   try {
     const results = await env.DB.batch([
@@ -470,24 +571,7 @@ export async function redeemTelegramProjectInvite(
         input.request_digest,
         input.telegram_user_id.trim(),
       ),
-      env.DB.prepare(
-        `INSERT INTO members (
-           id, email, display_name, telegram_chat_id, status, created_at, tenant
-         )
-         SELECT ?1, ?2, ?3, ?4, 'active', ?5, ?6
-          WHERE EXISTS (
-            SELECT 1 FROM invites WHERE id = ?7 AND accepted_at = ?8
-          )`,
-      ).bind(
-        memberId,
-        invite.email,
-        input.display_name.trim(),
-        input.telegram_user_id.trim(),
-        now,
-        env.TENANT_SLUG,
-        invite.id,
-        claimedAt,
-      ),
+      bindMemberStatement,
       env.DB.prepare(
         `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
          SELECT ?1, ?2, 'squad', ?3, ?4
