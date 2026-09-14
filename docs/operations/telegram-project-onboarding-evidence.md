@@ -502,8 +502,12 @@ themselves — an invalid `agents.status` value and a project status independent
 earlier, unrelated pre-check — both fixed in commit `608d622a` so the tests fail for the
 reason they claim to, not by accident.
 
-**Final head of this repository-local work: commit `608d622a` on
-`kasra/telegram-project-onboarding-20260913`.** `npm run typecheck` clean. Focused suite
+**The mutation table and the focused/full-suite counts in this addendum were produced at
+commit `608d622a` on `kasra/telegram-project-onboarding-20260913`; they describe that commit,
+not whatever this branch's tip happens to be when read. Later commits on this branch are
+docs-only unless this section itself is revised to name a new commit and re-measured counts —
+a docs-only commit changing this file's wording (as this correction does) does not by itself
+invalidate the `608d622a` measurement it is scoped to.** `npm run typecheck` clean. Focused suite
 (`telegram-project-onboarding.test.ts`, `members-sensitive-response.test.ts`,
 `needs-you.test.ts`, `routine-actions.test.ts`, `im-webhook-idempotency.test.ts`,
 `im-verdict-gates.test.ts`): 141/141. Full `npm test`: 512 files, 8,001 tests — see the exact

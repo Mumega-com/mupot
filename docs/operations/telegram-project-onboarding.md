@@ -30,19 +30,31 @@ built with `role: 'member'` and the member's real, resolved capability grants
 surface-capability checks (`memberHasGateGrant`, `memberHasSurfaceGrant` — bare `gate_grants`
 existence, no liveness join, no `gate:agent-self-completion` special case) are removed.
 
-Net effect: **a human holding only a coarse org-scope admin *role* (not an actual org-scope
-admin *capability grant* row) can no longer approve `gate:agent-self-completion` over IM.**
-Only a real, resolved capability grant (an explicit `org`/`department`/`squad` row, evaluated
-the identical way HTTP and MCP evaluate it) satisfies the gate now. This closes the same class
-of divergence Kasra flagged in mupot#1319 BLOCK-2 and mupot#1080/#1081 — IM's verdict gate
-previously diverged from the canonical HTTP/MCP predicate, which is exactly the "two copies of
-one rule" defect class. That deferred item is closed here, for the IM surface, by deletion
-rather than a third copy.
+Net effect: **no principal can approve `gate:agent-self-completion` over IM after this change,
+regardless of role or capability grants.** `memberAuth` (`src/im/index.ts:400-402`) hardcodes
+`role: 'member'` for every IM principal — it never sets `role: 'admin'` or `role: 'owner'`,
+and `evaluateVerdictGates`'s check for this gate (`legacyOwnerAdmin(auth)` in
+`src/tasks/index.ts:93`) tests only that coarse role, never capability grant rows. So a
+capability grant does not restore IM approval for `gate:agent-self-completion` either: with
+`role` fixed at `'member'`, `legacyOwnerAdmin` is false no matter what the principal's real,
+resolved capability grants contain. This was verified by execution — probes with an
+org-scope-owner grant row and, separately, an org-scope-admin grant row were both refused.
 
-If an operator relies on Telegram approval today for `gate:agent-self-completion` on the
-strength of a coarse role alone (no capability row), grant them the real capability row before
-or as part of adopting this change — do not treat the coarse role as sufficient going forward,
-on IM or any other surface.
+This makes IM strictly narrower than HTTP for this one gate (a browser session carrying an
+owner/admin role cookie can still approve it there) and brings IM to parity with MCP, whose
+`auth.role` is likewise always `'member'` (see `reference_mupot_mcp_role_always_member`).
+This closes the same class of divergence Kasra flagged in mupot#1319 BLOCK-2 and
+mupot#1080/#1081 — IM's verdict gate previously used its own hand-rolled, laxer check
+(`memberHasGateGrant`/`memberHasSurfaceGrant`) instead of the canonical HTTP/MCP predicate.
+That deferred item is closed here, for the IM surface, by deletion rather than a third copy —
+but the closure is "IM can no longer approve this gate at all," not "IM now evaluates the
+same capability rows HTTP does."
+
+If an operator relies on Telegram approval today for `gate:agent-self-completion`, that path
+is gone after this change on any basis — coarse role or capability grant row. Decide those
+verdicts on the dashboard (HTTP) as an owner or admin instead. Extending IM to carry this gate
+(by consulting real capability grants the way HTTP does, rather than the coarse role check) is
+future work, not part of this PR.
 
 ## Authority and credential boundaries
 
