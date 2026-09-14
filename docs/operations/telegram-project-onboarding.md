@@ -13,13 +13,53 @@ Onboarding does not grant organization admin, an agent or workspace token, merge
 publish, spend, or independent gate authority. Approval and rejection still require the
 existing task gate grant, surface capability, conflict checks, and shared verdict predicate.
 
-This slice onboards **net-new humans only**. Redeeming a project invite whose email already
-belongs to an existing member refuses with `member_already_exists` and makes no partial
-writes (see the invite redemption tests). Binding a Telegram identity to an *existing* member
-account — for example, an operator who already has a web login and simply wants to add
-Telegram as a second channel — is not in scope of this PR. Do not work around that by
-inviting an existing member's own email; provision that binding through a separate, explicitly
-reviewed change instead.
+A project invite onboards a **net-new human** by default: `POST /api/members/invites`
+without `member_id` mints a fresh, tokenless member at redemption. Redeeming that kind of
+invite when its email already belongs to an existing member refuses with
+`member_already_exists` and makes no partial writes (see the invite redemption tests). Do not
+work around that by inviting an existing member's own email — use the bind-existing-member
+path below instead.
+
+### Binding a Telegram identity to an existing member
+
+Pass `member_id` (the existing, active, same-tenant member's id) instead of `email` when
+creating the invite:
+
+```bash
+curl --fail-with-body --silent --show-error \
+  -H "Authorization: Bearer ${MUPOT_OPERATOR_TOKEN:?}" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "member_id":"<existing-member-id>",
+    "project_id":"<project-id>",
+    "squad_id":"<participant-squad-id>",
+    "capability":"member",
+    "expires_in_seconds":3600
+  }' \
+  "$MUPOT_ORIGIN/api/members/invites"
+```
+
+`member_id` and `email` are mutually exclusive in the request body — the member's own email is
+read server-side (so the UNIQUE email fence and the invite/receipt shape are identical to the
+net-new path) and returned in the `201` response for the operator to confirm before delivery.
+Creation refuses `member_not_found` (404 — also returned for a member in another tenant, a
+deliberate collapse so this is never a cross-tenant existence oracle), `member_not_active`
+(403, a suspended member), or `member_missing_email` (400, an IM-only member with no email on
+file) before minting the invite. The actor's capability ceiling is the same
+`actorRankOnSquad` path the net-new invite uses — no separate, looser rank check.
+
+At redemption, `/start <pairing-code>` binds the authenticated Telegram identity onto the
+**existing** member (an `UPDATE`, never an `INSERT`) instead of minting a new one; no new
+member row, token, or display-name change results. Two conflict shapes both refuse with
+`telegram_identity_conflict` and leave the invite retryable if the underlying condition is
+transient: the target member already has a **different** Telegram identity bound, or the
+Telegram identity sending `/start` already belongs to a **different** member. The target
+member must still be `status='active'` at the moment of redemption (re-checked, not merely
+at invite creation) — the atomic claim itself refuses to commit for a bind target that is no
+longer active, so a member suspended between invite creation and redemption does not burn the
+pairing code; it becomes usable again once the member is reactivated. The reply to the
+participant is the same generic success/failure text as the net-new path — the redemption
+error enum is never echoed into the chat (see the existing anti-oracle test).
 
 ## Behaviour change: IM verdict authority
 
@@ -202,6 +242,9 @@ to add a broader grant.
 Create the project invitation through the member surface. A project invite requires all of
 `project_id`, `squad_id`, and `expires_in_seconds`; omitting them creates a different legacy
 browser invitation. Keep the lifetime short and operationally realistic (maximum seven days).
+This mints a **net-new human** at redemption. To bind Telegram onto an *existing* member
+instead, pass `member_id` in place of `email` — see "Binding a Telegram identity to an
+existing member" above.
 
 ```bash
 curl --fail-with-body --silent --show-error \

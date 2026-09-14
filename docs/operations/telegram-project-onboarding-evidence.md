@@ -741,3 +741,132 @@ three receipt sub-conjuncts) is unrelated to this WARN and is unchanged by this 
 | `note: sanitizeReceiptText(row.note)` | reverted to raw `row.note` passthrough | RED (control chars present, not single line) | "sanitizes verdict.note with the same helper as decided_by_display" |
 | bidi/zero-width/soft-hyphen strip clause | removed (C0/C1 clause kept) | RED × 4 (bidi embedding/override, bidi isolates, zero-width, soft hyphen) | the 4 named WARN-3 tests |
 | same mutation as above | — | GREEN (unaffected, as expected) | "keeps combining marks intact" (negative control, correctly unaffected) |
+
+## Bind-existing-member follow-up (mupot#1407 extension, 2026-09-14)
+
+Separate task, separate branch: `kasra/telegram-bind-existing-member-20260914`, forked from
+`origin/main` at `49a344aa9cd20d1aa7b563b36c946bc91ffea02b` (the merged #1407). Prior commits
+on this branch, oldest first:
+
+- `c057d13c` — initial implementation: `createProjectInvite` accepts optional `member_id`;
+  `redeemTelegramProjectInvite` binds an existing member instead of inserting a new one;
+  migration `0154_project_invite_member_bind.sql` adds `invites.member_id` and extends
+  0152's joint-null trigger.
+- `aa66b330` — a correctness fix found by running the tests written for this task (not by a
+  separate review pass), plus the tests that found it and two more added afterward. See
+  "What testing found" below.
+
+This section describes work already committed at the SHAs above at the time it was written;
+it does not describe this documentation commit's own pending state.
+
+### Design (one predicate, one claim statement, no second copy)
+
+`createProjectInvite` (`src/members/project-invites.ts`): `member_id` and a caller-supplied
+`email` are mutually exclusive. When `member_id` is set, the function looks up the member with
+the SAME tenant-collapse shape as `GET /members/:id` (`WHERE id = ?1 AND (tenant = ?2 OR
+tenant IS NULL)`) — a member in another tenant reads as `member_not_found` (404), never a
+distinguishable "wrong tenant" response, so this can never become a cross-tenant existence
+oracle. `member_not_active` (403) and `member_missing_email` (400, an IM-only member with no
+email on file — `invites.email` is `NOT NULL`) are checked next; the member's own email
+becomes the invite's `email`, so the `members.email` UNIQUE fence and the receipt shape are
+byte-identical to the net-new path. The actor's capability ceiling reuses `actorRankOnSquad`
+verbatim — no second, looser rank predicate for the bind path.
+
+`redeemTelegramProjectInvite`: when `invite.member_id` is set, the atomic batch's second
+statement becomes an `UPDATE members SET telegram_chat_id = ?` (never an `INSERT`) guarded by
+`(tenant = ? OR tenant IS NULL)` and `(telegram_chat_id IS NULL OR telegram_chat_id = ?)`. A
+pre-check ahead of the batch (mirroring the existing JS-pre-check-then-SQL-fence pattern
+already used for pairing-code validity) answers the "member already bound to a DIFFERENT
+Telegram identity" conflict with its own named `telegram_identity_conflict` — necessary
+because, unlike every other member-eligibility fact, this ONE case changes the returned error
+code, so a redundant copy inside the atomic guard would only ever silently agree with it. The
+reverse conflict ("this Telegram identity already belongs to a different member") is left
+entirely to the pre-existing `UNIQUE(members.telegram_chat_id)` catch — the exact same
+mechanism the net-new path already relies on, not a second copy of it.
+
+### What testing found (a real gap, not a hypothetical)
+
+The suspended-member test (written per the brief's explicit "pin member status='active' at
+claim time" instruction) failed on the first run against the initial implementation. Cause:
+`bindMemberStatement` could affect 0 rows without throwing (a suspended member is not a SQL
+error), but `CLAIM_INVITE_SQL` — bound only to the invite's own columns — had already
+committed `accepted_at`. This permanently burned a single-use invite for a transient member
+suspension, on the ordinary SEQUENTIAL "member got suspended before `/start`" path, not merely
+under a race. Worse: the downstream capability INSERT and receipt-completion UPDATE were
+guarded only by `EXISTS(invite accepted)`, which was now true — so a residual race (the same
+kind of Telegram-conflict or a mid-flight tenant reassignment, landing between the pre-check
+and the atomic claim) would grant a squad capability and mark the receipt `completed` for a
+member whose Telegram identity was never actually bound.
+
+Fix (all inside `aa66b330`, one round, found by the task's own tests rather than a second
+review pass): `CLAIM_INVITE_SQL` gained one more conjunct — `invites.member_id IS NULL OR
+EXISTS(SELECT 1 FROM members WHERE id = invites.member_id AND status = 'active')` — so the
+claim itself refuses to commit for an inactive bind target (net-new invites are unaffected;
+the `OR` short-circuits before touching `members`). `bindMemberStatement` dropped its own
+`status = 'active'` re-check as a guaranteed-vacuous copy (`CLAIM_INVITE_SQL` already proves it
+inside the same D1-batch transaction — no external write can interleave). The capabilities
+INSERT and receipt-completion UPDATE gained a conditional `EXISTS(SELECT 1 FROM members WHERE
+id = ? AND telegram_chat_id = ?)` conjunct for the bind path, tying them to
+`bindMemberStatement`'s OWN effect having landed, not merely to `CLAIM_INVITE_SQL`'s.
+
+### Verification
+
+- `npm run typecheck`: clean.
+- `node scripts/check-migration-numbering.mjs`: `0154_project_invite_member_bind.sql` sorts
+  above `origin/main` head `0153`; no open PR (checked: #1386, #1384, #1381, #1363, #1362,
+  #1352, #1344, #1343, #1327, #1324, #1317, #1277, #1253) reserves `0154` or higher.
+- `node scripts/check-schema-chain-fresh.mjs`: fresh after `npm run gen:schema-chain`.
+- `npx vitest run tests/telegram-project-onboarding.test.ts tests/members-sensitive-response.test.ts tests/im-webhook-idempotency.test.ts tests/im-verdict-gates.test.ts`:
+  exit 0, 4 files, 111 passed (before the 3 tests the correctness fix added; see full-suite
+  count below for the final total).
+- `npx vitest run tests/telegram-project-onboarding.test.ts`: exit 0, 76/76 (was 53 before this
+  task; +23 new: 1 schema-trigger test, 7 `createProjectInvite` member_id tests, 8
+  `redeemTelegramProjectInvite` member_id tests, 5 HTTP route tests, plus the suspend-retry and
+  tenant-reassignment tests added by the correctness fix).
+- `npm test` (full suite, committed tree at `aa66b330`): see the PR body for the exact final
+  count — measured after this addendum was drafted, so it is reported there rather than
+  risking a stale number here once more commits land on top.
+
+### Mutation table (every conjunct new to this task, all executed for real: mutate → run
+### targeted test → confirm red → `git checkout --` → confirm `git diff --stat` empty → next)
+
+| Guard | Location | Mutation | Result |
+| --- | --- | --- | --- |
+| 0154 trigger: member-bind requires full project field set (INSERT + UPDATE) | migration 0154 | both RAISE ABORT clauses removed | RED — new schema test |
+| `invalid_member_id` on blank/whitespace `member_id` | `createProjectInvite` | check removed | RED — wrong error returned |
+| Member lookup returns `member_not_found` | `createProjectInvite` | check neutered (`if (false)`) | RED — 2 tests (nonexistent + cross-tenant), both throw on null deref once neutered |
+| Member lookup tenant scoping | `createProjectInvite` SQL | `(tenant = ?2 OR tenant IS NULL)` removed | RED — cross-tenant invite is minted (existence-oracle class) |
+| `member_not_active` on suspended member | `createProjectInvite` | check neutered | RED — invite minted for a suspended member |
+| `member_missing_email` on null email | `createProjectInvite` | check neutered | RED — throws on `.trim()` of null |
+| Rank ceiling (`cannot_grant_above_own_rank`) reached via the bind path | `createProjectInvite` | ceiling check neutered | RED — invite minted above actor's rank |
+| Pre-check `telegram_identity_conflict` (member already bound differently) | `redeemTelegramProjectInvite` | pre-check neutered | RED — wrong error code (falls through to atomic-guard's generic fallback instead) |
+| `CLAIM_INVITE_SQL`'s new member-status conjunct | `redeemTelegramProjectInvite` | conjunct removed | RED — 2 tests; redemption now SUCCEEDS entirely for a suspended member (both the claim's own conjunct AND bindMemberStatement's own now-removed re-check are gone, so nothing blocks it) |
+| `bindMemberStatement`'s own tenant conjunct | `redeemTelegramProjectInvite` | `(tenant = ?3 OR tenant IS NULL)` replaced with `(1=1)` | RED — tenant-reassigned member gets bound anyway |
+| `memberBindLandedGuard` cross-statement fence (capabilities INSERT + receipt UPDATE) | `redeemTelegramProjectInvite` | guard fragment/params neutered to `''`/`[]` | RED — capability row granted (count 1, expected 0) for a member whose bind never landed — the exact defect class this guard exists to prevent |
+| Stray-`email`-with-`member_id` rejection | `src/members/index.ts` `parseInvite` | check neutered | RED — 201 instead of 400 |
+| `member_not_found`/`member_not_active` → 404/403 HTTP mapping | `src/members/index.ts` `projectInviteErrorStatus` | both arms neutered | RED — both fall to default 400 |
+
+Honestly-reported non-distinguishable survivors (documented, not silently dropped):
+
+- `bindMemberStatement`'s own `(telegram_chat_id IS NULL OR telegram_chat_id = ?1)` conjunct
+  is TOCTOU-only from this test suite's perspective: the pre-check above reads the identical
+  condition from the identical row with no intervening I/O, so in every sequential test it can
+  only ever agree with the pre-check. Same class as the pre-existing receipt sub-conjuncts'
+  TOCTOU-only gap in `CLAIM_INVITE_SQL` (documented in the prior #1407 evidence above). A real
+  concurrent redemption is the only thing that could exercise it independently.
+- `bindMemberStatement`'s `EXISTS(invites WHERE id = ? AND accepted_at = ?)` conjunct: removing
+  it is not caught by any test, because the capabilities/receipt statements' own guards
+  (`EXISTS(invite accepted)` plus `memberBindLandedGuard`) already independently prevent any
+  observable bad effect even if `bindMemberStatement` re-fires harmlessly (re-setting an
+  already-correct value). Kept for structural symmetry with the net-new `INSERT`'s identical
+  `EXISTS` guard, not because a test proves it uniquely load-bearing.
+
+### Not done
+
+- A real concurrent (multi-connection) exercise of the two TOCTOU-only survivors above —
+  consistent with every prior TOCTOU-only finding in this codebase, which are accepted and
+  documented rather than fabricated into a synchronous test.
+- `docs/operations/telegram-project-onboarding.md` updated in the same commit range: removed
+  the "net-new humans only" restriction, added a "Binding a Telegram identity to an existing
+  member" section with the request shape, the three creation-time refusals, and the two
+  redemption-time conflict shapes.
