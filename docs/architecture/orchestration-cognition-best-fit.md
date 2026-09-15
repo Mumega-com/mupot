@@ -5,8 +5,8 @@ Status: decision recommendation, 2026-09-15. Grounded in repo receipts
 [port-interfaces-model-brain.md](./port-interfaces-model-brain.md),
 [loop-container-design](../superpowers/specs/2026-06-08-loop-container-design.md),
 [agent-identity-lifecycle-comparables-2026-07-21.md](../research/agent-identity-lifecycle-comparables-2026-07-21.md),
-ROADMAP Paperclip map) plus 2026 field surveys (LangGraph / CrewAI / AutoGen /
-Letta / Paperclip / Devin / DeerFlow). Updates by PR only.
+ROADMAP Paperclip map) plus 2026 field surveys and a **GitHub code survey**
+(Mumega family + starred orchestration repos). Updates by PR only.
 
 ## One-sentence recommendation
 
@@ -14,6 +14,51 @@ Letta / Paperclip / Devin / DeerFlow). Updates by PR only.
 orchestration = seat + gate + receipt + thin wake mailbox, with work execution
 owned by external runtimes (Paperclip / harness / CF Workflows) — **never** a
 CrewAI/LangGraph-shaped multi-agent framework inside the pot.
+
+## GitHub landscape (code that actually exists)
+
+The earlier peer table understated how crowded GitHub is. Treat these as
+*adjacent codebases to learn from*, not candidates to vendor into mupot core.
+
+### Mumega family (same org — highest priority to place correctly)
+
+| Repo | What it is | Layer | Relation to mupot |
+|---|---|---|---|
+| [`Mumega-com/sos`](https://github.com/Mumega-com/sos) | MCP-native agent OS: Redis bus, squad labor, inboxes, wakes, optional Mirror | Coordination **kernel** under many harnesses | **Do not re-build inside mupot.** Bus/squad poll paths retire per mupot-core; keep only rank policy + seat-on-envelope inbox. SOS README itself says frameworks build *one* agent/workflow; SOS sits *under* them — mupot is the sealed *wall*, not a second SOS. |
+| [`Mumega-com/mirror`](https://github.com/Mumega-com/mirror) | Engrams + pgvector memory, MCP, tenant RLS | Cognition / memory | Archive-or-replace with mem0 port; keep attribution on the pot. Optional plane for SOS; not mupot core. |
+| [`Mumega-com/herdr-mupot-bridge`](https://github.com/Mumega-com/herdr-mupot-bridge) | Poll plugin: flights board, presence, inbox deliver (allowlisted reads) | Execution bridge | Pattern to keep: **thin, allowlisted, seat-scoped hop**. Event-driven seatlink is the successor; don’t grow a second orchestrator here. |
+| [`Mumega-com/prime-mupot-experience`](https://github.com/Mumega-com/prime-mupot-experience) | Runbooks for prime seat vs mupot+SOS | Ops cognition | Evidence for gate discipline and boot — not a runtime to merge. |
+| [`Mumega-com/inkwell`](https://github.com/Mumega-com/inkwell) | Agent-first publishing engine | Product addon | Stays outside core (content plane). |
+
+### Starred / widely cloned orchestration code on GitHub
+
+| Repo (approx. stars) | Pattern in the code | Steal | Don’t steal into mupot |
+|---|---|---|---|
+| [`paperclipai/paperclip`](https://github.com/paperclipai/paperclip) (~80k) | Company OS: goals, org chart, budgets, heartbeats, board UI; “if OpenClaw is an employee, Paperclip is the company” | Adapter proof; budget/heartbeat *patterns*; board-as-source-of-work | Identity/authz (ROADMAP: weaker than mupot gates); don’t become Paperclip |
+| [`microsoft/autogen`](https://github.com/microsoft/autogen) (~61k) + Magentic-One | Group chat / orchestrator + specialists; task ledger + progress ledger loops | Progress-ledger *as receipts*; open-ended manager only in a **harness** | Actor group-chat as pot control plane |
+| [`crewAIInc/crewAI`](https://github.com/crewAIInc/crewAI) (~59k) | Crews (roles) + Flows (event workflows) | Flows ≈ CF Workflows thinking; keep crews out of core | Role YAML org inside the Worker |
+| [`openai/swarm`](https://github.com/openai/swarm) (~22k) | Educational flat handoffs | Handoff ergonomics at **task** scope | Standing multi-agent runtime |
+| [`letta-ai/letta`](https://github.com/letta-ai/letta) (~25k) | Stateful agents + tiered memory | Memory tier vocabulary behind mem0 port | Hosting Letta as the control plane |
+| [`kyegomez/swarms`](https://github.com/kyegomez/swarms) (~7k) | Enterprise swarm topologies | Opt-in fan-out recipes for harnesses only | Default swarm architecture |
+| [`VRSEN/agency-swarm`](https://github.com/VRSEN/agency-swarm) (~4.5k) | Agency roles + tool handoffs | Role≠authority reminder (authority = grants) | Agency tree as RBAC |
+| [`mainframecomputer/orchestra`](https://github.com/mainframecomputer/orchestra) (~0.8k) | Conduct/Compose hierarchical teams | Conductor≠executor split (aligns with rank-not-act) | Another in-process team runtime |
+| [`Yeachan-Heo/oh-my-claudecode`](https://github.com/Yeachan-Heo/oh-my-claudecode) (~39k) | Teams-first orchestration **for Claude Code** | Harness-side parallel seats; mupot remains the door/gate | Pulling IDE team orchestration into the pot |
+| [`mikeyobrien/ralph-orchestrator`](https://github.com/mikeyobrien/ralph-orchestrator) (~3k) | Autonomous loop over coding CLIs | Loop+receipt discipline for a seat | Replacing gates with “keep looping” |
+| [`Kocoro-lab/Shannon`](https://github.com/Kocoro-lab/Shannon), [`abhi1693/openclaw-mission-control`](https://github.com/abhi1693/openclaw-mission-control), [`RunMaestro/Maestro`](https://github.com/RunMaestro/Maestro) | Prod orchestration platforms / mission-control UIs | Observability + JSON agent defs as *addons* | Second control tower beside mupot door |
+| [`tinyhumansai/openhuman`](https://github.com/tinyhumansai/openhuman), [`HKUDS/DeepCode`](https://github.com/HKUDS/DeepCode), [`cft0808/edict`](https://github.com/cft0808/edict) | Harness + multi-agent workflow engines | Harness engineering lives with the seat | Competing “agent OS” inside CF Worker |
+
+**Pattern that repeats across GH:** almost every popular repo fuses (1) a reasoning
+loop, (2) multi-agent routing, and (3) sometimes a UI. Mupot’s subtraction says
+those are three different products. SOS already claimed (2)’s *bus*; Paperclip
+claims (3)+(org); harness repos claim (1). Mupot should own **authority + proof**,
+not win the stars race in category (1) or (2).
+
+**After this GH pass:** the recommendation does **not** change — it gets sharper.
+Mumega already *has* the coordination kernel (`sos`) and the memory plane
+(`mirror`). Starred orchestration code on GitHub is mostly competing to own
+those layers again. Mupot’s job is the sealed wall (seat · door · gate ·
+receipt · rank-only brain), with adapters out to Paperclip/boards and bridges
+out to harnesses (`herdr-mupot-bridge` / seatlink), not another swarm framework.
 
 ## First: separate two words the field conflates
 
