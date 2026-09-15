@@ -524,6 +524,7 @@ describe('DELETE /members/:id/telegram — round 4 (P1-A tenant fence, P2-B/C re
   const ADMIN_A = 'member-unbind-admin-a'
   const TARGET_A = 'member-unbind-target-a'
   const TARGET_B = 'member-unbind-target-b'
+  const TARGET_B_UNBOUND = 'member-unbind-target-b-unbound'
   const ORG_OBSERVER = 'member-unbind-org-observer'
 
   beforeEach(() => {
@@ -534,6 +535,7 @@ describe('DELETE /members/:id/telegram — round 4 (P1-A tenant fence, P2-B/C re
         ('${ADMIN_A}', 'Unbind Admin A', 'active', '${TENANT_A}', NULL, NULL),
         ('${TARGET_A}', 'Unbind Target A', 'active', '${TENANT_A}', '9500000', '2026-09-14T00:00:00.000000Z'),
         ('${TARGET_B}', 'Unbind Target B', 'active', '${TENANT_B}', '9500100', '2026-09-14T00:00:00.000000Z'),
+        ('${TARGET_B_UNBOUND}', 'Unbind Target B Unbound', 'active', '${TENANT_B}', NULL, NULL),
         ('${ORG_OBSERVER}', 'Org Observer', 'active', '${TENANT_A}', NULL, NULL);
       INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES
         ('cap-unbind-admin-a', '${ADMIN_A}', 'org', NULL, 'admin'),
@@ -573,6 +575,22 @@ describe('DELETE /members/:id/telegram — round 4 (P1-A tenant fence, P2-B/C re
     // The tenant-B row is untouched — not merely refused at the HTTP layer.
     expect(harness.sqlite.prepare('SELECT telegram_chat_id FROM members WHERE id = ?').get(TARGET_B))
       .toEqual({ telegram_chat_id: '9500100' })
+  })
+
+  // The clearing UPDATE has its OWN independent tenant fence too (defense in
+  // depth), so a tenant-B target with telegram BOUND can't distinguish which
+  // of the two fences a mutation broke — both independently produce
+  // member_not_found. A tenant-B target with telegram UNBOUND (NULL) CAN
+  // distinguish them: if the SELECT's OWN fence were removed, the SELECT
+  // would find the tenant-B row anyway (matching by id alone) and this
+  // would answer `telegram_not_bound` instead of `member_not_found` — a
+  // cross-tenant EXISTENCE ORACLE. This is the case only the SELECT's own
+  // fence closes.
+  it('P1-A — the SELECT fence itself: a tenant-B member with NO Telegram bound answers member_not_found, never telegram_not_bound (no cross-tenant oracle)', async () => {
+    const res = await membersApp.fetch(unbindRequest(TARGET_B_UNBOUND), env)
+
+    expect(res.status).toBe(404)
+    await expect(res.json()).resolves.toEqual({ error: 'member_not_found' })
   })
 
   it('P2-B/C — a successful unbind writes an append-only receipt row (actor, target, prior identity)', async () => {
