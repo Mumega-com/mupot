@@ -770,6 +770,40 @@ describe('DELETE /members/:id/telegram — round 4 (P1-A tenant fence, P2-B/C re
     ).get(TARGET_B)).toEqual({ n: 0 })
   })
 
+  // A8 (Athena final-gate round 5, 2026-09-15): the clearing UPDATE and the
+  // receipt INSERT are now ONE atomic DB.batch() — if mutated back to two
+  // separate .run() calls, a failed receipt write would leave the binding
+  // cleared with no durable trace. Forces the receipt INSERT to fail with a
+  // real PRIMARY KEY violation (a receipt with the id crypto.randomUUID() is
+  // about to mint already exists) and asserts the clearing UPDATE did NOT
+  // survive — same transaction, rolled back together.
+  it('A8 — a failed receipt write leaves the binding intact (clearing UPDATE + receipt INSERT are atomic)', async () => {
+    const FIXED_UUID = '00000000-0000-4000-8000-000000000001'
+    vi.spyOn(crypto, 'randomUUID').mockReturnValue(FIXED_UUID as ReturnType<typeof crypto.randomUUID>)
+    harness.sqlite.exec(`
+      INSERT INTO telegram_unbind_receipts (id, tenant, member_id, actor_id, prior_telegram_chat_id, created_at)
+        VALUES ('${FIXED_UUID}', '${TENANT_A}', '${TARGET_A}', 'someone-else', 'stale', '2026-09-14T00:00:00.000Z');
+    `)
+
+    const res = await membersApp.fetch(unbindRequest(TARGET_A), env)
+    expect(res.status).toBe(500)
+
+    // The clearing UPDATE must NOT have survived — it ran in the SAME
+    // DB.batch() transaction as the receipt INSERT that failed.
+    expect(harness.sqlite.prepare('SELECT telegram_chat_id FROM members WHERE id = ?').get(TARGET_A))
+      .toEqual({ telegram_chat_id: '9500000' })
+    // The pre-existing (unrelated) receipt row is untouched — no second row
+    // for this id, and its own fields were never overwritten.
+    expect(harness.sqlite.prepare(
+      'SELECT COUNT(*) AS n FROM telegram_unbind_receipts WHERE id = ?',
+    ).get(FIXED_UUID)).toEqual({ n: 1 })
+    expect(harness.sqlite.prepare(
+      'SELECT actor_id FROM telegram_unbind_receipts WHERE id = ?',
+    ).get(FIXED_UUID)).toEqual({ actor_id: 'someone-else' })
+
+    vi.restoreAllMocks()
+  })
+
   it('P2-B/C — a successful unbind writes an append-only receipt row (actor, target, prior identity)', async () => {
     const res = await membersApp.fetch(unbindRequest(TARGET_A), env)
 
@@ -834,6 +868,24 @@ describe('DELETE /members/:id/telegram — round 4 (P1-A tenant fence, P2-B/C re
     await expect(res.json()).resolves.toEqual({ error: 'member_not_found' })
     expect(harness.sqlite.prepare(
       'SELECT COUNT(*) AS n FROM member_tokens WHERE member_id = ?',
+    ).get(TARGET_B)).toEqual({ n: 0 })
+  })
+
+  // P1 (kasra-review adversarial addendum round 5, 2026-09-15): POST
+  // /members/:id/capabilities' member lookup was ALSO unscoped by tenant —
+  // the same #1330 F2 class as suspend/mint/unbind in this file. A tenant-A
+  // admin could grant (or revoke) a capability on a tenant-B member.
+  it('P1 round 5 — refuses (member_not_found) a tenant-A admin GRANTING a capability on a tenant-B member', async () => {
+    const res = await membersApp.fetch(new Request(`https://pot.example/members/${TARGET_B}/capabilities`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ scope_type: 'org', capability: 'admin' }),
+    }), env)
+
+    expect(res.status).toBe(404)
+    await expect(res.json()).resolves.toEqual({ error: 'member_not_found' })
+    expect(harness.sqlite.prepare(
+      `SELECT COUNT(*) AS n FROM capabilities WHERE member_id = ? AND scope_type = 'org' AND scope_id IS NULL`,
     ).get(TARGET_B)).toEqual({ n: 0 })
   })
 })
