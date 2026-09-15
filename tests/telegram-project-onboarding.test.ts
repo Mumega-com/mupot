@@ -1296,6 +1296,46 @@ describe('Telegram project invitation service', () => {
       .toEqual({ accepted_at: null })
   })
 
+  it("still allows redemption when the NET-NEW invite minter's standing is a DEPARTMENT-level grant, not a direct squad grant (round 6 P2, currentMemberSquadRank department inheritance)", async () => {
+    const DEPARTMENT_MINTER = 'member-department-minter'
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status, tenant)
+      VALUES ('${DEPARTMENT_MINTER}', 'department-minter@example.test', 'Department Minter', 'active', '${TENANT}');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+      VALUES ('cap-department-minter', '${DEPARTMENT_MINTER}', 'department', 'department-delivery', 'admin');
+    `)
+    const departmentMinterAuth: AuthContext = {
+      userId: 'department-minter-user',
+      email: 'department-minter@example.test',
+      role: 'member',
+      tenant: TENANT,
+      memberId: DEPARTMENT_MINTER,
+      capabilities: [{
+        member_id: DEPARTMENT_MINTER, scope_type: 'department', scope_id: 'department-delivery', capability: 'admin',
+      }],
+    }
+    const created = await createProjectInvite(env, departmentMinterAuth, {
+      email: 'net-new-department-minted@example.test',
+      project_id: 'project-active',
+      squad_id: 'squad-participants',
+      capability: 'member',
+      expires_in_seconds: 3600,
+    })
+    expect(created.ok).toBe(true)
+    if (!created.ok) return
+    reserveUpdate('update-net-new-department-minter-ok', VALID_REQUEST_DIGEST, '9001102')
+
+    const result = await redeemTelegramProjectInvite(env, {
+      pairing_code: created.value.pairing_code,
+      telegram_user_id: '9001102',
+      display_name: 'Net New Department Minted',
+      update_id: 'update-net-new-department-minter-ok',
+      request_digest: VALID_REQUEST_DIGEST,
+    })
+
+    expect(result.ok).toBe(true)
+  })
+
   // ── Athena addendum D: this onboarding slice is net-new humans only.
   // Redeeming an invite whose email already belongs to an existing member
   // (a different Telegram identity, so no telegram_chat_id conflict) must
@@ -2366,6 +2406,16 @@ describe('Telegram project invite — bind existing member', () => {
     })
 
     it('still allows redemption when the minter member-binds THEMSELVES — self-exempt from the target-promotion ceiling (round 6 P1-A)', async () => {
+      // member-bind-owner's GLOBAL rank (5, via this squad-owner grant on an
+      // UNRELATED squad) exceeds their own ORG-scope-local rank (4, admin) —
+      // so WITHOUT the self-exemption, targetOutgrewMinter would compute
+      // target(5) > minter(4) and incorrectly refuse a principal acting on
+      // themselves. This is the discriminating fixture: it fails if the
+      // self-exemption is ever dropped, unlike a same-rank self-target.
+      harness.sqlite.exec(`
+        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES ('cap-bind-owner-unrelated-squad-owner', 'member-bind-owner', 'squad', 'squad-unrelated-to-bind', 'owner')
+      `)
       const created = await createProjectInvite(env, ownerAuth, {
         member_id: 'member-bind-owner',
         project_id: 'project-bind',
