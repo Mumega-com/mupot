@@ -231,11 +231,12 @@ function projectFrom(run: RunContext): Project {
 }
 
 // Exported for P1-4 unit-level pinning of notifyHumanWait's null-assignee
-// branch (`if (!run.assigned_agent_id) return true`): every reachable public
-// entry point (submitRoutineProposal) requires the acting agent principal to
-// equal run.assigned_agent_id before it ever gets this far, so a null
-// assignee can only be exercised by driving notifyHumanWait directly with a
-// real, correctly-shaped RunContext/ActionRow — not by re-deriving the join.
+// branch (`if (!run.assigned_agent_id) return { delivered: false, reason:
+// 'no_recipient' }`): every reachable public entry point
+// (submitRoutineProposal) requires the acting agent principal to equal
+// run.assigned_agent_id before it ever gets this far, so a null assignee can
+// only be exercised by driving notifyHumanWait directly with a real,
+// correctly-shaped RunContext/ActionRow — not by re-deriving the join.
 export async function loadRun(env: Env, runId: string): Promise<RunContext | null> {
   return env.DB.prepare(
     `SELECT rr.id, rr.tenant, rr.project_id, rr.routine_id, rr.routine_revision,
