@@ -1120,3 +1120,292 @@ ever exercised the same-scope case and could not have caught this regression.
   complete (non-chunked) full-suite run recorded on this branch. It reconciles exactly
   with CI's 8054-passed/1-failed count at `fbf85528`: 8054 + 1 (the fixed test) + 3 (the
   new tests above) = 8058.
+
+## Round 4 — Kasra adversarial re-gate + Athena addendum (2026-09-15)
+
+Kasra adversarial re-gate on head `a832f84d` (round 3's final head): **BLOCK** (CI
+16/16, 14/16 mutations killed, P0 still open on one plane). Athena's parallel gate added
+5 more items (N1-N5) before this round pushed. All items addressed below, one commit per
+logical group: `b00a4764` (code + first tests), `bd7172e1` (N1 test), `23b5c0bc` (P1-A
+SELECT-fence-specific test).
+
+### P0-A (BLOCK) — the role plane, not just grant rows
+
+`targetMaxRankAcrossScopes` (`src/auth/capability.ts`) maxed only over
+`resolveCapabilities`'s GRANT ROWS. `actorRankOnScopeFor` floors the ACTOR on BOTH
+`auth.role` and grants — an asymmetry: the org owner "characteristically holds zero
+capability rows" (`src/auth/index.ts:917-923`), so the OLD ceiling measured the owner's
+standing as 0. Executed by the reviewer: org admin invites `member_id` = bootstrap owner
+→ MINTED; redeemed; owner row `telegram_chat_id = ATTACKER-TG-99`; `PATCH
+.../status=suspended` on the owner → **200** (the exact #1337 lockout).
+
+Fix: new `targetLegacyRoleRank(env, targetMemberId)` — reads `members.email` for the
+target, then `users.role` for that email (the SAME email-is-the-dedup-key bridge
+`upsertUserByEmail` in `src/auth/index.ts` already uses to keep one human's `users` row
+and `members` row in sync — `members` carries no `role` column at all). No email, or an
+email matching no `users` row, resolves to 0 — the safe default, never an escalation.
+Folded into `targetMaxRankAcrossScopes` itself (the ONE helper), so all 4 call sites
+inherit it: suspend/reactivate, token mint, capability grant (`src/members/index.ts`),
+and the member-bind invite (`src/members/project-invites.ts`).
+
+Tests (`tests/members-agent-capability-route.test.ts`, new `BOOTSTRAP_OWNER_MEMBER`
+fixture — a members row + a `users` row sharing its email, role='owner', **zero**
+capability rows):
+- suspend → 403, member stays active
+- token mint → 403, zero `member_tokens` rows
+- capability grant/revoke → 403, no row change
+- a member with NO email bridges to nothing (rank 0), never treated as elevated — proves
+  absence-of-bridge is the safe default, not a separate escalation path
+
+Takeover-probe re-run (`tests/telegram-project-onboarding.test.ts`, `describe
+createProjectInvite — member_id`): org admin mints a `member_id` invite for the same
+bootstrap-owner shape → `{ ok: false, error: 'forbidden' }`, zero invite rows created.
+
+Mutation: commented out the `targetLegacyRoleRank` fold line in
+`targetMaxRankAcrossScopes` → **RED** on all 3 new route tests + the takeover-probe re-run
+(4 tests total). Restored (`git diff --stat` empty before continuing).
+
+### N2 (Athena, BLOCK) — actor/target symmetry + self-exemption
+
+`exceedsTargetRankCeiling`'s `actorRank` parameter was always a SCOPE-LOCAL number
+(`actorMaxRankOnScope(c, scopeType, scopeId)`) compared against a GLOBAL target rank —
+two different quantities. Athena's repro: actor = org admin (rank 4 on the `org` scope)
+who ALSO holds `owner` on one unrelated squad (real global standing 5) → self-mint
+(target = self) → **403**, a principal measured as unable to outrank himself. Same class
+on suspend/reactivate, capability grant, member-bind invite, and the new unbind route.
+
+Fix: new `actorMaxRankAcrossScopes(env, auth)` — the actor's standing on the SAME global
+quantity `targetMaxRankAcrossScopes` computes for the target (role-plane rank, unioned
+with the max grant rank across every scope). Sources grants from `auth.capabilities ??
+resolveCapabilities(...)` — the SAME precedence `actorRankOnScopeFor` already uses —
+rather than an unconditional DB requery, because a directory-channel session has
+`auth.capabilities` deliberately zeroed to `[]` by the B1 ambient-authority ceiling; a raw
+DB query here would silently reinstate exactly the ambient authority that ceiling exists
+to close. `exceedsTargetRankCeiling`'s signature changed to `(env, auth, targetMemberId)`
+and is now explicitly self-exempt (`auth.memberId === targetMemberId` → never exceeds),
+independent of the comparison. `targetRankCeiling` (`src/members/index.ts`) no longer
+takes a scope at all — the ceiling question is scope-independent by construction now.
+
+Tests:
+- `tests/members-agent-capability-route.test.ts` — a member holding org-admin (grant,
+  rank 4) AND squad-owner-elsewhere (grant, rank 5) self-suspends, self-mints, and
+  self-grants — all succeed (200/201), proving the actor/target symmetry fix (this
+  fixture's `auth.capabilities` already matches the DB rows, so it isolates the
+  local-vs-global fix from the self-exempt fix below).
+- `tests/telegram-project-onboarding.test.ts` — `ownerAuth`'s OWN `capabilities` field
+  is fixed at describe-setup time to org-admin only; a NEW squad-owner grant is inserted
+  directly into the DB afterward (simulating a session whose `auth.capabilities` has gone
+  stale relative to the DB) and `ownerAuth` member-binds `member_id` = itself → succeeds.
+  This is the case that isolates self-exemption specifically: without it, actor (session-
+  cached, rank 4) vs target (fresh DB read, rank 5) would disagree even though they are
+  the same principal.
+
+Mutation: (a) commented out the self-exempt line — **RED** on the telegram-onboarding
+self-bind test (members-agent-capability-route's self test stayed green, because its
+fixture has actor/target always computed identically — an honest, reported non-kill for
+THAT specific test, not a gap in the self-exempt line's coverage overall). (b) reverted
+`actorMaxRankAcrossScopes` to always call `resolveCapabilities` (dropping the
+`auth.capabilities ??` precedence) — **RED** on the pre-existing `P0-1c` test (an org
+owner acting via `auth.capabilities` alone, no matching DB rows), confirming the
+B1-ceiling-respecting precedence is independently load-bearing. Both restored.
+
+### N1 (Athena) — token mint's own pre-existing tenant gap
+
+`POST /members/:id/tokens`' member lookup (`src/members/index.ts`) was `WHERE id = ?`
+alone — the same #1330 F2 class the suspend route next to it, and this round's own unbind
+route, both needed fencing. Fixed with the identical tenant-collapse predicate (exact
+match OR legacy NULL-tenant row) used elsewhere in this file; no tenant-adoption write
+needed since this handler never updates the `members` row itself.
+
+Test: tenant-A admin mints a token for a tenant-B member → `404 member_not_found`, zero
+`member_tokens` rows. Mutation: dropped the tenant conjunct → **RED** (201 instead of
+404).
+
+### P1-A — unbind's tenant gap (two independent fences)
+
+`DELETE /members/:id/telegram`'s SELECT and its clearing UPDATE were both `WHERE id = ?`
+alone. Fixed both: the SELECT with the standard tenant-collapse predicate; the UPDATE
+with tenant-collapse-and-adopt PLUS a `telegram_chat_id = ?` TOCTOU conjunct pinning it to
+the exact identity the handler just read (same discipline as this feature's own
+`MEMBER_BIND_LANDED_GUARD_SQL`).
+
+Tests + a mutation surprise worth recording: a tenant-B target with Telegram BOUND
+(`telegram_chat_id` set) returns `member_not_found` — but mutating away the SELECT's OWN
+tenant fence left that test GREEN, because the UPDATE's independent tenant fence still
+converts the request to a 0-row update → the same `member_not_found` response via a
+different path. Added a SECOND, distinguishing test: a tenant-B target with NO Telegram
+bound (`telegram_chat_id IS NULL`). Under the same SELECT-fence-removed mutation, this one
+goes RED — the mutated SELECT finds the tenant-B row by id alone and answers
+`telegram_not_bound` instead of `member_not_found`, the cross-tenant EXISTENCE ORACLE the
+fence exists to prevent. Both mutations (SELECT alone; the combined SELECT+UPDATE) are
+now correctly killed by at least one test.
+
+### P2-B/C — unbind receipt + the M8 mutation survivor
+
+No route/tool/table anywhere recorded an unbind (grepped `INSERT INTO
+telegram_unbind_receipts`, `INSERT INTO connector_audit`, `dashboard/audit.ts`'s
+`loadAudit` sources — none read or wrote anything for this action; the mint/revoke paths
+in this same file write no receipt row either, confirmed by reading `mintMemberToken`/
+`revokeMemberToken` in `src/members/service.ts`, so there was no existing writer to reuse
+verbatim). New append-only `telegram_unbind_receipts` table added to migration 0154
+(still unshipped — additive `CREATE TABLE IF NOT EXISTS`, no rebuild), following this
+codebase's own per-action-class receipt-table convention (`oauth_consent_receipts` 0091,
+`gate_owner_reassignments` 0113, `verdict_reversals` 0118). Written only once the clearing
+UPDATE is proven (by its own row-count check) to have landed against the exact prior
+identity — never a phantom receipt for a no-op.
+
+M8: the ONLY pre-existing negative test for this route's `requireCapability(orgScope,
+'admin')` gate used a SQUAD-scope non-admin — an org-scope `admin` → `observer` mutation
+at that exact line left the whole suite green. Added the missing ORG-SCOPE observer
+negative test.
+
+Tests + mutations: (a) removed the receipt INSERT entirely → RED (the receipt-exists
+assertion fails, `undefined` instead of a row). (b) mutated the route's own capability
+floor from `'admin'` to `'observer'` → RED on the new M8 test (200 instead of 403).
+
+### P2-D (Athena) — enumeration oracle via check ordering
+
+`createProjectInvite`'s coarse "does the actor hold admin standing at ALL" check ran
+AFTER the member lookup, so a zero-standing caller got a DIFFERENT error per target
+(`member_not_found` / `member_not_active` / `member_missing_email`) — an enumeration
+oracle reachable by anyone, admin or not. Neither `edge` (squad/department, resolved
+earlier) nor the actor-rank computation depends on the target member row, so the check
+moved above the lookup with no other reordering needed.
+
+Test: one zero-standing actor (`squadOnlyAdminAuth`, no org-scope standing) against FOUR
+target shapes — nonexistent, active, suspended, no-email — all four now return the
+IDENTICAL `{ ok: false, error: 'forbidden' }`, and zero invite rows exist for any of them.
+Mutation: disabled the early actor-rank gate (falls through to the member lookup first,
+as before the fix) → RED — the four calls diverge (`forbidden` / `forbidden` /
+`member_not_found` / `cannot_grant_above_own_rank` / `member_missing_email` depending on
+target), exactly the oracle the fix closes.
+
+### P2-E — capability upgrade at redemption, not a permanent brick
+
+Round 2's P2-3 ("any pre-existing grant on the invited squad throws a UNIQUE violation,
+rolling the whole claim back to a permanent, unrecoverable `redemption_failed`") was left
+explicitly NOT FIXED. On the bind-EXISTING-member path this is the MOST common shape — the
+whole point is usually adding Telegram to someone who already works on that squad. Fixed
+with `INSERT … ON CONFLICT (member_id, scope_type, scope_id) DO UPDATE SET capability =
+<higher of existing vs invited, via a RANK_SQL_CASE ladder matching capability.ts's own
+RANK> ` — never downgrades (an existing `admin` redeeming an `observer` invite keeps
+`admin`), never exceeds the invite's own capability (already capped at mint time to `<=`
+the minter's rank via the pre-existing `cannot_grant_above_own_rank` check, so this can
+never smuggle a grant past the minter's ceiling). When the guarding `WHERE EXISTS(...)`
+is false (a failed claim), zero source rows means the INSERT never fires and `ON CONFLICT`
+never triggers — a failed claim touches no pre-existing row.
+
+Tests: (a) existing `observer` grant on the invited squad, invite for `member` → upgraded
+to `member`, exactly ONE row (not a second row, not thrown away). (b) existing `admin`
+grant, invite for `observer` → KEPT at `admin`, never downgraded.
+
+Mutations: (a) reverted to a bare INSERT (no `ON CONFLICT`) → RED on both tests (`ok:
+false`, `redemption_failed`). (b) kept `ON CONFLICT` but replaced the CASE with an
+unconditional `capability = excluded.capability` (would silently downgrade) → RED on both
+— a bind-param-count mismatch this time (compile-broken mutation, not a semantic
+survivor: the `?` in the CASE's comparison is now unused, so the extra
+`capabilityRank(invite.capability)` bind value has no matching placeholder) — still an
+honest kill, confirmed via the exact `column index out of range` error, not a silently
+wrong pass.
+
+### N4 (Athena) — creation must not mint a permanently dead invite
+
+Creation's member lookup (`project-invites.ts`) collapsed a NULL-tenant target the SAME
+way `GET /members/:id` does (`tenant = ? OR tenant IS NULL`) — right for a READ, wrong
+here: redemption's `MEMBER_BIND_ELIGIBLE_SQL` requires an EXACT, non-NULL tenant match,
+so a NULL-tenant target passed creation, minted a real invite, and could NEVER be
+redeemed — a silent, permanent dead invite indistinguishable from any other expired code.
+Creation now uses the SAME exact-match predicate the eligibility fence enforces; a
+NULL-tenant target now refuses immediately with `member_not_found` (still not a
+cross-tenant oracle — a NULL-tenant row and a genuinely nonexistent one resolve to the
+identical refusal).
+
+Test: NULL-tenant target → creation itself refuses (`member_not_found`), zero invite rows
+minted (replaces the round-2 test that asserted creation SUCCEEDED and only redemption
+failed — that assertion described exactly the bug N4 closes). Mutation: reverted to the
+collapse-shaped predicate → RED (creation now succeeds, minting the dead invite again).
+
+### N5 (Athena, Low) — parameter order, not just SQL text
+
+The existing seam test (`CLAIM_INVITE_SQL`/`MEMBER_BIND_UPDATE_SQL` both `.toContain(
+MEMBER_BIND_ELIGIBLE_SQL)`) proves identical SQL TEXT, not that both call sites bind the
+SAME VALUES in the SAME ORDER into that text's 3 placeholders — a transposed bind at only
+one site would still pass. Added a behavioral test: spies on both statements' real
+`.bind()` calls during one genuine redemption (a thin wrapper around `env.DB.prepare` that
+records the bound values for the two target SQL strings, then delegates to the real
+statement) and asserts the exact 3-tuple `(id, tenant, telegram)` each site binds,
+including that they agree with EACH OTHER, not merely with the fixture.
+
+### Runbook + docs
+
+- `docs/operations/telegram-project-onboarding.md`: "Who may target whom" rewritten for
+  the global-standing + self-exempt semantics, with the operator-visible consequence
+  called out explicitly — a member outranking an org admin via even ONE unrelated squad
+  is untouchable by every org admin across all 5 gated actions (suspend, mint, grant,
+  member-bind invite, unbind); only an owner (or an equal-or-higher grant holder) can act
+  on them. "Undoing a bind" updated for the tenant fence and the new receipt table.
+- `docs/architecture/human-decision-channel-contract.md` (N3, Athena, BLOCK for merge):
+  this file was added to `main` at `bebed97e` — AFTER this branch (`kasra/telegram-bind-
+  existing-member-20260914`, base `main`, forked earlier) — so it does not exist in this
+  branch's own history to diff against. Added here with clause (g)'s "Net-new humans
+  only" gap rewritten as CLOSED (member-bind invite + unbind, with the authority floor
+  described) and clause (a)'s `CLAIM_INVITE_SQL` citations corrected to its current range
+  (`:315-349`, moved since the doc's original citation) plus both invite-creation rank
+  paths named (`actorRankOnSquad` net-new vs `actorRankOnScopeFor(org)` +
+  `exceedsTargetRankCeiling` member-bind). **This WILL need reconciling at merge time** —
+  main's copy of this file has no shared history with this branch's copy, so a merge will
+  see it as two independent adds of the same path. Flagging explicitly rather than
+  silently hoping git's 3-way merge resolves it cleanly (it should not — an add/add
+  conflict is the expected, correct outcome for a human/kasra-git to reconcile, not a bug
+  in this branch).
+
+### Verification
+
+- `npm run typecheck`: clean (`tsc --noEmit` exit 0), rerun after every code change in
+  this round.
+- Focused suites rerun clean after all fixes: `tests/members-capability-service.test.ts`,
+  `tests/members-sensitive-response.test.ts`, `tests/telegram-project-onboarding.test.ts`
+  (96/96), `tests/members-agent-capability-route.test.ts` (24/24), plus
+  `tests/squad-member-tools.test.ts`, `tests/agent-self-update.test.ts`,
+  `tests/flight-routes.test.ts`, `tests/members-capability-sqlite.test.ts`,
+  `tests/org-admin-capability-gate.test.ts`, `tests/surface-caps.test.ts` — 10 files,
+  335/335 combined.
+- All 8 local CI-parity scripts green: `check-schema-chain-fresh`,
+  `check-migration-numbering` (0154 still sorts above `origin/main` head 0153),
+  `check-test-schema-source` (26/127 baselines unchanged — no new mock-DB files, only
+  existing stubs updated for the new `SELECT email FROM members` / `SELECT role FROM
+  users` queries `targetLegacyRoleRank` introduces), `check-mcp-tool-seam`,
+  `check-operator-counts-source`, `check-branch-staleness`, `release-truth-policy` (4
+  docs scanned), `no-secrets`.
+- Mutation table (14 mutations, all executed for real via `sed`/`python3` source
+  mutation → rerun the specific test(s) → confirm RED → `git checkout --` restore →
+  confirm `git diff --stat` empty before the next mutation):
+
+| # | Item | Mutation | Result |
+| --- | --- | --- | --- |
+| M1 | P0-A | drop `targetLegacyRoleRank` fold in `targetMaxRankAcrossScopes` | RED (4 tests) |
+| M2 | N2 self-exempt | drop the `auth.memberId === targetMemberId` line | RED (telegram self-bind test); honest non-kill on the DB-synced self-fixture (documented as an isolating pair, not a gap) |
+| M3 | N2 precedence | `actorMaxRankAcrossScopes` always calls `resolveCapabilities` (drops `auth.capabilities ??`) | RED (P0-1c) |
+| M4a | P1-A SELECT | drop unbind SELECT's tenant conjunct | GREEN on the bound-target test (UPDATE's own fence covers it) — reported, not hidden |
+| M4b | P1-A SELECT | same mutation, unbound-target test | RED (existence oracle) |
+| M6 | P2-B/C receipt | remove the receipt INSERT | RED |
+| M7 | P2-B/C / M8 | `requireCapability(orgScope,'admin')` → `'observer'` on unbind | RED |
+| M8(N1) | N1 | drop token-mint SELECT's tenant conjunct | RED |
+| M9 | P2-D | disable the early actor-rank gate | RED |
+| M10 | P2-E | revert `ON CONFLICT` to bare INSERT | RED (both tests) |
+| M11 | P2-E | keep `ON CONFLICT`, force unconditional overwrite | RED (compile-broken: bind-count mismatch, still a kill) |
+| M12 | N4 | revert to the NULL-tenant collapse predicate | RED |
+
+Killed-by: M1 → `members-agent-capability-route.test.ts` (3 new P0-A tests) +
+`telegram-project-onboarding.test.ts` (`P0-A` takeover-probe re-run). M2 →
+`telegram-project-onboarding.test.ts` (`N2` self-bind-via-stale-session test). M3 →
+`telegram-project-onboarding.test.ts` (`P0-1c`, pre-existing). M4a/M4b →
+`members-agent-capability-route.test.ts` (`P1-A` — the SELECT-fence-specific variant).
+M6/M7 → `members-agent-capability-route.test.ts` (`P2-B/C` receipt test; `M8` observer
+test). M8(N1) → `members-agent-capability-route.test.ts` (`N1` test). M9 →
+`telegram-project-onboarding.test.ts` (`P2-D` test). M10/M11 →
+`telegram-project-onboarding.test.ts` (both `P2-E` tests). M12 →
+`telegram-project-onboarding.test.ts` (`N4` test).
+
+- **Full suite (`npm test`, all files, default worker parallelism, run once, host load
+  average ~1.2-2.4 at start): exit 0, 512 files, 8075 tests, 0 failed, 469s wall time. Reconciles exactly with round 3's 8058 + 17 new tests this round (6 in telegram-project-onboarding.test.ts, 11 in members-agent-capability-route.test.ts).**
