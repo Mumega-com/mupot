@@ -15,10 +15,20 @@ a Hermes line number — see `agent-harness-contract.md`'s Hermes-citation note.
 This is one of **two** conformance surfaces in this repo. `docs/runtime-adapter-contract.md`
 already has its own "Planned Conformance Tests" section (`:603-626`, `npm run
 conformance:runtime:local`) covering the identity/attach/messaging layer (signed
-attach, detach, heartbeat, inbox send/read/peek). This document does not repeat that
-surface — the rows below start one layer up, at the decision-channel and harness-safety
-properties that surface does not cover (invite binding, replay, principal, fences,
-receipts, e-stop, allowlists).
+attach, detach, heartbeat, inbox send/read/peek) — round 3 correction: that section's
+own text also *names*, at `:622-626`, planned webhook/capability/verdict/receipt cases
+("Hermes help, status, wake, task, unknown chat, unauthorized webhook, and forbidden
+capability cases"; "task creation `done_when`, ... verdict, and gated-completion
+behavior"; "result receipt and retry behavior") that overlap this document's own scope
+— the prior revision's claim that this document's rows "start one layer up" at
+properties that surface "does not cover" overstated the separation. The real
+distinction: those lines in `runtime-adapter-contract.md` are a one-line *planned*
+mention with no probe/expected/mutation table attached, while this document commits to
+an executable black-box spec (probe, expected outcome, kill mutation, existing test or
+TODO) for invite binding, replay, principal, fences, receipts, e-stop, and allowlists.
+This document does not duplicate that other section's own conformance suite
+(`npm run conformance:runtime:local`); it fills in the test-spec detail that section's
+one-line mentions do not themselves provide.
 
 ## How to read this table
 
@@ -44,30 +54,30 @@ receipts, e-stop, allowlists).
 
 | # | Probe | Expected | Kill mutation | Existing test |
 |---|---|---|---|---|
-| a1 | Redeem the same pairing code twice | 2nd redemption `invalid_or_expired_pairing_code`, no 2nd member/capability row | Drop `accepted_at IS NULL` from `CLAIM_INVITE_SQL` | `tests/telegram-project-onboarding.test.ts:625-629` (`M5`, `runClaim()` returns `0` rows affected) — this pins the SQL fence directly; it does not additionally assert the HTTP-level `invalid_or_expired_pairing_code` reply text for a *second* redemption attempt through the full webhook path, which remains implicit rather than pinned end-to-end |
+| a1 | Redeem the same pairing code twice | 2nd redemption `invalid_or_expired_pairing_code`, no 2nd member/capability row | Drop `accepted_at IS NULL` from `CLAIM_INVITE_SQL` | `tests/telegram-project-onboarding.test.ts:626-629` (`M5`, `runClaim()` returns `0` rows affected) — this pins the SQL fence directly; it does not additionally assert the HTTP-level `invalid_or_expired_pairing_code` reply text for a *second* redemption attempt through the full webhook path, which remains implicit rather than pinned end-to-end |
 | a2 | Redeem a code past `pairing_expires_at` | `invalid_or_expired_pairing_code` | Drop `pairing_expires_at > ?8` | `tests/telegram-project-onboarding.test.ts:632` (`M6`) |
 | a3 | Redeem with no matching `processing` receipt | `invalid_or_expired_pairing_code`/`update_receipt_invalid`, no writes | Drop the receipt `EXISTS` conjunct | `tests/telegram-project-onboarding.test.ts:638` (`M7`) |
 | a4 | Redeem into a project archived between invite mint and claim | Claim refused, no member/capability written | Drop `projects.status='active'` `EXISTS` | `tests/telegram-project-onboarding.test.ts:655` (`M8`) |
 | a5 | Redeem after the `project_squad_access` edge is revoked | Claim refused | Drop the `project_squad_access` `EXISTS` | `tests/telegram-project-onboarding.test.ts:672` (`M9`) |
 | a6 | Create an invite with a capability above the inviter's own rank | `cannot_grant_above_own_rank` | Remove the `capabilityRank(input.capability) > actorRank` check | `tests/telegram-project-onboarding.test.ts:383` |
-| a7 | Redeem, then read the invite row for a raw secret | Only `pairing_hash` ever stored; `pairing_code` never persisted | N/A — schema/code review, not a runtime mutation | **TODO**, confirmed genuinely absent (verified this revision): `tests/telegram-project-onboarding.test.ts:361-369` ("creates an active project invite ... stores only the pairing hash") reads the row via `SELECT project_id, squad_id, pairing_hash, pairing_expires_at FROM invites` — the column list itself excludes any raw-secret column, so `expect(JSON.stringify(row)).not.toContain(pairing_code)` (`:369`) is true by construction of the query, not proof the schema/other columns never persist it. A real probe needs `SELECT *` or a schema check |
+| a7 | Redeem, then read the invite row for a raw secret | Only `pairing_hash` ever stored; `pairing_code` never persisted | N/A — schema/code review, not a runtime mutation | **TODO**, confirmed genuinely absent (verified this revision): `tests/telegram-project-onboarding.test.ts:351-371` ("creates an active project invite ... stores only the pairing hash") reads the row via `SELECT project_id, squad_id, pairing_hash, pairing_expires_at FROM invites` — the column list itself excludes any raw-secret column, so `expect(JSON.stringify(row)).not.toContain(result.value.pairing_code)` (the assertion, at `:371`) is true by construction of the query, not proof the schema/other columns never persist it. A real probe needs `SELECT *` or a schema check |
 | a8 | Redeem using Telegram `first_name`/`username` as if they were identity | Display-name-only; identity is `telegram_user_id`, never these fields | Make `redeemTelegramProjectInvite` accept `display_name` as a lookup key | `tests/telegram-project-onboarding.test.ts:1435` (E, display_name label only) |
 
 ### (b) Ingress authority
 
 | # | Probe | Expected | Kill mutation | Existing test |
 |---|---|---|---|---|
-| b1 | POST `/im/webhook` with `IM_WEBHOOK_SECRET` unset | `503 webhook_not_configured` | Default the secret check to pass when unset | **TODO** — no test drives the unset-secret branch of `src/im/index.ts:911-913` directly. `tests/im-webhook.test.ts:47` ("keeps bad small secrets unauthorized") exercises the wrong-secret → `401` branch (`:914-917`), a *different* clause, and was miscited here in the prior revision. Separately: `src/channels/adapters/telegram.ts`'s `ChannelAdapter.verify` (`:44-49`) implements the identical fail-closed check against the same env var and IS unit-tested for the unset case (`tests/telegram-adapter.test.ts:12-14`, `test('fails closed when IM_WEBHOOK_SECRET is not configured')`) — but that test exercises the `/channels/telegram/...` path (`src/channels/index.ts:776`), a separate live route from `/im/webhook`, not this clause's own inline check. Two copies of one predicate, only one of which is tested for the unset case; see `human-decision-channel-contract.md` (b) |
+| b1 | POST `/im/webhook` with `IM_WEBHOOK_SECRET` unset | `503 webhook_not_configured` | Default the secret check to pass when unset | **TODO** — no test drives the unset-secret branch of `src/im/index.ts:911-913` directly. `tests/im-webhook.test.ts:47` ("keeps bad small secrets unauthorized") exercises the wrong-secret → `401` branch (`:914-917`), a *different* clause, and was miscited here in the prior revision. Separately: `src/channels/adapters/telegram.ts`'s `ChannelAdapter.verify` (`:47-52`) implements the identical fail-closed check against the same env var and IS unit-tested for the unset case (`tests/telegram-adapter.test.ts:12-14`, `it('fails closed when IM_WEBHOOK_SECRET is not configured')`) — but that test exercises the `/channels/telegram/...` path (`src/channels/index.ts:776`), a separate live route from `/im/webhook`, not this clause's own inline check. Two copies of one predicate, only one of which is tested for the unset case; see `human-decision-channel-contract.md` (b) |
 | b2 | POST with wrong/missing `X-Telegram-Bot-Api-Secret-Token` | `401 unauthorized` | Replace `timingSafeEqual` with `===` (functionally same result, but timing-attack surface — flag as a design-review item, not a black-box-observable mutation) | `tests/im-webhook.test.ts:47` |
 | b3 | POST with `Content-Length` over cap | `413`, body never parsed | Remove the pre-parse `content-length` check | `tests/im-webhook.test.ts:26` |
 | b4 | POST with actual body over cap (chunked, no honest `Content-Length`) | `413` after buffering, before JSON parse | Remove the post-read `buf.byteLength > maxBytes` check | `tests/im-webhook.test.ts:37` |
-| b5 | POST invalid UTF-8 bytes | `400 invalid_json`/`bad_utf8`, no downstream effect | Drop `{ fatal: true }` from `TextDecoder` | **TODO**, confirmed genuinely absent (verified this revision): `tests/im-webhook.test.ts:55` ("rejects invalid JSON after a valid small authenticated body") sends `'{not-json}'`, which is valid UTF-8 with malformed JSON *syntax* — it exercises `JSON.parse`'s failure path, not `readCappedBody`'s `TextDecoder({ fatal: true })` failure path (`src/im/index.ts:72-82`). No test sends actually-invalid UTF-8 bytes |
+| b5 | POST invalid UTF-8 bytes | `400 invalid_json`/`bad_utf8`, no downstream effect | Drop `{ fatal: true }` from `TextDecoder` — **weakly observable as stated**: for most invalid byte sequences, `TextDecoder` without `fatal` silently substitutes U+FFFD and the resulting string usually still fails `JSON.parse`, so the response stays `400` either way and the mutation would NOT flip the probe's outcome. The mutation only becomes observable with a body engineered so the U+FFFD-substituted text is itself valid JSON that reaches `canonicalJsonDigest` (`src/im/index.ts:945`) with corrupted (but well-formed) field values — that is the actual kill condition, not "any invalid UTF-8 body" | **TODO**, confirmed genuinely absent (verified this revision): `tests/im-webhook.test.ts:55` ("rejects invalid JSON after a valid small authenticated body") sends `'{not-json}'`, which is valid UTF-8 with malformed JSON *syntax* — it exercises `JSON.parse`'s failure path, not `readCappedBody`'s `TextDecoder({ fatal: true })` failure path (`src/im/index.ts:72-82`). No test sends actually-invalid UTF-8 bytes |
 
 ### (c) Replay
 
 | # | Probe | Expected | Kill mutation | Existing test |
 |---|---|---|---|---|
-| c1 | Send the identical update twice concurrently | Exactly one task/answer effect; both callers see the same stored reply | Remove the reservation's uniqueness on `(tenant, update_id)` | `tests/im-webhook-idempotency.test.ts:124-141` ("allows only one concurrent update to produce the task effect") |
+| c1 | Send the identical update twice concurrently | Exactly one task/answer effect; both callers see the same stored reply | Remove the reservation's uniqueness on `(tenant, update_id)` | `tests/im-webhook-idempotency.test.ts:124-144` ("allows only one concurrent update to produce the task effect") — the exactly-once assertions are at `:142-143` (`expect(receipt()).toHaveLength(1)`; `expect(receipt()[0]).toMatchObject({ telegram_user_id: '123', state: 'completed' })`), outside the previously-cited `:124-141` range |
 | c2 | Resend same `update_id` with different text/principal/forwarding | `409 update_conflict`, no effect from the second body | Compute the digest without one of `(text, telegram_user_id, forwarding)` | `tests/im-webhook-idempotency.test.ts:195-207` |
 | c3 | Crash/restart mid-`processing`, then resend | Row stays `processing`, resend returns `409 update_in_progress`, no replay | Allow a `processing` row to be claimed as if `empty` | `tests/im-webhook-idempotency.test.ts:210-220` (`it.each(['processing', 'unknown'])('does not retry effects after interrupted %s reservation', ...)`) — this simulates the interruption by directly setting the receipt row's `state` column rather than an actual process kill between reserve and complete (a real fault-injection harness, killing the process between the reservation write and the completion write, remains a further TODO; this test proves the *consequence* — a `processing`/`unknown` row is never treated as retryable — which is the externally observable half of the clause) |
 | c4 | Replay a `completed` update | Stored response returned verbatim, no second write | Skip the `state === 'completed'` short-circuit in `redeemTelegramProjectInvite`/webhook handler | `tests/telegram-project-onboarding.test.ts:966` |
@@ -106,7 +116,12 @@ today's **Reference implementation evidence** column is Hermes/mupot-plugin-spec
 because Hermes/mupot-plugin is the only harness that exists. A genuinely portable
 black-box probe — one a second harness's own test suite could run — is marked
 separately as TODO in each row where it does not exist; citing the plugin's test as if
-it were that portable probe was MAJOR-3 of the round-1 gate.
+it were that portable probe was MAJOR-3 of the round-1 gate. Property (g) (human
+decisions never ride the agent bearer) intentionally has no row of its own here: it is
+enforced by the decision-channel contract's own principal property, and this table's
+d1-d4 rows above already probe exactly that — a separate (g) row would just re-cite
+d1-d4 under a different letter, not add coverage. Named explicitly rather than left as a
+silent gap in the (b)-(f) range above (round 3 correction).
 
 ### (b) Lease/ack
 
@@ -141,7 +156,7 @@ without importing any Hermes/mupot-plugin-private function.
 |---|---|---|---|---|
 | hd1 | Configure the harness's peer-sender allowlist as explicitly empty | Every sender denied | Treat explicit-empty the same as absent | `tests/native/test_adapter.py::test_explicit_empty_allowed_agents_denies_everyone` |
 | hd2 | Omit the allowlist config entirely | Falls back to the documented default roster | Make an absent key also deny everyone (breaks the documented default) | `tests/native/test_adapter.py::test_absent_allowed_agents_key_falls_back_to_the_documented_default` |
-| hd3 | A peer sender not on the allowlist sends a message | Message refused, not delivered | Remove the allowlist membership check | `tests/native/test_routine_events.py::test_disabled_config_keeps_routine_path_absent_and_never_expands_peer_allowlist` (adjacent); a direct positive-refusal unit test is **TODO** |
+| hd3 | A peer sender not on the allowlist sends a message | Message refused, not delivered | Remove the allowlist membership check | `tests/native/test_adapter.py:1345 test_unlisted_sender_is_quarantined_never_delivered` (a sender outside `allowed_agents` never reaches the message handler and is recorded in the DLQ as `sender_policy`) with control `:1367 test_listed_sender_is_still_delivered` (same pipeline, allowed sender, message does reach the handler) — round 3 correction: the prior revision marked this **TODO** and cited only an adjacent, non-covering test (`test_routine_events.py`'s config-disabled case); a direct positive-refusal test already exists |
 | hd4 | Break the import the harness's own safety check depends on (simulate an unimportable dependency on the legacy delivery path) | Fails safe (refuses/warns), does not silently skip the check forever | Import unconditionally without a try/except fallback that can silently never re-attempt | `tests/native/test_estop_egress_gate.py::test_legacy_inbox_stream_deliver_fails_closed_when_agent_estop_unimportable` |
 | hd5 **(new, round 2 — BLOCK-2)** | A host-runtime flag exists whose purpose is routing (e.g. marking a harness-originated turn so it queues rather than interrupts a human's own turn); assert that the SAME flag does not ALSO cause the host to skip its own per-source authorization or its own global pause gate for that event | Either the host's own gates still run for a flagged event, OR the harness performs its own explicit, equivalent check at the same point instead of assuming the host's routing flag implies the host's security flag | Rely on the routing flag alone; remove the harness's own explicit check | Reference implementation evidence for the harness-owned compensating check: `tests/native/test_adapter.py::test_explicit_empty_allowed_agents_denies_everyone` / `::test_absent_allowed_agents_key_falls_back_to_the_documented_default` prove `self.allowed_agents` (the harness-owned sender fence) is enforced; the `allow_from`-scoping comment (`mupot_gateway/adapter.py:1103-1121`) documents WHY Hermes's own gates cannot be assumed to run. **No test proves the host-side absence directly** — that the host's own gates in fact do not run for a flagged event is a claim about Hermes, a repo this test suite cannot reach; it is asserted by the plugin's own comment, not independently verified here. TODO: a black-box probe belongs in Hermes's own test suite, not this one |
 
@@ -187,15 +202,22 @@ none of the cited tests can run against it.
 
 The prior revision of this document claimed every **TODO** row above was "a real
 absence, not a formatting placeholder." Round 2 (Athena gate on PR #1410) found that
-claim itself unverified in the wrong direction: 11 rows marked TODO (c3, d1, d2, d3,
-e2, e3, f1, hb1, hc5, hf2, hf5) were in fact already pinned by committed tests, some of
-which this document's own earlier "Sources read" list had already named. Only three
-rows — b5, e4, a7 — were re-checked this revision and confirmed genuinely absent (see
-each row's note above for what was checked and why the nearest-looking existing test
-does not actually cover the clause). The lesson generalizes: **a TODO claim is itself a
-claim requiring evidence** — "I did not find a test" is not the same statement as "no
-test exists," and this document was wrong about that distinction on 11 of 14
-previously-TODO rows. Several genuine TODOs (b5, e4, a7, hb2, he8, and the harness rows'
+claim wrong — and round 3 (this revision) found round 2's own self-audit of it was
+*itself* miscounted. Correct accounting: of the 19 rows this document's revision
+history has, at one point or another, marked **TODO** (a7, b1, b5, c3, d1, d2, d3, e1,
+e2, e3, e4, f1, f2, hb1, hb2, hc5, hd3, hf2, hf5), **13 were in fact already pinned by
+committed tests** (c3, d1, d2, d3, e1, e2, e3, f1, f2, hb1, hc5, hf2, hf5) — not "11 of
+14" as this paragraph previously stated — some of which this document's own earlier
+"Sources read" list had already named. **6 rows remained genuinely open** as of round 2
+(a7, b1, b5, e4, hb2, hd3; see each row's note above for what was checked and why the
+nearest-looking existing test does not actually cover the clause) — not "only three"
+(b5, e4, a7) as previously claimed. Round 3 additionally closed **hd3** (see that row
+above: a direct positive-refusal test exists, `test_adapter.py:1345`/`:1367`, and was
+simply miscited as TODO), leaving 5 of the 19 genuinely open. The lesson generalizes
+**twice over**: **a TODO claim is itself a claim requiring evidence** — "I did not find
+a test" is not the same statement as "no test exists" — and so is a count of how many
+TODO claims were wrong; this document got that count wrong on its first attempt to
+correct itself. Several genuine TODOs (a7, b1, b5, e4, hb2, he8, and the harness rows'
 portable-probe TODOs) need real infrastructure this repo does not currently have (fault
 injection between two specific writes, a live human session to drive, a Hermes-side
 test) rather than a quick addition; scope those as their own follow-up rather than

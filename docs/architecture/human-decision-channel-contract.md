@@ -57,9 +57,9 @@ row. A conjunct with no test proving it is load-bearing is not a fence, it is de
 ### (b) Ingress authority
 
 The transport boundary is a **shared secret, verified before the body is JSON-parsed**
-— not before the raw bytes are read at all. The actual order (`src/im/index.ts:899-918`)
-is: (1) size-cap the declared and actual byte length, (2) UTF-8-decode with
-`fatal: true`, (3) *then* compare the secret, (4) `JSON.parse` only after the secret
+— not before the raw bytes are read at all. The actual order (`src/im/index.ts:899-918`,
+step 4 at `:921`) is: (1) size-cap the declared and actual byte length, (2) UTF-8-decode
+with `fatal: true`, (3) *then* compare the secret, (4) `JSON.parse` only after the secret
 passes. Rejecting an oversized or malformed-encoding body cheaply, before spending a
 secret comparison on it, is deliberate — but "verified before any parsing" overstated
 it: the size cap and UTF-8 decode are themselves a form of parsing the body, and both
@@ -76,7 +76,7 @@ run before the secret check, not after.
   `src/im/index.ts:66,900-905`) and UTF-8-validated with `fatal: true`
   (`readCappedBody`, `src/im/index.ts:72-82`).
 - **Duplicate predicate, not yet unified:** `src/channels/adapters/telegram.ts`'s
-  `ChannelAdapter.verify` (`:44-49`) implements the identical
+  `ChannelAdapter.verify` (`:47-52`) implements the identical
   secret-header-comparison logic against the same
   `X-Telegram-Bot-Api-Secret-Token` header name (`src/im/index.ts:914`,
   `src/channels/adapters/telegram.ts:49`), and is live in production via
@@ -84,7 +84,7 @@ run before the secret check, not after.
   `/im/webhook` in `src/index.ts:110,113`) — this is not a dead duplicate, both
   paths are reachable today. Each copy has its own test suite
   (`tests/im-webhook.test.ts` vs `tests/telegram-adapter.test.ts`), so a fix to one
-  does not provably fix the other. Filed as a one-line issue on mupot
+  does not provably fix the other. Filed as mupot#1412
   (two-copies-of-one-predicate class) rather than folded silently into this doc.
 
 ### (c) Replay
@@ -114,9 +114,10 @@ time**, never a service or agent principal:
 
 - Identity is derived exclusively server-side from `members.telegram_chat_id`
   (`memberForChat`, `src/im/index.ts:93-105`); it is never read from message text.
-- `memberAuth` builds a flat `AuthContext` with `role: 'member'` (always — never
-  `'admin'`/`'owner'`) and the member's **live, re-resolved** capability grants
-  (`resolveCapabilities`, called fresh on every message — `src/im/index.ts:356,400-403`).
+- `memberAuth` (`src/im/index.ts:400-403`) builds a flat `AuthContext` with
+  `role: 'member'` (always — never `'admin'`/`'owner'`) and the member's **live,
+  re-resolved** capability grants (`resolveCapabilities`, called fresh on every
+  message — `src/im/index.ts:356`).
 - `/approve` and `/reject` route through the SAME shared gate evaluator as HTTP and MCP
   (`evaluateVerdictGates`, `src/tasks/index.ts:1417`), not a channel-local hand-rolled
   check. `writeVerdict` records `decidedBy: member.id` (`src/im/index.ts:684`) — the
@@ -177,12 +178,12 @@ Three distinct events are recorded **separately**, each idempotent on its own ke
    This write is **not atomic with** the webhook reservation's `completed` stamp — see gap
    below.
 3. **Notification** — a Routine entering a human wait separately attempts one delivery
-   (`notifyHumanWait`, `src/routines/actions.ts:391-421`) keyed by the stable
+   (`notifyHumanWait`, `src/routines/actions.ts:391-428`) keyed by the stable
    `request_id = routine-human:<run-id>:<action-key>` (`humanWaitRequestId`,
-   `src/routines/actions.ts:293-298`). `NotifyHumanWaitOutcome` distinguishes
-   `no_recipient` / `no_decision` / `delivery_refused` from an actual delivery
-   (`src/routines/actions.ts:376-421`) so a caller can tell "nobody to notify" from
-   "notification attempted and failed" — these used to collapse into one boolean
+   `src/routines/actions.ts:293-298`). `NotifyHumanWaitOutcome`
+   (`src/routines/actions.ts:385-389`) distinguishes `no_recipient` / `no_decision` /
+   `delivery_refused` from an actual delivery so a caller can tell "nobody to notify"
+   from "notification attempted and failed" — these used to collapse into one boolean
    (Athena addendum H).
 
 ### (g) Known gaps at v1 — do not treat these as closed
@@ -238,13 +239,16 @@ What **must change**, not merely adapt:
   numeric chat id). This is not a stylistic nit — it is load-bearing in the invite path
   itself: `CLAIM_INVITE_SQL` (`src/members/project-invites.ts:224-252`) **hardcodes** an
   `EXISTS (SELECT 1 FROM telegram_webhook_receipts receipt WHERE ... receipt.telegram_user_id
-  = ?12 ...)` conjunct (`:245-250`) as one of the atomic claim's fence conditions — a
+  = ?12 ...)` conjunct (`:244-251`) as one of the atomic claim's fence conditions — a
   second channel cannot claim an invite through this exact statement without either its
   own copy of this table+conjunct or a rewrite of the statement itself. The whole module
   is Telegram-typed end to end, not just at the edges: the redemption input type names
-  the field `telegram_user_id` (`src/members/project-invites.ts:67`), the error code is
-  `invalid_telegram_user_id` (`:82`), and the runtime check re-asserts the same field
-  name (`:119`). A second channel needs either its own `members.<channel>_id` column
+  the field `telegram_user_id` (`src/members/project-invites.ts:67`, the
+  `RedeemTelegramProjectInviteInput` interface field — not a runtime assertion), the
+  error code is `invalid_telegram_user_id` (`:82`), and the runtime re-asserts the same
+  field name twice at redemption time (`:404`, the input-shape check;
+  `:419`, the receipt-row comparison). A second channel needs either its own
+  `members.<channel>_id` column
   and its own receipts table (fast, but repeats the `telegram_` prefix pattern per
   channel and needs a repeated migration + repeated fence logic per channel), or a
   refactor to a generic `member_channel_identities (member_id, channel, external_id)` +
@@ -315,9 +319,11 @@ document and doubting it — which is what round 2 was.
 - `docs/architecture/mupot-core.md` (mupot `main` @ `49a344aa`)
 - `docs/operations/telegram-project-onboarding.md` (same ref)
 - `src/im/index.ts`, `src/members/project-invites.ts`, `src/routines/actions.ts` (same ref)
-- `src/tasks/index.ts:85-93,1417-1433` (`legacyOwnerAdmin`, `evaluateVerdictGates`; same ref)
+- `src/tasks/index.ts:93-95,1417-1433` (`legacyOwnerAdmin`, `evaluateVerdictGates`; same
+  ref — round 3 correction: the prior revision's `:85-93` range also swept in the
+  unrelated `inTenantScope` helper at `:86-88`, not just `legacyOwnerAdmin`)
 - `tests/im-verdict-gates.test.ts:89-143` (round 2, re-read line by line against the
-  claim it backs); `src/channels/index.ts:776`, `src/channels/adapters/telegram.ts:44-49`,
+  claim it backs); `src/channels/index.ts:776`, `src/channels/adapters/telegram.ts:47-52`,
   `src/index.ts:110,113` (round 2, duplicate-predicate finding)
 - `src/dashboard/index.ts:6110-6120,6320-6330`, `src/dashboard/health.ts:530-542`,
   `src/mcp/index.ts:408-420`, `src/pots/schema-chain.generated.ts:2813`,

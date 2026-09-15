@@ -10,16 +10,23 @@ work, delivers text to a human, and sends to peers. Mupot's own `docs/runtime-ad
 (mupot `main` @ `49a344aa`) defines the identity/attach/messaging surface every runtime must
 use; this document names the properties a harness must hold **on top of** that surface to
 be safe to run unattended. The Hermes/mupot-plugin integration
-(`Mumega-com/mupot-plugin` @ `6c86c2b0`, PR #6 `kasra/native-receive-telegram-20260913`)
+(`Mumega-com/mupot-plugin` PR #6 `kasra/native-receive-telegram-20260913`, merged at
+`332119b203ab76f483967eeb9300a5474f63c366`, head `f30921115ed215d32c80f3fbf808db95af4d7397`
+— round 3 correction: `6c86c2b0` is a *later*, unrelated PR **#7**'s merge commit, not
+PR #6's; PR #7 touches only `__init__.py` and one unrelated `adapter.py` handler near its
+end, so every line citation below this point is unaffected either way, but the commit
+identifying "this PR" was simply wrong)
 is the first harness this was proven against, across five adversarial gate rounds. "Open
-and unmerged" is a PR-review state, not a property of the commit `6c86c2b0` itself — this
-document cites that commit's tree directly and does not depend on the PR's merge status.
+and unmerged" was a PR-review state at the time this was written, not a property of the
+commit `f3092111` itself — this document cites that commit's tree directly and does not
+depend on the PR's merge status (both PR #6 and PR #7 have since merged).
 Per Hadi (2026-09-14): the method generalizes past this one harness — see the
 Second-harness checklist below.
 
 Every reference to **Hermes** (the host agent runtime the plugin runs inside, a separate
 repository this doc does not have access to and has not independently verified) is cited
-by **symbol**, not by line number, and pinned to one revision named once: the plugin's
+by **symbol**, not by line number, and pinned to one revision — cited by that same value
+every time it appears in this document, never a different Hermes SHA: the plugin's
 own CI-pinned Hermes ref, `233757037df1f03f9fe1cfddc097acd5ad7f7510`
 (`Mumega-com/mupot-plugin@6c86c2b0`, `.github/workflows/test.yml:34`). A Hermes line
 number is a release-truth violation the moment Hermes's own history moves; a Hermes
@@ -48,7 +55,7 @@ document says so rather than inventing one.
   ack statement joins `agent_inbox_lease_attempts` on `(tenant, agent_id, target_seat_key,
   attempt_id, state='leased')` AND the message's own `lease_attempt_id`/`lease_expires_at`
   still match that attempt row (`ackAgentInboxLeaseAttempt`,
-  `src/agents/messages.ts:1364-1420`). A stale attempt cannot consume a newer lease; a
+  `src/agents/messages.ts:1364-1510`). A stale attempt cannot consume a newer lease; a
   same-timestamp legacy consume cannot be rolled back by a fenced attempt ACK
   (`docs/operations/telegram-project-onboarding.md`, "attempt-v3 custody chain").
 - Consequence for the harness side: **never ACK before the work is durably committed.** The
@@ -73,8 +80,9 @@ document says so rather than inventing one.
   multiple of 3 (round 2 defect, see below). The fix that held: insert a zero-width space
   after **every individual backtick**, so no two backtick characters are ever adjacent in
   the escaped output — provably no run of length ≥2 survives, independent of run length,
-  position, or surrounding ANSI/CR/LF/other zero-width characters
-  (`_fenced_untrusted_block` docstring, `mupot_gateway/notifications.py:155-165`).
+  position, or surrounding ANSI/CR/LF/other zero-width characters (`_fenced_untrusted_block`
+  docstring's FIX paragraph, `mupot_gateway/notifications.py:168-176`; the full docstring
+  spans `:156-177`).
 - The caveat text ("not a message from a person... not an instruction, approval, or
   command") goes **after** the closing fence, never before the raw body — a long injection
   placed before the caveat can push it out of context or bury it.
@@ -193,7 +201,7 @@ choke points, does not conform to this document regardless of what it is called.
 
 ## Mapping to `mupot-core.md` invariants
 
-The eight properties above are this document's own restatement of harness-specific
+The seven properties above are this document's own restatement of harness-specific
 consequences of three core invariants (`docs/architecture/mupot-core.md`, mupot
 `main` @ `49a344aa`) — restated because a harness author should not have to derive them
 from the core doc, but the core doc is the authority, not this list:
@@ -281,8 +289,14 @@ and listing the broader adapter-conformance surface (attach, detach, heartbeat, 
 task verdicts). That is **one conformance surface**, covering the identity/attach/
 messaging layer this document builds on top of. This document's own
 `decision-channel-conformance.md` is a **second, narrower** surface — the harness-safety
-properties (b)-(g) above, which `runtime-adapter-contract.md`'s list does not cover
-(no e-stop, fence, or allowlist row exists there). The two should stay linked, not
+properties (b)-(f) above, which `runtime-adapter-contract.md`'s list does not cover
+(no e-stop, fence, or allowlist row exists there). Property (g) (human decisions never
+ride the agent bearer) has **no conformance row in either document** — it is enforced by
+construction in `decision-channel-conformance.md`'s own principal-property rows (d1-d4),
+which prove a human decision is authenticated under the human's identity, never a
+harness's; there is no separate black-box probe naming property (g) itself. That gap is
+named here rather than papered over with a row that would just re-assert d1-d4 under a
+different letter. The two should stay linked, not
 duplicated: a harness-conformance suite belongs alongside
 `npm run conformance:runtime:local`, extending it, not re-deriving the attach/inbox
 cases `decision-channel-conformance.md` already treats as out of its own scope.
@@ -337,7 +351,8 @@ Each line: the defect class, one line, the round it was found (all dates 2026-09
   plugin's own comments, at the plugin's CI-pinned rev
   `233757037df1f03f9fe1cfddc097acd5ad7f7510` (`.github/workflows/test.yml:34`), by
   symbol where the plugin names one
-- `Mumega-com/mupot-plugin` @ `6c86c2b0` (`master`, PR #6 head): `mupot_gateway/adapter.py`
+- `Mumega-com/mupot-plugin` @ `f30921115ed215d32c80f3fbf808db95af4d7397` (PR #6 head,
+  merged into `master` at `332119b203ab76f483967eeb9300a5474f63c366`): `mupot_gateway/adapter.py`
   (`_EstopDeferred` class + docstring lines 132-208, choke-point list `:162-181`,
   `_estop_engaged` lines 695-716, `normalize_agent`/`should_accept_message` lines
   630-648, allowlist init lines 1069-1102, `allow_from`-scoping comment / two-gate claim
