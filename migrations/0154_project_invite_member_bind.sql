@@ -21,6 +21,19 @@
 ALTER TABLE invites ADD COLUMN member_id TEXT REFERENCES members(id);
 ALTER TABLE members ADD COLUMN telegram_bound_at TEXT;
 
+-- mupot#1411 P2 round 5 (kasra-review adversarial addendum, 2026-09-15): a
+-- member-bind invite's capability outlives the MINTER's own authority to
+-- have minted it — an owner mints an 'admin' bind invite, is then demoted
+-- (or suspended), and redemption up to 7 days later still grants 'admin'
+-- with no re-check of who authorized it. `invited_by` (0002) already
+-- records the minter but is ambiguous (auth.memberId ?? auth.userId — a
+-- pure legacy web login with no member row leaves no memberId to re-check
+-- standing against later). This additive column records the minter's
+-- MEMBER id specifically, NULL when the minter had none (a pure legacy
+-- login) — redemption re-checks the minter's CURRENT org-scope-local rank
+-- only when this is non-NULL.
+ALTER TABLE invites ADD COLUMN minted_by_member_id TEXT REFERENCES members(id);
+
 DROP TRIGGER IF EXISTS validate_invites_project_pairing_insert;
 DROP TRIGGER IF EXISTS validate_invites_project_pairing_update;
 

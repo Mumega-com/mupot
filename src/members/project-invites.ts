@@ -6,6 +6,7 @@ import {
   hasCapability,
   legacyRoleRank,
   resolveCapabilities,
+  targetLegacyRoleRank,
 } from '../auth/capability'
 import { sha256Hex } from './service'
 
@@ -122,6 +123,7 @@ export type RedeemTelegramProjectInviteError =
   | 'ambiguous_pairing_code'
   | 'telegram_identity_conflict'
   | 'member_already_exists'
+  | 'invite_minter_authority_lost'
   | 'redemption_failed'
 
 export type RedeemTelegramProjectInviteResult =
@@ -147,6 +149,7 @@ interface RedeemableInviteRow {
   accepted_at: string | null
   pairing_expires_at: string
   member_id: string | null
+  minted_by_member_id: string | null
 }
 
 interface BindableMemberRow {
@@ -223,6 +226,25 @@ async function actorRankOnSquad(
   // when they were resolved (even to an empty array), which is itself the
   // real "no standing here" answer and must not be overridden upward.
   return auth.capabilities === undefined ? legacyRoleRank(auth.role) : 0
+}
+
+/**
+ * mupot#1411 P2 round 5 (kasra-review adversarial addendum, 2026-09-15): the
+ * invite MINTER's org-scope-local standing, re-derived FRESH from D1 at
+ * REDEMPTION time — an org-scope capability grant, unioned with their
+ * role-plane rank (targetLegacyRoleRank's members.email -> users.role
+ * bridge). Deliberately the SAME quantity actorRankOnScopeFor(env, auth,
+ * 'org', null) computes for a LIVE session — this is that quantity, computed
+ * for a memberId with no live session to read (the caller redeeming is the
+ * INVITEE's Telegram identity, never the minter).
+ */
+async function currentMemberOrgRank(env: Env, memberId: string): Promise<number> {
+  const grants = await resolveCapabilities(env, memberId)
+  let max = 0
+  for (const grant of grants) {
+    if (grant.scope_type === 'org') max = Math.max(max, capabilityRank(grant.capability))
+  }
+  return Math.max(max, await targetLegacyRoleRank(env, memberId))
 }
 
 function base64Url(bytes: Uint8Array): string {
@@ -545,12 +567,18 @@ export async function createProjectInvite(
   const createdAt = new Date().toISOString()
   const expiresAt = new Date(Date.now() + input.expires_in_seconds * 1000).toISOString()
   const invitedBy = auth.memberId ?? auth.userId
+  // mupot#1411 P2 round 5 (kasra-review adversarial addendum, 2026-09-15):
+  // `invited_by` is ambiguous (memberId OR userId) and cannot be re-resolved
+  // to a member's CURRENT standing later. This records the minter's MEMBER
+  // id specifically — NULL for a pure legacy web login with no member row —
+  // so redemption can re-check it (see redeemTelegramProjectInvite).
+  const mintedByMemberId = auth.memberId ?? null
 
   await env.DB.prepare(
     `INSERT INTO invites (
        id, email, department_id, capability, invited_by, accepted_at, created_at,
-       project_id, squad_id, pairing_hash, pairing_expires_at, member_id
-     ) VALUES (?1, ?2, NULL, ?3, ?4, NULL, ?5, ?6, ?7, ?8, ?9, ?10)`,
+       project_id, squad_id, pairing_hash, pairing_expires_at, member_id, minted_by_member_id
+     ) VALUES (?1, ?2, NULL, ?3, ?4, NULL, ?5, ?6, ?7, ?8, ?9, ?10, ?11)`,
   ).bind(
     id,
     email,
@@ -562,6 +590,7 @@ export async function createProjectInvite(
     pairingHash,
     expiresAt,
     memberId,
+    mintedByMemberId,
   ).run()
 
   return {
@@ -626,7 +655,7 @@ export async function redeemTelegramProjectInvite(
   if (receipt.state !== 'processing') return { ok: false, error: 'update_receipt_invalid' }
 
   const matches = await env.DB.prepare(
-    `SELECT id, email, project_id, squad_id, capability, accepted_at, pairing_expires_at, member_id
+    `SELECT id, email, project_id, squad_id, capability, accepted_at, pairing_expires_at, member_id, minted_by_member_id
        FROM invites
       WHERE pairing_hash = ?1
       LIMIT 2`,
@@ -667,6 +696,32 @@ export async function redeemTelegramProjectInvite(
       && member.telegram_chat_id !== input.telegram_user_id.trim()
     ) {
       return { ok: false, error: 'telegram_identity_conflict' }
+    }
+  }
+
+  // mupot#1411 P2 round 5 (kasra-review adversarial addendum, 2026-09-15): a
+  // member-bind invite's capability must not outlive the MINTER's own
+  // authority to have minted it. An owner mints an 'admin' bind invite, is
+  // then demoted (or suspended) — up to 7 days later (MAX_INVITE_LIFETIME_
+  // SECONDS) redemption used to still grant 'admin' with no re-check of who
+  // authorized it. Re-derives the minter's CURRENT org-scope-local rank
+  // fresh from D1 (currentMemberOrgRank — the SAME quantity
+  // actorRankOnScopeFor computes for a live session) rather than trusting
+  // whatever standing they had at mint time. Only runs when
+  // minted_by_member_id is non-NULL: a pure legacy web-login minter (no
+  // member row) has an IMMUTABLE role-plane rank in this schema (no route
+  // ever changes users.role), so there is nothing to re-check for them —
+  // and no regression, since that was already true before this column
+  // existed.
+  if (invite.member_id !== null && invite.minted_by_member_id !== null) {
+    const minter = await env.DB.prepare(
+      'SELECT status FROM members WHERE id = ?1 AND (tenant = ?2 OR tenant IS NULL) LIMIT 1',
+    ).bind(invite.minted_by_member_id, env.TENANT_SLUG).first<{ status: string }>()
+    const minterRank = minter && minter.status === 'active'
+      ? await currentMemberOrgRank(env, invite.minted_by_member_id)
+      : 0
+    if (minterRank < capabilityRank(invite.capability)) {
+      return { ok: false, error: 'invite_minter_authority_lost' }
     }
   }
 

@@ -1677,6 +1677,17 @@ describe('Telegram project invite — bind existing member', () => {
       VALUES ('member-squad-only-admin', 'squad-only-admin@example.test', 'Squad Only Admin', 'active', '${TENANT}');
       INSERT INTO members (id, email, display_name, status, tenant)
       VALUES ('member-existing', 'existing-human@example.test', 'Existing Human', 'active', '${TENANT}');
+      -- mupot#1411 P2 round 5 (kasra-review adversarial addendum, 2026-09-15):
+      -- ownerAuth's org-admin standing above is fed directly as
+      -- auth.capabilities (simulating an already-resolved session) — the
+      -- REAL DB row is needed too now, because redeemTelegramProjectInvite
+      -- re-derives the invite's minted_by_member_id's CURRENT standing
+      -- straight from the capabilities TABLE at redemption time (see
+      -- currentMemberOrgRank), never from a caller-supplied auth object.
+      -- Without this row every member-bind redemption test would refuse
+      -- with invite_minter_authority_lost even though nothing changed.
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+      VALUES ('cap-bind-owner-org', 'member-bind-owner', 'org', NULL, 'admin');
     `)
   })
 
@@ -2152,6 +2163,81 @@ describe('Telegram project invite — bind existing member', () => {
       `).get()).toEqual({ count: 0 })
       expect(harness.sqlite.prepare(`SELECT state FROM telegram_webhook_receipts WHERE update_id = 'update-bind-suspended'`).get())
         .toEqual({ state: 'processing' })
+    })
+
+    // ── P2 round 5 (kasra-review adversarial addendum, 2026-09-15) ──────────
+    //
+    // A member-bind invite's capability must not outlive the MINTER's own
+    // authority to have minted it. minted_by_member_id (0154) records the
+    // minter; redemption re-derives their CURRENT org-scope-local rank fresh
+    // from the capabilities table (currentMemberOrgRank) rather than trusting
+    // whatever standing they had at mint time.
+    it('refuses redemption when the invite MINTER is demoted between invite creation and claim', async () => {
+      const created = await createMemberInvite({ capability: 'admin' })
+      expect(created.ok).toBe(true)
+      if (!created.ok) return
+      // member-bind-owner's org-admin grant is downgraded to 'observer' —
+      // no longer enough to have authorized an 'admin' bind invite.
+      harness.sqlite.exec(`
+        UPDATE capabilities SET capability = 'observer'
+         WHERE member_id = 'member-bind-owner' AND scope_type = 'org'
+      `)
+      reserveUpdate('update-bind-minter-demoted', VALID_REQUEST_DIGEST, '9200600')
+
+      const result = await redeemTelegramProjectInvite(env, {
+        pairing_code: created.value.pairing_code,
+        telegram_user_id: '9200600',
+        display_name: 'Minter Demoted',
+        update_id: 'update-bind-minter-demoted',
+        request_digest: VALID_REQUEST_DIGEST,
+      })
+
+      expect(result).toEqual({ ok: false, error: 'invite_minter_authority_lost' })
+      expect(harness.sqlite.prepare('SELECT accepted_at FROM invites WHERE id = ?').get(created.value.invite.id))
+        .toEqual({ accepted_at: null })
+      expect(harness.sqlite.prepare(`
+        SELECT telegram_chat_id FROM members WHERE id = 'member-existing'
+      `).get()).toEqual({ telegram_chat_id: null })
+      expect(harness.sqlite.prepare(`
+        SELECT COUNT(*) AS count FROM capabilities WHERE member_id = 'member-existing'
+      `).get()).toEqual({ count: 0 })
+    })
+
+    it('refuses redemption when the invite MINTER is suspended between invite creation and claim', async () => {
+      const created = await createMemberInvite({ capability: 'admin' })
+      expect(created.ok).toBe(true)
+      if (!created.ok) return
+      harness.sqlite.exec(`UPDATE members SET status = 'suspended' WHERE id = 'member-bind-owner'`)
+      reserveUpdate('update-bind-minter-suspended', VALID_REQUEST_DIGEST, '9200700')
+
+      const result = await redeemTelegramProjectInvite(env, {
+        pairing_code: created.value.pairing_code,
+        telegram_user_id: '9200700',
+        display_name: 'Minter Suspended',
+        update_id: 'update-bind-minter-suspended',
+        request_digest: VALID_REQUEST_DIGEST,
+      })
+
+      expect(result).toEqual({ ok: false, error: 'invite_minter_authority_lost' })
+      expect(harness.sqlite.prepare('SELECT accepted_at FROM invites WHERE id = ?').get(created.value.invite.id))
+        .toEqual({ accepted_at: null })
+    })
+
+    it('still allows redemption when the invite MINTER retains sufficient authority (no regression)', async () => {
+      const created = await createMemberInvite({ capability: 'admin' })
+      expect(created.ok).toBe(true)
+      if (!created.ok) return
+      reserveUpdate('update-bind-minter-ok', VALID_REQUEST_DIGEST, '9200800')
+
+      const result = await redeemTelegramProjectInvite(env, {
+        pairing_code: created.value.pairing_code,
+        telegram_user_id: '9200800',
+        display_name: 'Minter Still Admin',
+        update_id: 'update-bind-minter-ok',
+        request_digest: VALID_REQUEST_DIGEST,
+      })
+
+      expect(result.ok).toBe(true)
     })
 
     it('refuses a second redemption of the same member-bind invite (single-use fence still holds)', async () => {
