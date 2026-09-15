@@ -52,11 +52,30 @@ member with no email on file) before minting the invite.
 AS the target member — the same thing a token mint does — so it requires the SAME authority:
 the actor needs **org-scope admin (or owner)**, not merely admin on the invited squad. This is
 stricter than the net-new path (which still only needs admin on the invited squad, since a
-fresh member cannot be "taken over"). The target's OWN standing is also checked: the invite is
-refused if the target's highest capability grant on ANY scope — org, any department, any
-squad, not only the one being invited into — exceeds the actor's own rank. An org admin
-(rank 4) cannot member-bind an org owner, or a member who happens to hold `owner` on some
-unrelated squad, even though neither of those facts is visible on the squad the invite names.
+fresh member cannot be "taken over"). The target's OWN standing is also checked, and — as of
+round 4 — on the SAME quantity the actor is measured on: **global standing**, the maximum of
+(a) the highest capability grant the principal holds on ANY scope (org, any department, any
+squad — not only the one an action happens to touch) and (b) their coarse legacy `role`
+(`users.role`, bridged by email; this is how the bootstrap **owner** is caught even though the
+owner characteristically holds ZERO capability grant rows). The invite is refused whenever the
+target's global standing exceeds the actor's global standing — with ONE exception: **a
+principal can never outrank themselves.** An org admin who binds their OWN Telegram identity,
+or mints their own token, always succeeds regardless of what else they happen to hold.
+
+This is a **widened ceiling, not merely a wider check** — it has an operator-visible
+consequence worth calling out explicitly: a member who holds `owner` (or otherwise outranks a
+would-be org-admin actor) on even ONE unrelated squad becomes untouchable by every org admin
+across ALL FOUR gated actions this ceiling covers — suspend/reactivate (`PATCH /members/:id`),
+token mint (`POST /members/:id/tokens`), capability grant (`POST /members/:id/capabilities`),
+member-bind invite, and Telegram unbind (`DELETE /members/:id/telegram`). Only a principal
+whose OWN global standing is at or above that member's can act on them — practically, only an
+**owner** (or another principal who separately holds an equal-or-higher grant somewhere).
+This is intentional: those five actions are all vertical-privilege-escalation-adjacent
+(mint/bind conjures a credential that authenticates AS the target; suspend can lock a
+principal out; a capability grant/revoke can strip or hand out real access), and a target's
+standing on ANY scope — not just the one an admin happens to be acting through — is real
+authority they hold in the pot. An org admin who needs to act on such a member must escalate
+to an owner, not attempt the same action repeatedly hoping a narrower scope check will pass.
 
 At redemption, `/start <pairing-code>` binds the authenticated Telegram identity onto the
 **existing** member (an `UPDATE`, never an `INSERT`) instead of minting a new one; no new
@@ -77,7 +96,12 @@ echoed into the chat (see the existing anti-oracle test).
 above) clears a member's bound Telegram identity. Use it if a bind was made in error or the
 participant's Telegram account changes — a new member-bind invite can then be redeemed to
 bind the correct identity. There is currently no self-service unbind from within Telegram
-itself; only an admin can undo a bind.
+itself; only an admin can undo a bind. Tenant-scoped identically to every other write in this
+file (round 4: this route's lookup and clearing UPDATE were previously unscoped by tenant, the
+same class the suspend route already closed — an admin can only unbind a member in their OWN
+tenant now). Every successful unbind writes an append-only row to
+`telegram_unbind_receipts` (who, when, and which Telegram identity was detached) — there was
+previously no durable record of an unbind at all.
 
 ## Behaviour change: IM verdict authority
 

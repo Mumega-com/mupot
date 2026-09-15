@@ -4,6 +4,10 @@ Status: architecture note, written 2026-09-14 by Kasra from receipts on mupot PR
 (`kasra/telegram-project-onboarding-20260913`, merged to `main` at `49a344aa`) and its
 gate history. Not a release contract. Hadi decides scope; updates by PR only.
 
+Updated 2026-09-15 (round 4, Athena N3) for mupot PR #1411
+(`kasra/telegram-bind-existing-member-20260914`): the "net-new humans only" gap named in
+clause (g) below is closed. See the clause itself for the current shape.
+
 ## One sentence
 
 A "decision channel" is any medium through which a human can join a Mupot project and
@@ -33,7 +37,7 @@ A human enters a project through one **single-use, server-hashed** invitation:
   stored; only its SHA-256 digest (`pairing_hash`) persists
   (`src/members/project-invites.ts:284-288,337`, `createProjectInvite`).
 - The claim is one atomic statement (`CLAIM_INVITE_SQL`,
-  `src/members/project-invites.ts:224-252`) with conjuncts that must all hold in the
+  `src/members/project-invites.ts:315-349`) with conjuncts that must all hold in the
   SAME statement, not a JS pre-check that can race it:
   - single-use: `accepted_at IS NULL`
   - not expired: `pairing_expires_at > ?8`
@@ -41,12 +45,26 @@ A human enters a project through one **single-use, server-hashed** invitation:
   - the exact squad-project edge still exists: `EXISTS (... project_squad_access ...)`
   - the authenticated transport receipt is in `state = 'processing'` for this exact
     `(tenant, update_id, digest, telegram_user_id)` (the "receipt-processing conjunct")
+  - mupot#1411: when the invite carries a `member_id` (binding an EXISTING member's
+    Telegram identity instead of minting a net-new one), an additional EXISTS clause
+    requires the target row to satisfy `MEMBER_BIND_ELIGIBLE_SQL` (exact non-NULL
+    tenant match, `status = 'active'`, Telegram-identity compatible) at claim time —
+    see clause (g) below.
 - Identity used to claim is the medium's own **immutable** user id (Telegram's
   `message.from.id`), never a display name, username, or any other field the human or
   transport can freely re-supply (`src/im/index.ts:857-872`, `telegramDisplayName` is
   documented COSMETIC ONLY — never identity, authority, or part of the request digest).
-- A capability grant can never invite above the inviter's own effective rank
-  (`actorRankOnSquad`, `src/members/project-invites.ts:163-186`; `cannot_grant_above_own_rank`).
+- A capability grant can never invite above the inviter's own effective rank. TWO
+  distinct paths, per mupot#1411: the **net-new** path (no `member_id` — a fresh member
+  is minted, nothing to take over) keeps the original squad-local ceiling
+  (`actorRankOnSquad`, `src/members/project-invites.ts`; `cannot_grant_above_own_rank`).
+  The **member-bind** path (`member_id` set — attaching Telegram to an EXISTING
+  identity, itself a credential mint) requires ORG-scope admin
+  (`actorRankOnScopeFor(env, auth, 'org', null)`) AND that the target does not outrank
+  the actor ANYWHERE (`exceedsTargetRankCeiling`, `src/auth/capability.ts`) — both sides
+  of that comparison are the SAME global-standing function (grants across every scope,
+  unioned with the role-plane rank), and a principal is always self-exempt from
+  outranking themselves.
 
 Adversarial finding this closes: PR #1407's own re-gate proved two of the `EXISTS`
 conjuncts (`projects.status='active'`, the `project_squad_access` edge) are **singly
@@ -188,12 +206,19 @@ Three distinct events are recorded **separately**, each idempotent on its own ke
 
 ### (g) Known gaps at v1 — do not treat these as closed
 
-- **Net-new humans only.** Redeeming an invite whose email already belongs to an existing
-  member refuses with `member_already_exists` and makes no partial writes. Binding a new
-  channel identity (e.g. Telegram) to an *existing* member (e.g. someone with a web
-  login) is explicitly out of scope and must not be worked around by inviting that
-  member's own email — it needs its own reviewed change
-  (`docs/operations/telegram-project-onboarding.md`, top section).
+- **Closed by mupot#1411: existing members can now bind.** A project invite created
+  with `member_id` set (instead of `email`) attaches a Telegram identity to an
+  EXISTING, active, same-tenant member rather than always minting a net-new one.
+  Authority floor: org admin (`actorRankOnScopeFor(env, auth, 'org', null)`) AND the
+  target must not outrank the actor anywhere (`exceedsTargetRankCeiling`, global
+  standing across every scope, unioned with the role-plane rank; self-exempt). Unbind —
+  `DELETE /members/:id/telegram` — is gated by the SAME floor, since clearing the
+  binding is a credential revocation with the same authority class as minting it.
+  Redeeming an invite whose caller-supplied `email` already belongs to an existing
+  member (the ORIGINAL net-new path, no `member_id`) is still refused with
+  `member_already_exists` and still makes no partial writes — that path is unchanged;
+  only the NEW `member_id` path binds an existing identity. See
+  `docs/operations/telegram-project-onboarding.md` for the operator-facing runbook.
 - **No invite revocation route.** There is no HTTP route to revoke an unused invite; the
   runbook's only path is a direct, approved DB `UPDATE` expiring one exact row by id.
 - **`gate:agent-self-completion` is coarse-role-only over this channel** (see (d) above) —
@@ -237,7 +262,7 @@ What **must change**, not merely adapt:
 - **Schema shape.** `members.telegram_chat_id` and `telegram_webhook_receipts` are
   Telegram-specific column/table names carrying Telegram-specific semantics (immutable
   numeric chat id). This is not a stylistic nit — it is load-bearing in the invite path
-  itself: `CLAIM_INVITE_SQL` (`src/members/project-invites.ts:224-252`) **hardcodes** an
+  itself: `CLAIM_INVITE_SQL` (`src/members/project-invites.ts:315-349`) **hardcodes** an
   `EXISTS (SELECT 1 FROM telegram_webhook_receipts receipt WHERE ... receipt.telegram_user_id
   = ?12 ...)` conjunct (`:244-251`) as one of the atomic claim's fence conditions — a
   second channel cannot claim an invite through this exact statement without either its

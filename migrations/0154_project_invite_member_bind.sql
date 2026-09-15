@@ -139,3 +139,26 @@ BEGIN
         AND squad_id = NEW.squad_id
     );
 END;
+
+-- mupot#1411 P2-B/C round 4 (kasra-review, 2026-09-15): DELETE
+-- /members/:id/telegram had NO audit trail at all -- the only write was the
+-- UPDATE clearing telegram_chat_id itself. Once a Telegram bind is a
+-- credential mint (same authority as POST /members/:id/tokens, see the
+-- route's own comment in src/members/index.ts), clearing it is a credential
+-- REVOCATION and deserves the same kind of durable trail this codebase
+-- already keeps for other identity-affecting admin actions -- append-only,
+-- one small table per action class (oauth_consent_receipts 0091,
+-- gate_owner_reassignments 0113, verdict_reversals 0118, this table
+-- following the same shape). prior_telegram_chat_id is retained so a later
+-- audit can tell WHICH identity was detached, not merely that something was.
+CREATE TABLE IF NOT EXISTS telegram_unbind_receipts (
+  id                      TEXT PRIMARY KEY,
+  tenant                  TEXT NOT NULL,
+  member_id               TEXT NOT NULL REFERENCES members(id) ON DELETE RESTRICT,
+  actor_id                TEXT NOT NULL,
+  prior_telegram_chat_id  TEXT NOT NULL,
+  created_at              TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_telegram_unbind_receipts_member
+  ON telegram_unbind_receipts(tenant, member_id, created_at DESC);

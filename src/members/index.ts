@@ -624,17 +624,29 @@ interface PatchMemberBody {
 // row on the ONE (scopeType, scopeId) an action happened to touch — a target
 // who outranked the actor via a DIFFERENT scope (an org owner with nothing on
 // THIS squad, say) sailed through. Now uses targetMaxRankAcrossScopes (the
-// target's real standing, everywhere) uniformly at all three call sites below
+// target's real standing, everywhere) uniformly at all four call sites below
 // AND the member-bind invite path (src/members/project-invites.ts), so none of
 // them can independently regress back to the narrow, bypassable check.
+//
+// mupot#1411 N2 round 4 (Athena, 2026-09-15): no longer takes a scope — the
+// CEILING question ("does the target outrank the actor, anywhere") is scope-
+// independent by construction now that both sides of exceedsTargetRankCeiling
+// are the SAME global quantity (actorMaxRankAcrossScopes vs
+// targetMaxRankAcrossScopes). Passing a scope-local actor rank in here used
+// to compare two different quantities: an org admin who ALSO holds 'owner' on
+// one squad has global standing 5, but their org-scope-LOCAL rank is only 4 —
+// so a self-mint/self-suspend/self-grant for that exact principal 403'd,
+// treating them as unable to outrank themselves. The scope a caller is
+// ACTING on still needs its own, separate, scope-local floor (e.g. the grant
+// route's `capabilityRank(capability) > actorMaxRankOnScope(c, scopeType,
+// scopeId)` "cannot_grant_above_own_rank" check, a few lines below its own
+// targetRankCeiling call) — that question is orthogonal to this one and is
+// untouched.
 async function targetRankCeiling(
   c: Context<AppEnv>,
   targetMemberId: string,
-  scopeType: CapabilityScopeType,
-  scopeId: string | null,
 ): Promise<Response | null> {
-  const actorRank = await actorMaxRankOnScope(c, scopeType, scopeId)
-  if (await exceedsTargetRankCeiling(c.env, targetMemberId, actorRank)) {
+  if (await exceedsTargetRankCeiling(c.env, c.get('auth'), targetMemberId)) {
     return c.json({ error: 'forbidden', reason: 'cannot_affect_higher_rank' }, 403)
   }
   return null
@@ -659,7 +671,7 @@ membersApp.patch('/members/:id', requireCapability(orgScope, 'admin'), async (c)
   // principal. Since #1330 revokes web sessions on suspend, an unguarded
   // suspend of the org OWNER is an immediate, total lockout of the one
   // principal who could undo it.
-  const ceiling = await targetRankCeiling(c, id, 'org', null)
+  const ceiling = await targetRankCeiling(c, id)
   if (ceiling) return ceiling
 
   let sessionsRevoked = 0
@@ -720,8 +732,17 @@ interface MintTokenBody {
 membersApp.post('/members/:id/tokens', requireCapability(orgScope, 'admin'), async (c) => {
   const memberId = c.req.param('id')
 
-  const member = await c.env.DB.prepare('SELECT id, status FROM members WHERE id = ? LIMIT 1')
-    .bind(memberId)
+  // mupot#1411 N1 round 4 (Athena, 2026-09-15): pre-existing, same #1330 F2
+  // class as the unbind fence a few lines below — this SELECT was `WHERE id
+  // = ?` alone, so a tenant-A admin could mint a token (a credential that
+  // authenticates AS the member) for a tenant-B member. Same tenant-collapse
+  // predicate as the other reads in this file (exact match OR legacy
+  // NULL-tenant row); no write here to adopt the tenant on, unlike suspend/
+  // unbind, since this handler never updates the members row itself.
+  const member = await c.env.DB.prepare(
+    'SELECT id, status FROM members WHERE id = ?1 AND (tenant = ?2 OR tenant IS NULL) LIMIT 1',
+  )
+    .bind(memberId, c.env.TENANT_SLUG)
     .first<{ id: string; status: Member['status'] }>()
   if (!member) return c.json({ error: 'member_not_found' }, 404)
 
@@ -729,7 +750,7 @@ membersApp.post('/members/:id/tokens', requireCapability(orgScope, 'admin'), asy
   // credential that authenticates AS that member, so an unguarded mint lets an
   // org admin (rank 4) obtain owner rank (5). That is vertical privilege
   // escalation, not merely acting on a higher-ranked target.
-  const mintCeiling = await targetRankCeiling(c, memberId, 'org', null)
+  const mintCeiling = await targetRankCeiling(c, memberId)
   if (mintCeiling) return mintCeiling
 
   let body: MintTokenBody
@@ -786,18 +807,51 @@ membersApp.delete(
   async (c) => {
     const memberId = c.req.param('id')
 
+    // mupot#1411 P1-A round 4 (kasra-review, 2026-09-15): both statements
+    // below were `WHERE id = ?` alone — the exact #1330 F2 class the suspend
+    // path above already closed 40 lines up. Reusing that SAME predicate
+    // (tenant match OR legacy NULL-tenant row, adopted into this tenant on
+    // write) rather than a second hand-written copy: a tenant-A admin could
+    // read AND clear a tenant-B member's Telegram binding, and the 404 for
+    // "wrong tenant" was indistinguishable from "not bound" / "not found" —
+    // an existence oracle across tenants.
     const member = await c.env.DB.prepare(
-      'SELECT id, telegram_chat_id FROM members WHERE id = ? LIMIT 1',
-    ).bind(memberId).first<{ id: string; telegram_chat_id: string | null }>()
+      'SELECT id, telegram_chat_id FROM members WHERE id = ?1 AND (tenant = ?2 OR tenant IS NULL) LIMIT 1',
+    ).bind(memberId, c.env.TENANT_SLUG).first<{ id: string; telegram_chat_id: string | null }>()
     if (!member) return c.json({ error: 'member_not_found' }, 404)
     if (member.telegram_chat_id === null) return c.json({ error: 'telegram_not_bound' }, 404)
 
-    const ceiling = await targetRankCeiling(c, memberId, 'org', null)
+    const ceiling = await targetRankCeiling(c, memberId)
     if (ceiling) return ceiling
 
+    const priorTelegramChatId = member.telegram_chat_id
+    const actorId = c.get('auth').memberId ?? c.get('auth').userId
+
+    // mupot#1411 P2-B/C round 4 (kasra-review, 2026-09-15): this UPDATE used
+    // to be the ONLY write on this path — no tenant guard (same F2 class as
+    // the SELECT above) and no audit trail at all. Tenant-scoped identically
+    // to the SELECT now, PLUS a `telegram_chat_id = ?3` conjunct pinning it
+    // to the exact identity this handler just read (the same TOCTOU
+    // discipline as this feature's own MEMBER_BIND_LANDED_GUARD in
+    // project-invites.ts) — a 0-row result means the binding already changed
+    // out from under us, so the receipt below is never written for a no-op.
+    const update = await c.env.DB.prepare(
+      `UPDATE members SET telegram_chat_id = NULL, telegram_bound_at = NULL, tenant = ?2
+        WHERE id = ?1 AND (tenant = ?2 OR tenant IS NULL) AND telegram_chat_id = ?3`,
+    ).bind(memberId, c.env.TENANT_SLUG, priorTelegramChatId).run()
+    if (!update.meta || update.meta.changes === 0) return c.json({ error: 'member_not_found' }, 404)
+
+    // Credential REVOCATION, same authority class as a token mint — leaves a
+    // durable trace of who cleared which identity, and which identity, and
+    // when. Written only once the clearing UPDATE above is proven to have
+    // landed against the exact prior identity, never against a guess.
     await c.env.DB.prepare(
-      'UPDATE members SET telegram_chat_id = NULL, telegram_bound_at = NULL WHERE id = ?',
-    ).bind(memberId).run()
+      `INSERT INTO telegram_unbind_receipts
+         (id, tenant, member_id, actor_id, prior_telegram_chat_id, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    )
+      .bind(crypto.randomUUID(), c.env.TENANT_SLUG, memberId, actorId, priorTelegramChatId, new Date().toISOString())
+      .run()
 
     return c.json({ member_id: memberId, telegram_unbound: true })
   },
@@ -855,7 +909,7 @@ membersApp.post('/members/:id/capabilities', requireCapability(orgScope, 'admin'
     if (!exists) return c.json({ error: `${scopeType}_not_found` }, 404)
   }
 
-  const ceiling = await targetRankCeiling(c, memberId, scopeType, scopeId)
+  const ceiling = await targetRankCeiling(c, memberId)
   if (ceiling) return ceiling
 
   const boundAgent = await resolveBoundAgentForMember(c.env, memberId)

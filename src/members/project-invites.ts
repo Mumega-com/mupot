@@ -12,6 +12,24 @@ import { sha256Hex } from './service'
 const CAPABILITIES: readonly Capability[] = ['owner', 'admin', 'lead', 'member', 'observer']
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 const REQUEST_DIGEST_RE = /^[0-9a-fA-F]{64}$/
+
+/**
+ * mupot#1411 P2-E round 4 (kasra-review, 2026-09-15): the capabilities INSERT
+ * below used to be a bare INSERT — any PRE-EXISTING grant on the invited
+ * squad (even a lowly 'observer', the MOST common shape for a member-bind
+ * invite: the whole point is adding Telegram to someone who already works on
+ * that squad) hit `UNIQUE(member_id, scope_type, scope_id)` and threw,
+ * rolling the whole claim back to a permanent, unrecoverable
+ * 'redemption_failed' — the invite is not re-burned, but nothing about the
+ * error tells the operator that "grant a capability the target already has"
+ * is the unfixable case. `RANK_SQL_CASE` mirrors capability.ts's own RANK
+ * ladder (owner=5 > admin=4 > lead=3 > member=2 > observer=1) so the ON
+ * CONFLICT clause below can compare the pre-existing row's capability
+ * against the invite's — in SQL, at conflict-evaluation time, since that is
+ * the only place the pre-existing value is visible.
+ */
+const RANK_SQL_CASE = (column: string): string =>
+  `(CASE ${column} WHEN 'owner' THEN 5 WHEN 'admin' THEN 4 WHEN 'lead' THEN 3 WHEN 'member' THEN 2 WHEN 'observer' THEN 1 ELSE 0 END)`
 const MAX_INVITE_LIFETIME_SECONDS = 7 * 24 * 60 * 60
 
 export interface CreateProjectInviteInput {
@@ -443,19 +461,6 @@ export async function createProjectInvite(
   ).bind(projectId, squadId).first<ProjectSquadRow>()
   if (!edge) return { ok: false, error: 'project_squad_not_linked' }
 
-  if (hasMemberId) {
-    // Same tenant-collapse shape as GET /members/:id (src/members/index.ts) —
-    // a member in another tenant reads as not-found, not forbidden, so this
-    // never becomes a cross-tenant existence oracle.
-    const member = await env.DB.prepare(
-      'SELECT id, email, status FROM members WHERE id = ?1 AND (tenant = ?2 OR tenant IS NULL) LIMIT 1',
-    ).bind(memberId, env.TENANT_SLUG).first<{ id: string; email: string | null; status: string }>()
-    if (!member) return { ok: false, error: 'member_not_found' }
-    if (member.status !== 'active') return { ok: false, error: 'member_not_active' }
-    if (!isNonEmptyString(member.email)) return { ok: false, error: 'member_missing_email' }
-    email = member.email.trim()
-  }
-
   // mupot#1411 P0-1 (kasra-review, 2026-09-15): a member-bind invite mints a
   // Telegram credential that authenticates AS the target member — exactly the
   // token-mint concept requireCapability(orgScope,'admin') + targetRankCeiling
@@ -471,14 +476,54 @@ export async function createProjectInvite(
   // not merely the invited squad. The net-new path (no member_id — nothing to
   // take over, a fresh member is minted) keeps the existing squad-admin
   // ceiling unchanged.
+  //
+  // mupot#1411 P2-D round 4 (kasra-review, 2026-09-15): this coarse
+  // "does the actor even hold admin standing at all" check used to run AFTER
+  // the member lookup below — so a zero-standing caller (never admin on
+  // anything) got a DIFFERENT error per target (member_not_found /
+  // member_not_active / member_missing_email / eventually 'forbidden'),
+  // making member existence, status, and email-presence an enumeration
+  // oracle available to literally anyone who could reach this function.
+  // Neither `edge` (squad/department) nor this rank computation depends on
+  // the target member row, so this can run first: a zero-standing caller now
+  // gets the exact same 'forbidden' refusal regardless of what the target
+  // member id resolves to.
   const actorRank = hasMemberId
     ? await actorRankOnScopeFor(env, auth, 'org', null)
     : await actorRankOnSquad(env, auth, squadId, edge.department_id)
   if (actorRank < capabilityRank('admin')) return { ok: false, error: 'forbidden' }
+
+  if (hasMemberId) {
+    // mupot#1411 N4 round 4 (Athena, 2026-09-15): deliberately EXACT tenant
+    // match here, NOT the GET /members/:id collapse shape (tenant = ? OR
+    // tenant IS NULL) this used to reuse. That collapse is right for a READ
+    // (existence-oracle safety) but wrong for a WRITE that creates a
+    // dependency on a LATER exact-tenant check: MEMBER_BIND_ELIGIBLE_SQL,
+    // the fence redemption actually enforces, requires `tenant = ?` exactly
+    // — NULL never equals a tenant slug in SQL — so a NULL-tenant member
+    // passed creation's old collapse-shaped check, minted a real invite, and
+    // could NEVER redeem it (permanently invalid_or_expired_pairing_code,
+    // no way to distinguish that from any other expired code). Refusing here
+    // with the SAME exact-match predicate as the eligibility fence trades a
+    // silent, permanent dead invite for an immediate, honest
+    // member_not_found at creation time — still not a cross-tenant oracle,
+    // since a NULL-tenant row and a genuinely nonexistent one both resolve
+    // to the identical refusal. Reached only once the caller is already
+    // proven to hold org-admin standing (above), so this is no longer
+    // reachable by a zero-standing caller at all.
+    const member = await env.DB.prepare(
+      'SELECT id, email, status FROM members WHERE id = ?1 AND tenant = ?2 LIMIT 1',
+    ).bind(memberId, env.TENANT_SLUG).first<{ id: string; email: string | null; status: string }>()
+    if (!member) return { ok: false, error: 'member_not_found' }
+    if (member.status !== 'active') return { ok: false, error: 'member_not_active' }
+    if (!isNonEmptyString(member.email)) return { ok: false, error: 'member_missing_email' }
+    email = member.email.trim()
+  }
+
   if (capabilityRank(input.capability) > actorRank) {
     return { ok: false, error: 'cannot_grant_above_own_rank' }
   }
-  if (hasMemberId && memberId !== null && await exceedsTargetRankCeiling(env, memberId, actorRank)) {
+  if (hasMemberId && memberId !== null && await exceedsTargetRankCeiling(env, auth, memberId)) {
     return { ok: false, error: 'forbidden' }
   }
 
@@ -719,15 +764,33 @@ export async function redeemTelegramProjectInvite(
         input.telegram_user_id.trim(),
       ),
       bindMemberStatement,
+      // mupot#1411 P2-E round 4: ON CONFLICT DO UPDATE instead of a bare
+      // INSERT — a pre-existing grant on the invited squad no longer throws
+      // (batch-wide rollback, permanent redemption_failed); it is upgraded
+      // to the HIGHER of the two ranks via RANK_SQL_CASE, NEVER downgraded
+      // (an existing 'admin' redeeming an 'observer' invite keeps 'admin')
+      // and never exceeding the invite's own capability (which was already
+      // capped at mint time to <= the minter's own rank in
+      // createProjectInvite above — 'cannot_grant_above_own_rank' — so this
+      // can never smuggle a grant past the minter's ceiling). When the
+      // SELECT's WHERE (the claim fence + bind-landed guard) is false, zero
+      // source rows means the INSERT never fires and ON CONFLICT never
+      // triggers either — a failed claim touches no pre-existing row.
       env.DB.prepare(
         `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
          SELECT ?, ?, 'squad', ?, ?
           WHERE EXISTS (
             SELECT 1 FROM invites WHERE id = ? AND accepted_at = ?
-          )${memberBindLandedGuard}`,
+          )${memberBindLandedGuard}
+         ON CONFLICT (member_id, scope_type, scope_id) DO UPDATE SET capability =
+           CASE WHEN ? > ${RANK_SQL_CASE('capabilities.capability')}
+                THEN excluded.capability
+                ELSE capabilities.capability
+           END`,
       ).bind(
         grantId, memberId, invite.squad_id, invite.capability, invite.id, claimedAt,
         ...memberBindLandedParams,
+        capabilityRank(invite.capability),
       ),
       env.DB.prepare(
         `UPDATE telegram_webhook_receipts

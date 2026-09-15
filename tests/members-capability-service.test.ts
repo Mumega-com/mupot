@@ -43,6 +43,13 @@ function makeServiceDb(options: ServiceDbOptions = {}) {
                 const capability = options.existingCapabilities?.[0]
                 return (capability === undefined ? null : { capability }) as T | null
               }
+              // mupot#1411 P0-A round 4: targetMaxRankAcrossScopes also
+              // folds in the role-plane rank via targetLegacyRoleRank
+              // (members.email -> users.role bridge) — a new `.first()`
+              // this stub must declare. null email = no bridge, no
+              // role-plane standing (this fixture's grants already cover
+              // the case under test).
+              if (sql.includes('SELECT email FROM members')) return { email: null } as T
               throw new Error(`unexpected first query: ${sql}`)
             },
             async all<T>() {
@@ -122,6 +129,8 @@ function makeGrantRouteEnv(
             const capability = existingCapabilities[0]
             return (capability === undefined ? null : { capability }) as T | null
           }
+          // mupot#1411 P0-A round 4: same role-plane bridge as above.
+          if (sql.includes('SELECT email FROM members')) return { email: null } as T
           throw new Error(`unexpected first query: ${sql}`)
         },
         async all<T>() {

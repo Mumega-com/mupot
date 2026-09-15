@@ -43,6 +43,14 @@ function makeEnv(options: {
           if (sql.includes('SELECT id, display_name FROM members')) {
             return { id: 'member-1', display_name: 'Operator' } as T
           }
+          // mupot#1411 P0-A round 4 (kasra-review, 2026-09-15):
+          // targetMaxRankAcrossScopes now also folds in the target's
+          // role-plane rank via targetLegacyRoleRank, bridged by email
+          // (members.email -> users.role) — a new `.first()` this stub must
+          // declare. `email: null` = "no bridge, no role-plane standing",
+          // matching this test's [] capability-grants fixture (target holds
+          // nothing anywhere; its subject is response headers, not authz).
+          if (sql.includes('SELECT email FROM members')) return { email: null } as T
           throw new Error(`unexpected first query: ${sql}`)
         },
         // mupot#1411 P0-1 (kasra-review, 2026-09-15): the mint route's

@@ -419,8 +419,37 @@ export async function actorMaxRankOnScope(
 }
 
 /**
+ * The target's role-plane rank via `users.role` — bridged by EMAIL, the same
+ * dedup key `upsertUserByEmail` (src/auth/index.ts) already uses to keep one
+ * human's `users` row and `members` row in sync. `members` carries no `role`
+ * column at all (see the schema in migrations/0001 — status only); a
+ * principal's standing can therefore live ENTIRELY on this plane, with ZERO
+ * capability rows. src/auth/index.ts:917-923 documents the exact case: "the
+ * org owner... characteristically holds zero capability rows."
+ *
+ * A member with a null email, or an email matching no `users` row (an
+ * IM-only member; a member who has never logged into the dashboard under
+ * that email), has no standing on this plane — this returns 0, the same
+ * safe default `targetMaxRankAcrossScopes` already returns for a member with
+ * no capability grants. Absence of a bridge is never treated as elevation.
+ */
+export async function targetLegacyRoleRank(env: Env, targetMemberId: string): Promise<number> {
+  const member = await env.DB.prepare('SELECT email FROM members WHERE id = ?1 LIMIT 1')
+    .bind(targetMemberId)
+    .first<{ email: string | null }>()
+  if (!member?.email) return 0
+  const user = await env.DB.prepare('SELECT role FROM users WHERE email = ?1 LIMIT 1')
+    .bind(member.email)
+    .first<{ role: AuthContext['role'] }>()
+  if (!user) return 0
+  return legacyRoleRank(user.role)
+}
+
+/**
  * The TARGET's highest effective capability rank across EVERY scope they hold
- * a grant on — not just the one scope a caller happens to be checking.
+ * a grant on, AND their coarse legacy-role standing — not just the one scope
+ * a caller happens to be checking, and not just one of the two authority
+ * planes this codebase recognizes.
  *
  * mupot#1337's targetRankCeiling (src/members/index.ts) originally compared
  * the target's row on ONE (scopeType, scopeId) only. mupot#1411 P0-1
@@ -435,6 +464,16 @@ export async function actorMaxRankOnScope(
  * token mint, capability grant): a target's standing on ANY scope makes them
  * a higher-ranked principal, not merely their standing on the one scope a
  * particular action happens to touch.
+ *
+ * mupot#1411 P0-A round 4 (kasra-review, 2026-09-15): the fix above measured
+ * ONLY the grant-rows plane while `actorRankOnScopeFor` floors the ACTOR on
+ * BOTH `auth.role` and grants — an asymmetry that let an org admin (role
+ * plane, rank 4) suspend/mint-for/grant-on/member-bind-invite-for the
+ * bootstrap owner (role plane, rank 5, zero grant rows): reproduced end to
+ * end (invite minted, redeemed, `PATCH .../status=suspended` on the owner
+ * returned 200 — the exact #1337 lockout this ceiling exists to prevent).
+ * Now folds targetLegacyRoleRank in too, so a target's standing on EITHER
+ * plane sets the ceiling.
  */
 export async function targetMaxRankAcrossScopes(env: Env, targetMemberId: string): Promise<number> {
   // Reuses resolveCapabilities — the SAME query every capability check in
@@ -446,21 +485,75 @@ export async function targetMaxRankAcrossScopes(env: Env, targetMemberId: string
   for (const grant of grants) {
     max = Math.max(max, RANK[grant.capability])
   }
+  max = Math.max(max, await targetLegacyRoleRank(env, targetMemberId))
+  return max
+}
+
+/**
+ * The ACTING principal's standing on the SAME global quantity
+ * targetMaxRankAcrossScopes computes for the target: their role-plane rank,
+ * unioned with the max rank of every grant they hold across EVERY scope (not
+ * just the scope the current action happens to touch).
+ *
+ * Sources grants from `auth.capabilities ?? resolveCapabilities(...)` — the
+ * SAME precedence actorRankOnScopeFor already uses — rather than always
+ * re-querying the DB directly. This is not just consistency: a directory-
+ * channel session has `auth.capabilities` deliberately zeroed to `[]` by the
+ * B1 ambient-authority ceiling (see AuthContext's own doc comment on
+ * `latentCapabilities`), and a raw `resolveCapabilities(env, auth.memberId)`
+ * call here would silently reinstate the DB's real grants, reopening the
+ * exact ambient-authority hole that ceiling exists to close. The target side
+ * (targetMaxRankAcrossScopes) is correctly unconditional — the TARGET is
+ * never the one whose ambient authority is being ceilinged.
+ */
+export async function actorMaxRankAcrossScopes(env: Env, auth: AuthContext): Promise<number> {
+  let max = legacyRoleRank(auth.role)
+  if (auth.memberId) {
+    const grants = auth.capabilities ?? (await resolveCapabilities(env, auth.memberId))
+    for (const grant of grants) {
+      max = Math.max(max, RANK[grant.capability])
+    }
+    max = Math.max(max, await targetLegacyRoleRank(env, auth.memberId))
+  }
   return max
 }
 
 /**
  * True when the target's real standing (targetMaxRankAcrossScopes) exceeds
- * the acting principal's own rank — the shared predicate behind
- * targetRankCeiling (HTTP) and every non-HTTP caller that needs the same
- * "you cannot act on a principal who outranks you, anywhere" rule.
+ * the ACTOR's real standing (actorMaxRankAcrossScopes) — the shared
+ * predicate behind targetRankCeiling (HTTP) and every non-HTTP caller that
+ * needs the same "you cannot act on a principal who outranks you, anywhere"
+ * rule. A principal can never outrank themselves (self-exempt), independent
+ * of the comparison below.
+ *
+ * mupot#1411 N2 round 4 (Athena, 2026-09-15): this used to take a caller-
+ * computed `actorRank: number`, and every call site fed it a SCOPE-LOCAL
+ * number (actorMaxRankOnScope) while the target side was already GLOBAL
+ * (targetMaxRankAcrossScopes) — comparing two different quantities. Org
+ * grants bubble DOWN to cover every squad by design, but a squad grant never
+ * bubbles UP to satisfy an org-scope check — so an org admin who ALSO holds
+ * 'owner' on one squad has a real global standing of 5, but their org-scope-
+ * LOCAL rank is only 4. Executed: that principal tried to mint a token FOR
+ * THEMSELVES — target = self, target's global rank (5, via the squad grant)
+ * compared against their own org-scope-local rank (4) — 403
+ * cannot_affect_higher_rank, a principal treated as unable to outrank
+ * himself. Same bug on suspend/reactivate, capability grant, and the newer
+ * member-bind invite and unbind paths — anywhere a caller's local rank could
+ * differ from their global one. Fixed by making both sides of the
+ * comparison the SAME function (this one, and targetMaxRankAcrossScopes),
+ * plus an explicit self-exemption: no comparison, correct or not, should
+ * ever be able to say a principal outranks themselves.
  */
 export async function exceedsTargetRankCeiling(
   env: Env,
+  auth: AuthContext,
   targetMemberId: string,
-  actorRank: number,
 ): Promise<boolean> {
-  const targetRank = await targetMaxRankAcrossScopes(env, targetMemberId)
+  if (auth.memberId && auth.memberId === targetMemberId) return false
+  const [targetRank, actorRank] = await Promise.all([
+    targetMaxRankAcrossScopes(env, targetMemberId),
+    actorMaxRankAcrossScopes(env, auth),
+  ])
   return targetRank > actorRank
 }
 

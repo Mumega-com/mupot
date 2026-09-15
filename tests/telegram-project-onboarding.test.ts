@@ -1824,6 +1824,58 @@ describe('Telegram project invite — bind existing member', () => {
       ).get('member-existing')).toEqual({ count: 0 })
     })
 
+    // mupot#1411 P2-D round 4 (kasra-review, 2026-09-15): the coarse
+    // "does the actor hold admin standing AT ALL" check used to run AFTER
+    // the member lookup, so a zero-standing caller got a DIFFERENT error per
+    // target (member_not_found / member_not_active / member_missing_email)
+    // — an enumeration oracle available to anyone, not only an admin. Moved
+    // above the lookup; every target shape below now gets the IDENTICAL
+    // 'forbidden' refusal from the SAME zero-standing actor.
+    it('P2-D — a zero-standing actor gets the IDENTICAL refusal regardless of target existence/state/email', async () => {
+      harness.sqlite.exec(`
+        INSERT INTO members (id, email, display_name, status, tenant)
+        VALUES ('member-p2d-suspended', 'p2d-suspended@example.test', 'P2D Suspended', 'suspended', '${TENANT}');
+        INSERT INTO members (id, email, display_name, status, tenant)
+        VALUES ('member-p2d-no-email', NULL, 'P2D No Email', 'active', '${TENANT}');
+      `)
+      const invite = (memberId: string) => createProjectInvite(env, squadOnlyAdminAuth, {
+        member_id: memberId,
+        project_id: 'project-bind',
+        squad_id: 'squad-bind',
+        capability: 'member',
+        expires_in_seconds: 3600,
+      })
+
+      const nonexistent = await invite('member-p2d-does-not-exist')
+      const active = await invite('member-existing')
+      const suspended = await invite('member-p2d-suspended')
+      const noEmail = await invite('member-p2d-no-email')
+
+      expect(nonexistent).toEqual({ ok: false, error: 'forbidden' })
+      expect(active).toEqual({ ok: false, error: 'forbidden' })
+      expect(suspended).toEqual({ ok: false, error: 'forbidden' })
+      expect(noEmail).toEqual({ ok: false, error: 'forbidden' })
+      // Not merely the same error CODE — no invite row exists for any of them.
+      expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM invites').get())
+        .toEqual({ count: 0 })
+    })
+
+    // N2 round 4 (Athena, 2026-09-15): self-exemption on the member-bind
+    // path too, not only the HTTP routes in src/members/index.ts.
+    it('N2 — an org admin may member-bind THEIR OWN Telegram identity even while holding elevated standing elsewhere', async () => {
+      harness.sqlite.exec(`
+        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES ('cap-bind-owner-elsewhere-owner', 'member-bind-owner', 'squad', 'squad-bind', 'owner');
+      `)
+      // ownerAuth's own memberId is 'member-bind-owner' — binding member_id
+      // = itself. Its global standing (owner, rank 5, via the extra squad
+      // grant just inserted) now exceeds its org-scope-local rank (admin,
+      // rank 4) — exactly the local-vs-global mismatch N2 fixes — but
+      // self-exemption means the comparison never even runs.
+      const result = await createMemberInvite({ member_id: 'member-bind-owner', capability: 'member' })
+      expect(result.ok).toBe(true)
+    })
+
     it('P0-1b — refuses an org-admin actor targeting a member who outranks them via a DIFFERENT, unrelated scope (target-rank ceiling, across ALL scopes)', async () => {
       harness.sqlite.exec(`
         INSERT INTO departments (id, slug, name) VALUES ('department-secret', 'secret', 'Secret Dept');
@@ -1870,6 +1922,29 @@ describe('Telegram project invite — bind existing member', () => {
         expires_in_seconds: 3600,
       })
       expect(result.ok).toBe(true)
+    })
+
+    // mupot#1411 P0-A round 4 (kasra-review, 2026-09-15): re-run of the
+    // executed takeover probe from the round-4 gate — an org admin mints a
+    // member_id invite for the bootstrap owner. The owner here has ZERO
+    // capability rows (the characteristic shape, src/auth/index.ts:917-923)
+    // and standing ONLY via `users.role`, bridged by email. Before the fix,
+    // targetMaxRankAcrossScopes measured the grants plane alone and returned
+    // 0 for this target, so the invite MINTED, was redeemable, and a
+    // subsequent `PATCH .../status=suspended` on the owner returned 200 —
+    // the exact #1337 lockout this ceiling exists to prevent.
+    it('P0-A — refuses an org admin minting a member_id invite for the bootstrap owner (role-plane only, zero capability rows)', async () => {
+      harness.sqlite.exec(`
+        INSERT INTO members (id, email, display_name, status, tenant)
+        VALUES ('member-bootstrap-owner', 'bootstrap-owner@example.test', 'Bootstrap Owner', 'active', '${TENANT}');
+        INSERT INTO users (id, email, role)
+        VALUES ('user-bootstrap-owner', 'bootstrap-owner@example.test', 'owner');
+      `)
+      const result = await createMemberInvite({ member_id: 'member-bootstrap-owner' })
+      expect(result).toEqual({ ok: false, error: 'forbidden' })
+      expect(harness.sqlite.prepare(
+        'SELECT COUNT(*) AS count FROM invites WHERE member_id = ?',
+      ).get('member-bootstrap-owner')).toEqual({ count: 0 })
     })
 
     it('does not create an invite row when member validation refuses', async () => {
@@ -1932,6 +2007,66 @@ describe('Telegram project invite — bind existing member', () => {
       `).get(TENANT) as { state: string; response_text: string }
       expect(receipt.state).toBe('completed')
       expect(JSON.parse(receipt.response_text)).toEqual(result.value)
+    })
+
+    // mupot#1411 P2-E round 4 (kasra-review, 2026-09-15): P2-3 from round 2
+    // was left NOT FIXED — any PRE-EXISTING grant on the invited squad
+    // (the MOST common shape for binding an existing member: they usually
+    // already work on that squad) hit `UNIQUE(member_id, scope_type,
+    // scope_id)` and threw, permanently bricking the invite as
+    // `redemption_failed`. ON CONFLICT DO UPDATE now upgrades to the HIGHER
+    // of the two ranks — never downgrades, never exceeds the invite's own
+    // capability (itself already capped at mint time to <= the minter's
+    // rank).
+    it('P2-E — an existing OBSERVER grant on the invited squad is UPGRADED to the invited capability, not thrown away', async () => {
+      harness.sqlite.exec(`
+        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES ('cap-existing-observer', 'member-existing', 'squad', 'squad-bind', 'observer');
+      `)
+      const created = await createMemberInvite({ capability: 'member' })
+      expect(created.ok).toBe(true)
+      if (!created.ok) return
+      reserveUpdate('update-bind-upgrade-observer', VALID_REQUEST_DIGEST, '9200300')
+
+      const result = await redeemTelegramProjectInvite(env, {
+        pairing_code: created.value.pairing_code,
+        telegram_user_id: '9200300',
+        display_name: 'Upgrade Observer',
+        update_id: 'update-bind-upgrade-observer',
+        request_digest: VALID_REQUEST_DIGEST,
+      })
+
+      expect(result.ok).toBe(true)
+      expect(harness.sqlite.prepare(`
+        SELECT COUNT(*) AS count FROM capabilities WHERE member_id = 'member-existing' AND scope_type = 'squad' AND scope_id = 'squad-bind'
+      `).get()).toEqual({ count: 1 }) // upgraded IN PLACE, not a second row
+      expect(harness.sqlite.prepare(`
+        SELECT capability FROM capabilities WHERE member_id = 'member-existing' AND scope_type = 'squad' AND scope_id = 'squad-bind'
+      `).get()).toEqual({ capability: 'member' }) // observer(1) -> member(2), upgraded
+    })
+
+    it('P2-E — an existing ADMIN grant on the invited squad is KEPT (never downgraded) when the invite is for a LOWER capability', async () => {
+      harness.sqlite.exec(`
+        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES ('cap-existing-admin', 'member-existing', 'squad', 'squad-bind', 'admin');
+      `)
+      const created = await createMemberInvite({ capability: 'observer' })
+      expect(created.ok).toBe(true)
+      if (!created.ok) return
+      reserveUpdate('update-bind-keep-admin', VALID_REQUEST_DIGEST, '9200301')
+
+      const result = await redeemTelegramProjectInvite(env, {
+        pairing_code: created.value.pairing_code,
+        telegram_user_id: '9200301',
+        display_name: 'Keep Admin',
+        update_id: 'update-bind-keep-admin',
+        request_digest: VALID_REQUEST_DIGEST,
+      })
+
+      expect(result.ok).toBe(true)
+      expect(harness.sqlite.prepare(`
+        SELECT capability FROM capabilities WHERE member_id = 'member-existing' AND scope_type = 'squad' AND scope_id = 'squad-bind'
+      `).get()).toEqual({ capability: 'admin' }) // NEVER downgraded to the invited 'observer'
     })
 
     it('refuses when the member already has a DIFFERENT Telegram identity bound', async () => {
@@ -2150,38 +2285,29 @@ describe('Telegram project invite — bind existing member', () => {
         .toEqual({ accepted_at: null })
     })
 
-    // F1 (Athena BLOCK): a NULL-tenant member can never be resolved by
-    // memberForChat (src/im/index.ts:95-97, no NULL fallback), so binding one
-    // would silently grant a capability an operator could never reach through
-    // Telegram. MEMBER_BIND_ELIGIBLE_SQL's `tenant = ?` is an exact, non-NULL
-    // match — refuses at the claim, invite intact.
-    it('F1 — refuses at the claim (invite stays intact) when the target member has a NULL tenant', async () => {
+    // F1 / N4 (Athena BLOCK, round 2; Athena N4, round 4): a NULL-tenant
+    // member can never be resolved by memberForChat (src/im/index.ts:95-97,
+    // no NULL fallback), so binding one would silently grant a capability an
+    // operator could never reach through Telegram. Round 2 made
+    // MEMBER_BIND_ELIGIBLE_SQL's `tenant = ?` an exact, non-NULL match, so
+    // redemption always refused — but CREATION still used the GET
+    // /members/:id collapse shape (tenant = ? OR tenant IS NULL), so the
+    // invite minted successfully and could then NEVER be redeemed: a
+    // silent, permanent dead invite with no distinguishing error. Round 4
+    // closes it at the SOURCE — creation now uses the same exact-tenant
+    // predicate the eligibility fence enforces, so a NULL-tenant target is
+    // refused immediately with member_not_found and no invite row is ever
+    // created for it.
+    it('N4 — refuses at CREATION (member_not_found), never mints a dead invite, when the target member has a NULL tenant', async () => {
       harness.sqlite.exec(`
         INSERT INTO members (id, email, display_name, status, tenant)
         VALUES ('member-null-tenant', 'null-tenant@example.test', 'Null Tenant', 'active', NULL);
       `)
       const created = await createMemberInvite({ member_id: 'member-null-tenant' })
-      expect(created.ok).toBe(true)
-      if (!created.ok) return
-      reserveUpdate('update-bind-null-tenant', VALID_REQUEST_DIGEST, '9201100')
-
-      const result = await redeemTelegramProjectInvite(env, {
-        pairing_code: created.value.pairing_code,
-        telegram_user_id: '9201100',
-        display_name: 'Null Tenant Target',
-        update_id: 'update-bind-null-tenant',
-        request_digest: VALID_REQUEST_DIGEST,
-      })
-
-      expect(result).toEqual({ ok: false, error: 'invalid_or_expired_pairing_code' })
-      expect(harness.sqlite.prepare(`
-        SELECT telegram_chat_id FROM members WHERE id = 'member-null-tenant'
-      `).get()).toEqual({ telegram_chat_id: null })
-      expect(harness.sqlite.prepare(`
-        SELECT COUNT(*) AS count FROM capabilities WHERE member_id = 'member-null-tenant'
-      `).get()).toEqual({ count: 0 })
-      expect(harness.sqlite.prepare('SELECT accepted_at FROM invites WHERE id = ?').get(created.value.invite.id))
-        .toEqual({ accepted_at: null })
+      expect(created).toEqual({ ok: false, error: 'member_not_found' })
+      expect(harness.sqlite.prepare(
+        'SELECT COUNT(*) AS count FROM invites WHERE member_id = ?',
+      ).get('member-null-tenant')).toEqual({ count: 0 })
     })
 
     // F2 (Athena BLOCK): a member ALREADY carrying the redeeming Telegram id
@@ -2232,6 +2358,66 @@ describe('Telegram project invite — bind existing member', () => {
   it('seam — the claim and the bind statement interpolate the IDENTICAL member-eligibility fragment', () => {
     expect(CLAIM_INVITE_SQL).toContain(MEMBER_BIND_ELIGIBLE_SQL)
     expect(MEMBER_BIND_UPDATE_SQL).toContain(MEMBER_BIND_ELIGIBLE_SQL)
+  })
+
+  // mupot#1411 N5 round 4 (Athena, 2026-09-15): identical SQL TEXT is not
+  // proof the two call sites bind the SAME VALUES in the SAME ORDER into
+  // that text's 3 placeholders (id, tenant, telegram_chat_id-compare) — a
+  // transposed bind at only ONE of the two sites would still pass the text-
+  // only seam test above while comparing the wrong facts at runtime. Spies
+  // on both statements' real `.bind()` calls during one genuine redemption
+  // and asserts the exact 3-tuple each site binds into the shared fragment.
+  it('N5 — the claim and the bind statement bind the SAME (id, tenant, telegram) tuple, in the SAME order', async () => {
+    const created = await createMemberInvite()
+    expect(created.ok).toBe(true)
+    if (!created.ok) return
+    reserveUpdate('update-bind-param-order', VALID_REQUEST_DIGEST, 'telegram-order-check')
+
+    const captured: Record<string, unknown[]> = {}
+    const realDb = env.DB
+    const spyDb = {
+      prepare(sql: string) {
+        return {
+          bind(...values: unknown[]) {
+            if (sql === CLAIM_INVITE_SQL || sql === MEMBER_BIND_UPDATE_SQL) {
+              captured[sql] = values
+            }
+            return realDb.prepare(sql).bind(...values)
+          },
+          first: (...args: unknown[]) => realDb.prepare(sql).first(...(args as [])),
+          all: (...args: unknown[]) => realDb.prepare(sql).all(...(args as [])),
+          run: (...args: unknown[]) => realDb.prepare(sql).run(...(args as [])),
+        }
+      },
+      batch: realDb.batch.bind(realDb),
+    } as unknown as Env['DB']
+    const spyEnv: Env = { ...env, DB: spyDb }
+
+    const result = await redeemTelegramProjectInvite(spyEnv, {
+      pairing_code: created.value.pairing_code,
+      telegram_user_id: 'telegram-order-check',
+      display_name: 'Order Check',
+      update_id: 'update-bind-param-order',
+      request_digest: VALID_REQUEST_DIGEST,
+    })
+    expect(result.ok).toBe(true)
+
+    // CLAIM_INVITE_SQL's bind_target EXISTS is the LAST clause it
+    // interpolates the shared fragment into -> the last 3 bound values.
+    const claimValues = captured[CLAIM_INVITE_SQL]
+    expect(claimValues).toBeDefined()
+    expect(claimValues.slice(-3)).toEqual(['member-existing', TENANT, 'telegram-order-check'])
+
+    // MEMBER_BIND_UPDATE_SQL binds its SET clause (2 values) first, then the
+    // shared fragment's WHERE (3 values), then its own trailing EXISTS (2
+    // values) -> the fragment's 3-tuple sits at index [2, 5).
+    const bindValues = captured[MEMBER_BIND_UPDATE_SQL]
+    expect(bindValues).toBeDefined()
+    expect(bindValues.slice(2, 5)).toEqual(['member-existing', TENANT, 'telegram-order-check'])
+
+    // And both sites agree with each other, not merely with the fixture —
+    // the actual assertion N5 asks for.
+    expect(claimValues.slice(-3)).toEqual(bindValues.slice(2, 5))
   })
 
   // ── Bind-landed proof: a stamp, not a state test ──────────────────────────
