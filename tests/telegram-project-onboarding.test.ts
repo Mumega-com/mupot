@@ -200,6 +200,40 @@ describe('Telegram project onboarding schema', () => {
     `)).toThrow(/project invite member bind requires the full project field set/)
   })
 
+  // P3 (kasra-review, 2026-09-15): member_id is a bare TEXT column with no
+  // CHECK of its own — a whitespace-only value would pass every conjunct
+  // above (it IS NOT NULL, and the project fields can be fully present) yet
+  // resolve to no real member anywhere. The application layer already trims
+  // and rejects this (isNonEmptyString in src/members/project-invites.ts),
+  // but the trigger is the schema's OWN backstop against any writer that
+  // bypasses the service (a direct migration, a future internal tool).
+  it('requires a member-bind project invite member_id to be non-blank', () => {
+    createProjectAndSquad()
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status)
+      VALUES ('member-bind-blank', 'bind-blank@example.com', 'Bind Blank', 'active');
+    `)
+
+    expect(() => harness.sqlite.prepare(`
+      INSERT INTO invites (
+        id, email, project_id, squad_id, pairing_hash, pairing_expires_at, member_id
+      ) VALUES (
+        'member-bind-whitespace', 'member-bind-whitespace@example.com', 'project-1', 'squad-1',
+        ?, '2026-09-13T01:00:00Z', '   '
+      )
+    `).run(VALID_PAIRING_HASH)).toThrow(/project invite member bind requires a non-blank member_id/)
+
+    // A real, non-blank member_id on the same shape is unaffected.
+    expect(() => harness.sqlite.prepare(`
+      INSERT INTO invites (
+        id, email, project_id, squad_id, pairing_hash, pairing_expires_at, member_id
+      ) VALUES (
+        'member-bind-nonblank', 'member-bind-nonblank@example.com', 'project-1', 'squad-1',
+        ?, '2026-09-13T01:00:00Z', 'member-bind-blank'
+      )
+    `).run(VALID_PAIRING_HASH)).not.toThrow()
+  })
+
   it('records webhook receipts once per tenant and update id', () => {
     const insert = harness.sqlite.prepare(`
       INSERT INTO telegram_webhook_receipts (
