@@ -57,6 +57,27 @@ describe('authenticated Telegram receipts and human controls', () => {
     // restriction (src/auth/capability.ts:315-322). This fixture must carry
     // a memberId + a real admin grant on squad-1, the same shape any real
     // inviter needs, rather than relying on the coarse legacy role alone.
+    //
+    // mupot#1411 P2 round 5: createProjectInvite now stores the minter's
+    // memberId in invites.minted_by_member_id, which REFERENCES members(id)
+    // — a real member row for 'inviter-member' is required, matching every
+    // real inviter (a memberId never exists without a backing members row).
+    //
+    // mupot#1411 round 6 (kasra-review adversarial addendum on Athena gate
+    // efdb0b08, P2): redeemTelegramProjectInvite now re-derives the minter's
+    // CURRENT squad-scope standing straight from the capabilities TABLE
+    // (currentMemberSquadRank) at redemption time — the auth object's
+    // capabilities array above is session-supplied and never read back from
+    // D1 there. A real grant row is needed too, the same collateral fixture
+    // gap round 5 found and fixed for the member-bind describe block.
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status, tenant)
+      VALUES ('inviter-member', 'admin@test.com', 'Inviter', 'active', '${env.TENANT_SLUG}')
+      ON CONFLICT (id) DO NOTHING;
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+      VALUES ('cap-inviter-member-squad-admin', 'inviter-member', 'squad', 'squad-1', 'admin')
+      ON CONFLICT (id) DO NOTHING;
+    `)
     const auth: AuthContext = {
       userId: 'admin', email: 'admin@test.com', role: 'admin', tenant: env.TENANT_SLUG,
       memberId: 'inviter-member',
@@ -226,8 +247,15 @@ describe('authenticated Telegram receipts and human controls', () => {
     const response = await post(request)
     const body = await response.json() as { reply: string }
     expect(body.reply).toMatch(/joined.*project-1/i)
-    expect(harness.sqlite.prepare('SELECT telegram_chat_id, status FROM members').all()).toEqual([{ telegram_chat_id: '123', status: 'active' }])
-    expect(harness.sqlite.prepare('SELECT scope_type, scope_id, capability FROM capabilities').all()).toEqual([{ scope_type: 'squad', scope_id: 'squad-1', capability: 'member' }])
+    // mupot#1411 P2 round 5: excludes 'inviter-member' — the invite()
+    // fixture now inserts a real row for it (invites.minted_by_member_id
+    // FK) — so this asserts only the net-new JOINED member's row, the
+    // fact this test is actually about.
+    expect(harness.sqlite.prepare("SELECT telegram_chat_id, status FROM members WHERE id != 'inviter-member'").all()).toEqual([{ telegram_chat_id: '123', status: 'active' }])
+    // mupot#1411 round 6: excludes 'inviter-member' — the invite() fixture
+    // now also inserts a real capabilities row for it (see the comment
+    // above), so this asserts only the net-new JOINED member's own grant.
+    expect(harness.sqlite.prepare("SELECT scope_type, scope_id, capability FROM capabilities WHERE member_id != 'inviter-member'").all()).toEqual([{ scope_type: 'squad', scope_id: 'squad-1', capability: 'member' }])
     expect(harness.sqlite.prepare('SELECT * FROM member_tokens').all()).toEqual([])
     const before = businessState()
     const stored = receipt()

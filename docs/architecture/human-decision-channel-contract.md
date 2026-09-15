@@ -4,6 +4,14 @@ Status: architecture note, written 2026-09-14 by Kasra from receipts on mupot PR
 (`kasra/telegram-project-onboarding-20260913`, merged to `main` at `49a344aa`) and its
 gate history. Not a release contract. Hadi decides scope; updates by PR only.
 
+Updated 2026-09-15 (round 6, Athena gate `efdb0b08`) for mupot PR #1411
+(`kasra/telegram-bind-existing-member-20260914`): the "net-new humans only" gap named in
+clause (g) below is closed. This revision replaces round 4's actor/target-ceiling
+description (a shape round 5 reverted, see `src/auth/capability.ts`'s own
+`exceedsTargetRankCeiling` history) with the shape that actually shipped — see clause (a)
+below — and corrects clause (g)'s unbind description to match round 5's self-unbind
+addition.
+
 ## One sentence
 
 A "decision channel" is any medium through which a human can join a Mupot project and
@@ -31,22 +39,44 @@ A human enters a project through one **single-use, server-hashed** invitation:
 
 - The raw secret (`pairing_code`) is returned to the creator exactly once and never
   stored; only its SHA-256 digest (`pairing_hash`) persists
-  (`src/members/project-invites.ts:284-288,337`, `createProjectInvite`).
+  (`src/members/project-invites.ts:552-564,577-591`, `createProjectInvite`).
 - The claim is one atomic statement (`CLAIM_INVITE_SQL`,
-  `src/members/project-invites.ts:224-252`) with conjuncts that must all hold in the
+  `src/members/project-invites.ts:337-371`) with conjuncts that must all hold in the
   SAME statement, not a JS pre-check that can race it:
   - single-use: `accepted_at IS NULL`
-  - not expired: `pairing_expires_at > ?8`
+  - not expired: `pairing_expires_at > ?`
   - project active: `EXISTS (... projects.status = 'active')`
   - the exact squad-project edge still exists: `EXISTS (... project_squad_access ...)`
   - the authenticated transport receipt is in `state = 'processing'` for this exact
     `(tenant, update_id, digest, telegram_user_id)` (the "receipt-processing conjunct")
+  - mupot#1411: when the invite carries a `member_id` (binding an EXISTING member's
+    Telegram identity instead of minting a net-new one), an additional EXISTS clause
+    requires the target row to satisfy `MEMBER_BIND_ELIGIBLE_SQL` (exact non-NULL
+    tenant match, `status = 'active'`, Telegram-identity compatible) at claim time —
+    see clause (g) below.
 - Identity used to claim is the medium's own **immutable** user id (Telegram's
   `message.from.id`), never a display name, username, or any other field the human or
   transport can freely re-supply (`src/im/index.ts:857-872`, `telegramDisplayName` is
   documented COSMETIC ONLY — never identity, authority, or part of the request digest).
-- A capability grant can never invite above the inviter's own effective rank
-  (`actorRankOnSquad`, `src/members/project-invites.ts:163-186`; `cannot_grant_above_own_rank`).
+- A capability grant can never invite above the inviter's own effective rank. TWO
+  distinct paths, per mupot#1411: the **net-new** path (no `member_id` — a fresh member
+  is minted, nothing to take over) keeps the original squad-local ceiling
+  (`actorRankOnSquad`, `src/members/project-invites.ts`; `cannot_grant_above_own_rank`).
+  The **member-bind** path (`member_id` set — attaching Telegram to an EXISTING
+  identity, itself a credential mint) requires ORG-scope admin
+  (`actorRankOnScopeFor(env, auth, 'org', null)`) AND that the target does not outrank
+  the actor ANYWHERE (`exceedsTargetRankCeiling`, `src/auth/capability.ts`) — the two
+  sides of that comparison are DELIBERATELY ASYMMETRIC, not the same quantity, and this
+  is the round-5 shape after round 4 shipped the symmetric version and then had to revert
+  it as its own escalation (see the round-5 note in `exceedsTargetRankCeiling`'s own
+  docstring): the **target** is GLOBAL (`targetMaxRankAcrossScopes` — the maximum of every
+  capability-grant row the target holds on ANY scope, unioned with their role-plane rank
+  via the `lower(email)` members↔users bridge), while the **actor** is ORG-SCOPE-LOCAL
+  (`actorRankOnScopeFor(env, auth, 'org', null)` — an org-scope capability grant unioned
+  with the session's own `auth.role`, never inflated by a grant the actor happens to hold
+  on some unrelated squad or department). The check refuses iff the target's global rank
+  exceeds the actor's org-scope-local rank; a principal is always self-exempt from
+  outranking themselves, independent of either side's computation.
 
 Adversarial finding this closes: PR #1407's own re-gate proved two of the `EXISTS`
 conjuncts (`projects.status='active'`, the `project_squad_access` edge) are **singly
@@ -188,12 +218,24 @@ Three distinct events are recorded **separately**, each idempotent on its own ke
 
 ### (g) Known gaps at v1 — do not treat these as closed
 
-- **Net-new humans only.** Redeeming an invite whose email already belongs to an existing
-  member refuses with `member_already_exists` and makes no partial writes. Binding a new
-  channel identity (e.g. Telegram) to an *existing* member (e.g. someone with a web
-  login) is explicitly out of scope and must not be worked around by inviting that
-  member's own email — it needs its own reviewed change
-  (`docs/operations/telegram-project-onboarding.md`, top section).
+- **Closed by mupot#1411: existing members can now bind.** A project invite created
+  with `member_id` set (instead of `email`) attaches a Telegram identity to an
+  EXISTING, active, same-tenant member rather than always minting a net-new one.
+  Authority floor: org admin (`actorRankOnScopeFor(env, auth, 'org', null)`) AND the
+  target must not outrank the actor anywhere (`exceedsTargetRankCeiling` — target
+  GLOBAL standing across every scope unioned with the role-plane rank, actor ORG-SCOPE-
+  LOCAL standing only; self-exempt). Unbind — `DELETE /api/members/members/:id/telegram` — is gated
+  by that SAME org-admin-plus-ceiling floor **OR by the bound member acting on
+  themselves** (self-unbind, added round 5: no capability check at all when the caller
+  targets their own member row, since a bind victim otherwise has no way to detach an
+  identity attached to them without their say). The admin path remains the same
+  credential-revocation authority class as minting it; the self path is a remedy, not a
+  widening of what an admin may do to someone else.
+  Redeeming an invite whose caller-supplied `email` already belongs to an existing
+  member (the ORIGINAL net-new path, no `member_id`) is still refused with
+  `member_already_exists` and still makes no partial writes — that path is unchanged;
+  only the NEW `member_id` path binds an existing identity. See
+  `docs/operations/telegram-project-onboarding.md` for the operator-facing runbook.
 - **No invite revocation route.** There is no HTTP route to revoke an unused invite; the
   runbook's only path is a direct, approved DB `UPDATE` expiring one exact row by id.
 - **`gate:agent-self-completion` is coarse-role-only over this channel** (see (d) above) —
@@ -205,6 +247,24 @@ Three distinct events are recorded **separately**, each idempotent on its own ke
   `processing`. This channel inherits that gap; it does not repair it. Reconcile by
   reading both the task status and the latest verdict row — a mismatch is an incident,
   not something to paper over by manufacturing a new decision.
+- **Invite minter re-check cannot see a session-role-only floor (round 6, mupot#1417).**
+  An invite's minter authority is re-derived fresh from D1 at redemption
+  (`currentMemberOrgRank`/`currentMemberSquadRank`, `src/members/project-invites.ts`) —
+  but a minting session's `auth.role` is folded into the actor's rank unconditionally at
+  mint time, with no requirement that it be backed by a `capabilities` row or a
+  `members.email -> users.role` bridge for that SAME member. A minter whose standing came
+  only from that unbridgeable session floor mints successfully and is refused at
+  redemption with no real change in authority. Proven by a dedicated test, not fixed.
+- **A squad owner's net-new `owner`-capability invite escalates the target's global rank
+  (round 6, mupot#1417 item 2 — the SAME defect kasra-review's own gate on `efdb0b08`
+  filed independently as mupot#1416; cross-linked round 7, not a second gap).** The
+  freshly-minted member becomes untouchable by every org admin's target-rank ceiling
+  (suspend, mint, capability grant/revoke, Telegram unbind) — a real, narrow behavior
+  change from before this slice existed. Not fixed.
+- **`members.email` is case-sensitive UNIQUE (round 6, F4, mupot#1418).** A case-variant
+  row can bridge to a role-plane rank it has no real standing for, becoming immune to an
+  org admin the same way a real owner is (denial-only, never an authority gain). Not
+  fixed — a follow-up issue tracks lowercasing `members.email` on write.
 
 ## Second-channel checklist (Slack, WhatsApp, email, SMS)
 
@@ -237,17 +297,17 @@ What **must change**, not merely adapt:
 - **Schema shape.** `members.telegram_chat_id` and `telegram_webhook_receipts` are
   Telegram-specific column/table names carrying Telegram-specific semantics (immutable
   numeric chat id). This is not a stylistic nit — it is load-bearing in the invite path
-  itself: `CLAIM_INVITE_SQL` (`src/members/project-invites.ts:224-252`) **hardcodes** an
+  itself: `CLAIM_INVITE_SQL` (`src/members/project-invites.ts:337-371`) **hardcodes** an
   `EXISTS (SELECT 1 FROM telegram_webhook_receipts receipt WHERE ... receipt.telegram_user_id
-  = ?12 ...)` conjunct (`:244-251`) as one of the atomic claim's fence conditions — a
+  = ? ...)` conjunct (`:357-364`) as one of the atomic claim's fence conditions — a
   second channel cannot claim an invite through this exact statement without either its
   own copy of this table+conjunct or a rewrite of the statement itself. The whole module
   is Telegram-typed end to end, not just at the edges: the redemption input type names
-  the field `telegram_user_id` (`src/members/project-invites.ts:67`, the
+  the field `telegram_user_id` (`src/members/project-invites.ts:101`, the
   `RedeemTelegramProjectInviteInput` interface field — not a runtime assertion), the
-  error code is `invalid_telegram_user_id` (`:82`), and the runtime re-asserts the same
-  field name twice at redemption time (`:404`, the input-shape check;
-  `:419`, the receipt-row comparison). A second channel needs either its own
+  error code is `invalid_telegram_user_id` (`:116`), and the runtime re-asserts the same
+  field name twice at redemption time (`:631`, the input-shape check;
+  `:646`, the receipt-row comparison). A second channel needs either its own
   `members.<channel>_id` column
   and its own receipts table (fast, but repeats the `telegram_` prefix pattern per
   channel and needs a repeated migration + repeated fence logic per channel), or a

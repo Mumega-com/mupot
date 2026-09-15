@@ -43,6 +43,13 @@ function makeServiceDb(options: ServiceDbOptions = {}) {
                 const capability = options.existingCapabilities?.[0]
                 return (capability === undefined ? null : { capability }) as T | null
               }
+              // mupot#1411 P0-A round 4: targetMaxRankAcrossScopes also
+              // folds in the role-plane rank via targetLegacyRoleRank
+              // (members.email -> users.role bridge) — a new `.first()`
+              // this stub must declare. null email = no bridge, no
+              // role-plane standing (this fixture's grants already cover
+              // the case under test).
+              if (sql.includes('FROM members') && sql.includes('lower(email)')) return { email: null } as T
               throw new Error(`unexpected first query: ${sql}`)
             },
             async all<T>() {
@@ -76,13 +83,34 @@ function makeServiceDb(options: ServiceDbOptions = {}) {
   }
 }
 
-function makeGrantRouteEnv(existingCapabilities: Capability[]): Env {
+function makeGrantRouteEnv(
+  existingCapabilities: Capability[],
+  options: { role?: 'owner' | 'admin'; targetGrants?: CapabilityGrant[] } = {},
+): Env {
+  const role = options.role ?? 'owner'
   const session = JSON.stringify({
-    userId: 'owner-user',
-    email: 'owner@example.test',
-    role: 'owner',
+    userId: `${role}-user`,
+    email: `${role}@example.test`,
+    role,
     createdAt: '2026-07-12T00:00:00.000Z',
   })
+  // mupot#1411 P0-1 (kasra-review, 2026-09-15): the grant route's
+  // targetRankCeiling now consults the TARGET's standing across EVERY scope
+  // (targetMaxRankAcrossScopes, via the SAME resolveCapabilities query every
+  // capability check reuses) rather than one (scope_type, scope_id) row — an
+  // `.all()` call this stub must declare, same shape as the sibling stub in
+  // tests/members-sensitive-response.test.ts. Defaults to the existing
+  // grant's own org-scope rows so callers that don't care about the ceiling
+  // (an owner actor, which always outranks any target) see no behavior
+  // change; a cross-scope caller passes targetGrants explicitly.
+  const targetGrants: CapabilityGrant[] =
+    options.targetGrants ??
+    existingCapabilities.map((capability) => ({
+      member_id: 'member-1',
+      scope_type: 'org',
+      scope_id: null,
+      capability,
+    }))
   const db = {
     prepare(sql: string) {
       const statement = {
@@ -101,9 +129,14 @@ function makeGrantRouteEnv(existingCapabilities: Capability[]): Env {
             const capability = existingCapabilities[0]
             return (capability === undefined ? null : { capability }) as T | null
           }
+          // mupot#1411 P0-A round 4: same role-plane bridge as above.
+          if (sql.includes('FROM members') && sql.includes('lower(email)')) return { email: null } as T
           throw new Error(`unexpected first query: ${sql}`)
         },
         async all<T>() {
+          if (sql.includes('SELECT member_id, scope_type, scope_id, capability') && sql.includes('FROM capabilities')) {
+            return { results: targetGrants as unknown as T[] }
+          }
           if (sql.includes('SELECT capability FROM capabilities')) {
             return { results: existingCapabilities.map((capability) => ({ capability })) as T[] }
           }
@@ -127,7 +160,7 @@ function makeGrantRouteEnv(existingCapabilities: Capability[]): Env {
     TENANT_SLUG: 'tenant-a',
     DB: db,
     SESSIONS: {
-      get: async (key: string) => (key === 'sess:owner-session' ? session : null),
+      get: async (key: string) => (key === `sess:${role}-session` ? session : null),
       put: async () => undefined,
       delete: async () => undefined,
     },
@@ -286,5 +319,40 @@ describe('POST /members/:id/capabilities', () => {
       action: 'grant',
       result: 'updated',
     })
+  })
+
+  // mupot#1411 P0-1: proves targetRankCeiling is actually CONSULTED on this
+  // route, not merely mocked without throwing. The target holds nothing on
+  // the scope being acted on (org) but outranks the actor via a DIFFERENT,
+  // unrelated squad scope — a case the pre-#1411 per-scope-only ceiling
+  // could not see (it only ever queried the target's row on the route's own
+  // scope) and which would fall through to 201 if the across-all-scopes
+  // widening were reverted.
+  it('refuses an org admin granting a capability to a member who outranks them via a DIFFERENT scope', async () => {
+    const res = await membersApp.request(
+      '/members/member-1/capabilities',
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          cookie: 'mupot_session=admin-session',
+        },
+        body: JSON.stringify({ scope_type: 'org', capability: 'member' }),
+      },
+      makeGrantRouteEnv([], {
+        role: 'admin',
+        targetGrants: [
+          {
+            member_id: 'member-1',
+            scope_type: 'squad',
+            scope_id: 'squad-elsewhere',
+            capability: 'owner',
+          },
+        ],
+      }),
+    )
+
+    expect(res.status).toBe(403)
+    await expect(res.json()).resolves.toMatchObject({ reason: 'cannot_affect_higher_rank' })
   })
 })
