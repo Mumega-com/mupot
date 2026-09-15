@@ -1571,6 +1571,21 @@ the phantom-success class this fix closes. Restored, confirmed clean, reran gree
     which never has a memberId without a backing row) and narrowing one broad
     `SELECT ... FROM members` assertion (which expected exactly one row) to exclude the new
     fixture row.
+- **M2 — actor role-plane DB read bypassed B1 zeroing (structural, pinned with a
+  regression test).** Before A1's fix, `actorMaxRankAcrossScopes` read `users.role` from
+  the DB unconditionally via `targetLegacyRoleRank` — a B1-zeroed directory-channel
+  session (`auth.capabilities` deliberately `[]`) whose bridged email matched a DB
+  `users.role='owner'` row would have had that role silently reinstated as the actor's
+  own standing. `actorRankOnScopeFor` (the sole actor-side function since A1's deletion)
+  never reads the DB for the actor's role plane — only `auth.role` and `auth.capabilities`
+  — so this is already fixed by construction, not a live gap. New test: `M2 — a
+  B1-zeroed session (capabilities: []) is refused ORG-admin standing even though a DB
+  users.role=owner row shares its bridged email`. Honest limitation noted in the test
+  itself: a B1-zeroed session can never pass `requireCapability(orgScope, 'admin')` with
+  `capabilities: []` in the first place, so this pins `requireCapability`'s own
+  grants-resolution never re-querying the DB when `capabilities` is already an array —
+  it does not exercise `exceedsTargetRankCeiling` specifically, which this session never
+  reaches.
 
 ### A5 corrections to round 4's evidence
 
@@ -1584,28 +1599,32 @@ assigned); the `N2` row's proof note corrected — it supports only the self-exe
 
 - `npm run typecheck`: clean, rerun after every code change this round.
 - The same 10 files round 4 tracked, plus the new receipts-immutability file — 11 files,
-  **353/353 combined** (337 round-4 baseline, corrected, + 16 new this round):
-  `members-agent-capability-route.test.ts` (34/34, up from 24 — 10 new: 3×A1, 2×A2,
-  1×P1-tenant-fence, 1×M12, 1×A8, 2×self-unbind), `telegram-project-onboarding.test.ts`
+  **354/354 combined** (verified by one combined run; 337 round-4 baseline, corrected,
+  + 17 new this round): `members-agent-capability-route.test.ts` (35/35, up from 24 —
+  11 new: 3×A1, 2×A2, 1×P1-tenant-fence, 1×M12, 1×A8, 2×self-unbind, 1×M2),
+  `telegram-project-onboarding.test.ts`
   (99/99, up from 96 — 3 new: 2×minter-authority-loss, 1×no-regression),
   `tests/telegram-unbind-receipts-immutable.test.ts` (new file, 3/3),
   `members-capability-service.test.ts`, `members-sensitive-response.test.ts`,
   `squad-member-tools.test.ts`, `agent-self-update.test.ts`, `flight-routes.test.ts`,
   `members-capability-sqlite.test.ts`, `org-admin-capability-gate.test.ts`,
   `surface-caps.test.ts`.
-- **Separately** (not part of the 353 above — a different file, touched only for a
+- **Separately** (not part of the 354 above — a different file, touched only for a
   fixture-schema regression, not new coverage for this round's own items):
   `tests/im-webhook-idempotency.test.ts` — 29/29, same count as before this round; fixed a
   FOREIGN KEY violation the new `minted_by_member_id` column exposed in its fixture (see
   "Second collateral gap" above).
 
-- **Full suite (`npm test`, all files, default worker parallelism, run once, after the
-  im-webhook-idempotency fixture fix above): exit 0, 513 files, 8091 tests, 0 failed,
-  551s wall time.** (The FIRST full run at this round's head, before that fix, was 512
-  files / 8091 total-attempted / 6 failed / 8085 passed — the exact im-webhook-idempotency
-  FK violation described above; not fabricated into a clean number, the failing run is
-  the reason the fixture fix exists.) Reconciles with round 4's 8075 + this round's new
-  tests: +16 in the 11-file focused set above, +0 net in im-webhook-idempotency.test.ts
-  (fixture-only change, no new test cases), for a net of 8075 + 16 = 8091, and one
-  additional test FILE (`telegram-unbind-receipts-immutable.test.ts`) bringing the file
-  count from 512 to 513.
+- **Full suite (`npm test`, all files, default worker parallelism, run THREE TIMES this
+  round — every change is a real fix or a real new test, not a re-roll for a better
+  number): first run (before the im-webhook-idempotency fixture fix) — 512 files, 8091
+  total, 6 failed / 8085 passed — the exact FK violation described above, not fabricated
+  into a clean number; the failing run is the reason the fixture fix exists. Second run
+  (after that fix, before the M2 test below) — exit 0, 513 files, 8091 tests, 0 failed,
+  551s. THIRD run (after adding the M2 regression test) — exit 0, **513 files, 8092
+  tests, 0 failed, 464s wall time. This is the final, current-head count.** Reconciles
+  exactly with round 4's 8075 + 17 new tests this round (10 in members-agent-capability-
+  route.test.ts, 3 in telegram-project-onboarding.test.ts, 3 in the new telegram-unbind-
+  receipts-immutable.test.ts file, 1 more M2 test added after the second full run —
+  8075 + 17 = 8092), and one additional test FILE bringing the file count from 512 to
+  513.
