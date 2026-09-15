@@ -183,6 +183,7 @@ describe('POST /members/:id/capabilities — target-rank ceiling (#1337)', () =>
   const OWNER_MEMBER = 'member-owner'
   const ADMIN_MEMBER = 'member-admin'
   const PEER_ADMIN = 'member-peer-admin'
+  const SQUAD_OWNER_MEMBER = 'member-squad-owner'
 
   function ownerCapabilityRequest(target: string, body: Record<string, unknown>): Request {
     return new Request(`https://pot.example/members/${target}/capabilities`, {
@@ -206,11 +207,17 @@ describe('POST /members/:id/capabilities — target-rank ceiling (#1337)', () =>
       INSERT INTO members (id, display_name, status, tenant) VALUES
         ('${OWNER_MEMBER}', 'The Owner', 'active', '${TENANT}'),
         ('${ADMIN_MEMBER}', 'An Admin', 'active', '${TENANT}'),
-        ('${PEER_ADMIN}', 'Peer Admin', 'active', '${TENANT}');
+        ('${PEER_ADMIN}', 'Peer Admin', 'active', '${TENANT}'),
+        ('${SQUAD_OWNER_MEMBER}', 'Squad Owner Elsewhere', 'active', '${TENANT}');
       INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES
         ('cap-owner', '${OWNER_MEMBER}', 'org', NULL, 'owner'),
         ('cap-admin', '${ADMIN_MEMBER}', 'org', NULL, 'admin'),
-        ('cap-peer',  '${PEER_ADMIN}',  'org', NULL, 'admin');
+        ('cap-peer',  '${PEER_ADMIN}',  'org', NULL, 'admin'),
+        -- mupot#1411 P0-1: this member holds NOTHING on 'org' (the scope
+        -- suspend/mint act on) but outranks the acting admin via a squad
+        -- grant on an UNRELATED squad — exactly the case the pre-#1411
+        -- per-scope-only ceiling could not see.
+        ('cap-squad-owner-elsewhere', '${SQUAD_OWNER_MEMBER}', 'squad', '${TARGET_SQUAD_ID}', 'owner');
     `)
     // The ACTOR is an org admin, not an owner. role is deliberately 'member' so
     // standing comes from the capability grant, which is the plane that matters.
@@ -290,6 +297,26 @@ describe('POST /members/:id/capabilities — target-rank ceiling (#1337)', () =>
       .toEqual({ status: 'suspended' })
   })
 
+  // mupot#1411 P0-1: regression proof for the across-ALL-scopes widening on
+  // the suspend/reactivate call site. The target has no 'org' grant at all —
+  // a per-scope-only ceiling (the pre-#1411 shape) would query the target's
+  // 'org' row, find none, and let this through. Only targetMaxRankAcrossScopes
+  // (which also sees the target's 'owner' grant on an unrelated squad) can
+  // refuse it. If the widening is reverted to per-scope, this test goes RED
+  // (the response becomes 200 and the member is suspended).
+  it('refuses an admin SUSPENDING a member who outranks them via a DIFFERENT, unrelated squad', async () => {
+    const res = await membersApp.fetch(new Request(`https://pot.example/members/${SQUAD_OWNER_MEMBER}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ status: 'suspended' }),
+    }), env)
+
+    expect(res.status).toBe(403)
+    await expect(res.json()).resolves.toMatchObject({ reason: 'cannot_affect_higher_rank' })
+    expect(harness.sqlite.prepare('SELECT status FROM members WHERE id = ?').get(SQUAD_OWNER_MEMBER))
+      .toEqual({ status: 'active' })
+  })
+
   it('refuses an admin MINTING A TOKEN for the org owner — a token authenticates AS that member, so this is rank ESCALATION', async () => {
     const res = await membersApp.fetch(new Request(`https://pot.example/members/${OWNER_MEMBER}/tokens`, {
       method: 'POST',
@@ -316,5 +343,25 @@ describe('POST /members/:id/capabilities — target-rank ceiling (#1337)', () =>
     expect(harness.sqlite.prepare(
       'SELECT COUNT(*) AS n FROM member_tokens WHERE member_id = ?',
     ).get(PEER_ADMIN)).toEqual({ n: 1 })
+  })
+
+  // mupot#1411 P0-1: regression proof for the across-ALL-scopes widening on
+  // the token-mint call site. Same shape as the suspend proof above — the
+  // target has no 'org' grant, only an 'owner' grant on an unrelated squad,
+  // so only targetMaxRankAcrossScopes (not a per-scope query) can see it
+  // outranks the acting org admin. Minting a token here would hand out a
+  // credential authenticating AS a principal who outranks the actor.
+  it('refuses an admin MINTING A TOKEN for a member who outranks them via a DIFFERENT, unrelated squad', async () => {
+    const res = await membersApp.fetch(new Request(`https://pot.example/members/${SQUAD_OWNER_MEMBER}/tokens`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ label: 'escalation attempt via unrelated squad' }),
+    }), env)
+
+    expect(res.status).toBe(403)
+    await expect(res.json()).resolves.toMatchObject({ reason: 'cannot_affect_higher_rank' })
+    expect(harness.sqlite.prepare(
+      'SELECT COUNT(*) AS n FROM member_tokens WHERE member_id = ?',
+    ).get(SQUAD_OWNER_MEMBER)).toEqual({ n: 0 })
   })
 })
