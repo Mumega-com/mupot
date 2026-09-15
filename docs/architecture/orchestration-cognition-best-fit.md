@@ -25,6 +25,7 @@ The earlier peer table understated how crowded GitHub is. Treat these as
 | Repo | What it is | Layer | Relation to mupot |
 |---|---|---|---|
 | [`Mumega-com/sos`](https://github.com/Mumega-com/sos) | MCP-native agent OS: Redis bus, squad labor, inboxes, wakes, optional Mirror | Coordination **kernel** under many harnesses | **Do not re-build inside mupot.** Bus/squad poll paths retire per mupot-core; keep only rank policy + seat-on-envelope inbox. SOS README itself says frameworks build *one* agent/workflow; SOS sits *under* them — mupot is the sealed *wall*, not a second SOS. |
+| **`mumega-sos-internal`** (private staging) | Dev/staging checkout of SOS + Mumega overlay; historically `/mnt/HC_Volume_104325311/SOS` → `/home/mumega/SOS` | Same kernel + host overlay | **Highest-fidelity source of cognition/orchestration behavior**, but **not readable from this Cloud Agent** (GH 404 — private / no grant). See [SOS internal](#sos-internal-private-staging--sovereign-mind) below. Treat public `Mumega-com/sos` `sovereign/` as the published mind; internal is where unreleased Mumega-specific work stages before public. |
 | [`Mumega-com/mirror`](https://github.com/Mumega-com/mirror) | Engrams + pgvector memory, MCP, tenant RLS | Cognition / memory | Archive-or-replace with mem0 port; keep attribution on the pot. Optional plane for SOS; not mupot core. |
 | [`Mumega-com/herdr-mupot-bridge`](https://github.com/Mumega-com/herdr-mupot-bridge) | Poll plugin: flights board, presence, inbox deliver (allowlisted reads) | Execution bridge | Pattern to keep: **thin, allowlisted, seat-scoped hop**. Event-driven seatlink is the successor; don’t grow a second orchestrator here. |
 | [`Mumega-com/prime-mupot-experience`](https://github.com/Mumega-com/prime-mupot-experience) | Runbooks for prime seat vs mupot+SOS | Ops cognition | Evidence for gate discipline and boot — not a runtime to merge. |
@@ -59,6 +60,63 @@ Mumega already *has* the coordination kernel (`sos`) and the memory plane
 those layers again. Mupot’s job is the sealed wall (seat · door · gate ·
 receipt · rank-only brain), with adapters out to Paperclip/boards and bridges
 out to harnesses (`herdr-mupot-bridge` / seatlink), not another swarm framework.
+
+## SOS internal (private staging + sovereign mind)
+
+This is the codebase the external GH survey understated. Per
+[sos-authoritative-deploy-path.md](../sos-authoritative-deploy-path.md):
+
+```
+mumega-sos-internal (private staging)
+        ↓ merge / promote
+Mumega-com/sos (public kernel — authoritative)
+        ↓ deploy worktree
+sos-public-kernel (/home/mumega/sos-public-kernel) — live daemons
+```
+
+**Access receipt (this run):** `gh` cannot resolve `Mumega-com/mumega-sos-internal`
+(404). Hetzner paths `/mnt/HC_Volume_104325311/SOS` and `/home/mumega/SOS` are
+absent on this Cloud VM. So claims about *unreleased* internal-only commits are
+**not verified here**. What *is* verified: the public tree already ships the
+sovereign cognition stack under `sovereign/` and `sos/services/brain/`.
+
+### What the sovereign mind actually does (from public SOS)
+
+| Piece | Role | Orchestration vs cognition |
+|---|---|---|
+| `sovereign/cortex.py` | Zero-LLM portfolio snapshot: squads, scored tasks, service health, tmux capacity | **Perceive / rank signals** |
+| `sovereign/brain.py` | Living loop: perceive→think→act→remember→report→sleep; scope wall `_assert_in_scope`; MemoryPort; token budget | **Cognition + dispatch** (acts via harness/bus) |
+| `sovereign/cortex_events.py` | Redis event wakeup (debounce) → cortex → brain | Event orchestration |
+| `sovereign/loop.py` | Claim squad task + dispatch on Redis | Execution orchestration |
+| `sos/services/brain/scoring.py` | `score = (impact × urgency × unblock) / cost` + squad-tier multiplier; FRC gate planned | Rank-only math (closest to mupot `BrainPort`) |
+| `sovereign/hive_evolution.py`, `genetics.py`, `trust.py`, `treasury.py`, `bank.py` | Evolution, spin, trust friction, economy | Field physics — **stay in mind**, never fork into pot |
+
+Event flow (from `sovereign/README.md`):
+
+```
+Redis event → cortex_events → cortex snapshot → brain pick → loop claim → agent via bus
+```
+
+### What mupot should take from SOS internal / sovereign
+
+| Take | How it lands in mupot |
+|---|---|
+| Perceive → rank → dispatch-to-owner → rest | Default `BrainPort` (`src/brain/ranking-policy.ts`) |
+| Scoring formula (impact/urgency/unblock/cost) | Extend ranking-policy with unblock/staleness when board exposes them |
+| Hard scope wall | Already: grants + seat; never soft-log and continue |
+| Event wake, not busy poll | Inbox / CF Queue wakes with seat on envelope |
+| Memory behind a port | mem0 (or Mirror) behind a memory port; brain never raw-POSTs |
+
+| Leave in SOS (internal or public) | Why |
+|---|---|
+| Redis bus + squad claim loop | Retired from mupot fleet paths; no authenticated principal |
+| Full `brain.py` act path (create_task / post_content / …) | Pot must not execute assignee work; harness owns motor |
+| C(t) / genetics / hive / treasury | Field physics; pot observes via ingest, does not recompute |
+| Mumega host overlay (billing, customer flows, Discord control) | Private product — not the public kernel, not mupot core |
+
+**Correction to the 2026-08-07 whitepaper:** “port sovereign brain into AgentDO”
+overshoots [mupot-core.md](./mupot-core.md). The internal mind stays a **caller**
+(coherence loop, ranking daemon) or a **policy source**; the pot stays the wall.
 
 ## First: separate two words the field conflates
 
