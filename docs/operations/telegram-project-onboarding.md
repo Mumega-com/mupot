@@ -72,9 +72,9 @@ happen to hold.)
 This ceiling has an operator-visible consequence worth calling out explicitly: a member who
 holds `owner` (or otherwise outranks org-admin, rank 4) ANYWHERE in the pot — even on one
 squad wholly unrelated to the action — is untouchable by every ORG ADMIN across all FIVE gated
-actions this ceiling covers — suspend/reactivate (`PATCH /members/:id`), token mint
-(`POST /members/:id/tokens`), capability grant (`POST /members/:id/capabilities`), member-bind
-invite, and Telegram unbind (`DELETE /members/:id/telegram`). Only a principal whose OWN
+actions this ceiling covers — suspend/reactivate (`PATCH /api/members/members/:id`), token mint
+(`POST /api/members/members/:id/tokens`), capability grant (`POST /api/members/members/:id/capabilities`), member-bind
+invite, and Telegram unbind (`DELETE /api/members/members/:id/telegram`). Only a principal whose OWN
 org-scope standing is at or above that member's GLOBAL standing can act on them — practically,
 only an **owner** (org-scope `owner`, rank 5). An org admin (rank 4, even one who separately
 holds `owner` on some other squad) cannot; they must escalate to an owner, not attempt the same
@@ -119,7 +119,9 @@ See `docs/architecture/human-decision-channel-contract.md` clause (g) and the
 at capability `owner` by a squad owner (permitted — capability at or below the minter's own
 rank) mints a member whose GLOBAL rank is then 5. Every org admin's target-rank ceiling (the
 five gated actions above) then refuses to act on that member — a real, if narrow, behavior
-change from before this slice existed. Not fixed this round; tracked as mupot#1417.
+change from before this slice existed. Not fixed this round; tracked as mupot#1417 item 2,
+the SAME defect kasra-review's gate independently filed as mupot#1416 — cross-linked
+round 7, not a second gap.
 
 **Known, disclosed gap — `members.email` is a case-sensitive UNIQUE column (F4, round 6):**
 `members.email TEXT UNIQUE` (migration `0002`) is exact-match unique; migration `0146`'s
@@ -148,7 +150,7 @@ becomes usable again once the member is eligible again. The reply to the partici
 same generic success/failure text as the net-new path — the redemption error enum is never
 echoed into the chat (see the existing anti-oracle test).
 
-**Undoing a bind.** `DELETE /members/:id/telegram` clears a member's bound Telegram identity.
+**Undoing a bind.** `DELETE /api/members/members/:id/telegram` clears a member's bound Telegram identity.
 Use it if a bind was made in error or the participant's Telegram account changes — a new
 member-bind invite can then be redeemed to bind the correct identity. Two ways to reach it:
 **org admin** (same target-rank ceiling as above — an admin cannot unbind a principal who

@@ -1751,7 +1751,11 @@ be narrowed to exclude `inviter-member`'s own new row (same shape as its existin
    member whose GLOBAL rank (`targetMaxRankAcrossScopes`) is then 5, making that member
    untouchable by every org admin's target-rank ceiling on all five gated actions — a
    real, narrow behavior change from `main`. Not exercised by a new test this round (no
-   code path to fix, only to disclose); named in the runbook and PR body.
+   code path to fix, only to disclose); named in the runbook and PR body. Round 7
+   (Athena N2): this is the SAME defect kasra-review's own gate on `efdb0b08` filed
+   independently as mupot#1416 (confirmed by reading both issue bodies — identical
+   mechanism, same reproduction shape) — cross-linked between the two issues this round,
+   not a second gap.
 
 ### F4 — `members.email` case-sensitive UNIQUE (disclosed, filed as mupot#1418)
 
@@ -1841,3 +1845,145 @@ later) corrected to 354.
   rank), `currentMemberSquadRank`'s department-inheritance branch, the reintroduced
   actor-side DB role-plane read in `exceedsTargetRankCeiling` (F2), the users-side
   `lower()` in `targetLegacyRoleRank` (F5), and the `actor_id` CHECK constraint.
+
+## Round 7 (kasra-review adversarial gate on `dd9a7d52`, BLOCK — + a parallel Athena
+addendum, 2026-09-15)
+
+kasra-review's gate on the round-6 head found 1 new P1 (narrow, executed) and 1 M4
+mutation survivor from round 6's own sweep. A parallel Athena addendum (N1, N2) added two
+doc-only corrections, folded in before push per Kasra-core's standing instruction to treat
+a mid-task coordinator addendum as an extension of the current round, not a new one.
+
+### P1 — the round-6 target re-check was gated on the wrong condition
+
+Round 6's fix wrapped BOTH the minter-side re-check (`baselineAuthorityLost`) and the
+target-side re-check (`targetOutgrewMinter`) inside a single
+`if (invite.minted_by_member_id !== null)` guard. The guard's own comment justified
+skipping the MINTER side when unknown (a pure legacy web-login minter has an immutable
+role-plane rank — nothing to re-check). It never justified skipping the TARGET side,
+which is D1-derivable regardless of whether the minter is known.
+
+PROVED (executed, new test `refuses redemption when the TARGET is promoted to org owner
+after a NULL-minter (legacy web-login) invite (round 7 P1)`): a session with
+`role: 'admin'` and no `memberId` (`auth.capabilities` never resolved — the pure
+web-login shape `actorRankOnScopeFor` floors to `RANK.admin` unconditionally,
+`src/auth/capability.ts:397`) mints a member-bind invite for a rank-0 member.
+`createProjectInvite` records `minted_by_member_id = auth.memberId ?? null` — NULL for
+this principal (`src/members/project-invites.ts:623`). The target is then promoted to
+org owner (a `capabilities` row inserted directly, simulating any of the routes that can
+do this). Before the fix, redemption's re-check block never ran at all (guarded on
+`minted_by_member_id !== null`), so the takeover succeeded — the attacker's Telegram
+identity bound to the org owner's row, with no org admin able to unbind it afterward
+(`exceedsTargetRankCeiling` would refuse the unbind, same ceiling that let the mint through
+in the first place). The net-new (`email`) invite path is separately refused for this same
+principal — `actorRankOnSquad` (`src/members/project-invites.ts:213-217`) returns 0 with
+no `memberId`, regardless of role — so member-bind was the ONE reachable shape for this
+principal, matching the PR's own existing "P0-1 requires org-admin, not squad-admin"
+design intent.
+
+FIX: `targetOutgrewMinter` now runs for every member-bind redemption
+(`invite.member_id !== null`), independent of whether `minted_by_member_id` is known.
+When known, it compares the target's global standing (`targetMaxRankAcrossScopes`)
+against the minter's CURRENT org-local rank (`minterRank`), unchanged from round 6. When
+`minted_by_member_id` is NULL, it compares against `capabilityRank('admin')` — the
+mint-time floor `createProjectInvite` enforces on EVERY minter, known or not
+(`actorRank < capabilityRank('admin')` refuses creation regardless of path,
+`src/members/project-invites.ts:564`) — since there is no minter row whose rank could
+have exceeded that floor. The minter-side re-check (`baselineAuthorityLost`,
+`minterActive`) stays gated on `minted_by_member_id !== null` exactly as before: there is
+still no minter row to re-check when none was recorded. Self-exemption
+(`invite.minted_by_member_id !== invite.member_id`) is preserved and is only meaningful
+when the minter is known — a NULL minter id can never equal a real member id, so a
+NULL-minter invite is never self-exempt (correct: there is no "self" to be exempt from
+when the minter is unreachable).
+
+Second new test (`still allows a NULL-minter (legacy web-login) invite to redeem when the
+target never grew past the mint-time floor (round 7 P1)`) proves no regression: the same
+NULL-minter invite, with the target left at rank 0, still redeems `ok:true`.
+
+MUTATION-VERIFIED three ways, each confirmed RED then restored (`git checkout --`,
+`git diff --stat` empty before the next):
+1. Reverting the split — moving `targetOutgrewMinter`'s computation back inside the
+   `if (invite.minted_by_member_id !== null)` block, matching round 6's structure exactly
+   — turns the new takeover test green (the fix is load-bearing, not redundant with
+   something else).
+2. Widening the NULL-branch floor from `capabilityRank('admin')` to
+   `capabilityRank('owner')` also turns the same test green — the FLOOR VALUE matters,
+   not merely that some floor exists.
+3. (M4, below) confirms the sibling `baselineAuthorityLost` disjunct independently.
+
+### M4 (round-6 mutation survivor) — `baselineAuthorityLost`'s second disjunct had no discriminating test
+
+Round 6's mutation sweep left `capabilityRank(invite.capability) > minterRank` (the
+second disjunct of `baselineAuthorityLost`) an honest, reported survivor: every existing
+fixture that demoted a minter also dropped them below the admin floor (the FIRST
+disjunct), so removing the second disjunct never changed any existing test's outcome.
+
+NEW test (`refuses redemption when the minter is demoted from owner to admin and the
+invite capability (owner) now exceeds their rank (M4)`): an org OWNER (`capabilities` row
+`scope_type='org', capability='owner'`) mints an `owner`-capability member-bind invite
+(permitted — capability at or below the minter's own rank). The minter is then demoted to
+`admin` (still `admin`, rank 4 — clears the FIRST disjunct: `4 < 4` is false). The
+invite's OWN capability (`owner`, rank 5) now exceeds the demoted minter's rank (4) — only
+the SECOND disjunct catches this.
+
+MUTATION-VERIFIED: removed the second disjunct (`... || capabilityRank(invite.capability)
+> minterRank`), leaving only `minterRank < capabilityRank('admin')` — the new M4 test went
+RED (redemption succeeded, `ok:true`, instead of refusing). Restored, confirmed
+`git diff --stat` empty.
+
+### N1 (Athena addendum, doc-only) — runbook/contract doc cited the unmounted route form
+
+`membersApp` mounts at `ROUTES.members = '/api/members'` (`src/types.ts:911`,
+`src/index.ts:107`, `app.route(ROUTES.members, membersApp)`) and registers the non-invite
+member routes at `/members/:id/...` (`src/members/index.ts:665,742,785,836,916`) — so the
+LIVE, reachable paths are `PATCH /api/members/members/:id`,
+`POST /api/members/members/:id/tokens`, `POST /api/members/members/:id/capabilities`, and
+`DELETE /api/members/members/:id/telegram`. `docs/operations/telegram-project-onboarding.md`
+(lines 75-77, 151) and `docs/architecture/human-decision-channel-contract.md` (line 227)
+all cited the unmounted form (`/members/:id/...`, missing the `/api/members` mount
+prefix) — an operator copying the unbind instruction as written would get a 404, not the
+route. All five citations corrected (verified each against the three sources named
+above); this PR body's own stray citations of the same routes (in the authority-floor
+section and the round-4 summary) were the identical bug and are corrected too, for the
+same reason — a public document repeating a wrong path is still wrong regardless of which
+document it lives in.
+
+### N2 (Athena addendum, doc-only) — mupot#1417 item 2 and mupot#1416 are the same defect
+
+mupot#1417's item 2 (a squad-owner's net-new `owner`-capability invite escalating the
+target's global rank, filed round 6) and mupot#1416 (the same escalation, filed
+independently by kasra-review's own gate on head `efdb0b08`) were never cross-referenced
+— confirmed by reading both issue bodies side by side: identical mechanism (a pure squad
+owner mints a net-new invite at `owner` on their own squad; the redeemed member's global
+rank becomes 5; every org admin's `exceedsTargetRankCeiling` then refuses to act on that
+member — suspend, mint, capability grant/revoke, unbind), identical reproduction shape.
+Neither issue was closed as a duplicate of the other (item 1 of #1417, the
+session-role-only minter gap, is unrelated and stays open there) — instead cross-linked
+with a comment on each issue, and both now cited together in the contract doc (clause g),
+the runbook, and this evidence doc's own F3 residual-2 entry above.
+
+### Verification
+
+- `npm run typecheck`: clean, rerun after every code change this round (this doc
+  describes work built on top of already-committed round-6 head `dd9a7d52`; it does not
+  name this round's own pending commit SHA, per release-truth discipline).
+- All 8 local CI-parity scripts green: `check-branch-staleness`, `check-mcp-tool-seam`,
+  `check-migration-numbering` (0154 unchanged, still sorts above `origin/main`'s current
+  head), `check-operator-counts-source`, `check-schema-chain-fresh`,
+  `check-test-schema-source`, `no-secrets`, `release-truth-policy` (now scans the same 4
+  declared documents, all round-7 edits are to files already on that list).
+- Focused (`tests/telegram-project-onboarding.test.ts
+  tests/members-agent-capability-route.test.ts tests/members-capability-service.test.ts
+  tests/im-webhook-idempotency.test.ts`, combined run): **186/186**, up from round 6's
+  176/176 for a superset of the same files (+3 new tests this round in
+  `telegram-project-onboarding.test.ts`: round-7 P1 takeover, round-7 P1 no-regression,
+  M4; the remaining delta from a straight 176+3=179 vs. 186 reflects this being the FIRST
+  round to combine exactly these four files rather than round 6's own 11-file/4-file
+  splits — a fresh baseline for this exact set, not a discrepancy in either count).
+- Full suite (`npm test`, all files, default worker parallelism, one run this round):
+  exit 0, **513 files, 8105 tests, 0 failed, 496.08s wall time** — reconciles exactly to
+  round 6's 8102 + 3 new tests this round (the round-7 P1 takeover test, its
+  no-regression counterpart, and M4 — all three in
+  `tests/telegram-project-onboarding.test.ts`), same 513 files as round 6 (no new test
+  FILES added this round).

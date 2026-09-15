@@ -754,12 +754,12 @@ export async function redeemTelegramProjectInvite(
   // grown past the minter's either. An owner mints an 'admin' bind invite,
   // is then demoted (or suspended) — up to 7 days later
   // (MAX_INVITE_LIFETIME_SECONDS) redemption used to still grant 'admin'
-  // with no re-check of who authorized it. Only runs when
-  // minted_by_member_id is non-NULL: a pure legacy web-login minter (no
-  // member row) has an IMMUTABLE role-plane rank in this schema (no route
-  // ever changes users.role), so there is nothing to re-check for them —
-  // and no regression, since that was already true before this column
-  // existed.
+  // with no re-check of who authorized it. The MINTER-side re-check below
+  // only runs when minted_by_member_id is non-NULL: a pure legacy
+  // web-login minter (no member row) has an IMMUTABLE role-plane rank in
+  // this schema (no route ever changes users.role), so there is nothing to
+  // re-check for them — and no regression, since that was already true
+  // before this column existed.
   //
   // mupot#1411 P1-B round 6: the round-5 check alone
   // (`minterRank < capabilityRank(invite.capability)`) missed the BASELINE
@@ -771,16 +771,31 @@ export async function redeemTelegramProjectInvite(
   // through this function in the first place. Re-checking `minterRank >=
   // admin` unconditionally closes it for both invite shapes.
   //
-  // mupot#1411 P1-A round 6: the round-5 check never re-derived the
-  // TARGET's standing for the member-bind path — a member-bind invite
-  // minted for a nobody, where the target is promoted to org owner any time
-  // within the invite's (up to 7-day) lifetime, still bound on redemption
-  // even though `exceedsTargetRankCeiling` would refuse the identical
-  // action taken as a fresh request. Recomputes that ceiling with CURRENT
-  // facts (self-exempt when the minter targets themselves, matching
-  // `exceedsTargetRankCeiling`'s own self-exemption — mint time already
-  // proved that case is safe and nothing about a principal's OWN standing
-  // relative to themselves can regress).
+  // mupot#1411 P1-A round 6, split round 7 (kasra-review adversarial gate
+  // on `dd9a7d52`): the round-5 check never re-derived the TARGET's
+  // standing for the member-bind path — a member-bind invite minted for a
+  // nobody, where the target is promoted to org owner any time within the
+  // invite's (up to 7-day) lifetime, still bound on redemption even though
+  // `exceedsTargetRankCeiling` would refuse the identical action taken as
+  // a fresh request. Round 6 gated the fix on `minted_by_member_id !==
+  // null` alongside the minter-side re-check — but the TARGET's standing
+  // is D1-derivable regardless of whether the minter is known, and a
+  // legacy web-login actor with no member row (`auth.memberId` undefined,
+  // `src/auth/index.ts:1367-1385` documents this as production-reachable)
+  // mints with `minted_by_member_id` NULL, leaving that exact takeover
+  // path open (the net-new path is separately refused at mint for such a
+  // principal — `actorRankOnSquad` floors at 0 with no memberId — so
+  // member-bind was the one reachable shape). `targetOutgrewMinter` now
+  // runs for EVERY member-bind redemption, independent of whether the
+  // minter is known: compared against the minter's CURRENT org-local rank
+  // when `minted_by_member_id` is non-NULL, or against
+  // `capabilityRank('admin')` — the mint-time floor `createProjectInvite`
+  // enforces on every minter, known or not — when it is NULL (there is no
+  // minter row to have gone above that floor, so the floor itself is the
+  // correct comparison). Self-exempt when the minter targets themselves,
+  // matching `exceedsTargetRankCeiling`'s own self-exemption (only
+  // meaningful when the minter is known — a NULL minter can never equal
+  // the target).
   //
   // mupot#1411 P2 round 6: the net-new (`email`) path had NO minter
   // re-check AT ALL — a squad-admin's invite, redeemed after they were
@@ -801,25 +816,30 @@ export async function redeemTelegramProjectInvite(
   // a follow-up issue rather than fixed here; the fix (only the granting
   // squad owner, or an org owner, can act back) is a broader ceiling-design
   // question than this round's scope.
+  let minterRank = 0
   if (invite.minted_by_member_id !== null) {
     const minter = await env.DB.prepare(
       'SELECT status FROM members WHERE id = ?1 AND (tenant = ?2 OR tenant IS NULL) LIMIT 1',
     ).bind(invite.minted_by_member_id, env.TENANT_SLUG).first<{ status: string }>()
     const minterActive = minter?.status === 'active'
-    const minterRank = minterActive
+    minterRank = minterActive
       ? invite.member_id !== null
         ? await currentMemberOrgRank(env, invite.minted_by_member_id)
         : await currentMemberSquadRank(env, invite.minted_by_member_id, invite.squad_id)
       : 0
     const baselineAuthorityLost =
       minterRank < capabilityRank('admin') || capabilityRank(invite.capability) > minterRank
-    const targetOutgrewMinter =
-      invite.member_id !== null
-      && invite.minted_by_member_id !== invite.member_id
-      && (await targetMaxRankAcrossScopes(env, invite.member_id)) > minterRank
-    if (baselineAuthorityLost || targetOutgrewMinter) {
+    if (baselineAuthorityLost) {
       return { ok: false, error: 'invite_minter_authority_lost' }
     }
+  }
+  const targetOutgrewMinter =
+    invite.member_id !== null
+    && invite.minted_by_member_id !== invite.member_id
+    && (await targetMaxRankAcrossScopes(env, invite.member_id))
+      > (invite.minted_by_member_id !== null ? minterRank : capabilityRank('admin'))
+  if (targetOutgrewMinter) {
+    return { ok: false, error: 'invite_minter_authority_lost' }
   }
 
   const memberId = invite.member_id ?? crypto.randomUUID()

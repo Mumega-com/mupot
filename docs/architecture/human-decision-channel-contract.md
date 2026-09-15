@@ -224,7 +224,7 @@ Three distinct events are recorded **separately**, each idempotent on its own ke
   Authority floor: org admin (`actorRankOnScopeFor(env, auth, 'org', null)`) AND the
   target must not outrank the actor anywhere (`exceedsTargetRankCeiling` — target
   GLOBAL standing across every scope unioned with the role-plane rank, actor ORG-SCOPE-
-  LOCAL standing only; self-exempt). Unbind — `DELETE /members/:id/telegram` — is gated
+  LOCAL standing only; self-exempt). Unbind — `DELETE /api/members/members/:id/telegram` — is gated
   by that SAME org-admin-plus-ceiling floor **OR by the bound member acting on
   themselves** (self-unbind, added round 5: no capability check at all when the caller
   targets their own member row, since a bind victim otherwise has no way to detach an
@@ -256,9 +256,11 @@ Three distinct events are recorded **separately**, each idempotent on its own ke
   only from that unbridgeable session floor mints successfully and is refused at
   redemption with no real change in authority. Proven by a dedicated test, not fixed.
 - **A squad owner's net-new `owner`-capability invite escalates the target's global rank
-  (round 6, mupot#1417).** The freshly-minted member becomes untouchable by every org
-  admin's target-rank ceiling (suspend, mint, capability grant/revoke, Telegram unbind) —
-  a real, narrow behavior change from before this slice existed. Not fixed.
+  (round 6, mupot#1417 item 2 — the SAME defect kasra-review's own gate on `efdb0b08`
+  filed independently as mupot#1416; cross-linked round 7, not a second gap).** The
+  freshly-minted member becomes untouchable by every org admin's target-rank ceiling
+  (suspend, mint, capability grant/revoke, Telegram unbind) — a real, narrow behavior
+  change from before this slice existed. Not fixed.
 - **`members.email` is case-sensitive UNIQUE (round 6, F4, mupot#1418).** A case-variant
   row can bridge to a role-plane rank it has no real standing for, becoming immune to an
   org admin the same way a real owner is (denial-only, never an authority gain). Not

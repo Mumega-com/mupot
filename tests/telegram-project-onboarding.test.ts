@@ -2438,6 +2438,151 @@ describe('Telegram project invite — bind existing member', () => {
       expect(result.ok).toBe(true)
     })
 
+    // ── round 7 (kasra-review adversarial gate on `dd9a7d52`) — round 6's
+    // target re-check ran only inside `if (invite.minted_by_member_id !==
+    // null)`, so it never applied when the minter is unknown. A legacy
+    // web-login admin (role plane only, no member row at all) can mint a
+    // member-bind invite — `actorRankOnScopeFor` floors 'admin' role to rank
+    // 4 with no memberId required — and `minted_by_member_id` records NULL
+    // for exactly that principal. The net-new path is separately refused for
+    // this same principal (`actorRankOnSquad` returns 0 with no memberId),
+    // so member-bind was the only reachable shape for the takeover.
+    it('refuses redemption when the TARGET is promoted to org owner after a NULL-minter (legacy web-login) invite (round 7 P1)', async () => {
+      const legacyWebLoginAdminAuth: AuthContext = {
+        userId: 'legacy-web-login-admin-user',
+        email: 'legacy-web-login-admin@example.test',
+        role: 'admin',
+        tenant: TENANT,
+        // memberId and capabilities intentionally absent — the pure
+        // web-login shape; minted_by_member_id will record NULL for it.
+      } as AuthContext
+
+      const created = await createProjectInvite(env, legacyWebLoginAdminAuth, {
+        member_id: 'member-existing',
+        project_id: 'project-bind',
+        squad_id: 'squad-bind',
+        capability: 'member',
+        expires_in_seconds: 3600,
+      })
+      expect(created.ok).toBe(true)
+      if (!created.ok) return
+      expect(harness.sqlite.prepare('SELECT minted_by_member_id FROM invites WHERE id = ?')
+        .get(created.value.invite.id)).toEqual({ minted_by_member_id: null })
+
+      harness.sqlite.exec(`
+        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES ('cap-target-promoted-null-minter', 'member-existing', 'org', NULL, 'owner')
+      `)
+      reserveUpdate('update-bind-null-minter-target-promoted', VALID_REQUEST_DIGEST, '9201300')
+
+      const result = await redeemTelegramProjectInvite(env, {
+        pairing_code: created.value.pairing_code,
+        telegram_user_id: '9201300',
+        display_name: 'Null Minter Target Promoted',
+        update_id: 'update-bind-null-minter-target-promoted',
+        request_digest: VALID_REQUEST_DIGEST,
+      })
+
+      expect(result).toEqual({ ok: false, error: 'invite_minter_authority_lost' })
+      expect(harness.sqlite.prepare('SELECT accepted_at FROM invites WHERE id = ?').get(created.value.invite.id))
+        .toEqual({ accepted_at: null })
+      expect(harness.sqlite.prepare(`
+        SELECT telegram_chat_id FROM members WHERE id = 'member-existing'
+      `).get()).toEqual({ telegram_chat_id: null })
+      expect(harness.sqlite.prepare(`
+        SELECT COUNT(*) AS count FROM capabilities WHERE member_id = 'member-existing' AND id != 'cap-target-promoted-null-minter'
+      `).get()).toEqual({ count: 0 })
+    })
+
+    it('still allows a NULL-minter (legacy web-login) invite to redeem when the target never grew past the mint-time floor (round 7 P1)', async () => {
+      const legacyWebLoginAdminAuth: AuthContext = {
+        userId: 'legacy-web-login-admin-user-2',
+        email: 'legacy-web-login-admin-2@example.test',
+        role: 'admin',
+        tenant: TENANT,
+      } as AuthContext
+
+      const created = await createProjectInvite(env, legacyWebLoginAdminAuth, {
+        member_id: 'member-existing',
+        project_id: 'project-bind',
+        squad_id: 'squad-bind',
+        capability: 'member',
+        expires_in_seconds: 3600,
+      })
+      expect(created.ok).toBe(true)
+      if (!created.ok) return
+      expect(harness.sqlite.prepare('SELECT minted_by_member_id FROM invites WHERE id = ?')
+        .get(created.value.invite.id)).toEqual({ minted_by_member_id: null })
+      reserveUpdate('update-bind-null-minter-ok', VALID_REQUEST_DIGEST, '9201400')
+
+      const result = await redeemTelegramProjectInvite(env, {
+        pairing_code: created.value.pairing_code,
+        telegram_user_id: '9201400',
+        display_name: 'Null Minter Ok',
+        update_id: 'update-bind-null-minter-ok',
+        request_digest: VALID_REQUEST_DIGEST,
+      })
+
+      expect(result.ok).toBe(true)
+    })
+
+    // ── M4 (round 6 survivor, closed round 7): baselineAuthorityLost's
+    // second disjunct (`capabilityRank(invite.capability) > minterRank`) had
+    // no discriminating test — an owner mints an 'owner'-capability invite,
+    // is demoted to 'admin' (still clears the FIRST disjunct's admin floor:
+    // 4 < 4 is false), and the invite's capability (owner, rank 5) now
+    // exceeds the demoted minter's rank (4). Only the second disjunct
+    // catches this.
+    it('refuses redemption when the minter is demoted from owner to admin and the invite capability (owner) now exceeds their rank (M4)', async () => {
+      harness.sqlite.exec(`
+        INSERT INTO members (id, email, display_name, status, tenant)
+        VALUES ('member-org-owner-minter', 'org-owner-minter@example.test', 'Org Owner Minter', 'active', '${TENANT}');
+        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES ('cap-org-owner-minter', 'member-org-owner-minter', 'org', NULL, 'owner');
+      `)
+      const orgOwnerMinterAuth: AuthContext = {
+        userId: 'org-owner-minter-user',
+        email: 'org-owner-minter@example.test',
+        role: 'member',
+        tenant: TENANT,
+        memberId: 'member-org-owner-minter',
+        capabilities: [{
+          member_id: 'member-org-owner-minter',
+          scope_type: 'org',
+          scope_id: null,
+          capability: 'owner',
+        }],
+      }
+
+      const created = await createProjectInvite(env, orgOwnerMinterAuth, {
+        member_id: 'member-existing',
+        project_id: 'project-bind',
+        squad_id: 'squad-bind',
+        capability: 'owner',
+        expires_in_seconds: 3600,
+      })
+      expect(created.ok).toBe(true)
+      if (!created.ok) return
+
+      harness.sqlite.exec(`
+        UPDATE capabilities SET capability = 'admin'
+         WHERE member_id = 'member-org-owner-minter' AND scope_type = 'org'
+      `)
+      reserveUpdate('update-bind-owner-invite-minter-demoted', VALID_REQUEST_DIGEST, '9201500')
+
+      const result = await redeemTelegramProjectInvite(env, {
+        pairing_code: created.value.pairing_code,
+        telegram_user_id: '9201500',
+        display_name: 'Owner Invite Minter Demoted',
+        update_id: 'update-bind-owner-invite-minter-demoted',
+        request_digest: VALID_REQUEST_DIGEST,
+      })
+
+      expect(result).toEqual({ ok: false, error: 'invite_minter_authority_lost' })
+      expect(harness.sqlite.prepare('SELECT accepted_at FROM invites WHERE id = ?').get(created.value.invite.id))
+        .toEqual({ accepted_at: null })
+    })
+
     // ── F3 disclosure (round 6, kept as a documented, NOT-fixed-this-round
     // gap — see docs/architecture/human-decision-channel-contract.md and the
     // currentMemberOrgRank docstring above): a minter whose org-scope
