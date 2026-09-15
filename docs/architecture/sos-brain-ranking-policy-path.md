@@ -17,6 +17,10 @@ returns ordered proposals — never wakes, never writes tasks, never bypasses a
 gate. That is exactly what [mupot-core.md](./mupot-core.md) keeps from SOS and
 what `BrainPort` in `src/types.ts` already seals.
 
+For the wider peer comparison (LangGraph / CrewAI / Letta / Paperclip / Devin)
+and the normative keep/build/avoid table, see
+[orchestration-cognition-best-fit.md](./orchestration-cognition-best-fit.md).
+
 ## What SOS brain actually is
 
 From the SOS loop (`perceive → think → act → remember → report → sleep`):
