@@ -7,6 +7,7 @@ import {
   legacyRoleRank,
   resolveCapabilities,
   targetLegacyRoleRank,
+  targetMaxRankAcrossScopes,
 } from '../auth/capability'
 import { sha256Hex } from './service'
 
@@ -233,10 +234,32 @@ async function actorRankOnSquad(
  * invite MINTER's org-scope-local standing, re-derived FRESH from D1 at
  * REDEMPTION time — an org-scope capability grant, unioned with their
  * role-plane rank (targetLegacyRoleRank's members.email -> users.role
- * bridge). Deliberately the SAME quantity actorRankOnScopeFor(env, auth,
- * 'org', null) computes for a LIVE session — this is that quantity, computed
- * for a memberId with no live session to read (the caller redeeming is the
- * INVITEE's Telegram identity, never the minter).
+ * bridge).
+ *
+ * mupot#1411 F3 round 6 (Athena gate `efdb0b08`): this is NOT "the SAME
+ * quantity" actorRankOnScopeFor(env, auth, 'org', null) computes for a live
+ * session, as an earlier revision of this comment claimed. actorRankOnScopeFor
+ * has a THIRD input this function has no way to re-derive: the SESSION's own
+ * `auth.role`, read directly off the AuthContext at mint time, unconditionally
+ * folded into the actor's rank regardless of whether that role is backed by
+ * anything queryable in D1 for this memberId. This function only ever has two
+ * planes to read — the `capabilities` table and the `members.email ->
+ * users.role` bridge — because at redemption there is no live session for the
+ * minter to re-read a `role` off; the caller redeeming is the INVITEE's
+ * Telegram identity, never the minter's own request. The two ARE the same
+ * quantity whenever the minting session's `auth.role` was itself sourced from
+ * `users.role` under an email that matches this member's own `members.email`
+ * (the ordinary case) — but a minter whose org-scope standing at mint time
+ * came ONLY from `auth.role` with no backing capabilities row and no bridged
+ * `users` row reachable from their OWN member email (a session-role-only
+ * minter) mints successfully here and is refused at redemption
+ * (`invite_minter_authority_lost`), even with no change in their real
+ * standing between the two. Documented, known-at-v1 gap — not fixed this
+ * round; see `docs/architecture/human-decision-channel-contract.md` clause
+ * (g) and the operator runbook's pre-flight checklist, which now name it.
+ * tests/telegram-project-onboarding.test.ts has a test exercising this exact
+ * shape (mint succeeds, redemption refuses) so the gap is proven, not merely
+ * asserted.
  */
 async function currentMemberOrgRank(env: Env, memberId: string): Promise<number> {
   const grants = await resolveCapabilities(env, memberId)
@@ -245,6 +268,31 @@ async function currentMemberOrgRank(env: Env, memberId: string): Promise<number>
     if (grant.scope_type === 'org') max = Math.max(max, capabilityRank(grant.capability))
   }
   return Math.max(max, await targetLegacyRoleRank(env, memberId))
+}
+
+/**
+ * mupot#1411 P2 round 6 (kasra-review adversarial addendum on Athena gate
+ * `efdb0b08`): the NET-NEW invite path's mint-time authority is SQUAD-scoped
+ * (`actorRankOnSquad`), not org-scoped — `currentMemberOrgRank` above is the
+ * wrong quantity to re-check it against at redemption. Mirrors
+ * `actorRankOnSquad`'s own grant-loop (department inheritance resolved from
+ * D1, same as `hasCapability`'s squad branch always requires) without that
+ * function's legacy-role floor: that floor exists only for a LIVE session
+ * with no memberId at all, which can never be the case here — the minter
+ * always has a real `members` row by construction (`minted_by_member_id`
+ * REFERENCES `members(id)`).
+ */
+async function currentMemberSquadRank(env: Env, memberId: string, squadId: string): Promise<number> {
+  const grants = await resolveCapabilities(env, memberId)
+  const squad = await env.DB.prepare('SELECT department_id FROM squads WHERE id = ?1 LIMIT 1')
+    .bind(squadId)
+    .first<{ department_id: string | null }>()
+  for (const capability of CAPABILITIES) {
+    if (hasCapability(grants, 'squad', squadId, capability, squad?.department_id ?? undefined)) {
+      return capabilityRank(capability)
+    }
+  }
+  return 0
 }
 
 function base64Url(bytes: Uint8Array): string {
@@ -699,28 +747,77 @@ export async function redeemTelegramProjectInvite(
     }
   }
 
-  // mupot#1411 P2 round 5 (kasra-review adversarial addendum, 2026-09-15): a
-  // member-bind invite's capability must not outlive the MINTER's own
-  // authority to have minted it. An owner mints an 'admin' bind invite, is
-  // then demoted (or suspended) — up to 7 days later (MAX_INVITE_LIFETIME_
-  // SECONDS) redemption used to still grant 'admin' with no re-check of who
-  // authorized it. Re-derives the minter's CURRENT org-scope-local rank
-  // fresh from D1 (currentMemberOrgRank — the SAME quantity
-  // actorRankOnScopeFor computes for a live session) rather than trusting
-  // whatever standing they had at mint time. Only runs when
+  // mupot#1411 P2 round 5, reshaped round 6 (kasra-review adversarial
+  // addendum on Athena gate `efdb0b08`): an invite's capability must not
+  // outlive the MINTER's own authority to have minted it — and, for the
+  // member-bind path specifically, the TARGET's standing must not have
+  // grown past the minter's either. An owner mints an 'admin' bind invite,
+  // is then demoted (or suspended) — up to 7 days later
+  // (MAX_INVITE_LIFETIME_SECONDS) redemption used to still grant 'admin'
+  // with no re-check of who authorized it. Only runs when
   // minted_by_member_id is non-NULL: a pure legacy web-login minter (no
   // member row) has an IMMUTABLE role-plane rank in this schema (no route
   // ever changes users.role), so there is nothing to re-check for them —
   // and no regression, since that was already true before this column
   // existed.
-  if (invite.member_id !== null && invite.minted_by_member_id !== null) {
+  //
+  // mupot#1411 P1-B round 6: the round-5 check alone
+  // (`minterRank < capabilityRank(invite.capability)`) missed the BASELINE
+  // authority `createProjectInvite` requires to reach EITHER invite shape at
+  // all (`actorRank >= admin`, both `hasMemberId` and squad-only branches
+  // above) — a minter demoted all the way to 'observer' minting an
+  // 'observer'-capability invite passed the old check (1 < 1 is false)
+  // despite 'observer' never being enough standing to have minted anything
+  // through this function in the first place. Re-checking `minterRank >=
+  // admin` unconditionally closes it for both invite shapes.
+  //
+  // mupot#1411 P1-A round 6: the round-5 check never re-derived the
+  // TARGET's standing for the member-bind path — a member-bind invite
+  // minted for a nobody, where the target is promoted to org owner any time
+  // within the invite's (up to 7-day) lifetime, still bound on redemption
+  // even though `exceedsTargetRankCeiling` would refuse the identical
+  // action taken as a fresh request. Recomputes that ceiling with CURRENT
+  // facts (self-exempt when the minter targets themselves, matching
+  // `exceedsTargetRankCeiling`'s own self-exemption — mint time already
+  // proved that case is safe and nothing about a principal's OWN standing
+  // relative to themselves can regress).
+  //
+  // mupot#1411 P2 round 6: the net-new (`email`) path had NO minter
+  // re-check AT ALL — a squad-admin's invite, redeemed after they were
+  // suspended or demoted below squad-admin, still minted a fresh member at
+  // the invited capability. Applies the SAME active + baseline-rank +
+  // capability-ceiling conditions here too, re-derived on the invite's
+  // SQUAD (`currentMemberSquadRank` — the authority a net-new mint actually
+  // requires, mirroring `actorRankOnSquad`) rather than the org scope —
+  // there is no existing identity to take over on this path, so no
+  // target-ceiling re-check applies.
+  //
+  // Known, disclosed residual NOT fixed this round (see PR body "Honest
+  // survivors" and the operator runbook): a net-new invite minted at
+  // capability 'owner' by a squad owner mints a member whose GLOBAL rank is
+  // now 5 — every org admin's `exceedsTargetRankCeiling` on that member
+  // (suspend, token mint, capability grant/revoke, Telegram unbind) then
+  // refuses, a real behavior change from `main` for that one path. Filed as
+  // a follow-up issue rather than fixed here; the fix (only the granting
+  // squad owner, or an org owner, can act back) is a broader ceiling-design
+  // question than this round's scope.
+  if (invite.minted_by_member_id !== null) {
     const minter = await env.DB.prepare(
       'SELECT status FROM members WHERE id = ?1 AND (tenant = ?2 OR tenant IS NULL) LIMIT 1',
     ).bind(invite.minted_by_member_id, env.TENANT_SLUG).first<{ status: string }>()
-    const minterRank = minter && minter.status === 'active'
-      ? await currentMemberOrgRank(env, invite.minted_by_member_id)
+    const minterActive = minter?.status === 'active'
+    const minterRank = minterActive
+      ? invite.member_id !== null
+        ? await currentMemberOrgRank(env, invite.minted_by_member_id)
+        : await currentMemberSquadRank(env, invite.minted_by_member_id, invite.squad_id)
       : 0
-    if (minterRank < capabilityRank(invite.capability)) {
+    const baselineAuthorityLost =
+      minterRank < capabilityRank('admin') || capabilityRank(invite.capability) > minterRank
+    const targetOutgrewMinter =
+      invite.member_id !== null
+      && invite.minted_by_member_id !== invite.member_id
+      && (await targetMaxRankAcrossScopes(env, invite.member_id)) > minterRank
+    if (baselineAuthorityLost || targetOutgrewMinter) {
       return { ok: false, error: 'invite_minter_authority_lost' }
     }
   }

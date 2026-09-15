@@ -65,4 +65,17 @@ describe('0154 telegram_unbind_receipts — append-only receipt', () => {
     const rows = harness.sqlite.prepare('SELECT COUNT(*) AS n FROM telegram_unbind_receipts').all() as Array<{ n: number }>
     expect(rows[0]!.n).toBe(1)
   })
+
+  // round 6 (kasra-review adversarial addendum, LOW): actor_id NOT NULL
+  // alone admits an empty string, leaving the audit trail blank for "who".
+  it('REFUSES an empty or whitespace-only actor_id', () => {
+    expect(() => {
+      harness.sqlite.prepare(INSERT).run('receipt-blank', 'mumega', 'member-1', '', '9500000', '2026-09-15T00:00:00.000Z')
+    }).toThrow(/CHECK constraint failed/)
+    expect(() => {
+      harness.sqlite.prepare(INSERT).run('receipt-whitespace', 'mumega', 'member-1', '   ', '9500000', '2026-09-15T00:00:00.000Z')
+    }).toThrow(/CHECK constraint failed/)
+    const rows = harness.sqlite.prepare('SELECT COUNT(*) AS n FROM telegram_unbind_receipts').all() as Array<{ n: number }>
+    expect(rows[0]!.n).toBe(0)
+  })
 })

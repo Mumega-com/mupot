@@ -477,6 +477,36 @@ describe('POST /members/:id/capabilities — target-rank ceiling (#1337)', () =>
     ).get(MIXED_CASE_OWNER_MEMBER)).toEqual({ n: 0 })
   })
 
+  // ── F5 round 6 (Athena gate `efdb0b08`, LOW): A2's fixture above only
+  // exercises the MEMBERS-side lower() (a mixed-case members.email bridging
+  // to an all-lowercase users.email). The bridge's OTHER hop
+  // (`WHERE lower(email) = ?1` on the users side, in `targetLegacyRoleRank`)
+  // has no fixture with a mixed-case `users.email` — this one uses an
+  // ALREADY-lowercase members.email so only the users-side lower() can be
+  // what makes the match, proving that hop is load-bearing too.
+  const USERS_SIDE_MIXED_CASE_OWNER_MEMBER = 'member-users-side-mixed-case-owner'
+  const USERS_SIDE_MIXED_CASE_MEMBERS_EMAIL = 'users-side-mixed-case-owner@example.test'
+  const USERS_SIDE_MIXED_CASE_USERS_EMAIL = 'Users-Side-Mixed-Case-Owner@Example.Test'
+
+  it('F5 — refuses an admin SUSPENDING a member whose users.email differs only in CASE from members.email (users-side lower())', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status, tenant)
+        VALUES ('${USERS_SIDE_MIXED_CASE_OWNER_MEMBER}', '${USERS_SIDE_MIXED_CASE_MEMBERS_EMAIL}', 'Users Side Mixed Case Owner', 'active', '${TENANT}');
+      INSERT INTO users (id, email, role)
+        VALUES ('user-users-side-mixed-case-owner', '${USERS_SIDE_MIXED_CASE_USERS_EMAIL}', 'owner');
+    `)
+    const res = await membersApp.fetch(new Request(`https://pot.example/members/${USERS_SIDE_MIXED_CASE_OWNER_MEMBER}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ status: 'suspended' }),
+    }), env)
+
+    expect(res.status).toBe(403)
+    await expect(res.json()).resolves.toMatchObject({ reason: 'cannot_affect_higher_rank' })
+    expect(harness.sqlite.prepare('SELECT status FROM members WHERE id = ?').get(USERS_SIDE_MIXED_CASE_OWNER_MEMBER))
+      .toEqual({ status: 'active' })
+  })
+
   it('P0-A — a member with NO email bridges to nothing and is never treated as elevated', async () => {
     // Absence of a bridge (no email, or an email matching no `users` row) is
     // the SAFE default (0), never an escalation — this member has real
@@ -555,6 +585,59 @@ describe('POST /members/:id/capabilities — target-rank ceiling (#1337)', () =>
 
     expect(res.status).toBe(403)
     expect(harness.sqlite.prepare('SELECT status FROM members WHERE id = ?').get(PEER_ADMIN))
+      .toEqual({ status: 'active' })
+  })
+
+  // ── F2 round 6 (Athena gate `efdb0b08`): M2 above never reaches
+  // `exceedsTargetRankCeiling` at all — a B1-zeroed session is refused
+  // earlier, at `requireCapability(orgScope, 'admin')` itself, which is why
+  // M2's own comment names that as its actual mutation-catching power. This
+  // test reaches `exceedsTargetRankCeiling` legitimately (a real org-scope
+  // 'admin' capability grant satisfies the route gate) so it can prove
+  // `exceedsTargetRankCeiling`'s ACTOR side specifically: the actor's
+  // bridged email matches a `users.role = 'owner'` (rank 5) row, but the
+  // actor's session only ever carries an 'admin' (rank 4) capability grant
+  // and a coarse `role: 'member'` (rank 0) — so the actor's computed rank
+  // must be 4, never 5. Suspending a target whose OWN global rank is
+  // exactly 5 (an org-scope 'owner' capability grant, not the role plane,
+  // to keep this test independent of A2) must therefore still refuse.
+  // Reintroducing a DB role-plane read on the actor side of
+  // `exceedsTargetRankCeiling` (the mutation `actorMaxRankAcrossScopes` used
+  // to be, deleted at A1) would compute the actor's rank as 5 here — 5 is
+  // not greater than the target's 5, so the ceiling would no longer trigger
+  // and this test would go RED (200 instead of 403).
+  it("F2/M2 — exceedsTargetRankCeiling's actor side never re-derives rank from a DB role-plane row, even when it would elevate the actor to outrank the target", async () => {
+    const DB_ELEVATED_ADMIN = 'member-db-elevated-admin'
+    const DB_ELEVATED_EMAIL = 'db-elevated-admin@example.test'
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status, tenant)
+        VALUES ('${DB_ELEVATED_ADMIN}', '${DB_ELEVATED_EMAIL}', 'DB Elevated Admin', 'active', '${TENANT}');
+      INSERT INTO users (id, email, role)
+        VALUES ('user-db-elevated-admin', '${DB_ELEVATED_EMAIL}', 'owner');
+    `)
+    authState.current = {
+      userId: 'db-elevated-admin-user',
+      email: DB_ELEVATED_EMAIL,
+      role: 'member',
+      tenant: TENANT,
+      memberId: DB_ELEVATED_ADMIN,
+      capabilities: [
+        { member_id: DB_ELEVATED_ADMIN, scope_type: 'org', scope_id: null, capability: 'admin' },
+      ],
+    } as AuthContext
+
+    // OWNER_MEMBER already carries an org-scope 'owner' grant (rank 5, set
+    // up in this describe block's own beforeEach) — a real target standing,
+    // not the role plane, so this is independent of A2's fixture.
+    const res = await membersApp.fetch(new Request(`https://pot.example/members/${OWNER_MEMBER}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ status: 'suspended' }),
+    }), env)
+
+    expect(res.status).toBe(403)
+    await expect(res.json()).resolves.toMatchObject({ reason: 'cannot_affect_higher_rank' })
+    expect(harness.sqlite.prepare('SELECT status FROM members WHERE id = ?').get(OWNER_MEMBER))
       .toEqual({ status: 'active' })
   })
 

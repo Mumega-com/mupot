@@ -383,6 +383,20 @@ describe('Telegram project invitation service', () => {
         ('project-decoy', 'squad-unlinked', 'write');
       INSERT INTO members (id, email, display_name, status, tenant)
       VALUES ('member-inviter', 'inviter@example.test', 'Inviter', 'active', '${TENANT}');
+      -- mupot#1411 round 6 (kasra-review adversarial addendum on Athena gate
+      -- efdb0b08, P2): inviterAuth's squad-admin standing above is fed
+      -- directly as auth.capabilities (simulating an already-resolved
+      -- session) — the REAL DB row is needed too now, because
+      -- redeemTelegramProjectInvite re-derives minted_by_member_id's CURRENT
+      -- squad-scope standing straight from the capabilities TABLE
+      -- (currentMemberSquadRank) at redemption time, never from a
+      -- caller-supplied auth object. Without this row every net-new
+      -- redemption test in this block would refuse with
+      -- invite_minter_authority_lost even though nothing changed — the same
+      -- collateral fixture gap round 5 found and fixed for the member-bind
+      -- describe block's own minter.
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+      VALUES ('cap-inviter-squad-admin', 'member-inviter', 'squad', 'squad-participants', 'admin');
     `)
   })
 
@@ -1230,6 +1244,58 @@ describe('Telegram project invitation service', () => {
     expect(retry.ok).toBe(true)
   })
 
+  // ── round 6 (kasra-review adversarial addendum on Athena gate `efdb0b08`,
+  // P2): the NET-NEW (email) path had NO minter re-check at all before this
+  // round — only the member-bind path re-derived the minter's standing at
+  // redemption. A squad-admin's invite, redeemed after they are suspended or
+  // demoted below squad-admin, used to still mint a fresh member at the
+  // invited capability with no re-check of who authorized it.
+  it('refuses redemption when the NET-NEW invite MINTER is demoted below squad-admin between invite creation and claim (round 6 P2)', async () => {
+    const created = await createInvite('net-new-minter-demoted@example.test')
+    expect(created.ok).toBe(true)
+    if (!created.ok) return
+    harness.sqlite.exec(`
+      UPDATE capabilities SET capability = 'observer'
+       WHERE member_id = 'member-inviter' AND scope_type = 'squad' AND scope_id = 'squad-participants'
+    `)
+    reserveUpdate('update-net-new-minter-demoted', VALID_REQUEST_DIGEST, '9001100')
+
+    const result = await redeemTelegramProjectInvite(env, {
+      pairing_code: created.value.pairing_code,
+      telegram_user_id: '9001100',
+      display_name: 'Net New Minter Demoted',
+      update_id: 'update-net-new-minter-demoted',
+      request_digest: VALID_REQUEST_DIGEST,
+    })
+
+    expect(result).toEqual({ ok: false, error: 'invite_minter_authority_lost' })
+    expect(harness.sqlite.prepare('SELECT accepted_at FROM invites WHERE id = ?').get(created.value.invite.id))
+      .toEqual({ accepted_at: null })
+    expect(harness.sqlite.prepare(`
+      SELECT COUNT(*) AS count FROM members WHERE email = 'net-new-minter-demoted@example.test'
+    `).get()).toEqual({ count: 0 })
+  })
+
+  it('refuses redemption when the NET-NEW invite MINTER is suspended between invite creation and claim (round 6 P2)', async () => {
+    const created = await createInvite('net-new-minter-suspended@example.test')
+    expect(created.ok).toBe(true)
+    if (!created.ok) return
+    harness.sqlite.exec(`UPDATE members SET status = 'suspended' WHERE id = 'member-inviter'`)
+    reserveUpdate('update-net-new-minter-suspended', VALID_REQUEST_DIGEST, '9001101')
+
+    const result = await redeemTelegramProjectInvite(env, {
+      pairing_code: created.value.pairing_code,
+      telegram_user_id: '9001101',
+      display_name: 'Net New Minter Suspended',
+      update_id: 'update-net-new-minter-suspended',
+      request_digest: VALID_REQUEST_DIGEST,
+    })
+
+    expect(result).toEqual({ ok: false, error: 'invite_minter_authority_lost' })
+    expect(harness.sqlite.prepare('SELECT accepted_at FROM invites WHERE id = ?').get(created.value.invite.id))
+      .toEqual({ accepted_at: null })
+  })
+
   // ── Athena addendum D: this onboarding slice is net-new humans only.
   // Redeeming an invite whose email already belongs to an existing member
   // (a different Telegram identity, so no telegram_chat_id conflict) must
@@ -1677,15 +1743,20 @@ describe('Telegram project invite — bind existing member', () => {
       VALUES ('member-squad-only-admin', 'squad-only-admin@example.test', 'Squad Only Admin', 'active', '${TENANT}');
       INSERT INTO members (id, email, display_name, status, tenant)
       VALUES ('member-existing', 'existing-human@example.test', 'Existing Human', 'active', '${TENANT}');
-      -- mupot#1411 P2 round 5 (kasra-review adversarial addendum, 2026-09-15):
-      -- ownerAuth's org-admin standing above is fed directly as
-      -- auth.capabilities (simulating an already-resolved session) — the
-      -- REAL DB row is needed too now, because redeemTelegramProjectInvite
-      -- re-derives the invite's minted_by_member_id's CURRENT standing
-      -- straight from the capabilities TABLE at redemption time (see
-      -- currentMemberOrgRank), never from a caller-supplied auth object.
-      -- Without this row every member-bind redemption test would refuse
-      -- with invite_minter_authority_lost even though nothing changed.
+      -- mupot#1411 P2 round 5 (kasra-review adversarial addendum, 2026-09-15),
+      -- corrected round 6 (F3): ownerAuth's org-admin standing above is fed
+      -- directly as auth.capabilities (simulating an already-resolved
+      -- session) — that alone is NOT what redemption re-checks.
+      -- redeemTelegramProjectInvite re-derives minted_by_member_id's CURRENT
+      -- standing straight from the capabilities TABLE (currentMemberOrgRank),
+      -- never from a caller-supplied auth object, so this row is the REAL
+      -- authority every member-bind redemption test in this block relies on
+      -- — not a workaround for an unrelated fixture quirk. It is also
+      -- EXACTLY the shape a session-role-only minter (standing from
+      -- auth.role alone, no capabilities row, no bridged users row) does
+      -- NOT have — see the dedicated test below proving that gap mints but
+      -- cannot redeem, and the docstring on currentMemberOrgRank
+      -- (src/members/project-invites.ts) for why it cannot be closed here.
       INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
       VALUES ('cap-bind-owner-org', 'member-bind-owner', 'org', NULL, 'admin');
     `)
@@ -2238,6 +2309,128 @@ describe('Telegram project invite — bind existing member', () => {
       })
 
       expect(result.ok).toBe(true)
+    })
+
+    // ── round 6 (kasra-review adversarial addendum on Athena gate
+    // `efdb0b08`) — the minter re-check above only ever compared the
+    // capability being GRANTED against the minter's current rank. It never
+    // re-derived the TARGET's standing (P1-A), and never re-checked the
+    // BASELINE admin-or-above authority every member-bind mint actually
+    // requires (P1-B) — a minter demoted to 'observer' minting an
+    // 'observer'-capability invite passed the old check unchanged.
+    it('refuses redemption when the TARGET is promoted to org owner between invite creation and claim (round 6 P1-A)', async () => {
+      const created = await createMemberInvite({ capability: 'member' })
+      expect(created.ok).toBe(true)
+      if (!created.ok) return
+      harness.sqlite.exec(`
+        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES ('cap-target-promoted', 'member-existing', 'org', NULL, 'owner')
+      `)
+      reserveUpdate('update-bind-target-promoted', VALID_REQUEST_DIGEST, '9200900')
+
+      const result = await redeemTelegramProjectInvite(env, {
+        pairing_code: created.value.pairing_code,
+        telegram_user_id: '9200900',
+        display_name: 'Target Promoted',
+        update_id: 'update-bind-target-promoted',
+        request_digest: VALID_REQUEST_DIGEST,
+      })
+
+      expect(result).toEqual({ ok: false, error: 'invite_minter_authority_lost' })
+      expect(harness.sqlite.prepare('SELECT accepted_at FROM invites WHERE id = ?').get(created.value.invite.id))
+        .toEqual({ accepted_at: null })
+      expect(harness.sqlite.prepare(`
+        SELECT telegram_chat_id FROM members WHERE id = 'member-existing'
+      `).get()).toEqual({ telegram_chat_id: null })
+    })
+
+    it("refuses redemption when the MINTER is demoted below admin, even for an 'observer'-capability invite the old check could not see (round 6 P1-B)", async () => {
+      const created = await createMemberInvite({ capability: 'observer' })
+      expect(created.ok).toBe(true)
+      if (!created.ok) return
+      harness.sqlite.exec(`
+        UPDATE capabilities SET capability = 'observer'
+         WHERE member_id = 'member-bind-owner' AND scope_type = 'org'
+      `)
+      reserveUpdate('update-bind-minter-below-admin', VALID_REQUEST_DIGEST, '9201000')
+
+      const result = await redeemTelegramProjectInvite(env, {
+        pairing_code: created.value.pairing_code,
+        telegram_user_id: '9201000',
+        display_name: 'Minter Below Admin',
+        update_id: 'update-bind-minter-below-admin',
+        request_digest: VALID_REQUEST_DIGEST,
+      })
+
+      expect(result).toEqual({ ok: false, error: 'invite_minter_authority_lost' })
+    })
+
+    it('still allows redemption when the minter member-binds THEMSELVES — self-exempt from the target-promotion ceiling (round 6 P1-A)', async () => {
+      const created = await createProjectInvite(env, ownerAuth, {
+        member_id: 'member-bind-owner',
+        project_id: 'project-bind',
+        squad_id: 'squad-bind',
+        capability: 'admin',
+        expires_in_seconds: 3600,
+      })
+      expect(created.ok).toBe(true)
+      if (!created.ok) return
+      reserveUpdate('update-bind-self-mint', VALID_REQUEST_DIGEST, '9201100')
+
+      const result = await redeemTelegramProjectInvite(env, {
+        pairing_code: created.value.pairing_code,
+        telegram_user_id: '9201100',
+        display_name: 'Self Mint',
+        update_id: 'update-bind-self-mint',
+        request_digest: VALID_REQUEST_DIGEST,
+      })
+
+      expect(result.ok).toBe(true)
+    })
+
+    // ── F3 disclosure (round 6, kept as a documented, NOT-fixed-this-round
+    // gap — see docs/architecture/human-decision-channel-contract.md and the
+    // currentMemberOrgRank docstring above): a minter whose org-scope
+    // standing at MINT time came ONLY from the live session's `auth.role`
+    // (owner/admin), with NO backing `capabilities` row and NO `users` row
+    // reachable from their OWN member email, mints successfully but is
+    // refused at redemption — currentMemberOrgRank has no D1 plane left to
+    // recover a role that only ever existed on the minting session object.
+    it('mints via a SESSION-ROLE-ONLY minter (auth.role floor with no backing D1 row) but redemption then refuses — documented gap, not fixed this round', async () => {
+      const SESSION_ROLE_ONLY_MINTER = 'member-session-role-only-minter'
+      harness.sqlite.exec(`
+        INSERT INTO members (id, email, display_name, status, tenant)
+        VALUES ('${SESSION_ROLE_ONLY_MINTER}', 'session-role-only-minter@example.test', 'Session Role Only Minter', 'active', '${TENANT}');
+      `)
+      const sessionRoleOnlyAuth: AuthContext = {
+        userId: 'session-role-only-user',
+        email: 'session-role-only-minter@example.test',
+        role: 'owner',
+        tenant: TENANT,
+        memberId: SESSION_ROLE_ONLY_MINTER,
+        capabilities: [],
+      }
+
+      const created = await createProjectInvite(env, sessionRoleOnlyAuth, {
+        member_id: 'member-existing',
+        project_id: 'project-bind',
+        squad_id: 'squad-bind',
+        capability: 'admin',
+        expires_in_seconds: 3600,
+      })
+      expect(created.ok).toBe(true)
+      if (!created.ok) return
+
+      reserveUpdate('update-bind-session-role-only', VALID_REQUEST_DIGEST, '9201200')
+      const result = await redeemTelegramProjectInvite(env, {
+        pairing_code: created.value.pairing_code,
+        telegram_user_id: '9201200',
+        display_name: 'Session Role Only Redeemer',
+        update_id: 'update-bind-session-role-only',
+        request_digest: VALID_REQUEST_DIGEST,
+      })
+
+      expect(result).toEqual({ ok: false, error: 'invite_minter_authority_lost' })
     })
 
     it('refuses a second redemption of the same member-bind invite (single-use fence still holds)', async () => {

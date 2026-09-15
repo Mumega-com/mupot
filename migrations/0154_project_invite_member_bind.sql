@@ -164,11 +164,16 @@ END;
 -- gate_owner_reassignments 0113, verdict_reversals 0118, this table
 -- following the same shape). prior_telegram_chat_id is retained so a later
 -- audit can tell WHICH identity was detached, not merely that something was.
+-- mupot#1411 round 6 (kasra-review adversarial addendum on Athena gate
+-- efdb0b08, LOW): `actor_id NOT NULL` alone admits an empty string, which
+-- would render as a blank "who" in the audit trail this table exists for.
+-- CHECK(length(trim(actor_id)) > 0) closes it the same way the invites
+-- triggers already refuse a whitespace-only member_id above.
 CREATE TABLE IF NOT EXISTS telegram_unbind_receipts (
   id                      TEXT PRIMARY KEY,
   tenant                  TEXT NOT NULL,
   member_id               TEXT NOT NULL REFERENCES members(id) ON DELETE RESTRICT,
-  actor_id                TEXT NOT NULL,
+  actor_id                TEXT NOT NULL CHECK (length(trim(actor_id)) > 0),
   prior_telegram_chat_id  TEXT NOT NULL,
   created_at              TEXT NOT NULL
 );
@@ -194,3 +199,19 @@ BEFORE DELETE ON telegram_unbind_receipts
 BEGIN
   SELECT RAISE(ABORT, 'telegram_unbind_receipts is append-only: DELETE is forbidden');
 END;
+
+-- mupot#1411 round 6 (kasra-review adversarial addendum, LOW, disclosed not
+-- fixed): SQLite's REPLACE conflict-resolution algorithm deletes the
+-- pre-existing conflicting row to make room for the new one, and that
+-- internal delete only fires DELETE triggers when the `recursive_triggers`
+-- pragma is enabled (off by default in SQLite/D1). This route never issues
+-- `INSERT OR REPLACE` against this table (see the plain INSERT above), so
+-- this codebase's own write path is not exposed — but a future caller doing
+-- `INSERT OR REPLACE INTO telegram_unbind_receipts (id, ...) VALUES (...)`
+-- with a colliding `id` would silently delete-and-replace an append-only row
+-- without tripping `telegram_unbind_receipts_no_delete`. Not fixed here
+-- (would need either enabling recursive_triggers pot-wide, which has
+-- broader blast radius than this one table, or an INSERT-time guard trigger
+-- refusing any id that already exists) — flagged so a future caller of this
+-- table does not assume append-only holds against every conflict-resolution
+-- clause, only against a direct UPDATE or DELETE statement.

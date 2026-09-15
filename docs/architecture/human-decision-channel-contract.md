@@ -4,9 +4,13 @@ Status: architecture note, written 2026-09-14 by Kasra from receipts on mupot PR
 (`kasra/telegram-project-onboarding-20260913`, merged to `main` at `49a344aa`) and its
 gate history. Not a release contract. Hadi decides scope; updates by PR only.
 
-Updated 2026-09-15 (round 4, Athena N3) for mupot PR #1411
+Updated 2026-09-15 (round 6, Athena gate `efdb0b08`) for mupot PR #1411
 (`kasra/telegram-bind-existing-member-20260914`): the "net-new humans only" gap named in
-clause (g) below is closed. See the clause itself for the current shape.
+clause (g) below is closed. This revision replaces round 4's actor/target-ceiling
+description (a shape round 5 reverted, see `src/auth/capability.ts`'s own
+`exceedsTargetRankCeiling` history) with the shape that actually shipped — see clause (a)
+below — and corrects clause (g)'s unbind description to match round 5's self-unbind
+addition.
 
 ## One sentence
 
@@ -40,7 +44,7 @@ A human enters a project through one **single-use, server-hashed** invitation:
   `src/members/project-invites.ts:337-371`) with conjuncts that must all hold in the
   SAME statement, not a JS pre-check that can race it:
   - single-use: `accepted_at IS NULL`
-  - not expired: `pairing_expires_at > ?8`
+  - not expired: `pairing_expires_at > ?`
   - project active: `EXISTS (... projects.status = 'active')`
   - the exact squad-project edge still exists: `EXISTS (... project_squad_access ...)`
   - the authenticated transport receipt is in `state = 'processing'` for this exact
@@ -61,10 +65,18 @@ A human enters a project through one **single-use, server-hashed** invitation:
   The **member-bind** path (`member_id` set — attaching Telegram to an EXISTING
   identity, itself a credential mint) requires ORG-scope admin
   (`actorRankOnScopeFor(env, auth, 'org', null)`) AND that the target does not outrank
-  the actor ANYWHERE (`exceedsTargetRankCeiling`, `src/auth/capability.ts`) — both sides
-  of that comparison are the SAME global-standing function (grants across every scope,
-  unioned with the role-plane rank), and a principal is always self-exempt from
-  outranking themselves.
+  the actor ANYWHERE (`exceedsTargetRankCeiling`, `src/auth/capability.ts`) — the two
+  sides of that comparison are DELIBERATELY ASYMMETRIC, not the same quantity, and this
+  is the round-5 shape after round 4 shipped the symmetric version and then had to revert
+  it as its own escalation (see the round-5 note in `exceedsTargetRankCeiling`'s own
+  docstring): the **target** is GLOBAL (`targetMaxRankAcrossScopes` — the maximum of every
+  capability-grant row the target holds on ANY scope, unioned with their role-plane rank
+  via the `lower(email)` members↔users bridge), while the **actor** is ORG-SCOPE-LOCAL
+  (`actorRankOnScopeFor(env, auth, 'org', null)` — an org-scope capability grant unioned
+  with the session's own `auth.role`, never inflated by a grant the actor happens to hold
+  on some unrelated squad or department). The check refuses iff the target's global rank
+  exceeds the actor's org-scope-local rank; a principal is always self-exempt from
+  outranking themselves, independent of either side's computation.
 
 Adversarial finding this closes: PR #1407's own re-gate proved two of the `EXISTS`
 conjuncts (`projects.status='active'`, the `project_squad_access` edge) are **singly
@@ -210,10 +222,15 @@ Three distinct events are recorded **separately**, each idempotent on its own ke
   with `member_id` set (instead of `email`) attaches a Telegram identity to an
   EXISTING, active, same-tenant member rather than always minting a net-new one.
   Authority floor: org admin (`actorRankOnScopeFor(env, auth, 'org', null)`) AND the
-  target must not outrank the actor anywhere (`exceedsTargetRankCeiling`, global
-  standing across every scope, unioned with the role-plane rank; self-exempt). Unbind —
-  `DELETE /members/:id/telegram` — is gated by the SAME floor, since clearing the
-  binding is a credential revocation with the same authority class as minting it.
+  target must not outrank the actor anywhere (`exceedsTargetRankCeiling` — target
+  GLOBAL standing across every scope unioned with the role-plane rank, actor ORG-SCOPE-
+  LOCAL standing only; self-exempt). Unbind — `DELETE /members/:id/telegram` — is gated
+  by that SAME org-admin-plus-ceiling floor **OR by the bound member acting on
+  themselves** (self-unbind, added round 5: no capability check at all when the caller
+  targets their own member row, since a bind victim otherwise has no way to detach an
+  identity attached to them without their say). The admin path remains the same
+  credential-revocation authority class as minting it; the self path is a remedy, not a
+  widening of what an admin may do to someone else.
   Redeeming an invite whose caller-supplied `email` already belongs to an existing
   member (the ORIGINAL net-new path, no `member_id`) is still refused with
   `member_already_exists` and still makes no partial writes — that path is unchanged;
@@ -264,7 +281,7 @@ What **must change**, not merely adapt:
   numeric chat id). This is not a stylistic nit — it is load-bearing in the invite path
   itself: `CLAIM_INVITE_SQL` (`src/members/project-invites.ts:337-371`) **hardcodes** an
   `EXISTS (SELECT 1 FROM telegram_webhook_receipts receipt WHERE ... receipt.telegram_user_id
-  = ?12 ...)` conjunct (`:357-364`) as one of the atomic claim's fence conditions — a
+  = ? ...)` conjunct (`:357-364`) as one of the atomic claim's fence conditions — a
   second channel cannot claim an invite through this exact statement without either its
   own copy of this table+conjunct or a rewrite of the statement itself. The whole module
   is Telegram-typed end to end, not just at the edges: the redemption input type names

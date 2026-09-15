@@ -84,14 +84,54 @@ authenticates AS the target; suspend can lock a principal out; a capability gran
 strip or hand out real access), and a target's standing on ANY scope — not just the one an
 admin happens to be acting through — is real authority they hold in the pot.
 
-**A member-bind invite's capability cannot outlive its own minter's authority either.** The
-invite records who minted it (`invites.minted_by_member_id`); at redemption, that minter's
-CURRENT org-scope standing is re-derived fresh from the database (never trusted from mint
-time) and compared against the invite's capability. An owner who mints an `admin` bind invite
-and is later demoted or suspended produces an invite that refuses at redemption
-(`invite_minter_authority_lost`, collapsed into the same generic chat reply as every other
-redemption refusal) rather than silently granting `admin` on the minter's now-stale authority,
-for as long as seven days (`MAX_INVITE_LIFETIME_SECONDS`) after the demotion.
+**No invite's capability can outlive its own minter's authority either — and, for a
+member-bind invite, the target's standing cannot outgrow it either.** Every invite records
+who minted it (`invites.minted_by_member_id`); at redemption, the minter's CURRENT standing is
+re-derived fresh from the database (never trusted from mint time) and the FULL mint-time
+authorization is re-run, not just the capability-vs-rank comparison: the minter must still be
+active, still hold AT LEAST admin-or-above standing on the scope that mint required (org-scope
+for a member-bind invite, squad-scope for a net-new one), and the invite's capability must
+still be at or below that current rank. For a member-bind invite specifically, the TARGET's
+CURRENT global standing is re-checked against the minter's current rank too (self-exempt when
+the minter targets themselves) — a member-bind invite minted for a nobody, where the target is
+promoted to org owner any time within the invite's lifetime, now refuses at redemption exactly
+as a fresh request would. Any of these failing collapses into the same generic
+`invite_minter_authority_lost` chat reply as every other redemption refusal, and the invite
+stays intact (not burned) — up to seven days (`MAX_INVITE_LIFETIME_SECONDS`) is a long enough
+window for a minter's standing, or a target's, to change underneath an unredeemed invite.
+
+**Known, disclosed gap — pre-flight for this whole re-check (F3, round 6):** the re-check above
+is only ever as good as what is queryable in D1 for the minter's `member_id` at redemption
+time — a member-bind invite's org-scope re-check reads the `capabilities` table and the
+`members.email -> users.role` bridge, and a net-new invite's squad-scope re-check reads the
+`capabilities` table for that squad. Neither can recover a minting session's raw `auth.role`
+floor when that floor was never backed by a matching row on either plane for the SAME
+member (e.g. a session role sourced from a login email that does not match the minter's own
+`members.email`). A minter whose standing at mint time came ONLY from that unbridgeable
+session floor mints successfully and is refused at redemption with no change in their real
+authority — pre-flight: before minting a bind or net-new invite on behalf of an operator,
+confirm their standing is visible as either a real `capabilities` row or a role-plane row
+reachable from their OWN member email, not only from how their session happened to authenticate.
+See `docs/architecture/human-decision-channel-contract.md` clause (g) and the
+`currentMemberOrgRank` docstring in `src/members/project-invites.ts`.
+
+**Known, disclosed gap — squad-owner net-new escalation (round 6):** a net-new invite minted
+at capability `owner` by a squad owner (permitted — capability at or below the minter's own
+rank) mints a member whose GLOBAL rank is then 5. Every org admin's target-rank ceiling (the
+five gated actions above) then refuses to act on that member — a real, if narrow, behavior
+change from before this slice existed. Not fixed this round; tracked as a follow-up issue.
+
+**Known, disclosed gap — `members.email` is a case-sensitive UNIQUE column (F4, round 6):**
+`members.email TEXT UNIQUE` (migration `0002`) is exact-match unique; migration `0146`'s
+`idx_members_email_lower` is a non-unique functional index added only for query performance,
+not a uniqueness guarantee. Two `members` rows differing only in email casing (e.g.
+`Owner@Example.test` and `owner@example.test`) can both exist. A case-variant row created via
+the net-new invite path inherits whatever role-plane rank its casing happens to bridge to
+under `lower()` (this is a DENIAL-only risk, never an authority gain — see A2 above — but it
+does make that variant row IMMUNE to an org admin the same way the real owner is). No code
+change this round; a follow-up issue tracks lowercasing `members.email` on write (or adding a
+functional UNIQUE index on `lower(email)`) to remove the possibility of the variant existing
+at all.
 
 At redemption, `/start <pairing-code>` binds the authenticated Telegram identity onto the
 **existing** member (an `UPDATE`, never an `INSERT`) instead of minting a new one; no new
@@ -204,8 +244,11 @@ Before mutation, record:
    `0153_inbox_lease_attempt_reconciliation.sql`, then
    `0154_project_invite_member_bind.sql`, in that order, in the deployed migration ledger.
    Migration 0152 creates the onboarding/webhook receipts; 0153 adds the server-authoritative
-   lease-attempt receipts used by the Hermes receiver; 0154 adds `invites.member_id` (the
-   bind-existing-member path) and `members.telegram_bound_at` (the bind-landed proof stamp).
+   lease-attempt receipts used by the Hermes receiver; 0154 adds all four of: `invites.member_id`
+   (the bind-existing-member path), `invites.minted_by_member_id` (the minter-authority-loss
+   re-check), `members.telegram_bound_at` (the bind-landed proof stamp), and the
+   `telegram_unbind_receipts` table (the append-only unbind audit trail, with its own
+   no-update/no-delete trigger pair).
 3. `IM_WEBHOOK_SECRET` configured at both ends, without reading or recording its value.
 4. The existing project is active and the intended department is correct.
 5. The planned capability (`observer`, `member`, `lead`, `admin`, or `owner`) is no greater
