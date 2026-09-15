@@ -42,7 +42,7 @@ import { isMissingWebSessionsTableError } from '../auth/web-sessions'
 import { csrf } from 'hono/csrf'
 import { assertBatchWritten } from '../lib/receipt'
 // The FROZEN capability API — everyone codes against these exact signatures.
-import { requireCapability, capabilityRank, actorMaxRankOnScope } from '../auth/capability'
+import { requireCapability, capabilityRank, actorMaxRankOnScope, exceedsTargetRankCeiling } from '../auth/capability'
 // Shared token lifecycle — the single mint/revoke path (also used by the dashboard).
 // sha256Hex/mintRawToken are imported ONLY for the invite-accept atomic batch.
 import {
@@ -618,23 +618,22 @@ interface PatchMemberBody {
 // STRICTLY ABOVE, not at-or-above: an admin removing another admin is ordinary
 // administration, and refusing it would break a live path to close a hole that
 // is about rank INVERSION, not peers.
+//
+// mupot#1411 P0-1 (kasra-review, 2026-09-15): this used to compare the target's
+// row on the ONE (scopeType, scopeId) an action happened to touch — a target
+// who outranked the actor via a DIFFERENT scope (an org owner with nothing on
+// THIS squad, say) sailed through. Now uses targetMaxRankAcrossScopes (the
+// target's real standing, everywhere) uniformly at all three call sites below
+// AND the member-bind invite path (src/members/project-invites.ts), so none of
+// them can independently regress back to the narrow, bypassable check.
 async function targetRankCeiling(
   c: Context<AppEnv>,
   targetMemberId: string,
   scopeType: CapabilityScopeType,
   scopeId: string | null,
 ): Promise<Response | null> {
-  const existing = scopeId === null
-    ? await c.env.DB.prepare(
-        'SELECT capability FROM capabilities WHERE member_id = ? AND scope_type = ? AND scope_id IS NULL LIMIT 1',
-      ).bind(targetMemberId, scopeType).first<{ capability: Capability }>()
-    : await c.env.DB.prepare(
-        'SELECT capability FROM capabilities WHERE member_id = ? AND scope_type = ? AND scope_id = ? LIMIT 1',
-      ).bind(targetMemberId, scopeType, scopeId).first<{ capability: Capability }>()
-
-  if (!existing) return null
   const actorRank = await actorMaxRankOnScope(c, scopeType, scopeId)
-  if (capabilityRank(existing.capability) > actorRank) {
+  if (await exceedsTargetRankCeiling(c.env, targetMemberId, actorRank)) {
     return c.json({ error: 'forbidden', reason: 'cannot_affect_higher_rank' }, 403)
   }
   return null
@@ -766,6 +765,40 @@ membersApp.delete(
     }
 
     return c.json({ token_id: tokenId, revoked: true })
+  },
+)
+
+// ── Telegram bind (admin unbind) ───────────────────────────────────────────────
+
+// mupot#1411 P0-1(d): a Telegram bind is a credential mint — it lets a chat
+// authenticate AS this member (memberForChat, src/im/index.ts) exactly the
+// way a member token does. Minting one is already gated behind org admin +
+// targetRankCeiling (POST /members/:id/tokens). Prior to this route, NOTHING
+// could clear `members.telegram_chat_id` once a member-bind invite set it —
+// an irreversible grant, unlike every other credential in this file (tokens
+// revoke, capabilities revoke). Same authority as the mint, checked the same
+// way: an admin cannot unbind a principal who outranks them either — that
+// would itself be an act ON a higher-ranked target.
+membersApp.delete(
+  '/members/:id/telegram',
+  requireCapability(orgScope, 'admin'),
+  async (c) => {
+    const memberId = c.req.param('id')
+
+    const member = await c.env.DB.prepare(
+      'SELECT id, telegram_chat_id FROM members WHERE id = ? LIMIT 1',
+    ).bind(memberId).first<{ id: string; telegram_chat_id: string | null }>()
+    if (!member) return c.json({ error: 'member_not_found' }, 404)
+    if (member.telegram_chat_id === null) return c.json({ error: 'telegram_not_bound' }, 404)
+
+    const ceiling = await targetRankCeiling(c, memberId, 'org', null)
+    if (ceiling) return ceiling
+
+    await c.env.DB.prepare(
+      'UPDATE members SET telegram_chat_id = NULL, telegram_bound_at = NULL WHERE id = ?',
+    ).bind(memberId).run()
+
+    return c.json({ member_id: memberId, telegram_unbound: true })
   },
 )
 

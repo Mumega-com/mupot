@@ -1,6 +1,8 @@
 import type { AuthContext, Capability, CapabilityGrant, Env } from '../types'
 import {
+  actorRankOnScopeFor,
   capabilityRank,
+  exceedsTargetRankCeiling,
   hasCapability,
   legacyRoleRank,
   resolveCapabilities,
@@ -53,6 +55,7 @@ export interface CreatedProjectInvite {
 
 export type CreateProjectInviteError =
   | 'tenant_scope'
+  | 'invalid_invite_scope'
   | 'invalid_email'
   | 'invalid_member_id'
   | 'invalid_project_id'
@@ -229,6 +232,39 @@ function uniqueConstraintColumn(error: unknown, column: string): boolean {
 }
 
 /**
+ * The ONE member-eligibility predicate for a Telegram bind-existing-member
+ * invite, expressed exactly once and interpolated verbatim into BOTH
+ * CLAIM_INVITE_SQL's `bind_target` EXISTS check and bindMemberStatement's own
+ * WHERE clause below, so the two statements structurally cannot drift into
+ * checking different facts (mupot#1411 Athena F2, round 2: CLAIM_INVITE_SQL's
+ * `bind_target` EXISTS checked `status` only; bindMemberStatement's WHERE
+ * checked `tenant` — two independent, hand-duplicated predicates).
+ *
+ * `tenant = ?` is an EXACT, non-NULL match, not the `(tenant = ? OR tenant IS
+ * NULL)` collapse shape used elsewhere for existence-oracle avoidance —
+ * deliberately, because `memberForChat` (src/im/index.ts:95-97) requires an
+ * exact tenant match with no NULL fallback, so a NULL-tenant member can never
+ * be resolved by `/approve` etc. through Telegram even if bound. Binding one
+ * would silently grant a capability an operator can never reach that way.
+ *
+ * tests/telegram-project-onboarding.test.ts has a seam test asserting BOTH
+ * compiled statement strings contain this exact constant, so any future edit
+ * that touches one copy without the other fails immediately.
+ */
+export const MEMBER_BIND_ELIGIBLE_SQL = "id = ? AND tenant = ? AND status = 'active' AND (telegram_chat_id IS NULL OR telegram_chat_id = ?)"
+
+/**
+ * The bind-landed PROOF used to gate the capability grant and receipt
+ * completion on the bind path — exported so a test can pin the exact text
+ * used in production (P1-2 pattern), directly against `members.telegram_bound_at`
+ * (see bindMemberStatement below), not against `telegram_chat_id`. A
+ * pre-existing telegram_chat_id that merely happens to already equal the
+ * redeeming identity must NOT satisfy this on its own; only THIS claim's own
+ * write of `telegram_bound_at = claimedAt` does.
+ */
+export const MEMBER_BIND_LANDED_GUARD_SQL = 'EXISTS (SELECT 1 FROM members WHERE id = ? AND telegram_bound_at = ?)'
+
+/**
  * The atomic single-use claim fence, extracted to a named constant so a test
  * can drive this EXACT statement directly (P1-2). tests/helpers/sqlite-d1.ts
  * is synchronous `node:sqlite`, so no test that goes through
@@ -237,32 +273,38 @@ function uniqueConstraintColumn(error: unknown, column: string): boolean {
  * on its own — the pre-check always agrees with a same-process, non-racing
  * caller. Pinning the statement itself, independent of that pre-check, is the
  * only way to prove single-use (`accepted_at IS NULL`), expiry
- * (`pairing_expires_at > ?8`), and the receipt-processing binding (the final
+ * (`pairing_expires_at > ?`), and the receipt-processing binding (the final
  * EXISTS) each still hold under a real concurrent claim.
  *
  * Member-bind extension: the final `member_id IS NULL OR EXISTS(...)`
- * conjunct ties the claim ITSELF to the target member still being active —
- * not merely the downstream bind statement. This is load-bearing, not
- * decorative: a bind statement that failed silently (0 rows, no exception —
- * a suspended member is not a SQL error) while this claim had already
- * committed would irreversibly burn a single-use invite for a transient
- * state with nothing to show for it (no member bound, no capability granted,
- * receipt left `processing`), and would do so on the ordinary sequential
- * "member got suspended before the participant typed /start" path, not only
+ * conjunct ties the claim ITSELF to the target member still being eligible —
+ * not merely the downstream bind statement, and via the SAME
+ * MEMBER_BIND_ELIGIBLE_SQL predicate the bind statement itself uses. This is
+ * load-bearing, not decorative: a bind statement that failed silently (0
+ * rows, no exception — a suspended member, a reassigned tenant, or a NULL
+ * tenant is not a SQL error) while this claim had already committed would
+ * irreversibly burn a single-use invite for a transient state with nothing
+ * to show for it (no member bound, no capability granted, receipt left
+ * `processing`), and would do so on the ordinary sequential "member's
+ * eligibility changed before the participant typed /start" path, not only
  * under a race. Net-new invites (`member_id IS NULL`) are unaffected — the
- * `OR` short-circuits before ever touching the `members` table for them.
+ * `OR` short-circuits before ever touching the `members` table for them; the
+ * eligibility fragment is bound against the invite's OWN `member_id` (read
+ * once, in JS, before the batch — never a correlated subquery column), the
+ * same value bindMemberStatement itself binds, so the two can never see
+ * different targets within the one atomic batch.
  */
 export const CLAIM_INVITE_SQL = `
   UPDATE invites
-     SET accepted_at = ?1
-   WHERE id = ?2
-     AND pairing_hash = ?3
-     AND project_id = ?4
-     AND squad_id = ?5
-     AND capability = ?6
-     AND email = ?7
+     SET accepted_at = ?
+   WHERE id = ?
+     AND pairing_hash = ?
+     AND project_id = ?
+     AND squad_id = ?
+     AND capability = ?
+     AND email = ?
      AND accepted_at IS NULL
-     AND pairing_expires_at > ?8
+     AND pairing_expires_at > ?
      AND EXISTS (
        SELECT 1 FROM projects project
         WHERE project.id = invites.project_id AND project.status = 'active'
@@ -274,19 +316,36 @@ export const CLAIM_INVITE_SQL = `
      )
      AND EXISTS (
        SELECT 1 FROM telegram_webhook_receipts receipt
-        WHERE receipt.tenant = ?9
-          AND receipt.update_id = ?10
-          AND lower(receipt.request_digest) = lower(?11)
-          AND receipt.telegram_user_id = ?12
+        WHERE receipt.tenant = ?
+          AND receipt.update_id = ?
+          AND lower(receipt.request_digest) = lower(?)
+          AND receipt.telegram_user_id = ?
           AND receipt.state = 'processing'
      )
      AND (
        invites.member_id IS NULL
        OR EXISTS (
-         SELECT 1 FROM members bind_target
-          WHERE bind_target.id = invites.member_id
-            AND bind_target.status = 'active'
+         SELECT 1 FROM members WHERE ${MEMBER_BIND_ELIGIBLE_SQL}
        )
+     )
+`
+
+/**
+ * The Telegram-bind UPDATE for an EXISTING member (the second statement of
+ * the same atomic batch as CLAIM_INVITE_SQL), extracted to a named constant
+ * for the same reason CLAIM_INVITE_SQL is: so a test can assert, byte for
+ * byte, that it interpolates the SAME MEMBER_BIND_ELIGIBLE_SQL fragment
+ * CLAIM_INVITE_SQL's own bind_target EXISTS does (the seam test) — the two
+ * can never independently drift back into checking different member facts.
+ * `telegram_bound_at = ?` is this claim's own bind-landed stamp; see
+ * MEMBER_BIND_LANDED_GUARD_SQL for how it is later proven, not merely stated.
+ */
+export const MEMBER_BIND_UPDATE_SQL = `
+  UPDATE members
+     SET telegram_chat_id = ?, telegram_bound_at = ?
+   WHERE ${MEMBER_BIND_ELIGIBLE_SQL}
+     AND EXISTS (
+       SELECT 1 FROM invites WHERE id = ? AND accepted_at = ?
      )
 `
 
@@ -337,6 +396,15 @@ export async function createProjectInvite(
   // receipt shape stay identical to the net-new path — the caller never gets
   // to choose an email that diverges from the member it is binding to.
   const hasMemberId = input.member_id !== undefined && input.member_id !== null
+  // mupot#1411 P2-2 (kasra-review, 2026-09-15): the HTTP route's parseInvite
+  // already refuses a body carrying both, but createProjectInvite is called
+  // directly by non-HTTP callers too (the same reason its own rank ceiling
+  // below cannot rely on route middleware) — a caller-supplied `email`
+  // silently winning member_id's derived email must be refused HERE, not
+  // only at the one HTTP entry point.
+  if (hasMemberId && input.email !== undefined && input.email !== null) {
+    return { ok: false, error: 'invalid_invite_scope' }
+  }
   let memberId: string | null = null
   let email = ''
   if (hasMemberId) {
@@ -388,10 +456,30 @@ export async function createProjectInvite(
     email = member.email.trim()
   }
 
-  const actorRank = await actorRankOnSquad(env, auth, squadId, edge.department_id)
+  // mupot#1411 P0-1 (kasra-review, 2026-09-15): a member-bind invite mints a
+  // Telegram credential that authenticates AS the target member — exactly the
+  // token-mint concept requireCapability(orgScope,'admin') + targetRankCeiling
+  // already guard in src/members/index.ts (POST /members/:id/tokens). A
+  // squad-admin ceiling is not enough: it never looks at what the TARGET
+  // already holds, so a squad-admin could member-bind an org OWNER (or any
+  // higher-ranked principal) onto their own squad at a low capability, then
+  // redeem it from THEIR OWN Telegram id and resolve through memberForChat AS
+  // that member — an identity takeover with no unbind route. So the member-id
+  // path requires ORG-scope admin (not squad-admin) AND the SAME
+  // target-rank-ceiling primitive the token-mint route uses, checked against
+  // the target's REAL standing across every scope (targetMaxRankAcrossScopes),
+  // not merely the invited squad. The net-new path (no member_id — nothing to
+  // take over, a fresh member is minted) keeps the existing squad-admin
+  // ceiling unchanged.
+  const actorRank = hasMemberId
+    ? await actorRankOnScopeFor(env, auth, 'org', null)
+    : await actorRankOnSquad(env, auth, squadId, edge.department_id)
   if (actorRank < capabilityRank('admin')) return { ok: false, error: 'forbidden' }
   if (capabilityRank(input.capability) > actorRank) {
     return { ok: false, error: 'cannot_grant_above_own_rank' }
+  }
+  if (hasMemberId && memberId !== null && await exceedsTargetRankCeiling(env, memberId, actorRank)) {
+    return { ok: false, error: 'forbidden' }
   }
 
   let pairingCode = ''
@@ -510,16 +598,19 @@ export async function redeemTelegramProjectInvite(
 
   // Bind-existing-member path (invite.member_id set at creation): pre-empt the
   // "already bound to a DIFFERENT Telegram identity" conflict with its own
-  // named error. Every OTHER member-eligibility fact (not found, wrong
-  // tenant, no longer active at claim time) is deliberately left to the
-  // atomic bindMemberStatement guard below — it re-checks the identical
-  // status/tenant facts inside the same claim, so a redundant JS copy here
-  // would only ever agree with it (same generic invalid_or_expired_pairing_code
-  // fallback), never diverge. Only the conflict case changes the returned
-  // error code, which is why it alone needs a pre-check; the reverse conflict
-  // ("this Telegram id already belongs to a different member") is left to the
-  // existing UNIQUE(members.telegram_chat_id) catch below — the SAME
-  // mechanism the net-new path already relies on, not a second copy.
+  // named error. Every OTHER member-eligibility fact (not found, wrong or
+  // NULL tenant, no longer active at claim time) is deliberately left to the
+  // atomic MEMBER_BIND_ELIGIBLE_SQL fence below — it re-checks the identical
+  // status/tenant/identity facts inside the same claim (exact non-NULL
+  // tenant, unlike this pre-check's own collapse shape used purely to avoid
+  // a cross-tenant existence oracle), so a mismatch here just means the pre-
+  // check found nothing to warn about and the atomic claim refuses instead
+  // (generic invalid_or_expired_pairing_code, invite stays unburned). Only
+  // the conflict case changes the returned error code, which is why it alone
+  // needs a pre-check; the reverse conflict ("this Telegram id already
+  // belongs to a different member") is left to the existing
+  // UNIQUE(members.telegram_chat_id) catch below — the SAME mechanism the
+  // net-new path already relies on, not a second copy.
   if (invite.member_id !== null) {
     const member = await env.DB.prepare(
       'SELECT id, status, telegram_chat_id FROM members WHERE id = ?1 AND (tenant = ?2 OR tenant IS NULL) LIMIT 1',
@@ -545,26 +636,22 @@ export async function redeemTelegramProjectInvite(
   }
   const responseText = JSON.stringify(value)
 
-  // status='active' is deliberately NOT re-checked here: CLAIM_INVITE_SQL
-  // (statement 1, same D1 batch = one transaction, no external write can
-  // interleave) already fences it as part of the claim itself, so re-testing
-  // it here could only ever agree — a guaranteed-vacuous copy, not a second
-  // layer. What CAN still fail independently is the Telegram identity match,
-  // which is exactly this statement's own reason to exist.
+  // MEMBER_BIND_ELIGIBLE_SQL (status, exact non-NULL tenant, Telegram
+  // compatibility) is deliberately NOT hand-duplicated here: it is the SAME
+  // constant CLAIM_INVITE_SQL's own bind_target EXISTS interpolates, bound
+  // with the SAME (memberId, env.TENANT_SLUG, telegram target) values — so
+  // this WHERE and that EXISTS can never drift into checking different
+  // facts (mupot#1411 Athena F2, round 2). Also stamps `telegram_bound_at =
+  // claimedAt` — a value unique to THIS claim (claimTimestamp() mixes in a
+  // random suffix) — so downstream statements can require PROOF this exact
+  // UPDATE landed, not merely that some past write left a matching state.
   const bindMemberStatement = invite.member_id !== null
-    ? env.DB.prepare(
-      `UPDATE members
-          SET telegram_chat_id = ?1
-        WHERE id = ?2
-          AND (tenant = ?3 OR tenant IS NULL)
-          AND (telegram_chat_id IS NULL OR telegram_chat_id = ?1)
-          AND EXISTS (
-            SELECT 1 FROM invites WHERE id = ?4 AND accepted_at = ?5
-          )`,
-    ).bind(
+    ? env.DB.prepare(MEMBER_BIND_UPDATE_SQL).bind(
       input.telegram_user_id.trim(),
+      claimedAt,
       memberId,
       env.TENANT_SLUG,
+      input.telegram_user_id.trim(),
       invite.id,
       claimedAt,
     )
@@ -589,24 +676,24 @@ export async function redeemTelegramProjectInvite(
 
   // Bind path only: tie the capability grant and receipt completion to
   // bindMemberStatement's OWN effect having actually landed, not merely to
-  // CLAIM_INVITE_SQL's. CLAIM_INVITE_SQL guarantees the member was active AT
-  // THE CLAIM, but bindMemberStatement can still independently affect 0 rows
-  // in the same batch (the residual Telegram-identity-conflict race — the
-  // pre-check above answers it in every sequential run, same TOCTOU-only
-  // shape as CLAIM_INVITE_SQL's own receipt sub-conjuncts). Without this,
-  // that race would grant the squad capability and mark the receipt
-  // completed for a member whose Telegram identity was never actually bound
-  // — capability without a proven bind. Net-new invites are unaffected: the
-  // member-INSERT's own UNIQUE constraints already make ITS failure throw
-  // (batch-wide rollback), so no analogous silent-0-rows gap exists there.
+  // CLAIM_INVITE_SQL's. This is a STAMP check, not a state check (mupot#1411
+  // Athena F2, round 2): `telegram_chat_id = ?` would have been satisfied by
+  // ANY history that happened to leave that value set — including a member
+  // who already carried the redeeming identity from something else entirely
+  // — independent of whether bindMemberStatement itself ran, and did so
+  // successfully, for THIS claim. `telegram_bound_at = claimedAt` can only be
+  // true if bindMemberStatement's own UPDATE (same batch, same transaction)
+  // matched MEMBER_BIND_ELIGIBLE_SQL and wrote THIS unique-per-claim value —
+  // it is proof of this claim's write, not a fact that could have been true
+  // already. Net-new invites are unaffected: the member-INSERT's own UNIQUE
+  // constraints already make ITS failure throw (batch-wide rollback), so no
+  // analogous silent-0-rows gap exists there.
   const memberBindLandedGuard = invite.member_id !== null
     ? `
-       AND EXISTS (
-         SELECT 1 FROM members WHERE id = ? AND telegram_chat_id = ?
-       )`
+       AND ${MEMBER_BIND_LANDED_GUARD_SQL}`
     : ''
   const memberBindLandedParams = invite.member_id !== null
-    ? [memberId, input.telegram_user_id.trim()]
+    ? [memberId, claimedAt]
     : []
 
   try {
@@ -623,6 +710,12 @@ export async function redeemTelegramProjectInvite(
         env.TENANT_SLUG,
         input.update_id.trim(),
         input.request_digest,
+        input.telegram_user_id.trim(),
+        // MEMBER_BIND_ELIGIBLE_SQL's 3 params — the SAME values
+        // bindMemberStatement below binds for its own copy of this fragment,
+        // captured once in JS so the two can never see different targets.
+        invite.member_id,
+        env.TENANT_SLUG,
         input.telegram_user_id.trim(),
       ),
       bindMemberStatement,

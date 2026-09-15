@@ -380,21 +380,25 @@ export function capabilityRank(cap: Capability): number {
 
 /** The acting principal's highest effective capability rank on a scope — their
  *  grants OR their coarse org role (owner=5, admin=4). 0 = no standing.
+ *  Context-independent core so a non-HTTP service (e.g.
+ *  src/members/project-invites.ts's member-bind invite path, mupot#1411 P0-1)
+ *  can reuse the EXACT same computation `actorMaxRankOnScope` uses over HTTP,
+ *  rather than hand-rolling a second copy that can drift.
  *  KNOWN DRIFT from requireCapability's stricter memberId-gated escape (see
  *  actorRankOnSquad's fix in src/members/project-invites.ts, P1-1 parity) —
  *  this function still floors on the coarse role even with no memberId on a
  *  non-org scope. Tracked separately, do not fix here: mupot#1408. */
-export async function actorMaxRankOnScope(
-  c: Context<AppEnv>,
+export async function actorRankOnScopeFor(
+  env: Env,
+  auth: AuthContext,
   scopeType: CapabilityScopeType,
   scopeId: string | null,
 ): Promise<number> {
-  const auth = c.get('auth')
   let max = auth.role === 'owner' ? RANK.owner : auth.role === 'admin' ? RANK.admin : 0
   if (auth.memberId) {
-    const grants = auth.capabilities ?? (await resolveCapabilities(c.env, auth.memberId))
+    const grants = auth.capabilities ?? (await resolveCapabilities(env, auth.memberId))
     const squadDept =
-      scopeType === 'squad' && scopeId ? await resolveSquadDepartment(c.env, scopeId) : null
+      scopeType === 'squad' && scopeId ? await resolveSquadDepartment(env, scopeId) : null
     // highest capability that resolves true on this scope = the actor's ceiling
     for (const cap of ['owner', 'admin', 'lead', 'member', 'observer'] as Capability[]) {
       if (hasCapability(grants, scopeType, scopeId, cap, squadDept ?? undefined)) {
@@ -404,6 +408,60 @@ export async function actorMaxRankOnScope(
     }
   }
   return max
+}
+
+export async function actorMaxRankOnScope(
+  c: Context<AppEnv>,
+  scopeType: CapabilityScopeType,
+  scopeId: string | null,
+): Promise<number> {
+  return actorRankOnScopeFor(c.env, c.get('auth'), scopeType, scopeId)
+}
+
+/**
+ * The TARGET's highest effective capability rank across EVERY scope they hold
+ * a grant on — not just the one scope a caller happens to be checking.
+ *
+ * mupot#1337's targetRankCeiling (src/members/index.ts) originally compared
+ * the target's row on ONE (scopeType, scopeId) only. mupot#1411 P0-1
+ * (kasra-review, 2026-09-15) found the resulting bypass on the member-bind
+ * invite path: a squad-admin invites `member_id` = an org OWNER onto their
+ * own (unrelated) squad at capability 'member'; the ceiling never looks at
+ * the owner's REAL standing (an org-scope or other-squad grant), the invite
+ * mints, and redeeming it from the victim's own Telegram id lets `/approve`
+ * etc. resolve through `memberForChat` AS the owner — an unbindable identity
+ * takeover (no route ever clears `members.telegram_chat_id`). The same class
+ * applies to every existing targetRankCeiling call site (suspend/reactivate,
+ * token mint, capability grant): a target's standing on ANY scope makes them
+ * a higher-ranked principal, not merely their standing on the one scope a
+ * particular action happens to touch.
+ */
+export async function targetMaxRankAcrossScopes(env: Env, targetMemberId: string): Promise<number> {
+  // Reuses resolveCapabilities — the SAME query every capability check in
+  // this file already runs (capabilities ∪ channel_capability_grants) —
+  // rather than a second, narrower hand-rolled query that could miss a
+  // grant plane the canonical resolver already knows about.
+  const grants = await resolveCapabilities(env, targetMemberId)
+  let max = 0
+  for (const grant of grants) {
+    max = Math.max(max, RANK[grant.capability])
+  }
+  return max
+}
+
+/**
+ * True when the target's real standing (targetMaxRankAcrossScopes) exceeds
+ * the acting principal's own rank — the shared predicate behind
+ * targetRankCeiling (HTTP) and every non-HTTP caller that needs the same
+ * "you cannot act on a principal who outranks you, anywhere" rule.
+ */
+export async function exceedsTargetRankCeiling(
+  env: Env,
+  targetMemberId: string,
+  actorRank: number,
+): Promise<boolean> {
+  const targetRank = await targetMaxRankAcrossScopes(env, targetMemberId)
+  return targetRank > actorRank
 }
 
 // ── surface-capability gate (#106) ────────────────────────────────────────────

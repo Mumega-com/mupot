@@ -1,17 +1,28 @@
 -- 0154_project_invite_member_bind.sql — bind a Telegram identity to an EXISTING
 -- member via a project invite, instead of always minting a net-new member.
 --
--- Additive, D1-safe: one nullable column plus an extension of 0152's own
+-- Additive, D1-safe: two nullable columns plus an extension of 0152's own
 -- joint-null trigger set (dropped and recreated, not a second copy of it) so a
 -- member_id invite still requires the full project field group (project_id,
 -- squad_id, pairing_hash, pairing_expires_at) — this is a project invite
 -- concept, never a legacy email invite. No UNION ALL, no backfill of existing
--- rows (member_id defaults NULL, matching every existing invite unchanged).
+-- rows (member_id and telegram_bound_at default NULL, matching every existing
+-- row unchanged).
+--
+-- members.telegram_bound_at: stamped ONLY by bindMemberStatement
+-- (src/members/project-invites.ts), with the claim's own unique-per-attempt
+-- timestamp, when a bind-existing-member invite's Telegram UPDATE actually
+-- lands — the bind-landed PROOF gating the capability grant and receipt
+-- completion, as opposed to a state test on telegram_chat_id (which a
+-- pre-existing, unrelated identity match could satisfy without this claim's
+-- own write ever having happened). Left NULL for members minted net-new
+-- (their telegram_chat_id is set at INSERT time, a different concept).
 
 ALTER TABLE invites ADD COLUMN member_id TEXT REFERENCES members(id);
+ALTER TABLE members ADD COLUMN telegram_bound_at TEXT;
 
-DROP TRIGGER validate_invites_project_pairing_insert;
-DROP TRIGGER validate_invites_project_pairing_update;
+DROP TRIGGER IF EXISTS validate_invites_project_pairing_insert;
+DROP TRIGGER IF EXISTS validate_invites_project_pairing_update;
 
 CREATE TRIGGER validate_invites_project_pairing_insert
 BEFORE INSERT ON invites
@@ -48,6 +59,13 @@ BEGIN
       AND length(trim(NEW.pairing_hash)) > 0
       AND length(trim(NEW.pairing_expires_at)) > 0
     );
+  -- mupot#1411 P3 (kasra-review, 2026-09-15): member_id is a bare TEXT column
+  -- with no CHECK of its own (unlike pairing_hash's hex-length check below) —
+  -- a whitespace-only value would pass every conjunct above (NOT NULL) yet
+  -- resolve to no real member anywhere. Refuse it at the trigger, the same
+  -- layer that already refuses whitespace-only project fields.
+  SELECT RAISE(ABORT, 'project invite member bind requires a non-blank member_id')
+  WHERE NEW.member_id IS NOT NULL AND length(trim(NEW.member_id)) = 0;
   SELECT RAISE(ABORT, 'project invite pairing hash must be 64 hex characters')
   WHERE NEW.pairing_hash IS NOT NULL
     AND (
@@ -99,6 +117,13 @@ BEGIN
       AND length(trim(NEW.pairing_hash)) > 0
       AND length(trim(NEW.pairing_expires_at)) > 0
     );
+  -- mupot#1411 P3 (kasra-review, 2026-09-15): member_id is a bare TEXT column
+  -- with no CHECK of its own (unlike pairing_hash's hex-length check below) —
+  -- a whitespace-only value would pass every conjunct above (NOT NULL) yet
+  -- resolve to no real member anywhere. Refuse it at the trigger, the same
+  -- layer that already refuses whitespace-only project fields.
+  SELECT RAISE(ABORT, 'project invite member bind requires a non-blank member_id')
+  WHERE NEW.member_id IS NOT NULL AND length(trim(NEW.member_id)) = 0;
   SELECT RAISE(ABORT, 'project invite pairing hash must be 64 hex characters')
   WHERE NEW.pairing_hash IS NOT NULL
     AND (

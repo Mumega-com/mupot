@@ -43,19 +43,26 @@ function makeEnv(options: {
           if (sql.includes('SELECT id, display_name FROM members')) {
             return { id: 'member-1', display_name: 'Operator' } as T
           }
-          // #1337: the mint route now consults the TARGET's existing capability
-          // before minting (targetRankCeiling — an org admin must not mint a
-          // token that authenticates AS a higher-ranked member). This stub is an
-          // exact-sequence allowlist, so the new lookup has to be declared here
-          // or every mint 500s.
-          //
-          // Returning null = "target holds no grant at org scope", which is the
-          // right fixture for THIS test: its subject is caching/referrer headers
-          // on a successful mint, not authorization. The ceiling itself is
-          // covered against the real migration chain in
-          // tests/members-agent-capability-route.test.ts.
-          if (sql.includes('SELECT capability FROM capabilities')) return null as T
           throw new Error(`unexpected first query: ${sql}`)
+        },
+        // mupot#1411 P0-1 (kasra-review, 2026-09-15): the mint route's
+        // targetRankCeiling now consults the TARGET's standing across EVERY
+        // scope (targetMaxRankAcrossScopes, via the SAME resolveCapabilities
+        // query every capability check reuses), not one (scope_type,
+        // scope_id) row via `.first()` — so the ceiling's own lookup is now
+        // an `.all()` call. This stub is an exact-sequence allowlist, so the
+        // new query shape has to be declared here or every mint 500s.
+        //
+        // Returning [] = "target holds no grant anywhere", which is the
+        // right fixture for THIS test: its subject is caching/referrer
+        // headers on a successful mint, not authorization. The ceiling
+        // itself is covered against the real migration chain in
+        // tests/members-agent-capability-route.test.ts.
+        async all<T>() {
+          if (sql.includes('SELECT member_id, scope_type, scope_id, capability') && sql.includes('FROM capabilities')) {
+            return { results: [] as T[] }
+          }
+          throw new Error(`unexpected all query: ${sql}`)
         },
         async run() {
           if (sql.includes('UPDATE invites SET accepted_at')) return { meta: { changes: 1 } }
