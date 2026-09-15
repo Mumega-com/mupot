@@ -247,6 +247,22 @@ Three distinct events are recorded **separately**, each idempotent on its own ke
   `processing`. This channel inherits that gap; it does not repair it. Reconcile by
   reading both the task status and the latest verdict row — a mismatch is an incident,
   not something to paper over by manufacturing a new decision.
+- **Invite minter re-check cannot see a session-role-only floor (round 6, mupot#1417).**
+  An invite's minter authority is re-derived fresh from D1 at redemption
+  (`currentMemberOrgRank`/`currentMemberSquadRank`, `src/members/project-invites.ts`) —
+  but a minting session's `auth.role` is folded into the actor's rank unconditionally at
+  mint time, with no requirement that it be backed by a `capabilities` row or a
+  `members.email -> users.role` bridge for that SAME member. A minter whose standing came
+  only from that unbridgeable session floor mints successfully and is refused at
+  redemption with no real change in authority. Proven by a dedicated test, not fixed.
+- **A squad owner's net-new `owner`-capability invite escalates the target's global rank
+  (round 6, mupot#1417).** The freshly-minted member becomes untouchable by every org
+  admin's target-rank ceiling (suspend, mint, capability grant/revoke, Telegram unbind) —
+  a real, narrow behavior change from before this slice existed. Not fixed.
+- **`members.email` is case-sensitive UNIQUE (round 6, F4, mupot#1418).** A case-variant
+  row can bridge to a role-plane rank it has no real standing for, becoming immune to an
+  org admin the same way a real owner is (denial-only, never an authority gain). Not
+  fixed — a follow-up issue tracks lowercasing `members.email` on write.
 
 ## Second-channel checklist (Slack, WhatsApp, email, SMS)
 

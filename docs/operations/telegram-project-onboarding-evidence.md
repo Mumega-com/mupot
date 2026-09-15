@@ -1628,3 +1628,216 @@ assigned); the `N2` row's proof note corrected — it supports only the self-exe
   receipts-immutable.test.ts file, 1 more M2 test added after the second full run —
   8075 + 17 = 8092), and one additional test FILE bringing the file count from 512 to
   513.
+
+## Round 6 (Athena gate `efdb0b08`, AMBER — no security block — + a parallel
+kasra-review adversarial addendum, 2026-09-15)
+
+Athena's round-5 gate closed all P0/P1s and returned AMBER: `F1` (docs describe a reverted
+shape), `F2` (an unverified test claim), `F3` (an incomplete minter re-check), `F4`
+(disclose a case-sensitivity gap), `F5` (LOW, one bridge hop untested), `F6` (four
+mechanical corrections). Before this round's push, kasra-review ran a parallel adversarial
+pass on the SAME head and reshaped F3 into three concrete, executable findings (P1-A,
+P1-B, P2) that Athena's own gate comment had not enumerated at that granularity.
+
+### F1 — `docs/architecture/human-decision-channel-contract.md` described a reverted shape
+
+The doc's clause (a) still read "both sides of that comparison are the SAME
+global-standing function" — round 4's shape, reverted by round 5's A1 fix (see the
+`exceedsTargetRankCeiling` docstring in `src/auth/capability.ts`, which documents its own
+history). Clause (g) had no mention of round 5's self-unbind addition; the header still
+said "round 4". Two SQL-placeholder citations (`?8`, `?12`) did not match the actual
+compiled SQL, which uses bare `?` throughout (D1/SQLite positional binding). All four
+corrected in place; the doc's own "Known gaps" clause (g) also now names all three round-6
+disclosed gaps (F3's session-role-only minter, F3's squad-owner escalation, F4's
+case-sensitivity) so a future reader of that doc alone — not just this evidence doc or the
+PR body — sees them.
+
+### F2 — the round-5 "M2" test does not test what it claims
+
+`tests/members-agent-capability-route.test.ts`'s M2 test sends a B1-zeroed session
+(`capabilities: []`) at the suspend route and asserts 403. Its OWN comment already states
+this is refused at `requireCapability(orgScope, 'admin')` — BEFORE `exceedsTargetRankCeiling`
+is ever called — so mutating `exceedsTargetRankCeiling`'s actor side back to a DB
+role-plane read (the pre-A1 bug) does NOT flip this test; it was never exercising that
+code path. Verified directly: reintroduced the mutation
+(`Math.max(actorRankOnScopeFor(...), await targetMaxRankAcrossScopes(env, auth.memberId ?? ''))`
+as the actor-rank computation) and ran the full file — 4 failures, none of them M2 itself.
+
+Rather than only correct the claim, added a SECOND test
+(`F2/M2 — exceedsTargetRankCeiling's actor side never re-derives rank from a DB
+role-plane row...`) using a session that legitimately holds an org-scope `admin`
+CAPABILITY GRANT (passes `requireCapability` on the real predicate, not the B1 floor) whose
+bridged email ALSO matches a `users.role = 'owner'` row. Targeting `OWNER_MEMBER` (a real
+org-scope `owner` CAPABILITY grant, rank 5, independent of the role plane so this test does
+not depend on A2's fixture) — the actor must be measured at rank 4 (their capability grant),
+never 5 (what a DB role-plane read would produce), so the suspend is refused (403). Mutating
+the actor side back to the old DB-read shape flips this test RED (confirmed: same mutation
+as above, this specific test — not just the file — fails). The original M2 test's honest
+limitation is KEPT (not deleted) since it still documents a true, if narrower, fact.
+
+### F3 — reshaped by the kasra-review adversarial addendum: three holes, not one
+
+The round-5 minter-authority-loss check
+(`minterRank < capabilityRank(invite.capability)`, gated on `invite.member_id !== null`)
+had three gaps the adversarial addendum named as P1-A/P1-B/P2:
+
+- **P1-A.** The TARGET's standing was checked at mint (`exceedsTargetRankCeiling`) but
+  never re-derived at redemption. PROVEN: minted a member-bind invite for `member-existing`
+  at capability `member`; after minting, granted `member-existing` an org-scope `owner`
+  capability row (simulating a promotion in the invite's lifetime); redeemed — under the
+  round-5 code this SUCCEEDED (the only check was capability-vs-minter-rank, and `member`
+  ≤ the minter's rank 4). Fixed by recomputing `targetMaxRankAcrossScopes(env,
+  invite.member_id)` against the minter's current rank at redemption, self-exempt when
+  `invite.minted_by_member_id === invite.member_id`.
+- **P1-B.** The old check alone missed the BASELINE admin-or-above authority
+  `createProjectInvite` actually requires (`actorRank >= capabilityRank('admin')`,
+  unconditional, both invite shapes). PROVEN: minted a member-bind invite at capability
+  `observer`; demoted the minter's org capability to `observer` (rank 1); redeemed — the
+  old check (`1 < capabilityRank('observer')` = `1 < 1` = false) let it through. Fixed by
+  re-checking `minterRank >= capabilityRank('admin')` unconditionally, independent of the
+  invite's own capability.
+- **P2.** The net-new (`email`) path had this check gated OUT entirely
+  (`invite.member_id !== null && ...`) — PROVEN: `createInvite()`'s minter (`member-inviter`,
+  squad-admin) demoted to `observer` on the invited squad after minting; redemption still
+  succeeded under round-5 code (no check ran at all for this path). Fixed with a new
+  `currentMemberSquadRank(env, memberId, squadId)` helper (mirrors `actorRankOnSquad`'s own
+  grant-loop, including department inheritance) and the SAME active + baseline-rank +
+  capability-ceiling predicate, scoped to the invite's squad instead of the org.
+
+New tests (all executed, all initially RED against the round-5 code before this round's
+fix, confirmed GREEN after):
+`refuses redemption when the TARGET is promoted to org owner between invite creation and
+claim (round 6 P1-A)`,
+`refuses redemption when the MINTER is demoted below admin, even for an
+'observer'-capability invite the old check could not see (round 6 P1-B)`,
+`still allows redemption when the minter member-binds THEMSELVES — self-exempt from the
+target-promotion ceiling (round 6 P1-A)`,
+`refuses redemption when the NET-NEW invite MINTER is demoted below squad-admin between
+invite creation and claim (round 6 P2)`,
+`refuses redemption when the NET-NEW invite MINTER is suspended between invite creation
+and claim (round 6 P2)`,
+`still allows redemption when the NET-NEW invite minter's standing is a DEPARTMENT-level
+grant, not a direct squad grant (round 6 P2, currentMemberSquadRank department
+inheritance)`.
+
+**Collateral fixture gap, same class as round 5's own finding:** adding the net-new
+minter re-check immediately broke ALL 9 pre-existing net-new redemption tests in
+`tests/telegram-project-onboarding.test.ts`'s `Telegram project invitation service`
+describe block, plus 2 in `tests/im-webhook-idempotency.test.ts` — both fixtures'
+`inviterAuth`/`invite()` fed squad-admin standing only through the session's
+`auth.capabilities` array, with NO backing `capabilities` row in the DB, exactly the
+pattern round 5 already found and fixed for the member-bind describe block's own minter
+(`member-bind-owner`). Fixed by adding the real row to both fixtures; one downstream
+assertion in `im-webhook-idempotency.test.ts` that counted ALL `capabilities` rows had to
+be narrowed to exclude `inviter-member`'s own new row (same shape as its existing
+`members`-table exclusion for the same reason).
+
+**Disclosed, not fixed (F3 residuals) — both filed as mupot#1417:**
+1. The re-check is only as good as what is D1-derivable for the minter's `member_id`. A
+   minting session's `auth.role` is folded into the actor's rank UNCONDITIONALLY at mint
+   time (`actorRankOnScopeFor`), with no requirement that it be backed by a `capabilities`
+   row or a `members.email -> users.role` bridge for that SAME member. PROVEN: a member
+   with NO capabilities row and NO matching `users` row, given a session with
+   `role: 'owner'`, mints a member-bind invite successfully (mint-time rank 5, from
+   `auth.role` alone) — redemption then computes `currentMemberOrgRank` = 0 (nothing on
+   either D1 plane) and refuses `invite_minter_authority_lost`, a real minter with
+   unchanged authority losing their own invite. Test:
+   `mints via a SESSION-ROLE-ONLY minter (auth.role floor with no backing D1 row) but
+   redemption then refuses — documented gap, not fixed this round`.
+   The `currentMemberOrgRank` docstring's prior claim that it computes "the SAME quantity"
+   as `actorRankOnScopeFor` for a live session is corrected — true only when the session's
+   role was itself sourced from THIS member's own bridged `users` row.
+2. A net-new invite minted at capability `owner` by a squad owner (permitted) mints a
+   member whose GLOBAL rank (`targetMaxRankAcrossScopes`) is then 5, making that member
+   untouchable by every org admin's target-rank ceiling on all five gated actions — a
+   real, narrow behavior change from `main`. Not exercised by a new test this round (no
+   code path to fix, only to disclose); named in the runbook and PR body.
+
+### F4 — `members.email` case-sensitive UNIQUE (disclosed, filed as mupot#1418)
+
+`migrations/0002_members.sql:8` — `email TEXT UNIQUE` is SQLite's default case-sensitive
+comparison. `migrations/0146_members_email_lower_index.sql` adds
+`idx_members_email_lower`, a non-unique functional index for query performance
+(`WHERE lower(email) = ?` avoiding a full table scan) — confirmed by reading the migration
+file itself, which states this purpose explicitly and creates a plain `INDEX`, not a
+`UNIQUE INDEX`. Two `members` rows differing only in casing can coexist; a case-variant row
+(creatable via the net-new invite path, which does not lowercase caller-supplied `email`)
+inherits whatever role-plane rank its casing bridges to under `targetLegacyRoleRank`'s
+`lower()` comparison — denial-only (a variant row becomes immune to an org admin), never an
+authority gain (nothing grants the variant row MORE than the bridge would grant a
+correctly-cased one). No code change; disclosed in the runbook, PR body, and this doc.
+
+### F5 — users-side `lower()` had no discriminating fixture (closed)
+
+A2's own fixture (`MIXED_CASE_MEMBERS_EMAIL = 'Bootstrap-Owner@Example.Test'`,
+`MIXED_CASE_USERS_EMAIL = 'bootstrap-owner@example.test'`) only exercises the MEMBERS-side
+`lower()` call in `targetLegacyRoleRank` — the users-side query
+(`WHERE lower(email) = ?1`) is satisfied trivially since every existing `users` fixture row
+in the suite is already all-lowercase. VERIFIED: removed the users-side `lower()` (
+`WHERE email = ?1` against the already-lowercased bind parameter) and ran the full A2 test
+— it stayed GREEN (as expected, since `?1` bound value is `lower(members.email)`, which
+happens to already equal the lowercase `users.email` in that fixture). Added a NEW fixture
+(`USERS_SIDE_MIXED_CASE_MEMBERS_EMAIL` all-lowercase, `USERS_SIDE_MIXED_CASE_USERS_EMAIL`
+mixed-case) and test (`F5 — refuses an admin SUSPENDING a member whose users.email differs
+only in CASE from members.email (users-side lower())`) — confirmed this ONE goes RED with
+the same mutation (`lower()` removed from the users-side query), restored, confirmed GREEN.
+
+### F6 — mechanical corrections
+
+Runbook's 0154 pre-flight line named only `invites.member_id` and `members.telegram_bound_at`
+of the migration's four additions; now names all four (`invites.minted_by_member_id`,
+`telegram_unbind_receipts` too). This PR body's own citation of the member-bind invite
+route as `POST /members/:id/invites` was never the real mounted route — verified against
+`src/index.ts:107` (`app.route(ROUTES.members, membersApp)`), `src/types.ts:911`
+(`members: '/api/members'`), and `src/members/index.ts:486` (`membersApp.post('/invites', ...)`) —
+corrected to `POST /api/members/invites`. The PR body's own internal count
+self-inconsistency ("354/354" stated, then "not counted in the 353 above" two paragraphs
+later) corrected to 354.
+
+### kasra-review adversarial addendum LOW items, folded in before push
+
+- **`INSERT OR REPLACE` bypasses the append-only DELETE trigger under
+  `recursive_triggers=off`.** SQLite's `REPLACE` conflict-resolution algorithm deletes a
+  pre-existing conflicting row to make room for the new one; per SQLite's own
+  documentation, that internal delete only fires DELETE triggers when
+  `recursive_triggers` is enabled (off by default in SQLite/D1). `grep`-verified this
+  codebase's own write path to `telegram_unbind_receipts` never issues `INSERT OR
+  REPLACE` (only the plain `INSERT ... SELECT ... WHERE changes() = 1` in
+  `src/members/index.ts`), so nothing here is exposed today. Disclosed via a migration
+  comment for any future caller; not fixed (would need either a pot-wide
+  `recursive_triggers` pragma change, broader blast radius than this one table, or a
+  new INSERT-time existing-id guard trigger).
+- **`actor_id NOT NULL` admitted an empty or whitespace-only string.** Added
+  `CHECK (length(trim(actor_id)) > 0)` to `telegram_unbind_receipts` (still-unshipped
+  migration 0154, edited directly) plus a test
+  (`REFUSES an empty or whitespace-only actor_id`). VERIFIED: removed the CHECK, ran
+  the test — failed (insert succeeded instead of throwing); restored, confirmed GREEN.
+
+### Verification
+
+- `npm run typecheck`: clean, rerun after every code change this round.
+- `node scripts/gen-schema-chain.mjs` rerun after the `actor_id` CHECK addition;
+  `check-schema-chain-fresh.mjs` green.
+- All 8 local CI-parity scripts green: `check-branch-staleness`, `check-mcp-tool-seam`,
+  `check-migration-numbering` (0154 still sorts above `origin/main` head 0153),
+  `check-operator-counts-source`, `check-schema-chain-fresh`, `check-test-schema-source`,
+  `no-secrets`, `release-truth-policy`.
+- Round 5's same 11 focused files, run combined: **364/364** (up from 354 — 10 new tests
+  this round: 2 in `members-agent-capability-route.test.ts`, 7 in
+  `telegram-project-onboarding.test.ts`, 1 in `telegram-unbind-receipts-immutable.test.ts`).
+- `tests/im-webhook-idempotency.test.ts`: 29/29, unchanged count (fixture-only fix).
+- Full suite (`npm test`, all files, default worker parallelism, one run this round —
+  driven directly by this round's fixes/tests, no re-roll needed): exit 0, **513 files,
+  8102 tests, 0 failed, 766.65s wall time**. Reconciles exactly to round 5's 8092 + 10 new
+  tests this round = 8102, on the same 513 files as round 5 (no new test FILES added this
+  round, unlike round 5's +1 file).
+- Every new predicate in this round mutation-tested directly against the compiled source
+  (edit with `sed`/`python3` → run the targeted test(s) → confirm RED → `git checkout --`
+  → confirm `git diff --stat` empty before the next mutation): the P1-A target-outgrew-
+  minter term, the P1-B baseline-admin-rank term, the P2 gate condition
+  (`invite.minted_by_member_id !== null`), the P2 active-status term, the self-exemption
+  term (caught only after replacing the first self-mint fixture — equal target/minter
+  rank — with one where the target's GLOBAL rank genuinely exceeds the minter's ORG-LOCAL
+  rank), `currentMemberSquadRank`'s department-inheritance branch, the reintroduced
+  actor-side DB role-plane read in `exceedsTargetRankCeiling` (F2), the users-side
+  `lower()` in `targetLegacyRoleRank` (F5), and the `actor_id` CHECK constraint.

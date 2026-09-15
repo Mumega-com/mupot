@@ -119,7 +119,7 @@ See `docs/architecture/human-decision-channel-contract.md` clause (g) and the
 at capability `owner` by a squad owner (permitted — capability at or below the minter's own
 rank) mints a member whose GLOBAL rank is then 5. Every org admin's target-rank ceiling (the
 five gated actions above) then refuses to act on that member — a real, if narrow, behavior
-change from before this slice existed. Not fixed this round; tracked as a follow-up issue.
+change from before this slice existed. Not fixed this round; tracked as mupot#1417.
 
 **Known, disclosed gap — `members.email` is a case-sensitive UNIQUE column (F4, round 6):**
 `members.email TEXT UNIQUE` (migration `0002`) is exact-match unique; migration `0146`'s
@@ -129,7 +129,7 @@ not a uniqueness guarantee. Two `members` rows differing only in email casing (e
 the net-new invite path inherits whatever role-plane rank its casing happens to bridge to
 under `lower()` (this is a DENIAL-only risk, never an authority gain — see A2 above — but it
 does make that variant row IMMUNE to an org admin the same way the real owner is). No code
-change this round; a follow-up issue tracks lowercasing `members.email` on write (or adding a
+change this round; mupot#1418 tracks lowercasing `members.email` on write (or adding a
 functional UNIQUE index on `lower(email)`) to remove the possibility of the variant existing
 at all.
 
