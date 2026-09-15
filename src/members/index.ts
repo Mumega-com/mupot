@@ -811,9 +811,31 @@ membersApp.delete(
 // revoke, capabilities revoke). Same authority as the mint, checked the same
 // way: an admin cannot unbind a principal who outranks them either — that
 // would itself be an act ON a higher-ranked target.
+//
+// mupot#1411 P2 round 5 (kasra-review adversarial addendum, 2026-09-15): a
+// member-bind invite (project-invites.ts) attaches a Telegram identity to an
+// EXISTING member — the person it lands on had no say in it, and until now
+// had NO way to detach their OWN identity without going through an org
+// admin. Honest framing: unbind is BOTH a remedy for that victim AND, in an
+// admin's hands, a takeover-enabler already inside the admin envelope this
+// same round's A1/A2 harden — nothing here widens what an ADMIN can do.
+// requireAdminOrSelfForTelegramUnbind lets the target unbind THEMSELVES with
+// no capability check at all (never a route an org admin needed to gate —
+// self-action, same class as N2's self-exemption in exceedsTargetRankCeiling
+// below), and falls back to the existing admin + targetRankCeiling path for
+// everyone else.
+const requireAdminOrSelfForTelegramUnbind: MiddlewareHandler<AppEnv> = async (c, next) => {
+  const auth = c.get('auth')
+  if (auth?.memberId && auth.memberId === c.req.param('id')) {
+    await next()
+    return
+  }
+  return requireCapability(orgScope, 'admin')(c, next)
+}
+
 membersApp.delete(
   '/members/:id/telegram',
-  requireCapability(orgScope, 'admin'),
+  requireAdminOrSelfForTelegramUnbind,
   async (c) => {
     const memberId = c.req.param('id')
 

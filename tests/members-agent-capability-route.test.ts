@@ -696,6 +696,55 @@ describe('DELETE /members/:id/telegram — round 4 (P1-A tenant fence, P2-B/C re
     })
   }
 
+  // P2 round 5 (kasra-review adversarial addendum, 2026-09-15): a bind
+  // victim (the target of an admin's member-bind invite, never asked) had
+  // NO way to detach their OWN Telegram identity without going through an
+  // org admin. requireAdminOrSelfForTelegramUnbind's self branch now lets
+  // them unbind THEMSELVES with no capability check at all.
+  it('P2 — a member with NO capability grants can unbind their OWN telegram identity', async () => {
+    authState.current = {
+      userId: 'unbind-target-a-user',
+      email: 'unbind-target-a@example.test',
+      role: 'member',
+      tenant: TENANT_A,
+      memberId: TARGET_A,
+      capabilities: [],
+    } as AuthContext
+
+    const res = await membersApp.fetch(unbindRequest(TARGET_A), env)
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toEqual({ member_id: TARGET_A, telegram_unbound: true })
+    expect(harness.sqlite.prepare('SELECT telegram_chat_id FROM members WHERE id = ?').get(TARGET_A))
+      .toEqual({ telegram_chat_id: null })
+    const receipt = harness.sqlite.prepare(
+      'SELECT actor_id FROM telegram_unbind_receipts WHERE member_id = ?',
+    ).get(TARGET_A)
+    expect(receipt).toEqual({ actor_id: TARGET_A })
+  })
+
+  it("P2 — still refuses (403) a non-admin member unbinding SOMEONE ELSE's telegram identity", async () => {
+    const OTHER_TARGET = 'member-unbind-other-target'
+    harness.sqlite.exec(`
+      INSERT INTO members (id, display_name, status, tenant, telegram_chat_id, telegram_bound_at)
+        VALUES ('${OTHER_TARGET}', 'Other Target', 'active', '${TENANT_A}', '9500999', '2026-09-14T00:00:00.000000Z');
+    `)
+    authState.current = {
+      userId: 'unbind-target-a-user',
+      email: 'unbind-target-a@example.test',
+      role: 'member',
+      tenant: TENANT_A,
+      memberId: TARGET_A,
+      capabilities: [],
+    } as AuthContext
+
+    const res = await membersApp.fetch(unbindRequest(OTHER_TARGET), env)
+
+    expect(res.status).toBe(403)
+    expect(harness.sqlite.prepare('SELECT telegram_chat_id FROM members WHERE id = ?').get(OTHER_TARGET))
+      .toEqual({ telegram_chat_id: '9500999' })
+  })
+
   it('P1-A — refuses (member_not_found, same as nonexistent) a tenant-A admin unbinding a tenant-B member', async () => {
     const res = await membersApp.fetch(unbindRequest(TARGET_B), env)
 
