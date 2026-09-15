@@ -1369,7 +1369,10 @@ including that they agree with EACH OTHER, not merely with the fixture.
   `tests/squad-member-tools.test.ts`, `tests/agent-self-update.test.ts`,
   `tests/flight-routes.test.ts`, `tests/members-capability-sqlite.test.ts`,
   `tests/org-admin-capability-gate.test.ts`, `tests/surface-caps.test.ts` — 10 files,
-  335/335 combined.
+  335/335 combined. **A5 correction (Athena final-gate, round 5, 2026-09-15): this count
+  was undercounted — a re-tally of the same 10 files at this round's head is 337, not
+  335. Left as originally written above rather than silently edited; this note is the
+  honest correction, not a rewrite of what round 4 actually claimed.**
 - All 8 local CI-parity scripts green: `check-schema-chain-fresh`,
   `check-migration-numbering` (0154 still sorts above `origin/main` head 0153),
   `check-test-schema-source` (26/127 baselines unchanged — no new mock-DB files, only
@@ -1377,14 +1380,17 @@ including that they agree with EACH OTHER, not merely with the fixture.
   users` queries `targetLegacyRoleRank` introduces), `check-mcp-tool-seam`,
   `check-operator-counts-source`, `check-branch-staleness`, `release-truth-policy` (4
   docs scanned), `no-secrets`.
-- Mutation table (14 mutations, all executed for real via `sed`/`python3` source
+- Mutation table (**A5 correction, Athena final-gate round 5, 2026-09-15: the table below
+  has 12 rows (M1-M4b, M6-M12 — M5 was never assigned; the "14 mutations" claim in this
+  bullet was wrong and is left as originally written, corrected here rather than
+  silently edited), all executed for real** via `sed`/`python3` source
   mutation → rerun the specific test(s) → confirm RED → `git checkout --` restore →
   confirm `git diff --stat` empty before the next mutation):
 
 | # | Item | Mutation | Result |
 | --- | --- | --- | --- |
 | M1 | P0-A | drop `targetLegacyRoleRank` fold in `targetMaxRankAcrossScopes` | RED (4 tests) |
-| M2 | N2 self-exempt | drop the `auth.memberId === targetMemberId` line | RED (telegram self-bind test); honest non-kill on the DB-synced self-fixture (documented as an isolating pair, not a gap) |
+| M2 | N2 self-exempt | drop the `auth.memberId === targetMemberId` line | RED (telegram self-bind test); honest non-kill on the DB-synced self-fixture (documented as an isolating pair, not a gap). **A5 correction: this row's proof supports ONLY the self-exemption, which survived round 5 unchanged — it does NOT validate the "both sides global" comparison this same round introduced, which round 5's A1 found to be the escalation (see round 5 section below). The self-exemption's real regression proof going forward is round 5's own A1 test set (`members-agent-capability-route.test.ts`, `A1 —` tests), not this row.** |
 | M3 | N2 precedence | `actorMaxRankAcrossScopes` always calls `resolveCapabilities` (drops `auth.capabilities ??`) | RED (P0-1c) |
 | M4a | P1-A SELECT | drop unbind SELECT's tenant conjunct | GREEN on the bound-target test (UPDATE's own fence covers it) — reported, not hidden |
 | M4b | P1-A SELECT | same mutation, unbound-target test | RED (existence oracle) |
@@ -1409,3 +1415,197 @@ test). M8(N1) → `members-agent-capability-route.test.ts` (`N1` test). M9 →
 
 - **Full suite (`npm test`, all files, default worker parallelism, run once, host load
   average ~1.2-2.4 at start): exit 0, 512 files, 8075 tests, 0 failed, 469s wall time. Reconciles exactly with round 3's 8058 + 17 new tests this round (6 in telegram-project-onboarding.test.ts, 11 in members-agent-capability-route.test.ts).**
+
+## Round 5 (Athena final-gate BLOCK on head `35aeefef` + kasra-review adversarial addendum, 2026-09-15)
+
+Athena's final-gate comment on the PR found A1 and A2 as NEW P0s (round 4's own fix
+direction on A1 was itself wrong); a parallel kasra-review adversarial pass on the same
+head (`35aeefef`) found five more items (two P1s, two P2s, one M2/M12 survivor pair) that
+were folded in before push per this round's brief.
+
+### A1 (P0) — round 4's actor-side globalisation was itself the escalation
+
+`exceedsTargetRankCeiling`'s actor side was `actorMaxRankAcrossScopes(env, auth)` —
+maxed over EVERY scope the actor holds a grant on, violating `capability.ts`'s own stated
+invariant ("grants never bubble UP"; an org grant bubbles DOWN to cover every squad, but a
+squad grant never bubbles UP to satisfy an org-scope check). Reproduced against round 4's
+code: an org admin (org-scope rank 4) who ALSO held `owner` on one unrelated squad —
+
+- minted a token AS the (unrelated) org owner: **201** (should refuse)
+- suspended the owner: **200** (should refuse)
+- revoked the owner's org capability row: **200, `removed:1`** (should refuse)
+
+Fix: actor side reverted to `actorRankOnScopeFor(env, auth, 'org', null)` — org-scope-local,
+matching what every one of the five call sites already proves before reaching this ceiling
+(all five are `requireCapability(orgScope, 'admin')`-gated, or the member-bind invite path's
+own equivalent check). The self-exemption (`auth.memberId === targetMemberId` → not
+exceeded) is untouched — it alone closes round 4's self-action-lockout finding (N2), and
+does not depend on which quantity either side computes. `actorMaxRankAcrossScopes` deleted;
+grepped for any other caller — none.
+
+New tests (`members-agent-capability-route.test.ts`, describe block
+`POST /members/:id/capabilities — target-rank ceiling (#1337)`): an actor with org-scope
+`admin` AND squad-scope `owner` on an unrelated squad, acting on the REAL org owner (a
+DIFFERENT member, not themselves) —
+- `A1 — refuses this actor SUSPENDING the real org owner` (was 200)
+- `A1 — refuses this actor MINTING A TOKEN for the real org owner` (was 201)
+- `A1 — refuses this actor REVOKING the real org owner's org capability row` (was 200 removed:1)
+
+Mutation (executed for real): replaced the actor-side call with `Promise.resolve(5)`
+(simulating the round-4 inflation) → all three A1 tests RED with the exact round-4 symptom
+status codes (200/201/200); the pre-existing `N2` self-target test stayed GREEN under the
+same mutation, confirming the self-exemption path is independent of this change. Restored,
+confirmed `git diff --stat` empty, reran green.
+
+### A2 (P0) — `targetLegacyRoleRank`'s email bridge compared exact case
+
+`members.email → users.email` used exact-case comparison on both hops; every OTHER email
+bridge in this codebase (`auth/index.ts:1285`, `sso.ts:114`,
+`resolve-human-member.ts:158,169`, migration 0146) is `lower()`. A `members.email` stored
+with different casing than its `users.email` counterpart bridged to NOTHING, silently
+returning legacy rank 0 — an org admin could suspend/mint-for/grant-on a target whose real
+role-plane rank (via a differently-cased email) was actually `owner`.
+
+Fix: `SELECT lower(email) AS email FROM members ...` on the first hop,
+`SELECT role FROM users WHERE lower(email) = ?1` on the second — either hop being
+differently-cased now bridges correctly.
+
+New tests: `A2 — refuses an admin SUSPENDING a member whose members.email differs only in
+CASE from users.email` and the equivalent MINTING test, using
+`members.email = 'Bootstrap-Owner@Example.Test'` against `users.email =
+'bootstrap-owner@example.test'` (legacy rank 5, org owner).
+
+Mutation: reverted both `lower()` calls → both new tests RED (200/201 instead of 403).
+Restored, confirmed clean, reran green.
+
+Collateral: two OTHER test files stub this exact query by SQL-substring match
+(`members-capability-service.test.ts`, `members-sensitive-response.test.ts`) —
+`sql.includes('SELECT email FROM members')` no longer matched the new `lower(email)` SQL
+text; updated both stubs to `sql.includes('FROM members') && sql.includes('lower(email)')`.
+
+### A8 — unbind clearing UPDATE + receipt INSERT were non-atomic
+
+Two separate `.run()` calls; a receipt-side failure (or a crash between the two) left the
+Telegram binding cleared with no durable trace of who did it. Now one atomic `DB.batch()`,
+with the receipt INSERT as `INSERT ... SELECT ?1, ?2, ?3, ?4, ?5, ?6 WHERE changes() = 1` —
+the same cross-statement idiom this codebase already uses in migrations
+0071/0134/0135's triggers and `flight-spine/receipts.ts`'s own atomic-audit guard — so a
+TOCTOU-raced 0-row UPDATE (the pre-existing `telegram_chat_id = ?3` conjunct) never writes a
+receipt for a clearing that never happened. The batch result is asserted with
+`assertWritten` (already imported for `assertBatchWritten` elsewhere in this file).
+
+New test: `A8 — a failed receipt write leaves the binding intact (clearing UPDATE + receipt
+INSERT are atomic)` — mocks `crypto.randomUUID()` to a fixed value, pre-inserts a receipt
+row with that same id (forcing a real PRIMARY KEY violation on the conditional INSERT), and
+asserts the clearing UPDATE did NOT survive (row unchanged) — proving atomicity, not merely
+that a successful unbind writes a receipt (which a separate, pre-existing test already
+covered).
+
+Mutation: reverted to two separate `.run()` calls (receipt INSERT unconditional VALUES,
+after the UPDATE) → the new test went RED — `telegram_chat_id` was `null` (the UPDATE had
+landed) despite the receipt INSERT throwing on the forced PK collision, reproducing exactly
+the phantom-success class this fix closes. Restored, confirmed clean, reran green.
+
+### kasra-review adversarial addendum on head `35aeefef` (parallel pass, folded in before push)
+
+- **P1 — `POST /members/:id/capabilities`'s member lookup unscoped by tenant.** Same
+  `#1330` F2 class already closed on suspend/mint/unbind in this file — `SELECT id FROM
+  members WHERE id = ?` alone let a tenant-A admin grant/revoke a capability on a tenant-B
+  member. Fenced with the identical `(tenant = ?2 OR tenant IS NULL)` predicate. New test:
+  `P1 round 5 — refuses (member_not_found) a tenant-A admin GRANTING a capability on a
+  tenant-B member`. Mutation: reverted the fence → RED (201 instead of 404). Restored,
+  confirmed clean.
+- **P1 — `telegram_unbind_receipts` claimed append-only, carried no trigger.** The
+  migration's own comment cited `oauth_consent_receipts`' (0091) append-only precedent but
+  never added the matching `BEFORE UPDATE`/`BEFORE DELETE` `RAISE(ABORT)` trigger pair — a
+  forged `actor_id` UPDATE or an outright DELETE both silently succeeded against the schema
+  as it actually shipped. Added directly to migration 0154 (still unshipped anywhere).
+  New file `tests/telegram-unbind-receipts-immutable.test.ts` (3 tests: accepts an insert,
+  refuses an UPDATE, refuses a DELETE) run against the REAL migration chain
+  (`applyAllMigrations`), same pattern as `gate-owner-reassign-immutable.test.ts`.
+- **M12 — the clearing UPDATE's own tenant fence was untested independently of the
+  SELECT's.** Every existing cross-tenant test reached the UPDATE only via a SELECT that
+  already filtered the row out, so a mutation removing JUST the UPDATE's own tenant
+  conjunct was never independently exercised. New test stubs ONLY the SELECT statement (by
+  exact SQL-text match) to return a fabricated fence-bypassed row for a real tenant-B
+  target, while every other statement — including the real UPDATE and INSERT, inside the
+  real `DB.batch()` — runs against the actual sqlite database; asserts the real row
+  survives untouched. This is a genuine defense-in-depth proof, not merely duplicated
+  coverage of the SELECT's own fence (which has its own separate test).
+- **P2 — self-unbind.** A member-bind invite attaches Telegram to an existing member
+  without their say; until this round they had no way to detach it themselves without an
+  org admin. `requireAdminOrSelfForTelegramUnbind` now lets `DELETE /members/:id/telegram`
+  pass with NO capability check when the caller targets themselves, falling back to the
+  existing admin + ceiling path otherwise. Framed honestly in the runbook as both a remedy
+  for the bind victim and, in an admin's hands, still the same takeover-enabler the admin
+  envelope already covers — nothing widens what an admin can do. Two new tests (self-unbind
+  succeeds with zero capabilities; a non-admin still cannot unbind SOMEONE ELSE). Mutation:
+  reverted the self branch to always fall through to `requireCapability` → the self-unbind
+  test went RED (403 instead of 200). Restored, confirmed clean.
+- **P2 — invite capability cannot outlive the minter's authority.** `invites` gained an
+  additive `minted_by_member_id` column (0154); `createProjectInvite` stores
+  `auth.memberId ?? null`. At redemption, a new `currentMemberOrgRank` helper re-derives the
+  minter's CURRENT org-scope standing fresh from D1 (the SAME quantity
+  `actorRankOnScopeFor` computes for a live session) and refuses
+  (`invite_minter_authority_lost`, collapsed into the existing generic chat reply) when it
+  no longer covers the invite's capability, or the minter is no longer active. Only runs
+  when `minted_by_member_id` is non-NULL — a pure legacy web-login minter's role-plane rank
+  is immutable in this schema (no route ever changes `users.role`), so there is nothing to
+  re-check for them, and no regression versus before this column existed. Two new tests
+  (demoted minter refused, suspended minter refused) plus a no-regression test (minter
+  retains authority → redemption still succeeds). Mutation: removed the check entirely →
+  both authority-loss tests went RED (`ok: true` instead of the refusal). Restored,
+  confirmed clean.
+  - **Collateral fixture gap found and fixed:** the "bind existing member" describe block
+    fed the creating actor's org-admin standing directly as `auth.capabilities` (simulating
+    an already-resolved session) with NO matching row in the `capabilities` table —
+    harmless before anything read it back from the database, but this round's redemption
+    check does exactly that. One line added to the shared `beforeEach` (a real
+    `capabilities` row for `member-bind-owner`) recovered all 12 tests in that describe
+    block that had gone red from this collateral effect.
+  - **Second collateral gap, found only by running the FULL suite (not caught by any
+    focused suite):** `tests/im-webhook-idempotency.test.ts`'s `invite()` fixture used a
+    synthetic `auth.memberId` (`'inviter-member'`) with NO backing `members` row — the new
+    `minted_by_member_id` column `REFERENCES members(id)`, so this threw a real FOREIGN KEY
+    constraint violation. Fixed by inserting the member row (matching every real inviter,
+    which never has a memberId without a backing row) and narrowing one broad
+    `SELECT ... FROM members` assertion (which expected exactly one row) to exclude the new
+    fixture row.
+
+### A5 corrections to round 4's evidence
+
+Applied as inline annotations in the round-4 section above rather than silent edits:
+round 4's "335/335 combined" focused-suite count corrected to 337; the mutation table's
+"14 mutations" bullet corrected — the table has 12 rows (M1-M4b, M6-M12; M5 was never
+assigned); the `N2` row's proof note corrected — it supports only the self-exemption
+(which survived round 5 unchanged), not the actor-globalisation round 5's A1 found wrong.
+
+### Verification
+
+- `npm run typecheck`: clean, rerun after every code change this round.
+- The same 10 files round 4 tracked, plus the new receipts-immutability file — 11 files,
+  **353/353 combined** (337 round-4 baseline, corrected, + 16 new this round):
+  `members-agent-capability-route.test.ts` (34/34, up from 24 — 10 new: 3×A1, 2×A2,
+  1×P1-tenant-fence, 1×M12, 1×A8, 2×self-unbind), `telegram-project-onboarding.test.ts`
+  (99/99, up from 96 — 3 new: 2×minter-authority-loss, 1×no-regression),
+  `tests/telegram-unbind-receipts-immutable.test.ts` (new file, 3/3),
+  `members-capability-service.test.ts`, `members-sensitive-response.test.ts`,
+  `squad-member-tools.test.ts`, `agent-self-update.test.ts`, `flight-routes.test.ts`,
+  `members-capability-sqlite.test.ts`, `org-admin-capability-gate.test.ts`,
+  `surface-caps.test.ts`.
+- **Separately** (not part of the 353 above — a different file, touched only for a
+  fixture-schema regression, not new coverage for this round's own items):
+  `tests/im-webhook-idempotency.test.ts` — 29/29, same count as before this round; fixed a
+  FOREIGN KEY violation the new `minted_by_member_id` column exposed in its fixture (see
+  "Second collateral gap" above).
+
+- **Full suite (`npm test`, all files, default worker parallelism, run once, after the
+  im-webhook-idempotency fixture fix above): exit 0, 513 files, 8091 tests, 0 failed,
+  551s wall time.** (The FIRST full run at this round's head, before that fix, was 512
+  files / 8091 total-attempted / 6 failed / 8085 passed — the exact im-webhook-idempotency
+  FK violation described above; not fabricated into a clean number, the failing run is
+  the reason the fixture fix exists.) Reconciles with round 4's 8075 + this round's new
+  tests: +16 in the 11-file focused set above, +0 net in im-webhook-idempotency.test.ts
+  (fixture-only change, no new test cases), for a net of 8075 + 16 = 8091, and one
+  additional test FILE (`telegram-unbind-receipts-immutable.test.ts`) bringing the file
+  count from 512 to 513.

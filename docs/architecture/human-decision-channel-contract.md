@@ -35,9 +35,9 @@ A human enters a project through one **single-use, server-hashed** invitation:
 
 - The raw secret (`pairing_code`) is returned to the creator exactly once and never
   stored; only its SHA-256 digest (`pairing_hash`) persists
-  (`src/members/project-invites.ts:284-288,337`, `createProjectInvite`).
+  (`src/members/project-invites.ts:552-564,577-591`, `createProjectInvite`).
 - The claim is one atomic statement (`CLAIM_INVITE_SQL`,
-  `src/members/project-invites.ts:315-349`) with conjuncts that must all hold in the
+  `src/members/project-invites.ts:337-371`) with conjuncts that must all hold in the
   SAME statement, not a JS pre-check that can race it:
   - single-use: `accepted_at IS NULL`
   - not expired: `pairing_expires_at > ?8`
@@ -262,17 +262,17 @@ What **must change**, not merely adapt:
 - **Schema shape.** `members.telegram_chat_id` and `telegram_webhook_receipts` are
   Telegram-specific column/table names carrying Telegram-specific semantics (immutable
   numeric chat id). This is not a stylistic nit — it is load-bearing in the invite path
-  itself: `CLAIM_INVITE_SQL` (`src/members/project-invites.ts:315-349`) **hardcodes** an
+  itself: `CLAIM_INVITE_SQL` (`src/members/project-invites.ts:337-371`) **hardcodes** an
   `EXISTS (SELECT 1 FROM telegram_webhook_receipts receipt WHERE ... receipt.telegram_user_id
-  = ?12 ...)` conjunct (`:244-251`) as one of the atomic claim's fence conditions — a
+  = ?12 ...)` conjunct (`:357-364`) as one of the atomic claim's fence conditions — a
   second channel cannot claim an invite through this exact statement without either its
   own copy of this table+conjunct or a rewrite of the statement itself. The whole module
   is Telegram-typed end to end, not just at the edges: the redemption input type names
-  the field `telegram_user_id` (`src/members/project-invites.ts:67`, the
+  the field `telegram_user_id` (`src/members/project-invites.ts:101`, the
   `RedeemTelegramProjectInviteInput` interface field — not a runtime assertion), the
-  error code is `invalid_telegram_user_id` (`:82`), and the runtime re-asserts the same
-  field name twice at redemption time (`:404`, the input-shape check;
-  `:419`, the receipt-row comparison). A second channel needs either its own
+  error code is `invalid_telegram_user_id` (`:116`), and the runtime re-asserts the same
+  field name twice at redemption time (`:631`, the input-shape check;
+  `:646`, the receipt-row comparison). A second channel needs either its own
   `members.<channel>_id` column
   and its own receipts table (fast, but repeats the `telegram_` prefix pattern per
   channel and needs a repeated migration + repeated fence logic per channel), or a
