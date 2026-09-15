@@ -1703,6 +1703,25 @@ describe('Telegram project invite — bind existing member', () => {
       })
     })
 
+    // P2-2 (kasra-review, 2026-09-15): the HTTP route's parseInvite already
+    // refuses member_id + email together, but createProjectInvite is called
+    // directly by non-HTTP callers too — calling it DIRECTLY here (bypassing
+    // parseInvite entirely) proves the SERVICE itself refuses, not only the
+    // one HTTP entry point.
+    it('P2-2 — the SERVICE itself refuses member_id and email supplied together, bypassing the HTTP route entirely', async () => {
+      await expect(createProjectInvite(env, ownerAuth, {
+        member_id: 'member-existing',
+        email: 'someone-else@example.test',
+        project_id: 'project-bind',
+        squad_id: 'squad-bind',
+        capability: 'member',
+        expires_in_seconds: 3600,
+      })).resolves.toEqual({ ok: false, error: 'invalid_invite_scope' })
+      expect(harness.sqlite.prepare(
+        'SELECT COUNT(*) AS count FROM invites WHERE member_id = ?',
+      ).get('member-existing')).toEqual({ count: 0 })
+    })
+
     it('collapses a member from another tenant to member_not_found (no cross-tenant existence oracle)', async () => {
       harness.sqlite.exec(`
         INSERT INTO members (id, email, display_name, status, tenant)
