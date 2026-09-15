@@ -5314,10 +5314,11 @@ function mcpTool(spec: ToolSpec): Record<string, unknown> {
   }
 }
 
-function mcpCallResult(tool: string, result: unknown): Record<string, unknown> {
+function mcpCallResult(tool: string, result: unknown, isError = false): Record<string, unknown> {
   return {
-    content: [{ type: 'text', text: JSON.stringify({ ok: true, tool, result }) }],
-    structuredContent: result,
+    content: [{ type: 'text', text: JSON.stringify(isError ? { ok: false, tool, ...(result as Record<string, unknown>) } : { ok: true, tool, result }) }],
+    structuredContent: isError ? { ok: false, tool, ...(result as Record<string, unknown>) } : result,
+    ...(isError ? { isError: true } : {}),
   }
 }
 
@@ -5549,12 +5550,17 @@ async function handleJsonRpc(c: import('hono').Context<AppEnv>, body: JsonRpcReq
     const outcome = await invokeTool(auth, c.env, params.name, params.arguments, ctx)
     if (outcome.ok) return rpcResult(id, mcpCallResult(outcome.tool as string, outcome.result))
 
-    return rpcError(
+    return rpcResult(
       id,
-      jsonRpcCodeForToolFailure(outcome.status, outcome.error),
-      outcome.error,
-      outcome.detail,
-      outcome.status,
+      mcpCallResult(
+        outcome.tool as string,
+        {
+          error: outcome.error,
+          ...(outcome.detail !== undefined ? { detail: outcome.detail } : {}),
+          status: outcome.status,
+        },
+        true,
+      ),
     )
   }
 

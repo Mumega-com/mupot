@@ -160,6 +160,44 @@ describe('JSON-RPC error codes for tool failures', () => {
     expect(jsonRpcCodeForToolFailure(404, 'send_target_not_visible')).toBe(-32000)
     expect(jsonRpcCodeForToolFailure(404, 'send_target_not_visible')).not.toBe(-32602)
   })
+
+  it('returns HTTP 200 with isError: true and structuredContent when a tool execution fails', async () => {
+    // Calling an unknown tool or a failing tool must return HTTP 200 with isError: true,
+    // so streamable HTTP / MCP transports do not drop/hang the response stream.
+    const res = await rpc('tools/call', { name: 'non_existent_tool_xyz', arguments: {} }, true)
+    expect(res.status).toBe(200)
+    const body = await res.json() as {
+      jsonrpc: string
+      id: number
+      result: {
+        isError: boolean
+        content: { type: string; text: string }[]
+        structuredContent: { ok: boolean; tool: string; error: string; status: number }
+      }
+    }
+    expect(body.jsonrpc).toBe('2.0')
+    expect(body.result.isError).toBe(true)
+    expect(body.result.structuredContent.ok).toBe(false)
+    expect(body.result.structuredContent.error).toBe('unknown_tool')
+    expect(body.result.structuredContent.status).toBe(400)
+    const textObj = JSON.parse(body.result.content[0].text)
+    expect(textObj.ok).toBe(false)
+    expect(textObj.error).toBe('unknown_tool')
+  })
+
+  it('returns HTTP 200 with isError: true when task_create fails validation (e.g. missing required fields)', async () => {
+    const res = await rpc('tools/call', { name: 'task_create', arguments: { squad_id: 'squad-core' } }, true)
+    expect(res.status).toBe(200)
+    const body = await res.json() as {
+      result: {
+        isError: boolean
+        structuredContent: { ok: boolean; error: string }
+      }
+    }
+    expect(body.result.isError).toBe(true)
+    expect(body.result.structuredContent.ok).toBe(false)
+    expect(body.result.structuredContent.error).toBe('invalid_args')
+  })
 })
 
 describe('custom GPT Actions compatibility', () => {
