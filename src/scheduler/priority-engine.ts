@@ -4,15 +4,13 @@
  * Builds on existing ATC ranking (`src/tasks/ranking.ts`) and authoritative
  * Mupot task/project/presence/budget/gate facts. It does not introduce a
  * parallel work queue. Default mode is dry-run propose. Canary may dispatch
- * exactly one non-production task through an injected callback — never live
- * merge/deploy/credential/payment/destructive work.
+ * exactly one proven-active non-production task through an injected callback.
  *
  * This module is not auto-wired into MCP, routines, or production dispatch.
  * `snapshot.actor` must be the authenticated session principal supplied by a
- * future live caller — the engine never invents or overrides it. Durable CAS
- * belongs at the D1/DO claim layer; MemoryTickStore is the in-memory contract.
+ * future live caller — the engine never invents or overrides it.
  */
-import { rankTasks } from '../tasks/ranking'
+import { PRIORITY_RANK, rankTasks } from '../tasks/ranking'
 import { isDoneWhenValid, isPlaceholderDoneWhen } from '../tasks/service'
 import type { AgentRuntimeState } from '../dashboard/observatory'
 import type { ProjectStatus, Task } from '../types'
@@ -61,10 +59,15 @@ export type ExclusionReason =
   | 'human_gate'
   | 'unsafe_side_effect'
   | 'project_archived_or_paused'
+  | 'missing_or_inactive_project'
+  | 'member_owned'
   | 'stale_or_incompatible_agent'
   | 'over_budget'
   | 'contradictory_telemetry'
   | 'no_live_compatible_agent'
+  | 'production_or_unproven_scope'
+  | 'idempotency_in_flight'
+  | 'dispatch_failed'
 
 export interface ScoreComponents {
   status_band: number
@@ -92,24 +95,40 @@ export interface DecisionReceipt {
   selected_agent_id: string | null
   budget: EngineBudget
   dispatch: { attempted: boolean, receipt_id: string | null }
-  result: 'proposed' | 'dispatched' | 'none' | 'refused'
+  result: 'proposed' | 'dispatched' | 'none' | 'refused' | 'failed'
   gate: 'athena_required'
   learning: { selected: boolean, exclusion_count: number }
   created_at: string
 }
 
+export type BeginResult =
+  | { status: 'acquired' }
+  | { status: 'existing', receipt: DecisionReceipt }
+  | { status: 'in_flight' }
+
 export interface TickStore {
-  get(idempotencyKey: string): DecisionReceipt | undefined
-  claim(taskId: string, idempotencyKey: string): boolean
-  put(receipt: DecisionReceipt): void
+  get(idempotencyKey: string): Promise<DecisionReceipt | undefined> | DecisionReceipt | undefined
+  begin(idempotencyKey: string): Promise<BeginResult> | BeginResult
+  claim(taskId: string, idempotencyKey: string): Promise<boolean> | boolean
+  releaseClaim(taskId: string, idempotencyKey: string): Promise<void> | void
+  put(receipt: DecisionReceipt): Promise<void> | void
 }
 
 export class MemoryTickStore implements TickStore {
   private readonly byKey = new Map<string, DecisionReceipt>()
+  private readonly reserved = new Set<string>()
   private readonly claimed = new Map<string, string>()
 
   get(idempotencyKey: string): DecisionReceipt | undefined {
     return this.byKey.get(idempotencyKey)
+  }
+
+  begin(idempotencyKey: string): BeginResult {
+    const existing = this.byKey.get(idempotencyKey)
+    if (existing) return { status: 'existing', receipt: existing }
+    if (this.reserved.has(idempotencyKey)) return { status: 'in_flight' }
+    this.reserved.add(idempotencyKey)
+    return { status: 'acquired' }
   }
 
   claim(taskId: string, idempotencyKey: string): boolean {
@@ -117,6 +136,10 @@ export class MemoryTickStore implements TickStore {
     if (existing !== undefined && existing !== idempotencyKey) return false
     this.claimed.set(taskId, idempotencyKey)
     return true
+  }
+
+  releaseClaim(taskId: string, idempotencyKey: string): void {
+    if (this.claimed.get(taskId) === idempotencyKey) this.claimed.delete(taskId)
   }
 
   put(receipt: DecisionReceipt): void {
@@ -141,11 +164,20 @@ export function isUnsafeSideEffect(task: Task): boolean {
   return UNSAFE_RE.test(taskText(task))
 }
 
+export function isProvenNonProduction(project: EngineProject | undefined): boolean {
+  return Boolean(project && project.status === 'active' && project.production === false)
+}
+
+function agentIsHonorable(agent: EngineAgent | undefined, state: AgentRuntimeState | undefined): boolean {
+  return state === 'live' && Boolean(agent && agent.compatible && agent.status === 'active')
+}
+
 export function excludeTask(
   task: Task,
   snapshot: EngineSnapshot,
 ): ExclusionReason | null {
   if (task.status !== 'open') return 'status_not_open'
+  if (task.assignee_member_id) return 'member_owned'
   if (!isDoneWhenValid(task.done_when)) return 'missing_done_when'
   if (isPlaceholderDoneWhen(task.done_when)) return 'placeholder_done_when'
   if (task.parent_task_id) {
@@ -156,19 +188,17 @@ export function excludeTask(
   }
   if (isHumanGated(task)) return 'human_gate'
   if (isUnsafeSideEffect(task)) return 'unsafe_side_effect'
-  if (task.project_id) {
-    const project = snapshot.projects.get(task.project_id)
-    if (!project) return 'contradictory_telemetry'
-    if (project.status === 'archived' || project.status === 'paused') {
-      return 'project_archived_or_paused'
-    }
+  if (!task.project_id) return 'missing_or_inactive_project'
+  const project = snapshot.projects.get(task.project_id)
+  if (!project) return 'contradictory_telemetry'
+  if (project.status === 'archived' || project.status === 'paused') {
+    return 'project_archived_or_paused'
   }
+  if (project.status !== 'active') return 'missing_or_inactive_project'
   if (task.assignee_agent_id) {
     const state = snapshot.agentStates.get(task.assignee_agent_id)
     const agent = snapshot.agents.find((row) => row.id === task.assignee_agent_id)
-    if (state !== 'live' || !agent || !agent.compatible || agent.status !== 'active') {
-      return 'stale_or_incompatible_agent'
-    }
+    if (!agentIsHonorable(agent, state)) return 'stale_or_incompatible_agent'
   }
   if (snapshot.budget.selected_cost_micro_usd > snapshot.budget.remaining_micro_usd) {
     return 'over_budget'
@@ -179,7 +209,7 @@ export function excludeTask(
   return null
 }
 
-function pickAgent(snapshot: EngineSnapshot): string | null {
+function pickUnassignedAgent(snapshot: EngineSnapshot): string | null {
   const live = snapshot.agents.filter((agent) => (
     agent.status === 'active'
     && agent.compatible
@@ -190,11 +220,19 @@ function pickAgent(snapshot: EngineSnapshot): string | null {
   return live[0]?.id ?? null
 }
 
+export function resolveSelectedAgent(task: Task, snapshot: EngineSnapshot): string | null {
+  if (task.assignee_agent_id) {
+    const agent = snapshot.agents.find((row) => row.id === task.assignee_agent_id)
+    const state = snapshot.agentStates.get(task.assignee_agent_id)
+    return agentIsHonorable(agent, state) ? task.assignee_agent_id : null
+  }
+  return pickUnassignedAgent(snapshot)
+}
+
 function score(task: Task): ScoreComponents {
-  const priority_rank = ({ P0: 0, P1: 1, P2: 2, P3: 3 } as const)[task.priority ?? 'P3'] ?? 4
   return {
     status_band: task.status === 'open' ? 1 : 99,
-    priority_rank,
+    priority_rank: PRIORITY_RANK[task.priority ?? 'untriaged'] ?? 4,
     created_at: task.created_at,
     id: task.id,
   }
@@ -248,7 +286,7 @@ export function propose(snapshot: EngineSnapshot, control: EngineControl): Omit<
 
   const ranked = rankTasks(eligible, snapshot.agentStates).filter((task) => task.status === 'open')
   const selected = ranked[0] ?? null
-  const agentId = selected ? pickAgent(snapshot) : null
+  const agentId = selected ? resolveSelectedAgent(selected, snapshot) : null
   if (selected && !agentId) {
     exclusions.push({ task_id: selected.id, reason: 'no_live_compatible_agent' })
   }
@@ -276,6 +314,35 @@ export function propose(snapshot: EngineSnapshot, control: EngineControl): Omit<
   }
 }
 
+function emptyRefused(input: {
+  snapshot: EngineSnapshot
+  control: EngineControl
+  mode: EngineMode
+  idempotency_key: string
+  created_at: string
+  reason: ExclusionReason
+}): DecisionReceipt {
+  return {
+    mode: input.mode,
+    actor: input.snapshot.actor,
+    idempotency_key: input.idempotency_key,
+    cas_key: `${input.idempotency_key}:none`,
+    paused: input.control.paused,
+    killed: input.control.killed,
+    candidates: [],
+    exclusions: [{ task_id: 'none', reason: input.reason }],
+    score_components: {},
+    selected_task_id: null,
+    selected_agent_id: null,
+    budget: input.snapshot.budget,
+    dispatch: { attempted: false, receipt_id: null },
+    result: 'refused',
+    gate: 'athena_required',
+    learning: { selected: false, exclusion_count: 1 },
+    created_at: input.created_at,
+  }
+}
+
 export async function tick(input: {
   store: TickStore
   snapshot: EngineSnapshot
@@ -288,11 +355,21 @@ export async function tick(input: {
   if (!input.snapshot.actor.trim()) {
     throw new Error('priority_engine_actor_unavailable')
   }
-  const existing = input.store.get(input.idempotency_key)
-  if (existing) return existing
+  const created_at = input.now ?? new Date().toISOString()
+  const began = await input.store.begin(input.idempotency_key)
+  if (began.status === 'existing') return began.receipt
+  if (began.status === 'in_flight') {
+    return emptyRefused({
+      snapshot: input.snapshot,
+      control: input.control,
+      mode: input.mode,
+      idempotency_key: input.idempotency_key,
+      created_at,
+      reason: 'idempotency_in_flight',
+    })
+  }
 
   const proposed = propose(input.snapshot, input.control)
-  const created_at = input.now ?? new Date().toISOString()
   const cas_key = `${input.idempotency_key}:${proposed.selected_task_id ?? 'none'}`
   let receipt: DecisionReceipt = {
     mode: input.mode,
@@ -315,7 +392,7 @@ export async function tick(input: {
   }
 
   if (receipt.selected_task_id) {
-    if (!input.store.claim(receipt.selected_task_id, input.idempotency_key)) {
+    if (!await input.store.claim(receipt.selected_task_id, input.idempotency_key)) {
       receipt = {
         ...receipt,
         selected_task_id: null,
@@ -331,25 +408,51 @@ export async function tick(input: {
     } else if (input.mode === 'canary' && receipt.selected_agent_id) {
       const selected = input.snapshot.tasks.find((task) => task.id === receipt.selected_task_id)
       const project = selected?.project_id ? input.snapshot.projects.get(selected.project_id) : undefined
-      if (project?.production) {
+      if (!isProvenNonProduction(project)) {
+        await input.store.releaseClaim(receipt.selected_task_id, input.idempotency_key)
         receipt = {
           ...receipt,
+          selected_task_id: null,
+          selected_agent_id: null,
           dispatch: { attempted: false, receipt_id: null },
-          result: 'proposed',
+          result: 'refused',
+          exclusions: [
+            ...receipt.exclusions,
+            { task_id: proposed.selected_task_id!, reason: 'production_or_unproven_scope' },
+          ],
+          learning: { selected: false, exclusion_count: receipt.exclusions.length + 1 },
         }
       } else if (input.dispatch) {
-        const dispatchId = await input.dispatch(receipt.selected_task_id, receipt.selected_agent_id)
-        receipt = {
-          ...receipt,
-          dispatch: { attempted: true, receipt_id: dispatchId },
-          result: 'dispatched',
+        const claimedTaskId = receipt.selected_task_id
+        const claimedAgentId = receipt.selected_agent_id
+        try {
+          const dispatchId = await input.dispatch(claimedTaskId, claimedAgentId)
+          receipt = {
+            ...receipt,
+            dispatch: { attempted: true, receipt_id: dispatchId },
+            result: 'dispatched',
+          }
+        } catch {
+          await input.store.releaseClaim(claimedTaskId, input.idempotency_key)
+          receipt = {
+            ...receipt,
+            selected_task_id: null,
+            selected_agent_id: null,
+            dispatch: { attempted: true, receipt_id: null },
+            result: 'failed',
+            exclusions: [
+              ...receipt.exclusions,
+              { task_id: proposed.selected_task_id!, reason: 'dispatch_failed' },
+            ],
+            learning: { selected: false, exclusion_count: receipt.exclusions.length + 1 },
+          }
         }
       }
     }
   }
 
-  const raced = input.store.get(input.idempotency_key)
+  const raced = await input.store.get(input.idempotency_key)
   if (raced) return raced
-  input.store.put(receipt)
+  await input.store.put(receipt)
   return receipt
 }

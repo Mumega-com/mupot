@@ -2833,9 +2833,29 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_agent_messages_lease_attempt" },
     ],
   },
+  {
+    file: "0154_priority_engine_ticks.sql",
+    sha256: "5e27f7d60021a0c63ff9a5f4a9ff7ba79f634481c1a5801a77a6d5bd66b40058",
+    statements: [
+      "-- Durable CAS ledger for the governed priority engine.\n-- Soft TEXT references only: this is a decision/execution receipt log, not a\n-- parallel task queue, and it must survive synthetic canary IDs in tests.\n\nCREATE TABLE priority_engine_reservations (\n  idempotency_key TEXT PRIMARY KEY,\n  status TEXT NOT NULL CHECK (status IN ('inflight', 'final')),\n  created_at TEXT NOT NULL CHECK (length(trim(created_at)) > 0)\n);",
+      "\n\nCREATE TABLE priority_engine_claims (\n  task_id TEXT PRIMARY KEY,\n  idempotency_key TEXT NOT NULL UNIQUE,\n  created_at TEXT NOT NULL CHECK (length(trim(created_at)) > 0)\n);",
+      "\n\nCREATE TABLE priority_engine_receipts (\n  idempotency_key TEXT PRIMARY KEY,\n  cas_key TEXT NOT NULL,\n  result TEXT NOT NULL CHECK (result IN ('proposed', 'dispatched', 'none', 'refused', 'failed')),\n  receipt_json TEXT NOT NULL CHECK (json_valid(receipt_json)),\n  created_at TEXT NOT NULL CHECK (length(trim(created_at)) > 0)\n);",
+      "\n\nCREATE INDEX idx_priority_engine_claims_key\n  ON priority_engine_claims(idempotency_key);",
+      "\n\nCREATE TRIGGER priority_engine_receipts_no_update\nBEFORE UPDATE ON priority_engine_receipts\nBEGIN\n  SELECT RAISE(ABORT, 'priority engine receipts are append-only');\nEND;",
+      "\n\nCREATE TRIGGER priority_engine_receipts_no_delete\nBEFORE DELETE ON priority_engine_receipts\nBEGIN\n  SELECT RAISE(ABORT, 'priority engine receipts are append-only');\nEND;",
+    ],
+    objects: [
+      { type: "table", name: "priority_engine_reservations" },
+      { type: "table", name: "priority_engine_claims" },
+      { type: "table", name: "priority_engine_receipts" },
+      { type: "index", name: "idx_priority_engine_claims_key" },
+      { type: "trigger", name: "priority_engine_receipts_no_update" },
+      { type: "trigger", name: "priority_engine_receipts_no_delete" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "833b618a5d63d0fdacd3c7eaa0b9f583645dad67b8a6dfa31da5e6b93ca2cd49"
+export const SCHEMA_CHAIN_DIGEST: string = "e55fd380d4ea5d763139dd3d23ac84d6e489437c08b44535331fdc5ec65f8417"
