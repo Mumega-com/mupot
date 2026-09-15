@@ -509,6 +509,55 @@ describe('POST /members/:id/capabilities — target-rank ceiling (#1337)', () =>
   // global) AND self-exempt regardless.
   const SELF_GLOBAL_OWNER_MEMBER = 'member-self-global-owner'
 
+  // M2 (kasra-review adversarial addendum round 5, 2026-09-15): before A1's
+  // fix, exceedsTargetRankCeiling's actor side (actorMaxRankAcrossScopes)
+  // read `users.role` from the DB unconditionally via targetLegacyRoleRank
+  // (the SAME helper used for the TARGET plane) — a B1-zeroed
+  // directory-channel session (auth.capabilities deliberately []) whose
+  // bridged email happened to match a `users` row with role='owner' would
+  // have that role silently reinstated as the ACTOR's own standing,
+  // exactly the ambient-authority hole the B1 ceiling exists to close.
+  // actorRankOnScopeFor (the sole actor-side function since A1 deleted
+  // actorMaxRankAcrossScopes) never reads the DB for the actor's role
+  // plane at all — only `auth.role` (the session's own declared role) and
+  // `auth.capabilities` (used as-is, never re-resolved, when already an
+  // array) — so this session, despite a DB users.role='owner' row sharing
+  // its bridged email, is refused at the ORG-admin gate itself, before
+  // ever reaching exceedsTargetRankCeiling. (A B1-zeroed session can never
+  // pass requireCapability(orgScope,'admin') with capabilities: [] in the
+  // first place, so this test's mutation-catching power is about
+  // requireCapability's own grants resolution never re-querying the DB
+  // when capabilities is already an array — not exceedsTargetRankCeiling
+  // specifically, which this session never reaches.)
+  it('M2 — a B1-zeroed session (capabilities: []) is refused ORG-admin standing even though a DB users.role=owner row shares its bridged email', async () => {
+    const B1_MEMBER = 'member-b1-zeroed'
+    const B1_EMAIL = 'b1-zeroed@example.test'
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status, tenant)
+        VALUES ('${B1_MEMBER}', '${B1_EMAIL}', 'B1 Zeroed', 'active', '${TENANT}');
+      INSERT INTO users (id, email, role)
+        VALUES ('user-b1-zeroed', '${B1_EMAIL}', 'owner');
+    `)
+    authState.current = {
+      userId: 'b1-zeroed-user',
+      email: B1_EMAIL,
+      role: 'member',
+      tenant: TENANT,
+      memberId: B1_MEMBER,
+      capabilities: [],
+    } as AuthContext
+
+    const res = await membersApp.fetch(new Request(`https://pot.example/members/${PEER_ADMIN}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ status: 'suspended' }),
+    }), env)
+
+    expect(res.status).toBe(403)
+    expect(harness.sqlite.prepare('SELECT status FROM members WHERE id = ?').get(PEER_ADMIN))
+      .toEqual({ status: 'active' })
+  })
+
   it('N2 — an org admin who also holds owner on an unrelated squad may still act on THEMSELVES', async () => {
     harness.sqlite.exec(`
       INSERT INTO members (id, display_name, status, tenant)
