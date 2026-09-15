@@ -39,14 +39,24 @@ curl --fail-with-body --silent --show-error \
   "$MUPOT_ORIGIN/api/members/invites"
 ```
 
-`member_id` and `email` are mutually exclusive in the request body — the member's own email is
-read server-side (so the UNIQUE email fence and the invite/receipt shape are identical to the
-net-new path) and returned in the `201` response for the operator to confirm before delivery.
-Creation refuses `member_not_found` (404 — also returned for a member in another tenant, a
-deliberate collapse so this is never a cross-tenant existence oracle), `member_not_active`
-(403, a suspended member), or `member_missing_email` (400, an IM-only member with no email on
-file) before minting the invite. The actor's capability ceiling is the same
-`actorRankOnSquad` path the net-new invite uses — no separate, looser rank check.
+`member_id` and `email` are mutually exclusive in the request body (refused, `invalid_invite_scope`,
+if both are present — enforced by the service itself, not only the HTTP route) — the member's
+own email is read server-side (so the UNIQUE email fence and the invite/receipt shape are
+identical to the net-new path) and returned in the `201` response for the operator to confirm
+before delivery. Creation refuses `member_not_found` (404 — also returned for a member in
+another tenant, a deliberate collapse so this is never a cross-tenant existence oracle),
+`member_not_active` (403, a suspended member), or `member_missing_email` (400, an IM-only
+member with no email on file) before minting the invite.
+
+**Who may target whom.** A member-bind invite mints a Telegram credential that authenticates
+AS the target member — the same thing a token mint does — so it requires the SAME authority:
+the actor needs **org-scope admin (or owner)**, not merely admin on the invited squad. This is
+stricter than the net-new path (which still only needs admin on the invited squad, since a
+fresh member cannot be "taken over"). The target's OWN standing is also checked: the invite is
+refused if the target's highest capability grant on ANY scope — org, any department, any
+squad, not only the one being invited into — exceeds the actor's own rank. An org admin
+(rank 4) cannot member-bind an org owner, or a member who happens to hold `owner` on some
+unrelated squad, even though neither of those facts is visible on the squad the invite names.
 
 At redemption, `/start <pairing-code>` binds the authenticated Telegram identity onto the
 **existing** member (an `UPDATE`, never an `INSERT`) instead of minting a new one; no new
@@ -54,12 +64,20 @@ member row, token, or display-name change results. Two conflict shapes both refu
 `telegram_identity_conflict` and leave the invite retryable if the underlying condition is
 transient: the target member already has a **different** Telegram identity bound, or the
 Telegram identity sending `/start` already belongs to a **different** member. The target
-member must still be `status='active'` at the moment of redemption (re-checked, not merely
-at invite creation) — the atomic claim itself refuses to commit for a bind target that is no
-longer active, so a member suspended between invite creation and redemption does not burn the
-pairing code; it becomes usable again once the member is reactivated. The reply to the
-participant is the same generic success/failure text as the net-new path — the redemption
-error enum is never echoed into the chat (see the existing anti-oracle test).
+member must still be `status='active'`, belong to THIS tenant exactly (a NULL tenant refuses —
+`memberForChat` has no NULL-tenant fallback), and be Telegram-compatible at the moment of
+redemption (re-checked, not merely at invite creation, via the SAME predicate the claim itself
+uses) — so a member suspended, reassigned to another tenant, or otherwise made ineligible
+between invite creation and redemption refuses AT THE CLAIM and leaves the invite intact; it
+becomes usable again once the member is eligible again. The reply to the participant is the
+same generic success/failure text as the net-new path — the redemption error enum is never
+echoed into the chat (see the existing anti-oracle test).
+
+**Undoing a bind.** `DELETE /members/:id/telegram` (org admin, same target-rank ceiling as
+above) clears a member's bound Telegram identity. Use it if a bind was made in error or the
+participant's Telegram account changes — a new member-bind invite can then be redeemed to
+bind the correct identity. There is currently no self-service unbind from within Telegram
+itself; only an admin can undo a bind.
 
 ## Behaviour change: IM verdict authority
 
@@ -135,10 +153,12 @@ export PARTICIPANT_SQUAD_ID='<filled-after-create>'
 Before mutation, record:
 
 1. `GET /health` and its exact clean release commit.
-2. Migrations `0152_telegram_project_onboarding.sql` and then
-   `0153_inbox_lease_attempt_reconciliation.sql` in the deployed migration ledger, in that
-   order. Migration 0152 creates the onboarding/webhook receipts; migration 0153 adds the
-   server-authoritative lease-attempt receipts used by the Hermes receiver.
+2. Migrations `0152_telegram_project_onboarding.sql`, then
+   `0153_inbox_lease_attempt_reconciliation.sql`, then
+   `0154_project_invite_member_bind.sql`, in that order, in the deployed migration ledger.
+   Migration 0152 creates the onboarding/webhook receipts; 0153 adds the server-authoritative
+   lease-attempt receipts used by the Hermes receiver; 0154 adds `invites.member_id` (the
+   bind-existing-member path) and `members.telegram_bound_at` (the bind-landed proof stamp).
 3. `IM_WEBHOOK_SECRET` configured at both ends, without reading or recording its value.
 4. The existing project is active and the intended department is correct.
 5. The planned capability (`observer`, `member`, `lead`, `admin`, or `owner`) is no greater
@@ -432,8 +452,8 @@ one, stop and investigate rather than widening the predicate.
 
 ## Rollback
 
-Rollback removes authority; it does not drop additive migrations `0152` or `0153`, or erase
-receipts.
+Rollback removes authority; it does not drop additive migrations `0152`, `0153`, or `0154`, or
+erase receipts.
 
 1. Stop new ingress at the Telegram webhook/Hermes configuration if the transport boundary
    is suspect. Rotate `IM_WEBHOOK_SECRET` at both ends before reopening. Do not reveal the old
@@ -462,8 +482,8 @@ receipts.
 - [ ] Direct deployment approval identifies the exact commit and tenant; no local test is
       represented as deploy authority.
 - [ ] `/health` reports the expected clean release commit after deployment.
-- [ ] The remote migration ledger includes `0152_telegram_project_onboarding.sql` followed by
-      `0153_inbox_lease_attempt_reconciliation.sql`.
+- [ ] The remote migration ledger includes `0152_telegram_project_onboarding.sql`, then
+      `0153_inbox_lease_attempt_reconciliation.sql`, then `0154_project_invite_member_bind.sql`.
 - [ ] `IM_WEBHOOK_SECRET` is configured at both ends; no credential value appears in evidence.
 - [ ] The participant-specific squad exists and the reverse edge query returns exactly the
       intended project.

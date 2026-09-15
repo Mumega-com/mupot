@@ -745,8 +745,12 @@ three receipt sub-conjuncts) is unrelated to this WARN and is unchanged by this 
 ## Bind-existing-member follow-up (mupot#1407 extension, 2026-09-14)
 
 Separate task, separate branch: `kasra/telegram-bind-existing-member-20260914`, forked from
-`origin/main` at `49a344aa9cd20d1aa7b563b36c946bc91ffea02b` (the merged #1407). Prior commits
-on this branch, oldest first:
+`origin/main` at `49a344aa9cd20d1aa7b563b36c946bc91ffea02b` (the merged #1407). This section
+describes ROUND 1 specifically — the commits named below, not "every commit this branch will
+ever hold" (a prior draft of this list stopped at `aa66b330` and, read after the two docs
+commits that followed it on the SAME branch, would have understated the branch's own history;
+see the Round 2 section below for what changed after this point, its own commit list, and its
+own scoped verification):
 
 - `c057d13c` — initial implementation: `createProjectInvite` accepts optional `member_id`;
   `redeemTelegramProjectInvite` binds an existing member instead of inserting a new one;
@@ -755,6 +759,8 @@ on this branch, oldest first:
 - `aa66b330` — a correctness fix found by running the tests written for this task (not by a
   separate review pass), plus the tests that found it and two more added afterward. See
   "What testing found" below.
+- `63069fb5` / `0b7a0945` — docs-only commits (this file plus the operations runbook)
+  finishing round 1; no source or test changes.
 
 This section describes work already committed at the SHAs above at the time it was written;
 it does not describe this documentation commit's own pending state.
@@ -827,24 +833,26 @@ id = ? AND telegram_chat_id = ?)` conjunct for the bind path, tying them to
   passed** (0 failed). Duration 584.11s. Up from 8018 on `origin/main` at `49a344aa` — the 23
   new tests in this one file account for the difference exactly.
 
-### Mutation table (every conjunct new to this task, all executed for real: mutate → run
+### Mutation table (round 1, `aa66b330`; corrected — Athena's round-2 BLOCK noted "Killed by"
+### was dropped for 12/13 rows, "every conjunct new to this task" overstates it since the
+### member-status conjunct reuses round 1's own predicate. All executed for real: mutate → run
 ### targeted test → confirm red → `git checkout --` → confirm `git diff --stat` empty → next)
 
-| Guard | Location | Mutation | Result |
-| --- | --- | --- | --- |
-| 0154 trigger: member-bind requires full project field set (INSERT + UPDATE) | migration 0154 | both RAISE ABORT clauses removed | RED — new schema test |
-| `invalid_member_id` on blank/whitespace `member_id` | `createProjectInvite` | check removed | RED — wrong error returned |
-| Member lookup returns `member_not_found` | `createProjectInvite` | check neutered (`if (false)`) | RED — 2 tests (nonexistent + cross-tenant), both throw on null deref once neutered |
-| Member lookup tenant scoping | `createProjectInvite` SQL | `(tenant = ?2 OR tenant IS NULL)` removed | RED — cross-tenant invite is minted (existence-oracle class) |
-| `member_not_active` on suspended member | `createProjectInvite` | check neutered | RED — invite minted for a suspended member |
-| `member_missing_email` on null email | `createProjectInvite` | check neutered | RED — throws on `.trim()` of null |
-| Rank ceiling (`cannot_grant_above_own_rank`) reached via the bind path | `createProjectInvite` | ceiling check neutered | RED — invite minted above actor's rank |
-| Pre-check `telegram_identity_conflict` (member already bound differently) | `redeemTelegramProjectInvite` | pre-check neutered | RED — wrong error code (falls through to atomic-guard's generic fallback instead) |
-| `CLAIM_INVITE_SQL`'s new member-status conjunct | `redeemTelegramProjectInvite` | conjunct removed | RED — 2 tests; redemption now SUCCEEDS entirely for a suspended member (both the claim's own conjunct AND bindMemberStatement's own now-removed re-check are gone, so nothing blocks it) |
-| `bindMemberStatement`'s own tenant conjunct | `redeemTelegramProjectInvite` | `(tenant = ?3 OR tenant IS NULL)` replaced with `(1=1)` | RED — tenant-reassigned member gets bound anyway |
-| `memberBindLandedGuard` cross-statement fence (capabilities INSERT + receipt UPDATE) | `redeemTelegramProjectInvite` | guard fragment/params neutered to `''`/`[]` | RED — capability row granted (count 1, expected 0) for a member whose bind never landed — the exact defect class this guard exists to prevent |
-| Stray-`email`-with-`member_id` rejection | `src/members/index.ts` `parseInvite` | check neutered | RED — 201 instead of 400 |
-| `member_not_found`/`member_not_active` → 404/403 HTTP mapping | `src/members/index.ts` `projectInviteErrorStatus` | both arms neutered | RED — both fall to default 400 |
+| Guard | Location | Mutation | Result | Killed by |
+| --- | --- | --- | --- | --- |
+| 0154 trigger: member-bind requires full project field set (INSERT + UPDATE) | migration 0154 | both RAISE ABORT clauses removed | RED | "requires a member-bind project invite to carry the full project field set" |
+| `invalid_member_id` on blank/whitespace `member_id` | `createProjectInvite` | check removed | RED — wrong error returned | "rejects an empty member_id as invalid_member_id" |
+| Member lookup returns `member_not_found` | `createProjectInvite` | check neutered (`if (false)`) | RED — both throw on null deref once neutered | "refuses a nonexistent member with member_not_found"; "collapses a member from another tenant to member_not_found (no cross-tenant existence oracle)" |
+| Member lookup tenant scoping | `createProjectInvite` SQL | `(tenant = ?2 OR tenant IS NULL)` removed | RED — cross-tenant invite minted (existence-oracle class) | "collapses a member from another tenant to member_not_found (no cross-tenant existence oracle)" |
+| `member_not_active` on suspended member | `createProjectInvite` | check neutered | RED — invite minted for a suspended member | "refuses a suspended member with member_not_active" |
+| `member_missing_email` on null email | `createProjectInvite` | check neutered | RED — throws on `.trim()` of null | "refuses a member with no email on file with member_missing_email" |
+| Rank ceiling (`cannot_grant_above_own_rank`) reached via the bind path | `createProjectInvite` | ceiling check neutered | RED — invite minted above actor's rank | "still enforces the actor rank ceiling on a member-bind invite (no second predicate)" |
+| Pre-check `telegram_identity_conflict` (member already bound differently) | `redeemTelegramProjectInvite` | pre-check neutered | RED — wrong error code (falls through to the atomic guard's generic fallback) | "refuses when the member already has a DIFFERENT Telegram identity bound" |
+| `CLAIM_INVITE_SQL`'s new member-status conjunct | `redeemTelegramProjectInvite` | conjunct removed | RED — redemption now SUCCEEDS entirely for a suspended member | "refuses redemption when the target member is suspended between invite creation and claim"; "does not burn the invite when the target member is suspended — it is retryable once reactivated" |
+| `bindMemberStatement`'s own tenant conjunct | `redeemTelegramProjectInvite` | `(tenant = ?3 OR tenant IS NULL)` replaced with `(1=1)` | RED — tenant-reassigned member gets bound anyway | round-1 test of this name, superseded in round 2 (see below) — the statement it names no longer exists verbatim after round 2's shared-predicate fix, re-proven there |
+| `memberBindLandedGuard` cross-statement fence (capabilities INSERT + receipt UPDATE) | `redeemTelegramProjectInvite` | guard fragment/params neutered to `''`/`[]` | RED — capability row granted (count 1, expected 0) for a member whose bind never landed | round-1 test of this name, superseded in round 2 by F2 and the stamp-guard proof (see below) |
+| Stray-`email`-with-`member_id` rejection | `src/members/index.ts` `parseInvite` | check neutered | RED — 201 instead of 400 | "rejects a body supplying both member_id and email as an ambiguous scope (400)" |
+| `member_not_found`/`member_not_active` → 404/403 HTTP mapping | `src/members/index.ts` `projectInviteErrorStatus` | both arms neutered | RED — both fall to default 400 | "refuses a member_id from another tenant (404)"; "refuses an inactive member (403)" |
 
 Honestly-reported non-distinguishable survivors (documented, not silently dropped):
 
@@ -870,3 +878,164 @@ Honestly-reported non-distinguishable survivors (documented, not silently droppe
   the "net-new humans only" restriction, added a "Binding a Telegram identity to an existing
   member" section with the request shape, the three creation-time refusals, and the two
   redemption-time conflict shapes.
+
+## Round 2 — Athena BLOCK + kasra-review parallel adversarial gate (2026-09-15)
+
+Same branch, same PR (#1411). Round 1 ended at `0b7a0945`. Athena's gate on that head
+returned **BLOCK** (F1, F2, F3 below); a parallel kasra-review adversarial pass on the same
+head separately found **P0-1** (identity takeover) plus P2/P3 items. Both are addressed here,
+in commits `97e2537f` (fix), `b403c64f` (test), `8a08d69e` (test) on top of `0b7a0945` — this
+documentation commit lands after those three and does not itself change source or test files.
+
+### Athena BLOCK — one eligibility predicate, not two
+
+Root cause named in the BLOCK: `CLAIM_INVITE_SQL`'s `bind_target` EXISTS (round 1) checked
+only `status = 'active'`; `bindMemberStatement`'s WHERE (round 1) separately checked
+`(tenant = ? OR tenant IS NULL)` — two hand-duplicated predicates that had already drifted
+(F2), and neither refused a NULL tenant (F1), which `memberForChat`
+(`src/im/index.ts:95-97`) can never resolve regardless.
+
+Fix: `MEMBER_BIND_ELIGIBLE_SQL` (`src/members/project-invites.ts`) — `id = ? AND tenant = ?
+AND status = 'active' AND (telegram_chat_id IS NULL OR telegram_chat_id = ?)`, with an EXACT,
+non-NULL tenant match — is now the ONLY place this predicate is written, interpolated
+verbatim into both `CLAIM_INVITE_SQL`'s `bind_target` EXISTS and the extracted
+`MEMBER_BIND_UPDATE_SQL` (bindMemberStatement's statement, itself now exported for the same
+P1-2 reason `CLAIM_INVITE_SQL` was). A seam test asserts both compiled statement strings
+contain the identical constant (`toContain`) — a future hand-edit to either copy that drifts
+even slightly fails immediately, rather than waiting for a behavioral test to notice.
+
+Consequence (F3 in Athena's own recommendation): a member reassigned to another tenant
+mid-flight is now refused AT THE CLAIM (`CLAIM_INVITE_SQL`'s own `bind_target` EXISTS fails),
+so the invite is left intact and retryable — not burned, as round 1's documented "judgment
+call" accepted. The round-1 test asserting the invite WAS burned in this scenario has been
+replaced with one asserting it stays intact (`accepted_at: null`).
+
+`memberBindLandedGuard` (gating the capabilities INSERT and receipt-completion UPDATE) was a
+STATE test — `EXISTS(members WHERE id = ? AND telegram_chat_id = ?)` — satisfiable by ANY
+history that happened to leave that value set, independent of whether `bindMemberStatement`
+itself ran, and ran successfully, for THIS claim (F2's exact mechanism: a member already
+carrying the redeeming identity, reassigned mid-flight, made the state test pass while the
+bind statement silently affected 0 rows). Fix: migration `0154` gains an additive
+`members.telegram_bound_at TEXT` column, written ONLY by `bindMemberStatement` with THIS
+claim's own unique timestamp (`claimTimestamp()` mixes in a random suffix); the guard
+(`MEMBER_BIND_LANDED_GUARD_SQL`, also exported) now checks `telegram_bound_at = ?` bound to
+that same claim timestamp — a PROOF this claim's own write landed, not a fact that could
+already have been true.
+
+### kasra-review P0-1 — identity takeover, closed
+
+A member-bind invite mints a Telegram credential that authenticates AS the target
+(`memberForChat`). Round 1's actor check (`actorRankOnSquad`, squad-scope) and its target
+check (none) meant a squad-admin could member-bind a higher-ranked principal — an org owner,
+say — onto their own squad at a low capability, then redeem it from THEIR OWN Telegram id and
+resolve through `memberForChat` AS that member. No route ever cleared
+`members.telegram_chat_id`, so the takeover was permanent.
+
+Fix, reusing existing primitives rather than adding new ones:
+
+- `createProjectInvite`'s member-bind branch now computes the actor's rank via
+  `actorRankOnScopeFor(env, auth, 'org', null)` (org-scope, not squad-scope) — the SAME
+  authority `POST /members/:id/tokens` already requires for minting a credential AS someone.
+  The non-member_id (net-new) path is unchanged.
+- New `exceedsTargetRankCeiling` / `targetMaxRankAcrossScopes`
+  (`src/auth/capability.ts`) check the target's standing ACROSS EVERY SCOPE they hold a grant
+  on (reusing `resolveCapabilities`, the same query every capability check already runs), not
+  one `(scope_type, scope_id)` row. This closes the identical per-scope bypass in
+  `targetRankCeiling`'s three PRE-EXISTING call sites (`src/members/index.ts`: suspend/
+  reactivate, token mint, capability grant) uniformly — `targetRankCeiling` itself now
+  delegates to `exceedsTargetRankCeiling` instead of its own narrow query.
+- New `DELETE /members/:id/telegram` route (org admin + the same `targetRankCeiling`) — the
+  bind was previously irreversible; this is the admin-unbind half of P0-1(d) (a self-unbind
+  via the bound chat is not implemented this round).
+
+### kasra-review P2 / P3
+
+- P2-2: `createProjectInvite` now refuses `member_id` and `email` supplied together itself
+  (`invalid_invite_scope`), not only at the HTTP `parseInvite` layer — a non-HTTP caller of
+  the service cannot bypass the route's own check.
+- P2-1 (email visibility / enumeration): resolved as a consequence of the P0-1 fix rather than
+  a separate change — member-bind invites now require ORG admin, the same principal who
+  already has full member visibility via `GET /members`, so the response's `invite.email`
+  is no longer reachable by a caller below that floor.
+- P2-3 (UNIQUE throw on a pre-existing capability row on the invited squad → permanent
+  `redemption_failed`): NOT fixed this round — noted here as a known robustness gap (the
+  claim itself rolls back on the thrown constraint, so the invite is not burned, but the
+  invite becomes permanently unusable until an operator intervenes). Left for a follow-up;
+  tracked in the PR body.
+- P3: migration `0154`'s `DROP TRIGGER` now uses `IF EXISTS` (matching 37/39 other
+  migrations); the trigger now also refuses a whitespace-only `member_id`. The operations
+  runbook's preflight, rollback, and evidence checklists now name `0154` alongside `0152`/
+  `0153`. This file's round-1 mutation table gained the "Killed by" column Athena's BLOCK
+  named as missing, and the self-falsifying commit list above (round 1's own section) is
+  corrected to include the two docs-only commits that followed `aa66b330` on this same
+  branch. "Who may target whom" for the member-bind path: an actor needs ORG-scope admin (or
+  owner) standing AND the target's MAX standing across every scope must not exceed the
+  actor's own — documented above under kasra-review P0-1, and in
+  `docs/operations/telegram-project-onboarding.md`'s bind-existing-member section.
+
+### Mutation table (round 2, all executed for real on the committed tree: mutate → run
+### targeted test(s) → confirm red → restore from a clean `git diff --stat`-empty baseline
+### → next; full commands and exact test names in
+### `tests/telegram-project-onboarding.test.ts`)
+
+| Guard | Location | Mutation | Result | Killed by |
+| --- | --- | --- | --- | --- |
+| `MEMBER_BIND_ELIGIBLE_SQL` tenant: `OR tenant IS NULL` restored | `src/members/project-invites.ts` | exact tenant match relaxed to the round-1 collapse shape | RED | "F1 — refuses at the claim (invite stays intact) when the target member has a NULL tenant" |
+| `MEMBER_BIND_ELIGIBLE_SQL` tenant conjunct dropped entirely (param kept, made a no-op) | `src/members/project-invites.ts` | `tenant = ?` → `(? IS NOT NULL)` | RED × 3 | "refuses at the claim (invite stays intact) when the target member is reassigned to another tenant mid-flight"; "F1 …"; "F2 — refuses at the claim, grants nothing, when the target already carries the redeeming Telegram id AND was reassigned to another tenant" |
+| `MEMBER_BIND_UPDATE_SQL` stops interpolating the shared constant (inlines a textually-different copy) | `src/members/project-invites.ts` | `${MEMBER_BIND_ELIGIBLE_SQL}` replaced with a hand-typed, deliberately narrower WHERE | RED | "seam — the claim and the bind statement interpolate the IDENTICAL member-eligibility fragment" |
+| `MEMBER_BIND_LANDED_GUARD_SQL` reverted to a state test | `src/members/project-invites.ts` | `telegram_bound_at = ?` → `telegram_chat_id = ?` (JS still binds `claimedAt` as the 2nd param — a type/semantic mismatch, not merely a text change) | RED × 6 (every bind-success path breaks, plus the dedicated proof test) | "MEMBER_BIND_LANDED_GUARD_SQL requires THIS claim's own stamp, not a pre-existing matching identity"; "joins through Telegram with the same generic reply text as the net-new path"; "does not burn the invite when the target member is suspended — it is retryable once reactivated"; + 3 more bind-success tests |
+| Member-bind actor rank restricted to squad-scope again (`hasMemberId ? org : squad` branch removed) | `src/members/project-invites.ts` | `actorRankOnScopeFor` branch dropped, always `actorRankOnSquad` | RED | "P0-1a — refuses a squad-admin actor (no org-scope standing) for a member-bind invite" |
+| `exceedsTargetRankCeiling` call removed from `createProjectInvite` | `src/members/project-invites.ts` | ceiling check block deleted | RED | "P0-1b — refuses an org-admin actor targeting a member who outranks them via a DIFFERENT, unrelated scope (target-rank ceiling, across ALL scopes)" |
+| `targetMaxRankAcrossScopes` narrowed back to org-scope-only (the pre-P0-1 shape) | `src/auth/capability.ts` | non-org grants skipped in the max-rank loop | RED × 2 | "P0-1b — …"; "refuses an org admin unbinding a member who outranks them via a DIFFERENT scope" |
+| `targetRankCeiling` call removed from the new unbind route | `src/members/index.ts` | ceiling check block deleted | RED | "refuses an org admin unbinding a member who outranks them via a DIFFERENT scope" |
+| Service-level `email` + `member_id` refusal removed | `src/members/project-invites.ts` | `invalid_invite_scope` check block deleted | RED | "P2-2 — the SERVICE itself refuses member_id and email supplied together, bypassing the HTTP route entirely" |
+| 0154 whitespace-only `member_id` trigger clause removed (both INSERT/UPDATE triggers) | migration 0154 | `RAISE(ABORT, 'project invite member bind requires a non-blank member_id')` clause deleted | RED (different error — `FOREIGN KEY constraint failed` — confirming the clause is what threw, not a vacuous no-op) | "requires a member-bind project invite member_id to be non-blank" |
+
+No new survivors reported this round — every new/changed guard above was proven by at least
+one mutation.
+
+### Verification
+
+- `npm run typecheck`: clean (`tsc --noEmit` exit 0).
+- `npx vitest run tests/telegram-project-onboarding.test.ts`: exit 0, **90/90** (up from 76 at
+  round 1 — 14 new tests: reassignment behavior change, F1, F2, seam, stamp-proof, P0-1a/b/c,
+  P2-2, 6 unbind-route tests, whitespace-member_id trigger test; net +14 after also removing
+  and replacing the one round-1 test whose assertion direction flipped).
+- `npx vitest run tests/members-sensitive-response.test.ts tests/members-agent-capability-route.test.ts tests/agent-self-update.test.ts tests/squad-member-tools.test.ts`:
+  exit 0, 4 files, **119/119** — confirms `targetRankCeiling`'s three pre-existing call sites
+  are unaffected by the across-all-scopes change (their fixtures grant exactly one scope per
+  member, so the narrower and broader queries agree on every one of these cases).
+- All local CI-parity scripts, re-run at head `8a08d69e`: `check-branch-staleness`,
+  `check-mcp-tool-seam`, `check-migration-numbering` (`0154` still sorts above `origin/main`
+  head `0153`, still uncontested by every other open PR's migrations dir),
+  `check-operator-counts-source`, `check-schema-chain-fresh` (fresh after `npm run
+  gen:schema-chain`), `check-test-schema-source`, `no-secrets`, `release-truth-policy` — all
+  exit 0.
+- **Full suite (`npm test`, all 515 files): NOT completed at head `8a08d69e`.** The host this
+  session ran on was under sustained memory pressure from OTHER concurrent processes (other
+  agent sessions, Hermes gateways, Celery workers — confirmed via `ps`/`free`, not attributable
+  to this PR's own code or tests) for the whole verification window. Three whole-suite attempts
+  (default parallelism, `--maxWorkers=2`, `--maxWorkers=1`) were each killed by the harness's
+  own low-memory guard before finishing; a fourth attempt split the suite into file-list chunks
+  to bound peak memory. What that chunking DID complete, all green, before being stopped to
+  finalize this report:
+  - `tests/execute*.test.ts` … lexicographically through the file list's first ~127 entries
+    (`find tests -name '*.test.ts' | sort`, chunk 1 of 4): **124 files, 2237 tests, 0 failed.**
+    (3 of the 127 names in that chunk are excluded by `vitest.config.ts`'s own exclude list —
+    not a failure, the same exclusion `npm test` itself applies.)
+  - The next 60 files (two 30-file sub-chunks of chunk 2 of 4, `tests/execute.test.ts` through
+    `tests/flight-routes.test.ts` alphabetically): **60 files, 985 tests, 0 failed** (451 +
+    534 across the two sub-chunks).
+  - **Not run this session:** the remaining files of chunk 2 (3 further 30-file sub-chunks),
+    and all of chunks 3 and 4 — roughly the back half of the alphabet
+    (`tests/flight-spine-*.test.ts` onward through `tests/*` and `tests/composition/`'s
+    workerd-pool step). None of the files not yet run are known, from this session, to touch
+    `src/members/`, `src/auth/capability.ts`, or the migration chain — but that is an
+    inference from the change's own surface area, not a measurement, and is exactly the kind
+    of claim a full run is supposed to replace with a fact.
+  - **Combined measured this session: 184 of 515 files, 3222 of an unknown total test count,
+    0 failures.** This is a strictly smaller claim than "full suite green" and must not be
+    read as one. The next re-gate should run `npm test` (or the same chunking, continued from
+    file 185 onward) against a clean git-backed checkout of head `8a08d69e` (or later) to get
+    the real, complete count — this session's own host contention is not evidence about the
+    code.

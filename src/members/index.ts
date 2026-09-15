@@ -13,6 +13,7 @@
 //   PATCH  /members/:id                  suspend / reactivate    (admin)
 //   POST   /members/:id/tokens           mint a scoped token     (admin) → raw ONCE
 //   DELETE /members/:id/tokens/:tid      revoke a token          (admin)
+//   DELETE /members/:id/telegram         unbind Telegram identity (admin)
 //   POST   /members/:id/capabilities     grant / revoke a grant  (admin)
 //
 // SECURITY DISCIPLINE
