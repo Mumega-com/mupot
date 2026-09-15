@@ -622,4 +622,23 @@ describe('DELETE /members/:id/telegram — round 4 (P1-A tenant fence, P2-B/C re
       'SELECT COUNT(*) AS n FROM telegram_unbind_receipts WHERE member_id = ?',
     ).get(TARGET_A)).toEqual({ n: 0 })
   })
+
+  // N1 (Athena, 2026-09-15): POST /members/:id/tokens' member lookup was
+  // unscoped by tenant — the same pre-existing #1330 F2 class this same
+  // round already closed on the unbind route two tests up. A tenant-A admin
+  // could mint a token (a credential that authenticates AS the member) for
+  // a tenant-B member.
+  it('N1 — refuses (member_not_found) a tenant-A admin minting a token for a tenant-B member', async () => {
+    const res = await membersApp.fetch(new Request(`https://pot.example/members/${TARGET_B}/tokens`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ label: 'cross-tenant mint attempt' }),
+    }), env)
+
+    expect(res.status).toBe(404)
+    await expect(res.json()).resolves.toEqual({ error: 'member_not_found' })
+    expect(harness.sqlite.prepare(
+      'SELECT COUNT(*) AS n FROM member_tokens WHERE member_id = ?',
+    ).get(TARGET_B)).toEqual({ n: 0 })
+  })
 })
