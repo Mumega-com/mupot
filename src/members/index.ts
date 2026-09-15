@@ -41,7 +41,7 @@ import type {
 import { requireAuth } from '../auth'
 import { isMissingWebSessionsTableError } from '../auth/web-sessions'
 import { csrf } from 'hono/csrf'
-import { assertBatchWritten } from '../lib/receipt'
+import { assertBatchWritten, assertWritten } from '../lib/receipt'
 // The FROZEN capability API — everyone codes against these exact signatures.
 import { requireCapability, capabilityRank, actorMaxRankOnScope, exceedsTargetRankCeiling } from '../auth/capability'
 // Shared token lifecycle — the single mint/revoke path (also used by the dashboard).
@@ -628,15 +628,25 @@ interface PatchMemberBody {
 // AND the member-bind invite path (src/members/project-invites.ts), so none of
 // them can independently regress back to the narrow, bypassable check.
 //
-// mupot#1411 N2 round 4 (Athena, 2026-09-15): no longer takes a scope — the
-// CEILING question ("does the target outrank the actor, anywhere") is scope-
-// independent by construction now that both sides of exceedsTargetRankCeiling
-// are the SAME global quantity (actorMaxRankAcrossScopes vs
-// targetMaxRankAcrossScopes). Passing a scope-local actor rank in here used
-// to compare two different quantities: an org admin who ALSO holds 'owner' on
-// one squad has global standing 5, but their org-scope-LOCAL rank is only 4 —
-// so a self-mint/self-suspend/self-grant for that exact principal 403'd,
-// treating them as unable to outrank themselves. The scope a caller is
+// mupot#1411 N2 round 4 (Athena, 2026-09-15): no longer takes a scope — round
+// 4 made the ACTOR side of exceedsTargetRankCeiling global too
+// (actorMaxRankAcrossScopes), reasoning that a scope-local actor rank
+// compared against a global target rank was two different quantities, and
+// added an explicit self-exemption so a principal can never outrank
+// themselves regardless.
+//
+// mupot#1411 A1 round 5 (Athena final-gate, 2026-09-15): round 4's
+// globalisation of the ACTOR side was itself the escalation — `actor =
+// actorMaxRankAcrossScopes` let an org admin who ALSO held 'owner' on one
+// unrelated squad act on every ORG-scope-gated route below (all four call
+// sites require `requireCapability(orgScope, 'admin')` first) as though
+// their real standing were global rank 5, not the org-scope rank 4 those
+// routes actually proved. exceedsTargetRankCeiling's actor side is now
+// `actorRankOnScopeFor(env, auth, 'org', null)` — org-scope-local, matching
+// what every call site here (and the member-bind invite path) already
+// requires before it ever reaches this ceiling. The self-exemption alone is
+// what closes N2 (a principal acting on themselves never reaches the
+// comparison at all); it survives this fix unchanged. The scope a caller is
 // ACTING on still needs its own, separate, scope-local floor (e.g. the grant
 // route's `capabilityRank(capability) > actorMaxRankOnScope(c, scopeType,
 // scopeId)` "cannot_grant_above_own_rank" check, a few lines below its own
@@ -826,32 +836,47 @@ membersApp.delete(
 
     const priorTelegramChatId = member.telegram_chat_id
     const actorId = c.get('auth').memberId ?? c.get('auth').userId
+    const receiptId = crypto.randomUUID()
+    const unboundAt = new Date().toISOString()
 
-    // mupot#1411 P2-B/C round 4 (kasra-review, 2026-09-15): this UPDATE used
-    // to be the ONLY write on this path — no tenant guard (same F2 class as
-    // the SELECT above) and no audit trail at all. Tenant-scoped identically
-    // to the SELECT now, PLUS a `telegram_chat_id = ?3` conjunct pinning it
-    // to the exact identity this handler just read (the same TOCTOU
-    // discipline as this feature's own MEMBER_BIND_LANDED_GUARD in
-    // project-invites.ts) — a 0-row result means the binding already changed
-    // out from under us, so the receipt below is never written for a no-op.
-    const update = await c.env.DB.prepare(
-      `UPDATE members SET telegram_chat_id = NULL, telegram_bound_at = NULL, tenant = ?2
-        WHERE id = ?1 AND (tenant = ?2 OR tenant IS NULL) AND telegram_chat_id = ?3`,
-    ).bind(memberId, c.env.TENANT_SLUG, priorTelegramChatId).run()
+    // mupot#1411 A8 round 5 (Athena final-gate, 2026-09-15): the clearing
+    // UPDATE and the receipt INSERT used to be two SEPARATE .run() calls — a
+    // failure on the receipt side (or a crash between the two calls) would
+    // leave the binding cleared with NO durable trace of who did it, exactly
+    // the phantom-success class assertWritten/assertBatchWritten exist to
+    // catch elsewhere in this file (invite-accept's own mint batch, a few
+    // hundred lines up). Batched atomically now (same `DB.batch()` shape the
+    // suspend route above already uses for its UPDATE+UPDATE pair) so either
+    // both writes land or neither does.
+    //
+    // The receipt INSERT is `... SELECT ... WHERE changes() = 1` rather than
+    // an unconditional VALUES row — the same cross-statement idiom this
+    // codebase already uses (migrations 0071/0134/0135's triggers,
+    // src/flight-spine/receipts.ts's own atomic-audit guard) to make one
+    // statement's write conditional on the row count the PREVIOUS statement
+    // in the same transaction actually changed. `changes() = 1` here reads
+    // the UPDATE immediately above: a 0-row UPDATE (the TOCTOU race the
+    // `telegram_chat_id = ?3` conjunct guards — someone else changed the
+    // binding between the SELECT above and now) must not write a receipt
+    // that claims a clearing which never happened.
+    const [update, insert] = await c.env.DB.batch([
+      c.env.DB.prepare(
+        `UPDATE members SET telegram_chat_id = NULL, telegram_bound_at = NULL, tenant = ?2
+          WHERE id = ?1 AND (tenant = ?2 OR tenant IS NULL) AND telegram_chat_id = ?3`,
+      ).bind(memberId, c.env.TENANT_SLUG, priorTelegramChatId),
+      c.env.DB.prepare(
+        `INSERT INTO telegram_unbind_receipts
+           (id, tenant, member_id, actor_id, prior_telegram_chat_id, created_at)
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6
+          WHERE changes() = 1`,
+      ).bind(receiptId, c.env.TENANT_SLUG, memberId, actorId, priorTelegramChatId, unboundAt),
+    ])
     if (!update.meta || update.meta.changes === 0) return c.json({ error: 'member_not_found' }, 404)
-
-    // Credential REVOCATION, same authority class as a token mint — leaves a
-    // durable trace of who cleared which identity, and which identity, and
-    // when. Written only once the clearing UPDATE above is proven to have
-    // landed against the exact prior identity, never against a guess.
-    await c.env.DB.prepare(
-      `INSERT INTO telegram_unbind_receipts
-         (id, tenant, member_id, actor_id, prior_telegram_chat_id, created_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-    )
-      .bind(crypto.randomUUID(), c.env.TENANT_SLUG, memberId, actorId, priorTelegramChatId, new Date().toISOString())
-      .run()
+    // The UPDATE landed (changes === 1), so the conditional INSERT above was
+    // guaranteed to fire — assertWritten catches a phantom success (e.g. a
+    // future constraint silently no-opping the row) rather than reporting
+    // telegram_unbound: true over an unrecorded revocation.
+    assertWritten(insert, 'telegram_unbind_receipts.insert')
 
     return c.json({ member_id: memberId, telegram_unbound: true })
   },
@@ -869,8 +894,17 @@ interface CapabilityBody {
 membersApp.post('/members/:id/capabilities', requireCapability(orgScope, 'admin'), async (c) => {
   const memberId = c.req.param('id')
 
-  const member = await c.env.DB.prepare('SELECT id FROM members WHERE id = ? LIMIT 1')
-    .bind(memberId)
+  // mupot#1411 P1 round 5 (kasra-review adversarial addendum, 2026-09-15):
+  // pre-existing, same #1330 F2 class the suspend/mint/unbind routes in this
+  // file already closed — this SELECT was `WHERE id = ?` alone, letting a
+  // tenant-A admin grant or revoke a capability on a tenant-B member. Same
+  // tenant-collapse predicate as the other reads here (exact match OR legacy
+  // NULL-tenant row); no write here to adopt the tenant on, since a grant/
+  // revoke never updates the members row itself.
+  const member = await c.env.DB.prepare(
+    'SELECT id FROM members WHERE id = ?1 AND (tenant = ?2 OR tenant IS NULL) LIMIT 1',
+  )
+    .bind(memberId, c.env.TENANT_SLUG)
     .first<{ id: string }>()
   if (!member) return c.json({ error: 'member_not_found' }, 404)
 

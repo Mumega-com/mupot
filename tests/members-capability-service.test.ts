@@ -49,7 +49,7 @@ function makeServiceDb(options: ServiceDbOptions = {}) {
               // this stub must declare. null email = no bridge, no
               // role-plane standing (this fixture's grants already cover
               // the case under test).
-              if (sql.includes('SELECT email FROM members')) return { email: null } as T
+              if (sql.includes('FROM members') && sql.includes('lower(email)')) return { email: null } as T
               throw new Error(`unexpected first query: ${sql}`)
             },
             async all<T>() {
@@ -130,7 +130,7 @@ function makeGrantRouteEnv(
             return (capability === undefined ? null : { capability }) as T | null
           }
           // mupot#1411 P0-A round 4: same role-plane bridge as above.
-          if (sql.includes('SELECT email FROM members')) return { email: null } as T
+          if (sql.includes('FROM members') && sql.includes('lower(email)')) return { email: null } as T
           throw new Error(`unexpected first query: ${sql}`)
         },
         async all<T>() {

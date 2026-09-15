@@ -50,7 +50,7 @@ function makeEnv(options: {
           // declare. `email: null` = "no bridge, no role-plane standing",
           // matching this test's [] capability-grants fixture (target holds
           // nothing anywhere; its subject is response headers, not authz).
-          if (sql.includes('SELECT email FROM members')) return { email: null } as T
+          if (sql.includes('FROM members') && sql.includes('lower(email)')) return { email: null } as T
           throw new Error(`unexpected first query: ${sql}`)
         },
         // mupot#1411 P0-1 (kasra-review, 2026-09-15): the mint route's

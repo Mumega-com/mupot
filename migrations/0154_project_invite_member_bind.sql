@@ -162,3 +162,22 @@ CREATE TABLE IF NOT EXISTS telegram_unbind_receipts (
 
 CREATE INDEX IF NOT EXISTS idx_telegram_unbind_receipts_member
   ON telegram_unbind_receipts(tenant, member_id, created_at DESC);
+
+-- mupot#1411 P1 round 5 (kasra-review adversarial addendum, 2026-09-15): this
+-- table's own comment above claimed "append-only" citing 0091's
+-- oauth_consent_receipts precedent, but never actually carried 0091's
+-- no-update/no-delete trigger pair -- an UPDATE forging actor_id, or an
+-- outright DELETE, both silently succeeded. Since this migration has not
+-- shipped anywhere yet (still unmerged branch #1411), the pair is added
+-- directly here rather than a follow-up migration.
+CREATE TRIGGER telegram_unbind_receipts_no_update
+BEFORE UPDATE ON telegram_unbind_receipts
+BEGIN
+  SELECT RAISE(ABORT, 'telegram_unbind_receipts is append-only: UPDATE is forbidden');
+END;
+
+CREATE TRIGGER telegram_unbind_receipts_no_delete
+BEFORE DELETE ON telegram_unbind_receipts
+BEGIN
+  SELECT RAISE(ABORT, 'telegram_unbind_receipts is append-only: DELETE is forbidden');
+END;

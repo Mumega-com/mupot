@@ -427,6 +427,56 @@ describe('POST /members/:id/capabilities — target-rank ceiling (#1337)', () =>
     expect(orgCapabilityOf(BOOTSTRAP_OWNER_MEMBER)).toBeUndefined()
   })
 
+  // ── A2 round 5 (Athena final-gate, 2026-09-15): the members.email ->
+  // users.email bridge compared EXACT case on both hops — every other email
+  // bridge in this codebase (auth/index.ts:1285, sso.ts:114,
+  // resolve-human-member.ts:158,169, migration 0146) is case-insensitive via
+  // lower(). A `members.email` captured with different casing than its
+  // `users.email` counterpart bridged to NOTHING, silently returning legacy
+  // rank 0 and letting an org admin suspend/mint-for/grant-on the target as
+  // though they had no role-plane standing at all.
+  const MIXED_CASE_OWNER_MEMBER = 'member-mixed-case-owner'
+  const MIXED_CASE_MEMBERS_EMAIL = 'Bootstrap-Owner@Example.Test'
+  const MIXED_CASE_USERS_EMAIL = 'bootstrap-owner@example.test'
+
+  function insertMixedCaseOwner(): void {
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status, tenant)
+        VALUES ('${MIXED_CASE_OWNER_MEMBER}', '${MIXED_CASE_MEMBERS_EMAIL}', 'Mixed Case Owner', 'active', '${TENANT}');
+      INSERT INTO users (id, email, role)
+        VALUES ('user-mixed-case-owner', '${MIXED_CASE_USERS_EMAIL}', 'owner');
+    `)
+  }
+
+  it('A2 — refuses an admin SUSPENDING a member whose members.email differs only in CASE from users.email (legacy rank 5)', async () => {
+    insertMixedCaseOwner()
+    const res = await membersApp.fetch(new Request(`https://pot.example/members/${MIXED_CASE_OWNER_MEMBER}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ status: 'suspended' }),
+    }), env)
+
+    expect(res.status).toBe(403)
+    await expect(res.json()).resolves.toMatchObject({ reason: 'cannot_affect_higher_rank' })
+    expect(harness.sqlite.prepare('SELECT status FROM members WHERE id = ?').get(MIXED_CASE_OWNER_MEMBER))
+      .toEqual({ status: 'active' })
+  })
+
+  it('A2 — refuses an admin MINTING A TOKEN for a member whose members.email differs only in CASE from users.email', async () => {
+    insertMixedCaseOwner()
+    const res = await membersApp.fetch(new Request(`https://pot.example/members/${MIXED_CASE_OWNER_MEMBER}/tokens`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ label: 'escalation attempt via case-mismatched email bridge' }),
+    }), env)
+
+    expect(res.status).toBe(403)
+    await expect(res.json()).resolves.toMatchObject({ reason: 'cannot_affect_higher_rank' })
+    expect(harness.sqlite.prepare(
+      'SELECT COUNT(*) AS n FROM member_tokens WHERE member_id = ?',
+    ).get(MIXED_CASE_OWNER_MEMBER)).toEqual({ n: 0 })
+  })
+
   it('P0-A — a member with NO email bridges to nothing and is never treated as elevated', async () => {
     // Absence of a bridge (no email, or an email matching no `users` row) is
     // the SAFE default (0), never an escalation — this member has real
@@ -504,6 +554,85 @@ describe('POST /members/:id/capabilities — target-rank ceiling (#1337)', () =>
       capability: 'admin',
     }), env)
     expect(grantRes.status).toBe(201)
+  })
+
+  // ── A1 round 5 (Athena final-gate, 2026-09-15): the globalised actor side
+  // round 4 introduced to fix N2 was ITSELF the escalation. This actor is an
+  // org admin (org-scope rank 4, the only standing every route below ever
+  // proves via requireCapability(orgScope,'admin')) who ALSO holds 'owner'
+  // on an unrelated squad (global rank 5 under round 4's actorMaxRank-
+  // AcrossScopes). Acting on ANOTHER principal — the real org owner, not
+  // themselves — round 4's code let this actor's inflated global 5 tie the
+  // owner's global 5 (5 > 5 is false) and sail through: reproduced end to
+  // end, mint-for-owner 201, suspend-owner 200, revoke-owner-org-row 200
+  // removed:1. The self-exemption that closes N2 does not apply here (the
+  // target is a DIFFERENT member) — only measuring the actor on the org
+  // scope the route actually authorized (rank 4 < owner's global rank 5)
+  // closes this one. Mutating the actor side of exceedsTargetRankCeiling
+  // back to the global function must flip all three assertions below to
+  // green-when-they-should-be-red.
+  const ADMIN_WITH_SQUAD_OWNER_ELSEWHERE = 'member-admin-squad-owner-elsewhere'
+
+  function setActorAdminWithSquadOwnerElsewhere(): void {
+    harness.sqlite.exec(`
+      INSERT INTO members (id, display_name, status, tenant)
+        VALUES ('${ADMIN_WITH_SQUAD_OWNER_ELSEWHERE}', 'Admin Plus Squad Owner Elsewhere', 'active', '${TENANT}');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES
+        ('cap-a1-org-admin', '${ADMIN_WITH_SQUAD_OWNER_ELSEWHERE}', 'org', NULL, 'admin'),
+        ('cap-a1-squad-owner', '${ADMIN_WITH_SQUAD_OWNER_ELSEWHERE}', 'squad', '${TARGET_SQUAD_ID}', 'owner');
+    `)
+    authState.current = {
+      userId: 'admin-squad-owner-elsewhere-user',
+      email: 'admin-squad-owner-elsewhere@example.test',
+      role: 'member',
+      tenant: TENANT,
+      memberId: ADMIN_WITH_SQUAD_OWNER_ELSEWHERE,
+      capabilities: [
+        { member_id: ADMIN_WITH_SQUAD_OWNER_ELSEWHERE, scope_type: 'org', scope_id: null, capability: 'admin' },
+        { member_id: ADMIN_WITH_SQUAD_OWNER_ELSEWHERE, scope_type: 'squad', scope_id: TARGET_SQUAD_ID, capability: 'owner' },
+      ],
+    } as AuthContext
+  }
+
+  it('A1 — refuses this actor SUSPENDING the real org owner (was 200 under round-4 global actor rank)', async () => {
+    setActorAdminWithSquadOwnerElsewhere()
+    const res = await membersApp.fetch(new Request(`https://pot.example/members/${OWNER_MEMBER}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ status: 'suspended' }),
+    }), env)
+
+    expect(res.status).toBe(403)
+    await expect(res.json()).resolves.toMatchObject({ reason: 'cannot_affect_higher_rank' })
+    expect(harness.sqlite.prepare('SELECT status FROM members WHERE id = ?').get(OWNER_MEMBER))
+      .toEqual({ status: 'active' })
+  })
+
+  it('A1 — refuses this actor MINTING A TOKEN for the real org owner (was 201 under round-4 global actor rank)', async () => {
+    setActorAdminWithSquadOwnerElsewhere()
+    const res = await membersApp.fetch(new Request(`https://pot.example/members/${OWNER_MEMBER}/tokens`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ label: 'escalation attempt via unrelated squad owner grant' }),
+    }), env)
+
+    expect(res.status).toBe(403)
+    await expect(res.json()).resolves.toMatchObject({ reason: 'cannot_affect_higher_rank' })
+    expect(harness.sqlite.prepare(
+      'SELECT COUNT(*) AS n FROM member_tokens WHERE member_id = ?',
+    ).get(OWNER_MEMBER)).toEqual({ n: 0 })
+  })
+
+  it("A1 — refuses this actor REVOKING the real org owner's org capability row (was 200 removed:1 under round-4 global actor rank)", async () => {
+    setActorAdminWithSquadOwnerElsewhere()
+    const res = await membersApp.fetch(ownerCapabilityRequest(OWNER_MEMBER, {
+      action: 'revoke',
+      scope_type: 'org',
+    }), env)
+
+    expect(res.status).toBe(403)
+    await expect(res.json()).resolves.toMatchObject({ reason: 'cannot_affect_higher_rank' })
+    expect(orgCapabilityOf(OWNER_MEMBER)).toEqual({ capability: 'owner' })
   })
 })
 
@@ -591,6 +720,54 @@ describe('DELETE /members/:id/telegram — round 4 (P1-A tenant fence, P2-B/C re
 
     expect(res.status).toBe(404)
     await expect(res.json()).resolves.toEqual({ error: 'member_not_found' })
+  })
+
+  // M12 (kasra-review adversarial addendum round 5, 2026-09-15): the SELECT
+  // above and the clearing UPDATE each carry their OWN independent tenant
+  // fence (defense in depth) — but every existing test reaches the UPDATE
+  // only via a SELECT that already filtered cross-tenant rows out, so a
+  // mutation removing JUST the UPDATE's own `(tenant = ?2 OR tenant IS
+  // NULL)` conjunct was never independently exercised (every same-tenant
+  // test still passes with it removed, and every cross-tenant test is
+  // already refused earlier by the SELECT). This simulates "the SELECT
+  // fence removed" by stubbing ONLY that one prepared statement to return a
+  // fabricated (fence-bypassed) row, while every other statement —
+  // including the real clearing UPDATE and receipt INSERT, run inside the
+  // same DB.batch() — still executes against the REAL sqlite database. If
+  // the UPDATE's own fence is intact, the cross-tenant write still fails (0
+  // rows changed) and the real tenant-B row survives untouched.
+  it("M12 — the clearing UPDATE's own tenant fence independently refuses a cross-tenant target, even if the SELECT fence were bypassed", async () => {
+    const SELECT_SQL = 'SELECT id, telegram_chat_id FROM members WHERE id = ?1 AND (tenant = ?2 OR tenant IS NULL) LIMIT 1'
+    const realDb = env.DB
+    const fenceBypassedDb = {
+      prepare: (sql: string) => {
+        if (sql === SELECT_SQL) {
+          return {
+            bind: () => ({
+              // Lies: claims the fence passed for a real tenant-B row —
+              // simulating the SELECT's own fence having been removed.
+              first: async () => ({ id: TARGET_B, telegram_chat_id: '9500100' }),
+            }),
+          } as unknown as D1PreparedStatement // stub covers only bind().first(), the one shape this route calls on it
+        }
+        return realDb.prepare(sql)
+      },
+      batch: (statements: D1PreparedStatement[]) => realDb.batch(statements),
+    } as unknown as D1Database // partial stub: only prepare/batch are exercised on this route
+
+    const fenceBypassedEnv = { ...env, DB: fenceBypassedDb } as Env
+
+    const res = await membersApp.fetch(unbindRequest(TARGET_B), fenceBypassedEnv)
+
+    expect(res.status).toBe(404)
+    await expect(res.json()).resolves.toEqual({ error: 'member_not_found' })
+    // The REAL row (tenant-B) survives — the UPDATE's own fence, not merely
+    // the SELECT above it, is what refused this write.
+    expect(harness.sqlite.prepare('SELECT telegram_chat_id FROM members WHERE id = ?').get(TARGET_B))
+      .toEqual({ telegram_chat_id: '9500100' })
+    expect(harness.sqlite.prepare(
+      'SELECT COUNT(*) AS n FROM telegram_unbind_receipts WHERE member_id = ?',
+    ).get(TARGET_B)).toEqual({ n: 0 })
   })
 
   it('P2-B/C — a successful unbind writes an append-only receipt row (actor, target, prior identity)', async () => {
