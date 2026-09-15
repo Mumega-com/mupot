@@ -1039,3 +1039,84 @@ one mutation.
     file 185 onward) against a clean git-backed checkout of head `8a08d69e` (or later) to get
     the real, complete count — this session's own host contention is not evidence about the
     code.
+  - **Superseded by Round 3 below**, which ran the full suite once, uncontended, to
+    completion — see that section for the real, complete count.
+
+## Round 3 — CI fix for the round-2 widening's own test fixture (2026-09-15)
+
+CI run `34917646917` on head `fbf85528` (round 2's own final head) came back **1 failed /
+8054 passed**:
+
+```
+FAIL tests/members-capability-service.test.ts > POST /members/:id/capabilities > returns
+     the shared upsert result after consolidating duplicate…
+AssertionError: expected 500 to be 201
+Error: unexpected all query: SELECT member_id, scope_type, scope_id, capability
+```
+
+Cause: round 2 widened `targetRankCeiling` to consult `exceedsTargetRankCeiling` /
+`targetMaxRankAcrossScopes` (`src/auth/capability.ts`) — the target's standing across
+*every* scope, via the same `resolveCapabilities` query every capability check already
+runs — and applied that uniformly to all three pre-existing call sites in
+`src/members/index.ts` (suspend/reactivate, token mint, capability grant). The grant
+route's own test fixture (`makeGrantRouteEnv` in `tests/members-capability-service.test.ts`)
+mocked only the OLD, narrower query shape; the new `.all()` query fell through to the
+mock's own `throw new Error('unexpected all query: …')`, so the route 500'd instead of
+returning 201. `tests/members-sensitive-response.test.ts`'s sibling mock had already been
+updated for this shape in round 2 — this one fixture was missed.
+
+### Fix (not just patching the mock blind)
+
+- `makeGrantRouteEnv` now declares the new `resolveCapabilities` query shape (identical
+  pattern to the already-fixed stub in `tests/members-sensitive-response.test.ts`) and
+  accepts an explicit `{ role, targetGrants }` override instead of always assuming an
+  org-owner actor and org-scope target grants.
+- Added a **positive** test proving the grant route's ceiling is actually consulted, not
+  merely mocked without throwing: an org-admin actor (rank 4, no fine-grained
+  capabilities) attempts to grant a capability to a target who holds nothing on the `org`
+  scope being acted on but holds `owner` (rank 5) on an unrelated squad — refused, `403
+  cannot_affect_higher_rank`.
+- Audited the other two pre-existing call sites (`tests/members-agent-capability-route.test.ts`)
+  and found neither had ANY test that could distinguish the round-2 across-all-scopes
+  widening from the pre-#1411 per-scope-only check — every existing fixture in that
+  describe block granted the target exactly one scope, so the narrow and broad queries
+  agreed on every case tested. Added one cross-scope regression test per call site
+  (a new `member-squad-owner` fixture member holding `owner` on `squad-target` only,
+  nothing on `org`; the acting `member-admin` is an org admin with no standing on
+  `squad-target`):
+  - `PATCH /members/:id` (suspend) — refused, `403 cannot_affect_higher_rank`, member
+    stays `active`.
+  - `POST /members/:id/tokens` (mint) — refused, `403 cannot_affect_higher_rank`, zero
+    `member_tokens` rows minted.
+- Grepped the whole test tree for other query-shape mocks that could see the new query
+  (`grep -rn "unexpected all query\|unexpected first query" tests/`): the only other hit,
+  `tests/flight-routes.test.ts`, already matches broadly on `sql.includes('FROM
+  capabilities')` and needed no change.
+
+### Mutation proof (all 3 new tests, executed for real)
+
+`src/members/index.ts`'s `targetRankCeiling` was temporarily reverted in place to the
+pre-#1411 per-scope-only shape (query `resolveCapabilities`, filter to the exact
+`(scopeType, scopeId)` the route acts on, drop `exceedsTargetRankCeiling` entirely), then
+restored from a backup copy (`git diff --stat` empty afterward, confirmed):
+
+| Test | Result under the per-scope revert |
+| --- | --- |
+| grant route — "refuses an org admin granting a capability to a member who outranks them via a DIFFERENT scope" | RED — 201 instead of 403 |
+| suspend — "refuses an admin SUSPENDING a member who outranks them via a DIFFERENT, unrelated squad" | RED — 200 instead of 403 |
+| token mint — "refuses an admin MINTING A TOKEN for a member who outranks them via a DIFFERENT, unrelated squad" | RED — 201 instead of 403 |
+
+All other tests in both files stayed green under the same revert, confirming they only
+ever exercised the same-scope case and could not have caught this regression.
+
+### Verification
+
+- `npm run typecheck`: clean (`tsc --noEmit` exit 0).
+- Focused (`tests/members-capability-service.test.ts tests/telegram-project-onboarding.test.ts
+  tests/members-sensitive-response.test.ts tests/members-agent-capability-route.test.ts`):
+  exit 0, **4 files, 118/118**.
+- **Full suite (`npm test`, all 512 files, default worker parallelism, run once,
+  uncontended host): exit 0, 512 files, 8058 tests, 0 failed.** This is the first
+  complete (non-chunked) full-suite run recorded on this branch. It reconciles exactly
+  with CI's 8054-passed/1-failed count at `fbf85528`: 8054 + 1 (the fixed test) + 3 (the
+  new tests above) = 8058.
