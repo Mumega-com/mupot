@@ -262,6 +262,7 @@ import '../departments/modules/agency' // side-effect: register AgencyModule (re
 import '../departments/modules/web-ops' // side-effect: register WebOpsModule (AI website-operations team — the wedge)
 import { makeMissionControlApp } from './mission-control-routes'
 import { makeElevationApp } from './elevation'
+import { makeAccountApp } from './account'
 export { controlTowerBody, potFleetBody } from './mission-control-views'
 import { getAuthContext, loadStudioData, studioPageHtml, dispatchStudioFlight, isSafeRepoUrl } from './studio'
 import { deployProject } from '../projects/deploy'
@@ -1407,6 +1408,13 @@ dashboardApp.route('/', makeMissionControlApp(shell))
 // structurally — inherits dashboardApp's cookie-only requireAuth gate above;
 // see src/dashboard/elevation.ts's module header for the full argument.
 dashboardApp.route('/', makeElevationApp(shell))
+
+// Mount Account Sub-app: GET /account ("My Account") — the Telegram
+// decision-pilot's self-service Connect/Disconnect page (mupot#1412).
+// UI only, over the existing POST /api/members/invites and DELETE
+// /api/members/members/:id/telegram routes — see src/dashboard/account.ts's
+// module header for the full authorization argument.
+dashboardApp.route('/', makeAccountApp(shell))
 
 // Mount Kanban Sub-app
 dashboardApp.route('/', kanbanApp)
@@ -3547,6 +3555,7 @@ export function shell(
       .sidebar-footer-account {
         flex: 1; min-width: 0; display: flex; align-items: center; gap: 10px;
         background: transparent; border: none; cursor: pointer; padding: 0; text-align: left;
+        text-decoration: none; color: inherit;
       }
       .sidebar-footer-avatar {
         width: 30px; height: 30px; flex: none; border-radius: 50%;
@@ -4368,13 +4377,13 @@ export function shell(
 
         <!-- account row + theme toggle -->
         <div class="sidebar-footer">
-          <button class="sidebar-footer-account" id="footer-account" aria-label="Account menu">
+          <a class="sidebar-footer-account" id="footer-account" href="/account" aria-label="My account">
             <span class="sidebar-footer-avatar" id="footer-avatar">?</span>
             <span>
               <span class="sidebar-footer-name" id="footer-name">—</span>
               <span class="sidebar-footer-role" id="footer-role">member</span>
             </span>
-          </button>
+          </a>
           <button class="sidebar-theme-btn" id="theme-toggle" title="Toggle theme" aria-label="Toggle light/dark theme">
             <span id="theme-icon">☀</span>
           </button>

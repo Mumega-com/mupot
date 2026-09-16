@@ -48,6 +48,37 @@ another tenant, a deliberate collapse so this is never a cross-tenant existence 
 `member_not_active` (403, a suspended member), or `member_missing_email` (400, an IM-only
 member with no email on file) before minting the invite.
 
+### Dashboard: Connect Telegram (self-service, mupot#1412)
+
+The curl call above is still the general-purpose path (any target member, any project/squad,
+any capability an admin chooses). For the common case — an org admin binding their **own**
+Telegram identity — the dashboard's **My Account** page (`/account`, linked from the sidebar
+account row) wraps the exact same `POST /api/members/invites` and `DELETE
+/api/members/members/:id/telegram` routes in a UI, with no new authorization predicate (see
+`src/dashboard/account.ts`'s module header for the full argument):
+
+- **Not connected:** a "Connect Telegram" button mints a 24-hour, self-targeted invite
+  (`member_id` is always the viewer's own server-rendered id, never client-suppliable) against
+  a project/squad the viewer already has access to (one picked automatically when only one is
+  eligible), at a capability equal to the viewer's own existing rank on that squad — never
+  higher. The response renders the pairing code and, when the bot's `@username` is available
+  (derived live via `getMe`, cached — see `getTelegramBotUsername`), a `https://t.me/<bot>?
+  start=<code>` deep link plus the expiry; otherwise it shows the code with plain instructions
+  to message the bot directly.
+- **Connected:** shows "Connected · bound `<date>`" and a Disconnect button (self-unbind needs
+  no rank at all, same as the curl-based unbind above).
+- **Below the org-admin mint floor:** the page shows an honest "ask an org admin" explanation
+  instead of a button wired to a guaranteed `forbidden` — see the next paragraph for why that
+  floor exists and is not something this page works around.
+
+**This does not lower the mint floor.** `createProjectInvite`'s member-bind path still requires
+the ACTOR to hold org-scope admin-or-above standing regardless of who they are binding —
+self-exemption only ever waives the checked TARGET's rank ceiling, never that floor (see "Who
+may target whom" below). An ordinary member with no org-scope grant cannot self-connect
+Telegram from this page, or from the curl call above, today. Updated owner flow for the pilot:
+**dashboard My Account → Connect Telegram → tap the Telegram link → `/start` runs
+automatically → `/needs` → `/approve <id>`.**
+
 **Who may target whom.** A member-bind invite mints a Telegram credential that authenticates
 AS the target member — the same thing a token mint does — so it requires the SAME authority:
 the actor needs **org-scope admin (or owner)**, not merely admin on the invited squad. This is
@@ -150,7 +181,8 @@ becomes usable again once the member is eligible again. The reply to the partici
 same generic success/failure text as the net-new path — the redemption error enum is never
 echoed into the chat (see the existing anti-oracle test).
 
-**Undoing a bind.** `DELETE /api/members/members/:id/telegram` clears a member's bound Telegram identity.
+**Undoing a bind.** `DELETE /api/members/members/:id/telegram` clears a member's bound Telegram identity
+(the dashboard's My Account "Disconnect" button, mupot#1412, is this exact route).
 Use it if a bind was made in error or the participant's Telegram account changes — a new
 member-bind invite can then be redeemed to bind the correct identity. Two ways to reach it:
 **org admin** (same target-rank ceiling as above — an admin cannot unbind a principal who

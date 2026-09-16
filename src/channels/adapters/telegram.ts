@@ -40,6 +40,55 @@ function idToString(v: unknown): string | null {
   return null
 }
 
+const BOT_USERNAME_CACHE_KEY = 'telegram:bot_username:v1'
+// Bot usernames essentially never change — 6h bounds getMe call volume across
+// every dashboard "Connect Telegram" page render without a real rotation
+// staying stale for long.
+const BOT_USERNAME_CACHE_TTL_SECONDS = 6 * 60 * 60
+
+/**
+ * The bot's own @username, for building a t.me deep link (`https://t.me/
+ * <username>?start=<code>`) on the dashboard's Connect Telegram page.
+ *
+ * mupot#1412 (dashboard Connect Telegram): `TELEGRAM_BOT_USERNAME` was
+ * explicitly REMOVED as an Env key (see src/types.ts's own comment — "Do not
+ * reintroduce them: a second authorisation model on one surface means the
+ * weaker one sets the level"), because it powered the old
+ * `/api/integrations/telegram` allowlist. This is a DIFFERENT, display-only
+ * use with no bearing on authorization — createProjectInvite/redeemTelegram-
+ * ProjectInvite never read it — so rather than reintroduce that key, the
+ * username is derived live from the Bot API via `getMe`, using the SAME
+ * `TELEGRAM_BOT_TOKEN` secret every other call in this file already uses.
+ * Cached in SESSIONS KV (the same general-purpose short-TTL cache other
+ * dashboard reads already use, e.g. src/dashboard/brain.ts's PHYSICS_KV_KEY)
+ * so a page loaded by many members doesn't call `getMe` on every render.
+ *
+ * Returns null when the token is unset, the call fails, or the response
+ * carries no username — callers must render an honest "not configured"
+ * state, never fabricate a link.
+ */
+export async function getTelegramBotUsername(env: Env): Promise<string | null> {
+  const token = telegramSecrets(env).TELEGRAM_BOT_TOKEN
+  if (!token) return null
+  if (env.SESSIONS) {
+    const cached = await env.SESSIONS.get(BOT_USERNAME_CACHE_KEY)
+    if (cached) return cached
+  }
+  try {
+    const res = await fetch(`${API}/bot${token}/getMe`)
+    if (!res.ok) return null
+    const data = (await res.json()) as { ok?: boolean; result?: { username?: unknown } }
+    const username = typeof data.result?.username === 'string' ? data.result.username.trim() : ''
+    if (!username) return null
+    if (env.SESSIONS) {
+      await env.SESSIONS.put(BOT_USERNAME_CACHE_KEY, username, { expirationTtl: BOT_USERNAME_CACHE_TTL_SECONDS })
+    }
+    return username
+  } catch {
+    return null
+  }
+}
+
 export const telegramAdapter: ChannelAdapter = {
   platform: 'telegram',
 

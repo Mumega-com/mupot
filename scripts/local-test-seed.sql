@@ -246,8 +246,17 @@ VALUES
   ('memship-conformance-sender-growth', 'agent-conformance-sender', 'sq-growth', 'member')
 ON CONFLICT(id) DO UPDATE SET capability = excluded.capability;
 
+-- mbr-local-owner bridges the dev-login identity (users.email
+-- 'local-owner@mupot.test', role 'owner' — see LOCAL_TEST_AUTH_EMAIL in
+-- wrangler-local-test.toml) to a real members row, so `auth.memberId`
+-- resolves for the primary browser-smoke session (src/auth/index.ts's
+-- email->member bridge). No explicit org capability row is needed: role
+-- 'owner' already floors actorRankOnScopeFor at RANK.owner regardless of
+-- capability grants — this row exists purely so the account/Telegram-connect
+-- surface (mupot#1412) has a member identity to bind against.
 INSERT INTO members (id, email, display_name, telegram_chat_id, status, created_at, tenant)
 VALUES
+  ('mbr-local-owner', 'local-owner@mupot.test', 'Local Owner', NULL, 'active', datetime('now'), 'local'),
   ('mbr-hermes-user', 'hermes@mupot.test', 'Hermes Test Operator', '123456789', 'active', datetime('now'), 'local'),
   ('mbr-local-admin', 'local-admin@mupot.test', 'Local Admin', NULL, 'active', datetime('now'), 'local'),
   ('mbr-conformance-runtime', 'runtime-conformance@mupot.test', 'Runtime Conformance Local', NULL, 'active', datetime('now'), 'local'),
