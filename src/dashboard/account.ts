@@ -42,6 +42,7 @@ import { html, raw } from 'hono/html'
 import type { HtmlEscapedString } from 'hono/utils/html'
 import type { AuthContext, Capability, Env } from '../types'
 import { actorRankOnScopeFor, capabilityRank } from '../auth/capability'
+import { MEMBER_BIND_MINT_FLOOR } from '../members/project-invites'
 import { getTelegramBotUsername } from '../channels/adapters/telegram'
 import { pageHeader, sectionPanel, pill, emptyState, type Html } from './ui'
 
@@ -116,6 +117,25 @@ export interface ConnectableSquad {
  * bubbles down to every squad — so "projects already accessible" is every
  * active project, the same population every other org-admin surface here
  * (e.g. /admin/members) already shows this viewer.
+ *
+ * kasra-review AMBER P1 (2026-09-16): the cap is ALSO clamped at 'admin',
+ * never 'owner', regardless of how high squadRank/orgRank go. Redemption
+ * writes the suggested capability as a REAL, durable squad capability row
+ * (via MEMBER_BIND'S downstream capability grant) — a redeemed 'owner' row
+ * makes targetMaxRankAcrossScopes for that member 5 FOREVER, independent of
+ * whatever standing the minting org admin/owner later loses. An org owner
+ * (rank 5) self-binding at 'owner' is fine the instant they do it (self-
+ * exempt, and they still outrank everyone) — but if their OWN org-scope
+ * standing is later reduced (role demoted, capability revoked) while this
+ * squad-owner row survives, NO remaining org admin (rank 4) can ever suspend,
+ * revoke a capability from, or unbind this now-uncontainable Telegram
+ * principal (`exceedsTargetRankCeiling` refuses with `cannot_affect_higher_
+ * rank` since target rank 5 > actor rank 4 forever). Capping the SUGGESTION
+ * at admin means the worst a self-bind can ever leave behind is a rank-4
+ * row, which every other org admin can still act on (4 is not > 4). See
+ * tests/dashboard-account-telegram-connect.test.ts's offboarding-chain test
+ * (mint -> redeem -> revoke org standing -> an org admin still gets 200 on
+ * suspend/capability-revoke/unbind) for the proof, not merely the render.
  */
 export async function loadConnectableSquads(
   env: Env,
@@ -133,7 +153,10 @@ export async function loadConnectableSquads(
   const out: ConnectableSquad[] = []
   for (const row of rows.results ?? []) {
     const squadRank = await actorRankOnScopeFor(env, auth, 'squad', row.squad_id)
-    out.push({ ...row, capability: capabilityAtRank(Math.min(squadRank, orgRank)) })
+    out.push({
+      ...row,
+      capability: capabilityAtRank(Math.min(squadRank, orgRank, capabilityRank(MEMBER_BIND_MINT_FLOOR))),
+    })
   }
   return out
 }
@@ -293,7 +316,7 @@ export async function telegramSectionBody(env: Env, auth: AuthContext): Promise<
   }
 
   const orgRank = await actorRankOnScopeFor(env, auth, 'org', null)
-  if (orgRank < capabilityRank('admin')) {
+  if (orgRank < capabilityRank(MEMBER_BIND_MINT_FLOOR)) {
     return emptyState({
       title: 'Telegram not connected',
       detail: 'Connecting your own Telegram currently needs org-admin standing.',

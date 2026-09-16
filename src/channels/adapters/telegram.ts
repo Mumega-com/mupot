@@ -40,11 +40,24 @@ function idToString(v: unknown): string | null {
   return null
 }
 
-const BOT_USERNAME_CACHE_KEY = 'telegram:bot_username:v1'
+const BOT_USERNAME_CACHE_PREFIX = 'telegram:bot_username:v1'
 // Bot usernames essentially never change — 6h bounds getMe call volume across
 // every dashboard "Connect Telegram" page render without a real rotation
 // staying stale for long.
 const BOT_USERNAME_CACHE_TTL_SECONDS = 6 * 60 * 60
+// Telegram bot usernames are 5-32 chars of letters/digits/underscore (they
+// must also end in "bot", but that constraint buys nothing extra here — this
+// is a shape check on an external API response, not an authorization rule).
+const TELEGRAM_USERNAME_RE = /^[A-Za-z0-9_]{5,32}$/
+
+/** First 8 hex chars of SHA-256(token) — enough to invalidate the cache key on
+ * rotation without storing (or logging) anything that reverses to the secret. */
+async function shortFingerprint(secret: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(secret))
+  let hex = ''
+  for (const byte of new Uint8Array(digest)) hex += byte.toString(16).padStart(2, '0')
+  return hex.slice(0, 8)
+}
 
 /**
  * The bot's own @username, for building a t.me deep link (`https://t.me/
@@ -63,15 +76,28 @@ const BOT_USERNAME_CACHE_TTL_SECONDS = 6 * 60 * 60
  * dashboard reads already use, e.g. src/dashboard/brain.ts's PHYSICS_KV_KEY)
  * so a page loaded by many members doesn't call `getMe` on every render.
  *
- * Returns null when the token is unset, the call fails, or the response
- * carries no username — callers must render an honest "not configured"
- * state, never fabricate a link.
+ * kasra-review AMBER P2 (2026-09-16): the cache key folds in a short
+ * fingerprint of the CURRENT token, so rotating `TELEGRAM_BOT_TOKEN` (e.g.
+ * to a different bot) can never keep serving the PRIOR bot's cached
+ * username — a stale entry under the old token's key is simply never read
+ * again; it expires on its own TTL rather than needing an explicit bust.
+ *
+ * kasra-review AMBER Low (2026-09-16): the response's `username` is
+ * validated against Telegram's own username shape before being trusted for
+ * a deep link or cached — a malformed/unexpected Bot API response degrades
+ * to the same "not configured" fallback as no token at all, never a broken
+ * or unsafe link.
+ *
+ * Returns null when the token is unset, the call fails, the response
+ * carries no (or a malformed) username — callers must render an honest
+ * "not configured" state, never fabricate a link.
  */
 export async function getTelegramBotUsername(env: Env): Promise<string | null> {
   const token = telegramSecrets(env).TELEGRAM_BOT_TOKEN
   if (!token) return null
+  const cacheKey = `${BOT_USERNAME_CACHE_PREFIX}:${await shortFingerprint(token)}`
   if (env.SESSIONS) {
-    const cached = await env.SESSIONS.get(BOT_USERNAME_CACHE_KEY)
+    const cached = await env.SESSIONS.get(cacheKey)
     if (cached) return cached
   }
   try {
@@ -79,9 +105,9 @@ export async function getTelegramBotUsername(env: Env): Promise<string | null> {
     if (!res.ok) return null
     const data = (await res.json()) as { ok?: boolean; result?: { username?: unknown } }
     const username = typeof data.result?.username === 'string' ? data.result.username.trim() : ''
-    if (!username) return null
+    if (!TELEGRAM_USERNAME_RE.test(username)) return null
     if (env.SESSIONS) {
-      await env.SESSIONS.put(BOT_USERNAME_CACHE_KEY, username, { expirationTtl: BOT_USERNAME_CACHE_TTL_SECONDS })
+      await env.SESSIONS.put(cacheKey, username, { expirationTtl: BOT_USERNAME_CACHE_TTL_SECONDS })
     }
     return username
   } catch {

@@ -103,6 +103,14 @@ describe('dashboard My Account — Telegram connect/disconnect (integration thro
       VALUES ('member-bound', 'bound@x.test', 'Bound Member', 'active', '${TENANT}');
       INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
       VALUES ('cap-bound-org', 'member-bound', 'org', NULL, 'admin');
+
+      -- org-scope 'lead' (rank 3) — one rank BELOW the mint floor (admin,
+      -- rank 4). Pins MEMBER_BIND_MINT_FLOOR exactly at 'admin': mutating it
+      -- to 'lead' (rank 3) would incorrectly let this member pass.
+      INSERT INTO members (id, email, display_name, status, tenant)
+      VALUES ('member-lead', 'lead@x.test', 'Lead Member', 'active', '${TENANT}');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+      VALUES ('cap-lead-org', 'member-lead', 'org', NULL, 'lead');
     `)
   })
 
@@ -156,6 +164,17 @@ describe('dashboard My Account — Telegram connect/disconnect (integration thro
     expect(body).not.toContain('id="tg-connect"')
     expect(body).toContain('org-admin standing')
     expect(body).toContain('Ask an org admin')
+  })
+
+  it('an org-scope LEAD member (one rank below the mint floor) is also refused — pins the floor exactly at admin (kasra-review AMBER P2)', async () => {
+    const env = makeEnv('lead@x.test')
+    env.DB = harness.db
+    const cookie = await devLogin(env)
+    const res = await dashboardApp.request('/account', { headers: { cookie: `mupot_session=${cookie}` } }, env)
+    expect(res.status).toBe(200)
+    const body = await res.text()
+    expect(body).not.toContain('id="tg-connect"')
+    expect(body).toContain('org-admin standing')
   })
 
   it('a member with an already-bound Telegram identity sees Connected + Disconnect, never the Connect form', async () => {
@@ -285,6 +304,111 @@ describe('dashboard My Account — Telegram connect/disconnect (integration thro
     expect(unboundBody).not.toContain('id="tg-disconnect"')
   })
 
+  // ── kasra-review AMBER P1 (2026-09-16): the offboarding chain, not the
+  //    render. Proves the capped-at-admin fix actually closes the
+  //    uncontainable-principal defect, against the REAL routes an
+  //    offboarding admin would use — not merely that the page suggests
+  //    'admin'. ──────────────────────────────────────────────────────────
+
+  it('offboarding chain: mint at the (now-capped) admin capability -> redeem -> revoke org standing -> a DIFFERENT org admin still gets 200 on unbind, capability-revoke, and suspend', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status, tenant)
+      VALUES ('member-offboarder', 'offboarder@x.test', 'Offboarder Admin', 'active', '${TENANT}');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+      VALUES ('cap-offboarder-org', 'member-offboarder', 'org', NULL, 'admin');
+    `)
+
+    const bindAuth: AuthContext = {
+      userId: 'admin-user',
+      email: 'admin@x.test',
+      role: 'member',
+      tenant: TENANT,
+      memberId: 'member-admin',
+      capabilities: [{ member_id: 'member-admin', scope_type: 'org', scope_id: null, capability: 'admin' }],
+    }
+    const env = { DB: harness.db, TENANT_SLUG: TENANT } as Env
+
+    // Mint at 'admin' — exactly what loadConnectableSquads now suggests post-
+    // fix (capped at MEMBER_BIND_MINT_FLOOR, never 'owner'), NOT a value this
+    // test hand-picks to dodge the defect.
+    const created = await createProjectInvite(env, bindAuth, {
+      member_id: 'member-admin',
+      project_id: 'project-a',
+      squad_id: 'squad-a',
+      capability: 'admin',
+      expires_in_seconds: 86400,
+    })
+    expect(created.ok).toBe(true)
+    if (!created.ok) return
+
+    harness.sqlite.prepare(`
+      INSERT INTO telegram_webhook_receipts (tenant, update_id, telegram_user_id, request_digest, state, created_at)
+      VALUES (?, 'update-offboard-1', 'tg-offboard-1', ?, 'processing', datetime('now'))
+    `).run(TENANT, VALID_REQUEST_DIGEST)
+
+    const redeemed = await redeemTelegramProjectInvite(env, {
+      pairing_code: created.value.pairing_code,
+      telegram_user_id: 'tg-offboard-1',
+      display_name: 'Admin Operator',
+      update_id: 'update-offboard-1',
+      request_digest: VALID_REQUEST_DIGEST,
+    })
+    expect(redeemed.ok).toBe(true)
+    if (!redeemed.ok) return
+    expect(redeemed.value.capability).toBe('admin') // never 'owner' — the fix under test
+
+    const dashEnv = makeEnv('offboarder@x.test')
+    dashEnv.DB = harness.db
+    const cookie = await devLogin(dashEnv)
+    const authHeaders = { cookie: `mupot_session=${cookie}`, 'content-type': 'application/json' }
+
+    // Step: revoke member-admin's ORG standing (the precondition the P1
+    // finding hinges on — their remaining rank is now ONLY the redeemed
+    // squad-scope 'admin' row).
+    const revokeOrg = await membersApp.request('/members/member-admin/capabilities', {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify({ action: 'revoke', scope_type: 'org', scope_id: null }),
+    }, dashEnv)
+    expect(revokeOrg.status, await revokeOrg.clone().text()).toBe(200)
+
+    // member-admin's ONLY remaining standing anywhere is squad-a 'admin'
+    // (rank 4) — confirm the fixture actually reached the hard case before
+    // asserting the routes below succeed against it.
+    const remaining = harness.sqlite.prepare(
+      `SELECT scope_type, scope_id, capability FROM capabilities WHERE member_id = 'member-admin'`,
+    ).all() as { scope_type: string; scope_id: string | null; capability: string }[]
+    expect(remaining).toEqual([{ scope_type: 'squad', scope_id: 'squad-a', capability: 'admin' }])
+
+    // Unbind Telegram (member-offboarder is a MERE org admin, rank 4 — target
+    // is also rank 4; 4 is not > 4, so the ceiling passes). This is the exact
+    // action a P0-class "uncontainable principal" would 403 on if the
+    // suggested capability had ever reached 'owner'.
+    const unbind = await membersApp.request(
+      '/members/member-admin/telegram',
+      { method: 'DELETE', headers: authHeaders },
+      dashEnv,
+    )
+    expect(unbind.status, await unbind.clone().text()).toBe(200)
+
+    // Revoke the squad capability itself.
+    const revokeSquad = await membersApp.request('/members/member-admin/capabilities', {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify({ action: 'revoke', scope_type: 'squad', scope_id: 'squad-a' }),
+    }, dashEnv)
+    expect(revokeSquad.status, await revokeSquad.clone().text()).toBe(200)
+    expect(await revokeSquad.json()).toEqual({ member_id: 'member-admin', action: 'revoke', removed: 1 })
+
+    // Suspend last.
+    const suspend = await membersApp.request(`/members/member-admin`, {
+      method: 'PATCH',
+      headers: authHeaders,
+      body: JSON.stringify({ status: 'suspended' }),
+    }, dashEnv)
+    expect(suspend.status, await suspend.clone().text()).toBe(200)
+  })
+
   // ── loadConnectableSquads / loadSelfMember — the one new read this page adds ──
 
   it('loadConnectableSquads lists only active projects with a linked squad, each capped at the caller org rank', async () => {
@@ -326,6 +450,29 @@ describe('dashboard My Account — Telegram connect/disconnect (integration thro
       ],
     }
     const squads = await loadConnectableSquads(env, auth, 4 /* admin */)
+    const squadA = squads.find((s) => s.squad_id === 'squad-a')
+    expect(squadA?.capability).toBe('admin')
+  })
+
+  it('loadConnectableSquads NEVER suggests owner, even for a genuine org OWNER with an explicit squad-owner grant (kasra-review AMBER P1)', async () => {
+    // Both squadRank AND orgRank are 5 here — the pre-fix Math.min(squadRank,
+    // orgRank) would have suggested 'owner'. A redeemed 'owner' squad row
+    // survives independent of this member's later org-role/standing, so the
+    // page must cap the suggestion at 'admin' unconditionally (see
+    // MEMBER_BIND_MINT_FLOOR's docstring in project-invites.ts).
+    harness.sqlite.exec(`
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+      VALUES ('cap-admin-squad-a-owner-2', 'member-admin', 'squad', 'squad-a', 'owner');
+    `)
+    const env = { DB: harness.db, TENANT_SLUG: TENANT } as Env
+    const auth: AuthContext = {
+      userId: 'owner-user',
+      email: 'admin@x.test',
+      role: 'owner', // legacy-role escape: actorRankOnScopeFor floors at RANK.owner=5
+      tenant: TENANT,
+      memberId: 'member-admin',
+    }
+    const squads = await loadConnectableSquads(env, auth, 5 /* owner */)
     const squadA = squads.find((s) => s.squad_id === 'squad-a')
     expect(squadA?.capability).toBe('admin')
   })
