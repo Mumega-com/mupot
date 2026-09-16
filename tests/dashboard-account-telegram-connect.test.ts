@@ -302,6 +302,34 @@ describe('dashboard My Account — Telegram connect/disconnect (integration thro
     for (const s of squads) expect(s.capability).toBe('admin')
   })
 
+  it('loadConnectableSquads caps at the LOWER of squad rank and org rank — never lets a higher squad-specific grant escape the org-rank ceiling', async () => {
+    // member-admin holds org 'admin' (rank 4) AND an explicit squad 'owner'
+    // (rank 5) grant on squad-a — a real, if unusual, shape. The suggested
+    // capability must be the MIN of the two (admin), never 'owner': a
+    // suggested 'owner' would violate createProjectInvite's own ceiling
+    // (capability > actor's org rank -> cannot_grant_above_own_rank) the
+    // instant this page's own hidden field reached that route.
+    harness.sqlite.exec(`
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+      VALUES ('cap-admin-squad-a-owner', 'member-admin', 'squad', 'squad-a', 'owner');
+    `)
+    const env = { DB: harness.db, TENANT_SLUG: TENANT } as Env
+    const auth: AuthContext = {
+      userId: 'admin-user',
+      email: 'admin@x.test',
+      role: 'member',
+      tenant: TENANT,
+      memberId: 'member-admin',
+      capabilities: [
+        { member_id: 'member-admin', scope_type: 'org', scope_id: null, capability: 'admin' },
+        { member_id: 'member-admin', scope_type: 'squad', scope_id: 'squad-a', capability: 'owner' },
+      ],
+    }
+    const squads = await loadConnectableSquads(env, auth, 4 /* admin */)
+    const squadA = squads.find((s) => s.squad_id === 'squad-a')
+    expect(squadA?.capability).toBe('admin')
+  })
+
   it('capabilityAtRank maps every ladder boundary exactly (owner=5..observer=1, and below)', () => {
     expect(capabilityAtRank(5)).toBe('owner')
     expect(capabilityAtRank(6)).toBe('owner')
